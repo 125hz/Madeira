@@ -147,6 +147,25 @@ game-specific patches — every change must fix the emulator/runtime generically
 
 ## 6. Status log
 
+- 2026-09-11 — FIRST D3D9 CUBE RUN (IPA 22:13): i386 `d3d9.dll` and
+  `winemetal.dll` loaded; two independent bugs. (1) `load_builtin_unixlib`
+  named the i386 winemetal `(unknown)` and bound the stub table: the PE
+  export-directory parse used `IMAGE_NT_HEADERS64` on a PE32 image
+  (`DataDirectory` at +96 vs +112 → read the resource dir). Fixed:
+  `ios_module_export_name()` magic-dispatched PE32/PE32+
+  (`virtual_ios.c:6146`), `ios_module_mapped_file_name()` wineserver
+  fallback (`:6213`), unknown module for a WoW caller now
+  `STATUS_NOT_SUPPORTED` + `[unixlib] UNRECOGNISED module …` (`:6394`).
+  (2) FEX x87 stack-optimisation pass: `_FormContextAddress(STATE +
+  idx*16)` (host) fed to `_LoadMemFPR/_StoreMemFPR` with `#0x420`
+  (`x87StackOptimizationPass.cpp:441/477/610`) → `GetGuestMemAddr` applied
+  the guest base to a HOST address → `str q2` at `B + low32(STATE+…)`;
+  guest RIP = mingw `ceilf` in d3d9.dll (first x87 code any 32-bit test
+  ran). The faulting region was plain unallocated window space, not a
+  DXMT arena. Fix assigned (Opus, FEX/**): context-indexed ops + audit
+  for other host addresses flowing into guest memory ops.
+
+
 - 2026-09-11 — **MILESTONE 2 PASSED (thirteenth device run, IPA 21:38).**
   `window-x86.exe`: `created hwnd`, `painted`, `painted-via-updatewindow`,
   `invalidate-rect returned 1`, `update-window returned 1`, exit

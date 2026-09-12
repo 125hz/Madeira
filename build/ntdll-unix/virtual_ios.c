@@ -6144,6 +6144,112 @@ extern const void *crypt32_unix_call_wow64_funcs[];
 extern const void *dwrite_unix_call_wow64_funcs[];
 
 /***********************************************************************
+ *           ios_module_export_name
+ *
+ * MADEIRA (WOW64_DESIGN.md §3 invariant 2, §7.4 rule 4): name a mapped PE
+ * from its export directory, for PE32 **and** PE32+.
+ *
+ * This used to walk the headers through IMAGE_NT_HEADERS, which in this
+ * 64-bit build is IMAGE_NT_HEADERS64.  For an i386 image that is the wrong
+ * struct: IMAGE_OPTIONAL_HEADER32 puts DataDirectory at +96 and
+ * IMAGE_OPTIONAL_HEADER64 puts it at +112, so
+ * DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT] read through the 64-bit
+ * spelling actually reads DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE] of
+ * a 32-bit image.  None of the i386 builtins we ship has a resource
+ * directory, so the RVA came back 0, every 32-bit module was named
+ * "(unknown)", and the by-name match chain in load_builtin_unixlib() could
+ * never recognise one.  (Device log: the i386 winemetal.dll at guest base
+ * 0x7b4b0000 has its export directory at RVA 0xa618 and DataDirectory[2]
+ * == 0, and was logged as "[unixlib] (unknown) -> wow64 table".)
+ */
+static const char *ios_module_export_name( const void *module )
+{
+    const IMAGE_DOS_HEADER *dos = module;
+    const IMAGE_NT_HEADERS32 *nt;
+    const IMAGE_EXPORT_DIRECTORY *exp;
+    DWORD exp_rva = 0, dirs = 0, size_of_image = 0;
+
+    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
+    nt = (const IMAGE_NT_HEADERS32 *)((const char *)module + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return NULL;
+
+    /* Magic sits at the same offset in both optional headers; everything
+     * after it does not. */
+    switch (nt->OptionalHeader.Magic)
+    {
+    case IMAGE_NT_OPTIONAL_HDR32_MAGIC:
+        dirs = nt->OptionalHeader.NumberOfRvaAndSizes;
+        size_of_image = nt->OptionalHeader.SizeOfImage;
+        if (dirs > IMAGE_DIRECTORY_ENTRY_EXPORT)
+            exp_rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        break;
+    case IMAGE_NT_OPTIONAL_HDR64_MAGIC:
+    {
+        const IMAGE_NT_HEADERS64 *nt64 = (const IMAGE_NT_HEADERS64 *)nt;
+        dirs = nt64->OptionalHeader.NumberOfRvaAndSizes;
+        size_of_image = nt64->OptionalHeader.SizeOfImage;
+        if (dirs > IMAGE_DIRECTORY_ENTRY_EXPORT)
+            exp_rva = nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        break;
+    }
+    default:
+        return NULL;
+    }
+
+    if (!exp_rva || !size_of_image) return NULL;
+    if (exp_rva >= size_of_image || size_of_image - exp_rva < sizeof(*exp)) return NULL;
+    exp = (const IMAGE_EXPORT_DIRECTORY *)((const char *)module + exp_rva);
+    if (!exp->Name || exp->Name >= size_of_image) return NULL;
+    return (const char *)module + exp->Name;
+}
+
+
+static unsigned int get_memory_section_name( HANDLE process, LPCVOID addr,
+                                             MEMORY_SECTION_NAME *info, SIZE_T len, SIZE_T *ret_len );
+
+/***********************************************************************
+ *           ios_module_mapped_file_name
+ *
+ * MADEIRA: last-resort identification for a mapped image whose export
+ * directory is missing or unreadable — ask the wineserver which file the
+ * view came from and keep the lowercased basename.  This is the same
+ * information FEX's image-map hook uses to name i386 images, and it is the
+ * only name available for a PE that exports nothing.  Only used when the
+ * export name and the builtin unix_path are both unavailable, so the server
+ * round trip never lands on the hot path.
+ */
+static BOOL ios_module_mapped_file_name( const void *module, char *buf, size_t buflen )
+{
+    struct
+    {
+        MEMORY_SECTION_NAME info;
+        WCHAR data[512];
+    } sec;
+    const WCHAR *name;
+    unsigned int len, i, start = 0, out = 0;
+
+    if (!buf || buflen < 2) return FALSE;
+    buf[0] = 0;
+    if (get_memory_section_name( GetCurrentProcess(), module, &sec.info, sizeof(sec), NULL ))
+        return FALSE;
+
+    name = sec.info.SectionFileName.Buffer;
+    len = sec.info.SectionFileName.Length / sizeof(WCHAR);
+    if (!name || !len) return FALSE;
+    for (i = 0; i < len; i++)
+        if (name[i] == '\\' || name[i] == '/') start = i + 1;
+    for (i = start; i < len && out < buflen - 1; i++)
+    {
+        char c = (char)(name[i] & 0x7f);
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        buf[out++] = c;
+    }
+    buf[out] = 0;
+    return out != 0;
+}
+
+
+/***********************************************************************
  *           ios_bind_unixlib_table
  *
  * Pick the 64-bit or the wow64 table for the calling process and log the
@@ -6201,22 +6307,20 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
     {
         /* unix_path may not be set on iOS (our loader doesn't always call
          * set_builtin_unixlib_name), so fall back to reading the DLL name
-         * from the PE export directory. */
-        const char *modname = NULL;
-        const IMAGE_DOS_HEADER *dos = module;
-        if (dos && dos->e_magic == IMAGE_DOS_SIGNATURE) {
-            const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)((char *)module + dos->e_lfanew);
-            if (nt->Signature == IMAGE_NT_SIGNATURE) {
-                DWORD exp_rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-                if (exp_rva) {
-                    const IMAGE_EXPORT_DIRECTORY *exp = (const IMAGE_EXPORT_DIRECTORY *)((char *)module + exp_rva);
-                    if (exp->Name) modname = (const char *)module + exp->Name;
-                }
-            }
-        }
+         * from the PE export directory (ios_module_export_name() handles
+         * both PE32 and PE32+ — see the note there; the 64-bit-only parse it
+         * replaces named every i386 module "(unknown)"), and then to the
+         * name of the file the view was mapped from. */
+        const char *modname = ios_module_export_name( module );
+        char secname[128];
         const char *up = NULL;
+        const char *match;
+
         if ((builtin = get_builtin_module( module ))) up = builtin->unix_path;
-        const char *match = up ? up : modname;
+        match = up ? up : modname;
+        secname[0] = 0;
+        if (!match && ios_module_mapped_file_name( module, secname, sizeof(secname) ))
+            match = secname;
         /* MADEIRA (WOW64_DESIGN.md §7.10 item 1): each branch only names the
          * library's pair of tables; ios_bind_unixlib_table() below picks the
          * one that matches the caller's bitness and logs it.  The stub tables
@@ -6289,10 +6393,27 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             funcs64 = funcs_wow64 = (const void *)ios_gl_stub_unix_call_table;
         } else {
             pthread_once( &ios_stub_tables_once, ios_init_stub_tables );
-            WARN_(module)("iOS: no unix .so for module %p (unix_path=%s, modname=%s), using stub table\n",
-                          module, up ? up : "(null)", modname ? modname : "(null)");
-            libname = modname ? modname : (up ? up : "(unknown)");
-            funcs64 = funcs_wow64 = (const void *)ios_stub_unix_call_table;
+            WARN_(module)("iOS: no unix .so for module %p (unix_path=%s, modname=%s, mapped=%s), using stub table\n",
+                          module, up ? up : "(null)", modname ? modname : "(null)",
+                          secname[0] ? secname : "(null)");
+            libname = modname ? modname : (up ? up : (secname[0] ? secname : "(unknown)"));
+            funcs64 = (const void *)ios_stub_unix_call_table;
+            /* MADEIRA (WOW64_DESIGN.md §7.4 rule 4: no fake success): a 32-bit
+             * caller must never be handed the stub table.  Its entries return
+             * STATUS_NOT_SUPPORTED but leave every OUTPUT field of the argument
+             * block untouched, and PE-side unix-call wrappers routinely ignore
+             * the status and use those fields — so an unrecognised module turns
+             * a missing unix side into uninitialised pointers in 32-bit code
+             * and, eventually, a wild access somewhere in the guest window.
+             * Fail the load loudly instead; the 64-bit path keeps the stub
+             * table it has always had. */
+            funcs_wow64 = NULL;
+            if (wow)
+                ERR( "[unixlib] UNRECOGNISED module %p (export name %s, unix_path %s, mapped file %s): "
+                     "no statically linked wow64 unix call table matches — refusing with "
+                     "STATUS_NOT_SUPPORTED instead of binding the stub table to a 32-bit caller\n",
+                     module, modname ? modname : "(none)", up ? up : "(none)",
+                     secname[0] ? secname : "(none)" );
         }
         status = ios_bind_unixlib_table( module, libname, wow, funcs64, funcs_wow64, funcs );
     }
