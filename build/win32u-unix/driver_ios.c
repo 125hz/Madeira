@@ -519,6 +519,59 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
         }
     }
 
+    /* iOS: synthesize the expose/damage-driven repaint a real windowing system
+     * delivers. Every other display driver gets an Expose (x11drv), a
+     * drawRect/needsDisplay (macdrv) or a damage event when a window becomes
+     * visible or when its backing surface is (re)created, and answers it with
+     * NtUserRedrawWindow( RDW_INVALIDATE ) — that is what puts the window's
+     * update region into the server, which is the ONLY source of the queue's
+     * QS_PAINT bit and therefore of WM_PAINT (server get_message only reports
+     * WM_PAINT while queue->paint_count is non-zero).
+     *
+     * winios.drv has no such event: the surface IS the presented buffer. So
+     * nothing ever asked the application to paint, and a window whose contents
+     * the runtime just dropped stayed empty forever. Two cases hit this:
+     *   - the show path took a route that carries SWP_NOREDRAW (the server then
+     *     skips expose_window() and the frame/client invalidation entirely, see
+     *     window.c set_window_pos: `if (swp_flags & SWP_NOREDRAW) goto done`),
+     *     e.g. when ShowWindow() degenerates to a WS_VISIBLE style toggle plus
+     *     update_window_state() because the parent looks invisible;
+     *   - CreateWindowSurface replaced the surface ("RECREATED — old content
+     *     dropped" above): the new buffer is blank and only the application can
+     *     refill it.
+     * apply_window_pos() already computes exactly the signal we need:
+     * SWP_FRAMECHANGED is forced whenever the surface pointer changed, and
+     * SWP_SHOWWINDOW marks the window going visible.
+     *
+     * Surface-less windows (GPU/client-surface presented, e.g. the D3D path)
+     * are deliberately left alone: they do not paint through GDI. */
+    if (surface && !IsRectEmpty( &new_rects->visible ) && !(swp_flags & SWP_HIDEWINDOW) &&
+        (swp_flags & (SWP_SHOWWINDOW | SWP_FRAMECHANGED)) &&
+        (get_window_long( hwnd, GWL_STYLE ) & WS_VISIBLE))
+    {
+        /* MADEIRA-TEMP: one line per newly shown surface-backed window, to
+         * settle WHY the show path carried SWP_NOREDRAW. A window that reaches
+         * here WITHOUT SWP_SHOWWINDOW was made visible by the WS_VISIBLE style
+         * toggle in show_window() (window.c:4855-4859), which happens only when
+         * is_window_visible(parent) is FALSE — parent_vis/parent_style/parent
+         * vs desktop/msgwin below say which of the three possible reasons it is
+         * (parent is the message window, parent handle is unresolvable, or the
+         * desktop style query failed). Remove once diagnosed. */
+        if (!(swp_flags & SWP_SHOWWINDOW))
+        {
+            static unsigned diag_n;
+            if (diag_n++ < 8)
+            {
+                HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
+                dprintf( 2, "MADEIRA-TEMP [paint-diag] hwnd=%p swp=%08x parent=%p desktop=%p "
+                         "msgwin=%p parent_style=%08x parent_vis=%d\n", hwnd, (unsigned)swp_flags,
+                         parent, get_desktop_window(), get_hwnd_message_parent(),
+                         (unsigned)get_window_long( parent, GWL_STYLE ), is_window_visible( parent ) );
+            }
+        }
+        NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN );
+    }
+
     if (winios_pWindowPosChanged)
         winios_pWindowPosChanged( hwnd, insert_after, owner_hint, swp_flags, new_rects, surface );
 }
@@ -1571,8 +1624,10 @@ static void load_display_driver(void)
         if (winios_pShowWindow)          winios_user_driver.pShowWindow          = winios_pShowWindow;
         /* window-pos wrapper dereferences window_rects on this side and
          * forwards plain ints to Winios.m's layer compositor */
-        if (winios_pWindowPosChanged || winios_window_frame)
-            winios_user_driver.pWindowPosChanged = winios_drv_window_pos_changed;
+        /* Always install the wrapper, even with no app-side hook linked: it
+         * also carries the expose-equivalent repaint request (see
+         * winios_drv_window_pos_changed), which must not depend on Winios.m. */
+        winios_user_driver.pWindowPosChanged = winios_drv_window_pos_changed;
         /* S2 desktop mode only: GDI window surfaces → app compositor.
          * Games keep the offscreen (invisible) surface path. */
         if (winios_desktop_mode())

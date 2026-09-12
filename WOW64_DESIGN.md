@@ -147,6 +147,44 @@ game-specific patches — every change must fix the emulator/runtime generically
 
 ## 6. Status log
 
+- 2026-09-11 — **MILESTONE 2 PASSED (thirteenth device run, IPA 21:38).**
+  `window-x86.exe`: `created hwnd`, `painted`, `painted-via-updatewindow`,
+  `invalidate-rect returned 1`, `update-window returned 1`, exit
+  `status=43`, no faults, ZERO `[rpm-avail] ml607` lines (allocator
+  invariant fix confirmed). `[paint-diag] hwnd=0x10028 swp=4000193f
+  parent=0x10022 desktop=0x10022 parent_style=00000000 parent_vis=0` — the
+  desktop window's style reads 0 for the 32-bit process, so `ShowWindow`
+  took the style-toggle branch; the driver repaint covers it, but the
+  style query is an M3 item (`NtUserGetWindowLong` on the desktop from a
+  WoW thread, or `is_window_visible` in win32u). `d3d9-cube-x86.exe`:
+  launch path works; `Library d3d9.dll not found` (exit 0xC0000135) —
+  expected until stage 4 produces the i386 `d3d9.dll`.
+
+
+- 2026-09-11 — **D3D9 stage 4 done: the i386 `d3d9.dll` compiles, links and is
+  installed** (Opus; details in §7.11). All 107 compile errors from 39 distinct
+  causes are closed, 21/21 `src/d3d9` translation units build as i386 PE, and
+  `app/Madeira/i386-windows/d3d9.dll` is 3,280,896 B, Machine 0x14C, importing
+  only `KERNEL32`/`USER32`/`GDI32`/`winemetal.dll` + the `api-ms-win-crt-*`
+  sets and exporting `Direct3DCreate9`, `Direct3DCreate9Ex` and the `D3DPERF_*`
+  family. The `MADEIRA-TEMP` `-Denable_d3d9` meson option is removed; d3d9 now
+  builds unconditionally for Windows targets. d3d11/d3d10core/dxgi still build
+  on both i386 and aarch64 (aarch64 checked with `--install none`, so the
+  64-bit farms are untouched — §7.7 risk 8). The work was: 30 call-site renames
+  in the imported sources; ~10 self-contained back-ports from the `v0.4-d3d9`
+  tag; a winemetal ABI *command* extension (four render commands + one blit
+  command, appended at the reference's own values, needing **no** new unix-call
+  slot because they ride the already-converted `encodeCommands` chain); the
+  per-chunk GPU-completion-target mechanism; and the resolve / stretch-blit /
+  copy / optimize encoder commands with their five internal-library shaders.
+  The texture-view model — §7.11's "genuinely invasive" item — was done
+  **additively** instead: `Texture::fullView` is `static constexpr … = 0` and
+  `TextureViewDescriptor` gained an identity-defaulted `swizzle`, so the
+  reference's packed `TextureViewKey` was not taken and every d3d11 view is
+  unchanged. Presentation needed no conversion, as §7.1 predicted, and that is
+  now verified slot by slot. Open: the remote Metal backend rejects the new
+  commands by name (needs `WMTW_OP_*` wire ops in `research/remote-metal/`,
+  another component); nothing has run on a device yet.
 - 2026-09-11 — D3D9 stages 3 and 5 landed; stage 4 imported but not yet
   compiling (Opus; details in §7.11). Licensing decision received from the
   fork owner: import under LGPL-2.1 §3 → GPL-3.0-or-later, so §7.2 is
@@ -231,6 +269,31 @@ game-specific patches — every change must fix the emulator/runtime generically
   `main` @ `09d949e` pushed to `125hz/Madeira`. Scratch files deleted.
   Revert path: `git checkout 09d949e && git submodule update --init` on
   a fresh clone of `125hz/Madeira` reproduces this state.
+- 2026-09-11 — D3D9 checkpoint committed+pushed: dxmt `3e8eed5` (96
+  files), main `be1066b`. Stage-4 continuation (reconcile §7.11 API
+  drift) running.
+- 2026-09-11 — Paint + allocator fixed (Opus). (A) `[rpm-avail] ml607
+  bad=0x20` was a FALSE POSITIVE: rpmalloc never cleared a page's `prev`
+  on head removal/republish, and the census's "repair" then zeroed the
+  class's available-list head, orphaning it (the ml614 store-at-0x30
+  shape). Fix (`rpmalloc.c` ml623): make the invariant real —
+  `page_full_to_available`, `page_available_to_free`,
+  `page_available_to_full` clear stale `prev`/`next`, the corrupt branch
+  advances instead of zeroing, a full page leaving via thread-free is
+  handled explicitly. Generic; affects the 64-bit path too. (B) WM_PAINT:
+  the server generates WM_PAINT only from `paint_count`
+  (`queue_ios.c:3375`), set by `set_update_region`; both logged
+  `[win-pos]` events carried SWP_NOREDRAW and neither had SWP_SHOWWINDOW —
+  `ShowWindow` took the "parent not visible" style-toggle branch
+  (`window.c:4855`), so no invalidate ever happened, and the iOS driver
+  (unlike x11drv/macdrv) has no expose/damage path to compensate. Fix:
+  `driver_ios.c:522-553` `winios_drv_window_pos_changed` requests
+  `NtUserRedrawWindow(RDW_INVALIDATE|ERASE|FRAME|ALLCHILDREN)` for a
+  visible surfaced window on SHOWWINDOW/FRAMECHANGED; hook installed
+  unconditionally (`:1626`). Open: why `is_window_visible(parent)` is
+  FALSE (`MADEIRA-TEMP [paint-diag]` line will say). wow64win thunks
+  verified correct. Test now also does InvalidateRect+UpdateWindow and
+  logs `painted-via-updatewindow`/`painted-via-queue`. IPA build started.
 
 
 - 2026-09-11 — **MILESTONE 1 PASSED (ninth device run).** `hello-x86.exe`
@@ -1073,7 +1136,7 @@ separately in `research/dxmt/LICENSE-MADEIRA.md`.
 | 1. i386 PE build stage; acceptance test; guest-pointer conversion mechanism | DXMT | `build/dxmt-ios/build-pe.sh`, `.xtool/build-dxmt.sh`, `build/x86-tests/d3d9-cube-x86.{c,exe}`, `build/x86-tests/build-d3d9-cube.sh`, `research/dxmt/{meson.build,src/winemetal/unix/winemetal_unix.c}` | **done, §7.8** |
 | 2. Licensing decision + notices | fork owner | `research/dxmt/{LICENSE,COPYING.LIB}`, `LICENSE-MADEIRA.md`, `THIRD-PARTY-NOTICES.md` | **done** — proceed under LGPL-2.1 §3 → GPL-3.0-or-later, notices written (§7.11) |
 | 3. airconv DXSO/FFP import | DXMT | `research/dxmt/src/airconv/{dxso_header.hpp,dxso_decoder.hpp,dxso_compile.{hpp,cpp},ffp_compile.{hpp,cpp}}`, the DXSO half of `airconv_public.h`, deltas to `nt/air_builder.*`/`air_signature.*`/`air_operations.cpp`/`air_type.cpp`, `src/airconv/meson.build` | **done, §7.11** |
-| 4. `src/d3d9` import + API reconciliation | DXMT | `research/dxmt/src/d3d9/**`, `src/meson.build` | **imported; 16/21 TUs compile**, reconciliation inventory in §7.11 |
+| 4. `src/d3d9` import + API reconciliation | DXMT | `research/dxmt/src/d3d9/**`, `src/meson.build`, deltas to `src/dxmt/*`, `src/util/wsi_window*`, `src/winemetal/{winemetal.h,Metal.hpp,unix/winemetal_unix.c}` | **done, §7.11** — 21/21 TUs compile, `d3d9.dll` links and installs, `enable_d3d9` option removed |
 | 5. Slot + wow64 table completion | DXMT | `src/winemetal/airconv_thunks.{h,c}`, `src/winemetal/unix/winemetal_unix.c`, regenerate `wmt_api_names.h` + `unix/wmt_remote_guard.h`, extend `gen_remote_guard.py` | **done, §7.11** (38 + 5 slots) |
 | 6. 32-bit unixlib table selection | WINE | `build/ntdll-unix/virtual_ios.c` static-link fallback | **hand-off, §7.10** |
 | 7. Launch button | APP | `app/Madeira/ContentView.swift` `thirtyTwoBitTests` | **hand-off, §7.10** |
@@ -1468,77 +1531,170 @@ part of the `git archive HEAD` export, so the new translation units were
 silently ignored; it now refreshes that copy from the tracked tree the same way
 it refreshes the submodule.
 
-**Stage 4, `src/d3d9` (imported, not compiling).** All **71** files of
-`src/d3d9` are imported (31,544 lines, including `meson.build`, `d3d9.def` and
-`version.rc`) and wired into `src/meson.build`. **16 of the 21 translation
-units already compile as i386 PE**; 5 fail, with **107 errors from 39 distinct
-causes**, all of them `src/dxmt`/`src/util` APIs that postdate this fork
-(`d3d9_device.cpp` 77, `d3d9_swapchain.cpp` 23, `d3d9_clear_quad.cpp` 3,
-`d3d9_texture.cpp` 2, `d3d9_buffer.cpp` 1, `d3d9_interface.cpp` 1). The module
-is therefore behind a `MADEIRA-TEMP` meson option, `-Denable_d3d9=true`, so the
-rest of the tree keeps building; `build-pe.sh` already defaults to installing
-`d3d9.dll` when it exists. There is no i386 `d3d9.dll` in
-`app/Madeira/i386-windows/` to replace — Wine's wined3d-based one was only ever
-built for the two 64-bit farms, so the §7.7 shadowing concern stands unchanged.
-`d3d9` needs **no** `dxgi`: its meson dependencies are `util_dep`,
-`winemetal_dep`, `airconv_forward_dep`, `dxmt_dep`, and `dxmt_dep` pulls in
-`winemetal` only.
+**Stage 4, `src/d3d9` — done: it compiles, links and is installed.** All **71**
+files of `src/d3d9` are imported (31,544 lines, including `meson.build`,
+`d3d9.def` and `version.rc`) and wired into `src/meson.build`. All **21**
+translation units now compile as i386 PE and `d3d9.dll` links: **107 errors
+from 39 distinct causes → 0**. The `MADEIRA-TEMP` `-Denable_d3d9` option is
+**gone** (removed from `meson.options`); `src/meson.build` builds `d3d9` for
+every non-`dxmt_native` target, and `build-pe.sh` installs it by default.
+Wine's wined3d-based `d3d9.dll` was only ever built for the two 64-bit farms,
+so nothing in `app/Madeira/i386-windows/` was replaced and the §7.7 shadowing
+concern stands unchanged. `d3d9` needs **no** `dxgi`: its meson dependencies
+are `util_dep`, `winemetal_dep`, `airconv_forward_dep`, `dxmt_dep`, and
+`dxmt_dep` pulls in `winemetal` only.
 
-The remaining work, grouped by the kind of change it needs:
+What closed the 39 causes, in the order §7.11 recommended:
 
-1. **Pure renames (adapt the imported call sites, ~19 errors).**
-   `ResourceAccess::Read/Write` → `DXMT_ENCODER_RESOURCE_ACESS_READ/WRITE`
-   (15; note the upstream typo in the fork's spelling);
-   `resolve_texture_cmd(...)` → the fork's `resolveTexture(src, src_view, dst,
-   dst_view)` (3, plus `ResolveTextureMode`/`ResolveTextureContext`);
-   `signalEventByHandle(handle, value)` → the fork's
-   `signalEvent(WMT::Reference<WMT::Event>&&, value)` (7) — check the
-   ownership convention before mapping it.
-2. **Additive back-ports from the tag, each self-contained (~20 errors).**
-   `wsi::foregroundWindow()` (`src/util/wsi_window.hpp` + the win32/headless
-   implementations, 5); `Recall_sRGB_ForRenderTarget()`
-   (`src/dxmt/dxmt_format.hpp`, 4); `RingBumpState::preallocate()` /
-   `seal_latest()` and its extra constructor argument (8);
-   `CommandQueue::HasDeviceError()`, `FrameLatencySignaled()`,
-   `WaitFrameLatency()` (3); `Presenter::setDisplaySyncEnabled()` (1);
-   `GetDXMTShaderCacheDirectory()` (1); `BufferAllocation::length` (2);
-   `TextureAllocation::buffer` (2); `Buffer::mapped_address`'s second
-   argument (1).
-3. **Mechanism back-ports (real work).**
-   - `GpuCompletionStatus` + `GpuCompletionTarget` + `CommandChunk::
-     addCompletionTarget()` (6 errors, and the `expected class name` /
-     `only virtual member functions can be marked 'final'` pair in
-     `d3d9_swapchain.cpp` are the same thing): the reference's per-chunk
-     completion-callback mechanism, which the fork's command queue does not
-     have.
-   - `ArgumentEncodingContext::copyTexture()` (3),
-     `stretch_blit_cmd` + `StretchBlitContext` (4 + 1) and
-     `optimizeTextureForGPUAccess()` (1): three encoder commands the fork's
-     context lacks. The stretch blit is a filtered copy and needs its
-     internal-library shader too.
-   - Four new render commands — `WMTRenderCommandSetVertexTexture`,
-     `SetVertexSamplerState`, `SetFragmentSamplerState`, `SetBlendFactor` —
-     with a `wmtcmd_render_setsamplerstate` record (8 errors). Direct3D 9
-     binds textures and samplers through Metal's argument *table* rather than
-     an argument buffer, which d3d11 never needed. This is a winemetal ABI
-     extension: append the enum values (never insert), add the struct, handle
-     them in `_MTLRenderCommandEncoder_encodeCommands`, and remember the new
-     records ride the same guest chain, so `wow_cmd_payload()` must learn any
-     payload pointer they carry.
-   - The **texture-view model** (13 `Texture::fullView`, 3 `miplevelCount`,
-     3 `checkViewUseMipRange`, 1 `checkViewUseSwizzle`, 1
-     `TextureViewDescriptor::swizzle`). This is the one genuinely invasive
-     item: the reference turned `TextureViewKey` from this fork's `unsigned`
-     index into a value carrying a descriptor plus a mip range, and added a
-     swizzle to the view descriptor. `Texture::fullView` maps to view `0` in
-     this fork (the constructor's view 0 spans every mip), and the mip-range
-     and swizzle checks are what D3DSAMP_MAXMIPLEVEL and the signed/INTZ
-     formats need. `dxmt_texture.hpp` is shared with d3d11, so this must be
-     done additively (new overloads alongside the existing view model) or as
-     a deliberate, separately verified change to both frontends — not by
-     swapping the header for the reference's.
+1. **Pure renames in the imported call sites** (`research/dxmt/src/d3d9/`,
+   `d3d9_device.cpp` and `d3d9_clear_quad.cpp` only): `ResourceAccess::Read/
+   Write/ReadWrite` → `DXMT_ENCODER_RESOURCE_ACESS_*` (15 sites; the fork keeps
+   the upstream `ACESS` typo). The reference also templates `access<>` on
+   `PipelineStage` where this fork templates it on `bool PreRasterStage`, an
+   error the `ResourceAccess` one had been masking: 15 further sites,
+   `PipelineStage::Vertex` → `true`, `Pixel`/`Compute` → `false`. That
+   parameter is inert in this fork (`trackBuffer`/`trackTexture` ignore it), so
+   the mapping is faithful to intent, not just to types. `resolve_texture_cmd`
+   and `signalEventByHandle` turned out **not** to be renames — see below.
+2. **Additive back-ports from the tag** (each listed in
+   `research/dxmt/LICENSE-MADEIRA.md`): `wsi::foregroundWindow()`
+   (`src/util/wsi_window.hpp:110`, `wsi_window_win32.cpp:244`,
+   `wsi_window_headless.cpp:87`); `Recall_sRGB_ForRenderTarget()`
+   (`src/dxmt/dxmt_format.hpp:37-49`); `RingBumpState::preallocate()` /
+   `seal_latest()` / the `single_writer` constructor argument
+   (`dxmt_ring_bump_allocator.hpp:33-85,110-127`) — the tag's `__i386__`
+   8 MB `kStagingBlockSize` came with it (`:14-23`), which matters here: a
+   32-bit guest lives under a 2-3 GB VA ceiling and each 32 MB block costs a
+   Metal address-space registration; `CommandQueue::HasDeviceError()` /
+   `MarkDeviceError()` / `FrameLatencySignaled()` / `WaitFrameLatency()`
+   (`dxmt_command_queue.hpp:207-216,294-310`, `.cpp:262-265`);
+   `Presenter::setDisplaySyncEnabled()` (`dxmt_presenter.hpp:42`,
+   `.cpp:106-113` — a no-op on iOS, where `_MetalLayer_setProps` compiles the
+   field out and `getProps` reports `true`); `GetDXMTShaderCacheDirectory()`
+   (`dxmt_shader_cache.hpp:11`, `.cpp:9-18`, which the existing `ShaderCache`
+   constructor now calls instead of duplicating);
+   `BufferAllocation::length()` (`dxmt_buffer.hpp:62-67`);
+   `TextureAllocation::buffer()` (`dxmt_texture.hpp:107-114`); and the
+   `out_minted_fresh` out-parameter of `DynamicBuffer::allocate`
+   (`dxmt_dynamic.hpp:13-21`, `.cpp:31,148-149`) — §7.11 had called that last
+   one `Buffer::mapped_address`'s second argument, which was a misreading.
+3. **Mechanism back-ports.**
+   - **Render-command ABI extension.** `WMTRenderCommandSetBlendFactor`,
+     `SetFragmentSamplerState`, `SetVertexTexture`, `SetVertexSamplerState`
+     appended to `WMTRenderCommandType` (`winemetal.h:1109-1128`) with
+     `wmtcmd_render_setsamplerstate` (`:1181-1187`); decoded in
+     `_MTLRenderCommandEncoder_encodeCommands`
+     (`unix/winemetal_unix.c:1758-1789`). `SetBlendFactor` reuses
+     `wmtcmd_render_setblendcolor` but sets **only** the blend colour: d3d9
+     carries its stencil reference on the depth-stencil state, so the d3d11
+     `SetBlendFactorAndStencilRef` behaviour would clobber it.
+     `WMTBlitCommandOptimizeContentsForGPUAccess` +
+     `wmtcmd_blit_optimize_contents` appended the same way
+     (`winemetal.h:869-882`, `:960-967`; decoded at `winemetal_unix.c:1521-1531`,
+     sized at `:1401-1402`). Three `WMTRenderCommandReserved*` and four
+     `WMTBlitCommandReserved*` placeholders keep every value on the reference's
+     own number, the same reasoning as §7.4 rule 5's NULL unix-call slots.
+     **No new unix-call slot was needed** and neither dispatch table changed
+     length: these are render/blit *commands*, which ride slots 36/38, whose
+     `_MTLBlitCommandEncoder_encodeCommands32` /
+     `_MTLRenderCommandEncoder_encodeCommands32` already walk the guest chain.
+     `wow_cmd_payload()` needed no new arm — every new record carries only
+     `obj_handle_t` values and scalars — and now says so explicitly
+     (`winemetal_unix.c:4634-4641`) so the next addition does not miss it.
+     PE-side helpers `setFragmentSamplerState` and `setDepthStencilState` added
+     to `Metal.hpp:430-450`.
+   - **GPU completion targets.** `GpuCompletionStatus`, `GpuCompletionTarget`,
+     `CommandChunk::addCompletionTarget()` and its `completion_targets` vector
+     + mutex (`dxmt_command_queue.hpp:24-42,155-172,199`), dispatched from the
+     finish thread alongside the existing frame-latency signal
+     (`dxmt_command_queue.cpp:181-184,194-196`), with `MarkDeviceError()` set
+     from the same `WMTCommandBufferStatusError` test so `HasDeviceError()` and
+     the `Failed` status agree.
+   - **The three context commands.** `ArgumentEncodingContext::copyTexture()`,
+     `optimizeTextureForGPUAccess()` and `stretchBlit()`, plus
+     `resolveDepthTexture()` and an extended `resolveTexture()`
+     (`dxmt_context.hpp:603-660`, `dxmt_context.cpp:443-575`). The extension is
+     the important part: `resolveTexture`'s four new arguments are all
+     defaulted, so **every d3d11 call site keeps its exact meaning** — a null
+     `pso` still selects Metal's own `StoreActionStoreAndMultisampleResolve`
+     attachment resolve. A non-null `pso` selects a new shader-resolve branch,
+     which is the only way to express the sub-rect, offset destination or
+     format-converting resolve that d3d9 `StretchRect` needs, and
+     `is_depth` selects the depth-attachment variant. `EncoderType::StretchBlit`
+     + `StretchBlitEncoderData` are new (`dxmt_context.hpp:85-90,206-240`,
+     encode body `dxmt_context.cpp:1276-1320`).
+     `ResolveTextureMode`/`ResolveTextureContext`/`StretchBlitContext` live in
+     `dxmt_command.{hpp,cpp}` next to the other internal-library contexts, and
+     their five shaders (`vs_resolve_msaa`, `fs_resolve_msaa_average`,
+     `fs_resolve_msaa_depth`, `vs_blit_quad`, `fs_blit_quad`) were imported into
+     `dxmt_command.metal:233-315`.
+   - **The texture-view model, done additively** — the one item §7.11 warned
+     was invasive, and it did not have to be. The reference turns
+     `TextureViewKey` from this fork's `unsigned` index into a packed value
+     carrying a descriptor and a mip range; **that change was not taken**,
+     because `dxmt_texture.hpp` is shared with d3d11. Instead:
+     `Texture::fullView` is a `static constexpr TextureViewKey = 0`
+     (`dxmt_texture.hpp:262-267`) — both constructors push the whole-resource
+     descriptor as view 0 and `createView()` only ever appends, so view 0 *is*
+     the full view, as a fact about the constructors rather than about the
+     number; `miplevelCount()` reads `info_.mipmap_level_count`;
+     `checkViewUseMipRange()` and `checkViewUseSwizzle()` are two more
+     derive-or-reuse helpers in the shape of the existing
+     `checkViewUseFormat()` (`dxmt_texture.cpp:302-330`); and
+     `TextureViewDescriptor` gains a `swizzle` field defaulting to the identity
+     (`dxmt_texture.hpp:25-45`), which `createView()` now compares
+     (`dxmt_texture.cpp:106-107`) and `TextureView`'s constructor passes through
+     to `newTextureView` in place of the hard-coded identity it used before
+     (`dxmt_texture.cpp:34-37`). Every d3d11 view keeps the identity swizzle, so
+     it keeps the view it had.
 
-Suggested order for the next session: (1) and (2) first — they are mechanical
-and drop the failing translation units to two — then the render-command
-extension, then completion targets, then the view model last, checking d3d11
-still builds after each step.
+**Presentation (§7.1 re-confirmed against the real code).** `d3d9_swapchain.cpp
+:335` calls `WMT::CreateMetalViewFromHWND`, which on iOS returns the one
+Swift-owned `CAMetalLayer` for every HWND, and hands it to the fork's own
+`Presenter` (`:345`). No conversion is needed in that path and none was added.
+Of the slots a `Present` touches, `CreateMetalViewFromHWND` (72),
+`MetalLayer_nextDrawable` (67), `MetalDrawable_texture` (66) and
+`presentDrawable` (47) carry **no** embedded pointer — their argument structs
+are `uint64_t`/`obj_handle_t` only (`winemetal_thunks.h:17-20,225-230`), so
+sharing the 64-bit handler is correct, not an oversight. The ones that do carry
+a pointer all have `_Foo32` variants already: `MetalLayer_setProps`/`getProps`
+(70/71), `WMTGetDisplayDescription` (96), `MetalLayer_getEDRValue` (97), the
+display-setting trio (99-101), and `MTLRenderCommandEncoder_encodeCommands`
+(38), which is the slot the new render commands ride.
+
+**Still open after this session.**
+
+- **The remote Metal backend does not know the new commands.**
+  `src/winemetal/unix/wmt_remote_pack.h` fails them with
+  `WMTW_PACK_UNSUPPORTED_OP` — loudly and by name, which is the right
+  behaviour and not a fake success, but it means a d3d9 title cannot run with
+  `wmtr_enabled()`. Closing it needs new `WMTW_OP_*` wire ops in
+  `research/remote-metal/`, which is a different component's tree.
+- **Sub-rect fidelity of the colour resolve is untested.** The shader-resolve
+  branch is a faithful port, but nothing has executed it yet; the only resolve
+  the acceptance test exercises is the full-extent MSAA backbuffer one, which
+  takes the unchanged attachment path.
+- **Nothing has run on a device.** Everything above is a compile/link result.
+  §7.9's `d3d9-cube-x86.exe` is built and installed and its launch button is
+  wired (§7.10), so the next step is an IPA and a device run.
+- **Working-tree line endings.** The `research/dxmt` checkout is CRLF in the
+  working tree while git stores LF, and git's stat cache currently hides that
+  (`git status` reports files clean that differ from `HEAD` by line endings
+  alone). Any file touched in this session therefore shows as a whole-file
+  rewrite in `git diff`. Pre-existing, not introduced here, but the commit
+  agent should normalise before committing or the D3D9 diff will be unreadable.
+
+Verified this session: `wsl bash .xtool/build-dxmt.sh` to completion — unix
+side **22/22** translation units OK, `libdxmt_unix.a` 4,400,808 B (was
+4,399,928 B), `libdxmt_combined.a` relinked; i386 PE stage `ninja` exit 0 with
+no new warnings, `d3d9.dll` **3,280,896 B** and `winemetal.dll` 65,536 B both
+**Machine 0x14C**, installed into `app/Madeira/i386-windows/`. `llvm-objdump
+-p` on the installed `d3d9.dll`: imports are exactly `KERNEL32`, `USER32`,
+`GDI32`, `winemetal.dll` and the `api-ms-win-crt-*` sets; exports include
+`Direct3DCreate9`, `Direct3DCreate9Ex`, `Direct3DShaderValidatorCreate9`,
+`DebugSetLevel`/`DebugSetMute` and all seven `D3DPERF_*`. d3d11 still builds:
+the i386 run produced `d3d11.dll` 32,276,480 B, `d3d10core.dll` 2,154,496 B and
+`dxgi.dll` 5,173,248 B (built, deliberately not installed), and a separate
+`build-pe.sh aarch64 --install none` run built the whole aarch64 farm clean
+(`d3d11.dll` 31,870,976 B, Machine 0xAA64) without touching
+`app/Madeira/aarch64-windows/`.
