@@ -1,12 +1,12 @@
 [submodule "FEX"]
 	path = FEX
-	url = https://github.com/willfaust/FEX.git
+	url = https://github.com/125hz/FEX.git
 	branch = ios-port-2607
 [submodule "wine"]
 	path = wine
-	url = https://github.com/willfaust/wine.git
+	url = https://github.com/125hz/wine.git
 	branch = ios-build
 [submodule "research/dxmt"]
 	path = research/dxmt
-	url = https://github.com/willfaust/dxmt.git
+	url = https://github.com/125hz/dxmt.git
 	branch = ios-port
