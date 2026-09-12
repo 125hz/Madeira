@@ -858,8 +858,6 @@ struct ContentView: View {
     /// WOW64_DESIGN.md stage E: every shipped 32-bit (WoW64) test program's
     /// launch button is one entry here — see `actionButtons`.
     private let thirtyTwoBitTests: [(label: String, exe: String)] = [
-        ("32-bit hello", "hello-x86.exe"),
-        ("32-bit window", "window-x86.exe"),
         ("D3D9 cube", "d3d9-cube-x86.exe"),
     ]
 

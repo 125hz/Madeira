@@ -147,6 +147,23 @@ game-specific patches — every change must fix the emulator/runtime generically
 
 ## 6. Status log
 
+- 2026-09-12 — **MILESTONE 4 PASSED (third cube run, IPA 23:58).** The
+  32-bit D3D9 cube rendered on the iPhone: `first DrawPrimitive returned
+  hr 0x00000000`, `present 1..3 hr=0x00000000`, frames 1–240 presented,
+  `done, frames presented = 240`, `MADEIRA-EXIT: d3d9-cube-x86.exe
+  status=43`, no faults, no allocator warnings. Screenshot shows the cube
+  with the far faces visible instead of the near ones: the test's own
+  software back-face culling (signed screen-space area, CULLMODE NONE) has
+  an inverted sign for the y-down XYZRHW space — a test bug, not a
+  renderer bug (the driver drew exactly the submitted triangles). Test
+  being changed to use `D3DCULL_CCW` (exercises the port's cull mapping)
+  and 900 frames. App overlay showed `Present: 240 | FPS: 0.9`; the FPS
+  figure is the app's own counter and needs checking against the 32-bit
+  present path later. Next: 64-bit regression check (x64 DX11 cube) since
+  shared FEXCore/rpmalloc code changed; then M5 (real 32-bit programs:
+  hooks lparam, 32-bit audio/nsi tables, guest threads, SEH, input).
+
+
 - 2026-09-11 — SECOND D3D9 CUBE RUN (IPA 23:32): both previous fixes
   confirmed (`[unixlib] winemetal … -> wow64 table (0x105946d90)`; no x87
   fault). Reached: `Direct3DCreate9 ok`, `device created (software vertex

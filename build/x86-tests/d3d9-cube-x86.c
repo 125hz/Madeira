@@ -21,21 +21,42 @@
  *     is linked -nostdlib, so the only imports are kernel32, user32 and
  *     d3d9 -- all Wine-supplied.  Verified with objdump -p in the build
  *     script.  Nothing here depends on ucrtbase/msvcrt plumbing.
- *   - No libm.  The two rotations are advanced by repeatedly multiplying a
- *     unit rotor by a constant-angle rotor, so there is no runtime sin/cos
- *     and no float-library dependency at all.
+ *   - No libm.  The two rotation angles are driven by wall-clock time (see
+ *     below) rather than frame count, which needs cos/sin of an arbitrary,
+ *     growing angle -- sinf_approx()/cosf_approx() below hand-roll that with
+ *     a range reduction and a fixed-degree Taylor polynomial, so there is
+ *     still no runtime libm call or float-library dependency, just inline
+ *     arithmetic the compiler emits itself.
+ *   - Wall-clock rotation, frame-rate independent.  QueryPerformanceCounter/
+ *     QueryPerformanceFrequency (kernel32) give elapsed seconds since start;
+ *     each rotor's angle is elapsed_seconds * a fixed rad/s rate, so the cube
+ *     turns at the same visual speed whether the app is capped at 30, 60 or
+ *     uncapped at whatever fps.  ll_to_double() below converts the 64-bit
+ *     counter deltas to double using only 32-bit-to-double conversions and a
+ *     float divide -- both single native instructions -- because -nostdlib
+ *     leaves no compiler-rt/libgcc to satisfy a __divdi3/__floatdidf style
+ *     helper call that a direct 64-bit int-to-float cast or a 64-bit integer
+ *     divide might otherwise lower to.
  *   - FVF XYZRHW|DIFFUSE with software vertex processing: vertices are
  *     already in screen space when they reach the device, so the test needs
  *     no transform, lighting or texture state, and no fixed-function vertex
  *     pipeline beyond the bare minimum.
- *   - No depth buffer.  A cube is convex, so back-face rejection alone gives
- *     a correct image.  The rejection is done here on the CPU (sign of the
- *     screen-space signed area) rather than via D3DRS_CULLMODE, so the image
- *     does not depend on the layer's winding convention.
+ *   - Hardware back-face culling.  All 12 triangles of the cube are submitted
+ *     every frame; D3DRS_CULLMODE is D3DCULL_CCW (the Direct3D 9 default), so
+ *     it is the driver's cull-state mapping that rejects the far faces, not
+ *     CPU-side logic.  The `tri[]` index order in build_frame() reverses each
+ *     quad's diagonal split relative to the `face[]` table's CCW-from-outside
+ *     authoring, so that front faces come out clockwise in screen space --
+ *     D3D9's front-facing convention under D3DCULL_CCW.  A cube is convex, so
+ *     that alone gives a correct image with no depth buffer: exactly the
+ *     (up to three) near faces survive culling.  Z test/write stays off by
+ *     default (D3DRS_ZENABLE = D3DZB_FALSE); build with
+ *     -DMADEIRA_D3D9_ZENABLE=1 to flip it on and exercise the depth path
+ *     instead (a matching depth-stencil surface is then created and cleared).
  *
  * Exit status (reported by the runtime as "MADEIRA-EXIT: ... status=<n>"):
- *   43  success -- MADEIRA_D3D9_FRAMES frames presented, or the window was
- *       closed after at least one frame was presented
+ *   43  success -- ran for MADEIRA_D3D9_SECONDS seconds of wall-clock time,
+ *       or the window was closed after at least one frame was presented
  *   20  Direct3DCreate9 returned NULL
  *   21  CreateDevice failed
  *   22  CreateVertexBuffer failed
@@ -48,9 +69,16 @@
 #include <windows.h>
 #include <d3d9.h>
 
-#define MADEIRA_D3D9_FRAMES   240
+#define MADEIRA_D3D9_SECONDS  15
 #define WIN_W                 640
 #define WIN_H                 480
+
+/* Off by default: flip with -DMADEIRA_D3D9_ZENABLE=1 to exercise the depth
+ * path instead of relying purely on D3DRS_CULLMODE (see the header comment
+ * and the SetRenderState/Clear calls in start() below). */
+#ifndef MADEIRA_D3D9_ZENABLE
+#define MADEIRA_D3D9_ZENABLE 0
+#endif
 
 /* -nostdlib: clang may still lower a struct initialisation to a memset or
  * memcpy call, so provide them rather than hoping it does not. */
@@ -95,6 +123,31 @@ static char *put_hex( char *p, unsigned int v )
     int i;
     *p++ = '0'; *p++ = 'x';
     for (i = 28; i >= 0; i -= 4) *p++ = digits[(v >> i) & 0xf];
+    return p;
+}
+
+/* Prints a non-negative float with a fixed number of decimal digits, rounded
+ * to nearest -- no CRT snprintf/dtoa available. */
+static char *put_fixed( char *p, float v, int decimals )
+{
+    unsigned int scale = 1;
+    unsigned int scaled, whole, frac, d;
+    int i;
+
+    if (v < 0.0f) v = 0.0f;
+    for (i = 0; i < decimals; i++) scale *= 10;
+    scaled = (unsigned int)(v * (float)scale + 0.5f);
+    whole  = scaled / scale;
+    frac   = scaled % scale;
+
+    p = put_uint( p, whole );
+    *p++ = '.';
+    d = scale / 10;
+    while (d)
+    {
+        *p++ = (char)('0' + (frac / d) % 10);
+        d /= 10;
+    }
     return p;
 }
 
@@ -175,22 +228,67 @@ static const D3DCOLOR face_color[6] =
     0xffe0e040, 0xff40e0e0, 0xffe040e0,
 };
 
-/* Rotors advanced by a constant-angle multiply each frame: no runtime trig.
- * step_a = 2*pi/180, step_b = 2*pi/300. */
-#define COS_STEP_A  0.99939083f
-#define SIN_STEP_A  0.03489950f
-#define COS_STEP_B  0.99978066f
-#define SIN_STEP_B  0.02094242f
+/* ---------------------------------------------------------- trig, no libm */
 
-/* Fill `out` with the visible triangles for this frame; returns the triangle
- * count (<= 12).  Vertices come out already in screen space, which is what
- * XYZRHW means. */
+#define MADEIRA_PI      3.14159265358979323846f
+#define MADEIRA_TWO_PI  (2.0f * MADEIRA_PI)
+
+/* Range-reduce x into [-PI, PI].  The float-to-int truncation is a native
+ * cvttss2si/fistp instruction, not a runtime call. */
+static float wrap_pi( float x )
+{
+    float k = (float)(int)(x * (1.0f / MADEIRA_TWO_PI));
+    x -= k * MADEIRA_TWO_PI;
+    if (x >  MADEIRA_PI) x -= MADEIRA_TWO_PI;
+    if (x < -MADEIRA_PI) x += MADEIRA_TWO_PI;
+    return x;
+}
+
+/* 7th-order Taylor sine/cosine over the reduced range: plenty accurate for a
+ * spinning test cube, and no libm dependency -- just multiplies and adds. */
+static float sinf_approx( float x )
+{
+    float x2;
+    x = wrap_pi( x );
+    x2 = x * x;
+    return x * (1.0f + x2 * (-1.0f / 6.0f +
+                    x2 * (1.0f / 120.0f +
+                    x2 * (-1.0f / 5040.0f))));
+}
+
+static float cosf_approx( float x )
+{
+    return sinf_approx( x + MADEIRA_PI * 0.5f );
+}
+
+/* Angular rates matching the milestone's original per-frame steps (2*pi/180
+ * and 2*pi/300 at an assumed 60 fps), but now expressed as rad/s so the
+ * rotation is frame-rate independent. */
+#define YAW_RATE_RAD_PER_SEC    (MADEIRA_TWO_PI / 3.0f)   /* full turn / 3s */
+#define PITCH_RATE_RAD_PER_SEC  (MADEIRA_TWO_PI / 5.0f)   /* full turn / 5s */
+
+/* Converts a 64-bit tick delta to a double using only 32-bit-to-double
+ * conversions and 64-bit shifts/subtracts (all native, no compiler-rt call):
+ * -nostdlib means a direct (double)(LONGLONG) cast or a 64-bit integer
+ * divide could silently need a __floatdidf/__divdi3 helper we cannot link. */
+static double ll_to_double( LONGLONG v )
+{
+    LONG  hi = (LONG)(v >> 32);
+    DWORD lo = (DWORD)(v & 0xFFFFFFFFu);
+    return (double)hi * 4294967296.0 + (double)lo;
+}
+
+/* ---------------------------------------------------------- cube geometry */
+
+/* Fill `out` with all 12 triangles for this frame; returns the triangle
+ * count (always 12).  Vertices come out already in screen space, which is
+ * what XYZRHW means.  Back-face rejection is left entirely to the device's
+ * D3DRS_CULLMODE now, so every triangle is submitted regardless of facing. */
 static unsigned int build_frame( struct vertex *out,
                                  float ca, float sa, float cb, float sb,
                                  float width, float height )
 {
     float sx[8], sy[8], sw[8];
-    int visible[8];
     unsigned int tris = 0;
     const float cam_z = 4.5f;            /* camera distance along +Z   */
     const float focal = 0.9f * height;   /* pixels per unit at z = 1   */
@@ -209,9 +307,8 @@ static unsigned int build_frame( struct vertex *out,
         y1 =  y * cb - z1 * sb;
         z2 =  y * sb + z1 * cb;
 
-        z2 += cam_z;
-        if (z2 < 0.1f) { visible[i] = 0; sx[i] = sy[i] = sw[i] = 0.0f; continue; }
-        visible[i] = 1;
+        z2 += cam_z;                     /* always >= ~2.7: cube half-
+                                             diagonal < cam_z, no near clip */
         inv = 1.0f / z2;
         sx[i] = cx + focal * x1 * inv;
         sy[i] = cy - focal * y1 * inv;
@@ -221,36 +318,26 @@ static unsigned int build_frame( struct vertex *out,
     for (f = 0; f < 6; f++)
     {
         const int *q = face[f];
-        float ax, ay, bx, by, area;
+        /* Reversed relative to face[]'s CCW-from-outside quad authoring: a
+         * quad (q0,q1,q2,q3) is split here as (q0,q2,q1) and (q0,q3,q2), the
+         * mirror image of the natural (q0,q1,q2)/(q0,q2,q3) split.  That
+         * makes front (camera-facing) triangles wind clockwise in screen
+         * space, which is D3D9's front-facing convention under the default
+         * D3DRS_CULLMODE = D3DCULL_CCW. */
+        static const int tri[6] = { 0, 2, 1, 0, 3, 2 };
+        int k;
 
-        if (!visible[q[0]] || !visible[q[1]] || !visible[q[2]] || !visible[q[3]])
-            continue;
-
-        /* Screen-space signed area of the first triangle.  For a convex
-         * solid this is exactly the back-face test, so no depth buffer and
-         * no reliance on the layer's D3DRS_CULLMODE convention. */
-        ax = sx[q[1]] - sx[q[0]];
-        ay = sy[q[1]] - sy[q[0]];
-        bx = sx[q[2]] - sx[q[0]];
-        by = sy[q[2]] - sy[q[0]];
-        area = ax * by - ay * bx;
-        if (area <= 0.0f) continue;
-
+        for (k = 0; k < 6; k++)
         {
-            static const int tri[6] = { 0, 1, 2, 0, 2, 3 };
-            int k;
-            for (k = 0; k < 6; k++)
-            {
-                int c = q[tri[k]];
-                out->x     = sx[c];
-                out->y     = sy[c];
-                out->z     = 0.5f;          /* no depth test in use */
-                out->rhw   = sw[c];
-                out->color = face_color[f];
-                out++;
-            }
-            tris += 2;
+            int c = q[tri[k]];
+            out->x     = sx[c];
+            out->y     = sy[c];
+            out->z     = 0.5f;
+            out->rhw   = sw[c];
+            out->color = face_color[f];
+            out++;
         }
+        tris += 2;
     }
     return tris;
 }
@@ -293,7 +380,9 @@ void start( void )
     IDirect3DDevice9 *dev = NULL;
     IDirect3DVertexBuffer9 *vb = NULL;
     unsigned int frame, presented = 0;
-    float ca = 1.0f, sa = 0.0f, cb = 1.0f, sb = 0.0f;
+    LARGE_INTEGER qpc_freq, qpc_start, qpc_now;
+    double freq_d, total_elapsed_d;
+    float total_elapsed, avg_fps;
     HRESULT hr;
 
     out_str( "MADEIRA-D3D9: 32-bit D3D9 cube starting\n" );
@@ -335,7 +424,12 @@ void start( void )
     pp.BackBufferWidth        = WIN_W;
     pp.BackBufferHeight       = WIN_H;
     pp.hDeviceWindow          = hwnd;
+#if MADEIRA_D3D9_ZENABLE
+    pp.EnableAutoDepthStencil = TRUE;
+    pp.AutoDepthStencilFormat = D3DFMT_D16;
+#else
     pp.EnableAutoDepthStencil = FALSE;
+#endif
     pp.PresentationInterval   = D3DPRESENT_INTERVAL_IMMEDIATE;
 
     hr = IDirect3D9_CreateDevice( d3d, D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hwnd,
@@ -358,18 +452,47 @@ void start( void )
     out_str( "MADEIRA-D3D9: dynamic vertex buffer created\n" );
 
     IDirect3DDevice9_SetRenderState( dev, D3DRS_LIGHTING, FALSE );
-    IDirect3DDevice9_SetRenderState( dev, D3DRS_ZENABLE, D3DZB_FALSE );
-    IDirect3DDevice9_SetRenderState( dev, D3DRS_CULLMODE, D3DCULL_NONE );
+    IDirect3DDevice9_SetRenderState( dev, D3DRS_ZENABLE,
+                                     MADEIRA_D3D9_ZENABLE ? D3DZB_TRUE : D3DZB_FALSE );
+    IDirect3DDevice9_SetRenderState( dev, D3DRS_CULLMODE, D3DCULL_CCW );
     IDirect3DDevice9_SetFVF( dev, FVF_CUBE );
 
-    for (frame = 0; frame < MADEIRA_D3D9_FRAMES; frame++)
+    {
+        char buf[64];
+        char *p = buf;
+        const char *s = "MADEIRA-D3D9: cull=CCW z=";
+        while (*s) *p++ = *s++;
+        s = MADEIRA_D3D9_ZENABLE ? "on" : "off";
+        while (*s) *p++ = *s++;
+        s = " seconds=";
+        while (*s) *p++ = *s++;
+        p = put_uint( p, MADEIRA_D3D9_SECONDS );
+        *p++ = '\n';
+        *p = 0;
+        out_str( buf );
+    }
+
+    QueryPerformanceFrequency( &qpc_freq );
+    QueryPerformanceCounter( &qpc_start );
+    freq_d = ll_to_double( qpc_freq.QuadPart );
+
+    for (frame = 0; ; frame++)
     {
         void *locked = NULL;
-        unsigned int tris;
-        float nca, ncb;
+        unsigned int tris, clear_flags;
+        float elapsed_seconds, angle_a, angle_b, ca, sa, cb, sb;
 
         pump();
         if (window_closed) break;
+
+        QueryPerformanceCounter( &qpc_now );
+        elapsed_seconds = (float)(ll_to_double( qpc_now.QuadPart - qpc_start.QuadPart ) / freq_d);
+        if (elapsed_seconds >= (float)MADEIRA_D3D9_SECONDS) break;
+
+        angle_a = elapsed_seconds * YAW_RATE_RAD_PER_SEC;
+        angle_b = elapsed_seconds * PITCH_RATE_RAD_PER_SEC;
+        ca = cosf_approx( angle_a ); sa = sinf_approx( angle_a );
+        cb = cosf_approx( angle_b ); sb = sinf_approx( angle_b );
 
         hr = IDirect3DVertexBuffer9_Lock( vb, 0, 0, &locked, D3DLOCK_DISCARD );
         if (FAILED(hr) || !locked)
@@ -382,7 +505,8 @@ void start( void )
         tris = build_frame( locked, ca, sa, cb, sb, (float)WIN_W, (float)WIN_H );
         IDirect3DVertexBuffer9_Unlock( vb );
 
-        IDirect3DDevice9_Clear( dev, 0, NULL, D3DCLEAR_TARGET,
+        clear_flags = D3DCLEAR_TARGET | (MADEIRA_D3D9_ZENABLE ? D3DCLEAR_ZBUFFER : 0);
+        IDirect3DDevice9_Clear( dev, 0, NULL, clear_flags,
                                 D3DCOLOR_XRGB( 24, 28, 40 ), 1.0f, 0 );
         if (SUCCEEDED(IDirect3DDevice9_BeginScene( dev )))
         {
@@ -409,15 +533,12 @@ void start( void )
         }
         presented++;
         if (frame == 0 || frame == 1 || ((frame + 1) % 60) == 0) log_frame( frame + 1 );
-
-        /* advance both rotors */
-        nca = ca * COS_STEP_A - sa * SIN_STEP_A;
-        sa  = sa * COS_STEP_A + ca * SIN_STEP_A;
-        ca  = nca;
-        ncb = cb * COS_STEP_B - sb * SIN_STEP_B;
-        sb  = sb * COS_STEP_B + cb * SIN_STEP_B;
-        cb  = ncb;
     }
+
+    QueryPerformanceCounter( &qpc_now );
+    total_elapsed_d = ll_to_double( qpc_now.QuadPart - qpc_start.QuadPart ) / freq_d;
+    total_elapsed   = (float)total_elapsed_d;
+    avg_fps         = (total_elapsed > 0.0f) ? ((float)presented / total_elapsed) : 0.0f;
 
     if (vb)  IDirect3DVertexBuffer9_Release( vb );
     if (dev) IDirect3DDevice9_Release( dev );
@@ -431,11 +552,17 @@ void start( void )
     }
 
     {
-        char buf[80];
+        char buf[128];
         char *p = buf;
         const char *s = "MADEIRA-D3D9: done, frames presented = ";
         while (*s) *p++ = *s++;
         p = put_uint( p, presented );
+        s = ", seconds = ";
+        while (*s) *p++ = *s++;
+        p = put_fixed( p, total_elapsed, 2 );
+        s = ", avg fps = ";
+        while (*s) *p++ = *s++;
+        p = put_fixed( p, avg_fps, 1 );
         *p++ = '\n';
         *p = 0;
         out_str( buf );
