@@ -147,6 +147,25 @@ game-specific patches — every change must fix the emulator/runtime generically
 
 ## 6. Status log
 
+- 2026-09-11 — SECOND D3D9 CUBE RUN (IPA 23:32): both previous fixes
+  confirmed (`[unixlib] winemetal … -> wow64 table (0x105946d90)`; no x87
+  fault). Reached: `Direct3DCreate9 ok`, `device created (software vertex
+  processing)`, `dynamic vertex buffer created`, `first locked vertex
+  pointer 0x0164a000` (guest), `frame 1`, `frame 2` — a 32-bit D3D9 device
+  on Metal with draw calls through the thunks. Two remaining bugs: (A)
+  survivable — `NtUserCallTwoParam`/`GetMonitorInfo` MONITORINFO* forwarded
+  as a ULONG by wow64win (`get_monitor_info` read guest 0xc1f75c); (B)
+  fatal — on DXMT worker threads, `dispatch_data_create` copied from
+  `0x7159db4800` (= B + low32 of a HOST pointer): the compiled DXSO
+  bitcode is returned to the 32-bit caller as a host pointer, truncated,
+  then rebased by the `newLibrary` 32-bit thunk. Fix assigned (Opus):
+  NtUserCall*Param pointer-code classification; bitcode kept host-side by
+  handle (mirror SM50 thunk32 pattern), audit of host-pointer results.
+  User observation: live view stayed black during frames 1–2 (no clear
+  colour visible) — presentation not yet confirmed; a present log line is
+  being added to the cube test.
+
+
 - 2026-09-11 — FIRST D3D9 CUBE RUN (IPA 22:13): i386 `d3d9.dll` and
   `winemetal.dll` loaded; two independent bugs. (1) `load_builtin_unixlib`
   named the i386 winemetal `(unknown)` and bound the stub table: the PE

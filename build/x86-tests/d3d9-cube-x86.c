@@ -112,6 +112,24 @@ static void log_step( const char *what, unsigned int hr )
     out_str( buf );
 }
 
+/* One line per presented frame for the first few frames: the frame number and
+ * the HRESULT Present actually returned.  `frame N` below is only printed once
+ * Present has already succeeded, so it cannot show a Present that returned a
+ * failure code or one that never returned at all. */
+static void log_present( unsigned int frame, unsigned int hr )
+{
+    char buf[96];
+    char *p = buf;
+    const char *s = "MADEIRA-D3D9: present ";
+    while (*s) *p++ = *s++;
+    p = put_uint( p, frame );
+    *p++ = ' '; *p++ = 'h'; *p++ = 'r'; *p++ = '=';
+    p = put_hex( p, hr );
+    *p++ = '\n';
+    *p = 0;
+    out_str( buf );
+}
+
 static void log_frame( unsigned int frame )
 {
     char buf[64];
@@ -371,12 +389,14 @@ void start( void )
             if (tris)
             {
                 IDirect3DDevice9_SetStreamSource( dev, 0, vb, 0, sizeof(struct vertex) );
-                IDirect3DDevice9_DrawPrimitive( dev, D3DPT_TRIANGLELIST, 0, tris );
+                hr = IDirect3DDevice9_DrawPrimitive( dev, D3DPT_TRIANGLELIST, 0, tris );
+                if (!frame) log_step( "first DrawPrimitive returned hr", (unsigned int)hr );
             }
             IDirect3DDevice9_EndScene( dev );
         }
 
         hr = IDirect3DDevice9_Present( dev, NULL, NULL, NULL, NULL );
+        if (frame < 3) log_present( frame + 1, (unsigned int)hr );
         if (FAILED(hr))
         {
             log_step( "Present failed, hr", (unsigned int)hr );
