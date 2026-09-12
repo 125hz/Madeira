@@ -147,6 +147,27 @@ game-specific patches — every change must fix the emulator/runtime generically
 
 ## 6. Status log
 
+- 2026-09-11 — D3D9 stages 3 and 5 landed; stage 4 imported but not yet
+  compiling (Opus; details in §7.11). Licensing decision received from the
+  fork owner: import under LGPL-2.1 §3 → GPL-3.0-or-later, so §7.2 is
+  resolved and the notices are written (`research/dxmt/COPYING.LIB`,
+  `research/dxmt/LICENSE-MADEIRA.md`, `THIRD-PARTY-NOTICES.md`).
+  **Stage 3 done:** the DXSO/FFP airconv path compiles for iOS arm64 with
+  only three additions to this fork's airconv (`air::InputPointCoord`,
+  `OutputPointSize` in `FunctionOutput`, `AIRBuilder::FPBinOp::pow`) —
+  22/22 unix translation units OK. **Stage 5 done:** both dispatch tables are
+  now 150 slots (127-144 NULL by design, DXSO at 145-149) and the wow64 table
+  has 38 new `_Foo32` variants that convert every embedded pointer with the
+  guest-window conversion; `MTLDevice_newBuffer` refuses the Metal-allocated
+  path loudly per §7.5. `gen_remote_guard.py` extended first (per-array guard
+  set + base→base32 map), both generated headers regenerated. **Stage 4:**
+  all 71 `src/d3d9` files imported; 16 of 21 translation units compile as
+  i386 PE, 5 fail with 107 errors from 39 distinct `src/dxmt` APIs that
+  postdate this fork — inventory in §7.11. The module is behind
+  `-Denable_d3d9=true` so the tree keeps building. Also fixed:
+  `.xtool/build-dxmt.sh` ran the workspace's stale copy of
+  `build/dxmt-ios/build.sh`, so edits to the unix file list were silently
+  ignored.
 - 2026-09-11 — ELEVENTH DEVICE RUN (IPA 19:22): `window-x86.exe` printed
   `created hwnd` and exited with the expected `status=43` — RegisterClass,
   CreateWindowEx, timer, DestroyWindow, PostQuitMessage, message loop and
@@ -192,6 +213,24 @@ game-specific patches — every change must fix the emulator/runtime generically
   accounting in the CPU module corrupted once user32 traffic starts. Both
   assigned (Opus, one agent, A then B). Commit agent resumed after the
   user set git identity.
+- 2026-09-11 — CHECKPOINT COMMITTED (local, not pushed): wine `97f11fd`
+  (17 files), FEX `7b51304` (29 files; nested `External/rpmalloc`
+  submodule committed first at `45f8676`), top-level `e5bb022` (49
+  files). Excluded on purpose: `research/dxmt` pointer, `build/dxmt-ios/*`
+  (D3D9 track, to be committed at its checkpoint). Stray untracked
+  scratch files at top level to delete before the next commit:
+  `FEX-status.tmp`, `diag-static.txt`. Commit procedure: one-off
+  `git -c core.autocrlf=true` per command; explicit paths at top level.
+- 2026-09-11 — PUSHED to the user's GitHub (never to willfaust/*; no
+  PRs). Forks `125hz/{wine,FEX,rpmalloc,dxmt}`; every submodule's
+  `origin` now points at the 125hz fork, `upstream` = willfaust
+  fetch-only with push URL `DISABLED`. Pushed: wine `ios-build` @
+  `97f11fd`, FEX `ios-port-2607` @ `afe2580` (adds `.gitmodules` →
+  125hz/rpmalloc), rpmalloc `ios-madeira` @ `45f8676`, dxmt `ios-port` @
+  `b4b89f0` (unchanged). Top-level `.gitmodules` now points at the forks;
+  `main` @ `09d949e` pushed to `125hz/Madeira`. Scratch files deleted.
+  Revert path: `git checkout 09d949e && git submodule update --init` on
+  a fresh clone of `125hz/Madeira` reproduces this state.
 
 
 - 2026-09-11 — **MILESTONE 1 PASSED (ninth device run).** `hello-x86.exe`
@@ -1019,17 +1058,23 @@ Consequences:
   worth telling whoever maintains it.
 
 This is a licensing decision for the fork owner, not something a port commit
-should settle. **Stage 3 onward is blocked on it.**
+should settle. ~~**Stage 3 onward is blocked on it.**~~ **Decided
+2026-09-11: proceed** — import under LGPL-2.1 §3, converting the copy
+distributed here to GPL-3.0-or-later, exactly as this repository already did
+for its Wine fork. The notices that decision requires are written (§7.11);
+`research/dxmt/LICENSE` deliberately stays MIT, because it states the terms of
+what this fork took from *its* upstream, and the imported files are listed
+separately in `research/dxmt/LICENSE-MADEIRA.md`.
 
 ### 7.3 Stages and file ownership
 
 | Stage | Owner | Files | State |
 |---|---|---|---|
 | 1. i386 PE build stage; acceptance test; guest-pointer conversion mechanism | DXMT | `build/dxmt-ios/build-pe.sh`, `.xtool/build-dxmt.sh`, `build/x86-tests/d3d9-cube-x86.{c,exe}`, `build/x86-tests/build-d3d9-cube.sh`, `research/dxmt/{meson.build,src/winemetal/unix/winemetal_unix.c}` | **done, §7.8** |
-| 2. Licensing decision + notices | fork owner | `research/dxmt/{LICENSE,COPYING.LIB}`, `LICENSE-MADEIRA.md`, `THIRD-PARTY-NOTICES.md` | **blocks 3–5** |
-| 3. airconv DXSO/FFP import | DXMT | `research/dxmt/src/airconv/{dxso_header.hpp,dxso_decoder.hpp,dxso_compile.{hpp,cpp},ffp_compile.{hpp,cpp}}`, the DXSO half of `airconv_public.h`, deltas to `nt/air_builder.*`/`air_signature.*`/`air_operations.cpp`/`air_type.cpp`, `src/airconv/meson.build` | not started |
-| 4. `src/d3d9` import + API reconciliation | DXMT | `research/dxmt/src/d3d9/**`, `src/meson.build` | not started |
-| 5. Slot + wow64 table completion | DXMT | `src/winemetal/airconv_thunks.{h,c}`, `src/winemetal/unix/winemetal_unix.c`, regenerate `wmt_api_names.h` + `unix/wmt_remote_guard.h`, extend `gen_remote_guard.py` | mechanism done, 37+5 slots outstanding |
+| 2. Licensing decision + notices | fork owner | `research/dxmt/{LICENSE,COPYING.LIB}`, `LICENSE-MADEIRA.md`, `THIRD-PARTY-NOTICES.md` | **done** — proceed under LGPL-2.1 §3 → GPL-3.0-or-later, notices written (§7.11) |
+| 3. airconv DXSO/FFP import | DXMT | `research/dxmt/src/airconv/{dxso_header.hpp,dxso_decoder.hpp,dxso_compile.{hpp,cpp},ffp_compile.{hpp,cpp}}`, the DXSO half of `airconv_public.h`, deltas to `nt/air_builder.*`/`air_signature.*`/`air_operations.cpp`/`air_type.cpp`, `src/airconv/meson.build` | **done, §7.11** |
+| 4. `src/d3d9` import + API reconciliation | DXMT | `research/dxmt/src/d3d9/**`, `src/meson.build` | **imported; 16/21 TUs compile**, reconciliation inventory in §7.11 |
+| 5. Slot + wow64 table completion | DXMT | `src/winemetal/airconv_thunks.{h,c}`, `src/winemetal/unix/winemetal_unix.c`, regenerate `wmt_api_names.h` + `unix/wmt_remote_guard.h`, extend `gen_remote_guard.py` | **done, §7.11** (38 + 5 slots) |
 | 6. 32-bit unixlib table selection | WINE | `build/ntdll-unix/virtual_ios.c` static-link fallback | **hand-off, §7.10** |
 | 7. Launch button | APP | `app/Madeira/ContentView.swift` `thirtyTwoBitTests` | **hand-off, §7.10** |
 | 8. IPA + device test | BUILD | `.xtool/build.sh` | after 3–7 |
@@ -1311,8 +1356,11 @@ It logs `MADEIRA-D3D9:` progress lines throughout, including the first
    `<prefix>_unix_call_wow64_funcs` — so the fix is one shared mechanism, not
    a one-off. Until it lands, a 32-bit DXMT module gets `thunk_SM50*` instead
    of `thunk32_SM50*`.
-2. **APP — launch button.** Add one entry to `thirtyTwoBitTests`
-   (`app/Madeira/ContentView.swift:858-863`), which is a
+   **Done** — `ios_bind_unixlib_table()` now picks by bitness (see the
+   2026-09-11 log entry); with stage 5 below, a 32-bit DXMT module gets the
+   `_Foo32` variants.
+2. **APP — launch button. Done:** the one entry is in `thirtyTwoBitTests`
+   (`app/Madeira/ContentView.swift:858-864`), which is a
    `[(label: String, exe: String)]` rendered with `id: \.exe` at `:1518-1531`:
    `("D3D9 cube", "d3d9-cube-x86.exe"),`. Nothing else — the renderer already
    sets `MADEIRA_EXE`, and `WineProcessBridge.m` detects i386 by real PE
@@ -1320,4 +1368,177 @@ It logs `MADEIRA-D3D9:` progress lines throughout, including the first
    `C:\windows\syswow64\d3d9-cube-x86.exe` (`:918-925`). The exe is already
    installed in `app/Madeira/i386-windows/`, which the probe at `:688-690`
    requires.
-3. **Fork owner — licensing (§7.2).**
+3. **Fork owner — licensing (§7.2). Done** — proceed, see §7.11.
+
+### 7.11 Stages 2, 3 and 5 — what landed; stage 4's remaining inventory
+
+**Stage 2, licensing (done).** The fork owner's decision is to import under
+LGPL-2.1 §3, converting the copy distributed here to GPL-3.0-or-later. Written
+in the same change as the first imported file:
+
+- `research/dxmt/COPYING.LIB` — the LGPL-2.1 text from the tag (new file).
+- `research/dxmt/LICENSE-MADEIRA.md` — a new section naming the origin, tag and
+  commit, the upstream licence, the §3 conversion, and a file-by-file list
+  separating whole-file imports from blocks spliced into existing files.
+  `research/dxmt/LICENSE` stays MIT on purpose: it states the terms of what
+  this fork took from *its* upstream.
+- `THIRD-PARTY-NOTICES.md` — a "DXMT — Direct3D 9 / DXSO frontend" row
+  (origin, tag, commit, LGPL-2.1-or-later, §3 conversion) plus a pointer from
+  the per-fork-notice list. It also records that describing these modules as
+  MIT is wrong for this tag.
+
+**Stage 3, DXSO/FFP (done).** Imported whole from the tag:
+`src/airconv/{dxso_header.hpp,dxso_decoder.hpp,dxso_compile.{hpp,cpp},ffp_compile.{hpp,cpp}}`
+(6 files, 7,373 lines). The fork's airconv needed exactly **three** additions,
+not the wholesale header deltas §7.3 budgeted for:
+
+- `air::InputPointCoord` + its `FunctionInput` slot and AIR metadata arm
+  (`air.point_coord`, float2) — PS point-sprite substitution.
+- `OutputPointSize` added to the `FunctionOutput` variant (the struct and the
+  mesh-output arm already existed) + its `air.point_size` arm.
+- `AIRBuilder::FPBinOp::pow` (one enum value, one `FnNames[]` entry).
+
+Deliberately **not** taken from the reference's `airconv_public.h`: its
+`AIRCONV_VERSION`, `SM50_BINDING_INDEX`, `SM50_SHADER_FLAG` (which adds a
+`flags` field to `SM50_SHADER_COMMON_DATA`, an SM50 wire-format change),
+`SM50_SHADER_ROOT_SIGNATURE` and the `ShaderType` relocation. DXSO references
+none of them and this fork's d3d11 depends on the current SM50 layout.
+
+**Stage 5, slots and the wow64 table (done).** Both tables are now **150**
+entries. 127–144 are `NULL` by design (§7.4 rule 5) so DXSO sits at the
+reference's own numbers, 145–149; ntdll fails a NULL slot rather than
+dispatching it. `airconv_thunks.{h,c}` carry the five PE-side `DXSO*` thunks
+(`winemetal.dll` exports them: ordinals 7–11), and the unix side carries
+`thunk_DXSO*` plus `thunk32_DXSOInitialize/Compile/GetCompiledBitcode` and the
+imported 32-bit argument-chain converter — which needed no arithmetic change
+because this tree's `UInt32ToPtr` is already the `+B` conversion (§7.8).
+
+The **38** shared slots that dereference caller memory now have `_Foo32`
+variants in the wow64 table. They reuse the 64-bit argument struct rather than
+a `*_params32` mirror, because every embedded pointer is a
+`WMTMemoryPointer`/`WMTConstMemoryPointer` — 8 bytes on both sides — so the
+blocks are layout-identical and only the pointer *values* differ. Each variant
+converts in place, calls the 64-bit handler, and restores the guest values
+(the block is the guest's own memory and DXMT reads its fields again).
+
+| Slot(s) | Conversion |
+|---|---|
+| 8 `NSString_getCString` | `buffer_ptr` (raw `uint64_t` holding a guest pointer; the buffer is OUT, the pointer IN) |
+| 18 `MTLDevice_newBuffer` | `info` → `WMTBufferInfo`, then `info->memory.ptr`; **refuses** the Metal-allocated path per §7.5 unless the storage mode is Private/Memoryless (where the handler leaves the field NULL); `gpu_address` untouched |
+| 19, 20, 21, 120 | `info` (sampler / depth-stencil / texture / shared texture descriptors: handles and scalars only below) |
+| 22 `MTLBuffer_newTexture` | `info` |
+| 26 `MTLLibrary_newFunction` | `arg` is a guest pointer to the function-name string, not a value |
+| 29, 34, 35 pipeline states | `info`, then `info->binary_archives_for_lookup` (second level; the archive handles inside are host handles) |
+| 32 `renderCommandEncoder` | `arg` → `WMTRenderPassInfo` |
+| 36, 37, 38 `*_encodeCommands` | the whole `wmtcmd_*` chain: every node's `next` at every hop, plus the payload pointer of `render_setbytes` / `render_setviewports` / `render_setscissorrects` / `compute_setbytes`; converted forward, then converted back node by node |
+| 45 `MTLTexture_replaceRegion` | `data` |
+| 54 `startCapture` | `info`, then `info->output_url` |
+| 56, 57, 58 scalers | `info` / `props` |
+| 60, 61 `NSString_string`/`alloc_init` | `buffer_ptr` |
+| 70, 71 `MetalLayer_set/getProps` | `arg` (71 is INOUT) |
+| 91 `MTLLogContainer_enumerate` | `buffer` (OUT array of handles) |
+| 96, 97 | `arg` (display description / EDR value, OUT) |
+| 98 `newFunctionWithConstants` | `name`, `constants`, then every `constants[i].data` (second level, array) |
+| 99, 100, 101 display settings | `hdr_metadata` |
+| 107 `MTLBuffer_updateContents` | `data` |
+| 114 `DispatchData_alloc_init` | its `handle` field is the BYTES pointer, not a handle (`arg` is the length) |
+| 115–119 `cache.c` | `path` / `key` |
+
+`gen_remote_guard.py` was extended **first**, as §7.4 rule 6 warned: it now
+reads both tables, keeps a per-array guarded set and a base→base32 map, and
+emits `_rmg_Foo32` wrappers (inside `#ifndef DXMT_NATIVE`) for exactly the 10
+variants whose 64-bit twin is guarded — previously it would have rewritten
+`_rmg_Foo32` back to `_Foo32` and stripped the guard. It also refuses to run if
+the two tables differ in length. `wmt_api_names.h` (150 entries) and
+`unix/wmt_remote_guard.h` (49 guards, 10 of them 32-bit) were regenerated in
+the same change; `gen_api_names.py` now strips the `_rmg_` wrapper prefix, so
+regenerating the census no longer renames every guarded slot to
+`rmg_<api>` (its committed copy predated the guards). The `NULL` block is written one entry per line because both
+generators read the table with a per-line regex.
+
+Verified: `wsl bash .xtool/build-dxmt.sh` to completion — unix side 22/22
+translation units OK (was 20; `dxso_compile` and `ffp_compile` are new),
+`libdxmt_unix.a` 4,399,928 B (was 3,927,648 B), `libdxmt_combined.a` relinked;
+i386 PE stage `ninja` exit 0 with `winemetal.dll` 65,536 B, Machine 0x14C,
+installed into `app/Madeira/i386-windows/` and now exporting `DXSOCompile`,
+`DXSODestroy`, `DXSODestroyBitcode`, `DXSOGetCompiledBitcode`,
+`DXSOInitialize`. Build-integration bug found and fixed on the way:
+`.xtool/build-dxmt.sh` ran `$MADEIRA_WORK/build/dxmt-ios/build.sh`, which is
+part of the `git archive HEAD` export, so the new translation units were
+silently ignored; it now refreshes that copy from the tracked tree the same way
+it refreshes the submodule.
+
+**Stage 4, `src/d3d9` (imported, not compiling).** All **71** files of
+`src/d3d9` are imported (31,544 lines, including `meson.build`, `d3d9.def` and
+`version.rc`) and wired into `src/meson.build`. **16 of the 21 translation
+units already compile as i386 PE**; 5 fail, with **107 errors from 39 distinct
+causes**, all of them `src/dxmt`/`src/util` APIs that postdate this fork
+(`d3d9_device.cpp` 77, `d3d9_swapchain.cpp` 23, `d3d9_clear_quad.cpp` 3,
+`d3d9_texture.cpp` 2, `d3d9_buffer.cpp` 1, `d3d9_interface.cpp` 1). The module
+is therefore behind a `MADEIRA-TEMP` meson option, `-Denable_d3d9=true`, so the
+rest of the tree keeps building; `build-pe.sh` already defaults to installing
+`d3d9.dll` when it exists. There is no i386 `d3d9.dll` in
+`app/Madeira/i386-windows/` to replace — Wine's wined3d-based one was only ever
+built for the two 64-bit farms, so the §7.7 shadowing concern stands unchanged.
+`d3d9` needs **no** `dxgi`: its meson dependencies are `util_dep`,
+`winemetal_dep`, `airconv_forward_dep`, `dxmt_dep`, and `dxmt_dep` pulls in
+`winemetal` only.
+
+The remaining work, grouped by the kind of change it needs:
+
+1. **Pure renames (adapt the imported call sites, ~19 errors).**
+   `ResourceAccess::Read/Write` → `DXMT_ENCODER_RESOURCE_ACESS_READ/WRITE`
+   (15; note the upstream typo in the fork's spelling);
+   `resolve_texture_cmd(...)` → the fork's `resolveTexture(src, src_view, dst,
+   dst_view)` (3, plus `ResolveTextureMode`/`ResolveTextureContext`);
+   `signalEventByHandle(handle, value)` → the fork's
+   `signalEvent(WMT::Reference<WMT::Event>&&, value)` (7) — check the
+   ownership convention before mapping it.
+2. **Additive back-ports from the tag, each self-contained (~20 errors).**
+   `wsi::foregroundWindow()` (`src/util/wsi_window.hpp` + the win32/headless
+   implementations, 5); `Recall_sRGB_ForRenderTarget()`
+   (`src/dxmt/dxmt_format.hpp`, 4); `RingBumpState::preallocate()` /
+   `seal_latest()` and its extra constructor argument (8);
+   `CommandQueue::HasDeviceError()`, `FrameLatencySignaled()`,
+   `WaitFrameLatency()` (3); `Presenter::setDisplaySyncEnabled()` (1);
+   `GetDXMTShaderCacheDirectory()` (1); `BufferAllocation::length` (2);
+   `TextureAllocation::buffer` (2); `Buffer::mapped_address`'s second
+   argument (1).
+3. **Mechanism back-ports (real work).**
+   - `GpuCompletionStatus` + `GpuCompletionTarget` + `CommandChunk::
+     addCompletionTarget()` (6 errors, and the `expected class name` /
+     `only virtual member functions can be marked 'final'` pair in
+     `d3d9_swapchain.cpp` are the same thing): the reference's per-chunk
+     completion-callback mechanism, which the fork's command queue does not
+     have.
+   - `ArgumentEncodingContext::copyTexture()` (3),
+     `stretch_blit_cmd` + `StretchBlitContext` (4 + 1) and
+     `optimizeTextureForGPUAccess()` (1): three encoder commands the fork's
+     context lacks. The stretch blit is a filtered copy and needs its
+     internal-library shader too.
+   - Four new render commands — `WMTRenderCommandSetVertexTexture`,
+     `SetVertexSamplerState`, `SetFragmentSamplerState`, `SetBlendFactor` —
+     with a `wmtcmd_render_setsamplerstate` record (8 errors). Direct3D 9
+     binds textures and samplers through Metal's argument *table* rather than
+     an argument buffer, which d3d11 never needed. This is a winemetal ABI
+     extension: append the enum values (never insert), add the struct, handle
+     them in `_MTLRenderCommandEncoder_encodeCommands`, and remember the new
+     records ride the same guest chain, so `wow_cmd_payload()` must learn any
+     payload pointer they carry.
+   - The **texture-view model** (13 `Texture::fullView`, 3 `miplevelCount`,
+     3 `checkViewUseMipRange`, 1 `checkViewUseSwizzle`, 1
+     `TextureViewDescriptor::swizzle`). This is the one genuinely invasive
+     item: the reference turned `TextureViewKey` from this fork's `unsigned`
+     index into a value carrying a descriptor plus a mip range, and added a
+     swizzle to the view descriptor. `Texture::fullView` maps to view `0` in
+     this fork (the constructor's view 0 spans every mip), and the mip-range
+     and swizzle checks are what D3DSAMP_MAXMIPLEVEL and the signed/INTZ
+     formats need. `dxmt_texture.hpp` is shared with d3d11, so this must be
+     done additively (new overloads alongside the existing view model) or as
+     a deliberate, separately verified change to both frontends — not by
+     swapping the header for the reference's.
+
+Suggested order for the next session: (1) and (2) first — they are mechanical
+and drop the failing translation units to two — then the render-command
+extension, then completion targets, then the view model last, checking d3d11
+still builds after each step.

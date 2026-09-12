@@ -860,6 +860,7 @@ struct ContentView: View {
     private let thirtyTwoBitTests: [(label: String, exe: String)] = [
         ("32-bit hello", "hello-x86.exe"),
         ("32-bit window", "window-x86.exe"),
+        ("D3D9 cube", "d3d9-cube-x86.exe"),
     ]
 
     enum JITStatus {

@@ -59,7 +59,8 @@ echo "=== airconv (C++ 20, needs LLVM headers) ==="
 for cpp in airconv_context.cpp air_type.cpp air_signature.cpp air_operations.cpp \
            dxbc_converter.cpp dxbc_converter_gs.cpp dxbc_converter_ts.cpp \
            dxbc_converter_basicblock.cpp dxbc_converter_cfg.cpp \
-           dxbc_instructions.cpp dxbc_signature.cpp metallib_writer.cpp; do
+           dxbc_instructions.cpp dxbc_signature.cpp metallib_writer.cpp \
+           dxso_compile.cpp ffp_compile.cpp; do
     name=$(basename "$cpp" .cpp)
     compile_cxx "$DXMT_SRC/airconv/$cpp" "$name"
 done

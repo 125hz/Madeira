@@ -15,6 +15,7 @@ dependency license texts are in `LICENSES/`. See "Why GPL-3.0-or-later" below.
 | **Wine** | LGPL-2.1-or-later | **GPL-3.0-or-later** | Fork relicensed under LGPL-2.1 §3, which expressly permits applying the ordinary GPL to a copy. `ntdll`, `wineserver`, `win32u`, ARM64EC loader modified for iOS. |
 | **FEX-Emu** | MIT | upstream MIT + **modifications GPL-3.0-or-later** | Forked. x86-64 → ARM64 translation. |
 | **DXMT** | MIT | upstream MIT + **modifications GPL-3.0-or-later** | Forked. D3D11 → Metal. |
+| **DXMT — Direct3D 9 / DXSO frontend** | **LGPL-2.1-or-later** | **GPL-3.0-or-later** | Imported into `research/dxmt` from a different fork of the same upstream: `https://github.com/dacevedo12/dxmt.git`, tag `v0.4-d3d9`, commit `e8dd4c656dcb74a6d970a30a397d1558b0e3fb2b` ("Copyright (c) 2023-2026 Feifan He for CodeWeavers"). That tag postdates upstream's MIT→LGPL relicense, so it is **not** MIT. Converted under LGPL-2.1 §3, which expressly permits distributing a copy under the ordinary GPL — the same route this repository took for its Wine fork. Licence text in `research/dxmt/COPYING.LIB`; the file-by-file list is in `research/dxmt/LICENSE-MADEIRA.md`. |
 | **rpmalloc** | 0BSD | 0BSD + **Will Faust's modifications GPL-3.0-or-later** | Nested submodule of FEX, forked to `willfaust/rpmalloc`. Commits by Ryan Houdek are **not** relicensed. |
 | **GMP** 6.3.0 | **LGPL-3.0-or-later** or GPL-2.0-or-later | Static (`libgmp.a`). |
 | **Nettle / Hogweed** 3.10.1 | **LGPL-3.0-or-later** or GPL-2.0-or-later | Static (`libnettle.a`, `libhogweed.a`). |
@@ -58,7 +59,9 @@ lives in a separate submodule. Each fork therefore carries its own
 - `wine/LICENSE-MADEIRA.md` — the LGPL-2.1 §3 conversion, exactly what changed
   and the two deliberate exceptions.
 - `FEX/LICENSE-MADEIRA.md`, `research/dxmt/LICENSE-MADEIRA.md` — upstream MIT
-  preserved; Madeira's modifications GPL-3.0-or-later.
+  preserved; Madeira's modifications GPL-3.0-or-later. `research/dxmt`'s notice
+  also records the LGPL-2.1-or-later Direct3D 9 / DXSO import and its §3
+  conversion, file by file.
 - `FEX/External/rpmalloc/LICENSE-MADEIRA.md` — 0BSD preserved; only Will
   Faust's commits are GPL, and authorship is distinguishable via `git log`.
 
