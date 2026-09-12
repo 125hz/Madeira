@@ -859,15 +859,10 @@ struct ContentView: View {
     /// launch button is one entry here — see `actionButtons`.
     private let thirtyTwoBitTests: [(label: String, exe: String)] = [
         ("D3D9 cube", "d3d9-cube-x86.exe"),
+        // Full Win32 path passed verbatim to MADEIRA_EXE — WineProcessBridge
+        // detects the backslash and launches it as-is (no syswow64 prefix).
+        (#"Mirror's Edge"#, #"C:\Mirrors-Edge\Mirror's Edge\Binaries\MirrorsEdge.exe"#),
     ]
-
-    /// "Custom exe" row (see `actionButtons`): a Win32 path typed at runtime,
-    /// so trying a program that is not one of the buttons above needs no
-    /// rebuild. Persisted so it survives a relaunch. Works for BOTH widths —
-    /// WineProcessBridge reads the target's PE machine off disk and routes an
-    /// i386 image through the WoW64 path by itself.
-    @AppStorage("madeiraCustomExePath") private var customExePath: String = ""
-    @AppStorage("madeiraCustomExeArgs") private var customExeArgs: String = ""
 
     enum JITStatus {
         case unknown
@@ -1537,8 +1532,6 @@ struct ContentView: View {
                     .tint(.indigo)
                 }
 
-                customExeRow
-
                 Button("Clear Log") {
                     logStore.clear()
                 }
@@ -1547,74 +1540,6 @@ struct ContentView: View {
             }
             .padding()
         }
-    }
-
-    /// Launch any exe already present in the prefix by typing its Win32 path,
-    /// 32-bit or 64-bit. Sets exactly the same three environment variables the
-    /// buttons above set (`MADEIRA_EXE` / `MADEIRA_ARGS` / `MADEIRA_DESKTOP`)
-    /// and calls the same `runWineFullSequence()`, so there is no second launch
-    /// path to keep in step. The working directory is handled by
-    /// WineProcessBridge, which chdir()s to the exe's own folder for every
-    /// full-path launch.
-    ///
-    /// Nothing here is escaped or re-quoted: `setenv` takes raw bytes, argv is
-    /// handed to `__wine_main` directly, and Wine's own `build_command_line`
-    /// does the Win32 quoting. So a path with spaces and apostrophes
-    /// (`C:\Some Folder\It's Here\Binaries\app.exe`) passes through verbatim.
-    private var customExeRow: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Custom exe")
-                .font(.caption)
-                .foregroundColor(.secondary)
-
-            /* An explicit width is required: `actionButtons` is a HORIZONTAL
-             * ScrollView, where a TextField has no intrinsic width to take and
-             * would collapse to nothing. */
-            TextField("C:\\path\\to\\program.exe", text: $customExePath)
-                .textFieldStyle(.roundedBorder)
-                .font(.system(.footnote, design: .monospaced))
-                .autocorrectionDisabled(true)
-                .textInputAutocapitalization(.never)
-                .submitLabel(.done)
-                .frame(width: 300)
-
-            TextField("arguments (optional)", text: $customExeArgs)
-                .textFieldStyle(.roundedBorder)
-                .font(.system(.footnote, design: .monospaced))
-                .autocorrectionDisabled(true)
-                .textInputAutocapitalization(.never)
-                .submitLabel(.done)
-                .frame(width: 300)
-
-            Button("Launch custom exe") {
-                /* Trim only surrounding whitespace — every other character,
-                 * spaces and apostrophes included, is part of the path and must
-                 * reach MADEIRA_EXE unchanged. One layer of wrapping double
-                 * quotes is removed because people paste quoted paths out of
-                 * Explorer, and MADEIRA_EXE is an environment variable rather
-                 * than a shell word: the quotes would become part of the name. */
-                var path = customExePath.trimmingCharacters(in: .whitespacesAndNewlines)
-                if path.count >= 2, path.hasPrefix("\""), path.hasSuffix("\"") {
-                    path = String(path.dropFirst().dropLast())
-                }
-                guard !path.isEmpty else {
-                    logStore.log("Custom exe: no path entered", level: .error)
-                    return
-                }
-                customExePath = path          // persist the cleaned-up value
-
-                let args = customExeArgs.trimmingCharacters(in: .whitespacesAndNewlines)
-                setenv("MADEIRA_EXE", path, 1)
-                if args.isEmpty { unsetenv("MADEIRA_ARGS") }
-                else { setenv("MADEIRA_ARGS", args, 1) }
-                unsetenv("MADEIRA_DESKTOP")
-                logStore.log("Custom exe: \(path)" + (args.isEmpty ? "" : " args=\(args)"))
-                runWineFullSequence()
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.brown)
-        }
-        .frame(width: 300, alignment: .leading)
     }
 
     private func runTriangleTest() {

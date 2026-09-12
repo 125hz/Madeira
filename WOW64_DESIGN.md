@@ -147,6 +147,40 @@ game-specific patches — every change must fix the emulator/runtime generically
 
 ## 6. Status log
 
+- 2026-09-12 — Desktop launch of the cube after the furniture-bias fix
+  (IPA 08:22): bias confirmed (session PEB now 0x70ffff0000, TEBs
+  0x70fff…), but `[wow-window] B=0x7100000000 REJECTED … next region
+  0x71fc120000` — the top ~64 MB of the only slot is occupied by a
+  non-Wine mapping: iOS's own top-down placement of anonymous memory for
+  system frameworks lands directly below the holdback. Child boot fails
+  cleanly now (`BOOT FAILED at stage 'guest-window-reserve'`,
+  `NtCreateUserProcess … returning c00000e5` → the "invalid handle" dialog
+  the user saw, instead of a hang). Fix assigned (Opus): reserve the
+  slot as a PROT_NONE placeholder at session start next to the cage
+  holdback and let the first 32-bit process adopt it. The custom-exe
+  launcher crashed for the user during the JIT-pool BRK step (log ends at
+  `JIT-pool pin chunk 0`, before any 32-bit code) and took two lines in
+  the button row; per the user it is REMOVED and replaced by a dedicated
+  one-line table entry with the game's full path (explicit user
+  exception for app UI; commits and emulator code stay game-name-free).
+  DONE (Opus, `virtual_ios.c` only): `ios_wow_reserve_placeholders()`
+  runs as the last statement of `virtual_init`, right after the cage
+  holdback, and takes every 4 GB-aligned slot in the furniture band as a
+  PROT_NONE mapping + reserved area (today: slot 0x7100000000, guard
+  borrowed from the holdback). `ios_wow_window_try()` ADOPTS the
+  placeholder (no unmap/remap); `ios_wow_exclude_windows()` also hides
+  unadopted placeholders from Wine placement and now keeps the side BELOW
+  the slot (the side above is the dead holdback); `ios_wow_candidate_slot`
+  skips held slots so the top-down bias goes quiet. Range diagnostics now
+  say `PARTIALLY OCCUPIED: free a..b, then OCCUPIED b+len` and print
+  "REFUSED A FREE ADDRESS" only when the range truly was free. Expected
+  log: session start `[wow-window] placeholder reserved
+  B=0x7100000000..0x7200000000 (+guard borrowed …) slot 0`; 32-bit child
+  `[wow-window] adopted placeholder B=0x7100000000 … guard=borrowed` then
+  `[Wine child] i386 image … reserve=0x0`. Cost: 64-bit-only sessions lose
+  that slot as preferred furniture space (~2.9 GB below it remains).
+
+
 - 2026-09-12 — M5 direction: the user's next target is a 32-bit UE3/D3D9
   game (name deliberately not recorded). Finding from the user: launching
   the D3D9 cube by double-clicking it in the Wine virtual desktop does
@@ -203,6 +237,23 @@ game-specific patches — every change must fix the emulator/runtime generically
   `apisetschema.dll` installed. `aarch64-windows/` ships no `.drv` at all
   — the audio agent must find how 64-bit audio binds its driver on iOS
   and replicate it for i386. Audio/nsi/dwrite table agent (Opus) started.
+- 2026-09-12 — 32-bit audio/nsi/dwrite done (Opus; main `1541d46`, wine
+  `87c1947`). Audio: `mmdevapi` binds the driver BY NAME
+  (`__wine_load_unix_lib(L"wineios.drv")` → `MemoryWineLoadUnixLibByName`
+  → Madeira's by-name fallback returns the table with a magic handle) —
+  no `.drv` PE is ever mapped, so none is needed for i386; the real
+  blocker was `MemoryWineLoadUnixLibByNameWow64` returning
+  STATUS_NOT_SUPPORTED. Now `audio_null_ios_unix_call_wow64_funcs` (37
+  slots, 20 new thunks, 37 `ios_wow_host_ptr` sites) registered by name
+  (`virtual_ios.c:17946`) and by module (`:6427`); the render scratch
+  buffer is allocated inside the guest window (`zero_bits=1` ceiling,
+  refuses loudly otherwise); `get_loopback_capture_device` uninitialised
+  result fixed. nsi: 1-slot wow64 table (struct derived from
+  `wine/include/wine/nsi.h:496`; no `nsi/unixlib.c` in this tree).
+  dwrite: 12 `ULongToPtr` → `ios_wow_host_ptr` in `freetype.c` incl.
+  nested outline arrays. Expected lines: `[unixlib] audio_null_ios
+  (wineios.drv) -> wow64 table`, `[unixlib] nsi … -> wow64 table`,
+  `[unixlib] dwrite … -> wow64 table`. IPA rebuild started.
 
 
 - 2026-09-12 — Cube test rework confirmed on device (IPA 00:43):

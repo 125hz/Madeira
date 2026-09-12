@@ -4698,9 +4698,23 @@ static void ios_furniture_census( void )
                  k + 1, top[k].base, top[k].size, top[k].size >> 20, top[k].prot );
 }
 
-static void ios_va_describe( void *addr, char *buf, size_t buflen )
+/* Describe what the kernel has at `addr` — or, when `len` is non-zero, across
+ * the whole range [addr, addr+len).
+ *
+ * RANGE AWARENESS (device evidence, desktop run after the furniture-bias fix):
+ * the single-address form printed "iOS REFUSED A FREE ADDRESS" whenever
+ * mach_vm_region returned a region ABOVE addr — which is also true of a RANGE
+ * whose first page is free and whose tail is occupied.  That is exactly the
+ * 4 GB guest-window candidate on device (free from 0x7100000000, occupied from
+ * 0x71fc120000), so the log accused iOS of refusing free VA when the real
+ * verdict was "part of your range is taken".  A caller that knows the length of
+ * the mapping it tried therefore passes it, and the refusal wording is reserved
+ * for a range that really was free end to end. */
+static void ios_va_describe_range( void *addr, ULONG_PTR len, char *buf, size_t buflen )
 {
-    mach_vm_address_t a = (mach_vm_address_t)(uintptr_t)addr;
+    mach_vm_address_t start = (mach_vm_address_t)(uintptr_t)addr;
+    mach_vm_address_t end = start + (len ? (mach_vm_address_t)len : 1);
+    mach_vm_address_t a = start;
     mach_vm_size_t size = 0;
     vm_region_basic_info_data_64_t info;
     mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
@@ -4712,14 +4726,37 @@ static void ios_va_describe( void *addr, char *buf, size_t buflen )
         snprintf( buf, buflen, "no-region-above (free to end of VA)" );
         return;
     }
-    if (a > (mach_vm_address_t)(uintptr_t)addr)
-        snprintf( buf, buflen, "FREE hole, next region 0x%llx (+0x%llx away) <-- iOS REFUSED A FREE ADDRESS",
-                  (unsigned long long)a,
-                  (unsigned long long)(a - (mach_vm_address_t)(uintptr_t)addr) );
-    else
-        snprintf( buf, buflen, "OCCUPIED 0x%llx+0x%llx prot=%x/%x shared=%d",
+    if (a >= end)       /* nothing mapped anywhere in the requested range */
+    {
+        if (len)
+            snprintf( buf, buflen, "FREE: all 0x%llx bytes from 0x%llx are free, next region 0x%llx "
+                                   "(+0x%llx past the end) <-- iOS REFUSED A FREE RANGE",
+                      (unsigned long long)len, (unsigned long long)start,
+                      (unsigned long long)a, (unsigned long long)(a - end) );
+        else
+            snprintf( buf, buflen, "FREE hole, next region 0x%llx (+0x%llx away) <-- iOS REFUSED A FREE ADDRESS",
+                      (unsigned long long)a, (unsigned long long)(a - start) );
+        return;
+    }
+    if (a > start)      /* head free, tail taken: name the occupied sub-range */
+    {
+        snprintf( buf, buflen, "PARTIALLY OCCUPIED: free 0x%llx..0x%llx, then OCCUPIED 0x%llx+0x%llx "
+                               "prot=%x/%x shared=%d (0x%llx of the range is not free)",
+                  (unsigned long long)start, (unsigned long long)a,
                   (unsigned long long)a, (unsigned long long)size,
-                  info.protection, info.max_protection, info.shared );
+                  info.protection, info.max_protection, info.shared,
+                  (unsigned long long)(end - a) );
+        return;
+    }
+    snprintf( buf, buflen, "OCCUPIED 0x%llx+0x%llx prot=%x/%x shared=%d%s",
+              (unsigned long long)a, (unsigned long long)size,
+              info.protection, info.max_protection, info.shared,
+              (len && a + size < end) ? " (and the range continues past this region)" : "" );
+}
+
+static void ios_va_describe( void *addr, char *buf, size_t buflen )
+{
+    ios_va_describe_range( addr, 0, buf, buflen );
 }
 
 static const char *ios_scan_stop_name( int stop )
@@ -5457,6 +5494,53 @@ static struct ios_wow_window ios_wow_windows[IOS_WOW_MAX_WINDOWS];
 static unsigned ios_wow_window_count;
 static pthread_mutex_t ios_wow_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* SESSION-START PLACEHOLDERS.
+ *
+ * DEVICE EVIDENCE (desktop session, the run after the top-down furniture bias
+ * landed): the bias worked — the session's PEB moved to 0x70ffff0000 and its
+ * TEBs to 0x70fff…, i.e. Wine's own furniture stopped using the one candidate
+ * slot — and the 32-bit child STILL could not reserve it:
+ *
+ *   [wow-window] B=0x7100000000 REJECTED: ... next region 0x71fc120000
+ *
+ * The top ~64 MB of the slot was occupied by something that is not a Wine view.
+ * That is iOS placing anonymous memory for the system frameworks itself
+ * (Metal, libdispatch, malloc zone growth, CoreAudio...): mmap(NULL) /
+ * vm_allocate pick the HIGHEST free hole, which is the slot directly below the
+ * [cage] holdback.  Wine cannot bias those allocations — the only way to keep
+ * the hole is to not leave one.
+ *
+ * So every 4 GB-aligned slot in the furniture band is reserved PROT_NONE at
+ * SESSION START (ios_wow_reserve_placeholders(), called from virtual_init right
+ * after the [cage] holdback, before any system framework has had a chance to
+ * map anything), registered as a Wine reserved area exactly as a real window
+ * is, and recorded here.  The first 32-bit pseudo-process that wants the slot
+ * ADOPTS the placeholder (ios_wow_window_try) instead of mapping a fresh range:
+ * the mapping and the reserved-area entry are kept as they are, because an
+ * unmap/remap would open precisely the gap this exists to close.
+ *
+ * A placeholder is never unmapped: window retirement is a deliberate leak (see
+ * ios_wow_window_retire), so an adopted placeholder stays adopted for the rest
+ * of the session and its slot becomes reusable only if a real window release is
+ * ever implemented. */
+struct ios_wow_placeholder
+{
+    ULONG_PTR base;          /* 4 GB-aligned slot base, 0 = unused entry */
+    unsigned  guard_owned;   /* same meaning as ios_wow_window.guard_owned */
+    unsigned  adopted;       /* a pseudo-process has taken this slot over */
+};
+static struct ios_wow_placeholder ios_wow_placeholders[IOS_WOW_MAX_WINDOWS];
+static unsigned ios_wow_placeholder_count;
+
+static struct ios_wow_placeholder *ios_wow_placeholder_find( ULONG_PTR base )
+{
+    unsigned i;
+
+    for (i = 0; i < ios_wow_placeholder_count; i++)
+        if (ios_wow_placeholders[i].base == base) return &ios_wow_placeholders[i];
+    return NULL;
+}
+
 /* Device-run fix: the MAIN wine process (start_main_thread) never reserved a
  * guest window — only the CreateProcess child path (wine_ios_child_main) did —
  * so a 32-bit MAIN image (e.g. `wine hello-x86.exe`) ran with B=0: the image
@@ -5684,26 +5768,71 @@ static ULONG_PTR ios_wow_image_ceiling( const struct pe_image_info *image_info )
  * The window is a Wine reserved area, so without this the ordinary furniture
  * search would happily hand out addresses inside a 32-bit process's window
  * and starve it.  Only called for requests that are not window-constrained. */
+/* Clamp [*start, *end) off the reserved slot [wb, we).
+ *
+ * The rule is "keep the side BELOW the slot whenever there is one", not "keep
+ * the larger side" as the first cut had it.  Measuring the two sides by size
+ * alone is wrong for this address space: the slots are the LOWEST 4 GB-aligned
+ * candidates in the band, so the side above a slot is the [cage] holdback —
+ * 8 GB of PROT_NONE VA that no furniture can ever use.  "Larger" therefore
+ * picked the dead side, map_reserved_area found nothing in it, and map_free_area
+ * then ground its way across the holdback at 64 KB a step before the advisory
+ * ceiling was relaxed (the ml116 pattern, for every unconstrained placement of
+ * the session).  Keeping the low side leaves the real furniture space.
+ *
+ * Still advisory: map_view drops the clamp when it leaves no room at all, and
+ * the relax valve below it drops it again on failure. */
+static void ios_wow_exclude_range( void **start, void **end, ULONG_PTR wb, ULONG_PTR we )
+{
+    if ((ULONG_PTR)*end <= wb || (ULONG_PTR)*start >= we) return;   /* no overlap */
+    if ((ULONG_PTR)*start < wb) *end = (void *)wb;                  /* keep the low side */
+    else if ((ULONG_PTR)*end > we) *start = (void *)we;             /* nothing below: keep the high side */
+    /* else the request lies entirely inside the slot: nothing to keep, leave
+       the range alone and let the caller's own fallback decide */
+}
+
 static void ios_wow_exclude_windows( void **start, void **end )
 {
     unsigned i, n = ios_wow_window_count;
 
     for (i = 0; i < n; i++)
     {
-        ULONG_PTR wb = ios_wow_windows[i].base, we;
+        ULONG_PTR wb = ios_wow_windows[i].base;
 
         if (!wb) continue;
         /* exclude the FB3 guard page too when it is ours; when it is borrowed
          * it belongs to a neighbour that is already unavailable anyway */
-        we = wb + ios_wow_slot_reservation( &ios_wow_windows[i] );
-        if ((ULONG_PTR)*end <= wb || (ULONG_PTR)*start >= we) continue;
-        /* keep whichever side of the window is larger */
-        if ((ULONG_PTR)*end - we > wb - (ULONG_PTR)*start)
-        {
-            if ((ULONG_PTR)*start < we) *start = (void *)we;
-        }
-        else if ((ULONG_PTR)*end > wb) *end = (void *)wb;
+        ios_wow_exclude_range( start, end, wb,
+                               wb + ios_wow_slot_reservation( &ios_wow_windows[i] ) );
     }
+
+    /* An UNADOPTED placeholder is not a window yet, but it is exactly as
+     * unavailable: it exists so that the slot is still free when a 32-bit
+     * pseudo-process finally asks for one.  An adopted one is already covered
+     * by its window entry above, at the same base. */
+    for (i = 0; i < ios_wow_placeholder_count; i++)
+    {
+        ULONG_PTR pb = ios_wow_placeholders[i].base;
+
+        if (!pb || ios_wow_placeholders[i].adopted) continue;
+        ios_wow_exclude_range( start, end, pb, pb + IOS_WOW_WINDOW_SIZE +
+                               (ios_wow_placeholders[i].guard_owned ? ios_wow_guard_size() : 0) );
+    }
+}
+
+/* Does any window or placeholder borrow its FB3 overrun guard page from the
+ * region that starts at `addr`?  Diagnostic only — see the [cage] grant. */
+static int ios_wow_guard_borrowed_from( ULONG_PTR addr )
+{
+    unsigned i;
+
+    for (i = 0; i < ios_wow_window_count; i++)
+        if (ios_wow_windows[i].base && !ios_wow_windows[i].guard_owned &&
+            ios_wow_windows[i].base + IOS_WOW_WINDOW_SIZE == addr) return 1;
+    for (i = 0; i < ios_wow_placeholder_count; i++)
+        if (ios_wow_placeholders[i].base && !ios_wow_placeholders[i].guard_owned &&
+            ios_wow_placeholders[i].base + IOS_WOW_WINDOW_SIZE == addr) return 1;
+    return 0;
 }
 
 static int ios_wow_band_ok( ULONG_PTR base, ULONG_PTR total )
@@ -5744,10 +5873,40 @@ static int ios_wow_guard_neighbour_blocked( ULONG_PTR addr, ULONG_PTR len )
 static int ios_wow_window_try( ULONG_PTR base, unsigned *guard_owned )
 {
     ULONG_PTR guard = ios_wow_guard_size();
-    char what[160];
+    struct ios_wow_placeholder *ph;
+    char what[256];
 
     *guard_owned = 0;
     if (!ios_wow_band_ok( base, IOS_WOW_WINDOW_SIZE )) return 0;
+
+    /* ADOPT the session-start placeholder for this slot, if there is one.
+     *
+     * Taking ownership is all that happens: the PROT_NONE mapping and the
+     * reserved-area entry made at session start are exactly what a fresh
+     * reservation would produce, and unmapping to remap them would hand the
+     * kernel a window — however brief — in which it could place a system
+     * framework's anonymous memory in the slot.  That is the failure this whole
+     * mechanism exists to prevent, so there is no unmap and no remap. */
+    if ((ph = ios_wow_placeholder_find( base )))
+    {
+        if (ph->adopted)
+        {
+            dprintf( 2, "[wow-window] B=%p REJECTED: its placeholder is already adopted by another "
+                        "32-bit pseudo-process (one 4GB window per slot, and a retired window's "
+                        "slot is never returned)\n", (void *)base );
+            return 0;
+        }
+        ph->adopted = 1;
+        *guard_owned = ph->guard_owned;
+        dprintf( 2, "[wow-window] adopted placeholder B=%p..%p reserved at session start "
+                    "(mapping and reserved area kept as-is) guard=%s\n",
+                 (void *)base, (void *)(base + IOS_WOW_WINDOW_SIZE),
+                 ph->guard_owned ? "owned" : "borrowed" );
+        return 1;
+    }
+
+    /* No placeholder for this slot (it could not be reserved at session start,
+     * or the band grew): fall back to reserving the range here and now. */
 
     /* preferred: the 4 GB window plus our own FB3 guard page */
     if (ios_wow_band_ok( base, IOS_WOW_WINDOW_SIZE + guard ) &&
@@ -5765,7 +5924,7 @@ static int ios_wow_window_try( ULONG_PTR base, unsigned *guard_owned )
      * if — and only if — the neighbour is already inaccessible */
     if (!ios_wow_guard_neighbour_blocked( base + IOS_WOW_WINDOW_SIZE, guard ))
     {
-        ios_va_describe( (void *)(base + IOS_WOW_WINDOW_SIZE), what, sizeof(what) );
+        ios_va_describe_range( (void *)(base + IOS_WOW_WINDOW_SIZE), guard, what, sizeof(what) );
         dprintf( 2, "[wow-window] B=%p REJECTED: 4GB+guard unavailable and the page at "
                     "%p is not an inaccessible neighbour (%s)\n",
                  (void *)base, (void *)(base + IOS_WOW_WINDOW_SIZE), what );
@@ -5774,11 +5933,17 @@ static int ios_wow_window_try( ULONG_PTR base, unsigned *guard_owned )
     if (anon_mmap_tryfixed( (void *)base, IOS_WOW_WINDOW_SIZE,
                             PROT_NONE, MAP_NORESERVE ) == MAP_FAILED)
     {
-        /* Name the occupant.  The usual one is ordinary MEM_TOP_DOWN furniture
-         * (the session TEB block and thread stacks) that was placed at the top
-         * of the band before any 32-bit process asked for a window — see
-         * ios_wow_candidate_slot(). */
-        ios_va_describe( (void *)base, what, sizeof(what) );
+        /* Name the occupant.  It is either ordinary MEM_TOP_DOWN furniture (the
+         * session TEB block and thread stacks) placed at the top of the band
+         * before any 32-bit process asked for a window — see
+         * ios_wow_candidate_slot() — or, once the bias keeps Wine out, iOS's own
+         * top-down placement of anonymous memory for a system framework, which
+         * is what the session-start placeholder exists to forestall.  Describe
+         * the WHOLE 4 GB range, not just its first page: the usual shape is a
+         * free head with an occupied tail, and the address-only description
+         * called that "iOS REFUSED A FREE ADDRESS", which is the opposite of
+         * what happened. */
+        ios_va_describe_range( (void *)base, IOS_WOW_WINDOW_SIZE, what, sizeof(what) );
         dprintf( 2, "[wow-window] B=%p REJECTED: the 4GB range is not free (%s); "
                     "something is already mapped inside this slot\n", (void *)base, what );
         return 0;
@@ -5823,11 +5988,22 @@ ULONG_PTR ios_wow_candidate_slot(void)
          cand += IOS_WOW_WINDOW_SIZE)
     {
         int taken = 0;
+        unsigned p;
 
         /* a slot an existing (or retired) window already owns is kept out of
            furniture by ios_wow_exclude_windows(), not by this bias */
         for (i = 0; i < n; i++)
             if (ios_wow_windows[i].base == cand) { taken = 1; break; }
+        /* and neither does a slot that is already held by a session-start
+         * placeholder: that is a real PROT_NONE reservation plus a reserved
+         * area, excluded by ios_wow_exclude_windows() as well, so there is
+         * nothing left here for an advisory bias to protect.  Skipping it is
+         * what keeps the two mechanisms from fighting: with every slot held,
+         * this returns 0 and the map_view bias simply stops applying, while a
+         * slot whose placeholder FAILED is still reported and still biased
+         * against, exactly as before. */
+        for (p = 0; p < ios_wow_placeholder_count && !taken; p++)
+            if (ios_wow_placeholders[p].base == cand) taken = 1;
         if (!taken) return cand;
     }
     return 0;
@@ -5870,6 +6046,67 @@ static ULONG_PTR ios_wow_window_pick( unsigned *guard_owned )
                                                       ~(IOS_WOW_WINDOW_SIZE - 1))) / IOS_WOW_WINDOW_SIZE
                                            : 0) );
     return 0;
+}
+
+/***********************************************************************
+ *           ios_wow_reserve_placeholders
+ *
+ * Reserve every guest-window slot of the furniture band at SESSION START.
+ *
+ * Called from virtual_init(), immediately after the [cage] holdback and as the
+ * last thing that function does — the earliest point at which mmap_init() and
+ * the reserved-area machinery are usable, and before Wine has placed any
+ * furniture or any system framework has had a reason to grow the heap, open a
+ * Metal device or start a dispatch queue.  Whatever the kernel would otherwise
+ * have put at the top of the band now goes somewhere else, because there is no
+ * hole left there to find.
+ *
+ * Today the band yields two candidates, [0x7100000000, 0x7200000000) and
+ * [0x7200000000, 0x7300000000); the second IS the holdback, so it is rejected
+ * (loudly, and correctly named) and only the first becomes a placeholder, with
+ * its FB3 guard page BORROWED from the holdback's first page — the holdback
+ * begins exactly at B+4 GB, so the guard cannot be reserved separately.
+ *
+ * Never fatal: a slot that cannot be reserved is reported and skipped, and
+ * ios_wow_window_try() still has its original reserve-on-demand path. */
+static void ios_wow_reserve_placeholders(void)
+{
+    ULONG_PTR floor = ios_usable_va_floor;
+    ULONG_PTR ceil  = ios_furniture_ceiling ? ios_furniture_ceiling : (ULONG_PTR)user_space_limit;
+    ULONG_PTR cand;
+
+    /* same candidate rule as ios_wow_window_pick(): 4 GB-aligned, lowest first,
+     * inside the furniture band and below the CEF pools */
+    if (ceil > IOS_WOW_CEF_POOLS_START) ceil = IOS_WOW_CEF_POOLS_START;
+    if (ceil <= floor || ceil - floor < IOS_WOW_WINDOW_SIZE) return;
+
+    pthread_mutex_lock( &ios_wow_mutex );
+    for (cand = (floor + IOS_WOW_WINDOW_SIZE - 1) & ~(IOS_WOW_WINDOW_SIZE - 1);
+         cand >= floor && cand + IOS_WOW_WINDOW_SIZE <= ceil;
+         cand += IOS_WOW_WINDOW_SIZE)
+    {
+        unsigned guard_owned = 0;
+
+        if (ios_wow_placeholder_count >= IOS_WOW_MAX_WINDOWS) break;
+        if (!ios_wow_window_try( cand, &guard_owned ))
+        {
+            dprintf( 2, "[wow-window] placeholder NOT reserved B=%p: the slot is already "
+                        "unavailable at session start (the line above says what is in it). A "
+                        "32-bit process will have to reserve a window the old way\n",
+                     (void *)cand );
+            continue;
+        }
+        ios_wow_placeholders[ios_wow_placeholder_count].base        = cand;
+        ios_wow_placeholders[ios_wow_placeholder_count].guard_owned = guard_owned;
+        ios_wow_placeholders[ios_wow_placeholder_count].adopted     = 0;
+        ios_wow_placeholder_count++;
+        dprintf( 2, "[wow-window] placeholder reserved B=%p..%p (+guard %s) slot %u — held "
+                    "PROT_NONE for the first 32-bit pseudo-process of this session\n",
+                 (void *)cand, (void *)(cand + IOS_WOW_WINDOW_SIZE),
+                 guard_owned ? "owned" : "borrowed (from the neighbouring PROT_NONE region)",
+                 ios_wow_placeholder_count - 1 );
+    }
+    pthread_mutex_unlock( &ios_wow_mutex );
 }
 
 NTSTATUS ios_wow_window_reserve(void)
@@ -5965,7 +6202,18 @@ void ios_wow_window_bind( void *peb_id )
  * to a region that was already inaccessible before we picked the slot and that
  * nothing here releases either, so the same protection holds.  guard_owned is
  * deliberately left set on the retired slot: ios_wow_exclude_windows() still
- * walks it and must keep using the same reservation size. */
+ * walks it and must keep using the same reservation size.
+ *
+ * PLACEHOLDERS.  A window that adopted a session-start placeholder returns
+ * nothing here either — not the mapping, not the reserved area, and not the
+ * placeholder entry, which stays marked adopted.  That is deliberate: the
+ * placeholder exists to guarantee the slot is still there when a 32-bit process
+ * asks for it, and handing the VA back to the kernel at exit would surrender
+ * exactly that guarantee to the next system-framework allocation.  A slot
+ * therefore serves ONE pseudo-process per session, and becomes reusable only
+ * once a real release (see above) can prove the process has no live threads —
+ * at which point that code re-marks the placeholder unadopted rather than
+ * unmapping it. */
 static void ios_wow_window_retire( struct ios_wow_window *slot )
 {
     static int warned;
@@ -6030,6 +6278,7 @@ int ios_wow_in_window( const void *addr ) { return 0; }
 ULONG ios_wow_guest_addr( const void *host ) { return PtrToUlong( host ); }
 void ios_wow_translate_limits( ULONG_PTR *l, ULONG_PTR *h ) { }
 NTSTATUS ios_wow_window_reserve(void) { return STATUS_NOT_SUPPORTED; }
+static void ios_wow_reserve_placeholders(void) { }
 void ios_wow_window_bind( void *peb_id ) { }
 void ios_wow_window_release( void *peb_id ) { }
 void ios_wow_window_release_current(void) { }
@@ -12928,6 +13177,15 @@ void virtual_init(void)
                  (unsigned long long)IOS_CAGE_BASE, (unsigned long long)IOS_CAGE_REAL_SIZE );
     }
     else dprintf( 2, "[cage] holdback reserve FAILED (errno %d) rev=ml433\n", errno );
+
+    /* Hold the 32-bit guest-window slot(s) the same way and for the same
+     * reason, now that the holdback is in place (the only candidate borrows its
+     * FB3 guard page from the holdback's first page, so the order matters) —
+     * see ios_wow_reserve_placeholders().  Must be the LAST thing virtual_init
+     * does: everything above it (the view block, the vprot table, the DOS area,
+     * the holdback) places memory of its own, and a placeholder that shadowed
+     * any of it would be a reservation failure instead of a held slot. */
+    ios_wow_reserve_placeholders();
 }
 
 
@@ -15695,6 +15953,18 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                     dprintf(2, "[cage] grant %p real=0x%llx reported=0x%lx st=0x%x rev=ml433\n",
                             pick, (unsigned long long)IOS_CAGE_REAL_SIZE,
                             (unsigned long)(st2 ? 0 : sz), (unsigned)st2);
+                    /* The holdback's first page is the page the only guest-window
+                     * slot BORROWS its FB3 overrun guard from (the slot ends
+                     * exactly where the holdback begins, so the guard cannot be
+                     * reserved separately).  Granting the holdback turns that page
+                     * into the guest's own memory, so a 32-bit access just past
+                     * B+4GB would land in it instead of faulting.  No behaviour
+                     * change here — say so, once, in the log. */
+                    if (!st2 && ios_wow_guard_borrowed_from( IOS_CAGE_BASE ))
+                        dprintf(2, "[wow-window] WARNING: the FB3 overrun guard page at 0x%llx was "
+                                   "BORROWED from the [cage] holdback just granted to the guest; a "
+                                   "32-bit access past B+4GB now reaches guest memory instead of "
+                                   "faulting\n", (unsigned long long)IOS_CAGE_BASE);
                 }
                 /* ml434 (#72 layer 2): the 4GB ask is the cppgc caged heap and
                  * must come back 4GB-ALIGNED. By the time it arrives (~69s) the
