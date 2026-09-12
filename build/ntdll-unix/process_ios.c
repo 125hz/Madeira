@@ -433,6 +433,12 @@ struct ios_child_args {
  * info in struct ios_child_args. */
 _Thread_local WORD ios_child_main_machine;
 
+/* Where this child currently is in wine_ios_child_main (which updates it).  A
+ * child that dies during bring-up used to leave no trace at all beyond a couple
+ * of dprintf lines, so a failed CreateProcess from the desktop looked like
+ * nothing happening; the thread entry below names the stage in one ERR. */
+_Thread_local const char *ios_child_boot_stage = "not started";
+
 static void *ios_child_thread_entry( void *arg )
 {
     struct ios_child_args *args = arg;
@@ -457,8 +463,30 @@ static void *ios_child_thread_entry( void *arg )
 
         dprintf(STDERR_FILENO, "[Wine child thread] calling wine_ios_child_main...\n");
         wine_ios_child_main( args->argc, args->argv, args->socketfd );
-        /* Should not return */
+        /* Should not return: every return is a bring-up failure. */
         dprintf(STDERR_FILENO, "[Wine child thread] wine_ios_child_main returned unexpectedly!\n");
+        ERR( "spawn_process: child %s (machine %04x) FAILED to boot at stage '%s'; "
+             "CreateProcess in the parent will report failure\n",
+             args->argc > 1 ? args->argv[1] : "?", args->pe_info.machine,
+             ios_child_boot_stage );
+
+        /* CRITICAL: hand the wineserver the EOF it is waiting for.
+         *
+         * NtCreateUserProcess blocks in NtWaitForSingleObject( process_info )
+         * until the new process either finishes init_process_done or DIES.  The
+         * server only learns a pseudo-process died when its side of the
+         * socketpair reaches EOF — and the only remaining reference to this
+         * child's end is args->socketfd (the parent closed socketfd[0] right
+         * after spawn_process returned).  Leaving it open therefore wedged the
+         * SPAWNER forever: a desktop double-click that failed anywhere in
+         * wine_ios_child_main produced no window, no error and no return from
+         * CreateProcess.  Closing it turns the same failure into a reported
+         * STATUS_INTERNAL_ERROR from NtCreateUserProcess. */
+        if (args->socketfd != -1)
+        {
+            close( args->socketfd );
+            args->socketfd = -1;
+        }
     } else {
         dprintf(STDERR_FILENO, "[Wine child thread] child exited with code %d\n", wine_ios_exit_code);
     }
@@ -1367,6 +1395,18 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         if (ios_is_arm64ec_cur() && pe_info.is_hybrid && machine == IMAGE_FILE_MACHINE_ARM64)
             machine = ios_cur_image_info()->Machine;
     }
+#ifdef WINE_IOS
+    /* One line saying which machine the child will be created with and which
+     * PE farm its system DLLs will come from.  A 32-bit child routed to the
+     * 64-bit farm (or the other way round) is invisible otherwise, and it is
+     * the first thing to check when a spawn silently produces no window. */
+    {
+        extern const char *ios_pe_dir_for_machine( WORD machine );
+        ERR( "NtCreateUserProcess: child machine=%04x (image machine=%04x hybrid=%d) pe_dir=%s\n",
+             machine, pe_info.machine, (int)pe_info.is_hybrid,
+             ios_pe_dir_for_machine( machine ) );
+    }
+#endif
     if (!(startup_info = create_startup_info( attr.ObjectName, process_flags, params, &pe_info, &startup_info_size )))
         goto done;
     env_size = get_env_size( params, &winedebug );
@@ -1494,6 +1534,13 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     if (!success)
     {
         if (!status) status = STATUS_INTERNAL_ERROR;
+#ifdef WINE_IOS
+        /* Name the failure at the boundary the caller sees.  Without this the
+         * only evidence a spawn failed was the absence of a window. */
+        ERR( "NtCreateUserProcess: %s (machine %04x) did not reach init_process_done; "
+             "returning %x — see the [Wine child] boot lines above for the stage\n",
+             debugstr_us(&path), machine, (unsigned)status );
+#endif
         goto done;
     }
 

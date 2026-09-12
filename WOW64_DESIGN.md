@@ -147,6 +147,52 @@ game-specific patches — every change must fix the emulator/runtime generically
 
 ## 6. Status log
 
+- 2026-09-12 — M5 direction: the user's next target is a 32-bit UE3/D3D9
+  game (name deliberately not recorded). Finding from the user: launching
+  the D3D9 cube by double-clicking it in the Wine virtual desktop does
+  nothing (the child-process path for an i386 image has never run on
+  device; the button path makes the exe the main process). Work started
+  (two agents): (a) full i386 Wine DLL set incl. d3dx9_*, d3dcompiler,
+  xinput, dinput, dsound, xaudio2, msvcr*/msvcp*, ole32/oleaut32/shell32
+  etc. via `.xtool/build-wine-i386.sh`; (b) child-launch trace/fix +
+  generic "Custom exe" launcher in the app (text field persisted in
+  UserDefaults, full Win32 path, working directory = exe folder; no
+  hardcoded paths, no game names). Queued: 32-bit audio/nsi/dwrite
+  unixlib tables. Limitation to remember: one 4 GB window slot → one
+  32-bit process at a time (a 32-bit launcher spawning a 32-bit game
+  cannot work yet).
+- 2026-09-12 — Desktop double-click logs (cube and the 32-bit game exe,
+  both from the Wine virtual desktop): NO `NtCreateUserProcess` line for
+  either target, while `services.exe`/`rpcss.exe` in the same sessions
+  log it and go through the child path normally. So the launch is
+  swallowed BEFORE the process-creation syscall (explorer double-click
+  handling on touch, shell32 `ShellExecute`, or kernelbase
+  `CreateProcessInternalW` bailing early) — not the 32-bit child path.
+  Discriminator for the user: double-click a 64-bit exe in the same
+  explorer. The custom launcher (in progress) bypasses explorer entirely.
+- 2026-09-12 — Full i386 DLL set built (Sonnet, `.xtool/build-wine-i386.sh`,
+  reproducible; logs in `.xtool/logs/build-wine-i386*.log`): 169 files,
+  87.5 MiB stripped, all PE32; 163 of 168 targets built; no i386 rule
+  for `winecoreaudio.drv`, `conhost`, `rpcss`, `services`, `wineboot`;
+  `wineios.drv` not in the i386 tree. Import closure clean except
+  `d3d12.dll → dxgi.dll` (DXMT-owned i386 `dxgi`/`d3d11`/`d3d10core`
+  exist from stage 1 and can be installed later for a 32-bit DX11 path).
+  `apisetschema.dll` installed. `aarch64-windows/` ships no `.drv` at all
+  — the audio agent must find how 64-bit audio binds its driver on iOS
+  and replicate it for i386. Audio/nsi/dwrite table agent (Opus) started.
+
+
+- 2026-09-12 — Cube test rework confirmed on device (IPA 00:43):
+  `cull=CCW z=off seconds=15`, all presents hr=0, **frames presented =
+  36765 in 15.00 s, avg fps = 2451.0** (uncapped; trivial scene — a
+  crossing-overhead figure, not a game prediction), exit 43, no faults.
+  Near faces render correctly with the driver's cull mapping. The x64
+  DX11 cube runs fine on the same IPA → no 64-bit regression from the
+  shared FEXCore/rpmalloc/driver changes. Buttons trimmed to the cube.
+  M5 started: (a) full i386 Wine DLL set (Sonnet), (b) 32-bit audio /
+  nsi / dwrite wow64 tables (Opus). Then a real 32-bit application.
+
+
 - 2026-09-12 — **MILESTONE 4 PASSED (third cube run, IPA 23:58).** The
   32-bit D3D9 cube rendered on the iPhone: `first DrawPrimitive returned
   hr 0x00000000`, `present 1..3 hr=0x00000000`, frames 1–240 presented,

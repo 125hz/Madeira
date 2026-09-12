@@ -651,24 +651,13 @@ static void *wine_process_thread(void *arg) {
         // Otherwise: detect "x64" in the exe name (cube-x64, fib-x64, etc.)
         // OR a Win32 full path (real game launches typically need ARM64EC).
         const char *force_ec = getenv("MADEIRA_USE_ARM64EC");
-        BOOL use_arm64ec = (force_ec && *force_ec == '1') ||
-                           (strstr(madeira_exe, "x64") != NULL) ||
-                           (strchr(madeira_exe, '\\') != NULL);
-        const char *bundle_subdir = use_arm64ec ? "arm64ec-windows" : "aarch64-windows";
-        LOG("Target exe: %{public}s (bundle=%{public}s)", madeira_exe, bundle_subdir);
-        dprintf(STDERR_FILENO, "[WineProc] Target exe: %s (bundle=%s)\n", madeira_exe, bundle_subdir);
 
-        /* WOW64_DESIGN.md stage E: read the target's actual PE machine to
-         * decide whether it is a 32-bit image, instead of extending the name
-         * heuristic above. This is additive only — bundle_subdir (the
-         * session's own 64-bit system32 farm, native aarch64 either way,
-         * since Wine's core loader always runs 64-bit and reaches a 32-bit
-         * exe through WOW64) is computed exactly as before and is not read
-         * here, so every existing input keeps the same bundle_subdir/exe
-         * path it always had. A bare exe name lives directly in one of the
-         * per-arch bundle dirs (same convention the farms below rely on); a
-         * full Win32 path lives under the prefix's drive_c. Any lookup or
-         * parse failure leaves target_machine at 0, i.e. "not i386". */
+        /* WOW64_DESIGN.md stage E: read the target's actual PE machine instead
+         * of guessing from its name. A bare exe name lives directly in one of
+         * the per-arch bundle dirs (same convention the farms below rely on);
+         * a full Win32 path lives under the prefix's drive_c. Any lookup or
+         * parse failure leaves target_machine at 0, i.e. "unknown", and the
+         * name heuristic below is then used exactly as before. */
         BOOL is_full_path_exe = (strchr(madeira_exe, '\\') != NULL) ||
                                 (madeira_exe[0] && madeira_exe[1] == ':');
         uint16_t target_machine = 0;
@@ -679,17 +668,58 @@ static void *wine_process_thread(void *arg) {
                 /* stage C review F10: only skip the "C:\" prefix when there
                  * actually is one — otherwise madeira_exe + 3 reads past the
                  * end of a short name. */
-                char windir[768];
-                snprintf(windir, sizeof(windir), "%s", madeira_exe + 3); /* skip "C:\" */
+                char windir[1024];
+                /* verbatim apart from the separator flip: spaces, apostrophes
+                 * and anything else in the path are copied as-is, and fopen()
+                 * below takes the bytes with no shell in between */
+                if (snprintf(windir, sizeof(windir), "%s", madeira_exe + 3) >= (int)sizeof(windir))
+                    dprintf(STDERR_FILENO, "[WineProc] WARNING: exe path truncated in the PE-machine probe; "
+                                           "a 32-bit target may be misdetected as 64-bit\n");
                 for (char *p = windir; *p; p++) if (*p == '\\') *p = '/';
-                snprintf(probe, sizeof(probe), "%s/drive_c/%s", g_prefix_path, windir);
+                if (snprintf(probe, sizeof(probe), "%s/drive_c/%s", g_prefix_path, windir) >= (int)sizeof(probe))
+                    dprintf(STDERR_FILENO, "[WineProc] WARNING: probe path truncated; "
+                                           "a 32-bit target may be misdetected as 64-bit\n");
             } else {
+                /* A BARE NAME is resolved by the launch below as
+                 * C:\windows\system32\<name>, which is symlinked from the
+                 * 64-bit farm — so a name that exists in a 64-bit farm is NOT
+                 * a 32-bit target, whatever i386-windows also happens to hold.
+                 *
+                 * This test is load-bearing now that the full i386 Wine set
+                 * ships: i386-windows carries explorer.exe, cmd.exe, start.exe,
+                 * notepad.exe, regedit.exe and friends under exactly the same
+                 * names as the 64-bit farms. Probing i386-windows first would
+                 * make the virtual-desktop launch (MADEIRA_EXE=explorer.exe)
+                 * look like a 32-bit MAIN image, reserve a guest window for the
+                 * whole session and route the exe at C:\windows\syswow64. To
+                 * launch a 32-bit build of a colliding name on purpose, give its
+                 * full path (C:\windows\syswow64\<name>) — the drive_c branch
+                 * above reads that file's own header and needs no name rules. */
                 NSString *bundlePathForProbe = [[NSBundle mainBundle] bundlePath];
-                snprintf(probe, sizeof(probe), "%s/i386-windows/%s",
-                         bundlePathForProbe.UTF8String, madeira_exe);
-                if (access(probe, R_OK) != 0) probe[0] = 0;
+                static const char * const farms64[] = { "aarch64-windows", "arm64ec-windows" };
+                int in_64bit_farm = 0;
+                for (size_t f = 0; f < sizeof(farms64) / sizeof(farms64[0]) && !in_64bit_farm; f++) {
+                    char cand[1024];
+                    snprintf(cand, sizeof(cand), "%s/%s/%s",
+                             bundlePathForProbe.UTF8String, farms64[f], madeira_exe);
+                    if (access(cand, R_OK) == 0) in_64bit_farm = 1;
+                }
+                if (in_64bit_farm) {
+                    dprintf(STDERR_FILENO, "[WineProc] PE probe: bare name '%s' exists in a 64-bit farm — "
+                                           "not probing i386-windows for it\n", madeira_exe);
+                } else {
+                    snprintf(probe, sizeof(probe), "%s/i386-windows/%s",
+                             bundlePathForProbe.UTF8String, madeira_exe);
+                    if (access(probe, R_OK) != 0) probe[0] = 0;
+                }
             }
             if (probe[0]) target_machine = madeira_pe_machine(probe);
+            /* Name the file that was (or was not) read. A typed path that does
+             * not exist, or one under a folder the probe resolved differently,
+             * otherwise shows up only as a target silently treated as 64-bit. */
+            dprintf(STDERR_FILENO, "[WineProc] PE probe: '%s' -> machine=0x%x%s\n",
+                    probe[0] ? probe : "(no probe path)", target_machine,
+                    probe[0] && !target_machine ? "  (unreadable or not a PE)" : "");
         }
         BOOL is_i386_target = (target_machine == MADEIRA_IMAGE_FILE_MACHINE_I386);
         if (target_machine) {
@@ -698,6 +728,35 @@ static void *wine_process_thread(void *arg) {
             dprintf(STDERR_FILENO, "[WineProc] Target exe PE machine=0x%x (%s)\n",
                     target_machine, is_i386_target ? "i386" : "not i386");
         }
+
+        /* Which 64-bit system-DLL farm this session's own Wine core runs on.
+         * x86_64 guests need arm64ec-windows (ARM64EC hybrid DLLs that interop
+         * with FEX-translated x86_64 code); everything else runs on plain
+         * aarch64-windows. MADEIRA_USE_ARM64EC=1 forces it.
+         *
+         * Decided from the PROBED machine when the probe succeeded. The old
+         * rule was "the name contains x64, or the path contains a backslash",
+         * and that second clause is wrong for a 32-bit target given by full
+         * path: a WoW64 process's 64-bit half is plain aarch64 (get_pe_dir()
+         * resolves /aarch64-windows because the main image is i386, so
+         * is_arm64ec() is false), yet the farm would have been populated with
+         * ARM64EC builds. Bare-name inputs do not resolve in the probe, so they
+         * fall back to the name heuristic and keep their existing behaviour;
+         * an x86_64 full-path target probes 0x8664 and keeps arm64ec too. */
+        BOOL use_arm64ec;
+        if (force_ec && *force_ec == '1')
+            use_arm64ec = YES;
+        else if (target_machine == MADEIRA_IMAGE_FILE_MACHINE_AMD64)
+            use_arm64ec = YES;
+        else if (target_machine == MADEIRA_IMAGE_FILE_MACHINE_I386 ||
+                 target_machine == MADEIRA_IMAGE_FILE_MACHINE_ARM64)
+            use_arm64ec = NO;
+        else
+            use_arm64ec = (strstr(madeira_exe, "x64") != NULL) || is_full_path_exe;
+        const char *bundle_subdir = use_arm64ec ? "arm64ec-windows" : "aarch64-windows";
+        LOG("Target exe: %{public}s (bundle=%{public}s)", madeira_exe, bundle_subdir);
+        dprintf(STDERR_FILENO, "[WineProc] Target exe: %s (bundle=%s, probed machine=0x%x)\n",
+                madeira_exe, bundle_subdir, target_machine);
 
         // Ensure Wine prefix has system32 directory with DLLs from bundle
         {
@@ -915,8 +974,14 @@ static void *wine_process_thread(void *arg) {
         // path used by cube/fib/hello tests) — or in syswow64 for an i386
         // target (WOW64_DESIGN.md stage E), matching where the syswow64 farm
         // above just symlinked it from i386-windows/.
-        char exe_path[512];
-        if (strchr(madeira_exe, '\\') || (madeira_exe[0] && madeira_exe[1] == ':')) {
+        /* 1024, not 512: a typed Win32 path can be long, and a SILENT truncation
+         * here turns into "file not found" far away from its cause. */
+        char exe_path[1024];
+        if (is_full_path_exe) {
+            if (strlen(madeira_exe) >= sizeof(exe_path))
+                dprintf(STDERR_FILENO, "[WineProc] ERROR: MADEIRA_EXE is %zu bytes, longer than the %zu-byte "
+                                       "launch path buffer — it will be truncated and will not be found\n",
+                        strlen(madeira_exe), sizeof(exe_path));
             snprintf(exe_path, sizeof(exe_path), "%s", madeira_exe);
         } else if (is_i386_target) {
             snprintf(exe_path, sizeof(exe_path), "C:\\windows\\syswow64\\%s", madeira_exe);
@@ -924,21 +989,49 @@ static void *wine_process_thread(void *arg) {
             snprintf(exe_path, sizeof(exe_path), "C:\\windows\\system32\\%s", madeira_exe);
         }
 
-        // Optional MADEIRA_ARGS env var: space-separated args appended to argv.
-        // Tokenized in-place; max 16 extra tokens.
+        // Optional MADEIRA_ARGS env var: args appended to argv, max 16 tokens.
+        //
+        // Tokenized in place, honouring DOUBLE QUOTES. The old split was a plain
+        // strtok_r on " ", so an argument containing a space (any Windows path —
+        // "C:\Some Folder\data.pak") was silently torn into two argv entries and
+        // the program received nonsense. Quotes group; the quote characters
+        // themselves are removed, exactly as a Win32 command line would be
+        // parsed, and Wine's build_command_line re-quotes on the way out so the
+        // guest sees the argument whole again. Apostrophes are ordinary
+        // characters here and in the shell-free path below — nothing strips or
+        // escapes them.
         static char args_buf[1024];
         char *extra_argv[16] = {0};
         int extra_argc = 0;
         const char *madeira_args = getenv("MADEIRA_ARGS");
         if (madeira_args && *madeira_args) {
+            if (strlen(madeira_args) >= sizeof(args_buf))
+                dprintf(STDERR_FILENO, "[WineProc] WARNING: MADEIRA_ARGS is %zu bytes, truncating to %zu\n",
+                        strlen(madeira_args), sizeof(args_buf) - 1);
             strncpy(args_buf, madeira_args, sizeof(args_buf) - 1);
             args_buf[sizeof(args_buf) - 1] = 0;
-            char *saveptr = NULL;
-            for (char *tok = strtok_r(args_buf, " ", &saveptr);
-                 tok && extra_argc < 16;
-                 tok = strtok_r(NULL, " ", &saveptr)) {
-                extra_argv[extra_argc++] = tok;
+
+            char *src = args_buf;      /* read cursor */
+            char *dst = args_buf;      /* write cursor: always <= src, so in place */
+            while (*src && extra_argc < 16) {
+                while (*src == ' ' || *src == '\t') src++;
+                if (!*src) break;
+                extra_argv[extra_argc++] = dst;
+                int in_quotes = 0;
+                while (*src && (in_quotes || (*src != ' ' && *src != '\t'))) {
+                    if (*src == '"') { in_quotes = !in_quotes; src++; continue; }
+                    *dst++ = *src++;
+                }
+                /* dst can still EQUAL src here (a token with no quotes in it),
+                 * so the separator has to be read before the terminator is
+                 * written over it. */
+                int had_separator = (*src != 0);
+                *dst++ = 0;
+                if (had_separator) src++;
             }
+            if (*src)
+                dprintf(STDERR_FILENO, "[WineProc] WARNING: MADEIRA_ARGS has more than 16 tokens, "
+                                       "the rest are dropped: %s\n", src);
         }
 
         char *argv[24];
@@ -959,16 +1052,33 @@ static void *wine_process_thread(void *arg) {
          * "cache/721e72f7.pc") then resolve to doubled paths that don't
          * exist. Per GPT diagnosis 2026-05-12. Only chdir for full-path EXE
          * launches; bare-name launches (cube, hello-x64) use C:\windows\system32. */
-        if (strchr(madeira_exe, '\\') || (madeira_exe[0] && madeira_exe[1] == ':')) {
-            /* Convert "C:\Program Files\Thumper\X.exe" → unix path */
+        if (is_full_path_exe) {
+            /* Convert "C:\Some Folder\It's Here\Binaries\app.exe" → unix path.
+             *
+             * Byte-for-byte: only '\\' becomes '/'. Spaces, apostrophes and
+             * every other character are copied verbatim, and nothing here goes
+             * through a shell — chdir()/setenv() take the bytes directly — so
+             * no quoting or escaping is involved at any step.
+             *
+             * Guarded like the PE-machine probe above (stage C review F10): the
+             * "C:\\" prefix is only skipped when there really is a drive letter,
+             * so a relative "\\dir\\app.exe" no longer reads three bytes in from
+             * an arbitrary offset. */
             char unix_dir[1024];
+            char wine_cwd[1024];
             const char *drive_c = "drive_c";
-            const char *after_drive = madeira_exe + 3; /* skip "C:\" */
+            int has_drive = (madeira_exe[0] && madeira_exe[1] == ':' && madeira_exe[2] == '\\');
+            const char *after_drive = has_drive ? madeira_exe + 3 : madeira_exe;
             char *last_sep = strrchr(madeira_exe, '\\');
-            if (last_sep && last_sep > madeira_exe + 3) {
-                /* Get "Program Files\Thumper" from "C:\Program Files\Thumper\X.exe" */
+
+            unix_dir[0] = 0;
+            wine_cwd[0] = 0;
+            if (last_sep && last_sep > after_drive) {
+                /* Get "Some Folder\It's Here\Binaries" from the full path */
                 size_t dir_len = (size_t)(last_sep - after_drive);
-                char windir[512];
+                char windir[1024];
+
+                if (dir_len >= sizeof(windir)) dir_len = sizeof(windir) - 1;
                 memcpy(windir, after_drive, dir_len);
                 windir[dir_len] = 0;
                 /* Translate backslashes to forward slashes */
@@ -980,20 +1090,23 @@ static void *wine_process_thread(void *arg) {
                 /* Also set the iOS-specific override so env_ios.c's
                  * get_initial_directory bypasses unix_to_nt_file_name (which
                  * fails to resolve drive_c via dosdevices on iOS). */
-                char wine_cwd[768];
-                /* Strip trailing exe name from madeira_exe to get the dir part */
                 {
-                    const char *exe = madeira_exe;
-                    size_t dir_len = (size_t)(last_sep - exe);
-                    if (dir_len < sizeof(wine_cwd) - 2) {
-                        memcpy(wine_cwd, exe, dir_len);
-                        wine_cwd[dir_len] = '\\';
-                        wine_cwd[dir_len + 1] = 0;
+                    size_t win_len = (size_t)(last_sep - madeira_exe);
+                    if (win_len < sizeof(wine_cwd) - 2) {
+                        memcpy(wine_cwd, madeira_exe, win_len);
+                        wine_cwd[win_len] = '\\';
+                        wine_cwd[win_len + 1] = 0;
                         setenv("MADEIRA_INITIAL_CWD", wine_cwd, 1);
                     }
                 }
                 dprintf(STDERR_FILENO, "[WineProc] chdir(%s) = %d errno=%d, PWD + MADEIRA_INITIAL_CWD=%s\n",
                         unix_dir, rc, rc ? errno : 0, wine_cwd);
+                if (rc)
+                    dprintf(STDERR_FILENO, "[WineProc] WARNING: the exe's own directory is not the working "
+                                           "directory; programs that open files relative to it will fail\n");
+            } else {
+                dprintf(STDERR_FILENO, "[WineProc] no directory component in '%s' — working directory left as is\n",
+                        madeira_exe);
             }
         }
 

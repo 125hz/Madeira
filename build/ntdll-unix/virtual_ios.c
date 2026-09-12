@@ -5522,8 +5522,27 @@ static struct ios_wow_window *ios_wow_slot_for_peb( void *peb_id )
 }
 
 /* The calling thread's window: its pseudo-process's, or one it reserved but
- * has not bound to a PEB yet (the child boot path reserves before the child
- * PEB exists). */
+ * whose PEB this thread cannot resolve yet.
+ *
+ * The owner fallback used to require slot->peb == NULL, i.e. "reserved but not
+ * bound".  That left a WINDOW-DARK GAP on the child boot path: a child's PEB is
+ * resolved through ios_jit_current_peb(), which reads the TEB out of the raw
+ * TSD slot / ios_teb_tls_key — and wine_ios_child_main publishes the child's
+ * TEB there only AFTER it calls ios_wow_window_bind().  Between the bind and
+ * that publication ios_jit_current_peb() still returns NULL on the child's own
+ * boot thread, so ios_wow_slot_for_peb() found nothing and the fallback refused
+ * the now-bound slot: ios_wow_base() read 0 for the one caller in the gap
+ * (wow_teb->Peb = ios_wow_guest_addr( child_peb + page_size )), which therefore
+ * published a TRUNCATED HOST pointer as the 32-bit TEB's PEB — exactly the
+ * garbage that write exists to repair.  start_main_thread has the same gap
+ * (bind at "ios_wow_window_bind( peb )" precedes the TEB-TSD discovery block)
+ * and only escapes it because nothing in its gap touches the window.
+ *
+ * The owner test is what makes the relaxation safe: `owner` is the thread that
+ * reserved the window, i.e. the owning pseudo-process's own boot thread, so it
+ * can only ever resolve to that process's window.  A slot whose PEB this thread
+ * CAN resolve is matched by ios_wow_slot_for_peb() first, so a bound slot is
+ * never reached through the fallback once identity works. */
 static struct ios_wow_window *ios_wow_slot_current(void)
 {
     struct ios_wow_window *slot = ios_wow_slot_for_peb( ios_jit_current_peb() );
@@ -5531,7 +5550,7 @@ static struct ios_wow_window *ios_wow_slot_current(void)
 
     if (slot) return slot;
     for (i = 0; i < n; i++)
-        if (ios_wow_windows[i].base && !ios_wow_windows[i].leaked && !ios_wow_windows[i].peb &&
+        if (ios_wow_windows[i].base && !ios_wow_windows[i].leaked &&
             pthread_equal( ios_wow_windows[i].owner, pthread_self() ))
             return &ios_wow_windows[i];
     return NULL;
@@ -5754,12 +5773,64 @@ static int ios_wow_window_try( ULONG_PTR base, unsigned *guard_owned )
     }
     if (anon_mmap_tryfixed( (void *)base, IOS_WOW_WINDOW_SIZE,
                             PROT_NONE, MAP_NORESERVE ) == MAP_FAILED)
+    {
+        /* Name the occupant.  The usual one is ordinary MEM_TOP_DOWN furniture
+         * (the session TEB block and thread stacks) that was placed at the top
+         * of the band before any 32-bit process asked for a window — see
+         * ios_wow_candidate_slot(). */
+        ios_va_describe( (void *)base, what, sizeof(what) );
+        dprintf( 2, "[wow-window] B=%p REJECTED: the 4GB range is not free (%s); "
+                    "something is already mapped inside this slot\n", (void *)base, what );
         return 0;
+    }
     mmap_add_reserved_area( (void *)base, IOS_WOW_WINDOW_SIZE );
     dprintf( 2, "[wow-window] B=%p: reserved exactly 4GB; FB3 guard BORROWED from the "
                 "pre-existing PROT_NONE region at %p\n",
              (void *)base, (void *)(base + IOS_WOW_WINDOW_SIZE) );
     return 1;
+}
+
+/* The lowest 4 GB-ALIGNED slot a future 32-bit pseudo-process could still take,
+ * or 0 if the band has none left.  Same candidate rule as ios_wow_window_pick().
+ *
+ * DEVICE EVIDENCE (desktop session): a 32-bit child spawned by CreateProcess
+ * died with "[Wine child] guest window reserve FAILED: 0xc0000017" while the
+ * furniture band looked almost empty — the census reported 8255 MB of 15232 MB
+ * occupied, but ~8192 MB of that is the [cage] holdback, so REAL furniture was
+ * about 63 MB.  The holdback fills the band from 0x7200000000 to the furniture
+ * ceiling, which leaves exactly ONE 4 GB-aligned candidate; and MEM_TOP_DOWN
+ * placements (the session TEB block first of all) go to the very top of what is
+ * left — immediately below the holdback, i.e. into the top of that one
+ * candidate.  Sixty-odd megabytes of furniture therefore made every 32-bit
+ * CHILD unstartable for the rest of the session.  A 32-bit MAIN image never hit
+ * it because start_main_thread reserves the window before the first TEB exists.
+ *
+ * So keep top-down furniture below the candidate.  ADVISORY, never fatal: the
+ * caller applies it only where it can also withdraw it (see map_view). */
+ULONG_PTR ios_wow_candidate_slot(void)
+{
+    ULONG_PTR floor = ios_usable_va_floor;
+    ULONG_PTR ceil  = ios_furniture_ceiling ? ios_furniture_ceiling : (ULONG_PTR)user_space_limit;
+    ULONG_PTR cand;
+    unsigned i, n;
+
+    if (ceil > IOS_WOW_CEF_POOLS_START) ceil = IOS_WOW_CEF_POOLS_START;
+    if (ceil <= floor || ceil - floor < IOS_WOW_WINDOW_SIZE) return 0;
+
+    n = ios_wow_window_count;
+    for (cand = (floor + IOS_WOW_WINDOW_SIZE - 1) & ~(IOS_WOW_WINDOW_SIZE - 1);
+         cand >= floor && cand + IOS_WOW_WINDOW_SIZE <= ceil;
+         cand += IOS_WOW_WINDOW_SIZE)
+    {
+        int taken = 0;
+
+        /* a slot an existing (or retired) window already owns is kept out of
+           furniture by ios_wow_exclude_windows(), not by this bias */
+        for (i = 0; i < n; i++)
+            if (ios_wow_windows[i].base == cand) { taken = 1; break; }
+        if (!taken) return cand;
+    }
+    return 0;
 }
 
 static ULONG_PTR ios_wow_window_pick( unsigned *guard_owned )
@@ -5790,8 +5861,14 @@ static ULONG_PTR ios_wow_window_pick( unsigned *guard_owned )
 
     ERR( "[wow-window] no free 4GB-ALIGNED slot in [%p,%p) — a 32-bit process "
          "cannot start (misaligned windows are not allowed, and a slot whose "
-         "neighbour page at B+4GB is accessible is rejected)\n",
-         (void *)floor, (void *)ceil );
+         "neighbour page at B+4GB is accessible is rejected). The band holds "
+         "%llu candidate slot(s); the REJECTED lines above say what is in each. "
+         "If the occupant is ordinary furniture, the top-down bias in map_view "
+         "did not run early enough for this session\n",
+         (void *)floor, (void *)ceil,
+         (unsigned long long)(ceil > floor ? (ceil - ((floor + IOS_WOW_WINDOW_SIZE - 1) &
+                                                      ~(IOS_WOW_WINDOW_SIZE - 1))) / IOS_WOW_WINDOW_SIZE
+                                           : 0) );
     return 0;
 }
 
@@ -10468,6 +10545,27 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
              * room at all, keep the original range rather than fail — the
              * same rule the furniture ceiling follows (ml117). */
             if (excl_start < excl_end) { start = excl_start; end = excl_end; }
+        }
+
+        /* Keep the one remaining 4 GB-ALIGNED slot free for a future 32-bit
+         * pseudo-process: without this the session TEB block and the other
+         * MEM_TOP_DOWN furniture land at the very top of the band, which is
+         * inside that slot, and every later 32-bit CHILD then fails its guest
+         * window reserve with STATUS_NO_MEMORY (see ios_wow_candidate_slot()).
+         *
+         * Only for TOP-DOWN picks — a bottom-up pick starts at the band floor
+         * and reaches a candidate only once the space below it is genuinely
+         * full, which is the same trade made explicitly.  And only when
+         * ceiling_relaxable, i.e. when the ONLY constraints in force are ours:
+         * that is exactly the set of requests that can withdraw them again at
+         * the "THE CEILING IS ADVISORY, NEVER FATAL" retry below, so this bias
+         * can never turn a satisfiable allocation into STATUS_NO_MEMORY
+         * ("never impose a constraint we cannot also withdraw", ml118). */
+        if (top_down && ceiling_relaxable)
+        {
+            ULONG_PTR cand = ios_wow_candidate_slot();
+
+            if (cand && (void *)cand > start && (void *)cand < end) end = (void *)cand;
         }
 #endif
 

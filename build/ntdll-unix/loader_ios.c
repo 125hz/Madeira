@@ -545,6 +545,15 @@ static const char *get_pe_dir( WORD machine )
     }
 }
 
+/* Same answer as get_pe_dir(), exported so the spawn path can SAY which PE farm
+ * a child's system DLLs will be resolved from.  Routing an i386 child at an
+ * aarch64/arm64ec farm (or vice versa) otherwise shows up only as a child that
+ * never produces a window. */
+const char *ios_pe_dir_for_machine( WORD machine )
+{
+    return get_pe_dir( machine );
+}
+
 static WORD get_alt_machine( WORD machine )
 {
     switch (machine)
@@ -3205,12 +3214,31 @@ extern size_t server_init_process_child( int child_fd_socket );
 
 DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_socket )
 {
+    /* set by the spawner (process_ios.c) and updated as this child boots, so a
+     * failure anywhere on the path names the stage exactly once */
+    extern _Thread_local const char *ios_child_boot_stage;
+    extern _Thread_local WORD ios_child_main_machine;
     TEB *teb;
     PEB *child_peb;
     NTSTATUS status;
 
     dprintf(STDERR_FILENO, "[Wine child] wine_ios_child_main: argc=%d argv[1]=%s fd=%d\n",
             argc, argc > 1 ? argv[1] : "(none)", child_fd_socket);
+
+    /* WOW64_DESIGN.md §2: every early-return below used to be a bare dprintf,
+     * so a child that died during bring-up produced no ERR at all and the
+     * parent simply never saw a process appear.  CHILD_STAGE() names the stage
+     * the child is in; CHILD_BOOT_FAIL() is the single exit that reports it. */
+#define CHILD_STAGE(s)  (ios_child_boot_stage = (s))
+#define CHILD_BOOT_FAIL(fmt, ...)                                                       \
+    do {                                                                                \
+        dprintf( STDERR_FILENO, "[Wine child] BOOT FAILED at stage '%s': " fmt,          \
+                 ios_child_boot_stage, ##__VA_ARGS__ );                                  \
+        ERR( "[Wine child] boot FAILED at stage '%s' for %s: " fmt,                      \
+             ios_child_boot_stage, argc > 1 ? argv[1] : "?", ##__VA_ARGS__ );            \
+        return;                                                                         \
+    } while (0)
+    CHILD_STAGE( "entry" );
 
     /* X1 recon: EC-ness is currently session-wide (main_image_info /
      * current_machine are shared ntdll-unix globals). Log what this child
@@ -3228,25 +3256,39 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
      * usual source of the machine, only runs much further down.  The window
      * is bound to the child's PEB as soon as that exists. */
     {
-        extern _Thread_local WORD ios_child_main_machine;
+        int child_is_i386 = ios_child_main_machine &&
+                            !is_machine_64bit( ios_child_main_machine );
 
-        if (ios_child_main_machine && !is_machine_64bit( ios_child_main_machine ))
+        /* One line with everything needed to tell "this child is 32-bit and got
+         * a window" from "the spawner never told us the machine" and from "the
+         * one window slot was already gone" — the three shapes a silent
+         * desktop-launched 32-bit child can have. */
+        if (child_is_i386)
         {
-            if ((status = ios_wow_window_reserve()))
-            {
-                dprintf(STDERR_FILENO, "[Wine child] guest window reserve FAILED: 0x%x — "
-                        "a 32-bit child cannot start without one\n", status);
-                return;
-            }
+            CHILD_STAGE( "guest-window-reserve" );
+            status = ios_wow_window_reserve();
+            dprintf(STDERR_FILENO, "[Wine child] i386 image %s machine=0x%x window=%p reserve=0x%x\n",
+                    argc > 1 ? argv[1] : "(none)", ios_child_main_machine,
+                    (void *)ios_wow_base(), (unsigned)status);
+            ERR( "[Wine child] i386 image %s machine=%04x window=%p reserve=%x\n",
+                 argc > 1 ? argv[1] : "(none)", ios_child_main_machine,
+                 (void *)ios_wow_base(), (unsigned)status );
+            if (status)
+                CHILD_BOOT_FAIL( "guest window reserve returned 0x%x — a 32-bit child "
+                                 "cannot start without one (the furniture band holds very "
+                                 "few 4GB-aligned slots; see [wow-window] lines above)\n",
+                                 (unsigned)status );
         }
+        else
+            dprintf(STDERR_FILENO, "[Wine child] 64-bit image %s machine=0x%x (no guest window)\n",
+                    argc > 1 ? argv[1] : "(none)", ios_child_main_machine);
     }
 
     /* Allocate a new TEB for this child "process" thread */
+    CHILD_STAGE( "virtual_alloc_teb" );
     status = virtual_alloc_teb( &teb );
-    if (status) {
-        dprintf(STDERR_FILENO, "[Wine child] virtual_alloc_teb FAILED: 0x%x\n", status);
-        return;
-    }
+    if (status)
+        CHILD_BOOT_FAIL( "virtual_alloc_teb returned 0x%x\n", (unsigned)status );
 
     /* Allocate a SEPARATE PEB for this child "process".
      * Without this, parent and child share peb->Ldr (module list),
@@ -3260,23 +3302,22 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
          * view there, so nothing else can be placed on top of it. */
         SIZE_T peb_size = 0x4000;
 
+        CHILD_STAGE( "windowed-peb-alloc" );
         child_peb = NULL;
         status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&child_peb, limit_4g - 1,
                                           &peb_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
-        if (status) {
-            dprintf(STDERR_FILENO, "[Wine child] windowed PEB alloc FAILED: 0x%x\n", (unsigned)status);
-            return;
-        }
+        if (status)
+            CHILD_BOOT_FAIL( "windowed PEB alloc returned 0x%x (window %p)\n",
+                             (unsigned)status, (void *)ios_wow_base() );
         memset( child_peb, 0, 0x4000 );
     }
     else
     {
+        CHILD_STAGE( "peb-mmap" );
         child_peb = mmap( NULL, 0x4000, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANON, -1, 0 );
-        if (child_peb == MAP_FAILED) {
-            dprintf(STDERR_FILENO, "[Wine child] PEB mmap FAILED: errno=%d\n", errno);
-            return;
-        }
+        if (child_peb == MAP_FAILED)
+            CHILD_BOOT_FAIL( "PEB mmap failed, errno=%d\n", errno );
     }
     /* Copy parent PEB — share heap, locks, etc. Clear LdrData so the child's
      * LdrInitializeThunk builds a fresh module list instead of traversing
@@ -3331,13 +3372,26 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
     /* WOW64_DESIGN.md §2: the window now has an owner, so every later
      * ios_wow_base()/ios_wow_base_for_peb() lookup resolves through the PEB
      * (including from other threads and from NtQueryInformationProcess). */
+    CHILD_STAGE( "window-bind" );
     ios_wow_window_bind( child_peb );
     /* init_teb ran before the child PEB existed, so TEB32->Peb still points at
      * the CREATOR's PEB (which is outside this window — a truncated host
-     * address, i.e. garbage to guest code).  Repoint it now. */
+     * address, i.e. garbage to guest code).  Repoint it now.
+     *
+     * This runs in the gap between ios_wow_window_bind() above and the
+     * pthread_setspecific( ios_teb_tls_key, teb ) further down, so this thread
+     * cannot yet resolve its own PEB and the window is found only through the
+     * slot's owner thread (see ios_wow_slot_current()).  Assert that it IS
+     * found: with base 0 ios_wow_guest_addr() silently truncates the host
+     * pointer and writes exactly the garbage this repoint exists to remove. */
     {
         WOW_TEB *wow_teb = get_wow_teb( teb );
+        ULONG_PTR wow_base = ios_wow_base();
 
+        if (wow_teb && !wow_base)
+            CHILD_BOOT_FAIL( "the guest window is not resolvable while repointing TEB32->Peb "
+                             "(child_peb=%p) — TEB32->Peb would be a truncated host pointer\n",
+                             child_peb );
         if (wow_teb)
             wow_teb->Peb = ios_wow_guest_addr( (char *)child_peb + page_size );
     }
@@ -3380,6 +3434,7 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
         main_argv = argv;
 
         /* Register with wineserver using the child's socketfd */
+        CHILD_STAGE( "server_init_process_child" );
         startup_info_size = server_init_process_child( child_fd_socket );
 
         /* init_startup_info — reads startup info from wineserver, loads the
@@ -3391,26 +3446,45 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
          * thread reads identity owner-aware from here on. */
         {
             SECTION_IMAGE_INFORMATION session_image_info = main_image_info;
+            CHILD_STAGE( "unix_init_startup_info" );
             unix_init_startup_info();
             ios_register_proc_ident( child_peb, &main_image_info );
             main_image_info = session_image_info;
         }
         dprintf(STDERR_FILENO, "[Wine child] PE loaded: Machine=0x%x TransferAddress=%p ImageBase=%p\n",
                 ios_cur_image_info()->Machine, ios_cur_image_info()->TransferAddress, peb->ImageBaseAddress);
+        if (!is_machine_64bit( ios_cur_image_info()->Machine ))
+            ERR( "[Wine child] i386 image mapped: base=%p transfer=%p window=%p guest_base=%p\n",
+                 peb->ImageBaseAddress, ios_cur_image_info()->TransferAddress,
+                 (void *)ios_wow_base(),
+                 (void *)(ULONG_PTR)ios_wow_guest_addr( peb->ImageBaseAddress ) );
 
         /* Set DLL load order for child's exe */
         *(ULONG_PTR *)&peb->CloudFileFlags = get_image_address();
         set_load_order_app_name( main_wargv[0] );
 
-        /* Set up thread stack */
-        init_thread_stack( teb, 0, 0, 0 );
+        /* Set up thread stack.  The status was dropped on the floor before: a
+         * failed 32-bit stack allocation (the window is the only place one can
+         * come from) left the child booting with TEB32 stack fields at 0 and
+         * faulting on its first guest push, with nothing said about it. */
+        CHILD_STAGE( "init_thread_stack" );
+        if ((status = init_thread_stack( teb, 0, 0, 0 )))
+            CHILD_BOOT_FAIL( "init_thread_stack returned 0x%x (window %p, guest ceiling %p)\n",
+                             (unsigned)status, (void *)ios_wow_base(),
+                             (void *)user_space_wow_limit );
 
         /* WOW64_DESIGN.md §2: a 32-bit child needs its own i386 ntdll mapped
          * (and LdrSystemDllInitBlock filled with GUEST addresses) exactly as
          * start_main_thread does for the session's main process.  The child
          * boot path never did this — there had never been a 32-bit child. */
         if (!is_machine_64bit( ios_cur_image_info()->Machine ))
+        {
+            CHILD_STAGE( "load_wow64_ntdll" );
             load_wow64_ntdll( ios_cur_image_info()->Machine );
+            ERR( "[Wine child] i386 ntdll bound: ntdll_handle=%p LdrInitializeThunk=%p (guest)\n",
+                 (void *)(ULONG_PTR)pLdrSystemDllInitBlock->ntdll_handle,
+                 (void *)(ULONG_PTR)pLdrSystemDllInitBlock->pLdrInitializeThunk );
+        }
 
         /* X3c: a cross-arch child (AMD64 exe, non-EC session) cannot run on
          * the session's aarch64 ntdll at all — load the ARM64EC build as a
@@ -3419,11 +3493,9 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
          * the standard map pipeline gave it pool/EC/x18 treatment. */
         if (ios_cur_image_info()->Machine == IMAGE_FILE_MACHINE_AMD64 && !is_arm64ec())
         {
+            CHILD_STAGE( "load_child_ec_ntdll" );
             if (ios_load_child_ec_ntdll( child_peb ) != 0)
-            {
-                dprintf(STDERR_FILENO, "[Wine child] EC ntdll load FAILED — cross-arch child cannot start\n");
-                return;
-            }
+                CHILD_BOOT_FAIL( "EC ntdll load failed — a cross-arch child cannot start\n" );
         }
         else
         /* S1: per-child ntdll copy. The child cannot share the parent's
@@ -3495,9 +3567,13 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
     }
 
     /* Finalize init and enter PE code (calls signal_start_thread, never returns) */
+    CHILD_STAGE( "server_init_process_done" );
     server_init_process_done();
 
     /* Never reaches here — server_init_process_done calls signal_start_thread */
+    CHILD_STAGE( "after-server_init_process_done" );
+#undef CHILD_STAGE
+#undef CHILD_BOOT_FAIL
 }
 #endif
 
