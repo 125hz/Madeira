@@ -6210,15 +6210,19 @@ extern NTSTATUS win32u_unix_lib_init(void);
  * guest addresses as host addresses — so the selection below must honour
  * `wow` exactly as get_unixlib_funcs() does for a real .so.
  *
- * Libraries deliberately absent here have no wow64 table at all
- * (audio_null_ios.c, nsi_unixlib_ios.c): a 32-bit caller is refused
- * rather than silently bound to the 64-bit table. */
+ * A library still absent here has no wow64 table at all: a 32-bit caller is
+ * refused rather than silently bound to the 64-bit table. */
 extern const void *dxmt_winemetal_unix_call_wow64_funcs[];
 extern const void *ws2_32_unix_call_wow64_funcs[];
 extern const void *bcrypt_unix_call_wow64_funcs[];
 extern const void *secur32_unix_call_wow64_funcs[];
 extern const void *crypt32_unix_call_wow64_funcs[];
 extern const void *dwrite_unix_call_wow64_funcs[];
+/* MADEIRA (M5): the audio driver and NSI, whose 64-bit tables are written by
+ * hand in this tree rather than compiled from wine/dlls/<dll>/, so their
+ * wow64 tables are named in the source instead of by build.sh's rename. */
+extern const void *audio_null_ios_unix_call_wow64_funcs[];
+extern const void *nsi_unix_call_wow64_funcs[];
 
 /***********************************************************************
  *           ios_module_export_name
@@ -6410,8 +6414,17 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             funcs64 = (const void *)dxmt_winemetal_unix_call_funcs;
             funcs_wow64 = (const void *)dxmt_winemetal_unix_call_wow64_funcs;
         } else if (match && (strstr(match, "wineios.drv") || strstr(match, "winecoreaudio") || strstr(match, "winealsa") || strstr(match, "winepulse"))) {
+            /* NOTE: mmdevapi does NOT reach the driver through this by-module
+             * path — __wine_load_unix_lib() asks for "wine<name>.drv" BY NAME
+             * and NtQueryVirtualMemory(MemoryWineLoadUnixLibByName[Wow64])
+             * binds the table there (see the audio branch in this file's
+             * NtQueryVirtualMemory), so no .drv PE is ever mapped and the
+             * i386 farm needs no driver file.  This branch stays for a module
+             * that IS mapped (a real winealsa/winepulse PE in a prefix), and
+             * now offers the wow64 table for the same reason. */
             libname = "audio_null_ios";
-            funcs64 = (const void *)audio_null_ios_unix_call_funcs;  /* no wow64 table */
+            funcs64 = (const void *)audio_null_ios_unix_call_funcs;
+            funcs_wow64 = (const void *)audio_null_ios_unix_call_wow64_funcs;
         } else if (match && strstr(match, "ws2_32")) {
             libname = "ws2_32";
             funcs64 = (const void *)ws2_32_unix_call_funcs;
@@ -6434,18 +6447,18 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
              * would silently leave the text stack dead again.
              *
              * MADEIRA: dwrite's wow64 table comes straight from the included
-             * dlls/dwrite/freetype.c and still converts with plain
-             * ULongToPtr(), not ios_wow_host_ptr(), unlike ws2_32/bcrypt/
-             * secur32/crypt32.  The argument LAYOUT is right (so binding it
-             * beats binding the 64-bit table), but the pointers inside it are
-             * guest addresses missing +B: a 32-bit dwrite.dll needs that same
-             * conversion pass before its glyph calls can work. */
+             * dlls/dwrite/freetype.c.  Its eight thunks now convert every
+             * embedded pointer with ios_wow_host_ptr() (M5), including the two
+             * array bases nested inside struct dwrite_outline32, so a 32-bit
+             * dwrite.dll's font data, glyph outlines and OUT slots resolve
+             * inside the guest window like ws2_32/bcrypt/secur32/crypt32. */
             libname = "dwrite (rev=ml494)";
             funcs64 = (const void *)dwrite_unix_call_funcs;
             funcs_wow64 = (const void *)dwrite_unix_call_wow64_funcs;
         } else if (match && strstr(match, "nsi.dll")) {
             libname = "nsi (rev=ml472)";
-            funcs64 = (const void *)nsi_unix_call_funcs;  /* no wow64 table */
+            funcs64 = (const void *)nsi_unix_call_funcs;
+            funcs_wow64 = (const void *)nsi_unix_call_wow64_funcs;
         } else if (match && strstr(match, "win32u")) {
             /* Register win32u's NtUser / NtGdi syscall table in slot 1.
              * Activating this causes user32 process_attach to crash until
@@ -17921,21 +17934,27 @@ NTSTATUS WINAPI NtQueryVirtualMemory( HANDLE process, LPCVOID addr,
                             strstr(ascii, "winealsa") || strstr(ascii, "winepulse") ||
                             strstr(ascii, "wineoss"))
                         {
-                            /* MADEIRA (WOW64_DESIGN.md §7.10 item 1): same rule as
-                             * load_builtin_unixlib's static fallback — audio_null_ios
-                             * has only a 64-bit table, so a 32-bit caller is refused
-                             * instead of being handed a mismatched argument layout. */
-                            if (info_class == MemoryWineLoadUnixLibByNameWow64)
+                            /* MADEIRA (WOW64_DESIGN.md §7.10 item 1): pick by the
+                             * CALLER's bitness, exactly as ios_bind_unixlib_table()
+                             * does for the by-module path.  This is the only place a
+                             * Wine audio driver is bound on iOS — mmdevapi's
+                             * __wine_load_unix_lib() asks for "wine<name>.drv" BY NAME
+                             * (HKCU\Software\Wine\Drivers\Audio = "ios" in the prefix
+                             * template), no .drv PE is ever mapped, and wow64.dll
+                             * routes a 32-bit caller here as ...ByNameWow64. */
                             {
-                                ERR("[unixlib] audio_null_ios (%s): no wow64 unix call table, "
-                                    "refusing to bind the 64-bit one for a 32-bit caller\n", ascii);
-                                return STATUS_NOT_SUPPORTED;
+                                BOOL wow = (info_class == MemoryWineLoadUnixLibByNameWow64);
+                                const void *table = wow
+                                    ? (const void *)audio_null_ios_unix_call_wow64_funcs
+                                    : (const void *)audio_null_ios_unix_call_funcs;
+
+                                dprintf( 2, "[unixlib] audio_null_ios (%s) -> %s table (%p)\n",
+                                         ascii, wow ? "wow64" : "64-bit", table );
+                                res[0] = (UINT64)(UINT_PTR)1; /* magic non-NULL handle */
+                                res[1] = (UINT64)(UINT_PTR)table;
+                                memcpy( buffer, res, min( len, sizeof(res) ));
+                                return STATUS_SUCCESS;
                             }
-                            ERR("iOS: MemoryWineLoadUnixLibByName %s -> audio_null_ios stub table\n", ascii);
-                            res[0] = (UINT64)(UINT_PTR)1; /* magic non-NULL handle */
-                            res[1] = (UINT64)(UINT_PTR)audio_null_ios_unix_call_funcs;
-                            memcpy( buffer, res, min( len, sizeof(res) ));
-                            return STATUS_SUCCESS;
                         }
                     }
 #endif

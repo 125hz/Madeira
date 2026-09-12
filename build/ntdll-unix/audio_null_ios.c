@@ -63,6 +63,7 @@ typedef int EDataFlow;
 #define AUDCLNT_E_NOT_INITIALIZED ((HRESULT)0x88890001L)
 #define S_FALSE 1
 #define E_FAIL 0x80004005L
+#define E_NOTIMPL 0x80004001L
 #define AUDCLNT_E_NOT_INITIALIZED 0x88890001L
 
 #define eRender 0
@@ -163,6 +164,14 @@ struct is_format_supported_params {
     HRESULT result;
 };
 
+struct get_loopback_capture_device_params {
+    const WCHAR *name;
+    const char *device;
+    char *ret_device;
+    UINT32 ret_device_len;
+    HRESULT result;
+};
+
 struct get_mix_format_params {
     const char *device;
     EDataFlow flow;
@@ -256,6 +265,52 @@ struct get_prop_value_params {
     unsigned int *buffer_size;
 };
 
+/* ------------------- MADEIRA: WoW64 guest window ------------------- */
+
+/* WOW64_DESIGN.md 2 "shifted guest window": a 32-bit pseudo-process owns one
+ * reserved host range [B, B+4G) and guest address `a` lives at host B + a.
+ * The helpers below are the same ones build/ntdll-unix/ios_wow.h and
+ * wine/include/wine/unixlib.h publish; they are respelled here (with matching
+ * signatures) because this file deliberately carries no Wine headers -- see
+ * the struct-mirror note above.  The guard is the one ios_wow.h uses, so if
+ * this file ever does gain those includes the first definition wins. */
+extern unsigned long ios_wow_base(void);          /* 0 when not a WoW process */
+extern int ios_wow_in_window(const void *addr);
+
+#ifndef __MADEIRA_IOS_WOW_HOST_PTR
+#define __MADEIRA_IOS_WOW_HOST_PTR
+static inline void *ios_wow_host_ptr(uint32_t addr)
+{
+    return addr ? (void *)(ios_wow_base() + (uintptr_t)addr) : NULL;
+}
+static inline uint32_t ios_wow_guest_ptr32(const void *host)
+{
+    return host ? (uint32_t)((uintptr_t)host - ios_wow_base()) : 0;
+}
+#endif
+
+/* A 32-bit field holding a guest pointer. */
+typedef uint32_t PTR32;
+
+/* Handles are never offset (WOW64_DESIGN.md 3, invariant 4): a 32-bit HANDLE
+ * is zero-extended, exactly like upstream's ULongToHandle(). */
+#define IOS_WOW_HANDLE(x)  ((HANDLE)(uintptr_t)(uint32_t)(x))
+
+/* Enough of NtAllocateVirtualMemory to put the render scratch inside the
+ * guest window.  Both live in the same statically-linked unix ntdll as
+ * NtSetEvent above; the signatures match wine/include/winternl.h with
+ * ULONG_PTR/SIZE_T spelled as the 64-bit unsigned types they are here. */
+extern NTSTATUS NtAllocateVirtualMemory( HANDLE process, void **ret, UINT_PTR zero_bits,
+                                         UINT_PTR *size_ptr, DWORD type, DWORD protect );
+extern NTSTATUS NtFreeVirtualMemory( HANDLE process, void **addr_ptr,
+                                     UINT_PTR *size_ptr, DWORD type );
+
+#define IOS_CURRENT_PROCESS ((HANDLE)(intptr_t)-1)
+#define IOS_MEM_COMMIT      0x00001000u
+#define IOS_MEM_RESERVE     0x00002000u
+#define IOS_MEM_RELEASE     0x00008000u
+#define IOS_PAGE_READWRITE  0x00000004u
+
 /* ---------------------------------------------------------------- */
 
 #define IOS_AUDIO_SAMPLE_RATE 48000u
@@ -284,6 +339,13 @@ struct ios_stream {
     UINT32 buffer_frames;        /* ring capacity in frames */
     BYTE *render_scratch;        /* contiguous area handed to GetBuffer */
     UINT32 scratch_frames;       /* scratch capacity */
+    /* MADEIRA: how render_scratch was obtained.  A 32-bit client can only
+     * address memory inside its guest window, so for a WoW process the
+     * scratch is an NtAllocateVirtualMemory reservation under a guest
+     * ceiling instead of a calloc(); scratch_guest says which free() to
+     * use.  See ios_audio_alloc_scratch(). */
+    int scratch_guest;
+    UINT_PTR scratch_bytes;      /* reservation size (scratch_guest only) */
     UINT32 pending_frames;       /* frames handed out, awaiting release */
     HANDLE event;
     /* Tier-2 real output */
@@ -521,6 +583,71 @@ static void ios_audio_teardown_unit(struct ios_stream *s) {
 
 /* ---------------------------------------------------------------- */
 
+/* MADEIRA (WOW64_DESIGN.md 3, invariants 1 and 2): render-buffer ownership.
+ *
+ * render_scratch is the ONE buffer this driver hands back to its client:
+ * get_render_buffer returns it and the application writes its samples
+ * straight into it (release_render_buffer then copies it into the ring).
+ * Invariant 1 says any pointer guest code can observe is a guest address, so
+ * for a 32-bit client that buffer MUST live inside that process's
+ * [B, B+4G) window.  A calloc() pointer is ordinary host furniture far above
+ * 4 GB: publishing it would truncate to an unrelated low address and the
+ * first sample the game wrote would land somewhere random in the window.
+ *
+ * So when the calling process has a window, reserve the scratch with a GUEST
+ * ceiling -- zero_bits = 1 gives limit 0x7fffffff, which virtual_ios.c's
+ * ios_wow_translate_limits() turns into [B+floor, B+0x7fffffff] -- and refuse
+ * loudly if the result somehow lands outside the window.  With no window
+ * (every 64-bit caller) this is byte-for-byte the calloc() path that has
+ * always been here.
+ *
+ * The ring and the AudioUnit are untouched: they are only ever read by the
+ * unix side and the Core Audio RT thread, which speak host addresses.
+ */
+static BYTE *ios_audio_alloc_scratch(UINT32 frames, UINT32 frame_bytes,
+                                     int *is_guest, UINT_PTR *alloc_bytes)
+{
+    void *addr = NULL;
+    UINT_PTR size;
+    NTSTATUS st;
+
+    *is_guest = 0;
+    *alloc_bytes = 0;
+    if (!frames || !frame_bytes) return NULL;
+
+    if (!ios_wow_base())
+        return (BYTE *)calloc(frames, frame_bytes);
+
+    size = (UINT_PTR)frames * frame_bytes;
+    st = NtAllocateVirtualMemory(IOS_CURRENT_PROCESS, &addr, 1 /* zero_bits */, &size,
+                                 IOS_MEM_COMMIT | IOS_MEM_RESERVE, IOS_PAGE_READWRITE);
+    if (st || !addr || !ios_wow_in_window(addr)) {
+        fprintf(stderr, "[ios_audio] WOW64 render scratch (%u frames x %u B) could not be "
+                        "placed in the guest window (status 0x%x, addr %p) -- refusing, "
+                        "rather than handing a host-only pointer to 32-bit code\n",
+                frames, frame_bytes, (unsigned)st, addr);
+        if (!st && addr) {
+            UINT_PTR z = 0;
+            NtFreeVirtualMemory(IOS_CURRENT_PROCESS, &addr, &z, IOS_MEM_RELEASE);
+        }
+        return NULL;
+    }
+    *is_guest = 1;
+    *alloc_bytes = size;
+    return (BYTE *)addr;
+}
+
+static void ios_audio_free_scratch(BYTE *scratch, int is_guest)
+{
+    if (!scratch) return;
+    if (is_guest) {
+        void *addr = scratch;
+        UINT_PTR z = 0;
+        NtFreeVirtualMemory(IOS_CURRENT_PROCESS, &addr, &z, IOS_MEM_RELEASE);
+    }
+    else free(scratch);
+}
+
 static NTSTATUS ios_process_attach(void *args) {
     LOG_FN_CALL(0, "process_attach");
     (void)args;
@@ -629,9 +756,10 @@ static NTSTATUS ios_create_stream(void *args) {
     s->buffer_frames = (UINT32)dur_frames;
     free(s->ring);
     s->ring = (BYTE *)calloc(s->buffer_frames, s->frame_bytes);
-    free(s->render_scratch);
-    s->scratch_frames = s->buffer_frames;
-    s->render_scratch = (BYTE *)calloc(s->scratch_frames, s->frame_bytes);
+    /* MADEIRA: guest-visible for a WoW client, plain calloc otherwise. */
+    s->render_scratch = ios_audio_alloc_scratch(s->buffer_frames, s->frame_bytes,
+                                                &s->scratch_guest, &s->scratch_bytes);
+    s->scratch_frames = s->render_scratch ? s->buffer_frames : 0;
     s->pending_frames = 0;
     atomic_store(&s->write_pos, 0);
     atomic_store(&s->play_pos, 0);
@@ -647,7 +775,8 @@ static NTSTATUS ios_create_stream(void *args) {
     if (stream_register(s)) {
         fprintf(stderr, "[ios-astream] ml739 too many streams -- refusing\n");
         ios_audio_teardown_unit(s);
-        free(s->render_scratch); free(s->ring); free(s);
+        ios_audio_free_scratch(s->render_scratch, s->scratch_guest);
+        free(s->ring); free(s);
         /* the handle was published above; it now points at freed memory */
         if (p->stream) *p->stream = 0;
         p->result = E_OUTOFMEMORY;
@@ -675,7 +804,7 @@ static NTSTATUS ios_release_stream(void *args) {
     }
     ios_audio_teardown_unit(s);
     stream_unregister(s);
-    free(s->render_scratch);
+    ios_audio_free_scratch(s->render_scratch, s->scratch_guest);
     free(s->ring);
     free(s);
     p->result = S_OK;
@@ -766,13 +895,25 @@ static NTSTATUS ios_get_render_buffer(void *args) {
     }
     if (p->frames > s->scratch_frames) {
         /* Client asked for more than the ring — grow scratch; the copy in
-         * release clamps to ring capacity anyway. */
-        BYTE *ns = (BYTE *)realloc(s->render_scratch,
-                                   (size_t)p->frames * s->frame_bytes);
-        if (!ns) { p->result = E_FAIL; return STATUS_SUCCESS; }
+         * release clamps to ring capacity anyway.
+         *
+         * MADEIRA: this used to be a realloc().  A WoW client's scratch is a
+         * guest-window reservation, not heap, so the grow is allocate-then-
+         * free — new first, so an allocation failure leaves the old buffer
+         * intact exactly as realloc() did.  Nothing written into the scratch
+         * before this point is live (the client has not called GetBuffer
+         * yet), so not preserving the contents is not observable. */
+        int guest = 0;
+        UINT_PTR bytes = 0;
+        BYTE *ns = ios_audio_alloc_scratch(p->frames, s->frame_bytes, &guest, &bytes);
+        if (!ns) { if (p->data) *p->data = NULL; p->result = E_FAIL; return STATUS_SUCCESS; }
+        ios_audio_free_scratch(s->render_scratch, s->scratch_guest);
         s->render_scratch = ns;
+        s->scratch_guest = guest;
+        s->scratch_bytes = bytes;
         s->scratch_frames = p->frames;
     }
+    if (!s->render_scratch) { if (p->data) *p->data = NULL; p->result = E_FAIL; return STATUS_SUCCESS; }
     s->pending_frames = p->frames;
     if (p->data) *p->data = s->render_scratch;
     p->result = S_OK;
@@ -833,7 +974,13 @@ static NTSTATUS ios_is_format_supported(void *args) {
 }
 
 static NTSTATUS ios_get_loopback_capture_device(void *args) {
-    (void)args;
+    struct get_loopback_capture_device_params *p = args;
+    /* This driver exposes no capture endpoint at all (get_endpoint_ids
+     * refuses eCapture), so loopback capture cannot work.  Say so: this used
+     * to return STATUS_SUCCESS and leave `result` untouched, which is an
+     * uninitialised HRESULT for the caller — harmless only because mmdevapi
+     * never reaches this call without a capture endpoint. */
+    if (p) p->result = (HRESULT)E_NOTIMPL;
     return STATUS_SUCCESS;
 }
 
@@ -1037,6 +1184,499 @@ const void *audio_null_ios_unix_call_funcs[] = {
     ios_is_started,                    /* is_started */
     ios_get_prop_value,                /* get_prop_value */
     ios_midi_stub,                     /* midi_get_driver */
+    ios_midi_stub,                     /* midi_init */
+    ios_midi_stub,                     /* midi_release */
+    ios_midi_stub,                     /* midi_out_message */
+    ios_midi_stub,                     /* midi_in_message */
+    ios_midi_stub,                     /* midi_notify_wait */
+    ios_midi_stub,                     /* aux_message */
+};
+
+/* ================= MADEIRA: the 32-bit (WoW64) table =================
+ *
+ * WOW64_DESIGN.md 2/3 (invariant 2) and 7.10 item 1.  A 32-bit mmdevapi.dll
+ * builds its argument blocks with 4-byte pointers and 4-byte HANDLEs, so the
+ * table above would read every field after the first pointer at the wrong
+ * offset.  `args` itself is already a HOST pointer -- the WoW64 module
+ * converts that one outer pointer -- but every pointer EMBEDDED in the block
+ * is still a GUEST address and needs + B before it is dereferenced, which is
+ * what ios_wow_host_ptr() does (NULL-preserving); ios_wow_guest_ptr32()
+ * writes one back.  Handles, stream handles, sizes, flags and enums are
+ * never offset (invariant 4).
+ *
+ * Shape mirrors upstream's drivers (dlls/winecoreaudio.drv/coreaudio.c,
+ * dlls/winealsa.drv/alsa.c): one thunk per call that carries a pointer, and
+ * the 64-bit entry shared directly wherever the two layouts are identical
+ * (a stream_handle is UINT64 and 8-byte aligned on i386 too) or the entry
+ * ignores `args` entirely.  The ORDER is enum unix_funcs from
+ * wine/dlls/mmdevapi/unixlib.h, the same order as the table above.
+ *
+ * Buffer contract: get_render_buffer is the only call that hands the client a
+ * pointer, and its buffer is allocated inside the guest window by
+ * ios_audio_alloc_scratch(); the thunk refuses to publish anything that is
+ * not in the window.
+ */
+
+static NTSTATUS ios_wow64_main_loop(void *args)
+{
+    struct {
+        PTR32 event;
+    } *params32 = args;
+    struct main_loop_params params = { .event = IOS_WOW_HANDLE(params32->event) };
+    return ios_main_loop(&params);
+}
+
+static NTSTATUS ios_wow64_get_endpoint_ids(void *args)
+{
+    struct {
+        EDataFlow flow;
+        PTR32 endpoints;
+        unsigned int size;
+        HRESULT result;
+        unsigned int num;
+        unsigned int default_idx;
+    } *params32 = args;
+    struct get_endpoint_ids_params params = {
+        .flow = params32->flow,
+        /* the buffer mmdevapi allocated; endpoint.name/.device inside it are
+         * byte OFFSETS, not pointers, so they need no conversion */
+        .endpoints = ios_wow_host_ptr(params32->endpoints),
+        .size = params32->size,
+    };
+    NTSTATUS status = ios_get_endpoint_ids(&params);
+    params32->size = params.size;
+    params32->result = params.result;
+    params32->num = params.num;
+    params32->default_idx = params.default_idx;
+    return status;
+}
+
+static NTSTATUS ios_wow64_create_stream(void *args)
+{
+    struct {
+        PTR32 name;
+        PTR32 device;
+        EDataFlow flow;
+        int share;
+        DWORD flags;
+        REFERENCE_TIME duration;
+        REFERENCE_TIME period;
+        PTR32 fmt;
+        HRESULT result;
+        PTR32 channel_count;
+        PTR32 stream;
+    } *params32 = args;
+    struct create_stream_params params = {
+        .name = ios_wow_host_ptr(params32->name),
+        .device = ios_wow_host_ptr(params32->device),
+        .flow = params32->flow,
+        .share = params32->share,
+        .flags = params32->flags,
+        .duration = params32->duration,
+        .period = params32->period,
+        .fmt = ios_wow_host_ptr(params32->fmt),
+        .channel_count = ios_wow_host_ptr(params32->channel_count),
+        /* *stream is a stream_handle (UINT64 in BOTH layouts) holding an
+         * opaque driver handle -- never offset, never truncated */
+        .stream = ios_wow_host_ptr(params32->stream),
+    };
+    NTSTATUS status = ios_create_stream(&params);
+    params32->result = params.result;
+    return status;
+}
+
+static NTSTATUS ios_wow64_release_stream(void *args)
+{
+    struct {
+        stream_handle stream;
+        PTR32 timer_thread;
+        HRESULT result;
+    } *params32 = args;
+    struct release_stream_params params = {
+        .stream = params32->stream,
+        .timer_thread = IOS_WOW_HANDLE(params32->timer_thread),
+    };
+    NTSTATUS status = ios_release_stream(&params);
+    params32->result = params.result;
+    return status;
+}
+
+static NTSTATUS ios_wow64_get_render_buffer(void *args)
+{
+    struct {
+        stream_handle stream;
+        UINT32 frames;
+        HRESULT result;
+        PTR32 data;
+    } *params32 = args;
+    BYTE *data = NULL;
+    struct get_render_buffer_params params = {
+        .stream = params32->stream,
+        .frames = params32->frames,
+        .data = &data,
+    };
+    uint32_t *slot;
+    NTSTATUS status = ios_get_render_buffer(&params);
+
+    params32->result = params.result;
+    if (!(slot = ios_wow_host_ptr(params32->data))) return status;
+    /* WOW64_DESIGN.md 3 invariant 1: the client writes its samples straight
+     * into this pointer, so it must be a guest address.  Anything else is a
+     * bug in ios_audio_alloc_scratch(), not something to truncate and hope. */
+    if (data && !ios_wow_in_window(data)) {
+        static int moaned;
+        if (moaned++ < 8)
+            fprintf(stderr, "[ios_audio] WOW64 get_render_buffer: scratch %p is OUTSIDE the "
+                            "guest window [%p, +4G) -- refusing to publish it to 32-bit code\n",
+                    (void *)data, (void *)ios_wow_base());
+        *slot = 0;
+        params32->result = E_FAIL;
+        return status;
+    }
+    *slot = ios_wow_guest_ptr32(data);
+    return status;
+}
+
+static NTSTATUS ios_wow64_get_capture_buffer(void *args)
+{
+    struct {
+        stream_handle stream;
+        HRESULT result;
+        PTR32 data;
+        PTR32 frames;
+        PTR32 flags;
+        PTR32 devpos;
+        PTR32 qpcpos;
+    } *params32 = args;
+    BYTE *data = NULL;
+    struct get_capture_buffer_params params = {
+        .stream = params32->stream,
+        .data = &data,
+        .frames = ios_wow_host_ptr(params32->frames),
+        .flags = ios_wow_host_ptr(params32->flags),
+        .devpos = ios_wow_host_ptr(params32->devpos),
+        .qpcpos = ios_wow_host_ptr(params32->qpcpos),
+    };
+    uint32_t *slot;
+    NTSTATUS status = ios_get_capture_buffer(&params);
+
+    params32->result = params.result;
+    /* this driver has no capture endpoint, so `data` is always NULL and
+     * ios_wow_guest_ptr32() keeps it 0; the window check is the same
+     * contract get_render_buffer enforces, should that ever change */
+    if (!(slot = ios_wow_host_ptr(params32->data))) return status;
+    if (data && !ios_wow_in_window(data)) {
+        fprintf(stderr, "[ios_audio] WOW64 get_capture_buffer: buffer %p is OUTSIDE the "
+                        "guest window -- refusing to publish it to 32-bit code\n", (void *)data);
+        *slot = 0;
+        params32->result = E_FAIL;
+        return status;
+    }
+    *slot = ios_wow_guest_ptr32(data);
+    return status;
+}
+
+static NTSTATUS ios_wow64_is_format_supported(void *args)
+{
+    struct {
+        PTR32 device;
+        EDataFlow flow;
+        int share;
+        PTR32 fmt_in;
+        HRESULT result;
+    } *params32 = args;
+    struct is_format_supported_params params = {
+        .device = ios_wow_host_ptr(params32->device),
+        .flow = params32->flow,
+        .share = params32->share,
+        .fmt_in = ios_wow_host_ptr(params32->fmt_in),
+    };
+    NTSTATUS status = ios_is_format_supported(&params);
+    params32->result = params.result;
+    return status;
+}
+
+static NTSTATUS ios_wow64_get_loopback_capture_device(void *args)
+{
+    struct {
+        PTR32 name;
+        PTR32 device;
+        PTR32 ret_device;
+        UINT32 ret_device_len;
+        HRESULT result;
+    } *params32 = args;
+    char *ret_device = ios_wow_host_ptr(params32->ret_device);
+    struct get_loopback_capture_device_params params = {
+        .name = ios_wow_host_ptr(params32->name),
+        .device = ios_wow_host_ptr(params32->device),
+        .ret_device = ret_device,
+        .ret_device_len = params32->ret_device_len,
+    };
+    NTSTATUS status = ios_get_loopback_capture_device(&params);
+    params32->result = params.result;
+    return status;
+}
+
+static NTSTATUS ios_wow64_get_mix_format(void *args)
+{
+    struct {
+        PTR32 device;
+        EDataFlow flow;
+        PTR32 fmt;
+        HRESULT result;
+    } *params32 = args;
+    struct get_mix_format_params params = {
+        .device = ios_wow_host_ptr(params32->device),
+        .flow = params32->flow,
+        /* WAVEFORMATEXTENSIBLE is fixed-width in both layouts */
+        .fmt = ios_wow_host_ptr(params32->fmt),
+    };
+    NTSTATUS status = ios_get_mix_format(&params);
+    params32->result = params.result;
+    return status;
+}
+
+static NTSTATUS ios_wow64_get_device_period(void *args)
+{
+    struct {
+        PTR32 device;
+        EDataFlow flow;
+        HRESULT result;
+        PTR32 def_period;
+        PTR32 min_period;
+    } *params32 = args;
+    struct get_device_period_params params = {
+        .device = ios_wow_host_ptr(params32->device),
+        .flow = params32->flow,
+        .def_period = ios_wow_host_ptr(params32->def_period),
+        .min_period = ios_wow_host_ptr(params32->min_period),
+    };
+    NTSTATUS status = ios_get_device_period(&params);
+    params32->result = params.result;
+    return status;
+}
+
+static NTSTATUS ios_wow64_get_buffer_size(void *args)
+{
+    struct {
+        stream_handle stream;
+        HRESULT result;
+        PTR32 frames;
+    } *params32 = args;
+    struct get_buffer_size_params params = {
+        .stream = params32->stream,
+        .frames = ios_wow_host_ptr(params32->frames),
+    };
+    NTSTATUS status = ios_get_buffer_size(&params);
+    params32->result = params.result;
+    return status;
+}
+
+static NTSTATUS ios_wow64_get_latency(void *args)
+{
+    struct {
+        stream_handle stream;
+        HRESULT result;
+        PTR32 latency;
+    } *params32 = args;
+    struct get_latency_params params = {
+        .stream = params32->stream,
+        .latency = ios_wow_host_ptr(params32->latency),
+    };
+    NTSTATUS status = ios_get_latency(&params);
+    params32->result = params.result;
+    return status;
+}
+
+static NTSTATUS ios_wow64_get_current_padding(void *args)
+{
+    struct {
+        stream_handle stream;
+        HRESULT result;
+        PTR32 padding;
+    } *params32 = args;
+    struct get_current_padding_params params = {
+        .stream = params32->stream,
+        .padding = ios_wow_host_ptr(params32->padding),
+    };
+    NTSTATUS status = ios_get_current_padding(&params);
+    params32->result = params.result;
+    return status;
+}
+
+static NTSTATUS ios_wow64_get_next_packet_size(void *args)
+{
+    struct {
+        stream_handle stream;
+        HRESULT result;
+        PTR32 frames;
+    } *params32 = args;
+    struct get_next_packet_size_params params = {
+        .stream = params32->stream,
+        .frames = ios_wow_host_ptr(params32->frames),
+    };
+    NTSTATUS status = ios_get_next_packet_size(&params);
+    params32->result = params.result;
+    return status;
+}
+
+static NTSTATUS ios_wow64_get_frequency(void *args)
+{
+    struct {
+        stream_handle stream;
+        HRESULT result;
+        PTR32 freq;
+    } *params32 = args;
+    struct get_frequency_params params = {
+        .stream = params32->stream,
+        .freq = ios_wow_host_ptr(params32->freq),
+    };
+    NTSTATUS status = ios_get_frequency(&params);
+    params32->result = params.result;
+    return status;
+}
+
+static NTSTATUS ios_wow64_get_position(void *args)
+{
+    struct {
+        stream_handle stream;
+        BOOL device;
+        HRESULT result;
+        PTR32 pos;
+        PTR32 qpctime;
+    } *params32 = args;
+    struct get_position_params params = {
+        .stream = params32->stream,
+        .device = params32->device,
+        .pos = ios_wow_host_ptr(params32->pos),
+        .qpctime = ios_wow_host_ptr(params32->qpctime),
+    };
+    NTSTATUS status = ios_get_position(&params);
+    params32->result = params.result;
+    return status;
+}
+
+static NTSTATUS ios_wow64_set_volumes(void *args)
+{
+    struct {
+        stream_handle stream;
+        float master_volume;
+        PTR32 volumes;
+        PTR32 session_volumes;
+    } *params32 = args;
+    struct set_volumes_params params = {
+        .stream = params32->stream,
+        .master_volume = params32->master_volume,
+        .volumes = ios_wow_host_ptr(params32->volumes),
+        .session_volumes = ios_wow_host_ptr(params32->session_volumes),
+    };
+    return ios_set_volumes(&params);
+}
+
+static NTSTATUS ios_wow64_set_event_handle(void *args)
+{
+    struct {
+        stream_handle stream;
+        PTR32 event;
+        HRESULT result;
+    } *params32 = args;
+    struct set_event_handle_params params = {
+        .stream = params32->stream,
+        .event = IOS_WOW_HANDLE(params32->event),
+    };
+    NTSTATUS status = ios_set_event_handle(&params);
+    params32->result = params.result;
+    return status;
+}
+
+static NTSTATUS ios_wow64_test_connect(void *args)
+{
+    struct {
+        PTR32 name;
+        enum driver_priority priority;
+    } *params32 = args;
+    struct test_connect_params params = {
+        .name = ios_wow_host_ptr(params32->name),
+        .priority = params32->priority,
+    };
+    NTSTATUS status = ios_test_connect(&params);
+    params32->priority = params.priority;
+    return status;
+}
+
+static NTSTATUS ios_wow64_get_prop_value(void *args)
+{
+    struct {
+        PTR32 device;
+        EDataFlow flow;
+        PTR32 guid;
+        PTR32 prop;
+        HRESULT result;
+        PTR32 value;      /* PROPVARIANT, 32-bit layout */
+        PTR32 buffer;
+        PTR32 buffer_size;
+    } *params32 = args;
+    /* `value` is deliberately NOT forwarded: a 64-bit PROPVARIANT written into
+     * the 32-bit slot would corrupt it, and this driver's get_prop_value is an
+     * unconditional E_FAIL (mmdevapi falls back), so none is ever produced.
+     * If that ever changes, say so instead of publishing a wrong struct. */
+    struct get_prop_value_params params = {
+        .device = ios_wow_host_ptr(params32->device),
+        .flow = params32->flow,
+        .guid = ios_wow_host_ptr(params32->guid),
+        .prop = ios_wow_host_ptr(params32->prop),
+        .value = NULL,
+        .buffer = ios_wow_host_ptr(params32->buffer),
+        .buffer_size = ios_wow_host_ptr(params32->buffer_size),
+    };
+    NTSTATUS status = ios_get_prop_value(&params);
+
+    if (params.result >= 0) {
+        fprintf(stderr, "[ios_audio] WOW64 get_prop_value succeeded but the 32-bit "
+                        "PROPVARIANT copy-back is not implemented -- reporting E_FAIL\n");
+        params32->result = (HRESULT)E_FAIL;
+    }
+    else params32->result = params.result;
+    return status;
+}
+
+/* Table indexed by enum unix_funcs, same 37 slots and same order as
+ * audio_null_ios_unix_call_funcs above.  Entries shared with the 64-bit table
+ * either ignore `args` entirely or have a struct whose 32-bit and 64-bit
+ * layouts are identical (stream_handle is UINT64 and 8-byte aligned in the
+ * i386 MS ABI too, so { stream, UINT32..., HRESULT } lays out the same). */
+const void *audio_null_ios_unix_call_wow64_funcs[] = {
+    ios_process_attach,                /* process_attach  (args == NULL) */
+    ios_process_detach,                /* process_detach  (args == NULL) */
+    ios_wow64_main_loop,               /* main_loop */
+    ios_wow64_get_endpoint_ids,        /* get_endpoint_ids */
+    ios_wow64_create_stream,           /* create_stream */
+    ios_wow64_release_stream,          /* release_stream */
+    ios_start,                         /* start           { stream, result } */
+    ios_stop,                          /* stop            { stream, result } */
+    ios_reset,                         /* reset           { stream, result } */
+    ios_timer_loop,                    /* timer_loop      { stream } */
+    ios_wow64_get_render_buffer,       /* get_render_buffer */
+    ios_release_render_buffer,         /* release_render_buffer (no pointers) */
+    ios_wow64_get_capture_buffer,      /* get_capture_buffer */
+    ios_release_capture_buffer,        /* release_capture_buffer (no pointers) */
+    ios_wow64_is_format_supported,     /* is_format_supported */
+    ios_wow64_get_loopback_capture_device, /* get_loopback_capture_device */
+    ios_wow64_get_mix_format,          /* get_mix_format */
+    ios_wow64_get_device_period,       /* get_device_period */
+    ios_wow64_get_buffer_size,         /* get_buffer_size */
+    ios_wow64_get_latency,             /* get_latency */
+    ios_wow64_get_current_padding,     /* get_current_padding */
+    ios_wow64_get_next_packet_size,    /* get_next_packet_size */
+    ios_wow64_get_frequency,           /* get_frequency */
+    ios_wow64_get_position,            /* get_position */
+    ios_wow64_set_volumes,             /* set_volumes */
+    ios_wow64_set_event_handle,        /* set_event_handle */
+    ios_set_sample_rate,               /* set_sample_rate { stream, float, result } */
+    ios_wow64_test_connect,            /* test_connect */
+    ios_is_started,                    /* is_started      { stream, result } */
+    ios_wow64_get_prop_value,          /* get_prop_value */
+    ios_midi_stub,                     /* midi_get_driver (ignores args) */
     ios_midi_stub,                     /* midi_init */
     ios_midi_stub,                     /* midi_release */
     ios_midi_stub,                     /* midi_out_message */

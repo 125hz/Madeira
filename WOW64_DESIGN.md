@@ -170,6 +170,29 @@ game-specific patches — every change must fix the emulator/runtime generically
   `CreateProcessInternalW` bailing early) — not the 32-bit child path.
   Discriminator for the user: double-click a 64-bit exe in the same
   explorer. The custom launcher (in progress) bypasses explorer entirely.
+  CORRECTION (same day): that reading was wrong — the planner's grep had
+  stopped short. Both logs DO contain `NtCreateUserProcess` for the
+  target (18:4390, 19:4592) followed by `[Wine child thread] ENTRY …
+  machine=0x14c` and `guest window reserve FAILED: 0xc0000017`. Root
+  cause: the session's top-down furniture (TEBs at 0x71ffed0000…,
+  parent PEB 0x71ffff0000) sits inside the ONLY 4 GB-aligned candidate
+  `[0x7100000000, 0x7200000000)`, so a 32-bit CHILD can never reserve it
+  (a 32-bit MAIN image reserves before its first TEB, which is why the
+  button works). Fixes (Opus, main `0ab948b`): `map_view` top-down bias
+  keeps the last aligned slot free (`virtual_ios.c:10564`, advisory via
+  `ceiling_relaxable`; `ios_wow_candidate_slot()` `:5810`); the failed
+  child leaked its server socket so the parent's `NtCreateUserProcess`
+  waited forever (`process_ios.c:473`) — now returns an error; the
+  owner-fallback in `ios_wow_slot_current` (`:5546`) refused a bound slot
+  during the bind gap, so every 32-bit child's `TEB32->Peb` was a
+  truncated host pointer — fixed; `init_thread_stack` status checked
+  (`loader_ios.c:3406`); every child early-exit logs its stage
+  (`CHILD_STAGE`/`CHILD_BOOT_FAIL`). Launcher: `@AppStorage`
+  `madeiraCustomExePath`/`madeiraCustomExeArgs`, "Launch custom exe" row
+  (`ContentView.swift:1564`); `WineProcessBridge.m`: PE-machine-driven
+  farm choice for full paths, quote-aware `MADEIRA_ARGS`, exe folder as
+  cwd, 1024-byte paths, bare names present in a 64-bit farm are not
+  probed as i386 (the full i386 set now contains `explorer.exe`).
 - 2026-09-12 — Full i386 DLL set built (Sonnet, `.xtool/build-wine-i386.sh`,
   reproducible; logs in `.xtool/logs/build-wine-i386*.log`): 169 files,
   87.5 MiB stripped, all PE32; 163 of 168 targets built; no i386 rule
