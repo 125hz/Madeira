@@ -67,6 +67,18 @@ app/Madeira/aarch64-windows/winedevice.exe
 # Toolchains (pulled by build scripts)
 toolchains/
 
+# Local Windows/WSL xtool setup, generated SwiftPM project and build logs
+/.xtool/
+/xtool/
+/xtool.yml
+/xtool.yaml
+/Package.swift
+/Package.resolved
+/.build/
+/.swiftpm/
+/AGENTS.md
+/CLAUDE.md
+
 # Xcode
 *.xcuserdata
 *.xcworkspace

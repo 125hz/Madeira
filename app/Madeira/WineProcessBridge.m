@@ -20,6 +20,8 @@
 #include <sys/stat.h>
 #include <limits.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdint.h>
 
 #include "WineProcessBridge.h"
 #include "WineServerBridge.h"
@@ -343,6 +345,43 @@ void madeira_seed_prefix_if_needed(const char *prefix_path) {
     }
 }
 
+/***********************************************************************
+ *           madeira_pe_machine
+ *
+ * WOW64_DESIGN.md stage E: read IMAGE_FILE_HEADER.Machine straight off disk
+ * (MZ -> e_lfanew -> "PE\0\0" -> Machine) instead of guessing from the exe
+ * name, so an i386 target can be routed to the syswow64 farm generically —
+ * this has nothing game-specific about it, it just answers "what machine is
+ * this PE". Returns 0 (and touches nothing else) on any read/format failure,
+ * which callers treat as "not i386" so behaviour for unreadable/odd inputs
+ * never regresses.
+ */
+static uint16_t madeira_pe_machine(const char *unix_path) {
+    if (!unix_path || !*unix_path) return 0;
+    FILE *f = fopen(unix_path, "rb");
+    if (!f) return 0;
+
+    unsigned char dos[64];
+    uint16_t machine = 0;
+    if (fread(dos, 1, sizeof(dos), f) == sizeof(dos) && dos[0] == 'M' && dos[1] == 'Z') {
+        uint32_t e_lfanew = (uint32_t)dos[0x3c] | ((uint32_t)dos[0x3d] << 8) |
+                            ((uint32_t)dos[0x3e] << 16) | ((uint32_t)dos[0x3f] << 24);
+        unsigned char pe[6];
+        if (e_lfanew <= (16u << 20) &&  /* sanity bound, real headers are tiny */
+            fseek(f, (long)e_lfanew, SEEK_SET) == 0 &&
+            fread(pe, 1, sizeof(pe), f) == sizeof(pe) &&
+            pe[0] == 'P' && pe[1] == 'E' && pe[2] == 0 && pe[3] == 0) {
+            machine = (uint16_t)pe[4] | ((uint16_t)pe[5] << 8);
+        }
+    }
+    fclose(f);
+    return machine;
+}
+
+#define MADEIRA_IMAGE_FILE_MACHINE_I386  0x14c
+#define MADEIRA_IMAGE_FILE_MACHINE_AMD64 0x8664
+#define MADEIRA_IMAGE_FILE_MACHINE_ARM64 0xaa64
+
 static void *wine_process_thread(void *arg) {
     @autoreleasepool {
         /* Perf: the guest main thread runs ON this pthread. Promote to
@@ -619,6 +658,47 @@ static void *wine_process_thread(void *arg) {
         LOG("Target exe: %{public}s (bundle=%{public}s)", madeira_exe, bundle_subdir);
         dprintf(STDERR_FILENO, "[WineProc] Target exe: %s (bundle=%s)\n", madeira_exe, bundle_subdir);
 
+        /* WOW64_DESIGN.md stage E: read the target's actual PE machine to
+         * decide whether it is a 32-bit image, instead of extending the name
+         * heuristic above. This is additive only — bundle_subdir (the
+         * session's own 64-bit system32 farm, native aarch64 either way,
+         * since Wine's core loader always runs 64-bit and reaches a 32-bit
+         * exe through WOW64) is computed exactly as before and is not read
+         * here, so every existing input keeps the same bundle_subdir/exe
+         * path it always had. A bare exe name lives directly in one of the
+         * per-arch bundle dirs (same convention the farms below rely on); a
+         * full Win32 path lives under the prefix's drive_c. Any lookup or
+         * parse failure leaves target_machine at 0, i.e. "not i386". */
+        BOOL is_full_path_exe = (strchr(madeira_exe, '\\') != NULL) ||
+                                (madeira_exe[0] && madeira_exe[1] == ':');
+        uint16_t target_machine = 0;
+        {
+            char probe[1024];
+            probe[0] = 0;
+            if (is_full_path_exe && strlen(madeira_exe) > 3 && madeira_exe[1] == ':') {
+                /* stage C review F10: only skip the "C:\" prefix when there
+                 * actually is one — otherwise madeira_exe + 3 reads past the
+                 * end of a short name. */
+                char windir[768];
+                snprintf(windir, sizeof(windir), "%s", madeira_exe + 3); /* skip "C:\" */
+                for (char *p = windir; *p; p++) if (*p == '\\') *p = '/';
+                snprintf(probe, sizeof(probe), "%s/drive_c/%s", g_prefix_path, windir);
+            } else {
+                NSString *bundlePathForProbe = [[NSBundle mainBundle] bundlePath];
+                snprintf(probe, sizeof(probe), "%s/i386-windows/%s",
+                         bundlePathForProbe.UTF8String, madeira_exe);
+                if (access(probe, R_OK) != 0) probe[0] = 0;
+            }
+            if (probe[0]) target_machine = madeira_pe_machine(probe);
+        }
+        BOOL is_i386_target = (target_machine == MADEIRA_IMAGE_FILE_MACHINE_I386);
+        if (target_machine) {
+            LOG("Target exe PE machine=0x%x (%{public}s)", target_machine,
+                is_i386_target ? "i386" : "not i386");
+            dprintf(STDERR_FILENO, "[WineProc] Target exe PE machine=0x%x (%s)\n",
+                    target_machine, is_i386_target ? "i386" : "not i386");
+        }
+
         // Ensure Wine prefix has system32 directory with DLLs from bundle
         {
             NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
@@ -680,13 +760,20 @@ static void *wine_process_thread(void *arg) {
             // system32 name resolves to the session arch's binary — colliding
             // names (ucrtbase, kernel32, ...) always do. sysaa64 is the
             // mirror for the future inverse case (aarch64 child in an EC
-            // session, e.g. rpcss under Steam).
+            // session, e.g. rpcss under Steam). syswow64 (WOW64_DESIGN.md
+            // stage E) is the REAL Windows farm name for this pattern: it is
+            // where a 32-bit ntdll.dll/kernel32.dll/kernelbase.dll and a
+            // bare-name i386 test exe live, and where the unix ntdll's
+            // machine->dir mapping (loader_ios.c) expects to find them.
             {
                 struct { const char *farm; const char *arch; } farms[] = {
-                    { "sysx64",  "arm64ec-windows" },
-                    { "sysaa64", "aarch64-windows" },
+                    { "sysx64",   "arm64ec-windows" },
+                    { "sysaa64",  "aarch64-windows" },
+                    { "syswow64", "i386-windows" },
                 };
-                for (int i = 0; i < 2; i++) {
+                /* stage C review F11: derive the bound from the array so
+                 * adding a farm cannot silently skip it. */
+                for (size_t i = 0; i < sizeof(farms) / sizeof(farms[0]); i++) {
                     NSString *farmDir = [prefix stringByAppendingPathComponent:
                         [NSString stringWithFormat:@"drive_c/windows/%s", farms[i].farm]];
                     NSString *archSource = [bundlePath stringByAppendingPathComponent:
@@ -825,10 +912,14 @@ static void *wine_process_thread(void *arg) {
         // If MADEIRA_EXE contains a backslash or starts with a drive letter
         // (e.g. "C:\\Program Files\\Thumper\\THUMPER_win10.exe"), use it
         // as-is. Otherwise treat it as a bare exe name in system32 (legacy
-        // path used by cube/fib/hello tests).
+        // path used by cube/fib/hello tests) — or in syswow64 for an i386
+        // target (WOW64_DESIGN.md stage E), matching where the syswow64 farm
+        // above just symlinked it from i386-windows/.
         char exe_path[512];
         if (strchr(madeira_exe, '\\') || (madeira_exe[0] && madeira_exe[1] == ':')) {
             snprintf(exe_path, sizeof(exe_path), "%s", madeira_exe);
+        } else if (is_i386_target) {
+            snprintf(exe_path, sizeof(exe_path), "C:\\windows\\syswow64\\%s", madeira_exe);
         } else {
             snprintf(exe_path, sizeof(exe_path), "C:\\windows\\system32\\%s", madeira_exe);
         }
@@ -911,6 +1002,17 @@ static void *wine_process_thread(void *arg) {
         wine_ios_exit_initialized = 1;
 
         LOG("Calling __wine_main...");
+
+        /* WOW64_DESIGN.md §2 (device-run fix): publish the main image's arch so
+         * the unix side reserves this pseudo-process's guest window BEFORE its
+         * first TEB. A 32-bit MAIN image otherwise runs with no window (the
+         * machine is unknown unix-side until after the TEB is placed), the
+         * image lands outside [B,B+4G) and build_wow64_parameters' 2GB ceiling
+         * is unmappable below 4GB. Mirrors the child path's ios_child_main_machine. */
+        {
+            extern int ios_main_image_i386;
+            ios_main_image_i386 = is_i386_target ? 1 : 0;
+        }
 
         if (setjmp(wine_ios_exit_jmpbuf) == 0) {
             __wine_main(argc, argv);

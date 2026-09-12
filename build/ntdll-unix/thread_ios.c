@@ -76,6 +76,7 @@
 #include "wine/server.h"
 #include "wine/debug.h"
 #include "unix_private.h"
+#include "ios_wow.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(thread);
 WINE_DECLARE_DEBUG_CHANNEL(seh);
@@ -1329,6 +1330,13 @@ void *get_cpu_area( USHORT machine )
 #else
     cpu = ULongToPtr( NtCurrentTeb64()->TlsSlots[WOW64_TLS_CPURESERVED] );
 #endif
+    /* iOS-Madeira (WOW64_DESIGN.md, stage C review F3): wow_peb is a SESSION
+     * global while pseudo-processes share the address space, so once any
+     * 32-bit child exists is_wow64() is true on 64-bit threads too — and those
+     * threads have no CPU area.  Upstream can dereference unconditionally
+     * because a process is WoW or it is not; here the NULL check is what keeps
+     * a 64-bit thread from faulting on cpu->Machine. */
+    if (!cpu) return NULL;
     if (cpu->Machine != machine) return NULL;
     switch (cpu->Machine)
     {
@@ -1379,26 +1387,51 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
     if (wow_teb)
     {
         WOW64_CPURESERVED *cpu;
+        /* iOS-Madeira (stage C review F1): size and tag the CPU area from the
+         * OWNING pseudo-process's main image, not from the session global.
+         * main_image_info is restored to the session's exe by
+         * wine_ios_child_main (loader_ios.c, "main_image_info =
+         * session_image_info") BEFORE init_thread_stack runs for the child, so
+         * a 32-bit child used to get an ARM64-sized area tagged ARM64 here and
+         * get_cpu_area( IMAGE_FILE_MACHINE_I386 ) then returned NULL — no
+         * Eax/Ebx/Esp/Eip were ever written into the initial 32-bit context.
+         * The ChpeV2 branch below (":Owner-aware (X3)") already keys off the
+         * owning PEB; this is the same rule. */
+        extern const SECTION_IMAGE_INFORMATION *ios_image_info_for_peb( void *peb_id );
+        USHORT wow_machine = ios_image_info_for_peb( teb->Peb )->Machine;
         SIZE_T cpusize = sizeof(WOW64_CPURESERVED) +
-            ((get_machine_context_size( main_image_info.Machine ) + 7) & ~7) + sizeof(ULONG64);
+            ((get_machine_context_size( wow_machine ) + 7) & ~7) + sizeof(ULONG64);
 
         /* 64-bit stack */
         if ((status = virtual_alloc_thread_stack( &stack, limit_4g, 0, 0x40000, 0x40000, TRUE ))) return status;
         cpu = (WOW64_CPURESERVED *)(((ULONG_PTR)stack.StackBase - cpusize) & ~15);
-        cpu->Machine = main_image_info.Machine;
+        cpu->Machine = wow_machine;
 
 #ifdef _WIN64
         teb->Tib.StackBase = teb->TlsSlots[WOW64_TLS_CPURESERVED] = cpu;
         teb->Tib.StackLimit = stack.StackLimit;
         teb->DeallocationStack = stack.DeallocationStack;
 
-        /* 32-bit stack */
+        /* 32-bit stack.  `limit` is a GUEST ceiling;
+         * virtual_alloc_thread_stack turns it into [B, B+limit] for a
+         * windowed process, and the resulting addresses are host, so every
+         * 32-bit TEB field below converts back to guest. */
         if (!limit || limit > user_space_wow_limit) limit = user_space_wow_limit;
+#ifdef WINE_IOS
+        /* user_space_wow_limit is published from the main image's
+         * large-address-aware bit (virtual_set_large_address_space, and
+         * ios_wow_image_ceiling when the image is mapped before init_peb), so
+         * the line above is the normal path.  It can only still be 0 for a
+         * thread created before that, and then the conservative 2 GB is the
+         * safe answer for both LAA and non-LAA images — 4 GB would put a
+         * non-LAA program's own stack above 0x80000000. */
+        if (!limit && ios_wow_base()) limit = limit_2g - 1;
+#endif
         if ((status = virtual_alloc_thread_stack( &stack, 0, limit, reserve_size, commit_size, TRUE )))
             return status;
-        wow_teb->Tib.StackBase = PtrToUlong( stack.StackBase );
-        wow_teb->Tib.StackLimit = PtrToUlong( stack.StackLimit );
-        wow_teb->DeallocationStack = PtrToUlong( stack.DeallocationStack );
+        wow_teb->Tib.StackBase = ios_wow_guest_addr( stack.StackBase );
+        wow_teb->Tib.StackLimit = ios_wow_guest_addr( stack.StackLimit );
+        wow_teb->DeallocationStack = ios_wow_guest_addr( stack.DeallocationStack );
         return STATUS_SUCCESS;
 #else
         wow_teb->Tib.StackBase = wow_teb->TlsSlots[WOW64_TLS_CPURESERVED] = PtrToUlong( cpu );

@@ -97,6 +97,7 @@
 #include "winternl.h"
 #include "wine/asm.h"
 #include "unix_private.h"
+#include "ios_wow.h"
 #include "wine/debug.h"
 
 /* defined at the bottom of this file with the [thread-stacks] dumper */
@@ -8951,6 +8952,24 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         }
     }
 
+#ifdef WINE_IOS
+    /* iOS-Madeira: a trap taken INSIDE a syscall (unix-side assert/__builtin_trap
+     * compiles to `brk #1`, which Darwin reports as SIGILL) must be turned into a
+     * failing syscall status, exactly as segv_handler does — never dispatched to
+     * KiUserExceptionDispatcher.  The frame would be built on the kernel stack,
+     * which is outside Tib.StackLimit/StackBase, so the PE side's is_valid_frame()
+     * (wine/dlls/ntdll/ntdll_misc.h:64) rejects it in call_seh_handlers
+     * (wine/dlls/ntdll/signal_arm64.c:274) and the process dies with
+     * "Exception frame is not in stack limits".  Upstream arm64 calls
+     * handle_syscall_fault() only from segv_handler
+     * (wine/dlls/ntdll/unix/signal_arm64.c:1075); it never traps in unix code. */
+    if (handle_syscall_fault( context, &rec ))
+    {
+        ios_fixup_x18_for_return( context );
+        return;
+    }
+#endif
+
     setup_exception( sigcontext, &rec );
 }
 
@@ -9501,15 +9520,23 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             kern_return_t rd_kr;
 
             vrec.NumberParameters = 2;
-            vrec.ExceptionInformation[0] = EXCEPTION_READ_FAULT;  /* refined below if the insn is a store */
             vrec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
             vrec.ExceptionAddress = (void *)PC_sig(bus_ctx);
             {
-                uint32_t f_insn = *(uint32_t *)(uintptr_t)PC_sig(bus_ctx);
-                /* loads have bit22 set in the ld/st register/immediate classes;
-                 * good enough to label the fault direction for wine's repair */
-                if ((f_insn & 0x0a000000) == 0x08000000 && !(f_insn & 0x00400000))
-                    vrec.ExceptionInformation[0] = EXCEPTION_WRITE_FAULT;
+                /* Classify from the HARDWARE ESR, not from si_code and not by
+                 * decoding the instruction by hand: on Darwin arm64 SIGBUS
+                 * si_code is always BUS_ADRALN and carries no direction, and
+                 * the ld/st bit22 decode only covered the register/immediate
+                 * classes.  EC 0x20/0x21 is an instruction abort, ISS.WnR
+                 * (bit 6) is the data direction — the same rule segv_handler
+                 * and the Mach EXC_BAD_ACCESS path already use, and the same
+                 * ESR the [wr-strip] reheal below reads. */
+                DWORD64 f_esr = get_fault_esr( bus_ctx );
+                DWORD64 f_ec  = f_esr >> 26;
+
+                if (f_ec == 0x20 || f_ec == 0x21)  vrec.ExceptionInformation[0] = EXCEPTION_EXECUTE_FAULT;
+                else if (f_esr & 0x40)             vrec.ExceptionInformation[0] = EXCEPTION_WRITE_FAULT;
+                else                               vrec.ExceptionInformation[0] = EXCEPTION_READ_FAULT;
             }
 
             if (!virtual_handle_fault( &vrec, (void *)SP_sig(bus_ctx) ))
@@ -10582,6 +10609,12 @@ void syscall_dispatcher_return_slowpath(void)
 /***********************************************************************
  *           init_syscall_frame
  */
+/* host -> guest for a known window base, NULL-preserving (stage C review F5) */
+static inline ULONG ios_wow_guest_in( const void *host, ULONG_PTR wow_base )
+{
+    return host ? (ULONG)((ULONG_PTR)host - wow_base) : 0;
+}
+
 void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, TEB *teb )
 {
     struct syscall_frame *frame = ((struct ntdll_thread_data *)&teb->GdiTebBatch)->syscall_frame;
@@ -10595,12 +10628,25 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
     context.Sp  = (DWORD64)teb->Tib.StackBase;
     context.Pc  = (DWORD64)IOS_PFUNC(RtlUserThreadStart);
 
+    /* WOW64_DESIGN.md §2/§3: every register of the initial 32-bit context is
+     * a GUEST value.  `entry` and `arg` arrive as host pointers (wow64.dll's
+     * get_ptr converted them on the way in), wow_peb is the host PEB32, and
+     * pLdrSystemDllInitBlock->pRtlUserThreadStart is already published guest.
+     * Tib.StackBase in the 32-bit TEB is guest too (see init_thread_stack).
+     *
+     * stage C review F5: use the NULL-preserving conversion.  A plain
+     * `- wow_base` would turn a NULL `arg` (the common case for a thread whose
+     * parameter is 0) into -B, i.e. 0xffffffff in the 32-bit register, instead
+     * of 0. */
+    ULONG_PTR wow_base = ios_wow_base_for_peb( teb->Peb );
+#define IOS_WOW_GUEST_IN(ptr) ios_wow_guest_in( (ptr), wow_base )
+
     if ((i386_context = get_cpu_area( IMAGE_FILE_MACHINE_I386 )))
     {
         XMM_SAVE_AREA32 *fpu = (XMM_SAVE_AREA32 *)i386_context->ExtendedRegisters;
         i386_context->ContextFlags = CONTEXT_I386_ALL;
-        i386_context->Eax = (ULONG_PTR)entry;
-        i386_context->Ebx = (arg == peb ? (ULONG_PTR)wow_peb : (ULONG_PTR)arg);
+        i386_context->Eax = IOS_WOW_GUEST_IN( entry );
+        i386_context->Ebx = IOS_WOW_GUEST_IN( arg == peb ? (void *)wow_peb : arg );
         i386_context->Esp = get_wow_teb( teb )->Tib.StackBase - 16;
         i386_context->Eip = pLdrSystemDllInitBlock->pRtlUserThreadStart;
         i386_context->SegCs = 0x23;
@@ -10617,12 +10663,13 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
     else if ((arm_context = get_cpu_area( IMAGE_FILE_MACHINE_ARMNT )))
     {
         arm_context->ContextFlags = CONTEXT_ARM_ALL;
-        arm_context->R0 = (ULONG_PTR)entry;
-        arm_context->R1 = (arg == peb ? (ULONG_PTR)wow_peb : (ULONG_PTR)arg);
+        arm_context->R0 = IOS_WOW_GUEST_IN( entry );
+        arm_context->R1 = IOS_WOW_GUEST_IN( arg == peb ? (void *)wow_peb : arg );
         arm_context->Sp = get_wow_teb( teb )->Tib.StackBase;
         arm_context->Pc = pLdrSystemDllInitBlock->pRtlUserThreadStart;
         if (arm_context->Pc & 1) arm_context->Cpsr |= 0x20; /* thumb mode */
     }
+#undef IOS_WOW_GUEST_IN
 
     if (suspend)
     {

@@ -855,6 +855,13 @@ struct ContentView: View {
     /// .compact = iPhone landscape: game surface expands, arrow keys appear.
     @Environment(\.verticalSizeClass) private var vSizeClass
 
+    /// WOW64_DESIGN.md stage E: every shipped 32-bit (WoW64) test program's
+    /// launch button is one entry here — see `actionButtons`.
+    private let thirtyTwoBitTests: [(label: String, exe: String)] = [
+        ("32-bit hello", "hello-x86.exe"),
+        ("32-bit window", "window-x86.exe"),
+    ]
+
     enum JITStatus {
         case unknown
         case testing
@@ -1507,6 +1514,21 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.blue)
+
+                // WOW64_DESIGN.md stage E: every 32-bit (WoW64) test program
+                // gets its own button here, same style as the x86_64 tests
+                // above. Add one to this array to wire up another (e.g. a
+                // later D3D9 cube) — no other code needed.
+                ForEach(thirtyTwoBitTests, id: \.exe) { test in
+                    Button(test.label) {
+                        setenv("MADEIRA_EXE", test.exe, 1)
+                        unsetenv("MADEIRA_ARGS")
+                        unsetenv("MADEIRA_DESKTOP")
+                        runWineFullSequence()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.indigo)
+                }
 
                 Button("Clear Log") {
                     logStore.clear()

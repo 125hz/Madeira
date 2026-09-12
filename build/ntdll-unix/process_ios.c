@@ -71,6 +71,7 @@
 #include "winioctl.h"
 #include "ddk/ntddk.h"
 #include "unix_private.h"
+#include "ios_wow.h"
 #include "wine/condrv.h"
 #include "wine/server.h"
 #include "wine/debug.h"
@@ -423,13 +424,25 @@ struct ios_child_args {
     struct pe_image_info pe_info;
 };
 
+/* WOW64_DESIGN.md §2: the machine of the child's main image, published to
+ * wine_ios_child_main so it can reserve the child's [B, B+4G) guest window
+ * BEFORE allocating the child's TEB/PEB pair — those must live in the window
+ * (guest code reads TEB32->Self / TEB32->Peb as 32-bit guest addresses), and
+ * unix_init_startup_info, which is where the machine would otherwise first be
+ * known, runs long after the TEB exists.  The parent already has the image
+ * info in struct ios_child_args. */
+_Thread_local WORD ios_child_main_machine;
+
 static void *ios_child_thread_entry( void *arg )
 {
     struct ios_child_args *args = arg;
 
+    ios_child_main_machine = args->pe_info.machine;
+
     /* Use dprintf for early logging — ERR requires TEB which isn't set up yet */
-    dprintf(STDERR_FILENO, "[Wine child thread] ENTRY: fd=%d, argc=%d, exe=%s\n",
-            args->socketfd, args->argc, args->argc > 1 ? args->argv[1] : "(none)");
+    dprintf(STDERR_FILENO, "[Wine child thread] ENTRY: fd=%d, argc=%d, machine=0x%x, exe=%s\n",
+            args->socketfd, args->argc, args->pe_info.machine,
+            args->argc > 1 ? args->argv[1] : "(none)");
 
     /* Set up exit handling for this child thread */
     wine_ios_main_thread = pthread_self();
@@ -451,6 +464,10 @@ static void *ios_child_thread_entry( void *arg )
     }
 
     dprintf(STDERR_FILENO, "[Wine child thread] thread exiting cleanly\n");
+    /* WOW64_DESIGN.md §2: the pseudo-process is over — give its guest window
+     * back to the furniture band.  Must run while this thread still resolves
+     * to that process (before the TEB TLS slot is cleared below). */
+    ios_wow_window_release_current();
     free( args->argv );
     free( args );
 
@@ -657,14 +674,19 @@ NTSTATUS wow64_wine_spawnvp( void *args )
         int   wait;
     } const *params32 = args;
 
-    ULONG *argv32 = ULongToPtr( params32->argv );
+    /* WOW64_DESIGN.md §2: the argv ARRAY is an embedded guest pointer, and so
+     * is every string in it — both need +B (the outer args block is the only
+     * pointer the WoW64 module converts). */
+    ULONG *argv32 = ios_wow_host_ptr( params32->argv );
     unsigned int i, count = 0;
     char **argv;
     NTSTATUS ret;
 
+    if (!argv32) return STATUS_INVALID_PARAMETER;
     while (argv32[count]) count++;
     argv = malloc( (count + 1) * sizeof(*argv) );
-    for (i = 0; i < count; i++) argv[i] = ULongToPtr( argv32[i] );
+    if (!argv) return STATUS_NO_MEMORY;
+    for (i = 0; i < count; i++) argv[i] = ios_wow_host_ptr( argv32[i] );
     argv[count] = NULL;
     ret = __wine_unix_spawnvp( argv, params32->wait );
     free( argv );
@@ -2247,6 +2269,25 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
     if (self)
     {
 #ifdef WINE_IOS
+        /* MADEIRA-TEMP: WOW64_DESIGN.md M1 exit-status observability. This is
+         * the one chokepoint every pseudo-process's own termination reaches
+         * exactly once (self == TRUE means the calling process is the one
+         * being terminated), so one generic line here covers every exe --
+         * not just the x86 test path -- with the image name and the decimal
+         * status the guest actually asked to exit with. */
+        {
+            PEB *peb = NtCurrentTeb() ? NtCurrentTeb()->Peb : NULL;
+            RTL_USER_PROCESS_PARAMETERS *pp = peb ? peb->ProcessParameters : NULL;
+            const WCHAR *path = (pp && pp->ImagePathName.Buffer) ? pp->ImagePathName.Buffer : NULL;
+            unsigned int len = path ? pp->ImagePathName.Length / sizeof(WCHAR) : 0;
+            unsigned int base = 0, i, n = 0;
+            char name[64];
+
+            for (i = 0; i < len; i++) if (path[i] == '\\' || path[i] == '/') base = i + 1;
+            for (i = base; i < len && n < sizeof(name) - 1; i++) name[n++] = (char)path[i];
+            name[n] = 0;
+            ERR( "MADEIRA-EXIT: %s status=%d\n", n ? name : "?", (int)exit_code );
+        }
         if (!handle) *exiting_flag = TRUE;
         else if (*exiting_flag) exit_process( exit_code );
         else abort_process( exit_code );
@@ -2711,6 +2752,31 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
                 ret = wine_server_call( req );
                 if (!ret && !is_machine_64bit( reply->machine ) && is_machine_64bit( native_machine ))
                     val = reply->peb + 0x1000;
+            }
+            SERVER_END_REQ;
+            if (!ret) *(ULONG_PTR *)info = val;
+        }
+        break;
+
+    /* iOS-Madeira (WOW64_DESIGN.md §2): the single source of truth for B, the
+     * host address of guest 0 for a 32-bit pseudo-process.  0 when the target
+     * has no guest window.  wow64.dll and the FEX WoW64 module each read this
+     * once at process init; nothing else may invent a B. */
+    case ProcessWineIosWowGuestBase:
+        len = sizeof(ULONG_PTR);
+        if (size != len) return STATUS_INFO_LENGTH_MISMATCH;
+        if (handle == GetCurrentProcess()) *(ULONG_PTR *)info = ios_wow_base();
+        else
+        {
+            ULONG_PTR val = 0;
+
+            /* pseudo-processes share one address space, so the registry is
+             * keyed by PEB and a handle resolves through the server. */
+            SERVER_START_REQ( get_process_info )
+            {
+                req->handle = wine_server_obj_handle( handle );
+                ret = wine_server_call( req );
+                if (!ret) val = ios_wow_base_for_peb( wine_server_get_ptr( reply->peb ) );
             }
             SERVER_END_REQ;
             if (!ret) *(ULONG_PTR *)info = val;

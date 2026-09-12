@@ -886,6 +886,12 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
 C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
 
 #ifdef _WIN64
+/* iOS-Madeira, WoW64 guest window (WOW64_DESIGN.md 2): in every thunk below
+ * `args` is already a HOST pointer - the WoW64 module converts that one outer
+ * pointer - but every pointer EMBEDDED in the 32-bit block, and every pointer
+ * nested inside those, is still a GUEST address.  ios_wow_host_ptr() is the
+ * +B conversion (NULL-preserving) and ios_wow_guest_ptr32() writes one back;
+ * both are plain ULongToPtr/PtrToUlong off the iOS port. */
 
 typedef ULONG PTR32;
 
@@ -905,14 +911,14 @@ static NTSTATUS wow64_open_cert_store( void *args )
         PTR32 key_count_ret;
     } const *params32 = args;
 
-    const CRYPT_DATA_BLOB32 *pfx32 = ULongToPtr( params32->pfx );
-    CRYPT_DATA_BLOB pfx = { pfx32->cbData, ULongToPtr( pfx32->pbData ) };
+    const CRYPT_DATA_BLOB32 *pfx32 = ios_wow_host_ptr( params32->pfx );
+    CRYPT_DATA_BLOB pfx = { pfx32->cbData, ios_wow_host_ptr( pfx32->pbData ) };
     struct open_cert_store_params params =
     {
         &pfx,
-        ULongToPtr( params32->password ),
-        ULongToPtr( params32->data_ret ),
-        ULongToPtr( params32->key_count_ret )
+        ios_wow_host_ptr( params32->password ),
+        ios_wow_host_ptr( params32->data_ret ),
+        ios_wow_host_ptr( params32->key_count_ret )
     };
 
     return open_cert_store( &params );
@@ -930,8 +936,8 @@ static NTSTATUS wow64_import_store_key( void *args )
     struct import_store_key_params params =
     {
         params32->data,
-        ULongToPtr( params32->buf ),
-        ULongToPtr( params32->buf_size )
+        ios_wow_host_ptr( params32->buf ),
+        ios_wow_host_ptr( params32->buf_size )
     };
 
     return import_store_key( &params );
@@ -951,8 +957,8 @@ static NTSTATUS wow64_import_store_cert( void *args )
     {
         params32->data,
         params32->index,
-        ULongToPtr( params32->buf ),
-        ULongToPtr( params32->buf_size )
+        ios_wow_host_ptr( params32->buf ),
+        ios_wow_host_ptr( params32->buf_size )
     };
 
     return import_store_cert( &params );
@@ -969,9 +975,9 @@ static NTSTATUS wow64_enum_root_certs( void *args )
 
     struct enum_root_certs_params params =
     {
-        ULongToPtr( params32->buffer ),
+        ios_wow_host_ptr( params32->buffer ),
         params32->size,
-        ULongToPtr( params32->needed )
+        ios_wow_host_ptr( params32->needed )
     };
 
     return enum_root_certs( &params );

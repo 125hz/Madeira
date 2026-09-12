@@ -308,6 +308,16 @@ DLGPROC get_dialog_proc( DLGPROC ret, BOOL ansi )
 
 static void init_user(void)
 {
+    /* iOS-Madeira (WOW64_DESIGN.md §3 invariant 2): gdi_init() -> font_init()
+     * dereferences Peb->AnsiCodePageData / OemCodePageData /
+     * UnicodeCaseTableData.  In a 32-bit process those three PEB64 fields were
+     * written by the guest's own ntdll with the WoW64 identity conversion, so
+     * they hold GUEST addresses; repair them before the first native read.
+     * Defined in build/ntdll-unix/env_ios.c (same image); no-op for a 64-bit
+     * process.  RtlInitCodePageTable() also guards itself. */
+    extern void ios_wow_fixup_peb64_ptrs(void);
+    ios_wow_fixup_peb64_ptrs();
+
     NtQuerySystemInformation( SystemBasicInformation, &system_info, sizeof(system_info), NULL );
 
     init_startup_info();
