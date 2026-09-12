@@ -182,9 +182,16 @@ game-specific patches — every change must fix the emulator/runtime generically
   `TextureViewDescriptor` gained an identity-defaulted `swizzle`, so the
   reference's packed `TextureViewKey` was not taken and every d3d11 view is
   unchanged. Presentation needed no conversion, as §7.1 predicted, and that is
-  now verified slot by slot. Open: the remote Metal backend rejects the new
-  commands by name (needs `WMTW_OP_*` wire ops in `research/remote-metal/`,
-  another component); nothing has run on a device yet.
+  now verified slot by slot. **The §7.5 audit found one real invariant break and
+  fixed it:** `Buffer::allocate` created every non-`CpuInvisible` allocation
+  with NULL memory and Shared storage — the Metal-allocated path
+  `_MTLDevice_newBuffer32` refuses — and that is every d3d9 vertex and index
+  buffer, so the first `CreateVertexBuffer` would have failed on a 32-bit
+  guest; it now sets `CpuPlaced` under `#ifdef __i386__`, the same shape
+  `Texture::allocate` already used. No `[buffer contents]` pointer reaches the
+  application anywhere in `src/d3d9`. Open: the remote Metal backend rejects
+  the new commands by name (needs `WMTW_OP_*` wire ops in
+  `research/remote-metal/`, another component); nothing has run on a device yet.
 - 2026-09-11 — D3D9 stages 3 and 5 landed; stage 4 imported but not yet
   compiling (Opus; details in §7.11). Licensing decision received from the
   fork owner: import under LGPL-2.1 §3 → GPL-3.0-or-later, so §7.2 is
@@ -1246,6 +1253,9 @@ else { buffer = [device newBufferWithLength:...];
   Stage 4 has to confirm that every `src/d3d9` buffer allocation supplies
   memory; if any does not, the fix is to route it through the ring allocator,
   not to relax this rule.
+  **Confirmed and fixed in stage 4 (§7.11):** one allocation did not — the
+  shared `Buffer::allocate`, which is every d3d9 vertex and index buffer. It
+  now supplies its own memory on i386 rather than the rule being relaxed.
 
 Two further constraints for stage 4:
 
@@ -1661,6 +1671,51 @@ a pointer all have `_Foo32` variants already: `MetalLayer_setProps`/`getProps`
 (70/71), `WMTGetDisplayDescription` (96), `MetalLayer_getEDRValue` (97), the
 display-setting trio (99-101), and `MTLRenderCommandEncoder_encodeCommands`
 (38), which is the slot the new render commands ride.
+
+**Mapped memory (§7.5): one real blocker found and fixed.** The §7.5 audit of
+the imported frontend turned up a genuine invariant break, and it was on the
+hottest path rather than a corner: `Buffer::allocate`
+(`research/dxmt/src/dxmt/dxmt_buffer.cpp:148-193`) built its `WMTBufferInfo`
+with `memory` NULL and `WMTResourceStorageModeShared` for every allocation that
+is not `CpuInvisible`. That is exactly the Metal-allocated path
+`_MTLDevice_newBuffer32` refuses, and **every d3d9 vertex and index buffer goes
+through it** — `allocateD3D9BufferStorage` (`src/d3d9/d3d9_device.cpp:3209`) and
+every `DynamicBuffer` rename (`src/dxmt/dxmt_dynamic.cpp:154`) ask for
+`CpuWriteCombined`, never `CpuInvisible`. On a 32-bit guest the very first
+`CreateVertexBuffer` would have failed the call. Fixed the way §7.5 prescribes
+(supply the memory; do not relax the rule) and the way `Texture::allocate`
+already did for its buffer-backed allocations
+(`dxmt_texture.cpp:186-188`): under `#ifdef __i386__`, `Buffer::allocate` now
+sets `BufferAllocationFlag::CpuPlaced` for any non-`CpuInvisible` allocation, so
+`BufferAllocation`'s constructor `wsi::aligned_malloc`s the backing and its
+destructor frees it. That memory is this PE module's own heap inside the WoW
+pseudo-process, so it is inside `[B, B+4G)` by construction.
+
+The rest of the audit came out clean, and worth stating because it is what
+§7.5 was written to protect:
+
+- **Nothing from `[buffer contents]` ever reaches the application.** There is no
+  `contents()` call anywhere in `src/d3d9/**`. Every `Lock`/`LockRect`/`LockBox`
+  out-pointer is PE-side memory the module owns: `wsi::aligned_malloc` mirrors
+  for buffers (`d3d9_buffer.cpp:291`, `:513`) and surfaces
+  (`d3d9_surface.cpp:524`), a `MapViewOfFile` chunk for volumes
+  (`d3d9_volume.cpp:173` via `d3d9_mem.cpp`), or the application's own
+  user-memory pointer. `d3d9_buffer_map.hpp:13-16` states the invariant
+  outright: Lock returns a host mirror Metal has never seen.
+- The three direct `device.newBuffer` calls inside `src/d3d9/**`
+  (`d3d9_texture.cpp:268`, `d3d9_cube_texture.cpp:165`,
+  `d3d9_device.cpp:10511`) all set `memory` from an `aligned_malloc`'d page.
+- The upload/const rings d3d9 builds (`d3d9_device.cpp:534-550`) are
+  `placed_buffer = true`, so their blocks are `malloc`ed by the ring.
+- Two Managed + NULL-memory ring allocators exist and *would* trip the thunk:
+  the queue's `staging_allocator` (`dxmt_command_queue.cpp:24-27`) and
+  `gpu_command_heap_allocator` (`dxmt_resource_initializer.cpp:50-52`). Neither
+  is reachable from d3d9 today — `AllocateStagingBuffer` has no d3d9 caller, and
+  the imported code says why it avoids it
+  (`d3d9_device.cpp:10621`, `d3d9_device.hpp:1597`: "that one is
+  Metal-allocated"). Left alone rather than changed: the thunk refuses them
+  loudly, which is the designed behaviour, and converting them would change
+  d3d11's allocation shape on the 64-bit farms for no present gain.
 
 **Still open after this session.**
 
