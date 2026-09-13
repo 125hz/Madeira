@@ -2334,10 +2334,41 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
             for (i = base; i < len && n < sizeof(name) - 1; i++) name[n++] = (char)path[i];
             name[n] = 0;
             ERR( "MADEIRA-EXIT: %s status=%d\n", n ? name : "?", (int)exit_code );
+            /* Unbuffered duplicate: ERR goes through the debug channel, which a
+             * muted err: channel or a dying log pump can swallow.  Everything
+             * below is the teardown that used to end the log (and the app), so
+             * each step names itself on fd 2 with a plain write(2). */
+            extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
+            dprintf( 2, "[Wine child exit] stage=madeira-exit exe=%s status=%d handle=%p "
+                        "exiting_flag=%d machine=%04x window=%p teb=%p peb=%p\n",
+                     n ? name : "?", (int)exit_code, handle, (int)*exiting_flag,
+                     ios_cur_image_info()->Machine, (void *)ios_wow_base(),
+                     NtCurrentTeb(), peb );
         }
-        if (!handle) *exiting_flag = TRUE;
-        else if (*exiting_flag) exit_process( exit_code );
-        else abort_process( exit_code );
+        if (!handle)
+        {
+            dprintf( 2, "[Wine child exit] stage=mark-exiting (no teardown yet)\n" );
+            *exiting_flag = TRUE;
+        }
+        else if (*exiting_flag)
+        {
+            dprintf( 2, "[Wine child exit] stage=exit_process\n" );
+            exit_process( exit_code );
+            dprintf( 2, "[Wine child exit] stage=returned-from-exit_process (UNEXPECTED)\n" );
+        }
+        else
+        {
+            /* The loader_init-failure path: ntdll called
+             * NtTerminateProcess( GetCurrentProcess(), status ) with no
+             * preceding NtTerminateProcess( 0, ... ), so exiting_flag is still
+             * FALSE.  abort_process() used to _exit() here, which on iOS ends
+             * the whole Mach task — every other pseudo-process, the UI, the log.
+             * It now performs the same per-pseudo-process teardown as
+             * exit_process (thread_ios.c). */
+            dprintf( 2, "[Wine child exit] stage=abort_process\n" );
+            abort_process( exit_code );
+            dprintf( 2, "[Wine child exit] stage=returned-from-abort_process (UNEXPECTED)\n" );
+        }
 #else
         if (!handle) process_exiting = TRUE;
         else if (process_exiting) exit_process( exit_code );

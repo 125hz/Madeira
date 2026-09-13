@@ -18149,6 +18149,13 @@ static unsigned int get_memory_image_info( HANDLE process, LPCVOID addr, MEMORY_
 }
 
 
+/* MADEIRA (WOW64_DESIGN.md §4): Wine-private MEMORY_INFORMATION_CLASS for the
+ * PE-VA -> JIT-pool-copy translation below.  Kept local to the two files that
+ * implement and use it (this one and wine/dlls/wow64/syscall.c) rather than
+ * added to the public winternl.h enum, which this iOS tree does not own; the
+ * value continues the MemoryWine* block (1000..1004 are taken). */
+#define MemoryWineIosJitPoolAddress ((MEMORY_INFORMATION_CLASS)1005)
+
 /***********************************************************************
  *             NtQueryVirtualMemory   (NTDLL.@)
  *             ZwQueryVirtualMemory   (NTDLL.@)
@@ -18278,6 +18285,34 @@ NTSTATUS WINAPI NtQueryVirtualMemory( HANDLE process, LPCVOID addr,
                 if (!dlclose( (void *)(UINT_PTR)*handle )) return STATUS_SUCCESS;
             }
             return STATUS_INVALID_HANDLE;
+
+#ifdef WINE_IOS
+        /* MADEIRA (WOW64_DESIGN.md §4): PE VA -> executable JIT-pool copy.
+         *
+         * PE code cannot execute at its mapped address here, so every image's
+         * code is copied into the dual-mapped pool and a Mach exception
+         * redirects a PC that lands on the PE address.  Pointer tables that
+         * PE code branches through are normally repaired in bulk — the
+         * NtProtect-time [iat-sync] sweep for pointers living inside a pool
+         * copy, the [stale-heal] escalation for the rest — but neither can
+         * reach a table that is READ from the PE view of a read-only section
+         * (the pool copy of that section is already correct, so the heal's
+         * exact-value scan finds nothing and the same VA keeps costing one
+         * Mach exception per call).  wow64.dll's copy of wow64win.dll's
+         * ServiceTable is exactly that case.
+         *
+         * This class lets PE code ask for the pool address of a function it
+         * is about to store in a private dispatch table, so the branch never
+         * faults in the first place.  Returns `addr` unchanged when it is not
+         * inside a pool-copied image (already-pool addresses included, which
+         * makes the call idempotent). */
+        case MemoryWineIosJitPoolAddress:
+            if (len < sizeof(ULONG_PTR)) return STATUS_INFO_LENGTH_MISMATCH;
+            if (process != GetCurrentProcess()) return STATUS_INVALID_HANDLE;
+            *(ULONG_PTR *)buffer = (ULONG_PTR)ios_jit_translate_addr( (void *)addr );
+            if (res_len) *res_len = sizeof(ULONG_PTR);
+            return STATUS_SUCCESS;
+#endif
 
         default:
             FIXME("(%p,%p,info_class=%d,%p,%ld,%p) Unknown information class\n",

@@ -221,6 +221,85 @@ game-specific patches — every change must fix the emulator/runtime generically
   unforced protection on iOS (`virtual_ios.c:8625`). Expected: i386 child
   logs `[nls-getptr] type=10/11/11` for its own PEB then `loader_init:
   [iOS] wow64 early locale_init done`; no `[vmem-denied] … protect=0x2`.
+- 2026-09-12 — Round with the locale/DLL-set IPA (23:21). Confirmed: early
+  `locale_init` runs in the i386 child, `[force-exec]` fallthrough applied
+  (8 lines, no `[vmem-denied]`), the game loads d3d9/winemetal and 28 new
+  DLLs resolve. Remaining, all generic: (a) CHILD path: no API-set map —
+  `load_apiset_dll` runs only on the main path, the child clones the
+  64-bit parent's PEB, so the 32-bit PEB has `ApiSetMap=0` and every
+  `api-ms-win-crt-*` import of d3d9/winemetal fails (no farm ships
+  forwarder DLLs; the schema must be mapped into the child's window per
+  machine). The app then crashed after the failed child's MADEIRA-EXIT.
+  Assigned (Opus #1: loader_ios/process_ios/thread_ios). (b) MAIN path:
+  EXCEPTION_WINE_NAME_THREAD raised by 32-bit code reaches the 64-bit
+  `dispatch_exception` with a GUEST pointer in ExceptionInformation[1] →
+  SEGV in ntdll (§4 boundary miss in `exception_record_32to64`). (c) MAIN
+  path: `Wow64SystemServiceEx` calls `ServiceTable[id]` from wow64win's
+  read-only .rdata, whose entries are PE addresses → every 32-bit
+  NtUser/NtGdi syscall takes a Mach redirect exception (~500k in a minute;
+  stale-heal "rewrote 0 slots") — the likely black screen. Assigned (Opus
+  #2: wow64/wow64win/virtual_ios/signal_arm64_ios/ntdll exception.c).
+  Also seen: one EXECUTE fault on a raw guest address 0x7bf8cbdc on a
+  second thread after a FEX CALLRET underflow (under review); missing
+  d3d10.dll (delay-load; add to i386 set later), gameux/NVCPL/nvapi/
+  PhysXLoader/AgPerfMon absent (expected).
+  (a) DONE (Opus #1, loader_ios/thread_ios/process_ios): `wine_ios_child_main`
+  never called `load_apiset_dll` for ANY child (64-bit children survived
+  on the inherited host pointer); new `ios_child_load_apiset(machine)`
+  maps the child's own `/i386-windows/apisetschema.dll` into the window
+  via `map_section` and publishes `wow_peb->ApiSetMap` as a guest address
+  (`[wow-apiset] child i386 schema mapped at host … = guest …`). The app
+  crash was `abort_process()` → raw `_exit()` (not the shimmed `exit()`),
+  taken because a child whose `loader_init` fails calls
+  `NtTerminateProcess(self)` without the `NtTerminateProcess(0)` that sets
+  `exiting_flag`; on iOS it now runs the per-pseudo-process teardown
+  (`process_exit_wrapper`) and logs `[Wine child exit] stage=…`. Bonus
+  find: `wow_peb` is a session global written only for 32-bit images, so
+  a 64-bit child spawned BY an i386 child (conhost) ran
+  `build_wow64_parameters` with an untranslated 2 GB ceiling → assert →
+  abort; neutralised by saving/NULLing `wow_peb` around
+  `unix_init_startup_info` in the child path (`[wow-peb] 64-bit child kept
+  out of the WoW64 branch`). Proper home is `env_ios.c:2016` (`init_peb`
+  should test `ios_wow_base()`); TODO. Audit leftovers (pre-existing for
+  64-bit children too): per-process keyed event missing (`NtCreateKeyedEvent`
+  only on the main path; handle tables are per pseudo-process — real
+  latent bug), session globals `startup_info_size`/`main_argv` overwritten
+  per child (safe only because spawns serialise), `current_machine` stays
+  0xaa64 in an i386 child (harmless today), Mach-port→TEB registry misses
+  the child's exception thread (`[reg-miss] … slot-0 fallback`).
+  (b)+(c) DONE (Opus #2): `exception_record_32to64/64to32` now share one
+  catalogue `get_exception_info_ptrs()` of pointer-carrying
+  ExceptionInformation entries (AV/in-page [1]; WINE_NAME_THREAD [1] when
+  [0]==0x1000; WINE_STUB [0] and [1] when [1]>>16; DBG_PRINTEXCEPTION_C/
+  WIDE_C [1]); `dispatch_exception` refuses a sub-4 GB pointer when a
+  guest base is published (`[exc-info] refusing to dereference …`). The
+  storm was `wow64_NtUserPeekMessage` (wow64win+0x27854): `syscall_tables[1]`
+  pointed at wow64win's PE-view .rdata ServiceTable (PE addresses; the
+  stale-heal scans only pool copies, hence "rewrote 0"). New memory class
+  `MemoryWineIosJitPoolAddress` (1005) in `NtQueryVirtualMemory` returns
+  the pool address of a PE VA; wow64.dll copies each ServiceTable into a
+  private translated array (`[wow-syscall] translated N ServiceTable
+  entries for wow64win.dll`) and translates the 21 CPU-DLL `GET_PTR`
+  targets (the other healed addresses were libwow64fex+0x1015a0/f0/638/748).
+  Secondary: the EXECUTE fault at raw guest 0x7bf8cbdc is FEX-side — after
+  a callret UNDERFLOW+RESET the JIT branched to a guest return address
+  without adding B. Assigned (Opus #3, FEX only).
+  DONE (Opus #3): NOT a missing base — the callret shadow stack ran away
+  (1.3 M entries, 499 % of the 4 MB window, on tid 0040) into the thread's
+  own `CpuStateFrame` and overwrote `Pointers.FallbackHandlerPointers[].Func`
+  (16-byte-aligned `.Func` halves sit exactly where `stp {guest_rip, host}`
+  writes the guest half), so the ABI stub's `blr x3` jumped to a raw guest
+  RIP. Every inline callret bounds guard was `#ifdef ARCHITECTURE_arm64ec`,
+  but `xtajit.dll` is plain aarch64 + `FEX_IOS_HOST` (same mis-gating class
+  as `AllocatorHooks.h`), so this module had NO guard at all; the only reset
+  ran at `CompileBlock` entry. Fix: shared `EmitCallRetStackGuard()` under
+  `FEX_IOS_HOST` at the three BranchOps sites and the JITCallback push
+  (window tightened 16 MB → 4 MB), reset zeroes the exposed frame and writes
+  back `State.callret_sp`; `Core.cpp`/`CallRetStack.h` reject non-pool host
+  halves after a reset (`[callret] rejected non-pool target host=… rip=…`).
+  Expect `[callret] … used=N` ≤ 131072 entries, never `499%`. The leak
+  source is expected (SEH unwind/longjmp abandon frames without RET). Also
+  shipped: i386 farm +2 (d3d10, ddraw; stock Wine, farm = 199).
 
 
 - 2026-09-12 — M5 direction: the user's next target is a 32-bit UE3/D3D9

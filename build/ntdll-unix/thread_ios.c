@@ -1766,7 +1766,37 @@ void abort_thread( int status )
  */
 void abort_process( int status )
 {
+#ifdef WINE_IOS
+    /* iOS-Madeira: _exit() KILLS THE WHOLE APP.
+     *
+     * Pseudo-processes are threads in one Mach task, and `exit()` is redirected
+     * to the wine_ios_exit shim (shims/wine_ios_exit.h), which longjmps back to
+     * this pseudo-process's own entry thread.  `_exit()` is NOT redirected — it
+     * is the raw syscall — so every caller of abort_process took the entire
+     * Madeira process down with one Windows process.
+     *
+     * That is exactly the path a child whose loader_init failed takes:
+     * ntdll's loader_init calls NtTerminateProcess( GetCurrentProcess(), ... )
+     * WITHOUT the preceding NtTerminateProcess( 0, ... ) that RtlExitUserProcess
+     * makes, so process_ios.c's self-terminate branch sees exiting_flag == FALSE
+     * and lands here.  Device log (2026-09-12): an i386 desktop child failed its
+     * imports, printed `MADEIRA-EXIT: ... status=-1073741515`, and the log — and
+     * the app — ended on the very next instruction.
+     *
+     * The distinction abort_process draws upstream (skip atexit handlers) is
+     * meaningless here; what matters is that only THIS pseudo-process dies and
+     * that its wineserver socket reaches EOF so the parent's CreateProcess wait
+     * returns.  process_exit_wrapper() does exactly that and then calls the
+     * redirected exit().  Same teardown as exit_process(), deliberately. */
+    dprintf( 2, "[proc-exit] abort_process(status=0x%x) -> pseudo-process teardown "
+                "(NOT _exit: that would end the whole app)\n", (unsigned)status );
+    process_exit_wrapper( get_unix_exit_code( status ));
+    /* process_exit_wrapper never returns on iOS (exit() shim longjmps, or
+     * pthread_exit()s a thread that has no jmpbuf). */
+    for (;;) pthread_exit( NULL );
+#else
     _exit( get_unix_exit_code( status ));
+#endif
 }
 
 

@@ -2554,14 +2554,22 @@ static void load_ntdll(void)
 
 
 /***********************************************************************
- *           load_apiset_dll
+ *           map_apiset_schema
+ *
+ * Map <pe_dir(machine)>/apisetschema.dll and return the API_SET_NAMESPACE
+ * inside the mapped view.  Split out of load_apiset_dll so the child boot
+ * path can ask for a DIFFERENT machine's schema than the session's
+ * `current_machine` (an i386 child under a 64-bit session needs
+ * /i386-windows/apisetschema.dll, and it needs it mapped inside its own
+ * guest window).  *view is the whole mapped view, for unmapping on rejection.
  */
-static void load_apiset_dll(void)
+static unsigned int map_apiset_schema( WORD machine, void **view, SIZE_T *view_size,
+                                       API_SET_NAMESPACE **map_out )
 {
     static WCHAR path[] = {'\\','?','?','\\','C',':','\\','w','i','n','d','o','w','s','\\',
                            's','y','s','t','e','m','3','2','\\',
                            'a','p','i','s','e','t','s','c','h','e','m','a','.','d','l','l',0};
-    const char *pe_dir = get_pe_dir( current_machine );
+    const char *pe_dir = get_pe_dir( machine );
     const IMAGE_NT_HEADERS *nt;
     const IMAGE_SECTION_HEADER *sec;
     API_SET_NAMESPACE *map;
@@ -2573,6 +2581,10 @@ static void load_apiset_dll(void)
     char *name = NULL;
     void *ptr;
     UINT i;
+
+    *view = NULL;
+    *view_size = 0;
+    *map_out = NULL;
 
     init_unicode_string( &str, path );
     InitializeObjectAttributes( &attr, &str, 0, 0, NULL );
@@ -2592,46 +2604,167 @@ static void load_apiset_dll(void)
     }
     if (!status)
     {
+        /* map_section() passes user_space_wow_limit as zero_bits; inside a
+         * windowed (32-bit) pseudo-process ios_wow_translate_limits turns that
+         * guest ceiling into [B, B+limit], which is what puts the view inside
+         * the guest window.  Outside a window it is an ordinary host mapping. */
         status = map_section( mapping, &ptr, &size, PAGE_READONLY );
         NtClose( mapping );
     }
-    if (!status)
-    {
-        nt = get_rva( ptr, ((IMAGE_DOS_HEADER *)ptr)->e_lfanew );
-        sec = IMAGE_FIRST_SECTION( nt );
+    if (status) return status;
 
-        for (i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
+    *view = ptr;
+    *view_size = size;
+
+    nt = get_rva( ptr, ((IMAGE_DOS_HEADER *)ptr)->e_lfanew );
+    sec = IMAGE_FIRST_SECTION( nt );
+
+    for (i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
+    {
+        if (memcmp( (char *)sec->Name, ".apiset", 8 )) continue;
+        map = (API_SET_NAMESPACE *)((char *)ptr + sec->PointerToRawData);
+        if (sec->PointerToRawData < size &&
+            size - sec->PointerToRawData >= sec->Misc.VirtualSize &&
+            map->Version == 6 &&
+            map->Size <= sec->Misc.VirtualSize)
         {
-            if (memcmp( (char *)sec->Name, ".apiset", 8 )) continue;
-            map = (API_SET_NAMESPACE *)((char *)ptr + sec->PointerToRawData);
-            if (sec->PointerToRawData < size &&
-                size - sec->PointerToRawData >= sec->Misc.VirtualSize &&
-                map->Version == 6 &&
-                map->Size <= sec->Misc.VirtualSize)
+            *map_out = map;
+            return STATUS_SUCCESS;
+        }
+        break;
+    }
+    NtUnmapViewOfSection( NtCurrentProcess(), ptr );
+    *view = NULL;
+    *view_size = 0;
+    return STATUS_APISET_NOT_PRESENT;
+}
+
+
+/***********************************************************************
+ *           load_apiset_dll
+ */
+static void load_apiset_dll(void)
+{
+    API_SET_NAMESPACE *map;
+    unsigned int status;
+    SIZE_T size;
+    void *ptr;
+
+    if ((status = map_apiset_schema( current_machine, &ptr, &size, &map )))
+    {
+        ERR( "failed to load apiset: %x\n", status );
+        return;
+    }
+    peb->ApiSetMap = map;
+    /* iOS-Madeira (WOW64_DESIGN.md §3 invariant 1): wow_peb holds
+     * GUEST addresses.  When this process has no window the view is a plain
+     * host mapping with no guest address at all, and PtrToUlong() would
+     * publish a truncated host pointer that 32-bit ntdll would dereference in
+     * get_apiset_entry().  Publish a guest address only if the view really is
+     * inside the window; 0 means "no apiset", which get_apiset_entry()
+     * handles as STATUS_APISET_NOT_PRESENT. */
+    if (wow_peb)
+        wow_peb->ApiSetMap = ios_wow_in_window( map ) ? ios_wow_guest_addr( map ) : 0;
+    TRACE( "loaded apiset at %p\n", map );
+}
+
+
+#ifdef WINE_IOS
+/***********************************************************************
+ *           ios_child_load_apiset
+ *
+ * The child (CreateProcess) boot path never ran load_apiset_dll at all: it
+ * clones the PEB of the 64-bit session process, so peb->ApiSetMap arrived as
+ * an inherited host pointer and the 32-bit PEB — which is freshly zeroed
+ * memory, not part of the sizeof(PEB) clone — kept ApiSetMap == 0.  The
+ * 32-bit ntdll's get_apiset_entry() then reports STATUS_APISET_NOT_PRESENT
+ * for every `api-ms-win-*` import, each one is retried as a real DLL file,
+ * and loader_init fails the whole process with STATUS_DLL_NOT_FOUND.
+ *
+ * Two maps, two namespaces, one per half of the process:
+ *   - peb->ApiSetMap   (HOST pointer) is what the 64-bit half — wow64.dll,
+ *     the CPU DLL, every aarch64 module — consults.  The clone from the
+ *     session PEB is a live view in this one shared address space, so it is
+ *     reusable; it is only re-mapped when it is missing or not a v6 schema.
+ *   - wow_peb->ApiSetMap (GUEST address) is what 32-bit code consults, and it
+ *     must be the CHILD's machine's schema, mapped inside the child's own
+ *     [B, B+4G) window.  map_section()'s user_space_wow_limit ceiling is what
+ *     places it there (same mechanism the 32-bit MAIN path relies on).
+ *
+ * Must run after unix_init_startup_info() (which publishes wow_peb and the
+ * guest ceiling) and before server_init_process_done().
+ */
+static void ios_child_load_apiset( WORD machine )
+{
+    API_SET_NAMESPACE *map;
+    unsigned int status;
+    SIZE_T size;
+    void *ptr;
+
+    /* --- 64-bit half ------------------------------------------------- */
+    {
+        const API_SET_NAMESPACE *cur = peb->ApiSetMap;
+
+        /* Nothing is mapped below iOS's 4 GB __PAGEZERO, so a non-zero
+         * sub-4 GB value is a truncated/guest pointer, never a host map. */
+        if (!cur || (ULONG_PTR)cur < IOS_WOW_WINDOW_SIZE || cur->Version != 6)
+        {
+            if ((status = map_apiset_schema( native_machine, &ptr, &size, &map )))
+                ERR( "[wow-apiset] child has no usable 64-bit apiset map (inherited %p) and "
+                     "re-mapping the %04x schema failed: %x — api-ms-win-* names will not "
+                     "resolve for the 64-bit half of this process\n",
+                     peb->ApiSetMap, native_machine, status );
+            else
             {
                 peb->ApiSetMap = map;
-                /* iOS-Madeira (WOW64_DESIGN.md §3 invariant 1): wow_peb holds
-                 * GUEST addresses.  map_section() places this view with no
-                 * window ceiling, so it is a plain host mapping with no guest
-                 * address at all, and PtrToUlong() would publish a truncated
-                 * host pointer that 32-bit ntdll would dereference in
-                 * get_apiset_entry().  (It is also the 64-bit pe_dir's schema,
-                 * which is not the map 32-bit code should consult.)  Publish
-                 * a guest address only if the view really is inside the
-                 * window; 0 means "no apiset", which get_apiset_entry()
-                 * handles as STATUS_APISET_NOT_PRESENT. */
-                if (wow_peb)
-                    wow_peb->ApiSetMap = ios_wow_in_window( map ) ? ios_wow_guest_addr( map ) : 0;
-                TRACE( "loaded %s apiset at %p\n", debugstr_w(path), map );
-                return;
+                dprintf( STDERR_FILENO, "[wow-apiset] child 64-bit schema re-mapped at host %p\n", map );
             }
-            break;
         }
-        NtUnmapViewOfSection( NtCurrentProcess(), ptr );
-        status = STATUS_APISET_NOT_PRESENT;
     }
-    ERR( "failed to load apiset: %x\n", status );
+
+    /* --- 32-bit half -------------------------------------------------- */
+    if (is_machine_64bit( machine )) return;
+
+    if (!wow_peb)
+    {
+        ERR( "[wow-apiset] FAILED: i386 child has no 32-bit PEB (wow_peb=NULL) — every "
+             "api-ms-win-* import will fail with STATUS_DLL_NOT_FOUND\n" );
+        dprintf( STDERR_FILENO, "[wow-apiset] FAILED: i386 child has no wow_peb\n" );
+        return;
+    }
+    if ((status = map_apiset_schema( machine, &ptr, &size, &map )))
+    {
+        ERR( "[wow-apiset] FAILED: cannot map %s/apisetschema.dll for the i386 child: %x — "
+             "every api-ms-win-* import will fail with STATUS_DLL_NOT_FOUND\n",
+             get_pe_dir( machine ), status );
+        dprintf( STDERR_FILENO, "[wow-apiset] FAILED: map_apiset_schema(%04x) = 0x%x\n",
+                 machine, status );
+        wow_peb->ApiSetMap = 0;
+        return;
+    }
+    if (!ios_wow_in_window( map ))
+    {
+        /* Publishing PtrToUlong(host) here is what invariant 1 forbids: the
+         * guest would dereference a truncated host pointer.  Refuse loudly and
+         * leave 0 (= STATUS_APISET_NOT_PRESENT) instead. */
+        ERR( "[wow-apiset] FAILED: the i386 child's schema landed OUTSIDE its guest window "
+             "(host %p, window %p, guest ceiling %p) — refusing to publish a truncated host "
+             "pointer; api-ms-win-* imports will fail\n",
+             map, (void *)ios_wow_base(), (void *)user_space_wow_limit );
+        dprintf( STDERR_FILENO, "[wow-apiset] FAILED: schema host %p outside window %p\n",
+                 map, (void *)ios_wow_base() );
+        NtUnmapViewOfSection( NtCurrentProcess(), ptr );
+        wow_peb->ApiSetMap = 0;
+        return;
+    }
+    wow_peb->ApiSetMap = ios_wow_guest_addr( map );
+    dprintf( STDERR_FILENO, "[wow-apiset] child i386 schema mapped at host %p = guest 0x%x "
+             "(view %p+%p, wow_peb=%p)\n",
+             map, (unsigned)wow_peb->ApiSetMap, ptr, (void *)size, wow_peb );
+    ERR( "[wow-apiset] child i386 schema mapped at host %p = guest %08x\n",
+         map, (unsigned)wow_peb->ApiSetMap );
 }
+#endif /* WINE_IOS */
 
 
 /***********************************************************************
@@ -3446,8 +3579,33 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
          * thread reads identity owner-aware from here on. */
         {
             SECTION_IMAGE_INFORMATION session_image_info = main_image_info;
+            /* WOW64_DESIGN.md §3: `wow_peb` is a SESSION global, and init_peb()
+             * (env_ios.c) only ever WRITES it — for a 32-bit image — so it
+             * stays pointing at the previous 32-bit pseudo-process when a
+             * 64-bit child boots next.  init_peb's `if (wow_peb)` block then
+             * ran for that 64-bit child: it called ios_wow_map_user_shared_data
+             * and build_wow64_parameters, whose limit_2g ceiling was NOT
+             * translated into a window (this child has none), so the
+             * allocation was attempted below 4 GB, returned STATUS_NO_MEMORY,
+             * and `assert( !status )` (env_ios.c:1934) aborted — which on iOS
+             * is an abort() inside the one shared Mach task.  Observed on
+             * device: a console-subsystem i386 child's conhost.exe died this
+             * way and NtCreateUserProcess returned c00000e5.
+             * Clearing it here makes the derivation per-process: init_peb
+             * re-publishes it for a 32-bit child, and if it comes back NULL
+             * this child is 64-bit and the 32-bit sibling's value (still live
+             * and blocked in NtCreateUserProcess) is restored. */
+            WOW_PEB *saved_wow_peb = wow_peb;
+
+            wow_peb = NULL;
             CHILD_STAGE( "unix_init_startup_info" );
             unix_init_startup_info();
+            if (!wow_peb && saved_wow_peb)
+            {
+                dprintf( STDERR_FILENO, "[wow-peb] 64-bit child kept out of the WoW64 branch; "
+                         "restoring the session wow_peb=%p\n", saved_wow_peb );
+                wow_peb = saved_wow_peb;
+            }
             ios_register_proc_ident( child_peb, &main_image_info );
             main_image_info = session_image_info;
         }
@@ -3485,6 +3643,13 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
                  (void *)(ULONG_PTR)pLdrSystemDllInitBlock->ntdll_handle,
                  (void *)(ULONG_PTR)pLdrSystemDllInitBlock->pLdrInitializeThunk );
         }
+
+        /* start_main_thread runs load_apiset_dll() right after load_wow64_ntdll;
+         * the child path never did, so every `api-ms-win-*` import of every
+         * module this child loads failed.  Same position, but per-machine and
+         * window-aware (see ios_child_load_apiset). */
+        CHILD_STAGE( "load_apiset" );
+        ios_child_load_apiset( ios_cur_image_info()->Machine );
 
         /* X3c: a cross-arch child (AMD64 exe, non-EC session) cannot run on
          * the session's aarch64 ntdll at all — load the ARM64EC build as a
