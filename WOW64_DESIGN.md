@@ -490,6 +490,30 @@ game-specific patches — every change must fix the emulator/runtime generically
   (`queue_ios.c:2290`), legacy `GetCursorPos` consumers still see the
   clamped cursor (would need driver re-centring). Launch table renamed
   `launchTargets` (either bitness; PE probe routes) + one 64-bit entry.
+- 2026-09-13 — **REGRESSION (commit ccf6e46).** Clearing win32u's
+  `zero_bits` was WRONG: its premise ("32-bit guests never receive a raw
+  win32u pointer") is false — win32u hands the guest the GDI shared handle
+  table (`init_gdi_shared`, read by i386 gdi32 through `peb64->
+  GdiSharedHandleTable` TRUNCATED to 32 bits, which only works because B
+  is 4 GB-aligned and the table sat inside the window), DIB pixel buffers,
+  DC bucket entries and message return buffers. With `zero_bits`=0 every
+  32-bit process now dies in gdi32 `get_gdi_client_ptr` at first GDI use
+  (log 29: `addr=0x7138c9057e` = B + low32(host gdi_shared); wined3d
+  DllMain → c0000005). Real root cause of BOTH symptoms: win32u
+  "process-globals" (`zero_bits`, `gdi_shared`) are TASK-globals here —
+  the first pseudo-process (64-bit explorer) allocates `gdi_shared` at a
+  host address and every later 32-bit child truncates it (the 10 AVs in
+  log 28), and a 32-bit process's `zero_bits` then breaks every later
+  64-bit allocation. Fix in progress (Opus): per-pseudo-process
+  `zero_bits` (function of the caller's WowTebOffset) and per-PEB GDI
+  handle tables allocated with the owner's ceiling. Also this round: the
+  `[win-pos] vis=EMPTY` diagnostic fires for ordinary zero-size child
+  controls (explorer toolbars) — noisy, to be restricted to top-level
+  WS_VISIBLE windows; the 64-bit title's button run (log 31) was still
+  loading DLLs when the log ended (no window yet) — needs a longer run
+  after the fix; the window release/re-adopt path WORKED (log 32: launcher
+  exit → `teardown B=0x7100000000 … 46 view(s) deleted` → second 32-bit
+  child adopted).
 
 
 - 2026-09-12 — M5 direction: the user's next target is a 32-bit UE3/D3D9

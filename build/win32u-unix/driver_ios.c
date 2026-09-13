@@ -547,35 +547,44 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
      * unconditionally, with the window rect and style that produced them. */
     else
     {
-        static unsigned degen_n;
-        unsigned n = ++degen_n;
-        if (n <= 64 || (n % 64) == 0)
+        /* ml780: an empty visible rect fires constantly for ordinary
+         * zero-size CHILD controls (e.g. a toolbar/rebar child window with
+         * no area) -- 40+ lines per session with no diagnostic value. Only
+         * a top-level window collapsing to 0x0 is interesting, so gate the
+         * whole diagnostic on "no WS_CHILD" before even touching the
+         * throttle counter. */
+        UINT style = get_window_long( hwnd, GWL_STYLE );
+        if (!(style & WS_CHILD) && (style & WS_VISIBLE))
         {
-            const RECT *w = &new_rects->window, *c = &new_rects->client;
-            UINT style = get_window_long( hwnd, GWL_STYLE );
-            dprintf( 2, "[win-pos] #d%u hwnd=%p after=%p flags=%08x vis=EMPTY "
-                     "win={%d,%d,%d,%d} client={%d,%d,%d,%d} style=%08x surface=%p"
-                     "%s rev=ml750\n",
-                     n, hwnd, insert_after, (unsigned)swp_flags,
-                     (int)w->left, (int)w->top, (int)w->right, (int)w->bottom,
-                     (int)c->left, (int)c->top, (int)c->right, (int)c->bottom,
-                     (unsigned)style, surface,
-                     (style & WS_VISIBLE) ? "  <-- DEGENERATE, WS_VISIBLE: nothing can be shown" : "" );
-
-            /* A WS_VISIBLE top-level window with no area almost always means
-             * the application sized itself from a display query that came back
-             * empty. Print what this driver would have told it, so the next log
-             * says immediately whether the geometry the application read was
-             * wrong or whether it invented the zero itself. */
-            HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
-            if ((style & WS_VISIBLE) && (!parent || parent == get_desktop_window()))
+            static unsigned degen_n;
+            unsigned n = ++degen_n;
+            if (n <= 64 || (n % 64) == 0)
             {
-                RECT mon = get_primary_monitor_rect( get_thread_dpi() );
-                RECT virt = get_virtual_screen_rect( get_thread_dpi(), MDT_DEFAULT );
-                dprintf( 2, "[win-pos] #d%u    driver would report: primary monitor={%d,%d,%d,%d} "
-                         "virtual screen={%d,%d,%d,%d} rev=ml750\n", n,
-                         (int)mon.left, (int)mon.top, (int)mon.right, (int)mon.bottom,
-                         (int)virt.left, (int)virt.top, (int)virt.right, (int)virt.bottom );
+                const RECT *w = &new_rects->window, *c = &new_rects->client;
+                dprintf( 2, "[win-pos] #d%u hwnd=%p after=%p flags=%08x vis=EMPTY "
+                         "win={%d,%d,%d,%d} client={%d,%d,%d,%d} style=%08x surface=%p"
+                         "%s rev=ml750\n",
+                         n, hwnd, insert_after, (unsigned)swp_flags,
+                         (int)w->left, (int)w->top, (int)w->right, (int)w->bottom,
+                         (int)c->left, (int)c->top, (int)c->right, (int)c->bottom,
+                         (unsigned)style, surface,
+                         (style & WS_VISIBLE) ? "  <-- DEGENERATE, WS_VISIBLE: nothing can be shown" : "" );
+
+                /* A WS_VISIBLE top-level window with no area almost always means
+                 * the application sized itself from a display query that came back
+                 * empty. Print what this driver would have told it, so the next log
+                 * says immediately whether the geometry the application read was
+                 * wrong or whether it invented the zero itself. */
+                HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
+                if ((style & WS_VISIBLE) && (!parent || parent == get_desktop_window()))
+                {
+                    RECT mon = get_primary_monitor_rect( get_thread_dpi() );
+                    RECT virt = get_virtual_screen_rect( get_thread_dpi(), MDT_DEFAULT );
+                    dprintf( 2, "[win-pos] #d%u    driver would report: primary monitor={%d,%d,%d,%d} "
+                             "virtual screen={%d,%d,%d,%d} rev=ml750\n", n,
+                             (int)mon.left, (int)mon.top, (int)mon.right, (int)mon.bottom,
+                             (int)virt.left, (int)virt.top, (int)virt.right, (int)virt.bottom );
+                }
             }
         }
     }

@@ -1939,7 +1939,11 @@ void pack_user_message( void *buffer, size_t size, UINT message,
                 memcpy( tmp_cds, cds, sizeof(*cds) );
 
                 extra_buffer_size = cds->cbData;
-                status = NtAllocateVirtualMemory( GetCurrentProcess(), ret_extra_buffer, zero_bits,
+                /* iOS-Madeira: per-pseudo-process ceiling — this buffer is
+                 * handed to the receiving process's WM_COPYDATA handler, so a
+                 * 32-bit one needs it inside its guest window
+                 * (build/win32u-unix/syscall_ios.c). */
+                status = NtAllocateVirtualMemory( GetCurrentProcess(), ret_extra_buffer, win32u_zero_bits(),
                                                   &extra_buffer_size, MEM_RESERVE | MEM_COMMIT,
                                                   PAGE_READWRITE );
                 if (!status)
