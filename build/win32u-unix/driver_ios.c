@@ -461,6 +461,25 @@ static BOOL winios_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *sur
 
     *window_surface = window_surface_create( sizeof(struct window_surface), &winios_surface_funcs,
                                              hwnd, surface_rect, info, 0 );
+
+    /* ml750: window_surface_create() returns NULL when the backing DIB
+     * cannot be allocated. Dropping `previous` then leaves the window with
+     * NO surface at all: nothing ever flushes, so the window is invisible
+     * for the rest of its life even though it is WS_VISIBLE and on the
+     * taskbar. Keep whatever the window already had and say so loudly --
+     * a stale surface still paints, a NULL one never can. */
+    if (!*window_surface)
+    {
+        static unsigned fail_n;
+        dprintf( 2, "[surf-create] #%u hwnd=%p rect={%d,%d,%d,%d} bytes=%u "
+                 "ALLOCATION FAILED -- keeping previous surface %p (window would be invisible) rev=ml750\n",
+                 ++fail_n, hwnd, (int)surface_rect->left, (int)surface_rect->top,
+                 (int)surface_rect->right, (int)surface_rect->bottom,
+                 (unsigned)info->bmiHeader.biSizeImage, previous );
+        *window_surface = previous;
+        return TRUE;
+    }
+
     if (previous) window_surface_release( previous );
 
     {
@@ -516,6 +535,48 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
             dprintf( 2, "[win-pos] #%u hwnd=%p after=%p flags=%08x vis={%d,%d,%d,%d} "
                      "surface=%p rev=ml505\n", n, hwnd, insert_after, (unsigned)swp_flags,
                      (int)v->left, (int)v->top, (int)v->right, (int)v->bottom, surface );
+        }
+    }
+    /* ml750: an EMPTY visible rect used to be filtered out here (to keep the
+     * 1x1 IME/message windows from burying the signal) -- which is precisely
+     * why a top-level window collapsing to 0x0 left NO trace in the log at
+     * all: [win-pos] fell silent, the compositor got a zero frame, and the
+     * only surviving evidence was a 128x128 surface (get_surface_rect()
+     * clamps an empty rect up to the 128px minimum) and a zero-size Metal
+     * layer. Degenerate rects are rare and always interesting, so log them
+     * unconditionally, with the window rect and style that produced them. */
+    else
+    {
+        static unsigned degen_n;
+        unsigned n = ++degen_n;
+        if (n <= 64 || (n % 64) == 0)
+        {
+            const RECT *w = &new_rects->window, *c = &new_rects->client;
+            UINT style = get_window_long( hwnd, GWL_STYLE );
+            dprintf( 2, "[win-pos] #d%u hwnd=%p after=%p flags=%08x vis=EMPTY "
+                     "win={%d,%d,%d,%d} client={%d,%d,%d,%d} style=%08x surface=%p"
+                     "%s rev=ml750\n",
+                     n, hwnd, insert_after, (unsigned)swp_flags,
+                     (int)w->left, (int)w->top, (int)w->right, (int)w->bottom,
+                     (int)c->left, (int)c->top, (int)c->right, (int)c->bottom,
+                     (unsigned)style, surface,
+                     (style & WS_VISIBLE) ? "  <-- DEGENERATE, WS_VISIBLE: nothing can be shown" : "" );
+
+            /* A WS_VISIBLE top-level window with no area almost always means
+             * the application sized itself from a display query that came back
+             * empty. Print what this driver would have told it, so the next log
+             * says immediately whether the geometry the application read was
+             * wrong or whether it invented the zero itself. */
+            HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
+            if ((style & WS_VISIBLE) && (!parent || parent == get_desktop_window()))
+            {
+                RECT mon = get_primary_monitor_rect( get_thread_dpi() );
+                RECT virt = get_virtual_screen_rect( get_thread_dpi(), MDT_DEFAULT );
+                dprintf( 2, "[win-pos] #d%u    driver would report: primary monitor={%d,%d,%d,%d} "
+                         "virtual screen={%d,%d,%d,%d} rev=ml750\n", n,
+                         (int)mon.left, (int)mon.top, (int)mon.right, (int)mon.bottom,
+                         (int)virt.left, (int)virt.top, (int)virt.right, (int)virt.bottom );
+            }
         }
     }
 

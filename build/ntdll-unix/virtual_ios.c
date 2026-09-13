@@ -5476,8 +5476,20 @@ struct ios_wow_window
     void      *peb;             /* owning pseudo-process; NULL = unbound/free */
     ULONG_PTR  base;            /* B, 0 = free slot */
     unsigned   leaked;          /* window intentionally not torn down, see
-                                   ios_wow_window_release(); never reused and
+                                   ios_wow_window_retire(); never reused and
                                    never matched by a lookup again */
+    unsigned   dead;            /* the owning pseudo-process has EXITED and the
+                                   window is waiting to be torn down by the next
+                                   32-bit pseudo-process that wants this slot
+                                   (RELEASE-ON-NEXT-ADOPT, see
+                                   ios_wow_window_mark_released).  A dead slot
+                                   still owns its VA and is still excluded from
+                                   furniture placement, but no lookup resolves
+                                   to it any more. */
+    void      *dead_peb;        /* the exited owner's PEB, kept for the deferred
+                                   teardown (JIT ledger, [proc-ident], fd cache) */
+    time_t     released_at;     /* when the owner exited; the teardown waits out
+                                   a settle interval, see IOS_WOW_SETTLE_SEC */
     unsigned   guard_owned;     /* 1: the FB3 overrun guard page at B+4G is part
                                    of OUR reservation.  0: it is a pre-existing
                                    inaccessible neighbour we verified and
@@ -5519,10 +5531,14 @@ static pthread_mutex_t ios_wow_mutex = PTHREAD_MUTEX_INITIALIZER;
  * the mapping and the reserved-area entry are kept as they are, because an
  * unmap/remap would open precisely the gap this exists to close.
  *
- * A placeholder is never unmapped: window retirement is a deliberate leak (see
- * ios_wow_window_retire), so an adopted placeholder stays adopted for the rest
- * of the session and its slot becomes reusable only if a real window release is
- * ever implemented. */
+ * A placeholder is NEVER unmapped, not even when its owner dies: the VA is the
+ * whole point of it.  What a release does (ios_wow_window_mark_released, and
+ * the deferred ios_wow_window_teardown that follows it) is mark the placeholder
+ * UNADOPTED again after replacing the 4 GB of VA with one PROT_NONE mapping, so
+ * the next 32-bit pseudo-process adopts exactly the same reservation.  Only the
+ * ABANDON path (ios_wow_window_retire: a process that keeps living inside the
+ * window while no longer being a WoW process) leaves a placeholder adopted for
+ * the rest of the session. */
 struct ios_wow_placeholder
 {
     ULONG_PTR base;          /* 4 GB-aligned slot base, 0 = unused entry */
@@ -5553,6 +5569,12 @@ static struct ios_wow_placeholder *ios_wow_placeholder_find( ULONG_PTR base )
  * before virtual_alloc_first_teb — exactly as the child path uses
  * ios_child_main_machine published by the spawner.  0 = 64-bit / unknown. */
 int ios_main_image_i386 = 0;
+
+/* The session's own PEB (the first pseudo-process), captured in
+ * virtual_alloc_first_teb().  The child path leaves the session global `peb`
+ * pointing at the last child it booted, so a released guest window has to put
+ * it back to something that still exists — see ios_wow_window_teardown(). */
+static PEB *ios_session_peb;
 
 /* stage C review FB3: OVERRUN GUARD PAGE.
  *
@@ -5601,7 +5623,20 @@ static struct ios_wow_window *ios_wow_slot_for_peb( void *peb_id )
     if (!peb_id) return NULL;
     for (i = 0; i < n; i++)
         if (ios_wow_windows[i].base && !ios_wow_windows[i].leaked &&
+            !ios_wow_windows[i].dead &&
             ios_wow_windows[i].peb == peb_id) return &ios_wow_windows[i];
+    return NULL;
+}
+
+/* The registry entry that owns `base`, whatever its state (live, dead-awaiting-
+ * teardown or leaked).  Used by the adopt path, which must never hand a slot to
+ * a second process while the first one's window is still standing. */
+static struct ios_wow_window *ios_wow_slot_at_base( ULONG_PTR base )
+{
+    unsigned i, n = ios_wow_window_count;
+
+    for (i = 0; i < n; i++)
+        if (ios_wow_windows[i].base == base && base) return &ios_wow_windows[i];
     return NULL;
 }
 
@@ -5635,9 +5670,33 @@ static struct ios_wow_window *ios_wow_slot_current(void)
     if (slot) return slot;
     for (i = 0; i < n; i++)
         if (ios_wow_windows[i].base && !ios_wow_windows[i].leaked &&
+            !ios_wow_windows[i].dead &&
             pthread_equal( ios_wow_windows[i].owner, pthread_self() ))
             return &ios_wow_windows[i];
     return NULL;
+}
+
+/* Is `addr` inside ANY guest window or placeholder of this session, whatever
+ * its state?  Not the same question as ios_wow_in_window(), which asks about
+ * the CALLER's window: this one is for session-wide bookkeeping that must not
+ * hand a piece of window VA to a process that does not own the window (see the
+ * TEB free-list guard in virtual_free_teb). */
+static int ios_wow_addr_in_any_window( const void *addr )
+{
+    ULONG_PTR a = (ULONG_PTR)addr;
+    unsigned i;
+
+    for (i = 0; i < ios_wow_window_count; i++)
+    {
+        ULONG_PTR b = ios_wow_windows[i].base;
+        if (b && a >= b && a < b + IOS_WOW_WINDOW_SIZE) return 1;
+    }
+    for (i = 0; i < ios_wow_placeholder_count; i++)
+    {
+        ULONG_PTR b = ios_wow_placeholders[i].base;
+        if (b && a >= b && a < b + IOS_WOW_WINDOW_SIZE) return 1;
+    }
+    return 0;
 }
 
 ULONG_PTR ios_wow_base_for_peb( void *peb_id )
@@ -5874,10 +5933,36 @@ static int ios_wow_window_try( ULONG_PTR base, unsigned *guard_owned )
 {
     ULONG_PTR guard = ios_wow_guard_size();
     struct ios_wow_placeholder *ph;
+    struct ios_wow_window *slot;
     char what[256];
 
     *guard_owned = 0;
     if (!ios_wow_band_ok( base, IOS_WOW_WINDOW_SIZE )) return 0;
+
+    /* Is the slot still owned by a registry entry?  A LIVE one means a 32-bit
+     * pseudo-process is running in it right now (one 4 GB window per slot); a
+     * DEAD one means its owner exited but ios_wow_reclaim_dead_windows() could
+     * not tear the window down (it runs at the top of ios_wow_window_reserve,
+     * so by the time we get here it has already tried and said why); a LEAKED
+     * one is a window deliberately abandoned by a process that is still alive
+     * inside it.  None of the three may be handed to a second process. */
+    if ((slot = ios_wow_slot_at_base( base )))
+    {
+        if (slot->dead)
+            dprintf( 2, "[wow-window] B=%p REJECTED: its predecessor's window (peb=%p) could not be "
+                        "torn down — see the [wow-window] teardown line above for why\n",
+                     (void *)base, slot->dead_peb );
+        else if (slot->leaked)
+            dprintf( 2, "[wow-window] B=%p REJECTED: the slot was abandoned by a pseudo-process that "
+                        "is still alive inside it (its TEB/PEB pair and images are in this range)\n",
+                     (void *)base );
+        else
+            dprintf( 2, "[wow-window] B=%p REJECTED: a 32-bit pseudo-process (peb=%p) is running in "
+                        "this window right now — there is one 4GB slot and it is taken. Concurrent "
+                        "32-bit pseudo-processes need a second slot (WOW64_DESIGN.md §2)\n",
+                     (void *)base, slot->peb );
+        return 0;
+    }
 
     /* ADOPT the session-start placeholder for this slot, if there is one.
      *
@@ -6109,12 +6194,100 @@ static void ios_wow_reserve_placeholders(void)
     pthread_mutex_unlock( &ios_wow_mutex );
 }
 
+/* Tear a dead window down.  Defined next to delete_view(), which it needs, and
+ * declared here because the registry code below drives it.  Returns 1 when the
+ * 4 GB range has been replaced and the slot may be handed out again. */
+static int ios_wow_window_teardown( ULONG_PTR base, void *dead_peb, unsigned guard_owned );
+
+/* How long after a pseudo-process's exit the teardown waits before replacing
+ * its window.  Nothing joins a pseudo-process's threads on iOS (see
+ * ios_wow_window_retire), so a laggard thread woken by its closing server fds
+ * can still be unwinding through the window for a moment after the exit.  Same
+ * reasoning and the same value as the JIT pool's reuse grace.  The teardown
+ * runs from the NEXT 32-bit process's boot, so in practice (a launcher exiting,
+ * then the program being started) the interval has long passed and nothing
+ * sleeps at all. */
+#define IOS_WOW_SETTLE_SEC 3
+
+/* RELEASE-ON-NEXT-ADOPT, step 2: tear down every window whose owner has exited.
+ *
+ * Runs at the top of ios_wow_window_reserve(), i.e. on the booting thread of the
+ * NEXT 32-bit pseudo-process, with no lock held.  Doing it here rather than in
+ * the exit path is the whole design: at exit the dying thread is still standing
+ * on its own TEB (and possibly its own stack) inside the window it would be
+ * unmapping, and its siblings have not been joined — nothing joins them, see
+ * ios_wow_window_retire().  By the time somebody wants the slot back, the dead
+ * process has been gone for at least one process creation. */
+static void ios_wow_reclaim_dead_windows(void)
+{
+    unsigned i;
+
+    for (i = 0; i < IOS_WOW_MAX_WINDOWS; i++)
+    {
+        ULONG_PTR base;
+        void *dead_peb;
+        unsigned guard_owned;
+        time_t released_at, now;
+
+        pthread_mutex_lock( &ios_wow_mutex );
+        /* dead == 1: released, nobody is tearing it down yet.  dead == 2: another
+         * thread is inside the teardown right now (spawns serialise today, but the
+         * teardown drops the registry lock and must not be entered twice). */
+        if (!ios_wow_windows[i].base || ios_wow_windows[i].dead != 1)
+        {
+            pthread_mutex_unlock( &ios_wow_mutex );
+            continue;
+        }
+        base        = ios_wow_windows[i].base;
+        dead_peb    = ios_wow_windows[i].dead_peb;
+        guard_owned = ios_wow_windows[i].guard_owned;
+        released_at = ios_wow_windows[i].released_at;
+        ios_wow_windows[i].dead = 2;
+        pthread_mutex_unlock( &ios_wow_mutex );
+
+        now = time( NULL );
+        if (released_at && now >= released_at && now - released_at < IOS_WOW_SETTLE_SEC)
+        {
+            struct timespec ts;
+
+            ts.tv_sec  = IOS_WOW_SETTLE_SEC - (now - released_at);
+            ts.tv_nsec = 0;
+            dprintf( 2, "[wow-window] teardown of B=%p waits %llds: its owner (peb=%p) exited just "
+                        "now and a laggard thread of it may still be unwinding inside the window\n",
+                     (void *)base, (long long)ts.tv_sec, dead_peb );
+            nanosleep( &ts, NULL );
+        }
+
+        if (!ios_wow_window_teardown( base, dead_peb, guard_owned ))
+        {
+            pthread_mutex_lock( &ios_wow_mutex );
+            ios_wow_windows[i].dead = 1;   /* still dead, still not reclaimable */
+            pthread_mutex_unlock( &ios_wow_mutex );
+            continue;
+        }
+
+        pthread_mutex_lock( &ios_wow_mutex );
+        /* free the registry entry and hand the reservation back to the
+         * placeholder, unadopted, exactly as it was at session start */
+        memset( &ios_wow_windows[i], 0, sizeof(ios_wow_windows[i]) );
+        {
+            struct ios_wow_placeholder *ph = ios_wow_placeholder_find( base );
+            if (ph) ph->adopted = 0;
+        }
+        pthread_mutex_unlock( &ios_wow_mutex );
+    }
+}
+
 NTSTATUS ios_wow_window_reserve(void)
 {
     struct ios_wow_window *slot = NULL;
     unsigned guard_owned = 0;
     ULONG_PTR base;
     unsigned i;
+
+    /* give back what a previous 32-bit pseudo-process left behind before
+     * looking for a free slot — this is what makes launcher -> program work */
+    ios_wow_reclaim_dead_windows();
 
     pthread_mutex_lock( &ios_wow_mutex );
     if (ios_wow_slot_current())
@@ -6141,6 +6314,10 @@ NTSTATUS ios_wow_window_reserve(void)
     slot->teb_block     = NULL;
     slot->next_free_teb = NULL;
     slot->teb_block_pos = 0;
+    slot->leaked        = 0;
+    slot->dead          = 0;
+    slot->dead_peb      = NULL;
+    slot->released_at   = 0;
     slot->guard_owned   = guard_owned;
     slot->base          = base;
     __sync_synchronize();
@@ -6166,54 +6343,26 @@ void ios_wow_window_bind( void *peb_id )
     pthread_mutex_unlock( &ios_wow_mutex );
 }
 
-/* Retire a window (stage C review F2).
+/* ABANDON a window without ever giving the slot back (stage C review F2).
  *
- * PRECONDITION for actually tearing a window down: no thread of the owning
- * pseudo-process may still be alive, because the window holds that process's
- * TEB/PEB block, its 32-bit stacks, all of its i386 images and its KUSER
- * SHARED_DATA view — and because pseudo-processes share ONE address space, a
- * munmap here destroys memory for the whole app, not just for the dead
- * process.
+ * This is NOT the exit path — that is ios_wow_window_mark_released() below.
+ * This is the one case where a pseudo-process stops being a WoW process while
+ * STAYING ALIVE inside its window: env_ios.c's start.exe fallback, where the
+ * main image turned out not to be a mappable 32-bit PE and a 64-bit launcher
+ * takes the pseudo-process over.  That process's first TEB/PEB pair is already
+ * inside the window and no thread of it is ever joined, so the VA can never be
+ * reclaimed: unbind the slot so no lookup resolves it, mark it leaked so it is
+ * never handed out again, and keep both the reserved-area entry and the
+ * PROT_NONE mapping so the range stays excluded from furniture placement.
  *
- * THAT PRECONDITION IS NOT GUARANTEED TODAY.  NtTerminateProcess on iOS ends
- * up in exit_process(), which longjmps out of the CALLING thread only
- * (process_ios.c, wine_ios_exit_jmpbuf); the pseudo-process's other threads
- * are not joined, and the caller of this function
- * (ios_child_thread_entry) is itself still running on a stack and a TEB that
- * may live inside the window.
- *
- * So: do not half-tear it down.  Unmapping the range while its file_views are
- * still in views_tree (the previous behaviour) left Wine's bookkeeping
- * pointing at unmapped VA, which is strictly worse than keeping the VA.
- * Retire the slot instead — unbind it so no later lookup resolves a dead
- * process, mark it leaked so it is never handed out again, and keep both the
- * reserved_area entry and the PROT_NONE mapping so the VA stays excluded from
- * furniture placement.  One ERR says so.
- *
- * A real release needs, under virtual_mutex: delete_view() for every view in
- * [B, B+4G) (which also restores PROT_NONE inside the reserved area), then
- * mmap_remove_reserved_area + munmap — and a way to prove the process has no
- * live threads.  Counting teb_list entries with teb->Peb == peb would give
- * that proof; joining the threads is the missing piece.
- *
- * Keeping the whole reservation also keeps the FB3 guard page past B+4G
- * mapped PROT_NONE, which is what a stale 32-bit overrun would hit.  A
- * BORROWED guard (slot->guard_owned == 0) is not ours to keep, but it belongs
- * to a region that was already inaccessible before we picked the slot and that
- * nothing here releases either, so the same protection holds.  guard_owned is
- * deliberately left set on the retired slot: ios_wow_exclude_windows() still
- * walks it and must keep using the same reservation size.
- *
- * PLACEHOLDERS.  A window that adopted a session-start placeholder returns
- * nothing here either — not the mapping, not the reserved area, and not the
- * placeholder entry, which stays marked adopted.  That is deliberate: the
- * placeholder exists to guarantee the slot is still there when a 32-bit process
- * asks for it, and handing the VA back to the kernel at exit would surrender
- * exactly that guarantee to the next system-framework allocation.  A slot
- * therefore serves ONE pseudo-process per session, and becomes reusable only
- * once a real release (see above) can prove the process has no live threads —
- * at which point that code re-marks the placeholder unadopted rather than
- * unmapping it. */
+ * Keeping the whole reservation also keeps the FB3 guard page past B+4G mapped
+ * PROT_NONE, which is what a stale 32-bit overrun would hit.  A BORROWED guard
+ * (slot->guard_owned == 0) is not ours to keep, but it belongs to a region that
+ * was already inaccessible before we picked the slot and that nothing here
+ * releases either, so the same protection holds.  guard_owned is deliberately
+ * left set on the retired slot: ios_wow_exclude_windows() still walks it and
+ * must keep using the same reservation size.  The placeholder stays ADOPTED,
+ * because the slot is genuinely gone for the rest of the session. */
 static void ios_wow_window_retire( struct ios_wow_window *slot )
 {
     static int warned;
@@ -6224,7 +6373,7 @@ static void ios_wow_window_retire( struct ios_wow_window *slot )
     base = slot->base;
     total = ios_wow_slot_reservation( slot );
     peb_id = slot->peb;
-    if (base && !slot->leaked)
+    if (base && !slot->leaked && !slot->dead)
     {
         slot->leaked = 1;      /* keep base: the VA is still ours, just dead */
         slot->peb = NULL;
@@ -6237,14 +6386,56 @@ static void ios_wow_window_retire( struct ios_wow_window *slot )
     if (!base) return;
 
     if (!warned++)
-        ERR( "[wow-window] B=%p (peb=%p, reservation 0x%llx) retired but NOT unmapped: a "
-             "pseudo-process's threads are not joined at exit, so tearing the window down "
-             "could unmap live memory for the whole app. The 4GB of VA is leaked on "
-             "purpose; %d window slot(s) total.\n",
+        ERR( "[wow-window] B=%p (peb=%p, reservation 0x%llx) ABANDONED but NOT unmapped: the "
+             "pseudo-process is still alive inside the window (its TEB/PEB pair is in this "
+             "range) and its threads are never joined, so the 4GB of VA is leaked on purpose. "
+             "This slot serves no further 32-bit process this session; %d slot(s) total.\n",
              (void *)base, peb_id, (unsigned long long)total, IOS_WOW_MAX_WINDOWS );
     else
         dprintf( 2, "[wow-window] retired (leaked) B=%p peb=%p reservation=0x%llx\n",
                  (void *)base, peb_id, (unsigned long long)total );
+}
+
+/* RELEASE-ON-NEXT-ADOPT, step 1: the owning pseudo-process has EXITED.
+ *
+ * Everything that could be done safely on a dying thread is done here — the
+ * slot stops resolving for anybody, the placeholder becomes unadopted, and the
+ * owner's identity is recorded — but NOT the teardown itself: this runs on the
+ * dead process's own last thread, which is still standing on a TEB (and
+ * possibly a stack) inside the very range that has to be replaced, and its
+ * siblings have not been joined because nothing on iOS joins them.  The
+ * teardown therefore happens in ios_wow_reclaim_dead_windows(), from the boot
+ * of the next 32-bit pseudo-process that wants the slot. */
+static void ios_wow_window_mark_released( struct ios_wow_window *slot )
+{
+    ULONG_PTR base;
+    void *peb_id;
+    int unadopted = 0;
+
+    pthread_mutex_lock( &ios_wow_mutex );
+    base   = slot->base;
+    peb_id = slot->peb;
+    if (base && !slot->leaked && !slot->dead)
+    {
+        struct ios_wow_placeholder *ph = ios_wow_placeholder_find( base );
+
+        slot->dead          = 1;
+        slot->dead_peb      = peb_id;
+        slot->released_at   = time( NULL );
+        slot->peb           = NULL;
+        slot->teb_block     = NULL;
+        slot->next_free_teb = NULL;
+        slot->teb_block_pos = 0;
+        if (ph) { ph->adopted = 0; unadopted = 1; }
+    }
+    else base = 0;
+    pthread_mutex_unlock( &ios_wow_mutex );
+    if (!base) return;
+
+    dprintf( 2, "[wow-window] released B=%p (owner peb=%p exit) — placeholder %s; the 4GB range "
+                "and its bookkeeping are torn down when the next 32-bit pseudo-process claims the "
+                "slot (release-on-next-adopt: nothing joins a dead process's threads here)\n",
+             (void *)base, peb_id, unadopted ? "unadopted" : "not present (reserved on demand)" );
 }
 
 /* Release the window owned by the calling thread's pseudo-process, from that
@@ -6259,7 +6450,19 @@ void ios_wow_window_release_current(void)
     if (!slot) return;
     /* works for a bound slot and for one that died during boot before
      * ios_wow_window_bind() ran (peb still NULL) */
-    ios_wow_window_retire( slot );
+    ios_wow_window_mark_released( slot );
+}
+
+/* Abandon the calling thread's window for good — see ios_wow_window_retire().
+ * Only for a pseudo-process that keeps running inside the window. */
+void ios_wow_window_retire_current(void)
+{
+    struct ios_wow_window *slot;
+
+    pthread_mutex_lock( &ios_wow_mutex );
+    slot = ios_wow_slot_current();
+    pthread_mutex_unlock( &ios_wow_mutex );
+    if (slot) ios_wow_window_retire( slot );
 }
 
 void ios_wow_window_release( void *peb_id )
@@ -6269,7 +6472,7 @@ void ios_wow_window_release( void *peb_id )
     pthread_mutex_lock( &ios_wow_mutex );
     slot = ios_wow_slot_for_peb( peb_id );
     pthread_mutex_unlock( &ios_wow_mutex );
-    if (slot) ios_wow_window_retire( slot );
+    if (slot) ios_wow_window_mark_released( slot );
 }
 #else
 ULONG_PTR ios_wow_base_for_peb( void *peb_id ) { return 0; }
@@ -6282,6 +6485,7 @@ static void ios_wow_reserve_placeholders(void) { }
 void ios_wow_window_bind( void *peb_id ) { }
 void ios_wow_window_release( void *peb_id ) { }
 void ios_wow_window_release_current(void) { }
+void ios_wow_window_retire_current(void) { }
 void ios_wow_map_user_shared_data(void) { }
 #endif  /* WINE_IOS */
 
@@ -8164,6 +8368,269 @@ static NTSTATUS create_view( struct file_view **view_ret, void *base, size_t siz
     *view_ret = view;
     return STATUS_SUCCESS;
 }
+
+
+#ifdef WINE_IOS
+/***********************************************************************
+ *           ios_jit_purge_window
+ *
+ * Drop every JIT-pool record that describes PE memory inside a guest window
+ * that is being released.
+ *
+ * ios_jit_reclaim_process() already frees the pool ranges the dead PEB
+ * allocated, and ios_jit_add_mapping()'s stale-containment logic would purge an
+ * overlapping entry the next time an image is mapped at the same address.  But
+ * relying on that means the table keeps entries whose pe_base is about to be
+ * replaced by a DIFFERENT process's image at exactly the same guest address —
+ * the window is handed back at the same B, so the next 32-bit process's ntdll,
+ * kernel32 and exe land on the very same VAs — and until the purge-on-add
+ * happens every translate/sync_write for an address in the overlap resolves to
+ * the dead copy.  Make it explicit: at release, anything in [base, base+size)
+ * is by definition gone.
+ *
+ * Entries are tombstoned in the order the lock-free readers require: size = 0
+ * first (a zero-size entry matches no query), barrier, then pe_base = NULL. */
+static void ios_jit_purge_window( ULONG_PTR base, ULONG_PTR size )
+{
+    int i, maps = 0, aliases = 0;
+
+    pthread_mutex_lock( &ios_pool_lock );
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        ULONG_PTR eb = (ULONG_PTR)ios_jit_mappings[i].pe_base;
+
+        if (!ios_jit_mappings[i].pe_base) continue;
+        if (eb >= base + size || eb + ios_jit_mappings[i].size <= base) continue;
+        dprintf( 2, "[jit-pool] image %p+0x%lx jit=%p owner_peb=%p purged: its guest window "
+                    "%p+0x%llx is being released\n",
+                 (void *)eb, (unsigned long)ios_jit_mappings[i].size,
+                 ios_jit_mappings[i].jit_base, ios_jit_mappings[i].owner_peb,
+                 (void *)base, (unsigned long long)size );
+        ios_jit_mappings[i].size = 0;
+        __sync_synchronize();
+        ios_jit_mappings[i].pe_base = NULL;
+        maps++;
+    }
+    for (i = 0; i < ios_jit_anon_alias_count; i++)
+    {
+        uintptr_t uv = ios_jit_anon_aliases[i].user_va;
+
+        if (!uv) continue;
+        if (uv >= base + size || ios_jit_anon_aliases[i].user_va_end <= base) continue;
+        dprintf( 2, "[iOS-xrem] anon RWX alias %p..%p purged: its guest window %p is being "
+                    "released\n", (void *)uv, (void *)ios_jit_anon_aliases[i].user_va_end,
+                 (void *)base );
+        ios_jit_anon_aliases[i].user_va_end = 0;
+        __sync_synchronize();
+        ios_mono_alias_retire( uv );
+        ios_jit_anon_aliases[i].user_va = 0;
+        aliases++;
+    }
+    pthread_mutex_unlock( &ios_pool_lock );
+    dprintf( 2, "[jit-pool] window purge B=%p: %d image mapping(s), %d anon alias(es)\n",
+             (void *)base, maps, aliases );
+}
+
+
+/***********************************************************************
+ *           ios_wow_window_teardown
+ *
+ * RELEASE-ON-NEXT-ADOPT, step 2 (WOW64_DESIGN.md §2).  Give a dead 32-bit
+ * pseudo-process's guest window back to the slot, WITHOUT ever leaving a hole
+ * the kernel could fill.
+ *
+ * The order is what matters:
+ *
+ *   1. Wine's bookkeeping for everything inside [B, B+4G) goes first — every
+ *      file_view (the i386 images, the anon views, the USD second view at
+ *      B+0x7ffe0000, the apiset view, the wow64 parameters block, the TEB/PEB
+ *      pages, every thread stack, the BOP/unix-call page at guest 0x250000),
+ *      then the pages_vprot bytes for the whole range.  Deleting a view inside
+ *      a reserved area already replaces its pages with PROT_NONE rather than
+ *      unmapping them, and it is what keeps free_ranges and views_tree
+ *      consistent; doing it after the big mmap would leave the tree pointing at
+ *      memory that is no longer what it says.
+ *
+ *   2. ONE mmap(MAP_FIXED, PROT_NONE, MAP_ANON|MAP_NORESERVE) over the whole
+ *      4 GB.  A fixed mapping atomically discards whatever is under it, so
+ *      there is never an instant in which the range is free — which is the
+ *      entire reason the session-start placeholder exists.  NO munmap, and the
+ *      reserved-area entry and the FB3 guard page are deliberately untouched:
+ *      an overrun past B+4G must keep faulting, and the next adopter needs the
+ *      reservation to be exactly what it was.
+ *
+ *   3. The per-pseudo-process registries that are keyed by PEB and would
+ *      otherwise answer for the NEXT process: a child's PEB is allocated inside
+ *      the window, so the next 32-bit child's PEB very probably has the same
+ *      host address as this dead one, and a surviving [proc-ident] entry would
+ *      hand it the dead process's image info and private ntdll.
+ *
+ *   4. The session globals that point into the window.
+ *
+ * LIVE THREADS.  The precondition everybody wants — "no thread of the owner is
+ * still running" — cannot be proved on iOS: pseudo-processes are threads of one
+ * Mach task, NtTerminateProcess longjmps out of the CALLING thread only
+ * (process_ios.c), nothing joins the others, and a pseudo-process's own boot TEB
+ * is never freed, so counting teb_list entries with teb->Peb == dead_peb always
+ * finds at least one and proves nothing.  What this function does instead:
+ * unlink those TEBs from teb_list and report how many there were, wait out a
+ * settle interval after the exit (see
+ * IOS_WOW_SETTLE_SEC, and note that the teardown only runs when the NEXT 32-bit
+ * process boots, which is at least one process creation later), and leave the
+ * range PROT_NONE — so a laggard thread of the dead process FAULTS on its first
+ * access instead of quietly writing into the next process's memory.  That is
+ * strictly better than the previous behaviour, which was to leak the slot and
+ * make every later 32-bit process fail to start.
+ */
+static int ios_wow_window_teardown( ULONG_PTR base, void *dead_peb, unsigned guard_owned )
+{
+    struct ntdll_thread_data *thread_data, *next_thread_data;
+    struct file_view *batch[256];
+    unsigned stale_tebs = 0;
+    unsigned deleted = 0, straddlers = 0;
+    sigset_t sigset;
+    unsigned n, i;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+
+    /* teb_list is threaded THROUGH THE TEBs themselves (the entry is a field of
+     * the ntdll_thread_data inside each TEB), and this process's TEBs are inside
+     * the window.  Unlink them before the memory goes: nothing removes them
+     * otherwise — virtual_free_teb() is the only remover and a pseudo-process's
+     * boot TEB is never freed — so the very next walker of teb_list
+     * (virtual_clear_tls_index, for one) would step into PROT_NONE.
+     * The criterion is the TEB's ADDRESS, not its PEB: what makes an entry
+     * unusable is that its storage is about to be replaced. */
+    LIST_FOR_EACH_ENTRY_SAFE( thread_data, next_thread_data, &teb_list,
+                              struct ntdll_thread_data, entry )
+    {
+        TEB *t = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+
+        if ((ULONG_PTR)t < base || (ULONG_PTR)t >= base + IOS_WOW_WINDOW_SIZE) continue;
+        list_remove( &thread_data->entry );
+        stale_tebs++;
+    }
+
+    /* 1. views, in batches so the rb tree is never walked while it is edited */
+    do
+    {
+        struct file_view *view;
+
+        n = 0;
+        WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+        {
+            ULONG_PTR vb = (ULONG_PTR)view->base;
+
+            if (vb + view->size <= base) continue;
+            if (vb >= base + IOS_WOW_WINDOW_SIZE) break;   /* tree is address-ordered */
+            if (vb < base || vb + view->size > base + IOS_WOW_WINDOW_SIZE)
+            {
+                /* a view cannot legally straddle the window: everything in here
+                 * was placed inside the reserved area.  Say so and leave it. */
+                straddlers++;
+                continue;
+            }
+            batch[n++] = view;
+            if (n == ARRAY_SIZE(batch)) break;
+        }
+        for (i = 0; i < n; i++) delete_view( batch[i] );
+        deleted += n;
+    } while (n == ARRAY_SIZE(batch));
+
+    /* 2. pages_vprot for the whole range (delete_view cleared the covered
+     *    pages; this catches anything that was never a view) */
+    if (alloc_pages_vprot( (void *)base, IOS_WOW_WINDOW_SIZE ))
+        set_page_vprot( (void *)base, IOS_WOW_WINDOW_SIZE, 0 );
+
+    /* 3. ONE fixed mapping over the whole window.  Deliberately not munmap +
+     *    mmap: that would open the hole this whole mechanism exists to close. */
+    if (anon_mmap_fixed( (void *)base, IOS_WOW_WINDOW_SIZE, PROT_NONE, MAP_NORESERVE ) == MAP_FAILED)
+    {
+        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+        ERR( "[wow-window] teardown of B=%p FAILED: the single PROT_NONE replacement of the 4GB "
+             "range returned %s. The slot stays dead and no 32-bit process will get it; nothing "
+             "was handed back to the kernel.\n", (void *)base, strerror(errno) );
+        return 0;
+    }
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+
+    dprintf( 2, "[wow-window] teardown B=%p (owner peb=%p): %u view(s) deleted, %u straddling "
+                "view(s) left alone, %u TEB(s) unlinked from teb_list (nothing frees a "
+                "pseudo-process's boot TEB on iOS), 4GB replaced by ONE PROT_NONE mapping, "
+                "guard=%s kept\n",
+             (void *)base, dead_peb, deleted, straddlers, stale_tebs,
+             guard_owned ? "owned" : "borrowed" );
+    if (straddlers)
+        ERR( "[wow-window] teardown B=%p: %u view(s) straddle the window boundary and were NOT "
+             "deleted — their pages were replaced anyway, so Wine's bookkeeping for them is now "
+             "wrong. Nothing should ever place a view across a guest window.\n",
+             (void *)base, straddlers );
+
+    /* 4. JIT-pool records: the dead process's pool ranges and copies, then
+     *    anything at all that describes memory inside the window. */
+    if (dead_peb)
+    {
+        extern void ios_jit_reclaim_process( void *peb );
+        ios_jit_reclaim_process( dead_peb );
+    }
+    ios_jit_purge_window( base, IOS_WOW_WINDOW_SIZE );
+
+    /* 5. registries keyed by the dead PEB — the next child's PEB is allocated
+     *    at the same place inside the same window, so a survivor would answer
+     *    for it — and the Mach-port -> TEB registry, whose entries for this
+     *    process name TEBs that have just become PROT_NONE. */
+    {
+        extern int ios_thread_registry_purge_range( uintptr_t base, uintptr_t size );
+        ios_thread_registry_purge_range( (uintptr_t)base, (uintptr_t)IOS_WOW_WINDOW_SIZE );
+    }
+    if (dead_peb)
+    {
+        extern void ios_proc_ident_release( void *peb_id );
+        extern void ios_fd_cache_release( void *peb );
+        ios_proc_ident_release( dead_peb );
+        ios_fd_cache_release( dead_peb );
+    }
+
+    /* 6. session globals that pointed into the window.  user_space_wow_limit is
+     *    republished from the next 32-bit main image's large-address-aware bit
+     *    (ios_wow_image_ceiling / virtual_set_large_address_space); wow_peb is
+     *    re-derived by that process's init_peb.
+     *
+     *    `peb` is the dangerous one: the child path deliberately leaves the
+     *    session global pointing at the last child it booted (loader_ios.c,
+     *    "peb stays as child_peb on this thread"), so after a 32-bit child dies
+     *    the global names a PEB inside the window we have just made PROT_NONE,
+     *    and the next unix-side `peb->...` on any thread would fault. */
+    if ((ULONG_PTR)peb >= base && (ULONG_PTR)peb < base + IOS_WOW_WINDOW_SIZE)
+    {
+        if (ios_session_peb &&
+            !((ULONG_PTR)ios_session_peb >= base &&
+              (ULONG_PTR)ios_session_peb < base + IOS_WOW_WINDOW_SIZE))
+        {
+            dprintf( 2, "[wow-window] session global peb=%p was the released window's — put back "
+                        "to the session PEB %p\n", peb, ios_session_peb );
+            peb = ios_session_peb;
+        }
+        else
+            ERR( "[wow-window] session global peb=%p is inside the released window %p and there is "
+                 "no session PEB outside it — every later unix-side peb dereference will fault\n",
+                 peb, (void *)base );
+    }
+    if (wow_peb && (ULONG_PTR)wow_peb >= base && (ULONG_PTR)wow_peb < base + IOS_WOW_WINDOW_SIZE)
+    {
+        dprintf( 2, "[wow-peb] session wow_peb=%p belonged to the released window — cleared\n",
+                 wow_peb );
+        wow_peb = NULL;
+    }
+    if (user_space_wow_limit)
+    {
+        dprintf( 2, "[wow-limit] cleared (was %p): the next 32-bit main image publishes its own\n",
+                 (void *)user_space_wow_limit );
+        user_space_wow_limit = 0;
+    }
+    return 1;
+}
+#endif  /* WINE_IOS */
 
 
 /***********************************************************************
@@ -13627,6 +14094,13 @@ TEB *virtual_alloc_first_teb(void)
     data_size = 2 * block_size;
     NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&ptr, 0, &data_size, MEM_COMMIT, PAGE_READWRITE );
     peb = (PEB *)((char *)teb_block + 31 * block_size + (is_win64 ? 0 : page_size));
+#ifdef WINE_IOS
+    /* Remember the SESSION's own PEB.  The child path deliberately leaves the
+     * global `peb` pointing at the last child it booted (loader_ios.c), so when
+     * that child was 32-bit and its guest window is released, the global would
+     * dangle into the PROT_NONE range; the teardown repoints it here. */
+    ios_session_peb = peb;
+#endif
     teb = init_teb( ptr, FALSE );
     pthread_key_create( &teb_key, NULL );
     pthread_setspecific( teb_key, teb );
@@ -13772,8 +14246,21 @@ void virtual_free_teb( TEB *teb )
         struct ios_wow_window *wow = ios_wow_slot_current();
         void ***free_list = wow ? &wow->next_free_teb : &next_free_teb;
 
-        *(void **)ptr = *free_list;
-        *free_list = ptr;
+        /* NEVER put a block that lives inside a guest window on the SESSION
+         * free list.  A laggard thread of a pseudo-process whose window has
+         * already been released resolves no window any more (the slot is dead),
+         * so it would have donated window VA to the session — and the next
+         * 64-bit thread's TEB would then sit in a range that the next 32-bit
+         * process is about to replace and fill with its own images.  Drop the
+         * block instead: it is inside the window and goes away with it. */
+        if (!wow && ios_wow_addr_in_any_window( ptr ))
+            dprintf( 2, "[wow-window] TEB block %p dropped, not pooled: it belongs to a guest "
+                        "window and this thread's pseudo-process no longer owns one\n", ptr );
+        else
+        {
+            *(void **)ptr = *free_list;
+            *free_list = ptr;
+        }
     }
 #else
     *(void **)ptr = next_free_teb;

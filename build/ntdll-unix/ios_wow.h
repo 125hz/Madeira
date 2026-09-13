@@ -46,10 +46,20 @@ extern int ios_main_image_i386;
 extern NTSTATUS ios_wow_window_reserve(void);
 /* Bind the window reserved on this thread to a pseudo-process. */
 extern void ios_wow_window_bind( void *peb_id );
-/* Release a pseudo-process's window (process exit). */
+/* Release a pseudo-process's window (process EXIT): the slot stops resolving,
+ * the session-start placeholder becomes unadopted again, and the 4 GB range and
+ * all of Wine's bookkeeping inside it are torn down when the next 32-bit
+ * pseudo-process claims the slot (release-on-next-adopt — nothing joins a dead
+ * pseudo-process's threads on iOS, so the teardown cannot run on the dying
+ * thread, which is still standing on a TEB inside the window). */
 extern void ios_wow_window_release( void *peb_id );
 /* Same, for the calling thread's own pseudo-process. */
 extern void ios_wow_window_release_current(void);
+/* ABANDON the calling thread's window for good: for a pseudo-process that stops
+ * being a WoW process while STAYING ALIVE inside the window (env_ios.c's
+ * start.exe fallback).  The VA is leaked on purpose and the slot serves no
+ * further 32-bit process this session. */
+extern void ios_wow_window_retire_current(void);
 
 /* Translate a GUEST-namespace ceiling pair into the calling process's host
  * window.  A no-op when the caller has no window, or when limit_high is not a

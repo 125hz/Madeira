@@ -346,18 +346,56 @@ int ios_is_arm64ec_cur(void)
 
 void ios_register_proc_ident( void *peb_id, const SECTION_IMAGE_INFORMATION *info )
 {
-    int idx = ios_proc_ident_count;
+    int idx = ios_proc_ident_count, i;
+
+    /* prefer a slot released by a dead pseudo-process (ios_proc_ident_release)
+     * — without this the registry fills up over a long multi-process session
+     * even though entries keep being freed.  Writing `info` before `peb` is the
+     * same publish order the append path uses, for the same lock-free readers. */
+    for (i = 0; i < ios_proc_ident_count; i++)
+        if (!ios_proc_idents[i].peb) { idx = i; break; }
+
     if (idx >= IOS_MAX_PROC_IDENTS)
     {
         dprintf(2, "[proc-ident] registry FULL — %p keeps session identity\n", peb_id);
         return;
     }
     ios_proc_idents[idx].info = *info;
+    ios_proc_idents[idx].ntdll_module = NULL;
+    __sync_synchronize();
     ios_proc_idents[idx].peb = peb_id;
     __sync_synchronize();
-    ios_proc_ident_count = idx + 1;
+    if (idx == ios_proc_ident_count) ios_proc_ident_count = idx + 1;
     dprintf(2, "[proc-ident] peb=%p Machine=0x%x (slot %d)\n",
             peb_id, info->Machine, idx);
+}
+
+/* A pseudo-process has exited and its PEB is about to be REUSED.
+ *
+ * This registry is keyed by PEB pointer, and a 32-bit child's PEB is allocated
+ * inside its guest window — so when the window is released and re-adopted, the
+ * next child's PEB lands at the same host address.  A surviving entry would
+ * then answer for the new process with the dead one's main-image info and its
+ * private (already tombstoned) ntdll copy, which is how a stale identity turns
+ * into a wrong pe_dir, a wrong is_arm64ec() and a call into freed pool memory.
+ * Called from the guest-window teardown (virtual_ios.c). */
+void ios_proc_ident_release( void *peb_id )
+{
+    int i, n = ios_proc_ident_count;
+
+    if (!peb_id) return;
+    for (i = 0; i < n; i++)
+    {
+        if (ios_proc_idents[i].peb != peb_id) continue;
+        ios_proc_idents[i].peb = NULL;        /* readers match on peb: clear it first */
+        __sync_synchronize();
+        ios_proc_idents[i].ntdll_module = NULL;
+        memset( &ios_proc_idents[i].funcs, 0, sizeof(ios_proc_idents[i].funcs) );
+        memset( &ios_proc_idents[i].info, 0, sizeof(ios_proc_idents[i].info) );
+        dprintf(2, "[proc-ident] released peb=%p (slot %d)\n", peb_id, i);
+        return;
+    }
+    dprintf(2, "[proc-ident] release: peb=%p was not registered\n", peb_id);
 }
 
 /* X3c: attach a private ntdll image + entry points to a registered ident. */

@@ -2258,6 +2258,14 @@ void process_exit_wrapper( int status )
          * the session (else-branch) lives as long as the app. Reuse is
          * grace-delayed inside the allocator for laggard exit threads. */
         ios_jit_reclaim_process( dead_peb );
+        /* WOW64_DESIGN.md §2: and its guest window, if it had one.  Here rather
+         * than only in ios_child_thread_entry because THIS is the chokepoint
+         * every pseudo-process exit reaches, on whichever thread called
+         * ExitProcess — a guest worker thread that ends the process does not
+         * return to the boot thread's setjmp at all.  Keyed by the dying PEB,
+         * not by the calling thread.  Nothing is unmapped here; see
+         * ios_wow_window_mark_released(). */
+        ios_wow_window_release( dead_peb );
     }
     else close( fd_socket );
 #else

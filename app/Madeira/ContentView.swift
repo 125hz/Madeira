@@ -240,9 +240,51 @@ final class MetalBackedView: UIView {
         (event?.allTouches ?? []).filter { $0.phase != .ended && $0.phase != .cancelled }
     }
 
+    /* ml660: the one place relative deltas are turned into wine events.
+     *
+     * Shared by the desktop trackpad path, the live-view drag path and (via
+     * winios_pointer directly) the on-screen aim stick, so all three are
+     * calibrated by the SAME sensRel slider and all three carry the truncation
+     * remainder — see the ml641 note on relCarryX. */
+    private func postRelative(_ dx: CGFloat, _ dy: CGFloat) {
+        let sens = CGFloat(InputSettings.shared.sensRel)
+        relCarryX += dx * sens
+        relCarryY += dy * sens
+        let ix = Int32(max(-30000, min(30000, relCarryX)))
+        let iy = Int32(max(-30000, min(30000, relCarryY)))
+        relCarryX -= CGFloat(ix)
+        relCarryY -= CGFloat(iy)
+        if ix != 0 || iy != 0 { winios_pointer(ix, iy, F_MOVE, 0) }
+    }
+
+    /* ml660: GAME MODE (MADEIRA_DESKTOP unset — everything the launch table
+     * starts) used to have exactly one behaviour: touch-down posted
+     * MOVE|LEFTDOWN|ABSOLUTE, each move posted MOVE|ABSOLUTE, lift posted
+     * LEFTUP. So a hold-and-drag to aim was, quite literally, a left click with
+     * the button held down for the whole drag — reported as "dragging just acts
+     * as a left click" — and the moves it did send were ABSOLUTE positions,
+     * which a mouse-look game turns into (finger position − its own clamped
+     * cursor): the ml641 spin, not aiming.
+     *
+     * The trackpad engine's Relative mode was never reachable from here: it is
+     * gated behind desktopMode. Now the live view honours the same toggle, so
+     * Relative gives a drag pure motion with no button at all, and a quick
+     * stationary tap still clicks. Absolute mode is untouched — desktop use
+     * (and every game that wants a real pointer) behaves exactly as before. */
+    private var gameRelative: Bool { !desktopMode && InputSettings.shared.relative }
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard desktopMode else {
             guard let t = touches.first else { return }
+            if gameRelative {
+                let p = t.location(in: self)
+                touchStartPoint = p
+                lastPanPoint = p
+                touchStartTime = Date().timeIntervalSinceReferenceDate
+                movedBeyondSlop = false
+                relCarryX = 0; relCarryY = 0   // never carry motion across a lift
+                return                          // NO button on touch-down
+            }
             let (x, y) = mapTouch(t)
             winios_post_touch_down(x, y)
             return
@@ -287,6 +329,14 @@ final class MetalBackedView: UIView {
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard desktopMode else {
             guard let t = touches.first else { return }
+            if gameRelative {
+                let p = t.location(in: self)
+                let dx = p.x - lastPanPoint.x, dy = p.y - lastPanPoint.y
+                lastPanPoint = p
+                if hypot(p.x - touchStartPoint.x, p.y - touchStartPoint.y) > 10 { movedBeyondSlop = true }
+                postRelative(dx, dy)
+                return
+            }
             let (x, y) = mapTouch(t)
             winios_post_touch_move(x, y)
             return
@@ -341,14 +391,7 @@ final class MetalBackedView: UIView {
          * by dragging RIGHT. That is the same sign as a mouse. Negate both terms
          * for content-drag (finger-follows-world) feel. */
         if InputSettings.shared.relative {
-            let sens = CGFloat(InputSettings.shared.sensRel)
-            relCarryX += dx * sens
-            relCarryY += dy * sens
-            let ix = Int32(max(-30000, min(30000, relCarryX)))
-            let iy = Int32(max(-30000, min(30000, relCarryY)))
-            relCarryX -= CGFloat(ix)
-            relCarryY -= CGFloat(iy)
-            if ix != 0 || iy != 0 { winios_pointer(ix, iy, F_MOVE, 0) }
+            postRelative(dx, dy)
             return
         }
 
@@ -363,6 +406,18 @@ final class MetalBackedView: UIView {
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard desktopMode else {
             guard let t = touches.first else { return }
+            if gameRelative {
+                // A stationary, quick lift is a click. Posted with NO move
+                // flag, so wine clicks wherever the GAME's own cursor is —
+                // posting a position here is exactly what makes a mouse-look
+                // title snap its aim before firing.
+                let now = Date().timeIntervalSinceReferenceDate
+                if !movedBeyondSlop && now - touchStartTime < 0.35 {
+                    winios_pointer(0, 0, F_LDOWN, 0)
+                    winios_pointer(0, 0, F_LUP, 0)
+                }
+                return
+            }
             let (x, y) = mapTouch(t)
             winios_post_touch_up(x, y)
             return
@@ -404,6 +459,11 @@ final class MetalBackedView: UIView {
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard desktopMode else {
             guard let t = touches.first else { return }
+            if gameRelative {
+                // Nothing to release — relative drags never pressed a button.
+                relCarryX = 0; relCarryY = 0
+                return
+            }
             let (x, y) = mapTouch(t)
             winios_post_touch_up(x, y)
             return
@@ -456,15 +516,30 @@ struct HoldKeyView: View {
 /// SwiftUI. So the pad is hosted in the window too, added after (and thus
 /// above) the Metal view, and driven from the SwiftUI button through this.
 final class JoystickPadState: ObservableObject {
+    /// The directional (arrow-key) stick.
     static let shared = JoystickPadState()
+    /// ml660: the aim stick. A SECOND instance rather than a second class —
+    /// the pad is one window-level overlay drawing every stick it is told
+    /// about, so a stick is just a state object with its own centre.
+    static let aim = JoystickPadState(glyph: "scope")
+
     @Published var held = false
     @Published var dir: Int = -1
+    /// ml660: continuous knob offset, −1…1 per axis, for the aim stick. The
+    /// directional stick leaves this nil and steers by `dir` (8-way snap),
+    /// because it drives KEYS and a key is either down or not.
+    @Published var vec: CGSize?
     @Published var center: CGPoint = .zero      // window coordinates
     /// ml641: driven by the pointer panel. The pad is NOT a sibling of the key
     /// row — it lives in its own UIWindow one level up (that is the whole point
     /// of this class), so the row's .transition(.opacity) cannot reach it and it
     /// stayed visible while every other button faded. It has to fade itself.
     @Published var hidden = false
+    /// SF Symbol drawn in the face, so two identical-looking sticks are
+    /// telling apart at a glance.
+    let glyph: String?
+
+    init(glyph: String? = nil) { self.glyph = glyph }
 }
 
 /// Window-level host for the pad. Transparent and non-interactive: the
@@ -508,10 +583,33 @@ final class PassthroughWindow: UIWindow {
 
 /// The expanded pad, drawn in window space at the button's location.
 struct JoystickPadOverlay: View {
-    @ObservedObject private var s = JoystickPadState.shared
-
     var body: some View {
         GeometryReader { _ in
+            // ml660: one face per registered stick — directional and aim. They
+            // never overlap (each is anchored to its own button's centre) so a
+            // plain ZStack is enough; ordering between them is irrelevant.
+            ZStack(alignment: .topLeading) {
+                JoystickPadFace(s: JoystickPadState.shared)
+                JoystickPadFace(s: JoystickPadState.aim)
+            }
+        }
+        // MUST ignore the safe area. s.center comes from the button's .global
+        // frame, which is measured from the WINDOW origin; without this the
+        // overlay's hosting view is inset by the safe area, the offset below
+        // is measured from below the status bar, and the pad lands ~59pt too
+        // low — roughly one pad radius, which is exactly why it appeared to
+        // sit under the game strip instead of centred on the button.
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+    }
+}
+
+/// One stick's face in the window-level overlay.
+struct JoystickPadFace: View {
+    @ObservedObject var s: JoystickPadState
+
+    var body: some View {
+        Group {
             // THE one and only joystick face — idle ring and expanded pad are
             // the same view, never two that swap. That identity is what makes
             // it seamless: the diameter and the knob offset are plain animated
@@ -526,25 +624,22 @@ struct JoystickPadOverlay: View {
             // offset that changes in the same transaction as `held` gets
             // animated too — which is what made the pad fly in from the top.
             // Here the only animatable quantities belong to the face itself.
-            JoystickFace(held: s.held, dir: s.dir)
+            JoystickFace(held: s.held, dir: s.dir, vec: s.vec, glyph: s.glyph)
                 .frame(width: JoystickFace.padRadius * 2,
                        height: JoystickFace.padRadius * 2)
                 .offset(x: s.center.x - JoystickFace.padRadius,
                         y: s.center.y - JoystickFace.padRadius)
                 .opacity(s.center == .zero ? 0 : 1)
         }
-        // MUST ignore the safe area. s.center comes from the button's .global
-        // frame, which is measured from the WINDOW origin; without this the
-        // overlay's hosting view is inset by the safe area, the offset above
-        // is measured from below the status bar, and the pad lands ~59pt too
-        // low — roughly one pad radius, which is exactly why it appeared to
-        // sit under the game strip instead of centred on the button.
-        .ignoresSafeArea()
-        .allowsHitTesting(false)
         .opacity(s.hidden ? 0 : 1)
         .animation(.easeInOut(duration: 0.28), value: s.hidden)
         .animation(.spring(response: 0.32, dampingFraction: 0.62), value: s.held)
         .animation(.spring(response: 0.22, dampingFraction: 0.58), value: s.dir)
+        // ml660: `vec` is DELIBERATELY not in an .animation(value:) list — the
+        // aim knob must sit exactly under the thumb, and a spring on it would
+        // both lag the finger and smear the deflection the driver reads. The
+        // spring-back on release still happens, because `held` flips in the
+        // same transaction and that animation covers every change in it.
     }
 }
 
@@ -559,6 +654,14 @@ struct JoystickFace: View {
     /// than faked by passing held:true (which would also kill the knob travel
     /// and the press styling).
     var alwaysExpanded = false
+    /// ml660: continuous knob deflection, −1…1 per axis. Set by the aim stick;
+    /// when non-nil it REPLACES the 8-way `dir` offset, so one face serves both
+    /// a d-pad-shaped stick (keys, snapped) and an analogue one (mouse-look).
+    var vec: CGSize?
+    /// ml660: SF Symbol identifying what this stick drives. Drawn in the middle
+    /// of the ring: alone at idle size (where a knob plus a glyph is a smudge)
+    /// and dimmed behind the knob when expanded, where deflecting reveals it.
+    var glyph: String?
     private var expanded: Bool { held || alwaysExpanded }
 
     static let idleDiameter: CGFloat = 22
@@ -576,8 +679,12 @@ struct JoystickFace: View {
     }
 
     private func knobOffset(_ d: CGFloat) -> CGSize {
-        guard dir >= 0, expanded else { return .zero }
+        guard expanded else { return .zero }
         let travel = d * knobTravelRatio
+        if let v = vec {
+            return CGSize(width: travel * v.width, height: travel * v.height)
+        }
+        guard dir >= 0 else { return .zero }
         let a = Double(dir) * 45.0 * .pi / 180.0
         return CGSize(width: travel * CGFloat(sin(a)), height: -travel * CGFloat(cos(a)))
     }
@@ -587,6 +694,12 @@ struct JoystickFace: View {
         return ZStack {
             interior
             Circle().strokeBorder(Color.white.opacity(0.55), lineWidth: expanded ? 2 : 1.5)
+            if let g = glyph {
+                Image(systemName: g)
+                    .font(.system(size: d * (expanded ? 0.30 : 0.62), weight: .medium))
+                    .foregroundColor(.white)
+                    .opacity(expanded ? 0.42 : 0.95)
+            }
             Circle()
                 .fill(Color.white)
                 .frame(width: d * 0.42, height: d * 0.42)
@@ -602,8 +715,88 @@ struct JoystickFace: View {
                         .opacity(expanded ? 0 : 1)
                 )
                 .offset(knobOffset(d))
+                // At idle size a glyph-bearing stick shows the GLYPH instead of
+                // the knob — 9pt of white disc plus a 2pt symbol is unreadable
+                // mush, and the glyph is the whole point of the distinction.
+                .opacity(glyph == nil || expanded ? 1 : 0)
         }
         .frame(width: d, height: d)
+    }
+}
+
+/// ml660 — AIM STICK ENGINE (velocity-control mouse-look).
+///
+/// The directional stick posts KEY events, so it is edge-triggered: press W,
+/// later release W. A mouse has no such thing as "held right" — a game reads
+/// motion, and a stick that is merely deflected is producing motion for as long
+/// as it is held. So this is a clock, not an event handler: a CADisplayLink
+/// converts the current deflection into a delta every frame, `dx = deflection ×
+/// sensRel × fullRate × Δt`, and posts it as RELATIVE motion.
+///
+/// Relative, specifically — the same path the pointer panel's "Relative" mode
+/// uses: `winios_pointer(dx, dy, MOUSEEVENTF_MOVE, 0)` with NO MOUSEEVENTF_
+/// ABSOLUTE. The wineserver adds our delta to its own cursor
+/// (`x = cursor.x + input->mouse.x`) and hands raw input `x - cursor.x`, i.e.
+/// exactly our delta, BEFORE any clamping happens — so aiming never stalls at
+/// a screen edge or inside a game's ClipCursor rect. Nothing new is needed on
+/// the driver side.
+///
+/// Δt comes from the display link rather than being assumed to be 1/60, so the
+/// same deflection turns the camera at the same rate on a 60Hz and a 120Hz
+/// panel, and a dropped frame does not eat the motion it was carrying.
+final class AimStickDriver {
+    static let shared = AimStickDriver()
+
+    /// Mouse counts per second at full deflection with sensRel == 1.0. The
+    /// slider (0.10…8.0, default 2.0) scales it, so the default is ~720
+    /// counts/s flat out — about a fast-but-controllable drag.
+    static let fullRate: CGFloat = 360
+
+    private var link: CADisplayLink?
+    private var vx: CGFloat = 0, vy: CGFloat = 0
+    // Same truncation problem as ml641's relCarryX: at low sensitivity the
+    // per-frame delta is a fraction, and Int32() of a fraction is zero forever.
+    private var carryX: CGFloat = 0, carryY: CGFloat = 0
+    /// Portrait and landscape can both have an aim stick on screen; whichever
+    /// is touched first starts the clock and the last one to lift stops it.
+    private var holders = 0
+
+    func begin() {
+        holders += 1
+        guard link == nil else { return }
+        carryX = 0; carryY = 0
+        let l = CADisplayLink(target: self, selector: #selector(tick(_:)))
+        l.add(to: .main, forMode: .common)
+        link = l
+    }
+
+    /// Deflection, −1…1 per axis, y positive DOWN (screen sense). Sign matches
+    /// the drag path: push right → view turns right, like a mouse.
+    func steer(_ v: CGSize) {
+        vx = v.width.isFinite ? v.width : 0
+        vy = v.height.isFinite ? v.height : 0
+    }
+
+    func end() {
+        holders = max(holders - 1, 0)
+        guard holders == 0 else { return }
+        vx = 0; vy = 0
+        carryX = 0; carryY = 0
+        link?.invalidate()
+        link = nil
+    }
+
+    @objc private func tick(_ l: CADisplayLink) {
+        guard vx != 0 || vy != 0 else { return }
+        let dt = max(min(l.targetTimestamp - l.timestamp, 1.0 / 15.0), 1.0 / 240.0)
+        let k = CGFloat(InputSettings.shared.sensRel) * Self.fullRate * CGFloat(dt)
+        carryX += vx * k
+        carryY += vy * k
+        let ix = Int32(max(-30000, min(30000, carryX)))
+        let iy = Int32(max(-30000, min(30000, carryY)))
+        carryX -= CGFloat(ix)
+        carryY -= CGFloat(iy)
+        if ix != 0 || iy != 0 { winios_pointer(ix, iy, 0x0001 /* MOUSEEVENTF_MOVE */, 0) }
     }
 }
 
@@ -714,6 +907,107 @@ struct JoystickKeyView: View {
                         held = false
                         withAnimation(.spring(response: 0.32, dampingFraction: 0.62)) {
                             JoystickPadState.shared.held = false
+                        }
+                    }
+            )
+    }
+}
+
+/// ml660 — the AIM stick: the directional stick's twin, for mouse-look.
+///
+/// Deliberately the same control in every visible respect (same face, same
+/// key-sized idle ring, same expand-under-the-thumb pad, same window-level
+/// host) so the pair reads as one set. Two things differ, and both follow from
+/// what it drives:
+///
+///   • Deflection is ANALOGUE, not snapped to eight sectors. A d-pad snaps
+///     because a key is binary; a camera is not, and aiming with 45° quantised
+///     directions is unusable.
+///   • Holding it still off-centre keeps producing motion (AimStickDriver's
+///     display link) instead of holding a key down.
+///
+/// It does NOT touch InputSettings.relative: that toggle governs what a finger
+/// on the live view does, and the whole point of the stick is to aim with the
+/// thumb while taps on the view keep clicking.
+struct AimStickKeyView: View {
+    @State private var held = false
+    @State private var hosted = false
+    @State private var center: CGPoint = .zero
+
+    /// Travel, in points of thumb movement, that means full deflection. Smaller
+    /// than the pad radius (58) so the stick reaches its limit well inside the
+    /// ring — you should not have to leave the pad to turn at full rate.
+    private let travel: CGFloat = 34
+    private let deadzone: CGFloat = 6
+
+    private func deflect(_ t: CGSize) -> CGSize {
+        let d = (t.width * t.width + t.height * t.height).squareRoot()
+        guard d > deadzone else { return .zero }
+        // Re-scale from the deadzone edge, so the first countable movement is
+        // a crawl rather than a jump to (deadzone/travel) of full speed.
+        let m = min((d - deadzone) / (travel - deadzone), 1.0)
+        return CGSize(width: t.width / d * m, height: t.height / d * m)
+    }
+
+    private func publish(_ v: CGSize) {
+        JoystickPadState.aim.vec = v
+        AimStickDriver.shared.steer(v)
+    }
+
+    var body: some View {
+        Color.clear
+            .frame(width: 34, height: 30)
+            .background(Color.white.opacity(held ? 0.30 : 0.15))
+            .cornerRadius(6)
+            .overlay { if !hosted { JoystickFace(held: false, dir: -1,
+                                                 glyph: JoystickPadState.aim.glyph) } }
+            .background(
+                GeometryReader { geo in
+                    Color.clear.onAppear {
+                        center = CGPoint(x: geo.frame(in: .global).midX,
+                                         y: geo.frame(in: .global).midY)
+                        JoystickPadState.aim.center = center
+                        if let scene = UIApplication.shared.connectedScenes
+                            .compactMap({ $0 as? UIWindowScene }).first {
+                            JoystickPadHost.attach(to: scene)
+                            hosted = true
+                        }
+                    }
+                    .onChange(of: geo.frame(in: .global)) { _, f in
+                        center = CGPoint(x: f.midX, y: f.midY)
+                        JoystickPadState.aim.center = center
+                    }
+                }
+            )
+            .animation(.spring(response: 0.32, dampingFraction: 0.62), value: held)
+            // The row this lives in is removed wholesale when the pointer panel
+            // opens. Without this the driver would keep firing at whatever
+            // deflection the thumb happened to be at when the view vanished.
+            .onDisappear { if held { held = false; publish(.zero); AimStickDriver.shared.end() } }
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { g in
+                        if !held {
+                            held = true
+                            if let scene = UIApplication.shared.connectedScenes
+                                .compactMap({ $0 as? UIWindowScene }).first {
+                                JoystickPadHost.attach(to: scene)
+                            }
+                            JoystickPadState.aim.center = center
+                            AimStickDriver.shared.begin()
+                            withAnimation(.spring(response: 0.32, dampingFraction: 0.62)) {
+                                JoystickPadState.aim.held = true
+                            }
+                        }
+                        publish(deflect(g.translation))
+                    }
+                    .onEnded { _ in
+                        publish(.zero)
+                        AimStickDriver.shared.end()
+                        held = false
+                        withAnimation(.spring(response: 0.32, dampingFraction: 0.62)) {
+                            JoystickPadState.aim.held = false
+                            JoystickPadState.aim.vec = nil
                         }
                     }
             )
@@ -855,13 +1149,21 @@ struct ContentView: View {
     /// .compact = iPhone landscape: game surface expands, arrow keys appear.
     @Environment(\.verticalSizeClass) private var vSizeClass
 
-    /// WOW64_DESIGN.md stage E: every shipped 32-bit (WoW64) test program's
-    /// launch button is one entry here — see `actionButtons`.
-    private let thirtyTwoBitTests: [(label: String, exe: String)] = [
+    /// Shipped launch targets, EITHER BITNESS. Was `thirtyTwoBitTests` /
+    /// "32-bit test programs" (WOW64_DESIGN.md stage E), but the table never
+    /// actually selected a bitness: the ForEach below hands `exe` to
+    /// MADEIRA_EXE verbatim and WineProcessBridge.m probes the PE machine of a
+    /// full path, routing 32- or 64-bit accordingly. So a 64-bit entry belongs
+    /// here just as much as a 32-bit one, and the old name only misled.
+    ///
+    /// Add a row to wire up another target — no other code needed. Entries are
+    /// keyed by `exe` in the ForEach, so each path must be unique.
+    private let launchTargets: [(label: String, exe: String)] = [
         ("D3D9 cube", "d3d9-cube-x86.exe"),
         // Full Win32 path passed verbatim to MADEIRA_EXE — WineProcessBridge
         // detects the backslash and launches it as-is (no syswow64 prefix).
         (#"Mirror's Edge"#, #"C:\Mirrors-Edge\Mirror's Edge\Binaries\MirrorsEdge.exe"#),
+        ("INSIDE", #"C:\INSIDE\INSIDE.exe"#),
     ]
 
     enum JITStatus {
@@ -952,6 +1254,7 @@ struct ContentView: View {
                                 .cornerRadius(6)
                         }
                         JoystickKeyView()
+                        AimStickKeyView()   // ml660: mouse-look twin
                     }
                     .transition(.opacity)
                     pointerToggleButton
@@ -1012,8 +1315,9 @@ struct ContentView: View {
     private var pointerToggleButton: some View {
         Button {
             withAnimation(.easeInOut(duration: 0.28)) { pointerPanel.toggle() }
-            // The window-level pad fades itself; see JoystickPadState.hidden.
+            // The window-level pads fade themselves; see JoystickPadState.hidden.
             JoystickPadState.shared.hidden = pointerPanel
+            JoystickPadState.aim.hidden = pointerPanel
         } label: {
             Image(systemName: pointerPanel ? "xmark" : "cursorarrow")
                 .font(.system(size: 17, weight: .medium))
@@ -1517,11 +1821,11 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.blue)
 
-                // WOW64_DESIGN.md stage E: every 32-bit (WoW64) test program
-                // gets its own button here, same style as the x86_64 tests
-                // above. Add one to this array to wire up another (e.g. a
-                // later D3D9 cube) — no other code needed.
-                ForEach(thirtyTwoBitTests, id: \.exe) { test in
+                // Every shipped launch target gets its own button here, same
+                // style as the x86_64 tests above. Bitness is decided by
+                // WineProcessBridge from the PE header, not by this table —
+                // see `launchTargets`.
+                ForEach(launchTargets, id: \.exe) { test in
                     Button(test.label) {
                         setenv("MADEIRA_EXE", test.exe, 1)
                         unsetenv("MADEIRA_ARGS")
@@ -1939,6 +2243,58 @@ struct ContentView: View {
                     logStore.log("DXMT config: \(v) via madeira-dxmt.txt")
                 }
             }
+
+            // ===== FEX JIT settings (ml900) =====================================
+            // Generic passthrough for FEX's own configuration, same shape as the
+            // DXMT block above. Madeira ships no /usr/share/fex-emu/Config.json and
+            // no AppConfig/*.json (the device log shows FEX probing for both and
+            // finding nothing), so the JIT runs entirely on compiled-in defaults and
+            // there was no way to change one without a rebuild. FEX's environment
+            // layer reads FEX_<OPTIONNAME>, so one file covers every option rather
+            // than growing a switch per knob.
+            //
+            // Documents/madeira-fex.txt: one NAME=VALUE per line, names exactly as
+            // they appear in FEX's Config.json.in, uppercased. Lines starting with
+            // '#' are comments. Examples:
+            //     X87REDUCEDPRECISION=1   # 64-bit x87 instead of 80-bit. Much faster
+            //                             # for 32-bit x87-heavy code, and a real
+            //                             # accuracy loss: anything that depends on
+            //                             # 80-bit intermediates (some geometry and
+            //                             # physics) can render or behave differently.
+            //     MAXINST=500             # smaller multiblock blocks: less compile
+            //                             # stutter, more dispatch
+            //     TSOENABLED=0            # relax emulated memory ordering. FAST AND
+            //                             # UNSAFE: x86 is TSO and ARM64 here is not,
+            //                             # so this can break any multithreaded guest.
+            // The effective values are printed once per process as [fex-cfg], so a
+            // log always says which way a run shipped.
+            //
+            // Name validation is deliberate: this writes into the process environment
+            // that the whole Wine session inherits, so only [A-Z0-9_] names are
+            // accepted and each is prefixed with FEX_ here -- a line in this file can
+            // never set an arbitrary environment variable.
+            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-fex.txt"), encoding: .utf8) {
+                var applied: [String] = []
+                for rawLine in txt.split(separator: "\n", omittingEmptySubsequences: true) {
+                    let line = rawLine.trimmingCharacters(in: .whitespaces)
+                    if line.isEmpty || line.hasPrefix("#") { continue }
+                    guard let eq = line.firstIndex(of: "=") else { continue }
+                    let name = String(line[line.startIndex..<eq]).trimmingCharacters(in: .whitespaces).uppercased()
+                    let value = String(line[line.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+                    guard !name.isEmpty, !value.isEmpty,
+                          name.allSatisfy({ $0.isASCII && ($0.isUppercase || $0.isNumber || $0 == "_") }) else {
+                        logStore.log("FEX config: ignoring malformed line '\(line)'", level: .error)
+                        continue
+                    }
+                    setenv("FEX_" + name, value, 1)
+                    applied.append("\(name)=\(value)")
+                }
+                if !applied.isEmpty {
+                    logStore.log("FEX config: \(applied.joined(separator: " ")) via madeira-fex.txt")
+                }
+            }
+            // ===== end FEX JIT settings =========================================
 
             // ml734: Theorafile call tracer. Documents/madeira-tf-trace.txt == "1"
             // redirects libtheorafile's tf_* exports through wrappers in
@@ -2503,6 +2859,7 @@ enum ControlAction: Codable, Equatable, Hashable {
     case mouseRight
     case joystickWASD        // renders as a stick, posts W/A/S/D
     case joystickArrows      // renders as a stick, posts the arrow keys
+    case joystickMouse       // ml660: renders as a stick, posts relative mouse motion
     case keyboardToggle      // raises the iOS keyboard, as in portrait
     case pad(String)         // ml645: Xbox button. NOT WIRED — see the panel.
 
@@ -2514,6 +2871,14 @@ enum ControlAction: Codable, Equatable, Hashable {
         default: return nil
         }
     }
+    /// ml660: the aim stick drives no keys at all, so `stickKeys` cannot
+    /// identify it — but it must still LOOK and hit-test like a stick.
+    var isMouseStick: Bool { self == .joystickMouse }
+    var isStick: Bool { stickKeys != nil || isMouseStick }
+    /// ml660: SF Symbol drawn in the face, distinguishing sticks from each
+    /// other. The key sticks stay plain (they were shipped that way and are
+    /// told apart by their label); the aim stick is marked.
+    var stickGlyph: String? { isMouseStick ? "scope" : nil }
     var isPad: Bool { if case .pad = self { return true }; return false }
 
     var label: String {
@@ -2524,6 +2889,7 @@ enum ControlAction: Codable, Equatable, Hashable {
         case .keyboardToggle:  return "⌨"
         case .joystickWASD:    return "WASD"
         case .joystickArrows:  return "↕"
+        case .joystickMouse:   return "AIM"
         case .pad(let n):      return n
         case .key(let vk):     return ControlAction.keyLabel(vk)
         }
@@ -2781,17 +3147,20 @@ struct TouchControlButton: View {
     @State private var isDown = false
     @State private var dragBase: CGPoint?
     @State private var stickDir: Int = -1
+    /// ml660: continuous deflection for the aim stick, −1…1 per axis.
+    @State private var stickVec: CGSize?
 
     private var diameter: CGFloat { TouchControlsModel.baseDiameter * CGFloat(control.scale) }
-    private var isStick: Bool { control.action.stickKeys != nil }
+    private var isStick: Bool { control.action.isStick }
     private var isSelected: Bool { m.editing && m.selected == control.id }
 
     var body: some View {
         ZStack {
-            if control.action.stickKeys != nil {
+            if isStick {
                 // Reuse the portrait pad's face so both look and animate the
                 // same; scale it to whatever size this control was pinched to.
-                JoystickFace(held: isDown, dir: stickDir, alwaysExpanded: true)
+                JoystickFace(held: isDown, dir: stickDir, alwaysExpanded: true,
+                             vec: stickVec, glyph: control.action.stickGlyph)
                     .frame(width: JoystickFace.padRadius * 2,
                            height: JoystickFace.padRadius * 2)
                     .scaleEffect(diameter / (JoystickFace.padRadius * 2))
@@ -2845,6 +3214,15 @@ struct TouchControlButton: View {
                     } else if let q = control.action.stickKeys {
                         isDown = true
                         applyStick(snap(v.translation), q)
+                    } else if control.action.isMouseStick {
+                        if !isDown {
+                            isDown = true
+                            AimStickDriver.shared.begin()
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        }
+                        let d = deflect(v.translation)
+                        stickVec = d
+                        AimStickDriver.shared.steer(d)
                     } else if !isDown {
                         isDown = true
                         press(true)
@@ -2855,12 +3233,30 @@ struct TouchControlButton: View {
                     if let q = control.action.stickKeys {
                         applyStick(-1, q)          // release every held direction
                         isDown = false
+                    } else if control.action.isMouseStick {
+                        if isDown {
+                            AimStickDriver.shared.steer(.zero)
+                            AimStickDriver.shared.end()
+                        }
+                        isDown = false
+                        stickVec = nil
                     } else if isDown {
                         isDown = false
                         press(false)
                     }
                 }
         )
+    }
+
+    /// ml660: ANALOGUE deflection for the aim stick, −1…1 per axis. Both the
+    /// deadzone and full travel scale with the control's pinched size, so a
+    /// stick you made bigger also needs a proportionally bigger thumb throw.
+    private func deflect(_ t: CGSize) -> CGSize {
+        let d = (t.width * t.width + t.height * t.height).squareRoot()
+        let dead = diameter * 0.12, travel = diameter * 0.55
+        guard d > dead else { return .zero }
+        let m = min((d - dead) / (travel - dead), 1.0)
+        return CGSize(width: t.width / d * m, height: t.height / d * m)
     }
 
     /// 8-way snap. Screen y grows downward, so measure clockwise from "up".
@@ -2911,7 +3307,7 @@ struct TouchControlButton: View {
             winios_pointer(0, 0, down ? 0x0008 : 0x0010, 0)   // RIGHTDOWN / RIGHTUP
         case .keyboardToggle:
             if down { MetalBackedView.toggleKeyboard() }
-        case .none, .joystickWASD, .joystickArrows:
+        case .none, .joystickWASD, .joystickArrows, .joystickMouse:
             break                                              // sticks drive themselves
         case .pad:
             break     // ml645: no XInput yet — deliberately inert, and labelled so
@@ -3025,6 +3421,7 @@ struct MappingPanel: View {
             section("Pointer, sticks & special", [
                 ("L click", .mouseLeft), ("R click", .mouseRight),
                 ("WASD", .joystickWASD), ("Arrows", .joystickArrows),
+                ("Aim", .joystickMouse),
                 ("Keyboard", .keyboardToggle), ("None", .none),
             ])
             section("Letters", letters)

@@ -147,6 +147,105 @@ game-specific patches — every change must fix the emulator/runtime generically
 
 ## 6. Status log
 
+- 2026-09-13 — **Guest-window RELEASE and RE-ADOPTION** (Opus,
+  `build/ntdll-unix/*` only). Device evidence (log 28): a 32-bit launcher
+  exe ran as an i386 CHILD in the desktop, booted fully (apiset mapped,
+  `[wow-syscall] translated 1540 …`), crashed in guest code with
+  c0000005 and exited cleanly through `[Wine child exit]
+  stage=abort_process` (the teardown fix held, the app survived). The
+  user then double-clicked the main 32-bit exe and got
+  `[wow-window] B=0x7100000000 REJECTED: its placeholder is already
+  adopted …` → `BOOT FAILED at stage 'guest-window-reserve'` →
+  `c00000e5`. "One 32-bit process per session, ever" is not acceptable:
+  launcher → game is the normal shape of a 32-bit title.
+  DESIGN CHOSEN: **release on next adopt** (deferred teardown), because
+  the precondition everybody wants — "no thread of the owner is still
+  running" — is *unprovable* here and the alternative is worse. On iOS
+  `NtTerminateProcess` longjmps out of the CALLING thread only, nothing
+  joins a pseudo-process's other threads, and its own boot TEB is never
+  freed, so counting `teb_list` entries with `teb->Peb == dead_peb`
+  always returns ≥ 1 and proves nothing; and at exit the dying thread is
+  still standing ON a TEB (and possibly a stack) inside the range it
+  would be replacing. So the EXIT path only marks: slot `dead`, owner
+  PEB recorded, placeholder marked UNADOPTED, one line
+  `[wow-window] released B=… (owner peb=… exit) — placeholder
+  unadopted`. The TEARDOWN runs from `ios_wow_reclaim_dead_windows()` at
+  the top of the NEXT `ios_wow_window_reserve()` — i.e. at least one
+  process creation later — and, in order: deletes every `file_view`
+  fully inside `[B, B+4G)` (images, anon views, the USD second view at
+  `B+0x7ffe0000`, the apiset view, the wow64 params block, TEB/PEB
+  pages, thread stacks, the BOP page at guest 0x250000), clears
+  `pages_vprot` for the whole range, then replaces all 4 GB with **ONE**
+  `mmap(MAP_FIXED, PROT_NONE, MAP_ANON|MAP_NORESERVE)` — no `munmap`,
+  the reserved-area entry and the FB3 guard are kept exactly as they
+  were, so there is never an instant in which the kernel could place a
+  system framework in the slot. Then `ios_jit_reclaim_process(dead_peb)`
+  + an explicit `ios_jit_purge_window()` (every `[jit-pool] image` and
+  `[iOS-xrem]` anon alias describing memory in the window — the next
+  process's ntdll/kernel32/exe land on the SAME guest addresses, so
+  relying on purge-on-add would leave stale entries shadowing them),
+  `[proc-ident]` and fd-cache slots for the dead PEB (its PEB address is
+  re-used by the next child, so a survivor would answer for the new
+  process), the Mach-port→TEB registry entries pointing into the window,
+  and the session globals `wow_peb` / `user_space_wow_limit` / the
+  session `peb` (the child path deliberately leaves the global `peb`
+  pointing at the last child it booted — after a release that would
+  dangle into PROT_NONE). Settle interval `IOS_WOW_SETTLE_SEC = 3`
+  before the teardown (same rationale and value as the JIT pool's reuse
+  grace); in the launcher→program case it has long expired and nothing
+  sleeps. A laggard thread of the dead process now FAULTS on PROT_NONE
+  instead of writing into the next process's memory.
+  Two states are kept apart on purpose: RELEASED (dead, reclaimable)
+  and ABANDONED/`leaked` (`ios_wow_window_retire_current()`, used only
+  by env_ios.c's start.exe fallback, where the pseudo-process goes on
+  LIVING inside the window — that slot is gone for the session).
+  The release is driven from `process_exit_wrapper` keyed by the dying
+  PEB (the chokepoint every pseudo-process exit reaches, on whichever
+  thread called ExitProcess) with `ios_child_thread_entry`'s
+  `release_current` left as the fallback for a child that died before
+  binding its window.
+  LIMITATION, unchanged and explicit: there is exactly ONE 4 GB-aligned
+  slot below the cage holdback, so two 32-bit pseudo-processes cannot be
+  alive at once. A 32-bit launcher that spawns the program and STAYS
+  ALIVE still fails, now with a clearer message (`a 32-bit
+  pseudo-process (peb=…) is running in this window right now`).
+  Concurrent 32-bit pseudo-processes need a SECOND slot — which means
+  freeing 4 GB of the band (shrinking the cage holdback or moving the
+  CEF pools) — out of scope here.
+  SAME ROUND, the launcher's own c0000005 SYMBOLIZED: guest RIP
+  0x7BC52390 (the reconstructed eip; `[rsp-trunc] guest_rip=0x7bc52273`
+  is the JIT block entry) = i386 `user32.dll` (guest base 0x7BC00000)
+  RVA 0x52390 = `WPRINTF_GetLen()`'s `WPR_STRING` scan
+  `for (len = 0; …) if (!*(arg->lpcstr_view + len)) break;`
+  (`cmpb $0x0,(%esi,%edi,1)`, which FEX emits as
+  `add w21,w10,w11 / add x24,x19,w21,uxtw / ldaprb w21,[x24]`).
+  `[ec-fault-regs] x10=0x63 x11=0x0` → ESI = 0x63, EDI = 0: the STRING
+  POINTER ITSELF is 0x63, read on the first iteration. NOT a
+  NULL+0x63 field read, and not a pointer-namespace bug of ours —
+  `wsprintfA`/`wvsprintfA` is pure i386 PE code with no thunk in the
+  path, and Wine's own NULL guard (`arg->lpcstr_view = "(null)"`, one
+  instruction earlier at RVA 0x52279) only covers NULL. The program fed
+  `%s` a garbage non-NULL value. WHY: 22 lines earlier the log has
+  `[dll-missing] L"C:\\windows\\system32\\dxdiagn.dll" status=c0000135`
+  → `apartment_add_dll couldn't load in-process dll` →
+  `com_get_class_object no class object
+  {a65b8071-3bfe-4213-9a5b-491da4461ca7}` = **CLSID_DxDiagProvider**.
+  i386 `dxdiagn.dll` is simply NOT IN THE 32-BIT FARM (Wine has it), so
+  `CoCreateInstance(CLSID_DxDiagProvider)` fails and the launcher
+  formats an uninitialised/garbage string from the failed query. GENERIC
+  fix, owner BUILD: add `dxdiagn` and its import closure to
+  `.xtool/build-wine-i386.sh` EXTRA_DLLS (any 32-bit program that asks
+  DxDiag for system info hits this). Two diagnostics were misleading
+  here and should be fixed when convenient: `[x86_live]` printed a host
+  address as RSI and `State.RIP=0x0` (no FEX state on the thread —
+  values unreliable, use `[ec-fault-regs]`), and `[x86_stk] vm_read
+  RSP=0xd8faf4 kr=1` read the GUEST stack pointer without adding B, so
+  the caller frame could not be walked. Also seen on the same thread
+  before the fatal fault: 10× survivable c0000005 at guest eip
+  0x7BB9FF61 = i386 `gdi32.dll` RVA 0x1FF61 inside `get_gdi_client_ptr`
+  (`cmpb $0x0,0xe(%eax,%edx,8)`), reading guest 0x38F61B3E — the 32-bit
+  GDI shared handle table pointer is garbage for a WoW process; separate
+  generic bug, not yet assigned.
 - 2026-09-12 — Desktop launch of the cube after the furniture-bias fix
   (IPA 08:22): bias confirmed (session PEB now 0x70ffff0000, TEBs
   0x70fff…), but `[wow-window] B=0x7100000000 REJECTED … next region
@@ -300,6 +399,97 @@ game-specific patches — every change must fix the emulator/runtime generically
   Expect `[callret] … used=N` ≤ 131072 entries, never `499%`. The leak
   source is expected (SEH unwind/longjmp abandon frames without RET). Also
   shipped: i386 farm +2 (d3d10, ddraw; stock Wine, farm = 199).
+- 2026-09-13 — **MILESTONE: a real 32-bit D3D9 game runs on the iPhone**
+  (391 s session, renders, takes input; user: "wow, it runs"), and the
+  32-bit cube launches from the 64-bit desktop. Exception storms gone
+  (`mach: msgs=697`), `[wow-syscall] translated 1540 ServiceTable entries`,
+  hit_rate 99 %. Open items from the same batch of logs: (1) PERF — the
+  process sits at phys 3.6 GB with 2.1 GB COMPRESSED: only 176 of 896 MB
+  JIT pool resident, FEX per-thread 16 MB regions (36 threads) fully dirty
+  and swapped (`fex=312 MB dirty`), guest 1138 MB; memory pressure, not
+  exceptions, is now the first-order cost. FEX runs on compiled defaults
+  (no Config.json found). Assigned (Opus: FEX footprint + generic 32-bit
+  JIT settings/toggles + periodic stats line). (2) A 32-bit launcher →
+  32-bit program sequence fails: the launcher adopted the only slot, and a
+  retired window is never returned → second process `guest-window-reserve
+  0xc0000017`. Assigned (Opus: real release via one MAP_FIXED PROT_NONE
+  replacement + bookkeeping teardown + re-adoption). The launcher itself
+  crashed on a guest NULL+0x63 read (guest RIP 0x7bc52273) — under review.
+  (3) A 64-bit (x86_64/arm64ec) title launched from the desktop shows on
+  the taskbar but its window is not visible; a 32-bit error dialog from
+  explorer likewise not visible — display/compositing of child windows,
+  next up. (4) Touch drag acts as left click; user wants a mouse-look
+  joystick (and one in landscape fullscreen) — app UI + winios input,
+  next up. Teardown fix confirmed: a crashed 32-bit child no longer kills
+  the app (`[Wine child exit] stage=abort_process`, session continued).
+  (2) DONE (Opus): release-on-next-adopt — exit marks the window dead
+  (`[wow-window] released B=… placeholder unadopted`); the next 32-bit
+  reserve tears it down under `virtual_mutex` (views inside the window
+  deleted, TEBs unlinked from `teb_list`, `pages_vprot` cleared, ONE
+  `anon_mmap_fixed(PROT_NONE)` over the 4 GB, jit-pool window purge,
+  thread registry / proc-ident / fd cache / `wow_peb` / `user_space_wow_limit`
+  / session `peb` reset) after a 3 s settle, then adopts. Concurrent 32-bit
+  pseudo-processes still need a second slot (holdback/CEF move) — out of
+  scope. The launcher crash was the program formatting a garbage string
+  after `CoCreateInstance(CLSID_DxDiagProvider)` failed: i386 `dxdiagn.dll`
+  is NOT in the farm → add `dxdiagn` + closure to the i386 set (TODO,
+  build owner). Follow-ups found: 32-bit `gdi32` `get_gdi_client_ptr` reads
+  a garbage shared handle-table pointer in a WoW process (10 survivable AVs
+  — real generic bug, TODO); `[x86_live]`/`[x86_stk]` diagnostics print
+  guest values unbased (TODO); `[fdtrace] CROSS! close … fd-cache-release`
+  closes other pseudo-processes' fds on child exit (pre-existing, TODO).
+  (3) assigned (Opus: win32u-unix driver — the 64-bit title's popup ended
+  0x0 after `ChangeDisplaySettings('\\.\DISPLAY1') find_source FAILED`).
+  (1) DONE (Opus, FEX only): the biggest sink was FEX's `ZeroScrub` read
+  sweep — on Darwin a read fault on an absent anonymous page ALLOCATES a
+  real zero page charged to phys_footprint (no shared zero page), so every
+  16 MB callret stack and every lookup cache was fully materialised on
+  every thread (`mincore_res 16384KB` with `dirty 10448KB`). Replaced by
+  `VirtualDontNeed` (decommit+recommit = fresh zero mapping, zero
+  footprint); pooled compiler buffers are decommitted when recycled
+  (`ThreadPoolAllocator::Recycle`); the frontend decode arena is sized from
+  `MaxInst` (640 KB instead of 8 MB per thread). Expected 200-350 MB off
+  phys_footprint. Defaults kept (Multiblock, MaxInst 5000, mtrack SMC, TSO
+  + half-barrier, L1-only); `X87ReducedPrecision`/`TSOEnabled` exposed via
+  `Documents/madeira-fex.txt` (`NAME=VALUE` → `FEX_<NAME>`), not defaulted
+  (correctness trade-offs). New lines: one-shot `[fex-cfg]`, periodic
+  `[fex-stats] … cpp_dispatch=+N (N/s) hit_rate`. Findings for others:
+  the `[phys-map]` census double-counts the pool (RX+RW aliases of one
+  object); the pool starts 896 MB resident (~180 MB ever used) — testable
+  now via `Documents/madeira-pool.txt` = 384; `[pool-warmer]` touches both
+  aliases (362 MB read every 2 s; RX pass redundant for residency);
+  hottest RIP is i386 `kernel32!VirtualAlloc` (guest allocator churn, not a
+  spin); `repeats~` counter in CB_SUMMARY is a broken majority estimator;
+  and 19 M `CompileBlock` entries at 99 % hit = ~49k/s dispatcher
+  round-trips the inline L1 probe failed to resolve (L2 disabled → shared
+  map under a lock) — the largest remaining generic CPU cost, next.
+  (3) DONE (Opus, win32u-unix + IOSDisplayShim): the popup WAS resized to
+  0x0 by the application, and the driver's `[win-pos]` gate on empty rects
+  hid the transition (now logged as `vis=EMPTY … DEGENERATE` with the
+  monitor rects the driver would report). Confirmed driver bug fixed:
+  `NtUserChangeDisplaySettings('\\.\DISPLAY1')` failed with BADPARAM in the
+  virtual-monitor regime (empty `sources`) although the driver synthesizes
+  that name — now validated against the synthesized mode list. Second
+  generic bug: win32u's process-global `zero_bits` (set to 0x7fffffff once a
+  WoW64 TEB exists) is TASK-global here, so after the first 32-bit launch
+  every later low-2 GB allocation in ANY pseudo-process failed
+  (`[va-scan] FAILED window=0x10000..0x80000000`) — explorer's error
+  dialog got no surface (`surf-create -> 0x0`) and was invisible; cleared
+  after init (`syscall_ios.c` wrapper, `[zero-bits] … clearing it`), and a
+  failed surface allocation keeps the previous surface. The app sizes a
+  degenerate Metal layer from the swapchain as a fallback. Left open:
+  `Winios.m` ignores `insert_after` (z-order = creation order).
+  (4) DONE (Opus, ContentView only): root cause — the trackpad engine incl.
+  Relative mode was gated on `MADEIRA_DESKTOP`, so every game launch used
+  the bare path: touch-down = LEFTDOWN|ABSOLUTE, so a drag was a held
+  click. Now: Relative mode on the live view posts pure relative MOVE with
+  no button (tap still clicks); new aim stick (portrait, next to the
+  directional stick; landscape `joystickMouse`) drives
+  `winios_pointer(dx,dy,MOVE)` per display-link frame, velocity control
+  with dead zone, `sensRel` scale; raw input receives unclamped deltas
+  (`queue_ios.c:2290`), legacy `GetCursorPos` consumers still see the
+  clamped cursor (would need driver re-centring). Launch table renamed
+  `launchTargets` (either bitness; PE probe routes) + one 64-bit entry.
 
 
 - 2026-09-12 — M5 direction: the user's next target is a 32-bit UE3/D3D9

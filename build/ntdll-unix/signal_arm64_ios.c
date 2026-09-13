@@ -575,6 +575,37 @@ thread_t ios_thread_registry_mach(int i)
     return ios_thread_registry[i].mach_thread;
 }
 
+/* WOW64_DESIGN.md §2: a 32-bit pseudo-process's guest window is being released
+ * and every TEB inside it is about to become PROT_NONE.  Entries naming those
+ * TEBs must go first: the registry is keyed by Mach port, ports are RECYCLED,
+ * and both the exception path's port lookup and ios_teb_is_registered() would
+ * otherwise hand the fault handler a pointer into the replaced range.  Nothing
+ * else ever removed an entry (threads never unregister), so this is the only
+ * remover — and it only removes entries whose TEB is provably gone.
+ *
+ * The count is not lowered: slots are matched by mach_thread, and a zeroed slot
+ * matches no real port (MACH_PORT_NULL is never a live thread). */
+int ios_thread_registry_purge_range( uintptr_t base, uintptr_t size )
+{
+    int count = ios_thread_registry_count(), purged = 0, i;
+
+    for (i = 0; i < count; i++)
+    {
+        uintptr_t teb = ios_thread_registry[i].teb;
+
+        if (!teb || teb < base || teb >= base + size) continue;
+        ios_thread_registry[i].mach_thread = 0;
+        __sync_synchronize();
+        ios_thread_registry[i].teb = 0;
+        ios_thread_registry[i].trampoline = NULL;
+        purged++;
+    }
+    if (purged)
+        dprintf( 2, "[thread-reg] purged %d entr(y|ies) whose TEB was inside the released guest "
+                    "window %p+0x%llx\n", purged, (void *)base, (unsigned long long)size );
+    return purged;
+}
+
 static int ios_thread_is_registered(thread_t mach_thread)
 {
     int count = __sync_fetch_and_add(&ios_thread_count, 0);
@@ -630,10 +661,15 @@ static int ios_lookup_thread(thread_t mach_thread, uintptr_t *teb_out, void **tr
                  miss_n, mach_thread, count, count > 0 ? (void *)ios_thread_registry[0].teb : NULL );
         }
     }
-    if (count > 0)
+    /* The fallback is the FIRST entry that still has a TEB, not literally slot
+     * 0: a slot whose TEB lived in a released guest window has been zeroed
+     * (ios_thread_registry_purge_range), and handing that 0 back would turn a
+     * missed lookup into a null TEB dereference inside the fault handler. */
+    for (int i = 0; i < count; i++)
     {
-        *teb_out = ios_thread_registry[0].teb;
-        *tramp_out = ios_thread_registry[0].trampoline;
+        if (!ios_thread_registry[i].teb) continue;
+        *teb_out = ios_thread_registry[i].teb;
+        *tramp_out = ios_thread_registry[i].trampoline;
         return 1;
     }
     *teb_out = 0;

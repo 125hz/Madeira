@@ -3907,6 +3907,80 @@ static BOOL ios_virtual_enum_display_settings( DWORD index, DEVMODEW *devmode, D
     return TRUE;
 }
 
+/* iOS-Madeira: does this device name refer to the single adapter that
+ * NtUserEnumDisplayDevices synthesizes in the virtual-monitor regime?
+ * That call hands out "\\.\DISPLAY1" for the adapter and
+ * "\\.\DISPLAY1\Monitor0" for its monitor, so both must be accepted here:
+ * an application that follows the documented
+ * EnumDisplayDevices -> EnumDisplaySettings -> ChangeDisplaySettingsEx
+ * sequence feeds exactly those strings back to us. */
+static BOOL ios_virtual_device_name( const UNICODE_STRING *name )
+{
+    static const WCHAR display1W[] = {'\\','\\','.','\\','D','I','S','P','L','A','Y','1'};
+    UINT len;
+
+    if (!name || !name->Length) return TRUE;                 /* NULL/empty = primary */
+    if (get_display_index( name ) == 1) return TRUE;         /* "\\.\DISPLAY1" */
+
+    /* "\\.\DISPLAY1\MonitorN" */
+    len = name->Length / sizeof(WCHAR);
+    if (len <= ARRAY_SIZE(display1W)) return FALSE;
+    if (wcsnicmp( name->Buffer, display1W, ARRAY_SIZE(display1W) )) return FALSE;
+    return name->Buffer[ARRAY_SIZE(display1W)] == '\\';
+}
+
+/* iOS-Madeira: NtUserChangeDisplaySettings for the virtual-monitor regime.
+ *
+ * The sources list is EMPTY here, so find_source() fails for every name --
+ * including the one this same driver advertises from
+ * NtUserEnumDisplayDevices and happily answers in
+ * NtUserEnumDisplaySettings. The result was DISP_CHANGE_BADPARAM for a mode
+ * the driver had just reported as CURRENT, which explorer logs as
+ * "Failed to initialize registry display settings" and which applications
+ * treat as a fatal video-init error (typically followed by sizing their
+ * fullscreen window from an uninitialised mode structure).
+ *
+ * The desktop size is fixed, so there is nothing to program: accept any
+ * mode the synthesized enumeration lists (that includes the current one)
+ * and report DISP_CHANGE_SUCCESSFUL. Reject a mode that is not in the list
+ * with BADMODE and an unknown device with BADPARAM -- never BADPARAM for
+ * our own device name. */
+static LONG ios_virtual_change_display_settings( UNICODE_STRING *devname, const DEVMODEW *devmode,
+                                                 DWORD flags )
+{
+    static const DWORD size_fields = DM_PELSWIDTH | DM_PELSHEIGHT;
+    DEVMODEW mode = {.dmSize = sizeof(mode)};
+    LONG ret = DISP_CHANGE_SUCCESSFUL;
+    const char *why = "no mode requested";
+    int sw, sh;
+    UINT i;
+
+    ios_screen_size( &sw, &sh );
+
+    if (!ios_virtual_device_name( devname )) ret = DISP_CHANGE_BADPARAM, why = "unknown device name";
+    else if (devmode && (devmode->dmFields & size_fields) == size_fields)
+    {
+        BOOL found = FALSE;
+
+        /* the desktop mode itself is always acceptable */
+        if ((int)devmode->dmPelsWidth == sw && (int)devmode->dmPelsHeight == sh) found = TRUE;
+        for (i = 0; !found && ios_virtual_enum_display_settings( i, &mode, 0 ); i++)
+            found = mode.dmPelsWidth == devmode->dmPelsWidth &&
+                    mode.dmPelsHeight == devmode->dmPelsHeight;
+
+        if (!found) ret = DISP_CHANGE_BADMODE, why = "mode is not in the virtual mode list";
+        else why = (flags & CDS_TEST) ? "mode supported (CDS_TEST)" : "mode accepted";
+    }
+
+    dprintf( STDERR_FILENO,
+             "[iOS ChangeDisplaySettings] virtual display %dx%d: req=%lux%lu flags=%#x -> %d (%s)\n",
+             sw, sh,
+             devmode ? (unsigned long)devmode->dmPelsWidth : 0ul,
+             devmode ? (unsigned long)devmode->dmPelsHeight : 0ul,
+             (unsigned)flags, (int)ret, why );
+    return ret;
+}
+
 static void monitor_get_interface_name( struct monitor *monitor, WCHAR *interface_name )
 {
     char buffer[MAX_PATH] = {0}, *tmp;
@@ -4623,6 +4697,18 @@ LONG WINAPI NtUserChangeDisplaySettings( UNICODE_STRING *devname, DEVMODEW *devm
                 (unsigned long)devmode->dmBitsPerPel,
                 (unsigned)devmode->dmFields);
     }
+
+#ifdef WINE_IOS
+    /* iOS-Madeira: answer for the synthesized virtual display BEFORE the
+     * source lookup. In this regime the sources list is empty, so
+     * find_source() cannot succeed for ANY name -- not even "\\.\DISPLAY1",
+     * which NtUserEnumDisplayDevices hands out and NtUserEnumDisplaySettings
+     * answers. Letting the call fall through returned DISP_CHANGE_BADPARAM
+     * for the driver's own device name (see explorer's
+     * initialize_display_settings failing for L"\\\\.\\DISPLAY1"). */
+    if (ios_virtual_monitor_active())
+        return ios_virtual_change_display_settings( devname, devmode, flags );
+#endif
 
     if ((!devname || !devname->Length) && !devmode) return apply_display_settings( NULL, NULL, hwnd, flags, lparam );
 

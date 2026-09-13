@@ -2212,16 +2212,17 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
 #ifdef WINE_IOS
         /* A genuine fallback (a non-PE main image, or one that was not found):
          * the 64-bit launcher owns this pseudo-process from here on and must not
-         * look like a WoW process, so retire its window (after the view above is
-         * gone) and drop the published guest ceiling.  The VA itself stays
-         * reserved — this process's first TEB/PEB pair lives inside the window
-         * and no thread of it is ever joined — so ios_wow_window_retire() logs
-         * exactly what is leaked. */
+         * look like a WoW process, so ABANDON its window (after the view above is
+         * gone) and drop the published guest ceiling.  Abandon, not release: this
+         * pseudo-process goes on LIVING inside the window — its first TEB/PEB
+         * pair is in there and no thread of it is ever joined — so the slot can
+         * never be handed to another 32-bit process and the VA is leaked on
+         * purpose.  ios_wow_window_retire_current() logs exactly what is lost. */
         if (ios_wow_base())
         {
-            ERR( "[wow-window] main image is not a mappable 32-bit PE (status %x) — retiring the "
+            ERR( "[wow-window] main image is not a mappable 32-bit PE (status %x) — abandoning the "
                  "guest window before booting the 64-bit launcher\n", (unsigned)status );
-            ios_wow_window_release_current();
+            ios_wow_window_retire_current();
             user_space_wow_limit = 0;
         }
 #endif

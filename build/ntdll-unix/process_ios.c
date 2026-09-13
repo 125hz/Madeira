@@ -493,8 +493,16 @@ static void *ios_child_thread_entry( void *arg )
 
     dprintf(STDERR_FILENO, "[Wine child thread] thread exiting cleanly\n");
     /* WOW64_DESIGN.md §2: the pseudo-process is over — give its guest window
-     * back to the furniture band.  Must run while this thread still resolves
-     * to that process (before the TEB TLS slot is cleared below). */
+     * back so the next 32-bit pseudo-process can adopt the slot (a launcher
+     * starting the real program is the normal shape of a 32-bit title).  Must
+     * run while this thread still resolves to that process (before the TEB TLS
+     * slot is cleared below).
+     *
+     * The ORDINARY exit already did this from process_exit_wrapper, keyed by
+     * the dying PEB; this call is the FALLBACK for a child that never got far
+     * enough to bind its window to a PEB — a boot failure, where the only way
+     * back to the slot is the owner-thread match in ios_wow_slot_current().
+     * It is a no-op once the window has been released. */
     ios_wow_window_release_current();
     free( args->argv );
     free( args );

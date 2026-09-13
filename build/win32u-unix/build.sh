@@ -105,6 +105,12 @@ for src in $WINE_SRC/dlls/win32u/*.c $WINE_SRC/dlls/win32u/dibdrv/*.c; do
             compile_one "$BUILD_DIR/message_ios.c" "message"
             continue
             ;;
+        syscall)
+            # Wraps upstream syscall.c to keep win32u's `zero_bits` global at
+            # 0 — see the header comment in syscall_ios.c.
+            compile_one "$BUILD_DIR/syscall_ios.c" "syscall"
+            continue
+            ;;
         freetype)
             # Statically-linked freetype (build/freetype-ios). The wrapper
             # re-defines HAVE_FT2BUILD_H itself; config_ios.h's #undefs win
