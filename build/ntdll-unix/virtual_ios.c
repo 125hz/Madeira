@@ -8628,7 +8628,34 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
             TRACE( "forcing exec permission on %p-%p\n", base, (char *)base + size - 1 );
         if (!mprotect( base, size, unix_prot | PROT_EXEC )) return 0;
         /* exec + write may legitimately fail, in that case fall back to write only */
+#ifdef WINE_IOS
+        /* iOS-Madeira: upstream gives up here for a read-only request, on the
+         * assumption that mprotect(READ|EXEC) failing means something is badly
+         * wrong.  On iOS it means nothing of the sort: TXM refuses PROT_EXEC on
+         * every VA outside the JIT pool, so force_exec_prot -- which only
+         * emulates a no-DEP process, switched on by load_native_dll() for any
+         * module without IMAGE_DLLCHARACTERISTICS_NX_COMPAT
+         * (wine/dlls/ntdll/loader.c:1930), i.e. effectively every i386 mingw
+         * module -- can NEVER be honoured here.  Returning -1 made every
+         * PAGE_READONLY request in such a process fail with
+         * STATUS_ACCESS_DENIED (182 of them in one 32-bit run, all protect=0x2,
+         * none in a 64-bit run, where NX_COMPAT is always set), even though the
+         * protection the caller actually asked for is applied fine by the
+         * plain mprotect below.  Nothing is lost by ignoring the "force": guest
+         * code is never executed from its own pages anyway, it is translated
+         * and run from the pool.  So fall through and apply what was asked. */
+        if (!(unix_prot & PROT_WRITE))
+        {
+            static unsigned long forceexec_n;
+
+            if (++forceexec_n <= 8 && !ios_in_mach_exc)
+                dprintf( 2, "[force-exec] PROT_EXEC unavailable on iOS; applying the requested "
+                            "protection unforced: base=%p size=0x%lx unix_prot=0x%x (#%lu)\n",
+                         base, (unsigned long)size, unix_prot, forceexec_n );
+        }
+#else
         if (!(unix_prot & PROT_WRITE)) return -1;
+#endif
     }
 
 #ifdef WINE_IOS

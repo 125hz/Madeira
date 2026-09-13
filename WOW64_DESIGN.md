@@ -179,6 +179,48 @@ game-specific patches — every change must fix the emulator/runtime generically
   `[wow-window] adopted placeholder B=0x7100000000 … guard=borrowed` then
   `[Wine child] i386 image … reserve=0x0`. Cost: 64-bit-only sessions lose
   that slot as preferred furniture space (~2.9 GB below it remains).
+- 2026-09-12 — Round with the placeholder IPA (12:14). Both runs confirm
+  `[wow-window] placeholder reserved B=0x7100000000` at session start and
+  `adopted placeholder` on the 32-bit launch (main path and child path).
+  (a) Cube from the 64-bit desktop (child path): boots through wow64.dll,
+  xtajit.dll, kernelbase; kernelbase then spawns `conhost.exe` for the
+  console-subsystem exe and ntdll's upcase table lookup faults on a NULL
+  NLS pointer in the child's ntdll .data pool copy (`[nls-probe] upcase
+  ptr: pool[x16+0x4e0]=0xdead1 PE=0x0`, host pc ntdll+0x4b67c); the
+  exception dispatch then calls through NULL in wow64.dll+0x1c2a0 and the
+  runtime terminates after 2000 redeliveries. Main-process i386 path and
+  64-bit children do not hit this. Assigned (Opus). (b) 32-bit main-process
+  launch of a real program: window bound, FEX up, loader resolves imports
+  and stops at `faultrep.DLL` / `d3dx10_35.dll` not found (stock Wine
+  DLLs never added to the i386 set). Assigned (Sonnet: extend
+  `.xtool/build-wine-i386.sh` EXTRA_DLLS with faultrep, d3dx10_33-43,
+  d3dx11_42/43, d3dcompiler_33-46 and their imports). Also observed there:
+  182× `[vmem-denied] set_vprot failed … size=0x1000 protect=0x2` inside
+  i386 images (4 KB protections vs 16 KB host pages) — under diagnosis.
+  RESOLVED (Opus): (a) root cause — the 64-bit ntdll's `loader_init`
+  calls `init_wow64()` which never returns (`Wow64LdrpInitialize`), so
+  `locale_init()` never runs in a WoW64 pseudo-process and `nls_info`
+  case tables stay NULL; the faulting routine was `upcase_unicode_to_utf8`
+  → `casemap()` while kernelbase built the `conhost.exe` path for a
+  console-subsystem child (the main-process launch never runs that path,
+  64-bit children run `locale_init` normally). Fix: `locale_init()` before
+  `init_wow64` under `_WIN64` (`ntdll/loader.c:5518`), `casemap()` falls
+  back to ASCII when the table is NULL (`locale.c:48`). The redelivery
+  storm was `Wow64PrepareForException` calling
+  `pBTCpuResetToConsistentState` unguarded before `load_cpu_dll` had bound
+  it (`wow64/syscall.c:1557`, now NULL-checked). The `[nls-probe]`
+  diagnostic is stale (assumes `adrp x16` form). (b) DLL set: 28 files
+  added (faultrep, d3dx10_33-43, d3dx11_42/43, d3dcompiler_33-41/46, and
+  the import closure d3d10_1/d3d10core/d3d11/dxgi as STOCK Wine i386 —
+  no Metal backend for those on i386 yet); farm 169 → 197, cross-import
+  check clean. (c) `[vmem-denied]` was not page-size: non-NX-compat i386
+  modules turn on `force_exec_prot`, and `mprotect_exec` returned -1 when
+  iOS refused the forced `+EXEC` without ever applying the plain
+  `PROT_READ` requested — bookkeeping said READONLY while the host page
+  stayed wider and the caller got ACCESS_DENIED. Now falls through to the
+  unforced protection on iOS (`virtual_ios.c:8625`). Expected: i386 child
+  logs `[nls-getptr] type=10/11/11` for its own PEB then `loader_init:
+  [iOS] wow64 early locale_init done`; no `[vmem-denied] … protect=0x2`.
 
 
 - 2026-09-12 — M5 direction: the user's next target is a 32-bit UE3/D3D9
