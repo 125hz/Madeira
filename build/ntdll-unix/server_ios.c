@@ -1103,6 +1103,10 @@ unsigned int server_select( const union select_op *select_op, data_size_t size, 
  * table, fixed slots, no allocation, no locks. A slot is only ever written
  * by its owning thread; the reader tolerates torn reads by re-checking seq.
  */
+/* iOS-Madeira ml940: consecutive zero-timeout (polling) waits per thread
+ * before one sched_yield is spent on them; see the end of server_wait. */
+#define IOS_SRV_YIELD_EVERY 64
+
 #define IOS_WAITREG_SLOTS 512
 struct ios_wait_entry
 {
@@ -1217,7 +1221,26 @@ unsigned int server_wait( const union select_op *select_op, data_size_t size, UI
     /* A test on Windows 2000 shows that Windows always yields during
        a wait, but a wait that is hit by an event gets a priority
        boost as well.  This seems to model that behavior the closest.  */
-    if (ret == STATUS_TIMEOUT) NtYieldExecution();
+    /* iOS-Madeira ml940: that upstream comment (unchanged from
+       wine/dlls/ntdll/unix/server.c:815 - this yield is upstream's, not a
+       Madeira anti-livelock addition) is about modelling a priority boost,
+       and nothing in Wine reads a status back from it.  A wait that timed
+       out after a real interval has already been off the CPU for that
+       interval, so the swtch_pri(0) was pure overhead on every timed-out
+       server_wait.  Only a zero-timeout wait - a poll - can be spun on, so
+       yield only for those, and only on every IOS_SRV_YIELD_EVERY'th
+       CONSECUTIVE one, which is what tells a spinner from a poll that
+       happens once per frame.  Per-thread streak, native TLS.  */
+    if (ret == STATUS_TIMEOUT)
+    {
+        static __thread unsigned int ios_poll_streak;
+
+        if (timeout && !timeout->QuadPart)
+        {
+            if (!(++ios_poll_streak % IOS_SRV_YIELD_EVERY)) NtYieldExecution();
+        }
+        else ios_poll_streak = 0;
+    }
     return ret;
 }
 

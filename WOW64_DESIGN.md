@@ -802,6 +802,56 @@ game-specific patches — every change must fix the emulator/runtime generically
   `app/Madeira/arm64ec-windows/xtajit64.dll` (`[build-id] … compiled Sep
   13 2026`). `[waiters] over60s` bar lives in `wine/dlls/ntdll/unix/sync.c:
   3832/3883` — TODO lower to 5 s and print every INF park's address.
+- 2026-09-13 — First `[prof]` run (32-bit D3D9 game, 3 min, 8-10 fps idle,
+  0.1-0.2 fps while streaming). Not CPU-bound overall (busy≈2 cores,
+  wait≈93 %); the serial main thread is: `dylib` 37-73 % = iOS filesystem
+  syscalls from Wine's path resolution (`fstatat` 17-28 %, `getattrlistat`
+  5-9 %, `__openat` 5-9 %, `read` 3-17 %, `lstat`, `listxattr`,
+  `__getdirentries64`), `swtch_pri` 10-22 % (a yield loop), `jit` 22-53 %
+  (mostly `hostPC outside block` = unattributed), `pe` 3-10 %, Metal
+  ≤0.4 %. Only 64 NtCreateFile failures in the run (all at startup) — the
+  cost is SUCCESSFUL lookups: per component `fstatat` +
+  `get_dir_case_sensitivity` (`getattrlistat` for the FSID on every call)
+  + `lstat` + `listxattr` (DOS-attribute xattr) per query. Codegen round
+  confirmed: `host_b/inst` 24→19, `cpp_dispatch` 50k→0.7-4k/s. Footprint
+  2.4 GB (pool 512, compressed 465 MB). Assigned: (a) Wine file lookup —
+  `[fs-stats]`, per-device case-sensitivity from the existing stat,
+  resolved-path cache, DOS-xattr skip flag, NtReadFile overhead (Opus,
+  `ntdll/unix/file.c`); (b) profiler v2 — JIT PC → guest RIP → module,
+  kernel-sample caller attribution, thread naming, `swtch_pri` source,
+  x87/SSE/TSO counters, emulated-D3D9-frontend share and the native-side
+  D3D9 design question (Opus, signal_arm64_ios.c + FEX).
+  (a) DONE (ml910, `ntdll/unix/file.c` only): `[fs-stats]` 4-line report
+  every 10 s (NT-level counts/µs, syscall counts, lookup depth histogram,
+  exact-vs-scan, cache hit/miss); `get_dir_case_sensitivity` memoised per
+  directory path (no syscall); resolved-name cache keyed by parent path +
+  case-folded name, validated by one `fstatat`, whole-path and
+  per-component, no negative entries; both DOS/reparse xattrs read with one
+  `listxattr` and memoised per (dev,ino,ctime); `MADEIRA_FS_NOXATTR=1`
+  A/B knob (off: xattrs from earlier runs would be missed); NtReadFile was
+  already pread-based with a cached fd (one extra lseek for the file
+  pointer). Expected: getattrlistat/getdirentries ≈0, fstatat ~2 per
+  repeat open instead of ~5 per component, listxattr ≈0 on repeats.
+  (b) DONE (ml930): FEX publishes a 64K-entry block ring (`IosProfMap.h`:
+  host range → guest RIP + per-block x87/vec/TSO counts) via a DATA export
+  `BTCpuIosProfMap` (never call PE exports from native — ml613); the
+  sampler joins samples to blocks per window, walks the PEB32 loader list
+  for the guest module map (the old x64 walk explained `guest=?`), names
+  threads by `tid=`, attributes kernel samples to the caller via x30 (+1
+  FP hop for shims), and splits a `jitdisp` bucket: the four hottest
+  "jit" PCs in l35 were INSIDE FEX's dispatcher (+0x1858..+0x20b8 = the
+  x87 F64 helpers / F80 softfloat ABI thunks) — about half the JIT bucket
+  was emulator helpers, i.e. x87 softfloat is the prime suspect (VS2005
+  msvcr80 = x87 float codegen); `X87ReducedPrecision=1` is a free A/B via
+  `Documents/madeira-fex.txt`. `swtch_pri`: the only `sched_yield` is
+  `NtYieldExecution` (`sync.c:2405`) with TWO `getrusage` around it (3
+  syscalls per yield); callers: `NtUserPeekMessage` on every empty queue
+  (`message_ios.c:3682`), `NtDelayExecution` unconditional (`sync.c:2451`),
+  timed-out `server_wait` (`server_ios.c:1220`), DXMT's `D9RecursiveSpinlock`
+  `SwitchToThread`. Assigned (Opus, small). Native-side D3D9 design written
+  up (COM shim in guest memory, native DXMT behind one unix call per API
+  call, §4/§7.5 rules) — DO NOT start until `jit by module` shows
+  `d3d9.dll` dominating. `BTCpuSuspendThread` spin got a `yield` hint.
 
 
 - 2026-09-12 — M5 direction: the user's next target is a 32-bit UE3/D3D9

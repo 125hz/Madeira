@@ -2570,6 +2570,7 @@ void ios_pool_watermarks( unsigned long long *size, unsigned long long *head,
     if (tail) *tail = (unsigned long long)ios_jit_tail_reserved;
 }
 
+
 /* Callback registered by xtajit64 (via unix_ios_push_jit_aliases unix-call)
  * so future ios_jit_add_mapping calls automatically push aliases to FEX
  * too. Without this, late-loaded DLLs (e.g. dlopen after process init)
@@ -2740,6 +2741,48 @@ static void *ios_pe_find_export( const unsigned char *base, const char *want )
     for (i = 0; i < exp->NumberOfNames; i++)
         if (!strcmp( (const char *)(base + names[i]), want ))
             return (void *)(base + funcs[ords[i]]);
+    return NULL;
+}
+
+/* ml930 [prof] SUPPORT: resolve a DATA export of the FEX CPU module.
+ *
+ * The sampler needs exactly one address out of FEX — the header of the block map
+ * it publishes (FEXCore Interface/Core/IosProfMap.h) — and it must obtain it
+ * WITHOUT calling anything.  ml613/ml614 is the standing precedent: calling a PE
+ * export of the emulator from native Mach-O code crashed every launch.  So this
+ * returns the ADDRESS of the exported variable and the caller reads through it
+ * with mach_vm_read_overwrite only.
+ *
+ * WHICH COPY. Executable PE images are copied into the JIT pool and run from
+ * there (mprotect_exec), so the LIVE globals of the module are the pool copy's,
+ * not the original image's — a PC-relative adrp in pool-resident code resolves
+ * inside the pool copy.  The pool copy is therefore tried FIRST; the PE base is
+ * tried second so this still works for a module that was never copied.  The
+ * caller validates the published magic, so picking the wrong copy is
+ * self-detecting rather than silently wrong.
+ *
+ * Read-only, allocation-free, and reached once per [prof] report window until it
+ * succeeds — never from the 200 Hz sampling loop. */
+void *ios_prof_find_fex_export( const char *name )
+{
+    int i;
+
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        const unsigned char *pe  = ios_jit_mappings[i].pe_base;
+        const unsigned char *jit = ios_jit_mappings[i].jit_base;
+        const char *nm;
+        void *addr;
+
+        if (!pe || !ios_jit_mappings[i].size) continue;
+        nm = ios_pe_module_name( ios_jit_mappings[i].pe_base, ios_jit_mappings[i].size );
+        if (!nm) continue;
+        if (!strstr( nm, "wow64fex" ) && !strstr( nm, "xtajit" ) &&
+            !strstr( nm, "arm64ecfex" )) continue;
+
+        if (jit && (addr = ios_pe_find_export( jit, name ))) return addr;
+        if ((addr = ios_pe_find_export( pe, name ))) return addr;
+    }
     return NULL;
 }
 
@@ -5887,6 +5930,53 @@ ULONG_PTR ios_wow_base(void)
 {
     struct ios_wow_window *slot = ios_wow_slot_current();
     return slot ? slot->base : 0;
+}
+
+/* ml930 [prof] SUPPORT: the RW alias of a pool address, or 0.
+ *
+ * The sampler has to set ONE enable word inside the FEX module's data, and that
+ * data may live in the module's POOL COPY, whose only mapping in the executing
+ * namespace is RX.  Writing it there is a protection fault, not a bug in the
+ * caller — RX and RW are two mach mappings of one vm object, and the RW one is
+ * where writes belong.  The caller tries the address as given first (a module
+ * that was never pool-copied has ordinary RW data) and falls back to this.
+ *
+ * Deliberately ONLY valid for the pool: this must never be able to turn an
+ * arbitrary host address into a writable one. */
+unsigned long long ios_prof_pool_rw_alias( unsigned long long addr )
+{
+    uintptr_t a  = (uintptr_t)addr;
+    uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+    uintptr_t rw = (uintptr_t)ios_jit_rw_base_global;
+    size_t ps = ios_jit_pool_size_global;
+
+    if (!ps || !rx || !rw) return 0;
+    if (a < rx || a >= rx + ps) return 0;
+    return (unsigned long long)(rw + (a - rx));
+}
+
+/* ml930 [prof] SUPPORT: B for the session's live 32-bit pseudo-process.
+ *
+ * The sampler runs on a native thread that belongs to no pseudo-process, so
+ * ios_wow_base() — which is per-CALLER — is useless to it, and there is exactly
+ * one live window per session by construction (§6, the release-on-next-adopt
+ * entry).  Dead and leaked slots are skipped on purpose: a dead window's 4 GB is
+ * PROT_NONE awaiting teardown and a leaked one belongs to a process that stopped
+ * being 32-bit, so naming a guest module out of either would be a lie.
+ *
+ * Deliberately unlocked.  ios_wow_mutex is held across window reservation and
+ * teardown, both of which can take milliseconds; a profiler must never be able to
+ * serialise against process creation.  The worst a torn read can do is yield a
+ * base that resolves no module, which the caller already reports as unresolved. */
+unsigned long long ios_prof_wow_window(void)
+{
+    unsigned i;
+
+    for (i = 0; i < ios_wow_window_count; i++)
+        if (ios_wow_windows[i].base && !ios_wow_windows[i].dead &&
+            !ios_wow_windows[i].leaked)
+            return (unsigned long long)ios_wow_windows[i].base;
+    return 0;
 }
 
 int ios_wow_in_window( const void *addr )

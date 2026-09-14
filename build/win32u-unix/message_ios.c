@@ -3460,6 +3460,56 @@ static inline LARGE_INTEGER *get_nt_timeout( LARGE_INTEGER *time, DWORD timeout 
     return time;
 }
 
+#include <time.h>   /* iOS-Madeira ml940: clock_gettime_nsec_np (commpage) */
+
+/***********************************************************************
+ *           ios_pump_yield
+ *
+ * iOS-Madeira ml940: rate limit for the empty-queue yields in the message
+ * pump.  Both call sites (wait_message's zero-timeout WAIT_TIMEOUT and
+ * NtUserPeekMessage's empty peek) are UPSTREAM Wine, byte-identical to
+ * wine/dlls/win32u/message.c:3415 and :3561 - they are NOT Madeira
+ * additions, and there is no ml note behind them.  Upstream's reason is
+ * starvation, not a wineserver livelock: a program that polls its queue in a
+ * tight loop would never leave the CPU, and the thread that would post the
+ * next message - on iOS the wineserver thread lives in this same Mach task -
+ * would not get to run.  Correctness never depended on it (Darwin preempts
+ * on its own quantum), so the yield can be thinned out; dropping it entirely
+ * would let a spinning pump hold its core against the server thread, so it
+ * is kept for genuine spinners.
+ *
+ * The [prof] sampler put libsystem_kernel`swtch_pri - Darwin's sched_yield -
+ * at 10-22 % of all CPU in every window of a 32-bit run, and a pump that
+ * polls once per frame paid one syscall per frame for a yield nobody could
+ * observe.  So: yield on every IOS_PUMP_YIELD_EVERY'th CONSECUTIVE empty
+ * poll on this thread, and never more than once per IOS_PUMP_YIELD_MIN_NS.
+ * A once-per-frame pump on an empty queue now reaches the threshold once
+ * every 64 frames instead of every frame; a real spinner still yields
+ * thousands of times a second.  Any successful peek clears the streak, so
+ * the common "drain the queue, then one empty peek, then render" loop never
+ * accumulates one at all.
+ *
+ * Per-thread state: `static __thread' is the existing idiom on this side of
+ * win32u (syscall_ios.c:86, winstation_ios.c:128) - native TLS, not the
+ * mingw TLS that is NULL on early loader paths (ml412).
+ */
+#define IOS_PUMP_YIELD_EVERY   64
+#define IOS_PUMP_YIELD_MIN_NS  200000ull    /* 200 us -> <= 5000 yields/s */
+
+static void ios_pump_yield( BOOL empty )
+{
+    static __thread unsigned int streak;
+    static __thread unsigned long long last_ns;
+    unsigned long long now;
+
+    if (!empty) { streak = 0; return; }
+    if (++streak % IOS_PUMP_YIELD_EVERY) return;
+    now = clock_gettime_nsec_np( CLOCK_MONOTONIC_RAW );
+    if (last_ns && now - last_ns < IOS_PUMP_YIELD_MIN_NS) return;
+    last_ns = now;
+    NtYieldExecution();
+}
+
 /* wait for message or signaled handle */
 static DWORD wait_message( DWORD count, const HANDLE *handles, DWORD timeout, DWORD wake_mask, DWORD changed_mask, DWORD flags )
 {
@@ -3533,7 +3583,8 @@ static DWORD wait_message( DWORD count, const HANDLE *handles, DWORD timeout, DW
         ret = WAIT_FAILED;
     }
 
-    if (ret == WAIT_TIMEOUT && !count && !timeout) NtYieldExecution();
+    /* iOS-Madeira ml940: was an unconditional NtYieldExecution() here. */
+    ios_pump_yield( ret == WAIT_TIMEOUT && !count && !timeout );
     if (ret == count - 1) get_user_thread_info()->last_driver_time = get_driver_check_time();
 
     KeUserDispatchCallback( &params.dispatch, sizeof(params), &ret_ptr, &ret_len );
@@ -3679,11 +3730,16 @@ BOOL WINAPI NtUserPeekMessage( MSG *msg_out, HWND hwnd, UINT first, UINT last, U
                 params.locks = *(DWORD *)ret_ptr;
                 params.restore = TRUE;
             }
-            NtYieldExecution();
+            /* iOS-Madeira ml940: was an unconditional NtYieldExecution().
+             * Once per empty peek is once per message-pump iteration; see
+             * ios_pump_yield above for why it is thinned and not removed. */
+            ios_pump_yield( TRUE );
             KeUserDispatchCallback( &params.dispatch, sizeof(params), &ret_ptr, &ret_len );
         }
         return FALSE;
     }
+
+    ios_pump_yield( FALSE );    /* ml940: a real message - this thread is not spinning */
 
     check_for_driver_events();
 

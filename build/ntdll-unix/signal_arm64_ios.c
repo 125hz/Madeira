@@ -12169,6 +12169,12 @@ extern void ios_pool_watermarks( unsigned long long *size, unsigned long long *h
 
 enum {
     PRB_JIT = 0,    /* FEX-generated ARM64 in the pool tail (EC_CODE buffers) */
+    PRB_JITDISP,    /* ml930: FEX's 16 KB dispatcher buffer -- NOT guest code.
+                     * Split out because the l35 log's four hottest "jit" PCs
+                     * (+0x1858, +0x1904, +0x200c, +0x20b8 of a buffer whose
+                     * published extent was [0x13ef74000,0x13ef7645c)) were all
+                     * inside it, i.e. up to 27 % of CPU was attributed to guest
+                     * code while actually sitting in an emulator helper. */
     PRB_FEXRT,      /* the FEX runtime's own PE pool copy (xtajit/arm64ecfex)  */
     PRB_PE,         /* any other Wine PE pool copy (broken out per module)     */
     PRB_POOLHOLE,   /* pool head, no live mapping: anon-RWX carve or freelist  */
@@ -12182,12 +12188,16 @@ enum {
     PRB_MAX
 };
 static const char * const ios_prb_name[PRB_MAX] = {
-    "jit", "fexrt", "pe", "poolhole", "unix", "mach", "metal",
+    "jit", "jitdisp", "fexrt", "pe", "poolhole", "unix", "mach", "metal",
     "dylib", "guest", "fexhost", "other"
 };
 
 #define IOS_PROFIMG_MAX  768
-struct ios_profimg_ent { uint64_t lo, hi; unsigned char cls; char name[40]; };
+/* ml930: `opaque` marks the images a RETURN ADDRESS may never be attributed to —
+ * the syscall shims and thread primitives.  A sample at fstatat+0x8 has LR in
+ * libsystem_kernel's own sched_yield/_open wrapper, not in the caller we want, so
+ * the caller walk keeps hopping while `opaque` is set. */
+struct ios_profimg_ent { uint64_t lo, hi; unsigned char cls, opaque; char name[40]; };
 static struct ios_profimg_ent ios_profimg[IOS_PROFIMG_MAX];
 static int ios_profimg_n;
 static uint32_t ios_profimg_built_for;      /* _dyld_image_count when last built */
@@ -12249,6 +12259,9 @@ static void ios_prof_build_images(void)
         else if (strstr( bn, "libsystem_kernel" ))            ios_profimg[k].cls = PRB_DYLIB;
         else if (ios_prof_name_is_metal( bn ))                ios_profimg[k].cls = PRB_METAL;
         else                                                  ios_profimg[k].cls = PRB_DYLIB;
+        ios_profimg[k].opaque = (strstr( bn, "libsystem_kernel" ) ||
+                                 strstr( bn, "libsystem_pthread" ) ||
+                                 strstr( bn, "libsystem_platform" )) ? 1 : 0;
         k++;
     }
     /* insertion sort by lo -- k is a few hundred and this runs once */
@@ -12281,14 +12294,352 @@ static int ios_prof_image_for( uint64_t pc, const char **name, uint64_t *base )
     return -1;
 }
 
+/* 1 = a PC in this image can never be the CALLER we are looking for. */
+static int ios_prof_image_opaque( uint64_t pc )
+{
+    int lo = 0, hi = ios_profimg_n - 1;
+    while (lo <= hi)
+    {
+        int mid = (lo + hi) / 2;
+        if (pc < ios_profimg[mid].lo) hi = mid - 1;
+        else if (pc >= ios_profimg[mid].hi) lo = mid + 1;
+        else return ios_profimg[mid].opaque;
+    }
+    return 0;
+}
+
+/* ============================================================================
+ * ml930  ATTRIBUTION: JIT -> GUEST MODULE, AND KERNEL -> CALLER
+ *
+ * ml901 answered "which REGION is the machine in" and the l35 device log then
+ * asked the two questions it could not answer:
+ *
+ *   (1) 22-53 % of CPU was `jit`, and NEARLY EVERY JIT SAMPLE printed
+ *       "guest=? (hostPC outside block)".  The old resolver needs a BLOCK BEGIN
+ *       and the only source was State.InlineJITBlockHeader (x28+0) of the sampled
+ *       thread -- the block that thread ENTERED, which is not where it is when it
+ *       is in the dispatcher, in a dispatcher helper, in an interpreter fallback
+ *       thunk, or when thread_get_state() returned a stale frame.  So the single
+ *       largest CPU bucket in the log had NO owner: it could have been the app's
+ *       own code, the emulated D3D9 frontend, or Wine's i386 DLLs, and those
+ *       three imply completely different next steps.
+ *
+ *   (2) 37-73 % of CPU was `dylib`, essentially all of it libsystem_kernel, and a
+ *       syscall name alone ("fstatat 24 %", "swtch_pri 17-22 %") names the
+ *       SYMPTOM.  Who called it is the fix.
+ *
+ * Both are solved by reading, never by calling.  FEX publishes a block map
+ * (FEXCore Interface/Core/IosProfMap.h) whose header address comes out of one
+ * DATA export; the caller of a kernel sample comes out of the register state we
+ * already fetched (LR at a syscall stub is still the caller -- Darwin syscall
+ * stubs build no frame) with one bounded frame-pointer hop when LR is itself
+ * inside libsystem_kernel.
+ *
+ * COST DISCIPLINE.  The 200 Hz loop gains: one compare against the dispatcher
+ * range, one store of LR/FP, and at most ONE extra mach_vm_read_overwrite (16
+ * bytes) per KERNEL sample whose LR is unhelpful.  Everything expensive --
+ * streaming the block ring, the guest module map, dladdr, sorting -- happens once
+ * per report window.  The self-measured cost line is still the contract.
+ * ==========================================================================*/
+
+/* Byte-for-byte mirror of FEXCore::IosProfMap::Block. */
+struct ios_profblk
+{
+    unsigned long long host_start;
+    unsigned int       host_size;
+    unsigned int       guest_rip;
+    unsigned short     n_inst, n_x87, n_vec, n_tso;
+};
+
+/* Byte-for-byte mirror of FEXCore::IosProfMap::Header.  std::atomic<uintN_t> is
+ * layout-compatible with uintN_t, which is what makes this legal to mirror in C.
+ * If either side changes, the magic/version check below is what catches it. */
+#define IOS_PROFMAP_MAGIC    0x314d5049u
+#define IOS_PROFMAP_VERSION  1u
+#define IOS_PROFMAP_DISPMAX  64
+
+struct ios_profmap_disp { unsigned long long begin; char name[24]; };
+
+struct ios_profmap_hdr
+{
+    unsigned int       magic, version, entry_size, capacity;
+    unsigned int       enable, bitness;
+    unsigned long long head;
+    unsigned long long entries;
+    unsigned long long guest_base;
+    unsigned long long disp_begin, disp_end;
+    unsigned int       n_disp, _pad0;
+    unsigned long long x87_ops, vec_ops, atomic_ops, tso_ops;
+    unsigned long long guest_insts, host_bytes, blocks, alloc_failed;
+    struct ios_profmap_disp disp[IOS_PROFMAP_DISPMAX];
+};
+
+static unsigned long long ios_profmap_addr;     /* host address of the header */
+static struct ios_profmap_hdr ios_profmap;      /* snapshot, refreshed per window */
+static int ios_profmap_live;
+static int ios_profmap_announced;
+
+/* virtual_ios.c, [prof] support (both are read-only and allocation-free). */
+extern void *ios_prof_find_fex_export( const char *name );
+extern unsigned long long ios_prof_wow_window(void);
+
+static int ios_prof_read( unsigned long long addr, void *buf, size_t len )
+{
+    mach_vm_size_t got = 0;
+    if (!addr) return 0;
+    return mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)addr, len,
+                                   (mach_vm_address_t)buf, &got ) == KERN_SUCCESS && got == len;
+}
+
+/* Attach to FEX's published map, and ASK IT TO RECORD.
+ *
+ * The enable byte is the whole handshake: FEX allocates the 1.5 MB ring only
+ * after it sees this, so a run with MADEIRA_PROF=0 -- or one where this export
+ * never resolves -- costs FEX one relaxed load per compile and zero bytes.
+ * Retried every report window until it succeeds, never latched on failure (the
+ * ml612 rule: a module that is not mapped yet must not disable a facility for the
+ * lifetime of the process). */
+static void ios_profmap_attach(void)
+{
+    unsigned long long hdr_addr = 0;
+    struct ios_profmap_hdr h;
+    void *slot;
+
+    if (ios_profmap_live) return;
+    if (!(slot = ios_prof_find_fex_export( "BTCpuIosProfMap" ))) return;
+    if (!ios_prof_read( (unsigned long long)(uintptr_t)slot, &hdr_addr, sizeof(hdr_addr) )) return;
+    if (!hdr_addr) return;
+    if (!ios_prof_read( hdr_addr, &h, sizeof(h) )) return;
+    if (h.magic != IOS_PROFMAP_MAGIC || h.version != IOS_PROFMAP_VERSION ||
+        h.entry_size != sizeof(struct ios_profblk))
+    {
+        if (!ios_profmap_announced++)
+            fprintf(stderr, "[prof] ml930 block map REJECTED at 0x%llx: magic=%08x version=%u "
+                            "entry=%u (want %08x/%u/%u) — the FEX side and this side disagree\n",
+                    hdr_addr, h.magic, h.version, h.entry_size,
+                    IOS_PROFMAP_MAGIC, IOS_PROFMAP_VERSION, (unsigned)sizeof(struct ios_profblk));
+        return;
+    }
+
+    ios_profmap_addr = hdr_addr;
+    ios_profmap = h;
+    ios_profmap_live = 1;
+
+    /* Ask for recording: ONE word, and never a store through a raw pointer.
+     *
+     * The header lives in the CPU module's data, and for a pool-copied module
+     * that data's only mapping in the executing namespace is RX -- storing there
+     * is a protection fault, not a bug.  RX and RW are two mappings of one vm
+     * object, so the fallback writes the same word through the pool's RW alias.
+     * The result is verified by reading `enable` back, and the outcome is logged
+     * either way: an enable that did not stick would otherwise look exactly like
+     * "FEX compiled nothing", which is the kind of silent nothing this whole
+     * round exists to stop producing. */
+    {
+        extern unsigned long long ios_prof_pool_rw_alias( unsigned long long addr );
+        unsigned long long slot_addr = hdr_addr + offsetof(struct ios_profmap_hdr, enable);
+        unsigned int one = 1, back = 0;
+        int ok;
+
+        mach_vm_write( mach_task_self(), (mach_vm_address_t)slot_addr,
+                       (vm_offset_t)&one, sizeof(one) );
+        ok = ios_prof_read( slot_addr, &back, sizeof(back) ) && back == 1;
+        if (!ok)
+        {
+            unsigned long long rw = ios_prof_pool_rw_alias( slot_addr );
+            if (rw)
+            {
+                mach_vm_write( mach_task_self(), (mach_vm_address_t)rw,
+                               (vm_offset_t)&one, sizeof(one) );
+                ok = ios_prof_read( slot_addr, &back, sizeof(back) ) && back == 1;
+            }
+        }
+        fprintf(stderr, "[prof] ml930 block map ATTACHED hdr=0x%llx B=0x%llx bitness=%u "
+                        "dispatcher=[0x%llx,0x%llx) regions=%u — enable=%s\n",
+                hdr_addr, ios_profmap.guest_base, ios_profmap.bitness,
+                ios_profmap.disp_begin, ios_profmap.disp_end, ios_profmap.n_disp,
+                ok ? "SET (FEX will record)" : "REFUSED — JIT samples stay unattributed");
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * 32-BIT GUEST MODULE MAP
+ *
+ * ml689's map walks the x64 TEB->PEB->Ldr, so under WoW64 it enumerates the
+ * 64-BIT loader list (ntdll, wow64, the CPU module) at HOST addresses.  A 32-bit
+ * guest RIP is a GUEST address below 4 GB (§2/§3 invariant 1) and matched nothing
+ * in it -- which is the second half of why the log printed "guest=?" even on the
+ * samples the RIP decoder did resolve.
+ *
+ * Two independent sources, in this order:
+ *   1. PEB32->LdrData, the real loader list: correct names for every module,
+ *      including the main image.
+ *   2. A bounded MZ probe backwards from an unresolved RIP.  Windows images are
+ *      64 KB-aligned, so this needs nothing but B, and it is what keeps the
+ *      attribution working when the loader list is not reachable (an early
+ *      sample, a child whose PEB32 the session global does not point at).
+ * Every read goes through mach_vm_read_overwrite: a module unmapping underneath
+ * the sampler must not be able to fault it.
+ * ------------------------------------------------------------------------- */
+#define IOS_GMOD32_MAX 160
+static struct { unsigned long long base, size; char name[40]; } ios_gmod32[IOS_GMOD32_MAX];
+static int ios_gmod32_count;
+static int ios_gmod32_from_ldr;
+static unsigned long long ios_gmod32_imagebase;
+
+static void ios_gmod32_add( unsigned long long base, unsigned long long size, const char *name )
+{
+    int i;
+    if (!base || !size || size > (512u << 20)) return;
+    for (i = 0; i < ios_gmod32_count; i++) if (ios_gmod32[i].base == base) return;
+    if (ios_gmod32_count >= IOS_GMOD32_MAX) return;
+    ios_gmod32[ios_gmod32_count].base = base;
+    ios_gmod32[ios_gmod32_count].size = size;
+    {
+        size_t l = strlen( name );
+        if (l > sizeof(ios_gmod32[0].name) - 1) l = sizeof(ios_gmod32[0].name) - 1;
+        memcpy( ios_gmod32[ios_gmod32_count].name, name, l );   /* wine poisons strncpy */
+        ios_gmod32[ios_gmod32_count].name[l] = 0;
+    }
+    ios_gmod32_count++;
+}
+
+static void ios_gmod32_build( unsigned long long B )
+{
+    unsigned int ldr = 0, head32, cur32;
+    unsigned long long peb32_host;
+    int guard = 0;
+
+    if (!B || ios_gmod32_from_ldr) return;
+    if (!wow_peb) return;
+    peb32_host = (unsigned long long)(uintptr_t)wow_peb;
+
+    ios_gmod32_imagebase = 0;
+    ios_prof_read( peb32_host + 0x08, &ios_gmod32_imagebase, 4 );   /* PEB32.ImageBaseAddress */
+    if (!ios_prof_read( peb32_host + 0x0c, &ldr, 4 ) || !ldr) return;
+
+    head32 = ldr + 0x0c;                       /* PEB_LDR_DATA32.InLoadOrderModuleList */
+    if (!ios_prof_read( B + head32, &cur32, 4 )) return;
+
+    while (cur32 && cur32 != head32 && guard++ < IOS_GMOD32_MAX)
+    {
+        unsigned int dllbase = 0, imgsize = 0, nbuf = 0, next = 0;
+        unsigned short nlen = 0;
+        char nm[40];
+        unsigned k, n;
+
+        /* LDR_DATA_TABLE_ENTRY32: DllBase +0x18, SizeOfImage +0x20,
+         * BaseDllName UNICODE_STRING32 +0x2c (Length +0x2c, Buffer +0x30). */
+        if (!ios_prof_read( B + cur32 + 0x18, &dllbase, 4 )) break;
+        if (!ios_prof_read( B + cur32 + 0x20, &imgsize, 4 )) break;
+        ios_prof_read( B + cur32 + 0x2c, &nlen, 2 );
+        ios_prof_read( B + cur32 + 0x30, &nbuf, 4 );
+
+        memset( nm, 0, sizeof(nm) );
+        n = nlen / 2;
+        if (n > sizeof(nm) - 1) n = sizeof(nm) - 1;
+        for (k = 0; k < n && nbuf; k++)
+        {
+            unsigned short wc = 0;
+            if (!ios_prof_read( B + nbuf + k * 2, &wc, 2 )) break;
+            nm[k] = (wc < 0x80) ? (char)wc : '?';
+        }
+        if (dllbase && imgsize) ios_gmod32_add( dllbase, imgsize, nm[0] ? nm : "?" );
+
+        if (!ios_prof_read( B + cur32, &next, 4 )) break;
+        cur32 = next;
+    }
+
+    if (ios_gmod32_count)
+    {
+        ios_gmod32_from_ldr = 1;
+        fprintf(stderr, "[prof] ml930 guest32 modmap: %d modules from PEB32->Ldr (B=0x%llx, "
+                        "image base 0x%llx)\n", ios_gmod32_count, B, ios_gmod32_imagebase);
+    }
+}
+
+/* Bounded MZ probe: 64 KB steps backwards, at most 32 MB.  Report cadence only. */
+static void ios_gmod32_probe( unsigned long long B, unsigned long long rip )
+{
+    unsigned long long cand = rip & ~0xffffULL;
+    int steps;
+
+    for (steps = 0; steps < 512 && cand; steps++, cand -= 0x10000ULL)
+    {
+        unsigned char mz[2];
+        unsigned int lfanew = 0, sig = 0, imgsize = 0;
+
+        if (!ios_prof_read( B + cand, mz, 2 )) continue;
+        if (mz[0] != 'M' || mz[1] != 'Z') continue;
+        if (!ios_prof_read( B + cand + 0x3c, &lfanew, 4 ) || !lfanew || lfanew > 0x1000) continue;
+        if (!ios_prof_read( B + cand + lfanew, &sig, 4 ) || sig != 0x00004550) continue;
+        /* IMAGE_NT_HEADERS32.OptionalHeader.SizeOfImage = +0x18 + 0x38 */
+        if (!ios_prof_read( B + cand + lfanew + 0x50, &imgsize, 4 ) || !imgsize) continue;
+        if (rip >= cand + imgsize) return;      /* a real image, but not this RIP's */
+        ios_gmod32_add( cand, imgsize,
+                        (cand == ios_gmod32_imagebase) ? "(main image)"
+                                                       : ios_pe_module_name( B + cand ) );
+        return;
+    }
+}
+
+/* Index into ios_gmod32, or -1.  One MZ probe is attempted on the first miss, so
+ * a module that is not in the loader list still gets named the first time a
+ * sample lands in it and costs nothing on every later lookup. */
+static int ios_guest32_module_idx( unsigned long long B, unsigned long long rip )
+{
+    int i;
+    for (i = 0; i < 2; i++)
+    {
+        int m;
+        for (m = 0; m < ios_gmod32_count; m++)
+            if (rip >= ios_gmod32[m].base && rip < ios_gmod32[m].base + ios_gmod32[m].size)
+                return m;
+        if (i == 0 && B) ios_gmod32_probe( B, rip );
+    }
+    return -1;
+}
+
+static const char *ios_guest32_module_for( unsigned long long B, unsigned long long rip,
+                                           unsigned long long *rva )
+{
+    int m = ios_guest32_module_idx( B, rip );
+    if (m < 0) { if (rva) *rva = rip; return NULL; }
+    if (rva) *rva = rip - ios_gmod32[m].base;
+    return ios_gmod32[m].name;
+}
+
+/* Name of the dispatcher region containing `pc`, and the offset inside it.
+ * Regions are published in EMISSION order, i.e. ascending, so the last one whose
+ * start is <= pc is the owner. */
+static const char *ios_prof_disp_region( uint64_t pc, unsigned long long *off )
+{
+    int i, best = -1;
+    if (!ios_profmap_live || pc < ios_profmap.disp_begin || pc >= ios_profmap.disp_end) return NULL;
+    for (i = 0; i < (int)ios_profmap.n_disp && i < IOS_PROFMAP_DISPMAX; i++)
+        if (ios_profmap.disp[i].begin && ios_profmap.disp[i].begin <= pc &&
+            (best < 0 || ios_profmap.disp[i].begin > ios_profmap.disp[best].begin))
+            best = i;
+    if (best < 0) return NULL;
+    if (off) *off = pc - ios_profmap.disp[best].begin;
+    return ios_profmap.disp[best].name;
+}
+
 #define IOS_PROF_TH_MAX   256
 #define IOS_PROF_PE_MAX    64
-#define IOS_PROF_PC_MAX   512
+/* ml930: 512 was far too small once JIT samples stopped collapsing into one
+ * "unresolved" line -- a 10 s window holds ~2 k running JIT samples spread over
+ * hundreds of distinct PCs, and a full table silently DROPS the tail, which is
+ * exactly the long tail a module histogram is made of.  4096 x 40 B = 160 KB. */
+#define IOS_PROF_PC_MAX  4096
+#define IOS_PROF_KC_MAX   512
 
 static thread_t ios_prof_port[IOS_PROF_TH_MAX];
 static char     ios_prof_tname[IOS_PROF_TH_MAX][32];
 static unsigned char ios_prof_trole[IOS_PROF_TH_MAX];    /* 1 = mach exc handler */
 static unsigned long ios_prof_trun[IOS_PROF_TH_MAX];
+static unsigned long ios_prof_tjit[IOS_PROF_TH_MAX];     /* ml930: JIT samples */
+static unsigned long long ios_prof_ttid[IOS_PROF_TH_MAX];/* ml930: Wine thread id */
 static int      ios_prof_nth;
 
 static void ios_prof_release_ports(void)
@@ -12309,6 +12660,7 @@ static void ios_prof_refresh_threads( thread_t self )
 
     ios_prof_release_ports();
     memset( ios_prof_trun, 0, sizeof(ios_prof_trun) );
+    memset( ios_prof_tjit, 0, sizeof(ios_prof_tjit) );
     if (task_threads( mach_task_self(), &th, &cnt ) != KERN_SUCCESS) return;
     for (i = 0; i < cnt; i++)
     {
@@ -12319,9 +12671,34 @@ static void ios_prof_refresh_threads( thread_t self )
         }
         ios_prof_port[k] = th[i];                 /* keep the send right */
         ios_prof_tname[k][0] = 0;
+        ios_prof_ttid[k] = 0;
         {
             pthread_t pt = pthread_from_mach_thread_np( th[i] );
             if (pt) pthread_getname_np( pt, ios_prof_tname[k], sizeof(ios_prof_tname[k]) );
+        }
+        /* ml930: NAME THE UNNAMED THREADS.
+         *
+         * In the l35 log every interesting thread printed "(unnamed)" -- one of
+         * them holding 87 % of busy time -- because pthread names are only set by
+         * the native side and a Wine/guest thread never gets one.  Every Wine
+         * thread does have an identity though: x18 is the TEB (that is the whole
+         * point of the wine-x18 ABI) and TEB->ClientId.UniqueThread at +0x48 is
+         * the thread id every other subsystem in the log already prints
+         * ([alert-storm] tid=00c0, the "E 24 " log prefix, [fex-stats] per-thread
+         * lines).  Read ONCE per report window, not in the sampling loop.
+         *
+         * thread_get_state here is safe and cheap at this cadence; x18 is
+         * callee-saved and valid whether the thread runs or waits. */
+        {
+            arm_thread_state64_t st0;
+            mach_msg_type_number_t sc0 = ARM_THREAD_STATE64_COUNT;
+            if (thread_get_state( th[i], ARM_THREAD_STATE64, (thread_state_t)&st0, &sc0 ) == KERN_SUCCESS &&
+                st0.__x[18] > 0x10000)
+            {
+                unsigned long long tid = 0;
+                if (ios_prof_read( st0.__x[18] + 0x48, &tid, 8 ) && tid && tid < 0x10000)
+                    ios_prof_ttid[k] = tid;
+            }
         }
         ios_prof_trole[k] = strstr( ios_prof_tname[k], "wine-x18-exc" ) ? 1 : 0;
         k++;
@@ -12340,11 +12717,22 @@ static uint64_t ios_prof_self_cpu_us( thread_t self )
            (uint64_t)bi.system_time.seconds * 1000000 + bi.system_time.microseconds;
 }
 
+/* ml930: moved out of ios_prof_thread's frame. 4096 PC slots plus 512 kernel-
+ * caller slots is ~180 KB, which is not a stack. */
+static struct { uint64_t pc, x28; unsigned long n; unsigned char cls; } ios_prof_hot[IOS_PROF_PC_MAX];
+static struct { uint64_t kpc, cpc; unsigned long n; } ios_prof_kc[IOS_PROF_KC_MAX];
+/* Sorted scratch for the one-pass block-ring scan; indices into ios_prof_hot.
+ * ios_prof_nsort is reset with the window so the top-PC printer can never pick
+ * up last window's resolution for a recycled slot. */
+struct ios_prof_pcsort { uint64_t pc; int slot; };
+static struct ios_prof_pcsort ios_prof_sorted[IOS_PROF_PC_MAX];
+static struct { uint64_t rip; unsigned long n; unsigned x87; } ios_prof_jitpc[IOS_PROF_PC_MAX];
+static int ios_prof_nsort;
+
 static void *ios_prof_thread( void *arg )
 {
     unsigned long bucket[PRB_MAX];
     struct { uint64_t pe_base; unsigned long n; } pe[IOS_PROF_PE_MAX];
-    struct { uint64_t pc, x28; unsigned long n; unsigned char cls; } hot[IOS_PROF_PC_MAX];
     int period_ms = 5, report_s = 10, npe = 0, backed_off = 0;
     thread_t self = mach_thread_self();
     unsigned long samples = 0, obs = 0, run_obs = 0, wait_obs = 0, dead = 0;
@@ -12373,13 +12761,14 @@ static void *ios_prof_thread( void *arg )
             }
         }
     }
-    fprintf(stderr, "[prof] ml901 armed: period=%dms report=%ds "
+    fprintf(stderr, "[prof] ml930 armed: period=%dms report=%ds "
                     "(knob Documents/madeira-prof.txt -> MADEIRA_PROF=\"period_ms[,report_s]\", 0=off)\n",
             period_ms, report_s);
 
     memset( bucket, 0, sizeof(bucket) );
     memset( pe, 0, sizeof(pe) );
-    memset( hot, 0, sizeof(hot) );
+    memset( ios_prof_hot, 0, sizeof(ios_prof_hot) );
+    memset( ios_prof_kc, 0, sizeof(ios_prof_kc) );
     ios_prof_build_images();
     ios_prof_refresh_threads( self );
     gettimeofday( &t0, NULL );
@@ -12422,7 +12811,16 @@ static void *ios_prof_thread( void *arg )
 
             switch (ios_pool_classify_pc( pc, &mi, &peb, &rva ))
             {
-            case IOS_POOLPC_JIT:  cls = PRB_JIT;      break;
+            case IOS_POOLPC_JIT:
+                /* ml930: the dispatcher lives in the pool tail too, so it used to
+                 * be counted as guest code.  One compare against the published
+                 * extent separates "the guest's own translated code" from "an
+                 * emulator helper", which are two different bills. */
+                cls = (ios_profmap_live && ios_profmap.disp_end &&
+                       pc >= ios_profmap.disp_begin && pc < ios_profmap.disp_end)
+                      ? PRB_JITDISP : PRB_JIT;
+                if (cls == PRB_JIT) ios_prof_tjit[i]++;
+                break;
             case IOS_POOLPC_HOLE: cls = PRB_POOLHOLE; break;
             case IOS_POOLPC_PE:
                 cls = PRB_PE;
@@ -12451,12 +12849,61 @@ static void *ios_prof_thread( void *arg )
             h = (int)((pc >> 2) % IOS_PROF_PC_MAX);
             {
                 int probe;
-                for (probe = 0; probe < 8; probe++)
+                for (probe = 0; probe < 16; probe++)
                 {
                     int s = (h + probe) % IOS_PROF_PC_MAX;
-                    if (!hot[s].n) { hot[s].pc = pc; hot[s].x28 = st.__x[28];
-                                     hot[s].cls = (unsigned char)cls; hot[s].n = 1; break; }
-                    if (hot[s].pc == pc) { hot[s].n++; break; }
+                    if (!ios_prof_hot[s].n) { ios_prof_hot[s].pc = pc; ios_prof_hot[s].x28 = st.__x[28];
+                                              ios_prof_hot[s].cls = (unsigned char)cls;
+                                              ios_prof_hot[s].n = 1; break; }
+                    if (ios_prof_hot[s].pc == pc) { ios_prof_hot[s].n++; break; }
+                }
+            }
+
+            /* ml930: ATTRIBUTE THE KERNEL SAMPLE TO ITS CALLER.
+             *
+             * A Darwin syscall stub is `mov x16,#n / svc #0x80 / b.lo ...` — it
+             * builds no frame and clobbers no LR, so at the sampled PC (always
+             * stub+0x8, which is why every kernel line in the log reads "+0x8")
+             * x30 STILL HOLDS THE CALLER.  That is free: we already have the
+             * register state.  When the immediate caller is itself a
+             * libsystem_kernel/pthread/platform wrapper — sched_yield calling
+             * swtch_pri is exactly this shape — take ONE frame-pointer hop, which
+             * costs a single 16-byte read and only on those samples.
+             *
+             * Bounded to two hops on purpose: an unbounded unwinder in a sampler
+             * is how a profiler becomes the thing it measures, and two hops is
+             * enough to cross any libsystem shim into OUR code. */
+            if (cls == PRB_DYLIB || cls == PRB_METAL)
+            {
+                uint64_t caller = st.__lr, fp = st.__fp;
+                int hop;
+                for (hop = 0; hop < 2; hop++)
+                {
+                    if (caller > 0x10000 && !ios_prof_image_opaque( caller )) break;
+                    if (fp <= 0x10000) break;
+                    {
+                        uint64_t frame[2];
+                        if (!ios_prof_read( fp, frame, sizeof(frame) )) break;
+                        fp = frame[0];
+                        caller = frame[1];
+                    }
+                }
+                /* Only record a caller we can NAME. A frame walked out of a
+                 * running thread can be mid-construction, and on a ptrauth build
+                 * x30 carries a signature, so an unnameable address is noise, not
+                 * a data point — drop it rather than print a hex number that
+                 * looks like a finding. */
+                if (caller > 0x10000 && ios_prof_image_for( caller, NULL, NULL ) >= 0)
+                {
+                    int kh = (int)(((pc >> 2) ^ (caller >> 2)) % IOS_PROF_KC_MAX), probe;
+                    for (probe = 0; probe < 8; probe++)
+                    {
+                        int s = (kh + probe) % IOS_PROF_KC_MAX;
+                        if (!ios_prof_kc[s].n) { ios_prof_kc[s].kpc = pc; ios_prof_kc[s].cpc = caller;
+                                                 ios_prof_kc[s].n = 1; break; }
+                        if (ios_prof_kc[s].kpc == pc && ios_prof_kc[s].cpc == caller)
+                        { ios_prof_kc[s].n++; break; }
+                    }
                 }
             }
         }
@@ -12496,7 +12943,7 @@ static void *ios_prof_thread( void *arg )
             for (c = 0; c < PRB_MAX; c++) cpu_obs += bucket[c];
             ios_pool_watermarks( &psz, &phead, &ptail );
 
-            fprintf(stderr, "[prof] ml901 %.1fs samples=%lu threads=%d obs=%lu busy=%.2f cores "
+            fprintf(stderr, "[prof] ml930 %.1fs samples=%lu threads=%d obs=%lu busy=%.2f cores "
                             "wait=%.1f%% dead=%lu cost=%.2f%%/core period=%dms "
                             "pool=%lluMB head=0x%llx tail=0x%llx\n",
                     elapsed_us / 1e6, samples, ios_prof_nth, obs,
@@ -12518,6 +12965,234 @@ static void *ios_prof_thread( void *arg )
                     if (len >= (int)sizeof(line) - 24) break;
                 }
                 fprintf(stderr, "[prof]   cpu%%:%s\n", line);
+            }
+
+            /* ======================================================= ml930
+             * WHO OWNS THE JIT TIME.
+             *
+             * Everything here runs ONCE per report window, never in the 200 Hz
+             * loop.  The ring is streamed in 256-entry chunks (one
+             * mach_vm_read_overwrite each, ~256 traps for a full 64 K ring) and
+             * the distinct JIT PCs of the window are sorted once, so the join is
+             * O(entries * log pcs) instead of a per-sample binary search over
+             * FEX's tables -- which at 200 Hz would have been the profiler
+             * becoming the problem it measures.
+             *
+             * The ring is NOT assumed sorted (blocks are claimed with an atomic
+             * fetch_add from several compiling threads), and a recycled host
+             * range can legitimately match two entries, so the YOUNGEST match
+             * wins: `age` is the distance back from Head, 0 = most recent. */
+            ios_profmap_attach();
+            /* Refresh the snapshot UNCONDITIONALLY. The dispatcher's extent is
+             * published by EmitDispatcher, which runs after BTCpuProcessInit —
+             * so at attach time it is still zero, and a refresh that only
+             * happened when there were JIT samples would leave the `jitdisp`
+             * split permanently off in exactly the windows it matters. */
+            if (ios_profmap_live)
+            {
+                struct ios_profmap_hdr h0;
+                if (ios_prof_read( ios_profmap_addr, &h0, sizeof(h0) )) ios_profmap = h0;
+            }
+            if (ios_profmap_live && bucket[PRB_JIT])
+            {
+                unsigned long long B;
+                int s, k;
+                unsigned long jit_resolved = 0, jit_x87 = 0;
+                unsigned long modn[IOS_GMOD32_MAX];
+                static unsigned long long prev_x87, prev_vec, prev_atom, prev_tso,
+                                          prev_blocks, prev_insts;
+
+                B = ios_profmap.guest_base;
+                if (!B) B = ios_prof_wow_window();
+                ios_gmod32_build( B );
+                memset( modn, 0, sizeof(modn) );
+
+                for (s = 0; s < IOS_PROF_PC_MAX; s++)
+                    if (ios_prof_hot[s].n && ios_prof_hot[s].cls == PRB_JIT &&
+                        ios_prof_nsort < IOS_PROF_PC_MAX)
+                    {
+                        ios_prof_sorted[ios_prof_nsort].pc = ios_prof_hot[s].pc;
+                        ios_prof_sorted[ios_prof_nsort].slot = s;
+                        ios_prof_jitpc[ios_prof_nsort].rip = 0;
+                        ios_prof_jitpc[ios_prof_nsort].n = ~0UL;
+                        ios_prof_jitpc[ios_prof_nsort].x87 = 0;
+                        ios_prof_nsort++;
+                    }
+                /* Shell sort: this reaches a couple of thousand entries and an
+                 * insertion sort there is ~4 M compares every 10 s for no reason. */
+                for (k = ios_prof_nsort / 2; k > 0; k /= 2)
+                    for (s = k; s < ios_prof_nsort; s++)
+                    {
+                        int j2;
+                        struct ios_prof_pcsort t = ios_prof_sorted[s];
+                        for (j2 = s; j2 >= k && ios_prof_sorted[j2 - k].pc > t.pc; j2 -= k)
+                            ios_prof_sorted[j2] = ios_prof_sorted[j2 - k];
+                        ios_prof_sorted[j2] = t;
+                    }
+
+                if (ios_prof_nsort && ios_profmap.entries && ios_profmap.capacity)
+                {
+                    struct ios_profblk buf[256];
+                    unsigned long long head = ios_profmap.head;
+                    unsigned int cap = ios_profmap.capacity;
+                    unsigned int total = (head < (unsigned long long)cap) ? (unsigned int)head : cap;
+                    unsigned int off;
+
+                    for (off = 0; off < total; off += 256)
+                    {
+                        unsigned int n = total - off, j;
+                        if (n > 256) n = 256;
+                        if (!ios_prof_read( ios_profmap.entries + (unsigned long long)off * sizeof(buf[0]),
+                                            buf, n * sizeof(buf[0]) )) break;
+                        for (j = 0; j < n; j++)
+                        {
+                            unsigned long long lo, hi2;
+                            int a, b2;
+                            if (!buf[j].host_start || !buf[j].host_size) continue;
+                            lo = buf[j].host_start;
+                            hi2 = lo + buf[j].host_size;
+                            /* first sorted PC >= lo */
+                            a = 0; b2 = ios_prof_nsort;
+                            while (a < b2) { int m2 = (a + b2) / 2;
+                                             if (ios_prof_sorted[m2].pc < lo) a = m2 + 1; else b2 = m2; }
+                            for (; a < ios_prof_nsort && ios_prof_sorted[a].pc < hi2; a++)
+                            {
+                                unsigned long age = (unsigned long)((head - 1 - (unsigned long long)(off + j)) & (cap - 1));
+                                if (age < ios_prof_jitpc[a].n)
+                                {
+                                    ios_prof_jitpc[a].n = age;
+                                    ios_prof_jitpc[a].rip = buf[j].guest_rip;
+                                    ios_prof_jitpc[a].x87 = buf[j].n_x87;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for (k = 0; k < ios_prof_nsort; k++)
+                {
+                    unsigned long n = ios_prof_hot[ios_prof_sorted[k].slot].n;
+                    int m;
+                    if (!ios_prof_jitpc[k].rip) continue;
+                    jit_resolved += n;
+                    if (ios_prof_jitpc[k].x87) jit_x87 += n;
+                    m = ios_guest32_module_idx( B, ios_prof_jitpc[k].rip );
+                    if (m >= 0) modn[m] += n;
+                }
+
+                {
+                    char line[512];
+                    int len = 0, rank;
+                    for (rank = 0; rank < 8; rank++)
+                    {
+                        int best = -1, m; unsigned long bv = 0;
+                        for (m = 0; m < ios_gmod32_count; m++) if (modn[m] > bv) { bv = modn[m]; best = m; }
+                        if (best < 0) break;
+                        len += snprintf( line + len, sizeof(line) - len, " %s=%.1f%%",
+                                         ios_gmod32[best].name, 100.0 * bv / cpu_obs );
+                        modn[best] = 0;
+                        if (len >= (int)sizeof(line) - 40) break;
+                    }
+                    fprintf(stderr, "[prof]   jit by module (%% of all CPU):%s unresolved=%.1f%% "
+                                    "[jit=%.1f%% jitdisp=%.1f%% | ring %llu blocks cap=%u%s]\n",
+                            line,
+                            100.0 * (bucket[PRB_JIT] - jit_resolved) / cpu_obs,
+                            100.0 * bucket[PRB_JIT] / cpu_obs,
+                            100.0 * bucket[PRB_JITDISP] / cpu_obs,
+                            (unsigned long long)ios_profmap.head, ios_profmap.capacity,
+                            (ios_profmap.head > ios_profmap.capacity) ? " WRAPPED" : "");
+                }
+
+                /* The X87ReducedPrecision question, answered by SAMPLES rather
+                 * than by compile counts: what share of the JIT time is spent in
+                 * blocks that contain at least one x87 op.  The emitted-op deltas
+                 * next to it say what the codegen is producing per window. */
+                fprintf(stderr, "[prof]   jit x87: %.1f%% of jit samples are in blocks containing x87 "
+                                "| emitted this window: x87=%llu vec=%llu atomic=%llu tso=%llu "
+                                "over %llu blocks / %llu guest insts\n",
+                        bucket[PRB_JIT] ? (100.0 * jit_x87 / bucket[PRB_JIT]) : 0.0,
+                        ios_profmap.x87_ops - prev_x87, ios_profmap.vec_ops - prev_vec,
+                        ios_profmap.atomic_ops - prev_atom, ios_profmap.tso_ops - prev_tso,
+                        ios_profmap.blocks - prev_blocks, ios_profmap.guest_insts - prev_insts);
+                prev_x87 = ios_profmap.x87_ops;  prev_vec = ios_profmap.vec_ops;
+                prev_atom = ios_profmap.atomic_ops; prev_tso = ios_profmap.tso_ops;
+                prev_blocks = ios_profmap.blocks; prev_insts = ios_profmap.guest_insts;
+            }
+
+            /* Which dispatcher helper. In l35 this bucket was invisible inside
+             * `jit`, and its four hottest PCs were 10-27 % of the whole machine. */
+            if (bucket[PRB_JITDISP] && cpu_obs && ios_profmap_live)
+            {
+                unsigned long dn[IOS_PROFMAP_DISPMAX];
+                char line[512];
+                int len = 0, rank, s;
+                memset( dn, 0, sizeof(dn) );
+                for (s = 0; s < IOS_PROF_PC_MAX; s++)
+                {
+                    int i2, best = -1;
+                    if (!ios_prof_hot[s].n || ios_prof_hot[s].cls != PRB_JITDISP) continue;
+                    for (i2 = 0; i2 < (int)ios_profmap.n_disp && i2 < IOS_PROFMAP_DISPMAX; i2++)
+                        if (ios_profmap.disp[i2].begin && ios_profmap.disp[i2].begin <= ios_prof_hot[s].pc &&
+                            (best < 0 || ios_profmap.disp[i2].begin > ios_profmap.disp[best].begin))
+                            best = i2;
+                    if (best >= 0) dn[best] += ios_prof_hot[s].n;
+                }
+                for (rank = 0; rank < 8; rank++)
+                {
+                    int best = -1, i2; unsigned long bv = 0;
+                    for (i2 = 0; i2 < IOS_PROFMAP_DISPMAX; i2++) if (dn[i2] > bv) { bv = dn[i2]; best = i2; }
+                    if (best < 0) break;
+                    len += snprintf( line + len, sizeof(line) - len, " %s=%.1f%%",
+                                     ios_profmap.disp[best].name, 100.0 * bv / cpu_obs );
+                    dn[best] = 0;
+                    if (len >= (int)sizeof(line) - 40) break;
+                }
+                fprintf(stderr, "[prof]   jit disp (%% of all CPU):%s\n", line);
+            }
+
+            /* ml930: WHO CALLED THE KERNEL. A syscall name is the symptom; this
+             * line is the caller.  Both ends are symbolised here, at report
+             * cadence, with dladdr -- the same resolver [thread-stacks] uses, so
+             * "Madeira`<routine>+0x..." means the identical thing in both. */
+            if (cpu_obs)
+            {
+                int rank;
+                char line[640];
+                int len = 0;
+                for (rank = 0; rank < 6; rank++)
+                {
+                    int best = -1, s; unsigned long bv = 0;
+                    for (s = 0; s < IOS_PROF_KC_MAX; s++)
+                        if (ios_prof_kc[s].n > bv) { bv = ios_prof_kc[s].n; best = s; }
+                    if (best < 0 || !bv) break;
+                    {
+                        Dl_info dk, dc;
+                        char ksym[64], csym[96];
+                        const char *cimg = NULL;
+                        uint64_t cbase = 0;
+                        if (dladdr( (void *)(uintptr_t)ios_prof_kc[best].kpc, &dk ) && dk.dli_sname)
+                            snprintf( ksym, sizeof(ksym), "%s", dk.dli_sname );
+                        else
+                            snprintf( ksym, sizeof(ksym), "0x%llx", (unsigned long long)ios_prof_kc[best].kpc );
+                        if (dladdr( (void *)(uintptr_t)ios_prof_kc[best].cpc, &dc ) && dc.dli_sname && dc.dli_saddr)
+                        {
+                            const char *img = dc.dli_fname ? strrchr( dc.dli_fname, '/' ) : NULL;
+                            img = img ? img + 1 : (dc.dli_fname ? dc.dli_fname : "?");
+                            snprintf( csym, sizeof(csym), "%s`%s+0x%llx", img, dc.dli_sname,
+                                      (unsigned long long)(ios_prof_kc[best].cpc - (uint64_t)(uintptr_t)dc.dli_saddr) );
+                        }
+                        else if (ios_prof_image_for( ios_prof_kc[best].cpc, &cimg, &cbase ) >= 0 && cimg)
+                            snprintf( csym, sizeof(csym), "%s+0x%llx", cimg,
+                                      (unsigned long long)(ios_prof_kc[best].cpc - cbase) );
+                        else
+                            snprintf( csym, sizeof(csym), "0x%llx", (unsigned long long)ios_prof_kc[best].cpc );
+                        len += snprintf( line + len, sizeof(line) - len, " %s<-%s %.1f%%",
+                                         ksym, csym, 100.0 * bv / cpu_obs );
+                    }
+                    ios_prof_kc[best].n = 0;
+                    if (len >= (int)sizeof(line) - 100) break;
+                }
+                if (len) fprintf(stderr, "[prof]   kern (%% of all CPU):%s\n", line);
             }
 
             /* per-module shares of the pool copies (* = counted as fexrt above) */
@@ -12554,11 +13229,18 @@ static void *ios_prof_thread( void *arg )
                     for (t = 0; t < ios_prof_nth; t++)
                         if (ios_prof_trun[t] > bv) { bv = ios_prof_trun[t]; best = t; }
                     if (best < 0) break;
-                    len += snprintf( line + len, sizeof(line) - len, " \"%s\"=%.1f%%",
-                                     ios_prof_tname[best][0] ? ios_prof_tname[best] : "(unnamed)",
-                                     100.0 * bv / run_obs );
+                    /* ml930: tid= is the Wine thread id from TEB->ClientId, which
+                     * is how every other line in the log names a thread; jit= is
+                     * that thread's share of ITS OWN samples spent in translated
+                     * guest code, which is what separates a guest thread from a
+                     * native one when neither has a pthread name. */
+                    len += snprintf( line + len, sizeof(line) - len, " tid=%04llx\"%s\"=%.1f%%(jit %.0f%%)",
+                                     ios_prof_ttid[best],
+                                     ios_prof_tname[best][0] ? ios_prof_tname[best] : "-",
+                                     100.0 * bv / run_obs,
+                                     100.0 * ios_prof_tjit[best] / (double)bv );
                     ios_prof_trun[best] = 0;
-                    if (len >= (int)sizeof(line) - 48) break;
+                    if (len >= (int)sizeof(line) - 64) break;
                 }
                 fprintf(stderr, "[prof]   threads:%s\n", line);
             }
@@ -12571,11 +13253,11 @@ static void *ios_prof_thread( void *arg )
                 {
                     int best = -1, s; unsigned long bv = 0;
                     for (s = 0; s < IOS_PROF_PC_MAX; s++)
-                        if (hot[s].n > bv) { bv = hot[s].n; best = s; }
+                        if (ios_prof_hot[s].n > bv) { bv = ios_prof_hot[s].n; best = s; }
                     if (best < 0 || !bv) break;
                     {
-                        uint64_t pc = hot[best].pc;
-                        int cls = hot[best].cls;
+                        uint64_t pc = ios_prof_hot[best].pc;
+                        int cls = ios_prof_hot[best].cls;
                         char detail[192];
                         detail[0] = 0;
                         if (cls == PRB_PE || cls == PRB_POOLHOLE)
@@ -12587,19 +13269,39 @@ static void *ios_prof_thread( void *arg )
                             else
                                 snprintf( detail, sizeof(detail), " pool+0x%llx", rva2 );
                         }
+                        else if (cls == PRB_JITDISP)
+                        {
+                            unsigned long long doff = 0;
+                            const char *rn = ios_prof_disp_region( pc, &doff );
+                            snprintf( detail, sizeof(detail), " disp:%s+0x%llx",
+                                      rn ? rn : "?", doff );
+                        }
                         else if (cls == PRB_JIT)
                         {
-                            uint64_t bb = 0, rip = 0; mach_vm_size_t g = 0;
-                            const char *why = "no x28";
-                            if (hot[best].x28 > 0x10000 &&
-                                mach_vm_read_overwrite( mach_task_self(),
-                                    (mach_vm_address_t)hot[best].x28, 8,
-                                    (mach_vm_address_t)&bb, &g ) == KERN_SUCCESS && g == 8 && bb)
-                                rip = ios_native_rip_from_hostpc( bb, pc, &why );
+                            /* ml930: the published map first — it answers for a PC
+                             * anywhere in the block, not only for the block the
+                             * sampled thread happened to have entered. x28's
+                             * InlineJITBlockHeader stays as the fallback for a PC
+                             * compiled before the map was armed. */
+                            uint64_t rip = 0;
+                            const char *why = "not in the published block map";
+                            int q;
+                            for (q = 0; q < ios_prof_nsort; q++)
+                                if (ios_prof_sorted[q].slot == best && ios_prof_sorted[q].pc == pc)
+                                { rip = ios_prof_jitpc[q].rip; break; }
+                            if (!rip && ios_prof_hot[best].x28 > 0x10000)
+                            {
+                                uint64_t bb = 0; mach_vm_size_t g = 0;
+                                if (mach_vm_read_overwrite( mach_task_self(),
+                                        (mach_vm_address_t)ios_prof_hot[best].x28, 8,
+                                        (mach_vm_address_t)&bb, &g ) == KERN_SUCCESS && g == 8 && bb)
+                                    rip = ios_native_rip_from_hostpc( bb, pc, &why );
+                            }
                             if (rip)
                             {
                                 uint64_t rva2 = 0;
-                                const char *mod = ios_guest_module_for( rip, &rva2 );
+                                const char *mod = ios_guest32_module_for( ios_profmap.guest_base, rip, &rva2 );
+                                if (!mod) mod = ios_guest_module_for( rip, &rva2 );
                                 snprintf( detail, sizeof(detail), " guest=%s+0x%llx rip=0x%llx",
                                           mod ? mod : "?", (unsigned long long)rva2,
                                           (unsigned long long)rip );
@@ -12626,7 +13328,7 @@ static void *ios_prof_thread( void *arg )
                                 rank + 1, 100.0 * bv / cpu_obs, ios_prb_name[cls],
                                 (unsigned long long)pc, detail);
                     }
-                    hot[best].n = 0;
+                    ios_prof_hot[best].n = 0;
                 }
             }
 
@@ -12641,7 +13343,9 @@ static void *ios_prof_thread( void *arg )
 
             memset( bucket, 0, sizeof(bucket) );
             memset( pe, 0, sizeof(pe) );
-            memset( hot, 0, sizeof(hot) );
+            memset( ios_prof_hot, 0, sizeof(ios_prof_hot) );
+            memset( ios_prof_kc, 0, sizeof(ios_prof_kc) );
+            ios_prof_nsort = 0;
             npe = 0;
             samples = obs = run_obs = wait_obs = dead = 0;
             ios_prof_build_images();
