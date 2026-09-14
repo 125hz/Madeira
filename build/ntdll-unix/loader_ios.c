@@ -3006,7 +3006,13 @@ static void start_main_thread(void)
     set_load_order_app_name( main_wargv[0] );
     WINE_IOS_LOG("init_thread_stack...");
     init_thread_stack( teb, 0, 0, 0 );
-    NtCreateKeyedEvent( &keyed_event, GENERIC_READ | GENERIC_WRITE, NULL, 0 );
+    /* iOS-Madeira: NAMED, and created through the same helper every child
+     * pseudo-process uses.  wineserver handle tables are per pseudo-process, so
+     * an anonymous handle created here would name a different object (or
+     * nothing) in every later process that falls back to it — the same class of
+     * bug as the GDI shared section.  See ios_default_keyed_event() in
+     * wine/dlls/ntdll/unix/sync.c; the name is the one Windows uses. */
+    keyed_event = ios_default_keyed_event();
     /* ml756: take FEX's host arena BEFORE any PE module is placed.
      *
      * This is the whole point of the placeholder: once guest DLLs start

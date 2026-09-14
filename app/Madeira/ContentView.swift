@@ -2177,14 +2177,68 @@ struct ContentView: View {
             // so it can be swapped between runs without a rebuild, and deleting
             // the file reverts to the proven default. Clamped to sane values --
             // a typo here would otherwise move the VA floor with it.
-            var poolSizeMB = 896
+            // ml901 (perf round 2): the DEFAULT is now a function of the SESSION
+            // SHAPE, not a single constant. This is not a per-title profile --
+            // it is the one structural fact that decides pool demand.
+            //
+            // The pool is dirty from birth (ml458: StikDebug's TXM blessing
+            // writes every page, and the no-footprint exemption is unreachable),
+            // so its SIZE costs jetsam budget 1:1 whether or not it is used. On
+            // the device it measures poolRX=896MB dirty / 621MB resident against
+            // a 4096MB ceiling -- 22% of the budget.
+            //
+            // What actually consumes it is the number of pseudo-processes that
+            // each copy their whole DLL set. A DESKTOP session is the fan-out
+            // case (explorer + services + rpcss + cmd + conhost + the CEF
+            // helpers; ml364 measured an 858MB bump there, which is why 896 is
+            // the proven value and must not move). A DIRECT launch is one
+            // process. Measured across every direct-launch log on hand, the
+            // high-water mark is head 180.5MB + tail 48MB = 228.6MB; the median
+            // is ~100MB. 512 leaves 2.2x headroom over the worst observed run
+            // and returns 384MB of footprint.
+            //
+            // RISK, stated plainly: a direct-launch title that needs more than
+            // ~460MB of code space (head + tail) will exhaust the pool. That
+            // failure is ALREADY loud and already graceful -- ml421 made the
+            // EC_CODE tail carve refuse honestly and FEX halve down, and the
+            // head allocator prints
+            //     [jit-pool] EXHAUSTED (image ...): want=... bump=.../... tail_resv=...
+            //     [jit-pool] EXHAUSTED (anon RWX): ...
+            //     [jit-pool] TAIL REFUSED (FEX EC_CODE): ...
+            // with the exact numbers. The line below names the knob in the same
+            // breath so a log reader never has to know this file exists.
+            let isDesktopFanout = getenv("MADEIRA_DESKTOP") != nil
+            var poolSizeMB = isDesktopFanout ? 896 : 512
+            var poolSource = isDesktopFanout ? "desktop-session default" : "direct-launch default"
             if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
                let txt = try? String(contentsOf: d.appendingPathComponent("madeira-pool.txt"), encoding: .utf8),
                let mb = Int(txt.trimmingCharacters(in: .whitespacesAndNewlines)),
                mb >= 256, mb <= 1152 {
                 poolSizeMB = mb
-                logStore.log("JIT pool overridden to \(mb)MB via madeira-pool.txt")
+                poolSource = "madeira-pool.txt override"
             }
+            logStore.log("JIT pool \(poolSizeMB)MB (\(poolSource)) — raise it with " +
+                         "Documents/madeira-pool.txt (bare MB, 256..1152) if the log shows [jit-pool] EXHAUSTED")
+            setenv("MADEIRA_POOL_MB", String(poolSizeMB), 1)
+            // ml901: [prof] sampling profiler. Documents/madeira-prof.txt holds
+            // "period_ms[,report_s]" -- "0" turns it off, absent means ON at the
+            // 5ms / 10s default. It samples every thread's PC and buckets it by
+            // REGION (FEX JIT output, the FEX runtime, each Wine PE pool copy,
+            // our unix binary, the Mach exception handler, Metal, other dylibs,
+            // waiting-in-kernel), which is the partition every remaining perf
+            // decision needs and the one no existing line reports. It measures
+            // and prints its own CPU cost and backs its period off if that ever
+            // exceeds 2% of one core, so it can never become the problem.
+            // Default ON: a run without it produces no [prof] evidence at all.
+            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-prof.txt"), encoding: .utf8) {
+                let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !v.isEmpty {
+                    setenv("MADEIRA_PROF", v, 1)
+                    logStore.log("Profiler: MADEIRA_PROF=\(v) via madeira-prof.txt")
+                }
+            }
+
             // ml694: W^X A/B switch. Documents/madeira-wx.txt containing "0"
             // disables page demotion for the SAME binary, so the on/off
             // comparison needs one rebuild, not two. The previous gate read

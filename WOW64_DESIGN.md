@@ -147,6 +147,132 @@ game-specific patches — every change must fix the emulator/runtime generically
 
 ## 6. Status log
 
+- 2026-09-13 — **PERF ROUND 2: a real profiler, and the pool stops costing
+  22 % of the jetsam budget** (Opus; `signal_arm64_ios.c`, `virtual_ios.c`
+  pool/census only, `ContentView.swift`). Premise of the round: every
+  perf claim so far was a guess, including mine. So the first deliverable
+  is measurement, not a fix.
+  (1) DONE — **`[prof]` continuous region sampler**
+  (`signal_arm64_ios.c:11786`, thread body `:12010`, `ios_prof_start`
+  `:12323`, started from the one-time exception-handler init at
+  `:5293`). Every 5 ms it samples every thread and buckets the
+  host PC by REGION — `jit` (FEX output in the pool tail), `fexrt` (the
+  FEX runtime's pool copy), `pe` (each Wine PE pool copy, broken out by
+  module), `poolhole`, `unix` (the Madeira binary), `mach` (the same but
+  on `wine-x18-exc`), `metal`, `dylib`, `guest`, `fexhost` — plus a
+  per-thread histogram (which is what separates DXMT / wineserver / guest
+  threads inside the single `unix` bucket) and the top 8 host PCs
+  symbolised to module+RVA, or to a guest RIP via ml688's native
+  block-tail decoder for JIT PCs. Classification of pool addresses is a
+  new lock-free, deref-free `ios_pool_classify_pc()`
+  (`virtual_ios.c:2517`); module NAMES are read only at report cadence,
+  through the fault-safe reader. `run_state` is consulted BEFORE
+  `thread_get_state` on purpose: a running thread's saved state is stale
+  and often still points into `libsystem_kernel`, so deciding "waiting"
+  from the PC would report a spinning process as idle. The sampler
+  measures its own CPU time every window, prints it as `cost=..%/core`,
+  and halves its rate (to 40 ms) if that exceeds 2 % — it can never
+  silently become the thing it measures. Knob
+  `Documents/madeira-prof.txt` = `period_ms[,report_s]`, `0` = off,
+  ABSENT = ON at 5 ms/10 s.
+  (2) DONE — **pool residency.** (a) The `[pool-warmer]` RX pass is now
+  1 cycle in 16 instead of every cycle (`virtual_ios.c:606`), and the
+  cycle cost is measured (`cost=..us`). What the RX pass was for: RX and
+  RW are two mach mappings of ONE vm object, so residency is established
+  by the RW touch alone; what is NOT shared is the per-mapping pmap
+  entry, so the RX pass only avoids SOFT faults (PTE install, no I/O) —
+  never a decompress. Dropping it entirely would reintroduce a soft-fault
+  burst on first execution after pressure; at 1/16 rate the worst case is
+  ~9k soft faults spread over 32 s. `MADEIRA_POOL_WARM=0` disables
+  touching for an A/B. (b) **The default pool is now session-shaped**
+  (`ContentView.swift:2211`): 896 MB for a DESKTOP session (the fan-out
+  case — ml364 measured an 858 MB bump there, so this must not move) and
+  **512 MB for a direct launch**. The pool is dirty from birth (ml458) so
+  its SIZE is the cost: 896 MB was 22 % of the 4096 MB ceiling for a
+  measured high-water of head 180.5 + tail 48 = 228.6 MB across every
+  direct-launch log on hand. 512 leaves 2.2x headroom and returns
+  384 MB. `madeira-pool.txt` still overrides; the three `[jit-pool]
+  EXHAUSTED` / `TAIL REFUSED` paths now name the knob and the current
+  value in the failure line itself.
+  (3) **NOT IMPLEMENTED — `FEX/CLAUDE.md` forbids AI-generated code in
+  that subtree** ("AI must not be used to generate code for
+  contributions to this project"). The investigation is complete and the
+  edits are specified; a human must apply them. Findings, ranked:
+  **(3a) The call-ret shadow stack is DEAD CODE on iOS and costs ~44
+  bytes per guest CALL and ~44 per RET.** Both readers of the pushed
+  `{guest_rip, host_label}` pairs are already compiled out —
+  `JIT/BranchOps.cpp:266` (`(void)SkipFullLookup;`, ml305) and
+  `Dispatcher/Dispatcher.cpp:199` (`(void)b(&LoopTop);`) — but the 9-
+  instruction `EmitCallRetStackGuard` (`ArchHelpers/Arm64Emitter.cpp:535`)
+  plus `adr`+`stp` still execute at `BranchOps.cpp:173-187` and `:297-310`,
+  and the guard plus `ldp` plus a now-dead `sub` at `:226-235`. Nothing
+  branches to the data. Removing the push/pop/guard under the same
+  `FEX_IOS_HOST` gate is the single largest `host_b/inst` win available
+  and is safe by the file's own contract ("purely a return-address
+  PREDICTOR").
+  **(3b) The `[Xbase, Wea, UXTW]` fold is never actually emitted.**
+  `GetGuestMemAddr` (`JIT/MemoryOps.cpp:588-676`) always returns an
+  invalid Offset once a window is active, so `GenerateMemOperand`
+  (`:678-704`) always emits `[Xn, #0]` and the UXTW encodings at `:693`
+  are unreachable. Every guest access pays one explicit `add x24, x19,
+  wEA, uxtw`, and a second `add` when there is any displacement. For TSO
+  GPR accesses the first add is unavoidable (LDAPUR/STLUR/LDAPR have no
+  register-offset form — `CodeEmitter/LoadstoreOps.inl:1943`), but
+  `VectorTSOEnabled=false` on this build, so EVERY SSE/MMX/x87 access and
+  every `push`/`pop` is non-TSO and could use the fold: `push eax` is 3
+  instructions where upstream emits 1 (`MemoryOps.cpp:1596-1621`).
+  **(3c) The half-barrier `nop` is emitted unconditionally** at
+  `MemoryOps.cpp:901, 916, 931, 2016, 2032` — 4 bytes on every TSO GPR
+  access — while its only consumer is already gated on
+  `HalfBarrierTSOEnabled` (`Utils/ArchHelpers/Arm64.cpp:2394-2434` via
+  `Windows/Common/TSOHandlerConfig.h:14`). Gating the emission is free;
+  the byte saving needs `HalfBarrierTSOEnabled=0`, which is a real
+  ordering trade at unaligned sites — an A/B, not a free win. Confirmed:
+  Apple Silicon has FEAT_LRCPC2, so it IS lowering to `LDAPUR`/`STLUR`,
+  not DMB pairs (`Common/HostFeatures.cpp:633`), and hardware TSO is a
+  no-op on iOS (`Windows/Common/FEXUnixLib.cpp:156`).
+  **(3d) The dispatcher fallback: the inline probe is CORRECT; the L1 is
+  the problem.** `Dispatcher/Dispatcher.cpp:277-289` is bit-identical to
+  `LookupCache.h:198-201`, and `L1ptr == cacheL1` in every `[CB_SUMMARY]`
+  kills the stale-pointer theory. The slow path DOES refill L1
+  (`LookupCache.h:238`). The causes, in order: (i) **`DisableL2Cache=1`
+  means there is no middle tier at all** — `Dispatcher.cpp:292` emits
+  `b(&NoBlock)`, so every L1 miss is a full C++ round-trip with
+  Spill/FillStaticRegs, a contended global atomic (`Core.cpp:1989`) and a
+  shared read lock, instead of the inline L2 walk at `:296-349` which
+  also back-fills L1; (ii) **the L1 is 1-way direct-mapped on
+  `RIP & 0x1FFFF`** (`LookupCache.h:499-515`, capped at 128 K entries on
+  iOS by ml363) while 39 k blocks x several entry points each
+  (`Core.cpp:2373`) oversubscribe it — conflict misses are the only
+  mechanism that explains a SUSTAINED 50 k/s after compile churn stops;
+  (iii) **L1 is per-thread, the map is per-CodeBuffer/shared**
+  (`Core.cpp:524` vs `CPUBackend.cpp:496`), so every thread pays its own
+  first-touch for every entry RIP, renewed after each whole-L1 decommit
+  (`ClearThreadLocalCaches`, `LookupCache.cpp:209`, reached from
+  `JIT.cpp:803`, `JIT.cpp:1305`, `CPUBackend.cpp:439`); (iv) 3a's disabled
+  RET predictor routes every guest RET through the probe, multiplying the
+  absolute miss count. NOTE for whoever implements: naively flipping
+  `DisableL2Cache=0` is NOT obviously a win here — `CODE_SIZE` is 32 MB
+  and `SIZE_PER_PAGE` is 64 KB per guest code page, so the arena covers
+  only 512 guest code pages before `ClearL2Cache` wipes it, and a 32-bit
+  game's code spans far more. Associativity (2-way) or a larger
+  `MAX_L1_ENTRIES` (`LookupCache.h:512`) is the better lever. It is
+  testable without a rebuild via `FEX_DISABLEL2CACHE=0` in
+  `madeira-fex.txt`.
+  (4) DONE — **`[phys-map]` now interprets itself** (`virtual_ios.c`):
+  VM tags are named (88 = IOSURFACE, 100 = IOACCELERATOR, 2 =
+  MALLOC_SMALL, 0 = untagged anon = ours), and a new `[phys-map] interp`
+  line states the two facts that were each mis-read once: the pool is
+  counted TWICE in `total_dirty` (RX+RW are one vm object), and
+  `hostlow` resident is mostly CLEAN file-backed memory (dyld shared
+  cache, framework `__TEXT`, Metal shader libs) which is not charged to
+  `phys_footprint` — only its dirty half (194 of 907 MB in the 301 s log)
+  is ours. Nothing in `hostlow` is a target.
+  Hottest guest RIP in that log resolves to `mmdevapi.dll+0x4056`
+  (B = 0x7100000000), but `repeats~` is still the broken majority
+  estimator, so treat it as a pointer, not a result — `[prof]` is what
+  should decide the next round.
+
 - 2026-09-13 — **Guest-window RELEASE and RE-ADOPTION** (Opus,
   `build/ntdll-unix/*` only). Device evidence (log 28): a 32-bit launcher
   exe ran as an i386 CHILD in the desktop, booted fully (apiset mapped,
@@ -514,6 +640,38 @@ game-specific patches — every change must fix the emulator/runtime generically
   after the fix; the window release/re-adopt path WORKED (log 32: launcher
   exit → `teardown B=0x7100000000 … 46 view(s) deleted` → second 32-bit
   child adopted).
+  DONE (Opus, win32u): `win32u_zero_bits()` per `(pid,peb)` (WoW caller →
+  `HighestUserAddress|0x7fffffff`, else 0; routed through every former
+  `zero_bits` reader incl. the dib.c section branch that leaked a host
+  pointer). The GDI shared table stays ONE session table (dce_list and
+  display_dc hand handles across pseudo-processes, so per-process tables
+  would break the session) but is section-backed with the master view on
+  the host and, for each 32-bit pseudo-process, a SECOND view of the same
+  memory mapped inside its window (`[gdi-shared] … guest-view=0x71…`), so
+  truncation yields the guest address and the window teardown cannot
+  destroy the session table (the pre-regression state was a time bomb:
+  the table lived inside the first 32-bit process's window). DC_ATTR
+  buckets and cache DCEs are owner-tagged and never recycled across
+  pseudo-processes (the other guest-dereferenced pointers). Expected:
+  `[zero-bits] peb=… wow=1 ceiling=0xffffffff`, `[gdi-shared] session
+  table …` once, `[gdi-shared] … guest-view=…` per 32-bit process, no
+  `eip 0x7BA9FF61` AVs, no `[va-scan] FAILED window=0x10000..0x80000000`.
+- 2026-09-13 — Round after the win32u fix. 32-bit MAIN path is healthy
+  again (301 s run: `[gdi-shared] … guest-view=0x71039e0000`, no AVs; user
+  reports ~7 fps in-game → perf round 2 assigned: sampling profiler
+  `[prof]`, pool residency (621/896 MB resident, warmer touches both
+  aliases, default size), dispatcher fallback 43-65k/s (inline L1 probe
+  misses), `host_b/inst=24`). CHILD path: (a) `gdi_shared_section` is a
+  HANDLE in the desktop's per-pseudo-process table → child's
+  `NtMapViewOfSection` = 0xc0000024, table truncated (assigned: named
+  section); (b) 64-bit ntdll RVA 0x39c3c (UTF-16 case-insensitive compare
+  loop) read raw guest 0x3e4c78 — §4 miss in some wow64 thunk (assigned);
+  (c) the title's main exe needs `msvfw32` (assigned to the same agent:
+  i386 set). 64-bit title (arm64ec path, NOT WoW64): from the desktop it
+  reaches DXMT but pays 5.6 M emulated stores/min (`[fault-cost] …
+  faults=5590872 total=12398 ms`) — exec-downgraded/pool-alias store path;
+  from the button it stalls in a lock while loading winhttp/jsproxy
+  (`[lock-census] … lockval=0x0`). Read-only investigation assigned.
 
 
 - 2026-09-12 — M5 direction: the user's next target is a 32-bit UE3/D3D9

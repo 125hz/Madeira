@@ -576,21 +576,52 @@ static void ios_window_inventory( const char *why, unsigned long long lo_arg, un
 extern unsigned long long ios_last_footprint_mb;
 extern int ios_fast_footprint;
 
+/* ml901 (perf round 2): pool-warmer cost control.
+ *
+ * WHAT THE RX PASS WAS FOR (ml121, quoted above the removed code below): the
+ * RX and RW aliases are two mach mappings of ONE vm object. Residency is a
+ * property of the OBJECT, so a read through RW makes the page resident for
+ * both; what is NOT shared is the per-mapping page table (pmap) entry. ml121's
+ * [exec-recover] stall was a pmap miss on the RX alias, i.e. a SOFT fault: the
+ * data is already in RAM, the kernel only has to install a PTE. Compressor
+ * decompression -- the expensive kind of fault, tens of microseconds -- can
+ * only happen on the object, and the RW pass already prevents that.
+ *
+ * So the RX pass buys avoidance of soft faults only, and it doubles the
+ * warmer's page-table work every 2 s (18,556 touches per cycle in the 301 s
+ * device log, of which exactly half are RX). It is kept, because losing the
+ * RX pmap entirely reintroduces a soft-fault burst the first time a cold
+ * module is executed after a pressure event -- but at 1/16 the rate.
+ *
+ * RISK of the reduced rate: between RX passes the RX pmap can be trimmed, so
+ * the first execution of a page in that window pays one soft fault (~1-2 us,
+ * no I/O). With ~9k pages that is a worst case of ~15 ms spread over a 32 s
+ * interval, versus 9k redundant touches every 2 s. Both passes stay bounded by
+ * the high-water marks (head_used / tail_resv), so untouched pool is never
+ * faulted in -- that part was already correct.
+ *
+ * MADEIRA_POOL_WARM=0 disables the warmer's touching entirely (the diagnostic
+ * timers below keep running), for a clean A/B.  The cycle cost is now MEASURED
+ * and printed, so the next round argues from numbers. */
 static void *ios_pool_warmer_thread( void *arg )
 {
     unsigned cycle = 0;
+    int warm_enabled = 1;
+    unsigned rx_every = 16;
+    {
+        const char *e = getenv( "MADEIRA_POOL_WARM" );
+        if (e && *e)
+        {
+            int v = atoi( e );
+            if (v <= 0) warm_enabled = 0;
+            else rx_every = (unsigned)v;
+        }
+        dprintf(2, "[pool-warmer] rev=ml901 enabled=%d rx_every=%u cycles (knob MADEIRA_POOL_WARM)\n",
+                warm_enabled, rx_every);
+    }
     for (;;)
     {
         volatile const char *rw = (volatile const char *)ios_jit_rw_base_global;
-        /* ml121: warm the RX ALIAS TOO. The warmer only ever touched the RW
-         * alias, but execution faults on the RX one -- they are two separate
-         * mach mappings of the same object, so residency established through RW
-         * need not hold for RX. ml121 died exactly this way: [exec-recover]
-         * pg=0x1243d8000 lost execute while the warmer was running, mprotect_rx
-         * failed EACCES (as it ALWAYS does on blessed pool memory -- never
-         * evidence), and the unrecoverable fault killed the CEF child. Reading
-         * through an RX mapping is permitted and is the only touch that can
-         * establish residency for the alias that actually executes. */
         volatile const char *rx = (volatile const char *)ios_jit_rx_base_global;
         size_t total = ios_jit_pool_size_global;
         if (rw && total)
@@ -599,20 +630,33 @@ static void *ios_pool_warmer_thread( void *arg )
             size_t tail = ios_jit_tail_reserved;
             size_t o, touched = 0;
             volatile char sink = 0;
+            struct timeval w0, w1;
+            long warm_us = 0;
+            int did_rx = 0;
             if (head > total) head = total;
             if (tail > total) tail = total;
-            for (o = 0; o < head; o += 0x4000) { sink += rw[o]; touched++; }
-            for (o = total - tail; o < total; o += 0x4000) { sink += rw[o]; touched++; }
-            if (rx)
+            gettimeofday( &w0, NULL );
+            if (warm_enabled)
             {
-                for (o = 0; o < head; o += 0x4000) { sink += rx[o]; touched++; }
-                for (o = total - tail; o < total; o += 0x4000) { sink += rx[o]; touched++; }
+                for (o = 0; o < head; o += 0x4000) { sink += rw[o]; touched++; }
+                for (o = total - tail; o < total; o += 0x4000) { sink += rw[o]; touched++; }
+                /* ml901: RX pmap top-up, 1 cycle in rx_every instead of every cycle. */
+                if (rx && (cycle % rx_every) == 0)
+                {
+                    did_rx = 1;
+                    for (o = 0; o < head; o += 0x4000) { sink += rx[o]; touched++; }
+                    for (o = total - tail; o < total; o += 0x4000) { sink += rx[o]; touched++; }
+                }
             }
+            gettimeofday( &w1, NULL );
+            warm_us = (w1.tv_sec - w0.tv_sec) * 1000000 + (w1.tv_usec - w0.tv_usec);
             (void)sink;
             cycle++;
             if (cycle == 1 || (cycle % 30) == 0)
-                dprintf(2, "[pool-warmer] cycle=%u touched=%lu pages (head=0x%lx tail=0x%lx)\n",
-                        cycle, (unsigned long)touched, (unsigned long)head, (unsigned long)tail);
+                dprintf(2, "[pool-warmer] rev=ml901 cycle=%u touched=%lu pages rx_pass=%d cost=%ldus "
+                        "(head=0x%lx tail=0x%lx)\n",
+                        cycle, (unsigned long)touched, did_rx, warm_us,
+                        (unsigned long)head, (unsigned long)tail);
             /* task #35: report the three pool slots every ~30s on this existing
              * timer — see ios_slot_probe. Cheap (a few mach queries) and it is
              * the only signal that says whether the ceiling is doing its job. */
@@ -927,13 +971,66 @@ static void *ios_pool_warmer_thread( void *arg )
                 for (ti = 0; ti < 256; ti++)
                     if ((dirty_by_tag[ti] >> 20) >= 32 || (res_by_tag[ti] >> 20) >= 32 ||
                         (swap_by_tag[ti] >> 20) >= 32)
-                        dprintf(2, "[phys-map]   tag %u totals rev=ml677 dirty=%llu MB res=%llu MB swap=%llu MB\n",
-                                ti, dirty_by_tag[ti] >> 20, res_by_tag[ti] >> 20, swap_by_tag[ti] >> 20);
+                    {
+                        /* ml901: NAME the tag. Three rounds were spent guessing
+                         * what "tag 100" was; these are the Darwin
+                         * VM_MEMORY_* constants from mach/vm_statistics.h. */
+                        const char *tn;
+                        switch (ti)
+                        {
+                        case 0:   tn = "untagged anon (OURS: pool/guest/FEX)"; break;
+                        case 1:   tn = "MALLOC"; break;
+                        case 2:   tn = "MALLOC_SMALL"; break;
+                        case 3:   tn = "MALLOC_LARGE"; break;
+                        case 4:   tn = "MALLOC_HUGE"; break;
+                        case 7:   tn = "MALLOC_TINY"; break;
+                        case 11:  tn = "MALLOC_NANO"; break;
+                        case 30:  tn = "STACK"; break;
+                        case 33:  tn = "DYLIB"; break;
+                        case 51:  tn = "LAYERKIT (CoreAnimation)"; break;
+                        case 60:  tn = "DYLD"; break;
+                        case 74:  tn = "LIBDISPATCH"; break;
+                        case 82:  tn = "SWIFT_RUNTIME"; break;
+                        case 83:  tn = "SWIFT_METADATA"; break;
+                        case 87:  tn = "SKYWALK"; break;
+                        case 88:  tn = "IOSURFACE (drawables — Metal/DXMT)"; break;
+                        case 90:  tn = "AUDIO"; break;
+                        case 100: tn = "IOACCELERATOR (GPU driver)"; break;
+                        default:  tn = "?"; break;
+                        }
+                        dprintf(2, "[phys-map]   tag %u (%s) totals rev=ml901 dirty=%llu MB res=%llu MB swap=%llu MB\n",
+                                ti, tn, dirty_by_tag[ti] >> 20, res_by_tag[ti] >> 20, swap_by_tag[ti] >> 20);
+                    }
                 dprintf(2, "[phys-map] bands rev=ml360 (dirty/res MB):");
                 for (ti = 0; ti < B_MAX; ti++)
                     dprintf(2, " %s=%llu/%llu", band_name[ti],
                             band_dirty[ti] >> 20, band_res[ti] >> 20);
                 dprintf(2, "\n");
+                /* ml901: TWO THINGS THE RAW BANDS ABOVE DO NOT SAY, and which
+                 * were each mis-read once already.
+                 *
+                 * (1) THE POOL IS DOUBLE-COUNTED. poolRX and poolRW are two mach
+                 *     mappings of ONE vm object. Their dirty and resident pages
+                 *     are the SAME physical pages; total_dirty above adds them
+                 *     twice. Subtract one copy for any footprint arithmetic.
+                 *
+                 * (2) hostlow's resident number is mostly NOT OURS AND NOT
+                 *     CHARGED. res-dirty is clean, file-backed memory: the dyld
+                 *     shared cache, framework/dylib __TEXT, Metal shader
+                 *     libraries, our own Mach-O. Clean shared-cache pages are
+                 *     not charged to phys_footprint, which is why footprint can
+                 *     sit well below the resident total. Only the DIRTY half of
+                 *     hostlow (malloc heaps, our statics) is ours to reduce. */
+                {
+                    unsigned long long pool_once = band_dirty[B_POOL_RX];
+                    unsigned long long low_clean = band_res[B_HOST_LOW] > band_dirty[B_HOST_LOW]
+                                                 ? band_res[B_HOST_LOW] - band_dirty[B_HOST_LOW] : 0;
+                    dprintf(2, "[phys-map] interp rev=ml901: pool counted TWICE above (RX+RW are one object) "
+                               "-> deduped total_dirty=%llu MB; hostlow clean(file-backed, mostly shared cache, "
+                               "NOT footprint)=%llu MB vs hostlow dirty(ours: malloc+statics)=%llu MB\n",
+                            (total_dirty - pool_once) >> 20, low_clean >> 20,
+                            band_dirty[B_HOST_LOW] >> 20);
+                }
             }
         }
         /* ml668: ADAPTIVE CADENCE. At a flat 2s the run kept ending BETWEEN
@@ -2390,6 +2487,87 @@ uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base )
     }
     if (module_base) *module_base = 0;
     return 0;
+}
+
+/* ml901 [prof] SAMPLING-PROFILER SUPPORT.
+ *
+ * Classify a host PC that may lie inside the JIT pool. Called from the
+ * profiler thread at ~200 Hz, so it must be pure arithmetic over the ledger:
+ * no locks (it must never block the allocator, and the allocator must never
+ * block on it) and no dereference of guest/PE memory (a concurrently unmapped
+ * image would fault the sampler). The caller resolves the module NAME from the
+ * returned pe_base with its own fault-safe reader, at report cadence only.
+ *
+ * Returns
+ *   IOS_POOLPC_NO    not in the pool
+ *   IOS_POOLPC_JIT   in the tail carve -- FEX-generated code (EC_CODE buffers)
+ *   IOS_POOLPC_PE    in a live PE module copy (*idx, *pe_base, *rva set)
+ *   IOS_POOLPC_HOLE  in the head but in no live mapping (anon RWX carve,
+ *                    freed-but-not-reused range); *rva = pool offset
+ * A torn read of ios_jit_mapping_count or of one entry can only misclassify a
+ * single sample, which is why nothing here is locked.
+ *
+ * The four codes are duplicated (not shared through a header) in
+ * signal_arm64_ios.c's [prof] sampler: ios_wow.h is owned by another track and
+ * this is a two-caller, four-constant contract. */
+#define IOS_POOLPC_NO    0
+#define IOS_POOLPC_JIT   1
+#define IOS_POOLPC_PE    2
+#define IOS_POOLPC_HOLE  3
+int ios_pool_classify_pc( unsigned long long pc, int *idx,
+                          unsigned long long *pe_base, unsigned long long *rva )
+{
+    uintptr_t a = (uintptr_t)pc;
+    uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+    uintptr_t rw = (uintptr_t)ios_jit_rw_base_global;
+    size_t ps = ios_jit_pool_size_global;
+    size_t off, tail;
+    int i, n;
+
+    if (idx) *idx = -1;
+    if (pe_base) *pe_base = 0;
+    if (rva) *rva = 0;
+    if (!ps) return IOS_POOLPC_NO;
+
+    if (rx && a >= rx && a < rx + ps)      off = a - rx;
+    else if (rw && a >= rw && a < rw + ps) off = a - rw;
+    else return IOS_POOLPC_NO;
+
+    tail = ios_jit_tail_reserved;
+    if (tail > ps) tail = ps;
+    if (tail && off >= ps - tail)
+    {
+        if (rva) *rva = off - (ps - tail);
+        return IOS_POOLPC_JIT;
+    }
+
+    n = ios_jit_mapping_count;
+    if (n > IOS_JIT_MAX_MAPPINGS) n = IOS_JIT_MAX_MAPPINGS;
+    for (i = 0; i < n; i++)
+    {
+        uintptr_t jb = (uintptr_t)ios_jit_mappings[i].jit_base;
+        size_t sz = ios_jit_mappings[i].size;
+        if (!jb || !sz) continue;
+        /* compare in the RX namespace: mappings are recorded by RX address */
+        if (rx && (rx + off) >= jb && (rx + off) < jb + sz)
+        {
+            if (idx) *idx = i;
+            if (pe_base) *pe_base = (unsigned long long)(uintptr_t)ios_jit_mappings[i].pe_base;
+            if (rva) *rva = (unsigned long long)((rx + off) - jb);
+            return IOS_POOLPC_PE;
+        }
+    }
+    if (rva) *rva = off;
+    return IOS_POOLPC_HOLE;
+}
+
+/* ml901: the pool's own high-water marks, for the [prof] header line. */
+void ios_pool_watermarks( unsigned long long *size, unsigned long long *head,
+                          unsigned long long *tail )
+{
+    if (size) *size = (unsigned long long)ios_jit_pool_size_global;
+    if (head) *head = (unsigned long long)jit_pool_offset;
+    if (tail) *tail = (unsigned long long)ios_jit_tail_reserved;
 }
 
 /* Callback registered by xtajit64 (via unix_ios_push_jit_aliases unix-call)
@@ -9644,9 +9822,12 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 {
                     ERR("iOS JIT: pool exhausted for anon RWX %p+0x%lx\n",
                         base, (unsigned long)size);
-                    dprintf(2, "[jit-pool] EXHAUSTED (anon RWX): want=0x%lx bump=0x%lx/0x%lx tail_resv=0x%lx freelist=%d — FAILING allocation\n",
+                    dprintf(2, "[jit-pool] EXHAUSTED (anon RWX): want=0x%lx bump=0x%lx/0x%lx tail_resv=0x%lx freelist=%d — FAILING allocation."
+                               " *** THE POOL IS TOO SMALL FOR THIS TITLE: put a larger number of MB in"
+                               " Documents/madeira-pool.txt (current %s MB, valid 256..1152) and relaunch *** rev=ml901\n",
                             (unsigned long)alloc_size, (unsigned long)jit_pool_offset, (unsigned long)jit_pool_size,
-                            (unsigned long)ios_jit_tail_reserved, ios_pool_free_count);
+                            (unsigned long)ios_jit_tail_reserved, ios_pool_free_count,
+                            getenv("MADEIRA_POOL_MB") ? getenv("MADEIRA_POOL_MB") : "?");
                     mprotect( base, size, PROT_READ );
                     errno = ENOMEM;
                     return -1;
@@ -9852,10 +10033,13 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                  * call into the module BUS-fault-looped, locking the whole
                  * session. -1/ENOMEM propagates up as a failed module load /
                  * failed process start, which the shell reports and survives. */
-                dprintf(2, "[jit-pool] EXHAUSTED (image %p+0x%lx): want=0x%lx bump=0x%lx/0x%lx tail_resv=0x%lx freelist=%d — FAILING the load (was: silent BUS loop)\n",
+                dprintf(2, "[jit-pool] EXHAUSTED (image %p+0x%lx): want=0x%lx bump=0x%lx/0x%lx tail_resv=0x%lx freelist=%d — FAILING the load (was: silent BUS loop)."
+                           " *** THE POOL IS TOO SMALL FOR THIS TITLE: put a larger number of MB in"
+                           " Documents/madeira-pool.txt (current %s MB, valid 256..1152) and relaunch *** rev=ml901\n",
                         image_base, (unsigned long)image_size, (unsigned long)alloc_size,
                         (unsigned long)jit_pool_offset, (unsigned long)jit_pool_size,
-                        (unsigned long)ios_jit_tail_reserved, ios_pool_free_count);
+                        (unsigned long)ios_jit_tail_reserved, ios_pool_free_count,
+                        getenv("MADEIRA_POOL_MB") ? getenv("MADEIRA_POOL_MB") : "?");
                 mprotect( base, size, PROT_READ );
                 errno = ENOMEM;
                 return -1;
@@ -17198,9 +17382,12 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
                             (unsigned long)freed, (unsigned long)(freed >> 20));
                 }
             }
-            dprintf(2, "[jit-pool] TAIL REFUSED (FEX EC_CODE): want=0x%lx tail_resv=0x%lx head_used=0x%lx/0x%lx — REFUSING honestly rev=ml421 (was: fall to normal alloc = guest-band non-exec buffer = ClearCache wild write)\n",
+            dprintf(2, "[jit-pool] TAIL REFUSED (FEX EC_CODE): want=0x%lx tail_resv=0x%lx head_used=0x%lx/0x%lx — REFUSING honestly rev=ml421 (was: fall to normal alloc = guest-band non-exec buffer = ClearCache wild write)."
+                       " *** FEX WILL HALVE ITS CODE BUFFER AND RUN SLOWER. If this repeats, the pool is too small:"
+                       " put a larger number of MB in Documents/madeira-pool.txt (current %s MB, valid 256..1152) *** rev=ml901\n",
                     (unsigned long)alloc_size, (unsigned long)reserve_offset,
-                    (unsigned long)jit_pool_offset, (unsigned long)ios_jit_pool_size_global);
+                    (unsigned long)jit_pool_offset, (unsigned long)ios_jit_pool_size_global,
+                    getenv("MADEIRA_POOL_MB") ? getenv("MADEIRA_POOL_MB") : "?");
             return STATUS_NO_MEMORY;
         }
         else

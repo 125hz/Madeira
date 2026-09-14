@@ -5285,6 +5285,15 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
             pthread_detach( healer );
         }
 
+        /* ml901: the [prof] region sampler. Started from this one-time block
+         * because it is the earliest task-wide init that every session reaches
+         * exactly once (ios_exc_handler_started guards it), and the profiler
+         * must cover the whole task, not one pseudo-process. */
+        {
+            extern void ios_prof_start(void);
+            ios_prof_start();
+        }
+
         /* ml522 (#67): take the task-level port for our masks now that the
          * receive port and handler thread exist. Done here rather than at
          * detach time so there is never a window in which a fault can reach
@@ -11771,6 +11780,554 @@ next_thread:
             }
         }
     }
+}
+
+/* ============================================================================
+ * ml901  [prof] CONTINUOUS REGION-BUCKETING SAMPLING PROFILER
+ *
+ * WHY THIS EXISTS. Every performance decision to date has been argued from a
+ * suspicion and then refuted by a measurement: the fault storm, GPU sequence
+ * lag, compressor thrash, buffer retention, lost wakeups. ml688's
+ * ios_cpu_profile() was the first real measurement, but it is a ONE-SHOT
+ * bounded window fired only by the spin detector, and it buckets by (thread,
+ * guest RIP) -- which answers "which guest function" but never "is the machine
+ * in the JIT, in FEX's runtime, in a Wine PE, in our unix side, in Metal, or
+ * asleep". That partition is the one every remaining optimisation needs,
+ * because the candidate fixes (dispatcher, code quality, pool residency, DXMT)
+ * live in DIFFERENT regions and only their shares can rank them.
+ *
+ * So: sample every thread continuously and bucket the host PC by REGION.
+ *
+ * COST. The budget is <1% of the device. Per sample and per thread this costs
+ * one thread_info() trap, plus one thread_get_state() ONLY for threads the
+ * kernel reports as running (typically 2-6 of ~40 in this workload). At the
+ * 5 ms default that is ~9k traps/s. The sampler MEASURES ITS OWN CPU TIME each
+ * window and prints it, and backs its period off (doubling, to 40 ms) if it
+ * ever exceeds 2% of one core -- so the cost is never a claim, it is in the
+ * log, and it cannot silently become part of the problem it measures.
+ *
+ * WHY run_state IS CONSULTED FIRST and the PC is not simply tested for
+ * libsystem_kernel: on Darwin thread_get_state() of a thread that is actually
+ * on-core returns the state saved at its last kernel entry, which for a busy
+ * thread is stale and frequently still points into libsystem_kernel. Deciding
+ * "waiting" from the PC would therefore report a spinning process as idle.
+ * run_state comes from the scheduler and does not have that failure mode. The
+ * residual staleness only blurs WHICH region a running thread is in, which is
+ * acceptable for a sampling profiler and is the same assumption ml686/ml688
+ * already ship.
+ *
+ * KNOB: Documents/madeira-prof.txt -> MADEIRA_PROF. Empty/absent = ON at 5 ms.
+ * "0" disables. A number is the sample period in ms (1..1000). A second
+ * comma-separated number is the report interval in seconds (default 10).
+ * ==========================================================================*/
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+
+/* mirrors the four codes in virtual_ios.c's ios_pool_classify_pc (deliberately
+ * duplicated rather than routed through ios_wow.h, which another track owns) */
+#define IOS_POOLPC_NO    0
+#define IOS_POOLPC_JIT   1
+#define IOS_POOLPC_PE    2
+#define IOS_POOLPC_HOLE  3
+extern int ios_pool_classify_pc( unsigned long long pc, int *idx,
+                                 unsigned long long *pe_base, unsigned long long *rva );
+extern void ios_pool_watermarks( unsigned long long *size, unsigned long long *head,
+                                 unsigned long long *tail );
+
+enum {
+    PRB_JIT = 0,    /* FEX-generated ARM64 in the pool tail (EC_CODE buffers) */
+    PRB_FEXRT,      /* the FEX runtime's own PE pool copy (xtajit/arm64ecfex)  */
+    PRB_PE,         /* any other Wine PE pool copy (broken out per module)     */
+    PRB_POOLHOLE,   /* pool head, no live mapping: anon-RWX carve or freelist  */
+    PRB_UNIX,       /* the Madeira main binary: wine unix side, DXMT, winemetal*/
+    PRB_MACH,       /* ... but sampled on the Mach exception handler thread    */
+    PRB_METAL,      /* Metal / AGX / IOGPU / GPU compiler dylibs               */
+    PRB_DYLIB,      /* every other host dylib                                  */
+    PRB_GUEST,      /* the guest window -- must be 0 (invariant 7)             */
+    PRB_FEXHOST,    /* FEX host band 0x7c..0x80                                */
+    PRB_OTHER,
+    PRB_MAX
+};
+static const char * const ios_prb_name[PRB_MAX] = {
+    "jit", "fexrt", "pe", "poolhole", "unix", "mach", "metal",
+    "dylib", "guest", "fexhost", "other"
+};
+
+#define IOS_PROFIMG_MAX  768
+struct ios_profimg_ent { uint64_t lo, hi; unsigned char cls; char name[40]; };
+static struct ios_profimg_ent ios_profimg[IOS_PROFIMG_MAX];
+static int ios_profimg_n;
+static uint32_t ios_profimg_built_for;      /* _dyld_image_count when last built */
+
+static int ios_prof_name_is_metal( const char *n )
+{
+    return strstr(n, "Metal") || strstr(n, "AGX") || strstr(n, "IOGPU") ||
+           strstr(n, "GPUCompiler") || strstr(n, "GPUTools") ||
+           strstr(n, "IOAccelerator") || strstr(n, "AppleGPU");
+}
+
+/* Snapshot every loaded Mach-O's executable segments. Rebuilt only when the
+ * image count changes, so the sampler's hot path is a binary search. */
+static void ios_prof_build_images(void)
+{
+    uint32_t n = _dyld_image_count(), i;
+    int k = 0, a, b;
+
+    if (n == ios_profimg_built_for && ios_profimg_n) return;
+    for (i = 0; i < n && k < IOS_PROFIMG_MAX; i++)
+    {
+        const struct mach_header_64 *mh =
+            (const struct mach_header_64 *)_dyld_get_image_header( i );
+        intptr_t slide = _dyld_get_image_vmaddr_slide( i );
+        const char *path = _dyld_get_image_name( i ), *bn;
+        const struct load_command *lc;
+        uint64_t lo = 0, hi = 0;
+        uint32_t c;
+
+        if (!mh || mh->magic != MH_MAGIC_64) continue;
+        lc = (const struct load_command *)(mh + 1);
+        for (c = 0; c < mh->ncmds; c++)
+        {
+            if (lc->cmd == LC_SEGMENT_64)
+            {
+                const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+                if ((sg->initprot & VM_PROT_EXECUTE) && sg->vmsize)
+                {
+                    uint64_t s = (uint64_t)(sg->vmaddr + slide), e = s + sg->vmsize;
+                    if (!lo || s < lo) lo = s;
+                    if (e > hi) hi = e;
+                }
+            }
+            if (!lc->cmdsize) break;
+            lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+        }
+        if (!lo || hi <= lo) continue;
+        bn = path ? strrchr( path, '/' ) : NULL;
+        bn = bn ? bn + 1 : (path ? path : "?");
+        ios_profimg[k].lo = lo;
+        ios_profimg[k].hi = hi;
+        {
+            size_t l = strlen( bn );
+            if (l > sizeof(ios_profimg[k].name) - 1) l = sizeof(ios_profimg[k].name) - 1;
+            memcpy( ios_profimg[k].name, bn, l );   /* wine poisons strncpy */
+            ios_profimg[k].name[l] = 0;
+        }
+        if (mh->filetype == MH_EXECUTE)                       ios_profimg[k].cls = PRB_UNIX;
+        else if (strstr( bn, "libsystem_kernel" ))            ios_profimg[k].cls = PRB_DYLIB;
+        else if (ios_prof_name_is_metal( bn ))                ios_profimg[k].cls = PRB_METAL;
+        else                                                  ios_profimg[k].cls = PRB_DYLIB;
+        k++;
+    }
+    /* insertion sort by lo -- k is a few hundred and this runs once */
+    for (a = 1; a < k; a++)
+    {
+        struct ios_profimg_ent t = ios_profimg[a];
+        for (b = a - 1; b >= 0 && ios_profimg[b].lo > t.lo; b--)
+            ios_profimg[b + 1] = ios_profimg[b];
+        ios_profimg[b + 1] = t;
+    }
+    ios_profimg_n = k;
+    ios_profimg_built_for = n;
+}
+
+static int ios_prof_image_for( uint64_t pc, const char **name, uint64_t *base )
+{
+    int lo = 0, hi = ios_profimg_n - 1;
+    while (lo <= hi)
+    {
+        int mid = (lo + hi) / 2;
+        if (pc < ios_profimg[mid].lo) hi = mid - 1;
+        else if (pc >= ios_profimg[mid].hi) lo = mid + 1;
+        else
+        {
+            if (name) *name = ios_profimg[mid].name;
+            if (base) *base = ios_profimg[mid].lo;
+            return ios_profimg[mid].cls;
+        }
+    }
+    return -1;
+}
+
+#define IOS_PROF_TH_MAX   256
+#define IOS_PROF_PE_MAX    64
+#define IOS_PROF_PC_MAX   512
+
+static thread_t ios_prof_port[IOS_PROF_TH_MAX];
+static char     ios_prof_tname[IOS_PROF_TH_MAX][32];
+static unsigned char ios_prof_trole[IOS_PROF_TH_MAX];    /* 1 = mach exc handler */
+static unsigned long ios_prof_trun[IOS_PROF_TH_MAX];
+static int      ios_prof_nth;
+
+static void ios_prof_release_ports(void)
+{
+    int i;
+    for (i = 0; i < ios_prof_nth; i++)
+        if (ios_prof_port[i]) mach_port_deallocate( mach_task_self(), ios_prof_port[i] );
+    ios_prof_nth = 0;
+}
+
+/* Cache the thread port list (and names) so the 200 Hz loop pays no
+ * task_threads()/port-churn; refreshed on the report cadence. */
+static void ios_prof_refresh_threads( thread_t self )
+{
+    thread_act_array_t th;
+    mach_msg_type_number_t cnt = 0, i;
+    int k = 0;
+
+    ios_prof_release_ports();
+    memset( ios_prof_trun, 0, sizeof(ios_prof_trun) );
+    if (task_threads( mach_task_self(), &th, &cnt ) != KERN_SUCCESS) return;
+    for (i = 0; i < cnt; i++)
+    {
+        if (th[i] == self || k >= IOS_PROF_TH_MAX)
+        {
+            mach_port_deallocate( mach_task_self(), th[i] );
+            continue;
+        }
+        ios_prof_port[k] = th[i];                 /* keep the send right */
+        ios_prof_tname[k][0] = 0;
+        {
+            pthread_t pt = pthread_from_mach_thread_np( th[i] );
+            if (pt) pthread_getname_np( pt, ios_prof_tname[k], sizeof(ios_prof_tname[k]) );
+        }
+        ios_prof_trole[k] = strstr( ios_prof_tname[k], "wine-x18-exc" ) ? 1 : 0;
+        k++;
+    }
+    ios_prof_nth = k;
+    vm_deallocate( mach_task_self(), (vm_address_t)th, cnt * sizeof(thread_t) );
+}
+
+static uint64_t ios_prof_self_cpu_us( thread_t self )
+{
+    struct thread_basic_info bi;
+    mach_msg_type_number_t bc = THREAD_BASIC_INFO_COUNT;
+    if (thread_info( self, THREAD_BASIC_INFO, (thread_info_t)&bi, &bc ) != KERN_SUCCESS)
+        return 0;
+    return (uint64_t)bi.user_time.seconds * 1000000 + bi.user_time.microseconds +
+           (uint64_t)bi.system_time.seconds * 1000000 + bi.system_time.microseconds;
+}
+
+static void *ios_prof_thread( void *arg )
+{
+    unsigned long bucket[PRB_MAX];
+    struct { uint64_t pe_base; unsigned long n; } pe[IOS_PROF_PE_MAX];
+    struct { uint64_t pc, x28; unsigned long n; unsigned char cls; } hot[IOS_PROF_PC_MAX];
+    int period_ms = 5, report_s = 10, npe = 0, backed_off = 0;
+    thread_t self = mach_thread_self();
+    unsigned long samples = 0, obs = 0, run_obs = 0, wait_obs = 0, dead = 0;
+    struct timeval t0, now;
+    uint64_t cpu0;
+
+    pthread_setname_np( "madeira-prof" );
+    pthread_set_qos_class_self_np( QOS_CLASS_UTILITY, 0 );
+
+    {
+        const char *e = getenv( "MADEIRA_PROF" );
+        if (e && *e)
+        {
+            int v = atoi( e );
+            const char *comma = strchr( e, ',' );
+            if (v == 0 && (e[0] == '0'))
+            {
+                fprintf(stderr, "[prof] ml901 DISABLED by MADEIRA_PROF=0\n");
+                return NULL;
+            }
+            if (v >= 1 && v <= 1000) period_ms = v;
+            if (comma)
+            {
+                int r = atoi( comma + 1 );
+                if (r >= 1 && r <= 600) report_s = r;
+            }
+        }
+    }
+    fprintf(stderr, "[prof] ml901 armed: period=%dms report=%ds "
+                    "(knob Documents/madeira-prof.txt -> MADEIRA_PROF=\"period_ms[,report_s]\", 0=off)\n",
+            period_ms, report_s);
+
+    memset( bucket, 0, sizeof(bucket) );
+    memset( pe, 0, sizeof(pe) );
+    memset( hot, 0, sizeof(hot) );
+    ios_prof_build_images();
+    ios_prof_refresh_threads( self );
+    gettimeofday( &t0, NULL );
+    cpu0 = ios_prof_self_cpu_us( self );
+
+    for (;;)
+    {
+        int i;
+        long elapsed_us;
+
+        usleep( period_ms * 1000 );
+        samples++;
+
+        for (i = 0; i < ios_prof_nth; i++)
+        {
+            struct thread_basic_info bi;
+            mach_msg_type_number_t bc = THREAD_BASIC_INFO_COUNT;
+            arm_thread_state64_t st;
+            mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+            uint64_t pc, peb = 0, rva = 0;
+            int cls = PRB_OTHER, mi = -1, h;
+
+            if (!ios_prof_port[i]) continue;
+            if (thread_info( ios_prof_port[i], THREAD_BASIC_INFO,
+                             (thread_info_t)&bi, &bc ) != KERN_SUCCESS)
+            {
+                mach_port_deallocate( mach_task_self(), ios_prof_port[i] );
+                ios_prof_port[i] = 0;
+                dead++;
+                continue;
+            }
+            obs++;
+            if (bi.run_state != TH_STATE_RUNNING) { wait_obs++; continue; }
+            if (thread_get_state( ios_prof_port[i], ARM_THREAD_STATE64,
+                                  (thread_state_t)&st, &sc ) != KERN_SUCCESS)
+                continue;
+            run_obs++;
+            ios_prof_trun[i]++;
+            pc = st.__pc;
+
+            switch (ios_pool_classify_pc( pc, &mi, &peb, &rva ))
+            {
+            case IOS_POOLPC_JIT:  cls = PRB_JIT;      break;
+            case IOS_POOLPC_HOLE: cls = PRB_POOLHOLE; break;
+            case IOS_POOLPC_PE:
+                cls = PRB_PE;
+                {   /* per-module tally, keyed by the PE base (stable) */
+                    int p;
+                    for (p = 0; p < npe; p++) if (pe[p].pe_base == peb) break;
+                    if (p == npe && npe < IOS_PROF_PE_MAX) { pe[npe].pe_base = peb; npe++; }
+                    if (p < IOS_PROF_PE_MAX) pe[p].n++;
+                }
+                break;
+            default:
+                if (pc < 0x1000000000ULL)
+                {
+                    int c = ios_prof_image_for( pc, NULL, NULL );
+                    cls = (c >= 0) ? c : PRB_OTHER;
+                    if (cls == PRB_UNIX && ios_prof_trole[i] == 1) cls = PRB_MACH;
+                }
+                else if (pc >= 0x7000000000ULL && pc < 0x7400000000ULL) cls = PRB_GUEST;
+                else if (pc >= 0x7c00000000ULL && pc < 0x8000000000ULL) cls = PRB_FEXHOST;
+                else cls = PRB_OTHER;
+                break;
+            }
+            bucket[cls]++;
+
+            /* hottest host PCs: open-addressed, linear probe, never grows */
+            h = (int)((pc >> 2) % IOS_PROF_PC_MAX);
+            {
+                int probe;
+                for (probe = 0; probe < 8; probe++)
+                {
+                    int s = (h + probe) % IOS_PROF_PC_MAX;
+                    if (!hot[s].n) { hot[s].pc = pc; hot[s].x28 = st.__x[28];
+                                     hot[s].cls = (unsigned char)cls; hot[s].n = 1; break; }
+                    if (hot[s].pc == pc) { hot[s].n++; break; }
+                }
+            }
+        }
+
+        gettimeofday( &now, NULL );
+        elapsed_us = (long)((now.tv_sec - t0.tv_sec) * 1000000 + (now.tv_usec - t0.tv_usec));
+        if (elapsed_us < (long)report_s * 1000000) continue;
+
+        {
+            uint64_t cpu1 = ios_prof_self_cpu_us( self );
+            double cost = elapsed_us ? (100.0 * (double)(cpu1 - cpu0) / (double)elapsed_us) : 0.0;
+            unsigned long cpu_obs = 0;
+            unsigned long long psz = 0, phead = 0, ptail = 0;
+            int c;
+
+            /* Split the FEX runtime out of the generic PE bucket. The test is a
+             * module NAME, which costs a fault-safe read of the PE's export
+             * directory -- so it happens once per module HERE, never in the
+             * 200 Hz loop. pe_is_fex[] is also reused by the module line. */
+            char pe_is_fex[IOS_PROF_PE_MAX];
+            {
+                int p;
+                memset( pe_is_fex, 0, sizeof(pe_is_fex) );
+                for (p = 0; p < npe; p++)
+                {
+                    const char *nm = ios_pe_module_name( pe[p].pe_base );
+                    if (strstr( nm, "xtajit" ) || strstr( nm, "arm64ecfex" ) ||
+                        strstr( nm, "libfex" ) || strstr( nm, "FEX" ))
+                    {
+                        pe_is_fex[p] = 1;
+                        if (bucket[PRB_PE] >= pe[p].n) bucket[PRB_PE] -= pe[p].n;
+                        bucket[PRB_FEXRT] += pe[p].n;
+                    }
+                }
+            }
+
+            for (c = 0; c < PRB_MAX; c++) cpu_obs += bucket[c];
+            ios_pool_watermarks( &psz, &phead, &ptail );
+
+            fprintf(stderr, "[prof] ml901 %.1fs samples=%lu threads=%d obs=%lu busy=%.2f cores "
+                            "wait=%.1f%% dead=%lu cost=%.2f%%/core period=%dms "
+                            "pool=%lluMB head=0x%llx tail=0x%llx\n",
+                    elapsed_us / 1e6, samples, ios_prof_nth, obs,
+                    samples ? (double)run_obs / (double)samples : 0.0,
+                    obs ? (100.0 * wait_obs / obs) : 0.0, dead, cost, period_ms,
+                    psz >> 20, phead, ptail);
+
+            if (!cpu_obs)
+                fprintf(stderr, "[prof]   no running samples in this window\n");
+            else
+            {
+                char line[512];
+                int len = 0;
+                for (c = 0; c < PRB_MAX; c++)
+                {
+                    if (!bucket[c]) continue;
+                    len += snprintf( line + len, sizeof(line) - len, " %s=%.1f%%",
+                                     ios_prb_name[c], 100.0 * bucket[c] / cpu_obs );
+                    if (len >= (int)sizeof(line) - 24) break;
+                }
+                fprintf(stderr, "[prof]   cpu%%:%s\n", line);
+            }
+
+            /* per-module shares of the pool copies (* = counted as fexrt above) */
+            if (npe && cpu_obs)
+            {
+                int p, rank;
+                char line[512];
+                int len = 0;
+                for (rank = 0; rank < 8; rank++)
+                {
+                    int best = -1; unsigned long bv = 0;
+                    for (p = 0; p < npe; p++) if (pe[p].n > bv) { bv = pe[p].n; best = p; }
+                    if (best < 0) break;
+                    len += snprintf( line + len, sizeof(line) - len, " %s%s=%.1f%%",
+                                     pe_is_fex[best] ? "*" : "",
+                                     ios_pe_module_name( pe[best].pe_base ),
+                                     100.0 * bv / cpu_obs );
+                    pe[best].n = 0;
+                    if (len >= (int)sizeof(line) - 32) break;
+                }
+                fprintf(stderr, "[prof]   pool modules (* = FEX runtime):%s\n", line);
+            }
+
+            /* thread shares -- this is what separates DXMT / wineserver / the
+             * game's own threads inside the single `unix` binary bucket */
+            if (run_obs)
+            {
+                int rank;
+                char line[512];
+                int len = 0;
+                for (rank = 0; rank < 8; rank++)
+                {
+                    int best = -1, t; unsigned long bv = 0;
+                    for (t = 0; t < ios_prof_nth; t++)
+                        if (ios_prof_trun[t] > bv) { bv = ios_prof_trun[t]; best = t; }
+                    if (best < 0) break;
+                    len += snprintf( line + len, sizeof(line) - len, " \"%s\"=%.1f%%",
+                                     ios_prof_tname[best][0] ? ios_prof_tname[best] : "(unnamed)",
+                                     100.0 * bv / run_obs );
+                    ios_prof_trun[best] = 0;
+                    if (len >= (int)sizeof(line) - 48) break;
+                }
+                fprintf(stderr, "[prof]   threads:%s\n", line);
+            }
+
+            /* top 8 host PCs, symbolised */
+            if (cpu_obs)
+            {
+                int rank;
+                for (rank = 0; rank < 8; rank++)
+                {
+                    int best = -1, s; unsigned long bv = 0;
+                    for (s = 0; s < IOS_PROF_PC_MAX; s++)
+                        if (hot[s].n > bv) { bv = hot[s].n; best = s; }
+                    if (best < 0 || !bv) break;
+                    {
+                        uint64_t pc = hot[best].pc;
+                        int cls = hot[best].cls;
+                        char detail[192];
+                        detail[0] = 0;
+                        if (cls == PRB_PE || cls == PRB_POOLHOLE)
+                        {
+                            int mi2 = -1; unsigned long long peb2 = 0, rva2 = 0;
+                            if (ios_pool_classify_pc( pc, &mi2, &peb2, &rva2 ) == IOS_POOLPC_PE)
+                                snprintf( detail, sizeof(detail), " %s+0x%llx",
+                                          ios_pe_module_name( peb2 ), rva2 );
+                            else
+                                snprintf( detail, sizeof(detail), " pool+0x%llx", rva2 );
+                        }
+                        else if (cls == PRB_JIT)
+                        {
+                            uint64_t bb = 0, rip = 0; mach_vm_size_t g = 0;
+                            const char *why = "no x28";
+                            if (hot[best].x28 > 0x10000 &&
+                                mach_vm_read_overwrite( mach_task_self(),
+                                    (mach_vm_address_t)hot[best].x28, 8,
+                                    (mach_vm_address_t)&bb, &g ) == KERN_SUCCESS && g == 8 && bb)
+                                rip = ios_native_rip_from_hostpc( bb, pc, &why );
+                            if (rip)
+                            {
+                                uint64_t rva2 = 0;
+                                const char *mod = ios_guest_module_for( rip, &rva2 );
+                                snprintf( detail, sizeof(detail), " guest=%s+0x%llx rip=0x%llx",
+                                          mod ? mod : "?", (unsigned long long)rva2,
+                                          (unsigned long long)rip );
+                            }
+                            else snprintf( detail, sizeof(detail), " guest=? (%s)", why );
+                        }
+                        else
+                        {
+                            const char *nm = NULL;
+                            uint64_t ibase = 0;
+                            Dl_info di;
+                            if (ios_prof_image_for( pc, &nm, &ibase ) >= 0 && nm)
+                            {
+                                if (dladdr( (void *)(uintptr_t)pc, &di ) && di.dli_sname && di.dli_saddr)
+                                    snprintf( detail, sizeof(detail), " %s`%s+0x%llx", nm,
+                                              di.dli_sname,
+                                              (unsigned long long)(pc - (uint64_t)(uintptr_t)di.dli_saddr) );
+                                else
+                                    snprintf( detail, sizeof(detail), " %s+0x%llx", nm,
+                                              (unsigned long long)(pc - ibase) );
+                            }
+                        }
+                        fprintf(stderr, "[prof]   top%d %5.1f%% %-8s pc=0x%llx%s\n",
+                                rank + 1, 100.0 * bv / cpu_obs, ios_prb_name[cls],
+                                (unsigned long long)pc, detail);
+                    }
+                    hot[best].n = 0;
+                }
+            }
+
+            /* self-regulate: never let the measurement become the problem */
+            if (cost > 2.0 && period_ms < 40)
+            {
+                period_ms *= 2;
+                backed_off++;
+                fprintf(stderr, "[prof]   BACKING OFF: cost %.2f%%/core > 2%%, period now %dms "
+                                "(backoffs=%d)\n", cost, period_ms, backed_off);
+            }
+
+            memset( bucket, 0, sizeof(bucket) );
+            memset( pe, 0, sizeof(pe) );
+            memset( hot, 0, sizeof(hot) );
+            npe = 0;
+            samples = obs = run_obs = wait_obs = dead = 0;
+            ios_prof_build_images();
+            ios_prof_refresh_threads( self );
+            gettimeofday( &t0, NULL );
+            cpu0 = ios_prof_self_cpu_us( self );
+        }
+    }
+    return NULL;
+}
+
+void ios_prof_start(void)
+{
+    static int started;
+    pthread_t t;
+    if (started) return;
+    started = 1;
+    if (!pthread_create( &t, NULL, ios_prof_thread, NULL )) pthread_detach( t );
+    else fprintf(stderr, "[prof] ml901 pthread_create FAILED — no profiler this run\n");
 }
 
 void ios_wait_chain_snapshot( const char *why )
