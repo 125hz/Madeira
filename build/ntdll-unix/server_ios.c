@@ -546,6 +546,332 @@ volatile int ios_srv_wait_timeouts = 0;   /* ... of which returned STATUS_TIMEOU
 volatile int ios_srv_req_count = 0;       /* ALL threads: wineserver requests */
 uintptr_t ios_srv_game_teb = 0;           /* set once by server_init_process_done */
 
+#ifdef WINE_IOS
+
+/***********************************************************************
+ *           [srv-stats]  —  what the wineserver round trip actually costs
+ *
+ * ml920's [prof] put 15-25 % of ALL CPU inside the round trip itself
+ * (read<-read_request, read<-read_reply_data, semaphore_signal_trap<-
+ * server_call_unlocked, semaphore_timedwait_trap<-main_loop) but could not
+ * say WHICH requests were paying it: the kernel stacks are identical for
+ * every request kind.  This is the missing half.
+ *
+ * Accounting is CLIENT-side and wraps exactly the span the profiler charges
+ * us for: send_request() entry to the last byte of the reply, i.e. the whole
+ * of server_call_unlocked, which is the single chokepoint every request kind
+ * goes through (wine_server_call, server_select and SERVER_START_REQ all end
+ * up here).  Cost per request: two mach_absolute_time() reads (a commpage
+ * read on arm64, no syscall) and three relaxed atomic adds.
+ *
+ * Counters are plain arrays written with __ATOMIC_RELAXED.  A lost increment
+ * costs fidelity, never correctness, and the alternative — a lock — would
+ * become the thing being measured.  The report is PIGGY-BACKED: whichever
+ * thread first sees the 10 s deadline at the end of its own call publishes
+ * the new deadline with a CAS and prints; every other thread sees the CAS
+ * fail and walks away, so the report happens exactly once per window with no
+ * timer thread of its own.  Each counter is exchanged to zero as it is read,
+ * so the numbers are per-window rates.
+ *
+ * The request NAMES come from server_req_names.h, generated once from the
+ * enum in wine/include/wine/server_protocol.h.  Regenerate it with:
+ *   sed -n '/^enum request$/,/REQ_NB_REQUESTS/p' include/wine/server_protocol.h \
+ *     | sed -n 's/^ *REQ_\([a-z0-9_]*\),$/    "\1",/p'
+ * and keep the C_ASSERT at its foot — it is what turns a Wine update that
+ * inserts a request into a build failure instead of a silently shifted table.
+ */
+#include <mach/mach_time.h>
+#include "ios_srv_stats.h"
+#include "server_req_names.h"
+
+/* MADEIRA_SRV_STATS=0 turns the accounting off entirely (both timer reads
+ * and every atomic add); any other value, or absent, leaves it on. */
+static int ios_srv_stats_on = -1;         /* -1 = not yet probed */
+
+#define IOS_SRV_STATS_PERIOD_S   10
+#define IOS_SRV_STATS_TOP_KINDS  12
+#define IOS_SRV_STATS_TOP_THR    6
+#define IOS_SRV_THR_SLOTS        256
+
+unsigned int ios_srv_nt_counts[IOS_NT_COUNTER_MAX];
+
+static unsigned int        ios_srv_kind_count[REQ_NB_REQUESTS];
+static unsigned long long  ios_srv_kind_ticks[REQ_NB_REQUESTS];
+static unsigned int        ios_srv_thr_tid[IOS_SRV_THR_SLOTS];
+static unsigned int        ios_srv_thr_count[IOS_SRV_THR_SLOTS];
+static unsigned long long  ios_srv_stats_deadline;   /* mach ticks */
+static unsigned long long  ios_srv_stats_window_t0;
+
+static inline unsigned long long ios_srv_ticks_to_ns( unsigned long long ticks )
+{
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info( &tb );
+    return ticks * tb.numer / tb.denom;
+}
+
+static inline unsigned long long ios_srv_ns_to_ticks( unsigned long long ns )
+{
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info( &tb );
+    return ns * tb.denom / tb.numer;
+}
+
+/* Open-addressed, fixed, never-grown.  A tid that cannot find a slot in four
+ * probes is folded into slot 0 and reported as tid 0000 — the top callers are
+ * a handful of threads, and a long tail that lands in the bucket is exactly
+ * what "other" should mean. */
+static inline void ios_srv_thr_bump( unsigned int tid )
+{
+    unsigned int i, idx = (tid * 2654435761u) % IOS_SRV_THR_SLOTS;
+
+    for (i = 0; i < 4; i++)
+    {
+        unsigned int slot = (idx + i) % IOS_SRV_THR_SLOTS;
+        unsigned int have = __atomic_load_n( &ios_srv_thr_tid[slot], __ATOMIC_RELAXED );
+
+        if (have == tid)
+        {
+            __atomic_fetch_add( &ios_srv_thr_count[slot], 1, __ATOMIC_RELAXED );
+            return;
+        }
+        if (!have)
+        {
+            unsigned int expect = 0;
+            if (__atomic_compare_exchange_n( &ios_srv_thr_tid[slot], &expect, tid, 0,
+                                             __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
+            {
+                __atomic_fetch_add( &ios_srv_thr_count[slot], 1, __ATOMIC_RELAXED );
+                return;
+            }
+            i--;   /* someone claimed it under us; re-read this same slot */
+        }
+    }
+    __atomic_fetch_add( &ios_srv_thr_count[0], 1, __ATOMIC_RELAXED );
+}
+
+static void ios_srv_stats_report( unsigned long long now )
+{
+    unsigned int top_kind[IOS_SRV_STATS_TOP_KINDS], top_thr[IOS_SRV_STATS_TOP_THR];
+    /* The snapshot arrays are static, not automatic: ~4.7 KB of stack would
+     * otherwise land on whichever thread happened to cross the deadline, and
+     * that can be a FEX/CEF-created thread with a small stack.  Only one
+     * thread is ever inside this function — the deadline CAS in
+     * ios_srv_stats_account() elects exactly one per window and publishes the
+     * next deadline before calling — so one shared set is safe. */
+    static unsigned int counts[REQ_NB_REQUESTS], thr_counts[IOS_SRV_THR_SLOTS];
+    static unsigned long long ticks[REQ_NB_REQUESTS];
+    unsigned long long total_ns = 0, window_ns;
+    unsigned int total = 0, nt[IOS_NT_COUNTER_MAX];
+    char line[1024];
+    int i, j, n, len;
+
+    window_ns = ios_srv_ticks_to_ns( now - ios_srv_stats_window_t0 );
+    ios_srv_stats_window_t0 = now;
+    if (!window_ns) window_ns = 1;
+
+    for (i = 0; i < REQ_NB_REQUESTS; i++)
+    {
+        counts[i] = __atomic_exchange_n( &ios_srv_kind_count[i], 0, __ATOMIC_RELAXED );
+        ticks[i]  = __atomic_exchange_n( &ios_srv_kind_ticks[i], 0, __ATOMIC_RELAXED );
+        total    += counts[i];
+        total_ns += ios_srv_ticks_to_ns( ticks[i] );
+    }
+    for (i = 0; i < IOS_SRV_THR_SLOTS; i++)
+        thr_counts[i] = __atomic_exchange_n( &ios_srv_thr_count[i], 0, __ATOMIC_RELAXED );
+    for (i = 0; i < IOS_NT_COUNTER_MAX; i++)
+        nt[i] = __atomic_exchange_n( &ios_srv_nt_counts[i], 0, __ATOMIC_RELAXED );
+
+    if (!total && !nt[IOS_NT_DELAY_ZERO] && !nt[IOS_NT_ALERT_WAIT]) return;
+
+    /* selection sort of the top N; N is tiny, the arrays are not sorted */
+    for (i = 0; i < IOS_SRV_STATS_TOP_KINDS; i++)
+    {
+        unsigned int best = 0, best_n = 0;
+        for (j = 0; j < REQ_NB_REQUESTS; j++)
+        {
+            int dup = 0;
+            for (n = 0; n < i; n++) if (top_kind[n] == (unsigned int)j) dup = 1;
+            if (dup || counts[j] <= best_n) continue;
+            best = j; best_n = counts[j];
+        }
+        top_kind[i] = best_n ? best : REQ_NB_REQUESTS;
+    }
+    for (i = 0; i < IOS_SRV_STATS_TOP_THR; i++)
+    {
+        unsigned int best = IOS_SRV_THR_SLOTS, best_n = 0;
+        for (j = 0; j < IOS_SRV_THR_SLOTS; j++)
+        {
+            int dup = 0;
+            for (n = 0; n < i; n++) if (top_thr[n] == (unsigned int)j) dup = 1;
+            if (dup || thr_counts[j] <= best_n) continue;
+            best = j; best_n = thr_counts[j];
+        }
+        top_thr[i] = best_n ? best : IOS_SRV_THR_SLOTS;
+    }
+
+    /* line 1: the headline — how much wall time this task spent inside the
+     * round trip, as a fraction of ONE core-second per second. */
+    wine_log_write( "[srv-stats] %llums reqs=%u (%llu/s) in-call=%llums (%llu.%02llu core) rev=ml950",
+                    window_ns / 1000000ull, total,
+                    (unsigned long long)total * 1000000000ull / window_ns,
+                    total_ns / 1000000ull,
+                    total_ns / window_ns,
+                    total_ns * 100ull / window_ns % 100ull );
+
+    /* snprintf returns the length it WOULD have written, so `len` must be
+     * clamped back to the buffer before it is used as an offset again — an
+     * unclamped len makes `sizeof(line) - len` underflow to a huge size_t on
+     * the next iteration, which is a buffer overrun, not a truncation. */
+#define IOS_SRV_APPEND(...)                                                        \
+    do {                                                                           \
+        int _w = snprintf( line + len, sizeof(line) - len, __VA_ARGS__ );           \
+        if (_w < 0) break;                                                         \
+        len += _w;                                                                 \
+        if (len > (int)sizeof(line) - 1) len = (int)sizeof(line) - 1;               \
+    } while (0)
+
+    len = snprintf( line, sizeof(line), "[srv-stats]   kinds:" );
+    for (i = 0; i < IOS_SRV_STATS_TOP_KINDS && len < (int)sizeof(line) - 1; i++)
+    {
+        unsigned int k = top_kind[i];
+        if (k >= REQ_NB_REQUESTS) break;
+        IOS_SRV_APPEND( " %s=%u/%lluus", ios_srv_req_names[k], counts[k],
+                        ios_srv_ticks_to_ns( ticks[k] ) / 1000ull / counts[k] );
+    }
+    wine_log_write( "%s", line );
+
+    len = snprintf( line, sizeof(line), "[srv-stats]   threads:" );
+    for (i = 0; i < IOS_SRV_STATS_TOP_THR && len < (int)sizeof(line) - 1; i++)
+    {
+        unsigned int s = top_thr[i];
+        if (s >= IOS_SRV_THR_SLOTS) break;
+        IOS_SRV_APPEND( " tid=%04x:%u",
+                        __atomic_load_n( &ios_srv_thr_tid[s], __ATOMIC_RELAXED ),
+                        thr_counts[s] );
+    }
+    wine_log_write( "%s", line );
+#undef IOS_SRV_APPEND
+
+    wine_log_write( "[srv-stats]   nt: setev=%u resetev=%u pulse=%u wait1=%u waitN=%u sigwait=%u "
+                    "relsem=%u relmut=%u sleep0=%u sleepN=%u yield_sc=%u",
+                    nt[IOS_NT_SET_EVENT], nt[IOS_NT_RESET_EVENT], nt[IOS_NT_PULSE_EVENT],
+                    nt[IOS_NT_WAIT_SINGLE], nt[IOS_NT_WAIT_MULTI], nt[IOS_NT_SIGNAL_AND_WAIT],
+                    nt[IOS_NT_RELEASE_SEM], nt[IOS_NT_RELEASE_MUTANT],
+                    nt[IOS_NT_DELAY_ZERO], nt[IOS_NT_DELAY_NONZERO], nt[IOS_NT_YIELD_SYSCALL] );
+
+    /* The alert ping-pong is NOT server-backed on this target: USE_FUTEX is
+     * defined for __APPLE__ in sync.c, so NtAlertThreadByThreadId is an
+     * InterlockedExchange plus os_sync_wake_by_address_any and
+     * NtWaitForAlertByThreadId is os_sync_wait_on_address.  Neither appears
+     * in reqs= above; they are reported here so [alert-storm] can be sized
+     * against the server traffic rather than confused with it. */
+    /* The decisive line for "what is the select traffic actually made of".
+     * *_inf is nearly free (one request, then the thread is off the CPU until
+     * something signals); *_fin and *_poll are the ones that cost a round trip
+     * per iteration, and tmo_fin says how many of the finite ones bought
+     * nothing but a STATUS_TIMEOUT. */
+    wine_log_write( "[srv-stats]   select: w1 inf=%u fin=%u poll=%u | wN inf=%u fin=%u poll=%u | "
+                    "all=%u sigwait=%u keyed=%u delay=%u other=%u | tmo=%u tmo_fin=%u",
+                    nt[IOS_SEL_WAIT1_INF], nt[IOS_SEL_WAIT1_FIN], nt[IOS_SEL_WAIT1_POLL],
+                    nt[IOS_SEL_WAITN_INF], nt[IOS_SEL_WAITN_FIN], nt[IOS_SEL_WAITN_POLL],
+                    nt[IOS_SEL_WAITALL], nt[IOS_SEL_SIGWAIT], nt[IOS_SEL_KEYED],
+                    nt[IOS_SEL_DELAY_ALERT], nt[IOS_SEL_OTHER],
+                    nt[IOS_SEL_RET_TIMEOUT], nt[IOS_SEL_RET_TIMEOUT_FIN] );
+
+    wine_log_write( "[srv-stats]   futex(no server): alert_wait=%u alert_wake=%u | "
+                    "fast hit=%u miss=%u wake=%u sleep=%u",
+                    nt[IOS_NT_ALERT_WAIT], nt[IOS_NT_ALERT_WAKE],
+                    nt[IOS_NT_FAST_HIT], nt[IOS_NT_FAST_MISS],
+                    nt[IOS_NT_FAST_WAKE], nt[IOS_NT_FAST_SLEEP] );
+}
+
+static inline void ios_srv_stats_account( unsigned int kind, unsigned long long t0 )
+{
+    unsigned long long now = mach_absolute_time();
+    TEB *teb = NtCurrentTeb();
+
+    if (kind < REQ_NB_REQUESTS)
+    {
+        __atomic_fetch_add( &ios_srv_kind_count[kind], 1, __ATOMIC_RELAXED );
+        __atomic_fetch_add( &ios_srv_kind_ticks[kind], now - t0, __ATOMIC_RELAXED );
+    }
+    ios_srv_thr_bump( teb ? (unsigned int)(ULONG_PTR)teb->ClientId.UniqueThread : 0 );
+
+    if (now >= __atomic_load_n( &ios_srv_stats_deadline, __ATOMIC_RELAXED ))
+    {
+        unsigned long long expect = __atomic_load_n( &ios_srv_stats_deadline, __ATOMIC_RELAXED );
+        if (now >= expect &&
+            __atomic_compare_exchange_n( &ios_srv_stats_deadline, &expect,
+                                         now + ios_srv_ns_to_ticks( IOS_SRV_STATS_PERIOD_S * 1000000000ull ),
+                                         0, __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
+            ios_srv_stats_report( now );
+    }
+}
+
+/* Bucket one server_wait by what it is actually waiting on and how long for.
+ * Called from server_wait, which is the only place that still has the CALLER's
+ * timeout — by the time server_select sees it, a relative timeout has already
+ * been folded into a QPC-epoch absolute and a zero-timeout poll is no longer
+ * distinguishable from a 1 ms one.  `size` is how NtWaitForMultipleObjects
+ * encodes the handle count (offsetof(wait.handles[count])), which is the same
+ * arithmetic ios_wait_enter already does above. */
+static void ios_srv_classify_select( const union select_op *op, data_size_t size,
+                                     const LARGE_INTEGER *timeout )
+{
+    int inf = !timeout, poll = timeout && !timeout->QuadPart;
+    int count = 1;
+
+    if (__atomic_load_n( &ios_srv_stats_on, __ATOMIC_RELAXED ) == 0) return;
+
+    if (!op)   /* alertable NtDelayExecution: server_wait( NULL, 0, ... ) */
+    {
+        ios_srv_nt_count( IOS_SEL_DELAY_ALERT );
+        return;
+    }
+
+    if (size >= offsetof( union select_op, wait.handles ))
+        count = (int)((size - offsetof( union select_op, wait.handles )) / sizeof(obj_handle_t));
+    if (count < 1) count = 1;
+
+    switch (op->op)
+    {
+    case SELECT_WAIT:
+        if (count > 1) ios_srv_nt_count( inf ? IOS_SEL_WAITN_INF : poll ? IOS_SEL_WAITN_POLL : IOS_SEL_WAITN_FIN );
+        else           ios_srv_nt_count( inf ? IOS_SEL_WAIT1_INF : poll ? IOS_SEL_WAIT1_POLL : IOS_SEL_WAIT1_FIN );
+        break;
+    case SELECT_WAIT_ALL:           ios_srv_nt_count( IOS_SEL_WAITALL ); break;
+    case SELECT_SIGNAL_AND_WAIT:    ios_srv_nt_count( IOS_SEL_SIGWAIT ); break;
+    case SELECT_KEYED_EVENT_WAIT:
+    case SELECT_KEYED_EVENT_RELEASE: ios_srv_nt_count( IOS_SEL_KEYED ); break;
+    default:                        ios_srv_nt_count( IOS_SEL_OTHER ); break;
+    }
+}
+
+static int ios_srv_stats_enabled(void)
+{
+    int on = __atomic_load_n( &ios_srv_stats_on, __ATOMIC_RELAXED );
+
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_SRV_STATS" );
+        on = (e && !strcmp( e, "0" )) ? 0 : 1;
+        if (on)
+        {
+            unsigned long long now = mach_absolute_time();
+            ios_srv_stats_window_t0 = now;
+            __atomic_store_n( &ios_srv_stats_deadline,
+                              now + ios_srv_ns_to_ticks( IOS_SRV_STATS_PERIOD_S * 1000000000ull ),
+                              __ATOMIC_RELAXED );
+            wine_log_write( "[srv-stats] ON rev=ml950 period=%ds — per-kind wineserver traffic; "
+                            "MADEIRA_SRV_STATS=0 to disable", IOS_SRV_STATS_PERIOD_S );
+        }
+        __atomic_store_n( &ios_srv_stats_on, on, __ATOMIC_RELAXED );
+    }
+    return on;
+}
+
+#endif /* WINE_IOS */
+
 /***********************************************************************
  *           server_call_unlocked
  */
@@ -553,6 +879,11 @@ unsigned int server_call_unlocked( void *req_ptr )
 {
     struct __server_request_info * const req = req_ptr;
     unsigned int ret;
+#ifdef WINE_IOS
+    const unsigned int stats_kind = req->u.req.request_header.req;
+    const int stats_on = ios_srv_stats_enabled();
+    const unsigned long long stats_t0 = stats_on ? mach_absolute_time() : 0;
+#endif
 
     ios_srv_req_count++;
     if ((ret = send_request( req ))) return ret;
@@ -563,7 +894,11 @@ unsigned int server_call_unlocked( void *req_ptr )
         extern void ios_wineserver_wake(void);
         ios_wineserver_wake();
     }
-    return wait_reply( req );
+    ret = wait_reply( req );
+#ifdef WINE_IOS
+    if (stats_on) ios_srv_stats_account( stats_kind, stats_t0 );
+#endif
+    return ret;
 }
 
 
@@ -1186,11 +1521,25 @@ unsigned int server_wait( const union select_op *select_op, data_size_t size, UI
         int is_game = ios_srv_game_teb &&
                       (uintptr_t)NtCurrentTeb() == ios_srv_game_teb;
         struct timespec t0, t1;
+
+        /* ml950: a real wait ends any Sleep(0) streak this thread had going
+         * (sync.c, ios_delay_zero) — a thread that blocks is not spinning. */
+        { extern void ios_spin_reset(void); ios_spin_reset(); }
+#ifdef WINE_IOS
+        ios_srv_classify_select( select_op, size, timeout );
+#endif
         if (is_game) clock_gettime( CLOCK_MONOTONIC, &t0 );
         ios_wait_enter( select_op, size, flags, abs_timeout,
                         __builtin_return_address(0) );
         ret = server_select( select_op, size, flags, abs_timeout, NULL, &apc );
         ios_wait_leave();
+#ifdef WINE_IOS
+        if (ret == STATUS_TIMEOUT)
+        {
+            ios_srv_nt_count( IOS_SEL_RET_TIMEOUT );
+            if (timeout && timeout->QuadPart) ios_srv_nt_count( IOS_SEL_RET_TIMEOUT_FIN );
+        }
+#endif
         if (is_game)
         {
             clock_gettime( CLOCK_MONOTONIC, &t1 );

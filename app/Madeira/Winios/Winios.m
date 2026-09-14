@@ -461,7 +461,46 @@ extern void winios_drv_post_key(unsigned short vk, unsigned int flags);
 extern void winios_dump_window_tree(void);
 extern void ios_dump_all_thread_stacks(void);
 
-#define WINIOS_RING_SIZE 256
+/* ml661 — THE RING IS DRAINED AT THE GAME'S FRAME RATE, NOT AT TOUCH RATE.
+ *
+ * The only consumer is winios_pProcessEvents, which runs inside the game's own
+ * message pump (message_ios.c process_driver_events, reached from PeekMessage
+ * and from GetAsyncKeyState's check_for_events). A game rendering at 15 fps
+ * drains ~15×/s; while it streams a level it can be a *tenth* of that, so the
+ * ring goes untouched for seconds at a time.
+ *
+ * The producer does not slow down to match. The aim stick is a CADisplayLink:
+ * it posts one relative MOUSEEVENTF_MOVE per display frame, 60–120/s, for as
+ * long as a thumb rests on it. So in a single 5-second stall the stick alone
+ * offers ~600 events into a 256-slot ring.
+ *
+ * The old policy was DROP-NEWEST ("if (next != tail)" and otherwise silently
+ * do nothing — the comment even claimed it dropped the oldest, which it never
+ * did). Once the stick had filled the ring, every subsequent event was thrown
+ * away, and the events being thrown away were the ones that matter: the key
+ * DOWN from the movement stick, the key UP that stops walking, the LEFTDOWN
+ * from a landscape button. That is the reported failure exactly — sticks and
+ * buttons go dead mid-fight, and come back when the frame rate recovers and
+ * the backlog finally drains. A half-dropped pair is worse still: a surviving
+ * DOWN whose UP was dropped leaves the key stuck on inside the game.
+ *
+ * Fix, in two parts:
+ *   1. Motion is COALESCED, not queued. Consecutive pure moves merge — relative
+ *      deltas sum, absolute positions keep the newest. That is lossless for the
+ *      game (a mouse that moved 300 counts over 5s is indistinguishable from
+ *      one 300-count report at the moment of the read) and it means the stick
+ *      can no longer fill anything: a whole stall collapses into one event.
+ *   2. Transitions are NEVER dropped. A key down/up or a button down/up always
+ *      gets a slot; if the ring is somehow still full, room is made by dropping
+ *      the oldest *move*, which is the only event class that can be lost
+ *      without the game ending up in a wrong state.
+ *
+ * A "pure move" is the only mergeable/droppable class: MOUSEEVENTF_MOVE with
+ * (optionally) ABSOLUTE and nothing else. Note post_touch_down deliberately
+ * posts MOVE|LEFTDOWN|ABSOLUTE as one event — the button bit makes it a
+ * transition, so it is never touched by either mechanism.
+ */
+#define WINIOS_RING_SIZE 1024
 #define WINIOS_EV_MOUSE 0
 #define WINIOS_EV_KEY   1
 #define KEYEVENTF_KEYUP 0x0002
@@ -477,18 +516,156 @@ static struct {
     unsigned int head;       /* producer cursor (Swift side) */
     unsigned int tail;       /* consumer cursor (Wine drain) */
     pthread_mutex_t lock;
+    /* ml661 diagnostics — see winios_q_report */
+    unsigned int pushed, coalesced, compactions, high_water;
+    unsigned int dropped_move, dropped_trans;
+    unsigned int keys_down;            /* driver-side held-key count */
+    unsigned int keydown_mask[8];      /* 256 vk bits: which are held */
+    unsigned int btn_mask;             /* bit0 = left held, bit1 = right held */
 } g_input_q = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
-static void winios_q_push_ev(unsigned int type, int x, int y, unsigned int flags, unsigned int data) {
-    pthread_mutex_lock(&g_input_q.lock);
-    unsigned int next = (g_input_q.head + 1) % WINIOS_RING_SIZE;
-    if (next != g_input_q.tail) {
-        g_input_q.buf[g_input_q.head] = (winios_input_event_t){type, x, y, flags, data};
-        g_input_q.head = next;
+static inline int winios_ev_is_pure_move(const winios_input_event_t *e) {
+    if (e->type != WINIOS_EV_MOUSE) return 0;
+    if (!(e->flags & MOUSEEVENTF_MOVE)) return 0;
+    /* any button / wheel bit makes it a transition */
+    return (e->flags & ~(unsigned)(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)) == 0;
+}
+
+/* Mergeable only into an identical KIND of move: relative into relative,
+ * absolute into absolute. Mixing the two would turn a delta into a position. */
+static inline int winios_ev_mergeable(const winios_input_event_t *a, const winios_input_event_t *b) {
+    return winios_ev_is_pure_move(a) && winios_ev_is_pure_move(b) && a->flags == b->flags;
+}
+
+static inline void winios_ev_merge(winios_input_event_t *dst, const winios_input_event_t *src) {
+    if (src->flags & MOUSEEVENTF_ABSOLUTE) {
+        dst->x = src->x; dst->y = src->y;      /* a position: newest wins */
+    } else {
+        long long x = (long long)dst->x + src->x;   /* a delta: they add */
+        long long y = (long long)dst->y + src->y;
+        dst->x = (int)(x < -30000 ? -30000 : (x > 30000 ? 30000 : x));
+        dst->y = (int)(y < -30000 ? -30000 : (y > 30000 ? 30000 : y));
     }
-    /* If buffer is full we drop the oldest event by simply not advancing —
-     * better than blocking the UI thread on a Wine event drain. */
+}
+
+/* Merge every run of consecutive pure moves already sitting in the ring.
+ * Only runs when the ring is full, so the O(n) rewrite is off the hot path.
+ * Caller holds the lock. */
+static winios_input_event_t g_q_scratch[WINIOS_RING_SIZE];
+static void winios_q_compact(void) {
+    unsigned int n = 0, i;
+    for (i = g_input_q.tail; i != g_input_q.head; i = (i + 1) % WINIOS_RING_SIZE) {
+        winios_input_event_t *s = &g_input_q.buf[i];
+        if (n && winios_ev_mergeable(&g_q_scratch[n - 1], s)) {
+            winios_ev_merge(&g_q_scratch[n - 1], s);
+            g_input_q.coalesced++;
+            continue;
+        }
+        g_q_scratch[n++] = *s;
+    }
+    memcpy(g_input_q.buf, g_q_scratch, n * sizeof(g_q_scratch[0]));
+    g_input_q.tail = 0;
+    g_input_q.head = n % WINIOS_RING_SIZE;
+    g_input_q.compactions++;
+}
+
+/* Last resort when the ring is full of UNmergeable events: evict the oldest
+ * pure move (alternating abs/rel moves defeat compaction but are still
+ * individually expendable). Returns 0 if the ring holds nothing but
+ * transitions — in which case the caller must not drop the newcomer either.
+ * Caller holds the lock. */
+static int winios_q_drop_oldest_move(void) {
+    unsigned int i, j;
+    for (i = g_input_q.tail; i != g_input_q.head; i = (i + 1) % WINIOS_RING_SIZE)
+        if (winios_ev_is_pure_move(&g_input_q.buf[i])) break;
+    if (i == g_input_q.head) return 0;
+    for (j = i; j != g_input_q.tail; ) {           /* close the gap backwards */
+        unsigned int p = (j + WINIOS_RING_SIZE - 1) % WINIOS_RING_SIZE;
+        g_input_q.buf[j] = g_input_q.buf[p];
+        j = p;
+    }
+    g_input_q.tail = (g_input_q.tail + 1) % WINIOS_RING_SIZE;
+    g_input_q.dropped_move++;
+    return 1;
+}
+
+static void winios_q_push_ev(unsigned int type, int x, int y, unsigned int flags, unsigned int data) {
+    winios_input_event_t e = { type, x, y, flags, data };
+    unsigned int next, depth;
+
+    pthread_mutex_lock(&g_input_q.lock);
+    g_input_q.pushed++;
+
+    /* Fast path: fold this move into the newest queued one. This is what keeps
+     * a 120Hz stick from ever occupying more than a single slot. */
+    if (g_input_q.head != g_input_q.tail) {
+        unsigned int prev = (g_input_q.head + WINIOS_RING_SIZE - 1) % WINIOS_RING_SIZE;
+        if (winios_ev_mergeable(&g_input_q.buf[prev], &e)) {
+            winios_ev_merge(&g_input_q.buf[prev], &e);
+            g_input_q.coalesced++;
+            goto done;
+        }
+    }
+
+    next = (g_input_q.head + 1) % WINIOS_RING_SIZE;
+    if (next == g_input_q.tail) {                  /* full — reclaim, don't drop */
+        winios_q_compact();
+        next = (g_input_q.head + 1) % WINIOS_RING_SIZE;
+    }
+    if (next == g_input_q.tail && winios_q_drop_oldest_move())
+        next = (g_input_q.head + 1) % WINIOS_RING_SIZE;
+
+    if (next != g_input_q.tail) {
+        g_input_q.buf[g_input_q.head] = e;
+        g_input_q.head = next;
+    } else {
+        /* 1023 pending transitions and another one arriving. Physically
+         * impossible from ten fingers; log every occurrence if it ever is. */
+        if (winios_ev_is_pure_move(&e)) g_input_q.dropped_move++;
+        else {
+            g_input_q.dropped_trans++;
+            fprintf(stderr, "[input] OVERFLOW dropped transition type=%u x=%d flags=0x%x "
+                            "(total dropped_trans=%u)\n",
+                    e.type, e.x, e.flags, g_input_q.dropped_trans);
+            fflush(stderr);
+        }
+    }
+
+done:
+    depth = (g_input_q.head + WINIOS_RING_SIZE - g_input_q.tail) % WINIOS_RING_SIZE;
+    if (depth > g_input_q.high_water) g_input_q.high_water = depth;
     pthread_mutex_unlock(&g_input_q.lock);
+}
+
+/* ml661 — one line naming the state of every input stage, so the next log
+ * says which one failed instead of leaving it to be inferred. Emitted from
+ * the drain at most once a second, and only when something is actually
+ * happening (queued work, held keys, or a non-zero drop count). */
+static void winios_q_report(unsigned int depth) {
+    static double next_at;
+    double now = CACurrentMediaTime();
+    unsigned int i, pushed, coalesced, hw, dm, dt, comp, keys, btns;
+    char held[256];
+    int n = 0;
+
+    pthread_mutex_lock(&g_input_q.lock);
+    pushed = g_input_q.pushed; coalesced = g_input_q.coalesced;
+    hw = g_input_q.high_water; dm = g_input_q.dropped_move;
+    dt = g_input_q.dropped_trans; comp = g_input_q.compactions;
+    keys = g_input_q.keys_down; btns = g_input_q.btn_mask;
+    held[0] = 0;
+    for (i = 0; i < 256 && n < (int)sizeof(held) - 8; i++)
+        if (g_input_q.keydown_mask[i >> 5] & (1u << (i & 31)))
+            n += snprintf(held + n, sizeof(held) - n, "%s%02x", n ? "," : "", i);
+    pthread_mutex_unlock(&g_input_q.lock);
+
+    if (now < next_at) return;
+    if (!depth && !keys && !btns && !dm && !dt && !hw) return;
+    next_at = now + 1.0;
+    fprintf(stderr, "[input] ring depth=%u high=%u pushed=%u coalesced=%u compact=%u "
+                    "dropped(move=%u trans=%u) drv_keys=%u[%s] drv_btn=0x%x\n",
+            depth, hw, pushed, coalesced, comp, dm, dt, keys, held, btns);
+    fflush(stderr);
 }
 
 /* Public C entry points for Swift / UIKit gesture handlers.
@@ -540,6 +717,7 @@ BOOL winios_pProcessEvents(DWORD mask) {
         }
     }
     BOOL drained = FALSE;
+    unsigned int depth = 0;
     for (;;) {
         winios_input_event_t e;
         pthread_mutex_lock(&g_input_q.lock);
@@ -549,16 +727,85 @@ BOOL winios_pProcessEvents(DWORD mask) {
         }
         e = g_input_q.buf[g_input_q.tail];
         g_input_q.tail = (g_input_q.tail + 1) % WINIOS_RING_SIZE;
+        depth = (g_input_q.head + WINIOS_RING_SIZE - g_input_q.tail) % WINIOS_RING_SIZE;
+        /* ml661: the driver's own view of what is held. The app posts what it
+         * believes; THIS is what wine was actually told. A mismatch between the
+         * two ("[input] app held" vs "drv_keys_down") is the whole diagnosis. */
+        if (e.type == WINIOS_EV_KEY && e.x >= 0 && e.x < 256) {
+            unsigned int *w = &g_input_q.keydown_mask[e.x >> 5], b = 1u << (e.x & 31);
+            if (e.flags & KEYEVENTF_KEYUP) {
+                if (*w & b) { *w &= ~b; if (g_input_q.keys_down) g_input_q.keys_down--; }
+            } else if (!(*w & b)) { *w |= b; g_input_q.keys_down++; }
+        } else if (e.type == WINIOS_EV_MOUSE) {
+            if (e.flags & MOUSEEVENTF_LEFTDOWN)  g_input_q.btn_mask |= 1u;
+            if (e.flags & MOUSEEVENTF_LEFTUP)    g_input_q.btn_mask &= ~1u;
+            if (e.flags & MOUSEEVENTF_RIGHTDOWN) g_input_q.btn_mask |= 2u;
+            if (e.flags & MOUSEEVENTF_RIGHTUP)   g_input_q.btn_mask &= ~2u;
+        }
         pthread_mutex_unlock(&g_input_q.lock);
 
-        fprintf(stderr, "[winios] drain type=%u x=%d y=%d flags=0x%x\n", e.type, e.x, e.y, e.flags); fflush(stderr);
+        /* ml661: this loop runs INSIDE the game's message pump, so its own cost
+         * is frame time. A per-event fprintf+fflush with hundreds of coalesced
+         * moves behind it was paying for the stall it was meant to diagnose.
+         * Transitions still log every time — they are rare and they are the
+         * events worth tracing; moves log one in 64. */
+        if (e.type == WINIOS_EV_KEY || !winios_ev_is_pure_move(&e)) {
+            fprintf(stderr, "[winios] drain type=%u x=%d y=%d flags=0x%x q=%u\n",
+                    e.type, e.x, e.y, e.flags, depth);
+            fflush(stderr);
+        } else {
+            static unsigned mv;
+            if ((mv++ % 64) == 0) {
+                fprintf(stderr, "[winios] drain move x=%d y=%d flags=0x%x q=%u (n=%u)\n",
+                        e.x, e.y, e.flags, depth, mv);
+                fflush(stderr);
+            }
+        }
         if (e.type == WINIOS_EV_KEY)
             winios_drv_post_key((unsigned short)e.x, e.flags);
         else
             winios_drv_post_mouse(e.x, e.y, e.flags, e.data, NULL);
         drained = TRUE;
     }
+    winios_q_report(depth);
     return drained;
+}
+
+/* ml661 — app-side release valve. Swift calls this when it decides the user
+ * cannot possibly still be holding anything (app resigned active, the control
+ * overlay was toggled away under a thumb, a gesture was cancelled): it posts a
+ * key-up for every key the DRIVER still believes is down. The app's own
+ * held-set is authoritative for intent, but this one closes the gap where the
+ * app's down got through and its up did not. */
+void winios_release_all_keys(void) {
+    unsigned int vks[64];
+    unsigned int i, n = 0, btns;
+
+    pthread_mutex_lock(&g_input_q.lock);
+    for (i = 0; i < 256 && n < 64; i++)
+        if (g_input_q.keydown_mask[i >> 5] & (1u << (i & 31))) vks[n++] = i;
+    btns = g_input_q.btn_mask;
+    pthread_mutex_unlock(&g_input_q.lock);
+
+    if (!n && !btns) return;
+    fprintf(stderr, "[input] release_all: %u key(s) + btn_mask=0x%x still down driver-side\n",
+            n, btns);
+    fflush(stderr);
+    for (i = 0; i < n; i++)
+        winios_q_push_ev(WINIOS_EV_KEY, (int)vks[i], 0, KEYEVENTF_KEYUP, 0);
+    if (btns & 1u) winios_q_push_ev(WINIOS_EV_MOUSE, 0, 0, MOUSEEVENTF_LEFTUP, 0);
+    if (btns & 2u) winios_q_push_ev(WINIOS_EV_MOUSE, 0, 0, MOUSEEVENTF_RIGHTUP, 0);
+}
+
+/* ml661 — what the driver believes is held, for the app's [input] line. Bit i
+ * of the 8-word mask is vk i; returns the count. mask may be NULL. */
+int winios_held_keys(unsigned int mask[8]) {
+    int i, n;
+    pthread_mutex_lock(&g_input_q.lock);
+    if (mask) for (i = 0; i < 8; i++) mask[i] = g_input_q.keydown_mask[i];
+    n = (int)g_input_q.keys_down;
+    pthread_mutex_unlock(&g_input_q.lock);
+    return n;
 }
 
 /* ============================================================ *

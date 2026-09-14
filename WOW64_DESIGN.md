@@ -852,6 +852,61 @@ game-specific patches — every change must fix the emulator/runtime generically
   up (COM shim in guest memory, native DXMT behind one unix call per API
   call, §4/§7.5 rules) — DO NOT start until `jit by module` shows
   `d3d9.dll` dominating. `BTCpuSuspendThread` spin got a `yield` hint.
+  Yields DONE (Opus): the `getrusage` pair was already dead on iOS
+  (`RUSAGE_THREAD` is Linux-only) — `NtYieldExecution` = `sched_yield` +
+  STATUS_SUCCESS; `NtDelayExecution` yields only for a zero timeout;
+  `NtUserPeekMessage`/`wait_message` yield on every 64th CONSECUTIVE empty
+  poll (≤1 per 200 µs, streak reset by any delivered message);
+  `server_wait` yields only on every 64th consecutive zero-timeout poll.
+  Per empty pump iteration: 1 → 0 syscalls; `Sleep(1)`: 2 → 1. Those
+  yields were upstream Wine's, not Madeira's.
+- 2026-09-14 — `[prof]` v2 A/B (logs 36/37): `X87ReducedPrecision=1` took
+  `jitdisp` (x87 F80 softfloat ABI thunks) from 20-50 % of CPU to 0 and
+  fps from ~8 to 15-20 (40 in simple views) → becomes the 32-bit default.
+  File lookups are now ≈0 while playing (`[fs-stats]` open=0-15/window,
+  `pcache` working). Remaining: `d3d9.dll` (emulated DXMT frontend) 20-28 %
+  of ALL CPU on the render thread + `dxmt-encode-thr` (95 % JIT) — the
+  native-D3D9 gate is MET; wineserver round trips 15-25 %
+  (`read<-read_reply_data`, `read<-read_request`, `semaphore_timedwait_trap
+  <-main_loop`, `semaphore_signal_trap<-server_call_unlock`); `Sleep(0)`
+  yields 5-21 % (`swtch_pri<-NtDelayExecution+0x24c`); pool-warmer
+  `mach_msg2_trap` 1-5 %. Memory: log 37 shows compressed=1714 MB of 2469
+  (pressure state differs between runs). User also reports the on-screen
+  sticks/buttons intermittently going dead. Assigned: input robustness
+  (Opus: ring coalescing, drain trigger, gesture-state watchdogs);
+  `[srv-stats]` + in-process fast sync design/first step + `Sleep(0)`
+  streak throttle + x87 default (Opus). Next: the native-side D3D9 port.
+  DONE: (a) input — the 256-slot event ring DROPPED THE NEWEST event when
+  full (comment claimed oldest) and the 120 Hz aim stick filled it during
+  streaming stalls, so key/button transitions were discarded (dead sticks,
+  stuck keys); `AimStickDriver.holders` was a bare refcount that a missed
+  `end()` pinned forever (self-sustaining 120 Hz flood); `TouchControlButton`
+  had no `onDisappear`. Now: ring 1024, consecutive pure moves coalesce
+  (relative deltas sum, absolute keep newest), transitions never dropped,
+  `winios_release_all_keys()`, app-side `InputGuard` ownership model with a
+  1 Hz reconciler against driver-held keys, tokens instead of a refcount,
+  `@GestureState` + `onDisappear` on every held control, release-all on
+  scene deactivation; `[input] ring …`/`[input] reconcile …` lines. Drain
+  trigger already ran from `GetAsyncKeyState` — no driver thread needed.
+  (b) `[srv-stats]` (5 lines/10 s: reqs/s, in-call time, top kinds with
+  avg µs from a generated `req_names` table with a `C_ASSERT` on
+  `REQ_NB_REQUESTS`, top threads, NT-level counters, the `select`
+  classification `w1/wN × inf/fin/poll`, futex counters). DECISION: no
+  fastsync yet — the alert ping-pong is futex-based on iOS (`USE_FUTEX` for
+  `__APPLE__`, `sync.c:139`) and never touches the server; whether the
+  round trips are pacing `select`s (fix client-side) or event/semaphore
+  traffic (build fastsync) is decided by the `select:` line next run. The
+  fastsync design is written and verified against upstream's `inproc_*`
+  hooks (`sync.c:800-959`, dead on iOS) and server `*_sync` split
+  (`event.c:127-150`): cell = state word + `srv_waiters` + client waiters +
+  generation; Dekker pairing with `wait_on`/`check_wait` (`thread.c:1242,
+  1304`); same wake primitive on both sides; fast waits capped at ~2 ms
+  then fall through to `server_wait` (APCs/alerts/wait-all untouched).
+  `Sleep(0)`: 16-call `isb` pause ladder then one `sched_yield` per 8 →
+  123 syscalls per 1000 (8.1×); streak reset on real waits/non-zero sleeps.
+  x87: `X87REDUCEDPRECISION=1` is now the 32-bit default unless the user
+  set it (`[fex-cfg]` reports `X87ReducedPrecision(madeira-32bit-default)`).
+  (c) §8 below: the native D3D9 plan (Opus, read-only investigation).
 
 
 - 2026-09-12 — M5 direction: the user's next target is a 32-bit UE3/D3D9
@@ -2601,3 +2656,332 @@ the i386 run produced `d3d11.dll` 32,276,480 B, `d3d10core.dll` 2,154,496 B and
 `build-pe.sh aarch64 --install none` run built the whole aarch64 farm clean
 (`d3d11.dll` 31,870,976 B, Machine 0xAA64) without touching
 `app/Madeira/aarch64-windows/`.
+
+
+## 8. Native ARM64 D3D9 frontend behind a 32-bit shim (M4b) — PLAN
+
+Premise (measured, §6 2026-09-14): the emulated `d3d9.dll` is 20-28 % of
+all CPU at 15-20 fps, on the game's render thread and on DXMT's own encode
+thread (95 % JIT there). Nothing about that code needs to be x86. Gate met.
+
+### 8.1 Inventory
+
+15 public interfaces, 320 vtable slots, 10 DLL exports, 1 private
+interface (`IDxmtDiag9`, tests only). Slots: `IDirect3D9Ex` 22,
+`IDirect3DDevice9Ex` 134, `SwapChain9Ex` 13, `Surface9` 17, `Texture9` 22,
+`CubeTexture9` 22, `VolumeTexture9` 22, `Volume9` 11, `VertexBuffer9` 14,
+`IndexBuffer9` 14, `VertexDeclaration9` 5, `VertexShader9` 5,
+`PixelShader9` 5, `StateBlock9` 6, `Query9` 8. Exports in `d3d9.cpp`:
+`Direct3DCreate9(Ex)`, seven `D3DPERF_*`, `DebugSetLevel/Mute`,
+`Direct3DShaderValidatorCreate9` (+ its 6-slot private vtable).
+
+Argument shapes (318/320 parsed): 125 no pointer; 91 one pointer; 78 two;
+24 three+; 68 `**` out-params (45 of them identity queries answerable in
+the shim); 18 interface-pointer inputs; 47 `const T*` inputs; 18 mapped-
+memory methods (`Lock/Unlock` ×2 buffers, `LockRect/UnlockRect` ×3,
+`LockBox/UnlockBox` ×2, `GetDC/ReleaseDC`) plus three transient cases
+(`DrawPrimitiveUP`, `DrawIndexedPrimitiveUP`, the `pSharedHandle`
+user-memory idiom); 1 callback (`shader_validator_cb`, never crosses).
+
+Hot path today is a cheap shadow-array store + dirty bit (`SetRenderState`
+`d3d9_device.cpp:6275-6306` always returns D3D_OK; `SetTexture` `:6524`;
+`SetStreamSource` `:11502`; `Set*ShaderConstantF` `:11302`); the expensive
+per-draw call is `DrawIndexedPrimitive` (`:6924`). CONSEQUENCE: a state
+setter turned into a synchronous unix call is a REGRESSION for that call;
+the win is in `Draw*`, `Lock/Unlock`, `Present`, shader compilation and —
+largest — the encode thread. Hence §8.6's command ring is not optional.
+
+### 8.2 Architecture
+
+(a) RECOMMENDED: native ARM64 **unixlib** (extend `libdxmt_unix.a`; new
+table pair bound by `load_builtin_unixlib` exactly like `winemetal`), NOT
+an arm64ec PE. Reasons: DXMT already builds `dxmt_native`
+(`research/dxmt/meson.build:10,39-41,150-153`, CI-tested); `src/meson.build:
+15-22` excludes d3d9 from it only by our own comment; the winemetal boundary
+disappears (`src/nativemetal/wineunixlib.h:9-11` makes `WINE_UNIX_CALL` a
+table-indirect call — today EVERY winemetal call pays a full JIT exit,
+`FEX/Source/Windows/WOW64/Module.cpp:642-663,733-752`, thousands per frame
+from the encode thread — this win is independent of batching and probably
+the largest single item); DXMT's threads become plain pthreads
+(`src/util/thread.hpp:326-348`), removing guest stacks, 16 MB callret
+reservations and all JIT for encode/finish/event/threadpool threads; Metal
+object lifetime is host-side, so the §7.5 `CpuPlaced` arm in
+`dxmt_buffer.cpp:148-193` and the 8 MB staging blocks
+(`dxmt_ring_bump_allocator.hpp:14-23`) can revert toward the tag; plain
+Itanium C++ EH; no JIT-pool residency (a 31.8 MB PE in the pool cost 22 %
+of the jetsam budget in §6 round 2). REJECTED: arm64ec PE + wow64 thunk DLL
+— no generic 32→64 PE thunk mechanism exists; `wow64win` works through the
+SYSCALL tables (`syscall.c:59-62,1185-1187`), so this would need hand-rolled
+syscall stubs + a `wow64d3d9.dll` converter + the PE: three modules, all
+the same pointer work, plus pool residency.
+
+(b) The i386 shim (`app/Madeira/i386-windows/d3d9.dll` becomes thin):
+objects and vtables live in guest memory by construction (image mapped in
+the window; `HeapAlloc` goes through the window chokepoint); vtables at a
+stable address for the process lifetime (apps cache/patch them — which is
+why `SetTexture` identifies textures via a registry, `:6530-6533`). Object
+header `{vtbl, refcount, kind, uint64 native}`; `native` is a HANDLE
+(index+generation into a native table — invariant 4, validated failure
+instead of a wild host dereference, and the per-process sweep of §8.9-5).
+Refcounting entirely guest-side, one native release at zero; D3D9's
+private-reference rules (surface lifetime = texture's, `d3d9_texture.hpp:
+219-229`) reproduced in parent/child tables. Identity answered LOCALLY with
+no call: `GetTexture`, `GetStreamSource`, `GetIndices`, `Get*Shader`,
+`GetVertexDeclaration`, `GetRenderTarget`, `GetDepthStencilSurface`,
+`GetBackBuffer`, `GetSwapChain`, `GetDevice`, `GetContainer`,
+`GetDirect3D`, `GetSurfaceLevel`, `GetCubeMapSurface`, `GetVolumeLevel`,
+all `QueryInterface`s (~45 of the 68 `**` slots). MUST-NOT-FORGET:
+`setupFpu()` (`d3d9_device.cpp:504-521`, x87 CW → 24-bit unless
+`D3DCREATE_FPU_PRESERVE` `:556-558`) moves into the shim and runs on the
+guest's creating thread. Also shim-local: `D3DPERF_*`, `DebugSet*`, the
+whole shader-validator state machine (`d3d9.cpp:85-316`).
+
+(c) Pointer rules: NO D3D9 struct contains an embedded pointer except
+`pBits`. Four mirrors needed (i386 vs LP64 layout differs):
+`D3DPRESENT_PARAMETERS` (HWND at +28/+32, size 56/64),
+`D3DDEVICE_CREATION_PARAMETERS` (16/24), `D3DLOCKED_RECT` (8/16, `pBits`),
+`D3DLOCKED_BOX` (12/16, `pBits`); everything else (`D3DCAPS9`,
+`D3DADAPTER_IDENTIFIER9`, `D3DVERTEXELEMENT9[]`, display modes, matrices,
+lights, materials, viewport, rects, boxes, constant arrays) is layout-
+identical and pointed at in place after one `+B`. Rules: outer block
+converted by FEX (`Module.cpp:751`); every nested pointer via
+`ios_wow_host_ptr()` NULL-preserving; nesting ≤2 levels (`pSharedHandle`
+— convert only when SYSTEMMEM + non-NULL = user-memory idiom;
+`DrawIndexedPrimitiveUP`'s two buffers; `pBits`); OUT pointers written
+back via `ios_wow_guest_ptr32()` — exactly one field, `pBits`; sizes,
+enums, HWND/HMONITOR/HDC/HANDLE, native handles never offset; both tables
+same length, 32-bit variant at the same index, generated; parameter blocks
+use fixed-width fields (`uint32` guest ptr, `uint64` handle) so they are
+layout-identical on both sides (the `WMTMemoryPointer` trick).
+
+Mapped memory (§7.5) — the GUEST ARENA: every app-dereferenceable pointer
+must be inside `[B,B+4G)`; `d3d9_buffer_map.hpp:13-54` states the contract
+and `:36-47` why it can never change (a Metal-wrapped page written through
+translated code livelocks at fault-service cadence; Metal allocates above
+4 GB anyway). Native `wsi::aligned_malloc` returns host heap — unusable.
+Mechanism: the shim `VirtualAlloc`s 64 MB chunks (window chokepoint ⇒ in
+`[B,B+4G)` by construction) and registers `{guest_base,size}`; the native
+side sub-allocates and computes guest addresses trivially; exhaustion
+returns a distinguished status and the shim grows-and-retries (no upcall
+machinery anywhere). Alignment 16384 (real iOS page; `DXMT_PAGE_SIZE=4096`
+at `meson.build:155` is wrong here — assert `getpagesize()`). Split the
+allocator: `dxmt::guest_alloc/guest_free`, `#define`d to
+`wsi::aligned_malloc` off-Madeira; convert ONLY app-visible sites:
+`d3d9_buffer.cpp:87,351`; `d3d9_surface.cpp:110,148`; texture/cube/volume
+mirrors (`d3d9_cube_texture.cpp:160,171` etc.); `d3d9_device.cpp:3213,
+3495,3621,5366,5408,5510,5560,10502` (backing pool `d3d9_device.hpp:1310`);
+`d3d9_mem.cpp` chunks. Leave host: `dxmt_context.cpp:40`,
+`dxmt_occlusion_query.hpp:169`, `dxmt_texture.cpp:187`, `dxmt_buffer.cpp:
+27`, both staging rings (`dxmt_ring_bump_allocator.hpp:206,249`).
+`d3d9_mem.cpp`'s reclaiming chunk allocator is gated `_WIN32 && !_WIN64`
+(`d3d9_mem.hpp:29-31`) → false natively → MANAGED/SYSTEMMEM mirrors become
+permanent guest-VA allocations; Phase 1 accepts and censuses it; Phase 2
+may back chunks with decommittable arena chunks.
+
+(d) Threading: DXMT threads become native pthreads (automatic in
+`dxmt_native`); audited — command queue uses Metal shared events and
+`obj_handle_t`, no Win32 sync anywhere in `src/dxmt`/`src/d3d9`.
+`src/util/util_win32_compat.h` must NOT be used (every stub warns+fails);
+new `util_madeira_compat.h` with real `GetCurrentThreadId`,
+`SwitchToThread`, `SetThreadPriority`, `GetCurrentProcessId`, sentinels.
+`D3DCREATE_MULTITHREADED` moves to the shim (recursive spinlock keyed by
+`GetCurrentThreadId`; native device constructed `is_protected=false`);
+encode/finish threads never took it (`d3d9_multithread.hpp:116-118`).
+Callbacks into the guest: none (validator stays local;
+`RegisterSoftwareDevice` returns NOTAVAILABLE `d3d9_interface.cpp:151`;
+window messages are guest-pump-driven). All user32/gdi32 stays in the
+shim: cursor `d3d9_device.cpp:1744-1844`, fullscreen styles `:1955-2015`,
+focus hook/`focusWindowProc` `:2025-2077,2191-2256`, `onFocusActivation`
+`:2086-2180`, `GetDC` via `D3DKMTCreateDCFromMemory` `d3d9_surface.cpp:
+46-53`, `GetClientRect` `d3d9_interface.cpp:980`/`wsi_window_headless.cpp:
+32`; a `wsi_window_madeira.cpp` takes client size from a shim-supplied
+per-HWND cache updated at CreateDevice/Reset/Present.
+
+(e) Presentation: unchanged (§7.1/§7.11): `d3d9_swapchain.cpp:336` →
+`WMT::CreateMetalViewFromHWND` → the one Swift-owned CAMetalLayer
+(`IOSDisplayShim.m:108-132`), handles cross as `obj_handle_t`; natively
+these become direct calls. RAW-vsync nil-drawable gate unchanged.
+
+### 8.3 Unix side
+`dxmt_d3d9_unix_call_funcs[]` + `dxmt_d3d9_unix_call_wow64_funcs[]`, same
+length/indices, generated; `virtual_ios.c` gains a `strstr(match,"d3d9")`
+branch next to the winemetal one (`:7133-7136`) and externs (`:6936`);
+`ios_bind_unixlib_table()` (`:7063-7081`) picks by bitness; the shim binds
+via `__wine_init_unix_call()` → `NtQueryVirtualMemory(MemoryWineLoad
+UnixLibWow64)` (`:18959-18971`); `ios_module_export_name()` handles PE32.
+
+### 8.4 Cost of one unix call — MEASURE FIRST
+Path: bridge page (`Module.cpp:1137`) → JIT exit + `SpillStaticRegs` →
+`HandleSyscall` → `HandleSyscallImpl` (`:725-775`) → `UnlockJITContext` →
+`WineUnixCall` → table → `_d3d9_Foo32` → `LockJITContext` (CAS + possible
+`WOW_CPU_AREA_DIRTY` reload) → `FillStaticRegs`. Estimate 150-400 ns; do
+not build on the estimate. Two measurements before any architecture work:
+(1) `[d3d9-census]` per-method counters in the CURRENT i386 d3d9.dll
+(modelled on `wmt_api_census.c`; divide by Present count → calls/frame);
+(2) `_d3d9_nop` unix slot timed from `d3d9-cube-x86.exe` → ns/call. At an
+assumed 13k calls/frame × 250 ns = 3.25 ms/frame: 6.5 % at 20 fps, 19 % of
+a 16.7 ms frame at 60 fps — synchronous-everything is a wall at target.
+
+### 8.5 Phase 1 — shim + native library, synchronous
+Acceptance: cube passes (exit 43), the game renders correctly, fps ≥ −10 %,
+`[prof]` `pe:d3d9.dll`/`jit:d3d9.dll` collapse, encode thread JIT → 0.
+Files to create under `research/dxmt/src/d3d9shim/` (i386 PE):
+`d3d9_api.py` (the single interface description: interface, ordinal, name,
+return, per-arg shape tag `u32/u64/iface_in/iface_out/in_struct:T/
+out_struct:T/in_array:T:count/out_ptr:T/locked_rect_out/handle`,
+disposition `local/sync/defer` + validation predicate + constant return),
+`gen_d3d9_thunks.py`, `d3d9shim_main.c` (DllMain, exports, D3DPERF, debug,
+validator moved verbatim from `d3d9.cpp:44-316`), `d3d9shim_object.c/.h`,
+`d3d9shim_window.c` (`d3d9_device.cpp:1744-2270`), `d3d9shim_fpu.c`
+(`setupFpu`), `d3d9shim_arena.c`, `d3d9shim_lock.c`, generated
+`d3d9shim_thunks.c` (320 bodies + 15 vtables) and `d3d9shim_ops.h`
+(parameter blocks + ring opcodes, included by BOTH sides), `d3d9.def`,
+`meson.build` (`cpu_family=='x86'`). Under `research/dxmt/src/d3d9/unix/`:
+generated `d3d9_unix.c` (entries, `_32` variants, tables, init),
+`d3d9_native_glue.cpp` (handle table, per-PEB registry, arena
+sub-allocator, `guest_alloc`, `d3d9_native_process_teardown`). Under
+`src/util/`: `wsi_platform_madeira.cpp`, `wsi_window_madeira.cpp`,
+`util_madeira_compat.h`. Files to modify: `research/dxmt/meson.build`
+(option `dxmt_madeira_native`, `-DDXMT_NATIVE=1 -DDXMT_MADEIRA=1`, keep
+`DXMT_IOS` — `:171-174` keys on `system()=='windows'`, new darwin arm),
+`src/meson.build:15-22`, `src/util/meson.build:26-47`, `src/d3d9/**`
+(`guest_alloc` conversions, user32 excision behind `#ifdef DXMT_MADEIRA`,
+multithread compat), `src/dxmt/dxmt_buffer.cpp:148-193` (`__i386__ &&
+!DXMT_MADEIRA`), `dxmt_ring_bump_allocator.hpp:19-23` (+ A/B dropping
+`seal_latest()` `:69-85`), `build/dxmt-ios/build.sh` (add TUs; need
+`-fexceptions -frtti`), `build/dxmt-ios/build-pe.sh:60` (install shim AS
+`d3d9.dll`), `.xtool/build-wine-i386.sh:36-41` (A/B name), `virtual_ios.c`
+(binding branch; call `d3d9_native_process_teardown` from
+`ios_wow_reclaim_dead_windows()` — §8.9-5), `ContentView.swift` launch
+table (state test). A/B knob: ship both i386 modules — emulated frontend
+as `d3d9-emulated.dll`, shim as `d3d9.dll`; `Documents/madeira-d3d9.txt`
+(`native` default / `emulated`) read in the shim's DllMain; on `emulated`
+the ten exports forward to `LoadLibraryA("d3d9-emulated.dll")`.
+
+### 8.6 Phase 2 — guest-side command ring
+Principle: the ring is a TRANSPORT, not a re-implementation — the native
+side replays by calling the same `MTLD3D9Device::Set*`. One ring per
+device, `VirtualAlloc`d in the window; `{head,tail,size,seq}` + records
+`{u16 op; u16 len; u32 seq; POD args}`; single producer (serialised by the
+shim's MULTITHREADED lock when requested), replay at flush. Records > ¼
+ring force flush + direct call. Deferred (~40, essentially all per-draw
+traffic): SetRenderState, SetTextureStageState, SetSamplerState,
+SetTexture, SetStreamSource(Freq), SetIndices, SetVertexDeclaration,
+SetFVF, Set*Shader, Set*ShaderConstant{F,I,B}, SetTransform,
+MultiplyTransform, SetViewport, SetMaterial, SetLight, LightEnable,
+SetClipPlane, SetClipStatus, SetScissorRect, SetNPatchMode,
+SetSoftwareVertexProcessing, SetCurrentTexturePalette, SetPaletteEntries,
+BeginScene, EndScene, Clear, DrawPrimitive, DrawIndexedPrimitive,
+SetRenderTarget, SetDepthStencilSurface, resource SetPriority/PreLoad/
+SetLOD/SetAutoGenFilterType, AddDirtyRect/Box, Query::Issue,
+StateBlock::Apply, every final Release. Each either returns D3D_OK
+unconditionally or has a shim-evaluable predicate (e.g.
+`SetVertexShaderConstantF` `:11304-11315` needs only `m_vsConstFCount`;
+`SetStreamSource` `:11506-11510` needs the stream count), written once in
+`d3d9_api.py` and re-checked natively under `DXMT_DEBUG`. Synchronous
+(flush then call): every Create*, CreateAdditionalSwapChain, CreateQuery,
+state-block create/begin/end/Capture, Lock/LockRect/LockBox (DISCARD may
+rename → new `pBits`), GetDC/ReleaseDC, Present(Ex), GetData/GetDataSize,
+Reset(Ex), TestCooperativeLevel, CheckDeviceState, GetRenderTargetData,
+GetFrontBufferData, StretchRect, ColorFill, UpdateSurface, UpdateTexture,
+ProcessVertices, ValidateDevice, EvictManagedResources,
+GetAvailableTextureMem, Draw*UP, SetCursorProperties, Set/GetGammaRamp,
+SetDialogBoxMode, and every runtime-state Get* (`GetRenderState`'s
+read-back quirks `:6313-6326` must NOT be shadowed). Local, no call:
+~45 identity queries + QueryInterface/AddRef/non-final Release/GetType.
+Flush triggers: ≥ ¾ full, any sync call, Present, Lock, GetData, device
+destruction, EndScene watchdog. Ordering: per-record monotonic `seq`
+asserted at replay. Expected: ~10-30 unix calls/frame instead of ~13,000.
+
+### 8.7 Generator
+`gen_d3d9_thunks.py` reads `d3d9_api.py` and emits `d3d9shim_thunks.c`
+(every vtable slot filled; unimplemented = `E_NOTIMPL` stub, never a hole),
+`d3d9shim_ops.h` (shared), `d3d9_unix.c` (entries, `_32` variants with
+`ios_wow_host_ptr` conversions from shape tags, ring-replay switch),
+`d3d9_unix_table.c` (both arrays), `_Static_assert`s on every mirror
+(`COMPATIBLE_STRUCT32` pattern `airconv_thunks.h:164-168`). Guard rails:
+generator owns BOTH tables and refuses length mismatch; slot number is the
+ABI; "regenerate, do not edit" headers; disposition column is the single
+source of defer/flush. Version handshake: shim sends a hash of
+`d3d9_api.py` at init; native refuses a mismatch. ~8k generated lines
+from ~400.
+
+### 8.8 Test plan
+1. Host-only: generator self-check; i386 PE build; `llvm-objdump -p`: imports
+exactly KERNEL32/USER32/GDI32/api-ms-win-crt-*, NOT winemetal; exports
+exactly the ten names; native half compiles with both tables present.
+2. `build/x86-tests/d3d9-cube-x86.c` unchanged (exit 43); its first Lock()
+pointer becomes the arena assertion (guest address inside the arena).
+3. New `build/x86-tests/d3d9-state-x86.c`: every resource type, identity
+round-trips (`SetTexture`/`GetTexture` same pointer, `GetSurfaceLevel(n)`
+twice same pointer, `GetDevice`/`GetContainer`), refcounts after each
+`Get*`, Lock/Unlock pointers < 4 GB, QueryInterface for
+IDirect3DResource9/IDirect3DBaseTexture9; own exit code and
+`MADEIRA-D3D9:` lines; launch-table entry.
+4. Device: cube, state test, the game; `[prof]` (pe/jit d3d9 buckets → 0,
+encode thread JIT → 0), `[d3d9-census]` calls/frame, `[d3d9-arena]`
+high-water, fps A/B via `madeira-d3d9.txt` in one session.
+
+### 8.9 Risks
+1. Licence: shim is new GPL-3.0-or-later code; three pieces moved verbatim
+from `d3d9.cpp` (validator `:85-316`, D3DPERF `:44-67`, `setupFpu`
+`d3d9_device.cpp:512-521`) carry DXMT's LGPL provenance → extend
+`research/dxmt/LICENSE-MADEIRA.md` and `THIRD-PARTY-NOTICES.md` (d3d9.dll
+is now two modules with two provenances).
+2. API drift vs `v0.4-d3d9`: every `src/d3d9` change behind `#ifdef
+DXMT_MADEIRA`; `guest_alloc` defined to `aligned_malloc` off-Madeira;
+record each site as §7.11 does; the `src/dxmt` reverts move TOWARD the tag.
+3. Float state: (a) `setupFpu` must move to the shim (silent CPU-math
+change otherwise); (b) DXMT's own float work now runs on ARM64 FPRs, not
+under the guest x87 CW/MXCSR — almost certainly harmless, but a change
+(the emulated build already used `-mfpmath=sse`, `meson.build:64-71`).
+4. Exception propagation: a bad app pointer now faults in HOST code, not as
+a guest c0000005 the app's SEH can catch. Mitigate: shim rejects NULL where
+the API requires; every unix entry validates converted pointers with
+`ios_wow_in_window()` (`ios_wow.h:70`) → `D3DERR_INVALIDCALL`; no C++
+exception escapes (`catch(...)` → E_FAIL, as `d3d9_shader.cpp:424,582`).
+Residual: a validly mapped but wrong pointer still faults hard.
+5. MOST IMPORTANT — Metal object lifetime on guest leak: native objects and
+Metal handles outlive the guest pseudo-process and hold host pointers INTO
+the arena, i.e. into the 4 GB range `ios_wow_reclaim_dead_windows()`
+replaces with PROT_NONE. Required: per-guest-process root keyed by the
+same PEB the window registry uses; export `d3d9_native_process_teardown
+(peb)`; call it BEFORE the PROT_NONE replace and before
+`ios_jit_purge_window()`; assert the order: arena pointers dropped, then
+Metal objects, then the remap.
+6. Guest-window memory: net positive (staging rings, CpuPlaced backings,
+argument buffers, DXMT thread stacks + 16 MB callret reservations leave
+the window); what stays is exactly the Lock mirrors and MANAGED/SYSTEMMEM
+mirrors (hundreds of MB possible; `d3d9_mem.cpp` reclamation off natively).
+Arena grows in 64 MB chunks, `[d3d9-arena]` high-water line, exhaustion
+names the cause (not opaque E_OUTOFMEMORY).
+7. Ring correctness (Phase 2): wrong frames rather than crashes — `seq`
+assert; `madeira-d3d9.txt` `native-nosync` makes every op synchronous for
+one-run bisection; generator owns the classification.
+8. Two-module ABI: opcode numbering + parameter-block layouts generated
+from one description, one commit, build-hash handshake.
+
+### 8.10 Sequencing
+0. `[d3d9-census]` + `_d3d9_nop` micro-benchmark on the existing emulated
+path → real calls/frame and ns/call on device.
+1. `dxmt_madeira_native` build mode: `src/d3d9` + substrate compiled
+iOS-arm64 into `libdxmt_unix.a`; `wsi_*_madeira.cpp`;
+`util_madeira_compat.h`; no shim yet → compiles/links.
+2. `d3d9_api.py` + generator; both tables; static asserts pass.
+3. Shim: objects, identity, refcounts, vtables, `setupFpu`, arena, window
+code → cube builds with the right imports.
+4. Unix entries + `virtual_ios.c` binding + per-PEB teardown → cube passes
+on device (exit 43).
+5. `d3d9-state-x86.c` passes on device.
+6. Game A/B via `madeira-d3d9.txt`; `[prof]` before/after → ≥ −10 % fps,
+d3d9 buckets gone.
+7. Phase 2 ring → calls/frame down two orders of magnitude; fps up.
+Steps 1 and 3 can run in parallel once 2 exists.
+Critical files: `research/dxmt/src/d3d9/d3d9_device.hpp` (134-slot
+declaration the description must match), `d3d9_device.cpp` (hot bodies
+`:6275,:6524,:11302,:11502`, `setupFpu` `:504-521`, user32 block
+`:1744-2270`, `guest_alloc` sites), `src/nativemetal/wineunixlib.h`,
+`build/ntdll-unix/virtual_ios.c` (`ios_bind_unixlib_table` `:7063`,
+`load_builtin_unixlib` `:7083-7229`, `MemoryWineLoadUnixLib*` `:18959`,
+window teardown), `src/winemetal/unix/winemetal_unix.c` (`_Foo32` pattern
+`:4415-4460`, tables `:5077,:5243`), `src/d3d9/d3d9_buffer_map.hpp`.

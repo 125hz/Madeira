@@ -476,6 +476,189 @@ final class MetalBackedView: UIView {
     }
 }
 
+/// ml661 — EVERY HELD CONTROL DECLARES WHAT IT WANTS HELD; NOTHING POSTS EDGES.
+///
+/// The sticks and buttons used to be edge-triggered in their own `@State`:
+/// "the thumb crossed into a new sector, so post W-up and A-down". That is
+/// only correct while the view survives to post the closing edge, and a
+/// SwiftUI view under a thumb has several ways not to:
+///
+///   • `DragGesture` has no cancellation callback. A system edge-swipe, the
+///     control-centre pull, or another recogniser winning simply means
+///     `onEnded` is never called — the key stays down forever.
+///   • Toggling the landscape controls off (`TouchControlsModel.visible`), or
+///     entering edit mode, or rotating, removes the whole `ForEach` body. The
+///     view is gone; `onEnded` will never arrive.
+///   • Two controls can bind the same key. Edge-triggered, whichever lifts
+///     first releases it out from under the other.
+///
+/// So ownership replaces edges. A control says "owner 7 wants {W, A}" and this
+/// class posts the difference between the union of all owners' wishes and what
+/// it has actually sent down. Releasing an owner is a single call that cannot
+/// be got wrong, an owner that vanishes takes its keys with it, and a shared
+/// key stays down while any owner still wants it.
+///
+/// On top of that sits a 1Hz reconciler. It compares this app-side intent
+/// against `winios_held_keys()` — what the DRIVER was actually told — and
+/// repairs a disagreement that survives three ticks: a key wine thinks is down
+/// that nobody wants gets an up, a key an owner wants that never reached wine
+/// gets its down re-sent. That makes a lost transition self-healing rather
+/// than permanent, whatever loses it.
+final class InputGuard {
+    static let shared = InputGuard()
+
+    /// owner → the virtual-keys that owner currently wants held.
+    private var wants: [Int: Set<Int32>] = [:]
+    /// owner → mouse buttons (0 = left, 1 = right) that owner wants held.
+    private var wantBtns: [Int: Set<Int>] = [:]
+    /// What we have actually posted a DOWN for and not yet an UP.
+    private var keysDown: Set<Int32> = []
+    private var btnsDown: Set<Int> = []
+
+    private var ticker: Timer?
+    private var mismatch = 0
+    private var heartbeat = 0
+
+    private static var ownerSeq = 0
+    /// Stable per-view identity. Stored in `@State`, so it is created once per
+    /// view identity and survives re-renders (which is exactly the lifetime a
+    /// held key has to be tied to).
+    static func newOwner() -> Int { ownerSeq += 1; return ownerSeq }
+
+    private init() {
+        let nc = NotificationCenter.default
+        // Backgrounding, a phone call, the app switcher: the finger is gone and
+        // no gesture callback is coming. Release everything, both sides.
+        for n in [UIApplication.willResignActiveNotification,
+                  UIApplication.didEnterBackgroundNotification] {
+            nc.addObserver(forName: n, object: nil, queue: .main) { [weak self] _ in
+                self?.releaseAll("scene-inactive")
+            }
+        }
+    }
+
+    // MARK: intent
+
+    func hold(_ owner: Int, keys: Set<Int32>) {
+        wants[owner] = keys.isEmpty ? nil : keys
+        sync()
+    }
+
+    func hold(_ owner: Int, buttons: Set<Int>) {
+        wantBtns[owner] = buttons.isEmpty ? nil : buttons
+        sync()
+    }
+
+    /// The one call a control makes when it stops being held — for any reason,
+    /// including reasons it cannot detect (see `.onDisappear` / `@GestureState`
+    /// at each call site).
+    func release(_ owner: Int) {
+        guard wants[owner] != nil || wantBtns[owner] != nil else { return }
+        wants[owner] = nil
+        wantBtns[owner] = nil
+        sync()
+    }
+
+    func releaseAll(_ reason: String) {
+        let had = keysDown.count + btnsDown.count
+        wants.removeAll()
+        wantBtns.removeAll()
+        sync()
+        AimStickDriver.shared.stopAll()
+        // Belt and braces: whatever the app believes, clear what the DRIVER
+        // believes. These are the two independent held-sets and either can be
+        // the stale one.
+        winios_release_all_keys()
+        if had > 0 { fputs("[input] releaseAll(\(reason)) released \(had)\n", stderr) }
+    }
+
+    private func sync() {
+        let wantKeys = wants.values.reduce(into: Set<Int32>()) { $0.formUnion($1) }
+        for vk in keysDown.subtracting(wantKeys) { winios_post_key(vk, 0) }
+        for vk in wantKeys.subtracting(keysDown) { winios_post_key(vk, 1) }
+        keysDown = wantKeys
+
+        let wantBtn = wantBtns.values.reduce(into: Set<Int>()) { $0.formUnion($1) }
+        for b in btnsDown.subtracting(wantBtn) {
+            winios_pointer(0, 0, b == 0 ? 0x0004 : 0x0010, 0)   // LEFTUP / RIGHTUP
+        }
+        for b in wantBtn.subtracting(btnsDown) {
+            winios_pointer(0, 0, b == 0 ? 0x0002 : 0x0008, 0)   // LEFTDOWN / RIGHTDOWN
+        }
+        btnsDown = wantBtn
+
+        startTickerIfNeeded()
+    }
+
+    // MARK: reconciler / diagnostics
+
+    /// The aim stick holds no keys, so `sync()` never runs for it — but a stick
+    /// stuck "held" is precisely the failure worth watching. Let it arm the
+    /// reconciler too.
+    func pokeTicker() { startTickerIfNeeded() }
+
+    private func startTickerIfNeeded() {
+        guard ticker == nil else { return }
+        let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(t, forMode: .common)
+        ticker = t
+    }
+
+    private func tick() {
+        var mask = [UInt32](repeating: 0, count: 8)
+        let drvCount = mask.withUnsafeMutableBufferPointer {
+            Int(winios_held_keys($0.baseAddress))
+        }
+        var drv = Set<Int32>()
+        for vk in 0..<256 where (mask[vk >> 5] & (UInt32(1) << UInt32(vk & 31))) != 0 {
+            drv.insert(Int32(vk))
+        }
+
+        let stuck = drv.subtracting(keysDown)        // wine holds what nobody wants
+        let lost  = keysDown.subtracting(drv)        // an owner wants what wine never got
+
+        // ml661: one line that names BOTH held-sets and the aim clock, every
+        // four seconds while anything is held. Pair it with winios.m's
+        // "[input] ring ..." line and a future report of dead input says which
+        // stage lost it — app intent, the ring, or the driver — instead of
+        // leaving it to be guessed at.
+        heartbeat += 1
+        if heartbeat % 4 == 0,
+           !keysDown.isEmpty || !btnsDown.isEmpty || drvCount > 0 || AimStickDriver.shared.isRunning {
+            fputs("[input] app keys=\(hex(keysDown)) btns=\(btnsDown.sorted()) " +
+                  "drv=\(hex(drv)) aim(holders=\(AimStickDriver.shared.holderCount) " +
+                  "link=\(AimStickDriver.shared.isRunning))\n", stderr)
+        }
+
+        if stuck.isEmpty && lost.isEmpty {
+            mismatch = 0
+            if keysDown.isEmpty && btnsDown.isEmpty && drvCount == 0
+                && !AimStickDriver.shared.isRunning {
+                ticker?.invalidate(); ticker = nil   // nothing held anywhere: stand down
+            }
+            return
+        }
+
+        mismatch += 1
+        // Three seconds of disagreement is not a drain that is merely late —
+        // even a badly stalled frame drains eventually. Repair it.
+        guard mismatch >= 3 else { return }
+        mismatch = 0
+        fputs("[input] reconcile stuck=\(hex(stuck)) lost=\(hex(lost)) " +
+              "app=\(hex(keysDown)) drv=\(hex(drv))\n", stderr)
+        // Repair only the keys that actually disagree. A blanket
+        // winios_release_all_keys() here would also drop the keys a thumb is
+        // legitimately holding, and they would not come back until the next
+        // reconcile — three seconds of not walking to fix one stuck key.
+        for vk in stuck { winios_post_key(vk, 0) }
+        for vk in lost  { winios_post_key(vk, 1) }
+    }
+
+    private func hex(_ s: Set<Int32>) -> String {
+        "[" + s.sorted().map { String(format: "%02x", $0) }.joined(separator: ",") + "]"
+    }
+}
+
 /// Arrow-key button with press/hold/release semantics. DragGesture with
 /// zero minimum distance fires onChanged at touch-down (key down once)
 /// and onEnded at lift (key up) — unlike Button, which only taps.
@@ -484,6 +667,11 @@ struct HoldKeyView: View {
     let vk: Int32
     var big = false   // landscape D-pad: thumb-sized
     @State private var isDown = false
+    @State private var owner = InputGuard.newOwner()
+    /// ml661: GestureState is reset by SwiftUI when the gesture ENDS *or IS
+    /// CANCELLED*, which is the only cancellation signal a DragGesture has.
+    /// Without it, a system gesture stealing the touch leaves the key down.
+    @GestureState private var active = false
 
     var body: some View {
         Text(label)
@@ -494,17 +682,22 @@ struct HoldKeyView: View {
             .cornerRadius(big ? 12 : 6)
             .gesture(
                 DragGesture(minimumDistance: 0)
+                    .updating($active) { _, s, _ in s = true }
                     .onChanged { _ in
                         if !isDown {
                             isDown = true
-                            winios_post_key(vk, 1)
+                            InputGuard.shared.hold(owner, keys: [vk])
                         }
                     }
                     .onEnded { _ in
                         isDown = false
-                        winios_post_key(vk, 0)
+                        InputGuard.shared.release(owner)
                     }
             )
+            .onChange(of: active) { _, a in
+                if !a && isDown { isDown = false; InputGuard.shared.release(owner) }
+            }
+            .onDisappear { isDown = false; InputGuard.shared.release(owner) }
     }
 }
 
@@ -753,16 +946,32 @@ final class AimStickDriver {
     static let fullRate: CGFloat = 360
 
     private var link: CADisplayLink?
-    private var vx: CGFloat = 0, vy: CGFloat = 0
     // Same truncation problem as ml641's relCarryX: at low sensitivity the
     // per-frame delta is a fraction, and Int32() of a fraction is zero forever.
     private var carryX: CGFloat = 0, carryY: CGFloat = 0
-    /// Portrait and landscape can both have an aim stick on screen; whichever
-    /// is touched first starts the clock and the last one to lift stops it.
-    private var holders = 0
 
-    func begin() {
-        holders += 1
+    /// ml661 — HOLDERS ARE TOKENS, NOT A COUNT.
+    ///
+    /// Portrait and landscape can both have an aim stick on screen, so the
+    /// clock is shared and needs to stop when the last thumb lifts. A bare
+    /// `holders += 1 / -= 1` counter gets that wrong in both directions: a
+    /// `begin()` whose `end()` never arrives (the gesture was cancelled, or the
+    /// control was removed mid-hold) pins the count above zero FOREVER, and
+    /// because the last deflection is still latched, the display link keeps
+    /// posting 60–120 relative moves a second into the event ring for the rest
+    /// of the session. That is not merely a stuck camera: it is the flood that
+    /// used to bury every key and button transition behind it.
+    ///
+    /// Keyed by owner instead, the operation is idempotent — a duplicate
+    /// `end()` is a no-op, a missing one is repaired the moment that owner
+    /// disappears or is released, and `stopAll()` can always clear the lot.
+    /// Each owner also carries its own deflection, so one stick lifting cannot
+    /// leave the other's vector latched.
+    private var vecs: [Int: CGSize] = [:]
+
+    func begin(_ owner: Int) {
+        if vecs[owner] == nil { vecs[owner] = .zero }
+        InputGuard.shared.pokeTicker()
         guard link == nil else { return }
         carryX = 0; carryY = 0
         let l = CADisplayLink(target: self, selector: #selector(tick(_:)))
@@ -772,21 +981,43 @@ final class AimStickDriver {
 
     /// Deflection, −1…1 per axis, y positive DOWN (screen sense). Sign matches
     /// the drag path: push right → view turns right, like a mouse.
-    func steer(_ v: CGSize) {
-        vx = v.width.isFinite ? v.width : 0
-        vy = v.height.isFinite ? v.height : 0
+    func steer(_ owner: Int, _ v: CGSize) {
+        guard vecs[owner] != nil else { return }   // not holding: ignore stragglers
+        vecs[owner] = CGSize(width: v.width.isFinite ? v.width : 0,
+                             height: v.height.isFinite ? v.height : 0)
     }
 
-    func end() {
-        holders = max(holders - 1, 0)
-        guard holders == 0 else { return }
-        vx = 0; vy = 0
+    func end(_ owner: Int) {
+        guard vecs.removeValue(forKey: owner) != nil else { return }
+        guard vecs.isEmpty else { return }
+        stopAll()
+    }
+
+    /// Unconditional halt: the app resigned active, or the reconciler decided
+    /// nothing can legitimately still be held.
+    func stopAll() {
+        vecs.removeAll()
         carryX = 0; carryY = 0
         link?.invalidate()
         link = nil
     }
 
+    var isRunning: Bool { link != nil }
+    var holderCount: Int { vecs.count }
+
+    /// Sum of every holder's deflection, clamped to unit length — two thumbs on
+    /// two aim sticks add, they do not multiply the rate.
+    private var vector: CGSize {
+        var x: CGFloat = 0, y: CGFloat = 0
+        for v in vecs.values { x += v.width; y += v.height }
+        let d = (x * x + y * y).squareRoot()
+        if d > 1 { x /= d; y /= d }
+        return CGSize(width: x, height: y)
+    }
+
     @objc private func tick(_ l: CADisplayLink) {
+        let v = vector
+        let vx = v.width, vy = v.height
         guard vx != 0 || vy != 0 else { return }
         let dt = max(min(l.targetTimestamp - l.timestamp, 1.0 / 15.0), 1.0 / 240.0)
         let k = CGFloat(InputSettings.shared.sensRel) * Self.fullRate * CGFloat(dt)
@@ -816,6 +1047,8 @@ struct JoystickKeyView: View {
     @State private var dir: Int = -1        // -1 = centred, else 0=up then clockwise
     @State private var center: CGPoint = .zero
     @State private var hosted = false       // overlay window up: it draws the face
+    @State private var owner = InputGuard.newOwner()
+    @GestureState private var active = false
 
     private let deadzone: CGFloat = 14      // pt of travel before a direction registers
 
@@ -836,16 +1069,28 @@ struct JoystickKeyView: View {
         }
     }
 
-    /// Release what is no longer held, press what newly is — never a blanket
-    /// release/re-press, which would make a held direction stutter as the
-    /// thumb wanders inside one sector.
+    /// ml661: declare the set this stick wants held and let InputGuard work out
+    /// the edges. Identical behaviour while the thumb wanders inside one sector
+    /// (the set is unchanged, so nothing is posted and a held direction does
+    /// not stutter) — but now the set is also released for us if this view is
+    /// torn down or its gesture is cancelled, which no edge-posting version
+    /// could manage.
     private func apply(_ next: Int) {
         guard next != dir else { return }
-        let old = Set(keys(for: dir)), new = Set(keys(for: next))
-        for vk in old.subtracting(new) { winios_post_key(vk, 0) }
-        for vk in new.subtracting(old) { winios_post_key(vk, 1) }
+        InputGuard.shared.hold(owner, keys: Set(keys(for: next)))
         dir = next
         JoystickPadState.shared.dir = next
+    }
+
+    /// Every path out of "held", including the ones SwiftUI never tells us
+    /// about directly.
+    private func releaseStick() {
+        guard held || dir != -1 else { return }
+        InputGuard.shared.release(owner)
+        dir = -1
+        held = false
+        JoystickPadState.shared.dir = -1
+        JoystickPadState.shared.held = false
     }
 
     private func snap(_ t: CGSize) -> Int {
@@ -886,8 +1131,13 @@ struct JoystickKeyView: View {
                 }
             )
             .animation(.spring(response: 0.32, dampingFraction: 0.62), value: held)
+            // ml661: the row this lives in is removed wholesale when the pointer
+            // panel opens, and the whole hierarchy is rebuilt on rotation.
+            // Either would otherwise strand whatever arrow was down.
+            .onDisappear { releaseStick() }
             .gesture(
                 DragGesture(minimumDistance: 0)
+                    .updating($active) { _, s, _ in s = true }
                     .onChanged { g in
                         if !held {
                             held = true
@@ -910,6 +1160,9 @@ struct JoystickKeyView: View {
                         }
                     }
             )
+            // ml661: a cancelled DragGesture never calls onEnded. GestureState
+            // going false is the only notice we get.
+            .onChange(of: active) { _, a in if !a { releaseStick() } }
     }
 }
 
@@ -933,6 +1186,8 @@ struct AimStickKeyView: View {
     @State private var held = false
     @State private var hosted = false
     @State private var center: CGPoint = .zero
+    @State private var owner = InputGuard.newOwner()
+    @GestureState private var active = false
 
     /// Travel, in points of thumb movement, that means full deflection. Smaller
     /// than the pad radius (58) so the stick reaches its limit well inside the
@@ -951,7 +1206,20 @@ struct AimStickKeyView: View {
 
     private func publish(_ v: CGSize) {
         JoystickPadState.aim.vec = v
-        AimStickDriver.shared.steer(v)
+        AimStickDriver.shared.steer(owner, v)
+    }
+
+    /// ml661: one exit for every way this stick can stop being held. Stopping
+    /// the driver matters more here than releasing a key does: a stick left
+    /// "held" keeps a display link posting a relative move every frame, and
+    /// that flood is what used to starve every other control.
+    private func releaseStick() {
+        guard held else { return }
+        held = false
+        JoystickPadState.aim.vec = nil
+        JoystickPadState.aim.held = false
+        AimStickDriver.shared.steer(owner, .zero)
+        AimStickDriver.shared.end(owner)
     }
 
     var body: some View {
@@ -983,9 +1251,10 @@ struct AimStickKeyView: View {
             // The row this lives in is removed wholesale when the pointer panel
             // opens. Without this the driver would keep firing at whatever
             // deflection the thumb happened to be at when the view vanished.
-            .onDisappear { if held { held = false; publish(.zero); AimStickDriver.shared.end() } }
+            .onDisappear { releaseStick() }
             .gesture(
                 DragGesture(minimumDistance: 0)
+                    .updating($active) { _, s, _ in s = true }
                     .onChanged { g in
                         if !held {
                             held = true
@@ -994,7 +1263,7 @@ struct AimStickKeyView: View {
                                 JoystickPadHost.attach(to: scene)
                             }
                             JoystickPadState.aim.center = center
-                            AimStickDriver.shared.begin()
+                            AimStickDriver.shared.begin(owner)
                             withAnimation(.spring(response: 0.32, dampingFraction: 0.62)) {
                                 JoystickPadState.aim.held = true
                             }
@@ -1003,7 +1272,7 @@ struct AimStickKeyView: View {
                     }
                     .onEnded { _ in
                         publish(.zero)
-                        AimStickDriver.shared.end()
+                        AimStickDriver.shared.end(owner)
                         held = false
                         withAnimation(.spring(response: 0.32, dampingFraction: 0.62)) {
                             JoystickPadState.aim.held = false
@@ -1011,6 +1280,10 @@ struct AimStickKeyView: View {
                         }
                     }
             )
+            // ml661: cancellation (system edge swipe, another recogniser winning)
+            // never calls onEnded — and here that would mean a camera spinning
+            // by itself and a ring full of moves.
+            .onChange(of: active) { _, a in if !a { releaseStick() } }
     }
 }
 
@@ -3203,6 +3476,13 @@ struct TouchControlButton: View {
     @State private var stickDir: Int = -1
     /// ml660: continuous deflection for the aim stick, −1…1 per axis.
     @State private var stickVec: CGSize?
+    /// ml661: held state belongs to InputGuard / AimStickDriver, keyed by this.
+    @State private var owner = InputGuard.newOwner()
+    /// ml661: SwiftUI resets this when the drag ends OR is cancelled. Toggling
+    /// the controls off, entering edit mode and rotating all tear this view out
+    /// mid-hold, and a plain onEnded never arrives for any of them — which is
+    /// how a landscape button ended up holding its key down for good.
+    @GestureState private var active = false
 
     private var diameter: CGFloat { TouchControlsModel.baseDiameter * CGFloat(control.scale) }
     private var isStick: Bool { control.action.isStick }
@@ -3257,6 +3537,7 @@ struct TouchControlButton: View {
                   y: CGFloat(control.ny) * screen.height)
         .gesture(
             DragGesture(minimumDistance: 0)
+                .updating($active) { _, s, _ in s = true }
                 .onChanged { v in
                     if m.editing {
                         m.selected = control.id
@@ -3271,12 +3552,12 @@ struct TouchControlButton: View {
                     } else if control.action.isMouseStick {
                         if !isDown {
                             isDown = true
-                            AimStickDriver.shared.begin()
+                            AimStickDriver.shared.begin(owner)
                             UIImpactFeedbackGenerator(style: .light).impactOccurred()
                         }
                         let d = deflect(v.translation)
                         stickVec = d
-                        AimStickDriver.shared.steer(d)
+                        AimStickDriver.shared.steer(owner, d)
                     } else if !isDown {
                         isDown = true
                         press(true)
@@ -3284,22 +3565,33 @@ struct TouchControlButton: View {
                 }
                 .onEnded { _ in
                     dragBase = nil
-                    if let q = control.action.stickKeys {
-                        applyStick(-1, q)          // release every held direction
-                        isDown = false
-                    } else if control.action.isMouseStick {
-                        if isDown {
-                            AimStickDriver.shared.steer(.zero)
-                            AimStickDriver.shared.end()
-                        }
-                        isDown = false
-                        stickVec = nil
-                    } else if isDown {
-                        isDown = false
-                        press(false)
-                    }
+                    releaseControl()
                 }
         )
+        // ml661: the two paths onEnded cannot cover. `active` going false is
+        // cancellation; onDisappear is the controls being hidden, edit mode
+        // being entered, or a rotation rebuilding the overlay — each of which
+        // used to leave this control's key or stick held for the rest of the
+        // session.
+        .onChange(of: active) { _, a in if !a { dragBase = nil; releaseControl() } }
+        .onDisappear { dragBase = nil; releaseControl() }
+    }
+
+    /// ml661 — the single exit from "held", idempotent so every one of the four
+    /// callers above can fire without double-releasing.
+    private func releaseControl() {
+        guard isDown || stickDir != -1 else { return }
+        isDown = false
+        if let q = control.action.stickKeys {
+            applyStick(-1, q)                       // releases every held direction
+        } else if control.action.isMouseStick {
+            AimStickDriver.shared.steer(owner, .zero)
+            AimStickDriver.shared.end(owner)
+            stickVec = nil
+        } else {
+            press(false)
+            InputGuard.shared.release(owner)    // covers every action kind
+        }
     }
 
     /// ml660: ANALOGUE deflection for the aim stick, −1…1 per axis. Both the
@@ -3341,9 +3633,8 @@ struct TouchControlButton: View {
     /// wanders inside one sector.
     private func applyStick(_ next: Int, _ q: [Int32]) {
         guard next != stickDir else { return }
-        let old = Set(stickKeys(stickDir, q)), new = Set(stickKeys(next, q))
-        for vk in old.subtracting(new) { winios_post_key(vk, 0) }
-        for vk in new.subtracting(old) { winios_post_key(vk, 1) }
+        // ml661: state the set, don't post the edges — see InputGuard.
+        InputGuard.shared.hold(owner, keys: Set(stickKeys(next, q)))
         if stickDir == -1, next != -1 { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
         stickDir = next
     }
@@ -3352,13 +3643,15 @@ struct TouchControlButton: View {
     /// continuously for as long as you walk.
     private func press(_ down: Bool) {
         if down { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
+        // ml661: keys and mouse buttons both go through InputGuard, so a button
+        // this view was holding when it vanished is released with it.
         switch control.action {
         case .key(let vk):
-            winios_post_key(vk, down ? 1 : 0)
+            InputGuard.shared.hold(owner, keys: down ? [vk] : [])
         case .mouseLeft:
-            winios_pointer(0, 0, down ? 0x0002 : 0x0004, 0)   // LEFTDOWN / LEFTUP
+            InputGuard.shared.hold(owner, buttons: down ? [0] : [])
         case .mouseRight:
-            winios_pointer(0, 0, down ? 0x0008 : 0x0010, 0)   // RIGHTDOWN / RIGHTUP
+            InputGuard.shared.hold(owner, buttons: down ? [1] : [])
         case .keyboardToggle:
             if down { MetalBackedView.toggleKeyboard() }
         case .none, .joystickWASD, .joystickArrows, .joystickMouse:

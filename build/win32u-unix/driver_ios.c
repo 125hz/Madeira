@@ -87,10 +87,22 @@ void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_
      * a dispatch layer that can fail for its own reasons. */
     NTSTATUS st = send_hardware_message( NULL, 0, &input, 0 );
     {
-        static unsigned cnt;
-        if (cnt++ < 40)
-            dprintf(2, "[winios] drv_post_mouse hwnd=%p flags=0x%x x=%d y=%d -> status=0x%x\n",
-                    hwnd, flags, x, y, (unsigned)st);
+        /* ml661: the old "first 40 lines" cap is the same trap ml647 fixed on
+         * the keyboard side — it is exhausted in the first second of pointer
+         * movement, so every later event, including every FAILING one, left no
+         * trace and the log read as if the driver had never been called. A
+         * button transition (the events a dead on-screen button is about) is
+         * rare enough to log every time; moves are thinned. Failures are always
+         * logged, and the running failure total is always truthful. */
+        static unsigned cnt, moves, bad;
+        BOOL is_move = !(flags & ~(unsigned)(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE));
+        cnt++;
+        if (st) bad++;
+        if (st || !is_move || cnt <= 8 || (moves & 0xff) == 0)
+            dprintf(2, "[winios] ml661 drv_post_mouse #%u hwnd=%p flags=0x%x x=%d y=%d "
+                       "-> status=0x%x (failures=%u)\n",
+                    cnt, hwnd, flags, x, y, (unsigned)st, bad);
+        if (is_move) moves++;
     }
 }
 

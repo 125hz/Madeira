@@ -41,6 +41,19 @@ void winios_post_touch_up(int x, int y);
  * down=1 press, down=0 release. */
 void winios_post_key(int vk, int down);
 
+/* ml661 — stuck-input release valve. Queues a key-up for every key (and a
+ * button-up for every mouse button) the DRIVER still believes is held. The
+ * app calls this whenever a held gesture can have ended without its matching
+ * release being posted: scene deactivation, the control overlay being hidden
+ * or rotated away under a thumb, a cancelled gesture. Cheap and idempotent —
+ * it does nothing when nothing is held. */
+void winios_release_all_keys(void);
+
+/* ml661 — driver-side held-key state, for the app's [input] diagnostic: bit i
+ * of mask[i>>5] is virtual-key i. Returns the number of keys held. Comparing
+ * this against the app's own held-set is what names the failing stage. */
+int winios_held_keys(unsigned int mask[8]);
+
 /* S2 desktop compositor placement. Called by the Swift presentation
  * placeholder (MetalBackedView) with its bounds in UIWindow coords —
  * the wine virtual desktop renders aspect-fit inside this frame, like
