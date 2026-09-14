@@ -77,6 +77,7 @@
 #include "wine/debug.h"
 #include "unix_private.h"
 #include "ios_wow.h"
+#include "ios_srv_stats.h"   /* ml951: [thrinfo] buckets */
 
 WINE_DEFAULT_DEBUG_CHANNEL(thread);
 WINE_DECLARE_DEBUG_CHANNEL(seh);
@@ -2521,6 +2522,77 @@ static BOOL is_process_wow64( const CLIENT_ID *id )
 }
 
 /******************************************************************************
+ *   iOS-Madeira ml951: NtQueryInformationThread's own-thread cache
+ *
+ * [srv-stats] put `get_thread_info' second only to `get_message': 103140
+ * requests in a 10 s window, ~10 k/s, and every one of them originates in
+ * NtQueryInformationThread below (the only other caller in this file is
+ * ios_mach_thread_for_handle(), which runs once per terminate).
+ *
+ * Most of what ThreadBasicInformation returns for the CALLING thread cannot
+ * change while that thread is the one asking:
+ *   - ExitStatus is STATUS_PENDING by construction (we are running);
+ *   - TebBaseAddress and ClientId are fixed for the lifetime of the thread;
+ *   - Priority / BasePriority / AffinityMask change only through
+ *     NtSetInformationThread, which bumps ios_thread_info_gen.
+ * So a one-entry per-thread cache, keyed on the HANDLE it was learned from
+ * and invalidated by the generation counter, answers the whole call with no
+ * server round trip.  The handle key is what lets a real (non-pseudo) self
+ * handle hit as well: the first query resolves it, and reply->tid tells us it
+ * was us.  A handle to ANOTHER thread is never cached — ExitStatus there is
+ * exactly the thing the caller is polling for.
+ *
+ * The generation counter is process-wide and bumped by every
+ * NtSetInformationThread, so a SetThreadPriority on any thread invalidates
+ * every cache; a cross-process priority change (which does not pass through
+ * this ntdll) is covered by the IOS_TBI_MAX_USES refresh cap.
+ */
+#define IOS_TBI_MAX_USES 4096
+
+struct ios_self_tbi
+{
+    HANDLE                   handle;   /* handle this entry was learned from */
+    unsigned int             gen;      /* 0 = empty                          */
+    unsigned int             uses;
+    THREAD_BASIC_INFORMATION info;
+};
+
+static __thread struct ios_self_tbi ios_self_tbi;
+static unsigned int ios_thread_info_gen = 1;
+
+static BOOL ios_tbi_get( HANDLE handle, THREAD_BASIC_INFORMATION *info )
+{
+    struct ios_self_tbi *c = &ios_self_tbi;
+
+    if (!c->gen || c->handle != handle) return FALSE;
+    if (c->gen != __atomic_load_n( &ios_thread_info_gen, __ATOMIC_RELAXED )) return FALSE;
+    if (++c->uses > IOS_TBI_MAX_USES) { c->gen = 0; return FALSE; }
+    *info = c->info;
+    return TRUE;
+}
+
+static void ios_tbi_put( HANDLE handle, const THREAD_BASIC_INFORMATION *info )
+{
+    struct ios_self_tbi *c = &ios_self_tbi;
+
+    if (info->ClientId.UniqueThread != NtCurrentTeb()->ClientId.UniqueThread ||
+        info->ExitStatus != STATUS_PENDING)
+    {
+        c->gen = 0;   /* another thread, or one that has exited: never cache */
+        return;
+    }
+    c->handle = handle;
+    c->info   = *info;
+    c->uses   = 0;
+    c->gen    = __atomic_load_n( &ios_thread_info_gen, __ATOMIC_RELAXED );
+}
+
+static void ios_tbi_invalidate(void)
+{
+    __atomic_fetch_add( &ios_thread_info_gen, 1, __ATOMIC_RELAXED );
+}
+
+/******************************************************************************
  *              NtQueryInformationThread  (NTDLL.@)
  */
 NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
@@ -2536,6 +2608,15 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
     {
         THREAD_BASIC_INFORMATION info;
         const ULONG_PTR affinity_mask = get_system_affinity_mask();
+
+        if (ios_tbi_get( handle, &info ))
+        {
+            ios_srv_thrinfo_count( IOS_TI_BASIC_SELF );
+            ios_srv_thrinfo_count( IOS_TI_BASIC_CACHED );
+            if (data) memcpy( data, &info, min( length, sizeof(info) ));
+            if (ret_len) *ret_len = min( length, sizeof(info) );
+            return STATUS_SUCCESS;
+        }
 
         SERVER_START_REQ( get_thread_info )
         {
@@ -2561,9 +2642,13 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
                 else
                     info.TebBaseAddress = NULL;
             }
+            ios_srv_thrinfo_count( info.ClientId.UniqueThread == NtCurrentTeb()->ClientId.UniqueThread
+                                   ? IOS_TI_BASIC_SELF : IOS_TI_BASIC_OTHER );
+            ios_tbi_put( handle, &info );
             if (data) memcpy( data, &info, min( length, sizeof(info) ));
             if (ret_len) *ret_len = min( length, sizeof(info) );
         }
+        else ios_srv_thrinfo_count( IOS_TI_BASIC_OTHER );
         return status;
     }
 
@@ -2571,6 +2656,20 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
     {
         const ULONG_PTR affinity_mask = get_system_affinity_mask();
         ULONG_PTR affinity = 0;
+        THREAD_BASIC_INFORMATION info;
+
+        ios_srv_thrinfo_count( IOS_TI_AFFINITY );
+        /* only for the pseudo handle: a real handle would need the server's
+         * THREAD_QUERY_INFORMATION check, which GetCurrentThread() always
+         * passes and which the cached entry cannot stand in for. */
+        if (handle == GetCurrentThread() && ios_tbi_get( handle, &info ))
+        {
+            ios_srv_thrinfo_count( IOS_TI_AFFINITY_CACHED );
+            affinity = info.AffinityMask;
+            if (data) memcpy( data, &affinity, min( length, sizeof(affinity) ));
+            if (ret_len) *ret_len = min( length, sizeof(affinity) );
+            return STATUS_SUCCESS;
+        }
 
         SERVER_START_REQ( get_thread_info )
         {
@@ -2592,6 +2691,7 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
         KERNEL_USER_TIMES kusrt;
         int unix_pid, unix_tid;
 
+        ios_srv_thrinfo_count( IOS_TI_TIMES );
         SERVER_START_REQ( get_thread_times )
         {
             req->handle = wine_server_obj_handle( handle );
@@ -2636,6 +2736,7 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
     case ThreadAmILastThread:
     {
         if (length != sizeof(ULONG)) return STATUS_INFO_LENGTH_MISMATCH;
+        ios_srv_thrinfo_count( IOS_TI_AMILAST );
         SERVER_START_REQ( get_thread_info )
         {
             req->handle = wine_server_obj_handle( handle );
@@ -2653,6 +2754,7 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
 
     case ThreadQuerySetWin32StartAddress:
     {
+        ios_srv_thrinfo_count( IOS_TI_START_ADDR );
         SERVER_START_REQ( get_thread_info )
         {
             req->handle = wine_server_obj_handle( handle );
@@ -2674,8 +2776,20 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
         const ULONG_PTR affinity_mask = get_system_affinity_mask();
         GROUP_AFFINITY affinity;
 
+        THREAD_BASIC_INFORMATION info;
+
         memset( &affinity, 0, sizeof(affinity) );
         affinity.Group = 0; /* Wine only supports max 64 processors */
+
+        ios_srv_thrinfo_count( IOS_TI_AFFINITY );
+        if (handle == GetCurrentThread() && ios_tbi_get( handle, &info ))
+        {
+            ios_srv_thrinfo_count( IOS_TI_AFFINITY_CACHED );
+            affinity.Mask = info.AffinityMask;
+            if (data) memcpy( data, &affinity, min( length, sizeof(affinity) ));
+            if (ret_len) *ret_len = min( length, sizeof(affinity) );
+            return STATUS_SUCCESS;
+        }
 
         SERVER_START_REQ( get_thread_info )
         {
@@ -2704,6 +2818,7 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
         ULONG terminated;
 
         if (length != sizeof(ULONG)) return STATUS_INFO_LENGTH_MISMATCH;
+        ios_srv_thrinfo_count( IOS_TI_TERMINATED );
         SERVER_START_REQ( get_thread_info )
         {
             req->handle = wine_server_obj_handle( handle );
@@ -2722,6 +2837,7 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
         if (length != sizeof(ULONG)) return STATUS_INFO_LENGTH_MISMATCH;
         if (!data) return STATUS_ACCESS_VIOLATION;
 
+        ios_srv_thrinfo_count( IOS_TI_SUSPEND );
         SERVER_START_REQ( get_thread_info )
         {
             req->handle = wine_server_obj_handle( handle );
@@ -2739,6 +2855,7 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
         len = length >= sizeof(*info) ? length - sizeof(*info) : 0;
         ptr = info ? (WCHAR *)(info + 1) : NULL;
 
+        ios_srv_thrinfo_count( IOS_TI_NAME );
         SERVER_START_REQ( get_thread_info )
         {
             req->handle = wine_server_obj_handle( handle );
@@ -2786,6 +2903,7 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
     case ThreadPriorityBoost:
     {
         if (length != sizeof(ULONG)) return STATUS_INFO_LENGTH_MISMATCH;
+        ios_srv_thrinfo_count( IOS_TI_OTHER_CLASS );
         SERVER_START_REQ( get_thread_info )
         {
             req->handle = wine_server_obj_handle( handle );
@@ -2839,6 +2957,13 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
     unsigned int status;
 
     TRACE("(%p,%d,%p,%x)\n", handle, class, data, length);
+
+    /* ml951: any set at all invalidates every cached ThreadBasicInformation
+     * in the process.  Bumping unconditionally (rather than per class) keeps
+     * the rule "a set is a fence" — a new class that changes a cached field
+     * cannot be added here and silently leave stale caches behind. */
+    ios_srv_thrinfo_count( IOS_TI_SET );
+    ios_tbi_invalidate();
 
     switch (class)
     {

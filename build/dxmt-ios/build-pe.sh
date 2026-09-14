@@ -59,6 +59,28 @@ done
 [ ${#arches[@]} -gt 0 ] || arches=(i386)
 [ ${#install_set[@]} -gt 0 ] || install_set=(winemetal.dll d3d9.dll)
 
+# MADEIRA (WOW64_DESIGN.md section 8.4): meson's default buildtype is `debug`,
+# which means every PE module this stage has ever produced -- including the
+# i386 d3d9.dll that section 6 measured at 20-28 % of all CPU -- was compiled
+# -O0.  That A/B has now been run: the i386 stage (the shipped D3D9 path)
+# defaults to `release` below.  research/dxmt/meson.build sets
+# 'b_ndebug=if-release', so a release build also defines NDEBUG, which flips
+# winemetal_thunks.c's UNIX_CALL from the asserting form to the quiet one
+# (src/winemetal/winemetal_thunks.c:35-44) -- confirmed to still compile.
+#
+# The aarch64/arm64ec stages are untouched by this: their default stays
+# `debug`, scoping the change to the i386 (D3D9) stage only.  Set
+# MADEIRA_DXMT_PE_BUILDTYPE=debug (and delete research/dxmt/build-pe-<arch>,
+# since meson only reads this at setup time) to go back to an unoptimised
+# i386 build for a bisect; MADEIRA_DXMT_PE_BUILDTYPE, when set, still applies
+# to every requested arch, matching the previous single-knob behaviour.
+default_pe_buildtype() {
+    case "$1" in
+        i386) echo release ;;
+        *)    echo debug ;;
+    esac
+}
+
 should_install() {
     for want in "${install_set[@]}"; do
         [ "$want" = all ] && return 0
@@ -147,6 +169,7 @@ for arch in "${arches[@]}"; do
     wine_build="$(arch_wine_build "$arch")"
     install_dir="$(arch_install_dir "$arch")"
     build_sub="build-pe-$arch"
+    buildtype="${MADEIRA_DXMT_PE_BUILDTYPE:-$(default_pe_buildtype "$arch")}"
 
     echo ""
     echo "=================================================================="
@@ -205,9 +228,10 @@ EOF
 
     cd "$DXMT_SRC"
     if [ ! -f "$build_sub/build.ninja" ]; then
-        echo "--- meson setup $build_sub"
+        echo "--- meson setup $build_sub (buildtype $buildtype)"
         rm -rf "$build_sub"
         meson setup --cross-file "$cross_file" --native-file "$native_file" \
+            --buildtype "$buildtype" \
             -Dwine_build_path="$wine_build" \
             -Dwine_builtin_dll=true \
             "$build_sub"

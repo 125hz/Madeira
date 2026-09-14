@@ -134,18 +134,7 @@ final class MetalBackedView: UIView {
         super.didMoveToWindow()
         guard let w = window else { return }   // detach: leave the host be
         MetalBackedView.keyboardTarget = self  // keyboard button targets the live view
-        // SwiftUI ancestors attach gesture recognizers that can delay or
-        // cancel raw touch delivery (double-tap timing is exactly what
-        // they punish). Defuse them for our subtree.
-        var v: UIView? = self
-        while let s = v {
-            s.gestureRecognizers?.forEach {
-                $0.cancelsTouchesInView = false
-                $0.delaysTouchesBegan = false
-                $0.delaysTouchesEnded = false
-            }
-            v = s.superview
-        }
+        defuseAncestorRecognizers()
         let host = MetalHostView.shared
         if host.superview !== w {
             host.removeFromSuperview()
@@ -164,8 +153,31 @@ final class MetalBackedView: UIView {
         }
     }
 
+    /// SwiftUI ancestors attach gesture recognizers that can delay or cancel
+    /// raw touch delivery (double-tap timing is exactly what they punish).
+    /// Defuse them for our subtree.
+    ///
+    /// ml662: re-run on every layout, not once on attach. SwiftUI installs
+    /// recognizers lazily as the body changes — a modifier added by a later
+    /// render arrives AFTER didMoveToWindow, and one such recogniser with
+    /// cancelsTouchesInView left at its default is enough to cancel a live-view
+    /// touch. Which is the mirror image of the aim-stick complaint: the game
+    /// view must be as uncancellable as the control layer.
+    func defuseAncestorRecognizers() {
+        var v: UIView? = self
+        while let s = v {
+            s.gestureRecognizers?.forEach {
+                $0.cancelsTouchesInView = false
+                $0.delaysTouchesBegan = false
+                $0.delaysTouchesEnded = false
+            }
+            v = s.superview
+        }
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
+        defuseAncestorRecognizers()
         if let w = window {
             MetalHostView.shared.frame = convert(gameRect(), to: w)
             let full = convert(bounds, to: w)
@@ -529,8 +541,14 @@ final class InputGuard {
         let nc = NotificationCenter.default
         // Backgrounding, a phone call, the app switcher: the finger is gone and
         // no gesture callback is coming. Release everything, both sides.
+        //
+        // ml662: memory warnings join the list. They are the one event that can
+        // tear down and rebuild view state under a thumb WITHOUT a scene phase
+        // change, so a control holding a key through one has nothing else that
+        // would notice.
         for n in [UIApplication.willResignActiveNotification,
-                  UIApplication.didEnterBackgroundNotification] {
+                  UIApplication.didEnterBackgroundNotification,
+                  UIApplication.didReceiveMemoryWarningNotification] {
             nc.addObserver(forName: n, object: nil, queue: .main) { [weak self] _ in
                 self?.releaseAll("scene-inactive")
             }
@@ -565,6 +583,11 @@ final class InputGuard {
         wantBtns.removeAll()
         sync()
         AimStickDriver.shared.stopAll()
+        // ml662: and forget the touches that were holding them, so the faces go
+        // dark and a finger still on the glass when the app comes back does not
+        // resume a press it never re-began. Each track releases its own owner,
+        // which after the removeAll above is already a no-op.
+        ControlOverlayView.shared.dropAllTouches(reason)
         // Belt and braces: whatever the app believes, clear what the DRIVER
         // believes. These are the two independent held-sets and either can be
         // the stale one.
@@ -659,45 +682,34 @@ final class InputGuard {
     }
 }
 
-/// Arrow-key button with press/hold/release semantics. DragGesture with
-/// zero minimum distance fires onChanged at touch-down (key down once)
-/// and onEnded at lift (key up) — unlike Button, which only taps.
+/// Hold-to-press key. ml662: visual only — the key is held by
+/// ControlOverlayView for exactly as long as ITS touch lasts, so a second
+/// finger landing anywhere can no longer cancel the press.
 struct HoldKeyView: View {
     let label: String
     let vk: Int32
     var big = false   // landscape D-pad: thumb-sized
-    @State private var isDown = false
-    @State private var owner = InputGuard.newOwner()
-    /// ml661: GestureState is reset by SwiftUI when the gesture ENDS *or IS
-    /// CANCELLED*, which is the only cancellation signal a DragGesture has.
-    /// Without it, a system gesture stealing the touch leaves the key down.
-    @GestureState private var active = false
+    @ObservedObject private var face: ControlFaceState
+    private let rid: String
+
+    init(label: String, vk: Int32, big: Bool = false) {
+        self.label = label; self.vk = vk; self.big = big
+        // Identity is the KEY, not the view: two buttons bound to the same
+        // virtual-key are the same control as far as input is concerned, and
+        // InputGuard already unions their intent.
+        let id = String(format: "hold.%02x", vk)
+        self.rid = id
+        _face = ObservedObject(wrappedValue: ControlFaces.state(id))
+    }
 
     var body: some View {
         Text(label)
             .font(.system(size: big ? 22 : 14, weight: .semibold, design: .monospaced))
             .foregroundColor(.white)
             .frame(minWidth: big ? 56 : 34, minHeight: big ? 56 : 30)
-            .background(Color.white.opacity(isDown ? 0.35 : 0.15))
+            .background(Color.white.opacity(face.down ? 0.35 : 0.15))
             .cornerRadius(big ? 12 : 6)
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .updating($active) { _, s, _ in s = true }
-                    .onChanged { _ in
-                        if !isDown {
-                            isDown = true
-                            InputGuard.shared.hold(owner, keys: [vk])
-                        }
-                    }
-                    .onEnded { _ in
-                        isDown = false
-                        InputGuard.shared.release(owner)
-                    }
-            )
-            .onChange(of: active) { _, a in
-                if !a && isDown { isDown = false; InputGuard.shared.release(owner) }
-            }
-            .onDisappear { isDown = false; InputGuard.shared.release(owner) }
+            .controlRegion(rid, label, .keys([vk]))
     }
 }
 
@@ -1031,6 +1043,549 @@ final class AimStickDriver {
     }
 }
 
+// ============================================================================
+// ml662 — ONE UIKIT MULTI-TOUCH LAYER FOR EVERY ON-SCREEN CONTROL.
+//
+// ml661 made a control that STOPS being held release correctly. It could not
+// make a control be held in the first place, because that was never in our
+// hands: every control was a SwiftUI `DragGesture(minimumDistance: 0)` and
+// SwiftUI gestures are arbitrated by UIGestureRecognizers, which are built for
+// ONE gesture at a time on a scrolling document — not for four thumbs on a
+// gamepad. Concretely, and all three were reported from the same build:
+//
+//   • A button only fires once its recogniser reaches .began. A simultaneous
+//     recogniser elsewhere (the live view's, the other window's, a system edge
+//     gesture) can delay that transition past the lift, or fail it outright.
+//     The tap is simply never delivered — "the buttons still aren't 100%
+//     being registered".
+//   • A second touch ANYWHERE makes UIKit re-run arbitration, and the losing
+//     recogniser is cancelled. `@GestureState` resets, ml661's cancel path
+//     correctly releases the stick — and the aim stick dies mid-aim because a
+//     stray finger brushed the live view. Correct behaviour, wrong cause.
+//   • `onEnded` can arrive late or, after a cancellation, never.
+//
+// None of that is fixable inside the gesture model, so the gesture model is
+// gone from the play path. Raw UIKit multi-touch has exactly the semantics a
+// gamepad needs and has had them since 2008: `touchesBegan/Moved/Ended/
+// Cancelled` deliver every finger independently, each `UITouch` keeps its
+// identity from began to ended, and a touch delivered to one view is unaffected
+// by touches delivered to another.
+//
+// So: ONE `ControlOverlayView`, a plain multi-touch UIView sitting at the very
+// top of the window stack, owns every control's touch. Controls are REGIONS in
+// window coordinates, registered by the SwiftUI views that draw them (the
+// `.controlRegion` modifier below), so layout stays declarative and only input
+// moves. The rules are the ones the failures name:
+//
+//   1. The region under a touch's INITIAL location owns that touch until it
+//      ends or is cancelled. No other touch can take it, release it, or
+//      cancel it.
+//   2. A stick follows its own touch's `location(in:)` even far outside its
+//      frame; a button releases if its own finger slides off (and re-presses
+//      if it slides back).
+//   3. `hitTest` returns nil everywhere except on a region, so the live view
+//      keeps every touch that is not on a control — and because those touches
+//      land in a DIFFERENT view (and a different window), they cannot cancel a
+//      control's touch.
+//   4. `InputGuard` still owns everything actually posted, keyed per TOUCH
+//      rather than per view — so a duplicate release is a no-op and a touch
+//      that vanishes takes its keys with it.
+// ============================================================================
+
+/// What a region does while a finger is on it.
+enum ControlRegionKind: Equatable {
+    /// Hold these virtual-keys for exactly as long as the touch lasts.
+    case keys(Set<Int32>)
+    /// Momentary: down on began, up 60 ms later. The portrait ⏎/␣/Esc row.
+    case tapKey(Int32)
+    /// Hold these mouse buttons (0 = left, 1 = right).
+    case buttons(Set<Int>)
+    /// 8-way snapped stick over four keys, in order up/right/down/left.
+    case dirStick(quad: [Int32], deadzone: CGFloat)
+    /// Analogue stick feeding AimStickDriver.
+    case aimStick(deadzone: CGFloat, travel: CGFloat)
+    /// Raise/lower the iOS software keyboard.
+    case keyboardToggle
+    /// Hit-tests and lights up, posts nothing: `.none` and the unwired pad
+    /// buttons. Deliberately still a region — swallowing the touch is the whole
+    /// point, or an inert button would swing the camera.
+    case inert
+
+    var isStick: Bool {
+        switch self { case .dirStick, .aimStick: return true; default: return false }
+    }
+    var name: String {
+        switch self {
+        case .keys:           return "keys"
+        case .tapKey:         return "tap"
+        case .buttons:        return "btn"
+        case .dirStick:       return "dirstick"
+        case .aimStick:       return "aimstick"
+        case .keyboardToggle: return "kbd"
+        case .inert:          return "inert"
+        }
+    }
+}
+
+/// One control's hit area, in WINDOW coordinates — the same space SwiftUI's
+/// `.global` frames are measured in, which is why both the portrait key row
+/// (app window) and the landscape overlay (controls window) can register into
+/// one list without any conversion.
+struct ControlRegion {
+    let id: String
+    /// Human label for the log line; may change when a control is remapped,
+    /// which is why it is NOT the identity.
+    var label: String
+    var frame: CGRect
+    var kind: ControlRegionKind
+    /// Round controls hit-test as circles so neighbouring sticks cannot steal
+    /// each other's corners; the portrait row's rectangular keys do not.
+    var circular = false
+    /// How far a finger may slide past the edge before a button releases.
+    var slideOff: CGFloat = 20
+    /// The window-level pad face this region drives, if any (portrait sticks).
+    /// Landscape sticks draw themselves and leave this nil.
+    weak var pad: JoystickPadState?
+
+    func hit(_ p: CGPoint, slack: CGFloat = 0) -> Bool {
+        if circular {
+            let c = CGPoint(x: frame.midX, y: frame.midY)
+            return hypot(p.x - c.x, p.y - c.y) <= max(frame.width, frame.height) / 2 + slack
+        }
+        return frame.insetBy(dx: -slack, dy: -slack).contains(p)
+    }
+}
+
+/// Per-control visual state, published by the UIKit layer and observed by the
+/// SwiftUI view that draws that control.
+///
+/// One object PER REGION, not one dictionary for all of them: the aim stick
+/// republishes its deflection every display frame, and a single shared
+/// `ObservableObject` would redraw every other button on screen 120 times a
+/// second for it.
+final class ControlFaceState: ObservableObject {
+    @Published var down = false
+    @Published var dir: Int = -1
+    @Published var vec: CGSize?
+}
+
+enum ControlFaces {
+    private static var map: [String: ControlFaceState] = [:]
+    /// Main-thread only (touch handling and SwiftUI body evaluation both are).
+    ///
+    /// Entries are deliberately NEVER removed. A control that is hidden and
+    /// shown again — the pointer panel, a rotation, toggling the overlay off —
+    /// must come back to the SAME object the touch layer publishes into, or the
+    /// view would observe one instance while the layer wrote to another and the
+    /// button would never light up again. There are a handful of these, each a
+    /// few bytes.
+    static func state(_ id: String) -> ControlFaceState {
+        if let s = map[id] { return s }
+        let s = ControlFaceState()
+        map[id] = s
+        return s
+    }
+}
+
+/// The single multi-touch layer. Transparent, sits above everything, and
+/// hit-tests to nothing except a registered region.
+final class ControlOverlayView: UIView {
+    static let shared = ControlOverlayView(frame: .zero)
+
+    private var order: [String] = []
+    private var regions: [String: ControlRegion] = [:]
+
+    /// What one finger is doing. Keyed by `ObjectIdentifier(UITouch)` — the
+    /// identity UIKit guarantees stable from began to ended/cancelled, and the
+    /// thing rule 1 above is actually about.
+    private struct Track {
+        let region: String
+        let owner: Int
+        let start: CGPoint
+        let seq: Int
+        let began: CFTimeInterval
+        /// Button whose finger has slid off the edge: released, but still ours.
+        var lapsed = false
+    }
+    private var tracked: [ObjectIdentifier: Track] = [:]
+
+    private var touchSeq = 0
+    private var nBegan = 0, nEnded = 0, nCancelled = 0, nMissed = 0
+    private var reportTimer: Timer?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        // The two lines this whole class exists for.
+        isMultipleTouchEnabled = true
+        isExclusiveTouch = false
+        isUserInteractionEnabled = true
+        backgroundColor = .clear
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    // MARK: registration
+
+    func register(_ r: ControlRegion) {
+        if regions[r.id] == nil { order.append(r.id) }
+        regions[r.id] = r
+        r.pad?.center = CGPoint(x: r.frame.midX, y: r.frame.midY)
+        // A region with no window behind it is a control that silently does
+        // nothing, which is the exact failure this revision exists to end. Any
+        // registration therefore guarantees the host window. Async because we
+        // are inside a SwiftUI update; attach() is idempotent, so a burst of
+        // registrations in one turn still creates exactly one window.
+        if window == nil {
+            DispatchQueue.main.async { TouchControlsHost.attach() }
+        }
+    }
+
+    func reframe(_ id: String, _ f: CGRect) {
+        guard var r = regions[id], r.frame != f else { return }
+        r.frame = f
+        regions[id] = r
+        r.pad?.center = CGPoint(x: f.midX, y: f.midY)
+    }
+
+    /// The view drawing this control went away (controls hidden, edit mode,
+    /// rotation, the pointer panel replacing the key row). Anything its finger
+    /// was holding goes with it — that is ml661's rule, enforced here once
+    /// instead of at four call sites.
+    func unregister(_ id: String) {
+        guard regions[id] != nil else { return }
+        // Array(): finish() mutates `tracked`, and a dictionary's key view is a
+        // live projection of it.
+        for k in Array(tracked.keys) where tracked[k]?.region == id {
+            finish(key: k, why: "unregistered")
+        }
+        regions[id] = nil
+        order.removeAll { $0 == id }
+    }
+
+    /// Topmost-last: a region registered later wins an overlap.
+    func region(at p: CGPoint) -> ControlRegion? {
+        // Edit mode belongs to SwiftUI — dragging and pinching controls into
+        // place is layout, not input, and must not press anything.
+        guard !TouchControlsModel.shared.editing else { return nil }
+        for id in order.reversed() {
+            if let r = regions[id], r.hit(p) { return r }
+        }
+        return nil
+    }
+
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        return region(at: point) != nil ? self : nil
+    }
+
+    // MARK: touch tracking
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        for t in touches { begin(t) }
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        for t in touches { move(t) }
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        for t in touches { finish(key: ObjectIdentifier(t), why: "ended") }
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        // A touch that began on a button and is still down when the app
+        // resigns active arrives here, not in touchesEnded. Same release path.
+        for t in touches { finish(key: ObjectIdentifier(t), why: "cancelled") }
+    }
+
+    /// The app went away, or the reconciler decided nothing can still be held.
+    func dropAllTouches(_ why: String) {
+        for k in Array(tracked.keys) { finish(key: k, why: why) }
+    }
+
+    private func begin(_ t: UITouch) {
+        let p = t.location(in: self)
+        guard let r = region(at: p) else {
+            // hitTest said yes and the region list changed before the touch was
+            // delivered. Should be impossible in one runloop turn — which is
+            // exactly why it gets a line of its own rather than a silent return.
+            nMissed += 1
+            fputs("[input] touch began on NO region at \(Int(p.x)),\(Int(p.y)) "
+                  + "regions=\(order.count) (total missed=\(nMissed))\n", stderr)
+            return
+        }
+        touchSeq += 1
+        let tk = Track(region: r.id, owner: InputGuard.newOwner(), start: p,
+                       seq: touchSeq, began: CACurrentMediaTime())
+        tracked[ObjectIdentifier(t)] = tk
+        nBegan += 1
+        let face = ControlFaces.state(r.id)
+        face.down = true
+
+        switch r.kind {
+        case .keys, .buttons:
+            applyHold(r, owner: tk.owner)
+            haptic()
+        case .tapKey(let vk):
+            winios_post_key(vk, 1)
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.06) { winios_post_key(vk, 0) }
+            haptic()
+        case .dirStick(let quad, _):
+            openPad(r)
+            steerDir(r, owner: tk.owner, dir: -1, quad: quad)
+        case .aimStick:
+            openPad(r)
+            AimStickDriver.shared.begin(tk.owner)
+            face.vec = .zero
+            r.pad?.vec = .zero
+            haptic()
+        case .keyboardToggle:
+            MetalBackedView.toggleKeyboard()
+            haptic()
+        case .inert:
+            break
+        }
+
+        if logs(tk.seq) {
+            fputs("[input] touch id=\(tk.seq) began on \(r.id) (\(r.label)) "
+                  + "kind=\(r.kind.name) active=\(tracked.count)\n", stderr)
+        }
+        startReporting()
+    }
+
+    private func move(_ t: UITouch) {
+        let key = ObjectIdentifier(t)
+        guard var tk = tracked[key], let r = regions[tk.region] else { return }
+        let p = t.location(in: self)
+        let d = CGSize(width: p.x - tk.start.x, height: p.y - tk.start.y)
+
+        switch r.kind {
+        case .dirStick(let quad, let dz):
+            // A stick follows its OWN touch wherever it goes — leaving the
+            // frame mid-drag is normal thumb travel, not a release.
+            steerDir(r, owner: tk.owner, dir: snap(d, deadzone: dz), quad: quad)
+        case .aimStick(let dz, let travel):
+            let v = deflect(d, deadzone: dz, travel: travel)
+            ControlFaces.state(r.id).vec = v
+            r.pad?.vec = v
+            AimStickDriver.shared.steer(tk.owner, v)
+        case .keys, .buttons:
+            let inside = r.hit(p, slack: r.slideOff)
+            if !inside && !tk.lapsed {
+                tk.lapsed = true
+                tracked[key] = tk
+                InputGuard.shared.release(tk.owner)
+                ControlFaces.state(r.id).down = false
+            } else if inside && tk.lapsed {
+                tk.lapsed = false
+                tracked[key] = tk
+                applyHold(r, owner: tk.owner)
+                ControlFaces.state(r.id).down = true
+            }
+        case .tapKey, .keyboardToggle, .inert:
+            break
+        }
+    }
+
+    private func finish(key: ObjectIdentifier, why: String) {
+        guard let tk = tracked.removeValue(forKey: key) else { return }
+        if why == "ended" { nEnded += 1 } else { nCancelled += 1 }
+
+        // Release unconditionally and in both systems. Both calls are no-ops
+        // for an owner that held nothing, so there is no case to get right.
+        InputGuard.shared.release(tk.owner)
+        AimStickDriver.shared.steer(tk.owner, .zero)
+        AimStickDriver.shared.end(tk.owner)
+
+        let face = ControlFaces.state(tk.region)
+        face.down = false
+        face.dir = -1
+        face.vec = nil
+        if let r = regions[tk.region] { closePad(r) }
+
+        if logs(tk.seq) {
+            let ms = Int((CACurrentMediaTime() - tk.began) * 1000)
+            fputs("[input] touch id=\(tk.seq) \(why) on \(tk.region) "
+                  + "(\(regions[tk.region]?.label ?? "gone")) held=\(ms)ms "
+                  + "active=\(tracked.count)\n", stderr)
+        }
+        if tracked.isEmpty { report(idle: true) }
+    }
+
+    // MARK: posting
+
+    private func applyHold(_ r: ControlRegion, owner: Int) {
+        switch r.kind {
+        case .keys(let k):    InputGuard.shared.hold(owner, keys: k)
+        case .buttons(let b): InputGuard.shared.hold(owner, buttons: b)
+        default: break
+        }
+    }
+
+    private func steerDir(_ r: ControlRegion, owner: Int, dir: Int, quad: [Int32]) {
+        let face = ControlFaces.state(r.id)
+        guard face.dir != dir else { return }
+        // ml661's rule survives intact: state the SET, never the edges.
+        InputGuard.shared.hold(owner, keys: Set(Self.stickKeys(dir, quad)))
+        if face.dir == -1 && dir != -1 { haptic() }
+        face.dir = dir
+        r.pad?.dir = dir
+    }
+
+    private func openPad(_ r: ControlRegion) {
+        guard let pad = r.pad else { return }
+        pad.center = CGPoint(x: r.frame.midX, y: r.frame.midY)
+        withAnimation(.spring(response: 0.32, dampingFraction: 0.62)) { pad.held = true }
+    }
+
+    private func closePad(_ r: ControlRegion) {
+        guard let pad = r.pad else { return }
+        pad.dir = -1
+        withAnimation(.spring(response: 0.32, dampingFraction: 0.62)) {
+            pad.held = false
+            pad.vec = nil
+        }
+    }
+
+    private static func stickKeys(_ d: Int, _ q: [Int32]) -> [Int32] {
+        switch d {
+        case 0: return [q[0]]
+        case 1: return [q[0], q[1]]
+        case 2: return [q[1]]
+        case 3: return [q[2], q[1]]
+        case 4: return [q[2]]
+        case 5: return [q[2], q[3]]
+        case 6: return [q[3]]
+        case 7: return [q[0], q[3]]
+        default: return []
+        }
+    }
+
+    /// 8-way snap. Screen y grows downward, so measure clockwise from "up".
+    private func snap(_ t: CGSize, deadzone: CGFloat) -> Int {
+        let d = (t.width * t.width + t.height * t.height).squareRoot()
+        if d < deadzone { return -1 }
+        var a = atan2(t.width, -t.height) * 180 / .pi
+        if a < 0 { a += 360 }
+        return Int((a + 22.5) / 45.0) % 8
+    }
+
+    /// Analogue deflection, −1…1 per axis, re-scaled from the deadzone edge so
+    /// the first countable movement is a crawl rather than a jump.
+    private func deflect(_ t: CGSize, deadzone: CGFloat, travel: CGFloat) -> CGSize {
+        let d = (t.width * t.width + t.height * t.height).squareRoot()
+        guard d > deadzone, travel > deadzone else { return .zero }
+        let m = min((d - deadzone) / (travel - deadzone), 1.0)
+        return CGSize(width: t.width / d * m, height: t.height / d * m)
+    }
+
+    private func haptic() { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
+
+    // MARK: diagnostics
+
+    /// Every one of the first 50 touches, then one in a hundred. Gated on the
+    /// touch's own sequence number so a began and its ended are always a pair —
+    /// a lone "began" in the log then means exactly what it looks like.
+    private func logs(_ seq: Int) -> Bool { seq <= 50 || seq % 100 == 0 }
+
+    private func startReporting() {
+        guard reportTimer == nil else { return }
+        let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.report(idle: false) }
+        RunLoop.main.add(t, forMode: .common)
+        reportTimer = t
+    }
+
+    /// One line a second while anything is held, plus one when the last finger
+    /// lifts. Silent when nothing is being touched, so it cannot bury the rest
+    /// of the log the way a free-running heartbeat would.
+    private func report(idle: Bool) {
+        var sticks: [String] = [], buttons: [String] = []
+        for tk in tracked.values {
+            guard let r = regions[tk.region] else { continue }
+            let f = ControlFaces.state(r.id)
+            switch r.kind {
+            case .dirStick: sticks.append("\(r.id)=dir\(f.dir)")
+            case .aimStick:
+                let v = f.vec ?? .zero
+                sticks.append(String(format: "%@=(%.2f,%.2f)", r.id, v.width, v.height))
+            default: buttons.append(r.id + (tk.lapsed ? "(off)" : ""))
+            }
+        }
+        fputs("[input] controls: active_touches=\(tracked.count) "
+              + "sticks=[\(sticks.sorted().joined(separator: " "))] "
+              + "buttons=[\(buttons.sorted().joined(separator: " "))] "
+              + "regions=\(order.count) began=\(nBegan) ended=\(nEnded) "
+              + "cancelled=\(nCancelled) missed=\(nMissed)\(idle ? " idle" : "")\n", stderr)
+        if idle { reportTimer?.invalidate(); reportTimer = nil }
+    }
+}
+
+/// Register the frame this view occupies as a control region, and take the
+/// view out of the input business entirely.
+///
+/// The SwiftUI side keeps what it is good at — layout, appearance, animation —
+/// and publishes its `.global` frame, which for a UIHostingController's tree is
+/// window coordinates, the space `ControlOverlayView` hit-tests in. Nothing
+/// here attaches a gesture, so nothing here can be arbitrated, delayed or
+/// cancelled.
+extension View {
+    func controlRegion(_ id: String, _ label: String, _ kind: ControlRegionKind,
+                       circular: Bool = false,
+                       pad: JoystickPadState? = nil) -> some View {
+        background(
+            GeometryReader { geo in
+                Color.clear
+                    .onAppear {
+                        ControlOverlayView.shared.register(
+                            ControlRegion(id: id, label: label, frame: geo.frame(in: .global),
+                                          kind: kind, circular: circular, pad: pad))
+                    }
+                    .onChange(of: geo.frame(in: .global)) { _, f in
+                        ControlOverlayView.shared.reframe(id, f)
+                    }
+                    .onChange(of: kind) { _, k in
+                        ControlOverlayView.shared.register(
+                            ControlRegion(id: id, label: label, frame: geo.frame(in: .global),
+                                          kind: k, circular: circular, pad: pad))
+                    }
+                    .onDisappear { ControlOverlayView.shared.unregister(id) }
+            }
+        )
+    }
+}
+
+/// Visual-only key for the portrait row. Draws, publishes its frame, and
+/// nothing else — ControlOverlayView presses it.
+struct ControlKeyView: View {
+    let id: String
+    let label: String
+    let kind: ControlRegionKind
+    var fontSize: CGFloat = 14
+    var width: CGFloat = 34
+    var height: CGFloat = 30
+    /// The ⌨ button was styled off `Color.secondary`; the key caps off white.
+    var secondaryTint = false
+    @ObservedObject private var face: ControlFaceState
+
+    init(id: String, label: String, kind: ControlRegionKind, fontSize: CGFloat = 14,
+         width: CGFloat = 34, height: CGFloat = 30, secondaryTint: Bool = false) {
+        self.id = id; self.label = label; self.kind = kind
+        self.fontSize = fontSize; self.width = width; self.height = height
+        self.secondaryTint = secondaryTint
+        _face = ObservedObject(wrappedValue: ControlFaces.state(id))
+    }
+
+    var body: some View {
+        Text(label)
+            .font(.system(size: fontSize, weight: .semibold, design: .monospaced))
+            .foregroundColor(.white)
+            .frame(minWidth: width, minHeight: height)
+            .background(secondaryTint
+                        ? Color.secondary.opacity(face.down ? 0.45 : 0.25)
+                        : Color.white.opacity(face.down ? 0.35 : 0.15))
+            .cornerRadius(6)
+            .controlRegion(id, label, kind)
+    }
+}
+
 /// On-screen thumbstick. Idle it is a key-sized ring with a white knob;
 /// press and hold and it expands into a pad you can steer. Travel snaps to
 /// eight d-pad directions, each mapped to the arrow keys Windows games
@@ -1042,65 +1597,20 @@ final class AimStickDriver {
 /// The pad expands DOWNWARD. It must never grow up into the game strip:
 /// that surface is a raw window-level UIView (MetalHostView.shared) drawn
 /// over SwiftUI, so anything overlapping it is simply covered.
+///
+/// ml662: input lives in ControlOverlayView now. This view lays the stick out,
+/// draws its idle ring, and publishes its frame — the expanded pad's held/dir
+/// state comes straight from the touch layer via JoystickPadState.
 struct JoystickKeyView: View {
-    @State private var held = false
-    @State private var dir: Int = -1        // -1 = centred, else 0=up then clockwise
-    @State private var center: CGPoint = .zero
+    static let rid = "portrait.dpad"
+
     @State private var hosted = false       // overlay window up: it draws the face
-    @State private var owner = InputGuard.newOwner()
-    @GestureState private var active = false
+    @ObservedObject private var face = ControlFaces.state(JoystickKeyView.rid)
 
     private let deadzone: CGFloat = 14      // pt of travel before a direction registers
 
     private let vkUp: Int32 = 0x26, vkRight: Int32 = 0x27
     private let vkDown: Int32 = 0x28, vkLeft: Int32 = 0x25
-
-    private func keys(for d: Int) -> [Int32] {
-        switch d {
-        case 0: return [vkUp]
-        case 1: return [vkUp, vkRight]
-        case 2: return [vkRight]
-        case 3: return [vkDown, vkRight]
-        case 4: return [vkDown]
-        case 5: return [vkDown, vkLeft]
-        case 6: return [vkLeft]
-        case 7: return [vkUp, vkLeft]
-        default: return []
-        }
-    }
-
-    /// ml661: declare the set this stick wants held and let InputGuard work out
-    /// the edges. Identical behaviour while the thumb wanders inside one sector
-    /// (the set is unchanged, so nothing is posted and a held direction does
-    /// not stutter) — but now the set is also released for us if this view is
-    /// torn down or its gesture is cancelled, which no edge-posting version
-    /// could manage.
-    private func apply(_ next: Int) {
-        guard next != dir else { return }
-        InputGuard.shared.hold(owner, keys: Set(keys(for: next)))
-        dir = next
-        JoystickPadState.shared.dir = next
-    }
-
-    /// Every path out of "held", including the ones SwiftUI never tells us
-    /// about directly.
-    private func releaseStick() {
-        guard held || dir != -1 else { return }
-        InputGuard.shared.release(owner)
-        dir = -1
-        held = false
-        JoystickPadState.shared.dir = -1
-        JoystickPadState.shared.held = false
-    }
-
-    private func snap(_ t: CGSize) -> Int {
-        let d = (t.width * t.width + t.height * t.height).squareRoot()
-        if d < deadzone { return -1 }
-        // Screen y grows downward; measure clockwise from "up".
-        var a = atan2(t.width, -t.height) * 180 / .pi
-        if a < 0 { a += 360 }
-        return Int((a + 22.5) / 45.0) % 8
-    }
 
     var body: some View {
         // The idle ring lives in the row (inset inside the 34x30 button so it
@@ -1109,60 +1619,30 @@ struct JoystickKeyView: View {
         // of the button in place and is never clipped by the game surface.
         Color.clear
             .frame(width: 34, height: 30)
-            .background(Color.white.opacity(held ? 0.30 : 0.15))
+            .background(Color.white.opacity(face.down ? 0.30 : 0.15))
             .cornerRadius(6)
             .overlay { if !hosted { JoystickFace(held: false, dir: -1) } }
             .background(
-                GeometryReader { geo in
+                GeometryReader { _ in
                     Color.clear.onAppear {
-                        center = CGPoint(x: geo.frame(in: .global).midX,
-                                         y: geo.frame(in: .global).midY)
-                        JoystickPadState.shared.center = center
                         if let scene = UIApplication.shared.connectedScenes
                             .compactMap({ $0 as? UIWindowScene }).first {
                             JoystickPadHost.attach(to: scene)
+                            TouchControlsHost.attach()   // ml662: the touch layer
                             hosted = true
                         }
                     }
-                    .onChange(of: geo.frame(in: .global)) { _, f in
-                        center = CGPoint(x: f.midX, y: f.midY)
-                        JoystickPadState.shared.center = center
-                    }
                 }
             )
-            .animation(.spring(response: 0.32, dampingFraction: 0.62), value: held)
-            // ml661: the row this lives in is removed wholesale when the pointer
-            // panel opens, and the whole hierarchy is rebuilt on rotation.
-            // Either would otherwise strand whatever arrow was down.
-            .onDisappear { releaseStick() }
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .updating($active) { _, s, _ in s = true }
-                    .onChanged { g in
-                        if !held {
-                            held = true
-                            if let scene = UIApplication.shared.connectedScenes
-                                .compactMap({ $0 as? UIWindowScene }).first {
-                                JoystickPadHost.attach(to: scene)
-                            }
-                            JoystickPadState.shared.center = center
-                            withAnimation(.spring(response: 0.32, dampingFraction: 0.62)) {
-                                JoystickPadState.shared.held = true
-                            }
-                        }
-                        apply(snap(g.translation))
-                    }
-                    .onEnded { _ in
-                        apply(-1)                        // releases every held arrow
-                        held = false
-                        withAnimation(.spring(response: 0.32, dampingFraction: 0.62)) {
-                            JoystickPadState.shared.held = false
-                        }
-                    }
-            )
-            // ml661: a cancelled DragGesture never calls onEnded. GestureState
-            // going false is the only notice we get.
-            .onChange(of: active) { _, a in if !a { releaseStick() } }
+            .animation(.spring(response: 0.32, dampingFraction: 0.62), value: face.down)
+            // ml662: the pad's centre is set from the registered frame, and the
+            // region is torn down with the view — which covers the pointer panel
+            // replacing this row and a rotation rebuilding the hierarchy, the two
+            // cases that used to strand a held arrow.
+            .controlRegion(Self.rid, "dpad",
+                           .dirStick(quad: [vkUp, vkRight, vkDown, vkLeft],
+                                     deadzone: deadzone),
+                           pad: JoystickPadState.shared)
     }
 }
 
@@ -1182,12 +1662,16 @@ struct JoystickKeyView: View {
 /// It does NOT touch InputSettings.relative: that toggle governs what a finger
 /// on the live view does, and the whole point of the stick is to aim with the
 /// thumb while taps on the view keep clicking.
+///
+/// ml662: this is the control the "a stray tap killed my aim" report was about.
+/// It no longer owns a gesture, so nothing arbitrates it: its finger is its own
+/// from began to ended, and a touch on the live view is delivered to a
+/// different view in a different window where it cannot reach this one.
 struct AimStickKeyView: View {
-    @State private var held = false
+    static let rid = "portrait.aim"
+
     @State private var hosted = false
-    @State private var center: CGPoint = .zero
-    @State private var owner = InputGuard.newOwner()
-    @GestureState private var active = false
+    @ObservedObject private var face = ControlFaces.state(AimStickKeyView.rid)
 
     /// Travel, in points of thumb movement, that means full deflection. Smaller
     /// than the pad radius (58) so the stick reaches its limit well inside the
@@ -1195,95 +1679,32 @@ struct AimStickKeyView: View {
     private let travel: CGFloat = 34
     private let deadzone: CGFloat = 6
 
-    private func deflect(_ t: CGSize) -> CGSize {
-        let d = (t.width * t.width + t.height * t.height).squareRoot()
-        guard d > deadzone else { return .zero }
-        // Re-scale from the deadzone edge, so the first countable movement is
-        // a crawl rather than a jump to (deadzone/travel) of full speed.
-        let m = min((d - deadzone) / (travel - deadzone), 1.0)
-        return CGSize(width: t.width / d * m, height: t.height / d * m)
-    }
-
-    private func publish(_ v: CGSize) {
-        JoystickPadState.aim.vec = v
-        AimStickDriver.shared.steer(owner, v)
-    }
-
-    /// ml661: one exit for every way this stick can stop being held. Stopping
-    /// the driver matters more here than releasing a key does: a stick left
-    /// "held" keeps a display link posting a relative move every frame, and
-    /// that flood is what used to starve every other control.
-    private func releaseStick() {
-        guard held else { return }
-        held = false
-        JoystickPadState.aim.vec = nil
-        JoystickPadState.aim.held = false
-        AimStickDriver.shared.steer(owner, .zero)
-        AimStickDriver.shared.end(owner)
-    }
-
     var body: some View {
         Color.clear
             .frame(width: 34, height: 30)
-            .background(Color.white.opacity(held ? 0.30 : 0.15))
+            .background(Color.white.opacity(face.down ? 0.30 : 0.15))
             .cornerRadius(6)
             .overlay { if !hosted { JoystickFace(held: false, dir: -1,
                                                  glyph: JoystickPadState.aim.glyph) } }
             .background(
-                GeometryReader { geo in
+                GeometryReader { _ in
                     Color.clear.onAppear {
-                        center = CGPoint(x: geo.frame(in: .global).midX,
-                                         y: geo.frame(in: .global).midY)
-                        JoystickPadState.aim.center = center
                         if let scene = UIApplication.shared.connectedScenes
                             .compactMap({ $0 as? UIWindowScene }).first {
                             JoystickPadHost.attach(to: scene)
+                            TouchControlsHost.attach()   // ml662: the touch layer
                             hosted = true
                         }
                     }
-                    .onChange(of: geo.frame(in: .global)) { _, f in
-                        center = CGPoint(x: f.midX, y: f.midY)
-                        JoystickPadState.aim.center = center
-                    }
                 }
             )
-            .animation(.spring(response: 0.32, dampingFraction: 0.62), value: held)
-            // The row this lives in is removed wholesale when the pointer panel
-            // opens. Without this the driver would keep firing at whatever
-            // deflection the thumb happened to be at when the view vanished.
-            .onDisappear { releaseStick() }
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .updating($active) { _, s, _ in s = true }
-                    .onChanged { g in
-                        if !held {
-                            held = true
-                            if let scene = UIApplication.shared.connectedScenes
-                                .compactMap({ $0 as? UIWindowScene }).first {
-                                JoystickPadHost.attach(to: scene)
-                            }
-                            JoystickPadState.aim.center = center
-                            AimStickDriver.shared.begin(owner)
-                            withAnimation(.spring(response: 0.32, dampingFraction: 0.62)) {
-                                JoystickPadState.aim.held = true
-                            }
-                        }
-                        publish(deflect(g.translation))
-                    }
-                    .onEnded { _ in
-                        publish(.zero)
-                        AimStickDriver.shared.end(owner)
-                        held = false
-                        withAnimation(.spring(response: 0.32, dampingFraction: 0.62)) {
-                            JoystickPadState.aim.held = false
-                            JoystickPadState.aim.vec = nil
-                        }
-                    }
-            )
-            // ml661: cancellation (system edge swipe, another recogniser winning)
-            // never calls onEnded — and here that would mean a camera spinning
-            // by itself and a ring full of moves.
-            .onChange(of: active) { _, a in if !a { releaseStick() } }
+            .animation(.spring(response: 0.32, dampingFraction: 0.62), value: face.down)
+            // Unregistering with the view is what stops the display link when
+            // the pointer panel replaces this row — otherwise the driver would
+            // keep firing at whatever deflection the thumb was at.
+            .controlRegion(Self.rid, "aim",
+                           .aimStick(deadzone: deadzone, travel: travel),
+                           pad: JoystickPadState.aim)
     }
 }
 
@@ -1433,6 +1854,9 @@ struct ContentView: View {
     /// keyed by `exe` in the ForEach, so each path must be unique.
     private let launchTargets: [(label: String, exe: String)] = [
         ("D3D9 cube", "d3d9-cube-x86.exe"),
+        // WOW64_DESIGN.md section 8.4, measurement 2: prints
+        // "MADEIRA-BENCH: unix-call ns/call = N" and exits 44.
+        ("Unix-call bench", "unixcall-bench-x86.exe"),
         // Full Win32 path passed verbatim to MADEIRA_EXE — WineProcessBridge
         // detects the backslash and launches it as-is (no syswow64 prefix).
         (#"Mirror's Edge"#, #"C:\Mirrors-Edge\Mirror's Edge\Binaries\MirrorsEdge.exe"#),
@@ -1516,16 +1940,17 @@ struct ContentView: View {
                     pointerModeToggle
                     pointerSensSlider
                 } else {
+                    // ml662: every one of these is now a REGION owned by
+                    // ControlOverlayView, not a SwiftUI gesture. A Button (which
+                    // ⏎/␣/Esc/⌨ used to be) needs its tap recogniser to win
+                    // arbitration against everything else on screen, and that is
+                    // precisely the fight a second finger made it lose.
                     Group {
-                        keyButton("⏎", vk: 0x0D)   // VK_RETURN
-                        keyButton("␣", vk: 0x20)   // VK_SPACE
-                        keyButton("Esc", vk: 0x1B) // VK_ESCAPE
-                        Button { MetalBackedView.toggleKeyboard() } label: {
-                            Text("⌨").font(.system(size: 20))
-                                .frame(minWidth: 40, minHeight: 32)
-                                .background(Color.secondary.opacity(0.25))
-                                .cornerRadius(6)
-                        }
+                        ControlKeyView(id: "portrait.enter", label: "⏎", kind: .tapKey(0x0D))
+                        ControlKeyView(id: "portrait.space", label: "␣", kind: .tapKey(0x20))
+                        ControlKeyView(id: "portrait.esc",   label: "Esc", kind: .tapKey(0x1B))
+                        ControlKeyView(id: "portrait.kbd",   label: "⌨", kind: .keyboardToggle,
+                                       fontSize: 20, width: 40, height: 32, secondaryTint: true)
                         JoystickKeyView()
                         AimStickKeyView()   // ml660: mouse-look twin
                     }
@@ -1558,6 +1983,14 @@ struct ContentView: View {
             ZStack {
                 Color.black
                 MadeiraMetalView()
+                    // ml662: the controls window hosts the UIKit touch layer, so
+                    // it has to exist in landscape whether or not the app was
+                    // ever in portrait this session.
+                    .onAppear { TouchControlsHost.attach() }
+                    .onReceive(NotificationCenter.default.publisher(
+                        for: UIDevice.orientationDidChangeNotification)) { _ in
+                        TouchControlsHost.attach()
+                    }
                 // Controls removed for now (ml586): game-only landscape.
                 // The FPS readout stays, pinned in the right pillarbox bar —
                 // the window-level surface covers anything drawn over the
@@ -1646,21 +2079,8 @@ struct ContentView: View {
         .transition(.opacity)
     }
 
-    private func keyButton(_ label: String, vk: Int32) -> some View {
-        Button(action: {
-            winios_post_key(vk, 1)
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.06) {
-                winios_post_key(vk, 0)
-            }
-        }) {
-            Text(label)
-                .font(.system(size: 14, weight: .semibold, design: .monospaced))
-                .foregroundColor(.white)
-                .frame(minWidth: 34, minHeight: 30)
-                .background(Color.white.opacity(0.15))
-                .cornerRadius(6)
-        }
-    }
+    // ml662: keyButton() is gone — a momentary key is `.tapKey` in the touch
+    // layer now (ControlKeyView), so it cannot be lost to gesture arbitration.
 
     private func entitlementBadges(_ ents: EntitlementStatus) -> some View {
         HStack(spacing: 8) {
@@ -3297,7 +3717,7 @@ final class TouchControlsModel: ObservableObject {
         return controls.firstIndex { $0.id == id }
     }
 
-    /// ml644: does this WINDOW point land on something interactive?
+    /// ml644: does this WINDOW point land on SwiftUI chrome?
     ///
     /// Hit-test geometrically, never by walking the UIView hierarchy. SwiftUI
     /// does not back each Button with its own UIView — the entire overlay is one
@@ -3306,21 +3726,19 @@ final class TouchControlsModel: ObservableObject {
     /// included, and ml643's "is it the root view?" test therefore rejected every
     /// touch in the window. Nothing responded, and edit mode — whose branch
     /// captured everything — could never be entered to mask it.
+    ///
+    /// ml662: this used to include the controls themselves. It must not any
+    /// more — the controls are regions in ControlOverlayView, which gets first
+    /// refusal on every point, and letting a control's circle also route to
+    /// SwiftUI would put a gesture recogniser back under the thumb. What is
+    /// left is the chrome that is genuinely a tap on a button: the top bar.
     func hitsInteractive(_ p: CGPoint, in bounds: CGRect) -> Bool {
         // Top bar: two 44pt buttons 10pt apart in play mode, centred, 10pt down.
         // Padded generously; a few points of slop costs nothing and a missed tap
         // costs a build.
         let barW: CGFloat = 2 * 44 + 10
-        if CGRect(x: bounds.midX - barW / 2 - 10, y: 0,
-                  width: barW + 20, height: 68).contains(p) { return true }
-        guard visible else { return false }
-        for c in controls {
-            let r = Self.baseDiameter * CGFloat(c.scale) / 2
-            let cx = CGFloat(c.nx) * bounds.width
-            let cy = CGFloat(c.ny) * bounds.height
-            if hypot(p.x - cx, p.y - cy) <= r { return true }
-        }
-        return false
+        return CGRect(x: bounds.midX - barW / 2 - 10, y: 0,
+                      width: barW + 20, height: 68).contains(p)
     }
 }
 
@@ -3333,10 +3751,17 @@ final class TouchControlsModel: ObservableObject {
 final class ControlsWindow: UIWindow {
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         let m = TouchControlsModel.shared
+        // ml662: the UIKit touch layer gets first refusal, in BOTH orientations
+        // — the portrait key row registers its frames here too, so this window
+        // is no longer landscape-only. `region(at:)` already returns nil in edit
+        // mode, so the edit-mode branch below still wins there.
+        let ov = ControlOverlayView.shared
+        if ov.window === self, ov.region(at: convert(point, to: ov)) != nil { return ov }
         // Edit mode owns the whole screen: drags and the scale pinch must not
         // leak through and swing the camera while you are arranging buttons.
         if m.editing { return super.hitTest(point, with: event) }
-        // Portrait draws nothing here, so it must consume nothing.
+        // Portrait draws no chrome here, so it must consume nothing beyond its
+        // regions.
         guard bounds.width > bounds.height else { return nil }
         guard m.hitsInteractive(point, in: bounds) else { return nil }
         return super.hitTest(point, with: event)
@@ -3366,9 +3791,38 @@ enum TouchControlsHost {
             w.rootViewController = host
             window = w
         }
-        window?.frame = scene.coordinateSpace.bounds
-        fputs("[controls] ml644 overlay attached frame=\(window?.frame ?? .zero) " +
-              "controls=\(TouchControlsModel.shared.controls.count)\n", stderr)
+        guard let w = window else { return }
+        w.frame = scene.coordinateSpace.bounds
+
+        // ml662 — THE TOUCH LAYER, as a WINDOW subview rather than a subview of
+        // the hosting view.
+        //
+        // It has to be above the SwiftUI hosting view and it has to stay there.
+        // A hosting view rebuilds its own subtree whenever the SwiftUI body
+        // changes, so anything parented inside it can be reordered underneath;
+        // a UIWindow does not reorder the subviews you add to it. Same argument
+        // as the one that put the pad in its own window in the first place.
+        //
+        // This is also the ONLY window-level input surface in the app, which is
+        // what makes rule 3 hold: a touch that misses every region is hit-tested
+        // to nil here and again in the pad's PassthroughWindow, and lands on the
+        // live view in the app window — a different view, so UIKit delivers the
+        // two independently and neither can cancel the other.
+        let ov = ControlOverlayView.shared
+        if ov.superview !== w { ov.removeFromSuperview(); w.addSubview(ov) }
+        w.bringSubviewToFront(ov)
+        ov.frame = w.bounds
+        ov.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        // The overlay's own window must not hand a control's touch to the
+        // pinch-to-scale recogniser SwiftUI installed on the hosting view.
+        w.rootViewController?.view.gestureRecognizers?.forEach {
+            $0.cancelsTouchesInView = false
+            $0.delaysTouchesBegan = false
+            $0.delaysTouchesEnded = false
+        }
+        fputs("[controls] ml644 overlay attached frame=\(w.frame) " +
+              "controls=\(TouchControlsModel.shared.controls.count) " +
+              "touchlayer=\(ov.frame)\n", stderr)
     }
 }
 
@@ -3467,34 +3921,63 @@ struct GlassShape: View {
     }
 }
 
+/// ml662: what this control DOES while a finger is on it, as a touch-layer
+/// region. Deadzone and travel scale with the pinched diameter, exactly as the
+/// old in-view versions did, so a stick you made bigger still needs a
+/// proportionally bigger thumb throw.
+extension ControlAction {
+    func regionKind(diameter: CGFloat) -> ControlRegionKind {
+        switch self {
+        case .none, .pad:      return .inert
+        case .key(let vk):     return .keys([vk])
+        case .mouseLeft:       return .buttons([0])
+        case .mouseRight:      return .buttons([1])
+        case .keyboardToggle:  return .keyboardToggle
+        case .joystickWASD, .joystickArrows:
+            return .dirStick(quad: stickKeys ?? [], deadzone: diameter * 0.22)
+        case .joystickMouse:
+            return .aimStick(deadzone: diameter * 0.12, travel: diameter * 0.55)
+        }
+    }
+}
+
+/// ml662: drawing only. Every branch that used to press, hold, steer or
+/// release is gone — ControlOverlayView does all of it, keyed by the UITouch
+/// that landed here, and publishes the pressed/deflected state this view reads
+/// back out of `ControlFaces`.
+///
+/// The DragGesture that remains is EDIT MODE ONLY: repositioning a control is
+/// layout, it happens while the game is not being played, and the touch layer
+/// deliberately stands down (`region(at:)` returns nil while editing) so this
+/// gesture has the screen to itself.
 struct TouchControlButton: View {
     let control: TouchControl
     let screen: CGSize
     @ObservedObject private var m = TouchControlsModel.shared
-    @State private var isDown = false
+    @ObservedObject private var face: ControlFaceState
     @State private var dragBase: CGPoint?
-    @State private var stickDir: Int = -1
-    /// ml660: continuous deflection for the aim stick, −1…1 per axis.
-    @State private var stickVec: CGSize?
-    /// ml661: held state belongs to InputGuard / AimStickDriver, keyed by this.
-    @State private var owner = InputGuard.newOwner()
-    /// ml661: SwiftUI resets this when the drag ends OR is cancelled. Toggling
-    /// the controls off, entering edit mode and rotating all tear this view out
-    /// mid-hold, and a plain onEnded never arrives for any of them — which is
-    /// how a landscape button ended up holding its key down for good.
-    @GestureState private var active = false
+    private let rid: String
+
+    init(control: TouchControl, screen: CGSize) {
+        self.control = control
+        self.screen = screen
+        let id = "ctl." + control.id.uuidString.prefix(8)
+        self.rid = id
+        _face = ObservedObject(wrappedValue: ControlFaces.state(id))
+    }
 
     private var diameter: CGFloat { TouchControlsModel.baseDiameter * CGFloat(control.scale) }
     private var isStick: Bool { control.action.isStick }
     private var isSelected: Bool { m.editing && m.selected == control.id }
+    private var isDown: Bool { face.down }
 
     var body: some View {
         ZStack {
             if isStick {
                 // Reuse the portrait pad's face so both look and animate the
                 // same; scale it to whatever size this control was pinched to.
-                JoystickFace(held: isDown, dir: stickDir, alwaysExpanded: true,
-                             vec: stickVec, glyph: control.action.stickGlyph)
+                JoystickFace(held: isDown, dir: face.dir, alwaysExpanded: true,
+                             vec: face.vec, glyph: control.action.stickGlyph)
                     .frame(width: JoystickFace.padRadius * 2,
                            height: JoystickFace.padRadius * 2)
                     .scaleEffect(diameter / (JoystickFace.padRadius * 2))
@@ -3515,7 +3998,7 @@ struct TouchControlButton: View {
         .scaleEffect(!isStick && isDown ? 0.92 : 1.0)
         .animation(.easeOut(duration: 0.08), value: isDown)
         // ml646: the springy knob, same curve as the portrait pad overlay.
-        .animation(.spring(response: 0.22, dampingFraction: 0.58), value: stickDir)
+        .animation(.spring(response: 0.22, dampingFraction: 0.58), value: face.dir)
         .overlay(alignment: .topTrailing) {
             if isSelected {
                 Button {
@@ -3533,132 +4016,30 @@ struct TouchControlButton: View {
                 .offset(x: 8, y: -8)
             }
         }
+        // MUST come before .position: .position expands the modified view to
+        // fill its parent, so a frame probe attached after it would measure the
+        // whole screen instead of this control. Attached here it measures the
+        // control and still reports its FINAL placed rect in .global.
+        .controlRegion(rid, control.action.label,
+                       control.action.regionKind(diameter: diameter),
+                       circular: true)
         .position(x: CGFloat(control.nx) * screen.width,
                   y: CGFloat(control.ny) * screen.height)
+        // Edit mode only; see the type comment.
         .gesture(
             DragGesture(minimumDistance: 0)
-                .updating($active) { _, s, _ in s = true }
                 .onChanged { v in
-                    if m.editing {
-                        m.selected = control.id
-                        guard let i = m.index(of: control.id) else { return }
-                        if dragBase == nil { dragBase = CGPoint(x: control.nx, y: control.ny) }
-                        let b = dragBase ?? .zero
-                        m.controls[i].nx = min(max(b.x + Double(v.translation.width  / screen.width),  0.03), 0.97)
-                        m.controls[i].ny = min(max(b.y + Double(v.translation.height / screen.height), 0.03), 0.97)
-                    } else if let q = control.action.stickKeys {
-                        isDown = true
-                        applyStick(snap(v.translation), q)
-                    } else if control.action.isMouseStick {
-                        if !isDown {
-                            isDown = true
-                            AimStickDriver.shared.begin(owner)
-                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        }
-                        let d = deflect(v.translation)
-                        stickVec = d
-                        AimStickDriver.shared.steer(owner, d)
-                    } else if !isDown {
-                        isDown = true
-                        press(true)
-                    }
+                    guard m.editing else { return }
+                    m.selected = control.id
+                    guard let i = m.index(of: control.id) else { return }
+                    if dragBase == nil { dragBase = CGPoint(x: control.nx, y: control.ny) }
+                    let b = dragBase ?? .zero
+                    m.controls[i].nx = min(max(b.x + Double(v.translation.width  / screen.width),  0.03), 0.97)
+                    m.controls[i].ny = min(max(b.y + Double(v.translation.height / screen.height), 0.03), 0.97)
                 }
-                .onEnded { _ in
-                    dragBase = nil
-                    releaseControl()
-                }
+                .onEnded { _ in dragBase = nil }
         )
-        // ml661: the two paths onEnded cannot cover. `active` going false is
-        // cancellation; onDisappear is the controls being hidden, edit mode
-        // being entered, or a rotation rebuilding the overlay — each of which
-        // used to leave this control's key or stick held for the rest of the
-        // session.
-        .onChange(of: active) { _, a in if !a { dragBase = nil; releaseControl() } }
-        .onDisappear { dragBase = nil; releaseControl() }
-    }
-
-    /// ml661 — the single exit from "held", idempotent so every one of the four
-    /// callers above can fire without double-releasing.
-    private func releaseControl() {
-        guard isDown || stickDir != -1 else { return }
-        isDown = false
-        if let q = control.action.stickKeys {
-            applyStick(-1, q)                       // releases every held direction
-        } else if control.action.isMouseStick {
-            AimStickDriver.shared.steer(owner, .zero)
-            AimStickDriver.shared.end(owner)
-            stickVec = nil
-        } else {
-            press(false)
-            InputGuard.shared.release(owner)    // covers every action kind
-        }
-    }
-
-    /// ml660: ANALOGUE deflection for the aim stick, −1…1 per axis. Both the
-    /// deadzone and full travel scale with the control's pinched size, so a
-    /// stick you made bigger also needs a proportionally bigger thumb throw.
-    private func deflect(_ t: CGSize) -> CGSize {
-        let d = (t.width * t.width + t.height * t.height).squareRoot()
-        let dead = diameter * 0.12, travel = diameter * 0.55
-        guard d > dead else { return .zero }
-        let m = min((d - dead) / (travel - dead), 1.0)
-        return CGSize(width: t.width / d * m, height: t.height / d * m)
-    }
-
-    /// 8-way snap. Screen y grows downward, so measure clockwise from "up".
-    private func snap(_ t: CGSize) -> Int {
-        let d = (t.width * t.width + t.height * t.height).squareRoot()
-        if d < diameter * 0.22 { return -1 }        // deadzone scales with the control
-        var a = atan2(t.width, -t.height) * 180 / .pi
-        if a < 0 { a += 360 }
-        return Int((a + 22.5) / 45.0) % 8
-    }
-
-    private func stickKeys(_ d: Int, _ q: [Int32]) -> [Int32] {
-        switch d {
-        case 0: return [q[0]]
-        case 1: return [q[0], q[1]]
-        case 2: return [q[1]]
-        case 3: return [q[2], q[1]]
-        case 4: return [q[2]]
-        case 5: return [q[2], q[3]]
-        case 6: return [q[3]]
-        case 7: return [q[0], q[3]]
-        default: return []
-        }
-    }
-
-    /// Release what is no longer held, press what newly is. A blanket
-    /// release/re-press would make a held direction stutter as the thumb
-    /// wanders inside one sector.
-    private func applyStick(_ next: Int, _ q: [Int32]) {
-        guard next != stickDir else { return }
-        // ml661: state the set, don't post the edges — see InputGuard.
-        InputGuard.shared.hold(owner, keys: Set(stickKeys(next, q)))
-        if stickDir == -1, next != -1 { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
-        stickDir = next
-    }
-
-    /// Haptic on the DOWN edge only — a held movement key would otherwise buzz
-    /// continuously for as long as you walk.
-    private func press(_ down: Bool) {
-        if down { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
-        // ml661: keys and mouse buttons both go through InputGuard, so a button
-        // this view was holding when it vanished is released with it.
-        switch control.action {
-        case .key(let vk):
-            InputGuard.shared.hold(owner, keys: down ? [vk] : [])
-        case .mouseLeft:
-            InputGuard.shared.hold(owner, buttons: down ? [0] : [])
-        case .mouseRight:
-            InputGuard.shared.hold(owner, buttons: down ? [1] : [])
-        case .keyboardToggle:
-            if down { MetalBackedView.toggleKeyboard() }
-        case .none, .joystickWASD, .joystickArrows, .joystickMouse:
-            break                                              // sticks drive themselves
-        case .pad:
-            break     // ml645: no XInput yet — deliberately inert, and labelled so
-        }
+        .onDisappear { dragBase = nil }
     }
 }
 

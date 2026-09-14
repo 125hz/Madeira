@@ -594,6 +594,7 @@ static int ios_srv_stats_on = -1;         /* -1 = not yet probed */
 #define IOS_SRV_THR_SLOTS        256
 
 unsigned int ios_srv_nt_counts[IOS_NT_COUNTER_MAX];
+unsigned int ios_srv_thrinfo_counts[IOS_TI_COUNTER_MAX];   /* ml951, see ios_srv_stats.h */
 
 static unsigned int        ios_srv_kind_count[REQ_NB_REQUESTS];
 static unsigned long long  ios_srv_kind_ticks[REQ_NB_REQUESTS];
@@ -711,7 +712,7 @@ static void ios_srv_stats_report( unsigned long long now )
 
     /* line 1: the headline — how much wall time this task spent inside the
      * round trip, as a fraction of ONE core-second per second. */
-    wine_log_write( "[srv-stats] %llums reqs=%u (%llu/s) in-call=%llums (%llu.%02llu core) rev=ml950",
+    wine_log_write( "[srv-stats] %llums reqs=%u (%llu/s) in-call=%llums (%llu.%02llu core) rev=ml951",
                     window_ns / 1000000ull, total,
                     (unsigned long long)total * 1000000000ull / window_ns,
                     total_ns / 1000000ull,
@@ -753,11 +754,38 @@ static void ios_srv_stats_report( unsigned long long now )
 #undef IOS_SRV_APPEND
 
     wine_log_write( "[srv-stats]   nt: setev=%u resetev=%u pulse=%u wait1=%u waitN=%u sigwait=%u "
-                    "relsem=%u relmut=%u sleep0=%u sleepN=%u yield_sc=%u",
+                    "relsem=%u relmut=%u sleep0=%u sleepN=%u yield_sc=%u park=%u",
                     nt[IOS_NT_SET_EVENT], nt[IOS_NT_RESET_EVENT], nt[IOS_NT_PULSE_EVENT],
                     nt[IOS_NT_WAIT_SINGLE], nt[IOS_NT_WAIT_MULTI], nt[IOS_NT_SIGNAL_AND_WAIT],
                     nt[IOS_NT_RELEASE_SEM], nt[IOS_NT_RELEASE_MUTANT],
-                    nt[IOS_NT_DELAY_ZERO], nt[IOS_NT_DELAY_NONZERO], nt[IOS_NT_YIELD_SYSCALL] );
+                    nt[IOS_NT_DELAY_ZERO], nt[IOS_NT_DELAY_NONZERO], nt[IOS_NT_YIELD_SYSCALL],
+                    nt[IOS_NT_SLEEP0_PARK] );
+
+    /* ml951: who is calling NtQueryInformationThread 10 k times a second.
+     * `cached' are the ones the client-side self cache answered with no
+     * server round trip at all; basic_other is the residue that still needs
+     * the server (a handle to a DIFFERENT thread — typically an exit-code or
+     * priority poll on a worker, which cannot be cached). */
+    {
+        unsigned int ti[IOS_TI_COUNTER_MAX];
+        unsigned int k;
+
+        for (k = 0; k < IOS_TI_COUNTER_MAX; k++)
+            ti[k] = __atomic_exchange_n( &ios_srv_thrinfo_counts[k], 0, __ATOMIC_RELAXED );
+
+        if (ti[IOS_TI_BASIC_SELF] || ti[IOS_TI_BASIC_OTHER] || ti[IOS_TI_AFFINITY] ||
+            ti[IOS_TI_AMILAST] || ti[IOS_TI_TERMINATED] || ti[IOS_TI_SUSPEND] ||
+            ti[IOS_TI_START_ADDR] || ti[IOS_TI_NAME] || ti[IOS_TI_OTHER_CLASS] ||
+            ti[IOS_TI_TIMES] || ti[IOS_TI_SET])
+            wine_log_write( "[thrinfo] basic self=%u (cached=%u) other=%u | affinity=%u (cached=%u) "
+                            "| times=%u amilast=%u terminated=%u suspend=%u startaddr=%u name=%u "
+                            "other_class=%u | set=%u",
+                            ti[IOS_TI_BASIC_SELF], ti[IOS_TI_BASIC_CACHED], ti[IOS_TI_BASIC_OTHER],
+                            ti[IOS_TI_AFFINITY], ti[IOS_TI_AFFINITY_CACHED], ti[IOS_TI_TIMES],
+                            ti[IOS_TI_AMILAST], ti[IOS_TI_TERMINATED], ti[IOS_TI_SUSPEND],
+                            ti[IOS_TI_START_ADDR], ti[IOS_TI_NAME], ti[IOS_TI_OTHER_CLASS],
+                            ti[IOS_TI_SET] );
+    }
 
     /* The alert ping-pong is NOT server-backed on this target: USE_FUTEX is
      * defined for __APPLE__ in sync.c, so NtAlertThreadByThreadId is an
@@ -862,7 +890,7 @@ static int ios_srv_stats_enabled(void)
             __atomic_store_n( &ios_srv_stats_deadline,
                               now + ios_srv_ns_to_ticks( IOS_SRV_STATS_PERIOD_S * 1000000000ull ),
                               __ATOMIC_RELAXED );
-            wine_log_write( "[srv-stats] ON rev=ml950 period=%ds — per-kind wineserver traffic; "
+            wine_log_write( "[srv-stats] ON rev=ml951 period=%ds — per-kind wineserver traffic; "
                             "MADEIRA_SRV_STATS=0 to disable", IOS_SRV_STATS_PERIOD_S );
         }
         __atomic_store_n( &ios_srv_stats_on, on, __ATOMIC_RELAXED );

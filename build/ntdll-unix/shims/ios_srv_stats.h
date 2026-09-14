@@ -28,6 +28,7 @@ enum ios_srv_nt_counter
     IOS_NT_DELAY_ZERO,         /* NtDelayExecution with a zero timeout       */
     IOS_NT_DELAY_NONZERO,      /* NtDelayExecution with a real timeout       */
     IOS_NT_YIELD_SYSCALL,      /* sched_yield() actually issued              */
+    IOS_NT_SLEEP0_PARK,        /* ml951: bounded park instead of a yield     */
     IOS_NT_ALERT_WAIT,         /* NtWaitForAlertByThreadId (futex, no server)*/
     IOS_NT_ALERT_WAKE,         /* NtAlertThreadByThreadId  (futex, no server)*/
     /* fast-path outcomes, see MADEIRA_FASTSYNC in sync.c */
@@ -67,6 +68,43 @@ extern unsigned int ios_srv_nt_counts[IOS_NT_COUNTER_MAX];
 static inline void ios_srv_nt_count( enum ios_srv_nt_counter which )
 {
     __atomic_fetch_add( &ios_srv_nt_counts[which], 1, __ATOMIC_RELAXED );
+}
+
+/*
+ * ml951: NtQueryInformationThread breakdown.  `get_thread_info' was the
+ * second-loudest request kind (103140 in a 10 s window) and every one of them
+ * comes from NtQueryInformationThread in build/ntdll-unix/thread_ios.c — but
+ * the request counter cannot say WHICH info class, nor whether the target is
+ * the calling thread (answerable without the server) or another one.  These
+ * buckets answer both, and the SELF/OTHER split is what decides whether the
+ * client-side cache below can help at all.
+ *
+ * Counted in NtQueryInformationThread, reported by ios_srv_stats_report().
+ */
+enum ios_srv_thrinfo_counter
+{
+    IOS_TI_BASIC_SELF,         /* ThreadBasicInformation, current thread     */
+    IOS_TI_BASIC_OTHER,        /* ThreadBasicInformation, another thread     */
+    IOS_TI_BASIC_CACHED,       /* ... of the SELF ones, answered from cache  */
+    IOS_TI_AFFINITY,           /* ThreadAffinityMask / ThreadGroupInformation*/
+    IOS_TI_AFFINITY_CACHED,
+    IOS_TI_TIMES,              /* ThreadTimes (get_thread_times, not _info)  */
+    IOS_TI_AMILAST,            /* ThreadAmILastThread                        */
+    IOS_TI_TERMINATED,         /* ThreadIsTerminated                         */
+    IOS_TI_SUSPEND,            /* ThreadSuspendCount                         */
+    IOS_TI_START_ADDR,         /* ThreadQuerySetWin32StartAddress            */
+    IOS_TI_NAME,               /* ThreadNameInformation                      */
+    IOS_TI_OTHER_CLASS,        /* everything else that reaches the server    */
+    IOS_TI_SET,                /* NtSetInformationThread (cache invalidation)*/
+
+    IOS_TI_COUNTER_MAX
+};
+
+extern unsigned int ios_srv_thrinfo_counts[IOS_TI_COUNTER_MAX];
+
+static inline void ios_srv_thrinfo_count( enum ios_srv_thrinfo_counter which )
+{
+    __atomic_fetch_add( &ios_srv_thrinfo_counts[which], 1, __ATOMIC_RELAXED );
 }
 
 #endif /* __IOS_SRV_STATS_H */

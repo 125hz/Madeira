@@ -45,28 +45,8 @@ WINE_DECLARE_DEBUG_CHANNEL(relay);
 #define QS_HARDWARE     0x40000000
 #define QS_INTERNAL     (QS_DRIVER | QS_HARDWARE)
 
-#ifdef WINE_IOS
-/* iOS: the canonical 0x7ffe0000 page can't be mapped (the app's 4GB
- * __PAGEZERO covers it), so every read through that address costs a Mach
- * exception round trip via the handler's USD redirect — and get_tick_count
- * below does THREE such loads per call, on every message-loop poll
- * (profiled as a top residual fault source in gameplay). Resolve the real
- * unix-side USD mapping once instead. */
-static const struct _KUSER_SHARED_DATA *get_user_shared_data(void)
-{
-    extern unsigned long long ios_get_real_usd(void);
-    static const struct _KUSER_SHARED_DATA *usd;
-    if (!usd)
-    {
-        unsigned long long real = ios_get_real_usd();
-        usd = (const struct _KUSER_SHARED_DATA *)(uintptr_t)(real ? real : 0x7ffe0000ULL);
-    }
-    return usd;
-}
-#define user_shared_data get_user_shared_data()
-#else
+#ifndef WINE_IOS
 static const struct _KUSER_SHARED_DATA *user_shared_data = (struct _KUSER_SHARED_DATA *)0x7ffe0000;
-#endif
 
 static LONG atomic_load_long( const volatile LONG *ptr )
 {
@@ -85,7 +65,51 @@ static ULONG atomic_load_ulong( const volatile ULONG *ptr )
     return __atomic_load_n( ptr, __ATOMIC_SEQ_CST );
 #endif
 }
+#endif  /* !WINE_IOS */
 
+#ifdef WINE_IOS
+#include <time.h>   /* ml951: clock_gettime_nsec_np (commpage, not a syscall) */
+
+/*
+ * iOS-Madeira ml951: get_tick_count() has exactly two consumers in this file,
+ * check_queue_bits() and check_queue_masks(), and both use it for the SAME
+ * comparison:
+ *
+ *     get_tick_count() - queue_shm->access_time / 10000 < 3000
+ *
+ * `access_time' is stamped by the wineserver from its `monotonic_time', which
+ * is monotonic_counter() = mach_continuous_time() in 100 ns units
+ * (build/wineserver/request_ios.c:548).  The left-hand side read
+ * KUSER_SHARED_DATA.TickCount -- and on iOS that page is NEVER WRITTEN unless
+ * MADEIRA_USD_TIME=1: create_user_data_mapping() maps the writable alias and
+ * returns early when the switch is off (build/wineserver/mapping_ios.c:1547),
+ * and set_current_time()'s seven stores are behind the same switch
+ * (build/wineserver/fd_ios.c:538).  A SEC_COMMIT mapping starts zeroed, so
+ * get_tick_count() returned 0 for the whole run.
+ *
+ * 0 - (a few million ms) in UINT64 is ~1.8e19, which is not < 3000, so `skip'
+ * was FALSE on EVERY empty peek and EVERY mask check: the shared-queue fast
+ * path could never fire, and each PeekMessage paid a full get_message round
+ * trip (243117 of them in one 10 s [srv-stats] window).  The same underflow
+ * is why check_queue_masks() never skipped, which is what the 2026-07-04
+ * once-per-second set_queue_mask heartbeat below was really working around.
+ *
+ * The fix is to read the clock the server actually stamped with, not the page
+ * it never wrote.  CLOCK_MONOTONIC_RAW is Darwin's mach_continuous_time (it
+ * keeps running across sleep, same as mach_continuous_time), and
+ * clock_gettime_nsec_np() is a commpage read, not a syscall -- cheaper than
+ * the three atomic loads it replaces.  Scaling: server ns/100 / 10000 = ms,
+ * here ns / 1000000 = ms, same epoch, same unit.
+ *
+ * This deliberately does NOT fix GetTickCount() for the guest (that is the
+ * USD clock and a separate, already-documented issue); it only stops win32u's
+ * own hung-queue heuristic from depending on a clock that does not tick.
+ */
+static UINT64 get_tick_count(void)
+{
+    return clock_gettime_nsec_np( CLOCK_MONOTONIC_RAW ) / 1000000ull;
+}
+#else
 static UINT64 get_tick_count(void)
 {
     ULONG high, low;
@@ -99,6 +123,7 @@ static UINT64 get_tick_count(void)
     /* note: we ignore TickCountMultiplier */
     return (UINT64)high << 32 | low;
 }
+#endif
 
 #define MAX_WINPROC_RECURSION  64
 
@@ -2921,6 +2946,102 @@ static BOOL process_hardware_message( MSG *msg, UINT hw_id, const struct hardwar
     return ret;
 }
 
+#ifdef WINE_IOS
+/***********************************************************************
+ *           [msgq] — is the shared-queue fast path actually firing?
+ *
+ * ml951.  check_queue_bits() is the whole reason an empty PeekMessage costs
+ * nothing on Linux, and it is a pure shared-memory read: if it returns FALSE
+ * the caller pays a get_message round trip.  There are six distinct ways for
+ * it to return FALSE and the [srv-stats] request counters cannot tell them
+ * apart, so count them here and print them on the same 10 s cadence.
+ *
+ * Emitted lines:
+ *   [msgq] shared queue: mapped shm=… wake_mask=… … access_age=…ms   (once)
+ *   [msgq] shared queue: NOT-MAPPED reason=…                          (once)
+ *   [msgq] 10s peek=… skipped=… served=… reasons: …                   (periodic)
+ *
+ * "peek" counts calls to check_queue_bits (non-internal), "skipped" the ones
+ * answered from shared memory, "served" the ones that fell through to the
+ * server.  A healthy idle pump is skipped≈peek with served≈1 per 3 s per
+ * thread (the hung-queue refresh).
+ */
+extern int dprintf( int fd, const char *fmt, ... );
+
+#define IOS_MSGQ_WHY(r)  (reason = (r))
+
+enum msgq_reason
+{
+    MSGQ_R_SKIP,            /* answered from shared memory, no server call  */
+    MSGQ_R_NOT_MAPPED,      /* get_shared_queue() failed                    */
+    MSGQ_R_WAKE_MASK,       /* stored wake_mask != requested                */
+    MSGQ_R_CHANGED_MASK,    /* stored changed_mask != requested             */
+    MSGQ_R_WAKE_BITS,       /* queue signalled: a real message is waiting   */
+    MSGQ_R_CHANGED_BITS,    /* changed bits need clearing                   */
+    MSGQ_R_STALE,           /* access_time older than the 3 s hung-queue cap*/
+    MSGQ_R_MAX
+};
+
+static unsigned int msgq_counts[MSGQ_R_MAX];
+static unsigned int msgq_peeks;
+
+static inline void msgq_count( enum msgq_reason r )
+{
+    __atomic_fetch_add( &msgq_counts[r], 1, __ATOMIC_RELAXED );
+}
+
+/* one-shot verdict on the shared session mapping */
+static void msgq_report_mapping( UINT status, const queue_shm_t *queue_shm )
+{
+    static int done;
+    UINT64 age;
+
+    if (__atomic_load_n( &done, __ATOMIC_RELAXED )) return;        /* hot path: one load */
+    if (__atomic_exchange_n( &done, 1, __ATOMIC_RELAXED )) return; /* first caller wins  */
+
+    if (status)
+    {
+        dprintf( 2, "[msgq] shared queue: NOT-MAPPED reason=get_shared_queue=%#x"
+                    " — every peek pays a get_message round trip\n", status );
+        return;
+    }
+    age = get_tick_count() - (UINT64)queue_shm->access_time / 10000;
+    dprintf( 2, "[msgq] shared queue: mapped shm=%p wake_mask=%#x changed_mask=%#x"
+                " wake_bits=%#x changed_bits=%#x internal_bits=%#x access_age=%llums\n",
+             (const void *)queue_shm, queue_shm->wake_mask, queue_shm->changed_mask,
+             queue_shm->wake_bits, queue_shm->changed_bits, queue_shm->internal_bits,
+             (unsigned long long)age );
+}
+
+/* periodic histogram; called from check_queue_bits every 1024 peeks so the
+ * clock read is amortised (the report itself is time-gated to 10 s). */
+static void msgq_report_tick(void)
+{
+    static unsigned long long next_ns;
+    unsigned long long now = clock_gettime_nsec_np( CLOCK_MONOTONIC_RAW );
+    unsigned int c[MSGQ_R_MAX], peeks, i, served = 0;
+
+    if (!next_ns) { next_ns = now + 10000000000ull; return; }
+    if (now < next_ns) return;
+    next_ns = now + 10000000000ull;
+
+    peeks = __atomic_exchange_n( &msgq_peeks, 0, __ATOMIC_RELAXED );
+    for (i = 0; i < MSGQ_R_MAX; i++)
+    {
+        c[i] = __atomic_exchange_n( &msgq_counts[i], 0, __ATOMIC_RELAXED );
+        if (i != MSGQ_R_SKIP) served += c[i];
+    }
+
+    dprintf( 2, "[msgq] 10s peek=%u skipped=%u served=%u reasons: not_mapped=%u"
+                " wake_mask=%u changed_mask=%u wake_bits=%u changed_bits=%u stale=%u\n",
+             peeks, c[MSGQ_R_SKIP], served, c[MSGQ_R_NOT_MAPPED], c[MSGQ_R_WAKE_MASK],
+             c[MSGQ_R_CHANGED_MASK], c[MSGQ_R_WAKE_BITS], c[MSGQ_R_CHANGED_BITS],
+             c[MSGQ_R_STALE] );
+}
+#else
+#define IOS_MSGQ_WHY(r)  ((void)0)
+#endif  /* WINE_IOS */
+
 /***********************************************************************
  *           check_queue_bits
  *
@@ -2931,26 +3052,40 @@ static BOOL check_queue_bits( UINT wake_mask, UINT changed_mask, UINT signal_bit
                               UINT *wake_bits, UINT *changed_bits, BOOL internal )
 {
     struct object_lock lock = OBJECT_LOCK_INIT;
-    const queue_shm_t *queue_shm;
+    const queue_shm_t *queue_shm = NULL;
     BOOL skip = FALSE;
     UINT status;
+#ifdef WINE_IOS
+    enum msgq_reason reason = MSGQ_R_SKIP;
+#endif
 
     while ((status = get_shared_queue( &lock, &queue_shm )) == STATUS_PENDING)
     {
         if (internal) skip = !(queue_shm->internal_bits & QS_HARDWARE);
         /* if the masks need an update */
-        else if (queue_shm->wake_mask != wake_mask) skip = FALSE;
-        else if (queue_shm->changed_mask != changed_mask) skip = FALSE;
+        else if (queue_shm->wake_mask != wake_mask) { skip = FALSE; IOS_MSGQ_WHY( MSGQ_R_WAKE_MASK ); }
+        else if (queue_shm->changed_mask != changed_mask) { skip = FALSE; IOS_MSGQ_WHY( MSGQ_R_CHANGED_MASK ); }
         /* or if some bits need to be cleared, or queue is signaled */
-        else if (queue_shm->wake_bits & signal_bits) skip = FALSE;
-        else if (queue_shm->changed_bits & clear_bits) skip = FALSE;
+        else if (queue_shm->wake_bits & signal_bits) { skip = FALSE; IOS_MSGQ_WHY( MSGQ_R_WAKE_BITS ); }
+        else if (queue_shm->changed_bits & clear_bits) { skip = FALSE; IOS_MSGQ_WHY( MSGQ_R_CHANGED_BITS ); }
         else
         {
             *wake_bits = queue_shm->wake_bits;
             *changed_bits = queue_shm->changed_bits;
             skip = get_tick_count() - (UINT64)queue_shm->access_time / 10000 < 3000; /* avoid hung queue */
+            IOS_MSGQ_WHY( skip ? MSGQ_R_SKIP : MSGQ_R_STALE );
         }
     }
+
+#ifdef WINE_IOS
+    if (!internal)
+    {
+        unsigned int n = __atomic_fetch_add( &msgq_peeks, 1, __ATOMIC_RELAXED );
+        msgq_report_mapping( status, status ? NULL : queue_shm );
+        msgq_count( status ? MSGQ_R_NOT_MAPPED : reason );
+        if (!(n & 0x3FF)) msgq_report_tick();
+    }
+#endif
 
     if (status) return FALSE;
     return skip;

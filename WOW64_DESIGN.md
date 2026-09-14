@@ -907,6 +907,53 @@ game-specific patches — every change must fix the emulator/runtime generically
   x87: `X87REDUCEDPRECISION=1` is now the 32-bit default unless the user
   set it (`[fex-cfg]` reports `X87ReducedPrecision(madeira-32bit-default)`).
   (c) §8 below: the native D3D9 plan (Opus, read-only investigation).
+- 2026-09-14 — First `[srv-stats]` run (log 38): **38k server requests/s**,
+  0.76 core in round trips; `get_message` 24k/s + `get_thread_info` 10k/s,
+  26k/s of it from the game's MAIN thread, which spins `PeekMessage` +
+  `Sleep(0)` (75k `Sleep(0)`/s) waiting for the render thread. Upstream's
+  shared-queue fast path (`check_queue_bits` / `get_shared_queue`) should
+  answer an empty peek without a server call — not engaging on iOS.
+  `select:` line: w1 inf 5k, fin 2.9k, wN fin 1k, tmo_fin 1k — pacing waits
+  are secondary. `event_op` 2.2k/s on the render/worker threads. Ring
+  healthy (`dropped 0`), aim `holders=0` after a stray tap: SwiftUI
+  `DragGesture` controls cancel on a second touch → UIKit multi-touch
+  overlay assigned. `d3d9.dll` 21-24 %, `jit` 47 %, `dylib` 41-45 %.
+  Assigned: shared-queue fast path + `get_thread_info` source + deeper
+  `Sleep(0)` pause (Opus); UIKit multi-touch controls (Opus). In flight:
+  D3D9 step 0 (census + nop bench) and step 2 (description + generator).
+  NOTE: four implementation agents at once this round (user's 60 fps
+  push; files disjoint).
+  RESULTS: (1) `get_message` storm ROOT CAUSE — `check_queue_bits`'s
+  hung-queue guard compares `get_tick_count()` (KUSER_SHARED_DATA
+  TickCount, NEVER written on iOS unless `MADEIRA_USD_TIME=1` → reads 0)
+  against the server's `mach_continuous_time` stamp → UINT64 underflow →
+  `skip` never true → every empty peek a server round trip (also why
+  `check_queue_masks` never skipped; the 2026-07-04 heartbeat was a
+  workaround for the same bug). Fix: iOS `get_tick_count()` reads
+  `clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)` (commpage; same epoch/unit
+  as the server). `[msgq]` lines. `get_thread_info`: per-thread cache of
+  the caller's own ThreadBasicInformation/affinity (`[thrinfo]` line
+  names the class and self/other). `Sleep(0)`: after 512 consecutive
+  spins the periodic rung becomes a 10 µs `futex_wait` park (`park=`
+  counter). Expected `get_message` 243k → ~4 per 10 s per GUI thread.
+  (2) Controls moved to a raw UIKit multi-touch `ControlOverlayView` in
+  the controls window (per-touch ownership, no gesture arbitration;
+  `[input] touch id=… began/ended on <control>`, `[input] controls: …`).
+  (3) D3D9 step 0 DONE: `[d3d9-census]` (317 methods, summaries at
+  Present 1/100/1000/every 5000, calls/frame, top 20, constant-register
+  and lock-size histograms) and `unixcall-bench-x86.exe` (slot 150
+  `_d3d9_nop`, `WMTNop`; prints `MADEIRA-BENCH: unix-call ns/call`, exit
+  44). FINDING: the i386 DXMT PE stage built with meson's default
+  `debug` (-O0) — the measured `d3d9.dll` was UNOPTIMISED; release is
+  now the i386 default (Sonnet). (4) D3D9 step 2 DONE: `d3d9_api.py` (320
+  slots: local 70 / sync 175 / defer 75), `gen_d3d9_thunks.py` → ~19.7k
+  generated lines, 13 guard rails verified firing, API hash handshake,
+  fixed-width blocks shared by both tables (no `_32` variants needed);
+  five mirrors not four (`D3DPRESENTSTATS` differs: LARGE_INTEGER is
+  4-byte aligned on i386); `D3DADAPTER_IDENTIFIER9` sizeof 1100 vs 1104
+  (padding only); both sides syntax-clean (i386 clang; LP64 gcc + LLP64
+  aarch64 clang). Next: steps 1 (native build mode) and 3 (shim
+  hand-written parts).
 
 
 - 2026-09-12 — M5 direction: the user's next target is a 32-bit UE3/D3D9
