@@ -147,6 +147,83 @@ game-specific patches — every change must fix the emulator/runtime generically
 
 ## 6. Status log
 
+- 2026-09-13 — **PERF ROUND 3 (ml920): the four items from round 2's §(3) are
+  IMPLEMENTED** (Opus; `FEX/FEXCore/**` only — `xtajit.dll` rebuilt, 0 new
+  warnings, iOS-host FEXCore compile-checked separately). AUTHORISATION: the
+  repository owner decided this fork's FEX subtree is maintained with AI
+  assistance and is never contributed upstream (pushes to `125hz/FEX` only, no
+  PRs), which is what round 2's item (3) was blocked on. Every change is gated
+  to the 32-bit WoW64 CPU module: the new macro `FEX_CALLRET_STACK_UNUSED`
+  (`ArchHelpers/Arm64Emitter.h:141`) and `LookupCache::L1_WAYS`
+  (`LookupCache.h:188`) are both `FEX_IOS_HOST && !ARCHITECTURE_arm64ec`, so
+  ARM64EC and every non-iOS build emit byte-identical code.
+  **(1) The dead call-ret shadow stack is no longer written.** Confirmed both
+  readers compiled out, and confirmed the WoW64 module is `ARCHITECTURE_arm64`
+  (so `Dispatcher.cpp`'s EnterEC reader does not even exist there). Removed:
+  the 9-instruction `EmitCallRetStackGuard` + `stp` at both CALL push sites
+  (`JIT/BranchOps.cpp:174`, `:337`), the guard + `ldp` + already-dead `sub` at
+  the RET pop (`:226`), the JITCallback sentinel push
+  (`Dispatcher/Dispatcher.cpp:732`), and the `str`/`ldr` of `callret_sp` in
+  Spill/FillStaticRegs (`ArchHelpers/Arm64Emitter.cpp:863`, `:974`).
+  Guest CALL 11 instructions → 1; guest RET 11 → 0. **What is deliberately
+  KEPT is the lone `adr TMP1, <l_CallReturn>` at a linked CALL**: it is not the
+  push, it is the known-call marker `Arm64JITCore::ExitFunctionLink` sniffs to
+  decide `bl` vs `b` when it backpatches a callsite (`JIT/JIT.cpp:630`). Drop
+  it and every direct call relinks as `b`, unbalancing the hardware
+  return-address stack against the `ret Xn` each guest RET emits — a
+  mispredict per return, which would have eaten the win. Its immediate and the
+  offset the linker reads it from both shrink by one instruction and are now
+  derived from the same macro on both sides.
+  **(2) The `[Xbase, Wea, UXTW]` fold is emitted.** `GetGuestMemAddr` takes an
+  `AllowRegOffsetFold` flag (`JITClass.h:356`) and `GuestMemAddr` carries a
+  `RegOffsetFold`/`IndexReg` pair (`:337`); a new `GenerateMemOperand`
+  overload turns it into `[x19, wEA, uxtw #0]` (`JIT/MemoryOps.cpp:721`). Passed
+  from `LoadMem`/`StoreMem` (all sizes but the 256-bit SVE lowering, whose
+  operand has no extend field), from the FPR class of
+  `LoadMemTSO`/`StoreMemTSO` — which is the whole x87/SSE path while
+  `VectorTSOEnabled=0` — and hand-rolled into `Push` (`:1654`) and `Pop`
+  (`:1809`). One `add` off every such access. The TSO GPR path is deliberately
+  untouched: LDAPUR/STLUR/LDAPR/LDAR have no register-offset form and the
+  unaligned back-patcher decodes them, exactly as §2 requires.
+  **(3) The half-barrier `nop` is gated** on the option its only consumer is
+  gated on, via the new `ContextImpl::IsHalfBarrierTSOEnabled()`
+  (`Interface/Context/Context.h:441`), at all five sites. Default is on, so
+  this changes nothing until `FEX_HALFBARRIERTSOENABLED=0` is set — at which
+  point it is 4 bytes off every 16/32/64-bit TSO GPR access. A/B, not a win.
+  **(4) The L1 is 2-way set-associative** for this module. Same array, same
+  2MB/thread, one fewer index bit, two ways. `L1Mask` is now a pre-scaled SET
+  mask (`LookupCache.h:416`); ways of a set are contiguous so each way is one
+  `ldp`. Way-0 hit costs exactly what the direct-mapped probe cost (same
+  instruction count, same registers) in both inline probes
+  (`Dispatcher.cpp:281`, `BranchOps.cpp:306` — the latter needs TMP3 to keep
+  the set pointer alive, which the direct-mapped form consumes); a way-0 miss
+  pays `ldp`/`sub`/`cbz` before falling to the C++ path it would have taken
+  anyway. C++ side: `FindBlock` probes both ways, `InsertL1` publishes into
+  way 0 demoting way 0 → way 1 (a FIFO), and `InvalidateCache` clears EVERY
+  way — missing that would leave a live branch target for invalidated host
+  code. Both `InsertL1` callers hold a LookupCache lock and `InvalidateCache`
+  requires the write lock, which is what closes the resurrect-a-just-cleared
+  -mapping race that demotion would otherwise open. `DisableL2Cache` is
+  untouched (round 2's warning about the 512-page L2 arena stands).
+  **(5) `repeats~` is fixed and renamed `hot_weight`** (`Core.cpp:1981`). Two
+  bugs: the `== 0` test and the `__sync_sub_and_fetch` were separate ops on a
+  counter every thread writes, so a lost race wrapped the unsigned counter to
+  ~1.8e19 and froze the candidate forever; and the field was never a repeat
+  count, it is Boyer-Moore's candidate weight. Saturating CAS now.
+  NOT DONE, and the highest-value immediate follow-up: the 16MB-per-thread
+  call-ret stack is still RESERVED (`Source/Windows/Common/CallRetStack.h:78`)
+  though nothing can now touch it. ml900 already removed its footprint cost, so
+  what is left is ~16MB of guest-band VA per guest thread (~640MB at 40
+  threads) that item (1) makes free to reclaim. Held back deliberately so this
+  round's device A/B stays a single variable.
+  A/B knobs for the device run, via `Documents/madeira-fex.txt`:
+  `HalfBarrierTSOEnabled=0` (item 3's byte saving, a real ordering trade at
+  unaligned sites), `DisableL2Cache=0` (still not obviously a win), and
+  `DynamicL1Cache=0` (pins L1 at the 128K-entry ceiling, i.e. 64K sets × 2, so
+  item 4 is measured without the growth heuristic moving underneath it). What
+  to watch: `[fex-stats] cpp_dispatch/s` (target ≤ 5k/s, from 42-65k),
+  `host_b/inst` (from 24), and `[CB_SUMMARY] hit_rate`.
+
 - 2026-09-13 — **PERF ROUND 2: a real profiler, and the pool stops costing
   22 % of the jetsam budget** (Opus; `signal_arm64_ios.c`, `virtual_ios.c`
   pool/census only, `ContentView.swift`). Premise of the round: every
@@ -672,6 +749,59 @@ game-specific patches — every change must fix the emulator/runtime generically
   faults=5590872 total=12398 ms`) — exec-downgraded/pool-alias store path;
   from the button it stalls in a lock while loading winhttp/jsproxy
   (`[lock-census] … lockval=0x0`). Read-only investigation assigned.
+  RESULTS: (a) DONE — `gdi_shared_section` is now the NAMED object
+  `\KernelObjects\__wine_ios_gdi_shared` (OBJ_OPENIF|OBJ_PERMANENT) opened
+  per caller; the session `keyed_event` likewise became a per-PEB
+  create-or-open of `\KernelObjects\CritSecOutOfMemoryEvent` (run-once
+  waits in a child were using a handle from the wrong table). (b) DONE —
+  the fault was `_wcsnicmp` called from `wow64!get_file_redirect`:
+  `ps_attributes_32to64` copied `PS_ATTRIBUTE_IMAGE_NAME` (and
+  GROUP_AFFINITY) `ValuePtr` raw; converted once; `get_file_redirect`
+  refuses a sub-4 GB buffer (`[wow-ptr] refusing …`). (c) DONE: msvfw32 +
+  avifil32 (farm = 202). 64-bit title investigation (read-only, Opus):
+  button launch = DEADLOCK in `InvalidationTracker::HandleImageMap`
+  (`std::shared_mutex IntervalsLock` taken per executable section with
+  allocating `XIntervals.Insert` + `LogMan` inside → re-entry via
+  `NotifyMemoryAlloc`; same signature FEX documents for two other titles);
+  desktop launch = the managed runtime's ~42 MB of anon PAGE_EXECUTE_
+  READWRITE regions are served as R+X pool aliases, so every plain data
+  store faults (5.6 M/min, ~8 µs round trip each, ~1 MB/s); a 64-byte
+  stride bulk copy dominates; W^X is off and page-granular; the mono
+  bridge only captures SWP atomics; `flags=0x172` = a real resize to 0x0
+  by the title (DXGI output `DesktopCoordinates` suspected zero; display
+  device enumeration is dormant behind `is_service_process()`). No 64-bit
+  title in any log has ever presented a frame. Perf round 2 (Opus): `[prof]`
+  5 ms sampling profiler (`Documents/madeira-prof.txt`), pool default 512
+  MB for direct launches / 896 desktop (`madeira-pool.txt`), warmer RX
+  pass 1/16, census dedup + VM tags (88 IOSURFACE, 100 IOACCELERATOR, 2
+  MALLOC_SMALL); `hostlow` 907 MB resident is clean shared-cache text, not
+  charged. FEX items found but NOT implemented by that agent (it stopped
+  at `FEX/CLAUDE.md`): callret writers are dead code on iOS (~44 B per
+  CALL/RET), the `[Xbase,Wea,UXTW]` fold is never emitted, half-barrier
+  `nop` unconditional, dispatcher misses = no L2 + 1-way L1 conflicts.
+  DECISION (owner, recorded): this fork's FEX subtree IS maintained with AI
+  assistance and is never contributed upstream; agents proceed in `FEX/**`.
+  Assigned now: FEX codegen/dispatcher items 1-4 (Opus) and the
+  InvalidationTracker deadlock + emulated-store write-window stopgap
+  (Opus).
+  DONE (Opus, ml760): `HandleImageMap` collects section ranges on the
+  stack, inserts under ONE lock per batch, logs after release; a TEB-keyed
+  (not thread_local — mingw TLS is NULL on early loader paths, ml412)
+  re-entrancy guard at every tracker entry logs `[xins] RE-ENTRY …
+  SKIPPED` instead of self-deadlocking; two more lock-held
+  `NtProtectVirtualMemory` sites (`ProtectRWXIntervalsInternal`,
+  `DisableSMCDetection`) scoped the same way. Store storm stopgap:
+  `[store-batch]` — 64 consecutive fixed-stride faults arm a ≤512 KB RW
+  window for 20 ms over the anon-RWX alias; an EXECUTE fault inside a
+  window restores R+X and bans the range; knob `MADEIRA_STORE_BATCH`
+  (default on); no FEX invalidation is queued (none existed before
+  either; a FEX-side range-invalidate entry point is the durable fix).
+  IMPORTANT build finding: `.xtool/build-fex.sh` only built the WOW64
+  module — `xtajit64.dll` had never been rebuilt since import; new stage
+  `.xtool/build-fex-arm64ec.sh` (gitignored) now produces
+  `app/Madeira/arm64ec-windows/xtajit64.dll` (`[build-id] … compiled Sep
+  13 2026`). `[waiters] over60s` bar lives in `wine/dlls/ntdll/unix/sync.c:
+  3832/3883` — TODO lower to 5 s and print every INF park's address.
 
 
 - 2026-09-12 — M5 direction: the user's next target is a 32-bit UE3/D3D9

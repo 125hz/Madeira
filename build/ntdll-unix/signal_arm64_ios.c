@@ -409,6 +409,286 @@ int ios_wx_repromote( unsigned long long pc )
     return 0;
 }
 
+/* ===================== ml760 STORE-BATCH WRITE WINDOWS =====================
+ *
+ * THE COST BEING ATTACKED. The managed runtime inside a 64-bit title allocates tens of MB of
+ * anonymous PAGE_EXECUTE_READWRITE, which Madeira serves by remapping pool pages into the
+ * caller's VA as R+X with an RW twin (virtual_ios.c's anon-RWX path). Every ordinary guest
+ * data store into such a region therefore takes a Mach fault and is emulated ONE STORE AT A
+ * TIME by the single handler thread. Measured on a desktop launch: 5.6M faults/min at ~8us
+ * each -- about 1 MB/s of effective write bandwidth for what the guest thinks is a memcpy.
+ * The dominant shape is unambiguous from [fault-class]: 8 sites at one pc, 66,954 hits each,
+ * a FIXED 64-byte ascending stride across a ~350MB span, plain STLR. That is a bulk copy.
+ *
+ * THE STOPGAP. When consecutive faults from the same host pc form an ascending fixed-stride
+ * run inside one anon-RWX alias region, mprotect a bounded, contiguous, alias-backed page
+ * range of that region to RW for a bounded deadline. The rest of the copy then lands
+ * directly, at memory speed, with no fault at all. On expiry the range is put back to R+X.
+ *
+ * WHY THIS DOES NOT LOSE COHERENCE THAT WE HAVE TODAY. The RW alias and the R+X view map the
+ * SAME physical pages, so a direct store and an emulated store deposit identical bytes. And
+ * the ml635 note on the emulation path records that it "NEVER invalidates FEX's cached
+ * translation" -- the fault buys no coherence today, it is pure cost. Letting the store land
+ * directly therefore loses nothing that currently exists.
+ *
+ * ⚠️ WHAT IS STILL WRONG, STATED PLAINLY. While a range is RW the guest could execute a stale
+ * FEX translation of code living in it. That hazard EXISTS TODAY, unchanged, because the
+ * emulated path never invalidated either; this does not add it and does not fix it. The
+ * durable fix is alias-lifetime metadata wired into FEX's translation invalidation (same
+ * conclusion as the ml694 note above). No invalidation is queued from here: the only
+ * native-side publish/retire entry points (ios_mono_alias_publish / _retire) describe alias
+ * LIFETIME, not content change, and there is no existing native entry point that asks FEX to
+ * invalidate a range -- calling an ARM64EC export from this handler is what crashed every
+ * launch in ml613. Adding one belongs on the FEX side of the boundary.
+ *
+ * ⚠️ TELEMETRY THIS BLINDS. Stores that land inside an open window do not pass through the
+ * emulator, so they do not reach ios_jit_anon_alias_note_write() -- the ml635 per-alias
+ * write_gen counter and written-chunk bitmap, and the ml636 highest-offset watermark, will
+ * UNDER-report for any alias that got windowed. Anyone using those to answer "was this page
+ * filled after its translation was compiled?" must run with MADEIRA_STORE_BATCH=0. The
+ * [store-batch] OPEN/CLOSED lines name every range this applies to.
+ *
+ * DIFFERENCES FROM ml691-695 W^X, which is off by default after two deterministic crashes:
+ *   - that demotes a page after N faults and leaves it RW for the REST OF THE RUN; this opens
+ *     a window with a deadline and closes it;
+ *   - that fires for any repeatedly-written page; this fires only for a detected ascending
+ *     fixed-stride run, i.e. a copy, not a hot data structure;
+ *   - a page ios_wx_pages has marked `sticky` (proven by an exec fault to hold code) is never
+ *     windowed, and an exec fault inside an open window closes it AND permanently bans the
+ *     region -- so the recovery hook is shared with, not duplicated from, the W^X path.
+ * That is strictly narrower than W^X, but it is the same class of mechanism and carries the
+ * same class of risk. MADEIRA_STORE_BATCH=0 disables it outright. */
+/* Declared explicitly: this block is the FIRST user of mach_absolute_time() in the file, and
+ * an implicit declaration would make it return `int` and silently wreck the deadline math. */
+extern uint64_t mach_absolute_time( void );
+
+#define IOS_SB_SLOTS        16
+#define IOS_SB_MAX_PAGES    32       /* 512KB of RW exposure per window, hard cap */
+#define IOS_SB_WINDOW_MS    20
+#define IOS_SB_RUN          64       /* consecutive fixed-stride ascending faults to arm */
+#define IOS_SB_BAN_SLOTS    32
+
+struct ios_sb_window {
+    unsigned long long lo, hi;        /* user-VA range currently held RW */
+    unsigned long long deadline;      /* mach_absolute_time() ticks */
+    unsigned long long stride, est;   /* detected stride; upper-bound faults avoided */
+    unsigned long long pc;
+    volatile int active;
+};
+static struct ios_sb_window ios_sb_win[IOS_SB_SLOTS];
+static unsigned long long ios_sb_ban_lo[IOS_SB_BAN_SLOTS], ios_sb_ban_hi[IOS_SB_BAN_SLOTS];
+static volatile unsigned ios_sb_ban_n;
+static volatile int ios_sb_lock;
+static volatile unsigned ios_sb_opened, ios_sb_closed, ios_sb_open_failed,
+                         ios_sb_close_failed, ios_sb_exec_closed, ios_sb_refused;
+static volatile unsigned long long ios_sb_total_bytes, ios_sb_total_est;
+
+int ios_store_batch_enabled( void )
+{
+    static int v = -1;
+    if (v < 0)
+    {
+        /* DEFAULT ON, unlike MADEIRA_WX. The exposure here is bounded in both space
+         * (IOS_SB_MAX_PAGES) and time (IOS_SB_WINDOW_MS) and is armed only by a detected
+         * bulk-copy signature, so it is A/B-able in a single run rather than being a
+         * whole-session state change. Set MADEIRA_STORE_BATCH=0 to turn it off. */
+        const char *e = getenv( "MADEIRA_STORE_BATCH" );
+        v = (e && e[0] == '0') ? 0 : 1;
+        dprintf( STDERR_FILENO,
+                 "[store-batch] ml760 MADEIRA_STORE_BATCH=%s -> %s "
+                 "(run>=%d fixed-stride faults arms a <=%dKB window for %dms, %d slots)\n",
+                 e ? e : "(unset)", v ? "ENABLED" : "DISABLED",
+                 IOS_SB_RUN, (IOS_SB_MAX_PAGES * 16), IOS_SB_WINDOW_MS, IOS_SB_SLOTS );
+    }
+    return v;
+}
+
+static unsigned long long ios_sb_ticks_per_ms( void )
+{
+    static unsigned long long t;
+    if (!t)
+    {
+        /* mach_timebase_info_data_t is not visible in this TU's header set; the struct is
+         * two uint32s and the call takes it by pointer (same shape as the ml685 block). */
+        struct { unsigned int numer, denom; } tb = { 0, 0 };
+        extern int mach_timebase_info( void * );
+        mach_timebase_info( &tb );
+        /* ticks = ns * denom / numer; 1ms = 1e6 ns */
+        t = (tb.numer && tb.denom) ? (1000000ull * tb.denom) / tb.numer : 24000ull;
+        if (!t) t = 24000ull;
+    }
+    return t;
+}
+
+/* Put one window back to R+X. Caller holds ios_sb_lock. */
+static void ios_sb_close_locked( int i, const char *why )
+{
+    unsigned long long lo = ios_sb_win[i].lo, hi = ios_sb_win[i].hi;
+    if (!ios_sb_win[i].active) return;
+    ios_sb_win[i].active = 0;
+    if (mprotect( (void *)(uintptr_t)lo, (size_t)(hi - lo), PROT_READ | PROT_EXEC ) == 0)
+    {
+        unsigned n = __sync_add_and_fetch( &ios_sb_closed, 1 );
+        if (n <= 8 || (n & 0x3f) == 0)
+            dprintf( STDERR_FILENO,
+                "[store-batch] ml760 CLOSED #%u 0x%llx+0x%llx (%s) pc=0x%llx stride=%llu "
+                "faults_saved<=%llu | totals: opened=%u closed=%u bytes=%lluKB saved<=%llu\n",
+                n, lo, hi - lo, why, ios_sb_win[i].pc, ios_sb_win[i].stride, ios_sb_win[i].est,
+                ios_sb_opened, n, ios_sb_total_bytes / 1024ull, ios_sb_total_est );
+    }
+    else
+    {
+        /* Loud: the range is now readable but NOT executable. Execution there will fault
+         * NOEXEC, which the exec path below can no longer repair. */
+        unsigned n = __sync_add_and_fetch( &ios_sb_close_failed, 1 );
+        dprintf( STDERR_FILENO,
+            "[store-batch] ml760 RE-PROMOTE FAILED #%u 0x%llx+0x%llx errno=%d (%s) — "
+            "region left NON-EXECUTABLE\n", n, lo, hi - lo, errno, why );
+    }
+}
+
+/* Close every window whose deadline has passed. Cheap: a 16-slot scan. */
+static void ios_sb_sweep( void )
+{
+    unsigned long long now;
+    int i;
+    if (__sync_lock_test_and_set( &ios_sb_lock, 1 )) return;   /* best effort */
+    now = mach_absolute_time();
+    for (i = 0; i < IOS_SB_SLOTS; i++)
+        if (ios_sb_win[i].active && now >= ios_sb_win[i].deadline)
+            ios_sb_close_locked( i, "deadline" );
+    __sync_lock_release( &ios_sb_lock );
+}
+
+/* An EXECUTE fault landed at `pc`. If it is inside an open window, that window's "this is
+ * data" assumption was wrong: restore R+X immediately (synchronously, before the faulting
+ * thread resumes) and BAN the range so it is never windowed again. Returns 1 when it
+ * restored execution, so the caller can treat the fault as handled -- exactly the contract
+ * ios_wx_repromote() already uses. */
+int ios_store_batch_exec_fault( unsigned long long pc )
+{
+    int i, hit = -1;
+    if (__sync_lock_test_and_set( &ios_sb_lock, 1 )) return 0;
+    for (i = 0; i < IOS_SB_SLOTS; i++)
+        if (ios_sb_win[i].active && pc >= ios_sb_win[i].lo && pc < ios_sb_win[i].hi) { hit = i; break; }
+    if (hit >= 0)
+    {
+        unsigned long long lo = ios_sb_win[hit].lo, hi = ios_sb_win[hit].hi;
+        unsigned bn = ios_sb_ban_n;
+        if (bn < IOS_SB_BAN_SLOTS)
+        {
+            ios_sb_ban_lo[bn] = lo; ios_sb_ban_hi[bn] = hi;
+            ios_sb_ban_n = bn + 1;
+        }
+        ios_sb_close_locked( hit, "EXEC fault" );
+        __sync_add_and_fetch( &ios_sb_exec_closed, 1 );
+        dprintf( STDERR_FILENO,
+            "[store-batch] ml760 EXEC FAULT inside window 0x%llx+0x%llx at pc=0x%llx — "
+            "restored R+X and BANNED this range (it holds CODE, not data); banned=%u\n",
+            lo, hi - lo, pc, ios_sb_ban_n );
+    }
+    __sync_lock_release( &ios_sb_lock );
+    return hit >= 0;
+}
+
+/* Try to open a window covering `addr`. Returns 1 if a window is now open.
+ * Called from the fault classifier once its stride detector has an ascending fixed-stride
+ * run; `rw` is the RW alias already resolved for `addr` by the store emulator. */
+static int ios_sb_try_open( unsigned long long addr, unsigned long long rw,
+                            unsigned long long stride, unsigned long long pc )
+{
+    extern uintptr_t ios_jit_anon_alias_lookup( uintptr_t );
+    unsigned long long page = addr & ~0x3fffull;
+    unsigned long long rw0, span;
+    int i, slot = -1, npages = 1;
+
+    if (!ios_store_batch_enabled() || !stride) return 0;
+
+    /* rw for `addr` must be consistent with the page base, or the alias is not linear here. */
+    if (rw < (addr - page)) return 0;
+    rw0 = rw - (addr - page);
+
+    for (i = 0; i < (int)ios_sb_ban_n && i < IOS_SB_BAN_SLOTS; i++)
+        if (page < ios_sb_ban_hi[i] && ios_sb_ban_lo[i] <= page) return 0;
+
+    /* Never window a page the W^X path has already proven to hold code. */
+    for (i = 0; i < IOS_WX_MAX; i++)
+        if (ios_wx_pages[i].page == page && ios_wx_pages[i].sticky) return 0;
+
+    /* Expand FORWARD only -- the detected sequence is ascending -- for as long as the RW
+     * alias stays contiguous, so the whole window is provably one live alias mapping. This
+     * is the same containment test the ml629 STP path makes for its 32-byte span, just
+     * applied at page granularity. */
+    if (ios_jit_anon_alias_lookup( (uintptr_t)page ) != (uintptr_t)rw0) return 0;
+    while (npages < IOS_SB_MAX_PAGES)
+    {
+        unsigned long long p = page + (unsigned long long)npages * 0x4000ull;
+        if (ios_jit_anon_alias_lookup( (uintptr_t)p ) != (uintptr_t)(rw0 + (p - page))) break;
+        npages++;
+    }
+    span = (unsigned long long)npages * 0x4000ull;
+
+    if (__sync_lock_test_and_set( &ios_sb_lock, 1 )) return 0;
+    {
+        /* Expire as we scan. This is the ONLY sweep that is guaranteed to run: the periodic
+         * one lives on the emulated-store path, and a successful window's whole purpose is to
+         * stop emulated stores happening. Without this, a fast copy would fill all
+         * IOS_SB_SLOTS with expired windows and then never open another. */
+        unsigned long long now = mach_absolute_time();
+        for (i = 0; i < IOS_SB_SLOTS; i++)
+            if (ios_sb_win[i].active && now >= ios_sb_win[i].deadline)
+                ios_sb_close_locked( i, "deadline" );
+    }
+    for (i = 0; i < IOS_SB_SLOTS; i++)
+    {
+        if (ios_sb_win[i].active)
+        {
+            if (page < ios_sb_win[i].hi && ios_sb_win[i].lo <= page)
+            { __sync_lock_release( &ios_sb_lock ); return 0; }   /* already open here */
+        }
+        else if (slot < 0) slot = i;
+    }
+    if (slot < 0)
+    {
+        __sync_add_and_fetch( &ios_sb_refused, 1 );
+        __sync_lock_release( &ios_sb_lock );
+        return 0;
+    }
+
+    if (mprotect( (void *)(uintptr_t)page, (size_t)span, PROT_READ | PROT_WRITE ) != 0)
+    {
+        unsigned n = __sync_add_and_fetch( &ios_sb_open_failed, 1 );
+        if (n <= 8)
+            dprintf( STDERR_FILENO, "[store-batch] ml760 open mprotect FAILED 0x%llx+0x%llx errno=%d\n",
+                     page, span, errno );
+        __sync_lock_release( &ios_sb_lock );
+        return 0;
+    }
+
+    ios_sb_win[slot].lo = page;
+    ios_sb_win[slot].hi = page + span;
+    ios_sb_win[slot].deadline = mach_absolute_time() + IOS_SB_WINDOW_MS * ios_sb_ticks_per_ms();
+    ios_sb_win[slot].stride = stride;
+    ios_sb_win[slot].est = span / stride;
+    ios_sb_win[slot].pc = pc;
+    ios_sb_win[slot].active = 1;
+    __sync_add_and_fetch( &ios_sb_total_bytes, span );
+    __sync_add_and_fetch( &ios_sb_total_est, span / stride );
+    {
+        unsigned n = __sync_add_and_fetch( &ios_sb_opened, 1 );
+        if (n <= 8 || (n & 0x3f) == 0)
+            dprintf( STDERR_FILENO,
+                "[store-batch] ml760 OPEN #%u region=0x%llx..0x%llx window=%dms pc=0x%llx "
+                "stride=%llu faults_saved<=%llu (upper bound = span/stride; the copy may stop "
+                "early) | totals: opened=%u closed=%u exec-closed=%u no-slot=%u\n",
+                n, page, page + span, IOS_SB_WINDOW_MS, pc, stride, span / stride,
+                n, ios_sb_closed, ios_sb_exec_closed, ios_sb_refused );
+    }
+    __sync_lock_release( &ios_sb_lock );
+    return 1;
+}
+/* =================== end ml760 STORE-BATCH WRITE WINDOWS =================== */
+
 /* Last thread that took an exec fault at a PE VA (i.e. made a native call
  * through the redirect path) — the game thread in practice. The [PROF]
  * sampler in server_ios.c follows this so it profiles the presenting
@@ -1828,6 +2108,20 @@ static void *ios_mach_exception_thread( void *arg )
                          * touches the guest page. Reaching this path at all means
                          * the "data page" assumption was wrong for that page, so
                          * it is put back and never demoted again. */
+                        /* ml760: same recovery contract for a STORE-BATCH write window. A
+                         * window is opened on the assumption that the range is a bulk-copy
+                         * DESTINATION; an execute fault inside one falsifies that, so the
+                         * window is closed, R+X restored synchronously, and the range banned
+                         * from ever being windowed again. Checked before the W^X table
+                         * because a windowed range is not registered in ios_wx_pages. */
+                        {
+                            extern int ios_store_batch_exec_fault( unsigned long long );
+                            if (ios_store_batch_exec_fault( (unsigned long long)fault_pc ))
+                            {
+                                handled = 1;
+                            }
+                        }
+                        if (!handled)
                         {
                             extern int ios_wx_repromote( unsigned long long );
                             if (ios_wx_repromote( (unsigned long long)fault_pc ))
@@ -3228,6 +3522,21 @@ wx_done: ;
                         static volatile int emul_count = 0;
                         int ec = __sync_add_and_fetch(&emul_count, 1);
 
+                        /* ml760: expire STORE-BATCH windows. This is the ordinary close
+                         * path; the exec-fault hook is the emergency one. Every 64th
+                         * emulated store is frequent enough that a deadline is honoured
+                         * within microseconds while faults are still flowing, and cheap
+                         * enough (a 16-slot scan) to be invisible.
+                         *
+                         * If faults stop entirely -- which is exactly what a successful
+                         * window causes -- nothing sweeps and the range stays RW past its
+                         * deadline. That is self-healing rather than a leak: it is a data
+                         * range, and the first execute fault in it restores R+X through
+                         * ios_store_batch_exec_fault(). It is stated here rather than
+                         * papered over, because "the deadline is best-effort" is exactly
+                         * the kind of detail a later reader must not have to rediscover. */
+                        if ((ec & 0x3f) == 0) ios_sb_sweep();
+
                         /* ============ ml680 WHAT DOES A FAULT ACTUALLY COST? ==
                          *
                          * I have twice asserted "37,000 Mach round trips/sec at
@@ -3305,6 +3614,7 @@ wx_done: ;
                                 unsigned long long hits; unsigned pages_seen;
                                 unsigned long long lo, hi, prev, stride;
                                 unsigned restarts, nset;
+                                unsigned run;     /* ml760: consecutive fixed-stride ascending steps */
                                 unsigned long long pset[FC_PAGESET];
                                 unsigned nsmp;
                                 struct { unsigned long long hits, rsp, rcx, rdx, r8, addr; } smp[FC_SAMPLES];
@@ -3372,6 +3682,7 @@ wx_done: ;
                                     fc[fi].lo = fc[fi].hi = (unsigned long long)fault_addr;
                                     fc[fi].prev = (unsigned long long)fault_addr;
                                     fc[fi].restarts = 0; fc[fi].stride = 0; fc[fi].nset = 0;
+                                    fc[fi].run = 0;
                                 } else {
                                     unsigned long long a = (unsigned long long)fault_addr;
                                     if (a < fc[fi].lo) fc[fi].lo = a;
@@ -3380,10 +3691,32 @@ wx_done: ;
                                         unsigned long long d = a - fc[fi].prev;
                                         if (d <= 64 && (!fc[fi].stride || d == fc[fi].stride))
                                             fc[fi].stride = d;
+                                        /* ml760: a RUN is the evidence a window needs -- a
+                                         * single matching step is noise, IOS_SB_RUN of them
+                                         * in a row is a bulk copy in progress. */
+                                        if (fc[fi].stride && d == fc[fi].stride) fc[fi].run++;
+                                        else fc[fi].run = 0;
                                     } else if (a + 0x10000 < fc[fi].prev) {
                                         fc[fi].restarts++;   /* big backward jump */
+                                        fc[fi].run = 0;
+                                    } else {
+                                        fc[fi].run = 0;
                                     }
                                     fc[fi].prev = a;
+                                }
+
+                                /* ml760: arm a STORE-BATCH write window. The detector above
+                                 * is the only cost this adds to the ordinary fault path; the
+                                 * mprotect happens once per window, not once per store. On
+                                 * success the run counter is reset so the NEXT window is only
+                                 * opened after the copy has walked out of this one and taken
+                                 * IOS_SB_RUN fresh faults beyond it. */
+                                if (fc[fi].run >= (unsigned)IOS_SB_RUN) {
+                                    if (ios_sb_try_open( (unsigned long long)fault_addr,
+                                                         (unsigned long long)rw_addr,
+                                                         fc[fi].stride,
+                                                         (unsigned long long)fault_pc ))
+                                        fc[fi].run = 0;
                                 }
                                 /* ml726: SAMPLE THE CALL FRAME AND ARGUMENTS.
                                  *
