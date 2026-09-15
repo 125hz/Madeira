@@ -453,8 +453,27 @@ void winios_pWindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 #define MOUSEEVENTF_LEFTUP      0x0004
 #define MOUSEEVENTF_RIGHTDOWN   0x0008
 #define MOUSEEVENTF_RIGHTUP     0x0010
+/* ml663: a real mouse has five buttons and two wheels. These flags were never
+ * reproduced here because a touchscreen cannot produce them; a Bluetooth mouse
+ * can, and winios_drv_post_mouse passes dwFlags/mouseData straight through to
+ * send_hardware_message, so nothing else has to change to carry them. */
+#define MOUSEEVENTF_MIDDLEDOWN  0x0020
+#define MOUSEEVENTF_MIDDLEUP    0x0040
+#define MOUSEEVENTF_XDOWN       0x0080
+#define MOUSEEVENTF_XUP         0x0100
 #define MOUSEEVENTF_WHEEL       0x0800
+#define MOUSEEVENTF_HWHEEL      0x1000
 #define MOUSEEVENTF_ABSOLUTE    0x8000
+#define WINIOS_XBUTTON1         0x0001
+#define WINIOS_XBUTTON2         0x0002
+/* ml663 — KEYEVENTF_EXTENDEDKEY, for the callers that must say so themselves.
+ * driver_ios.c derives the scan code from the VK and sets this flag whenever
+ * MAPVK_VK_TO_VSC_EX returns an 0xE0xx code (arrows, nav cluster, right
+ * ctrl/alt, numpad divide) — so nearly every extended key is already correct
+ * without the app's help. The exceptions are the keys that SHARE a virtual-key
+ * with a non-extended twin and can only be told apart by the flag: numpad
+ * Enter (VK_RETURN + E0) is the one a keyboard actually produces. */
+#define KEYEVENTF_EXTENDEDKEY   0x0001
 
 extern void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_data, void *hwnd);
 extern void winios_drv_post_key(unsigned short vk, unsigned int flags);
@@ -521,7 +540,12 @@ static struct {
     unsigned int dropped_move, dropped_trans;
     unsigned int keys_down;            /* driver-side held-key count */
     unsigned int keydown_mask[8];      /* 256 vk bits: which are held */
-    unsigned int btn_mask;             /* bit0 = left held, bit1 = right held */
+    /* ml663: bit0 left, bit1 right, bit2 middle, bit3 X1, bit4 X2. The three
+     * new bits exist for exactly one reason — winios_release_all_keys() below
+     * is the valve that un-sticks a button when the app loses the event that
+     * would have released it, and a button it does not track is a button it
+     * cannot un-stick. */
+    unsigned int btn_mask;
 } g_input_q = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
 static inline int winios_ev_is_pure_move(const winios_input_event_t *e) {
@@ -668,6 +692,17 @@ static void winios_q_report(unsigned int depth) {
     fflush(stderr);
 }
 
+/* ml665 — the same two counters winios_q_report prints, but readable on
+ * demand so the app can attribute them to a measurement window of its own.
+ * Takes the ring lock; called once per 10 s window from the mouse queue, so
+ * the cost is not on any hot path. */
+void winios_q_stats(unsigned int *pushed, unsigned int *coalesced) {
+    pthread_mutex_lock(&g_input_q.lock);
+    if (pushed)    *pushed    = g_input_q.pushed;
+    if (coalesced) *coalesced = g_input_q.coalesced;
+    pthread_mutex_unlock(&g_input_q.lock);
+}
+
 /* Public C entry points for Swift / UIKit gesture handlers.
  * Coordinates are in iOS view-local pixels; we scale to a fixed
  * 1024×768 logical surface inside winios_pProcessEvents to match
@@ -692,10 +727,29 @@ void winios_post_touch_up(int x, int y) {
 
 /* Key press bridge. vk = Windows virtual-key code, down = 1 for press,
  * 0 for release. Queued like mouse events; drained in pProcessEvents. */
-void winios_post_key(int vk, int down) {
-    fprintf(stderr, "[winios] post_key vk=0x%x down=%d\n", vk, down); fflush(stderr);
-    winios_q_push_ev(WINIOS_EV_KEY, vk, 0, down ? 0 : KEYEVENTF_KEYUP, 0);
+/* ml663 — the general form. extra carries KEYEVENTF_* bits the CALLER knows and
+ * the driver cannot derive: in practice only KEYEVENTF_EXTENDEDKEY, and only for
+ * a key whose virtual-key code is shared with a non-extended twin (numpad Enter
+ * vs Enter). driver_ios.c ORs its own MapVirtualKey-derived extended bit on top,
+ * so passing 0 leaves every other extended key exactly as it behaves today.
+ *
+ * No driver change is required for this: winios_drv_post_key already takes the
+ * queued flags as its starting value rather than rebuilding them. */
+void winios_post_key_ex(int vk, int down, unsigned int extra) {
+    /* A hardware keyboard makes this a hot path in a way ten fingers never
+     * could (held WASD + a chord + autorepeat-free down/up pairs). Log the first
+     * few and then one in 64 — the drain and drv_post_key log the same events
+     * with the same thinning, so a transition is still traceable end to end. */
+    static unsigned cnt;
+    if (cnt++ < 16 || (cnt & 0x3f) == 0) {
+        fprintf(stderr, "[winios] post_key vk=0x%x down=%d extra=0x%x (n=%u)\n",
+                vk, down, extra, cnt);
+        fflush(stderr);
+    }
+    winios_q_push_ev(WINIOS_EV_KEY, vk, 0, (down ? 0 : KEYEVENTF_KEYUP) | extra, 0);
 }
+
+void winios_post_key(int vk, int down) { winios_post_key_ex(vk, down, 0); }
 
 BOOL winios_pProcessEvents(DWORD mask) {
     static unsigned int cnt;
@@ -737,10 +791,17 @@ BOOL winios_pProcessEvents(DWORD mask) {
                 if (*w & b) { *w &= ~b; if (g_input_q.keys_down) g_input_q.keys_down--; }
             } else if (!(*w & b)) { *w |= b; g_input_q.keys_down++; }
         } else if (e.type == WINIOS_EV_MOUSE) {
-            if (e.flags & MOUSEEVENTF_LEFTDOWN)  g_input_q.btn_mask |= 1u;
-            if (e.flags & MOUSEEVENTF_LEFTUP)    g_input_q.btn_mask &= ~1u;
-            if (e.flags & MOUSEEVENTF_RIGHTDOWN) g_input_q.btn_mask |= 2u;
-            if (e.flags & MOUSEEVENTF_RIGHTUP)   g_input_q.btn_mask &= ~2u;
+            if (e.flags & MOUSEEVENTF_LEFTDOWN)   g_input_q.btn_mask |= 1u;
+            if (e.flags & MOUSEEVENTF_LEFTUP)     g_input_q.btn_mask &= ~1u;
+            if (e.flags & MOUSEEVENTF_RIGHTDOWN)  g_input_q.btn_mask |= 2u;
+            if (e.flags & MOUSEEVENTF_RIGHTUP)    g_input_q.btn_mask &= ~2u;
+            if (e.flags & MOUSEEVENTF_MIDDLEDOWN) g_input_q.btn_mask |= 4u;
+            if (e.flags & MOUSEEVENTF_MIDDLEUP)   g_input_q.btn_mask &= ~4u;
+            /* X1/X2 share one flag pair and are told apart by mouseData. */
+            if (e.flags & MOUSEEVENTF_XDOWN)
+                g_input_q.btn_mask |= (e.data & WINIOS_XBUTTON2) ? 16u : 8u;
+            if (e.flags & MOUSEEVENTF_XUP)
+                g_input_q.btn_mask &= ~((e.data & WINIOS_XBUTTON2) ? 16u : 8u);
         }
         pthread_mutex_unlock(&g_input_q.lock);
 
@@ -793,8 +854,11 @@ void winios_release_all_keys(void) {
     fflush(stderr);
     for (i = 0; i < n; i++)
         winios_q_push_ev(WINIOS_EV_KEY, (int)vks[i], 0, KEYEVENTF_KEYUP, 0);
-    if (btns & 1u) winios_q_push_ev(WINIOS_EV_MOUSE, 0, 0, MOUSEEVENTF_LEFTUP, 0);
-    if (btns & 2u) winios_q_push_ev(WINIOS_EV_MOUSE, 0, 0, MOUSEEVENTF_RIGHTUP, 0);
+    if (btns & 1u)  winios_q_push_ev(WINIOS_EV_MOUSE, 0, 0, MOUSEEVENTF_LEFTUP, 0);
+    if (btns & 2u)  winios_q_push_ev(WINIOS_EV_MOUSE, 0, 0, MOUSEEVENTF_RIGHTUP, 0);
+    if (btns & 4u)  winios_q_push_ev(WINIOS_EV_MOUSE, 0, 0, MOUSEEVENTF_MIDDLEUP, 0);
+    if (btns & 8u)  winios_q_push_ev(WINIOS_EV_MOUSE, 0, 0, MOUSEEVENTF_XUP, WINIOS_XBUTTON1);
+    if (btns & 16u) winios_q_push_ev(WINIOS_EV_MOUSE, 0, 0, MOUSEEVENTF_XUP, WINIOS_XBUTTON2);
 }
 
 /* ml661 — what the driver believes is held, for the app's [input] line. Bit i
@@ -1540,6 +1604,43 @@ void winios_cursor_show(int show) {
 
 /* Swift trackpad engine → wine. Absolute desktop-pixel coords; the
  * engine owns the cursor position. */
+/* ml663 — advance the DRAWN cursor by a relative delta, clamped to the wine
+ * desktop. Mirrors what the wineserver does with the same event
+ * (update_desktop_cursor_pos: x = cursor.x + input->mouse.x, then clamp), so the
+ * arrow on screen and wine's own cursor stay at the same place.
+ *
+ * Deliberately NOT a second source of truth: it moves nothing in wine, it only
+ * draws. If the two ever drift, the next absolute event (or wine's own
+ * SetCursorPos reaching winios_cursor_move) snaps this back. */
+static void winios_cursor_advance(int dx, int dy) {
+    if (!dx && !dy) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        winios_ensure_compositor();
+        if (!g_compositor_view) return;
+        winios_ensure_cursor_layer();
+        const char *dw = getenv("MADEIRA_SCREEN_W"), *dh = getenv("MADEIRA_SCREEN_H");
+        int desk_w = dw ? atoi(dw) : 1024, desk_h = dh ? atoi(dh) : 768;
+        if (desk_w <= 0) desk_w = 1024;
+        if (desk_h <= 0) desk_h = 768;
+        CGFloat x = g_cursor_pos_px.x + dx, y = g_cursor_pos_px.y + dy;
+        if (x < 0) x = 0; else if (x > desk_w - 1) x = desk_w - 1;
+        if (y < 0) y = 0; else if (y > desk_h - 1) y = desk_h - 1;
+        g_cursor_pos_px = CGPointMake(x, y);
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        winios_cursor_place();
+        [CATransaction commit];
+    });
+}
+
+/* ml663 — set by the app while a hardware mouse is driving relative motion.
+ * The aim stick and the touch mouse-look path leave it off: in those modes the
+ * game has hidden the cursor and the extra main-queue hop per sample is pure
+ * cost (see the ml641 note below). A real mouse in a menu is the opposite case —
+ * there IS a visible arrow and it has to follow the hand. */
+static _Atomic int g_rel_cursor;
+void winios_cursor_track_relative(int on) { g_rel_cursor = on ? 1 : 0; }
+
 void winios_pointer(int x, int y, unsigned int flags, unsigned int data) {
     winios_q_push_ev(WINIOS_EV_MOUSE, x, y, flags, data);
     /* ml641: ONLY an ABSOLUTE move carries a position. A relative move carries a
@@ -1547,7 +1648,10 @@ void winios_pointer(int x, int y, unsigned int flags, unsigned int data) {
      * top-left corner on every event. Relative mode is mouse-look, where the game
      * has hidden the cursor anyway — there is nothing to draw, and skipping this
      * also drops a dispatch_async to the main queue per touch sample. */
-    if ((flags & MOUSEEVENTF_MOVE) && (flags & MOUSEEVENTF_ABSOLUTE)) winios_cursor_move(x, y);
+    if (flags & MOUSEEVENTF_MOVE) {
+        if (flags & MOUSEEVENTF_ABSOLUTE) winios_cursor_move(x, y);
+        else if (g_rel_cursor) winios_cursor_advance(x, y);
+    }
 }
 
 /* ============================================================ *

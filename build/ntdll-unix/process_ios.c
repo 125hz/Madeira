@@ -2342,6 +2342,18 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
             for (i = base; i < len && n < sizeof(name) - 1; i++) name[n++] = (char)path[i];
             name[n] = 0;
             ERR( "MADEIRA-EXIT: %s status=%d\n", n ? name : "?", (int)exit_code );
+            /* ml962: the [srv-stats] report is piggy-backed on the 10 s
+             * deadline being crossed at the end of some server call, so a run
+             * that dies before the first window -- which is every crash worth
+             * diagnosing -- produced no counters at all.  This is the one
+             * chokepoint each pseudo-process's own exit passes exactly once,
+             * so dump the window here too: per-kind traffic, the Nt* entry
+             * points, the select breakdown and the fastsync hit/miss and
+             * cache-learn lines. */
+            {
+                extern void ios_srv_stats_report_now(void);
+                ios_srv_stats_report_now();
+            }
             /* Unbuffered duplicate: ERR goes through the debug channel, which a
              * muted err: channel or a dying log pump can swallow.  Everything
              * below is the teardown that used to end the log (and the app), so

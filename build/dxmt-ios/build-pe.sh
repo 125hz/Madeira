@@ -57,7 +57,51 @@ for arg in "$@"; do
     esac
 done
 [ ${#arches[@]} -gt 0 ] || arches=(i386)
-[ ${#install_set[@]} -gt 0 ] || install_set=(winemetal.dll d3d9.dll)
+[ ${#install_set[@]} -gt 0 ] || install_set=(winemetal.dll d3d9.dll d3d9-emulated.dll d3d9shim.dll)
+
+# MADEIRA (WOW64_DESIGN.md section 8.5): the i386 shim (built as d3d9shim.dll,
+# since two meson targets cannot both be called d3d9) is now bound to its unix
+# side -- virtual_ios.c's load_builtin_unixlib() has a `d3d9shim` branch that
+# hands it dxmt_d3d9_unix_call_{,wow64_}funcs -- so it SHIPS as d3d9.dll and
+# the emulated DXMT frontend ships beside it as d3d9-emulated.dll.
+#
+# Installing the shim as d3d9.dll is NOT the same thing as turning the native
+# frontend on. With no knob set, the shim's DllMain forwards all ten exports
+# to d3d9-emulated.dll (d3d9shim_main.c read_mode/forwarding), so the default
+# path is byte for byte the frontend section 6 measured and log 41 ran at
+# 30-40 fps -- the shim adds one LoadLibrary and a GetProcAddress per export,
+# once. The native ARM64 frontend is opt-in, per session, with
+# Documents/madeira-d3d9.txt = `native` (ContentView exports it as
+# MADEIRA_D3D9), which is what makes the A/B of section 8.8-4 a one-file
+# change on device rather than a reinstall.
+#
+# Set MADEIRA_D3D9_DEFAULT=emulated to go back to the previous mapping (the
+# emulated build installed as BOTH d3d9.dll and d3d9-emulated.dll, the shim
+# only as d3d9shim.dll, where nothing loads it) for a bisect. --install
+# matches the INSTALLED name, so `--install d3d9.dll` always ships whichever
+# module is currently mapped to that name.
+MADEIRA_D3D9_DEFAULT="${MADEIRA_D3D9_DEFAULT:-shim}"
+install_as() {
+    if [ "$2" = i386 ]; then
+        case "$1" in
+            d3d9shim.dll)
+                if [ "$MADEIRA_D3D9_DEFAULT" = shim ]; then
+                    echo "d3d9.dll d3d9shim.dll"
+                else
+                    echo "d3d9shim.dll"
+                fi
+                return ;;
+            d3d9.dll)
+                if [ "$MADEIRA_D3D9_DEFAULT" = shim ]; then
+                    echo "d3d9-emulated.dll"
+                else
+                    echo "d3d9.dll d3d9-emulated.dll"
+                fi
+                return ;;
+        esac
+    fi
+    echo "$1"
+}
 
 # MADEIRA (WOW64_DESIGN.md section 8.4): meson's default buildtype is `debug`,
 # which means every PE module this stage has ever produced -- including the
@@ -263,16 +307,30 @@ EOF
     while IFS= read -r dll; do
         found=1
         base="$(basename "$dll")"
-        if should_install "$base"; then
-            "$MINGW_BIN/$triple-strip" -o "$dest/$base" "$dll"
-            shown="$dest/$base"
-            mark="-> app/Madeira/$install_dir/"
-            installed=$((installed + 1))
-        else
-            shown="$dll"
+        # install_as may return more than one space-separated target name
+        # (the emulated d3d9 frontend installs as both d3d9.dll and
+        # d3d9-emulated.dll by default -- see install_as above).
+        read -r -a targets_for_dll <<< "$(install_as "$base" "$arch")"
+        shown="$dll"
+        marks=()
+        for target in "${targets_for_dll[@]}"; do
+            if should_install "$target" || should_install "$base"; then
+                "$MINGW_BIN/$triple-strip" -o "$dest/$target" "$dll"
+                shown="$dest/$target"
+                if [ "$target" = "$base" ]; then
+                    marks+=("-> app/Madeira/$install_dir/")
+                else
+                    marks+=("-> app/Madeira/$install_dir/$target")
+                fi
+                installed=$((installed + 1))
+            fi
+        done
+        if [ ${#marks[@]} -eq 0 ]; then
             mark="(built, not installed)"
+        else
+            mark="$(IFS=', '; echo "${marks[*]}")"
         fi
-        printf "    %-16s %10s bytes  " "$base" "$(wc -c < "$shown" | tr -d ' ')"
+        printf "    %-18s %10s bytes  " "$base" "$(wc -c < "$shown" | tr -d ' ')"
         printf "%s  " "$("$MINGW_BIN/llvm-readobj" --file-headers "$shown" \
             | sed -n 's/^  Machine: .*(\(0x[0-9A-Fa-f]*\))/Machine \1/p' | head -1)"
         echo "$mark"

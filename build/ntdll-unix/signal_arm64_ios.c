@@ -12342,20 +12342,21 @@ static int ios_prof_image_opaque( uint64_t pc )
  * per report window.  The self-measured cost line is still the contract.
  * ==========================================================================*/
 
-/* Byte-for-byte mirror of FEXCore::IosProfMap::Block. */
+/* Byte-for-byte mirror of FEXCore::IosProfMap::Block (v2: n_mem/n_atomic). */
 struct ios_profblk
 {
     unsigned long long host_start;
     unsigned int       host_size;
     unsigned int       guest_rip;
-    unsigned short     n_inst, n_x87, n_vec, n_tso;
+    unsigned short     n_inst, n_x87, n_vec, n_tso, n_mem, n_atomic;
+    unsigned int       reserved0;
 };
 
 /* Byte-for-byte mirror of FEXCore::IosProfMap::Header.  std::atomic<uintN_t> is
  * layout-compatible with uintN_t, which is what makes this legal to mirror in C.
  * If either side changes, the magic/version check below is what catches it. */
 #define IOS_PROFMAP_MAGIC    0x314d5049u
-#define IOS_PROFMAP_VERSION  1u
+#define IOS_PROFMAP_VERSION  2u
 #define IOS_PROFMAP_DISPMAX  64
 
 struct ios_profmap_disp { unsigned long long begin; char name[24]; };
@@ -12371,6 +12372,7 @@ struct ios_profmap_hdr
     unsigned int       n_disp, _pad0;
     unsigned long long x87_ops, vec_ops, atomic_ops, tso_ops;
     unsigned long long guest_insts, host_bytes, blocks, alloc_failed;
+    unsigned long long mem_ops;                  /* v2 */
     struct ios_profmap_disp disp[IOS_PROFMAP_DISPMAX];
 };
 
@@ -12399,13 +12401,65 @@ static int ios_prof_read( unsigned long long addr, void *buf, size_t len )
  * Retried every report window until it succeeds, never latched on failure (the
  * ml612 rule: a module that is not mapped yet must not disable a facility for the
  * lifetime of the process). */
+/* Ask the CPU module to record: ONE word, and never a store through a raw
+ * pointer.  Factored out of the attach because ml960 has to be able to re-arm a
+ * header that came back ZEROED -- see ios_profmap_rearm_if_reset(). */
+static int ios_profmap_set_enable( unsigned long long hdr_addr )
+{
+    extern unsigned long long ios_prof_pool_rw_alias( unsigned long long addr );
+    unsigned long long slot_addr = hdr_addr + offsetof(struct ios_profmap_hdr, enable);
+    unsigned int one = 1, back = 0;
+    int ok;
+
+    /* The header lives in the CPU module's data, and for a pool-copied module
+     * that data's only mapping in the executing namespace is RX -- storing there
+     * is a protection fault, not a bug.  RX and RW are two mappings of one vm
+     * object, so the fallback writes the same word through the pool's RW alias.
+     * The result is verified by reading `enable` back, because an enable that
+     * did not stick looks exactly like "FEX compiled nothing". */
+    mach_vm_write( mach_task_self(), (mach_vm_address_t)slot_addr,
+                   (vm_offset_t)&one, sizeof(one) );
+    ok = ios_prof_read( slot_addr, &back, sizeof(back) ) && back == 1;
+    if (!ok)
+    {
+        unsigned long long rw = ios_prof_pool_rw_alias( slot_addr );
+        if (rw)
+        {
+            mach_vm_write( mach_task_self(), (mach_vm_address_t)rw,
+                           (vm_offset_t)&one, sizeof(one) );
+            ok = ios_prof_read( slot_addr, &back, sizeof(back) ) && back == 1;
+        }
+    }
+    return ok;
+}
+
 static void ios_profmap_attach(void)
 {
     unsigned long long hdr_addr = 0;
     struct ios_profmap_hdr h;
     void *slot;
 
-    if (ios_profmap_live) return;
+    if (ios_profmap_live)
+    {
+        /* ml960: THE PUBLISHED HEADER CAN MOVE, and a latched attach cannot see
+         * it.  Several 32-bit pseudo-processes share this Mach task and each
+         * gets its own pool copy of the CPU module, so the address behind
+         * BTCpuIosProfMap is not a constant for the life of the process.  When
+         * it changes, everything the old header says freezes at its last value
+         * -- which is exactly the shape of the ml930 symptom (`ring N blocks`
+         * and every emission delta pinned at 0 while [fex-stats] kept counting
+         * compiles).  One export read per REPORT WINDOW closes that. */
+        unsigned long long cur = 0;
+        void *slot2 = ios_prof_find_fex_export( "BTCpuIosProfMap" );
+        if (!slot2) return;
+        if (!ios_prof_read( (unsigned long long)(uintptr_t)slot2, &cur, sizeof(cur) )) return;
+        if (!cur || cur == ios_profmap_addr) return;
+        fprintf(stderr, "[prof] ml960 block map MOVED 0x%llx -> 0x%llx — re-attaching "
+                        "(a different CPU-module copy is publishing; the old header is why "
+                        "the emission counters froze)\n", ios_profmap_addr, cur);
+        ios_profmap_live = 0;
+        ios_profmap_addr = 0;
+    }
     if (!(slot = ios_prof_find_fex_export( "BTCpuIosProfMap" ))) return;
     if (!ios_prof_read( (unsigned long long)(uintptr_t)slot, &hdr_addr, sizeof(hdr_addr) )) return;
     if (!hdr_addr) return;
@@ -12425,41 +12479,52 @@ static void ios_profmap_attach(void)
     ios_profmap = h;
     ios_profmap_live = 1;
 
-    /* Ask for recording: ONE word, and never a store through a raw pointer.
-     *
-     * The header lives in the CPU module's data, and for a pool-copied module
-     * that data's only mapping in the executing namespace is RX -- storing there
-     * is a protection fault, not a bug.  RX and RW are two mappings of one vm
-     * object, so the fallback writes the same word through the pool's RW alias.
-     * The result is verified by reading `enable` back, and the outcome is logged
-     * either way: an enable that did not stick would otherwise look exactly like
-     * "FEX compiled nothing", which is the kind of silent nothing this whole
-     * round exists to stop producing. */
+    /* Ask for recording. The outcome is logged either way: an enable that did
+     * not stick would otherwise look exactly like "FEX compiled nothing", which
+     * is the kind of silent nothing this whole round exists to stop producing. */
     {
-        extern unsigned long long ios_prof_pool_rw_alias( unsigned long long addr );
-        unsigned long long slot_addr = hdr_addr + offsetof(struct ios_profmap_hdr, enable);
-        unsigned int one = 1, back = 0;
-        int ok;
-
-        mach_vm_write( mach_task_self(), (mach_vm_address_t)slot_addr,
-                       (vm_offset_t)&one, sizeof(one) );
-        ok = ios_prof_read( slot_addr, &back, sizeof(back) ) && back == 1;
-        if (!ok)
-        {
-            unsigned long long rw = ios_prof_pool_rw_alias( slot_addr );
-            if (rw)
-            {
-                mach_vm_write( mach_task_self(), (mach_vm_address_t)rw,
-                               (vm_offset_t)&one, sizeof(one) );
-                ok = ios_prof_read( slot_addr, &back, sizeof(back) ) && back == 1;
-            }
-        }
-        fprintf(stderr, "[prof] ml930 block map ATTACHED hdr=0x%llx B=0x%llx bitness=%u "
+        int ok = ios_profmap_set_enable( hdr_addr );
+        fprintf(stderr, "[prof] ml960 block map ATTACHED hdr=0x%llx abi v%u entry=%uB B=0x%llx bitness=%u "
                         "dispatcher=[0x%llx,0x%llx) regions=%u — enable=%s\n",
-                hdr_addr, ios_profmap.guest_base, ios_profmap.bitness,
+                hdr_addr, ios_profmap.version, ios_profmap.entry_size,
+                ios_profmap.guest_base, ios_profmap.bitness,
                 ios_profmap.disp_begin, ios_profmap.disp_end, ios_profmap.n_disp,
                 ok ? "SET (FEX will record)" : "REFUSED — JIT samples stay unattributed");
     }
+}
+
+/* ml960: THE HEADER CAN BE RESET UNDER US.
+ *
+ * `enable` is the whole handshake and it lives in the CPU module's .data, which
+ * a re-map of that module's pool copy re-initialises from the file image --
+ * every accumulator back to zero, `entries` back to NULL, `enable` back to 0.
+ * FEX then stops recording (Enabled() sees a null ring), the ring pointer the
+ * sampler holds still points at the OLD, still-mapped ring, and the join keeps
+ * resolving the hot blocks that were compiled before the reset. The result is
+ * precisely the ml930 symptom: correct `jit by module` attribution next to
+ * emission counters pinned at zero.
+ *
+ * So check the handshake every window instead of trusting it once: if `enable`
+ * came back 0, or the ring pointer is gone, or `head` went BACKWARDS, re-arm and
+ * say so. One 4-byte read per window when healthy. */
+static void ios_profmap_rearm_if_reset( unsigned long long prev_head )
+{
+    unsigned int back = 0;
+    int reset;
+
+    if (!ios_profmap_live || !ios_profmap_addr) return;
+    if (!ios_prof_read( ios_profmap_addr + offsetof(struct ios_profmap_hdr, enable),
+                        &back, sizeof(back) ))
+        return;
+
+    reset = (back != 1) || !ios_profmap.entries || ios_profmap.head < prev_head;
+    if (!reset) return;
+
+    fprintf(stderr, "[prof] ml960 block map WAS RESET (enable=%u entries=0x%llx head=%llu prev=%llu) — "
+                    "the CPU module's data was re-initialised under us; re-arming. Every emission "
+                    "count since the reset was lost, not zero.\n",
+            back, ios_profmap.entries, ios_profmap.head, prev_head);
+    (void)ios_profmap_set_enable( ios_profmap_addr );
 }
 
 /* ---------------------------------------------------------------------------
@@ -12726,8 +12791,88 @@ static struct { uint64_t kpc, cpc; unsigned long n; } ios_prof_kc[IOS_PROF_KC_MA
  * up last window's resolution for a recycled slot. */
 struct ios_prof_pcsort { uint64_t pc; int slot; };
 static struct ios_prof_pcsort ios_prof_sorted[IOS_PROF_PC_MAX];
-static struct { uint64_t rip; unsigned long n; unsigned x87; } ios_prof_jitpc[IOS_PROF_PC_MAX];
+/* ml960: the JOIN RESULT, widened from "which RIP and did it have x87" to the
+ * whole block record.  The block dumps, the module histogram, the x87 line and
+ * the new tso/mem line are all views of this one table, so the ring is still
+ * streamed exactly once per window. */
+static struct { uint64_t rip, host_start; unsigned long n; unsigned int host_size;
+                unsigned short n_inst, n_x87, n_vec, n_tso, n_mem; } ios_prof_jitpc[IOS_PROF_PC_MAX];
 static int ios_prof_nsort;
+
+/* ml960: WHICH THREAD PAYS THE SYSCALL.  ios_prof_kc answers "who called read()";
+ * this answers "on which thread", which is the question that separates a render
+ * thread stalling on a server round trip from a pump thread doing its job.  Kept
+ * as a second table so the existing kern line's aggregation is unchanged and the
+ * hot loop pays one more open-addressed probe, not a wider key everywhere. */
+#define IOS_PROF_KCT_MAX 512
+static struct { uint64_t kpc, cpc; unsigned short ti; unsigned long n; } ios_prof_kct[IOS_PROF_KCT_MAX];
+
+/* ml960: hot-block dump bookkeeping.  One dump per distinct block host start for
+ * the whole session (a block that stays hot is dumped once, not every 10 s), and
+ * a hard session cap so a pathological workload cannot turn the log into a
+ * disassembly listing. */
+#define IOS_PROF_DUMP_MAX 64
+static unsigned long long ios_prof_dumped[IOS_PROF_DUMP_MAX];
+static int ios_prof_ndumped;
+
+static int ios_prof_dump_claim( unsigned long long host_start )
+{
+    int i;
+    if (!host_start) return 0;
+    for (i = 0; i < ios_prof_ndumped; i++) if (ios_prof_dumped[i] == host_start) return 0;
+    if (ios_prof_ndumped >= IOS_PROF_DUMP_MAX) return 0;
+    ios_prof_dumped[ios_prof_ndumped++] = host_start;
+    return ios_prof_ndumped;                 /* 1-based block number */
+}
+
+/* Read up to `want` bytes, NEVER faulting: mach_vm_read_overwrite reports an
+ * unreadable range as an error instead of delivering a signal, so the only work
+ * here is finding the largest prefix that IS readable.  Tries the whole request,
+ * then the remainder of the containing 16 KB page (the usual reason a request
+ * fails is that it runs off the end of a mapping), then halves. */
+static unsigned ios_prof_read_upto( unsigned long long addr, void *buf, unsigned want )
+{
+    unsigned n, pagelim;
+    if (!addr || !want) return 0;
+    if (ios_prof_read( addr, buf, want )) return want;
+    pagelim = 0x4000u - (unsigned)(addr & 0x3fffu);
+    if (pagelim && pagelim < want && ios_prof_read( addr, buf, pagelim )) return pagelim;
+    for (n = want / 2; n >= 8; n /= 2)
+        if (ios_prof_read( addr, buf, n )) return n;
+    return 0;
+}
+
+/* A window delta over a monotonic accumulator.  Returns 0 rather than a
+ * 2^64-sized number when the counter went BACKWARDS, which means the header was
+ * reset under us -- ios_profmap_rearm_if_reset() names that case on its own
+ * line, and a garbage delta next to it would just be noise. */
+static unsigned long long ios_prof_delta( unsigned long long cur, unsigned long long prev )
+{
+    return cur >= prev ? cur - prev : 0;
+}
+
+/* 8-byte groups, 64 bytes (=135 chars) per line so a line with the `[prof]     `
+ * prefix stays under 160 columns.  Consecutive lines continue the previous one;
+ * the dump header states the start address and the length of each stream. */
+static void ios_prof_hexdump( const char *tag, const unsigned char *p, unsigned len )
+{
+    unsigned off = 0;
+    while (off < len)
+    {
+        char line[200];
+        unsigned chunk = len - off, i;
+        int n = 0;
+        if (chunk > 64) chunk = 64;
+        for (i = 0; i < chunk; i++)
+        {
+            if (i && !(i & 7)) line[n++] = ' ';
+            n += snprintf( line + n, sizeof(line) - n, "%02x", p[off + i] );
+        }
+        line[n] = 0;
+        fprintf(stderr, "[prof]     %s: %s\n", tag, line);
+        off += chunk;
+    }
+}
 
 static void *ios_prof_thread( void *arg )
 {
@@ -12769,6 +12914,7 @@ static void *ios_prof_thread( void *arg )
     memset( pe, 0, sizeof(pe) );
     memset( ios_prof_hot, 0, sizeof(ios_prof_hot) );
     memset( ios_prof_kc, 0, sizeof(ios_prof_kc) );
+    memset( ios_prof_kct, 0, sizeof(ios_prof_kct) );
     ios_prof_build_images();
     ios_prof_refresh_threads( self );
     gettimeofday( &t0, NULL );
@@ -12904,6 +13050,18 @@ static void *ios_prof_thread( void *arg )
                         if (ios_prof_kc[s].kpc == pc && ios_prof_kc[s].cpc == caller)
                         { ios_prof_kc[s].n++; break; }
                     }
+                    /* ml960: the same (syscall, caller) pair, split by THREAD. */
+                    kh = (int)(((pc >> 2) ^ (caller >> 2) ^ ((uint64_t)i << 7)) % IOS_PROF_KCT_MAX);
+                    for (probe = 0; probe < 8; probe++)
+                    {
+                        int s = (kh + probe) % IOS_PROF_KCT_MAX;
+                        if (!ios_prof_kct[s].n) { ios_prof_kct[s].kpc = pc; ios_prof_kct[s].cpc = caller;
+                                                  ios_prof_kct[s].ti = (unsigned short)i;
+                                                  ios_prof_kct[s].n = 1; break; }
+                        if (ios_prof_kct[s].kpc == pc && ios_prof_kct[s].cpc == caller &&
+                            ios_prof_kct[s].ti == (unsigned short)i)
+                        { ios_prof_kct[s].n++; break; }
+                    }
                 }
             }
         }
@@ -12992,15 +13150,30 @@ static void *ios_prof_thread( void *arg )
             {
                 struct ios_profmap_hdr h0;
                 if (ios_prof_read( ios_profmap_addr, &h0, sizeof(h0) )) ios_profmap = h0;
+                else fprintf(stderr, "[prof]   block map header at 0x%llx UNREADABLE this window — "
+                                     "every map-derived number below is last window's\n", ios_profmap_addr);
             }
-            if (ios_profmap_live && bucket[PRB_JIT])
+            /* ml960: this block used to be gated on bucket[PRB_JIT]. It is not any
+             * more, because the EMISSION counters are about what the codegen is
+             * producing, which is a question a window with no JIT samples can still
+             * answer (and the window in which recording silently stopped is exactly
+             * the window whose report mattered). Everything that divides by a sample
+             * count is guarded individually instead. */
+            if (ios_profmap_live)
             {
                 unsigned long long B;
                 int s, k;
-                unsigned long jit_resolved = 0, jit_x87 = 0;
+                unsigned long jit_resolved = 0, jit_x87 = 0, jit_tso = 0;
+                double jit_tso_w = 0.0, jit_mem_w = 0.0;
                 unsigned long modn[IOS_GMOD32_MAX];
-                static unsigned long long prev_x87, prev_vec, prev_atom, prev_tso,
-                                          prev_blocks, prev_insts;
+                /* The header's own process-wide accumulators, differenced here. */
+                static unsigned long long prev_x87, prev_vec, prev_atom, prev_tso, prev_mem,
+                                          prev_blocks, prev_insts, prev_bytes;
+                static unsigned long long prev_head;
+                unsigned long long w_head = ios_profmap.head, w_new = 0;
+                unsigned long long r_inst = 0, r_x87 = 0, r_vec = 0, r_tso = 0, r_mem = 0,
+                                   r_atom = 0, r_bytes = 0, r_blocks = 0;
+                unsigned long long h_inst, h_x87, h_vec, h_tso, h_mem, h_atom, h_bytes, h_blocks;
 
                 B = ios_profmap.guest_base;
                 if (!B) B = ios_prof_wow_window();
@@ -13013,9 +13186,8 @@ static void *ios_prof_thread( void *arg )
                     {
                         ios_prof_sorted[ios_prof_nsort].pc = ios_prof_hot[s].pc;
                         ios_prof_sorted[ios_prof_nsort].slot = s;
-                        ios_prof_jitpc[ios_prof_nsort].rip = 0;
-                        ios_prof_jitpc[ios_prof_nsort].n = ~0UL;
-                        ios_prof_jitpc[ios_prof_nsort].x87 = 0;
+                        memset( &ios_prof_jitpc[ios_prof_nsort], 0, sizeof(ios_prof_jitpc[0]) );
+                        ios_prof_jitpc[ios_prof_nsort].n = ~0UL;   /* age: "no match yet" */
                         ios_prof_nsort++;
                     }
                 /* Shell sort: this reaches a couple of thousand entries and an
@@ -13030,13 +13202,16 @@ static void *ios_prof_thread( void *arg )
                         ios_prof_sorted[j2] = t;
                     }
 
-                if (ios_prof_nsort && ios_profmap.entries && ios_profmap.capacity)
+                if (ios_profmap.entries && ios_profmap.capacity)
                 {
                     struct ios_profblk buf[256];
-                    unsigned long long head = ios_profmap.head;
+                    unsigned long long head = w_head;
                     unsigned int cap = ios_profmap.capacity;
                     unsigned int total = (head < (unsigned long long)cap) ? (unsigned int)head : cap;
                     unsigned int off;
+
+                    w_new = (head >= prev_head) ? head - prev_head : 0;
+                    if (w_new > cap) w_new = cap;      /* the ring wrapped inside one window */
 
                     for (off = 0; off < total; off += 256)
                     {
@@ -13047,8 +13222,35 @@ static void *ios_prof_thread( void *arg )
                         for (j = 0; j < n; j++)
                         {
                             unsigned long long lo, hi2;
+                            unsigned long age;
                             int a, b2;
                             if (!buf[j].host_start || !buf[j].host_size) continue;
+                            age = (unsigned long)((head - 1 - (unsigned long long)(off + j)) & (cap - 1));
+                            /* ml960: THE EMISSION COUNTS, TAKEN FROM THE RING.
+                             *
+                             * The newest w_new appends ARE this window's compiles, and
+                             * `age` is already computed for the join, so this costs one
+                             * compare per entry on a scan that was happening anyway.
+                             * Why not simply difference the header's accumulators (which
+                             * is what ml930 did, and what printed x87=0 vec=0 ... over 0
+                             * blocks while [fex-stats] counted +498 compiles in the same
+                             * window): those accumulators live in the CPU module's .data,
+                             * and a header that has been reset, replaced by another pool
+                             * copy of the module, or is simply not the one the compiling
+                             * code writes, freezes at its last value -- which is
+                             * indistinguishable from "the codegen emitted nothing". The
+                             * ring is the one structure the sampler can verify for
+                             * itself, because the same entries are what resolve its JIT
+                             * samples to guest modules. Both are printed and a
+                             * disagreement is named. */
+                            if (age < w_new)
+                            {
+                                r_blocks++;
+                                r_inst += buf[j].n_inst;   r_x87  += buf[j].n_x87;
+                                r_vec  += buf[j].n_vec;    r_tso  += buf[j].n_tso;
+                                r_mem  += buf[j].n_mem;    r_atom += buf[j].n_atomic;
+                                r_bytes += buf[j].host_size;
+                            }
                             lo = buf[j].host_start;
                             hi2 = lo + buf[j].host_size;
                             /* first sorted PC >= lo */
@@ -13057,12 +13259,17 @@ static void *ios_prof_thread( void *arg )
                                              if (ios_prof_sorted[m2].pc < lo) a = m2 + 1; else b2 = m2; }
                             for (; a < ios_prof_nsort && ios_prof_sorted[a].pc < hi2; a++)
                             {
-                                unsigned long age = (unsigned long)((head - 1 - (unsigned long long)(off + j)) & (cap - 1));
                                 if (age < ios_prof_jitpc[a].n)
                                 {
                                     ios_prof_jitpc[a].n = age;
                                     ios_prof_jitpc[a].rip = buf[j].guest_rip;
-                                    ios_prof_jitpc[a].x87 = buf[j].n_x87;
+                                    ios_prof_jitpc[a].host_start = buf[j].host_start;
+                                    ios_prof_jitpc[a].host_size = buf[j].host_size;
+                                    ios_prof_jitpc[a].n_inst = buf[j].n_inst;
+                                    ios_prof_jitpc[a].n_x87 = buf[j].n_x87;
+                                    ios_prof_jitpc[a].n_vec = buf[j].n_vec;
+                                    ios_prof_jitpc[a].n_tso = buf[j].n_tso;
+                                    ios_prof_jitpc[a].n_mem = buf[j].n_mem;
                                 }
                             }
                         }
@@ -13073,13 +13280,17 @@ static void *ios_prof_thread( void *arg )
                 {
                     unsigned long n = ios_prof_hot[ios_prof_sorted[k].slot].n;
                     int m;
-                    if (!ios_prof_jitpc[k].rip) continue;
+                    if (!ios_prof_jitpc[k].host_start) continue;
                     jit_resolved += n;
-                    if (ios_prof_jitpc[k].x87) jit_x87 += n;
+                    if (ios_prof_jitpc[k].n_x87) jit_x87 += n;
+                    if (ios_prof_jitpc[k].n_tso) jit_tso += n;
+                    jit_tso_w += (double)n * (double)ios_prof_jitpc[k].n_tso;
+                    jit_mem_w += (double)n * (double)ios_prof_jitpc[k].n_mem;
                     m = ios_guest32_module_idx( B, ios_prof_jitpc[k].rip );
                     if (m >= 0) modn[m] += n;
                 }
 
+                if (bucket[PRB_JIT] && cpu_obs)
                 {
                     char line[512];
                     int len = 0, rank;
@@ -13101,22 +13312,220 @@ static void *ios_prof_thread( void *arg )
                             100.0 * bucket[PRB_JITDISP] / cpu_obs,
                             (unsigned long long)ios_profmap.head, ios_profmap.capacity,
                             (ios_profmap.head > ios_profmap.capacity) ? " WRAPPED" : "");
+
+                    /* The X87ReducedPrecision question, answered by SAMPLES rather
+                     * than by compile counts: what share of the JIT time is spent in
+                     * blocks that contain at least one x87 op. */
+                    fprintf(stderr, "[prof]   jit x87: %.1f%% of jit samples are in blocks containing x87\n",
+                            100.0 * jit_x87 / bucket[PRB_JIT]);
+                    /* ml960: the same question for ORDERING. tso/mem is the share of
+                     * the memory traffic the EXECUTING code performs that is emitted
+                     * as a half-barrier access -- i.e. what turning
+                     * HalfBarrierTSOEnabled off would actually be trading away,
+                     * weighted by where the machine really is rather than by what the
+                     * compiler happened to compile. */
+                    fprintf(stderr, "[prof]   jit tso: %.1f%% of jit samples are in blocks with tso ops | "
+                                    "avg tso/mem=%.2f (%.0f tso vs %.0f mem ops, sample-weighted)\n",
+                            100.0 * jit_tso / bucket[PRB_JIT],
+                            jit_mem_w > 0.0 ? jit_tso_w / jit_mem_w : 0.0, jit_tso_w, jit_mem_w);
                 }
 
-                /* The X87ReducedPrecision question, answered by SAMPLES rather
-                 * than by compile counts: what share of the JIT time is spent in
-                 * blocks that contain at least one x87 op.  The emitted-op deltas
-                 * next to it say what the codegen is producing per window. */
-                fprintf(stderr, "[prof]   jit x87: %.1f%% of jit samples are in blocks containing x87 "
-                                "| emitted this window: x87=%llu vec=%llu atomic=%llu tso=%llu "
-                                "over %llu blocks / %llu guest insts\n",
-                        bucket[PRB_JIT] ? (100.0 * jit_x87 / bucket[PRB_JIT]) : 0.0,
-                        ios_profmap.x87_ops - prev_x87, ios_profmap.vec_ops - prev_vec,
-                        ios_profmap.atomic_ops - prev_atom, ios_profmap.tso_ops - prev_tso,
-                        ios_profmap.blocks - prev_blocks, ios_profmap.guest_insts - prev_insts);
-                prev_x87 = ios_profmap.x87_ops;  prev_vec = ios_profmap.vec_ops;
+                h_x87    = ios_prof_delta( ios_profmap.x87_ops,     prev_x87 );
+                h_vec    = ios_prof_delta( ios_profmap.vec_ops,     prev_vec );
+                h_atom   = ios_prof_delta( ios_profmap.atomic_ops,  prev_atom );
+                h_tso    = ios_prof_delta( ios_profmap.tso_ops,     prev_tso );
+                h_mem    = ios_prof_delta( ios_profmap.mem_ops,     prev_mem );
+                h_blocks = ios_prof_delta( ios_profmap.blocks,      prev_blocks );
+                h_inst   = ios_prof_delta( ios_profmap.guest_insts, prev_insts );
+                h_bytes  = ios_prof_delta( ios_profmap.host_bytes,  prev_bytes );
+
+                fprintf(stderr, "[prof]   jit emit ring(+window): blocks=+%llu insts=+%llu x87=+%llu vec=+%llu "
+                                "tso=+%llu mem=+%llu atomic=+%llu hostB=+%llu | head %llu->%llu cap=%u%s\n",
+                        r_blocks, r_inst, r_x87, r_vec, r_tso, r_mem, r_atom, r_bytes,
+                        prev_head, w_head, ios_profmap.capacity,
+                        (w_head > (unsigned long long)ios_profmap.capacity) ? " WRAPPED" : "");
+                {
+                    /* The verdict exists so that "the counters are zero" can never
+                     * again mean three different things in one line. */
+                    unsigned long long diff = (h_blocks > r_blocks) ? h_blocks - r_blocks
+                                                                   : r_blocks - h_blocks;
+                    const char *verdict = "agrees with ring";
+                    if (!h_blocks && r_blocks)
+                        verdict = "HDR-STALLED: the ring advanced and the header did not — the counters "
+                                  "the CPU module increments are not the ones behind this header address";
+                    else if (h_blocks && !r_blocks)
+                        verdict = "RING-STALLED: the header counted compiles the ring did not record — "
+                                  "the ring pointer is stale or its allocation failed";
+                    else if (diff > 4 && diff * 8 > h_blocks)
+                        verdict = "SKEW: header and ring disagree by more than a window edge";
+                    fprintf(stderr, "[prof]   jit emit hdr(+window): blocks=+%llu insts=+%llu x87=+%llu vec=+%llu "
+                                    "tso=+%llu mem=+%llu atomic=+%llu hostB=+%llu | totals blocks=%llu insts=%llu "
+                                    "allocfail=%llu hdr=0x%llx — %s\n",
+                            h_blocks, h_inst, h_x87, h_vec, h_tso, h_mem, h_atom, h_bytes,
+                            ios_profmap.blocks, ios_profmap.guest_insts, ios_profmap.alloc_failed,
+                            ios_profmap_addr, verdict);
+                }
+
+                /* ================================================================ ml960
+                 * HOT-BLOCK DUMPS. The top JIT PCs of the window, once per distinct
+                 * block for the whole session, as raw bytes for offline disassembly
+                 * (build/tools/prof-disasm.sh). A percentage tells us WHERE the
+                 * machine is; only the instructions tell us why, and every codegen
+                 * question left on the list -- the shadow stack, the [Xbase, Wea,
+                 * UXTW] fold, the half-barrier nop -- is a question about bytes.
+                 *
+                 * Every read goes through mach_vm_read_overwrite, which reports an
+                 * unmapped range as an error rather than delivering a signal: this
+                 * path cannot fault, on a guest page or anywhere else. */
+                if (bucket[PRB_JIT] && cpu_obs && ios_prof_nsort)
+                {
+                    int shown[8], ns = 0, rank, nunres = 0;
+                    unsigned long long unres[4];
+
+                    for (rank = 0; rank < 6; rank++)
+                    {
+                        int best = -1, q, dup, j2;
+                        unsigned long bv = 0;
+
+                        for (q = 0; q < ios_prof_nsort; q++)
+                        {
+                            unsigned long n = ios_prof_hot[ios_prof_sorted[q].slot].n;
+                            for (dup = 0, j2 = 0; j2 < ns; j2++) if (shown[j2] == q) dup = 1;
+                            if (dup || n <= bv) continue;
+                            bv = n; best = q;
+                        }
+                        if (best < 0 || !bv) break;
+                        shown[ns++] = best;
+
+                        {
+                            unsigned long long hs = ios_prof_jitpc[best].host_start;
+                            unsigned long long pc = ios_prof_sorted[best].pc;
+                            unsigned long long rip = ios_prof_jitpc[best].rip;
+                            unsigned int hlen = ios_prof_jitpc[best].host_size;
+                            unsigned long long rva = 0;
+                            const char *mod = ios_guest32_module_for( B, rip, &rva );
+                            unsigned char gb[96], hb[768];
+                            unsigned int hoff = 0, hwant, glen, hgot;
+                            int num;
+
+                            if (!hs || !hlen) continue;   /* this PC joined no block: nothing to say */
+                            /* Collect the unnamed RIPs BEFORE the dedupe claim:
+                             * a block that was already dumped in an earlier
+                             * window is still worth describing the memory of. */
+                            if (!mod && nunres < (int)(sizeof(unres) / sizeof(unres[0])))
+                            {
+                                int d, seen = 0;
+                                for (d = 0; d < nunres; d++) if (unres[d] == rip) seen = 1;
+                                if (!seen) unres[nunres++] = rip;
+                            }
+                            if (!(num = ios_prof_dump_claim( hs ))) continue;  /* already dumped */
+
+                            hwant = hlen;
+                            if (hwant > 768)
+                            {
+                                unsigned long long c = (pc > hs + 192) ? (pc - hs - 192) : 0;
+                                if (c + 384 > hlen) c = hlen - 384;
+                                hoff = (unsigned int)(c & ~3ULL);
+                                hwant = 384;
+                            }
+                            /* Guest bytes live at B + rip (§2: a 32-bit guest
+                             * address is an offset into the window). With no B
+                             * there is no guest namespace to read from. */
+                            glen = B ? ios_prof_read_upto( B + rip, gb, sizeof(gb) ) : 0;
+                            hgot = ios_prof_read_upto( hs + hoff, hb, hwant );
+
+                            fprintf(stderr, "[prof]   block#%d rip=0x%llx module=%s+0x%llx host=0x%llx+%u "
+                                            "guest_insts=%u x87=%u vec=%u tso=%u mem=%u samples=%.1f%% pc=0x%llx "
+                                            "gdump=0x%llx+%u hdump=0x%llx+%u\n",
+                                    num, rip, mod ? mod : "?", rva, hs, hlen,
+                                    ios_prof_jitpc[best].n_inst, ios_prof_jitpc[best].n_x87,
+                                    ios_prof_jitpc[best].n_vec, ios_prof_jitpc[best].n_tso,
+                                    ios_prof_jitpc[best].n_mem, 100.0 * bv / cpu_obs, pc,
+                                    rip, glen, hs + hoff, hgot);
+                            if (glen) ios_prof_hexdump( "g", gb, glen );
+                            else fprintf(stderr, "[prof]     g: <guest bytes at host 0x%llx not readable>\n", B + rip);
+                            if (hgot) ios_prof_hexdump( "h", hb, hgot );
+                            else fprintf(stderr, "[prof]     h: <pool bytes at 0x%llx not readable>\n", hs + hoff);
+                        }
+                    }
+
+                    /* ============================================================ ml960
+                     * WHAT IS AT AN UNRESOLVED RIP. ios_guest32_module_idx found no
+                     * module and the MZ probe found no image, so the hottest guest
+                     * code in the log has no name. Describe the memory instead: the
+                     * Mach region says what it IS, NtQueryVirtualMemory says what
+                     * WINE THINKS it is, and the two together separate "a module the
+                     * loader list does not carry" from "JIT-generated or thunk code
+                     * in a private anonymous view" -- different next steps.
+                     *
+                     * NtQueryVirtualMemory takes Wine's virtual_mutex, which is why
+                     * this runs on the profiler thread at report cadence and for at
+                     * most two addresses per window -- never in the sampling loop and
+                     * never in a signal handler. */
+                    for (rank = 0; rank < nunres; rank++)
+                    {
+                        unsigned long long rip = unres[rank];
+                        unsigned long long host = B + rip;
+                        mach_vm_address_t ra = (mach_vm_address_t)host;
+                        mach_vm_size_t rs = 0;
+                        vm_region_basic_info_data_64_t rbi;
+                        mach_msg_type_number_t rc = VM_REGION_BASIC_INFO_COUNT_64;
+                        mach_port_t ro = MACH_PORT_NULL;
+                        char machs[128], nts[192];
+
+                        snprintf( machs, sizeof(machs), "UNMAPPED" );
+                        if (mach_vm_region( mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                                            (vm_region_info_t)&rbi, &rc, &ro ) == KERN_SUCCESS &&
+                            host >= (unsigned long long)ra &&
+                            host < (unsigned long long)ra + (unsigned long long)rs)
+                            snprintf( machs, sizeof(machs),
+                                      "base=0x%llx size=0x%llx prot=%c%c%c max=%c%c%c shared=%d",
+                                      (unsigned long long)ra, (unsigned long long)rs,
+                                      (rbi.protection & VM_PROT_READ) ? 'r' : '-',
+                                      (rbi.protection & VM_PROT_WRITE) ? 'w' : '-',
+                                      (rbi.protection & VM_PROT_EXECUTE) ? 'x' : '-',
+                                      (rbi.max_protection & VM_PROT_READ) ? 'r' : '-',
+                                      (rbi.max_protection & VM_PROT_WRITE) ? 'w' : '-',
+                                      (rbi.max_protection & VM_PROT_EXECUTE) ? 'x' : '-',
+                                      (int)rbi.shared );
+
+                        snprintf( nts, sizeof(nts), "not queried" );
+                        if (rank < 2)
+                        {
+                            MEMORY_BASIC_INFORMATION mbi;
+                            SIZE_T got = 0;
+                            memset( &mbi, 0, sizeof(mbi) );
+                            if (!NtQueryVirtualMemory( NtCurrentProcess(), (void *)(uintptr_t)host,
+                                                       MemoryBasicInformation, &mbi, sizeof(mbi), &got ))
+                                snprintf( nts, sizeof(nts),
+                                          "state=%s type=%s prot=0x%x alloc=0x%llx base=0x%llx size=0x%llx",
+                                          (mbi.State == MEM_COMMIT) ? "COMMIT" :
+                                          (mbi.State == MEM_RESERVE) ? "RESERVE" : "FREE",
+                                          (mbi.Type == MEM_IMAGE) ? "IMAGE" :
+                                          (mbi.Type == MEM_MAPPED) ? "MAPPED(view)" :
+                                          (mbi.Type == MEM_PRIVATE) ? "PRIVATE(anon)" : "none",
+                                          (unsigned)mbi.Protect,
+                                          (unsigned long long)(uintptr_t)mbi.AllocationBase,
+                                          (unsigned long long)(uintptr_t)mbi.BaseAddress,
+                                          (unsigned long long)mbi.RegionSize );
+                            else
+                                snprintf( nts, sizeof(nts), "NtQueryVirtualMemory FAILED (Wine has no view here)" );
+                        }
+                        fprintf(stderr, "[prof]   unresolved rip=0x%llx host=0x%llx in32window=%s | mach %s | wine %s\n",
+                                rip, host, (B && rip < 0x100000000ULL) ? "yes" : "NO", machs, nts);
+                    }
+                }
+
+                /* The handshake is checked AFTER the report, so this window's numbers
+                 * are printed from the header that produced them and the next window
+                 * starts from a re-armed one. */
+                ios_profmap_rearm_if_reset( prev_head );
+
+                prev_x87 = ios_profmap.x87_ops;     prev_vec = ios_profmap.vec_ops;
                 prev_atom = ios_profmap.atomic_ops; prev_tso = ios_profmap.tso_ops;
-                prev_blocks = ios_profmap.blocks; prev_insts = ios_profmap.guest_insts;
+                prev_mem = ios_profmap.mem_ops;     prev_bytes = ios_profmap.host_bytes;
+                prev_blocks = ios_profmap.blocks;   prev_insts = ios_profmap.guest_insts;
+                prev_head = w_head;
             }
 
             /* Which dispatcher helper. In l35 this bucket was invisible inside
@@ -13159,6 +13568,10 @@ static void *ios_prof_thread( void *arg )
                 int rank;
                 char line[640];
                 int len = 0;
+                /* ml960: remember the three hottest pairs before the printer zeroes
+                 * them, so the by-thread line below can be about the SAME entries. */
+                struct { uint64_t kpc, cpc; char label[112]; } ktop[3];
+                int nktop = 0;
                 for (rank = 0; rank < 6; rank++)
                 {
                     int best = -1, s; unsigned long bv = 0;
@@ -13188,11 +13601,133 @@ static void *ios_prof_thread( void *arg )
                             snprintf( csym, sizeof(csym), "0x%llx", (unsigned long long)ios_prof_kc[best].cpc );
                         len += snprintf( line + len, sizeof(line) - len, " %s<-%s %.1f%%",
                                          ksym, csym, 100.0 * bv / cpu_obs );
+                        if (nktop < 3)
+                        {
+                            ktop[nktop].kpc = ios_prof_kc[best].kpc;
+                            ktop[nktop].cpc = ios_prof_kc[best].cpc;
+                            snprintf( ktop[nktop].label, sizeof(ktop[nktop].label), "%s<-%s", ksym, csym );
+                            nktop++;
+                        }
                     }
                     ios_prof_kc[best].n = 0;
                     if (len >= (int)sizeof(line) - 100) break;
                 }
                 if (len) fprintf(stderr, "[prof]   kern (%% of all CPU):%s\n", line);
+
+                /* ml960: WHICH THREAD PAYS IT.  "read<-read_request 3.3%" is a
+                 * process-wide number, and the whole question in this round is
+                 * whether the RENDER thread is the one blocked on the server, or
+                 * whether a pump thread is absorbing the round trips while the
+                 * render thread runs.  Same three entries, split by tid. */
+                for (rank = 0; rank < nktop; rank++)
+                {
+                    char tl[256];
+                    int tlen = 0, slot, pick;
+                    unsigned long tot = 0;
+
+                    for (slot = 0; slot < IOS_PROF_KCT_MAX; slot++)
+                        if (ios_prof_kct[slot].n && ios_prof_kct[slot].kpc == ktop[rank].kpc &&
+                            ios_prof_kct[slot].cpc == ktop[rank].cpc)
+                            tot += ios_prof_kct[slot].n;
+                    if (!tot) continue;
+
+                    tl[0] = 0;
+                    for (pick = 0; pick < 3; pick++)
+                    {
+                        int best2 = -1; unsigned long bv2 = 0;
+                        for (slot = 0; slot < IOS_PROF_KCT_MAX; slot++)
+                            if (ios_prof_kct[slot].n > bv2 && ios_prof_kct[slot].kpc == ktop[rank].kpc &&
+                                ios_prof_kct[slot].cpc == ktop[rank].cpc)
+                            { bv2 = ios_prof_kct[slot].n; best2 = slot; }
+                        if (best2 < 0) break;
+                        {
+                            int ti = ios_prof_kct[best2].ti;
+                            tlen += snprintf( tl + tlen, sizeof(tl) - tlen, " tid=%04llx\"%s\"=%.0f%%",
+                                              (ti >= 0 && ti < IOS_PROF_TH_MAX) ? ios_prof_ttid[ti] : 0ULL,
+                                              (ti >= 0 && ti < IOS_PROF_TH_MAX && ios_prof_tname[ti][0])
+                                                  ? ios_prof_tname[ti] : "-",
+                                              100.0 * bv2 / tot );
+                        }
+                        ios_prof_kct[best2].n = 0;
+                        if (tlen >= (int)sizeof(tl) - 48) break;
+                    }
+                    fprintf(stderr, "[prof]   kern by thread: %s (%.1f%% of all CPU) ->%s\n",
+                            ktop[rank].label, 100.0 * tot / cpu_obs, tl);
+                }
+            }
+
+            /* ================================================================ ml960
+             * WHAT THE `dylib` BUCKET ACTUALLY IS.
+             *
+             * 41 % of the machine in one bucket named after a file extension is not
+             * a measurement, it is a placeholder -- and the kern caller list only
+             * explains the part that is a syscall (about 18 % of the 41). The rest
+             * is Metal/AGX encode work, objc/libc++ machinery and allocator time,
+             * and those rank completely differently as targets. Two lines: by IMAGE
+             * (the executable-segment table the sampler already built, so no
+             * resolver is involved) and by SYMBOL (dladdr, at report cadence only).
+             * PRB_METAL is folded in because the images the reader expects to see
+             * here -- Metal, AGXMetal, MTLCompiler -- are classified into it. */
+            if (cpu_obs)
+            {
+                struct { uint64_t base; unsigned long n; const char *name; } img[48];
+                struct { uint64_t saddr; unsigned long n; const char *sym; const char *img; } sym[96];
+                int nimg = 0, nsym = 0, s, rank, len;
+                char line[560];
+
+                for (s = 0; s < IOS_PROF_PC_MAX; s++)
+                {
+                    const char *nm = NULL;
+                    uint64_t base = 0;
+                    Dl_info di;
+                    int c, i2;
+
+                    if (!ios_prof_hot[s].n) continue;
+                    c = ios_prof_hot[s].cls;
+                    if (c != PRB_DYLIB && c != PRB_METAL) continue;
+                    if (ios_prof_image_for( ios_prof_hot[s].pc, &nm, &base ) < 0 || !nm) continue;
+
+                    for (i2 = 0; i2 < nimg; i2++) if (img[i2].base == base) break;
+                    if (i2 == nimg && nimg < (int)(sizeof(img) / sizeof(img[0])))
+                    { img[nimg].base = base; img[nimg].n = 0; img[nimg].name = nm; nimg++; }
+                    if (i2 < nimg) img[i2].n += ios_prof_hot[s].n;
+
+                    if (dladdr( (void *)(uintptr_t)ios_prof_hot[s].pc, &di ) && di.dli_sname && di.dli_saddr)
+                    {
+                        uint64_t sa = (uint64_t)(uintptr_t)di.dli_saddr;
+                        for (i2 = 0; i2 < nsym; i2++) if (sym[i2].saddr == sa) break;
+                        if (i2 == nsym && nsym < (int)(sizeof(sym) / sizeof(sym[0])))
+                        { sym[nsym].saddr = sa; sym[nsym].n = 0; sym[nsym].sym = di.dli_sname;
+                          sym[nsym].img = nm; nsym++; }
+                        if (i2 < nsym) sym[i2].n += ios_prof_hot[s].n;
+                    }
+                }
+
+                len = 0; line[0] = 0;
+                for (rank = 0; rank < 8; rank++)
+                {
+                    int best = -1, i2; unsigned long bv = 0;
+                    for (i2 = 0; i2 < nimg; i2++) if (img[i2].n > bv) { bv = img[i2].n; best = i2; }
+                    if (best < 0) break;
+                    len += snprintf( line + len, sizeof(line) - len, " %s=%.1f%%",
+                                     img[best].name, 100.0 * bv / cpu_obs );
+                    img[best].n = 0;
+                    if (len >= (int)sizeof(line) - 48) break;
+                }
+                if (len) fprintf(stderr, "[prof]   dylib by image (%% of all CPU):%s\n", line);
+
+                len = 0; line[0] = 0;
+                for (rank = 0; rank < 8; rank++)
+                {
+                    int best = -1, i2; unsigned long bv = 0;
+                    for (i2 = 0; i2 < nsym; i2++) if (sym[i2].n > bv) { bv = sym[i2].n; best = i2; }
+                    if (best < 0) break;
+                    len += snprintf( line + len, sizeof(line) - len, " %s`%s=%.1f%%",
+                                     sym[best].img, sym[best].sym, 100.0 * bv / cpu_obs );
+                    sym[best].n = 0;
+                    if (len >= (int)sizeof(line) - 64) break;
+                }
+                if (len) fprintf(stderr, "[prof]   dylib top syms (%% of all CPU):%s\n", line);
             }
 
             /* per-module shares of the pool copies (* = counted as fexrt above) */
@@ -13345,6 +13880,7 @@ static void *ios_prof_thread( void *arg )
             memset( pe, 0, sizeof(pe) );
             memset( ios_prof_hot, 0, sizeof(ios_prof_hot) );
             memset( ios_prof_kc, 0, sizeof(ios_prof_kc) );
+            memset( ios_prof_kct, 0, sizeof(ios_prof_kct) );
             ios_prof_nsort = 0;
             npe = 0;
             samples = obs = run_obs = wait_obs = dead = 0;

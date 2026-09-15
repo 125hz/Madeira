@@ -954,6 +954,30 @@ game-specific patches — every change must fix the emulator/runtime generically
   (padding only); both sides syntax-clean (i386 clang; LP64 gcc + LLP64
   aarch64 clang). Next: steps 1 (native build mode) and 3 (shim
   hand-written parts).
+- 2026-09-14 — Log 39 (queue-clock fix + release d3d9 + multi-touch):
+  user reports "almost always above 30 fps" in the training level (was
+  15-20). `[srv-stats]` 38k → 1.4k reqs/s, in-call 0.76 → 0.03 core;
+  `[msgq] peek=2.8M skipped=2.8M served=414`; `[thrinfo] basic self=33k
+  (cached=32k)`; controls: 42 touches began/ended, 0 cancelled/missed.
+  `d3d9.dll` 20-28 % → 9-12 % (release build). NEW FINDINGS: (1)
+  `[d3d9-census]`: **203,648 D3D9 calls per frame**, of which
+  `Query::GetData` + `GetDataSize` = 85,695 each — the render thread
+  busy-polls a query (GPU fence / occlusion) until the GPU finishes; then
+  `SetSamplerState` 12.4k/frame, `SetRenderState` 6.8k, `SetTexture` 2.3k,
+  `SetVertexShaderConstantF` 2.1k (mostly 1 or 3-4 registers),
+  `DrawIndexedPrimitive` 608, `DrawIndexedPrimitiveUP` 201,
+  `TestCooperativeLevel` 809 — the ring design (§8.6) must defer exactly
+  these; the GetData spin needs a real wait (flush + block on the Metal
+  command buffer completion, not a poll). (2) `mach_msg2_trap <-
+  ios_pool_warmer_thread` 4.4-4.8 % of ALL CPU: the periodic `[phys-map]`
+  walk over ~130k VM regions. (3) `[fs-stats] pcache=h87/m822/p0` — the
+  resolved-name cache never stores; opens still 0.6 ms (`scan=635`,
+  `dirscan=548`). (4) `Sleep(0)` at 288k/s on the main thread (waiting
+  for the render thread) → 33k parks/s, `__ulock_wait2` 9-14 %.
+  Render thread (tid 00c0) is the critical path: 32-34 % busy, jit 70 %.
+  Assigned: census cost + park ladder (Opus, virtual_ios.c/sync.c);
+  path-cache populate bug (Opus, file.c); the query spin waits for step 1
+  to release `src/d3d9/**`.
 
 
 - 2026-09-12 — M5 direction: the user's next target is a 32-bit UE3/D3D9
@@ -3032,3 +3056,160 @@ declaration the description must match), `d3d9_device.cpp` (hot bodies
 `load_builtin_unixlib` `:7083-7229`, `MemoryWineLoadUnixLib*` `:18959`,
 window teardown), `src/winemetal/unix/winemetal_unix.c` (`_Foo32` pattern
 `:4415-4460`, tables `:5077,:5243`), `src/d3d9/d3d9_buffer_map.hpp`.
+- 2026-09-14 — Log 41 (mouse + native-build IPA, shim installed as
+  d3d9.dll falling back to d3d9-emulated.dll — fallback WORKED, 30-40 fps
+  in level 1). Mouse: works only with iOS AssistiveTouch on — confirmed
+  by Apple's documentation that iPhone routes pointer devices ONLY through
+  AssistiveTouch (no public HID path; `prefersPointerLocked` not honoured
+  on iPhone), so the requirement cannot be removed by the app; with it on,
+  `mouse path: gcmouse`, deltas fractional (AssistiveTouch-scaled), ~10-15
+  handler events/s observed. Stutter cause hypothesis: AssistiveTouch
+  synthesises TOUCHES for clicks → the game view's absolute touch path
+  jumps the cursor (assigned: suppress synthesized touches while GCMouse
+  is active, high-QoS handler queue, iPhone-aware lock, UI hint).
+  Perf: `[d3d9-census] per_frame=117,841` (GetData/GetDataSize 49k each);
+  `[srv-stats]` 4.4k/s, `event_op` 1.9k/s @55 µs + `select` 0.9k/s = the
+  main↔render handoff → fastsync step 1 ASSIGNED (design in the ml951
+  entry); `[fs-stats] open=1190/1987ms fail=1181` — failing opens 1.67 ms
+  each (~11 fstatat + an unexplained remainder; `get_object_info=1122`
+  per 10 s looks like the failure path hitting the server) → whole-path
+  negative cache + phase breakdown ASSIGNED; `[vm-census]` off by default
+  confirmed (`mach_msg2_trap<-warmer` gone). Threads: main 26-31 %, render
+  31 %, encode 6-7 %. Resumed after rate limit: query busy-poll fix,
+  generator gap fixes, farm install naming (emulated back as d3d9.dll).
+- 2026-09-14 — fastsync step 1 DONE (ml952; wine `server/event.c`,
+  `server/inproc_sync.c`, `server/thread.c`, `ntdll/unix/sync.c`,
+  `server.c`, new `build/ntdll-unix/shims/ios_fastsync.h`). 8192 cells ×
+  32 B in wineserver BSS, referenced across the archive boundary; a cell
+  per handle-reachable event (`create_event_sync` only — device/async/
+  process/thread syncs untouched). Client: seqlock-published cache keyed
+  `(handle, pid)` + `gen`; `NtSetEvent`/`NtResetEvent` CAS the word and
+  call the server only when `srv_waiters != 0` (Dekker: seq_cst store then
+  load on both sides); single-handle non-alertable waits spin 96 then park
+  on `os_sync_wait_on_address` ≤ 2 ms (`MADEIRA_FASTSYNC_CAP_US`, 50 µs–
+  50 ms), then fall through to `server_wait` with the relative timeout
+  reduced by the time spent; zero-timeout waits deliberately miss so the
+  server produces `STATUS_TIMEOUT` + pending APCs. Server `signaled` CAS-
+  claims SET→CLAIMED for auto-reset (so a client cannot steal a token the
+  server already reported); WaitAll releases claims (`object_sync_unclaim`).
+  PulseEvent disables the cell for good (folds state back into `signaled`).
+  Knob `MADEIRA_FASTSYNC` (default on); banner `[fastsync] ON rev=ml952`;
+  counters in `[srv-stats] futex(no server): fast hit/miss/wake/sleep`.
+  Expected next log: `kinds: event_op` 19.3k → hundreds per 10 s,
+  `select: w1 inf` 4.9k → <500, in-call 2.4 s → <1 s. If `w1 inf` stays
+  high while `fast sleep` is large, handoffs exceed the cap → raise
+  `MADEIRA_FASTSYNC_CAP_US`. Stress test `sync-x86.exe` (button "Fastsync
+  stress": ping-pong parity, exactly-once over 4 waiters, manual release-
+  all, 300 ms timeout; exit 46 = pass, 50–56 = which property broke).
+  Semaphores not done (outside `event_op`, 0 % of measured traffic).
+- 2026-09-14 — D3D9 native step 4 DONE (hooks 320/320 via generated
+  `d3d9_native_gen.inc` + 6 hand-written; identity by find-before-create;
+  arena root pinned per PEB; `D3D9_GUEST_PTR32` window assertion; binding
+  branch in `load_builtin_unixlib` matches `d3d9shim` in match OR modname;
+  `d3d9_native_process_teardown` before the PROT_NONE replace; shim ships
+  as `d3d9.dll`, unset knob = forward to `d3d9-emulated.dll`, only
+  `Documents/madeira-d3d9.txt` = `native` runs native; `TestCooperativeLevel`
+  lock-free; `[d3d9-native-census]`; api hash `0xf49329770a2bc97b`).
+  Log 42 (mid-round snapshot IPA the user sideloaded: fastsync ml952 +
+  query fix + whole-path negative cache + profiler ml960 + shim forwarding):
+  REGRESSION — not a hang: main thread guest AV reading NULL+0xc ~10 s in,
+  right after the first three presents and a worker-created thread; the
+  game's own crash-dump writer then called ReadProcessMemory on the NULL
+  page and `NtReadVirtualMemory`'s `__TRY` did not catch the fault (caller
+  on a stack outside TEB limits → "Exception frame is not in stack limits"
+  → process gone). Native D3D9 was NOT active (forwarding confirmed). Died
+  before the first `[srv-stats]` window, so no fastsync counters. Assigned:
+  fastsync adversarial review + handshake stress (sync.c/server), negative
+  cache review + `MADEIRA_FS_NEGCACHE` knob (file.c), fault-proof
+  `NtReadVirtualMemory` via `mach_vm_read_overwrite` (virtual.c) +
+  `readvm-x86.exe`. New generic knob file `Documents/madeira-env.txt`
+  (NAME=VALUE, MADEIRA_*/DXMT_* only) for device-side bisects.
+  Mouse: iPhone routes pointers only through AssistiveTouch (Apple);
+  requirement cannot be removed; stutter mitigations shipped in this IPA.
+- 2026-09-14 — fastsync ml962: DEFAULT OFF + three defects fixed
+  (`ntdll/unix/sync.c`, `server/event.c`, `server/object.h`,
+  `shims/ios_fastsync.h`, `shims/ios_srv_stats.h`, `server_ios.c`,
+  `process_ios.c`, `x86-tests/sync-x86.c`). `MADEIRA_FASTSYNC=1` now
+  ENABLES (unset/`0` = off, banner `[fastsync] OFF (MADEIRA_FASTSYNC=1
+  enables)`); with it off `madeira_cell_alloc` returns −1 for every event,
+  so every hook falls through to `signaled` and `get_inproc_sync_fd` is
+  upstream's — off is the pre-ml952 path. (1) TORN CACHE PUBLISH —
+  `madeira_fast_publish` marked the entry busy with a RELEASE STORE and
+  then wrote the fields; a release store constrains only what precedes it,
+  so compiler or core could land `handle`/`pid` BEFORE the odd marker and a
+  reader saw a stable-looking entry with the NEW handle and the OLD
+  cell/gen — a wait on handle B returning SUCCESS whenever unrelated event
+  A was set, i.e. the log-42 NULL+small read in all three programs. Now a
+  real C11 seqlock: relaxed odd marker, RELEASE FENCE, relaxed field
+  stores, release fence, relaxed even marker; reader uses relaxed atomic
+  loads and compares `handle`/`pid` inside the fenced region;
+  `madeira_fast_close` tests the slot inside the section. (2) DOUBLE
+  RELEASE — a client `NtSetEvent` with `srv_waiters != 0` CAS'd the cell
+  and ALSO sent `event_op SET_EVENT`, whose `exchange(state, SET)` minted a
+  second token if a fast waiter had consumed the first: two waiters
+  released by one SetEvent. New private opcode `MADEIRA_EVENT_OP_WAKE`
+  ('MAWA', `op` is a plain int + `default:` arm ⇒ no protocol.def change)
+  runs `wake_up()` only, so `event_sync_signaled`'s CAS decides whether a
+  token still exists. (3) LOST SET ON `MADEIRA_CELL_CLAIMED` — the client
+  CAS'd CLAIMED→SET and `event_sync_satisfied` then stored RESET,
+  swallowing the set; the fast op now yields to the server on CLAIMED
+  (server is single-threaded, so the request is applied after the claim
+  resolves). Also: the negative learn answer was NEVER cached (on iOS the
+  reply is always `STATUS_NOT_IMPLEMENTED`, which the old code dropped), so
+  every wait on a thread/process/mutex/semaphore/timer/file re-asked —
+  `get_inproc_sync_fd` was the #1 request kind at 925–1837 per 10 s; now
+  cached (negative entries are fail-safe: they can only route to the
+  server). Plus: no fast path for a caller with no TEB (`pid == 0`),
+  reply cell index bounds-checked, `event_sync_remove_queue` reads
+  `event->cell` before `remove_queue`'s `release_object`. Observability:
+  `[srv-stats] fastsync cache: learn_ev/learn_none/relearn/stale_gen/
+  evict`, and `ios_srv_stats_report_now()` from the MADEIRA-EXIT path so a
+  run that dies before the first 10 s window still leaves counters.
+  `sync-x86.exe` gains tests 5–9 (fresh-event thread-start handshake ×20k
+  with a NULL-pointer check, server-queued vs fast waiter exactly-once,
+  manual "loader done" under cell churn, late-set timed waits, heap-node
+  handshake ×5k); exits 57–61 name them, 46 = pass. Must be run BOTH ways:
+  default (server path) and `MADEIRA_FASTSYNC=1`.
+- 2026-09-14 — Logs 43/44/45 (same ml952 snapshot): a 64-bit title, the
+  UE3 game and a VN boot menu (twice) all died with guest NULL+small reads
+  seconds after thread creation → common cause = fastsync torn cache
+  publish (ml962 entry above). Also seen: `get_inproc_sync_fd` 925-1837
+  per 10 s (negative learn never cached; fixed), the VN launcher exiting 1
+  ("not installed"), and `wholeneg=h31/p32` hits with no stores.
+  Whole-path negative cache ml913 review (`file.c`): (1) stamp read AFTER
+  the absence proof — the `<leaf>?` reparse probe re-ran `find_file_in_dir`
+  and re-stamped, and the after-walk `fstatat` fallback stamped later still,
+  so a create landing inside one directory scan produced an entry that
+  never went stale (now `ios_dir_stamp_ok`: a stamp is usable only if read
+  before the work that proved absence; fallback deleted); (2) key was
+  case-FOLDED while the resolver prefers exact case per component (now the
+  exact requested spelling); (3) whole-path and per-component entries
+  shared a table AND a key string (`'\1'` namespace byte); (4) `readdir`
+  error cached as absent (errno captured, store suppressed). DEFAULT OFF:
+  `MADEIRA_FS_NEGCACHE=1` enables; `[fs-stats]` prints `wholeneg=OFF(...)`;
+  `[fs-neg] hit key=… stamp_dir=…` first 16 distinct keys when on. Test
+  `fs-x86.exe` (button "FS lookup stress", exit 47; 61-66 name the phase)
+  — proven to catch the old semantics on a host model of the resolver.
+  `NtReadVirtualMemory` iOS (`virtual_ios.c:19841-20072`): three-tier
+  no-fault copy (vprot-proven → memmove; else one `mach_vm_read_overwrite`;
+  else page-by-page → `STATUS_PARTIAL_COPY` with the real count); write
+  path pre-checks the source. Test `readvm-x86.exe` (button
+  "ReadProcessMemory", exit 48) incl. a read from a hand-switched stack.
+  Proposal (not done): port the ml377 "bad frame on step 0 = ordinary
+  unhandled exception" rule to `wine/dlls/ntdll/signal_arm64.c:274`, and
+  widen `is_valid_frame()` on iOS to accept the currently executing stack.
+  On-screen controls dying after a stray game-view tap: `ControlOverlayView`
+  keyed touches by `ObjectIdentifier(UITouch)`; UIKit recycles UITouch
+  objects, `begin()` overwrote an unclosed track without releasing its
+  owner, and `InputGuard.sync()` posts the union of owners → a phantom
+  owner pins a key/button DOWN for the session (re-press adds nothing, so
+  "the button does nothing"). The game view used `touches.first` with one
+  shared state set, so a second finger forged the click that triggered the
+  arbitration. Fix: `reconcile(event)` rebuilds the table from UITouch
+  identity on every callback (stale-gone/phase/view/absent), `begin()`
+  finishes a reused address first, game view owns exactly one finger.
+  Logs: `[input] recover region=… reason=…`, 5 s `[input] health
+  held>5s=[…]`, `owners=N` in the InputGuard heartbeat. Removed: the
+  on-screen aim/mouse joystick button, `JoystickPadState.aim`, the
+  landscape "Aim" mapping (gamepad right stick still uses AimStickDriver).
+  New: `Documents/madeira-env.txt` generic env passthrough.

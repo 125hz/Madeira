@@ -85,7 +85,14 @@ PATCHED_FILES=(
     "winstation:$WINE_SRC/server/winstation.c:winstation.o"
     # task#32 Steam: stop_thread Mach-based context capture (iOS signal
     # suspend is dead) lives in the submodule's thread.c
+    # ml952 also puts the fastsync claim release in check_wait() here.
     "thread:$WINE_SRC/server/thread.c:thread.o"
+    # ml952 fastsync: event.c DEFINES the shared cell table that
+    # dlls/ntdll/unix/sync.c references, and inproc_sync.c's
+    # get_inproc_sync_fd handler is the handle -> cell learn request.
+    # Both must be rebuilt with WINE_IOS and the shims include path.
+    "event:$WINE_SRC/server/event.c:event.o"
+    "inproc_sync:$WINE_SRC/server/inproc_sync.c:inproc_sync.o"
     # ml474 (#79): sock.c now builds from the submodule. Before this entry
     # the archive carried a hand-inserted Jul-10 sock.o (probed, source
     # lost) that every rebuild silently preserved — the #79 TCP-table
@@ -156,6 +163,8 @@ REPLACEMENTS=(
     "mapping.o:mapping.o"
     "winstation.o:winstation.o"
     "thread.o:thread.o"
+    "event.o:event.o"
+    "inproc_sync.o:inproc_sync.o"
     "sock.o:sock.o"
     "object.o:object.o"
     "async.o:async.o"

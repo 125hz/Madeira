@@ -104,8 +104,163 @@ final class MetalBackedView: UIView {
         self.isMultipleTouchEnabled = true
         self.isUserInteractionEnabled = true
         self.backgroundColor = .clear
+        // ml663: with a Bluetooth mouse attached, iOS draws its own pointer over
+        // whatever is under it — including this surface, where it is both
+        // distracting and a lie (the game has its own cursor, at its own
+        // position). Hide it for the game area specifically, so the SwiftUI
+        // chrome around it still shows a pointer you can aim at when pointer
+        // lock is off. Harmless with no mouse: the interaction simply never
+        // fires.
+        addInteraction(UIPointerInteraction(delegate: PointerHider.shared))
+        installPointerFallback()
     }
-    required init?(coder: NSCoder) { super.init(coder: coder) }
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        addInteraction(UIPointerInteraction(delegate: PointerHider.shared))
+        installPointerFallback()
+    }
+
+    // ==================================================================
+    // ml664 — THE MOUSE THAT GameController CANNOT SEE.
+    //
+    // `HardwareInput` wires GCMouse as completely as it can be wired, and on a
+    // device where the mouse is an AssistiveTouch pointer device that still
+    // yields zero deltas (see the ml664 banner in HardwareInput.attachMouse).
+    // The events DO exist — they arrive as UIKit *indirect pointer* input,
+    // which is a different pipeline with a different opt-in
+    // (UIApplicationSupportsIndirectInputEvents, already in Info.plist).
+    //
+    // Three recognisers, because iOS splits one mouse across three shapes:
+    //   • hover  — movement with no button down. Absolute positions; we keep
+    //              the previous one and send the difference.
+    //   • drag   — movement WITH a button down. Hover stops during a drag, so
+    //              a pan restricted to `.indirectPointer` carries it instead.
+    //   • scroll — the wheel, delivered as a pan with no touches at all when
+    //              `allowedScrollTypesMask` is set.
+    // Buttons themselves are indirect-pointer TOUCHES, intercepted at the top
+    // of touchesBegan/Ended/Cancelled and read off `UIEvent.buttonMask`.
+    //
+    // None of this may touch a finger. `allowedTouchTypes` on both pans is
+    // restricted to `.indirectPointer` (the scroll pan accepts no touch type at
+    // all), the hover recogniser is not a touch recogniser to begin with, and
+    // every one of them is `cancelsTouchesInView = false` and recognises
+    // simultaneously — so `ControlOverlayView`'s multi-touch arbitration and
+    // the trackpad/game touch paths below are unchanged.
+    // ==================================================================
+
+    private var hoverLast = CGPoint.zero
+    private var hoverHasLast = false
+    private var pointerPanLast = CGPoint.zero
+    private var pointerScrollLast = CGPoint.zero
+
+    private func installPointerFallback() {
+        let indirect = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+
+        let hover = UIHoverGestureRecognizer(target: self, action: #selector(onPointerHover(_:)))
+        hover.cancelsTouchesInView = false
+        hover.delegate = PointerGestureDelegate.shared
+        addGestureRecognizer(hover)
+
+        let drag = UIPanGestureRecognizer(target: self, action: #selector(onPointerDrag(_:)))
+        drag.allowedTouchTypes = indirect
+        drag.allowedScrollTypesMask = []          // motion only; the wheel is separate
+        drag.maximumNumberOfTouches = 1
+        drag.cancelsTouchesInView = false
+        drag.delaysTouchesBegan = false
+        drag.delaysTouchesEnded = false
+        drag.delegate = PointerGestureDelegate.shared
+        addGestureRecognizer(drag)
+
+        let scroll = UIPanGestureRecognizer(target: self, action: #selector(onPointerScroll(_:)))
+        scroll.allowedTouchTypes = []             // NEVER a finger: scroll events only
+        scroll.allowedScrollTypesMask = [.continuous, .discrete]
+        scroll.cancelsTouchesInView = false
+        scroll.delaysTouchesBegan = false
+        scroll.delaysTouchesEnded = false
+        scroll.delegate = PointerGestureDelegate.shared
+        addGestureRecognizer(scroll)
+    }
+
+    @objc private func onPointerHover(_ g: UIHoverGestureRecognizer) {
+        let p = g.location(in: self)
+        switch g.state {
+        case .began:
+            hoverLast = p; hoverHasLast = true
+        case .changed:
+            // No previous sample (the pointer re-entered, or a drag just ended)
+            // means the first difference would be a jump from wherever it was
+            // last seen. Re-seed instead of posting it.
+            guard hoverHasLast else { hoverLast = p; hoverHasLast = true; return }
+            let d = CGPoint(x: p.x - hoverLast.x, y: p.y - hoverLast.y)
+            hoverLast = p
+            HardwareInput.shared.uikitMoved(d.x, d.y, src: "hover")
+        default:
+            hoverHasLast = false
+        }
+    }
+
+    @objc private func onPointerDrag(_ g: UIPanGestureRecognizer) {
+        // Translation, not location: a pan's translation keeps accumulating past
+        // the point where the clamped system pointer stops, which is the only
+        // edge behaviour iOS gives us for free.
+        let t = g.translation(in: self)
+        switch g.state {
+        case .began:
+            pointerPanLast = .zero
+            hoverHasLast = false
+        case .changed:
+            let d = CGPoint(x: t.x - pointerPanLast.x, y: t.y - pointerPanLast.y)
+            pointerPanLast = t
+            HardwareInput.shared.uikitMoved(d.x, d.y, src: "pan")
+        default:
+            pointerPanLast = .zero
+            hoverHasLast = false      // hover re-seeds on its next sample
+        }
+    }
+
+    @objc private func onPointerScroll(_ g: UIPanGestureRecognizer) {
+        let t = g.translation(in: self)
+        switch g.state {
+        case .changed:
+            let d = CGPoint(x: t.x - pointerScrollLast.x, y: t.y - pointerScrollLast.y)
+            pointerScrollLast = t
+            HardwareInput.shared.uikitScroll(d.x, d.y)
+        default:
+            pointerScrollLast = .zero
+        }
+    }
+
+    /// An indirect-pointer touch is a MOUSE BUTTON, not a finger — it must never
+    /// reach the trackpad/game touch logic below, which would read a click as a
+    /// tap and a click-drag as a one-finger aim.
+    ///
+    /// Returns true when this event belonged to the pointer and is handled.
+    private func pointerButtons(_ touches: Set<UITouch>, with event: UIEvent?,
+                                ending: Bool) -> Bool {
+        guard touches.contains(where: { $0.type == .indirectPointer }) else { return false }
+        var mask = event?.buttonMask ?? []
+        if ending {
+            // Belt and braces against a mask that still lists the button being
+            // released: if nothing indirect is still down, nothing is held.
+            let live = (event?.allTouches ?? []).filter {
+                $0.type == .indirectPointer && $0.phase != .ended && $0.phase != .cancelled
+            }
+            if live.isEmpty { mask = [] }
+        }
+        var want: Set<Int> = []
+        if mask.contains(.primary)   { want.insert(InputGuard.Btn.left) }
+        if mask.contains(.secondary) { want.insert(InputGuard.Btn.right) }
+        if mask.contains(UIEvent.ButtonMask.button(3)) { want.insert(InputGuard.Btn.middle) }
+        if mask.contains(UIEvent.ButtonMask.button(4)) { want.insert(InputGuard.Btn.x1) }
+        if mask.contains(UIEvent.ButtonMask.button(5)) { want.insert(InputGuard.Btn.x2) }
+        // A down with an empty mask happens in UIKit's pointer-compatibility
+        // mode, where a click is reported as a touch and nothing else. It is a
+        // left click; treating it as "no buttons" would make the mouse unable to
+        // click at all on exactly the devices this fallback exists for.
+        if !ending && want.isEmpty { want.insert(InputGuard.Btn.left) }
+        HardwareInput.shared.uikitButtons(want)
+        return true
+    }
 
     // Visibility-stall postmortem (2026-07-03): the intermittent "presents
     // count but the screen stays black until a bg/fg or screenshot" state
@@ -285,9 +440,65 @@ final class MetalBackedView: UIView {
      * (and every game that wants a real pointer) behaves exactly as before. */
     private var gameRelative: Bool { !desktopMode && InputSettings.shared.relative }
 
+    // ========================================================================
+    // ml666 — THE GAME VIEW OWNS ONE FINGER, AND KNOWS WHICH.
+    //
+    // Every branch below used `touches.first` — an arbitrary member of the set
+    // this callback happens to carry — while writing ONE set of per-view state
+    // (`touchStartPoint`, `lastPanPoint`, `movedBeyondSlop`, `touchStartTime`).
+    // With two fingers on the live view that state belongs to whichever finger
+    // moved last: a second touch landing mid-drag re-seeds the start point, so
+    // the first finger's lift is judged "stationary and quick" and fires a
+    // CLICK the user never asked for; in absolute mode each extra finger posts
+    // its own LEFTDOWN and the lifts do not pair with them.
+    //
+    // A stray touch is therefore not a harmless no-op here, and the click it
+    // produces is the event the user reports right before the controls die. So
+    // the live view claims exactly one `UITouch` and ignores the rest until it
+    // ends — the same rule the control layer follows. Weak, because UIKit owns
+    // the object and a missed end must not pin it.
+    //
+    // Nothing on this path touches overlay or held-key state: the click is
+    // posted straight to the ring as a LEFTDOWN/LEFTUP pair and no InputGuard
+    // owner, region or face is involved, so a tap on the game can no longer
+    // release what a thumb on a control is holding.
+    // ========================================================================
+    private weak var gameTouch: UITouch?
+
+    /// The claimed finger, if it is in this callback's set.
+    private func ownedTouch(_ touches: Set<UITouch>) -> UITouch? {
+        guard let owned = gameTouch else { return nil }
+        return touches.first { $0 === owned }
+    }
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if pointerButtons(touches, with: event, ending: false) { return }   // ml664
+        // ========================================================================
+        // ml665 — THE CLICK THAT ARRIVES AS A FINGER.
+        //
+        // On iPhone a mouse reaches an app only through AssistiveTouch, and
+        // AssistiveTouch delivers a CLICK as a synthesised `.direct` UITouch at
+        // the accessibility cursor's position. Without this guard that touch ran
+        // the whole finger path below: `winios_post_touch_down` / an absolute
+        // MOVE|LEFTDOWN|ABSOLUTE at the cursor's point, which SNAPS the game's
+        // cursor across the screen — and then GCMouse's relative deltas resume
+        // from wherever it landed. Click, jump, drift, click, jump: the stutter.
+        //
+        // The button itself is not lost: GCMouse's own `pressedChangedHandler`
+        // already reported it (HardwareInput.button), with no position attached,
+        // which is exactly what a mouse-look game wants. So this is pure
+        // de-duplication, and it only applies while a real mouse is live.
+        // ========================================================================
+        if HardwareInput.shared.shouldIgnore(touches, logging: true) { return }
         guard desktopMode else {
+            // ml666: one owner. A live claim is only replaced when its touch is
+            // gone (UIKit deallocated it, or it already ended) — never by a
+            // second finger arriving.
+            if let held = gameTouch, held.phase != .ended, held.phase != .cancelled {
+                return
+            }
             guard let t = touches.first else { return }
+            gameTouch = t
             if gameRelative {
                 let p = t.location(in: self)
                 touchStartPoint = p
@@ -339,8 +550,15 @@ final class MetalBackedView: UIView {
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        // ml664: the pan recogniser owns pointer motion — a second delta from
+        // here would double every click-drag.
+        if touches.contains(where: { $0.type == .indirectPointer }) { return }
+        // ml665: the down was dropped as synthesised, so its moves must be too —
+        // otherwise a click-drag with the AssistiveTouch cursor would turn the
+        // camera a second time on top of the GCMouse deltas already doing it.
+        if HardwareInput.shared.shouldIgnore(touches, logging: false) { return }
         guard desktopMode else {
-            guard let t = touches.first else { return }
+            guard let t = ownedTouch(touches) else { return }   // ml666
             if gameRelative {
                 let p = t.location(in: self)
                 let dx = p.x - lastPanPoint.x, dy = p.y - lastPanPoint.y
@@ -416,8 +634,11 @@ final class MetalBackedView: UIView {
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if pointerButtons(touches, with: event, ending: true) { return }    // ml664
+        if HardwareInput.shared.shouldIgnore(touches, logging: false) { return }  // ml665
         guard desktopMode else {
-            guard let t = touches.first else { return }
+            guard let t = ownedTouch(touches) else { return }   // ml666
+            gameTouch = nil
             if gameRelative {
                 // A stationary, quick lift is a click. Posted with NO move
                 // flag, so wine clicks wherever the GAME's own cursor is —
@@ -469,10 +690,19 @@ final class MetalBackedView: UIView {
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        // ml664: a cancelled pointer touch gets no mask worth reading — drop
+        // every button rather than guess, the same rule ml661 applies to fingers.
+        if touches.contains(where: { $0.type == .indirectPointer }) {
+            HardwareInput.shared.uikitButtons([])
+            return
+        }
+        if HardwareInput.shared.shouldIgnore(touches, logging: false) { return }  // ml665
         guard desktopMode else {
-            guard let t = touches.first else { return }
+            guard let t = ownedTouch(touches) else { return }   // ml666
+            gameTouch = nil
             if gameRelative {
-                // Nothing to release — relative drags never pressed a button.
+                // Nothing to release — relative drags never pressed a button,
+                // and a cancelled touch is never a click.
                 relCarryX = 0; relCarryY = 0
                 return
             }
@@ -521,8 +751,32 @@ final class InputGuard {
 
     /// owner → the virtual-keys that owner currently wants held.
     private var wants: [Int: Set<Int32>] = [:]
-    /// owner → mouse buttons (0 = left, 1 = right) that owner wants held.
+    /// owner → mouse buttons that owner wants held. See `Btn`.
     private var wantBtns: [Int: Set<Int>] = [:]
+
+    /// ml663 — the five buttons a real mouse has. On-screen controls only ever
+    /// ask for `.left`/`.right`; a Bluetooth mouse asks for all of them, and
+    /// they go through the SAME ownership union so an on-screen fire button and
+    /// a physical left button cannot release each other's press.
+    enum Btn {
+        static let left = 0, right = 1, middle = 2, x1 = 3, x2 = 4
+    }
+
+    /// MOUSEEVENTF_* for one button edge. `data` carries XBUTTON1/2, which is
+    /// how X1 and X2 are told apart — they share one flag pair.
+    static func postButton(_ b: Int, down: Bool) {
+        let flags: UInt32
+        var data: UInt32 = 0
+        switch b {
+        case Btn.left:   flags = down ? 0x0002 : 0x0004
+        case Btn.right:  flags = down ? 0x0008 : 0x0010
+        case Btn.middle: flags = down ? 0x0020 : 0x0040
+        case Btn.x1:     flags = down ? 0x0080 : 0x0100; data = 1
+        case Btn.x2:     flags = down ? 0x0080 : 0x0100; data = 2
+        default: return
+        }
+        winios_pointer(0, 0, flags, data)
+    }
     /// What we have actually posted a DOWN for and not yet an UP.
     private var keysDown: Set<Int32> = []
     private var btnsDown: Set<Int> = []
@@ -602,12 +856,8 @@ final class InputGuard {
         keysDown = wantKeys
 
         let wantBtn = wantBtns.values.reduce(into: Set<Int>()) { $0.formUnion($1) }
-        for b in btnsDown.subtracting(wantBtn) {
-            winios_pointer(0, 0, b == 0 ? 0x0004 : 0x0010, 0)   // LEFTUP / RIGHTUP
-        }
-        for b in wantBtn.subtracting(btnsDown) {
-            winios_pointer(0, 0, b == 0 ? 0x0002 : 0x0008, 0)   // LEFTDOWN / RIGHTDOWN
-        }
+        for b in btnsDown.subtracting(wantBtn) { InputGuard.postButton(b, down: false) }
+        for b in wantBtn.subtracting(btnsDown) { InputGuard.postButton(b, down: true) }
         btnsDown = wantBtn
 
         startTickerIfNeeded()
@@ -648,7 +898,14 @@ final class InputGuard {
         heartbeat += 1
         if heartbeat % 4 == 0,
            !keysDown.isEmpty || !btnsDown.isEmpty || drvCount > 0 || AimStickDriver.shared.isRunning {
+            // ml666: `owners` is the number of distinct intents in the union.
+            // An owner that outlives its finger is invisible to the stuck/lost
+            // comparison above (app and driver AGREE that the key is down —
+            // they are both wrong together), so this count is the one number
+            // that names it: owners standing higher than the controls actually
+            // under a thumb is a held-forever key.
             fputs("[input] app keys=\(hex(keysDown)) btns=\(btnsDown.sorted()) " +
+                  "owners=\(Set(wants.keys).union(wantBtns.keys).count) " +
                   "drv=\(hex(drv)) aim(holders=\(AimStickDriver.shared.holderCount) " +
                   "link=\(AimStickDriver.shared.isRunning))\n", stderr)
         }
@@ -722,11 +979,11 @@ struct HoldKeyView: View {
 /// above) the Metal view, and driven from the SwiftUI button through this.
 final class JoystickPadState: ObservableObject {
     /// The directional (arrow-key) stick.
+    ///
+    /// ml666: the only one. There was a second instance for the portrait aim
+    /// stick; that control is gone (see the ml666 note at the portrait key
+    /// row), and with it the reason for the pad to draw more than one face.
     static let shared = JoystickPadState()
-    /// ml660: the aim stick. A SECOND instance rather than a second class —
-    /// the pad is one window-level overlay drawing every stick it is told
-    /// about, so a stick is just a state object with its own centre.
-    static let aim = JoystickPadState(glyph: "scope")
 
     @Published var held = false
     @Published var dir: Int = -1
@@ -790,12 +1047,10 @@ final class PassthroughWindow: UIWindow {
 struct JoystickPadOverlay: View {
     var body: some View {
         GeometryReader { _ in
-            // ml660: one face per registered stick — directional and aim. They
-            // never overlap (each is anchored to its own button's centre) so a
-            // plain ZStack is enough; ordering between them is irrelevant.
+            // ml666: one face, for the directional stick. The aim stick that
+            // shared this overlay has been removed from the HUD.
             ZStack(alignment: .topLeading) {
                 JoystickPadFace(s: JoystickPadState.shared)
-                JoystickPadFace(s: JoystickPadState.aim)
             }
         }
         // MUST ignore the safe area. s.center comes from the button's .global
@@ -1204,14 +1459,30 @@ final class ControlOverlayView: UIView {
         let start: CGPoint
         let seq: Int
         let began: CFTimeInterval
+        /// ml666 — THE TOUCH ITSELF, weakly.
+        ///
+        /// `ObjectIdentifier` is an ADDRESS, and UIKit recycles `UITouch`
+        /// objects between sequences: a table keyed only by the address cannot
+        /// tell "the same finger, still down" from "a new finger that happens to
+        /// have been handed the same object". Keeping the object lets every
+        /// sweep below ask UIKit itself — is this touch still alive, is it still
+        /// the one I began with, what phase does it think it is in — instead of
+        /// trusting a key that can silently mean two different fingers.
+        weak var touch: UITouch?
+        /// Consecutive events in which UIKit did not list this touch as live.
+        /// Two strikes, not one: an event's touch set is assembled before
+        /// delivery, so a single absence is not proof of anything and reaping a
+        /// finger that IS on the glass would release a key mid-hold.
+        var misses = 0
         /// Button whose finger has slid off the edge: released, but still ours.
         var lapsed = false
     }
     private var tracked: [ObjectIdentifier: Track] = [:]
 
     private var touchSeq = 0
-    private var nBegan = 0, nEnded = 0, nCancelled = 0, nMissed = 0
+    private var nBegan = 0, nEnded = 0, nCancelled = 0, nMissed = 0, nRecovered = 0
     private var reportTimer: Timer?
+    private var healthTimer: Timer?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -1228,6 +1499,7 @@ final class ControlOverlayView: UIView {
     func register(_ r: ControlRegion) {
         if regions[r.id] == nil { order.append(r.id) }
         regions[r.id] = r
+        startHealthMonitor()   // ml666: armed as soon as there is a control to lose
         r.pad?.center = CGPoint(x: r.frame.midX, y: r.frame.midY)
         // A region with no window behind it is a control that silently does
         // nothing, which is the exact failure this revision exists to end. Any
@@ -1278,22 +1550,103 @@ final class ControlOverlayView: UIView {
 
     // MARK: touch tracking
 
+    /// ml665 — an AssistiveTouch cursor hovering over a control must not press
+    /// it. The synthesised click is a `.direct` touch with no contact patch (see
+    /// HardwareInput.shouldIgnore), and while a real mouse is live it is always
+    /// a duplicate of a GCMouse button that has already been reported. A touch
+    /// dropped here is simply never tracked, so `move`/`finish` — both of which
+    /// are no-ops for an untracked touch — need no matching guard.
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        for t in touches { begin(t) }
+        reconcile(event)
+        for t in touches where !HardwareInput.shared.shouldIgnore(t, logging: true) {
+            begin(t)
+        }
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        reconcile(event)
         for t in touches { move(t) }
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         for t in touches { finish(key: ObjectIdentifier(t), why: "ended") }
+        reconcile(event)
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         // A touch that began on a button and is still down when the app
-        // resigns active arrives here, not in touchesEnded. Same release path.
+        // resigns active arrives here, not in touchesEnded. Same release path:
+        // the region is released and the touch forgotten, which is the whole of
+        // what a cancel means to a control.
         for t in touches { finish(key: ObjectIdentifier(t), why: "cancelled") }
+        reconcile(event)
+    }
+
+    // ========================================================================
+    // ml666 — REBUILD FROM `UITouch` IDENTITY ON EVERY EVENT.
+    //
+    // ml662 assumed the four callbacks are a complete, balanced ledger: every
+    // `began` is matched by an `ended` or a `cancelled` on the same view. UIKit
+    // does not promise that. A view that is re-parented or whose window is
+    // re-framed under a live finger, an event delivered while the app is being
+    // suspended, a `UITouch` reclaimed for a new sequence — each drops the
+    // closing callback, and a per-touch table keyed by address then holds a
+    // PHANTOM: an entry for a finger that is not on the glass.
+    //
+    // A phantom is not a cosmetic leak. Its `InputGuard` owner is still in the
+    // wants-union, so the key or mouse button it was holding is pinned DOWN for
+    // the rest of the session — pressing that control again changes nothing
+    // (the union already contains it) and releasing it changes nothing (the
+    // phantom still wants it). That is precisely "the buttons stop working",
+    // and for an aim-stick region the phantom also keeps its last deflection in
+    // `AimStickDriver.vecs`, so the camera drifts and the stick reads dead.
+    //
+    // So the table is no longer trusted between events: every callback first
+    // reconciles it against the only authority there is, the live `UITouch`
+    // objects UIKit hands us. Anything tracked that is not among them — or that
+    // UIKit has already deallocated, or that it now reports as ended/cancelled
+    // — is released and forgotten before the new event is processed. No cap, no
+    // per-region exclusivity, nothing that can leave a region unreachable: the
+    // only way to hold a region is to have a live finger on it.
+    // ========================================================================
+    private func reconcile(_ event: UIEvent?) {
+        guard !tracked.isEmpty else { return }
+        // `allTouches` is every touch in the current multi-touch sequence, not
+        // just the ones in this callback's set — including fingers resting on
+        // other controls and on the game view in the other window.
+        var live = Set<ObjectIdentifier>()
+        for t in event?.allTouches ?? [] where t.phase != .ended && t.phase != .cancelled {
+            live.insert(ObjectIdentifier(t))
+        }
+        // Array(): finish() mutates `tracked` from inside the loop.
+        for (k, tk) in Array(tracked) {
+            guard let t = tk.touch else {          // UIKit deallocated it
+                finish(key: k, why: "stale-gone"); continue
+            }
+            if t.phase == .ended || t.phase == .cancelled {
+                finish(key: k, why: "stale-phase"); continue
+            }
+            // `UITouch.view` is the view the touch was delivered to and does
+            // not change for the life of that touch. So a live touch at our
+            // address that UIKit says belongs to ANOTHER view is the recycling
+            // case caught in flight: the object was handed to a new finger
+            // somewhere else (the game view, most often) and our entry is a
+            // phantom. Only trusted when UIKit actually names a view.
+            if let v = t.view, v !== self {
+                finish(key: k, why: "stale-view"); continue
+            }
+            // Absence from `allTouches` is the last resort, and deliberately
+            // the weakest test: two consecutive events plus a grace period
+            // before the finger is declared gone.
+            guard event != nil else { continue }
+            if live.contains(k) {
+                if tk.misses != 0 { var u = tk; u.misses = 0; tracked[k] = u }
+            } else if tk.misses >= 1, CACurrentMediaTime() - tk.began > 0.25 {
+                finish(key: k, why: "stale-absent")
+            } else {
+                var u = tk; u.misses += 1; tracked[k] = u
+            }
+        }
     }
 
     /// The app went away, or the reconciler decided nothing can still be held.
@@ -1302,6 +1655,12 @@ final class ControlOverlayView: UIView {
     }
 
     private func begin(_ t: UITouch) {
+        // ml666: UIKit hands out recycled `UITouch` objects, so this address may
+        // still carry a track whose closing callback never arrived. Releasing it
+        // HERE is what stops the old owner's keys from being pinned down by a
+        // finger that is no longer on the glass — the overwrite this replaces
+        // left that owner in InputGuard's union forever.
+        finish(key: ObjectIdentifier(t), why: "reused")
         let p = t.location(in: self)
         guard let r = region(at: p) else {
             // hitTest said yes and the region list changed before the touch was
@@ -1314,7 +1673,7 @@ final class ControlOverlayView: UIView {
         }
         touchSeq += 1
         let tk = Track(region: r.id, owner: InputGuard.newOwner(), start: p,
-                       seq: touchSeq, began: CACurrentMediaTime())
+                       seq: touchSeq, began: CACurrentMediaTime(), touch: t)
         tracked[ObjectIdentifier(t)] = tk
         nBegan += 1
         let face = ControlFaces.state(r.id)
@@ -1388,6 +1747,23 @@ final class ControlOverlayView: UIView {
     private func finish(key: ObjectIdentifier, why: String) {
         guard let tk = tracked.removeValue(forKey: key) else { return }
         if why == "ended" { nEnded += 1 } else { nCancelled += 1 }
+
+        // ml666 — ONE LINE PER RECOVERED REGION.
+        //
+        // "ended" is the finger lifting; anything else is a release this layer
+        // had to work out for itself, and each reason names a different way the
+        // ledger was broken. A build that never prints these is a build where
+        // the four callbacks really are balanced; a build that prints them says
+        // which mechanism is dropping the close, and the region it would have
+        // left dead is named right there.
+        if why != "ended" {
+            nRecovered += 1
+            let ms = Int((CACurrentMediaTime() - tk.began) * 1000)
+            fputs("[input] recover region=\(tk.region) "
+                  + "(\(regions[tk.region]?.label ?? "gone")) reason=\(why) "
+                  + "id=\(tk.seq) held=\(ms)ms active=\(tracked.count) "
+                  + "(total recovered=\(nRecovered))\n", stderr)
+        }
 
         // Release unconditionally and in both systems. Both calls are no-ops
         // for an owner that held nothing, so there is no case to get right.
@@ -1491,6 +1867,41 @@ final class ControlOverlayView: UIView {
         let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.report(idle: false) }
         RunLoop.main.add(t, forMode: .common)
         reportTimer = t
+    }
+
+    /// ml666 — THE SYMPTOM, NAMED, EVERY FIVE SECONDS.
+    ///
+    /// A dead control is always a region whose touch never ended. Five seconds
+    /// is far longer than any press and longer than most holds that matter:
+    /// a stick held that long is a thumb resting on it and says so, while a
+    /// BUTTON reported here for minutes on end is the failure itself, named,
+    /// with the reason its release never came still in the log above it.
+    ///
+    /// Silent when nothing qualifies, so it costs a running game nothing. It
+    /// also re-reconciles with no event in hand (`reconcile(nil)` still reaps
+    /// touches UIKit has deallocated or already ended), which is what un-sticks
+    /// a region when no further touch ever arrives to do it.
+    func startHealthMonitor() {
+        guard healthTimer == nil else { return }
+        let t = Timer(timeInterval: 5.0, repeats: true) { [weak self] _ in self?.health() }
+        RunLoop.main.add(t, forMode: .common)
+        healthTimer = t
+    }
+
+    private func health() {
+        reconcile(nil)
+        let now = CACurrentMediaTime()
+        var stale: [String] = []
+        for tk in tracked.values where now - tk.began > 5.0 {
+            stale.append(String(format: "%@(%@,%ds%@)", tk.region,
+                                regions[tk.region]?.kind.name ?? "gone",
+                                Int(now - tk.began), tk.lapsed ? ",off" : ""))
+        }
+        guard !stale.isEmpty else { return }
+        fputs("[input] health held>5s=[\(stale.sorted().joined(separator: " "))] "
+              + "active=\(tracked.count) regions=\(order.count) "
+              + "began=\(nBegan) ended=\(nEnded) cancelled=\(nCancelled) "
+              + "recovered=\(nRecovered) missed=\(nMissed)\n", stderr)
     }
 
     /// One line a second while anything is held, plus one when the last finger
@@ -1646,67 +2057,17 @@ struct JoystickKeyView: View {
     }
 }
 
-/// ml660 — the AIM stick: the directional stick's twin, for mouse-look.
-///
-/// Deliberately the same control in every visible respect (same face, same
-/// key-sized idle ring, same expand-under-the-thumb pad, same window-level
-/// host) so the pair reads as one set. Two things differ, and both follow from
-/// what it drives:
-///
-///   • Deflection is ANALOGUE, not snapped to eight sectors. A d-pad snaps
-///     because a key is binary; a camera is not, and aiming with 45° quantised
-///     directions is unusable.
-///   • Holding it still off-centre keeps producing motion (AimStickDriver's
-///     display link) instead of holding a key down.
-///
-/// It does NOT touch InputSettings.relative: that toggle governs what a finger
-/// on the live view does, and the whole point of the stick is to aim with the
-/// thumb while taps on the view keep clicking.
-///
-/// ml662: this is the control the "a stray tap killed my aim" report was about.
-/// It no longer owns a gesture, so nothing arbitrates it: its finger is its own
-/// from began to ended, and a touch on the live view is delivered to a
-/// different view in a different window where it cannot reach this one.
-struct AimStickKeyView: View {
-    static let rid = "portrait.aim"
-
-    @State private var hosted = false
-    @ObservedObject private var face = ControlFaces.state(AimStickKeyView.rid)
-
-    /// Travel, in points of thumb movement, that means full deflection. Smaller
-    /// than the pad radius (58) so the stick reaches its limit well inside the
-    /// ring — you should not have to leave the pad to turn at full rate.
-    private let travel: CGFloat = 34
-    private let deadzone: CGFloat = 6
-
-    var body: some View {
-        Color.clear
-            .frame(width: 34, height: 30)
-            .background(Color.white.opacity(face.down ? 0.30 : 0.15))
-            .cornerRadius(6)
-            .overlay { if !hosted { JoystickFace(held: false, dir: -1,
-                                                 glyph: JoystickPadState.aim.glyph) } }
-            .background(
-                GeometryReader { _ in
-                    Color.clear.onAppear {
-                        if let scene = UIApplication.shared.connectedScenes
-                            .compactMap({ $0 as? UIWindowScene }).first {
-                            JoystickPadHost.attach(to: scene)
-                            TouchControlsHost.attach()   // ml662: the touch layer
-                            hosted = true
-                        }
-                    }
-                }
-            )
-            .animation(.spring(response: 0.32, dampingFraction: 0.62), value: face.down)
-            // Unregistering with the view is what stops the display link when
-            // the pointer panel replaces this row — otherwise the driver would
-            // keep firing at whatever deflection the thumb was at.
-            .controlRegion(Self.rid, "aim",
-                           .aimStick(deadzone: deadzone, travel: travel),
-                           pad: JoystickPadState.aim)
-    }
-}
+// ml666 — THE AIM STICK IS GONE FROM THE HUD.
+//
+// It was the portrait key row's second stick (the "scope" glyph, its own
+// JoystickPadState instance, the `.aimStick` region kind) and the user asked
+// for it to be removed: mouse-look on the live view is the drag path, which
+// needs no on-screen control at all, and the row is short of width.
+//
+// `AimStickDriver` itself STAYS — a physical gamepad's right stick drives it
+// (HardwareInput), which is a different control surface with exactly the same
+// velocity semantics — and so does the `.aimStick` region kind, because it is
+// what that driver is reached through.
 
 // SwiftUI wrapper around the placeholder view.
 // iOS software-keyboard → Wine key events. Each character is mapped to a
@@ -1790,6 +2151,24 @@ final class InputSettings: ObservableObject {
     @Published var relative: Bool  = false { didSet { save() } }
     @Published var sensAbs:  Double = 2.0  { didSet { save() } }
     @Published var sensRel:  Double = 2.0  { didSet { save() } }
+    /// ml663 — HARDWARE mouse gain, and a third slider rather than a reuse of
+    /// `sensRel`, because it is calibrated against something different. sensRel
+    /// converts THUMB TRAVEL (view points, and a thumb has ~40pt of it) into
+    /// mouse counts, so its useful default is 2.0. A mouse already reports
+    /// motion in mouse counts: the honest default is 1.0 — pass them through
+    /// untouched and let the game's own sensitivity slider be the sensitivity
+    /// slider, exactly as on a PC. Sharing one value would mean plugging in a
+    /// mouse doubled its speed for no reason a user could see.
+    @Published var sensMouse: Double = 1.0 { didSet { save() } }
+    /// ml665 — drop AssistiveTouch's synthesised `.direct` touches while a real
+    /// mouse is delivering GCMouse deltas. ON by default because on iPhone the
+    /// synthesised touch is always a duplicate of a click GCMouse already
+    /// reported, and letting it through is what made the pointer jump to the
+    /// accessibility cursor on every click. The knob exists for the device we
+    /// have not seen: if `[hwinput] touch classified …` ever calls a real finger
+    /// synthesised, set `"ignoreTouchesWithMouse": false` in
+    /// Documents/madeira-input.json and the old behaviour comes back exactly.
+    @Published var ignoreTouchesWithMouse = true { didSet { save() } }
     /// ml649: heavy diagnostics. Default OFF so the shipped default is the fast
     /// path; flip it on only when a run needs to be explainable.
     @Published var diagnostics = false { didSet { madeira_set_diag_enabled(diagnostics ? 1 : 0); save() } }
@@ -1811,6 +2190,8 @@ final class InputSettings: ObservableObject {
             relative = j["relative"] as? Bool   ?? false
             sensAbs  = j["sensAbs"]  as? Double ?? 2.0
             sensRel  = j["sensRel"]  as? Double ?? 2.0
+            sensMouse = j["sensMouse"] as? Double ?? 1.0
+            ignoreTouchesWithMouse = j["ignoreTouchesWithMouse"] as? Bool ?? true
             diagnostics = j["diagnostics"] as? Bool ?? false
         }
         loading = false
@@ -1819,7 +2200,9 @@ final class InputSettings: ObservableObject {
 
     private func save() {
         guard !loading else { return }
-        let j: [String: Any] = ["relative": relative, "sensAbs": sensAbs, "sensRel": sensRel, "diagnostics": diagnostics]
+        let j: [String: Any] = ["relative": relative, "sensAbs": sensAbs, "sensRel": sensRel,
+                                "sensMouse": sensMouse, "diagnostics": diagnostics,
+                                "ignoreTouchesWithMouse": ignoreTouchesWithMouse]
         guard let d = try? JSONSerialization.data(withJSONObject: j) else { return }
         try? d.write(to: Self.url, options: .atomic)
     }
@@ -1838,6 +2221,9 @@ struct ContentView: View {
     @State private var entitlements: EntitlementStatus?
     @State private var debuggerAttached = isDebuggerAttached()
     @ObservedObject private var input = InputSettings.shared
+    /// ml663: so the pointer-lock button and the mouse slider appear exactly
+    /// when there is a mouse to aim them at, and vanish when it is unplugged.
+    @ObservedObject private var hw = HardwareInput.shared
     @State private var pointerPanel = false
     @Namespace private var pointerNS
     /// .compact = iPhone landscape: game surface expands, arrow keys appear.
@@ -1857,6 +2243,12 @@ struct ContentView: View {
         // WOW64_DESIGN.md section 8.4, measurement 2: prints
         // "MADEIRA-BENCH: unix-call ns/call = N" and exits 44.
         ("Unix-call bench", "unixcall-bench-x86.exe"),
+        ("Fastsync stress", "sync-x86.exe"),
+        ("FS lookup stress", "fs-x86.exe"),
+        // ml962: ReadProcessMemory/WriteProcessMemory robustness — prints
+        // MADEIRA-READVM lines and exits 48. build/x86-tests/readvm-x86.c
+        // lists what every other status means.
+        ("ReadProcessMemory", "readvm-x86.exe"),
         // Full Win32 path passed verbatim to MADEIRA_EXE — WineProcessBridge
         // detects the backslash and launches it as-is (no syswow64 prefix).
         (#"Mirror's Edge"#, #"C:\Mirrors-Edge\Mirror's Edge\Binaries\MirrorsEdge.exe"#),
@@ -1898,6 +2290,10 @@ struct ContentView: View {
                 jit_install_trap_handler()
                 entitlements = EntitlementStatus.check()
                 logEntitlementStatus()
+                // ml663: GameController's connect notifications only fire for
+                // devices that arrive AFTER an observer exists, so this has to
+                // run before the user can plug anything in. Idempotent.
+                HardwareInput.shared.start()
             }
         }
     }
@@ -1952,11 +2348,14 @@ struct ContentView: View {
                         ControlKeyView(id: "portrait.kbd",   label: "⌨", kind: .keyboardToggle,
                                        fontSize: 20, width: 40, height: 32, secondaryTint: true)
                         JoystickKeyView()
-                        AimStickKeyView()   // ml660: mouse-look twin
                     }
                     .transition(.opacity)
                     pointerToggleButton
                     diagToggleButton
+                    // ml665: no lock button where lock cannot happen (iPhone).
+                    if hw.mouseConnected && HardwareInput.pointerLockAvailable {
+                        pointerLockButton
+                    }
                     Spacer()
                 }
             }
@@ -1965,6 +2364,43 @@ struct ContentView: View {
             // The expanded pad overflows this row; without a raised zIndex the
             // later VStack siblings (action buttons, log) would draw over it.
             .zIndex(10)
+            // ml663: the hardware mouse's own gain. Its own row rather than a
+            // fourth control squeezed into the one above, and only while a mouse
+            // is attached — a slider that cannot affect anything is noise.
+            if pointerPanel && hw.mouseConnected {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "computermouse")
+                            .font(.system(size: 13))
+                            .foregroundColor(.secondary)
+                        Slider(value: $input.sensMouse, in: 0.10...8.0)
+                        Text(String(format: "%.2f", input.sensMouse))
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .frame(width: 38, alignment: .trailing)
+                    }
+                    // ml665: two facts the user cannot discover from inside the
+                    // app, and both change how this slider should be set.
+                    // AssistiveTouch applies its OWN tracking-speed scale before
+                    // we ever see a delta (which is why they arrive fractional),
+                    // so a mid Tracking Speed there plus this slider is one gain
+                    // stage the user can reason about instead of two multiplying
+                    // each other. And the requirement itself is not ours to
+                    // remove: iPhone has no other pointer-device path.
+                    if UIDevice.current.userInterfaceIdiom == .phone {
+                        Text("iPhone: AssistiveTouch must be on (Settings ▸ "
+                             + "Accessibility ▸ Touch ▸ AssistiveTouch ▸ Devices). "
+                             + "Set its Tracking Speed to the middle and use this "
+                             + "slider for in-game sensitivity.")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.bottom, 4)
+                .transition(.opacity)
+            }
             Divider()
             actionButtons
             Divider()
@@ -2023,7 +2459,7 @@ struct ContentView: View {
             withAnimation(.easeInOut(duration: 0.28)) { pointerPanel.toggle() }
             // The window-level pads fade themselves; see JoystickPadState.hidden.
             JoystickPadState.shared.hidden = pointerPanel
-            JoystickPadState.aim.hidden = pointerPanel
+            // ml666: the aim stick is gone; only the directional pad fades.
         } label: {
             Image(systemName: pointerPanel ? "xmark" : "cursorarrow")
                 .font(.system(size: 17, weight: .medium))
@@ -2047,6 +2483,39 @@ struct ContentView: View {
                 .frame(minWidth: 40, minHeight: 32)
                 .background(Color.secondary.opacity(0.25))
                 .cornerRadius(6)
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// ml663 — THE WAY BACK OUT.
+    ///
+    /// Pointer lock hides and pins the iOS pointer, which is exactly right while
+    /// the game has the mouse and exactly wrong when the user wants to press
+    /// something in the app. There must always be two ways out of it and neither
+    /// may need the pointer: this button (touch works regardless of lock) and
+    /// the Ctrl+Alt+P chord on the keyboard itself. The landscape overlay's own
+    /// copy sits in its top bar for the same reason.
+    ///
+    /// ml664: it also NAMES THE PATH. Lock means something different on each —
+    /// on `gcmouse` it is containment the user wants, on `uikit` it is the thing
+    /// that would switch the mouse off — so the button says which one it is
+    /// rather than leaving the user to infer it from whether aiming works.
+    private var pointerLockButton: some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            HardwareInput.shared.togglePointerLock()
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: hw.pointerLocked ? "cursorarrow.slash" : "cursorarrow.motionlines")
+                    .font(.system(size: 17, weight: .regular))
+                Text(hw.mousePath == .gcmouse ? "HID"
+                     : hw.mousePath == .uikit ? "UI" : "—")
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+            }
+            .foregroundStyle(.white.opacity(hw.pointerLocked ? 1.0 : 0.35))
+            .frame(minWidth: 52, minHeight: 32)
+            .background(Color.secondary.opacity(0.25))
+            .cornerRadius(6)
         }
         .buttonStyle(.plain)
     }
@@ -2991,6 +3460,49 @@ struct ContentView: View {
                 }
             }
 
+            // Native D3D9 frontend A/B (WOW64_DESIGN.md section 8.5 / 8.8-4).
+            // The i386 d3d9.dll games import is now the thin SHIM; with no knob
+            // set its DllMain forwards all ten exports to d3d9-emulated.dll, so
+            // the default path is the proven emulated DXMT frontend. Writing
+            // "native" into Documents/madeira-d3d9.txt makes the same shim bind
+            // its unix side instead and run the frontend as native ARM64 code in
+            // libdxmt_unix.a -- the whole point of section 8, and the reason the
+            // knob is per session rather than per build: both frontends ship in
+            // the bundle, so the A/B is one file and a relaunch.
+            // "emulated" is the explicit spelling of the default.
+            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-d3d9.txt"), encoding: .utf8) {
+                let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !v.isEmpty {
+                    setenv("MADEIRA_D3D9", v, 1)
+                    logStore.log("D3D9 frontend: MADEIRA_D3D9=\(v) via madeira-d3d9.txt")
+                }
+            }
+
+            // Generic environment passthrough (ml961). Documents/madeira-env.txt:
+            // one NAME=VALUE per line ("#" comments), exported verbatim so any
+            // MADEIRA_* runtime knob (MADEIRA_FASTSYNC=0, MADEIRA_FS_NEGCACHE=0,
+            // MADEIRA_SRV_STATS=0, ...) can be A/B tested on the device without a
+            // rebuild. Applied before the launch so native code sees it from the
+            // first getenv. Only MADEIRA_ and DXMT_ names are honoured, so a stray
+            // line cannot redirect PATH or the loader.
+            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-env.txt"), encoding: .utf8) {
+                for raw in txt.split(whereSeparator: { $0.isNewline }) {
+                    let line = raw.trimmingCharacters(in: .whitespaces)
+                    if line.isEmpty || line.hasPrefix("#") { continue }
+                    guard let eq = line.firstIndex(of: "=") else { continue }
+                    let name = String(line[..<eq]).trimmingCharacters(in: .whitespaces)
+                    let value = String(line[line.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+                    guard name.hasPrefix("MADEIRA_") || name.hasPrefix("DXMT_") else {
+                        logStore.log("madeira-env.txt: ignoring \(name) (only MADEIRA_*/DXMT_* names are honoured)")
+                        continue
+                    }
+                    setenv(name, value, 1)
+                    logStore.log("Env override: \(name)=\(value) via madeira-env.txt")
+                }
+            }
+
             // ===== FEX JIT settings (ml900) =====================================
             // Generic passthrough for FEX's own configuration, same shape as the
             // DXMT block above. Madeira ships no /usr/share/fex-emu/Config.json and
@@ -3757,6 +4269,14 @@ final class ControlsWindow: UIWindow {
         // mode, so the edit-mode branch below still wins there.
         let ov = ControlOverlayView.shared
         if ov.window === self, ov.region(at: convert(point, to: ov)) != nil { return ov }
+        // ml665: the AssistiveTouch hint banner lives in this window's hosting
+        // view, and in PORTRAIT the guard below hands everything outside a
+        // control region straight through — which would make the banner's
+        // dismiss button untappable. Its published rect is the one exception.
+        if HardwareInput.shared.assistiveTouchHint,
+           HardwareInput.hintRect.contains(point) {
+            return super.hitTest(point, with: event)
+        }
         // Edit mode owns the whole screen: drags and the scale pinch must not
         // leak through and swing the camera while you are arranging buttons.
         if m.editing { return super.hitTest(point, with: event) }
@@ -3828,6 +4348,7 @@ enum TouchControlsHost {
 
 struct TouchControlsOverlay: View {
     @ObservedObject private var m = TouchControlsModel.shared
+    @ObservedObject private var hw = HardwareInput.shared
     @State private var pinchBase: Double?
 
     var body: some View {
@@ -3846,6 +4367,11 @@ struct TouchControlsOverlay: View {
                         MappingPanel(control: m.controls[i], screen: geo.size)
                     }
                 }
+                // ml665: OUTSIDE the landscape branch. A mouse that enumerates
+                // and never reports is exactly as broken in portrait, and this
+                // window is the only surface that is above the game in both
+                // orientations.
+                if hw.assistiveTouchHint { assistiveTouchBanner(landscape: landscape) }
             }
             .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
             .contentShape(Rectangle())
@@ -3854,9 +4380,77 @@ struct TouchControlsOverlay: View {
         .ignoresSafeArea()
     }
 
+    /// ml665 — the one thing the app cannot do for the user.
+    ///
+    /// iPhone routes every pointer device through AssistiveTouch; there is no
+    /// public HID path and `prefersPointerLocked` is an iPad API. So when a
+    /// mouse enumerates and ten seconds pass with no GCMouse delta, the ONLY
+    /// useful thing to show is the exact settings path. Raised once per session
+    /// (HardwareInput.armAssistiveTouchHint), cleared by the first delta, and
+    /// dismissable — its rect is published to `HardwareInput.hintRect` so
+    /// `ControlsWindow.hitTest` lets the dismiss button through in portrait,
+    /// where that window deliberately consumes nothing else.
+    private func assistiveTouchBanner(landscape: Bool) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "computermouse")
+                .font(.system(size: 15))
+                .foregroundStyle(.white.opacity(0.9))
+            Text("Mouse detected. iPhone needs AssistiveTouch: "
+                 + "Settings > Accessibility > Touch > AssistiveTouch > On, then Devices")
+                .font(.system(size: 12))
+                .foregroundStyle(.white)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            Button {
+                HardwareInput.shared.dismissAssistiveTouchHint()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.8))
+                    .frame(width: 32, height: 32)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(GlassShape())
+        .padding(.horizontal, 12)
+        // Landscape puts topBar at the top of this same window; sit under it.
+        .padding(.top, landscape ? 62 : 8)
+        .background(GeometryReader { g -> Color in
+            // Window coords: this window is full-screen, so .global is its own
+            // coordinate space. Published rather than recomputed in hitTest
+            // because hitTest has no access to SwiftUI layout.
+            let f = g.frame(in: .global)
+            DispatchQueue.main.async { HardwareInput.hintRect = f }
+            return Color.clear
+        })
+        .transition(.opacity)
+    }
+
     private var topBar: some View {
         HStack(spacing: 10) {
             glassButton("gamecontroller", dim: !m.visible) { m.visible.toggle() }
+            // ml663: landscape is where a keyboard and mouse are actually used,
+            // so the escape hatch from pointer lock has to be reachable HERE —
+            // by touch, which pointer lock does not affect. (Ctrl+Alt+P does the
+            // same thing without leaving the keyboard.)
+            // ml665: and not at all on iPhone, where `prefersPointerLocked` is
+            // inert — the cursor on screen is AssistiveTouch's, not UIKit's.
+            if hw.mouseConnected && HardwareInput.pointerLockAvailable {
+                // ml664: three states, not two. Locked; unlocked on the raw HID
+                // path (lock is available and useful); unlocked on the UIKit
+                // path (lock is refused — it would stop pointer delivery). The
+                // glyph distinguishes them so "the button does nothing" is never
+                // the only symptom.
+                glassButton(hw.pointerLocked ? "cursorarrow.slash"
+                            : hw.mousePath == .uikit ? "cursorarrow.click.badge.clock"
+                            : "cursorarrow.motionlines",
+                            dim: !hw.pointerLocked) {
+                    HardwareInput.shared.togglePointerLock()
+                }
+            }
             glassButton(m.editing ? "checkmark" : "pencil") {
                 m.editing.toggle()
                 if !m.editing { m.selected = nil }
@@ -4149,7 +4743,10 @@ struct MappingPanel: View {
             section("Pointer, sticks & special", [
                 ("L click", .mouseLeft), ("R click", .mouseRight),
                 ("WASD", .joystickWASD), ("Arrows", .joystickArrows),
-                ("Aim", .joystickMouse),
+                // ml666: no "Aim" entry — the mouse-look stick is off the HUD.
+                // `.joystickMouse` stays in ControlAction so a layout saved
+                // before this build still decodes and still works; it just
+                // cannot be assigned to a new control any more.
                 ("Keyboard", .keyboardToggle), ("None", .none),
             ])
             section("Letters", letters)

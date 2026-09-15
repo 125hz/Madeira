@@ -650,6 +650,9 @@ static inline void ios_srv_thr_bump( unsigned int tid )
     __atomic_fetch_add( &ios_srv_thr_count[0], 1, __ATOMIC_RELAXED );
 }
 
+static int ios_srv_stats_busy;   /* ml962: serialises the two callers below */
+static int ios_srv_stats_enabled(void);
+
 static void ios_srv_stats_report( unsigned long long now )
 {
     unsigned int top_kind[IOS_SRV_STATS_TOP_KINDS], top_thr[IOS_SRV_STATS_TOP_THR];
@@ -658,13 +661,21 @@ static void ios_srv_stats_report( unsigned long long now )
      * that can be a FEX/CEF-created thread with a small stack.  Only one
      * thread is ever inside this function — the deadline CAS in
      * ios_srv_stats_account() elects exactly one per window and publishes the
-     * next deadline before calling — so one shared set is safe. */
+     * next deadline before calling, and ios_srv_stats_report_now() takes the
+     * ios_srv_stats_busy flag — so one shared set is safe. */
     static unsigned int counts[REQ_NB_REQUESTS], thr_counts[IOS_SRV_THR_SLOTS];
     static unsigned long long ticks[REQ_NB_REQUESTS];
     unsigned long long total_ns = 0, window_ns;
     unsigned int total = 0, nt[IOS_NT_COUNTER_MAX];
     char line[1024];
-    int i, j, n, len;
+    int i, j, n, len, expect = 0;
+
+    /* ml962: the window reporter is elected by the deadline CAS, but the
+     * process-exit reporter below is not, and both use the static snapshot
+     * arrays.  One CAS keeps them from overlapping; a losing caller simply
+     * skips its report rather than interleaving lines with the winner's. */
+    if (!__atomic_compare_exchange_n( &ios_srv_stats_busy, &expect, 1, 0,
+                                      __ATOMIC_ACQUIRE, __ATOMIC_RELAXED )) return;
 
     window_ns = ios_srv_ticks_to_ns( now - ios_srv_stats_window_t0 );
     ios_srv_stats_window_t0 = now;
@@ -682,7 +693,12 @@ static void ios_srv_stats_report( unsigned long long now )
     for (i = 0; i < IOS_NT_COUNTER_MAX; i++)
         nt[i] = __atomic_exchange_n( &ios_srv_nt_counts[i], 0, __ATOMIC_RELAXED );
 
-    if (!total && !nt[IOS_NT_DELAY_ZERO] && !nt[IOS_NT_ALERT_WAIT]) return;
+    if (!total && !nt[IOS_NT_DELAY_ZERO] && !nt[IOS_NT_ALERT_WAIT] &&
+        !nt[IOS_NT_FAST_HIT] && !nt[IOS_NT_FAST_MISS] && !nt[IOS_FS_LEARN_EVENT])
+    {
+        __atomic_store_n( &ios_srv_stats_busy, 0, __ATOMIC_RELEASE );
+        return;
+    }
 
     /* selection sort of the top N; N is tiny, the arrays are not sorted */
     for (i = 0; i < IOS_SRV_STATS_TOP_KINDS; i++)
@@ -811,6 +827,29 @@ static void ios_srv_stats_report( unsigned long long now )
                     nt[IOS_NT_ALERT_WAIT], nt[IOS_NT_ALERT_WAKE],
                     nt[IOS_NT_FAST_HIT], nt[IOS_NT_FAST_MISS],
                     nt[IOS_NT_FAST_WAKE], nt[IOS_NT_FAST_SLEEP] );
+
+    /* ml962: the cache's own behaviour.  learn_ev+learn_none must track
+     * get_inproc_sync_fd in the kinds line above; if it does and both stay
+     * high while relearn is high too, the (handle>>2) slot is being fought
+     * over rather than warmed. */
+    wine_log_write( "[srv-stats]   fastsync cache: learn_ev=%u learn_none=%u relearn=%u "
+                    "stale_gen=%u evict=%u",
+                    nt[IOS_FS_LEARN_EVENT], nt[IOS_FS_LEARN_NONE], nt[IOS_FS_RELEARN],
+                    nt[IOS_FS_STALE_GEN], nt[IOS_FS_EVICT] );
+
+    __atomic_store_n( &ios_srv_stats_busy, 0, __ATOMIC_RELEASE );
+}
+
+/* ml962: print one report immediately, wherever the caller is.  The 10 s
+ * window reporter is piggy-backed on server traffic, so a process that dies
+ * in its first few seconds -- which is exactly the case the fastsync counters
+ * are needed for -- used to produce no [srv-stats] at all.  Called from the
+ * MADEIRA-EXIT path in process_ios.c. */
+void ios_srv_stats_report_now(void)
+{
+    if (!ios_srv_stats_enabled()) return;
+    wine_log_write( "[srv-stats] final report (process exit)" );
+    ios_srv_stats_report( mach_absolute_time() );
 }
 
 static inline void ios_srv_stats_account( unsigned int kind, unsigned long long t0 )

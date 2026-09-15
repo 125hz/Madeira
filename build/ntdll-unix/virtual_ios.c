@@ -576,6 +576,88 @@ static void ios_window_inventory( const char *why, unsigned long long lo_arg, un
 extern unsigned long long ios_last_footprint_mb;
 extern int ios_fast_footprint;
 
+/* ml960 (perf round 4): THE CENSUS WAS COSTING 4.4-4.8 % OF ALL CPU.
+ *
+ * [prof] on a 32-bit D3D9 title at ~30 fps put mach_msg2_trap <-
+ * ios_pool_warmer_thread at 4.4-4.8 % of all CPU in EVERY window — one call
+ * site, and it is the mach_vm_region_recurse walk of [phys-map]. The arithmetic:
+ * the walk is ~80-130k regions, it ran "every 5th cycle", and ml670 pinned the
+ * loop period at 250 ms for the whole session the moment d3d11 loaded
+ * (ios_fast_footprint is set once and never cleared), so "every 5th cycle" is
+ * every 1.25 s => 65-100k mach traps per second, forever. [window] (12-13k
+ * regions / 3.75 s), [slot#] (4 x 16 GB walks) and [pool-rot] (one
+ * mach_vm_region per 256 KB of .text) rode the same amplified timer.
+ *
+ * None of these walks feeds a MECHANISM. Verified consumer by consumer:
+ *   - ios_slot_probe / ios_window_inventory / ios_bigres_report are dprintf-only
+ *     and their VALUABLE callers are the event-driven ones (jumbo reserve failed,
+ *     hinted jumbo retry exhausted) which are untouched here.
+ *   - [pool-rot] only reports .text pages that lost EXECUTE; it takes no
+ *     corrective action, and the real repair path is the fault handler.
+ *   - [phys-map] is pure attribution for offline reading.
+ *   - [jit-pool] STALE and the leaked-hold release run on the ALLOCATION paths,
+ *     not on this thread, and are not touched.
+ *   - [census-hold] RPMALLOC-REPAIR (signal_arm64_ios.c) only PRINTS a
+ *     breadcrumb that the FEX-side repair already stamped; it repairs nothing.
+ * So every one of them is a diagnostic and can default to off.
+ *
+ * New shape (three independent wall-clock deadlines, not "every Nth cycle" of a
+ * period that another subsystem moves underneath them):
+ *   - pool-warmer page touch: every 2 s, its designed ml104 cadence (~150-260 us
+ *     per pass; RX top-up still 1 pass in rx_every, i.e. every 32 s).
+ *   - heartbeat: every 10 s — one task_info() for [footprint], the malloc zone
+ *     tripwire, and ios_pump_sample().
+ *   - full region census ([phys-map] [slot#] [window] [pool-rot] [bigres-use]):
+ *     OFF unless MADEIRA_VMCENSUS=1 (or Documents/madeira-vmcensus.txt contains
+ *     a non-zero number), then every 60 s.
+ * ml668/ml670's terminal-burst capture is KEPT but bounded: fast (250 ms)
+ * [footprint] sampling for IOS_FOOTPRINT_BURST_MS after the d3d11 phase trigger,
+ * and whenever a sample is actually within ~1.2 GB of the 4096 MB jetsam ceiling
+ * — which is what ml668's own comment says, while its code said 2400 MB and a
+ * healthy 2441 MB steady state therefore pinned it on forever. */
+#define IOS_WARM_PERIOD_MS        2000u
+#define IOS_HEARTBEAT_MS         10000u
+#define IOS_CENSUS_PERIOD_MS     60000u
+#define IOS_FOOTPRINT_FAST_MS      250u
+#define IOS_FOOTPRINT_BURST_MS  120000u   /* ml670 phase trigger, time-bounded */
+#define IOS_FOOTPRINT_NEAR_MB     2900u   /* 4096 MB ceiling minus ~1.2 GB */
+
+static unsigned long long ios_mono_ms( void )
+{
+    struct timeval tv;
+    gettimeofday( &tv, NULL );
+    return (unsigned long long)tv.tv_sec * 1000ull + (unsigned long long)tv.tv_usec / 1000ull;
+}
+
+/* ml960: the knob. Env first (that is how every other unix-side knob in this
+ * file is spelled — MADEIRA_POOL_WARM, MADEIRA_POOL_MB); Documents file second,
+ * so the census can be turned on ON DEVICE without an app rebuild.  WINEPREFIX's
+ * parent IS the app's Documents directory (same derivation as the
+ * [share-probe] tee further down). */
+static int ios_vmcensus_enabled( void )
+{
+    const char *e = getenv( "MADEIRA_VMCENSUS" );
+    char buf[32];
+
+    if (!e || !*e)
+    {
+        const char *wp = getenv( "WINEPREFIX" );
+        if (wp && strlen( wp ) < 440)
+        {
+            char path[512];
+            int fd;
+            snprintf( path, sizeof(path), "%s/../madeira-vmcensus.txt", wp );
+            if ((fd = open( path, O_RDONLY )) >= 0)
+            {
+                ssize_t n = read( fd, buf, sizeof(buf) - 1 );
+                close( fd );
+                if (n > 0) { buf[n] = 0; e = buf; }
+            }
+        }
+    }
+    return (e && atoi( e ) > 0);
+}
+
 /* ml901 (perf round 2): pool-warmer cost control.
  *
  * WHAT THE RX PASS WAS FOR (ml121, quoted above the removed code below): the
@@ -608,6 +690,11 @@ static void *ios_pool_warmer_thread( void *arg )
     unsigned cycle = 0;
     int warm_enabled = 1;
     unsigned rx_every = 16;
+    /* ml960: independent wall-clock deadlines (ms).  Everything below used to
+     * hang off "cycle % N" of a loop period that ml670 silently multiplied by 8. */
+    int vmcensus = 0;
+    unsigned long long next_warm = 0, next_beat = 0, next_census = 0, next_fp = 0;
+    unsigned long long fast_since = 0;
     {
         const char *e = getenv( "MADEIRA_POOL_WARM" );
         if (e && *e)
@@ -616,14 +703,40 @@ static void *ios_pool_warmer_thread( void *arg )
             if (v <= 0) warm_enabled = 0;
             else rx_every = (unsigned)v;
         }
-        dprintf(2, "[pool-warmer] rev=ml901 enabled=%d rx_every=%u cycles (knob MADEIRA_POOL_WARM)\n",
-                warm_enabled, rx_every);
+        dprintf(2, "[pool-warmer] rev=ml960 enabled=%d rx_every=%u passes period=%ums "
+                   "(knob MADEIRA_POOL_WARM)\n",
+                warm_enabled, rx_every, IOS_WARM_PERIOD_MS);
     }
+    vmcensus = ios_vmcensus_enabled();
+    dprintf(2, "[vm-census] rev=ml960 enabled=%d (knob MADEIRA_VMCENSUS=1 or a non-zero "
+               "Documents/madeira-vmcensus.txt) — heartbeat [footprint] every %us; "
+               "[phys-map]/[slot#]/[window]/[pool-rot]/[bigres-use] region walks %s\n",
+            vmcensus, IOS_HEARTBEAT_MS / 1000u,
+            vmcensus ? "ON, every 60s" : "OFF (they cost ~4.5% of all CPU when on)");
     for (;;)
     {
         volatile const char *rw = (volatile const char *)ios_jit_rw_base_global;
         volatile const char *rx = (volatile const char *)ios_jit_rx_base_global;
         size_t total = ios_jit_pool_size_global;
+        /* ml960: one tick, four independent deadlines.  The tick itself does
+         * nothing but compare them, so its rate only bounds the resolution of
+         * the fast footprint sampler. */
+        unsigned long long now_ms = ios_mono_ms();
+        int do_warm   = (now_ms >= next_warm);
+        int do_beat   = (now_ms >= next_beat);
+        int do_census = (vmcensus && now_ms >= next_census);
+        int fp_fast, do_fp;
+
+        if (ios_fast_footprint && !fast_since) fast_since = now_ms;
+        fp_fast = (fast_since && now_ms - fast_since < IOS_FOOTPRINT_BURST_MS)
+                  || ios_last_footprint_mb >= IOS_FOOTPRINT_NEAR_MB;
+        do_fp = do_beat || (fp_fast && now_ms >= next_fp);
+
+        if (do_warm)   next_warm   = now_ms + IOS_WARM_PERIOD_MS;
+        if (do_beat)   next_beat   = now_ms + IOS_HEARTBEAT_MS;
+        if (do_census) next_census = now_ms + IOS_CENSUS_PERIOD_MS;
+        if (do_fp)     next_fp     = now_ms + IOS_FOOTPRINT_FAST_MS;
+
         if (rw && total)
         {
             size_t head = jit_pool_offset;               /* snapshot; only grows */
@@ -636,11 +749,12 @@ static void *ios_pool_warmer_thread( void *arg )
             if (head > total) head = total;
             if (tail > total) tail = total;
             gettimeofday( &w0, NULL );
-            if (warm_enabled)
+            if (warm_enabled && do_warm)
             {
                 for (o = 0; o < head; o += 0x4000) { sink += rw[o]; touched++; }
                 for (o = total - tail; o < total; o += 0x4000) { sink += rw[o]; touched++; }
-                /* ml901: RX pmap top-up, 1 cycle in rx_every instead of every cycle. */
+                /* ml901: RX pmap top-up, 1 warm pass in rx_every instead of
+                 * every pass (ml960: passes are 2 s, so every 32 s). */
                 if (rx && (cycle % rx_every) == 0)
                 {
                     did_rx = 1;
@@ -651,15 +765,19 @@ static void *ios_pool_warmer_thread( void *arg )
             gettimeofday( &w1, NULL );
             warm_us = (w1.tv_sec - w0.tv_sec) * 1000000 + (w1.tv_usec - w0.tv_usec);
             (void)sink;
-            cycle++;
-            if (cycle == 1 || (cycle % 30) == 0)
-                dprintf(2, "[pool-warmer] rev=ml901 cycle=%u touched=%lu pages rx_pass=%d cost=%ldus "
-                        "(head=0x%lx tail=0x%lx)\n",
-                        cycle, (unsigned long)touched, did_rx, warm_us,
-                        (unsigned long)head, (unsigned long)tail);
-            /* task #35: report the three pool slots every ~30s on this existing
-             * timer — see ios_slot_probe. Cheap (a few mach queries) and it is
-             * the only signal that says whether the ceiling is doing its job. */
+            if (do_warm)
+            {
+                cycle++;
+                /* ml960: one warm pass per 2 s, so this line is every 60 s. */
+                if (cycle == 1 || (cycle % 30) == 0)
+                    dprintf(2, "[pool-warmer] rev=ml960 cycle=%u touched=%lu pages rx_pass=%d cost=%ldus "
+                            "(head=0x%lx tail=0x%lx)\n",
+                            cycle, (unsigned long)touched, did_rx, warm_us,
+                            (unsigned long)head, (unsigned long)tail);
+            }
+            /* task #35: report the pool slots — see ios_slot_probe. ml960: it is
+             * NOT "a few mach queries": each of the four 16 GB slots is walked
+             * region by region, so it rides the census gate with the rest. */
             /* ml136 CATCH THE REPLACEMENT WHEN IT HAPPENS, not at the exec fault.
              *
              * ml134 proved a live pool RX page had max_prot=0x3 when a healthy
@@ -683,7 +801,11 @@ static void *ios_pool_warmer_thread( void *arg )
              * ios_jit_mappings already records text_offset/text_size per module,
              * so walk exactly those ranges: any .text page whose max_prot has
              * lost EXECUTE is real corruption, with no benign explanation. */
-            if ((cycle % 5) == 0 && rx)
+            /* ml960: census-gated (was every 5th cycle = every 1.25 s). One
+             * mach_vm_region per 256 KB of every module's .text — ~250 traps a
+             * pass in the measured run. Log-only: it reports corruption, it does
+             * not repair it, so it is a diagnostic like the rest. */
+            if (do_census && rx)
             {
                 unsigned mi;
                 size_t bad = 0, checked = 0;
@@ -719,23 +841,28 @@ static void *ios_pool_warmer_thread( void *arg )
                 if (bad)
                     dprintf(2, "[pool-rot] %lu of %lu sampled .text pages LOST EXEC (cycle=%u)\n",
                             (unsigned long)bad, (unsigned long)checked, cycle);
-                else if (cycle % 15 == 0)
+                else
                     dprintf(2, "[pool-rot] clean: %lu .text pages sampled across %u mappings (cycle=%u)\n",
                             (unsigned long)checked, ios_jit_mapping_count, cycle);
             }
-            if (cycle == 1 || (cycle % 15) == 0)
+            /* ml469 (wall #79): one-shot proof of whether TCP loopback
+             * works at all under this port — the webhelper's transport
+             * ws://localhost dial loop never completes and steam.exe's own
+             * connectivity test says NoLAN, but nothing on record shows a
+             * loopback connect succeeding here.  Raw BSD sockets, below
+             * wine, so a failure indicts the platform layer directly.
+             * ml960: one-shot, so it keeps riding the warm pass, not the census. */
+            if (do_warm && cycle == 1)
             {
-                /* ml469 (wall #79): one-shot proof of whether TCP loopback
-                 * works at all under this port — the webhelper's transport
-                 * ws://localhost dial loop never completes and steam.exe's own
-                 * connectivity test says NoLAN, but nothing on record shows a
-                 * loopback connect succeeding here.  Raw BSD sockets, below
-                 * wine, so a failure indicts the platform layer directly. */
-                if (cycle == 1)
-                {
-                    extern void ios_loopback_selftest(void);
-                    ios_loopback_selftest();
-                }
+                extern void ios_loopback_selftest(void);
+                ios_loopback_selftest();
+            }
+            /* ml960: census-gated (was every 15th cycle = every 3.75 s).
+             * [window] alone walked 12-13k regions a pass. Both probes are
+             * dprintf-only; the callers that matter are the event-driven ones at
+             * "jumbo reserve failed" / "hinted jumbo retry exhausted", untouched. */
+            if (do_census)
+            {
                 ios_slot_probe( "periodic" );
                 /* ml121 probe-design fix: the inventory was wired ONLY to the
                  * jumbo-failure sites, and ml121 died before any jumbo call, so
@@ -744,7 +871,7 @@ static void *ios_pool_warmer_thread( void *arg )
                 ios_window_inventory( "periodic", 0x7048000000ULL, 0x7400000000ULL );
                 ios_bigres_report( "periodic" );
             }
-            /* ml358 FOOTPRINT (every cycle, one line): phys_footprint is the
+            /* ml358 FOOTPRINT (one line per heartbeat): phys_footprint is the
              * EXACT number jetsam kills on — everything else in this file
              * measures address space, which is not what got us killed (ml357:
              * "Terminated due to memory issue" with pools at 0% committed).
@@ -754,12 +881,21 @@ static void *ios_pool_warmer_thread( void *arg )
              * ledger total. Peak is tracked so a pull after death still shows
              * how close the run got. */
             /* ml398 (task #60): sample the beacon-marked chrome_ipc pump
-             * thread's Mach state each cycle — see ios_pump_sample() in
-             * signal_arm64_ios.c. */
+             * thread's Mach state — see ios_pump_sample() in
+             * signal_arm64_ios.c.
+             * ml960: moved onto the 10 s heartbeat (was every cycle = 4x/s).
+             * It is not a single sample: it also runs ios_alert_ring_dump()
+             * ([alert-ring]), ios_alert_waiter_dump() ([waiters]), the orphan-lock
+             * stamp sweep and ios_lock_census() — together ~2-3 mach calls per
+             * registered thread, i.e. a few hundred traps per call, plus four log
+             * lines. All of it is stall forensics for a wedge that is not
+             * happening while frames are being presented. */
+            if (do_beat)
             {
                 extern void ios_pump_sample(void);
                 ios_pump_sample();
             }
+            if (do_fp)
             {
                 task_vm_info_data_t vmi;
                 mach_msg_type_number_t vmi_cnt = TASK_VM_INFO_COUNT;
@@ -770,7 +906,7 @@ static void *ios_pool_warmer_thread( void *arg )
                     unsigned long long fp_mb = (unsigned long long)vmi.phys_footprint >> 20;
                     if (fp_mb > peak_mb) peak_mb = fp_mb;
                     ios_last_footprint_mb = fp_mb;      /* ml668: drives the sampler cadence */
-                    dprintf(2, "[footprint] rev=ml358 phys=%llu MB (peak %llu) internal=%llu MB "
+                    dprintf(2, "[footprint] rev=ml960 phys=%llu MB (peak %llu) internal=%llu MB "
                             "compressed=%llu MB external=%llu MB reusable=%llu MB (cycle=%u)\n",
                             fp_mb, peak_mb,
                             (unsigned long long)vmi.internal >> 20,
@@ -797,7 +933,15 @@ static void *ios_pool_warmer_thread( void *arg )
              * Self-calibrating: the first PASS is logged too, with its cost in ms.
              * Without that, silence would be ambiguous between "heap healthy" and
              * "probe never ran". If the cost turns out to be large we will see it
-             * immediately and can back the interval off. */
+             * immediately and can back the interval off.
+             *
+             * ml960: moved onto the 10 s heartbeat (was every cycle, i.e. 4 full
+             * heap validations per second once ml670 pinned the loop at 250 ms).
+             * malloc_zone_check walks EVERY block of every zone, so its cost
+             * grows with the heap; it measured 0 ms at cycle 1 with a small heap
+             * and was never re-measured. The bracket it produces widens from
+             * ~2 s to ~10 s, which is still a readable window in the log. */
+            if (do_beat)
             {
                 extern int malloc_zone_check( void *zone );
                 static int zone_bad, zone_announced;
@@ -815,8 +959,8 @@ static void *ios_pool_warmer_thread( void *arg )
                         {
                             zone_bad = 1;
                             dprintf(2, "[zone-check] *** HOST MALLOC ZONE FIRST FAILED AT cycle=%u "
-                                       "(%ld ms) — corruption happened within the last ~2s; read the "
-                                       "log immediately above this line rev=ml566\n", cycle, ms);
+                                       "(%ld ms) — corruption happened within the last ~10s; read the "
+                                       "log immediately above this line rev=ml960\n", cycle, ms);
                         }
                         else if (!zone_announced)
                         {
@@ -834,9 +978,16 @@ static void *ios_pool_warmer_thread( void *arg )
              * vs FEX lookup caches vs CEF heap. Walk the address space and
              * charge private-dirty+swapped pages to each region; the base
              * addresses identify the owner offline (pool = RX base, FEX bands,
-             * PA pools, guest heap). Every 5th cycle plus cycle 2, because the
-             * walk is tens of thousands of kernel calls. */
-            if (cycle == 2 || (cycle % 5) == 0)
+             * PA pools, guest heap).
+             *
+             * ml960: THIS IS THE 4.4-4.8 % — census-gated, and every 60 s when
+             * on. mach_vm_region_recurse is one mach trap per region and the map
+             * carries 80-130k regions, so one pass is ~100k traps; at the
+             * ml670-amplified 1.25 s rate that was 65-100k traps/s of pure
+             * diagnostic, showing up in [prof] as
+             * mach_msg2_trap<-ios_pool_warmer_thread. Nothing consumes the
+             * result but the log. */
+            if (do_census)
             {
                 struct { unsigned long long base, size, dirty, res, swap; unsigned tag; } top[12];
                 unsigned long long dirty_by_tag[256];
@@ -1037,14 +1188,17 @@ static void *ios_pool_warmer_thread( void *arg )
          * samples during texture upload, so every "peak" we quoted was a stale
          * lower bound -- ml664 reported 2733MB when loading was still climbing.
          * Once the footprint is within ~1.2GB of the 4096MB jetsam limit, drop
-         * to 250ms so the terminal burst is actually captured. The expensive
-         * region/band accounting above stays on the slow cycle; only the cheap
-         * task_info() footprint line runs at the fast rate. */
-        {
-            extern unsigned long long ios_last_footprint_mb;
-            extern int ios_fast_footprint;
-            usleep( (ios_fast_footprint || ios_last_footprint_mb >= 2400) ? 250000 : 2000000 );
-        }
+         * to 250ms so the terminal burst is actually captured.
+         *
+         * ml960: the tick is now a FIXED 250 ms and it does nothing on its own —
+         * it only compares the four deadlines at the top of the loop, so its
+         * only job is to bound the RESOLUTION of the fast footprint sampler.
+         * ml668's "the expensive accounting stays on the slow cycle" was the
+         * intent but not the effect: the slow cycle was expressed as a multiple
+         * of this period, so speeding the period up sped THEM up too, and ml670
+         * made that permanent for every D3D title. Deadlines in milliseconds
+         * cannot be re-scaled by accident. */
+        usleep( IOS_FOOTPRINT_FAST_MS * 1000u );
     }
     return NULL;
 }
@@ -6486,6 +6640,14 @@ static int ios_wow_window_teardown( ULONG_PTR base, void *dead_peb, unsigned gua
  * unmapping, and its siblings have not been joined — nothing joins them, see
  * ios_wow_window_retire().  By the time somebody wants the slot back, the dead
  * process has been gone for at least one process creation. */
+/* MADEIRA (WOW64_DESIGN.md §8.9-5, "MOST IMPORTANT"): the native ARM64 D3D9
+ * frontend's per-guest-process teardown, in libdxmt_unix.a.  Native D3D9
+ * objects and the Metal objects behind them outlive the guest pseudo-process
+ * and hold HOST POINTERS INTO THE ARENA — i.e. into the very 4 GB range the
+ * teardown below is about to replace with PROT_NONE.  Dropping them has to
+ * happen first, and the call site below is what asserts that order. */
+extern void d3d9_native_process_teardown( void *peb );
+
 static void ios_wow_reclaim_dead_windows(void)
 {
     unsigned i;
@@ -6525,6 +6687,13 @@ static void ios_wow_reclaim_dead_windows(void)
                      (void *)base, (long long)ts.tv_sec, dead_peb );
             nanosleep( &ts, NULL );
         }
+
+        /* BEFORE the PROT_NONE replace and before ios_jit_purge_window(),
+         * both of which happen inside ios_wow_window_teardown(): the order is
+         * arena pointers dropped, then Metal objects, then the remap (§8.9-5).
+         * Keyed by the same PEB the window registry is, so a second live
+         * 32-bit process keeps its own objects. */
+        d3d9_native_process_teardown( dead_peb );
 
         if (!ios_wow_window_teardown( base, dead_peb, guard_owned ))
         {
@@ -6880,6 +7049,12 @@ static void ios_init_stub_tables(void)
  * winemetal_unix.c to avoid collision with our own ntdll table). */
 extern const void *dxmt_winemetal_unix_call_funcs[];
 
+/* MADEIRA (WOW64_DESIGN.md §8.3): the native ARM64 D3D9 frontend's table,
+ * from the same archive.  Its 324 entries are generated by
+ * research/dxmt/src/d3d9shim/gen_d3d9_thunks.py, and it is `const void *const`
+ * because the generator emits both tables that way. */
+extern const void *const dxmt_d3d9_unix_call_funcs[];
+
 /* iOS-Madeira 2026-05-13: null audio driver unix table. Implements the 37
  * mmdevapi audio funcs to provide a fake "iOS Null" render endpoint with
  * a real-time IAudioClock — enough for FMOD's rhythm-game timing engine
@@ -6934,6 +7109,7 @@ extern NTSTATUS win32u_unix_lib_init(void);
  * A library still absent here has no wow64 table at all: a 32-bit caller is
  * refused rather than silently bound to the 64-bit table. */
 extern const void *dxmt_winemetal_unix_call_wow64_funcs[];
+extern const void *const dxmt_d3d9_unix_call_wow64_funcs[];
 extern const void *ws2_32_unix_call_wow64_funcs[];
 extern const void *bcrypt_unix_call_wow64_funcs[];
 extern const void *secur32_unix_call_wow64_funcs[];
@@ -7134,6 +7310,32 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             libname = "winemetal";
             funcs64 = (const void *)dxmt_winemetal_unix_call_funcs;
             funcs_wow64 = (const void *)dxmt_winemetal_unix_call_wow64_funcs;
+        } else if ((match && strstr(match, "d3d9shim")) ||
+                   (modname && strstr(modname, "d3d9shim"))) {
+            /* MADEIRA (WOW64_DESIGN.md §8.3): the i386 D3D9 shim, bound to
+             * the native ARM64 frontend in libdxmt_unix.a.  Matched on
+             * "d3d9shim" and not on "d3d9" on purpose: the EMULATED frontend
+             * ships beside it as d3d9.dll / d3d9-emulated.dll, imports
+             * winemetal rather than a d3d9 unix side, and must keep getting
+             * the refusal it gets today rather than this table -- whose 324
+             * parameter blocks it has never heard of.
+             *
+             * `modname` is tested as well as `match` because `match` prefers
+             * builtin->unix_path, which for a module installed as d3d9.dll
+             * would read "d3d9.so" and miss.  The EXPORT name stays
+             * d3d9shim.dll whatever filename the DLL is installed under
+             * (build-pe.sh installs it as d3d9.dll), which is exactly the
+             * discrimination this branch needs, and ios_module_export_name()
+             * reads it out of the PE32 export directory.
+             *
+             * Both arrays have the same length by construction (one list in
+             * gen_d3d9_thunks.py, asserted again in C in d3d9_unix_table.c),
+             * and _d3d9_init refuses any caller whose sizeof(void *) is not 4
+             * -- so the 64-bit table can be entered but can never lie about a
+             * result (§7.4 rule 4). */
+            libname = "d3d9shim";
+            funcs64 = (const void *)dxmt_d3d9_unix_call_funcs;
+            funcs_wow64 = (const void *)dxmt_d3d9_unix_call_wow64_funcs;
         } else if (match && (strstr(match, "wineios.drv") || strstr(match, "winecoreaudio") || strstr(match, "winealsa") || strstr(match, "winepulse"))) {
             /* NOTE: mmdevapi does NOT reach the driver through this by-module
              * path — __wine_load_unix_lib() asks for "wine<name>.drv" BY NAME
@@ -19636,6 +19838,152 @@ NTSTATUS WINAPI NtResetWriteWatch( HANDLE process, PVOID base, SIZE_T size )
 }
 
 
+#ifdef WINE_IOS
+/***********************************************************************
+ *           ios_probe_range_readable / ios_copy_in_no_fault   (ml962)
+ *
+ * NtReadVirtualMemory's current-process branch is upstream-written as
+ * `__TRY { memmove } __EXCEPT { STATUS_PARTIAL_COPY }`: the fault is EXPECTED
+ * and the handler is what turns it into ERROR_PARTIAL_COPY.  That contract
+ * does not hold in this port.  A guest crash reporter called
+ * ReadProcessMemory(GetCurrentProcess(), <unmapped>, ...) from its own
+ * alternate stack -- a stack it switched to itself, so outside the TEB's
+ * Tib.StackLimit/StackBase -- and the fault inside _platform_memmove could not
+ * be dispatched at all:
+ *   [mach_exc] sym pc=libsystem_platform.dylib`_platform_memmove+0x1bc
+ *              lr=Madeira`NtReadVirtualMemory+0xf0
+ *   [mach-deliver] rev=ml378 no TEB owns sp=0x702010fbd0 -> BEST-EFFORT delivery
+ *   err:seh:call_seh_handlers invalid frame 702010fbd0 (7020118000-70290FD20)
+ *   err:seh:NtRaiseException Exception frame is not in stack limits
+ *   err:process:NtTerminateProcess exit_code=0xc0000005
+ * The whole process died because a probe that is DOCUMENTED to fail returned
+ * through a path that needs a working exception dispatcher.  Any crash-dump
+ * writer, anti-tamper check or debugger-like scan hits this.
+ *
+ * So on iOS the current-process copy must never depend on a fault being
+ * caught.  Three tiers, cheapest first:
+ *   1. the pages_vprot table says every 4K page of the source is committed and
+ *      readable -> plain memmove, ZERO syscalls.  Guest memory is allocated
+ *      through wow64_NtAllocateVirtualMemory -> NtAllocateVirtualMemory, so
+ *      ordinary guest reads (and ntdll's own PEB/LDT reads) stay on this tier.
+ *   2. otherwise one mach_vm_read_overwrite for the whole range -- covers
+ *      FEX/host mappings that Wine does not own a view for.  It reports
+ *      KERN_INVALID_ADDRESS / KERN_PROTECTION_FAILURE instead of faulting.
+ *   3. on failure, page-by-page mach_vm_read_overwrite to find the readable
+ *      prefix, which is what Windows reports as ERROR_PARTIAL_COPY.
+ * The unmapped guest NULL page has no vprot entry and no Mach region, so it
+ * costs one trap and returns STATUS_PARTIAL_COPY.
+ *
+ * ios_probe_range_readable returns 1 = certainly readable, 0 = certainly not,
+ * -1 = unknown (a VPROT_GUARD page is in the range: only a real fault can grow
+ * a thread stack, so the caller must decide whether to take that risk).
+ */
+static int ios_probe_range_readable( const void *addr, SIZE_T size )
+{
+    const UINT_PTR guest_page_mask = ((UINT_PTR)1 << page_shift) - 1;
+    const char *p, *end;
+    int saw_guard = 0;
+
+    if (!size) return 1;
+    if (!addr) return 0;
+    end = (const char *)addr + size;
+    if (end < (const char *)addr) return 0;          /* wrap */
+
+    /* tier 1: Wine's own page-protection table. Exact per-4K-page bytes, not
+     * the get_host_page_vprot union, so a partially-protected host page is
+     * reported "not readable" and falls through to the Mach tiers rather than
+     * being over-reported as safe. Read without virtual_mutex on purpose --
+     * the same lock-free peek ios_reclaim_page_vprot documents, and a stale
+     * byte only costs us a trip through tier 2. */
+    for (p = ROUND_ADDR( addr, guest_page_mask ); p < end; p += guest_page_mask + 1)
+    {
+        BYTE vprot = get_page_vprot( p );
+        if (vprot & VPROT_GUARD) saw_guard = 1;
+        if (!(get_unix_prot( vprot ) & PROT_READ)) break;
+    }
+    if (p >= end) return 1;
+    if (saw_guard) return -1;
+
+    /* tier 2: the Mach map, for pages Wine has no view for (FEX heap, the JIT
+     * pool, dyld images). Walks region-by-region so a HOLE is detected rather
+     * than mistaken for the containing region -- same shape as
+     * ios_range_writable above. */
+    {
+        mach_vm_address_t a = (mach_vm_address_t)(uintptr_t)addr;
+        mach_vm_address_t stop = (mach_vm_address_t)(uintptr_t)end;
+
+        while (a < stop)
+        {
+            mach_vm_address_t q = a;
+            mach_vm_size_t sz = 0;
+            vm_region_basic_info_data_64_t info;
+            mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t obj = MACH_PORT_NULL;
+
+            if (mach_vm_region( mach_task_self(), &q, &sz, VM_REGION_BASIC_INFO_64,
+                                (vm_region_info_t)&info, &cnt, &obj ) != KERN_SUCCESS)
+                return 0;
+            if (q > a) return 0;                     /* hole */
+            if (!(info.protection & VM_PROT_READ)) return 0;
+            a = q + sz;
+        }
+    }
+    return 1;
+}
+
+/* Copy [addr,addr+size) of THIS task into buffer without ever taking a fault.
+ * Returns the number of bytes copied; *status is STATUS_SUCCESS only for a
+ * complete copy, STATUS_PARTIAL_COPY otherwise (Windows reports the same for
+ * both a short copy and a copy of nothing).
+ *
+ * Overlapping src/dst keeps upstream's memmove semantics only on tier 1;
+ * mach_vm_read_overwrite does not define overlap. That is deliberate and not
+ * reachable from a guest: tier 1 covers everything Wine owns a view for, and
+ * guest memory is all Wine views, so reaching tier 2 means BOTH ends are
+ * host/FEX mappings -- and a call that overlapping would previously have
+ * faulted anyway. */
+static SIZE_T ios_copy_in_no_fault( void *buffer, const void *addr, SIZE_T size,
+                                    unsigned int *status )
+{
+    mach_vm_size_t got = 0;
+    SIZE_T done = 0;
+
+    *status = STATUS_SUCCESS;
+    if (!size) return 0;
+
+    if (ios_probe_range_readable( addr, size ) == 1)
+    {
+        memmove( buffer, addr, size );
+        return size;
+    }
+
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(uintptr_t)addr,
+                                (mach_vm_size_t)size, (mach_vm_address_t)(uintptr_t)buffer,
+                                &got ) == KERN_SUCCESS && got == size)
+        return size;
+
+    /* partially readable range: hand back the readable prefix, page by page,
+     * the way Windows' ReadProcessMemory does. */
+    while (done < size)
+    {
+        SIZE_T off = (SIZE_T)(((uintptr_t)addr + done) & (host_page_size - 1));
+        SIZE_T chunk = min( size - done, (SIZE_T)host_page_size - off );
+
+        got = 0;
+        if (mach_vm_read_overwrite( mach_task_self(),
+                                    (mach_vm_address_t)((uintptr_t)addr + done),
+                                    (mach_vm_size_t)chunk,
+                                    (mach_vm_address_t)((uintptr_t)buffer + done),
+                                    &got ) != KERN_SUCCESS || got != chunk)
+            break;
+        done += chunk;
+    }
+    *status = STATUS_PARTIAL_COPY;
+    return done;
+}
+#endif  /* WINE_IOS */
+
+
 /***********************************************************************
  *             NtReadVirtualMemory   (NTDLL.@)
  *             ZwReadVirtualMemory   (NTDLL.@)
@@ -19652,6 +20000,13 @@ NTSTATUS WINAPI NtReadVirtualMemory( HANDLE process, const void *addr, void *buf
     }
     else if (process == GetCurrentProcess())
     {
+#ifdef WINE_IOS
+        /* ml962: never rely on the __TRY below catching the fault -- see
+         * ios_copy_in_no_fault. virtual_check_buffer_for_write() above has
+         * already pre-faulted the DESTINATION (that is what clears a write
+         * watch), so the copy only has to be made safe on the source side. */
+        size = ios_copy_in_no_fault( buffer, addr, size, &status );
+#else
         __TRY
         {
             memmove( buffer, addr, size );
@@ -19663,6 +20018,7 @@ NTSTATUS WINAPI NtReadVirtualMemory( HANDLE process, const void *addr, void *buf
             size = 0;
         }
         __ENDTRY
+#endif
     }
     else
     {
@@ -19689,6 +20045,32 @@ NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *bu
 {
     unsigned int status;
 
+#ifdef WINE_IOS
+    /* ml962: the same "a documented failure must not need the exception
+     * dispatcher" rule as NtReadVirtualMemory, applied to this function's one
+     * faulting step.
+     *
+     * The TARGET (addr) is already safe: unlike the read path this never
+     * touches it directly -- write_process_memory in build/wineserver/mach_ios.c
+     * does the store with mach_vm_write against the task port, including the
+     * mach_vm_region + temporary-reprotect fallback for a W^X page whose write
+     * permission was dropped when exec was enabled.  Wine's own
+     * VPROT_WRITECOPY / set_protection handling stays where it is, in the
+     * server's write_process_memory, untouched by this change.
+     *
+     * The SOURCE (buffer) is ours, and virtual_check_buffer_for_read() probes
+     * it with __TRY -- the same construct that killed the process on the read
+     * path when the caller ran on a stack outside the TEB's limits.  So decide
+     * it without faulting when we can: a range Mach and the vprot table agree
+     * is unreadable is STATUS_PARTIAL_COPY outright, and only the "unknown"
+     * verdict (-1: a VPROT_GUARD page, where a real fault is the only thing
+     * that grows a thread stack) still goes through the __TRY probe. */
+    if (ios_probe_range_readable( buffer, size ) == 0)
+    {
+        if (bytes_written) *bytes_written = 0;
+        return STATUS_PARTIAL_COPY;
+    }
+#endif
     if (virtual_check_buffer_for_read( buffer, size ))
     {
         SERVER_START_REQ( write_process_memory )

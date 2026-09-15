@@ -1,0 +1,245 @@
+/*
+ * iOS-Madeira ml952: in-process fast sync ("fastsync") cell table.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * On this target the wineserver is a THREAD in the same Mach task as every
+ * guest thread, so a "server round trip" is a socket write, a scheduler hop,
+ * the server's main loop, a socket write back and a second scheduler hop —
+ * measured at ~50 us per request in [srv-stats].  Log 41 showed the 32-bit
+ * title paying that 2900 times a second for event_op (SetEvent/ResetEvent)
+ * and 900 times a second for a single-object infinite wait, all of it between
+ * the game's main thread and its render/worker threads: ~150 us of latency on
+ * every handoff between the two threads that pace the frame.
+ *
+ * Upstream Wine already has the shape of the answer: dlls/ntdll/unix/sync.c's
+ * inproc_set_event()/inproc_wait() hooks, which on Linux hand the operation to
+ * /dev/ntsync and never reach the server.  Those hooks are dead here
+ * (inproc_device_fd < 0, there is no ntsync on iOS).  This header is the iOS
+ * substitute for the ntsync object: a plain array of cells in the ONE address
+ * space that the server and every guest thread share, with the same wake
+ * primitive (os_sync_wait_on_address / __ulock_wait) already used by
+ * NtWaitForAlertByThreadId.
+ *
+ * WHO OWNS WHAT
+ * -------------
+ * The table is DEFINED once, by the server (wine/server/event.c), and
+ * referenced by the client (wine/dlls/ntdll/unix/sync.c).  Both archives are
+ * linked into the one iOS image, so this is a plain cross-archive symbol
+ * reference, exactly like the user_shared_data / shared_session globals the
+ * wineserver build script already has to reason about.
+ *
+ * Cell allocation and freeing are SERVER-ONLY and happen on the server thread
+ * (create_event / event destroy), so they need no lock.  Everything a client
+ * touches is an atomic on one of the four words below.
+ *
+ * THE STATE WORD IS THE SINGLE SOURCE OF TRUTH
+ * --------------------------------------------
+ * For an event that owns a cell, cell->state — not the server's
+ * `event_sync.signaled` bit — is what event_sync_signaled() reads and what
+ * event_sync_satisfied() clears.  There is exactly one place the two can
+ * disagree, and it is deliberate: MADEIRA_CELL_DISABLED (see below).
+ *
+ *   MADEIRA_CELL_RESET     (0)  not signaled.  Also the futex sleep value:
+ *                               a parked client waits for this word to stop
+ *                               being 0.
+ *   MADEIRA_CELL_SET       (1)  signaled, and the token is up for grabs.
+ *   MADEIRA_CELL_CLAIMED   (2)  signaled, but the SERVER has already decided
+ *                               (inside event_sync_signaled) to hand this
+ *                               auto-reset token to one of its own queued
+ *                               waiters.  Clients must not consume it.  This
+ *                               value only ever exists between check_wait()
+ *                               and end_wait() on the server thread, i.e. for
+ *                               a few hundred nanoseconds with no client
+ *                               server-call in between.  It exists because
+ *                               `satisfied' has no return value: without the
+ *                               claim, a client CAS could steal the token
+ *                               after the server's `signaled' said yes, and
+ *                               the server would report WAIT_0 to a thread
+ *                               that never acquired the event.
+ *   MADEIRA_CELL_DISABLED (-1)  this event has left the fast path for good.
+ *                               Set by the first NtPulseEvent on the object
+ *                               (PulseEvent's "release whoever is waiting at
+ *                               this instant and then immediately clear"
+ *                               cannot be expressed on a futex word without
+ *                               losing or duplicating wakeups), and by
+ *                               madeira_cell_free().  While DISABLED the
+ *                               server falls back to its own `signaled' bit
+ *                               and clients always call the server, so the
+ *                               object behaves exactly as it did before this
+ *                               change.
+ *
+ * THE TWO DEKKER PAIRINGS
+ * -----------------------
+ * (1) client setter vs. SERVER waiter.  A server-side waiter must not sleep
+ *     through a set that a client performed with no server call, and a client
+ *     must not skip the server call while the server has someone queued.
+ *
+ *       client NtSetEvent:  store state = SET   (seq_cst)
+ *                           load  srv_waiters   (seq_cst)  -> if != 0, ALSO
+ *                                                             do the event_op
+ *                                                             request so the
+ *                                                             server wakes its
+ *                                                             own queue
+ *       server wait_on():   add   srv_waiters++ (seq_cst)   [event_sync_add_queue]
+ *                           load  state         (seq_cst)   [event_sync_signaled,
+ *                                                             from check_wait,
+ *                                                             which always runs
+ *                                                             after wait_on]
+ *
+ *     Two threads, each storing its own flag with seq_cst and then loading the
+ *     other's with seq_cst: on a total order at least one of the two loads is
+ *     ordered after the other's store, so they cannot both miss.  Worst case
+ *     BOTH see the other and the set is delivered twice — harmless, the second
+ *     delivery is an idempotent store plus a wake_up() over an empty queue.
+ *
+ * (2) client setter vs. CLIENT waiter.  Same shape, with `waiters' in place of
+ *     `srv_waiters':
+ *
+ *       client setter:      store state = SET   (seq_cst)
+ *                           load  waiters       (seq_cst) -> if != 0, wake
+ *       client waiter:      add   waiters++     (seq_cst)
+ *                           load  state         (seq_cst) -> if SET, consume
+ *                                                            and never park
+ *
+ *     and the park itself re-checks: os_sync_wait_on_address is given the
+ *     value the waiter last observed, so a set landing between the load and
+ *     the syscall makes the syscall return immediately rather than sleep.
+ *
+ * GENERATION
+ * ----------
+ * `gen' is bumped on every allocation AND every free, so a client that cached
+ * (index, gen) for a handle can detect that the cell has been recycled under
+ * it and fall back to the server.  A live handle pins the event, and the event
+ * pins the cell, so this only ever fires for the documented-undefined case of
+ * operating on an already-closed handle.
+ */
+
+#ifndef __IOS_FASTSYNC_H
+#define __IOS_FASTSYNC_H
+
+#include <stdint.h>
+
+/* 8192 cells x 32 bytes = 256 KB of BSS, demand-zero, only the touched pages
+ * are ever committed.  A running 32-bit title has a few hundred events; the
+ * allocator simply hands back "no cell" past the end and those events keep the
+ * pre-fastsync behaviour, so the size is a tuning constant, not a limit. */
+#define MADEIRA_SYNC_CELLS      8192
+
+#define MADEIRA_CELL_DISABLED   (-1)
+#define MADEIRA_CELL_RESET      0
+#define MADEIRA_CELL_SET        1
+#define MADEIRA_CELL_CLAIMED    2
+
+struct madeira_sync_cell
+{
+    int          state;        /* MADEIRA_CELL_*; the futex word                 */
+    int          srv_waiters;  /* server wait_queue entries on this object       */
+    int          waiters;      /* client threads parked on &state                */
+    unsigned int gen;          /* bumped on every alloc and every free           */
+    unsigned int manual;       /* 1 = manual-reset (NotificationEvent)           */
+    unsigned int pad[3];       /* keep two cells per 64-byte line                */
+};
+
+extern struct madeira_sync_cell madeira_sync_cells[MADEIRA_SYNC_CELLS];
+
+/* Packing of the get_inproc_sync_fd reply.  `type' is an int carrying a small
+ * enum inproc_sync_type on every other target; bit 30 is free there and says
+ * "this is a Madeira cell reply, there is no fd in flight".  24 bits of index
+ * covers MADEIRA_SYNC_CELLS with room to spare. */
+#define MADEIRA_FAST_REPLY_FLAG    0x40000000
+#define MADEIRA_FAST_REPLY_MANUAL  0x20000000
+#define MADEIRA_FAST_REPLY_IDX(t)  ((t) & 0x00ffffff)
+
+/* ml962: the `event_op' opcode that means "WAKE YOUR QUEUE, DO NOT SIGNAL".
+ *
+ * A client NtSetEvent that finds srv_waiters != 0 has ALREADY published the
+ * new state in the cell; all that is left for the server is to let the threads
+ * sitting in its own wait queue re-evaluate that word.  It must NOT signal the
+ * event a second time: between the client's CAS and the server picking the
+ * request up, another client can legitimately consume the auto-reset token on
+ * the fast path, and a server-side SET_EVENT on top of that mints a SECOND
+ * token out of ONE SetEvent and releases two waiters.  That was the ml952
+ * double-release bug (WOW64_DESIGN.md section 6, ml962 entry).
+ *
+ * `op' is a plain int in struct event_op_request and the server's switch has a
+ * `default: STATUS_INVALID_PARAMETER' arm, so an out-of-enum value is a safe
+ * private extension with no protocol.def change: only the iOS client ever
+ * sends it and only the iOS server ever accepts it. */
+#define MADEIRA_EVENT_OP_WAKE      0x4d415741   /* 'MAWA' */
+
+/* ------------------------------------------------------------------------
+ * The wake primitive, shared verbatim by both sides.
+ *
+ * This is the same ladder dlls/ntdll/unix/sync.c uses for the alert futex
+ * (os_sync_wait_on_address on 14.4+/iOS 17.4+, __ulock_wait below that),
+ * lifted into a header so the SERVER can issue exactly the same wake a client
+ * setter would.  If the two sides used different primitives a client parked by
+ * one could never be woken by the other.
+ * ------------------------------------------------------------------------ */
+
+#ifdef __APPLE__
+
+#include <AvailabilityMacros.h>
+#ifdef MAC_OS_VERSION_14_4
+#include <os/os_sync_wait_on_address.h>
+#endif
+
+#ifndef UL_COMPARE_AND_WAIT
+#define UL_COMPARE_AND_WAIT 1
+#endif
+#ifndef ULF_WAKE_ALL
+#define ULF_WAKE_ALL 0x00000100
+#endif
+
+extern int __ulock_wait( uint32_t operation, void *addr, uint64_t value, uint32_t timeout );
+extern int __ulock_wake( uint32_t operation, void *addr, uint64_t wake_value );
+
+/* Park on *addr while it still reads `val', for at most ns_timeout
+ * nanoseconds (0 = forever, which this file never asks for).  Returns
+ * immediately if the word already changed. */
+static inline void madeira_fast_park( const int *addr, int val, uint64_t ns_timeout )
+{
+#ifdef MAC_OS_VERSION_14_4
+    if (__builtin_available( macOS 14.4, iOS 17.4, * ))
+    {
+        if (ns_timeout)
+            os_sync_wait_on_address_with_timeout( (void *)addr, (uint64_t)(uint32_t)val, 4,
+                                                  OS_SYNC_WAIT_ON_ADDRESS_NONE,
+                                                  OS_CLOCK_MACH_ABSOLUTE_TIME, ns_timeout );
+        else
+            os_sync_wait_on_address( (void *)addr, (uint64_t)(uint32_t)val, 4,
+                                     OS_SYNC_WAIT_ON_ADDRESS_NONE );
+        return;
+    }
+#endif
+    {
+        uint32_t us = (uint32_t)(ns_timeout / 1000);
+        if (ns_timeout && !us) us = 1;
+        __ulock_wait( UL_COMPARE_AND_WAIT, (void *)addr, (uint64_t)(uint32_t)val, us );
+    }
+}
+
+/* Wake one parked thread, or all of them for a manual-reset event (where a
+ * single set releases every waiter). */
+static inline void madeira_fast_wake( const int *addr, int all )
+{
+#ifdef MAC_OS_VERSION_14_4
+    if (__builtin_available( macOS 14.4, iOS 17.4, * ))
+    {
+        if (all) os_sync_wake_by_address_all( (void *)addr, 4, OS_SYNC_WAKE_BY_ADDRESS_NONE );
+        else     os_sync_wake_by_address_any( (void *)addr, 4, OS_SYNC_WAKE_BY_ADDRESS_NONE );
+        return;
+    }
+#endif
+    __ulock_wake( UL_COMPARE_AND_WAIT | (all ? ULF_WAKE_ALL : 0), (void *)addr, 0 );
+}
+
+#else  /* !__APPLE__ — fastsync is an iOS-only path; keep the header compilable */
+
+static inline void madeira_fast_park( const int *addr, int val, uint64_t ns_timeout ) { }
+static inline void madeira_fast_wake( const int *addr, int all ) { }
+
+#endif /* __APPLE__ */
+
+#endif /* __IOS_FASTSYNC_H */

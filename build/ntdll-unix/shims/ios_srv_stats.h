@@ -37,6 +37,21 @@ enum ios_srv_nt_counter
     IOS_NT_FAST_WAKE,          /* os_sync_wake_by_address issued             */
     IOS_NT_FAST_SLEEP,         /* os_sync_wait_on_address entered            */
 
+    /* ml962: what the handle -> cell cache is actually doing.  On the first
+     * device logs get_inproc_sync_fd was the #1 request kind (925-1837 per
+     * 10 s), i.e. "learn once per handle, ever" was not happening at all --
+     * the negative answer was never cached, so every wait on a thread,
+     * process, mutex, semaphore, timer or file re-asked.  These four make that
+     * visible instead of inferable: learn_ev + learn_none is the number of
+     * get_inproc_sync_fd requests the cache issued, relearn is how many of
+     * them were for a handle whose own entry was still in the slot (thrash,
+     * not cold misses), stale_gen is the recycled-cell rejection. */
+    IOS_FS_LEARN_EVENT,        /* learn resolved to a cell-backed event      */
+    IOS_FS_LEARN_NONE,         /* learn resolved to "no cell", now cached    */
+    IOS_FS_RELEARN,            /* learn for a handle already in its slot     */
+    IOS_FS_STALE_GEN,          /* entry matched but the cell was recycled    */
+    IOS_FS_EVICT,              /* madeira_fast_close() dropped an entry      */
+
     /* Breakdown of the `select` request, which is the one request kind whose
      * count says nothing about its cause: NtWaitForSingleObject, a multi-object
      * wait, NtSignalAndWaitForSingleObject, a keyed event and an alertable
@@ -69,6 +84,12 @@ static inline void ios_srv_nt_count( enum ios_srv_nt_counter which )
 {
     __atomic_fetch_add( &ios_srv_nt_counts[which], 1, __ATOMIC_RELAXED );
 }
+
+/* ml962: print one report right now instead of waiting for the next 10 s
+ * window.  Defined in build/ntdll-unix/server_ios.c, called from the
+ * MADEIRA-EXIT path so a process that dies in its first seconds still leaves
+ * its counters in the log. */
+extern void ios_srv_stats_report_now(void);
 
 /*
  * ml951: NtQueryInformationThread breakdown.  `get_thread_info' was the

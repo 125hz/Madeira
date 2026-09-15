@@ -41,6 +41,25 @@ void winios_post_touch_up(int x, int y);
  * down=1 press, down=0 release. */
 void winios_post_key(int vk, int down);
 
+/* ml663 — the same, with room for KEYEVENTF_* bits the CALLER knows and the
+ * driver cannot derive. In practice that is only KEYEVENTF_EXTENDEDKEY (0x1),
+ * and only for a key sharing its virtual-key code with a non-extended twin:
+ * numpad Enter is VK_RETURN + E0, and nothing about VK_RETURN says which one it
+ * was. Every OTHER extended key (arrows, Ins/Del/Home/End/PgUp/PgDn, right
+ * ctrl/alt, numpad divide, NumLock) already gets the flag inside
+ * driver_ios.c:142, which derives the scan code with MAPVK_VK_TO_VSC_EX and
+ * sets E0 whenever that returns 0xE0xx — so pass 0 and nothing changes.
+ *
+ * winios_post_key(vk, down) is exactly winios_post_key_ex(vk, down, 0). */
+void winios_post_key_ex(int vk, int down, unsigned int extra_flags);
+
+/* ml663 — while a hardware mouse is driving RELATIVE motion, advance the drawn
+ * cursor arrow by each delta (clamped to the wine desktop) so it tracks the
+ * hand in menus. Off by default: the aim stick and touch mouse-look post the
+ * same relative events in modes where the game has hidden the cursor, and the
+ * per-sample main-queue hop would be pure cost there. */
+void winios_cursor_track_relative(int on);
+
 /* ml661 — stuck-input release valve. Queues a key-up for every key (and a
  * button-up for every mouse button) the DRIVER still believes is held. The
  * app calls this whenever a held gesture can have ended without its matching
@@ -48,6 +67,15 @@ void winios_post_key(int vk, int down);
  * or rotated away under a thumb, a cancelled gesture. Cheap and idempotent —
  * it does nothing when nothing is held. */
 void winios_release_all_keys(void);
+
+/* ml665 — the two ring counters the app's mouse-delivery diagnostic needs.
+ * `pushed` is every event handed to the ring; `coalesced` is how many of those
+ * were folded into an already-queued move because wine had not drained yet.
+ * The DIFFERENCE between two samples is the interesting quantity: a large
+ * coalesced share means the game is receiving one summed delta per frame
+ * instead of a burst, which is what a 30-40 fps game can consume anyway.
+ * Both are monotonic and may wrap; subtract with wrapping arithmetic. */
+void winios_q_stats(unsigned int *pushed, unsigned int *coalesced);
 
 /* ml661 — driver-side held-key state, for the app's [input] diagnostic: bit i
  * of mask[i>>5] is virtual-key i. Returns the number of keys held. Comparing
