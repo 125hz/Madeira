@@ -22,6 +22,189 @@ import os.log
 // the window but has interaction disabled, so touches fall through to the
 // SwiftUI hierarchy (and thus to the placeholder's touch handlers).
 
+/// How the guest surface (the fixed-resolution virtual display games render
+/// into — see `MetalBackedView.guestSize()`) is mapped into the live view's
+/// bounds. A tap on `displayModeToggle` (ContentView) cycles Fit -> Fill ->
+/// Stretch -> Fit and the choice persists via InputSettings.
+enum DisplayMode: String, CaseIterable {
+    case fit, fill, stretch, aspect
+
+    var label: String {
+        switch self {
+        case .fit:     return "Fit"
+        case .fill:    return "Fill"
+        case .stretch: return "Stretch"
+        case .aspect:  return "Aspect"
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .fit:     return "aspectratio"
+        case .fill:    return "arrow.up.left.and.arrow.down.right"
+        case .stretch: return "rectangle.expand.vertical"
+        case .aspect:  return "rectangle.ratio.16.to.9"
+        }
+    }
+    var next: DisplayMode {
+        switch self {
+        case .fit:     return .fill
+        case .fill:    return .stretch
+        case .stretch: return .aspect
+        case .aspect:  return .fit
+        }
+    }
+}
+
+/// Geometry shared by two things that must never disagree: the frame the
+/// presented layer's host view is given (MetalBackedView.gameRect(), which
+/// sizes MetalHostView.shared directly — see applyDisplayModeAndLog) and
+/// where a touch point lands on the guest surface (`mapTouch`). If layout
+/// and touch mapping each did their own aspect math, Fill/Stretch would skew
+/// input the moment they disagreed by a rounding hair.
+enum GameSurfaceLayout {
+    /// The rect, in the same coordinate space as `bounds`, that the guest
+    /// surface occupies for `mode`. Fit/Fill preserve the guest aspect ratio
+    /// and center the result — Fill's rect can extend beyond `bounds` on one
+    /// axis (that IS the fill: the host view is sized to this rect directly,
+    /// so it genuinely covers more than `bounds` there; mapTouch below clamps
+    /// a touch landing in that extra margin to the surface edge). Stretch is
+    /// exactly `bounds`.
+    static func rect(guest: CGSize, aspect: CGSize = .zero, bounds: CGRect, mode: DisplayMode) -> CGRect {
+        guard guest.width > 0, guest.height > 0,
+              bounds.width > 0, bounds.height > 0 else { return bounds }
+        if mode == .stretch { return bounds }
+        // Aspect: letterbox on the shape of what is actually PRESENTED (the
+        // swapchain drawable, i.e. the game's back buffer), not the virtual
+        // monitor. A game whose back buffer is 4:3 on a 16:9 monitor is
+        // stretched by the layer in every other mode; here the host view takes
+        // the drawable's aspect so the layer scales it uniformly. Falls back to
+        // Fit until the swapchain has published a drawable size.
+        let shape = (mode == .aspect && aspect.width > 0 && aspect.height > 0) ? aspect : guest
+        let sx = bounds.width / shape.width, sy = bounds.height / shape.height
+        let scale = mode == .fill ? max(sx, sy) : min(sx, sy)
+        let w = shape.width * scale, h = shape.height * scale
+        return CGRect(x: bounds.minX + (bounds.width - w) / 2,
+                      y: bounds.minY + (bounds.height - h) / 2,
+                      width: w, height: h)
+    }
+
+    /// Maps a point in `bounds`'s coordinate space (a touch location) to
+    /// guest-pixel coordinates for `mode`, clamped to the guest surface —
+    /// including a touch that lands in Fill's cropped-away margin, which
+    /// clamps to the nearest edge rather than reporting an off-surface point.
+    static func map(point: CGPoint, guest: CGSize, aspect: CGSize = .zero, bounds: CGRect, mode: DisplayMode) -> CGPoint {
+        let r = rect(guest: guest, aspect: aspect, bounds: bounds, mode: mode)
+        guard r.width > 0, r.height > 0 else { return .zero }
+        let x = (point.x - r.minX) * guest.width / r.width
+        let y = (point.y - r.minY) * guest.height / r.height
+        return CGPoint(x: min(max(x, 0), guest.width - 1),
+                       y: min(max(y, 0), guest.height - 1))
+    }
+}
+
+/// The guest's virtual monitor: what shape it starts out, and how the app
+/// finds out when the guest changes it.
+///
+/// Before 2026-09-14 the monitor was a fixed 1024x768 for every direct launch,
+/// so a widescreen game ran 4:3 and Fit pillarboxed it on a 19.5:9 phone —
+/// "the game runs in a smaller window in landscape". Neither the display-mode
+/// toggle nor anything else in the app can fix that, because the aspect is
+/// decided by the monitor the guest is rendering for, not by how the result is
+/// scaled afterwards. So the monitor now takes the DEVICE's landscape shape,
+/// the way a PC monitor decides what a game looks like on Windows.
+enum GuestDisplay {
+    /// The modes the virtual monitor advertises. Kept in step with
+    /// `ios_standard_modes` in build/win32u-unix/sysparams_ios.c: this list
+    /// decides the session default, that one is what `EnumDisplaySettings`
+    /// hands the guest, and a default missing from the guest's own mode table
+    /// is a mode a game cannot re-select after it switches away.
+    static let standardModes: [(w: Int, h: Int)] = [
+        (640, 480), (800, 600), (1024, 768), (1152, 864),
+        (1280, 720), (1280, 768), (1280, 800), (1280, 960),
+        (1280, 1024), (1360, 768), (1366, 768), (1440, 900),
+        (1600, 900), (1600, 1200), (1680, 1050), (1920, 1080),
+        (1920, 1200), (2048, 1536), (2560, 1440),
+    ]
+
+    /// Pick the standard mode to start a session at for a landscape view of
+    /// `size` points.
+    ///
+    /// Two constraints, in order. **Shape** first: the mode whose aspect is
+    /// nearest the view's. Games want STANDARD modes, so a 19.5:9 phone gets
+    /// the nearest standard aspect — 16:9 — and Fit letterboxes the remaining
+    /// sliver, rather than a 1560x720 nobody's mode list contains. **Cost**
+    /// second: only modes between 0.9 and 2.1 MP are considered (a phone GPU
+    /// renders every one of those pixels), and among modes of effectively the
+    /// same aspect the cheapest wins — so 16:9 lands on 1280x720 rather than
+    /// 1920x1080, and 16:10 on 1280x800.
+    static func defaultMode(forLandscapeView size: CGSize) -> (w: Int, h: Int) {
+        let fallback = (w: 1280, h: 720)
+        guard size.width > 0, size.height > 0 else { return fallback }
+        let want = Double(max(size.width, size.height) / min(size.width, size.height))
+
+        let candidates = standardModes.filter { m in
+            let px = m.w * m.h
+            return px >= 900_000 && px <= 2_100_000
+        }
+        guard !candidates.isEmpty else { return fallback }
+
+        let error = { (m: (w: Int, h: Int)) in abs(Double(m.w) / Double(m.h) - want) }
+        let best = candidates.map(error).min()!
+        // Anything within this of the best is the SAME standard aspect wearing
+        // a different rounding (1366x768 is 1.7786, 1280x720 is 1.7778); the
+        // tie is broken on render cost, not on the third decimal place.
+        return candidates.filter { error($0) <= best + 0.01 }
+                         .min { $0.w * $0.h < $1.w * $1.h }!
+    }
+
+    /// Choose the session's virtual monitor and export it for win32u
+    /// (`ios_screen_size()` reads exactly these three variables).
+    /// `Documents/madeira-screen.txt` holding `WxH` overrides the choice.
+    /// Desktop mode does NOT come through here — explorer is launched with an
+    /// explicit `/desktop=WxH` and exports its own size.
+    @discardableResult
+    static func configureSessionDefault(view: CGSize, knob: String?) -> (w: Int, h: Int, source: String) {
+        var mode = defaultMode(forLandscapeView: view)
+        var source = "view"
+        if let raw = knob?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+            let parts = raw.lowercased().split(separator: "x")
+            if parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]), w > 0, h > 0 {
+                mode = (w, h)
+                source = "knob"
+            }
+        }
+        setenv("MADEIRA_SCREEN_W", String(mode.w), 1)
+        setenv("MADEIRA_SCREEN_H", String(mode.h), 1)
+        setenv("MADEIRA_SCREEN_SRC", source, 1)
+        return (mode.w, mode.h, source)
+    }
+
+    /// The device's landscape view size in POINTS. Points, not pixels: the
+    /// aspect is the same either way, and points are what the presented
+    /// layer's frame is expressed in.
+    static var landscapeViewSize: CGSize {
+        let b = UIScreen.main.bounds.size
+        return CGSize(width: max(b.width, b.height), height: min(b.width, b.height))
+    }
+
+    /// Re-lay-out the presented surface when the guest switches modes.
+    /// Idempotent and cheap: `guestSize()` calls it on every use so the
+    /// observer exists no matter which view got on screen first.
+    static func observeModeChanges() {
+        _ = observer
+    }
+
+    private static let observer: NSObjectProtocol = NotificationCenter.default.addObserver(
+        // The ObjC importer maps a `NSString * const` whose name ends in
+        // "Notification" onto NSNotification.Name and drops that suffix, so the
+        // Swift spelling of MadeiraDisplayModeChangedNotification is this.
+        forName: .MadeiraDisplayModeChanged,
+        object: nil, queue: .main
+    ) { _ in
+        MetalBackedView.refreshDisplayMode()
+    }
+}
+
 /// Raw window-level host for the presenting CAMetalLayer.
 final class MetalHostView: UIView {
     // Process-lifetime singleton. The CAMetalLayer is registered with DXMT's
@@ -81,6 +264,10 @@ final class MetalHostView: UIView {
 // SwiftUI-hosted placeholder: geometry + touch input only.
 final class MetalBackedView: UIView {
     private static var layerRegistered = false
+    /// Aspect mode follows the swapchain drawable, which DXMT resizes on
+    /// device Reset (a game changing resolution in its options). Nothing in
+    /// UIKit lays us out for that, so watch the property and re-apply.
+    private static var drawableObservation: NSKeyValueObservation?
 
     // Hardware keyboard bridge: the view becomes first responder so the iOS
     // software keyboard appears, and each typed character is forwarded to
@@ -272,17 +459,84 @@ final class MetalBackedView: UIView {
     // ~1 FPS content mostly doesn't. Resolution path: raise game FPS (perf
     // work), with a steady-rate re-present in DXMT as fallback insurance.
 
-    /// Largest 4:3 rect (the 1024×768 logical surface's aspect) that fits
-    /// centered in our bounds. The window-level host view gets THIS frame,
-    /// not our full bounds — otherwise landscape stretches the game to the
-    /// display edges (2026-07-05). Touch mapping uses the same rect so
-    /// letterboxing never skews input.
+    /// The guest surface's logical resolution — the size of the virtual
+    /// monitor win32u is reporting to the guest RIGHT NOW. This is no longer
+    /// the launch-time `MADEIRA_SCREEN_W/H` pair: since 2026-09-14 a guest's
+    /// `ChangeDisplaySettings` really resizes the virtual monitor
+    /// (build/win32u-unix/sysparams_ios.c: `ios_virtual_change_display_settings`
+    /// → `ios_publish_screen_size`), so the value must be read back from
+    /// `winios_screen_size()` (IOSDisplayShim.m) on every use. A stale read
+    /// here would letterbox a game's new mode inside the old one's aspect.
+    /// `GuestDisplay.observeModeChanges` re-lays-out when it changes.
+    private func guestSize() -> CGSize {
+        GuestDisplay.observeModeChanges()
+        var w: Int32 = 0, h: Int32 = 0
+        winios_screen_size(&w, &h)
+        guard w > 0, h > 0 else {
+            return CGSize(width: envInt("MADEIRA_SCREEN_W", 1024),
+                          height: envInt("MADEIRA_SCREEN_H", 768))
+        }
+        return CGSize(width: CGFloat(w), height: CGFloat(h))
+    }
+
+    /// The rect (view-local points) the guest surface occupies for the
+    /// current DisplayMode: Fit is the largest centered rect that fits our
+    /// bounds (unchanged from the original hardcoded-1024x768 behaviour, just
+    /// generalised to guestSize()); Fill is the smallest centered rect that
+    /// COVERS our bounds — same width (or height) as bounds exactly, the
+    /// other axis overflowing symmetrically; Stretch is bounds itself. The
+    /// window-level host view gets exactly THIS frame (see applyDisplayMode
+    /// below), not our full bounds unconditionally — Fit must stay confined
+    /// to keep it out of sibling SwiftUI chrome (the pillarbox HUD bar in
+    /// landscape, the header/log rows around the 240pt portrait game strip),
+    /// and Fill/Stretch only grow as far as the aspect math actually needs.
+    /// Touch mapping (mapTouch, below) uses the identical rect so
+    /// letterboxing/cropping/stretching never skews input.
     private func gameRect() -> CGRect {
-        let gw: CGFloat = 1024, gh: CGFloat = 768
-        let scale = min(bounds.width / gw, bounds.height / gh)
-        let w = gw * scale, h = gh * scale
-        return CGRect(x: (bounds.width - w) / 2, y: (bounds.height - h) / 2,
-                      width: max(w, 1), height: max(h, 1))
+        GameSurfaceLayout.rect(guest: guestSize(), aspect: MetalHostView.shared.metalLayer.drawableSize,
+                               bounds: bounds, mode: InputSettings.shared.displayMode)
+    }
+
+    private static var lastLoggedRect: CGRect?
+    private static var lastLoggedMode: DisplayMode?
+
+    /// Sizes the presented layer's host view to gameRect() and logs the
+    /// result — called on attach, on every layout pass (rotation, safe-area
+    /// change) and immediately when the mode itself changes
+    /// (InputSettings.displayMode didSet, via refreshDisplayMode()). Logging
+    /// is rate-limited to actual changes so a settled layout doesn't spam
+    /// stderr on every pass.
+    ///
+    /// Fill/Stretch can genuinely extend past our own bounds on one axis
+    /// (that's the point — filling the pillarbox bars a game used to leave
+    /// empty) which may run under the notch/home indicator in landscape;
+    /// per spec that's acceptable there. It can also, by a similar amount,
+    /// spill a little into the thin rows directly above/below the 240pt
+    /// portrait strip, which callers should keep in mind when placing HUD
+    /// elements close to that strip in Fill mode.
+    private func applyDisplayModeAndLog() {
+        guard let w = window else { return }
+        let mode = InputSettings.shared.displayMode
+        let guest = guestSize()
+        let r = gameRect()
+        MetalHostView.shared.frame = convert(r, to: w)
+        guard r != Self.lastLoggedRect || mode != Self.lastLoggedMode else { return }
+        Self.lastLoggedRect = r
+        Self.lastLoggedMode = mode
+        fputs(String(format: "[display] mode=%@ guest=%.0fx%.0f view=%.0fx%.0f -> rect=(%.0f,%.0f %.0fx%.0f)\n",
+                    mode.label, guest.width, guest.height, bounds.width, bounds.height,
+                    r.minX, r.minY, r.width, r.height), stderr)
+        let d = MetalHostView.shared.metalLayer.drawableSize
+        fputs(String(format: "[display]   drawable=%.0fx%.0f (the shape Aspect mode keeps)\n", d.width, d.height), stderr)
+    }
+
+    /// Re-applies the display mode to whichever MetalBackedView is currently
+    /// on screen. InputSettings is a plain ObservableObject, not something
+    /// this raw UIKit view observes, so a mode flip from the HUD button needs
+    /// an explicit nudge to take effect before the next incidental layout
+    /// pass (rotation, etc.) would otherwise pick it up.
+    static func refreshDisplayMode() {
+        keyboardTarget?.applyDisplayModeAndLog()
     }
 
     override func didMoveToWindow() {
@@ -295,7 +549,7 @@ final class MetalBackedView: UIView {
             host.removeFromSuperview()
             w.addSubview(host)
         }
-        host.frame = convert(gameRect(), to: w)
+        applyDisplayModeAndLog()
         // S2 desktop mode: the winios compositor renders the wine virtual
         // desktop aspect-fit inside THIS placeholder's area, exactly like
         // the games' Metal layer — never over the whole phone screen.
@@ -304,6 +558,9 @@ final class MetalBackedView: UIView {
         if !Self.layerRegistered {
             Self.layerRegistered = true
             madeira_display_set_layer(host.metalLayer)
+            Self.drawableObservation = host.metalLayer.observe(\.drawableSize, options: [.new]) { _, _ in
+                DispatchQueue.main.async { MetalBackedView.refreshDisplayMode() }
+            }
             LogStore.shared.log("MetalLayer registered with DXMT shim (window-hosted singleton)", level: .success)
         }
     }
@@ -334,21 +591,23 @@ final class MetalBackedView: UIView {
         super.layoutSubviews()
         defuseAncestorRecognizers()
         if let w = window {
-            MetalHostView.shared.frame = convert(gameRect(), to: w)
+            applyDisplayModeAndLog()
             let full = convert(bounds, to: w)
             winios_set_compositor_frame(full.minX, full.minY, full.width, full.height)
         }
     }
 
-    // Map touch point in view-local UI points to the 1024×768 logical
-    // surface DXMT swapchains use, then post to winios.drv. Coordinates
-    // are relative to the aspect-fit gameRect (letterbox borders clamp).
+    // Map touch point in view-local UI points to guest-pixel coordinates via
+    // the same GameSurfaceLayout math that sizes the presented layer's host
+    // view (see gameRect()/applyDisplayModeAndLog above), then post to
+    // winios.drv. Off-surface touches (Fill's cropped margin) clamp to the
+    // nearest edge.
     private func mapTouch(_ touch: UITouch) -> (Int32, Int32) {
         let p = touch.location(in: self)
-        let r = gameRect()
-        let x = Int32(min(max((p.x - r.minX) * 1024 / r.width, 0), 1023))
-        let y = Int32(min(max((p.y - r.minY) * 768 / r.height, 0), 767))
-        return (x, y)
+        let guest = guestSize()
+        let g = GameSurfaceLayout.map(point: p, guest: guest, aspect: MetalHostView.shared.metalLayer.drawableSize,
+                                      bounds: bounds, mode: InputSettings.shared.displayMode)
+        return (Int32(g.x), Int32(g.y))
     }
 
     // ==================================================================
@@ -421,7 +680,60 @@ final class MetalBackedView: UIView {
         let iy = Int32(max(-30000, min(30000, relCarryY)))
         relCarryX -= CGFloat(ix)
         relCarryY -= CGFloat(iy)
-        if ix != 0 || iy != 0 { winios_pointer(ix, iy, F_MOVE, 0) }
+        if ix != 0 || iy != 0 {
+            winios_pointer(ix, iy, F_MOVE, 0)
+            Self.relPosts += 1
+            Self.relAccX += Int(ix); Self.relAccY += Int(iy)
+        } else {
+            Self.relTruncated += 1
+        }
+        relmouseReport()
+    }
+
+    // ====================================================================
+    // ml667 — the touch end of [relmouse].
+    //
+    // The report is "swipes stop turning the camera, but the pause-menu
+    // cursor still moves". Three different layers can produce that, and only
+    // one of them lives here, so the first job is to stop guessing which:
+    // this line says whether the FINGER still reaches this view at all.
+    //
+    //   posts / acc   deltas this view actually handed to winios_pointer.
+    //   trunc         deltas the sensitivity scale rounded away to nothing
+    //                 (the ml641 carry should keep this from mattering).
+    //   claims        touchesBegan calls that took ownership.
+    //   refused       touchesBegan calls turned away because a claim was
+    //                 still live — with the owner's phase and whether it is
+    //                 still OUR view's touch. `refused` climbing while
+    //                 `claims` does not, with owner_mine=false, is the
+    //                 recycled-UITouch trap (a pooled UITouch reissued to
+    //                 another view leaves `gameTouch` pointing at a live
+    //                 stranger, and this view never accepts a finger again).
+    //
+    // If posts keeps climbing here while the server's [relmouse] rel_in does
+    // not, the loss is below us; if posts stalls with refused climbing, it is
+    // here. Static because the counters must survive a view rebuild.
+    // ====================================================================
+    private static var relPosts = 0, relTruncated = 0, relAccX = 0, relAccY = 0
+    private static var claims = 0, refused = 0
+    private static var lastRefusePhase = -1, lastRefuseMine = false
+    private static var relNextReport: TimeInterval = 0
+
+    private func relmouseReport() {
+        let now = Date().timeIntervalSinceReferenceDate
+        guard now >= Self.relNextReport else { return }
+        Self.relNextReport = now + 5
+        var owner = "none"
+        if let o = gameTouch {
+            owner = "phase=\(o.phase.rawValue) mine=\(o.view === self)"
+        }
+        let line = "[relmouse] ml667 src=touch posts=\(Self.relPosts) "
+            + "acc=(\(Self.relAccX),\(Self.relAccY)) trunc=\(Self.relTruncated) "
+            + "claims=\(Self.claims) refused=\(Self.refused) "
+            + "last_refuse(phase=\(Self.lastRefusePhase) mine=\(Self.lastRefuseMine)) "
+            + "owner=\(owner) relmode=\(InputSettings.shared.relative) "
+            + "sens=\(InputSettings.shared.sensRel)\n"
+        fputs(line, stderr)
     }
 
     /* ml660: GAME MODE (MADEIRA_DESKTOP unset — everything the launch table
@@ -495,10 +807,14 @@ final class MetalBackedView: UIView {
             // gone (UIKit deallocated it, or it already ended) — never by a
             // second finger arriving.
             if let held = gameTouch, held.phase != .ended, held.phase != .cancelled {
+                Self.refused += 1                                   // ml667
+                Self.lastRefusePhase = held.phase.rawValue
+                Self.lastRefuseMine = (held.view === self)
                 return
             }
             guard let t = touches.first else { return }
             gameTouch = t
+            Self.claims += 1                                        // ml667
             if gameRelative {
                 let p = t.location(in: self)
                 touchStartPoint = p
@@ -2172,6 +2488,14 @@ final class InputSettings: ObservableObject {
     /// ml649: heavy diagnostics. Default OFF so the shipped default is the fast
     /// path; flip it on only when a run needs to be explainable.
     @Published var diagnostics = false { didSet { madeira_set_diag_enabled(diagnostics ? 1 : 0); save() } }
+    /// Fit/Fill/Stretch — how the guest surface maps into the live view.
+    /// MetalBackedView doesn't observe this object, so the setter nudges the
+    /// on-screen view directly (see MetalBackedView.refreshDisplayMode()); a
+    /// plain `didSet { save() }` here would leave the old mode on screen
+    /// until the next incidental layout pass.
+    @Published var displayMode: DisplayMode = .aspect {
+        didSet { save(); MetalBackedView.refreshDisplayMode() }
+    }
 
     /// didSet fires for assignments made in init() because the properties are
     /// already initialised by then; without this the first launch would write
@@ -2193,6 +2517,7 @@ final class InputSettings: ObservableObject {
             sensMouse = j["sensMouse"] as? Double ?? 1.0
             ignoreTouchesWithMouse = j["ignoreTouchesWithMouse"] as? Bool ?? true
             diagnostics = j["diagnostics"] as? Bool ?? false
+            displayMode = (j["displayMode"] as? String).flatMap(DisplayMode.init(rawValue:)) ?? .aspect
         }
         loading = false
         madeira_set_diag_enabled(diagnostics ? 1 : 0)   // push the restored value down
@@ -2202,7 +2527,8 @@ final class InputSettings: ObservableObject {
         guard !loading else { return }
         let j: [String: Any] = ["relative": relative, "sensAbs": sensAbs, "sensRel": sensRel,
                                 "sensMouse": sensMouse, "diagnostics": diagnostics,
-                                "ignoreTouchesWithMouse": ignoreTouchesWithMouse]
+                                "ignoreTouchesWithMouse": ignoreTouchesWithMouse,
+                                "displayMode": displayMode.rawValue]
         guard let d = try? JSONSerialization.data(withJSONObject: j) else { return }
         try? d.write(to: Self.url, options: .atomic)
     }
@@ -2249,6 +2575,27 @@ struct ContentView: View {
         // MADEIRA-READVM lines and exits 48. build/x86-tests/readvm-x86.c
         // lists what every other status means.
         ("ReadProcessMemory", "readvm-x86.exe"),
+        // 2026-09-14: the virtual monitor's mode table and a real
+        // ChangeDisplaySettings — enumerates modes, switches to 800x600 and
+        // checks that the screen metrics, GetMonitorInfo and WM_DISPLAYCHANGE
+        // all agree, then restores. Exits 51. build/x86-tests/dispmode-x86.c
+        // lists what every other status means.
+        ("Display modes", "dispmode-x86.exe"),
+        // 2026-09-14: the guest-window CONCURRENCY test. Spawns ITSELF three
+        // levels deep, every level staying alive and blocked on its child, so
+        // each live 32-bit pseudo-process needs its own 4 GB window slot.
+        // Exits 49 when the whole chain ran; a CreateProcess failure prints
+        // "MADEIRA-SPAWN CONCURRENCY LIMIT: depth=N", which is the direct
+        // measurement of how many concurrent 32-bit processes fit.
+        // build/x86-tests/spawn-x86.c lists every other status.
+        ("Spawn chain", "spawn-x86.exe"),
+        // 2026-09-14: SuspendThread / GetThreadContext / SetThreadContext /
+        // ResumeThread on a 64-bit thread running EMULATED code. Asserts that
+        // the reported Rsp is inside the target thread's own stack and the
+        // reported Rip inside the exe image, redirects the thread to a landing
+        // function and puts the original context back, 200 times. Exits 50 on
+        // success; build/x64-tests/ctx-x64.c lists every other status.
+        ("Thread context (x64)", "ctx-x64.exe"),
         // Full Win32 path passed verbatim to MADEIRA_EXE — WineProcessBridge
         // detects the backslash and launches it as-is (no syswow64 prefix).
         (#"Mirror's Edge"#, #"C:\Mirrors-Edge\Mirror's Edge\Binaries\MirrorsEdge.exe"#),
@@ -2333,6 +2680,7 @@ struct ContentView: View {
                     // The cursor button has slid to the leftmost slot and become
                     // the close control; matchedGeometryEffect animates the slide.
                     pointerToggleButton
+                    displayModeToggle
                     pointerModeToggle
                     pointerSensSlider
                 } else {
@@ -2351,6 +2699,7 @@ struct ContentView: View {
                     }
                     .transition(.opacity)
                     pointerToggleButton
+                    displayModeToggle
                     diagToggleButton
                     // ml665: no lock button where lock cannot happen (iPhone).
                     if hw.mouseConnected && HardwareInput.pointerLockAvailable {
@@ -2433,10 +2782,12 @@ struct ContentView: View {
                 // game area itself, so it cannot ride on the game view.
                 HStack(spacing: 0) {
                     Spacer(minLength: 0)
-                    VStack {
+                    VStack(spacing: 8) {
                         FPSOverlay(compact: true)
+                        displayModeToggle
                         Spacer()
                     }
+                    .padding(.top, 8)
                     .frame(width: barW)
                 }
             }
@@ -2514,6 +2865,28 @@ struct ContentView: View {
             }
             .foregroundStyle(.white.opacity(hw.pointerLocked ? 1.0 : 0.35))
             .frame(minWidth: 52, minHeight: 32)
+            .background(Color.secondary.opacity(0.25))
+            .cornerRadius(6)
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Cycles Fit -> Fill -> Stretch -> Fit. Sits next to pointerToggleButton
+    /// in the portrait control row and pinned in the landscape pillarbox bar
+    /// (landscapeBody) — see GameSurfaceLayout/DisplayMode near the top of
+    /// this file for what each mode does to the presented layer.
+    private var displayModeToggle: some View {
+        Button {
+            input.displayMode = input.displayMode.next
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: input.displayMode.symbol)
+                    .font(.system(size: 15, weight: .medium))
+                Text(input.displayMode.label)
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            .frame(minWidth: 74, minHeight: 32)
             .background(Color.secondary.opacity(0.25))
             .cornerRadius(6)
         }
@@ -2752,6 +3125,9 @@ struct ContentView: View {
                     setenv("MADEIRA_DESKTOP", "1", 1)
                     setenv("MADEIRA_SCREEN_W", String(deskW), 1)
                     setenv("MADEIRA_SCREEN_H", String(deskH), 1)
+                    // explorer owns the size in desktop mode; say so in the
+                    // [display] virtual monitor line win32u prints at session start.
+                    setenv("MADEIRA_SCREEN_SRC", "desktop", 1)
                     // ml371: surfdump ground truth — the "frozen desktop"
                     // question (fresh pixels never presented vs nothing
                     // painting upstream) is undecidable from the log alone
@@ -2908,6 +3284,9 @@ struct ContentView: View {
                     setenv("MADEIRA_DESKTOP", "1", 1)
                     setenv("MADEIRA_SCREEN_W", String(deskW), 1)
                     setenv("MADEIRA_SCREEN_H", String(deskH), 1)
+                    // explorer owns the size in desktop mode; say so in the
+                    // [display] virtual monitor line win32u prints at session start.
+                    setenv("MADEIRA_SCREEN_SRC", "desktop", 1)
                     runWineFullSequence()
                 }
                 .buttonStyle(.borderedProminent)
@@ -3458,6 +3837,28 @@ struct ContentView: View {
                     setenv("DXMT_CONFIG", v, 1)
                     logStore.log("DXMT config: \(v) via madeira-dxmt.txt")
                 }
+            }
+
+            // The session's virtual monitor (2026-09-14). A direct launch used
+            // to get a fixed 1024x768 screen whatever the device looked like,
+            // so a widescreen game rendered 4:3 and Fit pillarboxed it — the
+            // "game runs in a smaller window in landscape" report. The monitor
+            // now takes the nearest STANDARD mode to the device's landscape
+            // shape, at a phone-sized pixel count; Documents/madeira-screen.txt
+            // holding "WxH" (e.g. "1920x1080") overrides it for a session, the
+            // same one-file-and-relaunch shape as the knobs below.
+            //
+            // Desktop mode is untouched: the "Wine Virtual Desktop" and Steam
+            // buttons export their own /desktop size (and source=desktop) at
+            // press time, after this has run.
+            do {
+                let knob = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+                    .flatMap { try? String(contentsOf: $0.appendingPathComponent("madeira-screen.txt"),
+                                           encoding: .utf8) }
+                let view = GuestDisplay.landscapeViewSize
+                let m = GuestDisplay.configureSessionDefault(view: view, knob: knob)
+                logStore.log("[display] virtual monitor \(m.w)x\(m.h) (source=\(m.source)) for a "
+                             + "\(Int(view.width))x\(Int(view.height))-pt landscape view")
             }
 
             // Native D3D9 frontend A/B (WOW64_DESIGN.md section 8.5 / 8.8-4).

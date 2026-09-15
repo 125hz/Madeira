@@ -44,10 +44,15 @@
  *     non-writable protection, PAGE_READONLY included, falls into its
  *     `default:` and returns STATUS_ACCESS_VIOLATION.  So PAGE_READONLY must
  *     FAIL with ERROR_NOACCESS and PAGE_EXECUTE_READ must SUCCEED with the
- *     bytes landing and the protection restored.  Check 4b is also the only
- *     coverage here for the server-side write path
- *     (build/wineserver/mach_ios.c write_process_memory), which has to
- *     mach_vm_protect an executable page writable and put it back.
+ *     bytes landing and the protection restored.  Checks 4b and 4c are the
+ *     only coverage here for the server-side write path
+ *     (build/wineserver/mach_ios.c write_process_memory): 4b is the executable
+ *     page, which has to be made writable and put back, and 4c (ml972) is a
+ *     plain PAGE_READWRITE page, which kernelbase hands straight to
+ *     NtWriteVirtualMemory.  4c exists because the port's failure was in the
+ *     server routine itself, so EVERY WriteProcessMemory failed and not just
+ *     the interesting one -- a fix that only understood executable pages would
+ *     have passed 4b and left the common case broken.
  *  5. ALT STACK.  Checks 1 and 3 again from a stack this program allocated with
  *     VirtualAlloc and entered by moving ESP in inline asm -- no TEB describes
  *     it, which is exactly the condition that turned the original failure
@@ -67,8 +72,8 @@
  *   64  the straddling read did not report a partial copy
  *   65  the straddling read reported the wrong readable-prefix length
  *   66  WriteProcessMemory to PAGE_READONLY did not fail the way Wine does
- *   67  WriteProcessMemory to PAGE_EXECUTE_READ failed, or the bytes/protection
- *       did not come back right
+ *   67  WriteProcessMemory to PAGE_EXECUTE_READ or PAGE_READWRITE failed, or
+ *       the bytes / the restored protection did not come back right
  *   68  a check behaved differently on the manually switched stack
  *   69  a zero-length read was not a success
  */
@@ -327,6 +332,30 @@ static int check_write_readonly(void)
         }
     }
     line_0( "MADEIRA-READVM: write to PAGE_EXECUTE_READ landed and the protection was restored OK" );
+
+    /* 4c: PAGE_READWRITE, i.e. the case kernelbase does NOT reprotect for --
+     * it calls NtWriteVirtualMemory directly.  ml972: nothing covered this, and
+     * on this port it was broken in exactly the same place as 4b and for
+     * exactly the same reason (write_process_memory needs a Mach task port that
+     * no pseudo-process has, so every WriteProcessMemory returned
+     * ERROR_ACCESS_DENIED).  4b alone could be "fixed" by something that only
+     * looks at executable pages; this says the ordinary path works too. */
+    if (!VirtualProtect( page, BLOCK, PAGE_READWRITE, &old )) return 60;
+    page[0] = 'x'; page[1] = 'x'; page[2] = 'x'; page[3] = 'x';
+    put = 0;
+    SetLastError( 0 );
+    if (!WriteProcessMemory( GetCurrentProcess(), page, src, 4, &put ) || put != 4)
+    {
+        line_2( "MADEIRA-READVM: write to PAGE_READWRITE failed err=",
+                (unsigned int)GetLastError(), " put=", (unsigned int)put, "" );
+        return 67;
+    }
+    if (page[0] != 'W' || page[1] != 'P' || page[2] != 'M' || page[3] != '!')
+    {
+        line_0( "MADEIRA-READVM: write to PAGE_READWRITE reported success but the bytes did not land" );
+        return 67;
+    }
+    line_0( "MADEIRA-READVM: write to PAGE_READWRITE landed OK" );
     return 0;
 }
 

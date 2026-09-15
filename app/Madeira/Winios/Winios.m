@@ -546,6 +546,11 @@ static struct {
      * would have released it, and a button it does not track is a button it
      * cannot un-stick. */
     unsigned int btn_mask;
+    /* ml667: relative moves are the mouse-look signal and nothing counted them
+     * separately — "pushed" mixes them with absolute moves, keys and buttons,
+     * so a log could not say whether the camera stopped because the deltas
+     * stopped being produced or because they stopped being delivered. */
+    unsigned int rel_moves;
 } g_input_q = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
 static inline int winios_ev_is_pure_move(const winios_input_event_t *e) {
@@ -619,6 +624,9 @@ static void winios_q_push_ev(unsigned int type, int x, int y, unsigned int flags
 
     pthread_mutex_lock(&g_input_q.lock);
     g_input_q.pushed++;
+    if (type == WINIOS_EV_MOUSE && (flags & MOUSEEVENTF_MOVE) &&
+        !(flags & MOUSEEVENTF_ABSOLUTE))
+        g_input_q.rel_moves++;                                  /* ml667 */
 
     /* Fast path: fold this move into the newest queued one. This is what keeps
      * a 120Hz stick from ever occupying more than a single slot. */
@@ -668,7 +676,7 @@ done:
 static void winios_q_report(unsigned int depth) {
     static double next_at;
     double now = CACurrentMediaTime();
-    unsigned int i, pushed, coalesced, hw, dm, dt, comp, keys, btns;
+    unsigned int i, pushed, coalesced, hw, dm, dt, comp, keys, btns, rel;
     char held[256];
     int n = 0;
 
@@ -677,6 +685,7 @@ static void winios_q_report(unsigned int depth) {
     hw = g_input_q.high_water; dm = g_input_q.dropped_move;
     dt = g_input_q.dropped_trans; comp = g_input_q.compactions;
     keys = g_input_q.keys_down; btns = g_input_q.btn_mask;
+    rel = g_input_q.rel_moves;
     held[0] = 0;
     for (i = 0; i < 256 && n < (int)sizeof(held) - 8; i++)
         if (g_input_q.keydown_mask[i >> 5] & (1u << (i & 31)))
@@ -686,9 +695,9 @@ static void winios_q_report(unsigned int depth) {
     if (now < next_at) return;
     if (!depth && !keys && !btns && !dm && !dt && !hw) return;
     next_at = now + 1.0;
-    fprintf(stderr, "[input] ring depth=%u high=%u pushed=%u coalesced=%u compact=%u "
+    fprintf(stderr, "[input] ring depth=%u high=%u pushed=%u rel=%u coalesced=%u compact=%u "
                     "dropped(move=%u trans=%u) drv_keys=%u[%s] drv_btn=0x%x\n",
-            depth, hw, pushed, coalesced, comp, dm, dt, keys, held, btns);
+            depth, hw, pushed, rel, coalesced, comp, dm, dt, keys, held, btns);
     fflush(stderr);
 }
 

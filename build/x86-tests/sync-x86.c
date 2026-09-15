@@ -28,10 +28,17 @@
  *     must make the next wait block again.  A manual event that is consumed
  *     like an auto-reset one passes test 1 and fails only here.
  *
- *  4. TIMEOUT.  A wait with a finite timeout on an event nobody sets must
- *     return WAIT_TIMEOUT, and must not return early -- the fast path adjusts
- *     a relative timeout by the time it already spent, and an arithmetic slip
- *     there turns every timed wait into a spin.
+ *  4. TIMEOUT, three ways.  A wait with a finite timeout on an event nobody
+ *     sets must return WAIT_TIMEOUT, and must not return early -- the fast
+ *     path adjusts a relative timeout by the time it already spent, and an
+ *     arithmetic slip there turns every timed wait into a spin.  (a) 300 ms,
+ *     longer than the fast-path cap, so the server gets a remainder: it must
+ *     be neither short nor absurdly long.  (b) 1 ms, SHORTER than the cap, the
+ *     one case where handing the server a zero remainder is right.  (c) twenty
+ *     10 ms waits in a row must add up to at least 100 ms of real time -- a
+ *     timed wait that returns instantly passes (a) and (b) only by luck but
+ *     can never pass this, and "returns instantly" is exactly what turns a
+ *     loader's retry delay into a busy loop that starves what it waits for.
  *
  * Deliberate restrictions, the same ones the other tests in this directory
  * work under: no CRT (this file supplies `start' plus memset/memcpy and links
@@ -353,7 +360,13 @@ static int run_manual(void)
 static int run_timeout(void)
 {
     DWORD t0, spent, r;
+    unsigned int i;
 
+    /* (a) LONGER THAN THE FAST-PATH CAP.  The fast path parks for at most its
+     *     cap (2 ms) and then hands the REMAINDER to the server.  If that
+     *     subtraction is wrong the wait comes back early -- and "early" here
+     *     means a remainder of zero, which server_wait treats as a poll, so
+     *     the whole 300 ms evaporates and WAIT_TIMEOUT arrives instantly. */
     ResetEvent( ev_a );
     t0 = GetTickCount();
     r = WaitForSingleObject( ev_a, 300 );
@@ -364,14 +377,62 @@ static int run_timeout(void)
         line_1( "MADEIRA-SYNC: timed wait returned ", (unsigned int)r, " not WAIT_TIMEOUT" );
         return 56;
     }
-    /* The fast path parks for at most its cap and then hands the remainder to
-     * the server; if that subtraction is wrong the wait comes back early. */
     if (spent + 30 < 300)
     {
         line_2( "MADEIRA-SYNC: timed wait returned after ", spent, " ms, wanted ", 300, " ms" );
         return 56;
     }
+    /* ... and not absurdly LATE either: the remainder must be the caller's
+     * timeout less the park, not the caller's timeout plus it. */
+    if (spent > 2000)
+    {
+        line_2( "MADEIRA-SYNC: timed wait took ", spent, " ms for a ", 300, " ms timeout" );
+        return 56;
+    }
     line_1( "MADEIRA-SYNC: 300 ms timed wait returned WAIT_TIMEOUT after ", spent, " ms OK" );
+
+    /* (b) SHORTER THAN THE FAST-PATH CAP.  Here the fast path is allowed to
+     *     consume the whole timeout and hand the server a zero remainder --
+     *     the one case where that is the right answer.  It must still be a
+     *     WAIT_TIMEOUT and it must still come back promptly. */
+    ResetEvent( ev_a );
+    t0 = GetTickCount();
+    r = WaitForSingleObject( ev_a, 1 );
+    spent = GetTickCount() - t0;
+    if (r != WAIT_TIMEOUT)
+    {
+        line_1( "MADEIRA-SYNC: 1 ms timed wait returned ", (unsigned int)r, " not WAIT_TIMEOUT" );
+        return 56;
+    }
+    if (spent > 500)
+    {
+        line_2( "MADEIRA-SYNC: 1 ms timed wait took ", spent, " ms, wanted about ", 1, " ms" );
+        return 56;
+    }
+
+    /* (c) A RUN OF TIMED WAITS MUST ACCUMULATE REAL TIME.  This is the shape a
+     *     loader uses a timed wait for -- as a sleep, or as a retry delay -- and
+     *     it is what turns a wait that returns instantly into a busy loop that
+     *     never lets the thing it is waiting for run.  Twenty 10 ms waits on an
+     *     event nobody sets cannot take less than 100 ms in total. */
+    ResetEvent( ev_a );
+    t0 = GetTickCount();
+    for (i = 0; i < 20; i++)
+    {
+        if (WaitForSingleObject( ev_a, 10 ) != WAIT_TIMEOUT)
+        {
+            line_1( "MADEIRA-SYNC: 10 ms timed wait ", i, " was not WAIT_TIMEOUT" );
+            return 56;
+        }
+    }
+    spent = GetTickCount() - t0;
+    if (spent < 100)
+    {
+        line_2( "MADEIRA-SYNC: 20 x 10 ms timed waits took ", spent,
+                " ms, cannot be under ", 100, " ms" );
+        return 56;
+    }
+    line_1( "MADEIRA-SYNC: sub-cap + repeated timed waits OK (20 x 10 ms took ", spent, " ms)" );
     return 0;
 }
 

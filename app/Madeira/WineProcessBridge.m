@@ -289,6 +289,65 @@ static volatile int g_wine_running = 0;
 static char *g_prefix_path = NULL;
 
 /***********************************************************************
+ *           madeira_install_user_fonts
+ *
+ * "Double-click install" for iOS: anything the user drops into
+ * Documents/fonts/ is installed into the prefix's C:\windows\Fonts.
+ *
+ * That directory is the ONE place a font has to be for Wine to install it:
+ * win32u's font_init() -> load_file_system_fonts() scans
+ * \??\C:\windows\fonts on every session start and registers every face it
+ * finds in the font list and in the HKCU\Software\Wine\Fonts\Cache key —
+ * which IS Wine's font cache — so a file copied here behaves exactly like one
+ * of the preinstalled faces, for 32-bit and 64-bit guests alike. (The
+ * HKLM\...\CurrentVersion\Fonts value only carries fonts that live OUTSIDE
+ * that directory; Wine writes it itself, from the face's real name, in
+ * update_external_font_keys().)
+ *
+ * Generic: no font name, no title, no app is special-cased — whatever is in
+ * the folder gets installed. Runs before the wineserver starts, every
+ * session, so a font added between runs is picked up on the next launch.
+ */
+static void madeira_install_user_fonts(NSString *prefix)
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *src = [[prefix stringByDeletingLastPathComponent]
+                        stringByAppendingPathComponent:@"fonts"];
+    NSString *dst = [prefix stringByAppendingPathComponent:@"drive_c/windows/Fonts"];
+    NSArray<NSString *> *names = [fm contentsOfDirectoryAtPath:src error:nil];
+    NSUInteger installed = 0;
+
+    if (!names.count) return;
+    [fm createDirectoryAtPath:dst withIntermediateDirectories:YES attributes:nil error:nil];
+
+    for (NSString *name in names) {
+        NSString *ext = name.pathExtension.lowercaseString;
+        if (![ext isEqualToString:@"ttf"] && ![ext isEqualToString:@"otf"] &&
+            ![ext isEqualToString:@"ttc"] && ![ext isEqualToString:@"fon"]) continue;
+        if ([name hasPrefix:@"."]) continue;
+
+        NSString *from = [src stringByAppendingPathComponent:name];
+        NSString *to   = [dst stringByAppendingPathComponent:name];
+        NSDictionary *a = [fm attributesOfItemAtPath:from error:nil];
+        NSDictionary *b = [fm attributesOfItemAtPath:to error:nil];
+
+        /* already installed and unchanged: leave it alone (size is enough —
+         * a replaced font of identical size is indistinguishable to the user
+         * and re-copying every launch costs more than it is worth) */
+        if (b && [a[NSFileSize] isEqual:b[NSFileSize]]) continue;
+
+        [fm removeItemAtPath:to error:nil];
+        if ([fm copyItemAtPath:from toPath:to error:nil]) {
+            installed++;
+            LOG("[fonts] installed %{public}s", name.UTF8String);
+        } else {
+            LOG("[fonts] FAILED to install %{public}s", name.UTF8String);
+        }
+    }
+    LOG("[fonts] installed %lu from Documents/fonts", (unsigned long)installed);
+}
+
+/***********************************************************************
  *           madeira_seed_prefix_if_needed
  *
  * Extract the bundled prefix template on first launch and (re)create the
@@ -342,6 +401,10 @@ void madeira_seed_prefix_if_needed(const char *prefix_path) {
         madeira_repair_profile( prefix );
         /* ml581: see madeira_undo_appdata_skeleton() above. */
         madeira_undo_appdata_skeleton( prefix );
+        /* Fonts the user dropped into Documents/fonts. Must be in place before
+         * the wineserver starts, so win32u's session-start scan of
+         * C:\windows\fonts sees them. */
+        madeira_install_user_fonts( prefix );
     }
 }
 
@@ -849,7 +912,218 @@ static void *wine_process_thread(void *arg) {
                     }
                     dprintf(STDERR_FILENO, "[WineProc] Farm %s: %d links -> %s\n",
                             farms[i].farm, farmLinked, farms[i].arch);
+
+                    /* system32\wbem — the one SUBDIRECTORY of the farm.
+                     *
+                     * The bundle farms are flat, but WMI's registered
+                     * InprocServer32 paths are C:\windows\system32\wbem\<name>
+                     * (they are in the shipped registry, and wine.inf installs
+                     * these five modules there: "11,wbem,mofcomp.exe" etc).
+                     * A flat link leaves system32\wbem EMPTY, so
+                     * CoCreateInstance(CLSID_WbemLocator) fails with
+                     * c0000135 / "no class object" — which is what two
+                     * different 32-bit programs hit in the device logs, both
+                     * through dxdiagn asking WMI about the display adapter.
+                     * The list is wine.inf's, not any program's. */
+                    {
+                        static const char *wbem[] = { "wbemprox.dll", "wbemdisp.dll",
+                                                      "wmiutils.dll", "wmic.exe",
+                                                      "mofcomp.exe" };
+                        NSString *wbemDir = [farmDir stringByAppendingPathComponent:@"wbem"];
+                        int wbemLinked = 0;
+                        [fm createDirectoryAtPath:wbemDir withIntermediateDirectories:YES
+                                       attributes:nil error:nil];
+                        for (size_t w = 0; w < sizeof(wbem) / sizeof(wbem[0]); w++) {
+                            NSString *n = [NSString stringWithUTF8String:wbem[w]];
+                            NSString *src = [archSource stringByAppendingPathComponent:n];
+                            NSString *dst = [wbemDir stringByAppendingPathComponent:n];
+                            [fm removeItemAtPath:dst error:nil];
+                            if (![fm fileExistsAtPath:src]) continue;  /* farm doesn't build it */
+                            if ([fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil])
+                                wbemLinked++;
+                        }
+                        dprintf(STDERR_FILENO, "[WineProc] Farm %s\\wbem: %d/%zu links -> %s\n",
+                                farms[i].farm, wbemLinked,
+                                sizeof(wbem) / sizeof(wbem[0]), farms[i].arch);
+                    }
                 }
+
+                /* the same subdirectory for the session's own system32 (the
+                 * flat pass above linked the session arch into system32, but
+                 * never its wbem subdir) */
+                {
+                    static const char *wbem[] = { "wbemprox.dll", "wbemdisp.dll",
+                                                  "wmiutils.dll", "wmic.exe", "mofcomp.exe" };
+                    NSString *wbemDir = [sys32Dir stringByAppendingPathComponent:@"wbem"];
+                    int wbemLinked = 0;
+                    [fm createDirectoryAtPath:wbemDir withIntermediateDirectories:YES
+                                   attributes:nil error:nil];
+                    for (size_t w = 0; w < sizeof(wbem) / sizeof(wbem[0]); w++) {
+                        NSString *n = [NSString stringWithUTF8String:wbem[w]];
+                        NSString *src = [dllSource stringByAppendingPathComponent:n];
+                        NSString *dst = [wbemDir stringByAppendingPathComponent:n];
+                        [fm removeItemAtPath:dst error:nil];
+                        if (![fm fileExistsAtPath:src]) continue;
+                        if ([fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil])
+                            wbemLinked++;
+                    }
+                    dprintf(STDERR_FILENO, "[WineProc] system32\\wbem: %d/%zu links -> %s\n",
+                            wbemLinked, sizeof(wbem) / sizeof(wbem[0]), bundle_subdir);
+                }
+            }
+
+            /* C:\windows\winsxs — THE SIDE-BY-SIDE ASSEMBLY STORE.
+             *
+             * DEVICE EVIDENCE, every 32-bit run and the desktop alike:
+             *   fixme:actctx:parse_depend_manifests Could not find dependent
+             *       assembly "Microsoft.Windows.Common-Controls" (6.0.0.0)
+             *   err:commdlg:DllMain failed to create activation context ...
+             *       14001
+             * because the prefix has no winsxs directory AT ALL, so no program
+             * in it can ever get a v6 common-controls activation context.
+             * Non-fatal in Wine, but it is a permanent, prefix-wide gap: comdlg32
+             * gives up on its activation context in DllMain, and every app
+             * manifest that asks for Common-Controls 6.0.0.0 — which is nearly
+             * all of them — takes the v5 path forever.
+             *
+             * WHY IT IS MISSING: the store is not in the shipped template
+             * (scripts/build-prefix-snapshot.sh deletes drive_c/windows/winsxs
+             * before tarring), and nothing recreates it here because this port
+             * never runs wineboot's fake-DLL install — which is what builds it
+             * on a normal Wine prefix.
+             *
+             * WHAT WINE ACTUALLY WRITES, reproduced here exactly
+             * (dlls/setupapi/fakedll.c register_manifest/append_manifest_filename/
+             *  create_manifest/create_winsxs_dll_path):
+             *   windows\winsxs\manifests\<DIR>.manifest
+             *   windows\winsxs\<DIR>\comctl32.dll        (= comctl32_v6.dll)
+             * with
+             *   <DIR> = <arch>_microsoft.windows.common-controls_
+             *           6595b64144ccf1df_6.0.2600.2982_none_deadbeef
+             * — lower case, publicKeyToken and version verbatim, and the literal
+             * "deadbeef" where Microsoft puts a content hash (fakedll.c writes
+             * that constant; ntdll's actctx.c lookup_manifest_file recognises it
+             * and prefers a non-Wine assembly if one is ever present).
+             * The manifest BYTES are dlls/comctl32_v6/comctl32.manifest with the
+             * empty processorArchitecture="" filled in with the architecture —
+             * fakedll.c does that substitution at install time, and actctx.c
+             * validates the identity inside the file against the one parsed out
+             * of the file NAME, so the two must agree.
+             *
+             * ntdll searches, for a dependency on 6.0.0.0 (actctx.c
+             * build_manifest_filter/lookup_winsxs):
+             *   windows\winsxs\manifests\
+             *     <arch>_Microsoft.Windows.Common-Controls_6595b64144ccf1df_6.0.*.*_*_*.manifest
+             * with <arch> = "x86" for a 32-bit process and "arm64" for both
+             * aarch64 AND arm64ec (actctx.c current_archW). "amd64" is seeded
+             * too because an arm64ec setupapi would have installed it under that
+             * name (fakedll.c has no __arm64ec__ case and falls into __x86_64__),
+             * and lookup_manifest_file's __arm64ec__ branch rewrites an explicit
+             * "amd64_" request to the wildcard "a??64_", which matches either.
+             *
+             * ONLY WHEN THE DLL IS THERE. A manifest without
+             * winsxs\<DIR>\comctl32.dll would make ntdll's find_actctx_dll
+             * redirect every comctl32.dll load for that assembly into a
+             * directory that has none — strictly worse than no manifest. So an
+             * architecture whose farm has no comctl32_v6.dll is skipped, loudly.
+             */
+            {
+                /* dlls/comctl32_v6/comctl32.manifest verbatim, with the one
+                 * substitution fakedll.c makes. LF only, no BOM: actctx.c
+                 * assumes UTF-8 when there is no UTF-16 BOM. */
+                static const char *manifest_tmpl =
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+                    "<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\n"
+                    "  <assemblyIdentity type=\"win32\" name=\"Microsoft.Windows.Common-Controls\" version=\"6.0.2600.2982\" processorArchitecture=\"@ARCH@\" publicKeyToken=\"6595b64144ccf1df\"/>\n"
+                    "  <file name=\"comctl32.dll\">\n"
+                    "    <windowClass>Button</windowClass>\n"
+                    "    <windowClass>ButtonListBox</windowClass>\n"
+                    "    <windowClass>ComboBoxEx32</windowClass>\n"
+                    "    <windowClass>ComboLBox</windowClass>\n"
+                    "    <windowClass>ComboBox</windowClass>\n"
+                    "    <windowClass>Edit</windowClass>\n"
+                    "    <windowClass>ListBox</windowClass>\n"
+                    "    <windowClass>NativeFontCtl</windowClass>\n"
+                    "    <windowClass>ReBarWindow32</windowClass>\n"
+                    "    <windowClass>ScrollBar</windowClass>\n"
+                    "    <windowClass>Static</windowClass>\n"
+                    "    <windowClass>SysAnimate32</windowClass>\n"
+                    "    <windowClass>SysDateTimePick32</windowClass>\n"
+                    "    <windowClass>SysHeader32</windowClass>\n"
+                    "    <windowClass>SysIPAddress32</windowClass>\n"
+                    "    <windowClass>SysLink</windowClass>\n"
+                    "    <windowClass>SysListView32</windowClass>\n"
+                    "    <windowClass>SysMonthCal32</windowClass>\n"
+                    "    <windowClass>SysPager</windowClass>\n"
+                    "    <windowClass>SysTabControl32</windowClass>\n"
+                    "    <windowClass>SysTreeView32</windowClass>\n"
+                    "    <windowClass>ToolbarWindow32</windowClass>\n"
+                    "    <windowClass>msctls_hotkey32</windowClass>\n"
+                    "    <windowClass>msctls_progress32</windowClass>\n"
+                    "    <windowClass>msctls_statusbar32</windowClass>\n"
+                    "    <windowClass>msctls_trackbar32</windowClass>\n"
+                    "    <windowClass>msctls_updown32</windowClass>\n"
+                    "    <windowClass>tooltips_class32</windowClass>\n"
+                    "  </file>\n"
+                    "</assembly>\n";
+                static const struct { const char *arch; const char *farm; } sxs[] = {
+                    { "x86",   "i386-windows"    },   /* every 32-bit process */
+                    { "arm64", "aarch64-windows" },   /* aarch64 AND arm64ec sessions */
+                    { "amd64", "arm64ec-windows" },   /* what an arm64ec setupapi installs */
+                };
+                NSString *winsxsDir = [prefix stringByAppendingPathComponent:@"drive_c/windows/winsxs"];
+                NSString *manifestsDir = [winsxsDir stringByAppendingPathComponent:@"manifests"];
+                int sxsSeeded = 0;
+
+                [fm createDirectoryAtPath:manifestsDir withIntermediateDirectories:YES
+                               attributes:nil error:nil];
+                for (size_t s = 0; s < sizeof(sxs) / sizeof(sxs[0]); s++) {
+                    NSString *archSource = [bundlePath stringByAppendingPathComponent:
+                        [NSString stringWithUTF8String:sxs[s].farm]];
+                    NSString *dll = [archSource stringByAppendingPathComponent:@"comctl32_v6.dll"];
+                    if (![fm fileExistsAtPath:dll]) {
+                        dprintf(STDERR_FILENO,
+                                "[WineProc] winsxs: %s SKIPPED -- %s has no comctl32_v6.dll, and a "
+                                "manifest without the assembly's DLL would redirect comctl32 loads "
+                                "into an empty directory (build it with .xtool/build-wine-64.sh / "
+                                "build-wine-i386.sh)\n", sxs[s].arch, sxs[s].farm);
+                        continue;
+                    }
+                    NSString *dir = [NSString stringWithFormat:
+                        @"%s_microsoft.windows.common-controls_6595b64144ccf1df_"
+                        @"6.0.2600.2982_none_deadbeef", sxs[s].arch];
+                    NSString *asmDir = [winsxsDir stringByAppendingPathComponent:dir];
+                    NSString *manifest = [manifestsDir stringByAppendingPathComponent:
+                        [dir stringByAppendingString:@".manifest"]];
+                    /* one substitution, not a format string: fakedll.c splices
+                     * the architecture into the source manifest's empty
+                     * processorArchitecture="", and this is that splice. */
+                    NSString *text = [[NSString stringWithUTF8String:manifest_tmpl]
+                        stringByReplacingOccurrencesOfString:@"@ARCH@"
+                                                  withString:[NSString stringWithUTF8String:sxs[s].arch]];
+                    NSString *link = [asmDir stringByAppendingPathComponent:@"comctl32.dll"];
+
+                    [fm createDirectoryAtPath:asmDir withIntermediateDirectories:YES
+                                   attributes:nil error:nil];
+                    if (![[text dataUsingEncoding:NSUTF8StringEncoding]
+                            writeToFile:manifest atomically:YES]) {
+                        dprintf(STDERR_FILENO, "[WineProc] winsxs: FAILED to write %s\n",
+                                manifest.UTF8String);
+                        continue;
+                    }
+                    /* re-link every session: the bundle path changes on reinstall */
+                    [fm removeItemAtPath:link error:nil];
+                    if (![fm createSymbolicLinkAtPath:link withDestinationPath:dll error:nil]) {
+                        dprintf(STDERR_FILENO, "[WineProc] winsxs: FAILED to link %s\n",
+                                link.UTF8String);
+                        continue;
+                    }
+                    sxsSeeded++;
+                }
+                dprintf(STDERR_FILENO,
+                        "[WineProc] winsxs: %d/%zu Common-Controls 6.0 assemblies seeded "
+                        "(manifests + comctl32.dll) -> %s\n",
+                        sxsSeeded, sizeof(sxs) / sizeof(sxs[0]), winsxsDir.UTF8String);
             }
 
             /* ml719: REPAIR THE SHELL FOLDERS. They ship as symlinks to the BUILD

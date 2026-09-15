@@ -25,6 +25,7 @@
 
 #include <assert.h>
 #include <pthread.h>
+#include <time.h>
 
 #include "ntstatus.h"
 #include "ntgdi_private.h"
@@ -103,6 +104,50 @@ void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_
                        "-> status=0x%x (failures=%u)\n",
                     cnt, hwnd, flags, x, y, (unsigned)st, bad);
         if (is_move) moves++;
+
+        /* ml667 — the driver half of [relmouse]; the server half is printed by
+         * relmouse_report() in queue_ios.c. Together they bracket the one gap
+         * nothing could see before: whether a relative delta that LEFT the app
+         * ever became a WM_INPUT for the game.
+         *
+         * This end reports what win32u handed the server and what the cursor
+         * did as a result. rel/acc rising with cursor= standing still means the
+         * cursor is pinned (a clip rect, or a game re-centring); rel rising
+         * with the server's rel_in standing still means the send_hardware_message
+         * call itself is being lost. Relative moves only, so the line appears
+         * only in Relative pointer mode, at most once every 5s. */
+        if (is_move && !(flags & MOUSEEVENTF_ABSOLUTE))
+        {
+            static unsigned rel_cnt, rel_bad;
+            static long long acc_x, acc_y;
+            static struct timespec next_at;
+            struct timespec now;
+
+            rel_cnt++;
+            if (st) rel_bad++;
+            acc_x += x;
+            acc_y += y;
+
+            clock_gettime( CLOCK_MONOTONIC, &now );
+            if (now.tv_sec >= next_at.tv_sec)
+            {
+                CURSORINFO info = { .cbSize = sizeof(info) };
+                POINT pt = {0};
+                DWORD fg_tid = 0, fg_pid = 0;
+                HWND fg = NtUserGetForegroundWindow();
+
+                if (NtUserGetCursorInfo( &info )) pt = info.ptScreenPos;
+                if (fg) fg_tid = get_window_thread( fg, &fg_pid );
+
+                next_at.tv_sec = now.tv_sec + 5;
+                dprintf(2, "[relmouse] ml667 src=drv rel=%u fail=%u acc=(%lld,%lld) "
+                           "last=(%d,%d) cursor=(%d,%d) cursor_flags=0x%x "
+                           "foreground=%p fg_tid=%04x fg_pid=%04x\n",
+                        rel_cnt, rel_bad, acc_x, acc_y, x, y,
+                        (int)pt.x, (int)pt.y, (unsigned)info.flags,
+                        fg, (unsigned)fg_tid, (unsigned)fg_pid);
+            }
+        }
     }
 }
 

@@ -582,6 +582,7 @@ uintptr_t ios_srv_game_teb = 0;           /* set once by server_init_process_don
  */
 #include <mach/mach_time.h>
 #include "ios_srv_stats.h"
+#include "ios_spin_hist.h"
 #include "server_req_names.h"
 
 /* MADEIRA_SRV_STATS=0 turns the accounting off entirely (both timer reads
@@ -600,6 +601,98 @@ static unsigned int        ios_srv_kind_count[REQ_NB_REQUESTS];
 static unsigned long long  ios_srv_kind_ticks[REQ_NB_REQUESTS];
 static unsigned int        ios_srv_thr_tid[IOS_SRV_THR_SLOTS];
 static unsigned int        ios_srv_thr_count[IOS_SRV_THR_SLOTS];
+/*
+ * ml970  CALLER ATTRIBUTION for the kinds line.
+ *
+ * `kinds:' answers WHICH request is hot and `threads:' answers WHO issues it,
+ * but neither says WHAT CODE asked.  Log 46 had five request kinds locked to
+ * each other at ~177/s -- dup_handle=1770 get_object_info=1770
+ * close_handle=1772 get_thread_context=1770 and set_thread_context=2950 per
+ * 10 s -- with nothing in a D3D9 game that should touch a thread context per
+ * frame.  A count cannot distinguish "the game polls a worker" from "our own
+ * wow64 plumbing round-trips on the CURRENT thread", and those want opposite
+ * fixes.
+ *
+ * WHAT IS RECORDED.  One return address per request, taken at
+ * server_call_unlocked: preferably ONE FRAME ABOVE it -- server_call_unlocked's
+ * immediate caller is nearly always the thin wrapper (wine_server_call, or
+ * server_select), and the frame above that is the Nt* entry point that is
+ * worth naming.  The hop is a guarded read of this thread's own frame-pointer
+ * chain (arm64 keeps x29 linked on Darwin); if any guard fails it falls back
+ * to the immediate return address, so it can degrade but never fault.
+ *
+ * WHY NOT THE GUEST RIP.  For a 32-bit caller the interesting address is the
+ * i386 EIP, and it is NOT cheaply available on this side: the wow64 CPU area's
+ * Eip is only valid once FEX has flushed its JIT state into it, which is
+ * itself a server round trip (Context::FlushThreadStateContext), so reading it
+ * here would either be stale or cost more than the request being measured.
+ * What the host symbol gives instead is the Nt* function, which is the level
+ * the fix lives at anyway: NtQueryInformationThread(ThreadWow64Context) and
+ * NtQueryObject name their own callers unambiguously.
+ *
+ * Resolution is dladdr() at report time on at most 8x2 addresses; nothing on
+ * the hot path but two loads, a bounds check and one relaxed CAS/add.  PCs are
+ * never cleared (they are stable for the life of the process, so the table
+ * stays warm across windows); only the counts are exchanged to zero.
+ */
+#define IOS_SRV_CALLER_SLOTS 4
+
+static uintptr_t    ios_srv_caller_pc[REQ_NB_REQUESTS][IOS_SRV_CALLER_SLOTS];
+static unsigned int ios_srv_caller_n[REQ_NB_REQUESTS][IOS_SRV_CALLER_SLOTS];
+static unsigned int ios_srv_caller_other[REQ_NB_REQUESTS];
+
+/* One guarded hop up the frame-pointer chain.  `ra' is the caller's own return
+ * address and `fp' its frame pointer; on arm64 a frame is { saved x29, saved
+ * x30 } at [fp], so the caller's caller is at [[fp]+8].  Every guard below is
+ * about never dereferencing a value we did not prove is a live frame link:
+ * non-NULL, 16-byte aligned, strictly ascending (stacks grow down, so an outer
+ * frame is at a HIGHER address), and within 64 KB -- a single Wine stack frame
+ * is never larger, and the bound is what stops a leaf function that reused x29
+ * from sending us into unmapped memory. */
+static inline uintptr_t ios_srv_caller_hop( uintptr_t ra, uintptr_t fp )
+{
+    uintptr_t outer;
+
+    if (!fp || (fp & 15) || fp < 0x1000) return ra;
+    outer = *(const uintptr_t *)fp;
+    if (!outer || (outer & 15) || outer <= fp || outer - fp > 0x10000) return ra;
+    return *(const uintptr_t *)(outer + 8);
+}
+
+#define IOS_SRV_CALLER_PC() \
+    ios_srv_caller_hop( (uintptr_t)__builtin_return_address(0), (uintptr_t)__builtin_frame_address(0) )
+
+static void ios_srv_caller_bump( unsigned int kind, uintptr_t pc )
+{
+    int i;
+
+    if (kind >= REQ_NB_REQUESTS || !pc) return;
+    for (i = 0; i < IOS_SRV_CALLER_SLOTS; i++)
+    {
+        uintptr_t have = __atomic_load_n( &ios_srv_caller_pc[kind][i], __ATOMIC_RELAXED );
+
+        if (have == pc)
+        {
+            __atomic_fetch_add( &ios_srv_caller_n[kind][i], 1, __ATOMIC_RELAXED );
+            return;
+        }
+        if (!have)
+        {
+            uintptr_t expect = 0;
+            if (__atomic_compare_exchange_n( &ios_srv_caller_pc[kind][i], &expect, pc, 0,
+                                             __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
+            {
+                __atomic_fetch_add( &ios_srv_caller_n[kind][i], 1, __ATOMIC_RELAXED );
+                return;
+            }
+            i--;   /* someone claimed it under us; re-read this same slot */
+        }
+    }
+    /* A kind with more than IOS_SRV_CALLER_SLOTS distinct call sites: counted
+     * but not named, so the printed shares are honest about what they miss. */
+    __atomic_fetch_add( &ios_srv_caller_other[kind], 1, __ATOMIC_RELAXED );
+}
+
 static unsigned long long  ios_srv_stats_deadline;   /* mach ticks */
 static unsigned long long  ios_srv_stats_window_t0;
 
@@ -694,7 +787,8 @@ static void ios_srv_stats_report( unsigned long long now )
         nt[i] = __atomic_exchange_n( &ios_srv_nt_counts[i], 0, __ATOMIC_RELAXED );
 
     if (!total && !nt[IOS_NT_DELAY_ZERO] && !nt[IOS_NT_ALERT_WAIT] &&
-        !nt[IOS_NT_FAST_HIT] && !nt[IOS_NT_FAST_MISS] && !nt[IOS_FS_LEARN_EVENT])
+        !nt[IOS_NT_FAST_HIT] && !nt[IOS_NT_FAST_MISS] && !nt[IOS_FS_LEARN_EVENT] &&
+        !nt[IOS_FS_LEARN_NONE] && !nt[IOS_FS_EVICT])
     {
         __atomic_store_n( &ios_srv_stats_busy, 0, __ATOMIC_RELEASE );
         return;
@@ -757,6 +851,43 @@ static void ios_srv_stats_report( unsigned long long now )
     }
     wine_log_write( "%s", line );
 
+    /* ml970: and WHAT called each of them.  Two names per kind at most -- the
+     * question this answers is "who owns this traffic", and a kind with a
+     * genuine long tail of callers says so through `+N more'. */
+    len = snprintf( line, sizeof(line), "[srv-stats]   kinds-by-caller:" );
+    for (i = 0; i < 8 && len < (int)sizeof(line) - 1; i++)
+    {
+        unsigned int k = top_kind[i], shown = 0;
+        int c;
+
+        if (k >= REQ_NB_REQUESTS) break;
+        IOS_SRV_APPEND( " %s:", ios_srv_req_names[k] );
+        for (c = 0; c < IOS_SRV_CALLER_SLOTS && shown < 2; c++)
+        {
+            unsigned int n = __atomic_exchange_n( &ios_srv_caller_n[k][c], 0, __ATOMIC_RELAXED );
+            uintptr_t pc = __atomic_load_n( &ios_srv_caller_pc[k][c], __ATOMIC_RELAXED );
+            Dl_info di;
+
+            if (!n || !pc) continue;
+            shown++;
+            if (dladdr( (void *)pc, &di ) && di.dli_sname && di.dli_saddr)
+                IOS_SRV_APPEND( " %s+0x%llx=%u", di.dli_sname,
+                                (unsigned long long)(pc - (uintptr_t)di.dli_saddr), n );
+            else
+                IOS_SRV_APPEND( " 0x%llx=%u", (unsigned long long)pc, n );
+        }
+        /* drain whatever the two-name cap left behind so the next window is
+         * not skewed by this one's residue */
+        for (; c < IOS_SRV_CALLER_SLOTS; c++)
+            __atomic_exchange_n( &ios_srv_caller_n[k][c], 0, __ATOMIC_RELAXED );
+        {
+            unsigned int other = __atomic_exchange_n( &ios_srv_caller_other[k], 0, __ATOMIC_RELAXED );
+            if (other) IOS_SRV_APPEND( " +%u more", other );
+        }
+        IOS_SRV_APPEND( " |" );
+    }
+    wine_log_write( "%s", line );
+
     len = snprintf( line, sizeof(line), "[srv-stats]   threads:" );
     for (i = 0; i < IOS_SRV_STATS_TOP_THR && len < (int)sizeof(line) - 1; i++)
     {
@@ -767,7 +898,6 @@ static void ios_srv_stats_report( unsigned long long now )
                         thr_counts[s] );
     }
     wine_log_write( "%s", line );
-#undef IOS_SRV_APPEND
 
     wine_log_write( "[srv-stats]   nt: setev=%u resetev=%u pulse=%u wait1=%u waitN=%u sigwait=%u "
                     "relsem=%u relmut=%u sleep0=%u sleepN=%u yield_sc=%u park=%u",
@@ -822,6 +952,40 @@ static void ios_srv_stats_report( unsigned long long now )
                     nt[IOS_SEL_DELAY_ALERT], nt[IOS_SEL_OTHER],
                     nt[IOS_SEL_RET_TIMEOUT], nt[IOS_SEL_RET_TIMEOUT_FIN] );
 
+    /* ml970: the spin governor's own distribution (sync.c).  `sleep0'/`yield'
+     * are the GOVERNED calls, `sys' the syscalls those calls actually cost --
+     * the ratio between them is the whole point of the governor, and p50/p80
+     * are the time-to-progress percentiles the park ladder is sized against. */
+    {
+        struct ios_spin_snapshot sp;
+        unsigned int b;
+
+        ios_spin_hist_snapshot( &sp );
+        if (sp.streaks || sp.gov_sleep0 || sp.gov_yield)
+        {
+            wine_log_write( "[sleep0] streaks=%u calls: sleep0=%u yield=%u | syscalls: yield=%u park=%u "
+                            "(%llu/s) | per-call=%u.%03u%% | to-progress p50=%uus p80=%uus warm=%u rev=ml970",
+                            sp.streaks, sp.gov_sleep0, sp.gov_yield, sp.sys_yield, sp.sys_park,
+                            ((unsigned long long)sp.sys_yield + sp.sys_park) * 1000000000ull / window_ns,
+                            (sp.gov_sleep0 + sp.gov_yield)
+                              ? (sp.sys_yield + sp.sys_park) * 100u / (sp.gov_sleep0 + sp.gov_yield) : 0,
+                            (sp.gov_sleep0 + sp.gov_yield)
+                              ? (unsigned int)(((unsigned long long)(sp.sys_yield + sp.sys_park) * 100000ull /
+                                                (sp.gov_sleep0 + sp.gov_yield)) % 1000ull) : 0,
+                            sp.us_p50, sp.us_p80, sp.warm_hits );
+
+            len = snprintf( line, sizeof(line), "[sleep0]   hist calls:" );
+            for (b = 0; b < IOS_SPIN_HIST_N; b++)
+                if (sp.calls[b]) IOS_SRV_APPEND( " %u=%u", 1u << b, sp.calls[b] );
+            wine_log_write( "%s", line );
+
+            len = snprintf( line, sizeof(line), "[sleep0]   hist us:" );
+            for (b = 0; b < IOS_SPIN_HIST_N; b++)
+                if (sp.us[b]) IOS_SRV_APPEND( " %u=%u", b ? 1u << b : 0u, sp.us[b] );
+            wine_log_write( "%s", line );
+        }
+    }
+
     wine_log_write( "[srv-stats]   futex(no server): alert_wait=%u alert_wake=%u | "
                     "fast hit=%u miss=%u wake=%u sleep=%u",
                     nt[IOS_NT_ALERT_WAIT], nt[IOS_NT_ALERT_WAKE],
@@ -831,11 +995,34 @@ static void ios_srv_stats_report( unsigned long long now )
     /* ml962: the cache's own behaviour.  learn_ev+learn_none must track
      * get_inproc_sync_fd in the kinds line above; if it does and both stay
      * high while relearn is high too, the (handle>>2) slot is being fought
-     * over rather than warmed. */
-    wine_log_write( "[srv-stats]   fastsync cache: learn_ev=%u learn_none=%u relearn=%u "
-                    "stale_gen=%u evict=%u",
-                    nt[IOS_FS_LEARN_EVENT], nt[IOS_FS_LEARN_NONE], nt[IOS_FS_RELEARN],
-                    nt[IOS_FS_STALE_GEN], nt[IOS_FS_EVICT] );
+     * over rather than warmed.
+     *
+     * ml972: ... and each number now comes with the RUNNING TOTAL in
+     * parentheses.  The ml962 line printed window deltas only, and a warm
+     * cache legitimately learns nothing for minutes at a time -- so "all five
+     * zero" could mean either "nothing happened this window" or "this code
+     * never runs", and on the device it meant the latter for evict (NtClose is
+     * server_ios.c's, and it was missing the call: see NtClose below).  A
+     * total that is still zero after the process has been up for a while is
+     * now unambiguous evidence that the counter is not wired, which is the
+     * only reading that tells you to go and look at the call site. */
+    {
+        static unsigned int fs_total[5];
+        fs_total[0] += nt[IOS_FS_LEARN_EVENT];
+        fs_total[1] += nt[IOS_FS_LEARN_NONE];
+        fs_total[2] += nt[IOS_FS_RELEARN];
+        fs_total[3] += nt[IOS_FS_STALE_GEN];
+        fs_total[4] += nt[IOS_FS_EVICT];
+        wine_log_write( "[srv-stats]   fastsync cache: learn_ev=%u(%u) learn_none=%u(%u) "
+                        "relearn=%u(%u) stale_gen=%u(%u) evict=%u(%u)",
+                        nt[IOS_FS_LEARN_EVENT], fs_total[0],
+                        nt[IOS_FS_LEARN_NONE],  fs_total[1],
+                        nt[IOS_FS_RELEARN],     fs_total[2],
+                        nt[IOS_FS_STALE_GEN],   fs_total[3],
+                        nt[IOS_FS_EVICT],       fs_total[4] );
+    }
+
+#undef IOS_SRV_APPEND
 
     __atomic_store_n( &ios_srv_stats_busy, 0, __ATOMIC_RELEASE );
 }
@@ -852,7 +1039,7 @@ void ios_srv_stats_report_now(void)
     ios_srv_stats_report( mach_absolute_time() );
 }
 
-static inline void ios_srv_stats_account( unsigned int kind, unsigned long long t0 )
+static inline void ios_srv_stats_account( unsigned int kind, unsigned long long t0, uintptr_t caller )
 {
     unsigned long long now = mach_absolute_time();
     TEB *teb = NtCurrentTeb();
@@ -862,6 +1049,7 @@ static inline void ios_srv_stats_account( unsigned int kind, unsigned long long 
         __atomic_fetch_add( &ios_srv_kind_count[kind], 1, __ATOMIC_RELAXED );
         __atomic_fetch_add( &ios_srv_kind_ticks[kind], now - t0, __ATOMIC_RELAXED );
     }
+    ios_srv_caller_bump( kind, caller );
     ios_srv_thr_bump( teb ? (unsigned int)(ULONG_PTR)teb->ClientId.UniqueThread : 0 );
 
     if (now >= __atomic_load_n( &ios_srv_stats_deadline, __ATOMIC_RELAXED ))
@@ -950,6 +1138,9 @@ unsigned int server_call_unlocked( void *req_ptr )
     const unsigned int stats_kind = req->u.req.request_header.req;
     const int stats_on = ios_srv_stats_enabled();
     const unsigned long long stats_t0 = stats_on ? mach_absolute_time() : 0;
+    /* ml970: taken HERE, not inside ios_srv_stats_account(), because the
+     * return address a static inline sees depends on whether it was inlined. */
+    const uintptr_t stats_ra = stats_on ? IOS_SRV_CALLER_PC() : 0;
 #endif
 
     ios_srv_req_count++;
@@ -963,7 +1154,7 @@ unsigned int server_call_unlocked( void *req_ptr )
     }
     ret = wait_reply( req );
 #ifdef WINE_IOS
-    if (stats_on) ios_srv_stats_account( stats_kind, stats_t0 );
+    if (stats_on) ios_srv_stats_account( stats_kind, stats_t0, stats_ra );
 #endif
     return ret;
 }
@@ -1590,7 +1781,7 @@ unsigned int server_wait( const union select_op *select_op, data_size_t size, UI
         struct timespec t0, t1;
 
         /* ml950: a real wait ends any Sleep(0) streak this thread had going
-         * (sync.c, ios_delay_zero) — a thread that blocks is not spinning. */
+         * (sync.c, ios_spin_governor) — a thread that blocks is not spinning. */
         { extern void ios_spin_reset(void); ios_spin_reset(); }
 #ifdef WINE_IOS
         ios_srv_classify_select( select_op, size, timeout );
@@ -1760,6 +1951,7 @@ unsigned int server_queue_process_apc( HANDLE process, const union apc_call *cal
 
             /* remove the handle from the cache, get_apc_result will close it for us */
             close_inproc_sync( handle );
+            madeira_fast_close( handle );   /* ml972 fastsync, see NtClose below */
 
             SERVER_START_REQ( get_apc_result )
             {
@@ -3549,6 +3741,7 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE 
     {
         fd = remove_fd_from_cache( source );
         close_inproc_sync( source );
+        madeira_fast_close( source );   /* ml972 fastsync, see NtClose below */
     }
 
     SERVER_START_REQ( dup_handle )
@@ -3623,6 +3816,27 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
      * retrieve it again */
     fd = remove_fd_from_cache( handle );
     close_inproc_sync( handle );
+    /* ml972 fastsync: THE EVICTION THAT WAS NEVER WIRED.
+     *
+     * dlls/ntdll/unix/server.c has carried this call since ml952, but that file
+     * is not the one that gets compiled: build.sh substitutes THIS overlay for
+     * server.c, so on the device NtClose never dropped anything from the
+     * handle -> cell cache.  `[srv-stats] fastsync cache: ... evict=0' was not
+     * a quiet cache, it was a dead call site.
+     *
+     * The consequence is worse than a stale-entry miss.  A positive entry is
+     * validated against the CELL's generation, and a cell stays live as long as
+     * its EVENT does -- not as long as this handle does.  So close a handle to
+     * an event something else still holds (a duplicate, an inherited handle, a
+     * named event opened twice), let the handle VALUE come back out of the
+     * handle table for an unrelated object, and the cache still answers with
+     * the old event's cell: handle value matches, pid matches, generation
+     * matches.  NtSetEvent on the new handle then signals the OLD event, and a
+     * wait on the new handle is satisfied by the OLD event's token.  With a
+     * loader creating and closing events thousands of times a second that is a
+     * handshake signalled to nobody: a worker that never resumes, and the
+     * critical section it holds never released. */
+    madeira_fast_close( handle );
 
     SERVER_START_REQ( close_handle )
     {

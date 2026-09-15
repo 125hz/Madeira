@@ -840,6 +840,172 @@ int read_process_memory( struct process *process, client_ptr_t ptr, data_size_t 
     return (ret == KERN_SUCCESS);
 }
 
+#ifdef WINE_IOS
+/* ml972: WriteProcessMemory ON A TARGET THAT IS IN OUR OWN MACH TASK.
+ *
+ * NtWriteVirtualMemory has no current-process shortcut: every write, including
+ * WriteProcessMemory(GetCurrentProcess(), ...), becomes a write_process_memory
+ * request.  And write_process_memory needs get_process_port(), which on this
+ * port returns process->trace_data -- always 0, because there is no per-guest
+ * Mach task to hold a port for.  So EVERY WriteProcessMemory on this target
+ * failed at the first `if (!process_port)' with STATUS_ACCESS_DENIED, which is
+ * the `err=5 put=0' readvm-x86.exe reports for its PAGE_EXECUTE_READ case (and
+ * would report for a plain PAGE_READWRITE one, which nothing covered).
+ *
+ * get_process_port() cannot simply return mach_task_self(): its own comment
+ * records that doing so ALSO activates read_process_memory and regressed a
+ * guest into a SEGV plus a loader-lock deadlock.  It does not need to be
+ * changed.  The wineserver is a thread in the same task as every guest thread,
+ * so for a target in the CALLER's own process the addresses in the request are
+ * already valid pointers here, and the write is a store, not an IPC.
+ *
+ * Only the caller's own process is handled: a 32-bit guest's address was
+ * translated into a host pointer by the WOW64 thunk using the CALLING
+ * process's 4 GB window, so the same number means a different byte in another
+ * pseudo-process.  Cross-process writes therefore keep exactly the behaviour
+ * they have today (the port-based path below, i.e. STATUS_ACCESS_DENIED) --
+ * this change can only turn a failure into a success, never the reverse.
+ *
+ * THE PROTECTION LADDER, AND WHY IT IS IN THIS ORDER.
+ *
+ * kernelbase's WriteProcessMemory already asks NtProtectVirtualMemory for
+ * PAGE_EXECUTE_READWRITE before it gets here (dlls/kernelbase/memory.c:644),
+ * but on iOS that does not mean the page is writable: TXM refuses to grant
+ * execute through mprotect at all, so virtual_ios.c's mprotect_exec() either
+ * left the page R-X from an earlier grant, or owns it through the dual-mapped
+ * JIT pool where the executable view is RX and a separate RW alias maps the
+ * same physical pages.  Hence:
+ *
+ *   1. region already writable          -> plain store.  This is the ONLY
+ *      correct answer for a MAP_SHARED section view: vm_protect(...COPY)
+ *      would privatise it and every other pseudo-process would keep reading
+ *      the old bytes.
+ *   2. a live dual-map RW alias covers it -> store through the alias.  No
+ *      protection change at all, so the executable view never loses execute --
+ *      which matters because on iOS taking VM_PROT_EXECUTE away can be a
+ *      one-way trip.  This is the same mechanism the SIGBUS store emulator in
+ *      signal_arm64_ios.c uses for guest stores into an execute-only alias;
+ *      the lookup is weak so this file still links if that unit is absent.
+ *   3. vm_protect( current | WRITE )    -> keeps EXECUTE in the request, so on
+ *      a device that grants RWX nothing is ever dropped.
+ *   4. vm_protect( READ | WRITE ), then  5. ( READ | WRITE | COPY ) -- the same
+ *      ladder, for the same reasons, as mprotect_exec()'s RW path
+ *      (virtual_ios.c:9636): plain first so shared mappings stay shared, COPY
+ *      only for a mapping whose maxprot has no WRITE (a code-signed file).
+ *      Both restore the region's original protection afterwards, and a failure
+ *      to restore EXECUTE is logged rather than swallowed: the bytes did land,
+ *      but the page is no longer executable and the next call through it will
+ *      fault somewhere far away from here.
+ *   6. nothing worked -> KERN_PROTECTION_FAILURE, i.e. STATUS_ACCESS_DENIED,
+ *      which is what a page that genuinely cannot be written should give.
+ *
+ * PAGE_READONLY is NOT special-cased here and does not need to be: Wine
+ * refuses it one level up, in WriteProcessMemory's `default:' arm, and never
+ * sends the request.  A debugger-style NtWriteVirtualMemory straight to a
+ * read-only page is the case upstream's Mach path also lets through once the
+ * mapping permits it.
+ */
+extern uintptr_t ios_jit_anon_alias_lookup( uintptr_t addr ) __attribute__((weak));
+
+static int ios_write_own_task( client_ptr_t ptr, data_size_t size, const char *src,
+                               data_size_t *written )
+{
+    mach_vm_address_t addr = (mach_vm_address_t)ptr;
+    mach_vm_size_t    page = (mach_vm_size_t)get_page_size();
+    data_size_t       remaining = size;
+    kern_return_t     ret = KERN_SUCCESS;
+
+    while (remaining)
+    {
+        mach_vm_address_t region = addr, prot_base = 0;
+        mach_vm_size_t    region_size = 0, chunk, prot_size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object_name = MACH_PORT_NULL;
+        char *dst = NULL;
+        int reprotect = 0;
+
+        ret = mach_vm_region( mach_task_self(), &region, &region_size, VM_REGION_BASIC_INFO_64,
+                              (vm_region_info_t)&info, &count, &object_name );
+        if (ret != KERN_SUCCESS) break;
+        /* mach_vm_region returns the next region at or ABOVE the address, so a
+         * hole is "the region I got back starts past me". */
+        if (region > addr || region + region_size <= addr)
+        {
+            ret = KERN_INVALID_ADDRESS;
+            break;
+        }
+
+        chunk = region + region_size - addr;
+        if (chunk > remaining) chunk = remaining;
+
+        /* A region with no access at all is a guard page or a reservation, not
+         * something a protection change should quietly open up.  Windows says
+         * ACCESS_VIOLATION for PAGE_NOACCESS and so do we. */
+        if (info.protection == VM_PROT_NONE)
+        {
+            ret = KERN_PROTECTION_FAILURE;
+            break;
+        }
+
+        if (info.protection & VM_PROT_WRITE) dst = (char *)(uintptr_t)addr;        /* 1 */
+        else if (ios_jit_anon_alias_lookup)                                        /* 2 */
+        {
+            uintptr_t rw = ios_jit_anon_alias_lookup( (uintptr_t)addr );
+            /* the alias must cover the whole chunk linearly, or the tail would
+             * land in another mapping: check the last byte resolves to the
+             * matching offset of the same alias. */
+            if (rw && ios_jit_anon_alias_lookup( (uintptr_t)(addr + chunk - 1) ) == rw + chunk - 1)
+                dst = (char *)rw;
+        }
+
+        if (!dst)
+        {
+            prot_base = addr & ~(page - 1);
+            prot_size = ((addr + chunk + page - 1) & ~(page - 1)) - prot_base;
+
+            ret = mach_vm_protect( mach_task_self(), prot_base, prot_size, FALSE,   /* 3 */
+                                   info.protection | VM_PROT_WRITE );
+            if (ret != KERN_SUCCESS)
+                ret = mach_vm_protect( mach_task_self(), prot_base, prot_size, FALSE,  /* 4 */
+                                       VM_PROT_READ | VM_PROT_WRITE );
+            if (ret != KERN_SUCCESS)
+                ret = mach_vm_protect( mach_task_self(), prot_base, prot_size, FALSE,  /* 5 */
+                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY );
+            if (ret != KERN_SUCCESS)                                                   /* 6 */
+            {
+                ret = KERN_PROTECTION_FAILURE;
+                break;
+            }
+            reprotect = 1;
+            dst = (char *)(uintptr_t)addr;
+        }
+
+        memcpy( dst, src, (size_t)chunk );
+
+        if (reprotect)
+        {
+            kern_return_t back = mach_vm_protect( mach_task_self(), prot_base, prot_size,
+                                                  FALSE, info.protection );
+            if (back != KERN_SUCCESS)
+                fprintf( stderr, "[srv-wpm] ml972 could NOT restore prot 0x%x on 0x%llx+0x%llx "
+                         "(kr=%d) -- the write landed, the page did not go back%s\n",
+                         info.protection, (unsigned long long)prot_base,
+                         (unsigned long long)prot_size, back,
+                         (info.protection & VM_PROT_EXECUTE) ? " AND IT WAS EXECUTABLE" : "" );
+        }
+
+        if (written) *written += (data_size_t)chunk;
+        addr      += chunk;
+        src       += chunk;
+        remaining -= (data_size_t)chunk;
+    }
+
+    mach_set_error( ret );
+    return (ret == KERN_SUCCESS);
+}
+#endif  /* WINE_IOS */
+
 /* write data to a process memory space */
 int write_process_memory( struct process *process, client_ptr_t ptr, data_size_t size, const char *src,
                           data_size_t *written )
@@ -849,6 +1015,11 @@ int write_process_memory( struct process *process, client_ptr_t ptr, data_size_t
     mach_vm_offset_t data;
 
     if (written) *written = 0;
+
+#ifdef WINE_IOS
+    if ((mach_vm_address_t)ptr == ptr && size && current && current->process == process)
+        return ios_write_own_task( ptr, size, src, written );
+#endif
 
     if (!process_port)
     {

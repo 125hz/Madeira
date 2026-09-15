@@ -2005,6 +2005,115 @@ game-specific patches — every change must fix the emulator/runtime generically
   present); FB7/FB8 done. Codegen re-verified byte-identical. All builds
   clean. Stage F resumed: reproducible `xtajit.dll` stage, final IPA,
   line-ending diagnosis.
+- 2026-09-14 — **The virtual monitor is a real monitor now: it takes the
+  device's shape, it lists modes, and `ChangeDisplaySettings` programs it.**
+  Two generic defects, not one program's problem. (a) Every direct launch got
+  a fixed 1024x768 virtual monitor whatever the device looked like, so a
+  widescreen game rendered 4:3 and Fit pillarboxed it on a 19.5:9 phone —
+  "the game runs in a smaller window in landscape". The `[display] mode=…`
+  control added last round scales the presented surface and cannot touch
+  that, because the aspect is decided inside the guest by the monitor it
+  renders for. (b) `ios_virtual_change_display_settings` answered every mode
+  request with DISP_CHANGE_SUCCESSFUL and changed nothing, which is worse
+  than a clean failure: the game sizes its swapchain and its projection for a
+  mode it is not running.
+
+  **Default = the device's landscape shape.** `GuestDisplay`
+  (`ContentView.swift:105`) holds the standard-mode list and
+  `defaultMode(forLandscapeView:)` (`:130`) picks from it — nearest aspect
+  first, then cheapest among modes of effectively the same aspect, with the
+  candidate set limited to 0.9–2.1 MP because on a phone the render cost of a
+  mode is the reason not to offer it. A 19.5:9 phone gets the nearest
+  *standard* aspect (16:9) and Fit letterboxes the remaining sliver, rather
+  than a 1560x720 that appears in nobody's mode list. `configureSessionDefault`
+  (`:156`) exports `MADEIRA_SCREEN_W/H` plus a new `MADEIRA_SCREEN_SRC`;
+  `Documents/madeira-screen.txt` holding `WxH` overrides it for a session
+  (knob block, `:3830`). Desktop mode is untouched — explorer's buttons
+  export their own `/desktop` size and `MADEIRA_SCREEN_SRC=desktop` at press
+  time, after the block above has run.
+
+  **win32u.** `ios_screen_size()` (`sysparams_ios.c:213`) is now a current
+  mode plus a session default instead of a constant; it logs
+  `[display] virtual monitor WxH (source=view|knob|desktop)` once.
+  `ios_standard_modes[]` (`:3901`) + `ios_mode_at_index()` (`:3913`) are the
+  mode table `NtUserEnumDisplaySettings` serves (`:3940`): index 0 is always
+  the current mode, the rest are the standard modes capped at twice the
+  current pixel count, all 32 bpp / 60 Hz. `ios_virtual_change_display_settings`
+  (`:4087`) validates against that table (BADMODE for anything else, never
+  BADPARAM for our own device name) and, for CDS_FULLSCREEN or 0, calls
+  `ios_publish_screen_size()` (`:4031`), which is the whole propagation path:
+  `update_display_cache(TRUE)` re-runs the virtual-monitor branch and pushes
+  the new rectangle to the server, which moves `SM_C{X,Y}SCREEN`,
+  `EnumDisplayMonitors`/`GetMonitorInfo` and the desktop window (win32u
+  answers WND_DESKTOP rects from `get_primary_monitor_rect()`,
+  `wine/dlls/win32u/window.c:1780`, so no `SetWindowPos` on a thread-less
+  window is attempted); `NtUserClipCursor(NULL)` resets the desktop cursor
+  clip, which absolute pointer input is clamped to
+  (`build/wineserver/queue_ios.c` `update_desktop_cursor_pos`) and which the
+  server seeds at a fixed size before any monitor exists; the weak
+  `winios_display_mode_changed()` tells the app; then WM_DISPLAYCHANGE.
+  `ios_publish_screen_size_once()` (`:4055`) runs the same path once for the
+  session default, driven from the first `SM_CXSCREEN` query made after the
+  desktop window handle is cached (`:7439`) — that is the one hot, lock-free
+  place that is by definition about this value, and without it a monitor
+  wider than the server's seed would have its pointer input clipped.
+  `ChangeDisplaySettings(NULL, 0)` and CDS_RESET restore the session default,
+  this port's equivalent of the registry mode.
+
+  **App.** `IOSDisplayShim.m:84` `winios_screen_size()` is the accessor,
+  `:96` `winios_display_mode_changed()` the sink win32u calls; it caches the
+  size (seeded from the environment so a read before the first publish still
+  answers) and posts `MadeiraDisplayModeChangedNotification` on the main
+  queue. `MetalBackedView.guestSize()` (`ContentView.swift:454`) reads that
+  accessor instead of `MADEIRA_SCREEN_W/H`, so `GameSurfaceLayout` — which
+  sizes the presented layer's host view AND maps touches — follows the
+  current mode; `GuestDisplay.observer` (`:187`) re-lays-out on the
+  notification.
+
+  **On a 2556x1179-point landscape view** the default is **1280x720**
+  (16:9 is the nearest standard aspect to 2.168; 1280x720 is the cheapest
+  16:9 mode in the MP window). Fit gives it the full height and a 2096x1179-pt
+  rect — 230 pt of pillarbox each side, the 19.5:9-vs-16:9 sliver — where
+  1024x768 gave 1572x1179 with 492 pt each side: 82 % of the width instead of
+  61 %, and the picture is no longer 4:3-shaped. Fill crops that sliver to
+  cover the view (2556x1438, 130 pt off top and bottom); Stretch distorts by
+  2.168/1.778 = 1.22x. `EnumDisplaySettings` offers 14 modes there (everything
+  up to 1.84 MP), so a game's resolution list works the way it does on
+  Windows.
+
+  **Test.** `build/x86-tests/dispmode-x86.c` (+ `build-dispmode-test.sh`,
+  i386, kernel32/user32 only): enumerates modes (≥ 6, index 0 == current, all
+  32 bpp / 60 Hz, 800x600 present), switches to 800x600 with CDS_FULLSCREEN,
+  asserts `SM_C{X,Y}SCREEN`, `GetMonitorInfo`'s `rcMonitor` and
+  ENUM_CURRENT_SETTINGS all report 800x600 and that WM_DISPLAYCHANGE arrived
+  on a window it created carrying that size, then restores with
+  `ChangeDisplaySettings(NULL, 0)` and asserts the original size is back.
+  Exit 51 = pass; the header lists what 52–63 each mean. Launch row
+  "Display modes" in `launchTargets` (`ContentView.swift:2560`).
+
+  **Log to read:** `[display] virtual monitor 1280x720 (source=view)` once at
+  start; `[iOS ChangeDisplaySettings] virtual display WxH: req=… -> 0 (mode
+  programmed)` per switch; `[display] guest surface is now WxH` from the app;
+  `[display] mode=Fit guest=WxH view=WxH -> rect=…` re-logged with the new
+  guest size. `(mode is not in the virtual mode list)` means the game asked
+  for something the table does not offer — add it to *both* lists, they are
+  kept in step deliberately.
+
+  **Reported, not changed:** DXMT's headless monitor
+  (`research/dxmt/src/util/wsi_monitor_headless.cpp:105` `getDisplayMode`)
+  still synthesizes the OLD three-entry list — 640x480, 800x600 and the
+  current screen size — so the mode list a game sees through
+  D3D9 `EnumAdapterModes`/DXGI is shorter than the one user32 now offers. It
+  is not a correctness break: `getScreenSize()` there calls
+  `GetSystemMetrics(SM_CXSCREEN)` live in the emulated build (`:49`), so
+  DXGI's current mode and `getDesktopCoordinates` follow the switch and the
+  two APIs never contradict each other about what is running. Bringing the
+  two tables into line needs the i386 DXMT modules rebuilt, which is its own
+  stage. The native D3D9 frontend caches no monitor size at device creation:
+  `wsi_window_madeira.cpp:100` `getWindowSize` answers from the per-HWND
+  client-size cache the shim refills at CreateDevice/Reset/Present
+  (`d3d9_native_glue.cpp:1179`), so a fullscreen window that grew with the
+  monitor is reported at its new client size with no hook needed.
 
 ## 7. D3D9 path (M4)
 
@@ -3213,3 +3322,843 @@ window teardown), `src/winemetal/unix/winemetal_unix.c` (`_Foo32` pattern
   on-screen aim/mouse joystick button, `JoystickPadState.aim`, the
   landscape "Aim" mapping (gamepad right stick still uses AimStickDriver).
   New: `Documents/madeira-env.txt` generic env passthrough.
+- 2026-09-14 — Logs 46-54 (ml962 build, both features default off). The
+  32-bit UE3 game RUNS AGAIN at "good framerate" (user). Triage:
+  `sync-x86` with fastsync ON → exit 56: "timed wait returned after 0 ms,
+  wanted 300 ms" (fast timed waits return instantly); the game with
+  fastsync ON sits on its loading screen with `create_event`+`close_handle`
+  ~8k/s and a critical section held > 60 s (a timed-wait loop gone busy);
+  `readvm-x86` → 67 (`WriteProcessMemory` to PAGE_EXECUTE_READ refused
+  server-side); `fs-x86` passed phases 1-6 (log rotated before the exit).
+  Gameplay profile (10 min): `swtch_pri<-NtYieldExecution` 15.2 % +
+  `__ulock_wait2<-NtDelayExecution` 8.6 % + `swtch_pri<-NtDelayExecution`
+  3.7 % = ~28 % of all CPU in the Sleep(0) ladder (2.2 M Sleep(0)/10 s,
+  435 k yields, 260 k parks); jit 31.6 % (63 % of JIT samples in TSO
+  blocks, tso/mem 0.39); per-frame `dup_handle/get_object_info/
+  close_handle/get_thread_context` ≈ 177/s and `set_thread_context` 295/s
+  with no obvious owner; `[d3d9-census] per_frame=30,526` (was 117,841).
+  Relative mouse: camera stops turning "after a bit" while the pause-menu
+  cursor still moves (delta path vs cursor path). 64-bit title: same crash
+  as log 43 — a push at sp≈0x10 right after `signal_set_full_context`,
+  with `set_thread_context` traffic (context restore with a null SP).
+  VN A: whole app died — a new 32-bit thread got a TEB OUTSIDE the 4 GB
+  window (x18=0x70ffec0000; creator TEB also outside) → wild TEB32 reads
+  → `[redeliv] terminating process`. VN B: boot-menu AV in 32-bit ntdll
+  reading NULL+0x63; launcher "not installed" (exit 1); game exe exits 0
+  in ~1 s with no window. VN C: error dialog, exit 0. Assigned: fastsync
+  timed-wait + WriteProcessMemory RX; VN boots + `Documents/fonts` install;
+  relative-mouse delta path + `[relmouse]` diagnostics; display-mode
+  control (fit/fill/stretch); Sleep(0) ladder redesign + `[srv-stats]`
+  caller attribution + TSO A/B recipe. 64-bit context-restore crash queued.
+
+- 2026-09-14 — Relative-mouse camera death: ROOT CAUSE FOUND IN THE SERVER'S
+  RAW-INPUT ROUTING, plus `[relmouse]` diagnostics at all three stages
+  (ml667; `build/wineserver/queue_ios.c`, `build/win32u-unix/driver_ios.c`,
+  `app/Madeira/Winios/Winios.m`, `app/Madeira/ContentView.swift`).
+  Log 46 clears the app side completely: relative `drv_post_mouse`
+  (`flags=0x1`) is still arriving at t+320 s (#2059, `drain move` n=2049),
+  the ring never drops a move, and the relative-mode tap-click at t+301 s
+  hit-tests to the game window at cursor (367,283) — so the finger, the ring,
+  the driver, the desktop cursor and `gameTouch` are all alive when the
+  camera is dead. Motion therefore reaches the server and dies between
+  `queue_mouse_message` and the game's `WM_INPUT`.
+  Mechanism: pointer motion has two consumers with different routing.
+  `WM_MOUSEMOVE` is routed by HIT TEST (`find_hardware_message_window` →
+  `shallow_window_from_point`), so the menu cursor keeps working as long as
+  the game's window is under the pointer. `WM_INPUT` is routed by FOREGROUND:
+  `queue_mouse_message` calls `dispatch_rawinput_message` only when
+  `get_foreground_thread()` returns a thread, and that function resolves
+  `foreground_input->focus`, else `->active`, else the window the DRIVER
+  passed. Our driver deliberately passes `hwnd = NULL` (driver_ios.c:88, so
+  the legacy path hit-tests), so the "assume the receiving window is"
+  fallback the upstream comment promises has nothing to fall back to — and
+  three ordinary events leave `focus`/`active` empty for good:
+  `DECL_HANDLER(set_foreground_window)` stores `foreground_input = NULL`
+  whenever the window made foreground IS the desktop window;
+  `thread_input_destroy()` clears it when the foreground thread exits and
+  nothing restores it; `thread_input_cleanup_window()` zeroes `focus` and
+  `active` when their window is destroyed. From that moment every game
+  reading the camera from raw input or DirectInput stops turning, silently
+  and permanently, while the cursor keeps moving. Second, independent way in:
+  `DECL_HANDLER(update_rawinput_devices)` drops the process out of
+  `rawinput_processes` on an empty registration (RIDEV_REMOVE) and re-adds it
+  ONLY by walking the input desktop's thread list — dinput takes that branch
+  on every Unacquire/Acquire pair (`input_thread_update_device_list`, a pause
+  menu), from its own hidden `di_em_win` thread, so a process whose thread is
+  not on that list never comes back.
+  Fixes (both generic, both strictly widen a path that currently delivers
+  nothing): `get_foreground_thread()` now falls back to the caller's window
+  and then to `desktop->cursor_win`, the same ground truth the legacy path
+  uses — `focus`/`active` still win when they resolve; and
+  `update_rawinput_devices` re-arms the registering process itself when the
+  desktop walk did not cover it, guarded on list membership so it only fires
+  in the broken case.
+  Diagnostics — one `[relmouse] ml667` line per stage, every 5 s, only while
+  RELATIVE moves are arriving (i.e. only in Relative pointer mode):
+  `src=touch` (ContentView) posts/acc/trunc plus claims/refused and the
+  `gameTouch` owner's phase and view, which is what would expose a recycled
+  UITouch stranding the one-finger claim; `src=drv` (driver_ios) relative
+  posts, failures, accumulated delta, `NtUserGetCursorInfo` position and the
+  foreground window/thread as win32u sees it; and the server line: `rel_in`
+  / `move_q` / `raw_disp` / `raw_q` with the four drop reasons
+  (`nofg` no foreground thread, `nodev` no registered mouse device left,
+  `notfg` not the foreground process without RIDEV_INPUTSINK, `nowin` no
+  target window), the cursor position and clip rect, `cursor_win`,
+  `foreground_input`/`focus`/`active`, the size of `rawinput_processes`, and
+  whether the cursor window's process is still listed with which device
+  flags and `hwndTarget`. Next log: find the line where `rel_in` keeps
+  climbing and `raw_q` stops — the drop counter that moves with it names the
+  gate, and `listed=0` / `devs=0` would mean the dinput re-registration path
+  is the one still failing. `[input] ring` now also carries `rel=`.
+  Built: `libwin32u_unix.a` and `libwineserver.a` rebuilt clean; app relinked.
+
+- 2026-09-14 — Three 32-bit engines, four generic bugs (logs m2/m51/m52/m53/m54).
+  **1. A recycled TEB from another pseudo-process killed the app on thread
+  start.** `[teb-tsd] thread tid=0098 raw=0x70ffec0000` — a thread of the
+  32-bit pseudo-process whose window is `B=0x7100000000` started on a TEB
+  OUTSIDE that window, so `init_teb` derived its TEB32/FS base by truncating
+  the host address and every TEB access from x86 code read guest
+  `0xffecxxxx`: `BUS ... addr=0x71ffec2018` (= B + truncate(TEB) + teb_offset
+  + `NtTib.Self`), 2,000 redeliveries, `[redeliv] terminating process`, whole
+  app gone. `0x70ffec0000` was tid `0084`'s TEB (m53:2497, a 64-bit thread of
+  a different pseudo-process, out of the SESSION block). m54 shows the same
+  thing independently: tid `00b0` got tid `0094`'s `0x70ffea0000`, and in both
+  runs the NEXT thread created got the correct in-window block. Root cause:
+  `virtual_free_teb` (`build/ntdll-unix/virtual_ios.c`) chose the free list
+  with `ios_wow_slot_current()` — **the window of whoever ran the free**.
+  `exit_thread` (`thread_ios.c`, the `prev_teb` handoff) does not free its own
+  TEB; it frees the PREVIOUS exiting thread's, and those two threads belong to
+  different pseudo-processes routinely. A session-block TEB freed by a 32-bit
+  thread therefore landed on that window's free list and the next thread of
+  that process popped it. Fix: key the list on the ADDRESS of the block
+  (`ios_wow_live_slot_for_addr`), which is exact in both directions and makes
+  the old one-directional guard a sub-case. Plus a named, local failure
+  instead of a task-wide death: `virtual_alloc_teb` now refuses a wow thread
+  whose block is outside its window with `[teb-window] REFUSING thread` and
+  `STATUS_NO_MEMORY` (the `done:` path in `RtlCreateUserThread` already closes
+  the handle and the request pipe, so the guest just gets a failed
+  `CreateThread`). Cross-process creation needs no change: `NtCreateThreadEx`
+  for a foreign process goes through `APC_CREATE_THREAD`
+  (`thread_ios.c:1621`), so `virtual_alloc_teb`/`init_thread_stack` always run
+  ON a thread of the target process and already resolve the target's window.
+  **2. AFD/winsock pointers crossed the boundary untranslated.** m52: a 32-bit
+  program's startup socket call faulted in native code —
+  `[mach_exc] UNHANDLED pc=...sock_ioctl_send+0xe8 addr=0xe8fa9c`, backtrace
+  `sock_ioctl` -> `NtDeviceIoControlFile` -> `__wine_syscall_dispatcher` —
+  reading the WSABUF array at the bare guest address `0xe8fa9c` instead of
+  `B+0xe8fa9c`; the program then put up a modal error dialog
+  (`[winios-tree] 0xc00b0 ... style=94c801c4` = icon + one-line static + OK)
+  and exited 0. `wow64_NtDeviceIoControlFile` translates `in_buf`/`out_buf`
+  but nothing translates the pointers INSIDE an AFD request, because on
+  classic WoW64 they need no translation. Fixed in
+  `wine/dlls/ntdll/unix/socket.c`: `afd_guest_ptr()` adds `ios_wow_base()`
+  (NULL stays NULL) at every guest->host site — SENDMSG/RECVMSG
+  `buffers_ptr`/`addr_ptr`/`addr_len_ptr`/`control_ptr`/`ws_flags_ptr`,
+  `IOCTL_AFD_RECV`'s `params32->buffers`, both per-WSABUF loops,
+  `wow64_translate_control`, and TransmitFile's `head_ptr`/`tail_ptr`. The
+  struct-layout switches also moved from `in_wow64_call()` to
+  `ios_wow_base() != 0`, for the same reason stage C review F3 changed
+  `virtual_alloc_teb`: `is_wow64()` is SESSION-wide in this fork, so a 64-bit
+  pseudo-process sharing a session with a 32-bit one reads `afd_wsabuf_32`
+  off a 64-bit WSABUF array.
+  **3. A 32-bit process cannot spawn a 32-bit process — ONE window slot.**
+  Not a registry or file problem: m51:5203-5215 shows the launcher's
+  `CreateProcess` returning `c00000e5` because
+  `[wow-window] B=0x7100000000 REJECTED: a 32-bit pseudo-process is running in
+  this window right now` and `B=0x7200000000 REJECTED: the 4GB range is not
+  free`. The launcher's "not installed" dialog is the CONSEQUENCE, and its
+  `[srv-stats]` shows it did essentially no registry work at all. The band
+  `[0x7038000000, 0x7400000000)` holds exactly three 4 GB-aligned slots and
+  the `[cage] holdback` (`IOS_CAGE_BASE 0x7200000000 + 8GB-64KB`,
+  `virtual_ios.c:1412`) covers both of the other two, unconditionally, at
+  `virtual_init` time, for a V8/cppgc reservation that only a CEF session ever
+  asks for. NOT changed here — it trades directly against a documented CEF
+  invariant and belongs to that owner. Minimal recommended change: when
+  `ios_wow_window_pick()` finds no slot and `ios_cage_holdback_live` is still
+  1 (nobody has taken the 8 GB), carve `[0x7200000000, 0x7300000000)` out of
+  the holdback as a second window — its FB3 guard is then borrowed from the
+  remaining holdback exactly as slot 0 borrows from it today — and log the
+  trade. A CEF session and concurrent 32-bit pseudo-processes cannot both fit
+  in 64 GB; whichever actually asks should win over the one that never does.
+  **4. Missing farm modules.** `wbemprox.dll` is in NEITHER farm, so
+  `system32\wbem` is empty, `CoCreateInstance(CLSID_WbemLocator
+  {4590f811-1d3a-11d0-891f-00aa004b2e24})` fails, and BOTH 32-bit programs in
+  m2/m51 die or give up within a few hundred instructions of that line — they
+  reach it through `dxdiagn.dll` asking WMI about the display adapter
+  (m2:4827-4829 for the boot stub, whose fault is then at
+  `USER32+0x52390 = cmpb $0,(%esi,%edi)` in `WPRINTF_GetLen`, scanning a
+  garbage `%s` argument of `0x63` — NOT ntdll, as the load addresses show
+  ntdll at guest `0x7BF40000` and USER32 at `0x7BC00000`; m51:4393-4395 /
+  m2:5632-5634 for the game exe, which exits 0 without ever calling
+  `CreateWindow` or entering a message loop — its `[srv-stats]` shows no
+  `get_message`, no `set_queue_mask`, no `open_key`). Added
+  `wbemprox wmiutils wbemdisp` (+ `wmic`/`mofcomp`) to
+  `.xtool/build-wine-i386.sh`, along with the DirectShow/VfW set a 32-bit
+  multimedia program needs and neither farm has (`quartz devenum qcap qedit
+  amstream mciqtz32 msdmo`, the `iccvid msvidc32 msrle32` VfW codecs and the
+  `*.acm` audio codecs) and `riched20 riched32 msftedit usp10 mlang`. The
+  farms are FLAT but WMI's registered `InprocServer32` paths are
+  `C:\windows\system32\wbem\<name>`, so `WineProcessBridge.m` now also links
+  wine.inf's five wbem modules into `system32\wbem` and into each farm's
+  `wbem` (`[WineProc] system32\wbem: N/5 links`). The aarch64/arm64ec farms
+  need the same three modules — that build script is not in scope here.
+  Still open and unexplained on that path: every 32-bit run logs
+  `fixme:actctx:parse_depend_manifests Could not find dependent assembly
+  "Microsoft.Windows.Common-Controls" (6.0.0.0)` and
+  `err:commdlg:DllMain failed to create activation context ... 14001`, because
+  the prefix has no `C:\windows\winsxs\manifests` at all — Wine would install
+  `dlls/comctl32_v6/comctl32.manifest` there. Non-fatal in Wine, but it means
+  no program in this prefix can ever get a v6 common-controls activation
+  context.
+  **Fonts.** The backend is ALIVE, contrary to first appearances: freetype is
+  statically linked and merged into `libwin32u_unix.a`
+  (`build/win32u-unix/build.sh`, `freetype_ios.c`), `font_init()` ->
+  `load_file_system_fonts()` scans `\??\C:\windows\fonts` FIRST, and the
+  prefix template ships 14 TTFs there plus the `HKLM\...\CurrentVersion\Fonts`
+  values. The single `[file-fail] #20 ... Madeira.app/fonts` in every log is
+  the SECOND scan, Wine's DATA-dir fonts (`get_fonts_data_dir_path`), which
+  the bundle does not ship; `[file-fail]` only logs failures, so the
+  successful `C:\windows\fonts` scan leaves no line and the absence of the
+  string "Fonts" in the logs proves nothing either way. `load_mac_fonts` is
+  deliberately stubbed (`CTFontCollectionCreateFromAvailableFonts` -> NULL).
+  New: any `.ttf/.otf/.ttc/.fon` the user drops into `Documents/fonts/` is
+  installed into the prefix's `drive_c/windows/Fonts` at session start
+  (`madeira_install_user_fonts`, called from `madeira_seed_prefix_if_needed`
+  so it lands before the wineserver starts), logging
+  `[fonts] installed <name>` per file and
+  `[fonts] installed N from Documents/fonts`. No registry write is needed for
+  that directory: Wine's own `load_directory_fonts` plus the
+  `HKCU\Software\Wine\Fonts\Cache` key ARE the install, and
+  `HKLM\...\CurrentVersion\Fonts` only carries fonts living OUTSIDE
+  `C:\windows\fonts` (written by `update_external_font_keys()` from the face's
+  real name, which the app side cannot know without parsing the TTF name
+  table).
+  **`[redeliv] terminating process` — not this file's to change.**
+  `build/ntdll-unix/signal_arm64_ios.c:6950-6952` does
+  `task_terminate(mach_task_self()); _exit(76); for(;;) pause();` — it kills
+  the whole Mach task, i.e. every pseudo-process, for one wedged thread.
+  Minimal change recommended: dump the forensics exactly as today, then take
+  the pseudo-process path instead of the task path — `abort_process()`
+  (`thread_ios.c`, which exists precisely because `_exit()` kills the app) for
+  the faulting thread's own pseudo-process, keeping `task_terminate` only as
+  the fallback when the faulting thread is the session's own boot thread or
+  has no resolvable PEB. `process_ios.c:944` already records that
+  per-pseudo-process termination is an open bug, so that owner should land it.
+  Built: `libntdll_unix.a` rebuilt clean (30/30); `WineProcessBridge.m` passes
+  `-fsyntax-only` against the iPhoneOS SDK. Next log: `[teb-window]` must
+  never appear and every `[teb-tsd] thread` inside a 32-bit pseudo-process
+  must read `0x71xxxxxxxx`; `[WineProc] system32\wbem: 5/5`;
+  `[fonts] installed N`; no `sock_ioctl_send` fault and no
+  `com_get_class_object ... {4590f811-...}`; and a second `[wow-window]` slot
+  line if the cage trade is taken.
+- 2026-09-14 — fastsync ml972 + server-side WriteProcessMemory
+  (`ntdll/unix/sync.c`, `build/ntdll-unix/server_ios.c`,
+  `build/wineserver/mach_ios.c`, `x86-tests/sync-x86.c`,
+  `x86-tests/readvm-x86.c`). Four defects, all found from the ml962 device
+  run (`MADEIRA_FASTSYNC=1`): `sync-x86.exe` exit 56 with "timed wait
+  returned after 0 ms", the 32-bit title stuck on its loading screen with
+  `create_event=79625 close_handle=79333` per 10 s and `[hot-lock]
+  waiters=3` held > 60 s, and `readvm-x86.exe` exit 67
+  `err=5 put=0`.
+  (1) TIMED WAIT RETURNED IMMEDIATELY — `madeira_fast_wait`'s fall-through
+  re-read the clock and subtracted the WHOLE measured interval from the
+  caller's relative timeout, so the remainder was a MEASUREMENT where the
+  design intends an INVARIANT: the fast path may consume at most
+  `budget_ns = min(cap, the caller's timeout)`, never more. Any overshoot
+  came straight off the caller (`left <= 0` → `store->QuadPart = 0` →
+  `server_wait` with a ZERO timeout, which is Wine's POLL: `STATUS_TIMEOUT`
+  with no wait at all). And there WAS a systematic overshoot: the budget was
+  measured on `clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)`, which keeps
+  incrementing while the system is asleep, while `madeira_fast_park` parks on
+  `OS_CLOCK_MACH_ABSOLUTE_TIME` / `__ulock_wait`, which do not — two clocks
+  for one interval, differing by exactly the sleep. Fixed both ends:
+  `madeira_now_ns()` is now `CLOCK_UPTIME_RAW` (== `mach_absolute_time`, the
+  clock the park counts, with a `mach_absolute_time`+timebase fallback because
+  `clock_gettime_nsec_np` reports failure as 0), and the elapsed time is
+  CLAMPED to `budget_ns` before it is subtracted, so `left > 0` whenever the
+  caller's timeout exceeded the cap and `left == 0` only when the cap WAS the
+  whole timeout. The park loop also got a 64-round bound so no clock
+  behaviour can turn it into a spin. `os_sync_wait_on_address_with_timeout`'s
+  `timeout_ns` is nanoseconds (SDK header checked) and the `__ulock_wait`
+  fallback's µs conversion was already right — units were not the bug.
+  (2) `madeira_fast_close()` WAS NEVER CALLED — `dlls/ntdll/unix/server.c`
+  has carried the call since ml952, but `build/ntdll-unix/build.sh`
+  substitutes `server_ios.c` for `server.c`, so the compiled `NtClose` (and
+  the `DUPLICATE_CLOSE_SOURCE` path, and the APC-result path) dropped
+  nothing from the handle→cell cache. `evict=0` in `[srv-stats] fastsync
+  cache:` was a dead call site, not a quiet cache. This is a correctness
+  bug, not a miss: a positive entry is validated against the CELL's
+  generation, and a cell lives as long as the EVENT, not as long as the
+  handle — so close one handle to an event something else still holds, let
+  the handle VALUE be reissued, and `(handle, pid, gen)` all still match: a
+  `NtSetEvent` on the new handle signals the OLD event and a wait on it is
+  satisfied by the OLD event's token. Now called at all three sites.
+  (3) A PARKED WAITER DID NOT RE-TEST `gen` — the park is the one unbounded
+  pause in `madeira_fast_wait`, and across it the event can be destroyed and
+  the cell handed to a new one (`madeira_cell_free` stores DISABLED and wakes,
+  but `create_event` can re-alloc and store RESET/SET before the woken thread
+  runs, and the word is then indistinguishable). The woken thread would
+  CONSUME the new occupant's auto-reset token — a SetEvent delivered to a
+  thread that never waited, and the real waiter never woken; with a loader
+  churning events at 8 k/s that is a permanently lost handshake, which is what
+  `[hot-lock] waiters=3` for > 60 s looks like. `madeira_fast_lookup` now
+  returns the generation and the loop re-checks it after every park
+  (`madeira_cell_alive`), as does `madeira_fast_event_op` before each CAS.
+  (4) THE `waiters` COUNT COULD GO NEGATIVE — `madeira_cell_alloc` zeroes
+  `waiters` for a recycled cell, so a stale parked thread's decrement took the
+  NEW occupant to −1; the next genuine waiter's `waiters++` brought it back to
+  0 and a setter's `if (waiters) wake` then did nothing, so that cell's every
+  future handoff paid the full cap. The decrement is now skipped when the
+  generation moved (over-counting only ever costs a spurious wake).
+  Observability: `fastsync cache:` prints `value(running total)` for all five
+  counters — a warm cache legitimately learns nothing for minutes, so a
+  window delta of 0 could not distinguish "quiet" from "not wired", and a
+  total still 0 after minutes now says unambiguously "go look at the call
+  site".
+  (5) WriteProcessMemory ALWAYS FAILED — `NtWriteVirtualMemory` has no
+  current-process shortcut, so every write becomes a `write_process_memory`
+  request, and that needs `get_process_port()` = `process->trace_data`, which
+  is always 0 here (no per-guest Mach task). Every WriteProcessMemory on this
+  port returned `STATUS_ACCESS_DENIED`, not just the PAGE_EXECUTE_READ one
+  the test noticed. `get_process_port()` is NOT changed (its comment records
+  that returning `mach_task_self()` also activates `read_process_memory` and
+  regressed a guest into a SEGV + loader-lock deadlock). Instead
+  `write_process_memory` gets an iOS same-task path, taken only when the
+  target is the CALLER's own process (a 32-bit address was translated through
+  the calling process's 4 GB window, so cross-process keeps today's
+  behaviour exactly — this change can only turn a failure into a success):
+  per Mach region, (a) already writable → store; (b) a live dual-map RW alias
+  covers it (`ios_jit_anon_alias_lookup`, weak) → store through the alias,
+  changing no protection, so an executable view never loses EXECUTE — the
+  same mechanism `signal_arm64_ios.c`'s store emulator uses; (c)
+  `vm_protect(current|WRITE)`, then `READ|WRITE`, then `READ|WRITE|COPY` —
+  the same ladder and the same ordering rationale as `mprotect_exec`'s RW
+  path (plain first so a MAP_SHARED section view is not privatised, COPY only
+  for a mapping whose maxprot has no WRITE) — then restore, with a failure to
+  restore EXECUTE logged as `[srv-wpm]` rather than swallowed; (d) otherwise
+  `KERN_PROTECTION_FAILURE`. A `VM_PROT_NONE` region is refused outright.
+  `PAGE_READONLY` is untouched: Wine refuses it one level up in
+  `WriteProcessMemory`'s `default:` arm and never sends the request.
+  Tests: `sync-x86.exe` (exit 46) test 4 now has THREE timed cases and keeps
+  exit 56 — (a) 300 ms, longer than the cap, must be neither early nor
+  absurdly late; (b) 1 ms, SHORTER than the cap, the one case where a zero
+  remainder is right; (c) twenty 10 ms waits must add up to ≥ 100 ms, which is
+  the direct regression test for "a timed wait that returns instantly", the
+  shape that turns a loader's retry delay into a busy loop. Test 8 (late set)
+  is unchanged and must still pass. `readvm-x86.exe` (exit 48) gains check 4c,
+  a plain PAGE_READWRITE WriteProcessMemory under exit 67 — the case that was
+  equally broken and had no coverage, so a fix that only understood
+  executable pages could not pass. Both must be run BOTH ways: default
+  (server path) and `MADEIRA_FASTSYNC=1`. Banner is now
+  `[fastsync] ON rev=ml972`.
+
+- 2026-09-14 — Log 46 (10 min, 40-60 fps): **the spin was never mostly
+  `Sleep(0)`, and the per-frame context traffic was ours**. Three findings, two
+  fixed, one measured.
+  (1) `[srv-stats]` per 10 s: `sleep0` 1.27-2.01 M, `park` 108-196 k — and
+  **`yield_sc` 8.2-14.3 M**, i.e. **1.15 M `sched_yield`/s**, seven times the
+  `Sleep(0)` rate. `[prof]` puts it in one place:
+  `swtch_pri<-NtYieldExecution+0x28` **13.9-15.2 % of ALL CPU**, `kern by
+  thread` **100 % tid=00c0** (the render thread). That entry cannot be the
+  ml950-ml960 ladder: `ios_delay_zero` is inlined into `NtDelayExecution`, so
+  the ladder's own yield and park show as `NtDelayExecution+0x410` (2.8-3.7 %)
+  and `__ulock_wait2<-NtDelayExecution+0x3f4` (6.6-8.6 %). `NtYieldExecution`'s
+  exported entry has only three callers — win32u's `ios_pump_yield` (capped at
+  5 k/s), `server_wait`'s poll streak (the whole process makes 3.7 k
+  requests/s), and the guest's own `SwitchToThread` through wow64 — and the
+  ladder can account for at most ~60 k of 11.5 M. So ~99.5 % of it is ONE
+  32-bit guest thread spinning on `SwitchToThread`, with no throttle at all.
+  Three rounds of Sleep(0) tuning had been aimed at the smaller spin.
+  FIX (ml970, `sync.c`, `NtDelayExecution`/`NtYieldExecution` region only): ONE
+  governor for both entry points, indexed by **elapsed spin time** instead of
+  call count, and bounding the **kernel-entry rate** instead of the call rate.
+  Between kernel entries: an `isb sy` pause that doubles every 8 calls (8→256,
+  ~100 ns→~3 µs) — a userspace poll adds no handoff latency and costs no
+  syscall. Kernel entries at most one per gap, gap by elapsed spin:
+  `<50 µs`→20 µs, `<500 µs`→100 µs, `<5 ms`→300 µs, `≥5 ms`→500 µs; parks
+  15/15/30/60 µs, hard cap 1 ms. The FIRST kernel entry of a streak is a real
+  `sched_yield()`, so an isolated `Sleep(0)`/`SwitchToThread` — pacing, not
+  spinning — is byte-for-byte unchanged, and a once-per-frame caller always
+  starts a fresh streak (2 ms window). Parks stay SHORT on purpose and do not
+  grow to fill the gap: the park hands the core over, it does not sleep through
+  the handoff, so the chance a peer's progress lands inside a park is
+  60/500 = 12 % and added handoff latency is 0 at the p50, ≤60 µs at the p88 —
+  against ml960's 200 µs park. Anti-livelock is now STRONGER than the old
+  ladder's "every 8th call": no governed thread spins more than 500 µs of wall
+  time without descheduling, at any rung and any loop rate. Per-thread EWMA of
+  finished-streak duration lets a thread whose spins historically run long skip
+  the cheap rung (never past rung 2). Per-call-site keying was rejected with a
+  reason: the wow64 CPU area's `Eip` is only valid after FEX flushes JIT state
+  into it (itself a server round trip), and the unix-side return address is the
+  syscall dispatcher for every 32-bit caller alike — so the estimator is
+  per-thread, and the full distribution goes to the log instead.
+  NEW LINES: `[sleep0] streaks= calls: sleep0= yield= | syscalls: yield= park=
+  (N/s) | per-call=X.XXX% | to-progress p50= p80= warm= rev=ml970` plus
+  `[sleep0]   hist calls:` and `[sleep0]   hist us:` (log2 buckets, a streak
+  ends exactly when the thread makes progress, so the µs histogram IS the
+  time-to-progress distribution the ladder is calibrated against).
+  Arithmetic for the target: 2 permanently spinning threads × 1/500 µs = 4 k
+  syscalls/s (target ≤5 k), from ~1.17 M/s today — a ~290× reduction.
+  (2) `dup_handle=1770 get_object_info=1770 close_handle=1772
+  get_thread_context=1770` and `set_thread_context=2950` per 10 s — 3 to 5 per
+  frame, in a process where nothing should touch a thread context per frame.
+  **Owner found by arithmetic, no instrumentation needed**: FEX's
+  `BTCpuGetContext`/`BTCpuSetContext` (`FEX/Source/Windows/WOW64/Module.cpp`)
+  each open with `FEX::Windows::ValidateHandleAccess` (→ `NtQueryObject` →
+  `get_object_info`) + `DupHandle` (→ `dup_handle`) + `GetThreadTLS` (→
+  `get_thread_info`) and close with `NtClose` (→ `close_handle`); Get then does
+  `FlushThreadStateContext` (→ `set_thread_context`) + `RtlWow64GetThreadContext`
+  (→ `get_thread_context`), Set does Flush + Set + Get. With G calls of
+  BTCpuGetContext and S of BTCpuSetContext that is exactly G+S objinfo, G+S dup,
+  G+S close, G+S get_ctx and **G+2S set_ctx** — and G=590, S=1180 reproduces all
+  five measured numbers exactly. Every internal caller in
+  `wine/dlls/wow64/syscall.c` (32-bit exception dispatch, `NtContinue`,
+  `NtSetContextThread`, APC/callback) passes `GetCurrentThread()`, the
+  PSEUDO-handle. So the triple was validating, duplicating and closing a handle
+  to the calling thread itself — and the duplicate is what made the rest
+  expensive, because Wine's `get_thread_wow64_context`/`set_thread_wow64_context`
+  (`dlls/ntdll/unix/signal_arm64.c`) both start with
+  `BOOL self = (handle == GetCurrentThread())` and read/write the caller's own
+  CPU area with NO server call when that holds; a duplicated handle to the same
+  thread does not compare equal, so every context transfer took the cross-thread
+  path for nothing.
+  FIX (ml970, FEX WOW64 module): `GetThreadTLS()` answers the pseudo-handle from
+  `CurrentTEB()`, and `BTCpuGetContext`/`BTCpuSetContext` skip the access check
+  (a thread always has full access to itself), the duplicate and the close when
+  the target is the current thread, passing the pseudo-handle straight down. A
+  real handle — what a guest-issued `GetThreadContext` on another thread arrives
+  as — still takes the original path, access check included. Expected: all five
+  kinds → ~0, and `get_thread_info` loses 1770 per 10 s: **~1180 requests/s of
+  the measured ~3700/s, ~32 %**, plus ~45 ms/s of in-call wall time off the
+  render thread's critical path.
+  ALSO (ml970, `server_ios.c`): `[srv-stats]   kinds-by-caller:` — one return
+  address per request, taken one guarded frame above `server_call_unlocked`
+  (`wine_server_call`/`server_select` are thin wrappers, so depth 0 is rarely
+  the interesting name) and resolved with `dladdr` at report time, top 2 callers
+  for each of the top 8 kinds plus `+N more`. The frame hop validates the link
+  (non-NULL, 16-byte aligned, strictly ascending, <64 KB) and falls back to
+  depth 0, so it can degrade but never fault. It deliberately does NOT try to
+  print a guest RIP — see (1) for why that value is not cheaply available on
+  this side.
+  (3) TSO: 63-64 % of jit samples are in blocks with TSO ops, tso/mem 0.34-0.39.
+  `prof-disasm` on the 14 hot-block dumps (1477 host words) counts
+  **72 `ldapr` + 12 `stlr`, 0 `ldar`, only 3 `dmb`, and 83 `nop`** — so TSO here
+  is acquire/release, not barriers, and the half-barrier back-patch slots are
+  **5.6 % of hot-block code**. The decisive pattern, one guest
+  `add [reg-516], reg` in the densest block: `sub w20,w9,#516; add
+  x24,x19,w20,uxtw; ldapr w20,[x24]; nop; add w20,w20,w7; sub w21,w9,#516; add
+  x24,x19,w21,uxtw; nop; stlr w20,[x24]` — **9 host instructions**, of which the
+  second address computation is a verbatim repeat of the first. Top 3 codegen
+  inefficiencies: (a) the same guest EA is materialised twice for a
+  load-modify-store, 2 of 9 instructions, ~17 % of that block — an addressing
+  CSE/peephole in `Addressing.cpp`/the RA, not small; (b) NO displacement can be
+  folded into a TSO op because `SupportsTSOImm9` is false on this host
+  (`IREmitter.h:94` `IsSIMM9 &= (SupportsTSOImm9 || !TSO)`) and LDAPR/STLR have
+  no offset form at all — with FEAT_LRCPC2 the pair becomes
+  `ldapur/stlur w20,[x24,#-516]` and 4 of the 9 instructions disappear; (c) the
+  `nop` slot itself, already gated by `HalfBarrierTSOEnabled` (ml920).
+  FEX defaults confirmed unchanged across hosts (`Config.json.in`:
+  `TSOEnabled=true`, `HalfBarrierTSOEnabled=true`, `VectorTSOEnabled=false`,
+  `MemcpySetTSOEnabled=false`); the WOW64 module forces none of them, and
+  hardware TSO is unconditionally unavailable here
+  (`FEXUnixLib.cpp TryEnableHardwareTSO` returns false under `FEX_IOS_HOST`), so
+  `IsAtomicTSOEnabled()` is always `Config.TSOEnabled`. `ParanoidTSO` no longer
+  exists upstream. Implemented (ml970, `CPUFeatures.cpp`, ~14 lines, default
+  OFF): `HOSTFEATURES=ENABLELRCPC2` in `Documents/madeira-fex.txt` sets
+  `SupportsTSOImm9`. It is opt-in and not detected because this PE branch cannot
+  reach `sysctl hw.optional.arm.FEAT_LRCPC2` (FEXUnixLib's table is not
+  registered on the iOS host) and FEAT_LRCPC2 is ARMv8.4 while the app's iOS 18
+  floor admits ARMv8.3 parts — on an A12/A13 an unconditional `true` would emit
+  an undefined instruction in every block. The unaligned back-patcher already
+  decodes and rewrites LDAPUR/STLUR (`ArchHelpers/Arm64.cpp:2202,2352,2412`), so
+  nothing downstream needs changing.
+  A/B RECIPE for `Documents/madeira-fex.txt`, one line per run, in this order —
+  `[fex-cfg]` and `FEX: TSO config` echo what actually took effect:
+  **A0** baseline (no TSO line). **A1** `HOSTFEATURES=ENABLELRCPC2` — A14/M1 or
+  newer ONLY; no ordering change whatsoever (`ldapur`/`stlur` are the same
+  acquire/release semantics with an offset), so the only risk is an undefined
+  instruction on pre-A14 silicon, which fails loudly and immediately. **A2**
+  `HALFBARRIERTSOENABLED=0` — removes the 4-byte back-patch slot from every
+  TSO GPR access (~5.6 % of hot-block bytes) and switches the unaligned handler
+  from `HalfBarrier` to `NonAtomic`; RISK: an unaligned access that faults is
+  rewritten to a bare `ldr`/`str` with NO barrier at all, and any ALIGNED access
+  later flowing through that same patched site loses its ordering too — a
+  cross-thread visibility bug that shows up as rare, non-reproducible state
+  corruption, never as a crash. **A3** `VECTORTSOENABLED=1` and/or
+  **A4** `MEMCPYSETTSOENABLED=1` — these make things SLOWER (they add `dmb ish`
+  to every vector access, and force `rep movs`/`rep stos` onto a per-element
+  loop, losing FEAT_MOPS and the 32-byte `ldp`/`stp` path, and clear the
+  guest-visible ERMS CPUID bit); run them only to test whether a suspected
+  ordering bug is a vector/string-op accuracy gap, which ml512 already tried
+  once with no change. **A5** `TSOENABLED=0` — the big one and the dangerous
+  one: FEX's own text is "highly likely to break any multithreaded application".
+  On this workload it would remove all 84 acquire/release ops and their address
+  arithmetic from the hot blocks; treat any fps number it produces as an upper
+  bound on what (a)+(b) could reach safely, NOT as a shippable setting.
+  For a narrower experiment, `EXTENDEDVOLATILEMETADATA` takes per-module,
+  per-instruction TSO overrides (WoW64/ARM64EC only) so one DLL can drop TSO
+  without touching the global knob.
+  Built: `libntdll_unix.a` 30/30 clean; `libwow64fex.dll` → `xtajit.dll` and
+  `libarm64ecfex.dll` → `xtajit64.dll` both relinked. NEXT LOG should show
+  `yield_sc` ≈ 20-50 k and `park` ≈ 20-40 k per 10 s (from 11.5 M / 160 k),
+  `swtch_pri<-NtYieldExecution` and `__ulock_wait2<-NtDelayExecution` together
+  under ~2 % of CPU (from ~24 %), `get_object_info`/`dup_handle`/`close_handle`/
+  `get_thread_context`/`set_thread_context` absent from `kinds:`, `get_thread_info`
+  ≈ 2000 per 10 s, total reqs ≈ 2.5 k/s, and the new `[sleep0] hist us:` line
+  deciding whether the 20/100/300/500 µs gaps are the right ones.
+
+- 2026-09-14 — **A SECOND guest-window slot, per-pseudo-process fault
+  termination, and the winsxs/WMI prefix gaps** (Opus; `virtual_ios.c`,
+  `signal_arm64_ios.c`'s `[redeliv]` terminal, `WineProcessBridge.m`, the farm
+  scripts, one `ContentView.swift` launch row, `build/x86-tests/spawn-x86.c`).
+
+  **1. A 32-bit process can now start a second 32-bit process — the [cage]
+  trade, taken on demand.** `ios_wow_carve_holdback_slots()`
+  (`build/ntdll-unix/virtual_ios.c:6587` comment, `:6648` code) runs from
+  `ios_wow_window_pick()` (`:6736`) ONLY after every ordinary candidate has been
+  refused and ONLY while `ios_cage_holdback_live == 1` (nobody has asked for the
+  8 GB V8/cppgc cage). It replaces `[0x7200000000, 0x7300000000)` with one
+  `MAP_FIXED` `PROT_NONE` mapping over VA the holdback already owns — no
+  `munmap`, so the kernel never gets an instant in which it could place a system
+  framework in the slot, the same reasoning as the session-start placeholders —
+  adds the Wine reserved area, and records an unadopted placeholder that
+  `ios_wow_window_try()` then adopts by the normal path. `[cage] CARVED
+  guest-window slot 1 B=0x7200000000…` and `[cage] holdback TRADED` name the
+  cost; `ios_cage_holdback_live` is cleared because the grant path in the jumbo
+  walk `munmap`s the WHOLE `IOS_CAGE_REAL_SIZE` range, which would now unmap a
+  live guest window.
+  **TWO is the hard maximum, and the arithmetic is worth writing down so nobody
+  re-derives it.** The furniture band is `[ios_usable_va_floor,
+  ios_furniture_ceiling)` = `[0x7038000000, 0x73ffff0000)` and holds exactly two
+  4 GB-ALIGNED slots that fit whole. `0x7300000000` is NOT a third: it needs
+  `[0x73ffff0000, 0x7400000000)`, which is the PA guard pool's home base (the
+  `guard_first` walk derives `slot - 64KB` from the ceiling, which is why the
+  ceiling stops exactly there), and its FB3 overrun guard page at
+  `0x7400000000` can neither be borrowed (that page is a FREE HOLE at the start
+  of the CEF pools, and `ios_wow_guard_neighbour_blocked()` correctly refuses a
+  hole) nor owned (`ios_wow_band_ok()` refuses a reservation crossing
+  `IOS_WOW_CEF_POOLS_START`). A third window needs the CEF pool boundary moved;
+  it is not a cage question.
+  **Slot 0's FB3 guard is not lost to the carve** even though it borrows the
+  holdback's first page — which is now slot 1's page 0. `IOS_WOW_GUEST_FLOOR`
+  (0x110000) keeps every placement inside a window above guest 0x110000, so that
+  page stays PROT_NONE for the life of the session and an overrun off the top of
+  slot 0 still faults. The guarantee now rests on the guest floor rather than on
+  a separate reservation; that floor is load-bearing, not cosmetic.
+  **N-slot audit — everything that assumed one B.** Already correct, verified by
+  reading: `ios_wow_base()` / `ios_wow_in_window()` / `ios_wow_guest_addr()` /
+  `ios_wow_translate_limits()` all resolve through `ios_wow_slot_current()`,
+  i.e. per CALLER (`:6040`); `ios_wow_live_slot_for_addr()` (`:6088`) keys TEB
+  pooling on the block ADDRESS; `ios_wow_slot_for_peb()`, `ios_jit_purge_window(
+  base, size)`, `d3d9_native_process_teardown(peb)`, `ios_wow_window_teardown(
+  base, …)`, `ios_wow_reclaim_dead_windows()` (already loops all
+  `IOS_WOW_MAX_WINDOWS`), `ios_wow_exclude_windows()`,
+  `ios_wow_candidate_slot()` and `win32u_zero_bits()`
+  (`build/win32u-unix/syscall_ios.c:112`, cached per (pid, peb)) are per-process
+  already; there is no hard-coded `0x7100000000` anywhere outside comments.
+  FIXED here: (a) `ios_wow_window_teardown()` no longer clears
+  `user_space_wow_limit` when another live window remains (`:9322`,
+  `[wow-limit] KEPT`) — it is a GUEST ceiling shared by every 32-bit
+  pseudo-process, and stripping it mid-run would unbound every later placement
+  in the survivor; (b) `ios_prof_wow_window()` (`:6174`) returned "the first
+  live window" on the then-true assumption that there is exactly one — it now
+  returns the most recently ADOPTED live window and says once, in the log, that
+  a guest RIP sample cannot name its own process (FEX's per-process
+  `guest_base` is still preferred whenever published).
+  Logging: `[wow-window] slot k B=… adopted by pid … — n of m slot(s) now carry
+  a live 32-bit pseudo-process` on bind (`:6966`), and
+  `[wow-window] slot k B=… released` on exit.
+  **REMAINING session-global, named rather than hidden:**
+  `user_space_wow_limit` is published by the FIRST 32-bit main image's
+  large-address-aware bit, so two concurrent 32-bit processes that DISAGREE
+  about LAA share the first one's ceiling. Harmless when they agree; a real
+  (small) divergence from Windows when they do not.
+
+  **2. `[redeliv]` now kills ONE pseudo-process, not the app.**
+  `build/ntdll-unix/signal_arm64_ios.c:7321` (the terminal; helpers at `:6672`
+  watchdog, `:6701` thunk, `:6716` redirect). The forensics dump is unchanged.
+  WHY A REDIRECT AND NOT A CALL: `abort_process()` → `process_exit_wrapper()` is
+  keyed ENTIRELY by the CALLING thread — `ios_proc_socket_index()` resolves the
+  pseudo-process through `ios_jit_current_peb()`, which reads the TEB out of
+  that thread's TSD slot (`virtual_ios.c:3660`), and the `exit()` shim longjmps
+  on the thread that owns the jmpbuf — while `[redeliv]` runs on the MACH
+  EXCEPTION SERVER thread, which belongs to no pseudo-process at all. Calling
+  `abort_process` there would have closed the SESSION's master socket and
+  released nobody's window. So the faulting thread, already suspended with its
+  register state in our hands, is pointed at a thunk (`x18` = its TEB, a private
+  512 KB `mmap`ed stack because a JIT-executing thread's SP is not a usable C
+  stack and its Windows stack is inside the process being torn down) and
+  resumed; every lookup then resolves to the process that actually faulted,
+  `[Wine child exit] stage=redeliv-abort` is logged, and `process_exit_wrapper`
+  closes that process's socket, reclaims its JIT pool and calls
+  `ios_wow_window_release( dead_peb )`.
+  `task_terminate` survives for the two cases where nothing could be left alive
+  — the faulting thread has no resolvable PEB, or its PEB is the session's own
+  (`ios_session_peb_get()`, new, `virtual_ios.c:6118`) — and as the WATCHDOG
+  fallback: a detached thread waits 10 s and, if the faulting thread still
+  exists (`thread_get_state` succeeds), does exactly what this site used to do
+  unconditionally. That bound is deliberate: the wedged thread CAN be holding a
+  lock the teardown needs — the `[deliver-hold]` diagnostic exists precisely
+  because a thread can hold FEX's shared lock at a guest redirect — and a hung
+  app is worse than a dead one.
+  **Adjacent bug, not this round's to change:** `process_exit_wrapper`
+  (`server_ios.c:2864`) falls back to `close( fd_socket )` — the SESSION's
+  master socket — whenever `ios_proc_socket_index()` returns -1, which is what a
+  SECOND exit attempt by a sibling thread of an already-dead pseudo-process
+  gets. Pre-existing, in a file this round does not own; it wants a server-side
+  owner.
+
+  **3. Prefix gaps.**
+  (a) `C:\windows\winsxs` did not exist AT ALL, which is why every run logged
+  `parse_depend_manifests Could not find dependent assembly
+  "Microsoft.Windows.Common-Controls" (6.0.0.0)` and
+  `commdlg:DllMain failed to create activation context … 14001`. The store is
+  deleted from the shipped template (`scripts/build-prefix-snapshot.sh:71`) and
+  nothing recreated it, because this port never runs wineboot's fake-DLL
+  install. `app/Madeira/WineProcessBridge.m:1030-1128` now seeds it exactly the
+  way `setupapi` does (`wine/dlls/setupapi/fakedll.c` `register_manifest` /
+  `append_manifest_filename` / `create_manifest` / `create_winsxs_dll_path`):
+  `windows\winsxs\manifests\<DIR>.manifest` plus
+  `windows\winsxs\<DIR>\comctl32.dll`, with
+  `<DIR> = <arch>_microsoft.windows.common-controls_6595b64144ccf1df_
+  6.0.2600.2982_none_deadbeef` — lower case, publicKeyToken and version
+  verbatim, and the literal `deadbeef` where Microsoft puts a content hash
+  (ntdll's `actctx.c` `lookup_manifest_file` knows that constant and prefers a
+  non-Wine assembly if one is ever present). The manifest bytes are
+  `dlls/comctl32_v6/comctl32.manifest` with the empty
+  `processorArchitecture=""` filled in — the substitution `fakedll.c:853-864`
+  makes at install time, and which `actctx.c` then validates against the
+  identity parsed out of the file NAME, so the two must agree.
+  Three architectures are seeded: `x86` (every 32-bit process), `arm64` (BOTH
+  aarch64 and arm64ec — `actctx.c:596-606` `current_archW` is `arm64` under
+  `__arm64ec__`) and `amd64` (what an arm64ec `setupapi` would install, since
+  `fakedll.c` has no `__arm64ec__` case and falls into the `__x86_64__` branch;
+  `lookup_manifest_file`'s `__arm64ec__` branch rewrites an explicit `amd64_`
+  request to the wildcard `a??64_`, which matches either).
+  **An architecture whose farm has no `comctl32_v6.dll` is SKIPPED, loudly:** a
+  manifest without the assembly's DLL makes `find_actctx_dll`
+  (`wine/dlls/ntdll/loader.c:3625`) redirect every `comctl32.dll` load for that
+  assembly into a directory that has none — strictly worse than no manifest.
+  `comctl32_v6` is a SEPARATE module from `comctl32` (same sources built with
+  `-D__WINE_COMCTL32_VERSION=6` plus its own button/combo/edit/listbox/static
+  supersedes, `PARENTSRC = ../comctl32`), so the plain `comctl32.dll` cannot
+  stand in for it; both farm scripts now build it.
+  Log: `[WineProc] winsxs: n/3 Common-Controls 6.0 assemblies seeded`.
+  (b) **The WMI modules were on the i386 list but had never been BUILT.**
+  `wbemprox.dll`, `wmiutils.dll`, `wbemdisp.dll`, `wmic.exe` and `mofcomp.exe`
+  were absent from all three farm directories, so both `system32\wbem` link
+  passes could only ever have logged `0/5`. Ran `.xtool/build-wine-i386.sh`:
+  221 modules installed, and the script's own import-closure check then reported
+  two real gaps introduced by the new modules — `devenum -> avicap32` and
+  `wbemprox -> winspool.drv` — both added to the script and rebuilt.
+  Result: **0 missing cross-imports**, 234 files, all verified `pe-i386`.
+  (c) **There was no 64-bit farm build script at all.** The aarch64 and arm64ec
+  directories had been populated by hand, which is why "add wbemprox to the
+  farms" had no runnable meaning for 64-bit — and why a module missing from the
+  aarch64 farm is silently missing from the i386 one as well (the i386 script
+  derives its ENTIRE target list from `app/Madeira/aarch64-windows/`). Added
+  `.xtool/build-wine-64.sh`: named module list, one bulk make issued from the
+  build ROOT (dodging the `make -C dlls/<x>` stub-Makefile trap recorded at
+  `WOW64_DESIGN.md:1218`), strip, install, machine-type verify, `.drv`/`.cpl`
+  atomic names handled, and a `--configure-arm64ec` stage. aarch64: `wbemprox
+  wmiutils wbemdisp dxdiagn comctl32_v6 wmic mofcomp winspool.drv` all built,
+  stripped, installed, verified `coff-arm64`. arm64ec (tree configured here for
+  the first time): `wbemprox wmiutils wbemdisp dxdiagn comctl32_v6` built,
+  verified `coff-arm64ec`. **`wmic.exe`/`mofcomp.exe` do not exist for arm64ec
+  by construction** — that tree emits only `clean`/`.pot` rules for those
+  programs, and the shipped arm64ec farm has never contained a single Wine
+  program EXE (its 13 `.exe` files are all `*-x64` test binaries); Wine programs
+  come from the aarch64 farm, which has both, and the `wbem` link loops skip
+  what a farm does not build. So `Farm sysx64\wbem: 3/5` is the CORRECT reading
+  there, not a gap.
+  **Two fresh-configure traps, both fixed inside that script:**
+  `config.status: creating Makefile` dies with
+  `../dlls/ntdll/unix/sync.c:79: error: ios_srv_stats.h: No such file` because
+  makedep scans EVERY `#include`, including the `#ifdef WINE_IOS` ones, while
+  those headers live in `build/ntdll-unix/shims/` and are reached only through
+  `-I` at compile time. `build-macos` and `build-i386` never saw it because
+  their Makefiles predate those includes. `--configure-arm64ec` copies
+  `ios_srv_stats.h` / `ios_spin_hist.h` / `ios_fastsync.h` next to the sources
+  that include them first. Anyone reconfiguring any tree will need the same.
+  Second trap, arm64ec only: every module with an `.idl` importlib (wbemdisp
+  first) failed with a bare `error: cannot find stdole2.tlb`, because widl's
+  `open_typelib()` (`wine/tools/widl/widl.c:644`) searches
+  `<dir>/<module>/<pe_dir>/<name>` with
+  `pe_dir = get_arch_dir({ target.cpu, PLATFORM_WINDOWS })`, and for an arm64ec
+  target that collapses to `/aarch64-windows` — while the tree builds the
+  typelib into `dlls/stdole2.tlb/arm64ec-windows/`. The script now aliases
+  `dlls/*.tlb/aarch64-windows -> arm64ec-windows` before the make; with that,
+  wbemdisp builds.
+
+  **Test program.** `build/x86-tests/spawn-x86.c` + `build-spawn-test.sh`:
+  a no-CRT i386 PE that `CreateProcess`es ITSELF three levels deep, every level
+  staying ALIVE and blocked in `WaitForSingleObject` on its child, so each live
+  32-bit pseudo-process needs its own window. Root exits **49** on a full chain;
+  60-65 name exactly where it broke and propagate unchanged up the chain; a
+  `CreateProcess` failure also prints `MADEIRA-SPAWN CONCURRENCY LIMIT: depth=N
+  … N+1 concurrent 32-bit pseudo-process(es) fit in this address space`, which
+  is the direct measurement. Launch row **"Spawn chain"** added to
+  `launchTargets` in `app/Madeira/ContentView.swift` (the only edit made there).
+  **Read the expected result correctly:** with TWO slots the chain reaches
+  depth 1 and then reports the concurrency limit with exit 61. Reaching depth 1
+  AT ALL is item 1's fix; **exit 49 requires a third slot**, i.e. the CEF pool
+  boundary moving, and is the gate for whoever takes that on.
+
+  **Built and verified here:** `libntdll_unix.a` rebuilt clean 30/30 three
+  times, no new warnings (the three that remain are pre-existing and in other
+  code); `WineProcessBridge.m` passes `-fsyntax-only` against the iPhoneOS SDK;
+  `spawn-x86.exe` built i386 with its import set asserted kernel32-only and
+  `LARGE_ADDRESS_AWARE` asserted; both farm builds ran to completion with their
+  own verifiers.
+  **Needs the device, and exactly what to look for:**
+  `[cage] CARVED guest-window slot 1 B=0x7200000000` followed by
+  `[wow-window] slot 1 B=0x7200000000 adopted by pid …` on a 32-bit program
+  launched BY a 32-bit program — that one pair is the whole of item 1 — then
+  `MADEIRA-SPAWN depth=0` / `depth=1` from the new button. Also
+  `[WineProc] system32\wbem: 5/5 links`, `Farm syswow64\wbem: 5/5`,
+  `Farm sysaa64\wbem: 5/5` and `Farm sysx64\wbem: 3/5` (arm64ec has no Wine
+  program EXEs at all — see above); `[WineProc] winsxs: 3/3`; NO
+  `parse_depend_manifests … Common-Controls`, NO `commdlg … 14001`, NO
+  `com_get_class_object … {4590f811-…}`. For item 2: a guest fault that used to
+  end the session must now log `[redeliv] terminating ONE pseudo-process` →
+  `[Wine child exit] stage=redeliv-abort` → `[wow-window] slot k … released`
+  with the desktop still alive; `[redeliv] the faulting thread is STILL ALIVE
+  10 s after being redirected` would mean the teardown deadlocked on a lock the
+  wedged thread holds, and names the next thing to fix.
+
+- 2026-09-14 — **The x64 CONTEXT cannot carry six ARM registers, and FEX keeps
+  live state in every one of them** (logs m50 / l43, same crash). A 64-bit
+  title with a managed runtime died within seconds, twice in the same shape.
+  Both faults are now fully accounted for, and the second one is arithmetically
+  certain rather than inferred.
+
+  **The mapping's hole.** `context_x64_to_arm()`
+  (`wine/dlls/ntdll/unwind.h:144-153`) writes `X13 = X14 = X18 = X23 = X24 =
+  X28 = 0` into every native ARM64 context it builds, because an x86-64
+  `CONTEXT` has no field for them. On a stock arm64ec host that is harmless:
+  those registers are the emulator's, and the emulator is always re-entered
+  through `KiUserEmulationDispatcher`, which reloads its whole world from the
+  CPU area. FEX's ARM64EC backend does not leave them spare —
+  `FEX/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp:142-146` puts
+  **the guest RSP in x23** ("SP's register location isn't specified by the
+  ARM64EC ABI, we choose to use r23"), `Arm64Emitter.h:33` puts **STATE, the
+  CpuStateFrame pointer, in x28**, and `Arm64Emitter.h:63/66` and
+  `Arm64Emitter.cpp:171` claim x13 (TMP4), x24 (REG_AF) and x14 (a dynamically
+  allocated GPR). So EVERY register the x64 CONTEXT drops is one the JIT is
+  using. Any resume that passes through an x64 CONTEXT and lands **natively**
+  back on emitted code — an SEH continue, `RtlRestoreContext`, a user APC's
+  `NtContinue`, `SetThreadContext` + `ResumeThread` — puts the guest back with
+  RSP = 0 and no CPU-state pointer. That is precisely m50's
+  `[x86_live] RSP=0x0 … State.RIP=0x0` on a thread whose HOST sp
+  (`0x702080f398`) is a perfectly good stack address inside its own 8 MB stack
+  region. FEX's own `NtContinueNative` is a direct syscall wrapper
+  (`FEX/Source/Windows/ARM64EC/Module.S:362`) carrying a real ARM64 context, so
+  it is not the producer — the EC CONTEXT wrappers are.
+
+  **The second fault, proved not guessed.** `signal_set_full_context+0x1b4`
+  stored to `0xfffffffffffffc70`. That number is exactly
+  `-sizeof(ARM64 CONTEXT)` = `-0x390`, and the bounce at
+  `build/ntdll-unix/signal_arm64_ios.c` computes
+  `user_context = (frame->sp - sizeof(CONTEXT)) & ~15`. Disassembling the built
+  `signal_arm64.o` shows the sequence verbatim: `ldr x8,[x21,#0xf8]` (frame->sp)
+  / `and x8,x8,#~15` / `sub x20,x8,#0x390` / `str w8,[x20]` with
+  `w8 = 0x400007 = CONTEXT_FULL`, and m50's `segv_handler` reports
+  `x20=0xfffffffffffffc70`. So `frame->sp == 0`: `NtContinue` was called with a
+  CONTEXT whose `Sp` (the caller's `Rsp`) was zero, and ntdll then dereferenced
+  a wild pointer instead of failing. Fault #3/#4 is therefore DOWNSTREAM of
+  fault #1 — the guest fault raised by the RSP-less thread was dispatched, and
+  the continue that came back out of the dispatcher carried the zeroed context.
+
+  **Why `GetThreadContext` cannot be trusted either.**
+  `wine/dlls/ntdll/signal_arm64ec.c:1674` asks for the NATIVE ARM context
+  unconditionally and runs it through `context_arm_to_x64()`, which maps `Sp` →
+  `Rsp` and `Pc` → `Rip` verbatim. For a thread parked in FEX's emitted code
+  that hands the caller the emulator's own stack pointer as the guest RSP and a
+  code-cache address as the guest RIP — values it will hand straight back
+  through `SetThreadContext`. The in-tree ml715/ml716 probes
+  (`[ec-getctx]`, `[srv-getctx]`, `[ctx-frame]`/`MADEIRA_CTX_FRAME`) were
+  written for exactly this and **have never run**: `[ec-getctx]` appears zero
+  times in every log from l43 to m54, because
+  `app/Madeira/arm64ec-windows/ntdll.dll` is dated 2026-09-10 21:45 while
+  `signal_arm64ec.c` was last edited 21:57 — the PE ntdll has not been rebuilt
+  since. Anything added to `signal_arm64ec.c` needs a full wine PE rebuild
+  (`.xtool/build-wine-native.sh` + `.xtool/build.sh`) to reach the device;
+  `.xtool/_ntdll.sh` only rebuilds the UNIX half.
+
+  **A third defect found on the way, not yet fixed.** On iOS cross-thread
+  `SetThreadContext` never reaches its target. `wine/server/thread.c:1343` only
+  converts a resume into the fake-`STATUS_KERNEL_APC` context handback when
+  `thread->suspend_cookie == cookie`, and that cookie is set only from the
+  `select` request's suspend-context path (`thread.c:2155`), i.e. only from
+  `wait_suspend()` (`build/ntdll-unix/thread_ios.c:1848`) — which on iOS runs
+  only at thread start, because POSIX signal suspend is dead
+  (`build/wineserver/mach_ios.c:407`). Worse, `stop_thread()`
+  (`thread.c:974`) returns early whenever `thread->context` already exists, and
+  nothing on the iOS path ever frees it, so the Mach snapshot taken at the FIRST
+  suspend is what every later `GetThreadContext` returns. A stop-the-world
+  therefore reads a stale context and its writes are silently dropped. Fixing
+  that is the next step and is what `ctx-x64.exe` will measure.
+
+  **Fixed here (ships with the ntdll-unix rebuild).**
+  `build/ntdll-unix/signal_arm64_ios.c`, `signal_set_full_context()`: (a) it
+  now snapshots `frame->x[13,14,23,24,28]` before the context is applied and
+  restores any the incoming context zeroed, for arm64ec threads only — those
+  values cannot be *requested* through an x64 CONTEXT, so a zero in one is
+  never intent, and a native ARM64 context carries real values and is left
+  alone; (b) a CONTEXT whose `Pc` is neither EC code nor a pool address (so the
+  resume WILL bounce through `KiUserEmulationDispatcher`) and whose `Sp` is not
+  a usable stack is now refused with `STATUS_INVALID_PARAMETER` before the
+  frame is touched, instead of carving the dispatcher frame out of a null
+  pointer. Both log through the new capped `[ctx]` channel.
+
+  **Fixed at the source (needs a PE ntdll rebuild to take effect).**
+  `wine/dlls/ntdll/signal_arm64ec.c`: `NtSetContextThread` merges the target's
+  live x13/x14/x23/x24/x28 back in after `context_x64_to_arm()`; and, behind
+  `MADEIRA_CTX_EMU=1`, `NtGetContextThread` reports the EMULATED pair for a
+  target parked in non-EC code — `Rsp` from x23 and `Rip` from
+  `CpuArea->EmulatorData[0]` + 0x18 (FEX's CpuStateFrame), cross-checked
+  against x28 so a clobbered register cannot fabricate a RIP. Get and Set ride
+  one switch on purpose: an `Rsp` handed out as a guest RSP has to come back as
+  one.
+
+  **New diagnostics, 16 lines per session total.** `[ctx] set` fires from the
+  unix `NtSetContextThread` when the incoming `Sp`/`Pc` (which on arm64ec ARE
+  the caller's `Rsp`/`Rip`) is not a stack the target owns or not inside any
+  module the loader knows, and prints the caller's return address. `[ctx] get`
+  is its counterpart on `NtGetContextThread`. `[ctx] continue REFUSED` and
+  `[ctx] restored emulator-private regs` come from `signal_set_full_context`.
+
+  **New test.** `build/x64-tests/ctx-x64.c` + launch row **"Thread context
+  (x64)"** in `launchTargets` (`app/Madeira/ContentView.swift`, the only edit
+  made there). Thread A spins in a loop with no calls in it; thread B does
+  `SuspendThread` / `GetThreadContext` / assert `Rsp` inside A's stack and
+  `Rip` inside the exe image / redirect `Rip` to a `landing` function via
+  `SetThreadContext` / `ResumeThread` / wait for the landing flag / restore the
+  original context and check A resumes spinning — 200 times. Exit 50 = pass;
+  55 = a host stack pointer was reported as the guest RSP, 56 = a code-cache
+  address was reported as the guest RIP, 59 = the redirect was lost, 60 = the
+  restore did not take (the iOS `thread->context` defect above). Built with
+  `build/x64-tests/build.sh ctx-x64`, whose hard-coded macOS toolchain and
+  bundle paths now fall back to this checkout's `.xtool/toolchains/llvm-mingw`
+  and `app/Madeira/arm64ec-windows`.
+
+  **Built and verified here:** `libntdll_unix.a` rebuilt clean 30/30;
+  `signal_arm64.o` disassembled to confirm the new register-rescue stores land
+  at `frame->x[13]`=+0x68, `[14]`=+0x70, `[23]`=+0xb8, `[24]`=+0xc0,
+  `[28]`=+0xe0 and that the `sub x20, x8, #0x390` crash site is now
+  unreachable with a null `Sp`; `ctx-x64.exe` built x86-64 PE (109 568 bytes)
+  and copied into the arm64ec farm.
+
+  **Needs the device, and exactly what to look for.** Press **"Thread context
+  (x64)"**: `MADEIRA-CTX PASS` / exit 50 means the round trip is honest. Exit
+  **55** or **56** with the printed value is the direct measurement that
+  `GetThreadContext` is still handing out host registers — that is the gate for
+  turning on `MADEIRA_CTX_EMU=1`, which needs the PE ntdll rebuilt first. Exit
+  **60** confirms the `thread->context` staleness above. In the title's own log,
+  the signature to watch is `[ctx] restored emulator-private regs … x23(guest
+  RSP)=…` — every line is a resume that WOULD have put the guest back with
+  RSP = 0, i.e. one prevented crash; and `[ctx] continue REFUSED` replacing the
+  old `signal_set_full_context+0x1b4` fault. If `[x86_live] RSP=0x0` still
+  appears with no `[ctx]` line before it, the zeroing is reaching the thread by
+  a path that does not go through `signal_set_full_context` — the cross-thread
+  server handback — and the `thread->context` defect is then the whole story.

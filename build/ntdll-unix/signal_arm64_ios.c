@@ -5834,16 +5834,201 @@ static void restore_context( const CONTEXT *context, ucontext_t *sigcontext )
 
 
 /***********************************************************************
+ *   iOS-Madeira ml980: ARM64EC CONTEXT ROUND-TRIP INTEGRITY.
+ *
+ * An x86-64 CONTEXT has no home for six ARM64 registers, so
+ * context_x64_to_arm() (wine/dlls/ntdll/unwind.h:144-153) writes
+ *
+ *     X13 = X14 = X18 = X23 = X24 = X28 = 0
+ *
+ * into EVERY native context it builds -- from NtSetContextThread,
+ * NtContinue, RtlRestoreContext and KiUserApcDispatcher alike. On a stock
+ * arm64ec host that is harmless: those registers belong to the emulator,
+ * and the emulator is always re-entered through KiUserEmulationDispatcher,
+ * which reloads its whole world from the CPU area.
+ *
+ * With FEX as the arm64ec emulator they are not spare at all:
+ *
+ *   x23 = the GUEST RSP      FEXCore/.../Arm64Emitter.cpp:142-146 --
+ *                            "SP's register location isn't specified by the
+ *                             ARM64EC ABI, we choose to use r23"
+ *   x28 = STATE, the CpuStateFrame pointer   Arm64Emitter.h:33
+ *   x24 = REG_AF             Arm64Emitter.h:66
+ *   x13 = TMP4               Arm64Emitter.h:63
+ *   x14 = a dynamically allocated GPR        Arm64Emitter.cpp:171
+ *
+ * So any resume that passes through an x64 CONTEXT and lands back on
+ * FEX-emitted code -- an SEH continue, RtlRestoreContext, a user APC's
+ * NtContinue, or SetThreadContext()+ResumeThread() -- puts the guest back
+ * with RSP = 0 and no CPU-state pointer. That is exactly the l43/m50
+ * signature: `[x86_live] RSP=0x0 ... State.RIP=0x0` on a thread whose HOST
+ * sp is a perfectly good stack address.
+ *
+ * These six cannot be *requested* through an x64 CONTEXT, so a zero
+ * arriving in one is never a caller's intent -- it is the mapping's hole.
+ * Restoring the live values is therefore always right and never loses a
+ * legitimate request. Native ARM64 contexts (FEX's own NtContinueNative,
+ * wait_suspend restores, start_thread) carry real values and are untouched.
+ */
+#define IOS_CTX_LOG_MAX     16
+/* The cross-thread probe costs one extra get_thread_info server call per
+ * SetThreadContext until it either spends its 16 log lines or hits this cap.
+ * 4096 checks is ~80 s at the observed 50 set_thread_context/s -- past process
+ * start and well into the window where these crashes happen -- after which the
+ * probe costs nothing at all. */
+#define IOS_CTX_CHECK_MAX   4096
+static int ios_ctx_log_budget = IOS_CTX_LOG_MAX;
+static int ios_ctx_checks;
+
+static int ios_ctx_take_line(void)
+{
+    if (ios_ctx_log_budget <= 0) return 0;
+    ios_ctx_log_budget--;
+    return 1;
+}
+
+/* Is [addr, addr+size) backed by a writable mapping right now? */
+static int ios_ctx_writable_range( ULONG_PTR addr, size_t size )
+{
+    mach_vm_address_t a = (mach_vm_address_t)addr;
+    mach_vm_size_t sz = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+
+    if (addr < 0x10000 || addr + size < addr) return 0;
+    if (mach_vm_region( mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO_64,
+                        (vm_region_info_t)&info, &cnt, &obj ) != KERN_SUCCESS) return 0;
+    if (obj != MACH_PORT_NULL) mach_port_deallocate( mach_task_self(), obj );
+    if (a > (mach_vm_address_t)addr) return 0;
+    if ((mach_vm_address_t)(addr + size) > a + sz) return 0;
+    return (info.protection & VM_PROT_WRITE) != 0;
+}
+
+/* Does this address belong to something the loader knows -- a guest PE VA,
+ * its JIT-pool copy, or a Mach-O image? FEX-EMITTED pool code answers 0,
+ * which is the point: a "guest RIP" that is really a JIT block address is
+ * the failure this probe exists to name. */
+static int ios_ctx_code_known( ULONG_PTR pc )
+{
+    extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+    extern void *ios_jit_translate_addr( void *addr );
+    uint64_t mod = 0;
+    Dl_info dli;
+
+    if (pc < 0x10000) return 0;
+    if (ios_jit_reverse_translate( (uint64_t)pc, &mod )) return 1;
+    if (ios_jit_translate_addr( (void *)pc )) return 1;
+    if (dladdr( (const void *)pc, &dli )) return 1;
+    return 0;
+}
+
+static int ios_ctx_stack_bounds( HANDLE handle, BOOL self, ULONG_PTR *limit, ULONG_PTR *base )
+{
+    TEB *teb = NULL;
+
+    *limit = *base = 0;
+    if (self) teb = NtCurrentTeb();
+    else
+    {
+        THREAD_BASIC_INFORMATION tbi;
+        if (NtQueryInformationThread( handle, ThreadBasicInformation, &tbi, sizeof(tbi), NULL ))
+            return 0;
+        teb = tbi.TebBaseAddress;
+    }
+    if (!teb) return 0;
+    *limit = (ULONG_PTR)teb->Tib.StackLimit;
+    *base  = (ULONG_PTR)teb->Tib.StackBase;
+    return *base > *limit;
+}
+
+/* Returns 1 when Sp is usable as a stack pointer for this target. */
+static int ios_ctx_sp_ok( ULONG_PTR sp, int have_bounds, ULONG_PTR limit, ULONG_PTR base )
+{
+    if (!sp || (sp & 15)) return 0;
+    if (have_bounds && sp > limit && sp <= base) return 1;
+    return ios_ctx_writable_range( sp - 16, 16 );
+}
+
+
+/***********************************************************************
  *           signal_set_full_context
  */
 NTSTATUS signal_set_full_context( CONTEXT *context )
 {
     extern int ios_is_arm64ec_cur(void);
     struct syscall_frame *frame = get_syscall_frame();
-    NTSTATUS status = NtSetContextThread( GetCurrentThread(), context );
+    ULONG64 emu_save[5];
+    int emu_rescue = 0;
+    NTSTATUS status;
+
+    /* ml980: REFUSE AN UNUSABLE Sp BEFORE IT BECOMES A WILD STORE.
+     *
+     * The KiUserEmulationDispatcher bounce below carves its frame out of
+     * frame->sp, which is whatever Rsp the caller just handed us. l43 and m50
+     * both died right there: a CONTEXT with Rsp == 0 made
+     *   user_context = (0 - sizeof(CONTEXT)) & ~15 = 0xfffffffffffffc70
+     * and the inlined NtGetContextThread stored ContextFlags through it --
+     * `signal_set_full_context+0x1b4`, `x20=0xfffffffffffffc70`, and
+     * 0xfffffffffffffc70 is exactly -sizeof(ARM64 CONTEXT) = -0x390.
+     * Fail the continue instead of faulting inside ntdll; the frame has not
+     * been touched yet, so the caller simply gets an error back. */
+    if (ios_is_arm64ec_cur() && (context->ContextFlags & CONTEXT_CONTROL) == CONTEXT_CONTROL)
+    {
+        extern void *ios_jit_rx_base_global;
+        extern size_t ios_jit_pool_size_global;
+        uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+        size_t psz = ios_jit_pool_size_global;
+        int in_pool = rx && psz && context->Pc >= rx && context->Pc < rx + psz;
+
+        if (!is_ec_code( context->Pc ) && !in_pool &&
+            !ios_ctx_sp_ok( (ULONG_PTR)context->Sp, 0, 0, 0 ))
+        {
+            if (ios_ctx_take_line())
+                ERR_(seh)( "[ctx] continue REFUSED: Sp/Rsp=%p is not a usable stack "
+                           "(Pc/Rip=%p is neither EC code nor a pool address, so this "
+                           "resume would bounce through KiUserEmulationDispatcher and "
+                           "carve its frame out of Sp). caller=%p lr=%p flags=%08x\n",
+                           (void *)context->Sp, (void *)context->Pc, (void *)frame->pc,
+                           (void *)frame->lr, (unsigned int)context->ContextFlags );
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
+
+    if (ios_is_arm64ec_cur() && (context->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER)
+    {
+        emu_save[0] = frame->x[13];
+        emu_save[1] = frame->x[14];
+        emu_save[2] = frame->x[23];
+        emu_save[3] = frame->x[24];
+        emu_save[4] = frame->x[28];
+        emu_rescue = 1;
+    }
+
+    status = NtSetContextThread( GetCurrentThread(), context );
 
     if (!status && (context->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER)
         frame->restore_flags |= CONTEXT_INTEGER;
+
+    /* ml980: put back whatever the x64 CONTEXT mapping zeroed. See the block
+     * comment above: x23 is FEX's guest RSP and x28 its CpuStateFrame. */
+    if (!status && emu_rescue)
+    {
+        static const unsigned char emu_regs[5] = { 13, 14, 23, 24, 28 };
+        unsigned int rescued = 0;
+        int i;
+
+        for (i = 0; i < 5; i++)
+        {
+            if (frame->x[emu_regs[i]] || !emu_save[i]) continue;
+            frame->x[emu_regs[i]] = emu_save[i];
+            rescued |= 1u << emu_regs[i];
+        }
+        if (rescued && ios_ctx_take_line())
+            ERR_(seh)( "[ctx] restored emulator-private regs zeroed by the x64 CONTEXT "
+                       "mapping: mask=0x%08x x23(guest RSP)=%p x28(FEX STATE)=%p pc=%p\n",
+                       rescued, (void *)emu_save[2], (void *)emu_save[4], (void *)frame->pc );
+    }
 
     /* iOS-Madeira diag (Thumper desktop ILL): the crash pc is entered with no
      * branch/register/immediate trail = a context restore. Log every resume
@@ -5938,6 +6123,35 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
 
     if (self && (flags & CONTEXT_DEBUG_REGISTERS)) self = FALSE;
 
+    /* iOS-Madeira ml980 [ctx] set: NAME THE PRODUCER OF A BOGUS x64 CONTEXT.
+     *
+     * On arm64ec this CONTEXT arrived from context_x64_to_arm(), so Sp IS the
+     * caller's Rsp and Pc IS its Rip. If either is not something this target
+     * could be executing -- Sp outside its stack (and not writable at all),
+     * or Pc in neither a known module, nor its JIT-pool copy, nor a Mach-O
+     * image -- the caller's x64 view of this thread was never valid. The
+     * usual cause is the arm64ec NtGetContextThread wrapper
+     * (wine/dlls/ntdll/signal_arm64ec.c:1674) converting the HOST ARM
+     * registers of a thread parked in FEX JIT code into Rsp/Rip.
+     * Capped at IOS_CTX_LOG_MAX lines and IOS_CTX_CHECK_MAX checks. */
+    if ((flags & CONTEXT_CONTROL) && ios_ctx_log_budget > 0 && ios_ctx_checks < IOS_CTX_CHECK_MAX)
+    {
+        ULONG_PTR lim = 0, base = 0;
+        int have = ios_ctx_stack_bounds( handle, self, &lim, &base );
+        int sp_ok, pc_ok;
+
+        ios_ctx_checks++;
+        sp_ok = ios_ctx_sp_ok( (ULONG_PTR)context->Sp, have, lim, base );
+        pc_ok = ios_ctx_code_known( (ULONG_PTR)context->Pc );
+        if ((!sp_ok || !pc_ok) && ios_ctx_take_line())
+            ERR_(seh)( "[ctx] set self=%d handle=%p Sp/Rsp=%p (%s) Pc/Rip=%p (%s) "
+                       "stack=(%p,%p] flags=%08x caller=%p lr=%p\n",
+                       self, handle, (void *)context->Sp, sp_ok ? "ok" : "NOT A STACK",
+                       (void *)context->Pc, pc_ok ? "ok" : "NOT IN ANY MODULE",
+                       (void *)lim, (void *)base, (unsigned int)context->ContextFlags,
+                       (void *)frame->pc, (void *)frame->lr );
+    }
+
     /* iOS-Madeira diag: companion to [set-ctx] in signal_set_full_context —
      * catch cross-thread PC rewrites into the FEX tail carve that land on
      * data words (suspend/invalidate machinery redirecting threads). */
@@ -6030,6 +6244,29 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
         context->ContextFlags |= CONTEXT_FLOATING_POINT;
     }
     if (needed_flags & CONTEXT_DEBUG_REGISTERS) FIXME( "debug registers not supported\n" );
+
+    /* iOS-Madeira ml980 [ctx] get: the counterpart of the [ctx] set probe.
+     * A returned Sp outside the target's own stack limits means the caller is
+     * about to be told a host stack pointer is its x64 Rsp -- the exact value
+     * it will hand straight back through SetThreadContext. */
+    if ((context->ContextFlags & CONTEXT_CONTROL) && ios_ctx_log_budget > 0 &&
+        ios_ctx_checks < IOS_CTX_CHECK_MAX)
+    {
+        ULONG_PTR lim = 0, base = 0;
+        int have = ios_ctx_stack_bounds( handle, self, &lim, &base );
+
+        ios_ctx_checks++;
+        if (have && !((ULONG_PTR)context->Sp > lim && (ULONG_PTR)context->Sp <= base) &&
+            ios_ctx_take_line())
+            ERR_(seh)( "[ctx] get self=%d handle=%p returned Sp/Rsp=%p OUTSIDE the target's "
+                       "stack (%p,%p] Pc/Rip=%p (%s) caller=%p\n",
+                       self, handle, (void *)context->Sp, (void *)lim, (void *)base,
+                       (void *)context->Pc,
+                       ios_ctx_code_known( (ULONG_PTR)context->Pc ) ? "in a module"
+                                                                   : "NOT IN ANY MODULE",
+                       (void *)frame->pc );
+    }
+
     set_context_exception_reporting_flags( &context->ContextFlags, CONTEXT_SERVICE_ACTIVE );
     return STATUS_SUCCESS;
 }
@@ -6399,6 +6636,136 @@ static void setup_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec )
 
 
 #ifdef WINE_IOS
+/***********************************************************************
+ *           [redeliv] TERMINAL — kill ONE pseudo-process, not the app
+ *
+ * The redelivery terminal below used to be
+ *     task_terminate( mach_task_self() ); _exit( 76 );
+ * i.e. one wedged thread ended every pseudo-process, the desktop, the UI and
+ * the log.  The forensics dump is unchanged; what follows it is not.
+ *
+ * WHY A REDIRECT AND NOT A CALL.  abort_process() -> process_exit_wrapper()
+ * is keyed ENTIRELY by the CALLING thread: ios_proc_socket_index() resolves the
+ * pseudo-process through ios_jit_current_peb(), which reads the TEB out of this
+ * thread's TSD slot; ios_wow_window_release() takes the dying PEB; and the
+ * exit() shim longjmps on the thread that owns the jmpbuf.  The [redeliv] site
+ * runs on the MACH EXCEPTION SERVER thread, which belongs to no pseudo-process
+ * at all — calling abort_process there would close the SESSION's master socket
+ * and release nobody's window.  So the faulting thread, which is suspended and
+ * whose register state we already own, is pointed at the thunk below and
+ * resumed; every lookup then resolves to the process that actually faulted.
+ *
+ * THE STACK is ours, not the faulting thread's.  The thread may have been
+ * executing JIT output with an SP that is not a usable C stack, and its Windows
+ * stack is inside the very process being torn down.  One 512 KB anonymous
+ * mapping, made on demand, used once (the terminal is latched).
+ *
+ * THE WATCHDOG is the honest part.  The thread may hold a lock that the
+ * teardown needs (see the [deliver-hold] diagnostic: a thread CAN be holding
+ * FEX's shared lock at a guest redirect), and a hung app is worse than a dead
+ * one.  So a detached thread waits IOS_REDELIV_ABORT_WAIT_SEC and, if the
+ * faulting thread still exists, does exactly what this site used to do
+ * unconditionally.  A pseudo-process that dies cleanly ends that thread —
+ * pthread_exit() for a worker, a return out of ios_child_thread_entry for a
+ * child's boot thread — so "still there" is the wedge.
+ *
+ * The thread port may also have been deallocated by the exception machinery by
+ * then, in which case thread_get_state fails and the watchdog reads that as
+ * "gone" and does nothing. That is the safe direction on purpose: the only way
+ * this watchdog can be wrong is by declining to kill, never by killing a
+ * healthy session.
+ */
+#define IOS_REDELIV_ABORT_WAIT_SEC 10
+
+static thread_t ios_redeliv_abort_thread;
+static volatile int ios_redeliv_abort_stage;   /* 1 redirected, 2 thunk entered */
+
+static void *ios_redeliv_abort_watchdog( void *arg )
+{
+    arm_thread_state64_t st;
+    mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+    struct timespec ts = { IOS_REDELIV_ABORT_WAIT_SEC, 0 };
+
+    (void)arg;
+    nanosleep( &ts, NULL );
+    memset( &st, 0, sizeof(st) );
+    if (thread_get_state( ios_redeliv_abort_thread, ARM_THREAD_STATE64,
+                          (thread_state_t)&st, &cnt ) != KERN_SUCCESS)
+    {
+        dprintf( 2, "[redeliv] pseudo-process teardown finished (the faulting thread is gone); "
+                    "the app and every other pseudo-process survived\n" );
+        return NULL;
+    }
+    dprintf( 2, "[redeliv] the faulting thread is STILL ALIVE %d s after being redirected to "
+                "abort_process (pc=0x%llx, stage=%d) — it is wedged, most likely holding a lock "
+                "the teardown needs. Falling back to killing the task, which is what this site "
+                "used to do unconditionally\n",
+             IOS_REDELIV_ABORT_WAIT_SEC,
+             (unsigned long long)__darwin_arm_thread_state64_get_pc( st ), ios_redeliv_abort_stage );
+    task_terminate( mach_task_self() );
+    _exit( 76 );
+    for (;;) pause();
+}
+
+/* Runs ON the faulting thread (see above).  Everything it touches resolves to
+ * that thread's pseudo-process. */
+static void ios_redeliv_abort_thunk(void)
+{
+    ios_redeliv_abort_stage = 2;
+    dprintf( 2, "[Wine child exit] stage=redeliv-abort peb=%p teb=%p — an undeliverable fault "
+                "wedged this thread; tearing down ONLY this pseudo-process (its wineserver "
+                "socket reaches EOF, its JIT pool and guest window are released)\n",
+             NtCurrentTeb() ? NtCurrentTeb()->Peb : NULL, NtCurrentTeb() );
+    abort_process( STATUS_ACCESS_VIOLATION );
+    /* abort_process is DECLSPEC_NORETURN; if it ever did return, the watchdog
+     * above is what stops this thread from delivering anything again. */
+    for (;;) pause();
+}
+
+/* Point `state` at the thunk.  Returns 0 when this thread cannot be redirected
+ * (no stack could be made), in which case the caller keeps the task kill. */
+static int ios_redeliv_redirect_to_abort( thread_t thread, arm_thread_state64_t *state,
+                                          uintptr_t thread_teb )
+{
+    static char *stack;
+    pthread_attr_t attr;
+    pthread_t wd;
+    size_t sz = 512 * 1024;
+    uintptr_t sp;
+
+    if (!stack)
+    {
+        void *m = mmap( NULL, sz, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANON, -1, 0 );
+        if (m == MAP_FAILED)
+        {
+            dprintf( 2, "[redeliv] cannot allocate an abort stack (%s) — falling back to the "
+                        "task kill\n", strerror( errno ) );
+            return 0;
+        }
+        stack = m;
+    }
+    sp = ((uintptr_t)stack + sz - 64) & ~(uintptr_t)15;
+
+    ios_redeliv_abort_thread = thread;
+    ios_redeliv_abort_stage  = 1;
+
+    memset( state->__x, 0, sizeof(state->__x) );
+    state->__x[18] = (uint64_t)thread_teb;    /* NtCurrentTeb() on this port */
+    state->__fp    = 0;                       /* terminate any unwind */
+    state->__lr    = 0;
+    __darwin_arm_thread_state64_set_sp( *state, sp );
+    __darwin_arm_thread_state64_set_pc_fptr( *state, (void *)ios_redeliv_abort_thunk );
+
+    pthread_attr_init( &attr );
+    pthread_attr_setdetachstate( &attr, PTHREAD_CREATE_DETACHED );
+    if (pthread_create( &wd, &attr, ios_redeliv_abort_watchdog, NULL ))
+        dprintf( 2, "[redeliv] WARNING: no watchdog thread; a teardown that wedges will hang "
+                    "instead of killing the app\n" );
+    pthread_attr_destroy( &attr );
+    return 1;
+}
+
 /***********************************************************************
  *           ios_mach_deliver_guest_exception  (ml369, #63)
  *
@@ -6921,7 +7288,17 @@ dispatch:
              * Latch it: dump exactly once, then kill and keep killing. Mach
              * task_terminate first (unshimmable), then the raw _exit syscall,
              * then park this thread forever so it can never deliver again —
-             * whichever lands first, no second dump is possible. */
+             * whichever lands first, no second dump is possible.
+             *
+             * 2026-09-14: the KILL is no longer task-wide by default.  One
+             * wedged thread ended every pseudo-process, the desktop and the
+             * log; a 32-bit program faulting undeliverably must not take the
+             * desktop that launched it with it.  The dump is unchanged; after
+             * it, the faulting thread is redirected to abort_process() for its
+             * OWN pseudo-process (see ios_redeliv_redirect_to_abort above).
+             * The task kill remains for the two cases where nothing could
+             * survive anyway — the session's own pseudo-process, and a thread
+             * whose PEB cannot be resolved — and as the watchdog's fallback. */
             ios_redeliv_terminating = 1;
             static const int fregs[] = { 0, 8, 9, 10, 16, 19, 20 };
             unsigned fi;
@@ -6946,7 +7323,35 @@ dispatch:
                          (unsigned long long)words[4], (unsigned long long)words[5],
                          (unsigned long long)words[6], (unsigned long long)words[7] );
             }
-            dprintf( 2, "[redeliv] terminating process rev=ml465\n" );
+            {
+                extern void *ios_session_peb_get(void);
+                void *fault_peb    = teb ? teb->Peb : NULL;
+                void *session_peb  = ios_session_peb_get();
+
+                if (fault_peb && fault_peb != session_peb &&
+                    ios_redeliv_redirect_to_abort( thread, state, thread_teb ))
+                {
+                    dprintf( 2, "[redeliv] terminating ONE pseudo-process (peb=%p teb=%p tid=%04x), "
+                                "NOT the task: the faulting thread is redirected to abort_process "
+                                "on its own identity; the session (peb=%p) and every other "
+                                "pseudo-process keep running rev=2026-09-14\n",
+                             fault_peb, teb, (unsigned)(ULONG_PTR)teb->ClientId.UniqueThread,
+                             session_peb );
+                    /* NOT `*state = mc.__ss` — that copy (made above) is the
+                     * KiUserExceptionDispatcher entry this site is refusing.
+                     * ios_redeliv_redirect_to_abort() wrote the thunk entry
+                     * into *state directly and the caller's thread_set_state
+                     * publishes exactly that. */
+                    return 1;
+                }
+                dprintf( 2, "[redeliv] terminating the TASK rev=2026-09-14: %s — there is nothing "
+                            "for a per-pseudo-process teardown to leave alive\n",
+                         !fault_peb ? "the faulting thread has no resolvable PEB"
+                                    : (fault_peb == session_peb
+                                       ? "the faulting thread belongs to the SESSION's own "
+                                         "pseudo-process"
+                                       : "the redirect could not be set up") );
+            }
             task_terminate( mach_task_self() );
             _exit( 76 );
             for (;;) pause();
