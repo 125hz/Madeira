@@ -2477,6 +2477,20 @@ static void monitor_get_info( struct monitor *monitor, MONITORINFO *info, UINT d
     {
         char buffer[CCHDEVICENAME];
         if (monitor->source) snprintf( buffer, sizeof(buffer), "\\\\.\\DISPLAY%d", monitor->source->id + 1 );
+#ifdef WINE_IOS
+        /* iOS-Madeira 2026-09-16: the virtual monitor has no source, and
+         * upstream's sourceless name is "WinDisc" -- Windows' name for a
+         * DISCONNECTED monitor. Everything that goes looking for a display by
+         * name gets that string from GetMonitorInfo and then asks about it:
+         * DXMT's win32 wsi does GetMonitorInfoW -> EnumDisplaySettingsW(szDevice)
+         * (research/dxmt/src/util/wsi_monitor_win32.cpp), and wined3d compares
+         * an output's name against EnumDisplayDevices'. This driver advertises
+         * exactly one adapter, "\\.\DISPLAY1"; say so here too rather than
+         * handing out a name that reads as "nothing is plugged in".
+         * (Comparing against &virtual_monitor, not ios_virtual_monitor_active():
+         * display_lock is already held here.) */
+        else if (monitor == &virtual_monitor) strcpy( buffer, "\\\\.\\DISPLAY1" );
+#endif
         else strcpy( buffer, "WinDisc" );
         asciiz_to_unicode( ((MONITORINFOEXW *)info)->szDevice, buffer );
     }
@@ -4176,6 +4190,72 @@ static NTSTATUS d3dkmt_open_adapter_from_gdi_display_name( D3DKMT_OPENADAPTERFRO
 
     RtlInitUnicodeString( &name, desc->DeviceName );
     if (!name.Length) return STATUS_UNSUCCESSFUL;
+
+#ifdef WINE_IOS
+    /* iOS-Madeira 2026-09-16: the virtual-monitor regime again -- the sources
+     * list is EMPTY, so find_source() cannot succeed for ANY name, not even
+     * the "\\.\DISPLAY1" this very driver hands out from
+     * NtUserEnumDisplayDevices and answers in NtUserEnumDisplaySettings /
+     * NtUserChangeDisplaySettings.  This was the last unguarded entry point,
+     * and it is the one every wined3d-based DLL (ddraw, d3d8, d3d10/11, dxgi,
+     * and dxdiagn's display probe through them) hits first:
+     *
+     *   wined3d_adapter_init            (wine/dlls/wined3d/directx.c:3441)
+     *     EnumDisplayDevicesW -> "\\.\DISPLAY1", ATTACHED_TO_DESKTOP|PRIMARY
+     *   wined3d_adapter_create_output   (directx.c:3387)
+     *   wined3d_output_init             (directx.c:3360)
+     *     D3DKMTOpenAdapterFromGdiDisplayName -> here -> STATUS_UNSUCCESSFUL
+     *     => "return E_INVALIDARG"
+     *   => err:d3d:wined3d_adapter_create_output Failed to initialise output
+     *      L"\\.\DISPLAY1", hr 0x80070057
+     *
+     * wined3d then reports ZERO outputs, which every D3D DLL treats as "no
+     * display attached" -- the application's own renderer-init failure path.
+     * Nothing about the DEVMODE was ever rejected: the device-name lookup
+     * never got that far, so no dmFields/dmSize/registry-vs-current change
+     * could have fixed it.
+     *
+     * Synthesize the adapter the same way the neighbouring entry points
+     * synthesize the source: accept the names this driver advertises, hand
+     * back a stable LUID (there is no GPU object either -- clear_display_devices()
+     * empties the gpus list in this regime) and the single VidPnSourceId.
+     * NtGdiDdDDIOpenAdapterFromLuid() allocates a real D3DKMT adapter handle
+     * for any LUID; it only WARNs that no Vulkan physical device matches,
+     * which is true and harmless here.  The handle matters because
+     * wined3d_output_init() immediately does D3DKMTCreateDevice() against the
+     * adapter's own handle and D3DKMTCloseAdapter() against this one. */
+    if (ios_virtual_monitor_active())
+    {
+        /* Stable and non-zero; NtGdiDdDDIEnumAdapters2 enumerates no GPUs in
+         * this regime, so nothing can collide with it. */
+        static const LUID virtual_luid = { 0x4d616469, 0x1 };   /* 'Madi' */
+
+        if (!ios_virtual_device_name( &name ))
+        {
+            WARN( "unknown device name %s\n", debugstr_us(&name) );
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        luid_desc.AdapterLuid = virtual_luid;
+        if ((status = NtGdiDdDDIOpenAdapterFromLuid( &luid_desc )))
+        {
+            ERR( "NtGdiDdDDIOpenAdapterFromLuid failed, status %#x\n", (unsigned int)status );
+            return status;
+        }
+
+        desc->hAdapter = luid_desc.hAdapter;
+        desc->AdapterLuid = virtual_luid;
+        desc->VidPnSourceId = 1;   /* source id 0 + 1, as upstream computes it */
+        {
+            static int logged;
+            if (logged++ < 4)
+                dprintf(2, "[vmode] synthesized D3DKMTOpenAdapterFromGdiDisplayName -> hAdapter %#x vidpn 1\n",
+                        (unsigned int)(UINT_PTR)desc->hAdapter);
+        }
+        return STATUS_SUCCESS;
+    }
+#endif
+
     if (!(source = find_source( &name ))) return STATUS_UNSUCCESSFUL;
 
     luid_desc.AdapterLuid = source->gpu->luid;

@@ -4724,3 +4724,85 @@ window teardown), `src/winemetal/unix/winemetal_unix.c` (`_Foo32` pattern
   HUD buttons = `MadeiraMetalView` had no width constraint and covered the
   pillarbox bar (`.frame(width: gameW)`); `[hud] tap …` on every button;
   30 fps cap = vsync mode 3 (`presentDrawable:afterMinimumDuration:1/30`).
+- 2026-09-16 — Logs 64/65: the 2001 title now passes DNS (dispatcher
+  guard fired once, dnsapi bound) and exits 1 after
+  `wined3d_adapter_create_output Failed to initialise output \.\DISPLAY1
+  hr 0x80070057` (a wined3d DLL pulled in by dxdiagn) — assigned: wined3d
+  output init against the virtual display, DXMT adapter mode list from the
+  real mode table, `[d3d9-modes]` log, `d3d9modes-x86.exe` (exit 55).
+  Landscape layout: the game placeholder was a `height*4/3` column (from
+  the 1024x768 days) so every display mode operated inside a 4:3 box
+  (Fill/Stretch looked horizontally stretched, Fit never grew); now the
+  whole view is the game area, the FPS pill and display-mode button are
+  portrait-only (user), and "Fill height" = uniform scale to the full
+  height with side bars.
+- 2026-09-16 — **`wined3d_adapter_create_output` E_INVALIDARG was never about a
+  DEVMODE: the virtual-monitor regime's LAST unguarded win32u entry point.**
+  Log 65, the 2001-era 32-bit title, exits 1 from its own renderer-init path
+  with four `err:d3d:wined3d_adapter_create_output Failed to initialise output
+  L"\.\DISPLAY1", hr 0x80070057` and nothing else. Traced the whole chain:
+  `wined3d_adapter_init` (`wine/dlls/wined3d/directx.c:3441`) walks
+  `EnumDisplayDevicesW`, gets our synthesized `\.\DISPLAY1` with
+  `ATTACHED_TO_DESKTOP|PRIMARY`, and calls `wined3d_adapter_create_output`
+  (`directx.c:3387`) → `wined3d_output_init` (`directx.c:3360`), whose FIRST
+  statement is `D3DKMTOpenAdapterFromGdiDisplayName`, and whose only
+  `E_INVALIDARG` is that call failing. Not `EnumDisplaySettingsExW`, not
+  `GetMonitorInfo`, not `dmFields`/`dmSize`/`DM_POSITION`/registry-vs-current —
+  none of those are reached. Below it,
+  `d3dkmt_open_adapter_from_gdi_display_name` (`sysparams_ios.c`, now :4182)
+  does `find_source(L"\.\DISPLAY1")`, and in this port the sources list is
+  **empty** (`update_display_cache` takes the `is_service_process()` branch,
+  `clear_display_devices()`, one `virtual_monitor`), so it returns
+  STATUS_UNSUCCESSFUL for the very name this driver hands out.
+  `NtUserEnumDisplayDevices`, `NtUserEnumDisplaySettings` and
+  `NtUserChangeDisplaySettings` each already had an `ios_virtual_monitor_active()`
+  branch for exactly this; the D3DKMT one did not. Fixed the same way: accept
+  `ios_virtual_device_name()`, hand back a stable LUID (there is no `gpu` object
+  either) through `NtGdiDdDDIOpenAdapterFromLuid` — which succeeds for any LUID,
+  only WARNing that no Vulkan physical device matches — and `VidPnSourceId = 1`.
+  **This is what every wined3d-based DLL needs**: with zero outputs `ddraw`,
+  `d3d8`, `dxgi` and `d3d10/11` all report "no display attached". `ddraw.dll`
+  was the loader here (log 65 line ~4795, before `dxdiagn` even loads); the
+  title never reached `Direct3DCreate9` itself. Also stopped
+  `GetMonitorInfo(MONITORINFOEXW)` reporting `szDevice = "WinDisc"` (Windows'
+  name for a DISCONNECTED monitor) for the virtual monitor — it is
+  `\.\DISPLAY1` now, which is what DXMT's win32 wsi feeds straight back into
+  `EnumDisplaySettingsW`.
+  DXMT side: the D3D9 adapter's mode list only ever had THREE entries
+  (`640x480, 800x600, current`) in `wsi_monitor_headless.cpp` while user32 has
+  reported 14+ since 2026-09-14 — it now reads `EnumDisplaySettingsExW`
+  verbatim where user32 exists, and mirrors `ios_standard_modes[]` (same
+  index-0-is-current, same ≤2× pixel-count filter) below the Win32 boundary
+  where it does not. Note for anyone re-reading this: the **i386** PE
+  `d3d9-emulated.dll` does not compile that file at all —
+  `research/dxmt/src/util/meson.build` routes `cpu_family == 'x86' && windows`
+  to `wsi_monitor_win32.cpp`, which was already going through user32; the
+  headless copy serves the native ARM64 frontend and the aarch64 PE.
+  `GetAdapterModeCount`/`EnumAdapterModes` (+ the `Ex` pair) also stopped
+  rejecting everything but `X8R8G8B8`: the display behind them is the virtual
+  monitor, whose `ChangeDisplaySettings` ignores `dmBitsPerPel` entirely, so
+  `R5G6B5`/`X1R5G5B5`/`A2R10G10B10` really are settable — and `CheckDeviceType`
+  gates a FULLSCREEN device on `GetAdapterModeCount(DisplayFormat) != 0`, so a
+  title that offers 16-bit colour was being told the adapter has no modes at all.
+  New `[d3d9-modes]` trace (`Logger::info`, both frontends): one line per
+  process with the mode count, the current mode and the first eight modes, and
+  one line per `CreateDevice`/`CreateDeviceEx`/`Reset` as
+  `WxH fmt refresh= windowed= count= -> hr 0x…`.
+  Test: `build/x86-tests/d3d9modes-x86.c` →
+  `C:\windows\syswow64\d3d9modes-x86.exe` (`build-d3d9modes-test.sh`, imports
+  kernel32+user32+d3d9 only). Asserts ≥ 6 modes, no degenerate entry, 640x480
+  and 800x600 present, `GetAdapterDisplayMode == GetSystemMetrics(SM_CXSCREEN/
+  SM_CYSCREEN)`, `CheckDeviceType(HAL, X8R8G8B8, fullscreen)` OK, then creates
+  and presents a FULLSCREEN device at 800x600 and at 640x480 and restores the
+  mode. **Exit 55 = pass**; 60-70 each name one failed check (see the file
+  header).
+  **What to look for in the next log:** the `err:d3d:wined3d_adapter_create_output`
+  lines GONE, replaced by `[vmode] synthesized D3DKMTOpenAdapterFromGdiDisplayName
+  -> hAdapter … vidpn 1` (≤ 4 times); then `info: [d3d9-modes] adapter 0
+  count=N current=WxH@60 | …` with N in the teens, not 3; and — the point of
+  the exercise — `info: [d3d9-modes] CreateDevice WxH FMT refresh=R windowed=0
+  -> hr 0x…` naming the mode the title actually wants and the HRESULT it got.
+  If the title still fails with a healthy count and no `CreateDevice` line at
+  all, it is refusing before D3D9 and the next thing to read is what `ddraw`
+  answers (`IDirectDraw7::EnumDisplayModes` / `GetDisplayMode`), not the mode
+  table.

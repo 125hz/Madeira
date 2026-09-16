@@ -35,7 +35,7 @@ enum DisplayMode: String, CaseIterable {
         case .fill:    return "Fill"
         case .stretch: return "Stretch"
         case .aspect:  return "Aspect"
-        case .fitHeight: return "Fit height"
+        case .fitHeight: return "Fill height"
         }
     }
     var symbol: String {
@@ -3253,10 +3253,15 @@ struct ContentView: View {
     /// anything drawn over the game area itself. No header/log/nav chrome.
     private var landscapeBody: some View {
         GeometryReader { geo in
-            let gameW = min(geo.size.width, geo.size.height * 4.0 / 3.0)
-            let barW = max((geo.size.width - gameW) / 2.0, 44)
-            ZStack {
-                Color.black
+            // 2026-09-16: landscape is game-only. The whole view is the game
+            // area (the old `height * 4/3` box dated from the fixed 1024x768
+            // monitor and squeezed every display mode into a 4:3 column), and
+            // the FPS pill / display-mode button live in portrait only, per the
+            // user: nothing may sit over the game in landscape. Fit/Aspect/
+            // Fit-height letterbox inside this box with a UNIFORM scale, Fill
+            // covers it, Stretch fills it exactly.
+            let gameW = geo.size.width
+            HStack(spacing: 0) {
                 MadeiraMetalView()
                     // Device feedback (2026-09-15): the display-mode and FPS-cap
                     // buttons in the right pillarbox bar below took no taps.
@@ -3273,7 +3278,7 @@ struct ContentView: View {
                     // pillarbox areas (barW each side) are now genuinely outside
                     // MetalBackedView's bounds, so the buttons receive their
                     // taps like any other unobstructed SwiftUI control.
-                    .frame(width: gameW)
+                    .frame(width: gameW, height: geo.size.height)
                     // ml662: the controls window hosts the UIKit touch layer, so
                     // it has to exist in landscape whether or not the app was
                     // ever in portrait this session.
@@ -3293,21 +3298,10 @@ struct ContentView: View {
                         JoystickPadState.shared.hidden = true
                         JoystickPadState.shared.center = .zero
                     }
-                // Controls removed for now (ml586): game-only landscape.
-                // The FPS readout stays, pinned in the right pillarbox bar —
-                // the window-level surface covers anything drawn over the
-                // game area itself, so it cannot ride on the game view.
-                HStack(spacing: 0) {
-                    Spacer(minLength: 0)
-                    VStack(spacing: 8) {
-                        FPSOverlay(compact: true)
-                        displayModeToggle
-                        Spacer()
-                    }
-                    .padding(.top, 8)
-                    .frame(width: barW)
-                }
+                // Game-only landscape (ml586, reaffirmed 2026-09-16): no FPS
+                // pill and no display-mode button here — both stay in portrait.
             }
+            .background(Color.black)
         }
         .ignoresSafeArea()
         .background(Color.black)
