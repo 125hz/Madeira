@@ -29,9 +29,11 @@ Dynamically loaded at runtime:
   (d3d12/LICENSE-metal-shader-converter-headers.txt).
 
 LGPL notice: this application uses the LGPL-licensed libraries above. Their
-complete corresponding source is in the Madeira repository, and the
-application's own source there allows a recipient to rebuild and relink it
-with modified versions of those libraries (the recipient rebuild procedure
-is documented in docs/LICENSING.md, where its verification status is also
-recorded). Reverse engineering the combined work for debugging such
+complete corresponding source, and the application's own source and build
+scripts, are in the Madeira repository. The procedure for rebuilding the
+application against modified versions of those libraries is documented in
+docs/BUILDING.md in that repository, together with the inputs it needs that
+the repository does not contain and the verification status of each step;
+as of 2026-09-16 that end-to-end rebuild has not been demonstrated from a
+clean checkout. Reverse engineering the combined work for debugging such
 modifications is permitted.

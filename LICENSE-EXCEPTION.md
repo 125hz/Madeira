@@ -1,16 +1,25 @@
 # Additional permission for the Apple Metal Shader Converter (GPL-3.0 section 7)
 
-DRAFT prepared 2026-09-16 for review. NOT IN EFFECT until adopted in a
-tagged release; every copy of this text in the forks and the runtime is
-provisional in the same way. See "Scope and authority" for what it can and
-cannot cover.
+DRAFT prepared 2026-09-16 for review. NOT IN EFFECT until the copyright
+holder completes the adoption line below. Distribution begins with the first
+push to a public remote, not with a release tag, so the line must be
+completed BEFORE any public push (the repository's `.githooks/pre-push`
+refuses a remote push while this file is a draft; enable it with
+`git config core.hooksPath .githooks`). Every copy of this text in the
+forks and the runtime follows this adoption. See "Scope and authority" for
+what it can and cannot cover.
+
+Adopted on: 
+By: 
+
+(Both blank = draft. Once completed, remove the word DRAFT from this file.)
 
 Madeira is licensed under the GNU General Public License, version 3 or (at
 your option) any later version (see `COPYING`). The following additional
 permission applies to the parts of Madeira whose copyright is held by the
 Madeira authors (see "Scope and authority"):
 
-### Madeira Converter Exception, version 1 (DRAFT of 2026-09-16; not in effect until adopted)
+### Madeira Converter Exception, version 1 (DRAFT of 2026-09-16; in effect from the adoption date above)
 
 Additional permission under GNU GPL version 3 section 7.
 
@@ -53,7 +62,9 @@ It does NOT cover, and nothing here changes:
   Madeira-authored patches reapplied under LGPL-2.1-or-later, documented in
   `docs/wine-lgpl-provenance.md`;
 - the Apple libraries themselves. The converter library is tracked in this
-  repository and distributed only under Apple's agreement
+  repository (whether that co-location, or the built app, forms a combined
+  work with the GPL code is a question for the legal review, not settled by
+  this file) and it is distributed only under Apple's agreement
   (`app/Madeira/d3d12/METAL-SHADER-CONVERTER-AGREEMENT.txt`, section 2.B:
   distribution "for the sole purpose of shader conversion").
 

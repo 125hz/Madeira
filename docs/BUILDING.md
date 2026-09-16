@@ -35,12 +35,12 @@ git-ignored and consumed by the app project.
    also tracked). Verified: built on the development machine; not re-run
    from a clean checkout.
 2. FEX (submodule, branch ios-port-2607):
-   - `FEX/build-ios`: `cmake -S FEX -B FEX/build-ios -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DENABLE_FEX_ALLOCATOR=OFF -DENABLE_ASSERTIONS=OFF` then build the FEXCore targets -> `FEX/build-ios/FEXCore/Source/lib{FEXCore,FEXCore_Base,JemallocLibs}.a` and `External/{cephes,fmt,SoftFloat-3e,xxhash}` archives (values read back from CMakeCache). UNVERIFIED from clean.
-   - `FEX/build-arm64ec`: with the llvm-mingw `bin` on PATH, `make arm64ecfex` -> `Bin/libarm64ecfex.dll`, copied to `app/Madeira/arm64ec-windows/xtajit64.dll`. Verified this session (rebuilt ml905).
+   - `FEX/build-ios`: `build/fex-ios/build.sh` (same options as the development CMakeCache) -> `FEX/build-ios/FEXCore/Source/lib{FEXCore,FEXCore_Base,JemallocLibs}.a` and the `External/{cephes,fmt,SoftFloat-3e,xxhash}` archives. UNVERIFIED from clean.
+   - `FEX/build-arm64ec`: `build/fex-arm64ec/build.sh` (configures with `FEX/Data/CMake/toolchain_mingw.cmake` and the recorded options on first run, builds target `arm64ecfex`, copies `Bin/libarm64ecfex.dll` to `app/Madeira/arm64ec-windows/xtajit64.dll`). The build step was verified this session; the first-run configure in the script is reconstructed from CMakeCache and UNVERIFIED.
 3. Wine (submodule, branch madeira-lgpl):
    - unix side: `build/ntdll-unix/build.sh`, `build/wineserver/build.sh`,
      `build/win32u-unix/build.sh` -> `app/Madeira/lib{ntdll_unix,wineserver,win32u_unix}.a`. Verified on the development machine.
-   - PE side: `wine/build-arm64ec` configured with `--enable-archs=arm64ec --without-x --disable-tests` (from config.status), llvm-mingw on PATH, `make -C dlls/ntdll` etc.; ntdll.dll is then stripped and padded (memory: reference_build_and_deploy_chains) and the PE modules copied to `app/Madeira/arm64ec-windows/` (tracked). UNVERIFIED from clean.
+   - PE side: `build/wine-pe/build-ntdll.sh` (configures `wine/build-arm64ec` with `--enable-archs=arm64ec --without-x --disable-tests` on first run, builds `dlls/ntdll`, strips, pads to SizeOfImage + 0x50000, copies to the app). Other PE modules: `make -C dlls/<name>` in that tree and copy the DLL, as the script's header says. The strip/pad step was verified this session; the configure step is UNVERIFIED from clean.
 4. DXMT (submodule, branch ios-port):
    - unix side: `build/dxmt-ios/build.sh` (needs `toolchains/llvm-ios-build`) -> `app/Madeira/libdxmt_combined.a` (ignored; the app links it). Verified this session.
    - PE side: `meson setup research/dxmt/build-arm64ec research/dxmt -Dbuildtype=release -Dwine_build_path=../../wine/build-arm64ec --cross-file=research/dxmt/build-arm64ec-win.txt` then `ninja -C research/dxmt/build-arm64ec src/winemetal/winemetal.dll` (and d3d11.dll) -> copied to `app/Madeira/arm64ec-windows/`. Verified this session (winemetal.dll).
