@@ -4460,3 +4460,74 @@ window teardown), `src/winemetal/unix/winemetal_unix.c` (`_Foo32` pattern
   gotcha recorded: any make in `wine/build-macos` regenerates config.h and
   drops the GnuTLS defines prepare-wine.py appends → re-append before the
   ntdll-unix build.
+- 2026-09-15 — Log 56 (second launch in one app run): `BAD POOL: no valid
+  placement after retries. Killing in 10s` was a misdiagnosis, and the kill
+  was the worst part of it. Session 1's pool was fine (`RX=0x11bfe0000,
+  RW=0x13bfe0000`); the address space was never the problem. `[early-detach]`
+  (ml524) drops StikDebug ~2 s after the pool is granted, so session 2's
+  allocation BRK reached nobody — the log says it plainly two lines up
+  (`[task-exc] BREAKPOINT #1 … jit26_prepare_region+0x28`, then `[brk-f00d]
+  skipped stray StikDebug BRK`). x0 came back 0, the loop broke on attempt 0,
+  and the `else` branch printed a canned "all placements landed in the
+  forbidden guest 64G window" that was hard-coded rather than observed.
+  A second pool would have been useless anyway: ntdll-unix reads
+  `WINE_IOS_JIT_RX/RW/SIZE` exactly once behind `jit_pool_init_done`
+  (`virtual_ios.c`), the dylib is never unloaded, and `wine_process_start()`
+  only spawns another thread into `__wine_main` in the same process — so from
+  session 2 on, Wine is already committed to the first pool's bump pointer,
+  freelist, image and anon-alias tables, and the TEB trampoline at pool+8.
+  Fix: **the pool is a process-lifetime resource.** `StikJITHelper.cachedPool`
+  holds it and every later session gets the same mapping back after a
+  validation probe (`jit_range_is_mapped`: no holes across the full range, plus
+  R+X / R+W on the first page of each alias only — deeper pages legitimately
+  change protection under W^X demotion and poisoning). Reuse is logged as
+  `[jit-pool] reuse RX=… RW=… size=…MB (session N) — no debugger round trip`
+  and removes a ~1.9 s whole-process BRK suspension from every launch after the
+  first. **The pool is deliberately NOT scrubbed between sessions:** zeroing or
+  madvise-ing it would destroy live ntdll-unix state that `jit_pool_init_done`
+  guarantees will never be rebuilt (the pool+0/+8 trampoline, every image the
+  alias tables point at, the freelist's accounting); reclaiming dead ranges is
+  already ntdll-unix's job (`[jit-pool] RECLAIM peb=…`). When a pool really does
+  have to be allocated, placement now makes progress instead of re-rolling:
+  a rejected region is freed and then re-reserved at the same VA with
+  `vm_allocate(VM_FLAGS_FIXED)` — reserve-only, so a blocked hole costs address
+  space and no footprint — which is what ml595/ml596 lacked when the kernel
+  handed back `0x7000000000` three times running; then, if eight rolls still
+  fail, an explicit sweep places the range itself with `vm_allocate(FIXED)` and
+  asks the debugger only to bless it (`jit26_prepare_region` with x0 ≠ 0;
+  `_M` is ANYWHERE-only), 64 MB stride from the pin frontier then 1 GB out to
+  64 G, every candidate **verified executable** before acceptance and released
+  otherwise. Success logs `[jit-pool] placed at RX=… RW=… after K attempt(s)`.
+  `exit(0)` is gone: failure logs `[jit-pool] NO POOL after K attempts — Wine
+  will not start. The app stays usable`, names the real reason (debugger gone
+  vs. every placement rejected), and leaves the UI and the log alive.
+  Separately, the ml347 JIT-pool dump is now opt-in: every unhandled guest
+  fault (and the first ILL) was writing the whole RW alias — 512 MB at the
+  direct-launch default — synchronously from a fault handler into the synced
+  Documents folder. `ios_jit_dump_enabled()` in `signal_arm64_ios.c` gates both
+  sites on `MADEIRA_JIT_DUMP=1` (default off, settable from
+  `Documents/madeira-env.txt`), and a stale `fex-jit-dump.bin` is deleted at
+  session start when the knob is off. **Needs the device:** launch a program,
+  quit it, launch a second one in the same app run — the second launch must
+  print `[jit-pool] reuse RX=0x… RW=0x… (session 2)` within milliseconds, no
+  `Allocating …MB JIT pool via debugger` line, no `BAD POOL`, no 10-second
+  kill; and no `fex-jit-dump.bin` should appear in Documents unless
+  `MADEIRA_JIT_DUMP=1` is set.
+- 2026-09-15 — Logs 56-58. The 2001-era title now runs past DEP (24
+  regions promoted) and exits 1 after opening `\??\Global\SecDrv` /
+  `\??\SecDrv` fails: SafeDisc copy protection needs the secdrv kernel
+  driver Windows removed in 2015 — not an emulator defect; not emulating
+  it. "Nothing launched" from the Custom popup = that quick exit plus the
+  second launch failing at "BAD POOL": root cause was the early-detached
+  debugger no longer servicing the allocation BRK (fixed: pool cached for
+  the app lifetime, reuse path, explicit hinted placement, no exit(0)).
+  512 MB `fex-jit-dump.bin` now behind `MADEIRA_JIT_DUMP=1`. UI: Enable JIT
+  first; `DisplayMode.fitHeight` (aspect kept, full height, side bars);
+  on-screen gamepad controls are real XInput sources (`ControlAction.
+  gamepad`, `.gamepadDPad`, `OnScreenPad` merge with the physical pad,
+  `src=` in the `[xinput]` line) — the "L" glyph was `.mouseLeft`'s label
+  because the controller tab only set `padBinding`; control size slider
+  (`sizeScale` 0.5-2.0). Log 58 (UE3 game, this build): main thread
+  `sleep0=3.4 M/10 s` but `yield_sc=1551`, `park=26 k` — the governor works;
+  render thread 59 % (jit 17 %) — next perf target is that thread's non-JIT
+  share (`kern` shows `NtDelayExecution` 5.2 %, server reads 6 %).

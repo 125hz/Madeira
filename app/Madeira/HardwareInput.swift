@@ -1077,7 +1077,15 @@ final class HardwareInput: ObservableObject {
         }
         gamepadConnected = remaining
         if !remaining {
-            padStopSampling()
+            // ml670: the sampler is slot 0's clock for the ON-SCREEN half too,
+            // so it only stands down when neither source is left. Without this
+            // guard, unplugging a controller would silently kill the virtual
+            // one that is still on the screen.
+            if OnScreenPad.shared.isLive {
+                padQueue.async { [weak self] in self?.padSample() }
+            } else {
+                padStopSampling()
+            }
             // A button physically held when the battery died sends no up.
             ControlOverlayView.shared.padReleaseAll("pad disconnected")
         }
@@ -1105,13 +1113,70 @@ final class HardwareInput: ObservableObject {
         }
     }
 
-    /// One sample of every connected pad. padQueue only.
+    // ========================================================================
+    // ml670 — THE ON-SCREEN CONTROLLER JOINS SLOT 0
+    //
+    // THE MERGE RULE, and why each half of it is what it is.
+    //   buttons  OR.   Two sources cannot disagree about a bit: either says
+    //                  pressed and it is pressed. This is also what a PC does
+    //                  with two XInput devices merged by a remapper.
+    //   triggers MAX.  Analogue, and a partially-pulled physical trigger must
+    //                  not cancel a fully-held on-screen one.
+    //   sticks   PHYSICAL WINS past its deadzone, else on-screen. NOT summed:
+    //            summing two sources that both rest near zero produces drift
+    //            with no user input at all, and a real thumb on a real stick is
+    //            unambiguously the more specific intent. Below the deadzone the
+    //            physical stick is saying nothing, so the screen gets it.
+    //
+    // THE PACKET INVARIANT IS UNTOUCHED: the bump is still `merged != last
+    // published`, so a game's `dwPacketNumber` still ticks on change and only
+    // on change — which is the one optimisation that field exists for.
+    // ========================================================================
+
+    /// The layout gained or lost its last virtual-controller control. Called
+    /// from `OnScreenPad.setPresent` on the main thread.
+    func padScreenPresence(_ present: Bool) {
+        if present {
+            padStartSampling()
+            startTicker()
+            xlog("pad0 on-screen source armed (physical=\(gamepadConnected ? "yes" : "no"))")
+        } else if !gamepadConnected {
+            padStopSampling()
+            // Clear the slot BEFORE standing the timer down, or the last merged
+            // sample would sit there forever reading as a connected pad.
+            padQueue.async { [weak self] in
+                winios_gamepad_set_state(0, nil)
+                self?.padLastPublished[0] = PadSnapshot()
+            }
+            xlog("pad0 on-screen source gone, slot cleared")
+        } else {
+            // A physical pad is still there; one more sample re-publishes it
+            // without the on-screen half.
+            padQueue.async { [weak self] in self?.padSample() }
+        }
+    }
+
+    /// An on-screen transition. Publish NOW rather than on the next 4 ms tick:
+    /// a button press that waits out a tick is a button press a 1 kHz-polling
+    /// game can miss entirely at the start of a frame.
+    func padScreenChanged() {
+        padQueue.async { [weak self] in self?.padSample() }
+    }
+
+    /// One sample of every connected pad, plus slot 0's on-screen half.
+    /// padQueue only.
     private func padSample() {
         padLock.lock(); let slots = padSlots; padLock.unlock()
+        let screen = OnScreenPad.shared.snapshot()
 
-        for (i, c) in slots.enumerated() {
-            guard let gp = c?.extendedGamepad else { continue }
-            let snap = Self.read(gp)
+        for i in 0..<slots.count {
+            let phys = slots[i]?.extendedGamepad.map(Self.read)
+            // Slot 0 is the one the layout can reach: wine presents it as
+            // XInput user 0, and two people cannot share one on-screen layout.
+            let useScreen = (i == 0 && screen.live)
+            guard phys != nil || useScreen else { continue }
+            let snap = useScreen ? Self.mergePad(physical: phys, screen: screen.sample)
+                                 : phys!
 
             if snap != padLastPublished[i] {
                 padLastPublished[i] = snap
@@ -1129,19 +1194,48 @@ final class HardwareInput: ObservableObject {
             // connected flag alive without a second code path.
             winios_gamepad_set_state(Int32(i), &st)
 
-            // The on-screen bindings follow pad 0, which is also the pad wine
-            // presents as XInput user 0. A second controller is a second XInput
-            // user and nothing else — two people cannot share one layout.
-            if i == 0 { padDriveBindings(snap) }
+            // The on-screen BINDINGS (ml668, a physical button pressing a
+            // key control) follow the PHYSICAL sample only — feeding them the
+            // merged one would make an on-screen A press its own bound control
+            // and, through a default binding, itself.
+            if i == 0, let p = phys { padDriveBindings(p) }
         }
 
         let now = CACurrentMediaTime()
-        if now - padStatAt >= 10.0, slots.contains(where: { $0 != nil }) {
+        if now - padStatAt >= 10.0, slots.contains(where: { $0 != nil }) || screen.live {
             padStatAt = now
             let s0 = padLastPublished[0]
-            xlog(String(format: "pad0 packets=%u last_buttons=0x%04x lx=%d ly=%d",
-                        padPackets[0], Int(s0.buttons), Int(s0.lx), Int(s0.ly)))
+            let src = slots[0] != nil ? (screen.live ? "both" : "phys")
+                                      : (screen.live ? "screen" : "none")
+            xlog(String(format: "pad0 packets=%u last_buttons=0x%04x lx=%d ly=%d src=%@",
+                        padPackets[0], Int(s0.buttons), Int(s0.lx), Int(s0.ly), src))
         }
+    }
+
+    /// XInput's own left/right thumb deadzone constants. Used here — and only
+    /// here — as the "is the physical stick saying anything at all?" test that
+    /// decides which source owns that stick this sample. A game's own deadzone
+    /// is still its own business (see `read`: nothing is pre-clamped).
+    private static let leftThumbDeadzone: Double = 7849
+    private static let rightThumbDeadzone: Double = 8689
+
+    static func mergePad(physical p: PadSnapshot?, screen s: PadSnapshot) -> PadSnapshot {
+        guard let p else { return s }
+        var m = PadSnapshot()
+        m.buttons = p.buttons | s.buttons
+        m.lt = max(p.lt, s.lt)
+        m.rt = max(p.rt, s.rt)
+        if hypot(Double(p.lx), Double(p.ly)) > leftThumbDeadzone {
+            m.lx = p.lx; m.ly = p.ly
+        } else {
+            m.lx = s.lx; m.ly = s.ly
+        }
+        if hypot(Double(p.rx), Double(p.ry)) > rightThumbDeadzone {
+            m.rx = p.rx; m.ry = p.ry
+        } else {
+            m.rx = s.rx; m.ry = s.ry
+        }
+        return m
     }
 
     /// Decide whether this sample is worth a main-queue hop, and make it.
@@ -1185,7 +1279,10 @@ final class HardwareInput: ObservableObject {
                 ov.padRelease(b.rawValue)
                 continue
             }
-            let d = TouchControlsModel.baseDiameter * CGFloat(c.scale)
+            // ml670: through the model's helper, so the layout-wide size
+            // slider moves the deadzone the binding path computes exactly as it
+            // moves the one the thumb path computes.
+            let d = TouchControlsModel.diameter(c)
             ov.padPress(b.rawValue, region: c.regionID,
                         kind: c.action.regionKind(diameter: d),
                         label: c.action.label)
@@ -1235,8 +1332,13 @@ final class HardwareInput: ObservableObject {
         if !map.isEmpty { return map }
 
         let order: [PadButton] = [.a, .b, .x, .y, .lb, .rb, .start, .back]
+        // ml670: a VIRTUAL controller button is never a default binding target.
+        // The physical button it would be bound to is already in the merge, so
+        // binding it here would press a control that does nothing with the
+        // press — and, for the matching button, bind the pad to itself.
         let buttons = controls.filter {
-            !$0.action.isStick && $0.action != .none && $0.action != .keyboardToggle
+            !$0.action.isStick && !$0.action.isGamepad
+                && $0.action != .none && $0.action != .keyboardToggle
         }
         for (i, c) in buttons.enumerated() where i < order.count { map[order[i]] = c }
         if let stick = controls.first(where: { $0.action.stickKeys != nil }) {

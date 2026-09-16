@@ -27,7 +27,7 @@ import os.log
 /// bounds. A tap on `displayModeToggle` (ContentView) cycles Fit -> Fill ->
 /// Stretch -> Fit and the choice persists via InputSettings.
 enum DisplayMode: String, CaseIterable {
-    case fit, fill, stretch, aspect
+    case fit, fill, stretch, aspect, fitHeight
 
     var label: String {
         switch self {
@@ -35,6 +35,7 @@ enum DisplayMode: String, CaseIterable {
         case .fill:    return "Fill"
         case .stretch: return "Stretch"
         case .aspect:  return "Aspect"
+        case .fitHeight: return "Fit height"
         }
     }
     var symbol: String {
@@ -43,6 +44,7 @@ enum DisplayMode: String, CaseIterable {
         case .fill:    return "arrow.up.left.and.arrow.down.right"
         case .stretch: return "rectangle.expand.vertical"
         case .aspect:  return "rectangle.ratio.16.to.9"
+        case .fitHeight: return "arrow.up.and.down.square"
         }
     }
     var next: DisplayMode {
@@ -50,7 +52,8 @@ enum DisplayMode: String, CaseIterable {
         case .fit:     return .fill
         case .fill:    return .stretch
         case .stretch: return .aspect
-        case .aspect:  return .fit
+        case .aspect:  return .fitHeight
+        case .fitHeight: return .fit
         }
     }
 }
@@ -79,9 +82,13 @@ enum GameSurfaceLayout {
         // stretched by the layer in every other mode; here the host view takes
         // the drawable's aspect so the layer scales it uniformly. Falls back to
         // Fit until the swapchain has published a drawable size.
-        let shape = (mode == .aspect && aspect.width > 0 && aspect.height > 0) ? aspect : guest
+        // Fit height: keep the presented aspect and always fill the view's
+        // full height, so a landscape game gets side bars but never top/bottom
+        // bars (a wider-than-view result is centred and cropped at the sides).
+        let useDrawable = (mode == .aspect || mode == .fitHeight) && aspect.width > 0 && aspect.height > 0
+        let shape = useDrawable ? aspect : guest
         let sx = bounds.width / shape.width, sy = bounds.height / shape.height
-        let scale = mode == .fill ? max(sx, sy) : min(sx, sy)
+        let scale = mode == .fill ? max(sx, sy) : (mode == .fitHeight ? sy : min(sx, sy))
         let w = shape.width * scale, h = shape.height * scale
         return CGRect(x: bounds.minX + (bounds.width - w) / 2,
                       y: bounds.minY + (bounds.height - h) / 2,
@@ -1731,13 +1738,44 @@ enum ControlRegionKind: Equatable {
     case aimStick(deadzone: CGFloat, travel: CGFloat)
     /// Raise/lower the iOS software keyboard.
     case keyboardToggle
-    /// Hit-tests and lights up, posts nothing: `.none` and the unwired pad
-    /// buttons. Deliberately still a region — swallowing the touch is the whole
-    /// point, or an inert button would swing the camera.
+    /// Hit-tests and lights up, posts nothing: `.none` and the legacy unwired
+    /// `.pad` glyph. Deliberately still a region — swallowing the touch is the
+    /// whole point, or an inert button would swing the camera.
     case inert
 
+    // ml670 — THE ON-SCREEN HALF OF XINPUT.
+    //
+    // These three are the touch-layer shapes of a VIRTUAL CONTROLLER. They post
+    // no keys and take no `InputGuard` owner: what they mutate is
+    // `OnScreenPad`, whose merged sample `HardwareInput` publishes into the
+    // same `winios_gamepad_set_state` slot a physical pad fills. So a game
+    // reading XInput cannot tell a thumb from a controller, which is the entire
+    // point — everything below the seqlock already works and needed nothing.
+
+    /// Hold one XInput button (or drive one analogue trigger to 255) for
+    /// exactly as long as the touch lasts.
+    case padButton(PadButton)
+    /// One cross-shaped control holding the four D-pad bits, 8-way snapped so a
+    /// diagonal sets two exactly as a real pad does.
+    case padDPad(deadzone: CGFloat)
+    /// Analogue thumbstick: deflection −1…1 per axis, scaled to XInput units
+    /// by `OnScreenPad`. `right` picks rx/ry over lx/ly.
+    case padStick(right: Bool, deadzone: CGFloat, travel: CGFloat)
+
     var isStick: Bool {
-        switch self { case .dirStick, .aimStick: return true; default: return false }
+        switch self {
+        case .dirStick, .aimStick, .padStick: return true
+        default: return false
+        }
+    }
+    /// Does this region contribute to the virtual controller? `register` and
+    /// `unregister` use it to decide whether slot 0 has an on-screen source at
+    /// all, which is what marks it connected with no physical pad attached.
+    var isPadKind: Bool {
+        switch self {
+        case .padButton, .padDPad, .padStick: return true
+        default: return false
+        }
     }
     var name: String {
         switch self {
@@ -1748,7 +1786,198 @@ enum ControlRegionKind: Equatable {
         case .aimStick:       return "aimstick"
         case .keyboardToggle: return "kbd"
         case .inert:          return "inert"
+        case .padButton:      return "padbtn"
+        case .padDPad:        return "paddpad"
+        case .padStick:       return "padstick"
         }
+    }
+}
+
+// ============================================================================
+// ml670 — THE VIRTUAL CONTROLLER
+//
+// WHY THIS IS A SEPARATE OBJECT AND NOT A FIELD ON `ControlOverlayView`.
+// The sample is produced on the MAIN thread (a touch) and consumed on
+// `HardwareInput.padQueue` (the 4 ms sampler). One lock-guarded aggregate with
+// a value-type snapshot is the whole of the thread story, and it is the same
+// story `PadSnapshot` already tells for the physical pad: built on one thread,
+// compared there, carried by copy.
+//
+// CONTRIBUTIONS ARE KEYED BY REGION, not accumulated as edges. The same rule
+// ml661 wrote for keys — state the SET, never the edges — for exactly the same
+// reason: a lost "up" from a cancelled touch would otherwise pin a button down
+// for the session, and that is the single most reported symptom in this file's
+// history. A region that stops contributing removes its entry; the aggregate is
+// recomputed from what is left, so nothing can leak.
+//
+// PRESENCE IS NOT PRESSURE. `present` counts REGISTERED pad controls, not held
+// ones: XInput's contract is that a connected controller answers with zeroes,
+// and a slot that only appears on the first press would read to a game as a
+// controller being hot-plugged mid-frame.
+// ============================================================================
+final class OnScreenPad {
+    static let shared = OnScreenPad()
+
+    /// What one region is contributing right now.
+    private struct Contribution {
+        var buttons: UInt16 = 0
+        var lt: UInt8 = 0, rt: UInt8 = 0
+        var lvec: CGSize?
+        var rvec: CGSize?
+    }
+
+    private let lock = NSLock()
+    private var parts: [String: Contribution] = [:]
+    /// What each region is CALLED, so the release line can name the button and
+    /// not the opaque region id — a log that says `A up` is readable, one that
+    /// says `ctl.3f1a90c2 up` is a lookup.
+    private var names: [String: String] = [:]
+    private var agg = HardwareInput.PadSnapshot()
+    private var present = 0
+
+    /// Diagnostics for the rate-limited `[xinput] onscreen …` line.
+    private var logged = 0
+    private var lastLogAt: CFTimeInterval = 0
+
+    /// The merged on-screen sample plus whether any pad control exists at all.
+    func snapshot() -> (sample: HardwareInput.PadSnapshot, live: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        return (agg, present > 0)
+    }
+
+    var isLive: Bool { lock.lock(); defer { lock.unlock() }; return present > 0 }
+
+    /// `ControlOverlayView.register`/`unregister` publish how many pad-kind
+    /// regions the layout currently has. The sampler has to be running for the
+    /// slot to stay connected, so a change either starts or stops it.
+    func setPresent(_ n: Int) {
+        lock.lock()
+        let was = present
+        present = n
+        lock.unlock()
+        guard (was > 0) != (n > 0) else { return }
+        fputs("[xinput] onscreen controls \(n > 0 ? "present" : "gone") (regions=\(n))\n", stderr)
+        HardwareInput.shared.padScreenPresence(n > 0)
+    }
+
+    // MARK: contributions (main thread)
+
+    func press(_ rid: String, _ b: PadButton) {
+        var c = Contribution()
+        switch b {
+        case .lt: c.lt = 255
+        case .rt: c.rt = 255
+        case .leftStick:  c.lvec = .zero      // a stick control held but centred
+        case .rightStick: c.rvec = .zero
+        default:  c.buttons = b.mask
+        }
+        apply(rid, c, log: b.label, down: true)
+    }
+
+    /// 8-way D-pad, `dir` the same 0-7 (0 = up, clockwise) the thumb sticks use,
+    /// −1 centred.
+    func dpad(_ rid: String, dir: Int) {
+        var c = Contribution()
+        let up = PadButton.dpadUp.mask, rt = PadButton.dpadRight.mask
+        let dn = PadButton.dpadDown.mask, lf = PadButton.dpadLeft.mask
+        switch dir {
+        case 0: c.buttons = up
+        case 1: c.buttons = up | rt
+        case 2: c.buttons = rt
+        case 3: c.buttons = dn | rt
+        case 4: c.buttons = dn
+        case 5: c.buttons = dn | lf
+        case 6: c.buttons = lf
+        case 7: c.buttons = up | lf
+        default: break
+        }
+        apply(rid, c, log: "D-pad\(dir)", down: dir >= 0)
+    }
+
+    /// Analogue deflection, −1…1 per axis, screen sense (y grows DOWN). XInput
+    /// reports y positive UP, so the one negation lives here and nowhere else.
+    func stick(_ rid: String, right: Bool, vec: CGSize) {
+        var c = Contribution()
+        if right { c.rvec = vec } else { c.lvec = vec }
+        apply(rid, c, log: right ? "R-stick" : "L-stick", down: vec != .zero)
+    }
+
+    func clear(_ rid: String) {
+        lock.lock()
+        guard parts.removeValue(forKey: rid) != nil else { lock.unlock(); return }
+        let name = names.removeValue(forKey: rid) ?? rid
+        let before = agg
+        recompute()
+        let after = agg
+        lock.unlock()
+        note("up", rid: name, before: before, after: after)
+        if before != after { HardwareInput.shared.padScreenChanged() }
+    }
+
+    func clearAll() {
+        lock.lock()
+        guard !parts.isEmpty else { lock.unlock(); return }
+        parts.removeAll()
+        names.removeAll()
+        let before = agg
+        recompute()
+        lock.unlock()
+        if before != agg { HardwareInput.shared.padScreenChanged() }
+    }
+
+    private func apply(_ rid: String, _ c: Contribution, log: String, down: Bool) {
+        lock.lock()
+        parts[rid] = c
+        names[rid] = log
+        let before = agg
+        recompute()
+        let after = agg
+        lock.unlock()
+        note(down ? "down" : "up", rid: log, before: before, after: after)
+        // Immediately, not on the next 4 ms tick: a transition is the one thing
+        // a gamepad reader must never have to wait for.
+        if before != after { HardwareInput.shared.padScreenChanged() }
+    }
+
+    /// lock held.
+    private func recompute() {
+        var b: UInt16 = 0, lt: UInt8 = 0, rt: UInt8 = 0
+        var lv = CGSize.zero, rv = CGSize.zero
+        for c in parts.values {
+            b |= c.buttons
+            lt = max(lt, c.lt)
+            rt = max(rt, c.rt)
+            // Sum then clamp: two controls both claiming a stick is a layout
+            // mistake, not a crash, and the clamp keeps the result legal.
+            if let v = c.lvec { lv.width += v.width; lv.height += v.height }
+            if let v = c.rvec { rv.width += v.width; rv.height += v.height }
+        }
+        var s = HardwareInput.PadSnapshot()
+        s.buttons = b
+        s.lt = lt; s.rt = rt
+        s.lx = Self.axis(lv.width);  s.ly = Self.axis(-lv.height)
+        s.rx = Self.axis(rv.width);  s.ry = Self.axis(-rv.height)
+        agg = s
+    }
+
+    private static func axis(_ v: CGFloat) -> Int16 {
+        let s = (Double(min(max(v, -1), 1)) * 32767.0).rounded()
+        return Int16(max(-32768.0, min(32767.0, s)))
+    }
+
+    /// Rate-limited so a stick held against the gate cannot bury the log: every
+    /// one of the first 64 transitions, then at most one a second.
+    private func note(_ what: String, rid: String, before: HardwareInput.PadSnapshot,
+                      after: HardwareInput.PadSnapshot) {
+        guard before != after else { return }
+        let now = CACurrentMediaTime()
+        guard logged < 64 || now - lastLogAt >= 1.0 else { return }
+        logged += 1
+        lastLogAt = now
+        fputs(String(format: "[xinput] onscreen %@ %@ buttons=0x%04x lt=%d rt=%d "
+                     + "lx=%d ly=%d rx=%d ry=%d\n", rid, what, Int(after.buttons),
+                     Int(after.lt), Int(after.rt), Int(after.lx), Int(after.ly),
+                     Int(after.rx), Int(after.ry)), stderr)
     }
 }
 
@@ -1869,6 +2098,9 @@ final class ControlOverlayView: UIView {
     func register(_ r: ControlRegion) {
         if regions[r.id] == nil { order.append(r.id) }
         regions[r.id] = r
+        // ml670: a re-register can turn a keyboard control into a pad control
+        // or back, so the count is recomputed rather than incremented.
+        publishPadPresence()
         startHealthMonitor()   // ml666: armed as soon as there is a control to lose
         r.pad?.center = CGPoint(x: r.frame.midX, y: r.frame.midY)
         // A region with no window behind it is a control that silently does
@@ -1901,6 +2133,15 @@ final class ControlOverlayView: UIView {
         }
         regions[id] = nil
         order.removeAll { $0 == id }
+        OnScreenPad.shared.clear(id)
+        publishPadPresence()
+    }
+
+    /// ml670: how many of the registered regions are virtual-controller
+    /// controls. A handful of regions exist at any time, so recounting on every
+    /// registration is cheaper than the bookkeeping that would avoid it.
+    private func publishPadPresence() {
+        OnScreenPad.shared.setPresent(regions.values.filter { $0.kind.isPadKind }.count)
     }
 
     /// Topmost-last: a region registered later wins an overlap.
@@ -2026,6 +2267,10 @@ final class ControlOverlayView: UIView {
         // goes the same way a finger does when the app stops being able to
         // observe input at all.
         padReleaseAll(why)
+        // ml670: and so does the virtual controller. `finish` above has already
+        // cleared every TRACKED region; this catches anything a lost callback
+        // left behind, which is the failure mode this whole valve exists for.
+        OnScreenPad.shared.clearAll()
     }
 
     private func begin(_ t: UITouch) {
@@ -2075,6 +2320,19 @@ final class ControlOverlayView: UIView {
             haptic()
         case .inert:
             break
+        // ml670 — the virtual controller. No InputGuard owner is taken: these
+        // hold no keys and no mouse buttons, and `OnScreenPad` is keyed by
+        // region, so `finish`'s unconditional `clear` is the whole release path.
+        case .padButton(let b):
+            OnScreenPad.shared.press(r.id, b)
+            haptic()
+        case .padDPad:
+            OnScreenPad.shared.dpad(r.id, dir: -1)
+            haptic()
+        case .padStick(let right, _, _):
+            face.vec = .zero
+            OnScreenPad.shared.stick(r.id, right: right, vec: .zero)
+            haptic()
         }
 
         if logs(tk.seq) {
@@ -2113,6 +2371,35 @@ final class ControlOverlayView: UIView {
                 applyHold(r, owner: tk.owner)
                 ControlFaces.state(r.id).down = true
             }
+        // ml670: a virtual button slides off and comes back exactly as a key
+        // does — same slack, same lapsed flag, so a thumb rolling off the edge
+        // releases the XInput bit instead of pinning it.
+        case .padButton(let b):
+            let inside = r.hit(p, slack: r.slideOff)
+            if !inside && !tk.lapsed {
+                tk.lapsed = true
+                tracked[key] = tk
+                OnScreenPad.shared.clear(r.id)
+                ControlFaces.state(r.id).down = false
+            } else if inside && tk.lapsed {
+                tk.lapsed = false
+                tracked[key] = tk
+                OnScreenPad.shared.press(r.id, b)
+                ControlFaces.state(r.id).down = true
+            }
+        case .padDPad(let dz):
+            let dir = snap(d, deadzone: dz)
+            let face = ControlFaces.state(r.id)
+            if face.dir != dir {
+                if face.dir == -1 && dir != -1 { haptic() }
+                face.dir = dir
+                OnScreenPad.shared.dpad(r.id, dir: dir)
+            }
+        case .padStick(let right, let dz, let travel):
+            let v = deflect(d, deadzone: dz, travel: travel)
+            ControlFaces.state(r.id).vec = v
+            r.pad?.vec = v
+            OnScreenPad.shared.stick(r.id, right: right, vec: v)
         case .tapKey, .keyboardToggle, .inert:
             break
         }
@@ -2144,6 +2431,9 @@ final class ControlOverlayView: UIView {
         InputGuard.shared.release(tk.owner)
         AimStickDriver.shared.steer(tk.owner, .zero)
         AimStickDriver.shared.end(tk.owner)
+        // ml670: and in the third. Also a no-op for a region that contributed
+        // nothing, so there is still no case to get right.
+        OnScreenPad.shared.clear(tk.region)
 
         let face = ControlFaces.state(tk.region)
         face.down = false
@@ -2257,6 +2547,13 @@ final class ControlOverlayView: UIView {
             // A stick control bound to a BUTTON holds nothing — the button has
             // no direction to steer with. It still takes the hold so the face
             // lights and the binding is visibly doing something.
+            break
+        case .padButton, .padDPad, .padStick:
+            // ml670: a PHYSICAL button bound to a VIRTUAL controller button is
+            // a remap of the pad onto itself, and the physical sample is
+            // already in the merge — pressing it here would double-count and,
+            // worse, fight the finger for a region-keyed contribution. The face
+            // still lights, so the binding is visibly doing something.
             break
         }
         fputs("[input] pad \(button) down on \(rid) (\(label)) kind=\(kind.name)\n", stderr)
@@ -2415,8 +2712,8 @@ final class ControlOverlayView: UIView {
             guard let r = regions[tk.region] else { continue }
             let f = ControlFaces.state(r.id)
             switch r.kind {
-            case .dirStick: sticks.append("\(r.id)=dir\(f.dir)")
-            case .aimStick:
+            case .dirStick, .padDPad: sticks.append("\(r.id)=dir\(f.dir)")
+            case .aimStick, .padStick:
                 let v = f.vec ?? .zero
                 sticks.append(String(format: "%@=(%.2f,%.2f)", r.id, v.width, v.height))
             default: buttons.append(r.id + (tk.lapsed ? "(off)" : ""))
@@ -3161,6 +3458,12 @@ struct ContentView: View {
     private var actionButtons: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 12) {
+                Button("Enable JIT") {
+                    enableJITViaStikDebug()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.blue)
+
                 Button("Wine Virtual Desktop") {
                     // S3-pre R2v2: raw rpcss.exe CANNOT run standalone —
                     // its wmain unconditionally StartServiceCtrlDispatcherW's
@@ -3194,12 +3497,6 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.mint)
-
-                Button("Enable JIT") {
-                    enableJITViaStikDebug()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.blue)
 
                 // Every shipped launch target gets its own button here, same
                 // style as Wine Virtual Desktop / Enable JIT above. Bitness is
@@ -3791,6 +4088,32 @@ struct ContentView: View {
                 }
             }
 
+            // ml962: the 512MB JIT-pool dump is now OPT-IN.
+            //
+            // signal_arm64_ios.c writes the WHOLE RW alias to
+            // Documents/fex-jit-dump.bin on the first unhandled exec fault and
+            // again on the first ILL — an offline-disassembly aid from ml347 that
+            // nothing in a normal run wants. At today's pool sizes that is a
+            // 512-896MB file written synchronously from a fault handler, into the
+            // folder the user syncs, every time a guest faults. m56 produced one.
+            //
+            // MADEIRA_JIT_DUMP=1 (via Documents/madeira-env.txt, which the block
+            // above already passes through) turns it back on. Default off, and the
+            // stale file from an earlier run is deleted here so it cannot keep
+            // occupying half a gigabyte of the user's storage forever.
+            let jitDumpOn = (getenv("MADEIRA_JIT_DUMP").map { String(cString: $0) } ?? "0") != "0"
+            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+                let dump = d.appendingPathComponent("fex-jit-dump.bin")
+                if jitDumpOn {
+                    logStore.log("JIT pool dump ARMED (MADEIRA_JIT_DUMP=1) — the first unhandled guest " +
+                                 "fault will write the whole pool to Documents/fex-jit-dump.bin")
+                } else if let sz = (try? FileManager.default.attributesOfItem(atPath: dump.path)[.size]) as? Int {
+                    try? FileManager.default.removeItem(at: dump)
+                    logStore.log("Removed stale Documents/fex-jit-dump.bin (\(sz / 1024 / 1024)MB) — " +
+                                 "set MADEIRA_JIT_DUMP=1 in madeira-env.txt to collect one")
+                }
+            }
+
             // ===== FEX JIT settings (ml900) =====================================
             // Generic passthrough for FEX's own configuration, same shape as the
             // DXMT block above. Madeira ships no /usr/share/fex-emu/Config.json and
@@ -4028,11 +4351,14 @@ struct ContentView: View {
                 // executing with no JIT pool, and it cost a diagnostic cycle plus a
                 // wrong conclusion I wrote into the source. A run without the pool can
                 // only manufacture misleading secondary crashes, so refuse to start one.
-                logStore.log("JIT pool allocation FAILED — not starting Wine.", level: .error)
-                logStore.log("  All placements landed in the forbidden guest 64G window.", level: .info)
-                logStore.log("  Force-quit and relaunch: placement is chosen by the kernel", level: .info)
-                logStore.log("  and depends on current memory layout, so a fresh process", level: .info)
-                logStore.log("  usually lands somewhere valid.", level: .info)
+                // ml962: the reason is printed by allocatePool itself, on the
+                // [jit-pool] lines directly above — it knows whether the debugger
+                // was gone, whether every placement was rejected, or whether a
+                // cached pool had been torn down. This used to assert "all
+                // placements landed in the forbidden guest 64G window" no matter
+                // what actually happened, which sent m56's diagnosis after an
+                // address-space problem that did not exist.
+                logStore.log("JIT pool unavailable — not starting Wine (see the [jit-pool] lines above).", level: .error)
                 logStore.uiPaused = false
                 return
             }
@@ -4481,6 +4807,81 @@ enum PadButton: String, Codable, CaseIterable, Hashable, Identifiable {
         case .rightStick: return "R-stick"
         }
     }
+
+    // ========================================================================
+    // ml670 — HOW A VIRTUAL ONE OF THESE IS DRAWN.
+    //
+    // Put on the button and not in the view because the shape IS part of the
+    // button's identity: a rounded rect says "shoulder", a capsule says
+    // "system", a coloured circle says "face". A user who has ever held a
+    // controller reads the layout without reading a single label, and the view
+    // then has one switch instead of four.
+    // ========================================================================
+
+    /// Xbox face colours. Everything else is uncoloured — a wash of tint on
+    /// every button would make the four that MEAN something unreadable.
+    var tint: Color? {
+        switch self {
+        case .a: return Color(red: 0.36, green: 0.76, blue: 0.30)
+        case .b: return Color(red: 0.88, green: 0.28, blue: 0.24)
+        case .x: return Color(red: 0.24, green: 0.53, blue: 0.92)
+        case .y: return Color(red: 0.96, green: 0.76, blue: 0.16)
+        default: return nil
+        }
+    }
+
+    /// SF Symbol drawn instead of a label, for the four D-pad directions.
+    var glyph: String? {
+        switch self {
+        case .dpadUp:    return "arrowtriangle.up.fill"
+        case .dpadDown:  return "arrowtriangle.down.fill"
+        case .dpadLeft:  return "arrowtriangle.left.fill"
+        case .dpadRight: return "arrowtriangle.right.fill"
+        default: return nil
+        }
+    }
+
+    /// The label drawn ON the control, which is not always the label used in
+    /// the chip: "Start"/"Back" become small caps in a capsule.
+    var faceLabel: String {
+        switch self {
+        case .start: return "START"
+        case .back:  return "BACK"
+        default:     return label
+        }
+    }
+
+    enum Face { case round, wide, capsule, small, stick }
+
+    var face: Face {
+        switch self {
+        case .a, .b, .x, .y:                             return .round
+        case .lb, .rb, .lt, .rt:                         return .wide
+        case .start, .back:                              return .capsule
+        case .l3, .r3:                                   return .small
+        case .leftStick, .rightStick:                    return .stick
+        case .dpadUp, .dpadDown, .dpadLeft, .dpadRight:  return .round
+        }
+    }
+
+    /// Drawn size, given the layout's base diameter for a round button.
+    func size(diameter d: CGFloat) -> CGSize {
+        switch face {
+        case .round, .stick: return CGSize(width: d, height: d)
+        case .wide:          return CGSize(width: d * 1.50, height: d * 0.66)
+        case .capsule:       return CGSize(width: d * 0.70, height: d * 0.35)
+        case .small:         return CGSize(width: d * 0.72, height: d * 0.72)
+        }
+    }
+
+    /// Round controls hit-test as circles so neighbouring ones cannot steal
+    /// each other's corners; the oblong ones must not.
+    var circularHit: Bool {
+        switch face {
+        case .round, .small, .stick: return true
+        case .wide, .capsule:        return false
+        }
+    }
 }
 
 /// What a control does when pressed. Codable with associated values so the
@@ -4494,7 +4895,22 @@ enum ControlAction: Codable, Equatable, Hashable {
     case joystickArrows      // renders as a stick, posts the arrow keys
     case joystickMouse       // ml660: renders as a stick, posts relative mouse motion
     case keyboardToggle      // raises the iOS keyboard, as in portrait
-    case pad(String)         // ml645: Xbox button. NOT WIRED — see the panel.
+    case pad(String)         // ml645: Xbox button. NEVER WIRED — see below.
+
+    // ml670 — THE VIRTUAL CONTROLLER, as an action.
+    //
+    // WHY A NEW CASE AND NOT A REVIVAL OF `.pad(String)`. That case carried a
+    // free-form STRING, which is why it could never be wired: nothing could
+    // turn "A" into an XInput bit without a lookup that would silently miss on
+    // any spelling nobody thought of, and a layout on disk could name a button
+    // that does not exist. `PadButton` is the closed set, it already owns the
+    // `mask`, and it is already raw-value Codable. `.pad` stays only so a
+    // layout saved before this build still DECODES; it draws dimmed, hit-tests
+    // as `.inert`, and the panel migrates it on the first tap.
+    case gamepad(PadButton)
+    /// One cross-shaped control carrying all four D-pad directions. Not a
+    /// `PadButton` — there is no such physical button; it is four of them.
+    case gamepadDPad
 
     /// The four keys a stick drives, up/right/down/left. nil for non-sticks.
     var stickKeys: [Int32]? {
@@ -4507,7 +4923,15 @@ enum ControlAction: Codable, Equatable, Hashable {
     /// ml660: the aim stick drives no keys at all, so `stickKeys` cannot
     /// identify it — but it must still LOOK and hit-test like a stick.
     var isMouseStick: Bool { self == .joystickMouse }
-    var isStick: Bool { stickKeys != nil || isMouseStick }
+    /// ml670: the `PadButton` this control IS, if it is a virtual controller
+    /// button. nil for every keyboard/mouse control and for the D-pad cross,
+    /// which is four buttons and not one.
+    var padButton: PadButton? { if case .gamepad(let b) = self { return b }; return nil }
+    var isGamepad: Bool {
+        if case .gamepad = self { return true }
+        return self == .gamepadDPad
+    }
+    var isStick: Bool { stickKeys != nil || isMouseStick || padButton?.isStick == true }
     /// ml660: SF Symbol drawn in the face, distinguishing sticks from each
     /// other. The key sticks stay plain (they were shipped that way and are
     /// told apart by their label); the aim stick is marked.
@@ -4524,8 +4948,28 @@ enum ControlAction: Codable, Equatable, Hashable {
         case .joystickArrows:  return "↕"
         case .joystickMouse:   return "AIM"
         case .pad(let n):      return n
+        case .gamepad(let b):  return b.label
+        case .gamepadDPad:     return "D-pad"
         case .key(let vk):     return ControlAction.keyLabel(vk)
         }
+    }
+
+    /// ml670 — the DRAWN size of this control, and whether its hit region is a
+    /// circle. Everything that used to assume "one round button, `baseDiameter`
+    /// across" goes through here now, because a shoulder button is oblong and a
+    /// Start capsule is small, and the touch region has to be the SAME rect the
+    /// user sees or the control is dead exactly where it looks alive.
+    func controlSize(diameter d: CGFloat) -> CGSize {
+        if let b = padButton { return b.size(diameter: d) }
+        if self == .gamepadDPad { return CGSize(width: d * 1.55, height: d * 1.55) }
+        return CGSize(width: d, height: d)
+    }
+    var circularHit: Bool {
+        if let b = padButton { return b.circularHit }
+        // The cross's four diagonals live in the CORNERS of its square, which a
+        // circular hit test is precisely what would cut off.
+        if self == .gamepadDPad { return false }
+        return true
     }
 
     /// Minimal for pass 1 — the full VK table arrives with the mapping panel.
@@ -4586,6 +5030,27 @@ final class TouchControlsModel: ObservableObject {
     @Published var editing = false              // transient, never persisted
     @Published var selected: UUID?              // transient
 
+    /// ml670 — ONE SIZE KNOB FOR THE WHOLE LAYOUT, 0.5…2.0.
+    ///
+    /// The pinch that already exists scales ONE control, which is the right
+    /// tool for "this button is too small" and the wrong one for "everything is
+    /// too small on this phone" — a user with a dozen controls would have to
+    /// pinch each one and would not get them consistent. This multiplies every
+    /// control's own `scale`, so the two compose: a deliberately-huge stick
+    /// stays proportionally huge when the whole layout shrinks.
+    ///
+    /// Global rather than per-orientation because the layout itself is global:
+    /// there is one `controls` array and it is landscape-only.
+    @Published var sizeScale: Double = 1.0      { didSet { save() } }
+
+    /// THE one place a control's drawn diameter is computed. Every caller —
+    /// the view, the mapping panel's placement, the physical-pad binding path —
+    /// goes through it, or the touch region and the pixels drift apart the
+    /// first time the slider moves.
+    static func diameter(_ c: TouchControl) -> CGFloat {
+        baseDiameter * CGFloat(c.scale) * CGFloat(shared.sizeScale)
+    }
+
     /// The HUD cluster's (controller/pencil buttons, TouchControlsOverlay.
     /// topBar) actual on-screen frame, in the same window coordinate space
     /// `ControlsWindow.hitTest` runs in — published every render via a
@@ -4602,7 +5067,16 @@ final class TouchControlsModel: ObservableObject {
             .appendingPathComponent("madeira-controls.json")
     }
 
-    private struct Saved: Codable { var controls: [TouchControl]; var visible: Bool }
+    /// `sizeScale` is OPTIONAL, not defaulted. The synthesised decoder uses
+    /// `decodeIfPresent` only for Optionals — a non-optional with a default
+    /// value still THROWS on a missing key, which would make every layout
+    /// written before this build fail to decode and silently reset to empty.
+    /// Same reasoning, and the same shape, as `TouchControl.padBinding`.
+    private struct Saved: Codable {
+        var controls: [TouchControl]
+        var visible: Bool
+        var sizeScale: Double?
+    }
 
     private init() {
         loading = true
@@ -4610,13 +5084,15 @@ final class TouchControlsModel: ObservableObject {
            let s = try? JSONDecoder().decode(Saved.self, from: d) {
             controls = s.controls
             visible  = s.visible
+            sizeScale = min(max(s.sizeScale ?? 1.0, 0.5), 2.0)
         }
         loading = false
     }
 
     private func save() {
         guard !loading else { return }
-        guard let d = try? JSONEncoder().encode(Saved(controls: controls, visible: visible))
+        guard let d = try? JSONEncoder().encode(
+            Saved(controls: controls, visible: visible, sizeScale: sizeScale))
         else { return }
         try? d.write(to: Self.url, options: .atomic)
     }
@@ -4774,6 +5250,10 @@ struct TouchControlsOverlay: View {
                         }
                     }
                     topBar(in: geo)
+                    // ml670: edit mode only. In play mode there is nothing to
+                    // adjust and a slider under the thumb would be a control
+                    // that eats a press.
+                    if m.editing { sizeBar(in: geo) }
                     if m.editing, let i = m.index(of: m.selected) {
                         MappingPanel(control: m.controls[i], screen: geo.size)
                     }
@@ -4899,6 +5379,41 @@ struct TouchControlsOverlay: View {
             DispatchQueue.main.async { m.hudClusterRect = f }
             return Color.clear
         })
+    }
+
+    /// ml670 — THE LAYOUT-WIDE SIZE SLIDER.
+    ///
+    /// Rides just under the HUD cluster, so it follows the cluster wherever the
+    /// user has dragged it and never has to be hunted for. It is safe to put a
+    /// SwiftUI gesture here and nowhere else: while `editing` is set,
+    /// `ControlsWindow.hitTest` hands the whole screen to the hosting view and
+    /// `ControlOverlayView.region(at:)` returns nil, so the touch layer is
+    /// standing down and there is nothing for the slider to fight with.
+    ///
+    /// It multiplies rather than replaces each control's own pinch scale — see
+    /// `TouchControlsModel.sizeScale`.
+    private func sizeBar(in geo: GeometryProxy) -> some View {
+        let base = hudBaseCenter(in: geo)
+        let w: CGFloat = min(300, geo.size.width - 40)
+        return HStack(spacing: 10) {
+            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                .font(.system(size: 13))
+                .foregroundStyle(.white.opacity(0.75))
+            Slider(value: $m.sizeScale, in: 0.5...2.0)
+                .tint(.white.opacity(0.85))
+            Text("\(Int((m.sizeScale * 100).rounded()))%")
+                .font(.system(size: 12, weight: .medium).monospacedDigit())
+                .foregroundStyle(.white.opacity(0.85))
+                .frame(width: 44, alignment: .trailing)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .frame(width: w)
+        .background(GlassShape())
+        .position(x: min(max(base.x + hudDragState.width, w / 2 + 8),
+                         geo.size.width - w / 2 - 8),
+                  y: min(base.y + hudDragState.height + 48,
+                         geo.size.height - 30))
     }
 
     /// Small drag handle, leading edge of the cluster. A LongPressGesture
@@ -5031,6 +5546,17 @@ extension ControlAction {
             return .dirStick(quad: stickKeys ?? [], deadzone: diameter * 0.22)
         case .joystickMouse:
             return .aimStick(deadzone: diameter * 0.12, travel: diameter * 0.55)
+        // ml670: deadzone and travel scale with the DRAWN size exactly as the
+        // keyboard sticks' do, so a stick made bigger by the size slider still
+        // wants a proportionally bigger thumb throw.
+        case .gamepad(let b):
+            if b.isStick {
+                return .padStick(right: b == .rightStick,
+                                 deadzone: diameter * 0.12, travel: diameter * 0.42)
+            }
+            return .padButton(b)
+        case .gamepadDPad:
+            return .padDPad(deadzone: diameter * 0.26)
         }
     }
 }
@@ -5060,21 +5586,163 @@ struct TouchControlButton: View {
         _face = ObservedObject(wrappedValue: ControlFaces.state(id))
     }
 
-    private var diameter: CGFloat { TouchControlsModel.baseDiameter * CGFloat(control.scale) }
+    /// ml670: the layout-wide size slider multiplies this control's own pinch.
+    private var diameter: CGFloat { TouchControlsModel.diameter(control) }
     private var isStick: Bool { control.action.isStick }
     private var isSelected: Bool { m.editing && m.selected == control.id }
     private var isDown: Bool { face.down }
+    /// ml670: the DRAWN rect. Square for everything that was here before; a
+    /// shoulder button, a Start capsule and the D-pad cross are not square, and
+    /// `.controlRegion` is attached after this frame so the touch region is
+    /// exactly what is on screen.
+    private var boxSize: CGSize { control.action.controlSize(diameter: diameter) }
+
+    // ------------------------------------------------------------------
+    // ml670 — VIRTUAL CONTROLLER FACES
+    //
+    // WHY THIS EXISTS AT ALL: every one of these used to draw the letter "L".
+    // A control is created with `action = .mouseLeft` (so a brand-new button is
+    // usable before anything is mapped), `.mouseLeft.label` is "L", and the
+    // controller tab only ever set `padBinding` — a SECOND property that does
+    // not touch `action`. So a user who added a button and chose "A" on the
+    // controller tab got a left-mouse button, drawn "L", pressing nothing on a
+    // pad. The action is now what says "this IS an A button", and the drawing
+    // follows the action.
+    // ------------------------------------------------------------------
+
+    /// The edit-mode selection ring and the resting outline, in whatever shape
+    /// this control actually is.
+    @ViewBuilder private var outline: some View {
+        let o = isSelected ? 0.95 : (isStick || control.action == .gamepadDPad ? 0 : 0.28)
+        let w: CGFloat = isSelected ? 2 : 1
+        switch control.action.padButton?.face {
+        case .some(.wide):
+            RoundedRectangle(cornerRadius: boxSize.height * 0.30)
+                .stroke(.white.opacity(o), lineWidth: w)
+        case .some(.capsule):
+            Capsule().stroke(.white.opacity(o), lineWidth: w)
+        default:
+            if control.action == .gamepadDPad {
+                RoundedRectangle(cornerRadius: boxSize.width * 0.16)
+                    .stroke(.white.opacity(isSelected ? 0.95 : 0), lineWidth: w)
+            } else {
+                Circle().stroke(.white.opacity(o), lineWidth: w)
+            }
+        }
+    }
+
+    @ViewBuilder private func padFace(_ b: PadButton) -> some View {
+        switch b.face {
+        case .round:
+            ZStack {
+                GlassShape(circle: true)
+                if let t = b.tint {
+                    // Translucent like every other control — the tint is a hue
+                    // on the glass, not a solid disc, or the four face buttons
+                    // would be the only opaque things on the screen.
+                    Circle().fill(t.opacity(isDown ? 0.62 : 0.34))
+                }
+                if let g = b.glyph {
+                    Image(systemName: g)
+                        .font(.system(size: boxSize.height * 0.40, weight: .semibold))
+                        .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.88))
+                } else {
+                    Text(b.faceLabel)
+                        .font(.system(size: boxSize.height * 0.42, weight: .semibold))
+                        .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.92))
+                }
+            }
+        case .small:
+            ZStack {
+                GlassShape(circle: true)
+                Text(b.faceLabel)
+                    .font(.system(size: boxSize.height * 0.36, weight: .semibold))
+                    .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.85))
+            }
+        case .wide:
+            ZStack {
+                RoundedRectangle(cornerRadius: boxSize.height * 0.30)
+                    .fill(.ultraThinMaterial)
+                    .opacity(isDown ? 1.0 : 0.85)
+                Text(b.faceLabel)
+                    .font(.system(size: boxSize.height * 0.40, weight: .semibold))
+                    .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.88))
+            }
+        case .capsule:
+            ZStack {
+                Capsule().fill(.ultraThinMaterial).opacity(isDown ? 1.0 : 0.85)
+                Text(b.faceLabel)
+                    .font(.system(size: boxSize.height * 0.44, weight: .semibold))
+                    .kerning(0.6)
+                    .minimumScaleFactor(0.5)
+                    .lineLimit(1)
+                    .padding(.horizontal, 4)
+                    .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.85))
+            }
+        case .stick:
+            // Unreachable: `isStick` catches the two sticks before padFace is
+            // called. Present so the switch is exhaustive without a `default`,
+            // which is what makes a new PadButton a compile error here.
+            EmptyView()
+        }
+    }
+
+    /// ONE cross, not four buttons. A real D-pad's diagonals are its corners,
+    /// and four separate circles cannot produce one without two thumbs — which
+    /// is exactly the thing an 8-way snap over a single region gives for free,
+    /// using the same `snap` the thumbsticks already use.
+    private var dpadCross: some View {
+        let w = boxSize.width
+        let arm = w * 0.36
+        let r = arm * 0.28
+        // 0 up, clockwise. A diagonal lights BOTH of its arms, because it is
+        // holding both bits.
+        func lit(_ dir: Int) -> Bool {
+            guard face.dir >= 0 else { return false }
+            let d = face.dir
+            switch dir {
+            case 0: return d == 7 || d == 0 || d == 1
+            case 2: return d == 1 || d == 2 || d == 3
+            case 4: return d == 3 || d == 4 || d == 5
+            default: return d == 5 || d == 6 || d == 7
+            }
+        }
+        func arrow(_ g: String, _ dir: Int, _ dx: CGFloat, _ dy: CGFloat) -> some View {
+            Image(systemName: g)
+                .font(.system(size: arm * 0.46, weight: .semibold))
+                .foregroundStyle(.white.opacity(lit(dir) ? 1.0 : 0.55))
+                .offset(x: dx * w * 0.33, y: dy * w * 0.33)
+        }
+        return ZStack {
+            RoundedRectangle(cornerRadius: r).fill(.ultraThinMaterial)
+                .frame(width: w, height: arm)
+            RoundedRectangle(cornerRadius: r).fill(.ultraThinMaterial)
+                .frame(width: arm, height: w)
+            arrow("arrowtriangle.up.fill",    0,  0, -1)
+            arrow("arrowtriangle.right.fill", 2,  1,  0)
+            arrow("arrowtriangle.down.fill",  4,  0,  1)
+            arrow("arrowtriangle.left.fill",  6, -1,  0)
+        }
+        .frame(width: w, height: w)
+    }
 
     var body: some View {
         ZStack {
             if isStick {
                 // Reuse the portrait pad's face so both look and animate the
                 // same; scale it to whatever size this control was pinched to.
+                // ml670: a VIRTUAL thumbstick uses the identical face — a stick
+                // is a stick, and drawing it any other way would be the second
+                // stick idiom on one screen.
                 JoystickFace(held: isDown, dir: face.dir, alwaysExpanded: true,
                              vec: face.vec, glyph: control.action.stickGlyph)
                     .frame(width: JoystickFace.padRadius * 2,
                            height: JoystickFace.padRadius * 2)
                     .scaleEffect(diameter / (JoystickFace.padRadius * 2))
+            } else if control.action == .gamepadDPad {
+                dpadCross
+            } else if let b = control.action.padButton {
+                padFace(b)
             } else {
                 GlassShape(circle: true)
                 Text(control.action.label)
@@ -5084,10 +5752,8 @@ struct TouchControlButton: View {
                                                     : (isDown ? 1.0 : 0.85)))
             }
         }
-        .frame(width: diameter, height: diameter)
-        .overlay(Circle().stroke(.white.opacity(isSelected ? 0.95
-                                                : (isStick ? 0 : 0.28)),
-                                 lineWidth: isSelected ? 2 : 1))
+        .frame(width: boxSize.width, height: boxSize.height)
+        .overlay(outline)
         // A stick must not shrink under the thumb; only round buttons do that.
         .scaleEffect(!isStick && isDown ? 0.92 : 1.0)
         .animation(.easeOut(duration: 0.08), value: isDown)
@@ -5116,7 +5782,7 @@ struct TouchControlButton: View {
         // control and still reports its FINAL placed rect in .global.
         .controlRegion(rid, control.action.label,
                        control.action.regionKind(diameter: diameter),
-                       circular: true)
+                       circular: control.action.circularHit)
         .position(x: CGFloat(control.nx) * screen.width,
                   y: CGFloat(control.ny) * screen.height)
         // Edit mode only; see the type comment.
@@ -5180,7 +5846,12 @@ struct MappingPanel: View {
     private var layout: Placement {
         let cx = CGFloat(control.nx) * screen.width
         let cy = CGFloat(control.ny) * screen.height
-        let r  = TouchControlsModel.baseDiameter * CGFloat(control.scale) / 2
+        // ml670: the control's real half-extent, which now depends on its SHAPE
+        // (a D-pad cross is half again as wide as a button) and on the
+        // layout-wide size slider. The larger half-axis, so the panel clears it
+        // whichever side it ends up on.
+        let box = control.action.controlSize(diameter: TouchControlsModel.diameter(control))
+        let r  = max(box.width, box.height) / 2
         let gap: CGFloat = 14, edge: CGFloat = 8
 
         for size in [CGSize(width: 340, height: 236),
@@ -5286,8 +5957,38 @@ struct MappingPanel: View {
     // xinput1_3 reads the same sample through win32u). These bindings are for
     // the majority of titles, which read the keyboard and the mouse and have
     // never heard of a controller.
+    // ml670 — AND THE TAB NOW HAS TWO HALVES, because there are two genuinely
+    // different things a controller can mean for one control and conflating
+    // them is what shipped a screen full of buttons labelled "L".
+    //
+    //   MAKE IT a controller button  → sets `action`. The control IS an XInput
+    //     button: it draws like one and a game polling XInput sees it pressed.
+    //   ALSO PRESSED BY              → sets `padBinding`. The control keeps
+    //     doing whatever the keyboard tab says, and a PHYSICAL button is a
+    //     second finger on it.
+    //
+    // Both at once is legal and occasionally useful; neither implies the other.
     private var controllerTab: some View {
         VStack(alignment: .leading, spacing: 12) {
+            Text("Make this control a virtual controller button. A game that "
+                 + "reads XInput sees it as controller 1, with or without a "
+                 + "physical pad plugged in.")
+                .font(.system(size: 11))
+                .foregroundStyle(.white.opacity(0.62))
+                .fixedSize(horizontal: false, vertical: true)
+            actionSection("Face buttons", [.gamepad(.a), .gamepad(.b),
+                                           .gamepad(.x), .gamepad(.y)])
+            actionSection("Bumpers & triggers", [.gamepad(.lb), .gamepad(.rb),
+                                                 .gamepad(.lt), .gamepad(.rt)])
+            actionSection("D-pad", [.gamepadDPad, .gamepad(.dpadUp),
+                                    .gamepad(.dpadDown), .gamepad(.dpadLeft),
+                                    .gamepad(.dpadRight)])
+            actionSection("Sticks & clicks", [.gamepad(.leftStick), .gamepad(.rightStick),
+                                              .gamepad(.l3), .gamepad(.r3)])
+            actionSection("System", [.gamepad(.start), .gamepad(.back)])
+
+            Rectangle().fill(.white.opacity(0.15)).frame(height: 1).padding(.vertical, 2)
+
             Text("Also press this control with a physical controller button. "
                  + "Games that read XInput get the controller either way.")
                 .font(.system(size: 11))
@@ -5351,6 +6052,12 @@ struct MappingPanel: View {
                     .fill(.white.opacity(on ? 0.36 : 0.12)))
         }
         .buttonStyle(.plain)
+    }
+
+    /// ml670: a row of chips that set `action`, labelled by the action itself —
+    /// no second label table to drift out of step with what the control draws.
+    private func actionSection(_ title: String, _ actions: [ControlAction]) -> some View {
+        section(title, actions.map { ($0.label, $0) })
     }
 
     private func section(_ title: String, _ items: [(String, ControlAction)]) -> some View {

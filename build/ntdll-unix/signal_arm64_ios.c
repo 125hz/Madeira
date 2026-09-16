@@ -126,6 +126,30 @@ void ios_mono_bridge_capture( unsigned long long teb, unsigned long long frame,
                               unsigned long long host_pc, unsigned long long fault_addr );
 
 
+/* ml962: is the JIT-pool dump armed?
+ *
+ * The two one-shot dumps below (unhandled exec fault; ILL diagnosis) were added
+ * in ml347 to disassemble FEX output offline. They write the ENTIRE RW alias --
+ * 512MB at today's direct-launch default, 896MB under a desktop session --
+ * synchronously, from inside a fault handler, into the app's Documents folder,
+ * which is the folder the user syncs. A single unhandled guest fault therefore
+ * cost m56 a half-gigabyte file and the stall to produce it, for a diagnostic
+ * nobody had asked for.
+ *
+ * Default OFF. MADEIRA_JIT_DUMP=1 (Documents/madeira-env.txt passes it through)
+ * arms it. Cached: this is read on a fault path. */
+static int ios_jit_dump_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv( "MADEIRA_JIT_DUMP" );
+        cached = (v && *v && strcmp( v, "0" )) ? 1 : 0;
+    }
+    return cached;
+}
+
+
 /* ml255: storm gate -- see ios_storm_gate in virtual_ios.c for the rationale
  * (510 MB log from a 524k-iteration NULL-deref loop). */
 static int ios_sig_storm_gate( unsigned long *n )
@@ -5030,7 +5054,8 @@ skip_reclaim_band: ;
                      * slots to a file. Lets us disassemble FEX-emitted ARM64 offline
                      * to verify codegen correctness independently. */
                     static volatile int dumped = 0;
-                    if (cnt == 1 && __sync_bool_compare_and_swap(&dumped, 0, 1))
+                    if (cnt == 1 && ios_jit_dump_enabled() &&
+                        __sync_bool_compare_and_swap(&dumped, 0, 1))
                     {
                         extern void *ios_jit_rw_base_global;
                         extern size_t ios_jit_pool_size_global;
@@ -9800,7 +9825,8 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *sigcontext )
          * fire for ILL since we deliver via setup_exception). One-shot. */
         {
             static volatile int ill_dumped = 0;
-            if (__sync_bool_compare_and_swap(&ill_dumped, 0, 1)) {
+            if (ios_jit_dump_enabled() &&
+                __sync_bool_compare_and_swap(&ill_dumped, 0, 1)) {
                 extern void *ios_jit_rw_base_global;
                 extern size_t ios_jit_pool_size_global;
                 if (ios_jit_rw_base_global && ios_jit_pool_size_global) {

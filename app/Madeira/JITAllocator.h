@@ -28,6 +28,17 @@ void jit_region_destroy(JITRegion *region);
 /// changes nothing if the private ownership API refuses.
 bool jit_make_region_no_footprint(void *addr, size_t size, const char *label);
 
+/// ml962: is [addr, addr+size) still MAPPED, with at least `need_prot`
+/// (VM_PROT_* bits; pass 0 to test mapped-ness only) on every region it spans?
+/// A hole anywhere in the range answers false.
+///
+/// The JIT pool outlives a single Wine session (StikJITHelper caches it for the
+/// process lifetime), so the second launch of an app run has to ask whether the
+/// pool it is about to hand back still exists rather than assume it. Cheap:
+/// mach_vm_region walks whole regions, so a healthy 512MB pool answers in one
+/// or two iterations.
+bool jit_range_is_mapped(void *addr, size_t size, int need_prot);
+
 // Get the RW (writable) pointer. Write generated code here.
 void *jit_region_rw_ptr(JITRegion *region);
 

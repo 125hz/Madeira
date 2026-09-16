@@ -61,6 +61,10 @@ enum StikJITHelper {
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { timer in
             if jit_check_debugged() {
                 timer.invalidate()
+                // ml962: a fresh attach re-arms BRK servicing, so a pool CAN be
+                // allocated again after an earlier detach.
+                debuggerDetached = false
+                unsetenv("MADEIRA_DETACHED")
                 LogStore.shared.log("JIT enabled! (CS_DEBUGGED set)", level: .success)
                 completion(true)
             }
@@ -77,10 +81,110 @@ enum StikJITHelper {
         return result
     }
 
+    // ── ml962: the JIT pool is a PROCESS-LIFETIME resource ──────────────────
+    //
+    // m56 (2026-09-15) died launching a SECOND program inside one app run:
+    //
+    //   [task-exc] BREAKPOINT #1 ... jit26_prepare_region+0x28
+    //   [brk-f00d] skipped stray StikDebug BRK at pc=0x104e60510 (si_code=0)
+    //   [ERR] BAD POOL: no valid placement after retries. Killing in 10s
+    //
+    // Nothing was wrong with the address space. The FIRST session detaches
+    // StikDebug ~2s after the pool is granted ([early-detach], ml524), so on the
+    // second launch the allocation BRK reaches nobody: our own task-level Mach
+    // handler skips the stray BRK, x0 comes back 0, the loop breaks on attempt 0
+    // and the code printed a canned "all placements landed in the forbidden
+    // guest 64G window" that was simply false, then killed the app in 10s.
+    //
+    // The deeper point is that a second pool was never usable anyway. Wine's
+    // unix side reads WINE_IOS_JIT_RX/RW/SIZE exactly ONCE, behind
+    // `jit_pool_init_done` in virtual_ios.c, and that dylib is never unloaded —
+    // wine_process_start() just spawns another thread into __wine_main in the
+    // SAME process. So from session 2 onward Wine is already committed to the
+    // first pool: its bump pointer, freelist, image table, anon-alias table and
+    // the TEB trampoline at pool+8 all describe that exact mapping. Handing it a
+    // freshly allocated second pool would rewrite three env vars and change
+    // nothing else.
+    //
+    // Therefore: allocate once, cache here, hand the SAME pool to every later
+    // session. That is both the correct behaviour and the fast one — it removes
+    // a ~1.9s whole-process BRK suspension from every launch after the first.
+    //
+    // DELIBERATELY NOT SCRUBBED between sessions. Zeroing or madvise-ing the
+    // pool would destroy live state that ntdll-unix still owns and will never
+    // rebuild (jit_pool_init_done is already 1): the TEB restore trampoline at
+    // pool+0/+8, every image mapping the alias tables still point at, and the
+    // freelist's accounting. Reclaiming dead ranges is ntdll-unix's job and it
+    // already does it ([jit-pool] RECLAIM peb=... on pseudo-process death).
+    private struct CachedPool {
+        let rx: UnsafeMutableRawPointer
+        let rw: UnsafeMutableRawPointer
+        let size: Int
+    }
+    private static var cachedPool: CachedPool?
+    private static var poolSession = 0
+    /// Set when StikDebug has gone away. CS_DEBUGGED is sticky after detach, so
+    /// csops cannot answer "is anyone servicing BRK right now?" — this can.
+    private static var debuggerDetached = false
+    private static let poolLock = NSLock()
+    /// Bad placements, freed and then re-reserved so the kernel cannot hand back
+    /// the same hole on the next roll. Reserve-only (never written), so they
+    /// cost VA and no footprint. Kept for the process lifetime on purpose.
+    private static var blockedHoles: [(addr: vm_address_t, size: vm_size_t)] = []
+
     /// Allocate a JIT memory pool via BRK #0xf00d WITHOUT detaching the debugger.
     /// The debugger stays attached so Wine can use BRK to prepare PE code pages.
+    ///
+    /// Idempotent per app run: the first call allocates, every later call returns
+    /// the same pool (see the CachedPool note above).
     static func allocatePool(poolSize: Int = 128 * 1024 * 1024) -> (rx: UnsafeMutableRawPointer, rw: UnsafeMutableRawPointer, size: Int)? {
-        LogStore.shared.log("Allocating \(poolSize / 1024 / 1024)MB JIT pool via debugger...")
+        poolLock.lock()
+        defer { poolLock.unlock() }
+        poolSession += 1
+        let session = poolSession
+
+        if let p = cachedPool {
+            // Validate rather than assume. Full-range mapped-ness catches a pool
+            // that was torn down under us; the protection probe is deliberately
+            // limited to the FIRST page of each alias, which holds the TEB
+            // trampoline and is never handed out (jit_pool_offset starts at
+            // 0x4000) — pages deeper in the pool legitimately change protection
+            // (W^X demotion, poisoned ranges) and must not fail this test.
+            let rxOK = jit_range_is_mapped(p.rx, p.size, 0)
+                    && jit_range_is_mapped(p.rx, 0x4000, VM_PROT_READ | VM_PROT_EXECUTE)
+            let rwOK = jit_range_is_mapped(p.rw, p.size, 0)
+                    && jit_range_is_mapped(p.rw, 0x4000, VM_PROT_READ | VM_PROT_WRITE)
+            if rxOK && rwOK {
+                LogStore.shared.log(String(format:
+                    "[jit-pool] reuse RX=%p RW=%p size=%dMB (session %d) — no debugger round trip",
+                    Int(bitPattern: p.rx), Int(bitPattern: p.rw), p.size / 1024 / 1024, session),
+                    level: .success)
+                if poolSize != p.size {
+                    LogStore.shared.log("[jit-pool] this session asked for \(poolSize / 1024 / 1024)MB; " +
+                        "keeping the \(p.size / 1024 / 1024)MB pool of session 1 — Wine's unix side " +
+                        "latched those addresses once and cannot be re-pointed in-process. " +
+                        "Force-quit and relaunch to change the pool size.")
+                }
+                return (rx: p.rx, rw: p.rw, size: p.size)
+            }
+            LogStore.shared.log(String(format:
+                "[jit-pool] cached pool RX=%p RW=%p is no longer intact (rx_ok=%d rw_ok=%d) — allocating a new one",
+                Int(bitPattern: p.rx), Int(bitPattern: p.rw), rxOK ? 1 : 0, rwOK ? 1 : 0), level: .error)
+            cachedPool = nil
+        }
+
+        if debuggerDetached || getenv("MADEIRA_DETACHED") != nil {
+            // Only the debugger can bless pages for execution, and it is gone.
+            // Say so honestly instead of blaming the address space — and do not
+            // kill the app: the UI, the log and the 'Enable JIT' button all work.
+            LogStore.shared.log("[jit-pool] NO POOL: StikDebug already detached this run and there is " +
+                "no pool to reuse. Only the debugger can bless executable pages.", level: .error)
+            LogStore.shared.log("  Press 'Enable JIT' to re-attach StikDebug, then launch again. " +
+                "The app stays usable — nothing is being killed.")
+            return nil
+        }
+
+        LogStore.shared.log("Allocating \(poolSize / 1024 / 1024)MB JIT pool via debugger... (session \(session))")
 
         // iOS-Madeira: FEX's dispatcher emit has a position-dependent encoding
         // bug — only works when the JIT pool lands at a high enough address
@@ -135,41 +239,114 @@ enum StikJITHelper {
         // kernel allows, otherwise kept alive as a pin.
         // ⚠️ ml596: the old claim that the next pick "must land elsewhere" is FALSE.
         // ml595 freed and re-requested three times and the kernel handed back the
-        // SAME 0x7000000000 hole each time, so the retry loop is not a strategy —
-        // it is three identical attempts. Failure is therefore deterministic within
-        // a launch and the caller must abort rather than run without a pool. A real
-        // fix needs explicit placement (hinted allocation / reserve-and-carve),
-        // not a re-roll; simply pinning the bad region to force a different address
-        // costs another 896MB against the 4096MB jetsam ceiling.
+        // SAME 0x7000000000 hole each time, so the retry loop was not a strategy —
+        // it was three identical attempts.
+        //
+        // ml962 makes each attempt actually make progress. A rejected placement is
+        // freed and then RE-RESERVED at the same VA with vm_allocate(FIXED), so the
+        // kernel cannot offer that hole again. The reservation is zero-fill and
+        // never touched, so — exactly like the pin chunks above — it costs address
+        // space and no footprint; only the rejected 896MB of DIRTY debugger pages
+        // would have cost jetsam budget, and those are handed back first.
         let goodLow = 0x119000000
         let guestLo = 0x7000000000
         let guestHi = 0x8000000000
+        func placementIsGood(_ a: Int) -> Bool {
+            return a >= goodLow && !(a + poolSize > guestLo && a < guestHi)
+        }
         var rxPtrOpt: UnsafeMutableRawPointer? = nil
-        for attempt in 0..<3 {
+        var attempts = 0
+
+        // Phase 1: the kernel's own pick, via the debugger's _M (ANYWHERE-only).
+        for _ in 0..<8 {
+            attempts += 1
             guard let p = jit26_prepare_region(nil, poolSize), p != UnsafeMutableRawPointer(bitPattern: 0) else {
-                LogStore.shared.log("Debugger failed to allocate RX memory (attempt \(attempt))", level: .error)
+                LogStore.shared.log("[jit-pool] the allocation BRK returned nothing on attempt \(attempts) — " +
+                    "no debugger serviced it (look for '[brk-f00d] skipped stray StikDebug BRK' just above)",
+                    level: .error)
                 break
             }
             let a = Int(bitPattern: p)
-            let inGuestWindow = a + poolSize > guestLo && a < guestHi
-            if a >= goodLow && !inGuestWindow {
-                rxPtrOpt = p
-                break
-            }
-            LogStore.shared.log(String(format: "BAD POOL placement 0x%lx (%@) — re-rolling (attempt %d)",
+            if placementIsGood(a) { rxPtrOpt = p; break }
+            LogStore.shared.log(String(format: "[jit-pool] rejected placement 0x%lx (%@) on attempt %d — blocking that hole and re-rolling",
                                        a, a < goodLow ? "mode A low" : "guest 64G window",
-                                       attempt), level: .error)
+                                       attempts), level: .error)
             let dkr = vm_deallocate(mach_task_self_, vm_address_t(a), vm_size_t(poolSize))
-            LogStore.shared.log(dkr == KERN_SUCCESS
-                ? "  bad region freed"
-                : "  bad region kept as pin (vm_deallocate kr=\(dkr))")
-        }
-        guard let rxPtr = rxPtrOpt else {
-            LogStore.shared.log("BAD POOL: no valid placement after retries. Killing in 10s — please relaunch.", level: .error)
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 10) {
-                LogStore.shared.log("BAD POOL — exiting now. Relaunch the app.", level: .error)
-                exit(0)
+            if dkr == KERN_SUCCESS {
+                var reserve = vm_address_t(a)
+                let rkr = vm_allocate(mach_task_self_, &reserve, vm_size_t(poolSize), VM_FLAGS_FIXED)
+                if rkr == KERN_SUCCESS && reserve == vm_address_t(a) {
+                    blockedHoles.append((addr: reserve, size: vm_size_t(poolSize)))
+                    LogStore.shared.log(String(format: "  hole 0x%lx+0x%lx freed and reserved (VA only) so the next roll cannot reuse it", a, poolSize))
+                } else {
+                    LogStore.shared.log("  hole freed but NOT reserved (vm_allocate kr=\(rkr)) — the next roll may land here again", level: .error)
+                }
+            } else {
+                LogStore.shared.log("  bad region kept as pin (vm_deallocate kr=\(dkr))")
             }
+        }
+
+        // Phase 2 (ml962): EXPLICIT PLACEMENT. The debugger's allocator is
+        // ANYWHERE-only — madeira-jit.js says so in as many words ("_M<size>,<perms>
+        // — but doesn't support fixed addr") — so we place the range ourselves with
+        // vm_allocate(FIXED) at a hint and ask the debugger only to BLESS it
+        // (jit26_prepare_region with x0 != 0 skips _M and calls prepare_memory_region
+        // on the address we pass).
+        //
+        // Every candidate is VERIFIED EXECUTABLE afterwards. A blessing that
+        // silently did nothing yields non-executable pages, which is the exact
+        // failure mode that produced the ml78 black screen, so an unverified hint
+        // is worse than no hint at all — it is rejected and freed here instead.
+        //
+        // The band is [0x119000000, 0x7000000000): above FEX's mode-A emit floor and
+        // entirely below the guest 64G window. The proven pool addresses all sit
+        // just above the pin frontier (m56: 0x11bfe0000), so sweep there first on a
+        // 64MB stride, then coarsely on 1GB out to 64G. ml92's map says most of that
+        // is spoken for; a refused vm_allocate(FIXED) costs one syscall, so probing
+        // it is free and the log says exactly how far we got.
+        if rxPtrOpt == nil {
+            var hints: [Int] = []
+            var h = max(goodLow, pinChunks.last.map { Int($0) + chunkSize } ?? goodLow)
+            h = (h + 0x3FFF) & ~0x3FFF
+            for _ in 0..<64 { hints.append(h); h += 64 * 1024 * 1024 }
+            h = 0x200000000
+            while h + poolSize <= guestLo && hints.count < 160 { hints.append(h); h += 0x40000000 }
+
+            var probes = 0
+            for hint in hints {
+                guard placementIsGood(hint) else { continue }
+                probes += 1
+                var got = vm_address_t(hint)
+                guard vm_allocate(mach_task_self_, &got, vm_size_t(poolSize), VM_FLAGS_FIXED) == KERN_SUCCESS,
+                      got == vm_address_t(hint) else { continue }
+                attempts += 1
+                let blessed = jit26_prepare_region(UnsafeMutableRawPointer(bitPattern: hint), poolSize)
+                let ok = blessed != nil && Int(bitPattern: blessed!) == hint
+                    && jit_range_is_mapped(UnsafeMutableRawPointer(bitPattern: hint), 0x4000,
+                                           VM_PROT_READ | VM_PROT_EXECUTE)
+                if ok {
+                    LogStore.shared.log(String(format: "[jit-pool] hinted placement 0x%lx accepted (blessed and verified executable) after %d probes", hint, probes), level: .success)
+                    rxPtrOpt = UnsafeMutableRawPointer(bitPattern: hint)
+                    break
+                }
+                LogStore.shared.log(String(format: "[jit-pool] hint 0x%lx reserved but the debugger could not make it executable — releasing", hint))
+                vm_deallocate(mach_task_self_, got, vm_size_t(poolSize))
+            }
+            if rxPtrOpt == nil {
+                LogStore.shared.log("[jit-pool] hinted placement found no home in [0x119000000, 0x7000000000) after \(probes) probes")
+            }
+        }
+
+        guard let rxPtr = rxPtrOpt else {
+            // ml962: NEVER kill the app. The old path scheduled exit(0) in 10s,
+            // which destroyed the log the user was about to read and made a
+            // recoverable situation look like a crash. Wine simply does not start.
+            LogStore.shared.log("[jit-pool] NO POOL after \(attempts) attempts — Wine will not start. " +
+                                "The app stays usable; nothing is being killed.", level: .error)
+            LogStore.shared.log("  Every placement was either below 0x119000000 (FEX mode-A emit bug) or " +
+                                "inside the guest 64G window [0x70,0x80)G, and no hinted address could be blessed.")
+            LogStore.shared.log("  Press 'Enable JIT' to re-attach StikDebug and try again, or force-quit and " +
+                                "relaunch — placement depends on the current VM layout.")
             return nil
         }
         let rxAddr = Int(bitPattern: rxPtr)
@@ -298,6 +475,13 @@ enum StikJITHelper {
         // the UI view. Detail (kr / footprint delta) is in the jit_log lines.
         LogStore.shared.log("[no-footprint] pool applied=\(exempt)", level: exempt ? .success : .error)
 
+        // ml962: this pool now belongs to the APP RUN, not to this session. Every
+        // later launch gets it back from the cache above — see the CachedPool note.
+        cachedPool = CachedPool(rx: rxPtr, rw: rwPtr, size: poolSize)
+        LogStore.shared.log(String(format:
+            "[jit-pool] placed at RX=%p RW=%p size=%dMB after %d attempt(s) (session %d) — held for the app's lifetime",
+            rxAddr, Int(bitPattern: rwPtr), poolSize / 1024 / 1024, attempts, session), level: .success)
+
         LogStore.shared.log("JIT pool ready (debugger still attached).", level: .success)
 
         return (rx: rxPtr, rw: rwPtr, size: poolSize)
@@ -307,6 +491,10 @@ enum StikJITHelper {
     static func detachDebugger() {
         LogStore.shared.log("Detaching debugger...")
         jit26_detach()
+        // ml962: remember it. CS_DEBUGGED stays SET after detach, so csops cannot
+        // tell a later caller that nobody is servicing BRK any more — this can, and
+        // that is what turns m56's mystery "BAD POOL" into an accurate message.
+        debuggerDetached = true
         // task #34: signal in-process waiters (share-probe poller). CS_DEBUGGED
         // is sticky post-detach, so an env flag is the reliable signal.
         setenv("MADEIRA_DETACHED", "1", 1)

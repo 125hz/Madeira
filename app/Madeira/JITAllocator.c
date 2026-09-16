@@ -209,6 +209,41 @@ JITRegion *jit_region_create(size_t size) {
     return region;
 }
 
+// ml962: does a range still exist, with the protections we expect?
+//
+// The pool is allocated once per APP RUN and reused by every later session
+// (StikJITHelper.cachedPool), so "is the thing I cached still there?" is now a
+// real question with a real answer, instead of an assumption. Walk the regions
+// the range spans: the first gap, or the first region missing a needed
+// protection bit, is a no.
+bool jit_range_is_mapped(void *addr, size_t size, int need_prot) {
+    if (!addr || !size) return false;
+
+    mach_port_t task = mach_task_self();
+    mach_vm_address_t cur = (mach_vm_address_t)(uintptr_t)addr;
+    mach_vm_address_t end = cur + size;
+
+    while (cur < end) {
+        mach_vm_address_t r_addr = cur;
+        mach_vm_size_t    r_size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+
+        kern_return_t kr = mach_vm_region(task, &r_addr, &r_size,
+                                          VM_REGION_BASIC_INFO_64,
+                                          (vm_region_info_t)&info, &cnt, &obj);
+        if (obj != MACH_PORT_NULL) mach_port_deallocate(task, obj);
+        if (kr != KERN_SUCCESS) return false;   /* nothing at or above cur */
+        if (r_addr > cur) return false;         /* a hole starts at cur */
+        if (r_size == 0) return false;          /* no forward progress */
+        if (need_prot && (info.protection & need_prot) != need_prot) return false;
+
+        cur = r_addr + r_size;
+    }
+    return true;
+}
+
 // ml358: make an ALREADY-MAPPED region jetsam-exempt.
 //
 // jit_region_create() marks its memory entry NO_FOOTPRINT, but the production
