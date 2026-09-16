@@ -2115,6 +2115,131 @@ game-specific patches — every change must fix the emulator/runtime generically
   (`d3d9_native_glue.cpp:1179`), so a fullscreen window that grew with the
   monitor is reported at its new client size with no hook needed.
 
+- 2026-09-15 — **XInput: a controller paired to the phone is XInput user 0, and
+  the same pad also presses the user's own on-screen controls.** Two roads, on
+  purpose, because they serve two different halves of the library: anything
+  written after roughly 2006 asks XInput for a pad, and everything older reads
+  the keyboard and the mouse and has never heard of one. Neither road is a
+  fallback for the other and both carry the pad at the same time — which is
+  exactly what a PC with a controller and a key remapper does.
+
+  **The transport, in full.** `HardwareInput.swift:1109` `padSample()` reads
+  every `GCExtendedGamepad` on a dedicated `.userInteractive` queue driven by a
+  `DispatchSourceTimer` at 4 ms (`:1093`), plus `valueChangedHandler` on that
+  same queue so a button transition never waits out a tick. **Not a
+  `CADisplayLink`:** it cannot exceed the refresh rate, and XInput's contract is
+  a state that is current when you ask — a pad sampled at 60 Hz hands a
+  1 kHz-polling game the same sample sixteen times and then jumps. Each sample
+  is converted to XInput units (`:1289` `read`, `:1318` `axis`, `:1325`
+  `trigger`) and published with `winios_gamepad_set_state`
+  (`app/Madeira/Winios/Winios.m:1700`) into one of four slots. The slot is a
+  **seqlock, not a queue and not a mutex** (`Winios.h`, the ml668 banner; the
+  reader is `Winios.m:1749` `winios_gamepad_get_state`): a gamepad is a STATE,
+  the reader is a guest thread possibly inside a frame's critical path in the
+  same Mach task as the writer, and a bounded seqlock read cannot block it —
+  four tries, then report "absent" for that one poll rather than hand a game a
+  torn sample. The slot owns the **packet number** and bumps it only when a
+  field actually differs (`Winios.m:1717`), because a packet that ticks on every
+  resample defeats the one optimisation it exists for.
+
+  **The syscall.** `NtUserCallTwoParam_GetGamepadState`
+  (`wine/include/ntuser.h:1233`, appended to the end of the enum — those codes
+  are an ABI between `win32u.dll` and the unix library and the farms are not
+  rebuilt in lockstep), with `arg1` packing the user index in its low byte and a
+  `NtUserGamepadOp_*` selector above it, `arg2` the output buffer, and the
+  inline wrapper `NtUserGetGamepadState` at `:1249`. **No new syscall number,
+  no `win32u.spec` change, no `win32syscalls.h` regeneration and no wow64win
+  table change** — `NtUserCallTwoParam` is already a syscall on every arch, so
+  the PE-side `win32u.dll` in all three farms needed no rebuild at all. Dispatch
+  is `build/win32u-unix/sysparams_ios.c:8160` (and the same case, `#else return
+  0;`, in upstream `wine/dlls/win32u/sysparams.c:7635`), body
+  `build/win32u-unix/driver_ios.c:305` `ios_gamepad_query` — a plain memory
+  read, no lock, no server round trip, because the app and the guest are one
+  task (§2). Op 0 returns `XINPUT_STATE` (16 bytes), op 1 `XINPUT_CAPABILITIES`
+  (20). `C_ASSERT`s at `driver_ios.c:288-290` pin both sizes and the shared
+  struct's, since a silent layout drift there is garbage sticks and nothing
+  else. The 32-bit half is `wine/dlls/wow64win/user.c:1902`: both payloads are
+  pointer-free with identical 32- and 64-bit layout, so `guest_ptr32(arg2)` is
+  the entire marshalling.
+
+  **wine's xinput1_3** (`wine/dlls/xinput1_3/main.c:794` for the banner) tries
+  the host slot FIRST in `XInputGetState`/`Ex` (`:934`), `XInputSetState`
+  (`:911` — accepted and ignored; iOS cannot drive a pad's motors, and
+  `ERROR_DEVICE_NOT_CONNECTED` would read to a game as the controller vanishing
+  mid-frame), `XInputGetCapabilitiesEx` (`:1248`), `XInputGetBatteryInformation`
+  (wired/full, the one answer that never draws a low-battery warning for a
+  charge we cannot see) and `XInputGetKeystroke`, whose edge state machine was
+  split out as `keystroke_from_state` (`:1064`) so the host path runs the
+  identical logic over its own edge memory rather than a second copy of it.
+  `XInputEnable` (`:883`) returns early when any host pad exists. All of that
+  is **#ifdef-free**: a `win32u` that does not know the code falls into
+  `default:` and returns 0, which is bit-for-bit "no pad in that slot", so a
+  stock Wine keeps its HID path untouched. The host path also deliberately
+  answers **before** `start_update_thread()` — that call builds a thread, a
+  window, a device-notification registration and a setupapi enumeration that on
+  a phone finds nothing, in every process that so much as asks once.
+
+  **The on-screen half.** `TouchControl.padBinding`
+  (`app/Madeira/ContentView.swift:4570`, a `PadButton` at `:4423`, raw-value
+  Codable so the layout JSON stores a name and not an ordinal) names the
+  physical button that ALSO presses that control. `HardwareInput`
+  `applyPadBindings` (`:1179`) drives them through
+  `ControlOverlayView.padPress`/`padRelease`/`padDir`/`padAim`
+  (`ContentView.swift:2239-2318`), which take an `InputGuard` owner **per
+  physical button** and hold that control's own `ControlRegionKind` — so the
+  reconciler in `InputGuard.tick`, the coalescing ring and every owner count see
+  one more finger and need to know nothing new. `padReleaseAll` is wired into
+  `dropAllTouches` (`:2023`), so a pad hold dies with every other hold. The left
+  stick 8-way-snaps into whatever dirstick it is bound to using the SAME
+  `snap`/`stickKeys` convention a thumb uses (`HardwareInput.swift:1339`
+  `snap8`); the right stick drives `AimStickDriver`, and does so even with no
+  aim control on screen whenever `InputSettings.relative` is set, because in
+  that mode nothing else on the phone can turn the camera with a pad. Defaults
+  when a layout names no button at all (`bindingMap`, `:1232`): A/B/X/Y then
+  LB/RB then Start/Back onto the layout's own buttons in creation order, left
+  stick onto its first stick — one explicit binding anywhere turns the whole
+  default set off, because a half-defaulted layout is the only thing more
+  confusing than no defaults. The **on-screen** dpad and buttons still post
+  keys and feed XInput nothing; the physical pad is the only thing in that slot.
+  The mapping panel's controller tab (`ContentView.swift:5289`) now picks a
+  binding instead of the `ControlAction.pad("A")` glyph chips it used to offer,
+  which drew an Xbox letter and pressed nothing.
+
+  **Farms.** `xinput1_1/1_2/1_3/1_4/9_1_0/xinputuap` built and installed for all
+  three arches; `wow64win.dll` rebuilt for aarch64 (its thunk is the 32-bit half
+  of the syscall, and a farm with the new `xinput1_3` and an old `wow64win` is
+  the exact shape that fails only for 32-bit programs and only at runtime). The
+  64-bit farm shipped **no xinput at all** before this, so a 64-bit title asking
+  for a controller failed at `LoadLibrary` before any of the above could be
+  wrong; `.xtool/build-wine-64.sh`'s default set and `build-wine-i386.sh`'s
+  `EXTRA_DLLS` now carry the whole set. `xinput1_3` gained `win32u` in IMPORTS
+  (and so did 1_1/1_2/1_4/uap, which share its `main.c` through `PARENTSRC`);
+  `xinput9_1_0` forwards to `xinput1_4.dll` at runtime and needed nothing.
+
+  **Test:** `build/x86-tests/xinput-x86.c`, built by `build-xinput-test.sh` into
+  `xinput-x86.exe` (i386, no CRT, kernel32-only imports — `xinput1_3.dll` is
+  `LoadLibrary`'d so "the DLL is missing" and "the DLL says no pad" are
+  different exit codes). It polls `XInputGetState(0)` at 120 Hz for 15 s and
+  prints `MADEIRA-XINPUT: packet=N buttons=0x…. lx=… ly=… lt=… rt=…` on every
+  packet change, exiting **53** on the first change. **63** is the timeout, and
+  the line above it says which failure it was: no pad ever in slot 0, or a pad
+  connected whose packet number never moved. 32-bit specifically, because the
+  wow64 thunk is on the 32-bit path only — a 64-bit program would pass this test
+  with that thunk missing entirely.
+
+  **What to look for in the next log:** `[xinput] pad0 connected vendor=…
+  profile=extended` at pair time and `[winios] gamepad slot 0 connected` right
+  behind it; then every 10 s `[xinput] pad0 packets=N last_buttons=0x…. lx=…
+  ly=…` — N climbing while the pad is being handled and standing still while it
+  is at rest is CORRECT, N standing still while a stick is being waggled is the
+  sampler. The 1 Hz `[hwinput] keys_down=… pad=0x…. lx=… ly=…` line carries the
+  raw sample, which separates "the pad is not reporting" from "the pad is
+  reporting and nothing is bound". `[input] pad <button> down on ctl.… (label)
+  kind=…` is one line per bound press, and `[input] app keys=… owners=…` should
+  show the owner count rise by one per held pad button and fall back — an owner
+  count that stays high after every button is released is a pad hold that
+  outlived its release.
+
 ## 7. D3D9 path (M4)
 
 Goal: a 32-bit PE calling Direct3D 9 renders through Metal on the phone.
@@ -4162,3 +4287,176 @@ window teardown), `src/winemetal/unix/winemetal_unix.c` (`_Foo32` pattern
   appears with no `[ctx]` line before it, the zeroing is reaching the thread by
   a path that does not go through `signal_set_full_context` — the cross-thread
   server handback — and the `thread->context` defect is then the whole story.
+
+- 2026-09-15 — **DEP off for a non-NX-compat image: the emulator was never
+  told, so code the program wrote into its own memory could not be executed**
+  (log m55).
+
+  **The death.** A 2001-era retail 32-bit title died within seconds, always the
+  same way:
+
+      [guest-code] pool_rip=0x1b4380f (PE 0x1b4380f) -- NO pool copy (identity translate)
+      0090:err:seh:segv_handler SEGV #1: pc=0x151f74368 addr=0x0 ... x20=0x1b4380f
+        [guest-state] rip=0x1b4380f rsp=0x108fb1c
+      setup_exception for SEGV ... (virtual_handle_fault failed)
+      [fault-rgn] addr=0x0 ... NO wine view
+      wine: Unhandled page fault on execute access to 01B4380F at address 01B4380F
+
+  Guest RIP `0x01B4380F` is in no PE image: it is memory the program allocated
+  `PAGE_READWRITE` and wrote code into — an unpacker or copy-protection stage,
+  the single most common thing a program of that vintage does.
+
+  **Why it could not run.** On Windows a 32-bit image without
+  `IMAGE_DLLCHARACTERISTICS_NX_COMPAT` runs with DEP disabled and executing any
+  committed readable page is legal. Wine models that with `force_exec_prot`
+  (`virtual_set_force_exec`), which ORs `PROT_EXEC` into every `PROT_READ`
+  mapping. On this port that mechanism is inert and irrelevant: iOS TXM refuses
+  `PROT_EXEC` outside the JIT pool, which is why `mprotect_exec` already
+  deliberately ignores the force (`virtual_ios.c`, the `[force-exec]` note), and
+  **nothing host-executes a guest page anyway** — guest code is decoded and run
+  from the pool. The only thing that decides whether a guest address may be
+  executed is FEX's `InvalidationTracker::XIntervals`, consulted through
+  `QueryExecutableRange` -> `QueryGuestExecutableRange` ->
+  `Decoder::CheckRangeExecutable`. A range that is not in it decodes as
+  `NOEXEC`, `Core.cpp` raises `NoExecOp`, and the JIT branches to the
+  dispatcher's `GuestSignal_SIGSEGV` trampoline (`Dispatcher.cpp:566`) whose
+  whole body is `mov w1,#0 ; ldr x1,[x1]` — a deliberate read of address 0.
+  **That is where `addr=0x0` came from: it is the trap, not the fault.**
+  `virtual_handle_fault` and `[fault-rgn]` were both answering a question about
+  page 0 that nobody had asked, and the address that mattered appeared only in a
+  register.
+
+  **The missing wire.** `BTCpuNotifyProcessExecuteFlagsChange` — the CPU
+  backend's DEP hook, exported by `libwow64fex.dll` and implemented all the way
+  down to `InvalidationTracker::HandleProcessExecuteFlagsChange` — **was never
+  resolved or called by this Wine tree**. The 32-bit loader's
+  `NtSetInformationProcess(ProcessExecuteFlags)` for a non-NX-compat image
+  (`wine/dlls/ntdll/loader.c:1930`) was forwarded straight through at
+  `wine/dlls/wow64/process.c:962` to the host ntdll, which set
+  `force_exec_prot` and stopped. `DEPDisabled` stayed false for the life of
+  every process. FEX's comment at `WOW64/Module.cpp:1869` had stated this
+  exactly; nothing acted on it.
+
+  **The fix, in three parts.**
+
+  1. `wine/dlls/wow64/syscall.c` resolves and pool-translates
+     `pBTCpuNotifyProcessExecuteFlagsChange` alongside the other `BTCpuNotify*`
+     hooks, `wow64_private.h` declares it, and `wow64/process.c`
+     `wow64_NtSetInformationProcess` gets `ProcessExecuteFlags` its own case: it
+     forwards as before and, on success, notifies the backend. The handle is
+     deliberately not examined, because ntdll's own implementation of this class
+     ignores it too. This covers both the loader's automatic opt-out and
+     `SetProcessDEPPolicy` at runtime (`kernel32/process.c:558` maps
+     `PROCESS_DEP_ENABLE` to `MEM_EXECUTE_OPTION_DISABLE|PERMANENT`).
+
+  2. `FEX/Source/Windows/Common/InvalidationTracker.cpp`
+     `PromoteDEPRegionLocked()` is the one place a region becomes executable
+     because DEP is off: `VirtualQuery` the address, and if it is committed,
+     readable, not already executable and not a `PAGE_GUARD`/`PAGE_NOACCESS`
+     page, insert it into `XIntervals`, into `RWXIntervals` when writable (so
+     the SMC write-trap is armed — an unpacker writes, executes, rewrites and
+     executes again), and into `DEPPromotedIntervals` so `GetTrapProt` /
+     `GetUntrapProt` trap it with `PAGE_READONLY`/`PAGE_READWRITE` rather than
+     the `PAGE_EXECUTE_*` pair the host page can never hold. Two callers:
+     `HandleProcessExecuteFlagsChange`'s sweep, **now bounded to
+     `[GuestBase, GuestBase+4GiB)`** — the upstream walk from 0 is correct only
+     when guest and host share a 32-bit space, and here it would have marked
+     FEX's own heap and the pool's RW alias as guest code *and* armed write
+     traps on them; and, new, `QueryExecutableRange()`, which on a decode miss
+     with DEP off promotes lazily and answers. Doing it at decode time rather
+     than on the fault is what makes it usable: the block is compiled correctly
+     the first time, instead of having to unwind a running block and re-enter
+     the JIT at the same RIP from a signal handler. Only `IntervalsLock` is
+     taken there and nothing is invalidated — nothing can have been compiled for
+     a range the decoder is only now asking about — which matters because the
+     caller already holds `CodeInvalidationMutex` shared and it has no
+     shared-to-exclusive upgrade. A miss that is *not* a committed readable page
+     still returns "not executable", so a genuine wild branch still faults: DEP
+     off does not mean every address is code.
+
+  3. `virtual_ios.c` `virtual_handle_fault` gains the host-side
+     `EXCEPTION_EXECUTE_FAULT` branch (grant `VPROT_EXEC` on a committed
+     readable page when `force_exec_prot`, and report success only if the kernel
+     actually honoured it, since on iOS it usually cannot);
+     `virtual_set_force_exec` logs the transition and publishes
+     `ios_dep_disabled`; and `signal_arm64_ios.c` `ios_fex_noexec_trap_rip()`
+     recognises the JIT trap by its two instruction words (`ldr x1,[x1]` with
+     `x1` just zeroed — a pairing that cannot occur by accident) and reads the
+     guest RIP from FEX's live `CpuStateFrame` at `x28+0x18`, falling back to
+     `x20`. `segv_handler` now classifies that case **before** consulting the
+     page machinery, so the log names the guest RIP and says whether DEP is off
+     (a promotion gap) or on (a correct access violation) instead of printing a
+     region report for page 0. The exception record is left untouched on
+     purpose: FEX's `HandleGuestException` rewrites it into the execute AV the
+     guest sees.
+
+  **New diagnostics.** `[dep-off] DEP DISABLED/re-enabled for this process` from
+  the unix side, one `[dep-off] promoting 0x…+0x… to executable for a
+  non-NX-compat image (guest rip 0x…)` per promoted region (capped at 512, with
+  the cap announced), `[dep-off] EXECUTE FAULT (FEX no-exec trap) at guest
+  rip=…` from the fault handler, and a periodic `[dep-off] summary:` line on the
+  same ~10 s clock as `[fex-stats]`, emitted from
+  `WowSyscallHandler::PreCompile` and silent unless DEP is actually off. All
+  four absent in a run that dies on an execute fault is itself the diagnosis.
+
+  **New test.** `build/x86-tests/execrw-x86.c` +
+  `build/x86-tests/build-execrw-test.sh`, which links the same source twice with
+  opposite linker flags and asserts the `NX_COMPAT` bit actually differs, so a
+  toolchain that ignored one flag cannot produce a green run that tested
+  nothing: **`execrw-x86.exe`** (`--disable-nxcompat`, DEP off) and
+  **`execrw-nx-x86.exe`** (`--nxcompat`, DEP on). The program reads its own PE
+  header to decide which half to run. DEP off: execute `mov eax,42 ; ret` from
+  `VirtualAlloc(PAGE_READWRITE)`; rewrite the immediate and call again, then 64
+  more rewrite-and-call rounds **with no `FlushInstructionCache` anywhere** (an
+  unpacker does not issue one either, so a stale translation fails loudly); the
+  same stub from `HeapAlloc`'d memory; the same stub from a page committed
+  separately inside an earlier `MEM_RESERVE`; and finally
+  `SetProcessDEPPolicy(PROCESS_DEP_ENABLE)`, after which the very same buffer
+  must stop being executable. DEP on: the first call must raise an access
+  violation with `ExceptionInformation[0] == 8` at the address jumped to. No CRT
+  and no `__try` (clang has no 32-bit x86 SEH): recovery is a vectored handler
+  that redirects `Eip` to a stub returning a sentinel, which is safe because the
+  faulting instruction is the callee's first byte so the stack is exactly what a
+  `__cdecl` callee expects. Exit **52** = pass; 41/42 = DEP-off promotion is not
+  happening, 43/44 = DEP is not being enforced, 45/46 = self-modifying code runs
+  a stale translation, 47/48 = heap or late-commit memory was missed, 49-51 =
+  the runtime opt-in did not take.
+
+  **Built and verified here:** `libntdll_unix.a` 30/30 clean (no new warnings);
+  `libwow64fex.dll` -> `aarch64-windows/xtajit.dll` and `libarm64ecfex.dll` ->
+  `arm64ec-windows/xtajit64.dll` both rebuilt (`InvalidationTracker` is shared);
+  `wow64.dll` rebuilt via `.xtool/build-wine-64.sh aarch64 wow64` and its new
+  `BTCpuNotifyProcessExecuteFlagsChange` lookup string confirmed present in the
+  installed binary, matching the export in the freshly built `xtajit.dll`; both
+  test exes built i386 PE, kernel32-only imports, large-address-aware, and the
+  `NX_COMPAT` bit confirmed 0 in one and 1 in the other.
+
+  **Needs the device.** Two launch rows are wanted: **`execrw-x86.exe`** and
+  **`execrw-nx-x86.exe`**. Both must end in `MADEIRA-EXIT … status=52`. In the
+  DEP-off run the log must also carry `[dep-off] DEP DISABLED`, at least one
+  `[dep-off] promoting …`, and a `[dep-off] summary:` line; in the `NX_COMPAT`
+  run it must carry none of them. Then the title itself: the `[guest-code] … NO
+  pool copy` / `Unhandled page fault on execute access` pair at a non-image RIP
+  should be gone, replaced by a `[dep-off] promoting …` line for the region that
+  RIP lies in. If the fault still happens, the new `[dep-off] EXECUTE FAULT …
+  dep_disabled=` line decides it immediately: `dep_disabled=0` means the
+  notification never arrived (wow64/backend wiring), `dep_disabled=1` means the
+  region was not promoted (an `InvalidationTracker` gap), and the guest RIP it
+  prints is the address to look up.
+- 2026-09-15 — Log 55 (a 2001-era 32-bit retail title): the JIT's
+  no-exec trap (`mov w1,#0; ldr x1,[x1]`) was being reported as a NULL
+  fault; the real cause was DEP-off semantics never reaching the CPU
+  backend (`BTCpuNotifyProcessExecuteFlagsChange` unresolved/uncalled by
+  wow64) — fixed (see the agent entry above: lazy promotion on decode miss,
+  bounded sweep, `[dep-off]` lines, `execrw-x86.exe`/`execrw-nx-x86.exe`
+  exit 52). XInput end to end (`NtUserCallTwoParam_GetGamepadState`, seqlock
+  slots in Winios, xinput1_x for all three farms, pad bindings on the
+  landscape controls, `xinput-x86.exe` exit 53). UI: launch row reduced to
+  five buttons + "Custom…" (path popup, `madeiraCustomExePath`); per-test
+  buttons gone (run tests through the popup as `C:\windows\syswow64\<exe>`);
+  display-mode button icon-only; landscape HUD cluster draggable (0.3 s
+  long-press, persisted per orientation); keyboard button resolves its
+  target from the window at tap time (`[keyboard] show …` lines). Build
+  gotcha recorded: any make in `wine/build-macos` regenerates config.h and
+  drops the GnuTLS defines prepare-wine.py appends → re-append before the
+  ntdll-unix build.

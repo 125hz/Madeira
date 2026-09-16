@@ -106,15 +106,15 @@ final class HardwareInput: ObservableObject {
 
     private var kbOwner = 0
     private var mouseOwner = 0
-    private var padKeyOwner = 0
-    private var padBtnOwner = 0
-    private var padAimOwner = 0
 
     private var heldVKs: Set<Int32> = []
     private var heldButtons: Set<Int> = []
-    private var padKeys: Set<Int32> = []
-    private var padButtons: Set<Int> = []
-    private var padAimActive = false
+
+    // ml668: the gamepad has no owner of its own here any more. Its presses go
+    // through `ControlOverlayView`, which allocates one InputGuard owner PER
+    // PHYSICAL BUTTON — because a pad button now presses a control the user
+    // chose, not a key this file invented, and "which control" is a property of
+    // the layout rather than of the device. See the pad section below.
 
     // MARK: relative-motion carry
     //
@@ -249,9 +249,6 @@ final class HardwareInput: ObservableObject {
         started = true
         kbOwner = InputGuard.newOwner()
         mouseOwner = InputGuard.newOwner()
-        padKeyOwner = InputGuard.newOwner()
-        padBtnOwner = InputGuard.newOwner()
-        padAimOwner = InputGuard.newOwner()
 
         let nc = NotificationCenter.default
         nc.addObserver(forName: .GCKeyboardDidConnect, object: nil, queue: .main) { [weak self] n in
@@ -281,8 +278,8 @@ final class HardwareInput: ObservableObject {
         nc.addObserver(forName: .GCControllerDidConnect, object: nil, queue: .main) { [weak self] n in
             self?.attachController(n.object as? GCController)
         }
-        nc.addObserver(forName: .GCControllerDidDisconnect, object: nil, queue: .main) { [weak self] _ in
-            self?.detachController()
+        nc.addObserver(forName: .GCControllerDidDisconnect, object: nil, queue: .main) { [weak self] n in
+            self?.detachController(n.object as? GCController)
         }
 
         // ml661's rule, applied to hardware: the events that end a press are the
@@ -382,18 +379,14 @@ final class HardwareInput: ObservableObject {
     /// releaseAll (and winios_release_all_keys behind it) has already sent, or is
     /// about to send, the ups.
     private func forgetHeld(_ why: String) {
-        guard !heldVKs.isEmpty || !heldButtons.isEmpty || !padKeys.isEmpty
-                || !padButtons.isEmpty || padAimActive else { return }
-        log("forget held (\(why)) keys=\(heldVKs.count) btns=\(heldButtons.count) "
-            + "pad=\(padKeys.count)")
+        guard !heldVKs.isEmpty || !heldButtons.isEmpty else { return }
+        log("forget held (\(why)) keys=\(heldVKs.count) btns=\(heldButtons.count)")
         heldVKs.removeAll(); heldButtons.removeAll()
-        padKeys.removeAll(); padButtons.removeAll()
-        padAimActive = false
         InputGuard.shared.release(kbOwner)
         InputGuard.shared.release(mouseOwner)
-        InputGuard.shared.release(padKeyOwner)
-        InputGuard.shared.release(padBtnOwner)
-        AimStickDriver.shared.end(padAimOwner)
+        // ml668: the pad's holds live in ControlOverlayView, one owner per
+        // physical button. Its own valve is the complete one.
+        ControlOverlayView.shared.padReleaseAll(why)
         motionLock.lock()
         carryX = 0; carryY = 0
         scrollAccumX = 0; scrollAccumY = 0
@@ -944,99 +937,393 @@ final class HardwareInput: ObservableObject {
         log("pointer lock \(want ? "ON" : "OFF") (\(why)) path=\(mousePath.rawValue)")
     }
 
-    // MARK: - gamepad (optional extra; a generic default mapping)
+    // ========================================================================
+    // MARK: - ml668 — THE GAMEPAD
     //
-    // Cheap, because it needs no new plumbing: a stick is the same 8-way snap
-    // ControlOverlayView already does, the right stick is the aim engine ml660
-    // already built, and the face buttons are keys InputGuard already holds.
+    // A controller paired to the phone has to reach the game by TWO roads at
+    // once, and they are not alternatives:
     //
-    // The mapping below is the conventional PC shooter layout (triggers are the
-    // mouse buttons, left stick walks, right stick looks). It is a DEFAULT, not
-    // a claim about any particular title — the on-screen controls' own remapping
-    // UI is where per-title layouts belong.
+    //   1. XInput. Everything written after about 2006 asks XInput for a pad,
+    //      and for those titles the right answer is to BE the pad. The sampler
+    //      below writes an XINPUT_GAMEPAD-shaped struct into a shared slot
+    //      (Winios.m, `winios_gamepad_set_state`), win32u reads it through one
+    //      syscall, and wine's xinput1_3 hands it to the game. Nothing about
+    //      the user's on-screen layout is involved: the game gets the raw pad.
+    //
+    //   2. The on-screen layout. Most of what this port actually runs is older
+    //      than XInput and reads the keyboard and the mouse. For those, a
+    //      controller is useless unless something turns its buttons into the
+    //      keys they DO read — which is exactly what the landscape control
+    //      layout already does for a thumb. So each control can name a physical
+    //      button (`TouchControl.padBinding`), and pressing that button presses
+    //      that control through the SAME `InputGuard` ownership path a finger
+    //      uses: `ControlOverlayView.padPress` takes an owner, holds the
+    //      control's own `ControlRegionKind`, and lights its face.
+    //
+    // BOTH AT ONCE IS CORRECT, not a conflict. It is what a PC with a
+    // controller and a key remapper does, and a game can only notice if it
+    // reads XInput *and* the keyboard for the same action — in which case the
+    // user unbinds the control, which is what the panel is for.
+    //
+    // WHY 250 Hz AND WHY NOT A DISPLAY LINK. XInput's contract is a STATE that
+    // is current when you ask; a game may poll it at 1 kHz, and a pad sampled
+    // at the display's 60 Hz would hand that game the same sample sixteen times
+    // and then jump. `CADisplayLink` cannot exceed the refresh rate, so it is
+    // the wrong clock here however convenient it is elsewhere: a
+    // `DispatchSourceTimer` at 4 ms on a dedicated `.userInteractive` queue is.
+    // `valueChangedHandler` fires on the same queue and samples immediately, so
+    // a button transition is never waiting out the rest of a tick.
+    //
+    // WHY NOT THE MAIN QUEUE. The same reason ml665 moved the mouse off it: a
+    // sample queued behind a SwiftUI body evaluation is jitter the user feels.
+    // Everything on the pad queue either writes the shared slot (thread-safe by
+    // construction, see Winios.h) or hops to main — and the hop happens only
+    // when something CHANGED, which for buttons is rare and for sticks is
+    // throttled to 120 Hz, because `AimStickDriver` consumes its vector on a
+    // display link and cannot use anything faster.
+    // ========================================================================
+
+    /// One XInput user index per connected controller, in connection order.
+    /// Written on main (connect/disconnect), read on `padQueue`.
+    private var padSlots: [GCController?] = [nil, nil, nil, nil]
+    private let padLock = NSLock()
+
+    /// The sampling clock's queue. Serial, `.userInteractive`, and also the
+    /// `handlerQueue` of every attached controller, so a value-changed callback
+    /// and a timer tick can never interleave mid-sample.
+    private let padQueue = DispatchQueue(label: "madeira.hwinput.pad",
+                                         qos: .userInteractive)
+    /// padQueue only.
+    private var padTimer: DispatchSourceTimer?
+    private var padPackets = [UInt32](repeating: 0, count: 4)
+    private var padLastPublished = [PadSnapshot](repeating: PadSnapshot(), count: 4)
+    private var padLastApplied = PadSnapshot()
+    private var padLastStickHop: CFTimeInterval = 0
+    private var padStatAt: CFTimeInterval = 0
+    /// MAIN-THREAD mirror of the last sample the bindings acted on, for the
+    /// 1 Hz line. `padLastApplied` itself belongs to the pad queue and reading
+    /// it from `tick()` would be a plain race over a struct.
+    private var padUIState = PadSnapshot()
+
+    /// One pad's readings, in XInput units. Deliberately a value type: it is
+    /// built on the pad queue, compared there, and carried to the main queue by
+    /// copy, so there is nothing for the two threads to share.
+    struct PadSnapshot: Equatable {
+        var buttons: UInt16 = 0
+        var lt: UInt8 = 0, rt: UInt8 = 0
+        var lx: Int16 = 0, ly: Int16 = 0
+        var rx: Int16 = 0, ry: Int16 = 0
+    }
+
+    private func xlog(_ s: String) {
+        fputs("[xinput] \(s)\n", stderr)
+    }
 
     private func attachController(_ c: GCController?) {
-        guard let c, let gp = c.extendedGamepad else { return }
-        c.handlerQueue = .main
-        gp.valueChangedHandler = { [weak self] pad, _ in self?.padChanged(pad) }
+        guard let c else { return }
+        guard let gp = c.extendedGamepad else {
+            // A controller with no extended profile is a remote or a
+            // micro-gamepad: no second stick, no triggers, nothing XInput can
+            // be built out of. Say so rather than fail silently.
+            log("controller ignored: \(c.vendorName ?? "?") has no extended gamepad profile")
+            return
+        }
+
+        padLock.lock()
+        var slot = padSlots.firstIndex(where: { $0 === c })
+        if slot == nil { slot = padSlots.firstIndex(where: { $0 == nil }) }
+        if let i = slot { padSlots[i] = c }
+        padLock.unlock()
+
+        guard let i = slot else {
+            xlog("no free user index for \(c.vendorName ?? "?") (4 pads already)")
+            return
+        }
+
+        // NOT `.main` — see the banner. The handler only samples; everything
+        // that touches SwiftUI or InputGuard hops from inside padSample().
+        c.handlerQueue = padQueue
+        gp.valueChangedHandler = { [weak self] _, _ in self?.padSample() }
+
         gamepadConnected = true
+        padStartSampling()
         startTicker()
-        log("gamepad connected: \(c.vendorName ?? "controller")")
+        xlog("pad\(i) connected vendor=\(c.vendorName ?? "?") profile=extended")
     }
 
-    private func detachController() {
-        padKeys.removeAll(); padButtons.removeAll()
-        InputGuard.shared.release(padKeyOwner)
-        InputGuard.shared.release(padBtnOwner)
-        AimStickDriver.shared.end(padAimOwner)
-        padAimActive = false
-        gamepadConnected = GCController.controllers().contains { $0.extendedGamepad != nil }
-        log("gamepad disconnected")
+    private func detachController(_ c: GCController?) {
+        let live = GCController.controllers()
+        var freed: [Int] = []
+
+        padLock.lock()
+        for i in padSlots.indices {
+            guard let s = padSlots[i] else { continue }
+            // Either this is the controller that went away, or it is one the
+            // framework no longer lists — a disconnect notification names one
+            // device and we have no guarantee it names every device that left.
+            if s === c || !live.contains(where: { $0 === s }) {
+                padSlots[i] = nil
+                freed.append(i)
+            }
+        }
+        let remaining = padSlots.contains { $0 != nil }
+        padLock.unlock()
+
+        for i in freed {
+            // Clear the slot BEFORE anything else: a game polling right now
+            // must see ERROR_DEVICE_NOT_CONNECTED, not the last sample forever.
+            winios_gamepad_set_state(Int32(i), nil)
+            xlog("pad\(i) disconnected")
+        }
+        gamepadConnected = remaining
+        if !remaining {
+            padStopSampling()
+            // A button physically held when the battery died sends no up.
+            ControlOverlayView.shared.padReleaseAll("pad disconnected")
+        }
     }
 
-    private func padChanged(_ gp: GCExtendedGamepad) {
-        var keys = Set<Int32>()
-        var btns = Set<Int>()
+    private func padStartSampling() {
+        padQueue.async { [weak self] in
+            guard let self, self.padTimer == nil else { return }
+            let t = DispatchSource.makeTimerSource(queue: self.padQueue)
+            // 4 ms with 1 ms leeway: the leeway is what lets the OS coalesce
+            // this timer with whatever else is waking the core, which matters
+            // on a phone in a way it never does on a desktop.
+            t.schedule(deadline: .now(), repeating: .milliseconds(4),
+                       leeway: .milliseconds(1))
+            t.setEventHandler { [weak self] in self?.padSample() }
+            self.padTimer = t
+            t.resume()
+        }
+    }
 
-        // Left stick and d-pad both walk. 8-way, so a diagonal holds two keys —
-        // exactly what ControlOverlayView.stickKeys does for a thumb.
-        let ls = gp.leftThumbstick
-        appendStick(&keys, x: CGFloat(ls.xAxis.value), y: CGFloat(ls.yAxis.value),
-                    quad: [0x57, 0x44, 0x53, 0x41])            // W D S A
-        let dp = gp.dpad
-        if dp.up.isPressed    { keys.insert(0x26) }
-        if dp.right.isPressed { keys.insert(0x27) }
-        if dp.down.isPressed  { keys.insert(0x28) }
-        if dp.left.isPressed  { keys.insert(0x25) }
+    private func padStopSampling() {
+        padQueue.async { [weak self] in
+            self?.padTimer?.cancel()
+            self?.padTimer = nil
+        }
+    }
 
-        if gp.buttonA.isPressed { keys.insert(0x20) }           // space
-        if gp.buttonB.isPressed { keys.insert(0xA2) }           // left ctrl
-        if gp.buttonX.isPressed { keys.insert(0x45) }           // E
-        if gp.buttonY.isPressed { keys.insert(0x52) }           // R
-        if gp.leftShoulder.isPressed  { keys.insert(0x51) }     // Q
-        if gp.rightShoulder.isPressed { keys.insert(0x46) }     // F
-        if gp.leftThumbstickButton?.isPressed == true  { keys.insert(0xA0) }  // left shift
-        if gp.rightThumbstickButton?.isPressed == true { keys.insert(0x43) }  // C
-        if gp.buttonMenu.isPressed { keys.insert(0x1B) }        // escape
-        if gp.buttonOptions?.isPressed == true { keys.insert(0x09) }          // tab
+    /// One sample of every connected pad. padQueue only.
+    private func padSample() {
+        padLock.lock(); let slots = padSlots; padLock.unlock()
 
-        if gp.rightTrigger.isPressed { btns.insert(InputGuard.Btn.left) }
-        if gp.leftTrigger.isPressed  { btns.insert(InputGuard.Btn.right) }
+        for (i, c) in slots.enumerated() {
+            guard let gp = c?.extendedGamepad else { continue }
+            let snap = Self.read(gp)
 
-        if keys != padKeys { padKeys = keys; InputGuard.shared.hold(padKeyOwner, keys: keys) }
-        if btns != padButtons { padButtons = btns; InputGuard.shared.hold(padBtnOwner, buttons: btns) }
+            if snap != padLastPublished[i] {
+                padLastPublished[i] = snap
+                padPackets[i] &+= 1
+            }
+            var st = winios_gamepad()
+            st.connected = 1
+            st.buttons = snap.buttons
+            st.left_trigger = snap.lt
+            st.right_trigger = snap.rt
+            st.lx = snap.lx; st.ly = snap.ly
+            st.rx = snap.rx; st.ry = snap.ry
+            // The slot owns the packet number and only bumps it on a real
+            // change, so publishing every sample is free and keeps the
+            // connected flag alive without a second code path.
+            winios_gamepad_set_state(Int32(i), &st)
 
-        // Right stick → mouse look, through the display-link engine that already
-        // converts a held deflection into per-frame motion (a mouse has no
-        // "held right"; see AimStickDriver).
-        let rs = gp.rightThumbstick
-        let vec = HardwareInput.deflect(CGFloat(rs.xAxis.value), -CGFloat(rs.yAxis.value),
-                                        deadzone: 0.15)
-        if vec == .zero {
-            if padAimActive { padAimActive = false; AimStickDriver.shared.end(padAimOwner) }
+            // The on-screen bindings follow pad 0, which is also the pad wine
+            // presents as XInput user 0. A second controller is a second XInput
+            // user and nothing else — two people cannot share one layout.
+            if i == 0 { padDriveBindings(snap) }
+        }
+
+        let now = CACurrentMediaTime()
+        if now - padStatAt >= 10.0, slots.contains(where: { $0 != nil }) {
+            padStatAt = now
+            let s0 = padLastPublished[0]
+            xlog(String(format: "pad0 packets=%u last_buttons=0x%04x lx=%d ly=%d",
+                        padPackets[0], Int(s0.buttons), Int(s0.lx), Int(s0.ly)))
+        }
+    }
+
+    /// Decide whether this sample is worth a main-queue hop, and make it.
+    /// padQueue only.
+    private func padDriveBindings(_ snap: PadSnapshot) {
+        let last = padLastApplied
+        // A trigger is analogue, so "changed" for a BINDING means it crossed
+        // the press threshold — otherwise a resting trigger's last-bit noise
+        // would hop every 4 ms.
+        let buttonsMoved = snap.buttons != last.buttons
+            || Self.triggerOn(snap.lt) != Self.triggerOn(last.lt)
+            || Self.triggerOn(snap.rt) != Self.triggerOn(last.rt)
+        let sticksMoved = snap.lx != last.lx || snap.ly != last.ly
+            || snap.rx != last.rx || snap.ry != last.ry
+        guard buttonsMoved || sticksMoved else { return }
+
+        if !buttonsMoved {
+            // Stick-only motion: AimStickDriver consumes its vector on a
+            // display link and the dirstick only changes on an 8-way boundary,
+            // so anything past 120 Hz is thrown away on arrival.
+            let now = CACurrentMediaTime()
+            guard now - padLastStickHop >= 1.0 / 120.0 else { return }
+            padLastStickHop = now
+        }
+        padLastApplied = snap
+        DispatchQueue.main.async { [weak self] in
+            self?.padUIState = snap
+            self?.applyPadBindings(snap)
+        }
+    }
+
+    /// Press, release and steer the bound landscape controls. MAIN THREAD:
+    /// `TouchControlsModel`, `ControlOverlayView`, `InputGuard` and
+    /// `AimStickDriver` are all main-thread objects.
+    private func applyPadBindings(_ s: PadSnapshot) {
+        let ov = ControlOverlayView.shared
+        let map = Self.bindingMap(TouchControlsModel.shared.controls)
+
+        for b in PadButton.allCases where !b.isStick {
+            guard let c = map[b], Self.pressed(b, s) else {
+                ov.padRelease(b.rawValue)
+                continue
+            }
+            let d = TouchControlsModel.baseDiameter * CGFloat(c.scale)
+            ov.padPress(b.rawValue, region: c.regionID,
+                        kind: c.action.regionKind(diameter: d),
+                        label: c.action.label)
+        }
+
+        // Left stick → the 8-way control it is bound to. Same snap, same quad
+        // and the same `stickKeys` the thumb path uses, so a diagonal holds two
+        // keys exactly as it does under a finger.
+        if let c = map[.leftStick], let quad = c.action.stickKeys {
+            ov.padDir(PadButton.leftStick.rawValue, region: c.regionID, quad: quad,
+                      dir: Self.snap8(CGFloat(s.lx) / 32767, CGFloat(s.ly) / 32767,
+                                      deadzone: 0.35))
         } else {
-            if !padAimActive { padAimActive = true; AimStickDriver.shared.begin(padAimOwner) }
-            AimStickDriver.shared.steer(padAimOwner, vec)
+            ov.padRelease(PadButton.leftStick.rawValue)
         }
-        startTicker()
+
+        // Right stick → velocity mouse-look. `AimStickDriver` wants y positive
+        // DOWN (screen sense); XInput reports y positive UP, hence the one
+        // negation. It runs even with no aim control on screen whenever the
+        // game is in relative-mouse mode, because in that mode there is nothing
+        // else on the phone that can turn the camera with a controller.
+        let aim = map[.rightStick]
+        if aim != nil || InputSettings.shared.relative {
+            let v = Self.deflect(CGFloat(s.rx) / 32767, -CGFloat(s.ry) / 32767,
+                                 deadzone: 0.15)
+            ov.padAim(PadButton.rightStick.rawValue,
+                      region: aim?.action.isMouseStick == true ? aim?.regionID : nil,
+                      vec: v)
+        } else {
+            ov.padRelease(PadButton.rightStick.rawValue)
+        }
     }
 
-    /// 8-way snap with a deadzone, in stick coordinates (y positive UP).
-    private func appendStick(_ into: inout Set<Int32>, x: CGFloat, y: CGFloat, quad: [Int32]) {
-        let d = (x * x + y * y).squareRoot()
-        guard d >= 0.35, quad.count == 4 else { return }
-        var a = atan2(x, y) * 180 / .pi                // clockwise from "up"
-        if a < 0 { a += 360 }
-        switch Int((a + 22.5) / 45.0) % 8 {
-        case 0: into.insert(quad[0])
-        case 1: into.formUnion([quad[0], quad[1]])
-        case 2: into.insert(quad[1])
-        case 3: into.formUnion([quad[2], quad[1]])
-        case 4: into.insert(quad[2])
-        case 5: into.formUnion([quad[2], quad[3]])
-        case 6: into.insert(quad[3])
-        default: into.formUnion([quad[0], quad[3]])
+    /// Which control each physical button presses.
+    ///
+    /// THE DEFAULTS EXIST BECAUSE A LAYOUT WITH NO BINDINGS IS THE COMMON CASE.
+    /// Every layout saved before this feature has none, and a controller that
+    /// does nothing until the user has visited an edit panel is a controller
+    /// that looks broken. So: if the layout names no button at all, the face
+    /// buttons and bumpers fall onto the layout's own buttons in the order they
+    /// were created, and the left stick onto its first stick. One explicit
+    /// binding anywhere turns the whole default set off — a half-defaulted
+    /// layout is the one thing more confusing than no defaults.
+    static func bindingMap(_ controls: [TouchControl]) -> [PadButton: TouchControl] {
+        var map: [PadButton: TouchControl] = [:]
+        for c in controls where c.padBinding != nil { map[c.padBinding!] = c }
+        if !map.isEmpty { return map }
+
+        let order: [PadButton] = [.a, .b, .x, .y, .lb, .rb, .start, .back]
+        let buttons = controls.filter {
+            !$0.action.isStick && $0.action != .none && $0.action != .keyboardToggle
         }
+        for (i, c) in buttons.enumerated() where i < order.count { map[order[i]] = c }
+        if let stick = controls.first(where: { $0.action.stickKeys != nil }) {
+            map[.leftStick] = stick
+        }
+        if let look = controls.first(where: { $0.action.isMouseStick }) {
+            map[.rightStick] = look
+        }
+        return map
+    }
+
+    /// Is this button down in that sample? The triggers are analogue and have
+    /// no XInput bit; 30/255 is the threshold wine's own xinput1_3 uses for a
+    /// trigger keystroke, so a bound trigger and a game reading XInput agree
+    /// about when it counts as pressed.
+    private static func pressed(_ b: PadButton, _ s: PadSnapshot) -> Bool {
+        switch b {
+        case .lt: return triggerOn(s.lt)
+        case .rt: return triggerOn(s.rt)
+        default:  return b.mask != 0 && (s.buttons & b.mask) != 0
+        }
+    }
+    private static func triggerOn(_ v: UInt8) -> Bool { v > 30 }
+
+    /// One GCExtendedGamepad reading, in XInput units.
+    ///
+    /// NO DEADZONE IS APPLIED. XInput's convention is that the APPLICATION owns
+    /// the deadzone — XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE is a constant a game
+    /// may use, scale or ignore — and a driver that pre-clamps turns a game's
+    /// own handling into a second, wrong clamp on top of ours. The deadzones
+    /// further down this file are on the paths where THIS app is the consumer:
+    /// the on-screen control bindings.
+    private static func read(_ gp: GCExtendedGamepad) -> PadSnapshot {
+        var s = PadSnapshot()
+        var b: UInt16 = 0
+        if gp.buttonA.isPressed { b |= PadButton.a.mask }
+        if gp.buttonB.isPressed { b |= PadButton.b.mask }
+        if gp.buttonX.isPressed { b |= PadButton.x.mask }
+        if gp.buttonY.isPressed { b |= PadButton.y.mask }
+        if gp.leftShoulder.isPressed  { b |= PadButton.lb.mask }
+        if gp.rightShoulder.isPressed { b |= PadButton.rb.mask }
+        if gp.leftThumbstickButton?.isPressed  == true { b |= PadButton.l3.mask }
+        if gp.rightThumbstickButton?.isPressed == true { b |= PadButton.r3.mask }
+        // Menu is Start and Options is Back, which is the mapping every Xbox,
+        // PlayStation and MFi pad iOS vends agrees on. `buttonHome` (the Xbox
+        // / PS / Guide button) is deliberately NOT reported: iOS reserves it,
+        // it is how the user gets out, and XINPUT_GAMEPAD_GUIDE is an
+        // undocumented bit only XInputGetStateEx is supposed to expose anyway.
+        if gp.buttonMenu.isPressed { b |= PadButton.start.mask }
+        if gp.buttonOptions?.isPressed == true { b |= PadButton.back.mask }
+        if gp.dpad.up.isPressed    { b |= PadButton.dpadUp.mask }
+        if gp.dpad.down.isPressed  { b |= PadButton.dpadDown.mask }
+        if gp.dpad.left.isPressed  { b |= PadButton.dpadLeft.mask }
+        if gp.dpad.right.isPressed { b |= PadButton.dpadRight.mask }
+        s.buttons = b
+        s.lt = trigger(gp.leftTrigger.value)
+        s.rt = trigger(gp.rightTrigger.value)
+        s.lx = axis(gp.leftThumbstick.xAxis.value)
+        s.ly = axis(gp.leftThumbstick.yAxis.value)
+        s.rx = axis(gp.rightThumbstick.xAxis.value)
+        s.ry = axis(gp.rightThumbstick.yAxis.value)
+        return s
+    }
+
+    /// GameController reports −1…1; XInput reports −32768…32767. Scaling by
+    /// 32767 (not 32768) is what makes full deflection land exactly on the
+    /// positive limit instead of one count short of it, and the clamp is what
+    /// stops a pad that overshoots slightly from wrapping to a full deflection
+    /// in the OPPOSITE direction.
+    private static func axis(_ v: Float) -> Int16 {
+        let s = (Double(v) * 32767.0).rounded()
+        return Int16(max(-32768.0, min(32767.0, s)))
+    }
+    private static func trigger(_ v: Float) -> UInt8 {
+        UInt8(max(0.0, min(255.0, (Double(v) * 255.0).rounded())))
+    }
+
+    /// 8-way snap in STICK coordinates (y positive UP), returning the same
+    /// 0-7 index `ControlOverlayView.snap` produces — 0 is up, clockwise — or
+    /// −1 for centred. Shared convention, so a control steered by a thumb and
+    /// the same control steered by a stick hold the identical key set.
+    private static func snap8(_ x: CGFloat, _ y: CGFloat, deadzone: CGFloat) -> Int {
+        let d = (x * x + y * y).squareRoot()
+        guard d >= deadzone else { return -1 }
+        var a = atan2(x, y) * 180 / .pi            // clockwise from "up"
+        if a < 0 { a += 360 }
+        return Int((a + 22.5) / 45.0) % 8
     }
 
     /// Analogue deflection rescaled from the deadzone edge, so the first
@@ -1077,7 +1364,7 @@ final class HardwareInput: ObservableObject {
         let dx = tickDX, dy = tickDY, wheelN = tickWheel
         motionLock.unlock()
         let idle = tickKeys == 0 && wheelN == 0 && dx == 0 && dy == 0
-            && heldVKs.isEmpty && heldButtons.isEmpty && padKeys.isEmpty && padButtons.isEmpty
+            && heldVKs.isEmpty && heldButtons.isEmpty && !gamepadConnected
         if idle {
             // Nothing moved and nothing is held: stand down rather than print a
             // line a second for the rest of the session.
@@ -1086,10 +1373,17 @@ final class HardwareInput: ObservableObject {
             return
         }
         let keys = heldVKs.sorted().map { String(format: "%02x", $0) }.joined(separator: ",")
-        let pad = padKeys.sorted().map { String(format: "%02x", $0) }.joined(separator: ",")
+        // ml668: the pad's own held-set belongs to ControlOverlayView now, so
+        // what this line can honestly report about it is the RAW sample —
+        // which is also the more useful number, because it separates "the pad
+        // is not reporting" from "the pad is reporting and nothing is bound".
+        let p = padUIState
+        let pad = gamepadConnected
+            ? String(format: "pad=0x%04x lx=%d ly=%d rx=%d ry=%d",
+                     Int(p.buttons), Int(p.lx), Int(p.ly), Int(p.rx), Int(p.ry))
+            : "pad=none"
         log("keys_down=[\(keys)] mouse_dx=\(Int(dx)) mouse_dy=\(Int(dy)) "
-            + "buttons=\(heldButtons.sorted()) wheel=\(wheelN) "
-            + "pad=[\(pad)] padbtn=\(padButtons.sorted()) "
+            + "buttons=\(heldButtons.sorted()) wheel=\(wheelN) \(pad) "
             + "lock=\(pointerLocked ? "on" : "off") path=\(mousePath.rawValue) "
             + "events=\(tickKeys)")
         tickKeys = 0

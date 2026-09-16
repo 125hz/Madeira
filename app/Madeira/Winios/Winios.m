@@ -25,11 +25,19 @@
 #import <os/log.h>
 #include <stdarg.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <sys/time.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+/* ml668: the gamepad slot's struct and button bits live in the app-facing
+ * header, because Swift includes the same file. Including it here is also the
+ * only thing that keeps the two sides' signatures honest — everything else in
+ * this file is reached through a bridging header the compiler never compares
+ * against these definitions. */
+#include "Winios.h"
 
 /* csops syscall — CS_DEBUGGED is the flag StikDebug JIT rides on. Declared by
  * hand for the same reason JITAllocator.c does: <sys/codesign.h> is not in the
@@ -1661,6 +1669,118 @@ void winios_pointer(int x, int y, unsigned int flags, unsigned int data) {
         if (flags & MOUSEEVENTF_ABSOLUTE) winios_cursor_move(x, y);
         else if (g_rel_cursor) winios_cursor_advance(x, y);
     }
+}
+
+/* ============================================================ *
+ * ml668 — the gamepad slots. See the long comment in Winios.h for why this
+ * is a state and not a queue, and why the reader uses a seqlock.
+ * ============================================================ */
+
+struct winios_gamepad_slot {
+    _Atomic unsigned int seq;          /* even = stable, odd = writer inside */
+    struct winios_gamepad st;
+};
+
+static struct winios_gamepad_slot g_pads[WINIOS_GAMEPAD_MAX];
+/* Serialises WRITERS only. Readers never take it — that is the point. The app
+ * publishes from one queue today, but a second producer (a future second pad
+ * source) must not be able to interleave two odd sequences on one slot. */
+static pthread_mutex_t g_pads_write_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic unsigned int g_pad_samples, g_pad_packets;
+
+/* Everything except `packet` — the identity a change is measured against. */
+static inline int winios_gamepad_same(const struct winios_gamepad *a,
+                                      const struct winios_gamepad *b) {
+    return a->buttons == b->buttons
+        && a->left_trigger == b->left_trigger && a->right_trigger == b->right_trigger
+        && a->lx == b->lx && a->ly == b->ly && a->rx == b->rx && a->ry == b->ry
+        && a->connected == b->connected;
+}
+
+void winios_gamepad_set_state(int index, const struct winios_gamepad *st) {
+    struct winios_gamepad_slot *slot;
+    struct winios_gamepad next;
+    unsigned int seq;
+
+    if (index < 0 || index >= WINIOS_GAMEPAD_MAX) return;
+    slot = &g_pads[index];
+
+    if (st) next = *st;
+    else { memset(&next, 0, sizeof(next)); }
+    next.reserved[0] = next.reserved[1] = next.reserved[2] = 0;
+
+    pthread_mutex_lock(&g_pads_write_lock);
+    atomic_fetch_add_explicit(&g_pad_samples, 1, memory_order_relaxed);
+    if (winios_gamepad_same(&next, &slot->st)) {
+        /* Nothing moved. Leaving the packet number alone is the CONTRACT: a
+         * game that re-polls and sees the same packet skips its own input
+         * processing entirely, which is most of what XInput's packet number is
+         * for. Bumping it here would make every poll look like a new report. */
+        pthread_mutex_unlock(&g_pads_write_lock);
+        return;
+    }
+    /* A packet number of 0 is indistinguishable from "never reported" to some
+     * engines, so the first change lands on 1 and it only ever grows. */
+    next.packet = slot->st.packet + 1;
+    if (!next.packet) next.packet = 1;
+
+    seq = atomic_load_explicit(&slot->seq, memory_order_relaxed);
+    atomic_store_explicit(&slot->seq, seq + 1, memory_order_relaxed);   /* odd */
+    atomic_thread_fence(memory_order_release);
+    slot->st = next;
+    atomic_thread_fence(memory_order_release);
+    atomic_store_explicit(&slot->seq, seq + 2, memory_order_relaxed);   /* even */
+    atomic_fetch_add_explicit(&g_pad_packets, 1, memory_order_relaxed);
+    pthread_mutex_unlock(&g_pads_write_lock);
+
+    {
+        /* One line per connect/disconnect edge, never per sample: this runs at
+         * 250 Hz and a log line per report would bury the rest of the session. */
+        static unsigned char was_connected[WINIOS_GAMEPAD_MAX];
+        if (was_connected[index] != next.connected) {
+            was_connected[index] = next.connected;
+            fprintf(stderr, "[winios] gamepad slot %d %s\n",
+                    index, next.connected ? "connected" : "disconnected");
+            fflush(stderr);
+        }
+    }
+}
+
+int winios_gamepad_get_state(int index, struct winios_gamepad *out) {
+    struct winios_gamepad_slot *slot;
+    struct winios_gamepad copy;
+    unsigned int s0, s1;
+    int tries;
+
+    if (index < 0 || index >= WINIOS_GAMEPAD_MAX) {
+        if (out) memset(out, 0, sizeof(*out));
+        return 0;
+    }
+    slot = &g_pads[index];
+
+    /* Bounded, because an unbounded retry loop on a hot poll is a hang waiting
+     * for a scheduling accident. Four attempts is far more than a 16-byte copy
+     * can lose to a writer that only runs 250 times a second; if all four lose,
+     * report the pad as absent for this one poll rather than hand the game a
+     * torn sample — the next poll is a millisecond away. */
+    for (tries = 0; tries < 4; tries++) {
+        s0 = atomic_load_explicit(&slot->seq, memory_order_acquire);
+        if (s0 & 1u) continue;
+        copy = slot->st;
+        atomic_thread_fence(memory_order_acquire);
+        s1 = atomic_load_explicit(&slot->seq, memory_order_relaxed);
+        if (s0 != s1) continue;
+        if (!copy.connected) break;
+        if (out) *out = copy;
+        return 1;
+    }
+    if (out) memset(out, 0, sizeof(*out));
+    return 0;
+}
+
+void winios_gamepad_stats(unsigned int *samples, unsigned int *packets) {
+    if (samples) *samples = atomic_load_explicit(&g_pad_samples, memory_order_relaxed);
+    if (packets) *packets = atomic_load_explicit(&g_pad_packets, memory_order_relaxed);
 }
 
 /* ============================================================ *

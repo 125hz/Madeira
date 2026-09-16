@@ -276,10 +276,64 @@ final class MetalBackedView: UIView {
     // Run) directly instead of relying on the browse list.
     static weak var keyboardTarget: MetalBackedView?
     override var canBecomeFirstResponder: Bool { true }
+
+    /// `keyboardTarget` is reassigned in didMoveToWindow(window: non-nil), but
+    /// rotation destroys/recreates this placeholder (SwiftUI switches between
+    /// the portrait/landscape branches, each its own identity — see the
+    /// comment on that if/else in ContentView.body), and nothing clears the
+    /// weak reference on the way OUT: didMoveToWindow(window: nil) early-
+    /// returns without touching it. So there is a real window, between the
+    /// old placeholder's teardown and the new one's attach, where
+    /// `keyboardTarget` still points at a view whose `.window` is nil — a
+    /// `becomeFirstResponder()` on that view fails silently, which is exactly
+    /// "tap the keyboard button, nothing happens." Resolve fresh at tap time
+    /// instead of trusting the cached weak var: fall back to walking the live
+    /// window hierarchy for whichever MetalBackedView is actually attached
+    /// right now, and adopt it.
+    private static func resolveKeyboardTarget() -> MetalBackedView? {
+        if let t = keyboardTarget, t.window != nil { return t }
+        for scene in UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }) {
+            for window in scene.windows {
+                if let found = firstMetalBackedView(in: window) {
+                    keyboardTarget = found
+                    return found
+                }
+            }
+        }
+        return keyboardTarget   // last resort: whatever we had, even if stale
+    }
+
+    private static func firstMetalBackedView(in view: UIView) -> MetalBackedView? {
+        if let v = view as? MetalBackedView { return v }
+        for sub in view.subviews {
+            if let found = firstMetalBackedView(in: sub) { return found }
+        }
+        return nil
+    }
+
     static func toggleKeyboard() {
-        guard let v = keyboardTarget else { return }
-        if v.isFirstResponder { v.resignFirstResponder() }
-        else { v.becomeFirstResponder() }
+        let target = resolveKeyboardTarget()
+        guard let v = target else {
+            fputs("[keyboard] show target=nil isFirstResponder=n/a window=nil " +
+                  "(no live MetalBackedView found)\n", stderr)
+            return
+        }
+        // Forced onto the main queue, after a layout pass, so a tap that
+        // lands mid-rotation (the placeholder just got a new frame/window)
+        // never races becomeFirstResponder against layout still settling.
+        DispatchQueue.main.async {
+            v.window?.layoutIfNeeded()
+            let id = ObjectIdentifier(v)
+            if v.isFirstResponder {
+                let ok = v.resignFirstResponder()
+                fputs("[keyboard] hide target=\(id) isFirstResponder=\(v.isFirstResponder) " +
+                      "window=\(String(describing: v.window)) resigned=\(ok)\n", stderr)
+            } else {
+                let ok = v.becomeFirstResponder()
+                fputs("[keyboard] show target=\(id) isFirstResponder=\(v.isFirstResponder) " +
+                      "window=\(String(describing: v.window)) became=\(ok)\n", stderr)
+            }
+        }
     }
 
     override init(frame: CGRect) {
@@ -1968,6 +2022,10 @@ final class ControlOverlayView: UIView {
     /// The app went away, or the reconciler decided nothing can still be held.
     func dropAllTouches(_ why: String) {
         for k in Array(tracked.keys) { finish(key: k, why: why) }
+        // ml668: a pad hold is a finger by every other rule in this file, so it
+        // goes the same way a finger does when the app stops being able to
+        // observe input at all.
+        padReleaseAll(why)
     }
 
     private func begin(_ t: UITouch) {
@@ -2135,6 +2193,134 @@ final class ControlOverlayView: UIView {
             pad.held = false
             pad.vec = nil
         }
+    }
+
+    // MARK: ml668 — a physical controller button pressing an on-screen control
+    //
+    // THE RULE THIS OBEYS. A pad button is a SECOND FINGER, not a second input
+    // system. It takes an `InputGuard` owner exactly as a touch does, it holds
+    // exactly the `ControlRegionKind` that touch would have held, and it
+    // publishes into the same `ControlFaces` state — so the reconciler in
+    // `InputGuard.tick`, the coalescing ring behind `winios_post_key` and every
+    // diagnostic that counts owners see one more finger and nothing they have
+    // to be taught about.
+    //
+    // THE OWNER KIND IS THE BUTTON: one owner per physical button, for the life
+    // of the session. Per-button rather than per-control is what makes
+    // rebinding safe — moving a binding from one control to another restates
+    // that one owner's key set and disturbs nothing else — and it is what lets
+    // `padReleaseAll` be a complete, idempotent valve.
+    //
+    // A pad hold deliberately does NOT go in `tracked`: that table is keyed by
+    // `UITouch` identity and every sweep in it asks UIKit whether the touch is
+    // still alive. A button has no UITouch to ask about, and its release comes
+    // from the sampler (or from `padReleaseAll`), which cannot be lost the way
+    // a cancelled gesture can.
+
+    private struct PadHold {
+        let region: String
+        let owner: Int
+        var dir: Int = -1
+        var aiming = false
+    }
+    private var padHolds: [String: PadHold] = [:]
+    private var padOwners: [String: Int] = [:]
+
+    private func padOwner(_ button: String) -> Int {
+        if let o = padOwners[button] { return o }
+        let o = InputGuard.newOwner()
+        padOwners[button] = o
+        return o
+    }
+
+    /// Hold `rid` with `kind` on behalf of `button`. Idempotent: called every
+    /// sample while the button is down, it costs one dictionary lookup after
+    /// the first. `label` is for the log line only.
+    func padPress(_ button: String, region rid: String,
+                  kind: ControlRegionKind, label: String) {
+        if let h = padHolds[button], h.region == rid, !h.aiming { return }
+        padRelease(button)                       // rebound, or was aiming
+        let owner = padOwner(button)
+        padHolds[button] = PadHold(region: rid, owner: owner)
+        ControlFaces.state(rid).down = true
+        switch kind {
+        case .keys(let k):    InputGuard.shared.hold(owner, keys: k)
+        case .buttons(let b): InputGuard.shared.hold(owner, buttons: b)
+        case .tapKey(let vk):
+            // Momentary, exactly as the touch path spells it: a physical
+            // button held down on a tap-key control still sends one pair.
+            winios_post_key(vk, 1)
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.06) { winios_post_key(vk, 0) }
+        case .keyboardToggle:
+            MetalBackedView.toggleKeyboard()
+        case .dirStick, .aimStick, .inert:
+            // A stick control bound to a BUTTON holds nothing — the button has
+            // no direction to steer with. It still takes the hold so the face
+            // lights and the binding is visibly doing something.
+            break
+        }
+        fputs("[input] pad \(button) down on \(rid) (\(label)) kind=\(kind.name)\n", stderr)
+    }
+
+    /// Release whatever `button` is holding. A no-op when it holds nothing, so
+    /// the sampler can call it unconditionally on every up edge.
+    func padRelease(_ button: String) {
+        guard let h = padHolds.removeValue(forKey: button) else { return }
+        InputGuard.shared.release(h.owner)
+        AimStickDriver.shared.steer(h.owner, .zero)
+        AimStickDriver.shared.end(h.owner)
+        guard !h.region.isEmpty else { return }
+        let face = ControlFaces.state(h.region)
+        face.down = false
+        face.dir = -1
+        face.vec = nil
+        if let r = regions[h.region] { closePad(r) }
+    }
+
+    /// An 8-way direction from a physical stick, into a dirstick control.
+    /// `dir` is -1 for centred, else the same 0-7 the touch path uses.
+    func padDir(_ button: String, region rid: String, quad: [Int32], dir: Int) {
+        if padHolds[button]?.region != rid {
+            padRelease(button)
+            padHolds[button] = PadHold(region: rid, owner: padOwner(button))
+            if let r = regions[rid] { openPad(r) }
+        }
+        guard padHolds[button]?.dir != dir else { return }
+        padHolds[button]?.dir = dir
+        // ml661's rule again: state the SET, never the edges.
+        InputGuard.shared.hold(padOwner(button), keys: Set(Self.stickKeys(dir, quad)))
+        let face = ControlFaces.state(rid)
+        face.down = dir != -1
+        face.dir = dir
+        if let r = regions[rid] { r.pad?.dir = dir }
+    }
+
+    /// Velocity mouse-look from a physical stick. `rid` may be nil: a game in
+    /// relative-mouse mode gets pad look whether or not the layout has an aim
+    /// control to light up.
+    func padAim(_ button: String, region rid: String?, vec: CGSize) {
+        if vec == .zero { padRelease(button); return }
+        if padHolds[button] == nil {
+            padHolds[button] = PadHold(region: rid ?? "", owner: padOwner(button),
+                                       dir: -1, aiming: true)
+            AimStickDriver.shared.begin(padOwner(button))
+        }
+        AimStickDriver.shared.steer(padOwner(button), vec)
+        if let rid {
+            let face = ControlFaces.state(rid)
+            face.down = true
+            face.vec = vec
+            if let r = regions[rid] { r.pad?.vec = vec }
+        }
+    }
+
+    /// Every pad hold, gone. The controller disconnected, the app resigned
+    /// active, or `InputGuard.releaseAll` decided nothing can still be held.
+    func padReleaseAll(_ why: String) {
+        guard !padHolds.isEmpty else { return }
+        let n = padHolds.count
+        for b in Array(padHolds.keys) { padRelease(b) }
+        fputs("[input] pad releaseAll(\(why)) released \(n)\n", stderr)
     }
 
     private static func stickKeys(_ d: Int, _ q: [Int32]) -> [Int32] {
@@ -2496,6 +2682,13 @@ final class InputSettings: ObservableObject {
     @Published var displayMode: DisplayMode = .aspect {
         didSet { save(); MetalBackedView.refreshDisplayMode() }
     }
+    /// Landscape HUD cluster (controller/pencil buttons, TouchControlsOverlay.
+    /// topBar) drag position — fractional (0...1) of the screen, one slot per
+    /// rotation because the notch/home-indicator sit on opposite sides, so a
+    /// spot dragged clear of them in one is inside them in the other. nil
+    /// means "no drag yet, use the default top-center placement."
+    @Published var hudPosLandscapeLeft:  CGPoint? = nil { didSet { save() } }
+    @Published var hudPosLandscapeRight: CGPoint? = nil { didSet { save() } }
 
     /// didSet fires for assignments made in init() because the properties are
     /// already initialised by then; without this the first launch would write
@@ -2518,17 +2711,27 @@ final class InputSettings: ObservableObject {
             ignoreTouchesWithMouse = j["ignoreTouchesWithMouse"] as? Bool ?? true
             diagnostics = j["diagnostics"] as? Bool ?? false
             displayMode = (j["displayMode"] as? String).flatMap(DisplayMode.init(rawValue:)) ?? .aspect
+            hudPosLandscapeLeft  = Self.point(from: j["hudPosLandscapeLeft"])
+            hudPosLandscapeRight = Self.point(from: j["hudPosLandscapeRight"])
         }
         loading = false
         madeira_set_diag_enabled(diagnostics ? 1 : 0)   // push the restored value down
     }
 
+    private static func point(from v: Any?) -> CGPoint? {
+        guard let d = v as? [String: Any],
+              let nx = d["nx"] as? Double, let ny = d["ny"] as? Double else { return nil }
+        return CGPoint(x: nx, y: ny)
+    }
+
     private func save() {
         guard !loading else { return }
-        let j: [String: Any] = ["relative": relative, "sensAbs": sensAbs, "sensRel": sensRel,
+        var j: [String: Any] = ["relative": relative, "sensAbs": sensAbs, "sensRel": sensRel,
                                 "sensMouse": sensMouse, "diagnostics": diagnostics,
                                 "ignoreTouchesWithMouse": ignoreTouchesWithMouse,
                                 "displayMode": displayMode.rawValue]
+        if let p = hudPosLandscapeLeft  { j["hudPosLandscapeLeft"]  = ["nx": Double(p.x), "ny": Double(p.y)] }
+        if let p = hudPosLandscapeRight { j["hudPosLandscapeRight"] = ["nx": Double(p.x), "ny": Double(p.y)] }
         guard let d = try? JSONSerialization.data(withJSONObject: j) else { return }
         try? d.write(to: Self.url, options: .atomic)
     }
@@ -2552,6 +2755,11 @@ struct ContentView: View {
     @ObservedObject private var hw = HardwareInput.shared
     @State private var pointerPanel = false
     @Namespace private var pointerNS
+    /// Custom… launch button (below): the popup's visibility and the path it
+    /// edits, prefilled from `customExePathKey` when the button is tapped.
+    @State private var showCustomLaunchAlert = false
+    @State private var customExePath: String =
+        UserDefaults.standard.string(forKey: ContentView.customExePathKey) ?? ""
     /// .compact = iPhone landscape: game surface expands, arrow keys appear.
     @Environment(\.verticalSizeClass) private var vSizeClass
 
@@ -2562,44 +2770,18 @@ struct ContentView: View {
     /// full path, routing 32- or 64-bit accordingly. So a 64-bit entry belongs
     /// here just as much as a 32-bit one, and the old name only misled.
     ///
-    /// Add a row to wire up another target — no other code needed. Entries are
-    /// keyed by `exe` in the ForEach, so each path must be unique.
-    private let launchTargets: [(label: String, exe: String)] = [
-        ("D3D9 cube", "d3d9-cube-x86.exe"),
-        // WOW64_DESIGN.md section 8.4, measurement 2: prints
-        // "MADEIRA-BENCH: unix-call ns/call = N" and exits 44.
-        ("Unix-call bench", "unixcall-bench-x86.exe"),
-        ("Fastsync stress", "sync-x86.exe"),
-        ("FS lookup stress", "fs-x86.exe"),
-        // ml962: ReadProcessMemory/WriteProcessMemory robustness — prints
-        // MADEIRA-READVM lines and exits 48. build/x86-tests/readvm-x86.c
-        // lists what every other status means.
-        ("ReadProcessMemory", "readvm-x86.exe"),
-        // 2026-09-14: the virtual monitor's mode table and a real
-        // ChangeDisplaySettings — enumerates modes, switches to 800x600 and
-        // checks that the screen metrics, GetMonitorInfo and WM_DISPLAYCHANGE
-        // all agree, then restores. Exits 51. build/x86-tests/dispmode-x86.c
-        // lists what every other status means.
-        ("Display modes", "dispmode-x86.exe"),
-        // 2026-09-14: the guest-window CONCURRENCY test. Spawns ITSELF three
-        // levels deep, every level staying alive and blocked on its child, so
-        // each live 32-bit pseudo-process needs its own 4 GB window slot.
-        // Exits 49 when the whole chain ran; a CreateProcess failure prints
-        // "MADEIRA-SPAWN CONCURRENCY LIMIT: depth=N", which is the direct
-        // measurement of how many concurrent 32-bit processes fit.
-        // build/x86-tests/spawn-x86.c lists every other status.
-        ("Spawn chain", "spawn-x86.exe"),
-        // 2026-09-14: SuspendThread / GetThreadContext / SetThreadContext /
-        // ResumeThread on a 64-bit thread running EMULATED code. Asserts that
-        // the reported Rsp is inside the target thread's own stack and the
-        // reported Rip inside the exe image, redirects the thread to a landing
-        // function and puts the original context back, 200 times. Exits 50 on
-        // success; build/x64-tests/ctx-x64.c lists every other status.
-        ("Thread context (x64)", "ctx-x64.exe"),
+    /// Trimmed to the shipped/user-facing set (2026-09-15) — the rest of the
+    /// diagnostic exes (unix-call bench, fastsync/FS/readvm/spawn/dispmode/ctx
+    /// tests, …) stay in the bundle and keep working through this exact
+    /// mechanism; they just no longer get a button. Add a row back to wire one
+    /// up again — no other code needed. Entries are keyed by `exe` in the
+    /// ForEach, so each path must be unique.
+    private let launchTargets: [(label: String, exe: String, tint: Color)] = [
+        ("INSIDE", #"C:\INSIDE\INSIDE.exe"#, .orange),
+        ("D3D9 cube", "d3d9-cube-x86.exe", .purple),
         // Full Win32 path passed verbatim to MADEIRA_EXE — WineProcessBridge
         // detects the backslash and launches it as-is (no syswow64 prefix).
-        (#"Mirror's Edge"#, #"C:\Mirrors-Edge\Mirror's Edge\Binaries\MirrorsEdge.exe"#),
-        ("INSIDE", #"C:\INSIDE\INSIDE.exe"#),
+        (#"Mirror's Edge"#, #"C:\Mirrors-Edge\Mirror's Edge\Binaries\MirrorsEdge.exe"#, .pink),
     ]
 
     enum JITStatus {
@@ -2880,17 +3062,14 @@ struct ContentView: View {
             input.displayMode = input.displayMode.next
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
         } label: {
-            HStack(spacing: 4) {
-                Image(systemName: input.displayMode.symbol)
-                    .font(.system(size: 15, weight: .medium))
-                Text(input.displayMode.label)
-                    .font(.system(size: 13, weight: .semibold))
-            }
-            .frame(minWidth: 74, minHeight: 32)
-            .background(Color.secondary.opacity(0.25))
-            .cornerRadius(6)
+            Image(systemName: input.displayMode.symbol)
+                .font(.system(size: 17, weight: .medium))
+                .frame(minWidth: 40, minHeight: 32)
+                .background(Color.secondary.opacity(0.25))
+                .cornerRadius(6)
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(input.displayMode.label)
     }
 
     private var pointerModeToggle: some View {
@@ -2982,282 +3161,6 @@ struct ContentView: View {
     private var actionButtons: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 12) {
-                Button("Enable JIT") {
-                    enableJITViaStikDebug()
-                }
-                .buttonStyle(.borderedProminent)
-
-                Button("Steam Testing") {
-                    // Steam S3 first boot: virtual desktop (Steam needs a
-                    // window manager) + services.exe (SCM → rpcss for Steam's
-                    // COM, the chain proven in the rpcss milestone) + steam.exe
-                    // itself, all launched by C:\steam-launch.bat (pushed to
-                    // the prefix). Batch avoids quote-escaping hell; combase's
-                    // 5s OpenSCManager retry covers the services-vs-steam race.
-                    // Steam install = CrossOver copy at C:\Program Files (x86)\
-                    // Steam (all boot binaries verified x86-64; steamwebhelper
-                    // /libcef = 209MB → watch pool: first webhelper may fit,
-                    // multiples need .text sharing). Flags: -no-cef-sandbox
-                    // (sandbox can't work in Wine), -cef-disable-gpu (software
-                    // render), -console (Steam's own log → our stderr). Steam
-                    // WILL try to self-update through our GnuTLS stack — that
-                    // attempt is itself an informative S0 re-test.
-                    let deskW = 1024, deskH = 768
-                    // ml589: find Steam and (re)write the launch batch. Returns
-                    // false — having logged why — when there is nothing to run.
-                    guard prepareSteamLaunch() else { return }
-                    // ml590 STEP 1 (one-run phase check, NOT a timing measurement):
-                    // arm the ml578 sock-wire probe. It answers exactly one
-                    // question — does today's ~1s CM failure reach the same TLS
-                    // phase ml578 did (ServerHello -> client Finished -> server
-                    // encrypted records), or does it die earlier?
-                    //
-                    // Its numbers are NOT trustworthy as timings: no monotonic
-                    // clock, a getpeername() before EVERY send/recv even after the
-                    // 12-line budget is spent, and synchronous dprintf() on a path
-                    // whose whole ping budget is 1000ms — it perturbs what it
-                    // measures, which is why ml579 gated it off. Step 2 replaces it
-                    // with a per-socket timeline (cached peer, generation counter,
-                    // one line at close) that can be trusted for timing.
-                    //
-                    // COLD LAUNCH REQUIRED: ios_sock_wire() latches this env into a
-                    // static on its FIRST call (socket.c:842), so if any earlier
-                    // Wine session in this app process already touched a socket the
-                    // flag is stuck off. Force-quit, launch, press this first.
-                    // ml591: the phase question is ANSWERED, so the per-event
-                    // probe goes back off — it distorts the very budget step 2
-                    // measures. [sock-tl] replaces it and needs no env var.
-                    unsetenv("MADEIRA_SOCK_WIRE")
-                    // ml594 A/B: post-login hang = FEX optimizer NONTERMINATION.
-                    // Chrome_InProcRendererThread (wtid 0208) sampled 9x at
-                    // 97-100% CPU (cpu=277 -> 918, run=1) inside
-                    // DeadFlagCalculationEliminination::ProcessBlock while EVERY
-                    // other thread sat at cpu=0 and Steam presented ZERO further
-                    // frames. One CompileBlock entered that pass and never came
-                    // back, and the thread holds a fexlock read ref, so it can
-                    // stall other FEX threads too. NOT a network/cryptnet/wineserver
-                    // wait — our new guards never fired.
-                    //
-                    // FEX_O0 disables the default x87 + dead-flag passes
-                    // (FEXCore/Source/Interface/IR/PassManager.cpp:70). Slower, but
-                    // if the hang disappears the pass is convicted and the next step
-                    // is disabling ONLY CreateDeadFlagCalculationEliminination().
-                    // ml596: FEX_O0 has NEVER ACTUALLY BEEN TESTED, and my earlier
-                    // comment here blaming it for an execute fault was WRONG.
-                    // ml595 died because the JIT pool never existed: all three
-                    // placement attempts returned 0x7000000000 (the forbidden guest
-                    // 64G window), we logged "continuing without it", and Wine then
-                    // ran with `pool not initialised` -- so LdrInitializeThunk stayed
-                    // at its PE address 0x71ffd77654 instead of being redirected into
-                    // the pool (a healthy run logs `redirected PC 0x71ffd77654 ->
-                    // 0x12078f654`). The execute fault was the guaranteed consequence
-                    // of launching without the execution substrate, and pool placement
-                    // happens HERE in Swift before FEX reads any env var -- FEX_O0
-                    // cannot influence it. (Caught by Sol.)
-                    //
-                    // Convict the dead-flag pass with a targeted FEX build that
-                    // disables ONLY CreateDeadFlagCalculationEliminination(); broad O0
-                    // also drops the x87 pass and proves less. unsetenv keeps a stale
-                    // value from a previous launch out of play.
-                    unsetenv("FEX_O0")
-                    // ml597 A/B: remove ONLY DeadFlagCalculationEliminination, the pass
-                    // the renderer thread was pinned inside during the ml594 hang.
-                    // Everything else in the pipeline (incl. x87) stays exactly as in a
-                    // known-good run, so a result here implicates or clears this one pass.
-                    // The [dfe-guard] bounds ship active in BOTH arms — if the pass is
-                    // exonerated and the hang recurs, they still name the failure mode.
-                    // ml598 ISOLATION RUN: gate OFF, same rebuilt FEX.
-                    // ml597 crashed with c000001d (ILLEGAL INSTRUCTION) after the
-                    // desktop came up, but that run changed TWO things at once: my
-                    // DFE gate AND ~107 lines of FEX source committed today that had
-                    // never been built — the shipped xtajit64.dll dated Aug 6 while
-                    // Core.cpp/IosJitAlias.cpp/TSOHandlerConfig.h and a net rewrite of
-                    // WinAPI/IO.cpp were newer. Any of those can produce a
-                    // miscompilation-shaped fault, so ml597 convicts nothing.
-                    //   crashes again -> the REBUILD is at fault, DFE still untested
-                    //   runs fine     -> disabling DFE is what breaks it
-                    unsetenv("MADEIRA_NO_DFE")
-                    // ml599: name the pass that corrupts the IR list.
-                    //
-                    // ml598 settled the mechanism: FEX hangs walking a block
-                    // BACKWARDS because the intrusive Previous chain never reaches
-                    // CodeBegin. Two passes make that assumption —
-                    // DeadFlagCalculationEliminination::ProcessBlock and
-                    // ConstrainedRAPass::Run — and the store-page freeze was the
-                    // second one (PC pinned inside libarm64ecfex.dll RVA
-                    // 0x100b0c-0x100cdc, all within ConstrainedRAPass::Run, for
-                    // minutes at ~100% CPU while frames stayed at 4,114).
-                    //
-                    // Both now validate the block BEFORE touching it and repair the
-                    // Previous chain from the forward chain when that is intact, so
-                    // the hang should be gone either way. This var adds the sweep
-                    // that reports WHICH pass first breaks the list, so the run also
-                    // produces the root cause and not just the containment.
-                    // ml601: SWEEP OFF. Two runs checked 118M and 47M blocks and found
-                    // corruption exactly once (block 260, ml599b) — the after-every-pass
-                    // sweep is not earning its cost, and it taxes every large compile.
-                    // The unconditional parts STAY ON regardless of this variable: the
-                    // cheap backward check at DFE and RA entry, the repair, and the
-                    // bounded-walk guards. Only the attribution sweep is disabled.
-                    // Set it again for a run that is specifically hunting the corrupter.
-                    unsetenv("MADEIRA_IR_TOPO")
-                    // ml623: TARGETED IR/RA CAPTURE for the ULTRAKILL Mono wall.
-                    //
-                    // FEX miscompiles ONE instruction in Mono's x86-64 emitter:
-                    //   mono-2.0-bdwgc.dll+0x4db25b   mov byte ptr [rcx+2], al
-                    // With RCX=0x7040140010 (valid, a fresh RWX code buffer) and AL=0x4c,
-                    // it emitted `movz w6,#0x44 ; orr x8,x8,x6 ; dmb ish ; strb w8,[x6,xzr]`
-                    // -- the address register still held the IMMEDIATE because the
-                    // `add x6, x0, #2` that BOTH sibling branches emit was never generated,
-                    // so the store landed on 0x44.
-                    //
-                    // This prints that instruction's IR after the frontend and after every
-                    // pass, plus the emitted host bytes. The last stage at which the address
-                    // computation still exists names the culprit: frontend/decoder, a named
-                    // pass, RA liveness, or the ARM emitter.
-                    //
-                    // Compile-time only, capped at 4 captures. Unset it for a normal run.
-                    setenv("MADEIRA_IRCAP_RVA", "0x4db25b", 1)
-                    setenv("MADEIRA_IRCAP_MODULE", "mono-2.0-bdwgc.dll", 1)
-                    setenv("MADEIRA_EXE", "explorer.exe", 1)
-                    setenv("MADEIRA_ARGS",
-                           "/desktop=shell,\(deskW)x\(deskH) cmd /c C:\\steam-launch.bat", 1)
-                    setenv("MADEIRA_DESKTOP", "1", 1)
-                    setenv("MADEIRA_SCREEN_W", String(deskW), 1)
-                    setenv("MADEIRA_SCREEN_H", String(deskH), 1)
-                    // explorer owns the size in desktop mode; say so in the
-                    // [display] virtual monitor line win32u prints at session start.
-                    setenv("MADEIRA_SCREEN_SRC", "desktop", 1)
-                    // ml371: surfdump ground truth — the "frozen desktop"
-                    // question (fresh pixels never presented vs nothing
-                    // painting upstream) is undecidable from the log alone
-                    // because the [winios] present line caps at 12.
-                    // ml556: surface PNG dumping also off for the clean baseline —
-                    // it encodes a PNG on the present path. Restore "1" to re-enable.
-                    unsetenv("MADEIRA_DUMP_SURFACES")
-                    // ml493: bursts of N CONSECUTIVE frames per window. The
-                    // login window's black regions change every frame, which
-                    // the 2s-throttled first/latest dump can never show —
-                    // adjacent frames are the only way to measure what moves.
-                    setenv("MADEIRA_SURF_SEQ", "10", 1)
-                    // ml515: SRCWATCH RE-ENABLED, now hooked in the MACH
-                    // exception handler (where guest faults are actually
-                    // delivered) instead of segv_handler. It consumes its own
-                    // faults BEFORE every other classification and marks them
-                    // handled via the canonical thread_set_state path, so a
-                    // protection fault can no longer reach the guest as an AV.
-                    // ml514 hooked the wrong path: 0 faults, black window 2/2.
-                    /* ml530 (#78): srcwatch subject = the assembled steamui JS buffer, not the
-                     // render bitmap. "1" would mean the legacy render subject, and the
-                     // watch arms only ONCE — so with both call sites live, whichever ran
-                     // first would silently win and the other would never arm at all.
-                     //
-                     // Target: V8 reports `SyntaxError: Invalid or unexpected token` on
-                     // steamui JS that our file reads deliver byte-perfect (ml489: 73/73
-                     // MATCH, the failing file 100% verified through NtReadFile). That is
-                     // the DOMINANT Steam variance — 27 of 45 attempts stall right after
-                     // BrowserReady because the UI script never parses — and the same
-                     // corrupter family as the render glitch, so it buys both. */
-                    /* ml533: back to the RENDER subject — the js subject is structurally
-                    // blocked (the failing steamui files are read through a reused 64KB
-                    // chunk buffer, so no assembled buffer exists in our view). The render
-                    // watch now names the CALLER via the guest return address at [RSP],
-                    // which is what the block-granular RIP could never do. */
-                    // ml556 CLEAN-BASELINE TEST: srcwatch OFF.
-                    //
-                    // It write-protects the render bitmap and takes a Mach fault
-                    // per page ON THE RENDER HOT PATH, and the correlation across
-                    // this session is stark:
-                    //     attributions 1824/2370/426/2721 -> run dies at 36-52 s
-                    //     attributions 0/0/0              -> run reaches 94-106 s
-                    // Runs carrying our instrumentation die in roughly half the
-                    // time. Before attributing the crash to Steam or to FEX we owe
-                    // ourselves the one-variable control: does it still crash with
-                    // the probe off? Re-enable by restoring "render".
-                    // ml574: arm the dead-release detector in wineserver.
-                    // O(n) walk of object_list on every release_object — slow by
-                    // design, diagnostic only. Set to "0" to disarm.
-                    // ml579: DISABLED. It walks the global wineserver object list on
-                    // EVERY release_object() — O(n) in the single-threaded server. It
-                    // already caught the free_async_queue over-release (ml574) and that
-                    // fix is shipped; leaving the detector armed just starves the server,
-                    // and Steam allows each CM ping only 1000 ms. Set to "1" to re-arm.
-                    setenv("MADEIRA_DEAD_RELEASE", "0", 1)
-                    setenv("MADEIRA_SRCWATCH", "off", 1)
-                    // ml548: restrict srcwatch to the row band where displacement
-                    // was actually MEASURED, so the 400-attribution budget is not
-                    // spent on the full-frame clear (which touches every page
-                    // first and made the content painters invisible in ml517).
-                    // Band from ml543 frame 009: the Steam logo core landed at
-                    // (96,188) instead of (350,188) — exactly -254 px, one tile
-                    // pitch — so rows 150..230 bracket the displaced element.
-                    // ml550: was "150,230" — chosen for the SPLASH logo. On a
-                    // login-window run that band produced ZERO attributions
-                    // (426 on the splash run), because nothing painted there.
-                    // Widen to most of the surface so the watch follows whatever
-                    // the frame actually draws; the per-page budget still bounds
-                    // the fault cost.
-                    setenv("MADEIRA_SRCWATCH_ROWS", "0,400", 1)
-                    // ml527 (#82 RETEST, ONE VARIABLE): run V8 with its JIT on.
-                    //
-                    // ml526's phase timeline made the case concrete — of ~39s to
-                    // the login window, the single biggest block is 13.0s of
-                    // BrowserReady -> GetDesiredSteamUIWindows, i.e. Steam's UI
-                    // JavaScript booting, and interpreted V8 costs 5-20x there.
-                    //
-                    // #82 convicted jitless-off because both trial runs parked
-                    // CrBrowserMain shortly after BrowserReady (ml474b +104s,
-                    // ml475 +4s). ⚠️ Both ran with StikDebug attached and
-                    // spinning, when every trap was a round-trip to a starved
-                    // debugger — the overhead that made webhelper bring-up 89s
-                    // instead of 9s (b439be6). V8's JIT emits runtime x86, the
-                    // heaviest trap/compile workload in the process, so it is
-                    // exactly what that overhead punished worst. The verdict may
-                    // not survive early detach.
-                    //
-                    // ⛔ VERDICT (ml527, 2 runs): #82 SURVIVES early detach — jitless
-                    // stays ON. Both jitless-off runs died in the SAME window ml474b
-                    // and ml475 died in: right after BrowserReady, before
-                    // GetDesiredSteamUIWindows was ever reached (13:20:19 and
-                    // 13:22:45), so 4/4 across two completely different debugger
-                    // regimes. The failure MODE changed — a c0000005 ->
-                    // chrome_elf.dll+0xd4153 -> ffff7001 Crashpad termination rather
-                    // than #82's park in NtWaitForAlertByThreadId — but the window is
-                    // identical, and jitless-ON reaches the login window repeatedly
-                    // through that same window.
-                    //
-                    // No consolation prize either: BrowserReady took 12s and 10s with
-                    // the JIT on vs 8-11s (median 9s) with it off, because V8's JIT
-                    // emits runtime x86 that FEX must then compile. So the debugger
-                    // overhead was NOT what convicted jitless-off, and the 13s of
-                    // Steam UI JavaScript stays unmeasured — neither run survived to
-                    // reach it.
-                    //
-                    // Flip to "0" only alongside a fix for the post-BrowserReady death.
-                    setenv("MADEIRA_JITLESS", "1", 1)
-                    // ml514 note (kept for the record): The ml514 watch
-                    // armed correctly (76 pages protected) but logged ZERO
-                    // faults and produced an all-black window on two runs: the
-                    // hook went in the BSD segv_handler, while guest faults in
-                    // this port are handled IN-MACH by the exception server, so
-                    // the protection fault was delivered to the guest as an AV
-                    // and killed Chromium's paint. A probe must never break the
-                    // path it measures. To revive it, hook the Mach exception
-                    // server (where ios_emulate_unaligned_guest_access already
-                    // runs), not segv_handler, and re-enable this env var.
-                    // ml502 sentinel: DELIBERATELY NOT ENABLED. It stamps
-                    // magenta into currently-black pixels, and on windows
-                    // Chromium does not fully rewrite it SURVIVES and reaches
-                    // the screen (console 0x200bc hit untouched=177891 in one
-                    // round). It answered its question in ml503/ml504 —
-                    // untouched=0 on the login window proved Chromium writes
-                    // every pixel — so it must not ship enabled. Re-enable
-                    // with MADEIRA_SURF_SENTINEL=1 if the question returns.
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.green)
-
                 Button("Wine Virtual Desktop") {
                     // S3-pre R2v2: raw rpcss.exe CANNOT run standalone —
                     // its wmain unconditionally StartServiceCtrlDispatcherW's
@@ -3292,80 +3195,16 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.mint)
 
-                // ml741: Stray (UE4). Launch the shipping binary DIRECTLY rather
-                // than Stray.exe -- the launcher builds its child's command line
-                // itself and passed only "Hk_project", so Unreal picked its
-                // default RHI. That default is DX12 for this title and we only
-                // implement D3D11, which is why the first run sat on an
-                // unsignalled event for 97s at startup instead of failing loudly.
-                //
-                // Args are overridable at runtime from Documents/madeira-args.txt
-                // so UE4 flags can be tried without a rebuild; the string below is
-                // the default when that file is absent.
-                Button("Stray (UE4, -dx11)") {
-                    setenv("MADEIRA_EXE",
-                           "C:\\Program Files\\Stray\\Hk_project\\Binaries\\Win64\\Stray-Win64-Shipping.exe", 1)
-                    var args = "Hk_project -dx11 -windowed"
-                    if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-                       let txt = try? String(contentsOf: d.appendingPathComponent("madeira-args.txt"), encoding: .utf8) {
-                        let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !v.isEmpty { args = v }
-                    }
-                    setenv("MADEIRA_ARGS", args, 1)
-                    unsetenv("MADEIRA_DESKTOP")
-                    logStore.log("Stray: args = \(args)")
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.orange)
-
-                Button("Thumper (standalone)") {
-                    // Game lives at Documents/wine/drive_c/Program Files/Thumper/
-                    // (push via scripts/deploy-thumper.sh during development;
-                    // bundled as resource for distribution later).
-                    setenv("MADEIRA_EXE",
-                           "C:\\Program Files\\Thumper\\THUMPER_win10.exe", 1)
-                    unsetenv("MADEIRA_ARGS")
-                    unsetenv("MADEIRA_DESKTOP")
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.pink)
-
-                Button("x64 DX11 cube") {
-                    setenv("MADEIRA_EXE", "cube-x64.exe", 1)
-                    unsetenv("MADEIRA_ARGS")
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.purple)
-
-                // ml731c: one-second check of the Windows clock contract
-                // (GetTickCount64 / system time / unbiased interrupt time /
-                // QueryPerformanceCounter). Verifying this by hand previously
-                // cost a five-minute game run plus a control-log comparison,
-                // and the game is too unstable to serve as a measuring tool.
-                // Each clock is checked separately so a partial failure names
-                // itself: QPC passing alone is the shared-page signature.
-                Button("x64 clock test") {
-                    setenv("MADEIRA_EXE", "clocktest-x64.exe", 1)
-                    unsetenv("MADEIRA_ARGS")
-                    unsetenv("MADEIRA_DESKTOP")
-                    runWineFullSequence()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.teal)
-
-                Button("arm64 DX11 cube") {
-                    runTriangleTest()
+                Button("Enable JIT") {
+                    enableJITViaStikDebug()
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.blue)
 
                 // Every shipped launch target gets its own button here, same
-                // style as the x86_64 tests above. Bitness is decided by
-                // WineProcessBridge from the PE header, not by this table —
-                // see `launchTargets`.
+                // style as Wine Virtual Desktop / Enable JIT above. Bitness is
+                // decided by WineProcessBridge from the PE header, not by this
+                // table — see `launchTargets`.
                 ForEach(launchTargets, id: \.exe) { test in
                     Button(test.label) {
                         setenv("MADEIRA_EXE", test.exe, 1)
@@ -3374,8 +3213,19 @@ struct ContentView: View {
                         runWineFullSequence()
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(.indigo)
+                    .tint(test.tint)
                 }
+
+                // Prompts via the .alert below, then launches exactly like the
+                // full-path launchTargets entries above (Mirror's Edge,
+                // INSIDE) — see launchCustomExe().
+                Button("Custom…") {
+                    customExePath = UserDefaults.standard.string(forKey: Self.customExePathKey)
+                        ?? customExePath
+                    showCustomLaunchAlert = true
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.gray)
 
                 Button("Clear Log") {
                     logStore.clear()
@@ -3385,6 +3235,43 @@ struct ContentView: View {
             }
             .padding()
         }
+        // Modal popup rather than the old 2-line text-field row (removed —
+        // it crashed): an .alert can't be laid out wrong, and it cannot
+        // collide with the horizontal ScrollView's own gesture recognizers.
+        .alert("Custom Launch", isPresented: $showCustomLaunchAlert) {
+            TextField("C:\\Games\\Foo\\foo.exe", text: $customExePath)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+            Button("Launch") { launchCustomExe() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Full Windows path to the .exe, passed to MADEIRA_EXE exactly as typed.")
+        }
+    }
+
+    /// UserDefaults key for the last path typed into the Custom… launcher —
+    /// deliberately a plain UserDefaults value (not the Documents/*.json
+    /// files InputSettings/TouchControlsModel use) since it is one string
+    /// with no other app code that needs to read it off disk.
+    private static let customExePathKey = "madeiraCustomExePath"
+
+    /// Launch mechanism identical to the launchTargets ForEach above and the
+    /// full-path entries in that table (Mirror's Edge, INSIDE): MADEIRA_EXE
+    /// gets the path VERBATIM and WineProcessBridge.m detects the backslash
+    /// and launches it as-is, no syswow64 prefix. Trims whitespace and
+    /// refuses an empty path rather than handing Wine a blank MADEIRA_EXE.
+    private func launchCustomExe() {
+        let trimmed = customExePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            logStore.log("Custom launch: empty path, ignored.", level: .error)
+            return
+        }
+        customExePath = trimmed
+        UserDefaults.standard.set(trimmed, forKey: Self.customExePathKey)
+        setenv("MADEIRA_EXE", trimmed, 1)
+        unsetenv("MADEIRA_ARGS")
+        unsetenv("MADEIRA_DESKTOP")
+        runWineFullSequence()
     }
 
     private func runTriangleTest() {
@@ -4510,6 +4397,92 @@ struct SetupGuideView: View {
 // SwiftUI. Same reason JoystickPadHost exists; see its comment.
 // ============================================================================
 
+/// ml668 — A PHYSICAL CONTROLLER BUTTON, as a landscape control can be bound
+/// to one.
+///
+/// Deliberately NOT `ControlAction.pad(String)`. That case says "this
+/// on-screen button DRAWS an Xbox glyph", which was never wired to anything.
+/// This says "this on-screen control is ALSO pressed by that physical button",
+/// which is a second, orthogonal property of the same control: the control
+/// keeps posting its own keys or mouse buttons, and the pad is a second finger
+/// on it rather than a different action.
+///
+/// WHY THE LAYER EXISTS AT ALL, given that XInput now works. Most of the
+/// software this port runs predates XInput and reads the keyboard and the
+/// mouse, full stop. A controller is useless to those titles unless something
+/// turns its buttons into the keys they do read — which is exactly what the
+/// landscape control layout already does for a thumb. Binding the pad to the
+/// SAME controls reuses the user's own mapping instead of inventing a second
+/// one, and it is also what a PC with a controller and a key remapper does:
+/// XInput and the remapper both see every button, at the same time, and that
+/// is not a conflict.
+///
+/// Raw-value Codable so the layout JSON stores a NAME and not an ordinal:
+/// inserting a button in the middle of this enum must not silently rebind
+/// every layout already on disk.
+enum PadButton: String, Codable, CaseIterable, Hashable, Identifiable {
+    case a, b, x, y
+    case lb, rb, lt, rt
+    case l3, r3
+    case start, back
+    case dpadUp, dpadDown, dpadLeft, dpadRight
+    case leftStick, rightStick
+
+    var id: String { rawValue }
+
+    /// The XINPUT_GAMEPAD_* bit this button reports in, or 0 for the two
+    /// analogue sticks (which are not buttons and have no bit).
+    var mask: UInt16 {
+        switch self {
+        case .a:          return 0x1000
+        case .b:          return 0x2000
+        case .x:          return 0x4000
+        case .y:          return 0x8000
+        case .lb:         return 0x0100
+        case .rb:         return 0x0200
+        case .l3:         return 0x0040
+        case .r3:         return 0x0080
+        case .start:      return 0x0010
+        case .back:       return 0x0020
+        case .dpadUp:     return 0x0001
+        case .dpadDown:   return 0x0002
+        case .dpadLeft:   return 0x0004
+        case .dpadRight:  return 0x0008
+        // The triggers are ANALOGUE and have no XInput button bit at all. A
+        // control bound to one is pressed past a threshold — see
+        // HardwareInput.padPressed.
+        case .lt, .rt:    return 0
+        case .leftStick, .rightStick: return 0
+        }
+    }
+
+    var isStick: Bool { self == .leftStick || self == .rightStick }
+    var isTrigger: Bool { self == .lt || self == .rt }
+
+    var label: String {
+        switch self {
+        case .a: return "A"
+        case .b: return "B"
+        case .x: return "X"
+        case .y: return "Y"
+        case .lb: return "LB"
+        case .rb: return "RB"
+        case .lt: return "LT"
+        case .rt: return "RT"
+        case .l3: return "L3"
+        case .r3: return "R3"
+        case .start: return "Start"
+        case .back: return "Back"
+        case .dpadUp: return "D↑"
+        case .dpadDown: return "D↓"
+        case .dpadLeft: return "D←"
+        case .dpadRight: return "D→"
+        case .leftStick: return "L-stick"
+        case .rightStick: return "R-stick"
+        }
+    }
+}
+
 /// What a control does when pressed. Codable with associated values so the
 /// whole layout round-trips through JSON.
 enum ControlAction: Codable, Equatable, Hashable {
@@ -4589,6 +4562,19 @@ struct TouchControl: Codable, Identifiable, Equatable {
     var ny: Double = 0.5
     var scale: Double = 1.0
     var action: ControlAction = .mouseLeft   // usable the moment it is created
+
+    /// ml668 — the physical controller button that also presses this control,
+    /// if any. Optional and defaulted, so the synthesised `Codable` decodes a
+    /// layout written before this field existed (`decodeIfPresent` for an
+    /// Optional) and every stored layout keeps working untouched.
+    var padBinding: PadButton? = nil
+
+    /// The id this control's hit region is registered under in
+    /// `ControlOverlayView`. Derived, never stored — the UUID already IS the
+    /// identity, and this is only the short form the touch layer keys on.
+    /// `TouchControlButton.init` builds its region with this same property, so
+    /// a physical button and a thumb address one region and cannot drift.
+    var regionID: String { "ctl." + id.uuidString.prefix(8) }
 }
 
 final class TouchControlsModel: ObservableObject {
@@ -4599,6 +4585,16 @@ final class TouchControlsModel: ObservableObject {
     @Published var visible = true               { didSet { save() } }
     @Published var editing = false              // transient, never persisted
     @Published var selected: UUID?              // transient
+
+    /// The HUD cluster's (controller/pencil buttons, TouchControlsOverlay.
+    /// topBar) actual on-screen frame, in the same window coordinate space
+    /// `ControlsWindow.hitTest` runs in — published every render via a
+    /// GeometryReader background, same trick as `HardwareInput.hintRect`.
+    /// Replaces a fixed top-center guess now that the cluster is draggable
+    /// (ml? movable HUD). `.zero` until the first layout pass lands, so
+    /// `hitsInteractive` keeps its old fixed-rect guess as a fallback until
+    /// then.
+    var hudClusterRect: CGRect = .zero
 
     private var loading = false
     private static var url: URL {
@@ -4646,12 +4642,21 @@ final class TouchControlsModel: ObservableObject {
     /// SwiftUI would put a gesture recogniser back under the thumb. What is
     /// left is the chrome that is genuinely a tap on a button: the top bar.
     func hitsInteractive(_ p: CGPoint, in bounds: CGRect) -> Bool {
-        // Top bar: two 44pt buttons 10pt apart in play mode, centred, 10pt down.
-        // Padded generously; a few points of slop costs nothing and a missed tap
-        // costs a build.
-        let barW: CGFloat = 2 * 44 + 10
-        return CGRect(x: bounds.midX - barW / 2 - 10, y: 0,
-                      width: barW + 20, height: 68).contains(p)
+        guard hudClusterRect != .zero else {
+            // Fallback for the first frame or two, before topBar's
+            // GeometryReader has published a real frame: the original
+            // fixed top-center guess (two 44pt buttons 10pt apart, centred,
+            // 10pt down). Padded generously; a few points of slop costs
+            // nothing and a missed tap costs a build.
+            let barW: CGFloat = 2 * 44 + 10
+            return CGRect(x: bounds.midX - barW / 2 - 10, y: 0,
+                          width: barW + 20, height: 68).contains(p)
+        }
+        // The cluster can now be dragged anywhere in the safe area and its
+        // button count varies (mouse-lock, "+" in edit mode), so hit-test the
+        // MEASURED frame instead of a fixed guess — generously padded, same
+        // reasoning as above.
+        return hudClusterRect.insetBy(dx: -14, dy: -14).contains(p)
     }
 }
 
@@ -4751,6 +4756,11 @@ struct TouchControlsOverlay: View {
     @ObservedObject private var m = TouchControlsModel.shared
     @ObservedObject private var hw = HardwareInput.shared
     @State private var pinchBase: Double?
+    /// Live drag delta for the HUD cluster (controller/pencil buttons); only
+    /// non-zero while a long-press-drag on its grip is in progress. The
+    /// settled position lives in InputSettings, one slot per landscape
+    /// rotation — see hudBaseCenter/commitHudDrag below.
+    @GestureState private var hudDragState: CGSize = .zero
 
     var body: some View {
         GeometryReader { geo in
@@ -4763,7 +4773,7 @@ struct TouchControlsOverlay: View {
                             TouchControlButton(control: c, screen: geo.size)
                         }
                     }
-                    topBar
+                    topBar(in: geo)
                     if m.editing, let i = m.index(of: m.selected) {
                         MappingPanel(control: m.controls[i], screen: geo.size)
                     }
@@ -4830,8 +4840,17 @@ struct TouchControlsOverlay: View {
         .transition(.opacity)
     }
 
-    private var topBar: some View {
-        HStack(spacing: 10) {
+    /// Movable HUD cluster. Anchored top-center by default, same as before,
+    /// but a long-press-then-drag on its grip repositions it anywhere inside
+    /// the safe area and the drop point persists per landscape rotation
+    /// (InputSettings.hudPosLandscapeLeft/Right, same JSON file as the other
+    /// input settings) so it comes back where it was left. The buttons
+    /// themselves stay plain taps — only the grip carries the drag gesture,
+    /// so there is no ambiguity with tapping gamecontroller/pencil/plus.
+    private func topBar(in geo: GeometryProxy) -> some View {
+        let center = hudBaseCenter(in: geo)
+        return HStack(spacing: 10) {
+            hudGrip(in: geo)
             glassButton("gamecontroller", dim: !m.visible) { m.visible.toggle() }
             // ml663: landscape is where a keyboard and mouse are actually used,
             // so the escape hatch from pointer lock has to be reachable HERE —
@@ -4870,6 +4889,86 @@ struct TouchControlsOverlay: View {
         }
         .padding(.top, 10)
         .animation(.easeInOut(duration: 0.22), value: m.editing)
+        .position(x: center.x + hudDragState.width, y: center.y + hudDragState.height)
+        .background(GeometryReader { g -> Color in
+            // Window coords, same trick (and the same reason) as
+            // HardwareInput.hintRect above: ControlsWindow.hitTest has no
+            // access to SwiftUI layout, so the measured frame is published
+            // here for it to read.
+            let f = g.frame(in: .global)
+            DispatchQueue.main.async { m.hudClusterRect = f }
+            return Color.clear
+        })
+    }
+
+    /// Small drag handle, leading edge of the cluster. A LongPressGesture
+    /// gate (0.3s + haptic) before the DragGesture, rather than a bare drag
+    /// on the whole cluster, keeps a plain tap on gamecontroller/pencil/plus
+    /// completely unambiguous — only this handle ever starts a move.
+    private func hudGrip(in geo: GeometryProxy) -> some View {
+        Image(systemName: "line.3.horizontal")
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(.white.opacity(0.55))
+            .frame(width: 24, height: 44)
+            .contentShape(Rectangle())
+            .gesture(hudDragGesture(in: geo))
+    }
+
+    private func hudDragGesture(in geo: GeometryProxy) -> some Gesture {
+        LongPressGesture(minimumDuration: 0.3)
+            .onEnded { _ in
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            }
+            .sequenced(before: DragGesture(minimumDistance: 0))
+            .updating($hudDragState) { value, state, _ in
+                if case .second(true, let drag?) = value {
+                    state = drag.translation
+                }
+            }
+            .onEnded { value in
+                guard case .second(true, let drag?) = value else { return }
+                commitHudDrag(translation: drag.translation, in: geo)
+            }
+    }
+
+    /// UIDevice.current.orientation, not geo's width/height compare: the two
+    /// landscape rotations put the notch/home-indicator on opposite sides, so
+    /// they need their own saved spot even though both are "landscape."
+    /// Anything that isn't clearly landscapeRight is treated as landscapeLeft
+    /// — topBar only renders in landscape at all, so this only has to pick a
+    /// side, not detect landscape in the first place.
+    private var isLandscapeRight: Bool { UIDevice.current.orientation == .landscapeRight }
+
+    /// The cluster's un-dragged center: the saved drop point for this
+    /// rotation if there is one, else the original top-center spot.
+    private func hudBaseCenter(in geo: GeometryProxy) -> CGPoint {
+        let saved = isLandscapeRight ? InputSettings.shared.hudPosLandscapeRight
+                                      : InputSettings.shared.hudPosLandscapeLeft
+        if let n = saved {
+            return CGPoint(x: n.x * geo.size.width, y: n.y * geo.size.height)
+        }
+        // Matches the pre-drag layout: horizontally centered, ~10pt (padding)
+        // + half the 44pt button height below the top edge.
+        return CGPoint(x: geo.size.width / 2, y: geo.safeAreaInsets.top + 32)
+    }
+
+    /// Drops the cluster where the drag ended, clamped so it (approximately —
+    /// button count varies) stays inside the safe area, and persists the
+    /// fractional position for this rotation.
+    private func commitHudDrag(translation: CGSize, in geo: GeometryProxy) {
+        let base = hudBaseCenter(in: geo)
+        var center = CGPoint(x: base.x + translation.width, y: base.y + translation.height)
+        let halfW: CGFloat = 90, halfH: CGFloat = 30
+        let minX = geo.safeAreaInsets.leading + halfW
+        let maxX = max(minX, geo.size.width - geo.safeAreaInsets.trailing - halfW)
+        let minY = geo.safeAreaInsets.top + halfH
+        let maxY = max(minY, geo.size.height - geo.safeAreaInsets.bottom - halfH)
+        center.x = min(max(center.x, minX), maxX)
+        center.y = min(max(center.y, minY), maxY)
+        guard geo.size.width > 0, geo.size.height > 0 else { return }
+        let normalized = CGPoint(x: center.x / geo.size.width, y: center.y / geo.size.height)
+        if isLandscapeRight { InputSettings.shared.hudPosLandscapeRight = normalized }
+        else { InputSettings.shared.hudPosLandscapeLeft = normalized }
     }
 
     /// Pinch anywhere scales the SELECTED control. With nothing selected it does
@@ -4956,7 +5055,7 @@ struct TouchControlButton: View {
     init(control: TouchControl, screen: CGSize) {
         self.control = control
         self.screen = screen
-        let id = "ctl." + control.id.uuidString.prefix(8)
+        let id = control.regionID
         self.rid = id
         _face = ObservedObject(wrappedValue: ControlFaces.state(id))
     }
@@ -5173,23 +5272,85 @@ struct MappingPanel: View {
         }
     }
 
+    // ml668 — THE CONTROLLER TAB IS NOW A BINDING, NOT A LABEL.
+    //
+    // What it used to offer was `ControlAction.pad("A")`: a control that DREW
+    // an Xbox glyph and, as the banner admitted, pressed nothing. What it
+    // offers now is the physical button that ALSO presses this control, on top
+    // of whatever the keyboard tab set it to. The distinction is the whole
+    // feature: a control still posts its own key, and the pad is a second
+    // finger on it, so one layout serves a thumb and a controller at once.
+    //
+    // A game that reads XInput sees the pad regardless of anything chosen
+    // here — that path does not go through the layout at all (wine's
+    // xinput1_3 reads the same sample through win32u). These bindings are for
+    // the majority of titles, which read the keyboard and the mouse and have
+    // never heard of a controller.
     private var controllerTab: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("XInput isn't wired up yet. These save with your layout but do "
-                 + "nothing when pressed — controller support lands with the Wine HID stack.")
+            Text("Also press this control with a physical controller button. "
+                 + "Games that read XInput get the controller either way.")
                 .font(.system(size: 11))
-                .foregroundStyle(.orange.opacity(0.95))
+                .foregroundStyle(.white.opacity(0.55))
                 .fixedSize(horizontal: false, vertical: true)
-            section("Face", [("A", .pad("A")), ("B", .pad("B")), ("X", .pad("X")), ("Y", .pad("Y"))])
-            section("D-pad", [("D↑", .pad("D↑")), ("D↓", .pad("D↓")),
-                              ("D←", .pad("D←")), ("D→", .pad("D→"))])
-            section("Bumpers & triggers", [("LB", .pad("LB")), ("RB", .pad("RB")),
-                                           ("LT", .pad("LT")), ("RT", .pad("RT"))])
-            section("Sticks", [("LS", .pad("LS")), ("RS", .pad("RS")),
-                               ("L3", .pad("L3")), ("R3", .pad("R3"))])
-            section("System", [("Menu", .pad("Menu")), ("View", .pad("View")),
-                               ("Guide", .pad("Guide"))])
+            padSection("Face", [.a, .b, .x, .y])
+            padSection("Bumpers & triggers", [.lb, .rb, .lt, .rt])
+            padSection("D-pad", [.dpadUp, .dpadDown, .dpadLeft, .dpadRight])
+            padSection("Sticks & clicks", [.leftStick, .rightStick, .l3, .r3])
+            padSection("System", [.start, .back])
+            padSection("", [nil])            // the "None" chip, on its own row
+            Text("A stick binding wants a stick control: L-stick steers a WASD "
+                 + "or arrows control, R-stick drives mouse-look. With nothing "
+                 + "bound at all, A/B/X/Y and the bumpers fall to the first "
+                 + "buttons in the layout and L-stick to its first stick.")
+                .font(.system(size: 10))
+                .foregroundStyle(.white.opacity(0.38))
+                .fixedSize(horizontal: false, vertical: true)
         }
+    }
+
+    /// One row of pad-binding chips. `nil` is the unbind chip.
+    private func padSection(_ title: String, _ items: [PadButton?]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if !title.isEmpty {
+                Text(title)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.45))
+            }
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 48), spacing: 6)], spacing: 6) {
+                ForEach(Array(items.enumerated()), id: \.offset) { _, b in
+                    padChip(b)
+                }
+            }
+        }
+    }
+
+    private func padChip(_ button: PadButton?) -> some View {
+        let on = control.padBinding == button
+        return Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            guard let i = m.index(of: control.id) else { return }
+            // ONE control per button. Binding B to a control that already has
+            // A silently leaves A unbound would be surprising; binding a button
+            // that another control already claims quietly stealing it would be
+            // worse. So: clear the button everywhere first, then claim it here.
+            if let button {
+                for j in m.controls.indices where m.controls[j].padBinding == button {
+                    m.controls[j].padBinding = nil
+                }
+            }
+            m.controls[i].padBinding = button
+        } label: {
+            Text(button?.label ?? "None")
+                .font(.system(size: 12, weight: .medium))
+                .lineLimit(1)
+                .minimumScaleFactor(0.55)
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity, minHeight: 30)
+                .background(RoundedRectangle(cornerRadius: 7)
+                    .fill(.white.opacity(on ? 0.36 : 0.12)))
+        }
+        .buttonStyle(.plain)
     }
 
     private func section(_ title: String, _ items: [(String, ControlAction)]) -> some View {

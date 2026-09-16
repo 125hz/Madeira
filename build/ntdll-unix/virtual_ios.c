@@ -15549,6 +15549,44 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
                 ret = STATUS_SUCCESS;
         }
     }
+    else if (err == EXCEPTION_EXECUTE_FAULT && force_exec_prot &&
+             (vprot & VPROT_COMMITTED) && (get_unix_prot( vprot ) & PROT_READ))
+    {
+        /* iOS-Madeira: DEP-OFF EXECUTE FAULT, host side.
+         *
+         * A process whose image lacks IMAGE_DLLCHARACTERISTICS_NX_COMPAT runs with DEP
+         * disabled (wine/dlls/ntdll/loader.c:1930 sets MEM_EXECUTE_OPTION_ENABLE, which lands
+         * in virtual_set_force_exec below), and on Windows executing from any committed
+         * readable page is then legal.  Upstream needs no fault handling for that because
+         * force_exec_prot adds PROT_EXEC to every PROT_READ mapping as it is made; a page that
+         * predates the policy change is fixed up by virtual_set_force_exec's sweep.
+         *
+         * Here PROT_EXEC is not always grantable - iOS TXM refuses it outside the JIT pool, see
+         * mprotect_exec's [force-exec] note - so the sweep can silently leave a page
+         * non-executable and the fault is the only remaining notice.  Grant execute the same
+         * way a PAGE_EXECUTE_READWRITE NtProtectVirtualMemory would: record VPROT_EXEC and
+         * re-apply, and report success only if the kernel actually honoured it.  When it does
+         * not, fall through to the normal access-violation report rather than resuming into a
+         * page that still cannot execute - an unhandleable fault loop is worse than a clean AV.
+         *
+         * NOTE this is the HOST half only, and on this port the host half is the small half:
+         * guest code is never host-executed, it is translated and run from the pool.  What
+         * makes a guest page executable is FEX's InvalidationTracker (see the [dep-off]
+         * promotion there), reached through NtSetInformationProcess(ProcessExecuteFlags) ->
+         * wow64.dll -> BTCpuNotifyProcessExecuteFlagsChange. */
+        set_page_vprot_bits( page, host_page_size, VPROT_EXEC, 0 );
+        if (!mprotect_range( page, host_page_size, 0, 0 ))
+        {
+            static unsigned long depoff_n;
+
+            if (++depoff_n <= 16 && !ios_in_mach_exc)
+                dprintf( 2, "[dep-off] promoting %p+0x%lx to executable for a non-NX-compat image "
+                            "(guest rip %p) host-side #%lu\n",
+                         page, (unsigned long)host_page_size, addr, depoff_n );
+            ret = STATUS_SUCCESS;
+        }
+        else set_page_vprot_bits( page, host_page_size, 0, VPROT_EXEC );
+    }
     mutex_unlock( &virtual_mutex );
     rec->ExceptionCode = ret;
     return ret;
@@ -16145,6 +16183,15 @@ NTSTATUS virtual_uninterrupted_write_memory( void *addr, const void *buffer, SIZ
  *
  * Whether to force exec prot on all views.
  */
+/* iOS-Madeira: is DEP off for this process?
+ *
+ * Read by the fault handler in signal_arm64_ios.c to tell two identical-looking deaths apart: a
+ * guest branch into a page that FEX has not been told is code (a DEP-off gap - reportable, and
+ * fixable in the tracker) versus a genuine wild branch in a DEP-enabled process (correct
+ * behaviour, the guest gets its access violation).  Plain int, read without the lock: it is a
+ * diagnostic, and it only ever goes false -> true in practice. */
+int ios_dep_disabled;
+
 void virtual_set_force_exec( BOOL enable )
 {
     struct file_view *view;
@@ -16154,6 +16201,14 @@ void virtual_set_force_exec( BOOL enable )
     if (!force_exec_prot != !enable)  /* change all existing views */
     {
         force_exec_prot = enable;
+        ios_dep_disabled = !!enable;
+        /* One line per transition.  The counterpart on the emulator's side is FEX's
+         * "[dep-off] DEP DISABLED for this process" - both must appear, and their absence when a
+         * 32-bit program dies on an execute fault is itself the diagnosis. */
+        dprintf( 2, "[dep-off] DEP %s for this process (force_exec_prot=%d) — every committed "
+                    "readable guest page is now executable; guest-side promotion is FEX's "
+                    "InvalidationTracker, reached via BTCpuNotifyProcessExecuteFlagsChange\n",
+                 enable ? "DISABLED" : "re-enabled", enable );
 
         WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
         {

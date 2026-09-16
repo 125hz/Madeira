@@ -8455,6 +8455,66 @@ static void ios_decline_foreign_fault( int sig, const void *pc, const void *addr
     }
     signal( sig, SIG_DFL );
 }
+
+/* iOS-Madeira: IS THIS FEX'S "CANNOT EXECUTE HERE" TRAP RATHER THAN A REAL NULL DEREFERENCE?
+ *
+ * When the frontend decodes a guest address that FEX's InvalidationTracker does not hold as
+ * executable, Decoder::CheckRangeExecutable fails, Core.cpp raises NoExecOp, and the emitted
+ * block branches to the dispatcher's GuestSignal_SIGSEGV trampoline
+ * (FEX/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp:566), whose entire body is
+ *
+ *     mov  w1, #0          ; LoadConstant(r1, 0)
+ *     ldr  x1, [x1]        ; "Force a SIGSEGV by loading zero"
+ *
+ * i.e. a DELIBERATE read of address 0.  The signal that arrives here therefore says
+ * si_addr = NULL, and everything downstream believed it: virtual_handle_fault was asked about
+ * page 0, ios_dump_fault_region printed "[fault-rgn] addr=0x0 ... NO wine view", and the one
+ * address that mattered - the guest RIP the emulator refused to translate - appeared nowhere
+ * except in a register.  A retail 32-bit title died exactly this way at guest RIP 0x01B4380F,
+ * a page it had VirtualAlloc'd PAGE_READWRITE and written an unpacker stage into.
+ *
+ * So classify it FIRST: recognise the trampoline by its two instruction words (the faulting
+ * instruction is `ldr x1,[x1]` with x1 just zeroed - a pairing that cannot occur by accident in
+ * compiled code), and take the guest RIP from FEX's live CpuStateFrame at x28+0x18, the same
+ * offset the [guest-state] dump reads.  Returns the guest RIP, or 0 when this is an ordinary
+ * fault that must take the normal path.
+ *
+ * Deliberately reads through mach_vm_read_overwrite: a wrong x28, or a pc in a code buffer
+ * being reclaimed, must yield "not the trap" and not a second fault inside the handler. */
+static uint64_t ios_fex_noexec_trap_rip( ucontext_t *context, const void *fault_addr,
+                                         int *rip_from_x20 )
+{
+    uint64_t pc = (uint64_t)PC_sig( context );
+    uint64_t st, rip = 0;
+    uint32_t w[2];
+    mach_vm_size_t got = 0;
+
+    *rip_from_x20 = 0;
+    if (fault_addr) return 0;                    /* the trap always reads address 0 */
+    if (pc < 0x10000) return 0;
+
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(pc - 4), sizeof(w),
+                                (mach_vm_address_t)w, &got ) != KERN_SUCCESS || got != sizeof(w))
+        return 0;
+    if (w[1] != 0xf9400021) return 0;            /* ldr x1,[x1] */
+    /* whichever encoding LoadConstant picked for "x1 = 0" */
+    if (w[0] != 0x52800001 && w[0] != 0xd2800001 &&
+        w[0] != 0x2a1f03e1 && w[0] != 0xaa1f03e1) return 0;
+
+    st = (uint64_t)REGn_sig( 28, context );      /* FEX STATE = CpuStateFrame */
+    got = 0;
+    if (st > 0x100000 &&
+        mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(st + 0x18), sizeof(rip),
+                                (mach_vm_address_t)&rip, &got ) == KERN_SUCCESS &&
+        got == sizeof(rip) && rip)
+        return rip;
+
+    /* No readable CpuStateFrame: the JIT keeps the block's entry RIP in x20 on this path, which
+     * is where the register dump found 0x1b4380f.  Flagged as second-hand so a wrong value here
+     * can never be mistaken for the state's own. */
+    *rip_from_x20 = 1;
+    return (uint64_t)REGn_sig( 20, context );
+}
 #endif
 
 static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
@@ -9509,6 +9569,55 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         {
             last_fault_pc = this_pc;
             fault_repeat_count = 1;
+        }
+    }
+#endif
+#ifdef WINE_IOS
+    /* Classify FEX's no-exec trap BEFORE the page machinery is asked anything: its fault address
+     * is 0 by construction (see ios_fex_noexec_trap_rip), so virtual_handle_fault would be
+     * answering a question about page 0 that nobody asked, and ios_dump_fault_region would
+     * print a region report for page 0.  Name the guest RIP instead, and say whether DEP is off
+     * - which is the difference between "this page should have been promoted and was not" (a
+     * gap in the [dep-off] promotion in FEX's InvalidationTracker) and "a DEP-enabled process
+     * took a wild branch", which is a correct access violation the guest is entitled to.
+     *
+     * The record is left exactly as built.  FEX rewrites it anyway: the trap sets
+     * SynchronousFaultData (FAULT_SIGSEGV / TRAPNO_PF) and HandleGuestException turns it into
+     * EXCEPTION_ACCESS_VIOLATION with ExceptionInformation[0] = EXCEPTION_EXECUTE_FAULT and
+     * [1] = the guest RIP, which is where the "Unhandled page fault on execute access" wording
+     * comes from.  Touching it here could only disagree with that. */
+    {
+        int rip_from_x20 = 0;
+        uint64_t trap_rip = ios_fex_noexec_trap_rip( context, siginfo->si_addr, &rip_from_x20 );
+
+        if (trap_rip)
+        {
+            extern void ios_dump_fault_region( void *addr );
+            extern int ios_dep_disabled;
+            extern ULONG_PTR ios_wow_base(void);
+            static unsigned long noexec_n;
+            ULONG_PTR wow_base = ios_wow_base();
+
+            if (++noexec_n <= 16)
+            {
+                dprintf( 2, "[dep-off] EXECUTE FAULT (FEX no-exec trap) at guest rip=0x%llx "
+                            "(host %p) — host pc=%p, addr=0 is the trap's own NULL load, not the "
+                            "faulting address; rip from %s; dep_disabled=%d #%lu\n",
+                         (unsigned long long)trap_rip,
+                         (void *)(wow_base ? wow_base + (ULONG_PTR)trap_rip : (ULONG_PTR)trap_rip),
+                         (void *)PC_sig(context), rip_from_x20 ? "x20" : "CpuStateFrame",
+                         ios_dep_disabled, noexec_n );
+                if (!ios_dep_disabled)
+                    dprintf( 2, "[dep-off]   DEP is ON for this process: the image declares "
+                                "NX_COMPAT (or never opted out), so this execute fault is "
+                                "correct and the guest gets an access violation\n" );
+                else
+                    dprintf( 2, "[dep-off]   DEP is OFF yet this range was not promoted — a gap "
+                                "in the InvalidationTracker promotion, not a guest bug\n" );
+                if (wow_base) ios_dump_fault_region( (void *)(wow_base + (ULONG_PTR)trap_rip) );
+            }
+            setup_exception( context, &rec );
+            return;
         }
     }
 #endif

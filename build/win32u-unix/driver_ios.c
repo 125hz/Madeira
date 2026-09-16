@@ -210,6 +210,152 @@ void winios_drv_post_key(unsigned short vk, unsigned int flags)
     }
 }
 
+/***********************************************************************
+ *           ml668 — XINPUT
+ *
+ * THE WHOLE TRANSPORT, in one sentence: a controller paired to the phone is
+ * sampled by the app into a shared struct (app/Madeira/Winios/Winios.m,
+ * winios_gamepad_set_state), and wine's xinput1_3 reads that struct through
+ * ONE win32u call — NtUserCallTwoParam with NtUserCallTwoParam_GetGamepadState
+ * — which lands here and does a plain memory read.
+ *
+ * WHY A win32u CALL AND NOT THE HID/hidclass PATH. Upstream xinput1_3 finds
+ * its pads by enumerating GUID_DEVINTERFACE_WINEXINPUT through setupapi,
+ * opening each with CreateFile, and running a thread that sits in an
+ * overlapped HidD_ read. Every layer of that exists to get bytes across a
+ * PROCESS boundary from a driver. Here there is no boundary to cross: the
+ * "device" is a GCController object in the very same Mach task as the game's
+ * thread (WOW64_DESIGN.md §2 — one task, pseudo-processes as threads), so the
+ * HID stack would be a service, a driver, a pipe, a thread and a poll loop
+ * built entirely to move sixteen bytes from one page of this address space to
+ * another. The syscall is those sixteen bytes and nothing else.
+ *
+ * WHY IT MUST BE CHEAP. A game polls XInputGetState once per frame per pad at
+ * the very least, and plenty poll it in a spin loop at 1000 Hz. This function
+ * takes no lock, allocates nothing, touches no server and cannot block; the
+ * seqlock on the app side is what makes that safe (see Winios.h).
+ *
+ * THE POINTER. arg2 is a guest buffer, so the 32-bit caller's copy is
+ * translated in wine/dlls/wow64win/user.c's wow64_NtUserCallTwoParam. Both
+ * payload structs are pointer-free and have identical layout in 32-bit and
+ * 64-bit (XINPUT_STATE is 16 bytes, XINPUT_CAPABILITIES 20, natural alignment
+ * throughout), which is exactly why they can be copied across the boundary
+ * with no marshalling at all.
+ */
+
+/* Mirror of `struct winios_gamepad` in app/Madeira/Winios/Winios.h. Repeated
+ * rather than included for the same reason every other winios_* prototype in
+ * this file is: that header is part of the app target and reaching into it
+ * from the win32u unix build would drag UIKit's include path in behind it.
+ * The two definitions are checked against each other by the static assertion
+ * below — a silent layout drift here would hand games garbage sticks. */
+struct winios_gamepad
+{
+    unsigned int   packet;
+    unsigned short buttons;
+    unsigned char  left_trigger, right_trigger;
+    short          lx, ly, rx, ry;
+    unsigned char  connected;
+    unsigned char  reserved[3];
+};
+
+extern int winios_gamepad_get_state( int index, struct winios_gamepad *out ) __attribute__((weak));
+
+/* Byte-for-byte XINPUT_STATE (a DWORD packet number followed by
+ * XINPUT_GAMEPAD). Not #included from xinput.h: that is a PE-side SDK header
+ * and this is the unix half of win32u. */
+struct ios_xinput_gamepad
+{
+    WORD  buttons;
+    BYTE  left_trigger;
+    BYTE  right_trigger;
+    SHORT thumb_lx, thumb_ly, thumb_rx, thumb_ry;
+};
+
+struct ios_xinput_state
+{
+    DWORD packet_number;
+    struct ios_xinput_gamepad gamepad;
+};
+
+/* Byte-for-byte XINPUT_CAPABILITIES. */
+struct ios_xinput_caps
+{
+    BYTE  type;
+    BYTE  sub_type;
+    WORD  flags;
+    struct ios_xinput_gamepad gamepad;
+    WORD  left_motor_speed, right_motor_speed;
+};
+
+C_ASSERT( sizeof(struct ios_xinput_state) == 16 );
+C_ASSERT( sizeof(struct ios_xinput_caps) == 20 );
+C_ASSERT( sizeof(struct winios_gamepad) == 20 );
+
+/***********************************************************************
+ *           ios_gamepad_query
+ *
+ * The body of NtUserCallTwoParam_GetGamepadState. `index` is the XInput user
+ * index (0-3) and `op` selects the payload; see NtUserGamepadOp_* in
+ * wine/include/ntuser.h. Returns 1 when a pad is connected in that slot and
+ * `buffer` was filled, 0 otherwise — which is also what an upstream,
+ * non-Madeira win32u returns for a code it does not know, so xinput1_3's
+ * runtime probe degrades to "no iOS pad, use the HID path" with no #ifdef.
+ */
+ULONG_PTR ios_gamepad_query( UINT index, UINT op, void *buffer )
+{
+    struct winios_gamepad pad;
+
+    if (!buffer || index >= 4) return 0;
+    if (!winios_gamepad_get_state) return 0;          /* app side not linked in */
+    if (!winios_gamepad_get_state( index, &pad )) return 0;
+
+    switch (op)
+    {
+    case 0:   /* NtUserGamepadOp_State */
+    {
+        struct ios_xinput_state *state = buffer;
+
+        state->packet_number        = pad.packet;
+        state->gamepad.buttons      = pad.buttons;
+        state->gamepad.left_trigger  = pad.left_trigger;
+        state->gamepad.right_trigger = pad.right_trigger;
+        state->gamepad.thumb_lx     = pad.lx;
+        state->gamepad.thumb_ly     = pad.ly;
+        state->gamepad.thumb_rx     = pad.rx;
+        state->gamepad.thumb_ry     = pad.ry;
+        return 1;
+    }
+    case 1:   /* NtUserGamepadOp_Caps */
+    {
+        struct ios_xinput_caps *caps = buffer;
+
+        /* XINPUT_DEVTYPE_GAMEPAD / XINPUT_DEVSUBTYPE_GAMEPAD. The `gamepad`
+         * member of XINPUT_CAPABILITIES is not a reading — it is a MASK of
+         * what the device can report, which is why every field is saturated
+         * rather than copied from `pad`. 0xf3ff is every XINPUT_GAMEPAD_* bit
+         * except the two reserved gaps; the thumbs report 16-bit resolution
+         * (low bits clear, as real XInput reports them) and the triggers 8. */
+        caps->type     = 1;
+        caps->sub_type = 1;
+        /* No rumble: iOS haptics are a different device from the pad's motors
+         * and CHHapticEngine cannot drive them. Claiming FFB and then doing
+         * nothing is worse than an honest zero — a game would show a rumble
+         * slider that changes nothing. */
+        caps->flags    = 0;
+        caps->gamepad.buttons       = 0xf3ff;
+        caps->gamepad.left_trigger  = 0xff;
+        caps->gamepad.right_trigger = 0xff;
+        caps->gamepad.thumb_lx = caps->gamepad.thumb_ly = (SHORT)0xffc0;
+        caps->gamepad.thumb_rx = caps->gamepad.thumb_ry = (SHORT)0xffc0;
+        caps->left_motor_speed = caps->right_motor_speed = 0;
+        return 1;
+    }
+    default:
+        return 0;
+    }
+}
+
 /* [winios-tree] window-tree dump: every top-level window with class,
  * title, style and rects. Driven from the app side (Winios.m
  * ProcessEvents drain) every few seconds in desktop mode — ground truth
