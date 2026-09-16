@@ -17,8 +17,5 @@ This folder holds what the app needs from Apple's Metal Shader Converter.
   See LICENSE-metal-shader-converter-headers.txt.
 - canary_*.dxil: Madeira's own test shaders (GPL-3.0-or-later with the
   draft additional permission in the repository's LICENSE-EXCEPTION.md).
-- LICENSE-MADEIRA-GPL-3.0.txt and LICENSE-MADEIRA-EXCEPTION.txt: copies of
-  the repository's COPYING and LICENSE-EXCEPTION.md, staged into this
-  bundled folder by build/madeira-d3d12/fetch-converter.sh so the shipped
-  app carries the licence and the (draft) additional permission. They are
-  generated copies and are not tracked in git.
+- Madeira's own licence, the draft exception and every third-party notice
+  ship in the bundle's `licenses` folder (see THIRD-PARTY-NOTICES.txt there).

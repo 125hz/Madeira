@@ -11,11 +11,11 @@ Statically linked into the main executable (`Madeira` / `Madeira.debug.dylib`):
 
 | Component | Upstream licence | Madeira changes | Notes |
 |---|---|---|---|
-| Wine unix side (ntdll, wineserver, win32u, wineios.drv) from the `wine` fork and `build/*-unix` | LGPL-2.1-or-later | GPL-3.0-or-later in the current fork (LGPL s.3 conversion); LGPL branch being prepared, see `docs/wine-lgpl-provenance.md` | statically linked |
+| Wine unix side (ntdll, wineserver, win32u, wineios.drv) from the `wine` fork (branch `madeira-lgpl`) and `build/*-unix` | LGPL-2.1-or-later | LGPL-2.1-or-later (rebuilt from upstream wine-11.4, see `docs/wine-lgpl-provenance.md`); the earlier GPL-converted branch is retired | statically linked |
 | FEXCore and helpers (`FEX/build-ios/*.a`), including the rpmalloc fork under FEX/External | MIT (rpmalloc: 0BSD) | GPL-3.0-or-later + draft additional permission (Will Faust commits; Ryan Houdek rpmalloc commits stay 0BSD) | statically linked |
 | DXMT unix side + airconv (`libdxmt_combined.a`) | MIT | GPL-3.0-or-later + draft additional permission | statically linked |
 | LLVM (inside `libdxmt_combined.a`) | Apache-2.0 with LLVM exception | none | statically linked |
-| gnutls, nettle, hogweed, gmp | LGPL-2.1+ / LGPL-3+ or GPL-2+ (dual) / LGPL-3+ or GPL-2+ | none | statically linked; LGPL obligations apply |
+| gnutls 3.8.9, nettle 3.10.1, hogweed 3.10.1, gmp 6.3.0 | LGPL-2.1+ / dual LGPL-3+ or GPL-2+ / dual LGPL-3+ or GPL-2+ | none; Madeira elects LGPL-3.0-or-later for the dual-licensed three | statically linked; LGPL obligations apply; sources tracked in build/gnutls-ios/src |
 | Madeira app (Swift/ObjC), native D3D12 runtime (`madeira_d3d12.dll`, PE) | GPL-3.0-or-later + draft additional permission | author-owned | |
 
 Dynamically loaded at runtime (dlopen; this is NOT a GPL-compatibility
@@ -62,11 +62,22 @@ plugins):
 
 ## Open items before public release
 
-- Adopt the LGPL Wine branch in the superproject (review
-  `docs/wine-lgpl-provenance.md`).
+- DONE 2026-09-16: the LGPL Wine branch `madeira-lgpl` is adopted (the wine
+  submodule points at it; code-identical to the GPL branch apart from
+  licence notices, checked by diff).
 - Confirm every downstream Wine patch is author-owned (git authorship is
   evidence, not proof); note any patch adapted from third-party code.
-- Decide the gnutls/nettle/gmp dual-licence election and record it.
-- Clean-machine rebuild/relink/install test (see obligation 2).
-- The effective exception text must ship inside the IPA (app/Madeira/d3d12 is bundled; `build/madeira-d3d12/fetch-converter.sh` stages COPYING and the exception there).
+- DONE 2026-09-16: election recorded in `app/Madeira/licenses/THIRD-PARTY-NOTICES.txt`:
+  GnuTLS 3.8.9 LGPL-2.1-or-later; Nettle/Hogweed 3.10.1 and GMP 6.3.0 taken
+  under LGPL-3.0-or-later. Their source tarballs and SHA-256 sums are
+  tracked in `build/gnutls-ios/src`. The licence texts ship in the bundle.
+- Clean-machine rebuild/relink/install test (see obligation 2): a fresh
+  recursive clone was tried 2026-09-16 and does NOT build unaided; the
+  missing inputs and the reconstructed recipes are in `docs/BUILDING.md`.
+  Still open: re-executing every UNVERIFIED step there from scratch, then
+  signing and installing.
+- DONE 2026-09-16: the bundle carries `licenses/` (GPL-3.0, the draft
+  exception, LGPL-2.1, LGPL-3.0, MIT, 0BSD, LLVM texts and
+  THIRD-PARTY-NOTICES.txt); `build/stage-licenses.sh` refreshes the two
+  generated copies and the Xcode build fails if they are stale.
 - Lawyer review of this arrangement.

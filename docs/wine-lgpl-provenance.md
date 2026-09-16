@@ -10,15 +10,15 @@ Apple's proprietary converter can attach to it.
 built as: upstream tag `wine-11.4` + the 51 Madeira commits below
 cherry-picked in order with `-x` (skipping only the conversion commit) +
 one commit adding LGPL `LICENSE-MADEIRA.md` and `CONTRIBUTING.md`.
-All 51 applied without conflict. It is checked out in a separate worktree
-and the superproject still points at the GPL branch; adopt with
-`git -C wine checkout madeira-lgpl` and a submodule pointer update, after
-review.
+All 51 applied without conflict. ADOPTED 2026-09-16: the wine submodule now points at `madeira-lgpl`
+(a1e4a040484). A diff against the retired GPL branch differs only in
+licence-notice lines (22629 lines swapped, equal counts, no code change).
 
 **Authorship.** Every one of the 51 commits carries the author
 `Will Faust <willtechnoduck@gmail.com>`. Git authorship is evidence of
-origin, not proof of ownership; the author should confirm that no patch
-below was adapted from third-party code except as noted:
+origin, not proof of ownership. OWNERSHIP CONFIRMATION: pending an explicit
+statement by the author that no patch below was adapted from third-party
+code except as noted (requested 2026-09-16):
 - `dlls/wineios.drv/coreaudio.c`, `coremidi.c`, `coreaudio.h`, `unixlib.h`
   derive from upstream Wine's `winecoreaudio.drv` (Copyright CodeWeavers,
   Huw Davies) and keep those notices. Their licence is upstream's LGPL.

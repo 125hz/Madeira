@@ -25,7 +25,5 @@ got="$(shasum -a 256 "$SRC" | cut -d' ' -f1)"
 [[ "$got" == "$MSC_IOS_DYLIB_SHA256" ]] || { echo "fetch-converter: extracted iOS dylib hash mismatch ($got)" >&2; exit 1; }
 DEST_DIR="$REPO_ROOT/app/Madeira/d3d12"
 cp "$SRC" "$DEST_DIR/libmetalirconverter.dylib"
-# Licence texts that must ship in the bundle alongside the library.
-cp "$REPO_ROOT/COPYING" "$DEST_DIR/LICENSE-MADEIRA-GPL-3.0.txt"
-cp "$REPO_ROOT/LICENSE-EXCEPTION.md" "$DEST_DIR/LICENSE-MADEIRA-EXCEPTION.txt"
-echo "staged $(wc -c < "$DEST_DIR/libmetalirconverter.dylib" | tr -d ' ') bytes (sha256 verified) and the licence texts -> $DEST_DIR"
+bash "$REPO_ROOT/build/stage-licenses.sh"
+echo "staged $(wc -c < "$DEST_DIR/libmetalirconverter.dylib" | tr -d ' ') bytes (sha256 verified) -> $DEST_DIR"

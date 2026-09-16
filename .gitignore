@@ -138,6 +138,6 @@ research/remote-metal/host/rmetald.*
 # Apple's installer agreement 2.B permits distributing it solely for shader
 # conversion, which is its only use here; see app/Madeira/d3d12/NOTICE.txt.
 
-# Licence texts staged into the bundle by fetch-converter.sh (copies of COPYING and LICENSE-EXCEPTION.md)
-app/Madeira/d3d12/LICENSE-MADEIRA-GPL-3.0.txt
-app/Madeira/d3d12/LICENSE-MADEIRA-EXCEPTION.txt
+# Licence copies generated into the bundle by build/stage-licenses.sh (from COPYING and LICENSE-EXCEPTION.md)
+app/Madeira/licenses/LICENSE-MADEIRA-GPL-3.0.txt
+app/Madeira/licenses/LICENSE-MADEIRA-EXCEPTION.txt
