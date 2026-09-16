@@ -52,9 +52,10 @@ It does NOT cover, and nothing here changes:
   LGPL branch built from the upstream wine-11.4 baseline with the
   Madeira-authored patches reapplied under LGPL-2.1-or-later, documented in
   `docs/wine-lgpl-provenance.md`;
-- the Apple libraries themselves, which are distributed only under Apple's
-  agreement (`app/Madeira/d3d12/METAL-SHADER-CONVERTER-AGREEMENT.txt`,
-  section 2.B: distribution "for the sole purpose of shader conversion").
+- the Apple libraries themselves. The converter library is tracked in this
+  repository and distributed only under Apple's agreement
+  (`app/Madeira/d3d12/METAL-SHADER-CONVERTER-AGREEMENT.txt`, section 2.B:
+  distribution "for the sole purpose of shader conversion").
 
 This file is a licensing statement by the copyright holder, not legal
 advice; the assembled application must be reviewed before public release

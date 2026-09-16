@@ -24,7 +24,7 @@ plugins):
 
 | Component | Licence | Notes |
 |---|---|---|
-| `libmetalirconverter.dylib` (Apple Metal Shader Converter) | Apple proprietary; agreement s.2.B permits distribution solely for shader conversion | loaded with dlopen by the DXMT/Madeira unix side; used only to convert DXIL to Metal libraries |
+| `libmetalirconverter.dylib` (Apple Metal Shader Converter) | Apple proprietary; agreement s.2.B permits distribution solely for shader conversion; tracked in the repository (decision 2026-09-16) with the agreement and NOTICE beside it | loaded with dlopen by the DXMT/Madeira unix side; used only to convert DXIL to Metal libraries |
 | Apple system frameworks (Metal, Foundation, UIKit, ...) | Apple OS components | GPL-3 "System Library" |
 | PE DLLs in `arm64ec-windows/` (Wine builtins, FEX `libarm64ecfex.dll`, `d3d12.dll`, `winemetal.dll`) | as their sources above | separate files in the bundle |
 

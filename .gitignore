@@ -134,10 +134,9 @@ build/madeira-d3d12/out-ios/
 build/madeira-d3d12/out-pe/
 research/remote-metal/host/rmetald.*
 
-# Apple Metal Shader Converter dynamic library: obtained from the installer package,
-# never committed (Apple installer agreement 2.B permits distribution only for shader
-# conversion; GPL/LGPL compatibility of shipping it inside the app is unresolved)
-app/Madeira/d3d12/libmetalirconverter.dylib
+# Apple Metal Shader Converter dynamic library: TRACKED (decision 2026-09-16).
+# Apple's installer agreement 2.B permits distributing it solely for shader
+# conversion, which is its only use here; see app/Madeira/d3d12/NOTICE.txt.
 
 # Licence texts staged into the bundle by fetch-converter.sh (copies of COPYING and LICENSE-EXCEPTION.md)
 app/Madeira/d3d12/LICENSE-MADEIRA-GPL-3.0.txt
