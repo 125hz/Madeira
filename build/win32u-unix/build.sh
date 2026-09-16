@@ -141,6 +141,10 @@ fi
 
 echo ""
 echo "=== Building libwin32u_unix.a ==="
+# Start from scratch: `ar r` into a leftover archive keeps the previous
+# run's merged freetype members, and the libtool merge below then adds
+# them again (observed: 214 members for 88 objects after three runs).
+rm -f "$OBJ_DIR/libwin32u_unix.a"
 ar rcs "$OBJ_DIR/libwin32u_unix.a" "$OBJ_DIR"/*.o
 
 # Merge the static freetype so the app link needs no project changes.
