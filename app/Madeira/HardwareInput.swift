@@ -986,6 +986,31 @@ final class HardwareInput: ObservableObject {
     /// One XInput user index per connected controller, in connection order.
     /// Written on main (connect/disconnect), read on `padQueue`.
     private var padSlots: [GCController?] = [nil, nil, nil, nil]
+
+    // ml671 — THE PROFILE IS CAPTURED, NOT RE-FETCHED.
+    //
+    // This used to read `slots[i]?.extendedGamepad` on the sampling queue,
+    // every 4 ms, and `.map` a nil result into a nil sample. A nil there is
+    // indistinguishable from "no pad": the loop `continue`d, the slot was never
+    // published, `winios_gamepad_get_state` kept answering "not connected", and
+    // the 10 s line still printed `src=phys` — because that field only ever
+    // tested `padSlots[0] != nil`, which was true the whole time. So a pad that
+    // enumerated, logged "connected", and then reported NOTHING looked exactly
+    // like a pad that was connected and sitting perfectly centred.
+    //
+    // Capturing the profile once, on the main thread, at attach removes the
+    // per-sample optional entirely — the profile object lives as long as the
+    // controller does, and this is how Apple's own samples poll a pad. It is
+    // also cheaper. And `padProfileMissing` below makes the remaining failure
+    // say its own name instead of impersonating a centred stick.
+    private var padProfiles: [GCExtendedGamepad?] = [nil, nil, nil, nil]
+    /// ml671 — slot 0's UNCONVERTED reading, for the 1 Hz line. Guarded by
+    /// `padLock` rather than carried on the main hop, because the hop only
+    /// happens when the SNAPSHOT changes: a pad whose axes are stuck at zero
+    /// would never hop, and the one line that could prove it would never be
+    /// written. One uncontended lock per sample is not a cost worth having an
+    /// unanswerable bug for.
+    private var padRawMirror = PadRaw()
     private let padLock = NSLock()
 
     /// The sampling clock's queue. Serial, `.userInteractive`, and also the
@@ -1005,6 +1030,26 @@ final class HardwareInput: ObservableObject {
     /// it from `tick()` would be a plain race over a struct.
     private var padUIState = PadSnapshot()
 
+    /// ml671 — the UNCONVERTED GameController reading.
+    ///
+    /// Kept beside the XInput-unit snapshot for exactly one reason: when a pad
+    /// reports nothing, the only question worth answering is whether
+    /// GameController handed us zeros or whether WE turned real numbers into
+    /// zeros — and no amount of Int16 logging can separate those two. The
+    /// floats go on the 1 Hz line as `lxf=`/`lyf=`/`rxf=`/`ryf=`.
+    struct PadRaw: Equatable {
+        var lxf: Float = 0, lyf: Float = 0
+        var rxf: Float = 0, ryf: Float = 0
+        var ltf: Float = 0, rtf: Float = 0
+        var buttons: UInt16 = 0
+
+        /// Is any AXIS saying anything at all? Buttons deliberately excluded:
+        /// the whole question this answers is about the analogue half.
+        var axesQuiet: Bool {
+            lxf == 0 && lyf == 0 && rxf == 0 && ryf == 0 && ltf == 0 && rtf == 0
+        }
+    }
+
     /// One pad's readings, in XInput units. Deliberately a value type: it is
     /// built on the pad queue, compared there, and carried to the main queue by
     /// copy, so there is nothing for the two threads to share.
@@ -1015,8 +1060,53 @@ final class HardwareInput: ObservableObject {
         var rx: Int16 = 0, ry: Int16 = 0
     }
 
+    // ml671 — the axis probe. padQueue only, except the three writes in
+    // attachController, which happen before the timer for that slot can run.
+    private var padAxisProbeAt = [CFTimeInterval](repeating: 0, count: 4)
+    private var padAxisSeen = [Bool](repeating: false, count: 4)
+    private var padProfileWarned = [Bool](repeating: false, count: 4)
+    private var padSampleCount = [UInt32](repeating: 0, count: 4)
+
     private func xlog(_ s: String) {
         fputs("[xinput] \(s)\n", stderr)
+    }
+
+    /// A slot holds a controller but no profile to read it through. One line
+    /// per slot per connection — this is the failure that used to look like a
+    /// centred stick, and it must never be silent again.
+    private func padProfileMissing(_ i: Int) {
+        guard !padProfileWarned[i] else { return }
+        padProfileWarned[i] = true
+        xlog("pad\(i) HAS NO EXTENDED PROFILE — the controller is enumerated but "
+             + "nothing can be read from it; the slot stays unpublished and every "
+             + "XInputGetState will answer ERROR_DEVICE_NOT_CONNECTED")
+    }
+
+    /// The two lines that end an "is it the pad or is it us?" argument: the
+    /// first time any axis moves, and a one-shot complaint if none ever does.
+    private func padAxisProbe(_ i: Int, _ raw: PadRaw) {
+        if !raw.axesQuiet {
+            guard !padAxisSeen[i] else { return }
+            padAxisSeen[i] = true
+            xlog(String(format: "pad%d first axis motion lxf=%.4f lyf=%.4f "
+                                + "rxf=%.4f ryf=%.4f ltf=%.3f rtf=%.3f "
+                                + "(after %u samples)",
+                        i, raw.lxf, raw.lyf, raw.rxf, raw.ryf, raw.ltf, raw.rtf,
+                        padSampleCount[i]))
+            return
+        }
+        // Quiet, and it has been quiet since the pad appeared. Say so ONCE,
+        // five seconds in: by then the user has certainly touched something, so
+        // "every axis still reads exactly 0.0" is a finding and not a wait.
+        guard !padAxisSeen[i], padAxisProbeAt[i] != 0,
+              CACurrentMediaTime() - padAxisProbeAt[i] >= 5.0 else { return }
+        padAxisProbeAt[i] = 0
+        xlog(String(format: "pad%d ANALOGUE SILENCE: %u samples in 5s and every "
+                            + "axis float is exactly 0.0 (buttons=0x%04x). The "
+                            + "conversion is not the suspect -- GameController "
+                            + "itself is reporting nothing on this profile's "
+                            + "thumbsticks and triggers.",
+                    i, padSampleCount[i], Int(raw.buttons)))
     }
 
     private func attachController(_ c: GCController?) {
@@ -1032,7 +1122,7 @@ final class HardwareInput: ObservableObject {
         padLock.lock()
         var slot = padSlots.firstIndex(where: { $0 === c })
         if slot == nil { slot = padSlots.firstIndex(where: { $0 == nil }) }
-        if let i = slot { padSlots[i] = c }
+        if let i = slot { padSlots[i] = c; padProfiles[i] = gp }   // ml671
         padLock.unlock()
 
         guard let i = slot else {
@@ -1046,9 +1136,18 @@ final class HardwareInput: ObservableObject {
         gp.valueChangedHandler = { [weak self] _, _ in self?.padSample() }
 
         gamepadConnected = true
+        padAxisProbeAt[i] = CACurrentMediaTime()
+        padAxisSeen[i] = false
+        padProfileWarned[i] = false
         padStartSampling()
         startTicker()
-        xlog("pad\(i) connected vendor=\(c.vendorName ?? "?") profile=extended")
+        // ml671: name the analogue elements at connect. A pad whose sticks never
+        // move is a different fault from a pad that has no sticks, and this line
+        // is what tells them apart before a single sample is taken.
+        xlog("pad\(i) connected vendor=\(c.vendorName ?? "?") profile=extended "
+             + "sticks=\(gp.leftThumbstick.xAxis.value == 0 && gp.leftThumbstick.yAxis.value == 0 ? "centred" : "deflected") "
+             + "l3=\(gp.leftThumbstickButton != nil) r3=\(gp.rightThumbstickButton != nil) "
+             + "options=\(gp.buttonOptions != nil)")
     }
 
     private func detachController(_ c: GCController?) {
@@ -1063,6 +1162,7 @@ final class HardwareInput: ObservableObject {
             // device and we have no guarantee it names every device that left.
             if s === c || !live.contains(where: { $0 === s }) {
                 padSlots[i] = nil
+                padProfiles[i] = nil                                // ml671
                 freed.append(i)
             }
         }
@@ -1166,11 +1266,27 @@ final class HardwareInput: ObservableObject {
     /// One sample of every connected pad, plus slot 0's on-screen half.
     /// padQueue only.
     private func padSample() {
-        padLock.lock(); let slots = padSlots; padLock.unlock()
+        padLock.lock()
+        let slots = padSlots
+        let profiles = padProfiles
+        padLock.unlock()
         let screen = OnScreenPad.shared.snapshot()
 
         for i in 0..<slots.count {
-            let phys = slots[i]?.extendedGamepad.map(Self.read)
+            // ml671: the CAPTURED profile, not a fresh `controller.extendedGamepad`
+            // on this queue. See the banner on `padProfiles`.
+            var phys: PadSnapshot?
+            if let gp = profiles[i] {
+                padSampleCount[i] &+= 1
+                let raw = Self.readRaw(gp)
+                if i == 0 {
+                    padLock.lock(); padRawMirror = raw; padLock.unlock()
+                }
+                padAxisProbe(i, raw)
+                phys = Self.snapshot(raw)
+            } else if slots[i] != nil {
+                padProfileMissing(i)
+            }
             // Slot 0 is the one the layout can reach: wine presents it as
             // XInput user 0, and two people cannot share one on-screen layout.
             let useScreen = (i == 0 && screen.live)
@@ -1202,13 +1318,40 @@ final class HardwareInput: ObservableObject {
         }
 
         let now = CACurrentMediaTime()
-        if now - padStatAt >= 10.0, slots.contains(where: { $0 != nil }) || screen.live {
+        if now - padStatAt >= 10.0,
+           slots.contains(where: { $0 != nil }) || profiles.contains(where: { $0 != nil })
+               || screen.live {
             padStatAt = now
             let s0 = padLastPublished[0]
-            let src = slots[0] != nil ? (screen.live ? "both" : "phys")
-                                      : (screen.live ? "screen" : "none")
-            xlog(String(format: "pad0 packets=%u last_buttons=0x%04x lx=%d ly=%d src=%@",
-                        padPackets[0], Int(s0.buttons), Int(s0.lx), Int(s0.ly), src))
+            padLock.lock(); let raw0 = padRawMirror; padLock.unlock()
+            // ml671: `src` used to be derived from `padSlots[0] != nil` alone,
+            // so it said "phys" for a slot that had never been read. It now
+            // reports the PROFILE, which is the thing samples actually come
+            // from, and carries the raw floats beside the converted ints so the
+            // two can be compared without a second run.
+            let src = profiles[0] != nil ? (screen.live ? "both" : "phys")
+                                         : (screen.live ? "screen"
+                                            : (slots[0] != nil ? "noprofile" : "none"))
+            // ml671 — READ THE SLOT BACK, and report what a GAME would get.
+            //
+            // Everything else on this line is what the app BELIEVES it
+            // published. This is the bytes `XInputGetState` will actually
+            // return, fetched through the very same `winios_gamepad_get_state`
+            // that win32u's `ios_gamepad_query` calls — an xinput-x86.exe run
+            // performed from inside the app, once every ten seconds. If
+            // `got=no` while `samples=` is climbing, the sampler is running and
+            // the publish is not landing, which no amount of app-side state can
+            // tell you on its own.
+            var back = winios_gamepad()
+            let got = winios_gamepad_get_state(0, &back) != 0
+            xlog(String(format: "pad0 packets=%u samples=%u last_buttons=0x%04x "
+                                + "lx=%d ly=%d lxf=%.4f lyf=%.4f rxf=%.4f ryf=%.4f "
+                                + "src=%@ slot(got=%@ packet=%u buttons=0x%04x lx=%d ly=%d)",
+                        padPackets[0], padSampleCount[0], Int(s0.buttons),
+                        Int(s0.lx), Int(s0.ly),
+                        raw0.lxf, raw0.lyf, raw0.rxf, raw0.ryf, src,
+                        got ? "yes" : "no", back.packet, Int(back.buttons),
+                        Int(back.lx), Int(back.ly)))
         }
     }
 
@@ -1225,12 +1368,24 @@ final class HardwareInput: ObservableObject {
         m.buttons = p.buttons | s.buttons
         m.lt = max(p.lt, s.lt)
         m.rt = max(p.rt, s.rt)
-        if hypot(Double(p.lx), Double(p.ly)) > leftThumbDeadzone {
+        // ml671 — THE FALLBACK MUST NOT DESTROY A SMALL REAL DEFLECTION.
+        //
+        // This used to be a plain two-way choice: physical past its deadzone,
+        // otherwise the screen. That silently zeroed every physical deflection
+        // under 24% of full travel (7849/32767) whenever an on-screen stick
+        // existed at all — including a resting one, whose contribution is zero.
+        // A slow walk on a real stick therefore became no walk.
+        //
+        // Three-way instead, and the order is the order of specificity: a real
+        // stick past its deadzone wins; failing that, a screen stick that is
+        // ACTUALLY DEFLECTED wins, because the thumb on it is the live intent;
+        // failing that, whatever the physical stick says, however small.
+        if hypot(Double(p.lx), Double(p.ly)) > leftThumbDeadzone || (s.lx == 0 && s.ly == 0) {
             m.lx = p.lx; m.ly = p.ly
         } else {
             m.lx = s.lx; m.ly = s.ly
         }
-        if hypot(Double(p.rx), Double(p.ry)) > rightThumbDeadzone {
+        if hypot(Double(p.rx), Double(p.ry)) > rightThumbDeadzone || (s.rx == 0 && s.ry == 0) {
             m.rx = p.rx; m.ry = p.ry
         } else {
             m.rx = s.rx; m.ry = s.ry
@@ -1371,8 +1526,8 @@ final class HardwareInput: ObservableObject {
     /// own handling into a second, wrong clamp on top of ours. The deadzones
     /// further down this file are on the paths where THIS app is the consumer:
     /// the on-screen control bindings.
-    private static func read(_ gp: GCExtendedGamepad) -> PadSnapshot {
-        var s = PadSnapshot()
+    private static func readRaw(_ gp: GCExtendedGamepad) -> PadRaw {
+        var r = PadRaw()
         var b: UInt16 = 0
         if gp.buttonA.isPressed { b |= PadButton.a.mask }
         if gp.buttonB.isPressed { b |= PadButton.b.mask }
@@ -1393,13 +1548,39 @@ final class HardwareInput: ObservableObject {
         if gp.dpad.down.isPressed  { b |= PadButton.dpadDown.mask }
         if gp.dpad.left.isPressed  { b |= PadButton.dpadLeft.mask }
         if gp.dpad.right.isPressed { b |= PadButton.dpadRight.mask }
-        s.buttons = b
-        s.lt = trigger(gp.leftTrigger.value)
-        s.rt = trigger(gp.rightTrigger.value)
-        s.lx = axis(gp.leftThumbstick.xAxis.value)
-        s.ly = axis(gp.leftThumbstick.yAxis.value)
-        s.rx = axis(gp.rightThumbstick.xAxis.value)
-        s.ry = axis(gp.rightThumbstick.yAxis.value)
+        r.buttons = b
+        r.ltf = gp.leftTrigger.value
+        r.rtf = gp.rightTrigger.value
+        // ml671 — AND THERE IS NO SECOND ACCESSOR TO TRY.
+        //
+        // Worth stating, because "read the stick a different way" is the first
+        // thing anyone reaches for when a stick reads zero. GCControllerDirection
+        // Pad vends exactly `xAxis`/`yAxis` (GCControllerAxisInput) plus the four
+        // synthesised `up`/`down`/`left`/`right` buttons — it has no whole-vector
+        // property, and `GCController.physicalInputProfile.dpads[...]` hands back
+        // THIS SAME OBJECT rather than a second opinion. So if these four floats
+        // are zero while the stick is deflected, the value never reached
+        // GameController, and no amount of rewriting this function changes it.
+        // That is precisely the claim `padAxisProbe` is there to settle.
+        r.lxf = gp.leftThumbstick.xAxis.value
+        r.lyf = gp.leftThumbstick.yAxis.value
+        r.rxf = gp.rightThumbstick.xAxis.value
+        r.ryf = gp.rightThumbstick.yAxis.value
+        return r
+    }
+
+    /// The raw reading in XInput units. Split from `readRaw` so the two can be
+    /// logged side by side: the whole point of keeping the floats is to be able
+    /// to say which of the two is zero.
+    private static func snapshot(_ r: PadRaw) -> PadSnapshot {
+        var s = PadSnapshot()
+        s.buttons = r.buttons
+        s.lt = trigger(r.ltf)
+        s.rt = trigger(r.rtf)
+        s.lx = axis(r.lxf)
+        s.ly = axis(r.lyf)
+        s.rx = axis(r.rxf)
+        s.ry = axis(r.ryf)
         return s
     }
 
@@ -1480,9 +1661,16 @@ final class HardwareInput: ObservableObject {
         // which is also the more useful number, because it separates "the pad
         // is not reporting" from "the pad is reporting and nothing is bound".
         let p = padUIState
+        // ml671: the RAW floats beside the converted ints. `lx=0 lyf=0.83` is
+        // a conversion bug; `lx=0 lyf=0.0` is GameController reporting nothing,
+        // and one line now says which. The raw half is lock-guarded rather than
+        // hopped, because a pad stuck at zero never changes and so never hops.
+        padLock.lock(); let raw = padRawMirror; padLock.unlock()
         let pad = gamepadConnected
-            ? String(format: "pad=0x%04x lx=%d ly=%d rx=%d ry=%d",
-                     Int(p.buttons), Int(p.lx), Int(p.ly), Int(p.rx), Int(p.ry))
+            ? String(format: "pad=0x%04x lx=%d ly=%d rx=%d ry=%d "
+                             + "lxf=%.3f lyf=%.3f rxf=%.3f ryf=%.3f ltf=%.2f rtf=%.2f",
+                     Int(p.buttons), Int(p.lx), Int(p.ly), Int(p.rx), Int(p.ry),
+                     raw.lxf, raw.lyf, raw.rxf, raw.ryf, raw.ltf, raw.rtf)
             : "pad=none"
         log("keys_down=[\(keys)] mouse_dx=\(Int(dx)) mouse_dy=\(Int(dy)) "
             + "buttons=\(heldButtons.sorted()) wheel=\(wheelN) \(pad) "

@@ -3154,6 +3154,17 @@ struct ContentView: View {
                     for: UIDevice.orientationDidChangeNotification)) { _ in
                     TouchControlsHost.attach()   // re-frame to the new bounds
                 }
+                // Device feedback (2026-09-15): rotating to landscape left a
+                // tiny, unpressable ghost of this row's arrow pad on screen.
+                // JoystickKeyView (below) only exists in THIS body — rotating
+                // away tears it down, but ControlOverlayView.unregister never
+                // resets JoystickPadState.center, so the window-level overlay
+                // (JoystickPadHost, always attached, never torn down) kept
+                // drawing the idle ring at its last PORTRAIT position, now
+                // misplaced in the landscape window. Re-entering portrait is
+                // this body reappearing, so un-hide (respecting whatever the
+                // pointer-panel toggle already wants) right here.
+                .onAppear { JoystickPadState.shared.hidden = pointerPanel }
             HStack(spacing: 6) {
                 if pointerPanel {
                     // The cursor button has slid to the leftmost slot and become
@@ -3247,6 +3258,22 @@ struct ContentView: View {
             ZStack {
                 Color.black
                 MadeiraMetalView()
+                    // Device feedback (2026-09-15): the display-mode and FPS-cap
+                    // buttons in the right pillarbox bar below took no taps.
+                    // Root cause: this view had NO width constraint despite the
+                    // doc comment above already claiming "full-height 4:3
+                    // surface centered" — it was actually full-SCREEN, so
+                    // MetalBackedView's own (interactive; unlike MetalHostView)
+                    // bounds extended straight through the pillarbox bar,
+                    // stacked as a ZStack sibling "on top of" which portrait's
+                    // own comment (see MadeiraMetalView in portraitBody) already
+                    // warns against — SwiftUI content overlaid on this surface
+                    // gets covered, it must be a sibling placed clear of it
+                    // instead. Constraining the width to gameW does that: the
+                    // pillarbox areas (barW each side) are now genuinely outside
+                    // MetalBackedView's bounds, so the buttons receive their
+                    // taps like any other unobstructed SwiftUI control.
+                    .frame(width: gameW)
                     // ml662: the controls window hosts the UIKit touch layer, so
                     // it has to exist in landscape whether or not the app was
                     // ever in portrait this session.
@@ -3254,6 +3281,17 @@ struct ContentView: View {
                     .onReceive(NotificationCenter.default.publisher(
                         for: UIDevice.orientationDidChangeNotification)) { _ in
                         TouchControlsHost.attach()
+                    }
+                    // Device feedback (2026-09-15): see the matching onAppear in
+                    // portraitBody — this is the landscape half of hiding the
+                    // portrait arrow-pad's stale window-level ghost. `center`
+                    // is left stale (nothing resets it on unregister) so it is
+                    // zeroed here too, belt-and-suspenders against the opacity
+                    // check in JoystickPadFace ever seeing a leftover nonzero
+                    // value while hidden briefly flips during a rotation.
+                    .onAppear {
+                        JoystickPadState.shared.hidden = true
+                        JoystickPadState.shared.center = .zero
                     }
                 // Controls removed for now (ml586): game-only landscape.
                 // The FPS readout stays, pinned in the right pillarbox bar —
@@ -3358,6 +3396,12 @@ struct ContentView: View {
         Button {
             input.displayMode = input.displayMode.next
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            // Device feedback (2026-09-15): this button (and the FPS-cap pill
+            // beside it in landscape) went dead-silent when taps were being
+            // swallowed upstream — nothing here ever logged, so there was no
+            // way to tell "action ran" from "tap never arrived." Every tap now
+            // says so.
+            fputs("[hud] tap display-mode -> \(input.displayMode.label)\n", stderr)
         } label: {
             Image(systemName: input.displayMode.symbol)
                 .font(.system(size: 17, weight: .medium))
@@ -5429,12 +5473,20 @@ struct TouchControlsOverlay: View {
             .gesture(hudDragGesture(in: geo))
     }
 
+    /// `.global`, not the default `.local`, and that is load-bearing: `.local`
+    /// measures translation against the GRIP'S OWN frame, and that frame moves
+    /// every time `hudDragState` moves the cluster via `.position()` below —
+    /// translation-fed-back-into-the-thing-that-defines-translation is a
+    /// textbook feedback loop and is exactly what made the drag jittery. In
+    /// `.global` (window) space the origin never moves regardless of what the
+    /// gesture itself does to the view, so `start + translation` stays a
+    /// simple, stable sum for the whole gesture.
     private func hudDragGesture(in geo: GeometryProxy) -> some Gesture {
         LongPressGesture(minimumDuration: 0.3)
             .onEnded { _ in
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             }
-            .sequenced(before: DragGesture(minimumDistance: 0))
+            .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .global))
             .updating($hudDragState) { value, state, _ in
                 if case .second(true, let drag?) = value {
                     state = drag.translation
@@ -5502,6 +5554,10 @@ struct TouchControlsOverlay: View {
                              _ action: @escaping () -> Void) -> some View {
         Button {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            // Device feedback (2026-09-15): every HUD button logs its tap now,
+            // so a report of "nothing happened" is distinguishable from "the
+            // tap never reached SwiftUI" by whether this line shows up.
+            fputs("[hud] tap \(system)\n", stderr)
             withAnimation(.easeInOut(duration: 0.22)) { action() }
         } label: {
             // Stroke only — never a .fill variant.

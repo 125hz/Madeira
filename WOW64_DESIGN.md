@@ -4357,13 +4357,10 @@ window teardown), `src/winemetal/unix/winemetal_unix.c` (`_Foo32` pattern
      the SMC write-trap is armed — an unpacker writes, executes, rewrites and
      executes again), and into `DEPPromotedIntervals` so `GetTrapProt` /
      `GetUntrapProt` trap it with `PAGE_READONLY`/`PAGE_READWRITE` rather than
-     the `PAGE_EXECUTE_*` pair the host page can never hold. Two callers:
-     `HandleProcessExecuteFlagsChange`'s sweep, **now bounded to
-     `[GuestBase, GuestBase+4GiB)`** — the upstream walk from 0 is correct only
-     when guest and host share a 32-bit space, and here it would have marked
-     FEX's own heap and the pool's RW alias as guest code *and* armed write
-     traps on them; and, new, `QueryExecutableRange()`, which on a decode miss
-     with DEP off promotes lazily and answers. Doing it at decode time rather
+     the `PAGE_EXECUTE_*` pair the host page can never hold. Its **only** caller
+     is `QueryExecutableRange()`, which on a decode miss with DEP off promotes
+     and answers — see the revision below for why there is no eager sweep.
+     Doing it at decode time rather
      than on the fault is what makes it usable: the block is compiled correctly
      the first time, instead of having to unwind a running block and re-enter
      the JIT at the same RIP from a signal handler. Only `IntervalsLock` is
@@ -4531,3 +4528,199 @@ window teardown), `src/winemetal/unix/winemetal_unix.c` (`_Foo32` pattern
   `sleep0=3.4 M/10 s` but `yield_sc=1551`, `park=26 k` — the governor works;
   render thread 59 % (jit 17 %) — next perf target is that thread's non-JIT
   share (`kern` shows `NtDelayExecution` 5.2 %, server reads 6 %).
+
+  **REVISED THE SAME DAY, from the next device run: promotion is LAZY ONLY, and
+  no log line a guest can drive is uncapped.** The first revision promoted
+  eagerly in two places — a sweep of the guest window when DEP is switched off,
+  and `HandleMemoryProtectionNotification` treating "DEP off + readable" as
+  executable — and both were wrong for the same reason. Here a *writable*
+  promoted region does not merely gain a bit in an interval list: it enters
+  `RWXIntervals`, and `ProtectRWXIntervalsInternal` then arms a REAL host write
+  trap (`NtProtectVirtualMemory` to `PAGE_READONLY`) on any page a block is
+  compiled in. So eager promotion taxed every data page of a non-NX-compat
+  image whether or not the program ever executed from one. Measured:
+
+      [dep-off] summary: DEP off, 38 regions / 25280 KiB promoted (0 lazily)
+
+  for a title that never executes from its data, and the resulting SMC
+  bookkeeping printed `D D4 Add SMC interval: <start> - <end>` from the render
+  thread roughly **100 times a second for the whole session** — a 77 MB /
+  1.6 M-line log, with `[prof] kern` putting
+  ``write<-Madeira`unixcall_wine_dbg_write`` at **3.2 % of all CPU**. The
+  diagnostic had become the regression.
+
+  Both eager paths are gone. `HandleMemoryProtectionNotification`
+  (`InvalidationTracker.cpp:224-262`) is back to meaning exactly what the guest
+  asked for — only a genuine `PAGE_EXECUTE_*` inserts — and
+  `HandleProcessExecuteFlagsChange`'s disable branch
+  (`InvalidationTracker.cpp:428-455`) now only sets the flag and invalidates
+  cached code, so `PromoteDEPRegionLocked` has one caller left: the decode miss.
+  An execute attempt is the only correct trigger and the frontend raises one
+  before it emits anything, so a program that never runs code out of its own
+  data pays **nothing** — not a VirtualQuery, not an interval, not a trap — and
+  one that does pays a VirtualQuery and one insert, once, per region it jumps
+  into. Removal stays DEP-aware so a lazily-promoted region still leaves
+  `DEPPromotedIntervals` when it is reprotected or freed.
+
+  The `Add SMC interval` line itself (`InvalidationTracker.cpp:254`) is capped
+  at 64 per session with the cap announced, and so is `[dep-off] promoting`
+  (`InvalidationTracker.cpp:388`, lowered from 512). The rule this codifies:
+  **no log on a path the guest can drive at frame rate may be uncapped**, DFmt
+  included — debug level is not a cap when debug output is on, and on this port
+  every line costs a `unixcall` into the host writer.
+
+  `regions=0` in the `[dep-off] summary` is therefore the EXPECTED reading for
+  most non-NX-compat programs, and is the measurement that the sweep is gone.
+  `build/x86-tests/execrw-x86.c` is unchanged and still covers everything: each
+  of its five phases is an actual execute attempt, so each still promotes.
+
+- 2026-09-15 — **A 32-bit DLL with no unix side killed the process, and dnsapi
+  was that DLL** (logs n60/n62/n63/np3, identical). The sequence, host-side and
+  entirely generic:
+
+  ```
+  0024:err:dnsapi:DllMain No libresolv support, expect problems
+  [mach_exc] sym pc=Madeira`__wine_unix_call_dispatcher+0x5c
+             insn f8617810 = ldr x16,[x0,x1,lsl #3]   x0=0 (table) x1=1 (code)
+  [mach_exc] lr PE: libwow64fex.dll+0x1048c0          <- FEX's wow64 unix-call bridge
+  [guest-state] rip=0x2a0002                          <- the 32-bit __wine_unix_call trampoline
+  SEGV #1 addr=0x8 -> #2/#3 addr=0x0 -> SEGV LOOP DETECTED -> process dead
+  ```
+
+  `WINE_UNIX_CALL(code, args)` is
+  `__wine_unix_call(__wine_unixlib_handle, code, args)`, and that handle is the
+  unix call **table**. A PE DLL whose `DllMain` saw `__wine_init_unix_call()`
+  fail leaves it at 0 — and upstream dnsapi then calls it anyway: `main.c`'s
+  `DllMain` logs "No libresolv support, expect problems" and every later
+  `DnsQuery_*` still expands `RESOLV_CALL()`. So `ldr x16, [x0, x1, lsl #3]`
+  read host address `code*8`. A library that has no unix side on this port must
+  produce a failed CALL, never a dead pseudo-process, and the two halves of
+  that are fixed separately below.
+
+  **1. The dispatcher no longer dereferences a table it was not given.**
+  `signal_arm64_ios.c:12288-12292` adds three instructions in front of the load:
+  `cbz x0` (no table), `cmp x1, #0x1000` + `b.hs` (a code past any builtin's
+  `funcs_count` — the largest is opengl32's 3107, which is also why
+  `virtual_ios.c`'s stub table is 4096 entries), and `cbz x16` after the load
+  (a NULL entry inside a real table). All three branch to
+  `Lunixcall_no_table` (`signal_arm64_ios.c:12322-12325`), which calls
+  `ios_unixlib_null_call()` (`signal_arm64_ios.c:12192`) and rejoins the normal
+  epilogue at `Lunixcall_return`, so the return path, the `restore_flags`
+  check and the stack switch are the ones that were already there. The helper
+  returns **STATUS_NOT_IMPLEMENTED** and logs, once per calling module:
+
+  ```
+  [unixlib] call with NULL handle from <module>+0x<off> code=N handle=0x0 -> STATUS_NOT_IMPLEMENTED
+  ```
+
+  naming the caller through `ios_jit_reverse_translate()` + `ios_pe_module_name()`
+  for PE code in the JIT pool and `dladdr` otherwise. **One check covers both
+  bitnesses**: FEX's wow64 bridge (`WOW64/Module.cpp:764`, the
+  `BridgeInstrs::UnixCall` arm of `HandleSyscallImpl`) forwards the guest's
+  handle verbatim into this same dispatcher, which is why n60's `lr` is inside
+  `libwow64fex.dll`. Nothing was added to FEX. The faulting instruction is now
+  at `__wine_unix_call_dispatcher+0x68`, not `+0x5c`, so older logs read
+  against the new binary need that offset shifted.
+
+  **2. dnsapi has a unix side.** `build/ntdll-unix/dnsapi_unixlib_ios.c` is
+  upstream `dlls/dnsapi/libresolv.c` compiled into `libntdll_unix.a`
+  (`build/ntdll-unix/build.sh:118-125`, `:174`) the way ws2_32's and dwrite's
+  are, and bound by name in `load_builtin_unixlib` at
+  `virtual_ios.c:7613` — both tables, `dnsapi_unix_call_funcs` and
+  `dnsapi_unix_call_wow64_funcs`. Upstream expects configure to have linked
+  `-lresolv`; this file instead resolves the three things libresolv.c actually
+  uses out of `/usr/lib/libresolv.9.dylib` with `dlopen`/`dlsym` at first use —
+  `res_9_ninit`, `res_9_nquery` and `__res_9_state` (the `_n` forms on purpose:
+  they take the state explicitly and report through `state->res_h_errno`, so
+  the object references neither the process-global `_res` nor `h_errno`).
+  `llvm-nm -u` on the result names no new symbol beyond
+  `dlopen`/`dlsym`/`pthread_once`, so **the app's final link is unchanged** —
+  which is the whole reason for the `dlopen` over `-lresolv`. Every path has a
+  no-libresolv fallback that RETURNS: an all-zero state (`nscount` 0 ->
+  `DNS_ERROR_NO_DNS_SERVERS`) and `TRY_AGAIN` -> `map_h_errno` ->
+  `DNS_ERROR_RCODE_SERVER_FAILURE`. A lookup that fails is a normal documented
+  outcome for a Windows program; a process that dies inside the lookup is not.
+  `HAVE_RES_GETSERVERS` and `HAVE_STRUCT___RES_STATE__U__EXT_NSCOUNT6` are
+  deliberately left off — one fewer dynamic symbol and one fewer struct layout
+  to match, at the cost of an IPv6-only server list, and queries use the
+  state's own servers either way.
+
+  **3. A second fault on the same path, found while building the test.** The
+  wow64 bridge converts the outer argument-block pointer with plain arithmetic
+  (`GuestWindow::ToHostPtr`: `host = B + guest`), because guest address 0 must
+  map to the window's deliberately unmapped first page so a guest null
+  dereference still faults. That is right for a pointer the guest dereferences
+  and **wrong for an argument block that is allowed to be absent** — and
+  `set_serverlist` is exactly that: `DnsQuery_UTF8` passes its `servers`
+  parameter straight to `RESOLV_CALL( set_serverlist, servers )`, and that
+  parameter is NULL for every `DnsQuery_A` that does not name its own servers.
+  A 32-bit NULL therefore arrived at the unix side as `B`, which is not NULL,
+  and `if (!addrs …)` would have read the unmapped page and faulted the HOST on
+  the first query. `wine/dlls/dnsapi/libresolv.c:419-422` adds
+  `wow64_resolv_set_serverlist`, which round-trips the block through
+  `ios_wow_host_ptr( ios_wow_guest_ptr32( args ) )`: exact for a real block,
+  NULL for `B`, and the identity off this port. **This is a generic hazard, not
+  a dnsapi one** — any unixlib entry whose argument block may legitimately be
+  NULL has it, and the one-line alternative is to make the bridge itself
+  NULL-preserving (`Args ? ToHostPtr(Args) : nullptr`,
+  `WOW64/Module.cpp:764`). That was left to FEX's owner rather than changed
+  here, because only `libntdll_unix.a` was rebuilt in this pass and a FEX
+  source change that is not in the shipped `libwow64fex.dll` is worse than no
+  change at all.
+
+  **4. Refusals are visible now.** `ios_bind_unixlib_table()` and the
+  UNRECOGNISED-module branch logged their refusals with `ERR`, and
+  `virtual_ios.c`'s debug channel is `virtual` while the app runs
+  `WINEDEBUG=err+all,err-virtual` (`WineProcessBridge.m:505`) — so **every one
+  of those lines has been invisible**, which is why n60 shows dnsapi's DllMain
+  complaining and no `[unixlib]` line for it at all. Both now use `dprintf(2)`
+  like the success lines, and both say `has no unix side on this port`
+  (`virtual_ios.c:7479`, `:7665`). A library losing its unix side is the first
+  half of every NULL-handle crash; it has to be loud.
+
+  **Test.** `build/x86-tests/dns-x86.c`, built by `build-dns-test.sh` into
+  **`dns-x86.exe`** (i386, no CRT, imports asserted to be dnsapi + kernel32
+  only), run from the launcher's Custom path popup as
+  `C:\windows\syswow64\dns-x86.exe`. It calls `DnsQuery_A("localhost",
+  DNS_TYPE_A)` and `DnsQuery_A("madeira-dns-test.invalid", DNS_TYPE_A)` — both
+  with `aipServers = NULL`, which is what exercises item 3 — then
+  `DnsQueryConfig(DnsConfigDnsServerList)` twice (size, then fetch), whose
+  argument block carries two guest pointers OUT of 32-bit code. It prints
+  `MADEIRA-DNS: <what> status=<n> …` per call and exits **54** when every call
+  RETURNED, whatever it returned: 9002 (`DNS_ERROR_RCODE_SERVER_FAILURE`) is
+  the expected answer where the sandbox leaves libresolv with no nameservers
+  and is a pass. 60 is a query that claimed `ERROR_SUCCESS` with no records —
+  the "fake success" shape — and 61 an impossible size answer. **No
+  `MADEIRA-EXIT` line at all is the original bug.** No launcher button was
+  added: ContentView is another track's file this pass.
+
+  **What to look for in the next log:** `[unixlib] dnsapi (module 0x…) ->
+  wow64 table (0x…)` at load, `[unixlib] dnsapi: libresolv loaded (0x…)` (or
+  the `NO libresolv on this device` line) at the first query, and **no**
+  `err:dnsapi:DllMain No libresolv support`. If some other library still calls
+  through a NULL handle, it now announces itself by name in one
+  `[unixlib] call with NULL handle from …` line instead of taking the process
+  with it.
+- 2026-09-15 late — Logs 59-63 (DRM-free 1.10 build of the 2001 title,
+  the UE3 game with a physical pad). Title crash moved to a HOST NULL read
+  in `__wine_unix_call_dispatcher` (table=0): dnsapi's unix side never
+  bound on this port ("No libresolv support") and its DnsQuery still
+  issued the call → fixed twice: dispatcher refuses a NULL/short table
+  with STATUS_NOT_IMPLEMENTED (`[unixlib] call with NULL handle from …`),
+  and dnsapi is bound via `dnsapi_unixlib_ios.c` (libresolv.9 through
+  dlopen, both tables) + `dns-x86.exe` (exit 54, run via the Custom popup).
+  Also found: wow64 unix-call bridge converts a guest NULL arg block to B
+  (documented; NULL-preserving bridge left to FEX). 77 MB log = FEX's
+  `Add SMC interval` printed ~100/s from the eager DEP sweep arming write
+  traps on every RW region (3.2 % CPU in `unixcall_wine_dbg_write`) → eager
+  promotion removed entirely (lazy on decode miss only), log capped at 64.
+  Physical thumbsticks dead: the pad slot was never published (per-sample
+  `extendedGamepad` fetch could be nil → `continue`), `src=phys` was
+  derived from the slot not the sample; profile now captured at attach,
+  `lxf=…` raw floats + `ANALOGUE SILENCE` verdict + slot read-back in the
+  10 s line. UI: HUD drag jitter = `.local` drag coordinate space on a
+  moving view (→ `.global`); tiny landscape joystick = portrait
+  `JoystickPadState.shared` face never hidden in landscape; dead landscape
+  HUD buttons = `MadeiraMetalView` had no width constraint and covered the
+  pillarbox bar (`.frame(width: gameW)`); `[hud] tap …` on every button;
+  30 fps cap = vsync mode 3 (`presentDrawable:afterMinimumDuration:1/30`).

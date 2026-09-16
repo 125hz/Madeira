@@ -51,7 +51,9 @@ struct FPSOverlay: View {
     @State private var displayTimer: Timer? = nil
     /// Mirrors DXMT's g_madeira_vsync_mode (read per present, live-safe).
     /// 1 = locked 60, 0 = display max (120 ProMotion), 2 = raw (frame-skip
-    /// mailbox — game unthrottled, panel shows ≤ display rate).
+    /// mailbox — game unthrottled, panel shows ≤ display rate), 3 = locked 30
+    /// (added 2026-09-15, same afterMinimumDuration mechanism as 60 — see
+    /// winemetal_unix.c's _MTLCommandBuffer_presentDrawable).
     @State private var vsyncMode: Int32 = 1
     /// Ring buffer of (timestamp, count) pairs, 100ms cadence, 5s window.
     @State private var samples: [(t: CFAbsoluteTime, c: UInt64)] = []
@@ -140,13 +142,17 @@ struct FPSOverlay: View {
         .onDisappear { stopTimers() }
     }
 
-    /// Pacing pill, cycles 60 → MAX(n) → RAW → 60. Shared by the wide
+    /// Pacing pill, cycles 60 → MAX(n) → RAW → 30 → 60. Shared by the wide
     /// (portrait) and compact (landscape bar) overlay variants.
     ///   60: presents paced to exactly 60Hz.
     ///   MAX(n): free-run to display refresh; n = current cap
     ///     (120 = ProMotion; 60 = thermal/LPM capped).
     ///   RAW: game unthrottled (frame-skip mailbox) — FPS readout =
     ///     raw stack throughput.
+    ///   30: presents paced to exactly 30Hz — device feedback (2026-09-15)
+    ///     asked for a cap below 60 (thermal/battery headroom); appended
+    ///     rather than reordering the existing three so a saved/expected
+    ///     cycle position never silently changes meaning.
     private var pacingPill: some View {
         Text(pillLabel)
             .foregroundColor(pillColor)
@@ -155,23 +161,37 @@ struct FPSOverlay: View {
             .overlay(RoundedRectangle(cornerRadius: 4)
                 .stroke(pillColor, lineWidth: 1))
             .onTapGesture {
-                vsyncMode = vsyncMode == 1 ? 0 : (vsyncMode == 0 ? 2 : 1)
+                vsyncMode = Self.nextVsyncMode(vsyncMode)
+                fputs("[hud] tap fps-cap -> \(pillLabel(for: vsyncMode))\n", stderr)
                 madeira_set_vsync_locked(vsyncMode)
-                ProMotionIntent.shared.setActive(vsyncMode != 1)
+                ProMotionIntent.shared.setActive(vsyncMode == 0 || vsyncMode == 2)
             }
     }
 
-    private var pillLabel: String {
-        switch vsyncMode {
+    private static func nextVsyncMode(_ mode: Int32) -> Int32 {
+        switch mode {
+        case 1: return 0    // 60 -> MAX
+        case 0: return 2    // MAX -> RAW
+        case 2: return 3    // RAW -> 30
+        default: return 1   // 30 -> 60
+        }
+    }
+
+    private func pillLabel(for mode: Int32) -> String {
+        switch mode {
         case 1: return "60"
+        case 3: return "30"
         case 0: return "MAX(\(UIScreen.main.maximumFramesPerSecond))"
         default: return "RAW"
         }
     }
 
+    private var pillLabel: String { pillLabel(for: vsyncMode) }
+
     private var pillColor: Color {
         switch vsyncMode {
         case 1: return .cyan
+        case 3: return .indigo
         case 0: return .pink
         default: return .orange
         }

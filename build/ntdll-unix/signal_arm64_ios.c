@@ -12150,6 +12150,89 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_return,
 
 
 /***********************************************************************
+ *           ios_unixlib_null_call
+ *
+ * MADEIRA (WOW64_DESIGN.md §6, 2026-09-15): the "this unix call has no table"
+ * return path for __wine_unix_call_dispatcher below.
+ *
+ * WHY THIS EXISTS.  WINE_UNIX_CALL(code, args) expands to
+ * __wine_unix_call(__wine_unixlib_handle, code, args), and a PE DLL whose
+ * DllMain saw __wine_init_unix_call() FAIL leaves __wine_unixlib_handle at 0
+ * and calls it anyway — upstream dnsapi is exactly that shape ("No libresolv
+ * support, expect problems" and then straight into RESOLV_CALL).  The
+ * dispatcher's one instruction `ldr x16, [x0, x1, lsl #3]` then loads from
+ * 0 + code*8, which on this port is a HOST-side read of a guard page: log n60
+ * has pc=__wine_unix_call_dispatcher+0x5c, x0=0, x1=1, addr=0x8, three SEGVs
+ * in a row and then SEGV LOOP DETECTED — the whole pseudo-process dies for a
+ * DLL that merely has no unix side here.  A missing unix side must be a failed
+ * CALL, never a dead process, so the dispatcher checks first and lands here.
+ *
+ * The same check covers the 32-bit path without a second copy: FEX's wow64
+ * unix-call bridge (FEX/Source/Windows/WOW64/Module.cpp, the BridgeInstrs::
+ * UnixCall arm of HandleSyscallImpl) forwards the guest's handle verbatim to
+ * this same dispatcher, which is why n60's lr is libwow64fex.dll+0x1048c0.
+ *
+ * `ret_addr` is the dispatcher's caller (x30 at entry, before anything
+ * clobbers it): for a 64-bit caller that names the PE module directly, and for
+ * a 32-bit one it names FEX's bridge.  Logged once per caller module so a
+ * DLL that retries in a loop cannot flood the log.
+ */
+/* Upper bound on a unix-call code.  Larger than every builtin's funcs_count
+ * (the biggest is opengl32's 3107, which is also why virtual_ios.c's stub
+ * table is 4096 entries), so no real call is refused by it, while a wild code
+ * can no longer turn `ldr x16, [x0, x1, lsl #3]` into a read 32 GB past the
+ * table.  The string form is what the asm below pastes into its `cmp`. */
+#define IOS_UNIXLIB_MAX_CODE     0x1000
+#define IOS_UNIXLIB_MAX_CODE_STR "0x1000"
+
+#define IOS_UNIXLIB_NULL_SEEN 32
+static uint64_t ios_unixlib_null_seen[IOS_UNIXLIB_NULL_SEEN];
+static unsigned int ios_unixlib_null_seen_count;
+
+NTSTATUS __attribute__((used)) ios_unixlib_null_call( UINT64 handle, unsigned int code,
+                                                      const void *ret_addr )
+{
+    uint64_t lr = (uint64_t)(uintptr_t)ret_addr, key = 0, rva = 0;
+    const char *name = "?";
+    unsigned int i;
+    Dl_info di;
+#ifdef WINE_IOS
+    extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+    uint64_t mod = 0, va;
+
+    if (lr && (va = ios_jit_reverse_translate( lr, &mod )) && mod)
+    {
+        name = ios_pe_module_name( mod );
+        rva  = va - mod;
+        key  = mod;
+    }
+    else
+#endif
+    if (lr && dladdr( (void *)(uintptr_t)lr, &di ) && di.dli_fbase)
+    {
+        if (di.dli_fname) name = di.dli_fname;
+        rva = lr - (uint64_t)(uintptr_t)di.dli_fbase;
+        key = (uint64_t)(uintptr_t)di.dli_fbase;
+    }
+    else key = lr & ~0xfffull;
+
+    for (i = 0; i < ios_unixlib_null_seen_count && i < IOS_UNIXLIB_NULL_SEEN; i++)
+        if (ios_unixlib_null_seen[i] == key) return STATUS_NOT_IMPLEMENTED;
+    if (ios_unixlib_null_seen_count < IOS_UNIXLIB_NULL_SEEN)
+        ios_unixlib_null_seen[ios_unixlib_null_seen_count++] = key;
+
+    dprintf( STDERR_FILENO,
+             "[unixlib] call with %s from %s+0x%llx code=%u handle=0x%llx -> "
+             "STATUS_NOT_IMPLEMENTED (this module has no unix side on this port; "
+             "further calls from it are silent)\n",
+             !handle ? "NULL handle" :
+             code >= IOS_UNIXLIB_MAX_CODE ? "out-of-range code" : "NULL table entry",
+             name, (unsigned long long)rva, code, (unsigned long long)handle );
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+
+/***********************************************************************
  *           __wine_unix_call_dispatcher
  */
 __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
@@ -12193,9 +12276,23 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    __ASM_CFI(".cfi_offset 26, -0x78\n\t")
                    __ASM_CFI(".cfi_offset 27, -0x70\n\t")
                    __ASM_CFI(".cfi_offset 28, -0x68\n\t")
+                   /* MADEIRA (2026-09-15): never dereference a unixlib table
+                    * the PE side never got.  x0 is the table, x1 the code;
+                    * a NULL table (a DLL whose __wine_init_unix_call() failed
+                    * and that called WINE_UNIX_CALL anyway), a code past any
+                    * builtin's funcs_count, or a NULL entry inside a real
+                    * table all divert to ios_unixlib_null_call(), which logs
+                    * once per caller module and returns STATUS_NOT_IMPLEMENTED.
+                    * Three instructions on the hot path, against a host-side
+                    * SEGV loop that killed the whole pseudo-process (n60). */
+                   "cbz x0, " __ASM_LOCAL_LABEL("unixcall_no_table") "\n\t"
+                   "cmp x1, #" IOS_UNIXLIB_MAX_CODE_STR "\n\t"
+                   "b.hs " __ASM_LOCAL_LABEL("unixcall_no_table") "\n\t"
                    "ldr x16, [x0, x1, lsl 3]\n\t"
+                   "cbz x16, " __ASM_LOCAL_LABEL("unixcall_no_table") "\n\t"
                    "mov x0, x2\n\t"             /* args */
-                   "blr x16\n\t"
+                   "blr x16\n"
+                   __ASM_LOCAL_LABEL("unixcall_return") ":\n\t"
                    "ldr w16, [sp, #0x10c]\n\t"  /* frame->restore_flags */
                    "cbnz w16, " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") "\n\t"
                    __ASM_CFI_CFA_IS_AT2(sp, 0x98, 0x02) /* frame->syscall_cfa */
@@ -12213,7 +12310,19 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "ldp x16, x17, [sp, #0xf8]\n\t"
                    /* switch to user stack */
                    "mov sp, x16\n\t"
-                   "ret x17" )
+                   "ret x17\n"
+
+                   /* No table, no entry, or a code out of range: report it and
+                    * return STATUS_NOT_IMPLEMENTED through the normal epilogue.
+                    * x0/x1 still hold the handle and the code; x30 still holds
+                    * the caller's return address (it was only SAVED to
+                    * frame+0xf0 above, never overwritten), and clobbering it
+                    * with the `bl` is safe because the return below uses x17
+                    * loaded from frame+0x100, not x30. */
+                   __ASM_LOCAL_LABEL("unixcall_no_table") ":\n\t"
+                   "mov x2, x30\n\t"            /* ret_addr */
+                   "bl " __ASM_NAME("ios_unixlib_null_call") "\n\t"
+                   "b " __ASM_LOCAL_LABEL("unixcall_return") )
 
 #endif  /* __aarch64__ */
 

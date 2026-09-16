@@ -7286,6 +7286,16 @@ extern const void *crypt32_unix_call_funcs[];
  * when \\.\Nsi can't be opened. See nsi_unixlib_ios.c */
 extern const void *nsi_unix_call_funcs[];
 
+/* MADEIRA 2026-09-15: dnsapi's unix side (the system resolver), compiled from
+ * upstream dlls/dnsapi/libresolv.c by build/ntdll-unix/dnsapi_unixlib_ios.c.
+ * Before this, dnsapi was the "(unknown module)" case below: its DllMain's
+ * __wine_init_unix_call() failed, it logged "No libresolv support, expect
+ * problems" and then called WINE_UNIX_CALL with a NULL handle anyway, which
+ * faulted the HOST inside __wine_unix_call_dispatcher and killed the whole
+ * pseudo-process (log n60).  A 32-bit title that merely initialises
+ * networking at startup loads dnsapi; one that doesn't, never noticed. */
+extern const void *dnsapi_unix_call_funcs[];
+
 /* iOS-Madeira ml494 (#61 text wall): dwrite's unix side (freetype glyph
  * rasterisation). Without it every __wine_unix_call from dwrite.dll failed,
  * so get_glyph_bbox never ran and every glyph run reported an EMPTY bbox —
@@ -7329,6 +7339,13 @@ extern const void *dwrite_unix_call_wow64_funcs[];
  * wow64 tables are named in the source instead of by build.sh's rename. */
 extern const void *audio_null_ios_unix_call_wow64_funcs[];
 extern const void *nsi_unix_call_wow64_funcs[];
+/* dnsapi's is upstream's own `#ifdef _WIN64` wow64 table, whose thunks now
+ * convert the guest pointers embedded in their argument blocks with
+ * ios_wow_host_ptr() (M5) exactly as ws2_32's and dwrite's do — plus a new
+ * wow64_resolv_set_serverlist, because that entry's argument block IS the
+ * caller's optional IP4_ARRAY and a 32-bit NULL reaches the unix side as the
+ * window base rather than as NULL. */
+extern const void *dnsapi_unix_call_wow64_funcs[];
 
 /***********************************************************************
  *           ios_module_export_name
@@ -7453,10 +7470,16 @@ static NTSTATUS ios_bind_unixlib_table( void *module, const char *libname, BOOL 
 
     if (!table)
     {
-        ERR( "[unixlib] %s (module %p): no %s unix call table — failing the load rather than "
-             "binding the %s table to a %s caller\n", libname, module,
-             wow ? "wow64" : "64-bit", wow ? "64-bit" : "wow64",
-             wow ? "32-bit" : "64-bit" );
+        /* MADEIRA 2026-09-15: dprintf, not ERR.  This file's debug channel is
+         * `virtual`, and the app runs with WINEDEBUG=err+all,err-virtual
+         * (WineProcessBridge.m:505) — so every refusal logged here has been
+         * INVISIBLE, which is why log n60 shows dnsapi's DllMain complaining
+         * and no [unixlib] line for it at all.  A library losing its unix side
+         * is the first half of every NULL-handle crash and has to be loud. */
+        dprintf( 2, "[unixlib] %s (module %p) has no unix side on this port: no %s unix call "
+                 "table — failing the load rather than binding the %s table to a %s caller\n",
+                 libname, module, wow ? "wow64" : "64-bit", wow ? "64-bit" : "wow64",
+                 wow ? "32-bit" : "64-bit" );
         return STATUS_NOT_SUPPORTED;
     }
     dprintf( 2, "[unixlib] %s (module %p) -> %s table (%p)\n",
@@ -7587,6 +7610,14 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             libname = "dwrite (rev=ml494)";
             funcs64 = (const void *)dwrite_unix_call_funcs;
             funcs_wow64 = (const void *)dwrite_unix_call_wow64_funcs;
+        } else if (match && (strstr(match, "dnsapi") || strstr(match, "DNSAPI"))) {
+            /* Matched on "dnsapi" so both the export name ("DNSAPI.dll") and a
+             * unix_path of "dnsapi.so" land here; the strstr chain is already
+             * case-sensitive elsewhere, and dnsapi's export directory spells
+             * it lowercase. */
+            libname = "dnsapi";
+            funcs64 = (const void *)dnsapi_unix_call_funcs;
+            funcs_wow64 = (const void *)dnsapi_unix_call_wow64_funcs;
         } else if (match && strstr(match, "nsi.dll")) {
             libname = "nsi (rev=ml472)";
             funcs64 = (const void *)nsi_unix_call_funcs;
@@ -7631,11 +7662,12 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
              * table it has always had. */
             funcs_wow64 = NULL;
             if (wow)
-                ERR( "[unixlib] UNRECOGNISED module %p (export name %s, unix_path %s, mapped file %s): "
-                     "no statically linked wow64 unix call table matches — refusing with "
-                     "STATUS_NOT_SUPPORTED instead of binding the stub table to a 32-bit caller\n",
-                     module, modname ? modname : "(none)", up ? up : "(none)",
-                     secname[0] ? secname : "(none)" );
+                dprintf( 2, "[unixlib] UNRECOGNISED module %p (export name %s, unix_path %s, "
+                         "mapped file %s) has no unix side on this port: no statically linked "
+                         "wow64 unix call table matches — refusing with STATUS_NOT_SUPPORTED "
+                         "instead of binding the stub table to a 32-bit caller\n",
+                         module, modname ? modname : "(none)", up ? up : "(none)",
+                         secname[0] ? secname : "(none)" );
         }
         status = ios_bind_unixlib_table( module, libname, wow, funcs64, funcs_wow64, funcs );
     }
