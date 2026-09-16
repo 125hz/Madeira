@@ -1,0 +1,19 @@
+This folder holds what the app needs from Apple's Metal Shader Converter.
+
+- libmetalirconverter.dylib (iOS build): Apple proprietary. NOT in the source
+  repository. Distributed inside built Madeira packages under the Apple
+  Metal Shader Converter agreement, section 2.B ("install, use, test, and
+  distribute the Dynamic Libraries for the sole purpose of shader
+  conversion"); Madeira uses it solely to convert DXIL shaders to Metal.
+  Full agreement: METAL-SHADER-CONVERTER-AGREEMENT.txt. Obtain it with
+  build/madeira-d3d12/fetch-converter.sh from Apple's installer package.
+- Metal Shader Converter headers (metal_irconverter*, compiled into the
+  runtime): Apache License 2.0, Copyright Apple Inc.
+  See LICENSE-metal-shader-converter-headers.txt.
+- canary_*.dxil: Madeira's own test shaders (GPL-3.0-or-later with the
+  draft additional permission in the repository's LICENSE-EXCEPTION.md).
+- LICENSE-MADEIRA-GPL-3.0.txt and LICENSE-MADEIRA-EXCEPTION.txt: copies of
+  the repository's COPYING and LICENSE-EXCEPTION.md, staged into this
+  bundled folder by build/madeira-d3d12/fetch-converter.sh so the shipped
+  app carries the licence and the (draft) additional permission. They are
+  generated copies and are not tracked in git.

@@ -138,3 +138,7 @@ research/remote-metal/host/rmetald.*
 # never committed (Apple installer agreement 2.B permits distribution only for shader
 # conversion; GPL/LGPL compatibility of shipping it inside the app is unresolved)
 app/Madeira/d3d12/libmetalirconverter.dylib
+
+# Licence texts staged into the bundle by fetch-converter.sh (copies of COPYING and LICENSE-EXCEPTION.md)
+app/Madeira/d3d12/LICENSE-MADEIRA-GPL-3.0.txt
+app/Madeira/d3d12/LICENSE-MADEIRA-EXCEPTION.txt
