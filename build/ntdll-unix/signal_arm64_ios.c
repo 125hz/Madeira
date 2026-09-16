@@ -3812,6 +3812,20 @@ skip_reclaim_band: ;
                         static volatile uint64_t stuck_page;
                         static volatile uint64_t stuck_pc;
                         static volatile uint32_t stuck_n;
+                        /* ml876: exact faulting ADDRESS, and a page-level storm
+                         * counter. ml871-875 killed a UE 5.4 game thread here on
+                         * every run: an SDK dll walked its import table with the
+                         * classic VirtualProtect(entry,RW) / write / VirtualProtect
+                         * (page,RO) pattern; on 16 KB host pages the RO of one 4 KB
+                         * guest page strips W from the neighbour the guest had just
+                         * made RW, [wr-strip] heals it and the thread advances to
+                         * the NEXT entry -- a different address every time. Same
+                         * (page,pc) 50x is therefore NOT "zero progress". Livelock
+                         * = the SAME address re-faulting (ml261 sp-16 push, ml385
+                         * NULL write, ml557 un-stuck heal); key on it. Keep a much
+                         * larger page-level ceiling as the storm safety net. */
+                        static volatile uint64_t stuck_addr;
+                        static volatile uint32_t stuck_page_n;
                         uint64_t fpage = (uint64_t)fault_addr & ~0x3fffull;
                         /* ml385: NULL-page faults keyed as 1, not 0 — `if (fpage &&`
                          * excluded them entirely and a NULL-write loop in
@@ -3820,6 +3834,22 @@ skip_reclaim_band: ;
                          * had detached). */
                         if (!fpage) fpage = 1;
 
+                        if (fpage == stuck_page && fault_pc_check == stuck_pc &&
+                            (uint64_t)fault_addr != stuck_addr)
+                        {
+                            /* ml876: same page+pc but a NEW address = progress.
+                             * Restart the exact-address count; keep the page
+                             * storm count (ceiling 20000, logged every 1000). */
+                            uint32_t pn = __sync_add_and_fetch(&stuck_page_n, 1);
+                            stuck_addr = (uint64_t)fault_addr;
+                            stuck_n = 0;
+                            if ((pn % 1000) == 0)
+                                dprintf(STDERR_FILENO,
+                                    "[fault-stuck] ml876 page 0x%llx pc 0x%llx: %u faults, addresses advancing (last 0x%llx)\n",
+                                    (unsigned long long)fpage, (unsigned long long)fault_pc_check, pn,
+                                    (unsigned long long)fault_addr);
+                            if (pn >= 20000) stuck_n = 49;   /* storm ceiling: next fault breaks */
+                        }
                         if (fpage == stuck_page && fault_pc_check == stuck_pc)
                         {
                             uint32_t n = __sync_add_and_fetch(&stuck_n, 1);
@@ -3889,7 +3919,9 @@ skip_reclaim_band: ;
                         {
                             stuck_page = fpage;
                             stuck_pc = fault_pc_check;
+                            stuck_addr = (uint64_t)fault_addr;
                             stuck_n = 0;
+                            stuck_page_n = 0;
                         }
                     }
 
@@ -7673,6 +7705,111 @@ static void ios_decline_foreign_fault( int sig, const void *pc, const void *addr
 }
 #endif
 
+/* ---------------------------------------------------------------------------
+ * ml845 [tlswatch]: catch the writer of the UE5 exe's thread-local at
+ * static TLS block 0 +0x38 IN THE ACT.
+ *
+ * Established so far: the value is the thread's own FEX emulator stack top,
+ * it appears during dispatch of the engine's thread-naming exception
+ * (RaiseException 0x406D1388), and NOTHING in the executable writes that slot
+ * -- every static form has been exhausted. So the writer is either a guest DLL
+ * or our own dispatch code, and only a runtime trap can name it.
+ *
+ * Arm: in NtRaiseException for that code, make the block's host page(s)
+ * read-only. Re-arm: from NtContinue on the same thread while the target word
+ * is still untouched (dispatch continues through several NtContinue calls, so
+ * an off-target write that steals the watch costs one interval, not the run).
+ * Catch: in bus_handler, before the [wr-strip] heal that would otherwise
+ * silently restore access, log the faulting PC (dladdr for native, raw for JIT
+ * pool), the target offset, restore access and resume in place. Capped. */
+#include <dlfcn.h>
+static uintptr_t ios_tlswatch_block, ios_tlswatch_page, ios_tlswatch_len;
+static DWORD ios_tlswatch_tid;
+static int ios_tlswatch_armed, ios_tlswatch_hit, ios_tlswatch_faults;
+
+void ios_tlswatch_arm_block( void *blockp, const char *why )
+{
+    TEB *teb = NtCurrentTeb();
+    uintptr_t block, target;
+
+    /* ml881: OPT-IN. The ml845 diagnosis is closed (ml848 fixed the TLS-slot
+     * aliasing), but this stayed armed on every new thread, write-protecting
+     * its 16 KB TLS page. A UE 5.4 worker's plain TLS-slot store compiles to
+     * a store-release (stlr), which the bus-handler emulator refuses, and the
+     * refusal became a DATATYPE_MISALIGNMENT exception delivered to the game
+     * -- which then crashed inside its own crash reporter. */
+    { static int enabled = -1; if (enabled < 0) enabled = getenv("MADEIRA_TLSWATCH") != NULL; if (!enabled) return; }
+    if (ios_tlswatch_hit || ios_tlswatch_armed || !teb || !blockp) return;
+    block = (uintptr_t)blockp;
+    if (*(uint64_t *)(block + 0x38)) return;   /* nothing left to catch on this thread */
+    target = block + 0x38;
+    ios_tlswatch_page = target & ~(uintptr_t)0x3fff;
+    ios_tlswatch_len = ((target + 0x20) > ios_tlswatch_page + 0x4000) ? 0x8000 : 0x4000;
+    if (mprotect( (void *)ios_tlswatch_page, ios_tlswatch_len, PROT_READ ))
+    {
+        dprintf( 2, "[tlswatch] ml845 arm(%s) FAILED errno=%d page=%p\n", why, errno, (void *)ios_tlswatch_page );
+        return;
+    }
+    ios_tlswatch_block = block;
+    ios_tlswatch_tid = (DWORD)(ULONG_PTR)teb->ClientId.UniqueThread;
+    ios_tlswatch_armed = 1;
+    dprintf( 2, "[tlswatch] ml845 ARMED (%s) tid=%04x block=%p target=%p page=%p len=0x%zx value-now=0x%llx\n",
+             why, (unsigned)ios_tlswatch_tid, (void *)block, (void *)target, (void *)ios_tlswatch_page,
+             (size_t)ios_tlswatch_len, (unsigned long long)*(uint64_t *)target );
+}
+
+void ios_tlswatch_arm( const char *why )
+{
+    void **blocks = NtCurrentTeb() ? NtCurrentTeb()->ThreadLocalStoragePointer : NULL;
+    if (blocks && blocks[0]) ios_tlswatch_arm_block( blocks[0], why );
+}
+
+void ios_tlswatch_rearm( const char *why )
+{
+    TEB *teb = NtCurrentTeb();
+    if (ios_tlswatch_armed || ios_tlswatch_hit || !ios_tlswatch_block || !teb) return;
+    if ((DWORD)(ULONG_PTR)teb->ClientId.UniqueThread != ios_tlswatch_tid) return;
+    if (ios_tlswatch_faults >= 24) return;
+    if (*(uint64_t *)(ios_tlswatch_block + 0x38))
+    {
+        /* Already written between faults: name that fact instead of watching a
+         * slot that has nothing left to tell us. */
+        dprintf( 2, "[tlswatch] ml845 target already set at rearm(%s): 0x%llx -- the write fell between "
+                    "a heal and this rearm, or came from a thread the watch does not follow\n",
+                 why, (unsigned long long)*(uint64_t *)(ios_tlswatch_block + 0x38) );
+        ios_tlswatch_hit = 1;
+        return;
+    }
+    if (!mprotect( (void *)ios_tlswatch_page, ios_tlswatch_len, PROT_READ )) ios_tlswatch_armed = 1;
+}
+
+/* Returns 1 when the fault was the watch and has been healed (caller resumes). */
+static int ios_tlswatch_fault( const void *addr, const void *pc, const char *which )
+{
+    uintptr_t a = (uintptr_t)addr;
+    Dl_info di;
+    int in_target;
+    long off;
+
+    if (!ios_tlswatch_armed) return 0;
+    if (a < ios_tlswatch_page || a >= ios_tlswatch_page + ios_tlswatch_len) return 0;
+    ios_tlswatch_faults++;
+    off = (long)(a - ios_tlswatch_block);
+    in_target = (off >= 0x38 && off < 0x50);
+    memset( &di, 0, sizeof di );
+    dladdr( pc, &di );
+    dprintf( 2, "[tlswatch] ml845 WRITE #%d via %s: addr=%p = block%+ld %s | pc=%p %s`%s+0x%llx tid=%04x\n",
+             ios_tlswatch_faults, which, addr, off, in_target ? "<== TARGET WORD" : "(other data on the page)",
+             pc, di.dli_fname ? strrchr( di.dli_fname, '/' ) ? strrchr( di.dli_fname, '/' ) + 1 : di.dli_fname : "(no image: JIT pool or guest)",
+             di.dli_sname ? di.dli_sname : "?",
+             di.dli_saddr ? (unsigned long long)((uintptr_t)pc - (uintptr_t)di.dli_saddr) : 0ull,
+             (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread );
+    mprotect( (void *)ios_tlswatch_page, ios_tlswatch_len, PROT_READ | PROT_WRITE );
+    ios_tlswatch_armed = 0;
+    if (in_target) ios_tlswatch_hit = 1;
+    return 1;
+}
+
 static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     EXCEPTION_RECORD rec = { 0 };
@@ -8192,6 +8329,31 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                     int i, plausible = 0;
 
                     ERR("  [guest-state] x28=%p rip=%p\n", (void*)state, (void*)cs[0]);
+                    /* ml885: State.rip is only the block ENTRY. Resolve the exact
+                     * guest instruction from the block tail, and show its bytes,
+                     * so a fault names the x86 instruction rather than the block.
+                     * A resolved RIP that does not belong to the block the return
+                     * address implies means the `ret` landed in the wrong block
+                     * (callret / invalidation), not that the guest read garbage. */
+                    {
+                        extern uint64_t ios_native_rip_from_hostpc( uint64_t, uint64_t, const char ** );
+                        uint64_t bb = 0, xrip = 0; const char *why = "";
+                        mach_vm_size_t g2 = 0;
+                        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)state, 8,
+                                                    (mach_vm_address_t)&bb, &g2 ) == KERN_SUCCESS && g2 == 8 && bb)
+                            xrip = ios_native_rip_from_hostpc( bb, (uint64_t)(uintptr_t)pc, &why );
+                        if (xrip)
+                        {
+                            uint8_t xb[16]; mach_vm_size_t g3 = 0;
+                            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)xrip, sizeof(xb),
+                                                        (mach_vm_address_t)xb, &g3 ) == KERN_SUCCESS && g3 == sizeof(xb))
+                                ERR("  [guest-exact] ml885 block=%p rip=%p x86=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                    (void*)bb, (void*)xrip, xb[0],xb[1],xb[2],xb[3],xb[4],xb[5],xb[6],xb[7],xb[8],xb[9],xb[10],xb[11],xb[12],xb[13],xb[14],xb[15]);
+                            else
+                                ERR("  [guest-exact] ml885 block=%p rip=%p (bytes unreadable)\n", (void*)bb, (void*)xrip);
+                        }
+                        else ERR("  [guest-exact] ml885 block=%p unresolved: %s\n", (void*)bb, why);
+                    }
                     for (i = 0; i < 16; i += 4)
                         ERR("  [guest-state]   %s=%p %s=%p %s=%p %s=%p\n",
                             gn[i],   (void*)cs[1+i], gn[i+1], (void*)cs[2+i],
@@ -9771,6 +9933,11 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
              * Always logs the wine-vs-host comparison for the first few, so if
              * this case never actually occurs we find out instead of assuming.
              */
+            if (ios_tlswatch_fault( siginfo->si_addr, pc, "bus" ))
+            {
+                ios_fixup_x18_for_return( bus_ctx );
+                return;
+            }
             if (rd_kr == KERN_SUCCESS)
             {
                 DWORD64 esr = get_fault_esr( bus_ctx );
@@ -11424,7 +11591,15 @@ uint64_t ios_native_rip_from_hostpc( uint64_t block_begin, uint64_t host_pc, con
     for (i = 0; i < tail.n_entries; i++)
     {
         struct ios_vlpair e;
-        if (pos + 17 > (uint32_t)got) break;      /* stay inside what we read */
+        if (pos + 17 > (uint32_t)got)
+        {
+            /* ml875: the table can exceed one 512-byte window; ml688 silently
+             * stopped here and returned a PARTIAL RIP. Slide the window. */
+            tab_addr += pos; pos = 0; got = 0;
+            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)tab_addr,
+                    sizeof(tab), (mach_vm_address_t)tab, &got ) != KERN_SUCCESS || got < 17)
+            { if (why) *why = "RIP table truncated"; return 0; }
+        }
         e = ios_vl64pair_decode( tab + pos );
         pos += e.size;
         if (host_pc >= cur_host + e.arm) { cur_host += e.arm; cur_rip += e.rip; }

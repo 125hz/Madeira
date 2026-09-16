@@ -532,6 +532,199 @@ static inline unsigned int wait_reply( struct __server_request_info *req )
 }
 
 
+/* ============================================================================
+ * ml875 [thread-sample] -- task-wide guest/native thread sampler.
+ *
+ * Why this shape (review of ml873/ml874):
+ *  - every thread gets a record: native pc/lr/sp + dladdr, name, run state,
+ *    even when guest resolution fails (a GameThread blocked in native code
+ *    carries no valid FEX registers and would otherwise vanish);
+ *  - the guest RIP comes from the ml688 block-tail resolver ([x28+0] is
+ *    InlineJITBlockHeader); State.rip is NOT maintained while the JIT runs;
+ *  - x17 (callret sp) and x23 (SRA guest rsp) are only meaningful when pc is
+ *    inside a JIT block, so callret/stack are only decoded on a resolved
+ *    sample; stack matches are CANDIDATE return addresses, not an unwind;
+ *  - module names come from the sampled thread's OWN PEB (pseudo-processes
+ *    share the Mach task but not their loader lists), rebuilt every burst;
+ *  - one sampler for the task, bursts of 4 passes 250 ms apart every 20 s,
+ *    GameThread and RUNNING threads on every pass, everything else once. */
+static int ios_ts_armed;
+struct ios_ts_mod { uint64_t base, size; char name[40]; };
+struct ios_ts_map { uint64_t peb; int n; struct ios_ts_mod m[160]; };
+static struct ios_ts_map ios_ts_maps[6];
+static int ios_ts_nmaps;
+
+static int ios_ts_read(uint64_t a, void *o, size_t n)
+{
+    vm_size_t got = 0;
+    return a > 0x10000 && vm_read_overwrite(mach_task_self(), (vm_address_t)a, n, (vm_address_t)o, &got) == KERN_SUCCESS && got == n;
+}
+
+/* ml876: thread_get_state returns x18 == 0 for every thread (the kernel does
+ * not preserve the platform register), so ml875 never had a TEB and never
+ * built a module map. The TEB lives in the pthread TSD slot ios_teb_tls_key;
+ * find the TSD array's offset inside struct pthread by SELF-CALIBRATION (set
+ * a private key on this thread, scan for the value) rather than trusting the
+ * 224 from libpthread's private headers. */
+static long ios_ts_tsd_off = -1;
+static void ios_ts_calibrate(void)
+{
+    extern pthread_key_t ios_teb_tls_key;
+    pthread_key_t k; long off; char *base = (char *)pthread_self();
+    if (pthread_key_create(&k, NULL)) return;
+    pthread_setspecific(k, (void *)0x5a5a1234abcdULL);
+    for (off = 0; off < 8192; off += 8) {
+        uint64_t v = 0;
+        if (ios_ts_read((uint64_t)(uintptr_t)base + off + (uint64_t)k * 8, &v, 8) && v == 0x5a5a1234abcdULL) { ios_ts_tsd_off = off; break; }
+    }
+    pthread_setspecific(k, NULL); pthread_key_delete(k);
+    wine_log_write("[thread-sample] ml876 tsd offset calibrated: %ld (teb key %lu)", ios_ts_tsd_off, (unsigned long)ios_teb_tls_key);
+}
+static uint64_t ios_ts_teb(pthread_t pt)
+{
+    extern pthread_key_t ios_teb_tls_key;
+    uint64_t v = 0;
+    if (ios_ts_tsd_off < 0 || !pt || !ios_teb_tls_key) return 0;
+    ios_ts_read((uint64_t)(uintptr_t)pt + ios_ts_tsd_off + (uint64_t)ios_teb_tls_key * 8, &v, 8);
+    return (v & 0xfff) ? 0 : v;
+}
+
+static struct ios_ts_map *ios_ts_map_for_teb(uint64_t teb)
+{
+    uint64_t peb = 0, ldr = 0, head, cur; int i, guard = 0; struct ios_ts_map *mp;
+    if (!teb || (teb & 0xfff) || !ios_ts_read(teb + 0x60, &peb, 8) || !peb) return NULL;
+    for (i = 0; i < ios_ts_nmaps; i++) if (ios_ts_maps[i].peb == peb) return &ios_ts_maps[i];
+    if (ios_ts_nmaps >= 6 || !ios_ts_read(peb + 0x18, &ldr, 8) || !ldr) return NULL;
+    mp = &ios_ts_maps[ios_ts_nmaps]; memset(mp, 0, sizeof(*mp)); mp->peb = peb;
+    head = ldr + 0x10;
+    if (!ios_ts_read(head, &cur, 8)) return NULL;
+    while (cur && cur != head && guard++ < 200 && mp->n < 160) {
+        uint64_t base = 0, buf = 0, next = 0; uint32_t size = 0; uint16_t len = 0, w[40]; int k;
+        if (!ios_ts_read(cur + 0x30, &base, 8) || !ios_ts_read(cur + 0x40, &size, 4) ||
+            !ios_ts_read(cur + 0x58, &len, 2) || !ios_ts_read(cur + 0x60, &buf, 8)) break;
+        if (base && size) {
+            struct ios_ts_mod *m = &mp->m[mp->n++];
+            m->base = base; m->size = size;
+            len /= 2; if (len > 39) len = 39;
+            if (len && ios_ts_read(buf, w, len * 2)) { for (k = 0; k < len; k++) m->name[k] = w[k] < 128 ? (char)w[k] : '?'; m->name[len] = 0; }
+            else strcpy(m->name, "?");
+        }
+        if (!ios_ts_read(cur, &next, 8)) break;
+        cur = next;
+    }
+    ios_ts_nmaps++;
+    wine_log_write("[thread-sample] ml876 modmap peb=0x%llx modules=%d first=%s@0x%llx", (unsigned long long)peb, mp->n,
+                   mp->n ? mp->m[0].name : "-", (unsigned long long)(mp->n ? mp->m[0].base : 0));
+    return mp;
+}
+
+static const char *ios_ts_mod_for(struct ios_ts_map *mp, uint64_t va, uint64_t *rva)
+{
+    int i;
+    if (!mp) return NULL;
+    for (i = 0; i < mp->n; i++)
+        if (va >= mp->m[i].base && va < mp->m[i].base + mp->m[i].size) { *rva = va - mp->m[i].base; return mp->m[i].name; }
+    return NULL;
+}
+
+static int ios_ts_sym(uint64_t a, char *out, size_t cap)
+{
+    Dl_info di; const char *img;
+    if (!a || !dladdr((void *)a, &di) || !di.dli_fname) { snprintf(out, cap, "0x%llx", (unsigned long long)a); return 0; }
+    img = strrchr(di.dli_fname, '/'); img = img ? img + 1 : di.dli_fname;
+    if (di.dli_sname) snprintf(out, cap, "%s`%s+0x%llx", img, di.dli_sname, (unsigned long long)(a - (uint64_t)di.dli_saddr));
+    else snprintf(out, cap, "%s+0x%llx", img, (unsigned long long)(a - (uint64_t)di.dli_fbase));
+    return 1;
+}
+
+static void ios_thread_sampler_pass(int burst)
+{
+    extern uint64_t ios_native_rip_from_hostpc( uint64_t, uint64_t, const char ** );
+    mach_port_t self_port = pthread_mach_thread_np(pthread_self());
+    thread_act_array_t tlist; mach_msg_type_number_t tcount; unsigned k, printed = 0;
+    if (task_threads(mach_task_self(), &tlist, &tcount) != KERN_SUCCESS) return;
+    ios_ts_nmaps = 0;                                   /* fresh maps every pass */
+    for (k = 0; k < tcount && printed < 64; k++) {
+        thread_basic_info_data_t bi; mach_msg_type_number_t bic = THREAD_BASIC_INFO_COUNT;
+        arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+        char tname[40] = ""; pthread_t pt; int running, is_game;
+        uint64_t pc, lr, sp, x28, x17, x18, x23, bb = 0, rip = 0, cr[16], stk[64], nstk[64];
+        int have_bb, have_cr, have_stk, have_nstk;
+        const char *why = "";
+        if (tlist[k] == self_port) continue;
+        if (thread_info(tlist[k], THREAD_BASIC_INFO, (thread_info_t)&bi, &bic) != KERN_SUCCESS) continue;
+        pt = pthread_from_mach_thread_np(tlist[k]);
+        if (pt) pthread_getname_np(pt, tname, sizeof(tname));
+        running = bi.run_state == TH_STATE_RUNNING;
+        is_game = !strcmp(tname, "GameThread") || !strncmp(tname, "RenderThread", 12) || !strncmp(tname, "RHIThread", 9);
+        if (burst && !running && !is_game) continue;    /* idle waiters: once per burst */
+        if (thread_suspend(tlist[k]) != KERN_SUCCESS) continue;
+        if (thread_get_state(tlist[k], ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) != KERN_SUCCESS) { thread_resume(tlist[k]); continue; }
+        pc = arm_thread_state64_get_pc(st); lr = arm_thread_state64_get_lr(st); sp = arm_thread_state64_get_sp(st);
+        x28 = st.__x[28]; x17 = st.__x[17]; x23 = st.__x[23];
+        x18 = ios_ts_teb(pt);                          /* ml876: TEB from TSD, not x18 */
+        if (!x18) x18 = st.__x[18];
+        have_bb  = ios_ts_read(x28, &bb, 8) && bb > 0x10000;
+        have_cr  = ios_ts_read(x17, cr, sizeof(cr));
+        have_stk = !(x23 & 7) && ios_ts_read(x23, stk, sizeof(stk));
+        have_nstk = !(sp & 7) && ios_ts_read(sp, nstk, sizeof(nstk));
+        thread_resume(tlist[k]);
+        if (have_bb) rip = ios_native_rip_from_hostpc(bb, pc, &why);
+        {
+            char line[1400], s1[120], s2[120]; int n; unsigned i, shown; uint64_t rva; const char *mn;
+            struct ios_ts_map *mp = ios_ts_map_for_teb(x18);
+            ios_ts_sym(pc, s1, sizeof(s1)); ios_ts_sym(lr, s2, sizeof(s2));
+            n = snprintf(line, sizeof(line), "[thread-sample] ml876 b%d \"%s\" teb=0x%llx cpu=%d%% %s pc=%s lr=%s sp=0x%llx",
+                         burst, tname, (unsigned long long)x18, bi.cpu_usage / 10, running ? "RUN" : "wait",
+                         s1, s2, (unsigned long long)sp);
+            if (rip) {
+                mn = ios_ts_mod_for(mp, rip, &rva);
+                n += snprintf(line + n, sizeof(line) - n, " GUEST rip=0x%llx", (unsigned long long)rip);
+                if (mn) n += snprintf(line + n, sizeof(line) - n, "(%s+0x%llx)", mn, (unsigned long long)rva);
+                n += snprintf(line + n, sizeof(line) - n, " callret=[");
+                for (i = 0; have_cr && i < 8 && n < (int)sizeof(line) - 100; i++) {
+                    uint64_t g = cr[i * 2]; if (!g) break;
+                    mn = ios_ts_mod_for(mp, g, &rva);
+                    if (mn) n += snprintf(line + n, sizeof(line) - n, " %s+0x%llx", mn, (unsigned long long)rva);
+                    else n += snprintf(line + n, sizeof(line) - n, " 0x%llx", (unsigned long long)g);
+                }
+                n += snprintf(line + n, sizeof(line) - n, " ] rsp=0x%llx stack-cand=[", (unsigned long long)x23);
+                for (i = 0, shown = 0; have_stk && i < 64 && shown < 12 && n < (int)sizeof(line) - 80; i++) {
+                    mn = ios_ts_mod_for(mp, stk[i], &rva);
+                    if (!mn || rva < 0x1000) continue;
+                    n += snprintf(line + n, sizeof(line) - n, " %s+0x%llx", mn, (unsigned long long)rva); shown++;
+                }
+                n += snprintf(line + n, sizeof(line) - n, " ]");
+            } else {
+                n += snprintf(line + n, sizeof(line) - n, " NATIVE (%s%s) sp-cand=[", have_bb ? "unresolved: " : "no FEX state", have_bb ? why : "");
+                for (i = 0, shown = 0; have_nstk && i < 64 && shown < 12 && n < (int)sizeof(line) - 80; i++) {
+                    mn = ios_ts_mod_for(mp, nstk[i], &rva);
+                    if (!mn || rva < 0x1000) continue;
+                    n += snprintf(line + n, sizeof(line) - n, " %s+0x%llx", mn, (unsigned long long)rva); shown++;
+                }
+                n += snprintf(line + n, sizeof(line) - n, " ]");
+            }
+            wine_log_write("%s", line);
+            printed++;
+        }
+    }
+    for (k = 0; k < tcount; k++) mach_port_deallocate(mach_task_self(), tlist[k]);
+    vm_deallocate(mach_task_self(), (vm_address_t)tlist, tcount * sizeof(*tlist));
+}
+
+static void ios_thread_sampler_main(void)
+{
+    ios_ts_calibrate();
+    wine_log_write("[thread-sample] ml876 armed (task-wide: burst of 4 passes / 250 ms every 20 s)");
+    for (;;) {
+        int b;
+        sleep(20);
+        for (b = 0; b < 4; b++) { ios_thread_sampler_pass(b); usleep(250000); }
+        wine_log_write("[thread-sample] ml876 burst done");
+    }
+}
+
+
 /* iOS-Madeira 2026-07-05: per-present frame-anatomy counters, read by
  * winemetal_unix's Present-cadence log line (same binary). The wait
  * accounting is gated to the GAME thread (main Wine thread, captured in
@@ -1003,6 +1196,9 @@ static void invoke_system_apc( const union apc_call *call, union apc_result *res
 unsigned int server_select( const union select_op *select_op, data_size_t size, UINT flags,
                             timeout_t abs_timeout, struct context_data *context, struct user_apc *user_apc )
 {
+#ifdef WINE_IOS
+    { extern void ios_tls38_poll( const char * ); ios_tls38_poll( "wait" ); }
+#endif
     unsigned int ret;
     int cookie;
     obj_handle_t apc_handle = 0;
@@ -1246,6 +1442,9 @@ NTSTATUS WINAPI NtContinueEx( CONTEXT *context, KCONTINUE_ARGUMENT *args )
     struct user_apc apc;
     NTSTATUS status;
     BOOL alertable;
+#ifdef WINE_IOS
+    { extern void ios_tlswatch_rearm( const char * ); ios_tlswatch_rearm( "NtContinue" ); }
+#endif
 
     if ((UINT_PTR)args > 0xff)
         alertable = args->ContinueFlags & KCONTINUE_FLAG_TEST_ALERT;
@@ -2778,6 +2977,11 @@ void server_init_process_done(void)
          * (unix side), or elsewhere — mapping the hot buckets tells us
          * where the ~1.4s/frame actually goes. Counts halve at each print
          * so the histogram tracks the current phase. */
+        /* ml875 [thread-sample]: ONE task-wide sampler (ml873 armed seven, one
+         * per pseudo-process, each suspending the others' threads). Body in
+         * ios_thread_sampler_main() above. */
+        if (__sync_bool_compare_and_swap(&ios_ts_armed, 0, 1))
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_thread_sampler_main(); });
         if (!getenv("MADEIRA_QUIET"))
         {
             /* iOS-Madeira 2026-07-05 quiet mode: the sampler thread_suspends

@@ -1060,20 +1060,16 @@ struct ContentView: View {
         .transition(.opacity)
     }
 
+    /// ml896: NOT a Button. A Button's press highlight is an implicit animation,
+    /// and SwiftUI renders animations on its AsyncRenderer thread, which needs a
+    /// CAPresentationModifierGroup, whose shared memory comes from a tagged
+    /// purgable vm_allocate that fails once a game is running (three crash
+    /// reports, all in commitAsyncValues force-unwrapping that nil). HoldKeyView
+    /// changes only a colour with no animation, so it stays on the main-thread
+    /// render path the rest of this UI already uses for minutes without harm.
+    /// Down at touch, up at lift, which is also the correct key semantics.
     private func keyButton(_ label: String, vk: Int32) -> some View {
-        Button(action: {
-            winios_post_key(vk, 1)
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.06) {
-                winios_post_key(vk, 0)
-            }
-        }) {
-            Text(label)
-                .font(.system(size: 14, weight: .semibold, design: .monospaced))
-                .foregroundColor(.white)
-                .frame(minWidth: 34, minHeight: 30)
-                .background(Color.white.opacity(0.15))
-                .cornerRadius(6)
-        }
+        HoldKeyView(label: label, vk: vk)
     }
 
     private func entitlementBadges(_ ents: EntitlementStatus) -> some View {
@@ -1465,6 +1461,37 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.orange)
 
+                // Valley of the Ancient (UE5). Like Stray, the LAUNCHER builds its
+                // own child command line and passes only the project name, so any
+                // flag we want has to go on the shipping binary directly. Measured
+                // from a real run: AncientGame.exe spawns
+                //   AncientGame-Win64-Shipping.exe ValleyoftheAncient
+                // and nothing else, which is why the launcher is skipped here.
+                //
+                // Flags come from Documents/madeira-valley-args.txt so a UE switch
+                // can be tried without rebuilding and reinstalling. The default
+                // carries -ansimalloc because the first two runs both died with
+                //   FMallocBinned2 Attempt to free an unrecognized block 885560000
+                // at the same address, before any RHI work. Selecting a different
+                // allocator says whether that is Binned2's own bookkeeping or a
+                // genuine bad free; delete the flag to reproduce the fatal.
+                Button("Valley of the Ancient (UE5)") {
+                    setenv("MADEIRA_EXE",
+                           "C:\\Program Files\\Valley of the Ancient - DX12\\ValleyoftheAncient\\Binaries\\Win64\\AncientGame-Win64-Shipping.exe", 1)
+                    var args = "ValleyoftheAncient -windowed -ansimalloc"
+                    if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+                       let txt = try? String(contentsOf: d.appendingPathComponent("madeira-valley-args.txt"), encoding: .utf8) {
+                        let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !v.isEmpty { args = v }
+                    }
+                    setenv("MADEIRA_ARGS", args, 1)
+                    unsetenv("MADEIRA_DESKTOP")
+                    logStore.log("Valley: args = \(args)")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.mint)
+
                 Button("Thumper (standalone)") {
                     // Game lives at Documents/wine/drive_c/Program Files/Thumper/
                     // (push via scripts/deploy-thumper.sh during development;
@@ -1485,6 +1512,33 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.purple)
+
+                // madeira-d3d12 M2: an x86-64 guest driving the ARM64EC D3D12
+                // runtime. Creates device/queue/allocator/list/fence, records
+                // and closes an empty list, executes it, signals a fence and
+                // wakes an event waiter, plus the refusal cases. Prints a build
+                // marker naming which architecture it actually reached, which
+                // states the loader question as evidence rather than assumption.
+                // The visible one: an x86-64 Windows program drawing a rotating
+                // cube through our D3D12 interfaces and presenting into the
+                // host window. Shaders are still matched fixtures rather than
+                // runtime-converted DXIL, which the window title states.
+                Button("D3D12 cube") {
+                    setenv("MADEIRA_EXE", "d3d12-cube-x64.exe", 1)
+                    unsetenv("MADEIRA_ARGS")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.indigo)
+
+                Button("D3D12 M2 ABI") {
+                    setenv("MADEIRA_EXE", "d3d12-m2-x64.exe", 1)
+                    unsetenv("MADEIRA_ARGS")
+                    unsetenv("MADEIRA_DESKTOP")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.teal)
 
                 // ml731c: one-second check of the Windows clock contract
                 // (GetTickCount64 / system time / unbiased interrupt time /
@@ -1998,6 +2052,35 @@ struct ContentView: View {
             winios_phase("pool-ready")
             logStore.log("BRK suspension lasted \(String(format: "%.2f", elapsed))s")
 
+            // Arena carver self-test. Documents/madeira-arena-test.txt holds
+            // "churn:N", "ramp:N" or "random:N". Deliberately a SEPARATE file
+            // from madeira-arena.txt: a test that only runs when the feature is
+            // enabled cannot be used to decide whether to enable it.
+            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-arena-test.txt"), encoding: .utf8) {
+                let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !v.isEmpty {
+                    setenv("MADEIRA_ARENA_TEST", v, 1)
+                    logStore.log("arena carver self-test: \(v)", level: .success)
+                }
+            }
+
+            // ml787: deterministic call-ret allocation failure injection.
+            // Documents/madeira-fexfail.txt holds "reserve:N" or "commit:N".
+            // The containment path it exercises only occurs naturally when a
+            // title exhausts the emulator's address band, and only the reserve
+            // half occurs at all -- an untested cleanup path is an assumption,
+            // so this makes both reproducible on demand. Absent the file
+            // nothing is injected.
+            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-fexfail.txt"), encoding: .utf8) {
+                let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !v.isEmpty {
+                    setenv("MADEIRA_FEX_FAIL_CALLRET", v, 1)
+                    logStore.log("call-ret failure injection: \(v) via madeira-fexfail.txt", level: .error)
+                }
+            }
+
             // ml762: remote Metal backend. Documents/madeira-remote.txt holds
             // "<host-ip> <token>" and routes winemetal to a Metal daemon on that
             // host instead of the local device. The mode is decided ONCE per
@@ -2015,6 +2098,51 @@ struct ContentView: View {
                 } else if !parts.isEmpty {
                     logStore.log("madeira-remote.txt needs '<host-ip> <token>'", level: .error)
                 }
+            }
+
+            // madeira-d3d12: M1 shader-converter gate, in-app.
+            // Documents/madeira-d3d12.txt == "1" runs the same canary that
+            // passes standalone on macOS and over SSH on this device, but from
+            // inside Madeira -- which is the only way to test bundling, signing
+            // and dlopen under the app's own sandbox. Results go to the log.
+            // Reports its decision either way. A gate that stays silent when it
+            // declines to run is indistinguishable from one that never executed,
+            // which cost a device run to work out.
+            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+                let url = d.appendingPathComponent("madeira-d3d12.txt")
+                let raw = try? String(contentsOf: url, encoding: .utf8)
+                let val = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if val == "1" {
+                    let dir = Bundle.main.bundlePath + "/d3d12"
+                    let dylib = dir + "/libmetalirconverter.dylib"
+                    let haveDylib = FileManager.default.fileExists(atPath: dylib)
+                    let transcript = d.appendingPathComponent("madeira-d3d12-canary.log").path
+                    logStore.log("madeira-d3d12: running the M1 canary in-app (dylib present: \(haveDylib))", level: .info)
+                    let fails = madeira_d3d12_canary_run_log(
+                        dir, dylib, nil, transcript,
+                        (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String) ?? "?")
+                    if fails == 0 {
+                        logStore.log("madeira-d3d12: M1 canary PASSED in-app (transcript: madeira-d3d12-canary.log)", level: .success)
+                    } else {
+                        logStore.log("madeira-d3d12: M1 canary FAILED (\(fails) checks)", level: .error)
+                    }
+                } else {
+                    logStore.log("madeira-d3d12: gate off (madeira-d3d12.txt \(raw == nil ? "unreadable" : "= '\(val)'"))", level: .debug)
+                }
+            }
+
+            // ml821: coalesced remote messages. Documents/madeira-remote-batch.txt
+            // == "1" makes the pre-submission flush send many buffer ranges per
+            // round trip and drains autorelease pools in one call. It is OPT-IN
+            // because the measurement it is meant to improve needs a matched
+            // baseline: with the file absent the process behaves exactly as
+            // ml820 did. Round-trip COUNT is the cost being attacked -- one
+            // gameplay frame spent 369 ms of 524 ms on 2,197 serialized calls.
+            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-remote-batch.txt"), encoding: .utf8),
+               txt.trimmingCharacters(in: .whitespacesAndNewlines) == "1" {
+                setenv("DXMT_REMOTE_BATCH", "1", 1)
+                logStore.log("remote Metal: message coalescing ON via madeira-remote-batch.txt", level: .success)
             }
 
             // ml761: top-level API census. Documents/madeira-apicensus.txt == "1"
@@ -2786,7 +2914,10 @@ struct TouchControlButton: View {
                                  lineWidth: isSelected ? 2 : 1))
         // A stick must not shrink under the thumb; only round buttons do that.
         .scaleEffect(!isStick && isDown ? 0.92 : 1.0)
-        .animation(.easeOut(duration: 0.08), value: isDown)
+        // ml890: no press animation. Pressing the on-screen Enter key killed the
+        // whole process with a SwiftUI trap on com.apple.SwiftUI.AsyncRenderer
+        // (DisplayList.ViewUpdater.ViewCache.commitAsyncValues) while this
+        // glass control animated its press; the state change now applies at once.
         // ml646: the springy knob, same curve as the portrait pad overlay.
         .animation(.spring(response: 0.22, dampingFraction: 0.58), value: stickDir)
         .overlay(alignment: .topTrailing) {

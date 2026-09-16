@@ -551,13 +551,60 @@ static void ios_window_inventory( const char *why, unsigned long long lo_arg, un
                 break;
             }
 
-    dprintf(2, "[window] 0x%llx..0x%llx regions=%u occupied=%llu MB of %llu MB "
-            "free=%llu MB maxhole=%llu MB@0x%llx rev=ml366 (%s)\n",
-            lo_arg, hi_arg, regions, (unsigned long long)(total >> 20),
-            (unsigned long long)((hi_arg - lo_arg) >> 20),
-            (unsigned long long)(free_total >> 20),
-            (unsigned long long)(free_max >> 20),
-            (unsigned long long)free_max_at, why);
+    /* ml787: never report a window as free without checking the TASK CEILING
+     * first.
+     *
+     * A region walk above the ceiling finds no mappings, because the range is
+     * not in the task's map at all -- and the census then printed the whole
+     * span as free. A 449GB window was read as 15GB of usable address space on
+     * a task whose ceiling is 63GB, and used to argue for a placement that
+     * could never have worked. "No mappings here" and "usable" are different
+     * claims; this one now says which it is making. */
+    {
+        task_vm_info_data_t ceil_vmi;
+        mach_msg_type_number_t ceil_cnt = TASK_VM_INFO_COUNT;
+        unsigned long long task_max = 0;
+        if (task_info( mach_task_self(), TASK_VM_INFO,
+                       (task_info_t)&ceil_vmi, &ceil_cnt ) == KERN_SUCCESS)
+            task_max = (unsigned long long)ceil_vmi.max_address;
+
+        if (task_max && (unsigned long long)lo_arg >= task_max)
+        {
+            dprintf(2, "[window] 0x%llx..0x%llx OUTSIDE TASK MAP (ceiling 0x%llx) -- "
+                    "no mappings found here because the range is not mapped at all; "
+                    "this is NOT free space rev=ml787 (%s)\n",
+                    (unsigned long long)lo_arg, (unsigned long long)hi_arg, task_max, why);
+        }
+        else
+        {
+            /* CLAMP the span to the ceiling rather than annotating it. A window
+             * that starts below the ceiling and ends above it would otherwise
+             * report the unmapped remainder as free -- the same untruth as the
+             * fully-outside case, just harder to notice. */
+            unsigned long long eff_hi = (unsigned long long)hi_arg;
+            unsigned long long eff_free = (unsigned long long)free_total;
+            unsigned long long eff_hole = (unsigned long long)free_max;
+            int clamped = 0;
+            if (task_max && eff_hi > task_max)
+            {
+                unsigned long long cut = eff_hi - task_max;
+                eff_hi = task_max;
+                clamped = 1;
+                /* Everything above the ceiling was counted as a free hole. */
+                eff_free = eff_free > cut ? eff_free - cut : 0;
+                if (eff_hole > cut) eff_hole -= cut; else eff_hole = 0;
+            }
+            dprintf(2, "[window] 0x%llx..0x%llx regions=%u occupied=%llu MB of %llu MB "
+                    "free=%llu MB maxhole=%llu MB@0x%llx rev=ml787%s (%s)\n",
+                    (unsigned long long)lo_arg, eff_hi, regions,
+                    (unsigned long long)(total >> 20),
+                    (unsigned long long)((eff_hi - (unsigned long long)lo_arg) >> 20),
+                    (unsigned long long)(eff_free >> 20),
+                    (unsigned long long)(eff_hole >> 20),
+                    (unsigned long long)free_max_at,
+                    clamped ? " CLAMPED-TO-TASK-CEILING" : "", why);
+        }
+    }
     for (i = 0; i < 6; i++)
         if (counts[i])
             dprintf(2, "[window]   %-7s n=%-5u %llu MB\n",
@@ -697,6 +744,13 @@ static void *ios_pool_warmer_thread( void *arg )
                  * the one measurement that decides whether a 3rd pool is
                  * reachable never fired. Put it on the periodic timer too. */
                 ios_window_inventory( "periodic", 0x7048000000ULL, 0x7400000000ULL );
+                /* ml897: the band CoreAnimation's tag-51 vm_allocate lands in.
+                 * ml896 measured KERN_NO_SPACE there in 36 of 110 cycles while
+                 * every success sat in 0x724..0x76b; this says WHO occupies it. */
+                {
+                    extern unsigned long long ios_layerkit_lo, ios_layerkit_hi;   /* ml902: the MEASURED span */
+                    if (ios_layerkit_hi) ios_window_inventory( "layerkit-span", ios_layerkit_lo, ios_layerkit_hi );
+                }
                 ios_bigres_report( "periodic" );
             }
             /* ml358 FOOTPRINT (every cycle, one line): phys_footprint is the
@@ -725,6 +779,31 @@ static void *ios_pool_warmer_thread( void *arg )
                     unsigned long long fp_mb = (unsigned long long)vmi.phys_footprint >> 20;
                     if (fp_mb > peak_mb) peak_mb = fp_mb;
                     ios_last_footprint_mb = fp_mb;      /* ml668: drives the sampler cadence */
+                    /* ml896: replay CoreAnimation's shmem request EXACTLY. ml894 used
+                     * plain ANYWHERE|PURGABLE and never saw a failure, but the
+                     * disassembly of CA::Render::Shmem::new_shmem shows
+                     *   vm_allocate(task, &addr, size, 0x33000003)
+                     * = ANYWHERE | PURGABLE | VM_MAKE_TAG(51), and the tag picks
+                     * the address range. Four variants isolate tag vs purgable. */
+                    {
+                        static kern_return_t last[4] = { -1, -1, -1, -1 };
+                        static const int fl[4] = { 0x33000003, 0x33000001, 0x00000003, 0x00000001 };
+                        static const char *nm[4] = { "tag51+purg", "tag51", "purg", "plain" };
+                        vm_address_t a[4]; kern_return_t kr[4]; int i, changed = 0;
+                        for (i = 0; i < 4; i++) {
+                            a[i] = 0;
+                            kr[i] = vm_allocate( mach_task_self(), &a[i], 0x19000, fl[i] );
+                            if (kr[i] != last[i]) changed = 1;
+                        }
+                        if (changed || (cycle % 30) == 0)
+                            dprintf(2, "[ca-shmem-probe] rev=ml896 %s: kr=%d 0x%lx | %s: kr=%d 0x%lx | %s: kr=%d 0x%lx | %s: kr=%d 0x%lx (cycle=%u)\n",
+                                    nm[0], kr[0], (unsigned long)a[0], nm[1], kr[1], (unsigned long)a[1],
+                                    nm[2], kr[2], (unsigned long)a[2], nm[3], kr[3], (unsigned long)a[3], cycle);
+                        for (i = 0; i < 4; i++) {
+                            last[i] = kr[i];
+                            if (kr[i] == KERN_SUCCESS) vm_deallocate( mach_task_self(), a[i], 0x19000 );
+                        }
+                    }
                     dprintf(2, "[footprint] rev=ml358 phys=%llu MB (peak %llu) internal=%llu MB "
                             "compressed=%llu MB external=%llu MB reusable=%llu MB (cycle=%u)\n",
                             fp_mb, peak_mb,
@@ -823,6 +902,18 @@ static void *ios_pool_warmer_thread( void *arg )
                 natural_t rdepth = 0;
                 unsigned regions = 0, ti, tj;
                 unsigned long long total_dirty = 0;
+                /* ml894: HOLE CENSUS below 64GB. CoreAnimation's presentation-
+                 * modifier shmem (what SwiftUI's async renderer allocates on
+                 * every animation frame) is an UNTAGGED vm_allocate(ANYWHERE|
+                 * PURGABLE) of ~100KB; two Enter presses at the game menu died
+                 * on exactly that returning NULL (SwiftUICore commitAsyncValues
+                 * force-unwraps the group). Untagged requests are confined to
+                 * the default range, so record what is actually free down here:
+                 * the largest gap, the total, and the LOWEST gap >= 128KB (a
+                 * lowest-fit search would land there). */
+                unsigned long long hole_prev_end = 0, hole_max = 0, hole_total = 0,
+                                   hole_first_ok = 0, hole_first_ok_size = 0;
+                unsigned hole_count = 0;
                 memset( top, 0, sizeof(top) );
                 memset( dirty_by_tag, 0, sizeof(dirty_by_tag) );
                 memset( res_by_tag, 0, sizeof(res_by_tag) );
@@ -838,6 +929,14 @@ static void *ios_pool_warmer_thread( void *arg )
                                                 (vm_region_recurse_info_t)&info, &icnt ) != KERN_SUCCESS)
                         break;
                     if (info.is_submap) { rdepth++; continue; }
+                    if (raddr < 0x1000000000ULL && raddr > hole_prev_end && hole_prev_end)
+                    {
+                        unsigned long long gap = raddr - hole_prev_end;
+                        hole_total += gap;
+                        if (gap > hole_max) hole_max = gap;
+                        if (gap >= 0x20000) { hole_count++; if (!hole_first_ok) { hole_first_ok = hole_prev_end; hole_first_ok_size = gap; } }
+                    }
+                    if (raddr + rsize > hole_prev_end) hole_prev_end = raddr + rsize;
                     d = ((unsigned long long)info.pages_dirtied +
                          (unsigned long long)info.pages_swapped_out) << 14;
                     {
@@ -933,6 +1032,8 @@ static void *ios_pool_warmer_thread( void *arg )
                     dprintf(2, " %s=%llu/%llu", band_name[ti],
                             band_dirty[ti] >> 20, band_res[ti] >> 20);
                 dprintf(2, "\n");
+                dprintf(2, "[holes<64G] rev=ml894 free=%llu MB largest=%llu MB gaps>=128K=%u lowest=0x%llx+0x%llx (cycle=%u)\n",
+                        hole_total >> 20, hole_max >> 20, hole_count, hole_first_ok, hole_first_ok_size, cycle);
             }
         }
         /* ml668: ADAPTIVE CADENCE. At a flat 2s the run kept ending BETWEEN
@@ -4073,9 +4174,78 @@ struct reserved_area
     struct list entry;
     void       *base;
     size_t      size;
+    /* ml799: FEX_ONLY. The emulator's arena is held in this same list so that
+     * freed views return to Wine's free-range machinery like any other reserved
+     * range -- but NOTHING generic may allocate from it. Wine's list carried no
+     * kind, and map_reserved_area_inner() considers every entry, so adding the
+     * 8GB arena untyped would let guest DLLs and unrelated heaps take it: the
+     * exact collision the arena exists to end. Generic adds skip these entries
+     * entirely (see mmap_add_reserved_area) so an adjacent range can never
+     * silently coalesce the type away. */
+    unsigned int fex_only;
 };
 
 static struct list reserved_areas = LIST_INIT(reserved_areas);
+
+/* ml814: per-request allocation-failure attribution.
+ *
+ * ml813 used a SHARED GLOBAL for this and it lied immediately: three different
+ * requests on two threads all reported one identical 256KB Mach record, because
+ * the global was only written by the fixed-map path and never reset. I then
+ * read that stale value as the cause. Thread-local and reset at the top of
+ * every map_view call, so a record either belongs to THIS request or is absent.
+ *
+ * stage: 0 none, 1 limits/params, 2 placement scan, 3 anon mmap,
+ *        4 vprot table, 5 view struct, 6 fixed-map */
+struct ios_af_rec { int stage; int err; unsigned long long addr, size; };
+static __thread struct ios_af_rec ios_af;
+static const char * const ios_af_stage_name[] = {
+    "none", "limits/params", "placement-scan", "anon-mmap",
+    "vprot-table", "view-struct", "fixed-map" };
+static inline void ios_af_set( int stage, int err, const void *addr, size_t size )
+{
+    /* First failure wins: later stages are consequences of the first. */
+    if (ios_af.stage) return;
+    ios_af.stage = stage; ios_af.err = err;
+    ios_af.addr = (unsigned long long)(uintptr_t)addr; ios_af.size = (unsigned long long)size;
+}
+
+/* ml797: the arena, for the PE side to hand to the emulator as plain data.
+ * The setenv() calls at the reservation site stay for logging and for unix-side
+ * consumers, but they can never reach rpmalloc's band selector -- it runs too
+ * early to call anything that reads an environment. Zero means nothing was
+ * reserved. Declared here because the reserved-area allocator below needs them. */
+ULONG_PTR ios_fex_arena_base_unix = 0;
+ULONG_PTR ios_fex_arena_end_unix = 0;
+
+/* ml800: hand the arena to the PE side on request.
+ *
+ * This is the authoritative answer: these globals live in ntdll-unix, of which
+ * there is exactly one per Mach task, so no image copy can make it stale. */
+NTSTATUS unixcall_ios_get_fex_arena( void *args )
+{
+    struct ios_get_fex_arena_params *p = args;
+
+    if (!p) return STATUS_INVALID_PARAMETER;
+    p->base = (ULONG64)ios_fex_arena_base_unix;
+    p->end  = (ULONG64)ios_fex_arena_end_unix;
+    return STATUS_SUCCESS;
+}
+
+/* ml799: may this request be served from the FEX_ONLY arena?
+ *
+ * Only when the caller's address requirements are CONTAINED in the arena. That
+ * is the whole exclusivity rule: FEX asks with [band_base, band_end], which
+ * ntdll itself published, so its requests qualify and nothing else does. An
+ * unconstrained request (limit_low 0, limit_high the top of the address space)
+ * can never be contained, so generic placement is excluded by construction
+ * rather than by a list of call sites someone has to remember to update. */
+static int fex_arena_covers( const void *limit_low, const void *limit_high )
+{
+    if (!ios_fex_arena_base_unix || !ios_fex_arena_end_unix) return 0;
+    return (ULONG_PTR)limit_low  >= ios_fex_arena_base_unix &&
+           (ULONG_PTR)limit_high <= ios_fex_arena_end_unix;
+}
 
 struct builtin_module
 {
@@ -4556,6 +4726,16 @@ static unsigned int ios_va_scan_skips;
 static void *ios_scan_base, *ios_scan_end;
 static unsigned int ios_scan_views;
 static size_t ios_scan_maxgap;
+/* ml798: the gap AFTER the last view, up to `end`.
+ *
+ * maxgap only ever measured gaps that sit BEFORE a view, so when the walk ran
+ * off the end of the view list the terminal region was never measured at all.
+ * That made "maxgap=0x0" read as "not one byte of contiguous space anywhere",
+ * and an 8GB band whose views stopped 2GB in was diagnosed as fragmented when
+ * the kernel was simply REFUSING the rest (firstfail=0xc88000000 errno=12).
+ * Reporting the tail separately keeps those two verdicts apart: a large tail
+ * with a firstfail inside it means refusal, not occupancy. */
+static size_t ios_scan_tailgap;
 static int ios_scan_stop;   /* see ios_scan_stop_name() */
 
 /* ml118 THE DISCRIMINATING QUESTION. The kernel's own walk reported ONE
@@ -4821,7 +5001,58 @@ void *anon_mmap_alloc( size_t size, int prot )
 
     for (;;)
     {
-        ret = mmap( NULL, size, prot, MAP_PRIVATE | MAP_ANON, -1, 0 );
+        /* ml902: ask for HEAP-range placement FIRST. Untagged kernel picks
+         * fill the default range, spill into CoreAnimation's tag-51 span once
+         * that range is tight (ants45: 77 untagged failures, CA aborted at 13
+         * min), and ml815 already proved the tagged form is the one that keeps
+         * working under pressure. Untagged stays as the fallback. */
+        ret = mmap( NULL, size, prot, MAP_PRIVATE | MAP_ANON, VM_MAKE_TAG( VM_MEMORY_MALLOC ), 0 );
+        if (ret == MAP_FAILED) ret = mmap( NULL, size, prot, MAP_PRIVATE | MAP_ANON, -1, 0 );
+        /* ml815: ONE bounded retry with a heap-directed allocation tag.
+         *
+         * ml814 proved the fatal is a plain 96KB anonymous mmap returning
+         * ENOMEM at a 2GB footprint on a 32GB host. I read "the kernel picks
+         * the address" as "placement is therefore ruled out" -- that was wrong.
+         * This kernel partitions the address space into ranges and selects one
+         * by allocation TAG and size (vm_map_range_configure; the usable
+         * windows demonstrably move between launches). A small UNTAGGED mapping
+         * can therefore be confined to a range that is full while other windows
+         * are mappable -- which is exactly the shape the startup probes show.
+         *
+         * So: if the untagged attempt fails, ask once more as heap memory. On
+         * Darwin the tag rides in the fd argument for MAP_ANON. This runs ONLY
+         * after a failure that is otherwise fatal, so it cannot regress a
+         * working path, and it is one retry, not a loop.
+         *
+         * If this recovers the allocation, the failure is range placement, not
+         * exhaustion -- and the log says which. */
+        if (ret == MAP_FAILED)
+        {
+            int saved = errno;
+            void *tagged = mmap( NULL, size, prot, MAP_PRIVATE | MAP_ANON,
+                                 VM_MAKE_TAG( VM_MEMORY_MALLOC ), 0 );
+            static unsigned long tag_n;
+            unsigned long tn = ++tag_n;
+
+            if (tagged != MAP_FAILED)
+            {
+                if (tn <= 32 || (tn % 256) == 0)
+                    dprintf( 2, "[mmap-tag] ml815 #%lu RECOVERED size=0x%lx prot=%d at %p "
+                                "(untagged failed errno=%d) -- this is RANGE PLACEMENT, "
+                                "not exhaustion\n",
+                             tn, (unsigned long)size, prot, tagged, saved );
+                ret = tagged;
+            }
+            else
+            {
+                if (tn <= 32)
+                    dprintf( 2, "[mmap-tag] ml815 #%lu BOTH FAILED size=0x%lx prot=%d "
+                                "untagged errno=%d tagged errno=%d -- genuine exhaustion of "
+                                "every range this allocation may use\n",
+                             tn, (unsigned long)size, prot, saved, errno );
+                errno = saved;
+            }
+        }
         if (ret == MAP_FAILED || !ios_jit_pool_intersects( ret, size )) break;
         dprintf( 2, "[jit-clobber] kernel-pick %p+0x%lx prot=%x landed INSIDE the JIT pool"
                     " (rx=%p rw=%p size=0x%lx) — rejecting, try %d\n",
@@ -5039,6 +5270,11 @@ static void mmap_add_reserved_area( void *addr, SIZE_T size )
         area_end = (char *)area->base + area->size;
 
         if (area->base > end) break;
+        /* ml799: never merge a generic range into the FEX arena. Adjacency is
+         * enough for the merge below to swallow it, and the type would vanish
+         * with no diagnostic -- after which generic placement could allocate
+         * inside the arena. Skipping keeps the insert position correct. */
+        if (area->fex_only) continue;
         if (area_end < addr) continue;
         if (area->base > addr)
         {
@@ -5070,8 +5306,53 @@ static void mmap_add_reserved_area( void *addr, SIZE_T size )
     {
         area->base = addr;
         area->size = size;
+        area->fex_only = 0;
         list_add_before( ptr, &area->entry );
     }
+}
+
+/***********************************************************************
+ *           mmap_add_fex_reserved_area
+ *
+ * ml799: register the emulator's arena as a FEX_ONLY reserved range.
+ *
+ * Deliberately does NOT merge with anything. The arena is registered exactly
+ * once, and merging is what would erase the kind. An overlap with an existing
+ * range is a bug worth naming rather than absorbing: it would mean two owners
+ * again, which is the condition this whole change exists to remove.
+ */
+static int mmap_add_fex_reserved_area( void *addr, SIZE_T size )
+{
+    struct reserved_area *area;
+    struct list *ptr;
+
+    LIST_FOR_EACH( ptr, &reserved_areas )
+    {
+        area = LIST_ENTRY( ptr, struct reserved_area, entry );
+        if (area->base > addr) break;
+        if ((char *)area->base + area->size > (char *)addr)
+        {
+            ERR( "[fex-arena] ml799 REFUSING to register arena %p+%llx: it overlaps an existing "
+                 "reserved range %p+%llx -- two owners again; not registering\n",
+                 addr, (unsigned long long)size, area->base, (unsigned long long)area->size );
+            return 0;
+        }
+    }
+
+    if (!(area = malloc( sizeof(*area) )))
+    {
+        ERR( "[fex-arena] ml802 could not allocate a reserved-area record for %p+%llx\n",
+             addr, (unsigned long long)size );
+        return 0;
+    }
+    area->base = addr;
+    area->size = size;
+    area->fex_only = 1;
+    list_add_before( ptr, &area->entry );
+    ERR( "[fex-arena] ml799 registered FEX_ONLY reserved area %p..%p (%llu MB) -- generic "
+         "placement cannot allocate here\n", addr, (char *)addr + size,
+         (unsigned long long)(size >> 20) );
+    return 1;
 }
 
 static void mmap_remove_reserved_area( void *addr, SIZE_T size )
@@ -5120,6 +5401,10 @@ static void mmap_remove_reserved_area( void *addr, SIZE_T size )
                     {
                         new_area->base = (char *)addr + size;
                         new_area->size = (char *)area->base + area->size - (char *)new_area->base;
+                        /* ml799: a split must carry the kind across. The tail half
+                         * of a FEX_ONLY area is still FEX_ONLY; defaulting it to
+                         * generic would quietly open the arena to everything. */
+                        new_area->fex_only = area->fex_only;
                         list_add_after( ptr, &new_area->entry );
                     }
                     area->size = (char *)addr - (char *)area->base;
@@ -5202,6 +5487,14 @@ static void *anon_mmap_tryfixed( void *start, size_t size, int prot, int flags )
     }
     else
     {
+        /* ml813: keep the REAL reason.
+         *
+         * Everything except KERN_NO_SPACE was flattened to ENOMEM, so an
+         * invalid-address rejection and a genuine out-of-space became
+         * indistinguishable -- and a whole diagnosis was built on reading one as
+         * the other. Record the raw kr so the allocation-failure probe can name
+         * what the kernel actually said. */
+        ios_af_set( 6, (int)ret, start, size );
         errno = (ret == KERN_NO_SPACE ? EEXIST : ENOMEM);
         ptr = MAP_FAILED;
     }
@@ -6609,6 +6902,20 @@ static int ios_skip_occupied( void *addr, size_t size, size_t align_mask,
     return 1;
 }
 
+/* ml900: the kernel's range for VM_MEMORY_LAYERKIT (CoreAnimation's render
+ * shmem), measured in ios_va_profile() before any guest view or emulator arena
+ * exists. It is ~10 GB and randomised per launch; two runs proved that both the
+ * emulator arena and the guest stacks landed inside it, CoreAnimation ran out
+ * of space, and the app aborted in CA::Render::Encoder::grow (40 min in) or
+ * trapped in SwiftUI's async renderer. Generic placement must never use it. */
+unsigned long long ios_layerkit_lo, ios_layerkit_hi;
+static int ios_layerkit_enforce = 1;          /* ml901: soft -- dropped if the exclusion would fail an allocation */
+static unsigned long ios_layerkit_skips;
+static inline int ios_in_layerkit( unsigned long long a, size_t size )
+{
+    return ios_layerkit_enforce && ios_layerkit_hi && a + size > ios_layerkit_lo && a < ios_layerkit_hi;
+}
+
 static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
                                 void *start, size_t size, int unix_prot )
 {
@@ -6656,6 +6963,21 @@ static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
                 else start = (void *)((pool_end + (size_t)step - 1) & ~((uintptr_t)step - 1));
                 continue;
             }
+        }
+        if (ios_in_layerkit( (unsigned long long)(uintptr_t)start, size ))   /* ml900 */
+        {
+            static int skipped;
+            ios_layerkit_skips++;
+            if (skipped++ < 8)
+                dprintf( 2, "[layerkit-range] SKIP scan over CoreAnimation's range at %p (0x%llx..0x%llx)\n",
+                         start, ios_layerkit_lo, ios_layerkit_hi );
+            if (step < 0)
+            {
+                if (ios_layerkit_lo < size) break;
+                start = ROUND_ADDR( (char *)(uintptr_t)(ios_layerkit_lo - size), (size_t)(-step) - 1 );
+            }
+            else start = (void *)(uintptr_t)((ios_layerkit_hi + (size_t)step - 1) & ~((uintptr_t)step - 1));
+            continue;
         }
         if (anon_mmap_tryfixed( start, size, unix_prot, 0 ) != MAP_FAILED) return start;
         TRACE( "Found free area is already mapped, start %p.\n", start );
@@ -6706,7 +7028,24 @@ static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
  * Find a free area between views inside the specified range and map it.
  * virtual_mutex must be held by caller.
  */
+static void *map_free_area_inner( void *base, void *end, size_t size, int top_down, int unix_prot, size_t align_mask );
 static void *map_free_area( void *base, void *end, size_t size, int top_down, int unix_prot, size_t align_mask )
+{
+    unsigned long before = ios_layerkit_skips;
+    void *r = map_free_area_inner( base, end, size, top_down, unix_prot, align_mask );
+    if (!r && ios_layerkit_enforce && ios_layerkit_skips != before)
+    {
+        /* ml901: the only fit was inside CoreAnimation's range. Failing the
+         * guest here is worse than starving CoreAnimation later, so stop
+         * enforcing for the rest of the process and search again. */
+        ios_layerkit_enforce = 0;
+        dprintf( 2, "[layerkit-range] ml901 exclusion DROPPED: no free area of 0x%lx outside 0x%llx..0x%llx; "
+                    "guest views may now enter CoreAnimation's range\n", (unsigned long)size, ios_layerkit_lo, ios_layerkit_hi );
+        r = map_free_area_inner( base, end, size, top_down, unix_prot, align_mask );
+    }
+    return r;
+}
+static void *map_free_area_inner( void *base, void *end, size_t size, int top_down, int unix_prot, size_t align_mask )
 {
     struct wine_rb_entry *first = find_view_inside_range( &base, &end, top_down );
     ptrdiff_t step = top_down ? -(align_mask + 1) : (align_mask + 1);
@@ -6733,6 +7072,7 @@ static void *map_free_area( void *base, void *end, size_t size, int top_down, in
     ios_scan_end = end;
     ios_scan_views = 0;
     ios_scan_maxgap = 0;
+    ios_scan_tailgap = 0;
     ios_scan_stop = first ? 0 : 9;
     ios_scan_fail_addr = NULL;
     ios_scan_fail_errno = 0;
@@ -6779,8 +7119,15 @@ static void *map_free_area( void *base, void *end, size_t size, int top_down, in
         }
     }
 
+    /* ml798: measure the terminal region before trying it, so a failure here is
+     * distinguishable from having no space at all. */
     if (!first)
+    {
+        if (start && (char *)end > (char *)start)
+            ios_scan_tailgap = (char *)end - (char *)start;
+        if (ios_scan_tailgap > ios_scan_maxgap) ios_scan_maxgap = ios_scan_tailgap;
         start = try_map_free_area( base, end, step, start, size, unix_prot );
+    }
 
     if (!start)
         ERR( "couldn't map free area in range %p-%p, size %p\n", base, end, (void *)size );
@@ -7025,12 +7372,17 @@ static NTSTATUS create_view( struct file_view **view_ret, void *base, size_t siz
         delete_view( view );
     }
 
-    if (!alloc_pages_vprot( base, size )) return STATUS_NO_MEMORY;
+    if (!alloc_pages_vprot( base, size ))
+    {
+        ios_af_set( 4, errno, base, size );
+        return STATUS_NO_MEMORY;
+    }
 
     /* Create the view structure */
 
     if (!(view = alloc_view()))
     {
+        ios_af_set( 5, errno, base, size );
         FIXME( "out of memory for %p-%p\n", base, (char *)base + size );
         return STATUS_NO_MEMORY;
     }
@@ -9502,6 +9854,8 @@ static void *map_reserved_area_inner( void *limit_low, void *limit_high, size_t 
             void *start = area->base;
             void *end = (char *)start + area->size;
 
+            /* ml799: the FEX arena serves only requests contained in it. */
+            if (area->fex_only && !fex_arena_covers( limit_low, limit_high )) continue;
             if (start >= limit_high) continue;
             if (end <= limit_low) return NULL;
             if (start < limit_low) start = (void *)ROUND_SIZE( 0, limit_low, host_page_mask );
@@ -9517,6 +9871,8 @@ static void *map_reserved_area_inner( void *limit_low, void *limit_high, size_t 
             void *start = area->base;
             void *end = (char *)start + area->size;
 
+            /* ml799: the FEX arena serves only requests contained in it. */
+            if (area->fex_only && !fex_arena_covers( limit_low, limit_high )) continue;
             if (start >= limit_high) return NULL;
             if (end <= limit_low) continue;
             if (start < limit_low) start = (void *)ROUND_SIZE( 0, limit_low, host_page_mask );
@@ -9595,6 +9951,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                           unsigned int alloc_type, unsigned int vprot,
                           ULONG_PTR limit_low, ULONG_PTR limit_high, size_t align_mask )
 {
+    ios_af.stage = 0;   /* ml814: this request's attribution starts clean */
     int top_down = alloc_type & MEM_TOP_DOWN;
     void *ptr;
     int unix_prot = get_unix_prot( vprot );
@@ -9746,13 +10103,14 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                  * generous cap so a retry loop cannot flood the log). */
                 if (ptr ? ios_storm_gate( &vs_storm ) : (vs_fails++ < 256))
                 dprintf( 2, "[va-scan] %s window=%p..%p size=%p align=%p %s tries=%u skips=%u"
-                            " | seen=%p..%p views=%u maxgap=%p stop=%s"
+                            " | seen=%p..%p views=%u maxgap=%p tailgap=%p stop=%s"
                             " | firstfail=%p errno=%d(%s) %s%s\n",
                          ptr ? "SLOW" : "FAILED", start, end, (void *)size,
                          (void *)(align_mask + 1), top_down ? "top-down" : "bottom-up",
                          ios_va_scan_tries - tries0, ios_va_scan_skips - skips0,
                          ios_scan_base, ios_scan_end, ios_scan_views,
-                         (void *)ios_scan_maxgap, ios_scan_stop_name( ios_scan_stop ),
+                         (void *)ios_scan_maxgap, (void *)ios_scan_tailgap,
+                         ios_scan_stop_name( ios_scan_stop ),
                          ios_scan_fail_addr, ios_scan_fail_errno,
                          ios_scan_fail_errno ? strerror( ios_scan_fail_errno ) : "-", what,
                          ptr ? "" : (ceiling_relaxable ? "  --> relaxing ceiling, retrying unclamped"
@@ -9773,7 +10131,11 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
              * the unclamped kernel pick below. Only constraints WE added are
              * dropped — a caller-supplied limit_high never sets
              * ceiling_relaxable, so its contract still holds. */
-            if (!ceiling_relaxable) return STATUS_NO_MEMORY;
+            if (!ceiling_relaxable)
+            {
+                ios_af_set( 2, ios_scan_fail_errno, ios_scan_fail_addr, size );
+                return STATUS_NO_MEMORY;
+            }
             start = address_space_start;
             end = min( user_space_limit, host_addr_space_limit );
             if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
@@ -9783,6 +10145,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         {
             if ((ptr = anon_mmap_alloc( view_size, unix_prot )) == MAP_FAILED)
             {
+                ios_af_set( 3, errno, NULL, view_size );
                 status = (errno == ENOMEM) ? STATUS_NO_MEMORY : STATUS_INVALID_PARAMETER;
                 ERR( "anon mmap error %s, size %p, unix_prot %#x\n",
                      strerror(errno), (void *)view_size, unix_prot );
@@ -10802,6 +11165,27 @@ static void ios_va_profile( const char *when )
                  when, probes[i].addr, probes[i].band,
                  kr == KERN_SUCCESS ? "MAPPABLE" : "refused", (int)kr );
         if (kr == KERN_SUCCESS) mach_vm_deallocate( mach_task_self(), a, 0x4000 );
+    }
+    /* ml898: measure the kernel's range for VM_MEMORY_LAYERKIT (51), the tag
+     * CoreAnimation allocates its render shmem with. ml896 proved those
+     * allocations interleave with Wine's guest views around 20-30 GB and hit
+     * KERN_NO_SPACE a third of the time once a game is running. Fill the range
+     * with 256 MB chunks until it refuses, record the span, give it all back.
+     * Runs before any guest view exists, so the span is the kernel's, not ours. */
+    {
+        mach_vm_address_t got[128]; unsigned n = 0; kern_return_t kr = KERN_SUCCESS;
+        mach_vm_address_t lo = ~0ULL, hi = 0;
+        while (n < 128)
+        {
+            mach_vm_address_t a = 0;
+            kr = mach_vm_allocate( mach_task_self(), &a, 256ULL << 20, VM_FLAGS_ANYWHERE | VM_MAKE_TAG(51) );
+            if (kr != KERN_SUCCESS) break;
+            got[n++] = a; if (a < lo) lo = a; if (a + (256ULL << 20) > hi) hi = a + (256ULL << 20);
+        }
+        dprintf( 2, "[layerkit-range] rev=ml898 %s: %u x 256MB tag-51 chunks before kr=%d; span 0x%llx..0x%llx (%llu MB) -- guest views must stay OUT of this\n",
+                 when, n, kr, (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)((hi - lo) >> 20) );
+        if (n && !ios_layerkit_hi) { ios_layerkit_lo = lo; ios_layerkit_hi = hi; }   /* ml900: first measurement wins */
+        while (n) { n--; mach_vm_deallocate( mach_task_self(), got[n], 256ULL << 20 ); }
     }
 }
 
@@ -11860,6 +12244,12 @@ static void *alloc_virtual_heap( SIZE_T size )
         void *base = area->base;
         void *end = (char *)base + area->size;
 
+        /* ml799: the virtual heap is Wine's own bookkeeping and is exactly the
+         * kind of unconstrained allocation the arena must never serve. It also
+         * must not widen address_space_limit to the arena's top: that number
+         * feeds placement decisions elsewhere, and stretching it to cover a
+         * range nothing generic may use would misreport the usable space. */
+        if (area->fex_only) continue;
         if (is_beyond_limit( base, area->size, address_space_limit ))
             address_space_limit = host_addr_space_limit = end;
         if (is_win64 && base < (void *)0x80000000) break;
@@ -13573,6 +13963,11 @@ static void free_reserved_memory( char *base, char *limit )
             char *area_base = area->base;
             char *area_end = area_base + area->size;
 
+            /* ml799: never free the FEX arena. It is held for the process
+             * lifetime, and the 0x80000000..address_space_limit call below
+             * spans it -- releasing it here would hand the emulator's address
+             * space back to general use mid-run, silently. */
+            if (area->fex_only) continue;
             if (area_end <= base) continue;
             if (area_base >= limit) return;
             if (area_base < base) area_base = base;
@@ -13841,9 +14236,144 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
  *             NtAllocateVirtualMemory   (NTDLL.@)
  *             ZwAllocateVirtualMemory   (NTDLL.@)
  */
+#ifdef WINE_IOS
+/* ml842 PROVENANCE PROBE.
+ *
+ * UE5 died with "FMallocBinned2 Attempt to free an unrecognized block
+ * 0000000885560000", and that address appeared NOWHERE else in the log -- so we
+ * could not say whether we ever handed it out, whether it was freed twice, or
+ * whether it was never ours. "It is absent from the mapping logs" establishes
+ * nothing on its own, which is exactly why this exists.
+ *
+ * Records every guest-band virtual allocation and release, capped, so the next
+ * run can answer where a given pointer came from instead of inviting a guess.
+ * Passive: it only prints.
+ *
+ * Set Documents/madeira-vmwatch.txt to a hex address to get a loud line when an
+ * allocation COVERS it or a free TOUCHES it, which survives the line cap. */
+static unsigned long ios_vm_alloc_logged, ios_vm_free_logged;
+static UINT64 ios_vm_watch_addr;
+static int ios_vm_watch_ready;
+
+static UINT64 ios_vm_watch(void)
+{
+    if (!ios_vm_watch_ready)
+    {
+        const char *home = getenv( "HOME" );
+        char path[1024];
+        FILE *f;
+        ios_vm_watch_ready = 1;
+        if (home)
+        {
+            snprintf( path, sizeof path, "%s/Documents/madeira-vmwatch.txt", home );
+            if ((f = fopen( path, "r" )))
+            {
+                unsigned long long v = 0;
+                if (fscanf( f, "%llx", &v ) == 1) ios_vm_watch_addr = v;
+                fclose( f );
+                if (ios_vm_watch_addr)
+                    dprintf( 2, "[vmwatch] ml842 watching 0x%llx\n",
+                             (unsigned long long)ios_vm_watch_addr );
+            }
+        }
+    }
+    return ios_vm_watch_addr;
+}
+
+/* Guest band only: FEX's own arenas and the JIT pool would bury the signal. */
+static void ios_vm_note_alloc( void *base, SIZE_T size, ULONG type, ULONG protect )
+{
+    UINT64 b = (UINT64)(ULONG_PTR)base, w = ios_vm_watch();
+    int covers = (w && b <= w && w < b + size);
+    if (b < 0x100000000ull) return;
+    if (covers || ios_vm_alloc_logged < 3000)
+    {
+        ios_vm_alloc_logged++;
+        dprintf( 2, "[valloc] ml842 %s base=0x%llx size=0x%llx type=0x%x prot=0x%x tid=%04x\n",
+                 covers ? "COVERS-WATCH" : "#", (unsigned long long)b,
+                 (unsigned long long)size, (unsigned)type, (unsigned)protect,
+                 NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0 );
+    }
+}
+
+static void ios_vm_note_free( void *base, SIZE_T size, ULONG type )
+{
+    UINT64 b = (UINT64)(ULONG_PTR)base, w = ios_vm_watch();
+    int hits = (w && b <= w && (size == 0 || w < b + size));
+    if (b < 0x100000000ull) return;
+    if (hits || ios_vm_free_logged < 3000)
+    {
+        ios_vm_free_logged++;
+        dprintf( 2, "[vfree] ml842 %s base=0x%llx size=0x%llx type=0x%x tid=%04x\n",
+                 hits ? "HITS-WATCH" : "#", (unsigned long long)b,
+                 (unsigned long long)size, (unsigned)type,
+                 NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0 );
+    }
+}
+#endif
+
+#ifdef WINE_IOS
+/* ml844 [tls38]: WHEN does the exe's thread-local at static TLS block 0 +0x38
+ * change from 0 to the FEX emulator stack top?
+ *
+ * Offline analysis of the UE5 shipping exe found that this 16-byte thread-local
+ * is zeroed by a dynamic TLS initialiser at thread attach, freed by its
+ * destructor at detach (FMemory::Free of the first word), and has NO other
+ * address-taker anywhere in the image. So the value arrives by a path no static
+ * scan can see. This polls the slot at two points every engine thread hits
+ * constantly -- server waits and virtual allocations -- and logs the first
+ * poll per thread and the first 0 -> non-zero transition, with the guest RIP
+ * taken from the CPU area's saved x64 context (Rip is at +0xF8 of an AMD64
+ * CONTEXT; ARM64EC_NT_CONTEXT is layout-compatible by design). That brackets
+ * the writer to one syscall interval on a known guest thread. Passive. */
+void ios_tls38_poll( const char *where )
+{
+    static struct { DWORD tid; int state; } seen[48];
+    static unsigned nseen, lines;
+    TEB *teb = NtCurrentTeb();
+    void **blocks; ULONG64 v, top = 0, rip = 0, rsp = 0; DWORD tid; unsigned i, slot = ~0u;
+    CHPE_V2_CPU_AREA_INFO *area;
+
+    if (!teb || lines > 60) return;
+    blocks = teb->ThreadLocalStoragePointer;
+    if (!blocks || !blocks[0]) return;
+    v = ((ULONG64 *)blocks[0])[7];
+    tid = (DWORD)(ULONG_PTR)teb->ClientId.UniqueThread;
+    for (i = 0; i < nseen; i++) if (seen[i].tid == tid) { slot = i; break; }
+    if (slot == ~0u) { if (nseen >= 48) return; slot = nseen++; seen[slot].tid = tid; seen[slot].state = 0; }
+    if (seen[slot].state == 0)
+    {
+        seen[slot].state = 1; lines++;
+        dprintf( 2, "[tls38] ml844 tid=%04x first poll at %s: tls0+0x38=0x%llx (block=%p)\n",
+                 (unsigned)tid, where, (unsigned long long)v, blocks[0] );
+    }
+    if (v && seen[slot].state == 1)
+    {
+        seen[slot].state = 2; lines++;
+        area = teb->ChpeV2CpuAreaInfo;
+        if (area)
+        {
+            top = area->EmulatorStackBase;
+            if (area->ContextAmd64)
+            {
+                rip = *(ULONG64 *)((char *)area->ContextAmd64 + 0xF8);
+                rsp = *(ULONG64 *)((char *)area->ContextAmd64 + 0x98);
+            }
+        }
+        dprintf( 2, "[tls38] ml844 tid=%04x SET at %s: tls0+0x38=0x%llx %s top=0x%llx | guest Rip=0x%llx Rsp=0x%llx\n",
+                 (unsigned)tid, where, (unsigned long long)v,
+                 v == top ? "== EMULATOR STACK TOP" : "(not the stack top)",
+                 (unsigned long long)top, (unsigned long long)rip, (unsigned long long)rsp );
+    }
+}
+#endif
+
 NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR zero_bits,
                                          SIZE_T *size_ptr, ULONG type, ULONG protect )
 {
+#ifdef WINE_IOS
+    ios_tls38_poll( "valloc" );
+#endif
     static const ULONG type_mask = MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN | MEM_WRITE_WATCH | MEM_RESET;
     ULONG_PTR limit;
 #ifdef WINE_IOS
@@ -14733,6 +15263,31 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                          hit == (unsigned)-1 ? 0 : ios_steer[hit].freed, ios_steer_n );
             }
         }
+        /* ml813: name every FAILED guest allocation.
+         *
+         * A game died on "Ran out of memory allocating 32768 bytes with
+         * alignment 0" at a 2GB footprint, and nothing in the log said which
+         * request failed or why -- the reason had already been flattened to
+         * ENOMEM several layers down. This prints the request as the caller made
+         * it (jumbo_hint/jumbo_size are captured before *ret and *size_ptr are
+         * overwritten), the status, and the last raw Mach result.
+         *
+         * Uncapped for the first 64 failures, then every 64th: a single failure
+         * is the interesting one, and a storm should not hide it. */
+        if (st != STATUS_SUCCESS)
+        {
+            static unsigned long af_n;
+            unsigned long n = ++af_n;
+            if (n <= 64 || (n % 64) == 0)
+                dprintf( 2, "[alloc-fail] ml814 #%lu status=%08x hint=%p size=0x%llx type=0x%x "
+                            "protect=0x%x tid=%04x | STAGE=%s err=%d at 0x%llx+0x%llx\n",
+                         n, (unsigned)st, jumbo_hint, (unsigned long long)jumbo_size,
+                         (unsigned)type, (unsigned)protect,
+                         NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0,
+                         ios_af.stage <= 6 ? ios_af_stage_name[ios_af.stage] : "?",
+                         ios_af.err, ios_af.addr, ios_af.size );
+        }
+        if (!st && ret) ios_vm_note_alloc( *ret, size_ptr ? *size_ptr : 0, type, protect );
         return st;
     }
 #else
@@ -14881,6 +15436,7 @@ void ios_reserve_fex_arena(void)
         { 0x0200000000ull, 0x0fbfffffffull, 0x080000000ull, "2GB anywhere low"         },
     };
     unsigned i;
+    unsigned long long arena_task_max = 0;
 
     if (done) return;
     done = 1;
@@ -14917,49 +15473,226 @@ void ios_reserve_fex_arena(void)
          * independently, a FAILED reservation is the safe outcome. The opt-in
          * returns only once it consumes WINE_IOS_FEX_ARENA_BASE/SIZE. */
         const char *opt = getenv( "MADEIRA_FEX_ARENA" );
-        if (1 || !opt || opt[0] != '1')
+
+        /* ml792 MILESTONE 1: "probe" proves the FULL reservation.
+         *
+         * Every earlier probe asked for 16KB or 256MB and then declared a
+         * multi-GB window owned. That is not the same question: a window can
+         * accept a small mapping and still have no contiguous 8GB hole. This
+         * mode asks for the whole thing, holds it for the process lifetime,
+         * and reports exactly what the kernel gave back.
+         *
+         * It is deliberately NOT the working feature. The emulator still runs
+         * its own selector, so holding a band it does not consume makes x64
+         * WORSE, not better -- that is the state that wedged the loader. This
+         * mode exists to answer one question before anything is built on the
+         * answer: can the range be reserved at all, and where? */
+        if (opt && !strcmp( opt, "probe" ))
         {
-            dprintf( 2, "[fex-arena] ml757 disabled (MADEIRA_FEX_ARENA != 1) -- FEX selects its "
-                        "own band, as before. Enable only once FEX consumes the published range.\n" );
+            MEM_ADDRESS_REQUIREMENTS req;
+            MEM_EXTENDED_PARAMETER param;
+            void *base = NULL;
+            SIZE_T size = 0x200000000ull;          /* 8GB, the whole thing */
+            NTSTATUS status;
+
+            memset( &req, 0, sizeof(req) );
+            memset( &param, 0, sizeof(param) );
+            req.LowestStartingAddress = (void *)0x0200000000ull;
+            req.HighestEndingAddress  = (void *)0x0fbfffffffull;
+            req.Alignment             = 0x10000;
+            param.Type    = MemExtendedParameterAddressRequirements;
+            param.Pointer = &req;
+
+            status = NtAllocateVirtualMemoryEx( NtCurrentProcess(), &base, &size,
+                                                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                                                PAGE_NOACCESS, &param, 1 );
+            if (status)
+                dprintf( 2, "[fex-arena] ml792 PROBE: full 8GB reservation FAILED status=%08x "
+                            "in [0x200000000,0xfbfffffff] -- a contiguous 8GB hole does not exist "
+                            "here at this point in startup\n", (unsigned)status );
+            else
+                dprintf( 2, "[fex-arena] ml792 PROBE: full 8GB RESERVED base=%p size=0x%llx and HELD "
+                            "for the process lifetime. The emulator still selects its own band, so "
+                            "x64 guests are EXPECTED TO FAIL this run -- this proves the range can "
+                            "be taken, nothing more.\n", base, (unsigned long long)size );
+            return;
+        }
+
+        /* ml799: ON by default, MADEIRA_FEX_ARENA=0 to disable.
+         *
+         * ml757 forced this off because the emulator ran its own selector
+         * alongside the reservation, so holding a range only pushed FEX into
+         * whatever was left. Both halves of that are now gone: ml797 hands the
+         * range to FEX as plain data so it consumes rather than selects, and
+         * the range is registered FEX_ONLY below so ordinary MEM_RESERVE
+         * requests inside it are SERVED from it rather than refused over it.
+         * An off switch stays, because this changes where every FEX allocation
+         * lives and a one-variable A/B must remain possible. */
+        if (opt && opt[0] == '0')
+        {
+            dprintf( 2, "[fex-arena] ml799 disabled by MADEIRA_FEX_ARENA=0 -- FEX selects its "
+                        "own band, as before.\n" );
             return;
         }
     }
 
+    /* ml801: the real ceiling, for judging placements the kernel chose for us. */
+    {
+        task_vm_info_data_t vmi;
+        mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+        if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt ) == KERN_SUCCESS)
+            arena_task_max = (unsigned long long)vmi.max_address;
+    }
+
     for (i = 0; i < ARRAY_SIZE(plan); i++)
     {
-        MEM_ADDRESS_REQUIREMENTS req;
-        MEM_EXTENDED_PARAMETER param;
-        NTSTATUS status;
-        void *base = NULL;
+        /* ml799: hold the range NATIVELY as PROT_NONE, with no Windows view.
+         *
+         * A MEM_RESERVE_PLACEHOLDER view was the wrong instrument: it puts an
+         * entry in Wine's view tree, and every later ordinary MEM_RESERVE from
+         * rpmalloc/FEXCore/CallRetStack would then have to reserve OVER it and
+         * fail. A native PROT_NONE mapping registered as a reserved area is the
+         * shape Wine already knows how to allocate out of -- views are carved
+         * from it normally, and unmap_area() restores PROT_NONE on free.
+         *
+         * VM_FLAGS_ANYWHERE with the window's base as the hint searches upward,
+         * so the result must be CHECKED against the window rather than assumed:
+         * a mapping that landed outside is worse than none, because the whole
+         * point is that FEX and Wine agree on where the arena is. */
+        mach_vm_address_t addr = (mach_vm_address_t)plan[i].lo;
         SIZE_T size = plan[i].size;
+        void *base;
+        kern_return_t kr;
 
-        memset( &req, 0, sizeof(req) );
-        memset( &param, 0, sizeof(param) );
-        req.LowestStartingAddress = (void *)plan[i].lo;
-        req.HighestEndingAddress  = (void *)plan[i].hi;
-        req.Alignment             = 0x10000;
-        param.Type    = MemExtendedParameterAddressRequirements;
-        param.Pointer = &req;
-
-        status = NtAllocateVirtualMemoryEx( NtCurrentProcess(), &base, &size,
-                                            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-                                            PAGE_NOACCESS, &param, 1 );
-        if (status)
+        /* ml802: 64KiB alignment mask. Wine's allocation granularity is 64KiB and
+         * FEX asks with Alignment=0x10000; a base that is merely page-aligned
+         * would make the first granule unusable and silently shrink the arena. */
+        kr = mach_vm_map( mach_task_self(), &addr, (mach_vm_size_t)size, 0xffff, VM_FLAGS_ANYWHERE,
+                          MEMORY_OBJECT_NULL, 0, 0, PROT_NONE, VM_PROT_ALL, VM_INHERIT_COPY );
+        if (kr != KERN_SUCCESS)
         {
-            dprintf( 2, "[fex-arena] ml756 %s: reserve FAILED status=%08x\n",
-                     plan[i].what, (unsigned)status );
+            dprintf( 2, "[fex-arena] ml799 %s: native reserve FAILED kr=%d\n",
+                     plan[i].what, (int)kr );
+            continue;
+        }
+        if (ios_layerkit_hi && addr + size > ios_layerkit_lo && addr < ios_layerkit_hi)
+        {
+            /* ml900/ml901: the kernel put the arena inside CoreAnimation's tag-51
+             * range (ants39: 8 of its 9.7 GB). Give it back and walk FIXED
+             * candidates above the span (up to the task ceiling), then below it
+             * (down to 8 GB), 1 GB apart. ml900 tried exactly one address each
+             * way, both came back KERN_INVALID_ADDRESS, and the boot died with
+             * no arena at all -- so if every candidate fails, take the ANYWHERE
+             * placement back: a starved CoreAnimation is survivable, no arena is not. */
+            mach_vm_address_t orig = addr, cand; unsigned tries = 0; kern_return_t k2 = KERN_FAILURE;
+            mach_vm_deallocate( mach_task_self(), addr, (mach_vm_size_t)size );
+            for (cand = (ios_layerkit_hi + 0xffff) & ~0xffffULL;
+                 arena_task_max && cand + size <= arena_task_max && k2 != KERN_SUCCESS && tries < 64;
+                 cand += 1ULL << 30, tries++)
+            {
+                addr = cand;
+                k2 = mach_vm_map( mach_task_self(), &addr, (mach_vm_size_t)size, 0xffff, VM_FLAGS_FIXED,
+                                  MEMORY_OBJECT_NULL, 0, 0, PROT_NONE, VM_PROT_ALL, VM_INHERIT_COPY );
+            }
+            for (cand = (ios_layerkit_lo - size) & ~0xffffULL;
+                 ios_layerkit_lo >= size && cand >= 0x200000000ULL && k2 != KERN_SUCCESS && tries < 128;
+                 cand -= 1ULL << 30, tries++)
+            {
+                addr = cand;
+                k2 = mach_vm_map( mach_task_self(), &addr, (mach_vm_size_t)size, 0xffff, VM_FLAGS_FIXED,
+                                  MEMORY_OBJECT_NULL, 0, 0, PROT_NONE, VM_PROT_ALL, VM_INHERIT_COPY );
+                if (cand < (1ULL << 30)) break;
+            }
+            if (k2 != KERN_SUCCESS)
+            {
+                addr = orig;
+                k2 = mach_vm_map( mach_task_self(), &addr, (mach_vm_size_t)size, 0xffff, VM_FLAGS_ANYWHERE,
+                                  MEMORY_OBJECT_NULL, 0, 0, PROT_NONE, VM_PROT_ALL, VM_INHERIT_COPY );
+                dprintf( 2, "[fex-arena] ml901 %s: no FIXED home outside CoreAnimation's range 0x%llx..0x%llx after %u tries; "
+                            "keeping the ANYWHERE placement at 0x%llx (kr=%d) -- CoreAnimation may starve later\n",
+                         plan[i].what, ios_layerkit_lo, ios_layerkit_hi, tries, (unsigned long long)addr, (int)k2 );
+                if (k2 != KERN_SUCCESS) continue;
+            }
+            else
+                dprintf( 2, "[fex-arena] ml901 %s: moved out of CoreAnimation's range 0x%llx..0x%llx to 0x%llx after %u tries\n",
+                         plan[i].what, ios_layerkit_lo, ios_layerkit_hi, (unsigned long long)addr, tries );
+        }
+        if (addr < plan[i].lo || addr + size > plan[i].hi)
+        {
+            /* ml801: an out-of-window placement is NOT automatically wrong.
+             *
+             * VM_FLAGS_ANYWHERE treats the window base as a floor and searches
+             * upward; it has no notion of the upper bound. ml799 discarded any
+             * range that overran the window, and threw away two perfectly good
+             * 8GB reservations in a row because the kernel started them 25GB in
+             * -- inside the window, but ending past its top. That run fell
+             * through to a 4GB candidate and Stray exhausted it at 57 threads.
+             *
+             * The windows are HINTS for steering placement. What must actually
+             * be true is that the range is entirely mappable and that FEX is
+             * told where it is -- which the ml800 hand-off does regardless of
+             * which window it came from. So keep it when it fits under the task
+             * ceiling, and say plainly that it was not where we asked. */
+            if (arena_task_max && (unsigned long long)addr + size <= arena_task_max)
+            {
+                dprintf( 2, "[fex-arena] ml801 %s: kernel placed the range at 0x%llx, outside the "
+                            "requested window [0x%llx,0x%llx] but entirely below the task ceiling "
+                            "0x%llx -- KEEPING it; the window is a hint and the emulator is told "
+                            "the real address\n", plan[i].what, (unsigned long long)addr,
+                         (unsigned long long)plan[i].lo, (unsigned long long)plan[i].hi,
+                         arena_task_max );
+            }
+            else
+            {
+                dprintf( 2, "[fex-arena] ml801 %s: kernel placed the range at 0x%llx+0x%llx, which "
+                            "runs past the task ceiling 0x%llx -- releasing it; that range can "
+                            "never be mapped\n", plan[i].what, (unsigned long long)addr,
+                         (unsigned long long)size, arena_task_max );
+                mach_vm_deallocate( mach_task_self(), addr, (mach_vm_size_t)size );
+                continue;
+            }
+        }
+        base = (void *)(ULONG_PTR)addr;
+        if (!mmap_add_fex_reserved_area( base, size ))
+        {
+            /* ml802: registration failed, so nothing would serve allocations
+             * from this range -- but the mapping is still ours. Leaving it held
+             * while publishing nothing is the worst of both worlds: FEX runs its
+             * own selector and has LESS space than with no reservation at all,
+             * which is exactly the ml757 failure. Give the range back. */
+            ERR( "[fex-arena] ml802 registration FAILED for %p+%llx -- releasing the reservation "
+                 "so the emulator's own selector is not left competing with a range Wine still "
+                 "holds\n", base, (unsigned long long)size );
+            mach_vm_deallocate( mach_task_self(), addr, (mach_vm_size_t)size );
             continue;
         }
 
         {
+            /* ml793 step 2: publish an EXACT half-open range [base, base+size).
+             *
+             * The version is part of the contract, not decoration: the consumer
+             * must be able to tell "no arena published" from "an arena
+             * published by a build that meant something different". A silent
+             * mismatch is how the two sides ended up believing different ranges
+             * belonged to them. */
             char b[64];
             snprintf( b, sizeof(b), "%llx", (unsigned long long)(ULONG_PTR)base );
             setenv( "WINE_IOS_FEX_ARENA_BASE", b, 1 );
             snprintf( b, sizeof(b), "%llx", (unsigned long long)size );
             setenv( "WINE_IOS_FEX_ARENA_SIZE", b, 1 );
+            snprintf( b, sizeof(b), "%llx", (unsigned long long)((ULONG_PTR)base + size) );
+            setenv( "WINE_IOS_FEX_ARENA_END", b, 1 );   /* exclusive */
+            setenv( "WINE_IOS_FEX_ARENA_VERSION", "1", 1 );
+            ios_fex_arena_base_unix = (ULONG_PTR)base;
+            ios_fex_arena_end_unix  = (ULONG_PTR)base + size;
+            dprintf( 2, "[fex-arena] ml793 PUBLISHED [%p,0x%llx) size=0x%llx version=1 -- the "
+                        "emulator must CONSUME this range; it must not run its own selector\n",
+                     base, (unsigned long long)((ULONG_PTR)base + size),
+                     (unsigned long long)size );
         }
-        dprintf( 2, "[fex-arena] ml756 RESERVED %s base=%p size=0x%llx -- placeholder held for "
-                    "process lifetime; guest images are excluded from it\n",
+        dprintf( 2, "[fex-arena] ml799 RESERVED %s base=%p size=0x%llx -- held natively as "
+                    "PROT_NONE for the process lifetime and registered FEX_ONLY; generic "
+                    "placement cannot allocate here\n",
                  plan[i].what, base, (unsigned long long)size );
         if (size < 0x200000000ull)
             dprintf( 2, "[fex-arena] ml774 WARNING: only 0x%llx bytes. Sufficient for small "
@@ -15559,6 +16292,10 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
 
     TRACE("%p %p %08lx %x\n", process, addr, size, type );
 
+#ifdef WINE_IOS
+    ios_vm_note_free( addr, size, type );
+#endif
+
     /* ml171 LEAK PROBE: the 512MB reserves grow without bound (27 -> 55 across runs,
      * 28GB) and only ~1%% is ever committed. If the owner never RELEASES them the fix is
      * reclamation, not more address space; if it does release and our accounting still
@@ -15726,6 +16463,16 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
     DWORD old;
 
 #ifdef WINE_IOS
+    /* ml846: a marked request from the PE-side dispatcher arms the [tlswatch]
+     * write watch on the thread's TLS block instead of changing protection. */
+    if (size == 0x0BAD0038 && new_prot == PAGE_READONLY)
+    {
+        extern void ios_tlswatch_arm_block( void *block, const char *why );
+        ios_tlswatch_arm_block( addr, "pe-unwind" );
+        if (old_prot) *old_prot = PAGE_READWRITE;
+        *size_ptr = 0;
+        return STATUS_SUCCESS;
+    }
     LPVOID ios_jit_orig_addr = NULL;  /* JIT pool RX addr if caller passed one */
     {
         LPVOID orig_addr = addr;

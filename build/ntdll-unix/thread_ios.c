@@ -1860,7 +1860,17 @@ NTSTATUS send_debug_event( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL first_c
  */
 NTSTATUS WINAPI NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL first_chance )
 {
-    NTSTATUS status = send_debug_event( rec, context, first_chance, !(is_win64 || is_wow64() || is_old_wow64()) );
+    NTSTATUS status;
+#ifdef WINE_IOS
+    /* ml845: the engine's thread-naming exception is where a bogus "stack base"
+     * reaches its per-thread state. Watch the slot across this dispatch. */
+    if (rec && rec->ExceptionCode == 0x406D1388)
+    {
+        extern void ios_tlswatch_arm( const char * );
+        ios_tlswatch_arm( "raise 0x406D1388" );
+    }
+#endif
+    status = send_debug_event( rec, context, first_chance, !(is_win64 || is_wow64() || is_old_wow64()) );
 
     if (status == DBG_CONTINUE || status == DBG_EXCEPTION_HANDLED)
         return NtContinue( context, FALSE );
@@ -2045,6 +2055,24 @@ NTSTATUS WINAPI NtTerminateThread( HANDLE handle, LONG exit_code )
 {
     unsigned int ret;
     BOOL self;
+
+    /* iOS-Madeira ml805: name every thread death and WHO caused it.
+     *
+     * A render thread exited while owning a critical section and eight threads
+     * deadlocked behind it forever. The wineserver only reports `violent=0`,
+     * which proves an orderly pipe closure and NOTHING about the cause: a
+     * thread returning from its procedure, calling ExitThread, and being
+     * terminated by a peer all produce it. Separating those is the whole point
+     * -- "the wait timed out and it shut itself down" and "something else killed
+     * it" call for opposite fixes. */
+    {
+        static unsigned long ios_term_n;
+        if (++ios_term_n <= 128)
+            ERR( "[thr-exit] ml805 target=%p self=%d exit_code=%d by_tid=%04x caller=%p\n",
+                 handle, ios_terminate_is_self( handle ) ? 1 : 0, (int)exit_code,
+                 (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
+                 __builtin_return_address(0) );
+    }
 
     /* iOS-Madeira ml559 (#74 successor, DISCRIMINATOR — not a fix):
      *
@@ -2346,6 +2374,32 @@ BOOL get_thread_times(int unix_pid, int unix_tid, LARGE_INTEGER *kernel_time, LA
 
 static void set_native_thread_name( HANDLE handle, const UNICODE_STRING *name )
 {
+    /* iOS-Madeira ml810: publish the thread name <-> TID <-> TEB mapping.
+     *
+     * Everything below is #ifdef linux, so on iOS this function did nothing and
+     * the log carried thread NAMES (from [thread-stacks], keyed by mach port)
+     * and Windows TIDs (from every other probe) with no way to join them. That
+     * gap produced a wrong attribution: a deadlocked "00dc" was reported as
+     * RenderThread 0 when it was actually PoolThread 1, and a whole causal
+     * chain was built on it. One line here makes that mistake impossible.
+     *
+     * Self-naming is the common case (a thread names itself on entry), and it
+     * is the only one that can be resolved without a server round trip -- so
+     * say plainly which case this is rather than printing a bare handle. */
+    {
+        char nm[64];
+        int nlen = ntdll_wcstoumbs( name->Buffer, name->Length / sizeof(WCHAR),
+                                    nm, sizeof(nm) - 1, FALSE );
+        if (nlen < 0) nlen = 0;
+        nm[nlen] = 0;
+        if (ios_terminate_is_self( handle ))
+            ERR( "[thr-name] ml810 tid=%04x teb=%p name=\"%s\"\n",
+                 (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
+                 NtCurrentTeb(), nm );
+        else
+            ERR( "[thr-name] ml810 handle=%p (named by tid=%04x, NOT self) name=\"%s\"\n",
+                 handle, (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, nm );
+    }
 #ifdef linux
     unsigned int status;
     char path[64], nameA[64];

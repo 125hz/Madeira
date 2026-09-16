@@ -69,6 +69,11 @@ PATCHED_FILES=(
     # REPLACEMENTS inserts it into the prebuilt base archive. An entry in
     # only the first compiles, prints OK, and is silently discarded.
     "object:$WINE_SRC/server/object.c:object.o"
+    # ml805: event/handle carry the [evt-hist] instrumentation. Both MUST be
+    # listed here -- they are otherwise linked from a prebuilt object and the
+    # source edits would be dead code, the same trap as the unix/*.c forks.
+    "event:$WINE_SRC/server/event.c:event.o"
+    "handle:$WINE_SRC/server/handle.c:handle.o"
     # ml575: async.c carries the free_async_queue UAF fix.
     "async:$WINE_SRC/server/async.c:async.o"
     "process_ios:$WINE_SRC/server/process.c:process.o"
@@ -159,6 +164,12 @@ REPLACEMENTS=(
     "sock.o:sock.o"
     "object.o:object.o"
     "async.o:async.o"
+    # ml805: BOTH lists matter. PATCHED_FILES only compiles; REPLACEMENTS is what
+    # actually swaps the object into the archive. Adding to one and not the other
+    # compiles cleanly, ships the OLD object, and fails at link with an undefined
+    # symbol -- which is exactly what happened first try.
+    "event.o:event.o"
+    "handle.o:handle.o"
 )
 
 for entry in "${REPLACEMENTS[@]}"; do

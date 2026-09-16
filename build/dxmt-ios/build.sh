@@ -51,6 +51,36 @@ compile_cxx() {
     fi
 }
 
+# ---- madeira-d3d12 M1 canary (optional) -------------------------------------
+# Compiled into this library so the app can run the shader-converter gate
+# in-process. Guarded: the converter package is a locally supplied dependency
+# and the DXMT build must not start failing when it is absent.
+compile_objcxx_arc() {
+    local src=$1 name=$2 extra="${3:-}"
+    printf "  %-40s " "$name"
+    if xcrun -sdk iphoneos clang++ $COMMON_FLAGS -std=c++20 -fobjc-arc -x objective-c++ $extra \
+        -c "$src" -o "$OBJ_DIR/$name.o" 2>"$OBJ_DIR/$name.err"; then
+        echo "OK"; SUCCEEDED=$((SUCCEEDED+1))
+    else
+        echo "FAILED"; FAILED=$((FAILED+1)); FAILED_FILES="$FAILED_FILES $name"
+    fi
+}
+if [[ -f "$BUILD_DIR/../madeira-d3d12/deps.sh" ]] && \
+   source "$BUILD_DIR/../madeira-d3d12/deps.sh" 2>/dev/null; then
+    echo "=== madeira-d3d12 canary (Objective-C++, Metal Shader Converter) ==="
+    compile_objcxx_arc "$REPO_ROOT/research/madeira-d3d12/tests/native/msc_canary.mm" \
+                       msc_canary "-DIR_PRIVATE_IMPLEMENTATION -I$MSC_INCLUDE"
+    # The runtime conversion service reached from the D3D12 runtime through
+    # winemetal's unix call. Deliberately NOT defining IR_PRIVATE_IMPLEMENTATION
+    # here: the converter's runtime header emits its bind points and helper
+    # bodies only where that macro is set, and defining it in a second
+    # translation unit gives duplicate symbols. The canary owns the one copy.
+    compile_objcxx_arc "$REPO_ROOT/research/madeira-d3d12/src/unix/madeira_ir_unix.mm" \
+                       madeira_ir_unix "-I$MSC_INCLUDE -I$REPO_ROOT/research/madeira-d3d12/src"
+else
+    echo "=== madeira-d3d12 canary SKIPPED (converter package not resolvable) ==="
+fi
+
 echo "=== winemetal unix (Objective-C) ==="
 compile_objc "$DXMT_SRC/winemetal/unix/winemetal_unix.c" winemetal_unix
 compile_objc "$DXMT_SRC/winemetal/unix/cache.c"          cache
@@ -93,3 +123,19 @@ echo ""
 echo "=== Archiving libdxmt_unix.a ==="
 xcrun -sdk iphoneos ar rcs "$OUT_LIB" "$OBJ_DIR"/*.o
 echo "Built: $OUT_LIB ($(wc -c < "$OUT_LIB" | tr -d ' ') bytes)"
+
+# The app links libdxmt_combined.a (this unix side merged with the LLVM archives
+# airconv needs), NOT libdxmt_unix.a. Refreshing only the latter is how a change
+# here reaches nothing: the app would keep linking the previous objects and the
+# build would look clean. Replace our members in place and re-index.
+COMBINED="$BUILD_DIR/libdxmt_combined.a"
+if [ -f "$COMBINED" ]; then
+    echo "=== Refreshing libdxmt_combined.a ==="
+    xcrun -sdk iphoneos ar r "$COMBINED" "$OBJ_DIR"/*.o
+    xcrun -sdk iphoneos ranlib "$COMBINED"
+    echo "Refreshed: $COMBINED ($(wc -c < "$COMBINED" | tr -d ' ') bytes)"
+    APP_COPY="$REPO_ROOT/app/Madeira/libdxmt_combined.a"
+    if [ -f "$APP_COPY" ]; then cp "$COMBINED" "$APP_COPY"; echo "Staged: $APP_COPY"; fi
+else
+    echo "NOTE: $COMBINED absent; the app links that file, so build it before deploying."
+fi

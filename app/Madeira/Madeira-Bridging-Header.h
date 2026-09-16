@@ -25,3 +25,15 @@ int madeira_get_vsync_locked(void);
 
 /* ml526: startup phase timeline (Winios.m) */
 void winios_phase(const char *name);
+
+/* madeira-d3d12: M1 shader-converter canary, compiled into libdxmt.
+ * Returns the number of failed checks; 0 means the gate passed. Output goes to
+ * stderr, which is already captured into madeira-log.txt. */
+int madeira_d3d12_canary_run(const char *fixture_dir, const char *dylib_path,
+                             void (*sink)(const char *));
+/* Same run, but also writes the full per-check transcript to log_path, which is
+ * how the in-app detail is captured: stderr is not redirected into
+ * madeira-log.txt until later in startup. */
+int madeira_d3d12_canary_run_log(const char *fixture_dir, const char *dylib_path,
+                                 void (*sink)(const char *), const char *log_path,
+                                 const char *build_id);

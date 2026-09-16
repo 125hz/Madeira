@@ -516,6 +516,29 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
             dprintf( 2, "[win-pos] #%u hwnd=%p after=%p flags=%08x vis={%d,%d,%d,%d} "
                      "surface=%p rev=ml505\n", n, hwnd, insert_after, (unsigned)swp_flags,
                      (int)v->left, (int)v->top, (int)v->right, (int)v->bottom, surface );
+            /* ml853: name the window. A dialog nobody can see (nothing is
+             * presenting) is otherwise just a rectangle; the class and the
+             * text of every window, children included, make it readable
+             * from the log. Static controls carry a message box's body. */
+            {
+                WCHAR clsW[64], txtW[200];
+                char cls[64], txt[200];
+                UNICODE_STRING us = { 0, sizeof(clsW), clsW };
+                int j, tn;
+                cls[0] = 0;
+                if (NtUserGetClassName( hwnd, FALSE, &us ) > 0)
+                {
+                    for (j = 0; j < us.Length / (int)sizeof(WCHAR) && j < 63; j++)
+                        cls[j] = (clsW[j] >= 32 && clsW[j] < 127) ? (char)clsW[j] : '?';
+                    cls[j] = 0;
+                }
+                tn = NtUserInternalGetWindowText( hwnd, txtW, ARRAY_SIZE(txtW) );
+                for (j = 0; j < tn && j < 199; j++)
+                    txt[j] = (txtW[j] >= 32 && txtW[j] < 127) ? (char)txtW[j] : '?';
+                txt[j] = 0;
+                if (cls[0] || txt[0])
+                    dprintf( 2, "[win-name] #%u hwnd=%p class='%s' text=\"%s\" rev=ml853\n", n, hwnd, cls, txt );
+            }
         }
     }
 
