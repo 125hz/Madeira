@@ -2968,6 +2968,14 @@ final class InputSettings: ObservableObject {
     /// synthesised, set `"ignoreTouchesWithMouse": false` in
     /// Documents/madeira-input.json and the old behaviour comes back exactly.
     @Published var ignoreTouchesWithMouse = true { didSet { save() } }
+    /// ml672 — OFF by default. A physical pad's right stick can feed
+    /// `AimStickDriver` (see HardwareInput's `applyPadBindings`) so games
+    /// with no native controller support still get camera control from a
+    /// controller. But a game that reads the pad itself through XInput or
+    /// the DirectInput joystick already gets that stick natively; feeding
+    /// it into the mouse ON TOP of that steers the camera twice and drags
+    /// the game's own cursor around. Off until the user asks for it.
+    @Published var padRightStickMouse = false { didSet { save() } }
     /// ml649: heavy diagnostics. Default OFF so the shipped default is the fast
     /// path; flip it on only when a run needs to be explainable.
     @Published var diagnostics = false { didSet { madeira_set_diag_enabled(diagnostics ? 1 : 0); save() } }
@@ -3006,6 +3014,7 @@ final class InputSettings: ObservableObject {
             sensRel  = j["sensRel"]  as? Double ?? 2.0
             sensMouse = j["sensMouse"] as? Double ?? 1.0
             ignoreTouchesWithMouse = j["ignoreTouchesWithMouse"] as? Bool ?? true
+            padRightStickMouse = j["padRightStickMouse"] as? Bool ?? false
             diagnostics = j["diagnostics"] as? Bool ?? false
             displayMode = (j["displayMode"] as? String).flatMap(DisplayMode.init(rawValue:)) ?? .aspect
             hudPosLandscapeLeft  = Self.point(from: j["hudPosLandscapeLeft"])
@@ -3026,6 +3035,7 @@ final class InputSettings: ObservableObject {
         var j: [String: Any] = ["relative": relative, "sensAbs": sensAbs, "sensRel": sensRel,
                                 "sensMouse": sensMouse, "diagnostics": diagnostics,
                                 "ignoreTouchesWithMouse": ignoreTouchesWithMouse,
+                                "padRightStickMouse": padRightStickMouse,
                                 "displayMode": displayMode.rawValue]
         if let p = hudPosLandscapeLeft  { j["hudPosLandscapeLeft"]  = ["nx": Double(p.x), "ny": Double(p.y)] }
         if let p = hudPosLandscapeRight { j["hudPosLandscapeRight"] = ["nx": Double(p.x), "ny": Double(p.y)] }
@@ -5858,6 +5868,9 @@ struct MappingPanel: View {
     let control: TouchControl
     let screen: CGSize
     @ObservedObject private var m = TouchControlsModel.shared
+    /// ml672: the "Right stick also moves the mouse" toggle below lives on
+    /// this object.
+    @ObservedObject private var input = InputSettings.shared
     @State private var tab = 0                    // 0 keyboard, 1 controller
 
 
@@ -6054,6 +6067,31 @@ struct MappingPanel: View {
                  + "or arrows control, R-stick drives mouse-look. With nothing "
                  + "bound at all, A/B/X/Y and the bumpers fall to the first "
                  + "buttons in the layout and L-stick to its first stick.")
+                .font(.system(size: 10))
+                .foregroundStyle(.white.opacity(0.38))
+                .fixedSize(horizontal: false, vertical: true)
+
+            Rectangle().fill(.white.opacity(0.15)).frame(height: 1).padding(.vertical, 2)
+
+            // ml672 — OFF by default. A game that reads the controller
+            // itself (XInput or the DirectInput joystick) already gets the
+            // right stick natively; also feeding it to the mouse steers the
+            // camera twice and drags the game's own cursor. Turn this on
+            // only for a game with no native controller support that is
+            // being played with a mouse-look control on screen, or in
+            // relative-mouse mode.
+            Toggle(isOn: $input.padRightStickMouse) {
+                Text("Right stick also moves the mouse")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.white.opacity(0.85))
+            }
+            .toggleStyle(.switch)
+            .tint(.accentColor)
+            Text("Off by default: a game that reads the controller itself "
+                 + "already gets the right stick, and feeding it to the "
+                 + "mouse too fights the camera against itself. An "
+                 + "on-screen mouse-look control still works by touch "
+                 + "either way.")
                 .font(.system(size: 10))
                 .foregroundStyle(.white.opacity(0.38))
                 .fixedSize(horizontal: false, vertical: true)

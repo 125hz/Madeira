@@ -1024,6 +1024,21 @@ final class HardwareInput: ObservableObject {
     private var padLastPublished = [PadSnapshot](repeating: PadSnapshot(), count: 4)
     private var padLastApplied = PadSnapshot()
     private var padLastStickHop: CFTimeInterval = 0
+    /// ml6xx — see the banner on `padDriveBindings`: the right stick's feed
+    /// into `AimStickDriver` cannot rely on "the quantised sample changed"
+    /// alone, or a return-to-centre that happens to land on a repeated
+    /// Int16 latches the last real deflection forever. This is the clock
+    /// for that keepalive. padQueue only.
+    private var padLastAimReconcile: CFTimeInterval = 0
+    /// The last vector THIS app told `AimStickDriver` about, MAIN THREAD
+    /// only, purely for the `[padmouse]` diagnostic lines below —
+    /// `AimStickDriver`'s own summed vector is private, and may also be
+    /// carrying an on-screen touch's contribution this app cannot see.
+    private var padLastAimVec: CGSize = .zero
+    /// Rate limit for the "fed a non-zero vector" line, MAIN THREAD only —
+    /// otherwise a held stick would print at whatever rate the 120 Hz
+    /// stick-hop throttle allows.
+    private var padLastAimLogAt: CFTimeInterval = 0
     private var padStatAt: CFTimeInterval = 0
     /// MAIN-THREAD mirror of the last sample the bindings acted on, for the
     /// 1 Hz line. `padLastApplied` itself belongs to the pad queue and reading
@@ -1066,6 +1081,11 @@ final class HardwareInput: ObservableObject {
     private var padAxisSeen = [Bool](repeating: false, count: 4)
     private var padProfileWarned = [Bool](repeating: false, count: 4)
     private var padSampleCount = [UInt32](repeating: 0, count: 4)
+    /// Cumulative count of samples where `readRaw` saw ANY axis non-zero,
+    /// alongside `padSampleCount` on the 10 s line — the number that
+    /// separates "the stick never reported motion" from "it did, and
+    /// something downstream dropped it on the floor".
+    private var padAxisEvents = [UInt32](repeating: 0, count: 4)
 
     private func xlog(_ s: String) {
         fputs("[xinput] \(s)\n", stderr)
@@ -1279,6 +1299,7 @@ final class HardwareInput: ObservableObject {
             if let gp = profiles[i] {
                 padSampleCount[i] &+= 1
                 let raw = Self.readRaw(gp)
+                if !raw.axesQuiet { padAxisEvents[i] &+= 1 }
                 if i == 0 {
                     padLock.lock(); padRawMirror = raw; padLock.unlock()
                 }
@@ -1344,10 +1365,12 @@ final class HardwareInput: ObservableObject {
             // tell you on its own.
             var back = winios_gamepad()
             let got = winios_gamepad_get_state(0, &back) != 0
-            xlog(String(format: "pad0 packets=%u samples=%u last_buttons=0x%04x "
+            xlog(String(format: "pad0 packets=%u samples=%u axis_events=%u "
+                                + "last_buttons=0x%04x "
                                 + "lx=%d ly=%d lxf=%.4f lyf=%.4f rxf=%.4f ryf=%.4f "
                                 + "src=%@ slot(got=%@ packet=%u buttons=0x%04x lx=%d ly=%d)",
-                        padPackets[0], padSampleCount[0], Int(s0.buttons),
+                        padPackets[0], padSampleCount[0], padAxisEvents[0],
+                        Int(s0.buttons),
                         Int(s0.lx), Int(s0.ly),
                         raw0.lxf, raw0.lyf, raw0.rxf, raw0.ryf, src,
                         got ? "yes" : "no", back.packet, Int(back.buttons),
@@ -1395,6 +1418,30 @@ final class HardwareInput: ObservableObject {
 
     /// Decide whether this sample is worth a main-queue hop, and make it.
     /// padQueue only.
+    ///
+    /// ml6xx — THE RIGHT STICK IS NOT ALLOWED TO GO STALE.
+    //
+    // `AimStickDriver`'s CADisplayLink keeps posting whatever vector it was
+    // last handed, every frame, for as long as it runs — there is no "stop"
+    // signal separate from a fresh `padAim` call carrying a smaller (or
+    // zero) vector. Gating that call purely on "did the quantised Int16
+    // change since the sample we last acted on" is correct for buttons and
+    // the left stick: nothing to redo while they repeat. For the right
+    // stick it is not: if the ONE sample where the stick's return to centre
+    // finishes happens to land on the same Int16 as the sample before it —
+    // which Int16 quantisation of a continuous float, or a physically
+    // imperfect centre detent, both make easy — this function goes quiet
+    // and the LAST real deflection drives the mouse forever. That is
+    // exactly what a report of "the camera is being forced up" with no
+    // thumb on the stick looks like: a holder `AimStickDriver` was never
+    // told to release.
+    //
+    // So the right stick also gets a time-based keepalive, independent of
+    // whether its quantised sample changed: at least once every 200 ms the
+    // CURRENT sample is re-applied regardless. That costs nothing while a
+    // controller sits idle (5 Hz, and `applyPadBindings` is idempotent when
+    // nothing is actually held) and turns "stuck forever" into "stuck for
+    // at most a fifth of a second" in the worst case this cannot rule out.
     private func padDriveBindings(_ snap: PadSnapshot) {
         let last = padLastApplied
         // A trigger is analogue, so "changed" for a BINDING means it crossed
@@ -1405,16 +1452,18 @@ final class HardwareInput: ObservableObject {
             || Self.triggerOn(snap.rt) != Self.triggerOn(last.rt)
         let sticksMoved = snap.lx != last.lx || snap.ly != last.ly
             || snap.rx != last.rx || snap.ry != last.ry
-        guard buttonsMoved || sticksMoved else { return }
+        let now = CACurrentMediaTime()
+        let aimKeepaliveDue = now - padLastAimReconcile >= 0.2
+        guard buttonsMoved || sticksMoved || aimKeepaliveDue else { return }
 
-        if !buttonsMoved {
+        if !buttonsMoved && sticksMoved {
             // Stick-only motion: AimStickDriver consumes its vector on a
             // display link and the dirstick only changes on an 8-way boundary,
             // so anything past 120 Hz is thrown away on arrival.
-            let now = CACurrentMediaTime()
             guard now - padLastStickHop >= 1.0 / 120.0 else { return }
             padLastStickHop = now
         }
+        padLastAimReconcile = now
         padLastApplied = snap
         DispatchQueue.main.async { [weak self] in
             self?.padUIState = snap
@@ -1459,16 +1508,50 @@ final class HardwareInput: ObservableObject {
         // negation. It runs even with no aim control on screen whenever the
         // game is in relative-mouse mode, because in that mode there is nothing
         // else on the phone that can turn the camera with a controller.
+        //
+        // ml6xx — OPT-IN WHEN A PHYSICAL PAD IS PRESENT. This function only
+        // ever runs off a PHYSICAL sample (see `padDriveBindings`'s caller),
+        // so reaching here already means a real controller is attached. A
+        // 2008-era title that reads that controller through XInput or the
+        // DirectInput joystick gets the right stick from wine natively —
+        // feeding the SAME stick into the mouse on top of that steers the
+        // camera twice (reported as "the camera is being forced up") and
+        // drags the game's own menu cursor. So this is now opt-in, default
+        // OFF, via `InputSettings.padRightStickMouse`. Turning it off does
+        // NOT touch an on-screen mouse-stick control's own touch handling —
+        // that is a different path (`ControlOverlayView`'s `.aimStick`
+        // region, driven by a finger, not by this function) and keeps
+        // working exactly as before.
         let aim = map[.rightStick]
-        if aim != nil || InputSettings.shared.relative {
+        if InputSettings.shared.padRightStickMouse, aim != nil || InputSettings.shared.relative {
             let v = Self.deflect(CGFloat(s.rx) / 32767, -CGFloat(s.ry) / 32767,
                                  deadzone: 0.15)
             ov.padAim(PadButton.rightStick.rawValue,
                       region: aim?.action.isMouseStick == true ? aim?.regionID : nil,
                       vec: v)
+            padLogAim(src: "phys", vec: v)
         } else {
             ov.padRelease(PadButton.rightStick.rawValue)
+            padLastAimVec = .zero
         }
+    }
+
+    /// MAIN THREAD. The `[padmouse]` diagnostics ml672 asked for: a
+    /// rate-limited line whenever this app feeds `AimStickDriver` a
+    /// non-zero vector (so "the mouse moved" can be tied to a SOURCE and a
+    /// VALUE instead of guessed at), plus a periodic line while the driver
+    /// is running at all — which is the one case a stuck vector needs: the
+    /// driver keeps posting motion every frame with NOTHING in this log
+    /// explaining why unless something says so on a clock, not on an edge.
+    private func padLogAim(src: String, vec: CGSize) {
+        padLastAimVec = vec
+        guard vec != .zero else { return }
+        let now = CACurrentMediaTime()
+        guard now - padLastAimLogAt >= 0.5 else { return }
+        padLastAimLogAt = now
+        fputs(String(format: "[padmouse] src=%@ vec=(%.3f,%.3f) holders=%d\n",
+                     src, Double(vec.width), Double(vec.height),
+                     AimStickDriver.shared.holderCount), stderr)
     }
 
     /// Which control each physical button presses.
@@ -1676,6 +1759,20 @@ final class HardwareInput: ObservableObject {
             + "buttons=\(heldButtons.sorted()) wheel=\(wheelN) \(pad) "
             + "lock=\(pointerLocked ? "on" : "off") path=\(mousePath.rawValue) "
             + "events=\(tickKeys)")
+        // ml672 — the 1 Hz half of the `[padmouse]` diagnostics: while
+        // `AimStickDriver` is running at all, say so and say what THIS app
+        // last fed it. A driver still running with nothing moving it is
+        // precisely the "stuck forever" failure mode padDriveBindings' new
+        // keepalive is meant to make impossible — if this line ever shows
+        // `link=true` alongside a `pad0` 10 s line reading all-zero floats
+        // for more than the keepalive's 200 ms, the stale vector is coming
+        // from somewhere this app cannot see (an on-screen touch's own
+        // holder in `AimStickDriver`, not this one).
+        if AimStickDriver.shared.isRunning {
+            fputs(String(format: "[padmouse] driver running vec=(%.3f,%.3f) holders=%d\n",
+                         Double(padLastAimVec.width), Double(padLastAimVec.height),
+                         AimStickDriver.shared.holderCount), stderr)
+        }
         tickKeys = 0
         motionLock.lock()
         tickDX -= dx; tickDY -= dy; tickWheel -= wheelN
