@@ -35,15 +35,23 @@
  *    generic format a game uses, not a private one, so the format-translation
  *    path in dinput's core is exercised — SetCooperativeLevel(BACKGROUND |
  *    NONEXCLUSIVE) and Acquire.
- * 3. Polls at 120 Hz for ten seconds. Every time the state CHANGES it prints
+ * 3. Prints the state at rest and runs a REST CHECK on it (see rest_check):
+ *    with DirectInput's default 0..65535 range every axis must read ~32767 and
+ *    the POV must read -1. That is the exact property whose absence made a
+ *    2008 title's camera spin: the first version of joystick_ios.c described
+ *    the trigger axes as if 0 were their centre, so a RELEASED trigger read as
+ *    a fully deflected axis.
+ * 4. Polls at 120 Hz for ten seconds. Every time the state CHANGES it prints
  *    one line:
  *
- *      MADEIRA-DINPUT: x=..... y=..... z=..... rx=..... ry=..... rz=.....
- *                      pov=..... buttons=0x........
+ *      MADEIRA-DINPUT: x=..... y=..... z=..... rx=..... ry=..... pov=.....
+ *                      buttons=0x........
  *
- *    and exits on the first one. Axes are the DirectInput 0..65535 range (a
- *    centred stick reads ~32767, a released trigger 0), pov is hundredths of
- *    a degree or -1 for centred, and buttons is a bitmask of the first 32.
+ *    and exits on the first one. X/Y are the left stick, Rx/Ry the right
+ *    stick, and Z the COMBINED triggers (left - right, centred when both are
+ *    released) — the Xbox 360 DirectInput layout, so there is no Rz. pov is
+ *    hundredths of a degree or -1 for centred, and buttons is a bitmask of the
+ *    first 32.
  *
  * HOW TO RUN IT: launch it, then move a stick or press a button on the paired
  * controller. It exits as soon as it sees one change.
@@ -187,13 +195,57 @@ static void report(const DIJOYSTATE2 *js)
     write_int(js->lRx);
     WRITE_LINE(" ry=");
     write_int(js->lRy);
-    WRITE_LINE(" rz=");
-    write_int(js->lRz);
     WRITE_LINE(" pov=");
     write_int((int)js->rgdwPOV[0]);
     WRITE_LINE(" buttons=");
     write_hex32(buttons);
     WRITE_LINE("\n");
+}
+
+/* THE REST CHECK — the property the first version of joystick_ios.c did not
+ * have, and the one that made a 2008 title's camera spin.
+ *
+ * DirectInput's default axis range is 0..65535, so an axis nobody is touching
+ * must read its CENTRE, 32767 (the device's integer scaling lands one LSB
+ * above it, hence the tolerance), and an untouched POV must read -1
+ * (0xffffffff), not 0 — 0 is "up". An axis that rests at an END of the range
+ * is a stick held permanently hard over as far as the game is concerned, and
+ * a game that maps it to camera yaw turns forever and cannot be out-voted by
+ * the mouse.
+ *
+ * Reported as a line rather than an exit code on purpose: if the player is
+ * holding a stick or a trigger when this runs, a failure here is theirs, not
+ * the driver's. The line is what the device log is grepped for. */
+#define REST_CENTRE   32767
+#define REST_TOLERANCE  512
+
+static int near_centre(LONG v)
+{
+    LONG d = v - REST_CENTRE;
+    if (d < 0) d = -d;
+    return d <= REST_TOLERANCE;
+}
+
+static void rest_check(const DIJOYSTATE2 *js)
+{
+    int ok = 1;
+
+    if (!near_centre(js->lX))  { WRITE_LINE("MADEIRA-DINPUT: REST-CHECK x not centred\n");  ok = 0; }
+    if (!near_centre(js->lY))  { WRITE_LINE("MADEIRA-DINPUT: REST-CHECK y not centred\n");  ok = 0; }
+    if (!near_centre(js->lZ))  { WRITE_LINE("MADEIRA-DINPUT: REST-CHECK z not centred "
+                                            "(z is the COMBINED triggers; released = centre)\n"); ok = 0; }
+    if (!near_centre(js->lRx)) { WRITE_LINE("MADEIRA-DINPUT: REST-CHECK rx not centred\n"); ok = 0; }
+    if (!near_centre(js->lRy)) { WRITE_LINE("MADEIRA-DINPUT: REST-CHECK ry not centred\n"); ok = 0; }
+    if (js->rgdwPOV[0] != 0xffffffff)
+    {
+        WRITE_LINE("MADEIRA-DINPUT: REST-CHECK pov is not -1 (idle must be 0xffffffff, not 0 = up)\n");
+        ok = 0;
+    }
+
+    if (ok) WRITE_LINE("MADEIRA-DINPUT: REST-CHECK pass (every axis centred, pov -1)\n");
+    else    WRITE_LINE("MADEIRA-DINPUT: REST-CHECK FAIL - an axis rests off-centre. If nobody was "
+                       "touching the pad this is the bug that spins a camera forever; see "
+                       "joystick_ios.c ios_init_object_properties.\n");
 }
 
 /* Two states differ if anything a game would react to differs. Comparing the
@@ -204,7 +256,7 @@ static int state_changed(const DIJOYSTATE2 *a, const DIJOYSTATE2 *b)
     int i;
 
     if (a->lX != b->lX || a->lY != b->lY || a->lZ != b->lZ) return 1;
-    if (a->lRx != b->lRx || a->lRy != b->lRy || a->lRz != b->lRz) return 1;
+    if (a->lRx != b->lRx || a->lRy != b->lRy) return 1;
     if (a->rgdwPOV[0] != b->rgdwPOV[0]) return 1;
     for (i = 0; i < 32; i++) if (a->rgbButtons[i] != b->rgbButtons[i]) return 1;
     return 0;
@@ -284,6 +336,7 @@ void start(void)
     {
         WRITE_LINE("MADEIRA-DINPUT: acquired, initial state:\n");
         report(&last);
+        rest_check(&last);
     }
 
     for (i = 0; i < total_polls; i++)

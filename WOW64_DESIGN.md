@@ -5102,7 +5102,7 @@ window teardown), `src/winemetal/unix/winemetal_unix.c` (`_Foo32` pattern
   product ID is deliberately NOT Microsoft's `0x045e`: a family of DirectInput
   games filters that vendor out of their own enumeration on the assumption the
   device is already visible through XInput, which would make exactly the games
-  this exists for ignore it (`wine/dlls/dinput/joystick_ios.c:117`, pid.codes
+  this exists for ignore it (`wine/dlls/dinput/joystick_ios.c:120`, pid.codes
   `0x1209`). `dinput` + `dinput8` gain `win32u` in `IMPORTS` and are rebuilt
   for all three farms.
   **Test: `dinput-x86.exe`** (`build/x86-tests/dinput-x86.c`,
@@ -5523,3 +5523,106 @@ window teardown), `src/winemetal/unix/winemetal_unix.c` (`_Foo32` pattern
   `movl $0x1, -0xc(%ebp)` / `movl $0x0, -0x2c(%ebp)` — `quit = TRUE` and
   `send_notify = FALSE` — before the loop, and repeats both at `0x1000ca5c`
   inside it.
+
+- 2026-09-16 — ml761: **the DirectInput joystick's TRIGGER axes rested at the
+  end of the range instead of its centre, and a camera turned forever.**
+
+  **The report.** With ml760's `joystick_ios.c` a 2008 DINPUT8 title ran for
+  the first time, and its camera span constantly to the left. Neither the
+  controller's right stick nor the touch mouse could turn it back. The XInput
+  slot was all zeros throughout —
+  `[xinput] pad0 packets=… buttons=0x0000 lx=0 ly=0 … slot(got=yes …)`,
+  `[hwinput] … rx=0 ry=0` — so the sticks really were centred and the transport
+  really was fine. That combination is the whole diagnosis: **all zeros is the
+  state that triggers the bug**, which is why the log looked innocent.
+
+  **The bug.** ml760 converted every axis to an UNSIGNED 0..65535 logical value
+  and declared `logical_min = 0, logical_max = 65535` for all of them. For a
+  stick that is harmless — XInput 0 becomes 32768, which is the declared centre
+  — and the sticks were in fact correct. For a trigger it is fatal: XInput 0
+  means RELEASED, it became logical 0, and `scale_axis_value` saturates that to
+  `phy_min`. A released trigger therefore read as a **fully deflected axis** —
+  `0` with dinput's default 0..65535 range, `-1000` with an app range of
+  -1000..1000. Both `Z` (left trigger) and `Rz` (right trigger) sat there from
+  the moment the device was acquired. A title of that era that maps "the third
+  axis" to camera yaw sees a stick held hard over and never released; the right
+  stick could not out-vote it because the pegged axis was saturated, and the
+  mouse could not either because the game sums them.
+  Confirmed by running ml760's exact arithmetic on the host: trigger released
+  -> `0` (default range) and `-1000` (symmetric range), while a centred stick
+  -> `32768` and `0`. Sticks fine, triggers pegged, exactly as reported.
+
+  **The fix**, `wine/dlls/dinput/joystick_ios.c`:
+  (1) **Nothing is pre-scaled any more.** Each object now declares the logical
+  range its raw values actually live in and hands the raw value to the scaling
+  (`ios_logical_stick`/`ios_logical_triggers`/`ios_logical_pov` at
+  `joystick_ios.c:327`, `ios_init_object_properties` at `:494`). Axes are
+  `logical_min = -32768, logical_max = 32767`, so logical 0 IS the centre; the
+  hat stays 0..7 with an idle value of 8, deliberately outside the range, which
+  is what makes `ios_scale_value` return -1 (0xffffffff) rather than 0 (= up).
+  `scale_axis_value` derives the centre from the declared range, so
+  `DIPROP_RANGE` keeps working: whatever the app sets, rest lands on the middle
+  of it.
+  (2) **Z is the COMBINED trigger axis, `left - right`, and there is no Rz**
+  (`joystick_ios.c:354`). This is the Xbox 360 controller's DirectInput
+  contract — Windows' XUSB DirectInput device reports exactly one combined,
+  centred Z — and it is the ONLY arrangement in which a trigger axis can rest
+  at the centre of the app's range instead of at one end of it. Two separate
+  trigger axes are the modern XInput/raw-HID view, and a program that wants
+  that has XInput, which this port has had since ml668. Keeping `Rz` as a
+  separate right trigger would have left a second pegged axis to reproduce the
+  same spin in the next title that happened to map it.
+  The object set is now X, Y (left stick), Rx, Ry (right stick), Z (combined
+  triggers), POV 0 (d-pad), buttons 0..9.
+  (3) `ios_joystick_enum_device` re-states what it already did and now says so:
+  the joystick is offered ONLY when the host slot reports a pad, re-checked on
+  every `EnumDevices` and every `CreateDevice`, with no caching — so a session
+  with no controller enumerates no joystick, and one paired mid-session is
+  picked up by the next enumeration (`joystick_ios.c:401`).
+
+  **Proof, before the device.** The scaling was extracted verbatim and run on
+  the host against four app-configured ranges. At rest — sticks at 0, both
+  triggers released, no d-pad — every axis reads the centre of the configured
+  range and the POV reads -1:
+  | range | centre | X | Y | Z | Rx | Ry | POV |
+  |---|---|---|---|---|---|---|---|
+  | 0..65535 (dinput default) | 32767 | 32768 | 32768 | 32768 | 32768 | 32768 | -1 |
+  | -1000..1000 | 0 | 0 | 0 | 0 | 0 | 0 | -1 |
+  | 0..1000 | 500 | 500 | 500 | 500 | 500 | 500 | -1 |
+  | -32768..32767 | -1 | 0 | 0 | 0 | 0 | 0 | -1 |
+  The one-LSB offsets (32768 for a 32767 centre) are Wine's own: `log_ctr =
+  round((-32768 + 32767)/2.0) = -1`, and `joystick_hid.c` produces the same
+  values for a winebus-backed pad. Extremes check out too: stick -32768 ->
+  range minimum, 32767 -> maximum, left trigger full -> near maximum, right
+  trigger full -> near minimum, both full -> centre. POV logical 0..7 ->
+  0, 4500 … 31500 and idle -> -1.
+
+  **Against a stale workspace.** `joystick_ios.c:129` now carries a build tag
+  naming the axis contract —
+  `MADEIRA-DINPUT-IOS ml761-combined-z axes=X,Y,Rx,Ry,Z(LT-RT)
+  logical=-32768..32767 pov=0..7/idle8` — emitted from a TRACE so it survives
+  into `.rdata`. All six shipped binaries were grepped for it after installing:
+  `i386/dinput.dll`, `i386/dinput8.dll`, `aarch64/dinput.dll`,
+  `aarch64/dinput8.dll`, `arm64ec/dinput.dll`, `arm64ec/dinput8.dll` — present
+  in every one. The point is that ml760 and ml761 differ in no export and in no
+  file size; without the tag "is the farm actually carrying the fix" is not a
+  question a build can answer.
+
+  **`dinput-x86.exe` gains a REST CHECK** (`build/x86-tests/dinput-x86.c:229`):
+  after acquiring it asserts every axis is within 512 of 32767 and the POV is
+  -1, and prints `REST-CHECK pass` or `REST-CHECK FAIL` naming the axis. It is
+  a printed verdict rather than an exit code on purpose — a player holding a
+  stick when the test starts would otherwise fail it — so the device log is
+  grepped for `REST-CHECK`. Exit codes are unchanged (58 pass / 68 no device /
+  69 no change / 64,65,66 setup failures), and `rz` is gone from its output.
+
+  **`.xtool/build-wine-i386.sh` now takes module names**, matching
+  `build-wine-64.sh`: `build-wine-i386.sh dinput dinput8` builds and installs
+  just those two instead of re-running ~700 strip+install copies onto /mnt/c
+  (`build-wine-i386.sh:71` for the argument parse, `:467` for the subset
+  filter). Names resolve against the same Makefile rule table the breadth phase
+  uses, so a typo is reported as "no i386 rule" rather than silently building
+  nothing, and the verify and import-closure passes still scan the WHOLE farm —
+  a subset build that breaks the closure has to say so. Rebuilt this way for
+  all three farms: `built: 2 failed: 0` each, **0 missing cross-imports** on
+  i386, aarch64 and arm64ec.
