@@ -6589,6 +6589,15 @@ static void ios_log_guest_exception( const char *via, const EXCEPTION_RECORD *re
     }
 }
 
+/* MADEIRA [d3d9-last]: the D3D9 frontend's last-call ring, dumped from the
+ * crash path. Weak on purpose -- it is defined in DXMT's native half
+ * (research/dxmt/src/d3d9/d3d9_census.cpp, linked through libdxmt_combined.a)
+ * and a build without that archive resolves it to NULL and skips the call.
+ * Note that a title on the EMULATED i386 frontend keeps its ring in guest
+ * memory, which this side cannot read; d3d9-emulated.dll dumps its own from a
+ * vectored handler instead, in the same [d3d9-last] format. */
+extern void d3d9_dump_last_calls(void) __attribute__((weak));
+
 static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec, CONTEXT *context )
 {
     struct exc_stack_layout *stack;
@@ -6596,6 +6605,7 @@ static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec
     NTSTATUS status;
 
     ios_log_guest_exception( "raise", rec, context->Pc );
+    if (d3d9_dump_last_calls && rec->ExceptionCode == STATUS_ACCESS_VIOLATION) d3d9_dump_last_calls();
 
     status = send_debug_event( rec, context, TRUE, TRUE );
     if (status == DBG_CONTINUE || status == DBG_EXCEPTION_HANDLED)

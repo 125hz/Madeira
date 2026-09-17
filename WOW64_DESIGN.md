@@ -4806,3 +4806,720 @@ window teardown), `src/winemetal/unix/winemetal_unix.c` (`_Foo32` pattern
   all, it is refusing before D3D9 and the next thing to read is what `ddraw`
   answers (`IDirectDraw7::EnumDisplayModes` / `GetDisplayMode`), not the mode
   table.
+- 2026-09-16 — Logs 66-70. UE3 game: loading is 99 % failing file
+  lookups (`open=4805/9889 ms fail=4805` per 10 s = 2 ms per miss, ~480/s,
+  mostly DISTINCT probe names) → directory-contents cache assigned +
+  whole-path negative cache to default ON. 55 MB log = DXMT `[mem-census]`/
+  `[trim]` (22k reports × 8 lines) + `[iOS-xrem]` 42k lines → capped.
+  2001 title: ddraw probe fails (`wined3d_adapter_gl_init` no GL), then
+  `[d3d9-modes] count=14` and NO CreateDevice, process idles → NO3D
+  fallback + `[d3d9-caps]` trace + legacy caps audit assigned. 2008 title:
+  CreateDevice 800x600 OK then guest NULL+4 in game code (VC80 SxS
+  manifest missing, DINPUT8/XINPUT loaded) → `[d3d9-last]` crash ring +
+  VC runtime WineSxS manifests + full i386 farm audit + dinput joystick
+  over the gamepad query assigned. 64-bit title: no new log this round.
+- 2026-09-16 — Log qp4 (934 s play session, 55.8 MB) + q67: **the spin
+  governor's pause loop is the largest single consumer of CPU in the process**,
+  the census is the whole log, and an occlusion query that ends in an empty
+  submission is never settled.
+  (1) SPIN GOVERNOR (`ntdll/unix/sync.c:3254-3308`). `[prof]` names
+  `ios_spin_governor+0x320` — the `isb sy` delay loop in `ios_cpu_pause()` —
+  as `top1` in **79 of the session's 94** 10 s windows (`fstatat` takes it in
+  12 of the remaining 15, during the file-lookup phases): **23.6-31.7 % of ALL
+  CPU mid-game and 50.6-60.8 % during level loads**, ahead of the JIT
+  (13-31 %) and ahead
+  of the file lookups (19-42 %). `[sleep0]` says why: 2.6 M governed calls per
+  10 s window out of ~500 streaks, i.e. ~2 µs of ISB per call for the whole
+  length of a streak. The ml970 ladder escalates the GAP between kernel
+  entries but not the PARK taken at each one, and the park is the only part
+  that gives the core back, so the duty cycle ran backwards — 75 % parked on
+  rung 0, then 15 %, 10 %, 12 % as the wait got longer and more hopeless.
+  Retuned so park sits just under gap on every rung: gap
+  `{20, 100, 250, 400} µs`, park `{15, 80, 240, 380} µs` → ~95 % parked.
+  The latency this costs is bounded by the rung's park length and
+  `[sleep0] hist us` prices it: 96 % of finished streaks are ≥ 2 ms, p50
+  time-to-progress 8 ms, p80 16 ms, under 5 % finish inside 1 ms — so the
+  deepest rung's 380 µs granularity is < 5 % of the median wait it applies
+  to, against giving back ~0.7 of a core. Policy, rungs, the first-kernel-
+  entry `sched_yield()` and the 1 ms `IOS_SPIN_PARK_MAX_NS` cap are all
+  unchanged; only the two tables moved.
+  (2) OCCLUSION QUERY LOST IN AN EMPTY SUBMISSION
+  (`dxmt_context.cpp:865-893`, `dxmt_occlusion_query.hpp:129-144`).
+  `VisibilityResultQuery::getValue` reports only once `seq_id_issued` reaches
+  `seq_id_end`, and the only thing that advances `seq_id_issued` is
+  `~VisibilityResultReadback` calling `issue()`. When `vro_state_.reset()`
+  returns 0 — a submission that counted no visibility samples at all, e.g. a
+  flush with no render encoder — no readback is built, so nothing ever issues
+  for that `seqId`; the `erase_if` that follows then dropped every query whose
+  END landed there out of `pending_queries_`, and a query is only ever issued
+  through a readback that captured it, so no later submission could settle it
+  either. `end()` already handled begin and end sharing one seq id and offset;
+  what was unhandled is a query that BEGINS in one submission and ENDS in an
+  empty one — permanently stranded, with D3D9 `GetData` polling it forever.
+  Measured as `[d3d9-query] worst_ever` = **178 s in q67** (line 301509) and
+  10.3 s in qp4 (line 413203) against `issue_to_complete_avg` of 34 ms. New
+  `issueEmpty(seqId)` records the seq with nothing to accumulate, which with
+  an empty submission is exactly the right value. This is the strongest
+  candidate for the blank screen after a death transition: the game stops
+  drawing the world, the flush that follows counts nothing, and whichever
+  query ended in it never answers.
+  (3) THE LOG WAS THE CENSUS. 441,203 of qp4's 454,514 lines and 54.2 MB of
+  its 55.8 MB are `[mem-census]`/`[buf-site]`/`[dyn-census]`/`[trim]`/`[live]`
+  (22,449 reports × ~31 ERR lines, ml684's per-30-seq trigger firing several
+  times a second on the encode thread) plus `[iOS-xrem]` (58,854 lines: ml437's
+  1-in-64 sample was calibrated against 4,234 events and the real rate is
+  3.8 M). `mem_census_report` is now emitted once per 10 s — same cadence as
+  `[prof]` and `[srv-stats]`, so the three line up — with `why` starting
+  `warn` never throttled and the first report always emitted
+  (`dxmt_mem_census.cpp:167-219`); the trigger stays on the fence where ml684
+  put it. `[iOS-xrem]` goes to first 32 + 1-in-1024
+  (`FEX/Source/Windows/Common/InvalidationTracker.cpp:768-784`). Nothing else
+  in qp4 exceeds 1,000 lines. Expected: a 30 min session lands at ~4 MB, of
+  which ~0.8 MB is the periodic census and ~0.4 MB `[iOS-xrem]`.
+  (4) MEASURED, NOT CHANGED. `d3d9-emulated.dll` is **4.6 % of all CPU on
+  average across the 47 mid-game windows (median 4.2 %, max 8.3 %)** — it
+  straddles the 5 % bar rather than clearing it, and the native frontend has
+  still never run on a device, so it stays an A/B rather than a new default:
+  `Documents/madeira-d3d9.txt` containing `native` selects it, and the
+  confirmation is `[d3d9] MADEIRA_D3D9=native` in place of the
+  `MADEIRA_D3D9 unset: forwarding to d3d9-emulated.dll` line (qp4 line 1052),
+  no `d3d9-emulated.dll` row in `[prof] jit by module`, and a
+  `[d3d9-native-census]` table with the same per-frame shape as
+  `[d3d9-census]` (SetSamplerState ~10.6 k/f, SetRenderState ~4.8 k/f,
+  DrawIndexedPrimitive ~391/f, TestCooperativeLevel ~511/f).
+  **`[fastsync] OFF` (qp4 line 207) is the biggest remaining server win and
+  it is a knob, not a code change**: the device has
+  `MADEIRA_FASTSYNC=0` in `Documents/madeira-env.txt` (line 13), so
+  `event_op` — `NtSetEvent` 10-12 k + `NtResetEvent` 6.7-8.9 k per 10 s — is
+  **half of all 36-45 k server requests**, and the ml972 fast path that would
+  serve them in-process is inert (`fastsync cache: learn_ev=0` in every
+  window). `MADEIRA_FS_NEGCACHE=1` is off the same way
+  (`[fs-stats] wholeneg=OFF`). Boot, non-file contributors in order: the
+  governor again (50.6-60.8 % of CPU in the t+60…130 s windows), wineserver
+  IPC (~21 % of CPU in the t+50 s window: `read_reply_data` 7.5 %,
+  `read_request` 5.0 %, `wait_select_reply` 2.6 %, `call_req_handler` 1.2 %,
+  server `main_loop` 4.5 %), then JIT compilation (`libwow64fex.dll` 5.9 % of
+  CPU in the first window, +7,306 blocks / 562,933 guest insts / 9.35 MB of
+  host code in the t+40 s window alone; 38.8 k blocks for the session at a
+  98 % cache hit rate). **PE image pool copies are NOT worth caching across
+  sessions**: all 95 of them happen before the first present and total
+  100.7 MB (`used=0x600c000`), which is ~0.1 s of a ~40 s boot. FEX codegen
+  left alone this round — `[prof] jit tso` reports 33-41 % of memory ops
+  carrying TSO semantics, so the imm9/EA ideas are real but worth ~1-2 % of
+  total CPU against a 30-60 % item, and they are not provable from these
+  20 `block#` dumps.
+  **What to look for in the next log:** `ios_spin_governor` must be GONE from
+  `[prof] top1..top8`; `[sleep0]` `sleep0`+`yield` per 10 s should fall from
+  ~2.6 M to roughly 130 k with `park` rising only slightly, from ~2.5 k/s to
+  ~3.0-3.2 k/s — the gaps shrank by ~20 %, so a streak takes about as many
+  kernel entries as before, it just spends them asleep instead of awake — and
+  `to-progress p50` must stay at 8192 µs (if it moves to 16384 µs the park is
+  too long and rung 3 should go back to 240 µs); `busy` cores should drop
+  from ~2.2 to ~1.5 at the same frame rate; `[d3d9-query] worst_ever` must
+  stay within a few times `issue_to_complete_avg` instead of 10-178 s; and the
+  log itself must come back under 5 MB with `[mem-census] ml678 why=seq`
+  appearing once per 10 s next to each `[srv-stats]`.
+- 2026-09-16 — ml915: directory-contents cache + whole-path fast path
+  (`ntdll/unix/file.c` only; `build/x86-tests/fs-x86.c` phase 10). q66 said
+  the UE3 title's load is `open=4805/9889.131ms fail=4805` per 10 s — 99 % of
+  wall time in `lookup_unix_name` for opens that FAIL, 2.06 ms each — and the
+  names are mostly DISTINCT (localised/variant package spellings), so ml912's
+  per-COMPONENT and ml913's per-PATH negative entries are written once and
+  read never: every probe still walked the path and scanned a directory of
+  thousands. Two pieces, both keyed where the repetition actually is.
+  (1) `ios_dc_*` (`file.c:1034-1424`): the first case-insensitive scan of a
+  directory is read into a table — exact spellings in readdir order, plus an
+  FNV hash of each name's `ntdll_towupper`-folded UTF-16 form, in an
+  open-addressed index — keyed on `(dev, ino)` and stamped with ns `mtime`
+  AND `ctime`. One `fstatat` of the directory revalidates the whole table, so
+  any name in it, present or absent, is one syscall and a hash probe.
+  Semantics are upstream's: the exact-case `fstatat` still runs first
+  (`find_file_in_dir:4526`), the table is only consulted after the
+  `is_legal_8dot3_name` and `get_dir_case_sensitivity` gates, a candidate is
+  confirmed with a real `wcsnicmp` (equal-under-`wcsnicmp` implies equal
+  hash, which is what makes a miss sound), the LOWEST readdir index wins so
+  case siblings resolve as before, and 8.3 names bypass the table (they match
+  a second way inside the same pass) while still building it. The scan that
+  builds a table now reads to the END even after it matches (`:4676`) — one
+  extra partial walk, once per directory. Bounds: 64 directories / 4 MB
+  total, 1 MB and 65536 names per directory, LRU to get under the count and
+  largest-first to get under the bytes. Stamp is read from the dir fd BEFORE
+  the walk (ml914's rule), and every create path in this process also drops
+  the table by path (`ios_dc_invalidate_path`, called from `NtCreateFile`
+  when `created`, `NtDeleteFile`, rename and link) so a create-then-open
+  inside one clock tick cannot read a table older than the create.
+  (2) The table alone does not move the headline number: a failing open still
+  paid ~7 `fstatat` walking the path. So `lookup_unix_name:5371` splits the
+  question — a `'\2'`-namespaced, EXACT-spelling entry in `ios_pc` maps the
+  requested PARENT path to its resolved directory (recorded at `:5686`,
+  only on `STATUS_OBJECT_NAME_NOT_FOUND`, where `pos` is exactly the parent),
+  and the leaf is answered by that directory's table. One `fstatat` validates
+  both. Absent leaf AND absent `<leaf>?` ⇒ `STATUS_OBJECT_NAME_NOT_FOUND`
+  returned before the shortcut stat: **one syscall for a whole failing open**.
+  An EXACT-byte match in a directory whose resolved spelling is the requested
+  one returns `STATUS_SUCCESS` with the buffer untouched, so a successful open
+  is still one `fstatat`; every other kind of match falls through and is
+  resolved the long way, so "exact case beats readdir order" is untouched.
+  Guards are ml913's: never `open_reparse` (`NtQueryAttributesFile` passes it,
+  so `GetFileAttributes` never takes this path), only `FILE_OPEN`/
+  `FILE_OVERWRITE`, never a legal 8.3 leaf, never a relative `root_fd`, never
+  a trailing separator. Residual hazard is ml913's and unchanged: a
+  case-sibling directory created from outside this resolver can make a cached
+  parent resolution wrong.
+  (3) `MADEIRA_FS_NEGCACHE` now defaults ON (`=0` disables); new
+  `MADEIRA_FS_DIRCACHE=0` disables the table and with it the fast path.
+  `[fs-stats]` gains `open: … (fail=N fail_avg_us=N)`, a `dircache=` line
+  (`dirs/entries/bytes/hits/misses/scans/evict/stale/inval/big`), a `dirfast:
+  notfound/exact/nocache` line and a `wdir` phase.
+  Proof before device: the `ios_dc_*` code was extracted verbatim and run on
+  the host under ASan/UBSan against a brute-force model of the readdir loop —
+  3600 names including case-sibling pairs, 30800 probes (own spelling, upper,
+  lower, 20000 near-miss absentees); every answer, every returned spelling and
+  every exact-vs-case-insensitive verdict matched, and the bounds and
+  invalidation paths held. `fs-x86.exe` phase 10: 3000 files in one directory,
+  then 5000 distinct absent names opened three times (two disjoint sets plus a
+  repeat, each timed and printing `avg N us` — the same quantity as
+  `fail_avg_us`), then create/delete/rename in the hot directory and
+  flipped-case opens of files that exist. Phases 2-6 now check every
+  transition with `CreateFile` as well as `GetFileAttributes`, because only
+  the former reaches the whole-path caches. Exit 47 = pass.
+  **What to look for in the next log:** `[fs-stats] open: … fail_avg_us=` must
+  fall from ~2060 to ~150-350 (one `fstatat` in this sandbox is ~155 µs), and
+  `lookup=9889ms/4805` to well under 1 s per 10 s; `dircache=ON: dirs=` a
+  handful to a few dozen with `scans=` going to 0 after the first windows
+  while `hits=` climbs into the thousands; `dirfast: notfound=` should be most
+  of `fail=`, with `nocache=` only in the first windows. If `stale=` or
+  `inval=` is large the game is writing into the directories it probes and the
+  table is being rebuilt — look at `scans=` next. If `fail_avg_us` stays high
+  while `dircache` hits are high, the cost is the walk, not the scan, and
+  `dirfast: nocache=` will say the parent resolutions are not being reused.
+  A/B: `MADEIRA_FS_DIRCACHE=0` restores the ml914 build (table and fast path
+  both gone); adding `MADEIRA_FS_NEGCACHE=0` restores ml912.
+- 2026-09-16 — ml760: **the farms stop being a list of the modules somebody
+  already watched a program fail without.** Three things, one goal: a 32-bit
+  game should at least BOOT without anyone having tested that game.
+
+  **(1) The breadth round.** `.xtool/build-wine-i386.sh` derived its whole
+  target list from the file names in `app/Madeira/aarch64-windows/` plus a
+  hand-written `EXTRA_DLLS`. That can only ever contain what has already been
+  missed, and the failure it misses is not a degradation — it is
+  `err:module:import_dll Library FOO.dll (which is needed by L"…\game.exe") not
+  found` and the process never reaches its first instruction. There is no
+  partial symptom to notice, so the only way to discover a gap is to run the
+  exact program that needs it. So the script now takes the complement: it reads
+  every `dlls/<x>/i386-windows/<file>` and `programs/<x>/i386-windows/<file>`
+  RULE out of the configured tree's `Makefile` (makedep emits one only for a
+  module actually configured for this arch, which makes the rules both the
+  complete list and the correct one) and builds all of them minus a named,
+  justified skip list — `.xtool/build-wine-i386.sh:332` (`BREADTH_EXT_RE`),
+  `:336` (`SKIP_BREADTH_REASON`), `:405` (the `HAS_RULE` prune). Reading rules
+  also distinguishes, for the first time, "module not configured for i386"
+  (conhost, services, wineboot, rpcss, winecoreaudio.drv — the WoW64 host side,
+  built for the native arch only) from "build failed", which the name-based
+  phase reported identically.
+  Result: **+498 modules, 241 -> 742 files, 104.5 MB -> 177.2 MB**, `built: 720
+  failed: 0`, all PE32/pe-i386, **0 missing cross-imports**.
+  Skipped, with the reason in the script: the 19 `*.sys` kernel drivers plus
+  `ntoskrnl.exe`/`winedevice.exe` (WoW64 runs drivers 64-bit only and this app
+  ships no `services.exe`/`winedevice.exe` at all, so a 32-bit `.sys` is never
+  loaded — this includes `hidclass.sys`, which is why the DirectInput work below
+  does not go through HID); `winemac.drv`, `wineps.drv`, `winevulkan`/
+  `vulkan-1`, `opencl`, `wpcap` (host backends with no iOS unixlib; the tree is
+  configured `--without-vulkan` and graphics go through DXMT/Metal); `wow32`,
+  `winevdm`, `vga`, `hal`, `w32skrnl` plus every `.dll16/.exe16/.drv16/.vxd`
+  (the 16-bit NE layer, with no 16-bit modules under it in a WoW64 tree);
+  `winemenubuilder`, `wineconsole`; and three that built fine and were then
+  dropped on cost — `aero.msstyles` (7.4 MB of theme resources and nothing
+  selects a visual style), `winedbg.exe` (4.5 MB, only ever spawned by a crash
+  dialog this port does not show), and `ir50_32.dll`. That last one is worth
+  recording precisely, because the usual assumption is wrong in both
+  directions: **Wine DOES have `dlls/ir50_32`** — but it is a thin VfW wrapper
+  whose decoder is `winegstreamer`'s, and the first full breadth run's closure
+  check reported exactly one gap, `ir50_32.dll -> winegstreamer.dll`, which
+  needs a GStreamer unixlib that is not built for iOS. Also absent from Wine
+  entirely, so unbuildable rather than skipped: **`mfc*` — there is no
+  `wine/dlls/mfc42` or any other MFC module**, which is why the VC80/VC90 MFC
+  side-by-side assemblies below cannot be seeded either. Gecko and wine-mono
+  remain external packages (`mshtml.dll` ships as the stub; `mscoree`/`fusion`
+  now ship so the .NET detection path answers instead of failing at load).
+
+  **(2) `windows\winsxs` for the Visual C++ runtimes.** A 32-bit title in the
+  last log logged `Could not find dependent assembly "Microsoft.VC80.CRT"
+  (8.0.50727.762)`. Unlike the Common-Controls message this port has logged
+  forever, that one is fatal-shaped: a VS2005/2008 build carries its CRT as a
+  side-by-side dependency in its own manifest and imports `MSVCR80.dll` by
+  name, and every DLL it later loads with the same dependency fails the same
+  way. `WineProcessBridge.m` already seeded ONE assembly; it now seeds the ten
+  `WINE_MANIFEST` assemblies the tree actually has
+  (`grep -rn WINE_MANIFEST wine/dlls --include=*.rc`): Common-Controls 6.0,
+  **VC80.CRT / VC90.CRT** (each with its `msvcr`/`msvcp`/`msvcm` trio),
+  **VC80.ATL / VC90.ATL**, GdiPlus 1.0 and 1.1, and MSXML 3 / 4 / 6 — for
+  `x86`, `arm64` and `amd64`, from a table at
+  `app/Madeira/WineProcessBridge.m:1135`, with the naming taken byte-for-byte
+  from `dlls/setupapi/fakedll.c` `append_manifest_filename` (arch, name and
+  language lower-cased and truncated, publicKeyToken and version verbatim, the
+  literal `deadbeef` where Microsoft puts a content hash):
+  `x86_microsoft.vc80.crt_1fc8b3b9a1e18e3b_8.0.50727.9672_none_deadbeef`.
+  **An older request still matches**, which is what makes seeding these blind
+  worth doing: `ntdll/actctx.c build_manifest_filter` pins only major.minor
+  (`_%u.%u.*.*_`) and `lookup_manifest_file` then accepts any build/revision
+  `>=` the requested one, so the 8.0.50727.**762** the title asked for is served
+  by the 8.0.50727.**9672** Wine ships, and one assembly per major.minor covers
+  every service pack of it. The manifest text and the assembly directory are
+  now generated together from the same `<file>` list, so a farm missing (say)
+  `msvcm80.dll` drops that name from BOTH rather than advertising a file that
+  is not there — the same "never redirect a load into an empty directory" rule
+  the Common-Controls seeding already had. VC100+ is NOT seeded and there is
+  nothing to seed: VS2010 stopped deploying the CRT side-by-side.
+
+  **(3) DirectInput can finally see the controller.** A pad reached Windows
+  only as XInput (`NtUserCallTwoParam_GetGamepadState`). `dinput`'s only
+  joystick backend, `joystick_hid.c`, enumerates devices `winebus.sys` creates
+  — and there is no `winebus.sys` here, no driver host to load it into, and no
+  HID transport under it. So `EnumDevices(DI8DEVCLASS_GAMECTRL)` returned
+  NOTHING, and every DirectInput-era title saw no controller while XInput-era
+  titles in the same prefix worked. New `wine/dlls/dinput/joystick_ios.c`
+  synthesises ONE joystick from the same gamepad query, with the object set
+  `winebus.sys` gives an XInput pad so a game's stock controller map lands where
+  it expects: X/Y left stick, Rx/Ry right stick, Z/Rz triggers, an 8-way POV
+  hat from the d-pad, and buttons 0..9 = A B X Y LB RB Back Start LThumb
+  RThumb. It reuses dinput's own scaling (`scale_value`/`scale_axis_value`
+  logic over `struct object_properties`) so `DIPROP_RANGE`/`DEADZONE`/
+  `SATURATION` behave as they do on a HID device; it is offered ahead of the
+  HID loop in `wine/dlls/dinput/dinput.c:391` and recognised by its fixed
+  instance GUID in `wine/dlls/dinput/dinput.c:288`; force feedback is
+  unsupported and says so (`guidFFDriver == GUID_NULL`, no
+  `DIDC_FORCEFEEDBACK`) rather than accepting effects and dropping them;
+  keyboard and mouse are untouched. **There is no `#ifdef`**:
+  `NtUserGetGamepadState` is `NtUserCallTwoParam` with a code appended to the
+  end of the enum, so a win32u that does not implement it answers 0 —
+  bit-for-bit "no pad in that slot" — and on a stock Wine this file enumerates
+  nothing and the HID path runs exactly as before. Sampling is buffered from
+  polling: there is no report thread and no `read_event`, so
+  `dinput_main.c`'s input thread skips the device (it requires both), and
+  `device.c` calls `Poll` at the top of BOTH `GetDeviceState` and
+  `GetDeviceData`, so a game that never calls `Poll` itself still works. The
+  product ID is deliberately NOT Microsoft's `0x045e`: a family of DirectInput
+  games filters that vendor out of their own enumeration on the assumption the
+  device is already visible through XInput, which would make exactly the games
+  this exists for ignore it (`wine/dlls/dinput/joystick_ios.c:117`, pid.codes
+  `0x1209`). `dinput` + `dinput8` gain `win32u` in `IMPORTS` and are rebuilt
+  for all three farms.
+  **Test: `dinput-x86.exe`** (`build/x86-tests/dinput-x86.c`,
+  `build/x86-tests/build-dinput-test.sh`) — i386 PE, no CRT, imports
+  `dinput8` + `ole32` + `kernel32` only; enumerates `DI8DEVCLASS_GAMECTRL`
+  printing every device it is offered, creates the first,
+  `SetDataFormat(&c_dfDIJoystick2)`, acquires, and polls 10 s printing
+  `MADEIRA-DINPUT:` lines on every state change.
+  **58** = a device enumerated AND its state changed (it works), **68** = the
+  enumeration produced nothing, **69** = it enumerated but never moved; 64/65/66
+  are create/setup/acquire failures. Run `xinput-x86.exe` first to tell "no pad
+  paired" apart from "dinput does not expose it".
+  *(The launcher button for it has to be added by whoever owns ContentView.)*
+
+  **(4) The 64-bit farms, and the budget.** The same "build everything"
+  argument applies word for word to `aarch64-windows` and `arm64ec-windows`;
+  what does not apply is the cost. A 64-bit PE here is roughly 2.5x the same
+  module built for i386 (compare the two `shell32.dll`s) and there are two such
+  farms, so the sweep would cost about 5x the i386 one — several hundred MB in
+  an IPA with ~120 MB of room. `.xtool/build-wine-64.sh` therefore grows a
+  curated `DEFAULT_DLLS` (`.xtool/build-wine-64.sh:150`) instead, documented
+  entry by entry: the 2010/2012/2013 VC runtimes (the single largest block, and
+  the one whose absence is unconditionally fatal at load),
+  `d3dcompiler_43`/`_47` (neither 64-bit farm had ANY d3dcompiler),
+  `d3dx9_43`/`d3dx11_43`/`d3dxof`, XAudio2 7/8/9 + `x3daudio1_7` +
+  `xapofx1_5`, `dinput`+`dinput8`, `gdiplus`, `riched20`/`usp10`, `msvfw32`,
+  and a launcher set (`mscoree fusion xmllite msxml6 wintypes sxs gameux
+  normaliz`). It also gains the i386 script's two checks: machine type
+  (llvm-objdump calls an ARM64 PE `coff-arm64`, not `pe-aarch64` — the old
+  wording made every file look wrong) and **import closure**, which immediately
+  found four gaps, two of them pre-existing and silent:
+  `dxdiagn.dll -> ddraw.dll` and `bthprops.cpl -> bluetoothapis.dll`, i.e. two
+  modules that had shipped in those farms unloadable the whole time. Both are
+  now built. `d3dx10_43` (drags a second D3D10 stack in for a generation that
+  barely existed in x64), the DirectShow stack (nothing to decode with:
+  `winegstreamer` needs GStreamer and `winedmo` needs FFmpeg, neither built for
+  iOS) and `msi`/`cabinet`/`msiexec` (the bootstrap EXE of a game installer is
+  32-bit in practice) are deliberately left to the i386 farm. A third, smaller
+  fix in the same script: targets with no rule for the requested arch are now
+  pruned and reported as "not configured for this arch" instead of failing with
+  an empty error line — which is what the arm64ec tree does with every program
+  (it configures eight) and with `wow64win`.
+  Result: aarch64 **148 -> 180 files, 129.5 -> 154.5 MB**; arm64ec **142 -> 164
+  files, 145.4 -> 167.6 MB**; `failed: 0` on both, all ARM64 PE, **0 missing
+  cross-imports** on both.
+  Total farm growth this round: **+119.9 MB uncompressed** (i386 +72.7,
+  aarch64 +25.0, arm64ec +22.3), inside the ~120 MB ceiling.
+
+- 2026-09-16 — Logs q68 (a 2001-era D3D9 + ddraw title) and q69/q70 (a 2008-era
+  D3D9 + DINPUT8 + XINPUT1_3 + d3dx9_38 title). **Neither title was stopped by
+  D3D9, and the second one's null had nothing to do with D3D9 either.** What
+  the two logs actually say, then four generic fixes and two instruments.
+  **q68 — the 2001 title does not stop at the adapter; it stops in its intro
+  movie.** After `[d3d9-modes] adapter 0 count=14` the log has no
+  `CreateDevice` and no exit, which reads as "it enumerated modes and refused".
+  It did not refuse. In order after the mode enumeration (`q68:1036-1081`) it
+  loads `devenum`, `avicap32`, `winmm`, `msacm32`, `msdmo`, `quartz`,
+  `msvfw32`, `msrle32`, `msvidc32`, `iccvid` — a DirectShow graph with the
+  Video-for-Windows codec set — and immediately before that `dxdiagn`,
+  `wbemprox`, `setupapi`, `cfgmgr32` and `mmdevapi`, i.e. a DirectX-diagnostics
+  and WMI sweep. The only hard failure in the sequence is `[dll-missing] #1
+  L"ir50_32.dll" status=c0000135` (the Indeo 5 video codec, which this port
+  does not ship and Wine does not implement). It then creates two threads whose
+  start addresses are inside `mmdevapi.dll` (`717b15b4a0` / `717b15ca00`
+  against base `717B150000`) and **spins**: the second `[prof]` window is
+  `tid=002c=96.7%(jit 82%)` with `top1..top8` all inside a ~200-byte JIT range
+  (`0x1389ab7fc..0x1389ab8d0`) — ~97 % of a core in a handful of instructions,
+  indefinitely. The audio side says where it stopped:
+  `build/ntdll-unix/audio_null_ios.c` logs each entry point at call #1, and the
+  log has `process_attach`, `test_connect`, `get_endpoint_ids`,
+  `get_mix_format` and `is_format_supported` — and **never `create_stream`,
+  `start`, `get_render_buffer`, `main_loop`, `timer_loop`,
+  `get_current_padding` or `get_position`**. So the graph asked whether a
+  format was supported (`audio_null_ios.c:968` accepts everything), never
+  initialised a stream, and something in the graph now busy-waits for a frame
+  or a clock that never arrives. It is not deadlocked, it is not showing a
+  dialog we fail to draw, and it is not a D3D9 problem: the next step belongs
+  to the DirectShow/VfW/audio track. The one thing this track owed it — a
+  believable adapter identity for the diagnostics sweep it runs just before —
+  is fixed below.
+  **q70 — the 2008 title's null is an EMPTY `DISPLAY_DEVICE.DeviceID`, not a
+  D3D9 return.** The device is created and presented (`[d3d9-modes] CreateDevice
+  800x600 A8R8G8B8 ... -> hr 0x0`, then a full `[d3d9-census] summary 1` with
+  2485 calls and `[iOS DXMT] nextDrawable #1`), so the renderer works. The
+  fault is `bus_handler BUS #1 ... addr=0x7100000004 insn=0x38bfc31a`
+  (`q70:5245`) — decoded, `ldrb w26,[x24]` with `x24 = guestbase + 4`, a
+  **one-byte** read of guest address 4 — and the line immediately before it is
+  `[vmode] synthesized EnumDisplayDevices adapter idx=0` (`q70:5154`), two WMI
+  round-trips after `wbemprox`. `NtUserEnumDisplayDevices`' virtual-monitor arm
+  in `build/win32u-unix/sysparams_ios.c` was returning `*info->DeviceID = 0`
+  and `*info->DeviceKey = 0` — empty strings. An empty `DeviceID` is not a
+  harmless omission: it is the field an application parses to find out which
+  GPU it is on, with `p = strstr(dd.DeviceID, "VEN_"); vendor = strtoul(p + 4,
+  ...)` and no null check, because on Windows the string is never empty.
+  `p + 4` with `p == NULL` is a byte read of address 4. That is the fault,
+  exactly. Both fields are now filled in the format the non-virtual path
+  produces (`sysparams_ios.c:4340-4390`): adapter
+  `PCI\VEN_106B&DEV_0001&SUBSYS_00000000&REV_00` plus a
+  `...\Control\Video\{...}\0000` key; monitor
+  `MONITOR\Default_Monitor\{4d36e96e-...}\0000` (or the
+  `\\?\DISPLAY#...#{e6f07b5f-...}` interface path under
+  `EDD_GET_DEVICE_INTERFACE_NAME`) plus a `...\Control\Class\{4d36e96e-...}\0000`
+  key. The `[vmode]` trace now prints `flags=` too.
+  **One identity, three interfaces.** `0x106B / 0x0001` above is not a new
+  number: it is what `MTLD3D9Interface::GetAdapterIdentifier` has always
+  reported (`d3d9_interface.cpp:600-612`). wined3d's no3d adapter reported
+  `HW_VENDOR_SOFTWARE / CARD_WINE` — **vendor 0, device 0** — which is both what
+  a period title's GPU table reads as "no adapter" AND a different GPU from the
+  one D3D9 names on the same machine, so a title that asks both concludes it is
+  looking at two cards. `wined3d_adapter_no3d_create`'s `gpu_description` is now
+  `HW_VENDOR_APPLE / CARD_APPLE_GPU` (`wined3d/directx.c:3390`; enumerators
+  added at `wined3d_private.h:2085` and `:2098`), description `"DXMT (Metal) 2D"`,
+  vidmem left at the upstream 128 MB. All three answers now agree.
+  **wined3d falls back to no3d itself.** There is no OpenGL and no Vulkan here,
+  so `wined3d_adapter_gl_create` always fails in `wined3d_caps_gl_ctx_create`
+  ("Failed to find a suitable pixel format", `adapter_gl.c:346`) and
+  `wined3d_create` returned NULL. ddraw has always retried with `WINED3D_NO3D`
+  — twice, at `ddraw.c:5136` and `main.c:469`, which is why q68 shows the
+  pixel-format error four times in one run — but it is the **only** caller that
+  does; d3d8, dxgi and dxcore have no retry and lost even the 2D, display-mode
+  and adapter-identity surface no3d would have given them. `wined3d_init`
+  (`directx.c:3575-3600`) now retries once with the flag, and sets it on the
+  `wined3d` object rather than only the adapter: `wined3d_check_device_format`
+  gates texture capabilities on `wined3d->flags & WINED3D_NO3D`, and an adapter
+  that is no3d while its `wined3d` is not would advertise 3D nothing can back.
+  The recovery announces itself as `err:winediag: Disabling 3D support: no
+  OpenGL or Vulkan adapter is available.` The registry knob (`renderer=no3d`,
+  `wined3d_main.c`) still short-circuits ahead of it.
+  **`adapter_no3d_get_wined3d_caps` was empty**, so under no3d the only
+  `DDSCAPS` ddraw reported were the generic ones (`FLIP`, `OFFSCREENPLAIN`,
+  `PALETTE`, `PRIMARYSURFACE`, `TEXTURE`, `ZBUFFER`, `MIPMAP`), and every
+  surface kind a flipping primary chain is made of read as unsupported — on a
+  path where ddraw does the flipping itself and needs no 3D backend for any of
+  it. It now adds `FRONTBUFFER | BACKBUFFER | COMPLEX | OWNDC | VIDEOMEMORY |
+  LOCALVIDMEM` (`directx.c:2904-2935`). `WINEDDCAPS_3D`, `3DDEVICE` and
+  `NONLOCALVIDMEM` stay off deliberately — their absence is what makes ddraw
+  set its own `DDRAW_NO3D`, and there is no AGP aperture to describe.
+  **Instrument 1, `[d3d9-caps]`** (`d3d9_interface.cpp:230-420` plus the call
+  sites). Every `CheckDeviceType`, `CheckDeviceFormat`, `CheckDepthStencilMatch`,
+  `CheckDeviceMultiSampleType`, `CheckDeviceFormatConversion`, `GetDeviceCaps`,
+  `GetAdapterIdentifier` and `GetAdapterDisplayMode` prints its arguments and
+  its HRESULT — **once per distinct query, capped at 256 lines**. Frame 1 of a
+  real title issues thousands of these (the census measured 2016
+  `EnumAdapterModes` and 144 `CheckDeviceType` in one frame), so a repeat costs
+  one atomic load against a 1024-slot open-addressed set of the query's 64-bit
+  FNV-1a hash. The hash is used rather than packed bit ranges because the
+  fields do not fit side by side in 64 bits (`Usage` is 32 and a FOURCC is
+  another 32) and overlapping shifted XORs alias one query onto another, which
+  shows up as a line the trace never prints. `GetDeviceCaps` prints the fields
+  a legacy title gates on across three lines (shader versions,
+  `MaxSimultaneousTextures`, `MaxTexture*`, `MaxPrimitiveCount`,
+  `MaxVertexShaderConst`, `NumSimultaneousRTs`, `Caps`/`Caps2`/`Caps3`,
+  `DevCaps` with `HWTNL`/`PURE` called out, `TextureCaps` with `POW2` and
+  `NONPOW2COND` called out, `RasterCaps`, `PrimitiveMiscCaps`, `StencilCaps`,
+  `DeclTypes`). The five format probes are traced by WRAPPING: the bodies moved
+  into non-virtual `...Probe` helpers (`d3d9_interface.hpp`), deliberately NOT
+  `STDMETHODCALLTYPE` so `gen_d3d9_census.py` does not renumber all 317 methods
+  (`--check` still reports `317 methods across 13 files; 0 stale`). Wrapping
+  rather than editing returns because `CheckDeviceFormat` alone returns from two
+  dozen places and a trace threaded through all of them drifts the first time
+  one moves. Probes that one method makes of another are traced too, which is
+  informative — it is what explains a `CheckDeviceType` refusal — rather than
+  noise.
+  **Instrument 2, `[d3d9-last]`** (`d3d9_census.{hpp,cpp}`). A 64-entry
+  lock-free ring of the last D3D9 calls, pushed from the same generated
+  `D3D9_CENSUS` macro that already sits at the top of all 317 vtable slots, so
+  no call site was touched: one relaxed `fetch_add` plus six plain stores, with
+  the sequence number written last so a torn slot is visible rather than
+  quietly misleading. `LogPresentRequest` also pushes a RET entry carrying the
+  HRESULT and the extent (`ringNote`, `d3d9_interface.cpp:475`), which covers
+  CreateDevice / CreateDeviceEx / Reset / ResetEx / CreateAdditionalSwapChain;
+  `D3D9_CENSUS_RET(code, hr, a0, a1)` exists for adding further return sites.
+  **How it reaches the log is the interesting part.** The 32-bit frontend is
+  guest code (`d3d9.dll` is the 114 KB shim forwarding to the 2.1 MB
+  `d3d9-emulated.dll`), so the ring lives in guest memory and the host crash
+  reporter cannot read it. So there are two dumps printing the same block: a
+  vectored exception handler installed at DLL init (`d3d9_census.cpp:306` —
+  first in the chain, returns `EXCEPTION_CONTINUE_SEARCH` unconditionally, and
+  filters to the codes that end a process unhandled so C++ throws, thread-name
+  notifications and `OutputDebugString` do not trigger it) covers the emulated
+  frontend; and `extern "C" d3d9_dump_last_calls()` (`d3d9_census.cpp:519`),
+  declared weak and called from the single site
+  `build/ntdll-unix/signal_arm64_ios.c:6599,6608` on `STATUS_ACCESS_VIOLATION`,
+  covers the native one. `DllMain(DLL_PROCESS_DETACH)` with a non-NULL
+  `reserved` dumps on an orderly `ExitProcess`, i.e. the `MADEIRA-EXIT` case
+  (`d3d9.cpp:29`). Three dumps per process, so a fault inside a fault cannot
+  flood the log.
+  **Caps audit, 2000-2010 expectations.** Everything below was already right
+  and is now asserted by a test: DXT1-5 as 2D and cube textures;
+  `R5G6B5`/`X1R5G5B5`/`A1R5G5B5` as render targets and textures and
+  `A4R4G4B4` as a texture; `L8`/`A8`/`A8L8`/`L16`/`V8U8`/`Q8W8V8U8`;
+  `D16`/`D24S8`/`D24X8` as depth-stencil, and all nine
+  `{X8R8G8B8, A8R8G8B8, R5G6B5} x {D16, D24S8, D24X8}` matches;
+  `CheckDeviceType` windowed and fullscreen for every display/backbuffer pair;
+  ps/vs 3.0; `MaxPrimitiveCount = 0x555555` (>= `0xFFFFF`);
+  `MaxSimultaneousTextures = 8`; `MaxVertexShaderConst = 256`;
+  `NumSimultaneousRTs = 4`; `DevCaps` carrying `HWTRANSFORMANDLIGHT|PUREDEVICE`;
+  the full `StencilCaps` and `DeclTypes`; and no `POW2` bit at all, which is
+  the most permissive non-power-of-two answer there is. `AUTOGENMIPMAP` on a
+  non-renderable format returns `D3DOK_NOAUTOGEN`, a SUCCESS code — the
+  distinction matters, because a FAILED answer there sends a title down a
+  no-mipmaps path.
+  **One real defect found in the audit and fixed:** `CheckDeviceFormat` and
+  `CheckDepthStencilMatch` accepted only `X8R8G8B8`/`R5G6B5`/`X1R5G5B5` as an
+  adapter format, while `isEnumerableDisplayFormat` enumerates modes for
+  `A2R10G10B10` as well. `CheckDeviceType` for a fullscreen device ends by
+  asking `CheckDeviceFormat` whether the backbuffer is a render target AT THE
+  DISPLAY FORMAT, so **every `A2R10G10B10` fullscreen probe was refused on an
+  adapter that had just reported fourteen `A2R10G10B10` modes** — a mode list
+  no device could be created from, with no second answer telling the caller to
+  fall back. `A2R10G10B10` is a real render target here (`isColorRTFormat`), so
+  it is accepted now (`d3d9_interface.cpp:863`, `:1173`).
+  **Known gaps, deliberately not closed here** (each has a documented fallback
+  a period title takes, and closing them means adding format support rather
+  than changing a probe): `X8L8V8U8`, `L6V5U5` and `A2W10V10U10` are unmapped,
+  so the 2002-2005 bump-map set stops at `V8U8`/`Q8W8V8U8`; `P8`/`A8P8`, packed
+  YUV, `R8G8B8`, `R3G3B2`/`A8R3G3B2`, `A4L4` and `CxV8U8` are SCRATCH-only by
+  design and the probe correctly refuses them; `D32` and `D16_LOCKABLE` are
+  refused, matching wined3d and DXVK; `A4R4G4B4` is a texture but not a render
+  target, matching DXVK. The test prints all of them as `[info]` so a
+  regression in any one is visible without being a failure.
+  **`d3d9.customVendorId` / `d3d9.customDeviceId` / `d3d9.customDeviceDesc`**
+  (`d3d9_interface.cpp:540-585`, off by default). The defaults are honest —
+  Apple's real vendor id and the Metal device's own name — because a
+  translation layer should say what it is. The knob exists because a period
+  title commonly carries a hard-coded vendor table with `0x10DE`/`0x1002`/
+  `0x8086` and nothing else in it, and treats an unrecognised vendor the way it
+  treats a broken driver. That is not something the adapter can fix from the
+  inside, only something the user can A/B, so it is spelled the way DXVK spells
+  it (four hex digits) and reaches the device through
+  `Documents/madeira-dxmt.txt`, e.g.
+  `d3d9.customVendorId = 10de; d3d9.customDeviceId = 05e2`. It moves the D3D9
+  answer only — the ddraw and `EnumDisplayDevices` identities stay at
+  `0x106B / 0x0001` — so an A/B that changes behaviour also tells you the title
+  is reading D3D9's number rather than the display device's.
+  **Tests.** `build/x86-tests/d3d9caps-x86.c` (`./build-d3d9caps-test.sh`;
+  imports kernel32 + d3d9 only, and creates no window, because a title probes
+  all of this before it has a renderer) walks the matrix above, prints every
+  answer as `MADEIRA-D3D9CAPS: [ok  ]` / `[FAIL]` / `[info]`, and additionally
+  asserts that `CheckDeviceType` and `CheckDeviceFormat` cannot disagree about
+  a backbuffer — the defect class the `A2R10G10B10` bug belongs to. **Exit
+  56** = every required expectation met; 60-73 name which one was not.
+  `build/x86-tests/ddraw-x86.c` (`./build-ddraw-test.sh`; kernel32 + user32 +
+  ddraw) creates `IDirectDraw7` with no window, checks `GetDeviceIdentifier` is
+  non-degenerate, `EnumDisplayModes` >= 6 with 640x480 present, and `GetCaps`;
+  then goes `EXCLUSIVE|FULLSCREEN` -> `SetDisplayMode(640,480,16)` -> flipping
+  primary + 1 back buffer -> `Blt` colour fill -> `Flip` -> `Lock`/`Unlock` on
+  the primary -> `RestoreDisplayMode`. **Exit 57**; 80-94 name the step. Run
+  both from the Custom popup as `C:\windows\syswow64\d3d9caps-x86.exe` and
+  `C:\windows\syswow64\ddraw-x86.exe`. App-side launch buttons are still owed
+  by the app track (`ContentView.swift`).
+  Built: `d3d9-emulated.dll` (i386) and `libdxmt_combined.a` via
+  `.xtool/build-dxmt.sh`; `ddraw.dll` + `wined3d.dll` (i386; 720 modules, 0
+  failures, 0 missing cross-imports) via `.xtool/build-wine-i386.sh`;
+  `ntdll-unix` + `win32u-unix` via `.xtool/build-wine-native.sh`. All clean.
+  **What to look for in the next log.** (1) `MADEIRA-D3D9CAPS: PASS` /
+  `status=56` and `MADEIRA-DDRAW: PASS` / `status=57`, and the same
+  `VendorId`/`DeviceId` pair printed by both. (2) In the ddraw run, the
+  pixel-format error must now be followed by `err:winediag: Disabling 3D
+  support` — the error appearing WITHOUT that line is the fallback not firing.
+  (3) For the 2008 title, `[vmode] synthesized EnumDisplayDevices adapter
+  idx=0 flags=...` should be followed by the title continuing rather than by
+  `bus_handler BUS #1 ... addr=<guestbase>+4`. If it still faults there, the
+  `[d3d9-last]` block from the vectored handler names what D3D9 was last asked
+  for; if that block's newest entries are far in the past, the null is not
+  D3D9's and the next suspect is the `wbemprox` `Win32_VideoController` answer
+  two calls earlier. (4) For the 2001 title, `[d3d9-caps]` will show whether it
+  probed anything at all before going to its intro movie; the question after
+  that is `[ios_audio] create_stream #1`, which has never appeared, and the
+  ~97 % spin in the `mmdevapi`-started thread.
+  A/B: `MADEIRA_D3D9_CENSUS=0` turns off the census, the ring and both
+  `[d3d9-last]` dumps together (they share `g_on`); `[d3d9-caps]` is
+  unconditional and self-capping.
+  **Two build stages were silently compiling stale sources, and both reported
+  success.** Found while verifying the above, and worth more than the fixes it
+  was blocking. `.xtool/build-fex.sh` and `.xtool/build-dxmt.sh` rsync their
+  tracked trees into the `git archive HEAD` workspace before building, and say
+  in a comment why. The other two stages did not:
+  - `.xtool/build-wine-i386.sh` built `$WORK/wine/`, the exported HEAD, so the
+    edits to `wine/dlls/wined3d/` above were invisible. The run said
+    `built: 720  failed: 0`, stripped and installed `wined3d.dll` and
+    `ddraw.dll` into `app/Madeira/i386-windows/` with fresh timestamps, and
+    reported `0 missing cross-imports`. Nothing distinguished it from a real
+    rebuild. It was caught only by grepping the installed DLL for a string the
+    change adds — `grep -ac "DXMT (Metal) 2D" wined3d.dll` returned 0 while
+    `grep -ac "WineD3D DirectDraw Emulation"` still returned 1.
+  - `.xtool/build-wine-native.sh` is worse, because
+    `prepare-native-scripts.py` copies each part's `build.sh` into the
+    workspace but NOT its sources, so `build/ntdll-unix/*.c` and
+    `build/win32u-unix/*.c` were compiled from the export. Both edits above
+    live in those directories. `.xtool/run-ml760-wine-native.sh` exists as a
+    one-file `cp` workaround for exactly this, which is the shape of a trap
+    that has been hit before.
+  Both now rsync the tracked tree first, with the same comment the other two
+  carry. `build-wine-i386.sh` syncs `wine/` without `--delete` (wine's
+  configure leaves generated files inside the source tree, and deleting
+  everything untracked would force a full reconfigure every run) and excludes
+  `build-*/` so the configured `build-i386` / `build-64` trees are not walked.
+  `build-wine-native.sh` syncs `build/{ntdll-unix,win32u-unix,wineserver}`
+  excluding `build.sh` (which `prepare-native-scripts.py` rewrites into the
+  workspace) and `obj/`. After the fix the strings are present
+  (`DXMT (Metal) 2D` and `Disabling 3D support: no OpenGL` both in the
+  installed `wined3d.dll`, the old description gone), and the workspace copies
+  of `sysparams_ios.c` and `signal_arm64_ios.c` carry the changes with
+  `libntdll_unix.a` / `libwin32u_unix.a` rebuilt from them.
+  The general lesson: a stage that builds out of the `git archive` workspace
+  cannot be trusted to have built what is in the working tree unless it syncs,
+  and "N built, 0 failed" is not evidence that it did. Verifying a change by
+  grepping the produced binary for a string only that change introduces is
+  cheap and is the only check here that would have caught it.
+
+- 2026-09-16 — The q68 spin, named: **`mmdevapi`'s MIDI notify thread, burning
+  a core because this port's audio driver answered `midi_notify_wait` with
+  "success" and wrote nothing.** Nothing to do with format negotiation, which
+  is where the entry-point log pointed and where the search started.
+  **The identification.** The profiler had already printed the answer and it
+  was read past: `[prof] threads: tid=002c"mmdevapi_midi_notify"=96.7%(jit
+  82%)`. That name is set by `SetThreadDescription` in
+  `wine/dlls/mmdevapi/main.c` `notify_thread`, and it is the second of the two
+  thread start addresses in the log: `717b15ca00` against base `717B150000` is
+  RVA `0xca00`, and `llvm-objdump -d` on the shipped `i386-windows/mmdevapi.dll`
+  labels `0x1000ca00 <_notify_thread@4>` (the other, `717b15b4a0` = RVA
+  `0xb4a0`, is `devenum.c`'s `_notif_thread_proc@4` — the device-change
+  listener, and harmless). The hot range is the 31 bytes at `0x1000ca4c`:
+  `push esi / push 0x23 / push handle / call __wine_unix_call` then
+  `cmpl $0, quit` / `cmpl $0, notify.send_notify`, and `jmp` back. `0x23` is
+  35, which is `midi_notify_wait` in `enum unix_funcs`. That is the whole loop.
+  **The cause.** `notify_thread` is `while (1) { MIDI_CALL( midi_notify_wait );
+  if (quit) break; ... }` with `quit` and `notify` as *uninitialised* locals —
+  the call is defined to BLOCK until a notification arrives or the driver is
+  released (`winecoreaudio.drv` and `winealsa.drv` both sit on a condition
+  variable in it) and to write `*quit` on every return.
+  `build/ntdll-unix/audio_null_ios.c` pointed all seven MIDI/aux slots of both
+  its tables at one `ios_midi_stub` that returned `STATUS_SUCCESS` and touched
+  nothing. That is not "no MIDI"; it is "success, and the answer is whatever
+  was already on the caller's stack". Here the stack happened to hold zeros, so
+  `quit` read false forever and the loop became a busy wait. Had it held
+  garbage instead, `notify.send_notify` would have been true and
+  `DriverCallback` would have jumped through an uninitialised function pointer
+  — the same bug with a crash instead of a spin. The thread is created from
+  `DriverProc`'s `DRV_LOAD`, which `winmm`'s `MMDRV_Install("mmdevapi", ...)`
+  sends when *anything* first touches `mmdevapi.dll`, so no program has to use
+  MIDI to pay for this.
+  **The fix, in two independent places, because either alone would have been
+  enough and the pair is what makes it not happen again.**
+  1. `wine/dlls/mmdevapi/main.c:354` — `notify_thread` now resets both outputs
+     before every call and defaults them to *stop*: `quit = TRUE`,
+     `notify.send_notify = FALSE`, and the loop also breaks if the unix call
+     itself fails. A backend that returns without filling them in now ends the
+     thread instead of spinning. `midMessage` / `modMessage` clear
+     `send_notify` before their calls for the same reason. Costs nothing when
+     the driver behaves: every real one assigns `*quit` on every return.
+  2. `build/ntdll-unix/audio_null_ios.c:1269-1375` — the one stub is replaced
+     by an entry point per slot, and both the 64-bit and the WoW64 table get
+     them (`*err` and `*quit` are 4-byte guest pointers for a 32-bit
+     `mmdevapi`, so the 64-bit entries would have written them at the wrong
+     offsets — `*quit` not landing where `notify_thread` reads it is precisely
+     this bug). `midi_init` reports `DRV_FAILURE`, which is how
+     `winecoreaudio.drv` says "this backend has no MIDI" and which makes
+     `DRV_LOAD` fail so the thread is never created at all; `midi_notify_wait`
+     answers `quit = TRUE`; `midi_in/out_message` and `aux_message` answer
+     `MMSYSERR_NOTSUPPORTED` with `send_notify` cleared. Losing MIDI and `aux`
+     through `winmm` is the truth being told for the first time — they never
+     worked. `waveOut` is untouched: `mmdevapi.spec` exports no `wodMessage`,
+     so `winmm`'s waveform path goes through the COM side, not `DriverProc`.
+  **Three more things the same file was getting wrong, found while reading it
+  against `winecoreaudio.drv`:**
+  - `is_format_supported` returned `S_OK` for *everything*, including formats
+    `create_stream` would then quietly drop to silent null-mode. It now
+    validates what the RemoteIO unit can actually be spelled for (packed PCM
+    or float32, 1-8 channels, 4-192 kHz, 8/16/24/32-bit, `nBlockAlign`
+    consistent with the container) and answers `S_FALSE` otherwise, which
+    `client.c` turns into a closest-match `GetMixFormat` for a shared-mode
+    caller and into `AUDCLNT_E_UNSUPPORTED_FORMAT` for an exclusive one.
+    `create_stream` refuses exactly the same set with
+    `AUDCLNT_E_UNSUPPORTED_FORMAT`, so the two answers agree — a caller told a
+    format is fine and then handed a stream that plays nothing has no way to
+    recover. The null-mode fallback stays for what it is actually for: the unit
+    failing to build (no audio session yet), where the format is fine and only
+    the environment is not.
+  - 8-bit PCM was marked `kAudioFormatFlagIsSignedInteger`. WAVE 8-bit is
+    *unsigned* and everything wider is signed; the flag inverted the sign bit
+    of every sample on the way to the hardware, which plays as full-scale buzz.
+    Only formats above 8 bits get the flag now.
+  - Every negotiation entry point now prints its ANSWER once per distinct
+    outcome — `[audio] is_format_supported fmt=tag1/2ch/44100Hz/16bit/align4
+    share=shared -> 0x00000000` — keyed on the format plus the HRESULT, with a
+    fixed 64-slot table so a per-period call cannot flood the log. The existing
+    `[ios_audio] <fn> #N` counters say how often an entry point was reached;
+    they never said what it replied, and a negotiation that ends in silence is
+    a sequence of replies.
+  **Test: `build/x86-tests/audio-x86.c` -> `audio-x86.exe`**, run from the
+  Custom path popup as `C:\windows\syswow64\audio-x86.exe`. One program, three
+  paths, because they share one unix driver and nothing else: (a) WASAPI
+  shared mode through `CoCreateInstance(MMDeviceEnumerator)` —
+  `GetMixFormat`, `IsFormatSupported` for 16-bit 44.1 kHz stereo and 16-bit
+  22 kHz mono, `GetDevicePeriod`, `Initialize`, `GetBufferSize`, 200 ms of
+  silence through `IAudioRenderClient`, `Start`, and `GetCurrentPadding` must
+  DRAIN (the one observable that separates a device consuming audio from one
+  merely accepting it), `Stop`; (b) `DirectSoundCreate8`, primary buffer,
+  200 ms secondary, `Play`, and the play cursor must move; (c) `waveOutOpen`
+  at 22 kHz mono 8-bit — the case the sign-flag bug above corrupts — one
+  prepared buffer, `waveOutWrite`, and the header must come back `WHDR_DONE`.
+  Exit 59 = all three inside a 5 s budget; 60/61/62 name the failing path;
+  63 = the budget expired. It is also the regression test for the spin without
+  calling MIDI at all: the notify thread is created when `mmdevapi.dll` first
+  initialises, which stage (a) does, so finishing inside the budget *is* the
+  proof that the thread is not spinning. Built with
+  `build/x86-tests/build-audio-test.sh`, which asserts the import set is
+  `ole32/dsound/winmm/user32/kernel32` — `mmdevapi` is reached through COM, the
+  way a real program reaches it, so the prefix's COM registration is part of
+  what the test covers.
+  Rebuilt: the i386 farm (`build-wine-i386.sh`, 720 built / 0 failed / 0
+  missing cross-imports) and `libntdll_unix.a` (`build/ntdll-unix/build.sh`,
+  31 succeeded / 0 failed). Verified in the produced binary rather than
+  assumed, per the stale-workspace lesson above: the rebuilt
+  `i386-windows/mmdevapi.dll` disassembles at `0x1000ca23` to
+  `movl $0x1, -0xc(%ebp)` / `movl $0x0, -0x2c(%ebp)` — `quit = TRUE` and
+  `send_notify = FALSE` — before the loop, and repeats both at `0x1000ca5c`
+  inside it.

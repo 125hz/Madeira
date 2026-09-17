@@ -457,6 +457,63 @@ static _Atomic uint32_t g_call_counter[NULL_AUDIO_FN_COUNT];
     } \
 } while (0)
 
+/* One line per DISTINCT outcome.  The per-function counters above say how
+ * often an entry point was reached; they say nothing about what it answered,
+ * and a negotiation that ends in a loop or in silence is a sequence of
+ * ANSWERS.  Printing every answer would drown the log (get_current_padding
+ * alone runs at the device period), so each caller derives a small key from
+ * the arguments and the HRESULT it is about to return, and the line is
+ * printed the first time that exact key is seen.  A fixed 64-slot table, no
+ * eviction: once it is full the port is answering more than 64 distinct ways
+ * and the log has already shown the interesting ones. */
+#define IOS_LOG_KEYS 64
+static _Atomic uint32_t g_log_keys[IOS_LOG_KEYS];
+static _Atomic uint32_t g_log_key_n;
+
+static int ios_outcome_is_new(uint32_t key)
+{
+    uint32_t n, i;
+    if (!key) key = 1;                    /* 0 marks an empty slot */
+    n = atomic_load_explicit(&g_log_key_n, memory_order_acquire);
+    for (i = 0; i < n && i < IOS_LOG_KEYS; i++)
+        if (atomic_load_explicit(&g_log_keys[i], memory_order_relaxed) == key) return 0;
+    n = atomic_fetch_add_explicit(&g_log_key_n, 1, memory_order_acq_rel);
+    if (n >= IOS_LOG_KEYS) return 0;
+    atomic_store_explicit(&g_log_keys[n], key, memory_order_release);
+    return 1;
+}
+
+/* Fold a WAVEFORMATEX and an HRESULT into one key.  Different formats and
+ * different answers for the same format both produce a new line; a repeat of
+ * either does not. */
+static uint32_t ios_fmt_key(const struct WAVEFORMATEX_stub *fmt, int share, HRESULT hr)
+{
+    uint32_t k = 0x9e3779b9u ^ (uint32_t)hr ^ ((uint32_t)share << 28);
+    if (fmt) {
+        k = k * 31u + fmt->wFormatTag;
+        k = k * 31u + fmt->nChannels;
+        k = k * 31u + fmt->nSamplesPerSec;
+        k = k * 31u + fmt->wBitsPerSample;
+        k = k * 31u + fmt->nBlockAlign;
+    }
+    return k;
+}
+
+static void ios_log_fmt(const char *what, const struct WAVEFORMATEX_stub *fmt,
+                        int share, HRESULT hr)
+{
+    if (!ios_outcome_is_new(ios_fmt_key(fmt, share, hr))) return;
+    if (!fmt) {
+        fprintf(stderr, "[audio] %s fmt=(null) share=%d -> 0x%08x\n",
+                what, share, (unsigned)hr);
+        return;
+    }
+    fprintf(stderr, "[audio] %s fmt=tag%u/%uch/%uHz/%ubit/align%u share=%s -> 0x%08x\n",
+            what, fmt->wFormatTag, fmt->nChannels, fmt->nSamplesPerSec,
+            fmt->wBitsPerSample, fmt->nBlockAlign,
+            share == 0 ? "shared" : "exclusive", (unsigned)hr);
+}
+
 static uint64_t mach_to_ns(uint64_t mach) {
     if (!g_timebase.denom) mach_timebase_info(&g_timebase);
     return mach * g_timebase.numer / g_timebase.denom;
@@ -516,6 +573,34 @@ static int ios_fmt_is_float(const struct WAVEFORMATEX_stub *fmt) {
     return 0;
 }
 
+/* Is this a PCM or float format this driver can actually open?  The RemoteIO
+ * unit is built from the client's own format in create_stream, so "supported"
+ * means "an AudioStreamBasicDescription can be spelled for it": packed linear
+ * PCM, one to eight channels, a sane rate, and a block alignment that matches
+ * the container size.  Anything else gets the closest-match treatment rather
+ * than a lie -- mmdevapi's client.c turns S_FALSE into GetMixFormat() for a
+ * shared-mode caller and into AUDCLNT_E_UNSUPPORTED_FORMAT for an exclusive
+ * one, which is exactly the WASAPI contract. */
+static int ios_fmt_openable(const struct WAVEFORMATEX_stub *fmt)
+{
+    UINT32 container;
+
+    if (!fmt) return 0;
+    /* 1 = WAVE_FORMAT_PCM, 3 = IEEE_FLOAT, 0xFFFE = EXTENSIBLE */
+    if (fmt->wFormatTag != 1 && fmt->wFormatTag != 3 && fmt->wFormatTag != 0xFFFE)
+        return 0;
+    if (fmt->nChannels < 1 || fmt->nChannels > 8) return 0;
+    if (fmt->nSamplesPerSec < 4000 || fmt->nSamplesPerSec > 192000) return 0;
+    if (fmt->wBitsPerSample != 8 && fmt->wBitsPerSample != 16 &&
+        fmt->wBitsPerSample != 24 && fmt->wBitsPerSample != 32) return 0;
+    if (ios_fmt_is_float(fmt) && fmt->wBitsPerSample != 32) return 0;
+    if (!fmt->nBlockAlign) return 0;
+    container = fmt->nBlockAlign / fmt->nChannels;
+    if (container * fmt->nChannels != fmt->nBlockAlign) return 0;
+    if (container * 8 != fmt->wBitsPerSample) return 0;
+    return 1;
+}
+
 /* Build the RemoteIO unit for the negotiated stream format. Returns 0 on
  * success; any failure leaves s->au NULL (null-mode fallback). */
 static int ios_audio_setup_unit(struct ios_stream *s, const struct WAVEFORMATEX_stub *fmt) {
@@ -537,13 +622,19 @@ static int ios_audio_setup_unit(struct ios_stream *s, const struct WAVEFORMATEX_
 
     asbd.mSampleRate = s->sample_rate;
     asbd.mFormatID = kAudioFormatLinearPCM;
-    asbd.mFormatFlags = kAudioFormatFlagIsPacked |
-        (ios_fmt_is_float(fmt) ? kAudioFormatFlagIsFloat : kAudioFormatFlagIsSignedInteger);
     asbd.mBytesPerPacket = s->frame_bytes;
     asbd.mFramesPerPacket = 1;
     asbd.mBytesPerFrame = s->frame_bytes;
     asbd.mChannelsPerFrame = s->channels;
     asbd.mBitsPerChannel = (s->frame_bytes / s->channels) * 8;
+    /* WAVE 8-bit PCM is UNSIGNED and everything wider is signed -- that is the
+     * format's rule, not a choice.  Marking an 8-bit stream signed inverts its
+     * sign bit on the way to the hardware, which plays as full-scale buzz
+     * rather than as the sample the game wrote; plenty of older titles still
+     * open waveOut at 8 bits. */
+    asbd.mFormatFlags = kAudioFormatFlagIsPacked |
+        (ios_fmt_is_float(fmt) ? kAudioFormatFlagIsFloat
+         : (asbd.mBitsPerChannel > 8 ? kAudioFormatFlagIsSignedInteger : 0));
 
     err = AudioUnitSetProperty(s->au, kAudioUnitProperty_StreamFormat,
                                kAudioUnitScope_Input, 0, &asbd, sizeof(asbd));
@@ -737,9 +828,29 @@ static NTSTATUS ios_create_stream(void *args) {
     LOG_FN_CALL(4, "create_stream");
     struct create_stream_params *p = args;
     uint64_t dur_frames;
+    struct ios_stream *s;
+
+    /* Refuse exactly what is_format_supported refuses, and nothing more.  The
+     * two answers have to agree: a caller that was told a format is fine and
+     * then gets a stream which silently plays nothing has no way to recover,
+     * whereas AUDCLNT_E_UNSUPPORTED_FORMAT sends it back to GetMixFormat.
+     * This is NOT the null-mode fallback below -- that one is for the unit
+     * failing to build (no audio session yet, device busy), where the format
+     * is fine and only the environment is not, and where silent-but-ticking
+     * keeps a game's timing alive. */
+    if (!ios_fmt_openable(p->fmt)) {
+        p->result = (HRESULT)0x88890008L; /* AUDCLNT_E_UNSUPPORTED_FORMAT */
+        ios_log_fmt("create_stream", p->fmt, p->share, p->result);
+        return STATUS_SUCCESS;
+    }
+
     /* ml739: a stream per client. */
-    struct ios_stream *s = calloc(1, sizeof(*s));
-    if (!s) { p->result = E_OUTOFMEMORY; return STATUS_SUCCESS; }
+    s = calloc(1, sizeof(*s));
+    if (!s) {
+        p->result = E_OUTOFMEMORY;
+        ios_log_fmt("create_stream", p->fmt, p->share, p->result);
+        return STATUS_SUCCESS;
+    }
     s->valid = 1;
     s->started = 0;
     s->start_mach = 0;
@@ -780,9 +891,11 @@ static NTSTATUS ios_create_stream(void *args) {
         /* the handle was published above; it now points at freed memory */
         if (p->stream) *p->stream = 0;
         p->result = E_OUTOFMEMORY;
+        ios_log_fmt("create_stream", p->fmt, p->share, p->result);
         return STATUS_SUCCESS;
     }
     p->result = S_OK;
+    ios_log_fmt("create_stream", p->fmt, p->share, p->result);
     return STATUS_SUCCESS;
 }
 
@@ -968,8 +1081,12 @@ static NTSTATUS ios_release_capture_buffer(void *args) {
 static NTSTATUS ios_is_format_supported(void *args) {
     struct is_format_supported_params *p = args;
     LOG_FN_CALL(14, "is_format_supported");
-    /* Accept anything. */
-    p->result = S_OK;
+    /* Shared mode resamples nothing here -- the unit is opened at the client's
+     * own rate -- so every openable format is supported outright.  This used
+     * to answer S_OK unconditionally, which promised formats create_stream
+     * would then quietly drop to silent null-mode. */
+    p->result = ios_fmt_openable(p->fmt_in) ? S_OK : S_FALSE;
+    ios_log_fmt("is_format_supported", p->fmt_in, p->share, p->result);
     return STATUS_SUCCESS;
 }
 
@@ -1012,6 +1129,7 @@ static NTSTATUS ios_get_mix_format(void *args) {
         memcpy((char *)p->fmt + 24, pcm_guid, 16);
     }
     p->result = S_OK;
+    ios_log_fmt("get_mix_format", p->fmt, 0, p->result);
     return STATUS_SUCCESS;
 }
 
@@ -1020,6 +1138,9 @@ static NTSTATUS ios_get_device_period(void *args) {
     if (p->def_period) *p->def_period = 100000; /* 10 ms in 100ns units */
     if (p->min_period) *p->min_period = 50000;  /* 5 ms */
     p->result = S_OK;
+    if (ios_outcome_is_new(0x6ea10d00u ^ (uint32_t)p->flow))
+        fprintf(stderr, "[audio] get_device_period flow=%d -> def=10ms min=5ms 0x%08x\n",
+                p->flow, (unsigned)p->result);
     return STATUS_SUCCESS;
 }
 
@@ -1145,8 +1266,110 @@ static NTSTATUS ios_get_prop_value(void *args) {
     return STATUS_SUCCESS;
 }
 
+/* ---------------------------- MIDI and aux ----------------------------
+ *
+ * There is no MIDI backend on this port.  Saying so was NOT what this file
+ * used to do: every one of the seven MIDI/aux slots pointed at one stub that
+ * returned STATUS_SUCCESS and wrote nothing at all, which is not "no MIDI",
+ * it is "success, and the answer is whatever was already on the caller's
+ * stack".  That cost a whole core.
+ *
+ * mmdevapi's DriverProc (wine/dlls/mmdevapi/main.c, DRV_LOAD) starts a
+ * notify_thread whenever midi_init leaves its *err at DRV_SUCCESS, and that
+ * thread is `while (1) { midi_notify_wait; if (quit) break; ... }`.
+ * midi_notify_wait is defined to BLOCK until a notification arrives or the
+ * driver is released -- winecoreaudio.drv and winealsa.drv both sit on a
+ * condition variable in it.  A stub that returns instantly without setting
+ * *quit turns that loop into a spin: in the reference trace the thread
+ * "mmdevapi_midi_notify" held 96.7 % of a core for the whole session inside
+ * the 31-byte guest loop at mmdevapi.dll+0xca4c, with the movie it was meant
+ * to be playing stalled behind it.
+ *
+ * So each entry point now answers for itself:
+ *   midi_init        -> DRV_FAILURE, so DRV_LOAD fails and the thread is
+ *                       never created (winmm then reports no MIDI devices,
+ *                       which is the truth; waveOut does not come through
+ *                       here -- mmdevapi exports no wodMessage).
+ *   midi_notify_wait -> quit = TRUE, so even a thread that does exist leaves
+ *                       its loop on the first turn instead of spinning.
+ *   mid/mod/aux msg  -> MMSYSERR_NOTSUPPORTED and send_notify = FALSE.
+ */
+#define IOS_DRV_FAILURE           0   /* mmsystem.h DRV_FAILURE */
+#define IOS_MMSYSERR_NOTSUPPORTED 8   /* mmsystem.h MMSYSERR_NOTSUPPORTED */
+
+struct ios_midi_init_params { UINT *err; };
+struct ios_midi_notify_wait_params { BOOL *quit; void *notify; };
+struct ios_midi_message_params {
+    UINT dev_id;
+    UINT msg;
+    UINT_PTR user;
+    UINT_PTR param_1;
+    UINT_PTR param_2;
+    UINT *err;
+    void *notify;
+};
+struct ios_aux_message_params {
+    UINT dev_id;
+    UINT msg;
+    UINT_PTR user;
+    UINT_PTR param_1;
+    UINT_PTR param_2;
+    UINT *err;
+};
+
+/* notify_context's first field is `BOOL send_notify` at offset 0 in both the
+ * 64-bit and the 32-bit layout, so clearing it needs no other knowledge of
+ * the struct and the same helper serves both tables. */
+static void ios_midi_clear_notify(void *notify)
+{
+    if (notify) *(BOOL *)notify = 0;
+}
+
 static NTSTATUS ios_midi_stub(void *args) {
+    /* midi_get_driver and midi_release: nothing to report, nothing to free. */
     (void)args;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ios_midi_init(void *args) {
+    struct ios_midi_init_params *p = args;
+    if (p && p->err) *p->err = IOS_DRV_FAILURE;
+    if (ios_outcome_is_new(0x3d1d1000u))
+        fprintf(stderr, "[audio] midi_init -> DRV_FAILURE (no MIDI backend on this "
+                        "port; mmdevapi will not start its notify thread)\n");
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ios_midi_notify_wait(void *args) {
+    struct ios_midi_notify_wait_params *p = args;
+    if (p) {
+        if (p->quit) *p->quit = 1;
+        ios_midi_clear_notify(p->notify);
+    }
+    if (ios_outcome_is_new(0x3d1d2000u))
+        fprintf(stderr, "[audio] midi_notify_wait -> quit=TRUE (there is nothing to "
+                        "wait for; returning without this is a busy loop)\n");
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ios_midi_message(void *args) {
+    struct ios_midi_message_params *p = args;
+    if (p) {
+        if (p->err) *p->err = IOS_MMSYSERR_NOTSUPPORTED;
+        ios_midi_clear_notify(p->notify);
+    }
+    if (ios_outcome_is_new(0x3d1d3000u ^ (p ? p->msg : 0)))
+        fprintf(stderr, "[audio] midi message msg=%u -> MMSYSERR_NOTSUPPORTED\n",
+                p ? p->msg : 0);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ios_aux_message(void *args) {
+    struct ios_aux_message_params *p = args;
+    if (p && p->err) *p->err = IOS_MMSYSERR_NOTSUPPORTED;
+    if (ios_outcome_is_new(0x3d1d4000u ^ (p ? p->msg : 0)))
+        fprintf(stderr, "[audio] aux message msg=%u -> MMSYSERR_NOTSUPPORTED\n",
+                p ? p->msg : 0);
     return STATUS_SUCCESS;
 }
 
@@ -1184,12 +1407,12 @@ const void *audio_null_ios_unix_call_funcs[] = {
     ios_is_started,                    /* is_started */
     ios_get_prop_value,                /* get_prop_value */
     ios_midi_stub,                     /* midi_get_driver */
-    ios_midi_stub,                     /* midi_init */
-    ios_midi_stub,                     /* midi_release */
-    ios_midi_stub,                     /* midi_out_message */
-    ios_midi_stub,                     /* midi_in_message */
-    ios_midi_stub,                     /* midi_notify_wait */
-    ios_midi_stub,                     /* aux_message */
+    ios_midi_init,                     /* midi_init */
+    ios_midi_stub,                     /* midi_release   (args == NULL) */
+    ios_midi_message,                  /* midi_out_message */
+    ios_midi_message,                  /* midi_in_message */
+    ios_midi_notify_wait,              /* midi_notify_wait */
+    ios_aux_message,                   /* aux_message */
 };
 
 /* ================= MADEIRA: the 32-bit (WoW64) table =================
@@ -1640,6 +1863,73 @@ static NTSTATUS ios_wow64_get_prop_value(void *args)
     return status;
 }
 
+/* The MIDI/aux blocks carry pointers too, and a 32-bit mmdevapi builds them
+ * with 4-byte UINT_PTRs, so the 64-bit entries above would write *err and
+ * *quit at the wrong offsets -- and *quit not landing where notify_thread
+ * reads it is precisely the spin this file is fixing. */
+static NTSTATUS ios_wow64_midi_init(void *args)
+{
+    struct { PTR32 err; } *params32 = args;
+    struct ios_midi_init_params params = {
+        .err = ios_wow_host_ptr(params32->err),
+    };
+    return ios_midi_init(&params);
+}
+
+static NTSTATUS ios_wow64_midi_notify_wait(void *args)
+{
+    struct { PTR32 quit; PTR32 notify; } *params32 = args;
+    struct ios_midi_notify_wait_params params = {
+        .quit = ios_wow_host_ptr(params32->quit),
+        .notify = ios_wow_host_ptr(params32->notify),
+    };
+    return ios_midi_notify_wait(&params);
+}
+
+static NTSTATUS ios_wow64_midi_message(void *args)
+{
+    struct {
+        UINT dev_id;
+        UINT msg;
+        PTR32 user;
+        PTR32 param_1;
+        PTR32 param_2;
+        PTR32 err;
+        PTR32 notify;
+    } *params32 = args;
+    struct ios_midi_message_params params = {
+        .dev_id = params32->dev_id,
+        .msg = params32->msg,
+        .user = params32->user,
+        .param_1 = params32->param_1,
+        .param_2 = params32->param_2,
+        .err = ios_wow_host_ptr(params32->err),
+        .notify = ios_wow_host_ptr(params32->notify),
+    };
+    return ios_midi_message(&params);
+}
+
+static NTSTATUS ios_wow64_aux_message(void *args)
+{
+    struct {
+        UINT dev_id;
+        UINT msg;
+        PTR32 user;
+        PTR32 param_1;
+        PTR32 param_2;
+        PTR32 err;
+    } *params32 = args;
+    struct ios_aux_message_params params = {
+        .dev_id = params32->dev_id,
+        .msg = params32->msg,
+        .user = params32->user,
+        .param_1 = params32->param_1,
+        .param_2 = params32->param_2,
+        .err = ios_wow_host_ptr(params32->err),
+    };
+    return ios_aux_message(&params);
+}
+
 /* Table indexed by enum unix_funcs, same 37 slots and same order as
  * audio_null_ios_unix_call_funcs above.  Entries shared with the 64-bit table
  * either ignore `args` entirely or have a struct whose 32-bit and 64-bit
@@ -1677,10 +1967,10 @@ const void *audio_null_ios_unix_call_wow64_funcs[] = {
     ios_is_started,                    /* is_started      { stream, result } */
     ios_wow64_get_prop_value,          /* get_prop_value */
     ios_midi_stub,                     /* midi_get_driver (ignores args) */
-    ios_midi_stub,                     /* midi_init */
-    ios_midi_stub,                     /* midi_release */
-    ios_midi_stub,                     /* midi_out_message */
-    ios_midi_stub,                     /* midi_in_message */
-    ios_midi_stub,                     /* midi_notify_wait */
-    ios_midi_stub,                     /* aux_message */
+    ios_wow64_midi_init,               /* midi_init */
+    ios_midi_stub,                     /* midi_release    (args == NULL) */
+    ios_wow64_midi_message,            /* midi_out_message */
+    ios_wow64_midi_message,            /* midi_in_message */
+    ios_wow64_midi_notify_wait,        /* midi_notify_wait */
+    ios_wow64_aux_message,             /* aux_message */
 };

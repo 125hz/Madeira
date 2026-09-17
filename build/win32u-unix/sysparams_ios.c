@@ -4316,15 +4316,78 @@ NTSTATUS WINAPI NtUserEnumDisplayDevices( UNICODE_STRING *device, DWORD index,
             else
                 info->StateFlags = DISPLAY_DEVICE_ATTACHED | DISPLAY_DEVICE_ACTIVE;
         }
+        /* DeviceID and DeviceKey used to be returned as EMPTY strings here,
+         * and an empty DeviceID is not a harmless omission: it is the field a
+         * title reads to find out WHICH GPU it is running on. The idiom that
+         * does it is
+         *
+         *     p = strstr( dd.DeviceID, "VEN_" );   // NULL on ""
+         *     vendor = strtoul( p + 4, NULL, 16 ); // reads byte at 0 + 4
+         *
+         * with no NULL check, because on Windows the string is never empty.
+         * That is a byte read of address 4, which is exactly the fault a
+         * 2008-era title took here immediately after this call returned. The
+         * empty DeviceKey has the same shape for the titles that go to the
+         * registry instead.
+         *
+         * So both are filled in, in the format the non-virtual path above
+         * produces, and the PCI ids are the SAME identity the rest of the
+         * port reports for this adapter: 0x106B / 0x0001, matching
+         * MTLD3D9Interface::GetAdapterIdentifier in
+         * research/dxmt/src/d3d9/d3d9_interface.cpp and the no3d adapter in
+         * wine/dlls/wined3d/directx.c. A title that cross-checks D3D9,
+         * DirectDraw and EnumDisplayDevices now sees one GPU rather than
+         * three, which is the case the vendor-table code paths were written
+         * for. */
         if (info->cb >= offsetof(DISPLAY_DEVICEW, DeviceID) + sizeof(info->DeviceID))
-            *info->DeviceID = 0;
+        {
+            if (is_adapter)
+            {
+                /* EDD_GET_DEVICE_INTERFACE_NAME has no meaning for an
+                 * adapter: it asks for a device INTERFACE path, and an
+                 * adapter is not an interface. Wine returns an empty string
+                 * for that combination and so does Windows. */
+                if (flags & EDD_GET_DEVICE_INTERFACE_NAME)
+                    *info->DeviceID = 0;
+                else
+                    asciiz_to_unicode( info->DeviceID,
+                                       "PCI\\VEN_106B&DEV_0001&SUBSYS_00000000&REV_00" );
+            }
+            else if (flags & EDD_GET_DEVICE_INTERFACE_NAME)
+            {
+                char buffer[MAX_PATH];
+                snprintf( buffer, sizeof(buffer), "\\\\?\\DISPLAY#Default_Monitor#4&madeira&0&UID0#%s",
+                          guid_devinterface_monitorA );
+                asciiz_to_unicode( info->DeviceID, buffer );
+            }
+            else
+            {
+                char buffer[MAX_PATH];
+                snprintf( buffer, sizeof(buffer), "MONITOR\\Default_Monitor\\%s\\0000",
+                          guid_devclass_monitorA );
+                asciiz_to_unicode( info->DeviceID, buffer );
+            }
+        }
         if (info->cb >= offsetof(DISPLAY_DEVICEW, DeviceKey) + sizeof(info->DeviceKey))
-            *info->DeviceKey = 0;
+        {
+            char buffer[MAX_PATH];
+            /* The adapter's video GUID is fixed rather than generated: the
+             * virtual monitor is one device that never changes across runs,
+             * and a stable key is what a title caching the string between
+             * sessions expects. */
+            if (is_adapter)
+                snprintf( buffer, sizeof(buffer), "%s\\Video\\%s\\0000", control_keyA,
+                          "{8C0C2A5B-0E7E-4B0E-9E3F-1D0A6B5C4D21}" );
+            else
+                snprintf( buffer, sizeof(buffer), "%s\\Class\\%s\\0000", control_keyA,
+                          guid_devclass_monitorA );
+            asciiz_to_unicode( info->DeviceKey, buffer );
+        }
         {
             static int logged;
             if (logged++ < 4)
-                dprintf(2, "[vmode] synthesized EnumDisplayDevices %s idx=%u\n",
-                        is_adapter ? "adapter" : "monitor", index);
+                dprintf(2, "[vmode] synthesized EnumDisplayDevices %s idx=%u flags=%#x\n",
+                        is_adapter ? "adapter" : "monitor", index, (unsigned)flags );
         }
         return STATUS_SUCCESS;
     }

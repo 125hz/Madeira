@@ -1026,16 +1026,84 @@ static void *wine_process_thread(void *arg) {
              * redirect every comctl32.dll load for that assembly into a
              * directory that has none — strictly worse than no manifest. So an
              * architecture whose farm has no comctl32_v6.dll is skipped, loudly.
+             *
+             * ------------------------------------------------------------------
+             * ml760: THE SAME GAP, FOR THE VISUAL C++ RUNTIMES.
+             *
+             * DEVICE EVIDENCE, a 32-bit title in the last log:
+             *   err:actctx:parse_depend_manifests Could not find dependent
+             *       assembly "Microsoft.VC80.CRT" (8.0.50727.762)
+             * This one is NOT cosmetic. A program built with Visual Studio 2005
+             * or 2008 carries its CRT as a side-by-side dependency in its own
+             * RT_MANIFEST and imports MSVCR80.dll/MSVCP80.dll by name. With no
+             * VC80.CRT assembly in the store the activation context fails, the
+             * loader falls back to a plain system32 search, and — crucially —
+             * every DLL the program loads later that has the SAME dependency
+             * gets the same failure. Wine ships the runtimes and the assembly
+             * manifests; it is only the store that was never built here.
+             *
+             * Wine's assembly manifests are the ten WINE_MANIFEST resources in
+             * the tree (grep -rn WINE_MANIFEST wine/dlls --include=*.rc):
+             *   comctl32_v6  Microsoft.Windows.Common-Controls 6.0.2600.2982
+             *   msvcr80      Microsoft.VC80.CRT   8.0.50727.9672
+             *                 (msvcr80.dll, msvcp80.dll, msvcm80.dll)
+             *   msvcr90      Microsoft.VC90.CRT   9.0.30729.6161
+             *                 (msvcr90.dll, msvcp90.dll, msvcm90.dll)
+             *   atl80        Microsoft.VC80.ATL   8.0.50727.4053
+             *   atl90        Microsoft.VC90.ATL   9.0.30729.6161
+             *   gdiplus      Microsoft.Windows.GdiPlus 1.0.6000.16386
+             *                 and 1.1.7601.23038 (WINE_MANIFEST11, same DLL)
+             *   msxml3       Microsoft-Windows-MSXML30 6.0.6000.16386
+             *   msxml4       Microsoft.MSXML2          4.1.0.0
+             *   msxml6       Microsoft-Windows-MSXML60 6.0.6000.16386
+             *
+             * A REQUEST FOR AN OLDER BUILD STILL MATCHES. actctx.c
+             * build_manifest_filter only pins major.minor —
+             *   <arch>_<name>_<key>_<major>.<minor>.*.*_*_*.manifest
+             * — and lookup_manifest_file then accepts any candidate whose
+             * build/revision is >= the requested one. So the 8.0.50727.762 the
+             * title asked for is served by the 8.0.50727.9672 Wine ships, and
+             * one seeded assembly per major.minor covers every service pack of
+             * it. That is why these are worth seeding blind: the version a
+             * given program asks for cannot be enumerated in advance, and it
+             * does not have to be.
+             *
+             * NOT SEEDED, and why:
+             *   Microsoft.VC100.* / VC110+ — VS2010 stopped deploying the CRT
+             *     side-by-side; msvcr100 and later install into system32 and
+             *     Wine ships no manifest for them. Nothing to seed.
+             *   Microsoft.VC80.MFC / VC90.MFC — Wine has no mfc* module at all
+             *     (there is no wine/dlls/mfc*), so the assembly would point at
+             *     a DLL that does not exist. See the farm audit.
              */
             {
-                /* dlls/comctl32_v6/comctl32.manifest verbatim, with the one
-                 * substitution fakedll.c makes. LF only, no BOM: actctx.c
-                 * assumes UTF-8 when there is no UTF-16 BOM. */
-                static const char *manifest_tmpl =
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
-                    "<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\n"
-                    "  <assemblyIdentity type=\"win32\" name=\"Microsoft.Windows.Common-Controls\" version=\"6.0.2600.2982\" processorArchitecture=\"@ARCH@\" publicKeyToken=\"6595b64144ccf1df\"/>\n"
-                    "  <file name=\"comctl32.dll\">\n"
+                /* One entry per WINE_MANIFEST assembly in the Wine tree.
+                 *
+                 *   name     assemblyIdentity name, verbatim (it is written
+                 *            into the manifest and actctx.c compares it
+                 *            case-insensitively against the parsed file name)
+                 *   lname    the same, lower-cased: fakedll.c append_string()
+                 *            lower-cases arch/name/language when it builds the
+                 *            directory name, but copies publicKeyToken and
+                 *            version through verbatim
+                 *   files    <file name="..."> entries, in manifest order, each
+                 *            paired with the farm file it is linked from. The
+                 *            FIRST one is the assembly's reason to exist: if it
+                 *            is missing from a farm the whole assembly is
+                 *            skipped for that architecture. A later one that is
+                 *            missing is dropped from BOTH the directory and the
+                 *            manifest text, so the manifest never advertises a
+                 *            file that is not there.
+                 *   body     extra XML inside <file>…</file>; NULL means the
+                 *            self-closing <file name="x"/> form Wine uses for
+                 *            everything except comctl32.
+                 */
+                struct sxs_file { const char *in_assembly; const char *in_farm; };
+                struct sxs_assembly {
+                    const char *name, *lname, *key, *version, *body;
+                    struct sxs_file files[4];
+                };
+                static const char *comctl32_body =
                     "    <windowClass>Button</windowClass>\n"
                     "    <windowClass>ButtonListBox</windowClass>\n"
                     "    <windowClass>ComboBoxEx32</windowClass>\n"
@@ -1063,9 +1131,51 @@ static void *wine_process_thread(void *arg) {
                     "    <windowClass>msctls_statusbar32</windowClass>\n"
                     "    <windowClass>msctls_trackbar32</windowClass>\n"
                     "    <windowClass>msctls_updown32</windowClass>\n"
-                    "    <windowClass>tooltips_class32</windowClass>\n"
-                    "  </file>\n"
-                    "</assembly>\n";
+                    "    <windowClass>tooltips_class32</windowClass>\n";
+                static const struct sxs_assembly asms[] = {
+                    /* dlls/comctl32_v6/comctl32.manifest */
+                    { "Microsoft.Windows.Common-Controls", "microsoft.windows.common-controls",
+                      "6595b64144ccf1df", "6.0.2600.2982", NULL /*set below*/,
+                      { { "comctl32.dll", "comctl32_v6.dll" } } },
+                    /* dlls/msvcr80/msvcr80.manifest */
+                    { "Microsoft.VC80.CRT", "microsoft.vc80.crt",
+                      "1fc8b3b9a1e18e3b", "8.0.50727.9672", NULL,
+                      { { "msvcr80.dll", "msvcr80.dll" },
+                        { "msvcp80.dll", "msvcp80.dll" },
+                        { "msvcm80.dll", "msvcm80.dll" } } },
+                    /* dlls/msvcr90/msvcr90.manifest */
+                    { "Microsoft.VC90.CRT", "microsoft.vc90.crt",
+                      "1fc8b3b9a1e18e3b", "9.0.30729.6161", NULL,
+                      { { "msvcr90.dll", "msvcr90.dll" },
+                        { "msvcp90.dll", "msvcp90.dll" },
+                        { "msvcm90.dll", "msvcm90.dll" } } },
+                    /* dlls/atl80/atl80.manifest */
+                    { "Microsoft.VC80.ATL", "microsoft.vc80.atl",
+                      "1fc8b3b9a1e18e3b", "8.0.50727.4053", NULL,
+                      { { "atl80.dll", "atl80.dll" } } },
+                    /* dlls/atl90/atl90.manifest */
+                    { "Microsoft.VC90.ATL", "microsoft.vc90.atl",
+                      "1fc8b3b9a1e18e3b", "9.0.30729.6161", NULL,
+                      { { "atl90.dll", "atl90.dll" } } },
+                    /* dlls/gdiplus/gdiplus.manifest and gdiplus11.manifest:
+                     * two assemblies, one DLL. */
+                    { "Microsoft.Windows.GdiPlus", "microsoft.windows.gdiplus",
+                      "6595b64144ccf1df", "1.0.6000.16386", NULL,
+                      { { "gdiplus.dll", "gdiplus.dll" } } },
+                    { "Microsoft.Windows.GdiPlus", "microsoft.windows.gdiplus",
+                      "6595b64144ccf1df", "1.1.7601.23038", NULL,
+                      { { "gdiplus.dll", "gdiplus.dll" } } },
+                    /* dlls/msxml3, msxml4 and msxml6 manifests */
+                    { "Microsoft-Windows-MSXML30", "microsoft-windows-msxml30",
+                      "31bf3856ad364e35", "6.0.6000.16386", NULL,
+                      { { "msxml3.dll", "msxml3.dll" } } },
+                    { "Microsoft.MSXML2", "microsoft.msxml2",
+                      "6bd6b9abf345378f", "4.1.0.0", NULL,
+                      { { "msxml4.dll", "msxml4.dll" } } },
+                    { "Microsoft-Windows-MSXML60", "microsoft-windows-msxml60",
+                      "31bf3856ad364e35", "6.0.6000.16386", NULL,
+                      { { "msxml6.dll", "msxml6.dll" } } },
+                };
                 static const struct { const char *arch; const char *farm; } sxs[] = {
                     { "x86",   "i386-windows"    },   /* every 32-bit process */
                     { "arm64", "aarch64-windows" },   /* aarch64 AND arm64ec sessions */
@@ -1073,57 +1183,99 @@ static void *wine_process_thread(void *arg) {
                 };
                 NSString *winsxsDir = [prefix stringByAppendingPathComponent:@"drive_c/windows/winsxs"];
                 NSString *manifestsDir = [winsxsDir stringByAppendingPathComponent:@"manifests"];
-                int sxsSeeded = 0;
+                int sxsSeeded = 0, sxsSkipped = 0;
+                size_t sxsWanted = (sizeof(asms) / sizeof(asms[0])) * (sizeof(sxs) / sizeof(sxs[0]));
 
                 [fm createDirectoryAtPath:manifestsDir withIntermediateDirectories:YES
                                attributes:nil error:nil];
                 for (size_t s = 0; s < sizeof(sxs) / sizeof(sxs[0]); s++) {
+                    NSString *arch = [NSString stringWithUTF8String:sxs[s].arch];
                     NSString *archSource = [bundlePath stringByAppendingPathComponent:
                         [NSString stringWithUTF8String:sxs[s].farm]];
-                    NSString *dll = [archSource stringByAppendingPathComponent:@"comctl32_v6.dll"];
-                    if (![fm fileExistsAtPath:dll]) {
-                        dprintf(STDERR_FILENO,
-                                "[WineProc] winsxs: %s SKIPPED -- %s has no comctl32_v6.dll, and a "
-                                "manifest without the assembly's DLL would redirect comctl32 loads "
-                                "into an empty directory (build it with .xtool/build-wine-64.sh / "
-                                "build-wine-i386.sh)\n", sxs[s].arch, sxs[s].farm);
-                        continue;
-                    }
-                    NSString *dir = [NSString stringWithFormat:
-                        @"%s_microsoft.windows.common-controls_6595b64144ccf1df_"
-                        @"6.0.2600.2982_none_deadbeef", sxs[s].arch];
-                    NSString *asmDir = [winsxsDir stringByAppendingPathComponent:dir];
-                    NSString *manifest = [manifestsDir stringByAppendingPathComponent:
-                        [dir stringByAppendingString:@".manifest"]];
-                    /* one substitution, not a format string: fakedll.c splices
-                     * the architecture into the source manifest's empty
-                     * processorArchitecture="", and this is that splice. */
-                    NSString *text = [[NSString stringWithUTF8String:manifest_tmpl]
-                        stringByReplacingOccurrencesOfString:@"@ARCH@"
-                                                  withString:[NSString stringWithUTF8String:sxs[s].arch]];
-                    NSString *link = [asmDir stringByAppendingPathComponent:@"comctl32.dll"];
+                    for (size_t a = 0; a < sizeof(asms) / sizeof(asms[0]); a++) {
+                        const struct sxs_assembly *asmdef = &asms[a];
+                        const char *body = asmdef->body;
+                        /* the comctl32 window-class list, attached by index so
+                         * the table itself stays a plain initialiser */
+                        if (a == 0) body = comctl32_body;
 
-                    [fm createDirectoryAtPath:asmDir withIntermediateDirectories:YES
-                                   attributes:nil error:nil];
-                    if (![[text dataUsingEncoding:NSUTF8StringEncoding]
-                            writeToFile:manifest atomically:YES]) {
-                        dprintf(STDERR_FILENO, "[WineProc] winsxs: FAILED to write %s\n",
-                                manifest.UTF8String);
-                        continue;
+                        NSString *first = [archSource stringByAppendingPathComponent:
+                            [NSString stringWithUTF8String:asmdef->files[0].in_farm]];
+                        if (![fm fileExistsAtPath:first]) {
+                            dprintf(STDERR_FILENO,
+                                    "[WineProc] winsxs: %s/%s SKIPPED -- %s has no %s, and a manifest "
+                                    "without the assembly's DLL would redirect that DLL's loads into "
+                                    "an empty directory (build it with .xtool/build-wine-i386.sh / "
+                                    "build-wine-64.sh)\n",
+                                    sxs[s].arch, asmdef->name, sxs[s].farm, asmdef->files[0].in_farm);
+                            sxsSkipped++;
+                            continue;
+                        }
+                        NSString *dir = [NSString stringWithFormat:@"%@_%s_%s_%s_none_deadbeef",
+                            arch, asmdef->lname, asmdef->key, asmdef->version];
+                        NSString *asmDir = [winsxsDir stringByAppendingPathComponent:dir];
+                        NSString *manifest = [manifestsDir stringByAppendingPathComponent:
+                            [dir stringByAppendingString:@".manifest"]];
+
+                        [fm createDirectoryAtPath:asmDir withIntermediateDirectories:YES
+                                       attributes:nil error:nil];
+
+                        /* Build the manifest and the directory together, so the
+                         * <file> list and the directory contents cannot drift.
+                         * LF only, no BOM: actctx.c assumes UTF-8 when there is
+                         * no UTF-16 BOM. The architecture is spliced into the
+                         * source manifest's empty processorArchitecture="",
+                         * exactly as fakedll.c does at install time — actctx.c
+                         * validates the identity inside the file against the one
+                         * parsed out of the file NAME, so the two must agree. */
+                        NSMutableString *text = [NSMutableString stringWithString:
+                            @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+                            @"<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\n"];
+                        [text appendFormat:
+                            @"  <assemblyIdentity type=\"win32\" name=\"%s\" version=\"%s\" "
+                            @"processorArchitecture=\"%@\" publicKeyToken=\"%s\"/>\n",
+                            asmdef->name, asmdef->version, arch, asmdef->key];
+
+                        BOOL ok = YES;
+                        for (size_t f = 0; f < sizeof(asmdef->files) / sizeof(asmdef->files[0]); f++) {
+                            if (!asmdef->files[f].in_assembly) break;
+                            NSString *src = [archSource stringByAppendingPathComponent:
+                                [NSString stringWithUTF8String:asmdef->files[f].in_farm]];
+                            NSString *link = [asmDir stringByAppendingPathComponent:
+                                [NSString stringWithUTF8String:asmdef->files[f].in_assembly]];
+                            [fm removeItemAtPath:link error:nil];  /* the bundle path changes on reinstall */
+                            if (![fm fileExistsAtPath:src]) continue;
+                            if (![fm createSymbolicLinkAtPath:link withDestinationPath:src error:nil]) {
+                                dprintf(STDERR_FILENO, "[WineProc] winsxs: FAILED to link %s\n",
+                                        link.UTF8String);
+                                ok = NO;
+                                break;
+                            }
+                            if (body)
+                                [text appendFormat:@"  <file name=\"%s\">\n%s  </file>\n",
+                                    asmdef->files[f].in_assembly, body];
+                            else
+                                [text appendFormat:@"  <file name=\"%s\"/>\n",
+                                    asmdef->files[f].in_assembly];
+                        }
+                        [text appendString:@"</assembly>\n"];
+                        if (!ok) { sxsSkipped++; continue; }
+
+                        if (![[text dataUsingEncoding:NSUTF8StringEncoding]
+                                writeToFile:manifest atomically:YES]) {
+                            dprintf(STDERR_FILENO, "[WineProc] winsxs: FAILED to write %s\n",
+                                    manifest.UTF8String);
+                            sxsSkipped++;
+                            continue;
+                        }
+                        sxsSeeded++;
                     }
-                    /* re-link every session: the bundle path changes on reinstall */
-                    [fm removeItemAtPath:link error:nil];
-                    if (![fm createSymbolicLinkAtPath:link withDestinationPath:dll error:nil]) {
-                        dprintf(STDERR_FILENO, "[WineProc] winsxs: FAILED to link %s\n",
-                                link.UTF8String);
-                        continue;
-                    }
-                    sxsSeeded++;
                 }
                 dprintf(STDERR_FILENO,
-                        "[WineProc] winsxs: %d/%zu Common-Controls 6.0 assemblies seeded "
-                        "(manifests + comctl32.dll) -> %s\n",
-                        sxsSeeded, sizeof(sxs) / sizeof(sxs[0]), winsxsDir.UTF8String);
+                        "[WineProc] winsxs: %d/%zu assemblies seeded, %d skipped "
+                        "(Common-Controls 6.0, VC80/VC90 CRT+ATL, GdiPlus 1.0/1.1, MSXML 3/4/6 "
+                        "x x86/arm64/amd64) -> %s\n",
+                        sxsSeeded, sxsWanted, sxsSkipped, winsxsDir.UTF8String);
             }
 
             /* ml719: REPAIR THE SHELL FOLDERS. They ship as symlinks to the BUILD

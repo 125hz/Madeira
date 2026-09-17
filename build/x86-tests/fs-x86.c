@@ -1,19 +1,22 @@
-/* MADEIRA-TEMP: the stress self-test for the ml910/ml912/ml913 NT-path
+/* MADEIRA-TEMP: the stress self-test for the ml910/ml912/ml913/ml915 NT-path
  * resolution caches in wine/dlls/ntdll/unix/file.c (WOW64_DESIGN.md section 6:
- * "ml910", "negative", "whole-path").
+ * "ml910", "negative", "whole-path", "dircache").
  *
  * WHAT IT CHECKS, AND WHY
  * -----------------------
- * Three caches sit between a Windows path and the unix file it names:
+ * Four caches sit between a Windows path and the unix file it names:
  *
  *   1. get_dir_case_sensitivity() memoised per directory path;
  *   2. a resolved-name cache with per-component NEGATIVE entries stamped with
  *      the parent directory's (dev, ino, nanosecond mtime);
  *   3. a WHOLE-PATH negative cache, keyed on the path and stamped with the
- *      deepest directory that does exist, so a failing open costs one fstatat.
+ *      deepest directory that does exist, so a failing open costs one fstatat;
+ *   4. a DIRECTORY-CONTENTS cache: one directory read once into a hash table
+ *      keyed on (dev, ino) and stamped with its mtime and ctime, after which
+ *      any name in it -- present or absent -- is one fstatat plus a probe.
  *
- * All three answer "does this path exist" without touching the file system,
- * and all three are revalidated against a directory mtime.  Every way that can
+ * All four answer "does this path exist" without touching the file system,
+ * and all four are revalidated against a directory mtime.  Every way that can
  * go wrong has the same signature from a program's point of view: an open that
  * returns NOT_FOUND for a file that is there (or SUCCESS for one that is not),
  * with no error anywhere else.  Engines that probe a list of candidate paths
@@ -67,6 +70,21 @@
  *      that the entry is stamped with, so the entry is born already matching
  *      the live directory and never goes stale.
  *
+ *  10  DIRECTORY-CONTENTS CACHE.  3000 files in one directory, then 5000
+ *      DISTINCT absent names probed in it, twice with two disjoint name sets
+ *      and once repeating the first set.  Distinct names are what the device
+ *      log actually shows (an engine probing localised package spellings), and
+ *      they are exactly what a per-NAME cache cannot help with: without a
+ *      directory table every one of them re-reads 3000 entries.  Each pass
+ *      prints its wall time and the mean microseconds per failing probe, so a
+ *      device log carries the same number [fs-stats] prints as fail_avg_us.
+ *      Then the three transitions that must invalidate the table while it is
+ *      hot: a create in the cached directory probed back immediately (the
+ *      same-tick case the create paths invalidate by path for), a delete, and
+ *      a rename in and out.  Finally a flipped-case probe of a file that does
+ *      exist, which must still resolve to its real spelling -- that is the
+ *      answer that now comes out of the table instead of a readdir walk.
+ *
  * Deliberate restrictions, the same as the other tests in this directory: no
  * CRT (this file supplies `start' plus memset/memcpy and links -nostdlib, so
  * its only import is kernel32), no 64-bit division, no int-to-double.
@@ -82,7 +100,10 @@
  *   66  a directory was still reported missing after being recreated
  *   67  CreateThread/CreateEvent failed
  *
- * A/B: run it with MADEIRA_FS_NEGCACHE=1 and without.  Both must give 47.
+ * A/B: run it with MADEIRA_FS_NEGCACHE=0 and without (the whole-path negative
+ * cache is on by default since ml915), and with MADEIRA_FS_DIRCACHE=0 and
+ * without.  All four combinations must give 47; only the phase 10 timings
+ * should differ, and they are the point.
  */
 #include <stddef.h>
 #include <windows.h>
@@ -92,6 +113,12 @@
 #define RELMAX     64
 #define PATHMAX    320
 #define CONC_ROUNDS 200u
+/* phase 10: one directory big enough that a case-insensitive scan of it is
+ * expensive (the device log's directories hold thousands of package files),
+ * and more distinct absent probes than it has entries. */
+#define NBIG        3000u
+#define NMISS       5000u
+#define NFRESH      64u
 
 /* -nostdlib: clang may still lower a struct initialisation to memset/memcpy. */
 void *memset( void *dst, int c, size_t n )
@@ -252,6 +279,23 @@ static int probe( const char *rel, unsigned int *err )
     return 0;
 }
 
+/* GetFileAttributes reaches the resolver with open_reparse=TRUE, which the
+ * whole-path caches deliberately refuse to serve.  A real open does not, and a
+ * real open is what the device log is full of, so phase 10 times this one. */
+static int probe_open( const char *rel, unsigned int *err )
+{
+    char full[PATHMAX];
+    HANDLE h;
+
+    make_full( full, rel );
+    SetLastError( 0 );
+    h = CreateFileA( full, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL );
+    if (h != INVALID_HANDLE_VALUE) { CloseHandle( h ); return 1; }
+    *err = (unsigned int)GetLastError();
+    return 0;
+}
+
 static int create_file_at( const char *rel )
 {
     char full[PATHMAX];
@@ -371,7 +415,7 @@ static int phase_create_then_probe(void)
         made++;
         /* the whole point: the negative entry for this path is microseconds
          * old and the create has to have killed it. */
-        if (!probe( model[i].rel, &err ))
+        if (!probe( model[i].rel, &err ) || !probe_open( model[i].rel, &err ))
         {
             fail_path( "phase2 missing right after CreateFile", model[i].rel, err );
             return 65;
@@ -405,6 +449,11 @@ static int sweep( int flip, int phase )
                                       : "phase4 present but absent in the model", rel, 0 );
                 return 62;
             }
+            if (!probe_open( rel, &err ))
+            {
+                fail_path( "sweep attributes found it but an open did not", rel, err );
+                return 61;
+            }
         }
         else
         {
@@ -418,6 +467,11 @@ static int sweep( int flip, int phase )
             {
                 fail_path( "sweep wrong error for a missing leaf", rel, err );
                 return 63;
+            }
+            if (probe_open( rel, &err ))
+            {
+                fail_path( "sweep an open found a file the model says is absent", rel, 0 );
+                return 62;
             }
         }
     }
@@ -753,6 +807,260 @@ static int phase_case_siblings(void)
     return 0;
 }
 
+/* ------------------------------------------------------------ phase 10 */
+
+static const char *big_dir = "bigdir";
+
+/* "bigdir\\b<i>_Pkg.upk" -- the files that really are there */
+static void big_rel( char *rel, unsigned int i )
+{
+    char *p = rel;
+    p[0] = 0;
+    p = str_cat( p, big_dir );
+    p = str_cat( p, "\\b" );
+    p = put_uint( p, i );
+    p = str_cat( p, "_Pkg.upk" );
+    *p = 0;
+}
+
+/* "bigdir\\<tag><i>_LOC_INT.upk" -- distinct names that are never created.
+ * The shape is the device's: an engine asking for localised variants of a
+ * package, a different spelling every time, so a per-name negative entry is
+ * written once and never read again. */
+static void miss_rel( char *rel, const char *tag, unsigned int i )
+{
+    char *p = rel;
+    p[0] = 0;
+    p = str_cat( p, big_dir );
+    p = str_cat( p, "\\" );
+    p = str_cat( p, tag );
+    p = put_uint( p, i );
+    p = str_cat( p, "_LOC_INT.upk" );
+    *p = 0;
+}
+
+/* 5000 absent probes, timed.  Returns 0, or the failing exit code. */
+static int miss_pass( const char *tag, unsigned int pass, unsigned int *ms_out )
+{
+    char rel[RELMAX];
+    unsigned int i, err, t0, t1, ms;
+
+    t0 = (unsigned int)GetTickCount();
+    for (i = 0; i < NMISS; i++)
+    {
+        miss_rel( rel, tag, i );
+        if (probe_open( rel, &err ))
+        {
+            fail_path( "phase10 absent name opened", rel, 0 );
+            return 62;
+        }
+        if (err != ERROR_FILE_NOT_FOUND)
+        {
+            fail_path( "phase10 wrong error for a missing leaf", rel, err );
+            return 63;
+        }
+    }
+    t1 = (unsigned int)GetTickCount();
+    ms = t1 - t0;                        /* unsigned: correct across a wrap */
+    *ms_out = ms;
+    {
+        char buf[256], *p = buf;
+        p = put_str( p, "MADEIRA-FS: phase 10 pass " );
+        p = put_uint( p, pass );
+        p = put_str( p, ": " );
+        p = put_uint( p, NMISS );
+        p = put_str( p, " distinct absent probes in " );
+        p = put_uint( p, ms );
+        p = put_str( p, " ms, avg " );
+        p = put_uint( p, ms * 1000u / NMISS );   /* 32-bit only, on purpose */
+        p = put_str( p, " us each" );
+        *p++ = '\n';
+        *p = 0;
+        out_str( buf );
+    }
+    return 0;
+}
+
+static int phase_dircache(void)
+{
+    char rel[RELMAX], rel2[RELMAX], full[PATHMAX], full2[PATHMAX], dirfull[PATHMAX];
+    unsigned int i, err, ms1, ms2, ms3;
+    int rc;
+
+    make_full( dirfull, big_dir );
+    if (!CreateDirectoryA( dirfull, NULL ) && GetLastError() != ERROR_ALREADY_EXISTS) return 60;
+
+    for (i = 0; i < NBIG; i++)
+    {
+        big_rel( rel, i );
+        if (!create_file_at( rel ))
+        {
+            fail_path( "phase10 CreateFile failed", rel, (unsigned int)GetLastError() );
+            return 64;
+        }
+    }
+    line_1( "MADEIRA-FS: phase 10 directory populated with ", NBIG, " files" );
+
+    /* pass 1 reads the directory once and answers the other 4999 from the
+     * table; pass 2 uses names pass 1 never saw, so it can only be the table;
+     * pass 3 repeats pass 1's names, which the whole-path negative cache
+     * answers before find_file_in_dir is even reached. */
+    if ((rc = miss_pass( "m", 1, &ms1 ))) return rc;
+    if ((rc = miss_pass( "n", 2, &ms2 ))) return rc;
+    if ((rc = miss_pass( "m", 3, &ms3 ))) return rc;
+
+    /* a file that DOES exist, asked for in the wrong case: this is the answer
+     * that now comes out of the table, and it must be the same one the
+     * readdir walk gave. */
+    for (i = 0; i < NBIG; i += 97)
+    {
+        big_rel( rel, i );
+        if (!probe_open( rel, &err ))
+        {
+            fail_path( "phase10 existing file could not be opened", rel, err );
+            return 61;
+        }
+        flip_leaf_case( rel );
+        if (!probe( rel, &err ))
+        {
+            fail_path( "phase10 existing file missing under the other case", rel, err );
+            return 61;
+        }
+        if (!probe_open( rel, &err ))
+        {
+            fail_path( "phase10 existing file could not be opened in the other case", rel, err );
+            return 61;
+        }
+    }
+
+    /* CREATE IN A HOT DIRECTORY.  The table for bigdir was built moments ago
+     * and every probe above re-validated it, so this is the create-then-open
+     * that a stamp alone could miss inside one clock tick. */
+    for (i = 0; i < NFRESH; i++)
+    {
+        rel[0] = 0;
+        str_cat( rel, big_dir );
+        str_cat( rel, "\\fresh" );
+        {
+            char *p = rel;
+            while (*p) p++;
+            p = put_uint( p, i );
+            p = str_cat( p, ".dat" );
+            *p = 0;
+        }
+        if (probe( rel, &err ))
+        {
+            fail_path( "phase10 fresh name present before it was created", rel, 0 );
+            return 62;
+        }
+        if (!create_file_at( rel ))
+        {
+            fail_path( "phase10 CreateFile failed", rel, (unsigned int)GetLastError() );
+            return 64;
+        }
+        if (!probe( rel, &err ))
+        {
+            fail_path( "phase10 missing right after a create in a cached directory", rel, err );
+            return 65;
+        }
+        if (!probe_open( rel, &err ))
+        {
+            fail_path( "phase10 unopenable right after a create in a cached directory", rel, err );
+            return 65;
+        }
+    }
+
+    /* DELETE FROM A HOT DIRECTORY */
+    for (i = 0; i < NBIG; i += 211)
+    {
+        big_rel( rel, i );
+        make_full( full, rel );
+        if (!DeleteFileA( full ))
+        {
+            fail_path( "phase10 DeleteFile failed", rel, (unsigned int)GetLastError() );
+            return 64;
+        }
+        if (probe( rel, &err ) || probe_open( rel, &err ))
+        {
+            fail_path( "phase10 deleted file still present in a cached directory", rel, 0 );
+            return 62;
+        }
+        if (err != ERROR_FILE_NOT_FOUND)
+        {
+            fail_path( "phase10 wrong error after a delete", rel, err );
+            return 63;
+        }
+    }
+
+    /* RENAME WITHIN A HOT DIRECTORY, onto a name pass 1 recorded as absent */
+    for (i = 1; i < NBIG; i += 307)
+    {
+        big_rel( rel, i );
+        miss_rel( rel2, "m", i );
+        make_full( full, rel );
+        make_full( full2, rel2 );
+        if (!MoveFileA( full, full2 ))
+        {
+            fail_path( "phase10 MoveFile failed", rel, (unsigned int)GetLastError() );
+            return 64;
+        }
+        if (probe( rel, &err ) || probe_open( rel, &err ))
+        {
+            fail_path( "phase10 rename source still present", rel, 0 );
+            return 62;
+        }
+        if (!probe( rel2, &err ) || !probe_open( rel2, &err ))
+        {
+            fail_path( "phase10 rename target missing", rel2, err );
+            return 65;
+        }
+        /* and back, so the cleanup below is simple */
+        if (!MoveFileA( full2, full ))
+        {
+            fail_path( "phase10 MoveFile back failed", rel2, (unsigned int)GetLastError() );
+            return 64;
+        }
+        if (probe( rel2, &err ) || probe_open( rel2, &err ))
+        {
+            fail_path( "phase10 rename target still present after moving back", rel2, 0 );
+            return 62;
+        }
+        if (!probe( rel, &err ) || !probe_open( rel, &err ))
+        {
+            fail_path( "phase10 rename source missing after moving back", rel, err );
+            return 65;
+        }
+    }
+
+    /* teardown: 3000 files plus the fresh ones */
+    for (i = 0; i < NBIG; i++)
+    {
+        big_rel( rel, i );
+        make_full( full, rel );
+        DeleteFileA( full );
+    }
+    for (i = 0; i < NFRESH; i++)
+    {
+        rel[0] = 0;
+        str_cat( rel, big_dir );
+        str_cat( rel, "\\fresh" );
+        {
+            char *p = rel;
+            while (*p) p++;
+            p = put_uint( p, i );
+            p = str_cat( p, ".dat" );
+            *p = 0;
+        }
+        make_full( full, rel );
+        DeleteFileA( full );
+    }
+    make_full( dirfull, big_dir );
+    RemoveDirectoryA( dirfull );
+
+    out_str( "MADEIRA-FS: phase 10 (directory-contents cache) OK\n" );
+    return 0;
+}
+
 /* --------------------------------------------------------------- driver */
 
 static void cleanup(void)
@@ -796,6 +1104,7 @@ static int run_all(void)
     if ((rc = phase_directory_churn())) return rc;
     if ((rc = phase_case_siblings())) return rc;
     if ((rc = phase_concurrent_create())) return rc;
+    if ((rc = phase_dircache())) return rc;
 
     cleanup();
     out_str( "MADEIRA-FS: all checks passed\n" );
