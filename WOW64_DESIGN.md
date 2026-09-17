@@ -5626,3 +5626,121 @@ window teardown), `src/winemetal/unix/winemetal_unix.c` (`_Foo32` pattern
   a subset build that breaks the closure has to say so. Rebuilt this way for
   all three farms: `built: 2 failed: 0` each, **0 missing cross-imports** on
   i386, aarch64 and arm64ec.
+
+## 9. Running without `extended-virtual-addressing` ("lazy VA") — PLAN
+
+Goal (upstream request): every feature of this fork must work when the app
+has only the default iOS address space, so the 32-bit work can be merged
+into upstream Madeira, which ships without the entitlement.
+
+### 9.1 What the entitlement buys us today (facts from the tree)
+
+- `com.apple.developer.kernel.extended-virtual-addressing` is NOT in
+  `app/Madeira/Madeira.entitlements`; the sideloader injects it (the app's
+  own tip says "use GetMoreRam"). With it the task's VA top is 512 GB and
+  the map measured on the dev phone (ml92) was: `__PAGEZERO` 0-4 GB, 4-64 GB
+  fully reserved by malloc's xzone, one usable ~63 GB window
+  `0x7038000000..0x7fffdf0000` (448-512 GB). Every fixed address in the
+  fork lives there: guest slot 0 `0x7100000000`, slot 1 / cage holdback
+  `0x7200000000..0x7400000000`, CEF PartitionAlloc pools `[0x74,0x7c) GB`,
+  FEX host heap + arena `[0x7c,0x80) GB`, Wine "furniture" (PE image copies,
+  TEBs, heaps) top-down under `ios_furniture_ceiling`, JIT pool
+  (kernel-placed, RW alias parked below the 64 GB carve-out floor).
+- Hard-coded literals in that band: `virtual_ios.c` 104, `signal_arm64_ios.c`
+  18, `StikJITHelper.swift` 14, `FEX/Source/Windows/ARM64EC/Module.cpp` 3,
+  `wineserver/mapping_ios.c` 2, `thread_ios.c` 1, `win32u syscall_ios.c` 1.
+- Without the entitlement the task's VA top is 64 GB (`MACH_VM_MAX_ADDRESS`
+  for a stock iOS app). The 448-512 GB window does not exist, so today's
+  layout cannot start Wine at all. Upstream (64-bit only, guest==host) fits
+  in the low 64 GB; what this fork adds is two 4 GB-ALIGNED 4 GB guest
+  windows, and that is the one thing the design cannot shrink: the guest
+  address must equal the low 32 bits of the host address (`B` 4 GB-aligned,
+  FEX `REG_GUEST_BASE`), and a window is a contiguous PROT_NONE reservation.
+
+### 9.2 Unknown that decides everything — measure first (step 0)
+
+We do not know the free map of a stock 64 GB task on this device: how much
+of 4-64 GB malloc's xzone really reserves without the entitlement (the
+"fully reserved" observation was made WITH it, where xzone sizes itself to
+the big space), where dyld's shared cache and Metal/GPU mappings sit, and
+whether a 4 GB-aligned 4 GB hole exists at all. Step 0 is a probe build
+that runs with the entitlement absent: at launch walk
+`mach_vm_region_recurse` and log every free hole >= 256 MB (`[va-map]`),
+then try `mmap(PROT_NONE)` of 4 GB at every 4 GB-aligned base in 4-64 GB
+and log which succeed (`[va-probe] slot k: ok|EBUSY`), plus the largest
+free extent for the JIT pool (2 x pool size, dual-mapped) and the FEX heap.
+Nothing else in this plan should be written before that log exists; it
+tells us whether we have 1, 2 or 0 candidate guest slots and how much is
+left for furniture. Expected budget if the map is like a normal iOS app:
+~48-56 GB free, of which the fork needs: 2 slots 8 GB (lazy, see 9.3), JIT
+pool 1-1.8 GB, FEX heap 2-4 GB (lazy), Wine furniture 4-8 GB, CEF cage 8 GB
+ONLY when CEF runs (lazy), leaving >= 20 GB for games' own allocations.
+
+### 9.3 Design: a discovered layout instead of constants, and lazy reservations
+
+1. One layout table, computed at session start (`ios_va_layout` in
+   `virtual_ios.c`, exported to Swift via a small C accessor and to FEX via
+   the existing `NtQueryInformationProcess` classes): `va_top`,
+   `usable_floor`, `furniture_ceiling`, `slot[k].base` (4 GB-aligned holes
+   found by the probe, best-fit), `pool_hint`, `fex_heap_hint`, `cage_hint`
+   (0 when no 8 GB-aligned hole exists -> CEF disabled with a clear log,
+   not a crash). Every one of the ~143 literal sites reads the table;
+   `0x7100000000` stops appearing anywhere except in the doc. Entitlement
+   present -> the probe finds the old window and the table reproduces
+   today's layout exactly, so the entitled build is a regression test for
+   the refactor.
+2. Lazy guest windows: no placeholder at session start. Slot k is reserved
+   (`MAP_FIXED|PROT_NONE` at the probed base, re-probed at that moment)
+   when the first 32-bit process needs it and released on exit
+   (release-on-next-adopt already exists; make it release-on-exit so the
+   VA returns to the pool of holes). `win32u_zero_bits()` and the GDI
+   section view already take the base from the process.
+3. Lazy FEX host heap: FEX's allocator hint region `[0x7c,0x80) GB` (16 GB)
+   becomes a chunked reservation: 512 MB chunks reserved on demand from
+   `fex_heap_hint`; the `[bigres]` steering table (`va-arena`) keeps them
+   inside the layout. FEX only needs its heap below 2^48, not contiguous.
+4. JIT pool: unchanged mechanism (one dual-mapped pool, debugger-blessed),
+   but its hint list comes from the table and its size is bounded by the
+   largest free extent / 2; keep the app-lifetime reuse.
+5. Furniture: Wine's top-down furniture band `[usable_floor,
+   furniture_ceiling)` is already a runtime pair (`ios_usable_va_floor_get`);
+   it moves to the table. PE pool copies (100 MB) and TEB/heaps are small;
+   the "14 GB" figure came from CEF-era reservations, not games.
+6. CEF cage / PartitionAlloc pools: opt-in lazy reservations at CEF process
+   start (`cage_hint`); the soft-pool broker stays; on a 64 GB map they may
+   be unavailable -> CEF (Steam webhelper) is the one feature that can
+   legitimately be "not supported without the entitlement". Games do not
+   use it.
+7. Second 32-bit slot exists only if the probe found two aligned holes;
+   otherwise `[wow-window]` reports "1 slot" and a 32-bit process spawning
+   a 32-bit process gets `STATUS_NO_MEMORY` with the existing loud line.
+
+### 9.4 Risks
+
+- The probe finds NO 4 GB-aligned hole in a stock task (xzone or the
+  shared cache straddling every 4 GB boundary). Then the identity mapping
+  is impossible without the entitlement and the fallback is a NON-identity
+  window (`guest = host - B` with B not 4 GB-aligned): FEX already computes
+  addresses as `B + guest32` (`REG_GUEST_BASE`), so the JIT side is fine;
+  what breaks is every place that assumes `low32(host) == guest`
+  (win32u `zero_bits` views, the GDI shared section, wow64 pointer
+  truncation checks, the profiler's module map, `ios_wow_guest_ptr32`). A
+  grep for 32-bit casts of host pointers in the wow64 path is the inventory
+  for that fallback; it is a bigger change than 9.3 and only worth doing if
+  step 0 says the aligned hole never exists.
+- Memory (not VA) is unchanged: jetsam 4 GB; `increased-memory-limit` is a
+  separate entitlement that upstream ships.
+- Metal/DXMT map large buffers (staging rings, textures) in the same 64 GB;
+  the `[mem-census]` numbers (about 1.5-2 GB) fit.
+
+### 9.5 Sequencing and cost
+
+0. Probe build + one device log without the entitlement (Sonnet-size,
+   ~150 lines, no behaviour change). Decides 9.3 vs 9.4.
+1. Layout table + literal sweep (Opus; mechanical but wide: ~143 sites;
+   both builds must pass: entitled = identical layout, stock = probed).
+2. Lazy windows + lazy FEX heap + pool hints from the table.
+3. Cage/PA pools lazy and optional; CEF marked entitlement-dependent.
+4. Device runs: entitled (regression) and stock (the goal): D3D9 cube,
+   the 32-bit game, the spawn-chain test (slot count), a 64-bit title.
+Everything here is emulator-generic; nothing is per-title.
