@@ -208,7 +208,7 @@ enum GuestDisplay {
         forName: .MadeiraDisplayModeChanged,
         object: nil, queue: .main
     ) { _ in
-        MetalBackedView.refreshDisplayMode()
+        MetalBackedView.refreshDisplayMode(reason: "mode-changed")
     }
 }
 
@@ -553,52 +553,138 @@ final class MetalBackedView: UIView {
     /// and Fill/Stretch only grow as far as the aspect math actually needs.
     /// Touch mapping (mapTouch, below) uses the identical rect so
     /// letterboxing/cropping/stretching never skews input.
-    private func gameRect() -> CGRect {
-        GameSurfaceLayout.rect(guest: guestSize(), aspect: MetalHostView.shared.metalLayer.drawableSize,
-                               bounds: bounds, mode: InputSettings.shared.displayMode)
+    /// Mirrors ContentView's own portrait/landscape branch condition
+    /// (`vSizeClass == .compact` picks landscapeBody, see ContentView.body)
+    /// via this view's own trait collection: MetalBackedView lives inside
+    /// whichever branch SwiftUI mounted and inherits its size class through
+    /// the view hierarchy, so this stays in step without a second source of
+    /// truth.
+    private var isPortraitLayout: Bool {
+        traitCollection.verticalSizeClass != .compact
     }
 
-    private static var lastLoggedRect: CGRect?
-    private static var lastLoggedMode: DisplayMode?
-
-    /// Sizes the presented layer's host view to gameRect() and logs the
-    /// result — called on attach, on every layout pass (rotation, safe-area
-    /// change) and immediately when the mode itself changes
-    /// (InputSettings.displayMode didSet, via refreshDisplayMode()). Logging
-    /// is rate-limited to actual changes so a settled layout doesn't spam
-    /// stderr on every pass.
+    /// The DisplayMode actually used for layout AND touch mapping this
+    /// frame — may differ from the user's InputSettings.shared.displayMode.
     ///
-    /// Fill/Stretch can genuinely extend past our own bounds on one axis
-    /// (that's the point — filling the pillarbox bars a game used to leave
-    /// empty) which may run under the notch/home indicator in landscape;
-    /// per spec that's acceptable there. It can also, by a similar amount,
-    /// spill a little into the thin rows directly above/below the 240pt
-    /// portrait strip, which callers should keep in mind when placing HUD
-    /// elements close to that strip in Fill mode.
-    private func applyDisplayModeAndLog() {
+    /// In portrait the game strip is a fixed-height row (ContentView.
+    /// portraitBody: `MadeiraMetalView().frame(height: 240)`) with control
+    /// buttons stacked directly below it. Fill/Fill-height are allowed to
+    /// grow the presented rect past `bounds` on one axis by design (see
+    /// GameSurfaceLayout.rect) — that's correct in landscape/fullscreen,
+    /// where nothing sits below the surface, but in portrait that overflow
+    /// is exactly "the live view overlaps the buttons below it". A CAMetalLayer
+    /// doesn't reliably honour contentsRect cropping for drawable-presented
+    /// content, so rather than risk a coordinate mismatch, fall back to
+    /// Aspect in portrait for those two modes: it still fills as much of the
+    /// 240pt strip as the guest's own shape allows, it just never crosses
+    /// the strip's edges. Landscape/fullscreen is untouched.
+    private func effectiveDisplayMode() -> DisplayMode {
+        let mode = InputSettings.shared.displayMode
+        guard isPortraitLayout, mode == .fill || mode == .fitHeight else { return mode }
+        return .aspect
+    }
+
+    /// The drawable size to hand GameSurfaceLayout, or `.zero` ("unknown")
+    /// when DXMT hasn't published a real one yet. `.zero` makes
+    /// GameSurfaceLayout.rect/.map fall back to the guest size instead of
+    /// letterboxing/mapping against a stale or placeholder shape (MetalHostView
+    /// seeds 800x600 at init, before any game has resized it).
+    private func drawableAspect() -> CGSize {
+        let d = MetalHostView.shared.metalLayer.drawableSize
+        return (d.width > 0 && d.height > 0) ? d : .zero
+    }
+
+    private func gameRect() -> CGRect {
+        GameSurfaceLayout.rect(guest: guestSize(), aspect: drawableAspect(),
+                               bounds: bounds, mode: effectiveDisplayMode())
+    }
+
+    /// Coalesces the ~0.3s settle re-apply scheduled by applyAndScheduleSettle
+    /// (below) / refreshDisplayMode(reason:) — a burst of triggers (rotation
+    /// firing layoutSubviews repeatedly, KVO plus a layout pass, …) collapses
+    /// to one trailing re-apply instead of one per trigger.
+    private static var pendingSettleWorkItem: DispatchWorkItem?
+
+    /// UIKit reports PRE-rotation bounds while a rotation/safe-area
+    /// transition is still animating, and DXMT may not have published the
+    /// new drawableSize yet either — so an apply driven by the transition's
+    /// own callback can compute from stale inputs. This is the fix for
+    /// "the Aspect button lays out small until you cycle all the way back to
+    /// it": re-apply once more after things have actually settled, from
+    /// whichever MetalBackedView is live right now (`keyboardTarget`, not a
+    /// captured view — rotation destroys/recreates this placeholder, see the
+    /// comment on ContentView's landscapeBody/portraitBody if/else).
+    private static func scheduleSettleReapply(reason: String) {
+        pendingSettleWorkItem?.cancel()
+        let item = DispatchWorkItem {
+            keyboardTarget?.applyDisplayModeAndLog(reason: "settle:\(reason)")
+        }
+        pendingSettleWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: item)
+    }
+
+    /// Sizes the presented layer's host view to gameRect() and logs every
+    /// call (LogStore's signature dedup already collapses repeats with an
+    /// on-screen counter, so this doesn't spam the UI — see LogPattern
+    /// .canonicalize) with the inputs that produced `rect`, so a pulled log
+    /// says exactly what each apply saw rather than just its outcome.
+    ///
+    /// `reason` names the trigger (layout / attach / drawable / mode-changed
+    /// / mode-toggle / orientation / settle:<reason>) — see refreshDisplayMode
+    /// (reason:) and the call sites in layoutSubviews/didMoveToWindow.
+    ///
+    /// Fill/Fill-height can genuinely extend past our own bounds on one axis
+    /// in landscape/fullscreen (that's the point — filling the pillarbox bars
+    /// a game used to leave empty), which may run under the notch/home
+    /// indicator there; per spec that's acceptable. In portrait,
+    /// effectiveDisplayMode() already keeps this from happening (see above).
+    private func applyDisplayModeAndLog(reason: String) {
         guard let w = window else { return }
         let mode = InputSettings.shared.displayMode
+        let effective = effectiveDisplayMode()
         let guest = guestSize()
+        let rawDrawable = MetalHostView.shared.metalLayer.drawableSize
         let r = gameRect()
         MetalHostView.shared.frame = convert(r, to: w)
-        guard r != Self.lastLoggedRect || mode != Self.lastLoggedMode else { return }
-        Self.lastLoggedRect = r
-        Self.lastLoggedMode = mode
-        fputs(String(format: "[display] mode=%@ guest=%.0fx%.0f view=%.0fx%.0f -> rect=(%.0f,%.0f %.0fx%.0f)\n",
-                    mode.label, guest.width, guest.height, bounds.width, bounds.height,
+        let modeLabel = mode == effective ? mode.label : "\(effective.label)(req:\(mode.label))"
+        fputs(String(format: "[display] apply reason=%@ mode=%@ guest=%.0fx%.0f drawable=%.0fx%.0f "
+                    + "bounds=(%.0f,%.0f %.0fx%.0f) -> rect=(%.0f,%.0f %.0fx%.0f)\n",
+                    reason, modeLabel, guest.width, guest.height, rawDrawable.width, rawDrawable.height,
+                    bounds.minX, bounds.minY, bounds.width, bounds.height,
                     r.minX, r.minY, r.width, r.height), stderr)
-        let d = MetalHostView.shared.metalLayer.drawableSize
-        fputs(String(format: "[display]   drawable=%.0fx%.0f (the shape Aspect mode keeps)\n", d.width, d.height), stderr)
+    }
+
+    /// Instance-side helper for the two direct call sites (layoutSubviews,
+    /// didMoveToWindow) that already hold `self`: apply now AND arm the
+    /// coalesced settle re-apply for ~0.3s out.
+    private func applyAndScheduleSettle(_ reason: String) {
+        applyDisplayModeAndLog(reason: reason)
+        Self.scheduleSettleReapply(reason: reason)
     }
 
     /// Re-applies the display mode to whichever MetalBackedView is currently
-    /// on screen. InputSettings is a plain ObservableObject, not something
-    /// this raw UIKit view observes, so a mode flip from the HUD button needs
-    /// an explicit nudge to take effect before the next incidental layout
-    /// pass (rotation, etc.) would otherwise pick it up.
-    static func refreshDisplayMode() {
-        keyboardTarget?.applyDisplayModeAndLog()
+    /// on screen, and arms the settle re-apply. InputSettings is a plain
+    /// ObservableObject, not something this raw UIKit view observes, so a
+    /// mode flip from the HUD button (or the guest's own mode-change
+    /// notification, or a drawableSize KVO, or a device rotation) needs an
+    /// explicit nudge — see the call sites of this function.
+    static func refreshDisplayMode(reason: String = "refresh") {
+        keyboardTarget?.applyDisplayModeAndLog(reason: reason)
+        scheduleSettleReapply(reason: reason)
     }
+
+    /// Idempotent, app-lifetime: re-lay-out on device rotation too, not just
+    /// on the layoutSubviews pass UIKit happens to schedule around it — the
+    /// pass that DOES fire during the transition sees pre-rotation bounds
+    /// (see scheduleSettleReapply above), so the rotation notification itself
+    /// is a second, independent trigger with its own settle re-apply.
+    private static let orientationObserver: NSObjectProtocol = NotificationCenter.default.addObserver(
+        forName: UIDevice.orientationDidChangeNotification,
+        object: nil, queue: .main
+    ) { _ in
+        MetalBackedView.refreshDisplayMode(reason: "orientation")
+    }
+    private static func observeOrientationChanges() { _ = orientationObserver }
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
@@ -610,7 +696,8 @@ final class MetalBackedView: UIView {
             host.removeFromSuperview()
             w.addSubview(host)
         }
-        applyDisplayModeAndLog()
+        applyAndScheduleSettle("attach")
+        Self.observeOrientationChanges()
         // S2 desktop mode: the winios compositor renders the wine virtual
         // desktop aspect-fit inside THIS placeholder's area, exactly like
         // the games' Metal layer — never over the whole phone screen.
@@ -620,7 +707,11 @@ final class MetalBackedView: UIView {
             Self.layerRegistered = true
             madeira_display_set_layer(host.metalLayer)
             Self.drawableObservation = host.metalLayer.observe(\.drawableSize, options: [.new]) { _, _ in
-                DispatchQueue.main.async { MetalBackedView.refreshDisplayMode() }
+                // drawableSize is written off the render thread (DXMT's
+                // setProps); KVO delivers on whatever thread the write
+                // happened on, and applyDisplayModeAndLog touches UIKit, so
+                // this MUST hop to main before calling it.
+                DispatchQueue.main.async { MetalBackedView.refreshDisplayMode(reason: "drawable") }
             }
             LogStore.shared.log("MetalLayer registered with DXMT shim (window-hosted singleton)", level: .success)
         }
@@ -652,7 +743,11 @@ final class MetalBackedView: UIView {
         super.layoutSubviews()
         defuseAncestorRecognizers()
         if let w = window {
-            applyDisplayModeAndLog()
+            // UIKit calls layoutSubviews mid-rotation with pre-rotation
+            // bounds (this is exactly the "Aspect lays out small until you
+            // cycle the mode" bug) — applyAndScheduleSettle both applies now
+            // AND arms a re-apply once the transition has actually settled.
+            applyAndScheduleSettle("layout")
             let full = convert(bounds, to: w)
             winios_set_compositor_frame(full.minX, full.minY, full.width, full.height)
         }
@@ -660,14 +755,15 @@ final class MetalBackedView: UIView {
 
     // Map touch point in view-local UI points to guest-pixel coordinates via
     // the same GameSurfaceLayout math that sizes the presented layer's host
-    // view (see gameRect()/applyDisplayModeAndLog above), then post to
+    // view (see gameRect()/applyDisplayModeAndLog above — effectiveDisplayMode()
+    // and drawableAspect() keep the two in agreement), then post to
     // winios.drv. Off-surface touches (Fill's cropped margin) clamp to the
     // nearest edge.
     private func mapTouch(_ touch: UITouch) -> (Int32, Int32) {
         let p = touch.location(in: self)
         let guest = guestSize()
-        let g = GameSurfaceLayout.map(point: p, guest: guest, aspect: MetalHostView.shared.metalLayer.drawableSize,
-                                      bounds: bounds, mode: InputSettings.shared.displayMode)
+        let g = GameSurfaceLayout.map(point: p, guest: guest, aspect: drawableAspect(),
+                                      bounds: bounds, mode: effectiveDisplayMode())
         return (Int32(g.x), Int32(g.y))
     }
 
@@ -2985,7 +3081,7 @@ final class InputSettings: ObservableObject {
     /// plain `didSet { save() }` here would leave the old mode on screen
     /// until the next incidental layout pass.
     @Published var displayMode: DisplayMode = .aspect {
-        didSet { save(); MetalBackedView.refreshDisplayMode() }
+        didSet { save(); MetalBackedView.refreshDisplayMode(reason: "mode-toggle") }
     }
     /// Landscape HUD cluster (controller/pencil buttons, TouchControlsOverlay.
     /// topBar) drag position — fractional (0...1) of the screen, one slot per
@@ -3126,6 +3222,9 @@ struct ContentView: View {
                 jit_install_trap_handler()
                 entitlements = EntitlementStatus.check()
                 logEntitlementStatus()
+                // WOW64_DESIGN.md §9.2 step 0: measure the free VA map before
+                // Wine/JIT touches it. Read-only, no behaviour change.
+                mad_va_probe(entitlements?.extendedVA ?? false)
                 // ml663: GameController's connect notifications only fire for
                 // devices that arrive AFTER an observer exists, so this has to
                 // run before the user can plug anything in. Idempotent.

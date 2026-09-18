@@ -1039,7 +1039,11 @@ static int add_poll_user( struct fd *fd )
     pollfd[ret].revents = 0;
     poll_users[ret] = fd;
     active_users++;
-    ws_log("[wineserver-fd] add_poll_user: user=%d unix_fd=%d active_users=%d", ret, fd->unix_fd, active_users);
+    {
+        static unsigned int ios_apu_calls;   /* capped like send_client_fd */
+        if (++ios_apu_calls <= 64 || !(ios_apu_calls & 4095))
+            ws_log("[wineserver-fd] add_poll_user: #%u user=%d unix_fd=%d active_users=%d", ios_apu_calls, ret, fd->unix_fd, active_users);
+    }
     return ret;
 }
 

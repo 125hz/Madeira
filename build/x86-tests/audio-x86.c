@@ -36,6 +36,12 @@
  *     DRAIN (that is the only proof the device clock is actually running —
  *     a driver that accepts buffers and never consumes them looks identical
  *     until you read the padding), Stop.
+ * (a2) WASAPI again, but SIX channels of float32 (WAVE_FORMAT_EXTENSIBLE,
+ *     5.1 channel mask) with a 440 Hz tone on front-left and front-right only
+ *     and silence on centre/LFE/surrounds, for 300 ms. This is the shape a
+ *     multichannel title opens and the shape that has to be folded down to a
+ *     stereo route; a driver that takes the 24-byte frame for anything else
+ *     plays it at three times the pitch with the silent channels cut into it.
  * (b) DirectSound: DirectSoundCreate8, a primary buffer, a secondary buffer
  *     of 200 ms, Lock/Unlock, Play, and the play cursor must MOVE.
  * (c) waveOut: 22 kHz mono 8-bit — the oldest shape in the list, and the one
@@ -365,6 +371,178 @@ static void stage_wasapi(void)
     WRITE_LINE("MADEIRA-AUDIO: (a) WASAPI OK\n");
 }
 
+/* --------------------- (a2) 5.1 float, the downmix ----------------------- */
+
+/* One cycle of a sine, 64 points, as constants: there is no CRT here and so no
+ * sinf(). Stepping through it with a 16.16 phase accumulator is exact enough
+ * for "is this a 440 Hz tone or is it static", which is the whole question. */
+static const float sine64[64] = {
+     0.000000f, 0.098017f, 0.195090f, 0.290285f, 0.382683f, 0.471397f, 0.555570f, 0.634393f,
+     0.707107f, 0.773010f, 0.831470f, 0.881921f, 0.923880f, 0.956940f, 0.980785f, 0.995185f,
+     1.000000f, 0.995185f, 0.980785f, 0.956940f, 0.923880f, 0.881921f, 0.831470f, 0.773010f,
+     0.707107f, 0.634393f, 0.555570f, 0.471397f, 0.382683f, 0.290285f, 0.195090f, 0.098017f,
+     0.000000f,-0.098017f,-0.195090f,-0.290285f,-0.382683f,-0.471397f,-0.555570f,-0.634393f,
+    -0.707107f,-0.773010f,-0.831470f,-0.881921f,-0.923880f,-0.956940f,-0.980785f,-0.995185f,
+    -1.000000f,-0.995185f,-0.980785f,-0.956940f,-0.923880f,-0.881921f,-0.831470f,-0.773010f,
+    -0.707107f,-0.634393f,-0.555570f,-0.471397f,-0.382683f,-0.290285f,-0.195090f,-0.098017f
+};
+
+/* KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, spelled out rather than pulled in from
+ * ksmedia.h so this file keeps its short include list. */
+static const GUID subtype_ieee_float =
+    { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
+
+#define SPK_FL 0x1
+#define SPK_FR 0x2
+#define SPK_FC 0x4
+#define SPK_LFE 0x8
+#define SPK_BL 0x10
+#define SPK_BR 0x20
+
+/* A 5.1 stream is what broke on the device: six interleaved float channels
+ * handed to a stereo route. The tone goes on FRONT LEFT and FRONT RIGHT only
+ * and the other four channels are held at silence, so the expected result is
+ * a clean 440 Hz tone at unity — if the driver ever treats the 24-byte frame
+ * as anything other than six channels, the tone comes out at three times the
+ * pitch with the silent channels chopped into it, which is audibly the
+ * reported symptom. */
+static void stage_wasapi_51(void)
+{
+    IMMDeviceEnumerator *devenum = NULL;
+    IAudioRenderClient *render = NULL;
+    IAudioClient *client = NULL;
+    IMMDevice *device = NULL;
+    WAVEFORMATEXTENSIBLE fmt;
+    WAVEFORMATEX *closest = NULL;
+    UINT32 frames = 0, padding = 0, want, i, phase = 0, step;
+    DWORD rate = 48000;
+    BYTE *data = NULL;
+    float *out;
+    HRESULT hr;
+    int k;
+
+    WRITE_LINE("MADEIRA-AUDIO: (a2) WASAPI 5.1 float32, 440 Hz on FL/FR only\n");
+
+    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
+                          &IID_IMMDeviceEnumerator, (void **)&devenum);
+    if (SUCCEEDED(hr))
+        hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(devenum, eRender, eConsole, &device);
+    if (SUCCEEDED(hr))
+        hr = IMMDevice_Activate(device, &IID_IAudioClient, CLSCTX_INPROC_SERVER, NULL,
+                                (void **)&client);
+    if (FAILED(hr) || !client)
+    {
+        WRITE_LINE("MADEIRA-AUDIO: could not re-open a client for the 5.1 stage hr=");
+        write_hex32((unsigned int)hr);
+        WRITE_LINE("\n");
+        ExitProcess(60);
+    }
+
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    fmt.Format.nChannels = 6;
+    fmt.Format.nSamplesPerSec = rate;
+    fmt.Format.wBitsPerSample = 32;
+    fmt.Format.nBlockAlign = 6 * 4;              /* 24 bytes per frame */
+    fmt.Format.nAvgBytesPerSec = rate * fmt.Format.nBlockAlign;
+    fmt.Format.cbSize = 22;
+    fmt.Samples.wValidBitsPerSample = 32;
+    fmt.dwChannelMask = SPK_FL | SPK_FR | SPK_FC | SPK_LFE | SPK_BL | SPK_BR;
+    fmt.SubFormat = subtype_ieee_float;
+
+    hr = IAudioClient_IsFormatSupported(client, AUDCLNT_SHAREMODE_SHARED,
+                                        &fmt.Format, &closest);
+    WRITE_LINE("MADEIRA-AUDIO: IsFormatSupported 5.1float hr=");
+    write_hex32((unsigned int)hr);
+    if (closest) { WRITE_LINE(" closest: "); write_fmt(closest); CoTaskMemFree(closest); }
+    WRITE_LINE("\n");
+    if (FAILED(hr))
+    {
+        WRITE_LINE("MADEIRA-AUDIO: a shared-mode engine that refuses 5.1 sends every "
+                   "multichannel title down its own downmix path or none at all.\n");
+        ExitProcess(60);
+    }
+
+    hr = IAudioClient_Initialize(client, AUDCLNT_SHAREMODE_SHARED, 0, 3000000, 0,
+                                 &fmt.Format, NULL);
+    WRITE_LINE("MADEIRA-AUDIO: Initialize(5.1) hr=");
+    write_hex32((unsigned int)hr);
+    WRITE_LINE("\n");
+    if (FAILED(hr)) ExitProcess(60);
+
+    hr = IAudioClient_GetBufferSize(client, &frames);
+    if (FAILED(hr) || !frames) { WRITE_LINE("MADEIRA-AUDIO: GetBufferSize(5.1) failed\n"); ExitProcess(60); }
+
+    hr = IAudioClient_GetService(client, &IID_IAudioRenderClient, (void **)&render);
+    if (FAILED(hr) || !render) { WRITE_LINE("MADEIRA-AUDIO: GetService(5.1) failed\n"); ExitProcess(60); }
+
+    /* 300 ms of tone, clamped to the buffer. */
+    want = rate / 3;
+    if (want > frames) want = frames;
+    hr = IAudioRenderClient_GetBuffer(render, want, &data);
+    if (FAILED(hr) || !data)
+    {
+        WRITE_LINE("MADEIRA-AUDIO: GetBuffer(5.1, ");
+        write_uint(want);
+        WRITE_LINE(") hr=");
+        write_hex32((unsigned int)hr);
+        WRITE_LINE("\n");
+        ExitProcess(60);
+    }
+
+    /* 64 table entries per cycle at 440 Hz: step = 64*440/rate, in 16.16.
+     * 64*440*65536 is 1845493760, which still fits a DWORD, so this needs no
+     * 64-bit arithmetic. */
+    step = (28160u * 65536u) / rate;
+    out = (float *)data;
+    for (i = 0; i < want; i++)
+    {
+        float v = sine64[(phase >> 16) & 63];
+        out[i * 6 + 0] = v;       /* FL  */
+        out[i * 6 + 1] = v;       /* FR  */
+        out[i * 6 + 2] = 0.0f;    /* FC  */
+        out[i * 6 + 3] = 0.0f;    /* LFE */
+        out[i * 6 + 4] = 0.0f;    /* BL  */
+        out[i * 6 + 5] = 0.0f;    /* BR  */
+        phase += step;
+    }
+    hr = IAudioRenderClient_ReleaseBuffer(render, want, 0);
+    if (FAILED(hr)) { WRITE_LINE("MADEIRA-AUDIO: ReleaseBuffer(5.1) failed\n"); ExitProcess(60); }
+
+    hr = IAudioClient_Start(client);
+    WRITE_LINE("MADEIRA-AUDIO: Start(5.1) ");
+    write_uint(want);
+    WRITE_LINE(" frames hr=");
+    write_hex32((unsigned int)hr);
+    WRITE_LINE("\n");
+    if (FAILED(hr)) ExitProcess(60);
+
+    for (k = 0; k < 16; k++)
+    {
+        Sleep(25);
+        if (FAILED(IAudioClient_GetCurrentPadding(client, &padding))) break;
+        if (padding < want) break;
+    }
+    WRITE_LINE("MADEIRA-AUDIO: 5.1 padding ");
+    write_uint(want);
+    WRITE_LINE(" -> ");
+    write_uint(padding);
+    WRITE_LINE("\n");
+    if (padding >= want)
+    {
+        WRITE_LINE("MADEIRA-AUDIO: the 5.1 buffer never drained - the mixer is not "
+                   "consuming multichannel frames.\n");
+        ExitProcess(60);
+    }
+
+    IAudioClient_Stop(client);
+    IAudioRenderClient_Release(render);
+    IAudioClient_Release(client);
+    IMMDevice_Release(device);
+    IMMDeviceEnumerator_Release(devenum);
+    WRITE_LINE("MADEIRA-AUDIO: (a2) 5.1 downmix OK\n");
+}
+
 /* ----------------------------- (b) DirectSound --------------------------- */
 
 static void stage_dsound(void)
@@ -582,6 +760,7 @@ void start(void)
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
     stage_wasapi();
+    stage_wasapi_51();
     stage_dsound();
     stage_waveout();
 

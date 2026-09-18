@@ -93,6 +93,15 @@ int64_t jit_test_execute_strategy2(void);
 /// pages is a real portability bug. Call after JIT is enabled.
 void jit_wx_probe(void);
 
+/// WOW64_DESIGN.md §9.2 step 0: address-space probe. Call once at startup,
+/// before any Wine/JIT allocation, right after EntitlementStatus is checked
+/// (`entitlement_present` is EntitlementStatus.extendedVA). Read-only: walks
+/// the task's free/mapped map and tries releasing 4GB-aligned reservations,
+/// releasing each immediately. No behaviour change; logs via fprintf(stderr)
+/// / the jit log callback under "[va-map]"/"[va-probe]" tags so it lands in
+/// madeira-log.txt. Budgeted at < 50ms (a few thousand mach calls).
+void mad_va_probe(bool entitlement_present);
+
 // Log callback type
 typedef void (*jit_log_callback_t)(const char *message);
 

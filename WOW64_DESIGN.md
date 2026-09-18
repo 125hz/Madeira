@@ -5744,3 +5744,241 @@ ONLY when CEF runs (lazy), leaving >= 20 GB for games' own allocations.
 4. Device runs: entitled (regression) and stock (the goal): D3D9 cube,
    the 32-bit game, the spawn-chain test (slot count), a 64-bit title.
 Everything here is emulator-generic; nothing is per-title.
+
+- 2026-09-18 — Log r77, a 2008-era 32-bit title through XAudio2/XACT: "very
+  staticky, and isn't playing the right audio". **The driver was opening one
+  RemoteIO unit PER STREAM and handing a 5.1 stream straight to the hardware
+  as if six interleaved channels were the route's own.** The negotiation
+  logging added two days ago is what made this a five-line diagnosis instead
+  of a search, and it also named the second half of the bug on its own.
+  **What the log says.** Three `[ios-astream] CREATE` lines, three
+  `RemoteIO ready` lines, `(3 now live)`:
+  `create_stream fmt=tag65534/2ch/48000Hz/32bit/align8`, then
+  `tag65534/6ch/48000Hz/32bit/align24`, then another stereo one — an XAudio2
+  mastering voice plus two XACT cue banks, which is an ordinary shape and not
+  an exotic one. Two independent faults, either of which alone is "static":
+  1. **Six channels into a stereo route.** `RemoteIO ready: 48000 Hz, 6 ch,
+     24 B/frame` — the unit accepted a 6-channel client format on a device
+     whose output is two channels, and nothing downmixes in between. The
+     hardware consumes the 24-byte frames as its own 8-byte ones, so playback
+     runs three times too fast with every third sample drawn from a different
+     speaker: audio-shaped static, which is exactly the report.
+  2. **Three output units, no mixer.** Three RemoteIO instances rendering into
+     one route with nothing arbitrating. WASAPI shared mode is *by definition*
+     a mixer: one engine, one output format, every client summed into it. This
+     port had N engines and no mixer, which the earlier single-stream titles
+     never exposed.
+  **The rewrite** (`build/ntdll-unix/audio_null_ios.c`), all of it inside the
+  driver; no PE-side file changed.
+  - **One engine, N clients** (`ios_engine_ensure` / `ios_engine_start` /
+    `ios_engine_stop_if_idle` / `ios_engine_render_cb`, lines 897-1005). A
+    single RemoteIO owned by the driver rather than by any stream, stereo
+    float32, running at the rate the unit reports for the hardware side
+    (`kAudioUnitProperty_StreamFormat`, output scope, element 0) rather than an
+    assumed 48 kHz — a headset or Bluetooth route at 44.1 kHz used to make
+    RemoteIO resample behind our back. The render callback walks the stream
+    registry, sums each live stream, then clips to [-1, 1]: summing N clients
+    exceeds full scale routinely and wrapping is the other thing that sounds
+    like static. The unit stops when the last client stops, not when any one
+    of them does.
+  - **The downmix** (`ios_build_mix_gains`, line 694). A per-channel gain pair
+    built once at create_stream from `dwChannelMask`, or from the channel count
+    when there is no mask (plain WAVEFORMATEX — most of DirectSound, all of
+    waveOut). Standard coefficients: L/R at unity to their own side, centre and
+    back-centre at -3 dB to both, surrounds and sides at -3 dB to their side,
+    LFE at -10 dB to both (dropping it loses the bass a game puts ONLY there),
+    mono to both at unity rather than -3 dB so a mono title is not half as loud
+    as a stereo one. Anything the mask does not name folds in at 0.5 rather
+    than being silently dropped. The gains are printed at create_stream, so the
+    next log shows the matrix and not just the channel count.
+  - **SubFormat, not bit depth** (`ios_fmt_tag` / `ios_fmt_kind`, lines 599-650).
+    32-bit is IEEE float OR PCM int32 and the two decode to completely
+    different audio; the old `ios_fmt_is_float` looked at the first BYTE of the
+    SubFormat GUID, which works only by luck of little-endian layout, and
+    everything else keyed off `wBitsPerSample`. Now the sample kind comes from
+    the first DWORD of the SubFormat GUID when the format is EXTENSIBLE, and
+    u8/s16/s24/s32/f32 each have their own decoder.
+    `wValidBitsPerSample` is read and reported: 24-in-32 needs no rescaling
+    because WAVEFORMATEXTENSIBLE stores those samples MSB-justified, but a
+    producer that right-justifies instead would be ~48 dB quiet and the log
+    line is the only thing that would say why.
+  - **Conversion moved off the render thread.** The ring is now the ENGINE's
+    shape — stereo float32, two floats per client frame — and
+    `release_render_buffer` decodes, downmixes and peak-tracks into it on the
+    game's own thread (`ios_ingest_frames`, line 1441). The render thread is
+    left with a resample and an add. It also fixes the accounting the old code
+    got wrong for anything but stereo 16-bit: the ring used to be sized and
+    indexed in the CLIENT's frame bytes, so a 24-byte 5.1 frame and an 8-byte
+    stereo frame indexed the same buffer differently.
+  - **Per-stream resampling** (`ios_resample_step` / `ios_mix_stream`, lines
+    779-830). 16.16 linear interpolation from the client's rate to the engine's;
+    a stream at the engine's own rate has step 0x10000 and the interpolation
+    degenerates to a copy. `play_pos` stays in CLIENT frames, which is what
+    `get_frequency` reports and what `get_position` has to be counted in.
+    `set_sample_rate` recomputes the step — changing the rate without it played
+    the stream at the wrong speed.
+  - **The mix format is now the engine's**: 2ch float32 at the hardware rate
+    (`get_mix_format`, line 1539), where it used to claim 16-bit PCM. Every
+    modern client takes the mix format as the shape to hand over to avoid a
+    conversion; being told 16-bit while the engine mixes float meant a
+    conversion on every path with nothing checking the two agreed.
+  - **Locking.** The registry is now read by the Core Audio render thread as
+    well as by Wine threads, so mutating it takes `g_mix_lock` (mix) and
+    `g_streams_lock` (handle validation), mix first; the render callback only
+    ever TRY-locks, because blocking a render thread is never allowed, and a
+    miss costs one buffer of silence and is counted. Handle validation — the
+    hot path, once per device period per client — still takes the cheap lock
+    only. `stream_unregister` holds the mix lock across the slot clear, which
+    is what makes freeing the stream immediately afterwards safe.
+  - **The 10 s census** (`ios_report_streams`, line 1007), driven from
+    `get_current_padding` because that is the one entry point every active
+    client hits at its period:
+    `[audio] stream 0: fmt=f32/6ch/48000Hz/32bit(valid 32)/mask0x3f
+    frames_written=… underruns=… peak=0.707 playing`, then one
+    `[audio] engine: 48000 Hz, running, 3 client(s), mix-lock misses=0`. "Which
+    of the three clients is the broken one" is the first question every one of
+    these reports raises and the per-call counters could not answer it.
+  **Test**: `build/x86-tests/audio-x86.c` gains stage (a2) — a six-channel
+  float32 WAVE_FORMAT_EXTENSIBLE stream with the 5.1 mask, 440 Hz on FL/FR
+  only and silence on centre/LFE/surrounds, 300 ms, padding must drain. The
+  tone comes from a 64-point sine table stepped with a 16.16 phase
+  accumulator, because there is no CRT here and so no `sinf`. Exit codes are
+  unchanged: 59 still means every path passed, and this stage fails as 60 with
+  the rest of the WASAPI path.
+  **What the next log should show**: exactly ONE `[audio] engine ready: one
+  RemoteIO, <rate> Hz stereo float32` for the whole session however many
+  streams are created; a `downmix L=[1.00 0.00 0.71 0.32 0.71 0.00] R=[0.00
+  1.00 0.71 0.32 0.00 0.71]` on the 5.1 `CREATE` line; no `RemoteIO ready`
+  lines at all (the string is gone); and a `[audio] stream k:` census every
+  10 s whose `peak` is non-zero for the streams that are audible and whose
+  `underruns` stays near zero. A peak of 0 with a rising `frames_written` means
+  the client is writing silence; a large `underruns` with a rising
+  `frames_written` means the ring is being drained faster than it is filled,
+  which would point at the resample step rather than at the downmix.
+  Rebuilt `libntdll_unix.a` (31 succeeded / 0 failed, 1 839 192 bytes) and
+  verified in the produced archive rather than assumed: `engine ready: one
+  RemoteIO`, `stream %d: fmt=`, `downmix L=` and `mix-lock misses` are all
+  present and the old `RemoteIO ready: %u Hz` is gone.
+
+- 2026-09-18 — **Large-address-aware by default for 32-bit processes, Wine's
+  own images pushed into the high half, and a census that names who ate the
+  guest window.** Logs r76/r77/r78: a 2008-era open-world 32-bit D3D9 title
+  boots, reaches gameplay, and a minute later calls `exit(3)` two lines after
+  three `[va-scan] FAILED` lines — `window=0x7100110000..0x7180000000`
+  (i.e. the scan tops out at guest `0x80000000`), sizes `0xfd0000` then
+  `0x7e8000` then `0x3f4000`, `views=347 maxgap=0x3c0000
+  stop=gaps-exhausted(bottom-up)`. That is the allocator's 16 → 8 → 4 MB
+  fallback cascade failing in a 2 GB user space whose largest hole is 3.75 MB,
+  and the CRT aborting on the NULL.
+  **Why 2 GB is not 2 GB here.** The same title fits on Windows, so the
+  difference is what we spend that Windows does not: Wine's builtin i386 DLL
+  images (the farm is 742 modules and a large fraction of them now load) are
+  all inside `[B, B+2G)`; the emulated D3D9 frontend's C++ heap and its
+  `CpuPlaced` dynamic buffers are guest-visible *by construction*
+  (`d3d9_guest_alloc.hpp` — a `Lock()` pointer must be nameable by 32-bit
+  code), and the same run's `[mem-census]` measured `CpuPlaced=9444`,
+  `DynamicBuffer LIVE=7009`, 184 MB; plus the fragmentation all of that leaves.
+  On Windows a non-LAA program never sees any of it, because none of it exists.
+  - **The policy (what Proton ships).** `WINE_LARGE_ADDRESS_AWARE=1` is forced
+    on for 32-bit games upstream for precisely this failure. Here: a 32-bit main
+    image that does **not** carry `IMAGE_FILE_LARGE_ADDRESS_AWARE` is given the
+    whole 4 GB window as its user space anyway. `ios_laa_forced()`
+    (`virtual_ios.c:6264`) is the knob — default ON, `MADEIRA_LAA=0` in
+    `Documents/madeira-env.txt` restores 2 GB for an A/B — and
+    `ios_wow_ceiling_for_charact()` (`:6282`) is now the ONE place the ceiling
+    is spelled. Both sites that used to write
+    `(charact & LARGE_ADDRESS_AWARE) ? limit_4g : limit_2g` call it:
+    `ios_wow_image_ceiling()` (`:6378`), which publishes before `init_peb`
+    because the main image is mapped first, and
+    `virtual_set_large_address_space()` (`:16724`), which publishes at
+    `init_peb`. They cannot disagree about the same image any more. Logs once:
+    `[laa] 32-bit image is not large-address-aware; user space raised to 4 GB
+    (MADEIRA_LAA=0 keeps 2 GB)`.
+  - **`MaximumUserModeAddress` follows for free.** `user_space_wow_limit`
+    becomes `limit_4g - 1`; `get_wow_user_space_limit()` rounds it to
+    `0xFFFF0000` and `SystemBasicInformation.HighestUserAddress` is that minus
+    one — `0xFFFEFFFF`, which is what Windows reports for a 4 GB-aware x86
+    process. Every `zero_bits` translation, the 32-bit stack ceiling and
+    `NtAllocateVirtualMemoryEx`'s `MEM_ADDRESS_REQUIREMENTS` validation read the
+    same global, so they all move together.
+  - **`GlobalMemoryStatus` needed one more thing.** The guest's own kernel32
+    does not ask ntdll: it clamps `dwTotalVirtual`/`dwAvailVirtual` to `MAXLONG`
+    by reading `nt->FileHeader.Characteristics` out of the MAPPED image
+    (`dlls/kernel32/heap.c:466`, "values are limited to 2Gb unless the app has
+    the IMAGE_FILE_LARGE_ADDRESS_AWARE flag"). An app allocator that sizes
+    itself from that call would still have believed it had 2 GB. So the bit is
+    set in the mapped header too, for the main image of a windowed
+    pseudo-process only (`virtual_ios.c:14388`): the headers are a `MAP_PRIVATE`
+    file mapping held at `VPROT_READ|VPROT_WRITECOPY`, so this opens the host
+    page, stores, and closes it; the copy-on-write is private to the process,
+    exactly as a guest write to its own header would be, and Wine's recorded
+    vprot is untouched so a later guest write still faults and is handled
+    normally. `SECTION_IMAGE_INFORMATION` is deliberately NOT patched —
+    `main_image_info.ImageCharacteristics` keeps the file's real bit, which is
+    what makes the `forced-laa=1` evidence honest.
+  - **What stays below 2 GB.** `KUSER_SHARED_DATA` at guest `0x7ffe0000` and the
+    process heap's first segment are untouched. TEB blocks now say out loud that
+    they prefer the low half (`virtual_ios.c:15246`): the first block was already
+    hardcoded to `limit_2g - 1`, and every later block now tries `limit_2g - 1`
+    first and only falls back to the raised ceiling if the low half is full
+    (`[laa] no room below guest 2 GB for a TEB block`). Windows keeps the TEB low
+    even for an LAA program, and the third device run already showed what the
+    alternative costs — TEB32 at guest `0xFFFE0000`, PEB32 at `0xFFFF0000`,
+    unusable to code that reads the sign bit as an error flag. PREFER, not
+    require: a TEB above 2 GB still beats a thread that cannot be created.
+  - **Wine's furniture moves up (item 2, done, not deferred).** A BUILTIN image
+    in a windowed process is Wine's furniture, not the app's — nothing the app
+    does depends on where a system DLL lands, because the app never names one by
+    address. `map_image_view()` now takes `is_builtin` (`:14129`) and, when a
+    high half exists, places builtins top-down in `[B+2G, ceiling]` FIRST
+    (`:14165`), before the preferred-base attempt, leaving the low half to the
+    program. Gated on `IMAGE_FLAGS_ImageDynamicallyRelocated` — the same test
+    the existing `top_down` uses, and the flag that means the server already
+    assigned this image a randomized base, i.e. it is relocatable; an image
+    without it keeps exactly today's placement, so nothing that cannot move is
+    moved. NATIVE (app-supplied) DLLs are untouched and keep their preferred
+    bases. Advisory, never fatal: a failure falls straight through to the
+    ordinary preferred-base / full-window path.
+  - **`[wow-va]` census (item 3).** `[va-scan] FAILED` said the window was full
+    and never said what was in it, and `ios_furniture_census()` cannot answer —
+    it walks the HOST furniture band, while every tenant of a guest window is a
+    Wine view. `ios_wow_va_census()` (`:12054`) walks `views_tree` under the
+    mutex `map_view` already holds and prints, for the first 4 failures per
+    pseudo-process (keyed on the window base, so a later 32-bit process gets its
+    own budget — `:12377`): totals, then per class — `image-builtin` (membership
+    in `builtin_modules`, `ios_view_is_builtin()` at `:12045`), `image-native`,
+    `file-mapping`, `reserved` (MEM_RESERVE, VA spent with no footprint), and
+    `anon<64K` / `anon<1M` / `anon<16M` / `anon<64M` / `anon>=64M`, because
+    "9444 small objects" and "one 512 MB reservation" are different problems
+    with the same total. Anonymous views of exactly 0x4000000 are also counted
+    as `d3d9-arena?` — that is `guest_alloc`'s chunk size. Then the 8 largest
+    free gaps, which is what decides exhaustion versus fragmentation.
+  **Test**: `build/x86-tests/laa-x86.c` + `build-laa-test.sh`, `laa-x86.exe`
+  (i386 PE, kernel32 only, 13 824 B). It is the one test here that is
+  deliberately **not** linked `--large-address-aware`, and its build script
+  asserts the bit is ABSENT — the inverse of every other script's assertion,
+  because an image carrying the bit would pass whether or not the policy works.
+  It prints `GlobalMemoryStatus dwTotalVirtual`, then reserves 64 MB chunks
+  (`MEM_RESERVE|PAGE_NOACCESS`, so this is a question about address space and
+  not about the 4096 MB jetsam ceiling) until failure, and prints
+  `MADEIRA-LAA: reserved N MB highest=0x…`. Exit 60 requires BOTH ≥ 2600 MB
+  reserved AND at least one address ≥ `0x80000000` — a total alone would pass an
+  implementation that raised a limit but still handed out only low addresses.
+  Exit 61 otherwise, which is also how `MADEIRA_LAA=0` is verified: the same
+  binary must then report under 2048 MB and exit 61. Run it from the Custom
+  popup as `C:\windows\syswow64\laa-x86.exe`.
+  **What the next log should show**: one `[laa] 32-bit image is not
+  large-address-aware; user space raised to 4 GB` line, one `[laa] main image
+  header at … patched`, a `[wow-limit] published guest 32-bit ceiling
+  0xffffffff … forced-laa=1`, and a run of `[laa] builtin image #n placed in the
+  high half at guest 0x8…` lines during loading. If a `[va-scan] FAILED` still
+  happens, it is now followed by a `[wow-va] census` that names the owner class
+  holding the window — and the discriminator is there in one line: if
+  `image-builtin` has collapsed to near zero below 2 GB and the failure persists,
+  the window is being eaten by the D3D9 arena and the anon buckets say at what
+  granularity; if `free` is large and `gap#1` is small, it is fragmentation and
+  not exhaustion. The failure that produced r76 should simply not recur: the
+  three failing requests were 16 MB, 8 MB and 4 MB against a 3.75 MB largest gap
+  in a half-window that now has a second half. Rebuilt `libntdll_unix.a`
+  (31 succeeded / 0 failed, 1 839 552 bytes); the only compiler diagnostic is the
+  pre-existing `MemoryWineIosJitPoolAddress` `-Wswitch` note.

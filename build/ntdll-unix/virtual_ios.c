@@ -6227,6 +6227,74 @@ ULONG ios_wow_guest_addr( const void *host )
  * excludes the DOS area; here the floor has to be re-applied inside B. */
 #define IOS_WOW_GUEST_FLOOR ((ULONG_PTR)0x110000)
 
+/***********************************************************************
+ *           ios_laa_forced / ios_wow_ceiling_for_charact
+ *
+ * LARGE-ADDRESS-AWARE BY DEFAULT (the policy Proton ships as
+ * WINE_LARGE_ADDRESS_AWARE=1, forced on for 32-bit games).
+ *
+ * WHY.  A non-large-address-aware image gets a 2 GB user space on Windows, and
+ * a 2008-era open-world D3D9 title fits in it THERE.  It does not fit here,
+ * because this port spends guest VA that Windows does not:
+ *   - Wine's builtin i386 DLL images (the farm is 742 modules and a large
+ *     fraction of them now load) all live inside [B, B+2G);
+ *   - the emulated D3D9 frontend's entire C++ heap and its CpuPlaced dynamic
+ *     buffers are guest-visible by construction (d3d9_guest_alloc.hpp: a Lock()
+ *     pointer must be nameable by 32-bit code), and the census in the same run
+ *     measured DynamicBuffer LIVE=7009 / 184 MB;
+ *   - plus the fragmentation all of that leaves behind.
+ * The observed end state is the [va-scan] FAILED triple (16 -> 8 -> 4 MB
+ * fallbacks, maxgap=0x3c0000) followed by the CRT's exit(3).
+ *
+ * WHAT.  A 32-bit main image that does NOT carry IMAGE_FILE_LARGE_ADDRESS_AWARE
+ * is given the full 4 GB window as its user space anyway.  MADEIRA_LAA=0 (env;
+ * the app passes Documents/madeira-env.txt through) restores the 2 GB ceiling
+ * for an A/B, because the risk this policy takes is real and generic: code that
+ * stores a pointer in a signed int, or tests `if ((int)p < 0)`, breaks above
+ * 0x80000000.  That is exactly the trade Proton makes by default.
+ *
+ * WHAT STAYS LOW regardless (unchanged by this policy, and deliberately so):
+ * the first TEB block and the PEB32/TEB32 derived from it (virtual_alloc_teb
+ * and the first-block allocation both hardcode limit_2g - 1), the
+ * KUSER_SHARED_DATA emulation at guest 0x7ffe0000, and the process heap's first
+ * segment (it is reserved before anything pushes past 2 GB, and nothing here
+ * moves it).  Windows keeps the TEB low even for an LAA program, so this is the
+ * same shape, not a concession.
+ */
+static BOOL ios_laa_forced(void)
+{
+    static int cached = -1;
+
+    if (cached < 0)
+    {
+        const char *e = getenv( "MADEIRA_LAA" );
+        cached = !(e && *e && atoi( e ) == 0);
+    }
+    return cached;
+}
+
+/* The guest user-space ceiling (inclusive) implied by an image's
+ * characteristics, with the policy above applied.  Both places that used to
+ * spell out "(charact & LARGE_ADDRESS_AWARE) ? limit_4g : limit_2g" now call
+ * this, so ios_wow_image_ceiling() (which publishes before init_peb) and
+ * virtual_set_large_address_space() (which publishes at init_peb) can never
+ * disagree about the same image. */
+static ULONG_PTR ios_wow_ceiling_for_charact( WORD charact )
+{
+    BOOL laa = !!(charact & IMAGE_FILE_LARGE_ADDRESS_AWARE);
+
+    if (!laa && ios_laa_forced())
+    {
+        static int said;
+
+        if (!said++)
+            dprintf( 2, "[laa] 32-bit image is not large-address-aware; user space raised to 4 GB "
+                        "(MADEIRA_LAA=0 keeps 2 GB)\n" );
+        laa = TRUE;
+    }
+    return (laa ? limit_4g : limit_2g) - 1;
+}
+
 void ios_wow_translate_limits( ULONG_PTR *limit_low, ULONG_PTR *limit_high )
 {
     ULONG_PTR base = ios_wow_base(), low, high;
@@ -6301,14 +6369,19 @@ static ULONG_PTR ios_wow_image_ceiling( const struct pe_image_info *image_info )
         is_main = FALSE;
     }
 
-    ceiling = ((charact & IMAGE_FILE_LARGE_ADDRESS_AWARE) ? limit_4g : limit_2g) - 1;
-    if (!is_main) return ceiling & ~granularity_mask;
+    /* A DLL mapped before the main image ("too early to know", charact == 0)
+     * keeps the conservative 2 GB and publishes nothing — the LAA policy is a
+     * statement about the PROGRAM, and raising a ceiling for an image we have
+     * not identified is exactly the bug this branch exists to avoid. */
+    if (!is_main) return ((limit_2g) - 1) & ~granularity_mask;
 
+    ceiling = ios_wow_ceiling_for_charact( charact );
     user_space_wow_limit = ceiling;
     ERR( "[wow-limit] published guest 32-bit ceiling %p from the main image "
-         "(machine %04x characteristics %04x large-address-aware=%d) before init_peb\n",
+         "(machine %04x characteristics %04x large-address-aware=%d forced-laa=%d) before init_peb\n",
          (void *)ceiling, image_info->machine, charact,
-         !!(charact & IMAGE_FILE_LARGE_ADDRESS_AWARE) );
+         !!(charact & IMAGE_FILE_LARGE_ADDRESS_AWARE),
+         !(charact & IMAGE_FILE_LARGE_ADDRESS_AWARE) && ios_laa_forced() );
     return get_wow_user_space_limit();
 }
 
@@ -11934,6 +12007,145 @@ failed:
     return status;
 }
 
+#ifdef WINE_IOS
+/***********************************************************************
+ *           ios_wow_va_census
+ *
+ * WHO ATE THE GUEST WINDOW.
+ *
+ * [va-scan] FAILED already says the window is full and prints the largest gap,
+ * but not one word about WHAT is in it — and the whole question this port has
+ * to answer is whether the 2 GB (now 4 GB) is spent on the program or on us.
+ * ios_furniture_census() walks the HOST furniture band and cannot answer it:
+ * the guest window is a Wine reserved area, so every tenant of it is a Wine
+ * view and the view tree is the authoritative record.
+ *
+ * Classes, in the order the log prints them:
+ *   image-builtin   SEC_IMAGE views whose base is in builtin_modules — Wine's
+ *                   own i386 DLL farm, the thing the high-half placement above
+ *                   is trying to move out of the low half.
+ *   image-native    SEC_IMAGE views that are not builtin — the program and the
+ *                   DLLs it shipped.  Untouchable: their bases are theirs.
+ *   file-mapping    SEC_FILE without SEC_IMAGE.
+ *   reserved        MEM_RESERVE with nothing committed at allocation time
+ *                   (VA spent, no footprint) — the D3D9 guest arena's 64 MB
+ *                   chunks land here or in anon-64M below, so the arena is
+ *                   called out separately by its exact chunk size.
+ *   anon-*          everything else, bucketed by allocation size, because
+ *                   "9444 CpuPlaced objects" and "one 512 MB reservation" are
+ *                   completely different problems with the same total.
+ * Plus the 8 largest free gaps, which is what decides whether the next failure
+ * is exhaustion or fragmentation.
+ *
+ * virtual_mutex is held by the caller (map_view), so walking views_tree and
+ * builtin_modules here is safe and nothing can move underneath it.
+ */
+#define IOS_WOW_ARENA_CHUNK  ((size_t)0x4000000)   /* d3d9_guest_alloc.hpp: 64 MB */
+
+static int ios_view_is_builtin( const void *base )
+{
+    struct builtin_module *builtin;
+
+    LIST_FOR_EACH_ENTRY( builtin, &builtin_modules, struct builtin_module, entry )
+        if (builtin->module == base) return 1;
+    return 0;
+}
+
+static void ios_wow_va_census( const void *scan_start, const void *scan_end, size_t want )
+{
+    static const char * const names[] = { "image-builtin", "image-native", "file-mapping",
+                                          "reserved", "anon<64K", "anon<1M", "anon<16M",
+                                          "anon<64M", "anon>=64M" };
+    enum { C_IMG_B, C_IMG_N, C_FILE, C_RESV, C_A64K, C_A1M, C_A16M, C_A64M, C_ABIG, C_MAX };
+    struct { unsigned n; unsigned long long bytes; } cls[C_MAX] = { { 0 } };
+    unsigned long long gap[8] = { 0 };
+    ULONG_PTR gap_at[8] = { 0 };
+    ULONG_PTR base = ios_wow_base();
+    ULONG_PTR ceiling = base + (get_wow_user_space_limit() ? get_wow_user_space_limit()
+                                                           : (limit_2g - 1));
+    ULONG_PTR prev_end = base + IOS_WOW_GUEST_FLOOR;
+    unsigned long long mapped = 0, arena_bytes = 0;
+    unsigned nviews = 0, arena_chunks = 0, above_2g = 0, i, k;
+    unsigned long long above_2g_bytes = 0;
+    struct file_view *view;
+
+    if (!base) return;
+
+    WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+    {
+        ULONG_PTR vb = (ULONG_PTR)view->base;
+        int c;
+
+        if (vb < base || vb >= base + IOS_WOW_WINDOW_SIZE) continue;
+        nviews++;
+        mapped += view->size;
+        if (vb >= base + limit_2g) { above_2g++; above_2g_bytes += view->size; }
+
+        if (vb > prev_end)
+        {
+            unsigned long long g = vb - prev_end;
+
+            for (i = 0; i < 8 && gap[i] >= g; i++) {}
+            if (i < 8)
+            {
+                for (k = 7; k > i; k--) { gap[k] = gap[k - 1]; gap_at[k] = gap_at[k - 1]; }
+                gap[i] = g;
+                gap_at[i] = prev_end;
+            }
+        }
+        if (vb + view->size > prev_end) prev_end = vb + view->size;
+
+        if (view->protect & SEC_IMAGE)      c = ios_view_is_builtin( view->base ) ? C_IMG_B : C_IMG_N;
+        else if (view->protect & SEC_FILE)  c = C_FILE;
+        else if (!(view->protect & VPROT_COMMITTED)) c = C_RESV;
+        else if (view->size <  0x10000)     c = C_A64K;
+        else if (view->size <  0x100000)    c = C_A1M;
+        else if (view->size < 0x1000000)    c = C_A16M;
+        else if (view->size < IOS_WOW_ARENA_CHUNK) c = C_A64M;
+        else                                c = C_ABIG;
+        cls[c].n++;
+        cls[c].bytes += view->size;
+
+        if (view->size == IOS_WOW_ARENA_CHUNK && !(view->protect & (SEC_IMAGE | SEC_FILE)))
+        {
+            arena_chunks++;
+            arena_bytes += view->size;
+        }
+    }
+    if (ceiling > prev_end)
+    {
+        unsigned long long g = ceiling - prev_end;
+
+        for (i = 0; i < 8 && gap[i] >= g; i++) {}
+        if (i < 8)
+        {
+            for (k = 7; k > i; k--) { gap[k] = gap[k - 1]; gap_at[k] = gap_at[k - 1]; }
+            gap[i] = g;
+            gap_at[i] = prev_end;
+        }
+    }
+
+    dprintf( 2, "[wow-va] census B=%p ceiling=guest 0x%llx | the failed request wanted 0x%llx in "
+                "%p..%p | views=%u mapped=%llu MB free=%llu MB (of %llu MB below the ceiling); "
+                "%u views / %llu MB are above guest 2 GB\n",
+             (void *)base, (unsigned long long)(ceiling - base), (unsigned long long)want,
+             scan_start, scan_end, nviews, mapped >> 20,
+             (unsigned long long)(((ceiling - base) - mapped) >> 20),
+             (unsigned long long)((ceiling - base) >> 20), above_2g, above_2g_bytes >> 20 );
+    for (i = 0; i < C_MAX; i++)
+        if (cls[i].n)
+            dprintf( 2, "[wow-va]   %-13s n=%-5u %llu MB (0x%llx)\n",
+                     names[i], cls[i].n, cls[i].bytes >> 20, (unsigned long long)cls[i].bytes );
+    if (arena_chunks)
+        dprintf( 2, "[wow-va]   d3d9-arena?   n=%-5u %llu MB — anonymous views of exactly 0x%llx, "
+                    "the guest_alloc chunk size (counted in a class above as well)\n",
+                 arena_chunks, arena_bytes >> 20, (unsigned long long)IOS_WOW_ARENA_CHUNK );
+    for (i = 0; i < 8 && gap[i]; i++)
+        dprintf( 2, "[wow-va]   gap#%u 0x%llx (%llu MB) at guest 0x%llx\n",
+                 i + 1, gap[i], gap[i] >> 20, (unsigned long long)(gap_at[i] - base) );
+}
+#endif  /* WINE_IOS */
+
 /***********************************************************************
  *           map_view
  *
@@ -12146,6 +12358,25 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                          ptr ? "" : (ceiling_relaxable ? "  --> relaxing ceiling, retrying unclamped"
                                                        : "  <-- STATUS_NO_MEMORY (callers see a NULL alloc)") );
                 }
+#ifdef WINE_IOS
+                /* [wow-va] name the tenants of the guest window on a FAILURE
+                 * inside one.  First 4 per pseudo-process: the interesting run
+                 * is the 16 -> 8 -> 4 MB fallback cascade that precedes the
+                 * CRT's exit(3), and one census per step is enough to see the
+                 * window's shape change (or not).  Keyed on the window base so
+                 * a later 32-bit process gets its own budget instead of
+                 * inheriting a spent session-wide counter. */
+                if (!ptr && ios_wow_base() &&
+                    (ULONG_PTR)start >= ios_wow_base() &&
+                    (ULONG_PTR)start < ios_wow_base() + IOS_WOW_WINDOW_SIZE)
+                {
+                    static ULONG_PTR census_for;
+                    static unsigned census_n;
+
+                    if (census_for != ios_wow_base()) { census_for = ios_wow_base(); census_n = 0; }
+                    if (census_n++ < 4) ios_wow_va_census( start, end, size );
+                }
+#endif
             }
             if (ptr)
             {
@@ -13896,7 +14127,8 @@ static unsigned int get_mapping_info( HANDLE handle, ACCESS_MASK access, unsigne
  * Map a view for a PE image at an appropriate address.
  */
 static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_info *image_info, SIZE_T size,
-                                ULONG_PTR limit_low, ULONG_PTR limit_high, ULONG alloc_type )
+                                ULONG_PTR limit_low, ULONG_PTR limit_high, ULONG alloc_type,
+                                BOOL is_builtin )
 {
     unsigned int vprot = SEC_IMAGE | SEC_FILE | VPROT_COMMITTED | VPROT_READ | VPROT_EXEC | VPROT_WRITECOPY;
     void *base;
@@ -13929,6 +14161,47 @@ static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_inf
          * address_space_start for host placements. */
         limit_low  = wow_base + IOS_WOW_GUEST_FLOOR;
         limit_high = wow_base + ios_wow_image_ceiling( image_info );
+
+        /* [laa] KEEP WINE'S OWN FURNITURE OUT OF THE LOW 2 GB.
+         *
+         * On Windows a non-large-address-aware program never sees anything in
+         * [2G, 4G) at all; here it sees 742 builtin i386 modules competing with
+         * it for the low half, which is what the [va-scan] FAILED evidence is
+         * made of.  A BUILTIN image is Wine's furniture, not the app's: nothing
+         * the app does depends on where it lands, because the app never names a
+         * system DLL by a hardcoded address.  So when a high half exists (the
+         * ceiling is above 2 GB, i.e. the image is LAA or the policy above made
+         * it so), place builtins there first, top-down, and leave the low half
+         * to the program.
+         *
+         * Gated on IMAGE_FLAGS_ImageDynamicallyRelocated — the same test
+         * `top_down` above uses.  That flag means the server already assigned
+         * this image a randomized base, i.e. it is relocatable; an image without
+         * it keeps exactly today's placement, so we can never move something
+         * that cannot be moved.  NATIVE (app-supplied) DLLs are untouched and
+         * keep their preferred bases.
+         *
+         * Advisory, never fatal: on failure we fall straight through to the
+         * ordinary preferred-base / full-window path below. */
+        if (is_builtin && (image_info->image_flags & IMAGE_FLAGS_ImageDynamicallyRelocated) &&
+            limit_high > wow_base + limit_2g)
+        {
+            static unsigned hi_n, hi_fail;
+
+            if (!map_view( view_ret, NULL, size, MEM_TOP_DOWN, vprot,
+                           wow_base + limit_2g, limit_high, 0 ))
+            {
+                if (hi_n++ < 8 || !(hi_n % 64))
+                    dprintf( 2, "[laa] builtin image #%u placed in the high half at guest %p "
+                                "(+0x%lx), keeping the low 2 GB for the program\n",
+                             hi_n, (void *)((ULONG_PTR)(*view_ret)->base - wow_base),
+                             (unsigned long)size );
+                return STATUS_SUCCESS;
+            }
+            if (hi_fail++ < 8)
+                dprintf( 2, "[laa] builtin image (size 0x%lx) did not fit the high half; falling "
+                            "back to the whole window\n", (unsigned long)size );
+        }
 #endif
     }
     else
@@ -14033,7 +14306,7 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
-    status = map_image_view( &view, image_info, size, limit_low, limit_high, alloc_type );
+    status = map_image_view( &view, image_info, size, limit_low, limit_high, alloc_type, is_builtin );
     /* ml366: NAME the image whose placement failed. ml365's mmdevapi load
      * returned c0000017 with zero attributable evidence — the [va-scan]
      * FAILED line was storm-gated and nothing tied a placement failure to a
@@ -14108,6 +14381,67 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
                             s[i].Name, sec_addr, (unsigned long)sec_size);
                         mprotect_exec(sec_addr, sec_size, prot);
                     }
+                }
+            }
+        }
+
+        /* [laa] MAKE THE IMAGE AGREE WITH THE CEILING.
+         *
+         * ios_wow_ceiling_for_charact() raises the VA ceiling, but the guest's
+         * own kernel32 does not ask ntdll what the ceiling is: GlobalMemoryStatus
+         * clamps dwTotalVirtual/dwAvailVirtual to MAXLONG by reading
+         * `nt->FileHeader.Characteristics` straight out of the MAPPED image
+         * (dlls/kernel32/heap.c, "values are limited to 2Gb unless the app has
+         * the IMAGE_FILE_LARGE_ADDRESS_AWARE flag").  An allocator that sizes its
+         * reservations from GlobalMemoryStatus would therefore still believe it
+         * has 2 GB, and so would any app code that inspects its own header.
+         *
+         * So set the bit in the mapped header too, for the main image of a
+         * windowed pseudo-process only.  The headers are a MAP_PRIVATE file
+         * mapping held at VPROT_READ|VPROT_WRITECOPY (unix PROT_READ), so this
+         * opens the host page, stores, and closes it again; the copy-on-write
+         * that the store triggers is private to this process, exactly as a guest
+         * write to its own header would be, and Wine's recorded vprot is
+         * untouched so a later guest write still faults and is handled normally.
+         *
+         * SECTION_IMAGE_INFORMATION is deliberately NOT patched:
+         * main_image_info.ImageCharacteristics keeps the file's real bit, which
+         * is what makes the "forced-laa=1" evidence honest, and every ceiling
+         * consumer already routes through ios_wow_ceiling_for_charact(). */
+        if (ios_wow_base() && !offset && !is_machine_64bit( image_info->machine ) &&
+            !(image_info->image_charact & IMAGE_FILE_DLL) &&
+            !(image_info->image_charact & IMAGE_FILE_LARGE_ADDRESS_AWARE) && ios_laa_forced())
+        {
+            IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)view->base;
+
+            if (dos->e_magic == IMAGE_DOS_SIGNATURE && dos->e_lfanew > 0 &&
+                (SIZE_T)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS32) < min( size, page_size ))
+            {
+                IMAGE_NT_HEADERS32 *nt = (IMAGE_NT_HEADERS32 *)((char *)view->base + dos->e_lfanew);
+
+                if (nt->Signature == IMAGE_NT_SIGNATURE)
+                {
+                    WORD *field = &nt->FileHeader.Characteristics;
+
+                    /* mprotect_range(), not a raw mprotect: a 4 KB-aligned i386
+                     * image puts its first section inside the SAME 16 KB host
+                     * page as its headers, so "restore PROT_READ" would strip
+                     * execute from the top of .text.  mprotect_range recomputes
+                     * the protection from Wine's own per-page bytes (the union
+                     * over the host page), so `set` adds write and the second
+                     * call puts back exactly what was there. */
+                    if (!mprotect_range( field, sizeof(*field), VPROT_WRITE, 0 ))
+                    {
+                        nt->FileHeader.Characteristics |= IMAGE_FILE_LARGE_ADDRESS_AWARE;
+                        mprotect_range( field, sizeof(*field), 0, 0 );
+                        dprintf( 2, "[laa] main image header at %p patched: characteristics now %04x, "
+                                    "so the guest's own GlobalMemoryStatus reports the raised ceiling "
+                                    "too\n", view->base, nt->FileHeader.Characteristics );
+                    }
+                    else
+                        dprintf( 2, "[laa] could not open the main image header at %p for writing "
+                                    "(errno %d) — the VA ceiling is 4 GB but GlobalMemoryStatus will "
+                                    "still clamp to 2 GB\n", view->base, errno );
                 }
             }
         }
@@ -14907,8 +15241,41 @@ NTSTATUS virtual_alloc_teb( TEB **ret_teb )
              * (the third device run's 0xFFFE0000/0xFFFF0000). */
             if (wow && !zbits) zbits = limit_2g - 1;
 #endif
-            if ((status = NtAllocateVirtualMemory( NtCurrentProcess(), &ptr, zbits,
-                                                   &total, MEM_RESERVE, PAGE_READWRITE )))
+            status = STATUS_NO_MEMORY;
+#ifdef WINE_IOS
+            /* [laa] TEB BLOCKS PREFER THE LOW 2 GB — and now have to say so out
+             * loud, because ios_wow_ceiling_for_charact() may have raised
+             * user_space_wow_limit to 4 GB for an image that never asked for it.
+             * Windows keeps the TEB low even for a large-address-aware program,
+             * the first block here is hardcoded to limit_2g for exactly that
+             * reason, and the third device run showed what the alternative costs
+             * (TEB32 at guest 0xFFFE0000, PEB32 at 0xFFFF0000, unusable to code
+             * that treats the sign bit as an error flag).
+             *
+             * PREFER, not require: if the low half is full, a TEB above 2 GB is
+             * still far better than a thread that cannot be created at all, so
+             * this falls back to the published ceiling.  32 blocks of TEB per
+             * reservation makes this rare enough to be a non-event. */
+            if (wow && zbits > limit_2g - 1)
+            {
+                SIZE_T low_total = total;
+
+                status = NtAllocateVirtualMemory( NtCurrentProcess(), &ptr, limit_2g - 1,
+                                                  &low_total, MEM_RESERVE, PAGE_READWRITE );
+                if (status)
+                {
+                    static int spilled;
+
+                    if (spilled++ < 8)
+                        dprintf( 2, "[laa] no room below guest 2 GB for a TEB block (status %x); "
+                                    "falling back to the raised ceiling %p\n",
+                                 (unsigned)status, (void *)zbits );
+                }
+                else total = low_total;
+            }
+#endif
+            if (status && (status = NtAllocateVirtualMemory( NtCurrentProcess(), &ptr, zbits,
+                                                             &total, MEM_RESERVE, PAGE_READWRITE )))
             {
                 server_leave_uninterrupted_section( &virtual_mutex, &sigset );
                 return status;
@@ -16349,7 +16716,15 @@ void virtual_set_large_address_space(void)
                 free_reserved_memory( 0, (char *)0x7ffe0000 );
 #endif
         }
+#ifdef WINE_IOS
+        /* Same rule, one spelling — see ios_wow_ceiling_for_charact().  When
+         * ios_wow_image_ceiling() already published (the normal path: the main
+         * image is mapped before init_peb runs), this recomputes the identical
+         * number from the identical characteristics. */
+        else user_space_wow_limit = ios_wow_ceiling_for_charact( main_image_info.ImageCharacteristics );
+#else
         else user_space_wow_limit = ((main_image_info.ImageCharacteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE) ? limit_4g : limit_2g) - 1;
+#endif
     }
     else
     {

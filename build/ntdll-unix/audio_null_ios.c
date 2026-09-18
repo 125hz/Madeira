@@ -64,7 +64,8 @@ typedef int EDataFlow;
 #define S_FALSE 1
 #define E_FAIL 0x80004005L
 #define E_NOTIMPL 0x80004001L
-#define AUDCLNT_E_NOT_INITIALIZED 0x88890001L
+#define AUDCLNT_E_UNSUPPORTED_FORMAT ((HRESULT)0x88890008L)
+#define AUDCLNT_E_BUFFER_TOO_LARGE ((HRESULT)0x88890006L)
 
 #define eRender 0
 #define eCapture 1
@@ -328,6 +329,19 @@ static const char IOS_DEVICE_NAME[] = "ios-null";
  * typically creates one shared-mode render stream; if a game opens a
  * second concurrent stream we'd need a table. Not worried about that
  * for the Tier-1 silent driver. */
+/* How one sample is stored in the client's buffer.  Derived from the format's
+ * SubFormat GUID when it is EXTENSIBLE, never from the bit depth alone: 32-bit
+ * is IEEE float OR PCM int32 and those two decode to completely different
+ * audio.  Reading the bit depth and guessing is what "isn't playing the right
+ * audio" sounds like. */
+enum ios_sample_kind {
+    IOS_SK_U8,      /* WAVE 8-bit PCM is UNSIGNED */
+    IOS_SK_S16,
+    IOS_SK_S24,     /* packed 3-byte container */
+    IOS_SK_S32,
+    IOS_SK_F32
+};
+
 struct ios_stream {
     int valid;
     int started;
@@ -336,6 +350,13 @@ struct ios_stream {
     UINT32 sample_rate;
     UINT32 channels;
     UINT32 frame_bytes;          /* nBlockAlign of the stream format */
+    enum ios_sample_kind kind;
+    UINT32 valid_bits;           /* wValidBitsPerSample, for the log line */
+    UINT32 channel_mask;         /* dwChannelMask, 0 = "use the default layout" */
+    /* Per-client-channel gain into the engine's stereo bus.  Built once from
+     * the channel mask at create_stream; this is the 5.1 (and 7.1, and quad,
+     * and mono) downmix. */
+    float mix_gain[8][2];
     UINT32 buffer_frames;        /* ring capacity in frames */
     BYTE *render_scratch;        /* contiguous area handed to GetBuffer */
     UINT32 scratch_frames;       /* scratch capacity */
@@ -348,12 +369,23 @@ struct ios_stream {
     UINT_PTR scratch_bytes;      /* reservation size (scratch_guest only) */
     UINT32 pending_frames;       /* frames handed out, awaiting release */
     HANDLE event;
-    /* Tier-2 real output */
-    AudioUnit au;                /* RemoteIO; NULL = null-mode fallback */
-    int au_running;
-    BYTE *ring;
-    _Atomic uint64_t write_pos;  /* frames produced by the game (monotonic) */
-    _Atomic uint64_t play_pos;   /* frames consumed by the RT callback */
+    /* The ring is ALWAYS engine-side stereo float32 -- 2 floats per client
+     * frame -- not the client's own format.  release_render_buffer converts
+     * and downmixes into it on the game's own thread, so the Core Audio
+     * render thread only has to resample and sum. */
+    float *ring;
+    _Atomic uint64_t write_pos;  /* client frames produced by the game (monotonic) */
+    _Atomic uint64_t play_pos;   /* client frames consumed by the mixer */
+    /* 16.16 step from one engine frame to client frames, and the current
+     * fractional position inside play_pos.  Both are owned by the render
+     * thread.  A stream at the engine's own rate has step == 0x10000 and the
+     * interpolation below degenerates to a copy. */
+    uint32_t resample_step;
+    uint32_t resample_frac;
+    /* Diagnostics for the 10 s line. */
+    _Atomic uint64_t stat_frames_written;
+    _Atomic uint32_t stat_underruns;
+    _Atomic uint32_t stat_peak_q16;
 };
 
 /* ml739: one stream object per client, mirroring Wine's CoreAudio driver.
@@ -375,6 +407,10 @@ struct ios_stream {
 #define IOS_MAX_STREAMS 16
 static struct ios_stream *g_streams[IOS_MAX_STREAMS];
 static pthread_mutex_t g_streams_lock;   /* ml739: init at process_attach */
+/* Declared here rather than beside the engine below because the registry
+ * helpers need them; see the comment on stream_register. */
+static pthread_mutex_t g_mix_lock;
+static void ios_engine_stop_if_idle(void);
 
 static struct ios_stream *stream_from_handle(stream_handle h)
 {
@@ -393,13 +429,22 @@ static struct ios_stream *stream_from_handle(stream_handle h)
     return s;
 }
 
+/* The registry is read by TWO readers with very different rules: ordinary Wine
+ * threads validating a handle (often, cheaply, under g_streams_lock) and the
+ * Core Audio render thread walking it to mix (under g_mix_lock, which it only
+ * ever try-locks).  Mutating it therefore takes both, mix lock first, so the
+ * render callback can never walk a half-written slot -- and so that a stream
+ * about to be freed cannot be picked up by a pass already in flight.  Handle
+ * validation keeps taking the cheap lock only. */
 static int stream_register(struct ios_stream *s)
 {
     int i, n = 0;
+    pthread_mutex_lock(&g_mix_lock);
     pthread_mutex_lock(&g_streams_lock);
     for (i = 0; i < IOS_MAX_STREAMS; i++) if (g_streams[i]) n++;
     for (i = 0; i < IOS_MAX_STREAMS; i++) if (!g_streams[i]) { g_streams[i] = s; break; }
     pthread_mutex_unlock(&g_streams_lock);
+    pthread_mutex_unlock(&g_mix_lock);
     if (i == IOS_MAX_STREAMS) return -1;
     fprintf(stderr, "[ios-astream] ml739 CREATE stream=%p (%d now live)\n", (void *)s, n + 1);
     return 0;
@@ -408,10 +453,16 @@ static int stream_register(struct ios_stream *s)
 static void stream_unregister(struct ios_stream *s)
 {
     int i, n = 0;
+    pthread_mutex_lock(&g_mix_lock);
     pthread_mutex_lock(&g_streams_lock);
     for (i = 0; i < IOS_MAX_STREAMS; i++) if (g_streams[i] == s) g_streams[i] = NULL;
     for (i = 0; i < IOS_MAX_STREAMS; i++) if (g_streams[i]) n++;
     pthread_mutex_unlock(&g_streams_lock);
+    /* Still holding the mix lock: the caller frees the stream the moment this
+     * returns, and taking the lock here has waited out any render pass that
+     * was already reading it. */
+    ios_engine_stop_if_idle();
+    pthread_mutex_unlock(&g_mix_lock);
     fprintf(stderr, "[ios-astream] ml739 RELEASE stream=%p (%d still live)\n", (void *)s, n);
 }
 
@@ -530,47 +581,285 @@ static uint64_t elapsed_frames(const struct ios_stream *s) {
     return s->accumulated_frames + (ns * s->sample_rate / 1000000000ull);
 }
 
-/* ------------------- Tier-2: RemoteIO real output ------------------- */
+/* ------------------- format decoding ------------------- */
 
-/* Core Audio real-time thread. Ring + atomics ONLY — no Wine calls, no
- * locks, no allocation, no logging. Underrun = silence (WASAPI-correct:
- * padding drains to 0 and the position clock pauses at write_pos). */
-static OSStatus ios_audio_render_cb(void *refcon, AudioUnitRenderActionFlags *flags,
-                                    const AudioTimeStamp *ts, UInt32 bus,
-                                    UInt32 nframes, AudioBufferList *iodata) {
-    struct ios_stream *s = refcon;
-    BYTE *out = (BYTE *)iodata->mBuffers[0].mData;
-    UINT32 fb = s->frame_bytes;
-    UINT32 cap = s->buffer_frames;
+/* WAVEFORMATEXTENSIBLE body, at the byte offsets the struct has on every
+ * Windows ABI: [0..17] WAVEFORMATEX, [18] Samples (union, wValidBitsPerSample),
+ * [20] dwChannelMask, [24] SubFormat GUID (16 bytes).  This file carries no
+ * Wine headers (see the struct-mirror note at the top), so the body is read by
+ * offset rather than through a struct. */
+static int ios_fmt_is_extensible(const struct WAVEFORMATEX_stub *fmt) {
+    return fmt && fmt->wFormatTag == 0xFFFE && fmt->cbSize >= 22;
+}
+
+/* The format tag that actually decides the sample layout: for EXTENSIBLE that
+ * is the first DWORD of the SubFormat GUID (KSDATAFORMAT_SUBTYPE_PCM is
+ * {00000001-...}, _IEEE_FLOAT is {00000003-...}), not wFormatTag and not the
+ * bit depth. */
+static UINT32 ios_fmt_tag(const struct WAVEFORMATEX_stub *fmt) {
+    if (!fmt) return 0;
+    if (!ios_fmt_is_extensible(fmt)) return fmt->wFormatTag;
+    {
+        const uint8_t *sub = (const uint8_t *)fmt + 24;
+        return (UINT32)sub[0] | ((UINT32)sub[1] << 8) |
+               ((UINT32)sub[2] << 16) | ((UINT32)sub[3] << 24);
+    }
+}
+
+static int ios_fmt_is_float(const struct WAVEFORMATEX_stub *fmt) {
+    return ios_fmt_tag(fmt) == 3;
+}
+
+static UINT32 ios_fmt_valid_bits(const struct WAVEFORMATEX_stub *fmt) {
+    UINT32 v;
+    if (!fmt) return 0;
+    if (!ios_fmt_is_extensible(fmt)) return fmt->wBitsPerSample;
+    v = *(const uint16_t *)((const char *)fmt + 18);
+    /* 0 means "same as the container"; anything larger is a broken header. */
+    if (!v || v > fmt->wBitsPerSample) v = fmt->wBitsPerSample;
+    return v;
+}
+
+static UINT32 ios_fmt_channel_mask(const struct WAVEFORMATEX_stub *fmt) {
+    if (!ios_fmt_is_extensible(fmt)) return 0;
+    return *(const uint32_t *)((const char *)fmt + 20);
+}
+
+/* Container size -> how to read one sample.  wValidBitsPerSample smaller than
+ * the container (24-in-32) needs no rescaling: WAVEFORMATEXTENSIBLE stores
+ * those samples MSB-justified inside the container, so reading the container
+ * as a full-range integer is already correct.  The valid-bits count is kept
+ * only so the 10 s line can show it, because a producer that right-justifies
+ * instead would show up as audio ~48 dB too quiet and nothing else would say
+ * why. */
+static enum ios_sample_kind ios_fmt_kind(const struct WAVEFORMATEX_stub *fmt) {
+    if (ios_fmt_is_float(fmt)) return IOS_SK_F32;
+    switch (fmt->wBitsPerSample) {
+    case 8:  return IOS_SK_U8;
+    case 24: return IOS_SK_S24;
+    case 32: return IOS_SK_S32;
+    default: return IOS_SK_S16;
+    }
+}
+
+/* One sample of channel `c` of one frame, as a float in [-1, 1]. */
+static float ios_sample_to_float(enum ios_sample_kind kind, const BYTE *frame, UINT32 c) {
+    switch (kind) {
+    case IOS_SK_F32: { float v; memcpy(&v, frame + (size_t)c * 4, 4); return v; }
+    case IOS_SK_U8:  return ((int)frame[c] - 128) * (1.0f / 128.0f);
+    case IOS_SK_S24: {
+        const BYTE *p = frame + (size_t)c * 3;
+        /* little-endian 24-bit, promoted to the top of an int32 so one scale
+         * factor serves every integer width */
+        int32_t v = (int32_t)(((uint32_t)p[0] << 8) | ((uint32_t)p[1] << 16) |
+                              ((uint32_t)p[2] << 24));
+        return v * (1.0f / 2147483648.0f);
+    }
+    case IOS_SK_S32: { int32_t v; memcpy(&v, frame + (size_t)c * 4, 4); return v * (1.0f / 2147483648.0f); }
+    case IOS_SK_S16: default: { int16_t v; memcpy(&v, frame + (size_t)c * 2, 2); return v * (1.0f / 32768.0f); }
+    }
+}
+
+/* SPEAKER_* bits from ksmedia.h, in the order WAVEFORMATEXTENSIBLE requires
+ * the channels to appear in the buffer (low bit first). */
+#define IOS_SPK_FRONT_LEFT            0x00001
+#define IOS_SPK_FRONT_RIGHT           0x00002
+#define IOS_SPK_FRONT_CENTER          0x00004
+#define IOS_SPK_LOW_FREQUENCY         0x00008
+#define IOS_SPK_BACK_LEFT             0x00010
+#define IOS_SPK_BACK_RIGHT            0x00020
+#define IOS_SPK_FRONT_LEFT_OF_CENTER  0x00040
+#define IOS_SPK_FRONT_RIGHT_OF_CENTER 0x00080
+#define IOS_SPK_BACK_CENTER           0x00100
+#define IOS_SPK_SIDE_LEFT             0x00200
+#define IOS_SPK_SIDE_RIGHT            0x00400
+
+#define IOS_GAIN_M3DB 0.70710678f
+
+/* Build the per-channel downmix into the stereo bus.
+ *
+ * THIS IS THE BUG THE DEVICE HEARD.  A 5.1 stream used to be handed to a
+ * 6-channel RemoteIO unit on a device whose route is stereo: the hardware
+ * takes the interleaved 24-byte frames as if they were its own, so playback
+ * runs three times too fast with every third sample from a different speaker
+ * -- static that has the shape of the real audio in it.  Nothing downmixes
+ * for us, so this does, with the standard ITU coefficients: centre and the
+ * surrounds fold in at -3 dB, LFE at -10 dB (dropping it entirely loses the
+ * bass a game puts ONLY there), and the mixer saturates at the end.
+ *
+ * The layout comes from dwChannelMask when there is one.  When there is not
+ * -- a plain WAVEFORMATEX, which is most of DirectSound and all of waveOut --
+ * the channel count implies the standard layout, which is what every other
+ * WASAPI implementation assumes too. */
+static void ios_build_mix_gains(struct ios_stream *s, UINT32 mask)
+{
+    static const UINT32 default_mask[9] = {
+        0,
+        IOS_SPK_FRONT_CENTER,                                            /* 1: mono */
+        IOS_SPK_FRONT_LEFT | IOS_SPK_FRONT_RIGHT,                        /* 2 */
+        IOS_SPK_FRONT_LEFT | IOS_SPK_FRONT_RIGHT | IOS_SPK_FRONT_CENTER, /* 3 */
+        IOS_SPK_FRONT_LEFT | IOS_SPK_FRONT_RIGHT | IOS_SPK_BACK_LEFT | IOS_SPK_BACK_RIGHT,
+        IOS_SPK_FRONT_LEFT | IOS_SPK_FRONT_RIGHT | IOS_SPK_FRONT_CENTER |
+            IOS_SPK_BACK_LEFT | IOS_SPK_BACK_RIGHT,                      /* 5 */
+        IOS_SPK_FRONT_LEFT | IOS_SPK_FRONT_RIGHT | IOS_SPK_FRONT_CENTER |
+            IOS_SPK_LOW_FREQUENCY | IOS_SPK_BACK_LEFT | IOS_SPK_BACK_RIGHT, /* 6: 5.1 */
+        IOS_SPK_FRONT_LEFT | IOS_SPK_FRONT_RIGHT | IOS_SPK_FRONT_CENTER |
+            IOS_SPK_LOW_FREQUENCY | IOS_SPK_BACK_CENTER |
+            IOS_SPK_SIDE_LEFT | IOS_SPK_SIDE_RIGHT,                      /* 7: 6.1 */
+        IOS_SPK_FRONT_LEFT | IOS_SPK_FRONT_RIGHT | IOS_SPK_FRONT_CENTER |
+            IOS_SPK_LOW_FREQUENCY | IOS_SPK_BACK_LEFT | IOS_SPK_BACK_RIGHT |
+            IOS_SPK_SIDE_LEFT | IOS_SPK_SIDE_RIGHT                       /* 8: 7.1 */
+    };
+    UINT32 ch = s->channels, c, bit, i;
+
+    memset(s->mix_gain, 0, sizeof(s->mix_gain));
+    if (ch > 8) ch = 8;
+
+    /* One channel is mono however it is labelled: it goes to both sides at
+     * unity, not at -3 dB, or a mono game is half as loud as a stereo one. */
+    if (ch == 1) {
+        s->mix_gain[0][0] = s->mix_gain[0][1] = 1.0f;
+        return;
+    }
+
+    if (!mask || ch > 8) mask = default_mask[ch <= 8 ? ch : 8];
+
+    /* Walk the mask low bit first; the Nth set bit is the Nth channel in the
+     * interleaved frame.  A mask with fewer bits than there are channels
+     * leaves the extra channels at zero rather than guessing. */
+    c = 0;
+    for (i = 0; i < 11 && c < ch; i++) {
+        bit = 1u << i;
+        if (!(mask & bit)) continue;
+        switch (bit) {
+        case IOS_SPK_FRONT_LEFT:            s->mix_gain[c][0] = 1.0f; break;
+        case IOS_SPK_FRONT_RIGHT:           s->mix_gain[c][1] = 1.0f; break;
+        case IOS_SPK_FRONT_CENTER:
+        case IOS_SPK_BACK_CENTER:
+            s->mix_gain[c][0] = s->mix_gain[c][1] = IOS_GAIN_M3DB; break;
+        case IOS_SPK_LOW_FREQUENCY:
+            s->mix_gain[c][0] = s->mix_gain[c][1] = 0.316f; /* -10 dB */ break;
+        case IOS_SPK_BACK_LEFT:
+        case IOS_SPK_SIDE_LEFT:
+        case IOS_SPK_FRONT_LEFT_OF_CENTER:  s->mix_gain[c][0] = IOS_GAIN_M3DB; break;
+        case IOS_SPK_BACK_RIGHT:
+        case IOS_SPK_SIDE_RIGHT:
+        case IOS_SPK_FRONT_RIGHT_OF_CENTER: s->mix_gain[c][1] = IOS_GAIN_M3DB; break;
+        default: break;
+        }
+        c++;
+    }
+    /* A mask that named fewer speakers than the stream has channels (or named
+     * none we know) would silence the rest; fold anything left over into both
+     * sides quietly rather than dropping it. */
+    for (; c < ch; c++)
+        s->mix_gain[c][0] = s->mix_gain[c][1] = 0.5f;
+}
+
+/* ------------------- Tier-2: one RemoteIO engine, N streams -------------
+ *
+ * There used to be one AudioUnit PER STREAM.  A title that opens three
+ * concurrent clients -- an XAudio2 mastering voice, a 5.1 cue bank and a
+ * stereo one is an ordinary shape -- then had three RemoteIO instances all
+ * rendering into the same route with nothing arbitrating between them.  The
+ * hardware picks one, or interleaves them, and the result is the static the
+ * device reported.  WASAPI shared mode is by definition a mixer: one engine,
+ * one output format, every client summed into it.  So: ONE unit, owned by the
+ * driver rather than by any stream, running stereo float32 at the hardware's
+ * own sample rate, and a software mixer in the render callback. */
+static AudioUnit g_engine_au;
+static int g_engine_running;
+static UINT32 g_engine_rate = IOS_AUDIO_SAMPLE_RATE;
+/* g_mix_lock (declared with the registry above) guards the stream registry
+ * against the render callback.  The callback only ever TRY-locks it (blocking
+ * a Core Audio render thread is never allowed); the rare miss, while a stream
+ * is being created or freed, costs one buffer of silence and is counted. */
+static _Atomic uint32_t g_mix_lock_misses;
+
+static uint32_t ios_resample_step(UINT32 stream_rate)
+{
+    uint64_t step;
+    if (!stream_rate || !g_engine_rate) return 0x10000u;
+    /* client frames per engine frame, 16.16 */
+    step = ((uint64_t)stream_rate << 16) / g_engine_rate;
+    if (!step) step = 1;
+    return (uint32_t)step;
+}
+
+/* Sum ONE stream into the engine's stereo bus.  Core Audio real-time thread:
+ * ring + atomics only, no Wine calls, no allocation, no logging.  An underrun
+ * simply contributes nothing further -- WASAPI-correct, since padding drains
+ * to zero and the position clock pauses at write_pos. */
+static void ios_mix_stream(struct ios_stream *s, float *out, UInt32 nframes)
+{
     uint64_t play = atomic_load_explicit(&s->play_pos, memory_order_relaxed);
     uint64_t wr = atomic_load_explicit(&s->write_pos, memory_order_acquire);
     uint64_t avail = wr - play;
-    UInt32 tocopy = avail < nframes ? (UInt32)avail : nframes;
-    UInt32 i = 0;
-    (void)flags; (void)ts; (void)bus;
-    while (i < tocopy) {
-        UINT32 idx = (UINT32)((play + i) % cap);
-        UINT32 chunk = cap - idx;
-        if (chunk > tocopy - i) chunk = tocopy - i;
-        memcpy(out + (size_t)i * fb, s->ring + (size_t)idx * fb, (size_t)chunk * fb);
-        i += chunk;
+    uint32_t cap = s->buffer_frames;
+    uint32_t step = s->resample_step ? s->resample_step : 0x10000u;
+    uint32_t frac = s->resample_frac;
+    UInt32 i;
+
+    if (!cap || !s->ring) return;
+    for (i = 0; i < nframes; i++) {
+        uint32_t idx, adv;
+        float l, r;
+        /* Interpolation needs the next frame too, but only when we are
+         * actually between frames -- at the engine's own rate frac is always
+         * zero and one available frame is enough. */
+        if (avail < (frac ? 2u : 1u)) {
+            atomic_fetch_add_explicit(&s->stat_underruns, 1, memory_order_relaxed);
+            break;
+        }
+        idx = (uint32_t)(play % cap);
+        l = s->ring[(size_t)idx * 2];
+        r = s->ring[(size_t)idx * 2 + 1];
+        if (frac) {
+            uint32_t idx2 = (idx + 1) % cap;
+            float t = (float)frac * (1.0f / 65536.0f);
+            l += (s->ring[(size_t)idx2 * 2] - l) * t;
+            r += (s->ring[(size_t)idx2 * 2 + 1] - r) * t;
+        }
+        out[(size_t)i * 2] += l;
+        out[(size_t)i * 2 + 1] += r;
+        frac += step;
+        adv = frac >> 16;
+        frac &= 0xffffu;
+        if (adv > avail) adv = (uint32_t)avail;
+        play += adv;
+        avail -= adv;
     }
-    if (tocopy < nframes)
-        memset(out + (size_t)tocopy * fb, 0, (size_t)(nframes - tocopy) * fb);
-    atomic_store_explicit(&s->play_pos, play + tocopy, memory_order_release);
-    return noErr;
+    s->resample_frac = frac;
+    atomic_store_explicit(&s->play_pos, play, memory_order_release);
 }
 
-/* Parse the WASAPI format into "is float?" — tag 3 = IEEE float, tag
- * 0xFFFE = extensible (SubFormat GUID first byte: 1 PCM, 3 float). */
-static int ios_fmt_is_float(const struct WAVEFORMATEX_stub *fmt) {
-    if (!fmt) return 0;
-    if (fmt->wFormatTag == 3) return 1;
-    if (fmt->wFormatTag == 0xFFFE && fmt->cbSize >= 22) {
-        const uint8_t *sub = (const uint8_t *)fmt + 24;
-        return sub[0] == 3;
+static OSStatus ios_engine_render_cb(void *refcon, AudioUnitRenderActionFlags *flags,
+                                     const AudioTimeStamp *ts, UInt32 bus,
+                                     UInt32 nframes, AudioBufferList *iodata) {
+    float *out = (float *)iodata->mBuffers[0].mData;
+    size_t samples = (size_t)nframes * 2;
+    size_t j;
+    int i;
+    (void)refcon; (void)flags; (void)ts; (void)bus;
+
+    memset(out, 0, samples * sizeof(float));
+    if (pthread_mutex_trylock(&g_mix_lock)) {
+        atomic_fetch_add_explicit(&g_mix_lock_misses, 1, memory_order_relaxed);
+        return noErr;
     }
-    return 0;
+    for (i = 0; i < IOS_MAX_STREAMS; i++) {
+        struct ios_stream *s = g_streams[i];
+        if (s && s->valid && s->started) ios_mix_stream(s, out, nframes);
+    }
+    pthread_mutex_unlock(&g_mix_lock);
+    /* Summing N clients can exceed full scale; clip rather than wrap, which
+     * is what every hardware mixer does and what the alternative sounds
+     * like. */
+    for (j = 0; j < samples; j++) {
+        float v = out[j];
+        out[j] = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
+    }
+    return noErr;
 }
 
 /* Is this a PCM or float format this driver can actually open?  The RemoteIO
@@ -601,75 +890,153 @@ static int ios_fmt_openable(const struct WAVEFORMATEX_stub *fmt)
     return 1;
 }
 
-/* Build the RemoteIO unit for the negotiated stream format. Returns 0 on
- * success; any failure leaves s->au NULL (null-mode fallback). */
-static int ios_audio_setup_unit(struct ios_stream *s, const struct WAVEFORMATEX_stub *fmt) {
+/* Build the ONE output unit, once, at the hardware's own sample rate.  Any
+ * failure leaves g_engine_au NULL, which is the null-mode fallback: streams
+ * still keep time off the wall clock so a game's audio-driven logic advances
+ * even with no audible output.  Called with g_mix_lock held. */
+static int ios_engine_ensure(void) {
     AudioComponentDescription desc = {0};
-    AudioComponent comp;
     AudioStreamBasicDescription asbd = {0};
+    AudioStreamBasicDescription hw = {0};
     AURenderCallbackStruct cb;
+    AudioComponent comp;
+    UInt32 sz = sizeof(hw);
+    AudioUnit au = NULL;
     OSStatus err;
+
+    if (g_engine_au) return 0;
 
     desc.componentType = kAudioUnitType_Output;
     desc.componentSubType = kAudioUnitSubType_RemoteIO;
     desc.componentManufacturer = kAudioUnitManufacturer_Apple;
     comp = AudioComponentFindNext(NULL, &desc);
-    if (!comp) { fprintf(stderr, "[ios_audio] RemoteIO component not found\n"); return -1; }
-    if ((err = AudioComponentInstanceNew(comp, &s->au))) {
-        fprintf(stderr, "[ios_audio] AudioComponentInstanceNew: %d\n", (int)err);
-        s->au = NULL; return -1;
+    if (!comp) { fprintf(stderr, "[audio] RemoteIO component not found\n"); return -1; }
+    if ((err = AudioComponentInstanceNew(comp, &au))) {
+        fprintf(stderr, "[audio] AudioComponentInstanceNew: %d\n", (int)err);
+        return -1;
     }
 
-    asbd.mSampleRate = s->sample_rate;
-    asbd.mFormatID = kAudioFormatLinearPCM;
-    asbd.mBytesPerPacket = s->frame_bytes;
-    asbd.mFramesPerPacket = 1;
-    asbd.mBytesPerFrame = s->frame_bytes;
-    asbd.mChannelsPerFrame = s->channels;
-    asbd.mBitsPerChannel = (s->frame_bytes / s->channels) * 8;
-    /* WAVE 8-bit PCM is UNSIGNED and everything wider is signed -- that is the
-     * format's rule, not a choice.  Marking an 8-bit stream signed inverts its
-     * sign bit on the way to the hardware, which plays as full-scale buzz
-     * rather than as the sample the game wrote; plenty of older titles still
-     * open waveOut at 8 bits. */
-    asbd.mFormatFlags = kAudioFormatFlagIsPacked |
-        (ios_fmt_is_float(fmt) ? kAudioFormatFlagIsFloat
-         : (asbd.mBitsPerChannel > 8 ? kAudioFormatFlagIsSignedInteger : 0));
+    /* Ask the unit what the route is actually running at rather than assuming
+     * 48 kHz.  A headset or a Bluetooth route can put the session at 44.1 or
+     * 16 kHz, and a client format that disagrees with the hardware either
+     * makes RemoteIO resample behind our back or plays at the wrong speed.
+     * Matching it here means the only resampling is ours, per stream, and it
+     * is visible in the log. */
+    g_engine_rate = IOS_AUDIO_SAMPLE_RATE;
+    if (!AudioUnitGetProperty(au, kAudioUnitProperty_StreamFormat,
+                              kAudioUnitScope_Output, 0, &hw, &sz) &&
+        hw.mSampleRate >= 4000.0 && hw.mSampleRate <= 192000.0)
+        g_engine_rate = (UINT32)hw.mSampleRate;
 
-    err = AudioUnitSetProperty(s->au, kAudioUnitProperty_StreamFormat,
+    /* Stereo float32, interleaved: the engine's mix bus.  Everything a client
+     * opens is converted and downmixed into this one shape. */
+    asbd.mSampleRate = g_engine_rate;
+    asbd.mFormatID = kAudioFormatLinearPCM;
+    asbd.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+    asbd.mChannelsPerFrame = 2;
+    asbd.mBitsPerChannel = 32;
+    asbd.mBytesPerFrame = 2 * 4;
+    asbd.mFramesPerPacket = 1;
+    asbd.mBytesPerPacket = asbd.mBytesPerFrame;
+
+    err = AudioUnitSetProperty(au, kAudioUnitProperty_StreamFormat,
                                kAudioUnitScope_Input, 0, &asbd, sizeof(asbd));
     if (err) {
-        fprintf(stderr, "[ios_audio] SetProperty(StreamFormat rate=%u ch=%u fb=%u float=%d): %d\n",
-                s->sample_rate, s->channels, s->frame_bytes, ios_fmt_is_float(fmt), (int)err);
+        fprintf(stderr, "[audio] SetProperty(StreamFormat %u Hz stereo float32): %d\n",
+                g_engine_rate, (int)err);
         goto fail;
     }
 
-    cb.inputProc = ios_audio_render_cb;
-    cb.inputProcRefCon = s;
-    err = AudioUnitSetProperty(s->au, kAudioUnitProperty_SetRenderCallback,
+    cb.inputProc = ios_engine_render_cb;
+    cb.inputProcRefCon = NULL;
+    err = AudioUnitSetProperty(au, kAudioUnitProperty_SetRenderCallback,
                                kAudioUnitScope_Input, 0, &cb, sizeof(cb));
-    if (err) { fprintf(stderr, "[ios_audio] SetRenderCallback: %d\n", (int)err); goto fail; }
+    if (err) { fprintf(stderr, "[audio] SetRenderCallback: %d\n", (int)err); goto fail; }
 
-    if ((err = AudioUnitInitialize(s->au))) {
-        fprintf(stderr, "[ios_audio] AudioUnitInitialize: %d\n", (int)err);
+    if ((err = AudioUnitInitialize(au))) {
+        fprintf(stderr, "[audio] AudioUnitInitialize: %d\n", (int)err);
         goto fail;
     }
-    fprintf(stderr, "[ios_audio] RemoteIO ready: %u Hz, %u ch, %u B/frame, float=%d, ring=%u frames\n",
-            s->sample_rate, s->channels, s->frame_bytes, ios_fmt_is_float(fmt), s->buffer_frames);
+    g_engine_au = au;
+    fprintf(stderr, "[audio] engine ready: one RemoteIO, %u Hz stereo float32, "
+                    "up to %d clients mixed\n", g_engine_rate, IOS_MAX_STREAMS);
     return 0;
 fail:
-    AudioComponentInstanceDispose(s->au);
-    s->au = NULL;
+    AudioComponentInstanceDispose(au);
     return -1;
 }
 
-static void ios_audio_teardown_unit(struct ios_stream *s) {
-    if (!s->au) return;
-    if (s->au_running) AudioOutputUnitStop(s->au);
-    AudioUnitUninitialize(s->au);
-    AudioComponentInstanceDispose(s->au);
-    s->au = NULL;
-    s->au_running = 0;
+/* Called with g_mix_lock held. */
+static void ios_engine_start(void) {
+    OSStatus err;
+    if (!g_engine_au || g_engine_running) return;
+    if ((err = AudioOutputUnitStart(g_engine_au))) {
+        fprintf(stderr, "[audio] AudioOutputUnitStart: %d -- null-mode\n", (int)err);
+        AudioUnitUninitialize(g_engine_au);
+        AudioComponentInstanceDispose(g_engine_au);
+        g_engine_au = NULL;
+        return;
+    }
+    g_engine_running = 1;
+}
+
+/* Stop the hardware once no client is playing.  Called with g_mix_lock held. */
+static void ios_engine_stop_if_idle(void) {
+    int i;
+    if (!g_engine_au || !g_engine_running) return;
+    for (i = 0; i < IOS_MAX_STREAMS; i++)
+        if (g_streams[i] && g_streams[i]->valid && g_streams[i]->started) return;
+    AudioOutputUnitStop(g_engine_au);
+    g_engine_running = 0;
+}
+
+static void ios_engine_teardown(void) {
+    if (!g_engine_au) return;
+    if (g_engine_running) AudioOutputUnitStop(g_engine_au);
+    AudioUnitUninitialize(g_engine_au);
+    AudioComponentInstanceDispose(g_engine_au);
+    g_engine_au = NULL;
+    g_engine_running = 0;
+}
+
+/* The 10 s census.  Called from ordinary Wine threads only (get_current_padding
+ * is the one entry point every active client hits at its device period), never
+ * from the render callback.  One line per live stream, because "which of the
+ * three clients is the broken one" is the first question every one of these
+ * reports raises and the per-call counters cannot answer it. */
+static void ios_report_streams(void) {
+    static uint64_t last_mach;
+    static const char *kind_name[] = { "u8", "s16", "s24", "s32", "f32" };
+    uint64_t now = mach_absolute_time();
+    int i, k = 0;
+
+    if (last_mach && mach_to_ns(now - last_mach) < 10000000000ull) return;
+    if (pthread_mutex_trylock(&g_mix_lock)) return;   /* next period will do */
+    last_mach = now;
+    for (i = 0; i < IOS_MAX_STREAMS; i++) {
+        struct ios_stream *s = g_streams[i];
+        uint32_t peak;
+        if (!s) continue;
+        peak = atomic_load_explicit(&s->stat_peak_q16, memory_order_relaxed);
+        atomic_store_explicit(&s->stat_peak_q16, 0, memory_order_relaxed);
+        fprintf(stderr, "[audio] stream %d: fmt=%s/%uch/%uHz/%ubit(valid %u)/mask0x%x "
+                        "frames_written=%llu underruns=%u peak=%u.%03u %s\n",
+                k, kind_name[s->kind], s->channels, s->sample_rate,
+                s->frame_bytes && s->channels ? (s->frame_bytes / s->channels) * 8 : 0,
+                s->valid_bits, s->channel_mask,
+                (unsigned long long)atomic_load_explicit(&s->stat_frames_written,
+                                                         memory_order_relaxed),
+                atomic_load_explicit(&s->stat_underruns, memory_order_relaxed),
+                peak >> 16, ((peak & 0xffff) * 1000) >> 16,
+                s->started ? "playing" : "stopped");
+        k++;
+    }
+    if (k)
+        fprintf(stderr, "[audio] engine: %u Hz, %s, %d client(s), mix-lock misses=%u\n",
+                g_engine_rate, g_engine_au ? (g_engine_running ? "running" : "idle")
+                                           : "NULL (null-mode, no audible output)",
+                k, atomic_load_explicit(&g_mix_lock_misses, memory_order_relaxed));
+    pthread_mutex_unlock(&g_mix_lock);
 }
 
 /* ---------------------------------------------------------------- */
@@ -743,6 +1110,7 @@ static NTSTATUS ios_process_attach(void *args) {
     LOG_FN_CALL(0, "process_attach");
     (void)args;
     pthread_mutex_init(&g_streams_lock, NULL);
+    pthread_mutex_init(&g_mix_lock, NULL);
     if (!g_timebase.denom) mach_timebase_info(&g_timebase);
     return STATUS_SUCCESS;
 }
@@ -754,22 +1122,24 @@ static NTSTATUS ios_process_detach(void *args) {
      * live at process detach has to be disposed individually. */
     {
         int i;
+        /* The engine goes first and under the same lock the render callback
+         * uses, so no pass can be in flight over the registry we are about to
+         * empty. */
+        pthread_mutex_lock(&g_mix_lock);
+        ios_engine_teardown();
         for (i = 0; i < IOS_MAX_STREAMS; i++) {
-            struct ios_stream *s;
-            pthread_mutex_lock(&g_streams_lock);
-            s = g_streams[i];
+            struct ios_stream *s = g_streams[i];
             g_streams[i] = NULL;
-            pthread_mutex_unlock(&g_streams_lock);
             if (!s) continue;
-            /* Stop the hardware, but do NOT free. release_stream joins a
-             * stream's own timer thread before freeing it; here we have no
-             * handle to join, and freeing while that thread may still be
-             * looping is a use-after-free. The process is going away, so
-             * leaving the memory is the safe trade. */
+            /* Mark dead, but do NOT free. release_stream joins a stream's own
+             * timer thread before freeing it; here we have no handle to join,
+             * and freeing while that thread may still be looping is a
+             * use-after-free. The process is going away, so leaving the memory
+             * is the safe trade. */
             s->valid = 0;
             s->started = 0;
-            ios_audio_teardown_unit(s);
         }
+        pthread_mutex_unlock(&g_mix_lock);
     }
     return STATUS_SUCCESS;
 }
@@ -839,7 +1209,7 @@ static NTSTATUS ios_create_stream(void *args) {
      * is fine and only the environment is not, and where silent-but-ticking
      * keeps a game's timing alive. */
     if (!ios_fmt_openable(p->fmt)) {
-        p->result = (HRESULT)0x88890008L; /* AUDCLNT_E_UNSUPPORTED_FORMAT */
+        p->result = AUDCLNT_E_UNSUPPORTED_FORMAT;
         ios_log_fmt("create_stream", p->fmt, p->share, p->result);
         return STATUS_SUCCESS;
     }
@@ -859,33 +1229,56 @@ static NTSTATUS ios_create_stream(void *args) {
     s->channels = p->fmt && p->fmt->nChannels ? p->fmt->nChannels : IOS_AUDIO_CHANNELS;
     s->frame_bytes = p->fmt && p->fmt->nBlockAlign ? p->fmt->nBlockAlign
                           : (s->channels * IOS_AUDIO_BITS) / 8;
+    s->kind = ios_fmt_kind(p->fmt);
+    s->valid_bits = ios_fmt_valid_bits(p->fmt);
+    s->channel_mask = ios_fmt_channel_mask(p->fmt);
+    ios_build_mix_gains(s, s->channel_mask);
     /* Ring capacity: the requested buffer duration (100ns units), floor
      * 100ms so a slow FEX-translated mixer has slack. */
     dur_frames = (uint64_t)(p->duration > 0 ? p->duration : 0) * s->sample_rate / 10000000ull;
     if (dur_frames < s->sample_rate / 10) dur_frames = s->sample_rate / 10;
     if (dur_frames > s->sample_rate * 4) dur_frames = s->sample_rate * 4;
     s->buffer_frames = (UINT32)dur_frames;
-    free(s->ring);
-    s->ring = (BYTE *)calloc(s->buffer_frames, s->frame_bytes);
-    /* MADEIRA: guest-visible for a WoW client, plain calloc otherwise. */
+    /* The ring is the ENGINE's shape (stereo float32), not the client's: two
+     * floats per client frame however many channels and whatever sample type
+     * the client writes.  Sizing it off the client's frame_bytes is what made
+     * a 24-byte 5.1 frame and an 8-byte stereo frame index the same buffer
+     * differently. */
+    s->ring = (float *)calloc((size_t)s->buffer_frames * 2, sizeof(float));
+    /* MADEIRA: guest-visible for a WoW client, plain calloc otherwise.  The
+     * scratch IS in the client's format -- it is the buffer the game writes
+     * its own samples into. */
     s->render_scratch = ios_audio_alloc_scratch(s->buffer_frames, s->frame_bytes,
                                                 &s->scratch_guest, &s->scratch_bytes);
     s->scratch_frames = s->render_scratch ? s->buffer_frames : 0;
     s->pending_frames = 0;
     atomic_store(&s->write_pos, 0);
     atomic_store(&s->play_pos, 0);
+    atomic_store(&s->stat_frames_written, 0);
+    atomic_store(&s->stat_underruns, 0);
+    atomic_store(&s->stat_peak_q16, 0);
 
+    pthread_mutex_lock(&g_mix_lock);
     if (p->flow == eRender && s->ring)
-        ios_audio_setup_unit(s, p->fmt);   /* failure -> null-mode */
+        ios_engine_ensure();               /* failure -> null-mode */
+    s->resample_step = ios_resample_step(s->sample_rate);
+    s->resample_frac = 0;
+    pthread_mutex_unlock(&g_mix_lock);
 
     if (p->channel_count) *p->channel_count = s->channels;
     if (p->stream) *p->stream = (stream_handle)(uintptr_t)s;
-    fprintf(stderr, "[ios-astream] ml738 CREATED gen=%u handle=%p rate=%u ch=%u fb=%u\n",
-            g_stream_gen, (void *)s, s->sample_rate, s->channels,
-            s->frame_bytes);
+    fprintf(stderr, "[ios-astream] ml738 CREATED gen=%u handle=%p rate=%u ch=%u fb=%u "
+                    "mask=0x%x downmix L=[%.2f %.2f %.2f %.2f %.2f %.2f] "
+                    "R=[%.2f %.2f %.2f %.2f %.2f %.2f] step=0x%x\n",
+            g_stream_gen, (void *)s, s->sample_rate, s->channels, s->frame_bytes,
+            s->channel_mask,
+            s->mix_gain[0][0], s->mix_gain[1][0], s->mix_gain[2][0],
+            s->mix_gain[3][0], s->mix_gain[4][0], s->mix_gain[5][0],
+            s->mix_gain[0][1], s->mix_gain[1][1], s->mix_gain[2][1],
+            s->mix_gain[3][1], s->mix_gain[4][1], s->mix_gain[5][1],
+            s->resample_step);
     if (stream_register(s)) {
         fprintf(stderr, "[ios-astream] ml739 too many streams -- refusing\n");
-        ios_audio_teardown_unit(s);
         ios_audio_free_scratch(s->render_scratch, s->scratch_guest);
         free(s->ring); free(s);
         /* the handle was published above; it now points at freed memory */
@@ -906,16 +1299,17 @@ static NTSTATUS ios_release_stream(void *args) {
     if (!s) { p->result = AUDCLNT_E_NOT_INITIALIZED; return STATUS_SUCCESS; }
 
     /* Order matters. Mark this stream dead first so its own timer thread
-     * leaves its loop, join that thread, and only then dispose the AudioUnit
-     * so the render callback cannot still be running against memory we are
-     * about to free. Nothing here touches another client's stream. */
+     * leaves its loop and the mixer stops picking it up, join that thread, and
+     * only then unregister -- which takes the render callback's own lock, so
+     * no pass can still be reading this stream's ring when we free it below.
+     * Nothing here touches another client's stream, and the engine keeps
+     * running for them (it stops itself once none are playing). */
     s->valid = 0;
     s->started = 0;
     if (p->timer_thread) {
         NtWaitForSingleObject(p->timer_thread, FALSE, NULL);
         NtClose(p->timer_thread);
     }
-    ios_audio_teardown_unit(s);
     stream_unregister(s);
     ios_audio_free_scratch(s->render_scratch, s->scratch_guest);
     free(s->ring);
@@ -929,19 +1323,21 @@ static NTSTATUS ios_start(void *args) {
     struct stream_handle_params *p = args;
     struct ios_stream *s = stream_from_handle(p->stream);
     if (!s) { p->result = AUDCLNT_E_NOT_INITIALIZED; return STATUS_SUCCESS; }
+    /* Under the mixer's lock: `started` is what the render callback reads to
+     * decide whether to pull from this stream, and the engine must be running
+     * before it can. */
+    pthread_mutex_lock(&g_mix_lock);
     if (!s->started) {
-        if (s->au && !s->au_running) {
-            OSStatus err = AudioOutputUnitStart(s->au);
-            if (err) {
-                fprintf(stderr, "[ios_audio] AudioOutputUnitStart: %d — null-mode\n", (int)err);
-                ios_audio_teardown_unit(s);
-            } else {
-                s->au_running = 1;
-            }
-        }
+        ios_engine_ensure();
+        /* Recomputed here, not only at create_stream: a stream created while
+         * the engine did not yet exist got its step from the default rate, and
+         * the engine may have since come up on a route running at another. */
+        s->resample_step = ios_resample_step(s->sample_rate);
+        ios_engine_start();
         s->start_mach = mach_absolute_time();
         s->started = 1;
     }
+    pthread_mutex_unlock(&g_mix_lock);
     p->result = S_OK;
     return STATUS_SUCCESS;
 }
@@ -950,14 +1346,15 @@ static NTSTATUS ios_stop(void *args) {
     struct stream_handle_params *p = args;
     struct ios_stream *s = stream_from_handle(p->stream);
     if (!s) { p->result = AUDCLNT_E_NOT_INITIALIZED; return STATUS_SUCCESS; }
+    pthread_mutex_lock(&g_mix_lock);
     if (s->started) {
-        if (s->au && s->au_running) {
-            AudioOutputUnitStop(s->au);
-            s->au_running = 0;
-        }
         s->accumulated_frames = elapsed_frames(s);
         s->started = 0;
+        /* The hardware only stops when the LAST client stops; the others are
+         * still playing through the same unit. */
+        ios_engine_stop_if_idle();
     }
+    pthread_mutex_unlock(&g_mix_lock);
     p->result = S_OK;
     return STATUS_SUCCESS;
 }
@@ -966,13 +1363,20 @@ static NTSTATUS ios_reset(void *args) {
     struct stream_handle_params *p = args;
     struct ios_stream *s = stream_from_handle(p->stream);
     if (!s) { p->result = AUDCLNT_E_NOT_INITIALIZED; return STATUS_SUCCESS; }
+    pthread_mutex_lock(&g_mix_lock);
     s->started = 0;
     s->accumulated_frames = 0;
     s->start_mach = 0;
-    /* Drop queued-but-unplayed audio (only legal while stopped). */
+    /* Drop queued-but-unplayed audio (only legal while stopped).  The
+     * resampler's sub-frame position is part of that state: leaving it set
+     * would make the first frame after the reset interpolate against the
+     * stale one. */
     atomic_store(&s->write_pos, 0);
     atomic_store(&s->play_pos, 0);
+    s->resample_frac = 0;
     s->pending_frames = 0;
+    ios_engine_stop_if_idle();
+    pthread_mutex_unlock(&g_mix_lock);
     p->result = S_OK;
     return STATUS_SUCCESS;
 }
@@ -998,10 +1402,10 @@ static NTSTATUS ios_get_render_buffer(void *args) {
     struct get_render_buffer_params *p = args;
     struct ios_stream *s = stream_from_handle(p->stream);
     if (!s) { if (p->data) *p->data = NULL; p->result = AUDCLNT_E_NOT_INITIALIZED; return STATUS_SUCCESS; }
-    if (s->au) {
+    if (g_engine_au) {
         uint64_t padding = atomic_load(&s->write_pos) - atomic_load(&s->play_pos);
         if (p->frames + padding > s->buffer_frames) {
-            p->result = (HRESULT)0x88890006L; /* AUDCLNT_E_BUFFER_TOO_LARGE */
+            p->result = AUDCLNT_E_BUFFER_TOO_LARGE;
             if (p->data) *p->data = NULL;
             return STATUS_SUCCESS;
         }
@@ -1033,30 +1437,65 @@ static NTSTATUS ios_get_render_buffer(void *args) {
     return STATUS_SUCCESS;
 }
 
+/* Convert and downmix the frames the client just wrote into the stream's
+ * stereo-float ring.  This runs on the GAME's thread, not the render thread:
+ * the per-sample work (decode, N-channel fold-down, peak) belongs where a
+ * long buffer costs the game and not the audio device.  What the render
+ * thread is left with is a resample and an add. */
+static void ios_ingest_frames(struct ios_stream *s, UINT32 n, uint64_t wr, int silent)
+{
+    UINT32 cap = s->buffer_frames;
+    UINT32 ch = s->channels > 8 ? 8 : s->channels;
+    UINT32 i, c;
+    float peak = 0.0f;
+
+    for (i = 0; i < n; i++) {
+        size_t o = (size_t)((wr + i) % cap) * 2;
+        float l = 0.0f, r = 0.0f;
+        if (!silent) {
+            const BYTE *frame = s->render_scratch + (size_t)i * s->frame_bytes;
+            for (c = 0; c < ch; c++) {
+                float v = ios_sample_to_float(s->kind, frame, c);
+                l += v * s->mix_gain[c][0];
+                r += v * s->mix_gain[c][1];
+            }
+        }
+        s->ring[o] = l;
+        s->ring[o + 1] = r;
+        if (l > peak) peak = l; else if (-l > peak) peak = -l;
+        if (r > peak) peak = r; else if (-r > peak) peak = -r;
+    }
+
+    if (peak > 0.0f) {
+        uint32_t q = peak >= 16.0f ? 0xffffffffu : (uint32_t)(peak * 65536.0f);
+        uint32_t old = atomic_load_explicit(&s->stat_peak_q16, memory_order_relaxed);
+        while (q > old &&
+               !atomic_compare_exchange_weak_explicit(&s->stat_peak_q16, &old, q,
+                                                      memory_order_relaxed,
+                                                      memory_order_relaxed))
+            ;
+    }
+}
+
 static NTSTATUS ios_release_render_buffer(void *args) {
     struct release_render_buffer_params *p = args;
     struct ios_stream *s = stream_from_handle(p->stream);
     if (!s) { p->result = AUDCLNT_E_NOT_INITIALIZED; return STATUS_SUCCESS; }
-    if (s->au && p->written_frames > 0) {
-        UINT32 fb = s->frame_bytes;
+    if (s->ring && p->written_frames > 0) {
         UINT32 cap = s->buffer_frames;
         UINT32 n = p->written_frames;
         uint64_t wr = atomic_load_explicit(&s->write_pos, memory_order_relaxed);
-        UINT32 i = 0;
         if (n > s->pending_frames) n = s->pending_frames;
-        if (p->flags & 0x2 /* AUDCLNT_BUFFERFLAGS_SILENT */)
-            memset(s->render_scratch, 0, (size_t)n * fb);
-        while (i < n) {
-            UINT32 idx = (UINT32)((wr + i) % cap);
-            UINT32 chunk = cap - idx;
-            if (chunk > n - i) chunk = n - i;
-            memcpy(s->ring + (size_t)idx * fb,
-                   s->render_scratch + (size_t)i * fb, (size_t)chunk * fb);
-            i += chunk;
-        }
-        /* release-store AFTER the copy so the RT callback never reads
+        if (n > cap) n = cap;
+        /* AUDCLNT_BUFFERFLAGS_SILENT means "ignore what is in the buffer",
+         * not "the buffer contains zeroes" -- the client is allowed to leave
+         * whatever it likes there.  Writing silence straight into the ring is
+         * both correct and cheaper than zeroing the scratch first. */
+        ios_ingest_frames(s, n, wr, (p->flags & 0x2) != 0);
+        /* release-store AFTER the conversion so the render thread never reads
          * frames that aren't fully written */
         atomic_store_explicit(&s->write_pos, wr + n, memory_order_release);
+        atomic_fetch_add_explicit(&s->stat_frames_written, n, memory_order_relaxed);
     }
     s->pending_frames = 0;
     p->result = S_OK;
@@ -1104,29 +1543,41 @@ static NTSTATUS ios_get_loopback_capture_device(void *args) {
 static NTSTATUS ios_get_mix_format(void *args) {
     struct get_mix_format_params *p = args;
     LOG_FN_CALL(16, "get_mix_format");
-    /* WAVEFORMATEXTENSIBLE is 40 bytes; first 18 are WAVEFORMATEX */
+    /* The mix format is the ENGINE's format, and the engine is a stereo
+     * float32 mixer -- so that is what this reports.  It used to report
+     * 16-bit PCM, which is not what the engine mixes in and not what a WASAPI
+     * consumer expects from a shared-mode endpoint: every modern client
+     * (XAudio2, FAudio, dsound's own resampler) takes the mix format as the
+     * format it should hand over to avoid a conversion, and being told 16-bit
+     * while the device actually wants float meant a conversion on every path
+     * with nothing checking that the two agreed.
+     *
+     * The rate is the hardware's, learned when the engine was built, so a
+     * client that follows the mix format needs no resampling from us at all.
+     *
+     * WAVEFORMATEXTENSIBLE is 40 bytes; the first 18 are WAVEFORMATEX. */
     if (p->fmt) {
+        UINT32 rate = g_engine_rate ? g_engine_rate : IOS_AUDIO_SAMPLE_RATE;
         memset(p->fmt, 0, 40);
         struct WAVEFORMATEX_stub *f = p->fmt;
         f->wFormatTag = 0xFFFE; /* WAVE_FORMAT_EXTENSIBLE */
-        f->nChannels = IOS_AUDIO_CHANNELS;
-        f->nSamplesPerSec = IOS_AUDIO_SAMPLE_RATE;
-        f->wBitsPerSample = IOS_AUDIO_BITS;
-        f->nBlockAlign = IOS_AUDIO_FRAME_BYTES;
-        f->nAvgBytesPerSec = IOS_AUDIO_SAMPLE_RATE * IOS_AUDIO_FRAME_BYTES;
+        f->nChannels = 2;
+        f->nSamplesPerSec = rate;
+        f->wBitsPerSample = 32;
+        f->nBlockAlign = 2 * 4;
+        f->nAvgBytesPerSec = rate * (2 * 4);
         f->cbSize = 22; /* extensible body */
         /* Extensible body: Samples (2), ChannelMask (4), SubFormat (16).
-         * KSDATAFORMAT_SUBTYPE_PCM = {00000001-0000-0010-8000-00AA00389B71} */
+         * KSDATAFORMAT_SUBTYPE_IEEE_FLOAT = {00000003-0000-0010-8000-00AA00389B71} */
         uint16_t *samples = (uint16_t *)((char *)p->fmt + 18);
-        *samples = IOS_AUDIO_BITS;
+        *samples = 32;
         uint32_t *mask = (uint32_t *)((char *)p->fmt + 20);
-        *mask = 0x3; /* SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT */
-        /* SubFormat GUID PCM */
-        static const uint8_t pcm_guid[16] = {
-            0x01,0x00,0x00,0x00, 0x00,0x00, 0x10,0x00,
+        *mask = IOS_SPK_FRONT_LEFT | IOS_SPK_FRONT_RIGHT;
+        static const uint8_t float_guid[16] = {
+            0x03,0x00,0x00,0x00, 0x00,0x00, 0x10,0x00,
             0x80,0x00, 0x00,0xAA, 0x00,0x38,0x9B,0x71
         };
-        memcpy((char *)p->fmt + 24, pcm_guid, 16);
+        memcpy((char *)p->fmt + 24, float_guid, 16);
     }
     p->result = S_OK;
     ios_log_fmt("get_mix_format", p->fmt, 0, p->result);
@@ -1167,7 +1618,7 @@ static NTSTATUS ios_get_current_padding(void *args) {
     struct ios_stream *s = stream_from_handle(p->stream);
     if (!s) { if (p->padding) *p->padding = 0; p->result = AUDCLNT_E_NOT_INITIALIZED; return STATUS_SUCCESS; }
     if (p->padding) {
-        if (s->au) {
+        if (g_engine_au) {
             uint64_t pad = atomic_load(&s->write_pos) - atomic_load(&s->play_pos);
             *p->padding = (UINT32)(pad > s->buffer_frames ? s->buffer_frames : pad);
         } else {
@@ -1175,6 +1626,9 @@ static NTSTATUS ios_get_current_padding(void *args) {
         }
     }
     p->result = S_OK;
+    /* Every active client hits this at its device period, which makes it the
+     * one place a periodic census can live without a thread of its own. */
+    ios_report_streams();
     return STATUS_SUCCESS;
 }
 
@@ -1200,11 +1654,13 @@ static NTSTATUS ios_get_position(void *args) {
     struct get_position_params *p = args;
     struct ios_stream *s = stream_from_handle(p->stream);
     if (!s) { if (p->pos) *p->pos = 0; p->result = AUDCLNT_E_NOT_INITIALIZED; return STATUS_SUCCESS; }
-    /* THIS is the function that drives FMOD's clock. Tier-2: frames the
-     * RT callback actually consumed — the true hardware clock. Null-mode
+    /* THIS is the function that drives a game engine's audio clock. Tier-2:
+     * client frames the mixer actually consumed — the true hardware clock,
+     * still counted in the CLIENT's frames even when the engine runs at a
+     * different rate, because that is the unit get_frequency reports. Null-mode
      * fallback: wall-clock synthesis as before. */
     if (p->pos) {
-        if (s->au)
+        if (g_engine_au)
             *p->pos = atomic_load(&s->play_pos);
         else
             *p->pos = elapsed_frames(s);
@@ -1240,7 +1696,15 @@ static NTSTATUS ios_set_sample_rate(void *args) {
     struct set_sample_rate_params *p = args;
     struct ios_stream *s = stream_from_handle(p->stream);
     if (!s) { p->result = AUDCLNT_E_NOT_INITIALIZED; return STATUS_SUCCESS; }
-    if (p->rate > 0) s->sample_rate = (UINT32)p->rate;
+    if (p->rate > 0) {
+        pthread_mutex_lock(&g_mix_lock);
+        s->sample_rate = (UINT32)p->rate;
+        /* The resampler's step is derived from this rate, so changing one
+         * without the other silently plays the stream at the wrong speed --
+         * which is what this call exists to avoid. */
+        s->resample_step = ios_resample_step(s->sample_rate);
+        pthread_mutex_unlock(&g_mix_lock);
+    }
     p->result = S_OK;
     return STATUS_SUCCESS;
 }
