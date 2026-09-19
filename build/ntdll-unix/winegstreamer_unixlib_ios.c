@@ -181,6 +181,8 @@
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/channel_layout.h>
@@ -254,6 +256,7 @@ struct wma_transform
     UINT32 rate;
     UINT32 in_channels;
     UINT32 avg_bytes;       /* nAvgBytesPerSec, for the silence estimate */
+    UINT32 depth;           /* WAVEFORMATEX wBitsPerSample, as gst-libav passes it */
 
     /* negotiated PCM output */
     enum AVSampleFormat out_sample_fmt;
@@ -292,7 +295,31 @@ struct wma_transform
     UINT32 packet_count;
     UINT32 short_tail_dropped;
     UINT32 candidate;       /* index into the parameter candidate list */
+
+    /* w2: a candidate is not "accepted" until it has produced SANE audio for
+     * several packets running, and a decoder that runs out of candidates is
+     * muted for good.  Garbage at +19 dB is worse than no audio. */
+    UINT32 good_packets;
+    UINT32 insane_frames;
+    BOOL frame_rejected;   /* set by append_frame for the packet in flight */
+    BOOL muted;
+
+    /* MADEIRA_WMA_DUMP=1: the exact bytes, for decoding on the host */
+    int dump_fd;
+    UINT32 dumped_packets;
 };
+
+/* How many consecutive sane packets a candidate must produce before it is
+ * believed.  One is not enough: w2 shows a wrong configuration decoding a
+ * single packet "successfully" and then emitting noise. */
+#define MADEIRA_WMA_ACCEPT_PACKETS 3
+/* Float PCM from a WMA decoder lives in [-1, 1].  A little headroom is normal
+ * (inter-sample peaks, lossless content); 9.4 -- what the device census
+ * measured -- is not audio. */
+/* Host decode of real streams: legitimate peaks of 1.27 and 1.54 (lossy
+ * overshoot); garbage from wrong parameters reads 4.5 to 15.  1.25 rejected
+ * real audio. */
+#define MADEIRA_WMA_SANE_PEAK 3.0f
 
 /* The whole file logs with dprintf(2, ...) rather than ERR/TRACE: this unix
  * side has no Wine debug channel of its own in this build, and the app runs
@@ -500,6 +527,12 @@ static int open_decoder( struct wma_transform *transform, INT64 bit_rate, int fl
     avctx->sample_rate = transform->rate;
     avctx->block_align = transform->block_align;
     avctx->bit_rate = bit_rate;
+    /* w2: gst-libav sets this from the caps `depth` (gstavcodecmap.c) and
+     * winegstreamer puts the WAVEFORMATEX depth there, so the desktop path
+     * that decodes these streams DOES pass it.  It was dropped here on the
+     * grounds that no WMA decoder reads it -- true today, but matching the
+     * working path exactly is worth more than being right about that. */
+    avctx->bits_per_coded_sample = transform->depth;
     /* bits_per_coded_sample is deliberately NOT set from the WAVEFORMATEX:
      * wma_decoder.c's SetOutputType writes the OUTPUT sample size back into
      * the input block (`wfx->wBitsPerSample = sample_size;`), so for a float
@@ -598,8 +631,39 @@ static NTSTATUS append_frame( struct wma_transform *transform, AVFrame *frame )
         WMA_LOG( "swr_convert failed (%d)\n", converted );
         return STATUS_UNSUCCESSFUL;
     }
+    if (converted <= 0) return STATUS_SUCCESS;
+
+    /* w2: DOES IT LOOK LIKE AUDIO?  libavcodec can "decode" a packet under the
+     * wrong configuration -- wrong bit rate, wrong flags2 -- without returning
+     * an error, and what comes out is noise at many times full scale (the
+     * device census read peak=9.406 after one such packet was accepted).  A
+     * WMA decoder's float output lives in [-1, 1]; anything far outside it is
+     * not a quiet mistake, it is the loudest possible one.  Reject the frame
+     * and let the caller emit silence instead, which also stops a bad
+     * candidate from ever satisfying the acceptance test below. */
+    if (transform->out_sample_fmt == AV_SAMPLE_FMT_FLT)
+    {
+        const float *f = (const float *)dst;
+        size_t i, n = (size_t)converted * transform->out_channels;
+        float peak = 0.0f;
+
+        for (i = 0; i < n; i++)
+        {
+            float v = f[i] < 0.0f ? -f[i] : f[i];
+            if (v > peak) peak = v;
+            /* NaN/Inf compare false against everything, so catch them too. */
+            if (!(v <= MADEIRA_WMA_SANE_PEAK))
+            {
+                transform->insane_frames++;
+                transform->frame_rejected = TRUE;
+                return STATUS_SUCCESS;   /* not a transform error: silence */
+            }
+        }
+        (void)peak;
+    }
+
     transform->pcm_len += (size_t)converted * transform->out_frame_size;
-    if (converted > 0) transform->produced_output = TRUE;
+    transform->produced_output = TRUE;
     return STATUS_SUCCESS;
 }
 
@@ -671,6 +735,90 @@ static INT64 implied_bit_rate( struct wma_transform *transform, UINT nb_frames )
     samples = (UINT64)nb_frames << wma_frame_len_bits( transform->rate );
     if (!samples) return 0;
     return (INT64)((UINT64)transform->block_align * 8 * transform->rate / samples);
+}
+
+/***********************************************************************
+ *           MADEIRA_WMA_DUMP=1 -- the exact bytes, for the host
+ *
+ * The device cannot decode these streams and the host has no copy of them, so
+ * every round so far has been an argument about bytes nobody could look at.
+ * With MADEIRA_WMA_DUMP=1 in Documents/madeira-env.txt each decoder writes
+ * Documents/wma-dump-<n>.bin:
+ *
+ *   magic "MADWMA01" (8)      -- so a truncated or mixed-up file is obvious
+ *   u32 codec tag             -- 0x161 &c, what the media type said
+ *   u32 sample rate
+ *   u32 channels
+ *   u32 block_align
+ *   u32 nAvgBytesPerSec       -- the value FAudio declared, fake or not
+ *   u32 extradata size
+ *   extradata bytes           -- MF_MT_USER_DATA verbatim
+ *   then, per packet: u32 length, then that many bytes
+ *
+ * Capped at 64 packets: enough for a host decode to succeed or fail the same
+ * way, small enough to move off a device.
+ */
+#define MADEIRA_WMA_DUMP_PACKETS 64
+
+static unsigned int wma_dump_seq;
+
+static void dump_open( struct wma_transform *transform, UINT codec_tag )
+{
+    const char *docs;
+    char path[512];
+    UINT32 head[6];
+    int fd;
+
+    transform->dump_fd = -1;
+    if (!getenv( "MADEIRA_WMA_DUMP" )) return;
+
+    docs = getenv( "MADEIRA_DOCS_DIR" );
+    if (docs) snprintf( path, sizeof(path), "%s/wma-dump-%u.bin", docs, wma_dump_seq++ );
+    else snprintf( path, sizeof(path), "/tmp/wma-dump-%u.bin", wma_dump_seq++ );
+
+    if ((fd = open( path, O_WRONLY | O_CREAT | O_TRUNC, 0644 )) < 0)
+    {
+        WMA_LOG( "dump: cannot create %s (%d)\n", path, errno );
+        return;
+    }
+    head[0] = codec_tag;
+    head[1] = transform->rate;
+    head[2] = transform->in_channels;
+    head[3] = transform->block_align;
+    head[4] = transform->avg_bytes;
+    head[5] = transform->extradata_size;
+    if (write( fd, "MADWMA01", 8 ) != 8 ||
+        write( fd, head, sizeof(head) ) != (ssize_t)sizeof(head) ||
+        (transform->extradata_size &&
+         write( fd, transform->extradata, transform->extradata_size )
+             != (ssize_t)transform->extradata_size))
+    {
+        WMA_LOG( "dump: short write on %s\n", path );
+        close( fd );
+        return;
+    }
+    transform->dump_fd = fd;
+    WMA_LOG( "dump: writing the first %u packets to %s\n", MADEIRA_WMA_DUMP_PACKETS, path );
+}
+
+static void dump_packet_to_file( struct wma_transform *transform, const BYTE *data, size_t size )
+{
+    UINT32 len = (UINT32)size;
+
+    if (transform->dump_fd < 0) return;
+    if (transform->dumped_packets >= MADEIRA_WMA_DUMP_PACKETS)
+    {
+        close( transform->dump_fd );
+        transform->dump_fd = -1;
+        return;
+    }
+    transform->dumped_packets++;
+    if (write( transform->dump_fd, &len, sizeof(len) ) != (ssize_t)sizeof(len) ||
+        write( transform->dump_fd, data, size ) != (ssize_t)size)
+    {
+        close( transform->dump_fd );
+        transform->dump_fd = -1;
+    }
 }
 
 static void dump_packet_head( struct wma_transform *transform, const BYTE *data, size_t size )
@@ -752,6 +900,7 @@ static int send_one_packet( struct wma_transform *transform, const BYTE *data, s
     /* The retry path below can leave this NULL if BOTH opens fail; a decoder
      * that is gone must report that, not be called. */
     if (!transform->avctx) return AVERROR(EINVAL);
+    transform->frame_rejected = FALSE;
 
     /* av_new_packet zero-fills AV_INPUT_BUFFER_PADDING_SIZE past the end,
      * which every bitstream reader in libavcodec reads past into. */
@@ -777,6 +926,10 @@ static int send_one_packet( struct wma_transform *transform, const BYTE *data, s
         if (*status) return 0;
     }
     if (frames) transform->last_frames = frames;
+    /* A frame the sanity check threw out is a decode failure as far as the
+     * caller is concerned: it must produce silence and it must not let a
+     * candidate be believed. */
+    if (transform->frame_rejected) return AVERROR(EILSEQ);
     return 0;
 }
 
@@ -810,7 +963,19 @@ static NTSTATUS decode_staged( struct wma_transform *transform, BOOL flush_tail 
         data = transform->in_buf + offset;
 
         if (transform->packet_count < 2) dump_packet_head( transform, data, take );
+        dump_packet_to_file( transform, data, take );
         transform->packet_count++;
+
+        /* Muted: every candidate was tried and none produced audio.  Do not
+         * keep calling a decoder that has proved it cannot decode this stream
+         * -- just keep the timeline running with silence. */
+        if (transform->muted)
+        {
+            transform->fail_count++;
+            if ((status = append_silence_for_packet( transform, take ))) return status;
+            offset += take;
+            continue;
+        }
 
         err = send_one_packet( transform, data, take, &status );
         if (status) return status;
@@ -821,14 +986,36 @@ static NTSTATUS decode_staged( struct wma_transform *transform, BOOL flush_tail 
          * candidate is tried on this same packet and kept only if it decodes,
          * so a wrong guess cannot be adopted; the transition is logged either
          * way so the next log names the winner instead of implying it. */
-        while (err < 0 && !transform->produced_output)
+        if (err >= 0) transform->good_packets++;
+        else transform->good_packets = 0;
+
+        while (err < 0 && transform->good_packets < MADEIRA_WMA_ACCEPT_PACKETS)
         {
             INT64 was_rate = transform->bit_rate;
             INT64 bit_rate;
             const char *why;
             int flags2;
 
-            if (!next_candidate( transform, data, &bit_rate, &flags2, &why )) break;
+            if (!next_candidate( transform, data, &bit_rate, &flags2, &why ))
+            {
+                /* Out of guesses.  w2 showed the alternative: a configuration
+                 * accepted on one packet, then 90 failures and noise at +19 dB
+                 * reaching the mixer.  Silence is the only honest output for a
+                 * stream this port cannot decode. */
+                if (!transform->muted)
+                {
+                    transform->muted = TRUE;
+                    WMA_LOG( "transform %p: no configuration decodes this stream "
+                             "(%uHz %uch block=%u flags2=%#x, %u insane frames rejected) "
+                             "-- MUTING: silence from here on\n",
+                             transform, transform->rate, transform->in_channels,
+                             transform->block_align,
+                             wma_flags2( transform->codec_id, transform->extradata,
+                                         transform->extradata_size ),
+                             transform->insane_frames );
+                }
+                break;
+            }
 
             WMA_LOG( "nothing decoded at %d bit/s; trying %d bit/s%s -- %s\n",
                      (int)was_rate, (int)bit_rate,
@@ -842,13 +1029,28 @@ static NTSTATUS decode_staged( struct wma_transform *transform, BOOL flush_tail 
             }
             err = send_one_packet( transform, data, take, &status );
             if (status) return status;
-            if (err >= 0 && transform->produced_output)
+            if (err >= 0)
             {
-                WMA_LOG( "accepted: %d bit/s%s (%s); decoding resumed\n",
+                /* PROVISIONAL, not accepted.  The packet decoded and its
+                 * output passed the sanity check, but w2 showed exactly that
+                 * much happening under a configuration that then produced 90
+                 * failures and noise.  The candidate is confirmed only after
+                 * MADEIRA_WMA_ACCEPT_PACKETS consecutive sane packets; until
+                 * then the search stays open and a relapse moves on to the
+                 * next guess. */
+                transform->good_packets++;
+                WMA_LOG( "provisional: %d bit/s%s (%s) decoded packet %u\n",
                          (int)transform->bit_rate,
-                         flags2 >= 0 ? " with use_variable_block_len cleared" : "", why );
+                         flags2 >= 0 ? " with use_variable_block_len cleared" : "", why,
+                         transform->packet_count );
                 break;
             }
+        }
+        if (transform->good_packets == MADEIRA_WMA_ACCEPT_PACKETS)
+        {
+            transform->good_packets++;   /* log once */
+            WMA_LOG( "accepted: %d bit/s after %u consecutive sane packets (transform %p)\n",
+                     (int)transform->bit_rate, MADEIRA_WMA_ACCEPT_PACKETS, transform );
         }
 
         offset += take;
@@ -910,6 +1112,7 @@ static NTSTATUS transform_create( struct wg_transform_create_params *params )
     enum AVCodecID codec_id;
     UINT in_tag, out_tag;
     UINT32 extra;
+    INT64 open_rate;
     int err;
 
     params->transform = 0;
@@ -959,11 +1162,13 @@ static NTSTATUS transform_create( struct wg_transform_create_params *params )
     if (!(transform = calloc( 1, sizeof(*transform) ))) return STATUS_NO_MEMORY;
     pthread_mutex_init( &transform->lock, NULL );
     transform->magic = MADEIRA_WG_TRANSFORM_MAGIC;
+    transform->dump_fd = -1;
     transform->codec_id = codec_id;
     transform->block_align = in->nBlockAlign;
     transform->rate = in->nSamplesPerSec;
     transform->in_channels = in->nChannels;
     transform->avg_bytes = in->nAvgBytesPerSec;
+    transform->depth = in->wBitsPerSample;
     transform->channel_mask = channel_mask( in, params->input_type.format_size );
     transform->out_channels = out->nChannels;
     transform->out_sample_fmt = (out_tag == WAVE_FORMAT_IEEE_FLOAT) ? AV_SAMPLE_FMT_FLT
@@ -1002,13 +1207,37 @@ static NTSTATUS transform_create( struct wg_transform_create_params *params )
     transform->bit_rate_alt = xwma_true_bit_rate( in->nChannels, in->nSamplesPerSec,
                                                   (INT64)in->nAvgBytesPerSec * 8 );
 
-    if ((err = open_decoder( transform, (INT64)in->nAvgBytesPerSec * 8, -1 )) < 0)
+    open_rate = (INT64)in->nAvgBytesPerSec * 8;
+    /* HOST-VERIFIED (real wave-bank streams fed through this same libavcodec,
+     * packet by packet): for the combinations in xwma_true_bit_rate() the rate
+     * in the header decodes 0 packets in 600 and the table's rate decodes all
+     * of them.  The ambiguity that kept this a mere candidate -- the same
+     * triple can be an honest ASF stream -- does not exist when the codec
+     * private data is the synthetic blob an xWMA caller makes up (all zero
+     * but flags2): a real ASF header never looks like that.  So open such a
+     * stream at the true rate, and leave the header's rate as the candidate. */
+    if (transform->bit_rate_alt && codec_id == AV_CODEC_ID_WMAV2 && extra >= 6)
     {
-        WMA_LOG( "avcodec_open2(%s) failed (%d) at %u bit/s\n", transform->codec->name, err,
-                 (UINT)in->nAvgBytesPerSec * 8 );
+        BOOL synthetic = TRUE;
+        UINT32 k;
+        for (k = 0; k < extra; k++)
+            if (k != 4 && k != 5 && transform->extradata[k]) synthetic = FALSE;
+        if (synthetic)
+        {
+            INT64 header_rate = open_rate;
+            open_rate = transform->bit_rate_alt;
+            transform->bit_rate_alt = header_rate;
+        }
+    }
+
+    if ((err = open_decoder( transform, open_rate, -1 )) < 0)
+    {
+        WMA_LOG( "avcodec_open2(%s) failed (%d) at %d bit/s\n", transform->codec->name, err,
+                 (int)open_rate );
         goto unsupported;
     }
 
+    dump_open( transform, in_tag );
     params->transform = (wg_transform_t)(UINT_PTR)transform;
     WMA_LOG( "decoder created fmt=%s tag=%#x %uHz %uch block=%u avg=%uB/s bitrate=%d"
              " extradata=%u flags2=%#x -> pcm %s %uHz %uch %ubit (transform %p)%s\n",
@@ -1048,6 +1277,7 @@ static NTSTATUS transform_destroy( wg_transform_t handle )
     pthread_mutex_lock( &transform->lock );
     report_failures( transform );
     transform->magic = 0;
+    if (transform->dump_fd >= 0) close( transform->dump_fd );
     if (transform->swr) swr_free( &transform->swr );
     if (transform->avctx) avcodec_free_context( &transform->avctx );
     if (transform->frame) av_frame_free( &transform->frame );
@@ -1107,9 +1337,9 @@ static NTSTATUS transform_push_data( wg_transform_t handle, struct wg_sample *sa
      * should always be a multiple; the log is what turns "should" into
      * "does".) */
     if (transform->push_count < 8)
-        WMA_LOG( "push #%u size=%u fifo=%zu block=%u%s\n",
+        WMA_LOG( "push #%u size=%u fifo=%zu block=%u pkts=%u transform=%p%s\n",
                  transform->push_count, (UINT)sample->size, transform->in_len,
-                 transform->block_align,
+                 transform->block_align, transform->packet_count, transform,
                  (sample->size % transform->block_align) ? "  <-- NOT a multiple of block_align" : "" );
     transform->push_count++;
 
@@ -1360,6 +1590,7 @@ static NTSTATUS wma_transform_drain( void *args )
 
     if (!transform) return STATUS_INVALID_HANDLE;
     pthread_mutex_lock( &transform->lock );
+    WMA_LOG( "drain: transform=%p after %u packets\n", transform, transform->packet_count );
     transform->draining = TRUE;
     status = decode_staged( transform, TRUE );
     if (!status && transform->avctx)
@@ -1389,6 +1620,8 @@ static NTSTATUS wma_transform_flush( void *args )
     if (!transform) return STATUS_INVALID_HANDLE;
     pthread_mutex_lock( &transform->lock );
     report_failures( transform );
+    WMA_LOG( "flush: transform=%p after %u packets (%u pushes)\n",
+             transform, transform->packet_count, transform->push_count );
     transform->in_len = 0;
     transform->pcm_pos = transform->pcm_len = 0;
     transform->have_pts = FALSE;

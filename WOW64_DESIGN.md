@@ -7331,3 +7331,195 @@ guest-slots=… verdict=…`). Consequences:
   status; that is what the tag is for, and `strings <module>.dll` now answers
   it (22 of 35 i386 modules carry it — the 13 that do not are x3daudio/xapofx,
   which never reference the decoder).
+
+- 2026-09-19 — **w2: the diagnostics worked, the "fix" did not, and the honest
+  output for a stream we cannot decode is silence.** The new instrumentation
+  answered its question immediately: `push #0..7 size=1487 fifo=0 block=1487`,
+  so phase within a push is exact, and `pkt#0 … | superframe index=15
+  nb_frames nibble=8 -> implies 32019 bit/s` is a **perfectly well-formed WMA
+  superframe header** — eight frames, 32 kbit/s for 22050 Hz stereo at block
+  1487, which is the XACT WMA block-align table's own value. The bytes at the
+  start of a push are right and the parameters implied by them are right.
+
+  `pkt#1 … | index=3 nb_frames nibble=1 -> implies 256158 bit/s` is not the
+  successor of pkt#0 — a superframe index should step 15→0 and nb_frames stay
+  near 8. Two adjacent packets cut from one FIFO, the first immaculate and the
+  second not its continuation. That is the whole remaining mystery, and it is
+  not a parameter question, so no further parameter guessing is warranted.
+
+  **The candidate search was making things worse, and that is the important
+  lesson.** It reported `accepted: 32019 bit/s with use_variable_block_len
+  cleared; decoding resumed` and was then followed by 90 failures and
+  `[audio] stream 2 … peak=9.406`. One packet decoding without an error is
+  **not** evidence that a configuration is right: libavcodec will happily
+  "decode" under the wrong flags and emit noise at many times full scale. A
+  search whose accept test is weaker than its failure mode converts a silent
+  bug into a loud one. Three changes, all of which apply whatever the root
+  cause turns out to be:
+
+  * **Every converted frame is sanity-checked** before it is appended. Float
+    PCM from a WMA decoder lives in [-1, 1]; a frame containing a sample
+    outside ±1.25, or a NaN, is rejected and the packet is treated as a decode
+    failure. This is unconditional — it is not part of the search — so no
+    configuration, chosen or stock, can put +19 dB noise into the mixer again.
+  * **A candidate is provisional until `MADEIRA_WMA_ACCEPT_PACKETS` (3)
+    consecutive sane packets.** A relapse reopens the search rather than
+    keeping a guess that worked once.
+  * **A decoder that exhausts its candidates MUTES** and emits silence for
+    every later packet without calling libavcodec again. Garbage at +19 dB is
+    worse than no audio; a stream this port cannot decode should be inaudible,
+    not audible and wrong.
+
+  **`bits_per_coded_sample` is set again.** It was dropped two rounds ago on
+  the correct observation that no WMA decoder in libavcodec reads it — but
+  gst-libav sets it from the caps `depth` (`gstavcodecmap.c`) and winegstreamer
+  puts the WAVEFORMATEX depth in those caps, so the desktop path that decodes
+  these streams does pass it. Matching the working path exactly is worth more
+  than being right about which fields it needs.
+
+  **And the measurement that ends the argument: `MADEIRA_WMA_DUMP=1`.**
+  Honoured out of `Documents/madeira-env.txt` (the generic `MADEIRA_*`
+  passthrough), it writes `Documents/wma-dump-<n>.bin` per decoder: magic
+  `MADWMA01`, then codec tag, sample rate, channels, block_align,
+  nAvgBytesPerSec and the extradata length as u32s, the extradata verbatim,
+  then the first 64 pushed packets each with a u32 length prefix. Three rounds
+  have now been spent arguing about bytes nobody could look at; this puts the
+  exact bitstream on the host, where it can be decoded with the same libavcodec
+  and the answer read off directly. The push lines also carry the transform
+  pointer and a per-transform packet counter now, and `flush`/`drain` log
+  themselves, so "is one transform being fed by two voices, or seeked between
+  pushes" is answerable from the same log.
+
+  Four other differences from the desktop path were checked and are NOT the
+  bug: packets are built with `av_new_packet` + memcpy (so they carry zeroed
+  `AV_INPUT_BUFFER_PADDING_SIZE`) and never point into the FIFO;
+  `avcodec_receive_frame` is drained to EAGAIN after every send; each
+  `wg_transform_create` allocates a zeroed context and `wma_decoder.c`'s
+  `try_create_wg_transform` destroys the previous transform first, so no
+  `block_align`/extradata can be stale across the two `SetInputType` calls the
+  log shows; and `wma_decoder.c:transform_ProcessInput` already refuses any
+  sample that is not a multiple of block_align.
+
+- 2026-09-20 — **A 64-bit D3D11 title died in the loader on a D3DX9 import, and
+  the 64-bit farms had ONE `d3dx9_*.dll`.** Logs w3/w4: `err:module:import_dll
+  Library d3dx9_42.dll (which is needed by <main exe>) not found`, exit status
+  0xC0000135, nothing else. Census of the three farms at that moment:
+  `d3dx9_*` i386=20, aarch64=1, arm64ec=1 (only `_43`); same story for
+  `d3dx10_*` and `d3dcompiler_*` (33..42 absent) and `d3d10.dll` / `d3d10_1.dll`
+  (absent, so even the one `d3dx10_43.dll` could not load — the import-closure
+  check had been flagging `d3dx10_43.dll -> d3d10_1.dll`). The 32-bit breadth
+  build ("everything that compiles") was never mirrored on the 64-bit side,
+  which stayed a curated list. Fixed generically with
+  `.xtool/build-wine-64.sh all …`: d3dx9_24..43, d3dx10 + d3dx10_33..43,
+  d3dx11_42/43, d3dcompiler_33..47, d3d10, d3d10_1, d2d1, quartz, glu32 for both
+  aarch64 and arm64ec (arm64ec is what an x86-64 process loads). `d3d10.dll` /
+  `d3d10_1.dll` import only `D3D10CoreCreateDevice` + `CreateDXGIFactory`, both
+  exported by the Metal `d3d10core.dll` / `dxgi.dll` already in the farm
+  (checked with `llvm-objdump -p`). Import closure now reports 0 missing for
+  both farms. Farm sizes: aarch64 229 files, arm64ec 211. TODO: make the 64-bit
+  farm a breadth build like i386 so this class of failure cannot recur one DLL
+  at a time.
+- 2026-09-19 — w1.txt line ~38948: the app died on a host BUS after a long
+  healthy session. **It is not the profiler, and `msync()` is not a readability
+  test.** The log symbolises the pc itself: `sym pc=Madeira`
+  `ios_alert_waiter_dump+0x3d4`, `bt[0] ios_pump_sample+0x4c`,
+  `bt[1] ios_pool_warmer_thread+0x6e4` — the pool-warmer thread, not the
+  profiler sampler, and `wine/dlls/ntdll/unix/sync.c`, not
+  `signal_arm64_ios.c`'s module-name code.
+  ROOT CAUSE. ml441/ml442 guarded every lock-word probe with
+  `if (!msync( page, 0x4000, MS_ASYNC ))`, reasoning that Darwin returns ENOMEM
+  for an unmapped page. msync answers a question about the MAPPING and says
+  nothing about the PROTECTION, so a region mapped `PROT_NONE` — exactly what a
+  guest DLL being unloaded or reprotected looks like for the moment it takes —
+  passes the guard and then faults on the load. The log has it in one line:
+  `[bus-rgn] region=0x71774f0000+0xd8000 prot=0 max=7` with
+  `VERDICT <== ANONYMOUS, NEVER RESIDENT`. The faulting
+  `insn=0xb8404528 (ldr w8,[x9],#4)` is this function's own w0/w1 pair — the
+  compiler folded `*(al)` and the `al + 4` address into one post-increment —
+  at `sync.c:5022` as it stood.
+  Fixed by reading OUT instead of dereferencing: new `ios_safe_read()`
+  (`sync.c:4955-5002`, `mach_vm_read_overwrite` into a local) now backs the
+  `[hot-lock]` 0x40-byte rows, the `[waiters]` w0/w1 probe, and
+  `ios_orphan_check`'s lock-word read. The kernel does the permission check and
+  reports failure as a return value instead of a signal, which is the only
+  "is this readable" that is not a race in the first place: any protection test
+  is stale by the next instruction, and this one cannot be, because the test IS
+  the read. `w0`/`w1` keep their existing `0xdeaddead` poison when the read
+  fails, so no log consumer had to learn a new spelling. The two REAP paths
+  (`ios_wpm_reap_shared`, `ios_srw_reap_exclusive`) must stay real atomic RMWs
+  on the guest word, so they get a `ios_safe_read` probe before the CAS loop
+  instead — it catches the common "page is already gone" case; the residual
+  reprotect-between-probe-and-CAS window is inherent to writing another
+  process's lock and is what the orphan detector's three-strike verdict pays for.
+  SECOND DEFECT, AND THE ONE THAT MADE IT FATAL. The first BUS was survivable;
+  the REPORT of it was not. `ios_log_guest_exception+0x48`, insn `b9404808`
+  (`ldr w8,[x0,#0x48]`) with `x0 = 0`: it opened with
+  `NtCurrentTeb()->ClientId.UniqueThread`, a load at TEB+0x48, and
+  `NtCurrentTeb()` is x18, which is 0 on every thread we did not create. So the
+  handler faulted inside the handler on a thread with no TEB to adopt it, twice,
+  and the process died. Now it prints `tid=0000` instead
+  (`signal_arm64_ios.c:6611-6625`). Its two `DBG_PRINTEXCEPTION` buffers are
+  GUEST pointers and were dereferenced straight into `%.*s` / a WCHAR loop; they
+  are copied out through `ios_exc_safe_read_upto` now
+  (`signal_arm64_ios.c:6588-6609`), which returns the longest readable prefix
+  and appends `<unreadable tail>`. A logging helper must not be able to kill the
+  process.
+  AUDITED AND ALREADY CLEAN: the ml998 loader re-walk (`ios_gmod32_build`) reads
+  every field through `ios_prof_read` (= `mach_vm_read_overwrite`) and is
+  bounded to `IOS_GMOD32_MAX` = 160 entries; `ios_pe_module_name` reads the PE
+  header and export directory the same way; `ios_gmod32_probe` and the
+  `[prof] block#` guest byte dumps use `ios_prof_read` / `ios_prof_read_upto`;
+  the `[thread-stacks]` sampler's TEB reads are `mach_vm_read_overwrite`. None
+  of them can fault, which is why none of them is in the backtrace.
+  **What to look for in the next log:** no `bus_handler` at
+  `ios_alert_waiter_dump`; `[waiters]` rows with `w0=deaddead w1=deaddead` where
+  a lock page has gone away (that is the fix working, not a new fault); and any
+  `[exc-disp]` line from a no-TEB thread reading `tid=0000` rather than being
+  the last line in the file.
+
+- 2026-09-20 — **THE xWMA "DECODER BUG" WAS NEVER IN THE DECODER: a streaming
+  wave bank that does not start at byte 0 of its file had its wave data read
+  from the wrong place.** Four rounds went into libavcodec parameters. What
+  ended it was reproducing on the HOST instead of reasoning from device logs:
+  a minimal host ffmpeg built from the same 7.1.1 tree (`~/ffhost`), a 40-line
+  harness that opens/sends exactly as `winegstreamer_unixlib_ios.c` does, and
+  the wave-bank container files from a local install.
+  1. The 16 packet-head bytes logged by `[wma] pkt#0` / `pkt#1` were searched
+     for in the container: found, 1487 bytes apart (= block_align), so pushes
+     ARE consecutive packets of SOMETHING.
+  2. But the position was `entry_start + 22528` of an unrelated entry — not a
+     multiple of block_align. For a second stream the position was
+     `entry_start + 0xf000` of another unrelated entry. The offsets differ, so
+     it is not a constant skew …
+  3. … it is the BANK'S BASE OFFSET. The containers hold several `WBND` banks
+     each; for both samples `logged position + bank base` is exactly the start
+     of an entry whose rate/channels/block_align match what the decoder was
+     created with. `FACT_INTERNAL_ParseWaveBank` adds
+     `FACTStreamingParameters.offset` to every HEADER read (`SEEKSET`), but
+     leaves `entries[i].PlayRegion.dwOffset` bank-relative, and the streaming
+     path (`FACT_INTERNAL_OnBufferEnd` → `FACT_INTERNAL_ReadFile`) uses it as
+     an ABSOLUTE file position. Correct format, wrong bytes: every WMA packet
+     fails, PCM/ADPCM banks play the wrong sound. A bank at offset 0 (or in
+     memory) is unaffected — which is why menus were fine and everything
+     streamed from a multi-bank container was noise.
+  Fix (`wine/libs/faudio/src/FACT_internal.c`, generic): after the entry
+  length fix-ups, `if (isStreaming && offset) entries[i].PlayRegion.dwOffset +=
+  offset`. Build tag `MADEIRA-FACT-2026-09-20-stream-base-offset` in every
+  `xactengine*.dll`.
+  Host measurements on the CORRECTLY located entries, same API calls as the
+  device: 22050 Hz 2ch block 1487 — header rate 192000: 642 of 643 packets
+  fail; 32000: 0 fail, 238 s decoded, peak 1.54. 32000 Hz 2ch block 2304 —
+  192000: 87/87 fail; 48000: 0 fail. So (a) `libavformat/xwma.c`'s fake-rate
+  table is REQUIRED, not optional: the decoder now opens at the table's rate
+  up front when the codec-private data is the synthetic all-zero-but-flags2
+  blob an xWMA caller fabricates (a real ASF header never is), keeping the
+  header rate as the fallback candidate; (b) legitimate float peaks reach
+  1.54, so last round's ±1.25 "sane frame" limit would have muted real audio —
+  now 3.0 (garbage measured 4.5–15). Also worth keeping: a fresh WMA decoder
+  fed a mid-stream packet fails SILENTLY (`exponents not initialized`, no
+  av_log) — "no log line" does not mean "no error path".
+  LESSON: when the bytes are available on the host, reproduce there first. The
+  device log could only ever say "packets fail"; ten minutes with the real
+  file said where the bytes came from.
+  64-bit farms also gained xactengine2_*/3_*, xaudio2_0..6, x3daudio1_0..6 and
+  xapofx1_1..4 (they had only the newest of each).

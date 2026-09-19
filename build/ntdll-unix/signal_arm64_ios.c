@@ -6561,31 +6561,92 @@ static inline void ios_fixup_x18_for_return( ucontext_t *context );
  * OutputDebugString we never see). Log every exception dispatched to the
  * guest: code+address+params. DBG_PRINTEXCEPTION carries the game's own
  * debug string — print it. 0xE06D7363 = MSVC C++ throw. */
+/* ml1000: A LOGGING HELPER MUST NOT BE ABLE TO KILL THE PROCESS.
+ *
+ * Two ways this one could, and did.
+ *
+ * (1) NO TEB.  `NtCurrentTeb()->ClientId.UniqueThread' is a load at TEB+0x48,
+ * and on a thread with no TEB NtCurrentTeb() is NULL.  w1.txt caught exactly
+ * that, twice, while reporting the BUS that ios_alert_waiter_dump had just
+ * taken on the pool-warmer thread:
+ *
+ *   sym pc=Madeira`ios_log_guest_exception+0x48 ... addr=0x48 x18=0x0
+ *   insn_stream ... [b9404808] ...        (ldr w8,[x0,#0x48], x0 = 0)
+ *   bt[1] Madeira`setup_exception+0x108
+ *   bt[2] Madeira`bus_handler+0x1a9c
+ *
+ * So the first fault was survivable and the REPORT of it was not: the handler
+ * faulted inside the handler, the thread had no TEB to adopt it with, and the
+ * app died. A tid of 0000 in a log line is worth infinitely more than a crash.
+ *
+ * (2) GUEST POINTERS.  ExceptionInformation[1] on a DBG_PRINTEXCEPTION is a
+ * pointer chosen by the GUEST, printed here with %.*s / read as a WCHAR array.
+ * A guest that raises the exception with a bad pointer -- or a good one whose
+ * page is unmapped between the raise and this line -- turns its own debug
+ * print into our crash. Both are copied out with mach_vm_read_overwrite now,
+ * which reports failure as a return value rather than a signal. */
+static int ios_exc_safe_read( unsigned long long addr, void *buf, size_t len )
+{
+    mach_vm_size_t got = 0;
+    if (!addr || !len) return 0;
+    return mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)addr, len,
+                                   (mach_vm_address_t)buf, &got ) == KERN_SUCCESS && got == len;
+}
+
+/* Longest prefix of [addr, addr+want) that is readable, halving on failure.
+ * A string that runs off the end of its page still prints what there was. */
+static unsigned ios_exc_safe_read_upto( unsigned long long addr, void *buf, unsigned want )
+{
+    unsigned n, pagelim;
+    if (!addr || !want) return 0;
+    if (ios_exc_safe_read( addr, buf, want )) return want;
+    pagelim = 0x4000u - (unsigned)(addr & 0x3fffu);
+    if (pagelim && pagelim < want && ios_exc_safe_read( addr, buf, pagelim )) return pagelim;
+    for (n = want / 2; n >= 8; n /= 2)
+        if (ios_exc_safe_read( addr, buf, n )) return n;
+    return 0;
+}
+
 static void ios_log_guest_exception( const char *via, const EXCEPTION_RECORD *rec, ULONG64 pc )
 {
     static volatile int exc_logged = 0;
+    struct _TEB *teb;
+    unsigned int tid;
     int n = __sync_add_and_fetch(&exc_logged, 1);
     if (n > 80) return;
+    /* ml1000: see (1) above. NtCurrentTeb() is x18 on this port and x18 is 0 on
+     * every thread we did not create; 0000 means "no TEB", which is itself the
+     * most interesting thing a line from such a thread can say. */
+    teb = NtCurrentTeb();
+    tid = teb ? (unsigned int)(ULONG_PTR)teb->ClientId.UniqueThread : 0;
     dprintf(2, "[exc-disp] %s tid=%04x code=%08x flags=%x addr=%p pc=%llx nparams=%u p0=%llx p1=%llx\n",
-            via, (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
+            via, tid,
             (unsigned int)rec->ExceptionCode, (unsigned int)rec->ExceptionFlags,
             rec->ExceptionAddress, (unsigned long long)pc, (unsigned int)rec->NumberParameters,
             rec->NumberParameters > 0 ? (unsigned long long)rec->ExceptionInformation[0] : 0,
             rec->NumberParameters > 1 ? (unsigned long long)rec->ExceptionInformation[1] : 0);
     if (rec->ExceptionCode == 0x40010006 && rec->NumberParameters >= 2 &&
         rec->ExceptionInformation[1])   /* DBG_PRINTEXCEPTION_C: [0]=len [1]=char* */
-        dprintf(2, "[exc-disp]   OutputDebugStringA: \"%.*s\"\n",
-                (int)(rec->ExceptionInformation[0] > 512 ? 512 : rec->ExceptionInformation[0]),
-                (const char *)rec->ExceptionInformation[1]);
+    {
+        char buf[513];
+        unsigned want = (unsigned)(rec->ExceptionInformation[0] > 512 ? 512 : rec->ExceptionInformation[0]);
+        unsigned got = ios_exc_safe_read_upto( (unsigned long long)rec->ExceptionInformation[1], buf, want );
+        buf[got] = 0;
+        dprintf(2, "[exc-disp]   OutputDebugStringA: \"%.*s\"%s\n", (int)got, buf,
+                got < want ? " <unreadable tail>" : "");
+    }
     if (rec->ExceptionCode == 0x4001000a && rec->NumberParameters >= 2 &&
         rec->ExceptionInformation[1])   /* DBG_PRINTEXCEPTION_WIDE_C */
     {
-        const WCHAR *ws = (const WCHAR *)rec->ExceptionInformation[1];
+        WCHAR ws[256];
         char buf[256];
-        int i;
-        for (i = 0; i < 255 && ws[i]; i++) buf[i] = (ws[i] < 128) ? (char)ws[i] : '?';
+        unsigned got = ios_exc_safe_read_upto( (unsigned long long)rec->ExceptionInformation[1],
+                                               ws, sizeof(ws) - sizeof(WCHAR) );
+        unsigned nchars = got / sizeof(WCHAR);
+        unsigned i;
+        for (i = 0; i < nchars && i < 255 && ws[i]; i++) buf[i] = (ws[i] < 128) ? (char)ws[i] : '?';
         buf[i] = 0;
-        dprintf(2, "[exc-disp]   OutputDebugStringW: \"%s\"\n", buf);
+        dprintf(2, "[exc-disp]   OutputDebugStringW: \"%s\"%s\n", buf, got ? "" : " <unreadable>");
     }
 }
 
