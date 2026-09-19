@@ -4221,14 +4221,20 @@ static int ios_insn_x18_role(uint32_t insn)
         if (rm == 18) return X18_ROLE_RM;
     }
 
-    /* ADD/SUB (immediate) — [31:24]=x00 10001 or x10 10001 */
-    if ((top8 & 0x5F) == 0x11)
+    /* ADD/SUB (immediate): [28:23] = 100010, both sf and both S values.
+     * 2026-09-21: the old mask `(top8 & 0x5F) == 0x11` matched only the ADD
+     * forms -- 0xD1/0xF1/0x51/0x71 (SUB/SUBS) all fall outside it -- so
+     * `sub x8,x18,#imm` and `cmp x18,#imm` went unpatched and ran with a
+     * zeroed x18, silently. Neither faults, so nothing downstream could
+     * notice. The exact class mask also keeps ADDG/SUBG (bit 23 set) out. */
+    if (((insn >> 23) & 0x3F) == 0x22)
     {
         if (rn == 18) return X18_ROLE_RN;
     }
 
-    /* ADD/SUB (register) — [31:24]=x00 01011 or x10 01011 */
-    if ((top8 & 0x5F) == 0x0B)
+    /* ADD/SUB (shifted or extended register): [28:24] = 01011, which is this
+     * class alone. Same widening as above -- SUB/SUBS were being missed. */
+    if (((insn >> 24) & 0x1F) == 0x0B)
     {
         if (rn == 18) return X18_ROLE_RN;
         if (rm == 18) return X18_ROLE_RM;
@@ -4237,15 +4243,56 @@ static int ios_insn_x18_role(uint32_t insn)
     return X18_ROLE_NONE;
 }
 
-/* Statistics only: does this instruction have a general-purpose destination
- * register that is distinct from every other register it reads?  Such a site
- * could be trampolined with the destination as the scratch; everything else
- * (stores, prefetches, SIMD transfers, flag-setting compares, register-offset
- * loads whose destination IS the index) could not.  The emitter below does not
- * need the distinction -- it uses x18 itself -- but the split is worth logging
- * because it is exactly the population the old spill-based emitter could have
- * handled without touching SP. */
-static int ios_x18_insn_has_free_dest(uint32_t insn, int role)
+/* Does x18 occupy more than one REGISTER field of this instruction?  The role
+ * decoder reports a single field, and rewriting only that one would leave a
+ * live x18 read behind (`add x0,x18,x18`), which is exactly the silent-zero
+ * failure this pass exists to prevent.  Such encodings are meaningless in real
+ * Windows ARM64 code -- x18 is the TEB -- so the patcher skips them instead of
+ * growing a multi-field rewrite. */
+static int ios_x18_multi_field(uint32_t insn)
+{
+    int rn  = (insn >> 5) & 0x1f;
+    int rm  = (insn >> 16) & 0x1f;
+    int rt2 = (insn >> 10) & 0x1f;
+    uint32_t top8 = insn >> 24, top11 = insn >> 21;
+    int n = (rn == 18);
+
+    /* Rm is a register only in these families; elsewhere those bits are
+     * immediate. Rt2 is a register only in a load/store pair. */
+    if (((top11 & 0x1F9) == 0x1C1 && ((insn >> 10) & 3) == 2) ||   /* reg offset */
+        ((insn >> 24) & 0x1F) == 0x0B ||                           /* add/sub reg */
+        (top11 & 0x7FF) == 0x150 || (top11 & 0x7FF) == 0x550)      /* mov (reg)  */
+        n += (rm == 18);
+    if ((top8 & 0x3E) == 0x28 || (top8 & 0x3E) == 0x2C)
+        n += (rt2 == 18);
+    return n > 1;
+}
+
+/* Replace the x18 field of an instruction with another register. */
+static uint32_t ios_insn_replace_x18(uint32_t insn, int role, int scratch)
+{
+    switch (role)
+    {
+    case X18_ROLE_RN:  return (insn & ~(0x1fu << 5))  | ((uint32_t)scratch << 5);
+    case X18_ROLE_RM:  return (insn & ~(0x1fu << 16)) | ((uint32_t)scratch << 16);
+    case X18_ROLE_RT2: return (insn & ~(0x1fu << 10)) | ((uint32_t)scratch << 10);
+    default:           return insn;
+    }
+}
+
+/* Does this instruction write a general-purpose register that it does not also
+ * read (ignoring the x18 field, which the trampoline replaces)?  That register
+ * can hold the TEB while the rewritten instruction runs, so such a site needs
+ * neither SP nor x18.  Returns its number, or -1.
+ *
+ * Disqualifiers, all load-bearing: a vector Rt holds no pointer; a store's Rt
+ * is a source; PRFM's "Rt" is a prefetch operation, not a register; Rt==31 is
+ * xzr or SP; Rt equal to any surviving source register (`ldrb w8,[x18,x8]`,
+ * `add x0,x18,x0`) would destroy that source before use; a pair with
+ * write-back, or whose two destinations coincide, is unpredictable when the
+ * base is one of them; and Rt==18 is excluded so that a site which WRITES x18
+ * can never be left depending on x18 surviving (see ios_jit_patch_x18). */
+static int ios_x18_free_dest(uint32_t insn, int role)
 {
     int rt  = insn & 0x1f;
     int rn  = (insn >> 5) & 0x1f;
@@ -4257,47 +4304,121 @@ static int ios_x18_insn_has_free_dest(uint32_t insn, int role)
     int size = (insn >> 30) & 3;
     int opc  = (insn >> 22) & 3;
 
-    if (rt == 31) return 0;                       /* xzr/sp -- nothing freed */
+    if (rt == 31 || rt == 18) return -1;
 
-    /* LDR/STR, unsigned 12-bit immediate offset */
+    /* LDR/STR, unsigned 12-bit immediate offset (V=0 and V=1) */
     if ((top8 & 0x3F) == 0x39 || (top8 & 0x3F) == 0x3D)
-        return !v && opc != 0 && !(size == 3 && opc == 2) && role == X18_ROLE_RN;
-
-    /* LDR/STR, register offset */
-    if ((top11 & 0x1F9) == 0x1C1 && ((insn >> 10) & 3) == 2)
     {
-        if (v || opc == 0 || (size == 3 && opc == 2)) return 0;
-        return (role == X18_ROLE_RN) ? (rt != rm) : (rt != rn);
+        if (v || opc == 0 || (size == 3 && opc == 2)) return -1;
+        return role == X18_ROLE_RN ? rt : -1;
     }
 
-    /* LDP/STP: load, vector-free, no write-back, two distinct destinations */
-    if ((top8 & 0x3E) == 0x28)
+    /* LDR/STR, register offset (x18 may be the base or the index) */
+    if ((top11 & 0x1F9) == 0x1C1 && ((insn >> 10) & 3) == 2)
     {
-        int wback = ((insn >> 23) & 3) == 1 || ((insn >> 23) & 3) == 3;
-        return !v && ((insn >> 22) & 1) && !wback && rt != rt2 && role == X18_ROLE_RN;
+        if (v || opc == 0 || (size == 3 && opc == 2)) return -1;
+        if (role == X18_ROLE_RN) return rt != rm ? rt : -1;
+        if (role == X18_ROLE_RM) return rt != rn ? rt : -1;
+        return -1;
+    }
+
+    /* LDP/STP: only a non-write-back GPR load with two distinct destinations */
+    if ((top8 & 0x3E) == 0x28 || (top8 & 0x3E) == 0x2C)
+    {
+        int mode  = (insn >> 23) & 3;               /* 1 = post, 3 = pre-index */
+        int wback = (mode == 1 || mode == 3);
+        if (v || !((insn >> 22) & 1) || wback) return -1;
+        if (rt2 == 31 || rt == rt2) return -1;
+        return role == X18_ROLE_RN ? rt : -1;
     }
 
     /* MOV (register) = ORR Xd|Wd, ZR, x18 */
-    if ((top11 & 0x7FF) == 0x150 || (top11 & 0x7FF) == 0x550) return role == X18_ROLE_RM;
+    if ((top11 & 0x7FF) == 0x150 || (top11 & 0x7FF) == 0x550)
+        return role == X18_ROLE_RM ? rt : -1;
 
-    /* ADD/SUB immediate (ADDS/SUBS with an xzr destination already rejected) */
-    if ((top8 & 0x5F) == 0x11) return role == X18_ROLE_RN;
+    /* ADD/SUB (immediate), including ADDS/SUBS; Rd==31 already rejected */
+    if (((insn >> 23) & 0x3F) == 0x22) return role == X18_ROLE_RN ? rt : -1;
 
-    /* ADD/SUB register */
-    if ((top8 & 0x5F) == 0x0B)
-        return (role == X18_ROLE_RN) ? (rt != rm) : (rt != rn);
+    /* ADD/SUB (shifted or extended register) */
+    if (((insn >> 24) & 0x1F) == 0x0B)
+    {
+        if (role == X18_ROLE_RN) return rt != rm ? rt : -1;
+        if (role == X18_ROLE_RM) return rt != rn ? rt : -1;
+        return -1;
+    }
 
+    return -1;
+}
+
+/* Is this exactly one of the shapes the Mach handler's x18==0 emulator
+ * completes?  Mirrors the case-3 decode in signal_arm64_ios.c one for one --
+ * class 2 below is sound ONLY for instructions listed here, because its whole
+ * safety argument is "a zeroed x18 makes this fault at a tiny address and the
+ * emulator finishes it". Keep the two in step. */
+static int ios_x18_emulator_covers(uint32_t insn)
+{
+    uint32_t u = insn & 0xffc00000;
+
+    /* unsigned-offset immediate, V=0: the eight opcodes the switch enumerates */
+    if (u == 0xf9400000 || u == 0xb9400000 || u == 0x39400000 || u == 0x79400000 ||
+        u == 0xf9000000 || u == 0xb9000000 || u == 0x39000000 || u == 0x79000000)
+        return 1;
+    /* LDP/STP signed offset, no write-back, 64- and 32-bit */
+    if (u == 0xa9400000 || u == 0xa9000000 || u == 0x29400000 || u == 0x29000000)
+        return 1;
+    if ((insn & 0x3f200c00) == 0x38200800) return 1;   /* GPR register offset  */
+    if ((insn & 0x3f200c00) == 0x38000000) return 1;   /* GPR unscaled imm9    */
+    if ((insn & 0x3f200c00) == 0x3c200800) return 1;   /* SIMD register offset */
+    if ((insn & 0x3f000000) == 0x3d000000) return 1;   /* SIMD unsigned imm    */
+    return 0;
+}
+
+/* Trampoline classes -- see the long comment in ios_jit_patch_x18. */
+#define X18_TRAMP_FREE_DEST 1   /* scratch = the instruction's own destination */
+#define X18_TRAMP_X18       2   /* scratch = x18; a zero x18 faults and is emulated */
+#define X18_TRAMP_SPILL     3   /* scratch = x16/x17, spilled through SP        */
+
+/* Pick the class and the scratch register. Returns 0 (skip this site) when
+ * class 3 has no free veneer register either. */
+static int ios_x18_tramp_class(uint32_t insn, int role, int *scratch)
+{
+    int rt  = insn & 0x1f;
+    int rn  = (insn >> 5) & 0x1f;
+    int rm  = (insn >> 16) & 0x1f;
+    int rt2 = (insn >> 10) & 0x1f;
+    int d;
+
+    if (ios_x18_multi_field(insn)) return 0;    /* would leave a live x18 read */
+    d = ios_x18_free_dest(insn, role);
+
+    if (d >= 0) { *scratch = d; return X18_TRAMP_FREE_DEST; }
+
+    if (role == X18_ROLE_RN && ios_x18_emulator_covers(insn))
+    {
+        *scratch = 18;
+        return X18_TRAMP_X18;
+    }
+
+    /* x16 first: the signal-return path redirects JIT-pool PCs through a
+     * veneer that overwrites x17, so a trampoline holding the TEB in x17
+     * loses it whenever a signal lands inside it. */
+    if (rt != 16 && rn != 16 && rm != 16 && rt2 != 16) { *scratch = 16; return X18_TRAMP_SPILL; }
+    if (rt != 17 && rn != 17 && rm != 17 && rt2 != 17) { *scratch = 17; return X18_TRAMP_SPILL; }
     return 0;
 }
 
 /* Self-check for the emitted trampoline words: on AArch64 an SP-based load or
  * store raises an SP alignment fault whenever SP is not 16-byte aligned, and a
  * misaligned SP is a normal, legal state here (see the emitter's comment).  No
- * word of a trampoline may therefore use register 31 as its address base. */
+ * word of a class 1 or class 2 trampoline may use register 31 as its address
+ * base.  Class 3's two spill words are exempt by construction: they are the
+ * exact encodings the fault path recognises and emulates. */
 static int ios_x18_word_uses_sp_base(uint32_t w)
 {
-    if ((w & 0x0A000000) != 0x08000000) return 0;     /* not a load/store */
-    if ((w & 0x3B000000) == 0x18000000) return 0;     /* load literal: no Rn field */
+    if (w == 0xF81F0FF0 || w == 0xF81F0FF1 ||          /* str x16|x17,[sp,#-16]! */
+        w == 0xF84107F0 || w == 0xF84107F1) return 0;  /* ldr x16|x17,[sp],#16   */
+    if ((w & 0x0A000000) != 0x08000000) return 0;      /* not a load/store */
+    if ((w & 0x3B000000) == 0x18000000) return 0;      /* load literal: no Rn field */
     return ((w >> 5) & 0x1f) == 31;
 }
 
@@ -4368,7 +4489,7 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
     int skipped = 0;
     int lit_skipped = 0;
     int sp_refused = 0;
-    int free_dest = 0, no_free_dest = 0;
+    int free_dest = 0, x18_scratch = 0, spill_class = 0;
     unsigned char *data_map = NULL;
     extern int ios_teb_tls_slot_offset;
     const int slot_off = ios_teb_tls_slot_offset;
@@ -4499,10 +4620,10 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
         {
             int rm = (insn >> 16) & 0x1f;
             uint32_t words[8];
-            int nw = 0, w;
+            int nw = 0, w, scratch = -1, cls;
 
-            /* Check trampoline space (worst case 5 instructions = 20 bytes) */
-            if (tramp_off + 24 > tramp_size)
+            /* Check trampoline space (worst case 7 instructions = 28 bytes) */
+            if (tramp_off + 32 > tramp_size)
             {
                 ERR("x18 patcher: out of trampoline space at %d patches\n", count);
                 break;
@@ -4516,69 +4637,88 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
             int is_mov_from_x18 = (role == X18_ROLE_RM) &&
                 ((insn & 0xFFE0FFE0) == 0xAA0003E0) && rm == 18;
 
-            if (ios_x18_insn_has_free_dest(insn, role)) free_dest++; else no_free_dest++;
+            cls = ios_x18_tramp_class(insn, role, &scratch);
+            if (!cls) { skipped++; continue; }
 
-            /* TEB load sequence (uses TPIDRRO_EL0, which iOS preserves):
-             *   mrs xT, TPIDRRO_EL0
-             *   and xT, xT, #~7                (clear CPU number from low 3 bits)
-             *   ldr xT, [xT, #SLOT_OFFSET]     (TEB out of our pthread TSD slot)
+            /* WHERE THE TEB LIVES WHILE THE PATCHED INSTRUCTION RUNS.
              *
-             * THE SCRATCH IS x18 ITSELF (2026-09-21).
+             * Every trampoline starts with the same three instructions --
+             *   mrs xT, TPIDRRO_EL0 ; and xT, xT, #~7 ; ldr xT, [xT, #SLOT]
+             * -- and the only real question is which register xT may be.  Two
+             * platform facts decide it, and both were learned the hard way:
              *
-             * The emitter used to spill a scratch register with
-             * `str x16, [sp,#-16]!` / `ldr x16, [sp],#16`.  That is fatal on
-             * this platform: AArch64 raises an SP alignment fault on ANY
-             * SP-based memory access taken while SP is not 16-byte aligned,
-             * and an 8-mod-16 SP is a legal, expected state -- the dispatch
-             * path from native ARM64EC code into x64 code pushes an x64-style
-             * return address before it reads the TEB.  The push therefore
-             * faulted (BUS, fault address 0) on the first such call in any
-             * x86-64 process, and the fault landed inside a trampoline, where
-             * recovery is hardest.  Note only SP-based *accesses* fault; `sub`
-             * / `add` on SP do not, but SP cannot be realigned without a
-             * scratch register, and SP cannot be read into one without a
-             * scratch register either -- the trampoline has to avoid SP
-             * entirely, which means it has to find a free register.
+             *  (a) An SP-based load or store raises an SP alignment fault
+             *      whenever SP is not 16-byte aligned, and an 8-mod-16 SP is
+             *      legal and expected here: the dispatch path from native
+             *      ARM64EC code into x64 code pushes an x64-style return
+             *      address before it reads the TEB.  The original emitter
+             *      opened with `str x16,[sp,#-16]!` and therefore killed every
+             *      x86-64 process at its first such call.  Only SP-based
+             *      *accesses* fault -- `add`/`sub` on SP do not -- but SP can
+             *      be neither realigned nor copied into a register without
+             *      already holding a scratch register, so a trampoline that
+             *      wants to avoid SP must find a free register instead.
              *
-             * There is no register that is provably dead at an arbitrary
-             * mid-function patch site: x16/x17 are call-clobbered veneer
-             * registers, but the dispatch sequences that reach these very
-             * instructions keep both live.  Deriving the scratch from the
-             * patched instruction's own destination works for plain loads and
-             * for ADD/MOV, but not for stores, prefetches, SIMD transfers or
-             * compares -- and no per-thread spill slot can help, because
-             * reaching one (through TPIDRRO_EL0) already needs the scratch.
+             *  (b) x18 does NOT survive an exception return.  The kernel
+             *      zeroes the platform register on every signal return and on
+             *      every Mach exception reply, including the ~10^5 PE-page
+             *      exec-fault redirects a running process takes.  A trampoline
+             *      that loads the TEB into x18 and uses it in the NEXT
+             *      instruction is therefore racing the kernel, and loses often
+             *      enough to matter: an interrupted `add x8, x18, x0, lsl #3`
+             *      resumed with x18 == 0 silently produced x8 = index*8, and
+             *      the TLS read one instruction later died on a small address
+             *      that no emulator recognises.  x16 and x17, by contrast, are
+             *      ordinary registers that every exception return restores.
              *
-             * x18 resolves it with no spill at all.  x18 is the register the
-             * whole pass exists to eliminate: this platform zeroes it at every
-             * context switch and signal return, so no code may rely on its
-             * contents, and every read of it inside .text is what we are
-             * rewriting.  Loading the TEB into x18 lets the ORIGINAL
-             * instruction run unmodified, and it is strictly beneficial
-             * elsewhere: sites this pass skips (literal-pool words, addressing
-             * modes it does not decode) then see a correct TEB instead of zero,
-             * and the diagnostics that treat a page-aligned non-zero x18 as
-             * "this thread's TEB" become right more often.
+             * So: never keep a value in x18 across an instruction boundary
+             * unless a WRONG value is guaranteed to fault.  Three classes:
              *
-             * Interruption is self-healing.  A signal delivered part way
-             * through a trampoline returns with x18 zeroed, so the original
-             * instruction faults exactly as an unpatched one would and the
-             * existing x18==0 emulator in the Mach handler completes it with
-             * the thread's real TEB.  The old emitter had no such property: a
-             * signal there left a half-restored x16/x17. */
-            if (is_mov_from_x18)
+             *  1 FREE-DEST -- the instruction writes a GPR it does not read.
+             *    Use that register: no SP, no x18, nothing to lose.  This is
+             *    the majority, and it covers both shapes that died above
+             *    (`add xD,x18,…`, `mov xD,x18`, `ldr xD,[x18,…]`).
+             *
+             *  2 X18 -- a memory access based on x18 with no free destination
+             *    (stores, pairs, SIMD, register-offset loads whose destination
+             *    is the index).  x18 is allowed here, and ONLY here, because a
+             *    zeroed x18 turns the access into a fault at a tiny address,
+             *    which the Mach handler's x18==0 emulator completes against
+             *    the real TEB and resumes at pc+4 -- the trampoline's own
+             *    branch back.  ios_x18_emulator_covers() restricts this class
+             *    to the encodings that emulator actually decodes.
+             *
+             *  3 SPILL -- everything else: x18 as a non-base operand, a
+             *    destination that is also a source, a compare.  A zeroed x18
+             *    would run silently, so these keep the TEB in x16 (x17 only if
+             *    x16 is taken) and spill it through SP.  The two SP words are
+             *    now recoverable: the fault path recognises those exact
+             *    encodings inside the pool and emulates them against the
+             *    misaligned SP.  x16 is preferred because the signal-return
+             *    path redirects pool PCs through a veneer that overwrites x17.
+             */
+            if (cls == X18_TRAMP_FREE_DEST) free_dest++;
+            else if (cls == X18_TRAMP_X18)  x18_scratch++;
+            else                            spill_class++;
+
+            if (is_mov_from_x18 && cls == X18_TRAMP_FREE_DEST)
             {
-                int rd = insn & 0x1f;
-                words[nw++] = 0xD53BD060 | rd;                  /* mrs xRd, TPIDRRO_EL0 */
-                words[nw++] = 0x927DF000 | (rd << 5) | rd;      /* and xRd, xRd, #~7    */
-                words[nw++] = 0xF9400000 | ((slot_off / 8) << 10) | (rd << 5) | rd;
+                /* `mov xD, x18` is just "load the TEB into xD" */
+                words[nw++] = 0xD53BD060 | scratch;
+                words[nw++] = 0x927DF000 | (scratch << 5) | scratch;
+                words[nw++] = 0xF9400000 | ((slot_off / 8) << 10) | (scratch << 5) | scratch;
             }
             else
             {
-                words[nw++] = 0xD53BD060 | 18;                  /* mrs x18, TPIDRRO_EL0 */
-                words[nw++] = 0x927DF000 | (18 << 5) | 18;      /* and x18, x18, #~7    */
-                words[nw++] = 0xF9400000 | ((slot_off / 8) << 10) | (18 << 5) | 18;
-                words[nw++] = insn;                             /* unchanged: x18 IS the TEB now */
+                if (cls == X18_TRAMP_SPILL)                     /* str xS,[sp,#-16]! */
+                    words[nw++] = (scratch == 17) ? 0xF81F0FF1 : 0xF81F0FF0;
+                words[nw++] = 0xD53BD060 | scratch;             /* mrs xS, TPIDRRO_EL0 */
+                words[nw++] = 0x927DF000 | (scratch << 5) | scratch;
+                words[nw++] = 0xF9400000 | ((slot_off / 8) << 10) | (scratch << 5) | scratch;
+                /* class 2's scratch IS x18, so the rewrite is a no-op there */
+                words[nw++] = ios_insn_replace_x18(insn, role, scratch);
+                if (cls == X18_TRAMP_SPILL)                     /* ldr xS,[sp],#16 */
+                    words[nw++] = (scratch == 17) ? 0xF84107F1 : 0xF84107F0;
             }
 
             /* Branch back to the instruction after the patched one */
@@ -4588,10 +4728,12 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
                 words[nw++] = 0x14000000 | ((ret_delta >> 2) & 0x3FFFFFF);
             }
 
-            /* Self-check: refuse to install a trampoline that would take an SP
-             * alignment fault.  The copied original can trip this when it is
-             * itself SP-based (`ldr x0,[sp,x18]`); leaving such a site
-             * unpatched is the documented safe degradation. */
+            /* Self-check: refuse to install a trampoline with an unrecoverable
+             * SP-based access.  Class 3's own two spill words are exempt (the
+             * fault path emulates exactly those encodings); what this catches
+             * is a copied original that is itself SP-based, e.g.
+             * `ldr x0,[sp,x18]`.  Leaving such a site unpatched is the
+             * documented safe degradation. */
             for (w = 0; w < nw; w++) if (ios_x18_word_uses_sp_base(words[w])) break;
             if (w < nw)
             {
@@ -4626,12 +4768,11 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
         ERR("x18 patcher: patched %d instructions (%d skipped, %d SP-refused), "
             "trampolines=%lu bytes\n",
             count, skipped, sp_refused, (unsigned long)tramp_off);
-    /* Shape census (see ios_x18_insn_has_free_dest): free_dest is the share a
-     * destination-register scratch would have covered, no_free_dest the share
-     * that had no free register at all and used to force the SP spill. */
+    /* Per-image class census — see the classes described at the emit site. */
     if (count > 0)
-        dprintf(2, "[x18-tramp] shapes: %d with a free destination register, "
-                "%d without (all now use x18 as the scratch)\n", free_dest, no_free_dest);
+        dprintf(2, "[x18-tramp] shapes: class1 free-dest=%d, class2 x18-scratch=%d, "
+                "class3 sp-spill=%d, skipped=%d\n",
+                free_dest, x18_scratch, spill_class, skipped);
     /* dprintf, not ERR (err-virtual muted): literal words the x18 matcher
      * WOULD have clobbered — nonzero = a dodged conhost-class boot death. */
     if (lit_skipped)
@@ -6662,6 +6803,76 @@ static int ios_wow_guard_borrowed_from( ULONG_PTR addr )
     return 0;
 }
 
+/***********************************************************************
+ *           ios_wow_band
+ *
+ * The range guest-window candidates are drawn from.
+ *
+ * On a device whose user address space reaches 512 GB this is the furniture
+ * band [ios_usable_va_floor, ios_furniture_ceiling) capped below the CEF
+ * pools, exactly as before.  A device WITHOUT that much address space -- the
+ * kernel reports TASK_VM_INFO.max_address = 0xfc0000000 (63 GB) on a tablet
+ * with no extended-virtual-addressing entitlement -- has no such band at all:
+ * every candidate was above the end of the map, both slots were REJECTED
+ * ("4GB+guard unavailable ... free to end of VA") and no 32-bit program could
+ * start (STATUS_NO_MEMORY from the reserve, surfaced to the user as an
+ * unrelated-looking error box).  Nothing about a guest window needs a HIGH
+ * address: FEX forms host addresses as B + zext32(EA), so B only has to be
+ * 4 GB-aligned.  The launch-time probe on that device shows every 4 GB slot
+ * from 12 GB to 60 GB free.
+ *
+ * So when the map ends at or below the normal band, candidates come from
+ * [16 GB, 24 GB): above the image, the malloc zones, the shared cache and
+ * the JIT pool's RW alias (all below 16 GB), and clear of the top-down
+ * furniture (TEBs, stacks, PE images), which packs downward from the end of
+ * the map.  Lowest first, same as the high band.
+ */
+static void ios_wow_band( ULONG_PTR *floor, ULONG_PTR *ceil )
+{
+    static ULONG_PTR kern_max;      /* 0 = not asked yet, 1 = unavailable */
+    static int announced;
+
+    *floor = ios_usable_va_floor;
+    *ceil  = ios_furniture_ceiling ? ios_furniture_ceiling : (ULONG_PTR)user_space_limit;
+    if (*ceil > IOS_WOW_CEF_POOLS_START) *ceil = IOS_WOW_CEF_POOLS_START;
+
+    if (!kern_max)
+    {
+        task_vm_info_data_t vmi;
+        mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+
+        kern_max = 1;
+        if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt ) == KERN_SUCCESS &&
+            vmi.max_address >= 0x100000000ULL)
+            kern_max = (ULONG_PTR)vmi.max_address;
+    }
+
+    if (kern_max > 1 && kern_max < *floor + IOS_WOW_WINDOW_SIZE)
+    {
+        ULONG_PTR top = kern_max & ~(IOS_WOW_WINDOW_SIZE - 1);
+        ULONG_PTR lo  = (ULONG_PTR)0x400000000ULL;                      /* 16 GB */
+        ULONG_PTR hi  = top > 2 * IOS_WOW_WINDOW_SIZE ? top - 2 * IOS_WOW_WINDOW_SIZE : 0;
+
+        /* TWO slots, like the high band: every slot in the band is reserved as
+         * a 4 GB placeholder at session start, and a band of ten would take
+         * 32 GB out of a 63 GB map -- and ios_wow_candidate_slot() would bias
+         * top-down furniture below whichever slot was left unreserved. */
+        if (hi > lo + 2 * IOS_WOW_WINDOW_SIZE) hi = lo + 2 * IOS_WOW_WINDOW_SIZE;
+        if (hi > lo + IOS_WOW_WINDOW_SIZE)
+        {
+            *floor = lo;
+            *ceil  = hi;
+        }
+        if (!announced)
+        {
+            announced = 1;
+            dprintf( 2, "[wow-window] SMALL ADDRESS SPACE: the map ends at %p, below the normal "
+                        "guest-window band -- candidates come from the low band [%p,%p) instead\n",
+                     (void *)kern_max, (void *)*floor, (void *)*ceil );
+        }
+    }
+}
+
 static int ios_wow_band_ok( ULONG_PTR base, ULONG_PTR total )
 {
     if (base < IOS_WOW_CEF_POOLS_START && base + total > IOS_WOW_CEF_POOLS_START)
@@ -6827,12 +7038,11 @@ static int ios_wow_window_try( ULONG_PTR base, unsigned *guard_owned )
  * caller applies it only where it can also withdraw it (see map_view). */
 ULONG_PTR ios_wow_candidate_slot(void)
 {
-    ULONG_PTR floor = ios_usable_va_floor;
-    ULONG_PTR ceil  = ios_furniture_ceiling ? ios_furniture_ceiling : (ULONG_PTR)user_space_limit;
+    ULONG_PTR floor, ceil;
     ULONG_PTR cand;
     unsigned i, n;
 
-    if (ceil > IOS_WOW_CEF_POOLS_START) ceil = IOS_WOW_CEF_POOLS_START;
+    ios_wow_band( &floor, &ceil );
     if (ceil <= floor || ceil - floor < IOS_WOW_WINDOW_SIZE) return 0;
 
     n = ios_wow_window_count;
@@ -6985,14 +7195,13 @@ static ULONG_PTR ios_wow_carve_holdback_slots(void)
 
 static ULONG_PTR ios_wow_window_pick( unsigned *guard_owned )
 {
-    ULONG_PTR floor = ios_usable_va_floor;
-    ULONG_PTR ceil  = ios_furniture_ceiling ? ios_furniture_ceiling : (ULONG_PTR)user_space_limit;
+    ULONG_PTR floor, ceil;
     ULONG_PTR cand;
 
     /* the GUEST WINDOW is exactly 4 GB in every conversion; the FB3 guard page
      * may fall outside [floor, ceil) when it is borrowed, so the candidate test
      * below bounds the window only and ios_wow_window_try() decides the guard */
-    if (ceil > IOS_WOW_CEF_POOLS_START) ceil = IOS_WOW_CEF_POOLS_START;
+    ios_wow_band( &floor, &ceil );
     if (ceil <= floor || ceil - floor < IOS_WOW_WINDOW_SIZE) return 0;
 
     /* 4 GB-aligned only, lowest first, so top-down furniture keeps packing
@@ -7051,13 +7260,12 @@ static ULONG_PTR ios_wow_window_pick( unsigned *guard_owned )
  * ios_wow_window_try() still has its original reserve-on-demand path. */
 static void ios_wow_reserve_placeholders(void)
 {
-    ULONG_PTR floor = ios_usable_va_floor;
-    ULONG_PTR ceil  = ios_furniture_ceiling ? ios_furniture_ceiling : (ULONG_PTR)user_space_limit;
+    ULONG_PTR floor, ceil;
     ULONG_PTR cand;
 
     /* same candidate rule as ios_wow_window_pick(): 4 GB-aligned, lowest first,
      * inside the furniture band and below the CEF pools */
-    if (ceil > IOS_WOW_CEF_POOLS_START) ceil = IOS_WOW_CEF_POOLS_START;
+    ios_wow_band( &floor, &ceil );
     if (ceil <= floor || ceil - floor < IOS_WOW_WINDOW_SIZE) return;
 
     pthread_mutex_lock( &ios_wow_mutex );

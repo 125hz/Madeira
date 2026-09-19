@@ -59,6 +59,47 @@ enum DisplayMode: String, CaseIterable {
     }
 }
 
+/// Fullscreen is a MODE the user enters with a button (ContentView's
+/// fullscreenToggle, or the HUD cluster's exit button in TouchControlsOverlay)
+/// — never a side effect of rotation, size class, or `UIDevice.current.
+/// orientation`. It governs three things that all used to be keyed on
+/// "landscape" (a proxy that broke on iPad — see ContentView.body): whether
+/// MetalBackedView clamps Fill/Fill-height to Aspect (effectiveDisplayMode),
+/// whether TouchControlsOverlay shows the movable HUD cluster + on-screen
+/// controls, and whether ControlsWindow's hit-test lets the HUD cluster (and
+/// its edit mode) claim the screen.
+///
+/// Deliberately NOT persisted — the spec is explicit that the app always
+/// starts in the normal view — so this is a bare in-memory flag, not routed
+/// through InputSettings' UserDefaults-backed JSON blob.
+final class FullscreenState: ObservableObject {
+    static let shared = FullscreenState()
+
+    @Published var active = false {
+        didSet {
+            guard oldValue != active else { return }
+            // The surface must re-lay-out for the new bounds/clamp rule the
+            // instant this flips, exactly like a display-mode change does.
+            MetalBackedView.refreshDisplayMode(reason: active ? "fullscreen-enter" : "fullscreen-exit")
+            // ml: a stale `editing == true` left over from the HUD cluster's
+            // pencil button used to survive a rotation/exit and make
+            // ControlsWindow.hitTest (below) claim the ENTIRE screen — even
+            // the launch row and log console in the normal view — because
+            // TouchControlsOverlay's full-bounds gesture becomes reachable
+            // the moment hitTest forwards to it. That is "sometimes pressing
+            // a launch button does nothing" for real: whether it reproduces
+            // depended entirely on whether the user had previously opened
+            // edit mode. Force it closed the moment fullscreen ends so a
+            // stale flag can never outlive the mode it only makes sense in.
+            if !active {
+                TouchControlsModel.shared.editing = false
+                TouchControlsModel.shared.selected = nil
+            }
+        }
+    }
+    private init() {}
+}
+
 /// Geometry shared by two things that must never disagree: the frame the
 /// presented layer's host view is given (MetalBackedView.gameRect(), which
 /// sizes MetalHostView.shared directly — see applyDisplayModeAndLog) and
@@ -579,35 +620,32 @@ final class MetalBackedView: UIView {
     /// and Fill/Stretch only grow as far as the aspect math actually needs.
     /// Touch mapping (mapTouch, below) uses the identical rect so
     /// letterboxing/cropping/stretching never skews input.
-    /// Mirrors ContentView's own portrait/landscape branch condition
-    /// (`vSizeClass == .compact` picks landscapeBody, see ContentView.body)
-    /// via this view's own trait collection: MetalBackedView lives inside
-    /// whichever branch SwiftUI mounted and inherits its size class through
-    /// the view hierarchy, so this stays in step without a second source of
-    /// truth.
-    private var isPortraitLayout: Bool {
-        traitCollection.verticalSizeClass != .compact
-    }
 
     /// The DisplayMode actually used for layout AND touch mapping this
     /// frame — may differ from the user's InputSettings.shared.displayMode.
     ///
-    /// In portrait the game strip is a fixed-height row (ContentView.
-    /// portraitBody: `MadeiraMetalView().frame(height: 240)`) with control
-    /// buttons stacked directly below it. Fill/Fill-height are allowed to
-    /// grow the presented rect past `bounds` on one axis by design (see
-    /// GameSurfaceLayout.rect) — that's correct in landscape/fullscreen,
-    /// where nothing sits below the surface, but in portrait that overflow
-    /// is exactly "the live view overlaps the buttons below it". A CAMetalLayer
-    /// doesn't reliably honour contentsRect cropping for drawable-presented
-    /// content, so rather than risk a coordinate mismatch, fall back to
-    /// Aspect in portrait for those two modes: it still fills as much of the
-    /// 240pt strip as the guest's own shape allows, it just never crosses
-    /// the strip's edges. Landscape/fullscreen is untouched.
+    /// In the NORMAL view the game surface always has sibling chrome next to
+    /// or below it — the fixed-height portrait strip (ContentView.
+    /// portraitBody: `MadeiraMetalView().frame(height: 240)`) or the
+    /// fixed-width right-hand tools column (wideNormalBody). Fill/Fill-height
+    /// are allowed to grow the presented rect past `bounds` on one axis by
+    /// design (see GameSurfaceLayout.rect) — that's correct in FULLSCREEN,
+    /// where nothing else is on screen, but in the normal view that overflow
+    /// is exactly "the live view overlaps the chrome next to/below it". A
+    /// CAMetalLayer doesn't reliably honour contentsRect cropping for
+    /// drawable-presented content, so rather than risk a coordinate mismatch,
+    /// fall back to Aspect in the normal view for those two modes.
+    ///
+    /// ml: this used to key off `traitCollection.verticalSizeClass`, which
+    /// mirrored ContentView's own (also since-removed) `vSizeClass ==
+    /// .compact` branch condition. Both lied on iPad, where split view and
+    /// Stage Manager report regular/regular in every orientation — so the
+    /// clamp either never engaged or never released there. FullscreenState is
+    /// the one flag every view in the app now agrees on (see its doc comment).
     private func effectiveDisplayMode() -> DisplayMode {
         let mode = InputSettings.shared.displayMode
-        guard isPortraitLayout, mode == .fill || mode == .fitHeight else { return mode }
-        return .aspect
+        let clampsToAspect = !FullscreenState.shared.active && (mode == .fill || mode == .fitHeight)
+        return clampsToAspect ? .aspect : mode
     }
 
     /// The drawable size to hand GameSurfaceLayout, or `.zero` ("unknown")
@@ -639,7 +677,8 @@ final class MetalBackedView: UIView {
     /// it": re-apply once more after things have actually settled, from
     /// whichever MetalBackedView is live right now (`keyboardTarget`, not a
     /// captured view — rotation destroys/recreates this placeholder, see the
-    /// comment on ContentView's landscapeBody/portraitBody if/else).
+    /// comment on ContentView.body's fullscreenBody/wideNormalBody/
+    /// portraitBody if/else).
     private static func scheduleSettleReapply(reason: String) {
         pendingSettleWorkItem?.cancel()
         let item = DispatchWorkItem {
@@ -3209,8 +3248,29 @@ struct ContentView: View {
     private static let customButtonTints: [Color] = [
         .teal, .indigo, .brown, .cyan, .yellow,
     ]
-    /// .compact = iPhone landscape: game surface expands, arrow keys appear.
-    @Environment(\.verticalSizeClass) private var vSizeClass
+    /// Whether the game surface is fullscreen — see FullscreenState's doc
+    /// comment. The single source of truth `body`'s if/else and every
+    /// control row's fullscreenToggle button read; deliberately NOT an
+    /// `@Environment(\.verticalSizeClass)` or `UIDevice.current.orientation`
+    /// check — both lie on iPad (regular/regular size classes in split view
+    /// and Stage Manager; orientation can read faceUp/unknown, or simply not
+    /// match the window's own shape in a multi-window scene).
+    @ObservedObject private var fullscreenState = FullscreenState.shared
+    /// ml: THE LAUNCH-STATE GUARD.
+    ///
+    /// runWineFullSequence() used to have no notion of "a session is already
+    /// running" at all — only `jit_check_debugged()`, which stops protecting
+    /// anything the moment early-detach runs (seconds in). A boot that never
+    /// finishes (`wine_process_is_running()` stuck at 1 — the "detach-wait:
+    /// presents=0 running=1 elapsed=Ns" line, logged forever) left every
+    /// later tap free to kick off a SECOND full sequence on top of the first
+    /// one's still-live JIT pool / wineserver / env vars, with nothing in the
+    /// UI to say why the result looked like "nothing happened." This is that
+    /// guard: set the instant a sequence starts, cleared the instant
+    /// runWineFullSequence's background work actually finishes (normal exit,
+    /// boot-failure timeout, or a pool-allocation failure) — see the three
+    /// `isLaunching = false` sites inside that function.
+    @State private var isLaunching = false
 
     /// Shipped launch targets, EITHER BITNESS. Was `thirtyTwoBitTests` /
     /// "32-bit test programs" (WOW64_DESIGN.md stage E), but the table never
@@ -3250,20 +3310,42 @@ struct ContentView: View {
          * no NavigationLinks anywhere in the app, so nothing depended on the
          * two-column selection behaviour. */
         NavigationStack {
-            Group {
-                if vSizeClass == .compact {
-                    landscapeBody
-                } else {
-                    portraitBody
+            // ml: THE BODY SWITCH, rewritten so fullscreen is a MODE, never a
+            // side effect of rotation.
+            //
+            // Was `vSizeClass == .compact ? landscapeBody : portraitBody` —
+            // i.e. rotating to landscape silently dropped into a fullscreen
+            // body with no way back and (on iPad, where vSizeClass is
+            // .regular in EVERY orientation because iPad never compacts its
+            // vertical size class the way iPhone does) never triggered at
+            // all, leaving the tiny portrait layout on screen sideways with
+            // dead buttons. Three states now: fullscreen (explicit button
+            // only, any orientation), wide normal (rotated to landscape but
+            // fullscreen was never pressed — same tools as portrait, laid
+            // out sideways), tall normal (today's portrait). The wide/tall
+            // split reads `geo`'s own measured size, not a size class or
+            // `UIDevice.current.orientation` — both are unreliable on iPad
+            // (split view / Stage Manager windows, `.faceUp`/`.unknown` at
+            // launch) where this geometry is the only fact that is actually
+            // true.
+            GeometryReader { geo in
+                Group {
+                    if fullscreenState.active {
+                        fullscreenBody
+                    } else if geo.size.width > geo.size.height {
+                        wideNormalBody
+                    } else {
+                        portraitBody
+                    }
                 }
             }
             // Rotation destroys/recreates the UIViewRepresentable across
-            // this if/else (two SwiftUI identities) — HARMLESS since
+            // this if/else (multiple SwiftUI identities) — HARMLESS since
             // 2026-07-05: MetalHostView is a process-lifetime singleton;
             // a fresh placeholder only re-parents the same CAMetalLayer.
             .navigationTitle("Madeira")
             .navigationBarTitleDisplayMode(.inline)
-            .navigationBarHidden(vSizeClass == .compact)
+            .navigationBarHidden(fullscreenState.active)
             .onAppear {
                 jit_install_trap_handler()
                 entitlements = EntitlementStatus.check()
@@ -3279,8 +3361,8 @@ struct ContentView: View {
         }
     }
 
-    /// Portrait: classic tooling layout — header, badges, 240pt game strip,
-    /// key row, action buttons, log console.
+    /// Portrait (tall normal view): classic tooling layout — header, badges,
+    /// 240pt game strip, key row, action buttons, log console.
     private var portraitBody: some View {
         VStack(spacing: 0) {
             // Readouts sit ABOVE the game strip, closest to the surface they
@@ -3309,91 +3391,23 @@ struct ContentView: View {
                     for: UIDevice.orientationDidChangeNotification)) { _ in
                     TouchControlsHost.attach()   // re-frame to the new bounds
                 }
-                // Device feedback (2026-09-15): rotating to landscape left a
-                // tiny, unpressable ghost of this row's arrow pad on screen.
-                // JoystickKeyView (below) only exists in THIS body — rotating
-                // away tears it down, but ControlOverlayView.unregister never
-                // resets JoystickPadState.center, so the window-level overlay
+                // Device feedback (2026-09-15): rotating away used to leave a
+                // tiny, unpressable ghost of this row's arrow pad on screen —
+                // JoystickKeyView (below) only exists in THIS body, and
+                // ControlOverlayView.unregister never resets
+                // JoystickPadState.center, so the window-level overlay
                 // (JoystickPadHost, always attached, never torn down) kept
-                // drawing the idle ring at its last PORTRAIT position, now
-                // misplaced in the landscape window. Re-entering portrait is
-                // this body reappearing, so un-hide (respecting whatever the
-                // pointer-panel toggle already wants) right here.
+                // drawing the idle ring at its last position here, now
+                // misplaced elsewhere. Re-entering this body is what un-hides
+                // it (respecting whatever the pointer-panel toggle already
+                // wants) right here.
                 .onAppear { JoystickPadState.shared.hidden = pointerPanel }
-            HStack(spacing: 6) {
-                if pointerPanel {
-                    // The cursor button has slid to the leftmost slot and become
-                    // the close control; matchedGeometryEffect animates the slide.
-                    pointerToggleButton
-                    displayModeToggle
-                    pointerModeToggle
-                    pointerSensSlider
-                } else {
-                    // ml662: every one of these is now a REGION owned by
-                    // ControlOverlayView, not a SwiftUI gesture. A Button (which
-                    // ⏎/␣/Esc/⌨ used to be) needs its tap recogniser to win
-                    // arbitration against everything else on screen, and that is
-                    // precisely the fight a second finger made it lose.
-                    Group {
-                        ControlKeyView(id: "portrait.enter", label: "⏎", kind: .tapKey(0x0D))
-                        ControlKeyView(id: "portrait.space", label: "␣", kind: .tapKey(0x20))
-                        ControlKeyView(id: "portrait.esc",   label: "Esc", kind: .tapKey(0x1B))
-                        ControlKeyView(id: "portrait.kbd",   label: "⌨", kind: .keyboardToggle,
-                                       fontSize: 20, width: 40, height: 32, secondaryTint: true)
-                        JoystickKeyView()
-                    }
-                    .transition(.opacity)
-                    pointerToggleButton
-                    displayModeToggle
-                    diagToggleButton
-                    // ml665: no lock button where lock cannot happen (iPhone).
-                    if hw.mouseConnected && HardwareInput.pointerLockAvailable {
-                        pointerLockButton
-                    }
-                    Spacer()
-                }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            // The expanded pad overflows this row; without a raised zIndex the
-            // later VStack siblings (action buttons, log) would draw over it.
-            .zIndex(10)
+            controlRow
             // ml663: the hardware mouse's own gain. Its own row rather than a
-            // fourth control squeezed into the one above, and only while a mouse
+            // fourth control squeezed into controlRow, and only while a mouse
             // is attached — a slider that cannot affect anything is noise.
             if pointerPanel && hw.mouseConnected {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 8) {
-                        Image(systemName: "computermouse")
-                            .font(.system(size: 13))
-                            .foregroundColor(.secondary)
-                        Slider(value: $input.sensMouse, in: 0.10...8.0)
-                        Text(String(format: "%.2f", input.sensMouse))
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundColor(.secondary)
-                            .frame(width: 38, alignment: .trailing)
-                    }
-                    // ml665: two facts the user cannot discover from inside the
-                    // app, and both change how this slider should be set.
-                    // AssistiveTouch applies its OWN tracking-speed scale before
-                    // we ever see a delta (which is why they arrive fractional),
-                    // so a mid Tracking Speed there plus this slider is one gain
-                    // stage the user can reason about instead of two multiplying
-                    // each other. And the requirement itself is not ours to
-                    // remove: iPhone has no other pointer-device path.
-                    if UIDevice.current.userInterfaceIdiom == .phone {
-                        Text("iPhone: AssistiveTouch must be on (Settings ▸ "
-                             + "Accessibility ▸ Touch ▸ AssistiveTouch ▸ Devices). "
-                             + "Set its Tracking Speed to the middle and use this "
-                             + "slider for in-game sensitivity.")
-                            .font(.system(size: 10))
-                            .foregroundColor(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-                .padding(.horizontal, 8)
-                .padding(.bottom, 4)
-                .transition(.opacity)
+                mouseGainRow
             }
             Divider()
             actionButtons
@@ -3402,61 +3416,192 @@ struct ContentView: View {
         }
     }
 
-    /// Landscape: game mode. Full-height 4:3 surface centered (aspect-fit
-    /// happens in MetalBackedView); ALL controls live in the pillarbox
-    /// bars left/right of the game — the window-level surface would cover
-    /// anything drawn over the game area itself. No header/log/nav chrome.
-    private var landscapeBody: some View {
-        GeometryReader { geo in
-            // 2026-09-16: landscape is game-only. The whole view is the game
-            // area (the old `height * 4/3` box dated from the fixed 1024x768
-            // monitor and squeezed every display mode into a 4:3 column), and
-            // the FPS pill / display-mode button live in portrait only, per the
-            // user: nothing may sit over the game in landscape. Fit/Aspect/
-            // Fit-height letterbox inside this box with a UNIFORM scale, Fill
-            // covers it, Stretch fills it exactly.
-            let gameW = geo.size.width
-            HStack(spacing: 0) {
+    /// Wide normal view: rotated to landscape shape WITHOUT pressing the
+    /// fullscreen button. Exactly the same tools as portraitBody — nothing is
+    /// removed or hidden, see FullscreenState's doc comment — just arranged
+    /// for the width: live view on the left, the rest in a scrollable column
+    /// on the right, so nothing runs off the bottom of a short landscape
+    /// screen (iPhone landscape, a narrow iPad split).
+    private var wideNormalBody: some View {
+        HStack(spacing: 0) {
+            VStack(spacing: 0) {
+                if let ents = entitlements {
+                    entitlementBadges(ents)
+                }
+                HStack(spacing: 6) {
+                    FPSOverlay()
+                    Spacer()
+                }
+                .padding(.horizontal, 8)
+                .padding(.bottom, 4)
                 MadeiraMetalView()
-                    // Device feedback (2026-09-15): the display-mode and FPS-cap
-                    // buttons in the right pillarbox bar below took no taps.
-                    // Root cause: this view had NO width constraint despite the
-                    // doc comment above already claiming "full-height 4:3
-                    // surface centered" — it was actually full-SCREEN, so
-                    // MetalBackedView's own (interactive; unlike MetalHostView)
-                    // bounds extended straight through the pillarbox bar,
-                    // stacked as a ZStack sibling "on top of" which portrait's
-                    // own comment (see MadeiraMetalView in portraitBody) already
-                    // warns against — SwiftUI content overlaid on this surface
-                    // gets covered, it must be a sibling placed clear of it
-                    // instead. Constraining the width to gameW does that: the
-                    // pillarbox areas (barW each side) are now genuinely outside
-                    // MetalBackedView's bounds, so the buttons receive their
-                    // taps like any other unobstructed SwiftUI control.
-                    .frame(width: gameW, height: geo.size.height)
-                    // ml662: the controls window hosts the UIKit touch layer, so
-                    // it has to exist in landscape whether or not the app was
-                    // ever in portrait this session.
-                    .onAppear { TouchControlsHost.attach() }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.black)
+                    .onAppear {
+                        TouchControlsHost.attach()
+                        JoystickPadState.shared.hidden = pointerPanel
+                    }
                     .onReceive(NotificationCenter.default.publisher(
                         for: UIDevice.orientationDidChangeNotification)) { _ in
                         TouchControlsHost.attach()
                     }
-                    // Device feedback (2026-09-15): see the matching onAppear in
-                    // portraitBody — this is the landscape half of hiding the
-                    // portrait arrow-pad's stale window-level ghost. `center`
-                    // is left stale (nothing resets it on unregister) so it is
-                    // zeroed here too, belt-and-suspenders against the opacity
-                    // check in JoystickPadFace ever seeing a leftover nonzero
-                    // value while hidden briefly flips during a rotation.
-                    .onAppear {
-                        JoystickPadState.shared.hidden = true
-                        JoystickPadState.shared.center = .zero
-                    }
-                // Game-only landscape (ml586, reaffirmed 2026-09-16): no FPS
-                // pill and no display-mode button here — both stay in portrait.
             }
-            .background(Color.black)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    controlRow
+                    if pointerPanel && hw.mouseConnected {
+                        mouseGainRow
+                    }
+                    Divider()
+                    actionButtons
+                    Divider()
+                    // Fixed floor, not a flex-fill: List has no natural
+                    // intrinsic height inside a ScrollView (nothing above it
+                    // is height-constrained either), so without one it would
+                    // try to claim effectively unbounded height. Below that
+                    // floor the List scrolls its own rows exactly as it does
+                    // in portraitBody's un-scrolled VStack; above it, this
+                    // outer ScrollView takes over so the column overflowing
+                    // a short landscape screen never clips the launch row.
+                    logConsole
+                        .frame(minHeight: 280)
+                }
+            }
+            .frame(width: 360)
+        }
+    }
+
+    /// The FPS/display/keys/pointer row shared by every NORMAL-view layout
+    /// (portraitBody, wideNormalBody) — extracted so wide landscape gets
+    /// exactly the same tools as portrait, just arranged differently around
+    /// the game surface; no launch/control affordance goes missing just
+    /// because the phone is sideways.
+    private var controlRow: some View {
+        HStack(spacing: 6) {
+            if pointerPanel {
+                // The cursor button has slid to the leftmost slot and become
+                // the close control; matchedGeometryEffect animates the slide.
+                pointerToggleButton
+                displayModeToggle
+                fullscreenToggle
+                pointerModeToggle
+                pointerSensSlider
+            } else {
+                // ml662: every one of these is now a REGION owned by
+                // ControlOverlayView, not a SwiftUI gesture. A Button (which
+                // ⏎/␣/Esc/⌨ used to be) needs its tap recogniser to win
+                // arbitration against everything else on screen, and that is
+                // precisely the fight a second finger made it lose.
+                Group {
+                    ControlKeyView(id: "portrait.enter", label: "⏎", kind: .tapKey(0x0D))
+                    ControlKeyView(id: "portrait.space", label: "␣", kind: .tapKey(0x20))
+                    ControlKeyView(id: "portrait.esc",   label: "Esc", kind: .tapKey(0x1B))
+                    ControlKeyView(id: "portrait.kbd",   label: "⌨", kind: .keyboardToggle,
+                                   fontSize: 20, width: 40, height: 32, secondaryTint: true)
+                    JoystickKeyView()
+                }
+                .transition(.opacity)
+                pointerToggleButton
+                displayModeToggle
+                fullscreenToggle
+                diagToggleButton
+                // ml665: no lock button where lock cannot happen (iPhone).
+                if hw.mouseConnected && HardwareInput.pointerLockAvailable {
+                    pointerLockButton
+                }
+                Spacer()
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        // The expanded pad overflows this row; without a raised zIndex the
+        // later siblings (action buttons, log) would draw over it.
+        .zIndex(10)
+    }
+
+    /// ml663: the hardware mouse's own gain slider + the iPhone AssistiveTouch
+    /// hint. Its own row rather than a fourth control squeezed into
+    /// controlRow, and only while a mouse is attached — a slider that cannot
+    /// affect anything is noise. Shared by portraitBody/wideNormalBody, same
+    /// reasoning as controlRow above.
+    private var mouseGainRow: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 8) {
+                Image(systemName: "computermouse")
+                    .font(.system(size: 13))
+                    .foregroundColor(.secondary)
+                Slider(value: $input.sensMouse, in: 0.10...8.0)
+                Text(String(format: "%.2f", input.sensMouse))
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .frame(width: 38, alignment: .trailing)
+            }
+            // ml665: two facts the user cannot discover from inside the
+            // app, and both change how this slider should be set.
+            // AssistiveTouch applies its OWN tracking-speed scale before
+            // we ever see a delta (which is why they arrive fractional),
+            // so a mid Tracking Speed there plus this slider is one gain
+            // stage the user can reason about instead of two multiplying
+            // each other. And the requirement itself is not ours to
+            // remove: iPhone has no other pointer-device path.
+            if UIDevice.current.userInterfaceIdiom == .phone {
+                Text("iPhone: AssistiveTouch must be on (Settings ▸ "
+                     + "Accessibility ▸ Touch ▸ AssistiveTouch ▸ Devices). "
+                     + "Set its Tracking Speed to the middle and use this "
+                     + "slider for in-game sensitivity.")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.bottom, 4)
+        .transition(.opacity)
+    }
+
+    /// Fullscreen: game mode, entered only via fullscreenToggle (or restored
+    /// by rotating while already in it — see FullscreenState). Full-bounds
+    /// surface, any orientation; ALL controls live in the movable HUD cluster
+    /// (TouchControlsOverlay, a window-level overlay — the window-hosted
+    /// surface would cover anything drawn "over" it in this SwiftUI tree, see
+    /// the comment on MadeiraMetalView in portraitBody). No header/log/nav
+    /// chrome, no FPS pill, no display-mode button — those stay in the
+    /// normal view.
+    private var fullscreenBody: some View {
+        GeometryReader { geo in
+            // ml: this used to be landscapeBody, keyed on the device having
+            // rotated rather than on fullscreen having been requested, and
+            // therefore unreachable in a PORTRAIT fullscreen and un-exitable
+            // on iPad where the triggering size-class check never fired at
+            // all. Fit/Aspect/Fit-height letterbox inside this box with a
+            // UNIFORM scale, Fill covers it, Stretch fills it exactly — same
+            // GameSurfaceLayout/DisplayMode math as everywhere else, just
+            // against the FULL bounds instead of a clamped one (see
+            // MetalBackedView.effectiveDisplayMode).
+            MadeiraMetalView()
+                .frame(width: geo.size.width, height: geo.size.height)
+                // ml662: the controls window hosts the UIKit touch layer, so
+                // it has to exist here whether or not the app was ever in the
+                // normal view this session.
+                .onAppear { TouchControlsHost.attach() }
+                .onReceive(NotificationCenter.default.publisher(
+                    for: UIDevice.orientationDidChangeNotification)) { _ in
+                    TouchControlsHost.attach()
+                }
+                // Device feedback (2026-09-15): see the matching onAppear in
+                // portraitBody — this is the fullscreen half of hiding the
+                // normal view's stale window-level joystick-pad ghost.
+                // `center` is left stale (nothing resets it on unregister) so
+                // it is zeroed here too, belt-and-suspenders against the
+                // opacity check in JoystickPadFace ever seeing a leftover
+                // nonzero value while hidden briefly flips during a rotation.
+                .onAppear {
+                    JoystickPadState.shared.hidden = true
+                    JoystickPadState.shared.center = .zero
+                }
+                .background(Color.black)
         }
         .ignoresSafeArea()
         .background(Color.black)
@@ -3538,18 +3683,17 @@ struct ContentView: View {
     }
 
     /// Cycles Fit -> Fill -> Stretch -> Fit. Sits next to pointerToggleButton
-    /// in the portrait control row and pinned in the landscape pillarbox bar
-    /// (landscapeBody) — see GameSurfaceLayout/DisplayMode near the top of
+    /// in every normal-view control row (controlRow, shared by portraitBody/
+    /// wideNormalBody) — see GameSurfaceLayout/DisplayMode near the top of
     /// this file for what each mode does to the presented layer.
     private var displayModeToggle: some View {
         Button {
             input.displayMode = input.displayMode.next
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             // Device feedback (2026-09-15): this button (and the FPS-cap pill
-            // beside it in landscape) went dead-silent when taps were being
-            // swallowed upstream — nothing here ever logged, so there was no
-            // way to tell "action ran" from "tap never arrived." Every tap now
-            // says so.
+            // beside it) went dead-silent when taps were being swallowed
+            // upstream — nothing here ever logged, so there was no way to
+            // tell "action ran" from "tap never arrived." Every tap now says so.
             fputs("[hud] tap display-mode -> \(input.displayMode.label)\n", stderr)
         } label: {
             Image(systemName: input.displayMode.symbol)
@@ -3560,6 +3704,28 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(input.displayMode.label)
+    }
+
+    /// Enters fullscreen — the ONLY way in now (see FullscreenState's doc
+    /// comment: rotation alone never does this any more). Sits right next to
+    /// displayModeToggle in every normal-view control row, and is itself
+    /// absent from the fullscreen body — the HUD cluster's own exit button
+    /// (TouchControlsOverlay.topBar) is the way back out, draggable the same
+    /// way the rest of that cluster is.
+    private var fullscreenToggle: some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            fputs("[hud] tap fullscreen -> enter\n", stderr)
+            fullscreenState.active = true
+        } label: {
+            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                .font(.system(size: 17, weight: .medium))
+                .frame(minWidth: 40, minHeight: 32)
+                .background(Color.secondary.opacity(0.25))
+                .cornerRadius(6)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Enter fullscreen")
     }
 
     private var pointerModeToggle: some View {
@@ -4058,10 +4224,22 @@ struct ContentView: View {
     /// Debugger stays attached during PE loading so mprotect_exec can use BRK
     /// to prepare code pages. Detach happens after Wine finishes + recovery.
     private func runWineFullSequence() {
-        guard jit_check_debugged() else {
-            logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
+        // ml: THE RELAUNCH GUARD. See isLaunching's doc comment. Every early
+        // return on this path — this one included — logs a
+        // "[launch] ignored: <reason>" line through the app's normal log
+        // function (so it lands in the exported log, not just stderr), so a
+        // tap that does nothing visible ALWAYS has a reason on record.
+        guard !isLaunching else {
+            logStore.log("[launch] ignored: a session is already launching or running — "
+                         + "wait for it to finish (or its boot to fail/time out) before trying again",
+                         level: .error)
             return
         }
+        guard jit_check_debugged() else {
+            logStore.log("[launch] ignored: JIT not enabled — press 'Enable JIT' first", level: .error)
+            return
+        }
+        isLaunching = true
 
         logStore.log("Running full Wine sequence...")
 
@@ -4683,6 +4861,13 @@ struct ContentView: View {
                 // address-space problem that did not exist.
                 logStore.log("JIT pool unavailable — not starting Wine (see the [jit-pool] lines above).", level: .error)
                 logStore.uiPaused = false
+                // ml: reset the relaunch guard on every exit from this
+                // closure, not just the successful-completion path at the
+                // bottom — a failure here used to leave isLaunching stuck
+                // `true` forever, silently ignoring (see the guard at the top
+                // of this function) every later tap with no way out short of
+                // relaunching the app.
+                DispatchQueue.main.async { self.isLaunching = false }
                 return
             }
 
@@ -4814,7 +4999,16 @@ struct ContentView: View {
             logStore.log("Detaching debugger...")
             StikJITHelper.detachDebugger()
 
-            DispatchQueue.main.async { heartbeat.invalidate() }
+            // ml: THE OTHER HALF OF THE RELAUNCH GUARD. This is reached on
+            // every path out of the poll loop above — a clean guest exit, the
+            // maxWait timeout (a boot that hung forever, the exact
+            // "detach-wait: presents=0 running=1" case), all of it — so a
+            // relaunch is never blocked longer than this cleanup actually
+            // takes.
+            DispatchQueue.main.async {
+                heartbeat.invalidate()
+                self.isLaunching = false
+            }
         }
     }
 
@@ -5468,26 +5662,45 @@ final class TouchControlsModel: ObservableObject {
 final class ControlsWindow: UIWindow {
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         let m = TouchControlsModel.shared
-        // ml662: the UIKit touch layer gets first refusal, in BOTH orientations
-        // — the portrait key row registers its frames here too, so this window
-        // is no longer landscape-only. `region(at:)` already returns nil in edit
-        // mode, so the edit-mode branch below still wins there.
+        // ml662: the UIKit touch layer gets first refusal in EVERY body — the
+        // key row (portraitBody/wideNormalBody) registers its frames here
+        // too, so this window is not fullscreen-only. `region(at:)` already
+        // returns nil in edit mode, so the edit-mode branch below still wins
+        // there.
         let ov = ControlOverlayView.shared
         if ov.window === self, ov.region(at: convert(point, to: ov)) != nil { return ov }
         // ml665: the AssistiveTouch hint banner lives in this window's hosting
-        // view, and in PORTRAIT the guard below hands everything outside a
-        // control region straight through — which would make the banner's
-        // dismiss button untappable. Its published rect is the one exception.
+        // view, and the guard below hands everything outside a control region
+        // straight through in the normal view — which would make the
+        // banner's dismiss button untappable. Its published rect is the one
+        // exception, in every body.
         if HardwareInput.shared.assistiveTouchHint,
            HardwareInput.hintRect.contains(point) {
             return super.hitTest(point, with: event)
         }
-        // Edit mode owns the whole screen: drags and the scale pinch must not
-        // leak through and swing the camera while you are arranging buttons.
+        // ml: THE STALE-EDIT-MODE FIX.
+        //
+        // `m.editing` used to gate this branch alone: true claims the WHOLE
+        // screen unconditionally (TouchControlsOverlay's body applies
+        // `.contentShape(Rectangle()).gesture(scalePinch)` across its full
+        // bounds, so once hitTest forwards here there is nothing left for
+        // the normal view underneath to receive). Edit mode is only ever
+        // ENTERED from the HUD cluster's pencil button, which only exists in
+        // fullscreen — but nothing used to CLEAR it when fullscreen ended, so
+        // a user who opened edit mode, then rotated away or exited
+        // fullscreen without tapping the checkmark first, got every future
+        // tap — including the launch row's — silently swallowed here. That
+        // is the "pressing a launch button does nothing, hit or miss"
+        // report: whether it reproduced depended entirely on edit-mode
+        // history. FullscreenState.active's didSet now force-clears
+        // `editing` the moment fullscreen ends (belt), and this guard makes
+        // sure a stale `true` can never matter outside fullscreen even if
+        // that ever raced (suspenders).
+        guard FullscreenState.shared.active else { return nil }
+        // Edit mode owns the whole (fullscreen) screen: drags and the scale
+        // pinch must not leak through and swing the camera while you are
+        // arranging buttons.
         if m.editing { return super.hitTest(point, with: event) }
-        // Portrait draws no chrome here, so it must consume nothing beyond its
-        // regions.
-        guard bounds.width > bounds.height else { return nil }
         guard m.hitsInteractive(point, in: bounds) else { return nil }
         return super.hitTest(point, with: event)
     }
@@ -5554,6 +5767,13 @@ enum TouchControlsHost {
 struct TouchControlsOverlay: View {
     @ObservedObject private var m = TouchControlsModel.shared
     @ObservedObject private var hw = HardwareInput.shared
+    /// ml: re-keyed from a local `geo.size.width > geo.size.height` read to
+    /// the shared mode flag — see FullscreenState's doc comment. The cluster
+    /// and on-screen controls now show/hide with fullscreen, not with device
+    /// shape, so a portrait fullscreen gets them too and a wide NORMAL-view
+    /// landscape (live view + launch row + logs, side by side) does not try
+    /// to show them over chrome that isn't there.
+    @ObservedObject private var fullscreenState = FullscreenState.shared
     @State private var pinchBase: Double?
     /// Live drag delta for the HUD cluster (controller/pencil buttons); only
     /// non-zero while a long-press-drag on its grip is in progress. The
@@ -5563,10 +5783,9 @@ struct TouchControlsOverlay: View {
 
     var body: some View {
         GeometryReader { geo in
-            // Landscape only; portrait keeps the existing key row and joystick.
-            let landscape = geo.size.width > geo.size.height
+            let fullscreen = fullscreenState.active
             ZStack(alignment: .top) {
-                if landscape {
+                if fullscreen {
                     if m.visible || m.editing {
                         ForEach(m.controls) { c in
                             TouchControlButton(control: c, screen: geo.size)
@@ -5581,11 +5800,11 @@ struct TouchControlsOverlay: View {
                         MappingPanel(control: m.controls[i], screen: geo.size)
                     }
                 }
-                // ml665: OUTSIDE the landscape branch. A mouse that enumerates
-                // and never reports is exactly as broken in portrait, and this
-                // window is the only surface that is above the game in both
-                // orientations.
-                if hw.assistiveTouchHint { assistiveTouchBanner(landscape: landscape) }
+                // ml665: OUTSIDE the fullscreen branch. A mouse that
+                // enumerates and never reports is exactly as broken in the
+                // normal view, and this window is the only surface that is
+                // above the game in every body.
+                if hw.assistiveTouchHint { assistiveTouchBanner(fullscreen: fullscreen) }
             }
             .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
             .contentShape(Rectangle())
@@ -5602,9 +5821,9 @@ struct TouchControlsOverlay: View {
     /// useful thing to show is the exact settings path. Raised once per session
     /// (HardwareInput.armAssistiveTouchHint), cleared by the first delta, and
     /// dismissable — its rect is published to `HardwareInput.hintRect` so
-    /// `ControlsWindow.hitTest` lets the dismiss button through in portrait,
-    /// where that window deliberately consumes nothing else.
-    private func assistiveTouchBanner(landscape: Bool) -> some View {
+    /// `ControlsWindow.hitTest` lets the dismiss button through in the normal
+    /// view, where that window deliberately consumes nothing else.
+    private func assistiveTouchBanner(fullscreen: Bool) -> some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: "computermouse")
                 .font(.system(size: 15))
@@ -5630,8 +5849,8 @@ struct TouchControlsOverlay: View {
         .padding(.vertical, 10)
         .background(GlassShape())
         .padding(.horizontal, 12)
-        // Landscape puts topBar at the top of this same window; sit under it.
-        .padding(.top, landscape ? 62 : 8)
+        // Fullscreen puts topBar at the top of this same window; sit under it.
+        .padding(.top, fullscreen ? 62 : 8)
         .background(GeometryReader { g -> Color in
             // Window coords: this window is full-screen, so .global is its own
             // coordinate space. Published rather than recomputed in hitTest
@@ -5654,6 +5873,16 @@ struct TouchControlsOverlay: View {
         let center = hudBaseCenter(in: geo)
         return HStack(spacing: 10) {
             hudGrip(in: geo)
+            // ml: THE WAY OUT. Third button in the same movable cluster —
+            // simplest option that satisfies both "draggable, same
+            // implementation as the rest of the cluster" and "never ends up
+            // off-screen after a rotation" for free, since it rides the
+            // cluster's own clamped, persisted position (hudBaseCenter/
+            // commitHudDrag below) rather than needing a second one of its
+            // own. A tap exits; only the grip drags.
+            glassButton("arrow.down.right.and.arrow.up.left") {
+                fullscreenState.active = false
+            }
             glassButton("gamecontroller", dim: !m.visible) { m.visible.toggle() }
             // ml663: landscape is where a keyboard and mouse are actually used,
             // so the escape hatch from pointer lock has to be reachable HERE —
@@ -5779,10 +6008,15 @@ struct TouchControlsOverlay: View {
 
     /// UIDevice.current.orientation, not geo's width/height compare: the two
     /// landscape rotations put the notch/home-indicator on opposite sides, so
-    /// they need their own saved spot even though both are "landscape."
-    /// Anything that isn't clearly landscapeRight is treated as landscapeLeft
-    /// — topBar only renders in landscape at all, so this only has to pick a
-    /// side, not detect landscape in the first place.
+    /// they need their own saved spot even though both are "landscape." This
+    /// is purely a cosmetic drop-point memory, not what decides whether the
+    /// cluster shows (that's FullscreenState) — so orientation's iPad
+    /// unreliability doesn't bite here the way it would for that decision. A
+    /// portrait fullscreen (now possible — see FullscreenState) shares the
+    /// "left" slot by default, same as anything that isn't clearly
+    /// landscapeRight; `hudBaseCenter`/`commitHudDrag` below always clamp
+    /// into the CURRENT safe area regardless, so a stale/shared slot can
+    /// never place the cluster off-screen, only in a slightly generic spot.
     private var isLandscapeRight: Bool { UIDevice.current.orientation == .landscapeRight }
 
     /// The cluster's un-dragged center: the saved drop point for this

@@ -7756,3 +7756,83 @@ guest-slots=… verdict=…`). Consequences:
   `learn_ev`/`learn_none` NOT tracking `pollpeek` 1:1 (if they do, the
   polled handles are being churned and `MADEIRA_FS_POLLPEEK=0` is the off
   switch). Then `MADEIRA_FASTSYNC=auto` for the other half.
+
+- 2026-09-22 — **No 32-bit program could start on a device whose address space
+  ends at 63 GB.** Tablet log (no `extended-virtual-addressing`): `[va-probe]
+  entitlement=no top=0xfc0000000 guest-slots=12`, then `[wow-window]
+  B=0x7100000000 REJECTED: 4GB+guard unavailable … (free to end of VA)`, the
+  same for `0x7200000000`, `main-process reserve FAILED 0xc0000017`, and the
+  user sees an unrelated-looking "invalid handle" box from the launcher. The
+  64-bit side already adapts (TEBs at `0xfbffe0000`, §9.6 probe says
+  `identity-layout-possible`); only the guest-window CANDIDATE BAND was still
+  the constant `[0x7000000000 + pool, 0x73ffff0000)`. Nothing about a guest
+  window needs a high address — FEX forms `B + zext32(EA)`, so B only has to be
+  4 GB-aligned. New `ios_wow_band()` (virtual_ios.c, used by
+  `ios_wow_candidate_slot`, `ios_wow_window_pick` and
+  `ios_wow_reserve_placeholders`): when `TASK_VM_INFO.max_address` is below the
+  normal band, candidates come from `[16 GB, 24 GB)` — two slots, above the
+  image / malloc zones / shared cache / pool RW alias, below the top-down
+  furniture. Two and not ten because every slot in the band is reserved as a
+  placeholder at session start and `ios_wow_candidate_slot()` biases furniture
+  below the first UNreserved one. Logged once as `[wow-window] SMALL ADDRESS
+  SPACE …`. UNVERIFIED on the device. Known soft spots if it still fails
+  there: the heuristics in signal_arm64_ios.c that classify
+  `0x7000000000..0x7400000000` as "guest band" (:7355, :8623, :13891) do not
+  know about a low window; registered threads do not depend on them.
+- 2026-09-21 — **CORRECTION to the x18-trampoline entry above: "interruption is
+  self-healing" was wrong, and x18-as-scratch everywhere regressed both a
+  32-bit and a 64-bit title.** The claim only holds for instructions that FAULT
+  when x18 is zero. The kernel zeroes the platform register on every exception
+  return -- not just signals, but every Mach exception reply, and a running
+  process takes ~10^5 of them for PE-page exec-fault redirects alone. So a
+  trampoline that loads the TEB into x18 and consumes it in the NEXT
+  instruction is racing the kernel, and loses often enough at a hot site to be
+  deterministic. Both failures were the same shape, an address computation:
+  `add x8, x18, x0, lsl #3` (64-bit, TLS slot index) and
+  `add x8, x18, #0x2000` (32-bit, the TEB32 that sits 0x2000 above the TEB64)
+  resumed with x18 == 0, produced x8 = index*8 and x8 = 0x2000, and the load
+  ONE instruction later died on a tiny address that no emulator recognises as
+  a TEB access. `add` does not fault, so there was nothing to heal. The
+  device logs show the TSD slot itself was perfectly healthy at the moment of
+  death (`[teb-tsd] … raw=0x7101890000 teb_key_val=0x7101890000`), which is
+  what rules out the slot-offset and publication theories: the trampoline read
+  the right TEB and the kernel threw it away. Note also that the previous
+  build was immune for a reason worth stating plainly: **x16 and x17 survive an
+  exception return and x18 does not**, so the old spill emitter could lose only
+  its SP push, never its TEB.
+  The rule now is: never keep a value in x18 across an instruction boundary
+  unless a wrong value is guaranteed to fault. Three classes, chosen per site,
+  counted per image in `[x18-tramp] shapes:`:
+   1. **free destination** -- the instruction writes a GPR it does not read.
+      Scratch = that register, with the x18 field rewritten to it. No SP, no
+      x18, immune to everything. Both shapes above land here. 61.0 % of the
+      4,804 sites in the shipped ARM64/ARM64EC images.
+   2. **x18** -- a memory access based on x18 with no free destination
+      (stores, pairs, SIMD, register-offset loads whose destination is the
+      index). x18 is allowed here and ONLY here, because a zeroed x18 turns the
+      access into a fault at a tiny address that the Mach handler's x18==0
+      emulator completes against the real TEB and resumes at pc+4 -- the
+      trampoline's own branch back. The patcher restricts this class to the
+      encodings that emulator actually decodes, and the emulator gained the
+      32-bit load/store pair it was missing. 38.4 %.
+   3. **spill** -- everything else: x18 as a non-base operand, a destination
+      that is also a source, a compare. A zeroed x18 would run silently, so
+      these keep the TEB in x16 (x17 only if x16 is taken; the signal-return
+      path redirects pool PCs through a veneer that overwrites x17) and spill
+      through SP. The SP alignment fault those two words take on a legally
+      8-mod-16 stack is now RECOVERABLE: the fault path recognises the exact
+      push/pop encodings inside the pool, emulates them against the misaligned
+      SP and resumes, logging `[x18-tramp] sp-spill emulated`. Only 0.6 % of
+      sites -- 28 across five images -- so the cost of a Mach round trip there
+      is irrelevant.
+  Two decoder bugs fell out of the same review. `(top8 & 0x5F) == 0x11` and
+  `== 0x0B` matched only the ADD forms of add/sub: every `sub xD,x18,#imm`,
+  `cmp x18,#imm` and `cmp x18,xM` was going unpatched and running with a zeroed
+  x18, silently and forever. They now use the exact class masks
+  (`insn[28:23] == 0b100010`, `insn[28:24] == 0b01011`). And an instruction
+  naming x18 in two register fields (`add x0,x18,x18`) was being half-rewritten,
+  leaving a live x18 read behind; those are meaningless in real code, so the
+  patcher skips them instead.
+  LESSON: "it will fault if it is wrong" is a property of an instruction, not
+  of a register, and it must be checked per encoding. A scratch register is
+  only a scratch register if the kernel agrees.

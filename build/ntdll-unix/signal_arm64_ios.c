@@ -2250,6 +2250,75 @@ static void *ios_mach_exception_thread( void *arg )
                 }
             }
 
+            /* 2.9. Recover the SP alignment fault inside an x18 trampoline's
+             * spill pair.
+             *
+             * Class 3 trampolines (see ios_jit_patch_x18 in virtual_ios.c) keep
+             * the TEB in x16/x17 and save the old value through SP, because
+             * their patched instruction would run SILENTLY WRONG with a zeroed
+             * x18 rather than faulting. SP is legally 8-mod-16 on the dispatch
+             * path from ARM64EC code into x64 code, and AArch64 faults on any
+             * SP-based access with a misaligned SP, so those two words have to
+             * be completable here. The encodings are exact and the PC must be
+             * inside the JIT pool, so nothing else can match; a misaligned SP
+             * is required too, since that is the only condition under which
+             * these words fault at all. */
+            if (!handled)
+            {
+                extern void *ios_jit_rx_base_global;
+                extern size_t ios_jit_pool_size_global;
+                uint64_t sp_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
+                uint64_t sp_val = state.__sp;
+                uintptr_t jrx = (uintptr_t)ios_jit_rx_base_global;
+                size_t jsz = ios_jit_pool_size_global;
+
+                if ((sp_val & 15) && jrx && sp_pc >= jrx && sp_pc < jrx + jsz)
+                {
+                    uint32_t w = 0;
+                    mach_vm_size_t got = 0;
+                    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)sp_pc, 4,
+                                                (mach_vm_address_t)&w, &got ) == KERN_SUCCESS && got == 4)
+                    {
+                        int reg = (w & 1) ? 17 : 16;
+                        int done = 0;
+                        if (w == 0xF81F0FF0 || w == 0xF81F0FF1)      /* str xN,[sp,#-16]! */
+                        {
+                            uint64_t nsp = sp_val - 16;
+                            if (mach_vm_write( mach_task_self(), (mach_vm_address_t)nsp,
+                                               (vm_offset_t)&state.__x[reg], 8 ) == KERN_SUCCESS)
+                            {
+                                state.__sp = nsp;
+                                done = 1;
+                            }
+                        }
+                        else if (w == 0xF84107F0 || w == 0xF84107F1) /* ldr xN,[sp],#16 */
+                        {
+                            uint64_t v = 0;
+                            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)sp_val, 8,
+                                                        (mach_vm_address_t)&v, &got ) == KERN_SUCCESS && got == 8)
+                            {
+                                state.__x[reg] = v;
+                                state.__sp = sp_val + 16;
+                                done = 1;
+                            }
+                        }
+                        if (done)
+                        {
+                            static volatile int spill_count = 0;
+                            int sc = __sync_add_and_fetch(&spill_count, 1);
+                            if (sc <= 8 || (sc % 4096) == 0)
+                                dprintf(STDERR_FILENO,
+                                    "[x18-tramp] sp-spill emulated #%d pc=%p insn=%08x sp=%p (%lu mod 16) x%d\n",
+                                    sc, (void *)(uintptr_t)sp_pc, w, (void *)(uintptr_t)sp_val,
+                                    (unsigned long)(sp_val & 15), reg);
+                            __darwin_arm_thread_state64_set_pc_fptr(
+                                state, (void *)(uintptr_t)(sp_pc + 4));
+                            handled = 1;
+                        }
+                    }
+                }
+            }
+
             /* 3. Emulate [x18, #imm] accesses when x18 == 0.
              * iOS zeros x18 on context switch. EC/FEX code reads the TEB
              * through x18; with x18==0 the effective address IS the TEB
@@ -2380,6 +2449,25 @@ static void *ios_mach_exception_thread( void *arg )
                             int rt2 = (insn >> 10) & 0x1f;
                             *(uint64_t *)ea       = (rt == 31)  ? 0 : state.__x[rt];
                             *(uint64_t *)(ea + 8) = (rt2 == 31) ? 0 : state.__x[rt2];
+                            emulated = 1;
+                        }
+                        /* 32-bit pair, same addressing mode. Missing until
+                         * 2026-09-21: an unpatched `ldp w8,w9,[x18,#imm]` was
+                         * an UNRECOGNIZED encoding and therefore fatal, and the
+                         * patcher's class 2 leans on this emulator being
+                         * complete for every shape it routes here. */
+                        else if (!emulated && (insn & 0xffc00000) == 0x29400000)
+                        {
+                            int rt2 = (insn >> 10) & 0x1f;
+                            if (rt != 31)  state.__x[rt]  = *(uint32_t *)ea;
+                            if (rt2 != 31) state.__x[rt2] = *(uint32_t *)(ea + 4);
+                            emulated = 1;
+                        }
+                        else if (!emulated && (insn & 0xffc00000) == 0x29000000)
+                        {
+                            int rt2 = (insn >> 10) & 0x1f;
+                            *(uint32_t *)ea       = (rt == 31)  ? 0 : (uint32_t)state.__x[rt];
+                            *(uint32_t *)(ea + 4) = (rt2 == 31) ? 0 : (uint32_t)state.__x[rt2];
                             emulated = 1;
                         }
 
