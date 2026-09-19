@@ -286,6 +286,12 @@ struct wma_transform
     UINT32 fail_logged;
     UINT64 silence_frames;
     UINT32 last_frames;     /* frames the last SUCCESSFUL packet produced */
+
+    /* v95 instrumentation: what actually arrives, and at what phase */
+    UINT32 push_count;
+    UINT32 packet_count;
+    UINT32 short_tail_dropped;
+    UINT32 candidate;       /* index into the parameter candidate list */
 };
 
 /* The whole file logs with dprintf(2, ...) rather than ERR/TRACE: this unix
@@ -293,6 +299,55 @@ struct wma_transform
  * with WINEDEBUG=err+all,err-virtual, so a channel-gated line would be
  * invisible in exactly the device logs these messages exist for. */
 #define WMA_LOG( fmt, ... ) dprintf( 2, "[wma] " fmt, ## __VA_ARGS__ )
+
+/***********************************************************************
+ *           libavcodec's own diagnostics
+ *
+ * MADEIRA 2026-09-19 (log v95).  wmadec explains every one of its failures --
+ * "nb_frames is 0 bits left 11888", "next_block_len_bits 6 out of range",
+ * "overflow (470 > 466) in spectral RLE" -- and each one names a DIFFERENT
+ * field of the bitstream, which is the difference between "wrong parameters"
+ * and "wrong bytes".  Those lines were already in v95 and were nearly missed:
+ * they go to stderr through av_log's default callback with libavcodec's own
+ * "[wmav2 @ 0x...]" prefix, so a grep for this port's "[wma]" tag does not
+ * find them.  Routing them through the same tag makes the decoder's own
+ * diagnosis part of the log everyone actually reads.
+ *
+ * Capped, because a stream that fails every packet produces one of these per
+ * frame -- v95 spent 11,000 lines on them.
+ */
+#define MADEIRA_WMA_MAX_AV_LOGS 64
+
+static unsigned int wma_av_log_count;
+
+static void wma_av_log( void *avcl, int level, const char *fmt, va_list args )
+{
+    char buf[512];
+    int n;
+
+    (void)avcl;
+    if (level > AV_LOG_WARNING) return;
+    if (wma_av_log_count >= MADEIRA_WMA_MAX_AV_LOGS)
+    {
+        if (wma_av_log_count == MADEIRA_WMA_MAX_AV_LOGS)
+        {
+            wma_av_log_count++;
+            dprintf( 2, "[wma] av: further libavcodec diagnostics suppressed\n" );
+        }
+        return;
+    }
+    wma_av_log_count++;
+    n = vsnprintf( buf, sizeof(buf), fmt, args );
+    if (n <= 0) return;
+    dprintf( 2, "[wma] av: %s%s", buf, buf[strlen(buf) - 1] == '\n' ? "" : "\n" );
+}
+
+static pthread_once_t wma_av_log_once = PTHREAD_ONCE_INIT;
+
+static void wma_install_av_log(void)
+{
+    av_log_set_callback( wma_av_log );
+}
 
 static struct wma_transform *get_transform( wg_transform_t handle )
 {
@@ -433,7 +488,7 @@ static void pcm_compact( struct wma_transform *transform )
  * it needs is kept on the transform, because the retry path below has to be
  * able to build a second context after the media type is long gone.
  */
-static int open_decoder( struct wma_transform *transform, INT64 bit_rate )
+static int open_decoder( struct wma_transform *transform, INT64 bit_rate, int flags2_override )
 {
     AVCodecContext *avctx;
     int err;
@@ -462,6 +517,15 @@ static int open_decoder( struct wma_transform *transform, INT64 bit_rate )
         }
         memcpy( avctx->extradata, transform->extradata, transform->extradata_size );
         avctx->extradata_size = transform->extradata_size;
+        /* flags2 lives at extradata+4 for WMA v2 (wmadec.c wma_decode_init).
+         * A candidate may clear a bit there; the transform's own copy is left
+         * untouched so each attempt starts from what the caller supplied. */
+        if (flags2_override >= 0 && transform->codec_id == AV_CODEC_ID_WMAV2 &&
+            transform->extradata_size >= 6)
+        {
+            avctx->extradata[4] = (uint8_t)(flags2_override & 0xff);
+            avctx->extradata[5] = (uint8_t)((flags2_override >> 8) & 0xff);
+        }
     }
 
     if ((err = avcodec_open2( avctx, transform->codec, NULL )) < 0)
@@ -566,6 +630,117 @@ static NTSTATUS append_silence_for_packet( struct wma_transform *transform, size
     return STATUS_SUCCESS;
 }
 
+/***********************************************************************
+ *           what a WMA v2 superframe header looks like, and what arrived
+ *
+ * MADEIRA 2026-09-19 (log v95).  With FFmpeg's own xWMA parameters -- flags2
+ * = 31, xwma.c's normalised bit rate, the container's block_align -- EVERY
+ * packet of every bit-reservoir stream failed, and the complaints libavcodec
+ * printed name every field of the bitstream in turn:
+ *
+ *     2289  nb_frames is N bits left M          (the superframe header)
+ *     1744  overflow (N > M) in spectral RLE    (the coefficient VLCs)
+ *     ~3600 next/prev/block_len_bits out of range  (the block-length fields)
+ *      863  frame_len overflow
+ *
+ * `nb_frames` is read from bits 4..7 of the packet's FIRST BYTE, before any
+ * parameter-derived field width is used, so a packet whose nb_frames nibble is
+ * implausible is a packet that does not START where we think it does.  That is
+ * a different bug from every parameter theory, and these two helpers are how
+ * the next log tells the two apart instead of inviting a third guess: the
+ * first bytes of the first packets are printed verbatim, with the header
+ * nibbles broken out and the bit rate those nibbles IMPLY.
+ */
+static UINT wma_frame_len_bits( UINT32 rate )
+{
+    /* libavcodec/wma.c ff_wma_get_frame_len_bits, for version 2. */
+    if (rate <= 16000) return 9;
+    if (rate <= 22050) return 10;
+    return 11;
+}
+
+/* bit rate implied by "this packet holds nb_frames frames of frame_len
+ * samples in block_align bytes" -- the arithmetic that independently
+ * reproduces every row of xwma.c's table, so it is the honest third candidate
+ * when the table has no row for a stream. */
+static INT64 implied_bit_rate( struct wma_transform *transform, UINT nb_frames )
+{
+    UINT64 samples;
+
+    if (!nb_frames || nb_frames > 15) return 0;
+    samples = (UINT64)nb_frames << wma_frame_len_bits( transform->rate );
+    if (!samples) return 0;
+    return (INT64)((UINT64)transform->block_align * 8 * transform->rate / samples);
+}
+
+static void dump_packet_head( struct wma_transform *transform, const BYTE *data, size_t size )
+{
+    char hex[3 * 16 + 1];
+    unsigned int i, n = size < 16 ? (unsigned int)size : 16;
+    UINT nibble_hi, nibble_lo;
+
+    for (i = 0; i < n; i++)
+    {
+        static const char d[] = "0123456789abcdef";
+        hex[i * 3 + 0] = d[(data[i] >> 4) & 0xf];
+        hex[i * 3 + 1] = d[data[i] & 0xf];
+        hex[i * 3 + 2] = ' ';
+    }
+    hex[n * 3] = 0;
+
+    /* wmadec.c: skip_bits(4) is the super-frame index, get_bits(4) is
+     * nb_frames.  Bits are MSB-first, so they are the two nibbles of byte 0. */
+    nibble_hi = data[0] >> 4;
+    nibble_lo = data[0] & 0xf;
+    WMA_LOG( "pkt#%u %zu bytes: %s| superframe index=%u nb_frames nibble=%u"
+             " -> implies %d bit/s (open at %d)\n",
+             transform->packet_count, size, hex, nibble_hi, nibble_lo,
+             (int)implied_bit_rate( transform, nibble_lo ), (int)transform->bit_rate );
+}
+
+/* The ordered list of parameter guesses.  Each is validated by "does a packet
+ * actually decode", so a wrong one cannot be adopted silently -- and every
+ * transition is logged, which is what makes the next device log an answer
+ * rather than another hypothesis. */
+static BOOL next_candidate( struct wma_transform *transform, const BYTE *first_packet,
+                            INT64 *bit_rate, int *flags2, const char **why )
+{
+    UINT flags2_now = wma_flags2( transform->codec_id, transform->extradata,
+                                  transform->extradata_size );
+    INT64 implied = first_packet ? implied_bit_rate( transform, first_packet[0] & 0xf ) : 0;
+
+    for (;;)
+    {
+        switch (transform->candidate++)
+        {
+        case 0:
+            if (!transform->bit_rate_alt || transform->bit_rate_alt == transform->bit_rate)
+                continue;
+            *bit_rate = transform->bit_rate_alt;
+            *flags2 = -1;
+            *why = "libavformat/xwma.c's fake-rate table";
+            return TRUE;
+        case 1:
+            if (!implied || implied == transform->bit_rate) continue;
+            *bit_rate = implied;
+            *flags2 = -1;
+            *why = "the rate implied by this packet's own nb_frames nibble";
+            return TRUE;
+        case 2:
+            /* FFmpeg does exactly this itself for flags2 == 0xd ("this fixes
+             * issue1503", wmadec.c wma_decode_init): a stream whose block
+             * lengths will not parse may simply not be using variable ones. */
+            if (!(flags2_now & 0x0004)) continue;
+            *bit_rate = implied ? implied : transform->bit_rate;
+            *flags2 = (int)(flags2_now & ~0x0004u);
+            *why = "the same rate with use_variable_block_len cleared";
+            return TRUE;
+        default:
+            return FALSE;
+        }
+    }
+}
+
 /* Feed one packet and drain whatever frames it produced.  Returns the
  * libavcodec status of the send. */
 static int send_one_packet( struct wma_transform *transform, const BYTE *data, size_t size,
@@ -622,42 +797,57 @@ static NTSTATUS decode_staged( struct wma_transform *transform, BOOL flush_tail 
 
         if (avail < take)
         {
+            /* A tail shorter than block_align is never a packet.  Mid-stream
+             * it is the front of the next push and waits; at drain there is no
+             * next push, and feeding it short earns a bare
+             * "Input packet size too small" AVERROR_INVALIDDATA from wmadec
+             * (which is where v95's -1094995529 came from).  Drop it. */
             if (!flush_tail) break;
-            take = avail;
+            transform->short_tail_dropped += (UINT32)avail;
+            offset += avail;
+            break;
         }
         data = transform->in_buf + offset;
+
+        if (transform->packet_count < 2) dump_packet_head( transform, data, take );
+        transform->packet_count++;
 
         err = send_one_packet( transform, data, take, &status );
         if (status) return status;
 
-        /* THE xWMA BIT-RATE RETRY (see the header comment).  Only before any
-         * output has been produced, and only once: a stream that has already
-         * decoded a frame has proved its parameters, and reopening under it
-         * would throw away the bit reservoir for no reason. */
-        if (err < 0 && !transform->produced_output && !transform->alt_tried &&
-            transform->bit_rate_alt && transform->bit_rate_alt != transform->bit_rate)
+        /* THE PARAMETER SEARCH.  Only while NOTHING has decoded yet: a stream
+         * that has produced a frame has proved its parameters, and reopening
+         * under it would throw away the bit reservoir for no reason.  Each
+         * candidate is tried on this same packet and kept only if it decodes,
+         * so a wrong guess cannot be adopted; the transition is logged either
+         * way so the next log names the winner instead of implying it. */
+        while (err < 0 && !transform->produced_output)
         {
-            INT64 was = transform->bit_rate;
+            INT64 was_rate = transform->bit_rate;
+            INT64 bit_rate;
+            const char *why;
+            int flags2;
 
-            transform->alt_tried = TRUE;
-            if (!open_decoder( transform, transform->bit_rate_alt ))
+            if (!next_candidate( transform, data, &bit_rate, &flags2, &why )) break;
+
+            WMA_LOG( "nothing decoded at %d bit/s; trying %d bit/s%s -- %s\n",
+                     (int)was_rate, (int)bit_rate,
+                     flags2 >= 0 ? " with modified flags2" : "", why );
+            if (open_decoder( transform, bit_rate, flags2 ) < 0)
             {
-                WMA_LOG( "no packet decoded at %d bit/s; xWMA reports a fake rate for "
-                         "%uHz %uch, retrying at %d bit/s (libavformat/xwma.c)\n",
-                         (int)was, transform->rate, transform->in_channels,
-                         (int)transform->bit_rate_alt );
-                err = send_one_packet( transform, data, take, &status );
-                if (status) return status;
-                if (err >= 0)
-                    WMA_LOG( "bit rate %d bit/s accepted; decoding resumed\n",
-                             (int)transform->bit_rate );
+                /* Put a working context back rather than leaving the transform
+                 * holding a NULL decoder. */
+                open_decoder( transform, was_rate, -1 );
+                break;
             }
-            else
+            err = send_one_packet( transform, data, take, &status );
+            if (status) return status;
+            if (err >= 0 && transform->produced_output)
             {
-                /* Reopening failed outright: put the working context back so
-                 * the transform stays usable rather than becoming a NULL
-                 * decoder that faults on the next push. */
-                open_decoder( transform, was );
+                WMA_LOG( "accepted: %d bit/s%s (%s); decoding resumed\n",
+                         (int)transform->bit_rate,
+                         flags2 >= 0 ? " with use_variable_block_len cleared" : "", why );
+                break;
             }
         }
 
@@ -695,15 +885,18 @@ static NTSTATUS decode_staged( struct wma_transform *transform, BOOL flush_tail 
 
 static void report_failures( struct wma_transform *transform )
 {
-    if (!transform->fail_count) return;
-    WMA_LOG( "%u packets failed to decode on transform %p (%llu frames of silence emitted "
-             "in their place), %uHz %uch block=%u at %d bit/s\n",
-             transform->fail_count, transform, (unsigned long long)transform->silence_frames,
+    if (!transform->fail_count && !transform->short_tail_dropped) return;
+    WMA_LOG( "%u of %u packets failed to decode on transform %p (%llu frames of silence "
+             "emitted in their place, %u trailing bytes dropped), %uHz %uch block=%u "
+             "at %d bit/s\n",
+             transform->fail_count, transform->packet_count, transform,
+             (unsigned long long)transform->silence_frames, transform->short_tail_dropped,
              transform->rate, transform->in_channels, transform->block_align,
              (int)transform->bit_rate );
     transform->fail_count = 0;
     transform->fail_logged = 0;
     transform->silence_frames = 0;
+    transform->short_tail_dropped = 0;
 }
 
 /***********************************************************************
@@ -758,6 +951,11 @@ static NTSTATUS transform_create( struct wg_transform_create_params *params )
     if (out_tag == WAVE_FORMAT_IEEE_FLOAT && out->wBitsPerSample != 32)
         return STATUS_NOT_SUPPORTED;
 
+    /* Route libavcodec's own diagnostics through this file's tag (see
+     * wma_av_log): they name the field of the bitstream that failed, which is
+     * the only thing that distinguishes wrong parameters from wrong bytes. */
+    pthread_once( &wma_av_log_once, wma_install_av_log );
+
     if (!(transform = calloc( 1, sizeof(*transform) ))) return STATUS_NO_MEMORY;
     pthread_mutex_init( &transform->lock, NULL );
     transform->magic = MADEIRA_WG_TRANSFORM_MAGIC;
@@ -804,7 +1002,7 @@ static NTSTATUS transform_create( struct wg_transform_create_params *params )
     transform->bit_rate_alt = xwma_true_bit_rate( in->nChannels, in->nSamplesPerSec,
                                                   (INT64)in->nAvgBytesPerSec * 8 );
 
-    if ((err = open_decoder( transform, (INT64)in->nAvgBytesPerSec * 8 )) < 0)
+    if ((err = open_decoder( transform, (INT64)in->nAvgBytesPerSec * 8, -1 )) < 0)
     {
         WMA_LOG( "avcodec_open2(%s) failed (%d) at %u bit/s\n", transform->codec->name, err,
                  (UINT)in->nAvgBytesPerSec * 8 );
@@ -899,6 +1097,21 @@ static NTSTATUS transform_push_data( wg_transform_t handle, struct wg_sample *sa
         pthread_mutex_unlock( &transform->lock );
         return STATUS_SUCCESS;
     }
+
+    /* v95: PROVE THE PHASE.  The staged FIFO means this file's failure lines
+     * always report a block_align-sized cut whatever the caller pushed, so the
+     * push size itself has to be logged or a re-phasing caller is invisible.
+     * (wma_decoder.c's transform_ProcessInput already drops any sample whose
+     * length is not a multiple of block_align -- "WMA transform uses fixed
+     * size input samples and ignores samples with invalid sizes" -- so this
+     * should always be a multiple; the log is what turns "should" into
+     * "does".) */
+    if (transform->push_count < 8)
+        WMA_LOG( "push #%u size=%u fifo=%zu block=%u%s\n",
+                 transform->push_count, (UINT)sample->size, transform->in_len,
+                 transform->block_align,
+                 (sample->size % transform->block_align) ? "  <-- NOT a multiple of block_align" : "" );
+    transform->push_count++;
 
     if (sample->size && data)
     {

@@ -1028,6 +1028,17 @@ struct wma_stage
     unsigned int channels;
     unsigned int block_align;
     unsigned int declared_avg_bytes;
+    /* 0 pushes the whole bitstream in one ProcessInput; otherwise the stream
+     * is pushed in chunks of this many bytes, which is what exercises the unix
+     * side's packet FIFO (one push -> several block_align packets, and a
+     * remainder carried to the next push). */
+    unsigned int push_chunk;
+    /* Push one deliberately MISALIGNED buffer first.  wma_decoder.c's
+     * transform_ProcessInput drops any sample whose length is not a multiple
+     * of block_align -- "WMA transform uses fixed size input samples and
+     * ignores samples with invalid sizes" -- so this must be harmless and must
+     * not shift the phase of everything that follows. */
+    int probe_misaligned;
 };
 
 /* A media type carrying everything wma_decoder.c's SetInputType /
@@ -1126,16 +1137,48 @@ static unsigned int fundamental_hz( unsigned int rate )
     return crossings * rate / pcm_samples;
 }
 
+/* Pull PCM until the transform says it needs more input.  Returns 0 only on a
+ * hard failure; "need more input" is the normal way out. */
+static int drain_output( IMFTransform *mft, DWORD out_size )
+{
+    MFT_OUTPUT_DATA_BUFFER out_buffer;
+    IMFSample *sample;
+    DWORD status;
+    HRESULT hr;
+
+    for (;;)
+    {
+        if (FAILED(hr = wrap_sample( &sample, NULL, 0, out_size )))
+        {
+            report_hr( "MFCreateSample(output) failed", hr );
+            return 0;
+        }
+        memset( &out_buffer, 0, sizeof(out_buffer) );
+        out_buffer.pSample = sample;
+        status = 0;
+        hr = IMFTransform_ProcessOutput( mft, 0, 1, &out_buffer, &status );
+        if (SUCCEEDED(hr)) collect_pcm( sample );
+        if (out_buffer.pEvents) IMFCollection_Release( out_buffer.pEvents );
+        IMFSample_Release( sample );
+        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return 1;
+        if (FAILED(hr))
+        {
+            report_hr( "ProcessOutput failed", hr );
+            return 0;
+        }
+        if (pcm_samples >= sizeof(pcm) / sizeof(pcm[0])) return 1;
+    }
+}
+
 /* Runs one stage end to end.  Returns EXIT_PASS, EXIT_DECODE_FAILED or
  * EXIT_NOT_REGISTERED. */
 static int run_stage( const struct wma_stage *st )
 {
-    MFT_OUTPUT_DATA_BUFFER out_buffer;
     IMFMediaType *in_type = NULL, *out_type = NULL;
     MFT_OUTPUT_STREAM_INFO out_info;
     IMFSample *sample = NULL;
     IMFTransform *mft = NULL;
-    DWORD status, out_size;
+    DWORD out_size;
     unsigned int hz;
     HRESULT hr;
     int rc;
@@ -1208,45 +1251,54 @@ static int run_stage( const struct wma_stage *st )
         out_size = out_info.cbSize;
 
     stage = "ProcessInput";
-    if (FAILED(hr = wrap_sample( &sample, st->data, st->data_size, st->data_size )))
+    if (st->probe_misaligned)
     {
-        report_hr( "MFCreateSample(input) failed", hr );
-        goto done;
+        /* 1000 bytes is not a multiple of any of these block sizes. */
+        if (SUCCEEDED(wrap_sample( &sample, st->data, 1000, 1000 )))
+        {
+            hr = IMFTransform_ProcessInput( mft, 0, sample, 0 );
+            IMFSample_Release( sample );
+            sample = NULL;
+            WRITE_LINE( "MADEIRA-WMA: misaligned 1000-byte push returned " );
+            write_hex32( (unsigned int)hr );
+            WRITE_LINE( " (wma_decoder.c ignores non-multiples of block_align)\n" );
+        }
     }
-    IMFSample_SetSampleTime( sample, 0 );
-    hr = IMFTransform_ProcessInput( mft, 0, sample, 0 );
-    IMFSample_Release( sample );
-    sample = NULL;
-    if (FAILED(hr))
     {
-        report_hr( "ProcessInput failed", hr );
-        goto done;
+        unsigned int pos = 0, chunk = st->push_chunk ? st->push_chunk : st->data_size;
+
+        while (pos < st->data_size)
+        {
+            unsigned int n = st->data_size - pos;
+            if (n > chunk) n = chunk;
+            if (FAILED(hr = wrap_sample( &sample, st->data + pos, n, n )))
+            {
+                report_hr( "MFCreateSample(input) failed", hr );
+                goto done;
+            }
+            IMFSample_SetSampleTime( sample, 0 );
+            hr = IMFTransform_ProcessInput( mft, 0, sample, 0 );
+            IMFSample_Release( sample );
+            sample = NULL;
+            if (hr == MF_E_NOTACCEPTING)
+            {
+                /* The transform wants its output drained first; that is the
+                 * normal MFT handshake, so drain and retry this same chunk. */
+                if (!drain_output( mft, out_size )) goto done;
+                continue;
+            }
+            if (FAILED(hr))
+            {
+                report_hr( "ProcessInput failed", hr );
+                goto done;
+            }
+            pos += n;
+            if (!drain_output( mft, out_size )) goto done;
+        }
     }
 
     stage = "ProcessOutput";
-    for (;;)
-    {
-        if (FAILED(hr = wrap_sample( &sample, NULL, 0, out_size )))
-        {
-            report_hr( "MFCreateSample(output) failed", hr );
-            goto done;
-        }
-        memset( &out_buffer, 0, sizeof(out_buffer) );
-        out_buffer.pSample = sample;
-        status = 0;
-        hr = IMFTransform_ProcessOutput( mft, 0, 1, &out_buffer, &status );
-        if (SUCCEEDED(hr)) collect_pcm( sample );
-        if (out_buffer.pEvents) IMFCollection_Release( out_buffer.pEvents );
-        IMFSample_Release( sample );
-        sample = NULL;
-        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) break;
-        if (FAILED(hr))
-        {
-            report_hr( "ProcessOutput failed", hr );
-            goto done;
-        }
-        if (pcm_samples >= sizeof(pcm) / sizeof(pcm[0])) break;
-    }
+    if (!drain_output( mft, out_size )) goto done;
 
     stage = "checking the PCM";
     WRITE_LINE( "MADEIRA-WMA: decoded " );
@@ -1295,13 +1347,13 @@ static int run( void )
             "A 44100 Hz stereo, honest rate",
             wma_test_data, sizeof(wma_test_data),
             wma_test_extradata, sizeof(wma_test_extradata),
-            WMA_TEST_RATE, WMA_TEST_CHANNELS, WMA_TEST_BLOCK_ALIGN, WMA_TEST_AVG_BYTES
+            WMA_TEST_RATE, WMA_TEST_CHANNELS, WMA_TEST_BLOCK_ALIGN, WMA_TEST_AVG_BYTES, 0, 0
         },
         {
             "B 22050 Hz stereo low bit rate, honest rate",
             wma_test_b_data, sizeof(wma_test_b_data),
             wma_test_b_extradata, sizeof(wma_test_b_extradata),
-            WMA_TEST_B_RATE, WMA_TEST_B_CHANNELS, WMA_TEST_B_BLOCK_ALIGN, WMA_TEST_B_AVG_BYTES
+            WMA_TEST_B_RATE, WMA_TEST_B_CHANNELS, WMA_TEST_B_BLOCK_ALIGN, WMA_TEST_B_AVG_BYTES, 0, 0
         },
         {
             /* 48000 bit/s = 6000 B/s is one of the figures libavformat/xwma.c
@@ -1311,7 +1363,21 @@ static int run( void )
             "C 22050 Hz stereo, xWMA fake byte rate",
             wma_test_b_data, sizeof(wma_test_b_data),
             wma_test_b_extradata, sizeof(wma_test_b_extradata),
-            WMA_TEST_B_RATE, WMA_TEST_B_CHANNELS, WMA_TEST_B_BLOCK_ALIGN, 6000
+            WMA_TEST_B_RATE, WMA_TEST_B_CHANNELS, WMA_TEST_B_BLOCK_ALIGN, 6000, 0, 0
+        },
+        {
+            /* PHASE. The unix side stages pushed bytes in a FIFO and cuts
+             * block_align packets off the head, so a caller that does not push
+             * exactly one packet at a time must still decode identically. This
+             * stage pushes two packets at a time and leads with a deliberately
+             * misaligned 1000-byte buffer, which wma_decoder.c is documented to
+             * ignore -- if it did not, or if the FIFO re-phased on it, the
+             * fundamental check below would fail. */
+            "D 22050 Hz stereo, chunked and misaligned pushes",
+            wma_test_b_data, sizeof(wma_test_b_data),
+            wma_test_b_extradata, sizeof(wma_test_b_extradata),
+            WMA_TEST_B_RATE, WMA_TEST_B_CHANNELS, WMA_TEST_B_BLOCK_ALIGN,
+            WMA_TEST_B_AVG_BYTES, WMA_TEST_B_BLOCK_ALIGN * 2, 1
         },
     };
     unsigned int i;

@@ -6823,6 +6823,11 @@ static int ios_redeliv_redirect_to_abort( thread_t thread, arm_thread_state64_t 
  *         1 = state rewritten to enter KiUserExceptionDispatcher,
  *         2 = fault serviced by page machinery (guard/watch): plain retry.
  */
+/* Defined further down next to bus_handler (the signal path's user); forward
+ * declared here because the Mach path must run the SAME emulator — see the
+ * [unaligned-atomic] block below for why the two paths may not disagree. */
+static int ios_emulate_unaligned_guest_access(ucontext_t *ctx, uint32_t insn, uintptr_t addr);
+
 static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_state64_t *state,
                                                    arm_neon_state64_t *neon, int have_neon,
                                                    int exception, uintptr_t fault_addr,
@@ -6846,6 +6851,11 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
     ucontext_t uc;
     struct __darwin_mcontext64 mc;
     static int deliver_logs;
+    /* 2026-09-19: set when the ESR says this data abort is an ALIGNMENT fault
+     * (DFSC 0b100001). Such a fault is serviceable — it is neither an access
+     * violation nor a transient — so it skips wine's page machinery, the
+     * transient-retry debounce and the redelivery terminal below. */
+    int is_align = 0;
 
     /* Pick the faulting thread's TEB by STACK CONTAINMENT, not by
      * self-consistency alone.
@@ -7051,6 +7061,75 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
         else rec.ExceptionInformation[0] = EXCEPTION_READ_FAULT;
         rec.ExceptionInformation[1] = fault_addr;
 
+        /* iOS-Madeira 2026-09-19 [unaligned-atomic]: AN ALIGNMENT FAULT IS NOT
+         * AN ACCESS VIOLATION, ON EITHER DELIVERY PATH.
+         *
+         * A 32-bit title froze after its D3D9 device came up with 13 parked
+         * waiters behind one guest critical section. The trigger was a JIT'd
+         * x86 `xchg [mem],reg` — host `swpal w26,w4,[x24]` (0xb8fa8304) at
+         * pool pc 0x138181c94 on guest address ...e32e, i.e. 2 mod 4. x86
+         * permits unaligned atomics; ARM64 LSE atomics fault, and FEX exists
+         * to fix exactly that. The log shows the two paths DISAGREEING about
+         * the same fault, four lines apart:
+         *
+         *   bus_handler  -> esr=0x92000021 -> 80000002 -> FEX: "Handled
+         *                   unaligned atomic: new pc: 138181C98"   (correct)
+         *   this handler -> c0000005 READ 0x710553e32e -> FEX: "Reconstructing
+         *                   context ... eip: 2E3733C0"             (fatal)
+         *
+         * FEX only emulates unaligned LSE atomics, it never back-patches them
+         * (HandleAtomicMemOp returns 4 = skip, no code rewrite), so a guest
+         * spin-acquire re-faults at the SAME host pc on every iteration. Under
+         * the transient-retry debounce below the 1st and 2nd faults declined to
+         * the BSD signal path and were fixed, and the 3rd was dispatched from
+         * here as a bogus access violation — which is not raised at any guest
+         * instruction that can handle it, so the thread unwound out of the
+         * locked region and every later waiter parked forever.
+         *
+         * The ESR already says which it is and nothing else has to be guessed:
+         * EC 0x24/0x25 is a data abort and DFSC (ISS[5:0]) 0b100001 is
+         * "Alignment fault" — the same bits `bus_handler` reads. Plain
+         * loads/stores are emulated in place here exactly as the signal path
+         * does; anything else (LSE atomics, CAS/CASP, exclusives, LDAPR/STLR)
+         * is dispatched as STATUS_DATATYPE_MISALIGNMENT so FEX's unaligned
+         * machinery gets the same shot it gets from bus_handler.
+         *
+         * Safe on this thread: the emulator touches only GPRs of the fabricated
+         * context (it refuses SIMD) and copies bytes through pointers in the
+         * one shared Mach task, and it uses no wine log macros — both required
+         * of anything running on the exception-server thread. */
+        is_align = (esr_ec == 0x24 || esr_ec == 0x25) && (esr & 0x3F) == 0x21;
+        if (is_align)
+        {
+            uint32_t a_insn = 0;
+            mach_vm_size_t got = 0;
+            static unsigned long ua_emu, ua_fex;
+
+            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)pc,
+                                        sizeof(a_insn), (mach_vm_address_t)&a_insn,
+                                        &got ) == KERN_SUCCESS && got == sizeof(a_insn) &&
+                ios_emulate_unaligned_guest_access( &uc, a_insn, fault_addr ))
+            {
+                PC_sig(&uc) += 4;
+                *state = mc.__ss;
+                if (++ua_emu <= 16 || (ua_emu % 4096) == 0)
+                    dprintf( 2, "[unaligned-atomic] mach-path pc=0x%llx insn=0x%08x addr=0x%llx "
+                                "handled by emulation (plain ld/st) emu=%lu to-fex=%lu rev=2026-09-19\n",
+                             (unsigned long long)pc, a_insn, (unsigned long long)fault_addr,
+                             ua_emu, ua_fex );
+                return 1;
+            }
+
+            rec.ExceptionCode = EXCEPTION_DATATYPE_MISALIGNMENT;
+            rec.NumberParameters = 0;
+            if (++ua_fex <= 32 || (ua_fex % 4096) == 0)
+                dprintf( 2, "[unaligned-atomic] mach-path pc=0x%llx insn=0x%08x addr=0x%llx "
+                            "handed to FEX as 80000002 (was c0000005 before 2026-09-19) "
+                            "emu=%lu to-fex=%lu\n",
+                         (unsigned long long)pc, a_insn, (unsigned long long)fault_addr,
+                         ua_emu, ua_fex );
+        }
+
         /* iOS-Madeira ml613 [av-detail]: THE THREE-WAY DISCRIMINATOR.
          *
          * ml612's fatal AV printed only ExceptionAddress, so read-vs-execute and
@@ -7075,8 +7154,8 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
          * never block on ios_tail_carve_lock from a fault handler. */
         {
             static unsigned long av_n;
-            unsigned long n = ++av_n;
-            if (n <= 24 || (n % 4096) == 0)
+            unsigned long n = is_align ? 0 : ++av_n;   /* alignment faults are not AVs — see above */
+            if (n && (n <= 24 || (n % 4096) == 0))
             {
                 uint64_t hpc = (uint64_t)arm_thread_state64_get_pc( mc.__ss );
                 unsigned int hinsn = 0;
@@ -7181,18 +7260,25 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
          * GUARD_PAGE_VIOLATION / STACK_OVERFLOW must be dispatched
          * immediately (wine semantics — state is consistent, no repeat
          * gating). */
-        st = ios_virtual_handle_fault_for_thread( &rec, teb );
-        if (!st)
+        /* An alignment fault has no page to service, and this helper ENDS with
+         * `rec->ExceptionCode = ret` — letting it run would overwrite the
+         * 80000002 chosen above with c0000005 again. It still has to pass the
+         * guest-pc gate below, so no `goto dispatch` here. */
+        if (!is_align)
         {
-            if (deliver_logs < 24)
+            st = ios_virtual_handle_fault_for_thread( &rec, teb );
+            if (!st)
             {
-                deliver_logs++;
-                dprintf( 2, "[mach-deliver] rev=ml369 page-serviced pc=0x%llx addr=0x%llx (guard/watch), retrying\n",
-                         (unsigned long long)pc, (unsigned long long)fault_addr );
+                if (deliver_logs < 24)
+                {
+                    deliver_logs++;
+                    dprintf( 2, "[mach-deliver] rev=ml369 page-serviced pc=0x%llx addr=0x%llx (guard/watch), retrying\n",
+                             (unsigned long long)pc, (unsigned long long)fault_addr );
+                }
+                return 2;
             }
-            return 2;
+            if (st != STATUS_ACCESS_VIOLATION) goto dispatch;
         }
-        if (st != STATUS_ACCESS_VIOLATION) goto dispatch;
     }
 
     /* only claim faults in plausibly GUEST-side execution:
@@ -7213,6 +7299,7 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
      * the decline regime. Dispatch only on the 3rd identical
      * (thread,pc,addr) fault — still well before the script's 8-stop kill.
      * Single server thread services all messages: no atomics needed. */
+    if (!is_align)
     {
         static struct { uint64_t key; uint32_t n; } rep[16];
         uint64_t key = ((uint64_t)thread << 48) ^ pc ^ ((uint64_t)fault_addr << 1);
@@ -7301,6 +7388,16 @@ dispatch:
      * thread's pointer registers (the ml460 corruption lived at [x10+x9*8]
      * and register dumps were capped away long before the storm settled),
      * then terminate honestly. */
+    /* 2026-09-19: EXEMPT ALIGNMENT FAULTS. The premise of this terminal is "no
+     * legitimate guest pattern redelivers the SAME (thread,pc,addr) thousands
+     * of times" — and the comment above already lists "unaligned" among the
+     * handled retries that "never reach this point". That was true only while
+     * this path mislabelled them c0000005; now that 80000002 is delivered from
+     * here, an unaligned atomic in a guest spin-acquire legitimately redelivers
+     * once per loop iteration (FEX emulates, it cannot back-patch an LSE
+     * atomic), and counting those would kill the pseudo-process for making
+     * progress. */
+    if (!is_align)
     {
         static struct { uint64_t key; uint32_t n; } redeliv[16];
         static volatile int ios_redeliv_terminating;

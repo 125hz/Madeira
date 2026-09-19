@@ -6981,3 +6981,353 @@ guest-slots=… verdict=…`). Consequences:
   with no caller-supplied memory` line at all — one of those means another
   allocation site was missed, and it names the length and options so the site
   can be identified.
+- 2026-09-19 — Logs v95 (open-world 32-bit D3D9 title, gameplay) + u92 (UE3).
+  Two measured costs removed, and the audio question answered: **FAudio's SSE2
+  mixers are not in the i386 binary at all**, so no CPUID check can reach them.
+  First, two round-3 changes confirmed in the field: `[prof] jit by module` now
+  reads `xaudio2_2.dll=23-27%` instead of `Zx`, and `[fex-cfg] FEAT_LRCPC2=1 ->
+  ... NOT auto-enabled` is in the log.
+  (1) THE CENSUS WAS COSTING TWO EMULATED LOCKED RMWs PER D3D9 CALL.
+  `[d3d9-census]` measures **10,548 calls per frame** in this title
+  (`calls: per_frame=10547.9`), and `D3D9_CENSUS` paid `g_calls[code]
+  .fetch_add` plus `ringCall`'s head bump on every one of them. In i386 under
+  FEX a `lock xadd` is not one instruction, it is a TSO read-modify-write the
+  JIT lowers to an exclusive-monitor sequence — and this is inside the DLL
+  `[prof]` puts at **13-20 % of all CPU**. Neither atomic bought anything: each
+  counter is a monotone tally whose only reader is the 5-second summary.
+  The counters are now per thread (`d3d9_census.hpp:41-92` — `ThreadCounters`,
+  a `thread_local` block pointer, allocated and linked on a thread's first D3D9
+  call and never freed so a dead thread keeps contributing; summed by
+  `callCount()` at report time, `d3d9_census.cpp:59-76`, used at :212). The
+  counters stay `std::atomic` so the summing read and the counting write are a
+  well-defined relaxed pair rather than a data race, but the write is a
+  load/add/store, NOT `fetch_add` — on x86 three plain instructions with no lock
+  prefix. Only the owning thread writes its own block, so the non-atomic RMW
+  cannot lose a count.
+  The `[d3d9-last]` ring is now opt-in, `MADEIRA_D3D9_LAST=1`
+  (`d3d9_census.hpp:95-104`, `d3d9_census.cpp:358-399`). It is forensics, not a
+  measurement: nothing in any report reads it and it only prints after the
+  process is already dying. When it is off the vectored exception handler is not
+  installed either, so a guest fault no longer walks through it, and
+  `dumpLastCalls` prints "ring disabled" with the knob name rather than an empty
+  ring (`d3d9_census.cpp:526-534`) — an empty ring reads as "D3D9 was never
+  called" and has sent a reader the wrong way before.
+  Net: ~21,000 emulated locked RMWs per frame become ~10,500 TLS-load-plus-
+  increment pairs. Every census number is unchanged.
+  (2) TWO SERVER ROUND TRIPS PER WINDOW MESSAGE, GONE. `focusWindowProc` opened
+  every message with `GetPropW(kFocusProcProp)` + `GetPropW(kFocusDeviceProp)`,
+  and a window property lives in the wineserver here: `[srv-stats]` puts
+  `get_window_property: NtUserGetProp+0x7c` at 858-2646 per 10 s at 42-54 us,
+  the third largest request kind in the process, purely to re-read two values
+  this DLL set itself. Now an 8-slot process-local HWND table
+  (`d3d9shim_window.c:56-122`), read at :404-408, written at :499, invalidated
+  at :417 (WM_NCDESTROY), :526 (unhook, dropped BEFORE the proc reads it again
+  so a dangling device pointer is impossible) and re-seeded at :545 when the app
+  has re-subclassed on top of us and the property must stay. The properties are
+  kept as the cross-DLL contract and as the miss path, so behaviour is identical
+  in every case — the cache can only make it faster, never different.
+  (3) MEASURED, NOT CHANGED.
+  **Cursor caching: declined, with the number.** `set_cursor` is 572-1746 per
+  10 s at 37-46 us = **2.5-8 ms per 10 s, 0.03-0.08 % of one core**. Against
+  that: `NtUserShowCursor` has no unchanged case at all — every call moves a
+  desktop-GLOBAL count by +/-1 and returns it, and apps spin on that return
+  value (`while (ShowCursor(FALSE) >= 0)`), so a per-process cache is wrong the
+  moment anything else touches it. `NtUserClipCursor`'s clip is likewise
+  desktop-global and the server drops it on foreground changes that originate
+  outside this process, so a stale "identical rect, skip the call" is a mouse
+  that escapes the window in a first-person title. Wrong trade for 0.05 % of a
+  core; the round trips stay.
+  **memcpy/memset under TSO: FEX is already right, the guest CRT is not.**
+  `[fex-cfg]` confirms `MemcpySetTSOEnabled=0` (with `TSOEnabled=1
+  HalfBarrierTSOEnabled=1 VectorTSOEnabled=0`), and that flag is exactly what
+  makes `CPUID.cpp:663` advertise ERMS to the guest and `MemoryOps.cpp:2127,
+  :2371` take the non-atomic bulk path — so FEX's REP MOVS fast path IS active
+  in 32-bit mode. The guest never asks for it: v95's hot ucrtbase block
+  (`ucrtbase.dll+0x5c9cc`, 182 guest insts, **vec=0**, mem=73, tso=20, 1.8 % of
+  all CPU) is a scalar word loop, neither `rep movsb` nor SSE. Making Wine's
+  i386 CRT issue the string op FEX is waiting for is a CRT-source change with
+  `memmove` overlap semantics attached, in someone else's tree; left alone.
+  **The JIT is warm and is not a steady-state cost.** `blocks` 25040 -> 25943 at
+  **2-37 blocks/s** across gameplay windows, `hit_rate` 92-93 %, `insts/blk=87`.
+  Nothing to fix. (`cpp_dispatch` is still quantised to 16384, so its per-second
+  rate remains an artefact of the counter.)
+  **Server, ranked** (busiest v95 window, total `in-call` only 0.05-0.09 core):
+  select 5881, event_op 4694 (fastsync stays OFF as instructed),
+  get_window_property 2646 (item 2 above), set_cursor 1746,
+  get_window_rectangles 1335, get_async_result 977 + ioctl 977, release_mutex
+  898. The `get_async_result`+`ioctl` pair is **977-979 per 10 s in every window
+  of every log and both titles** — a fixed ~97.8/s, i.e. a ~10.2 ms periodic
+  overlapped-IRP poll in our own infrastructure, not per-frame work, 0.7 % of a
+  core. u92 has a different shape worth someone's attention: `event_op=19537`
+  per 10 s (5.9 % of a core), and `set_hook=898` + `remove_hook=898` per 10 s —
+  a hook installed and removed **90 times a second**, 1796 round trips/s.
+  LOADING-PHASE bursts are a different population again and neither of the two
+  fixes above touches them: v95:2896 has `add_fd_completion=103180` in one 10 s
+  window (10.3 k/s at 18 us = **1.9 % of a core**, overlapped file I/O
+  completion during streaming) and v95:2414 has `release_mutex:
+  NtReleaseMutant+0xec=3147` at 38 us (1.2 % of a core) alongside
+  `create_file=478/549us`. Both are worth a look by whoever owns the streaming
+  and file paths; they do not appear in the steady-state gameplay windows.
+  (4) AUDIO: THE SSE2 MIXERS ARE NOT IN THE BINARY, SO CPUID IS NOT THE GATE.
+  `FAudio_internal_simd.c:38-75` only defines `__SSE2__` for x86_64 and macOS;
+  a 32-bit x86 build falls to the `#else` with `NEED_SCALAR_CONVERTER_FALLBACKS
+  1`, so `HAVE_SSE2_INTRINSICS` is 0, the entire SSE2 section is preprocessed
+  away, and `FAudio_INTERNAL_InitSIMDFunctions` takes the scalar fallbacks
+  **whatever `IsProcessorFeaturePresent` returns**. `wine/libs/faudio/
+  Makefile.in` passes no `-msse2`. The profile agrees: the two hot blocks
+  (`xaudio2_2.dll+0x19080`, `+0x1a5b0`) are scalar-double — `cvtsi2sd`, a
+  `movsd` of a constant from the same image at +0x2fe68 — with only 12-16 vector
+  ops in ~100 guest instructions, which is not what a packed-single mixer looks
+  like.
+  The runtime gate would pass if the code existed: `ntdll/unix/system.c:727`
+  sets `PF_XMMI64_INSTRUCTIONS_AVAILABLE = TRUE` whenever I386 is in
+  `supported_machines`, which it is. **So `-msse2` on the faudio i386 build is
+  the whole fix**, and it is one line in `wine/libs/faudio/Makefile.in`. NOT
+  done here: `wine/libs/faudio` is another agent's this round.
+  **The device graph is stereo** — `[audio] get_mix_format
+  fmt=tag65534/2ch/48000Hz/32bit/align8 share=shared -> 0x00000000` and
+  `[audio] stream 0: fmt=f32/2ch/48000Hz/32bit(valid 32)/mask0x3`. No 6-channel
+  mastering voice; that question is closed.
+  **Two observations to hand on.** `[audio] stream 0: ... peak=0.000` for the
+  whole run while `FAudio_AudioClientThread` sits at **28.1 % of all CPU (jit
+  99 %)** — either the peak meter is unwired or the mixer is spending a quarter
+  of the machine producing silence, and those need different fixes.
+  `[d3d9-query] worst_ever=35760929us` (35.8 s) against
+  `issue_to_complete_avg=33945us` and `polls_per_completion=2.1`: steady state
+  is healthy, so this is one outlier, most likely a load screen, but it is the
+  same shape as the stranded query ml998 fixed and deserves a second look if it
+  recurs.
+  **What to look for in the next log:** `d3d9-emulated.dll` down from 13-20 % of
+  all CPU by roughly the share the two locked RMWs were taking, with
+  `[d3d9-census] per_frame` UNCHANGED at ~10,548 and every top-20 count
+  unchanged (if a count moves, the per-thread summing is wrong, not the
+  workload); `[srv-stats] get_window_property` falling out of the top four in
+  the open-world title; `[d3d9-last]` appearing only as "ring disabled" unless
+  someone sets `MADEIRA_D3D9_LAST=1`. Unchanged on purpose: `blocks`,
+  `hit_rate`, `event_op`, `set_cursor`, and `xaudio2_2.dll`'s share — the audio
+  fix is a build flag in another tree and nothing here touches it.
+
+- 2026-09-19 — **An unaligned x86 atomic was delivered to the guest as an
+  access violation, because the Mach fault path never read the ESR.** Log v96,
+  a 2012-era 32-bit D3D9 title: the device is created, loading starts, and the
+  process freezes with 13 parked waiters behind one guest critical section that
+  is never released. One instruction did it —
+  `BUS #1: pc=0x138181c94 addr=0x710553e32e insn=0xb8fa8304`, i.e. `swpal
+  w26,w4,[x24]`, the JIT's translation of a guest `xchg [mem],reg`, on a DWORD
+  at **2 mod 4**. x86 allows that; ARM64 LSE atomics do not, and FEX exists to
+  catch the alignment fault and finish the access by hand. The `[bus-rgn]`
+  probe already proved the memory was innocent (`prot=3`, anonymous, resident,
+  page materialises), so nothing about the page was ever the problem.
+
+  **The two delivery paths disagreed about the same fault, four lines apart.**
+  This is the whole defect, and the log states it outright:
+
+  ```
+  bus_handler  [unaligned-guest] REFUSED-OTHER insn=0xb8fa8304 ... keeping 80000002
+  [exc-disp]   raise tid=003c code=80000002
+  D 3C         Handled unaligned atomic: new pc: 138181C98      <- FEX fixed it
+  [mach-deliver] rev=ml369 #0 code=c0000005 pc=0x138181c94      <- same fault, AV
+  D 3C         Reconstructing context
+  D 3C         pc: 138181C94 eip: 2E3733C0                      <- into the guest
+  ```
+
+  So the answers to the three questions this was opened with are: (1) the
+  signal path is **correct** — `bus_handler` reads `get_fault_esr`, keeps
+  `EXCEPTION_DATATYPE_MISALIGNMENT`, and FEX's WOW64 hook
+  (`FEX/Source/Windows/WOW64/Module.cpp:1758` -> `:643` ->
+  `FEXCore/Source/Utils/ArchHelpers/Arm64.cpp`) resumes the **host** context at
+  `pc+4`, exactly as designed; (2) `HandleUnalignedAccess` **does** handle the
+  LSE `ATOMIC_MEM` class (`Arm64.cpp:2286` -> `HandleAtomicMemOp`, whose
+  `DoCAS32`/`DoLoad32` helpers are themselves alignment-aware), for size=2 SWP
+  with Rs != Rt and for the single-register addressing our 32-bit window uses;
+  and (3) **no back-patch is involved**, so code-buffer writability never came
+  into it. Everything on the FEX side worked.
+
+  **What did not work was `ios_mach_deliver_guest_exception_inner`**
+  (`build/ntdll-unix/signal_arm64_ios.c`). It set
+  `rec.ExceptionCode = EXCEPTION_ACCESS_VIOLATION` for **every**
+  `EXC_BAD_ACCESS` and only ever consulted the ESR to pick read/write/execute —
+  the DFSC field that says "alignment fault" (`ISS[5:0] == 0b100001`, plainly
+  visible in the same log as `esr=0x92000021`) was never examined. Which path a
+  given fault took was then decided by the transient-retry debounce: faults #1
+  and #2 declined to the BSD signal path and were fixed; the **third** was
+  dispatched from the Mach path as `c0000005` at guest `eip 2E3733C0`, the
+  thread unwound out of the locked region still holding the lock, and every
+  later waiter parked forever.
+
+  Why a third fault existed at all is the second half of the story, and it is
+  not a bug: **FEX cannot back-patch an LSE atomic** — no single ARM64
+  instruction has SWP's semantics — so `HandleAtomicMemOp` emulates and returns
+  "skip 4" without rewriting the site. A guest spin-acquire therefore re-faults
+  at the *same* host pc on *every* iteration. That is correct and only slow; it
+  is also guaranteed to reach any rule that assumes a repeated fault is a
+  pathology.
+
+  **Fix.** `signal_arm64_ios.c`, in the Mach delivery path: classify
+  `EC 0x24/0x25 && DFSC 0x21` as an alignment fault and treat it as serviceable
+  rather than fatal. Plain loads/stores are emulated in place by the **same**
+  `ios_emulate_unaligned_guest_access` the signal path uses (forward declared
+  for it; it touches only GPRs, refuses SIMD, uses byte-wise copies and no wine
+  log macros, so it is safe on the exception-server thread); everything else —
+  LSE atomics, CAS/CASP, load/store-exclusive pairs, LDAPR/STLR — is dispatched
+  as `STATUS_DATATYPE_MISALIGNMENT` so FEX's machinery gets the same shot it
+  gets from `bus_handler`. Three consequences had to be handled with it:
+  `ios_virtual_handle_fault_for_thread` is skipped (it ends with
+  `rec->ExceptionCode = ret` and would put `c0000005` straight back); the
+  `[av-detail]` discriminator does not fire (an alignment fault is not an AV and
+  must not drain that budget); and both the transient-retry debounce and the
+  **`[redeliv]` 2000-identical-redeliveries terminal** exempt alignment faults —
+  its premise, that nothing legitimate redelivers the same `(thread,pc,addr)`
+  thousands of times, stops holding the moment a spin-acquire on a misaligned
+  word starts being serviced from here, and killing the pseudo-process for
+  making progress would have been a worse bug than the one being fixed.
+  Alignment faults still pass the guest-pc gate, so a host-side one is declined
+  as before.
+
+  **Census, because the cost is now the thing to watch.**
+  `FEXCore/Source/Utils/ArchHelpers/Arm64.cpp` gained a thin wrapper around
+  `HandleUnalignedAccess` — the return value alone says which happened (a byte
+  count means the handler performed the access; `0`/`-4` means the site was
+  rewritten and must re-run), so one wrapper covers all nine class branches
+  without touching any of them. It emits `[unaligned-atomic] pc=... insn=...
+  addr=... handled by emulation|patch`, deduplicated by host pc and capped at
+  32 lines, and bumps `ua_emu` / `ua_patch` on the periodic `[fex-stats]` line
+  (`Interface/Core/Core.cpp`), which is never capped. The Mach path prints its
+  own `[unaligned-atomic] mach-path ...` line for the same reason.
+
+  **Test.** `build/x86-tests/unaligned-x86.c` + `build-unaligned-test.sh`
+  (i386, kernel32 only, no CRT), with a button below the live view. It asserts
+  its own premise first (every word really is at 1, 2 or 3 mod 4 — offset 2 is
+  the one the device died on), then checks `lock xadd` (including a negative
+  addend), `lock cmpxchg` **taken and not taken**, `lock inc` across a carry,
+  `xchg [mem],reg` and kernel32's exported `InterlockedExchange` for the exact
+  value *and* the exact return value at all three offsets; then runs two threads
+  x 1,000,000 iterations each of `lock xadd`, `lock inc` and a `lock cmpxchg`
+  CAS loop, requiring exactly 2,000,000 — a short count is a lost update, which
+  is the failure mode that turns a guest reference count into a use-after-free
+  rather than a hang. The last phase is the device's own shape: a **misaligned
+  `xchg` spinlock** guarding an ordinary non-atomic counter, which fails on a
+  short count *and* on timeout, because "wedged" is the symptom under
+  investigation. The build script disassembles the image and asserts the four
+  mnemonics and the lock prefixes are really there, so a compiler that lowered
+  `lock xadd` to a CAS loop cannot make the test pass while exercising nothing.
+  Exit 70 = pass, 71 = wrong result, 72 = environment, 73 = the premise broke,
+  74 = timeout. **No `MADEIRA-EXIT` line at all is the original bug** — a
+  crashed run must never read as a fail-with-verdict.
+
+  **What the next log should show.** From `unaligned-x86.exe`:
+  `MADEIRA-UNALIGNED: all checks passed` and `MADEIRA-EXIT:
+  unaligned-x86.exe status=70`, with the per-phase `ms=` figures giving the real
+  per-fault round-trip cost. From the unix side: `[unaligned-atomic]` lines
+  naming a handful of sites with `handled by emulation`, `ua_emu` climbing on
+  `[fex-stats]` while `ua_patch` stays small, and — the actual regression
+  check — **no `[mach-deliver] ... code=c0000005` at a pc whose `[bus-rgn]`
+  reports `si_code=1`**, and no `Reconstructing context` / `pc: ... eip: ...`
+  pair following a `DATATYPE_MISALIGNMENT`. On the title itself the `swpal` at
+  the D3D9 loading path should show up once as an `[unaligned-atomic]` site line
+  and then never again in the log, with loading continuing past it.
+
+- 2026-09-19 — **The WMA decoder's second device run: the parameters are right,
+  so the next question is the bytes — and the answer was already in the log.**
+  Log v95: the retry fires and still every packet of every bit-reservoir
+  stream fails. Five streams, five geometries, all failing: 32000 Hz 1ch
+  block=1280, 32000 Hz 2ch block=2304, 22050 Hz 2ch block=1487, 44100 Hz 1ch
+  block=2230, 44100 Hz 2ch block=4459.
+
+  **The parameters are now independently confirmed, which removes them as
+  suspects.** A WMA superframe holds `nb_frames` frames of `frame_len` samples
+  in `block_align` bytes, so `bit_rate = block_align * 8 * rate /
+  (nb_frames * frame_len)`. Running that over the five geometries with
+  `frame_len` from `ff_wma_get_frame_len_bits` and an 8- or 6-frame superframe
+  gives 20000, 48000, 32000, 48000 and 96000 bit/s — **every one of them
+  exactly the value libavformat/xwma.c's table normalises to.** Two independent
+  derivations agreeing is as far as a parameter theory can be taken from this
+  side; the rate the retry adopts is right.
+
+  **And libavcodec had been saying so all along.** wmadec explains each of its
+  failures, and those lines were in v95 — with libavcodec's own
+  `[wmav2 @ 0x…]` prefix, which a grep for this port's `[wma]` tag does not
+  match, so they were nearly missed. Tabulated:
+
+      2289  nb_frames is N bits left M            (the superframe header)
+      3595  next/prev/block_len_bits N out of range
+      1744  overflow (N > M) in spectral RLE
+       863  frame_len overflow
+
+  `nb_frames` is bits 4..7 of the packet's **first byte**, read before any
+  parameter-derived field width is used. A packet whose nb_frames nibble is
+  implausible is a packet that does not START where we think it does — a
+  different class of bug from every rate or flags theory, and the most common
+  complaint by a wide margin. `av_log_set_callback` now routes libavcodec's
+  diagnostics through the `[wma]` tag (capped at 64), so the decoder's own
+  account of itself is part of the log everyone reads.
+
+  **What the next log decides.** Two measurements, neither of which existed
+  before: `[wma] push #n size=… fifo=… block=…` for the first eight pushes,
+  which flags any push that is not a multiple of block_align; and
+  `[wma] pkt#n … <hex> | superframe index=… nb_frames nibble=… -> implies N
+  bit/s` for the first two packets, which prints the bytes themselves. If the
+  nibbles are 6–8 and consistent, the framing is right and the remaining
+  suspect is the codec configuration; if they are noise, the bytes are not
+  superframe-aligned and no parameter will ever help. This is the measurement
+  that should have been taken a round earlier instead of a second parameter
+  theory.
+
+  **Fixed outright this round.** A trailing partial packet is no longer fed to
+  the decoder — `buf_size < block_align` earns a bare "Input packet size too
+  small" `AVERROR_INVALIDDATA`, which is where v95's `-1094995529` came from;
+  it is dropped and counted. The parameter search gained two more
+  self-validating candidates beyond xwma.c's table: the rate implied by the
+  packet's own nb_frames nibble, and that rate with `use_variable_block_len`
+  cleared (FFmpeg does exactly this itself for `flags2 == 0xd`, "this fixes
+  issue1503"). Every candidate is kept only if a packet actually decodes, and
+  each transition is logged.
+
+  **And a real out-of-bounds read on the FAudio side, which is the better
+  candidate for the census's `peak=65535.999`.**
+  `FAudio_INTERNAL_DecodeWMAMF` chose its branch with
+  `if (wfx->Format.wFormatTag == FAUDIO_FORMAT_EXTENSIBLE) { dpds path } else
+  { XMA2 path }` and then read `dwBytesPerBlock` and `dwSamplesEncoded` — both
+  `FAudioXMA2WaveFormat` fields — out of the caller's format struct. For an
+  xWMA voice submitted as a plain WAVEFORMATEX with tag WMAUDIO2, which
+  XAudio2 allows and which `FAudio_WMADEC_init` itself handles through its
+  `type` switch rather than through `wFormatTag`, that is a read **past the end
+  of the caller's struct**. The results become the decoder's input chunk size
+  and the size of an uninitialised `pRealloc`'d output buffer that the voice
+  then indexes by its own cursor. The branch is now keyed on the format
+  actually being XMA2, and both `pRealloc` sites zero their newly grown tail —
+  heap garbage played as float32 is arbitrarily loud, which is exactly what a
+  peak of 65535.999 looks like.
+
+  **i386 FAudio was also built with no SIMD at all.**
+  `FAudio_internal_simd.c`'s detection chain has cases for aarch64, x86_64 and
+  macOS and an `#else` for "all other hardware"; i686 fell into that `#else`,
+  because nothing defines `__SSE2__` for an i686 PE target (verified: clang
+  `-target i686-windows -dM -E` defines neither `__SSE2__` nor `__SSE__`,
+  unlike x86_64-windows). `HAVE_SSE2_INTRINSICS` was therefore never defined,
+  so `FAudio_INTERNAL_InitSIMDFunctions` had no SSE2 branch compiled in and the
+  runtime `IsProcessorFeaturePresent(PF_XMMI64_INSTRUCTIONS_AVAILABLE)` check
+  could not select one — scalar mixing and resampling for every XAudio2 title,
+  profiled at 22–27% of all CPU under translation. i686 now gets
+  `HAVE_SSE2_INTRINSICS` with the scalar fallbacks **kept** and the runtime
+  check **kept**, since unlike x86_64 the ISA does not guarantee SSE2 here;
+  all this does is make the SSE2 half exist to be chosen. It is done with
+  `__attribute__((target("sse2")))` on the seven `_SSE2` functions rather than
+  `-msse2` on the file, deliberately: a file-wide flag would also let the
+  compiler emit SSE2 into the scalar fallbacks, which are the paths that have
+  to keep running on a CPU without it. Verified in the rebuilt library:
+  `FAudio_INTERNAL_InitSIMDFunctions` now references all seven `_SSE2` entries,
+  `FAudio_INTERNAL_Mix_Generic_SSE2` disassembles to
+  `movups/mulps/movaps/addps` on `%xmm`, and `ResampleStereo_SSE2` carries 14
+  packed ops.
+
+  **A build-system trap worth recording.** `.xtool/build-wine-i386.sh` counts a
+  target as built if the output FILE EXISTS after the bulk make. A compile
+  error inside a static library the modules link — here a `*/` inside a comment
+  I added to `libs/faudio`, which closed the comment early — therefore reported
+  "built: 35 failed: 0" while every DLL was the previous build. It was caught
+  only because the build tag was missing from all 35. Any claim that a library
+  change shipped needs a check on the ARTIFACT, not on the script's exit
+  status; that is what the tag is for, and `strings <module>.dll` now answers
+  it (22 of 35 i386 modules carry it — the 13 that do not are x3daudio/xapofx,
+  which never reference the decoder).
