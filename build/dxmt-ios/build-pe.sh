@@ -10,14 +10,19 @@
 #   ./build-pe.sh                 # i386 only (the milestone-4 target)
 #   ./build-pe.sh i386 aarch64    # more arches
 #   ./build-pe.sh --targets winemetal.dll d3d9.dll
-#   ./build-pe.sh --install all   # also install d3d11/dxgi/d3d10core
+#   ./build-pe.sh --install all   # also install nvapi/nvngx and friends
 #
 # --targets limits what is BUILT; --install limits what is copied into
 # app/Madeira/<arch>-windows/.  The install set defaults to the modules the
-# D3D9 path needs, so that building the whole tree for a compile check does
-# not quietly add DLLs to the app bundle that nothing has wired up yet (the
-# i386 d3d11/dxgi/d3d10core do build, but their 32-bit unix-call dispatch is
-# still the open hand-off in WOW64_DESIGN.md section 7).
+# Direct3D paths need, so that building the whole tree for a compile check
+# does not quietly add DLLs to the app bundle that nothing has wired up yet.
+#
+# d3d11.dll / dxgi.dll / d3d10core.dll joined that default set on 2026-09-19
+# (WOW64_DESIGN.md section 6): the 32-bit unix-call dispatch they need is the
+# same winemetal wow64 table the D3D9 path already uses, and they REPLACE
+# Wine's wined3d-based i386 copies -- .xtool/build-wine-i386.sh no longer
+# builds those (NEVER_OVERWRITE/EXCLUDE/SKIP_BREADTH_REASON there), so a farm
+# round will not overwrite what this stage installs.
 #
 # Why it builds out of a synced copy rather than in place: the native build
 # workspace ($MADEIRA_WORK, recorded in .xtool/work-path) is a `git archive
@@ -57,7 +62,8 @@ for arg in "$@"; do
     esac
 done
 [ ${#arches[@]} -gt 0 ] || arches=(i386)
-[ ${#install_set[@]} -gt 0 ] || install_set=(winemetal.dll d3d9.dll d3d9-emulated.dll d3d9shim.dll)
+[ ${#install_set[@]} -gt 0 ] || install_set=(winemetal.dll d3d9.dll d3d9-emulated.dll d3d9shim.dll \
+                                             d3d11.dll dxgi.dll d3d10core.dll)
 
 # MADEIRA (WOW64_DESIGN.md section 8.5): the i386 shim (built as d3d9shim.dll,
 # since two meson targets cannot both be called d3d9) is now bound to its unix

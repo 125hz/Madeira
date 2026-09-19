@@ -6728,3 +6728,256 @@ guest-slots=… verdict=…`). Consequences:
   the audio census reporting `peak=` values at or below about 1.0 where s79
   reported 7.991, with the bus limiter's gain sitting at 1.0 instead of riding
   18 dB down.
+
+- 2026-09-19 — **The WMA decoder's first device run, and the bit rate xWMA
+  lies about.** Log u87: the chain works — `[unixlib] winegstreamer (wma via
+  libavcodec) … -> wow64 table`, no `dll-missing`, no
+  `com_get_class_object` — and two decoders are created:
+
+      [wma] decoder created fmt=wmav2 tag=0x161 44100Hz 1ch block=139  extradata=10 …
+      [wma] decoder created fmt=wmav2 tag=0x161 22050Hz 2ch block=1487 extradata=16 …
+      [wma] avcodec_send_packet failed (-1), dropping 1487 bytes        ×4762
+
+  The second one failed **every** packet, and the audio census still read
+  `peak=65535.999`. Two defects, and the first is entirely about where those
+  two streams' codec-private data comes from.
+
+  **`extradata=10` is real; `extradata=16` is invented.** Ten bytes is an ASF
+  WMA v2 codec-private blob — `{DWORD samples_per_block; WORD encode_options;
+  DWORD super_block_align}` — and libavcodec reads
+  `flags2 = AV_RL16(extradata + 4)` out of it (`wmadec.c wma_decode_init`).
+  Sixteen bytes is not codec data at all: an xWMA RIFF's `fmt ` chunk is a
+  plain WAVEFORMATEX with no tail, so FAudio has none to pass on and
+  `FAudio_WMADEC_init` invents one —
+  `static const uint8_t fake_codec_data[16] = {0,0,0,0,31,0,…}`
+  (`wine/libs/faudio/src/FAudio_platform_win32_wmadec.c:249`). **That 31 is
+  correct**, and independently so: FFmpeg's own xWMA demuxer writes the
+  identical shape, six bytes with `[4] = 31`, under the comment "setup
+  extradata with our experimentally obtained value"
+  (`libavformat/xwma.c`). flags2 = 31 is exp-VLC + bit reservoir + variable
+  block length, which is also why `block_align` is 1487 and not a couple of
+  hundred bytes: with a bit reservoir a packet is a SUPERFRAME of several
+  1024-sample frames. So the flags were never the problem.
+
+  **The bit rate was**, and FFmpeg says so in as many words directly above the
+  fixup this port now mirrors: *"XWMA encoder only allows a few channel/sample
+  rate/bitrate combinations, but some create identical files with fake bitrate
+  … Decoder needs correct bitrate to work, so it's normalized here."* 22050 Hz
+  **stereo** is one of the listed rows (→ 32000). The bit rate is not cosmetic
+  to libavcodec: `ff_wma_init` (`libavcodec/wma.c`) derives `bps` from it and
+  then picks the coefficient VLC table (`:335-343`), the high band start
+  (`:149-181`), whether noise coding is on (`:111`) and — decisively for a
+  bit-reservoir stream — `byte_offset_bits` (`:141`), which is how many bits of
+  the **superframe header** hold the first frame's offset. Get that wrong and
+  every superframe is misparsed and `wma_decode_superframe` falls out of its
+  `fail:` label, whose statement is a bare `return -1` (`wmadec.c:992`). The
+  log's `(-1)` is that line and no other error path in the decoder — every
+  other one returns an `AVERROR` tag.
+
+  **It is a retry, not a table lookup, and that distinction is the point.**
+  xwma.c's table is now in `winegstreamer_unixlib_ios.c`
+  (`xwma_true_bit_rate`), but only as a CANDIDATE, because a table cannot be
+  trusted from this side: the same entry point also serves honest ASF WMA v2 —
+  that is the 44100 Hz stream that already worked — and "1ch 44100 Hz at
+  96 kbps" is both a row in that table and a perfectly ordinary real file.
+  Normalising unconditionally would have broken a working stream to fix a
+  broken one. So the decoder opens at the rate the media type reported, and
+  only if a packet fails **before any output has been produced** is it reopened
+  once at the normalised rate and the same packet retried. That cannot touch a
+  stream that already decodes, costs one reopen on one that does not, and logs
+  which rate won — so the next log states it rather than leaving it to be
+  inferred. The creation line now also carries `avg=`, `bitrate=` and
+  `flags2=`, the three numbers whose absence made u87 take a source read
+  instead of a glance.
+
+  **A host reproduction is only partial, and saying so matters.** FFmpeg's own
+  wmav2 ENCODER emits flags2 = 0x0001 — no bit reservoir, one frame per packet
+  — so it cannot produce a superframe stream to reproduce the device failure
+  exactly. What the host run does establish: that stream decoded with FAudio's
+  16-byte blob fails all 22 packets at every bit rate tried (flags mismatch,
+  as expected), and decodes cleanly with its own 10-byte blob. The bit-rate
+  sensitivity is read from libavcodec's source and from FFmpeg's own xWMA
+  fixup, not measured here, and the on-device retry is what will confirm it.
+
+  **Defect 2: a dropped packet is not silence.** FAudio's decode loop
+  (`FAudio_INTERNAL_DecodeWMAMF`) walks a voice with two independent cursors —
+  `samples_pos`, which advances by what the VOICE consumed, and `output_pos`,
+  by what the DECODER produced — and copies `output_buf + samples_pos`. That
+  buffer is sized from the xWMA **dpds** table, the byte count the stream
+  *promises*, and allocated with `pRealloc`, which does not zero. A decoder
+  that returns fewer bytes than promised therefore leaves the tail of it
+  holding whatever was in the heap, and a voice whose cursor has run past
+  `output_pos` reads exactly that. So a packet that fails now emits SILENCE of
+  the length it represented — the frame count of the last packet that did
+  decode, or failing that its share of `nAvgBytesPerSec` — instead of nothing
+  at all. The decoder's byte budget keeps matching the container's and the
+  failure is inaudible rather than being someone else's uninitialised memory.
+  The per-packet line is capped at 8 per decoder (u87 spent 4,762 identical
+  lines, which is a way to lose a device log) with a one-line summary at flush
+  and destroy.
+
+  **The test grew two stages** (`build/x86-tests/wma-x86.c`, exit codes
+  unchanged): B is 22050 Hz stereo at a low bit rate — the geometry of the
+  stream that failed — and C is the same bytes declared with the 48 kbit/s
+  figure xwma.c lists as a lie for that combination, which must still decode.
+
+  **What the next log should show.** The creation line for the 22050 Hz stereo
+  stream carrying its real `avg=`/`bitrate=`, then either no failures at all
+  or a single `no packet decoded at N bit/s … retrying at 32000 bit/s` followed
+  by `bit rate 32000 bit/s accepted; decoding resumed` — and at most eight
+  failure lines in the whole log whatever happens. The census peak should come
+  down off 65535.999; if it does not, the remaining garbage is not this
+  decoder, because a failed packet can now only contribute zeroes.
+
+- 2026-09-19 — **The 32-bit farm's `d3d11.dll` / `dxgi.dll` / `d3d10core.dll`
+  are now DXMT's, not wined3d's.** A 2012-era 32-bit title got as far as
+  loading `dxgi.dll`, `d3dcompiler_39` and `d3d11.dll` (log u93, lines
+  ~1911-1919) and then died on a NULL read in its own code. The reason was one
+  line of policy, not a bug: `.xtool/build-wine-i386.sh` built those three
+  from stock Wine *on purpose*, purely so `d3dx10_43 -> d3d10_1 -> d3d10core +
+  dxgi` closed. They are wined3d frontends, and **wined3d has no backend in
+  this port at all** — no OpenGL, and the tree is configured
+  `--without-vulkan` — so `D3D11CreateDevice` and `CreateDXGIFactory` could
+  only ever hand back failure. The title was reading the NULL it had been
+  given. The 64-bit farm has shipped DXMT's Metal-backed builds since the
+  start; the 32-bit farm now does too.
+
+  **Build.** `build/dxmt-ios/build-pe.sh` already compiled all three for i386
+  (the meson tree has known about `cpu_family == 'x86'` since §7.6); what it
+  did not do was install them, because §7's hand-off note said their 32-bit
+  unix-call dispatch was still open. It is not — it is the same winemetal
+  wow64 table the D3D9 path uses, audited below — so they joined the default
+  install set (`build-pe.sh:65-66`), release buildtype like the d3d9 module.
+  Stripped i386 sizes: **`d3d11.dll` 3,190,784**, **`dxgi.dll` 1,097,728**,
+  **`d3d10core.dll` 872,448** (Wine's were 704,512 / 409,600 / 53,248 — the
+  ratio is the whole Metal backend plus airconv). DXMT ships no `d3d10.dll` /
+  `d3d10_1.dll`; Wine's stay, and their entire import surface is
+  `D3D10CoreCreateDevice` + `CreateDXGIFactory`, both of which DXMT's modules
+  export, so the closure that motivated the old policy still holds — it is now
+  satisfied by modules that can actually create a device. `d3d12.dll`'s
+  `CreateDXGIFactory2` resolves too. `wined3d.dll` itself stays in the farm:
+  `d3d8` and `ddraw` still import it.
+
+  **Keeping Wine's out.** Three guards, all in `.xtool/build-wine-i386.sh`,
+  because the farm script has three independent paths that could re-create
+  them: `EXCLUDE` (`:82-87`, the name phase, seeded from the aarch64 farm's
+  listing), `NEVER_OVERWRITE` (`:81`, checked again in the breadth phase at
+  `:542` and a third time at install at `:640`), and a `SKIP_BREADTH_REASON`
+  entry (`:519`) so the run's policy-skip report says *why* rather than the
+  three modules just silently not appearing.
+
+  **The thunk audit, and what it found.** The 32-bit winemetal table
+  (`winemetal_unix.c:5281-5441`) turned out to need **no new entries**. All
+  151 slots are populated (127-144 are the reference tree's reserved NULLs,
+  which nothing in this tree can call — `wmt_api_names.h` prints them as
+  `<null slot>`), and the 13 slots the d3d11/dxgi path uses that the d3d9 path
+  never touched — 92 `CGColorSpace_checkColorSpaceSupported`, 94/95
+  `WMTGet{Primary,Secondary}DisplayId`, 96 `WMTGetDisplayDescription`, 97
+  `MetalLayer_getEDRValue`, 101 `WMTQueryDisplaySettingForLayer`, 104
+  `MTLSharedEvent_setWin32EventAtValue`, 108-110 `SharedEventListener_*`, 111
+  `WMTGetOSVersion`, 121/122 `WMTBootstrap{Register,LookUp}` — either already
+  have a `*32` variant (96, 97, 101) or carry no embedded pointer at all and
+  correctly share the 64-bit handler (`unixcall_bootstrap` holds its name in a
+  `char name[128]` inline array; `unixcall_get_os_version` is three
+  `uint64_t`; slot 104's `event_handle` is an NT HANDLE in a 64-bit field,
+  which zero-extends). The three command-chain thunks (36/37/38, §7.7 risk 6)
+  were re-checked against every `wmtcmd_*` struct rather than against the d3d9
+  call sites: exactly four carry a CPU payload pointer —
+  `wmtcmd_render_setbytes`, `wmtcmd_render_setviewports`,
+  `wmtcmd_render_setscissorrects`, `wmtcmd_compute_setbytes` — and
+  `wow_cmd_payload()` (`winemetal_unix.c:4659-4686`) handles all four. d3d11 is
+  the first caller to use the COMPUTE chain at all; its one payload command was
+  already there. The SM50 (DXBC) thunks are likewise the first thing d3d11
+  exercises that d3d9 did not — d3d9 goes through DXSO — and
+  `sm50_compilation_argument32_convert()` covers all seven argument types, with
+  `MTL_SHADER_REFLECTION` and `MTL_SM50_SHADER_ARGUMENT` both pointer-free.
+
+  **The one real gap was on the DXMT side, not in the table.**
+  `_MTLDevice_newBuffer32` refuses a CPU-visible buffer whose `memory.ptr` is
+  NULL, because the handler would then write `[buffer contents]` — a pointer
+  in Metal's own heap, outside the guest window — into a field a 32-bit caller
+  reads (§7.5). Stage 4 fixed every d3d9 allocation site for this;
+  `StagingBufferBlockAllocator` has a `placed_buffer` flag, and **three rings
+  pass it false**, all of them on the d3d11 path and all of them
+  `WMTResourceStorageModeManaged`, which `DXMT_IOS` remaps to **Shared**:
+  `CommandQueue::staging_allocator` (`dxmt_command_queue.cpp:25-28`),
+  `MTLD3D11CommandList::staging_allocator`
+  (`d3d11_context_impl.cpp:5351-5353`) and
+  `ResourceInitializer::gpu_command_heap_allocator`
+  (`dxmt_resource_initializer.cpp:50-52`). d3d9 sidestepped all three with its
+  own rings and said so (`d3d9_device.hpp:1597`, `d3d9_device.cpp:10799`); on
+  i386 they would each have got `STATUS_INVALID_ADDRESS` and, under the
+  release build's quiet `UNIX_CALL`, a **NULL `MTLBuffer` with no assertion**.
+  Private storage is not an alternative either: these blocks are filled by
+  `MTLBuffer_updateContents`, which memcpys into `[buffer contents]`, and that
+  is NULL for a Private buffer. So `StagingBufferBlockAllocator::allocate`
+  now forces the placed backing on `__i386__ && !DXMT_MADEIRA`
+  (`dxmt_ring_bump_allocator.hpp:209-236`), exactly as `Buffer::allocate`
+  (`dxmt_buffer.cpp:171-190`) and `Texture::allocate`
+  (`dxmt_texture.cpp:186-188`) already do. Nothing reads `mapped_address` on
+  those three rings, so the only cost is guest VA — which is why
+  `kStagingBlockSize` is already 8 MB on i386 instead of 32 MB. Every other
+  `newBuffer` call site was re-checked and was already correct:
+  `dummy_cbuffer_` supplies memory unconditionally, the occlusion-query
+  readback heap has its own `#ifdef __i386__`, `zero_buffer_` and
+  `copy_temp_allocator` are Private, and `Buffer::allocate` forces `CpuPlaced`.
+
+  **Mapped memory reaching the app.** Every `pMappedResource->pData` d3d11
+  hands out (`d3d11_context_imm.cpp:169-258`, `d3d11_context_def.cpp:175-257`)
+  comes from a `BufferAllocation`/`TextureAllocation` `mappedMemory`, and on
+  i386 those are this PE module's own heap — so they go through the
+  `allocate_virtual_memory` window chokepoint by construction and the 32-bit
+  process can dereference them. That was already true before this change
+  (`d3d11_buffer.cpp:92`, `d3d11_texture_dynamic.cpp:125`,
+  `dxmt_staging.cpp:80`); the test below is what turns "already true" into
+  "measured".
+
+  **DXGI vs the virtual monitor.** On i386 `src/util/meson.build`'s `else` arm
+  selects `wsi_monitor_win32.cpp` + `wsi_window_win32.cpp`, so output and mode
+  enumeration go out through user32 to the port's virtual monitor — the same
+  path `d3d9modes-x86.exe` already validates. `DXMT_IOS` is keyed on
+  `host_machine.system() == 'windows'` (§7.8) and therefore *is* defined for
+  i386, so `d3d11_swapchain.cpp:765-780` still forces visible/foregrounded and
+  never takes the fullscreen-exit branch.
+
+  **Test:** `build/x86-tests/d3d11-x86.c`, built by `build-d3d11-test.sh`
+  into **`d3d11-x86.exe`** (i386, no CRT, no dxguid; imports are exactly
+  `kernel32`/`user32`/`d3d11`/`dxgi`, asserted by the script, which also
+  refuses to run if the installed `d3d11.dll`/`dxgi.dll`/`d3d10core.dll` still
+  import `wined3d.dll`). It creates a 640x480 window, calls `CreateDXGIFactory`
+  directly and logs every adapter, then `D3D11CreateDeviceAndSwapChain`
+  (HARDWARE, feature levels 11_0/10_1/10_0, accepting >= 10_0), logs the
+  containing output's desktop rect and the first eight display modes, exercises
+  `ResizeTarget(640x480)` and `SetFullscreenState` both ways, creates a DYNAMIC
+  vertex buffer and `Map`s it `WRITE_DISCARD`, clears the RTV to
+  B=192 G=128 R=64 and `Present`s 30 frames, then reads the centre pixel back
+  through a STAGING texture `Map(READ)`. Exit **66** = pass, **67** = device
+  creation failed (HRESULT printed), **68** = a mapped pointer the 32-bit
+  process cannot reach, **69** = readback mismatch; 60-65 name the earlier
+  setup step that failed. The 68 check is the interesting one: inside a 32-bit
+  process every pointer is 32 bits wide, so a truncated host address cannot
+  show up as a large value — it shows up as a pointer naming nothing. The test
+  therefore asks **`VirtualQuery`** whether the span is `MEM_COMMIT`,
+  unguarded, writable and wholly inside one region, logs the region's base,
+  size, state and protection either way, and only then writes a pattern and
+  reads it back. A launch button ("D3D11 test", `ContentView.swift:3204-3208`)
+  sits below the live view; it can also be run from the Custom popup as
+  `C:\windows\syswow64\d3d11-x86.exe`.
+
+  **What the next device log should show.** `MADEIRA-D3D11: CreateDXGIFactory
+  hr=0x00000000` with at least one `adapter 0 vendor=... device=... vram_mb=...
+  name=...` line (a vendor or device id of 0 is what a period title reads as
+  "no adapter"), then `D3D11CreateDeviceAndSwapChain hr=0x00000000` and
+  `feature level hr=0x0000b000` (11_0). `GetContainingOutput` and
+  `GetDisplayModeList` must agree with the virtual monitor — the output rect
+  and the mode list should match what `d3d9modes-x86.exe` prints, and a mode
+  count of 0 means the user32 path is not seeing the monitor. `mapped pData`
+  should be a plain low address with `region state 0x00001000` (MEM_COMMIT)
+  and a read/write protection, followed by `dynamic buffer
+  map/write/readback/unmap OK`. Then 30 `present` lines at `hr=0x00000000`,
+  `staging RowPitch` at 2560 or more, and `pixel B=192 G=128 R=64 A=255`
+  before `PASS` / `MADEIRA-EXIT: d3d11-x86.exe status=66`. On the unix side
+  there must be **no** `winemetal: MTLDevice_newBuffer from a 32-bit caller
+  with no caller-supplied memory` line at all — one of those means another
+  allocation site was missed, and it names the length and options so the site
+  can be identified.

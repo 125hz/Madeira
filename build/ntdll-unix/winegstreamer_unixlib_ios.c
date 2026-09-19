@@ -75,6 +75,102 @@
  * different transform (CLSID_wg_resampler), the WMA MFT never advertises a
  * rate change, and silently resampling here would hide a negotiation bug as a
  * pitch bug.
+ *
+ * -------------------------------------------------------------------------
+ * xWMA AND ITS LYING BIT RATE   (device log u87, 2026-09-19)
+ * -------------------------------------------------------------------------
+ * The first device run decoded one stream and failed EVERY packet of another:
+ *
+ *   [wma] decoder created fmt=wmav2 tag=0x161 44100Hz 1ch block=139 extradata=10 ...
+ *   [wma] decoder created fmt=wmav2 tag=0x161 22050Hz 2ch block=1487 extradata=16 ...
+ *   [wma] avcodec_send_packet failed (-1), dropping 1487 bytes   x4762
+ *
+ * The two streams differ in where their codec-private data comes from, and
+ * that is the whole story.
+ *
+ * `extradata=10` is a REAL WMA v2 codec-private blob, the one an ASF header
+ * carries: {DWORD samples_per_block; WORD encode_options; DWORD
+ * super_block_align}.  libavcodec reads flags2 = AV_RL16(extradata + 4) out of
+ * it (libavcodec/wmadec.c wma_decode_init), which is `encode_options`, and
+ * that stream decodes.
+ *
+ * `extradata=16` is NOT codec-private data at all.  FAudio has none to give --
+ * an xWMA RIFF's `fmt ` chunk is a plain WAVEFORMATEX with no tail -- so
+ * FAudio_WMADEC_init INVENTS one:
+ *
+ *   static const uint8_t fake_codec_data[16] = {0,0,0,0,31,0,0,0,0,0,0,0,0,0,0,0};
+ *
+ * That is the right thing to do and the 31 is not arbitrary: FFmpeg's own xWMA
+ * demuxer writes the identical shape, six bytes with [4] = 31, over the
+ * comment "setup extradata with our experimentally obtained value"
+ * (libavformat/xwma.c).  flags2 = 31 means exp-VLC + bit reservoir + variable
+ * block length, which is what the Microsoft xWMA encoder produces -- and it is
+ * why block_align is 1487 rather than a couple of hundred bytes: with a bit
+ * reservoir a packet is a SUPERFRAME holding several 1024-sample frames.
+ *
+ * So the flags are right.  What is wrong is the bit rate, and xwma.c says so
+ * in as many words, right above the fixup this file now mirrors:
+ *
+ *   "XWMA encoder only allows a few channel/sample rate/bitrate combinations,
+ *    but some create identical files with fake bitrate (1ch 22050hz at
+ *    20/48/192kbps are all 20kbps, with the exact same codec data).
+ *    Decoder needs correct bitrate to work, so it's normalized here."
+ *
+ * 22050 Hz stereo -- our failing stream -- is one of the listed rows.  The
+ * bit rate is not cosmetic to libavcodec: ff_wma_init (libavcodec/wma.c)
+ * derives `bps` from it and then picks the coefficient VLC table
+ * (coef_vlc_table, wma.c:335-343), the high band start (high_freq, :149-181),
+ * whether noise coding is on (:111) and -- decisively for a bit-reservoir
+ * stream -- `byte_offset_bits` (:141), which is how many bits of the
+ * SUPERFRAME HEADER hold the offset of the first frame.  Get that wrong and
+ * every superframe is misparsed and wma_decode_superframe falls through to its
+ * `fail:` label, whose statement is a bare `return -1` (wmadec.c:992).  The
+ * log's `(-1)` is that exact line and no other error path in the decoder.
+ *
+ * WHAT THIS FILE DOES ABOUT IT, AND WHY IT IS A RETRY AND NOT A TABLE LOOKUP.
+ * xwma.c's table is applied here (xwma_true_bit_rate below), but only as a
+ * CANDIDATE, because a table cannot be trusted on its own from this side: the
+ * same entry point also serves honest ASF WMA v2 (that is the 44100 Hz stream
+ * that already worked), and "1ch 44100 Hz at 96 kbps" is both a row in that
+ * table and a perfectly ordinary real file.  So the decoder is opened with the
+ * bit rate the media type reported, and only if a packet FAILS BEFORE ANY
+ * OUTPUT HAS BEEN PRODUCED is it reopened once with the normalised rate and
+ * the same packet retried.  That is self-validating: it cannot touch a stream
+ * that already decodes, it costs one reopen on a stream that does not, and
+ * whichever rate wins is logged so the next device log states it as fact
+ * rather than leaving it to be inferred.
+ *
+ * A HOST REPRODUCTION IS ONLY PARTIAL, and the honest note is worth keeping:
+ * FFmpeg's own wmav2 ENCODER emits flags2 = 0x0001 -- no bit reservoir, one
+ * frame per packet -- so it cannot produce a superframe stream to reproduce
+ * the device failure exactly.  Decoding such a stream with flags2 = 31 fails
+ * every packet (verified), which confirms the flags path; the bit-rate
+ * sensitivity above is read from libavcodec's source and from FFmpeg's own
+ * xWMA fixup, not measured here.
+ *
+ * -------------------------------------------------------------------------
+ * A FAILED PACKET MUST STILL PRODUCE TIME
+ * -------------------------------------------------------------------------
+ * Dropping a packet silently is not the same as producing silence, and the
+ * difference is audible.  FAudio's decode loop
+ * (FAudio_INTERNAL_DecodeWMAMF) walks the voice with two independent cursors:
+ * `samples_pos`, which advances by what the VOICE consumed, and `output_pos`,
+ * which advances by what the DECODER produced, and it copies
+ * `output_buf + samples_pos`.  Its output buffer is sized from the xWMA dpds
+ * table -- the byte count the stream PROMISES -- and allocated with pRealloc,
+ * which does not zero.  A decoder that returns fewer bytes than the dpds table
+ * promised therefore leaves the tail of that buffer holding whatever was in
+ * the heap, and a voice whose cursor has run past `output_pos` reads it.
+ *
+ * So a packet that fails to decode now emits SILENCE of the length that packet
+ * represented (its share of nAvgBytesPerSec, or the frame count of the last
+ * packet that did decode) rather than nothing at all.  The decoder's byte
+ * budget then still matches the container's, and the failure is inaudible
+ * instead of being someone else's uninitialised memory.
+ *
+ * The per-packet failure line is capped at 8 per decoder -- the first run
+ * printed 4,762 identical lines, which is a way to lose a device log -- and a
+ * one-line summary is printed when the transform is flushed or destroyed.
  */
 
 #include "config.h"
@@ -108,6 +204,10 @@
 #define MADEIRA_WAVE_FORMAT_XMA1  0x0165
 #define MADEIRA_WAVE_FORMAT_XMA2  0x0166
 
+/* Per-decoder cap on the per-packet failure line; the rest are counted and
+ * reported once. */
+#define MADEIRA_WMA_MAX_FAIL_LOGS 8
+
 static const GUID madeira_MFMediaType_Audio =
     { 0x73647561, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
 
@@ -140,9 +240,20 @@ struct wma_transform
     AVPacket *packet;
     SwrContext *swr;
 
+    /* everything needed to REOPEN the decoder with a different bit rate */
+    enum AVCodecID codec_id;
+    BYTE *extradata;
+    UINT32 extradata_size;
+    UINT32 channel_mask;
+    INT64 bit_rate;         /* what the decoder is open with now */
+    INT64 bit_rate_alt;     /* xwma.c's normalised value, 0 if none applies */
+    BOOL alt_tried;
+    BOOL produced_output;
+
     UINT32 block_align;     /* input packet size, bytes */
     UINT32 rate;
     UINT32 in_channels;
+    UINT32 avg_bytes;       /* nAvgBytesPerSec, for the silence estimate */
 
     /* negotiated PCM output */
     enum AVSampleFormat out_sample_fmt;
@@ -169,6 +280,12 @@ struct wma_transform
     BOOL have_pts;
     BOOL draining;
     BOOL discontinuity;
+
+    /* failure accounting (see the header comment's last section) */
+    UINT32 fail_count;
+    UINT32 fail_logged;
+    UINT64 silence_frames;
+    UINT32 last_frames;     /* frames the last SUCCESSFUL packet produced */
 };
 
 /* The whole file logs with dprintf(2, ...) rather than ERR/TRACE: this unix
@@ -242,6 +359,43 @@ static void layout_from_mask( AVChannelLayout *layout, UINT32 mask, UINT32 chann
 }
 
 /***********************************************************************
+ *           xwma_true_bit_rate
+ *
+ * libavformat/xwma.c, verbatim: the (channels, sample rate, reported bit rate)
+ * combinations the Microsoft xWMA encoder is known to LIE about, and what the
+ * stream really is.  Returns 0 when the combination is not one of them.
+ *
+ * Kept as a candidate rather than applied unconditionally -- see the header
+ * comment: "1ch 44100 Hz at 96 kbps" is both a row here and an ordinary real
+ * ASF file, and this entry point serves both.
+ */
+static INT64 xwma_true_bit_rate( UINT32 channels, UINT32 rate, INT64 br )
+{
+    if (channels == 1)
+    {
+        if (rate == 22050 && (br == 48000 || br == 192000)) return 20000;
+        if (rate == 32000 && (br == 48000 || br == 192000)) return 20000;
+        if (rate == 44100 && (br == 96000 || br == 192000)) return 48000;
+    }
+    else if (channels == 2)
+    {
+        if (rate == 22050 && (br == 48000 || br == 192000)) return 32000;
+        if (rate == 32000 && br == 192000) return 48000;
+    }
+    return 0;
+}
+
+/* The flags word libavcodec reads out of WMA v1/v2 codec-private data
+ * (wmadec.c wma_decode_init).  Logged on creation because it is the single
+ * most useful number for diagnosing a stream that will not decode. */
+static UINT wma_flags2( enum AVCodecID id, const BYTE *ed, UINT32 n )
+{
+    if (id == AV_CODEC_ID_WMAV1 && n >= 4) return ed[2] | (ed[3] << 8);
+    if (id == AV_CODEC_ID_WMAV2 && n >= 6) return ed[4] | (ed[5] << 8);
+    return 0;
+}
+
+/***********************************************************************
  *           buffers
  */
 static BOOL buffer_reserve( BYTE **buf, size_t *cap, size_t need )
@@ -270,6 +424,54 @@ static void pcm_compact( struct wma_transform *transform )
              transform->pcm_len - transform->pcm_pos );
     transform->pcm_len -= transform->pcm_pos;
     transform->pcm_pos = 0;
+}
+
+/***********************************************************************
+ *           open_decoder
+ *
+ * Opens (or REOPENS) the libavcodec decoder at a given bit rate.  Everything
+ * it needs is kept on the transform, because the retry path below has to be
+ * able to build a second context after the media type is long gone.
+ */
+static int open_decoder( struct wma_transform *transform, INT64 bit_rate )
+{
+    AVCodecContext *avctx;
+    int err;
+
+    if (transform->avctx) avcodec_free_context( &transform->avctx );
+    swr_free( &transform->swr );
+
+    if (!(avctx = avcodec_alloc_context3( transform->codec ))) return AVERROR(ENOMEM);
+    avctx->sample_rate = transform->rate;
+    avctx->block_align = transform->block_align;
+    avctx->bit_rate = bit_rate;
+    /* bits_per_coded_sample is deliberately NOT set from the WAVEFORMATEX:
+     * wma_decoder.c's SetOutputType writes the OUTPUT sample size back into
+     * the input block (`wfx->wBitsPerSample = sample_size;`), so for a float
+     * output that field says 32, which is not the coded sample size.  No WMA
+     * decoder in libavcodec reads it -- they take everything from extradata,
+     * block_align and bit_rate -- so the honest value is none. */
+    layout_from_mask( &avctx->ch_layout, transform->channel_mask, transform->in_channels );
+
+    if (transform->extradata_size)
+    {
+        if (!(avctx->extradata = av_mallocz( transform->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE )))
+        {
+            avcodec_free_context( &avctx );
+            return AVERROR(ENOMEM);
+        }
+        memcpy( avctx->extradata, transform->extradata, transform->extradata_size );
+        avctx->extradata_size = transform->extradata_size;
+    }
+
+    if ((err = avcodec_open2( avctx, transform->codec, NULL )) < 0)
+    {
+        avcodec_free_context( &avctx );
+        return err;
+    }
+    transform->avctx = avctx;
+    transform->bit_rate = bit_rate;
+    return 0;
 }
 
 /***********************************************************************
@@ -333,7 +535,74 @@ static NTSTATUS append_frame( struct wma_transform *transform, AVFrame *frame )
         return STATUS_UNSUCCESSFUL;
     }
     transform->pcm_len += (size_t)converted * transform->out_frame_size;
+    if (converted > 0) transform->produced_output = TRUE;
     return STATUS_SUCCESS;
+}
+
+/* Silence of the length a packet that failed to decode represented, so the
+ * decoder's byte budget keeps matching the container's (see the header
+ * comment: FAudio indexes its own output buffer by the VOICE's cursor, and
+ * that buffer is not zeroed). */
+static NTSTATUS append_silence_for_packet( struct wma_transform *transform, size_t bytes )
+{
+    UINT32 frames = transform->last_frames;
+    size_t need;
+
+    /* Prefer the frame count of the last packet that DID decode -- exact for
+     * the constant-geometry WMA superframes xWMA uses.  Failing that, the
+     * packet's share of the stream's own byte rate, which is what a CBR
+     * container's block_align encodes. */
+    if (!frames && transform->avg_bytes)
+        frames = (UINT32)((UINT64)bytes * transform->rate / transform->avg_bytes);
+    if (!frames) return STATUS_SUCCESS;
+
+    need = transform->pcm_len + (size_t)frames * transform->out_frame_size;
+    if (!buffer_reserve( &transform->pcm_buf, &transform->pcm_cap, need ))
+        return STATUS_NO_MEMORY;
+    memset( transform->pcm_buf + transform->pcm_len, 0,
+            (size_t)frames * transform->out_frame_size );
+    transform->pcm_len += (size_t)frames * transform->out_frame_size;
+    transform->silence_frames += frames;
+    return STATUS_SUCCESS;
+}
+
+/* Feed one packet and drain whatever frames it produced.  Returns the
+ * libavcodec status of the send. */
+static int send_one_packet( struct wma_transform *transform, const BYTE *data, size_t size,
+                            NTSTATUS *status )
+{
+    UINT32 frames = 0;
+    int err;
+
+    /* The retry path below can leave this NULL if BOTH opens fail; a decoder
+     * that is gone must report that, not be called. */
+    if (!transform->avctx) return AVERROR(EINVAL);
+
+    /* av_new_packet zero-fills AV_INPUT_BUFFER_PADDING_SIZE past the end,
+     * which every bitstream reader in libavcodec reads past into. */
+    if ((err = av_new_packet( transform->packet, size )) < 0) return err;
+    memcpy( transform->packet->data, data, size );
+
+    err = avcodec_send_packet( transform->avctx, transform->packet );
+    av_packet_unref( transform->packet );
+    if (err < 0 && err != AVERROR(EAGAIN)) return err;
+
+    for (;;)
+    {
+        int ret = avcodec_receive_frame( transform->avctx, transform->frame );
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+        if (ret < 0)
+        {
+            WMA_LOG( "avcodec_receive_frame failed (%d)\n", ret );
+            break;
+        }
+        frames += transform->frame->nb_samples;
+        *status = append_frame( transform, transform->frame );
+        av_frame_unref( transform->frame );
+        if (*status) return 0;
+    }
+    if (frames) transform->last_frames = frames;
+    return 0;
 }
 
 /* Decode every whole block_align-sized packet currently staged.  `flush_tail`
@@ -348,6 +617,7 @@ static NTSTATUS decode_staged( struct wma_transform *transform, BOOL flush_tail 
     {
         size_t avail = transform->in_len - offset;
         size_t take = transform->block_align;
+        const BYTE *data;
         int err;
 
         if (avail < take)
@@ -355,35 +625,63 @@ static NTSTATUS decode_staged( struct wma_transform *transform, BOOL flush_tail 
             if (!flush_tail) break;
             take = avail;
         }
+        data = transform->in_buf + offset;
 
-        /* av_new_packet zero-fills AV_INPUT_BUFFER_PADDING_SIZE past the end,
-         * which every bitstream reader in libavcodec reads past into. */
-        if ((err = av_new_packet( transform->packet, take )) < 0) return STATUS_NO_MEMORY;
-        memcpy( transform->packet->data, transform->in_buf + offset, take );
-        offset += take;
+        err = send_one_packet( transform, data, take, &status );
+        if (status) return status;
 
-        err = avcodec_send_packet( transform->avctx, transform->packet );
-        av_packet_unref( transform->packet );
-        if (err < 0 && err != AVERROR(EAGAIN))
+        /* THE xWMA BIT-RATE RETRY (see the header comment).  Only before any
+         * output has been produced, and only once: a stream that has already
+         * decoded a frame has proved its parameters, and reopening under it
+         * would throw away the bit reservoir for no reason. */
+        if (err < 0 && !transform->produced_output && !transform->alt_tried &&
+            transform->bit_rate_alt && transform->bit_rate_alt != transform->bit_rate)
         {
-            /* A corrupt packet is not a fatal transform error: report it once
-             * and keep going, the way a decoder in a media pipeline does. */
-            WMA_LOG( "avcodec_send_packet failed (%d), dropping %zu bytes\n", err, take );
-            continue;
+            INT64 was = transform->bit_rate;
+
+            transform->alt_tried = TRUE;
+            if (!open_decoder( transform, transform->bit_rate_alt ))
+            {
+                WMA_LOG( "no packet decoded at %d bit/s; xWMA reports a fake rate for "
+                         "%uHz %uch, retrying at %d bit/s (libavformat/xwma.c)\n",
+                         (int)was, transform->rate, transform->in_channels,
+                         (int)transform->bit_rate_alt );
+                err = send_one_packet( transform, data, take, &status );
+                if (status) return status;
+                if (err >= 0)
+                    WMA_LOG( "bit rate %d bit/s accepted; decoding resumed\n",
+                             (int)transform->bit_rate );
+            }
+            else
+            {
+                /* Reopening failed outright: put the working context back so
+                 * the transform stays usable rather than becoming a NULL
+                 * decoder that faults on the next push. */
+                open_decoder( transform, was );
+            }
         }
 
-        for (;;)
+        offset += take;
+
+        if (err < 0)
         {
-            err = avcodec_receive_frame( transform->avctx, transform->frame );
-            if (err == AVERROR(EAGAIN) || err == AVERROR_EOF) break;
-            if (err < 0)
+            transform->fail_count++;
+            if (transform->fail_logged < MADEIRA_WMA_MAX_FAIL_LOGS)
             {
-                WMA_LOG( "avcodec_receive_frame failed (%d)\n", err );
-                break;
+                transform->fail_logged++;
+                WMA_LOG( "avcodec_send_packet failed (%d) on %zu bytes at %d bit/s "
+                         "(%uHz %uch block=%u flags2=%#x)%s\n",
+                         err, take, (int)transform->bit_rate, transform->rate,
+                         transform->in_channels, transform->block_align,
+                         wma_flags2( transform->codec_id, transform->extradata,
+                                     transform->extradata_size ),
+                         transform->fail_logged == MADEIRA_WMA_MAX_FAIL_LOGS
+                             ? " -- further failures counted only" : "" );
             }
-            status = append_frame( transform, transform->frame );
-            av_frame_unref( transform->frame );
-            if (status) return status;
+            /* Emit silence for this packet rather than dropping it: the
+             * container promised these bytes and FAudio's output buffer is not
+             * zeroed (header comment). */
+            if ((status = append_silence_for_packet( transform, take ))) return status;
         }
     }
 
@@ -393,6 +691,19 @@ static NTSTATUS decode_staged( struct wma_transform *transform, BOOL flush_tail 
         transform->in_len -= offset;
     }
     return status;
+}
+
+static void report_failures( struct wma_transform *transform )
+{
+    if (!transform->fail_count) return;
+    WMA_LOG( "%u packets failed to decode on transform %p (%llu frames of silence emitted "
+             "in their place), %uHz %uch block=%u at %d bit/s\n",
+             transform->fail_count, transform, (unsigned long long)transform->silence_frames,
+             transform->rate, transform->in_channels, transform->block_align,
+             (int)transform->bit_rate );
+    transform->fail_count = 0;
+    transform->fail_logged = 0;
+    transform->silence_frames = 0;
 }
 
 /***********************************************************************
@@ -450,9 +761,12 @@ static NTSTATUS transform_create( struct wg_transform_create_params *params )
     if (!(transform = calloc( 1, sizeof(*transform) ))) return STATUS_NO_MEMORY;
     pthread_mutex_init( &transform->lock, NULL );
     transform->magic = MADEIRA_WG_TRANSFORM_MAGIC;
+    transform->codec_id = codec_id;
     transform->block_align = in->nBlockAlign;
     transform->rate = in->nSamplesPerSec;
     transform->in_channels = in->nChannels;
+    transform->avg_bytes = in->nAvgBytesPerSec;
+    transform->channel_mask = channel_mask( in, params->input_type.format_size );
     transform->out_channels = out->nChannels;
     transform->out_sample_fmt = (out_tag == WAVE_FORMAT_IEEE_FLOAT) ? AV_SAMPLE_FMT_FLT
                                                                     : AV_SAMPLE_FMT_S16;
@@ -465,55 +779,48 @@ static NTSTATUS transform_create( struct wg_transform_create_params *params )
         goto nomem;
     memcpy( transform->out_format, out, transform->out_format_size );
 
-    if (!(transform->codec = avcodec_find_decoder( codec_id )))
-    {
-        WMA_LOG( "libavcodec has no decoder for codec id %d (tag %#x)\n", codec_id, in_tag );
-        goto unsupported;
-    }
-    if (!(transform->avctx = avcodec_alloc_context3( transform->codec ))) goto nomem;
-    if (!(transform->frame = av_frame_alloc())) goto nomem;
-    if (!(transform->packet = av_packet_alloc())) goto nomem;
-
-    transform->avctx->sample_rate = in->nSamplesPerSec;
-    transform->avctx->block_align = in->nBlockAlign;
-    transform->avctx->bit_rate = (int64_t)in->nAvgBytesPerSec * 8;
-    /* bits_per_coded_sample is deliberately NOT set from in->wBitsPerSample:
-     * wma_decoder.c's SetOutputType writes the OUTPUT sample size back into
-     * the input WAVEFORMATEX (`wfx->wBitsPerSample = sample_size;`), so for a
-     * float output that field says 32, which is not the coded sample size.
-     * No WMA decoder in libavcodec reads it -- they take everything from
-     * extradata, block_align and bit_rate -- so the honest value is none. */
-    layout_from_mask( &transform->avctx->ch_layout,
-                      channel_mask( in, params->input_type.format_size ), in->nChannels );
-
     /* The codec private data is the cbSize bytes that follow the WAVEFORMATEX
      * -- for WMA that is the decoder's flags/superframe configuration, and the
-     * decoder refuses to open without it. */
+     * decoder refuses to open without it.  Kept on the transform because the
+     * bit-rate retry has to reopen with it. */
     extra = in->cbSize;
     if (extra > params->input_type.format_size - sizeof(WAVEFORMATEX))
         extra = params->input_type.format_size - sizeof(WAVEFORMATEX);
     if (extra)
     {
-        if (!(transform->avctx->extradata = av_mallocz( extra + AV_INPUT_BUFFER_PADDING_SIZE )))
-            goto nomem;
-        memcpy( transform->avctx->extradata, (const BYTE *)in + sizeof(WAVEFORMATEX), extra );
-        transform->avctx->extradata_size = extra;
+        if (!(transform->extradata = malloc( extra ))) goto nomem;
+        memcpy( transform->extradata, (const BYTE *)in + sizeof(WAVEFORMATEX), extra );
+        transform->extradata_size = extra;
     }
 
-    if ((err = avcodec_open2( transform->avctx, transform->codec, NULL )) < 0)
+    if (!(transform->codec = avcodec_find_decoder( codec_id )))
     {
-        WMA_LOG( "avcodec_open2(%s) failed (%d)\n", transform->codec->name, err );
+        WMA_LOG( "libavcodec has no decoder for codec id %d (tag %#x)\n", codec_id, in_tag );
+        goto unsupported;
+    }
+    if (!(transform->frame = av_frame_alloc())) goto nomem;
+    if (!(transform->packet = av_packet_alloc())) goto nomem;
+
+    transform->bit_rate_alt = xwma_true_bit_rate( in->nChannels, in->nSamplesPerSec,
+                                                  (INT64)in->nAvgBytesPerSec * 8 );
+
+    if ((err = open_decoder( transform, (INT64)in->nAvgBytesPerSec * 8 )) < 0)
+    {
+        WMA_LOG( "avcodec_open2(%s) failed (%d) at %u bit/s\n", transform->codec->name, err,
+                 (UINT)in->nAvgBytesPerSec * 8 );
         goto unsupported;
     }
 
     params->transform = (wg_transform_t)(UINT_PTR)transform;
-    WMA_LOG( "decoder created fmt=%s tag=%#x %uHz %uch block=%u extradata=%u"
-             " -> pcm %s %uHz %uch %ubit (transform %p)\n",
+    WMA_LOG( "decoder created fmt=%s tag=%#x %uHz %uch block=%u avg=%uB/s bitrate=%d"
+             " extradata=%u flags2=%#x -> pcm %s %uHz %uch %ubit (transform %p)%s\n",
              transform->codec->name, in_tag, (UINT)in->nSamplesPerSec, (UINT)in->nChannels,
-             (UINT)in->nBlockAlign, extra,
+             (UINT)in->nBlockAlign, (UINT)in->nAvgBytesPerSec, (int)transform->bit_rate,
+             extra, wma_flags2( codec_id, transform->extradata, extra ),
              transform->out_sample_fmt == AV_SAMPLE_FMT_FLT ? "float32" : "s16",
              (UINT)out->nSamplesPerSec, (UINT)out->nChannels, (UINT)out->wBitsPerSample,
-             transform );
+             transform,
+             transform->bit_rate_alt ? " [xWMA fake-rate candidate available]" : "" );
     return STATUS_SUCCESS;
 
 nomem:
@@ -526,6 +833,7 @@ fail:
     if (transform->frame) av_frame_free( &transform->frame );
     if (transform->packet) av_packet_free( &transform->packet );
     av_channel_layout_uninit( &transform->out_layout );
+    free( transform->extradata );
     free( transform->out_format );
     pthread_mutex_destroy( &transform->lock );
     transform->magic = 0;
@@ -540,12 +848,14 @@ static NTSTATUS transform_destroy( wg_transform_t handle )
     if (!transform) return STATUS_INVALID_HANDLE;
 
     pthread_mutex_lock( &transform->lock );
+    report_failures( transform );
     transform->magic = 0;
     if (transform->swr) swr_free( &transform->swr );
     if (transform->avctx) avcodec_free_context( &transform->avctx );
     if (transform->frame) av_frame_free( &transform->frame );
     if (transform->packet) av_packet_free( &transform->packet );
     av_channel_layout_uninit( &transform->out_layout );
+    free( transform->extradata );
     free( transform->out_format );
     free( transform->in_buf );
     free( transform->pcm_buf );
@@ -839,7 +1149,7 @@ static NTSTATUS wma_transform_drain( void *args )
     pthread_mutex_lock( &transform->lock );
     transform->draining = TRUE;
     status = decode_staged( transform, TRUE );
-    if (!status)
+    if (!status && transform->avctx)
     {
         /* Flush the decoder's own lookahead, then the converter's. */
         int err;
@@ -854,6 +1164,7 @@ static NTSTATUS wma_transform_drain( void *args )
         }
         avcodec_flush_buffers( transform->avctx );
     }
+    report_failures( transform );
     pthread_mutex_unlock( &transform->lock );
     return status;
 }
@@ -864,6 +1175,7 @@ static NTSTATUS wma_transform_flush( void *args )
 
     if (!transform) return STATUS_INVALID_HANDLE;
     pthread_mutex_lock( &transform->lock );
+    report_failures( transform );
     transform->in_len = 0;
     transform->pcm_pos = transform->pcm_len = 0;
     transform->have_pts = FALSE;
