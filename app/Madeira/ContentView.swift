@@ -3,6 +3,7 @@ import UIKit
 import QuartzCore
 import Metal
 import os.log
+import GameController
 
 // 2026-07-03 window-hosted Metal layer.
 //
@@ -213,6 +214,28 @@ enum GuestDisplay {
 }
 
 /// Raw window-level host for the presenting CAMetalLayer.
+// ml1001 -- CONTROLLER EVENTS BELONG TO THE GAME, NOT TO THE FOCUS ENGINE.
+//
+// Since iOS 18 the system also turns game-controller input into UIKit/SwiftUI
+// focus navigation (the left stick moves focus, B is "back"), and a view
+// hierarchy that has not said otherwise only sees the ANALOGUE half of the pad
+// through GameController in brief bursts: device logs showed ~40 non-zero stick
+// samples in 25,000 while buttons arrived normally. `GCEventInteraction` is the
+// declaration that a view tree consumes the controller through the
+// GameController framework; SwiftUI's `handlesGameControllerEvents` is the same
+// thing one layer up. Installed on every view that fronts the game surface.
+// Below iOS 18 neither the behaviour nor the class exists, so this is a no-op.
+enum GamepadEventClaim {
+    static func install(on view: UIView) {
+        if #available(iOS 18.0, *) {
+            if view.interactions.contains(where: { $0 is GCEventInteraction }) { return }
+            let claim = GCEventInteraction()
+            claim.handledEventTypes = .gamepad
+            view.addInteraction(claim)
+        }
+    }
+}
+
 final class MetalHostView: UIView {
     // Process-lifetime singleton. The CAMetalLayer is registered with DXMT's
     // swapchain exactly once; if the host were recreated on view teardown
@@ -226,6 +249,7 @@ final class MetalHostView: UIView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         isUserInteractionEnabled = false   // touches fall through to SwiftUI
+        GamepadEventClaim.install(on: self)
         backgroundColor = .black
         contentScaleFactor = UIScreen.main.scale
         metalLayer.device = MTLCreateSystemDefaultDevice()
@@ -360,11 +384,13 @@ final class MetalBackedView: UIView {
         // lock is off. Harmless with no mouse: the interaction simply never
         // fires.
         addInteraction(UIPointerInteraction(delegate: PointerHider.shared))
+        GamepadEventClaim.install(on: self)
         installPointerFallback()
     }
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         addInteraction(UIPointerInteraction(delegate: PointerHider.shared))
+        GamepadEventClaim.install(on: self)
         installPointerFallback()
     }
 
@@ -2186,6 +2212,7 @@ final class ControlOverlayView: UIView {
         isExclusiveTouch = false
         isUserInteractionEnabled = true
         backgroundColor = .clear
+        GamepadEventClaim.install(on: self)
     }
     required init?(coder: NSCoder) { fatalError() }
 

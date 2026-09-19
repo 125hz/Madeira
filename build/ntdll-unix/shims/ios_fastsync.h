@@ -113,6 +113,35 @@
  * it and fall back to the server.  A live handle pins the event, and the event
  * pins the cell, so this only ever fires for the documented-undefined case of
  * operating on an already-closed handle.
+ *
+ * ml982: THE FOUR MODES OF MADEIRA_FASTSYNC
+ * -----------------------------------------
+ * The one env var now selects four points on a ladder, because the two halves
+ * of this mechanism have very different risk profiles and only the cheap half
+ * is worth having on by default:
+ *
+ *   "0" / "off" / "no"   NOTHING.  madeira_cell_alloc() answers -1 for every
+ *                        event, so event->signaled is the state again and this
+ *                        table is never touched by either side.  Byte for byte
+ *                        the pre-ml952 server and client.
+ *   unset  (the DEFAULT) CELLS ONLY.  The server keeps each event's state in
+ *                        its cell -- which is a pure relocation of one bit,
+ *                        since with no client participation signaled()/
+ *                        satisfied()/signal() read and write the cell exactly
+ *                        where they used to read and write `signaled' -- and
+ *                        the client uses it for ONE read-only thing: answering
+ *                        a zero-timeout wait that the word says is NOT
+ *                        signaled (MADEIRA_FS_POLLPEEK).  No wake semantics,
+ *                        no token can be consumed or minted off-server, so
+ *                        there is no lost- or double-wakeup to get wrong.
+ *   "auto"               CELLS + the client wake path, armed only once the
+ *                        task's own [srv-stats] window shows more event/select
+ *                        traffic than MADEIRA_FS_AUTO_REQS (20000 per 10 s).
+ *                        A quiet process (a launcher, a helper) never arms.
+ *   "1" / "on"           CELLS + the client wake path from the first call.
+ *
+ * The client half is what NtSetEvent/NtResetEvent/NtWaitForSingleObject route
+ * through; the server half is unconditional above "off".
  */
 
 #ifndef __IOS_FASTSYNC_H
@@ -167,6 +196,27 @@ extern struct madeira_sync_cell madeira_sync_cells[MADEIRA_SYNC_CELLS];
  * private extension with no protocol.def change: only the iOS client ever
  * sends it and only the iOS server ever accepts it. */
 #define MADEIRA_EVENT_OP_WAKE      0x4d415741   /* 'MAWA' */
+
+/* ml982: "TAKE THIS OBJECT OUT OF THE FAST PATH, PERMANENTLY."
+ *
+ * The self-heal half of the watchdog in ntdll/unix/sync.c.  When a client that
+ * has been waiting on an object finds the server saying "not signaled" while
+ * the shared word says SET -- the only shape of incoherence either side can
+ * actually observe -- it sends this, and the server runs exactly the code path
+ * a PulseEvent runs: event_sync_disable_cell(), which folds the cell's state
+ * back into `signaled', stores MADEIRA_CELL_DISABLED and wakes every parked
+ * client so they re-read it and go to the server.  From then on that ONE event
+ * behaves as it did before ml952 and every other event is untouched.
+ *
+ * A hang therefore degrades to a logged hiccup plus one permanently slower
+ * event, which is the direction this whole mechanism is supposed to fail in.
+ *
+ * Unlike the other opcodes this one is accepted on a SYNCHRONIZE handle: the
+ * thread that notices the incoherence is a WAITER, and a waiter is not
+ * required to hold EVENT_MODIFY_STATE.  It changes no observable event state
+ * (disable_cell copies the cell word into `signaled' and leaves it there), so
+ * it is not a state modification in the sense EVENT_MODIFY_STATE guards. */
+#define MADEIRA_EVENT_OP_DISABLE   0x4d414449   /* 'MADI' */
 
 /* ------------------------------------------------------------------------
  * The wake primitive, shared verbatim by both sides.

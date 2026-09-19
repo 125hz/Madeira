@@ -10373,6 +10373,22 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             (void*)REGn_sig(18, (ucontext_t*)sigcontext),
             (void*)bus_lr_val, bus_insn, bus_branch_insn,
             bus_pc_ok ? "" : " <unmappable PC>");
+        /* 2026-09-21: name the SP alignment fault. AArch64 raises one on any
+         * SP-based load/store executed while SP is not 16-byte aligned, and it
+         * surfaces as SIGBUS with a fault address of 0 or of SP itself — which
+         * reads exactly like a bad mapping and sent one investigation a long
+         * way round. An 8-mod-16 SP is legal here (the dispatch path into x64
+         * code pushes an x64-style return address), so the instruction is the
+         * bug, not the stack pointer. */
+        if (bus_pc_ok && (bus_insn & 0x0A000000) == 0x08000000 &&
+            (bus_insn & 0x3B000000) != 0x18000000 && ((bus_insn >> 5) & 0x1f) == 31)
+        {
+            uintptr_t bus_sp = (uintptr_t)SP_sig((ucontext_t*)sigcontext);
+            if (bus_sp & 15)
+                ERR("  [sp-align] insn 0x%08x uses SP as its base and sp=%p is %lu mod 16"
+                    " — SP alignment fault, not a bad mapping\n",
+                    bus_insn, (void*)bus_sp, (unsigned long)(bus_sp & 15));
+        }
         /* Dump Mach handler .data fault diagnostic (first fault only) */
         if (bus_count == 1 && ios_exc_data_fault_count > 0)
         {

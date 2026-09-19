@@ -788,7 +788,7 @@ static void ios_srv_stats_report( unsigned long long now )
 
     if (!total && !nt[IOS_NT_DELAY_ZERO] && !nt[IOS_NT_ALERT_WAIT] &&
         !nt[IOS_NT_FAST_HIT] && !nt[IOS_NT_FAST_MISS] && !nt[IOS_FS_LEARN_EVENT] &&
-        !nt[IOS_FS_LEARN_NONE] && !nt[IOS_FS_EVICT])
+        !nt[IOS_FS_LEARN_NONE] && !nt[IOS_FS_EVICT] && !nt[IOS_FS_POLLPEEK])
     {
         __atomic_store_n( &ios_srv_stats_busy, 0, __ATOMIC_RELEASE );
         return;
@@ -1007,12 +1007,15 @@ static void ios_srv_stats_report( unsigned long long now )
      * now unambiguous evidence that the counter is not wired, which is the
      * only reading that tells you to go and look at the call site. */
     {
-        static unsigned int fs_total[5];
+        static unsigned int fs_total[8];
         fs_total[0] += nt[IOS_FS_LEARN_EVENT];
         fs_total[1] += nt[IOS_FS_LEARN_NONE];
         fs_total[2] += nt[IOS_FS_RELEARN];
         fs_total[3] += nt[IOS_FS_STALE_GEN];
         fs_total[4] += nt[IOS_FS_EVICT];
+        fs_total[5] += nt[IOS_FS_POLLPEEK];
+        fs_total[6] += nt[IOS_FS_WATCHDOG];
+        fs_total[7] += nt[IOS_FS_DESYNC];
         wine_log_write( "[srv-stats]   fastsync cache: learn_ev=%u(%u) learn_none=%u(%u) "
                         "relearn=%u(%u) stale_gen=%u(%u) evict=%u(%u)",
                         nt[IOS_FS_LEARN_EVENT], fs_total[0],
@@ -1020,6 +1023,25 @@ static void ios_srv_stats_report( unsigned long long now )
                         nt[IOS_FS_RELEARN],     fs_total[2],
                         nt[IOS_FS_STALE_GEN],   fs_total[3],
                         nt[IOS_FS_EVICT],       fs_total[4] );
+        /* ml982: pollpeek is the request kind that is NOT in `reqs=' because it
+         * never happened -- so it is printed next to the w1 poll= count it came
+         * out of.  desync is the only number here that is ever alarming. */
+        wine_log_write( "[srv-stats]   fastsync served: pollpeek=%u(%u) [w1 poll left=%u] "
+                        "watchdog=%u(%u) desync=%u(%u)",
+                        nt[IOS_FS_POLLPEEK], fs_total[5], nt[IOS_SEL_WAIT1_POLL],
+                        nt[IOS_FS_WATCHDOG], fs_total[6],
+                        nt[IOS_FS_DESYNC],   fs_total[7] );
+
+        /* ml982: the "auto" rule.  This reporter is the only thing in the image
+         * that already knows the task's request rate, so the rule costs nothing
+         * of its own.  A no-op unless MADEIRA_FASTSYNC=auto. */
+        {
+            extern void madeira_fastsync_auto_arm( unsigned int ops, unsigned long long window_ns );
+            madeira_fastsync_auto_arm( nt[IOS_NT_SET_EVENT] + nt[IOS_NT_RESET_EVENT] +
+                                       nt[IOS_SEL_WAIT1_INF] + nt[IOS_SEL_WAIT1_FIN] +
+                                       nt[IOS_SEL_WAIT1_POLL] + nt[IOS_FS_POLLPEEK],
+                                       window_ns );
+        }
     }
 
 #undef IOS_SRV_APPEND
@@ -3291,6 +3313,13 @@ void server_init_process_done(void)
         extern uintptr_t ios_srv_game_teb;
         ios_srv_game_teb = (uintptr_t)NtCurrentTeb();
     }
+
+    /* ml982: this process owns no handles yet, so any entry in the shared
+     * handle -> cell cache that carries OUR pid is a ghost left behind by a
+     * dead pseudo-process whose id the server has since reissued to us.  See
+     * madeira_fast_flush_pid() in ntdll/unix/sync.c for why that is a
+     * correctness problem and not just a leak. */
+    madeira_fast_flush_pid();
 
     if (!get_device_info( initial_cwd, &info ) && (info.Characteristics & FILE_REMOVABLE_MEDIA))
         chdir( "/" );

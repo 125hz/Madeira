@@ -2873,28 +2873,104 @@ volatile int ios_fex_rip_resolved = 0;
  * and size, and ios_pe_module_name() names them. Find the emulator module, walk its
  * export directory, done. Returns NULL (and says so) if anything is missing, so a failed
  * resolve can never be mistaken for "the lookup ran and found nothing". */
-static void *ios_pe_find_export( const unsigned char *base, const char *want )
+/* 2026-09-21: every read below goes through mach_vm_read_overwrite.
+ *
+ * The walk used to dereference the guest image directly. Its callers include
+ * the sampler thread, which runs asynchronously to the guest processes it
+ * reports on, so the image could be — and was — unmapped between the mapping
+ * table lookup and the header read: the profiler took a SEGV on the DOS
+ * signature of a module whose process had just exited, on a thread with no TEB,
+ * and the follow-up fault killed the app. mach_vm_read_overwrite reports an
+ * unreadable page as a failure instead of raising one, and every offset is
+ * bounds-checked against the mapping size the way the module-name reader is. */
+static int ios_pe_safe_read( uint64_t addr, void *buf, size_t len )
 {
-    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)base;
-    const IMAGE_NT_HEADERS64 *nt;
-    const IMAGE_EXPORT_DIRECTORY *exp;
-    const DWORD *names, *funcs;
-    const WORD *ords;
-    DWORD i, va, sz;
+    mach_vm_size_t got = 0;
+    if (!addr || !len) return 0;
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)addr, len,
+                                (mach_vm_address_t)buf, &got ) != KERN_SUCCESS)
+        return 0;
+    return got == len;
+}
 
-    if (!base || dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
-    nt = (const IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return NULL;
-    va = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-    sz = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
-    if (!va || !sz) return NULL;
-    exp = (const IMAGE_EXPORT_DIRECTORY *)(base + va);
-    names = (const DWORD *)(base + exp->AddressOfNames);
-    ords  = (const WORD  *)(base + exp->AddressOfNameOrdinals);
-    funcs = (const DWORD *)(base + exp->AddressOfFunctions);
-    for (i = 0; i < exp->NumberOfNames; i++)
-        if (!strcmp( (const char *)(base + names[i]), want ))
-            return (void *)(base + funcs[ords[i]]);
+/* Bounded, fault-proof copy of a mapped PE's export-directory Name into `out`.
+ * Returns 0 and leaves `out` empty when anything is malformed or unreadable. */
+static int ios_pe_module_name_safe( const void *image_base, size_t image_size,
+                                    char *out, size_t outlen )
+{
+    uint64_t b = (uint64_t)(uintptr_t)image_base;
+    uint32_t lfanew = 0, exp_rva = 0, name_rva = 0, sig = 0;
+    uint16_t mz = 0, magic = 0;
+    size_t cap, i;
+
+    if (outlen) out[0] = 0;
+    if (!b || image_size < 0x100 || outlen < 2) return 0;
+    if (!ios_pe_safe_read( b, &mz, 2 ) || mz != 0x5a4d) return 0;
+    if (!ios_pe_safe_read( b + 0x3c, &lfanew, 4 )) return 0;
+    if ((size_t)lfanew + 0x90 > image_size) return 0;
+    if (!ios_pe_safe_read( b + lfanew, &sig, 4 ) || sig != 0x00004550) return 0;
+    if (!ios_pe_safe_read( b + lfanew + 0x18, &magic, 2 ) || magic != 0x20b) return 0;
+    if (!ios_pe_safe_read( b + lfanew + 0x88, &exp_rva, 4 )) return 0;
+    if (!exp_rva || (size_t)exp_rva + 0x10 > image_size) return 0;
+    if (!ios_pe_safe_read( b + exp_rva + 0x0c, &name_rva, 4 )) return 0;
+    if (!name_rva || (size_t)name_rva + 1 > image_size) return 0;
+
+    cap = image_size - name_rva;
+    if (cap > outlen - 1) cap = outlen - 1;
+    /* Chunked: one read of the whole span would fail outright if its tail
+     * crossed into an unmapped page, even when the NUL is in the first bytes. */
+    for (i = 0; i < cap; i += 16)
+    {
+        size_t n = cap - i < 16 ? cap - i : 16, k;
+        if (!ios_pe_safe_read( b + name_rva + i, out + i, n )) break;
+        for (k = 0; k < n; k++) if (!out[i + k]) return 1;
+    }
+    out[0] = 0;
+    return 0;                                   /* no NUL inside the image */
+}
+
+static void *ios_pe_find_export( const unsigned char *base, size_t image_size,
+                                 const char *want )
+{
+    uint64_t b = (uint64_t)(uintptr_t)base;
+    uint32_t lfanew = 0, sig = 0, exp_rva = 0, exp_sz = 0;
+    uint32_t nnames = 0, funcs_rva = 0, names_rva = 0, ords_rva = 0, i;
+    uint16_t mz = 0, magic = 0;
+    size_t wlen = strlen( want );
+    char nm[160];
+
+    if (!b || image_size < 0x100 || wlen + 1 > sizeof(nm)) return NULL;
+    if (!ios_pe_safe_read( b, &mz, 2 ) || mz != 0x5a4d) return NULL;
+    if (!ios_pe_safe_read( b + 0x3c, &lfanew, 4 )) return NULL;
+    if ((size_t)lfanew + 0x90 > image_size) return NULL;
+    if (!ios_pe_safe_read( b + lfanew, &sig, 4 ) || sig != 0x00004550) return NULL;
+    if (!ios_pe_safe_read( b + lfanew + 0x18, &magic, 2 ) || magic != 0x20b) return NULL;
+    if (!ios_pe_safe_read( b + lfanew + 0x88, &exp_rva, 4 )) return NULL;
+    if (!ios_pe_safe_read( b + lfanew + 0x8c, &exp_sz, 4 )) return NULL;
+    if (!exp_rva || !exp_sz || (size_t)exp_rva + 0x28 > image_size) return NULL;
+    if (!ios_pe_safe_read( b + exp_rva + 0x18, &nnames, 4 )) return NULL;
+    if (!ios_pe_safe_read( b + exp_rva + 0x1c, &funcs_rva, 4 )) return NULL;
+    if (!ios_pe_safe_read( b + exp_rva + 0x20, &names_rva, 4 )) return NULL;
+    if (!ios_pe_safe_read( b + exp_rva + 0x24, &ords_rva, 4 )) return NULL;
+    if (nnames > 0x20000) return NULL;                       /* bound the walk */
+    if ((size_t)names_rva + 4ull * nnames > image_size) return NULL;
+    if ((size_t)ords_rva  + 2ull * nnames > image_size) return NULL;
+
+    for (i = 0; i < nnames; i++)
+    {
+        uint32_t nrva = 0, frva = 0;
+        uint16_t ord = 0;
+
+        if (!ios_pe_safe_read( b + names_rva + 4ull * i, &nrva, 4 )) return NULL;
+        if (!nrva || (size_t)nrva + wlen + 1 > image_size) continue;
+        if (!ios_pe_safe_read( b + nrva, nm, wlen + 1 )) continue;
+        if (nm[wlen] || memcmp( nm, want, wlen )) continue;
+        if (!ios_pe_safe_read( b + ords_rva + 2ull * i, &ord, 2 )) return NULL;
+        if ((size_t)funcs_rva + 4ull * ord + 4 > image_size) return NULL;
+        if (!ios_pe_safe_read( b + funcs_rva + 4ull * ord, &frva, 4 )) return NULL;
+        if (!frva || (size_t)frva >= image_size) return NULL;
+        return (void *)(uintptr_t)(b + frva);
+    }
     return NULL;
 }
 
@@ -2925,17 +3001,19 @@ void *ios_prof_find_fex_export( const char *name )
     {
         const unsigned char *pe  = ios_jit_mappings[i].pe_base;
         const unsigned char *jit = ios_jit_mappings[i].jit_base;
-        const char *nm;
+        size_t sz = ios_jit_mappings[i].size;
+        char nm[160];
         void *addr;
 
-        if (!pe || !ios_jit_mappings[i].size) continue;
-        nm = ios_pe_module_name( ios_jit_mappings[i].pe_base, ios_jit_mappings[i].size );
-        if (!nm) continue;
+        if (!pe || !sz) continue;
+        /* Safe name read: this runs on the sampler thread, where the image may
+         * already be gone (see ios_pe_safe_read). */
+        if (!ios_pe_module_name_safe( pe, sz, nm, sizeof(nm) )) continue;
         if (!strstr( nm, "wow64fex" ) && !strstr( nm, "xtajit" ) &&
             !strstr( nm, "arm64ecfex" )) continue;
 
-        if (jit && (addr = ios_pe_find_export( jit, name ))) return addr;
-        if ((addr = ios_pe_find_export( pe, name ))) return addr;
+        if (jit && (addr = ios_pe_find_export( jit, sz, name ))) return addr;
+        if ((addr = ios_pe_find_export( pe, sz, name ))) return addr;
     }
     return NULL;
 }
@@ -2974,8 +3052,10 @@ void ios_resolve_fex_exports( void )
         if (!nm) continue;
         if (!strstr( nm, "xtajit64" ) && !strstr( nm, "arm64ecfex" )) continue;
 
-        rip_cb = ios_pe_find_export( ios_jit_mappings[i].pe_base, "BTCpu64IosRipFromHostPC" );
-        rel_cb = ios_pe_find_export( ios_jit_mappings[i].pe_base, "BTCpu64IosReleaseThreadHolds" );
+        rip_cb = ios_pe_find_export( ios_jit_mappings[i].pe_base, ios_jit_mappings[i].size,
+                                     "BTCpu64IosRipFromHostPC" );
+        rel_cb = ios_pe_find_export( ios_jit_mappings[i].pe_base, ios_jit_mappings[i].size,
+                                     "BTCpu64IosReleaseThreadHolds" );
 
         /* Record the addresses for diagnostics. */
         if (rip_cb) ios_fex_rip_from_hostpc_cb = (void *)rip_cb;
@@ -4157,16 +4237,68 @@ static int ios_insn_x18_role(uint32_t insn)
     return X18_ROLE_NONE;
 }
 
-/* Replace x18 in an instruction with a different register */
-static uint32_t ios_insn_replace_x18(uint32_t insn, int role, int scratch)
+/* Statistics only: does this instruction have a general-purpose destination
+ * register that is distinct from every other register it reads?  Such a site
+ * could be trampolined with the destination as the scratch; everything else
+ * (stores, prefetches, SIMD transfers, flag-setting compares, register-offset
+ * loads whose destination IS the index) could not.  The emitter below does not
+ * need the distinction -- it uses x18 itself -- but the split is worth logging
+ * because it is exactly the population the old spill-based emitter could have
+ * handled without touching SP. */
+static int ios_x18_insn_has_free_dest(uint32_t insn, int role)
 {
-    switch (role)
+    int rt  = insn & 0x1f;
+    int rn  = (insn >> 5) & 0x1f;
+    int rm  = (insn >> 16) & 0x1f;
+    int rt2 = (insn >> 10) & 0x1f;
+    uint32_t top8  = insn >> 24;
+    uint32_t top11 = insn >> 21;
+    int v    = (insn >> 26) & 1;
+    int size = (insn >> 30) & 3;
+    int opc  = (insn >> 22) & 3;
+
+    if (rt == 31) return 0;                       /* xzr/sp -- nothing freed */
+
+    /* LDR/STR, unsigned 12-bit immediate offset */
+    if ((top8 & 0x3F) == 0x39 || (top8 & 0x3F) == 0x3D)
+        return !v && opc != 0 && !(size == 3 && opc == 2) && role == X18_ROLE_RN;
+
+    /* LDR/STR, register offset */
+    if ((top11 & 0x1F9) == 0x1C1 && ((insn >> 10) & 3) == 2)
     {
-    case X18_ROLE_RN:  return (insn & ~(0x1f << 5)) | (scratch << 5);
-    case X18_ROLE_RM:  return (insn & ~(0x1f << 16)) | (scratch << 16);
-    case X18_ROLE_RT2: return (insn & ~(0x1f << 10)) | (scratch << 10);
-    default:           return insn;
+        if (v || opc == 0 || (size == 3 && opc == 2)) return 0;
+        return (role == X18_ROLE_RN) ? (rt != rm) : (rt != rn);
     }
+
+    /* LDP/STP: load, vector-free, no write-back, two distinct destinations */
+    if ((top8 & 0x3E) == 0x28)
+    {
+        int wback = ((insn >> 23) & 3) == 1 || ((insn >> 23) & 3) == 3;
+        return !v && ((insn >> 22) & 1) && !wback && rt != rt2 && role == X18_ROLE_RN;
+    }
+
+    /* MOV (register) = ORR Xd|Wd, ZR, x18 */
+    if ((top11 & 0x7FF) == 0x150 || (top11 & 0x7FF) == 0x550) return role == X18_ROLE_RM;
+
+    /* ADD/SUB immediate (ADDS/SUBS with an xzr destination already rejected) */
+    if ((top8 & 0x5F) == 0x11) return role == X18_ROLE_RN;
+
+    /* ADD/SUB register */
+    if ((top8 & 0x5F) == 0x0B)
+        return (role == X18_ROLE_RN) ? (rt != rm) : (rt != rn);
+
+    return 0;
+}
+
+/* Self-check for the emitted trampoline words: on AArch64 an SP-based load or
+ * store raises an SP alignment fault whenever SP is not 16-byte aligned, and a
+ * misaligned SP is a normal, legal state here (see the emitter's comment).  No
+ * word of a trampoline may therefore use register 31 as its address base. */
+static int ios_x18_word_uses_sp_base(uint32_t w)
+{
+    if ((w & 0x0A000000) != 0x08000000) return 0;     /* not a load/store */
+    if ((w & 0x3B000000) == 0x18000000) return 0;     /* load literal: no Rn field */
+    return ((w >> 5) & 0x1f) == 31;
 }
 
 /* Patch all x18 references in a PE .text section.
@@ -4235,8 +4367,21 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
     int count = 0;
     int skipped = 0;
     int lit_skipped = 0;
+    int sp_refused = 0;
+    int free_dest = 0, no_free_dest = 0;
     unsigned char *data_map = NULL;
     extern int ios_teb_tls_slot_offset;
+    const int slot_off = ios_teb_tls_slot_offset;
+
+    /* Without the TSD slot offset every trampoline would load its TEB from
+     * <tsd base>+0, i.e. garbage. Leaving .text alone is correct but slow (the
+     * Mach handler emulates each x18 access), so refuse rather than patch. */
+    if (!slot_off)
+    {
+        dprintf(2, "[x18-tramp] REFUSED: TEB TSD slot offset not published yet — "
+                   ".text %p left unpatched\n", text_rx);
+        return 0;
+    }
 
     /* B/BL reach guard (Steam S3 run 11 root cause): imm26 spans ±128MB.
      * The patcher used to encode out-of-range tramp offsets silently
@@ -4351,110 +4496,142 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
         role = ios_insn_x18_role(insn);
         if (role == X18_ROLE_NONE) continue;
 
-        /* Determine scratch register — use x17 normally.
-         * Avoid conflicts with instruction's other register operands. */
-        int scratch = 17;
-        int rt = insn & 0x1f;
-        int rn = (insn >> 5) & 0x1f;
-        int rm = (insn >> 16) & 0x1f;
-        if (rt == 17 || rn == 17 || rm == 17) scratch = 16;
-        /* Double-check: if both x16 and x17 are used, skip (extremely rare) */
-        if (scratch == 16 && (rt == 16 || rn == 16 || rm == 16))
         {
-            skipped++;
-            continue;
-        }
+            int rm = (insn >> 16) & 0x1f;
+            uint32_t words[8];
+            int nw = 0, w;
 
-        /* Check trampoline space (max 6 instructions = 24 bytes per trampoline) */
-        if (tramp_off + 24 > tramp_size)
-        {
-            ERR("x18 patcher: out of trampoline space at %d patches\n", count);
-            break;
-        }
-
-        uintptr_t insn_rx = (uintptr_t)(text_rx + i);
-        uintptr_t tramp_rx_addr = (uintptr_t)(tramp_rx + tramp_off);
-        uintptr_t return_rx = insn_rx + 4;
-
-        /* TEB load sequence (3 instructions, uses TPIDRRO_EL0 which iOS preserves):
-         *   mrs xSCRATCH, TPIDRRO_EL0
-         *   and xSCRATCH, xSCRATCH, #~7   (clear CPU number from low 3 bits)
-         *   ldr xSCRATCH, [xSCRATCH, #SLOT_OFFSET]  (load TEB from TLS slot)
-         */
-        extern int ios_teb_tls_slot_offset;
-        int slot_off = ios_teb_tls_slot_offset;
-
-        /* Check if this is MOV xN, x18 (special case — load TEB directly into dest) */
-        int is_mov_from_x18 = (role == X18_ROLE_RM) &&
-            ((insn & 0xFFE0FFE0) == 0xAA0003E0) && rm == 18;
-
-        if (is_mov_from_x18)
-        {
-            int rd = insn & 0x1f;
-            /* mrs xRd, TPIDRRO_EL0 */
-            *(uint32_t *)(tramp_rw + tramp_off) = 0xD53BD060 | rd;
-            tramp_off += 4;
-            /* and xRd, xRd, #~7 (immediate: 0xFFFFFFFFFFFFFFF8 = immr=0 imms=0x3C) */
-            *(uint32_t *)(tramp_rw + tramp_off) = 0x927DF000 | (rd << 5) | rd;
-            tramp_off += 4;
-            /* ldr xRd, [xRd, #slot_off] */
-            *(uint32_t *)(tramp_rw + tramp_off) = 0xF9400000 | ((slot_off / 8) << 10) | (rd << 5) | rd;
-            tramp_off += 4;
-        }
-        else
-        {
-            /* Check trampoline space (7 instructions = 28 bytes) */
-            if (tramp_off + 32 > tramp_size)
+            /* Check trampoline space (worst case 5 instructions = 20 bytes) */
+            if (tramp_off + 24 > tramp_size)
             {
                 ERR("x18 patcher: out of trampoline space at %d patches\n", count);
                 break;
             }
-            /* str xSCRATCH, [sp, #-16]! */
-            *(uint32_t *)(tramp_rw + tramp_off) = (scratch == 17) ? 0xF81F0FF1 : 0xF81F0FF0;
-            tramp_off += 4;
-            /* mrs xSCRATCH, TPIDRRO_EL0 */
-            *(uint32_t *)(tramp_rw + tramp_off) = 0xD53BD060 | scratch;
-            tramp_off += 4;
-            /* and xSCRATCH, xSCRATCH, #~7 */
-            *(uint32_t *)(tramp_rw + tramp_off) = 0x927DF000 | (scratch << 5) | scratch;
-            tramp_off += 4;
-            /* ldr xSCRATCH, [xSCRATCH, #slot_off] */
-            *(uint32_t *)(tramp_rw + tramp_off) = 0xF9400000 | ((slot_off / 8) << 10) | (scratch << 5) | scratch;
-            tramp_off += 4;
-            /* Modified instruction with x18 replaced by scratch */
-            *(uint32_t *)(tramp_rw + tramp_off) = ios_insn_replace_x18(insn, role, scratch);
-            tramp_off += 4;
-            /* ldr xSCRATCH, [sp], #16 */
-            *(uint32_t *)(tramp_rw + tramp_off) = (scratch == 17) ? 0xF84107F1 : 0xF84107F0;
-            tramp_off += 4;
+
+            uintptr_t insn_rx = (uintptr_t)(text_rx + i);
+            uintptr_t tramp_rx_addr = (uintptr_t)(tramp_rx + tramp_off);
+            uintptr_t return_rx = insn_rx + 4;
+
+            /* Check if this is MOV xN, x18 (special case — load TEB directly into dest) */
+            int is_mov_from_x18 = (role == X18_ROLE_RM) &&
+                ((insn & 0xFFE0FFE0) == 0xAA0003E0) && rm == 18;
+
+            if (ios_x18_insn_has_free_dest(insn, role)) free_dest++; else no_free_dest++;
+
+            /* TEB load sequence (uses TPIDRRO_EL0, which iOS preserves):
+             *   mrs xT, TPIDRRO_EL0
+             *   and xT, xT, #~7                (clear CPU number from low 3 bits)
+             *   ldr xT, [xT, #SLOT_OFFSET]     (TEB out of our pthread TSD slot)
+             *
+             * THE SCRATCH IS x18 ITSELF (2026-09-21).
+             *
+             * The emitter used to spill a scratch register with
+             * `str x16, [sp,#-16]!` / `ldr x16, [sp],#16`.  That is fatal on
+             * this platform: AArch64 raises an SP alignment fault on ANY
+             * SP-based memory access taken while SP is not 16-byte aligned,
+             * and an 8-mod-16 SP is a legal, expected state -- the dispatch
+             * path from native ARM64EC code into x64 code pushes an x64-style
+             * return address before it reads the TEB.  The push therefore
+             * faulted (BUS, fault address 0) on the first such call in any
+             * x86-64 process, and the fault landed inside a trampoline, where
+             * recovery is hardest.  Note only SP-based *accesses* fault; `sub`
+             * / `add` on SP do not, but SP cannot be realigned without a
+             * scratch register, and SP cannot be read into one without a
+             * scratch register either -- the trampoline has to avoid SP
+             * entirely, which means it has to find a free register.
+             *
+             * There is no register that is provably dead at an arbitrary
+             * mid-function patch site: x16/x17 are call-clobbered veneer
+             * registers, but the dispatch sequences that reach these very
+             * instructions keep both live.  Deriving the scratch from the
+             * patched instruction's own destination works for plain loads and
+             * for ADD/MOV, but not for stores, prefetches, SIMD transfers or
+             * compares -- and no per-thread spill slot can help, because
+             * reaching one (through TPIDRRO_EL0) already needs the scratch.
+             *
+             * x18 resolves it with no spill at all.  x18 is the register the
+             * whole pass exists to eliminate: this platform zeroes it at every
+             * context switch and signal return, so no code may rely on its
+             * contents, and every read of it inside .text is what we are
+             * rewriting.  Loading the TEB into x18 lets the ORIGINAL
+             * instruction run unmodified, and it is strictly beneficial
+             * elsewhere: sites this pass skips (literal-pool words, addressing
+             * modes it does not decode) then see a correct TEB instead of zero,
+             * and the diagnostics that treat a page-aligned non-zero x18 as
+             * "this thread's TEB" become right more often.
+             *
+             * Interruption is self-healing.  A signal delivered part way
+             * through a trampoline returns with x18 zeroed, so the original
+             * instruction faults exactly as an unpatched one would and the
+             * existing x18==0 emulator in the Mach handler completes it with
+             * the thread's real TEB.  The old emitter had no such property: a
+             * signal there left a half-restored x16/x17. */
+            if (is_mov_from_x18)
+            {
+                int rd = insn & 0x1f;
+                words[nw++] = 0xD53BD060 | rd;                  /* mrs xRd, TPIDRRO_EL0 */
+                words[nw++] = 0x927DF000 | (rd << 5) | rd;      /* and xRd, xRd, #~7    */
+                words[nw++] = 0xF9400000 | ((slot_off / 8) << 10) | (rd << 5) | rd;
+            }
+            else
+            {
+                words[nw++] = 0xD53BD060 | 18;                  /* mrs x18, TPIDRRO_EL0 */
+                words[nw++] = 0x927DF000 | (18 << 5) | 18;      /* and x18, x18, #~7    */
+                words[nw++] = 0xF9400000 | ((slot_off / 8) << 10) | (18 << 5) | 18;
+                words[nw++] = insn;                             /* unchanged: x18 IS the TEB now */
+            }
+
+            /* Branch back to the instruction after the patched one */
+            {
+                intptr_t ret_delta = (intptr_t)return_rx
+                                   - (intptr_t)(tramp_rx_addr + (uintptr_t)nw * 4);
+                words[nw++] = 0x14000000 | ((ret_delta >> 2) & 0x3FFFFFF);
+            }
+
+            /* Self-check: refuse to install a trampoline that would take an SP
+             * alignment fault.  The copied original can trip this when it is
+             * itself SP-based (`ldr x0,[sp,x18]`); leaving such a site
+             * unpatched is the documented safe degradation. */
+            for (w = 0; w < nw; w++) if (ios_x18_word_uses_sp_base(words[w])) break;
+            if (w < nw)
+            {
+                if (sp_refused < 4)
+                    ERR("x18 patcher: REFUSED text+0x%lx orig=0x%08x — emitted word %d "
+                        "(0x%08x) is SP-based\n", (unsigned long)i, insn, w, words[w]);
+                sp_refused++;
+                continue;
+            }
+
+            for (w = 0; w < nw; w++)
+                *(uint32_t *)(tramp_rw + tramp_off + (size_t)w * 4) = words[w];
+            tramp_off += (size_t)nw * 4;
+
+            /* Patch original instruction: B <trampoline> */
+            intptr_t fwd_delta = (intptr_t)tramp_rx_addr - (intptr_t)insn_rx;
+            uint32_t b_insn = 0x14000000 | ((fwd_delta >> 2) & 0x3FFFFFF);
+            *(uint32_t *)(text_rw + i) = b_insn;
+
+            if (count < 2)
+            {
+                ERR("  patch[%d]: text+0x%lx orig=0x%08x → B 0x%08x delta=%ld slot_off=0x%x\n",
+                    count, (unsigned long)i, insn, b_insn, (long)fwd_delta, slot_off);
+                for (w = 0; w < nw; w++) ERR("    tramp[%d]=0x%08x\n", w, words[w]);
+            }
+
+            count++;
         }
-
-        /* Branch back to return address */
-        intptr_t ret_delta = (intptr_t)return_rx - (intptr_t)(tramp_rx + tramp_off);
-        *(uint32_t *)(tramp_rw + tramp_off) = 0x14000000 | ((ret_delta >> 2) & 0x3FFFFFF);
-        tramp_off += 4;
-
-        /* Patch original instruction: B <trampoline> */
-        intptr_t fwd_delta = (intptr_t)tramp_rx_addr - (intptr_t)insn_rx;
-        uint32_t b_insn = 0x14000000 | ((fwd_delta >> 2) & 0x3FFFFFF);
-        *(uint32_t *)(text_rw + i) = b_insn;
-
-        if (count < 2)
-        {
-            ERR("  patch[%d]: text+0x%lx orig=0x%08x → B 0x%08x delta=%ld slot_off=0x%x\n",
-                count, (unsigned long)i, insn, b_insn, (long)fwd_delta, slot_off);
-            /* Dump first trampoline instructions */
-            size_t t_start = tramp_off - (is_mov_from_x18 ? 12 : 24) - 4; /* back to start */
-            for (int d = 0; d <= (is_mov_from_x18 ? 3 : 6); d++)
-                ERR("    tramp[%d]=0x%08x\n", d, *(uint32_t *)(tramp_rw + t_start + d * 4));
-        }
-
-        count++;
     }
 
-    if (count > 0 || skipped > 0)
-        ERR("x18 patcher: patched %d instructions (%d skipped), trampolines=%lu bytes\n",
-            count, skipped, (unsigned long)tramp_off);
+    if (count > 0 || skipped > 0 || sp_refused > 0)
+        ERR("x18 patcher: patched %d instructions (%d skipped, %d SP-refused), "
+            "trampolines=%lu bytes\n",
+            count, skipped, sp_refused, (unsigned long)tramp_off);
+    /* Shape census (see ios_x18_insn_has_free_dest): free_dest is the share a
+     * destination-register scratch would have covered, no_free_dest the share
+     * that had no free register at all and used to force the SP spill. */
+    if (count > 0)
+        dprintf(2, "[x18-tramp] shapes: %d with a free destination register, "
+                "%d without (all now use x18 as the scratch)\n", free_dest, no_free_dest);
     /* dprintf, not ERR (err-virtual muted): literal words the x18 matcher
      * WOULD have clobbered — nonzero = a dodged conhost-class boot death. */
     if (lit_skipped)

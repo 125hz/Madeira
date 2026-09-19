@@ -52,6 +52,18 @@ enum ios_srv_nt_counter
     IOS_FS_STALE_GEN,          /* entry matched but the cell was recycled    */
     IOS_FS_EVICT,              /* madeira_fast_close() dropped an entry      */
 
+    /* ml982.  POLLPEEK is the whole point of the default mode: a zero-timeout
+     * single-object wait answered STATUS_TIMEOUT from the shared cell with no
+     * server round trip.  On the measurement this was written against that is
+     * 116607 requests per 10 s, a third of all traffic, of which 115920 were
+     * going to be told "no" anyway.  WATCHDOG/DESYNC are the self-heal: a
+     * watchdog tick is one re-validation of a long INFINITE wait, a desync is
+     * one object that had to be demoted to the server path because the server
+     * and the cell disagreed. */
+    IOS_FS_POLLPEEK,           /* zero-timeout wait answered from the cell   */
+    IOS_FS_WATCHDOG,           /* long-wait re-validations performed         */
+    IOS_FS_DESYNC,             /* objects demoted after a real disagreement  */
+
     /* Breakdown of the `select` request, which is the one request kind whose
      * count says nothing about its cause: NtWaitForSingleObject, a multi-object
      * wait, NtSignalAndWaitForSingleObject, a keyed event and an alertable

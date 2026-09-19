@@ -7523,3 +7523,236 @@ guest-slots=… verdict=…`). Consequences:
   file said where the bytes came from.
   64-bit farms also gained xactengine2_*/3_*, xaudio2_0..6, x3daudio1_0..6 and
   xapofx1_1..4 (they had only the newest of each).
+
+- 2026-09-21 — **Physical thumbsticks "do not work" while buttons do: the
+  analogue half of the pad was reaching GameController only in bursts.**
+  Device logs x100-x102: the `[xinput]` census shows buttons arriving normally
+  but `axis_events` of 36-50 in 25,000-60,000 samples during minutes of play
+  with the stick held (the one run with 606 was a held TRIGGER:
+  `first axis motion … ltf=1.000`). The slot read-back, the win32u query and
+  the struct layout are all correct, so the values never got to the app. Since
+  iOS 18 the system also turns controller input into UIKit/SwiftUI focus
+  navigation unless the hierarchy declares that it consumes the pad through
+  GameController: `GCEventInteraction` (UIKit, `handledEventTypes = .gamepad`)
+  and SwiftUI's `handlesGameControllerEvents(matching:)` (cross-import overlay
+  `_GameController_SwiftUI`). Neither was installed. Now: `GamepadEventClaim`
+  puts the interaction on the Metal host view, the Metal-backed surface and
+  the control overlay, and the root SwiftUI view carries the modifier, both
+  behind `#available(iOS 18)`. UNVERIFIED on device — what to read next time:
+  `axis_events` should climb by hundreds per 10 s while a stick is held.
+- 2026-09-21 — Profile of a job-system title in gameplay (x102): wineserver
+  traffic 34-46k req/s (`select` 22k/s — half INFINITE single-object waits,
+  half zero-timeout polls that time out — and `NtSetEvent` 11k/s), in-call
+  0.7-1.06 core, and `read_request`/`read_reply_data`/`write` in the kernel
+  ≈ 50 % of ALL CPU against 23 % for guest code. The frame rate there is the
+  server's, not the GPU's or the JIT's. This is the workload the in-process
+  event fast path was written for; see the fastsync entry that follows.
+- 2026-09-21 — **Every x86-64 title died at the first call from ARM64EC code
+  into x64 code, because our own x18 trampolines pushed a register onto a
+  legally misaligned SP.** iOS reserves x18, so the JIT loader rewrites each
+  `[x18, …]` reference in a PE's `.text` into a branch to a generated
+  trampoline that fetches the TEB from our pthread TSD slot via
+  `TPIDRRO_EL0`. The trampoline needed one scratch register and spilled it
+  with `str x16,[sp,#-16]!`. AArch64 raises an **SP alignment fault on any
+  SP-based memory access taken while SP is not 16-byte aligned**, and an
+  8-mod-16 SP is normal on the EC→x64 dispatch path, which pushes an
+  x64-style return address before reading the TEB. Result: BUS with fault
+  address 0 inside a trampoline (`insn=f81f0ff0`, `sp=…3d8`), then a
+  second-order mess because recovery runs with `x18=0` and clobbers `x17`.
+  Note the constraint carefully: only SP-based *accesses* fault, `add`/`sub`
+  on SP do not — but SP cannot be realigned, or copied into a register,
+  without already having a scratch register, so the trampoline must avoid SP
+  entirely and therefore must find a free register. There is none that is
+  provably dead at an arbitrary mid-function site: x16/x17 are call-clobbered
+  veneer registers, yet the dispatch sequences that reach these very
+  instructions keep both live, and no per-thread spill slot helps because
+  reaching one already needs the scratch. Taking the scratch from the patched
+  instruction's own destination covers plain loads, `mov` and `add` — a census
+  of the shipped ARM64 and ARM64EC PE images (4,780 patch sites) puts that at
+  61 %, leaving 39 % (stores, compares, prefetches, SIMD transfers,
+  register-offset loads whose destination is the index) with nothing.
+  **The fix is to use x18 itself as the scratch**: it is the one register the
+  whole pass exists to eliminate, the platform zeroes it at every context
+  switch and signal return so nothing may rely on it, and with the TEB in x18
+  the original instruction runs *unmodified*. No spill, one shape, 100 %
+  coverage. Two bonuses: sites the pass skips then see a correct TEB instead
+  of zero, and a signal delivered mid-trampoline returns with x18 zeroed, so
+  the instruction faults exactly as an unpatched one would and the existing
+  `x18==0` emulator finishes it — self-healing, where the old emitter left a
+  half-restored x16/x17. The emitter now also self-checks every word it is
+  about to install and refuses any that uses register 31 as an address base.
+  LESSON: a generated code sequence inherits the *caller's* invariants, not
+  the compiler's. "Push a scratch register" is only free in code that owns its
+  stack discipline; injected code owns nothing, so it must spill into
+  something it can prove is its own — and the register the rewrite is removing
+  is exactly that. Second lesson: when a SIGBUS reports a fault address of 0
+  or of SP itself, suspect SP alignment before suspecting the mapping; the BUS
+  handler now says so in an `[sp-align]` line.
+  Same log, unrelated: the sampler thread walked a guest PE export directory
+  with raw loads and took a SEGV on a module whose process had just exited.
+  That walk (and the module-name read next to it) now goes through
+  `mach_vm_read_overwrite` with every offset bounded by the mapping size, the
+  discipline the rest of the fault-path readers already follow.
+
+- 2026-09-21 — fastsync ml982: AUDIT, a read-only default that ships, a
+  watchdog, and a job-system stress test (`ntdll/unix/sync.c`,
+  `ntdll/unix/unix_private.h`, `ntdll/unix/server.c`, `server/event.c`,
+  `server/object.h`, `shims/ios_fastsync.h`, `shims/ios_srv_stats.h`,
+  `build/ntdll-unix/server_ios.c`, `x86-tests/sync-x86.c`,
+  `x86-tests/build-sync-test.sh`).
+  MOTIVATION, from a 10 min device log of a title with a job system
+  ("Core_N - Thread 0") in steady gameplay: `[srv-stats]` 33.8-46.5 k
+  requests/s, in-call 0.73-1.06 core, and `[prof]` putting
+  `read<-read_request` 31-33 % + `read<-read_reply_data` 12 % +
+  `write<-call_req_handler` 5 % ≈ **half of all CPU inside the wineserver
+  round trip**, against jit 22-24 %. The traffic is `select=223749/21us` +
+  `event_op=112093/22us` per 10 s, i.e. `NtSetEvent` 110569, single-object
+  waits 223277 — 105477 INFINITE and **116607 zero-timeout polls of which
+  115920 time out**. The in-process event fast path that removes nearly
+  all of it exists (ml952/ml962/ml972) and has been default OFF since
+  ml962 because the ml972 round was never run on a device.
+  **THE SPLIT.** The audit's main conclusion is that this mechanism is two
+  mechanisms with very different risk. Taking or minting a token
+  off-server (set / reset / park / wake) is the hard half: every
+  lost-wakeup and double-release defect of ml952-ml972 lives there.
+  ANSWERING "NOT SIGNALED" is not: it consumes nothing, releases nobody,
+  writes nothing, and the word it reads IS the server's own state —
+  `MADEIRA_CELL_RESET` is exactly the value `event_sync_signaled()`
+  answers "no" for. So `MADEIRA_FASTSYNC` now selects four rungs (table at
+  the head of `ios_fastsync.h`): `0`/`off` = no cells at all (pre-ml952,
+  byte for byte); **unset = the new default: the server keeps event state
+  in a cell and the client uses it for ONE read-only thing**; `auto` =
+  that plus the wake path armed on traffic; `1`/`on` = the wake path from
+  the first call. With no client participation a cell is a pure relocation
+  of one bit — `signaled`/`satisfied`/`signal` read and write the cell
+  exactly where they used to read and write `event->signaled`, and every
+  CAS succeeds first time.
+  **POLL PEEK** (`MADEIRA_FS_POLLPEEK`, default on): a zero-timeout
+  single-object wait whose cell reads RESET returns `STATUS_TIMEOUT` with
+  no request. The generation is re-read AFTER the state word, so an
+  unchanged `gen` either side proves no recycle happened across the load
+  and the RESET belonged to our event; SET/CLAIMED/DISABLED and every
+  doubt go to the server. **One poll in 16 goes to the server anyway**,
+  which is the whole safety argument: it bounds how long a pending system
+  APC can sit undelivered behind a thread that does nothing but poll, and
+  it makes a wrong cache entry self-correcting within 16 iterations of the
+  caller's own loop (the worst a wrong peek can do is a spin, never a lost
+  wakeup). Every 64th peeked poll yields, replacing `server_wait`'s poll
+  streak for these calls; `ios_spin_reset()` is deliberately NOT called
+  from the peek (a poll that does not block is not "a thread that
+  blocked"), so a peeked poll no longer ends a Sleep(0) streak. Counter
+  `pollpeek=N(total)` prints next to the surviving `w1 poll=`.
+  **WATCHDOG.** A hang cannot live in the park loop — it caps at
+  `madeira_fast_cap_ns` (2 ms) — it lives in the `server_wait` the
+  fall-through does, so the fix is to stop making that wait infinite. When
+  the wake path is live, an INFINITE single-object wait **on a cell-backed
+  event** (thread/process/mutex/file keep the plain infinite wait,
+  answered from the negative cache) becomes a 2 s wait that backs off x4
+  to 60 s. On each expiry: if the cell says SET while the server has just
+  said not-signaled, re-ask the server with a ZERO-timeout select — which
+  is both the confirmation and the cure, since a genuinely signaled object
+  satisfies the wait there and then. Only "server says no AND the cell
+  still says SET" is a verdict: one
+  `[fastsync] DESYNC handle=... cell=... gen=... state=.../... waiters=... srv_waiters=...`
+  line per process, `desync=` in `[srv-stats]`, and
+  `MADEIRA_EVENT_OP_DISABLE` (MADI) on that ONE object — a new opcode that
+  runs `event_sync_disable_cell()`, the exit PulseEvent has always used,
+  folding the cell state back into `signaled` and waking every parked
+  client. It is the one opcode accepted on a SYNCHRONIZE handle, because
+  the thread that notices is by construction a waiter. A false positive
+  therefore costs one permanently slower event; a real incoherence costs a
+  log line instead of a dead thread.
+  **DEFECT FIXED: a positive cache entry outliving its process.** The
+  `(handle, pid)` cache is invalidated by `madeira_fast_close()`, i.e. by
+  THIS process closing the handle. Nothing invalidates the entries of a
+  process that simply dies — and the server reuses process ids
+  (`alloc_ptid` keeps a free list), so a later pseudo-process can be handed
+  the same id, allocate the same low handle values, and hit a slot whose
+  handle AND pid both match and whose cell is still live because the event
+  is still alive elsewhere. That is a set or a wait landing on an
+  unrelated object with no race at all — the ml962 torn-publish failure
+  shape, reachable deterministically. `madeira_fast_flush_pid()` scans the
+  2048 slots once from `server_init_process_done()`, where this process
+  provably owns no handles, so any entry with our pid is a ghost.
+  **AUDIT: what was checked and found sound.** Auto-reset with N waiters
+  and M setters (the SET -> CLAIMED claim plus `MADEIRA_EVENT_OP_WAKE`
+  make exactly-once hold: a client CAS cannot steal a token the server has
+  reported, and the client's wake-only opcode cannot mint a second one);
+  the two Dekker pairings (`store state; load srv_waiters` against
+  `srv_waiters++; load state`, both seq_cst — and on arm64 STLR followed
+  by LDAR is exactly the pair that forbids the store-buffering
+  reordering); manual set/reset racing waiters; a poll consuming an
+  auto-reset token exactly once; a handle waited on BOTH through the cell
+  and through a server-side `select`, including `WaitForMultipleObjects`
+  (the server's `check_wait` claims, `end_wait` satisfies, and nothing can
+  run between them because the server is one thread); WaitAll claim
+  release through `object_sync_unclaim`; handle close/reuse across a park
+  (the `gen` re-check); `PulseEvent` (one-way exit, and every client op
+  tests DISABLED); `NtSignalAndWaitForSingleObject` and keyed events
+  (never fast-pathed); alertable waits (never fast-pathed);
+  `NtSuspendThread`/`NtTerminateThread` of a parked thread (both are
+  signal-delivered on this port, so the park returns EINTR and the loop
+  re-checks; the cap bounds the rest).
+  **RESIDUAL, documented not fixed.** (a) `madeira_cell_alive()` and the
+  state CAS are not atomic with each other: between them the event can be
+  destroyed and the cell re-allocated, and the CAS then touches a
+  stranger's event. The window is tens of nanoseconds and reaching it
+  needs the caller to be operating on a handle another thread is closing —
+  undefined on Windows too — but the consequence here is a lost wakeup on
+  an unrelated object. Closing it properly means packing {state, gen} into
+  one 64-bit word and CASing both, with the futex still waiting on the low
+  half; that is mechanical but touches every state access on both sides
+  and is not worth doing blind. (b) A thread killed while parked leaks its
+  `waiters` increment, so every later set on that cell pays one spurious
+  `os_sync_wake_by_address` — cost only.
+  **DEFAULT DECISION: the wake path stays OFF.** The brief allowed `auto`
+  as the default if soundness could be argued case by case. It cannot, on
+  two grounds: residual (a) above is a real lost-wakeup vector that was
+  chosen not to be eliminated, and nothing in ml972 or ml982 has ever
+  executed on a device. `auto` is implemented and is one env var away
+  (`MADEIRA_FASTSYNC=auto`): the rule arms the wake path task-wide, once,
+  never back, when a `[srv-stats]` window shows more than
+  `MADEIRA_FS_AUTO_REQS` (20000, ~2 k/s) event+select operations — the
+  measurement above is 338 k, a launcher is nowhere near, and the three
+  programs that died on the ml952 snapshot were all quiet ones. It logs
+  `[fastsync] AUTO-ENABLED after N ... ops in Nms (N/s, threshold N)`. The
+  arm is task-wide rather than per-pseudo-process because this image is
+  one Mach task and both the flag and the counters are single words in it.
+  What ships enabled is the read-only half, which is `poll=116607` per
+  10 s — a third of all requests — for no wake semantics at all.
+  **TEST.** `sync-x86.exe` gains test 10, a job system: 6 workers rotating
+  per iteration through `WaitForSingleObject` INFINITE / 1 ms / 0 ms poll /
+  `WaitForMultipleObjects` over two handles at 50 ms, so the same event is
+  continuously waited on through the client path AND queued in the
+  server's select; a producer publishing bursts of 1-8 jobs, one in 16 of
+  them signalled through a handle made by `DuplicateHandle` and closed
+  immediately (fresh handle value, fresh cache slot, an eviction, against
+  a live event); a churn thread recycling cells throughout; 10 s. Exact
+  accounting — a job is claimed with an atomic decrement, so it can be
+  taken only once — plus a ONE SECOND per-burst deadline, which is what
+  turns a lost wakeup from a stall into a failure. Exits 62 (a job was not
+  consumed in a second, or the counters did not balance), 63 (a
+  multi-object wait was released by the wrong handle — the never-signalled
+  second handle), 64 (a zero-timeout poll gave the wrong answer: a manual
+  event must read signaled TWICE after one set and not-signalled after the
+  reset, an auto-reset event must be consumed by a poll exactly once).
+  Writing it caught a bug in itself: N `SetEvent` calls on an unwaited
+  auto-reset event release ONE thread, not N, so the burst is published as
+  a counter plus one signal and the released worker hands the baton on.
+  **VERIFIED BY RUNNING:** both native archives rebuild clean (`ntdll-unix`
+  32/32, `wineserver` all files, no new warnings), `sync-x86.exe` builds
+  (i386 PE, kernel32-only import, LAA set), and the WHOLE of `sync-x86.c`
+  — all ten tests — was compiled against a POSIX model of the Win32 event
+  surface (one global mutex and condvar, so auto-reset consumption is
+  correct by construction) and RUN on the build host: exit 46, with test
+  10 turning over 494337 jobs in 109854 bursts, each consumed exactly
+  once. That is evidence about the TEST, not about fastsync — a test that
+  cannot pass against a known-correct implementation is evidence about
+  nothing. **VERIFIED BY REASONING ONLY:** everything in the audit list
+  above, the peek's coherence with `event_sync_signaled`, the watchdog's
+  verdict rule, and that the default mode is behaviour-preserving for the
+  server. Next device run should show `pollpeek=` large with `w1 poll=`
+  collapsed and `reqs/s` down by about a third, with
+  `learn_ev`/`learn_none` NOT tracking `pollpeek` 1:1 (if they do, the
+  polled handles are being churned and `MADEIRA_FS_POLLPEEK=0` is the off
+  switch). Then `MADEIRA_FASTSYNC=auto` for the other half.

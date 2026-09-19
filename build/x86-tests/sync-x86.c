@@ -79,6 +79,39 @@
  *     the handle and the payload live in a heap node that is freed and
  *     re-allocated every round, so the node address is recycled as well.
  *
+ * 10. JOB SYSTEM (ml982).  Tests 1-9 each isolate one property with one wait
+ *     shape.  This one reproduces the shape the device measurement actually
+ *     showed -- a title whose worker pool is fed by one producer over a single
+ *     auto-reset event, with every wait shape in the mix at once:
+ *
+ *       - 6 workers rotating, per iteration, through WaitForSingleObject
+ *         INFINITE / 1 ms / 0 ms poll / WaitForMultipleObjects over TWO
+ *         handles with a 50 ms timeout.  The same event is therefore waited on
+ *         through the client fast path AND queued in the wineserver's own
+ *         select at the same time, by different threads, continuously -- which
+ *         is the one interleaving that needs the client and the server views
+ *         of the signaled state to stay coherent (`waitN' was 474 per 10 s in
+ *         the measurement, i.e. rare but always present).
+ *       - a producer publishing bursts of 1-8 jobs, some of them SET through a
+ *         handle freshly created by DuplicateHandle and closed straight after,
+ *         so handle values and client cache slots for a LIVE event churn too.
+ *       - a churn thread creating and closing unrelated events throughout, so
+ *         server cells are recycled under everybody.
+ *
+ *     EXACT ACCOUNTING, which is what makes this a test rather than a soak:
+ *     every job is produced once and, because a job is claimed with an atomic
+ *     decrement of the outstanding count, can be consumed exactly once.  After
+ *     each burst the producer waits for consumed == produced with a ONE SECOND
+ *     deadline, and at the end the outstanding count must be zero: a lost
+ *     wakeup that a soak test would hide as a stall is a failure here, and it
+ *     names the counters.
+ *
+ *     It also asserts the two poll answers every round, because the read-only
+ *     zero-timeout answer (MADEIRA_FS_POLLPEEK) is the half of this mechanism
+ *     that is ON by default: a manual-reset event must read signaled TWICE
+ *     after one SetEvent and not-signaled after ResetEvent, and an auto-reset
+ *     event must be consumed by a poll EXACTLY once.
+ *
  * Deliberate restrictions, the same ones the other tests in this directory
  * work under: no CRT (this file supplies `start' plus memset/memcpy and links
  * -nostdlib, so its only import is kernel32), no 64-bit division, no
@@ -98,6 +131,9 @@
  *   59  manual-reset under churn: released early, or not all waiters released
  *   60  late set: a satisfied timed wait reported the wrong result or time
  *   61  heap-node handshake: the wait returned before the producer published
+ *   62  job system: a produced job was not consumed within one second
+ *   63  job system: a multi-object wait was released by the wrong handle
+ *   64  job system: a zero-timeout poll gave the wrong answer for the event
  */
 #include <stddef.h>
 #include <windows.h>
@@ -110,6 +146,9 @@
 #define DR_ROUNDS     300u      /* slow sets in the server-queue test 6 */
 #define CHURN_EVENTS  400u      /* events created/closed per churn pass, test 7 */
 #define WATCHDOG_MS   20000u    /* no single wait in this test may take longer */
+#define JOB_WORKERS   6u        /* worker threads in test 10                   */
+#define JOB_MS        10000u    /* how long the job system runs, test 10       */
+#define JOB_DRAIN_MS  1000u     /* per-burst deadline: no job may take longer  */
 
 /* -nostdlib: clang may still lower a struct initialisation to memset/memcpy. */
 void *memset( void *dst, int c, size_t n )
@@ -803,6 +842,236 @@ static int run_node_handshake(void)
     return 0;
 }
 
+/* ------------------------------------------------------- 10: job system */
+
+/* jb_ready is the ONE auto-reset event every worker contends for; jb_idle is a
+ * manual-reset event that is never set, and exists so that a quarter of the
+ * waits are WaitForMultipleObjects over two handles -- which is a wineserver
+ * select on jb_ready, running concurrently with the other workers' fast-path
+ * waits on the same object.  jb_mr / jb_solo are the producer's own poll
+ * assertions. */
+static HANDLE jb_ready, jb_idle, jb_mr, jb_solo;
+static volatile LONG jb_avail;      /* jobs published and not yet taken      */
+static volatile LONG jb_produced;   /* total published                       */
+static volatile LONG jb_consumed;   /* total taken                           */
+static volatile LONG jb_spurious;   /* releases that found no job (legal)    */
+static volatile LONG jb_stop;       /* 1 = drain and exit                    */
+static volatile LONG jb_exited;     /* workers that have left the loop       */
+static volatile LONG jb_churn_stop;
+
+/* AN AUTO-RESET EVENT IS A FLAG, NOT A COUNT -- which is why this is modelled
+ * the way a real job system models it.  N SetEvent calls on an unwaited
+ * auto-reset event release ONE thread, not N, so a burst is published as a
+ * counter plus ONE signal and the released worker hands the baton on: take one
+ * job, and if the counter is still positive signal the next worker.  The chain
+ * cannot break, because the only worker that does not signal is the one that
+ * took the last job.
+ *
+ * A release that finds the counter empty is therefore LEGAL here (a leftover
+ * signal from a previous burst, or two workers racing for the last job) and is
+ * counted rather than failed -- "exactly one waiter per SetEvent" is what
+ * tests 2 and 6 assert, with handshakes that make it unambiguous.  What this
+ * test asserts is the property those cannot: over ten seconds of every wait
+ * shape at once, every job is taken exactly once and none takes longer than a
+ * second, which is what a lost wakeup destroys. */
+static DWORD WINAPI jb_worker( LPVOID arg )
+{
+    unsigned int idx = (unsigned int)(LONG_PTR)arg, n = 0;
+
+    for (;;)
+    {
+        HANDLE two[2];
+        DWORD r;
+        LONG left;
+
+        if (InterlockedExchangeAdd( (LONG *)&jb_stop, 0 )) break;
+
+        /* every shape, interleaved, on the same handle */
+        switch ((idx + n++) & 3)
+        {
+        case 0:
+            r = WaitForSingleObject( jb_ready, INFINITE );
+            break;
+        case 1:
+            r = WaitForSingleObject( jb_ready, 1 );
+            break;
+        case 2:
+            r = WaitForSingleObject( jb_ready, 0 );
+            break;
+        default:
+            two[0] = jb_ready;
+            two[1] = jb_idle;
+            r = WaitForMultipleObjects( 2, two, FALSE, 50 );
+            /* jb_idle is created reset and never set: a release on it means a
+             * handle resolved to the wrong object, which is the shape the
+             * ml962 torn cache publish failed in */
+            if (r == WAIT_OBJECT_0 + 1) { fail( 63 ); goto out; }
+            break;
+        }
+
+        if (r != WAIT_OBJECT_0) continue;            /* timed out: go round again */
+        if (InterlockedExchangeAdd( (LONG *)&jb_stop, 0 )) break;   /* draining */
+
+        if ((left = InterlockedDecrement( (LONG *)&jb_avail )) < 0)
+        {
+            InterlockedIncrement( (LONG *)&jb_avail );
+            InterlockedIncrement( (LONG *)&jb_spurious );
+            continue;
+        }
+        InterlockedIncrement( (LONG *)&jb_consumed );
+        if (left > 0) SetEvent( jb_ready );          /* pass the baton on */
+    }
+out:
+    InterlockedIncrement( (LONG *)&jb_exited );
+    return 0;
+}
+
+static DWORD WINAPI jb_churn_thread( LPVOID arg )
+{
+    while (!InterlockedExchangeAdd( (LONG *)&jb_churn_stop, 0 ))
+    {
+        unsigned int i;
+        for (i = 0; i < CHURN_EVENTS; i++)
+        {
+            HANDLE e = CreateEventA( NULL, (i & 1) ? TRUE : FALSE, (i & 2) ? TRUE : FALSE, NULL );
+            if (!e) return 1;
+            SetEvent( e );
+            ResetEvent( e );
+            CloseHandle( e );
+        }
+        Sleep( 1 );
+    }
+    return 0;
+}
+
+/* The two poll answers, asserted once per burst.  These are cheap and they are
+ * the exact properties the read-only zero-timeout answer has to have. */
+static int jb_check_polls(void)
+{
+    /* manual-reset: one set, signaled for ever (twice in a row proves the poll
+     * did not consume it), then not signaled after the reset */
+    SetEvent( jb_mr );
+    if (WaitForSingleObject( jb_mr, 0 ) != WAIT_OBJECT_0) return 64;
+    if (WaitForSingleObject( jb_mr, 0 ) != WAIT_OBJECT_0) return 64;
+    ResetEvent( jb_mr );
+    if (WaitForSingleObject( jb_mr, 0 ) != WAIT_TIMEOUT) return 64;
+
+    /* auto-reset: one set, consumed by exactly one poll */
+    SetEvent( jb_solo );
+    if (WaitForSingleObject( jb_solo, 0 ) != WAIT_OBJECT_0) return 64;
+    if (WaitForSingleObject( jb_solo, 0 ) != WAIT_TIMEOUT) return 64;
+    return 0;
+}
+
+static int run_job_system(void)
+{
+    HANDLE workers[JOB_WORKERS], churn;
+    DWORD id, t_end, deadline;
+    unsigned int i, round = 0, rc = 0;
+
+    jb_avail = jb_produced = jb_consumed = jb_spurious = 0;
+    jb_stop = jb_exited = jb_churn_stop = 0;
+
+    if (!(jb_ready = CreateEventA( NULL, FALSE, FALSE, NULL ))) return 50;
+    if (!(jb_idle  = CreateEventA( NULL, TRUE,  FALSE, NULL ))) return 50;
+    if (!(jb_mr    = CreateEventA( NULL, TRUE,  FALSE, NULL ))) return 50;
+    if (!(jb_solo  = CreateEventA( NULL, FALSE, FALSE, NULL ))) return 50;
+    if (!(churn = CreateThread( NULL, 0, jb_churn_thread, NULL, 0, &id ))) return 50;
+    for (i = 0; i < JOB_WORKERS; i++)
+        if (!(workers[i] = CreateThread( NULL, 0, jb_worker, (LPVOID)(LONG_PTR)i, 0, &id )))
+            return 50;
+
+    t_end = GetTickCount() + JOB_MS;
+    while ((int)(t_end - GetTickCount()) > 0)
+    {
+        unsigned int burst = 1 + (round & 7), k;
+
+        /* publish the whole burst BEFORE the signal: a worker must never see a
+         * token without a job behind it any earlier than it has to */
+        for (k = 0; k < burst; k++)
+        {
+            InterlockedIncrement( (LONG *)&jb_avail );
+            InterlockedIncrement( (LONG *)&jb_produced );
+        }
+
+        if ((round & 15) == 0)
+        {
+            /* a SECOND live handle to the same event, used once and closed: a
+             * fresh handle value, a fresh client cache slot and an eviction,
+             * all against an event that stays alive throughout */
+            HANDLE dup = NULL;
+            if (DuplicateHandle( GetCurrentProcess(), jb_ready, GetCurrentProcess(),
+                                 &dup, 0, FALSE, DUPLICATE_SAME_ACCESS ) && dup)
+            {
+                SetEvent( dup );
+                CloseHandle( dup );
+            }
+            else SetEvent( jb_ready );
+        }
+        else SetEvent( jb_ready );
+
+        /* Every job must be taken, and taken within a second.  This is where a
+         * lost wakeup lands: the counters simply stop converging. */
+        deadline = GetTickCount() + JOB_DRAIN_MS;
+        for (;;)
+        {
+            LONG done = InterlockedExchangeAdd( (LONG *)&jb_consumed, 0 );
+            LONG made = InterlockedExchangeAdd( (LONG *)&jb_produced, 0 );
+
+            if (failure) { rc = failure; goto stop; }
+            if (done == made) break;
+            if ((int)(deadline - GetTickCount()) <= 0)
+            {
+                line_2( "MADEIRA-SYNC: job system stalled, consumed=", (unsigned int)done,
+                        " produced=", (unsigned int)made, "" );
+                rc = 62;
+                goto stop;
+            }
+            Sleep( 0 );
+        }
+
+        if ((rc = jb_check_polls())) goto stop;
+        round++;
+    }
+
+stop:
+    /* Drain: workers in an INFINITE wait need one token each to notice.  Keep
+     * setting until every one of them has left, bounded so a genuine hang is
+     * still reported rather than hanging the test. */
+    InterlockedExchange( (LONG *)&jb_stop, 1 );
+    for (i = 0; i < 20000u && (DWORD)InterlockedExchangeAdd( (LONG *)&jb_exited, 0 ) < JOB_WORKERS; i++)
+    {
+        SetEvent( jb_ready );
+        Sleep( 1 );
+    }
+    for (i = 0; i < JOB_WORKERS; i++)
+    {
+        WaitForSingleObject( workers[i], WATCHDOG_MS );
+        CloseHandle( workers[i] );
+    }
+    InterlockedExchange( (LONG *)&jb_churn_stop, 1 );
+    WaitForSingleObject( churn, WATCHDOG_MS );
+    CloseHandle( churn );
+    CloseHandle( jb_ready );
+    CloseHandle( jb_idle );
+    CloseHandle( jb_mr );
+    CloseHandle( jb_solo );
+
+    if (rc) return rc;
+    if (failure) return failure;
+    if (jb_consumed != jb_produced || jb_avail)
+    {
+        line_2( "MADEIRA-SYNC: job system consumed=", (unsigned int)jb_consumed,
+                " produced=", (unsigned int)jb_produced, "" );
+        return 62;
+    }
+    line_2( "MADEIRA-SYNC: job system ", (unsigned int)jb_produced,
+            " jobs over ", round, " bursts, each consumed exactly once OK" );
+    line_2( "MADEIRA-SYNC:   workers=", JOB_WORKERS, " spurious_wakes=",
+            (unsigned int)jb_spurious, " OK" );
+    return 0;
+}
+
 /* --------------------------------------------------------------- driver */
 
 static int run_all(void)
@@ -833,6 +1102,7 @@ static int run_all(void)
     if ((rc = run_loader_manual())) return rc;
     if ((rc = run_late_set())) return rc;
     if ((rc = run_node_handshake())) return rc;
+    if ((rc = run_job_system())) return rc;
 
     out_str( "MADEIRA-SYNC: all checks passed\n" );
     return 46;
