@@ -5886,6 +5886,35 @@ static unsigned ios_wow_window_count;
 static unsigned ios_wow_adopt_seq;
 static pthread_mutex_t ios_wow_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/***********************************************************************
+ *           ios_name_unix_lock          (iOS-Madeira ml981)
+ *
+ * Give [thread-stacks] a NAME for the pthread mutex a parked thread is on.
+ *
+ * A thread stopped at __psynch_mutexwait carries the mutex in x0, and until now
+ * the dump printed only the raw address — so identifying a process-wide lock
+ * deadlock (t85:1213 x0=0x1058db078, t86:6607 x8=0x1061a709f) meant recovering
+ * the image slide from two unrelated profiler symbols and running llvm-nm over
+ * the shipped binary. These are the locks whose loss stops everything, so name
+ * them in the log instead. Addresses only; no state is read, so this is safe to
+ * call from a sampler while the lock is held.
+ */
+const char *ios_name_unix_lock( unsigned long long addr )
+{
+    struct { const void *p; const char *name; } known[] = {
+        { &virtual_mutex,   "ntdll:virtual_mutex"   },
+        { &ios_pool_lock,   "ntdll:ios_pool_lock"   },
+        { &ios_wow_mutex,   "ntdll:ios_wow_mutex"   },
+        { &fd_cache_mutex,  "ntdll:fd_cache_mutex"  },
+    };
+    unsigned i;
+
+    if (!addr) return NULL;
+    for (i = 0; i < sizeof(known) / sizeof(known[0]); i++)
+        if (addr == (unsigned long long)(uintptr_t)known[i].p) return known[i].name;
+    return NULL;
+}
+
 /* SESSION-START PLACEHOLDERS.
  *
  * DEVICE EVIDENCE (desktop session, the run after the top-down furniture bias
@@ -7376,6 +7405,18 @@ extern const void *dnsapi_unix_call_funcs[];
  * never called). Chromium drew no text anywhere as a result. */
 extern const void *dwrite_unix_call_funcs[];
 
+/* MADEIRA 2026-09-19: winegstreamer's unix side, which upstream implements
+ * with GStreamer (dlls/winegstreamer/wg_transform.c) and this port implements
+ * with libavcodec (build/ntdll-unix/winegstreamer_unixlib_ios.c) for the WMA
+ * family only.  Without it winegstreamer.dll could not load at all, so
+ * CLSID_CWMADecMediaObject -> wmadmod.dll -> CLSID_wg_wma_decoder had no class
+ * object, FAudio got no decoder for an xWMA/WMA voice, and xaudio2 played the
+ * COMPRESSED bytes as PCM -- the static, and the 8x-full-scale peaks in the
+ * audio census.  The table implements the wg_transform subset wma_decoder.c
+ * uses; the wg_parser and wg_muxer entries return STATUS_NOT_IMPLEMENTED,
+ * which is what a quartz splitter or a media source already handles. */
+extern const void *winegstreamer_unix_call_funcs[];
+
 /* win32u's unix init, statically linked via libwin32u_unix.a. Renamed
  * from __wine_unix_lib_init in build/win32u-unix/build.sh so future
  * statically-linked unix libs can keep their own init without colliding.
@@ -7419,6 +7460,14 @@ extern const void *nsi_unix_call_wow64_funcs[];
  * caller's optional IP4_ARRAY and a 32-bit NULL reaches the unix side as the
  * window base rather than as NULL. */
 extern const void *dnsapi_unix_call_wow64_funcs[];
+/* winegstreamer's is written by hand in winegstreamer_unixlib_ios.c, because
+ * dlls/winegstreamer/unixlib.h carries no 32-bit param structs at all (nothing
+ * upstream enters that unixlib from the other bitness).  The entries that
+ * differ are the ones holding a struct wg_media_type (its union is a pointer,
+ * so the struct is 24 bytes and not 32) and the two that hold a
+ * struct wg_sample * -- including the guest pointer inside wg_sample->data,
+ * which is where the caller's compressed input and PCM output actually live. */
+extern const void *winegstreamer_unix_call_wow64_funcs[];
 
 /***********************************************************************
  *           ios_module_export_name
@@ -7691,6 +7740,17 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             libname = "dnsapi";
             funcs64 = (const void *)dnsapi_unix_call_funcs;
             funcs_wow64 = (const void *)dnsapi_unix_call_wow64_funcs;
+        } else if (match && strstr(match, "winegstreamer")) {
+            /* MADEIRA 2026-09-19: matched before the generic fallback so the
+             * DLL loads at all.  Upstream binds "winegstreamer.so"; the PE
+             * export name is "winegstreamer.dll" — "winegstreamer" is the
+             * substring both spellings share.  The wow64 table is real (not
+             * the stub): a 32-bit title is the whole reason this exists, and
+             * its thunks convert the struct wg_media_type / struct wg_sample
+             * pointers that the 32-bit layouts place at different offsets. */
+            libname = "winegstreamer (wma via libavcodec)";
+            funcs64 = (const void *)winegstreamer_unix_call_funcs;
+            funcs_wow64 = (const void *)winegstreamer_unix_call_wow64_funcs;
         } else if (match && strstr(match, "nsi.dll")) {
             libname = "nsi (rev=ml472)";
             funcs64 = (const void *)nsi_unix_call_funcs;
@@ -11659,8 +11719,9 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
  * the commit signal -- a probe whose cap is spent on the case it is not measuring reports
  * nothing useful. Called only from the commit branches instead.
  *
- * Reads memory back rather than echoing intent, and only when the protection actually permits
- * reading, so the probe can never itself fault.
+ * Reads memory back rather than echoing intent.  The read goes through
+ * mach_vm_read_overwrite, not a load (ml981): this runs under virtual_mutex, and a fault
+ * taken here deadlocks the whole process against the exception thread.
  */
 static void ios_verify_commit_zero( const void *base, SIZE_T size, ULONG protect, int was_committed )
 {
@@ -11719,7 +11780,66 @@ static void ios_verify_commit_zero( const void *base, SIZE_T size, ULONG protect
     seq = hi ? ++ck_hi : ++ck_lo;
     {
         size_t chk = size < 64 ? (size_t)size : 64;
-        long nz = ios_first_nonzero( base, chk );
+        unsigned char snap[64];
+        mach_vm_size_t got = 0;
+        long nz;
+
+        /* ml981: THIS PROBE RUNS UNDER virtual_mutex, SO IT MAY NEVER FAULT.
+         *
+         * The ml293 comment above claims the probe "can never itself fault"
+         * because it checks the protection first — but it checks the protection
+         * the CALLER ASKED FOR, not the one the page ended up with. When a
+         * commit reports success while the host page stays PROT_NONE (device
+         * logs t85:1195 / t86:5280, addr = the just-committed base, mach region
+         * prot=0 max=7), the load below took EXC_BAD_ACCESS, and that is not a
+         * recoverable fault here:
+         *
+         *   NtAllocateVirtualMemory holds virtual_mutex across this call
+         *   -> the Mach message goes to wine-x18-exc
+         *   -> the delivery path locks virtual_mutex (virtual_handle_fault,
+         *      virtual_setup_exception, the [fault-rgn] dumper)
+         *   -> that lock is held by the very thread whose fault it is servicing.
+         *
+         * Both threads stop forever (t86:6711 "Core_5 - Thread 0" parked at
+         * ios_verify_commit_zero+0x80 run=3 cpu=0, t86:6607 wine-x18-exc in
+         * __psynch_mutexwait on 0x1061a7078 = virtual_mutex), and every later
+         * VirtualAlloc/VirtualProtect/VirtualFree/page-fault fixup in the whole
+         * process queues behind them: the process sits at ~0 % CPU with nothing
+         * in a server wait, which is why [srv-stuck] and [waiters] stayed silent.
+         * A DIAGNOSTIC MUST NOT BE ABLE TO DO THAT.
+         *
+         * mach_vm_read_overwrite reads the same bytes without a load on this
+         * thread: an inaccessible page comes back as a failed kern_return
+         * instead of a fault. And a refused read is itself the signal we most
+         * want — it means a MEM_COMMIT that returned STATUS_SUCCESS left memory
+         * the guest cannot touch — so report it instead of swallowing it. */
+        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(uintptr_t)base,
+                                    (mach_vm_size_t)chk, (mach_vm_address_t)(uintptr_t)snap,
+                                    &got ) != KERN_SUCCESS || got != (mach_vm_size_t)chk)
+        {
+            BYTE hv = get_host_page_vprot( base );
+            mach_vm_address_t ra = (mach_vm_address_t)(uintptr_t)base;
+            mach_vm_size_t rs = 0;
+            vm_region_basic_info_data_64_t ri;
+            mach_msg_type_number_t rc = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t ro = MACH_PORT_NULL;
+            int have_region = (mach_vm_region( mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                                               (vm_region_info_t)&ri, &rc, &ro ) == KERN_SUCCESS);
+
+            if (hi) stale_hi++; else stale_lo++;
+            dprintf( 2, "[commit-noaccess] #%lu %s *** COMMIT SUCCEEDED BUT PAGE IS UNREADABLE *** "
+                     "base=%p size=0x%lx protect=0x%x host_page_vprot=0x%02x unix_prot=0x%x "
+                     "region=0x%llx+0x%llx prot=%d max=%d checked=%lu/%lu stale=%lu/%lu "
+                     "recommit=%lu rev=ml981\n",
+                     seq, hi ? "arena/pool" : "GUEST", base, (unsigned long)size,
+                     (unsigned)protect, hv, (unsigned)get_unix_prot( hv ),
+                     have_region ? (unsigned long long)ra : 0ull,
+                     have_region ? (unsigned long long)rs : 0ull,
+                     have_region ? ri.protection : -1, have_region ? ri.max_protection : -1,
+                     ck_lo, ck_hi, stale_lo, stale_hi, recommit_n );
+            return;
+        }
+        nz = ios_first_nonzero( snap, chk );
         if (nz < 0)
         {
             /* boring: first few, then sparse -- but the totals ride along */
@@ -11735,7 +11855,7 @@ static void ios_verify_commit_zero( const void *base, SIZE_T size, ULONG protect
             /* ml546 defect #2: ml545 printed bytes[0..7] from BASE while reporting
              * first_nonzero=+0x8 -- so it printed eight zeros and told us nothing
              * about the actual stale content. Print from the offending offset. */
-            const unsigned char *b = (const unsigned char *)base + nz;
+            const unsigned char *b = snap + nz;      /* ml981: the Mach snapshot, same bytes */
             if (hi) stale_hi++; else stale_lo++;      /* ALWAYS logged: this is the signal */
             dprintf( 2, "[commit-zero] #%lu %s *** STALE ON COMMIT *** base=%p size=0x%lx "
                      "protect=0x%x first_nonzero=+0x%lx checked=%lu/%lu stale=%lu/%lu recommit=%lu "

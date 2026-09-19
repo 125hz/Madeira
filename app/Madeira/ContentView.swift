@@ -3147,6 +3147,16 @@ struct MadeiraMetalView: UIViewRepresentable {
     func updateUIView(_ uiView: MetalBackedView, context: Context) {}
 }
 
+/// A user-added Custom… launch button, persisted across app restarts —
+/// see `ContentView.customLaunchButtonsKey`. `label` is the exe's file
+/// name without extension (derived once, at Add Button time); `path` is
+/// the full Windows path handed to MADEIRA_EXE verbatim, same as the
+/// built-in `launchTargets` full-path entries.
+struct CustomLaunchButton: Codable, Equatable {
+    let label: String
+    let path: String
+}
+
 struct ContentView: View {
     @StateObject private var logStore = LogStore.shared
     @State private var jitStatus: JITStatus = .unknown
@@ -3163,6 +3173,15 @@ struct ContentView: View {
     @State private var showCustomLaunchAlert = false
     @State private var customExePath: String =
         UserDefaults.standard.string(forKey: ContentView.customExePathKey) ?? ""
+    /// User-added Custom… buttons (Add Button in the alert below), persisted
+    /// as JSON under `customLaunchButtonsKey` and loaded once at view init.
+    @State private var customLaunchButtons: [CustomLaunchButton] =
+        ContentView.loadCustomLaunchButtons()
+    /// Fixed tint cycle for `customLaunchButtons` so neighbouring
+    /// user-added buttons are visually distinct; wraps by index.
+    private static let customButtonTints: [Color] = [
+        .teal, .indigo, .brown, .cyan, .yellow,
+    ]
     /// .compact = iPhone landscape: game surface expands, arrow keys appear.
     @Environment(\.verticalSizeClass) private var vSizeClass
 
@@ -3660,6 +3679,23 @@ struct ContentView: View {
                     .tint(test.tint)
                 }
 
+                // User-added buttons (Custom… ▸ Add Button), same launch
+                // path as the full-path launchTargets entries above — see
+                // launchCustomExe(_:). Long-press for a Remove context menu;
+                // built-in buttons above are not removable.
+                ForEach(Array(customLaunchButtons.enumerated()), id: \.element.path) { index, button in
+                    Button(button.label) {
+                        launchCustomExe(button.path)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Self.customButtonTints[index % Self.customButtonTints.count])
+                    .contextMenu {
+                        Button("Remove", role: .destructive) {
+                            removeCustomLaunchButton(button)
+                        }
+                    }
+                }
+
                 // Prompts via the .alert below, then launches exactly like the
                 // full-path launchTargets entries above (Mirror's Edge,
                 // INSIDE) — see launchCustomExe().
@@ -3687,6 +3723,7 @@ struct ContentView: View {
                 .autocorrectionDisabled()
                 .textInputAutocapitalization(.never)
             Button("Launch") { launchCustomExe() }
+            Button("Add Button") { addCustomLaunchButton() }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Full Windows path to the .exe, passed to MADEIRA_EXE exactly as typed.")
@@ -3704,7 +3741,54 @@ struct ContentView: View {
     /// gets the path VERBATIM and WineProcessBridge.m detects the backslash
     /// and launches it as-is, no syswow64 prefix. Trims whitespace and
     /// refuses an empty path rather than handing Wine a blank MADEIRA_EXE.
-    private func launchCustomExe() {
+    /// `path` is nil for the alert's own Launch button (uses/persists the
+    /// text field, `customExePath`); a user-added button below passes its
+    /// stored path explicitly and does not touch the text field or
+    /// `customExePathKey`.
+    private func launchCustomExe(_ path: String? = nil) {
+        let trimmed = (path ?? customExePath).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            logStore.log("Custom launch: empty path, ignored.", level: .error)
+            return
+        }
+        if path == nil {
+            customExePath = trimmed
+            UserDefaults.standard.set(trimmed, forKey: Self.customExePathKey)
+        }
+        setenv("MADEIRA_EXE", trimmed, 1)
+        unsetenv("MADEIRA_ARGS")
+        unsetenv("MADEIRA_DESKTOP")
+        runWineFullSequence()
+    }
+
+    /// UserDefaults key for the persisted, JSON-encoded `[CustomLaunchButton]`
+    /// array — the user-added buttons on the same row as launchTargets.
+    private static let customLaunchButtonsKey = "madeiraCustomLaunchButtons"
+
+    /// Decodes `customLaunchButtonsKey` for the `@State` initializer above;
+    /// any decode failure (missing key, corrupt data) is treated as "no
+    /// buttons yet" rather than a crash.
+    private static func loadCustomLaunchButtons() -> [CustomLaunchButton] {
+        guard let data = UserDefaults.standard.data(forKey: customLaunchButtonsKey),
+              let decoded = try? JSONDecoder().decode([CustomLaunchButton].self, from: data)
+        else {
+            return []
+        }
+        return decoded
+    }
+
+    private func saveCustomLaunchButtons() {
+        guard let data = try? JSONEncoder().encode(customLaunchButtons) else { return }
+        UserDefaults.standard.set(data, forKey: Self.customLaunchButtonsKey)
+    }
+
+    /// Add Button in the Custom Launch alert: takes the typed path as-is
+    /// (trimmed, same validation as Launch), derives a label from the exe's
+    /// file name (text after the last backslash, minus a trailing ".exe",
+    /// case preserved), and appends a persistent button — unless a button
+    /// for that exact path already exists, in which case this is a no-op
+    /// and the alert simply closes.
+    private func addCustomLaunchButton() {
         let trimmed = customExePath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             logStore.log("Custom launch: empty path, ignored.", level: .error)
@@ -3712,10 +3796,20 @@ struct ContentView: View {
         }
         customExePath = trimmed
         UserDefaults.standard.set(trimmed, forKey: Self.customExePathKey)
-        setenv("MADEIRA_EXE", trimmed, 1)
-        unsetenv("MADEIRA_ARGS")
-        unsetenv("MADEIRA_DESKTOP")
-        runWineFullSequence()
+        guard !customLaunchButtons.contains(where: { $0.path == trimmed }) else { return }
+        let fileName = trimmed.split(separator: "\\").last.map(String.init) ?? trimmed
+        let label = fileName.lowercased().hasSuffix(".exe")
+            ? String(fileName.dropLast(4))
+            : fileName
+        customLaunchButtons.append(CustomLaunchButton(label: label, path: trimmed))
+        saveCustomLaunchButtons()
+    }
+
+    /// Long-press ▸ Remove on a user-added button (see the ForEach above).
+    /// Built-in launchTargets buttons have no such context menu at all.
+    private func removeCustomLaunchButton(_ button: CustomLaunchButton) {
+        customLaunchButtons.removeAll { $0.path == button.path }
+        saveCustomLaunchButtons()
     }
 
     private func runTriangleTest() {

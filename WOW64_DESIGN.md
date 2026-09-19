@@ -6386,3 +6386,345 @@ guest-slots=… verdict=…`). Consequences:
   past its brand-string probe and read back a CPU name of `Unknown ARM CPU`
   (the single `ARM_UNKNOWN` entry), which is cosmetic and correct; whatever it
   does next is where the next line of evidence has to come from.
+
+- 2026-09-19 — **A DEBUG PROBE INSIDE `virtual_mutex` FAULTED, AND THE FAULT
+  DEADLOCKED THE WHOLE PROCESS AGAINST THE EXCEPTION THREAD.** The 2012-era
+  32-bit title from logs t85 (direct launch) / t86 (from the Wine desktop)
+  loads ~60 DLLs, gets past the ml980 CPUID fix, creates its CRT worker
+  threads and then stops dead: no `MADEIRA-EXIT`, no fault report, no
+  `[srv-stuck]`, `[waiters] parked=0`, `[prof] busy=0.04 cores wait=99.7%`
+  with only host UI threads sampled. All three silences have ONE cause, and
+  none of the hypotheses the symptom suggests (missing child process, absent
+  service, invisible modal, COM activation) is it: no `NtCreateUserProcess`
+  line exists in either log, and the last guest work is a thread creation.
+  **The chain, with line numbers.** t85:1119 and t85:1191 `[thr-create]
+  start=0x71786af7d0` — both new threads start at `msvcr100.dll+0x5f7d0`
+  (base `0x7178650000`, t85:784), i.e. `_beginthreadex`'s `_threadstartex`;
+  t85:1190 is their `SetThreadName` exception (`code=406d1388`). One of them
+  calls `VirtualAlloc(MEM_COMMIT)`, which takes `virtual_mutex` at the top of
+  `NtAllocateVirtualMemory` and holds it across the commit branch
+  (`virtual_ios.c:16930`). That branch ends in `ios_verify_commit_zero`
+  (`:11665`, the ml293 "MEM_COMMIT must read back as zero" probe), which did
+  a plain `ldrb` over the first 64 bytes of the freshly committed range —
+  t85:1195 `[store-noalias] addr=0x71018f2000 insn=0x3869680a
+  pc=0x10479e8a8 ... region 0x71018f0000+0x4000 prot=0 max=7`, t86:5280 the
+  identical fault at `0x7101902000`. The page the commit had just reported
+  `STATUS_SUCCESS` for is `PROT_NONE`, so the probe took `EXC_BAD_ACCESS`.
+  **Naming the frame is what makes this readable.** `llvm-nm -n` over the
+  shipped `.build/arm64-apple-ios/release/Madeira-App` gives
+  `_ios_pool_warmer_thread` at `0x1001a639c` and `_madeira_get_present_count`
+  at `0x10031c170`; the profiler prints both at runtime (`+0x33c` =
+  `0x10479a6d8`, and `0x104910170`), so the slide is `0x45f4000` exactly and
+  t85's `pc=0x10479e8a8` is `ios_verify_commit_zero+0x80` — the `ldrb
+  w10,[x0,x9]` of `ios_first_nonzero`. The same nm resolves the register dump
+  two lines later: t85:1213 `x0=0x1058db078` is `_virtual_mutex`
+  (`0x1012e7078 + 0x45f4000`) and t85:1214 `x16=0x12d` is
+  `__psynch_mutexwait`. **The main thread was already blocked on
+  `virtual_mutex` two seconds into the process.**
+  **Why the fault can never complete.** The Mach message goes to
+  `wine-x18-exc`, and every route it can take to deliver the exception locks
+  `virtual_mutex` (`virtual_handle_fault` `:15904`, the `[fault-rgn]` dumper
+  `:16031`, `virtual_setup_exception`) — a lock held by the very thread whose
+  fault it is servicing. t86's 20 s `[thread-stacks]` sampler states both ends
+  outright, unchanged across three consecutive dumps 20 s apart (t86:5702,
+  :6205, :6711): `port=0x1f9c3 "Core_5 - Thread 0"
+  pc=Madeira!ios_verify_commit_zero+0x80 run=3 susp=0 cpu=0` — parked AT the
+  faulting instruction — and (t86:5598, :6101, :6607) `port=0x10013
+  "wine-x18-exc" pc=__psynch_mutexwait x8=0x1061a709f`, i.e. mutex
+  `0x1061a7078` = `virtual_mutex` at t86's slide `0x4ec0000`. Neither ever
+  runs again, and every later `VirtualAlloc`/`VirtualProtect`/`VirtualFree`,
+  every page-fault fixup, every module load and every thread creation in the
+  process queues behind them. That is precisely why the wineserver-side
+  reporters said nothing: **nobody is in a server wait**, so `[srv-stuck]`
+  has nothing to report and `[waiters] parked=0` is accurate. The ml378
+  "BEST-EFFORT delivery on guest stack" line (t85:1197) is a red herring on
+  this path — the thread never gets far enough to use the fabricated frame.
+  **Fix 1 (`ml981`, the cause): a probe that runs under a process-wide lock
+  may never take a fault.** `ios_verify_commit_zero` now reads through
+  `mach_vm_read_overwrite` into a stack buffer instead of dereferencing the
+  guest pointer: an inaccessible page comes back as a failed `kern_return`
+  on the calling thread rather than an exception. The probe's own ml293
+  comment claimed it "can never itself fault" because it checks the
+  protection first — it checks the protection the CALLER ASKED FOR, not the
+  one the page ended up with, and that gap is the entire bug. A refused read
+  is now the loudest line in the log rather than a hang:
+  `[commit-noaccess] ... *** COMMIT SUCCEEDED BUT PAGE IS UNREADABLE ***
+  base=... size=... protect=... host_page_vprot=0x... unix_prot=0x...
+  region=...+... prot=... max=... rev=ml981`.
+  **What the next log must answer, and the standing hypothesis.**
+  `host_page_vprot` is the field to read. iOS host pages are 16 KB and guest
+  pages are 4 KB, `get_host_page_vprot` (`:8001`) ORs the four sub-page bytes
+  together, and `get_unix_prot` returns `PROT_NONE` for ANY vprot carrying
+  `VPROT_GUARD` (`0x10`, `:4532`). So a guest `MEM_COMMIT` of a 4 KB page
+  that shares its 16 KB host page with a `PAGE_GUARD` page makes the whole
+  host page inaccessible even though the commit itself is correct — which is
+  what a 2012 engine committing heap adjacent to its own guard page would
+  produce. If the next log prints `host_page_vprot` with bit `0x10` set, that
+  is confirmed, and upstream's `virtual_handle_fault` guard branch (`:15916`)
+  already self-heals it on first touch at the cost of one spurious
+  `STATUS_GUARD_PAGE_VIOLATION`; if bit `0x10` is clear while `unix_prot`
+  says `PROT_READ|PROT_WRITE`, then `mprotect_exec` is reporting a success it
+  did not apply and the hunt moves there. Deliberately NOT changed now:
+  `get_unix_prot`'s guard handling. Making a mixed guard/non-guard host page
+  accessible changes when the guest sees its guard-page exception, and that
+  is a behaviour decision that needs its own evidence, not a smuggled-in
+  side effect of a crash fix.
+  **Fix 2 (`ml981`, the diagnostic gap): `[thread-stacks]` is armed in every
+  launch mode.** The 20 s sampler was created inside
+  `winios_ensure_compositor` (`app/Madeira/Winios/Winios.m`), i.e. only when
+  explorer's desktop attaches — t86 has 697 `[thread-stacks]` lines and t85,
+  the direct launch of the same title hitting the same wedge, has **zero**.
+  The one report that answers "what is each thread blocked in" was absent
+  from exactly the mode being debugged. It now starts from
+  `winios_freeze_watch_start`, which runs in every mode, and announces itself
+  (`[thread-stacks] 20s sampler armed rev=ml981`) so its absence can never
+  again be mistaken for "nothing to report".
+  **Fix 3 (`ml981`): `[thread-stacks]` names the lock.** A thread stopped in
+  `__psynch_mutexwait` carries the contended mutex in `x0` (and `x0+0x27` in
+  `x8`). Printed raw it costs a slide reconstruction and an `llvm-nm` run —
+  the detour this entry is made of. `ios_name_unix_lock` (`virtual_ios.c`,
+  addresses only, reads no state, so it is safe from a sampler while the lock
+  is held) maps the process-wide locks whose loss stops everything —
+  `virtual_mutex`, `ios_pool_lock`, `ios_wow_mutex`, `fd_cache_mutex` — and
+  the dump now appends ` lock=ntdll:virtual_mutex`. One line, and this class
+  of hang identifies itself.
+  **Not the cause, checked and ruled out.** The store-client loader DLL
+  (t85:829) and `dbghelp.dll` (t85:1114) both load and return; the video
+  codec DLL maps at its own fixed base (t85:839); the only `err:`/`fixme:`
+  traffic after line 1000 is benign (`RtlSetHeapInformation`,
+  `wow64_NtQuerySystemInformation class 61453`, the `\\.\Nsi` device,
+  `set_native_thread_name`); the only `OutputDebugStringA` is our own d3d9
+  forwarding notice (t85:951); and neither log contains a process-creation
+  request of any kind.
+
+- 2026-09-19 â€” **The native ARM64 D3D9 frontend's first two device runs: a
+  four-byte struct-tail overrun that smashed the application's stack cookie,
+  and a guest arena that was never created at all.** Both titles bound the
+  unix side (`[unixlib] d3d9shim â€¦ -> wow64 table`), enumerated modes and got
+  `CreateDevice â€¦ -> hr 0x0`, so the transport, the handle table, the object
+  model and the vtables are right; both then died in guest code within a
+  handful of calls. The two causes are unrelated and both are at the boundary.
+
+  **(1) `0xC0000409` in the application's own epilogue (t90).** The last
+  crossings in the log are `GetDeviceCaps`, `GetAdapterIdentifier` and two
+  `CheckDeviceFormat`s, and the fault address is in the title, not in D3D9 â€”
+  which is what a `/GS` cookie check looks like: the frame was corrupted
+  earlier and the corruption is only detected when the function returns.
+  `D3DADAPTER_IDENTIFIER9` is the one struct the boundary classifies
+  "padding-only": every field at the same offset, but `sizeof()` is **1100**
+  on i386 and **1104** on LP64, because `d3d9types.h` opens with
+  `#pragma pack(push,4)` â€” which caps the `LARGE_INTEGER DriverVersion`
+  member's alignment at 4 on i386 and leaves it at 8 on LP64, so only the tail
+  padding differs. Measured, not assumed: `i686-w64-mingw32-clang` 1100,
+  `x86_64-w64-mingw32-clang` 1104, both against the same header, and the pack
+  directive is the SDK's, so an MSVC-built title has 1100 too. The unix entry
+  pointed the frontend at the guest buffer *in place* (the window check
+  already used `D3D9SHIM_SIZE32_*`, so only the write was wrong), and
+  `MTLD3D9Interface::GetAdapterIdentifier` (`src/d3d9/d3d9_interface.cpp:594`)
+  opens with `std::memset(pIdentifier, 0, sizeof(*pIdentifier))` â€” 1104 bytes
+  into an 1100-byte buffer. Titles declare that struct as a stack local, so
+  the four bytes past its end are the cookie. FIX: it bounces like a mirror.
+  `gen_d3d9_thunks.py` emits a host-layout local, hands the frontend that, and
+  copies back through a new `D3D9_COPY32_OUT(T, guest, host)` which copies
+  exactly `D3D9SHIM_SIZE32_<T>` bytes and carries its own
+  `_Static_assert(D3D9SHIM_SIZE32_##T <= sizeof(T))`; `D3D9_COPY32_IN` is the
+  other direction. Those two macros are the whole copy surface for a
+  padding-only struct, and `generator_self_check()` now **refuses to emit** any
+  `out_struct`/`inout_struct` whose target is not a mirror, a padding-only
+  bounce or a declared layout-identical struct â€” so the next struct added to
+  the description cannot default to a host-sized write into a guest buffer.
+  The audit behind that rule: `D3DCAPS9` 304/304, `D3DGAMMARAMP` 1536/1536,
+  `D3DLIGHT9` 104, `D3DMATERIAL9` 68, `D3DVIEWPORT9` 24, `D3DSURFACE_DESC` 32,
+  `D3DVOLUME_DESC` 28, `D3DVERTEXBUFFER_DESC` 24, `D3DINDEXBUFFER_DESC` 20,
+  `D3DDISPLAYMODE(EX)` 16/24, `D3DRASTER_STATUS` 8, `D3DCLIPSTATUS9` 8,
+  `RGNDATA` 36 â€” every one identical on both ABIs; the five mirrors already
+  bounced; `D3DADAPTER_IDENTIFIER9` was the only in-place write whose two
+  sizes differ, and it is the only one a title touches during device init.
+
+  **(2) The guest arena was never registered (t89).** The log says it plainly,
+  one line before `CreateDevice â€¦ -> hr 0x0`: `[d3d9-native] arena: no chunk
+  registered â€” the shim has not called d3d9_native_arena_register yet, so every
+  app-visible allocation fails`. `d3d9shim_arena_init()` only constructed its
+  critical section, on the reading that the arena grows on demand â€” but it
+  cannot, because the consumer is `dxmt::guest_alloc()` on the *native* side
+  and the only caller of `d3d9shim_arena_grow()` is the shim's answer to
+  `D3D9SHIM_STATUS_ARENA_EXHAUSTED`, which nothing ever produced. So the arena
+  started empty and stayed empty: every Lock mirror, every MANAGED/SYSTEMMEM
+  mirror and every backing-pool block was a NULL allocation while the create
+  call it was made for still returned `S_OK`. FIX: `d3d9shim_arena_init()`
+  (`d3d9shim_arena.c`) reserves and registers the first 64 MB chunk from the
+  transport handshake, before any D3D9 object can exist; and the
+  grow-and-retry path of Â§8.2(c) is now actually reachable â€” a `guest_alloc()`
+  that cannot be served leaves a *per-thread* mark
+  (`d3d9_native_arena_take_starved()`), the generated unix entry takes it
+  after every `HRESULT` method and, if the call also failed, returns
+  `D3D9SHIM_STATUS_ARENA_EXHAUSTED` so the shim grows and retries the same
+  block once. Only on a failed `HRESULT`, so a retry can never repeat work
+  that succeeded; per-thread so a starving DXMT worker cannot make an
+  unrelated call on another thread look like an exhaustion.
+
+  **What the bus fault in t89 is, and what it is not.** The store that faults
+  (`addr=0x7103721e5b insn=strb w22,[x19,w21,uxtw]`, guest `0x03721e5b`) is
+  **not** a `Lock` pointer: `[bus-rgn]` says `region=0x7103650000+0x33c000
+  prot=1 max=1 share_mode=4`, and `[fault-rgn]` says `protect=0x800021`, i.e.
+  `SEC_FILE | VPROT_READ | VPROT_COMMITTED` â€” a read-only **data-file** view,
+  not arena memory and not an image. The arena was empty in that run, so it
+  had handed the title no pointer at all. That fault therefore belongs to the
+  file-mapping path (a view the guest expected copy-on-write, mapped
+  `MAP_SHARED` read-only), not to D3D9, and is left to that owner; it is
+  recorded here because the arena line sitting immediately above it in the log
+  invites the opposite conclusion. What D3D9 owes is the ability to tell the
+  two apart next time, which is (3).
+
+  **(3) Two diagnostics the next log needs.** `MADEIRA_D3D9_LOCKCHECK=1` arms
+  a writability assertion on every pointer handed back to the guest â€” the two
+  `pBits` and the two buffer `Lock()`s' `ppbData`, all of which funnel through
+  `d3d9_guest_ptr32()`. In-window is not the same thing as writable, so the
+  pointer is looked up in the arena (a miss names a missed
+  `dxmt::guest_alloc()` site) and the first and last byte of its allocation are
+  read and written back unchanged: a non-writable mapping then faults on the
+  guest's own thread inside a named function with the allocation printed,
+  instead of thousands of translated instructions later. And `[d3d9-last]`:
+  the census summary only prints on a Present cadence, so a title that dies
+  during device init produced no census at all, and a fault in the
+  application's own code carries no D3D9 frame â€” the same counter site now
+  records a per-thread last opcode (printed by every census summary), and
+  `MADEIRA_D3D9_TRACE=1` prints one line per crossing, the last of which names
+  the call the guest was in when it died.
+
+  **What the next log should show.** The `[d3d9-arena] chunk 0xâ€¦â€¦â€¦ size 64 MB,
+  committed 64 MB` line during `Direct3DCreate9`, and **no** `arena: no chunk
+  registered`; `GetAdapterIdentifier` still reporting `hr 0x0` with the same
+  vendor/device/description, and the title getting past the caps-and-formats
+  block that `0xC0000409` used to end â€” i.e. a first `Present`, and with it the
+  first `[d3d9-native-census]` summary (which now also carries `[d3d9-last]`
+  and the arena high-water). Under `MADEIRA_D3D9_LOCKCHECK=1`, a handful of
+  `[d3d9-lockcheck] ok â€¦ writable` lines at the first `Lock`/`LockRect`; a
+  `[d3d9-lockcheck] â€¦ the arena never allocated it` line instead would name an
+  app-visible allocation site still on the host heap, and a fault *inside*
+  `d3d9_native_lockcheck` would mean the arena chunk itself is not committed â€”
+  either answer is a decisive one rather than a guest-side store with no
+  provenance. Both halves rebuilt and both host-validation compiles are clean
+  at `-Wall -Wextra`; `D3D9SHIM_API_HASH = 0xf49329770a2bc97b`, so a stale
+  half refuses at `_d3d9_init` rather than running with the old layout.
+
+- 2026-09-19 — **A WMA decoder MFT, on libavcodec, because there is no
+  GStreamer on iOS.** Device log t84, the same 2008-era 32-bit title as s79:
+  its PCM menu sounds were clean and everything else — gameplay music, cutscene
+  dialogue — was static and "the wrong audio". Three lines say why:
+
+      err:module:load_dll [dll-missing] L"C:\windows\system32\winegstreamer.dll"
+                          status=c0000135
+      err:ole:com_get_class_object no class object {5b4d4e54-…} could be created
+      fixme:ole:CoCreateInstanceEx no instance created for interface
+          {bf94c121-…} (IMFTransform) of class {2eeb4adf-4578-4d10-bca7-bb955f56320a}
+          (CLSID_CWMADecMediaObject), hr 0x80070005
+
+  The title's voices are xWMA. FAudio decodes one by asking COM for the
+  Windows WMA decoder MFT (`wine/libs/faudio/src/FAudio_platform_win32_wmadec.c`:
+  `CoCreateInstance(CLSID_CWMADecMediaObject, …, IID_IMFTransform, …)`); in Wine
+  that CLSID is `wmadmod.dll`, which forwards to `CLSID_wg_wma_decoder`
+  `{5b4d4e54-…}` in `winegstreamer.dll` (`wine/dlls/wmadmod/wmadmod.c:40`),
+  whose decoder is a GStreamer pipeline on the unix side. **And FAudio, handed
+  no decoder, submits the voice's COMPRESSED bytes to the mixer as if they were
+  PCM.** That is not a missing-feature failure mode, it is a loud one: it is
+  exactly the 8x-full-scale peaks the s79 audio census reported, and it is why
+  the bus limiter from that entry could make the result quieter but never
+  correct — a limiter on a bitstream is still a bitstream. A PCM menu sound
+  needs no decoder at all, which is the entire reason the menu sounded fine.
+
+  **Why the DLL was missing, and why the fix is not "turn it on".**
+  `configure` sets `enable_winegstreamer=no` when the GStreamer development
+  files are absent (`.xtool/logs/configure-wine-stageA.log`: "gstreamer-1.0
+  base plugins development files not found"), which puts `dlls/winegstreamer`
+  in the generated Makefile's `DISABLED_SUBDIRS` — so makedep emits its import
+  library and its two resources and *no object or module rules at all*. But the
+  gate is in `configure`, not in `Makefile.in`, and only the seven
+  `#pragma makedep unix` files (`unixlib.c`, `wg_allocator.c`, `wg_format.c`,
+  `wg_media_type.c`, `wg_muxer.c`, `wg_parser.c`, `wg_transform.c`) ever include
+  `<gst/gst.h>`. The PE half — including `wma_decoder.c` — has never needed
+  GStreamer. So the rules are written by the local stage scripts
+  (`.xtool/build-wine-i386.sh`, `.xtool/build-wine-64.sh`) and handed to make as
+  a second `-f` fragment that inherits `$(<arch>_CC/CFLAGS/LDFLAGS)` from the
+  real Makefile; upstream's `configure.ac` and `Makefile.in` are untouched.
+  `winegstreamer.dll` is now in the i386 farm (634,880 bytes) and the aarch64
+  farm (983,040 bytes, with `wmadmod.dll` beside it); the arm64ec farm is
+  unchanged because its build tree in this checkout is an include-only symlink
+  directory (`build-wine-64.sh --configure-arm64ec` would have to run first).
+  Nothing had to be registered: the shipped `app/Madeira/prefix-template.tar.gz`
+  was snapshotted from a host Wine that ran `wine.inf`'s `RegisterDllsSection`,
+  so `system.reg` already carries all 18 `wg_*` CLSIDs, `{2eeb4adf-…}` with its
+  `DirectShow\MediaObjects` and `MediaFoundation\Transforms` category entries,
+  and the `Wow6432Node` mirrors of both. **The registration was never the gap —
+  the binary and its unix side were.**
+
+  **The unix side** is `build/ntdll-unix/winegstreamer_unixlib_ios.c`, bound by
+  name in `virtual_ios.c`'s `load_builtin_unixlib()` like every other
+  statically-linked unixlib on this port, and backed by a minimal static FFmpeg
+  7.1.1 (`.xtool/build-ffmpeg.sh`; `--disable-everything` plus
+  `wmav1,wmav2,wmapro,wmalossless,xma1,xma2`, `--disable-gpl --disable-nonfree`,
+  LGPL-2.1+, recorded in `THIRD-PARTY-NOTICES.md`; the tarball is fetched at
+  build time and checked against a sha256 pinned in the script, never
+  committed; 620 KiB + 872 KiB + 120 KiB of archives, of which only the reached
+  objects are linked). It implements the `wg_transform` subset `wma_decoder.c`
+  uses — create/destroy/push_data/read_data/get_output_type/set_output_type/
+  drain/flush/get_status, with `notify_qos` a no-op and `wg_init_gstreamer` a
+  benign success so `main.c`'s `init_gstreamer_proc` lets the DLL load. Details
+  that are load-bearing:
+
+  * **Refusal is a feature.** `wg_transform_create` returns
+    `STATUS_NOT_SUPPORTED` for anything that is not a WMA-family
+    `WAVEFORMATEX`, and for a rate change. winegstreamer also hosts the aac,
+    h264, wmv, resampler and colour-converter transforms, and a transform that
+    accepts an H.264 stream and then emits nothing is worse for its caller than
+    one that never opened (§7.4 rule 4: no fake success). The rate check exists
+    because resampling is `CLSID_wg_resampler`'s job, and silently doing it here
+    would turn a negotiation bug into a pitch bug.
+  * **Packetisation.** Every WMA decoder in libavcodec wants one packet of
+    exactly `block_align` bytes; a pushed sample is one or more of those
+    (FAudio submits whole xWMA blocks), so the bytes are staged and split here,
+    and a trailing partial packet waits for the next push rather than being
+    decoded short. libswresample converts sample format and channel layout
+    only.
+  * **The wow64 table is real, not the stub.** A 32-bit title is the entire
+    reason this exists. `dlls/winegstreamer/unixlib.h` carries no 32-bit param
+    structs (nothing upstream enters that unixlib from the other bitness), so
+    they are written out in this file the way `nsi_unixlib_ios.c` writes
+    `struct nsi_enumerate_all_ex32`. Three shapes differ, and were verified by
+    compiling the same declarations for i686-windows and for the host:
+    `struct wg_media_type`'s union is a POINTER, so the struct is 24 bytes with
+    the format at +20 instead of 32 bytes with it at +24 (and
+    `wg_transform_create_params` is 80 bytes with `output_type` at +32, not 96
+    with it at +40); `..._push/read_data_params` puts `result` at +12, not +16.
+    `struct wg_sample` is **identical** in both builds — every member is
+    fixed-width and i386 aligns `INT64`/`UINT64` to 8 exactly as the host does —
+    so it is used in place and only its `data` member, which holds a GUEST
+    address, goes through `ios_wow_host_ptr()`. The entries that take a bare
+    `wg_transform_t` or a block of same-offset scalars (destroy, drain, flush,
+    get_status, notify_qos, init) share the 64-bit entry rather than getting a
+    field-copying thunk that is a second place for the layout to drift.
+
+  **The test.** `build/x86-tests/wma-x86.c` → `wma-x86.exe` (i386, no CRT,
+  `build/x86-tests/build-wma-test.sh`, launch button below the live view). It
+  walks FAudio's chain exactly: `CoCreateInstance(CLSID_CWMADecMediaObject,
+  IID_IMFTransform)`, a WMA V2 input type (44100 Hz stereo, `block_align` 743,
+  the 10 codec-private bytes in `MF_MT_USER_DATA`), a 16-bit PCM output type,
+  one `ProcessInput` of 11 real WMA packets and `ProcessOutput` until dry. The
+  embedded vector is 0.5 s of a 440 Hz sine at half full scale, encoded by a
+  host FFmpeg 7.1.1 `wmav2` encoder; the same packets decoded through this
+  file's exact code path on the host give 18432 samples/channel, peak 16488 and
+  a 442 Hz fundamental. **The test asserts the frequency, not just
+  non-silence**, because passing the compressed bytes through is loud too —
+  silence was never the symptom. Exit 62 pass, 63 created but decode failed, 64
+  class not registered (what the port did before this), 65 watchdog.
+
+  **What the next device log should show.** No
+  `[dll-missing] …winegstreamer.dll`, no `com_get_class_object` for
+  `{5b4d4e54-…}` and no `CoCreateInstanceEx … 0x80070005` for `{2eeb4adf-…}`;
+  a `[unixlib] winegstreamer (wma via libavcodec) (module …) -> wow64 table (…)`
+  line when the DLL loads; one
+  `[wma] decoder created fmt=wmav2 tag=0x161 44100Hz 2ch block=… extradata=… ->
+  pcm float32 44100Hz 2ch 32bit` per voice; and — the measurement that matters —
+  the audio census reporting `peak=` values at or below about 1.0 where s79
+  reported 7.991, with the bus limiter's gain sitting at 1.0 instead of riding
+  18 dB down.

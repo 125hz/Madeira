@@ -14794,12 +14794,34 @@ void ios_dump_all_thread_stacks(void)
                              (unsigned long long)st.__x[18],
                              have_wtid ? (unsigned long long)wtid : 0ull);
             }
+            /* ml981: NAME THE LOCK, don't print a bare address.
+             *
+             * A thread stopped in __psynch_mutexwait holds the contended mutex
+             * in x0 (and x0+0x27 in x8, which is what the register dumps show).
+             * Left raw, identifying it needs the image slide and llvm-nm over
+             * the shipped binary -- the detour that ml981's virtual_mutex
+             * deadlock cost. ios_name_unix_lock knows our own process-wide
+             * locks, and one of those parked is always the whole story. */
+            char lockname[48] = "";
+            {
+                extern const char *ios_name_unix_lock( unsigned long long addr );
+                const char *ln = NULL;
+                if (sym && strstr( sym, "psynch" ))
+                {
+                    if (!(ln = ios_name_unix_lock( st.__x[0] )))
+                        ln = ios_name_unix_lock( st.__x[8] - 0x27 );
+                }
+                if (ln) snprintf( lockname, sizeof(lockname), " lock=%s", ln );
+                else if (sym && strstr( sym, "psynch" ))
+                    snprintf( lockname, sizeof(lockname), " lock=0x%llx",
+                              (unsigned long long)st.__x[0] );
+            }
             fprintf(stderr, "[thread-stacks] port=0x%x \"%s\" pc=%s`%s+0x%llx run=%d susp=%d "
-                    "cpu=%d x8=0x%llx x18=0x%llx sp=0x%llx%s\n",
+                    "cpu=%d x8=0x%llx x18=0x%llx sp=0x%llx%s%s\n",
                     threads[i], tname, img, sym, (unsigned long long)off,
                     bi.run_state, bi.suspend_count, bi.cpu_usage,
                     (unsigned long long)st.__x[8], (unsigned long long)st.__x[18],
-                    (unsigned long long)arm_thread_state64_get_sp(st), tebstate);
+                    (unsigned long long)arm_thread_state64_get_sp(st), tebstate, lockname);
 
             /* ================= ml677 SPIN SNAPSHOT =========================
              *

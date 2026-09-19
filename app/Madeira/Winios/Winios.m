@@ -330,11 +330,38 @@ static void *winios_freeze_super(void *arg) {
     return NULL;
 }
 
+/* ml981: WEDGED-THREAD TRIAGE MUST NOT DEPEND ON THE DESKTOP BEING UP.
+ *
+ * Sample every thread's stack every 20s from an app-side timer — it keeps
+ * firing when all wine threads are stuck (unlike the tree dump, which rides
+ * wine's event drain).  It used to be armed only from winios_ensure_compositor,
+ * i.e. only when explorer's desktop attaches: a title started DIRECTLY got no
+ * [thread-stacks] at all, so a hang in that mode had to be reconstructed from
+ * register dumps and nm.  Device log t85 (direct launch) has zero
+ * [thread-stacks] lines and t86 (same title, same wedge, via the desktop) has
+ * 697 — and t86's answered the question in one line:
+ *   port=0x1f9c3 "..." pc=Madeira`ios_verify_commit_zero+0x80 run=3 cpu=0
+ *   port=0x10013 "wine-x18-exc" pc=__psynch_mutexwait ... (on virtual_mutex)
+ * Arm it from the freeze detector's start instead, which runs in every mode. */
+static void winios_stack_timer_start(void) {
+    extern void ios_dump_all_thread_stacks(void);
+    static dispatch_source_t stack_timer;
+    if (stack_timer) return;
+    stack_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                      dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    dispatch_source_set_timer(stack_timer, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC),
+                              20 * NSEC_PER_SEC, NSEC_PER_SEC);
+    dispatch_source_set_event_handler(stack_timer, ^{ ios_dump_all_thread_stacks(); });
+    dispatch_resume(stack_timer);
+    dprintf(STDERR_FILENO, "[thread-stacks] 20s sampler armed rev=ml981\n");
+}
+
 void winios_freeze_watch_start(void) {
     static int started;
     pthread_t th, sup;
     if (started) return;
     started = 1;
+    winios_stack_timer_start();
     wfz_t0 = winios_now_mono();
     winios_bg_observe();
     wfz_gen = 1;
@@ -1010,18 +1037,7 @@ static void winios_ensure_compositor(void) {
     winios_layout_compositor();
     fprintf(stderr, "[winios] compositor attached inside presentation frame\n");
     fflush(stderr);
-    /* Wedged-thread triage: sample every thread's stack every 20s from
-     * an app-side timer — keeps firing even when all wine threads are
-     * stuck (unlike the tree dump, which rides wine's event drain). */
-    static dispatch_source_t stack_timer;
-    if (!stack_timer) {
-        stack_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-                          dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
-        dispatch_source_set_timer(stack_timer, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC),
-                                  20 * NSEC_PER_SEC, NSEC_PER_SEC);
-        dispatch_source_set_event_handler(stack_timer, ^{ ios_dump_all_thread_stacks(); });
-        dispatch_resume(stack_timer);
-    }
+    winios_stack_timer_start();
 }
 
 /* main thread only */
