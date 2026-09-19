@@ -12374,9 +12374,40 @@ static const char *ios_pe_module_name( uint64_t base )
                                (mach_vm_address_t)&pe_sig, &got) != KERN_SUCCESS || got != 4)
         return "?";
     if (pe_sig != 0x00004550) return "?";
-    if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(base + e_lfanew + 0x88), 4,
-                               (mach_vm_address_t)&exp_rva, &got) != KERN_SUCCESS || got != 4)
-        return "?";
+    /* ml998: THE EXPORT DIRECTORY IS NOT AT THE SAME OFFSET IN PE32 AND PE32+.
+     *
+     * This read was hardcoded to e_lfanew+0x88, which is IMAGE_NT_HEADERS64's
+     * DataDirectory[0] (OptionalHeader at +0x18, DataDirectory at +0x70).  In a
+     * 32-bit image OptionalHeader32 puts DataDirectory at +0x60, so the export
+     * directory is at e_lfanew+0x78 and +0x88 is DataDirectory[2] -- RESOURCE.
+     * `exp_rva' was therefore the resource RVA, `name_rva' was read from offset
+     * 0x0c of IMAGE_RESOURCE_DIRECTORY (NumberOfNamedEntries | NumberOfIdEntries
+     * << 16, a small plausible-looking number that passes the range check), and
+     * the "name" was 63 arbitrary bytes from that address.
+     *
+     * That is where the profiler's `Zx' and `PnQ' modules came from: r76 line
+     * 6858 reports `jit by module: Zx=42.4% ... Zx=0.2%' -- the same two-letter
+     * garbage twice, for two different images, at 21-44 % of all CPU.  Both are
+     * 32-bit guest DLLs that the MZ probe had to name because they loaded after
+     * the one-shot loader walk (see ios_gmod32_build).  SizeOfImage happens to
+     * sit at +0x50 in BOTH layouts, which is why ios_gmod32_probe's own reads
+     * were right and only the name was wrong.
+     *
+     * Pick the layout from OptionalHeader.Magic, the field that exists to say
+     * which one it is. */
+    {
+        unsigned short magic = 0;
+        uint32_t ddir_off;
+        if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(base + e_lfanew + 0x18), 2,
+                                   (mach_vm_address_t)&magic, &got) != KERN_SUCCESS || got != 2)
+            return "?";
+        if (magic == 0x010b) ddir_off = 0x78;        /* PE32  */
+        else if (magic == 0x020b) ddir_off = 0x88;   /* PE32+ */
+        else return "?";
+        if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(base + e_lfanew + ddir_off), 4,
+                                   (mach_vm_address_t)&exp_rva, &got) != KERN_SUCCESS || got != 4)
+            return "?";
+    }
     if (!exp_rva || exp_rva > 0x10000000) return "(exe)";
     if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(base + exp_rva + 0x0c), 4,
                                (mach_vm_address_t)&name_rva, &got) != KERN_SUCCESS || got != 4)
@@ -12393,6 +12424,17 @@ static const char *ios_pe_module_name( uint64_t base )
         return "(exe)";
     namebuf[got < sizeof(namebuf) ? got : sizeof(namebuf) - 1] = 0;
     namebuf[sizeof(namebuf) - 1] = 0;
+    /* ml998: and refuse to report a name that cannot be one.  The PE32/PE32+ bug
+     * above spent a release printing `Zx' as if it were a module, which read as
+     * an exotic finding (a packer? a copy-protection stub?) rather than as the
+     * plain arithmetic error it was.  A module name is printable ASCII; anything
+     * else means the RVA chain did not land on a string, and "?" says so. */
+    {
+        unsigned i;
+        if (!namebuf[0]) return "?";
+        for (i = 0; namebuf[i]; i++)
+            if (namebuf[i] < 0x20 || namebuf[i] > 0x7e) return "?";
+    }
     return namebuf;
 }
 
@@ -13228,13 +13270,25 @@ static void ios_gmod32_add( unsigned long long base, unsigned long long size, co
     ios_gmod32_count++;
 }
 
-static void ios_gmod32_build( unsigned long long B )
+/* ml998: RE-WALKABLE.  This used to latch on ios_gmod32_from_ldr and never run
+ * again, so the map was a snapshot of whatever was loaded the first time a
+ * sample landed in 32-bit code -- and every DLL loaded after that had to be
+ * named by the MZ probe instead.  In r76 the walk ran at line 5164 with 50
+ * modules and the guest went on to load seven more (an XAudio2 implementation,
+ * an XACT engine, mfplat/mfreadwrite/rtworkq and two DMO codecs) at lines
+ * 5708-6701; the first of those is 21-44 % of all CPU for the rest of the run
+ * and the profiler called it `Zx'.  ios_gmod32_add already dedupes by base, so
+ * re-walking only ever appends, and ios_guest32_module_idx now asks for a
+ * re-walk when a sample misses the map. */
+static void ios_gmod32_build( unsigned long long B, int rewalk )
 {
     unsigned int ldr = 0, head32, cur32;
     unsigned long long peb32_host;
     int guard = 0;
+    static int announced;
 
-    if (!B || ios_gmod32_from_ldr) return;
+    if (!B) return;
+    if (ios_gmod32_from_ldr && !rewalk) return;
     if (!wow_peb) return;
     peb32_host = (unsigned long long)(uintptr_t)wow_peb;
 
@@ -13277,8 +13331,12 @@ static void ios_gmod32_build( unsigned long long B )
     if (ios_gmod32_count)
     {
         ios_gmod32_from_ldr = 1;
-        fprintf(stderr, "[prof] ml930 guest32 modmap: %d modules from PEB32->Ldr (B=0x%llx, "
-                        "image base 0x%llx)\n", ios_gmod32_count, B, ios_gmod32_imagebase);
+        if (ios_gmod32_count != announced)
+        {
+            announced = ios_gmod32_count;
+            fprintf(stderr, "[prof] ml930 guest32 modmap: %d modules from PEB32->Ldr (B=0x%llx, "
+                            "image base 0x%llx)\n", ios_gmod32_count, B, ios_gmod32_imagebase);
+        }
     }
 }
 
@@ -13313,13 +13371,26 @@ static void ios_gmod32_probe( unsigned long long B, unsigned long long rip )
 static int ios_guest32_module_idx( unsigned long long B, unsigned long long rip )
 {
     int i;
-    for (i = 0; i < 2; i++)
+    for (i = 0; i < 3; i++)
     {
         int m;
         for (m = 0; m < ios_gmod32_count; m++)
             if (rip >= ios_gmod32[m].base && rip < ios_gmod32[m].base + ios_gmod32[m].size)
                 return m;
-        if (i == 0 && B) ios_gmod32_probe( B, rip );
+        if (!B) break;
+        /* ml998: ask the LOADER first, then fall back to the MZ probe.  The
+         * loader knows the module's real BaseDllName; the probe can only read an
+         * export-table name, which is a different string (and absent entirely
+         * for an image with no exports).  Rate-limited because a sample in a
+         * genuinely unlisted image -- a manually mapped blob -- would otherwise
+         * re-walk the loader list every 5 ms forever, and the walk is ~50
+         * entries of mach_vm_read_overwrite. */
+        if (i == 0)
+        {
+            static unsigned misses;
+            if (!(misses++ & 0xff)) ios_gmod32_build( B, 1 );
+        }
+        else if (i == 1) ios_gmod32_probe( B, rip );
     }
     return -1;
 }
@@ -13836,7 +13907,7 @@ static void *ios_prof_thread( void *arg )
 
                 B = ios_profmap.guest_base;
                 if (!B) B = ios_prof_wow_window();
-                ios_gmod32_build( B );
+                ios_gmod32_build( B, 0 );
                 memset( modn, 0, sizeof(modn) );
 
                 for (s = 0; s < IOS_PROF_PC_MAX; s++)

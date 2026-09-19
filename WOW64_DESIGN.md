@@ -5982,3 +5982,407 @@ Everything here is emulator-generic; nothing is per-title.
   in a half-window that now has a second half. Rebuilt `libntdll_unix.a`
   (31 succeeded / 0 failed, 1 839 552 bytes); the only compiler diagnostic is the
   pre-existing `MemoryWineIosJitPoolAddress` `-Wswitch` note.
+
+### 9.6 Step 0 result (2026-09-18, device logs 79-83) — the entitlement is NOT required on the dev phone
+
+The launch probe ran with and without `extended-virtual-addressing` on the
+same device (iPhone18,3):
+
+| | with entitlement | without |
+|---|---|---|
+| `[va-map] top` | `0x8000000000` (512 GB) | `0x8000000000` (512 GB) |
+| free 4 GB-aligned slots | 112..127 (448-512 GB), 16 of 127 | identical |
+| verdict | identity-layout-possible | identity-layout-possible |
+| JIT pool | RX `0x1197..`, RW `0x1397..` | same band |
+| guest slot 0 | `B=0x7100000000` adopted | same |
+| result | games run | the UE3 title, the open-world title and `laa-x86.exe` (exit 60) all ran |
+
+So on this hardware/OS the task's VA top is 512 GB regardless of the
+entitlement, and the fork's fixed 448-512 GB layout works as is. The premise
+of 9.1 ("without the entitlement the top is 64 GB") was wrong for this
+device; it may still hold on older devices or OS versions, which is exactly
+what the probe reports at every launch (`[va-probe] entitlement=… top=…
+guest-slots=… verdict=…`). Consequences:
+
+- Nothing in 9.3 is needed to run without the entitlement HERE. The layout
+  table + lazy reservations remain the right design only for devices whose
+  probe says `top` < 512 GB or `guest-slots=0`; do not start that work until
+  a log from such a device exists.
+- Cheap hardening worth doing anyway: make session start consult the probe
+  result and refuse with a clear message (instead of failing deep inside
+  Wine) when `guest-slots=0`.
+- Tell upstream: the 32-bit work needs a free 4 GB-aligned slot in the
+  448-512 GB band, not the entitlement; the probe is the portable check.
+
+- 2026-09-18 — Log s79, the same title after the mixer landed: menu clean,
+  "horrible audio stutter and static during gameplay and cutscenes". **The
+  census written for the previous fix diagnosed this one by itself**, which is
+  the whole argument for spending log lines on answers rather than on call
+  counts: `[audio] stream 2: … frames_written=7338240 underruns=0 peak=7.991
+  playing`. Peak 7.99 is +18 dB over full scale, and this driver was hard-
+  clipping every one of those samples to 1.0.
+  **Why that is legal and why clipping is not.** A float WASAPI client is not
+  required to stay inside [-1, 1]; XAudio2 says so explicitly — voices sum
+  without clamping and the endpoint copes. Windows' shared-mode engine copes
+  with a limiter (its CAudioLimiter APO) that rides the gain down. Clipping a
+  signal that is eight times too large does not make it quieter, it replaces
+  it with a square wave, which is why the menu (one quiet voice, peak 0.313)
+  was clean and gameplay (many voices summed) was static. The peak climbed
+  0.815 → 4.006 → 5.007 → 6.992 → 7.991 across the session's 10 s windows, so
+  the census had also been watching it arrive.
+  **The three changes**, all in `build/ntdll-unix/audio_null_ios.c`:
+  1. **A bus limiter on the mixed signal** (`ios_limit_block`, line 874). Per
+     block: scan the block's peak BEFORE applying anything, move a peak
+     envelope (instant attack, one-pole ~250 ms release whose coefficient is
+     derived from the block length so the time constant does not depend on
+     Core Audio's buffer size), take `gain = min(1, 0.98/envelope)`, and ramp
+     from the previous block's gain to this one's. Ducking ramps over 1 ms so
+     a transient is caught inside the block that contains it; releasing ramps
+     over the whole block, because that is where zipper noise lives and the
+     envelope's release is already slow. The hard clamp stays, as a safety net
+     that now trims a fraction of a dB instead of 18. Cost is one max-scan and
+     one multiply per sample on a buffer already being walked, and the whole
+     path is skipped while gain is 1.0.
+  2. **A stereo endpoint now says it is one** (`ios_is_format_supported`, line
+     1722). s79 showed the title open a 5.1 stream beside its stereo one, feed
+     it 48000 frames a second of pure silence for the entire session
+     (`stream 1: … frames_written=5417760 … peak=0.000`), and put everything it
+     actually played through the stereo one. Answering "yes, 5.1 is fine" is
+     what a multichannel card says, and a client that hears it builds a
+     multichannel graph. Shared mode with more than two channels now returns
+     `S_FALSE`, which `mmdevapi`'s `client.c` turns into the stereo mix format
+     as the closest match — so the client builds the graph that matches the
+     hardware. `create_stream` still ACCEPTS more channels and downmixes them,
+     for callers that ignore the advice or never ask; the decision is logged
+     once.
+  3. **The period event is driven by the hardware clock** (`ios_timer_loop`,
+     line 1523). It was `usleep(10000); NtSetEvent();` — a clock SOURCE. On a
+     loaded device, with the game's mixer thread under FEX translation, 10 ms
+     of sleep is 10 ms plus whatever the scheduler adds, so wakeups drift
+     against the device and then bunch when the backlog clears: the client
+     mixes nothing for a while and then several periods at once. That is
+     audible as stutter while `underruns` stays at 0..2 for a whole session,
+     which is exactly what s79 reported — the ring never ran dry, and a game
+     hears the RATE its buffers are consumed at, not whether the mixer
+     starved. The thread is now a clock FOLLOWER: it signals when the engine
+     has consumed another period's worth of frames and sleeps for about as
+     long as the frames still queued will take, so a late wakeup signals at
+     once and lateness never accumulates. `NtSetEvent` stays on this Wine
+     thread — the Core Audio render thread must not enter Wine at all, which
+     is why the signal is not sent from the callback itself.
+     **With a liveness backstop**, which the clock-only version needs and does
+     not have for free: `play_pos` stops advancing the moment the ring is
+     empty, and the thing that refills the ring is this very event, so one
+     underrun would otherwise wedge a client into permanent silence. Two
+     periods of wall time with no signal forces one.
+  **And the ring is deeper** (line 1353): the floor goes from 100 ms to 200 ms
+  so a 60-80 ms stall of the game thread — a shader compile, a level chunk, the
+  JIT meeting new code — is not audible. This changes how much a client may
+  queue, not the latency the endpoint reports: `get_latency` (line 1831) and
+  `get_device_period` still describe the engine's 10 ms period, which is what
+  they are supposed to describe, and the two were conflated once already.
+  **The 10 s line grows the three numbers this round needed** and the next one
+  will: `limiter_min_gain=…` with a count of limited blocks on the engine line,
+  and `event_signals=…` plus `max_gap_ms=…` (the longest interval between two
+  `release_render_buffer` calls, line 1684) per stream. The `CREATE` line now
+  also prints what the client ASKED for (`asked=…ms ring=…ms flags=0x…`), since
+  "the ring is 200 ms" only means something next to the request it came from.
+  **What the next log should show.** On the engine line,
+  `limiter_min_gain=0.122 (N blocks limited)` for a client peaking near 8 —
+  0.98/7.99 — and a gain that stays at 1.000 when nothing is hot; the
+  per-stream `peak` stays the CLIENT's own pre-limiter peak, so peak 7.99 with
+  min_gain 0.122 is the limiter working and peak 7.99 with min_gain 1.000 is
+  the limiter not running. `[audio] is_format_supported 6ch shared -> S_FALSE`
+  once, followed — if the client takes the advice — by no 6-channel
+  `create_stream` at all and one fewer silent stream. Per stream,
+  `event_signals` near 100 per second of playing (one per 10 ms period) rather
+  than the ragged count a drifting timer gives, and `max_gap_ms` is the number
+  that finally separates the two stories: a gap far above 10 ms with
+  `underruns=0` is the client stalling (look at the game thread), while
+  `underruns` climbing with `max_gap_ms` near the period is us failing to
+  drain (look at the mixer). `ring=200ms` on every stream line.
+  **Test**: `build/x86-tests/audio-x86.c` stage (a2) now writes its 440 Hz tone
+  at x4 — +12 dB over full scale, which a float client is allowed to do — so
+  the whole path is exercised with a hot buffer, and it documents that
+  `S_FALSE` is the expected (not failing) answer to `IsFormatSupported(5.1)`
+  while `Initialize` on the same format must still succeed. Exit codes
+  unchanged: 59 = all paths passed.
+  Rebuilt `libntdll_unix.a` (31 succeeded / 0 failed, 1 842 088 bytes) and
+  checked the produced archive carries `limiter_min_gain`, `event_signals`,
+  `max_gap_ms` and the `S_FALSE` decision line.
+- 2026-09-19 — Logs r76/s79 (2008-era open-world 32-bit D3D9 title) + s81.
+  **Three of the four items came back negative, and the negatives are the
+  result**: LRCPC2 cannot pay on this port, the mystery 25.9 % module is our
+  own audio mixer, and the D3D9 redundant-state filtering the round was meant
+  to add is already there. One real bug fixed: the profiler has been printing
+  garbage module names for every late-loaded 32-bit DLL.
+  (1) LRCPC2 — DO NOT ENABLE. FEAT_LRCPC2's entire value is folding a
+  displacement into the access as `ldapur/stlur wR, [Xn, #imm9]`, which needs
+  the JIT to still HAVE the displacement when it emits the access. Behind a
+  guest window it never does: `Arm64JITCore::GetGuestMemAddr`
+  (`FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp`) returns `NoOffset` on
+  every non-identity path, deliberately — the base must be applied as
+  `Base + zext32(EA + disp)`, and an imm9 would add the displacement on the far
+  side of the window (`Base + zext32(EA) + disp`), which leaves the window
+  whenever an x86 effective address wraps at 4 GiB (the ml920 rule). Only the
+  `if (!GuestBase)` early return preserves `Offset`, and that is the Linux-host
+  path. So `SupportsTSOImm9 = true` emits `ldapur [Xn, #0]` — the same access as
+  `ldapr [Xn]`, one architecture version further up — and moves the displacement
+  add somewhere worse. Counted for `add [ebp-516], reg`, the load-modify-store
+  shape the hot blocks are full of: OFF = one IR `Add` for EA+disp that CSEs
+  across the load and the store, plus one `ApplyGuestBase` per access = **3**
+  address instructions; ON = `SelectAddressMode` peels the displacement so there
+  is no shared IR `Add` left and each access re-emits `sub Tmp, base, #516` +
+  `add Tmp, REG_GUEST_BASE, Tmp, UXTW` = **4**. A one-instruction REGRESSION per
+  load-modify-store, on a workload whose hot blocks are 95.1 % TSO-carrying —
+  and on an A12/A13 (ARMv8.3: LRCPC yes, LRCPC2 no) an unguarded enable emits an
+  undefined instruction in every JIT block. The unaligned back-patcher is not the
+  blocker and never was: it already decodes and rewrites both forms
+  (`Utils/ArchHelpers/Arm64.cpp` LDAPUR_INST/STLUR_INST at :2202, :2352, :2412).
+  The app now probes `hw.optional.arm.FEAT_LRCPC2` and REPORTS it without
+  applying it (`app/Madeira/ContentView.swift:4315-4368`, one sysctl at startup,
+  `[fex-cfg] FEAT_LRCPC2=…`); the wrong "what it buys" paragraph in
+  `FEX/Source/Windows/Common/CPUFeatures.cpp:82-116` is corrected in place.
+  Making this a win is a `GetGuestMemAddr` change (a window-safe displacement
+  path), not a feature-bit change, and the sysctl result is what that work would
+  gate on. NOTE: that CPUFeatures.cpp edit is comment-only and is NOT in the
+  shipped `xtajit.dll` yet — it goes out with the next FEX rebuild.
+  (2) "Zx" WAS NEVER A MODULE — IT WAS ARITHMETIC.
+  `ios_pe_module_name` (`build/ntdll-unix/signal_arm64_ios.c:12356`) read the
+  export directory at `e_lfanew + 0x88`, which is IMAGE_NT_HEADERS**64**'s
+  DataDirectory[0]. In a 32-bit image OptionalHeader32 puts DataDirectory at
+  +0x60, so the export directory is at `e_lfanew + 0x78` and +0x88 is
+  DataDirectory[2] — RESOURCE. `exp_rva` was therefore the resource RVA,
+  `name_rva` came from offset 0x0c of IMAGE_RESOURCE_DIRECTORY
+  (`NumberOfNamedEntries | NumberOfIdEntries << 16`, a small plausible number
+  that passes the range check), and the "name" was 63 arbitrary bytes from there.
+  Hence `Zx`, and `PnQ`, and `Zx` printed TWICE in one table (r76:6858
+  `Zx=42.4% … Zx=0.2%`) for two different images. `SizeOfImage` happens to sit at
+  +0x50 in both layouts, which is why `ios_gmod32_probe`'s own reads were right
+  and only the name was wrong. Now selected from `OptionalHeader.Magic`
+  (0x10b → +0x78, 0x20b → +0x88), and a name that is not printable ASCII is
+  reported as `?` rather than as a module, so the next instance of this
+  announces itself instead of looking like a discovery.
+  **Compounding half**: `ios_gmod32_build` latched on `ios_gmod32_from_ldr` and
+  never re-walked, so the map was a snapshot of whatever was loaded the first
+  time a sample landed in 32-bit code. In r76 it ran at :5164 with 50 modules and
+  the guest then loaded seven more at :5708-:6701 — an XAudio2 implementation, an
+  XACT engine, mfplat/mfreadwrite/rtworkq and two DMO codecs — none of which
+  could ever be named from the loader again. It is re-walkable now and
+  `ios_guest32_module_idx` asks the LOADER on a miss before falling back to the
+  MZ probe (rate-limited 1-in-256, because a sample in a genuinely unlisted image
+  would otherwise re-walk ~50 entries every 5 ms). The banner only reprints when
+  the count changes.
+  **WHAT IT IS**: guest base 0x79E30000 = the **XAudio2 implementation Wine
+  loads for the guest** — our own software mixer, not the game's code, not
+  middleware, and emphatically not a packer. The two hot blocks are a per-sample
+  conversion loop (`cvtsi2sd`, a `movsd` of a constant from the same image at
+  +0x2fe68, an 8-byte stack realign, vec=12/16 and mem=39/52 over ~100 guest
+  insts) and the two of them alone are ~5 % of all CPU; the module is **21-44 %
+  of all CPU** across the run. The largest single CPU consumer in this title is
+  software audio mixing, not rendering.
+  **AND THERE IS NO SMC / INVALIDATION STORM.** `blocks` rises monotonically and
+  never falls (9478 → 21049) while `hit_rate` RISES 70 % → 85 %: that is an open
+  world streaming in new code paths and a lookup cache warming, which is what
+  `+1150 blocks/window` means here. Invalidation traffic is 55 `[iOS-xrem]` lines
+  in the whole of r76. Nothing to fix. (`cpp_dispatch` is quantised to 16384
+  steps, so its per-second rate is an artefact of the counter, not a measurement.)
+  (3) PER-FRAME SERVER CALLS — the top one is ours and it is two round trips per
+  window MESSAGE, not per frame. `get_window_property: NtUserGetProp+0x7c` is
+  2088-2994 per 10 s in both logs, and the caller is the D3D9 focus-window
+  subclass: `research/dxmt/src/d3d9shim/d3d9shim_window.c:332-333` opens every
+  message with `GetPropW(hwnd, kFocusProcProp)` + `GetPropW(hwnd,
+  kFocusDeviceProp)`, each a `get_window_property` server round trip at 42 µs.
+  (The identical code in `d3d9/d3d9_device.cpp:2100-2101` is inside
+  `#ifndef DXMT_MADEIRA` and is not the one running.) The shim INSTALLED the
+  subclass, so it already knows both values: a small HWND-keyed process-local
+  table with `GetPropW` kept only as the miss path removes both round trips.
+  Left to the owner of that file. `set_cursor` is the app itself —
+  `NtUserShowCursor+0x4c` 728-988 and `NtUserClipCursor+0x1f0` 364-494 per 10 s,
+  i.e. a per-frame `ShowCursor`, in user32/win32u. `get_async_result:
+  irp_completion+0x58` and `ioctl: server_ioctl_file+0x17c` are **976-978 per
+  10 s in all three logs regardless of load** — a fixed ~97.7/s, i.e. a ~10.2 ms
+  periodic overlapped-IRP poll (the shape of a HID/input device read), not
+  per-frame work; at 70 µs the pair it is 0.7 % of one core and not worth a
+  change this round. Whole-server cost is `in-call` 1.0-1.3 s per 10 s =
+  0.10-0.12 core, so item (3)'s entire addressable budget is smaller than one of
+  the two audio blocks in item (2).
+  (4) D3D9 REDUNDANT-STATE FILTERING IS ALREADY IMPLEMENTED — all four methods,
+  with the early-out after the validation gates and after the census hook,
+  exactly as asked: `SetTexture` `if (m_textures[slot].ptr() == common) return
+  D3D_OK` (`d3d9_device.cpp`, with a comment naming the "engines that re-issue
+  every per-draw state-set" case), `SetRenderState` `if (m_renderStates[State] ==
+  Value)`, `SetSamplerState` `if (m_samplerStates[slot][Type] == Value)`, and
+  `SetVertexShaderConstantF` a `memcmp` short-circuit against the shadow array
+  (hot registers and the >=256 overflow store both). Nothing to add. So the
+  13.8 % of all CPU in `d3d9-emulated.dll` is NOT redundant work — it is the
+  fixed per-call cost of 5540 i386 calls per frame going through the JIT, and the
+  one remaining lever is the native ARM64 frontend. That matters more here than
+  it did for the UE3 title (4.6 %): **13.8 % is well clear of the 5 % bar**, and
+  the A/B is unchanged — `Documents/madeira-d3d9.txt` = `native`.
+  One contained thing an owner of `d3d9_census.cpp` should weigh: `D3D9_CENSUS`
+  runs `g_calls[code].fetch_add` AND `census::ringCall(code)`
+  (`d3d9_census.cpp:415`, a second atomic RMW plus an out-of-line call and ~8
+  stores) on every one of those 5540 calls/frame — ~220 k calls/s, ~440 k JIT'd
+  `lock xadd`/s, on the hottest path of the hottest guest DLL. The counter is the
+  measurement; the `[d3d9-last]` ring is crash forensics and could be gated
+  separately without losing a number anyone reads.
+  **What to look for in the next log:** no `Zx` and no `PnQ` in `[prof] jit by
+  module` — the audio DLL named properly and appearing ONCE, and `?` only where a
+  module genuinely has no readable export name; `[prof] ml930 guest32 modmap`
+  reprinting with a rising count as the guest loads more DLLs (50 → ~57 in r76's
+  shape); `[fex-cfg] FEAT_LRCPC2=1` on A14+ with the "NOT auto-enabled" text and
+  no change to `jit tso`. Unchanged on purpose: `blocks`, `hit_rate`, the server
+  `kinds` table, and `d3d9-emulated.dll`'s share.
+
+- 2026-09-19 — **A 32-bit title died in `strlen` inside 64-bit ntdll, called
+  from `libwow64fex.dll+0x1ca44` with `x0 = 0xfff95000`. It is NOT a missing
+  `+ B`: it is an out-of-range subscript in FEXCore's CPUID brand-string
+  emulation, and it can fire on any host, on any title that asks the CPU its
+  name.** Log s83, ~1230 lines in, right after wininet/windowscodecs/propsys
+  load: `SEGV pc=0x11aca4ffc addr=0xfff95000 x0=x19=0xfff95000`,
+  `pc PE: ntdll.dll+0x68ffc`, `lr PE: libwow64fex.dll+0x1ca44`, insn stream
+  `aa1f03e8 [38686809] 91000508 35ffffc9` — a `ldrb w9,[x0,x8]` strlen loop.
+  **Naming the frame decides the whole diagnosis.** `llvm-objdump -d
+  --start-address` over the SHIPPED `app/Madeira/aarch64-windows/xtajit.dll`
+  (ImageBase `0x180000000`, so RVA `0x1ca44` becomes VA `0x18001ca44`) lands one
+  instruction past `bl strlen` inside
+  `_ZNK7FEXCore8CPUIDEmu19Function_8000_0002hEj` —
+  `FEXCore::CPUIDEmu::Function_8000_0002h(uint32_t Leaf) const`, the
+  **processor brand string**, CPUID leaf `0x8000'0002`. The caller-insn word in
+  the log (`@lr-4 = 0x9406f54e`) is that `bl` exactly, and the guest state
+  confirms it from the other side: `rax=0x80000002`, with `rbx=0x756e6547`
+  ("Genu") and `rdx=0x49656e69` ("ineI") still in the registers from the
+  `CPUID(0x8000'0000)` the guest issued one instruction earlier. Full chain:
+  32-bit guest `cpuid` -> `Pointers.CPUIDFunction` (`JIT.cpp:750`, the
+  NONCONSTANT path — leaves `0x8000'0002..4` and `0x1A` are marked
+  `NONCONSTANT` in `CPUID.h`, so they are *not* constant-folded by
+  `RegisterAllocationPass.cpp:533` and are resolved at runtime) ->
+  `CPUIDEmu::RunFunction` -> `Function_8000_0002h(Leaf)` ->
+  `PerCPUData[GetCPUID()].ProductName` -> `strlen`. `BTCpuSimulate` ->
+  `BTCpuSimulateImpl` -> `ExecuteThread` is the outer frame; the `[exit-stk]`
+  dump agrees.
+  **Why it is not a pointer-namespace bug, stated so it cannot be re-litigated.**
+  `PerCPUData[i].ProductName` is assigned in exactly three places
+  (`CPUID.cpp:171`, `:391`, `:405`) and every one of them stores a
+  `ProductNames::*` string literal — `.rdata` of this very module, which in
+  log s83 is mapped at host `0x70ffcc…`. A correctly-indexed element therefore
+  **cannot** hold `0xfff95000`, with or without a guest window, so no `+ B` is
+  missing anywhere on this path. The disassembly shows what actually happened:
+  `blr [this+0x40]` (`GetCPUID`), `ubfiz x9, x0, #4, #32`, `ldr x19, [x8, x9]`
+  — an unchecked `<< 4` subscript into a `fextl::vector<CPUData>` of 16-byte
+  entries. `0xfff95000` is whatever the neighbouring heap object held. (It has
+  two flattering readings — guest `0xfff40000 + 0x55000`, i.e. inside the
+  i386 ntdll that `[laa]` put in the high half yesterday, and the low 32 bits
+  of host `0x70fff00000 + 0x95000`, the 64-bit ntdll — and both are
+  coincidences of "near the top of a 4 GB region". Neither is reachable
+  through this code.)
+  **The mismatch that makes the subscript out of range.** `PerCPUData` is sized
+  by `SetupHostHybridFlag` from `HostFeatures.CPUMIDRs`
+  (`CPUID.cpp:159`; `Cores = CPUMIDRs.size()` at `:1346`). `GetCPUID()` answers
+  from a completely unrelated source: on this branch
+  `GetCPUID_Syscall` -> `FHU::Syscalls::getcpu` -> the `_WIN32` arm,
+  `GetCurrentProcessorNumber()` (`Syscalls.h:123`) ->
+  `FEX/Source/Windows/Common/WinAPI/Sync.cpp:130` ->
+  `NtGetCurrentProcessorNumber` -> `build/ntdll-unix/thread_ios.c:3215` ->
+  `pthread_cpu_number_np()`, i.e. the REAL core the thread is on, 0..N-1 on the
+  device. And the iOS branch of `FEX::Windows::CPUFeatures::FetchHostFeatures`
+  publishes **one** synthetic MIDR (`CPUFeatures.cpp:117`,
+  `HostFeatures.CPUMIDRs.push_back(0u)`) because the `Hardware\…` registry keys
+  the non-iOS branch reads do not exist here. So `PerCPUData.size() == 1` while
+  `GetCPUID()` returns 0..5, and every brand-string CPUID taken on a core other
+  than 0 read 16/32/48/64/80 bytes past a 16-byte allocation. Note also that
+  `SupportsCPUIndexInTPIDRRO` is `!IsWine` (`CPUFeatures.cpp:145`), so under
+  Wine the TPIDRRO fast path is off and the `getcpu` path above is the live one.
+  **The fix (`ml980`), in FEXCore, generic, no placement involved.**
+  `CPUID.h:188` adds `WrapCPUIndex()` — the ONE place a host CPU number becomes
+  a `PerCPUData` subscript — and `:197` `CurrentCPUIndex()`. `RunFunctionName`
+  (`:60-68`) now calls it instead of open-coding `CPU % PerCPUData.size()`,
+  which also removes the divide-by-zero it would have taken on an empty list.
+  The single-argument overloads the JIT actually calls are switched over:
+  `CPUID.cpp:1116/:1120/:1124` (leaves `0x8000'0002/3/4`) and `:928`
+  (`Function_1Ah`, the hybrid leaf — unreachable while there is one MIDR, but
+  wrong in exactly the same way). `Function_01h`'s local APIC ID (`:466`) is
+  bounded too: an APIC ID must be one of the `Cores` addressable IDs reported
+  in the same EBX, and an unbounded one also made a leaf that FEX's own tables
+  call NONCONSTANT vary by *which core ran it*. Wrapping rather than clamping
+  keeps `RunFunctionName`'s existing behaviour bit-for-bit.
+  **Deliberately NOT done: resizing `CPUMIDRs` to the real core count.** That
+  is the other way to make the two numbers agree, and it is a guest-visible
+  topology change — `Cores` feeds CPUID.01h EBX[23:16], "number of addressable
+  logical cores", which is how legacy code counts CPUs. The guest already gets
+  the true count from `peb->NumberOfProcessors` via `GetSystemInfo`, so the
+  disagreement is cosmetic today; raising it would change how a title sizes its
+  worker pools, which is a separate decision with its own A/B and not something
+  to smuggle into a crash fix. The invariant that must hold either way is the
+  one now enforced: **the index is bounded by the table, not by a hope that two
+  independent sources of "how many cores" agree.**
+  **Why it never fired before.** Not placement, and not luck about `[laa]`.
+  Nothing else we have run issues `CPUID(0x8000'0002)`: no other log in the
+  series contains a `libwow64fex.dll+0x1ca44` frame, or any frame in that
+  function. It is a brand-string probe — a CRT / CPU-detection idiom a 2012-era
+  title does at startup and that our test programs, the D3D9 cube and the other
+  titles never do. Once a title *does* issue it the fault is near-certain
+  rather than rare: roughly five cores in six give an out-of-range index, and
+  the read only survives if the neighbouring heap word happens to be a readable
+  host pointer — in which case the guest silently got a garbage CPU name, which
+  is the "working by accident" outcome the same code would have produced on any
+  earlier build. Before yesterday the same OOB read would have found a
+  *different* garbage word; had it been a guest address it would have read
+  `0x7bf95000` instead of `0xfff95000` and faulted identically. The high-half
+  placement neither caused this nor is any part of the fix, and no builtin
+  needs pinning back to its traditional base on this account.
+  **Audit of the WOW64 module for the same class** (every value read from guest
+  registers, guest memory or a guest image header that is then dereferenced or
+  passed to a host function as a pointer). Already correct, with the evidence
+  in place: `HandleSyscallImpl`'s `[ESP]` return address, the unix-call
+  `StackLayout` and its `Args` block, and the `Wow64SystemServiceEx` argument
+  block (`Module.cpp:742`, `:751`, `:764`, `:776`, all via
+  `GuestWindow::ToHost`/`ToHostPtr`); `LdrSystemDllInitBlock.ntdll_handle`
+  (`:1119-1121`, guest -> `ToHost` before `HandleImageMap`); TEB32 via
+  `GetWowTEB` (`:400`) with a window assertion; the BOP page, published guest
+  and tracked host (`:1217`); `LookupExecutableFileSection` /
+  `QueryGuestExecutableRange` / `Mark*Range` (`:806-845` — `+B` in, `-B` out,
+  and a `Contains()` rejection instead of arithmetic nonsense for anything
+  outside the window); `BTCpuResetToConsistentStateImpl`'s
+  `ExceptionInformation[1]` (`:1700`, kept HOST on purpose — `wow64.dll`'s
+  `exception_record_64to32` owns the single `-B`); every `BTCpuNotify*`
+  callback (`:1783-1900`, host by contract, each with its `wow64.dll` call site
+  cited); `GetImageNameFromExports` (`:436`, RVA bounded by `SizeOfImage`);
+  `InvalidationTracker::DetectMonoBackpatcherBlock`
+  (`InvalidationTracker.cpp:927`, lifts a guest RIP by `GuestBase` before
+  reading code bytes); `CallRetStack::RejectNonPoolTargets`
+  (`CallRetStack.h:183`, refuses a frame whose host half is a guest address).
+  `BTCpuIsProcessorFeaturePresent` and `BTCpuUpdateProcessorInformation` take
+  no guest pointer at all. One incidental invariant worth recording: `B` is
+  4 GiB-aligned, so `wow64_private.h`'s `host_ptr32()` (`(ULONG)(addr - B)`) is
+  correct whether it is handed a host address in the window or a value that is
+  already a guest address — which is why `HandleGuestException`
+  (`Common/Exception.h:15`) writing a guest `Eip` into a 64-bit
+  `EXCEPTION_RECORD` still produces the right 32-bit record.
+  One latent gap, currently failing closed and left alone:
+  `LoadImageVolatileMetadata` (`ImageTracker.cpp:51-57`) compares
+  `LoadConfig->VolatileMetadataPointer` — a `ULONG` guest VA, since
+  `ArchImageLoadConfigDirectory` is `_IMAGE_LOAD_CONFIG_DIRECTORY32` for this
+  build — against `Address`, a HOST image base at or above `0x7100000000`. The
+  test is therefore always true and the function returns before dereferencing
+  anything, so volatile metadata is silently disabled for every windowed
+  process. That is a missing `+ B`, but it costs an optimisation rather than
+  correctness, and enabling a path that has never once run on this target does
+  not belong in a crash fix.
+  **Built**: `.xtool/build-fex.sh` (42/42, `libwow64fex.dll` ->
+  `app/Madeira/aarch64-windows/xtajit.dll`, 4 702 208 B) and
+  `.xtool/build-fex-arm64ec.sh` (`app/Madeira/arm64ec-windows/xtajit64.dll`,
+  5 246 976 B), because `CPUID.cpp`/`CPUID.h` are FEXCore and shared with the
+  ARM64EC module. Verified in both shipped binaries: `Function_8000_0002h` now
+  emits `ldp x8, x9, [x19, #0x28]` -> size -> `cmp #2` -> `udiv`/`msub` before
+  the `<< 4`, with a branch to index 0 for a one-entry table. `wow64.dll` was
+  not touched.
+  **What the next log should show**: one new line per process, early,
+  `[cpuid] ml980 PerCPUData entries=1 host cpu now=<0..5> source=getcpu …`
+  (`CPUID.cpp:1376`) — `entries=1` against a varying `host cpu` IS the
+  mismatch, printed where a future reader can see it without a disassembler —
+  and no `SEGV … lr PE: libwow64fex.dll+0x1ca44` at all. The title should walk
+  past its brand-string probe and read back a CPU name of `Unknown ARM CPU`
+  (the single `ARM_UNKNOWN` entry), which is cosmetic and correct; whatever it
+  does next is where the next line of evidence has to come from.

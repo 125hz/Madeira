@@ -456,10 +456,15 @@ static void stage_wasapi_51(void)
     write_hex32((unsigned int)hr);
     if (closest) { WRITE_LINE(" closest: "); write_fmt(closest); CoTaskMemFree(closest); }
     WRITE_LINE("\n");
+    /* S_FALSE (0x1) is the EXPECTED answer from a stereo endpoint and is what
+     * steers a client into building a stereo graph; the closest match printed
+     * above should be the stereo mix format. Initialize must still succeed on
+     * the 5.1 format below, because a caller is allowed to ignore the advice
+     * and the driver downmixes for it. Only a FAILED hr is a bug here. */
     if (FAILED(hr))
     {
-        WRITE_LINE("MADEIRA-AUDIO: a shared-mode engine that refuses 5.1 sends every "
-                   "multichannel title down its own downmix path or none at all.\n");
+        WRITE_LINE("MADEIRA-AUDIO: IsFormatSupported returned a hard failure for 5.1; "
+                   "S_OK or S_FALSE-with-closest-match are the only correct answers.\n");
         ExitProcess(60);
     }
 
@@ -497,7 +502,15 @@ static void stage_wasapi_51(void)
     out = (float *)data;
     for (i = 0; i < want; i++)
     {
-        float v = sine64[(phase >> 16) & 63];
+        /* x4, i.e. +12 dB over full scale. A float WASAPI client is allowed to
+         * do this -- XAudio2 voices sum without clamping and leave it to the
+         * endpoint -- and a driver that answers by hard-clipping turns the
+         * tone into a square wave. The device reported exactly that from a
+         * title whose mastering voice peaked at 7.99. There is no way for this
+         * program to hear the result, but it does prove the whole path still
+         * accepts and drains a hot buffer, and the driver's own 10 s census
+         * prints peak=4.00x against a limiter_min_gain near 0.245. */
+        float v = sine64[(phase >> 16) & 63] * 4.0f;
         out[i * 6 + 0] = v;       /* FL  */
         out[i * 6 + 1] = v;       /* FR  */
         out[i * 6 + 2] = 0.0f;    /* FC  */

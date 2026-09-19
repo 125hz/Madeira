@@ -4311,6 +4311,61 @@ struct ContentView: View {
                     logStore.log("FEX config: \(applied.joined(separator: " ")) via madeira-fex.txt")
                 }
             }
+
+            // ml998/2026-09-18: FEAT_LRCPC2 probe.
+            //
+            // CPUFeatures.cpp cannot ask the CPU what it is -- it is a PE module with
+            // no unix func table -- so HOSTFEATURES=ENABLELRCPC2 was left as a user
+            // opt-in. The app CAN ask, and this is where the answer belongs, one
+            // sysctl at startup. It is REPORTED and deliberately NOT auto-applied;
+            // the reason is a property of this port, not of the silicon, so it is
+            // worth stating where the next person will look for it.
+            //
+            // LRCPC2's whole value is folding a displacement into the access as
+            // `ldapur/stlur wR, [Xn, #imm9]'. That can only happen if the JIT still
+            // has the displacement when it emits the access -- and behind a guest
+            // window it never does. Arm64JITCore::GetGuestMemAddr (FEXCore JIT
+            // MemoryOps.cpp) returns NoOffset on EVERY non-identity path, because
+            // the guest base has to be applied as `Base + zext32(EA + disp)' and an
+            // imm9 would add the displacement on the far side of the window
+            // (`Base + zext32(EA) + disp'), which leaves the window whenever an x86
+            // effective address wraps at 4 GiB. So LoadMemTSO/StoreMemTSO see
+            // Guest.Offset invalid, emit `ldapur [Xn, #0]', and the displacement is
+            // still materialised by the add/sub inside GetGuestMemAddr.
+            //
+            // Counted, for `add [ebp-516], reg' (load-modify-store, the shape the
+            // hot blocks are full of):
+            //   OFF: one IR Add for EA+disp, CSE'd across the load and the store,
+            //        plus one ApplyGuestBase per access  = 3 address instructions.
+            //   ON:  SelectAddressMode peels the displacement, so there is no IR Add
+            //        to share, and each access re-emits `sub Tmp, base, #516' plus
+            //        `add Tmp, GUEST_BASE, Tmp, UXTW'  = 4.
+            // It is a one-instruction REGRESSION per load-modify-store here, not a
+            // win, and on an A12/A13 (ARMv8.3, LRCPC but not LRCPC2) an unguarded
+            // enable would emit an undefined instruction in every JIT block. Hence:
+            // report, do not apply. Turning this into a win needs GetGuestMemAddr to
+            // learn a window-safe offset path first; the sysctl result below is what
+            // that work would gate on.
+            do {
+                var lrcpc2: Int32 = 0
+                var sz: Int = MemoryLayout<Int32>.size
+                let ok: Bool = sysctlbyname("hw.optional.arm.FEAT_LRCPC2", &lrcpc2, &sz, nil, 0) == 0
+                let present: Bool = ok && lrcpc2 != 0
+                var msg: String = "[fex-cfg] FEAT_LRCPC2="
+                msg += ok ? String(lrcpc2) : "?"
+                if present {
+                    msg += " -> LRCPC2 TSO addressing AVAILABLE but NOT auto-enabled:"
+                    msg += " GetGuestMemAddr folds every displacement into the address behind"
+                    msg += " the guest window, so ldapur #0 would save nothing and would cost"
+                    msg += " one extra instruction per load-modify-store"
+                } else {
+                    msg += " -> LRCPC2 unavailable on this CPU; TSO stays on ldapr/stlr"
+                }
+                if getenv("FEX_HOSTFEATURES") != nil {
+                    msg += " | HOSTFEATURES set by madeira-fex.txt, left alone"
+                }
+                logStore.log(msg)
+            }
             // ===== end FEX JIT settings =========================================
 
             // ml734: Theorafile call tracer. Documents/madeira-tf-trace.txt == "1"

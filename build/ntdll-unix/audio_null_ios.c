@@ -386,6 +386,13 @@ struct ios_stream {
     _Atomic uint64_t stat_frames_written;
     _Atomic uint32_t stat_underruns;
     _Atomic uint32_t stat_peak_q16;
+    _Atomic uint32_t stat_event_signals;
+    _Atomic uint32_t stat_max_gap_us;   /* longest silence between two
+                                         * release_render_buffer calls: the
+                                         * one number that says whether a
+                                         * dropout was the client stalling or
+                                         * us failing to drain */
+    uint64_t last_release_mach;
 };
 
 /* ml739: one stream object per client, mirroring Wine's CoreAudio driver.
@@ -833,12 +840,103 @@ static void ios_mix_stream(struct ios_stream *s, float *out, UInt32 nframes)
     atomic_store_explicit(&s->play_pos, play, memory_order_release);
 }
 
+/* ---------------------------- the bus limiter ----------------------------
+ *
+ * A float WASAPI client is NOT required to keep its samples inside [-1, 1].
+ * XAudio2 says so explicitly: voices sum without clamping and it is the
+ * endpoint's job to cope.  The device census caught a title's mastering voice
+ * running at a peak of 7.99 -- +18 dB over full scale -- and this driver was
+ * hard-clipping every one of those samples to 1.0.  Clipping a signal that is
+ * eight times too big does not make it quieter, it replaces it with a square
+ * wave: that is the "horrible static" the device reported, and it appeared in
+ * gameplay and cutscenes (many voices summed) while the menu (one quiet
+ * voice) sounded fine.
+ *
+ * Windows does not clip here either; its shared-mode engine runs a limiter
+ * that rides the gain down.  So does this.  Per block: find the block's peak
+ * BEFORE applying anything, move an envelope follower (instant attack, ~250 ms
+ * release), derive gain = min(1, 0.98/envelope), and ramp linearly from the
+ * previous block's gain to this one's across the block so the gain changes do
+ * not themselves become zipper noise.  The hard clamp stays as a safety net
+ * for the one block a transient can outrun, where it now trims a fraction of
+ * a dB instead of 18.
+ *
+ * Cost: one max-scan and one multiply per sample, on a buffer that is already
+ * being walked.  All three variables are owned by the render thread alone. */
+#define IOS_LIMITER_CEILING 0.98f
+#define IOS_LIMITER_RELEASE_FRAMES 12000u   /* ~250 ms at 48 kHz */
+
+static float g_lim_env;          /* peak envelope, RT-owned */
+static float g_lim_gain = 1.0f;  /* gain applied at the end of the last block */
+static _Atomic uint32_t g_lim_min_gain_q16;  /* census: worst gain this window */
+static _Atomic uint32_t g_lim_active;        /* census: blocks that needed < 1 */
+
+static void ios_limit_block(float *out, size_t samples, UInt32 nframes)
+{
+    float peak = 0.0f, target, gain, dg;
+    size_t j;
+
+    for (j = 0; j < samples; j++) {
+        float a = out[j] < 0.0f ? -out[j] : out[j];
+        if (a > peak) peak = a;
+    }
+
+    /* Instant attack, one-pole release.  The release coefficient is derived
+     * from this block's length so the time constant is the same whatever
+     * buffer size Core Audio hands us. */
+    if (peak > g_lim_env) g_lim_env = peak;
+    else {
+        float k = (float)nframes / (float)IOS_LIMITER_RELEASE_FRAMES;
+        if (k > 1.0f) k = 1.0f;
+        g_lim_env += (peak - g_lim_env) * k;
+    }
+
+    target = g_lim_env > IOS_LIMITER_CEILING ? IOS_LIMITER_CEILING / g_lim_env : 1.0f;
+
+    if (target < 1.0f || g_lim_gain < 1.0f) {
+        /* Ducking is done inside 1 ms, so a transient is caught in the block
+         * that contains it rather than over the whole block; coming back up
+         * takes the whole block, because that is where zipper noise lives and
+         * the envelope's release is already slow. */
+        UInt32 ramp = nframes, f = 0;
+        if (target < g_lim_gain) {
+            ramp = g_engine_rate / 1000;
+            if (!ramp || ramp > nframes) ramp = nframes;
+        }
+        gain = g_lim_gain;
+        dg = ramp ? (target - g_lim_gain) / (float)ramp : 0.0f;
+        for (j = 0; j < samples; j += 2, f++) {
+            out[j] *= gain;
+            out[j + 1] *= gain;
+            if (f < ramp) gain += dg; else gain = target;
+        }
+        {
+            uint32_t q = (uint32_t)(target * 65536.0f);
+            uint32_t old = atomic_load_explicit(&g_lim_min_gain_q16, memory_order_relaxed);
+            /* 0 is "nothing recorded yet", so the first sample always wins */
+            while ((!old || q < old) &&
+                   !atomic_compare_exchange_weak_explicit(&g_lim_min_gain_q16, &old, q,
+                                                          memory_order_relaxed,
+                                                          memory_order_relaxed))
+                ;
+        }
+        atomic_fetch_add_explicit(&g_lim_active, 1, memory_order_relaxed);
+    }
+    g_lim_gain = target;
+
+    /* Safety net only: after the limiter this trims a transient's first block,
+     * not a whole signal. */
+    for (j = 0; j < samples; j++) {
+        float v = out[j];
+        out[j] = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
+    }
+}
+
 static OSStatus ios_engine_render_cb(void *refcon, AudioUnitRenderActionFlags *flags,
                                      const AudioTimeStamp *ts, UInt32 bus,
                                      UInt32 nframes, AudioBufferList *iodata) {
     float *out = (float *)iodata->mBuffers[0].mData;
     size_t samples = (size_t)nframes * 2;
-    size_t j;
     int i;
     (void)refcon; (void)flags; (void)ts; (void)bus;
 
@@ -852,13 +950,7 @@ static OSStatus ios_engine_render_cb(void *refcon, AudioUnitRenderActionFlags *f
         if (s && s->valid && s->started) ios_mix_stream(s, out, nframes);
     }
     pthread_mutex_unlock(&g_mix_lock);
-    /* Summing N clients can exceed full scale; clip rather than wrap, which
-     * is what every hardware mixer does and what the alternative sounds
-     * like. */
-    for (j = 0; j < samples; j++) {
-        float v = out[j];
-        out[j] = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
-    }
+    ios_limit_block(out, samples, nframes);
     return noErr;
 }
 
@@ -1015,27 +1107,41 @@ static void ios_report_streams(void) {
     last_mach = now;
     for (i = 0; i < IOS_MAX_STREAMS; i++) {
         struct ios_stream *s = g_streams[i];
-        uint32_t peak;
+        uint32_t peak, gap_us;
         if (!s) continue;
         peak = atomic_load_explicit(&s->stat_peak_q16, memory_order_relaxed);
         atomic_store_explicit(&s->stat_peak_q16, 0, memory_order_relaxed);
+        gap_us = atomic_load_explicit(&s->stat_max_gap_us, memory_order_relaxed);
+        atomic_store_explicit(&s->stat_max_gap_us, 0, memory_order_relaxed);
         fprintf(stderr, "[audio] stream %d: fmt=%s/%uch/%uHz/%ubit(valid %u)/mask0x%x "
-                        "frames_written=%llu underruns=%u peak=%u.%03u %s\n",
+                        "ring=%ums frames_written=%llu underruns=%u peak=%u.%03u "
+                        "event_signals=%u max_gap_ms=%u.%u %s\n",
                 k, kind_name[s->kind], s->channels, s->sample_rate,
                 s->frame_bytes && s->channels ? (s->frame_bytes / s->channels) * 8 : 0,
                 s->valid_bits, s->channel_mask,
+                s->sample_rate ? s->buffer_frames * 1000 / s->sample_rate : 0,
                 (unsigned long long)atomic_load_explicit(&s->stat_frames_written,
                                                          memory_order_relaxed),
                 atomic_load_explicit(&s->stat_underruns, memory_order_relaxed),
                 peak >> 16, ((peak & 0xffff) * 1000) >> 16,
+                atomic_load_explicit(&s->stat_event_signals, memory_order_relaxed),
+                gap_us / 1000, (gap_us % 1000) / 100,
                 s->started ? "playing" : "stopped");
+        atomic_store_explicit(&s->stat_event_signals, 0, memory_order_relaxed);
         k++;
     }
-    if (k)
-        fprintf(stderr, "[audio] engine: %u Hz, %s, %d client(s), mix-lock misses=%u\n",
+    if (k) {
+        uint32_t g = atomic_load_explicit(&g_lim_min_gain_q16, memory_order_relaxed);
+        atomic_store_explicit(&g_lim_min_gain_q16, 0, memory_order_relaxed);
+        fprintf(stderr, "[audio] engine: %u Hz, %s, %d client(s), mix-lock misses=%u, "
+                        "limiter_min_gain=%u.%03u (%u blocks limited)\n",
                 g_engine_rate, g_engine_au ? (g_engine_running ? "running" : "idle")
                                            : "NULL (null-mode, no audible output)",
-                k, atomic_load_explicit(&g_mix_lock_misses, memory_order_relaxed));
+                k, atomic_load_explicit(&g_mix_lock_misses, memory_order_relaxed),
+                g ? (g >> 16) : 1, g ? (((g & 0xffff) * 1000) >> 16) : 0,
+                atomic_load_explicit(&g_lim_active, memory_order_relaxed));
+        atomic_store_explicit(&g_lim_active, 0, memory_order_relaxed);
+    }
     pthread_mutex_unlock(&g_mix_lock);
 }
 
@@ -1233,10 +1339,18 @@ static NTSTATUS ios_create_stream(void *args) {
     s->valid_bits = ios_fmt_valid_bits(p->fmt);
     s->channel_mask = ios_fmt_channel_mask(p->fmt);
     ios_build_mix_gains(s, s->channel_mask);
-    /* Ring capacity: the requested buffer duration (100ns units), floor
-     * 100ms so a slow FEX-translated mixer has slack. */
+    /* Ring capacity: the requested buffer duration (100ns units), floor 200 ms.
+     *
+     * The floor is what lets a game thread stall without it being audible.
+     * Under FEX translation a 60-80 ms stall -- a shader compile, a level
+     * chunk loading, the JIT meeting new code -- is ordinary, and at the old
+     * 100 ms floor a client that keeps only one period of headroom has
+     * nothing left after one of those.  This changes how much the client is
+     * ALLOWED to queue, not the latency the endpoint reports: get_latency and
+     * get_device_period still describe the engine's 10 ms period, which is
+     * what they are supposed to describe. */
     dur_frames = (uint64_t)(p->duration > 0 ? p->duration : 0) * s->sample_rate / 10000000ull;
-    if (dur_frames < s->sample_rate / 10) dur_frames = s->sample_rate / 10;
+    if (dur_frames < s->sample_rate / 5) dur_frames = s->sample_rate / 5;
     if (dur_frames > s->sample_rate * 4) dur_frames = s->sample_rate * 4;
     s->buffer_frames = (UINT32)dur_frames;
     /* The ring is the ENGINE's shape (stereo float32), not the client's: two
@@ -1268,9 +1382,13 @@ static NTSTATUS ios_create_stream(void *args) {
     if (p->channel_count) *p->channel_count = s->channels;
     if (p->stream) *p->stream = (stream_handle)(uintptr_t)s;
     fprintf(stderr, "[ios-astream] ml738 CREATED gen=%u handle=%p rate=%u ch=%u fb=%u "
+                    "asked=%ums ring=%ums flags=0x%x "
                     "mask=0x%x downmix L=[%.2f %.2f %.2f %.2f %.2f %.2f] "
                     "R=[%.2f %.2f %.2f %.2f %.2f %.2f] step=0x%x\n",
             g_stream_gen, (void *)s, s->sample_rate, s->channels, s->frame_bytes,
+            (unsigned)(p->duration > 0 ? p->duration / 10000 : 0),
+            s->sample_rate ? s->buffer_frames * 1000 / s->sample_rate : 0,
+            (unsigned)p->flags,
             s->channel_mask,
             s->mix_gain[0][0], s->mix_gain[1][0], s->mix_gain[2][0],
             s->mix_gain[3][0], s->mix_gain[4][0], s->mix_gain[5][0],
@@ -1381,18 +1499,85 @@ static NTSTATUS ios_reset(void *args) {
     return STATUS_SUCCESS;
 }
 
+/* The client's period event, driven by the HARDWARE CLOCK.
+ *
+ * This used to be `usleep(10000); NtSetEvent();` -- a free-running wall-clock
+ * timer, which is a clock SOURCE.  On a loaded device, with the game's mixer
+ * thread running under FEX translation, a 10 ms sleep is 10 ms plus whatever
+ * the scheduler adds, so the wakeups drift against the audio device and then
+ * bunch when the backlog clears: the client mixes nothing for a while and then
+ * mixes several periods at once.  The ring never runs dry -- the device log
+ * showed one or two underruns in a whole session -- and it still stutters,
+ * because what a game hears is the RATE its buffers are consumed at, not
+ * whether the mixer starved.
+ *
+ * So this thread is now a clock FOLLOWER: it signals when the engine has
+ * actually consumed another period's worth of frames, and it sleeps for
+ * roughly as long as the remaining frames will take.  A late wakeup signals
+ * immediately and the next target is computed from the clock, so lateness
+ * never accumulates.  NtSetEvent stays on this Wine thread and is never called
+ * from the Core Audio render thread, which must not enter Wine at all.
+ *
+ * With no engine -- null-mode -- it falls back to the old wall-clock tick,
+ * which is the only clock there is in that case. */
 static NTSTATUS ios_timer_loop(void *args) {
-    /* Runs on a dedicated Wine thread mmdevapi spawns for event-driven
-     * clients. Wake the client every device period so it refills the
-     * ring; exit when the stream dies. */
     struct timer_loop_params *p = args;
     struct ios_stream *s = stream_from_handle(p->stream);
+    uint64_t next = 0, last_signal = 0;
     if (!s) return STATUS_SUCCESS;
     LOG_FN_CALL(9, "timer_loop");
     while (s->valid) {
-        usleep(10000); /* device period, 10 ms */
-        if (s->event && s->started)
-            NtSetEvent(s->event, NULL);
+        UINT32 rate = s->sample_rate ? s->sample_rate : IOS_AUDIO_SAMPLE_RATE;
+        UINT32 period = rate / 100;            /* 10 ms in client frames */
+        int signal_now = 0;
+        if (!period) period = 1;
+
+        if (g_engine_au && g_engine_running && s->started) {
+            uint64_t play = atomic_load_explicit(&s->play_pos, memory_order_acquire);
+            /* A reset rewinds play_pos; resync rather than wait forever. */
+            if (next > play + 4ull * period) next = play;
+            if (play >= next) {
+                next = play + period;
+                signal_now = 1;
+            }
+            /* LIVENESS.  play_pos stops advancing the moment the ring is
+             * empty, and the thing that refills the ring is the event this
+             * loop sends -- so pacing purely off the clock would let one
+             * underrun wedge the client into permanent silence.  Two periods
+             * of wall time with no signal is the backstop, and it also covers
+             * the moment before the first frame is ever played. */
+            if (!signal_now && last_signal &&
+                mach_to_ns(mach_absolute_time() - last_signal) > 20000000ull) {
+                next = play + period;
+                signal_now = 1;
+            }
+            if (signal_now) {
+                if (s->event) {
+                    NtSetEvent(s->event, NULL);
+                    atomic_fetch_add_explicit(&s->stat_event_signals, 1,
+                                              memory_order_relaxed);
+                }
+                last_signal = mach_absolute_time();
+                usleep(500);
+            } else {
+                /* Sleep for about as long as the frames still queued will
+                 * take.  A late wakeup signals at once and recomputes the
+                 * target from the clock, so lateness never accumulates. */
+                uint64_t us = (next - play) * 1000000ull / rate;
+                if (us < 500) us = 500;
+                if (us > 10000) us = 10000;
+                usleep((useconds_t)us);
+            }
+        } else {
+            usleep(10000); /* null-mode / stopped: wall clock is all there is */
+            next = atomic_load_explicit(&s->play_pos, memory_order_acquire);
+            if (s->event && s->started) {
+                NtSetEvent(s->event, NULL);
+                atomic_fetch_add_explicit(&s->stat_event_signals, 1,
+                                          memory_order_relaxed);
+                last_signal = mach_absolute_time();
+            }
+        }
     }
     return STATUS_SUCCESS;
 }
@@ -1481,6 +1666,23 @@ static NTSTATUS ios_release_render_buffer(void *args) {
     struct release_render_buffer_params *p = args;
     struct ios_stream *s = stream_from_handle(p->stream);
     if (!s) { p->result = AUDCLNT_E_NOT_INITIALIZED; return STATUS_SUCCESS; }
+    /* How long the client left us waiting since its last submission.  With
+     * underruns at zero this is the number that separates "the game thread
+     * stalled" from "we failed to drain the ring": a gap far above the device
+     * period, with no underrun, means the client bunched its work. */
+    {
+        uint64_t now = mach_absolute_time();
+        if (s->last_release_mach) {
+            uint32_t gap_us = (uint32_t)(mach_to_ns(now - s->last_release_mach) / 1000);
+            uint32_t old = atomic_load_explicit(&s->stat_max_gap_us, memory_order_relaxed);
+            while (gap_us > old &&
+                   !atomic_compare_exchange_weak_explicit(&s->stat_max_gap_us, &old, gap_us,
+                                                          memory_order_relaxed,
+                                                          memory_order_relaxed))
+                ;
+        }
+        s->last_release_mach = now;
+    }
     if (s->ring && p->written_frames > 0) {
         UINT32 cap = s->buffer_frames;
         UINT32 n = p->written_frames;
@@ -1520,11 +1722,32 @@ static NTSTATUS ios_release_capture_buffer(void *args) {
 static NTSTATUS ios_is_format_supported(void *args) {
     struct is_format_supported_params *p = args;
     LOG_FN_CALL(14, "is_format_supported");
-    /* Shared mode resamples nothing here -- the unit is opened at the client's
-     * own rate -- so every openable format is supported outright.  This used
-     * to answer S_OK unconditionally, which promised formats create_stream
-     * would then quietly drop to silent null-mode. */
-    p->result = ios_fmt_openable(p->fmt_in) ? S_OK : S_FALSE;
+    if (!ios_fmt_openable(p->fmt_in)) {
+        p->result = S_FALSE;
+    }
+    else if (p->share == 0 /* AUDCLNT_SHAREMODE_SHARED */ &&
+             p->fmt_in->nChannels > 2) {
+        /* The endpoint is stereo.  Answering "yes, 5.1 is fine" is what a
+         * multichannel-capable card says, and a client that hears it builds a
+         * multichannel graph: the device log showed a title open a 5.1 stream
+         * alongside its stereo one, feed the 5.1 one 48000 frames a second of
+         * pure silence for the whole session, and put everything it actually
+         * played through the stereo one at +18 dB.  A real stereo endpoint
+         * answers S_FALSE here and hands back its own mix format as the
+         * closest match, which is exactly what mmdevapi's client.c does with
+         * this return -- so the client builds the stereo graph that matches
+         * the hardware.
+         *
+         * create_stream still ACCEPTS more channels (and downmixes them), for
+         * callers that ignore the advice or never ask. */
+        p->result = S_FALSE;
+        if (ios_outcome_is_new(0x5ce0a000u ^ p->fmt_in->nChannels))
+            fprintf(stderr, "[audio] is_format_supported %uch shared -> S_FALSE "
+                            "(stereo endpoint; closest match is the mix format). "
+                            "create_stream still accepts it and downmixes.\n",
+                    p->fmt_in->nChannels);
+    }
+    else p->result = S_OK;
     ios_log_fmt("is_format_supported", p->fmt_in, p->share, p->result);
     return STATUS_SUCCESS;
 }
@@ -1607,7 +1830,12 @@ static NTSTATUS ios_get_buffer_size(void *args) {
 
 static NTSTATUS ios_get_latency(void *args) {
     struct get_latency_params *p = args;
-    if (p->latency) *p->latency = 100000; /* 10 ms */
+    /* The ENGINE's period, matching get_device_period's default, and
+     * deliberately not the ring depth: latency is how long a frame waits
+     * between the mixer taking it and the speaker, which is one engine
+     * period.  How much the client is allowed to queue ahead of that is
+     * get_buffer_size's business, and the two were conflated once already. */
+    if (p->latency) *p->latency = 100000; /* 10 ms in 100ns units */
     p->result = S_OK;
     return STATUS_SUCCESS;
 }
