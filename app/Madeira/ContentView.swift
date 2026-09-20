@@ -1600,7 +1600,7 @@ enum JoystickPadHost {
             w.rootViewController = host
             overlay = w
         }
-        overlay?.frame = scene.coordinateSpace.bounds
+        overlay?.frame = controlOverlayWindowBounds(in: scene)
     }
 }
 
@@ -1692,7 +1692,14 @@ struct JoystickFace: View {
     var glyph: String?
     private var expanded: Bool { held || alwaysExpanded }
 
-    static let idleDiameter: CGFloat = 22
+    // ml — was a bare `22`; that is exactly `keyRowButtonSize * 0.5` at the
+    // constant's old value of 44, so tying it to the constant keeps the same
+    // ratio (and keeps the ring inside its cell) at 36 and at any future
+    // resize, instead of silently drifting out of proportion the next time
+    // only one of the two numbers gets changed.
+    static var idleDiameter: CGFloat { keyRowButtonSize * 0.5 }
+    // The EXPANDED pad is a permanent, off-grid size — it must not shrink
+    // just because the idle ring's cell did.
     static let padRadius: CGFloat = 58
     private var idleDiameter: CGFloat { Self.idleDiameter }
     private var padRadius: CGFloat { Self.padRadius }
@@ -2239,6 +2246,20 @@ final class ControlOverlayView: UIView {
 
     private var order: [String] = []
     private var regions: [String: ControlRegion] = [:]
+    /// ml — WHO CURRENTLY OWNS EACH REGION ID.
+    ///
+    /// `id` is deliberately shared between rotation-swapped view instances
+    /// (e.g. `JoystickKeyView.rid == "portrait.dpad"` in both portraitBody and
+    /// wideNormalBody) so the overlay treats them as one logical control. But
+    /// SwiftUI gives no ordering guarantee between an outgoing instance's
+    /// `.onDisappear` and an incoming instance's `.onAppear` across a body
+    /// swap. When the disappear fires SECOND, an unregister keyed only by
+    /// `id` would delete the brand-new instance's just-published
+    /// registration a moment after it landed — dead controls until the next
+    /// re-register. `register`/`unregister`/`reframe` are keyed by an
+    /// instance-scoped token (see `ControlRegionModifier.owner` below) so a
+    /// stale call from an instance that no longer owns `id` is a no-op.
+    private var owners: [String: UUID] = [:]
 
     /// What one finger is doing. Keyed by `ObjectIdentifier(UITouch)` — the
     /// identity UIKit guarantees stable from began to ended/cancelled, and the
@@ -2287,9 +2308,10 @@ final class ControlOverlayView: UIView {
 
     // MARK: registration
 
-    func register(_ r: ControlRegion) {
+    func register(_ r: ControlRegion, owner: UUID) {
         if regions[r.id] == nil { order.append(r.id) }
         regions[r.id] = r
+        owners[r.id] = owner
         // ml670: a re-register can turn a keyboard control into a pad control
         // or back, so the count is recomputed rather than incremented.
         publishPadPresence()
@@ -2303,10 +2325,11 @@ final class ControlOverlayView: UIView {
         if window == nil {
             DispatchQueue.main.async { TouchControlsHost.attach() }
         }
+        logRegistration(r)
     }
 
-    func reframe(_ id: String, _ f: CGRect) {
-        guard var r = regions[id], r.frame != f else { return }
+    func reframe(_ id: String, _ f: CGRect, owner: UUID) {
+        guard var r = regions[id], owners[id] == owner, r.frame != f else { return }
         r.frame = f
         regions[id] = r
         r.pad?.center = CGPoint(x: f.midX, y: f.midY)
@@ -2316,17 +2339,40 @@ final class ControlOverlayView: UIView {
     /// rotation, the pointer panel replacing the key row). Anything its finger
     /// was holding goes with it — that is ml661's rule, enforced here once
     /// instead of at four call sites.
-    func unregister(_ id: String) {
-        guard regions[id] != nil else { return }
+    ///
+    /// `owner` must still be on record for `id`: see the `owners` doc comment
+    /// above. A call from an instance that has already been superseded is
+    /// silently ignored instead of deleting the superseding instance's live
+    /// registration.
+    func unregister(_ id: String, owner: UUID) {
+        guard regions[id] != nil, owners[id] == owner else { return }
         // Array(): finish() mutates `tracked`, and a dictionary's key view is a
         // live projection of it.
         for k in Array(tracked.keys) where tracked[k]?.region == id {
             finish(key: k, why: "unregistered")
         }
         regions[id] = nil
+        owners[id] = nil
         order.removeAll { $0 == id }
         OnScreenPad.shared.clear(id)
         publishPadPresence()
+    }
+
+    /// ml — one line per (re)registration, capped: a rotation or pointer-
+    /// panel toggle re-registers every control at once, and an uncapped log
+    /// would flood the device log exactly when it is most useful (right
+    /// after launch, diagnosing whether a control's frame/window came up
+    /// right the first time). The first 40 are the ones that matter for
+    /// that; a session that is still re-registering after 40 has already
+    /// told its story.
+    private static var loggedRegistrations = 0
+    private func logRegistration(_ r: ControlRegion) {
+        guard Self.loggedRegistrations < 40 else { return }
+        Self.loggedRegistrations += 1
+        let f = r.frame
+        let w = window?.bounds.size ?? .zero
+        fputs(String(format: "[controls] region %@ frame=(%.0f,%.0f %.0f\u{d7}%.0f) window=(%.0f\u{d7}%.0f)\n",
+                     r.id, f.origin.x, f.origin.y, f.width, f.height, w.width, w.height), stderr)
     }
 
     /// ml670: how many of the registered regions are virtual-controller
@@ -2928,41 +2974,72 @@ final class ControlOverlayView: UIView {
 /// window coordinates, the space `ControlOverlayView` hit-tests in. Nothing
 /// here attaches a gesture, so nothing here can be arbitrated, delayed or
 /// cancelled.
-extension View {
-    func controlRegion(_ id: String, _ label: String, _ kind: ControlRegionKind,
-                       circular: Bool = false,
-                       pad: JoystickPadState? = nil) -> some View {
-        background(
+///
+/// A `ViewModifier` (not a plain function returning `some View`) purely so it
+/// can hold `@State` — the per-instance ownership token `ControlOverlayView.
+/// owners` needs. See that property's doc comment for why an outgoing
+/// instance's `.onDisappear` must not be able to unregister an incoming
+/// instance's registration when the two share an `id` across a rotation.
+private struct ControlRegionModifier: ViewModifier {
+    let id: String
+    let label: String
+    let kind: ControlRegionKind
+    var circular: Bool = false
+    var pad: JoystickPadState? = nil
+
+    /// Minted once per view IDENTITY (an `@State` initial value persists
+    /// across re-renders of the same instance and is fresh for every new
+    /// one), never per region id — `id` is the shared logical-control name,
+    /// this is "which physical SwiftUI view currently claims it."
+    @State private var owner = UUID()
+
+    func body(content: Content) -> some View {
+        content.background(
             GeometryReader { geo in
                 Color.clear
                     .onAppear {
                         ControlOverlayView.shared.register(
                             ControlRegion(id: id, label: label, frame: geo.frame(in: .global),
-                                          kind: kind, circular: circular, pad: pad))
+                                          kind: kind, circular: circular, pad: pad),
+                            owner: owner)
                     }
                     .onChange(of: geo.frame(in: .global)) { _, f in
-                        ControlOverlayView.shared.reframe(id, f)
+                        ControlOverlayView.shared.reframe(id, f, owner: owner)
                     }
                     .onChange(of: kind) { _, k in
                         ControlOverlayView.shared.register(
                             ControlRegion(id: id, label: label, frame: geo.frame(in: .global),
-                                          kind: k, circular: circular, pad: pad))
+                                          kind: k, circular: circular, pad: pad),
+                            owner: owner)
                     }
-                    .onDisappear { ControlOverlayView.shared.unregister(id) }
+                    .onDisappear { ControlOverlayView.shared.unregister(id, owner: owner) }
             }
         )
     }
 }
 
-/// ml — UNIFORM SQUARE FOOTPRINT for every control in the scrollable key/
-/// tool row (ContentView.controlRow's non-pointer-panel branch): the tap
-/// keys, the modifiers, the keyboard toggle, the joystick, and the icon
-/// buttons (pointer/display/fullscreen/diag[/lock]) all share this exact
-/// size and corner radius, so nothing in the row reads as bigger or more
-/// important than its neighbour. Device feedback: Ctrl/Shift were visibly
-/// wider AND taller than Esc/⏎/␣ and the keyboard button before this.
-let keyRowButtonSize: CGFloat = 44
-let keyRowCornerRadius: CGFloat = 8
+extension View {
+    func controlRegion(_ id: String, _ label: String, _ kind: ControlRegionKind,
+                       circular: Bool = false,
+                       pad: JoystickPadState? = nil) -> some View {
+        modifier(ControlRegionModifier(id: id, label: label, kind: kind,
+                                        circular: circular, pad: pad))
+    }
+}
+
+/// ml — UNIFORM SQUARE FOOTPRINT for every control in the wrapping key/tool
+/// grid (ContentView.controlRow's non-pointer-panel branch): the tap keys,
+/// the modifiers, the keyboard toggle, the joystick, and the icon buttons
+/// (pointer/display/fullscreen/diag[/lock]) all share this exact size and
+/// corner radius, so nothing in the row reads as bigger or more important
+/// than its neighbour. Device feedback: Ctrl/Shift were visibly wider AND
+/// taller than Esc/⏎/␣ and the keyboard button before this.
+///
+/// 44 -> 36 (device feedback: the row wanted to take less vertical space) —
+/// every icon/label size below is scaled off this same constant rather than
+/// re-picked by eye, so a future resize only has to change this one number.
+let keyRowButtonSize: CGFloat = 36
+let keyRowCornerRadius: CGFloat = 7
 
 /// Visual-only key for the portrait row. Draws, publishes its frame, and
 /// nothing else — ControlOverlayView presses it.
@@ -2970,13 +3047,14 @@ struct ControlKeyView: View {
     let id: String
     let label: String
     let kind: ControlRegionKind
-    var fontSize: CGFloat = 15
+    // ml — was 15 at keyRowButtonSize==44; scaled with the same ratio to 36.
+    var fontSize: CGFloat = 12
     var size: CGFloat = keyRowButtonSize
     /// The ⌨ button was styled off `Color.secondary`; the key caps off white.
     var secondaryTint = false
     @ObservedObject private var face: ControlFaceState
 
-    init(id: String, label: String, kind: ControlRegionKind, fontSize: CGFloat = 15,
+    init(id: String, label: String, kind: ControlRegionKind, fontSize: CGFloat = 12,
          size: CGFloat = keyRowButtonSize, secondaryTint: Bool = false) {
         self.id = id; self.label = label; self.kind = kind
         self.fontSize = fontSize; self.size = size
@@ -3486,6 +3564,16 @@ struct ContentView: View {
                         portraitBody
                     }
                 }
+                // ml — belt-and-suspenders for the cold-landscape-launch fix in
+                // `controlOverlayWindowBounds`: this `geo` is the exact source
+                // of truth this same reader uses to pick wideNormalBody over
+                // portraitBody, so re-attaching whenever IT changes guarantees
+                // the overlay window gets re-measured at least once against
+                // whatever geometry the chosen body is actually laid out for,
+                // with no dependence on a rotation notification ever firing.
+                .onChange(of: geo.size) { _, _ in
+                    TouchControlsHost.attach()
+                }
             }
             // Rotation destroys/recreates the UIViewRepresentable across
             // this if/else (multiple SwiftUI identities) — HARMLESS since
@@ -3663,7 +3751,9 @@ struct ContentView: View {
                 // stretching anything into it.
                 //
                 // Fixed instead: no outer scroll container at all. controlRow
-                // and actionButtons keep their OWN horizontal ScrollViews for
+                // wraps to as many lines as it needs (a LazyVGrid, no scroll
+                // gesture of its own — see controlRow's doc comment) and
+                // actionButtons keeps its OWN horizontal ScrollView for
                 // overflow, so they only ever need their natural height here,
                 // and logConsole (a List, which already scrolls its own rows)
                 // gets `maxHeight: .infinity` to claim everything left in the
@@ -3731,66 +3821,63 @@ struct ContentView: View {
                 // ⏎/␣/Esc/⌨ used to be) needs its tap recogniser to win
                 // arbitration against everything else on screen, and that is
                 // precisely the fight a second finger made it lose.
-                HStack(spacing: 6) {
-                    // ml — MOVED to the far left, outside the scrolling
-                    // content (device feedback): fullscreen should always be
-                    // reachable without first scrolling the row, and a fixed
-                    // leading anchor keeps the row's start put regardless of
-                    // what's scrolled into view.
+                //
+                // ml — THE SCROLL-VS-PRESS FIX, TAKE TWO: no more ScrollView.
+                //
+                // This used to be a fixed-outside-the-ScrollView joystick slot
+                // plus a horizontal `ScrollView` for everything else — the
+                // joystick was pulled out because a control that owns a
+                // ControlOverlayView region is SUPPOSED to have absolute
+                // priority over any SwiftUI gesture underneath it (touch-down
+                // included, see ControlsWindow.hitTest), but the ScrollView's
+                // own pan recognizer kept winning that race whenever this
+                // control's registered region frame was even briefly stale.
+                // That fix only ever protected the joystick; the key caps were
+                // still inside the ScrollView and a drag starting on ANY of
+                // them could still be stolen by the pan gesture instead of
+                // registering as a press-and-hold, and a cold launch straight
+                // into landscape (see `controlOverlayWindowBounds`) could
+                // leave the touch layer entirely un-registered, at which point
+                // EVERYTHING in this row — joystick included — was just
+                // scrollable SwiftUI content with nothing pressing anything.
+                //
+                // A WRAPPING grid needs no scroll gesture at all, which
+                // removes the competing recognizer outright instead of
+                // special-casing one control against it: every control is
+                // always fully visible, wrapping to a second line if the
+                // column is too narrow for one, and the joystick is an
+                // ordinary cell like everything else because there is no
+                // longer a gesture for it to be extracted from.
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: keyRowButtonSize,
+                                                        maximum: keyRowButtonSize),
+                                              spacing: 6)],
+                          alignment: .leading, spacing: 6) {
                     fullscreenToggle
-                    // ml — THE JOYSTICK'S OWN FIXED SLOT, deliberately
-                    // OUTSIDE the ScrollView below.
-                    //
-                    // A control that owns a ControlOverlayView region is
-                    // SUPPOSED to have absolute priority over any SwiftUI
-                    // gesture underneath it — touch-down included, see
-                    // ControlsWindow.hitTest — but the reported bug ("can't
-                    // drag it, the row scrolls instead") showed the
-                    // horizontal ScrollView's own pan recognizer winning that
-                    // race whenever this control's registered region frame
-                    // was even briefly stale (see JoystickKeyView's
-                    // onDisappear/onAppear for that root cause). Taking the
-                    // control out of the scrolling content entirely removes
-                    // the competing gesture altogether — the most robust fix,
-                    // not just a priority hack layered on top of a shared
-                    // touch surface.
                     JoystickKeyView()
-                    Divider().frame(height: keyRowButtonSize - 10)
-                    // ml: horizontally scrollable, same idiom as actionButtons
-                    // below — this row grew to fit ⏎/␣/Esc/Ctrl/Shift/⌨/
-                    // pointer/display/diag[/pointer-lock], which does not fit
-                    // a narrow wideNormalBody right column or a short
-                    // landscape phone screen without either scrolling or
-                    // wrapping (wrapping would fight the row's fixed height).
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 6) {
-                            Group {
-                                ControlKeyView(id: "portrait.enter", label: "⏎", kind: .tapKey(0x0D))
-                                ControlKeyView(id: "portrait.space", label: "␣", kind: .tapKey(0x20))
-                                ControlKeyView(id: "portrait.esc",   label: "Esc", kind: .tapKey(0x1B))
-                                // ml: modifiers, not taps — held for exactly as long as
-                                // the finger is down (.keys, the same region kind
-                                // HoldKeyView uses for the arrow keys), so they combine
-                                // with any other on-screen key AND with the software
-                                // keyboard: both post through the same winios_post_key
-                                // ring / driver-side held-key state (InputGuard unions
-                                // every region's contribution; insertText's synthesized
-                                // presses land on top of whatever is already held).
-                                ControlKeyView(id: "portrait.ctrl",  label: "Ctrl", kind: .keys([0x11]))
-                                ControlKeyView(id: "portrait.shift", label: "Shift", kind: .keys([0x10]))
-                                ControlKeyView(id: "portrait.kbd",   label: "⌨", kind: .keyboardToggle,
-                                               fontSize: 24, secondaryTint: true)
-                            }
-                            .transition(.opacity)
-                            pointerToggleButton
-                            displayModeToggle
-                            diagToggleButton
-                            // ml665: no lock button where lock cannot happen (iPhone).
-                            if hw.mouseConnected && HardwareInput.pointerLockAvailable {
-                                pointerLockButton
-                            }
-                        }
-                        .padding(.vertical, 4)
+                    Group {
+                        ControlKeyView(id: "portrait.enter", label: "⏎", kind: .tapKey(0x0D))
+                        ControlKeyView(id: "portrait.space", label: "␣", kind: .tapKey(0x20))
+                        ControlKeyView(id: "portrait.esc",   label: "Esc", kind: .tapKey(0x1B))
+                        // ml: modifiers, not taps — held for exactly as long as
+                        // the finger is down (.keys, the same region kind
+                        // HoldKeyView uses for the arrow keys), so they combine
+                        // with any other on-screen key AND with the software
+                        // keyboard: both post through the same winios_post_key
+                        // ring / driver-side held-key state (InputGuard unions
+                        // every region's contribution; insertText's synthesized
+                        // presses land on top of whatever is already held).
+                        ControlKeyView(id: "portrait.ctrl",  label: "Ctrl", kind: .keys([0x11]))
+                        ControlKeyView(id: "portrait.shift", label: "Shift", kind: .keys([0x10]))
+                        ControlKeyView(id: "portrait.kbd",   label: "⌨", kind: .keyboardToggle,
+                                       fontSize: 20, secondaryTint: true)
+                    }
+                    .transition(.opacity)
+                    pointerToggleButton
+                    displayModeToggle
+                    diagToggleButton
+                    // ml665: no lock button where lock cannot happen (iPhone).
+                    if hw.mouseConnected && HardwareInput.pointerLockAvailable {
+                        pointerLockButton
                     }
                 }
                 .padding(.horizontal, 8)
@@ -3905,7 +3992,7 @@ struct ContentView: View {
             // ml666: the aim stick is gone; only the directional pad fades.
         } label: {
             Image(systemName: pointerPanel ? "xmark" : "cursorarrow")
-                .font(.system(size: 18, weight: .medium))
+                .font(.system(size: 15, weight: .medium))
                 .frame(width: keyRowButtonSize, height: keyRowButtonSize)
                 .background(Color.secondary.opacity(0.25))
                 .cornerRadius(keyRowCornerRadius)
@@ -3921,7 +4008,7 @@ struct ContentView: View {
             input.diagnostics.toggle()
         } label: {
             Image(systemName: "ladybug")
-                .font(.system(size: 18, weight: .regular))
+                .font(.system(size: 15, weight: .regular))
                 .foregroundStyle(.white.opacity(input.diagnostics ? 1.0 : 0.35))
                 .frame(width: keyRowButtonSize, height: keyRowButtonSize)
                 .background(Color.secondary.opacity(0.25))
@@ -3951,14 +4038,14 @@ struct ContentView: View {
             // ml — vertical, not horizontal: the icon+"HID"/"UI" tag used to
             // sit side by side in a wide (minWidth 52) rectangle, which is
             // exactly the non-square shape the rest of the row no longer
-            // has. Stacked, both lines fit the same 44x44 square as every
-            // other control here.
+            // has. Stacked, both lines fit the same keyRowButtonSize square
+            // as every other control here.
             VStack(spacing: 1) {
                 Image(systemName: hw.pointerLocked ? "cursorarrow.slash" : "cursorarrow.motionlines")
-                    .font(.system(size: 16, weight: .regular))
+                    .font(.system(size: 13, weight: .regular))
                 Text(hw.mousePath == .gcmouse ? "HID"
                      : hw.mousePath == .uikit ? "UI" : "—")
-                    .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                    .font(.system(size: 7, weight: .semibold, design: .monospaced))
                     .lineLimit(1)
                     .minimumScaleFactor(0.6)
             }
@@ -3985,7 +4072,7 @@ struct ContentView: View {
             fputs("[hud] tap display-mode -> \(input.displayMode.label)\n", stderr)
         } label: {
             Image(systemName: input.displayMode.symbol)
-                .font(.system(size: 18, weight: .medium))
+                .font(.system(size: 15, weight: .medium))
                 .frame(width: keyRowButtonSize, height: keyRowButtonSize)
                 .background(Color.secondary.opacity(0.25))
                 .cornerRadius(keyRowCornerRadius)
@@ -4007,7 +4094,7 @@ struct ContentView: View {
             fullscreenState.active = true
         } label: {
             Image(systemName: "arrow.up.left.and.arrow.down.right")
-                .font(.system(size: 18, weight: .medium))
+                .font(.system(size: 15, weight: .medium))
                 .frame(width: keyRowButtonSize, height: keyRowButtonSize)
                 .background(Color.secondary.opacity(0.25))
                 .cornerRadius(keyRowCornerRadius)
@@ -6052,6 +6139,47 @@ final class TouchControlsModel: ObservableObject {
     }
 }
 
+/// ml — THE SIZE TO GIVE A WINDOW-LEVEL OVERLAY, root-caused from a device
+/// report: app launched STRAIGHT INTO landscape (wide normal view) had a dead
+/// toolbar joystick and a key row that scrolled instead of pressing — i.e. the
+/// touch layer was not there to claim those touches at all — while portrait
+/// launches, and landscape reached by rotating or by a fullscreen round trip,
+/// worked. The log line `TouchControlsHost.attach` already prints
+/// (`[controls] ml644 overlay attached frame=...`) showed exactly this on a
+/// cold landscape launch: the FIRST call recorded a portrait-shaped frame
+/// (402×874 on that device) and only a LATER call — triggered by entering/
+/// leaving fullscreen — recorded the correct 874×402.
+///
+/// `scene.coordinateSpace.bounds` is the culprit: on a cold launch directly
+/// into a non-default interface orientation, it can still report the
+/// pre-rotation "reference" size for the first render pass or two, before
+/// the scene's own interface-orientation transform has landed — with nothing
+/// to correct it afterward, because `UIDevice.orientationDidChangeNotification`
+/// (the only other thing that re-runs `attach()`) fires on an actual
+/// *change*, and a device that was ALREADY landscape before launch never
+/// produces one. A portrait launch never hits this because the stale first
+/// reading and the true one happen to agree.
+///
+/// SwiftUI's own `.global` coordinate space — the space every `ControlRegion`
+/// registers its frame in — does NOT have this problem: by the time any
+/// `.onAppear` fires, SwiftUI has already completed a layout pass against the
+/// app's real key window, which is how `ContentView.body`'s own `geo.size`
+/// check picks `wideNormalBody` correctly on that same cold launch. Sourcing
+/// this window's frame from THAT window instead of the scene's separate
+/// coordinate space ties both to the same ground truth by construction, so
+/// they cannot disagree — not even for one frame.
+func controlOverlayWindowBounds(in scene: UIWindowScene) -> CGRect {
+    // Second fallback deliberately excludes our OWN overlay windows
+    // (ControlsWindow, JoystickPadHost's PassthroughWindow) — neither is ever
+    // made key, but by the time this runs both may already be in
+    // `scene.windows`, and picking one of them here would just reproduce the
+    // exact "measuring the wrong window" bug this function exists to end.
+    let size = scene.windows.first(where: { $0.isKeyWindow })?.bounds.size
+        ?? scene.windows.first(where: { !($0 is ControlsWindow) && !($0 is PassthroughWindow) })?.bounds.size
+        ?? scene.coordinateSpace.bounds.size
+    return CGRect(origin: .zero, size: size)
+}
+
 /// Click-through EXCEPT where a control actually is.
 ///
 /// PassthroughWindow (the joystick pad's) returns nil unconditionally because it
@@ -6129,7 +6257,9 @@ enum TouchControlsHost {
             window = w
         }
         guard let w = window else { return }
-        w.frame = scene.coordinateSpace.bounds
+        // ml — was `scene.coordinateSpace.bounds`; see `controlOverlayWindowBounds`'s
+        // doc comment for the cold-landscape-launch bug that traced to it.
+        w.frame = controlOverlayWindowBounds(in: scene)
 
         // ml662 — THE TOUCH LAYER, as a WINDOW subview rather than a subview of
         // the hosting view.

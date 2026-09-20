@@ -8420,3 +8420,20 @@ guest-slots=… verdict=…`). Consequences:
   log should otherwise be quiet — no `[prof]`, `[thread-stacks]`,
   `[srv-stats]` detail, `[hot-lock]` or `[footprint]` lines — and
   `MADEIRA_DIAG=1` should bring all of them back.
+
+- 2026-09-25 — **REGRESSION, every program died at start on every device:
+  a `thread_local` was added to the emulator module.** The previous round
+  batched FEX's dispatch counter in a `static thread_local` inside
+  `ContextImpl::CompileBlock` (FEXCore/Source/Interface/Core/Core.cpp). All five
+  device logs die at the same instruction, `libwow64fex.dll+0x13770`:
+  `ldr x9, [x10, x9, lsl #3]` with x10 = TEB->ThreadLocalStoragePointer = NULL
+  — implicit TLS in a PE DLL is reached through the TEB's TLS vector, and the
+  threads the emulator compiles on do not have one populated by this loader.
+  Replaced by a plain unlocked increment of the shared word (a statistic may
+  lose a count; it costs no bus lock either). Verified by disassembly: the site
+  is now load/add/store, and `[x18,#0x58]` reads in the DLL went 3 → 2 (the two
+  that remain predate the regression and shipped in working builds).
+  RULE: no `thread_local` in `xtajit*.dll`; per-thread emulator state lives in
+  the FEX thread object. The host model and the artifact checks of that round
+  could not catch this — only a boot can; a change to the emulator DLLs should
+  be assumed unverified until one has happened.
