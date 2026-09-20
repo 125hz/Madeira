@@ -8437,3 +8437,25 @@ guest-slots=… verdict=…`). Consequences:
   the FEX thread object. The host model and the artifact checks of that round
   could not catch this — only a boot can; a change to the emulator DLLs should
   be assumed unverified until one has happened.
+
+- 2026-09-26 — **Silent tablet, healthy engine: the audio SESSION, not the
+  mixer.** Tablet logs show `[audio] stream … peak=1.618`, the RemoteIO IO
+  thread running and the bus limiter engaging (`27 blocks limited`), i.e.
+  samples with real signal are rendered — and the user hears nothing; the phone
+  is fine. Everything downstream of the render callback belongs to
+  AVAudioSession: category, activation, route, volume. A session that is not in
+  the Playback category obeys the tablet's Silent Mode (a Control Centre toggle
+  there) and is muted with no error anywhere. The old code set the category
+  once at session start and reported through `os_log` only, so neither a
+  failure nor a later override could appear in the exported log (last round's
+  `[audio-route]` line went the same way and never showed up).
+  `madeira_audio_session_ensure()` (app/Madeira/WineProcessBridge.m) now sets
+  Playback + activates (retrying as mixable if a non-mixable activation is
+  refused), writes category/options/active/outputs/outputVolume/sampleRate/
+  otherAudioPlaying to stderr, and is re-run on interruption-ended, route
+  change (not on our own category change) and media-services reset, and by the
+  audio driver every time it starts the output unit (weak symbol in
+  `audio_null_ios.c ios_engine_start`). UNVERIFIED on the tablet; the
+  `[audio-route] why=…` lines in the next log name the cause if it persists
+  (`outputVolume=0.00`, a non-Playback category, `active=0`, or an unexpected
+  output port).

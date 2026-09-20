@@ -45,6 +45,112 @@ static os_log_t wine_proc_log(void) {
 
 #define LOG(fmt, ...) os_log(wine_proc_log(), "[WineProc] " fmt, ##__VA_ARGS__)
 
+/* ---------------------------------------------------------------------------
+ * 2026-09-26 -- THE AUDIO SESSION, MADE ROBUST AND MADE VISIBLE.
+ *
+ * Device report: a tablet is silent while the phone is fine, and the engine
+ * census on the tablet proves samples with real signal are being rendered
+ * (the bus limiter engages, the RemoteIO IO thread runs). So the silence is
+ * downstream of us: the session category, activation, route or volume.
+ * A session that is NOT in the Playback category obeys the tablet Silent
+ * Mode (a Control Centre toggle there, not a hardware switch) and is muted
+ * with no error anywhere -- which is exactly what a failed or overridden
+ * setCategory looks like. The previous code logged its results through os_log
+ * only, so the exported log could not say which of these it was.
+ *
+ * So: one function that (a) sets Playback and activates, retrying as
+ * mixable if a non-mixable activation is refused, (b) reports category,
+ * route, volume and errors into the EXPORTED log (stderr), and (c) is called
+ * again whenever the system tells us the session changed under us --
+ * interruption ended, route change, media services reset -- and by the audio
+ * driver every time it starts the output unit (weak symbol, see
+ * build/ntdll-unix/audio_null_ios.c).
+ * ------------------------------------------------------------------------- */
+void madeira_audio_session_ensure(const char *why)
+{
+    @autoreleasepool {
+        AVAudioSession *session = [AVAudioSession sharedInstance];
+        NSError *err = nil;
+        BOOL cat_ok, act_ok;
+
+        cat_ok = [session setCategory:AVAudioSessionCategoryPlayback
+                                 mode:AVAudioSessionModeDefault
+                              options:0
+                                error:&err];
+        if (!cat_ok)
+            dprintf(STDERR_FILENO, "[audio-route] setCategory(Playback) FAILED: %s\n",
+                    err.localizedDescription.UTF8String ?: "?");
+        err = nil;
+        act_ok = [session setActive:YES error:&err];
+        if (!act_ok) {
+            dprintf(STDERR_FILENO, "[audio-route] setActive FAILED (%ld): %s -- retrying as mixable\n",
+                    (long)err.code, err.localizedDescription.UTF8String ?: "?");
+            err = nil;
+            [session setCategory:AVAudioSessionCategoryPlayback
+                            mode:AVAudioSessionModeDefault
+                         options:AVAudioSessionCategoryOptionMixWithOthers
+                           error:&err];
+            err = nil;
+            act_ok = [session setActive:YES error:&err];
+            if (!act_ok)
+                dprintf(STDERR_FILENO, "[audio-route] setActive (mixable) FAILED (%ld): %s\n",
+                        (long)err.code, err.localizedDescription.UTF8String ?: "?");
+        }
+
+        NSMutableArray<NSString *> *outs = [NSMutableArray array];
+        for (AVAudioSessionPortDescription *port in session.currentRoute.outputs)
+            [outs addObject:[NSString stringWithFormat:@"%@(%@)", port.portType, port.portName]];
+        NSString *joined = outs.count ? [outs componentsJoinedByString:@", "] : @"none";
+        dprintf(STDERR_FILENO,
+                "[audio-route] why=%s category=%s options=0x%lx active=%d outputs=<%s> "
+                "outputVolume=%.2f sampleRate=%.0f ioBuffer=%.1fms otherAudioPlaying=%d "
+                "secondaryHint=%d\n",
+                why ? why : "?", session.category.UTF8String,
+                (unsigned long)session.categoryOptions, act_ok ? 1 : 0, joined.UTF8String,
+                session.outputVolume, session.sampleRate, session.IOBufferDuration * 1000.0,
+                session.isOtherAudioPlaying ? 1 : 0,
+                session.secondaryAudioShouldBeSilencedHint ? 1 : 0);
+        if (session.outputVolume <= 0.001f)
+            dprintf(STDERR_FILENO, "[audio-route] NOTE: the system output volume is 0 -- "
+                                   "that alone explains silence\n");
+    }
+}
+
+static void madeira_audio_session_observe(void)
+{
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+        [nc addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:nil
+                    usingBlock:^(NSNotification *n) {
+            NSUInteger type = [n.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
+            dprintf(STDERR_FILENO, "[audio-route] interruption %s\n",
+                    type == AVAudioSessionInterruptionTypeBegan ? "BEGAN" : "ENDED");
+            if (type == AVAudioSessionInterruptionTypeEnded)
+                madeira_audio_session_ensure("interruption-ended");
+        }];
+        [nc addObserverForName:AVAudioSessionRouteChangeNotification object:nil queue:nil
+                    usingBlock:^(NSNotification *n) {
+            NSUInteger reason = [n.userInfo[AVAudioSessionRouteChangeReasonKey] unsignedIntegerValue];
+            /* CategoryChange (3) is caused by our own setCategory: re-running
+             * ensure() from it would loop. Report it, act on the others. */
+            if (reason == AVAudioSessionRouteChangeReasonCategoryChange) {
+                AVAudioSession *s2 = [AVAudioSession sharedInstance];
+                dprintf(STDERR_FILENO, "[audio-route] category changed -> %s options=0x%lx\n",
+                        s2.category.UTF8String, (unsigned long)s2.categoryOptions);
+                return;
+            }
+            char why[48];
+            snprintf(why, sizeof(why), "route-change-%lu", (unsigned long)reason);
+            madeira_audio_session_ensure(why);
+        }];
+        [nc addObserverForName:AVAudioSessionMediaServicesWereResetNotification object:nil queue:nil
+                    usingBlock:^(NSNotification *n __unused) {
+            madeira_audio_session_ensure("media-services-reset");
+        }];
+    });
+}
+
 /* ---- ml581: undo the hand-made AppData skeleton ------------------------
  *
  * While chasing the Steam login window I hand-created
@@ -573,44 +679,10 @@ static void *wine_process_thread(void *arg) {
 
         /* 2026-07-05 audio: activate the AVAudioSession before Wine boots
          * so the RemoteIO unit in the mmdevapi driver can start. Playback
-         * category = ignores silent switch (it's a game). */
-        {
-            NSError *aerr = nil;
-            AVAudioSession *session = [AVAudioSession sharedInstance];
-            [session setCategory:AVAudioSessionCategoryPlayback error:&aerr];
-            if (aerr) LOG("AVAudioSession setCategory failed: %{public}s",
-                          aerr.localizedDescription.UTF8String);
-            aerr = nil;
-            [session setActive:YES error:&aerr];
-            if (aerr) LOG("AVAudioSession setActive failed: %{public}s",
-                          aerr.localizedDescription.UTF8String);
-            else LOG("AVAudioSession active: rate=%.0f latency=%.1fms",
-                     session.sampleRate, session.outputLatency * 1000.0);
-
-            /* ml — device feedback: a tablet user reported no sound while the
-             * engine's own census showed audio flowing (Wine's mixer WAS
-             * producing samples), which points at the ROUTE rather than a
-             * Wine-side bug — a route with no usable output, or outputVolume
-             * pinned at 0 (hardware mute switch, ringer, a Bluetooth output
-             * that silently failed to connect), explains "flowing but
-             * silent" with nothing to fix on the emulation side. One line,
-             * after activation so the route reflects what Wine will actually
-             * get, through the same log function as the two lines above. */
-            {
-                AVAudioSessionRouteDescription *route = session.currentRoute;
-                NSMutableArray<NSString *> *outs = [NSMutableArray array];
-                for (AVAudioSessionPortDescription *port in route.outputs) {
-                    [outs addObject:[NSString stringWithFormat:@"%@(%@)",
-                                                port.portType, port.portName]];
-                }
-                NSString *outsJoined = outs.count ? [outs componentsJoinedByString:@", "] : @"none";
-                LOG("[audio-route] category=%{public}s outputs=<%{public}s> "
-                    "outputVolume=%.2f sampleRate=%.0f otherAudioPlaying=%d",
-                    session.category.UTF8String, outsJoined.UTF8String,
-                    session.outputVolume, session.sampleRate,
-                    session.isOtherAudioPlaying ? 1 : 0);
-            }
-        }
+         * category = ignores the silent switch (this is a game).
+         * 2026-09-26: moved into madeira_audio_session_ensure() -- see it. */
+        madeira_audio_session_observe();
+        madeira_audio_session_ensure("session-start");
 
         /* 2026-07-04 BISECT RESULT: arm A (this env set, all handler fixes
          * on) booted to menu at 17-18 FPS with the x18-access emulator

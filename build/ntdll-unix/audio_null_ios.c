@@ -1059,9 +1059,18 @@ fail:
 }
 
 /* Called with g_mix_lock held. */
+/* App side (WineProcessBridge.m): puts the AVAudioSession in the Playback
+ * category, activates it, and writes category/route/volume into the exported
+ * log.  Re-asserted here because the unit can be started long after session
+ * start, by which time another framework or an interruption may have changed
+ * the session -- and a session that is not Playback is muted by the tablet's
+ * Silent Mode with no error anywhere, while this engine happily renders. */
+extern void madeira_audio_session_ensure(const char *why) __attribute__((weak));
+
 static void ios_engine_start(void) {
     OSStatus err;
     if (!g_engine_au || g_engine_running) return;
+    if (madeira_audio_session_ensure) madeira_audio_session_ensure("engine-start");
     if ((err = AudioOutputUnitStart(g_engine_au))) {
         fprintf(stderr, "[audio] AudioOutputUnitStart: %d -- null-mode\n", (int)err);
         AudioUnitUninitialize(g_engine_au);
