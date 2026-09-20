@@ -736,6 +736,18 @@ static void *ios_pool_warmer_thread( void *arg )
                   || ios_last_footprint_mb >= IOS_FOOTPRINT_NEAR_MB;
         do_fp = do_beat || (fp_fast && now_ms >= next_fp);
 
+        /* ml1001: the tight-loop watchdog. It rides THIS tick because this is
+         * the only thread in the process that is always running and already
+         * wakes on a timer, and because the failure it looks for -- a guest
+         * thread pinned at 100 % inside a few bytes of its own code -- produces
+         * no fault, no allocation and no server request, so nothing else in the
+         * process is ever called while it is happening. It is quiet until an
+         * episode passes eight seconds; see ios_tight_loop_tick(). */
+        {
+            extern void ios_tight_loop_tick( void );
+            ios_tight_loop_tick();
+        }
+
         if (do_warm)   next_warm   = now_ms + IOS_WARM_PERIOD_MS;
         if (do_beat)   next_beat   = now_ms + IOS_HEARTBEAT_MS;
         if (do_census) next_census = now_ms + IOS_CENSUS_PERIOD_MS;
@@ -16364,6 +16376,26 @@ void virtual_map_user_shared_data(void)
     }
     if (needs_close) close( fd );
     NtClose( section );
+
+    /* ml1001: SAY WHAT THE GUEST CLOCK READS, ONCE, AT THE MOMENT IT BECOMES
+     * READABLE.  GetTickCount()/GetTickCount64() in kernelbase are three loads
+     * from this page and nothing else, so this line IS what every guest program
+     * will be told the time is.  It read 0 for the entire life of this port
+     * (the server's publication was opt-in behind MADEIRA_USD_TIME), which is
+     * indistinguishable in a log from "nobody asked" -- so print it rather than
+     * infer it.  A zero here means the clock is frozen and any guest that keys
+     * a data structure on the tick will collide every entry against every
+     * other one.  Two reads, once per process. */
+    {
+        unsigned long long ms = ((unsigned long long)user_shared_data->TickCount.High1Time << 32)
+                                | user_shared_data->TickCount.LowPart;
+        dprintf( 2, "[usd-clock] ml1001 guest KUSER_SHARED_DATA at %p: GetTickCount64()=%llu ms "
+                    "(TickCountMultiplier=0x%x) — %s\n",
+                 (void *)user_shared_data, ms,
+                 (unsigned)user_shared_data->TickCountMultiplier,
+                 ms ? "ticking" : "*** FROZEN AT ZERO: every guest tick-keyed timer will collide "
+                                  "(MADEIRA_USD_TIME=0 set?) ***" );
+    }
 }
 
 

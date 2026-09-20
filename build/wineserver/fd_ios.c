@@ -404,14 +404,31 @@ static void atomic_store_long(volatile LONG *ptr, LONG value)
 }
 
 /* ml731c: one place decides whether the shared-data clock is armed, so the
- * mapping and the periodic write can never disagree about it. */
+ * mapping and the periodic write can never disagree about it.
+ *
+ * ml1001: THE DEFAULT IS NOW ON, and the reason is a proven hang rather than a
+ * tidiness argument.  While this was opt-in, KUSER_SHARED_DATA.TickCount stayed
+ * at its SEC_COMMIT zero for the whole run, so GetTickCount() and
+ * GetTickCount64() returned 0 to every guest program, forever.  A 64-bit title
+ * whose HTTP stack keys an absolute-deadline timer tree on GetTickCount64
+ * therefore gave every timer the SAME key, and its "is this node already in the
+ * tree" sentinel is "the stored deadline is {0,0}" -- which a zero clock also
+ * produces.  The node was re-inserted while still linked, the equal-key path
+ * made it its own child, and a worker thread span in that tree at 100 % of a
+ * core for the rest of the run.  Three devices, three runs, byte-identical
+ * corruption.  See WOW64_DESIGN.md 2026-09-28.
+ *
+ * A clock that does not tick is not a missing optimisation, it is a wrong
+ * answer from an API, and it can only ever be found by the program that trips
+ * over it.  `MADEIRA_USD_TIME=0' is the kill switch and restores the frozen
+ * page exactly (mapping included -- see create_user_data_mapping). */
 int ios_usd_time_enabled(void)
 {
     static int env = -1;
     if (env < 0)
     {
         const char *e = getenv( "MADEIRA_USD_TIME" );
-        env = (e && e[0] == '1') ? 1 : 0;
+        env = (e && e[0] == '0') ? 0 : 1;
     }
     return env;
 }

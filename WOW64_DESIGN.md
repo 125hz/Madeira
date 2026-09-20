@@ -8478,3 +8478,161 @@ guest-slots=… verdict=…`). Consequences:
   still fast-fails with the same relative path while `[profile]` shows the
   folder present, the next suspect is the known-folder lookup itself in the
   x86-64 shell32 (registry value for the LocalAppDataLow GUID / USERPROFILE).
+
+- 2026-09-28 — **`GetTickCount64()` returned 0 to every guest program for the
+  whole life of this port, and a 64-bit managed-runtime engine title turned
+  that into an unkillable 100 %-CPU spin on its loading screen.**
+  THE SYMPTOM. One worker thread of a 64-bit title sits at 100 % of a core
+  (`jit 100 %`) for minutes inside ~0x80 bytes of the engine DLL, RVA
+  0x112e463..0x112e4e1; every other worker is parked in
+  `NtWaitForSingleObject`; `real_compile=+0`, no file I/O, no server request,
+  no fault anywhere near it. Three logs, three devices, two OS versions, two
+  address layouts (engine DLL at 0x70fccf0000 and at 0x3feaf0000), with
+  `MADEIRA_FASTSYNC` on and off, different worker indices — byte-identical
+  failure every time. Deterministic to that degree is not a race.
+  WHAT THE LOOP IS. The function at engine RVA 0x112e430 is a Sleator top-down
+  splay: `Node *splay(struct timeval key /*packed in rcx*/, Node *t)` over
+  `{smaller@+0, larger@+8, same@+0x10, key@+0x18, payload@+0x20}`, with the
+  header node on the stack at `[rsp]` and the searched key at
+  `[rsp+0x40]/[rsp+0x44]`. It is **libcurl's timer splay** (`Curl_splay`),
+  statically linked into the engine; the callers are `Curl_splayinsert`,
+  `Curl_splayremove`, `Curl_splaygetbest`, `multi_timeout` and, above those,
+  `Curl_expire`. The node is not allocated: it is an intrusive
+  `struct Curl_tree` embedded in the easy handle at `+0x8a48`, with `payload`
+  pointing back at the handle. The `[prof]` histogram (0x4c6, 0x4ca, 0x4d2,
+  0x4d9, 0x4e1, 0x463) says the thread takes the right-right zig-zig arm on
+  EVERY iteration and never once takes the left arm.
+  IT IS A CYCLE, AND NO EMULATION DEFECT CAN PRODUCE IT. This was settled on
+  the build machine rather than argued, by transcribing the loop
+  instruction-for-instruction into a host model: (a) 20,000 random acyclic
+  trees x random keys all terminate; (b) **50,000 acyclic shapes driven by an
+  ARBITRARY comparator all terminate** — every arm of the loop moves `t` to a
+  node reachable by one or two links of the ORIGINAL tree, so descent is
+  structural, not predicate-driven, and therefore *no* wrong branch, lost
+  NZCV, mis-set `setg`/`test`, or bad 32-bit signed compare can hang it; and
+  (c) an exhaustive enumeration of every graph on <=3 nodes finds 5,555
+  non-terminating shapes matching the device's instruction mix, all of which
+  require a cycle whose nodes keep BOTH children inside the cycle. The
+  hypothesis "guest flags lost across a host fault" is dead twice over: the
+  Mach handler round-trips the whole `arm_thread_state64_t` (`__cpsr`
+  included — nothing in `signal_arm64_ios.c` ever writes it), and no fault of
+  any kind lands in that block during the hang (`[fault-class]` attributes
+  every fault to blockRIPs in ntdll/FEX, never to the engine).
+  THE CORRUPT NODE, READ OFF THE DEVICE. The existing `[spin]`/`[tree]`
+  detectors already captured it. Tablet log, 64 bytes at the node:
+  `smaller = larger = same = 0x30c8689d8` — **the node is its own left child,
+  its own right child and its own duplicate-chain link** — `key =
+  0xffffffffffffffff` = libcurl's `KEY_NOTUSED {-1,-1}`, and `payload =
+  0x30c85ff90`, exactly `node - 0x8a48`. The phone logs show the same shape at
+  a different address. A `-1` key is smaller than every real key, which is
+  precisely why the left arm never runs.
+  ROOT CAUSE: A CLOCK THAT DOES NOT TICK. The qword immediately before the
+  node is `state.expiretime` (easy handle `+0x8a40`), and in all three runs it
+  reads **`{tv_sec = 0, tv_usec = 1000}`** — minutes into the process.
+  `Curl_tvnow()` on Windows is `GetTickCount64()` with
+  `tv_sec = ms/1000, tv_usec = (ms%1000)*1000`, so that value is only
+  reachable if `GetTickCount64()` returned **0**. It did, for every guest
+  program this port has ever run: `GetTickCount`/`GetTickCount64` in
+  kernelbase are nothing but three loads from `KUSER_SHARED_DATA.TickCount`,
+  and that page was never written. The server's publication
+  (`set_current_time()`, `build/wineserver/fd_ios.c:538`) and the writable
+  alias that makes it possible (`create_user_data_mapping()`,
+  `build/wineserver/mapping_ios.c:1547`) were both behind an opt-in
+  `MADEIRA_USD_TIME=1`; a `SEC_COMMIT` mapping starts zeroed. ml951 found the
+  same frozen page from the other side, fixed win32u's own `get_tick_count()`
+  by reading `CLOCK_MONOTONIC_RAW` instead, and said in its comment that the
+  guest-facing clock was "a separate, already-documented issue". It was the
+  whole bug.
+  HOW ZERO BECOMES A SELF-LINKED NODE. `Curl_expire(data, milli)` uses
+  `data->state.expiretime == {0,0}` as its sentinel for "this node is NOT in
+  the tree", and skips `Curl_splayremove` when it sees it. With the clock stuck
+  at 0, `Curl_expire(data, 0)` computes `set = tvnow() + 0 = {0,0}`, removes
+  and re-inserts correctly, and then stores `{0,0}` into `expiretime` — so the
+  node is IN the tree while its own sentinel says it is not. The next
+  `Curl_expire` therefore inserts a node that is already linked: `Curl_splay`
+  brings it to the root, `compare(i, t->key) == 0` with `node == t`, and the
+  equal-key arm executes `node->same = t; t->smaller = node; t->key =
+  KEY_NOTUSED` with `t == node`, writing the node's own address into its own
+  links and `{-1,-1}` into its own key. Every later splay walks that node
+  forever. Nothing about this is program-specific: any guest that keys a
+  container on the tick, or reserves 0 as "unset", collides every entry
+  against every other one.
+  THE FIX. `ios_usd_time_enabled()` now defaults ON, with `MADEIRA_USD_TIME=0`
+  as the kill switch that restores the frozen page exactly (mapping included).
+  The reason the gate existed is itself already fixed, and the comment that
+  records it is in the build script: wineserver and ntdll-unix BOTH define
+  `user_shared_data`, the single-process link merged them, and guest ntdll
+  init (`user_shared_data = NULL; NtAllocateVirtualMemory(..., PAGE_READONLY)`)
+  stole the server's pointer and aimed it at a read-only page — so the
+  server's next store wedged the main loop. The `objcopy --redefine-sym
+  _user_shared_data=_ws_user_shared_data` sweep in
+  `build/wineserver/build.sh` removed that collision; the opt-in gate outlived
+  the defect it was protecting against. `create_user_data_mapping()`
+  additionally calls `set_current_time()` once, at creation, before any client
+  exists, so the page is never observed at zero in the window before the
+  server's event loop first runs — which matters because 0 is not merely a
+  wrong time, it is a reserved value.
+  MADE VISIBLE, BECAUSE A CLOCK ONLY REVEALS ITSELF THROUGH ITS VICTIM.
+  `[usd-clock]` prints the guest's `GetTickCount64()` once, at the moment the
+  page becomes readable, and says FROZEN AT ZERO in as many words if it is;
+  and the quiet-default `[perf]` line gains `tick=Nms`, one relaxed 64-bit
+  read every ten seconds, so "does the guest clock advance" is answerable from
+  any log from now on without re-running anything.
+  THE TIGHT-LOOP WATCHDOG (`[tight-loop]`, `ios_tight_loop_tick()` in
+  `signal_arm64_ios.c`, called from the pool-warmer's 250 ms tick in
+  `virtual_ios.c`). The `[spin]`/`[tree]` pair that produced the decisive
+  evidence above lives inside the 200 Hz profiler, which is off by default —
+  a shipping build could not have reported this at all. The watchdog is
+  default-ON and silent: it samples at 2 Hz, gates on
+  `thread_info().cpu_usage >= 900` before it costs a second trap, and prints
+  nothing until a registered thread has stayed inside one 2 KB window of HOST
+  pc for more than eight seconds. Then, once per episode and at most eight
+  times per process, it dumps the guest x86-64 register file (out of FEX's
+  `CpuStateFrame` via TEB+0x1788 -> +0x30, using the offsets FEX publishes in
+  `[state-offsets]`), 128 bytes of guest code at rip, 64 bytes at every
+  register that points at readable memory, and a bounded <=64-step chase of
+  `*(reg+0)` and `*(reg+8)` from each of them reporting the FIRST REPEATED
+  ADDRESS with the node's bytes. Those two offsets are the left/right or
+  next/prev of essentially every intrusive node layout, so the cycle test is
+  generic rather than tuned to this structure. Every guest byte is read with
+  `mach_vm_read_overwrite` — there is not one guest dereference in it, which
+  is the point, since the thread it samples is by definition sitting on
+  corrupt memory — it takes no lock, allocates nothing, uses no
+  `thread_local`, and `MADEIRA_TIGHTLOOP=0` turns it off. The window is
+  measured on the host pc deliberately: FEX's published `State.rip` is
+  block-granular and in t45 it named a different function from the one
+  executing.
+  THE 450/s EXEC-FAULT REDIRECTS: CHARACTERISED, NOT YET REMOVED. Steady state
+  still takes ~450 `exec-fault redirects` a second, each a full Mach exception.
+  The hot targets resolve exactly: ntdll is at 0x70ffcd0000+0x130000 -> pool
+  0x1190a8000, so 0x70ffd38b58 is ntdll RVA 0x68b58 and 0x70ffd25100 is RVA
+  0x55100; `[EXC_SAMPLE]` catches one with `insn=0xd10103ff`
+  (`sub sp,sp,#0x40`) — a function PROLOGUE, i.e. a CALL through a stale PE VA,
+  not a data access. `[stale-heal]` reports `rewrote 0 slot(s)` for both, and
+  that is informative rather than a failure: its escalation pass scans every
+  registered module copy's whole image minus `.text` for the exact 8-byte
+  value, so the pointer is provably NOT in any module copy — it lives in an
+  anon executable range, the guest heap, or an immediate inside emitted code,
+  none of which the scanner can reach. The only thing that separates those is
+  where the call came from, so the redirect path now prints `[stale-src]`
+  (four lines per distinct target, then silent) carrying LR and whether LR is
+  inside a registered module copy. That names the owner in the next log;
+  nothing is rewritten on a guess.
+  VERIFIED. `ntdll-unix`, `win32u-unix` and `wineserver` all build and link
+  clean, and the archives are checked BY CONTENT for the new strings and
+  symbols, not by exit status. The splay model and the shape enumeration are
+  host-run, reproducible, and answer a question no device log could.
+  UNVERIFIED ON DEVICE: that the clock now advances, that the title loads, and
+  that the watchdog behaves — by construction it should now print nothing at
+  all, which is the success condition. The next log should show
+  `[usd-clock] … ticking` at boot, `[perf] … tick=` advancing by ~10000 per
+  window, no `[tight-loop]` line, and `[stale-src]` naming the caller of the
+  two ntdll redirect targets.
+  LESSON. A stopped clock is not a missing feature, it is an API returning a
+  wrong answer, and the cost of a wrong answer is paid by whichever data
+  structure reserves that value as a sentinel — arbitrarily far from the
+  clock, arbitrarily long after the call, and with a symptom (100 % CPU in a
+  twenty-byte loop) that looks exactly like an emulation defect and is not. It
+  had been known and documented for two rounds and left opt-in because the
+  crash that originally motivated the gate was never re-attributed; that crash
+  was a symbol collision, and something else had already fixed it.

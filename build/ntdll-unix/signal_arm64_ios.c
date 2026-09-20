@@ -2313,6 +2313,49 @@ static void *ios_mach_exception_thread( void *arg )
                          * address only ever faults once. */
                         if (jit_pc != (void *)(uintptr_t)fault_pc)
                             ios_stale_va_enqueue((uint64_t)fault_pc);
+                        /* ml1001: NAME THE CALLER, not just the callee.
+                         *
+                         * The t45 run still takes ~450 exec-fault redirects a
+                         * second in steady state, and [stale-heal] reports
+                         * "rewrote 0 slot(s)" for the two hottest of them --
+                         * which means the branch target does NOT live in any
+                         * registered module copy: the healer's escalation pass
+                         * scans every copy's whole image minus .text and still
+                         * finds nothing.  So the pointer is somewhere the
+                         * healer cannot reach (an anon executable range, a
+                         * guest-heap dispatch table, or an immediate baked into
+                         * emitted code), and the only thing that can tell them
+                         * apart is WHERE THE CALL CAME FROM.  LR at a faulted
+                         * function entry is exactly that, and it costs nothing:
+                         * the register state is already fetched.  Four lines per
+                         * distinct target, then silent forever. */
+                        if (jit_pc != (void *)(uintptr_t)fault_pc)
+                        {
+                            static uint64_t src_seen[8];
+                            static unsigned src_hits[8];
+                            unsigned si;
+                            for (si = 0; si < 8; si++)
+                            {
+                                if (!src_seen[si]) { src_seen[si] = (uint64_t)fault_pc; }
+                                if (src_seen[si] == (uint64_t)fault_pc) break;
+                            }
+                            if (si < 8 && ++src_hits[si] <= 4)
+                            {
+                                extern void *ios_jit_pool_copy_owner(const void *addr, void **pe_base_out);
+                                void *lr_pe = NULL;
+                                uint64_t lr = state.__lr;
+                                void *lr_owner = ios_jit_pool_copy_owner((void *)(uintptr_t)lr, &lr_pe);
+                                dprintf(STDERR_FILENO,
+                                    "[stale-src] ml1001 #%u target=0x%llx -> pool %p, called from lr=0x%llx "
+                                    "(%s) sp=0x%llx — if the caller is not a registered module copy the "
+                                    "heal scanner can never find the slot\n",
+                                    src_hits[si], (unsigned long long)fault_pc, jit_pc,
+                                    (unsigned long long)lr,
+                                    lr_pe ? "registered module copy" : "NOT a registered module copy",
+                                    (unsigned long long)__darwin_arm_thread_state64_get_sp(state));
+                                (void)lr_owner;
+                            }
+                        }
                         /* [xlate-exec] pseudo-process forensics: every
                          * image-VA exec fault is an ownership decision —
                          * log which copy the thread was routed to. A child
@@ -15970,4 +16013,322 @@ next:
     vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(*threads));
     mach_port_deallocate(mach_task_self(), self);
     fflush(stderr);
+}
+
+
+/* ===========================================================================
+ * ml1001  THE TIGHT-LOOP WATCHDOG  --  [tight-loop]
+ *
+ * WHY THIS EXISTS.  A guest thread that burns a whole core inside twenty bytes
+ * of its own code, forever, is the hardest failure this port produces to read
+ * from a log: nothing faults, nothing is allocated, no server request is made,
+ * no new code is compiled, and every other thread is parked waiting for the one
+ * that will never finish.  The evidence needed to name the cause -- the guest
+ * register file, the bytes it is walking, and whether the structure it walks is
+ * CIRCULAR -- exists for the few seconds it is happening and nowhere else.
+ * The previous answer ([spin]/[tree], ml677/ml690) produced exactly that
+ * evidence and solved a hang, but it lives inside the 200 Hz profiler, which is
+ * off by default: a SHIPPING build cannot report this at all, and the next hang
+ * would need a re-run with diagnostics on before anyone could even see it.
+ *
+ * SO THIS IS DEFAULT-ON AND QUIET.  It rides the pool-warmer's existing 250 ms
+ * tick (the one thread in this process that is always running and already wakes
+ * on a timer), samples at 2 Hz, and prints NOTHING until a thread has been
+ * inside one small code window at near-100 % CPU for more than eight seconds.
+ * Then it prints one bounded report, once for that episode, and goes quiet
+ * again.  A healthy run's entire cost is one thread_info() per registered
+ * thread every 500 ms -- about 80 Mach traps a second against the ~8,500/s the
+ * profiler cost -- and thread_get_state() is only called for a thread whose
+ * cpu_usage already says it is spinning.
+ *
+ * SAFETY RULES IT OBEYS BY CONSTRUCTION.
+ *  - Every byte of guest memory is read with mach_vm_read_overwrite.  There is
+ *    not one dereference of a guest pointer anywhere below, so a stale or
+ *    unmapped address returns a failed kern_return instead of faulting the
+ *    watchdog -- which matters doubly here, because the thread being sampled is
+ *    by definition sitting on a corrupt data structure.
+ *  - No lock is taken, and none is shared with a guest thread.  All state is
+ *    file-scope and touched only by the warmer thread.
+ *  - No thread_local: implicit TLS is what killed every program in the ml1000
+ *    regression, and the habit does not belong in this tree at all.
+ *  - Hard caps everywhere: 8 reports per process, 64 chase steps, 16 tracked
+ *    threads, fixed-size buffers, no allocation.
+ *
+ * WHAT IT PRINTS, AND WHY EACH PART EARNS ITS LINE.
+ *  - The guest x86-64 register file (rax..r15, rip, rsp) read out of FEX's
+ *    CpuStateFrame.  The host ARM registers alone do not say which guest value
+ *    is which; FEX publishes the offsets ([state-offsets]) and this uses them.
+ *  - 128 bytes of guest code at rip.  A loop this small is usually readable by
+ *    hand from the bytes, and the bytes settle which instruction is hot without
+ *    needing the image on the build machine.
+ *  - 64 bytes at every register that points at readable memory.  The operands
+ *    of the loop are in those registers by definition.
+ *  - A BOUNDED POINTER CHASE from every such register, following *(p+0) and
+ *    *(p+8) for at most 64 steps, reporting the FIRST REPEATED ADDRESS.  This
+ *    is the part that converts "a thread is busy" into "the structure is
+ *    circular", and it is generic: those two offsets are the left/right or
+ *    next/prev of essentially every intrusive node layout in existence.  A
+ *    cycle found here means memory was corrupted; no cycle, over 64 hops of a
+ *    structure a thread has walked for eight seconds, means the loop is not a
+ *    pointer walk and the register dump is where to look instead.
+ * =========================================================================== */
+
+#define IOS_TL_SLOTS        16      /* threads tracked concurrently */
+/* The window is measured on the HOST pc, deliberately.  FEX's published
+ * State.rip is BLOCK-granular -- in the t45 device log it read 0x70fde0fc1a
+ * while the thread was actually executing 0x70fde1e4d2, a different function
+ * entirely -- so a guest-rip window would be measuring the wrong number.  The
+ * host pc is exact.  2 KB rather than the 512 bytes of guest code the shape of
+ * this bug suggests, because one guest instruction becomes three to six host
+ * ones: the 0x80-byte guest loop that motivated this occupied 0xf4 bytes of
+ * emitted ARM, and a loop twice its size would still fit.  A thread doing real
+ * work leaves a 2 KB window long before sixteen consecutive samples. */
+#define IOS_TL_WINDOW      2048
+#define IOS_TL_SAMPLE_MS    500     /* 2 Hz */
+#define IOS_TL_ARM_MS       8000    /* report after this long in one window */
+#define IOS_TL_MAX_REPORTS  8       /* per process, ever */
+#define IOS_TL_CHASE        64      /* pointer-chase step cap */
+
+struct ios_tl_slot {
+    thread_t  port;
+    uint64_t  lo, hi;               /* host pc window seen so far */
+    unsigned  ms;                   /* time spent inside it */
+    unsigned  reported;             /* this episode already printed */
+};
+static struct ios_tl_slot ios_tl[IOS_TL_SLOTS];
+static int ios_tl_reports;
+static int ios_tl_off = -1;         /* -1 = not yet resolved from the env */
+
+static int ios_tl_enabled( void )
+{
+    if (ios_tl_off < 0)
+    {
+        const char *e = getenv( "MADEIRA_TIGHTLOOP" );
+        ios_tl_off = (e && e[0] == '0') ? 1 : 0;
+    }
+    return !ios_tl_off;
+}
+
+/* At most 128 bytes, hex, from guest memory.  Silent on an unreadable address:
+ * the caller has already said what the address was. */
+static void ios_tl_dump_mem( const char *what, uint64_t addr, unsigned len )
+{
+    unsigned char b[128];
+    char line[3 * 128 + 8];
+    unsigned i;
+    int n = 0;
+
+    if (len > sizeof(b)) len = sizeof(b);
+    if (!ios_prof_read( addr, b, len )) return;
+    for (i = 0; i < len; i++)
+    {
+        if (i && !(i & 7)) line[n++] = ' ';
+        n += snprintf( line + n, sizeof(line) - n, "%02x", b[i] );
+    }
+    line[n] = 0;
+    dprintf( 2, "[tight-loop]   %s @0x%llx: %s\n", what, (unsigned long long)addr, line );
+}
+
+/* Follow *(p+off) up to IOS_TL_CHASE steps and report the first address that
+ * repeats.  Returns 1 if a cycle was found.  `off' is 0 or 8, so one call
+ * covers the left/next link and the other the right/prev link of whatever node
+ * layout the guest is using. */
+static int ios_tl_chase( const char *regname, unsigned off, uint64_t start )
+{
+    uint64_t seen[IOS_TL_CHASE], cur = start;
+    int hops, q;
+
+    for (hops = 0; hops < IOS_TL_CHASE; hops++)
+    {
+        uint64_t next = 0;
+        seen[hops] = cur;
+        if (!ios_prof_read( cur + off, &next, 8 )) return 0;
+        if (!next || (next & 7)) return 0;
+        for (q = 0; q <= hops; q++)
+            if (seen[q] == next)
+            {
+                dprintf( 2, "[tight-loop]   CYCLE via %s->+0x%x: 0x%llx repeats after %d hop(s) "
+                            "-- the structure this loop walks is CIRCULAR\n",
+                         regname, off, (unsigned long long)next, hops );
+                ios_tl_dump_mem( "  cycle node", next, 64 );
+                return 1;
+            }
+        cur = next;
+    }
+    return 0;
+}
+
+/* The one-shot report.  `teb' may be 0; everything below degrades to "not
+ * available" rather than guessing. */
+static void ios_tl_report( thread_t port, uintptr_t teb, const arm_thread_state64_t *st,
+                           unsigned ms, uint64_t lo, uint64_t hi )
+{
+    static const char * const gname[16] = { "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+                                            "r8 ","r9 ","r10","r11","r12","r13","r14","r15" };
+    uint64_t cpuarea = 0, frame = 0, rip = 0, gregs[16];
+    uint64_t host_pc = (uint64_t)__darwin_arm_thread_state64_get_pc( *st );
+    uint64_t pe_va = 0, mod = 0;
+    int i, found_cycle = 0, have_state = 0;
+
+    memset( gregs, 0, sizeof(gregs) );
+
+    /* FEX's CpuStateFrame, via the chain FEX itself publishes:
+     * TEB+0x1788 = CHPEV2_CPU_AREA_INFO, +0x30 = CpuStateFrame,
+     * +0x18 = rip, +0x20 = gregs[16]   ([state-offsets], ml271). */
+    if (teb && ios_prof_read( (uint64_t)teb + 0x1788, &cpuarea, 8 ) && cpuarea > 0x10000 &&
+        ios_prof_read( cpuarea + 0x30, &frame, 8 ) && frame > 0x10000 &&
+        ios_prof_read( frame + 0x18, &rip, 8 ) &&
+        ios_prof_read( frame + 0x20, gregs, sizeof(gregs) ))
+        have_state = 1;
+
+    {
+        extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+        pe_va = ios_jit_reverse_translate( host_pc, &mod );
+    }
+
+    dprintf( 2, "[tight-loop] ml1001 port=0x%x teb=0x%llx SPUN %u ms inside a %llu-byte code "
+                "window [0x%llx,0x%llx] with no exit -- host pc=0x%llx%s\n",
+             port, (unsigned long long)teb, ms, (unsigned long long)(hi - lo + 4),
+             (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)host_pc,
+             pe_va ? " (host pc is a pool module copy, not emulated code)" : "" );
+
+    if (!have_state)
+    {
+        dprintf( 2, "[tight-loop]   guest register file NOT available (teb/cpu-area chain "
+                    "unreadable) -- host sp=0x%llx lr=0x%llx\n",
+                 (unsigned long long)__darwin_arm_thread_state64_get_sp( *st ),
+                 (unsigned long long)st->__lr );
+        return;
+    }
+
+    dprintf( 2, "[tight-loop]   guest rip=0x%llx  rax=0x%llx rcx=0x%llx rdx=0x%llx rbx=0x%llx\n",
+             (unsigned long long)rip, (unsigned long long)gregs[0], (unsigned long long)gregs[1],
+             (unsigned long long)gregs[2], (unsigned long long)gregs[3] );
+    dprintf( 2, "[tight-loop]   rsp=0x%llx rbp=0x%llx rsi=0x%llx rdi=0x%llx\n",
+             (unsigned long long)gregs[4], (unsigned long long)gregs[5],
+             (unsigned long long)gregs[6], (unsigned long long)gregs[7] );
+    dprintf( 2, "[tight-loop]   r8 =0x%llx r9 =0x%llx r10=0x%llx r11=0x%llx\n",
+             (unsigned long long)gregs[8], (unsigned long long)gregs[9],
+             (unsigned long long)gregs[10], (unsigned long long)gregs[11] );
+    dprintf( 2, "[tight-loop]   r12=0x%llx r13=0x%llx r14=0x%llx r15=0x%llx\n",
+             (unsigned long long)gregs[12], (unsigned long long)gregs[13],
+             (unsigned long long)gregs[14], (unsigned long long)gregs[15] );
+
+    /* The loop body itself.  rip is block-granular unless the block was left,
+     * so it names the FUNCTION reliably and the instruction only sometimes --
+     * which is why the host pc window is printed above as well. */
+    ios_tl_dump_mem( "guest code", rip, 128 );
+
+    for (i = 0; i < 16; i++)
+    {
+        uint64_t v = gregs[i];
+        unsigned char probe[8];
+        if (i == 4 || v < 0x10000 || (v & 7)) continue;      /* skip rsp and non-pointers */
+        if (!ios_prof_read( v, probe, sizeof(probe) )) continue;
+        ios_tl_dump_mem( gname[i], v, 64 );
+        if (ios_tl_chase( gname[i], 0, v )) found_cycle = 1;
+        if (ios_tl_chase( gname[i], 8, v )) found_cycle = 1;
+    }
+
+    dprintf( 2, "[tight-loop]   verdict: %s\n",
+             found_cycle
+             ? "a pointer chain reachable from a live register is CIRCULAR -- this loop cannot "
+               "terminate; the structure was corrupted before the loop was entered, and the "
+               "corruption is the bug, not the loop"
+             : "no cycle in 64 hops of *(reg+0)/*(reg+8) from any register -- the loop is not a "
+               "pointer walk; read the register dump and the code bytes above" );
+}
+
+/* Called from the pool-warmer heartbeat (virtual_ios.c) on its 250 ms tick.
+ * Returns immediately unless half a second has passed. */
+void ios_tight_loop_tick( void )
+{
+    static unsigned long long next_ms;
+    unsigned long long now;
+    int n, i, s;
+    struct timeval tv;
+
+    if (!ios_tl_enabled() || ios_tl_reports >= IOS_TL_MAX_REPORTS) return;
+
+    gettimeofday( &tv, NULL );
+    now = (unsigned long long)tv.tv_sec * 1000ull + (unsigned long long)tv.tv_usec / 1000ull;
+    if (now < next_ms) return;
+    next_ms = now + IOS_TL_SAMPLE_MS;
+
+    n = ios_thread_registry_count();
+    for (i = 0; i < n; i++)
+    {
+        thread_t port = ios_thread_registry_mach( i );
+        uintptr_t teb = ios_thread_registry_teb( i );
+        struct thread_basic_info bi;
+        mach_msg_type_number_t bcnt = THREAD_BASIC_INFO_COUNT;
+        arm_thread_state64_t st;
+        mach_msg_type_number_t scnt = ARM_THREAD_STATE64_COUNT;
+        uint64_t pc;
+        int free_slot = -1;
+
+        if (!port) continue;
+        memset( &bi, 0, sizeof(bi) );
+        if (thread_info( port, THREAD_BASIC_INFO, (thread_info_t)&bi, &bcnt ) != KERN_SUCCESS)
+            continue;
+        /* The cheap gate: everything above is one trap, and a parked thread
+         * costs nothing more.  TH_USAGE_SCALE is 1000, so 900 is ~90 % of a
+         * core over the kernel's own averaging window. */
+        if (bi.run_state != TH_STATE_RUNNING || bi.cpu_usage < 900)
+        {
+            for (s = 0; s < IOS_TL_SLOTS; s++)
+                if (ios_tl[s].port == port) { ios_tl[s].port = 0; break; }
+            continue;
+        }
+        if (thread_get_state( port, ARM_THREAD_STATE64, (thread_state_t)&st, &scnt ) != KERN_SUCCESS)
+            continue;
+        pc = (uint64_t)__darwin_arm_thread_state64_get_pc( st );
+        if (!pc) continue;
+
+        for (s = 0; s < IOS_TL_SLOTS; s++)
+        {
+            if (ios_tl[s].port == port) break;
+            if (!ios_tl[s].port && free_slot < 0) free_slot = s;
+        }
+        if (s == IOS_TL_SLOTS)
+        {
+            if (free_slot < 0) continue;            /* table full: this pass ignores it */
+            s = free_slot;
+            ios_tl[s].port = port;
+            ios_tl[s].lo = ios_tl[s].hi = pc;
+            ios_tl[s].ms = 0;
+            ios_tl[s].reported = 0;
+            continue;
+        }
+
+        {
+            uint64_t lo = pc < ios_tl[s].lo ? pc : ios_tl[s].lo;
+            uint64_t hi = pc > ios_tl[s].hi ? pc : ios_tl[s].hi;
+            if (hi - lo >= IOS_TL_WINDOW)
+            {
+                /* Left the window: ordinary work, not a tight loop.  Start a
+                 * fresh episode from here. */
+                ios_tl[s].lo = ios_tl[s].hi = pc;
+                ios_tl[s].ms = 0;
+                ios_tl[s].reported = 0;
+                continue;
+            }
+            ios_tl[s].lo = lo;
+            ios_tl[s].hi = hi;
+            ios_tl[s].ms += IOS_TL_SAMPLE_MS;
+            if (ios_tl[s].ms >= IOS_TL_ARM_MS && !ios_tl[s].reported)
+            {
+                ios_tl[s].reported = 1;
+                ios_tl_reports++;
+                ios_tl_report( port, teb, &st, ios_tl[s].ms, lo, hi );
+                if (ios_tl_reports >= IOS_TL_MAX_REPORTS)
+                {
+                    dprintf( 2, "[tight-loop] report budget spent (%d) -- no further reports this "
+                                "run; MADEIRA_TIGHTLOOP=0 disables the watchdog entirely\n",
+                             IOS_TL_MAX_REPORTS );
+                    return;
+                }
+            }
+        }
+    }
 }

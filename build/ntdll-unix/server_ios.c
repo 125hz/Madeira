@@ -1111,13 +1111,33 @@ void ios_perf_line( unsigned long long phys_mb, unsigned long long peak_mb,
     win_ns = now_ns - prev_ns;
     if (prev_ns && win_ns >= 1000000ull)
     {
-        wine_log_write( "[perf] rev=ml990 phys=%lluMB(peak %llu, comp %llu) srv=%llu/s "
-                        "fastsync hit=%u miss=%u peek=%u desync=%u"
-                        " - MADEIRA_DIAG=1 for the full reporters",
-                        phys_mb, peak_mb, comp_mb,
-                        (reqs - prev_reqs) * 1000000000ull / win_ns,
-                        hit - prev_hit, miss - prev_miss, peek - prev_peek,
-                        desync - prev_desync );
+        /* ml1001: the guest's own clock, in the one line a quiet build prints.
+         *
+         * GetTickCount64() is three loads from KUSER_SHARED_DATA and nothing
+         * else, so this IS what every guest program is being told the time is.
+         * It sat at 0 for the whole life of this port and no log could show
+         * that, because a clock only reveals itself through the program that
+         * trips over it.  One relaxed 64-bit read every ten seconds; a value
+         * that does not advance between two [perf] lines is the whole bug. */
+        {
+            extern struct _KUSER_SHARED_DATA *user_shared_data;
+            unsigned long long usd_ms = 0;
+            /* The pointer starts life as the canonical 0x7ffe0000, which XNU's
+             * 4 GB __PAGEZERO makes unreadable, and only becomes a real address
+             * once virtual_alloc_first_teb() has run.  This reporter cannot run
+             * that early, but a diagnostic must not be the thing that decides
+             * that: read only an address that is plainly past __PAGEZERO. */
+            if ((unsigned long long)(uintptr_t)user_shared_data > 0x100000000ull)
+                usd_ms = ((unsigned long long)user_shared_data->TickCount.High1Time << 32)
+                         | user_shared_data->TickCount.LowPart;
+            wine_log_write( "[perf] rev=ml1001 phys=%lluMB(peak %llu, comp %llu) srv=%llu/s "
+                            "fastsync hit=%u miss=%u peek=%u desync=%u tick=%llums"
+                            " - MADEIRA_DIAG=1 for the full reporters",
+                            phys_mb, peak_mb, comp_mb,
+                            (reqs - prev_reqs) * 1000000000ull / win_ns,
+                            hit - prev_hit, miss - prev_miss, peek - prev_peek,
+                            desync - prev_desync, usd_ms );
+        }
 
         /* ml990: THE "auto" RULE MOVED HERE, AND IT HAD TO.
          *

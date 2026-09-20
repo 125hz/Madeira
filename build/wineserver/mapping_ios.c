@@ -1530,6 +1530,12 @@ struct obj_locator get_shared_object_locator( volatile void *object_shm )
     return locator;
 }
 
+#ifdef WINE_IOS
+/* Defined in fd_ios.c; no shared header carries the iOS-only server helpers. */
+extern int  ios_usd_time_enabled( void );
+extern void ios_usd_report_alias( void *ptr, size_t size, const char *when );
+#endif
+
 struct object *create_user_data_mapping( struct object *root, const struct unicode_str *name,
                                         unsigned int attr, const struct security_descriptor *sd )
 {
@@ -1591,6 +1597,18 @@ struct object *create_user_data_mapping( struct object *root, const struct unico
     ptr = mmap( NULL, mapping->size, PROT_WRITE, MAP_SHARED, get_unix_fd( mapping->fd ), 0 );
 #endif
     if (ptr != MAP_FAILED) user_shared_data = ptr;
+#ifdef WINE_IOS
+    /* ml1001: PUBLISH ONCE, HERE, BEFORE ANY CLIENT EXISTS.
+     *
+     * The periodic publication happens on the server's event loop, which does
+     * not run until main_loop() is reached; the page is SEC_COMMIT and starts
+     * zeroed.  A guest that reads the tick inside that gap gets 0 -- and 0 is
+     * not merely a wrong time, it is the value several timer libraries reserve
+     * as "unset" (see ios_usd_time_enabled()).  One seeding call closes the
+     * window entirely, costs one gettimeofday plus the same stores the loop
+     * makes anyway, and runs exactly once. */
+    if (ptr != MAP_FAILED && ios_usd_time_enabled()) set_current_time();
+#endif
     return &mapping->obj;
 }
 
