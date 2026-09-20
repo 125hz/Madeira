@@ -574,6 +574,10 @@ static void ios_window_inventory( const char *why, unsigned long long lo_arg, un
 /* ml668: published by the footprint sampler below and read by its own cadence
  * logic; defined further down alongside ios_jit_pool_size_global. */
 extern unsigned long long ios_last_footprint_mb;
+
+/* ml990: carried from the heartbeat's task_info() to the compact [perf] line a
+ * few statements later. Same thread, no synchronisation needed. */
+static unsigned long long ios_perf_phys_mb, ios_perf_peak_mb, ios_perf_comp_mb;
 extern int ios_fast_footprint;
 
 /* ml960 (perf round 4): THE CENSUS WAS COSTING 4.4-4.8 % OF ALL CPU.
@@ -890,7 +894,11 @@ static void *ios_pool_warmer_thread( void *arg )
              * registered thread, i.e. a few hundred traps per call, plus four log
              * lines. All of it is stall forensics for a wedge that is not
              * happening while frames are being presented. */
-            if (do_beat)
+            /* ml990: the stall forensics bundle is DIAGNOSTIC-ONLY. ~2-3 mach
+             * calls per registered thread plus four log lines, every 10 s, for
+             * a wedge that by definition is not happening while frames are
+             * being presented. MADEIRA_DIAG=1 brings it back. */
+            if (do_beat && madeira_diag_on())
             {
                 extern void ios_pump_sample(void);
                 ios_pump_sample();
@@ -906,14 +914,43 @@ static void *ios_pool_warmer_thread( void *arg )
                     unsigned long long fp_mb = (unsigned long long)vmi.phys_footprint >> 20;
                     if (fp_mb > peak_mb) peak_mb = fp_mb;
                     ios_last_footprint_mb = fp_mb;      /* ml668: drives the sampler cadence */
-                    dprintf(2, "[footprint] rev=ml960 phys=%llu MB (peak %llu) internal=%llu MB "
-                            "compressed=%llu MB external=%llu MB reusable=%llu MB (cycle=%u)\n",
-                            fp_mb, peak_mb,
-                            (unsigned long long)vmi.internal >> 20,
-                            (unsigned long long)vmi.compressed >> 20,
-                            (unsigned long long)vmi.external >> 20,
-                            (unsigned long long)vmi.reusable >> 20, cycle);
+                    /* ml990: the task_info() itself is ONE trap and its result
+                     * is what tells a post-mortem how close the run got to the
+                     * jetsam ceiling, so it is never gated. The six-field line
+                     * is: in the quiet default the numbers ride the compact
+                     * [perf] line below instead. */
+                    if (madeira_diag_on())
+                        dprintf(2, "[footprint] rev=ml990 phys=%llu MB (peak %llu) internal=%llu MB "
+                                "compressed=%llu MB external=%llu MB reusable=%llu MB (cycle=%u)\n",
+                                fp_mb, peak_mb,
+                                (unsigned long long)vmi.internal >> 20,
+                                (unsigned long long)vmi.compressed >> 20,
+                                (unsigned long long)vmi.external >> 20,
+                                (unsigned long long)vmi.reusable >> 20, cycle);
+                    else
+                    {
+                        ios_perf_phys_mb = fp_mb;
+                        ios_perf_peak_mb = peak_mb;
+                        ios_perf_comp_mb = (unsigned long long)vmi.compressed >> 20;
+                    }
                 }
+            }
+
+            /* ml990: THE ONE LINE THE QUIET BUILD STILL PRINTS.
+             *
+             * Everything in it is already counted for other reasons, so it adds
+             * no measurement of its own: the footprint came from the task_info
+             * above, and the server/sync counters are the ones [srv-stats]
+             * differences (it keeps counting them; only its ten-line report is
+             * gated). fps is known app-side and deliberately not duplicated
+             * here. With MADEIRA_DIAG=1 the full reporters run and this line
+             * stays out of their way. */
+            if (do_beat && !madeira_diag_on())
+            {
+                extern void ios_perf_line( unsigned long long phys_mb,
+                                           unsigned long long peak_mb,
+                                           unsigned long long comp_mb );
+                ios_perf_line( ios_perf_phys_mb, ios_perf_peak_mb, ios_perf_comp_mb );
             }
             /* ml566: WHEN does the host malloc zone become corrupt?
              *
@@ -941,7 +978,14 @@ static void *ios_pool_warmer_thread( void *arg )
              * grows with the heap; it measured 0 ms at cycle 1 with a small heap
              * and was never re-measured. The bracket it produces widens from
              * ~2 s to ~10 s, which is still a readable window in the log. */
-            if (do_beat)
+            /* ml990: this is a CRASH diagnostic (it brackets heap corruption
+             * that kills the process later), so it is not switched off — but
+             * malloc_zone_check() walks every block of every zone and this app
+             * runs a multi-gigabyte heap, so in the quiet default it runs once
+             * a minute instead of once every ten seconds. The bracket widens
+             * from ~10 s to ~60 s of log, which is still readable; the cost
+             * drops by 6x. MADEIRA_DIAG=1 restores the 10 s cadence. */
+            if (do_beat && (madeira_diag_on() || (cycle % 6) == 0))
             {
                 extern int malloc_zone_check( void *zone );
                 static int zone_bad, zone_announced;
@@ -3216,12 +3260,52 @@ struct ios_mono_bridge g_ios_mono_bridge = { .abi_version = 2 };  /* ml649: stru
  * line; wrapping just the dprintf would save nothing. */
 volatile int madeira_diag_enabled = 0;
 
+/* ml990: THE ONE KNOB.
+ *
+ * ml649 built this switch and then gated two rate-limited trace lines with it,
+ * while every reporter that actually costs something stayed unconditionally on:
+ * the 200 Hz [prof] sampler, the 20 s all-thread stack walk, the 10 s
+ * ios_pump_sample() bundle, a full malloc_zone_check() every 10 s, [srv-stats],
+ * [fs-stats], and FEX's per-dispatch hot-RIP estimator. Together that is the
+ * measurement being a meaningful fraction of the thing measured.
+ *
+ * madeira_diag_on() is now the single answer, and it is the OR of
+ *   - MADEIRA_DIAG=1 in Documents/madeira-env.txt (parsed once, here), and
+ *   - the live app switch (madeira_set_diag_enabled), so loud and quiet can
+ *     still be compared inside one run at one thermal state.
+ *
+ * Default OFF. What stays on at all times: every crash and boot diagnostic
+ * (the SEGV/BUS handlers, the Mach exception backtraces, MADEIRA-EXIT and its
+ * forced final [srv-stats], the DEP and dispatcher banners, [build-id]), plus
+ * ONE compact [perf] line every 10 s.
+ *
+ * A per-subsystem knob that is explicitly set still wins for that subsystem, so
+ * MADEIRA_PROF=5 arms the profiler in an otherwise quiet build.
+ *
+ * ⚠️ Gate the WORK, not the PRINT. Several probes do an expensive read (Mach
+ * calls, dual-map readback, hashing) and only then decide whether to format a
+ * line; wrapping just the dprintf would save nothing. */
+static int madeira_diag_env = -1;   /* -1 = not parsed */
+
+int madeira_diag_on( void )
+{
+    int e = __atomic_load_n( &madeira_diag_env, __ATOMIC_RELAXED );
+
+    if (e < 0)
+    {
+        const char *v = getenv( "MADEIRA_DIAG" );
+        e = (v && *v && v[0] != '0') ? 1 : 0;
+        __atomic_store_n( &madeira_diag_env, e, __ATOMIC_RELAXED );
+    }
+    return e || __atomic_load_n( &madeira_diag_enabled, __ATOMIC_RELAXED );
+}
+
 void madeira_set_diag_enabled( int on )
 {
     __atomic_store_n( &madeira_diag_enabled, on ? 1 : 0, __ATOMIC_RELAXED );
     /* Publish to FEX too — it is a separate PE and cannot see this global. */
     __atomic_store_n( &g_ios_mono_bridge.diag_enabled, on ? 1u : 0u, __ATOMIC_RELAXED );
-    dprintf( 2, "[diag] ml649 diagnostics %s\n", on ? "ON" : "OFF (quiet)" );
+    dprintf( 2, "[diag] ml990 diagnostics %s\n", on ? "ON" : "OFF (quiet)" );
 }
 
 int madeira_get_diag_enabled( void ) { return __atomic_load_n( &madeira_diag_enabled, __ATOMIC_RELAXED ); }

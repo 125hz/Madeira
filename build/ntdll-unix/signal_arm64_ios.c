@@ -14176,7 +14176,26 @@ static void *ios_prof_thread( void *arg )
     pthread_set_qos_class_self_np( QOS_CLASS_UTILITY, 0 );
 
     {
+        extern int madeira_diag_on( void );
         const char *e = getenv( "MADEIRA_PROF" );
+        /* ml990: the profiler is DIAGNOSTIC and now defaults OFF.  At 200 Hz it
+         * does one thread_info() per registered thread per tick -- ~8-9 k Mach
+         * traps a second across ~40 guest threads -- plus a ~27-line report
+         * every 10 s with dladdr resolution and a full image rebuild.  Its own
+         * self-measurement reported 0.34-0.62 %/core in x101, and that number
+         * counts only the sampler thread's own time, not the traps it forces on
+         * every other thread.
+         *
+         * MADEIRA_PROF is still authoritative when it is SET, so
+         * MADEIRA_PROF=5 arms it in an otherwise quiet build and
+         * MADEIRA_PROF=0 silences it even under MADEIRA_DIAG=1.  Only the
+         * UNSET case changed. */
+        if ((!e || !*e) && !madeira_diag_on())
+        {
+            fprintf(stderr, "[prof] ml990 OFF (default) — MADEIRA_DIAG=1 or "
+                            "MADEIRA_PROF=\"period_ms[,report_s]\" arms it\n");
+            return NULL;
+        }
         if (e && *e)
         {
             int v = atoi( e );
@@ -14441,24 +14460,46 @@ static void *ios_prof_thread( void *arg )
                 }
                 if (ec_stats)
                 {
-                    unsigned long long pair[2] = { 0, 0 };
+                    /* ml990: the array grew to 4. [2] is "the target was
+                     * already a pool address", which is what [1] ("faulted")
+                     * was silently counting most of -- q1 had it at 1.4 M/s
+                     * against 214 real exec-fault redirects per second, i.e.
+                     * `faulted' was never a fault count at all.  Read all four
+                     * but print the three that mean something; an emulator
+                     * built before ml990 exports a 2-element array, so a short
+                     * read falls back to the old pair rather than printing
+                     * whatever follows it in .data. */
+                    unsigned long long q[4] = { 0, 0, 0, 0 };
                     mach_vm_size_t got = 0;
-                    if (mach_vm_read_overwrite( mach_task_self(),
+                    int have4 = (mach_vm_read_overwrite( mach_task_self(),
                                                 (mach_vm_address_t)(uintptr_t)ec_stats,
-                                                sizeof(pair),
-                                                (mach_vm_address_t)(uintptr_t)pair,
-                                                &got ) == KERN_SUCCESS && got == sizeof(pair))
+                                                sizeof(q),
+                                                (mach_vm_address_t)(uintptr_t)q,
+                                                &got ) == KERN_SUCCESS && got == sizeof(q));
+                    if (!have4)
                     {
-                        static unsigned long long prev_x, prev_m;
+                        got = 0;
+                        have4 = -(mach_vm_read_overwrite( mach_task_self(),
+                                                (mach_vm_address_t)(uintptr_t)ec_stats,
+                                                2 * sizeof(q[0]),
+                                                (mach_vm_address_t)(uintptr_t)q,
+                                                &got ) == KERN_SUCCESS && got == 2 * sizeof(q[0]));
+                    }
+                    if (have4)
+                    {
+                        static unsigned long long prev_x, prev_m, prev_p;
                         static long long prev_redir;
                         long long redir = ios_exc_x18_fixes;
                         fprintf(stderr,
-                                "[ec-call] translated=%llu faulted=%llu "
-                                "(+%llu/+%llu this window; exec-fault redirects +%lld)\n",
-                                pair[0], pair[1],
-                                pair[0] - prev_x, pair[1] - prev_m, redir - prev_redir);
-                        prev_x = pair[0];
-                        prev_m = pair[1];
+                                "[ec-call] translated=%llu faulted=%llu inpool=%llu "
+                                "(+%llu/+%llu/+%llu this window; exec-fault redirects +%lld)%s\n",
+                                q[0], q[1], q[2],
+                                q[0] - prev_x, q[1] - prev_m, q[2] - prev_p,
+                                redir - prev_redir,
+                                (have4 < 0) ? " [pre-ml990 emulator: inpool is not counted]" : "");
+                        prev_x = q[0];
+                        prev_m = q[1];
+                        prev_p = q[2];
                         prev_redir = redir;
                     }
                     else ec_probe_done = 0;  /* image moved: re-resolve next window */
@@ -15345,6 +15386,31 @@ void ios_dump_all_thread_stacks(void)
     thread_act_array_t threads;
     mach_msg_type_number_t count = 0, i;
     thread_t self = mach_thread_self();
+    extern int madeira_diag_on( void );
+
+    /* ml990: GATED HERE, NOT AT THE TIMER.
+     *
+     * The 20 s GCD timer that drives this lives in the app target, which this
+     * round does not touch -- and this is the right place anyway, because the
+     * expense is the walk, not the print: task_threads() plus, for each of ~40
+     * threads, a thread_get_state(), a thread_info(), an 8-frame frame-pointer
+     * walk and a dladdr() per frame.  In x101 it was the loudest tag in the
+     * log at 1726 lines.  Nothing consumes it but a human reading a wedge.
+     *
+     * The FREEZE path is separate and still works: ios_wait_chain_snapshot()
+     * and the [spin] detector call their own collectors, and the Mach exception
+     * and SEGV handlers print their backtraces regardless of this switch. */
+    if (!madeira_diag_on())
+    {
+        static int said;
+        if (!said)
+        {
+            said = 1;
+            fprintf(stderr, "[thread-stacks] ml990 OFF (default) — MADEIRA_DIAG=1 re-arms the "
+                            "20s all-thread walk; crash and freeze backtraces are unaffected\n");
+        }
+        return;
+    }
 
     if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) return;
     fprintf(stderr, "[thread-stacks] ---- %u threads ----\n", count);

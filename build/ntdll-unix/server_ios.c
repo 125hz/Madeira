@@ -589,6 +589,10 @@ uintptr_t ios_srv_game_teb = 0;           /* set once by server_init_process_don
  * and every atomic add); any other value, or absent, leaves it on. */
 static int ios_srv_stats_on = -1;         /* -1 = not yet probed */
 
+/* ml990: the ten-line report and the per-request timing/caller work that only
+ * the report consumes. Follows MADEIRA_DIAG; see ios_srv_stats_enabled(). */
+static int ios_srv_report_on = 0;
+
 #define IOS_SRV_STATS_PERIOD_S   10
 #define IOS_SRV_STATS_TOP_KINDS  12
 #define IOS_SRV_STATS_TOP_THR    6
@@ -1061,16 +1065,103 @@ void ios_srv_stats_report_now(void)
     ios_srv_stats_report( mach_absolute_time() );
 }
 
+/* ml990: THE COMPACT QUIET-BUILD SUMMARY.
+ *
+ * Called once every 10 s from the pool-warmer heartbeat when MADEIRA_DIAG is
+ * off, in place of the ~60 lines the full reporters print between them.  It
+ * measures nothing of its own: every number here is already being counted for
+ * another reason -- the footprint came from the heartbeat's own task_info(),
+ * the request counts are the ones ios_srv_stats_account() maintains on the
+ * server path regardless, and the fastsync counters are relaxed adds on paths
+ * that were going to touch that cache line anyway.  Summing REQ_NB_REQUESTS
+ * slots once per ten seconds is free.
+ *
+ * fps is deliberately absent: the app knows it and prints it, and duplicating
+ * it here would mean a frame counter on a path that has none.
+ *
+ * Deltas, not totals, because the question this line answers is "is the server
+ * traffic collapsing the way fastsync says it should" -- which only a rate can
+ * answer. */
+void ios_perf_line( unsigned long long phys_mb, unsigned long long peak_mb,
+                    unsigned long long comp_mb )
+{
+    static unsigned long long prev_reqs, prev_ns;
+    static unsigned int prev_hit, prev_miss, prev_peek, prev_desync, prev_ops;
+    unsigned long long reqs = 0, now_ns, win_ns;
+    unsigned int hit, miss, peek, desync, ops;
+    unsigned int i;
+
+    for (i = 0; i < REQ_NB_REQUESTS; i++)
+        reqs += __atomic_load_n( &ios_srv_kind_count[i], __ATOMIC_RELAXED );
+
+    hit    = __atomic_load_n( &ios_srv_nt_counts[IOS_NT_FAST_HIT],  __ATOMIC_RELAXED );
+    miss   = __atomic_load_n( &ios_srv_nt_counts[IOS_NT_FAST_MISS], __ATOMIC_RELAXED );
+    peek   = __atomic_load_n( &ios_srv_nt_counts[IOS_FS_POLLPEEK],  __ATOMIC_RELAXED );
+    desync = __atomic_load_n( &ios_srv_nt_counts[IOS_FS_DESYNC],    __ATOMIC_RELAXED );
+
+    /* The same six counters the "auto" rule has always been fed. */
+    ops = __atomic_load_n( &ios_srv_nt_counts[IOS_NT_SET_EVENT],   __ATOMIC_RELAXED )
+        + __atomic_load_n( &ios_srv_nt_counts[IOS_NT_RESET_EVENT], __ATOMIC_RELAXED )
+        + __atomic_load_n( &ios_srv_nt_counts[IOS_SEL_WAIT1_INF],  __ATOMIC_RELAXED )
+        + __atomic_load_n( &ios_srv_nt_counts[IOS_SEL_WAIT1_FIN],  __ATOMIC_RELAXED )
+        + __atomic_load_n( &ios_srv_nt_counts[IOS_SEL_WAIT1_POLL], __ATOMIC_RELAXED )
+        + peek;
+
+    now_ns = ios_srv_ticks_to_ns( mach_absolute_time() );
+    win_ns = now_ns - prev_ns;
+    if (prev_ns && win_ns >= 1000000ull)
+    {
+        wine_log_write( "[perf] rev=ml990 phys=%lluMB(peak %llu, comp %llu) srv=%llu/s "
+                        "fastsync hit=%u miss=%u peek=%u desync=%u"
+                        " - MADEIRA_DIAG=1 for the full reporters",
+                        phys_mb, peak_mb, comp_mb,
+                        (reqs - prev_reqs) * 1000000000ull / win_ns,
+                        hit - prev_hit, miss - prev_miss, peek - prev_peek,
+                        desync - prev_desync );
+
+        /* ml990: THE "auto" RULE MOVED HERE, AND IT HAD TO.
+         *
+         * ml982 put it inside ios_srv_stats_report(), on the reasoning that
+         * the reporter was "the only thing in the image that already knows the
+         * task's request rate".  That was true then.  Now the report is behind
+         * MADEIRA_DIAG and the default is MADEIRA_FASTSYNC=auto, so leaving
+         * the rule there would have meant the wake path never arming in a
+         * shipping build -- the default would have been auto in name only.
+         *
+         * The two callers are mutually exclusive by construction: this line
+         * only runs when MADEIRA_DIAG is off, and the reporter only runs when
+         * it is on.  Never both, so never a double count.  (Arming twice would
+         * be harmless anyway -- madeira_fastsync_auto_arm latches with an
+         * exchange -- but "harmless" is not the same as "correct".) */
+        {
+            extern void madeira_fastsync_auto_arm( unsigned int ops, unsigned long long window_ns );
+            madeira_fastsync_auto_arm( ops - prev_ops, win_ns );
+        }
+    }
+
+    prev_reqs = reqs; prev_ns = now_ns; prev_ops = ops;
+    prev_hit = hit; prev_miss = miss; prev_peek = peek; prev_desync = desync;
+}
+
 static inline void ios_srv_stats_account( unsigned int kind, unsigned long long t0, uintptr_t caller )
 {
-    unsigned long long now = mach_absolute_time();
-    TEB *teb = NtCurrentTeb();
+    /* ml990: the SECOND clock read is as gated as the first -- reading it here
+     * and discarding it would have left the quiet build paying for exactly the
+     * thing the gate exists to remove. */
+    unsigned long long now = t0 ? mach_absolute_time() : 0;
+    TEB *teb;
 
     if (kind < REQ_NB_REQUESTS)
     {
         __atomic_fetch_add( &ios_srv_kind_count[kind], 1, __ATOMIC_RELAXED );
-        __atomic_fetch_add( &ios_srv_kind_ticks[kind], now - t0, __ATOMIC_RELAXED );
+        /* ml990: t0 == 0 means the quiet build did not read the clock, so
+         * there is no duration to charge and nothing downstream reads the
+         * per-kind ticks. The COUNT above is what [perf] differences. */
+        if (t0) __atomic_fetch_add( &ios_srv_kind_ticks[kind], now - t0, __ATOMIC_RELAXED );
     }
+    if (!__atomic_load_n( &ios_srv_report_on, __ATOMIC_RELAXED )) return;
+
+    teb = NtCurrentTeb();
     ios_srv_caller_bump( kind, caller );
     ios_srv_thr_bump( teb ? (unsigned int)(ULONG_PTR)teb->ClientId.UniqueThread : 0 );
 
@@ -1130,17 +1221,40 @@ static int ios_srv_stats_enabled(void)
 
     if (on < 0)
     {
+        /* ml990: TWO gates now, because counting and reporting have very
+         * different costs and very different value in a shipping run.
+         *
+         *   ios_srv_stats_on      the COUNTING.  Stays on unless
+         *                         MADEIRA_SRV_STATS=0, because the compact
+         *                         [perf] line differences these counters and
+         *                         they are a few relaxed adds on a path that
+         *                         fastsync has already taken from ~40 k/s to a
+         *                         few thousand per second.
+         *   ios_srv_report_on     the ten-line REPORT, and with it the two
+         *                         mach_absolute_time() calls and the caller-PC
+         *                         frame hop that only the report consumes.
+         *                         Follows MADEIRA_DIAG, or MADEIRA_SRV_STATS
+         *                         set to anything but 0. */
+        extern int madeira_diag_on( void );
         const char *e = getenv( "MADEIRA_SRV_STATS" );
         on = (e && !strcmp( e, "0" )) ? 0 : 1;
+        __atomic_store_n( &ios_srv_report_on,
+                          on && (e || madeira_diag_on()) ? 1 : 0, __ATOMIC_RELAXED );
         if (on)
         {
+            /* The window is armed either way: the MADEIRA-EXIT forced report
+             * has to be able to divide by a real window even in a quiet run. */
             unsigned long long now = mach_absolute_time();
             ios_srv_stats_window_t0 = now;
             __atomic_store_n( &ios_srv_stats_deadline,
                               now + ios_srv_ns_to_ticks( IOS_SRV_STATS_PERIOD_S * 1000000000ull ),
                               __ATOMIC_RELAXED );
-            wine_log_write( "[srv-stats] ON rev=ml951 period=%ds — per-kind wineserver traffic; "
-                            "MADEIRA_SRV_STATS=0 to disable", IOS_SRV_STATS_PERIOD_S );
+            if (__atomic_load_n( &ios_srv_report_on, __ATOMIC_RELAXED ))
+                wine_log_write( "[srv-stats] ON rev=ml990 period=%ds — per-kind wineserver traffic; "
+                                "MADEIRA_SRV_STATS=0 to disable", IOS_SRV_STATS_PERIOD_S );
+            else
+                wine_log_write( "[srv-stats] counting only (rev=ml990) — the per-kind report is "
+                                "behind MADEIRA_DIAG=1; the compact [perf] line carries reqs/s" );
         }
         __atomic_store_n( &ios_srv_stats_on, on, __ATOMIC_RELAXED );
     }
@@ -1159,10 +1273,15 @@ unsigned int server_call_unlocked( void *req_ptr )
 #ifdef WINE_IOS
     const unsigned int stats_kind = req->u.req.request_header.req;
     const int stats_on = ios_srv_stats_enabled();
-    const unsigned long long stats_t0 = stats_on ? mach_absolute_time() : 0;
+    /* ml990: the clock read and the caller-PC frame hop exist only to feed the
+     * ten-line report, so they follow ios_srv_report_on, not ios_srv_stats_on.
+     * The quiet build keeps the per-kind COUNT (which [perf] differences) and
+     * pays one relaxed add for it. */
+    const int stats_rep = stats_on && __atomic_load_n( &ios_srv_report_on, __ATOMIC_RELAXED );
+    const unsigned long long stats_t0 = stats_rep ? mach_absolute_time() : 0;
     /* ml970: taken HERE, not inside ios_srv_stats_account(), because the
      * return address a static inline sees depends on whether it was inlined. */
-    const uintptr_t stats_ra = stats_on ? IOS_SRV_CALLER_PC() : 0;
+    const uintptr_t stats_ra = stats_rep ? IOS_SRV_CALLER_PC() : 0;
 #endif
 
     ios_srv_req_count++;

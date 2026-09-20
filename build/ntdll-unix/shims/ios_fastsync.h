@@ -35,7 +35,7 @@
  *
  * THE STATE WORD IS THE SINGLE SOURCE OF TRUTH
  * --------------------------------------------
- * For an event that owns a cell, cell->state — not the server's
+ * For an event that owns a cell, the cell's STATE half — not the server's
  * `event_sync.signaled` bit — is what event_sync_signaled() reads and what
  * event_sync_satisfied() clears.  There is exactly one place the two can
  * disagree, and it is deliberate: MADEIRA_CELL_DISABLED (see below).
@@ -106,13 +106,54 @@
  *     value the waiter last observed, so a set landing between the load and
  *     the syscall makes the syscall return immediately rather than sleep.
  *
- * GENERATION
- * ----------
+ * GENERATION -- ml990: PACKED INTO THE STATE WORD, NOT BESIDE IT
+ * --------------------------------------------------------------
  * `gen' is bumped on every allocation AND every free, so a client that cached
  * (index, gen) for a handle can detect that the cell has been recycled under
  * it and fall back to the server.  A live handle pins the event, and the event
  * pins the cell, so this only ever fires for the documented-undefined case of
  * operating on an already-closed handle.
+ *
+ * Through ml982 `gen' was a SEPARATE word, which made "is this still my cell"
+ * (a load of gen) and "take the token" (a CAS on state) two operations with a
+ * gap between them:
+ *
+ *      client                                server
+ *      ------                                ------
+ *      load gen        -> G, matches
+ *                                            destroy event: state=DISABLED, gen=G+1
+ *                                            create event:  gen=G+2, state=SET
+ *      CAS state SET->RESET  SUCCEEDS  <---- and this token belongs to an event
+ *                                            this thread never waited on
+ *
+ * i.e. a lost wakeup on an unrelated object.  ml982 documented it as a
+ * residual and kept the wake path off by default because of it.
+ *
+ * ml990 removes the gap rather than narrowing it: the generation and the state
+ * live in ONE 64-bit word, `sg', so the CAS that takes a token also validates
+ * the generation.  There is no interleaving in which a CAS can succeed against
+ * a cell that changed hands since the load, because a change of hands IS a
+ * change of the word the CAS compares.
+ *
+ *      bits 63..32   gen   (never 0 for an allocated cell; 0 = never allocated)
+ *      bits 31..0    state (MADEIRA_CELL_*, read back as a SIGNED int)
+ *
+ * THE FUTEX STILL WAITS ON THE LOW HALF.  madeira_cell_futex() hands back the
+ * address of the state half -- which on this little-endian target is the
+ * address of `sg' itself -- so os_sync_wait_on_address/__ulock_wait keep
+ * comparing 4 bytes and a park is still "sleep while state == RESET".  That
+ * matters in both directions: a pure generation bump must not wake a parked
+ * waiter spuriously, and every recycle changes the LOW half too (a free stores
+ * DISABLED with the bump in the same store), so no recycle can be missed.
+ *
+ * EVERY access to the pair is a 64-bit atomic on both sides.  A 32-bit store
+ * to the low half would be architecturally fine on ARM64 but is a mixed-size
+ * data race in the C memory model, so the server rebuilds the whole word from
+ * the generation it read in the same load.  That read-modify-write is not
+ * atomic against a client CAS, and does not need to be: it is exactly as
+ * unconditional as the plain `state = RESET' store it replaces, and the server
+ * is the only writer of `gen' and runs on one thread, so the generation it
+ * reads cannot go stale under it.
  *
  * ml982: THE FOUR MODES OF MADEIRA_FASTSYNC
  * -----------------------------------------
@@ -124,7 +165,7 @@
  *                        event, so event->signaled is the state again and this
  *                        table is never touched by either side.  Byte for byte
  *                        the pre-ml952 server and client.
- *   unset  (the DEFAULT) CELLS ONLY.  The server keeps each event's state in
+ *   unset                CELLS ONLY.  The server keeps each event's state in
  *                        its cell -- which is a pure relocation of one bit,
  *                        since with no client participation signaled()/
  *                        satisfied()/signal() read and write the cell exactly
@@ -134,7 +175,7 @@
  *                        signaled (MADEIRA_FS_POLLPEEK).  No wake semantics,
  *                        no token can be consumed or minted off-server, so
  *                        there is no lost- or double-wakeup to get wrong.
- *   "auto"               CELLS + the client wake path, armed only once the
+ *   "auto" (the DEFAULT) CELLS + the client wake path, armed only once the
  *                        task's own [srv-stats] window shows more event/select
  *                        traffic than MADEIRA_FS_AUTO_REQS (20000 per 10 s).
  *                        A quiet process (a launcher, a helper) never arms.
@@ -142,6 +183,16 @@
  *
  * The client half is what NtSetEvent/NtResetEvent/NtWaitForSingleObject route
  * through; the server half is unconditional above "off".
+ *
+ * ml990 MOVES THE DEFAULT FROM "unset = cells only" TO "auto".  The two
+ * reasons ml982 gave for not doing so are both gone: (1) the lost-wakeup
+ * vector was the split gen/state pair, which the packing above makes
+ * unrepresentable; (2) "nothing has ever executed on a device" -- log y104 ran
+ * the whole mechanism with MADEIRA_FASTSYNC=auto through a 32-bit job-system
+ * title, armed it (`[fastsync] AUTO-ENABLED after 181468 event/select ops`),
+ * and reported desync=0, stale_gen=0 and relearn=0 in every window while total
+ * server traffic fell from 15296/s to ~5200/s.  MADEIRA_FASTSYNC=0 still
+ * forces the whole thing off, cells included.
  */
 
 #ifndef __IOS_FASTSYNC_H
@@ -160,15 +211,32 @@
 #define MADEIRA_CELL_SET        1
 #define MADEIRA_CELL_CLAIMED    2
 
+/* ml990: the packed {gen, state} word.  `state' is stored as the low 32 bits
+ * and read back SIGNED, so MADEIRA_CELL_DISABLED survives the round trip. */
+#define MADEIRA_SG(gen, state)  (((uint64_t)(unsigned int)(gen) << 32) | \
+                                 (uint64_t)(uint32_t)(int32_t)(state))
+#define MADEIRA_SG_GEN(sg)      ((unsigned int)((uint64_t)(sg) >> 32))
+#define MADEIRA_SG_STATE(sg)    ((int)(int32_t)(uint32_t)(uint64_t)(sg))
+
 struct madeira_sync_cell
 {
-    int          state;        /* MADEIRA_CELL_*; the futex word                 */
+    uint64_t     sg;           /* ml990 PACKED {gen:63..32, state:31..0}         */
     int          srv_waiters;  /* server wait_queue entries on this object       */
-    int          waiters;      /* client threads parked on &state                */
-    unsigned int gen;          /* bumped on every alloc and every free           */
+    int          waiters;      /* client threads parked on the state half        */
     unsigned int manual;       /* 1 = manual-reset (NotificationEvent)           */
     unsigned int pad[3];       /* keep two cells per 64-byte line                */
 };
+
+/* The futex address: the STATE half of `sg'.  Both sides must use this and
+ * only this, or a client parked by one could never be woken by the other. */
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
+    __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+#error "madeira_cell_futex() assumes the low half of sg lives at offset 0"
+#endif
+static inline int *madeira_cell_futex( struct madeira_sync_cell *cell )
+{
+    return (int *)&cell->sg;
+}
 
 extern struct madeira_sync_cell madeira_sync_cells[MADEIRA_SYNC_CELLS];
 

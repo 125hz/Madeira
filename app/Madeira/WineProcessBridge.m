@@ -586,6 +586,30 @@ static void *wine_process_thread(void *arg) {
                           aerr.localizedDescription.UTF8String);
             else LOG("AVAudioSession active: rate=%.0f latency=%.1fms",
                      session.sampleRate, session.outputLatency * 1000.0);
+
+            /* ml — device feedback: a tablet user reported no sound while the
+             * engine's own census showed audio flowing (Wine's mixer WAS
+             * producing samples), which points at the ROUTE rather than a
+             * Wine-side bug — a route with no usable output, or outputVolume
+             * pinned at 0 (hardware mute switch, ringer, a Bluetooth output
+             * that silently failed to connect), explains "flowing but
+             * silent" with nothing to fix on the emulation side. One line,
+             * after activation so the route reflects what Wine will actually
+             * get, through the same log function as the two lines above. */
+            {
+                AVAudioSessionRouteDescription *route = session.currentRoute;
+                NSMutableArray<NSString *> *outs = [NSMutableArray array];
+                for (AVAudioSessionPortDescription *port in route.outputs) {
+                    [outs addObject:[NSString stringWithFormat:@"%@(%@)",
+                                                port.portType, port.portName]];
+                }
+                NSString *outsJoined = outs.count ? [outs componentsJoinedByString:@", "] : @"none";
+                LOG("[audio-route] category=%{public}s outputs=<%{public}s> "
+                    "outputVolume=%.2f sampleRate=%.0f otherAudioPlaying=%d",
+                    session.category.UTF8String, outsJoined.UTF8String,
+                    session.outputVolume, session.sampleRate,
+                    session.isOtherAudioPlaying ? 1 : 0);
+            }
         }
 
         /* 2026-07-04 BISECT RESULT: arm A (this env set, all handler fixes

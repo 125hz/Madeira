@@ -325,7 +325,44 @@ struct wma_transform
  * side has no Wine debug channel of its own in this build, and the app runs
  * with WINEDEBUG=err+all,err-virtual, so a channel-gated line would be
  * invisible in exactly the device logs these messages exist for. */
-#define WMA_LOG( fmt, ... ) dprintf( 2, "[wma] " fmt, ## __VA_ARGS__ )
+/*
+ * ml990: CAPPED, AND THEN GATED.
+ *
+ * dprintf(2, ...) here is a real write(2) to the log file (stderr is dup2'd to
+ * it), and this macro fires roughly eight times per decoded audio packet --
+ * push, packet number, three "nothing decoded at N bit/s" lines, a provisional
+ * rate line.  In device log x101 it was 1610 lines, second only to the
+ * thread-stack walk, and every one of them is a syscall on the audio thread
+ * during gameplay.
+ *
+ * Two changes, in the order that matters:
+ *   1. A HARD CAP on the steady-state lines, so a stream that is failing every
+ *      packet cannot turn a decode problem into a logging problem.  The first
+ *      MADEIRA_WMA_MAX_LOGS lines are exactly what they were -- which is what
+ *      a diagnosis needs, because the interesting part of a WMA failure is
+ *      always at the start of the stream.
+ *   2. MADEIRA_DIAG=1 lifts the cap entirely, for when the stream itself is
+ *      what is under investigation.
+ *
+ * The cap is announced once so a reader never mistakes silence for success.
+ */
+#define MADEIRA_WMA_MAX_LOGS 200
+
+static unsigned int wma_log_count;
+
+#define WMA_LOG( fmt, ... )                                                          \
+    do {                                                                             \
+        extern int madeira_diag_on( void );                                          \
+        unsigned int _n = __atomic_add_fetch( &wma_log_count, 1, __ATOMIC_RELAXED ); \
+        if (_n <= MADEIRA_WMA_MAX_LOGS)                                              \
+            dprintf( 2, "[wma] " fmt, ## __VA_ARGS__ );                              \
+        else if (_n == MADEIRA_WMA_MAX_LOGS + 1)                                     \
+            dprintf( 2, "[wma] further per-packet lines suppressed after %u "         \
+                        "(rev=ml990; MADEIRA_DIAG=1 removes the cap)\n",              \
+                     (unsigned int)MADEIRA_WMA_MAX_LOGS );                           \
+        else if (madeira_diag_on())                                                  \
+            dprintf( 2, "[wma] " fmt, ## __VA_ARGS__ );                              \
+    } while (0)
 
 /***********************************************************************
  *           libavcodec's own diagnostics

@@ -8011,3 +8011,412 @@ guest-slots=… verdict=…`). Consequences:
   Anything that decides "this is a misalignment" must read the ESR, and the
   cost of guessing wrong is not a wrong log line — it is routing a survivable
   fault into an emulator path that faults again somewhere with no handler.
+
+- 2026-09-24 — **DXTn textures on a GPU with no BC support were never decoded,
+  and the two ways that failed looked like two different bugs.** A 32-bit D3D9
+  title is correct on a phone that reports `supportsBCTextureCompression = YES`
+  and is unreadable on a tablet that reports NO — menu text and every in-game
+  texture are noise, while an uncompressed background image is fine.
+  WHAT WAS ACTUALLY HAPPENING, AND WHY IT HAD TWO FACES. On a device without BC
+  support `to_metal_pixel_format` (`winemetal_unix.c` `remap_unsupported_bc`)
+  has always rewritten a BC descriptor to `RGBA8Unorm` / `R8Unorm` / `RG8Unorm`
+  of the SAME texel extent, so the resource is real and samplable — but nothing
+  above it ever decoded the blocks, and the D3D9 frontend kept uploading BC
+  bytes with BC row pitch. The blit encoder's `texture_upload_pitch_ok` guard
+  drops a copy whose `bytesPerRow` is smaller than `width * bpp`, and for the
+  8-byte block formats that pitch is `ceil(w/4)*8 = 2w` against a required `4w`,
+  so **BC1 uploads were silently discarded** and the texture showed its zero
+  fill. For the 16-byte block formats the same arithmetic gives
+  `ceil(w/4)*16 = 4w`, which passes the guard exactly — so **DXT3/DXT5 uploads
+  went through and their block bytes were then sampled as RGBA8**. One missing
+  decode, two symptoms: empty where BC1 was used, noise where BC2/BC3 was. The
+  device log's thousands of `[bc-remap] ml678 130 -> 70` / `132 -> 70` /
+  `134 -> 70` lines are the population: BC1, BC2 and BC3, no sRGB, all of it.
+  THE FIX IS IN ONE FUNCTION, BECAUSE THERE IS ONLY ONE FUNNEL.
+  `MTLD3D9Device::stageTextureUpload` (`d3d9_device.cpp:1410`) is the single
+  CPU-to-GPU texel path in the D3D9 frontend: `UnlockRect` on a texture level, a
+  cube face or a standalone surface, `AddDirtyRect`'s region push, the MANAGED
+  pre-draw sweep, all six branches of `UpdateTexture`, `UpdateSurface` and
+  `ColorFill`'s block fill all end there. It now carries a decode arm
+  (`d3d9_device.cpp:1438-1520`) modelled on the 3Dc pitch rewrite immediately
+  above it: when the upload is compressed and the adapter cannot sample BC, the
+  LOGICAL format is read off `dst_alloc->pixelFormat()` — `WMTTextureInfo` is
+  built on this side and the remap happens below the unix boundary, which never
+  writes the field back, which is the same property the D3D11 initial-data path
+  already relies on — and the staged bytes are produced by decoding straight
+  into the upload-ring block. `origin` and `size` are texel counts and do not
+  change; only the pitch, the block-row rounding and the contents do. There is
+  no scratch buffer and no per-block allocation: the ring span is sized for the
+  decoded layout and the decoder writes into it in one pass, on the thread that
+  called Unlock. `StretchRect`, `GetRenderTargetData` and AUTOGENMIPMAP need no
+  change at all — once both textures hold decoded texels those are ordinary
+  same-format GPU copies, and `generateMipmaps`, which Metal refuses on a BC
+  texture, now works because the storage is RGBA8.
+  THE SHADOW HAD TO BE PINNED, AND ONE PATH WAS ACTIVELY CORRUPTING. A
+  compressed resource's sysmem mirror is now its SOLE copy of the blocks,
+  because nothing re-encodes the decoded texels. Two consequences.
+  `MTLD3D9Texture::dropMirror` and `MTLD3D9CubeTexture::dropMirror` refuse to
+  evict one (`d3d9_texture.cpp:317-331`, `d3d9_cube_texture.cpp:193-205`), which
+  costs the compressed footprint — an eighth to a quarter of the decoded copy
+  the adapter is already paying for — and buys a Lock that always returns real
+  BC bytes at the correct block pitch. And `readbackSurfaceMirror`
+  (`d3d9_device.cpp:1561`) now returns immediately for these formats: it used to
+  allocate a ring span, encode a texture-to-buffer copy that the SAME pitch
+  guard then refused, and `memcpy` the untouched ring block over the
+  application's pixels. That is a pre-existing corruption of a read-Lock on a
+  DEFAULT DXT surface, independent of the decode, and it is gone.
+  THE DECODER IS NOW SHARED RATHER THAN NEARLY-SHARED. `dxmt_bcn.hpp` already
+  held complete BC1/BC2/BC3/BC4/BC5/BC7 block decoders; what it did not hold was
+  the per-image loop, which lived in `dxmt_resource_initializer.cpp` where only
+  D3D11's creation-time path could reach it, alongside a second, older copy of
+  the BC1 and BC3 block decoders. The loop moves to `dxmt_bcn.hpp:178`
+  (`bcn_decode_image`, now taking an explicit destination pitch), the duplicate
+  block decoders are deleted, and the initializer keeps thin forwarders so every
+  existing D3D11 caller is unchanged. One implementation, three frontends.
+  VERIFIED. A host unit test pins the block layout on the build machine against
+  blocks whose correct output follows from the BC specification by hand —
+  `build/dxmt-tests/bcn-host-test.cpp`, run by
+  `build/dxmt-tests/build-bcn-host-test.sh`: BC1 in both the four-colour and the
+  three-colour punch-through mode (where index 2 is a HALF blend and index 3 is
+  transparent black, the rule cut-out foliage is made of), BC2's
+  replicate-not-shift nibble expansion over a colour block that must not punch
+  through, BC3's eight- and six-interpolant alpha tables, BC4/BC5, odd extents
+  with guard bytes proving partial blocks are clipped rather than written past,
+  and 2x2 / 1x1 levels. 47 checks, 0 failures. On device,
+  `build/x86-tests/d3d9dxt-x86.c` drives the same four cases through a real
+  MANAGED DXT texture, a point sampler and a pass-through blend chain into an
+  offscreen A8R8G8B8 target, reads it back with `GetRenderTargetData` and
+  compares; it also asserts `CheckDeviceFormat` still advertises DXT1..DXT5,
+  since a title that cannot find them does not degrade, it refuses to start. Its
+  render target is four times the texture in each axis and each texel is read
+  from its cell centre, so a half-pixel convention error cannot masquerade as a
+  decode error. Every expectation it hard-codes was cross-checked against the
+  real decoder before shipping. Run it as
+  `C:\windows\syswow64\d3d9dxt-x86.exe`; PASS is `status=57`.
+  MEMORY DOES NOT GROW, WHICH IS THE OPPOSITE OF THE OBVIOUS ANSWER. The RGBA8
+  allocation was ALREADY being made — `remap_unsupported_bc` has been creating
+  these textures uncompressed since the day the device stopped rejecting them,
+  and `mem_census_texel_bytes` already charges BC1 at four bytes per texel, so
+  the `tex-private live=438MB` in the device log is the decoded footprint, not a
+  compressed one. Decoding fills memory that was already reserved and previously
+  held nothing. The only new cost is transient: a staged upload is now 4-8x
+  larger, so the upload ring will carry bigger blocks (it already provisions
+  >16MB blocks on demand). A 16-bit decode target for opaque BC1 was considered
+  and NOT taken: it would save nothing, because the allocation is decided at
+  create time by the unix remap while "are all of this texture's blocks opaque"
+  is only knowable after every future upload has been seen.
+  WHAT TO LOOK FOR IN THE NEXT DEVICE LOG. `d3d9: adapter has no BC texture
+  support` once at device create, then a `[bc-decode] textures=N levels=N
+  MB_in=... MB_out=... ms=... (xN expansion, N MB/s out)` line every ten seconds
+  while streaming, on its own wall clock so it does not wait for the
+  present-counted census summary. `MB_out/ms` is the decode throughput and `ms`
+  per ten seconds is what it costs against the frame budget. A `d3d9: no ring
+  block available` warning would mean a decoded upload outgrew the ring and was
+  dropped.
+  LESSON: a format remap that happens below an interface boundary is invisible
+  to everything above it, including the code that has to feed it. The remap here
+  was correct and necessary — without it the descriptor does not validate — but
+  it silently changed the meaning of every pitch the layer above computes, and
+  the only reason the failure looked like two unrelated bugs is that one block
+  size happens to satisfy the guard that the other trips.
+
+- 2026-09-24 — **Where the CPU actually goes in the 32-bit D3D9 path, measured,
+  and what is left to win.** The goal is 30 fps sustained; `[prof]` puts
+  `d3d9-emulated.dll` at 17.4 % of all CPU in one open-world title and 5.4 % in
+  another, so the frontend is the obvious suspect. The measurement says it is
+  not the whole story, and names what is.
+  THE PER-CALL BUDGET DOES NOT ADD UP, WHICH IS THE FINDING. The census counts
+  7,860 D3D9 calls per frame in the first title against `busy=2.43 cores`;
+  17.4 % of that is 0.42 cores, which at the frame rates in that log is on the
+  order of a microsecond per D3D9 call. The entry points cannot cost that: every
+  hot one already short-circuits on an unchanged value before it touches
+  anything (`SetRenderState` `d3d9_device.cpp:6426`, `SetSamplerState` `:6806`,
+  `SetTexture` `:6683`, `SetVertexShaderConstantF` `:11490` all compare first and
+  return), `SetTexture` identifies its argument by vtable pointer rather than by
+  a call through it, and `DrawPrimitiveUP` already sub-allocates its inline
+  vertex data from a ring instead of creating a buffer per call. The resolution
+  is in the thread table: `tid="dxmt-encode-thr"=13.5%(jit 81%)` — the encode
+  thread's code IS `d3d9-emulated.dll`, so the module's share is mostly per-DRAW
+  resolve and encode work, not per-CALL entry-point work. Micro-optimising state
+  setters therefore cannot reach the goal, and the shape of the remaining win is
+  per-draw, not per-call.
+  WHAT WAS FIXED ANYWAY, BECAUSE IT WAS FREE. The census instrument itself was
+  still paying what ml999 removed from the method counters: `shaderConstF()`,
+  `lockBytes()` and `queryPoll()` did a `fetch_add` on a file-scope atomic, which
+  on i386 under FEX is not an instruction but a TSO read-modify-write lowered to
+  an exclusive-monitor sequence. `shaderConstF` runs on EVERY
+  `Set{Vertex,Pixel}ShaderConstantF` — 2,602 + 2,428 per frame in one measured
+  title, 1,569 + 1,087 in the other — ahead of the device lock and ahead of the
+  short-circuit that makes the rest of the call cheap. All three now count into
+  the existing per-thread block (`d3d9_census.hpp` `ThreadCounters`,
+  `d3d9_census.cpp` `bump()`), which the summary already knew how to sum.
+  Verified by disassembling the shipped object: `shaderConstF` ends in a plain
+  `incl 0x4f4(%eax,%esi,4)` with no `lock` prefix, where it previously ended in a
+  locked add. Honest size: about 150k emulated locked read-modify-writes per
+  second removed, worth a fraction of a percent of a core — real, but not a
+  frame-rate change.
+  WHAT WAS DELIBERATELY NOT DONE, AND WHY. (a) Sub-allocating the small dynamic
+  buffers. The census makes this look urgent — `DynamicBuffer created=9309
+  LIVE=7009`, `buffers <=4K = 7581` — and it is not: those 7,581 buffers hold
+  4 MB of a 212 MB total, and `reuse-hit=15152/15298 = 99 %` says the recycler
+  almost never allocates. It is an object-count and residency question, not a CPU
+  one, and the CPU is what is short. (b) The recursive device lock. `LockDevice`
+  degenerates to a no-op unless the app passed `D3DCREATE_MULTITHREADED`, and no
+  log in hand records that flag, so any work there would be optimising a path
+  that may not execute; logging the behaviour flags at create is the cheap first
+  step. (c) The phase-2 guest-side command ring (section 8.6). It remains the
+  only change with the right shape — it attacks per-draw crossing cost rather
+  than per-call overhead — but it is not a change that can be landed and verified
+  in one pass, and a half-built ring is worse than none.
+  LESSON: a module's share of a profile is not the same as its entry points'
+  share. `d3d9-emulated.dll` contains both the API surface and the encode thread,
+  and reading the 17.4 % as "the vtable is expensive" would have sent three
+  rounds of micro-optimisation at the wrong half of it.
+
+- 2026-09-24 — **fastsync's residual closed and `auto` made the default; the
+  ARM64EC exit stub stopped walking a table it could never match; the
+  default-on diagnostics moved behind one knob** (`build/ntdll-unix/shims/ios_fastsync.h`,
+  `wine/dlls/ntdll/unix/sync.c`, `wine/server/event.c`,
+  `FEX/Source/Windows/ARM64EC/{Module.S,IosJitAlias.cpp,Module.cpp}`,
+  `FEX/FEXCore/Source/Interface/Core/Core.cpp`,
+  `build/ntdll-unix/{signal_arm64_ios.c,virtual_ios.c,server_ios.c,winegstreamer_unixlib_ios.c}`,
+  new `build/host-tests/fastsync-cellrace.c`).
+
+  **1. THE FASTSYNC RESIDUAL IS GONE, AND IT WAS REAL.** ml982 documented it
+  and declined to default the wake path on because of it: `madeira_cell_alive()`
+  and the state CAS were two operations, so a cell freed and re-allocated
+  between them let a client CAS consume a token out of a stranger's event —
+  a lost wakeup on an object the thread never waited for. ml990 removes the
+  gap rather than narrowing it. `{gen:63..32, state:31..0}` now live in one
+  64-bit word (`cell->sg`), so **the CAS that takes a token is also the
+  generation check**. There is no interleaving in which it can succeed against
+  a cell that changed hands, because a change of hands IS a change of the word
+  the CAS compares. Every access on both sides is a 64-bit atomic; the server
+  rebuilds the whole word from the generation it read in the same load, which
+  is exactly as unconditional as the plain `state = RESET` store it replaces.
+  The futex still waits on the LOW half (`madeira_cell_futex()`), so a pure
+  generation bump cannot wake a parked waiter spuriously, and every recycle
+  changes the low half too (a free stores DISABLED and the bump in one store,
+  where ml982 needed two).
+  **MEASURED, not argued.** `build/host-tests/fastsync-cellrace.c` compiles
+  BOTH shapes from the real shipping header and runs six clients against a
+  thread that destroys and recreates the event behind a cell continuously. Each
+  token the server mints is stamped with the epoch that minted it, so a theft
+  is detected exactly rather than inferred. With one `sched_yield()` modelling
+  the preemption both shapes genuinely allow between their two steps:
+  **ml982 stole 695051–903249 tokens of ~5.1 M consumed across three runs;
+  ml990 stole 0 of ~5.2 M with the same delay in the same place**, and 0 again
+  with no delay at all. That is the residual reproduced, then eliminated.
+  Residual (b) — a thread killed while parked leaks its `waiters` increment —
+  is unchanged and remains cost-only (one spurious `os_sync_wake` per set on
+  that cell).
+
+  **2. `MADEIRA_FASTSYNC` NOW DEFAULTS TO `auto`.** ml982 gave two reasons not
+  to, and both are answered: the lost-wakeup vector is the item above, and
+  "nothing in ml972 or ml982 has ever executed on a device" is no longer true.
+  Log y104 ran the whole mechanism with `MADEIRA_FASTSYNC=auto` through a
+  32-bit job-system title, armed it (`[fastsync] AUTO-ENABLED after 181468
+  event/select ops in 10000ms`) and reported **`desync=0`, `stale_gen=0`,
+  `relearn=0` in every window**, while total server traffic fell from
+  **15296/s in the pre-arm window to ~5200/s** in the steady windows after it —
+  `event_op` 72982 → ~7700 per 10 s, `select` 62419 → ~25700. For contrast,
+  x102 (ml972, fastsync fully off) sat at **33814–46537 req/s with 0.73–1.06
+  core of server in-call time alone**. The arm stays conditional on the task's
+  own request rate, so a launcher or installer never exercises the wake
+  semantics at all — which keeps the class of program that died on the ml952
+  snapshot on the path it survives. `MADEIRA_FASTSYNC=0` still forces
+  everything off including the cells, and a new `MADEIRA_FASTSYNC=cells`
+  reaches the old default.
+  **TRAP FOUND AND FIXED WHILE DOING IT.** The "auto" rule lived inside
+  `ios_srv_stats_report()` — which item 4 below puts behind `MADEIRA_DIAG`.
+  Left there, the new default would have been `auto` in name only: the wake
+  path would never have armed in a shipping build. It now runs from the
+  compact `[perf]` line, which is the thing that still executes every 10 s when
+  the reporters are quiet. The two callers are mutually exclusive by
+  construction. Verified in the built archive by relocation:
+  `_ios_perf_line` carries an `ARM64_RELOC_BRANCH26` to
+  `_madeira_fastsync_auto_arm`.
+
+  **3. `ExitFunctionEC` WAS WALKING A TABLE THAT COULD NOT CONTAIN THE ANSWER.**
+  q1's `fexrt=10.3%` resolved to ONE function: `libarm64ecfex.dll+0x110adc` is
+  `ExitFunctionEC+0xc`, and `+0x110b40`/`+0x110b54` are inside
+  `ios_ec_xlate_loop`. `[ec-call]` said `faulted` was climbing by **14 M per
+  10 s** while the unix side's real exec-fault redirects moved by **~2100 in
+  the same window** — four orders of magnitude apart, so those were never
+  faults. They are the RETURN half of the transition: on a call, x9 is a PE
+  virtual address that must be translated to its pool copy; on a return, x9 is
+  the instruction after a `blr x16` in an exit thunk that is ALREADY EXECUTING,
+  so it is already a pool address. The alias table maps PeBase to JitBase, so a
+  return address matched nothing — after walking every live entry (~50 x 6
+  instructions), bumping a counter labelled "faulted", and falling through with
+  x9 unchanged. **Unchanged was the correct answer all along.**
+  The fix is five instructions in front of the scan: `IosAliasJitSpan` is
+  `{lo, hi-lo}` over every registered `JitBase..+Size`, and `(x9 - lo) < span`
+  answers it. Behaviour is identical by construction — both paths leave x9
+  alone — and the one case in which it would NOT be, a live PE range
+  intersecting the Jit span, is **checked rather than asserted**:
+  `MaintainJitSpan()` publishes a zero span the moment that becomes true, and a
+  zero span makes the compare always fail, which is the pre-ml990 path
+  instruction for instruction. `MADEIRA_EC_POOL_FASTOUT=0` installs the same
+  zero, so the knob and the safety net share one mechanism and one tested code
+  path. The counter is split: `[ec-call] translated=N faulted=M inpool=P`,
+  where M is finally the "the alias table is missing an image" signal it was
+  written to be. **EXPECTED GAIN: most of `fexrt=10.3%`** on a 64-bit title,
+  of which `ExitFunctionEC+0xc` alone was 4.5–7.2 % of ALL CPU across fifteen
+  gameplay windows. Verified in the shipped `xtajit64.dll` disassembly:
+  `ldp x17, x4, [x16]` / `sub` / `cmp` / `b.lo <ios_ec_xlate_inpool>` at
+  `0x180110afc`, ahead of the last-hit cache.
+
+  **4. ONE KNOB FOR THE DIAGNOSTICS: `MADEIRA_DIAG`.** ml649 built
+  `madeira_set_diag_enabled` and then gated two rate-limited trace lines with
+  it, while everything that actually costs something stayed unconditionally on.
+  `madeira_diag_on()` is now the single answer — the OR of `MADEIRA_DIAG=1` in
+  `Documents/madeira-env.txt` and the live app switch — and the default is
+  quiet. Gated: the 200 Hz `[prof]` sampler (~8–9 k Mach traps/s across ~40
+  threads, plus a 27-line report every 10 s); the 20 s all-thread stack walk
+  (`ios_dump_all_thread_stacks`, **1726 lines in x101, the loudest tag in the
+  log** — gated at the walk, not at the timer, because the expense is the
+  `thread_get_state`+`thread_info`+frame walk+`dladdr` per thread); the 10 s
+  `ios_pump_sample()` bundle (`[waiters]`/`[hot-lock]`/`[alert-ring]`/
+  `[lock-census]`, a few hundred traps per call); the `[srv-stats]` ten-line
+  report **and with it the two `mach_absolute_time()` calls and the caller-PC
+  frame hop on every server request**; the `[footprint]` six-field line; and
+  FEX's `[CB_SUMMARY]` Boyer-Moore hot-RIP estimator, which did **two
+  bus-locked RMWs on process-wide words on every C++ CompileBlock dispatch —
+  42–65 k/s by its own `[fex-stats]` line** — to maintain a hint whose own
+  comment says `[prof]` is what decides anything.
+  Kept unconditional: every crash and boot diagnostic (SEGV/BUS handlers, Mach
+  exception backtraces, `MADEIRA-EXIT` and its forced final `[srv-stats]`, the
+  DEP and dispatcher banners, `[build-id]`), the `task_info()` that says how
+  close the run got to the jetsam ceiling, and **one compact `[perf]` line
+  every 10 s** carrying footprint, `srv=N/s` and the fastsync counters. Nothing
+  in that line is measured for it: every number was already being counted for
+  another reason. fps is deliberately absent — the app knows it.
+  Two things are *reduced* rather than gated because they are crash
+  diagnostics: `malloc_zone_check()` (which walks every block of a
+  multi-gigabyte heap) drops from every 10 s to every 60 s, widening its
+  corruption bracket from ~10 s to ~60 s of log for a 6x cost cut; and the
+  `[wma]` per-packet lines — **~8 write(2) calls per audio packet on the audio
+  thread, 1610 lines in x101** — gain a hard cap of 200, which keeps the start
+  of a stream (where every interesting WMA failure is) and stops a failing
+  stream turning a decode problem into a logging problem.
+  A per-subsystem knob that is explicitly SET still wins, so `MADEIRA_PROF=5`
+  arms the profiler in an otherwise quiet build and `MADEIRA_SRV_STATS=1`
+  restores the full report.
+
+  **5. THE L1 LOOKUP-CACHE QUESTION NOW HAS NUMBERS.** `DisableL2Cache=1`
+  means every inline-L1 miss is a full C++ round trip under a shared read lock,
+  and nothing reported how often that happened or what it cost. `[fex-stats]`
+  gains `l1_miss_l3hit=+N (N/s, P% of dispatches)` — dispatches that did NOT
+  end in a real compile, i.e. blocks the process had already compiled that only
+  the locked L3 map could find. **That is precisely the traffic a bounded L2
+  would absorb, and therefore the upper bound on what restoring one could
+  recover**, in units that can be acted on. It also gains `l1_entries=N
+  ways=W`, derived from the reporting thread's own `State.L1Mask`, which
+  answers "what does `DynamicL1Cache` actually grow to?" — a question that had
+  no data behind it because `CurrentL1Entries` was private and never printed.
+  Both inputs were already being counted, so the line costs nothing new, and
+  `g_cb_total` is now batched per thread (one un-contended thread-local
+  increment per dispatch, one global add per 512) so the counter is no longer a
+  contention artefact in the measurement it feeds.
+
+  **INVESTIGATED AND REJECTED.**
+  (a) **The 32-bit title's `unresolved=25.6%` of all CPU is a PROFILER
+  ATTRIBUTION HOLE, not hidden dispatcher cost. Do not chase it.** Three
+  things settle it. `jitdisp` — the bucket for PCs inside the published
+  dispatcher extent `[0x139374000,0x13937645c)` — is **0.0–0.2 % in every
+  window**, so the dispatcher is not where the time is. The unresolved PCs are
+  at `0x138b1d8f8/0x138b1d944/0x138b1dd00`, ~8 MB BELOW the dispatcher, i.e.
+  in the block pool. And the same host PCs **flip between resolved and
+  unresolved from window to window** (x101: resolved at lines 3457, 4393,
+  5040, 6441, 6606, 6932, 8339, 8790, 8956; unresolved at 3008, 3733, 4859,
+  5411, 5589, 5902, 6117, 7109, 7461, 7654, 7979, 8792, 9317) while naming the
+  same guest RIP (`rip=0x79e39207`) whenever they do resolve. A real
+  dispatcher PC cannot be a guest block in alternate windows. The hole is in
+  `ios_profmap`'s ring join, not in the emulator, and the emission counters
+  confirm the ring is not wrapping (13509 blocks of a 65536 cap, +6 per window
+  in steady state). **There is no quarter of the CPU to reclaim here** — the
+  real distribution is the resolved one: main exe ~16 %, `d3d9-emulated.dll`
+  ~15 %, `ucrtbase.dll` ~9 %.
+  (b) **A bounded L2 was NOT built this round.** The measurement that decides
+  its size and shape — `l1_miss_l3hit/s` — did not exist until item 5, and
+  upstream's L2 reserves ~512 MB of VA per thread against a band that ml387
+  already shrank the per-thread lookup allocation for twice. Building it blind
+  would have repeated ml363/ml387. Read the number first.
+  (c) **A semaphore analogue of fastsync was NOT built.** q1's gameplay
+  regime is a rigid `select` / `release_semaphore` duopoly at ~96 % of all
+  requests and a near-exact 1:1 pairing (47845/45774, 46570/44600,
+  41493/39681, …), with `select` ~95 % `w1 inf` — so the shape is right and
+  the win would be large. But a semaphore carries a COUNT, not a token, and
+  `ReleaseSemaphore` has a previous-count return value and an overflow status
+  that a client-side CAS would have to reproduce exactly; that is a different
+  proof obligation from the event cell, not the same one with a different
+  field. Doing it on the same evidence standard as ml990 needs its own round
+  and its own host model. Flagged, not attempted.
+  (d) **IOKit is not ours to fix from here.** q1's `mach_msg2_trap<-IOKit 4.5%`
+  and `iokit_user_client_trap ~2.4%` (together **~5–10 % of all CPU**) are
+  Metal, not input: the backtraces are IOKit's `IOConnectCallMethod` into
+  IOGPU on the guest main thread, and `IOGPUCommandQueueSubmitCommandBuffers`
+  on Metal's libdispatch threads. No repo source calls IOKit. The per-frame
+  `nextDrawable`/commit lives in the prebuilt DXMT archive, which this round
+  must not touch.
+  (e) **`[d3d9-census]`'s per-call instrument is the largest remaining
+  default-on diagnostic and belongs to another owner.** It is documented at
+  **2602 + 2428 API calls per frame** and `readEnabled()` defaults it ON.
+  `research/dxmt/**` was out of scope this round; it should get the same
+  `MADEIRA_DIAG` treatment.
+
+  **BUILD TRAP WORTH KNOWING.** A previous round left copies of
+  `ios_fastsync.h` (and `ios_srv_stats.h`) next to the sources in the xtool
+  workspace — `wine/server/`, `wine/dlls/ntdll/unix/`, `build/ntdll-unix/` —
+  in addition to the canonical `build/ntdll-unix/shims/` one. A quoted
+  `#include` searches the including file's own directory FIRST, so those stale
+  copies silently win over `-I.../shims` and the first build of this round
+  compiled the OLD struct against the NEW code. It failed loudly (17 errors)
+  only because the struct member was renamed; a change that merely altered a
+  VALUE would have built clean and shipped the wrong one. All four copies must
+  be refreshed together.
+
+  **VERIFIED BY BUILDING AND READING THE ARTIFACTS.** `ntdll-unix` 32/32,
+  `wineserver` all 18 files, both FEX modules link clean. `libntdll_unix.a`
+  1888760 B and `libwineserver.a` 1248328 B, `xtajit.dll` 4706304 B,
+  `xtajit64.dll` 5255168 B. Content, not just timestamps:
+  the `rev=ml990 … gen-packed` banner is present and the `rev=ml982 mode=`
+  one is gone; `event.o` carries seven 64-bit `ldaxr x*`/`stlxr` pairs for the
+  cell RMWs and two 32-bit ones for the `waiters` counters; `xtajit64.dll`
+  disassembles to the new `b.lo <ios_ec_xlate_inpool>`; `[perf] rev=ml990`,
+  `[ec-call] … inpool=%llu`, `l1_miss_l3hit` and the `[wma]` cap string are all
+  in the archives; and `_ios_perf_line` relocates to
+  `_madeira_fastsync_auto_arm`. Host models: `fastsync-cellrace` exit 0 (the
+  contrast above), `sync-x86.c` all ten tests against the POSIX model exit 46
+  with 488332 jobs each consumed exactly once. **VERIFIED BY REASONING ONLY:**
+  the server-side 64-bit rebuild being equivalent to the 32-bit store it
+  replaces, the in-pool fast-out's disjointness guard, and every claim about
+  what the quiet default still prints.
+
+  **WHAT TO READ IN THE NEXT DEVICE LOG — AND WHY IT TAKES TWO RUNS.**
+  `[ec-call]` is printed from inside the `[prof]` reporter's window, and
+  `[prof]` is now off by default, so **the mechanism run and the measurement
+  run are different runs**, which is the right methodology anyway: one with
+  `MADEIRA_DIAG=1` to confirm every mechanism did what it claims, and one
+  without it to measure the fps the quiet default actually delivers. Comparing
+  fps between the two also prices the diagnostics themselves, which nobody has
+  ever measured directly.
+  In BOTH runs: `[fastsync] rev=ml990 mode=auto`
+  at boot, then `[fastsync] AUTO-ENABLED` within the first busy window, then
+  `[perf]` every 10 s with `srv=` an order of magnitude below x102's
+  33814–46537/s and `desync=0` — a non-zero `desync` is the one alarming
+  number and demotes only the one object it names. `[fex-stats]` is not gated
+  and prints in both.
+  In the `MADEIRA_DIAG=1` run, `[ec-call]` should now show
+  `faulted` nearly FLAT (it should track `exec-fault redirects`, ~200/s, not
+  ~1.4 M/s) with `inpool` carrying what `faulted` used to; if `faulted` is
+  still in the millions the in-pool test is not firing and `IosAliasJitSpan`
+  is zero — check the `[build-id]` line for `EC in-pool fast-out ENABLED`.
+  `[fex-stats]` gives `l1_miss_l3hit/s` and `l1_entries`: if `l1_entries` has
+  settled at the 128 K ceiling and `l1_miss_l3hit/s` is still tens of
+  thousands, the L1 is capacity-bound and the bounded L2 is worth building; if
+  `l1_entries` is small, the growth heuristic is the thing to fix first. The
+  log should otherwise be quiet — no `[prof]`, `[thread-stacks]`,
+  `[srv-stats]` detail, `[hot-lock]` or `[footprint]` lines — and
+  `MADEIRA_DIAG=1` should bring all of them back.

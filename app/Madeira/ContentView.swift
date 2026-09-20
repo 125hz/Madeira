@@ -2954,23 +2954,32 @@ extension View {
     }
 }
 
+/// ml — UNIFORM SQUARE FOOTPRINT for every control in the scrollable key/
+/// tool row (ContentView.controlRow's non-pointer-panel branch): the tap
+/// keys, the modifiers, the keyboard toggle, the joystick, and the icon
+/// buttons (pointer/display/fullscreen/diag[/lock]) all share this exact
+/// size and corner radius, so nothing in the row reads as bigger or more
+/// important than its neighbour. Device feedback: Ctrl/Shift were visibly
+/// wider AND taller than Esc/⏎/␣ and the keyboard button before this.
+let keyRowButtonSize: CGFloat = 44
+let keyRowCornerRadius: CGFloat = 8
+
 /// Visual-only key for the portrait row. Draws, publishes its frame, and
 /// nothing else — ControlOverlayView presses it.
 struct ControlKeyView: View {
     let id: String
     let label: String
     let kind: ControlRegionKind
-    var fontSize: CGFloat = 14
-    var width: CGFloat = 34
-    var height: CGFloat = 30
+    var fontSize: CGFloat = 15
+    var size: CGFloat = keyRowButtonSize
     /// The ⌨ button was styled off `Color.secondary`; the key caps off white.
     var secondaryTint = false
     @ObservedObject private var face: ControlFaceState
 
-    init(id: String, label: String, kind: ControlRegionKind, fontSize: CGFloat = 14,
-         width: CGFloat = 34, height: CGFloat = 30, secondaryTint: Bool = false) {
+    init(id: String, label: String, kind: ControlRegionKind, fontSize: CGFloat = 15,
+         size: CGFloat = keyRowButtonSize, secondaryTint: Bool = false) {
         self.id = id; self.label = label; self.kind = kind
-        self.fontSize = fontSize; self.width = width; self.height = height
+        self.fontSize = fontSize; self.size = size
         self.secondaryTint = secondaryTint
         _face = ObservedObject(wrappedValue: ControlFaces.state(id))
     }
@@ -2979,11 +2988,17 @@ struct ControlKeyView: View {
         Text(label)
             .font(.system(size: fontSize, weight: .semibold, design: .monospaced))
             .foregroundColor(.white)
-            .frame(minWidth: width, minHeight: height)
+            // ml — EXACT, not minWidth/minHeight: a minimum lets a longer
+            // label ("Ctrl", "Shift") grow the button past its neighbours,
+            // which is exactly the "every button the same size" bug. The
+            // label instead shrinks to fit the fixed square.
+            .lineLimit(1)
+            .minimumScaleFactor(0.5)
+            .frame(width: size, height: size)
             .background(secondaryTint
                         ? Color.secondary.opacity(face.down ? 0.45 : 0.25)
                         : Color.white.opacity(face.down ? 0.35 : 0.15))
-            .cornerRadius(6)
+            .cornerRadius(keyRowCornerRadius)
             .controlRegion(id, label, kind)
     }
 }
@@ -3008,6 +3023,11 @@ struct JoystickKeyView: View {
 
     @State private var hosted = false       // overlay window up: it draws the face
     @ObservedObject private var face = ControlFaces.state(JoystickKeyView.rid)
+    /// ml — observed here too (not just held by JoystickPadHost's own
+    /// overlay) so THIS view can tell "the window-level face has a real,
+    /// freshly-registered centre" from "it doesn't yet, or it's a stale
+    /// leftover" — see the `.overlay` and `.onDisappear` below.
+    @ObservedObject private var pad = JoystickPadState.shared
 
     private let deadzone: CGFloat = 14      // pt of travel before a direction registers
 
@@ -3015,15 +3035,35 @@ struct JoystickKeyView: View {
     private let vkDown: Int32 = 0x28, vkLeft: Int32 = 0x25
 
     var body: some View {
-        // The idle ring lives in the row (inset inside the 34x30 button so it
-        // has breathing room). The EXPANDED pad is drawn by the window-level
+        // The idle ring lives in the row (inset inside the button so it has
+        // breathing room). The EXPANDED pad is drawn by the window-level
         // host at this same centre — see JoystickPadState — so it springs out
         // of the button in place and is never clipped by the game surface.
         Color.clear
-            .frame(width: 34, height: 30)
+            .frame(width: keyRowButtonSize, height: keyRowButtonSize)
             .background(Color.white.opacity(face.down ? 0.30 : 0.15))
-            .cornerRadius(6)
-            .overlay { if !hosted { JoystickFace(held: false, dir: -1) } }
+            .cornerRadius(keyRowCornerRadius)
+            // ml — THE STALE-CENTRE FIX (device feedback: "portrait is fine
+            // until you've visited landscape once, then the glyph is outside
+            // its button and unusable, even back in portrait").
+            //
+            // ROOT CAUSE: `pad` (JoystickPadState.shared) is a process-lifetime
+            // SINGLETON, but THIS view is not — portraitBody and wideNormalBody
+            // are different SwiftUI identities (see the comment on ContentView.
+            // body's if/else), so switching between them destroys one
+            // JoystickKeyView and creates another. The window-level face reads
+            // `pad.center`, which used to be left holding whatever the OUTGOING
+            // instance last registered — the other layout's screen position —
+            // until the incoming instance's own registration overwrote it. In
+            // the gap between "old instance gone" and "new instance's
+            // GeometryReader has actually measured its own frame", the window
+            // overlay drew the ring at that stale point, which is why it could
+            // land on the launch row or off in space. Local-fallback until we
+            // KNOW the centre is fresh (below) plus zeroing it on teardown
+            // (see `.onDisappear`) closes that gap from both ends: nothing
+            // stale is ever drawn, from either the instance that's gone or the
+            // one that hasn't registered yet.
+            .overlay { if !hosted || pad.center == .zero { JoystickFace(held: false, dir: -1) } }
             .background(
                 GeometryReader { _ in
                     Color.clear.onAppear {
@@ -3045,6 +3085,21 @@ struct JoystickKeyView: View {
                            .dirStick(quad: [vkUp, vkRight, vkDown, vkLeft],
                                      deadzone: deadzone),
                            pad: JoystickPadState.shared)
+            // See the ROOT CAUSE note above: whenever THIS instance goes away
+            // (rotation swapping portraitBody/wideNormalBody, the pointer
+            // panel replacing the row, fullscreen), zero the shared pad state
+            // outright rather than leaving it for the next instance to
+            // overwrite eventually. `.controlRegion`'s own onDisappear already
+            // unregisters the region (releasing any held touch/keys) — this
+            // additionally guarantees nothing can be drawn at the OLD position
+            // in the meantime.
+            .onDisappear {
+                pad.hidden = true
+                pad.center = .zero
+                pad.dir = -1
+                pad.vec = nil
+                hosted = false
+            }
     }
 }
 
@@ -3597,26 +3652,35 @@ struct ContentView: View {
                 .frame(width: leftWidth, height: geo.size.height)
                 .clipped()
                 Divider()
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 0) {
-                        controlRow
-                        if pointerPanel && hw.mouseConnected {
-                            mouseGainRow
-                        }
-                        Divider()
-                        actionButtons
-                        Divider()
-                        // Fixed floor, not a flex-fill: List has no natural
-                        // intrinsic height inside a ScrollView (nothing above it
-                        // is height-constrained either), so without one it would
-                        // try to claim effectively unbounded height. Below that
-                        // floor the List scrolls its own rows exactly as it does
-                        // in portraitBody's un-scrolled VStack; above it, this
-                        // outer ScrollView takes over so the column overflowing
-                        // a short landscape screen never clips the launch row.
-                        logConsole
-                            .frame(minHeight: 280)
+                // ml — WAS an outer `ScrollView` around this whole VStack,
+                // with `logConsole.frame(minHeight: 280)` — a List has no
+                // natural intrinsic height inside an unconstrained
+                // ScrollView, so a hardcoded floor stood in for one. That is
+                // exactly the reported "the log stops about half-way down an
+                // iPad column" bug: the VStack sized itself to CONTENT height
+                // (header + buttons + 280pt), and the surrounding ScrollView
+                // left the rest of a tall column simply blank rather than
+                // stretching anything into it.
+                //
+                // Fixed instead: no outer scroll container at all. controlRow
+                // and actionButtons keep their OWN horizontal ScrollViews for
+                // overflow, so they only ever need their natural height here,
+                // and logConsole (a List, which already scrolls its own rows)
+                // gets `maxHeight: .infinity` to claim everything left in the
+                // column — on an iPad's tall column that reaches the bottom;
+                // on a short landscape phone it shrinks gracefully to
+                // whatever is left rather than being clipped by a floor
+                // taller than the space actually available.
+                VStack(alignment: .leading, spacing: 0) {
+                    controlRow
+                    if pointerPanel && hw.mouseConnected {
+                        mouseGainRow
                     }
+                    Divider()
+                    actionButtons
+                    Divider()
+                    logConsole
+                        .frame(maxHeight: .infinity)
                 }
                 .frame(width: rightWidth, height: geo.size.height)
                 // Opaque, not just clipped: MetalHostView draws ABOVE this
@@ -3667,51 +3731,70 @@ struct ContentView: View {
                 // ⏎/␣/Esc/⌨ used to be) needs its tap recogniser to win
                 // arbitration against everything else on screen, and that is
                 // precisely the fight a second finger made it lose.
-                //
-                // ml: horizontally scrollable, same idiom as actionButtons
-                // below — this row grew to fit ⏎/␣/Esc/Ctrl/Shift/⌨/the
-                // joystick/pointer/display/fullscreen/diag[/pointer-lock],
-                // which does not fit a narrow wideNormalBody right column or
-                // a short landscape phone screen without either scrolling or
-                // wrapping (wrapping would fight the row's fixed height).
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        Group {
-                            ControlKeyView(id: "portrait.enter", label: "⏎", kind: .tapKey(0x0D))
-                            ControlKeyView(id: "portrait.space", label: "␣", kind: .tapKey(0x20))
-                            ControlKeyView(id: "portrait.esc",   label: "Esc", kind: .tapKey(0x1B))
-                            // ml: modifiers, not taps — held for exactly as long as
-                            // the finger is down (.keys, the same region kind
-                            // HoldKeyView uses for the arrow keys), so they combine
-                            // with any other on-screen key AND with the software
-                            // keyboard: both post through the same winios_post_key
-                            // ring / driver-side held-key state (InputGuard unions
-                            // every region's contribution; insertText's synthesized
-                            // presses land on top of whatever is already held).
-                            // Sized 44x40 — the ≥40pt tap-target floor — rather than
-                            // the 34x30 the tap keys use, since a modifier that is
-                            // easy to miss is a modifier that silently never holds.
-                            ControlKeyView(id: "portrait.ctrl",  label: "Ctrl", kind: .keys([0x11]),
-                                           width: 44, height: 40)
-                            ControlKeyView(id: "portrait.shift", label: "Shift", kind: .keys([0x10]),
-                                           width: 48, height: 40)
-                            ControlKeyView(id: "portrait.kbd",   label: "⌨", kind: .keyboardToggle,
-                                           fontSize: 26, width: 40, height: 32, secondaryTint: true)
-                            JoystickKeyView()
+                HStack(spacing: 6) {
+                    // ml — MOVED to the far left, outside the scrolling
+                    // content (device feedback): fullscreen should always be
+                    // reachable without first scrolling the row, and a fixed
+                    // leading anchor keeps the row's start put regardless of
+                    // what's scrolled into view.
+                    fullscreenToggle
+                    // ml — THE JOYSTICK'S OWN FIXED SLOT, deliberately
+                    // OUTSIDE the ScrollView below.
+                    //
+                    // A control that owns a ControlOverlayView region is
+                    // SUPPOSED to have absolute priority over any SwiftUI
+                    // gesture underneath it — touch-down included, see
+                    // ControlsWindow.hitTest — but the reported bug ("can't
+                    // drag it, the row scrolls instead") showed the
+                    // horizontal ScrollView's own pan recognizer winning that
+                    // race whenever this control's registered region frame
+                    // was even briefly stale (see JoystickKeyView's
+                    // onDisappear/onAppear for that root cause). Taking the
+                    // control out of the scrolling content entirely removes
+                    // the competing gesture altogether — the most robust fix,
+                    // not just a priority hack layered on top of a shared
+                    // touch surface.
+                    JoystickKeyView()
+                    Divider().frame(height: keyRowButtonSize - 10)
+                    // ml: horizontally scrollable, same idiom as actionButtons
+                    // below — this row grew to fit ⏎/␣/Esc/Ctrl/Shift/⌨/
+                    // pointer/display/diag[/pointer-lock], which does not fit
+                    // a narrow wideNormalBody right column or a short
+                    // landscape phone screen without either scrolling or
+                    // wrapping (wrapping would fight the row's fixed height).
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            Group {
+                                ControlKeyView(id: "portrait.enter", label: "⏎", kind: .tapKey(0x0D))
+                                ControlKeyView(id: "portrait.space", label: "␣", kind: .tapKey(0x20))
+                                ControlKeyView(id: "portrait.esc",   label: "Esc", kind: .tapKey(0x1B))
+                                // ml: modifiers, not taps — held for exactly as long as
+                                // the finger is down (.keys, the same region kind
+                                // HoldKeyView uses for the arrow keys), so they combine
+                                // with any other on-screen key AND with the software
+                                // keyboard: both post through the same winios_post_key
+                                // ring / driver-side held-key state (InputGuard unions
+                                // every region's contribution; insertText's synthesized
+                                // presses land on top of whatever is already held).
+                                ControlKeyView(id: "portrait.ctrl",  label: "Ctrl", kind: .keys([0x11]))
+                                ControlKeyView(id: "portrait.shift", label: "Shift", kind: .keys([0x10]))
+                                ControlKeyView(id: "portrait.kbd",   label: "⌨", kind: .keyboardToggle,
+                                               fontSize: 24, secondaryTint: true)
+                            }
+                            .transition(.opacity)
+                            pointerToggleButton
+                            displayModeToggle
+                            diagToggleButton
+                            // ml665: no lock button where lock cannot happen (iPhone).
+                            if hw.mouseConnected && HardwareInput.pointerLockAvailable {
+                                pointerLockButton
+                            }
                         }
-                        .transition(.opacity)
-                        pointerToggleButton
-                        displayModeToggle
-                        fullscreenToggle
-                        diagToggleButton
-                        // ml665: no lock button where lock cannot happen (iPhone).
-                        if hw.mouseConnected && HardwareInput.pointerLockAvailable {
-                            pointerLockButton
-                        }
+                        .padding(.vertical, 4)
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
                 }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
             }
         }
         // The expanded pad overflows this row; without a raised zIndex the
@@ -3822,10 +3905,10 @@ struct ContentView: View {
             // ml666: the aim stick is gone; only the directional pad fades.
         } label: {
             Image(systemName: pointerPanel ? "xmark" : "cursorarrow")
-                .font(.system(size: 17, weight: .medium))
-                .frame(minWidth: 40, minHeight: 32)
+                .font(.system(size: 18, weight: .medium))
+                .frame(width: keyRowButtonSize, height: keyRowButtonSize)
                 .background(Color.secondary.opacity(0.25))
-                .cornerRadius(6)
+                .cornerRadius(keyRowCornerRadius)
         }
         .matchedGeometryEffect(id: "pointerBtn", in: pointerNS)
     }
@@ -3838,11 +3921,11 @@ struct ContentView: View {
             input.diagnostics.toggle()
         } label: {
             Image(systemName: "ladybug")
-                .font(.system(size: 17, weight: .regular))
+                .font(.system(size: 18, weight: .regular))
                 .foregroundStyle(.white.opacity(input.diagnostics ? 1.0 : 0.35))
-                .frame(minWidth: 40, minHeight: 32)
+                .frame(width: keyRowButtonSize, height: keyRowButtonSize)
                 .background(Color.secondary.opacity(0.25))
-                .cornerRadius(6)
+                .cornerRadius(keyRowCornerRadius)
         }
         .buttonStyle(.plain)
     }
@@ -3865,17 +3948,24 @@ struct ContentView: View {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             HardwareInput.shared.togglePointerLock()
         } label: {
-            HStack(spacing: 3) {
+            // ml — vertical, not horizontal: the icon+"HID"/"UI" tag used to
+            // sit side by side in a wide (minWidth 52) rectangle, which is
+            // exactly the non-square shape the rest of the row no longer
+            // has. Stacked, both lines fit the same 44x44 square as every
+            // other control here.
+            VStack(spacing: 1) {
                 Image(systemName: hw.pointerLocked ? "cursorarrow.slash" : "cursorarrow.motionlines")
-                    .font(.system(size: 17, weight: .regular))
+                    .font(.system(size: 16, weight: .regular))
                 Text(hw.mousePath == .gcmouse ? "HID"
                      : hw.mousePath == .uikit ? "UI" : "—")
-                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
             }
             .foregroundStyle(.white.opacity(hw.pointerLocked ? 1.0 : 0.35))
-            .frame(minWidth: 52, minHeight: 32)
+            .frame(width: keyRowButtonSize, height: keyRowButtonSize)
             .background(Color.secondary.opacity(0.25))
-            .cornerRadius(6)
+            .cornerRadius(keyRowCornerRadius)
         }
         .buttonStyle(.plain)
     }
@@ -3895,10 +3985,10 @@ struct ContentView: View {
             fputs("[hud] tap display-mode -> \(input.displayMode.label)\n", stderr)
         } label: {
             Image(systemName: input.displayMode.symbol)
-                .font(.system(size: 17, weight: .medium))
-                .frame(minWidth: 40, minHeight: 32)
+                .font(.system(size: 18, weight: .medium))
+                .frame(width: keyRowButtonSize, height: keyRowButtonSize)
                 .background(Color.secondary.opacity(0.25))
-                .cornerRadius(6)
+                .cornerRadius(keyRowCornerRadius)
         }
         .buttonStyle(.plain)
         .accessibilityLabel(input.displayMode.label)
@@ -3917,10 +4007,10 @@ struct ContentView: View {
             fullscreenState.active = true
         } label: {
             Image(systemName: "arrow.up.left.and.arrow.down.right")
-                .font(.system(size: 17, weight: .medium))
-                .frame(minWidth: 40, minHeight: 32)
+                .font(.system(size: 18, weight: .medium))
+                .frame(width: keyRowButtonSize, height: keyRowButtonSize)
                 .background(Color.secondary.opacity(0.25))
-                .cornerRadius(6)
+                .cornerRadius(keyRowCornerRadius)
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Enter fullscreen")
@@ -6244,7 +6334,7 @@ struct TouchControlsOverlay: View {
 
     /// ml670 — THE LAYOUT-WIDE SIZE SLIDER.
     ///
-    /// Rides just under the HUD cluster, so it follows the cluster wherever the
+    /// Rides next to the HUD cluster, so it follows the cluster wherever the
     /// user has dragged it and never has to be hunted for. It is safe to put a
     /// SwiftUI gesture here and nowhere else: while `editing` is set,
     /// `ControlsWindow.hitTest` hands the whole screen to the hosting view and
@@ -6253,9 +6343,44 @@ struct TouchControlsOverlay: View {
     ///
     /// It multiplies rather than replaces each control's own pinch scale — see
     /// `TouchControlsModel.sizeScale`.
+    ///
+    /// ml — WAS a fixed "+48pt below the cluster's UN-dragged base, clamped to
+    /// the screen's bottom edge". That clamp is exactly the reported "slider
+    /// drawn on top of the cluster" bug: drag the cluster down near the
+    /// bottom edge (device feedback did — see the fullscreen edit-mode
+    /// screenshot) and there is no longer 48pt of room below it, so the
+    /// clamp pulled the bar back UP onto the buttons instead of trying the
+    /// other side. Fixed by reading `m.hudClusterRect` — the cluster's own
+    /// LIVE measured rect, published by topBar's GeometryReader in the same
+    /// window coordinate space this view's `.position()` already uses —
+    /// instead of re-deriving an approximate position independently (which
+    /// also could not know the cluster's actual height: the pointer-lock and
+    /// + buttons are conditional, so the cluster is not always the same
+    /// size). Below when there is room, above otherwise — holds for a
+    /// cluster dragged to any edge, and for portrait fullscreen, since
+    /// nothing here assumes a landscape shape any more.
     private func sizeBar(in geo: GeometryProxy) -> some View {
-        let base = hudBaseCenter(in: geo)
         let w: CGFloat = min(300, geo.size.width - 40)
+        let barHeight: CGFloat = 46
+        let gap: CGFloat = 10
+        let cluster = m.hudClusterRect
+        let hasCluster = cluster != .zero
+        let spaceBelow = hasCluster
+            ? geo.size.height - geo.safeAreaInsets.bottom - cluster.maxY : 0
+        let placeBelow = !hasCluster || spaceBelow >= barHeight + gap
+        let targetX = hasCluster ? cluster.midX : geo.size.width / 2
+        let targetY: CGFloat
+        if hasCluster {
+            targetY = placeBelow ? cluster.maxY + gap + barHeight / 2
+                                  : cluster.minY - gap - barHeight / 2
+        } else {
+            // Cold-start fallback: hudClusterRect's first publish is
+            // dispatched async from topBar, so a sizeBar that somehow
+            // renders before that lands (editing flips true on the very
+            // first frame) has nothing measured to key off yet. Matches the
+            // old fixed offset from the cluster's un-dragged top-center spot.
+            targetY = hudBaseCenter(in: geo).y + 48
+        }
         return HStack(spacing: 10) {
             Image(systemName: "arrow.up.left.and.arrow.down.right")
                 .font(.system(size: 13))
@@ -6271,10 +6396,9 @@ struct TouchControlsOverlay: View {
         .padding(.vertical, 8)
         .frame(width: w)
         .background(GlassShape())
-        .position(x: min(max(base.x + hudDragState.width, w / 2 + 8),
-                         geo.size.width - w / 2 - 8),
-                  y: min(base.y + hudDragState.height + 48,
-                         geo.size.height - 30))
+        .position(x: min(max(targetX, w / 2 + 8), geo.size.width - w / 2 - 8),
+                  y: min(max(targetY, barHeight / 2 + 8),
+                         geo.size.height - barHeight / 2 - 8))
     }
 
     /// Small drag handle, leading edge of the cluster. A LongPressGesture
