@@ -478,7 +478,14 @@ static void winios_drv_set_cursor( HWND hwnd, HCURSOR cursor )
     char bmibuf[sizeof(BITMAPINFOHEADER) + 256 * sizeof(RGBQUAD)];
     BITMAPINFO *bmi = (BITMAPINFO *)bmibuf;
 
-    if (!winios_desktop_mode() || !winios_cursor_set) return;
+    /* ml — WAS gated to desktop mode only ("iOS has no mouse cursor" — see
+     * winios_pSetCursor's own comment in Winios.m). Direct-launch titles
+     * that rely on the SYSTEM cursor (no self-drawn pointer, common in
+     * older DirectInput/GDI-menu games) need this hook too now that the app
+     * side can host the drawn cursor on the game's own presented layer
+     * instead of the desktop compositor — see winios_set_game_layer in
+     * Winios.m. `last_cursor` caching below still applies in both modes. */
+    if (!winios_cursor_set) return;
     if (!cursor)
     {
         if (winios_cursor_show) winios_cursor_show( 0 );
@@ -1891,8 +1898,10 @@ static void load_display_driver(void)
         if (winios_pCreateWindow)        winios_user_driver.pCreateWindow        = winios_pCreateWindow;
         if (winios_pDestroyWindow)       winios_user_driver.pDestroyWindow       = winios_pDestroyWindow;
         if (winios_pProcessEvents)       winios_user_driver.pProcessEvents       = winios_pProcessEvents;
-        if (winios_desktop_mode())       winios_user_driver.pSetCursor           = winios_drv_set_cursor;
-        else if (winios_pSetCursor)      winios_user_driver.pSetCursor           = winios_pSetCursor;
+        /* ml — installed unconditionally now (was desktop-mode only): see
+         * winios_drv_set_cursor's own comment above. winios_pSetCursor
+         * (Winios.m's old empty stub) is no longer wired to anything. */
+        winios_user_driver.pSetCursor            = winios_drv_set_cursor;
         if (winios_pDestroyCursorIcon)   winios_user_driver.pDestroyCursorIcon   = winios_pDestroyCursorIcon;
         if (winios_pShowWindow)          winios_user_driver.pShowWindow          = winios_pShowWindow;
         /* window-pos wrapper dereferences window_rects on this side and

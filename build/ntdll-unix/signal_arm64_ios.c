@@ -351,6 +351,153 @@ volatile unsigned long long ios_store_fault_dropped = 0;   /* ml685 */
  * which case it buys a core but may not move FPS at all)? */
 volatile unsigned int ios_cur_fault_port = 0;
 
+/**********************************************************************
+ *		ios_decode_exclusive_alias        (2026-09-23)
+ *
+ * LL/SC ON A PAGE WE MAP EXECUTE-ONLY: WHY THE STORE IS REPORTED AS FAILED
+ * RATHER THAN EMULATED.
+ *
+ * FEX takes a spin lock that lives INSIDE its JIT code buffer (the
+ * JITCodeTail the block emitter appends after every block), so the pair
+ *     ldaxr w9, [x24]
+ *     stlxr w9, w8, [x24]
+ * runs against the pool's RX view. The load succeeds -- RX is readable -- and
+ * the store takes a permission fault. A device log caught it inside FEX's own
+ * unaligned-access handler, i.e. while it was already servicing an exception:
+ * the second fault was fatal.
+ *
+ * The obvious repair, "do the store through the RW alias and report success",
+ * is WRONG. The value the matching load observed is unknown here (that load
+ * never faulted, so this handler never saw it), and the hardware monitor is
+ * gone the moment the exception is taken, so a store now cannot be proved
+ * atomic against the load then. Reporting success would silently turn a
+ * compare-and-swap into a blind write -- two owners of one lock.
+ *
+ * What is both correct and sufficient: STXR IS ARCHITECTURALLY ALLOWED TO FAIL
+ * SPURIOUSLY. So the store is not performed, the status register is set to 1,
+ * and -- the part that makes the loop converge -- the BASE REGISTER is moved to
+ * the writable alias of the same physical memory. Every well-formed LL/SC loop
+ * branches back to its load on failure and re-reads the base register, so the
+ * retry runs entirely on the RW view: real LDAXR, real STLXR, real monitor,
+ * full atomicity, and no further faults for that loop. The substitution is
+ * value-for-value because an exclusive access has NO offset operand -- Rn holds
+ * exactly the faulting effective address.
+ *
+ * Loads are handled the same way (base moved to the alias, value delivered from
+ * it) rather than left to fault twice; the monitor they would have set is not
+ * reproduced, so the STXR that follows fails once more and the loop simply
+ * turns one extra time. Forward progress is guaranteed: each fault moves a base
+ * register from the RX view to the RW view and the RW view never faults.
+ *
+ * Refused, deliberately: Rn == 31 (SP is never an exclusive base in generated
+ * code, and rewriting it is unrecoverable) and a store whose status register is
+ * WZR (the caller discards the result, so a fabricated failure would be
+ * invisible and the loop would believe it had the lock).
+ *
+ * Callers must apply `base_reg = base_val`, optionally `status_reg = 1` /
+ * `data_reg(s) = loaded`, and advance the PC by 4.
+ */
+struct ios_excl_fix
+{
+    int      base_reg;      /* Rn — always rewritten to the RW alias */
+    uint64_t base_val;
+    int      status_reg;    /* Rs for stores, -1 for loads */
+    int      data_reg;      /* Rt for loads, -1 for stores */
+    int      data2_reg;     /* Rt2 for LDXP/LDAXP, else -1 */
+    uint64_t data_val;
+    uint64_t data2_val;
+    int      is_pair;
+    int      is_load;
+};
+
+static int ios_decode_exclusive_alias( uint32_t insn, uintptr_t fault_addr,
+                                       uintptr_t rw_addr, struct ios_excl_fix *out )
+{
+    unsigned size_lg2, rn, rt, rt2, rs;
+    int is_load, is_pair;
+
+    /* size(2) 001000 o2 L o1 Rs(5) o0 Rt2(5) Rn(5) Rt(5), with o2 (bit 23) == 0.
+     * o2 == 1 is the LDAR/STLR/CAS family, which is NOT exclusive and is handled
+     * by the ordinary atomic emulators. */
+    if ((insn & 0x3f800000u) != 0x08000000u) return 0;
+
+    size_lg2 = (insn >> 30) & 3;
+    is_load  = (insn >> 22) & 1;          /* L */
+    is_pair  = (insn >> 21) & 1;          /* o1 */
+    rs       = (insn >> 16) & 0x1f;
+    rt2      = (insn >> 10) & 0x1f;
+    rn       = (insn >> 5)  & 0x1f;
+    rt       = insn & 0x1f;
+
+    if (is_pair)
+    {
+        /* LDXP/LDAXP/STXP/STLXP are 32- or 64-bit only, so bit31 is set. CASP
+         * shares o1 == 1 but has bit31 clear — that is the whole discriminator,
+         * and getting it wrong would treat a CASP's Rs pair as a status word. */
+        if (!(insn & 0x80000000u)) return 0;
+    }
+    else
+    {
+        if (rt2 != 0x1f) return 0;        /* Rt2 is RES1 for the single forms */
+    }
+
+    if (rn == 31) return 0;               /* SP base: refuse (see header) */
+    if (!is_load && rs == 31) return 0;   /* status discarded: refuse */
+
+    /* An exclusive access has no offset operand, so Rn holds exactly the faulting
+     * effective address. The CALLER must confirm that against its register file
+     * before applying the fix — it is the one invariant the rewrite rests on, and
+     * this decoder cannot read registers. `base_reg` is published for that check. */
+    (void)fault_addr;
+
+    memset( out, 0, sizeof(*out) );
+    out->base_reg   = (int)rn;
+    out->base_val   = (uint64_t)rw_addr;
+    out->status_reg = -1;
+    out->data_reg   = -1;
+    out->data2_reg  = -1;
+    out->is_pair    = is_pair;
+    out->is_load    = is_load;
+
+    if (is_load)
+    {
+        /* Deliver the value from the writable alias — the same physical bytes the
+         * RX view maps. Plain loads: the exclusivity the caller asked for is not
+         * reproduced, and does not need to be (see header). */
+        if (is_pair)
+        {
+            if (size_lg2 == 3)
+            {
+                out->data_val  = *(volatile uint64_t *)rw_addr;
+                out->data2_val = *(volatile uint64_t *)(rw_addr + 8);
+            }
+            else
+            {
+                out->data_val  = *(volatile uint32_t *)rw_addr;
+                out->data2_val = *(volatile uint32_t *)(rw_addr + 4);
+            }
+            if (rt  != 31) out->data_reg  = (int)rt;
+            if (rt2 != 31) out->data2_reg = (int)rt2;
+        }
+        else
+        {
+            switch (size_lg2)
+            {
+            case 0:  out->data_val = *(volatile uint8_t  *)rw_addr; break;
+            case 1:  out->data_val = *(volatile uint16_t *)rw_addr; break;
+            case 2:  out->data_val = *(volatile uint32_t *)rw_addr; break;
+            default: out->data_val = *(volatile uint64_t *)rw_addr; break;
+            }
+            if (rt != 31) out->data_reg = (int)rt;
+        }
+    }
+    else
+    {
+        out->status_reg = (int)rs;        /* = 1: "failed", nothing stored */
+    }
+    return 1;
+}
+
 /* ml691: pages demoted to RW by the W^X path, so an execute fault on one can be
  * recovered. Kept OUTSIDE the store handler's static so the exec path can reach
  * it. Restoring RX is synchronous -- the faulting thread does not resume until
@@ -3507,6 +3654,59 @@ static void *ios_mach_exception_thread( void *arg )
                                         ++swp_n, insn, 1 << size_lg2, rs, rt,
                                         (unsigned long long)fault_addr, (unsigned long long)rw_addr,
                                         (unsigned long long)in, (unsigned long long)old);
+                            }
+                        }
+                    }
+                    /* 2026-09-23 STLR/STLRB/STLRH/STLR-64 — STORE-RELEASE, not
+                     * exclusive. FEX lowers an x86 TSO store to STLR, and a guest
+                     * writing into a page we map RX (its own code buffer, or a
+                     * module copy's data) lands one here. The RW alias is the same
+                     * physical memory, so a release store through it is exactly the
+                     * requested operation; __ATOMIC_RELEASE matches the encoding
+                     * rather than over-ordering it.
+                     * Encoding: size 001000 o2=1 L=0 o1=0 Rs=11111 o0=1 Rt2=11111 Rn Rt. */
+                    else if ((insn & 0x3ffffc00u) == 0x089ffc00u)
+                    {
+                        int rt = insn & 0x1f;
+                        int size_lg2 = (insn >> 30) & 3;
+                        uint64_t v = IOS_STORE_SRC(rt);
+                        switch (size_lg2)
+                        {
+                        case 0:  __atomic_store_n((uint8_t  *)rw_addr, (uint8_t )v, __ATOMIC_RELEASE); break;
+                        case 1:  __atomic_store_n((uint16_t *)rw_addr, (uint16_t)v, __ATOMIC_RELEASE); break;
+                        case 2:  __atomic_store_n((uint32_t *)rw_addr, (uint32_t)v, __ATOMIC_RELEASE); break;
+                        default: __atomic_store_n((uint64_t *)rw_addr,           v, __ATOMIC_RELEASE); break;
+                        }
+                        emulated = 1;
+                    }
+                    /* 2026-09-23 LDXR/LDAXR/STXR/STLXR (+ the XP pair forms).
+                     * See ios_decode_exclusive_alias for why the store is reported
+                     * as a (legal) spurious failure and the BASE REGISTER is moved
+                     * to the writable alias instead of the store being faked. */
+                    else
+                    {
+                        struct ios_excl_fix fix;
+                        if (ios_decode_exclusive_alias( insn, fault_addr, rw_addr, &fix ) &&
+                            state.__x[fix.base_reg] == (uint64_t)fault_addr)
+                        {
+                            state.__x[fix.base_reg] = fix.base_val;
+                            if (fix.status_reg >= 0 && fix.status_reg != 31)
+                                state.__x[fix.status_reg] = 1;
+                            if (fix.data_reg  >= 0) state.__x[fix.data_reg]  = fix.data_val;
+                            if (fix.data2_reg >= 0) state.__x[fix.data2_reg] = fix.data2_val;
+                            emulated = 1;
+                            {
+                                static int excl_n;
+                                if (excl_n < 12)
+                                    dprintf(STDERR_FILENO,
+                                        "[excl-alias] #%d insn=0x%08x %s%s pc=0x%llx addr=0x%llx "
+                                        "-> base x%d retargeted to RW 0x%llx%s\n",
+                                        ++excl_n, insn, fix.is_load ? "load" : "store",
+                                        fix.is_pair ? "-pair" : "",
+                                        (unsigned long long)fault_pc,
+                                        (unsigned long long)fault_addr,
+                                        fix.base_reg, (unsigned long long)fix.base_val,
+                                        fix.is_load ? "" : " (status=1, nothing stored)");
                             }
                         }
                     }
@@ -10163,7 +10363,8 @@ static inline uint64_t ios_get_reg(ucontext_t *ctx, int r)
     return REGn_sig(r, ctx);
 }
 
-static int ios_emulate_store(ucontext_t *ctx, uint32_t insn, uintptr_t rw_addr)
+static int ios_emulate_store(ucontext_t *ctx, uint32_t insn, uintptr_t rw_addr,
+                             uintptr_t fault_addr)
 {
     int rt = insn & 0x1F;
     uint64_t rt_val = ios_get_reg(ctx, rt);
@@ -10294,6 +10495,49 @@ static int ios_emulate_store(ucontext_t *ctx, uint32_t insn, uintptr_t rw_addr)
             ERR("[cas-emu] CASP%s insn=0x%08x rw=%p rs=%d rt=%d -> emulated on RW alias\n",
                 sz64 ? "64" : "32", insn, (void *)rw_addr, rs, rt);
         return 1;
+    }
+
+    /* 2026-09-23 STLR/STLRB/STLRH — store-release. FEX lowers an x86 TSO store
+     * to this, and the byte form in particular reaches here whenever a guest
+     * writes into a page we map RX. Release ordering through the RW alias is
+     * exactly the requested operation on exactly the same physical bytes.
+     * Encoding: size 001000 1 0 0 11111 1 11111 Rn Rt. */
+    if ((insn & 0x3FFFFC00u) == 0x089FFC00u)
+    {
+        int size_lg2 = (insn >> 30) & 3;
+        switch (size_lg2)
+        {
+        case 0:  __atomic_store_n((uint8_t  *)rw_addr, (uint8_t )rt_val, __ATOMIC_RELEASE); break;
+        case 1:  __atomic_store_n((uint16_t *)rw_addr, (uint16_t)rt_val, __ATOMIC_RELEASE); break;
+        case 2:  __atomic_store_n((uint32_t *)rw_addr, (uint32_t)rt_val, __ATOMIC_RELEASE); break;
+        default: __atomic_store_n((uint64_t *)rw_addr,           rt_val, __ATOMIC_RELEASE); break;
+        }
+        return 1;
+    }
+
+    /* 2026-09-23 LDXR/LDAXR/STXR/STLXR and the LDXP/STXP pair forms. The store
+     * is NOT performed: it is reported as a spurious failure (architecturally
+     * legal) and the base register is moved to the writable alias so the loop's
+     * retry runs natively on a view that can accept the store. Full reasoning at
+     * ios_decode_exclusive_alias. */
+    {
+        struct ios_excl_fix fix;
+        if (ios_decode_exclusive_alias( insn, fault_addr, rw_addr, &fix ) &&
+            ios_get_reg( ctx, fix.base_reg ) == (uint64_t)fault_addr)
+        {
+            static int excl_log;
+            REGn_sig(fix.base_reg, ctx) = fix.base_val;
+            if (fix.status_reg >= 0 && fix.status_reg != 31)
+                REGn_sig(fix.status_reg, ctx) = 1;
+            if (fix.data_reg  >= 0) REGn_sig(fix.data_reg,  ctx) = fix.data_val;
+            if (fix.data2_reg >= 0) REGn_sig(fix.data2_reg, ctx) = fix.data2_val;
+            if (excl_log++ < 12)
+                ERR("[excl-alias] insn=0x%08x %s%s addr=%p -> base x%d retargeted to RW %p%s\n",
+                    insn, fix.is_load ? "load" : "store", fix.is_pair ? "-pair" : "",
+                    (void *)fault_addr, fix.base_reg, (void *)(uintptr_t)fix.base_val,
+                    fix.is_load ? "" : " (status=1, nothing stored)");
+            return 1;
+        }
     }
 
     return 0;  /* unhandled instruction */
@@ -10614,7 +10858,7 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             uintptr_t rw_addr = fault - rx + rw;
             uint32_t insn = *(uint32_t *)(uintptr_t)PC_sig(bus_ctx);
 
-            if (ios_emulate_store(bus_ctx, insn, rw_addr))
+            if (ios_emulate_store(bus_ctx, insn, rw_addr, fault))
             {
                 PC_sig(bus_ctx) += 4;
                 ios_fixup_x18_for_return( bus_ctx );
@@ -11084,6 +11328,58 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                     siginfo->si_addr, pc, (int)vrec.ExceptionInformation[0]);
                 goto bus_fatal;
             }
+            /* ============================================== 2026-09-23
+             * si_code IS NOT EVIDENCE OF MISALIGNMENT. THE ESR IS.
+             *
+             * Darwin reports every arm64 SIGBUS with si_code == BUS_ADRALN,
+             * including protection faults (KERN_PROTECTION_FAILURE), so the
+             * `si_code == BUS_ADRALN` gate below is true for faults that have
+             * nothing to do with alignment. Everything it does not emulate then
+             * fell out of the bottom of this block and kept
+             * STATUS_DATATYPE_MISALIGNMENT.
+             *
+             * A 32-bit title died exactly there: a store-release BYTE
+             * (`stlrb w20,[x24]`, insn 0x089fff14) to a read-execute page of a
+             * builtin image, ESR 0x9200004f — DFSC 0b001111, a level-3
+             * PERMISSION fault, WnR=1. A byte access cannot be misaligned and
+             * the hardware never said it was. The bogus 0x80000002 sent FEX into
+             * HandleUnalignedAccess, which faulted again on its own spin lock
+             * (see ios_decode_exclusive_alias) and killed the process — an
+             * ordinary, survivable access violation turned into a fatal one by
+             * mislabelling.
+             *
+             * DFSC (ESR.ISS[5:0]) says which it is, for EVERY encoding, decoded
+             * or not: 0b100001 is the alignment fault; 0b0001xx/0b0010xx/0b0011xx
+             * are translation / access-flag / permission faults. Only the first
+             * may keep 0x80000002. Everything else is the access violation that
+             * `vrec` was already built for, with the right direction and address
+             * — and FEX's ResetToConsistentState reconstructs the true guest RIP
+             * for a c0000005, which it cannot do for a misalignment.
+             *
+             * If the ESR is unavailable (0) or the class is not a data abort,
+             * nothing changes: the old behaviour is kept rather than guessed at. */
+            {
+                DWORD64 a_esr = get_fault_esr( bus_ctx );
+                DWORD64 a_ec  = a_esr >> 26;
+                unsigned a_dfsc = (unsigned)(a_esr & 0x3f);
+
+                if (a_esr && (a_ec == 0x24 || a_ec == 0x25) && a_dfsc != 0x21)
+                {
+                    static unsigned long mis_n;
+                    if (++mis_n <= 16 || (mis_n % 4096) == 0)
+                        ERR("[esr-class] NOT an alignment fault: esr=0x%llx ec=0x%llx dfsc=0x%02x "
+                            "(%s) insn=0x%08x addr=%p pc=%p — delivering c0000005 instead of "
+                            "80000002 (n=%lu)\n",
+                            (unsigned long long)a_esr, (unsigned long long)a_ec, a_dfsc,
+                            (a_dfsc & 0x3c) == 0x0c ? "permission" :
+                            (a_dfsc & 0x3c) == 0x04 ? "translation" :
+                            (a_dfsc & 0x3c) == 0x08 ? "access-flag" : "other",
+                            *(uint32_t *)(uintptr_t)PC_sig(bus_ctx), siginfo->si_addr, pc, mis_n);
+                    rec = vrec;
+                    goto bus_fatal;
+                }
+            }
+
             /* iOS-Madeira ml479 (#83): readable target + BUS_ADRALN — emulate
              * PLAIN loads/stores in place before concluding "alignment fault →
              * 80000002". The 80000002 path only helps ATOMICS (FEX's unaligned
@@ -14100,6 +14396,74 @@ static void *ios_prof_thread( void *arg )
                     samples ? (double)run_obs / (double)samples : 0.0,
                     obs ? (100.0 * wait_obs / obs) : 0.0, dead, cost, period_ms,
                     psz >> 20, phead, ptail);
+
+            /* ================================================== 2026-09-23
+             * [ec-call]: IS THE x64 -> ARM64EC FAST PATH ACTUALLY TAKEN?
+             *
+             * ExitFunctionEC translates a branch target from its PE VA to the
+             * JIT-pool copy inline and counts both outcomes in FEX's
+             * IosAliasStats. Anything it fails to translate branches to a
+             * non-executable PE VA and costs a full Mach exception round trip,
+             * which is what `[x18-redir2]` counts on this side. Printing the
+             * two next to each other is the only way a device log can prove
+             * the fast path is live: translated climbing with faulted flat is
+             * the fix working; translated FLAT at zero means the asm half of
+             * xtajit64 was built without FEX_IOS_HOST again.
+             *
+             * The export is resolved through the JIT-POOL copy of the emulator
+             * image, not its PE mapping: the pool copy is what executes, so its
+             * adrp-relative writes land in the pool's .bss. ios_prof_find_fex_export
+             * already prefers the pool copy. Resolution is retried until it
+             * succeeds (the emulator maps after the first few windows) and never
+             * latches a failure. Reads go through mach_vm_read_overwrite so a
+             * torn-down image cannot fault the sampler -- the discipline every
+             * other reader on this thread follows. */
+            {
+                extern void *ios_prof_find_fex_export( const char * );
+                static unsigned long long *ec_stats;
+                static int ec_probe_done;
+                if (!ec_stats && !ec_probe_done)
+                {
+                    ec_stats = ios_prof_find_fex_export( "IosAliasStats" );
+                    if (!ec_stats)
+                    {
+                        /* Expected and permanent in a 32-bit process: only the
+                         * ARM64EC emulator has an x64->EC transition to count, so
+                         * libwow64fex.dll does not export this. Say that, rather
+                         * than implying something is wrong, and say it rarely. */
+                        static int ec_quiet;
+                        if ((ec_quiet++ % 60) == 0)
+                            fprintf(stderr, "[ec-call] no IosAliasStats export in view "
+                                            "(normal for a 32-bit process; for a 64-bit one it "
+                                            "means the ARM64EC emulator is not mapped yet, or "
+                                            "libarm64ecfex.def lost the export)\n");
+                    }
+                }
+                if (ec_stats)
+                {
+                    unsigned long long pair[2] = { 0, 0 };
+                    mach_vm_size_t got = 0;
+                    if (mach_vm_read_overwrite( mach_task_self(),
+                                                (mach_vm_address_t)(uintptr_t)ec_stats,
+                                                sizeof(pair),
+                                                (mach_vm_address_t)(uintptr_t)pair,
+                                                &got ) == KERN_SUCCESS && got == sizeof(pair))
+                    {
+                        static unsigned long long prev_x, prev_m;
+                        static long long prev_redir;
+                        long long redir = ios_exc_x18_fixes;
+                        fprintf(stderr,
+                                "[ec-call] translated=%llu faulted=%llu "
+                                "(+%llu/+%llu this window; exec-fault redirects +%lld)\n",
+                                pair[0], pair[1],
+                                pair[0] - prev_x, pair[1] - prev_m, redir - prev_redir);
+                        prev_x = pair[0];
+                        prev_m = pair[1];
+                        prev_redir = redir;
+                    }
+                    else ec_probe_done = 0;  /* image moved: re-resolve next window */
+                }
+            }
 
             if (!cpu_obs)
                 fprintf(stderr, "[prof]   no running samples in this window\n");

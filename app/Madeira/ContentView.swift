@@ -404,6 +404,26 @@ final class MetalBackedView: UIView {
                 let ok = v.becomeFirstResponder()
                 fputs("[keyboard] show target=\(id) isFirstResponder=\(v.isFirstResponder) " +
                       "window=\(String(describing: v.window)) became=\(ok)\n", stderr)
+                // ml: THE "tap the button, then tap the live view" BUG.
+                //
+                // A `becomeFirstResponder()` that returns false is not a
+                // permanent refusal — it is UIKit saying "not right now",
+                // typically because this view is not yet actually attached to
+                // a window (the layoutIfNeeded above raced a rotation/re-attach
+                // still in flight) or another responder was mid-resign. The old
+                // code took `false` as final, so the keyboard silently stayed
+                // down until a SECOND, unrelated tap on the live view happened
+                // to retry it via touchesBegan. Retry once more on the next
+                // runloop tick — by then the attach/resign this turn started
+                // has had a chance to finish — before giving up for real.
+                if !ok {
+                    DispatchQueue.main.async {
+                        guard !v.isFirstResponder else { return }
+                        let retried = v.becomeFirstResponder()
+                        fputs("[keyboard] show-retry target=\(id) " +
+                              "isFirstResponder=\(v.isFirstResponder) became=\(retried)\n", stderr)
+                    }
+                }
             }
         }
     }
@@ -711,6 +731,12 @@ final class MetalBackedView: UIView {
         let rawDrawable = MetalHostView.shared.metalLayer.drawableSize
         let r = gameRect()
         MetalHostView.shared.frame = convert(r, to: w)
+        // The direct-launch cursor is a sublayer of MetalHostView.shared's own
+        // layer, positioned from that layer's LOCAL bounds (see Winios.m's
+        // winios_set_game_layer doc comment) — which just changed size/shape
+        // above. Re-place it now so it tracks every DisplayMode change and
+        // rotation, not only the next touch/pointer event.
+        winios_cursor_relayout()
         let modeLabel = mode == effective ? mode.label : "\(effective.label)(req:\(mode.label))"
         fputs(String(format: "[display] apply reason=%@ mode=%@ guest=%.0fx%.0f drawable=%.0fx%.0f "
                     + "bounds=(%.0f,%.0f %.0fx%.0f) -> rect=(%.0f,%.0f %.0fx%.0f)\n",
@@ -771,6 +797,10 @@ final class MetalBackedView: UIView {
         if !Self.layerRegistered {
             Self.layerRegistered = true
             madeira_display_set_layer(host.metalLayer)
+            // Direct-launch cursor host (Winios.m) — see winios_set_game_layer's
+            // doc comment there. Registered once, same lifetime reasoning as the
+            // DXMT registration right above: one host, one layer, forever.
+            winios_set_game_layer(Unmanaged.passUnretained(host.metalLayer).toOpaque())
             Self.drawableObservation = host.metalLayer.observe(\.drawableSize, options: [.new]) { _, _ in
                 // drawableSize is written off the render thread (DXMT's
                 // setProps); KVO delivers on whatever thread the write
@@ -3243,6 +3273,12 @@ struct ContentView: View {
     /// as JSON under `customLaunchButtonsKey` and loaded once at view init.
     @State private var customLaunchButtons: [CustomLaunchButton] =
         ContentView.loadCustomLaunchButtons()
+    /// Long-press ▸ Rename on a user-added button (below): which button is
+    /// being renamed (by path — `CustomLaunchButton` has no stable id of its
+    /// own) and the alert's own text field state.
+    @State private var showRenameLaunchAlert = false
+    @State private var renameLaunchButtonPath: String?
+    @State private var renameLaunchButtonText: String = ""
     /// Fixed tint cycle for `customLaunchButtons` so neighbouring
     /// user-added buttons are visually distinct; wraps by index.
     private static let customButtonTints: [Color] = [
@@ -3271,6 +3307,63 @@ struct ContentView: View {
     /// boot-failure timeout, or a pool-allocation failure) — see the three
     /// `isLaunching = false` sites inside that function.
     @State private var isLaunching = false
+
+    /// ml — THE LOADING SPINNER.
+    ///
+    /// Shown centred over the live view from the moment a GAME launch button
+    /// is tapped (a launchTargets entry, a user custom button, or the
+    /// Custom… alert's own Launch — see beginLaunchSpinner's call sites)
+    /// until the guest's first frame presents, the session ends, or 90s pass
+    /// — whichever comes first. Deliberately NOT shown for "Wine Virtual
+    /// Desktop" or "Enable JIT": neither call site calls beginLaunchSpinner.
+    @State private var showLaunchSpinner = false
+    /// `madeira_get_present_count()` at the moment the spinner started — the
+    /// present counter is monotonic and process-lifetime, so "a frame has
+    /// presented since launch" is `count > this`, never `count > 0` (a
+    /// second launch in the same run starts well above zero already).
+    @State private var launchSpinnerBaseline: UInt64 = 0
+    @State private var launchSpinnerDeadline = Date.distantPast
+
+    private func beginLaunchSpinner() {
+        launchSpinnerBaseline = madeira_get_present_count()
+        launchSpinnerDeadline = Date().addingTimeInterval(90)
+        withAnimation(.easeInOut(duration: 0.2)) { showLaunchSpinner = true }
+    }
+
+    /// Polled every 0.2s (see `launchSpinnerOverlay` below) rather than
+    /// event-driven: the three exits (first present, process exit, timeout)
+    /// have no common notification to hang a callback off, and a present
+    /// counter/isLaunching flag are cheap enough to sample on a timer.
+    private func tickLaunchSpinner() {
+        guard showLaunchSpinner else { return }
+        let presented = madeira_get_present_count() > launchSpinnerBaseline
+        let ended = !isLaunching
+        let timedOut = Date() >= launchSpinnerDeadline
+        if presented || ended || timedOut {
+            withAnimation(.easeInOut(duration: 0.2)) { showLaunchSpinner = false }
+        }
+    }
+
+    /// Centred over the live view, hit-testing disabled so it can never
+    /// intercept a touch meant for the game underneath (or, at this size,
+    /// for the sibling chrome around it in wideNormalBody).
+    @ViewBuilder private var launchSpinnerOverlay: some View {
+        if showLaunchSpinner {
+            VStack(spacing: 10) {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .tint(.white)
+                    .scaleEffect(1.3)
+                Text("Starting…")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(.white)
+            }
+            .padding(20)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+            .transition(.opacity)
+            .allowsHitTesting(false)
+        }
+    }
 
     /// Shipped launch targets, EITHER BITNESS. Was `thirtyTwoBitTests` /
     /// "32-bit test programs" (WOW64_DESIGN.md stage E), but the table never
@@ -3402,6 +3495,10 @@ struct ContentView: View {
                 // it (respecting whatever the pointer-panel toggle already
                 // wants) right here.
                 .onAppear { JoystickPadState.shared.hidden = pointerPanel }
+                .overlay { launchSpinnerOverlay }
+                .onReceive(Timer.publish(every: 0.2, on: .main, in: .common).autoconnect()) { _ in
+                    tickLaunchSpinner()
+                }
             controlRow
             // ml663: the hardware mouse's own gain. Its own row rather than a
             // fourth control squeezed into controlRow, and only while a mouse
@@ -3422,54 +3519,115 @@ struct ContentView: View {
     /// for the width: live view on the left, the rest in a scrollable column
     /// on the right, so nothing runs off the bottom of a short landscape
     /// screen (iPhone landscape, a narrow iPad split).
+    ///
+    /// ml — THE TWO-COLUMN REBUILD.
+    ///
+    /// This used to size the left column with `.frame(maxWidth: .infinity,
+    /// maxHeight: .infinity)` and trust HStack to give it "whatever the fixed
+    /// 360pt right column left over." That is ordinary, normally-reliable
+    /// SwiftUI sizing — and it is NOT what the raw live-view surface keys
+    /// off. MetalHostView is added directly to the UIWindow, ON TOP of the
+    /// entire SwiftUI tree (see the file-top comment), and it is sized from
+    /// THIS placeholder's own UIKit `bounds` (MetalBackedView.gameRect(),
+    /// applyDisplayModeAndLog) — a value SwiftUI only ever produces from a
+    /// flexible-frame negotiation ONE LAYOUT PASS after the fact, is stale
+    /// mid-rotation (see scheduleSettleReapply's doc comment), and is API
+    /// nothing here can inspect or assert on. Because the presented layer is
+    /// window-level, ANY gap between what SwiftUI intended and what UIKit's
+    /// bounds actually read at apply time draws OVER the launch row and log
+    /// console instead of being clipped by them — exactly the reported "live
+    /// view extends under the column" bug, plus a squeezed column on iPad.
+    ///
+    /// The fix: stop asking HStack to infer the split and hand both columns
+    /// an EXPLICIT size computed once from `geo`, every render. The left
+    /// column's frame is no longer a negotiated remainder; it is a number
+    /// this code owns, so MadeiraMetalView (and therefore MetalBackedView's
+    /// `bounds`, and therefore MetalHostView's frame AND mapTouch's rect —
+    /// display and touch mapping read the identical `bounds`) can never
+    /// exceed it. `.clipped()` on both columns is defense in depth for the
+    /// SwiftUI-hosted content (the log List, buttons); it cannot itself
+    /// constrain the window-level surface, which is why the explicit size is
+    /// the load-bearing part of this fix, not the clip.
     private var wideNormalBody: some View {
-        HStack(spacing: 0) {
-            VStack(spacing: 0) {
-                if let ents = entitlements {
-                    entitlementBadges(ents)
-                }
-                HStack(spacing: 6) {
-                    FPSOverlay()
-                    Spacer()
-                }
-                .padding(.horizontal, 8)
-                .padding(.bottom, 4)
-                MadeiraMetalView()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(Color.black)
-                    .onAppear {
-                        TouchControlsHost.attach()
-                        JoystickPadState.shared.hidden = pointerPanel
+        GeometryReader { geo in
+            // Right column: clamp(360...460) or ~34% of the width, per spec —
+            // wide enough for the log/launch text on an iPad, never so wide
+            // it eats the live view on a narrow iPhone landscape screen.
+            let rightWidth = min(max(geo.size.width * 0.34, 360), 460)
+            let dividerWidth: CGFloat = 1
+            let leftWidth = max(geo.size.width - rightWidth - dividerWidth, 0)
+
+            HStack(spacing: 0) {
+                VStack(spacing: 0) {
+                    if let ents = entitlements {
+                        entitlementBadges(ents)
                     }
-                    .onReceive(NotificationCenter.default.publisher(
-                        for: UIDevice.orientationDidChangeNotification)) { _ in
-                        TouchControlsHost.attach()
+                    HStack(spacing: 6) {
+                        FPSOverlay()
+                        Spacer()
                     }
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 4)
+                    MadeiraMetalView()
+                        // WIDTH explicit — see the type comment above, this
+                        // number is what MetalBackedView.bounds' width becomes,
+                        // and the cross-column HStack negotiation is exactly
+                        // the axis that went wrong. HEIGHT stays flexible
+                        // (`maxHeight: .infinity`): that negotiation is
+                        // entirely WITHIN this one VStack, against the header/
+                        // FPS row's own intrinsic height, which was never the
+                        // suspect axis and needs no hardcoded guess.
+                        .frame(width: leftWidth)
+                        .frame(maxHeight: .infinity)
+                        .background(Color.black)
+                        .clipped()
+                        .onAppear {
+                            TouchControlsHost.attach()
+                            JoystickPadState.shared.hidden = pointerPanel
+                        }
+                        .onReceive(NotificationCenter.default.publisher(
+                            for: UIDevice.orientationDidChangeNotification)) { _ in
+                            TouchControlsHost.attach()
+                        }
+                        .overlay { launchSpinnerOverlay }
+                        .onReceive(Timer.publish(every: 0.2, on: .main, in: .common).autoconnect()) { _ in
+                            tickLaunchSpinner()
+                        }
+                }
+                .frame(width: leftWidth, height: geo.size.height)
+                .clipped()
+                Divider()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        controlRow
+                        if pointerPanel && hw.mouseConnected {
+                            mouseGainRow
+                        }
+                        Divider()
+                        actionButtons
+                        Divider()
+                        // Fixed floor, not a flex-fill: List has no natural
+                        // intrinsic height inside a ScrollView (nothing above it
+                        // is height-constrained either), so without one it would
+                        // try to claim effectively unbounded height. Below that
+                        // floor the List scrolls its own rows exactly as it does
+                        // in portraitBody's un-scrolled VStack; above it, this
+                        // outer ScrollView takes over so the column overflowing
+                        // a short landscape screen never clips the launch row.
+                        logConsole
+                            .frame(minHeight: 280)
+                    }
+                }
+                .frame(width: rightWidth, height: geo.size.height)
+                // Opaque, not just clipped: MetalHostView draws ABOVE this
+                // entire SwiftUI tree (window-level, see the type comment),
+                // so if display-mode math or a mid-rotation stale `bounds`
+                // ever hands it a frame wider than `leftWidth` again, this
+                // column stays legible instead of showing the live view
+                // bleeding through translucent List/Button backgrounds.
+                .background(Color.black)
+                .clipped()
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 0) {
-                    controlRow
-                    if pointerPanel && hw.mouseConnected {
-                        mouseGainRow
-                    }
-                    Divider()
-                    actionButtons
-                    Divider()
-                    // Fixed floor, not a flex-fill: List has no natural
-                    // intrinsic height inside a ScrollView (nothing above it
-                    // is height-constrained either), so without one it would
-                    // try to claim effectively unbounded height. Below that
-                    // floor the List scrolls its own rows exactly as it does
-                    // in portraitBody's un-scrolled VStack; above it, this
-                    // outer ScrollView takes over so the column overflowing
-                    // a short landscape screen never clips the launch row.
-                    logConsole
-                        .frame(minHeight: 280)
-                }
-            }
-            .frame(width: 360)
         }
     }
 
@@ -3479,43 +3637,83 @@ struct ContentView: View {
     /// the game surface; no launch/control affordance goes missing just
     /// because the phone is sideways.
     private var controlRow: some View {
-        HStack(spacing: 6) {
+        Group {
             if pointerPanel {
                 // The cursor button has slid to the leftmost slot and become
                 // the close control; matchedGeometryEffect animates the slide.
-                pointerToggleButton
-                displayModeToggle
-                fullscreenToggle
-                pointerModeToggle
-                pointerSensSlider
+                //
+                // ml: displayModeToggle/fullscreenToggle used to live in THIS
+                // branch too — that is the "display-fit mode control shows up
+                // inside the mouse settings popup" bug. This row IS the mouse
+                // settings popup (absolute/relative + sensitivity, toggled by
+                // pointerToggleButton), and neither button belongs here: both
+                // are general-purpose view controls, not mouse settings, and
+                // the main toolbar (the `else` branch below) is their only
+                // home. Closing the popup (pointerToggleButton, now showing
+                // "xmark") is what gets you back to them. Not wrapped in the
+                // horizontal ScrollView below — pointerSensSlider wants to
+                // FILL the row's width, which a ScrollView would instead
+                // propose as unbounded and collapse to nothing.
+                HStack(spacing: 6) {
+                    pointerToggleButton
+                    pointerModeToggle
+                    pointerSensSlider
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
             } else {
                 // ml662: every one of these is now a REGION owned by
                 // ControlOverlayView, not a SwiftUI gesture. A Button (which
                 // ⏎/␣/Esc/⌨ used to be) needs its tap recogniser to win
                 // arbitration against everything else on screen, and that is
                 // precisely the fight a second finger made it lose.
-                Group {
-                    ControlKeyView(id: "portrait.enter", label: "⏎", kind: .tapKey(0x0D))
-                    ControlKeyView(id: "portrait.space", label: "␣", kind: .tapKey(0x20))
-                    ControlKeyView(id: "portrait.esc",   label: "Esc", kind: .tapKey(0x1B))
-                    ControlKeyView(id: "portrait.kbd",   label: "⌨", kind: .keyboardToggle,
-                                   fontSize: 20, width: 40, height: 32, secondaryTint: true)
-                    JoystickKeyView()
+                //
+                // ml: horizontally scrollable, same idiom as actionButtons
+                // below — this row grew to fit ⏎/␣/Esc/Ctrl/Shift/⌨/the
+                // joystick/pointer/display/fullscreen/diag[/pointer-lock],
+                // which does not fit a narrow wideNormalBody right column or
+                // a short landscape phone screen without either scrolling or
+                // wrapping (wrapping would fight the row's fixed height).
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        Group {
+                            ControlKeyView(id: "portrait.enter", label: "⏎", kind: .tapKey(0x0D))
+                            ControlKeyView(id: "portrait.space", label: "␣", kind: .tapKey(0x20))
+                            ControlKeyView(id: "portrait.esc",   label: "Esc", kind: .tapKey(0x1B))
+                            // ml: modifiers, not taps — held for exactly as long as
+                            // the finger is down (.keys, the same region kind
+                            // HoldKeyView uses for the arrow keys), so they combine
+                            // with any other on-screen key AND with the software
+                            // keyboard: both post through the same winios_post_key
+                            // ring / driver-side held-key state (InputGuard unions
+                            // every region's contribution; insertText's synthesized
+                            // presses land on top of whatever is already held).
+                            // Sized 44x40 — the ≥40pt tap-target floor — rather than
+                            // the 34x30 the tap keys use, since a modifier that is
+                            // easy to miss is a modifier that silently never holds.
+                            ControlKeyView(id: "portrait.ctrl",  label: "Ctrl", kind: .keys([0x11]),
+                                           width: 44, height: 40)
+                            ControlKeyView(id: "portrait.shift", label: "Shift", kind: .keys([0x10]),
+                                           width: 48, height: 40)
+                            ControlKeyView(id: "portrait.kbd",   label: "⌨", kind: .keyboardToggle,
+                                           fontSize: 26, width: 40, height: 32, secondaryTint: true)
+                            JoystickKeyView()
+                        }
+                        .transition(.opacity)
+                        pointerToggleButton
+                        displayModeToggle
+                        fullscreenToggle
+                        diagToggleButton
+                        // ml665: no lock button where lock cannot happen (iPhone).
+                        if hw.mouseConnected && HardwareInput.pointerLockAvailable {
+                            pointerLockButton
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
                 }
-                .transition(.opacity)
-                pointerToggleButton
-                displayModeToggle
-                fullscreenToggle
-                diagToggleButton
-                // ml665: no lock button where lock cannot happen (iPhone).
-                if hw.mouseConnected && HardwareInput.pointerLockAvailable {
-                    pointerLockButton
-                }
-                Spacer()
             }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
         // The expanded pad overflows this row; without a raised zIndex the
         // later siblings (action buttons, log) would draw over it.
         .zIndex(10)
@@ -3863,6 +4061,11 @@ struct ContentView: View {
                 // table — see `launchTargets`.
                 ForEach(launchTargets, id: \.exe) { test in
                     Button(test.label) {
+                        // ml: only for an ACTUAL new launch — runWineFullSequence's
+                        // own relaunch guard silently no-ops while a session is
+                        // already up, and starting the spinner anyway would leave
+                        // it spinning over a tap that did nothing.
+                        if !isLaunching { beginLaunchSpinner() }
                         setenv("MADEIRA_EXE", test.exe, 1)
                         unsetenv("MADEIRA_ARGS")
                         unsetenv("MADEIRA_DESKTOP")
@@ -3874,8 +4077,10 @@ struct ContentView: View {
 
                 // User-added buttons (Custom… ▸ Add Button), same launch
                 // path as the full-path launchTargets entries above — see
-                // launchCustomExe(_:). Long-press for a Remove context menu;
-                // built-in buttons above are not removable.
+                // launchCustomExe(_:), which is also where the loading
+                // spinner starts for THIS button (shared with the Custom…
+                // alert's own Launch button below). Long-press for
+                // Rename/Remove; built-in buttons above offer neither.
                 ForEach(Array(customLaunchButtons.enumerated()), id: \.element.path) { index, button in
                     Button(button.label) {
                         launchCustomExe(button.path)
@@ -3883,6 +4088,11 @@ struct ContentView: View {
                     .buttonStyle(.borderedProminent)
                     .tint(Self.customButtonTints[index % Self.customButtonTints.count])
                     .contextMenu {
+                        Button("Rename") {
+                            renameLaunchButtonPath = button.path
+                            renameLaunchButtonText = button.label
+                            showRenameLaunchAlert = true
+                        }
                         Button("Remove", role: .destructive) {
                             removeCustomLaunchButton(button)
                         }
@@ -3921,6 +4131,20 @@ struct ContentView: View {
         } message: {
             Text("Full Windows path to the .exe, passed to MADEIRA_EXE exactly as typed.")
         }
+        // Long-press ▸ Rename on a user-added button (the ForEach above) —
+        // same alert-not-inline-editor reasoning as Custom Launch itself.
+        .alert("Rename Button", isPresented: $showRenameLaunchAlert) {
+            TextField("Name", text: $renameLaunchButtonText)
+                .autocorrectionDisabled()
+            Button("Save") {
+                if let path = renameLaunchButtonPath {
+                    renameCustomLaunchButton(path: path, to: renameLaunchButtonText)
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("New name for this launch button.")
+        }
     }
 
     /// UserDefaults key for the last path typed into the Custom… launcher —
@@ -3948,6 +4172,12 @@ struct ContentView: View {
             customExePath = trimmed
             UserDefaults.standard.set(trimmed, forKey: Self.customExePathKey)
         }
+        // ml: covers BOTH callers — the alert's own Launch button and every
+        // user-added custom button (see the ForEach above) — so the loading
+        // spinner shows for either without a second call site to keep in
+        // sync. Guarded the same way as launchTargets: only for a launch
+        // that will actually start (see beginLaunchSpinner's doc comment).
+        if !isLaunching { beginLaunchSpinner() }
         setenv("MADEIRA_EXE", trimmed, 1)
         unsetenv("MADEIRA_ARGS")
         unsetenv("MADEIRA_DESKTOP")
@@ -4002,6 +4232,19 @@ struct ContentView: View {
     /// Built-in launchTargets buttons have no such context menu at all.
     private func removeCustomLaunchButton(_ button: CustomLaunchButton) {
         customLaunchButtons.removeAll { $0.path == button.path }
+        saveCustomLaunchButtons()
+    }
+
+    /// Long-press ▸ Rename on a user-added button: keyed by `path` (the only
+    /// stable identity `CustomLaunchButton` has — see its own doc comment),
+    /// same persistence as every other mutation of `customLaunchButtons`. A
+    /// blank/whitespace-only name is refused rather than saved, same
+    /// validation as the path fields elsewhere in this alert family.
+    private func renameCustomLaunchButton(path: String, to newLabel: String) {
+        let trimmed = newLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard let i = customLaunchButtons.firstIndex(where: { $0.path == path }) else { return }
+        customLaunchButtons[i] = CustomLaunchButton(label: trimmed, path: path)
         saveCustomLaunchButtons()
     }
 
@@ -4240,6 +4483,12 @@ struct ContentView: View {
             return
         }
         isLaunching = true
+        // No program is running yet — a cursor a PREVIOUS session left
+        // showing (or the stale builtin-fallback arrow a touch can create
+        // even before any SetCursor — see winios_ensure_cursor_layer's doc
+        // comment in Winios.m) must not carry into this one before its own
+        // first pSetCursor call.
+        winios_cursor_show(0)
 
         logStore.log("Running full Wine sequence...")
 
@@ -4665,6 +4914,45 @@ struct ContentView: View {
                 }
                 logStore.log(msg)
             }
+
+            // 2026-09-23: HOST FEATURES ARE PROBED, NOT ASSUMED.
+            //
+            // CPUFeatures.cpp (a PE module that cannot call sysctl) used to claim a
+            // fixed feature set that happens to be true of the newest phones. On an
+            // older core that is silent corruption, not a crash: with FEAT_AFP
+            // claimed but absent, FPCR.NEP is RES0, every scalar SSE operation
+            // zeroes the upper lanes of its destination instead of preserving them,
+            // and a 32-bit title rendered garbage text and geometry on a tablet
+            // while the same build was correct on a phone. The app CAN ask, so it
+            // does, and hands the answers over in one variable. A sysctl that does
+            // not exist is reported as "?" and left at the old assumption.
+            do {
+                let probes: [(key: String, sysctl: String)] = [
+                    ("AFP",    "hw.optional.arm.FEAT_AFP"),
+                    ("FLAGM",  "hw.optional.arm.FEAT_FlagM"),
+                    ("FLAGM2", "hw.optional.arm.FEAT_FlagM2"),
+                    ("FCMA",   "hw.optional.arm.FEAT_FCMA"),
+                    ("RCPC",   "hw.optional.arm.FEAT_LRCPC"),
+                    ("AES",    "hw.optional.arm.FEAT_AES"),
+                    ("PMULL",  "hw.optional.arm.FEAT_PMULL"),
+                    ("SHA",    "hw.optional.arm.FEAT_SHA256"),
+                    ("CRC",    "hw.optional.armv8_crc32"),
+                    ("ATOMICS", "hw.optional.arm.FEAT_LSE"),
+                ]
+                var parts: [String] = []
+                for p in probes {
+                    var v: Int32 = 0
+                    var sz: Int = MemoryLayout<Int32>.size
+                    if sysctlbyname(p.sysctl, &v, &sz, nil, 0) == 0 {
+                        parts.append(p.key + "=" + (v != 0 ? "1" : "0"))
+                    } else {
+                        parts.append(p.key + "=?")
+                    }
+                }
+                let joined: String = parts.joined(separator: ",")
+                setenv("FEX_MADEIRA_HOSTPROBE", joined, 1)
+                logStore.log("[fex-cfg] host feature probe: " + joined)
+            }
             // ===== end FEX JIT settings =========================================
 
             // ml734: Theorafile call tracer. Documents/madeira-tf-trace.txt == "1"
@@ -4987,6 +5275,9 @@ struct ContentView: View {
             }
             let wineElapsed = CFAbsoluteTimeGetCurrent() - pollStart
             logStore.log("Wine finished after \(String(format: "%.1f", wineElapsed))s")
+            // No program is running any more — the cursor it may have been
+            // showing must not survive back into the normal UI.
+            winios_cursor_show(0)
 
             // Step 5: Resume UI + os_log, give main thread time to recover before detach
             DispatchQueue.main.async {
@@ -5440,6 +5731,15 @@ enum ControlAction: Codable, Equatable, Hashable {
     /// ml660: the aim stick drives no keys at all, so `stickKeys` cannot
     /// identify it — but it must still LOOK and hit-test like a stick.
     var isMouseStick: Bool { self == .joystickMouse }
+    /// ml: `.joystickWASD` and `.joystickArrows` are THE SAME control (both
+    /// go through `.dirStick` with an identical deadzone/snap — see
+    /// `regionKind` below), told apart only by which four keys `stickKeys`
+    /// names. Before this they were also visually IDENTICAL — `stickGlyph`
+    /// only ever covered the aim stick, so two sticks added from "Pointer,
+    /// sticks & special" with different key sets drew the exact same idle
+    /// ring, and a user could not tell WASD from Arrows without pressing
+    /// one. See ContentView's Tasks doc: "same visuals apart from a small
+    /// label/glyph so they can be told apart."
     /// ml670: the `PadButton` this control IS, if it is a virtual controller
     /// button. nil for every keyboard/mouse control and for the D-pad cross,
     /// which is four buttons and not one.
@@ -5450,9 +5750,18 @@ enum ControlAction: Codable, Equatable, Hashable {
     }
     var isStick: Bool { stickKeys != nil || isMouseStick || padButton?.isStick == true }
     /// ml660: SF Symbol drawn in the face, distinguishing sticks from each
-    /// other. The key sticks stay plain (they were shipped that way and are
-    /// told apart by their label); the aim stick is marked.
-    var stickGlyph: String? { isMouseStick ? "scope" : nil }
+    /// other — every stick now gets one (see the doc comment above), since
+    /// the key sticks' actual on-screen label goes undrawn (the stick FACE
+    /// is what `TouchControlButton` renders for `isStick`, never the
+    /// `Text(control.action.label)` branch — see its `body`).
+    var stickGlyph: String? {
+        switch self {
+        case .joystickMouse:  return "scope"
+        case .joystickWASD:   return "keyboard"
+        case .joystickArrows: return "arrow.up.and.down.and.arrow.left.and.right"
+        default:              return nil
+        }
+    }
     var isPad: Bool { if case .pad = self { return true }; return false }
 
     var label: String {

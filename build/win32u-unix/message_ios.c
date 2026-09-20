@@ -3489,11 +3489,76 @@ static BOOL check_internal_bits( UINT mask )
     return signaled;
 }
 
+#ifdef WINE_IOS
+/***********************************************************************
+ *           ios_adopt_orphaned_foreground
+ *
+ * There is no window manager on this platform.  On every other driver the
+ * host gives a newly mapped top-level window the focus and the driver turns
+ * that into SetForegroundWindow; here nothing does.  Most programs still end
+ * up foreground because showing a window activates it, or because the first
+ * click does (WM_MOUSEACTIVATE).  But a desktop can be left with NO foreground
+ * window at all -- the window that was active got destroyed (a splash or
+ * launcher window), or the program only ever showed its window with
+ * SWP_NOACTIVATE and is driven by keys, not clicks.  Device log of such a
+ * program: `foreground=0x0 fg_input=0x0 focus=00000000 active=00000000` for
+ * the whole run, and every key press was dropped, because a keyboard message
+ * has no target other than the foreground thread's focus window.
+ *
+ * So, from the message pump of a thread that owns windows, at most once a
+ * second: if the desktop has no foreground window, make this thread's topmost
+ * visible, enabled top-level window the foreground window, through the normal
+ * client path so WM_ACTIVATE / WM_SETFOCUS are delivered.  This can only ever
+ * fill a vacuum; it never takes the foreground away from anything.
+ */
+static void ios_adopt_orphaned_foreground(void)
+{
+    static LONGLONG last_check;     /* process-wide seconds; benign race */
+    static unsigned int adoptions;
+    LARGE_INTEGER counter, freq;
+    LONGLONG now;
+    HWND *list;
+    DWORD tid = GetCurrentThreadId();
+    int i;
+
+    NtQueryPerformanceCounter( &counter, &freq );
+    now = counter.QuadPart / freq.QuadPart;
+    if (now == last_check) return;
+    last_check = now;
+
+    if (NtUserGetForegroundWindow()) return;
+    if (!(list = list_window_children( 0 ))) return;
+
+    for (i = 0; list[i]; i++)
+    {
+        RECT rect;
+
+        if (get_window_thread( list[i], NULL ) != tid) continue;
+        if (!is_window_visible( list[i] ) || !is_window_enabled( list[i] )) continue;
+        if (get_window_long( list[i], GWL_EXSTYLE ) & (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)) continue;
+        if (!get_window_rect( list[i], &rect, get_thread_dpi() )) continue;
+        if (rect.right - rect.left < 32 || rect.bottom - rect.top < 32) continue;   /* helper windows */
+
+        if (set_foreground_window( list[i], FALSE, TRUE ) && adoptions < 8)
+        {
+            extern int dprintf( int fd, const char *fmt, ... );
+            adoptions++;
+            dprintf( 2, "[focus] desktop had no foreground window; adopted %p (tid %04x) #%u\n",
+                     list[i], (unsigned int)tid, adoptions );
+        }
+        break;
+    }
+    free( list );
+}
+#endif
+
 static BOOL process_driver_events( UINT events_mask, UINT wake_mask, UINT changed_mask )
 {
     BOOL drained = FALSE;
 
 #ifdef WINE_IOS
+    ios_adopt_orphaned_foreground();
+
     /* iOS: always call pProcessEvents on every PeekMessage poll, not just
      * when QS_DRIVER is set. The QS_DRIVER bit is normally raised when the
      * wineserver poll detects driver-side fd events, but winios.drv uses

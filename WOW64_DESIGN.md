@@ -7836,3 +7836,178 @@ guest-slots=… verdict=…`). Consequences:
   LESSON: "it will fault if it is wrong" is a property of an instruction, not
   of a register, and it must be checked per encoding. A scratch register is
   only a scratch register if the kernel agrees.
+
+- 2026-09-23 — **Host CPU features were ASSUMED, and a wrong `true` is silent
+  corruption.** A 32-bit D3D9 title that is correct on the phone rendered
+  garbage text and geometry on a tablet with an older core, same build, same
+  data (menu background fine; every glyph quad and all in-game geometry
+  scrambled — i.e. computed values wrong, uploaded bytes right).
+  `FEX/Source/Windows/Common/CPUFeatures.cpp` cannot call sysctl (PE module,
+  no unix table) and claimed a fixed list including `SupportsAFP`. With
+  FEAT_AFP claimed on a core without it, FPCR.NEP is RES0: every scalar SSE
+  operation zeroes the upper lanes of its destination instead of preserving
+  them, which is exactly "vectors built with scalar ops come out wrong". The
+  app now probes `hw.optional.arm.FEAT_{AFP,FlagM,FlagM2,FCMA,LRCPC,AES,PMULL,
+  SHA256,LSE}` + `armv8_crc32` at session start, logs `[fex-cfg] host feature
+  probe: AFP=0,…`, and exports `FEX_MADEIRA_HOSTPROBE`; CPUFeatures.cpp turns
+  a feature off only on an explicit `=0` ("?" or no variable keeps the old
+  assumption). UNVERIFIED on the tablet — the probe line in the next log says
+  whether AFP was in fact the difference; if it reads AFP=1 there, this was
+  not the cause and the next suspects are GPU-family differences in the D3D9
+  layer.
+- 2026-09-23 — **A desktop with NO foreground window drops every key press.**
+  Log of a 32-bit SDL2 title: `foreground=0x0 fg_input=0x0 focus=00000000
+  active=00000000` for the whole run; on-screen Esc/Space/Enter/arrow keys did
+  nothing (`raw: drop(nofg=1)` for the mouse too). There is no window manager
+  here to hand a new top-level window the focus, which every other driver
+  relies on; most programs become foreground through ShowWindow activation or
+  the first click, but a program whose active window was destroyed, or that
+  is driven by keys only, is left orphaned. `ios_adopt_orphaned_foreground()`
+  (build/win32u-unix/message_ios.c, called from `process_driver_events`, at
+  most once a second): if the desktop has no foreground window, the pumping
+  thread's topmost visible, enabled, non-tool top-level window is made
+  foreground through the normal client path (WM_ACTIVATE/WM_SETFOCUS are
+  delivered). Logs `[focus] desktop had no foreground window; adopted …`.
+  It can only fill a vacuum.
+
+- 2026-09-23 — **Every x86-64 call into ARM64EC code cost a Mach exception,
+  for months, because a `.S` file was assembled without the define its C++
+  neighbours were compiled with.** A 64-bit title made no progress at all: 100%
+  CPU, `[x18-redir2]` at #446,464 in one run and #876,544 in another, three or
+  four distinct PCs, the `wine-x18-exc` handler thread holding 25% of all CPU
+  and `mach_msg2_trap` 23.6%. The redirect PCs came in PAIRS and that is what
+  named the bug: `ucrtbase+0x17164` is `tolower`, `ucrtbase+0x90c5c` is
+  `$ientry_thunk$cdecl$i8$i8`, and `0x17164 + (*(int32_t *)(0x17160) & ~3)`
+  **is** `0x90c5c`. `_stricmp`/`+0x90cec`, `__wine_dbg_output` with
+  `$ientry_thunk$cdecl$i8$i8i8i8`, and `kernelbase!VirtualAlloc2` are the same
+  shape. That arithmetic — target plus the entry-thunk offset stored in the
+  word before it — exists in exactly one place, `ExitFunctionEC` in FEX's
+  `Source/Windows/ARM64EC/Module.S`, and it was being performed in **PE
+  space**: two exec faults per guest call, one for the thunk and one for the
+  function the thunk then `blr x9`s to.
+  `Module.S` has carried an `#ifdef FEX_IOS_HOST` block since ml316 that
+  translates that target through `IosAliasEntries` (PE VA -> JIT-pool copy)
+  before branching. Disassembling the SHIPPED `xtajit64.dll` showed the block
+  was not there — and `check_target_ec` opened with `ldr x16,[x18,#0x60]`, the
+  `#else` arm. `.xtool/build-fex*.sh` passed the define in `-DCMAKE_C_FLAGS`
+  and `-DCMAKE_CXX_FLAGS`; `project(FEX C CXX ASM)` builds a `.S` with the
+  **ASM** language, whose flags are `CMAKE_ASM_FLAGS`. So the emulator's C++
+  half was built for iOS and its assembly half was built for Windows, in one
+  DLL, with no warning and no link error. Four mechanisms were silently absent:
+  the alias translation, `ExitToX64`'s fast-forward-sequence bypass,
+  `enter_jit`'s code-buffer sweep gate (whose C++ counterpart in
+  `CPUBackend.cpp` has been setting the flag one-sidedly all along), and every
+  `IOS_LOAD_TEB`.
+  **THE FIX BELONGS TO THE TARGET, NOT THE SCRIPT.**
+  `target_compile_definitions(arm64ecfex PRIVATE FEX_IOS_HOST)` feeds
+  `<DEFINES>` to the ASM rule as well as C/C++, so the flag now lives with the
+  thing it describes (`CMAKE_ASM_FLAGS` was added to the scripts too, as belt
+  and braces). And because "it built and looked fine" is precisely what went
+  wrong, `Module.S` now defines `IosEcAsmIosBuilt` inside its `#ifdef` and
+  `Module.cpp` reads it: a future mismatch **fails to link**. It prints next to
+  `[build-id]`.
+  **FAST PATH.** The scan is O(images) — ~50 entries x 6 instructions per
+  x64->EC call — so `ExitFunctionEC` gained a last-hit cache: `IosAliasHot`, a
+  single 32-bit index, probed before the walk and republished on a scan hit. An
+  INDEX and not a copy of the entry, deliberately: a naturally-aligned 32-bit
+  load is atomic, and the entry is RE-TESTED against the target before it is
+  believed, so a stale or out-of-range value costs one compare and can never
+  produce a wrong answer. No generation counter, no barrier, no lock.
+  `ExitToX64`'s FFS bypass — which reverse-translated its target to PE space to
+  consult the EC bitmap and then deliberately branched to the PE VA "because
+  this is RPC frequency" — now walks the same table forwards and branches to
+  the copy that can actually run.
+  **PROVE IT NEXT RUN:** `[ec-call] translated=N faulted=M` every 10 s from the
+  profiler window. FEX counts both outcomes in `IosAliasStats`, exported as
+  DATA; ntdll-unix reads it *through the pool copy* — the PE image's `.bss` is
+  not what executes, which is the same lesson the `[ec-bind] POOL STALE` line
+  records. `translated` climbing with `faulted` flat is the fix working;
+  `translated` stuck at 0 means the assembly half was built wrong again, which
+  is now also a link error.
+  **TWO NEAR-MISSES FOUND ON THE WAY IN.** (1) `Module.S`'s TEB reads use a
+  PLACEHOLDER TSD slot (`#0x898`) that virtual_ios.c's "Pass 0" rewrites to the
+  real one before the image ever runs. That pass filtered literal-pool words
+  with `data_map[i / 4]` — one BYTE per word — while `ios_x18_build_data_map`
+  stores one BIT per word and the x18 pass beside it reads it correctly. For a
+  2 MB `.text` that indexed ~512 KB past a 132 KB allocation, and whatever it
+  found there could mark a real triplet as data and SKIP it, leaving the
+  placeholder in place: a stranger's TSD word used as the TEB, with no fault to
+  catch it. It had never mattered because no shipped image contained the
+  triplet. Both readers now go through `IOS_X18_DATA_WORD()`. A host harness
+  replays the filter and the matcher against the rebuilt DLL: 6 triplets, 6
+  retargetable, 0 skipped. (2) The pass is skipped entirely when the slot
+  offset is not yet known, silently fatal for the same reason; that case now
+  logs, loudly, naming the image.
+  **BISECT HANDLE.** Three of the four newly-live mechanisms are either
+  verified statically or are the missing half of code already running; the FFS
+  bypass is the one that changes dispatch for native EC callers and has never
+  executed. `MADEIRA_EC_FFS_BYPASS=0` turns just that off and keeps the
+  translation. Reported at `[build-id]`.
+  32-bit runs were checked for the same pattern and do not have it: per-run
+  `[x18-redir2]` totals of 10, 10, 10 and 8,192 against 446,464 and 876,544 for
+  the 64-bit ones. The WOW64 module has no `.S` at all, and a 32-bit guest
+  reaches builtins through the wow64 thunk path rather than an EC transition.
+  LESSON: a build flag that reaches some translation units and not others is
+  invisible to every test that only asks "did it build?". When a mechanism is
+  supposed to be live and the evidence says it is not, **disassemble the
+  artifact** before theorising about the source.
+
+- 2026-09-23 — **A byte access reported as a datatype misalignment, and the
+  emulator's own spin lock living in memory it cannot write to.** A 32-bit
+  title died at startup with 0x80000002 twice in a row.
+  FIRST, THE LABEL. JIT code executed `stlrb w20,[x24]` (insn 0x089fff14) to a
+  read-execute page of a builtin image. ESR 0x9200004f: DFSC 0b001111, a
+  level-3 PERMISSION fault, WnR=1. A byte access cannot be misaligned and the
+  hardware never said it was — but Darwin reports **every** arm64 SIGBUS with
+  `si_code == BUS_ADRALN`, including `KERN_PROTECTION_FAILURE`, and
+  `bus_handler` gated on exactly that, so anything its emulators declined fell
+  out of the bottom still labelled STATUS_DATATYPE_MISALIGNMENT. The target was
+  the first byte of an exported syscall stub in `.text` — an inline hook a
+  32-bit program tried to install — i.e. an ordinary, survivable access
+  violation. The page is NOT mis-protected: `.text` is not writable in the PE
+  and wine's own vprot for it is `0x25` (committed|read|exec), which is why the
+  `[wr-strip]` machinery correctly answered "not a strip". `bus_handler` now
+  classifies from ESR.ISS DFSC for EVERY encoding, decoded or not: only
+  `0b100001` keeps 0x80000002, everything else is delivered as the c0000005 the
+  record was already built for — and which FEX's `ResetToConsistentState` can
+  reconstruct a guest RIP for, which it cannot do for a misalignment. Logged as
+  `[esr-class] NOT an alignment fault: … dfsc=0x0f (permission) …`.
+  SECOND, WHAT THE BOGUS LABEL RAN INTO. The 0x80000002 sent FEX to
+  `HandleUnalignedAccess`, which takes a backpatch lock — and that lock is
+  `JITCodeTail::SpinLockFutex`, which the block emitter appends INSIDE the JIT
+  code buffer. On iOS that buffer's executable view has no write bit, so
+  `ldaxr w9,[x24]` / `stlxr w9,w8,[x24]` faulted on the store, inside the
+  handler, while it was already handling a fault. Dead process. `Arm64.cpp` now
+  takes the futex through `DualMap::WriteAddr`. One call site, and every
+  participant (the CAS and `SpinWaitLock::Wait`/`Wake`, which key on an
+  ADDRESS) derives it from the same pointer, so they still agree; both views
+  map the same physical page, so the pair is a genuine hardware atomic.
+  Verified in both shipped emulator DLLs by disassembly: the lock address is
+  now `header + tailoff + WriteOffset + 0x20`.
+  THIRD, THE GENERAL CASE. The RX->RW alias store emulator learned the
+  exclusive family (LDXR/LDAXR/STXR/STLXR and the XP pairs) and the
+  store-release family (STLR/STLRB/STLRH), in both the Mach-thread decoder and
+  `ios_emulate_store`. **An exclusive pair cannot be emulated instruction by
+  instruction** — the monitor is lost with the exception, and the value the
+  matching load observed is unknown here because that load did not fault. So
+  the store is NOT performed and NOT faked: it is reported as a **spurious
+  failure**, which the architecture explicitly permits, with status=1 — and the
+  BASE REGISTER is moved to the writable alias. Every well-formed LL/SC loop
+  branches back to its load on failure and re-reads its base, so the retry runs
+  entirely on the RW view: real LDAXR, real STLXR, real monitor, full
+  atomicity, and no further faults for that loop. The substitution is
+  value-for-value because an exclusive access has NO offset operand, so Rn
+  holds exactly the faulting address — the caller verifies that against its
+  register file before applying anything. Refused by construction: an SP base,
+  and a store whose status register is WZR (a fabricated failure would be
+  invisible and the loop would believe it held the lock). Forward progress is
+  guaranteed: each fault moves one base register from a view that faults to one
+  that does not.
+  Host-tested: the decoder is extracted verbatim from the source and run
+  against both device encodings, all four widths in both directions, both pair
+  forms, and nine near-miss encodings that must NOT be claimed — CASP in
+  particular shares `o1 == 1` with STXP and is separated only by bit31.
+  LESSON: `si_code` on Darwin arm64 carries no information about alignment.
+  Anything that decides "this is a misalignment" must read the ESR, and the
+  cost of guessing wrong is not a wrong log line — it is routing a survivable
+  fault into an emulator path that faults again somewhere with no handler.

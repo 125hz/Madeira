@@ -751,9 +751,29 @@ void winios_q_stats(unsigned int *pushed, unsigned int *coalesced) {
  * Coordinates are in iOS view-local pixels; we scale to a fixed
  * 1024×768 logical surface inside winios_pProcessEvents to match
  * what DXMT swapchains use. */
+/* ml — THE POSITION SOURCE FOR DIRECT-LAUNCH MODE'S DRAWN CURSOR.
+ *
+ * These three carry the app's touch-to-mouse bridge and, until now, never
+ * touched the cursor layer at all — winios_pointer (below) is a SEPARATE
+ * entry point (the desktop trackpad, the relative aim-stick/hardware-mouse
+ * path) that already called winios_cursor_move/winios_cursor_advance on
+ * its own ABSOLUTE/relative branches. A direct-launch program's ordinary
+ * absolute tap-and-drag never went through winios_pointer, so it never
+ * moved a drawn cursor even in desktop mode. winios_cursor_move is cheap
+ * to call unconditionally (it no-ops with no layer/host to draw into,
+ * exactly like winios_pointer's own callers already rely on) and mode-
+ * correct on its own — see winios_cursor_host_layer — so no `#ifdef`/mode
+ * check belongs here.
+ *
+ * NOT covered: a program that warps the cursor itself (SetCursorPos,
+ * ClipCursor) without a touch in between — we have no signal for that and
+ * the drawn arrow will not follow it. Acceptable for now; the next touch
+ * (or a resumed drag) snaps it back, same as winios_cursor_advance's own
+ * drift note below. */
 void winios_post_touch_down(int x, int y) {
     fprintf(stderr, "[winios] post_touch_down x=%d y=%d\n", x, y); fflush(stderr);
     winios_q_push_ev(WINIOS_EV_MOUSE, x, y, MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE, 0);
+    winios_cursor_move(x, y);
 }
 
 void winios_post_touch_move(int x, int y) {
@@ -762,11 +782,13 @@ void winios_post_touch_move(int x, int y) {
         fprintf(stderr, "[winios] post_touch_move x=%d y=%d (n=%u)\n", x, y, cnt); fflush(stderr);
     }
     winios_q_push_ev(WINIOS_EV_MOUSE, x, y, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, 0);
+    winios_cursor_move(x, y);
 }
 
 void winios_post_touch_up(int x, int y) {
     fprintf(stderr, "[winios] post_touch_up x=%d y=%d\n", x, y); fflush(stderr);
     winios_q_push_ev(WINIOS_EV_MOUSE, x, y, MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE, 0);
+    winios_cursor_move(x, y);
 }
 
 /* Key press bridge. vk = Windows virtual-key code, down = 1 for press,
@@ -1528,6 +1550,74 @@ void winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
 
 static CALayer *g_cursor_layer;
 
+/* ml — DIRECT-LAUNCH CURSOR HOST.
+ *
+ * Desktop mode hosts the drawn cursor on g_compositor_view (above) — that
+ * view only exists in desktop mode, by winios_ensure_compositor's own
+ * gate. A directly-launched program has no such view: its presented
+ * surface is the app's own window-level CAMetalLayer (MetalHostView, added
+ * directly to the UIWindow above the entire SwiftUI tree — see
+ * ContentView.swift's file-top comment), so in that mode the cursor is
+ * hosted as a sublayer of THAT layer instead. Swift hands us its address
+ * once, right after registering the same layer with DXMT
+ * (MetalBackedView.didMoveToWindow) — see winios_set_game_layer, and
+ * Winios.h's doc comment for why this takes `void *` and not `CAMetalLayer
+ * *`.
+ *
+ * Positioning then needs only two numbers this file can get on its own:
+ * the layer's own `bounds` (which IS the current game rect in POINTS —
+ * MetalHostView.shared.frame is set to exactly GameSurfaceLayout.rect()
+ * converted to window coordinates on every apply, so the layer's LOCAL
+ * bounds are that rect's SIZE at local origin (0,0), independent of where
+ * the rect sits in the window) and the guest's logical resolution
+ * (winios_screen_size(), the same live source ContentView.swift's own
+ * touch-mapping and display code reads — see its guestSize()/mapTouch()).
+ * A drawable presented into a CAMetalLayer fills its bounds exactly
+ * (default contentsGravity is resize/stretch, and gameRect() already chose
+ * this rect to HAVE the guest's own aspect for every DisplayMode except
+ * Stretch, where stretching is the guest's own mapping too) — so
+ * guest-pixel -> layer-point is one uniform scale that is correct for
+ * every DisplayMode, in the normal view, the wide view and fullscreen,
+ * with no separate rect math to keep in sync with GameSurfaceLayout's. */
+static CALayer *g_game_layer;
+
+void winios_set_game_layer(void *metal_layer) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        g_game_layer = (__bridge CALayer *)metal_layer;
+    });
+}
+
+/* Implemented in IOSDisplayShim.m; declared there for Swift, not exported
+ * through a shared ObjC header this pure-C-safe file could include. Same
+ * "read the LIVE published size, not a launch-time constant" reasoning as
+ * every other caller — see winios_screen_size's own doc comment there. */
+extern void winios_screen_size(int *w, int *h);
+
+/* Cached once: MADEIRA_DESKTOP is fixed for a process's lifetime. */
+static int winios_cursor_desktop_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *dm = getenv("MADEIRA_DESKTOP");
+        mode = (dm && *dm == '1') ? 1 : 0;
+    }
+    return mode;
+}
+
+/* The layer the cursor draws into for the CURRENT mode: the desktop
+ * compositor in desktop mode (ensuring it exists first, same as every
+ * other desktop-mode caller in this file), or the game's own presented
+ * layer in direct-launch mode — NEVER the compositor there, which
+ * winios_ensure_compositor already refuses to create outside desktop mode
+ * (its own gate), so calling it in direct-launch mode is a harmless no-op
+ * left in place below rather than duplicating that mode check here. */
+static CALayer *winios_cursor_host_layer(void) {
+    if (winios_cursor_desktop_mode()) {
+        winios_ensure_compositor();
+        return g_compositor_view.layer;
+    }
+    return g_game_layer;
+}
+
 static UIImage *winios_cursor_image(void) {
     static UIImage *img;
     static dispatch_once_t once;
@@ -1559,40 +1649,105 @@ static UIImage *winios_cursor_image(void) {
 static int g_cur_w, g_cur_h, g_cur_hx, g_cur_hy;
 static CGPoint g_cursor_pos_px;
 
-/* main thread only */
+/* main thread only. Creates the layer at most once (process lifetime, like
+ * every other singleton layer in this file) and re-parents it onto
+ * whichever host is current — needed because a single app process can run
+ * a desktop session and a direct-launch session back to back, and the two
+ * modes host on different layers (see winios_cursor_host_layer above).
+ * Superlayer-equality check makes the re-parent a no-op on the hot path
+ * (called from every cursor move/set), not just on a genuine mode switch. */
 static void winios_ensure_cursor_layer(void) {
-    if (g_cursor_layer || !g_compositor_view) return;
-    UIImage *img = winios_cursor_image();
-    g_cursor_layer = [CALayer layer];
-    g_cursor_layer.zPosition = 10000;   /* above every window layer */
-    g_cursor_layer.anchorPoint = CGPointMake(0, 0);
-    g_cursor_layer.contents = (id)img.CGImage;
-    g_cursor_layer.bounds = CGRectMake(0, 0, img.size.width, img.size.height);
-    g_cursor_layer.magnificationFilter = kCAFilterNearest;
-    [g_compositor_view.layer addSublayer:g_cursor_layer];
+    CALayer *host = winios_cursor_host_layer();
+    if (!host) return;
+    if (!g_cursor_layer) {
+        UIImage *img = winios_cursor_image();
+        g_cursor_layer = [CALayer layer];
+        g_cursor_layer.zPosition = 10000;   /* above every window/game layer */
+        g_cursor_layer.anchorPoint = CGPointMake(0, 0);
+        g_cursor_layer.contents = (id)img.CGImage;
+        g_cursor_layer.bounds = CGRectMake(0, 0, img.size.width, img.size.height);
+        g_cursor_layer.magnificationFilter = kCAFilterNearest;
+        /* ml — VISIBILITY DEFAULT. Desktop mode's default here was always
+         * NO (a plain CALayer starts visible) — untouched, so an existing
+         * session's exact behaviour never changes (a move before the
+         * first WM_SETCURSOR already drew the builtin fallback arrow, and
+         * that stays true). Direct-launch mode starts HIDDEN instead: a
+         * game's first TOUCH (see winios_post_touch_down/move, which now
+         * call winios_cursor_move too — the position source for absolute
+         * taps/drags) can create this layer before the game has ever
+         * called SetCursor, and the spec is explicit that the cursor stays
+         * hidden until it does. winios_cursor_show below ensures this
+         * layer itself in direct-launch mode specifically so an early
+         * pSetCursor(NULL)/show(1) that arrives before any image is never
+         * lost to this ordering. */
+        g_cursor_layer.hidden = winios_cursor_desktop_mode() ? NO : YES;
+    }
+    if (g_cursor_layer.superlayer != host) {
+        [g_cursor_layer removeFromSuperlayer];
+        [host addSublayer:g_cursor_layer];
+    }
 }
 
 /* main thread only — place (and size) the cursor at its stored px pos,
  * honoring the wine cursor's hotspot when one is set */
 static void winios_cursor_place(void) {
     if (!g_cursor_layer) return;
+    if (winios_cursor_desktop_mode()) {
+        CGFloat x = g_cursor_pos_px.x, y = g_cursor_pos_px.y;
+        if (g_cur_w > 0) {
+            g_cursor_layer.bounds = CGRectMake(0, 0, g_cur_w * g_px_to_pt, g_cur_h * g_px_to_pt);
+            g_cursor_layer.position = CGPointMake(g_desk_origin.x + (x - g_cur_hx) * g_px_to_pt,
+                                                  g_desk_origin.y + (y - g_cur_hy) * g_px_to_pt);
+        } else {
+            g_cursor_layer.position = CGPointMake(g_desk_origin.x + x * g_px_to_pt,
+                                                  g_desk_origin.y + y * g_px_to_pt);
+        }
+        return;
+    }
+    /* Direct-launch mode — see winios_set_game_layer's doc comment above
+     * for why g_game_layer's own bounds ARE the current game rect and no
+     * window-coordinate offset belongs here (these are LOCAL sublayer
+     * coordinates, origin at the layer's own top-left). */
+    if (!g_game_layer) return;
+    int gw = 0, gh = 0;
+    winios_screen_size(&gw, &gh);
+    if (gw <= 0) gw = 1024;
+    if (gh <= 0) gh = 768;
+    CGRect hb = g_game_layer.bounds;
+    if (hb.size.width <= 0 || hb.size.height <= 0) return;
+    CGFloat sx = hb.size.width / gw, sy = hb.size.height / gh;
+    /* Cursor GLYPH never shrinks past 1x (spec) even when sx/sy < 1 on a
+     * small live-view column, but the drawn POSITION still uses the true,
+     * unclamped sx/sy — or the arrow would drift off its real hotspot as
+     * the gap between "where it should be" and "how big it is drawn"
+     * grows. A few points of hotspot slop on a heavily shrunk view is the
+     * accepted trade for the glyph staying visible at all. */
+    CGFloat imgScale = MAX(1.0, MIN(sx, sy));
     CGFloat x = g_cursor_pos_px.x, y = g_cursor_pos_px.y;
     if (g_cur_w > 0) {
-        g_cursor_layer.bounds = CGRectMake(0, 0, g_cur_w * g_px_to_pt, g_cur_h * g_px_to_pt);
-        g_cursor_layer.position = CGPointMake(g_desk_origin.x + (x - g_cur_hx) * g_px_to_pt,
-                                              g_desk_origin.y + (y - g_cur_hy) * g_px_to_pt);
+        g_cursor_layer.bounds = CGRectMake(0, 0, g_cur_w * imgScale, g_cur_h * imgScale);
+        g_cursor_layer.position = CGPointMake((x - g_cur_hx) * sx, (y - g_cur_hy) * sy);
     } else {
-        g_cursor_layer.position = CGPointMake(g_desk_origin.x + x * g_px_to_pt,
-                                              g_desk_origin.y + y * g_px_to_pt);
+        g_cursor_layer.position = CGPointMake(x * sx, y * sy);
     }
 }
 
 void winios_cursor_move(int x, int y) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        winios_ensure_compositor();
-        if (!g_compositor_view) return;
         winios_ensure_cursor_layer();
+        if (!g_cursor_layer) return;
         g_cursor_pos_px = CGPointMake(x, y);
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        winios_cursor_place();
+        [CATransaction commit];
+    });
+}
+
+/* See winios_cursor_relayout's doc comment in Winios.h. */
+void winios_cursor_relayout(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!g_cursor_layer || winios_cursor_desktop_mode()) return;
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
         winios_cursor_place();
@@ -1607,9 +1762,8 @@ void winios_cursor_set(unsigned int cur_id, int w, int h, int hot_x, int hot_y, 
     if (w <= 0 || h <= 0 || !bgra) return;
     NSData *data = [NSData dataWithBytes:bgra length:(size_t)w * h * 4];
     dispatch_async(dispatch_get_main_queue(), ^{
-        winios_ensure_compositor();
-        if (!g_compositor_view) return;
         winios_ensure_cursor_layer();
+        if (!g_cursor_layer) return;
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
         CGDataProviderRef dp = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
         CGImageRef img = CGImageCreate(w, h, 8, 32, w * 4, cs,
@@ -1631,6 +1785,19 @@ void winios_cursor_set(unsigned int cur_id, int w, int h, int hot_x, int hot_y, 
 
 void winios_cursor_show(int show) {
     dispatch_async(dispatch_get_main_queue(), ^{
+        /* ml — direct-launch mode only: winios_drv_set_cursor calls
+         * show(1)/show(0) BEFORE winios_cursor_set for the very first
+         * cursor of a session (see its own ordering in driver_ios.c), so
+         * without ensuring the layer here that first show() call would
+         * arrive with no layer to act on, and — since a freshly created
+         * layer now starts HIDDEN in direct-launch mode (see
+         * winios_ensure_cursor_layer) — the cursor could end up stuck
+         * hidden even after a real, non-NULL SetCursor. Desktop mode is
+         * untouched: it never ensured the layer here before, and still
+         * doesn't — winios_cursor_move/winios_cursor_set already do that
+         * on the very next call in the exact same order they always have,
+         * so behaviour there is unchanged. */
+        if (!winios_cursor_desktop_mode()) winios_ensure_cursor_layer();
         if (g_cursor_layer) g_cursor_layer.hidden = !show;
     });
 }
@@ -1648,11 +1815,26 @@ void winios_cursor_show(int show) {
 static void winios_cursor_advance(int dx, int dy) {
     if (!dx && !dy) return;
     dispatch_async(dispatch_get_main_queue(), ^{
-        winios_ensure_compositor();
-        if (!g_compositor_view) return;
         winios_ensure_cursor_layer();
-        const char *dw = getenv("MADEIRA_SCREEN_W"), *dh = getenv("MADEIRA_SCREEN_H");
-        int desk_w = dw ? atoi(dw) : 1024, desk_h = dh ? atoi(dh) : 768;
+        if (!g_cursor_layer) return;
+        /* ml — desktop mode keeps reading MADEIRA_SCREEN_W/H exactly as it
+         * always did (that session's desktop size is a launch-time
+         * constant in practice — untouched, requirement is "desktop mode
+         * behaves exactly as before"). Direct-launch mode reuses the SAME
+         * clamp-and-advance logic (that is the whole point — this path
+         * already accumulates and clamps a position for winios_cursor_move,
+         * just needed somewhere to draw and the right resolution to clamp
+         * against) but asks winios_screen_size() for it, the live-published
+         * guest resolution a game may have changed via ChangeDisplaySettings
+         * — env vars are a launch-time hint only there. */
+        int desk_w, desk_h;
+        if (winios_cursor_desktop_mode()) {
+            const char *dw = getenv("MADEIRA_SCREEN_W"), *dh = getenv("MADEIRA_SCREEN_H");
+            desk_w = dw ? atoi(dw) : 1024;
+            desk_h = dh ? atoi(dh) : 768;
+        } else {
+            winios_screen_size(&desk_w, &desk_h);
+        }
         if (desk_w <= 0) desk_w = 1024;
         if (desk_h <= 0) desk_h = 768;
         CGFloat x = g_cursor_pos_px.x + dx, y = g_cursor_pos_px.y + dy;

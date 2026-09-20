@@ -4432,6 +4432,12 @@ static int ios_x18_word_uses_sp_base(uint32_t w)
  * ios_jit_patch_x18. Shared by the patcher and the trampoline-need
  * counter. Caller frees. NULL on alloc failure (callers degrade to the
  * unguarded pre-2026-07-07 behavior). */
+/* One BIT per 4-byte instruction word; see ios_x18_build_data_map. Every reader
+ * must use this — an open-coded index is how the teb-tsd retarget pass spent a
+ * year reading past the end of the allocation. `off` is a BYTE offset into .text. */
+#define IOS_X18_DATA_WORD(dm, off) \
+    ((dm)[(((size_t)(off)) / 4) >> 3] & (1 << ((((size_t)(off)) / 4) & 7)))
+
 static unsigned char *ios_x18_build_data_map( const char *text, size_t text_size )
 {
     unsigned char *data_map = calloc( 1, text_size / 32 + 1 );
@@ -4471,7 +4477,7 @@ size_t ios_jit_x18_tramp_need( const char *text, size_t text_size )
     for (size_t i = 0; i < text_size; i += 4)
     {
         uint32_t insn = *(const uint32_t *)(text + i);
-        if (data_map && (data_map[(i / 4) >> 3] & (1 << ((i / 4) & 7)))) continue;
+        if (data_map && IOS_X18_DATA_WORD( data_map, i )) continue;
         if (ios_insn_x18_role( insn ) != X18_ROLE_NONE) need += 32;
     }
     free( data_map );
@@ -4555,6 +4561,33 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
      * The triplet is matched in full and all three registers must agree, so a
      * stray LDR with a coincidental immediate cannot be hit. Literal-pool
      * words are excluded via data_map for the same reason as the x18 pass. */
+    /* 2026-09-23: the "offset not discovered yet" case is FATAL-BY-SILENCE and
+     * must not stay quiet. If an image carrying the triplet is patched before
+     * the TSD slot is known, the pass is skipped, the PLACEHOLDER immediate
+     * survives, and every TEB read in that image returns whatever pthread keeps
+     * in slot 0x898 — a wrong pointer used as the TEB, with no fault to catch
+     * it. The ordering is sound today (the slot is published during early
+     * ntdll-unix init, long before any PE is copied), so this is insurance,
+     * not a known path; it costs one scan of .text on a path that is already
+     * scanning .text three times. */
+    if (!ios_teb_tls_slot_offset && text_size >= 12)
+    {
+        for (size_t i = 0; i + 12 <= text_size; i += 4)
+        {
+            uint32_t i0 = *(uint32_t *)(text_rw + i);
+            unsigned reg = i0 & 0x1f;
+            if ((i0 & 0xffffffe0) != 0xd53bd060) continue;
+            if (*(uint32_t *)(text_rw + i + 4) != (0x927df000u | (reg << 5) | reg)) continue;
+            if ((*(uint32_t *)(text_rw + i + 8) & 0xffc003ff) != (0xf9400000u | (reg << 5) | reg))
+                continue;
+            dprintf(2, "[teb-tsd] FATAL-BY-SILENCE: .text %p contains a hand-written TSD read at +0x%lx but the "
+                       "slot offset is NOT KNOWN YET — the placeholder immediate will survive and "
+                       "this image will read a stranger's TSD word as its TEB\n",
+                    text_rx, (unsigned long)i);
+            break;
+        }
+    }
+
     if (ios_teb_tls_slot_offset && text_size >= 12)
     {
         const uint32_t want_imm = (uint32_t)(ios_teb_tls_slot_offset / 8) << 10;
@@ -4576,7 +4609,22 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
             uint32_t i0, i1, i2;
             unsigned reg;
 
-            if (data_map && (data_map[i / 4] || data_map[(i + 4) / 4] || data_map[(i + 8) / 4]))
+            /* 2026-09-23: this read USED to be `data_map[i / 4]`, i.e. one BYTE
+             * per instruction word. `ios_x18_build_data_map` allocates
+             * `text_size / 32 + 1` bytes and stores ONE BIT per word — the x18
+             * pass below reads it correctly as `dm[(i/4) >> 3] & (1 << ((i/4) & 7))`.
+             * The byte form was therefore wrong twice over: it read out of bounds
+             * from the eighth of .text onwards (for a 2 MB .text, ~512 KB past the
+             * end of a 132 KB allocation), and whatever heap byte it found there
+             * made the whole triplet look like a literal pool and be SKIPPED.
+             * Nothing had noticed because no shipped image contained the triplet
+             * (see the Module.S build-flag defect of the same date) — so the pass
+             * never had a match to lose. The moment one exists, a spurious skip
+             * leaves the PLACEHOLDER slot immediate in place and the TEB read
+             * returns a stranger's TSD word. */
+            if (data_map && (IOS_X18_DATA_WORD( data_map, i ) ||
+                             IOS_X18_DATA_WORD( data_map, i + 4 ) ||
+                             IOS_X18_DATA_WORD( data_map, i + 8 )))
                 continue;
 
             i0 = *(uint32_t *)(text_rw + i);
@@ -4609,7 +4657,7 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
     {
         uint32_t insn = *(uint32_t *)(text_rw + i);
         int role;
-        if (data_map && (data_map[(i / 4) >> 3] & (1 << ((i / 4) & 7))))
+        if (data_map && IOS_X18_DATA_WORD( data_map, i ))
         {
             if (ios_insn_x18_role(insn) != X18_ROLE_NONE) lit_skipped++;
             continue;

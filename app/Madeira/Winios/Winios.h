@@ -101,6 +101,35 @@ void winios_pointer(int x, int y, unsigned int flags, unsigned int data);
  * by winios_pointer(MOVE); exposed for initial placement. */
 void winios_cursor_move(int x, int y);
 
+/* ml — DIRECT-LAUNCH CURSOR HOSTING (games, not the wine virtual desktop).
+ *
+ * Desktop mode draws the cursor as a sublayer of the desktop compositor
+ * view (winios_ensure_compositor in Winios.m), which only exists in that
+ * mode. A directly-launched program has no such view — its presented
+ * surface is the app's own game-host CAMetalLayer — so in that mode the
+ * cursor is hosted as a sublayer of THAT layer instead. `metal_layer` is
+ * `void *` rather than `CAMetalLayer *` so this header — included by
+ * build/win32u-unix/driver_ios.c, a plain-C translation unit — never has
+ * to import QuartzCore. Swift (MetalBackedView) calls this once, right
+ * after registering the same layer with DXMT; pass NULL to clear it. */
+void winios_set_game_layer(void *metal_layer);
+
+/* Re-run the guest-pixel -> view-point cursor placement against the
+ * CURRENT game layer bounds, without moving the stored guest position.
+ * Call after every display-mode/layout apply (rotation, DisplayMode
+ * toggle, a GeometryReader resize) so the drawn cursor tracks a moving or
+ * resizing game rect even when no new pointer event lands in the same
+ * tick. No-op in desktop mode (winios_layout_compositor already owns that
+ * relayout there) and before any cursor has ever been positioned. */
+void winios_cursor_relayout(void);
+
+/* Show/hide the drawn cursor. Normally driven by the driver's pSetCursor
+ * hook (NULL cursor -> hide, non-NULL -> show — see winios_drv_set_cursor
+ * in driver_ios.c); exposed here too so Swift can force it hidden once a
+ * run's wine process has actually exited, or before one has started, so a
+ * cursor a game was showing does not survive back into the normal UI. */
+void winios_cursor_show(int show);
+
 /* ========================================================================
  * ml668 — THE GAMEPAD SLOT.
  *
