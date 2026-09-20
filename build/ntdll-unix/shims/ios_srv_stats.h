@@ -64,6 +64,17 @@ enum ios_srv_nt_counter
     IOS_FS_WATCHDOG,           /* long-wait re-validations performed         */
     IOS_FS_DESYNC,             /* objects demoted after a real disagreement  */
 
+    /* ml1010: the SEMAPHORE half of the fast path, counted separately from
+     * the event half because the two arm together but can fail apart.  The
+     * measurement this was written against has release_semaphore=76091 and
+     * select=308752 per 10 s, essentially all of it single-object INFINITE
+     * waits by worker threads of ONE process: sem_rel should end up tracking
+     * NtReleaseSemaphore almost exactly, sem_wait should track the worker
+     * wakeups, and `release_semaphore'/`select' in the kinds line should fall
+     * by an order of magnitude.  MADEIRA_FASTSYNC_SEM=0 zeroes both. */
+    IOS_FS_SEM_REL,            /* NtReleaseSemaphore served from the cell    */
+    IOS_FS_SEM_WAIT,           /* a wait that took a token from the cell     */
+
     /* Breakdown of the `select` request, which is the one request kind whose
      * count says nothing about its cause: NtWaitForSingleObject, a multi-object
      * wait, NtSignalAndWaitForSingleObject, a keyed event and an alertable

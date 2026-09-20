@@ -8636,3 +8636,368 @@ guest-slots=… verdict=…`). Consequences:
   had been known and documented for two rounds and left opt-in because the
   crash that originally motivated the gate was never re-attributed; that crash
   was a symbol collision, and something else had already fixed it.
+
+- 2026-09-29 — **A 32-bit title froze after 5–10 minutes because the one
+  question every fault asks — "is this host pc JIT code?" — was answered under
+  an unbounded, ownerless spinlock that the asking thread could already hold.**
+  THE SHAPE. `[tight-loop] … SPUN 8000 ms inside a 20-byte code window
+  [0x11a270240,0x11a270250] with no exit`, `[prof] top2 19.6 % pe
+  libwow64fex.dll+0x1b240`, thread at 33.2 % of a core with `jit 0 %`. That RVA
+  is `CPUBackend::IsAddressInCodeBuffer`, and the 20 bytes are the
+  `exchange`/`yield` loop of `IosMigrateLock` (`CPUBackend.h`, the ml460 spin
+  that serialises every C++ toucher of `CurrentCodeBuffer` /
+  `SignalHandlerCodeBuffers` against the pool-tail sweeper).
+  THE EXACT TRIGGER, NOT A THEORY. Four lines earlier: `[code-buffer] rev=ml364
+  EXEC ALLOC FAILED even at 0x100000 — JIT pool exhausted; forcing honest fault
+  at 0xdead`, then `[deliver-hold] teb=… tid=0034 HOLDS FEX shared lock
+  @0x7c010c0120 at guest redirect (pc=0x11a26fbcc addr=0xdead) — this delivery
+  leaks the read hold`, with `hinsn=0xf9000114` (`str x20,[x8]`, x8=0xdead).
+  That deliberate fault lives in the `CodeBuffer` constructor, which
+  `GetEmptyCodeBuffer()` reaches **while holding `IosMigrateLock`**. Mach
+  delivery runs the handler on that same thread, the handler asks
+  `IsAddressInCodeBuffer`, and the query spins forever on a lock its own thread
+  owns. The thread was holding the FEX shared read lock at the moment of the
+  redirect, so the exclusive waiter behind it piled up at `depth=3086747`, 16
+  threads parked (8 of them over 60 s) and the whole emulated world stopped —
+  while `[freeze] alive t+1234s gaps=0` reported everything healthy, because
+  the process was busy, not blocked.
+  THE FIX. `IsAddressInCodeBuffer` no longer takes a lock. Each live code
+  buffer is published into one 64-bit slot of a 32-entry per-backend table as
+  `(Base >> FEX_PAGE_SHIFT) << 20 | UsablePageCount`; a single word means a
+  reader observes the old value or the new one and never a mixed {base,size}
+  pair, so no sequence counter and no retry loop are needed. The publishers are
+  the three existing mutators, still serialised by `IosMigrateLock`, so there
+  is exactly one writer at a time. The emitted read is 32 `ldar`s and a range
+  compare with no exclusive ops and no back edge — wait-free by inspection of
+  the disassembly, not by argument. The lock itself is now owner-aware and
+  recursion-tolerant, and the sweeper's two acquisitions are bounded (it holds
+  a LookupCache write lock while acquiring, so one wedged thread must cost a
+  skipped migration, never a process-wide park). Knob:
+  `MADEIRA_FEX_CODEBUF_LOCKFREE=0` restores the ml460 behaviour exactly.
+  WHY THE POOL WAS EXHAUSTED AT ALL — the same log, one layer down. 72,072
+  `[iOS-xrem] via=section` invalidations over ~880 half-to-one-megabyte ranges
+  repeating a fixed six-line map/unmap cycle, plus ~2.9 M `via=aligned` guest
+  frees. Each one takes `CodeInvalidationMutex` **exclusively** and walks every
+  thread's lookup cache, and `[fex-stats]` shows what that costs: a steady
+  state of 324,278 blocks at `+0/s` and `hit_rate=93 %` collapsing into
+  `+125,112 (10,268/s)` with `real_compile` equal to the block delta — nothing
+  was reused, the cache was wiped rather than missed. That storm is what burned
+  the pool's tail partition down to `carves=11 live=240 MB free=0 MB`, and an
+  empty tail is what fired the 0xdead fault above. The filter rests on the
+  tracker's own documented invariant: the only thing that decides whether a
+  guest address may be executed is `XIntervals`, so a range that does not
+  intersect `XIntervals` cannot hold translated code and invalidating it is
+  pure cost. Both unmap paths now test that first
+  (`MADEIRA_FEX_SKIP_EMPTY_INVALIDATE=0` to disable), and `[inval-filter]`
+  reports skipped-vs-kept by path so the next run measures the win instead of
+  assuming it. The `via=section` line was also 55 % of the entire log — one
+  dprintf syscall each — and is now sampled the way its `via=aligned` sibling
+  already was.
+  THE 64-BIT REDELIVERY STORM: AMPLIFIER FOUND, ROOT CAUSE NOT YET. A managed
+  runtime's null-check handler rewrites `CONTEXT.Rip` and returns
+  `EXCEPTION_CONTINUE_EXECUTION`; the log shows it doing exactly that, 60 times
+  out of 60, with a replacement Rip that is discarded every time while the
+  guest Rip stays pinned. The decisive counter is that 2,085 dispatches of the
+  identical record correspond to only 17 real host faults: ~2,068 of them are
+  software re-raises. `dispatch_exception` ignores `NtContinue`'s return value
+  and falls through to `call_seh_handlers` and then
+  `NtRaiseException( rec, context, FALSE )`, which re-dispatches the same
+  record — so one dropped continue becomes an unbounded loop that ends with
+  `[redeliv] terminating the TASK`. A continue into emulated x64 code depends
+  on the non-EC resume being bounced through `KiUserEmulationDispatcher`, and
+  that bounce is conditional: `signal_set_full_context` refuses outright when
+  it dislikes the Sp it is handed, and NtContinue then returns. Which of those
+  fired is unknown, because the refusal shared a 16-line budget that startup
+  had already spent — the log's zero `continue REFUSED` lines meant "out of
+  budget", not "did not happen". So: the refusal gets its own sampled counter;
+  the EC `NtContinue` reports its target classification and reports loudly
+  whenever it returns at all; and direct re-entry into simulation (publish the
+  x64 context into the CPU area and call `BeginSimulation`, exactly what
+  `dispatch_emulation` does) is implemented but OPT-IN behind
+  `MADEIRA_EC_CONTINUE_SIM=1`, because it changes the resume path of every
+  guest SEH continue and has not been seen on device.
+  A PROBE THAT LIED. `[rtcs] pre` in `prepare_exception_arm64ec` was printing
+  on every exception — its `if (rtcs_n < 40 …)` guard had no braces, so the
+  guard's body was the access-violation block and the ERR after it was
+  unconditional. 4,170 lines in one session, and because it was the only probe
+  still printing once `[rtcs] post`, `[ki-path]` and `[veh]` had spent their
+  one-shot caps, the storm appeared to change shape at iteration 60 when all
+  that had changed was which probes were alive. Same family as the ml631
+  dangling `else` in the same function. Braced, and `[ki-path]` now samples
+  (first 32, then powers of two) so a storm's tail is always represented.
+  LOOKUP-CACHE MISSES: MEASURED, DELIBERATELY NOT CHANGED. 64-bit gameplay runs
+  `cpp_dispatch=+802,816 (77,216/s)` with `l1_miss_l3hit` at 99 % of
+  dispatches; 32-bit runs 3,000–6,000/s. The whole difference is one token:
+  `LookupCache.h` gates `L1_WAYS = 2` on
+  `defined(FEX_IOS_HOST) && !defined(ARCHITECTURE_arm64ec)`, so the 64-bit
+  module keeps upstream's direct-mapped cache and thrashes on conflict misses.
+  Both emitted probes (`Dispatcher.cpp`, `BranchOps.cpp`) already loop over
+  `L1_WAYS` generically, the 2-way paths ship today in the 32-bit module, and
+  the memory budget does not move (ways reindex the same 128 K-entry / 2 MB
+  array as sets × ways). It is left alone tonight for one reason: associativity
+  is a compile-time constant baked into emitted code, so it cannot be put
+  behind a runtime knob, and every other change this round can.
+  VERIFIED. `xtajit.dll` and `xtajit64.dll` both rebuilt and checked BY CONTENT
+  — the new strings are present in both, and `IsAddressInCodeBuffer` was
+  disassembled out of the object file to confirm the fault path is 32 `ldar`
+  probes with no `ldaxr`/`stxr` and no back edge, and that the spin is now
+  reachable only from the degraded/knob-off branch behind an owner check. The
+  ARM64EC `ntdll.dll` rebuilt and carries the new `[ec-continue]` strings.
+  UNVERIFIED ON DEVICE. That the freeze is gone; the actual skipped-vs-kept
+  invalidation ratio (`[inval-filter]` will state it); whether the
+  block-compile rate falls back to near zero in steady state; and every part of
+  the 64-bit redelivery diagnosis beyond "the continue is dropped and the
+  caller re-raises the same record".
+  LESSON. A lock with no owner field and no timeout, taken on the path that
+  handles faults, is not a lock — it is a promise that no code inside any of
+  its critical sections will ever fault. `GetEmptyCodeBuffer` broke that
+  promise deliberately, by design, in the one situation the lock most needed to
+  survive. And the whole incident was invisible for two rounds because every
+  probe that would have named it was a one-shot counter spent during process
+  start: a cap that is cheap at boot is a blindfold during a storm.
+
+- 2026-09-29 — **SEMAPHORES JOIN THE IN-PROCESS FAST PATH (ml1010): the same
+  cell, the same generation packing, the same Dekker pairings, with the count
+  in the state half** (`build/ntdll-unix/shims/ios_fastsync.h`,
+  `build/ntdll-unix/shims/ios_srv_stats.h`, `build/ntdll-unix/server_ios.c`,
+  `wine/dlls/ntdll/unix/sync.c`, `wine/server/{semaphore.c,event.c,object.h,
+  thread.c,inproc_sync.c}`, new `build/host-tests/fastsync-semrace.c` +
+  `build-fastsync-semrace.sh`, `build/x86-tests/sync-x86.c` test 11).
+
+  **THE MEASUREMENT.** v48 (an x86-64 engine with a semaphore-driven job
+  system, in gameplay at ~45 fps): `[prof] cpu%: jit=29.8% … dylib=60.6%`, with
+  `read<-read_request 18.7% of all CPU`, `read<-read_reply_data 9.6%` and
+  `read<-wait_select_reply 9.6%` — i.e. **about 60 % of all CPU is wineserver
+  pipe I/O** — against `[srv-stats] kinds: select=308752
+  release_semaphore=76091 per 10 s`, where `select` is almost entirely
+  single-object INFINITE/timed waits by "Job.Worker N" threads on those
+  semaphores. fastsync was `AUTO-ENABLED` in that run and irrelevant, because
+  it only knew events. q1/u3 show the same duopoly at `release_semaphore=40510
+  select=42456`. ml990 flagged this and declined it in one sentence: "a
+  semaphore carries a COUNT, not a token, and `ReleaseSemaphore` has a
+  previous-count return value and an overflow status that a client-side CAS
+  would have to reproduce exactly; that is a different proof obligation."
+  This round discharges that obligation.
+
+  **CELL LAYOUT.** `struct madeira_sync_cell` gains `kind` and `smax` and keeps
+  its 32 bytes (`pad[3]` → `pad[1]`; both host models assert the size). For
+  `MADEIRA_CELL_KIND_SEM` the state half of the packed `{gen,state}` word IS
+  the current count: `0` is empty — the same value and the same meaning as
+  `MADEIRA_CELL_RESET`, so the futex sleep value and the read-only poll peek
+  need no special case — and `MADEIRA_CELL_DISABLED` (-1) is the same one-way
+  exit. `MADEIRA_CELL_SET`/`_CLAIMED` have no meaning for a semaphore: 1 and 2
+  are counts, so every reader branches on `kind` first. `max` is immutable per
+  object, so it sits beside the packed word rather than inside it, is written
+  before the store of `sg` that publishes the cell, and is read only after a
+  load of `sg` that matched the caller's generation — so a reader that has
+  matched the generation has by construction read the right `max` and the right
+  `kind`. `max <= 0x7fffffff` (create_semaphore already rejects more), so
+  `count + n` is checked for overflow entirely inside the signed 32-bit half.
+
+  **PROTOCOL WITH THE SERVER — AND THE PIECE THAT NEEDED NO NEW OPCODE.**
+  The event path answers "a client released, but the server still has threads
+  queued" with the private `MADEIRA_EVENT_OP_WAKE`. A semaphore needs no
+  private opcode for it at all: **`release_semaphore` with `count == 0` already
+  IS "change nothing, then `wake_up( obj, 0 )`"** — upstream's own code path,
+  and `max == 0` in `wake_up` means "no limit". So the mixed-waiter request is
+  a legal, unextended request carrying the access check the caller already
+  passes. The only new opcode is `MADEIRA_SEM_OP_DISABLE`, the rare self-heal,
+  carried through `event_op` and answered ahead of its `get_event_obj()`
+  because the handle it carries is a semaphore handle.
+  Server side, `semaphore_sync_signaled()` does not merely report that a token
+  exists — it **CAS-claims one** (count → count-1, in a retry loop so that a
+  concurrent client release cannot make it answer "not signaled" while a token
+  sits in the cell) and records the claim; `satisfied()` consumes the claim,
+  and `madeira_semaphore_sync_unclaim()` — wired next to the event one in
+  `thread.c`'s `object_sync_unclaim()` — gives it back for a wait-all that
+  turned out not to be satisfiable. Without the claim, `satisfied()` has no
+  return value and a client CAS between `signaled()` and it would make the
+  server report WAIT_0 to a thread that acquired nothing, and then decrement a
+  count that is already zero.
+
+  **THE INTERLEAVINGS, WRITTEN DOWN.**
+  (1) *Release vs wait, no lost wakeup.* Releaser: `CAS count+=n` (seq_cst)
+  then `load waiters` (seq_cst). Waiter: `waiters++` (seq_cst) then `load
+  count` (seq_cst). Two threads each storing their own flag and then loading
+  the other's, both seq_cst: on a total order at least one load is ordered
+  after the other's store, so they cannot both miss. The park re-tests the word
+  inside the syscall on top of that. The server half is the same pairing with
+  `srv_waiters`, incremented by `semaphore_sync_add_queue()`, which `wait_on()`
+  runs strictly before `check_wait()` reads the count.
+  (2) *N releases vs M waiters.* Every transfer is a CAS on ONE word that also
+  carries the generation, so the count is a linearizable counter: a release
+  adds n atomically, a consumer removes exactly one, a lost CAS retries.
+  Nothing is lost (a surplus stays in the cell) and nothing is duplicated (a
+  successful CAS on `{gen,cur}` is exclusive).
+  (3) *Close/reuse while parked.* The generation is inside the compared word,
+  so a CAS against a recycled cell cannot succeed; a mismatch after the park
+  leaves `waiters` alone (it now belongs to the new occupant's count) and hands
+  the wait to the server, exactly as the event path does.
+  (4) *Termination/suspend while parked.* The park is capped at
+  `madeira_fast_cap_ns` (2 ms) and then the wait goes to the server, so an APC,
+  a suspend or a kill is never delayed by more than the cap. The known residual
+  is unchanged: a thread killed while parked leaks its `waiters` increment,
+  which costs one spurious wake per release on that cell and nothing else.
+  (5) *Timeout racing a release.* A waiter returns SUCCESS **only** out of a
+  successful CAS, and it returns immediately when it wins one; the
+  budget-expiry exit performs no CAS at all. So a timed-out waiter cannot be
+  holding a token it then drops, and a waiter that took one cannot report a
+  timeout. The host model checks this with a ledger rather than taking the
+  argument on trust.
+  (6) *Client release with a server-side waiter.* The cell is updated first,
+  then `release_semaphore(count=0)` makes the server re-run its queue against
+  the word the client already wrote. Releasing again there would mint a second
+  set of tokens out of one `ReleaseSemaphore` — the ml952 double-release bug in
+  its semaphore form.
+  (7) *Server release with client waiters parked.* `release_semaphore()` now
+  wakes **even when the previous count was not zero**: upstream's "there cannot
+  be any thread to wake up if the count is != 0" stops being true the moment a
+  client can add tokens without telling the server. One token wakes one waiter,
+  a burst of n wakes ALL — `os_sync_wake_by_address` has no "wake exactly n",
+  and over-waking is safe because a woken waiter that loses re-parks.
+
+  **FILE:LINE.** Header: `build/ntdll-unix/shims/ios_fastsync.h:187` (the
+  ml1010 section), `:275` (`MADEIRA_CELL_KIND_*`), `:291` (`kind`/`smax` in the
+  struct), `:301` (`madeira_cell_kind()`), `:375` (`MADEIRA_SEM_OP_DISABLE`).
+  Server: `wine/server/semaphore.c:66` (`cell`/`claimed`), `:135`–`:310`
+  (`semaphore_sync_count`, the cell accessors `semaphore_cell_add/take/wake`,
+  `semaphore_sync_disable_cell`, the queue hooks, and
+  `madeira_semaphore_sync_unclaim` at `:279`), `:312` (`release_semaphore`'s
+  cell arm), `:335` (`count == 0` as the wake protocol), `:382` (`signaled`
+  CAS-claims), `:410` (`satisfied` consumes the claim),
+  `:443` (`create_semaphore_sync` allocates),
+  `:563` (`madeira_semaphore_cell_index`),
+  `:582` (`madeira_semaphore_disable_cell`);
+  `wine/server/event.c:65` (`madeira_fastsync_sem_enabled`),
+  `:140` (`madeira_cell_alloc_kind`), `:182` (`madeira_sem_cell_alloc`),
+  `:887` (`MADEIRA_SEM_OP_DISABLE` in `event_op`);
+  `wine/server/thread.c:1183`; `wine/server/inproc_sync.c:328`;
+  `wine/server/object.h:237`.
+  Client: `wine/dlls/ntdll/unix/sync.c:312` (`madeira_fast_sem`), `:418` (the
+  knob), `:442` (the ml1010 banner), `:477` (`madeira_fast_sem_enabled`),
+  `:756`/`:837` (`kind` read out of the cell in `madeira_fast_lookup`),
+  `:891` (`madeira_fast_try`'s semaphore arm),
+  `:927` (`madeira_fast_sem_release`), `:1154`/`:1176`/`:1263`–`:1271`
+  (the wait loop and its `st < 0` exit), `:1362` (`madeira_fast_demote` picks
+  the opcode), `:1402`/`:1414` (the watchdog's `st > 0` question),
+  `:2311` (`NtQuerySemaphore` answered from the cell),
+  `:2363` (`NtReleaseSemaphore`).
+  Counters: `build/ntdll-unix/shims/ios_srv_stats.h:75`
+  (`IOS_FS_SEM_REL`/`IOS_FS_SEM_WAIT`);
+  `build/ntdll-unix/server_ios.c:1035` (`[srv-stats] fastsync served:`),
+  `:1057` (the auto-arm sum gains `IOS_NT_RELEASE_SEM`),
+  `:1151` (`[perf] rev=ml1010`).
+
+  **HOST VERIFICATION, WITH NUMBERS.** New `build/host-tests/fastsync-semrace.c`,
+  compiled against the REAL shipping header (it asserts `sizeof(cell) == 32`,
+  that the futex address is the state half, and that `0x7fffffff` survives the
+  pack/unpack round trip as a POSITIVE number rather than colliding with
+  DISABLED). It models the whole protocol — three producers, six parking
+  consumers and a thread that CAS-claims the way `semaphore_sync_signaled()`
+  does, so the mixed client/server case is under test and not just the client
+  one — behind a **shadow ledger**: a producer adds to a separate "work"
+  counter BEFORE it releases and a consumer decrements it AFTER it wins a CAS,
+  so a consumer proceeding without a token is caught exactly rather than
+  inferred.
+  Three 2.5 s passes per run: **produced == consumed + left_in_cell in every
+  pass**, `no_work == 0`, and `waiters`/`srv_waiters` back to zero at rest —
+  e.g. `produced=796959 consumed=796959 left_in_cell=0 timeouts=13
+  parks=115285 srv_served=490856 refused=23875`. The run FAILS if it did not
+  actually park or did not actually exercise the server claim, so those
+  `parks=` and `srv_served=` numbers are assertions, not decoration. Overflow,
+  the count-of-zero no-op and the recycled-generation rejection are separate
+  deterministic checks.
+  **Under `-fsanitize=thread` (`build-fastsync-semrace.sh --tsan`): three
+  passes of ~434 k tokens each, exit 0, and NOT ONE race report.** (The first
+  TSan run reported three races, all of them on the harness's own `stop` flag;
+  it is now `_Atomic` so any future report can only be about the protocol.)
+  `fastsync-cellrace` (the ml990 event model) still passes against the changed
+  header: `ml982 SPLIT` stole 943854 tokens, `ml990 PACKED` stole 0 of 5.2 M,
+  exit 0.
+
+  **THE DEVICE TEST, AND THE BUG THE HOST MODEL FOUND IN IT.**
+  `build/x86-tests/sync-x86.c` gains test 11, a semaphore job system: 6 workers
+  rotating through `WaitForSingleObject` INFINITE / 1 ms / a 0 ms poll /
+  `WaitForMultipleObjects` over two handles with a 50 ms timeout, a producer
+  publishing bursts of 1..8 in ONE `ReleaseSemaphore` (some of them through a
+  `DuplicateHandle`d handle closed straight after), and a churn thread
+  recycling unrelated semaphores and events underneath. **Its accounting is
+  stricter than test 10's**: an auto-reset event legitimately produces a
+  "leftover signal" wake, but a semaphore release of n releases exactly n
+  waiters, so a wakeup with no job behind it FAILS (exit 65) instead of being
+  counted as spurious. It also asserts the arithmetic the client now owns —
+  the previous-count return, the max-count refusal changing nothing, the
+  count-of-zero release, and that a timed-out wait consumed nothing (exit 66).
+  The whole file was then compiled against a POSIX model of the Win32 sync
+  surface, which is the only thing that makes the "MADEIRA-EXIT status=46"
+  convention worth anything, and **the model failed it at first, exit 65**: the
+  shutdown mints tokens with no job behind them purely to release workers from
+  INFINITE waits, and the new worker was missing the drain check test 10 has.
+  Fixed at the worker's wait-return (sm_stop is set strictly before the first
+  drain token exists, so a worker holding one always sees it), and the model
+  now runs all eleven tests to **exit 46 with 1090851 semaphore jobs over
+  242413 bursts, every one consumed exactly once, alongside 1343670 event
+  jobs**. That is a bug in the TEST, caught before it could be misread as a bug
+  in the mechanism.
+
+  **KNOBS.** `MADEIRA_FASTSYNC_SEM=0|off|no` turns off ONLY the semaphore path,
+  on both sides: the server then allocates no cell for a semaphore, so it is
+  the pre-ml1010 object byte for byte, and the client's lookup reports "no
+  cell" for one. The two sides read the same environment, and a hypothetical
+  disagreement is safe in both directions (server-on/client-off = everything
+  goes to the server, which owns the cell as its own state;
+  server-off/client-on = there is no cell to learn). Default ON whenever
+  `MADEIRA_FASTSYNC` is `auto` (the default) or `1`; `MADEIRA_FASTSYNC=0` still
+  forces everything off, cells included. `NtReleaseSemaphore` now also feeds
+  the `auto` traffic estimate in both of its callers, so a title whose handoffs
+  are semaphores arms on its own release traffic rather than only on its select
+  half.
+
+  **VERIFIED BY BUILDING AND READING THE ARTIFACTS.** `ntdll-unix` 32/32,
+  `wineserver` every file, no new warnings. `libntdll_unix.a` 1902984 B,
+  `libwineserver.a` 1254000 B. By CONTENT, not timestamp: the
+  `[fastsync] rev=ml1010 mode=%s peek=%s sem=%s …` banner and
+  `[perf] rev=ml1010 … sem_rel=%u sem_wait=%u` are present and the `rev=ml990`
+  / `rev=ml1001` ones are gone; the `[srv-stats] fastsync served:` line carries
+  `sem_rel=%u(%u) sem_wait=%u(%u) [NtReleaseSemaphore=%u]`; `server.o` still
+  relocates to `_madeira_fastsync_auto_arm` (2 references) and now carries
+  `_ios_perf_line.prev_srel`/`.prev_swait`; `semaphore.o` defines
+  `_madeira_semaphore_{cell_index,disable_cell,sync_unclaim}`, references
+  `_madeira_sem_cell_alloc`/`_free` and `_madeira_sync_cells` from `event.o`,
+  and disassembles to **five 64-bit `ldaxr x`/`stlxr` pairs** for the cell RMWs
+  plus two 32-bit ones for the waiter counters, with `___ulock_wake` and
+  `_os_sync_wake_by_address_{any,all}` imported so both sides issue the same
+  wake a client would; `thread.o` references `_madeira_semaphore_sync_unclaim`
+  and `inproc_sync.o` references `_madeira_semaphore_cell_index`.
+  `sync-x86.exe` rebuilt (48128 B, kernel32-only imports, LARGE_ADDRESS_AWARE)
+  and copied to `app/Madeira/i386-windows/`.
+
+  **UNVERIFIED ON DEVICE.** Everything about how this behaves in a real guest:
+  nothing in this round has executed on hardware. Specifically unverified are
+  the mixed client/server case against the REAL wineserver (the host model has
+  a model of it, not the thing), a named semaphore opened from a second
+  pseudo-process, `NtQuerySemaphore` answered from the cell, and the
+  `MADEIRA_SEM_OP_DISABLE` demote path, which by design almost never runs. The
+  ml990/2026-09-25 lesson applies: assume unverified until a boot has happened.
+
+  **WHAT THE NEXT DEVICE LOG SHOULD SHOW.** `[fastsync] rev=ml1010 mode=auto
+  peek=on sem=on` at boot, then `[fastsync] AUTO-ENABLED` in the first busy
+  window. Then, in `[perf]` every 10 s: **`sem_rel` tracking
+  `NtReleaseSemaphore` almost exactly** (v48's shape says ~76000 per 10 s),
+  **`sem_wait` tracking the worker wakeups**, `srv=` an order of magnitude
+  below where it is now, and **`desync=0`** — a non-zero `desync` is the one
+  alarming number, and it demotes only the object it names, whose kind the
+  DESYNC line now prints. With `MADEIRA_DIAG=1`: `[srv-stats] kinds:` should
+  show **`release_semaphore` and `select` down by an order of magnitude** from
+  76091/308752 per 10 s; `fastsync served: … sem_rel=N(N) sem_wait=N(N)
+  [NtReleaseSemaphore=N]` with the first two close to the third; and
+  `[prof] cpu%` should show `dylib=` collapsing from 60.6 % as
+  `read<-read_request` / `read_reply_data` / `wait_select_reply`
+  (18.7 / 9.6 / 9.6 %) drain. If `sem_rel` stays at zero while
+  `NtReleaseSemaphore` is large, the learn is answering "no cell" — check the
+  `sem=` field of the boot banner and `MADEIRA_FASTSYNC_SEM`. Run
+  `sync-x86.exe` through the Custom path popup in four configurations
+  (default, `MADEIRA_FASTSYNC=0`, `MADEIRA_FASTSYNC=1`,
+  `MADEIRA_FASTSYNC_SEM=0`); every one must end in
+  `MADEIRA-EXIT: sync-x86.exe status=46`, and 65 or 66 name the exact
+  semaphore property that broke.

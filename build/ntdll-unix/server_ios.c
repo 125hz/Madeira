@@ -1011,7 +1011,7 @@ static void ios_srv_stats_report( unsigned long long now )
      * now unambiguous evidence that the counter is not wired, which is the
      * only reading that tells you to go and look at the call site. */
     {
-        static unsigned int fs_total[8];
+        static unsigned int fs_total[10];
         fs_total[0] += nt[IOS_FS_LEARN_EVENT];
         fs_total[1] += nt[IOS_FS_LEARN_NONE];
         fs_total[2] += nt[IOS_FS_RELEARN];
@@ -1020,6 +1020,8 @@ static void ios_srv_stats_report( unsigned long long now )
         fs_total[5] += nt[IOS_FS_POLLPEEK];
         fs_total[6] += nt[IOS_FS_WATCHDOG];
         fs_total[7] += nt[IOS_FS_DESYNC];
+        fs_total[8] += nt[IOS_FS_SEM_REL];
+        fs_total[9] += nt[IOS_FS_SEM_WAIT];
         wine_log_write( "[srv-stats]   fastsync cache: learn_ev=%u(%u) learn_none=%u(%u) "
                         "relearn=%u(%u) stale_gen=%u(%u) evict=%u(%u)",
                         nt[IOS_FS_LEARN_EVENT], fs_total[0],
@@ -1031,17 +1033,28 @@ static void ios_srv_stats_report( unsigned long long now )
          * never happened -- so it is printed next to the w1 poll= count it came
          * out of.  desync is the only number here that is ever alarming. */
         wine_log_write( "[srv-stats]   fastsync served: pollpeek=%u(%u) [w1 poll left=%u] "
-                        "watchdog=%u(%u) desync=%u(%u)",
+                        "watchdog=%u(%u) desync=%u(%u) sem_rel=%u(%u) sem_wait=%u(%u) "
+                        "[NtReleaseSemaphore=%u]",
                         nt[IOS_FS_POLLPEEK], fs_total[5], nt[IOS_SEL_WAIT1_POLL],
                         nt[IOS_FS_WATCHDOG], fs_total[6],
-                        nt[IOS_FS_DESYNC],   fs_total[7] );
+                        nt[IOS_FS_DESYNC],   fs_total[7],
+                        nt[IOS_FS_SEM_REL],  fs_total[8],
+                        nt[IOS_FS_SEM_WAIT], fs_total[9],
+                        nt[IOS_NT_RELEASE_SEM] );
 
         /* ml982: the "auto" rule.  This reporter is the only thing in the image
          * that already knows the task's request rate, so the rule costs nothing
          * of its own.  A no-op unless MADEIRA_FASTSYNC=auto. */
         {
             extern void madeira_fastsync_auto_arm( unsigned int ops, unsigned long long window_ns );
+            /* ml1010: NtReleaseSemaphore joins the traffic estimate.  A title
+             * whose handoffs are semaphores rather than events was previously
+             * invisible to this rule except through its select half, which on
+             * the motivating measurement was still enough -- but the rule is
+             * supposed to measure the traffic the fast path can remove, and
+             * that now includes the release side. */
             madeira_fastsync_auto_arm( nt[IOS_NT_SET_EVENT] + nt[IOS_NT_RESET_EVENT] +
+                                       nt[IOS_NT_RELEASE_SEM] +
                                        nt[IOS_SEL_WAIT1_INF] + nt[IOS_SEL_WAIT1_FIN] +
                                        nt[IOS_SEL_WAIT1_POLL] + nt[IOS_FS_POLLPEEK],
                                        window_ns );
@@ -1087,8 +1100,9 @@ void ios_perf_line( unsigned long long phys_mb, unsigned long long peak_mb,
 {
     static unsigned long long prev_reqs, prev_ns;
     static unsigned int prev_hit, prev_miss, prev_peek, prev_desync, prev_ops;
+    static unsigned int prev_srel, prev_swait;
     unsigned long long reqs = 0, now_ns, win_ns;
-    unsigned int hit, miss, peek, desync, ops;
+    unsigned int hit, miss, peek, desync, ops, srel, swait;
     unsigned int i;
 
     for (i = 0; i < REQ_NB_REQUESTS; i++)
@@ -1098,10 +1112,14 @@ void ios_perf_line( unsigned long long phys_mb, unsigned long long peak_mb,
     miss   = __atomic_load_n( &ios_srv_nt_counts[IOS_NT_FAST_MISS], __ATOMIC_RELAXED );
     peek   = __atomic_load_n( &ios_srv_nt_counts[IOS_FS_POLLPEEK],  __ATOMIC_RELAXED );
     desync = __atomic_load_n( &ios_srv_nt_counts[IOS_FS_DESYNC],    __ATOMIC_RELAXED );
+    srel   = __atomic_load_n( &ios_srv_nt_counts[IOS_FS_SEM_REL],   __ATOMIC_RELAXED );
+    swait  = __atomic_load_n( &ios_srv_nt_counts[IOS_FS_SEM_WAIT],  __ATOMIC_RELAXED );
 
-    /* The same six counters the "auto" rule has always been fed. */
+    /* The counters the "auto" rule has always been fed, plus ml1010's
+     * NtReleaseSemaphore: see the identical sum in ios_srv_stats_report(). */
     ops = __atomic_load_n( &ios_srv_nt_counts[IOS_NT_SET_EVENT],   __ATOMIC_RELAXED )
         + __atomic_load_n( &ios_srv_nt_counts[IOS_NT_RESET_EVENT], __ATOMIC_RELAXED )
+        + __atomic_load_n( &ios_srv_nt_counts[IOS_NT_RELEASE_SEM], __ATOMIC_RELAXED )
         + __atomic_load_n( &ios_srv_nt_counts[IOS_SEL_WAIT1_INF],  __ATOMIC_RELAXED )
         + __atomic_load_n( &ios_srv_nt_counts[IOS_SEL_WAIT1_FIN],  __ATOMIC_RELAXED )
         + __atomic_load_n( &ios_srv_nt_counts[IOS_SEL_WAIT1_POLL], __ATOMIC_RELAXED )
@@ -1130,12 +1148,14 @@ void ios_perf_line( unsigned long long phys_mb, unsigned long long peak_mb,
             if ((unsigned long long)(uintptr_t)user_shared_data > 0x100000000ull)
                 usd_ms = ((unsigned long long)user_shared_data->TickCount.High1Time << 32)
                          | user_shared_data->TickCount.LowPart;
-            wine_log_write( "[perf] rev=ml1001 phys=%lluMB(peak %llu, comp %llu) srv=%llu/s "
-                            "fastsync hit=%u miss=%u peek=%u desync=%u tick=%llums"
+            wine_log_write( "[perf] rev=ml1010 phys=%lluMB(peak %llu, comp %llu) srv=%llu/s "
+                            "fastsync hit=%u miss=%u peek=%u sem_rel=%u sem_wait=%u "
+                            "desync=%u tick=%llums"
                             " - MADEIRA_DIAG=1 for the full reporters",
                             phys_mb, peak_mb, comp_mb,
                             (reqs - prev_reqs) * 1000000000ull / win_ns,
                             hit - prev_hit, miss - prev_miss, peek - prev_peek,
+                            srel - prev_srel, swait - prev_swait,
                             desync - prev_desync, usd_ms );
         }
 
@@ -1161,6 +1181,7 @@ void ios_perf_line( unsigned long long phys_mb, unsigned long long peak_mb,
 
     prev_reqs = reqs; prev_ns = now_ns; prev_ops = ops;
     prev_hit = hit; prev_miss = miss; prev_peek = peek; prev_desync = desync;
+    prev_srel = srel; prev_swait = swait;
 }
 
 static inline void ios_srv_stats_account( unsigned int kind, unsigned long long t0, uintptr_t caller )

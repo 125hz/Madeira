@@ -112,6 +112,18 @@
  *     after one SetEvent and not-signaled after ResetEvent, and an auto-reset
  *     event must be consumed by a poll EXACTLY once.
  *
+ * 11. SEMAPHORE JOB SYSTEM (ml1010).  The same shape again, on the object the
+ *     measurement that motivated ml1010 actually uses: a producer that hands n
+ *     tokens to a worker pool in ONE ReleaseSemaphore.  Its accounting is
+ *     STRICTER than test 10's, because a semaphore release of n releases
+ *     exactly n waiters -- so a wakeup with no job behind it is a failure here
+ *     rather than a legal leftover, which is what catches a token handed out
+ *     twice or minted out of nothing.  It also asserts the arithmetic the
+ *     client fast path now performs for itself: the previous-count return
+ *     value, the max-count refusal changing nothing, a count-of-zero release
+ *     (the request the client sends to make the server re-run its own queue),
+ *     and that a timed-out wait never consumed a token it then dropped.
+ *
  * Deliberate restrictions, the same ones the other tests in this directory
  * work under: no CRT (this file supplies `start' plus memset/memcpy and links
  * -nostdlib, so its only import is kernel32), no 64-bit division, no
@@ -134,6 +146,11 @@
  *   62  job system: a produced job was not consumed within one second
  *   63  job system: a multi-object wait was released by the wrong handle
  *   64  job system: a zero-timeout poll gave the wrong answer for the event
+ *   65  semaphore job system: a wait was released without a job behind it, a
+ *       job was not consumed within one second, a release failed, or the
+ *       previous count it reported was impossible
+ *   66  semaphore: the previous-count return, the max-count refusal, a
+ *       count-of-zero release or a zero-timeout poll gave the wrong answer
  */
 #include <stddef.h>
 #include <windows.h>
@@ -1072,6 +1089,285 @@ stop:
     return 0;
 }
 
+/* ------------------------------------- 11: SEMAPHORE job system (ml1010) */
+
+/* WHY A SEPARATE TEST AND NOT A VARIANT OF TEST 10.
+ *
+ * A semaphore carries a COUNT, and that makes its accounting STRICTER than an
+ * auto-reset event's, not looser.  One ReleaseSemaphore( h, n ) releases
+ * exactly n waiters, so unlike test 10 -- where a release that finds the
+ * counter empty is legal and merely counted -- here a wait that returns
+ * WAIT_OBJECT_0 without a job behind it is a DEFECT and fails the run.  That
+ * is the property a client-side CAS can break in the two directions this
+ * round has to prove it does not: a token handed out twice (two waiters
+ * released by one release) and a token lost (a waiter that never wakes, or a
+ * timed-out waiter that consumed one and dropped it).
+ *
+ *   - 6 workers rotating, per iteration, through WaitForSingleObject INFINITE
+ *     / 1 ms / a 0 ms poll / WaitForMultipleObjects over TWO handles with a
+ *     50 ms timeout, so the same semaphore is waited on through the client
+ *     fast path AND queued in the wineserver's own select at the same time by
+ *     different threads, continuously.  The second handle is a semaphore that
+ *     is never released: a wakeup on it means a handle resolved to the wrong
+ *     object.
+ *   - a producer publishing bursts of 1..8 in ONE ReleaseSemaphore -- the
+ *     operation an event cannot express at all -- and checking the previous
+ *     count it reports, some of them through a handle freshly created by
+ *     DuplicateHandle and closed straight after.
+ *   - a churn thread creating and closing unrelated semaphores and events, so
+ *     server cells and client cache slots are recycled under everybody.
+ *
+ * Plus the three arithmetic facts the fast path now computes for itself:
+ * the previous-count return value, the max-count refusal (which must change
+ * nothing), and a count of zero (which is the request the client sends to make
+ * the server re-run its own wait queue, so it has to be a clean no-op). */
+
+#define SEM_WORKERS   6u
+#define SEM_MS     8000u        /* how long the semaphore job system runs   */
+#define SEM_MAX   65536u        /* comfortably above any burst backlog      */
+#define SEM_CHURN   200u        /* semaphores created/closed per churn pass */
+
+static HANDLE sm_ready;             /* the job semaphore                     */
+static HANDLE sm_idle;              /* never released; a wakeup here is a bug*/
+static volatile LONG sm_avail;      /* jobs published and not yet taken      */
+static volatile LONG sm_produced;
+static volatile LONG sm_consumed;
+static volatile LONG sm_stop;
+static volatile LONG sm_exited;
+static volatile LONG sm_churn_stop;
+
+static DWORD WINAPI sm_worker( LPVOID arg )
+{
+    unsigned int idx = (unsigned int)(LONG_PTR)arg, n = 0;
+
+    for (;;)
+    {
+        HANDLE two[2];
+        DWORD r;
+
+        if (InterlockedExchangeAdd( (LONG *)&sm_stop, 0 )) break;
+
+        switch ((idx + n++) & 3)
+        {
+        case 0:
+            r = WaitForSingleObject( sm_ready, INFINITE );
+            break;
+        case 1:
+            r = WaitForSingleObject( sm_ready, 1 );
+            break;
+        case 2:
+            r = WaitForSingleObject( sm_ready, 0 );
+            break;
+        default:
+            two[0] = sm_ready;
+            two[1] = sm_idle;
+            r = WaitForMultipleObjects( 2, two, FALSE, 50 );
+            if (r == WAIT_OBJECT_0 + 1) { fail( 65 ); goto out; }
+            break;
+        }
+
+        if (r != WAIT_OBJECT_0) continue;       /* timed out, holding nothing */
+
+        /* DRAINING.  The shutdown below mints tokens that have no job behind
+         * them, purely to let a worker out of an INFINITE wait, and it sets
+         * sm_stop strictly BEFORE the first of them exists -- so a worker
+         * holding one always sees the flag here.  Without this check the
+         * shutdown itself would trip the accounting assertion below, which is
+         * exactly what the POSIX host model of this file reported. */
+        if (InterlockedExchangeAdd( (LONG *)&sm_stop, 0 )) break;
+
+        /* We hold a real token.  There MUST be a job behind it: a semaphore does
+         * not have the auto-reset event's legal "leftover signal" case, so a
+         * negative result here is a token that was handed out twice or minted
+         * out of nothing. */
+        if (InterlockedDecrement( (LONG *)&sm_avail ) < 0)
+        {
+            InterlockedIncrement( (LONG *)&sm_avail );
+            fail( 65 );
+            goto out;
+        }
+        InterlockedIncrement( (LONG *)&sm_consumed );
+    }
+out:
+    InterlockedIncrement( (LONG *)&sm_exited );
+    return 0;
+}
+
+static DWORD WINAPI sm_churn_thread( LPVOID arg )
+{
+    while (!InterlockedExchangeAdd( (LONG *)&sm_churn_stop, 0 ))
+    {
+        unsigned int i;
+        for (i = 0; i < SEM_CHURN; i++)
+        {
+            HANDLE s = CreateSemaphoreA( NULL, (i & 1) ? 1 : 0, 4, NULL );
+            HANDLE e = CreateEventA( NULL, FALSE, FALSE, NULL );
+            if (!s || !e) return 1;
+            ReleaseSemaphore( s, 1, NULL );
+            WaitForSingleObject( s, 0 );
+            CloseHandle( s );
+            CloseHandle( e );
+        }
+        Sleep( 1 );
+    }
+    return 0;
+}
+
+/* The arithmetic the fast path now owns, asserted on a private semaphore so
+ * the numbers are exact and nothing else can move them. */
+static int sm_check_arithmetic(void)
+{
+    HANDLE s = CreateSemaphoreA( NULL, 0, 4, NULL );
+    LONG prev;
+
+    if (!s) return 50;
+
+    /* previous count, and the count is really there afterwards */
+    prev = -1;
+    if (!ReleaseSemaphore( s, 3, &prev ) || prev != 0)      goto bad;
+    prev = -1;
+    if (!ReleaseSemaphore( s, 1, &prev ) || prev != 3)      goto bad;
+
+    /* AT MAX: one more must be refused and must change NOTHING */
+    prev = -1;
+    if (ReleaseSemaphore( s, 1, &prev ))                    goto bad;
+    /* and a release larger than max is refused whatever the count */
+    if (ReleaseSemaphore( s, 5, NULL ))                     goto bad;
+
+    /* count == 0 is the client's "make the server re-run its queue" request:
+     * it must succeed, report the count and change nothing */
+    prev = -1;
+    if (!ReleaseSemaphore( s, 0, &prev ) || prev != 4)      goto bad;
+
+    /* exactly four tokens are there: four zero-timeout polls succeed, the
+     * fifth times out.  This is also the semaphore form of the read-only poll
+     * answer, which must never invent or consume a token it did not have. */
+    if (WaitForSingleObject( s, 0 ) != WAIT_OBJECT_0)       goto bad;
+    if (WaitForSingleObject( s, 0 ) != WAIT_OBJECT_0)       goto bad;
+    if (WaitForSingleObject( s, 0 ) != WAIT_OBJECT_0)       goto bad;
+    if (WaitForSingleObject( s, 0 ) != WAIT_OBJECT_0)       goto bad;
+    if (WaitForSingleObject( s, 0 ) != WAIT_TIMEOUT)        goto bad;
+
+    /* a timed wait on an empty semaphore must time out, and must not have
+     * taken a token it then dropped: one release, one wait, then empty again */
+    if (WaitForSingleObject( s, 10 ) != WAIT_TIMEOUT)       goto bad;
+    if (!ReleaseSemaphore( s, 1, NULL ))                    goto bad;
+    if (WaitForSingleObject( s, 100 ) != WAIT_OBJECT_0)     goto bad;
+    if (WaitForSingleObject( s, 0 ) != WAIT_TIMEOUT)        goto bad;
+
+    CloseHandle( s );
+    out_str( "MADEIRA-SYNC: semaphore prev-count, max refusal, count=0 and polls OK\n" );
+    return 0;
+bad:
+    CloseHandle( s );
+    return 66;
+}
+
+static int run_semaphore_jobs(void)
+{
+    HANDLE workers[SEM_WORKERS], churn;
+    DWORD id, t_end, deadline;
+    unsigned int i, round = 0, rc = 0;
+
+    if ((rc = sm_check_arithmetic())) return rc;
+
+    sm_avail = sm_produced = sm_consumed = 0;
+    sm_stop = sm_exited = sm_churn_stop = 0;
+
+    if (!(sm_ready = CreateSemaphoreA( NULL, 0, SEM_MAX, NULL ))) return 50;
+    if (!(sm_idle  = CreateSemaphoreA( NULL, 0, SEM_MAX, NULL ))) return 50;
+    if (!(churn = CreateThread( NULL, 0, sm_churn_thread, NULL, 0, &id ))) return 50;
+    for (i = 0; i < SEM_WORKERS; i++)
+        if (!(workers[i] = CreateThread( NULL, 0, sm_worker, (LPVOID)(LONG_PTR)i, 0, &id )))
+            return 50;
+
+    t_end = GetTickCount() + SEM_MS;
+    while ((int)(t_end - GetTickCount()) > 0)
+    {
+        unsigned int burst = 1 + (round & 7), k;
+        LONG prev = -1;
+
+        /* publish the whole burst BEFORE the tokens */
+        for (k = 0; k < burst; k++)
+        {
+            InterlockedIncrement( (LONG *)&sm_avail );
+            InterlockedIncrement( (LONG *)&sm_produced );
+        }
+
+        if ((round & 15) == 0)
+        {
+            /* a SECOND live handle to the same semaphore, used once and closed */
+            HANDLE dup = NULL;
+            if (DuplicateHandle( GetCurrentProcess(), sm_ready, GetCurrentProcess(),
+                                 &dup, 0, FALSE, DUPLICATE_SAME_ACCESS ) && dup)
+            {
+                if (!ReleaseSemaphore( dup, burst, &prev )) { rc = 65; CloseHandle( dup ); goto stop; }
+                CloseHandle( dup );
+            }
+            else if (!ReleaseSemaphore( sm_ready, burst, &prev )) { rc = 65; goto stop; }
+        }
+        else if (!ReleaseSemaphore( sm_ready, burst, &prev )) { rc = 65; goto stop; }
+
+        /* the previous count can be anything the workers have not drained yet,
+         * but it can never be negative nor past the maximum */
+        if (prev < 0 || (DWORD)prev > SEM_MAX - burst) { rc = 65; goto stop; }
+
+        deadline = GetTickCount() + JOB_DRAIN_MS;
+        for (;;)
+        {
+            LONG done = InterlockedExchangeAdd( (LONG *)&sm_consumed, 0 );
+            LONG made = InterlockedExchangeAdd( (LONG *)&sm_produced, 0 );
+
+            if (failure) { rc = failure; goto stop; }
+            if (done == made) break;
+            if ((int)(deadline - GetTickCount()) <= 0)
+            {
+                line_2( "MADEIRA-SYNC: semaphore job system stalled, consumed=",
+                        (unsigned int)done, " produced=", (unsigned int)made, "" );
+                rc = 65;
+                goto stop;
+            }
+            Sleep( 0 );
+        }
+        round++;
+    }
+
+stop:
+    InterlockedExchange( (LONG *)&sm_stop, 1 );
+    for (i = 0; i < 20000u && (DWORD)InterlockedExchangeAdd( (LONG *)&sm_exited, 0 ) < SEM_WORKERS; i++)
+    {
+        ReleaseSemaphore( sm_ready, 1, NULL );
+        Sleep( 1 );
+    }
+    for (i = 0; i < SEM_WORKERS; i++)
+    {
+        WaitForSingleObject( workers[i], WATCHDOG_MS );
+        CloseHandle( workers[i] );
+    }
+    InterlockedExchange( (LONG *)&sm_churn_stop, 1 );
+    WaitForSingleObject( churn, WATCHDOG_MS );
+    CloseHandle( churn );
+    CloseHandle( sm_ready );
+    CloseHandle( sm_idle );
+
+    if (rc) return rc;
+    if (failure) return failure;
+    /* sm_avail may be non-zero only by the drain tokens we minted above, which
+     * are released AFTER sm_stop and are never counted as produced; every job
+     * that WAS produced must have been consumed exactly once. */
+    if (sm_consumed != sm_produced)
+    {
+        line_2( "MADEIRA-SYNC: semaphore job system consumed=", (unsigned int)sm_consumed,
+                " produced=", (unsigned int)sm_produced, "" );
+        return 65;
+    }
+    line_2( "MADEIRA-SYNC: semaphore job system ", (unsigned int)sm_produced,
+            " jobs over ", round, " bursts, each consumed exactly once OK" );
+    line_1( "MADEIRA-SYNC:   workers=", SEM_WORKERS,
+            ", every wakeup had a job behind it OK" );
+    return 0;
+}
+
 /* --------------------------------------------------------------- driver */
 
 static int run_all(void)
@@ -1103,6 +1399,7 @@ static int run_all(void)
     if ((rc = run_late_set())) return rc;
     if ((rc = run_node_handshake())) return rc;
     if ((rc = run_job_system())) return rc;
+    if ((rc = run_semaphore_jobs())) return rc;
 
     out_str( "MADEIRA-SYNC: all checks passed\n" );
     return 46;

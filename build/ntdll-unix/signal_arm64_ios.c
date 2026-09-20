@@ -6340,12 +6340,24 @@ NTSTATUS signal_set_full_context( CONTEXT *context )
         if (!is_ec_code( context->Pc ) && !in_pool &&
             !ios_ctx_sp_ok( (ULONG_PTR)context->Sp, 0, 0, 0 ))
         {
-            if (ios_ctx_take_line())
-                ERR_(seh)( "[ctx] continue REFUSED: Sp/Rsp=%p is not a usable stack "
+            /* iOS-Madeira ml630 (#79): THIS REFUSAL NEEDS ITS OWN BUDGET.
+             *
+             * It used to draw on ios_ctx_log_budget, the same 16 lines the emulator-register
+             * rescue below spends during process start. So by the time anything interesting
+             * happened this - a refusal that makes NtContinue RETURN, which makes
+             * dispatch_exception re-raise the same record forever - printed nothing at all.
+             * An x86-64 session that dispatched one access violation 2,085 times showed zero
+             * "continue REFUSED" lines, and that zero meant "out of budget", not "did not
+             * happen". Refusing a continue is rare and always load-bearing: give it a
+             * dedicated sampled counter so it is never silenced by startup noise. */
+            static int refuse_n;
+            int rn = ++refuse_n;
+            if (rn <= 32 || !(rn & (rn - 1)))
+                ERR_(seh)( "[ctx] continue REFUSED #%d: Sp/Rsp=%p is not a usable stack "
                            "(Pc/Rip=%p is neither EC code nor a pool address, so this "
                            "resume would bounce through KiUserEmulationDispatcher and "
                            "carve its frame out of Sp). caller=%p lr=%p flags=%08x\n",
-                           (void *)context->Sp, (void *)context->Pc, (void *)frame->pc,
+                           rn, (void *)context->Sp, (void *)context->Pc, (void *)frame->pc,
                            (void *)frame->lr, (unsigned int)context->ContextFlags );
             return STATUS_INVALID_PARAMETER;
         }

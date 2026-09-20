@@ -95,6 +95,16 @@ final class FullscreenState: ObservableObject {
                 TouchControlsModel.shared.editing = false
                 TouchControlsModel.shared.selected = nil
             }
+            // ml — see ControlOverlayView.dropRegions' doc comment: each
+            // mode has its own region-id namespace ("portrait." for the key
+            // row, "ctl." for fullscreen's user-placed controls). Drop
+            // whichever does NOT belong to the mode just entered, so a
+            // region whose owning view's `.onDisappear` lost the race can
+            // never keep claiming screen space — and therefore stealing
+            // touches from the live view — in the mode that follows it.
+            ControlOverlayView.shared.dropRegions(unless: { id in
+                active ? id.hasPrefix("ctl.") : id.hasPrefix("portrait.")
+            })
         }
     }
     private init() {}
@@ -855,7 +865,14 @@ final class MetalBackedView: UIView {
     // winios.drv. Off-surface touches (Fill's cropped margin) clamp to the
     // nearest edge.
     private func mapTouch(_ touch: UITouch) -> (Int32, Int32) {
-        let p = touch.location(in: self)
+        mapPoint(touch.location(in: self))
+    }
+
+    /// Same mapping as `mapTouch`, for a point that is not necessarily a
+    /// live `UITouch`'s current location — the midpoint of several fingers
+    /// (Task 2's 2/3-finger taps), or a touch's ORIGINAL down point read
+    /// after the touch itself has already ended.
+    private func mapPoint(_ p: CGPoint) -> (Int32, Int32) {
         let guest = guestSize()
         let g = GameSurfaceLayout.map(point: p, guest: guest, aspect: drawableAspect(),
                                       bounds: bounds, mode: effectiveDisplayMode())
@@ -895,6 +912,11 @@ final class MetalBackedView: UIView {
 
     private let F_MOVE: UInt32 = 0x1, F_LDOWN: UInt32 = 0x2, F_LUP: UInt32 = 0x4
     private let F_RDOWN: UInt32 = 0x8, F_RUP: UInt32 = 0x10
+    // ml — Task 2 ("Touch" pointer mode): middle button, for a 3-finger tap.
+    // Matches Winios.m's MOUSEEVENTF_MIDDLEDOWN/UP (0x0020/0x0040) exactly —
+    // the same flag values `InputGuard.postButton` already sends for a
+    // Bluetooth mouse's middle button, so no driver-side change is involved.
+    private let F_MDOWN: UInt32 = 0x20, F_MUP: UInt32 = 0x40
     private let F_WHEEL: UInt32 = 0x800, F_ABS: UInt32 = 0x8000
 
     private var desktopMode: Bool {
@@ -1035,6 +1057,215 @@ final class MetalBackedView: UIView {
         return touches.first { $0 === owned }
     }
 
+    // ========================================================================
+    // Task 2 — "Touch" pointer mode: tap-to-click, tap-and-hold-to-drag, and
+    // 2/3-finger taps for right/middle click.
+    //
+    // A separate, independent state machine from the Absolute/Relative
+    // `gameTouch` single-owner path above: disambiguating a 1/2/3-finger TAP
+    // needs to see every finger of a gesture, not just the first one claimed,
+    // so it keeps its own small per-gesture ledger rather than reusing it.
+    //
+    //   1 finger, released quickly & without moving -> left click AT the tap.
+    //   1 finger held >= ~250ms OR moved before release -> left button DOWN
+    //       at the ORIGINAL down point (never the moved-to point — a hold
+    //       must not itself feel like a jump), follows the finger while it
+    //       is down, UP on lift.
+    //   2 fingers that both lift without moving -> right click at their
+    //       midpoint. 3 fingers -> middle click, same way.
+    //   A finger moving past a small slop CANCELS a 2/3-finger tap outright
+    //   (no click posted at all — ambiguous is safer as a no-op than as a
+    //   guess), except a 2-finger drag optionally scrolls the wheel.
+    // ========================================================================
+    private var tmDownPoints: [ObjectIdentifier: CGPoint] = [:]
+    private var tmGestureDownPoint = CGPoint.zero
+    private var tmPeak = 0                  // most fingers seen down at once this gesture
+    private var tmResolved = false          // true once a left DOWN has been posted (hold/drag)
+    private var tmDragTouch: UITouch?
+    private var tmSlopBroken = false
+    private var tmGeneration = 0            // invalidates a stale hold timer
+    private var tmTwoFingerLastY: CGFloat = 0
+    private var tmScrollAccum: CGFloat = 0
+
+    private static let tmHoldDelay: TimeInterval = 0.25
+    private static let tmSlop: CGFloat = 10
+
+    private var touchPointerMode: Bool { !desktopMode && InputSettings.shared.touchMode }
+
+    private func tmResetGesture() {
+        tmDownPoints.removeAll()
+        tmGestureDownPoint = .zero
+        tmPeak = 0
+        tmResolved = false
+        tmDragTouch = nil
+        tmSlopBroken = false
+        tmGeneration += 1
+        tmTwoFingerLastY = 0
+        tmScrollAccum = 0
+    }
+
+    /// Midpoint of every finger seen this gesture, read from their DOWN
+    /// points — for a tap that never broke slop (the only kind that reaches
+    /// here) that is within `tmSlop` of each finger's actual lift point, and
+    /// avoids needing a second ledger of "last known position" just for
+    /// fingers that have already ended by the time this runs.
+    private func tmMidpoint() -> CGPoint {
+        guard !tmDownPoints.isEmpty else { return tmGestureDownPoint }
+        let pts = Array(tmDownPoints.values)
+        let n = CGFloat(pts.count)
+        return CGPoint(x: pts.reduce(0) { $0 + $1.x } / n,
+                       y: pts.reduce(0) { $0 + $1.y } / n)
+    }
+
+    private func tmCommitDrag(_ t: UITouch) {
+        guard !tmResolved else { return }
+        tmResolved = true
+        tmDragTouch = t
+        let (x, y) = mapPoint(tmGestureDownPoint)
+        winios_post_touch_down(x, y)
+    }
+
+    private func postClickLeft(at p: CGPoint) {
+        let (x, y) = mapPoint(p)
+        winios_post_touch_down(x, y)
+        winios_post_touch_up(x, y)
+    }
+
+    /// Right/middle click at an absolute guest position. `winios_post_
+    /// touch_down/up` are left-button-only by construction (their C bodies
+    /// hardcode MOUSEEVENTF_LEFTDOWN/UP), so right/middle reuse
+    /// `winios_pointer` directly — the SAME primitive `InputGuard.
+    /// postButton` already calls for a Bluetooth mouse's right/middle
+    /// buttons — with MOUSEEVENTF_ABSOLUTE added so the click lands at a
+    /// specific point instead of wherever InputGuard's own (unrelated)
+    /// desktop-mode cursor last was. No driver change: Winios.m's
+    /// `winios_q_push_ev` already understands RIGHTDOWN/RIGHTUP/
+    /// MIDDLEDOWN/MIDDLEUP, and `winios_pointer` already calls
+    /// `winios_cursor_move` for any ABSOLUTE-flagged post (Winios.m:1867),
+    /// so the drawn cursor follows exactly like a left click does.
+    private func postAbsoluteClick(down: UInt32, up: UInt32, at p: CGPoint) {
+        let (x, y) = mapPoint(p)
+        winios_pointer(x, y, down | F_ABS, 0)
+        winios_pointer(x, y, up | F_ABS, 0)
+    }
+
+    private func touchModeBegan(_ touches: Set<UITouch>) {
+        guard !tmResolved else { return }   // a finger joining mid-drag changes nothing
+        for t in touches where tmDownPoints[ObjectIdentifier(t)] == nil {
+            tmDownPoints[ObjectIdentifier(t)] = t.location(in: self)
+        }
+        tmPeak = max(tmPeak, tmDownPoints.count)
+
+        if tmDownPoints.count == 1, let t = touches.first {
+            tmGestureDownPoint = t.location(in: self)
+            // Instant visual feedback — "a single tap moves the cursor
+            // there" — before we know whether this becomes a tap, a hold, or
+            // (if a second finger joins) a right/middle click. Purely the
+            // drawn arrow: no protocol event is posted yet, so a multi-
+            // finger tap that follows produces no stray click or jump.
+            let (x, y) = mapPoint(tmGestureDownPoint)
+            winios_cursor_move(x, y)
+            tmGeneration += 1
+            let gen = tmGeneration
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.tmHoldDelay) { [weak self, weak t] in
+                guard let self, let t, self.tmGeneration == gen, !self.tmResolved,
+                      self.tmDownPoints.count == 1 else { return }
+                self.tmCommitDrag(t)
+            }
+        } else {
+            // A second/third finger joined before the first resolved: only a
+            // multi-finger TAP is possible now — invalidate the hold timer so
+            // it can never fire a left click/drag out from under that.
+            tmGeneration += 1
+        }
+    }
+
+    private func touchModeMoved(_ touches: Set<UITouch>, _ event: UIEvent?) {
+        let active = activeTouches(event)
+
+        // Two-finger drag: scroll (optional per spec, cheap to add — reuses
+        // the exact notch math as the desktop trackpad's two-finger scroll
+        // below). Computed once per event from the current pair, never per
+        // touch: both fingers can appear in the same `touches` set and must
+        // not double-count one drag.
+        if !tmResolved, tmDownPoints.count == 2, active.count == 2 {
+            let avg = avgPoint(active)
+            if tmTwoFingerLastY == 0 { tmTwoFingerLastY = avg.y }
+            let dy = avg.y - tmTwoFingerLastY
+            if abs(dy) > 2 { tmSlopBroken = true }
+            tmTwoFingerLastY = avg.y
+            tmScrollAccum += dy
+            let (mx, my) = mapPoint(avg)
+            while tmScrollAccum <= -14 { tmScrollAccum += 14
+                winios_pointer(mx, my, F_WHEEL, UInt32(bitPattern: Int32(-120))) }
+            while tmScrollAccum >= 14  { tmScrollAccum -= 14
+                winios_pointer(mx, my, F_WHEEL, UInt32(bitPattern: Int32(120))) }
+            return
+        }
+
+        for t in touches {
+            guard let down = tmDownPoints[ObjectIdentifier(t)] else { continue }
+            let p = t.location(in: self)
+
+            if tmResolved {
+                guard t === tmDragTouch else { continue }   // only the drag's own finger moves it
+                let (x, y) = mapPoint(p)
+                winios_post_touch_move(x, y)
+                continue
+            }
+            guard tmDownPoints.count == 1 else {
+                // 3+ fingers (or a pair we are not scrolling): movement just
+                // cancels the tap — no gesture is defined for it.
+                if hypot(p.x - down.x, p.y - down.y) > Self.tmSlop { tmSlopBroken = true }
+                continue
+            }
+            if hypot(p.x - down.x, p.y - down.y) > Self.tmSlop {
+                tmSlopBroken = true
+                tmCommitDrag(t)                  // LDOWN at the ORIGINAL down point
+                let (x, y) = mapPoint(p)
+                winios_post_touch_move(x, y)      // then the move that broke slop
+            }
+        }
+    }
+
+    private func touchModeEnded(_ touches: Set<UITouch>, _ event: UIEvent?) {
+        if tmResolved, let d = tmDragTouch, touches.contains(d) {
+            let (x, y) = mapPoint(d.location(in: self))
+            winios_post_touch_up(x, y)
+            tmResetGesture()
+            return
+        }
+        guard !tmResolved else { return }   // some OTHER (ignored) finger lifted mid-drag
+        guard activeTouches(event).isEmpty else { return }   // wait for every finger up
+
+        let peak = tmPeak
+        let mid = tmMidpoint()
+        let brokeSlop = tmSlopBroken
+        tmResetGesture()
+        guard !brokeSlop else { return }   // a moved finger cancels the tap outright
+
+        switch peak {
+        case 1: postClickLeft(at: mid)
+        case 2: postAbsoluteClick(down: F_RDOWN, up: F_RUP, at: mid)
+        case 3: postAbsoluteClick(down: F_MDOWN, up: F_MUP, at: mid)
+        default: break   // 4+ fingers: no gesture defined, no click.
+        }
+    }
+
+    private func touchModeCancelled(_ touches: Set<UITouch>) {
+        if tmResolved, let d = tmDragTouch, touches.contains(d) {
+            // Release whatever button is down rather than leave it stuck —
+            // the same reasoning ml661 applies to held keys.
+            let (x, y) = mapPoint(d.location(in: self))
+            winios_post_touch_up(x, y)
+            tmResetGesture()
+            return
+        }
+        // A cancel mid-tap is a stronger signal than a slop break: drop the
+        // whole gesture, never guess a click out of it.
+        if !tmResolved { tmResetGesture() }
+    }
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         if pointerButtons(touches, with: event, ending: false) { return }   // ml664
         // ========================================================================
@@ -1055,6 +1286,13 @@ final class MetalBackedView: UIView {
         // ========================================================================
         if HardwareInput.shared.shouldIgnore(touches, logging: true) { return }
         guard desktopMode else {
+            // Task 2 — "Touch" pointer mode has its own multi-finger state
+            // machine (tap/hold/2-3-finger tap), independent of the single-
+            // owner `gameTouch` path below.
+            if touchPointerMode {
+                touchModeBegan(touches)
+                return
+            }
             // ml666: one owner. A live claim is only replaced when its touch is
             // gone (UIKit deallocated it, or it already ended) — never by a
             // second finger arriving.
@@ -1126,6 +1364,10 @@ final class MetalBackedView: UIView {
         // camera a second time on top of the GCMouse deltas already doing it.
         if HardwareInput.shared.shouldIgnore(touches, logging: false) { return }
         guard desktopMode else {
+            if touchPointerMode {
+                touchModeMoved(touches, event)
+                return
+            }
             guard let t = ownedTouch(touches) else { return }   // ml666
             if gameRelative {
                 let p = t.location(in: self)
@@ -1205,6 +1447,10 @@ final class MetalBackedView: UIView {
         if pointerButtons(touches, with: event, ending: true) { return }    // ml664
         if HardwareInput.shared.shouldIgnore(touches, logging: false) { return }  // ml665
         guard desktopMode else {
+            if touchPointerMode {
+                touchModeEnded(touches, event)
+                return
+            }
             guard let t = ownedTouch(touches) else { return }   // ml666
             gameTouch = nil
             if gameRelative {
@@ -1266,6 +1512,10 @@ final class MetalBackedView: UIView {
         }
         if HardwareInput.shared.shouldIgnore(touches, logging: false) { return }  // ml665
         guard desktopMode else {
+            if touchPointerMode {
+                touchModeCancelled(touches)
+                return
+            }
             guard let t = ownedTouch(touches) else { return }   // ml666
             gameTouch = nil
             if gameRelative {
@@ -2358,6 +2608,42 @@ final class ControlOverlayView: UIView {
         publishPadPresence()
     }
 
+    /// ml — BELT AND SUSPENDERS against a region surviving the mode it
+    /// belongs to (Task 1, fullscreen-cursor investigation).
+    ///
+    /// `unregister` above is owner-checked and depends on the outgoing
+    /// SwiftUI view's `.onDisappear` actually firing before the incoming
+    /// mode's first touch. Every registered region is a live claim on screen
+    /// space — `region(at:)`, and therefore `ControlsWindow.hitTest`, treats
+    /// ANY registered region as "this point belongs to a control, not the
+    /// live view" — so a region that outlives its view keeps claiming its
+    /// OLD position after the layout that put it there is gone. The
+    /// portrait/wide-normal key row's ids ("portrait.*") and fullscreen's
+    /// user-placed controls ("ctl.*") occupy completely different screen
+    /// positions in completely different bodies, so a leftover one can end
+    /// up sitting in the middle of the live view in the mode that follows
+    /// it — exactly the shape of "taps/drags on the game area do nothing"
+    /// with no visible control to blame, because the stale region draws
+    /// nothing; it only steals hit-testing.
+    ///
+    /// Called from `FullscreenState.active`'s didSet on every transition.
+    /// A no-op whenever `.onDisappear` already did its job — the common
+    /// case — so this costs nothing beyond a dictionary walk; it exists
+    /// purely to make a lost teardown self-healing instead of sticky for
+    /// the rest of the session.
+    func dropRegions(unless keep: (String) -> Bool) {
+        for id in Array(order) where !keep(id) {
+            for k in Array(tracked.keys) where tracked[k]?.region == id {
+                finish(key: k, why: "mode-switch-stale")
+            }
+            regions[id] = nil
+            owners[id] = nil
+            order.removeAll { $0 == id }
+            OnScreenPad.shared.clear(id)
+        }
+        publishPadPresence()
+    }
+
     /// ml — one line per (re)registration, capped: a rotation or pointer-
     /// panel toggle re-registers every control at once, and an uncapped log
     /// would flood the device log exactly when it is most useful (right
@@ -3273,6 +3559,16 @@ final class InputSettings: ObservableObject {
     static let shared = InputSettings()
 
     @Published var relative: Bool  = false { didSet { save() } }
+    /// ml — Task 2: the third pointer mode, "Touch" — tap-to-click plus a
+    /// tap-and-hold drag, positions mapped exactly like Absolute (see
+    /// `MetalBackedView.gameRelative`/`touchPointerMode` for how this and
+    /// `relative` combine: mutually exclusive by convention, `touchMode`
+    /// checked first). A separate flag rather than widening `relative` into
+    /// an enum: every existing `InputSettings.shared.relative` read stays
+    /// correct unchanged, and `pointerModeToggle` (ContentView) is the one
+    /// place that keeps the two in the "at most one true" relationship a
+    /// three-way UI control implies.
+    @Published var touchMode: Bool = false { didSet { save() } }
     @Published var sensAbs:  Double = 2.0  { didSet { save() } }
     @Published var sensRel:  Double = 2.0  { didSet { save() } }
     /// ml663 — HARDWARE mouse gain, and a third slider rather than a reuse of
@@ -3335,6 +3631,7 @@ final class InputSettings: ObservableObject {
         if let d = try? Data(contentsOf: Self.url),
            let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] {
             relative = j["relative"] as? Bool   ?? false
+            touchMode = j["touchMode"] as? Bool ?? false
             sensAbs  = j["sensAbs"]  as? Double ?? 2.0
             sensRel  = j["sensRel"]  as? Double ?? 2.0
             sensMouse = j["sensMouse"] as? Double ?? 1.0
@@ -3357,7 +3654,8 @@ final class InputSettings: ObservableObject {
 
     private func save() {
         guard !loading else { return }
-        var j: [String: Any] = ["relative": relative, "sensAbs": sensAbs, "sensRel": sensRel,
+        var j: [String: Any] = ["relative": relative, "touchMode": touchMode,
+                                "sensAbs": sensAbs, "sensRel": sensRel,
                                 "sensMouse": sensMouse, "diagnostics": diagnostics,
                                 "ignoreTouchesWithMouse": ignoreTouchesWithMouse,
                                 "padRightStickMouse": padRightStickMouse,
@@ -3811,7 +4109,19 @@ struct ContentView: View {
                 HStack(spacing: 6) {
                     pointerToggleButton
                     pointerModeToggle
-                    pointerSensSlider
+                    // ml — Task 2: Touch mode maps positions 1:1 through the
+                    // same game-rect mapping as Absolute (MetalBackedView.
+                    // mapPoint) — no sensitivity scaling applies, so there is
+                    // nothing for this slider to edit while it is selected.
+                    if !input.touchMode {
+                        pointerSensSlider
+                    } else {
+                        Text("Tap to click, hold to drag, two/three fingers "
+                             + "for right/middle click.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
@@ -4103,15 +4413,29 @@ struct ContentView: View {
         .accessibilityLabel("Enter fullscreen")
     }
 
+    /// Cycles Absolute -> Relative -> Touch -> Absolute. `relative` and
+    /// `touchMode` are kept mutually exclusive here — this button is the one
+    /// place that has to enforce that, since a three-way UI control implies
+    /// "at most one true" but the two flags are independent `@Published`
+    /// vars (see `InputSettings.touchMode`'s doc comment for why it is a
+    /// separate flag rather than widening `relative` into an enum).
     private var pointerModeToggle: some View {
         Button {
-            input.relative.toggle()
+            if input.touchMode {
+                input.touchMode = false            // Touch -> Absolute
+            } else if input.relative {
+                input.relative = false              // Relative -> Touch
+                input.touchMode = true
+            } else {
+                input.relative = true               // Absolute -> Relative
+            }
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
         } label: {
-            Text(input.relative ? "Relative" : "Absolute")
+            Text(input.touchMode ? "Touch" : (input.relative ? "Relative" : "Absolute"))
                 .font(.system(size: 13, weight: .semibold))
                 .frame(minWidth: 82, minHeight: 32)
-                .background((input.relative ? Color.accentColor : Color.secondary).opacity(0.28))
+                .background((input.touchMode || input.relative
+                             ? Color.accentColor : Color.secondary).opacity(0.28))
                 .cornerRadius(6)
         }
         .transition(.opacity)
@@ -6121,21 +6445,27 @@ final class TouchControlsModel: ObservableObject {
     /// SwiftUI would put a gesture recogniser back under the thumb. What is
     /// left is the chrome that is genuinely a tap on a button: the top bar.
     func hitsInteractive(_ p: CGPoint, in bounds: CGRect) -> Bool {
-        guard hudClusterRect != .zero else {
-            // Fallback for the first frame or two, before topBar's
-            // GeometryReader has published a real frame: the original
-            // fixed top-center guess (two 44pt buttons 10pt apart, centred,
-            // 10pt down). Padded generously; a few points of slop costs
-            // nothing and a missed tap costs a build.
-            let barW: CGFloat = 2 * 44 + 10
-            return CGRect(x: bounds.midX - barW / 2 - 10, y: 0,
-                          width: barW + 20, height: 68).contains(p)
-        }
-        // The cluster can now be dragged anywhere in the safe area and its
+        // ml — Task 1 (fullscreen cursor investigation): USED TO fall back to
+        // a guessed top-center rectangle here, before topBar's GeometryReader
+        // had published a real measurement. A guess can be WRONG for a given
+        // device/orientation/dragged-cluster position, and being wrong here
+        // means claiming screen space that is not actually the HUD — which
+        // silently steals that area from the live view for as long as the
+        // guess stays in effect. The rule this function exists to enforce is
+        // the other way round: when we do not POSITIVELY know a point is
+        // under a control, the live view wins. `hudClusterRect` is published
+        // on the very first render (topBar always renders while fullscreen
+        // is active, and publishes unconditionally), so the window this
+        // trades away is at most the first frame or two right after
+        // entering fullscreen — a possibly-ignored HUD tap, never a
+        // possibly-swallowed game-area touch.
+        guard hudClusterRect != .zero else { return false }
+        // The cluster can be dragged anywhere in the safe area and its
         // button count varies (mouse-lock, "+" in edit mode), so hit-test the
-        // MEASURED frame instead of a fixed guess — generously padded, same
-        // reasoning as above.
-        return hudClusterRect.insetBy(dx: -14, dy: -14).contains(p)
+        // MEASURED frame instead of a fixed guess — padded enough to keep
+        // 44pt buttons reachable without ballooning into a blob that reads
+        // as "empty space" to the user.
+        return hudClusterRect.insetBy(dx: -8, dy: -8).contains(p)
     }
 }
 
@@ -6187,6 +6517,22 @@ func controlOverlayWindowBounds(in scene: UIWindowScene) -> CGRect {
 /// lands on the hosting root view means empty space, and empty space belongs to
 /// the game underneath — mouse-look must keep working between the buttons.
 final class ControlsWindow: UIWindow {
+    /// ml — Task 1: one capped log line whenever this window consumes a
+    /// fullscreen touch instead of letting it fall through to the live view.
+    /// A device report of "the cursor does nothing in fullscreen" is
+    /// otherwise indistinguishable from "the touch reached MetalBackedView
+    /// and was mishandled there" — this line says definitively that the
+    /// touch never left THIS window, and why. Capped at 40 for the same
+    /// reason `ControlOverlayView.logRegistration` is: useful right after
+    /// the report reproduces, useless as an unbounded flood.
+    private static var refusedLogged = 0
+    private static func logRefusal(_ reason: String, _ p: CGPoint) {
+        guard refusedLogged < 40 else { return }
+        refusedLogged += 1
+        fputs(String(format: "[controls] ml refused game-area touch at (%.0f,%.0f) reason=%@\n",
+                     p.x, p.y, reason), stderr)
+    }
+
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         let m = TouchControlsModel.shared
         // ml662: the UIKit touch layer gets first refusal in EVERY body — the
@@ -6227,8 +6573,12 @@ final class ControlsWindow: UIWindow {
         // Edit mode owns the whole (fullscreen) screen: drags and the scale
         // pinch must not leak through and swing the camera while you are
         // arranging buttons.
-        if m.editing { return super.hitTest(point, with: event) }
+        if m.editing {
+            Self.logRefusal("editing", point)
+            return super.hitTest(point, with: event)
+        }
         guard m.hitsInteractive(point, in: bounds) else { return nil }
+        Self.logRefusal("hud-cluster", point)
         return super.hitTest(point, with: event)
     }
 }

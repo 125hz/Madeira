@@ -184,6 +184,63 @@
  * The client half is what NtSetEvent/NtResetEvent/NtWaitForSingleObject route
  * through; the server half is unconditional above "off".
  *
+ * ml1010: SEMAPHORES USE THE SAME CELL, WITH THE COUNT IN THE STATE HALF
+ * ---------------------------------------------------------------------
+ * The measurement that motivated this: a title whose job system is driven by
+ * semaphores spent `release_semaphore=76091 select=308752 per 10 s` and ~60 %
+ * of ALL CPU in wineserver pipe I/O, with fastsync armed but inert because it
+ * only knew events.  The shape is identical to the event handshake -- a
+ * producer hands a token to one of N worker threads inside ONE Mach task --
+ * so it gets the identical mechanism, not an approximation of it.
+ *
+ *   cell->kind   MADEIRA_CELL_KIND_SEM
+ *   state half   the CURRENT COUNT, 0..max, as a non-negative int.
+ *                MADEIRA_CELL_RESET (0) is "empty", which is also the futex
+ *                sleep value, exactly as for an event.
+ *                MADEIRA_CELL_DISABLED (-1) is the same one-way exit.
+ *                MADEIRA_CELL_SET/_CLAIMED have NO meaning here: 1 and 2 are
+ *                counts.  Every reader therefore branches on `kind' FIRST.
+ *   cell->smax   the maximum, which is immutable for the life of the object
+ *                and so needs no atomicity: it is written before the store of
+ *                `sg' that publishes the cell and read only after a load of
+ *                `sg' that matched the caller's generation.
+ *
+ * max <= 0x7fffffff (create_semaphore rejects more), so count + n can be
+ * checked for overflow entirely inside the signed 32-bit state half.
+ *
+ * WHAT MAKES THE ACCOUNTING EXACT.  Every token transfer is a CAS on the ONE
+ * packed word: a release CASes count -> count+n, a consumer CASes count ->
+ * count-1, and both carry the generation.  So the count is a linearizable
+ * counter, a consumer returns success only when its own CAS removed exactly
+ * one token, and a failed CAS retries rather than losing one.  A waiter that
+ * times out has by construction performed NO successful CAS, so it cannot be
+ * holding a token it then drops; a waiter that performed one returns SUCCESS
+ * immediately and can never report a timeout.
+ *
+ * THE MIXED-WAITER PROBLEM IS THE EVENT PROBLEM.  Both Dekker pairings are
+ * reused verbatim with `count > 0' in place of `state == SET':
+ *   client releaser:  CAS count+=n (seq_cst); load waiters (seq_cst) -> wake
+ *                     ...              ; load srv_waiters (seq_cst) -> tell
+ *                                        the server to re-run its own queue
+ *   client waiter:    waiters++   (seq_cst); load count (seq_cst)
+ *   server wait_on(): srv_waiters++(seq_cst); load count (seq_cst)  [signaled]
+ *
+ * and the "tell the server" request needs NO new opcode, because
+ * `release_semaphore' with count == 0 already IS "change nothing, then run
+ * wake_up( obj, 0 )", i.e. let every queued thread re-evaluate.  The server's
+ * semaphore_sync_signaled() then CAS-claims a token out of the same word, so
+ * a token a fast waiter already took simply makes that CAS fail and the queued
+ * thread stays queued: one release, one release, never two.
+ *
+ * WAKING n WAITERS.  os_sync_wake_by_address has no "wake exactly n", so a
+ * release of 1 wakes one and a release of n > 1 wakes ALL.  Over-waking is
+ * safe in the direction that matters: every woken waiter re-runs the CAS and
+ * re-parks if it loses, and the tokens it cannot take stay in the cell.
+ *
+ * MADEIRA_FASTSYNC_SEM=0 turns THIS path off and leaves events alone: the
+ * server then allocates no cell for a semaphore and the client never learns
+ * one, so semaphores behave exactly as they did before ml1010.
+ *
  * ml990 MOVES THE DEFAULT FROM "unset = cells only" TO "auto".  The two
  * reasons ml982 gave for not doing so are both gone: (1) the lost-wakeup
  * vector was the split gen/state pair, which the packing above makes
@@ -211,6 +268,13 @@
 #define MADEIRA_CELL_SET        1
 #define MADEIRA_CELL_CLAIMED    2
 
+/* ml1010: which object owns this cell.  EVENT is 0 so that a zero-initialised
+ * cell and every pre-ml1010 reading of the table mean exactly what they used
+ * to.  The value is immutable for the life of a generation, so a reader that
+ * has matched the generation has by construction read the right kind. */
+#define MADEIRA_CELL_KIND_EVENT 0
+#define MADEIRA_CELL_KIND_SEM   1
+
 /* ml990: the packed {gen, state} word.  `state' is stored as the low 32 bits
  * and read back SIGNED, so MADEIRA_CELL_DISABLED survives the round trip. */
 #define MADEIRA_SG(gen, state)  (((uint64_t)(unsigned int)(gen) << 32) | \
@@ -223,9 +287,21 @@ struct madeira_sync_cell
     uint64_t     sg;           /* ml990 PACKED {gen:63..32, state:31..0}         */
     int          srv_waiters;  /* server wait_queue entries on this object       */
     int          waiters;      /* client threads parked on the state half        */
-    unsigned int manual;       /* 1 = manual-reset (NotificationEvent)           */
-    unsigned int pad[3];       /* keep two cells per 64-byte line                */
+    unsigned int manual;       /* 1 = manual-reset (NotificationEvent), events   */
+    unsigned int kind;         /* ml1010 MADEIRA_CELL_KIND_*                     */
+    unsigned int smax;         /* ml1010 semaphore maximum count, immutable      */
+    unsigned int pad[1];       /* keep two cells per 64-byte line                */
 };
+
+/* The kind, read without synchronisation on purpose.  It is written once, by
+ * the server, BEFORE the store of `sg' that publishes the cell, and every
+ * operation that acts on it re-validates the generation in the same atomic
+ * that performs the operation -- so a kind read from a cell that has since
+ * changed hands can only ever lead to a CAS that fails. */
+static inline unsigned int madeira_cell_kind( const struct madeira_sync_cell *cell )
+{
+    return __atomic_load_n( &cell->kind, __ATOMIC_RELAXED );
+}
 
 /* The futex address: the STATE half of `sg'.  Both sides must use this and
  * only this, or a client parked by one could never be woken by the other. */
@@ -285,6 +361,18 @@ extern struct madeira_sync_cell madeira_sync_cells[MADEIRA_SYNC_CELLS];
  * (disable_cell copies the cell word into `signaled' and leaves it there), so
  * it is not a state modification in the sense EVENT_MODIFY_STATE guards. */
 #define MADEIRA_EVENT_OP_DISABLE   0x4d414449   /* 'MADI' */
+
+/* ml1010: the same self-heal for a SEMAPHORE, sent through the same `event_op'
+ * request because that request is the only one in the protocol with a spare
+ * opcode space and a `default: STATUS_INVALID_PARAMETER' arm.  It is answered
+ * before event_op's own get_event_obj(), because the handle it carries is a
+ * semaphore handle and would fail that object-type check.
+ *
+ * There is deliberately no semaphore analogue of MADEIRA_EVENT_OP_WAKE: the
+ * "wake your queue and change nothing" request for a semaphore already exists
+ * as `release_semaphore' with count == 0, which upstream implements as exactly
+ * that (no state change, then wake_up( obj, 0 ), and 0 means "no limit"). */
+#define MADEIRA_SEM_OP_DISABLE     0x4d414453   /* 'MADS' */
 
 /* ------------------------------------------------------------------------
  * The wake primitive, shared verbatim by both sides.
