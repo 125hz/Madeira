@@ -312,6 +312,50 @@ static void ios_merge_move(const char *src, const char *dst, int depth)
     rmdir( src );                       /* only succeeds once genuinely empty */
 }
 
+/* 2026-09-27 -- THE PER-USER AppData SKELETON, EVERY LAUNCH, FOR EVERY PROFILE.
+ *
+ * shell32 answers SHGetKnownFolderPath / SHGetFolderPath for a per-user folder
+ * only if the directory EXISTS (unless the caller passes KF_FLAG_CREATE or
+ * DONT_VERIFY, and engines generally do not). A managed-runtime engine asks for
+ * LocalAppDataLow to place its log and save data; when that fails it carries
+ * on with an EMPTY base path, then opens "<Company>\<Product>\output_log.txt"
+ * relative to the current directory, gets OBJECT_PATH_NOT_FOUND, hands the
+ * NULL stream to the CRT, and the CRT's invalid-parameter handler fast-fails
+ * the process (0xC0000409) before the first frame. The one-shot, marker-gated
+ * repair above only ever created the skeleton under ONE hard-coded profile
+ * name, once; a prefix whose live profile directory has another name (it is
+ * derived from the host account name) or that was created later never got it.
+ * mkdir -p is idempotent and costs nothing, so do it for every profile
+ * directory present, on every launch, and say what was found. */
+static void madeira_ensure_appdata(NSString *prefix)
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *users = [prefix stringByAppendingPathComponent:@"drive_c/users"];
+    NSArray<NSString *> *names = [fm contentsOfDirectoryAtPath:users error:nil];
+    NSMutableString *report = [NSMutableString string];
+
+    for (NSString *name in names)
+    {
+        BOOL isDir = NO;
+        NSString *home = [users stringByAppendingPathComponent:name];
+        if ([name hasPrefix:@"."] || [name caseInsensitiveCompare:@"Public"] == NSOrderedSame) continue;
+        if (![fm fileExistsAtPath:home isDirectory:&isDir] || !isDir) continue;
+
+        int made = 0;
+        for (NSString *leaf in @[ @"AppData/Roaming", @"AppData/Local", @"AppData/LocalLow",
+                                  @"AppData/Local/Temp" ])
+        {
+            NSString *path = [home stringByAppendingPathComponent:leaf];
+            if ([fm fileExistsAtPath:path]) continue;
+            if ([fm createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil])
+                made++;
+        }
+        [report appendFormat:@" %@(+%d)", name, made];
+    }
+    dprintf(STDERR_FILENO, "[profile] AppData skeleton ensured for:%s\n",
+            report.length ? report.UTF8String : " (no profile directories yet)");
+}
+
 static void madeira_repair_profile(NSString *prefix)
 {
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -507,6 +551,8 @@ void madeira_seed_prefix_if_needed(const char *prefix_path) {
         madeira_repair_profile( prefix );
         /* ml581: see madeira_undo_appdata_skeleton() above. */
         madeira_undo_appdata_skeleton( prefix );
+        /* 2026-09-27: every launch -- see madeira_ensure_appdata(). */
+        madeira_ensure_appdata( prefix );
         /* Fonts the user dropped into Documents/fonts. Must be in place before
          * the wineserver starts, so win32u's session-start scan of
          * C:\windows\fonts sees them. */

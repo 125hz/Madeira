@@ -8459,3 +8459,22 @@ guest-slots=… verdict=…`). Consequences:
   `[audio-route] why=…` lines in the next log name the cause if it persists
   (`outputVolume=0.00`, a non-Playback category, `active=0`, or an unexpected
   output port).
+
+- 2026-09-27 — **A 64-bit managed-runtime engine title fast-fails (0xC0000409)
+  before its first frame: its per-user data folder did not resolve.** Log t44:
+  all DLLs load, then `[file-wfail] status=0xc000003a … name=\??\C:\<game
+  dir>\<Company>\<Product>\output_log.txt` — a path RELATIVE to the current
+  directory, i.e. the engine's base path for LocalAppDataLow came back EMPTY —
+  and immediately `int 29` with code 5 (FAST_FAIL_INVALID_ARG) from the
+  engine's runtime: the NULL stream from the failed open went into the CRT,
+  whose invalid-parameter handler fast-fails. shell32 only answers a per-user
+  known folder whose directory exists (no KF_FLAG_CREATE from the caller). The
+  AppData skeleton was created once, marker-gated, under ONE hard-coded profile
+  name; the live profile directory is named after the host account.
+  `madeira_ensure_appdata()` (WineProcessBridge.m) now does `mkdir -p` of
+  AppData/{Roaming,Local,Local/Temp,LocalLow} for EVERY directory under
+  `drive_c/users` (except Public) on EVERY launch and logs `[profile] AppData
+  skeleton ensured for: name(+created) …`. UNVERIFIED on device. If the title
+  still fast-fails with the same relative path while `[profile]` shows the
+  folder present, the next suspect is the known-folder lookup itself in the
+  x86-64 shell32 (registry value for the LocalAppDataLow GUID / USERPROFILE).
