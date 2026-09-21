@@ -9001,3 +9001,646 @@ guest-slots=… verdict=…`). Consequences:
   `MADEIRA_FASTSYNC_SEM=0`); every one must end in
   `MADEIRA-EXIT: sync-x86.exe status=46`, and 65 or 66 name the exact
   semaphore property that broke.
+
+- 2026-09-30 — **The JIT pool did not run out of code-buffer space; it ran out
+  of BUDGET, and then a one-way size ratchet turned one refusal into the rest
+  of the session** (`build/ntdll-unix/virtual_ios.c` pool-tail allocator,
+  `FEX/FEXCore/Source/Interface/Core/CPUBackend.{h,cpp}`).
+
+  **WHAT THE LOG ACTUALLY SAYS.** The 32-bit run (`w50`) ends with
+  `[code-buffer] EXEC ALLOC FAILED even at 0x100000 — JIT pool exhausted` and a
+  deliberate fault at `0xdead`. Three numbers, read together, say the pool was
+  not full:
+  `[jit-pool] TAIL REFUSED … tail_resv=0xff04000 head_used=0x6c58000/0x20000000`
+  — the tail had reserved 255 MB, the head had used **108 MB of 512 MB**, and
+  **149 MB was free and unusable** because the tail's cap was the literal
+  midpoint `ios_jit_pool_size_global / 2` (`virtual_ios.c`, the old line 19041).
+  And recycling was never broken: the log carries **39 `tail REUSE` and as many
+  `tail FREE` events**, several per ten lines, against only 15 fresh carves for
+  53 code-buffer generations. The fatal allocation lost a RACE — at that instant
+  no carve happened to be free — it did not meet an exhausted pool.
+
+  **THE RATCHET, WHICH IS THE REAL DEFECT.** `CodeBufferManager::
+  StartLargerCodeBuffer()` computed the next size as
+  `min(Latest->AllocatedSize * 2, MAX_CODE_SIZE)` — from the size that was
+  GRANTED. On iOS a refused carve is not failed, it is DEGRADED: the
+  `CodeBuffer` ctor halves the request down (rev=ml364). So one refusal feeds
+  the halved value back into the ladder and the process walks **down** it and
+  can never climb back. `[gen] alloc#N` shows it exactly: #2..#15 are 32 MB,
+  then 16, 8, 4, 2 and from #31 onward the run alternates **1 MB/2 MB for
+  twenty-plus more generations** while 240 MB of 16–32 MB carves sit pinned.
+  A 1 MB buffer rotates ~32x more often than a 32 MB one, every rotation is a
+  `ClearCodeCache` that wipes every thread's L1/L2 (`real_compile +72960` in one
+  10 s window, `blocks` climbing 321 k to 411 k), and that rotation storm is
+  what eventually caught a moment with zero free carves.
+
+  **WHY ~11 GENERATIONS ARE LIVE AT ONCE, MEASURED.** In this FEX the active
+  code buffer is **shared by every thread** — one `CodeBufferManager::Latest`
+  plus a process-wide `LatestOffset` — and an old generation stays alive while
+  any thread's `CurrentCodeBuffer` still references it. `[gen] alloc#N …
+  prev_use_count=` reports **7..14** at every swap, i.e. 6..13 threads pinning
+  the outgoing generation, and the carve census at the first refusal is
+  `carves=11 live=240MB free=0MB`. So the tail must hold ~11 generations, not
+  ~2. At 32 MB that is 352 MB; at 16 MB it is 176 MB. The per-generation cap
+  is therefore a function of the tail budget, and is now computed as one.
+
+  **THE FIX, IN THREE PARTS.**
+  (1) *Budget, not midpoint* (`virtual_ios.c`, `ios_tail_budget()` /
+  `ios_tail_head_margin()` beside `ios_tail_carves`): the tail grows until it
+  would meet the head's monotonic high-water mark (`jit_pool_offset`) plus a
+  margin kept free for images not yet loaded — `pool - head_hw - margin`,
+  margin `MADEIRA_POOL_HEAD_MARGIN_MB` (default 96, never more than a quarter
+  of a small pool). Reading the opposing cursor is racy-but-monotonic, so a
+  stale read is conservative-late and can never un-refuse. On w50's shape that
+  is 308 MB instead of 256 MB.
+  (2) *Cap derived from the budget* (`ios_tail_gen_cap()`): the ml480 pair of
+  absolute constants (32 MB until an absolute 160 MB watermark, then 16 MB) was
+  tuned for an 896 MB pool and fires at 31 % of a 512 MB one. The cap is now
+  `pow2_floor(budget / 16)` clamped to [4 MB, 32 MB], halved once past three
+  quarters of the budget so late threads still get a real buffer.
+  `MADEIRA_FEX_CODEBUF_MAX_MB` overrides it; `MADEIRA_POOL_TAIL_HALF=1`
+  restores the exact pre-change midpoint cap AND the old 32/16 MB ladder.
+  (3) *The ladder only grows* (`CodeBufferManager::DesiredSize`): the next ask
+  is derived from the last ASK, not the last GRANT, so a degraded carve costs
+  exactly one generation and the following rotation asks for the cap again —
+  which the tail free-list can serve from the large carves already sitting
+  there. `MADEIRA_FEX_RECYCLE=0` restores the old "double the granted size".
+
+  **AND ONE RE-SCAN.** The free-list scan was factored into
+  `ios_tail_serve_freelist()` and is now run a SECOND time after the (already
+  rolled-back) budget refusal, logging `tail REUSE-LATE`. Carves are freed by
+  other threads continuously; a carve released between the first scan and the
+  refusal is the difference between a slower buffer and the `0xdead` fault.
+  It never returns a carve SMALLER than asked, because `FEXCore::Allocator::
+  VirtualAlloc` discards the returned `*size_ptr` and records the REQUESTED size
+  as `CodeBuffer::AllocatedSize` — a short grant would be a silent overrun.
+
+  **WHAT WAS NOT DONE, AND WHY.** Upstream's "clear the cache and reuse the
+  buffer from offset 0" is **not available here** and was not implemented. That
+  design belongs to an older FEX with one CodeBuffer per thread; this tree uses
+  the partially-persistent shared model, so resetting the active buffer's
+  cursor would overwrite blocks other threads are executing or are parked with a
+  host return address into. Nor can the ml460 pool-tail SWEEPER be ported to the
+  32-bit module as it stands: `IosSweepRegisterThread` is called only from
+  `FEX/Source/Windows/ARM64EC/Module.cpp:1998`, so `[gen-sweep]` prints **zero
+  lines** in a WOW64 run and no parked thread is ever remote-migrated — but the
+  obvious substitute for the ARM64EC `InSimulation` gate, `ControlBits::IN_JIT`
+  in `FEX/Source/Windows/WOW64/Module.cpp:161`, is CLEARED around every syscall
+  (`Context::UnlockJITContext` in `HandleSyscallImpl`) while the thread's host
+  return address is still inside the emitted block. Migrating on that flag
+  would free a buffer under a thread that is about to return into it — the
+  ml557/ml613 recycling race, reintroduced deliberately. A correct WOW64
+  sweeper needs a flag that means "no host return address into any code
+  buffer", and that flag does not exist yet. Finally, a retry-and-wait at the
+  allocation site is a DEADLOCK, not an option: everything that frees a code
+  buffer does so under `CodeBufferWriteMutex`, which the failing thread holds.
+  The `0xdead` fault therefore stays as the last resort; its message now names
+  the two conditions that must BOTH hold to reach it and the knobs that move
+  them.
+
+  **DIAGNOSTICS THAT WERE LYING.** `tail REUSE … free_left=%u` printed
+  `ios_tail_carve_n` — the TOTAL carve count — so every w50 line read
+  `free_left=15` while the free set was draining to zero; it now prints
+  free/total. The refusal census was once-only, so it fired at the first
+  refusal (11 carves, free=0) and then went silent for 42 more refusals and
+  four more carves — the log could not distinguish "budget spent" from "every
+  carve live at this instant", which need different fixes; it is sampled now
+  (first 2, then powers of two) and carries `budget=`, `resv=`, `head_hw=` and
+  `gen_cap=`. The refusal line itself was 43 identical 300-character dprintfs
+  in the window where the process was already dying; sampled, and it now
+  reports `free_carves=`. `[gen] alloc#N` stopped at 64 allocations and w50 made
+  53, so the one number that says whether the rotation rate is healthy was about
+  to vanish exactly when it mattered: the new **`[code-buffer] recycled #N …
+  asked=… got=… pinned=… degraded_total=…`** is sampled and never stops.
+  `asked` and `got` must stay equal in a healthy run.
+
+  **THE 64-BIT "NtContinue LOOP" DOES NOT EXIST — THE COUNTER WAS MISREAD.**
+  `w53` was read as "`[ec-continue] … #8192` — the same Rip continued 8,192
+  times". The `#N` printed there is a PROCESS-WIDE count of every `NtContinue`,
+  printed by `ec_sample()` at 1..32 and then at every power of two. The printed
+  sequence is exactly `1,2,…,32,64,128,…,8192` — forty lines, which is what the
+  sampler emits for 8,192 ordinary continues, most of them one pair per thread
+  at bring-up (the first `#1` is on the process's first thread, with no
+  exception anywhere in the 120 lines before it). Every independent marker of
+  the ml630 mechanism reads **zero** in both `w53` and `w7`: `ml630 RETURNED`
+  (which fires whenever a continue is actually dropped), `[ctx] continue
+  REFUSED` in `build/ntdll-unix/signal_arm64_ios.c` — whose counter is SAMPLED,
+  not capped, so its zero is trustworthy — and `[redeliv]`. `w53`'s three
+  `c0000005` episodes each resolved in ONE pass: `[veh] handler … returned
+  ffffffff` (EXCEPTION_CONTINUE_EXECUTION) with Rip and Rsp rewritten, and no
+  re-raise. `MADEIRA_EC_CONTINUE_SIM` was therefore **left opt-in**: there is no
+  evidence for making direct re-entry the default, and it changes the resume
+  path of every guest SEH continue. The device symptom is real but it is not
+  this. `w7`, the second device, says so from the other side: its
+  `[tight-loop]` verdict is `CYCLE via r8->+0x8: … repeats after 62 hop(s) — the
+  structure this loop walks is CIRCULAR … the corruption is the bug, not the
+  loop`. That is a different investigation, on a corrupted guest data structure,
+  and it is the one the next round should take.
+
+  **SO THE COUNTER WAS FIXED INSTEAD** (`wine/dlls/ntdll/signal_arm64ec.c`).
+  A counter whose shape can be mistaken for the bug it is meant to detect is
+  worse than no counter. `ec_continue_rep()` is a 16-slot racy table keyed on
+  `(thread, Rip)` — the same shape as the `[redeliv]` table in
+  `signal_arm64_ios.c` — and the line now carries `rep=`: a genuine redelivery
+  loop is one growing `rep=` on one thread, routine traffic is `rep=1..2`. A
+  `REPEATING` banner fires at `rep==256` and `rep==4096` on its own budget, so a
+  storm announces itself even where the global sampler would skip it. The table
+  biases toward UNDER-reporting on a slot collision, which is the safe
+  direction. `[seh-entry]` — the last hard 60-shot cap on this path, and the
+  bracket point that localises context corruption between `[veh]` and the SEH
+  walk — is now sampled too. The main line's tag moved from `ml630` to `ml1020`
+  and the `RETURNED` line moved with it, so one grep still catches both.
+
+  **REGRESSION TEST.** `build/x64-tests/ctx-x64.c` gains part 2: a vectored
+  handler catches an access violation in x64 code, rewrites `Rip` to a recovery
+  routine and returns `EXCEPTION_CONTINUE_EXECUTION`. It asserts BOTH halves of
+  the contract, and the second is the one the loop would break — execution
+  continues at the recovery routine (exit 64/65 otherwise) **and the handler
+  runs exactly once** (exit 66). A redelivery loop passes the first and fails
+  the second, which is precisely the failure that cannot be told from healthy
+  traffic in a log. The handler stops rewriting after eight iterations and ends
+  the thread, so a storm reports exit 66 instead of hanging the run.
+
+  **VERIFIED BY BUILDING AND READING THE ARTIFACTS.** `xtajit.dll` (4706304 B)
+  and `xtajit64.dll` (5259264 B) both rebuilt and checked BY CONTENT: three
+  `rev=ml1020` strings each including `[code-buffer] recycled`, and **zero**
+  `rev=ml364` strings. `libntdll_unix.a` 1908616 B, 32/32 files, carrying
+  `[pool-tail] budget=`, `[pool-tail] TOTALS #%lu … budget= resv= head_hw=
+  gen_cap=`, `TAIL REFUSED #%lu … free_carves=`, `REUSE-LATE` and
+  `free_left=%u/%u`. ARM64EC `ntdll.dll` rebuilt, stripped and installed
+  (1572864 B, `architecture: aarch64`), carrying the `ml1020` `#%d rep=%d`,
+  `REPEATING` and `RETURNED` strings and the sampled `[seh-entry] #%d`.
+  `ctx-x64.exe` rebuilt (115712 B) and copied to `app/Madeira/arm64ec-windows/`;
+  `run_veh_continue_test`, `veh_continue`, `thread_fault`, `recover_label` and
+  `give_up_label` are in its symbol table and its five new failure strings are
+  in the image.
+
+  **UNVERIFIED ON DEVICE.** Everything. Nothing here has executed on hardware:
+  not the new budget arithmetic, not the ladder, not `REUSE-LATE`, not the
+  `rep=` counter, and not part 2 of `ctx-x64`. The ml990/2026-09-25 lesson
+  applies. Also unverified: that ~11 live generations at 16 MB each is the right
+  steady state rather than a symptom of the pinning that the WOW64 module cannot
+  yet relieve.
+
+  **WHAT THE NEXT DEVICE LOG SHOULD SHOW.** At the first tail carve,
+  `[pool-tail] budget=0x… head_hw=… margin=… gen_cap=0x1000000 (16 MB)` on a
+  512 MB pool. Then `[code-buffer] recycled #N … asked=0x1000000 got=0x1000000`
+  with **asked == got** and `degraded_total=0` for the whole session, `pinned=`
+  in the 6..13 range this port already shows, and NO `[code-buffer] exec alloc
+  degraded` at all. If refusals do appear, `[pool-tail] TOTALS #N` now states
+  whether `free=` was zero (a race — `REUSE-LATE` should then be catching it) or
+  `resv=` had reached `budget=` (genuinely out of pool, and the pool file is the
+  answer). The `0xdead` line must never appear. On the 64-bit side the
+  `[ec-continue]` lines should read `rep=1` or `rep=2`; a `REPEATING` banner or
+  a non-zero `ml1020 RETURNED` is the first real evidence of the ml630 storm
+  that any log has produced. `ctx-x64.exe` through the Custom path popup must
+  reach `MADEIRA-CTX veh-continue PASS` and exit 50; 64/65/66 each name the
+  exact property that broke.
+
+  **THE EXEC-FAULT REDIRECTS: ONE FACT ADDED, NOT FIXED.** `[stale-src]` in the
+  x86-64 run (`v48`) now names the callers, and for the hot targets
+  (`0x70feaabc24`, `0x70feaabce8`, `0x70ffd38b58`, `0x70ffd3871c`,
+  `0x70ffd386a4`) the LR IS inside a registered module copy — yet
+  `[stale-heal] … rewrote 0 slot(s)` for all of them, and that scanner already
+  sweeps every registered copy's whole image minus `.text` for the exact 8-byte
+  value. Both facts together rule out the obvious answer: the slot is not in any
+  module COPY. The remaining candidate the evidence points at is that the slot
+  is in the ORIGINAL PE image — a data pointer that was never redirected, so the
+  caller loads a function pointer through a base that still points at PE space.
+  The scanner does not look there. Extending it to sweep the source mappings and
+  report where the value was found is a diagnostic-only change and is the
+  cheapest next step; it was not made this round. Two targets
+  (`0x70ffd313c4` with `lr=0x0`, `0x70ffd25130` with `lr=0x10438e374`) have
+  callers OUTSIDE any registered copy and are a separate question.
+
+  **LESSON.** A resource can be exhausted three ways — spent, fragmented, or
+  contended for one instant — and a refusal path that prints the same sentence
+  for all three sends every future reader down the same wrong road. Twice in one
+  round: a `free_left=` that counted the wrong set, and an `#N` whose
+  powers-of-two sampling looked exactly like the exponential storm it was added
+  to catch. Both cost a round of work aimed at the wrong mechanism.
+
+- 2026-09-30 — **Four independent "the program just will not run" reports, one
+  shape: an answer this port gives that no program can act on.** None of the
+  four was an emulation defect. Each was an API returning something Windows
+  never returns — a refusal where Windows answers, a pointer where Windows
+  passes an integer, an empty device list where Windows lists two devices, a
+  code page that is not on disk — and each was invisible because a wrong answer
+  produces no error anywhere.
+
+  **1. A 32-bit program that inline-hooks builtin ntdll can never land a byte.**
+  The three write faults in `w54.txt` (`p0=1 p1=71fff8ce10`, `…8c9d0`, `…8cc10`)
+  are the first bytes of the i386 ntdll syscall stubs `NtCreateFile`,
+  `NtQueryInformationFile` and `NtQueryDirectoryFile` — RVAs 0x4ce10 / 0x4c9d0 /
+  0x4cc10 in `app/Madeira/i386-windows/ntdll.dll`, each `b8 <imm32>` followed by
+  `mov edx,<dispatcher>; call *edx; ret $N`, i.e. an ordinary `E9` detour being
+  written one byte at a time. The guest DID change protection first, and the log
+  proves it twice: the published guest rip at every fault is `0xfff8cdcc` =
+  `NtProtectVirtualMemory+0xc`, the `ret $0x14` immediately after that stub's
+  `call`, and the emulator's own protection notification names exactly the 4 KB
+  page (`Add SMC interval: 71FFF8C000 - 71FFF8D000`) with an exec+write
+  protection. So the request arrived, was accepted, and did not reach the
+  hardware: `wine_want=5 host_prot=1`, Mach region `prot=1 max=3`.
+  ROOT CAUSE, `build/ntdll-unix/virtual_ios.c mprotect_exec()`.
+  `PAGE_EXECUTE_READWRITE` on a `SEC_IMAGE` view becomes
+  `VPROT_EXEC|VPROT_READ|VPROT_WRITECOPY`, so `get_unix_prot()` hands this
+  function `PROT_READ|PROT_WRITE|PROT_EXEC`. The ONLY branch in it that can
+  grant write on a region whose Mach `max_protection` lacks `VM_PROT_EXECUTE` is
+  the `vm_protect()` arm, and that arm is gated on `!(unix_prot & PROT_EXEC)`.
+  With `PROT_EXEC` set, control instead enters the JIT-pool arm, where the plain
+  `mprotect()` is refused by the kernel (no EXECUTE in `max_protection`) and the
+  two remaining outcomes are `mprotect(base, size, PROT_READ)` — read-only
+  forever — or copying an i386 image into the ARM64 JIT pool, which is worse.
+  Neither ever grants write. The emulator then untraps the page with another
+  `PAGE_EXECUTE_READWRITE` that lands in the same dead end, which is what
+  `[fault-stuck] … faulted 5 times with NO progress` is reporting.
+  FIX (ml1030): inside a WoW guest window, a `SEC_IMAGE` view is an i386 PE by
+  construction and its code is NEVER executed from that VA — the emulator reads
+  those bytes as data and runs its own translation out of the pool — so
+  `PROT_EXEC` there has no host meaning while `PROT_WRITE` is load-bearing. Drop
+  the meaningless bit (`ios_guest_image_is_host_data()`, gated on the VIEW being
+  SEC_IMAGE, not on the address range, so anonymous guest RWX keeps its pool
+  alias and its store emulator untouched). The SMC contract is preserved exactly
+  because it is expressed in the other direction: the trap is armed with
+  `PAGE_EXECUTE_READ`, which still resolves to `mprotect(PROT_READ)` — unchanged
+  behaviour — and disarmed with `PAGE_EXECUTE_READWRITE`, which now genuinely
+  grants write AFTER the emulator has invalidated the page's translations. A
+  page never translated simply becomes writable with no fault, which is also
+  correct. `MADEIRA_GUEST_IMAGE_WRITE=0` reverts.
+  MADE VISIBLE: `[vprot]` in `NtProtectVirtualMemory` prints, for any request
+  targeting a `SEC_IMAGE` view, the address, size, requested protection, status,
+  the view's own protect word, the page's vprot BEFORE and AFTER, and the Mach
+  region's current and max protection. "The request never arrived", "it was
+  refused" and "it was granted and did not take" are three different things and
+  nothing in the log could previously tell them apart. First 48, then 1-in-256;
+  import resolution alone issues hundreds at start-up.
+
+  **2. A 32-bit installer dies with 0xC0000005 the moment it creates a themed
+  window, because an ATOM was rebased into the guest window and then walked as a
+  string.** `w60.txt`: an MSI-based setup program faults at `NtUserSetProp+0x4c` reading
+  `0x720000c01a`, and a redistributable bootstrapper at `NtUserGetProp+0x50`
+  reading `0x720000c01d`; both faulting instructions are the inlined `lstrlenW`
+  (`ldrh w,[x],#2` with the `-2` counter and the `cbnz` back edge), both reached
+  from `NtUserCreateWindowEx -> send_message_timeout -> call_window_proc ->
+  KeUserModeCallback`, i.e. a control storing per-window state under an atom
+  during `WM_NCCREATE`. `0xc01a` and `0xc01d` are valid atoms.
+  ROOT CAUSE: `wine/dlls/wow64win/user.c` passes the `str` argument of
+  `NtUserSetProp` / `NtUserGetProp` / `NtUserRemoveProp` through `get_ptr()`.
+  Upstream that is the identity on a 32-bit value, so a `MAKEINTATOM` survives
+  and `IS_INTRESOURCE()` downstream still recognises it. Here `guest_ptr32()`
+  ADDS THE WINDOW BASE, so the atom arrives as `0x72000000c01a`,
+  `IS_INTRESOURCE` is false, `win32u/window.c` takes the string branch, and
+  `lstrlenW` walks the reserved-but-uncommitted low megabyte of the window
+  (`region 0x7200000000+0x110000 prot=0`, `ANONYMOUS, NEVER RESIDENT`) until it
+  faults. It kills the process outright rather than raising to the guest,
+  because the fault lands on a `KeUserModeCallback` stack the SEH dispatcher
+  then refuses (`Exception frame is not in stack limits`) — that refusal is a
+  second, separate defect and is NOT fixed here.
+  FIX (ml1030): `get_str_or_atom()` in `wow64win_private.h` passes an
+  `INTRESOURCE` through untranslated; the three thunks use it. Nothing is lost —
+  a real pointer below 64 KB cannot exist in a Windows process either, which is
+  the assumption `IS_INTRESOURCE` itself rests on. These are the only three
+  win32u entry points in the wow64win thunk set that take an atom-or-string;
+  every other `const WCHAR *` there is a plain string and every class name goes
+  through `UNICODE_STRING32`. VERIFIED BY DISASSEMBLY of the rebuilt
+  `aarch64-windows/wow64win.dll` (720896 B): `wow64_NtUserSetProp` now opens
+  `sub w10,w1,#1 / cmp w10,#0xffff / b.lo` and only adds the base on the
+  out-of-range arm. The two "propagated" exits in the same log are parents
+  forwarding a child's `0xC0000005` (`NtTerminateProcess(handle=0x0)`), not
+  separate faults, and no message box was ever shown.
+
+  **3. A visual-novel engine's "Boot Error — not installed correctly": the
+  prefix ships four code pages.** `app/Madeira/nls/` contained `c_1252`,
+  `c_437`, `c_20127` and `c_28591` and nothing else, out of the 71 code-page
+  tables Wine builds. Every other one — every CJK DBCS page, every Windows ANSI
+  page but Latin-1, every OEM page but 437 — was simply absent, so
+  `NtGetNlsSectionPtr(NLS_SECTION_CODEPAGE, …)` failed for it, and with it
+  `RtlInitCodePageTable` and every `MultiByteToWideChar`/`WideCharToMultiByte`
+  that names it. The mechanism is visible in both logs even for a page Wine
+  asks for itself: `[nls-getptr] type=11 id=10000` six times in a row
+  immediately before the message box, with fourteen matching
+  `\??\C:\windows\system32\c_10000.nls` open failures earlier —
+  `open_nls_data_file` tries `<data_dir>/nls/c_NNN.nls` first and only falls
+  back to the guest path, so a guest-path failure means the bundle did not have
+  it. FIX: ship all of `wine/nls/c_*.nls` (12 files -> 76, 4.8 MB -> 11 MB
+  uncompressed; the bundle directory is handed to the server whole, so no code
+  change is needed). This is the first thing to re-test: a program whose own
+  data is in a code page the prefix cannot load fails in whatever way its first
+  conversion fails, and "the game is not installed correctly" is exactly the
+  shape of a path that came back as mojibake.
+  ALSO FIXED, and wrong by construction regardless of this program:
+  `FileFsVolumeInformation` was the one volume class with no fallback — it
+  returned `STATUS_NOT_IMPLEMENTED` whenever `\Device\MountPointManager` could
+  not be opened, and this port has no mount manager at all. `kernelbase`'s
+  `GetVolumeInformationByHandleW` issues that query whenever the caller wants a
+  label or a serial and returns FALSE on any failure, so
+  **`GetVolumeInformation()` failed for every path on the system**, which is a
+  call every installer, licence check and "which drive am I on" heuristic makes.
+  `get_volume_serial_fallback()` now synthesises a STABLE serial — FNV-1a over
+  the filesystem's mount point (`statfs f_mntonname`, `st_dev` where there is
+  none) mixed with the DOS drive letter, never 0 or -1 — and the label comes
+  back empty, which is honest. Stability is the requirement: a program records a
+  serial at install time and compares it at launch. `FileIdInformation` gets the
+  same value instead of the 0 it used to report.
+  `MADEIRA_VOLUME_FALLBACK=0` restores the refusal.
+  AND THE INSTRUMENT, because guessing costs a device round trip per guess:
+  `build/x86-tests/sysprobe-x86.c` (`build-sysprobe-test.sh`, 70144 B, i386 PE,
+  imports kernel32/advapi32/shell32/user32 only, LARGE_ADDRESS_AWARE, exit 63)
+  prints in ONE run every value a program can use to decide whether the machine
+  is real and the install is valid: per drive the type, the whole
+  `GetVolumeInformation` tuple WITH its error code, `GetDiskFreeSpace(Ex)` and
+  `QueryDosDevice`; the well-known directories and whether each
+  `SHGetFolderPath` answer EXISTS; `GetVersionEx`, `GetSystemInfo`,
+  `GetNativeSystemInfo`, `GlobalMemoryStatusEx`, `IsWow64Process`,
+  computer/user name, `GetSystemMetrics`; ACP/OEMCP and every language id;
+  `EnumDisplaySettings(ENUM_CURRENT_SETTINGS)` and the mode count; the
+  `Windows NT\CurrentVersion` and `CentralProcessor\0` values this port
+  synthesises; and the environment those lookups are built on. It asserts
+  nothing and can only fail by crashing — a probe that decided what "correct"
+  looks like would encode the very expectations in question. Run it as
+  `C:\windows\syswow64\sysprobe-x86.exe` and diff against Windows.
+
+  **4. A 64-bit title is deaf to keyboard, on-screen keys and pad while every
+  counter says input is being delivered — because the raw-input device list is
+  EMPTY.** `w51.txt` shows focus, foreground and active window all agreeing on
+  the game window, `drv_post_key` returning `status=0x0 failures=0` for all 16
+  key events, `drv_post_mouse` the same for 202, raw dispatch running
+  (`raw: disp=203 q=257`) and `drop(nofg=0 nodev=0 notfg=0 nowin=0)`. It also
+  shows the title registering two raw devices with `mouse_flags=0x230` =
+  `RIDEV_NOLEGACY|RIDEV_CAPTUREMOUSE` — it has told the system to stop sending
+  it legacy `WM_KEY*`/`WM_MOUSE*` and to send only `WM_INPUT` — and four device
+  opens failing: `\??\HID#VID_845E&PID_0001…` and `&PID_0002…` under
+  `GUID_DEVINTERFACE_{MOUSE,KEYBOARD,HID}`, all `0xc0000034`. Those are
+  winebus.sys's synthetic "Wine HID mouse/keyboard", and this port has no driver
+  stack behind them.
+  ROOT CAUSE: `wine/dlls/win32u/rawinput.c add_device()` returns NULL when the
+  device file cannot be opened, and those four are the only candidates, so the
+  device list ends up EMPTY. Two consequences, both silent:
+  `GetRawInputDeviceList()` reports zero devices, so a title that asks whether
+  there is a keyboard before wiring its input concludes there is not; and
+  `GetRawInputDeviceInfo( hDevice, RIDI_DEVICENAME / RIDI_DEVICEINFO )` FAILS
+  for `WINE_MOUSE_HANDLE` (1) and `WINE_KEYBOARD_HANDLE` (2) — the very handles
+  the server stamps into every `WM_INPUT` it synthesises
+  (`rawmouse_init`/`rawkeyboard_init`, `build/wineserver/queue_ios.c`) — so a
+  title that identifies the source device before trusting a message drops all of
+  them. Both look exactly like "input is dispatched and the game ignores it",
+  which is why focus, foreground and message routing were searched first.
+  FIX (ml1030): `add_builtin_device()` publishes the built-in mouse and keyboard
+  when the enumeration produced no device of that type, under those same two
+  handles, with the same `RID_DEVICE_INFO_{MOUSE,KEYBOARD}` statics `add_device`
+  would have used and a name shaped like the PS/2 devices Windows reports for a
+  built-in keyboard and mouse (`\\?\ACPI#PNP0303#…{884b96c3-…}` and
+  `\\?\ACPI#PNP0F03#…{378de44c-…}`), because that is what callers pattern-match
+  on. It carries no file handle and no preparsed data, so `RIDI_PREPARSEDDATA`
+  correctly reports nothing for it; the two teardown paths now test the handle
+  before closing it. IT IS SELF-DISARMING: it runs only when the type is
+  missing, so on any host where the real device stack works nothing changes,
+  and that is the knob.
+  ALSO ESTABLISHED, so the next round does not re-ask: the iOS gamepad path IS
+  compiled into all three farms — `xinput1_3.dll` imports `NtUserCallTwoParam`
+  in `arm64ec-windows`, `aarch64-windows` AND `i386-windows` — so the ml668
+  transport is present in the 64-bit build; `wine_dinput_worker` starts and
+  survives the whole session but sits at `cpu=0` with an empty device list; and
+  `NtUserCallTwoParam_GetGamepadState` / `ios_gamepad_query` have NO
+  instrumentation on either side, which is why the log cannot say whether the
+  title ever asked. That counter is the next thing to add, and until it exists
+  "the controller does nothing" cannot be distinguished from "the title never
+  called XInput".
+
+  **VERIFIED BY BUILDING AND READING THE ARTIFACTS.** `ntdll-unix` 32/32 and
+  `win32u-unix` every file, no new warnings. `libntdll_unix.a` 1909816 B carries
+  the `[vprot] ml1030 …`, `[guest-image] ml1030 …` and `no mount manager:
+  answering FileFsVolumeInformation from statfs` strings; `libwin32u_unix.a`
+  3477480 B carries `Adding built-in device` and both built-in device paths;
+  `aarch64-windows/wow64win.dll` 720896 B disassembles to the atom test
+  described above. `sysprobe-x86.exe` built, import set and LAA bit asserted by
+  the build script, copied into `app/Madeira/i386-windows/`. 64 code-page tables
+  added to `app/Madeira/nls/` and `c_932.nls` checked BY CONTENT (header
+  `0d 00 a4 03` = 13 words, code page 932).
+
+  **UNVERIFIED ON DEVICE — all of it.** Nothing in this round has executed on
+  hardware, and the 2026-09-25 lesson applies. Specifically unverified: that the
+  inline hook now lands (and what the program does next — it died afterwards at
+  guest `rip=0xfffffffe`, which is a SEPARATE and un-diagnosed failure); that
+  the installers get past window creation, and whether the SEH refusal on a
+  `KeUserModeCallback` stack then becomes the next wall; that the code pages are
+  what the visual-novel engine was missing, which the boot error alone cannot
+  prove; and that the built-in raw-input devices are what the 64-bit title was
+  waiting for.
+
+  **WHAT THE NEXT DEVICE LOG SHOULD SHOW.** `[vprot] ml1030` lines for the ntdll
+  page with `before=25 after=2d host=rw-` and `st=0x0` — `after=2d host=r--`
+  would mean the write grant is still not reaching the hardware and the fix is
+  in the wrong place. `[guest-image] ml1030` a handful of times at start-up and
+  then quiet. No `[fault-stuck]` on an i386 image page. A setup program exiting
+  with anything other than `status=-1073741819`. No
+  `\??\C:\windows\system32\c_*.nls` open failures and no repeated
+  `[nls-getptr] type=11`. For the 64-bit title, `GetRawInputDeviceList` is not
+  logged, so the observable is behavioural: keys and stick reaching the game.
+  Run `C:\windows\syswow64\sysprobe-x86.exe` once and send the block between
+  `MADEIRA-SYSPROBE: begin` and `end`.
+
+  **LESSON.** Every one of these four is a value, not a crash. A refusal
+  (`STATUS_NOT_IMPLEMENTED` for a volume), an over-translation (a base added to
+  an integer), an omission (a device list, a code page) and a gate on the wrong
+  bit (`PROT_EXEC` deciding whether `PROT_WRITE` may be granted) all produce
+  programs that die with no error attributable to the thing that is wrong. The
+  only defence is to make the ANSWERS printable — `[vprot]` for one of them,
+  `sysprobe-x86.exe` for a hundred of them — because the failure is never
+  visible at the point where it is caused.
+
+- 2026-09-30 — **`GetThreadContext` on another thread replayed one snapshot
+  taken at bring-up for the whole session, and what it replayed was a
+  libsystem_kernel address labelled as an x86-64 `Rip`. Both halves are why a
+  stop-the-world retries forever** (`wine/server/thread.c` `stop_thread()`,
+  `build/wineserver/mach_ios.c`, `wine/dlls/ntdll/signal_arm64ec.c`).
+
+  **THE STALENESS, MEASURED, NOT INFERRED.** `stop_thread()`
+  (`wine/server/thread.c:987`) returns early whenever `thread->context` already
+  exists. That is correct upstream, because the context that exists there was
+  filled in by the TARGET while it was genuinely stopped and is released the
+  moment it resumes. Both release sites — `send_thread_wakeup()`
+  (`thread.c:1344`) and the select suspend-context handback (`thread.c:2210`) —
+  are gated on `thread->suspend_cookie`, which is set only from `wait_suspend()`,
+  which needs the SIGUSR1 suspend that does not exist on iOS. So nothing ever
+  freed it, and the Mach snapshot taken at a thread's FIRST suspend was the
+  answer to every later `GetThreadContext` on that thread, forever.
+
+  The tablet log settles it arithmetically. `[srv-getctx]`'s sampler was capped
+  at 48 and printed **40** lines — so it never reached its cap — one per thread,
+  all during bring-up, the last at file line 5820. The three ten-second windows
+  that follow, at lines 5889, 6272 and 6773, report
+  `suspend_thread=80/120/80 resume_thread=80/120/80 get_thread_context=80/120/80`.
+  **280 context reads, zero captures.** Every reply was the bring-up snapshot,
+  byte for byte. A caller that samples a thread to decide whether it may proceed
+  cannot ever see that thread move, so it retries at ~12 Hz forever. The phone
+  log (`w53`) has the same shape: 42 captures, all at bring-up.
+
+  **AND THE CONTENT WAS WRONG TOO, SO FRESHNESS ALONE WOULD NOT HAVE HELPED.**
+  `[ec-getctx]` reports, in **48 samples out of 48 on both devices**,
+  `is_ec=0 native_pc=0x251d4aed8 -> returned rip=0x251d4aed8 rsp=0x11e5de9e0`.
+  That "x64 Rip" is a libsystem_kernel address and that "Rsp" is the host kernel
+  stack: `NtGetContextThread` (`signal_arm64ec.c:1910`) asks for the NATIVE ARM
+  context unconditionally and `context_arm_to_x64()` maps `Pc`→`Rip` and
+  `Sp`→`Rsp` verbatim. Neither number means anything to an x64 caller. The
+  `saved_amd64` half the server captures alongside is not a fallback either:
+  `CpuArea->ContextAmd64` is written only by the EC exception dispatcher
+  (`signal_arm64ec.c:3297`) and by nothing else — FEX never touches it — which is
+  why 20 of the 40 tablet records read `rip=0x0 rsp=0x0`.
+
+  **TWO MECHANISMS FOR EXACTLY THIS WERE ALREADY IN THE TREE AND HAD NEVER
+  RUN.** ml716's syscall-frame substitution (`MADEIRA_CTX_FRAME`) and ml980's
+  emulated-view substitution (`MADEIRA_CTX_EMU`) were both written for this
+  failure and both left opt-in pending proof. `[ctx-frame]` appears **zero**
+  times in every log ever taken and `MADEIRA_CTX_EMU` appears in none. The proof
+  they were waiting for is the 48/48 above.
+
+  **THE FIX, IN FOUR PARTS.**
+  (1) *Re-capture instead of replaying* (`thread.c`, `stop_thread()`): a context
+  produced by the Mach path is marked `ios_snapshot` and is RE-FILLED on every
+  cross-thread stop; one the target filled in for itself is authoritative and is
+  left alone. The flag is initialised in `create_thread_context()` and set before
+  the first capture, so a capture that fails early no longer wedges the context
+  in `STATUS_PENDING` for the thread's life — a later successful one completes
+  it. `MADEIRA_CTX_REFRESH=0` restores the replay.
+  (2) *The syscall-frame substitution is ON by default*. For a thread inside a
+  unix call the frame's `pc` is the EC return address and its `sp` the guest
+  stack, which is exactly what Windows reports for a thread in a system call.
+  The selector is `is_inside_syscall()` verbatim (`kernel_stack <= sp <=
+  syscall_frame`), and the offsets it uses were re-checked against
+  `unix_private.h:102-130` and `struct syscall_frame`. `MADEIRA_CTX_FRAME=0`.
+  (3) *The emulated view is ON by default, and is now all-or-nothing*
+  (`signal_arm64ec.c`). It previously substituted `Sp` from X23 whenever the pc
+  was non-EC, and `Pc` only if the CPU-area cross-check succeeded — a mixed pair
+  belonging to no thread state. Nothing is substituted now unless
+  `emulated_rip()` has VERIFIED x28 against `CpuArea->EmulatorData[0]`. The two
+  substitutions are complementary by construction: after (2) a thread in a unix
+  call reports EC code, so `RtlIsEcCode()` is true and (3) does not fire; (3)
+  covers only threads genuinely in emitted code. `MADEIRA_CTX_EMU=0`.
+  (4) *`SetThreadContext` stops lying* (`mach_ios.c`,
+  `ios_apply_thread_context()`). A cross-thread set wrote the server's cached
+  copy and nothing ever read it back out into the thread, so it returned success
+  and did nothing — and before (1) a following get handed the write back out of
+  the cache, making the no-op undetectable. It now writes the target's SYSCALL
+  FRAME when it is inside a unix call, or its live Mach state when it is
+  genuinely halted, both under a momentary `thread_suspend()` so the frame cannot
+  be torn by a dispatcher return, and REFUSES anything else with a real status
+  instead of pretending. The one case that already worked —
+  `CreateThread(CREATE_SUSPENDED)` + set, where the target is parked in
+  `wait_suspend()` and applies the cached write itself — is explicitly excluded
+  and unchanged. `MADEIRA_CTX_SET=0`.
+
+  **TWO DETAILS OF THE FRAME WRITE THAT ARE NOT OPTIONAL, AND ARE WHY IT MIRRORS
+  `NtSetContextThread`'S SELF PATH BYTE FOR BYTE.** The first draft copied
+  `x[0..28]` wholesale and did not touch `restore_flags`, and both would have
+  been fatal. **x18 must be skipped**: it is the TEB pointer, the dispatcher's
+  return path reloads it from `frame->x[18]` unconditionally (`ldp x18, x19,
+  [sp, #0x90]`, `signal_arm64_ios.c:12698`), and an x64 CONTEXT has no field for
+  it — so `context_x64_to_arm()` puts a ZERO there and the thread would have come
+  out of its syscall with a null TEB. That is the same hole ml980 documents for
+  x13/x14/x23/x24/x28, one register further along, and `signal_arm64_ios.c:6547`
+  skips it for exactly this reason. **`restore_flags` must be set**, because that
+  word at +0x10c is what makes the return path take the slow restore at all;
+  `CONTEXT_INTEGER` is deliberately left out of it, again matching the self path.
+  The general rule this cost: when a port reimplements a kernel operation
+  cross-thread, the reference implementation is the SAME operation's in-process
+  path, and it should be copied, not paraphrased.
+
+  **WHY NOTHING WAS CHANGED IN FEX.** ARM64EC has no `BTCpuGetContext`: that
+  export exists only in the WOW64 module (`FEX/Source/Windows/WOW64/`), and
+  `libarm64ecfex.def` has no equivalent. On this path the emulator is never
+  consulted, so there was no FEX-side hook to fix — the conversion happens
+  entirely in the server and in ntdll's EC wrapper. FEX's own reconstruction
+  (`ReconstructThreadState` + `StoreStateToPackedECContext`,
+  `ARM64EC/Module.cpp:580`/`600`) is reachable only from the exception path and
+  mutates `Thread->CurrentFrame->State`; calling it from the server thread
+  against a target that is still running would corrupt that target's state, so
+  it is deliberately not used here. The verified `x28`/`CpuStateFrame` read in
+  (3) is the read-only equivalent.
+
+  **THE DIAGNOSTIC THAT MAKES THE NEXT LOG DECISIVE.** `[stw-loop]` fires once
+  per (target, caller) per ten seconds when one caller has suspended + read +
+  resumed the same target more than `MADEIRA_STW_THRESHOLD` (50) times in that
+  window. It names the target's state — `unix-call` / `fex-runtime` / `in-JIT` /
+  `native/EC`, each classified by a same-task read of the TEB and CPU area, never
+  by an address band — and prints the last three `{Pc,Sp}` pairs with the verdict
+  spelled out: identical means the caller is being shown a thread that never
+  moves. Both `[srv-getctx]` and `[ec-getctx]` were converted from hard caps to
+  powers-of-two sampling, because a 48-line cap spent at bring-up is what made
+  two device logs unable to describe the event they were taken for. And every
+  print in the capture path was MOVED OUT of the Mach-suspended window: `fprintf`
+  takes the stderr lock and can allocate, and doing that while a thread of the
+  same task is halted is the deadlock ml730 keeps real suspension opt-in for.
+
+  **REGRESSION TEST, AND IT WAS VALIDATED AGAINST REAL WINDOWS.**
+  `build/x64-tests/ctx-x64.c` gains part 3: Suspend/Get/Resume with no Set at
+  all, which is the shape a stop-the-world actually has and the only one that can
+  detect a cached context — part 1 rewrites the context every iteration and so
+  cannot tell a fresh read from a replay of its own last write. Three targets:
+  a thread spinning in a tight loop (Rip in the image, Rsp in its stack, and the
+  samples must not ALL be identical while the thread is demonstrably advancing —
+  exit 75), and a thread blocked on an event and on a semaphore (a usable pair,
+  constancy allowed because the thread really is stopped, and it must wake after
+  release — exits 74/79). The whole program was **run on an x86-64 Windows host
+  and exits 50**, which is what makes the new assertions trustworthy rather than
+  merely strict: the blocked cases there report `rip` inside ntdll
+  (`0x7ffaf8460e44`) with `varied=0`, and that is precisely the shape the device
+  must now produce instead of `0x251d4aed8`.
+
+  **VERIFIED BY BUILDING AND READING THE ARTIFACTS.** `libwineserver.a`
+  1262664 B, `mach_ios.c` and `server/thread.c` both compiling with an EMPTY
+  diagnostics file (0 bytes each). By CONTENT: the archive carries `[stw-loop]
+  ml1030 …`, `[srv-setctx] ml1030 …` and its `REFUSED` line, `[srv-getctx] ml715
+  #%u … state=%s`, the four knob names and all five state strings
+  (`unix-call`/`fex-runtime`/`in-JIT`/`native/EC`/`unknown`); `thread.o`
+  undefined-references `_ios_stw_note`, `_ios_apply_thread_context`,
+  `_ios_ctx_refresh_enabled` and `_ios_ctx_set_enabled`, every one of which
+  `mach_ios.o` defines. ARM64EC `ntdll.dll` rebuilt, stripped and installed
+  (1572864 B, `coff-arm64ec`, 0 missing cross-imports), carrying the new
+  `[ec-getctx] ml1030 MADEIRA_CTX_EMU=%d` banner and the `#%u` sampled line; the
+  one new warning that the first build produced was fixed and the remaining 14 in
+  that file are pre-existing. `ctx-x64.exe` rebuilt (131072 B) and copied to
+  `app/Madeira/arm64ec-windows/`.
+
+  **UNVERIFIED ON DEVICE.** Everything that only hardware can answer: that the
+  refresh does not introduce a Mach suspend/resume cost that matters at ~12 Hz;
+  that the syscall-frame substitution's frame is valid for a thread parked in the
+  in-process fast-path wait cell (the selector says it should be — that wait is
+  reached through a unix call — but no log has shown a `[ctx-frame]` line yet);
+  that `emulated_rip()`'s x28 cross-check holds for a target in the FEX
+  dispatcher as well as in emitted code; and the entire `[srv-setctx]` path,
+  which has never executed. Also unverified, and deliberately unchanged:
+  `MADEIRA_REAL_SUSPEND` is still 0, so "suspended" still does not stop a thread
+  running emitted code. That is now the next question rather than this one,
+  because a fresh context of a RUNNING thread at least differs between samples,
+  which is what ends the retry; a stale one never can.
+
+  **WHAT THE NEXT DEVICE LOG SHOULD SHOW.** At boot,
+  `[srv-getctx] ml1030 MADEIRA_CTX_REFRESH=1`, `[ctx-frame] ml1030
+  MADEIRA_CTX_FRAME=1` and `[ec-getctx] ml1030 MADEIRA_CTX_EMU=1`. Then, and this
+  is the single number that says whether the primary defect is gone,
+  **`[srv-getctx] ml715 #N` must keep climbing through the stop-the-world
+  windows** — its `#N` is now a capture count and must track
+  `get_thread_context` in `[srv-stats] kinds:`, not stop at 40. `[ctx-frame]
+  ml716 #N` should appear at all, with `frame_pc` an EC ntdll address rather than
+  a `0x25…` one, and `[ec-getctx]` should then report **`is_ec=1`** with a
+  returned `rip` inside a module and an `rsp` inside the guest stack. If a
+  `[stw-loop]` line still appears, its `state=` field and its three `{Pc,Sp}`
+  pairs name the remaining case directly: three identical pairs with
+  `state=unix-call` means the frame substitution is returning a frame that does
+  not advance; three identical pairs with `state=in-JIT` means the thread is not
+  being stopped and its CpuStateFrame rip is not being re-synced, which is the
+  `MADEIRA_REAL_SUSPEND` question; differing pairs mean the sampling is healthy
+  and whatever the caller is waiting for is elsewhere. `[srv-setctx] REFUSED`
+  with a non-trivial count would mean the title also hijacks threads, which no
+  log has shown yet. `ctx-x64.exe` through the Custom path popup must reach
+  `MADEIRA-CTX PASS` and exit 50; 74/75/79 each name the exact property that
+  broke, and 75 specifically is "the context is still cached".
+
+  **LESSON.** Two fixes for this exact failure were written, reviewed and merged
+  months apart, and both were left switched off pending evidence that could only
+  come from a device — while the probes that would have supplied that evidence
+  were capped at 48 lines and spent their entire budget on bring-up. The cap and
+  the opt-in defeated each other: the feature waited for proof, and the proof
+  waited for a probe that had already gone silent. A diagnostic that can run out
+  is not a diagnostic; sample it instead.

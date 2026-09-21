@@ -101,6 +101,11 @@ void winios_pointer(int x, int y, unsigned int flags, unsigned int data);
  * by winios_pointer(MOVE); exposed for initial placement. */
 void winios_cursor_move(int x, int y);
 
+/* Desktop mode: convert a point in WINDOW coordinates (points) to a desktop
+ * pixel, through the compositor's own letterbox mapping, clamped to the
+ * desktop. Returns 0 when there is no compositor (direct launch). */
+int winios_desktop_point_from_window(double wx, double wy, int *px, int *py);
+
 /* ml — DIRECT-LAUNCH CURSOR HOSTING (games, not the wine virtual desktop).
  *
  * Desktop mode draws the cursor as a sublayer of the desktop compositor

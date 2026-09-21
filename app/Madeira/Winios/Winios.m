@@ -1732,6 +1732,26 @@ static void winios_cursor_place(void) {
     }
 }
 
+int winios_desktop_point_from_window(double wx, double wy, int *px, int *py) {
+    const char *dw = getenv("MADEIRA_SCREEN_W"), *dh = getenv("MADEIRA_SCREEN_H");
+    int desk_w = dw ? atoi(dw) : 1024, desk_h = dh ? atoi(dh) : 768;
+    if (desk_w <= 0) desk_w = 1024;
+    if (desk_h <= 0) desk_h = 768;
+    if (!g_compositor_view || g_px_to_pt <= 0) { if (px) *px = 0; if (py) *py = 0; return 0; }
+    /* g_desk_origin is relative to the compositor view, whose frame is in
+     * window coordinates (see winios_layout_compositor). */
+    CGRect f = g_compositor_view.frame;
+    double x = (wx - f.origin.x - g_desk_origin.x) / g_px_to_pt;
+    double y = (wy - f.origin.y - g_desk_origin.y) / g_px_to_pt;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x > desk_w - 1) x = desk_w - 1;
+    if (y > desk_h - 1) y = desk_h - 1;
+    if (px) *px = (int)x;
+    if (py) *py = (int)y;
+    return 1;
+}
+
 void winios_cursor_move(int x, int y) {
     dispatch_async(dispatch_get_main_queue(), ^{
         winios_ensure_cursor_layer();

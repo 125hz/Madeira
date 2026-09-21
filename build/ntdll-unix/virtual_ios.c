@@ -2534,6 +2534,192 @@ static int ios_tail_carve_occupied( const void *base, size_t size )
 static unsigned ios_tail_carve_n;
 static pthread_mutex_t ios_tail_carve_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* ===================== ml1020 (#86): THE TAIL BUDGET IS NOT HALF THE POOL ====
+ *
+ * w50 died with 148MB of a 512MB pool free and unusable. The tail was capped
+ * at a fixed MIDPOINT (`reserve_offset + alloc_size > pool_size / 2`) while the
+ * head had used only 0x6c58000 (108MB) of its 256MB half; and the per-carve cap
+ * stepped down at an ABSOLUTE 160MB watermark that was tuned for an 896MB pool,
+ * so on a 512MB pool it fired at 31% of the pool and started the ladder down.
+ *
+ * Both numbers are now derived from the two quantities that actually matter:
+ * the head's high-water mark (jit_pool_offset — monotonic, so a racy read is
+ * conservative-late and never un-refuses) and a margin kept free for PE image
+ * copies that have not been loaded yet.
+ *
+ *   budget = pool - head_high_water - margin
+ *   cap    = pow2_floor(budget / IOS_TAIL_GENERATIONS) clamped to [4MB, 32MB]
+ *
+ * The cap divisor is the number of code-buffer GENERATIONS that must coexist.
+ * That number is a property of this port, not a guess: a generation stays alive
+ * while any thread's CurrentCodeBuffer still references it, and w50's
+ * `[gen] alloc#N ... prev_use_count=` line reported 7..14 references at every
+ * swap — i.e. 6..13 threads pinning the outgoing generation — with an 11-carve
+ * / 240MB live census at the first refusal. 16 gives those ~11 live generations
+ * room plus spares for the in-flight swap.
+ *
+ * Knobs: MADEIRA_POOL_HEAD_MARGIN_MB (default 96) and MADEIRA_FEX_CODEBUF_MAX_MB
+ * (0 = auto). MADEIRA_POOL_TAIL_HALF=1 restores the exact pre-ml1020 midpoint
+ * cap and the 32/16MB-at-160MB ladder. */
+static size_t ios_tail_head_margin(void)
+{
+    static size_t cached;
+    static int done;
+    if (!done)
+    {
+        const char *e = getenv( "MADEIRA_POOL_HEAD_MARGIN_MB" );
+        long v = e ? atol( e ) : 96;
+        if (v < 16) v = 16;
+        if (v > 512) v = 512;
+        cached = (size_t)v << 20;
+        /* Never give the margin more than a quarter of a small pool, or a
+         * 256MB pool would have no tail at all. */
+        if (ios_jit_pool_size_global && cached > ios_jit_pool_size_global / 4)
+            cached = ios_jit_pool_size_global / 4;
+        done = 1;
+    }
+    return cached;
+}
+
+static int ios_tail_half_mode(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *e = getenv( "MADEIRA_POOL_TAIL_HALF" );
+        cached = (e && e[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+
+/* Bytes the tail may reserve in total. Callers must treat 0 as "refuse". */
+static size_t ios_tail_budget(void)
+{
+    size_t pool = ios_jit_pool_size_global;
+    size_t head, margin;
+
+    if (!pool) return 0;
+    if (ios_tail_half_mode()) return pool / 2;
+
+    head = jit_pool_offset;                 /* monotonic high-water of the head */
+    margin = ios_tail_head_margin();
+    if (pool <= head + margin) return 0;
+    return pool - head - margin;
+}
+
+/* Largest single code buffer the tail will grant right now. */
+static size_t ios_tail_gen_cap(void)
+{
+    enum { IOS_TAIL_GEN_MIN = 4u * 1024 * 1024, IOS_TAIL_GEN_MAX = 32u * 1024 * 1024,
+           IOS_TAIL_GENERATIONS = 16 };
+    size_t budget, cap;
+    static size_t forced;
+    static int forced_done;
+
+    if (!forced_done)
+    {
+        const char *e = getenv( "MADEIRA_FEX_CODEBUF_MAX_MB" );
+        long v = e ? atol( e ) : 0;
+        if (v < 0) v = 0;
+        if (v > 32) v = 32;
+        forced = (size_t)v << 20;
+        forced_done = 1;
+    }
+    if (forced) return forced;
+
+    if (ios_tail_half_mode())
+        return (ios_jit_tail_reserved < 160u * 1024 * 1024) ? IOS_TAIL_GEN_MAX : IOS_TAIL_GEN_MAX / 2;
+
+    budget = ios_tail_budget();
+    if (!budget) return IOS_TAIL_GEN_MIN;
+
+    cap = budget / IOS_TAIL_GENERATIONS;
+    /* round DOWN to a power of two: FEX's size ladder is pow2 and an exact
+     * match is what makes the free-list reuse hit rather than waste. */
+    {
+        size_t p = IOS_TAIL_GEN_MIN;
+        while ((p << 1) <= cap && (p << 1) <= IOS_TAIL_GEN_MAX) p <<= 1;
+        cap = p;
+    }
+    if (cap > IOS_TAIL_GEN_MAX) cap = IOS_TAIL_GEN_MAX;
+    if (cap < IOS_TAIL_GEN_MIN) cap = IOS_TAIL_GEN_MIN;
+    /* Late threads must still get a REAL buffer: once three quarters of the
+     * budget is committed, halve the grant once so the remaining quarter is
+     * shared rather than swallowed by one hot thread. */
+    if (ios_jit_tail_reserved > budget - budget / 4 && cap > IOS_TAIL_GEN_MIN)
+        cap >>= 1;
+    return cap;
+}
+
+/* How many carves are free, and how many bytes they hold. Caller must NOT hold
+ * ios_tail_carve_lock. Used by the refusal diagnostics so a log says whether
+ * the refusal was "budget spent" or "every carve happened to be live at this
+ * instant" — w50 could not distinguish those, and they need different fixes. */
+static void ios_tail_free_census( unsigned *free_n, size_t *free_bytes, size_t *live_bytes )
+{
+    unsigned i, n = 0;
+    size_t fb = 0, lb = 0;
+    pthread_mutex_lock( &ios_tail_carve_lock );
+    for (i = 0; i < ios_tail_carve_n; i++)
+    {
+        if (ios_tail_carves[i].free) { n++; fb += ios_tail_carves[i].size; }
+        else lb += ios_tail_carves[i].size;
+    }
+    pthread_mutex_unlock( &ios_tail_carve_lock );
+    if (free_n) *free_n = n;
+    if (free_bytes) *free_bytes = fb;
+    if (live_bytes) *live_bytes = lb;
+}
+
+/* Hand out a FREE carve of at least alloc_size (smallest fitting). Returns 1 on
+ * success. Factored out of NtAllocateVirtualMemoryEx by ml1020 so the refusal
+ * path can re-scan: w50's fatal allocation failed at 0x100000 while carves were
+ * being freed and reacquired several times per ten log lines, i.e. it lost a
+ * race rather than running out of pool. A second scan after the (already
+ * rolled-back) budget refusal costs one uncontended mutex and closes it.
+ *
+ * NEVER returns a carve SMALLER than asked: FEXCore's VirtualAlloc discards the
+ * returned *size_ptr and records the REQUESTED size as CodeBuffer::AllocatedSize,
+ * so a short grant would be a silent buffer overrun. Larger is already the
+ * normal case and is only wasted tail space. */
+static int ios_tail_serve_freelist( size_t alloc_size, void **ret, SIZE_T *size_ptr, const char *why )
+{
+    unsigned i, best = ~0u, fn = 0;
+    void *jit_rx, *jit_rw;
+    size_t got;
+
+    pthread_mutex_lock( &ios_tail_carve_lock );
+    for (i = 0; i < ios_tail_carve_n; i++)
+        if (ios_tail_carves[i].free && ios_tail_carves[i].size >= alloc_size &&
+            (best == ~0u || ios_tail_carves[i].size < ios_tail_carves[best].size))
+            best = i;
+    if (best == ~0u)
+    {
+        pthread_mutex_unlock( &ios_tail_carve_lock );
+        return 0;
+    }
+    jit_rx = (char *)ios_jit_rx_base_global + ios_tail_carves[best].off;
+    jit_rw = (char *)ios_jit_rw_base_global + ios_tail_carves[best].off;
+    got = ios_tail_carves[best].size;
+    ios_tail_carves[best].free = 0;
+    pthread_mutex_unlock( &ios_tail_carve_lock );
+
+    {
+        volatile uint32_t *rw_words = (volatile uint32_t *)jit_rw;
+        size_t nwords = got / sizeof(uint32_t), i2;
+        for (i2 = 0; i2 < nwords; i2++) rw_words[i2] = 0xd503201fu;  /* NOP-prefill, same as fresh carves */
+    }
+    *ret = jit_rx;
+    *size_ptr = got;
+    /* ml1020: the old line printed ios_tail_carve_n — the TOTAL carve count —
+     * under the name "free_left", so every w50 line read "free_left=15" while
+     * the free set was in fact draining to zero. Print the real free count. */
+    ios_tail_free_census( &fn, NULL, NULL );
+    dprintf(2, "[jit-pool] tail %s rx=%p size=0x%lx (asked 0x%lx) free_left=%u/%u rev=ml1020\n",
+            why, jit_rx, (unsigned long)got, (unsigned long)alloc_size, fn, ios_tail_carve_n);
+    return 1;
+}
+
 /* iOS-Madeira ml613: WHICH TAIL CARVE DOES THIS HOST PC LIVE IN, AND IS IT FREE?
  *
  * ml612's crash faulted at host pc 0x15361d6d0, which is +0x496d0 into the 16MB
@@ -10447,8 +10633,107 @@ static void *ios_share_probe_thread(void *arg)
  * legitimately log on normal threads stay silent on that one. */
 volatile int ios_in_mach_exc;
 
+/***********************************************************************
+ *           ios_guest_image_is_host_data      (iOS-Madeira ml1030)
+ *
+ * TRUE for a page that belongs to a PE image mapped inside a WoW guest window.
+ *
+ * WHY THIS QUESTION EXISTS. Inside a guest window every SEC_IMAGE view is an
+ * i386 PE by construction, and this port NEVER executes an i386 image from its
+ * own VA: the emulator decodes those bytes as DATA and runs its own translation
+ * out of the JIT pool.  So VPROT_EXEC on such a page is Wine bookkeeping with no
+ * host meaning, while VPROT_WRITE is load-bearing -- it is what makes an inline
+ * hook, a runtime relocation fixup, or the emulator's own SMC untrap land.
+ *
+ * Deliberately NOT "anything in the window": a guest that allocates anonymous
+ * RWX memory (a managed runtime's code buffers) still needs the pool alias and
+ * the store emulator, and those views are not SEC_IMAGE.  The test is the view,
+ * not the address range.
+ *
+ * virtual_mutex is held by every caller that can reach here (mprotect_range from
+ * set_vprot, and the map_image section loop), so find_view() is safe. */
+static struct file_view *find_view( const void *addr, size_t size );
+
+static int ios_guest_image_write_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *s = getenv( "MADEIRA_GUEST_IMAGE_WRITE" );
+        cached = (s && (*s == '0' || *s == 'n' || *s == 'N')) ? 0 : 1;
+    }
+    return cached;
+}
+
+static int ios_guest_image_is_host_data( const void *base, size_t size )
+{
+#ifdef WINE_IOS
+    struct file_view *view;
+
+    if (!ios_guest_image_write_enabled()) return 0;
+    if (!ios_wow_in_window( base )) return 0;
+    if (!(view = find_view( base, size ))) return 0;
+    return (view->protect & SEC_IMAGE) != 0;
+#else
+    return 0;
+#endif
+}
+
 static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 {
+#ifdef WINE_IOS
+    /* iOS-Madeira ml1030: A 32-BIT IMAGE PAGE IS DATA TO THE HOST — SO STOP
+     * ROUTING ITS WRITE REQUESTS THROUGH THE EXECUTABLE MACHINERY.
+     *
+     * THE SYMPTOM. A guest that inline-hooks builtin i386 ntdll (a byte store
+     * over the first bytes of a syscall stub) faults forever: the device log
+     * shows `wine_want=5 host_prot=1 (not a strip)` on an image page whose Mach
+     * region reports `prot=1 max=3` — read-only, with no EXECUTE even permitted
+     * — while the guest has already issued NtProtectVirtualMemory(
+     * PAGE_EXECUTE_READWRITE) for exactly that 4 KB page (the emulator logs the
+     * matching exec+write protection notification).
+     *
+     * THE MECHANISM. PAGE_EXECUTE_READWRITE on a SEC_IMAGE view becomes
+     * VPROT_EXEC|VPROT_READ|VPROT_WRITECOPY, so get_unix_prot() hands this
+     * function PROT_READ|PROT_WRITE|PROT_EXEC.  The only branch below that can
+     * actually grant write on a region whose Mach max_protection lacks
+     * VM_PROT_EXECUTE is the vm_protect() arm, and that arm is gated on
+     * `!(unix_prot & PROT_EXEC)`.  With PROT_EXEC set, control instead enters
+     * the JIT-pool arm, where a plain mprotect() is refused by the kernel
+     * (max_protection has no EXECUTE) and the two remaining outcomes are
+     * `mprotect(base, size, PROT_READ)` — read-only forever — or copying an
+     * i386 image into the ARM64 JIT pool, which is worse.  Neither ever grants
+     * write, so the store re-faults, the emulator untraps the page with another
+     * PAGE_EXECUTE_READWRITE that lands in the same dead end, and the page is
+     * reported as "faulted N times with NO progress".
+     *
+     * THE FIX. Drop the bit that has no host meaning.  The emulator's SMC
+     * contract is preserved exactly, because it is expressed in the OTHER
+     * direction: it arms the trap with PAGE_EXECUTE_READ (which still lands on
+     * mprotect(PROT_READ) — unchanged behaviour) and disarms it with
+     * PAGE_EXECUTE_READWRITE (which now genuinely grants write, after it has
+     * invalidated the translations for the page).  A page the emulator has
+     * never translated simply becomes writable with no fault at all, which is
+     * also correct: there is nothing to invalidate.
+     *
+     * MADEIRA_GUEST_IMAGE_WRITE=0 restores the previous behaviour exactly. */
+    if ((unix_prot & PROT_EXEC) && ios_guest_image_is_host_data( base, size ))
+    {
+        static unsigned long gid_n;
+        if (++gid_n <= 24 && !ios_in_mach_exc)
+            dprintf( 2, "[guest-image] ml1030 #%lu %p+0x%lx prot=%c%c%c — 32-bit image page, "
+                        "EXEC has no host meaning here; applying %c%c- instead\n",
+                     gid_n, base, (unsigned long)size,
+                     (unix_prot & PROT_READ)  ? 'r' : '-',
+                     (unix_prot & PROT_WRITE) ? 'w' : '-',
+                     (unix_prot & PROT_EXEC)  ? 'x' : '-',
+                     (unix_prot & PROT_READ)  ? 'r' : '-',
+                     (unix_prot & PROT_WRITE) ? 'w' : '-' );
+        unix_prot &= ~PROT_EXEC;
+        if (!unix_prot) unix_prot = PROT_READ;   /* PAGE_EXECUTE alone: readable is the honest answer */
+    }
+#endif
+
     /* ml247: catch WHO narrows maxprot on pool pages.
      *
      * Poison is created during a module's life (POISONED AT FREE, and predating
@@ -18980,66 +19265,49 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
          * proven 16MB refusal once the tail is loaded. Hot threads that rotate
          * early get big buffers; late/idle threads still get real ones, so the
          * ml436 exhaustion (10 refusals, 123 degraded threads) can't return. */
+        /* ml1020: the cap and the budget are both derived from the head's
+         * high-water mark now — see ios_tail_gen_cap()/ios_tail_budget(). The
+         * one-shot banner states the arithmetic so a log never has to guess
+         * which constant refused a buffer. */
         {
-            enum { TAIL_BIG = 0x2000000, TAIL_SMALL = 0x1000000,
-                   TAIL_BIG_WATERMARK = 160u * 1024 * 1024 };
-            size_t cap = (ios_jit_tail_reserved < TAIL_BIG_WATERMARK) ? TAIL_BIG : TAIL_SMALL;
+            size_t cap = ios_tail_gen_cap();
+            static int budget_banner;
+
+            if (!budget_banner) {
+                budget_banner = 1;
+                dprintf(2, "[pool-tail] budget=0x%lx (%lu MB) of pool 0x%lx: head_hw=0x%lx margin=0x%lx gen_cap=0x%lx (%lu MB) rev=ml1020\n",
+                        (unsigned long)ios_tail_budget(), (unsigned long)(ios_tail_budget() >> 20),
+                        (unsigned long)ios_jit_pool_size_global, (unsigned long)jit_pool_offset,
+                        (unsigned long)ios_tail_head_margin(), (unsigned long)cap,
+                        (unsigned long)(cap >> 20));
+            }
 
             if (alloc_size > cap) {
                 static int cap_log_n;
                 if (cap_log_n < 16) {
                     cap_log_n++;
-                    dprintf(2, "[jit-pool] tail CAP: refusing 0x%lx (cap 0x%lx, tail_resv=0x%lx) so FEX halves down rev=ml480\n",
+                    dprintf(2, "[jit-pool] tail CAP: refusing 0x%lx (cap 0x%lx, tail_resv=0x%lx budget=0x%lx) so FEX halves down rev=ml1020\n",
                             (unsigned long)alloc_size, (unsigned long)cap,
-                            (unsigned long)ios_jit_tail_reserved);
+                            (unsigned long)ios_jit_tail_reserved, (unsigned long)ios_tail_budget());
                 }
                 return STATUS_NO_MEMORY;
             }
-            if (alloc_size > TAIL_SMALL) {
-                static int big_log_n;
-                if (big_log_n < 16) {
-                    big_log_n++;
-                    dprintf(2, "[jit-pool] tail BIG: granting 0x%lx (tail_resv=0x%lx) rev=ml480\n",
-                            (unsigned long)alloc_size, (unsigned long)ios_jit_tail_reserved);
-                }
-            }
         }
         /* ml438 (#74): serve from the free-list first — see ios_tail_carves. */
-        {
-            unsigned i, best = ~0u;
-            pthread_mutex_lock( &ios_tail_carve_lock );
-            for (i = 0; i < ios_tail_carve_n; i++)
-                if (ios_tail_carves[i].free && ios_tail_carves[i].size >= alloc_size &&
-                    (best == ~0u || ios_tail_carves[i].size < ios_tail_carves[best].size))
-                    best = i;
-            if (best != ~0u)
-            {
-                void *jit_rx = (char *)ios_jit_rx_base_global + ios_tail_carves[best].off;
-                void *jit_rw = (char *)ios_jit_rw_base_global + ios_tail_carves[best].off;
-                size_t got = ios_tail_carves[best].size;
-                ios_tail_carves[best].free = 0;
-                pthread_mutex_unlock( &ios_tail_carve_lock );
-                {
-                    volatile uint32_t *rw_words = (volatile uint32_t *)jit_rw;
-                    size_t nwords = got / sizeof(uint32_t);
-                    for (size_t i2 = 0; i2 < nwords; i2++) rw_words[i2] = 0xd503201fu;  /* NOP-prefill, same as fresh carves */
-                }
-                *ret = jit_rx;
-                *size_ptr = got;
-                dprintf(2, "[jit-pool] tail REUSE rx=%p size=0x%lx (asked 0x%lx) free_left=%u rev=ml438\n",
-                        jit_rx, (unsigned long)got, (unsigned long)alloc_size, ios_tail_carve_n);
-                return STATUS_SUCCESS;
-            }
-            pthread_mutex_unlock( &ios_tail_carve_lock );
-        }
+        if (ios_tail_serve_freelist( alloc_size, ret, size_ptr, "REUSE" ))
+            return STATUS_SUCCESS;
         /* Reserve from the END of the JIT pool to avoid colliding with
          * mprotect_exec's PE-image copies which take from the start.
          * ios_jit_tail_reserved is the shared file-scope counter so the
          * head allocators can refuse to grow into tail-carved buffers. */
         size_t reserve_offset = __sync_fetch_and_add(&ios_jit_tail_reserved, alloc_size);
         size_t pool_tail_off = ios_jit_pool_size_global - reserve_offset - alloc_size;
-        if (reserve_offset + alloc_size > ios_jit_pool_size_global / 2 ||
-            pool_tail_off < jit_pool_offset)
+        /* ml1020: the tail grows until it would meet the head's high-water mark
+         * plus the margin, instead of stopping at a fixed midpoint. The second
+         * clause is the real collision check and keeps the margin honest even
+         * if the head grows after the budget was computed. */
+        if (reserve_offset + alloc_size > ios_tail_budget() ||
+            pool_tail_off < jit_pool_offset + ios_tail_head_margin())
         {
             /* iOS-Madeira ml421 (ml420 death): the old "fall through to normal
              * allocation" is ALWAYS fatal for FEX — the normal path hands back
@@ -19052,6 +19320,13 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
              * fits forces the diagnosable 0xdead fault. Also roll back the
              * tail reservation — the old path leaked it on every refusal. */
             __sync_fetch_and_sub(&ios_jit_tail_reserved, alloc_size);
+            /* ml1020: RE-SCAN before giving up. The first scan ran before the
+             * reservation; carves are freed by other threads continuously (w50:
+             * 39 REUSE and as many FREE events, several per ten log lines), so a
+             * carve released in that window is exactly the difference between a
+             * slower buffer and the deliberate 0xdead fault. */
+            if (ios_tail_serve_freelist( alloc_size, ret, size_ptr, "REUSE-LATE" ))
+                return STATUS_SUCCESS;
             ERR("NtAllocateVirtualMemoryEx iOS: JIT-pool tail exhausted for FEX EC_CODE %zu bytes\n",
                 (size_t)*size_ptr);
             /* ml459 (#75): dump the carve table on the FIRST refusal — the
@@ -19060,11 +19335,16 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
              * and never returned. free=0 rows are the pinned set; cross-check
              * against [pool-tail] PIN lines to name their owners. */
             {
-                static int census_done;
-                if (!census_done)
+                /* ml1020: rate-limited, not once-only. w50 printed this census
+                 * at the FIRST refusal (11 carves, free=0) and then went silent
+                 * for 42 more refusals and four more carves, so the log could
+                 * not say whether the fatal refusal was "budget spent" or "every
+                 * carve happened to be live at this instant". Those need
+                 * different fixes, so both must be visible. */
+                static unsigned long census_n;
+                if (++census_n <= 2 || (census_n & (census_n - 1)) == 0)
                 {
                     unsigned ci; size_t live = 0, freed = 0;
-                    census_done = 1;
                     pthread_mutex_lock( &ios_tail_carve_lock );
                     for (ci = 0; ci < ios_tail_carve_n; ci++)
                     {
@@ -19076,17 +19356,32 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
                         else live += ios_tail_carves[ci].size;
                     }
                     pthread_mutex_unlock( &ios_tail_carve_lock );
-                    dprintf(2, "[pool-tail] TOTALS carves=%u live=0x%lx (%lu MB) free=0x%lx (%lu MB) rev=ml459\n",
-                            ios_tail_carve_n, (unsigned long)live, (unsigned long)(live >> 20),
-                            (unsigned long)freed, (unsigned long)(freed >> 20));
+                    dprintf(2, "[pool-tail] TOTALS #%lu carves=%u live=0x%lx (%lu MB) free=0x%lx (%lu MB) "
+                               "budget=0x%lx resv=0x%lx head_hw=0x%lx gen_cap=0x%lx rev=ml1020\n",
+                            census_n, ios_tail_carve_n, (unsigned long)live, (unsigned long)(live >> 20),
+                            (unsigned long)freed, (unsigned long)(freed >> 20),
+                            (unsigned long)ios_tail_budget(), (unsigned long)ios_jit_tail_reserved,
+                            (unsigned long)jit_pool_offset, (unsigned long)ios_tail_gen_cap());
                 }
             }
-            dprintf(2, "[jit-pool] TAIL REFUSED (FEX EC_CODE): want=0x%lx tail_resv=0x%lx head_used=0x%lx/0x%lx — REFUSING honestly rev=ml421 (was: fall to normal alloc = guest-band non-exec buffer = ClearCache wild write)."
-                       " *** FEX WILL HALVE ITS CODE BUFFER AND RUN SLOWER. If this repeats, the pool is too small:"
-                       " put a larger number of MB in Documents/madeira-pool.txt (current %s MB, valid 256..1152) *** rev=ml901\n",
-                    (unsigned long)alloc_size, (unsigned long)reserve_offset,
-                    (unsigned long)jit_pool_offset, (unsigned long)ios_jit_pool_size_global,
-                    getenv("MADEIRA_POOL_MB") ? getenv("MADEIRA_POOL_MB") : "?");
+            {
+                /* ml1020: rate-limited. w50 spent 43 identical copies of this
+                 * 300-character line, one dprintf syscall each, in the window
+                 * where the process was already dying. */
+                static unsigned long refuse_n;
+                unsigned fn = 0; size_t fb = 0;
+                ios_tail_free_census( &fn, &fb, NULL );
+                if (++refuse_n <= 4 || (refuse_n & (refuse_n - 1)) == 0)
+                    dprintf(2, "[jit-pool] TAIL REFUSED #%lu (FEX EC_CODE): want=0x%lx tail_resv=0x%lx budget=0x%lx head_hw=0x%lx/0x%lx "
+                               "free_carves=%u (0x%lx) — REFUSING honestly rev=ml1020 (was: fall to normal alloc = guest-band non-exec buffer = ClearCache wild write)."
+                               " *** FEX WILL HALVE ITS CODE BUFFER AND RUN SLOWER. If this repeats, the pool is too small:"
+                               " put a larger number of MB in Documents/madeira-pool.txt (current %s MB, valid 256..1152) *** \n",
+                            refuse_n, (unsigned long)alloc_size, (unsigned long)reserve_offset,
+                            (unsigned long)ios_tail_budget(),
+                            (unsigned long)jit_pool_offset, (unsigned long)ios_jit_pool_size_global,
+                            fn, (unsigned long)fb,
+                            getenv("MADEIRA_POOL_MB") ? getenv("MADEIRA_POOL_MB") : "?");
+            }
             return STATUS_NO_MEMORY;
         }
         else
@@ -19701,6 +19996,59 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
     else status = STATUS_INVALID_PARAMETER;
 
     if (!status) VIRTUAL_DEBUG_DUMP_VIEW( view );
+
+#ifdef WINE_IOS
+    /* iOS-Madeira ml1030: [vprot] — WHAT ACTUALLY HAPPENED TO AN IMAGE PAGE.
+     *
+     * A guest that patches code always changes protection first, so "the page is
+     * still read-only when the store faults" has exactly three possible causes:
+     * the request never arrived, it was refused, or it was granted and did not
+     * reach the hardware.  Nothing in the log could tell those apart, so this
+     * prints all three at once for the only class where they matter — a request
+     * that targets a SEC_IMAGE view.  vprot BEFORE/AFTER comes from the page
+     * table Wine itself consults, and cur/max come from the Mach region, so a
+     * granted-but-ineffective change is visible as `after=2d host=r--`.
+     *
+     * Capped and sampled: import resolution alone issues hundreds of these at
+     * start-up, and an uncapped log on a guest-driven path is how a 77 MB log
+     * happened before.  First 48, then one in 256. */
+    if (view && (view->protect & SEC_IMAGE))
+    {
+        static unsigned long vp_n;
+        const unsigned long n = ++vp_n;
+
+        if (n <= 48 || !(n & 255))
+        {
+            BYTE after = get_page_vprot( base );
+            mach_vm_address_t qa = (mach_vm_address_t)base;
+            mach_vm_size_t qs = 0;
+            vm_region_basic_info_data_64_t qi;
+            mach_msg_type_number_t qc = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t qo = MACH_PORT_NULL;
+            unsigned cur = 0, mx = 0;
+
+            if (mach_vm_region( mach_task_self(), &qa, &qs, VM_REGION_BASIC_INFO_64,
+                                (vm_region_info_t)&qi, &qc, &qo ) == KERN_SUCCESS)
+            {
+                cur = qi.protection;
+                mx  = qi.max_protection;
+            }
+            dprintf( 2, "[vprot] ml1030 #%lu %p+0x%lx new=0x%x st=0x%x view=%p+0x%lx vp=0x%x "
+                        "vprot before=%02x after=%02x host=%c%c%c max=%c%c%c wow=%d peb=%p\n",
+                     n, base, (unsigned long)size, (unsigned)new_prot, (unsigned)status,
+                     view->base, (unsigned long)view->size, (unsigned)view->protect,
+                     vprot, after,
+                     (cur & VM_PROT_READ)    ? 'r' : '-',
+                     (cur & VM_PROT_WRITE)   ? 'w' : '-',
+                     (cur & VM_PROT_EXECUTE) ? 'x' : '-',
+                     (mx  & VM_PROT_READ)    ? 'r' : '-',
+                     (mx  & VM_PROT_WRITE)   ? 'w' : '-',
+                     (mx  & VM_PROT_EXECUTE) ? 'x' : '-',
+                     ios_wow_in_window( base ),
+                     NtCurrentTeb() ? (void *)NtCurrentTeb()->Peb : NULL );
+        }
+    }
+#endif
 
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
 

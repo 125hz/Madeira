@@ -873,6 +873,15 @@ final class MetalBackedView: UIView {
     /// (Task 2's 2/3-finger taps), or a touch's ORIGINAL down point read
     /// after the touch itself has already ended.
     private func mapPoint(_ p: CGPoint) -> (Int32, Int32) {
+        if desktopMode {
+            // The desktop is drawn by the window-level compositor, letterboxed
+            // inside its own presentation frame; only it knows the mapping.
+            let w = convert(p, to: nil)
+            var px: Int32 = 0, py: Int32 = 0
+            winios_desktop_point_from_window(Double(w.x), Double(w.y), &px, &py)
+            Self.cursor = CGPoint(x: CGFloat(px), y: CGFloat(py))   // keep the trackpad's cursor in step
+            return (px, py)
+        }
         let guest = guestSize()
         let g = GameSurfaceLayout.map(point: p, guest: guest, aspect: drawableAspect(),
                                       bounds: bounds, mode: effectiveDisplayMode())
@@ -1090,7 +1099,12 @@ final class MetalBackedView: UIView {
     private static let tmHoldDelay: TimeInterval = 0.25
     private static let tmSlop: CGFloat = 10
 
-    private var touchPointerMode: Bool { !desktopMode && InputSettings.shared.touchMode }
+    // Touch mode applies in BOTH sessions. It was first gated to direct launches
+    // only, so on the Wine desktop -- the place a user most wants "tap where I
+    // mean, hold to drag a window" -- the trackpad path still ran and the cursor
+    // had to be dragged around. Desktop taps map through the compositor's own
+    // desktop-pixel mapping (winios_desktop_point_from_window), see mapPoint.
+    private var touchPointerMode: Bool { InputSettings.shared.touchMode }
 
     private func tmResetGesture() {
         tmDownPoints.removeAll()
@@ -1285,6 +1299,10 @@ final class MetalBackedView: UIView {
         // de-duplication, and it only applies while a real mouse is live.
         // ========================================================================
         if HardwareInput.shared.shouldIgnore(touches, logging: true) { return }
+        if desktopMode && touchPointerMode {
+            touchModeBegan(touches)
+            return
+        }
         guard desktopMode else {
             // Task 2 — "Touch" pointer mode has its own multi-finger state
             // machine (tap/hold/2-3-finger tap), independent of the single-
@@ -1363,6 +1381,10 @@ final class MetalBackedView: UIView {
         // otherwise a click-drag with the AssistiveTouch cursor would turn the
         // camera a second time on top of the GCMouse deltas already doing it.
         if HardwareInput.shared.shouldIgnore(touches, logging: false) { return }
+        if desktopMode && touchPointerMode {
+            touchModeMoved(touches, event)
+            return
+        }
         guard desktopMode else {
             if touchPointerMode {
                 touchModeMoved(touches, event)
@@ -1446,6 +1468,10 @@ final class MetalBackedView: UIView {
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         if pointerButtons(touches, with: event, ending: true) { return }    // ml664
         if HardwareInput.shared.shouldIgnore(touches, logging: false) { return }  // ml665
+        if desktopMode && touchPointerMode {
+            touchModeEnded(touches, event)
+            return
+        }
         guard desktopMode else {
             if touchPointerMode {
                 touchModeEnded(touches, event)
@@ -1511,6 +1537,10 @@ final class MetalBackedView: UIView {
             return
         }
         if HardwareInput.shared.shouldIgnore(touches, logging: false) { return }  // ml665
+        if desktopMode && touchPointerMode {
+            touchModeCancelled(touches)
+            return
+        }
         guard desktopMode else {
             if touchPointerMode {
                 touchModeCancelled(touches)
