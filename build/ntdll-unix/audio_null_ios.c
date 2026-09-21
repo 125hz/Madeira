@@ -409,6 +409,7 @@ struct ios_stream {
     _Atomic uint32_t stat_pad_max;
     _Atomic uint32_t stat_resyncs;
     int underrun_pending;               /* render thread only: re-centre next callback */
+    unsigned int resync_holdoff;        /* render thread only: callbacks until another re-centre is allowed */
 };
 
 /* ml739: one stream object per client, mirroring Wine's CoreAudio driver.
@@ -851,14 +852,33 @@ static void ios_mix_stream(struct ios_stream *s, float *out, UInt32 nframes)
      * MADEIRA_AUDIO_RESYNC=0 disables it; the [audio] line reports resyncs=N
      * either way, so a session that never underruns is visibly a session where
      * this made no difference. */
+    if (s->resync_holdoff) s->resync_holdoff--;
     if (s->underrun_pending) {
         uint32_t period = s->sample_rate ? s->sample_rate / 100u : 480u;
+        /* ml1130: WHAT IS KEPT MUST OUTLAST THE NEXT CALLBACK.
+         *
+         * ml1100 kept exactly one 10 ms period.  The device takes a whole
+         * callback at once -- 1024 frames, 21.3 ms, on the hardware in every
+         * log -- so the very next callback found 10 ms queued, ran dry, armed
+         * this branch again, and the client's refill was trimmed to 10 ms
+         * again: one underrun and one resync per callback for the rest of the
+         * session (a device log: underruns=1630 resyncs=1628, pad_ms=10..10).
+         * A single start-up hiccup turned into permanently broken audio.
+         *
+         * Keep two callbacks' worth of CLIENT frames plus a period, correct
+         * only when the queue is more than twice that, and never twice within
+         * ~2 s of callbacks, so this can only ever shorten a queue that is
+         * genuinely long and can never feed itself. */
+        uint64_t per_cb = ((uint64_t)nframes * step + 0xffffu) >> 16;
+        uint64_t keep;
         if (!period) period = 1;
-        if (avail > 2ull * period && ios_audio_resync_on()) {
-            play += avail - period;
-            avail = period;
+        keep = 2ull * per_cb + period;
+        if (avail > 2ull * keep && !s->resync_holdoff && ios_audio_resync_on()) {
+            play += avail - keep;
+            avail = keep;
             atomic_fetch_add_explicit(&s->stat_resyncs, 1, memory_order_relaxed);
             s->underrun_pending = 0;
+            s->resync_holdoff = 100;
         } else if (avail >= 1) {
             /* Refilled without overshooting, or the knob is off: either way the
              * dry spell is over and there is nothing left to correct. */
