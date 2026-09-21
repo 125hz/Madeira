@@ -13380,3 +13380,235 @@ guest-slots=… verdict=…`). Consequences:
      `MADEIRA-EXIT: … status=90`. Any other status names the case; rows 1-4
      failing with the process still alive is a status mismatch, rows 1-4
      killing the process is this fix not reaching that call.
+
+- 2026-09-21 — **CUTSCENE VOICE THAT "RANDOMLY CUTS OUT": THE FABRICATED WMA
+  FLAGS WORD, NOT THE FABRICATED BIT RATE. The block-size count in flags2 is
+  wrong for one whole class of wave-bank stream, and libavcodec hides that at
+  22 kHz and cannot at 32 kHz.** Host-reproduced on real wave banks, fixed in
+  `build/ntdll-unix/winegstreamer_unixlib_ios.c`, and proved on seventeen
+  extracted streams covering every combination one bank holds.
+
+  **THE SYMPTOM.** Device log `madeira-log (1).txt` lines 8197-8300 (the same
+  signature is in three earlier logs of the same title, so it is not one
+  install): a cutscene opens a dozen decoders at once, the stereo ones accept
+  immediately, and every `32000Hz 1ch block=1280` one walks the old three-rung
+  ladder and ends at
+
+      [wma] transform ...: no configuration decodes this stream
+            (32000Hz 1ch block=1280 flags2=0x1f) -- MUTING: silence from here on
+
+  or, worse, at `provisional: 22857 bit/s with use_variable_block_len cleared`
+  followed by `accepted: 22857 bit/s after 3 consecutive sane packets` -- a
+  configuration that decodes one frame per superframe instead of eight. Voice
+  that mutes on some lines and plays wrong on others is exactly "cuts out at
+  random".
+
+  **THE EVIDENCE IS ON THIS PC, AND IT IS NOT A LOG.** The title's wave banks
+  live inside its packfiles; scanning for the `WBND` signature finds 221 banks
+  in one 391 MB packfile, and parsing the entry metadata the way
+  `FACT_INTERNAL_ParseWaveBank` does (`wine/libs/faudio/src/FACT_internal.c`,
+  `FACTWaveBankMiniWaveFormat` in `include/FACT.h`) gives the WMA entries as
+  six distinct `(channels, rate, block-align index, avg-bytes index)`
+  combinations. Extracting three entries of each and decoding them through the
+  same libavcodec this port links is what settled every question below.
+
+  **FACT IS NOT MIS-READING ANYTHING -- that was checked first.** A failing
+  entry's format word is `0x110fa007`: tag 3 (WMA), 1 channel, 32000 Hz,
+  `wBlockAlign` byte 0x22, high bit clear. `0x22 & 0x1F` = 2 ->
+  `aWMABlockAlign[2]` = 1280 and `0x22 >> 5` = 1 -> `aWMAAvgBytesPerSec[1]` =
+  24000 B/s, which is precisely what the device log prints (`block=1280
+  avg=24000B/s`). The bit layout, both table indices and both table lookups are
+  right, so no FACT change and no PE `xactengine`/`xaudio2` rebuild were
+  needed. The 24000 B/s is simply the lie `libavformat/xwma.c` documents:
+  **every** WMA entry in the bank declares 24000 or 12000 B/s regardless of
+  content.
+
+  **AND THE BIT RATE THE TABLE GIVES IS ALREADY CORRECT.** Two independent
+  arithmetic checks agree on 20000 bit/s for the failing combination: the
+  bank's own `Duration` for one entry is 2021376 samples = 987 frames of 2048
+  over 126 packets of 1280 bytes = 8 frames per packet = 20000 bit/s exactly;
+  and the frames-per-packet nibble in the packet headers averages 7.85 over the
+  whole stream. `xwma_true_bit_rate()` already returned 20000 and the decoder
+  was already opened with it. **The bit rate was never the bug.**
+
+  **THE BUG: `nb_block_sizes`.** `ff_wma_init` (`libavcodec/wma.c`) takes the
+  count of MDCT block sizes from bits 3-4 of flags2:
+
+      nb = ((flags2 >> 3) & 3) + 1;
+      if ((bit_rate / channels) >= 32000) nb += 2;
+      if (nb > frame_len_bits - BLOCK_MIN_BITS) nb = frame_len_bits - BLOCK_MIN_BITS;
+      s->nb_block_sizes = nb + 1;
+
+  and `wma_decode_block` then reads its three block-length fields
+  `av_log2(nb_block_sizes - 1) + 1` bits wide each. An xWMA caller has no codec
+  private data to pass -- `FAudio_WMADEC_init` fabricates
+  `{0,0,0,0,31,0,0,0,...}` and FFmpeg's own xWMA demuxer fabricates the same
+  31 -- and 31 has bits 3-4 = 3, so `nb = 4` and `nb_block_sizes = 5`, which is
+  **three** bits per field. This stream's encoder used three block sizes, which
+  is **two**. Every frame is then read three bits out of phase, and the decoder
+  says so in the exact words the device log carries: `next_block_len_bits 6 out
+  of range`. Hand-checking the first packet against each possible
+  `byte_offset_bits` reproduces all four messages the log and the host sweep
+  print, in the right order, which is what turned this from a theory into a
+  reading of the bitstream.
+
+  **WHY IT LOOKED LIKE A PROPERTY OF ONE COMBINATION.** `nb_max =
+  frame_len_bits - BLOCK_MIN_BITS`. At 22050 Hz and below `frame_len_bits` is
+  10, `nb_max` is 3, and the clamp pins `nb_block_sizes` at 4 **whatever bits
+  3-4 say** -- so the fabricated 31 is harmless and every 22 kHz stream in the
+  bank decodes. At 32000 Hz and above `frame_len_bits` is 11, `nb_max` is 4,
+  the clamp lets 5 through, and the fabrication becomes audible. The 32 kHz
+  STEREO stream in the same bank genuinely uses five block sizes, so it decodes
+  with 31 as well -- which is why the failure looked like it belonged to "mono
+  1280" rather than to a flags word nobody owns.
+
+  **THE RATE TABLE, MEASURED** (`aWMAAvgBytesPerSec x 8` is what a header can
+  declare; "chosen" is what actually decodes):
+
+  | ch | rate  | blk idx | blk  | avg idx | declared | xwma.c | CHOSEN           | before    | after     |
+  |----|-------|---------|------|---------|----------|--------|------------------|-----------|-----------|
+  | 1  | 22050 | 0       | 929  | 1       | 192000   | 20000  | 20000 / 0x1f     | 61/61     | 61/61     |
+  | 2  | 22050 | 1       | 1487 | 1       | 192000   | 32000  | 32000 / 0x1f     | 1971/1971 | 1971/1971 |
+  | 1  | 32000 | 2       | 1280 | 1       | 192000   | 20000  | 20000 / **0x17** | **0/183** | **183/183** |
+  | 2  | 32000 | 8       | 2304 | 1       | 192000   | 48000  | 48000 / 0x1f     | 161/161   | 161/161   |
+  | 1  | 44100 | 3       | 2230 | 0       | 96000    | 48000  | 48000 / 0x1f     | 14/14     | 14/14     |
+  | 2  | 44100 | 6       | 4459 | 0       | 96000    | (none) | 96000 / 0x1f     | 25/25     | 25/25     |
+
+  Packets clean / packets total, summed over three extracted streams per
+  combination (two for 1ch 44100, which has only two entries long enough).
+  Seventeen streams, ~2600 packets, every one of them clean after; the 32 kHz
+  mono streams decoded **none** before, at any of the seven declarable rates.
+
+  **SO THE SEARCH IS OVER DERIVED PARAMETERS, NOT DECLARED ONES.** That is the
+  generic lesson and the shape of the fix. `bit_rate` and `flags2` reach the
+  decoder only through four quantities -- `byte_offset_bits`, `nb_block_sizes`,
+  `use_noise_coding` and the coefficient VLC table -- and two candidates with
+  the same four build the same decoder however different their declared numbers
+  look. `wma_build_candidates()` enumerates in evidence order (the rate the
+  decoder is open with, `xwma.c`'s table value, the declarable rate nearest
+  this stream's MULTI-packet frames-per-packet average, the container's own
+  rate, the remaining declarable rates, then a synthesised rate for every
+  `byte_offset_bits` class none of those reached) crossed with every flags2
+  worth trying at each (the caller's, then block-size counts 4, 3, 2 and 1,
+  then no block switching), and `add_candidate()` drops duplicates by that
+  four-part signature. The result is short -- 32 rungs for the failing
+  combination -- finite, and complete in the sense the old ladder was not: it
+  cannot reach "no configuration decodes this stream" before every distinct
+  superframe-offset width and block-size count has been tried.
+
+  **AND A RUNG IS JUDGED BY THE STREAM'S OWN ARITHMETIC.** "`avcodec_send_packet`
+  returned 0" is far too weak, and this is the second time that has cost a
+  round: switching the bit reservoir off makes every packet succeed as one
+  independent frame, which is what the old ladder's last guess did and why a
+  stream could be accepted and then sound wrong. `wma_packet_ok()` compares the
+  frames a packet produced against the count its own superframe header
+  declares -- the nibble this file already logged -- with slack for a
+  bit-reservoir restart and for libavcodec's two frames of decoder priming
+  (`wma_decode_init` sets `avctx->internal->skip_samples = 2 * frame_len`).
+  That check is what separates "it decoded" from "it decoded THIS stream", and
+  on the host it is the difference between picking `20000 / 0x17` and picking a
+  no-reservoir configuration that decodes 20 packets in a row at peak 22.5.
+
+  **A BAD PACKET NO LONGER ENDS THE STREAM.** Muting is now reserved for a
+  transform that has never produced output at all. A stream that has decoded
+  real audio and then hits a bad packet conceals it and carries on; and when
+  the ladder is exhausted with something having worked once, the decoder is
+  reopened on the rung that got furthest rather than left holding whichever
+  rung happened to be last.
+
+  **CHANGES** (all in `build/ntdll-unix/winegstreamer_unixlib_ios.c`; no other
+  file changed, no FACT change, no PE DLL rebuild):
+  * `:152` header comment -- the new section, with the `ff_wma_init` excerpt and
+    the `nb_max` clamp that hides the bug below 32 kHz.
+  * `:270` `MADEIRA_WMA_MAX_CANDIDATES` (48), `MADEIRA_WMA_NIBBLE_WINDOW` (16),
+    `struct wma_candidate`.
+  * `:325` / `:381` `struct wma_transform` -- `header_rate`, `flags2_open`,
+    `candidates[]`, `candidate_count`, `coded_frames`, `frame_slack`,
+    `nibble_sum`, `nibble_packets`, `accepted`, `search_done`, `search_off`,
+    `best_rate` / `best_flags2` / `best_good`; dead `alt_tried` removed.
+  * `:699` `open_decoder` -- records `flags2_open` and re-arms `frame_slack`.
+  * `:879` `implied_bit_rate_avg`, `:898` `wma_derived`, `:938`
+    `wma_rate_for_byte_offset_bits`, `:949` `wma_declared_rates`, `:952`
+    `add_candidate`, `:986` `add_flags_variants`, `:1002` `wma_build_candidates`,
+    `:1074` `wma_packet_ok`.
+  * `:1200` `next_candidate` -- now a cursor into the regenerated ladder.
+  * `:1249` `send_one_packet` -- counts CODED frames.
+  * `:1273`-`:1442` `decode_staged` -- nibble accounting, `wma_packet_ok`
+    acceptance, the exhaustion fallback, conceal-and-continue, and silence only
+    when a packet produced nothing.
+  * `:1587` `transform_create` -- `header_rate`, `MADEIRA_WMA_SEARCH`.
+  * `:1726` `transform_push_data` -- `push #` lines capped at 2 per decoder,
+    not 8 (a cutscene opens a dozen decoders at once and the phase question
+    these lines answer is settled by the first one; `MADEIRA_DIAG=1` still
+    prints every one).
+  * `:452` log-cap banner `rev=ml990` -> `rev=ml1120`.
+
+  **KNOBS.** `MADEIRA_WMA_SEARCH=0` pins the decoder to what the media type
+  alone gives and mutes a stream it cannot decode -- exactly the shipped
+  behaviour before this. Verified on the host: with it set, the 32 kHz mono
+  stream mutes and the 32 kHz stereo one still decodes 119/119.
+  `MADEIRA_DIAG=1` still lifts the `[wma]` log cap; `MADEIRA_WMA_DUMP=1` still
+  writes the packets.
+
+  **HOST ARTIFACTS** (WSL, `~/wmawork`, all built against `~/ffhost`, FFmpeg
+  7.1.1): `xwbscan.py` (wave-bank scanner/extractor), `streams/*.wmadata` (17
+  extracted streams), `wmasweep` (rate sweep + scoring), `wmascan` / `wmagrid`
+  (parameter-space probes, the latter validated against the three combinations
+  that already worked -- it picks their known-good configuration first),
+  `wmaone` (per-packet trace), and `wmaproof` -- which compiles lines 854-1220
+  of the shipped file verbatim as `ladder_slice.inc` against a stub transform,
+  so the numbers in the table above are the shipping code's and not a
+  paraphrase of it.
+
+  **BUILT AND VERIFIED BY READING THE ARTIFACT.** `.xtool/build-wine-native.sh`
+  with WSL idle; `libntdll_unix.a` 1,956,080 bytes (was 1,951,936), 33 members,
+  `winegstreamer_unixlib.o` a Mach-O 64-bit arm64 object. `strings` finds `an
+  untried superframe-offset width`, `no block switching`, `frames-per-packet
+  average`, `ladder armed`, `rev=ml1120` and `frames it declares`, and no
+  longer finds `the rate implied by this packet's own nb_frames nibble`, `xWMA
+  fake-rate candidate available` or `with use_variable_block_len cleared`. (The
+  `rev=ml990` still in the archive is `server_ios.c`'s `[srv-stats]` and
+  `virtual_ios.c`'s `[footprint]`, not this file.)
+
+  **WHAT IS UNVERIFIED ON DEVICE.** Everything above is host measurement on
+  bytes extracted from the wave banks; the device has not run this build. Two
+  things in particular are untested there: the ladder's cost at stream start --
+  up to 32 `avcodec_open2` calls on the audio thread for a stream that needs
+  the last rung, where a working stream costs one or two -- and the
+  conceal-and-continue path, which no host stream exercised because after the
+  fix every packet decodes.
+
+  **WHAT THE NEXT DEVICE LOG SHOULD SHOW.**
+  1. `[wma] decoder created ... 32000Hz 1ch block=1280 ... [ladder armed]`,
+     then ONE `packet 0 did not decode at 20000 bit/s flags2=0x1f; trying 20000
+     bit/s flags2=0x17 -- that rate with a different block-size count`, then
+     `provisional: 20000 bit/s flags2=0x17 ... decoded packet 0 into N of the N
+     frames it declares`, then `accepted: 20000 bit/s flags2=0x17 after 3
+     consecutive sane packets`. Three lines per decoder, not the eight the old
+     ladder printed.
+  2. **No `MUTING: silence from here on` at all**, and no `accepted:` line
+     naming a rate that is not one of 20000 / 32000 / 48000 / 96000.
+  3. The `32000Hz 2ch block=2304` and `22050Hz 2ch block=1487` decoders
+     accepting on their FIRST candidate exactly as before -- an extra `trying
+     ...` line under either of those is a regression in the candidate ORDER,
+     not in the candidate set.
+  4. At most two `push #` lines per transform.
+  5. `[wma] transform ...: ladder exhausted after N rungs; back to ...` would
+     mean a stream this ladder still cannot hold; the rung it falls back to and
+     the `N` are then the whole diagnosis, and `MADEIRA_WMA_DUMP=1` gets the
+     bytes.
+
+  **THE OTHER HALF OF THAT LOG'S SYMPTOM LIST, NOT RE-FIXED.** The same log
+  carries `[audio] ... max_gap_ms=68.4` and `limiter_min_gain=0.979 (20 blocks
+  limited)`. That log predates the ml1100 audio work: it has **zero**
+  `resyncs=` and `pad_ms=` lines, which are the markers that entry added, so it
+  is from a build without the period-signalling fix or `MADEIRA_AUDIO_RESYNC`.
+  Two further observations argue against spending a round on it: `underruns=0`
+  everywhere, so the post-underrun re-centre would never have fired anyway; and
+  the steady-state `max_gap_ms` of 22-28 ms is the session's own 21.3 ms
+  `ioBuffer` plus jitter, with 68.4 a single value at stream start. The limiter
+  numbers are the more interesting residue -- later windows read
+  `limiter_min_gain=0.574 (96 blocks limited)` with a stream peak of 1.705 --
+  but that is the mixer being handed hot audio, a different question from this
+  entry's, and it should be read again on a build that has ml1100 in it before
+  anyone decides it is a bug.

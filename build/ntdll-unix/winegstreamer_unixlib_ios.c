@@ -149,6 +149,59 @@
  * xWMA fixup, not measured here.
  *
  * -------------------------------------------------------------------------
+ * THE BIT RATE WAS NEVER THE WHOLE STORY: flags2's BLOCK-SIZE COUNT
+ *                                          (MADEIRA, 2026-09-21, host-proved)
+ * -------------------------------------------------------------------------
+ * Real wave-bank streams were finally decoded on the host, packet by packet,
+ * through this same libavcodec.  One combination failed every declared bit
+ * rate -- 32000 Hz mono, block_align 1280 -- while three others from the same
+ * bank decoded perfectly.  The bit rate the table names for it (20000) is
+ * RIGHT: the wave bank's own duration divided by its packet count says eight
+ * 2048-sample frames per 1280-byte packet, which is 20000 bit/s exactly, and
+ * the frames-per-packet nibble in the packet headers averages 7.85.
+ *
+ * What is wrong is the OTHER number the caller invents.  ff_wma_init derives
+ * the count of MDCT block sizes from bits 3-4 of flags2:
+ *
+ *     nb = ((flags2 >> 3) & 3) + 1;
+ *     if ((bit_rate / channels) >= 32000) nb += 2;
+ *     if (nb > frame_len_bits - BLOCK_MIN_BITS) nb = frame_len_bits - BLOCK_MIN_BITS;
+ *     s->nb_block_sizes = nb + 1;
+ *
+ * and wma_decode_block then reads its three block-length fields
+ * av_log2(nb_block_sizes - 1) + 1 bits wide each.  The synthetic flags2 = 31
+ * has bits 3-4 = 3, so nb = 4 and nb_block_sizes = 5, which is THREE bits per
+ * field; this stream's encoder used three block sizes, which is TWO.  Every
+ * frame is then read three bits out of phase and the decoder reports exactly
+ * what the device log shows -- "next_block_len_bits 6 out of range".
+ *
+ * That is also why the failure looked like it belonged to one rate: at 22050
+ * Hz and below, frame_len_bits is 10 and the `nb_max` clamp above pins
+ * nb_block_sizes at 4 whatever bits 3-4 say, so the fabricated 31 is harmless.
+ * At 32000 Hz and above, frame_len_bits is 11, the clamp lets 5 through, and
+ * the fabrication becomes audible -- as silence, because the old ladder ran
+ * out of guesses and muted.
+ *
+ * SO THE SEARCH IS OVER DERIVED PARAMETERS, NOT DECLARED ONES.  bit_rate and
+ * flags2 reach the decoder only through four quantities -- byte_offset_bits,
+ * nb_block_sizes, use_noise_coding and the coefficient VLC table -- and two
+ * candidates with the same four are the same decoder however different their
+ * declared numbers look.  wma_build_candidates() below enumerates them in
+ * evidence order and drops duplicates by that signature, so the ladder is
+ * short, finite and complete: it cannot mute a stream before every distinct
+ * superframe-offset width and block-size count has been tried.
+ *
+ * AND A CANDIDATE IS JUDGED BY THE STREAM'S OWN ARITHMETIC.  "avcodec_send_
+ * packet returned 0" is far too weak -- switching the bit reservoir off makes
+ * every packet "succeed" as one independent frame.  A packet decoded under the
+ * right parameters yields exactly the frame count its own superframe header
+ * declares, so wma_packet_ok() compares the two (see its comment for the
+ * slack), and that is what separates "it decoded" from "it decoded THIS
+ * stream".  Host result, real wave-bank streams, seventeen of them across all
+ * six (channels, rate, block_align) combinations one bank holds: every packet
+ * of every stream, where before this the 32000 Hz mono streams decoded none.
+ *
+ * -------------------------------------------------------------------------
  * A FAILED PACKET MUST STILL PRODUCE TIME
  * -------------------------------------------------------------------------
  * Dropping a packet silently is not the same as producing silence, and the
@@ -210,6 +263,26 @@
  * reported once. */
 #define MADEIRA_WMA_MAX_FAIL_LOGS 8
 
+/* Upper bound on the parameter ladder.  The generator below deduplicates by
+ * the parameters libavcodec actually derives, so a real stream uses far fewer
+ * than this; the cap is only there so a malformed media type cannot make the
+ * list grow. */
+#define MADEIRA_WMA_MAX_CANDIDATES 48
+
+/* How many packet headers the frames-per-packet average is taken over before
+ * it is used to rank candidates.  One packet is not enough: the nibble swings
+ * by three or four either side of the mean on a bit-reservoir stream, which is
+ * how the old ladder came to try 26666 and 22857 bit/s for a 20000 bit/s
+ * stream. */
+#define MADEIRA_WMA_NIBBLE_WINDOW 16
+
+struct wma_candidate
+{
+    INT64 bit_rate;
+    int flags2;
+    const char *why;
+};
+
 static const GUID madeira_MFMediaType_Audio =
     { 0x73647561, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
 
@@ -249,7 +322,8 @@ struct wma_transform
     UINT32 channel_mask;
     INT64 bit_rate;         /* what the decoder is open with now */
     INT64 bit_rate_alt;     /* xwma.c's normalised value, 0 if none applies */
-    BOOL alt_tried;
+    INT64 header_rate;      /* nAvgBytesPerSec * 8, whatever it is worth */
+    int flags2_open;        /* the flags2 the decoder is open with */
     BOOL produced_output;
 
     UINT32 block_align;     /* input packet size, bytes */
@@ -303,6 +377,23 @@ struct wma_transform
     UINT32 insane_frames;
     BOOL frame_rejected;   /* set by append_frame for the packet in flight */
     BOOL muted;
+
+    /* ml1120: the ladder, and what judges it */
+    struct wma_candidate candidates[MADEIRA_WMA_MAX_CANDIDATES];
+    UINT32 candidate_count;
+    UINT32 coded_frames;    /* frames the packet in flight produced */
+    UINT32 frame_slack;     /* frames the next packet may legitimately lose */
+    UINT32 nibble_sum;      /* frames-per-packet nibbles seen so far, and */
+    UINT32 nibble_packets;  /* how many headers they came from */
+    BOOL accepted;          /* a candidate has proved itself; stop searching */
+    BOOL search_done;       /* every rung has been tried */
+    BOOL search_off;        /* MADEIRA_WMA_SEARCH=0 */
+
+    /* the rung that got furthest, to fall back to rather than leaving the
+     * decoder holding whatever the last rung was */
+    INT64 best_rate;
+    int best_flags2;
+    UINT32 best_good;
 
     /* MADEIRA_WMA_DUMP=1: the exact bytes, for decoding on the host */
     int dump_fd;
@@ -358,7 +449,7 @@ static unsigned int wma_log_count;
             dprintf( 2, "[wma] " fmt, ## __VA_ARGS__ );                              \
         else if (_n == MADEIRA_WMA_MAX_LOGS + 1)                                     \
             dprintf( 2, "[wma] further per-packet lines suppressed after %u "         \
-                        "(rev=ml990; MADEIRA_DIAG=1 removes the cap)\n",              \
+                        "(rev=ml1120; MADEIRA_DIAG=1 removes the cap)\n",             \
                      (unsigned int)MADEIRA_WMA_MAX_LOGS );                           \
         else if (madeira_diag_on())                                                  \
             dprintf( 2, "[wma] " fmt, ## __VA_ARGS__ );                              \
@@ -605,6 +696,14 @@ static int open_decoder( struct wma_transform *transform, INT64 bit_rate, int fl
     }
     transform->avctx = avctx;
     transform->bit_rate = bit_rate;
+    transform->flags2_open = flags2_override >= 0 ? flags2_override
+        : (int)wma_flags2( transform->codec_id, transform->extradata,
+                           transform->extradata_size );
+    /* A fresh decoder primes itself: wma_decode_init sets
+     * avctx->internal->skip_samples to two frames and the bit reservoir starts
+     * empty, so the first packet after this legitimately yields up to three
+     * frames fewer than its header declares (wma_packet_ok). */
+    transform->frame_slack = 3;
     return 0;
 }
 
@@ -774,6 +873,212 @@ static INT64 implied_bit_rate( struct wma_transform *transform, UINT nb_frames )
     return (INT64)((UINT64)transform->block_align * 8 * transform->rate / samples);
 }
 
+/* The same arithmetic over every packet header seen so far.  A bit-reservoir
+ * stream's nibble swings several frames either side of its mean, so only the
+ * average names the rate; packet 0 on its own names a neighbour of it. */
+static INT64 implied_bit_rate_avg( struct wma_transform *transform )
+{
+    UINT64 samples;
+
+    if (!transform->nibble_sum || !transform->nibble_packets) return 0;
+    samples = (UINT64)transform->nibble_sum << wma_frame_len_bits( transform->rate );
+    return (INT64)((UINT64)transform->block_align * 8 * transform->rate *
+                   transform->nibble_packets / samples);
+}
+
+/***********************************************************************
+ *           the parameter ladder
+ *
+ * MADEIRA 2026-09-21.  See the header comment: bit_rate and flags2 reach the
+ * WMA v1/v2 decoder only through the four quantities ff_wma_init derives from
+ * them, so the search enumerates those.  wma_derived() is ff_wma_init's own
+ * arithmetic, kept here so two candidates that would build the SAME decoder
+ * are never both tried -- that is what keeps a complete ladder short.
+ */
+static void wma_derived( UINT32 rate, UINT32 channels, INT64 bit_rate, int flags2,
+                         int *byte_offset_bits, int *nb_block_sizes, int *noise,
+                         int *coef_vlc_table )
+{
+    UINT flb = wma_frame_len_bits( rate );
+    float bps = (float)bit_rate / (float)(channels * rate);
+    float bps1 = channels == 2 ? bps * 1.6f : bps;
+    UINT32 sr1 = rate >= 44100 ? 44100 : (rate >= 22050 ? 22050 :
+                 (rate >= 16000 ? 16000 : (rate >= 11025 ? 11025 : 8000)));
+    int nb, nb_max;
+
+    *byte_offset_bits = av_log2( (int)(bps * (1 << flb) / 8.0 + 0.5) ) + 2;
+
+    if (flags2 & 0x0004)
+    {
+        nb = ((flags2 >> 3) & 3) + 1;
+        if ((bit_rate / channels) >= 32000) nb += 2;
+        nb_max = (int)flb - 7;   /* BLOCK_MIN_BITS */
+        if (nb > nb_max) nb = nb_max;
+        *nb_block_sizes = nb + 1;
+    }
+    else *nb_block_sizes = 1;
+
+    *noise = 1;
+    if (sr1 == 44100) { if (bps1 >= 0.61f) *noise = 0; }
+    else if (sr1 == 22050) { if (bps1 >= 1.16f) *noise = 0; }
+    else if (sr1 == 8000) { if (bps > 0.75f) *noise = 0; }
+
+    *coef_vlc_table = 2;
+    if (rate >= 32000)
+    {
+        if (bps1 < 0.72f) *coef_vlc_table = 0;
+        else if (bps1 < 1.16f) *coef_vlc_table = 1;
+    }
+}
+
+/* A bit rate that lands ff_wma_init on a given byte_offset_bits, so a
+ * superframe-offset width no declared rate reaches is still tried before a
+ * stream is given up on.  The middle of the av_log2 window, so rounding in
+ * either direction stays inside it. */
+static INT64 wma_rate_for_byte_offset_bits( UINT32 rate, UINT32 channels, int bob )
+{
+    double target = 1.5 * (double)(1 << (bob - 2));
+
+    return (INT64)(target * 8.0 * channels * rate / (double)(1 << wma_frame_len_bits( rate )));
+}
+
+/* The bit rates an xWMA/XACT wave-bank header can declare: its average-bytes
+ * table times eight.  A header that lies is still lying with one of these, and
+ * each of them lands the noise-coding and coefficient-table thresholds where
+ * the encoder meant them to land -- which a synthesised rate does not. */
+static const INT64 wma_declared_rates[] =
+    { 20000, 32000, 48000, 64000, 96000, 160000, 192000 };
+
+static void add_candidate( struct wma_transform *transform, INT64 bit_rate, int flags2,
+                           const char *why )
+{
+    int bob, nbs, noise, cvt;
+    UINT32 i;
+
+    if (transform->candidate_count >= MADEIRA_WMA_MAX_CANDIDATES) return;
+    if (bit_rate <= 0) return;
+    wma_derived( transform->rate, transform->in_channels, bit_rate, flags2,
+                 &bob, &nbs, &noise, &cvt );
+    /* ff_wma_init refuses byte_offset_bits + 3 > MIN_CACHE_BITS; opening such
+     * a candidate would only cost a failed avcodec_open2. */
+    if (bob + 3 > 25) return;
+
+    for (i = 0; i < transform->candidate_count; i++)
+    {
+        int b2, n2, s2, c2;
+
+        wma_derived( transform->rate, transform->in_channels,
+                     transform->candidates[i].bit_rate, transform->candidates[i].flags2,
+                     &b2, &n2, &s2, &c2 );
+        if (b2 == bob && n2 == nbs && s2 == noise && c2 == cvt &&
+            ((transform->candidates[i].flags2 ^ flags2) & 0x0007) == 0)
+            return;
+    }
+    transform->candidates[transform->candidate_count].bit_rate = bit_rate;
+    transform->candidates[transform->candidate_count].flags2 = flags2;
+    transform->candidates[transform->candidate_count].why = why;
+    transform->candidate_count++;
+}
+
+/* Every flags2 worth trying at one bit rate, in evidence order: the one the
+ * caller supplied, then the block-size counts it may have invented wrongly,
+ * then no block switching at all. */
+static void add_flags_variants( struct wma_transform *transform, INT64 bit_rate,
+                                int flags2, const char *why, const char *why_blocks )
+{
+    int v;
+
+    add_candidate( transform, bit_rate, flags2, why );
+    for (v = 3; v >= 0; v--)
+        add_candidate( transform, bit_rate, (flags2 & ~0x18) | (v << 3), why_blocks );
+    add_candidate( transform, bit_rate, flags2 & ~0x0004, "no block switching" );
+}
+
+/* Rebuild the ordered ladder.  Called again whenever the frames-per-packet
+ * average has moved on, because that average is the only piece of evidence
+ * that improves as packets arrive; everything already tried keeps its place,
+ * since the list is regenerated from the same fixed sources in the same order
+ * and the cursor into it is an index. */
+static void wma_build_candidates( struct wma_transform *transform )
+{
+    INT64 implied = implied_bit_rate_avg( transform );
+    INT64 nearest = 0;
+    int flags2 = (int)wma_flags2( transform->codec_id, transform->extradata,
+                                  transform->extradata_size );
+    UINT32 i;
+    int bob;
+
+    transform->candidate_count = 0;
+
+    if (implied > 0)
+    {
+        INT64 best = 0;
+
+        for (i = 0; i < sizeof(wma_declared_rates) / sizeof(wma_declared_rates[0]); i++)
+        {
+            INT64 d = wma_declared_rates[i] - implied;
+
+            if (d < 0) d = -d;
+            if (!nearest || d < best) { best = d; nearest = wma_declared_rates[i]; }
+        }
+    }
+
+    add_flags_variants( transform, transform->bit_rate, flags2,
+                        "the rate the decoder was opened with",
+                        "that rate with a different block-size count" );
+    add_flags_variants( transform, transform->bit_rate_alt, flags2,
+                        "libavformat/xwma.c's fake-rate table",
+                        "that rate with a different block-size count" );
+    add_flags_variants( transform, nearest, flags2,
+                        "the declared rate nearest this stream's frames-per-packet average",
+                        "that rate with a different block-size count" );
+    add_flags_variants( transform, transform->header_rate, flags2,
+                        "the rate the container declared",
+                        "that rate with a different block-size count" );
+    for (i = 0; i < sizeof(wma_declared_rates) / sizeof(wma_declared_rates[0]); i++)
+        add_flags_variants( transform, wma_declared_rates[i], flags2,
+                            "another rate a wave-bank header can declare",
+                            "another declared rate with a different block-size count" );
+    /* and finally whatever superframe-offset width no declared rate reached,
+     * so "no configuration decodes this stream" means what it says */
+    for (bob = 7; bob <= 12; bob++)
+        add_flags_variants( transform,
+                            wma_rate_for_byte_offset_bits( transform->rate,
+                                                           transform->in_channels, bob ),
+                            flags2, "an untried superframe-offset width",
+                            "an untried superframe-offset width and block-size count" );
+}
+
+/***********************************************************************
+ *           wma_packet_ok
+ *
+ * Did this packet decode, or did it merely fail to complain?  A packet
+ * decoded under the right parameters yields exactly the frame count its own
+ * superframe header declares -- the nibble this port already logs -- and a
+ * configuration that misreads the bitstream yields a different one.  The
+ * clearest case is the bit reservoir switched off: every packet then
+ * "succeeds" as one independent frame, which is what the old ladder's last
+ * guess did and why a stream could be accepted and then sound wrong.
+ *
+ * `slack` is the frames a packet may legitimately be short by: two for
+ * libavcodec's own decoder priming (wma_decode_init sets
+ * avctx->internal->skip_samples = 2 * frame_len, trimmed from the first output
+ * after every open) plus one for a bit-reservoir restart, which happens at the
+ * start of a stream and again after any failed packet.
+ *
+ * A nibble of zero is a packet that carries only reservoir bytes for the next
+ * superframe.  It legitimately produces nothing, and libavcodec says so at
+ * WARNING level rather than failing, so it is good exactly when it produced
+ * nothing.
+ */
+static BOOL wma_packet_ok( struct wma_transform *transform, int err, UINT nibble )
+{
+    if (err < 0 || transform->frame_rejected) return FALSE;
+    if (!nibble) return transform->coded_frames == 0;
+    return transform->coded_frames <= nibble &&
+           transform->coded_frames + transform->frame_slack >= nibble;
+}
+
 /***********************************************************************
  *           MADEIRA_WMA_DUMP=1 -- the exact bytes, for the host
  *
@@ -883,47 +1188,34 @@ static void dump_packet_head( struct wma_transform *transform, const BYTE *data,
              (int)implied_bit_rate( transform, nibble_lo ), (int)transform->bit_rate );
 }
 
-/* The ordered list of parameter guesses.  Each is validated by "does a packet
- * actually decode", so a wrong one cannot be adopted silently -- and every
- * transition is logged, which is what makes the next device log an answer
- * rather than another hypothesis. */
-static BOOL next_candidate( struct wma_transform *transform, const BYTE *first_packet,
+/* The next rung of the ladder wma_build_candidates() generated.  Every rung is
+ * validated by wma_packet_ok(), so a wrong one cannot be adopted silently --
+ * and every transition is logged, which is what makes the next device log an
+ * answer rather than another hypothesis.
+ *
+ * The list is regenerated first, because the frames-per-packet average it is
+ * ordered by improves with every packet header seen; regeneration is
+ * deterministic and `candidate` is an index into it, so nothing already tried
+ * is tried twice. */
+static BOOL next_candidate( struct wma_transform *transform,
                             INT64 *bit_rate, int *flags2, const char **why )
 {
-    UINT flags2_now = wma_flags2( transform->codec_id, transform->extradata,
-                                  transform->extradata_size );
-    INT64 implied = first_packet ? implied_bit_rate( transform, first_packet[0] & 0xf ) : 0;
+    if (transform->search_off || transform->search_done) return FALSE;
 
-    for (;;)
+    wma_build_candidates( transform );
+    while (transform->candidate < transform->candidate_count)
     {
-        switch (transform->candidate++)
-        {
-        case 0:
-            if (!transform->bit_rate_alt || transform->bit_rate_alt == transform->bit_rate)
-                continue;
-            *bit_rate = transform->bit_rate_alt;
-            *flags2 = -1;
-            *why = "libavformat/xwma.c's fake-rate table";
-            return TRUE;
-        case 1:
-            if (!implied || implied == transform->bit_rate) continue;
-            *bit_rate = implied;
-            *flags2 = -1;
-            *why = "the rate implied by this packet's own nb_frames nibble";
-            return TRUE;
-        case 2:
-            /* FFmpeg does exactly this itself for flags2 == 0xd ("this fixes
-             * issue1503", wmadec.c wma_decode_init): a stream whose block
-             * lengths will not parse may simply not be using variable ones. */
-            if (!(flags2_now & 0x0004)) continue;
-            *bit_rate = implied ? implied : transform->bit_rate;
-            *flags2 = (int)(flags2_now & ~0x0004u);
-            *why = "the same rate with use_variable_block_len cleared";
-            return TRUE;
-        default:
-            return FALSE;
-        }
+        struct wma_candidate *cand = &transform->candidates[transform->candidate++];
+
+        if (cand->bit_rate == transform->bit_rate && cand->flags2 == transform->flags2_open)
+            continue;
+        *bit_rate = cand->bit_rate;
+        *flags2 = cand->flags2;
+        *why = cand->why;
+        return TRUE;
     }
+    transform->search_done = TRUE;
+    return FALSE;
 }
 
 /* Feed one packet and drain whatever frames it produced.  Returns the
@@ -938,6 +1230,7 @@ static int send_one_packet( struct wma_transform *transform, const BYTE *data, s
      * that is gone must report that, not be called. */
     if (!transform->avctx) return AVERROR(EINVAL);
     transform->frame_rejected = FALSE;
+    transform->coded_frames = 0;
 
     /* av_new_packet zero-fills AV_INPUT_BUFFER_PADDING_SIZE past the end,
      * which every bitstream reader in libavcodec reads past into. */
@@ -958,6 +1251,10 @@ static int send_one_packet( struct wma_transform *transform, const BYTE *data, s
             break;
         }
         frames += transform->frame->nb_samples;
+        /* in CODED frames, which is what the packet's own superframe header
+         * declares and what wma_packet_ok() checks it against */
+        transform->coded_frames +=
+            (UINT32)(transform->frame->nb_samples >> wma_frame_len_bits( transform->rate ));
         *status = append_frame( transform, transform->frame );
         av_frame_unref( transform->frame );
         if (*status) return 0;
@@ -983,6 +1280,8 @@ static NTSTATUS decode_staged( struct wma_transform *transform, BOOL flush_tail 
         size_t avail = transform->in_len - offset;
         size_t take = transform->block_align;
         const BYTE *data;
+        UINT nibble;
+        BOOL ok;
         int err;
 
         if (avail < take)
@@ -1003,6 +1302,15 @@ static NTSTATUS decode_staged( struct wma_transform *transform, BOOL flush_tail 
         dump_packet_to_file( transform, data, take );
         transform->packet_count++;
 
+        /* Every packet header widens the evidence the ladder is ordered by,
+         * whether or not this packet is the one being searched on. */
+        nibble = data[0] & 0xf;
+        if (transform->nibble_packets < MADEIRA_WMA_NIBBLE_WINDOW && nibble)
+        {
+            transform->nibble_sum += nibble;
+            transform->nibble_packets++;
+        }
+
         /* Muted: every candidate was tried and none produced audio.  Do not
          * keep calling a decoder that has proved it cannot decode this stream
          * -- just keep the timeline running with silence. */
@@ -1016,101 +1324,134 @@ static NTSTATUS decode_staged( struct wma_transform *transform, BOOL flush_tail 
 
         err = send_one_packet( transform, data, take, &status );
         if (status) return status;
+        ok = wma_packet_ok( transform, err, nibble );
 
-        /* THE PARAMETER SEARCH.  Only while NOTHING has decoded yet: a stream
-         * that has produced a frame has proved its parameters, and reopening
-         * under it would throw away the bit reservoir for no reason.  Each
-         * candidate is tried on this same packet and kept only if it decodes,
-         * so a wrong guess cannot be adopted; the transition is logged either
-         * way so the next log names the winner instead of implying it. */
-        if (err >= 0) transform->good_packets++;
+        /* THE PARAMETER SEARCH.  Only until a candidate is ACCEPTED: a stream
+         * that has produced the frames its own headers declare, several packets
+         * running, has proved its parameters, and reopening under it would
+         * throw away the bit reservoir for no reason.  Each candidate is tried
+         * on this same packet and kept only if that packet decodes to the right
+         * length, so a wrong guess cannot be adopted; the transition is logged
+         * either way so the next log names the winner instead of implying it. */
+        if (ok) transform->good_packets++;
         else transform->good_packets = 0;
+        if (transform->good_packets > transform->best_good)
+        {
+            transform->best_good = transform->good_packets;
+            transform->best_rate = transform->bit_rate;
+            transform->best_flags2 = transform->flags2_open;
+        }
 
-        while (err < 0 && transform->good_packets < MADEIRA_WMA_ACCEPT_PACKETS)
+        while (!ok && !transform->accepted)
         {
             INT64 was_rate = transform->bit_rate;
+            int was_flags2 = transform->flags2_open;
             INT64 bit_rate;
             const char *why;
             int flags2;
 
-            if (!next_candidate( transform, data, &bit_rate, &flags2, &why ))
+            if (!next_candidate( transform, &bit_rate, &flags2, &why ))
             {
-                /* Out of guesses.  w2 showed the alternative: a configuration
-                 * accepted on one packet, then 90 failures and noise at +19 dB
-                 * reaching the mixer.  Silence is the only honest output for a
-                 * stream this port cannot decode. */
-                if (!transform->muted)
+                /* Out of rungs.  w2 showed the alternative to muting: a
+                 * configuration accepted on one packet, then 90 failures and
+                 * noise at +19 dB reaching the mixer.  But muting is only
+                 * honest when NOTHING ever decoded -- a stream that has
+                 * produced real audio and then hits a bad packet must conceal
+                 * that packet and carry on, not fall silent for good. */
+                if (transform->best_good)
+                {
+                    /* Something decoded once.  Go back to it and conceal from
+                     * there rather than leaving the decoder holding whichever
+                     * rung happened to be last. */
+                    WMA_LOG( "transform %p: ladder exhausted after %u rungs; back to "
+                             "%d bit/s flags2=%#x, which decoded %u packets running\n",
+                             transform, transform->candidate, (int)transform->best_rate,
+                             transform->best_flags2, transform->best_good );
+                    open_decoder( transform, transform->best_rate, transform->best_flags2 );
+                }
+                else if (!transform->muted)
                 {
                     transform->muted = TRUE;
                     WMA_LOG( "transform %p: no configuration decodes this stream "
-                             "(%uHz %uch block=%u flags2=%#x, %u insane frames rejected) "
-                             "-- MUTING: silence from here on\n",
+                             "(%uHz %uch block=%u flags2=%#x, %u candidates tried, "
+                             "%u insane frames rejected) -- MUTING: silence from here on\n",
                              transform, transform->rate, transform->in_channels,
                              transform->block_align,
                              wma_flags2( transform->codec_id, transform->extradata,
                                          transform->extradata_size ),
-                             transform->insane_frames );
+                             transform->candidate, transform->insane_frames );
                 }
                 break;
             }
 
-            WMA_LOG( "nothing decoded at %d bit/s; trying %d bit/s%s -- %s\n",
-                     (int)was_rate, (int)bit_rate,
-                     flags2 >= 0 ? " with modified flags2" : "", why );
+            WMA_LOG( "packet %u did not decode at %d bit/s flags2=%#x; trying %d bit/s "
+                     "flags2=%#x -- %s\n", transform->packet_count - 1, (int)was_rate,
+                     was_flags2, (int)bit_rate, flags2, why );
             if (open_decoder( transform, bit_rate, flags2 ) < 0)
             {
                 /* Put a working context back rather than leaving the transform
                  * holding a NULL decoder. */
-                open_decoder( transform, was_rate, -1 );
-                break;
+                open_decoder( transform, was_rate, was_flags2 );
+                continue;
             }
             err = send_one_packet( transform, data, take, &status );
             if (status) return status;
-            if (err >= 0)
+            if ((ok = wma_packet_ok( transform, err, nibble )))
             {
-                /* PROVISIONAL, not accepted.  The packet decoded and its
-                 * output passed the sanity check, but w2 showed exactly that
-                 * much happening under a configuration that then produced 90
-                 * failures and noise.  The candidate is confirmed only after
-                 * MADEIRA_WMA_ACCEPT_PACKETS consecutive sane packets; until
-                 * then the search stays open and a relapse moves on to the
-                 * next guess. */
-                transform->good_packets++;
-                WMA_LOG( "provisional: %d bit/s%s (%s) decoded packet %u\n",
-                         (int)transform->bit_rate,
-                         flags2 >= 0 ? " with use_variable_block_len cleared" : "", why,
-                         transform->packet_count );
+                /* PROVISIONAL, not accepted.  The packet decoded to the length
+                 * its header declares, but a single packet is not proof: the
+                 * candidate is confirmed only after
+                 * MADEIRA_WMA_ACCEPT_PACKETS consecutive such packets, and
+                 * until then a relapse moves on to the next rung. */
+                transform->good_packets = 1;
+                if (!transform->best_good)
+                {
+                    transform->best_good = 1;
+                    transform->best_rate = transform->bit_rate;
+                    transform->best_flags2 = transform->flags2_open;
+                }
+                WMA_LOG( "provisional: %d bit/s flags2=%#x (%s) decoded packet %u "
+                         "into %u of the %u frames it declares\n",
+                         (int)transform->bit_rate, transform->flags2_open, why,
+                         transform->packet_count - 1, transform->coded_frames, nibble );
                 break;
             }
         }
-        if (transform->good_packets == MADEIRA_WMA_ACCEPT_PACKETS)
+        if (transform->good_packets >= MADEIRA_WMA_ACCEPT_PACKETS && !transform->accepted)
         {
-            transform->good_packets++;   /* log once */
-            WMA_LOG( "accepted: %d bit/s after %u consecutive sane packets (transform %p)\n",
-                     (int)transform->bit_rate, MADEIRA_WMA_ACCEPT_PACKETS, transform );
+            transform->accepted = TRUE;
+            WMA_LOG( "accepted: %d bit/s flags2=%#x after %u consecutive sane packets "
+                     "(transform %p)\n", (int)transform->bit_rate, transform->flags2_open,
+                     MADEIRA_WMA_ACCEPT_PACKETS, transform );
         }
+
+        /* The next packet loses a frame to the bit-reservoir restart that any
+         * failure causes; after a good one it must match its header exactly. */
+        transform->frame_slack = ok ? 0 : 1;
 
         offset += take;
 
-        if (err < 0)
+        if (!ok)
         {
             transform->fail_count++;
             if (transform->fail_logged < MADEIRA_WMA_MAX_FAIL_LOGS)
             {
                 transform->fail_logged++;
-                WMA_LOG( "avcodec_send_packet failed (%d) on %zu bytes at %d bit/s "
-                         "(%uHz %uch block=%u flags2=%#x)%s\n",
-                         err, take, (int)transform->bit_rate, transform->rate,
-                         transform->in_channels, transform->block_align,
-                         wma_flags2( transform->codec_id, transform->extradata,
-                                     transform->extradata_size ),
+                WMA_LOG( "packet %u concealed: send=%d, %u of %u declared frames, "
+                         "%zu bytes at %d bit/s flags2=%#x (%uHz %uch block=%u)%s\n",
+                         transform->packet_count - 1, err, transform->coded_frames, nibble,
+                         take, (int)transform->bit_rate, transform->flags2_open,
+                         transform->rate, transform->in_channels, transform->block_align,
                          transform->fail_logged == MADEIRA_WMA_MAX_FAIL_LOGS
                              ? " -- further failures counted only" : "" );
             }
             /* Emit silence for this packet rather than dropping it: the
              * container promised these bytes and FAudio's output buffer is not
-             * zeroed (header comment). */
-            if ((status = append_silence_for_packet( transform, take ))) return status;
+             * zeroed (header comment).  Only when the packet produced nothing:
+             * a packet that decoded to the wrong LENGTH has already put those
+             * samples in the buffer, and padding them would drift the stream. */
+            if (!transform->coded_frames &&
+                (status = append_silence_for_packet( transform, take ))) return status;
         }
     }
 
@@ -1243,6 +1584,14 @@ static NTSTATUS transform_create( struct wg_transform_create_params *params )
 
     transform->bit_rate_alt = xwma_true_bit_rate( in->nChannels, in->nSamplesPerSec,
                                                   (INT64)in->nAvgBytesPerSec * 8 );
+    transform->header_rate = (INT64)in->nAvgBytesPerSec * 8;
+    /* ml1120: MADEIRA_WMA_SEARCH=0 pins the decoder to the rate and flags this
+     * file worked out from the media type alone, which is what shipped before
+     * the ladder.  A stream it cannot decode then mutes, as it did. */
+    {
+        const char *v = getenv( "MADEIRA_WMA_SEARCH" );
+        transform->search_off = v && v[0] == '0';
+    }
 
     open_rate = (INT64)in->nAvgBytesPerSec * 8;
     /* HOST-VERIFIED (real wave-bank streams fed through this same libavcodec,
@@ -1284,7 +1633,8 @@ static NTSTATUS transform_create( struct wg_transform_create_params *params )
              transform->out_sample_fmt == AV_SAMPLE_FMT_FLT ? "float32" : "s16",
              (UINT)out->nSamplesPerSec, (UINT)out->nChannels, (UINT)out->wBitsPerSample,
              transform,
-             transform->bit_rate_alt ? " [xWMA fake-rate candidate available]" : "" );
+             transform->search_off ? " [ladder off: MADEIRA_WMA_SEARCH=0]"
+                                   : " [ladder armed]" );
     return STATUS_SUCCESS;
 
 nomem:
@@ -1373,7 +1723,11 @@ static NTSTATUS transform_push_data( wg_transform_t handle, struct wg_sample *sa
      * size input samples and ignores samples with invalid sizes" -- so this
      * should always be a multiple; the log is what turns "should" into
      * "does".) */
-    if (transform->push_count < 8)
+    /* ml1120: two, not eight.  A cutscene opens a dozen of these decoders at
+     * once and eight lines each is most of a device log's WMA section for no
+     * diagnosis -- the phase question these lines answer is settled by the
+     * first one, and MADEIRA_DIAG=1 still prints every one of them. */
+    if (transform->push_count < 2)
         WMA_LOG( "push #%u size=%u fifo=%zu block=%u pkts=%u transform=%p%s\n",
                  transform->push_count, (UINT)sample->size, transform->in_len,
                  transform->block_align, transform->packet_count, transform,
@@ -1665,6 +2019,10 @@ static NTSTATUS wma_transform_flush( void *args )
     transform->pts = 0;
     transform->draining = FALSE;
     transform->discontinuity = TRUE;
+    /* avcodec_flush_buffers empties the bit reservoir and re-arms the decoder
+     * priming, so the first packet after a flush is short for the same reasons
+     * a freshly opened decoder's is (wma_packet_ok). */
+    transform->frame_slack = 3;
     if (transform->avctx) avcodec_flush_buffers( transform->avctx );
     swr_free( &transform->swr );
     pthread_mutex_unlock( &transform->lock );
