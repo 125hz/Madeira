@@ -13612,3 +13612,93 @@ guest-slots=… verdict=…`). Consequences:
   but that is the mixer being handed hot audio, a different question from this
   entry's, and it should be read again on a build that has ml1100 in it before
   anyone decides it is a bug.
+
+## 2026-09-21 — ml1140: guest-pixel presentation, conservative modes, usable frame accounting, optional library
+
+**Evidence and scope.** Device logs 96 and 97 both use the GPU-backed D3D9
+emulated frontend. Log 96 line 3374 creates a 2560x1440 swapchain; line 4108
+multiplies its pixel extent by a 3x UIKit scale and requests 7680x4320. After
+reset, line 32970 turns a 1280x720 window into a 3840x2160 drawable. Log 97
+lines 3471-3474 does the same at 720p; lines 3758 and 4371 confirm the actual
+layer remains 3840x2160, including fullscreen. This is nine times the
+presentation pixel area, not nine times the entire scene-rendering workload.
+Log 96 line 73943 reports 22.3 fps / 44.8 ms wall, 9.8 ms presenting CPU,
+6.5 ms encode CPU and 27.31 ms GPU for that sample window. Other windows
+have much less GPU work. Log 97 line 5154 reports n=0 beside 599 presents:
+the first presenting thread was no longer the thread doing presentation.
+No executable names or application-specific dispatch were added.
+
+**Renderer and display.** The iOS WMT boundary now reports contents_scale=1
+for guest pixel dimensions; Core Animation still maps the drawable onto the
+host view. MADEIRA_PRESENT_PIXELS=0 restores the previous scale multiplication;
+the once-only tag is [present-size] ml1140. Virtual-mode enumeration defaults
+to the session pixel budget instead of four times it. MADEIRA_EXTENDED_MODES=1
+restores the old larger list; [mode-budget] ml1140 records the choice. Explicit
+saved requests retain the formerly supported range, so this is a conservative
+first-launch advertisement, not a forced downgrade of a user's saved mode.
+The emulated D3D9 fullscreen path requests the matching virtual display size
+and restores its previous size on leaving fullscreen. This lets pointer bounds
+track the selected fullscreen resolution. DXMT_D9_VIRTUAL_MODE=0 disables it;
+[d9-display] ml1140 and [iOS ChangeDisplaySettings] expose the result. The
+physical macOS display path is unchanged.
+
+**Accounting.** GAME ownership follows the presenting thread and resets its
+clock baseline when ownership changes. A trylock drops contended diagnostic
+samples without blocking rendering; MADEIRA_FRAME_FOLLOW=0 restores initial
+pinning. [frame-owner] is capped at eight lines. Metal completion callbacks
+retire every committed buffer and collect its GPU timestamps, including buffers
+which finish before DXMT calls waitUntilCompleted. The old counter missed
+those retirements and grew indefinitely. [gpu-work] ml1140 adds native render,
+blit and compute encoder counts, attachment load/store/clear counts, buffers
+per present and aggregate GPU milliseconds per present. These are low-volume
+heartbeat totals; attachment actions are not byte counts and overlapping GPU
+buffers are not end-to-end frame latency. MADEIRA_FRAME_STATS=0 disables the
+new instrumentation too. No FEX changes or implicit DLL TLS were introduced.
+
+**Optional frontend.** Documents/madeira-frontend.txt or madeira-env.txt must
+contain MADEIRA_FRONTEND=1. Otherwise the existing diagnostic UI stays in place.
+The SwiftUI library browses drive_c, validates PE headers and root containment,
+records x86/x64 bitness, supports manual names/covers and public Steam Store
+search, and only auto-matches an unambiguous exact title. Per-entry settings
+include resolution (default 1280x720), presentation aspect/scaling, FPS limits,
+x87 reduced precision, fast synchronization, arguments, extended display modes,
+logs and controls. Profiles and thumbnails persist locally. Invalid/newer JSON
+is preserved rather than silently replaced. Large imported images are bounded
+and downsampled. Engine configuration can be cached by native libraries, so
+changing engine options between sessions requires restarting Madeira.
+
+Library launches reuse the existing JIT/bootstrap path, open fullscreen and
+hide logs unless explicitly enabled. A draggable menu provides FPS/physical
+footprint/battery, live pacing limits, opacity and the existing touch editor,
+keyboard, and a graceful close request. It waits for native process and server
+exit before returning to the library; another launch is blocked during cleanup.
+It does not forcibly terminate a hung host thread. Controls are saved per entry
+and the previous global layout is restored on exit. The UI adapts to portrait
+and landscape and uses iOS 26 Liquid Glass with a material fallback. See
+docs/OPTIONAL_LIBRARY.md for use, switches, research links, and device checks.
+
+**Validation.** Native Wine builds: 32/32 and 46/46 objects succeeded;
+DXMT native build: 83/83 objects succeeded; i386 PE modules rebuilt. The IPA
+build printed IPA verified. Content checks found the new native tags in the
+archives and packaged Mach-O, and the fullscreen tag in the packaged i386
+D3D9 PE (machine 0x14c), byte-identical to the built resource. Swift compilation
+passed; only pre-existing warnings remained. Diff checks used core.autocrlf=true.
+Games and the UI were not run on this PC. Performance improvement, visual
+correctness, pointer reach, metadata interactions and exit/relaunch behavior
+remain device-unverified.
+
+**Next evidence.** First compare the same 720p scene with the frontend off,
+same pacing/thermal state, at least 30 seconds after loading. Then optionally
+A/B MADEIRA_PRESENT_PIXELS=0 after restarting. Send [present-size], d9 layer
+extent, [d9-display], [iOS ChangeDisplaySettings], [frame], [frame-owner],
+[gpu-work], [prof] and [d9-prof] windows. Check all four cursor edges after
+resolution changes. Priority after that: quantify GPU pass/attachment traffic,
+identify CPU encode/submission limits, then tune only the measured bottleneck.
+Separately test the opt-in library in both orientations, custom/Steam covers,
+profile persistence, FPS changes, touch editing, live logs and graceful quit.
+
+Verified release artifact: 154,810,775 bytes (147.64 MiB), modified
+2026-09-21 17:19:44 CDT. SHA-256:
+357d934e540c07de8c8f95c7acca1ceecaa2bdb0f7c3cb514359847ec19fd654.
+Fork commits: dxmt 6263d1f (ios-port), Madeira 5b7a1df (main).
+Wine 96c954c75af and FEX 9d3a1ca39 are unchanged. No upstream PR.
