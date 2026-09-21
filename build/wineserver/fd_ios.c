@@ -1337,6 +1337,57 @@ void main_loop(void)
                 }
             }
 
+            /* ml1060: [lost-wake] — the lost-wakeup detector and its self-heal,
+             * and [wait-census].  UNCONDITIONAL, unlike the block above: the
+             * whole point of it is to be running during the event it exists
+             * for, and the games path unsets MADEIRA_DESKTOP, which is exactly
+             * why ml585's [srv-stuck] has never printed a line in a title log.
+             *
+             * It runs HERE, immediately after get_next_timeout() above, because
+             * that call refreshed current_time/monotonic_time and check_wait()
+             * reads both — and because calling wake_up() from this point is the
+             * same call from the same place as an expiring wait timeout.
+             *
+             * Cost when nothing is stuck: one pass over 512 registry slots, two
+             * loads each, every 5 s.  MADEIRA_LOSTWAKE=0 disables it entirely;
+             * MADEIRA_LOSTWAKE_SECS tunes the age threshold (see queue_ios.c). */
+            {
+                static int lw_on = -1;
+                static struct timespec lw_last, census_last;
+                if (lw_on < 0)
+                {
+                    const char *d = getenv("MADEIRA_LOSTWAKE");
+                    lw_on = !(d && (!strcmp(d, "0") || !strcmp(d, "off") || !strcmp(d, "no")));
+                }
+                if (lw_on)
+                {
+                    struct timespec now;
+                    clock_gettime(CLOCK_MONOTONIC, &now);
+                    if (now.tv_sec - lw_last.tv_sec >= 5)
+                    {
+                        extern void ios_scan_lost_wakeups(void);
+                        lw_last = now;
+                        ios_scan_lost_wakeups();
+                    }
+                    /* The census is a full report, so it follows MADEIRA_DIAG
+                     * and the 10 s cadence every other reporter uses. */
+                    {
+                        static int diag_on = -1;
+                        if (diag_on < 0)
+                        {
+                            const char *g = getenv("MADEIRA_DIAG");
+                            diag_on = (g && *g == '1');
+                        }
+                        if (diag_on && now.tv_sec - census_last.tv_sec >= 10)
+                        {
+                            extern void ios_wait_census(void);
+                            census_last = now;
+                            ios_wait_census();
+                        }
+                    }
+                }
+            }
+
             /* Check for injected client fd (socketpair bypass) */
             {
                 int injected = __atomic_exchange_n(&g_injected_client_fd, -1, __ATOMIC_SEQ_CST);

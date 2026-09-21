@@ -128,6 +128,61 @@ void winios_set_game_layer(void *metal_layer);
  * relayout there) and before any cursor has ever been positioned. */
 void winios_cursor_relayout(void);
 
+/* ========================================================================
+ * ml — THE DIRECT-LAUNCH GDI OVERLAY.
+ *
+ * Desktop mode composites ordinary GDI windows through winios_ensure_
+ * compositor's full-screen UIView; a DIRECT launch has no such view, and its
+ * only presented surface is the game's own CAMetalLayer. So every ordinary
+ * top-level window a directly-launched program puts up before (or beside) its
+ * 3D window — a windowed/fullscreen chooser, a message box, an installer-style
+ * dialog, a popup menu or combo dropdown belonging to one — had nowhere to be
+ * drawn: no layer, no surface, no present. The program then waited forever for
+ * a click that could not be made.
+ *
+ * The fix is a TRANSPARENT overlay CALayer hosted inside the game layer, built
+ * lazily the first time such a window's GDI content actually arrives, with the
+ * per-window layers placed by the SAME guest-pixel -> layer-point scale the
+ * drawn cursor already uses (see winios_set_game_layer above). That scale is
+ * also exactly what MetalBackedView.mapPoint's touch mapping computes, so a
+ * tap lands where the dialog is drawn in every pointer mode without a second
+ * coordinate system to keep in sync. A CALayer cannot take touches, so the
+ * overlay never steals one, and it removes itself once the last GDI window is
+ * destroyed.
+ *
+ * MADEIRA_DIRECT_OVERLAY=0 restores the pre-overlay behaviour exactly.
+ * Desktop mode does not go through any of this.
+ * ======================================================================== */
+
+/* Re-place the overlay's window layers against the CURRENT game layer bounds,
+ * for the same reason (and from the same call site) as winios_cursor_relayout:
+ * both are sublayers of the game layer, positioned from its local bounds, and
+ * a DisplayMode/rotation/resize apply moves that rect under them. No-op in
+ * desktop mode and when no overlay exists. */
+void winios_overlay_relayout(void);
+
+/* Record a window that HOSTS the presented Metal layer. Called by
+ * IOSDisplayShim.m's direct-launch branch, once per swapchain, with the HWND
+ * DXMT asked for a metal view. Such a window's GDI client surface is whatever
+ * the program last painted there — for a D3D window, usually black — and
+ * drawing it would cover the game image, so the overlay drops that window
+ * (and any layer it had already made for it) instead. Desktop mode never
+ * calls this: there each window has its own metal SUBLAYER and the GDI
+ * content around it is the point. */
+void winios_overlay_note_metal_hwnd(void *hwnd);
+
+/* Reached from win32u as weak externs, not from the app — declared here so
+ * both sides' signatures are written down in one place.
+ *   skip_hwnd:     1 when this window's GDI flush must not be forwarded
+ *                  (a metal-hosting window, see above). Called on the GDI
+ *                  flush path, so it is lock-free.
+ *   window_count:  how many overlay windows are currently VISIBLE. win32u's
+ *                  blocking message wait polls the input ring while this is
+ *                  non-zero — a modal dialog's message loop sleeps instead of
+ *                  peeking, and nothing else would ever drain a touch to it. */
+int winios_overlay_skip_hwnd(void *hwnd);
+unsigned winios_overlay_window_count(void);
+
 /* Show/hide the drawn cursor. Normally driven by the driver's pSetCursor
  * hook (NULL cursor -> hide, non-NULL -> show — see winios_drv_set_cursor
  * in driver_ios.c); exposed here too so Swift can force it hidden once a

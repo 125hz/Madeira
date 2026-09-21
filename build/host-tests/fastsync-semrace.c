@@ -23,6 +23,13 @@
  *      nothing, single- and multi-threaded.
  *   E. GENERATION.  A cell destroyed and handed to a different semaphore under
  *      a consumer's feet must never let that consumer's CAS succeed.
+ *   F. LIVENESS OF THE MIXED PROTOCOL (ml1060).  With EVERY waiter on the
+ *      modelled SERVER path and every releaser on the client fast path -- the
+ *      shape a device log actually shows -- and with the producer WAITING for
+ *      the batch it submitted, no batch may stay undrained for longer than a
+ *      bound.  This is the one property an accounting test cannot see: the
+ *      wrong ordering loses no token, it only fails to WAKE, and the count
+ *      then reconciles perfectly while the program stops.
  *
  * The server half is modelled too -- a thread that CAS-claims tokens the way
  * semaphore_sync_signaled() does and hands them to "queued" waiters -- so the
@@ -32,7 +39,9 @@
  * (build/ntdll-unix/shims/ios_fastsync.h), so the packing, the accessors, the
  * sign handling and the struct layout under test are the shipping ones.
  *
- * Exit 0 = every check passed.
+ * Exit 0 = every check passed.  Exit 80-85 are the ml1060 server-path checks;
+ * 84 ("a batch took longer than the bound to drain") is a lost wakeup, and 85
+ * is the control failing to fail, which invalidates 84.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -437,6 +446,418 @@ static int check_stress( void )
     return 0;
 }
 
+
+/* ========================================================================
+ * ml1060: THE CASE THE DEVICE ACTUALLY RUNS -- every waiter on the SERVER
+ * path, every releaser on the CLIENT fast path, bursts of N in [1,8], and the
+ * producer WAITING for its batch before it releases the next one.
+ *
+ * check_stress() above models a mix: six consumers that park on the cell and
+ * one thread that CAS-claims the way semaphore_sync_signaled() does.  A device
+ * log (k67) showed the shipping shape is not that mix but its EXTREME:
+ * sem_rel=16802 per 10 s against sem_wait=0, i.e. essentially every release
+ * takes the client fast path and NOT ONE wait does -- because a managed
+ * runtime waits alertably and an alertable wait is handed straight to the
+ * server.  So the mixed protocol is exercised on EVERY hand-off, and the only
+ * thing between a queued thread and a token in the cell is the Dekker pair
+ * `CAS count+=n; load srv_waiters' against `srv_waiters++; load count'.
+ *
+ * WHY THIS IS A CLOSED LOOP, AND WHY THE FIRST VERSION OF IT PROVED NOTHING.
+ * An open-loop model -- producers releasing on a timer -- CANNOT fail, whatever
+ * the ordering, and the reason is worth writing down because it is also the
+ * reason the real defect is so hard to see: a missed wake is always collected
+ * by the NEXT release, because every release re-runs the server's whole queue.
+ * A first draft of this test duly reported zero lost wakeups for the correct
+ * AND the deliberately broken ordering, which says only that the test was
+ * measuring the wrong thing.
+ *
+ * A lost wake only becomes a HANG when nothing else is going to release: a job
+ * system whose producer is waiting for the batch it just submitted.  That is
+ * the closed loop modelled here, and in it ONE lost wake is terminal.  The
+ * check is therefore a liveness bound, exactly as it should be: no batch may
+ * stay undrained for more than SRV_STALL_MS while workers are queued on it.
+ *
+ * The rescue when the bound is exceeded is `srv_wake_up_unlimited()' -- which
+ * is `wake_up( obj, 0 )', which is precisely what the ml1060 server-side
+ * detector does on the device.  So the model also demonstrates that the
+ * self-heal works: the broken ordering stalls, is rescued, and still passes
+ * conservation with no token lost or duplicated.
+ * ===================================================================== */
+
+#define SRV_WAITERS      8
+#define SRV_RELEASERS    3
+#define SRV_WAIT_MS   5000        /* effectively INFINITE: a Wine wait with no
+                                   * timeout has no rescuer but the protocol  */
+#define SRV_STALL_MS   100        /* liveness bound on draining a batch      */
+#define SRV_RUN_MS    2500
+
+struct srv_entry
+{
+    int queued;                   /* on the server's wait queue              */
+    int satisfied;                /* check_wait handed it a token            */
+    pthread_cond_t cv;
+};
+
+static struct srv_entry      srvq[SRV_WAITERS];
+static pthread_mutex_t       srv_mtx = PTHREAD_MUTEX_INITIALIZER;
+/* ONE BATCH IN FLIGHT AT A TIME, and this is the point of the whole test.
+ * With several batches overlapping, a release whose wake was lost is rescued
+ * by the NEXT release from another producer -- every release re-runs the
+ * server's entire queue, so one notifying producer collects everybody's
+ * stranded tokens.  That rescue is real and is why the defect is survivable in
+ * a busy phase; it is also why a model with overlapping producers reports a
+ * clean bill of health for a protocol that is demonstrably broken.  A job
+ * system that is WAITING for the batch it submitted has no such rescuer, and
+ * that is the state a loading screen is in. */
+static pthread_mutex_t       prod_mtx = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic long          outstanding;      /* jobs released, not yet run */
+static _Atomic unsigned long srv_late, srv_woken, srv_timeouts, srv_requests;
+static _Atomic unsigned long srv_stalls, srv_stall_ms_max;
+static int                   srv_broken;       /* the wrong-order releaser   */
+
+static unsigned long long srv_now_ms( void )
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
+}
+
+/* wake_up( obj, 0 ): walk the queue handing out tokens until a whole pass
+ * hands out none.  The caller holds srv_mtx, exactly as every server request
+ * runs on the one server thread. */
+static void srv_wake_up_unlimited( void )
+{
+    int again = 1;
+
+    while (again)
+    {
+        int i;
+
+        again = 0;
+        for (i = 0; i < SRV_WAITERS; i++)
+        {
+            if (!srvq[i].queued || srvq[i].satisfied) continue;
+            if (!server_take()) return;            /* no tokens left at all */
+            srvq[i].satisfied = 1;
+            pthread_cond_signal( &srvq[i].cv );
+            atomic_fetch_add_explicit( &srv_woken, 1, memory_order_relaxed );
+            again = 1;
+        }
+    }
+}
+
+/* THE SAME DELAY IN THE SAME PLACE.
+ *
+ * Both orderings are two operations -- a CAS on the count and a load of
+ * srv_waiters -- differing only in which comes first.  A window a handful of
+ * instructions wide is not reliably hit in either, so it is WIDENED,
+ * identically, BETWEEN the two operations in both.  That is the discipline
+ * fastsync-cellrace.c used to show ml982 stealing 943854 tokens where ml990
+ * stole 0 of 5.2 M: the two runs differ in the protocol and in nothing else.
+ *
+ *   Shipping:  CAS count += n   [widen]   load srv_waiters
+ *              a waiter that queues inside the window published srv_waiters
+ *              BEFORE this load, so it is woken.
+ *   Wrong:     load srv_waiters [widen]   CAS count += n
+ *              a waiter that queues inside the window published srv_waiters
+ *              AFTER the load, and the count it read was still 0, so it sleeps
+ *              on a token that lands a moment later and nobody tells it. */
+static void srv_widen( void )
+{
+    usleep( 50 );
+}
+
+/* The CLIENT's NtReleaseSemaphore fast path, both orderings. */
+static void srv_client_release( unsigned int gen, unsigned int n )
+{
+    uint64_t sg;
+    int cur, notify = 0;
+
+    if (srv_broken)
+    {
+        notify = atomic_load_explicit( (_Atomic int *)&cell.srv_waiters,
+                                       memory_order_seq_cst ) != 0;
+        srv_widen();
+    }
+    for (;;)
+    {
+        sg = atomic_load_explicit( (_Atomic uint64_t *)&cell.sg, memory_order_seq_cst );
+        if (MADEIRA_SG_GEN( sg ) != gen) return;
+        cur = MADEIRA_SG_STATE( sg );
+        if (cur < 0) return;
+        if (n > cell.smax || (unsigned int)cur + n > cell.smax)
+        {
+            atomic_fetch_add_explicit( &overflow_refused, 1, memory_order_relaxed );
+            atomic_fetch_sub_explicit( &work, (long)n, memory_order_seq_cst );
+            atomic_fetch_sub_explicit( &outstanding, (long)n, memory_order_seq_cst );
+            return;                                /* LIMIT_EXCEEDED: no work */
+        }
+        if (atomic_compare_exchange_strong_explicit(
+                (_Atomic uint64_t *)&cell.sg, &sg, MADEIRA_SG( gen, cur + (int)n ),
+                memory_order_seq_cst, memory_order_seq_cst )) break;
+    }
+    atomic_fetch_add_explicit( &produced, n, memory_order_relaxed );
+
+    /* Dekker, client half #1.  The shipping order loads srv_waiters AFTER the
+     * CAS; `srv_broken' loaded it before, which is the hole. */
+    if (!srv_broken)
+    {
+        srv_widen();
+        notify = atomic_load_explicit( (_Atomic int *)&cell.srv_waiters,
+                                       memory_order_seq_cst ) != 0;
+    }
+    if (notify)
+    {
+        atomic_fetch_add_explicit( &srv_requests, 1, memory_order_relaxed );
+        pthread_mutex_lock( &srv_mtx );
+        srv_wake_up_unlimited();                   /* release_semaphore( 0 ) */
+        pthread_mutex_unlock( &srv_mtx );
+    }
+}
+
+static void *srv_releaser( void *arg )
+{
+    unsigned int s = 5557 + (unsigned int)(uintptr_t)arg;
+
+    while (!stop)
+    {
+        unsigned int n = 1 + ((s = s * 1103515245u + 12345u) >> 16) % 8u;
+        unsigned long long t0;
+
+        pthread_mutex_lock( &prod_mtx );
+        atomic_fetch_add_explicit( &work, (long)n, memory_order_seq_cst );
+        atomic_fetch_add_explicit( &outstanding, (long)n, memory_order_seq_cst );
+        srv_client_release( my_gen, n );
+
+        /* THE CLOSED LOOP: nothing else will release until this batch has run,
+         * so a wake that was not delivered is not recoverable by a later
+         * release.  This is the job system the device is running. */
+        t0 = srv_now_ms();
+        while (!stop && atomic_load_explicit( &outstanding, memory_order_seq_cst ) > 0)
+        {
+            unsigned long long el = srv_now_ms() - t0;
+
+            if (el > SRV_STALL_MS)
+            {
+                unsigned long prev;
+
+                atomic_fetch_add_explicit( &srv_stalls, 1, memory_order_relaxed );
+                prev = atomic_load_explicit( &srv_stall_ms_max, memory_order_relaxed );
+                if (el > prev)
+                    atomic_store_explicit( &srv_stall_ms_max, (unsigned long)el,
+                                           memory_order_relaxed );
+                /* THE SELF-HEAL, and it is the same call ml1060's server-side
+                 * detector makes: wake_up( obj, 0 ). */
+                pthread_mutex_lock( &srv_mtx );
+                srv_wake_up_unlimited();
+                pthread_mutex_unlock( &srv_mtx );
+                t0 = srv_now_ms();
+            }
+            /* Poll rather than sleep: the producer must submit the NEXT batch
+             * while the workers are still on their way back to the wait, which
+             * is the only moment `srv_waiters == 0' and the Dekker pair is the
+             * only thing keeping the hand-off alive.  A 200 us sleep here gives
+             * every worker time to re-queue first, srv_waiters is then never 0
+             * at a release, and the test cannot distinguish the two orderings. */
+            sched_yield();
+        }
+        pthread_mutex_unlock( &prod_mtx );
+    }
+    return NULL;
+}
+
+static void *srv_waiter( void *arg )
+{
+    int idx = (int)(uintptr_t)arg;
+
+    while (!stop)
+    {
+        int got = 0, timed_out = 0;
+        struct timespec ts;
+
+        pthread_mutex_lock( &srv_mtx );
+        /* wait_on() -> semaphore_sync_add_queue(): srv_waiters++ (seq_cst)
+         * strictly before check_wait() reads the count. */
+        atomic_fetch_add_explicit( (_Atomic int *)&cell.srv_waiters, 1, memory_order_seq_cst );
+        srvq[idx].queued = 1;
+        srvq[idx].satisfied = 0;
+
+        /* check_wait() -> semaphore_sync_signaled(): CAS-claim a token. */
+        if (server_take()) { srvq[idx].satisfied = 1; got = 1; }
+
+        if (!got)
+        {
+            clock_gettime( CLOCK_REALTIME, &ts );
+            /* Normalise for a deadline of SECONDS, not milliseconds: adding
+             * 5000 ms straight into tv_nsec leaves it at 4e9, which is not a
+             * valid timespec, and pthread_cond_timedwait then returns EINVAL
+             * immediately -- forever, inside srv_mtx, which is a livelock and
+             * not a test. */
+            ts.tv_sec  += (time_t)(SRV_WAIT_MS / 1000);
+            ts.tv_nsec += (long)(SRV_WAIT_MS % 1000) * 1000000L;
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ts.tv_sec++; }
+            while (!srvq[idx].satisfied && !stop)
+            {
+                int r = pthread_cond_timedwait( &srvq[idx].cv, &srv_mtx, &ts );
+                if (r == ETIMEDOUT) { timed_out = 1; break; }
+                if (r && r != EINTR) break;          /* never spin on an error */
+            }
+            if (srvq[idx].satisfied) got = 1;
+            else if (timed_out)
+            {
+                /* thread_timeout() -> the client re-selects immediately.  If a
+                 * token is there NOW it was there while this thread slept: a
+                 * wake the protocol owed and did not deliver.  `timed_out' is
+                 * set ONLY by a real ETIMEDOUT, never by the shutdown exit --
+                 * otherwise every run ends by counting its own teardown as a
+                 * lost wakeup. */
+                if (server_take())
+                {
+                    got = 1;
+                    atomic_fetch_add_explicit( &srv_late, 1, memory_order_relaxed );
+                }
+            }
+        }
+
+        srvq[idx].queued = 0;
+        srvq[idx].satisfied = 0;
+        atomic_fetch_sub_explicit( (_Atomic int *)&cell.srv_waiters, 1, memory_order_seq_cst );
+        pthread_mutex_unlock( &srv_mtx );
+
+        if (got)
+        {
+            atomic_fetch_add_explicit( &consumed, 1, memory_order_relaxed );
+            atomic_fetch_add_explicit( &srv_served, 1, memory_order_relaxed );
+            if (atomic_fetch_sub_explicit( &work, 1, memory_order_seq_cst ) <= 0)
+                atomic_fetch_add_explicit( &no_work, 1, memory_order_relaxed );
+            /* REPORT THE JOB DONE, then take the return path back to the
+             * wait.  The order of these two matters and is the realistic one:
+             * a job system decrements its completion counter when the job
+             * finishes and the worker then spends a little time getting back
+             * to its wait.  It is also what gives the model the state the
+             * Dekker pair exists for -- with the sleep BEFORE the decrement,
+             * every worker is already re-queued by the time the producer
+             * notices the batch is done, srv_waiters is never 0 at a release,
+             * and a releaser notifies the server on every single release
+             * whichever order it uses.  That is why an earlier version of this
+             * control could not fail. */
+            atomic_fetch_sub_explicit( &outstanding, 1, memory_order_seq_cst );
+            usleep( 5 + ((unsigned)idx * 37u) % 120u );
+        }
+        else if (timed_out)
+            atomic_fetch_add_explicit( &srv_timeouts, 1, memory_order_relaxed );
+    }
+    return NULL;
+}
+
+/* broken == 0 : the shipping ordering, which must never stall.
+ * broken == 1 : the ml952-style ordering, which must stall -- the control that
+ *               proves this liveness check can fail at all. */
+static int check_server_stress( int broken )
+{
+    pthread_t th[SRV_RELEASERS + SRV_WAITERS];
+    int i, n = 0;
+    long left, w;
+    unsigned long p, c, stalls;
+
+    my_gen = 17u;
+    srv_broken = broken;
+    cell_init( my_gen, 0, SEM_MAX );
+    atomic_store( &work, 0 ); atomic_store( &produced, 0 ); atomic_store( &consumed, 0 );
+    atomic_store( &no_work, 0 ); atomic_store( &overflow_refused, 0 );
+    atomic_store( &srv_served, 0 ); atomic_store( &srv_late, 0 );
+    atomic_store( &srv_woken, 0 ); atomic_store( &srv_timeouts, 0 );
+    atomic_store( &srv_requests, 0 ); atomic_store( &srv_stalls, 0 );
+    atomic_store( &srv_stall_ms_max, 0 ); atomic_store( &outstanding, 0 );
+    for (i = 0; i < SRV_WAITERS; i++)
+    {
+        pthread_cond_init( &srvq[i].cv, NULL );
+        srvq[i].queued = srvq[i].satisfied = 0;
+    }
+    stop = 0;
+
+    for (i = 0; i < SRV_RELEASERS; i++)
+        pthread_create( &th[n++], NULL, srv_releaser, (void *)(uintptr_t)i );
+    for (i = 0; i < SRV_WAITERS; i++)
+        pthread_create( &th[n++], NULL, srv_waiter, (void *)(uintptr_t)i );
+
+    usleep( SRV_RUN_MS * 1000 );
+    stop = 1;
+    for (i = 0; i < 400; i++)
+    {
+        int j;
+        pthread_mutex_lock( &srv_mtx );
+        for (j = 0; j < SRV_WAITERS; j++) pthread_cond_signal( &srvq[j].cv );
+        pthread_mutex_unlock( &srv_mtx );
+        usleep( 1000 );
+    }
+    for (i = 0; i < n; i++) pthread_join( th[i], NULL );
+
+    left   = MADEIRA_SG_STATE( cell.sg );
+    p      = atomic_load( &produced );
+    c      = atomic_load( &consumed );
+    w      = atomic_load( &work );
+    stalls = atomic_load( &srv_stalls );
+
+    printf( "MADEIRA-SEM[srv%s]: produced=%lu consumed=%lu left_in_cell=%ld "
+            "srv_woken=%lu wake_requests=%lu timeouts=%lu late=%lu "
+            "STALLS=%lu worst=%lums\n",
+            broken ? ",WRONG-ORDER" : "", p, c, left,
+            atomic_load( &srv_woken ), atomic_load( &srv_requests ),
+            atomic_load( &srv_timeouts ), atomic_load( &srv_late ),
+            stalls, atomic_load( &srv_stall_ms_max ) );
+
+    /* Conservation holds in BOTH orderings: the wrong order DELAYS tokens, it
+     * does not lose or duplicate them.  That is precisely why an accounting
+     * test alone cannot see this bug and the liveness bound has to exist. */
+    if ((unsigned long)left + c != p)
+    {
+        printf( "MADEIRA-SEM[srv]: FAIL - consumed+left=%lu but produced=%lu\n",
+                (unsigned long)left + c, p );
+        return 80;
+    }
+    if (atomic_load( &no_work ))
+    {
+        printf( "MADEIRA-SEM[srv]: FAIL - %lu waiters proceeded with no work behind the token\n",
+                atomic_load( &no_work ) );
+        return 81;
+    }
+    if (w != left)
+    {
+        printf( "MADEIRA-SEM[srv]: FAIL - ledger %ld but %ld tokens left in the cell\n", w, left );
+        return 81;
+    }
+    if (cell.srv_waiters || cell.waiters)
+    {
+        printf( "MADEIRA-SEM[srv]: FAIL - waiters=%d srv_waiters=%d at rest\n",
+                cell.waiters, cell.srv_waiters );
+        return 82;
+    }
+    if (!p || !c || !atomic_load( &srv_woken ) || !atomic_load( &srv_requests ))
+    {
+        printf( "MADEIRA-SEM[srv]: FAIL - the stress did not reach the server wake path"
+                " (produced=%lu consumed=%lu woken=%lu requests=%lu)\n",
+                p, c, atomic_load( &srv_woken ), atomic_load( &srv_requests ) );
+        return 83;
+    }
+    if (!broken && stalls)
+    {
+        printf( "MADEIRA-SEM[srv]: FAIL - %lu batches took longer than %ums to drain"
+                " (worst %lums); a wakeup was lost\n",
+                stalls, (unsigned)SRV_STALL_MS, atomic_load( &srv_stall_ms_max ) );
+        return 84;
+    }
+    if (broken && !stalls)
+    {
+        printf( "MADEIRA-SEM[srv]: FAIL - the WRONG-ORDER control never stalled, so this"
+                " liveness bound proves nothing about the right one\n" );
+        return 85;
+    }
+    printf( "MADEIRA-SEM[srv%s]: conservation, ledger, waiter accounting and liveness OK\n",
+            broken ? ",WRONG-ORDER (stalled as designed, self-heal recovered it)" : "" );
+    return 0;
+}
+
 int main( void )
 {
     int rc, pass;
@@ -448,6 +869,15 @@ int main( void )
      * and a single 2.5 s window is one sample, not a result */
     for (pass = 0; pass < 3; pass++)
         if ((rc = check_stress())) return rc;
+
+    /* ml1060: the device's actual shape -- every waiter on the SERVER path,
+     * every releaser on the client fast path, bursts of 1..8 in one release.
+     * Three passes of the shipping ordering (late must be 0), then ONE pass of
+     * the wrong ordering, which must lose wakeups -- otherwise the liveness
+     * assertion above is not testing anything. */
+    for (pass = 0; pass < 3; pass++)
+        if ((rc = check_server_stress( 0 ))) return rc;
+    if ((rc = check_server_stress( 1 ))) return rc;
 
     printf( "MADEIRA-SEM: all checks passed\n" );
     return 0;

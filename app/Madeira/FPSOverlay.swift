@@ -2,28 +2,81 @@ import SwiftUI
 import UIKit
 import QuartzCore
 
-/// Keeps the ProMotion panel promoted to 120Hz while MAX mode is on.
+/// Keeps the ProMotion panel promoted while the emulator is presenting.
 /// CAMetalLayer presents alone don't express frame-rate intent — iOS
 /// parks the display at 60Hz and only promotes on touch (observed
 /// 2026-07-05: MAX mode ran 60 except ~119 bursts while touching). An
 /// active CADisplayLink with preferredFrameRateRange(120) is the
 /// documented way for present-driven Metal apps to hold the panel at
 /// 120. The tick itself does nothing.
+///
+/// ml1050 — THE PANEL RATE IS THE QUANTISATION GRID, AND IT WAS OFF IN THE
+/// ONE MODE THAT SHIPS.
+///
+/// Until now this was armed only for `vsyncMode != 1`, i.e. never in the
+/// default 60 cap. That default cap is `presentDrawable:afterMinimum
+/// Duration:1/60` (winemetal_unix.c `_MTLCommandBuffer_presentDrawable`),
+/// and a drawable becomes visible at a VBLANK, never between two. So with
+/// the panel parked at 60Hz the visible instants are 16.67ms apart and a
+/// frame that is ready at 17-25ms cannot be shown at 20ms — it waits for
+/// the 33.3ms vblank. Every such frame is charged a full extra refresh, and
+/// a pipeline whose real cost is 17-25ms reports as exactly 30fps. That is
+/// the arithmetic behind "25-30 fps with 1.37 of 6 cores busy".
+///
+/// Promoting the panel does NOT weaken the cap: the cap is enforced on the
+/// present path by afterMinimumDuration, which is a minimum SPACING between
+/// presentations and is independent of the refresh rate. What promotion
+/// changes is only the grid the spacing snaps to — 8.33ms instead of
+/// 16.67ms — so the same 20ms frame lands at 25ms (40fps) instead of 33.3ms
+/// (30fps). On a 60Hz panel this is inert, which is the honest outcome: the
+/// `[frame]` line prints `panel=` so the log says which case it was.
+///
+/// The 30 cap keeps a 60Hz intent: it exists for thermal/battery headroom,
+/// and 33.3ms is an exact multiple of 16.67ms, so a finer grid buys it
+/// nothing and would cost power. MADEIRA_PROMOTE=0 restores the old
+/// behaviour (arm only outside the 60 cap).
 final class ProMotionIntent {
     static let shared = ProMotionIntent()
     private var link: CADisplayLink?
+    private var activeMax: Float = 0
 
-    func setActive(_ active: Bool) {
-        if active {
-            guard link == nil else { return }
+    /// Honest report of what the panel can do, for the native `[frame]` line.
+    static var panelMaxFPS: Int { UIScreen.main.maximumFramesPerSecond }
+
+    static var enabled: Bool = {
+        if let v = ProcessInfo.processInfo.environment["MADEIRA_PROMOTE"], v == "0" { return false }
+        return true
+    }()
+
+    /// `maxHz` 0 means "tear it down".
+    func setActive(_ active: Bool, maxHz: Int = ProMotionIntent.panelMaxFPS) {
+        let want = Float(max(maxHz, 0))
+        if active && want > 0 {
+            if link != nil && activeMax == want { return }
+            link?.invalidate()
             let l = CADisplayLink(target: self, selector: #selector(tick))
-            l.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+            // `minimum` must not exceed the panel's own maximum or CoreAnimation
+            // clamps the whole range away (a 60Hz device asked for min 60 /
+            // max 120 gets nothing useful).
+            let lo = Float(min(60, maxHz))
+            l.preferredFrameRateRange = CAFrameRateRange(minimum: lo, maximum: want, preferred: want)
             l.add(to: .main, forMode: .common)
             link = l
+            activeMax = want
+            fputs("[promote] display link armed preferred=\(Int(want))Hz panel_max=\(ProMotionIntent.panelMaxFPS)Hz\n", stderr)
         } else {
+            if link != nil { fputs("[promote] display link released\n", stderr) }
             link?.invalidate()
             link = nil
+            activeMax = 0
         }
+    }
+
+    /// The intent that belongs to a given pacing mode. See the type comment.
+    static func maxHz(for mode: Int32) -> Int {
+        if !enabled { return mode == 1 ? 0 : panelMaxFPS }   // pre-ml1050 behaviour
+        if mode == 3 { return min(60, panelMaxFPS) }         // 30 cap: 60Hz grid is exact
+        return panelMaxFPS
     }
 
     @objc private func tick(_ sender: CADisplayLink) {}
@@ -164,7 +217,11 @@ struct FPSOverlay: View {
                 vsyncMode = Self.nextVsyncMode(vsyncMode)
                 fputs("[hud] tap fps-cap -> \(pillLabel(for: vsyncMode))\n", stderr)
                 madeira_set_vsync_locked(vsyncMode)
-                ProMotionIntent.shared.setActive(vsyncMode == 0 || vsyncMode == 2)
+                // ml1050: armed in EVERY mode (see ProMotionIntent) — the panel
+                // rate is the grid a present snaps to, not the cap itself.
+                let hz = ProMotionIntent.maxHz(for: vsyncMode)
+                ProMotionIntent.shared.setActive(hz > 0, maxHz: hz)
+                madeira_set_display_max_fps(Int32(ProMotionIntent.panelMaxFPS), Int32(hz))
             }
     }
 
@@ -212,7 +269,11 @@ struct FPSOverlay: View {
         samples = [(now, c)]
         presentCount = c
         vsyncMode = madeira_get_vsync_locked()
-        ProMotionIntent.shared.setActive(vsyncMode != 1)
+        // ml1050: this used to be `setActive(vsyncMode != 1)`, i.e. the panel
+        // was left at 60Hz in the DEFAULT cap — see ProMotionIntent.
+        let hz = ProMotionIntent.maxHz(for: vsyncMode)
+        ProMotionIntent.shared.setActive(hz > 0, maxHz: hz)
+        madeira_set_display_max_fps(Int32(ProMotionIntent.panelMaxFPS), Int32(hz))
 
         // 100ms sampling — keeps the buffer fresh
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in

@@ -546,6 +546,320 @@ volatile int ios_srv_wait_timeouts = 0;   /* ... of which returned STATUS_TIMEOU
 volatile int ios_srv_req_count = 0;       /* ALL threads: wineserver requests */
 uintptr_t ios_srv_game_teb = 0;           /* set once by server_init_process_done */
 
+/***********************************************************************
+ *           [frame]  —  the frame critical-path breakdown (ml1050)
+ *
+ * Design, cost and the list of things it deliberately cannot see:
+ * build/ntdll-unix/shims/ios_frame_stats.h.  This is the storage, the
+ * accumulators and the reporter; the producers are winemetal_unix.c (present,
+ * drawable, GPU) and wine/dlls/ntdll/unix/sync.c (the waits).
+ */
+#include "ios_frame_stats.h"
+#include <mach/mach_time.h>
+
+int ios_frame_stats_on = 1;               /* MADEIRA_FRAME_STATS=0 */
+unsigned long long ios_frame_role_tid[IOS_FRAME_ROLE_MAX];
+
+struct ios_frame_acc
+{
+    /* presenting thread, closed once per Present */
+    unsigned long long frames;
+    unsigned long long wall_ns;
+    unsigned long long cpu_ns;
+    unsigned long long wait_ns[IOS_FRAME_WAIT_MAX];
+    /* encode thread */
+    unsigned long long presents, skips;
+    unsigned long long enc_cpu_ns, enc_wall_ns;
+    unsigned long long drawable_ns;
+    /* finish thread / GPU */
+    unsigned long long gpu_ns, gpu_bufs, qdepth_sum;
+    /* distributions, 1 ms per bucket */
+    unsigned int wall_hist[IOS_FRAME_HIST_N];
+    unsigned int draw_hist[IOS_FRAME_HIST_N];
+};
+
+static struct ios_frame_acc ios_frame_acc;
+static int ios_frame_panel_hz, ios_frame_intent_hz, ios_frame_mode = -1;
+
+#define IOS_FRAME_ADD(field, v) __atomic_fetch_add( &ios_frame_acc.field, (v), __ATOMIC_RELAXED )
+
+static inline unsigned long long ios_frame_now_ns(void)
+{
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info( &tb );
+    return mach_absolute_time() * tb.numer / tb.denom;
+}
+
+static inline unsigned long long ios_frame_cpu_ns(void)
+{
+    struct timespec ts;
+    /* CLOCK_THREAD_CPUTIME_ID is the calling thread's user+system time and is
+     * a vDSO-free but cheap trap on Darwin; two per frame per role thread. */
+    if (clock_gettime( CLOCK_THREAD_CPUTIME_ID, &ts )) return 0;
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+
+static inline void ios_frame_hist_add( unsigned int *h, unsigned long long ns )
+{
+    unsigned idx = (unsigned)(ns / 1000000ull);
+    if (idx >= IOS_FRAME_HIST_N) idx = IOS_FRAME_HIST_N - 1;
+    __atomic_fetch_add( &h[idx], 1, __ATOMIC_RELAXED );
+}
+
+/* Percentile out of a 1 ms-bucket histogram.  Returns the bucket's UPPER edge
+ * in ms, so a reported p95 of 25 means "95 % of frames finished within 25 ms",
+ * which is the direction that cannot mislead. */
+static unsigned ios_frame_pct( const unsigned int *h, unsigned pct )
+{
+    unsigned long long total = 0, seen = 0;
+    unsigned i;
+    for (i = 0; i < IOS_FRAME_HIST_N; i++) total += h[i];
+    if (!total) return 0;
+    for (i = 0; i < IOS_FRAME_HIST_N; i++)
+    {
+        seen += h[i];
+        if (seen * 100 >= total * pct) return i + 1;
+    }
+    return IOS_FRAME_HIST_N;
+}
+
+/* Claim a role for the calling thread.  Written once per role for the life of
+ * the process; the CAS makes a double claim (two threads racing through the
+ * same hook before either has published) resolve to one winner instead of
+ * ping-ponging, which would make the wait attribution flicker. */
+void ios_frame_stats_init(void);
+
+static void ios_frame_claim( enum ios_frame_role role )
+{
+    unsigned long long self = (unsigned long long)(uintptr_t)pthread_self(), expect = 0;
+    ios_frame_stats_init();
+    if (__atomic_load_n( &ios_frame_role_tid[role], __ATOMIC_RELAXED ) == self) return;
+    if (__atomic_load_n( &ios_frame_role_tid[role], __ATOMIC_RELAXED )) return;
+    __atomic_compare_exchange_n( &ios_frame_role_tid[role], &expect, self, 0,
+                                 __ATOMIC_RELAXED, __ATOMIC_RELAXED );
+}
+
+void ios_frame_game_tick(void)
+{
+    static unsigned long long last_wall, last_cpu;   /* GAME thread only */
+    unsigned long long now, cpu, dw;
+
+    if (!ios_frame_stats_on) return;
+    ios_frame_claim( IOS_FRAME_ROLE_GAME );
+    if (!ios_frame_is_role( IOS_FRAME_ROLE_GAME )) return;   /* a second presenter */
+
+    now = ios_frame_now_ns();
+    cpu = ios_frame_cpu_ns();
+    if (last_wall)
+    {
+        dw = now - last_wall;
+        /* A frame longer than four seconds is a load screen, an alt-tab or a
+         * breakpoint, not a frame; charging it would move every average by
+         * more than the effect being measured. */
+        if (dw < 4000000000ull)
+        {
+            IOS_FRAME_ADD( frames, 1 );
+            IOS_FRAME_ADD( wall_ns, dw );
+            IOS_FRAME_ADD( cpu_ns, cpu - last_cpu );
+            ios_frame_hist_add( ios_frame_acc.wall_hist, dw );
+        }
+    }
+    last_wall = now; last_cpu = cpu;
+}
+
+void ios_frame_encode_present( int skipped )
+{
+    static unsigned long long last_wall, last_cpu;   /* ENCODE thread only */
+    unsigned long long now, cpu;
+
+    if (!ios_frame_stats_on) return;
+    ios_frame_claim( IOS_FRAME_ROLE_ENCODE );
+    if (!ios_frame_is_role( IOS_FRAME_ROLE_ENCODE )) return;
+
+    IOS_FRAME_ADD( presents, 1 );
+    if (skipped) IOS_FRAME_ADD( skips, 1 );
+
+    now = ios_frame_now_ns();
+    cpu = ios_frame_cpu_ns();
+    if (last_wall && now - last_wall < 4000000000ull)
+    {
+        IOS_FRAME_ADD( enc_wall_ns, now - last_wall );
+        IOS_FRAME_ADD( enc_cpu_ns, cpu - last_cpu );
+    }
+    last_wall = now; last_cpu = cpu;
+}
+
+void ios_frame_drawable_wait( unsigned long long ns )
+{
+    if (!ios_frame_stats_on) return;
+    IOS_FRAME_ADD( drawable_ns, ns );
+    ios_frame_hist_add( ios_frame_acc.draw_hist, ns );
+}
+
+void ios_frame_gpu( unsigned long long gpu_ns, unsigned long long inflight )
+{
+    if (!ios_frame_stats_on) return;
+    ios_frame_claim( IOS_FRAME_ROLE_FINISH );
+    if (gpu_ns) { IOS_FRAME_ADD( gpu_ns, gpu_ns ); IOS_FRAME_ADD( gpu_bufs, 1 ); }
+    IOS_FRAME_ADD( qdepth_sum, inflight );
+}
+
+void ios_frame_limiter( unsigned long long ns )
+{
+    if (!ios_frame_stats_on || !ns) return;
+    IOS_FRAME_ADD( wait_ns[IOS_FRAME_WAIT_LIMITER], ns );
+}
+
+void ios_frame_wait_add( enum ios_frame_wait kind, unsigned long long ns )
+{
+    if (kind >= IOS_FRAME_WAIT_MAX) return;
+    if (!ios_frame_tracking()) return;
+    IOS_FRAME_ADD( wait_ns[kind], ns );
+}
+
+void ios_frame_note_display( int panel_hz, int intent_hz, int mode )
+{
+    ios_frame_panel_hz = panel_hz;
+    ios_frame_intent_hz = intent_hz;
+    ios_frame_mode = mode;
+}
+
+/* Parsed once, from the first producer that runs -- which is whichever of the
+ * presenting thread or the encode thread reaches its hook first.  There is no
+ * init hook shared by both halves of the image early enough to do it anywhere
+ * better, and a double parse is harmless. */
+void ios_frame_stats_init(void)
+{
+    static int done;
+    const char *e;
+    if (done) return;
+    done = 1;
+    e = getenv( "MADEIRA_FRAME_STATS" );
+    ios_frame_stats_on = (e && !strcmp( e, "0" )) ? 0 : 1;
+    wine_log_write( "[frame] ml1050 %s - one critical-path line per heartbeat: what BOUNDS a "
+                    "frame (presenting-thread CPU vs wait split by cause, encode thread, GPU "
+                    "time, drawable acquire, limiter). MADEIRA_FRAME_STATS=0 disables",
+                    ios_frame_stats_on ? "ON" : "OFF" );
+}
+
+/* One line per heartbeat window.  Everything is per-frame except fps, n and
+ * the two percentiles, because a per-window total cannot be compared against
+ * a refresh interval and the refresh interval is the thing every number here
+ * is trying to be measured against. */
+void ios_frame_report( unsigned long long win_ns )
+{
+    struct ios_frame_acc a;
+    unsigned int wall_p95, draw_p95;
+    double f, ef, gf, fps;
+    unsigned i;
+
+    if (!ios_frame_stats_on) return;
+
+    /* Exchange the 64-bit prefix to zero: these are per-window rates.  A
+     * producer racing this loses at most one frame's contribution.  The bound
+     * is derived from the struct rather than written down, so adding a counter
+     * cannot silently leave it un-zeroed -- and it stops exactly where the
+     * 32-bit histograms begin. */
+    memset( &a, 0, sizeof(a) );
+    for (i = 0; i < offsetof(struct ios_frame_acc, wall_hist) / sizeof(unsigned long long); i++)
+        ((unsigned long long *)&a)[i] =
+            __atomic_exchange_n( &((unsigned long long *)&ios_frame_acc)[i], 0, __ATOMIC_RELAXED );
+    /* wall_hist/draw_hist are unsigned int and sit past that prefix. */
+    {
+        unsigned int wh[IOS_FRAME_HIST_N], dh[IOS_FRAME_HIST_N];
+        for (i = 0; i < IOS_FRAME_HIST_N; i++)
+        {
+            wh[i] = __atomic_exchange_n( &ios_frame_acc.wall_hist[i], 0, __ATOMIC_RELAXED );
+            dh[i] = __atomic_exchange_n( &ios_frame_acc.draw_hist[i], 0, __ATOMIC_RELAXED );
+        }
+        wall_p95 = ios_frame_pct( wh, 95 );
+        draw_p95 = ios_frame_pct( dh, 95 );
+    }
+
+    if (!a.frames)
+    {
+        /* Silence would be ambiguous: "no frames" and "the instrument is not
+         * wired up" are different diagnoses and only one of them is a bug. */
+        if (a.presents || ios_frame_mode >= 0)
+            wine_log_write( "[frame] ml1050 n=0 (no Present reached the presenter this window) "
+                            "presents=%llu mode=%d panel=%dHz intent=%dHz",
+                            a.presents, ios_frame_mode, ios_frame_panel_hz, ios_frame_intent_hz );
+        return;
+    }
+
+    f  = 1e-6 / (double)a.frames;                       /* ns total -> ms/frame */
+    ef = a.presents ? 1e-6 / (double)a.presents : 0.0;
+    gf = a.gpu_bufs ? 1e-6 / (double)a.gpu_bufs : 0.0;
+    fps = win_ns ? (double)a.frames * 1e9 / (double)win_ns : 0.0;
+
+    {
+        double waitsum = 0.0;
+        for (i = 0; i < IOS_FRAME_WAIT_MAX; i++) waitsum += (double)a.wait_ns[i];
+        wine_log_write(
+            "[frame] ml1050 n=%llu fps=%.1f wall=%.1fms(p95 %u) | game: cpu=%.1f wait=%.1f "
+            "(fast=%.1f srv=%.1f sleep=%.1f unix=%.1f present=%.1f other=%.1f) | "
+            "encode: n=%llu skip=%llu cpu=%.1f idle=%.1f | gpu=%.2f(n=%llu) qdepth=%.1f | "
+            "drawable=%.2f(p95 %u) limiter=%.2f | mode=%d panel=%dHz intent=%dHz",
+            a.frames, fps, (double)a.wall_ns * f, wall_p95,
+            (double)a.cpu_ns * f,
+            ((double)a.wall_ns - (double)a.cpu_ns) * f,
+            (double)a.wait_ns[IOS_FRAME_WAIT_FAST] * f,
+            (double)a.wait_ns[IOS_FRAME_WAIT_SRV] * f,
+            (double)a.wait_ns[IOS_FRAME_WAIT_SLEEP] * f,
+            (double)a.wait_ns[IOS_FRAME_WAIT_UNIX] * f,
+            (double)a.wait_ns[IOS_FRAME_WAIT_PRESENT] * f,
+            ((double)a.wall_ns - (double)a.cpu_ns - waitsum
+             + (double)a.wait_ns[IOS_FRAME_WAIT_LIMITER]) * f,
+            a.presents, a.skips,
+            (double)a.enc_cpu_ns * ef,
+            ((double)a.enc_wall_ns - (double)a.enc_cpu_ns) * ef,
+            (double)a.gpu_ns * gf, a.gpu_bufs,
+            a.frames ? (double)a.qdepth_sum / (double)a.frames : 0.0,
+            (double)a.drawable_ns * ef, draw_p95,
+            (double)a.wait_ns[IOS_FRAME_WAIT_LIMITER] * ef,
+            ios_frame_mode, ios_frame_panel_hz, ios_frame_intent_hz );
+    }
+
+    /* ml1050: the handoff half, on its own line because it is a distribution
+     * and a distribution does not fit in a field.  `spin' is the adaptive
+     * spin's payoff rate (hit = a park and a wake that did not happen) and
+     * `park us' is the log2 histogram of how long the handoffs that DID park
+     * actually took.  Together they say whether MADEIRA_FASTSYNC_SPIN_US is
+     * set too low (mass at 1-32 us with a poor hit rate) or is simply not the
+     * problem (mass above 256 us, where no spin budget could have helped). */
+    {
+        extern void madeira_fast_park_hist_snapshot( unsigned int *out, unsigned n,
+                                                     unsigned int *spin_hit,
+                                                     unsigned int *spin_miss, int *credit );
+        unsigned int ph[16], i2, total = 0, seen = 0, p50 = 0, p90 = 0;
+        unsigned int spin_hit = 0, spin_miss = 0;
+        int credit = 0;
+        char line[512];
+        int len;
+
+        madeira_fast_park_hist_snapshot( ph, 16, &spin_hit, &spin_miss, &credit );
+        for (i2 = 0; i2 < 16; i2++) total += ph[i2];
+        if (total || spin_hit || spin_miss)
+        {
+            for (i2 = 0; i2 < 16; i2++)
+            {
+                seen += ph[i2];
+                if (!p50 && seen * 2 >= total) p50 = i2 ? (1u << (i2 - 1)) : 0;
+                if (!p90 && seen * 10 >= total * 9) { p90 = i2 ? (1u << (i2 - 1)) : 0; break; }
+            }
+            len = snprintf( line, sizeof(line),
+                            "[frame]   handoff: spin hit=%u miss=%u credit=%d | parked=%u "
+                            "p50=%uus p90=%uus | us:",
+                            spin_hit, spin_miss, credit, total, p50, p90 );
+            for (i2 = 0; i2 < 16 && len > 0 && len < (int)sizeof(line); i2++)
+                if (ph[i2])
+                    len += snprintf( line + len, sizeof(line) - len, " %u=%u",
+                                     i2 ? (1u << (i2 - 1)) : 0, ph[i2] );
+            wine_log_write( "%s", line );
+        }
+    }
+}
+
 #ifdef WINE_IOS
 
 /***********************************************************************
@@ -1148,15 +1462,27 @@ void ios_perf_line( unsigned long long phys_mb, unsigned long long peak_mb,
             if ((unsigned long long)(uintptr_t)user_shared_data > 0x100000000ull)
                 usd_ms = ((unsigned long long)user_shared_data->TickCount.High1Time << 32)
                          | user_shared_data->TickCount.LowPart;
-            wine_log_write( "[perf] rev=ml1010 phys=%lluMB(peak %llu, comp %llu) srv=%llu/s "
+            /* ml1060: `lostwake' is the server-side detector in
+             * build/wineserver/queue_ios.c (ios_scan_lost_wakeups): the number
+             * of times a thread was found queued on a cell-backed object across
+             * two consecutive 5 s scans while that object's cell said signalled.
+             * Each one was also self-healed with a wake_up(), so a non-zero
+             * value here means the run SURVIVED a lost wakeup rather than hung
+             * on it -- and the [lost-wake] line names the object.  The counter
+             * lives in the wineserver archive, the same cross-archive direction
+             * as madeira_sync_cells. */
+            extern unsigned int madeira_lostwake_count;
+            wine_log_write( "[perf] rev=ml1060 phys=%lluMB(peak %llu, comp %llu) srv=%llu/s "
                             "fastsync hit=%u miss=%u peek=%u sem_rel=%u sem_wait=%u "
-                            "desync=%u tick=%llums"
+                            "desync=%u lostwake=%u tick=%llums"
                             " - MADEIRA_DIAG=1 for the full reporters",
                             phys_mb, peak_mb, comp_mb,
                             (reqs - prev_reqs) * 1000000000ull / win_ns,
                             hit - prev_hit, miss - prev_miss, peek - prev_peek,
                             srel - prev_srel, swait - prev_swait,
-                            desync - prev_desync, usd_ms );
+                            desync - prev_desync,
+                            __atomic_load_n( &madeira_lostwake_count, __ATOMIC_RELAXED ),
+                            usd_ms );
         }
 
         /* ml990: THE "auto" RULE MOVED HERE, AND IT HAD TO.
@@ -1177,6 +1503,11 @@ void ios_perf_line( unsigned long long phys_mb, unsigned long long peak_mb,
             extern void madeira_fastsync_auto_arm( unsigned int ops, unsigned long long window_ns );
             madeira_fastsync_auto_arm( ops - prev_ops, win_ns );
         }
+
+        /* ml1050: the frame critical path, next to the line it belongs with.
+         * This runs in the QUIET build too -- what bounds a frame is not a
+         * diagnostic, it is the thing the port is being optimised against. */
+        ios_frame_report( win_ns );
     }
 
     prev_reqs = reqs; prev_ns = now_ns; prev_ops = ops;
@@ -1960,6 +2291,13 @@ unsigned int server_wait( const union select_op *select_op, data_size_t size, UI
     {
         int is_game = ios_srv_game_teb &&
                       (uintptr_t)NtCurrentTeb() == ios_srv_game_teb;
+        /* ml1050: a SECOND, different notion of "the game thread".
+         * ios_srv_game_teb is whichever thread ran server_init_process_done,
+         * i.e. the process's initial thread -- which in a job-system title is
+         * not the thread that presents. The frame instrument identifies the
+         * presenting thread by the fact that it presents, so the two are asked
+         * separately and neither is derived from the other. */
+        int is_presenter = ios_frame_tracking();
         struct timespec t0, t1;
 
         /* ml950: a real wait ends any Sleep(0) streak this thread had going
@@ -1968,11 +2306,19 @@ unsigned int server_wait( const union select_op *select_op, data_size_t size, UI
 #ifdef WINE_IOS
         ios_srv_classify_select( select_op, size, timeout );
 #endif
-        if (is_game) clock_gettime( CLOCK_MONOTONIC, &t0 );
+        if (is_game || is_presenter) clock_gettime( CLOCK_MONOTONIC, &t0 );
         ios_wait_enter( select_op, size, flags, abs_timeout,
                         __builtin_return_address(0) );
         ret = server_select( select_op, size, flags, abs_timeout, NULL, &apc );
         ios_wait_leave();
+        if (is_presenter)
+        {
+            struct timespec tp;
+            clock_gettime( CLOCK_MONOTONIC, &tp );
+            ios_frame_wait_add( IOS_FRAME_WAIT_SRV,
+                                (unsigned long long)((tp.tv_sec - t0.tv_sec) * 1000000000ll
+                                                     + (tp.tv_nsec - t0.tv_nsec)) );
+        }
 #ifdef WINE_IOS
         if (ret == STATUS_TIMEOUT)
         {

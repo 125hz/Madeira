@@ -460,6 +460,8 @@ extern void winios_window_frame( HWND hwnd, int x, int y, int w, int h, int visi
 extern void winios_cursor_set( unsigned int id, int w, int h, int hot_x, int hot_y,
                                const void *bgra ) __attribute__((weak));
 extern void winios_cursor_show( int show ) __attribute__((weak));
+/* ml — direct-launch overlay, see winios_direct_overlay() below. */
+extern int winios_overlay_skip_hwnd( void *hwnd ) __attribute__((weak));
 
 static int winios_desktop_mode(void);
 
@@ -574,6 +576,76 @@ static int winios_desktop_mode(void)
     return mode;
 }
 
+/* ml — THE DIRECT-LAUNCH GDI OVERLAY, win32u side.
+ *
+ * Two gates in this file used to make a direct launch blind to every ordinary
+ * window: pCreateWindowSurface was installed only in desktop mode (so a
+ * dialog got win32u's OFFSCREEN surface, whose flush is a no-op and reaches
+ * nobody), and winios_window_frame was forwarded only in desktop mode (so
+ * nothing on the app side ever learned where a window was). A program that
+ * asks a question before it creates its 3D window — a windowed/fullscreen
+ * chooser, a message box, an installer-style window — therefore sat waiting
+ * for a click on something that was never drawn.
+ *
+ * Nothing about that is desktop-specific: the surface bits and the window
+ * rect are the same data in both modes. So both gates now also open for a
+ * direct launch, and the app side decides where to draw the result — into a
+ * transparent overlay inside the game's own presented layer rather than the
+ * desktop compositor, which must not exist here (its opaque backdrop would
+ * cover the game; see winios_ensure_compositor's own comment).
+ *
+ * The one window this must NOT apply to is the one hosting the presented
+ * Metal layer: its GDI client area is the program's own paint, normally
+ * black, and drawing it would cover the game image. Only the app side knows
+ * which HWND that is (it is told by the swapchain), so the flush path asks —
+ * winios_overlay_skip_hwnd, which answers 0 in desktop mode.
+ *
+ * MADEIRA_DIRECT_OVERLAY=0 restores the previous behaviour exactly. */
+static int winios_direct_overlay(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *env = getenv( "MADEIRA_DIRECT_OVERLAY" );
+        on = !winios_desktop_mode() && !(env && *env == '0');
+    }
+    return on;
+}
+
+/* One [overlay] line for the FIRST window whose GDI content actually reaches
+ * the app in a direct launch. Class and size are what identify the window in
+ * a device log; the style word says whether it is the dialog/popup shape the
+ * overlay exists for. Once per session, so this stays a low-volume family. */
+static void winios_overlay_log_first( HWND hwnd, int surf_w, int surf_h )
+{
+    static int logged;
+    struct window_rects rects = {0};
+    UNICODE_STRING us;
+    WCHAR clsW[64];
+    char cls[64];
+    int j;
+
+    if (logged || !winios_direct_overlay()) return;
+    logged = 1;
+
+    us.Buffer = clsW;
+    us.Length = 0;
+    us.MaximumLength = sizeof(clsW);
+    cls[0] = 0;
+    if (NtUserGetClassName( hwnd, FALSE, &us ) > 0)
+    {
+        for (j = 0; j < us.Length / (int)sizeof(WCHAR) && j < 63; j++)
+            cls[j] = (clsW[j] >= 32 && clsW[j] < 127) ? (char)clsW[j] : '?';
+        cls[j] = 0;
+    }
+    get_window_rects( hwnd, COORDS_SCREEN, &rects, get_thread_dpi() );
+    dprintf( 2, "[overlay] first window hwnd=%p class='%s' surface=%dx%d "
+             "win={%d,%d,%d,%d} style=%08x\n", hwnd, cls, surf_w, surf_h,
+             (int)rects.window.left, (int)rects.window.top,
+             (int)rects.window.right, (int)rects.window.bottom,
+             (unsigned)get_window_long( hwnd, GWL_STYLE ) );
+}
+
 /* ml505 probe. This hook was a pure stub: wine hands the driver the
  * surface's VISIBLE REGION here — the rects left after sibling and child
  * occlusion — and we discarded all of it.
@@ -629,6 +701,11 @@ static BOOL winios_surface_flush( struct window_surface *surface, const RECT *re
         int surf_w = color_info->bmiHeader.biWidth;
         int surf_h = color_info->bmiHeader.biHeight;
         if (surf_h < 0) surf_h = -surf_h;
+        /* Direct launch: never hand the app the GDI surface of the window
+         * that hosts the presented Metal layer — see winios_direct_overlay.
+         * Answers 0 in desktop mode, so nothing changes there. */
+        if (winios_overlay_skip_hwnd && winios_overlay_skip_hwnd( surface->hwnd )) return TRUE;
+        winios_overlay_log_first( surface->hwnd, surf_w, surf_h );
         winios_surface_present( surface->hwnd,
                                 dirty->left, dirty->top,
                                 dirty->right - dirty->left, dirty->bottom - dirty->top,
@@ -716,9 +793,11 @@ static BOOL winios_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *sur
 static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                                            const struct window_rects *new_rects, struct window_surface *surface )
 {
-    /* desktop mode only — game windows must never wake the compositor
-     * (it would draw its backdrop OVER the DXMT Metal layer) */
-    if (winios_window_frame && winios_desktop_mode())
+    /* Desktop mode: the full-screen compositor. Direct launch: the
+     * transparent overlay inside the presented layer (winios_direct_overlay).
+     * Neither wakes the desktop compositor outside desktop mode — the app
+     * side keeps that gate, so its backdrop can still never cover a game. */
+    if (winios_window_frame && (winios_desktop_mode() || winios_direct_overlay()))
     {
         const RECT *v = &new_rects->visible;
         const RECT *c = &new_rects->client;
@@ -1910,12 +1989,21 @@ static void load_display_driver(void)
          * also carries the expose-equivalent repaint request (see
          * winios_drv_window_pos_changed), which must not depend on Winios.m. */
         winios_user_driver.pWindowPosChanged = winios_drv_window_pos_changed;
-        /* S2 desktop mode only: GDI window surfaces → app compositor.
-         * Games keep the offscreen (invisible) surface path. */
+        /* GDI window surfaces → app compositor. Desktop mode composites them
+         * into its own view; a direct launch draws them in the overlay inside
+         * the presented layer (see winios_direct_overlay). Without this hook
+         * a window gets win32u's offscreen surface, whose flush goes nowhere —
+         * which is precisely why a directly-launched dialog was invisible. */
         if (winios_desktop_mode())
         {
             winios_user_driver.pCreateWindowSurface = winios_CreateWindowSurface;
             dprintf( 2, "[winios] desktop mode: window-surface compositing ENABLED\n" );
+        }
+        else if (winios_direct_overlay())
+        {
+            winios_user_driver.pCreateWindowSurface = winios_CreateWindowSurface;
+            dprintf( 2, "[overlay] direct launch: window-surface compositing ENABLED "
+                        "(MADEIRA_DIRECT_OVERLAY=0 to disable)\n" );
         }
         winios_user_driver.pUpdateDisplayDevices = winios_UpdateDisplayDevices;
         __wine_set_user_driver( &winios_user_driver, WINE_GDI_DRIVER_VERSION );

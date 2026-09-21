@@ -150,6 +150,16 @@ static int madeira_desktop_mode(void) {
 // compositor layer (desktop mode only).
 extern CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd);
 
+// ml -- DIRECT-LAUNCH OVERLAY. Winios.m now draws a directly-launched
+// program's ordinary GDI windows (dialogs, message boxes, popup menus) into a
+// transparent overlay inside the presented layer, so a chooser shown before
+// the 3D window exists can be seen and clicked. The one window that must NOT
+// be drawn that way is the one HOSTING this layer: its GDI client area is the
+// program's own (usually black) paint and would cover the game image. This is
+// the only place that knows which HWND that is. Desktop mode does not call it
+// -- there each window has its own metal sublayer and its GDI frame is wanted.
+extern void winios_overlay_note_metal_hwnd(void *hwnd);
+
 // A window whose rect is degenerate (0x0) hands the compositor a zero frame,
 // so the CAMetalLayer it makes for that window is 0x0 too -- and DXMT then
 // presents frame after frame into a layer that cannot draw a single pixel,
@@ -252,6 +262,7 @@ static macdrv_metal_view my_view_create_metal_view(macdrv_view v, macdrv_metal_d
         NSLog(@"[madeira-display] view_create_metal_view called before layer registered!");
         return NULL;
     }
+    winios_overlay_note_metal_hwnd((void *)v);
     return (macdrv_metal_view)CFBridgingRetain(layer);
 }
 

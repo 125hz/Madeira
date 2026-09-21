@@ -319,6 +319,135 @@ static int phase_basic( int nx )
     return 0;
 }
 
+/* ------------------------------------------------ phase 6: patch a system DLL
+ *
+ * THE ONE CASE NO OTHER PHASE COVERS: an INLINE HOOK of a system DLL's .text,
+ * on a page the emulator has ALREADY TRANSLATED.
+ *
+ * Every phase above writes code into memory the program owns.  A copy-protection
+ * wrapper, an overlay, a file-redirection shim and a debugger-detection bypass all
+ * do something different: they take a function that is already running, change its
+ * protection to PAGE_EXECUTE_READWRITE, and overwrite its first bytes.  Three
+ * separate things have to be true for that to work here, and NONE of them is
+ * exercised anywhere else in this file:
+ *
+ *   (a) VirtualProtect( PAGE_EXECUTE_READWRITE ) on an image page has to SUCCEED,
+ *       and it has to actually make the page writable — an image view is mapped
+ *       read-only and its host mapping may not even permit execute, so "the call
+ *       returned TRUE" and "the store will land" are different claims;
+ *   (b) the store itself has to land, which is checked here by READING THE BYTES
+ *       BACK rather than by trusting that the write was issued;
+ *   (c) the emulator has to notice that a page it has already translated changed,
+ *       and re-translate it.  The function is called a thousand times first
+ *       precisely so that a translation exists to go stale.
+ *
+ * NO FlushInstructionCache BEFORE THE FIRST CALL, deliberately, for the same
+ * reason as phase 2: real patchers frequently omit it, x86 does not require it,
+ * and the whole point of a write-trap is to make it unnecessary.  It IS issued on
+ * the restore, because by then the test is only tidying up.
+ *
+ * The target is chosen for being trivially verifiable and unused by anything else
+ * while the test runs: a no-argument function returning a small integer.  Its
+ * original bytes are restored before the phase returns, so nothing downstream can
+ * observe the patch even if a later phase fails.
+ */
+#define PATCH_SENTINEL 0x0BAD
+
+static BYTE saved_bytes[8];
+static BYTE *patch_target;
+
+static int phase_patch_system_dll(void)
+{
+    typedef WORD (WINAPI *langid_fn)(void);
+    langid_fn fn;
+    HMODULE k32;
+    DWORD old_prot = 0, tmp_prot = 0;
+    volatile BYTE *p;
+    WORD before, after, restored;
+    unsigned int i;
+
+    if (!(k32 = GetModuleHandleA( "kernel32.dll" )))
+    {
+        line_0( "MADEIRA-EXECRW: GetModuleHandleA(kernel32.dll) failed" );
+        return 70;
+    }
+    if (!(fn = (langid_fn)GetProcAddress( k32, "GetSystemDefaultLangID" )))
+    {
+        line_0( "MADEIRA-EXECRW: GetProcAddress(GetSystemDefaultLangID) failed" );
+        return 70;
+    }
+    patch_target = (BYTE *)fn;
+    line_hex( "MADEIRA-EXECRW: phase 6 target at ", (unsigned int)(ULONG_PTR)patch_target,
+              " (a system DLL .text page)" );
+
+    /* Make it HOT first: a stale translation can only be observed if a translation
+     * exists, and this is what separates this phase from "patch a cold page". */
+    before = fn();
+    for (i = 0; i < 1000; i++) (void)fn();
+    line_hex( "MADEIRA-EXECRW: phase 6 pre-patch return ", before, " (1001 calls, now translated)" );
+
+    if (!VirtualProtect( patch_target, sizeof(saved_bytes), PAGE_EXECUTE_READWRITE, &old_prot ))
+    {
+        line_hex( "MADEIRA-EXECRW: VirtualProtect(PAGE_EXECUTE_READWRITE) on the image page FAILED, err=",
+                  GetLastError(), "" );
+        return 71;
+    }
+    line_hex( "MADEIRA-EXECRW: phase 6 VirtualProtect OK, previous protection ", old_prot, "" );
+
+    for (i = 0; i < sizeof(saved_bytes); i++) saved_bytes[i] = patch_target[i];
+
+    /* BYTE stores, one at a time — the shape a 5-byte detour actually takes, and the
+     * shape that shows up in a device log as a single-byte store faulting. */
+    p = (volatile BYTE *)patch_target;
+    p[0] = 0xB8;                                   /* mov eax, imm32 */
+    p[1] = (BYTE)(PATCH_SENTINEL & 0xff);
+    p[2] = (BYTE)((PATCH_SENTINEL >> 8) & 0xff);
+    p[3] = 0x00;
+    p[4] = 0x00;
+    p[5] = 0xC3;                                   /* ret            */
+
+    /* (b): did the bytes actually land?  A page that reports writable but silently
+     * drops stores is exactly the failure this test exists to catch, and it is
+     * invisible to every other check. */
+    if (p[0] != 0xB8 || p[5] != 0xC3 ||
+        p[1] != (BYTE)(PATCH_SENTINEL & 0xff) || p[2] != (BYTE)((PATCH_SENTINEL >> 8) & 0xff))
+    {
+        line_hex( "MADEIRA-EXECRW: the patch did NOT land — byte[0] reads back as ", p[0],
+                  " (expected 0xb8): the page reported writable but the store was dropped" );
+        for (i = 0; i < sizeof(saved_bytes); i++) p[i] = saved_bytes[i];
+        VirtualProtect( patch_target, sizeof(saved_bytes), old_prot, &tmp_prot );
+        return 72;
+    }
+
+    /* (c): the NEW bytes must run.  No cache flush. */
+    after = fn();
+
+    /* Restore before judging, so a failure cannot poison the rest of the process. */
+    for (i = 0; i < sizeof(saved_bytes); i++) p[i] = saved_bytes[i];
+    FlushInstructionCache( GetCurrentProcess(), patch_target, sizeof(saved_bytes) );
+    restored = fn();
+    if (!VirtualProtect( patch_target, sizeof(saved_bytes), old_prot, &tmp_prot ))
+        line_hex( "MADEIRA-EXECRW: phase 6 could not restore protection, err=", GetLastError(), "" );
+
+    if (after != PATCH_SENTINEL)
+    {
+        line_hex( "MADEIRA-EXECRW: the patched function returned ", after, "" );
+        line_hex( "MADEIRA-EXECRW:   expected ", PATCH_SENTINEL,
+                  " — the bytes changed but the emulator ran a STALE translation" );
+        return 73;
+    }
+    if (restored != before)
+    {
+        line_hex( "MADEIRA-EXECRW: after restoring the bytes the function returned ", restored, "" );
+        line_hex( "MADEIRA-EXECRW:   expected ", before, " — the restore did not take effect" );
+        return 74;
+    }
+
+    line_hex( "MADEIRA-EXECRW: phase 6 OK — inline patch of a translated system DLL ran the NEW code (",
+              after, "), and the restore took effect" );
+    return 0;
+}
+
 static int phase_smc(void)
 {
     unsigned int i;
@@ -458,6 +587,13 @@ static int run_all(void)
                : "MADEIRA-EXECRW: image has no NX_COMPAT — DEP is OFF, writable memory is executable" );
 
     if ((rc = phase_basic( nx ))) return rc;
+
+    /* Phase 6 runs in BOTH images: patching a system DLL's .text is a
+     * VirtualProtect question, not a DEP question, and Windows allows it either
+     * way.  Running it in the NX_COMPAT build too means the one image that can
+     * still be launched when DEP handling regresses still answers it. */
+    if ((rc = phase_patch_system_dll())) return rc;
+
     if (nx)
     {
         /* Nothing further is meaningful with DEP on: every remaining phase asserts that

@@ -3662,6 +3662,14 @@ static inline LARGE_INTEGER *get_nt_timeout( LARGE_INTEGER *time, DWORD timeout 
 
 #include <time.h>   /* iOS-Madeira ml940: clock_gettime_nsec_np (commpage) */
 
+/* ml — direct-launch overlay: how many ordinary GDI windows the app is
+ * currently showing over the game layer. Implemented in
+ * app/Madeira/Winios/Winios.m (weak, same pattern as the driver hooks in
+ * driver_ios.c — win32u links and runs without the app side, where this is
+ * NULL and the wait below keeps its plain unbounded form). Reads one atomic;
+ * see wait_message for why the blocking wait consults it at all. */
+extern unsigned winios_overlay_window_count(void) __attribute__((weak));
+
 /***********************************************************************
  *           ios_pump_yield
  *
@@ -3743,14 +3751,27 @@ static DWORD wait_message( DWORD count, const HANDLE *handles, DWORD timeout, DW
      * so drags advanced only when winemine's 1Hz timer woke the queue.
      * Wake every 16ms to poll driver events; only surface WAIT_TIMEOUT
      * when the CALLER's own deadline expires. Games path unchanged. */
+    /* ml — the SAME starvation, in a DIRECT launch, is half of "the dialog is
+     * there but nothing happens when you tap it": a modal dialog runs its own
+     * message loop and BLOCKS here, exactly like the desktop menu loops above,
+     * and no touch can reach it because only pProcessEvents drains the ring
+     * and only this wait returning runs it. A game's render loop peeks rather
+     * than waits and never reaches this code at all, so the poll is armed only
+     * while the direct overlay actually has a visible GDI window on screen
+     * (winios_overlay_window_count, weak — 0 with no app side linked, and 0
+     * the moment the dialog closes). An idle game thread therefore keeps its
+     * plain unbounded wait. */
     {
         static int ios_slice = -1;
+        int slice_poll;
         if (ios_slice < 0)
         {
             const char *d = getenv( "MADEIRA_DESKTOP" );
             ios_slice = (d && *d == '1');
         }
-        if (!ios_slice)
+        slice_poll = ios_slice ||
+                     (winios_overlay_window_count && winios_overlay_window_count() != 0);
+        if (!slice_poll)
         {
             do ret = NtWaitForMultipleObjects( count, handles, type, !!(flags & MWMO_ALERTABLE), abs );
             while (ret == count - 1 && !process_driver_events( QS_ALLINPUT, wake_mask, changed_mask ));

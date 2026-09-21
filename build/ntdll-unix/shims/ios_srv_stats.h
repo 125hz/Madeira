@@ -75,6 +75,14 @@ enum ios_srv_nt_counter
     IOS_FS_SEM_REL,            /* NtReleaseSemaphore served from the cell    */
     IOS_FS_SEM_WAIT,           /* a wait that took a token from the cell     */
 
+    /* ml1050 NOTE: the adaptive spin's payoff counters are deliberately NOT
+     * here.  This array is exchanged to zero by ios_srv_stats_report(), and
+     * with MADEIRA_DIAG on the [frame] reporter runs in the same window, so a
+     * second reader would get whatever the first left behind.  They live in
+     * wine/dlls/ntdll/unix/sync.c next to the controller that produces them
+     * and are drained by exactly one reader
+     * (madeira_fast_park_hist_snapshot). */
+
     /* Breakdown of the `select` request, which is the one request kind whose
      * count says nothing about its cause: NtWaitForSingleObject, a multi-object
      * wait, NtSignalAndWaitForSingleObject, a keyed event and an alertable

@@ -161,7 +161,12 @@ else
 fi
 
 echo "=== MADEIRA: dxmt_madeira_native -- util ==="
-for cpp in util_env.cpp util_string.cpp util_bloom.cpp thread.cpp \
+# MADEIRA (WOW64_DESIGN.md, ml1070): util_futex.cpp carries dxmt::futex's
+# backend selection and the one line that names it.  On this (Darwin) target
+# it selects std::atomic wait/notify, which is already __ulock_wait -- but the
+# selection is a runtime branch so that both halves compile the same code, and
+# a runtime branch still needs the object.
+for cpp in util_env.cpp util_string.cpp util_bloom.cpp util_futex.cpp thread.cpp \
            com/com_guid.cpp com/com_private_data.cpp config/config.cpp log/log.cpp \
            sha1/sha1_util.cpp \
            wsi_monitor_headless.cpp wsi_window_madeira.cpp wsi_platform_madeira.cpp; do

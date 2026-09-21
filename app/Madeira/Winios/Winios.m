@@ -949,8 +949,26 @@ int winios_held_keys(unsigned int mask[8]) {
  * CALayer per HWND inside a full-screen, touch-transparent UIView and
  * let Core Animation do the compositing. Desktop coords are native
  * pixels (e.g. 1170x2532); layers are placed in points (÷ screen
- * scale). Only active when MADEIRA_DESKTOP=1 (the driver side gates
- * surface creation, so games never reach these). */
+ * scale).
+ *
+ * ml — the SAME per-HWND layers now also serve a DIRECT launch, where
+ * the host is the transparent overlay inside the game's own presented
+ * layer rather than this full-screen view, and the desktop-pixel ->
+ * point mapping is the game rect's instead of the letterbox's. Only
+ * those two things differ; everything below is shared. See the overlay
+ * section after the cursor code, and Winios.h's doc comment for why a
+ * direct launch needed it at all. */
+
+/* ml — direct-launch overlay. Defined after the cursor section below,
+ * which is where the game layer it hosts on (g_game_layer), the live
+ * guest resolution (winios_screen_size) and the mode test
+ * (winios_cursor_desktop_mode) are already declared — same
+ * forward-declaration idiom as winios_place_metal_layer/
+ * winios_remove_layer above and below. */
+static int winios_overlay_active(void);
+static CALayer *winios_ensure_window_host(void);
+static CGRect winios_overlay_layer_rect(int x, int y, int w, int h);
+static void winios_overlay_refresh_live(void);
 
 static NSMutableDictionary<NSNumber *, CALayer *> *g_layers;
 static NSMutableDictionary<NSNumber *, NSValue *> *g_px_rects;  /* hwnd → last px rect */
@@ -979,7 +997,11 @@ static CGPoint g_desk_origin;            /* desktop (0,0) in view pt (letterbox 
 static CGRect g_comp_frame;              /* presentation area (window coords), from Swift */
 static BOOL g_comp_frame_set;
 
+/* Desktop pixels -> a rect in the HOST layer's own coordinate space. Desktop
+ * mode: the compositor view's letterbox mapping, exactly as before. Direct
+ * launch: the overlay's game-rect mapping (see winios_overlay_layer_rect). */
 static CGRect winios_layer_rect(int x, int y, int w, int h) {
+    if (winios_overlay_active()) return winios_overlay_layer_rect(x, y, w, h);
     CGFloat s = g_px_to_pt;
     return CGRectMake(g_desk_origin.x + x * s, g_desk_origin.y + y * s, w * s, h * s);
 }
@@ -1062,20 +1084,26 @@ static void winios_ensure_compositor(void) {
     winios_stack_timer_start();
 }
 
-/* main thread only */
+/* main thread only. `host` is whichever layer the current mode parents window
+ * layers onto — the compositor view's layer in desktop mode, the overlay in a
+ * direct launch — resolved by the caller (winios_ensure_window_host), which is
+ * also what guarantees one exists before we add a sublayer to it. */
 static CALayer *winios_layer_for(HWND hwnd, bool create) {
     NSNumber *key = @((uintptr_t)hwnd);
     CALayer *l = g_layers[key];
     if (!l && create) {
+        CALayer *host = winios_ensure_window_host();
+        if (!host) return nil;
         l = [CALayer layer];
         l.anchorPoint = CGPointMake(0, 0);
         l.magnificationFilter = kCAFilterNearest;
         l.opaque = YES;
-        [g_compositor_view.layer addSublayer:l];
+        [host addSublayer:l];
         g_layers[key] = l;
         fprintf(stderr, "[winios] layer created for hwnd=%p (%lu layers)\n",
                 hwnd, (unsigned long)g_layers.count);
         fflush(stderr);
+        winios_overlay_refresh_live();
     }
     return l;
 }
@@ -1089,6 +1117,10 @@ static void winios_remove_layer(HWND hwnd) {
             [l removeFromSuperlayer];
             [g_layers removeObjectForKey:key];
             [g_px_rects removeObjectForKey:key];
+            /* Direct launch: the last window going away is what retires the
+             * overlay, so the live count and the teardown are decided in one
+             * place. No-op in desktop mode. */
+            winios_overlay_refresh_live();
         }
         CAMetalLayer *ml = g_metal_layers[key];
         if (ml) {
@@ -1168,9 +1200,9 @@ CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
 void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
                          int cx, int cy, int cw, int ch) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        winios_ensure_compositor();
-        if (!g_compositor_view) return;
+        if (!winios_ensure_window_host()) return;
         CALayer *l = winios_layer_for(hwnd, true);
+        if (!l) return;
         NSNumber *key = @((uintptr_t)hwnd);
         g_px_rects[key] = [NSValue valueWithCGRect:CGRectMake(x, y, w, h)];
         if (!g_client_rects) g_client_rects = [NSMutableDictionary new];
@@ -1182,6 +1214,9 @@ void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
         winios_apply_contents_rect(key, l);
         winios_place_metal_layer(key);
         [CATransaction commit];
+        /* A window being shown or hidden changes how many overlay windows are
+         * on screen, which is what win32u's blocking wait polls on. */
+        winios_overlay_refresh_live();
     });
 }
 
@@ -1322,6 +1357,14 @@ void winios_dump_srcbits(const void *bits, int w, int h, int stride) {
 void winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
                             int sw, int sh, int stride, const void *bits) {
     if (sw <= 0 || sh <= 0 || !bits) return;
+    /* ml — before the copy, not after: a direct launch's D3D device window
+     * flushes a full-size black client area and forwarding it would both
+     * cover the game image and pay a whole-surface memcpy per flush for a
+     * bitmap we would then throw away. The win32u side asks the same question
+     * (winios_overlay_skip_hwnd) and normally never calls us at all for such
+     * a window; this is the backstop for a flush already in flight when the
+     * swapchain registered. Desktop mode never skips — see that function. */
+    if (winios_overlay_skip_hwnd(hwnd)) return;
     NSData *data = [NSData dataWithBytes:bits length:(size_t)stride * sh];
     static int dumpSurf = -1;
     if (dumpSurf < 0) dumpSurf = getenv("MADEIRA_DUMP_SURFACES") != NULL;
@@ -1518,9 +1561,9 @@ void winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
         fflush(stderr);
     }
     dispatch_async(dispatch_get_main_queue(), ^{
-        winios_ensure_compositor();
-        if (!g_compositor_view) return;
+        if (!winios_ensure_window_host()) return;
         CALayer *l = winios_layer_for(hwnd, true);
+        if (!l) return;
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
         CGDataProviderRef dp = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
         /* GDI 32bpp DIB = BGRX little-endian, no alpha */
@@ -1887,6 +1930,203 @@ void winios_pointer(int x, int y, unsigned int flags, unsigned int data) {
         if (flags & MOUSEEVENTF_ABSOLUTE) winios_cursor_move(x, y);
         else if (g_rel_cursor) winios_cursor_advance(x, y);
     }
+}
+
+/* ============================================================ *
+ * ml — THE DIRECT-LAUNCH GDI OVERLAY
+ * ============================================================
+ *
+ * See Winios.h's doc comment for the problem. The mechanics, all of which
+ * fall out of hosting inside the game layer rather than beside it:
+ *
+ * WHERE IT LIVES. A plain CALayer added to g_game_layer — the same layer the
+ * drawn cursor already hosts on (winios_set_game_layer), for the same reason:
+ * it is the ONE thing in a direct launch whose bounds are the live game rect
+ * in points. Sublayers of a CAMetalLayer composite ABOVE its presented
+ * drawable (that is how the cursor has always worked), so the overlay is
+ * above the game image; zPosition keeps it below the cursor's 10000, and the
+ * app's on-screen controls live in a separate UIWindow entirely, so they stay
+ * above both. Fullscreen changes only the game rect, which this reads live.
+ *
+ * NO BACKDROP. winios_ensure_compositor's opaque letterbox + teal desktop
+ * backdrop is exactly what must not happen here (the 2026-07-06 regression in
+ * its own comment: the backdrop covered a game's Metal layer). This layer has
+ * no background colour at all; only the per-window layers paint, and each is
+ * exactly its window's rect.
+ *
+ * COORDINATES. Guest pixel -> layer point is one uniform scale, the game
+ * layer's bounds over the live guest resolution — identical to
+ * winios_cursor_place's, and identical to what MetalBackedView.mapPoint
+ * computes for a touch (GameSurfaceLayout.map against the same guest size and
+ * the same rect). So a dialog is drawn where a tap on it lands, in Absolute,
+ * Relative and Touch pointer modes alike, with no mapping of its own to keep
+ * in step. When no GDI window exists, nothing here runs and input mapping is
+ * byte-for-byte what it was.
+ *
+ * TOUCHES. A CALayer is not a view and has no hit-testing, so the overlay can
+ * never intercept a touch — "it must not steal input once the dialog is gone"
+ * is structural here rather than something to remember to switch off.
+ * ============================================================ */
+
+/* The overlay container. nil whenever no GDI window exists, so its mere
+ * existence is the answer to "is a direct-launch window on screen". */
+static CALayer *g_overlay;
+
+/* Overlay windows currently VISIBLE. Written on the main thread by
+ * winios_overlay_refresh_live, read from wine threads in win32u's blocking
+ * message wait — see winios_overlay_window_count. */
+static _Atomic unsigned g_overlay_live;
+
+/* MADEIRA_DIRECT_OVERLAY=0 -> behave exactly as before this existed. Cached
+ * once, like every other env knob in this file; announced once so a device log
+ * distinguishes "the overlay decided there was nothing to draw" from "the
+ * overlay was switched off". */
+static int winios_overlay_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("MADEIRA_DIRECT_OVERLAY");
+        on = !(e && *e == '0');
+        if (!on) {
+            fprintf(stderr, "[overlay] disabled by MADEIRA_DIRECT_OVERLAY=0 — "
+                            "ordinary GDI windows will not be shown in a direct launch\n");
+            fflush(stderr);
+        }
+    }
+    return on;
+}
+
+static int winios_overlay_active(void) {
+    return !winios_cursor_desktop_mode() && winios_overlay_enabled();
+}
+
+/* Windows that HOST the presented Metal layer. A fixed table of atomics
+ * rather than a dictionary + lock because the reader is win32u's GDI flush
+ * path on a wine thread: it must not block, and in practice there is one
+ * entry (a swapchain per D3D device). Overflow just means a window is not
+ * recognised, which is the pre-overlay behaviour for it. */
+#define WINIOS_METAL_HWNDS 8
+static _Atomic(uintptr_t) g_metal_hwnds[WINIOS_METAL_HWNDS];
+
+void winios_overlay_note_metal_hwnd(void *hwnd) {
+    uintptr_t v = (uintptr_t)hwnd;
+    if (!v || !winios_overlay_active()) return;
+    for (int i = 0; i < WINIOS_METAL_HWNDS; i++) {
+        uintptr_t expected = 0;
+        if (atomic_load(&g_metal_hwnds[i]) == v) return;      /* already known */
+        if (atomic_compare_exchange_strong(&g_metal_hwnds[i], &expected, v)) {
+            fprintf(stderr, "[overlay] metal window hwnd=%p — its GDI surface will not be drawn\n",
+                    hwnd);
+            fflush(stderr);
+            /* A D3D window normally paints its client area (black) once
+             * before the swapchain exists, so a layer for it may already be
+             * up and covering the first frames. Retire it now. */
+            winios_remove_layer((HWND)hwnd);
+            return;
+        }
+    }
+}
+
+int winios_overlay_skip_hwnd(void *hwnd) {
+    uintptr_t v = (uintptr_t)hwnd;
+    if (!v || !winios_overlay_active()) return 0;
+    for (int i = 0; i < WINIOS_METAL_HWNDS; i++) {
+        uintptr_t s = atomic_load(&g_metal_hwnds[i]);
+        if (!s) break;                    /* slots fill in order */
+        if (s == v) return 1;
+    }
+    return 0;
+}
+
+unsigned winios_overlay_window_count(void) {
+    return atomic_load(&g_overlay_live);
+}
+
+/* Guest pixel rect -> the overlay's own (game-layer-local) coordinate space.
+ * The two numbers are the same ones winios_cursor_place reads, and for the
+ * same reasons its doc comment gives: g_game_layer.bounds IS the current game
+ * rect's size at local origin (0,0), and winios_screen_size() is the LIVE
+ * guest resolution, not a launch-time constant. */
+static CGRect winios_overlay_layer_rect(int x, int y, int w, int h) {
+    int gw = 0, gh = 0;
+    winios_screen_size(&gw, &gh);
+    if (gw <= 0) gw = 1024;
+    if (gh <= 0) gh = 768;
+    CGRect hb = g_game_layer ? g_game_layer.bounds : CGRectZero;
+    CGFloat sx = hb.size.width / gw, sy = hb.size.height / gh;
+    return CGRectMake(x * sx, y * sy, w * sx, h * sy);
+}
+
+/* main thread only */
+static void winios_ensure_overlay(void) {
+    if (g_overlay) return;
+    if (!winios_overlay_active()) return;
+    /* Swift publishes the game layer once, at first attach (MetalBackedView.
+     * didMoveToWindow), long before any program runs — so this is only ever
+     * nil in the window between app launch and that attach, where retrying on
+     * the next flush is exactly right. */
+    if (!g_game_layer) return;
+    if (!g_layers) g_layers = [NSMutableDictionary new];
+    if (!g_px_rects) g_px_rects = [NSMutableDictionary new];
+    if (!g_surf_sizes) g_surf_sizes = [NSMutableDictionary new];
+    g_overlay = [CALayer layer];
+    g_overlay.anchorPoint = CGPointMake(0, 0);
+    g_overlay.frame = g_game_layer.bounds;
+    g_overlay.zPosition = 5000;    /* above the drawable, below the cursor's 10000 */
+    int gw = 0, gh = 0;
+    winios_screen_size(&gw, &gh);
+    [g_game_layer addSublayer:g_overlay];
+    fprintf(stderr, "[overlay] created host=%p game-rect=%.0fx%.0f guest=%dx%d\n",
+            g_game_layer, g_overlay.frame.size.width, g_overlay.frame.size.height, gw, gh);
+    fflush(stderr);
+}
+
+/* main thread only. The one place that decides both "how many overlay windows
+ * are on screen" (which win32u polls on) and "is the overlay still needed",
+ * so those two can never disagree. Teardown waits for the last window to be
+ * DESTROYED rather than merely hidden: a dialog that is hidden and shown again
+ * keeps its layer and its content, and a transparent container with nothing
+ * but hidden sublayers costs nothing and cannot take a touch. */
+static void winios_overlay_refresh_live(void) {
+    if (!winios_overlay_active()) return;   /* desktop mode is not involved */
+    unsigned n = 0;
+    for (NSNumber *key in g_layers) {
+        CALayer *l = g_layers[key];
+        if (l && !l.hidden) n++;
+    }
+    atomic_store(&g_overlay_live, n);
+    if (!g_overlay || g_layers.count) return;
+    [g_overlay removeFromSuperlayer];
+    g_overlay = nil;
+    fprintf(stderr, "[overlay] emptied — last GDI window destroyed, overlay removed\n");
+    fflush(stderr);
+}
+
+/* main thread only. The host for per-window layers in the CURRENT mode. */
+static CALayer *winios_ensure_window_host(void) {
+    if (!winios_overlay_active()) {
+        winios_ensure_compositor();
+        return g_compositor_view.layer;
+    }
+    winios_ensure_overlay();
+    return g_overlay;
+}
+
+/* See Winios.h. Same trigger as winios_cursor_relayout, from the same Swift
+ * call site: both are sublayers of a game layer whose rect just moved. */
+void winios_overlay_relayout(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!g_overlay || !g_game_layer) return;
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        g_overlay.frame = g_game_layer.bounds;
+        for (NSNumber *key in g_px_rects) {
+            CALayer *l = g_layers[key];
+            CGRect r = g_px_rects[key].CGRectValue;
+            if (l) l.frame = winios_overlay_layer_rect((int)r.origin.x, (int)r.origin.y,
+                                                       (int)r.size.width, (int)r.size.height);
+        }
+        [CATransaction commit];
+    });
 }
 
 /* ============================================================ *

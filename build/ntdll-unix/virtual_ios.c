@@ -39,6 +39,8 @@
 #include <sys/mman.h>
 #include <limits.h>
 #include <pthread.h>
+/* ml1050: QOS_CLASS_* / pthread_set_qos_class_self_np for the pool warmer. */
+#include <pthread/qos.h>
 #include <sys/ioctl.h>
 #ifdef WINE_IOS
 /* Minimal Mach API decls to avoid <mach/mach.h>'s host_page_size symbol
@@ -694,6 +696,26 @@ static void *ios_pool_warmer_thread( void *arg )
     unsigned cycle = 0;
     int warm_enabled = 1;
     unsigned rx_every = 16;
+
+    /* ml1050: THIS IS A HOUSEKEEPING THREAD AND IT WAS RUNNING AT THE SAME
+     * SCHEDULING CLASS AS THE GAME.
+     *
+     * It is created from a guest thread, and thread_ios.c's start_thread()
+     * promotes every guest thread to QOS_CLASS_USER_INTERACTIVE, so this one
+     * inherited it -- while doing full RW+RX walks of a half-gigabyte JIT
+     * pool, the vm census, malloc_zone_check() over a multi-gigabyte heap and
+     * the 10 s reporters.  ml901 already measured it at 4.4-4.8 % of all CPU
+     * in every window.  Nothing it does is on any frame's critical path and
+     * nothing waits on it, so it has no business competing for a P-core with
+     * the presenting thread; UTILITY is what "do this when there is room"
+     * means on Darwin.  Set from the thread body rather than the creator's
+     * attr because pthread_set_qos_class_self_np is the only form that is
+     * legal after creation and the creator is a guest thread that must keep
+     * its own class.  MADEIRA_WARM_QOS=0 restores the inherited class. */
+    {
+        const char *q = getenv( "MADEIRA_WARM_QOS" );
+        if (!(q && !strcmp( q, "0" ))) pthread_set_qos_class_self_np( QOS_CLASS_UTILITY, 0 );
+    }
     /* ml960: independent wall-clock deadlines (ms).  Everything below used to
      * hang off "cycle % N" of a loop period that ml670 silently multiplied by 8. */
     int vmcensus = 0;
@@ -963,6 +985,27 @@ static void *ios_pool_warmer_thread( void *arg )
                                            unsigned long long peak_mb,
                                            unsigned long long comp_mb );
                 ios_perf_line( ios_perf_phys_mb, ios_perf_peak_mb, ios_perf_comp_mb );
+            }
+            /* ml1050: the [frame] critical-path line runs in BOTH builds.
+             *
+             * ios_perf_line() above is the quiet build's summary and is skipped
+             * whenever MADEIRA_DIAG is on -- which is every log this port takes
+             * when it is being optimised, i.e. exactly when the frame breakdown
+             * is wanted. So the diag build calls the frame reporter directly
+             * here instead of inheriting it from [perf]. The two are mutually
+             * exclusive by the same madeira_diag_on() test, so it is never
+             * reported twice in one window. Window length is this heartbeat's,
+             * which is what do_beat means. */
+            if (do_beat && madeira_diag_on())
+            {
+                extern void ios_frame_report( unsigned long long win_ns );
+                static unsigned long long frame_prev_ns;
+                struct timespec bt;
+                unsigned long long bnow;
+                clock_gettime( CLOCK_MONOTONIC_RAW, &bt );
+                bnow = (unsigned long long)bt.tv_sec * 1000000000ull + (unsigned long long)bt.tv_nsec;
+                if (frame_prev_ns) ios_frame_report( bnow - frame_prev_ns );
+                frame_prev_ns = bnow;
             }
             /* ml566: WHEN does the host malloc zone become corrupt?
              *
@@ -6950,6 +6993,78 @@ static BOOL ios_laa_forced(void)
     return cached;
 }
 
+/***********************************************************************
+ *           ios_wow_laa_synth / ios_wow_laa_low_first / ios_wow_laa_high_images
+ *
+ * ml1070: A RAISED CEILING IS NOT A LICENCE TO PLACE HIGH.
+ *
+ * ios_laa_forced() above raises the user-space ceiling for an image whose own
+ * header does NOT carry IMAGE_FILE_LARGE_ADDRESS_AWARE.  That is a deliberate
+ * compatibility trade and it stays.  What did NOT follow from it, and was
+ * nevertheless taken, is the second half: once the ceiling moves to 4 GB,
+ * wow64.dll's default_zero_bits becomes `HighestUserAddress | 0x7fffffff` ==
+ * 0xffffffff, so EVERY unhinted guest allocation — and in particular every
+ * MEM_TOP_DOWN reserve, whose whole meaning is "as high as you can" — is now
+ * searched from the top of the 4 GB window DOWN.  A program that never claimed
+ * to handle a pointer with bit 31 set is then handed one for its main arena.
+ *
+ * On Windows the two halves are the same decision because the flag is the
+ * program's own promise.  Here the promise is synthesised, so they have to be
+ * separated:
+ *
+ *   - the CEILING stays raised: the address space is there when the low half
+ *     genuinely runs out, which is the failure the policy was written for
+ *     (16 -> 8 -> 4 MB fallbacks against a 3.75 MB largest gap);
+ *   - the PLACEMENT prefers the low half: map_view() tries [floor, 2 GB) first
+ *     for a kernel-pick inside the window and only spills above 0x80000000
+ *     when the low half cannot serve the request.
+ *
+ * So a program that fits below 2 GB — every non-LAA program on Windows, by
+ * construction — sees exactly the address space it was built for, and one that
+ * does not still gets the extra half instead of dying.  No image, no title and
+ * no allocation size appears anywhere in this rule.
+ *
+ * ios_wow_laa_synth is set from the ONE place that identifies the main image
+ * (ios_wow_image_ceiling) and re-affirmed at init_peb; it is a session global
+ * for the same reason user_space_wow_limit is, and is reset with it.
+ *
+ * Knobs: MADEIRA_LAA_LOWFIRST=0 restores the pre-ml1070 placement (high half
+ * open to the program from the first allocation).  MADEIRA_LAA_HIGH_IMAGES=0
+ * additionally keeps Wine's builtin images out of the high half, which is the
+ * other half of the A/B: with it off, guest 32-bit ntdll goes back to a low
+ * base and NOTHING in the window has bit 31 set.
+ */
+static int ios_wow_laa_synth;      /* the 4 GB ceiling was synthesised, not declared */
+
+static void ios_wow_note_laa( WORD charact )
+{
+    ios_wow_laa_synth = !(charact & IMAGE_FILE_LARGE_ADDRESS_AWARE) && ios_laa_forced();
+}
+
+static BOOL ios_wow_laa_low_first(void)
+{
+    static int cached = -1;
+
+    if (cached < 0)
+    {
+        const char *e = getenv( "MADEIRA_LAA_LOWFIRST" );
+        cached = !(e && *e && atoi( e ) == 0);
+    }
+    return cached;
+}
+
+static BOOL ios_wow_laa_high_images(void)
+{
+    static int cached = -1;
+
+    if (cached < 0)
+    {
+        const char *e = getenv( "MADEIRA_LAA_HIGH_IMAGES" );
+        cached = !(e && *e && atoi( e ) == 0);
+    }
+    return cached;
+}
+
 /* The guest user-space ceiling (inclusive) implied by an image's
  * characteristics, with the policy above applied.  Both places that used to
  * spell out "(charact & LARGE_ADDRESS_AWARE) ? limit_4g : limit_2g" now call
@@ -7054,6 +7169,7 @@ static ULONG_PTR ios_wow_image_ceiling( const struct pe_image_info *image_info )
 
     ceiling = ios_wow_ceiling_for_charact( charact );
     user_space_wow_limit = ceiling;
+    ios_wow_note_laa( charact );          /* ml1070: synthesised vs declared */
     ERR( "[wow-limit] published guest 32-bit ceiling %p from the main image "
          "(machine %04x characteristics %04x large-address-aware=%d forced-laa=%d) before init_peb\n",
          (void *)ceiling, image_info->machine, charact,
@@ -7950,6 +8066,8 @@ void ios_wow_window_release( void *peb_id ) { }
 void ios_wow_window_release_current(void) { }
 void ios_wow_window_retire_current(void) { }
 void ios_wow_map_user_shared_data(void) { }
+void ios_wow_reserve_usd_slot( ULONG_PTR base ) { }
+void ios_wow_release_usd_slot(void) { }
 #endif  /* WINE_IOS */
 
 
@@ -10206,6 +10324,10 @@ static int ios_wow_window_teardown( ULONG_PTR base, void *dead_peb, unsigned gua
             dprintf( 2, "[wow-limit] cleared (was %p): the next 32-bit main image publishes its own\n",
                      (void *)user_space_wow_limit );
             user_space_wow_limit = 0;
+            /* ml1070: the synthesised-LAA flag describes the SAME ceiling and has
+             * the same lifetime — clear it here and nowhere else, so the two can
+             * never disagree about which process the ceiling belongs to. */
+            ios_wow_laa_synth = 0;
         }
     }
     return 1;
@@ -13228,6 +13350,64 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
             (size_t)((char *)end - (char *)ios_usable_va_floor) >= view_size)
             start = (void *)ios_usable_va_floor;
 
+#ifdef WINE_IOS
+        /* ml1070 [laa] LOW HALF FIRST for a SYNTHESISED 4 GB ceiling.
+         *
+         * See ios_wow_laa_synth.  The ceiling was raised for an image that never
+         * declared IMAGE_FILE_LARGE_ADDRESS_AWARE, so wow64.dll's
+         * default_zero_bits is 0xffffffff and every unhinted guest allocation —
+         * every MEM_TOP_DOWN reserve above all — is searched from the top of the
+         * window down.  Try the half the program was actually built for first.
+         *
+         * This is a PRE-ATTEMPT, not a constraint: it is one extra
+         * map_reserved_area() call over the reserved-area tree (the guest window
+         * IS a reserved area, so this is the path that serves guest allocations),
+         * it is silent, and a NULL from it changes nothing — control falls into
+         * exactly the pre-ml1070 code below with start/end untouched.  So it can
+         * never turn a satisfiable allocation into STATUS_NO_MEMORY, which is the
+         * ml118 rule ("never impose a constraint we cannot also withdraw").
+         *
+         * Only for requests that are already confined to a guest window (limit_high
+         * inside it): host-side placements, and map_image_view's deliberate
+         * high-half attempt for builtins (whose limit_low is B + 2 GB, so low_end
+         * lands at or below start and the test below fails), are untouched. */
+        if (ios_wow_laa_synth && ios_wow_laa_low_first() && !base &&
+            limit_high && ios_wow_in_window( (void *)limit_high ))
+        {
+            ULONG_PTR wb = ios_wow_base();
+            void *low_end = (void *)(wb + limit_2g);
+
+            if (wb && low_end > start && (char *)end > (char *)low_end &&
+                (size_t)((char *)low_end - (char *)start) >= view_size &&
+                (ptr = map_reserved_area( start, low_end, host_size, top_down,
+                                          unix_prot, align_mask )))
+            {
+                static unsigned long lf_n;
+
+                if (++lf_n <= 8 || !(lf_n % 512))
+                    dprintf( 2, "[laa] ml1070 #%lu low-half placement %p+0x%lx (guest %p) for a "
+                                "program whose header is not large-address-aware — the raised "
+                                "ceiling stays, the high half is spill only (MADEIRA_LAA_LOWFIRST=0 "
+                                "restores the old placement)\n",
+                             lf_n, ptr, (unsigned long)size, (void *)((ULONG_PTR)ptr - wb) );
+                goto done;
+            }
+            if (wb)
+            {
+                static unsigned long sp_n;
+
+                /* The low half could not serve it.  Say so BEFORE spilling, because
+                 * "the program got a bit-31 address" and "the program asked for one"
+                 * are different findings and only this line separates them. */
+                if (++sp_n <= 8 || !(sp_n % 64))
+                    dprintf( 2, "[laa] ml1070 SPILL #%lu: no room below guest 2 GB for 0x%lx bytes "
+                                "(%s, start=guest %p) — falling back to the whole window\n",
+                             sp_n, (unsigned long)size, top_down ? "top-down" : "bottom-up",
+                             (void *)((ULONG_PTR)start - wb) );
+            }
+        }
+#endif
+
         if ((ptr = map_reserved_area( start, end, host_size, top_down, unix_prot, align_mask )))
         {
             TRACE( "got mem in reserved area %p-%p\n", ptr, (char *)ptr + size );
@@ -13362,6 +13542,31 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
 done:
     status = create_view( view_ret, ptr, size, vprot );
     if (status != STATUS_SUCCESS) unmap_area( ptr, size );
+#ifdef WINE_IOS
+    /* ml1070 [hi-alloc]: WHO IS ABOVE 2 GB, and how big is it.
+     *
+     * Always on, and deliberately not gated on ios_wow_laa_synth — the census is
+     * only interesting when the placement is a surprise, but "an LAA program is
+     * using the high half" is the reading that proves the counter works.  The
+     * forced= field is what separates the two.  Bounded: the first 32, then
+     * 1-in-256, per run. */
+    if (!status)
+    {
+        ULONG_PTR wb = ios_wow_base();
+
+        if (wb && (ULONG_PTR)ptr >= wb + limit_2g && (ULONG_PTR)ptr < wb + IOS_WOW_WINDOW_SIZE)
+        {
+            static unsigned long hi_n;
+
+            if (++hi_n <= 32 || !(hi_n % 256))
+                dprintf( 2, "[hi-alloc] ml1070 #%lu guest %p+0x%lx type=0x%x vprot=0x%x %s "
+                            "forced-laa=%d lowfirst=%d\n",
+                         hi_n, (void *)((ULONG_PTR)ptr - wb), (unsigned long)size,
+                         alloc_type, vprot, top_down ? "top-down" : "bottom-up",
+                         ios_wow_laa_synth, (int)ios_wow_laa_low_first() );
+        }
+    }
+#endif
     return status;
 }
 
@@ -15117,8 +15322,13 @@ static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_inf
          *
          * Advisory, never fatal: on failure we fall straight through to the
          * ordinary preferred-base / full-window path below. */
+        /* ml1070: MADEIRA_LAA_HIGH_IMAGES=0 keeps Wine's furniture below 2 GB as
+         * well, so that NOTHING in the window has bit 31 set for a program whose
+         * header never claimed it could read one.  That is the second half of the
+         * A/B described at ios_wow_laa_synth; it costs the low-half headroom this
+         * placement was introduced to win back, so it is opt-in and default off. */
         if (is_builtin && (image_info->image_flags & IMAGE_FLAGS_ImageDynamicallyRelocated) &&
-            limit_high > wow_base + limit_2g)
+            limit_high > wow_base + limit_2g && ios_wow_laa_high_images())
         {
             static unsigned hi_n, hi_fail;
 
@@ -16087,7 +16297,15 @@ TEB *virtual_alloc_first_teb(void)
      * (Windows keeps the TEB low even for an LAA program), which is exactly why
      * upstream hardcodes it too. */
     {
-        ULONG_PTR teb_zbits = ios_wow_base() ? (limit_2g - 1) : 0;
+        ULONG_PTR wb = ios_wow_base();
+        ULONG_PTR teb_zbits = wb ? (limit_2g - 1) : 0;
+
+        /* ml1040: KUSER_SHARED_DATA lives at guest 0x7ffe0000 and the top-down
+         * search below would otherwise take exactly that address.  Hold it
+         * first; ios_wow_map_user_shared_data() hands the reservation back when
+         * it maps the real view.  See ios_wow_reserve_usd_slot. */
+        if (wb) ios_wow_reserve_usd_slot( wb );
+
         NtAllocateVirtualMemory( NtCurrentProcess(), &teb_block, teb_zbits, &total,
                                  MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE );
     }
@@ -16686,6 +16904,62 @@ void virtual_map_user_shared_data(void)
 
 #ifdef WINE_IOS
 /***********************************************************************
+ *           ios_wow_reserve_usd_slot / ios_wow_release_usd_slot   (ml1040)
+ *
+ * HOLD GUEST 0x7ffe0000 BEFORE THE FIRST TEB BLOCK IS ALLOCATED.
+ *
+ * `virtual_alloc_first_teb()` reserves the first TEB block with
+ * MEM_TOP_DOWN under a 2 GB ceiling.  Inside a guest window that search
+ * returns the highest free 128 KB below guest 0x80000000, which is
+ * 0x7FFE0000 — the address KUSER_SHARED_DATA has occupied on every version
+ * of Windows.  The device log shows exactly that: `[commit-zero] GUEST OK
+ * base=B+0x7ffe0000 size=0x20000` for the TEB block, and no
+ * `[wow-window] USD mapped` line afterwards, because the map then failed on
+ * an address that was already taken.  Every 32-bit `GetTickCount()`,
+ * `GetTickCount64()`, `InterruptTime` and `SystemTime` read then returned
+ * whatever byte of the TEB happened to be at that offset — constant for the
+ * life of the process.  A child pseudo-process was unaffected only because
+ * its TEB block comes from a different allocator and lands low.
+ *
+ * The page cannot simply be mapped here: this runs before the server
+ * connection exists, so the section cannot be opened yet.  Reserving the
+ * address costs nothing and needs nobody, and the real mapping replaces the
+ * reservation later from `ios_wow_map_user_shared_data()`.
+ *
+ * One granularity unit, because that is the unit MEM_RESERVE works in and
+ * the unit the top-down search steps by; it also matches Windows, where
+ * 0x7FFE0000..0x7FFF0000 belongs to the shared page and TEBs live below it.
+ */
+static void *ios_wow_usd_slot;
+
+void ios_wow_reserve_usd_slot( ULONG_PTR base )
+{
+    void *addr = (void *)(base + 0x7ffe0000);
+    SIZE_T size = 0x10000;
+    unsigned int status;
+
+    if (!base || ios_wow_usd_slot) return;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, &size,
+                                      MEM_RESERVE, PAGE_NOACCESS );
+    if (!status) ios_wow_usd_slot = addr;
+    dprintf( 2, "[usd-clock] wow: %s guest 0x7ffe0000 (host %p) for KUSER_SHARED_DATA "
+                "before the first TEB block: status=%08x\n",
+             status ? "FAILED to reserve" : "reserved",
+             (void *)(base + 0x7ffe0000), status );
+}
+
+void ios_wow_release_usd_slot(void)
+{
+    SIZE_T size = 0;
+    void *addr = ios_wow_usd_slot;
+
+    if (!addr) return;
+    ios_wow_usd_slot = NULL;
+    NtFreeVirtualMemory( NtCurrentProcess(), &addr, &size, MEM_RELEASE );
+}
+
+
+/***********************************************************************
  *           ios_wow_map_user_shared_data
  *
  * KUSER_SHARED_DATA for the 32-bit view (WOW64_DESIGN.md §4).  Guest code
@@ -16707,21 +16981,58 @@ void ios_wow_map_user_shared_data(void)
     HANDLE section;
     void *addr;
 
-    if (!base) return;
+    if (!base)
+    {
+        /* ml1040: never silent. A 32-bit process with no window has no 0x7ffe0000
+         * to map, but "there was no window" and "the mapping failed" used to look
+         * identical in a log — which is exactly how a frozen guest clock hid. */
+        dprintf( 2, "[usd-clock] wow: no guest window for this process — "
+                    "32-bit KUSER_SHARED_DATA NOT mapped\n" );
+        return;
+    }
     addr = (void *)(base + 0x7ffe0000);
+
+    /* ml1040: hand back the placeholder that virtual_alloc_first_teb parked here
+     * to keep the address free (see ios_wow_reserve_usd_slot). */
+    ios_wow_release_usd_slot();
+
     if ((status = NtOpenSection( &section, SECTION_MAP_READ, &attr )))
     {
-        ERR( "[wow-window] cannot open the USD section: %08x\n", status );
+        dprintf( 2, "[usd-clock] wow: cannot open the USD section: %08x — the 32-bit "
+                    "clock will read whatever is at guest 0x7ffe0000\n", status );
         return;
     }
     status = NtMapViewOfSection( section, NtCurrentProcess(), &addr, 0, 0, &offset, &size,
                                  ViewShare, 0, PAGE_READONLY );
     NtClose( section );
     if (status)
-        ERR( "[wow-window] USD not mapped at guest 0x7ffe0000 (host %p): %08x\n",
-             (void *)(base + 0x7ffe0000), status );
-    else
-        dprintf( 2, "[wow-window] USD mapped at host %p = guest 0x7ffe0000\n", addr );
+    {
+        /* ml1040: THIS LINE USED TO BE AN ERR(), WHICH MADEIRA_QUIET SWALLOWS.
+         * The failure was therefore invisible, and the only symptom was that
+         * GetTickCount() never moved for any 32-bit program in the process —
+         * a stopped clock with no error anywhere, the 2026-09-28 shape exactly. */
+        dprintf( 2, "[usd-clock] wow: *** FAILED to map KUSER_SHARED_DATA at guest "
+                    "0x7ffe0000 (host %p): %08x — every 32-bit GetTickCount/"
+                    "GetTickCount64/InterruptTime read is now whatever else lives "
+                    "there ***\n", (void *)(base + 0x7ffe0000), status );
+        return;
+    }
+
+    /* ml1040: PROVE IT ADVANCES, through the 32-bit view, not the 64-bit one.
+     * The 64-bit [usd-clock] line already said "ticking" while the 32-bit view
+     * was frozen, because they were different pages. Two reads a few hundred
+     * nanoseconds apart cannot show a tick, so print the value and let the
+     * second sample come from the guest's own test. */
+    {
+        const KUSER_SHARED_DATA *usd = addr;
+        unsigned long long ms = ((unsigned long long)usd->TickCount.High1Time << 32)
+                                | usd->TickCount.LowPart;
+
+        dprintf( 2, "[usd-clock] wow mapped at host %p = guest 0x7ffe0000: "
+                    "GetTickCount64()=%llu ms (TickCountMultiplier=0x%x) — %s\n",
+                 addr, ms, (unsigned)usd->TickCountMultiplier,
+                 ms ? "ticking" : "*** FROZEN AT ZERO ***" );
+    }
 }
 #endif
 
@@ -17675,7 +17986,11 @@ void virtual_set_large_address_space(void)
          * ios_wow_image_ceiling() already published (the normal path: the main
          * image is mapped before init_peb runs), this recomputes the identical
          * number from the identical characteristics. */
-        else user_space_wow_limit = ios_wow_ceiling_for_charact( main_image_info.ImageCharacteristics );
+        else
+        {
+            user_space_wow_limit = ios_wow_ceiling_for_charact( main_image_info.ImageCharacteristics );
+            ios_wow_note_laa( main_image_info.ImageCharacteristics );   /* ml1070 */
+        }
 #else
         else user_space_wow_limit = ((main_image_info.ImageCharacteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE) ? limit_4g : limit_2g) - 1;
 #endif
@@ -20014,10 +20329,30 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
      * happened before.  First 48, then one in 256. */
     if (view && (view->protect & SEC_IMAGE))
     {
-        static unsigned long vp_n;
+        static unsigned long vp_n, vp_hot;
         const unsigned long n = ++vp_n;
+        /* ml1040: THE SAMPLE STARVED THE ONE CASE IT WAS ADDED FOR.
+         *
+         * The first device run printed 51 [vprot] lines and NOT ONE of them was
+         * for the builtin ntdll view the round was about: import resolution
+         * spends the first-48 prefix during start-up, and 1-in-256 then misses a
+         * handful of requests entirely. A cap that is cheap at boot is a
+         * blindfold during the event (the 2026-09-29 lesson, again).
+         *
+         * So the two interesting classes always print, on their own budget:
+         * a request that would make an IMAGE page WRITABLE (the only kind that
+         * can be a code patch), and any request against an image placed in the
+         * HIGH half of a guest window (this port's builtin i386 DLLs, which is
+         * where a hook lands). Their own budget is generous and still bounded,
+         * because a guest can drive this path. */
+        const BOOL wants_write = (new_prot & (PAGE_READWRITE | PAGE_WRITECOPY |
+                                              PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+        const BOOL high_half_guest = ios_wow_in_window( base ) &&
+                                     ((ULONG_PTR)base - ios_wow_base()) >= 0x80000000u;
+        const BOOL always = wants_write || high_half_guest;
+        unsigned long h = always ? ++vp_hot : 0;
 
-        if (n <= 48 || !(n & 255))
+        if (n <= 48 || !(n & 255) || (always && (h <= 512 || !(h & 63))))
         {
             BYTE after = get_page_vprot( base );
             mach_vm_address_t qa = (mach_vm_address_t)base;
@@ -20033,9 +20368,10 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                 cur = qi.protection;
                 mx  = qi.max_protection;
             }
-            dprintf( 2, "[vprot] ml1030 #%lu %p+0x%lx new=0x%x st=0x%x view=%p+0x%lx vp=0x%x "
+            dprintf( 2, "[vprot] ml1040 #%lu%s %p+0x%lx new=0x%x st=0x%x view=%p+0x%lx vp=0x%x "
                         "vprot before=%02x after=%02x host=%c%c%c max=%c%c%c wow=%d peb=%p\n",
-                     n, base, (unsigned long)size, (unsigned)new_prot, (unsigned)status,
+                     n, high_half_guest ? " HIGH" : (wants_write ? " W" : ""),
+                     base, (unsigned long)size, (unsigned)new_prot, (unsigned)status,
                      view->base, (unsigned long)view->size, (unsigned)view->protect,
                      vprot, after,
                      (cur & VM_PROT_READ)    ? 'r' : '-',

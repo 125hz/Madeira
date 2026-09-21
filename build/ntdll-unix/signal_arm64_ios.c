@@ -956,6 +956,9 @@ static void *ios_stale_va_scanner( void *arg )
      * MADEIRA_NO_HEAL=1 reverts to dry-run reporting. */
     int do_heal = getenv( "MADEIRA_NO_HEAL" ) == NULL;
     pthread_setname_np( "wine-stale-heal" );
+    /* Background housekeeping: nothing waits on it, so it must not inherit
+     * the creator's USER_INTERACTIVE class and compete for a P-core. */
+    pthread_set_qos_class_self_np( QOS_CLASS_UTILITY, 0 );
     for (;;)
     {
         usleep( 100000 );
@@ -9051,6 +9054,200 @@ static uint64_t ios_fex_noexec_trap_rip( ucontext_t *context, const void *fault_
     *rip_from_x20 = 1;
     return (uint64_t)REGn_sig( 20, context );
 }
+
+/***********************************************************************
+ *           ios_guest_patch_note / ios_dump_guest_frame
+ *
+ * ml1070: MAKE A WILD GUEST BRANCH NAME ITS OWN CALLER.
+ *
+ * A guest that transfers control to an address with no code produces exactly
+ * one line today — FEX's "NoExec instruction in entry block" plus the
+ * [guest-state] register dump — and that is not enough to say WHO branched.
+ * Two device runs of the same program both died at guest rip=0xfffffffe with a
+ * plausible ESP and EBP, and the registers alone cannot distinguish a RET off a
+ * smashed frame from a CALL through a corrupted pointer: the discriminator is
+ * the stack, which was never printed.
+ *
+ * So at the no-exec trap (and only there — it is the one fault that means "the
+ * guest's own control flow is wrong"), print:
+ *
+ *   - the guest stack from ESP-0x10 to ESP+0x2c, one DWORD per slot, each with
+ *     the page protection Wine records for the address it points at.  An 'x'
+ *     slot is a return address, so the chain names the callers; '-' is data or
+ *     nothing.  Offsets are relative to ESP, so [+00] is what a RET would have
+ *     taken, and the value at [-04] is what a CALL would have pushed.
+ *   - fs:[0xC0] — TEB32->WOW32Reserved, the Wow64Transition pointer a hooker
+ *     that parses syscall thunks re-emits — plus the TEB32 base itself.
+ *   - KUSER_SHARED_DATA+0x300..0x31c, the SystemCall fields at guest
+ *     0x7ffe0300 that a 32-bit hooker reads to find the syscall stub.
+ *   - the last IOS_GPATCH_MAX guest addresses seen taking a write on an
+ *     EXECUTABLE guest page (i.e. an inline hook being installed), each with 16
+ *     bytes read back FROM THE GUEST VA.  That answers "did the detour land,
+ *     and what rel32 did it write" from the bytes rather than from inference.
+ *
+ * Bounded (first 4 no-exec traps per run), allocation-free, and every read goes
+ * through mach_vm_read_overwrite so an unreadable address is a printed "?"
+ * rather than a nested fault.  MADEIRA_GUESTFRAME=0 turns it off.
+ */
+#define IOS_GPATCH_MAX 8
+static struct { uint64_t addr; uint64_t host_pc; } ios_gpatch_ring[IOS_GPATCH_MAX];
+static volatile unsigned ios_gpatch_n;
+
+/* Called from the bus/segv write paths when a store lands on a guest page whose
+ * recorded protection includes EXEC.  Lock-free and signal-safe by construction:
+ * one fetch-and-add and two plain stores into a fixed array. */
+static void ios_guest_patch_note( uint64_t guest_addr, uint64_t host_pc )
+{
+    unsigned slot = __sync_fetch_and_add( &ios_gpatch_n, 1 ) % IOS_GPATCH_MAX;
+
+    ios_gpatch_ring[slot].addr = guest_addr;
+    ios_gpatch_ring[slot].host_pc = host_pc;
+}
+
+static int ios_guest_frame_on(void)
+{
+    static int cached = -1;
+
+    if (cached < 0)
+    {
+        const char *e = getenv( "MADEIRA_GUESTFRAME" );
+        cached = !(e && *e && atoi( e ) == 0);
+    }
+    return cached;
+}
+
+/* read `len` bytes of GUEST memory; returns 0 on failure */
+static int ios_guest_read( ULONG_PTR wow_base, uint64_t guest_addr, void *out, size_t len )
+{
+    mach_vm_size_t got = 0;
+
+    if (!wow_base || guest_addr + len > 0x100000000ull) return 0;
+    return mach_vm_read_overwrite( mach_task_self(),
+                                   (mach_vm_address_t)(wow_base + guest_addr), len,
+                                   (mach_vm_address_t)out, &got ) == KERN_SUCCESS && got == len;
+}
+
+/* one-character class for a guest address, from Wine's own vprot bookkeeping.
+ * ios_page_expected_prot() is the lock-free peek the [wr-strip] reheal uses, so
+ * this is safe to call from a fault handler. */
+static char ios_guest_class( ULONG_PTR wow_base, uint32_t guest_addr )
+{
+    extern int ios_page_expected_prot( const void *addr );
+    int p;
+
+    if (!wow_base || guest_addr < 0x10000) return '-';
+    p = ios_page_expected_prot( (const void *)(wow_base + guest_addr) );
+    if (p < 0) return '-';
+    if (p & PROT_EXEC) return 'x';
+    if (p & PROT_WRITE) return 'w';
+    if (p & PROT_READ) return 'r';
+    return '.';
+}
+
+static void ios_dump_guest_frame( ucontext_t *context, ULONG_PTR wow_base )
+{
+    uint64_t state = (uint64_t)REGn_sig( 28, context );
+    uint64_t cs[17];                   /* +0x18 rip, then gregs[0..15] */
+    mach_vm_size_t got = 0;
+    uint32_t esp, ebp, words[16];
+    unsigned char cls[16];
+    unsigned i;
+
+    if (!ios_guest_frame_on() || !wow_base || !state) return;
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(state + 0x18),
+                                sizeof(cs), (mach_vm_address_t)cs, &got ) != KERN_SUCCESS ||
+        got != sizeof(cs))
+    {
+        dprintf( 2, "[guest-frame] ml1070 CpuStateFrame at x28=%p unreadable — no stack dump\n",
+                 (void *)(uintptr_t)state );
+        return;
+    }
+
+    esp = (uint32_t)cs[1 + 4];
+    ebp = (uint32_t)cs[1 + 5];
+    dprintf( 2, "[guest-frame] ml1070 rip=0x%08x esp=0x%08x ebp=0x%08x (window base %p)\n",
+             (uint32_t)cs[0], esp, ebp, (void *)wow_base );
+
+    /* ESP-0x10 .. ESP+0x2c, 16 dwords */
+    for (i = 0; i < 16; i++)
+    {
+        uint32_t at = esp - 0x10 + i * 4;
+
+        if (!ios_guest_read( wow_base, at, &words[i], 4 )) { words[i] = 0; cls[i] = '?'; }
+        else cls[i] = (unsigned char)ios_guest_class( wow_base, words[i] );
+    }
+    for (i = 0; i < 16; i += 4)
+        dprintf( 2, "[guest-frame]   [esp%+d] %08x%c %08x%c %08x%c %08x%c\n",
+                 (int)(i * 4) - 0x10,
+                 words[i],     cls[i],     words[i + 1], cls[i + 1],
+                 words[i + 2], cls[i + 2], words[i + 3], cls[i + 3] );
+    dprintf( 2, "[guest-frame]   ('x' = the address that dword points at is EXECUTABLE guest "
+                "memory, i.e. a return address; w/r = data; '-' = not committed; '?' = unreadable)\n" );
+
+    /* TEB32 and fs:[0xC0] (WOW32Reserved / Wow64Transition) */
+    {
+        /* NtCurrentTeb() reads x18, which iOS zeroes on signal delivery — take
+         * the TEB from the pthread key the rest of this file uses at fault time. */
+        extern pthread_key_t ios_teb_tls_key;
+        TEB *teb64 = pthread_getspecific( ios_teb_tls_key );
+        uint64_t teb32 = 0;
+        uint32_t wow32res = 0, clientid[2] = { 0, 0 };
+
+        if (teb64 && teb64->WowTebOffset)
+            teb32 = (uint64_t)((ULONG_PTR)teb64 + (LONG)teb64->WowTebOffset);
+        if (teb32 >= wow_base && teb32 < wow_base + 0x100000000ull)
+        {
+            uint64_t g = teb32 - wow_base;
+
+            ios_guest_read( wow_base, g + 0xc0, &wow32res, 4 );
+            ios_guest_read( wow_base, g + 0x20, clientid, 8 );
+            dprintf( 2, "[guest-frame]   teb32=guest 0x%08x fs:[0xC0]=0x%08x (WOW32Reserved) "
+                        "ClientId=%x/%x\n",
+                     (uint32_t)g, wow32res, clientid[0], clientid[1] );
+        }
+        else
+            dprintf( 2, "[guest-frame]   teb32=%p is not inside this window — fs:[0xC0] not read\n",
+                     (void *)(uintptr_t)teb32 );
+    }
+
+    /* KUSER_SHARED_DATA SystemCall block */
+    {
+        uint32_t usd[8];
+
+        if (ios_guest_read( wow_base, 0x7ffe0300, usd, sizeof(usd) ))
+            dprintf( 2, "[guest-frame]   usd 0x7ffe0300: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                     usd[0], usd[1], usd[2], usd[3], usd[4], usd[5], usd[6], usd[7] );
+        else
+            dprintf( 2, "[guest-frame]   usd 0x7ffe0300 unreadable (KUSER_SHARED_DATA not mapped "
+                        "in the window)\n" );
+    }
+
+    /* the last inline-hook writes, read back from the guest VA */
+    {
+        unsigned n = ios_gpatch_n < IOS_GPATCH_MAX ? ios_gpatch_n : IOS_GPATCH_MAX;
+        unsigned k;
+
+        if (!n) dprintf( 2, "[guest-frame]   no write to an executable guest page was seen this run\n" );
+        for (k = 0; k < n; k++)
+        {
+            unsigned slot = (ios_gpatch_n - 1 - k) % IOS_GPATCH_MAX;
+            uint64_t a = ios_gpatch_ring[slot].addr;
+            unsigned char b[16];
+
+            if (a >= wow_base && a < wow_base + 0x100000000ull) a -= wow_base;
+            if (ios_guest_read( wow_base, a, b, sizeof(b) ))
+                dprintf( 2, "[guest-frame]   patched[-%u] guest 0x%08x: "
+                            "%02x %02x %02x %02x %02x %02x %02x %02x "
+                            "%02x %02x %02x %02x %02x %02x %02x %02x (host pc %p)\n",
+                         k + 1, (uint32_t)a, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                         b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+                         (void *)(uintptr_t)ios_gpatch_ring[slot].host_pc );
+            else
+                dprintf( 2, "[guest-frame]   patched[-%u] guest 0x%08x: UNREADABLE\n",
+                         k + 1, (uint32_t)a );
+        }
+    }
+}
 #endif
 
 static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
@@ -10151,6 +10348,10 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                     dprintf( 2, "[dep-off]   DEP is OFF yet this range was not promoted — a gap "
                                 "in the InvalidationTracker promotion, not a guest bug\n" );
                 if (wow_base) ios_dump_fault_region( (void *)(wow_base + (ULONG_PTR)trap_rip) );
+                /* ml1070: the registers say WHERE it went; this says who sent it.
+                 * First 4 traps only — the report is ~24 lines and a runaway
+                 * branch repeats the same RIP forever (see the ml486 cap above). */
+                if (noexec_n <= 4) ios_dump_guest_frame( context, wow_base );
             }
             setup_exception( context, &rec );
             return;
@@ -11309,6 +11510,21 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                     int stripped = (is_write && (want & PROT_WRITE) &&
                                     host_prot >= 0 && !(host_prot & VM_PROT_WRITE));
                     ++wr_seen;
+                    /* ml1070: a store into a page Wine records as EXECUTABLE is an
+                     * inline hook being installed.  Record the site (both the "host
+                     * stripped the write" case and the "wine says r-x, FEX's SMC
+                     * handler will take it" case, which is the one a detour into a
+                     * guest image actually takes) so [guest-frame] can read the
+                     * bytes back from the guest VA after a wild branch. */
+                    if (is_write && (want & PROT_EXEC))
+                    {
+                        extern ULONG_PTR ios_wow_base(void);
+                        ULONG_PTR wb = ios_wow_base();
+                        ULONG_PTR fa = (ULONG_PTR)siginfo->si_addr;
+
+                        if (wb && fa >= wb && fa < wb + 0x100000000ull)
+                            ios_guest_patch_note( (uint64_t)(fa - wb), (uint64_t)(uintptr_t)pc );
+                    }
                     if (wr_seen <= 12 || (wr_seen % 4096) == 0)
                         ERR("[wr-strip] #%lu addr=%p pc=%p esr=0x%llx write=%d "
                             "wine_want=%d host_prot=%d %s (seen=%lu healed=%lu) rev=ml552\n",

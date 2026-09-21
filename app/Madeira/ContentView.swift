@@ -747,6 +747,12 @@ final class MetalBackedView: UIView {
         // above. Re-place it now so it tracks every DisplayMode change and
         // rotation, not only the next touch/pointer event.
         winios_cursor_relayout()
+        // Same host layer, same trigger: a directly-launched program's ordinary
+        // GDI windows (a chooser dialog, a message box, a popup menu) are drawn
+        // in a transparent overlay hosted on that same layer and positioned from
+        // its local bounds — see winios_overlay_relayout's doc comment in
+        // Winios.h. No-op in desktop mode and whenever no such window exists.
+        winios_overlay_relayout()
         let modeLabel = mode == effective ? mode.label : "\(effective.label)(req:\(mode.label))"
         fputs(String(format: "[display] apply reason=%@ mode=%@ guest=%.0fx%.0f drawable=%.0fx%.0f "
                     + "bounds=(%.0f,%.0f %.0fx%.0f) -> rect=(%.0f,%.0f %.0fx%.0f)\n",

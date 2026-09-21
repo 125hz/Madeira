@@ -303,6 +303,27 @@ static inline unsigned int madeira_cell_kind( const struct madeira_sync_cell *ce
     return __atomic_load_n( &cell->kind, __ATOMIC_RELAXED );
 }
 
+/* ml1060: "does this cell say a waiter could be released RIGHT NOW?", written
+ * once so that the client watchdog, the server-side lost-wakeup detector and
+ * the host models cannot drift apart on it.
+ *
+ *   semaphore      count > 0                      (DISABLED is -1, so excluded)
+ *   manual event   state > 0                      (SET; DISABLED excluded)
+ *   auto event     state == MADEIRA_CELL_SET only -- CLAIMED (2) means the
+ *                  server is handing this token to one of its own queued
+ *                  threads at this instant, which resolves in nanoseconds on
+ *                  the server thread and is nobody's hang.
+ *
+ * `state' must come out of a load whose generation the caller has already
+ * matched; this function does no validation of its own on purpose, because the
+ * only correct place for that is the same atomic that read the state. */
+static inline int madeira_cell_signalled( unsigned int kind, unsigned int manual, int state )
+{
+    if (kind == MADEIRA_CELL_KIND_SEM) return state > 0;
+    if (manual) return state > 0;
+    return state == MADEIRA_CELL_SET;
+}
+
 /* The futex address: the STATE half of `sg'.  Both sides must use this and
  * only this, or a client parked by one could never be woken by the other. */
 #if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \

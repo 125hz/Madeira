@@ -77,6 +77,13 @@ extern ULONG ios_wow_guest_addr( const void *host );
  * i.e. at guest 0x7ffe0000.  No-op outside a window. */
 extern void ios_wow_map_user_shared_data(void);
 
+/* ml1040: hold guest 0x7ffe0000 from before the first TEB block is reserved
+ * until the real KUSER_SHARED_DATA view replaces it.  Without this the
+ * MEM_TOP_DOWN search for the TEB block takes that address and every 32-bit
+ * tick read in the process is frozen. */
+extern void ios_wow_reserve_usd_slot( ULONG_PTR base );
+extern void ios_wow_release_usd_slot(void);
+
 /* Convert the PEB64 pointer fields that the 32-bit ntdll writes itself with
  * the classic WoW64 identity (`peb64->X = PtrToUlong( guest_ptr )`) into HOST
  * pointers, so invariant 2 holds for the native readers of those fields.

@@ -977,7 +977,43 @@ HWND get_desktop_window(void)
 #endif  /* upstream explorer.exe launch path */
 
     if (!thread_info->top_window) ERR_(win)( "failed to create desktop window\n" );
-    else user_driver->pSetDesktopWindow( UlongToHandle( thread_info->top_window ));
+    else
+    {
+        /* iOS-Madeira ml1040: THE DESKTOP WINDOW MUST BE THE SIZE OF THE SCREEN,
+         * EVEN WHEN THERE IS NO SHELL TO SIZE IT.
+         *
+         * On Windows the desktop window always spans the virtual screen. Here it
+         * is sized by explorer.exe, and the games path deliberately never starts
+         * explorer (see the skip above) — so on a direct launch the desktop
+         * window stayed 0x0 with no style bits. A device log shows what that
+         * costs: a program's first window is a modal dialog, DS_CENTER centres it
+         * on a 0x0 parent, and it lands at {-127,-43,128,43} — entirely off
+         * screen, with nothing to show and no error anywhere. Everything else
+         * that reads the desktop is wrong by the same amount:
+         * GetWindowRect(GetDesktopWindow()), SPI_GETWORKAREA, CW_USEDEFAULT
+         * placement and every CenterWindow helper ever written.
+         *
+         * The virtual monitor already knows the answer, so give it to the window.
+         * Harmless in desktop mode: explorer sets its own size moments later. */
+        RECT virt = get_virtual_screen_rect( 0, MDT_DEFAULT );
+
+        if (virt.right > virt.left && virt.bottom > virt.top)
+        {
+            static int sized;
+
+            NtUserSetWindowPos( UlongToHandle( thread_info->top_window ), 0,
+                                virt.left, virt.top, virt.right - virt.left, virt.bottom - virt.top,
+                                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOSENDCHANGING );
+            if (!sized++)
+                dprintf( STDERR_FILENO, "[desktop-rect] ml1040 desktop window %p sized to the virtual "
+                                        "screen %dx%d at (%d,%d) — without this a DS_CENTER dialog "
+                                        "centres on a 0x0 desktop and lands off screen\n",
+                         UlongToHandle( thread_info->top_window ),
+                         (int)(virt.right - virt.left), (int)(virt.bottom - virt.top),
+                         (int)virt.left, (int)virt.top );
+        }
+        user_driver->pSetDesktopWindow( UlongToHandle( thread_info->top_window ));
+    }
 
     register_builtin_classes();
     return UlongToHandle( thread_info->top_window );

@@ -4673,3 +4673,382 @@ void ios_dump_stuck_waits(void)
     }
     fflush( stderr );
 }
+
+/* ============================================================
+ * iOS-Madeira ml1060: [lost-wake] -- a SERVER-SIDE lost-wakeup detector that
+ * also cures what it finds, and [wait-census], which makes a hang name the
+ * object everybody is waiting for.
+ *
+ * WHY THE DETECTOR HAD TO MOVE TO THIS SIDE.
+ * ml982 put the watchdog in the CLIENT (madeira_fast_watched_wait in
+ * ntdll/unix/sync.c): turn an INFINITE single-object wait into a heartbeat,
+ * and if the server says "not signaled" while the shared cell says "signaled",
+ * demote the object. That is the right instrument for the thread that is
+ * stuck, and it had one structural blind spot that a device log made
+ * unmissable: it only ran for NON-ALERTABLE waits. A managed-runtime title
+ * issues WaitForSingleObjectEx( h, INFINITE, TRUE ) for every handoff, so in
+ * log k67 all 56429 infinite single-object waits per 10 s arrived at the
+ * server with timeout == NULL, the heartbeat never ran once, and desync=0
+ * meant only that the detector was switched off for every thread that could
+ * hang. ml1060 removes that gate as well (see madeira_fast_watched_wait),
+ * but a client-side probe can only ever see the ONE object the calling thread
+ * is blocked on, and only when that thread's own code path reaches the probe.
+ *
+ * This one has neither limitation. The wineserver is a thread in the same
+ * Mach task; it owns every wait queue and can read every cell. It sees:
+ *
+ *   - the CLIENT's view, from the ml585 wait registry (ios_wait_reg, published
+ *     on entry to server_wait and cleared on exit, so a wait that never
+ *     returns is exactly the case it can describe);
+ *   - the SERVER's view, from ios_thread_wait_links(), which answers "is this
+ *     thread's active wait really queued on this object";
+ *   - the CELL, which is the shared word both sides transact on.
+ *
+ * WHAT IS REPORTED. Nothing, unless all four of these hold and hold across
+ * TWO consecutive scans of the same wait (same registry sequence number, same
+ * handle, same cell generation):
+ *
+ *   (1) a thread has been inside one server_wait for more than
+ *       MADEIRA_LOSTWAKE_SECS (5) seconds,
+ *   (2) on exactly ONE object, which is cell-backed (an event or a semaphore;
+ *       for anything else this prints nothing at all),
+ *   (3) the server really has that thread queued on that object, and the
+ *       thread is not suspended (a suspended thread cannot acquire a lock, so
+ *       its queued-ness is not evidence of anything),
+ *   (4) the cell says a waiter could be released right now
+ *       (madeira_cell_signalled(): count > 0, or SET).
+ *
+ * Requiring two scans is what separates "a token appeared a microsecond ago
+ * and the wake is in flight" from "this token has been sitting there for five
+ * seconds with a queued thread next to it".
+ *
+ * AND THEN IT CURES IT. wake_up( sync, 0 ) is exactly what a release does:
+ * it re-runs check_wait() for every queued thread, which CAS-claims a token
+ * out of the cell and refuses when there is none. It therefore CANNOT mint a
+ * token or release a thread that is not entitled to one -- the worst a false
+ * positive can do is deliver a token this thread was going to get anyway, one
+ * scan early. That is the direction this whole mechanism is supposed to fail
+ * in: a lost wakeup becomes a logged five-second stutter instead of a hang.
+ *
+ * COST. One pass over 512 registry slots every 5 s, no allocation, no locks,
+ * and for the overwhelmingly common case (an even sequence number = the thread
+ * is not in a wait) two loads per slot. It runs in the QUIET build by design:
+ * a detector that has to be switched on is a detector that is off during the
+ * event it exists for, which is the lesson of 2026-09-30.
+ * ============================================================ */
+
+#include "ios_fastsync.h"
+
+/* Differenced by the [perf] line in build/ntdll-unix/server_ios.c. Same
+ * cross-archive direction as madeira_sync_cells: defined here, referenced
+ * there. */
+unsigned int madeira_lostwake_count;
+
+#define MADEIRA_LOSTWAKE_SECS      5
+#define MADEIRA_LOSTWAKE_MAX_LINES 64
+#define MADEIRA_CENSUS_OBJS        64
+
+struct ios_lw_memo
+{
+    unsigned int seq;          /* registry sequence: the identity of ONE wait */
+    unsigned int tid;
+    unsigned int handle;
+    unsigned int gen;          /* cell generation, so a recycle is not a match */
+};
+
+struct ios_lw_find { unsigned int tid; struct thread *found; };
+
+static int ios_lw_match( struct process *process, void *arg )
+{
+    struct ios_lw_find *f = arg;
+    struct thread *t;
+    LIST_FOR_EACH_ENTRY( t, &process->thread_list, struct thread, proc_entry )
+        if (t->id == f->tid) { f->found = t; return 1; }
+    return 0;
+}
+
+/* Resolve a handle's object to its cell, if it has one. Returns the index, or
+ * -1 for "not a cell-backed object" -- which is the silent case by design: a
+ * thread parked on a mutex, a timer, a process or a socket is not something
+ * this detector knows anything about. */
+static int ios_lw_cell_of( struct object *obj, unsigned int *kind, unsigned int *manual )
+{
+    int man = 0, idx = madeira_event_cell_index( obj, &man );
+
+    if (idx >= 0) { *kind = MADEIRA_CELL_KIND_EVENT; *manual = (unsigned int)!!man; return idx; }
+    if ((idx = madeira_semaphore_cell_index( obj )) >= 0)
+    {
+        *kind = MADEIRA_CELL_KIND_SEM;
+        *manual = 0;
+        return idx;
+    }
+    return -1;
+}
+
+static unsigned long long ios_lw_now_ns( void )
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (unsigned long long)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+
+/* One scan. Called from main_loop (fd_ios.c) roughly every 5 s, at the point
+ * where the server has just recomputed its timers, i.e. with current_time and
+ * monotonic_time fresh -- check_wait() reads both. Calling wake_up() from
+ * there is exactly as safe as an expiring wait timeout, which is the same call
+ * from the same place. */
+void ios_scan_lost_wakeups( void )
+{
+    static struct ios_lw_memo memo[IOS_WAITREG_SLOTS];
+    static unsigned int printed;
+    static int secs = -1;
+    unsigned long long now_ns;
+    int i;
+
+    if (secs < 0)
+    {
+        const char *e = getenv( "MADEIRA_LOSTWAKE_SECS" );
+        secs = (e && *e) ? atoi( e ) : MADEIRA_LOSTWAKE_SECS;
+        if (secs < 1) secs = 1;
+    }
+    now_ns = ios_lw_now_ns();
+
+    for (i = 0; i < IOS_WAITREG_SLOTS; i++)
+    {
+        struct ios_wait_entry *e = &ios_wait_reg[i];
+        unsigned int s0 = e->seq, s1, handle, tid, flags;
+        unsigned int kind = 0, manual = 0, gen;
+        struct madeira_sync_cell *cell;
+        struct ios_lw_find f;
+        struct object *obj, *sync;
+        unsigned long long t0, age_ms;
+        uint64_t sg;
+        int idx, st, count;
+
+        if (!(s0 & 1)) { memo[i].seq = 0; continue; }   /* not in a wait */
+
+        t0     = e->t0_ns;
+        count  = e->count;
+        handle = e->handles[0];
+        tid    = e->wine_tid;
+        flags  = e->flags;
+        __sync_synchronize();
+        s1 = e->seq;
+        if (s1 != s0) { memo[i].seq = 0; continue; }     /* it moved: not stuck */
+
+        if (count != 1 || !handle || !t0 || now_ns < t0) { memo[i].seq = 0; continue; }
+        age_ms = (now_ns - t0) / 1000000ull;
+        if (age_ms < (unsigned long long)secs * 1000ull) { memo[i].seq = 0; continue; }
+
+        f.tid = tid; f.found = NULL;
+        enum_processes( ios_lw_match, &f );
+        if (!f.found) { memo[i].seq = 0; continue; }
+        if (f.found->suspend) { memo[i].seq = 0; continue; }
+
+        if (!(obj = get_handle_obj( f.found->process, handle, 0, NULL )))
+        {
+            clear_error();
+            memo[i].seq = 0;
+            continue;
+        }
+        if ((idx = ios_lw_cell_of( obj, &kind, &manual )) < 0)
+        {
+            release_object( obj );                       /* not a cell object */
+            memo[i].seq = 0;
+            continue;
+        }
+        cell = &madeira_sync_cells[idx];
+        sg   = __atomic_load_n( &cell->sg, __ATOMIC_SEQ_CST );
+        gen  = MADEIRA_SG_GEN( sg );
+        st   = MADEIRA_SG_STATE( sg );
+
+        /* The server must really have this thread queued on this object. A
+         * populated queue somewhere else proves nothing (ml687), and a client
+         * that has published a wait the server has already ended is a
+         * different bug with a different name. */
+        if (!madeira_cell_signalled( kind, manual, st ) ||
+            ios_thread_wait_links( f.found, obj ) != 1)
+        {
+            release_object( obj );
+            memo[i].seq = 0;
+            continue;
+        }
+
+        /* Two consecutive scans, same wait, same cell generation. */
+        if (memo[i].seq != s0 || memo[i].tid != tid ||
+            memo[i].handle != handle || memo[i].gen != gen)
+        {
+            memo[i].seq = s0; memo[i].tid = tid;
+            memo[i].handle = handle; memo[i].gen = gen;
+            release_object( obj );
+            continue;
+        }
+
+        __atomic_add_fetch( &madeira_lostwake_count, 1, __ATOMIC_RELAXED );
+        if (printed < MADEIRA_LOSTWAKE_MAX_LINES)
+        {
+            printed++;
+            fprintf( stderr,
+                     "[lost-wake] ml1060 #%u obj=%s cell=%d gen=%u %s=%d waiters=%d "
+                     "srv_waiters=%d manual=%u tid=%04x handle=%08x alertable=%d "
+                     "waited=%llu.%03llus - the cell says this object can release a waiter "
+                     "and the server has had this thread queued on it across two scans; "
+                     "waking its queue now. MADEIRA_FASTSYNC_SEM=0 / MADEIRA_FASTSYNC=cells "
+                     "/ MADEIRA_FASTSYNC=0 bisect the fast path.%s\n",
+                     __atomic_load_n( &madeira_lostwake_count, __ATOMIC_RELAXED ),
+                     kind == MADEIRA_CELL_KIND_SEM ? "sem" : "event",
+                     idx, gen,
+                     kind == MADEIRA_CELL_KIND_SEM ? "count" : "state", st,
+                     __atomic_load_n( &cell->waiters, __ATOMIC_RELAXED ),
+                     __atomic_load_n( &cell->srv_waiters, __ATOMIC_RELAXED ),
+                     manual, tid, handle, !!(flags & SELECT_ALERTABLE),
+                     age_ms / 1000ull, age_ms % 1000ull,
+                     printed == MADEIRA_LOSTWAKE_MAX_LINES
+                         ? "  (last line; further occurrences are counted in [perf] lostwake= only)"
+                         : "" );
+            fflush( stderr );
+        }
+
+        /* THE CURE. Identical to what a release does, and it cannot
+         * over-deliver: check_wait() CASes a token out of the cell per thread
+         * and refuses when there is none. */
+        sync = get_obj_sync( obj );
+        if (sync)
+        {
+            wake_up( sync, 0 );
+            release_object( sync );
+        }
+        release_object( obj );
+        memo[i].seq = 0;       /* a fresh pair of scans before reporting again */
+    }
+}
+
+/* ------------------------------------------------------------------------
+ * [wait-census]: under MADEIRA_DIAG=1, once per ~10 s, how many threads are
+ * blocked, on what kind of object, and which three objects have the most
+ * waiters -- with each one's cell state. A hang then names what everybody is
+ * waiting for instead of leaving it to be inferred from a stack sample.
+ * ---------------------------------------------------------------------- */
+
+struct ios_census_obj
+{
+    struct object *obj;
+    struct process *proc;
+    unsigned int handle;
+    unsigned int waiters;
+};
+
+void ios_wait_census( void )
+{
+    struct ios_census_obj tab[MADEIRA_CENSUS_OBJS];
+    unsigned int ntab = 0, blocked = 0, single = 0, alertable = 0, multi = 0, other_op = 0;
+    unsigned int n_event = 0, n_sem = 0, n_nocell = 0, n_unres = 0;
+    unsigned long long now_ns = ios_lw_now_ns(), oldest_ms = 0;
+    unsigned int oldest_tid = 0;
+    int i, k, slot;
+
+    for (i = 0; i < IOS_WAITREG_SLOTS; i++)
+    {
+        struct ios_wait_entry *e = &ios_wait_reg[i];
+        unsigned int s0 = e->seq, handle, tid, flags;
+        unsigned long long t0, age_ms;
+        struct ios_lw_find f;
+        struct object *obj;
+        unsigned int kind = 0, manual = 0;
+        int count;
+
+        if (!(s0 & 1)) continue;
+        t0 = e->t0_ns; count = e->count; handle = e->handles[0];
+        tid = e->wine_tid; flags = e->flags;
+        __sync_synchronize();
+        if (e->seq != s0) continue;
+
+        blocked++;
+        if (flags & SELECT_ALERTABLE) alertable++;
+        if (count == 1) single++;
+        else if (count > 1) { multi++; continue; }
+        else { other_op++; continue; }
+
+        if (t0 && now_ns >= t0)
+        {
+            age_ms = (now_ns - t0) / 1000000ull;
+            if (age_ms > oldest_ms) { oldest_ms = age_ms; oldest_tid = tid; }
+        }
+
+        f.tid = tid; f.found = NULL;
+        enum_processes( ios_lw_match, &f );
+        if (!f.found) { n_unres++; continue; }
+        if (!(obj = get_handle_obj( f.found->process, handle, 0, NULL )))
+        {
+            clear_error();
+            n_unres++;
+            continue;
+        }
+        if (ios_lw_cell_of( obj, &kind, &manual ) < 0) n_nocell++;
+        else if (kind == MADEIRA_CELL_KIND_SEM) n_sem++;
+        else n_event++;
+
+        for (k = 0, slot = -1; k < (int)ntab; k++)
+            if (tab[k].obj == obj) { slot = k; break; }
+        if (slot < 0 && ntab < MADEIRA_CENSUS_OBJS)
+        {
+            slot = (int)ntab++;
+            tab[slot].obj = obj; tab[slot].proc = f.found->process;
+            tab[slot].handle = handle; tab[slot].waiters = 0;
+        }
+        if (slot >= 0) tab[slot].waiters++;
+        /* The pointer is kept only as a tally key; nothing can destroy it while
+         * this runs, because the server is single-threaded and no request is in
+         * flight. The top-3 pass below re-resolves the handle for a real
+         * reference before it touches anything. */
+        release_object( obj );
+    }
+
+    fprintf( stderr, "[wait-census] ml1060 blocked=%u (single=%u multi=%u other=%u alertable=%u) "
+             "objects: event=%u sem=%u no-cell=%u unresolved=%u | oldest=%llu.%03llus tid=%04x\n",
+             blocked, single, multi, other_op, alertable,
+             n_event, n_sem, n_nocell, n_unres,
+             oldest_ms / 1000ull, oldest_ms % 1000ull, oldest_tid );
+
+    for (k = 0; k < 3; k++)
+    {
+        int best = -1, j;
+        struct object *obj;
+        unsigned int kind = 0, manual = 0;
+        int idx;
+
+        for (j = 0; j < (int)ntab; j++)
+            if (tab[j].waiters && (best < 0 || tab[j].waiters > tab[best].waiters)) best = j;
+        if (best < 0 || !tab[best].waiters) break;
+
+        if ((obj = get_handle_obj( tab[best].proc, tab[best].handle, 0, NULL )))
+        {
+            fprintf( stderr, "[wait-census]   #%d waiters=%u handle=%08x obj=%p ",
+                     k + 1, tab[best].waiters, tab[best].handle, obj );
+            if ((idx = ios_lw_cell_of( obj, &kind, &manual )) >= 0)
+            {
+                uint64_t sg = __atomic_load_n( &madeira_sync_cells[idx].sg, __ATOMIC_SEQ_CST );
+                fprintf( stderr, "%s cell=%d gen=%u %s=%d waiters=%d srv_waiters=%d signalled=%d\n",
+                         kind == MADEIRA_CELL_KIND_SEM ? "sem" : "event", idx,
+                         MADEIRA_SG_GEN( sg ),
+                         kind == MADEIRA_CELL_KIND_SEM ? "count" : "state",
+                         MADEIRA_SG_STATE( sg ),
+                         __atomic_load_n( &madeira_sync_cells[idx].waiters, __ATOMIC_RELAXED ),
+                         __atomic_load_n( &madeira_sync_cells[idx].srv_waiters, __ATOMIC_RELAXED ),
+                         madeira_cell_signalled( kind, manual, MADEIRA_SG_STATE( sg ) ) );
+            }
+            else
+            {
+                unsigned int c;
+                fprintf( stderr, "no-cell type=" );
+                for (c = 0; c < obj->ops->type->name.len / sizeof(WCHAR); c++)
+                    fputc( (char)obj->ops->type->name.str[c], stderr );
+                fputc( '\n', stderr );
+            }
+            release_object( obj );
+        }
+        else clear_error();
+        tab[best].waiters = 0;
+    }
+    fflush( stderr );
+}
