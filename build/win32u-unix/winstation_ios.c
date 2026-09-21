@@ -997,13 +997,27 @@ HWND get_desktop_window(void)
          * Harmless in desktop mode: explorer sets its own size moments later. */
         RECT virt = get_virtual_screen_rect( 0, MDT_DEFAULT );
 
-        if (virt.right > virt.left && virt.bottom > virt.top)
+        RECT cur = {0};
+
+        /* ml1080: every thread comes through here once (top_window is per
+         * thread), and from any thread but the owner NtUserSetWindowPos is a
+         * cross-thread SEND — a worker thread then waits forever on an owner
+         * that is itself blocked waiting for that worker.  Size the window only
+         * while it is still empty, and never synchronously from a non-owner. */
+        get_window_rect( UlongToHandle( thread_info->top_window ), &cur, get_thread_dpi() );
+        /* In a desktop session the shell sizes its own window; stay out of it. */
+        const char *dm = getenv( "MADEIRA_DESKTOP" );
+
+        if (!(dm && *dm == '1') &&
+            virt.right > virt.left && virt.bottom > virt.top &&
+            (cur.right <= cur.left || cur.bottom <= cur.top))
         {
             static int sized;
+            UINT swp = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOSENDCHANGING;
 
+            if (!is_current_thread_window( UlongToHandle( thread_info->top_window ))) swp |= SWP_ASYNCWINDOWPOS;
             NtUserSetWindowPos( UlongToHandle( thread_info->top_window ), 0,
-                                virt.left, virt.top, virt.right - virt.left, virt.bottom - virt.top,
-                                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOSENDCHANGING );
+                                virt.left, virt.top, virt.right - virt.left, virt.bottom - virt.top, swp );
             if (!sized++)
                 dprintf( STDERR_FILENO, "[desktop-rect] ml1040 desktop window %p sized to the virtual "
                                         "screen %dx%d at (%d,%d) — without this a DS_CENTER dialog "

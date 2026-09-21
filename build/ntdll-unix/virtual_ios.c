@@ -13377,8 +13377,12 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
             ULONG_PTR wb = ios_wow_base();
             void *low_end = (void *)(wb + limit_2g);
 
-            if (wb && low_end > start && (char *)end > (char *)low_end &&
-                (size_t)((char *)low_end - (char *)start) >= view_size &&
+            /* Only a request whose range straddles 2 GB has anything to try: one
+             * already confined below it, or deliberately above it, is not a spill. */
+            int tried = wb && low_end > start && (char *)end > (char *)low_end &&
+                        (size_t)((char *)low_end - (char *)start) >= view_size;
+
+            if (tried &&
                 (ptr = map_reserved_area( start, low_end, host_size, top_down,
                                           unix_prot, align_mask )))
             {
@@ -13392,7 +13396,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                              lf_n, ptr, (unsigned long)size, (void *)((ULONG_PTR)ptr - wb) );
                 goto done;
             }
-            if (wb)
+            if (tried)
             {
                 static unsigned long sp_n;
 
