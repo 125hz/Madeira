@@ -66,6 +66,7 @@ extern int debug_level;
 
 // Stop flag checked by wineserver event loop (fd_ios.c)
 volatile int g_wineserver_should_stop = 0;
+int g_wineserver_session_stop = 0;
 
 static pthread_t g_wineserver_thread;
 static volatile int g_wineserver_running = 0;
@@ -151,6 +152,8 @@ int wineserver_start(const char *prefix_path) {
         madeira_seed_prefix_if_needed(prefix_path);
     }
 
+    g_wineserver_should_stop = 0;
+    __atomic_store_n(&g_wineserver_session_stop, 0, __ATOMIC_RELEASE);
     g_wineserver_running = 1;
 
     /* 2026-07-04 perf: the wineserver thread used to be created at LOWERED
@@ -183,6 +186,14 @@ int wineserver_is_running(void) {
     return g_wineserver_running;
 }
 
+int wineserver_request_session_stop(void) {
+    const char *value = getenv("MADEIRA_SESSION_STOP");
+    if (!g_wineserver_running || (value && !strcmp(value, "0"))) return 0;
+    __atomic_store_n(&g_wineserver_session_stop, 1, __ATOMIC_RELEASE);
+    wine_log_msg("[session-stop] ml1150 queued guest termination");
+    return 1;
+}
+
 void wineserver_stop(void) {
     wine_log_msg("Wineserver stop requested");
     g_wineserver_should_stop = 1;
@@ -192,6 +203,7 @@ void wineserver_stop(void) {
     if (t) {
         wine_log_msg("Joining wineserver thread...");
         pthread_join(t, NULL);
+        g_wineserver_thread = 0;
         wine_log_msg("Wineserver thread joined");
     }
     g_wineserver_running = 0;

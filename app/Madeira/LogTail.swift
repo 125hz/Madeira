@@ -12,6 +12,21 @@ final class LogTail {
     private let queue = DispatchQueue(label: "com.madeira.logtail", qos: .utility)
     private var lineBuffer = Data()
     private var lastSize: off_t = 0
+    private var displayPaused = false
+
+    func setDisplayPaused(_ paused: Bool) {
+        queue.async { [weak self] in
+            guard let self, self.displayPaused != paused else { return }
+            self.displayPaused = paused
+            if paused { self.source?.suspend() }
+            else {
+                // Hidden lines remain in the file, but need not be parsed later.
+                if self.fd >= 0 { lseek(self.fd, 0, SEEK_END) }
+                self.lineBuffer.removeAll(keepingCapacity: true)
+                self.source?.resume()
+            }
+        }
+    }
 
     init(path: String, onLine: @escaping (String) -> Void) {
         self.path = path
@@ -26,6 +41,7 @@ final class LogTail {
 
     func stop() {
         queue.async { [weak self] in
+            if self?.displayPaused == true { self?.source?.resume(); self?.displayPaused = false }
             self?.source?.cancel()
             self?.source = nil
             self?.pollTimer?.cancel()
@@ -69,6 +85,7 @@ final class LogTail {
         }
         s.resume()
         source = s
+        if displayPaused { s.suspend() }
 
         // Initial drain
         readAvailable()
@@ -85,7 +102,7 @@ final class LogTail {
     }
 
     private func readAvailable() {
-        guard fd >= 0 else { return }
+        guard fd >= 0, !displayPaused else { return }
         var buf = [UInt8](repeating: 0, count: 64 * 1024)
         while true {
             let n = buf.withUnsafeMutableBytes { ptr in

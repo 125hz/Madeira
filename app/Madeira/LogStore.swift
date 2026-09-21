@@ -24,6 +24,15 @@ final class LogStore: ObservableObject {
     private var pendingNew: [LogEntry] = []
     private var pendingUpdates: [(index: Int, count: Int, lastRaw: String, lastTimestamp: Date)] = []
     private var flushTimer: Timer?
+    private var displaySuppressed = false
+
+    func setDisplayActive(_ active: Bool) {
+        let disabled = !LibraryFlags.enabled("MADEIRA_UI_LOG_IDLE")
+        let suppress = !active && !disabled
+        stateLock.lock(); displaySuppressed = suppress; stateLock.unlock()
+        tail?.setDisplayPaused(suppress)
+        fputs("[ui-log-idle] ml1150 display parsing suspended=\(suppress ? 1 : 0); file capture unchanged\n", stderr)
+    }
 
     /// When true, UI flushes slowly (1.5s) instead of normally (200ms). Used
     /// during Wine runtime so SwiftUI list churn doesn't drag frame pacing.
@@ -119,6 +128,8 @@ final class LogStore: ObservableObject {
 
     /// Called from tail-file callback (background queue) or C callback.
     private func handleRawLine(_ raw: String) {
+        stateLock.lock(); let suppressed = displaySuppressed; stateLock.unlock()
+        if suppressed { return }
         // Filter out lines we never want in UI (excessive byte spam, etc.)
         if shouldDropLine(raw) { return }
 

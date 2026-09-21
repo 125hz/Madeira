@@ -1291,6 +1291,7 @@ final class HardwareInput: ObservableObject {
         let profiles = padProfiles
         padLock.unlock()
         let screen = OnScreenPad.shared.snapshot()
+        let uiOwnsInput = LibraryController.shared.ownsInput
 
         for i in 0..<slots.count {
             // ml671: the CAPTURED profile, not a fresh `controller.extendedGamepad`
@@ -1305,6 +1306,7 @@ final class HardwareInput: ObservableObject {
                 }
                 padAxisProbe(i, raw)
                 phys = Self.snapshot(raw)
+                if i == 0, let sample = phys { LibraryController.shared.sample(sample) }
             } else if slots[i] != nil {
                 padProfileMissing(i)
             }
@@ -1312,7 +1314,7 @@ final class HardwareInput: ObservableObject {
             // XInput user 0, and two people cannot share one on-screen layout.
             let useScreen = (i == 0 && screen.live)
             guard phys != nil || useScreen else { continue }
-            let snap = useScreen ? Self.mergePad(physical: phys, screen: screen.sample)
+            let snap = uiOwnsInput ? PadSnapshot() : useScreen ? Self.mergePad(physical: phys, screen: screen.sample)
                                  : phys!
 
             if snap != padLastPublished[i] {
@@ -1335,7 +1337,7 @@ final class HardwareInput: ObservableObject {
             // key control) follow the PHYSICAL sample only — feeding them the
             // merged one would make an on-screen A press its own bound control
             // and, through a default binding, itself.
-            if i == 0, let p = phys { padDriveBindings(p) }
+            if i == 0, let p = phys { padDriveBindings(uiOwnsInput ? PadSnapshot() : p) }
         }
 
         let now = CACurrentMediaTime()

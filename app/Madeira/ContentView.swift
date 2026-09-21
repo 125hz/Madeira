@@ -3589,7 +3589,7 @@ extension MetalBackedView: UIKeyInput {
     var hasText: Bool { false }
 
     // US-keyboard VK + shift for a character. Returns nil for chars we can't map.
-    private static func vkForChar(_ ch: Character) -> (Int32, Bool)? {
+    static func vkForChar(_ ch: Character) -> (Int32, Bool)? {
         if ch == "\n" || ch == "\r" { return (0x0D, false) }   // VK_RETURN
         if ch == "\t" { return (0x09, false) }                 // VK_TAB
         if ch == " " { return (0x20, false) }                  // VK_SPACE
@@ -5099,14 +5099,12 @@ struct ContentView: View {
             library.error = "A session is already running."; return
         }
         guard jit_check_debugged() else { library.error = "Enable JIT before playing."; return }
-        do { _ = try LibraryModel.executable(entry.relativePath); try entry.validate() }
+        do { if entry.desktop != true { _ = try LibraryModel.executable(entry.relativePath) }; try entry.validate() }
         catch { library.error = error.localizedDescription; return }
         guard entry.windowsPath.utf8.count < 1024, entry.arguments.utf8.count < 1024 else {
             library.error = "The executable path or launch arguments are too long."; return
         }
-        setenv("MADEIRA_EXE", entry.windowsPath, 1)
-        setenv("MADEIRA_ARGS", entry.arguments, 1)
-        unsetenv("MADEIRA_DESKTOP")
+        entry.configureLaunch()
         library.begin(entry)
         runWineFullSequence(profile: entry)
     }
@@ -6683,7 +6681,7 @@ final class ControlsWindow: UIWindow {
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         if FullscreenState.shared.active, LibraryModel.shared.current != nil {
             let library = LibraryModel.shared
-            if library.menu || library.menuButtonRect.contains(point) {
+            if library.menu || library.launching || library.menuButtonRect.contains(point) {
                 return super.hitTest(point, with: event)
             }
         }

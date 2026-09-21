@@ -83,7 +83,7 @@ enum ios_frame_wait
 /* 1ms buckets, 0..62ms, [63] = everything slower.  Linear rather than log2
  * because the question is "did this frame miss a 16.67 or an 8.33ms vblank",
  * and a factor-of-two bucket cannot answer that. */
-#define IOS_FRAME_HIST_N 64
+#define IOS_FRAME_HIST_N 4096 /* ml1150: don't clip every long frame to 64ms */
 
 extern int ios_frame_stats_on;                                  /* MADEIRA_FRAME_STATS */
 extern unsigned long long ios_frame_role_tid[IOS_FRAME_ROLE_MAX];

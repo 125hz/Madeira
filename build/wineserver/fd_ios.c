@@ -1276,6 +1276,12 @@ void main_loop(void)
         }
         while (active_users)
         {
+            extern int g_wineserver_session_stop;
+            if (__atomic_exchange_n(&g_wineserver_session_stop, 0, __ATOMIC_ACQ_REL))
+            {
+                ws_log("[session-stop] ml1150 terminating Wine processes on server thread");
+                shutdown_master_socket();
+            }
             /* Check stop flag */
             if (g_wineserver_should_stop)
             {

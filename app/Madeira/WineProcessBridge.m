@@ -597,7 +597,15 @@ static uint16_t madeira_pe_machine(const char *unix_path) {
 #define MADEIRA_IMAGE_FILE_MACHINE_AMD64 0x8664
 #define MADEIRA_IMAGE_FILE_MACHINE_ARM64 0xaa64
 
+static void wine_process_finished(void *arg) {
+    /* Also runs when SIGQUIT makes the main guest thread call pthread_exit. */
+    wineserver_stop();
+    g_wine_running = 0;
+    dprintf(STDERR_FILENO, "[session-stop] ml1150 main guest thread retired\n");
+}
+
 static void *wine_process_thread(void *arg) {
+    pthread_cleanup_push(wine_process_finished, NULL);
     @autoreleasepool {
         /* Perf: the guest main thread runs ON this pthread. Promote to
          * USER_INTERACTIVE so it schedules on P-cores with minimal kernel
@@ -1702,12 +1710,6 @@ static void *wine_process_thread(void *arg) {
             dprintf(STDERR_FILENO, "[WineProc] Wine exited with code %d (caught by longjmp)\n", wine_ios_exit_code);
         }
 
-        g_wine_running = 0;
-
-        // Stop wineserver to prevent CPU spin (iOS kills for excessive CPU)
-        dprintf(STDERR_FILENO, "[WineProc] stopping wineserver...\n");
-        wineserver_stop();
-
         dprintf(STDERR_FILENO, "[WineProc] Wine process thread finished cleanly\n");
 
         // Steam S0: this thread's TEB was mirrored into pthread TSD slot
@@ -1723,6 +1725,7 @@ static void *wine_process_thread(void *arg) {
             *(void **)(tsd_base + 275 * 8) = NULL;
         }
     }
+    pthread_cleanup_pop(1);
     return NULL;
 }
 

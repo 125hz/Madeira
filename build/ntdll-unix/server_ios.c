@@ -566,6 +566,7 @@ struct ios_frame_acc
     unsigned long long frames;
     unsigned long long wall_ns;
     unsigned long long cpu_ns;
+    unsigned long long wall_max_ns;
     unsigned long long wait_ns[IOS_FRAME_WAIT_MAX];
     /* encode thread */
     unsigned long long presents, skips;
@@ -619,7 +620,7 @@ static unsigned ios_frame_pct( const unsigned int *h, unsigned pct )
     for (i = 0; i < IOS_FRAME_HIST_N; i++)
     {
         seen += h[i];
-        if (seen * 100 >= total * pct) return i + 1;
+        if (seen * 1000 >= total * pct) return i + 1;
     }
     return IOS_FRAME_HIST_N;
 }
@@ -681,6 +682,9 @@ void ios_frame_game_tick(void)
             IOS_FRAME_ADD( frames, 1 );
             IOS_FRAME_ADD( wall_ns, dw );
             IOS_FRAME_ADD( cpu_ns, cpu - last_cpu );
+            unsigned long long worst = __atomic_load_n( &ios_frame_acc.wall_max_ns, __ATOMIC_RELAXED );
+            while (dw > worst && !__atomic_compare_exchange_n( &ios_frame_acc.wall_max_ns, &worst,
+                    dw, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED )) { }
             ios_frame_hist_add( ios_frame_acc.wall_hist, dw );
         }
     }
@@ -848,7 +852,7 @@ void ios_frame_stats_init(void)
 void ios_frame_report( unsigned long long win_ns )
 {
     struct ios_frame_acc a;
-    unsigned int wall_p95, draw_p95;
+    unsigned int wall_p95, draw_p95, wall_p99, wall_p999, over50 = 0, over100 = 0;
     double f, ef, gf, fps;
     unsigned i;
 
@@ -871,8 +875,12 @@ void ios_frame_report( unsigned long long win_ns )
             wh[i] = __atomic_exchange_n( &ios_frame_acc.wall_hist[i], 0, __ATOMIC_RELAXED );
             dh[i] = __atomic_exchange_n( &ios_frame_acc.draw_hist[i], 0, __ATOMIC_RELAXED );
         }
-        wall_p95 = ios_frame_pct( wh, 95 );
-        draw_p95 = ios_frame_pct( dh, 95 );
+        wall_p95 = ios_frame_pct( wh, 950 );
+        draw_p95 = ios_frame_pct( dh, 950 );
+        wall_p99 = ios_frame_pct( wh, 990 );
+        wall_p999 = ios_frame_pct( wh, 999 );
+        for (i = 50; i < IOS_FRAME_HIST_N; i++) over50 += wh[i];
+        for (i = 100; i < IOS_FRAME_HIST_N; i++) over100 += wh[i];
     }
 
     if (!a.frames)
@@ -890,6 +898,9 @@ void ios_frame_report( unsigned long long win_ns )
     ef = a.presents ? 1e-6 / (double)a.presents : 0.0;
     gf = a.gpu_bufs ? 1e-6 / (double)a.gpu_bufs : 0.0;
     fps = win_ns ? (double)a.frames * 1e9 / (double)win_ns : 0.0;
+    wine_log_write( "[frame-tail] ml1150 n=%llu p99=%ums p99.9=%ums max=%.2fms >=50ms=%u >=100ms=%u "
+                    "(1ms buckets; samples under 4s; MADEIRA_FRAME_STATS=0 disables)",
+                    a.frames, wall_p99, wall_p999, a.wall_max_ns * 1e-6, over50, over100 );
 
     {
         double waitsum = 0.0;

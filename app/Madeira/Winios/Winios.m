@@ -32,6 +32,12 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+static _Atomic unsigned long long g_surface_present_count;
+unsigned long long winios_surface_present_count(void)
+{
+    return atomic_load_explicit(&g_surface_present_count, memory_order_relaxed);
+}
+
 /* ml668: the gamepad slot's struct and button bits live in the app-facing
  * header, because Swift includes the same file. Including it here is also the
  * only thing that keeps the two sides' signatures honest — everything else in
@@ -1728,6 +1734,7 @@ void winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
         if (img) {
             NSNumber *key = @((uintptr_t)hwnd);
             l.contents = (__bridge id)img;
+            atomic_fetch_add_explicit(&g_surface_present_count, 1, memory_order_relaxed);
             NSValue *old = g_surf_sizes[key];
             CGSize now = CGSizeMake(sw, sh);
             int grew = !old || !CGSizeEqualToSize(old.CGSizeValue, now);

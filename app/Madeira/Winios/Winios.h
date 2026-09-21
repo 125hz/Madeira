@@ -25,6 +25,9 @@
 extern "C" {
 #endif
 
+// Updated when a GDI surface reaches the compositor, including desktop sessions.
+unsigned long long winios_surface_present_count(void);
+
 /* Build the driver-funcs struct and register it via __wine_set_user_driver.
  * Idempotent: safe to call repeatedly; first call wins. */
 void winios_drv_register(void);
