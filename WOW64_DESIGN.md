@@ -11504,3 +11504,1636 @@ guest-slots=… verdict=…`). Consequences:
   7. `[winios] cursor set ...` and a visible arrow while the dialog is up, in
      all three pointer modes. Its absence with a drawn dialog on screen means
      the `winios_overlay_refresh_live` -> cursor hand-off is not firing.
+
+- **2026-09-21 — the JIT was recompiling the whole program every five seconds
+  because OUR pool refused the buffer FEX asked for; four million guest frees
+  a second were taking a write lock on the JIT's own decode path for nothing;
+  the spin controller had a state it could not leave; the audio period event
+  was firing at half its advertised rate; and the forced-LAA policy was
+  rewriting the program's own PE header (the ml1100 family).**
+
+  Evidence throughout is device log 83, 109,945 lines, `MADEIRA_DIAG=1`,
+  ~32 minutes (193 `[frame]` windows), a 32-bit D3D9 open-world title at
+  25-28 fps in play and ~60 in menus.
+
+  **READ THIS FIRST, BECAUSE IT REFRAMES THE WHOLE ROUND: THE FRAME IS GPU
+  BOUND, AND `srv=` IS NOT A SYNCHRONISATION COST.** Take GPU milliseconds per
+  frame as `gpu x n / frames` from the `[frame]` line and put it next to the
+  presenting thread's server wait:
+
+      line 108282  gpu=25.20(n=254) frames=254 -> 25.2 ms/frame   srv=23.8
+      line 107770  gpu=24.44(n=265) frames=265 -> 24.4 ms/frame   srv=22.4
+      line  99860  gpu=12.18(n=468) frames=239 -> 23.8 ms/frame   srv=20.0
+      line 100653  gpu= 7.75(n=612) frames=213 -> 22.3 ms/frame   srv=19.3
+      line 101254  gpu= 3.72(n=912) frames=318 -> 10.7 ms/frame   srv=10.1
+      line 106729  gpu= 8.17(n=404) frames=405 ->  8.2 ms/frame   srv= 6.6
+
+  `srv=` tracks GPU-ms-per-frame to within 5% across a 3x range, in windows
+  that differ in command-buffer count per frame by 3.6x. The presenting thread
+  is not waiting for a lock or a hand-off; it is waiting for the GPU, through
+  DXMT's frame-latency fence, and every millisecond of GPU time is a
+  millisecond of `srv=`. `wall = cpu + gpu` almost exactly (8.5 + 25.2 = 33.7
+  against wall 40.2, the remainder being `fast=5.5`). **30 fps therefore needs
+  GPU time under ~24 ms/frame, and the 25 ms windows are the ones to attack.**
+  That is item 5's territory and it is now the top of the list, not the
+  bottom. Everything below is CPU-side work that is real, is costing the game
+  thread and the audio thread, and would not by itself have moved fps in the
+  GPU-bound windows — which is stated here so the next log is read correctly
+  instead of being read as a disappointment.
+
+  **1. THE RECOMPILE STORM IS CODE-BUFFER ROTATION, AND THE ARITHMETIC CLOSES
+  EXACTLY.** `[prof]` reports ~5,200 blocks compiled per second thirty minutes
+  into a session with a cache hit rate pinned at 85-87%, and the candidate
+  causes named for this round were invalidation from the `[iOS-xrem]` flood,
+  SMC false positives, or the block-map ring. All three are wrong, and the log
+  says so in one line (38061, 47054, 80567):
+
+      [inval-filter] ml630 section: skipped=103835 kept=28 |
+                     aligned: skipped=4090441 kept=0
+
+  **Not one guest free in four million removed a single translated block.**
+  ml630's filter already catches all of it. What is actually happening is in
+  `[jit-pool]` and `[code-buffer]`:
+
+      line   591  [pool-tail] budget=0x19668000 (406 MB) of pool 0x20000000:
+                  head_hw=0x998000 margin=0x6000000 gen_cap=0x1000000 (16 MB)
+      line 102288 [jit-pool] tail CAP: refusing 0x2000000 (cap 0x1000000,
+                  tail_resv=0xc004000 budget=0x19538000) so FEX halves down
+      line 102261 [code-buffer] recycled #256 gen=256 asked=0x2000000
+                  got=0x1000000 ... pinned=12 degraded_total=255
+
+  FEX asks for 32 MB on every rotation (`CPUBackend.cpp:874`, the ml1020
+  ladder) and is refused on every one of them, by our own cap, with the tail
+  less than half spent — `tail_resv` never exceeds `0xe004000` (224 MB) of a
+  406 MB budget. `ios_tail_gen_cap()` (`virtual_ios.c:2654`) computed
+  `pow2_floor(budget / 16) = 16 MB`, and the divisor 16 was a GENERATION COUNT.
+
+  The cost of the halving is the whole storm, and the two sides of the
+  arithmetic match to three digits. A rotation gives the new buffer a brand-new
+  empty `GuestToHostMap` (`CPUBackend.cpp:727`), so every block in the outgoing
+  buffer is discarded:
+
+      total emitted   4,911,610 blocks x 54 insts/blk x 18 host B/inst = 4.77 GB
+      total discarded ~298 rotations x 16 MB                           = 4.77 GB
+
+  298 rotations is counted directly, not extrapolated: `[jit-pool] tail REUSE`
+  appears 283 times and `tail EC_CODE` 15, and every carve is one rotation.
+  67 `[frame]` windows separate rotation #128 (line 77336) from #256 (line
+  102261), i.e. 670 seconds for 128 rotations — **one rotation every 5.2
+  seconds, all session.** Immediately after rotation #256 the `[CB_SUMMARY]`
+  prints go 4261687 -> 4271445 -> 4280238 -> 4287998 real compiles per 16,384
+  lookups, i.e. 60%, 54%, 47% of all lookups are real compiles; in a settled
+  window the same figure is 0%. Every byte the JIT emitted in this session went
+  into a buffer that was then thrown away, and the program was not reaching new
+  code — it was re-reaching the code it had just lost.
+
+  **THE FIX, AND WHY IT CONVERGES RATHER THAN RATCHETING** (`virtual_ios.c`,
+  `ios_tail_gen_cap`). A generation count is the wrong unit. What pins tail
+  space is a thread parked in a wine wait still holding its `CurrentCodeBuffer`,
+  so the BYTES pinned are (how long a thread can stay parked) x (how fast the
+  JIT emits) — and doubling the carve halves the number of carves one park time
+  spans. The byte total is invariant in the carve size; the count is not. So
+  the cap is now sized from the measured live bytes: leave the live high-water
+  alone and divide only the remainder by the number of generations that can be
+  in flight (four). With this session's numbers, 406 MB budget and a 224 MB
+  live high-water gives `(406-224)/4 = 45 MB -> 32 MB`, which is what FEX asked
+  for in the first place. **It can only RAISE the cap** — the old count-based
+  value stays as a floor — so the worst case of a mis-measurement is exactly
+  today's behaviour, and the budget check at the reservation site, the
+  freelist re-scan and the `CodeBuffer` ctor's halving ladder are all
+  unchanged and still bound total tail use. `MADEIRA_POOL_GEN_LIVEFIT=0`
+  restores the pure count-based cap; `MADEIRA_FEX_CODEBUF_MAX_MB` still forces
+  a value and is the one-variable A/B.
+
+  **AND THE OTHER HALF OF ml630'S FILTER, WHICH WAS NEVER DONE**
+  (`InvalidationTracker.cpp`, `InvalidateAlignedInterval` and
+  `InvalidateContainingSection`). ml630 stopped the invalidation; the REMOVAL
+  underneath it kept running, so all four million of those frees still took
+  `IntervalsLock` **exclusively** to ask two sorted lists to remove a range
+  neither contains. That is not a free no-op: `IntervalsLock` is the lock
+  `QueryExecutableRange` takes SHARED on the JIT's decode path, and a writer
+  arriving ~3,400 times a second parks every compiling thread behind it. The
+  removal is now skipped exactly when the range intersects neither `XIntervals`
+  nor `RWXIntervals`, decided inside the SAME shared-lock scope ml630's
+  `MayHoldCode` already needed — so nothing happens between the two decisions
+  and no window exists that ml630 did not already have.
+  `MADEIRA_FEX_SKIP_EMPTY_REMOVE=0` restores it. The `[inval-filter]` line
+  grows `ml1100 xlock: skipped=N taken=N`.
+
+  **CLOSED, WITH EVIDENCE, SO IT IS NOT RE-ASKED.** The ml1070 low-half
+  pre-attempt is NOT a double tree walk in practice: it `goto done`s on
+  success, and the log shows 5,945,856 successes (`[laa] ml1070 #N low-half
+  placement`, 12,923 sampled lines) against **8** `[laa] ml1070 SPILL` lines in
+  the whole session. The second walk happens in 1.3 parts per million of calls.
+  No change made.
+
+  **2. `[valloc]` — WHAT ONE GUEST VirtualAlloc/VirtualFree ACTUALLY COSTS,
+  which nothing in this port has ever measured.** The hot cycle is generic Wine
+  heap behaviour — blocks above ~508 KB go straight to
+  `NtAllocateVirtualMemory` — and the log counts it from three different sides
+  without ever timing it: 6,451,200 `[iOS-xrem] via=aligned` notifications,
+  5,945,856 `[laa]` low-half placements and 5,857,280 `[commit-zero]` checks,
+  ~3,400 a second, at 0xb0000 (704 KB) a time.
+
+  `allocate_virtual_memory()` and `NtFreeVirtualMemory()` now carry two clock
+  reads and a handful of relaxed adds, and report one line per ten seconds:
+
+      [valloc] ml1100 <win>ms: reserve=N/Uus(lock Uus,p95 Uus) res+commit=...
+               commit=... decommit=... release=... | top sizes (cumulative): ...
+
+  The split is reserve / reserve+commit / commit / reset / decommit / release;
+  `lock` is specifically the wait to ENTER `virtual_mutex`, measured between
+  function entry and `server_enter_uninterrupted_section` returning, because
+  "the placement search is slow" and "the global lock is contended" want
+  opposite fixes and no log could tell them apart. p95 is read off a log2
+  histogram and reported as the bucket's lower bound, so it never overstates.
+  Top sizes is a ten-slot popularity sketch, racy by design.
+  `MADEIRA_VALLOC_STATS=0` removes all of it.
+
+  **THE FAST PATH IS DELIBERATELY NOT SHIPPED THIS ROUND, and that is the
+  finding, not a shortfall.** The design asked for is a per-window cache of
+  recently released anonymous RW regions, handed back zero-filled. Two things
+  have to be true for it to be worth building, and only a `[valloc]` line can
+  say whether they are: that the cost is in the placement search and the view
+  bookkeeping rather than in the one `mmap` (which Wine's `unmap_area` already
+  reduces to a single `MAP_FIXED|PROT_NONE` call inside a reserved area, so a
+  cache saves no syscall at all on free), and that it is not simply
+  `virtual_mutex` contention (in which case a cache behind the same lock saves
+  nothing). And the Windows semantics are a hard constraint that rules out the
+  obvious implementation: a parked region that keeps its `file_view` still
+  answers `NtQueryVirtualMemory` as `MEM_RESERVE`/`MEM_COMMIT` when the program
+  has released it and Windows must say `MEM_FREE`, and an explicit-base
+  `VirtualAlloc` into that range must succeed, not collide. A correct cache
+  therefore has to keep the range OUT of the view tree while remembering the
+  host mapping — which is a free-list inside the reserved area, i.e. a faster
+  `map_reserved_area`, not a region cache. That is the shape to build once the
+  measurement says where the microseconds are. Zeroing is the one piece already
+  settled: the right primitive on this OS is `mmap(MAP_FIXED|MAP_ANON)` over
+  the range, which is one syscall, drops the physical pages, faults if touched
+  while parked, and hands back zero-fill-on-demand on reuse — never a 704 KB
+  `memset`, and never `MADV_FREE_REUSABLE`, which makes no zeroing promise.
+
+  **3. `[frame]   srv-sites:` — WHICH server wait costs the presenting thread
+  its frame.** `srv=20-24 ms` of a 40 ms frame, and nothing could say what the
+  thread was waiting FOR: `[srv-stats]` is process-wide and the presenting
+  thread is one of six. The one site that already times these waits
+  (`server_ios.c`, the `is_presenter` block in `server_wait`) now also keys
+  them by object count, timeout class, first handle and caller return address,
+  and the top three by time are printed:
+
+      [frame]   srv-sites: #1 wait1 fin obj=000004f0 n=N tmo=N NNms(mean NNus)
+                pc=0x... | #2 ... total=NNms
+
+  The handle resolves offline against `[wait-census]`, which already prints
+  handle, object pointer, type and fastsync cell for every blocked waiter, so
+  no new probe is needed to name the object. Object type is deliberately not
+  read at the call site: it would need a server round trip or a reach into the
+  fastsync cache from the wrong translation unit.
+
+  **WHAT THE EXISTING LOG ALREADY SETTLES ABOUT THIS.** From `[srv-stats]`
+  around line 108300, per ten seconds: `nt: wait1=83883 waitN=1095` with
+  `fast hit=77026 miss=10389`, and `select: w1 inf=0 fin=4697 poll=2900 |
+  wN inf=471 fin=624 ... tmo=4302`.
+  * **No infinite single-object wait reaches the server at all** (`w1 inf=0`).
+    The fastsync cell path takes 91% of single waits. The fast path is working.
+  * `WaitForMultipleObjects` is 1,095 calls in ten seconds and **cannot use the
+    fast path at any of them** — there is no wait-any over N cells. That is 4.4
+    per frame. It is worth building only if `srv-sites` puts real time on a
+    `waitN` row; at 4.4 calls a frame it cannot account for 24 ms unless each
+    one blocks for milliseconds, and the GPU correlation above says the time is
+    the GPU's. **The host-test-backed wait-any design is therefore deferred on
+    purpose**, because the rule in this tree is that a concurrency primitive
+    ships with a model that fails for a deliberately wrong ordering, and
+    building one to absorb 4.4 calls a frame that are waiting on the GPU anyway
+    would be the wrong order of work.
+  * `tmo=4302` of ~5,321 finite server waits **returned STATUS_TIMEOUT**. 81%
+    of finite server waits in this process are polls that found nothing. That
+    is the one genuinely suspicious number the existing log contains and the
+    `srv-sites` `tmo=` column is what will name its owner.
+  * `event_op: NtSetEvent+0x14c=3439` against `nt: setev=39866` — 91% of
+    `NtSetEvent` calls are absorbed by the cell path and 3,439 a window are
+    not. Not chased this round; `srv-sites` covers the WAIT side first because
+    that is where the frame time is.
+
+  **4. THE SPIN CONTROLLER HAD AN ABSORBING STATE, AND THE RAMP BACK UP WAS
+  BROKEN TOO** (`sync.c`). Every `[frame] handoff:` line in the session reads
+  `spin hit=0 miss=0 credit=0` with 36,996 parks underneath it. ml1050 only
+  scores a spin it actually RAN, and a zero budget skips the phase — so at
+  credit 0 nothing spins, nothing is scored, and credit can never rise.
+
+  **And it was wrong to be off**, which the same line's histogram proves:
+
+      us: 0=618 1=692 2=621 4=3096 8=4376 16=5476 32=5341 64=4755
+          128=4154 256=3251 512=2319 1024=2051 2048=246   (36,996 parks)
+
+  Cumulatively, 20,220 of 36,996 parks (**54.7%**) complete within 32 us and
+  67.5% within 64 us, against a 40 us ceiling and a break-even of one in three.
+  The workload sat in the payoff region for the whole session with the
+  controller switched off. The same histogram is why 40 us is the right
+  ceiling and not 10 or 200: at 8 us only 25% of parks would be caught, and
+  past 128 us the marginal park costs more spin than it saves.
+
+  Two changes. **A probe**: one park in 64 spins anyway on a 5 us budget and is
+  scored by the ordinary hit/miss path. **A re-arm**: `MADEIRA_SPIN_CREDIT_UP`
+  is +2 of 64, so a credit of 0 buys 40 x 2/64 = 1.25 us on its next attempt —
+  shorter than 96.5% of the measured handoffs, so it would miss and decay
+  straight back to 0. A probe alone would not have fixed that. A probe that
+  PAYS is evidence about the workload rather than about one wait, so it re-arms
+  to a quarter of the ceiling (10 us, above a third of all parks) and the
+  ordinary +2/-1 rule takes over. Cost at the measured rate is ~580 probes per
+  ten seconds at 5 us — under 3 ms of spin across every thread in the process,
+  against 37,000 parks. `MADEIRA_FASTSYNC_SPIN_PROBE=0` restores ml1050
+  exactly. The handoff line gains `probe=`, so `hit=0 miss=0 probe=0` now means
+  OFF BY CONFIGURATION and `probe=N miss=N` means the workload genuinely does
+  not pay off — two things that were previously the same line.
+
+  **5. GPU TIME — WHAT THE NUMBERS MEAN, AND WHAT IS NOT YET DONE.** See the
+  correlation at the top: 22-25 ms of GPU per frame in the slow windows is the
+  frame. Two facts from the same line bound the diagnosis and are recorded so
+  the next round starts from them rather than from `gpu=`'s face value:
+  `gpu=` is a MEAN over `n` retired command buffers, so `gpu x n / frames` is
+  the per-frame total and the raw `gpu=` field falls when work is SPLIT ACROSS
+  MORE BUFFERS even as the frame gets slower (line 100653: `gpu=7.75(n=612)`
+  over 213 frames is 2.9 buffers a frame and 22.3 ms, slower than line 106729's
+  `gpu=8.17(n=404)` over 405 frames at 1.0 buffers a frame and 8.2 ms). And
+  `drawable=0.02(p95 1)` with `limiter=0.00` exonerates the present path and
+  the display grid completely — the producer is never held by `nextDrawable`.
+  **The per-frame pass/encoder/blit/upload census this round was asked for is
+  NOT implemented**, because the counters live PE-side in emulated i386 DXMT
+  and reaching them needs either a new winemetal unix call (the slot number is
+  the ABI) or a shared page, and that decision belongs with the owner of
+  `research/dxmt/src/d3d9`, who is editing that tree concurrently this round.
+  What the next round should measure first, in order: render passes per frame
+  (every break is a tile store plus a tile load on a TBDR GPU, and 2.9 command
+  buffers a frame is already a strong hint that passes are being restarted),
+  whether colour and depth load/store actions are `DontCare` where D3D9
+  semantics permit, and whether anything forces a mid-frame
+  `waitUntilCompleted`.
+
+  **6. THE AUDIO PERIOD EVENT WAS FIRING AT HALF ITS ADVERTISED RATE**
+  (`audio_null_ios.c`, `ios_timer_loop`). The reported symptom is a stutter
+  every few seconds leaving the audio slightly delayed. The census rules out
+  two of the three candidate mechanisms outright:
+  * **No drift.** `frames_written` advances by ~480,000 per ten-second window
+    for the whole session (93,208,800 frames over ~1,942 s = 48,000.0/s). The
+    write pointer does not slip against the device clock at all.
+  * **No underrun.** `underruns=0` in every window of the session, so the ring
+    never ran dry and `play_pos` never froze — which is the only mechanism in
+    this driver that can permanently ADD latency.
+  * **But the period is wrong.** `event_signals=470` per window is 47/s where a
+    10 ms period wants ~100/s, `frames_written / event_signals = 1021 frames =
+    21.3 ms`, and `max_gap_ms` is pinned at 22.3-23.4 — one wakeup per Core
+    Audio callback, not one per period. The cause is `next = play + period` in
+    the follower loop: `play_pos` advances in whole callbacks (a 1024-frame
+    device buffer jumps 21.3 ms at a time), so snapping the target to `play`
+    threw away the second crossing and the loop could only ever emit one signal
+    per observation. **The client's effective WASAPI period was the device's
+    buffer duration, not the 10 ms `get_device_period` advertises.** Fixed by
+    advancing the target by one period instead of snapping to `play`, with a
+    four-period catch-up guard so a descheduled loop cannot emit a burst.
+  * **The latency itself is now measured**, because no counter here ever
+    reported it: `pad_ms=min..max` per window, plus `resyncs=N`. A stable
+    `pad_ms` floor is a stable latency; a floor that steps up and stays up is
+    precisely the reported symptom, and it can now be read instead of argued.
+  * **And a re-centre for the one case that can cause it**: an underrun freezes
+    `play_pos` while the client keeps queueing, so the audio is not dropped, it
+    is shifted, and nothing ever removes the shift. The callback after a dry
+    spell now drops the overshoot back to one period and counts a resync.
+    It fires ONLY after an underrun, because dropping a healthy client's queued
+    audio is wrong — padding is the client's own choice. With this session's
+    `underruns=0` it would never have run, which is itself the point.
+    `MADEIRA_AUDIO_RESYNC=0` disables it.
+  * **The most likely cause of the reported stutter is item 1**, and the
+    numbers line up: the emulated mixer thread (`xaudio2_7.dll` 3.2% and
+    `FAudio_AudioClientThread` 7.3% of busy CPU) loses all of its translated
+    code on every code-buffer rotation, and rotations happen **every 5.2
+    seconds**. "A stutter every few seconds" and "one rotation every 5.2
+    seconds" is a testable prediction, not a coincidence: if the rotation rate
+    halves, the stutter rate should halve with it.
+
+  **7. THE FORCED-LAA POLICY WAS REWRITING THE PROGRAM'S OWN PE HEADER, AND
+  NOW DOES NOT** (`virtual_ios.c` `virtual_map_image_view`,
+  `wine/dlls/kernel32/heap.c:464`). Log 83 line 291 is
+  `[laa] main image header at 0x7100400000 patched: characteristics now 0122`.
+  A program is entitled to assume its own image bytes are the bytes that were
+  loaded from the file; self-integrity checks that hash the in-memory image,
+  headers included, are ordinary in shipped software, and the documented
+  failure mode of a failed self-check is a DELIBERATE crash — which in a log is
+  indistinguishable from an emulator bug, and has already cost this project
+  rounds of investigation. Real Windows never alters those bytes.
+
+  **The consumer is satisfied without touching a guest byte.** The only reader
+  was `GlobalMemoryStatus`, which clamps `dwTotalVirtual`/`dwAvailVirtual` to
+  `MAXLONG` by reading `nt->FileHeader.Characteristics` out of the mapped image
+  (`kernel32/heap.c:464`). On Windows that clamp is a no-op, because a non-LAA
+  process really does top out at `0x7FFEFFFF` and `ullTotalVirtual` is already
+  2 GB; it only bites where ntdll reports a LARGER user space than the header
+  bit predicts. So the clamp now asks the ceiling instead of the header:
+  `memstatus.ullTotalVirtual` is computed straight from
+  `NtQuerySystemInformation(SystemBasicInformation)`'s `HighestUserAddress`
+  (`kernelbase/memory.c:1436`), which is ntdll's own statement of the limit and
+  already reflects `user_space_wow_limit`. No new API, no extra call — the
+  value was already in hand two lines above. The patch site now logs
+  `[laa] ml1100 header left untouched (guest-visible image bytes are never
+  modified); ceiling reported via NtQuerySystemInformation HighestUserAddress`.
+  `MADEIRA_LAA_PATCH_HEADER=1` restores the old in-memory patch for an A/B and
+  says loudly in its own log line that it modifies guest-visible image bytes.
+  `SECTION_IMAGE_INFORMATION` was never patched and still is not.
+
+  **KNOBS ADDED THIS ROUND**, all defaulting to the new behaviour:
+  `MADEIRA_POOL_GEN_LIVEFIT=0` (count-based code-buffer cap),
+  `MADEIRA_FEX_SKIP_EMPTY_REMOVE=0` (unconditional interval removal),
+  `MADEIRA_VALLOC_STATS=0` (no `[valloc]` line, no clocks),
+  `MADEIRA_FASTSYNC_SPIN_PROBE=0` (ml1050's absorbing controller),
+  `MADEIRA_AUDIO_RESYNC=0` (no post-underrun re-centre),
+  `MADEIRA_LAA_PATCH_HEADER=1` (restore the PE-header patch).
+
+  **WHAT THE NEXT DEVICE LOG SHOULD SHOW, AND BY HOW MUCH.**
+  1. `[pool-tail] #N ... gen_cap=0x2000000 (32 MB) live=... (hw ...)` — the
+     banner is periodic now (first carve then every 32nd) because the cap is a
+     function of live bytes and has to be watchable. **If `gen_cap` is still
+     `0x1000000`, the live high-water is above ~278 MB and the fix is inert**;
+     the `live=`/`hw` fields say so directly and the next move is the pool size
+     in `Documents/madeira-pool.txt`, not more policy.
+  2. `[fex-stats] rev=ml1100 ... gen=N (+M rotations)` — the number this line
+     never had. **M should halve, from ~19 per ten seconds to ~10**, and
+     `blocks/s` should halve with it, from ~5,200 to ~2,600. If `gen` halves
+     and `blocks/s` does not, the working set genuinely exceeds 32 MB and the
+     next lever is code size, not buffer size. `hit_rate` should climb off its
+     85-86% pin.
+  3. `[code-buffer] recycled #N` every 16th rotation instead of at powers of
+     two, so the second half of a session still reports its rotation rate — the
+     previous log's last data point was #256 with ~40 rotations left to run.
+  4. `[inval-filter] ... ml1100 xlock: skipped=N taken=N` with **skipped near
+     the aligned skipped count (four million) and taken near 28**. Anything
+     else means the RWX list is intersecting ranges the X list is not, which
+     would be a new fact about this port.
+  5. `[valloc] ml1100` — the line that decides round two. Read `lock` against
+     the mean: `lock` near the mean means the global `virtual_mutex` is the
+     cost and the fix is lock scope; `lock` near zero with a large mean means
+     the placement search is the cost and the reserved-area free-list is the
+     fix. `p95` far above the mean means a tail worth chasing separately.
+  6. `[frame] handoff: spin hit=... probe=... credit=...` — **`credit` must
+     leave 0**. Expect `probe` ~580 per window until the first hit, then
+     `credit` at or above 16 and `hit` in the thousands. If `probe` stays high
+     and `hit` stays 0 with the p50 still at 32 us, the spin is not reaching
+     the cell and that is a different bug.
+  7. `[frame]   srv-sites:` — the top row should be a `wait1 fin` or `waitN`
+     whose `NNms` is ~60% of the window and whose mean is close to GPU-ms per
+     frame. **If it is, the frame is confirmed GPU-bound from the CPU side too
+     and item 5 is the only remaining lever.** A top row with `tmo=n`, i.e. a
+     poll loop, would be a different and much cheaper finding.
+  8. `[audio] ... event_signals=940 ... max_gap_ms=11..12 pad_ms=A..B
+     resyncs=0` — `event_signals` should **double** from 470 and `max_gap_ms`
+     should **halve** from 22.6. `pad_ms`'s low end should be flat across
+     windows; a floor that climbs is the latency bug and `resyncs` will say
+     whether the re-centre caught it.
+  9. `[laa] ml1100 header left untouched ...` once, and **no** `[laa] main
+     image header ... patched` line anywhere. `[hi-alloc]` and the low-half
+     placement behaviour must be unchanged — this round did not touch
+     placement, only the header write.
+
+  **THE HOST TEST, so the fast path has something to be built against.**
+  `build/x86-tests/vmchurn-x86.c` + `build-vmchurn-test.sh` ->
+  `vmchurn-x86.exe` (28 672 B, `pe-i386`, imports exactly `KERNEL32.dll`),
+  installed to `app/Madeira/i386-windows/`. It is the Windows rule set for
+  large-block allocation churn written down as assertions, because every one of
+  those rules is something a released-region cache breaks if it is written from
+  the syscall names alone: zero-fill on first use AND on every recycle (32
+  rounds, not one); released memory reports `MEM_FREE` and is not readable; a
+  released range is re-reservable AT ITS OWN BASE; decommitted pages stay
+  `MEM_RESERVE`, stop being readable, and read back as zero when recommitted;
+  and the protection installed is the protection asked for. Then it times 512
+  full reserve+commit / touch-every-page / release cycles, so "did the fast path
+  help" has a baseline instead of a memory.
+
+  **IT WAS ACTUALLY EXECUTED, on the Windows host's own WoW64** — which is the
+  reference implementation of every rule it checks, and is therefore worth
+  running before the port ever sees it. Result: **status 80, all five phases**,
+  512 cycles in 99 133 us = **193 619 ns per cycle**. Two things in that run are
+  themselves data. First, `phase 1 OK (32 rounds, same base reused 31 times)`:
+  **Windows itself hands the same address back 31 times out of 32** and still
+  zero-fills it, so address recycling is not the thing this port must avoid —
+  only the bookkeeping around it is. Second, 193 us a cycle on a desktop x86 is
+  dominated by touching 176 pages, not by the allocation call, which is the
+  first reason to distrust "the mapping call is the cost" as a premise and to
+  ship `[valloc]` before the cache.
+
+  A note on how the fault is asked, because an early draft got it wrong and the
+  wrong version PASSED phase 1 before crashing: there is no CRT and clang has no
+  SEH for 32-bit x86, so the house pattern is execrw-x86.c's VEH that redirects
+  `Eip` to a stub returning a sentinel — and that is only safe when the fault is
+  the FIRST instruction of a no-argument callee, because only then does the
+  stub's `ret` find the stack it expects. A data load inside a function whose
+  prologue has already run is not that case, and it crashed on real Windows.
+  The test now asks the kernel instead (`ReadProcessMemory` on the current
+  process plus `VirtualQuery`), which never raises and answers the question the
+  way a crash handler or an allocator walking its own address space would.
+
+  **VERIFIED BY BUILDING AND READING THE ARTIFACTS.**
+  * FEX: `.xtool/build-fex.sh`, 7/7 objects, no new diagnostics.
+    `app/Madeira/aarch64-windows/xtajit.dll` **4 710 400 B**, and BY CONTENT it
+    carries `ml1100 xlock`, `MADEIRA_FEX_SKIP_EMPTY_REMOVE`, `rev=ml1100`
+    (the `[fex-stats]` line) and `rotations`.
+  * Native: `.xtool/build-wine-native.sh`. `libntdll_unix.a` **1 943 424 B**
+    (32/32 compiled, 0 failed), `libwin32u_unix.a` **3 486 632 B** (46/46),
+    `libwineserver.a` **1 269 472 B**. BY CONTENT `libntdll_unix.a` carries all
+    thirteen new markers: `[valloc] ml1100`, `MADEIRA_VALLOC_STATS`,
+    `MADEIRA_POOL_GEN_LIVEFIT`, `[pool-tail] #%lu budget`,
+    `MADEIRA_LAA_PATCH_HEADER` (x3), `header left untouched`,
+    `MADEIRA_FASTSYNC_SPIN_PROBE` (x2), `ml1100 adaptive spin`, `srv-sites:`,
+    `probe=%u credit`, `pad_ms=%u..%u`, `MADEIRA_AUDIO_RESYNC`, `resyncs=%u`.
+    Compiler stderr carries **no new** diagnostic: `virtual.err` is the one
+    pre-existing `MemoryWineIosJitPoolAddress` `-Wswitch` note, `sync.err` is
+    six pre-existing `os_sync_wait_on_address` iOS-17.4 availability warnings
+    and nothing else, `server.err` the two pre-existing `%{public}s` ones, and
+    `audio_null_ios.err` is **empty**.
+  * i386 PE: `.xtool/build-wine-i386.sh kernel32`, built 1 / failed 0, import
+    closure still complete (0 missing cross-imports across all 754 files).
+    `app/Madeira/i386-windows/kernel32.dll` **561 152 B**, relinked from a
+    `heap.o` recompiled after the edit.
+
+  **AND A STAGE BUG THAT ALMOST SHIPPED A STALE BINARY, recorded because it is
+  exactly the failure the stage script's own header warns about and does not
+  actually prevent.** `.xtool/build-wine-native.sh` rsyncs
+  `build/{ntdll-unix,win32u-unix,wineserver}` into the workspace — **and not
+  `wine/`**. But `libntdll_unix.a` is built from `wine/dlls/ntdll/unix/*.c` as
+  well, including `sync.c`, which is where item 4 lives. The first native build
+  of this round reported `Results: 32 succeeded, 0 failed`, produced a plausible
+  1 942 696 B archive, and contained **neither** of the two `sync.c` markers:
+  it had compiled a copy of `sync.c` dated 21:33 the previous evening, left in
+  the workspace by an earlier `build-wine-i386.sh` run (that stage DOES sync
+  `wine/`). A successful-looking build of the wrong source is the exact shape
+  the 2026-09-25 lesson is about, and the only thing that caught it was checking
+  the archive BY CONTENT rather than by exit status. The fix used here was a
+  manual `rsync -a --exclude=.git --exclude='build-*/' wine/ $WORK/wine/`
+  before re-running the stage — the same command `build-wine-i386.sh` runs at
+  its top, and with the same deliberate absence of `--delete`, since Wine's
+  configure leaves generated files inside the source tree. **The stage script
+  should grow that sync**; it was not edited this round only because it is
+  shared with work running concurrently in the same workspace.
+
+  **UNVERIFIED ON DEVICE — all of it.** Specifically: that a 32 MB grant is
+  actually served rather than refused by the budget check one layer down (the
+  degrade ladder is the backstop and would put us back at 16 MB, i.e. at
+  today's behaviour); that 32 MB is enough to hold this title's working set at
+  all, which is the entire premise of item 1 and which only `gen=+M` against
+  `blocks/s` can settle; that the skipped exclusive lock measurably reduces
+  decode-path stalls, which no counter in this port can currently show
+  directly; that `clock_gettime(CLOCK_MONOTONIC_RAW)` twice per guest
+  VirtualAlloc is as cheap on a FEX-created thread as it is assumed to be here
+  — `[valloc]`'s own mean is the check, and `MADEIRA_VALLOC_STATS=0` is the
+  A/B; that the spin probe converges rather than oscillating between re-arm and
+  decay; and that the audio period fix does not simply double the emulated
+  mixer's wakeup cost on a thread that is already losing its code every 5.2
+  seconds (the two changes interact, and `max_gap_ms` with `pad_ms` is how to
+  tell).
+
+- **2026-09-21 — the screen was never zero, the CACHE of it was: a work area
+  latched before the monitor list existed put every centred dialog off screen,
+  and a mode ladder with no low 16:9 rungs made a 720p title render into a 4:3
+  screen (the `[monitor]` / ml1100 family).**
+
+  **THE REPORT.** Two device logs of the same 32-bit D3D9 visual-novel engine,
+  one direct launch (85) and one desktop session (86).
+
+  * log 85 line 1685: `[win-pos] #15 hwnd=0x30034 flags=0000080d
+    vis={-127,-43,128,43}` — a 255x86 dialog MOVED (`SWP_NOSIZE`) to
+    `((0 - 255)/2, (0 - 86)/2)`;
+  * log 86 line 5613: `[win-pos] #368 hwnd=0x200c8 flags=0000080d
+    vis={512,317,767,403}` — the SAME dialog, the same move, to
+    `((1280 - 255)/2, (720 - 86)/2)`.
+
+  Same program, same code path, same SetWindowPos flags. The only thing that
+  differed is the rectangle it divided by two, and in the direct launch that
+  rectangle was `{0,0,0,0}`.
+
+  Note what this rules out. **Not `DS_CENTER`:** the logged style `94c000c4`
+  has no `0x800`, and user32's DS_CENTER places at CREATE time, not with a
+  later move — the move is the program's own centring helper. **Not the
+  desktop window's rect:** ml1090 sized it, and log 85's single
+  `[desktop-rect]` line is what a SUCCESSFUL sizing looks like, because that
+  line only prints inside the "stored rect was empty" branch, so its absence
+  on every later thread is the proof rather than the doubt. And log 86's
+  `317 = (720 - 86)/2` — not `(700 - 86)/2`, although a taskbar sits at
+  `{0,700,1280,720}` — says the reference is a work area that equals the full
+  monitor, i.e. `SPI_GETWORKAREA` on a session where nothing reserved a strip.
+
+  **ROOT CAUSE 1 — `SPI_GETWORKAREA` CACHED AN ANSWER IT NEVER COMPUTED.**
+
+  `sysparams_ios.c`, unchanged from upstream:
+
+  ```c
+  if (!spi_loaded[spi_idx]) {
+      LIST_FOR_EACH_ENTRY( monitor, &monitors, ... ) {
+          if (!is_monitor_primary( monitor )) continue;
+          monitor_get_info( monitor, &info, dpi );
+          work_area = info.rcWork;
+          break;
+      }
+      spi_loaded[spi_idx] = TRUE;      /* <- even when the loop ran zero times */
+  }
+  ```
+
+  With an empty `monitors` list the loop body never runs, `work_area` keeps its
+  `{0,0,0,0}`, and the latch is set anyway. Upstream this is unreachable —
+  explorer populates the list long before anything asks. Here it is not only
+  reachable, it is SESSION-WIDE: `work_area` and `spi_loaded` are statics in
+  the ONE win32u that serves every pseudo-process in the Mach task, so a single
+  early query in a single process poisons the value for every process and every
+  thread for the rest of the session, silently, with no line anywhere saying
+  so. Every CenterWindow helper that asks then lands at `((0 - cx)/2,
+  (0 - cy)/2)`.
+
+  **ROOT CAUSE 2 — THE MONITOR LIST COULD BE EMPTY AND STILL "UP TO DATE".**
+
+  `lock_display_devices()`:
+
+  ```c
+  serial = get_monitor_update_serial();
+  if (!force && monitor_update_serial >= serial) return TRUE;
+  ```
+
+  `get_monitor_update_serial()` returns 0 whenever `get_shared_desktop()`
+  fails, which is the normal state of a thread that has not resolved a desktop
+  — the first win32u call any process makes in a direct launch, before
+  `get_desktop_window()` has run. `monitor_update_serial` starts at 0 too, so
+  `0 >= 0` took the early return and the virtual-monitor branch below it never
+  ran. The list stayed EMPTY, and every consumer of an empty list answers
+  `{0,0,0,0}` without a word: `get_primary_monitor_rect` (SM_CXVIRTUALSCREEN,
+  and the desktop window's synthesised rect), `get_monitor_from_rect` (so
+  `MonitorFromWindow` returns NULL, `GetMonitorInfoW` FAILS, and the caller's
+  `MONITORINFO` — a fresh stack local — reads as a monitor of size zero),
+  `NtUserEnumDisplayMonitors` (FALSE, no callback), and root cause 1, which
+  then made it permanent.
+
+  Log 85 dates the window: win32u's FIRST `[display] virtual monitor 1280x720`
+  is at line 1025, and that string is printed by `ios_screen_size()` on its
+  first call — the only ways to reach it are the virtual-monitor branch,
+  `monitor_get_rect`'s loop body and `SM_CXSCREEN`. So before line 1025 no
+  monitor rectangle had ever been computed in this process tree, and anything
+  that asked before then got zero.
+
+  **ROOT CAUSE 3 — A MODE LADDER WITH NO LOW WIDESCREEN RUNGS, AND A CAP THAT
+  MOVED UNDER THE CALLER.** Log 86 line 778:
+
+  ```
+  [iOS ChangeDisplaySettings] virtual display 1280x720: req=960x540 flags=0x9
+      -> -2 (mode is not in the virtual mode list)
+  ```
+
+  `ios_standard_modes[]` started at 640x480 and was 4:3-and-up: 960x540,
+  640x360, 854x480 and 1024x576 — the entire lower half of the 16:9 ladder —
+  simply did not exist. The title then programmed 1024x768 (log 86 line 6313)
+  and rendered its 1280x720 content into it. Nothing downstream can undo that;
+  the aspect was decided inside the guest. Separately, the list was filtered
+  against twice the CURRENT mode's pixel count, so the set of modes a program
+  could choose SHRANK as soon as it chose a small one, and a program that
+  stepped down could not find its own previous mode to step back up. A
+  monitor's mode list does not depend on the mode it is in.
+
+  **THE CHANGES.**
+
+  * `build/win32u-unix/sysparams_ios.c` `lock_display_devices()` — no longer
+    takes the early return while `monitors` is empty. The list is never
+    legitimately empty on this port (the branch below always adds the virtual
+    monitor), so "empty" means "not built yet", never "no displays".
+  * `build/win32u-unix/sysparams_ios.c` `SPI_GETWORKAREA` — latches only a
+    non-empty rectangle, and prints `[monitor] ml1100 SPI_GETWORKAREA has no
+    monitor yet (monitors=N)` the first two times it refuses. Costs one list
+    walk per query until the display exists and nothing after that.
+  * `build/win32u-unix/sysparams_ios.c` `monitor_get_info()` — one always-on
+    line the first time any monitor is asked for its rectangles:
+    `[monitor] ml1100 primary rc={…} work={…} source=… attached=… monitors=N
+    dpi=D`. Every route that has ever placed a window off screen here passes
+    through this function, and `source=` / `attached=` distinguish the two ways
+    a rect can come back empty — a sourceless monitor answering from
+    `ios_screen_size()`, versus a monitor whose source is not
+    `ATTACHED_TO_DESKTOP` and the `SetRectEmpty` that follows it.
+  * `build/win32u-unix/sysparams_ios.c` `ios_publish_screen_size()` — the
+    cached work area is dropped on a programmed mode change
+    (`ios_invalidate_work_area`). A cached rectangle derived from a monitor
+    that just changed size is the same failure as a never-computed one, only
+    harder to see because the numbers look plausible. Windows recomputes it on
+    a display change too, and a shell that reserves a taskbar strip re-applies
+    `SPI_SETWORKAREA` from its own `WM_DISPLAYCHANGE` handler.
+  * `build/win32u-unix/sysparams_ios.c` `ios_standard_modes[]` /
+    `ios_mode_at_index()` — the ladder gains the 16:9 and 16:10 low rungs
+    (640x360, 640x400, 720x480, 720x576, 800x480, 848x480, 854x480, 960x540,
+    960x600, 960x720, 1024x576, 1024x600, 1024x640, 1120x832, 1152x648,
+    1176x664, 1400x1050, 1600x1024) for 37 entries, and the cap is measured
+    against the SESSION DEFAULT rather than the current mode, at four times its
+    pixel count — so a 720p session reaches the whole standard ladder up to
+    1920x1200/2560x1440 and the list never moves under a caller.
+  * `research/dxmt/src/util/wsi_monitor_headless.cpp` — the native
+    (`DXMT_MADEIRA`) mirror of that table and of its cap, kept in step, with a
+    new `getDefaultScreenSize()` reading the same `MADEIRA_SCREEN_W/H` the app
+    published. The PE builds need no change: they reach the list through
+    `EnumDisplaySettingsExW`, which IS the win32u table.
+  * `app/Madeira/Winios/Winios.m` `winios_cursor_note_gdi_windows()` — now
+    prints `[winios] cursor ml1100 gdi-windows=N host=… layer=… drv-show=…
+    pos=(x,y)` whenever the count changes. **This is the answer to "log 85
+    contains no `[winios] cursor` line at all".** That absence is not evidence
+    that no pointer appeared: the only cursor line this port ever printed comes
+    from `winios_drv_set_cursor` (`driver_ios.c:557`), which needs a
+    `WM_SETCURSOR` the program cannot send while nothing it owns is under the
+    pointer — precisely the case the ml1090 hand-off exists to cover. A path
+    whose whole purpose is to run when the other one cannot must not be the
+    silent one.
+  * `research/dxmt/src/d3d9/d3d9_debug.hpp` + `d3d9_swapchain.cpp` —
+    `d9ExtentLogEnabled()`, and the `d9 layer extent` and `d9 swap params`
+    lines moved onto it, ON by default. "The right fifth of the picture is
+    missing" has exactly one arithmetic cause in this path — a back buffer
+    presented 1:1 into a destination narrower than it is — and exactly one line
+    that can tell blit from scale. It was behind `DXMT_D9_PRESENTDBG`, so every
+    device log taken so far is silent about the one number that decides it, and
+    two rounds of reading could not rule the present path in or out. Both lines
+    are deduped: one per distinct (window, drawable, backbuffer) triple, and
+    one per swapchain create/reset.
+
+  **WHAT IS STILL OPEN ON PROBLEM B, AND WHAT DECIDES IT.** The mode refusal is
+  fixed and proven from the log. The crop is not yet attributed. The three
+  candidates and their arithmetic, all from log 86:
+
+  1. the back buffer is 1280x720 while the window client is ~1030x608
+     (`[win-pos] #431 vis={125,43,1155,651}`); a 1:1 blit loses
+     (1280-1030)/1280 = **19.5 %** of the width, which is the "right ~20 %" of
+     the screenshot;
+  2. `[display] apply … guest=1024x768 drawable=800x600` (lines 6315 and 6516,
+     both AFTER the first present): the singleton `CAMetalLayer`'s
+     `drawableSize` is still the 800x600 seed `ContentView.swift:355` writes at
+     init. In desktop mode that is expected — DXMT presents into the per-window
+     layer from `winios_metal_layer_for_hwnd` — but it does mean nothing in
+     that log says what the per-window layer's extent actually was;
+  3. the window itself (1030 wide, centred for the old 1280-wide desktop at
+     x=125) hangs 131 px off the right edge of the new 1024-wide desktop and is
+     clipped there: (1155-1024)/1030 = 12.7 %.
+
+  The two newly always-on lines separate all three in one run.
+  `d9 swap params (…): WxH …` gives the back buffer; `d9 layer extent:
+  backbuffer WxH window-client WxH pinned-drawable WxH … -> drawable WxH
+  present=blit|scale` gives the destination and the verdict. `present=blit`
+  with a back buffer wider than the drawable is cause 1, and the fix belongs in
+  the presenter. `present=scale` moves the whole question to cause 3, and the
+  fix is that a programmed mode change must re-clamp windows onto the new
+  desktop.
+
+  **PROBLEM C IS NOT IN THIS ROUND.** The progressive-text corruption was taken
+  no further than the census line that makes its shape credible — log 86 line
+  6433, `MTLD3D9Surface::LockRect 182 calls in one frame`, consistent with the
+  "many small sub-rect locks per frame" the symptom implies. No DXMT
+  texture/surface code was changed for it and `build/x86-tests/d3d9lock-x86.c`
+  was not written. Nothing in this round touches those paths, so nothing here
+  regresses it.
+
+  **KNOBS ADDED.** `MADEIRA_MONITOR_HEAL=0` — restores the pre-ml1100 win32u
+  behaviour exactly (early-return with an empty list, latch any work area,
+  never invalidate it on a mode change). `DXMT_D9_EXTENTLOG=0` — silences the
+  two D3D9 extent lines.
+
+  **TESTS.** `build/x86-tests/monitor-x86.c` with
+  `build/x86-tests/build-monitor-test.sh`, shipped to
+  `app/Madeira/i386-windows/monitor-x86.exe` (i386 PE, 35,840 bytes, imports
+  kernel32/user32 only, LARGE_ADDRESS_AWARE). It asks all five "how big is the
+  screen" routes, prints each, dumps the `EnumDisplaySettings` ladder, and
+  creates a real `DS_CENTER` dialog from a hand-built `DLGTEMPLATE` with no
+  owner and no active window — the exact shape of the failure.
+
+  | status | meaning |
+  |---|---|
+  | 71 | every check passed |
+  | 72 | `SM_CXSCREEN` / `SM_CYSCREEN` is zero |
+  | 73 | `SM_C{X,Y}VIRTUALSCREEN` is zero or smaller than primary |
+  | 74 | `MonitorFromWindow(NULL, DEFAULTTOPRIMARY)` returned NULL |
+  | 75 | `GetMonitorInfoW` failed on that handle |
+  | 76 | `rcMonitor` is empty, or disagrees with `SM_C{X,Y}SCREEN` |
+  | 77 | `rcWork` is empty, or is not inside `rcMonitor` |
+  | 78 | `SPI_GETWORKAREA` failed, is empty, or disagrees with `rcWork` |
+  | 79 | `EnumDisplayMonitors` reported no monitor, or an empty one |
+  | 80 | `GetWindowRect(GetDesktopWindow())` is empty or the wrong size |
+  | 81 | the `DS_CENTER` dialog could not be created — nothing was tested |
+  | 82 | the `DS_CENTER` dialog landed outside the primary monitor |
+
+  **Run on this PC's real Windows first, as the reference implementation:
+  status 71**, with `rcMonitor {0,0,1536,960}`, `rcWork {0,0,1536,920}`,
+  `SPI_GETWORKAREA` agreeing with `rcWork`, `GetWindowRect(GetDesktopWindow())`
+  matching the virtual screen, and a mode ladder of dozens of entries (seven
+  refresh rates per extent, 800x600 through 2560x1440). That ladder is also the
+  shape argument behind root cause 3: a real GPU answers "what can you do" with
+  a long list, and ours answered with nineteen 4:3-and-up entries.
+
+  **ARTIFACTS.** `app/Madeira/libwin32u_unix.a` 3,486,632 bytes (46/46 files
+  compiled, 0 failed; `strings` finds both new `ml1100` lines);
+  `app/Madeira/i386-windows/d3d9-emulated.dll` 2,220,032 bytes, Machine 0x14C,
+  two `layer extent` strings; `app/Madeira/libdxmt_combined.a` 86,995,424
+  bytes; `app/Madeira/i386-windows/monitor-x86.exe` 35,840 bytes, pe-i386. The
+  app compiles (`python3 .xtool/prepare.py && xtool dev build --configuration
+  debug`, 0 errors).
+
+  **UNVERIFIED ON DEVICE — all of it.** Specifically: that the poisoned value
+  the engine centres on really is `SPI_GETWORKAREA` and not a
+  `GetMonitorInfo().rcWork` taken during the same empty-list window (both are
+  fixed; the new `[monitor]` line and `monitor-x86.exe`'s status say which it
+  was); that `lock_display_devices` ever actually took the early return with an
+  empty list on device — if it never did, root cause 1 alone explains
+  everything and the `monitors=0` refusal line will never print, which is a
+  finding and not a regression; that dropping the cached work area on a mode
+  change does not fight a shell that reserves a taskbar strip; that a 37-entry
+  ladder does not make some title's resolution menu unusable; and that the
+  ml1090 cursor hand-off was firing all along — the new line will say, and
+  `NO HOST LAYER YET` would mean it runs before `g_game_layer` exists and has
+  to be retried rather than dropped.
+
+  **WHAT THE NEXT DEVICE LOG SHOULD SHOW, IN THIS ORDER.**
+  1. `[monitor] ml1100 primary rc={0,0,1280,720} work={0,0,1280,720}
+     source=none(virtual) attached=n/a monitors=1` — once, early. `monitors=0`,
+     or an empty `work=`, names the surviving defect directly.
+  2. **No `[monitor] ml1100 SPI_GETWORKAREA has no monitor yet` at all.** One
+     or two of them is the fix working: the query was early and the answer was
+     refused instead of latched. A flood means the monitor list is never being
+     built and root cause 2 is not what was believed.
+  3. A dialog in a direct launch placed INSIDE `{0,0,1280,720}`, and
+     `[srv-input] btn … hit win=` naming the dialog's hwnd rather than
+     `00010020`.
+  4. `[winios] cursor ml1100 gdi-windows=1 host=0x… layer=0x… drv-show=-1
+     pos=(640,360)` while that dialog is up. `host=0x0` is the bug; a line with
+     a host and a layer and still no arrow on screen moves the question to
+     `winios_cursor_apply_visibility` and the pointer mode.
+  5. `[iOS ChangeDisplaySettings] … req=960x540 … -> 0 (mode programmed)`
+     instead of `-2`, followed by `[display] guest surface is now 960x540`.
+  6. `d9 swap params (…)` and `d9 layer extent: … present=blit|scale` — the two
+     lines that decide problem B's remaining half. Read them together: back
+     buffer versus drawable, and which pipeline was built.
+  7. `monitor-x86.exe` run as `C:\windows\syswow64\monitor-x86.exe`:
+     `MADEIRA-EXIT: … status=71`. Any other status names the route that
+     answered zero.
+
+- **2026-09-21 — a deferred MANAGED upload had nothing left to defer TO: the
+  second and every later `D3DLOCK_NO_DIRTY_UPDATE` write to a texture level was
+  dropped on the floor, and a sub-rect upload read one row past the end of the
+  level it came from (the `[d9-lock]` / ml1110 family).**
+
+  **THE REPORT.** A 32-bit D3D9 visual-novel engine draws its message text
+  progressively. While the text animates the glyphs appear as sparse fragments
+  — slivers of shadow and outline, with the FIRST glyph often complete — and
+  when the user skips the animation the engine redraws the line and it is
+  correct. The 32-bit tick counter was fixed and the symptom stayed, so it is
+  a rendering/update problem, not a timing one.
+
+  **THE TEST CAME FIRST, AND IT IS THE INSTRUMENT, NOT A CHECKBOX.**
+  `build/x86-tests/d3d9lock-x86.c` (+ `build-d3d9lock-test.sh`, modelled on the
+  `d3d9dxt` pair) builds a KNOWN 64x64 image out of 24 small sub-rect updates
+  spread over four frames — six per frame, with a draw, a `GetRenderTargetData`
+  readback and a `Present` between frames — and compares EVERY pixel against a
+  CPU-side expected image AFTER EVERY FRAME, not only at the end. That is the
+  whole point: a path that is correct at the end but wrong in the middle is
+  precisely the reported symptom, and an end-only check passes it.
+
+  The rectangle set is chosen so that each shape breaks a different piece of
+  the offset arithmetic: odd left edges, 1-texel widths and heights, a
+  full-width single row, rects flush against the right and the bottom edge, and
+  an overlapping pair so last-write-wins ordering is observable. Every case
+  draws 1:1 with a point sampler into an offscreen A8R8G8B8 render target.
+
+  | exit | case | what it isolates |
+  | --- | --- | --- |
+  | 57 | — | every case that ran passed (the pass code; 0 is reserved) |
+  | 20/21/25 | — | `Direct3DCreate9` / `CreateDevice` / window creation failed |
+  | 59 | — | a core resource create/lock failed (setup, not a result) |
+  | 61 | `managed.argb8` | MANAGED A8R8G8B8, progressive sub-rect `LockRect`s |
+  | 62 | `dynamic.argb8` | DEFAULT+DYNAMIC, plain sub-rect locks |
+  | 63 | `dynamic.discard` | DISCARD on the seeding lock, NOOVERWRITE after |
+  | 64 | `updatesurface` | SYSTEMMEM to DEFAULT, source RECT and dest POINT at DIFFERENT corners |
+  | 65 | `updatetexture` | `AddDirtyRect` after `NO_DIRTY_UPDATE` locks |
+  | 66..71 | `managed.a8` … `managed.argb1555` | A8, L8, A8L8, A4R4G4B4, R5G6B5, A1R5G5B5 — the sub-4-byte texel strides |
+  | 72 | `managed.xrgb8` | X8R8G8B8, with the stored X byte written as 0: it must still sample opaque |
+  | 73 | `readonly.relock` | a READONLY re-lock sees the earlier contents, and does not damage them |
+  | 74 | `getdc.xrgb8` | `GetDC` + `FillRect` + `TextOutA` + `ReleaseDC` |
+  | 75 | `colorfill.rect` | `ColorFill` with a sub-rect |
+  | 76 | `stretchrect.sub` | `StretchRect` sub-rect texture to render target |
+
+  A format or flag the device refuses is SKIPped, not failed, and cannot become
+  the exit code. The process exits with the code of the FIRST failing case so
+  one number names the earliest defect, and every case still runs and prints
+  its own line with the first bad pixel, what was read, what was expected and
+  how many pixels were wrong.
+
+  **RESULT ON REAL WINDOWS (this PC, stock retail D3D9, the 32-bit exe run from
+  PowerShell): 16 cases run, 0 skipped, 0 failed — PASS, `EXITCODE=57`.** The
+  reference implementation defines correctness and it agrees with the file, so
+  anything DXMT reports is a divergence from the runtime rather than a
+  disagreement about D3D9. One thing the reference taught the test: the stock
+  runtime REJECTS `D3DLOCK_NOOVERWRITE` on an image lock (it validates it as a
+  vertex/index-buffer flag), so case 63 drops the flag after the first refusal,
+  says so in one line, and keeps running as a DISCARD-seeded accumulation test.
+  A first draft skipped the case entirely and therefore proved nothing.
+
+  **DEFECT 1 — THE ONE THAT MATCHES THE SYMPTOM. A deferred MANAGED upload was
+  never performed** (`research/dxmt/src/d3d9/d3d9_surface.cpp:623` — the
+  `defer_no_dirty` gate — against `d3d9_texture.cpp:222` and
+  `d3d9_texture.cpp:365`).
+
+  BEFORE. A `D3DLOCK_NO_DIRTY_UPDATE` write-Unlock of a MANAGED 2D texture level
+  sets `defer_no_dirty` and skips BOTH `stageTextureUpload` AND
+  `noteLevelUploaded`. The comment there says the bytes "stay in the mirror
+  until a later AddDirtyRect / EvictManagedResources / plain Unlock (consumed by
+  the pre-draw managed sweep)". They do not. The sweep is driven by
+  `MTLD3D9Texture::m_needs_upload_mask`, and the ONLY things that ever SET that
+  mask are the constructor (`:222`, every level, once) and
+  `evictManagedMirror()`; `noteLevelUploaded` CLEARS it (`:365`) on every eager
+  upload. So the data flow was:
+
+      create                          needs_upload = {0}   (fresh MANAGED texture)
+      lock NO_DIRTY, write, unlock -> no upload, mask still {0}
+      bind + draw                 -> sweepManagedUpload pushes level 0, clears the bit
+      lock NO_DIRTY, write, unlock -> no upload, mask EMPTY
+      bind + draw                 -> sweep no-ops; the GPU still holds the FIRST write
+
+  The first write to any given texture arrives; every later write to the same
+  texture is dropped permanently, the mirror holding bytes the GPU will never
+  see. "The first glyph is complete and the rest are fragments" is that
+  sentence rendered.
+
+  AFTER. The deferred Unlock calls the new
+  `D9LazyMirrorHost::noteLevelDeferredWrite` (`d3d9_surface.hpp:48`,
+  `d3d9_texture.cpp:373`), which re-arms the level's bit AND bumps the sweep
+  epoch via `markManagedUploadPending()`. The epoch bump is not redundant: the
+  existing bump lives in `SetTexture`, which early-outs on a same-slot rebind,
+  and a title that rewrites an already-bound texture never re-enters it. The
+  next `QueueBatchedDraw` then runs `sweepBoundManagedUploads` and pushes the
+  level at full extent from the mirror INTO THE OP STREAM AHEAD OF THE DRAW,
+  which is the ordering the DXVK `UploadManagedTextures` shape gives. Repeated
+  deferred writes before a draw collapse into one push.
+
+  BOTH REFERENCES REACH THE GPU HERE, which is why this is a defect and not a
+  reading of the spec. Wine's `dlls/d3d9/texture.c` suppresses only
+  `wined3d_texture_add_dirty_region` for `D3DLOCK_NO_DIRTY_UPDATE` — that is the
+  D3D9-level dirty RECT that `UpdateTexture` consumes — while the sysmem-to-GPU
+  reload of a MANAGED texture is driven by wined3d's location invalidation on
+  the write map, which the flag does not touch. DXVK's `UnlockImage` calls
+  `SetNeedsUpload` for a MANAGED resource regardless of the flag, and gates only
+  `AddDirtyBox` on it. `DXMT_D9_NODIRTY_SWEEP=0` restores the old drop.
+
+  **DEFECT 2 — a sub-rect upload read past the end of the level it came from**
+  (`d3d9_device.cpp` `stageTextureUpload`, the staging memcpy).
+
+  BEFORE. The staging copy took `total_bytes = src_pitch * rows` from `src`,
+  where `src_pitch` is the WHOLE LEVEL's stride and `src` is the rect's own
+  corner inside the mirror. For a rect at `(x0, y0)` of `w x h` in a level of
+  `H` rows the read ends at `y0*pitch + x0*bpp + h*pitch`, which exceeds the
+  level's `H*pitch` exactly when `y0 + h == H` and `x0 > 0` — a rect flush
+  against the BOTTOM edge with a non-zero LEFT edge, which is what the bottom
+  row of a glyph cell at a non-zero x is. The over-read is `x0*bpp` bytes. On
+  the last level of a texture that is past the mirror allocation entirely, and
+  a small glyph texture's mirror is page-sized with nothing after it (a 64x64 A8
+  mirror is 4096 bytes, one page). The four callers are
+  `MTLD3D9Surface::UnlockRect`, `MTLD3D9Texture::stageMirrorLevel`,
+  `UpdateSurface` and `UpdateTexture`, all of which can be handed such a rect.
+  It never produced wrong pixels — the blit reads `width` texels per row and
+  ignores the tail — which is why it survived: it is a fault risk, not an image
+  bug.
+
+  AFTER. `stageTextureUpload` takes an optional `src_row_bytes` (0 = "the rows
+  are full-pitch", correct for every whole-level upload) and copies
+  `(rows-1)*src_pitch + min(src_row_bytes, src_pitch)`. The staged block keeps
+  its full-pitch STRIDE, so the blit descriptor is byte-for-byte what it was;
+  only the tail of the final row is now left unwritten instead of being read
+  from memory that does not belong to the source. The four sub-rect callers pass
+  `D3DFormatRowPitch(format, region_width)`. The 3Dc arm zeroes the parameter
+  because it rewrites `src_pitch` into the block stream the caller was not
+  describing, and those uploads are whole-level anyway.
+
+  **WHAT THE CENSUS IN LOG 86 ALREADY PROVED, AND WHAT IT DID NOT.** Summary 3
+  (present=1000, frames=900) is the steady state during the animation:
+  `MTLD3D9Surface::UnlockRect` 2279, `MTLD3D9Texture::QueryInterface` 2280,
+  `MTLD3D9Texture::GetType` 2280, `MTLD3D9Texture::AddRef` / `Release` 2283.
+  `MTLD3D9Surface::UnlockRect` ends with TWO container callbacks for a level-0
+  surface — `flagContainerDirtyRegion` (gated on `record_dirty`) and
+  `flagContainerAutoGenDirty` (gated only on `m_mip_level == 0`) — and each one
+  is exactly one `QueryInterface` + one `GetType` + one `Release`. Two per
+  unlock would be ~4558. The log says 2280, i.e. **1.00 per unlock**: only the
+  autogen callback ran, so `m_mip_level == 0` and `record_dirty` was FALSE on
+  EVERY unlock the title performed. `record_dirty` is
+  `m_mip_level == 0 && !m_locked_readonly && !m_locked_no_dirty_update`, so the
+  title locks with `D3DLOCK_READONLY` or with `D3DLOCK_NO_DIRTY_UPDATE` and
+  never with plain flags. The census cannot say WHICH, and the two mean
+  different bugs: `NO_DIRTY_UPDATE` is defect 1 above, while `READONLY` would
+  mean the title writes under a flag that promises not to, which both references
+  also refuse to upload and which would therefore be broken on Windows too. The
+  `[d9-lock] ml1110` line added below answers it in one line. (The boot-time
+  census, summary 1, is a different workload: 178 `CreateTexture` + 178
+  `LockRect` in the first frame is an atlas build, not the typewriter. Steady
+  state is only ~2.5 locks per frame against ~132 `DrawPrimitiveUP` and ~139
+  `SetTexture` — one texture per glyph, drawn as its own quad, so a dropped
+  upload shows up as ONE wrong glyph rather than a wrong line.)
+
+  **THE NEW LINE IS THE ANSWER, NOT A TRACE.** `[d9-lock] ml1110`
+  (`d3d9_surface.cpp`, anonymous namespace, called from `UnlockRect`) emits one
+  banner stating the upload policy in force, then one line per DISTINCT
+  (pool, usage, format, extent, full-vs-sub-rect, flags) combination, capped at
+  24 lines for a whole session, on by default so an ordinary device log carries
+  it. `DXMT_D9_LOCKLOG=0` silences it. It prints the policy the unlock actually
+  took: `upload locked rect on unlock` / `no upload (READONLY)` /
+  `defer to pre-draw managed sweep` / `cpu master, no upload
+  (UpdateTexture/UpdateSurface consumes)`.
+
+  **WHAT WAS READ AND FOUND CORRECT,** so it is not re-read next round:
+  `image_lock_block_offset` (the one offset routine both ends of a lock share —
+  `col_bytes` derives from the tight row pitch over the block-column count, so
+  it equals bpp for every uncompressed format); `UpdateSurface`'s source-RECT
+  and destination-POINT arithmetic, including its DYNAMIC-destination mirror
+  lockstep; `UpdateTexture`'s per-level dirty-rect scaling, its strict and loose
+  arms, and `unionDirtyRect` (it keeps the UNION, not the last rect — a superset
+  is safe); `ColorFill`'s rect validation and its BC block-grid arm; the eager
+  partial-upload path in `UnlockRect` itself. Also noted, not changed: a
+  MANAGED texture's mirror is DROPPED by `noteLevelUploaded` as soon as every
+  level has been uploaded once, so each of the next few locks pays a full
+  `FlushDrawBatch` + `flushOpenWork` + GPU wait inside `readbackSurfaceMirror`
+  to re-materialise it. `kMirrorReadEvictThreshold` (4) stops the thrash after
+  five round trips per texture, so it is a startup cost rather than a per-frame
+  one, but with ~178 textures it is on the order of 890 full pipeline stalls at
+  boot.
+
+  **ARTIFACTS.** `build/x86-tests/d3d9lock-x86.c` (~900 lines) and
+  `build-d3d9lock-test.sh`; `d3d9lock-x86.exe` **103424 B**, file format
+  `pe-i386`, `LARGE_ADDRESS_AWARE` set, imports exactly
+  `kernel32/user32/gdi32/d3d9` (gdi32 is new for this directory and is only the
+  GetDC case: `CreateSolidBrush`, `TextOutA`, `SetBkColor`), installed to
+  `app/Madeira/i386-windows/d3d9lock-x86.exe` — it runs on device as
+  `C:\windows\syswow64\d3d9lock-x86.exe` and deliberately has NO launch button.
+  i386 DXMT PE stage: **77/77 targets**, and the only compiler warning in the
+  whole log is the pre-existing unused `kName` in `d3d11_context_impl.cpp:613`.
+  Installed: `d3d9-emulated.dll` **2224128 B** (was 2220032), machine `0x14C`,
+  carrying the `[d9-lock] ml1110` banner and both knob names by `strings`.
+  `d3d11.dll` 3194880, `dxgi.dll` 1097728, `d3d10core.dll` 872448,
+  `d3d9.dll` (the shim) 114688 and `winemetal.dll` 53248 are unchanged in size,
+  as they must be: nothing outside `src/d3d9/` was touched.
+  **The native half was NOT rebuilt and could not be:** `build/dxmt-ios/build.sh`
+  does compile the same `src/d3d9/*.cpp` into `libdxmt_combined.a`, but
+  `.xtool/build-dxmt.sh` drives `xcrun -sdk iphoneos`, there is no `xcrun` on
+  this host, and this checkout has no `app/Madeira/libdxmt_combined.a` at all.
+  The archive therefore still carries the pre-ml1110 D3D9 frontend and must be
+  rebuilt on the Mac before the NATIVE (aarch64) D3D9 path shows either fix.
+  The 32-bit title under study loads the i386 PE `d3d9-emulated.dll`, which is
+  built and installed.
+
+  **KNOBS.** `DXMT_D9_NODIRTY_SWEEP=0` reverts defect 1 (deferred writes are
+  dropped again). `DXMT_D9_LOCKLOG=0` silences the `[d9-lock] ml1110` lines.
+  Defect 2 has no switch: it removes an out-of-bounds read and changes no
+  descriptor, so there is nothing to A/B.
+
+  **UNVERIFIED ON DEVICE — all of it.** Specifically: that the title's flag is
+  `NO_DIRTY_UPDATE` rather than `READONLY` (the census proves only that it is
+  one of them, and if it is READONLY then defect 1 is real but is NOT this
+  title's bug and the search must move to why a title writes under a read-only
+  promise); that `sweepBoundManagedUploads` actually sees these textures BOUND
+  at the moment of the draw (it sweeps `m_textures[0..7]`, and the epoch bump
+  covers a texture rewritten while already bound, but a binding restored
+  through a state block by another route is not something the reading settled);
+  that the full-extent sweep push is affordable at the title's lock rate; that
+  `d3d9lock-x86.exe` passes on device at all — it has only ever run on real
+  Windows; and that defect 2's over-read was ever actually faulting rather than
+  landing in page slack, which nothing in the logs so far would show.
+
+  **WHAT THE NEXT DEVICE LOG SHOULD SHOW, IN THIS ORDER.**
+  1. `[d9-lock] ml1110 upload policy: …` once, then a handful of
+     `[d9-lock] ml1110 pool=… fmt=… WxH locked=WxH (sub-rect) …` lines. **The
+     flags field on the glyph textures is the answer to the census question.**
+     `NO_DIRTY_UPDATE … -> defer to pre-draw managed sweep` confirms defect 1 is
+     this title's bug; `READONLY … -> no upload (READONLY)` says it is not, and
+     redirects the whole investigation.
+  2. `d3d9lock-x86.exe` run as `C:\windows\syswow64\d3d9lock-x86.exe`:
+     `MADEIRA-EXIT: … status=57`. Any other status is the first failing case's
+     code from the table above, and that case's own `MADEIRA-D9LOCK: … FAIL
+     (frame N, first bad pixel x,y got=… expected=…, count=…)` line says which
+     frame it went wrong on. A case that is right on the LAST frame and wrong on
+     an earlier one is an ordering problem between the upload and the draw; a
+     bad count equal to the area of all-but-the-last update is a
+     level-replacing staging buffer or a last-rect-wins coalesce; a bad region
+     displaced by a constant offset is a source-offset or destination-origin
+     error.
+  3. The message text itself: every glyph complete while it animates, not only
+     after a skip. If the `[d9-lock]` line says `NO_DIRTY_UPDATE` and the text
+     is STILL fragmented, the remaining suspects are the ones this round could
+     not reach by reading — the encoder ordering between the sweep's upload op
+     and the draw, and `readbackSurfaceMirror` silently failing (it has four
+     early returns and `materializeLevelForLock` clears the stale bit
+     regardless, so a failed re-materialise leaves the mirror holding pooled
+     garbage that the next composite writes on top of).
+  4. `MADEIRA-D3D9DXT: … status=57` from the existing `d3d9dxt-x86.exe`,
+     unchanged. The two tests share `stageTextureUpload`; a DXT regression there
+     would be defect 2's staging change and nothing else.
+
+- **2026-09-21 — ml1060 DELIVERED ITS HEARTBEAT AND THE LOADING SCREEN DID NOT
+  MOVE: the sync protocol is exonerated by its own numbers, and the one
+  asymmetry that was left is an expiring TIMEOUT that never looks at the
+  objects. A `[late-wake]` census that can see a hand-off delivered by a timer
+  rather than by a wake (the ml1110 family).**
+
+  (`wine/dlls/ntdll/unix/sync.c`, `wine/server/thread.c`,
+  `build/ntdll-unix/shims/ios_fastsync.h`,
+  `build/ntdll-unix/shims/ios_late_wake.h` (new),
+  `build/ntdll-unix/server_ios.c`, `build/host-tests/fastsync-semrace.c`,
+  `.xtool/build-wine-64.sh`.)
+
+  Evidence: device log 84 (14k lines, `MADEIRA_DIAG=1`, the ml1060 build), the
+  same hang in 67 (ml1010) and 76, and log 48 — the one run that ever reached
+  gameplay, on ml990, i.e. BEFORE the semaphore fast path existed. A 64-bit
+  x86-64 title on a widely used managed-runtime engine, animating a loading
+  screen at a steady 60 fps and never finishing the level.
+
+  **1. ml1060 WORKED, AND IT CHANGED NOTHING. THE TWO LOGS ARE THE SAME LOG.**
+  Put the last steady-state window of 67 (ml1010) beside 84 (ml1060), per 10 s:
+
+      67:  wait1=77546  w1 inf=56429 fin=3818  poll=17302  tmo=28006 tmo_fin=10562
+           relsem=17401 resetev=18183 delay=7827  sem_rel=16802 sem_wait=0(4)
+           watchdog=3(8)  desync=0
+      84:  wait1=77781  w1 inf=0     fin=60861 poll=16921  tmo=28229 tmo_fin=11127
+           relsem=17924 resetev=17803 delay=7807  sem_rel=17325 sem_wait=0
+           watchdog=3(10) desync=0  lost-wake lines: NONE
+
+  Every number is within 3% of its twin, and the only structural difference is
+  the one ml1060 asked for: `w1 inf` collapsed from 56429 to **zero** and `fin`
+  rose by almost exactly that amount, which is the alertable heartbeat engaging
+  for every one of those waits. So the gate ml1060 opened IS open.
+
+  **And the number that decides the round is `tmo_fin`: 10562 -> 11127.** If
+  the hand-offs in this title were being lost, ~56000 waits per 10 s that now
+  carry a 2 s timeout would have expired and `tmo_fin` would have risen by
+  tens of thousands. It rose by 565, and `watchdog=` — which counts one call
+  per heartbeat expiry — stayed at 1.5 per 10 s across ~36 parked threads on
+  the 2/8/32/60 s ladder, i.e. at the arithmetic floor. **Essentially no wait
+  in this title lasts two seconds.** `[lost-wake]` printed nothing in the whole
+  run and `desync=0` now means something, because the detector it comes from
+  can finally run for these threads. The wait/wake protocol is delivering.
+
+  **2. AND THE LOADER IS STILL DOING TWO FILE READS A SECOND.** `[fs-stats]`
+  per 10 s in the same window: `open=7 read=21`, `read: 388KB streamed=21
+  srv=0`, each read ~0.3 ms. Against `[prof] busy=0.84 cores wait=98.7%` and
+  `[frame] fps=60.0 wall=16.7 | game: cpu=0.8 wait=15.9 (srv=16.0)` — a
+  vsync-bound present, not a synchronisation cost.
+
+  The divergence from the good run is sharp and it is NOT in the sync mix.
+  The first asset burst is identical in both — log 48 `read=3228`, log 84
+  `read=3233` in the equivalent 10 s window — and then:
+
+      log 48 (ml990, in-game):   3228 -> 419 -> 2080 -> 160 -> 126 -> 111 reads/10s
+      log 84 (ml1060, hung):     3233 ->  39 ->   42 ->  30 ->  60 -> ... -> 21
+
+  and the process stops creating threads at exactly the same point: both logs
+  reach `iat-life sweep#192` and thread 00f4 with byte-identical module
+  sequences; in log 48 thread 00f4 goes on to create 00f8, 00fc and 0100, in
+  log 84 it runs `[thr-term] deinit` and dies and nothing is created after it.
+  The steady state that follows is not stalled — 1790 semaphore releases and
+  1780 ResetEvents a second, ~5600 hand-offs a second — it is **an idle job
+  system turning over while the loading work never gets scheduled.**
+
+  **3. WHAT THE ASYNC-I/O QUESTION ACTUALLY ANSWERS TO, WITH EVIDENCE.**
+  Asked whether overlapped `ReadFile` + event, IOCP `NtRemoveIoCompletion`, or
+  `ReadFileEx` APC completion could be swallowed by the ml1060 watchdog's
+  rewritten timeout or by ml1050's adaptive spin. **None of the three is on
+  this path at all**, and three independent counters say so:
+
+  * `[fs-stats] read: positioned=0 streamed=N srv=0` in EVERY window of the
+    run. `srv=0` is "no read went through a server-side async"; the loader's
+    reads are synchronous `read()` calls on the unix fd and return before
+    `NtReadFile` does.
+  * `[srv-stats] kinds:` in the steady state is `select`, `release_semaphore`,
+    `event_op`, `get_window_rectangles`, `set_queue_mask`, `close_handle`,
+    `create_file`, `get_handle_fd`, `open_key` — and nothing else. There is no
+    `register_async`, no `remove_completion`, no `create_completion`. The only
+    async traffic in the whole log is one window with `set_async_direct_result=824
+    recv_socket=819 get_async_result=11`, which is the TLS socket during
+    start-up and is identical in log 48.
+  * The ml1050 adaptive spin and the poll peek cannot be involved either:
+    `sem_wait=0` and `pollpeek=0(1)` against `poll=16921` say that no wait in
+    this title takes the client fast path, because every one of them is
+    alertable and ml1060 deliberately kept the gate there. A mechanism that
+    never runs cannot return late.
+
+  So the async-completion hypothesis is closed by measurement, not by
+  argument, and the remaining candidates are named in item 7.
+
+  **4. THE DEKKER RE-AUDIT, AND THE ONE ASYMMETRY IT FOUND.** Re-read against
+  the object code for the ALERTABLE server-side waiter and for the two
+  re-queue paths the brief named:
+
+  (a) *Is `srv_waiters` symmetric across an APC or a timeout?* Yes.
+      `semaphore_sync_add_queue()` increments before `add_queue()`
+      (`semaphore.c:238`), `semaphore_sync_remove_queue()` decrements after
+      `remove_queue()` (`:249`), and `end_wait()` runs `object_sync_remove_queue`
+      for **every** entry on every exit status (`thread.c:1297`). A `select`
+      continuation after `STATUS_USER_APC` or `STATUS_TIMEOUT` therefore goes
+      through remove/add as a pair, and the window in which `srv_waiters` is 0
+      while the thread still intends to wait is covered by `select_on()`
+      calling `check_wait()` immediately after `wait_on()` (`thread.c:1579`),
+      which re-evaluates the cell before the thread can sleep again.
+  (b) *Does a waiter that timed out consume a token or leave it?* It leaves it.
+      `end_wait( thread, STATUS_TIMEOUT )` only satisfies when
+      `status < wait->count`, and `STATUS_TIMEOUT` (0x102) never is, so
+      `satisfied()` does not run, `sem->claimed` is untouched and the token
+      stays in the cell for the next waiter. **No token is lost on any timeout
+      path** — which is exactly why no accounting counter in this port has ever
+      seen this, and why item 5 is about liveness rather than conservation.
+  (c) **AND THE ASYMMETRY: `thread_timeout()` NEVER LOOKS AT THE OBJECTS.**
+      Upstream's handler (`thread.c`) ends the wait with `STATUS_TIMEOUT`
+      unconditionally and only then calls `wake_thread()` for the OUTER wait.
+      Upstream may do that, because there every state change is a server
+      request: a release that happened before the timer fired has already run
+      `wake_up()` and this thread is no longer waiting, so "the timer fired"
+      really does imply "nothing signalled it".
+
+      With a cell it does not imply it. The interleaving is ordinary: a client
+      CASes the count up (`sync.c:1084`), reads `srv_waiters`, sees this thread
+      queued and sends the `release_semaphore( count = 0 )` whose entire job is
+      to make the server re-run its own queue — and that request is sitting in
+      the socket when `get_next_timeout()` picks this timer off the list. The
+      old body then told a thread `STATUS_TIMEOUT` while the token it was owed
+      was already in the cell, dequeued it (`srv_waiters--`), and the request
+      that arrived a moment later walked an empty queue. Nothing is lost; the
+      hand-off is simply delivered by a timer instead of by a wake, which for
+      an alertable wait on this port means the whole heartbeat interval.
+
+      **FIX** (`thread.c:1552`): `if (madeira_timeout_recheck() &&
+      wake_thread( thread ) != 0) return;` before the old body.
+      `wake_thread()` runs `check_wait()`, which tests the objects FIRST, then
+      a queued user APC, then `wait->when <= current_time` — and `current_time`
+      was refreshed by `get_next_timeout()` immediately before this handler
+      ran, so when nothing is signalled it returns `STATUS_TIMEOUT` and the
+      thread gets the identical status by the identical path. The only
+      behaviour that changes is that a token which is provably there is
+      preferred to a timer, which is the order every other entry into
+      `check_wait()` already uses. `wait->user` is NULL from the line above on
+      both paths, so `end_wait()` does not try to remove a timeout that has
+      already fired. `MADEIRA_TIMEOUT_RECHECK=0` restores upstream exactly.
+
+      Verified in the object code: `_thread_timeout` now contains
+      `bl _getenv`, two `bl _strcmp` and `bl _wake_thread` at +0xf4, all
+      strictly BEFORE `bl _end_wait` at +0x134 and `bl _send_thread_wakeup`
+      at +0x148, and the knob branches past the `bl _wake_thread`.
+
+  **5. THE HOST MODEL NOW COVERS THE EXPIRY HANDLER, AND THE CONTROL FAILS.**
+  `build/host-tests/fastsync-semrace.c` gains `check_timeout_requeue()`: six
+  waiters on the modelled SERVER path with a 4 ms finite timeout (the shape an
+  alertable wait has on this port), one client-fast-path releaser, and the
+  window between its CAS and its `release_semaphore( 0 )` widened by a random
+  1–6000 us so a due timer fires inside it. `late` is sampled INSIDE the
+  handler, under the server lock, at the instant it decides — not afterwards
+  from the client's re-select, which would also catch tokens that legitimately
+  arrived later and made a first draft of this check flap (it reported LATE=3
+  on a correct run).
+
+      shipping (check_wait() first)
+        pass 1  produced=920 consumed=920 delivered=920 by_recheck=512  LATE=0
+        pass 2  produced=920 consumed=920 delivered=920 by_recheck=528  LATE=0
+        pass 3  produced=920 consumed=919 delivered=919 by_recheck=536  LATE=0
+      upstream (end the wait, report TIMEOUT)
+                produced=920 consumed=920 delivered=920 by_recheck=0    LATE=575
+
+  Read `by_recheck`: **56-58% of all hand-offs in this model are collected by
+  the expiry handler's object check**, i.e. in the upstream ordering 62%
+  (575/920) of them were delivered by a timer and cost a full extra client
+  round trip each. Conservation (`produced == consumed + left_in_cell`) and the
+  no-work-behind-a-token ledger hold in BOTH orderings, which is the same
+  lesson ml1060 recorded: this class of defect loses nothing and only an
+  assertion about WHO delivered the hand-off can see it.
+
+  Under `-fsanitize=thread`: every check passes, exit 0, **no race report**
+  (recheck LATE=0 x3 with by_recheck=572/574/575, control LATE=518). The
+  ml1060 server-stress check still passes unchanged (3 x STALLS=0, wrong-order
+  control STALLS=4-10 worst 101 ms) and the ml990 event model still passes
+  against the changed header (`ml982 SPLIT` stole 679875, `ml990 PACKED` stole
+  0, exit 0).
+
+  **6. `[late-wake]` — THE CENSUS THAT CAN SEE THIS CLASS.**
+  (`build/ntdll-unix/shims/ios_late_wake.h`, `sync.c:762-810` and
+  `:1790-1920`, `server_ios.c:1471` and `:1640`.) The ml1060 detector needs a
+  wait older than five seconds; nothing in this failure waits that long. The
+  new census asks a different question at a place that costs nothing: a wait
+  has ALREADY returned `STATUS_TIMEOUT`, so it has already paid a server round
+  trip, and one more cell load is free.
+
+  * `madeira_late_note()` (`sync.c:1826`) runs on every finite single-object
+    wait that returned `STATUS_TIMEOUT` (`sync.c:4262`, `:4322`) and on every
+    heartbeat expiry inside `madeira_fast_watched_wait()` (`sync.c:1964`,
+    before the watchdog's zero-timeout re-ask can change the cell). It reads
+    the cell through the same `madeira_cell_signalled()` inline the client
+    watchdog, the server detector and the host models share, so the four
+    cannot drift.
+  * **Age.** `struct madeira_sync_cell` grows `rel_us` in the byte that was
+    `pad[1]`, so the cell is still 32 bytes and still two per cache line
+    (`check_layout` asserts it). It is stamped by the two CLIENT fast paths
+    that can raise a cell without the server knowing — `madeira_fast_sem_release`
+    (`sync.c:1231`) and `madeira_fast_event_op` on a SET (`sync.c:1309`) — and
+    by nothing else. Server-side releases are deliberately not stamped: a
+    release on the server thread walks its own queue in the same call and
+    cannot be late, and a stamp from it would dilute the measurement. A
+    signalled cell with no stamp is counted apart as `no-stamp=` rather than
+    bucketed at age 0, which would make the distribution say the opposite of
+    the truth. **A handful of microseconds is an honest race; hundreds of
+    microseconds is a wake that was owed and never delivered, and the p50 of
+    this distribution is the whole difference between the two readings.**
+  * `rescued=` is the second half the brief asked for — "releases whose wake
+    was delivered only by a later timeout" — counted at the one place in the
+    image that can see both halves: the heartbeat expired AND the watchdog's
+    zero-timeout re-ask then returned `STATUS_WAIT_0` on the spot
+    (`sync.c:1972`). It was previously invisible, folded into `watchdog=`,
+    which counts the check whether or not it found anything.
+  * Output. Always on, one line on `[perf]`:
+    `late=N rescued=N` (running totals, because the quiet build has no other
+    reader and a delta that has to be differenced by hand across a log is not
+    a number anybody reads). Under `MADEIRA_DIAG=1`, per 10 s:
+
+        [late-wake] ml1110 <win>ms: tmo_fin=N late=N (sem=N event=N no-stamp=N)
+                    age p50=Nus p90=Nus | heartbeat: expiries=N late=N rescued=N
+        [late-wake]   age us: 0=N 1=N 2=N ... 16384=N
+        [late-wake]   #1 cell=N obj=sem late=N
+
+    The hot list is a four-slot sketch keyed by cell index, racy by design, and
+    `cell=` resolves against `[wait-census]`, which already prints handle,
+    object pointer, type and cell for every blocked waiter.
+  * Percentiles are read off the log2 histogram and reported as the bucket's
+    LOWER bound, so they never overstate — the same rule `[sleep0]` uses.
+  * `MADEIRA_LATEWAKE=0` removes the stamp and the census entirely.
+
+  **7. WHAT THIS ROUND DOES NOT CLAIM, AND THE EXPERIMENT THAT SETTLES IT.**
+  No root cause is asserted. What the evidence now rules OUT is worth as much
+  as what it would have ruled in: the hand-off protocol is delivering
+  (item 1), no token is lost on any timeout path (item 4b), and asynchronous
+  I/O completion is not on this path at all (item 3).
+
+  **THE CHEAPEST DECISIVE EXPERIMENT IS ONE ENVIRONMENT VARIABLE, AND IT IS A
+  TRUE A/B AGAINST THE ONE RUN THAT WORKED.** Log 48 ran ml990. ml990 had no
+  semaphore cell: `[fastsync] rev=ml990 ... peek=on` with no `sem=` at all, and
+  `relsem=76091` per 10 s ALL going to the server as `release_semaphore`
+  requests. Every hung log since (67, 76, 84) has `sem=on`, and in log 84
+  `sem_rel=17325` releases write the cell while `sem_wait=0` waits read it —
+  so **every hand-off in the hung runs is the MIXED protocol and log 48 never
+  executed that mixture for semaphores even once.** That is the strongest
+  correlation in the evidence and it is testable for free:
+
+      Documents/madeira-env.txt:   MADEIRA_FASTSYNC_SEM=0
+
+  Both halves were re-read this round and are intact after ml1060. Client:
+  `madeira_fast_lookup()` returns "no cell" for a SEM kind (`sync.c:964`,
+  `:1045`), `madeira_fast_sem_release()` refuses (`sync.c:1142`), and
+  `madeira_fast_watched_wait()`'s lookup then fails so a semaphore wait becomes
+  the plain infinite `server_wait` it was before ml1060 — events keep both the
+  cell and the heartbeat. Server: `madeira_sem_cell_alloc()` returns -1
+  (`event.c:187`) so a semaphore gets no cell at all. Both names are present in
+  both shipping archives (`MADEIRA_FASTSYNC_SEM` x2 in `libntdll_unix.a`, x2 in
+  `libwineserver.a`). `MADEIRA_FASTSYNC=0` (no cells anywhere, the pre-ml952
+  port) is the bigger hammer and is the second run to make if the first
+  changes nothing; note that it also silences `[lost-wake]` and most of
+  `[late-wake]`, because with no cells there is nothing for either to read.
+
+  **8. A SECOND INSTANCE OF THE ml1100 STAGE BUG, ONE LEVEL DOWN, AND IT IS
+  WORSE.** The ml1100 entry recorded that `.xtool/build-wine-native.sh` does
+  not rsync `wine/` and that a stale `sync.c` from an earlier stage nearly
+  shipped. Doing that rsync by hand this round was not enough: the FIRST
+  rebuild failed with `no member named 'rel_us' in 'struct madeira_sync_cell'`
+  although `build/ntdll-unix/shims/ios_fastsync.h` had it. `build-wine-64.sh`
+  copies the shim headers into `wine/dlls/ntdll/unix/` and `wine/server/` so
+  that makedep can resolve the quoted includes on a fresh configure — and a
+  **quoted include resolves against the source directory FIRST**, so those
+  copies silently shadow the `-I shims` path at compile time. They were dated
+  21:33 the previous evening, the same stale-workspace timestamp ml1100 named,
+  and `rsync` without `--delete` cannot remove them because the tracked tree
+  has no such file. This time it errored out, which is luck — the change added
+  a member. A change that only altered the MEANING of an existing field would
+  have compiled clean against the old header and shipped. The fix used was to
+  re-copy all five shims by hand before rebuilding;
+  `.xtool/build-wine-64.sh:287` grows `ios_late_wake.h` in its list so a fresh
+  configure works, and the stage scripts still need the sync ml1100 asked for.
+
+  **VERIFIED BY BUILDING AND READING THE ARTIFACTS.** `.xtool/build-wine-native.sh`:
+  ntdll-unix **32 succeeded, 0 failed**, win32u-unix 46/46, wineserver every
+  file. `libntdll_unix.a` **1 950 424 B**, `libwineserver.a` **1 269 952 B**,
+  both 2026-09-21 02:15-02:16. (`libwin32u_unix.a` 3 489 144 B is rebuilt by
+  the same stage and carries none of this round's changes; it moved because
+  the shared workspace picked up concurrent work under `wine/dlls/win32u`.)
+  Compiler
+  stderr for every file changed here carries **no new diagnostic**: `sync.err`
+  is the six pre-existing `os_sync_*` iOS-17.4 availability warnings and
+  nothing else, `server.err` the two pre-existing `%{public}s` ones, and the
+  wineserver's `err-thread.txt`, `err-event.txt` and `err-semaphore.txt` are
+  **0 bytes each**. BY CONTENT: `libntdll_unix.a` carries
+  `[perf] rev=ml1110 ... late=%u rescued=%u tick=%llums` (and the `rev=ml1060`
+  form of it is gone, grep count 0), the three `[late-wake] ml1110 ...`
+  formats and `MADEIRA_LATEWAKE`; `sync.o` DEFINES `_madeira_late_wake_peek`
+  and `_madeira_late_wake_snapshot` and `server.o` references both.
+  `libwineserver.a` carries `MADEIRA_TIMEOUT_RECHECK` and its `thread.o`
+  disassembles as described in item 4(c) — `bl _getenv`, `bl _strcmp` x2,
+  `bl _wake_thread` at +0xf4, then `bl _end_wait` at +0x134,
+  `bl _send_thread_wakeup` at +0x148 and the pre-existing trailing
+  `bl _wake_thread` at +0x16c.
+
+  **UNVERIFIED ON DEVICE — all of it.** Specifically: that one commpage clock
+  read per client-side release and per client SetEvent is as free as it is
+  assumed to be (at the observed 1790 releases and 925 sets per 10 s it is
+  ~270 reads a second, but that is arithmetic, not a measurement, and
+  `MADEIRA_LATEWAKE=0` is the A/B); that `wake_thread()` from inside a fired
+  timeout handler is as harmless as the same call two lines below it has
+  always been (the risk is an outer wait being evaluated one handler earlier
+  than before, which `check_wait()` is already re-entrant for, and the
+  behaviour with nothing signalled is provably identical); that the four-slot
+  hot sketch names the object anybody cares about rather than four
+  uninteresting ones; and that the 32-bit `rel_us` truncation never produces a
+  nonsense age (it wraps every ~71 minutes and the only consumer subtracts two
+  stamps taken milliseconds apart, so a wrap is invisible to it — but that is
+  an argument, not a log line).
+
+  **WHAT THE NEXT DEVICE LOG SHOULD SHOW, IN THIS ORDER.**
+  1. `[perf] rev=ml1110 ... late=N rescued=N` at all, which is the proof the
+     census is wired. `rev=ml1060` appearing instead means a stale archive and
+     item 8 is why.
+  2. **`late=` and `rescued=`, and they are the answer.** `late=0 rescued=0`
+     over a full hung run says no hand-off in this title is being delivered by
+     a timer, and the search moves out of the wait/wake protocol for good —
+     to the two candidates item 2 leaves standing: the thread that dies
+     immediately after creation where the good run's equivalent goes on to
+     create three more, and whatever the loader is waiting for that is not a
+     wineserver object at all (`delay=7807` alertable `NtDelayExecution` per
+     10 s is 781/s of pure timed sleeping, and it is the same in the good run's
+     loading phase, so it wants measuring before it is accused). Non-zero says
+     the opposite, and then:
+  3. Under `MADEIRA_DIAG=1`, `[late-wake]`'s `age p50=`. **This is the single
+     number that separates the two readings.** p50 in single-digit
+     microseconds is an honest collision between a release and an expiry and
+     is not a defect. p50 in the hundreds of microseconds, or milliseconds, is
+     a wake that was owed and never delivered, and `[late-wake]   #1 cell=N
+     obj=sem` then names the object; cross it against `[wait-census]`, which
+     prints `cell=` for every blocked waiter, to get its handle.
+  4. `heartbeat: expiries=N late=N rescued=N`. `expiries` should stay at the
+     ~1.5 per 10 s that `watchdog=` reported in log 84 — if it jumps into the
+     thousands, something has started parking for two seconds and that is a
+     new finding on its own. `rescued=` greater than zero at ANY rate is this
+     port's heartbeat carrying a hand-off the wake path should have carried.
+  5. `tmo_fin=` unchanged at ~11000 per 10 s with `late=0` means those eleven
+     thousand timeouts are the guest's own short polls and are none of our
+     business. `tmo_fin` FALLING with the timeout re-check in place would be
+     item 4(c) paying off directly.
+  6. Then the A/B: the same run with `MADEIRA_FASTSYNC_SEM=0`. Reaching
+     gameplay is the whole answer and the semaphore fast path goes back to the
+     drawing board. Not reaching it exonerates ml1010 as well, and the next
+     thing to instrument is the loader's own progress rather than the sync
+     underneath it.
+
+- **2026-09-21 — a window LARGER than the guest desktop: win32u crops its
+  surface to the screen and the overlay stretched that crop over the whole
+  window, and a direct launch has no way to move such a window back on screen
+  (the `[overlay-flush]` / `[overlay-place]` / `[screen-routes]` family,
+  ml1110). Plus: the desktop compositor letterboxed against the LAUNCH-time
+  guest size, not the live one.**
+
+  **THE REPORT.** A 32-bit GDI-only scripting-engine title (`Present: 0`, no
+  D3D device) shows correctly from Explorer inside the virtual desktop and, in
+  a DIRECT launch, draws its title bar and menu bar with a WHITE client area.
+  Two device logs of the same program: `madeira-log (90).txt` (direct, broken)
+  and `madeira-log.prev (6).txt` (desktop, working).
+
+  **WHAT THE TWO LOGS AGREE ON, WHICH IS MOST OF IT.** The main window is
+  `win={5,5,1291,1016}`, `client={8,53,1288,1013}` in BOTH modes — 1286x1011,
+  with a 1280x960 client, on a 1280x720 guest desktop. In both modes its
+  surface is `surf=1280x768`, in both modes the first 64 flushes carry an
+  identical content signature and then it changes once, and in both modes the
+  dirty rect is the whole surface. So the surface SIZE, the flush cadence and
+  the damage are not what differs, and three of the four candidates going in
+  (child windows getting their own layers, a wrongly-clipped visible region, a
+  direct-mode paint/erase difference) are ruled out by the logs themselves:
+
+  * `[winios-tree]` in the desktop log shows the main window with **no child
+    windows at all** — the engine paints its own client area. The three hwnds
+    that got overlay layers in the direct log (`0x100c0/0x100c2/0x100c4`) have
+    EMPTY visible rects, which is why `[win-pos]` never printed them: they are
+    the 1x1 IME/message-shaped windows, hidden layers, drawing nothing.
+  * `[surf-clip] #1 count=1 rect[0]={0,0,1286,1011}` — a full, non-empty
+    visible region. Nothing is being clipped away.
+  * `[paint-diag] hwnd=0x1004a parent=0x1003c desktop=0x1003c` — the parent IS
+    the desktop, resolved correctly (ml1090's evaluation-order fix holding),
+    and the synthesised `RedrawWindow` fires.
+
+  **WHERE THE SURFACE SIZE COMES FROM, AND WHY IT MATTERS.**
+  `get_surface_rect()` (`wine/dlls/win32u/window.c:2038`) crops a surface to
+  the virtual screen *for a window larger than it* — "some applications create
+  huge windows" — then rounds to 128. For this window: `{5,5,1291,1016}` ∩
+  `{0,0,1280,720}` = `{5,5,1280,720}`, offset to window-local `{0,0,1275,715}`,
+  rounded to **`{0,0,1280,768}`**. That is the whole of `surf=1280x768`, and it
+  means **240 of the client's 960 rows, and 6 of its columns, are bits win32u
+  never allocated.** Nothing downstream can show them.
+
+  **ROOT CAUSE 1 — THE OVERLAY STRETCHED THAT CROP OVER THE WHOLE WINDOW.**
+  `winios_apply_contents_rect` (Winios.m) carried the assumption in its own
+  comment — "Surfaces are 128px-aligned (win32u), usually LARGER than the
+  window" — and clamped `contentsRect` to 1.0. With the surface SMALLER than
+  the window the clamp is a no-op, the layer stays framed to the full window
+  rect, and Core Animation resizes a 1280x768 image onto 1286x1011 of window:
+  a **1.32x vertical stretch**, with the rows that have no bits invented by the
+  stretch. The screenshot confirms the arithmetic exactly: the drawn layer
+  measures 321.5x337 pt, which is `1286 * (320/1280)` by `1011 * (240/720)` —
+  window rect times the game-rect scale, not surface times scale.
+
+  This is NOT direct-launch-specific. The desktop session has the same window,
+  the same 1280x768 surface and the same clamp; it has been stretching there
+  all along, and the per-window Metal sublayer (`winios_place_metal_layer`)
+  was measuring its offset from a window origin the parent layer no longer sat
+  at whenever a crop happened.
+
+  **ROOT CAUSE 2 — AN OVERSIZED WINDOW IN A DIRECT LAUNCH IS UNREACHABLE.**
+  In a desktop session an oversized window is a nuisance: drag it. A direct
+  launch has no window manager, no useful title-bar drag and no Alt+Space, so
+  whatever hangs off the guest desktop is gone for the session. 1286x1011 on
+  1280x720 means the bottom third of the window — including every client row
+  below 720 — was simply unreachable.
+
+  **WHAT IS *NOT* PROVEN, AND WHY THE WHITE IS NOT YET ATTRIBUTED.** The
+  surface's client area really is white in the direct log, and so is the engine
+  at that point: its own script output ends at `first.ks : @image storage=white
+  page=fore layer=base` (a WHITE base image, loaded in 26 ms) and never
+  advances. Every GDI blit in the whole direct log is 32x32 (the icon); the
+  desktop log carries 192x16, 48x48 and 256x256 blits. The last thing in the
+  direct log is a BUS fault inside `NtWriteFile` ->
+  `virtual_check_buffer_for_read` on the engine's own thread (`0024`), i.e. the
+  engine stalled writing its script log — **`build/ntdll-unix/virtual_ios.c`
+  territory, not this round's and not this agent's files.** So the honest
+  statement is: the two geometry defects above are proven by arithmetic and
+  would corrupt the picture the moment the engine does draw; whether they are
+  the *whole* of "white client area" cannot be decided from log 90, and the new
+  diagnostics exist precisely so the next one decides it without another round.
+
+  **THE CHANGES.**
+
+  * `build/win32u-unix/driver_ios.c:458-472` — new weak extern
+    `winios_window_surface_rect`, called from `winios_CreateWindowSurface`
+    once per surface creation with the surface rect in window-local pixels.
+    Both modes; the crop is not direct-launch-specific. Weak, so a stale app
+    side keeps the old (0,0)-and-no-smaller assumption rather than misreading
+    anything.
+  * `app/Madeira/Winios/Winios.m` `winios_window_drawn_rect()` /
+    `winios_place_window_layer()` replace `winios_apply_contents_rect`: the
+    layer is framed to the part of the window its surface actually covers and
+    `contentsRect` is that part of the surface, so one surface pixel is one
+    guest pixel again. **Byte-for-byte the old placement whenever the surface
+    starts at window-local (0,0) and is at least as big as the window** — i.e.
+    every window that fits on the guest desktop, which is every window in every
+    log so far except this one. `MADEIRA_SURFACE_EXACT=0` restores the stretch.
+    `winios_place_metal_layer` now measures its offset from the same origin.
+  * `app/Madeira/Winios/Winios.m` (overlay section) — **the direct-launch FIT.**
+    When the union of what the overlay draws is larger than the guest desktop,
+    that union is mapped into the game rect instead: one uniform scale, centred,
+    never magnifying (the union always contains the desktop rect, so the scale
+    is <= the plain one). The union is taken over windows that OWN a surface and
+    have delivered bits — a child paints into an ancestor's surface and is
+    already inside it, and reserving screen space for the rows win32u cropped
+    away would shrink everything else for a blank strip. Gated on **no Metal
+    layer presenting** (`winios_overlay_metal_live()`, slot 0 of the existing
+    atomic table): once a swapchain exists the game image owns the game rect and
+    its scale is DXMT's. When nothing overflows, the mapping is the ml1090
+    per-axis one, unchanged, so Stretch mode still stretches.
+    `MADEIRA_OVERLAY_FIT=0` disables it.
+  * `app/Madeira/ContentView.swift` `mapPoint` — the exact inverse of that fit,
+    read back through `winios_overlay_fit_source()` and run against the same
+    `gameRect()` the overlay was placed with, so the two stay inverses by
+    construction rather than by two copies of the same arithmetic. Clamped to
+    the SOURCE rect, not the desktop: the guest pixels a tap on an oversized
+    window lands on are legitimately outside it. The call returns 0 when no fit
+    is active and the existing `GameSurfaceLayout` path runs untouched.
+  * `app/Madeira/Winios/Winios.m` `winios_cursor_place` — the drawn cursor maps
+    through the same `winios_overlay_map_px`, so the arrow shrinks and moves
+    with the windows instead of pointing at where one used to be.
+
+  **THE COMPOSITOR'S GUEST SIZE (desktop mode, found while checking the above).**
+  `winios_layout_compositor()` and `winios_desktop_point_from_window()` read
+  `MADEIRA_SCREEN_W/H` — which is the session's launch-time SEED. win32u owns
+  the value afterwards and publishes every change through
+  `winios_display_mode_changed` (`IOSDisplayShim.m:96`). So a desktop session in
+  which anything programmed a different mode kept letterboxing against the OLD
+  size: the wine desktop drawn into a sub-rectangle of its own frame, taskbar
+  and window layers placed by a scale nothing else agreed with, and the touch
+  mapping off by the same factor. Both now call `winios_screen_size()`. And
+  because `winios_set_compositor_frame` deliberately skips a no-op frame
+  (`layoutSubviews` storms identical ones), a guest mode change — which moves
+  the mapping without moving the frame — could never trigger a relayout at all:
+  new `winios_compositor_relayout()`, called from `applyDisplayModeAndLog`
+  beside the cursor and overlay relayouts, i.e. from the same
+  `reason=mode-changed` apply the `.MadeiraDisplayModeChanged` observer drives.
+
+  **THE DIAGNOSTICS, WHICH ARE THE POINT OF THIS ROUND.** All always-on, all
+  deduped PER WINDOW (a global throttle buries a window created late — the
+  ml493 lesson), all direct-launch only except where noted:
+
+  1. `[overlay-win] #N hwnd=... parent=... child=... style=... ex=... after=...
+     swp=... win={...} client={...} visible={...} surface=own|(none) — paints
+     into an ancestor's surface` — first FOUR position events per window, from
+     `pWindowPosChanged`. This is the only line a child window with an empty
+     visible rect ever produces: the existing `[win-pos]` family drops those on
+     purpose, which is exactly how three hwnds got overlay layers in log 90 and
+     appeared nowhere else in the file. Four events, not two, so a dialog's own
+     later centring move is inside the budget.
+  2. `[overlay-flush] #N hwnd=... parent=... child=... own-surface=1 style=...
+     ex=... win={...} client={...} visible={...} surf={...} client-local={...}
+     dirty={...} -> clipped={...}` — first three flushes per window, with two
+     verdicts spelled out: `<-- DAMAGE ENTIRELY OUTSIDE THE SURFACE` and
+     `<-- SURFACE DOES NOT COVER THE WHOLE CLIENT (cropped to the virtual
+     screen)`. `client-local` is the client rect in the same window-local space
+     as `surf`, which is the only way to read "does the surface reach the bottom
+     of the client".
+  3. `[overlay-place] #N hwnd=... guest-win={...} drawn={...} layer=(...)
+     contents=(...) hidden=... game-rect=... guest=... fit=...` (app side, first
+     three placements per window) — where that guest rectangle actually landed
+     on screen. Together with (1) this separates the two ways a dialog ends up
+     off the top-left corner: win32u's line negative = the guest centred on a
+     zero screen; win32u's line sane and this one not = the overlay mapping is
+     wrong.
+  4. `[screen-routes] ml1110 at=... SM_CXSCREEN=... SM_CYSCREEN=...
+     SM_CXVIRTUALSCREEN=... SM_CYVIRTUALSCREEN=... primary={...} virtual={...}
+     workarea={...} desktop=... desktop-win={...} desktop-client={...}` — ONCE,
+     at the first window event, i.e. in the state a self-centring dialog is
+     about to read. A program can ask "how big is the screen" through at least
+     six APIs and in a direct launch they do not share a source: `SM_CXSCREEN`
+     and `GetDeviceCaps(HORZRES)` end at `get_primary_monitor_rect()` (via
+     `get_display_rect()` first when the DC names an adapter),
+     `SPI_GETWORKAREA` at a separately cached work area, and
+     `GetWindowRect(GetDesktopWindow())` at either a per-thread SYNTHESISED
+     monitor rect or the window's STORED rect depending on whether the calling
+     thread has resolved `top_window`; `MonitorFromPoint` + `GetMonitorInfo` go
+     to the monitor list itself. Two rounds have been spent inferring which one
+     a mis-centred dialog read; this prints all of them.
+     `<-- THE DESKTOP WINDOW IS STILL 0x0` calls out the ml1090 case directly —
+     its sizing is an `SWP_ASYNCWINDOWPOS` post to a window the server has
+     DETACHED from every thread, so there may be no pump to apply it.
+  5. `[winios-tree]` now also runs in a DIRECT launch — bounded to three dumps,
+     five seconds apart, and only once the overlay actually has a visible
+     window. Log 90 could not say what the windows around a blank client area
+     even were; the desktop log could, and that is what ruled the child-window
+     theory out in one line.
+
+  **KNOBS ADDED.** `MADEIRA_OVERLAY_FIT=0` (no fit; an oversized window hangs
+  off the game rect as before, clipped by `masksToBounds`),
+  `MADEIRA_SURFACE_EXACT=0` (restore the pre-ml1110 stretch placement, in both
+  modes). The existing `MADEIRA_DIRECT_OVERLAY=0` still removes the whole
+  direct-launch overlay.
+
+  **ARTIFACTS, VERIFIED BY CONTENT AND TIMESTAMP.** `win32u-unix` rebuilt alone
+  (not `build-wine-native.sh`, whose other two parts another agent is editing;
+  the tracked sources were rsynced into the workspace first, which is what that
+  script's own preamble exists for): **46/46 files compiled, 0 failed**,
+  `obj/driver.err` 0 bytes, `libwin32u_unix.a` **3,490,704 B** (was 3,486,632).
+  `strings` finds `[screen-routes] ml1110 at=`, `[overlay-flush] #%d hwnd=` and
+  `[overlay-win] #%d hwnd=`; `llvm-nm -m obj/driver.o` shows
+  `_winios_window_surface_rect` as `(undefined) weak external`, the same
+  encoding as the existing `_winios_overlay_skip_hwnd`. App compile-check
+  `python3 .xtool/prepare.py && xtool dev build --configuration debug`:
+  **Build complete**, only the two pre-existing `UIApplication.windows`
+  deprecation warnings and the pre-existing `will never be executed` in
+  `ContentView.swift`. The linked `Madeira.app/Madeira` (46,016,240 B) defines
+  `_winios_overlay_fit_source`, `_winios_window_surface_rect` and
+  `_winios_compositor_relayout`, and carries `[overlay-place] #`,
+  `[overlay] fit `, `MADEIRA_OVERLAY_FIT`, `MADEIRA_SURFACE_EXACT` and all
+  three win32u formats above.
+
+  **UNVERIFIED ON DEVICE — all of it,** and the 2026-09-25 lesson applies.
+  Specifically: that the white client area is the engine's own white base image
+  plus the stall in `NtWriteFile`, rather than a further display defect (the
+  new lines say which, and an `[overlay-flush]` whose `clipped` is non-empty
+  with a changing `sig` and still a white screen would move the question back
+  here); that shrinking the overlay to fit does not make an oversized window
+  unreadably small on a phone-sized live view (there is no minimum scale — the
+  alternative is a window that cannot be reached at all); that the fit's
+  guest->layer map and `mapPoint`'s inverse agree on a real tap (they are
+  written from one published rect, but that has never been measured under a
+  finger); that placing the layer at the surface's covered rect does not make
+  the desktop session look WORSE for this same oversized window — it has been
+  stretched there all along and `MADEIRA_SURFACE_EXACT=0` is the way back; and
+  that a guest mode change in a desktop session now relayouts the compositor
+  exactly once rather than fighting `layoutSubviews`.
+
+  **WHAT THE NEXT DEVICE LOG SHOULD SHOW, IN THIS ORDER.**
+  1. `[screen-routes] ml1110 at=first-window-event ...` — ONE line, early.
+     Every number on it should be 1280x720-shaped. `desktop-win={0,0,0,0}` with
+     the `<-- THE DESKTOP WINDOW IS STILL 0x0` tail names ml1090's async
+     `SetWindowPos` as never applied, and the fix then belongs on the owning
+     thread. A zero `workarea=` with a non-zero `primary=` is the ml1100 cache
+     surviving; a zero `primary=` is the monitor list itself.
+  2. `[overlay-win] #1..#4` for the program's own windows. For the mis-centred
+     chooser dialog, the event whose `win=` turns negative is the program's
+     centring move, and `[screen-routes]` above says what it divided by two.
+  3. `[overlay-place] #1` for the same hwnd — `guest-win` must equal
+     `[overlay-win]`'s `win=`, and `layer=` must be inside `(0,0 game-rect)`.
+     If `guest-win` is sane and `layer=` is not, the defect is the overlay
+     mapping and nothing guest-side is at fault.
+  4. `[overlay] fit ON src={0,0 1291x1016} desktop=1280x720 game-rect=WxH
+     scale=... origin=(...)` for the oversized-window title, and the whole
+     window visible inside the live view. `fit off` with a window bigger than
+     the desktop means the union was computed from windows that never delivered
+     bits, and the thing to read next is `[overlay-place]`'s `drawn=`.
+  5. `[overlay-flush] #1` for the main window: `surf={0,0,1280,768}` against
+     `client-local={3,48,1283,1008}` and the `<-- SURFACE DOES NOT COVER THE
+     WHOLE CLIENT` tail. That tail is EXPECTED here, not a regression — it is
+     win32u cropping a window bigger than the screen, and it is the reason the
+     fit measures the drawn rect rather than the window rect.
+  6. `[winios-tree]` in the direct launch, up to three times: the program's
+     window list with styles and rects, which is what log 90 lacked.
+  7. Desktop session, after any `[display] guest surface is now WxH`: a
+     `[winios] compositor layout: ... desk=WxH ...` whose `desk=` is that NEW
+     size. The old size there is this round's compositor fix not firing.

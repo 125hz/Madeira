@@ -393,6 +393,22 @@ struct ios_stream {
                                          * dropout was the client stalling or
                                          * us failing to drain */
     uint64_t last_release_mach;
+    /* ml1100: THE LATENCY ITSELF, which no counter here has ever reported.
+     *
+     * "A stutter every few seconds, after which the audio stays slightly
+     * delayed" is a claim about write_pos - play_pos, and nothing measured it.
+     * It matters because the ring's latency can only ever GROW on its own: an
+     * underrun freezes play_pos (ios_mix_stream stops advancing when the ring
+     * is dry) while the client keeps queueing, so the frames that should have
+     * played during the gap are not dropped -- they are played late, and every
+     * subsequent frame inherits that offset for the rest of the session.
+     * pad_min over a whole window is the number that proves or disproves it:
+     * a stable pad_min is a stable latency, a pad_min that steps up and stays
+     * up is exactly the reported symptom. Owned by the render thread. */
+    _Atomic uint32_t stat_pad_min;
+    _Atomic uint32_t stat_pad_max;
+    _Atomic uint32_t stat_resyncs;
+    int underrun_pending;               /* render thread only: re-centre next callback */
 };
 
 /* ml739: one stream object per client, mirroring Wine's CoreAudio driver.
@@ -793,6 +809,18 @@ static uint32_t ios_resample_step(UINT32 stream_rate)
     return (uint32_t)step;
 }
 
+/* ml1100: see the re-centre note in ios_mix_stream.  Read once; the render
+ * thread must not call getenv. */
+static int ios_audio_resync_on(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("MADEIRA_AUDIO_RESYNC");
+        cached = !(e && e[0] == '0');
+    }
+    return cached;
+}
+
 /* Sum ONE stream into the engine's stereo bus.  Core Audio real-time thread:
  * ring + atomics only, no Wine calls, no allocation, no logging.  An underrun
  * simply contributes nothing further -- WASAPI-correct, since padding drains
@@ -808,6 +836,45 @@ static void ios_mix_stream(struct ios_stream *s, float *out, UInt32 nframes)
     UInt32 i;
 
     if (!cap || !s->ring) return;
+
+    /* ml1100: RE-CENTRE AFTER AN UNDERRUN, AND ONLY AFTER ONE.
+     *
+     * This is the one place latency is permanently added: the loop below stops
+     * advancing play_pos when the ring is dry, so the wall time spent dry is
+     * time the client's queued audio is simply shifted by.  Dropping a client's
+     * audio is otherwise WRONG -- the padding a healthy WASAPI client carries is
+     * its own choice and its own buffering -- so the correction fires only on
+     * the callback after a dry spell, and only when the refill overshot, and it
+     * leaves exactly one period queued.  With no underrun this branch is a
+     * single predictable test per callback and never runs.
+     *
+     * MADEIRA_AUDIO_RESYNC=0 disables it; the [audio] line reports resyncs=N
+     * either way, so a session that never underruns is visibly a session where
+     * this made no difference. */
+    if (s->underrun_pending) {
+        uint32_t period = s->sample_rate ? s->sample_rate / 100u : 480u;
+        if (!period) period = 1;
+        if (avail > 2ull * period && ios_audio_resync_on()) {
+            play += avail - period;
+            avail = period;
+            atomic_fetch_add_explicit(&s->stat_resyncs, 1, memory_order_relaxed);
+            s->underrun_pending = 0;
+        } else if (avail >= 1) {
+            /* Refilled without overshooting, or the knob is off: either way the
+             * dry spell is over and there is nothing left to correct. */
+            s->underrun_pending = 0;
+        }
+    }
+
+    /* The latency census.  One min/max update per callback, not per frame. */
+    {
+        uint32_t pad = (uint32_t)(avail > 0xffffffffull ? 0xffffffffull : avail);
+        uint32_t old = atomic_load_explicit(&s->stat_pad_max, memory_order_relaxed);
+        if (pad > old) atomic_store_explicit(&s->stat_pad_max, pad, memory_order_relaxed);
+        old = atomic_load_explicit(&s->stat_pad_min, memory_order_relaxed);
+        if (!old || pad < old) atomic_store_explicit(&s->stat_pad_min, pad, memory_order_relaxed);
+    }
+
     for (i = 0; i < nframes; i++) {
         uint32_t idx, adv;
         float l, r;
@@ -816,6 +883,10 @@ static void ios_mix_stream(struct ios_stream *s, float *out, UInt32 nframes)
          * zero and one available frame is enough. */
         if (avail < (frac ? 2u : 1u)) {
             atomic_fetch_add_explicit(&s->stat_underruns, 1, memory_order_relaxed);
+            /* ml1100: arm the re-centre. play_pos stops here, so from this
+             * moment the client's queue is running late by however long the
+             * ring stays dry. */
+            s->underrun_pending = 1;
             break;
         }
         idx = (uint32_t)(play % cap);
@@ -1116,15 +1187,22 @@ static void ios_report_streams(void) {
     last_mach = now;
     for (i = 0; i < IOS_MAX_STREAMS; i++) {
         struct ios_stream *s = g_streams[i];
-        uint32_t peak, gap_us;
+        uint32_t peak, gap_us, pad_min, pad_max, rate_hz;
         if (!s) continue;
         peak = atomic_load_explicit(&s->stat_peak_q16, memory_order_relaxed);
         atomic_store_explicit(&s->stat_peak_q16, 0, memory_order_relaxed);
         gap_us = atomic_load_explicit(&s->stat_max_gap_us, memory_order_relaxed);
         atomic_store_explicit(&s->stat_max_gap_us, 0, memory_order_relaxed);
+        /* ml1100: pad_min is the latency floor for the window — a stable number
+         * is a stable latency, a number that steps up and stays up is the
+         * "slightly delayed ever after" the reports describe.  Both are reset
+         * each window so the next one measures itself. */
+        pad_min = atomic_exchange_explicit(&s->stat_pad_min, 0, memory_order_relaxed);
+        pad_max = atomic_exchange_explicit(&s->stat_pad_max, 0, memory_order_relaxed);
+        rate_hz = s->sample_rate ? s->sample_rate : 1;
         fprintf(stderr, "[audio] stream %d: fmt=%s/%uch/%uHz/%ubit(valid %u)/mask0x%x "
                         "ring=%ums frames_written=%llu underruns=%u peak=%u.%03u "
-                        "event_signals=%u max_gap_ms=%u.%u %s\n",
+                        "event_signals=%u max_gap_ms=%u.%u pad_ms=%u..%u resyncs=%u %s\n",
                 k, kind_name[s->kind], s->channels, s->sample_rate,
                 s->frame_bytes && s->channels ? (s->frame_bytes / s->channels) * 8 : 0,
                 s->valid_bits, s->channel_mask,
@@ -1135,6 +1213,8 @@ static void ios_report_streams(void) {
                 peak >> 16, ((peak & 0xffff) * 1000) >> 16,
                 atomic_load_explicit(&s->stat_event_signals, memory_order_relaxed),
                 gap_us / 1000, (gap_us % 1000) / 100,
+                pad_min * 1000u / rate_hz, pad_max * 1000u / rate_hz,
+                atomic_load_explicit(&s->stat_resyncs, memory_order_relaxed),
                 s->started ? "playing" : "stopped");
         atomic_store_explicit(&s->stat_event_signals, 0, memory_order_relaxed);
         k++;
@@ -1535,6 +1615,9 @@ static NTSTATUS ios_timer_loop(void *args) {
     uint64_t next = 0, last_signal = 0;
     if (!s) return STATUS_SUCCESS;
     LOG_FN_CALL(9, "timer_loop");
+    /* ml1100: resolve the resync knob HERE, on a Wine thread, so the Core Audio
+     * render thread never reaches a getenv on its first callback. */
+    ios_audio_resync_on();
     while (s->valid) {
         UINT32 rate = s->sample_rate ? s->sample_rate : IOS_AUDIO_SAMPLE_RATE;
         UINT32 period = rate / 100;            /* 10 ms in client frames */
@@ -1546,7 +1629,30 @@ static NTSTATUS ios_timer_loop(void *args) {
             /* A reset rewinds play_pos; resync rather than wait forever. */
             if (next > play + 4ull * period) next = play;
             if (play >= next) {
-                next = play + period;
+                /* ml1100: ADVANCE BY ONE PERIOD, DO NOT SNAP TO `play'.
+                 *
+                 * `next = play + period' threw away however far play_pos had
+                 * already run past the target, and play_pos does not advance
+                 * smoothly -- it advances in whole Core Audio callbacks. With a
+                 * 1024-frame device buffer it jumps 21.3 ms at a time, so this
+                 * loop could only ever observe ONE crossing per callback and
+                 * emitted ONE signal for TWO elapsed 10 ms periods. The device
+                 * census says exactly that: event_signals=470 per ten seconds
+                 * (47/s, one per callback) where a 10 ms period wants ~100/s,
+                 * frames_written/event_signals = 1021 frames = 21.3 ms per
+                 * wakeup, and max_gap_ms pinned at 22.6 -- the client's period
+                 * was silently the DEVICE's buffer, not the 10 ms this driver
+                 * advertises through get_device_period.
+                 *
+                 * Keeping the phase makes the next iteration find the second
+                 * crossing immediately and signal again, so a client that mixes
+                 * on its period event is woken at the rate it was promised and
+                 * has two periods of margin instead of one. */
+                next += period;
+                /* ... but never bank an unbounded debt: if this loop was itself
+                 * descheduled for a long time, catch up rather than emit a burst
+                 * of signals for periods nobody can still use. */
+                if (play >= next + 4ull * period) next = play + period;
                 signal_now = 1;
             }
             /* LIVENESS.  play_pos stops advancing the moment the ring is

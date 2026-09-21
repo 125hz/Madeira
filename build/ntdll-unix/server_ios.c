@@ -717,6 +717,67 @@ void ios_frame_wait_add( enum ios_frame_wait kind, unsigned long long ns )
     IOS_FRAME_ADD( wait_ns[kind], ns );
 }
 
+/* ml1100 [frame] srv-sites: WHICH server wait costs the presenting thread its frame.
+ *
+ * The 32-minute session that motivated this puts `srv=' at 20-24 ms of a 40 ms frame
+ * and gives no way at all to ask what the thread was waiting FOR. The whole-process
+ * [srv-stats] line can only say what every thread did together (`w1 inf=0 fin=4697
+ * poll=2900 | wN inf=471 fin=624 ... tmo=4302'), and the presenting thread is one of
+ * six. A per-site table on the presenting thread alone answers it, and it is cheap
+ * because that thread already reads the clock twice around this exact call.
+ *
+ * The key is deliberately made of things that are free at the call site: how many
+ * objects, whether the timeout is infinite/finite/poll, the first handle (which
+ * [wait-census] already prints alongside the object pointer, its type and its
+ * fastsync cell, so a later log resolves it without a new probe), and the caller's
+ * return address inside ntdll. Object TYPE is not read here on purpose: it would
+ * need either a server round trip or a reach into the fastsync cache from the wrong
+ * translation unit, and the handle plus [wait-census] gives the same answer offline.
+ *
+ * The table is per-process, tiny, and raced only by one thread by construction (the
+ * GAME role is a single TEB). It is drained and zeroed by the reporter. */
+#define IOS_FRAME_SRVSITE_N 12
+
+static struct {
+    unsigned long long ns;
+    unsigned int n;
+    unsigned int tmo;
+    const void *pc;
+    unsigned int handle;
+    unsigned short nobj;
+    unsigned char tclass;   /* 0 = infinite, 1 = finite, 2 = poll (zero timeout) */
+} ios_frame_srvsite[IOS_FRAME_SRVSITE_N];
+
+void ios_frame_srv_site( const void *pc, unsigned int handle, unsigned int nobj,
+                         unsigned char tclass, unsigned long long ns, int timed_out )
+{
+    int i, worst = 0;
+
+    if (!ios_frame_stats_on) return;
+    for (i = 0; i < IOS_FRAME_SRVSITE_N; i++)
+    {
+        if (ios_frame_srvsite[i].n && ios_frame_srvsite[i].pc == pc &&
+            ios_frame_srvsite[i].handle == handle && ios_frame_srvsite[i].nobj == nobj &&
+            ios_frame_srvsite[i].tclass == tclass)
+        {
+            ios_frame_srvsite[i].ns += ns;
+            ios_frame_srvsite[i].n++;
+            if (timed_out) ios_frame_srvsite[i].tmo++;
+            return;
+        }
+        /* Evict the cheapest slot: the table ranks by TIME, so the site that has
+         * cost least is the one whose loss the top-3 cannot notice. */
+        if (ios_frame_srvsite[i].ns < ios_frame_srvsite[worst].ns) worst = i;
+    }
+    ios_frame_srvsite[worst].ns = ns;
+    ios_frame_srvsite[worst].n = 1;
+    ios_frame_srvsite[worst].tmo = timed_out ? 1 : 0;
+    ios_frame_srvsite[worst].pc = pc;
+    ios_frame_srvsite[worst].handle = handle;
+    ios_frame_srvsite[worst].nobj = (unsigned short)nobj;
+    ios_frame_srvsite[worst].tclass = tclass;
+}
+
 void ios_frame_note_display( int panel_hz, int intent_hz, int mode )
 {
     ios_frame_panel_hz = panel_hz;
@@ -830,14 +891,15 @@ void ios_frame_report( unsigned long long win_ns )
     {
         extern void madeira_fast_park_hist_snapshot( unsigned int *out, unsigned n,
                                                      unsigned int *spin_hit,
-                                                     unsigned int *spin_miss, int *credit );
+                                                     unsigned int *spin_miss, int *credit,
+                                                     unsigned int *spin_probe );
         unsigned int ph[16], i2, total = 0, seen = 0, p50 = 0, p90 = 0;
-        unsigned int spin_hit = 0, spin_miss = 0;
+        unsigned int spin_hit = 0, spin_miss = 0, spin_probe = 0;
         int credit = 0;
         char line[512];
         int len;
 
-        madeira_fast_park_hist_snapshot( ph, 16, &spin_hit, &spin_miss, &credit );
+        madeira_fast_park_hist_snapshot( ph, 16, &spin_hit, &spin_miss, &credit, &spin_probe );
         for (i2 = 0; i2 < 16; i2++) total += ph[i2];
         if (total || spin_hit || spin_miss)
         {
@@ -847,15 +909,63 @@ void ios_frame_report( unsigned long long win_ns )
                 if (!p50 && seen * 2 >= total) p50 = i2 ? (1u << (i2 - 1)) : 0;
                 if (!p90 && seen * 10 >= total * 9) { p90 = i2 ? (1u << (i2 - 1)) : 0; break; }
             }
+            /* ml1100: `probe' is what separates "the controller decided not to spin"
+             * from "the controller can no longer decide anything" — see the probe
+             * note in sync.c. hit=0 miss=0 probe=0 now means OFF by configuration. */
             len = snprintf( line, sizeof(line),
-                            "[frame]   handoff: spin hit=%u miss=%u credit=%d | parked=%u "
+                            "[frame]   handoff: spin hit=%u miss=%u probe=%u credit=%d | parked=%u "
                             "p50=%uus p90=%uus | us:",
-                            spin_hit, spin_miss, credit, total, p50, p90 );
+                            spin_hit, spin_miss, spin_probe, credit, total, p50, p90 );
             for (i2 = 0; i2 < 16 && len > 0 && len < (int)sizeof(line); i2++)
                 if (ph[i2])
                     len += snprintf( line + len, sizeof(line) - len, " %u=%u",
                                      i2 ? (1u << (i2 - 1)) : 0, ph[i2] );
             wine_log_write( "%s", line );
+        }
+    }
+
+    /* ml1100: the third [frame] line — where the presenting thread's `srv=' went.
+     * Top three sites by TIME, drained and zeroed here. `obj=' is the first handle
+     * and resolves against [wait-census], which prints handle, object pointer, type
+     * and fastsync cell for every blocked waiter. `n=' with `tmo=' equal to it is a
+     * poll loop; `n=' near the frame count with a large mean is a real dependency. */
+    {
+        unsigned long long tot = 0;
+        char line[512];
+        int len, i2, k, printed = 0;
+
+        for (i2 = 0; i2 < IOS_FRAME_SRVSITE_N; i2++) tot += ios_frame_srvsite[i2].ns;
+        if (tot)
+        {
+            len = snprintf( line, sizeof(line), "[frame]   srv-sites:" );
+            for (k = 0; k < 3; k++)
+            {
+                int best = -1;
+
+                for (i2 = 0; i2 < IOS_FRAME_SRVSITE_N; i2++)
+                    if (ios_frame_srvsite[i2].n &&
+                        (best < 0 || ios_frame_srvsite[i2].ns > ios_frame_srvsite[best].ns))
+                        best = i2;
+                if (best < 0) break;
+                if (len > 0 && len < (int)sizeof(line))
+                    len += snprintf( line + len, sizeof(line) - len,
+                                     " #%d %s %s obj=%08x n=%u tmo=%u %llums(mean %lluus) pc=%p |",
+                                     k + 1,
+                                     ios_frame_srvsite[best].nobj > 1 ? "waitN" : "wait1",
+                                     ios_frame_srvsite[best].tclass == 0 ? "inf" :
+                                     ios_frame_srvsite[best].tclass == 1 ? "fin" : "poll",
+                                     ios_frame_srvsite[best].handle, ios_frame_srvsite[best].n,
+                                     ios_frame_srvsite[best].tmo,
+                                     ios_frame_srvsite[best].ns / 1000000ull,
+                                     ios_frame_srvsite[best].ns / ios_frame_srvsite[best].n / 1000ull,
+                                     ios_frame_srvsite[best].pc );
+                ios_frame_srvsite[best].ns = 0;   /* so the next pass finds the next one */
+                ios_frame_srvsite[best].n = 0;
+                printed = 1;
+            }
+            if (printed)
+                wine_log_write( "%s total=%llums", line, tot / 1000000ull );
+            memset( ios_frame_srvsite, 0, sizeof(ios_frame_srvsite) );
         }
     }
 }
@@ -897,6 +1007,8 @@ void ios_frame_report( unsigned long long win_ns )
 #include <mach/mach_time.h>
 #include "ios_srv_stats.h"
 #include "ios_spin_hist.h"
+#include "ios_fastsync.h"     /* ml1110: MADEIRA_CELL_KIND_* for [late-wake] */
+#include "ios_late_wake.h"
 #include "server_req_names.h"
 
 /* MADEIRA_SRV_STATS=0 turns the accounting off entirely (both timer reads
@@ -1356,6 +1468,48 @@ static void ios_srv_stats_report( unsigned long long now )
                         nt[IOS_FS_SEM_WAIT], fs_total[9],
                         nt[IOS_NT_RELEASE_SEM] );
 
+        /* ml1110: THE LATE-WAKE CENSUS.  See build/ntdll-unix/shims/ios_late_wake.h.
+         *
+         * `tmo_fin=' above says how many finite waits bought nothing but a
+         * STATUS_TIMEOUT; it cannot say whether the object was signalled when
+         * the timer fired, and that single bit is the difference between "the
+         * program asked for a poll and got one" and "a hand-off is being
+         * delivered by a timer".  This block answers it, with the age of the
+         * token so an honest race (a few microseconds) is not read as a lost
+         * wake (hundreds, or milliseconds). */
+        {
+            struct ios_late_snapshot lw;
+            unsigned int i;
+
+            madeira_late_wake_snapshot( &lw );
+            if (lw.tmo_fin || lw.hb || lw.rescued)
+            {
+                wine_log_write( "[late-wake] ml1110 %llums: tmo_fin=%u late=%u (sem=%u event=%u "
+                                "no-stamp=%u) age p50=%uus p90=%uus | heartbeat: expiries=%u "
+                                "late=%u rescued=%u",
+                                window_ns / 1000000ull, lw.tmo_fin,
+                                lw.late_sem + lw.late_event, lw.late_sem, lw.late_event,
+                                lw.nostamp, lw.age_p50, lw.age_p90,
+                                lw.hb, lw.hb_late, lw.rescued );
+
+                if (lw.late_sem + lw.late_event)
+                {
+                    len = snprintf( line, sizeof(line), "[late-wake]   age us:" );
+                    for (i = 0; i < IOS_LATE_AGE_N; i++)
+                        if (lw.age[i])
+                            IOS_SRV_APPEND( " %u=%u", i ? (1u << (i - 1)) : 0u, lw.age[i] );
+                    wine_log_write( "%s", line );
+                }
+
+                for (i = 0; i < IOS_LATE_HOT_N; i++)
+                    if (lw.hot[i].cell != 0xffffffffu && lw.hot[i].late)
+                        wine_log_write( "[late-wake]   #%u cell=%u obj=%s late=%u", i + 1,
+                                        lw.hot[i].cell,
+                                        lw.hot[i].kind == MADEIRA_CELL_KIND_SEM ? "sem" : "event",
+                                        lw.hot[i].late );
+            }
+        }
+
         /* ml982: the "auto" rule.  This reporter is the only thing in the image
          * that already knows the task's request rate, so the rule costs nothing
          * of its own.  A no-op unless MADEIRA_FASTSYNC=auto. */
@@ -1454,6 +1608,7 @@ void ios_perf_line( unsigned long long phys_mb, unsigned long long peak_mb,
         {
             extern struct _KUSER_SHARED_DATA *user_shared_data;
             unsigned long long usd_ms = 0;
+            unsigned int late_rescued = 0, late_total;
             /* The pointer starts life as the canonical 0x7ffe0000, which XNU's
              * 4 GB __PAGEZERO makes unreadable, and only becomes a real address
              * once virtual_alloc_first_teb() has run.  This reporter cannot run
@@ -1472,9 +1627,19 @@ void ios_perf_line( unsigned long long phys_mb, unsigned long long peak_mb,
              * lives in the wineserver archive, the same cross-archive direction
              * as madeira_sync_cells. */
             extern unsigned int madeira_lostwake_count;
-            wine_log_write( "[perf] rev=ml1060 phys=%lluMB(peak %llu, comp %llu) srv=%llu/s "
+            /* ml1110: `late' and `rescued' are the always-on half of the
+             * late-wake census (build/ntdll-unix/shims/ios_late_wake.h).  Both
+             * are RUNNING TOTALS here rather than window deltas, because the
+             * quiet build has no other reader and a delta that has to be
+             * differenced by hand across a log is not a number anybody reads.
+             * late>0 says some hand-off was delivered by a timer rather than
+             * by a wake; rescued>0 says this port's own heartbeat is what
+             * delivered it.  MADEIRA_DIAG=1 turns on [late-wake], which says
+             * WHICH object and how old the token was. */
+            late_total = madeira_late_wake_peek( &late_rescued );
+            wine_log_write( "[perf] rev=ml1110 phys=%lluMB(peak %llu, comp %llu) srv=%llu/s "
                             "fastsync hit=%u miss=%u peek=%u sem_rel=%u sem_wait=%u "
-                            "desync=%u lostwake=%u tick=%llums"
+                            "desync=%u lostwake=%u late=%u rescued=%u tick=%llums"
                             " - MADEIRA_DIAG=1 for the full reporters",
                             phys_mb, peak_mb, comp_mb,
                             (reqs - prev_reqs) * 1000000000ull / win_ns,
@@ -1482,6 +1647,7 @@ void ios_perf_line( unsigned long long phys_mb, unsigned long long peak_mb,
                             srel - prev_srel, swait - prev_swait,
                             desync - prev_desync,
                             __atomic_load_n( &madeira_lostwake_count, __ATOMIC_RELAXED ),
+                            late_total, late_rescued,
                             usd_ms );
         }
 
@@ -2314,10 +2480,27 @@ unsigned int server_wait( const union select_op *select_op, data_size_t size, UI
         if (is_presenter)
         {
             struct timespec tp;
+            unsigned long long ns;
             clock_gettime( CLOCK_MONOTONIC, &tp );
-            ios_frame_wait_add( IOS_FRAME_WAIT_SRV,
-                                (unsigned long long)((tp.tv_sec - t0.tv_sec) * 1000000000ll
-                                                     + (tp.tv_nsec - t0.tv_nsec)) );
+            ns = (unsigned long long)((tp.tv_sec - t0.tv_sec) * 1000000000ll
+                                      + (tp.tv_nsec - t0.tv_nsec));
+            ios_frame_wait_add( IOS_FRAME_WAIT_SRV, ns );
+            /* ml1100: and WHICH wait it was — see ios_frame_srv_site. Everything
+             * here is already in registers; nothing is queried. */
+            {
+                unsigned int nobj = 1, h0 = 0;
+                unsigned char tclass = !timeout ? 0 : (timeout->QuadPart ? 1 : 2);
+
+                if (select_op && size >= offsetof( union select_op, wait.handles ))
+                {
+                    nobj = (unsigned int)((size - offsetof( union select_op, wait.handles ))
+                                          / sizeof(obj_handle_t));
+                    if (!nobj) nobj = 1;
+                    else h0 = (unsigned int)select_op->wait.handles[0];
+                }
+                ios_frame_srv_site( __builtin_return_address(0), h0, nobj, tclass,
+                                    ns, ret == STATUS_TIMEOUT );
+            }
         }
 #ifdef WINE_IOS
         if (ret == STATUS_TIMEOUT)

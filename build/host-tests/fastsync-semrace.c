@@ -858,6 +858,298 @@ static int check_server_stress( int broken )
     return 0;
 }
 
+/* ========================================================================
+ * ml1110: THE TIMEOUT / RE-QUEUE CASE -- thread_timeout() vs a client release
+ * ========================================================================
+ *
+ * WHAT IS BEING MODELLED, AND WHY IT IS NOT THE CHECK ABOVE.
+ * check_server_stress() models waiters on an INFINITE server wait: the only
+ * thing that can end their wait is a wake.  Every hand-off in the device log
+ * this round was written against is ALERTABLE, and an alertable wait on this
+ * port is a chain of FINITE server waits -- the ml982/ml1060 heartbeat -- so
+ * the server's `thread_timeout()' runs on the hand-off path thousands of times
+ * a second.  Upstream that handler is allowed to end the wait without looking
+ * at the objects, because on a server that owns all the state "the timer fired"
+ * implies "nothing signalled it".  With a cell it does not: a client can CAS
+ * the count up and still be on its way to the server with the
+ * `release_semaphore( count = 0 )' that makes the server re-run its queue.
+ *
+ * The two orderings differ in ONE thing, inside the expiry handler:
+ *   recheck == 1 (shipping)  check_wait() first -- an available token beats
+ *                            the timer, which is the order every other entry
+ *                            into check_wait() already uses.
+ *   recheck == 0 (upstream)  end the wait, report STATUS_TIMEOUT, dequeue
+ *                            (srv_waiters--), and let the client re-select.
+ *
+ * NOTHING IS LOST EITHER WAY -- the token stays in the cell and the re-select
+ * collects it -- so, exactly as in check_server_stress(), conservation cannot
+ * distinguish them and the assertion has to be about WHO delivered the
+ * hand-off.  `late' counts hand-offs collected by the waiter's own re-select
+ * after it had already been told TIMEOUT.  The shipping ordering must produce
+ * none; the upstream ordering must produce some, or this check proves nothing.
+ */
+
+#define TQ_WAITERS      6
+#define TQ_WAIT_MS      4         /* the finite timeout under test          */
+#define TQ_RUN_MS    2000
+
+struct tq_entry
+{
+    int queued;
+    int satisfied;
+    pthread_cond_t cv;
+};
+
+static struct tq_entry       tqq[TQ_WAITERS];
+static pthread_mutex_t       tq_mtx = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic unsigned long tq_late, tq_direct, tq_timeouts, tq_rechecked;
+static int                   tq_recheck;
+
+/* wake_up( obj, 0 ) again, and it has to be the same walk: the caller holds
+ * tq_mtx because the wineserver is one thread. */
+static void tq_wake_up_unlimited( void )
+{
+    int again = 1;
+
+    while (again)
+    {
+        int i;
+
+        again = 0;
+        for (i = 0; i < TQ_WAITERS; i++)
+        {
+            if (!tqq[i].queued || tqq[i].satisfied) continue;
+            if (!server_take()) return;
+            tqq[i].satisfied = 1;
+            pthread_cond_signal( &tqq[i].cv );
+            again = 1;
+        }
+    }
+}
+
+static void *tq_releaser( void *arg )
+{
+    unsigned int s = 9001 + (unsigned int)(uintptr_t)arg;
+
+    while (!stop)
+    {
+        uint64_t sg;
+        int cur, notify;
+
+        /* NtReleaseSemaphore's client fast path, shipping ordering. */
+        for (;;)
+        {
+            sg = atomic_load_explicit( (_Atomic uint64_t *)&cell.sg, memory_order_seq_cst );
+            cur = MADEIRA_SG_STATE( sg );
+            if ((unsigned int)cur + 1u > cell.smax) break;
+            if (atomic_compare_exchange_strong_explicit(
+                    (_Atomic uint64_t *)&cell.sg, &sg, MADEIRA_SG( my_gen, cur + 1 ),
+                    memory_order_seq_cst, memory_order_seq_cst ))
+            {
+                atomic_fetch_add_explicit( &produced, 1, memory_order_relaxed );
+                atomic_fetch_add_explicit( &work, 1, memory_order_seq_cst );
+                break;
+            }
+        }
+        notify = atomic_load_explicit( (_Atomic int *)&cell.srv_waiters,
+                                       memory_order_seq_cst ) != 0;
+
+        /* THE WINDOW UNDER TEST, and it is the real one: the request has been
+         * decided on but has not reached the server yet, so a timer that is
+         * already due fires first.  Widening it is the same discipline the
+         * ordering test above uses -- the two runs differ in the handler and
+         * in nothing else. */
+        usleep( 1 + ((s = s * 1103515245u + 12345u) >> 20) % 6000u );
+
+        if (notify)
+        {
+            pthread_mutex_lock( &tq_mtx );
+            tq_wake_up_unlimited();
+            pthread_mutex_unlock( &tq_mtx );
+        }
+    }
+    return NULL;
+}
+
+static void *tq_waiter( void *arg )
+{
+    int idx = (int)(uintptr_t)arg;
+
+    while (!stop)
+    {
+        int got = 0, timed_out = 0, late = 0;
+        struct timespec ts;
+
+        pthread_mutex_lock( &tq_mtx );
+        atomic_fetch_add_explicit( (_Atomic int *)&cell.srv_waiters, 1, memory_order_seq_cst );
+        tqq[idx].queued = 1;
+        tqq[idx].satisfied = 0;
+        if (server_take()) { tqq[idx].satisfied = 1; got = 1; }
+
+        if (!got)
+        {
+            clock_gettime( CLOCK_REALTIME, &ts );
+            ts.tv_sec  += (time_t)(TQ_WAIT_MS / 1000);
+            ts.tv_nsec += (long)(TQ_WAIT_MS % 1000) * 1000000L;
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ts.tv_sec++; }
+            while (!tqq[idx].satisfied && !stop)
+            {
+                int r = pthread_cond_timedwait( &tqq[idx].cv, &tq_mtx, &ts );
+                if (r == ETIMEDOUT) { timed_out = 1; break; }
+                if (r && r != EINTR) break;
+            }
+            if (tqq[idx].satisfied) got = 1;
+            else if (timed_out)
+            {
+                /* ===== thread_timeout(), the two orderings =====
+                 *
+                 * `owed' is the whole measurement and it is taken HERE, under
+                 * the server lock, at the instant the handler runs -- not
+                 * afterwards from the client's re-select, which would also
+                 * catch tokens that legitimately arrived later and would make
+                 * the check flap.  A token in the cell at this instant is one
+                 * the client fast path put there before the timer fired, and
+                 * reporting STATUS_TIMEOUT over it is the defect. */
+                int st = MADEIRA_SG_STATE(
+                             atomic_load_explicit( (_Atomic uint64_t *)&cell.sg,
+                                                   memory_order_seq_cst ) );
+                int owed = madeira_cell_signalled( MADEIRA_CELL_KIND_SEM, 0, st );
+
+                if (tq_recheck && server_take())
+                {
+                    /* ml1110: check_wait() ran first and the token was there.
+                     * The wait is SATISFIED; no STATUS_TIMEOUT is produced and
+                     * the client never re-selects.  Nobody else can have taken
+                     * that token between the load and here: the other waiters
+                     * need this lock and a releaser only ever ADDS. */
+                    tqq[idx].satisfied = 1;
+                    got = 1;
+                    timed_out = 0;
+                    atomic_fetch_add_explicit( &tq_rechecked, 1, memory_order_relaxed );
+                }
+                else if (owed) late = 1;   /* told TIMEOUT over a live token */
+            }
+        }
+
+        tqq[idx].queued = 0;
+        tqq[idx].satisfied = 0;
+        atomic_fetch_sub_explicit( (_Atomic int *)&cell.srv_waiters, 1, memory_order_seq_cst );
+        pthread_mutex_unlock( &tq_mtx );
+
+        if (late) atomic_fetch_add_explicit( &tq_late, 1, memory_order_relaxed );
+
+        if (!got && timed_out)
+        {
+            /* The client got STATUS_TIMEOUT and re-selects at once, which is
+             * what an alertable wait's heartbeat does.  Nothing is lost -- the
+             * token is still in the cell -- but this whole round trip is the
+             * cost the re-check removes. */
+            atomic_fetch_add_explicit( &tq_timeouts, 1, memory_order_relaxed );
+            pthread_mutex_lock( &tq_mtx );
+            atomic_fetch_add_explicit( (_Atomic int *)&cell.srv_waiters, 1, memory_order_seq_cst );
+            if (server_take()) got = 1;
+            atomic_fetch_sub_explicit( (_Atomic int *)&cell.srv_waiters, 1, memory_order_seq_cst );
+            pthread_mutex_unlock( &tq_mtx );
+        }
+        if (got)
+        {
+            atomic_fetch_add_explicit( &consumed, 1, memory_order_relaxed );
+            if (atomic_fetch_sub_explicit( &work, 1, memory_order_seq_cst ) <= 0)
+                atomic_fetch_add_explicit( &no_work, 1, memory_order_relaxed );
+            atomic_fetch_add_explicit( &tq_direct, 1, memory_order_relaxed );
+        }
+    }
+    return NULL;
+}
+
+static int check_timeout_requeue( int recheck )
+{
+    pthread_t th[1 + TQ_WAITERS];
+    int i, n = 0;
+    long left;
+    unsigned long p, c, late;
+
+    my_gen = 23u;
+    tq_recheck = recheck;
+    cell_init( my_gen, 0, SEM_MAX );
+    atomic_store( &work, 0 ); atomic_store( &produced, 0 ); atomic_store( &consumed, 0 );
+    atomic_store( &no_work, 0 );
+    atomic_store( &tq_late, 0 ); atomic_store( &tq_direct, 0 );
+    atomic_store( &tq_timeouts, 0 ); atomic_store( &tq_rechecked, 0 );
+    for (i = 0; i < TQ_WAITERS; i++)
+    {
+        pthread_cond_init( &tqq[i].cv, NULL );
+        tqq[i].queued = tqq[i].satisfied = 0;
+    }
+    stop = 0;
+
+    pthread_create( &th[n++], NULL, tq_releaser, (void *)(uintptr_t)0 );
+    for (i = 0; i < TQ_WAITERS; i++)
+        pthread_create( &th[n++], NULL, tq_waiter, (void *)(uintptr_t)i );
+
+    usleep( TQ_RUN_MS * 1000 );
+    stop = 1;
+    for (i = 0; i < 400; i++)
+    {
+        int j;
+        pthread_mutex_lock( &tq_mtx );
+        for (j = 0; j < TQ_WAITERS; j++) pthread_cond_signal( &tqq[j].cv );
+        pthread_mutex_unlock( &tq_mtx );
+        usleep( 1000 );
+    }
+    for (i = 0; i < n; i++) pthread_join( th[i], NULL );
+
+    left = MADEIRA_SG_STATE( cell.sg );
+    p    = atomic_load( &produced );
+    c    = atomic_load( &consumed );
+    late = atomic_load( &tq_late );
+
+    printf( "MADEIRA-SEM[tmo,%s]: produced=%lu consumed=%lu left_in_cell=%ld "
+            "delivered=%lu by_recheck=%lu reported_timeouts=%lu LATE=%lu\n",
+            recheck ? "recheck" : "NO-RECHECK", p, c, left,
+            atomic_load( &tq_direct ), atomic_load( &tq_rechecked ),
+            atomic_load( &tq_timeouts ), late );
+
+    if ((unsigned long)left + c != p)
+    {
+        printf( "MADEIRA-SEM[tmo]: FAIL - consumed+left=%lu but produced=%lu\n",
+                (unsigned long)left + c, p );
+        return 86;
+    }
+    if (atomic_load( &no_work ))
+    {
+        printf( "MADEIRA-SEM[tmo]: FAIL - %lu waiters proceeded with no work behind the token\n",
+                atomic_load( &no_work ) );
+        return 87;
+    }
+    if (cell.srv_waiters || cell.waiters)
+    {
+        printf( "MADEIRA-SEM[tmo]: FAIL - waiters=%d srv_waiters=%d at rest\n",
+                cell.waiters, cell.srv_waiters );
+        return 87;
+    }
+    if (!p || !c)
+    {
+        printf( "MADEIRA-SEM[tmo]: FAIL - the stress produced nothing (p=%lu c=%lu)\n", p, c );
+        return 88;
+    }
+    if (recheck && late)
+    {
+        printf( "MADEIRA-SEM[tmo]: FAIL - %lu hand-offs were delivered by a timer although the"
+                " expiry handler re-checked the objects first\n", late );
+        return 89;
+    }
+    if (!recheck && !late)
+    {
+        printf( "MADEIRA-SEM[tmo]: FAIL - the NO-RECHECK control never delivered a hand-off by"
+                " a timer, so this check proves nothing about the other ordering\n" );
+        return 90;
+    }
+    printf( "MADEIRA-SEM[tmo,%s]: conservation, ledger and delivery-by-wake OK\n",
+            recheck ? "recheck" : "NO-RECHECK (timer-delivered, as designed)" );
+    return 0;
+}
+
 int main( void )
 {
     int rc, pass;
@@ -878,6 +1170,13 @@ int main( void )
     for (pass = 0; pass < 3; pass++)
         if ((rc = check_server_stress( 0 ))) return rc;
     if ((rc = check_server_stress( 1 ))) return rc;
+
+    /* ml1110: the expiry handler.  Three passes of the shipping ordering
+     * (LATE must be 0), then ONE of upstream's, which must deliver hand-offs
+     * by the timer -- otherwise the assertion above is decoration. */
+    for (pass = 0; pass < 3; pass++)
+        if ((rc = check_timeout_requeue( 1 ))) return rc;
+    if ((rc = check_timeout_requeue( 0 ))) return rc;
 
     printf( "MADEIRA-SEM: all checks passed\n" );
     return 0;

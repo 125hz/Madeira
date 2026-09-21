@@ -698,9 +698,17 @@ final class MetalBackedView: UIView {
     /// letterboxing/mapping against a stale or placeholder shape (MetalHostView
     /// seeds 800x600 at init, before any game has resized it).
     private func drawableAspect() -> CGSize {
+        // The drawable's shape means something only once this session has
+        // presented into it. Until then it is the 800x600 seed (or the last
+        // session's size), and a program that only ever shows ordinary windows
+        // was laid out 4:3 against a 16:9 guest — scaled unevenly on the two axes.
+        guard madeira_get_present_count() != Self.presentCountAtLaunch else { return .zero }
         let d = MetalHostView.shared.metalLayer.drawableSize
         return (d.width > 0 && d.height > 0) ? d : .zero
     }
+
+    /// Present counter value when the current session started — see drawableAspect().
+    static var presentCountAtLaunch: UInt64 = 0
 
     private func gameRect() -> CGRect {
         GameSurfaceLayout.rect(guest: guestSize(), aspect: drawableAspect(),
@@ -777,6 +785,14 @@ final class MetalBackedView: UIView {
         // its local bounds — see winios_overlay_relayout's doc comment in
         // Winios.h. No-op in desktop mode and whenever no such window exists.
         winios_overlay_relayout()
+        // ml1110 — the desktop-session twin of the two calls above. The
+        // compositor letterboxes the wine desktop inside its own frame against
+        // the guest resolution, and a guest-side ChangeDisplaySettings moves
+        // that mapping without moving the frame — which
+        // winios_set_compositor_frame deliberately cannot notice. This apply is
+        // already the reason="mode-changed" one, so it is the right trigger.
+        // No-op in a direct launch.
+        winios_compositor_relayout()
         let modeLabel = mode == effective ? mode.label : "\(effective.label)(req:\(mode.label))"
         fputs(String(format: "[display] apply reason=%@ mode=%@ guest=%.0fx%.0f drawable=%.0fx%.0f "
                     + "bounds=(%.0f,%.0f %.0fx%.0f) -> rect=(%.0f,%.0f %.0fx%.0f)\n",
@@ -911,6 +927,30 @@ final class MetalBackedView: UIView {
             winios_desktop_point_from_window(Double(w.x), Double(w.y), &px, &py)
             Self.cursor = CGPoint(x: CGFloat(px), y: CGFloat(py))   // keep the trackpad's cursor in step
             return (px, py)
+        }
+        // ml1110 — THE DIRECT-LAUNCH OVERLAY FIT, INVERTED EXACTLY.
+        //
+        // A direct launch has no window manager, so a top-level window larger
+        // than the guest desktop can never be moved back on screen; when one
+        // exists the GDI overlay maps the UNION of what it draws into the game
+        // rect with one uniform scale, centred (see winios_overlay_fit_source
+        // in Winios.h). That union is NOT the guest desktop, so the
+        // GameSurfaceLayout mapping below — which assumes it is — would put a
+        // tap somewhere the window is not. Same three numbers, same game rect
+        // `r` the overlay was placed against, run backwards. Clamped to the
+        // SOURCE rect rather than the desktop, because the guest pixels a tap
+        // on an oversized window lands on are legitimately outside it.
+        var fx = 0.0, fy = 0.0, fw = 0.0, fh = 0.0
+        if winios_overlay_fit_source(&fx, &fy, &fw, &fh) != 0, fw > 0, fh > 0 {
+            let r = gameRect()
+            let k = min(r.width / fw, r.height / fh)
+            if k > 0 {
+                let ox = r.minX + (r.width - fw * k) / 2
+                let oy = r.minY + (r.height - fh * k) / 2
+                let gx = min(max(fx + (p.x - ox) / k, fx), fx + fw - 1)
+                let gy = min(max(fy + (p.y - oy) / k, fy), fy + fh - 1)
+                return (Int32(gx), Int32(gy))
+            }
         }
         let guest = guestSize()
         let g = GameSurfaceLayout.map(point: p, guest: guest, aspect: drawableAspect(),
@@ -4226,6 +4266,7 @@ struct ContentView: View {
                     JoystickKeyView()
                     Group {
                         ControlKeyView(id: "portrait.enter", label: "⏎", kind: .tapKey(0x0D))
+                        ControlKeyView(id: "portrait.tab",   label: "Tab", kind: .tapKey(0x09))
                         ControlKeyView(id: "portrait.space", label: "␣", kind: .tapKey(0x20))
                         ControlKeyView(id: "portrait.esc",   label: "Esc", kind: .tapKey(0x1B))
                         // ml: modifiers, not taps — held for exactly as long as
@@ -4601,7 +4642,19 @@ struct ContentView: View {
                     // Known risk: if shellwindows_init beats services.exe's
                     // RPC_Init, OpenSCManager fails → watch whether that
                     // fails fast or hits the RaiseException→CS wedge again.
-                    let deskW = 960, deskH = 540
+                    // The desktop is the session's virtual monitor, not a size of its
+                    // own: runWineFullSequence re-derives the monitor from the view (or
+                    // Documents/madeira-screen.txt) AFTER this handler, so a fixed
+                    // 960x540 here made explorer program a mode smaller than the monitor
+                    // the compositor lays out against — a desktop drawn in the top-left
+                    // three quarters of its frame. (It went unnoticed while 960x540 was
+                    // missing from the mode list and the request was refused.)
+                    let screenKnob = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+                        .flatMap { try? String(contentsOf: $0.appendingPathComponent("madeira-screen.txt"),
+                                               encoding: .utf8) }
+                    let deskMode = GuestDisplay.configureSessionDefault(view: GuestDisplay.landscapeViewSize,
+                                                                        knob: screenKnob)
+                    let deskW = deskMode.w, deskH = deskMode.h
                     setenv("MADEIRA_EXE", "explorer.exe", 1)
                     setenv("MADEIRA_ARGS",
                            "/desktop=shell,\(deskW)x\(deskH) C:\\windows\\system32\\services.exe", 1)
@@ -5048,6 +5101,7 @@ struct ContentView: View {
             return
         }
         isLaunching = true
+        MetalBackedView.presentCountAtLaunch = madeira_get_present_count()
         // No program is running yet — a cursor a PREVIOUS session left
         // showing (or the stale builtin-fallback arrow a touch can create
         // even before any SetCursor — see winios_ensure_cursor_layer's doc

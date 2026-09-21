@@ -131,6 +131,12 @@ void ios_frame_gpu( unsigned long long gpu_ns, unsigned long long inflight );
  * predicate is inline and public. */
 void ios_frame_wait_add( enum ios_frame_wait kind, unsigned long long ns );
 
+/* ml1100: the presenting thread's server waits, attributed.  Called from the one
+ * site that already times them; `tclass' is 0 infinite / 1 finite / 2 poll.  The
+ * top three by time become the `[frame]   srv-sites:' line. */
+void ios_frame_srv_site( const void *pc, unsigned int handle, unsigned int nobj,
+                         unsigned char tclass, unsigned long long ns, int timed_out );
+
 /* Published from Swift through winemetal (only UIKit knows them) and from the
  * present thunk.  panel_hz = the display's maximum refresh; intent_hz = the
  * rate a CADisplayLink is currently asking for (0 = nothing armed); mode = the

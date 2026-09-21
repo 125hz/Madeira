@@ -828,11 +828,20 @@ BOOL winios_pProcessEvents(DWORD mask) {
      * this wine thread (valid TEB — the dump walks win32u internals). */
     static int desk = -1;
     if (desk < 0) desk = ({ const char *d = getenv("MADEIRA_DESKTOP"); d && *d == '1'; });
-    if (desk) {
-        static double next_tree_dump;
+    /* ml1110: the same dump, BOUNDED, in a direct launch. Log 90 could not say
+     * what the windows around a blank client area even were — [win-pos] drops
+     * children with an empty visible rect, and layers were created for three
+     * hwnds that appear in no other line in the file. Three dumps name every
+     * window, its style, its rects and its children once the overlay actually
+     * has something on screen; after that it goes quiet, so this stays a
+     * low-volume family rather than 30 lines every five seconds. */
+    static unsigned direct_dumps;
+    static double next_tree_dump;
+    if (desk || (direct_dumps < 3 && winios_overlay_window_count() > 0)) {
         double now = CACurrentMediaTime();
         if (now >= next_tree_dump) {
             next_tree_dump = now + 5.0;
+            if (!desk) direct_dumps++;
             winios_dump_window_tree();
         }
     }
@@ -969,26 +978,148 @@ static int winios_overlay_active(void);
 static CALayer *winios_ensure_window_host(void);
 static CGRect winios_overlay_layer_rect(int x, int y, int w, int h);
 static void winios_overlay_refresh_live(void);
+static CGRect winios_layer_rect(int x, int y, int w, int h);
+static void winios_overlay_recompute_fit(void);
+static int winios_overlay_map_px(CGFloat x, CGFloat y, CGPoint *out, CGSize *scale);
+static void winios_place_window_layer(NSNumber *key);
+static int winios_overlay_fit_active(void);
+static CGSize winios_game_rect_size(void);
+/* Implemented in IOSDisplayShim.m — the LIVE guest resolution, which a guest
+ * ChangeDisplaySettings really changes; see its doc comment there. Declared
+ * here as well as at its other use below because the compositor's own layout
+ * needs it, and that runs earlier in this file. */
+extern void winios_screen_size(int *w, int *h);
 
 static NSMutableDictionary<NSNumber *, CALayer *> *g_layers;
 static NSMutableDictionary<NSNumber *, NSValue *> *g_px_rects;  /* hwnd → last px rect */
 static NSMutableDictionary<NSNumber *, NSValue *> *g_surf_sizes; /* hwnd → surface px size */
+static NSMutableDictionary<NSNumber *, NSValue *> *g_surf_org;   /* hwnd → surface origin, window-local px */
 static NSMutableDictionary<NSNumber *, CAMetalLayer *> *g_metal_layers; /* hwnd → DXMT layer */
 static NSMutableDictionary<NSNumber *, NSValue *> *g_client_rects;      /* hwnd → client px rect */
 static void winios_place_metal_layer(NSNumber *key);
 
-/* Surfaces are 128px-aligned (win32u), usually LARGER than the window.
- * Crop the layer contents to the window's actual size or everything
- * stretches/squashes. Main thread only. */
-static void winios_apply_contents_rect(NSNumber *key, CALayer *l) {
+/* ml1110 — MADEIRA_SURFACE_EXACT=0 restores the pre-ml1110 placement (layer
+ * framed to the whole window, contents clamped to it) for a window whose
+ * surface does not cover it. Nothing else reads this. */
+static int winios_surface_exact(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("MADEIRA_SURFACE_EXACT");
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+/* ml1110 — WHERE A WINDOW'S BITS ACTUALLY ARE, IN GUEST PIXELS.
+ *
+ * win32u's get_surface_rect() does two things this file used to assume away:
+ * it rounds the surface out to a 128px grid (so it is usually LARGER than the
+ * window — the case the old contentsRect clamp existed for), and, for a window
+ * bigger than the virtual screen, it INTERSECTS the surface with that screen
+ * first ("some applications create huge windows"). The second case makes the
+ * surface SMALLER than the window: a 1286x1011 window on a 1280x720 desktop
+ * gets a 1280x768 surface. Clamping contentsRect to 1.0 then drew those
+ * 1280x768 bits across the full 1286x1011 window rect — a 1.32x vertical
+ * stretch, with the 243 rows win32u never allocated invented by the stretch.
+ *
+ * So compute the covered rect explicitly. `*cov` is the whole surface mapped
+ * into guest pixels (possibly hanging off the window); the return value is the
+ * part of it that is inside the window, which is what gets drawn. Empty return
+ * = nothing to show yet. */
+static CGRect winios_window_drawn_rect(NSNumber *key, CGRect *cov) {
     NSValue *sv = g_surf_sizes[key], *rv = g_px_rects[key];
-    if (!sv || !rv) return;
+    if (cov) *cov = CGRectZero;
+    if (!sv || !rv) return CGRectZero;
     CGSize surf = sv.CGSizeValue;
     CGRect px = rv.CGRectValue;
-    if (surf.width <= 0 || surf.height <= 0 || CGRectIsEmpty(px)) return;
-    l.contentsRect = CGRectMake(0, 0,
-                                MIN(px.size.width / surf.width, 1.0),
-                                MIN(px.size.height / surf.height, 1.0));
+    if (surf.width <= 0 || surf.height <= 0 || CGRectIsEmpty(px)) return CGRectZero;
+    CGPoint org = CGPointZero;
+    NSValue *ov = g_surf_org[key];
+    if (ov) { CGRect o = ov.CGRectValue; org = o.origin; }
+    CGRect c = CGRectMake(px.origin.x + org.x, px.origin.y + org.y, surf.width, surf.height);
+    if (cov) *cov = c;
+    CGRect drawn = CGRectIntersection(c, px);
+    return CGRectIsNull(drawn) ? CGRectZero : drawn;
+}
+
+/* ml1110 — THE APP SIDE OF "WHERE DID THAT WINDOW GO".
+ *
+ * win32u's [overlay-win]/[overlay-flush] lines say where a window is in GUEST
+ * pixels; this says where that became a rectangle on screen. Both halves are
+ * needed: a dialog drawn off the top-left corner is either a guest-side
+ * centring that read a zero screen (win32u's line is negative) or an overlay
+ * mapping that is wrong (win32u's line is sane and this one is not), and no
+ * log so far could tell those apart. First three placements per window, direct
+ * launch only, so it stays a low-volume family. */
+static void winios_log_placement(NSNumber *key, CGRect px, CGRect drawn, CALayer *l) {
+    if (!winios_overlay_active()) return;
+    static NSMutableDictionary<NSNumber *, NSNumber *> *seen;
+    if (!seen) seen = [NSMutableDictionary new];
+    unsigned n = seen[key].unsignedIntValue;
+    if (n >= 3) return;
+    seen[key] = @(n + 1);
+    CGRect f = l.frame, cr = l.contentsRect;
+    CGSize hb = winios_game_rect_size();
+    int gw = 0, gh = 0;
+    winios_screen_size(&gw, &gh);
+    fprintf(stderr, "[overlay-place] #%u hwnd=0x%llx guest-win={%.0f,%.0f %.0fx%.0f} "
+                    "drawn={%.0f,%.0f %.0fx%.0f} layer=(%.1f,%.1f %.1fx%.1f) "
+                    "contents=(%.3f,%.3f %.3fx%.3f) hidden=%d game-rect=%.0fx%.0f "
+                    "guest=%dx%d fit=%d rev=ml1110\n",
+            n + 1, key.unsignedLongLongValue,
+            px.origin.x, px.origin.y, px.size.width, px.size.height,
+            drawn.origin.x, drawn.origin.y, drawn.size.width, drawn.size.height,
+            f.origin.x, f.origin.y, f.size.width, f.size.height,
+            cr.origin.x, cr.origin.y, cr.size.width, cr.size.height,
+            (int)l.hidden, hb.width, hb.height, gw, gh, winios_overlay_fit_active());
+    fflush(stderr);
+}
+
+/* main thread only. Frames a window's layer and crops its contents so that
+ * every surface pixel lands on the guest pixel it belongs to — see
+ * winios_window_drawn_rect. Identical to the pre-ml1110 placement whenever the
+ * surface starts at window-local (0,0) and is at least as big as the window,
+ * which is every window that fits on the guest desktop. */
+static void winios_place_window_layer(NSNumber *key) {
+    CALayer *l = g_layers[key];
+    NSValue *rv = g_px_rects[key];
+    if (!l || !rv) return;
+    CGRect px = rv.CGRectValue;
+    NSValue *sv = g_surf_sizes[key];
+    if (!sv || !winios_surface_exact()) {
+        /* No bits yet (frame delivered before the first flush), or the knob is
+         * off: frame to the window and keep the old clamp. */
+        l.frame = winios_layer_rect((int)px.origin.x, (int)px.origin.y,
+                                    (int)px.size.width, (int)px.size.height);
+        if (sv && !CGRectIsEmpty(px)) {
+            CGSize surf = sv.CGSizeValue;
+            if (surf.width > 0 && surf.height > 0)
+                l.contentsRect = CGRectMake(0, 0, MIN(px.size.width / surf.width, 1.0),
+                                                  MIN(px.size.height / surf.height, 1.0));
+        }
+        return;
+    }
+    CGRect cov, drawn = winios_window_drawn_rect(key, &cov);
+    if (CGRectIsEmpty(drawn)) { l.frame = CGRectZero; return; }
+    l.frame = winios_layer_rect((int)drawn.origin.x, (int)drawn.origin.y,
+                                (int)drawn.size.width, (int)drawn.size.height);
+    l.contentsRect = CGRectMake((drawn.origin.x - cov.origin.x) / cov.size.width,
+                                (drawn.origin.y - cov.origin.y) / cov.size.height,
+                                drawn.size.width / cov.size.width,
+                                drawn.size.height / cov.size.height);
+    winios_log_placement(key, px, drawn, l);
+}
+
+/* Called from win32u (driver_ios.c) once per surface CREATION, on a wine
+ * thread — see winios_window_surface_rect's extern comment there. */
+void winios_window_surface_rect(HWND hwnd, int left, int top, int right, int bottom) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!g_surf_org) g_surf_org = [NSMutableDictionary new];
+        NSNumber *key = @((uintptr_t)hwnd);
+        g_surf_org[key] = [NSValue valueWithCGRect:CGRectMake(left, top,
+                                                              right - left, bottom - top)];
+        if (g_layers[key]) winios_place_window_layer(key);
+    });
 }
 static UIView *g_compositor_view;
 static CALayer *g_desk_bg;               /* teal desktop-area backdrop */
@@ -1014,8 +1145,17 @@ static void winios_layout_compositor(void) {
     CGRect frame = g_comp_frame_set ? g_comp_frame : (win ? win.bounds : g_compositor_view.frame);
     g_compositor_view.frame = frame;
 
-    const char *dw = getenv("MADEIRA_SCREEN_W"), *dh = getenv("MADEIRA_SCREEN_H");
-    int desk_w = dw ? atoi(dw) : 1024, desk_h = dh ? atoi(dh) : 768;
+    /* ml1110: the LIVE guest size, not MADEIRA_SCREEN_W/H. That environment
+     * pair is the session's launch-time SEED; win32u owns the value afterwards
+     * and publishes every change through winios_display_mode_changed (see
+     * IOSDisplayShim.m). Reading the seed here meant that a desktop session
+     * whose shell — or any program in it — programmed a different mode kept
+     * letterboxing against the OLD size: the wine desktop was then drawn into a
+     * sub-rectangle of its own frame, with the taskbar and every window layer
+     * placed by a scale nothing else in the app agreed with, and the touch
+     * mapping below (winios_desktop_point_from_window) off by the same factor. */
+    int desk_w = 0, desk_h = 0;
+    winios_screen_size(&desk_w, &desk_h);
     if (desk_w <= 0) desk_w = 1024;
     if (desk_h <= 0) desk_h = 768;
     CGFloat s = MIN(frame.size.width / desk_w, frame.size.height / desk_h);
@@ -1027,10 +1167,7 @@ static void winios_layout_compositor(void) {
 
     /* re-place existing window layers under the new mapping */
     for (NSNumber *key in g_px_rects) {
-        CALayer *l = g_layers[key];
-        CGRect r = g_px_rects[key].CGRectValue;
-        if (l) l.frame = winios_layer_rect((int)r.origin.x, (int)r.origin.y,
-                                           (int)r.size.width, (int)r.size.height);
+        winios_place_window_layer(key);
         winios_place_metal_layer(key);
     }
     fprintf(stderr, "[winios] compositor layout: frame=(%.0f,%.0f %.0fx%.0f) desk=%dx%d px_to_pt=%.3f\n",
@@ -1049,6 +1186,17 @@ void winios_set_compositor_frame(double x, double y, double w, double h) {
         g_comp_frame = f;
         g_comp_frame_set = YES;
         winios_layout_compositor();
+    });
+}
+
+/* ml1110 — see Winios.h. The desktop-mode twin of winios_overlay_relayout /
+ * winios_cursor_relayout, called from the same place in Swift: the compositor
+ * letterboxes the guest desktop inside its frame, and a GUEST mode change
+ * moves that mapping without moving the frame — so winios_set_compositor_frame
+ * (which deliberately skips a no-op frame) can never notice it. */
+void winios_compositor_relayout(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (g_compositor_view) winios_layout_compositor();
     });
 }
 
@@ -1117,6 +1265,8 @@ static void winios_remove_layer(HWND hwnd) {
             [l removeFromSuperlayer];
             [g_layers removeObjectForKey:key];
             [g_px_rects removeObjectForKey:key];
+            [g_surf_sizes removeObjectForKey:key];
+            [g_surf_org removeObjectForKey:key];
             /* Direct launch: the last window going away is what retires the
              * overlay, so the live count and the teardown are decided in one
              * place. No-op in desktop mode. */
@@ -1154,9 +1304,15 @@ static void winios_place_metal_layer(NSNumber *key) {
     NSValue *wv = g_px_rects[key], *cv = g_client_rects[key];
     if (!wv || !cv) return;
     CGRect w = wv.CGRectValue, c = cv.CGRectValue;
+    /* ml1110: the window layer is framed to the part of the window its surface
+     * actually covers — the whole window unless get_surface_rect() cropped it
+     * (winios_window_drawn_rect) — so the sublayer's offset is measured from
+     * THAT origin, not the window's. Identical whenever nothing was cropped. */
+    CGRect drawn = winios_window_drawn_rect(key, NULL);
+    CGPoint org = (winios_surface_exact() && !CGRectIsEmpty(drawn)) ? drawn.origin : w.origin;
     CGFloat s = g_px_to_pt;
-    ml.frame = CGRectMake((c.origin.x - w.origin.x) * s,
-                          (c.origin.y - w.origin.y) * s,
+    ml.frame = CGRectMake((c.origin.x - org.x) * s,
+                          (c.origin.y - org.y) * s,
                           c.size.width * s, c.size.height * s);
 }
 
@@ -1209,9 +1365,8 @@ void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
         g_client_rects[key] = [NSValue valueWithCGRect:CGRectMake(cx, cy, cw, ch)];
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
-        l.frame = winios_layer_rect(x, y, w, h);
         l.hidden = !visible;
-        winios_apply_contents_rect(key, l);
+        winios_place_window_layer(key);
         winios_place_metal_layer(key);
         [CATransaction commit];
         /* A window being shown or hidden changes how many overlay windows are
@@ -1573,13 +1728,20 @@ void winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
         if (img) {
             NSNumber *key = @((uintptr_t)hwnd);
             l.contents = (__bridge id)img;
-            g_surf_sizes[key] = [NSValue valueWithCGSize:CGSizeMake(sw, sh)];
-            if (CGRectIsEmpty(l.frame)) {
+            NSValue *old = g_surf_sizes[key];
+            CGSize now = CGSizeMake(sw, sh);
+            int grew = !old || !CGSizeEqualToSize(old.CGSizeValue, now);
+            g_surf_sizes[key] = [NSValue valueWithCGSize:now];
+            if (!g_px_rects[key] || CGRectIsEmpty(g_px_rects[key].CGRectValue)) {
                 /* frame not delivered yet — place at surface size */
                 g_px_rects[key] = [NSValue valueWithCGRect:CGRectMake(0, 0, sw, sh)];
-                l.frame = winios_layer_rect(0, 0, sw, sh);
+                grew = 1;
             }
-            winios_apply_contents_rect(key, l);
+            winios_place_window_layer(key);
+            /* ml1110: a window's DRAWN extent is only known once its bits have
+             * arrived, and that extent is what the direct-launch fit scales by.
+             * Only on a CHANGE — this runs on every flush. */
+            if (grew) winios_overlay_refresh_live();
             CGImageRelease(img);
         }
         CGDataProviderRelease(dp);
@@ -1813,35 +1975,36 @@ static void winios_cursor_place(void) {
      * for why g_game_layer's own bounds ARE the current game rect and no
      * window-coordinate offset belongs here (these are LOCAL sublayer
      * coordinates, origin at the layer's own top-left). */
-    int gw = 0, gh = 0;
-    winios_screen_size(&gw, &gh);
-    if (gw <= 0) gw = 1024;
-    if (gh <= 0) gh = 768;
     /* ml1090: the PUBLISHED game rect, not g_game_layer.bounds — see
      * winios_game_rect_size. Before the first Present the layer's bounds are
-     * not the rect Swift laid out. */
-    CGSize hb = winios_game_rect_size();
-    if (hb.width <= 0 || hb.height <= 0) return;
-    CGFloat sx = hb.width / gw, sy = hb.height / gh;
-    /* Cursor GLYPH never shrinks past 1x (spec) even when sx/sy < 1 on a
-     * small live-view column, but the drawn POSITION still uses the true,
-     * unclamped sx/sy — or the arrow would drift off its real hotspot as
+     * not the rect Swift laid out.
+     * ml1110: and the mapping itself now comes from winios_overlay_map_px, the
+     * one the overlay's window layers use — so when an oversized window has
+     * shrunk the overlay to fit, the arrow shrinks and moves with it instead of
+     * pointing at a window that is no longer under it. */
+    CGPoint pos;
+    CGSize s;
+    CGFloat x = g_cursor_pos_px.x, y = g_cursor_pos_px.y;
+    if (!winios_overlay_map_px(x - (g_cur_w > 0 ? g_cur_hx : 0),
+                               y - (g_cur_w > 0 ? g_cur_hy : 0), &pos, &s)) return;
+    /* Cursor GLYPH never shrinks past 1x (spec) even when the scale is < 1 on
+     * a small live-view column, but the drawn POSITION still uses the true,
+     * unclamped scale — or the arrow would drift off its real hotspot as
      * the gap between "where it should be" and "how big it is drawn"
      * grows. A few points of hotspot slop on a heavily shrunk view is the
      * accepted trade for the glyph staying visible at all. */
-    CGFloat imgScale = MAX(1.0, MIN(sx, sy));
-    CGFloat x = g_cursor_pos_px.x, y = g_cursor_pos_px.y;
     if (g_cur_w > 0) {
+        CGFloat imgScale = MAX(1.0, MIN(s.width, s.height));
         g_cursor_layer.bounds = CGRectMake(0, 0, g_cur_w * imgScale, g_cur_h * imgScale);
-        g_cursor_layer.position = CGPointMake((x - g_cur_hx) * sx, (y - g_cur_hy) * sy);
-    } else {
-        g_cursor_layer.position = CGPointMake(x * sx, y * sy);
     }
+    g_cursor_layer.position = pos;
 }
 
 int winios_desktop_point_from_window(double wx, double wy, int *px, int *py) {
-    const char *dw = getenv("MADEIRA_SCREEN_W"), *dh = getenv("MADEIRA_SCREEN_H");
-    int desk_w = dw ? atoi(dw) : 1024, desk_h = dh ? atoi(dh) : 768;
+    /* ml1110: the LIVE guest size — same reasoning as winios_layout_compositor,
+     * and they MUST agree or a touch lands somewhere the desktop is not. */
+    int desk_w = 0, desk_h = 0;
+    winios_screen_size(&desk_w, &desk_h);
     if (desk_w <= 0) desk_w = 1024;
     if (desk_h <= 0) desk_h = 768;
     if (!g_compositor_view || g_px_to_pt <= 0) { if (px) *px = 0; if (py) *py = 0; return 0; }
@@ -1947,6 +2110,25 @@ void winios_cursor_show(int show) {
 static void winios_cursor_note_gdi_windows(unsigned n) {
     if (winios_cursor_desktop_mode()) return;
     g_cursor_gdi_windows = n;
+    /* ml1100 — SAY SO. Log 85 contains no `[winios] cursor` line at all, and
+     * that was read as "the pointer never appeared". It is not evidence of
+     * anything: the only cursor line this file ever printed came from
+     * winios_drv_set_cursor (driver_ios.c), which needs a WM_SETCURSOR the
+     * program cannot send while nothing it owns is under the pointer — the
+     * exact case this hand-off exists to cover. A path whose whole purpose is
+     * to run when the other one cannot must not be the silent one. */
+    {
+        static unsigned last = (unsigned)-1;
+        if (n != last) {
+            last = n;
+            fprintf(stderr, "[winios] cursor ml1100 gdi-windows=%u host=%p layer=%p drv-show=%d "
+                            "pos=(%.0f,%.0f)%s\n",
+                    n, winios_cursor_host_layer(), g_cursor_layer, g_cursor_drv_show,
+                    g_cursor_pos_px.x, g_cursor_pos_px.y,
+                    winios_cursor_host_layer() ? "" : " — NO HOST LAYER YET, nothing can be drawn");
+            fflush(stderr);
+        }
+    }
     if (!n) { winios_cursor_apply_visibility(); return; }
     if (!g_cursor_pos_seeded) {
         int gw = 0, gh = 0;
@@ -2125,6 +2307,13 @@ void winios_overlay_note_metal_hwnd(void *hwnd) {
     }
 }
 
+/* ml1110 — "is a Metal layer presenting". Registration happens once per
+ * swapchain (winios_overlay_note_metal_hwnd above), and the slots fill in
+ * order, so slot 0 alone answers it. */
+static int winios_overlay_metal_live(void) {
+    return atomic_load(&g_metal_hwnds[0]) != 0;
+}
+
 int winios_overlay_skip_hwnd(void *hwnd) {
     uintptr_t v = (uintptr_t)hwnd;
     if (!v || !winios_overlay_active()) return 0;
@@ -2140,6 +2329,119 @@ unsigned winios_overlay_window_count(void) {
     return atomic_load(&g_overlay_live);
 }
 
+/* ml1110 — A WINDOW BIGGER THAN THE GUEST DESKTOP, WITH NO WAY TO MOVE IT.
+ *
+ * In a desktop session an oversized window is a nuisance: the user drags it, or
+ * the taskbar gets them back to it. A DIRECT launch has no window manager, no
+ * title-bar drag that goes anywhere useful and no keyboard Alt+Space — whatever
+ * hangs off the guest desktop is simply unreachable forever. Programs do size
+ * themselves past the screen (a 1286x1011 window on a 1280x720 desktop is what
+ * prompted this), and nothing else in the pipeline can recover it.
+ *
+ * So when the union of what the overlay actually draws is larger than the guest
+ * desktop, map that UNION into the game rect instead of the desktop: one
+ * uniform scale (aspect preserved — a non-uniform fit would shear every window
+ * and break the touch inverse), centred, and never magnifying, because the
+ * union always contains the desktop rect. When nothing overflows, the union IS
+ * the desktop rect and the mapping is byte-for-byte what it was before — the
+ * per-axis sx/sy of the ml1090 mapping, not a uniform scale, so Stretch mode
+ * keeps stretching exactly as it did.
+ *
+ * Gated on "no Metal layer is presenting": once a swapchain exists, the game
+ * image owns the game rect and its scale is DXMT's, so shrinking the overlay
+ * under it would put every GDI window in a coordinate system the presented
+ * frame does not share. MADEIRA_OVERLAY_FIT=0 disables the whole thing.
+ *
+ * Swift's touch mapping reads the same three numbers back through
+ * winios_overlay_fit_source() and inverts them, which is what keeps
+ * MetalBackedView.mapPoint an exact inverse of this. */
+static CGRect g_fit_src;        /* guest px: the rect that maps onto the game rect */
+static CGFloat g_fit_scale;     /* guest px -> points, uniform, fit only */
+static CGPoint g_fit_org;       /* game-rect points: where g_fit_src's top-left lands */
+static int g_fit_active;
+
+static int winios_overlay_fit_active(void) { return g_fit_active; }
+
+static int winios_overlay_fit_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("MADEIRA_OVERLAY_FIT");
+        on = !(e && *e == '0');
+        if (!on) {
+            fprintf(stderr, "[overlay] fit disabled by MADEIRA_OVERLAY_FIT=0 — a window larger "
+                            "than the guest desktop will hang off the game rect\n");
+            fflush(stderr);
+        }
+    }
+    return on;
+}
+
+/* main thread only. Recomputes the guest->overlay mapping from the windows
+ * currently on screen. Cheap: a handful of dictionary entries, run only when a
+ * window appears, moves, is hidden or first delivers its bits. */
+static void winios_overlay_recompute_fit(void) {
+    int gw = 0, gh = 0;
+    winios_screen_size(&gw, &gh);
+    if (gw <= 0) gw = 1024;
+    if (gh <= 0) gh = 768;
+    CGRect desk = CGRectMake(0, 0, gw, gh), src = desk;
+
+    if (winios_overlay_fit_enabled() && !winios_overlay_metal_live()) {
+        for (NSNumber *key in g_px_rects) {
+            CALayer *l = g_layers[key];
+            if (!l || l.hidden) continue;
+            /* Only a window that OWNS a surface has an extent worth reserving
+             * room for: a child paints into an ancestor's bits and is already
+             * inside it, and a window that has never flushed has nothing to
+             * show yet. winios_window_drawn_rect is empty for both, and it is
+             * the DRAWN rect rather than the window rect deliberately — the
+             * rows win32u cropped away have no bits and reserving screen space
+             * for them would shrink everything else for a blank strip. */
+            CGRect drawn = winios_window_drawn_rect(key, NULL);
+            if (CGRectIsEmpty(drawn)) continue;
+            src = CGRectUnion(src, drawn);
+        }
+    }
+
+    CGSize hb = winios_game_rect_size();
+    int active = !CGRectEqualToRect(src, desk) && hb.width > 0 && hb.height > 0;
+    CGFloat k = active ? MIN(hb.width / src.size.width, hb.height / src.size.height) : 0;
+    CGPoint org = active ? CGPointMake((hb.width - src.size.width * k) / 2,
+                                       (hb.height - src.size.height * k) / 2)
+                         : CGPointZero;
+
+    if (active == g_fit_active && CGRectEqualToRect(src, g_fit_src)
+        && k == g_fit_scale && CGPointEqualToPoint(org, g_fit_org)) return;
+    g_fit_src = src;
+    g_fit_scale = k;
+    g_fit_org = org;
+    g_fit_active = active;
+    fprintf(stderr, "[overlay] fit %s src={%.0f,%.0f %.0fx%.0f} desktop=%dx%d "
+                    "game-rect=%.0fx%.0f scale=%.4f origin=(%.1f,%.1f)\n",
+            active ? "ON" : "off (windows fit the guest desktop)",
+            src.origin.x, src.origin.y, src.size.width, src.size.height,
+            gw, gh, hb.width, hb.height, (double)k, org.x, org.y);
+    fflush(stderr);
+
+    /* Every window layer (and the cursor) is placed through this mapping. */
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    for (NSNumber *key in g_px_rects) winios_place_window_layer(key);
+    [CATransaction commit];
+    winios_cursor_relayout();
+}
+
+/* See Winios.h. Reports the guest-pixel rect the overlay currently maps onto
+ * the game rect, so Swift can invert exactly this transform for a touch. */
+int winios_overlay_fit_source(double *x, double *y, double *w, double *h) {
+    if (!g_fit_active) return 0;
+    if (x) *x = g_fit_src.origin.x;
+    if (y) *y = g_fit_src.origin.y;
+    if (w) *w = g_fit_src.size.width;
+    if (h) *h = g_fit_src.size.height;
+    return 1;
+}
+
 /* Guest pixel rect -> the overlay's own (game-layer-local) coordinate space.
  * The two numbers are the same ones winios_cursor_place reads, and for the
  * same reasons its doc comment gives: g_game_layer.bounds IS the current game
@@ -2151,8 +2453,35 @@ static CGRect winios_overlay_layer_rect(int x, int y, int w, int h) {
     if (gw <= 0) gw = 1024;
     if (gh <= 0) gh = 768;
     CGSize hb = winios_game_rect_size();   /* ml1090 — published rect first */
+    if (g_fit_active && g_fit_scale > 0) {  /* ml1110 — see g_fit_src above */
+        CGFloat k = g_fit_scale;
+        return CGRectMake(g_fit_org.x + (x - g_fit_src.origin.x) * k,
+                          g_fit_org.y + (y - g_fit_src.origin.y) * k, w * k, h * k);
+    }
     CGFloat sx = hb.width / gw, sy = hb.height / gh;
     return CGRectMake(x * sx, y * sy, w * sx, h * sy);
+}
+
+/* ml1110 — the same mapping for a POINT, for the drawn cursor. Returns 0 when
+ * there is no usable game rect yet (the caller then leaves the cursor alone).
+ * `*scale` is the per-axis scale the caller sizes its glyph by. */
+static int winios_overlay_map_px(CGFloat x, CGFloat y, CGPoint *out, CGSize *scale) {
+    int gw = 0, gh = 0;
+    winios_screen_size(&gw, &gh);
+    if (gw <= 0) gw = 1024;
+    if (gh <= 0) gh = 768;
+    CGSize hb = winios_game_rect_size();
+    if (hb.width <= 0 || hb.height <= 0) return 0;
+    if (g_fit_active && g_fit_scale > 0) {
+        if (out) *out = CGPointMake(g_fit_org.x + (x - g_fit_src.origin.x) * g_fit_scale,
+                                    g_fit_org.y + (y - g_fit_src.origin.y) * g_fit_scale);
+        if (scale) *scale = CGSizeMake(g_fit_scale, g_fit_scale);
+        return 1;
+    }
+    CGFloat sx = hb.width / gw, sy = hb.height / gh;
+    if (out) *out = CGPointMake(x * sx, y * sy);
+    if (scale) *scale = CGSizeMake(sx, sy);
+    return 1;
 }
 
 /* main thread only */
@@ -2173,6 +2502,9 @@ static void winios_ensure_overlay(void) {
      * own bounds are not yet the laid-out rect before the first Present. */
     g_overlay.frame = (CGRect){ CGPointZero, winios_game_rect_size() };
     g_overlay.zPosition = 5000;    /* above the drawable, below the cursor's 10000 */
+    /* A program may size its window past the guest desktop; without this the
+     * window's layer is drawn outside the game rect, over the app's own controls. */
+    g_overlay.masksToBounds = YES;
     int gw = 0, gh = 0;
     winios_screen_size(&gw, &gh);
     [g_game_layer addSublayer:g_overlay];
@@ -2199,6 +2531,9 @@ static void winios_overlay_refresh_live(void) {
     /* ml1090: the same count is the direct-launch pointer's "is there anything
      * of ours on screen" signal — see winios_cursor_note_gdi_windows. */
     winios_cursor_note_gdi_windows(n);
+    /* ml1110: which windows are on screen, and how big, is exactly what the
+     * fit scales by — so this is the one place that decides all three. */
+    winios_overlay_recompute_fit();
     if (!g_overlay || g_layers.count) return;
     [g_overlay removeFromSuperlayer];
     g_overlay = nil;
@@ -2224,13 +2559,11 @@ void winios_overlay_relayout(void) {
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
         g_overlay.frame = (CGRect){ CGPointZero, winios_game_rect_size() };   /* ml1090 */
-        for (NSNumber *key in g_px_rects) {
-            CALayer *l = g_layers[key];
-            CGRect r = g_px_rects[key].CGRectValue;
-            if (l) l.frame = winios_overlay_layer_rect((int)r.origin.x, (int)r.origin.y,
-                                                       (int)r.size.width, (int)r.size.height);
-        }
+        for (NSNumber *key in g_px_rects) winios_place_window_layer(key);
         [CATransaction commit];
+        /* ml1110: the game rect just changed, and the fit is measured against
+         * it. Re-places the layers again only if the mapping actually moved. */
+        winios_overlay_recompute_fit();
     });
 }
 

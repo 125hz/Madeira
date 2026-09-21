@@ -8363,6 +8363,114 @@ static BOOL handle_syscall_fault( ucontext_t *context, EXCEPTION_RECORD *rec )
 }
 
 
+#ifdef WINE_IOS
+/**********************************************************************
+ *		ios_syscall_fault_enabled
+ *
+ * ml1120 kill switch.  MADEIRA_SYSCALL_FAULT=0 restores the pre-ml1120
+ * behaviour: a fault taken on the unix-side stack is dispatched as a guest
+ * exception instead of unwinding the syscall.
+ */
+static int ios_syscall_fault_enabled( void )
+{
+    static int v = -1;
+
+    if (v < 0)
+    {
+        const char *e = getenv( "MADEIRA_SYSCALL_FAULT" );
+        v = (e && e[0] == '0' && !e[1]) ? 0 : 1;
+    }
+    return v;
+}
+
+
+/**********************************************************************
+ *		ios_handle_unix_fault
+ *
+ * ml1120: THE UPSTREAM SYSCALL-FAULT PATH, FOR EVERY SIGNAL THAT CAN CARRY
+ * A UNIX-SIDE FAULT ON THIS PORT.
+ *
+ * When a guest program hands a system call a bad buffer, the unix side probes
+ * it (virtual_check_buffer_for_read/_for_write and friends) and the probe
+ * faults.  Upstream that fault lands in segv_handler, handle_syscall_fault()
+ * sees is_inside_syscall() and either longjmps back into the probe (so it
+ * returns FALSE) or unwinds the syscall so it RETURNS the exception code;
+ * WriteFile then fails with ERROR_NOACCESS and the program carries on.
+ *
+ * On Darwin/arm64 that fault is NOT a SIGSEGV.  A reserved-but-uncommitted
+ * page is a PROT_NONE mapping, so the abort is KERN_PROTECTION_FAILURE, which
+ * the kernel delivers as SIGBUS -- and bus_handler had no equivalent of
+ * handle_syscall_fault().  A probe fault inside NtWriteFile was therefore
+ * converted to an access violation (BUS->AV, correctly) and then DISPATCHED AS
+ * A GUEST EXCEPTION carrying the HOST pc and the HOST (kernel-stack) sp.  The
+ * PE side's is_valid_frame() rejects a frame outside Tib.StackLimit/StackBase,
+ * so call_seh_handlers printed "invalid frame", NtRaiseException printed
+ * "Exception frame is not in stack limits" and the whole pseudo-process was
+ * terminated with c0000005 -- for a bad pointer Windows answers with a failed
+ * WriteFile.
+ *
+ * Three cases, distinguished exactly as upstream distinguishes them and logged
+ * so the next device log says which one ran:
+ *   probe    - thread_data->jmp_buf is set: a __TRY probe helper is on the
+ *              stack, handle_syscall_fault() longjmps and the helper returns
+ *              failure.
+ *   syscall  - no jmp_buf: the syscall/unix call returns rec->ExceptionCode.
+ *   callback - a user callback is active (frame->prev_frame) AND the fault is
+ *              still on the kernel stack, i.e. the unix side of the callback
+ *              faulted.  A GUEST-side fault during a callback runs on the
+ *              guest stack, fails is_inside_syscall() and keeps taking the
+ *              ordinary guest-dispatch path, which is what it must do.
+ *
+ * Returns TRUE when the context has been rewritten and the handler must
+ * return immediately; FALSE when the caller should carry on to
+ * setup_exception() exactly as before.
+ */
+static BOOL ios_handle_unix_fault( ucontext_t *context, EXCEPTION_RECORD *rec )
+{
+    extern const char *ntdll_syscall_name( UINT id );
+    static unsigned long fault_n;
+    struct ntdll_thread_data *thread_data;
+    struct syscall_frame *frame;
+    const char *kind, *name, *rw;
+    char idbuf[24], stbuf[32];
+    unsigned long n;
+    ULONG_PTR addr;
+
+    /* ml483: a thread created directly by CEF/FEX has no TEB, and both
+     * get_syscall_frame() and is_inside_syscall() dereference it on their
+     * first statement.  Such a thread is never inside a wine syscall. */
+    if (!NtCurrentTeb()) return FALSE;
+    thread_data = ntdll_get_thread_data();
+    if (!thread_data->kernel_stack || !thread_data->syscall_frame) return FALSE;
+    if (!is_inside_syscall( SP_sig(context) )) return FALSE;
+
+    frame = get_syscall_frame();
+    kind = thread_data->jmp_buf ? "probe" : (frame->prev_frame ? "callback" : "syscall");
+    if (!(name = ntdll_syscall_name( frame->syscall_id )))
+    {
+        snprintf( idbuf, sizeof(idbuf), "%04x", (unsigned int)frame->syscall_id );
+        name = idbuf;
+    }
+    addr = rec->NumberParameters >= 2 ? rec->ExceptionInformation[1] : 0;
+    rw = rec->NumberParameters >= 2
+         ? (rec->ExceptionInformation[0] == EXCEPTION_EXECUTE_FAULT ? "exec" :
+            rec->ExceptionInformation[0] == EXCEPTION_WRITE_FAULT   ? "write" : "read")
+         : "n/a";
+
+    if (thread_data->jmp_buf) strcpy( stbuf, "probe-returns-FALSE" );
+    else snprintf( stbuf, sizeof(stbuf), "%08x", (unsigned int)rec->ExceptionCode );
+
+    n = ++fault_n;
+    if (n <= 8 || (n % 256) == 0)
+        dprintf( STDERR_FILENO,
+                 "[syscall-fault] ml1120 %s nt=%s addr=0x%llx rw=%s -> status=%s (#%lu)\n",
+                 kind, name, (unsigned long long)addr, rw, stbuf, n );
+
+    return handle_syscall_fault( context, rec );
+}
+#endif
+
+
 /**********************************************************************
  *		ios_fixup_x18_for_return
  *
@@ -10366,7 +10474,13 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 #endif
         return;
     }
+#ifdef WINE_IOS
+    /* ml1120: same decision as upstream, through the shared helper so the
+     * TEB-less-thread guard and the [syscall-fault] line cover every route. */
+    if (ios_handle_unix_fault( context, &rec ))
+#else
     if (handle_syscall_fault( context, &rec ))
+#endif
     {
 #ifdef WINE_IOS
         ios_fixup_x18_for_return( context );
@@ -10593,7 +10707,7 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *sigcontext )
      * "Exception frame is not in stack limits".  Upstream arm64 calls
      * handle_syscall_fault() only from segv_handler
      * (wine/dlls/ntdll/unix/signal_arm64.c:1075); it never traps in unix code. */
-    if (handle_syscall_fault( context, &rec ))
+    if (ios_handle_unix_fault( context, &rec ))   /* ml1120: shared helper */
     {
         ios_fixup_x18_for_return( context );
         return;
@@ -11908,6 +12022,21 @@ bus_fatal:
         rec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
     }
     ERR("BUS at pc=%p addr=%p exec=%d rev=ml345\n", pc, siginfo->si_addr, is_exec_fault);
+
+    /* ml1120: LAST, after every repair above has had its turn (x18 fixup,
+     * exec-fault redirect, dual-map store emulation, virtual_handle_fault's
+     * guard pages / write watches / commit-on-fault, [bus-reheal], [stale-src],
+     * SMC and the unaligned emulator all `return` before this point).  What is
+     * left is a genuine fault, and if it was taken on the unix-side stack it
+     * belongs to the syscall, not to the guest -- see ios_handle_unix_fault.
+     * Darwin routes the whole PROT_NONE family here rather than to
+     * segv_handler, which is why this was the missing half of the upstream
+     * path.  MADEIRA_SYSCALL_FAULT=0 restores the old (fatal) behaviour. */
+    if (ios_syscall_fault_enabled() && ios_handle_unix_fault( bus_ctx, &rec ))
+    {
+        ios_fixup_x18_for_return( bus_ctx );
+        return;
+    }
 #endif
     setup_exception( sigcontext, &rec );
 }
@@ -12064,6 +12193,16 @@ static void fpe_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         rec.ExceptionCode = EXCEPTION_FLT_INVALID_OPERATION;
         break;
     }
+#ifdef WINE_IOS
+    /* ml1120: an arithmetic trap taken on the unix-side stack is the syscall's,
+     * for the same reason a page fault there is -- the dispatch frame would be
+     * built on the kernel stack and rejected by is_valid_frame(). */
+    if (ios_handle_unix_fault( (ucontext_t *)sigcontext, &rec ))
+    {
+        ios_fixup_x18_for_return( (ucontext_t *)sigcontext );
+        return;
+    }
+#endif
     setup_exception( sigcontext, &rec );
 }
 

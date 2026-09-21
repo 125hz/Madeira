@@ -635,6 +635,181 @@ static unsigned long long ios_mono_ms( void )
     return (unsigned long long)tv.tv_sec * 1000ull + (unsigned long long)tv.tv_usec / 1000ull;
 }
 
+/* ml1100 [valloc]: WHAT ONE GUEST VirtualAlloc/VirtualFree ACTUALLY COSTS.
+ *
+ * The device session this was written for runs the cycle
+ * "VirtualAlloc(NULL, ~0xb0000, MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE) ...
+ * VirtualFree(p, 0, MEM_RELEASE)" about 3,400 times a second — that is what the
+ * 6.45 M `[iOS-xrem] via=aligned` notifications and the 5.95 M `[laa] ml1070
+ * low-half placement` lines are counting from the other side. It is Wine's heap
+ * sending every block above ~508 KB straight to NtAllocateVirtualMemory, and it
+ * is generic behaviour, not one program's.
+ *
+ * Every counter this port has says how MANY. None of them says how LONG, or how
+ * much of that is spent waiting for the one global virtual_mutex that also
+ * serialises every map, protect, query and fault-handler lookup in the process.
+ * Those two numbers point at different fixes — a cheaper placement search versus
+ * a narrower lock — and no log in this project's history can tell them apart, so
+ * the measurement ships first and the fix follows it.
+ *
+ * Cost: two clock reads and a handful of relaxed adds per call, on a path that
+ * already takes a process-wide mutex and at least one mmap. MADEIRA_VALLOC_STATS=0
+ * removes even that. */
+enum { IOS_VA_RESERVE, IOS_VA_RESCOMMIT, IOS_VA_COMMIT, IOS_VA_RESET,
+       IOS_VA_DECOMMIT, IOS_VA_RELEASE, IOS_VA_OTHER, IOS_VA_CLASSES };
+
+#define IOS_VA_HIST 24      /* log2 microseconds, 0 .. 8.4 s */
+#define IOS_VA_TOPSIZE 10
+
+static const char * const ios_va_class_name[IOS_VA_CLASSES] =
+    { "reserve", "res+commit", "commit", "reset", "decommit", "release", "other" };
+
+static struct {
+    unsigned long long n;
+    unsigned long long ns_in;       /* wall time inside the call */
+    unsigned long long ns_lock;     /* of which: waiting to enter virtual_mutex */
+    unsigned long long bytes;
+    unsigned int hist[IOS_VA_HIST]; /* log2(us) of ns_in */
+} ios_va_stat[IOS_VA_CLASSES];
+
+/* Most-frequent request sizes, so "top sizes" is an answer and not a guess.
+ * Slot 0..n-1 scanned linearly; a miss evicts the least-used slot. Racy by
+ * design — it is a popularity sketch, not a ledger. */
+static struct { unsigned long long size; unsigned long long n; } ios_va_topsize[IOS_VA_TOPSIZE];
+
+static int ios_valloc_stats( void )
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *e = getenv( "MADEIRA_VALLOC_STATS" );
+        cached = (e && e[0] == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
+static unsigned long long ios_va_now_ns( void )
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC_RAW, &ts );
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+
+static int ios_va_class( ULONG type, int freeing )
+{
+    if (freeing)
+    {
+        if (type & MEM_RELEASE) return IOS_VA_RELEASE;
+        if (type & MEM_DECOMMIT) return IOS_VA_DECOMMIT;
+        return IOS_VA_OTHER;
+    }
+    if (type & MEM_RESET) return IOS_VA_RESET;
+    if ((type & MEM_RESERVE) && (type & MEM_COMMIT)) return IOS_VA_RESCOMMIT;
+    if (type & MEM_RESERVE) return IOS_VA_RESERVE;
+    if (type & MEM_COMMIT) return IOS_VA_COMMIT;
+    return IOS_VA_OTHER;
+}
+
+/* p95 read off the log2 histogram: the bucket the 95th sample falls in,
+ * reported as that bucket's LOWER bound in microseconds, so the number is never
+ * an overstatement. */
+static unsigned long ios_va_p95_us( const unsigned int *hist )
+{
+    unsigned long long total = 0, seen = 0;
+    int i;
+    for (i = 0; i < IOS_VA_HIST; i++) total += hist[i];
+    if (!total) return 0;
+    for (i = 0; i < IOS_VA_HIST; i++)
+    {
+        seen += hist[i];
+        if (seen * 100 >= total * 95) return i ? (1ul << (i - 1)) : 0;
+    }
+    return 1ul << (IOS_VA_HIST - 1);
+}
+
+static void ios_va_account( int cls, unsigned long long ns_in, unsigned long long ns_lock,
+                            unsigned long long bytes )
+{
+    unsigned long long us = ns_in / 1000ull;
+    int b = 0, i, worst = 0;
+
+    if (us) b = 64 - __builtin_clzll( us );
+    if (b >= IOS_VA_HIST) b = IOS_VA_HIST - 1;
+
+    __atomic_fetch_add( &ios_va_stat[cls].n, 1ull, __ATOMIC_RELAXED );
+    __atomic_fetch_add( &ios_va_stat[cls].ns_in, ns_in, __ATOMIC_RELAXED );
+    __atomic_fetch_add( &ios_va_stat[cls].ns_lock, ns_lock, __ATOMIC_RELAXED );
+    __atomic_fetch_add( &ios_va_stat[cls].bytes, bytes, __ATOMIC_RELAXED );
+    __atomic_fetch_add( &ios_va_stat[cls].hist[b], 1u, __ATOMIC_RELAXED );
+
+    if (!bytes) return;
+    for (i = 0; i < IOS_VA_TOPSIZE; i++)
+    {
+        if (ios_va_topsize[i].size == bytes)
+        {
+            __atomic_fetch_add( &ios_va_topsize[i].n, 1ull, __ATOMIC_RELAXED );
+            return;
+        }
+        if (ios_va_topsize[i].n < ios_va_topsize[worst].n) worst = i;
+    }
+    ios_va_topsize[worst].size = bytes;
+    ios_va_topsize[worst].n = 1;
+}
+
+/* One line per ten seconds, always on, reported from whichever caller notices
+ * the window has elapsed — there is no timer thread on this path and the
+ * heartbeat thread runs at UTILITY, so it must not own a number this hot. */
+static void ios_va_report( unsigned long long now_ns )
+{
+    static unsigned long long next_ns;
+    static unsigned long long last_n[IOS_VA_CLASSES], last_ns_in[IOS_VA_CLASSES];
+    static unsigned long long last_ns_lock[IOS_VA_CLASSES], last_ns;
+    unsigned long long want = __atomic_load_n( &next_ns, __ATOMIC_RELAXED );
+    char line[768], sizes[256];
+    int len = 0, sl = 0, i;
+    unsigned long long window_ms;
+
+    if (!want)
+    {
+        /* Seed the baseline instead of measuring against the epoch. */
+        __atomic_compare_exchange_n( &next_ns, &want, now_ns + 10000000000ull, 0,
+                                     __ATOMIC_RELAXED, __ATOMIC_RELAXED );
+        return;
+    }
+    if (now_ns < want) return;
+    if (!__atomic_compare_exchange_n( &next_ns, &want, now_ns + 10000000000ull, 0,
+                                      __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
+        return;   /* another thread owns this window */
+
+    window_ms = last_ns ? (now_ns - last_ns) / 1000000ull : 10000ull;
+    last_ns = now_ns;
+    if (!window_ms) window_ms = 1;
+
+    len = snprintf( line, sizeof(line), "[valloc] ml1100 %llums:", window_ms );
+    for (i = 0; i < IOS_VA_CLASSES && len > 0 && len < (int)sizeof(line); i++)
+    {
+        unsigned long long n = __atomic_load_n( &ios_va_stat[i].n, __ATOMIC_RELAXED );
+        unsigned long long ns = __atomic_load_n( &ios_va_stat[i].ns_in, __ATOMIC_RELAXED );
+        unsigned long long lk = __atomic_load_n( &ios_va_stat[i].ns_lock, __ATOMIC_RELAXED );
+        unsigned long long dn = n - last_n[i], dns = ns - last_ns_in[i], dlk = lk - last_ns_lock[i];
+
+        last_n[i] = n; last_ns_in[i] = ns; last_ns_lock[i] = lk;
+        if (!dn) continue;
+        len += snprintf( line + len, sizeof(line) - len,
+                         " %s=%llu/%lluus(lock %lluus,p95 %luus)",
+                         ios_va_class_name[i], dn, dns / dn / 1000ull, dlk / dn / 1000ull,
+                         ios_va_p95_us( ios_va_stat[i].hist ) );
+    }
+    for (i = 0; i < IOS_VA_TOPSIZE && sl >= 0 && sl < (int)sizeof(sizes); i++)
+    {
+        unsigned long long sz = ios_va_topsize[i].size, c = ios_va_topsize[i].n;
+        if (!sz || c < 64) continue;
+        sl += snprintf( sizes + sl, sizeof(sizes) - sl, " 0x%llx=%llu", sz, c );
+    }
+    dprintf( 2, "%s | top sizes (cumulative):%s%s\n", line, sl ? sizes : " -",
+             " (mean us INSIDE the call; lock us is the wait to enter virtual_mutex)" );
+}
+
 /* ml960: the knob. Env first (that is how every other unix-side knob in this
  * file is spelled — MADEIRA_POOL_WARM, MADEIRA_POOL_MB); Documents file second,
  * so the census can be turned on ON DEVICE without an app rebuild.  WINEPREFIX's
@@ -2635,6 +2810,18 @@ static int ios_tail_half_mode(void)
     return cached;
 }
 
+/* ml1100: see the live-fit block in ios_tail_gen_cap(). */
+static int ios_tail_gen_livefit(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *e = getenv( "MADEIRA_POOL_GEN_LIVEFIT" );
+        cached = (e && e[0] == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
 /* Bytes the tail may reserve in total. Callers must treat 0 as "refuse". */
 static size_t ios_tail_budget(void)
 {
@@ -2650,12 +2837,19 @@ static size_t ios_tail_budget(void)
     return pool - head - margin;
 }
 
+static void ios_tail_free_census( unsigned *free_n, size_t *free_bytes, size_t *live_bytes );
+
+/* ml1100: the live-bytes high-water, which is what the cap is really sized
+ * against. Monotonic, written only from ios_tail_gen_cap() (once per code-buffer
+ * rotation, i.e. a few hundred times in a session), read without a lock. */
+static size_t ios_tail_live_hw;
+
 /* Largest single code buffer the tail will grant right now. */
 static size_t ios_tail_gen_cap(void)
 {
     enum { IOS_TAIL_GEN_MIN = 4u * 1024 * 1024, IOS_TAIL_GEN_MAX = 32u * 1024 * 1024,
-           IOS_TAIL_GENERATIONS = 16 };
-    size_t budget, cap;
+           IOS_TAIL_GENERATIONS = 16, IOS_TAIL_GEN_INFLIGHT = 4 };
+    size_t budget, cap, live = 0, headroom, want;
     static size_t forced;
     static int forced_done;
 
@@ -2677,6 +2871,45 @@ static size_t ios_tail_gen_cap(void)
     if (!budget) return IOS_TAIL_GEN_MIN;
 
     cap = budget / IOS_TAIL_GENERATIONS;
+
+    /* ml1100: SIZE THE CAP FROM THE MEASURED LIVE BYTES, NOT FROM A CARVE COUNT.
+     *
+     * The fixed divisor of 16 came from counting GENERATIONS — "w50 reported 6..14
+     * references at every swap" — and a count is the wrong unit, because it is not
+     * invariant in the thing being chosen. What pins tail space is a thread parked
+     * in a wine wait still holding its CurrentCodeBuffer, so the bytes pinned are
+     * (how long a thread can stay parked) x (how fast the JIT emits), and doubling
+     * the carve HALVES the number of carves that one park time spans. The byte
+     * total is therefore roughly the same at 16 MB and at 32 MB, while the count
+     * is not — which is why the count-based rule ratchets and this one converges.
+     *
+     * The device session that motivated this says so directly: budget 406 MB,
+     * cap = pow2_floor(406/16) = 16 MB, and FEX asked for 32 MB and was refused on
+     * EVERY one of ~298 rotations ("[jit-pool] tail CAP: refusing 0x2000000
+     * (cap 0x1000000 ...)" with tail_resv never above 0xe004000 = 224 MB against a
+     * 406 MB budget). The tail was less than half spent and the refusal was the
+     * constant, not the pressure. Each refusal halved FEX's buffer, which halved
+     * the time before the next rotation, which discarded every block in it — that
+     * is the recompile storm, and it is ours, not the program's.
+     *
+     * The rule: leave the measured live high-water alone and divide only what is
+     * left by the number of generations that can be IN FLIGHT (allocated but not
+     * yet pinned-and-counted) — four, which is two more than the swap itself needs.
+     * It can only RAISE the cap: the count-based value stays as a floor, so the
+     * worst case of a mis-measurement is exactly today's behaviour. The budget
+     * check at the reservation site is unchanged and still bounds total tail use,
+     * and the CodeBuffer ctor's halving ladder is still the backstop for a refusal.
+     *
+     * MADEIRA_POOL_GEN_LIVEFIT=0 restores the pure count-based cap. */
+    if (ios_tail_gen_livefit())
+    {
+        ios_tail_free_census( NULL, NULL, &live );
+        if (live > ios_tail_live_hw) ios_tail_live_hw = live;
+        headroom = (budget > ios_tail_live_hw) ? budget - ios_tail_live_hw : 0;
+        want = headroom / IOS_TAIL_GEN_INFLIGHT;
+        if (want > cap) cap = want;
+    }
+
     /* round DOWN to a power of two: FEX's size ladder is pow2 and an exact
      * match is what makes the free-list reuse hit rather than waste. */
     {
@@ -7008,6 +7241,23 @@ static BOOL ios_laa_forced(void)
     {
         const char *e = getenv( "MADEIRA_LAA" );
         cached = !(e && *e && atoi( e ) == 0);
+    }
+    return cached;
+}
+
+/* ml1100: may the forced-LAA policy write IMAGE_FILE_LARGE_ADDRESS_AWARE into the
+ * MAIN IMAGE'S MAPPED HEADER?  Default NO — see the long note at the patch site in
+ * virtual_map_image_view().  Guest-visible image bytes must read back exactly as
+ * they were loaded, because programs hash them; the ceiling is reported through
+ * ntdll instead. */
+static BOOL ios_laa_patch_header(void)
+{
+    static int cached = -1;
+
+    if (cached < 0)
+    {
+        const char *e = getenv( "MADEIRA_LAA_PATCH_HEADER" );
+        cached = (e && e[0] == '1');
     }
     return cached;
 }
@@ -15552,37 +15802,62 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
             }
         }
 
-        /* [laa] MAKE THE IMAGE AGREE WITH THE CEILING.
+        /* [laa] MAKING THE IMAGE AGREE WITH THE CEILING — AND WHY WE STOPPED.
          *
          * ios_wow_ceiling_for_charact() raises the VA ceiling, but the guest's
-         * own kernel32 does not ask ntdll what the ceiling is: GlobalMemoryStatus
-         * clamps dwTotalVirtual/dwAvailVirtual to MAXLONG by reading
+         * own kernel32 did not ask ntdll what the ceiling is: GlobalMemoryStatus
+         * clamped dwTotalVirtual/dwAvailVirtual to MAXLONG by reading
          * `nt->FileHeader.Characteristics` straight out of the MAPPED image
          * (dlls/kernel32/heap.c, "values are limited to 2Gb unless the app has
-         * the IMAGE_FILE_LARGE_ADDRESS_AWARE flag").  An allocator that sizes its
-         * reservations from GlobalMemoryStatus would therefore still believe it
-         * has 2 GB, and so would any app code that inspects its own header.
+         * the IMAGE_FILE_LARGE_ADDRESS_AWARE flag").  The original fix was to set
+         * the bit in the mapped header, so that reader would see it.
          *
-         * So set the bit in the mapped header too, for the main image of a
-         * windowed pseudo-process only.  The headers are a MAP_PRIVATE file
-         * mapping held at VPROT_READ|VPROT_WRITECOPY (unix PROT_READ), so this
-         * opens the host page, stores, and closes it again; the copy-on-write
-         * that the store triggers is private to this process, exactly as a guest
-         * write to its own header would be, and Wine's recorded vprot is
-         * untouched so a later guest write still faults and is handled normally.
+         * ml1100: THAT IS THE ONE THING WE MUST NOT DO.  A program is entitled to
+         * assume its own image bytes are the bytes that were loaded from the file,
+         * and self-integrity checks that hash the in-memory image — headers
+         * included — are ordinary in shipped software.  A patched Characteristics
+         * word makes every such hash wrong, and the documented failure mode of a
+         * failed self-check is a DELIBERATE crash, which is indistinguishable in a
+         * log from an emulator bug and has already cost this project rounds of
+         * investigation.  Real Windows never alters those bytes.  Nothing about
+         * our address-space policy justifies rewriting the program's own image.
          *
-         * SECTION_IMAGE_INFORMATION is deliberately NOT patched:
-         * main_image_info.ImageCharacteristics keeps the file's real bit, which
-         * is what makes the "forced-laa=1" evidence honest, and every ceiling
-         * consumer already routes through ios_wow_ceiling_for_charact(). */
+         * THE CONSUMER IS SATISFIED WITHOUT TOUCHING A GUEST BYTE.  The clamp in
+         * kernel32 exists because Wine's ntdll reports a bigger address space than
+         * a non-LAA process has on Windows; the honest discriminator is therefore
+         * the ceiling ITSELF, not a header bit that merely predicts it.  It now
+         * reads the ceiling ntdll already reports — NtQuerySystemInformation
+         * (SystemBasicInformation)'s HighestUserAddress, which
+         * GlobalMemoryStatusEx has always turned into ullTotalVirtual and which
+         * user_space_wow_limit already reflects — and clamps only when the
+         * process genuinely cannot address more than 2 GB.  On Windows the two
+         * agree by construction (a non-LAA process really is capped at
+         * 0x7FFEFFFF), so the behaviour there is unchanged; here the program is
+         * told the truth about the space it actually has.
+         *
+         * SECTION_IMAGE_INFORMATION was never patched and still is not:
+         * main_image_info.ImageCharacteristics keeps the file's real bit, which is
+         * what makes the "forced-laa=1" evidence honest, and every ceiling
+         * consumer routes through ios_wow_ceiling_for_charact().
+         *
+         * MADEIRA_LAA_PATCH_HEADER=1 restores the old, image-modifying behaviour
+         * for an A/B; it is OFF by default and should stay off. */
         if (ios_wow_base() && !offset && !is_machine_64bit( image_info->machine ) &&
             !(image_info->image_charact & IMAGE_FILE_DLL) &&
             !(image_info->image_charact & IMAGE_FILE_LARGE_ADDRESS_AWARE) && ios_laa_forced())
         {
             IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)view->base;
 
-            if (dos->e_magic == IMAGE_DOS_SIGNATURE && dos->e_lfanew > 0 &&
-                (SIZE_T)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS32) < min( size, page_size ))
+            if (!ios_laa_patch_header())
+            {
+                dprintf( 2, "[laa] ml1100 header left untouched (guest-visible image bytes are never "
+                            "modified); ceiling reported via NtQuerySystemInformation "
+                            "HighestUserAddress, which GlobalMemoryStatus[Ex] now reads instead of the "
+                            "image's IMAGE_FILE_LARGE_ADDRESS_AWARE bit (MADEIRA_LAA_PATCH_HEADER=1 "
+                            "restores the old in-memory patch)\n" );
+            }
+            else if (dos->e_magic == IMAGE_DOS_SIGNATURE && dos->e_lfanew > 0 &&
+                     (SIZE_T)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS32) < min( size, page_size ))
             {
                 IMAGE_NT_HEADERS32 *nt = (IMAGE_NT_HEADERS32 *)((char *)view->base + dos->e_lfanew);
 
@@ -15603,7 +15878,9 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
                         mprotect_range( field, sizeof(*field), 0, 0 );
                         dprintf( 2, "[laa] main image header at %p patched: characteristics now %04x, "
                                     "so the guest's own GlobalMemoryStatus reports the raised ceiling "
-                                    "too\n", view->base, nt->FileHeader.Characteristics );
+                                    "too — MADEIRA_LAA_PATCH_HEADER=1 is set and this MODIFIES "
+                                    "GUEST-VISIBLE IMAGE BYTES; a program that hashes its own image "
+                                    "will see the difference\n", view->base, nt->FileHeader.Characteristics );
                     }
                     else
                         dprintf( 2, "[laa] could not open the main image header at %p for writing "
@@ -18043,6 +18320,10 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     sigset_t sigset;
     SIZE_T size = *size_ptr;
     NTSTATUS status = STATUS_SUCCESS;
+    /* ml1100 [valloc]: see ios_va_account. Entry clock only when the census is on. */
+    const int va_stats = ios_valloc_stats();
+    const unsigned long long va_t0 = va_stats ? ios_va_now_ns() : 0;
+    unsigned long long va_lock_ns = 0;
 
 #ifdef WINE_IOS
     /* WoW64 guest window (WOW64_DESIGN.md §2): every ceiling that reaches
@@ -18099,6 +18380,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     /* Reserve the memory */
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    if (va_stats) va_lock_ns = ios_va_now_ns() - va_t0;
 
     if ((type & MEM_RESERVE) || !base)
     {
@@ -18240,6 +18522,12 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     else if (status == STATUS_NO_MEMORY)
         ERR( "out of memory for allocation, base %p size %08lx\n", base, size );
 
+    if (va_stats)
+    {
+        unsigned long long now = ios_va_now_ns();
+        ios_va_account( ios_va_class( type, 0 ), now - va_t0, va_lock_ns, size );
+        ios_va_report( now );
+    }
     return status;
 }
 
@@ -19609,15 +19897,25 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
          * which constant refused a buffer. */
         {
             size_t cap = ios_tail_gen_cap();
-            static int budget_banner;
+            /* ml1100: this banner was one-shot, and one-shot is the wrong shape for
+             * the number it carries — the cap is now a FUNCTION of the live bytes,
+             * so a log has to be able to see it move. First carve, then every 32nd
+             * (~25 lines in a 32-minute session), and it states the live/free split
+             * the cap was derived from so the next log can check the arithmetic
+             * without a separate census. */
+            static unsigned long banner_n;
 
-            if (!budget_banner) {
-                budget_banner = 1;
-                dprintf(2, "[pool-tail] budget=0x%lx (%lu MB) of pool 0x%lx: head_hw=0x%lx margin=0x%lx gen_cap=0x%lx (%lu MB) rev=ml1020\n",
-                        (unsigned long)ios_tail_budget(), (unsigned long)(ios_tail_budget() >> 20),
+            if (!(banner_n++ & 31)) {
+                unsigned fn = 0; size_t fb = 0, lb = 0;
+                ios_tail_free_census( &fn, &fb, &lb );
+                dprintf(2, "[pool-tail] #%lu budget=0x%lx (%lu MB) of pool 0x%lx: head_hw=0x%lx margin=0x%lx "
+                           "gen_cap=0x%lx (%lu MB) live=%lu MB (hw %lu MB) free=%lu MB in %u carves resv=%lu MB rev=ml1100\n",
+                        banner_n, (unsigned long)ios_tail_budget(), (unsigned long)(ios_tail_budget() >> 20),
                         (unsigned long)ios_jit_pool_size_global, (unsigned long)jit_pool_offset,
                         (unsigned long)ios_tail_head_margin(), (unsigned long)cap,
-                        (unsigned long)(cap >> 20));
+                        (unsigned long)(cap >> 20), (unsigned long)(lb >> 20),
+                        (unsigned long)(ios_tail_live_hw >> 20), (unsigned long)(fb >> 20), fn,
+                        (unsigned long)(ios_jit_tail_reserved >> 20));
             }
 
             if (alloc_size > cap) {
@@ -20135,6 +20433,12 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
 
     /* Fix the parameters */
 
+    /* ml1100 [valloc]: the same-process path only — the cross-process APC above is
+     * a server round trip with a different cost model and is not what churns. */
+    const int va_stats = ios_valloc_stats();
+    const unsigned long long va_t0 = va_stats ? ios_va_now_ns() : 0;
+    unsigned long long va_lock_ns = 0;
+
     if (size) size = ROUND_SIZE( addr, size, page_mask );
     base = ROUND_ADDR( addr, page_mask );
 
@@ -20188,6 +20492,7 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
     }
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    if (va_stats) va_lock_ns = ios_va_now_ns() - va_t0;
 
     /* avoid freeing the DOS area when a broken app passes a NULL pointer */
     if (!base)
@@ -20233,6 +20538,12 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
         *size_ptr = size;
     }
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    if (va_stats)
+    {
+        unsigned long long now = ios_va_now_ns();
+        ios_va_account( ios_va_class( type, 1 ), now - va_t0, va_lock_ns, size );
+        ios_va_report( now );
+    }
     return status;
 }
 

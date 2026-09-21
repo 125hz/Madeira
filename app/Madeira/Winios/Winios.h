@@ -138,6 +138,17 @@ void winios_set_game_rect(double w, double h);
  * relayout there) and before any cursor has ever been positioned. */
 void winios_cursor_relayout(void);
 
+/* ml1110 — the DESKTOP-mode twin of the two relayout hooks: re-letterbox the
+ * wine desktop inside the compositor's frame against the CURRENT guest
+ * resolution. winios_set_compositor_frame only re-lays-out when the FRAME
+ * changes (layoutSubviews storms identical frames), so a guest-side
+ * ChangeDisplaySettings — which moves the mapping without moving the frame —
+ * would otherwise leave the desktop drawn into a sub-rectangle of its own area,
+ * with the taskbar, every window layer and the touch mapping scaled by the old
+ * size. Call it from the same place as winios_cursor_relayout/
+ * winios_overlay_relayout. No-op in a direct launch (no compositor). */
+void winios_compositor_relayout(void);
+
 /* ========================================================================
  * ml — THE DIRECT-LAUNCH GDI OVERLAY.
  *
@@ -192,6 +203,34 @@ void winios_overlay_note_metal_hwnd(void *hwnd);
  *                  peeking, and nothing else would ever drain a touch to it. */
 int winios_overlay_skip_hwnd(void *hwnd);
 unsigned winios_overlay_window_count(void);
+
+/* ml1110 — WHERE A WINDOW'S BITS SIT INSIDE IT. Called from win32u
+ * (driver_ios.c) once per surface CREATION, on a wine thread, with the surface
+ * rect in WINDOW-LOCAL pixels. win32u's get_surface_rect() rounds that rect out
+ * to a 128px grid — so it is usually LARGER than the window, which is what the
+ * old contentsRect clamp existed for — but for a window bigger than the virtual
+ * screen it first INTERSECTS it with that screen, which makes it SMALLER: a
+ * 1286x1011 window on a 1280x720 desktop gets a 1280x768 surface. Without this
+ * the app side drew those bits across the whole window rect, stretching them
+ * vertically by a third and inventing the rows win32u never allocated. Both
+ * modes: the crop is not direct-launch-specific. */
+void winios_window_surface_rect(void *hwnd, int left, int top, int right, int bottom);
+
+/* ml1110 — THE DIRECT-LAUNCH FIT, AND ITS INVERSE.
+ *
+ * A direct launch has no window manager, so a top-level window larger than the
+ * guest desktop is unreachable: it cannot be dragged, resized or Alt+Space'd
+ * back on screen. When one exists the overlay maps the UNION of what it draws
+ * (always containing the guest desktop, so it never magnifies) into the game
+ * rect with one uniform scale, centred — and a touch must invert exactly that,
+ * or the pointer lands somewhere the window is not.
+ *
+ * Returns 1 and fills the guest-pixel source rect while such a fit is active,
+ * 0 when the mapping is the plain per-axis guest->game-rect one and
+ * MetalBackedView.mapPoint's existing GameSurfaceLayout math already inverts
+ * it. Main-thread only, like every other overlay call. MADEIRA_OVERLAY_FIT=0
+ * switches the fit off and this always answers 0. */
+int winios_overlay_fit_source(double *x, double *y, double *w, double *h);
 
 /* Show/hide the drawn cursor. Normally driven by the driver's pSetCursor
  * hook (NULL cursor -> hide, non-NULL -> show — see winios_drv_set_cursor

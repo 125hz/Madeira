@@ -457,6 +457,20 @@ extern void winios_surface_present( HWND hwnd, int dirty_x, int dirty_y, int dir
                                     int surf_w, int surf_h, int stride, const void *bits ) __attribute__((weak));
 extern void winios_window_frame( HWND hwnd, int x, int y, int w, int h, int visible,
                                  int cx, int cy, int cw, int ch ) __attribute__((weak));
+/* ml1110 — WHERE THE SURFACE SITS INSIDE THE WINDOW.
+ *
+ * winios_surface_present carries only the surface's SIZE, and the app side
+ * assumed that size was always at window-local (0,0) and never smaller than
+ * the window ("surfaces are 128px-aligned, usually LARGER"). get_surface_rect()
+ * breaks both halves of that: it INTERSECTS the surface with the virtual screen
+ * for a window bigger than the screen, then rounds the result down/up to 128 —
+ * so a 1286x1011 window on a 1280x720 desktop gets a 1280x768 surface, and a
+ * window whose visible rect starts far off the left/top edge gets a non-zero
+ * origin. Publishing the rect once per surface creation is enough: it cannot
+ * change without the surface being recreated. Weak, like every other app hook
+ * here — a stale app side simply keeps the old (0,0)-and-no-smaller assumption. */
+extern void winios_window_surface_rect( HWND hwnd, int left, int top,
+                                        int right, int bottom ) __attribute__((weak));
 extern void winios_cursor_set( unsigned int id, int w, int h, int hot_x, int hot_y,
                                const void *bgra ) __attribute__((weak));
 extern void winios_cursor_show( int show ) __attribute__((weak));
@@ -612,6 +626,57 @@ static int winios_direct_overlay(void)
     return on;
 }
 
+/* ml1110 — EVERY "HOW BIG IS THE SCREEN" ROUTE, ONCE, IN ONE LINE.
+ *
+ * A program that centres its own dialog can read the screen through at least
+ * six different APIs, and in a direct launch — where no explorer has ever run —
+ * they do not all come from the same place: SM_CXSCREEN and
+ * GetDeviceCaps(HORZRES) end at get_primary_monitor_rect(), SPI_GETWORKAREA at
+ * a separately cached work area, GetWindowRect(GetDesktopWindow()) at either a
+ * per-thread SYNTHESISED monitor rect or the window's STORED rect depending on
+ * whether the calling thread has resolved top_window, and MonitorFromPoint +
+ * GetMonitorInfo at the monitor list itself. ml1100 healed the list and the
+ * work area; ml1090 sized the desktop window asynchronously from a thread that
+ * may not own it. Two rounds have now been spent inferring which of those a
+ * mis-centred dialog actually read. Print all of them, once, at the moment the
+ * first ordinary window appears — which is the state the program's own
+ * centring helper runs in — and the next log names the route outright. */
+static void winios_log_screen_routes( const char *when )
+{
+    static int logged;
+    struct window_rects desk_rects = {0};
+    RECT mon, virt, work = {0};
+    HWND desktop;
+
+    if (logged || !winios_direct_overlay()) return;
+    logged = 1;
+
+    desktop = get_desktop_window();
+    mon = get_primary_monitor_rect( get_thread_dpi() );
+    virt = get_virtual_screen_rect( get_thread_dpi(), MDT_DEFAULT );
+    NtUserSystemParametersInfo( SPI_GETWORKAREA, 0, &work, 0 );
+    get_window_rects( desktop, COORDS_SCREEN, &desk_rects, get_thread_dpi() );
+
+    dprintf( 2, "[screen-routes] ml1110 at=%s SM_CXSCREEN=%d SM_CYSCREEN=%d "
+             "SM_CXVIRTUALSCREEN=%d SM_CYVIRTUALSCREEN=%d primary={%d,%d,%d,%d} "
+             "virtual={%d,%d,%d,%d} workarea={%d,%d,%d,%d} desktop=%p "
+             "desktop-win={%d,%d,%d,%d} desktop-client={%d,%d,%d,%d}%s\n",
+             when,
+             get_system_metrics( SM_CXSCREEN ), get_system_metrics( SM_CYSCREEN ),
+             get_system_metrics( SM_CXVIRTUALSCREEN ), get_system_metrics( SM_CYVIRTUALSCREEN ),
+             (int)mon.left, (int)mon.top, (int)mon.right, (int)mon.bottom,
+             (int)virt.left, (int)virt.top, (int)virt.right, (int)virt.bottom,
+             (int)work.left, (int)work.top, (int)work.right, (int)work.bottom,
+             desktop,
+             (int)desk_rects.window.left, (int)desk_rects.window.top,
+             (int)desk_rects.window.right, (int)desk_rects.window.bottom,
+             (int)desk_rects.client.left, (int)desk_rects.client.top,
+             (int)desk_rects.client.right, (int)desk_rects.client.bottom,
+             IsRectEmpty( &desk_rects.window )
+                 ? "  <-- THE DESKTOP WINDOW IS STILL 0x0: every CenterWindow helper that "
+                   "reads it lands at (-cx/2,-cy/2)" : "" );
+}
+
 /* One [overlay] line for the FIRST window whose GDI content actually reaches
  * the app in a direct launch. Class and size are what identify the window in
  * a device log; the style word says whether it is the dialog/popup shape the
@@ -627,6 +692,7 @@ static void winios_overlay_log_first( HWND hwnd, int surf_w, int surf_h )
 
     if (logged || !winios_direct_overlay()) return;
     logged = 1;
+    winios_log_screen_routes( "first-window-content" );
 
     us.Buffer = clsW;
     us.Length = 0;
@@ -644,6 +710,103 @@ static void winios_overlay_log_first( HWND hwnd, int surf_w, int surf_h )
              (int)rects.window.left, (int)rects.window.top,
              (int)rects.window.right, (int)rects.window.bottom,
              (unsigned)get_window_long( hwnd, GWL_STYLE ) );
+}
+
+/* ml1110 — PER-WINDOW diagnostic budget for the direct-launch overlay.
+ *
+ * The question these lines answer is always per-WINDOW ("did THIS window's
+ * content ever reach a layer, and with what geometry"), so a global counter is
+ * the wrong shape: a window created late — the child that covers the client
+ * area, the dialog that appears after a minute — falls past any global window
+ * and is never sampled at all. That is the ml493 lesson one file over, and it
+ * cost a whole round there. Returns the 1-based call number while it is within
+ * `max` for this hwnd, 0 afterwards, so every caller is `if (!n) skip`.
+ *
+ * Lock-free and approximate on purpose: it runs on the GDI flush path. A race
+ * can only mis-count a line, never lose the window. */
+#define WINIOS_DIAG_SLOTS 16
+struct winios_diag_table
+{
+    struct { HWND hwnd; int n; } slot[WINIOS_DIAG_SLOTS];
+    int used;
+};
+static int winios_overlay_diag_n( struct winios_diag_table *t, HWND hwnd, int max )
+{
+    int i;
+
+    if (!winios_direct_overlay()) return 0;
+    for (i = 0; i < t->used && i < WINIOS_DIAG_SLOTS; i++)
+        if (t->slot[i].hwnd == hwnd) return t->slot[i].n < max ? ++t->slot[i].n : 0;
+    if (t->used >= WINIOS_DIAG_SLOTS) return 0;
+    i = t->used++;
+    t->slot[i].hwnd = hwnd;
+    t->slot[i].n = 1;
+    return 1;
+}
+
+/* ml1110 — THE LINE THAT DECIDES "WHY IS THE CLIENT AREA BLANK".
+ *
+ * A direct launch has no window manager and no desktop compositor, so between
+ * "the program painted" and "pixels on screen" there are four places the
+ * content can be lost, and no log so far could tell them apart:
+ *
+ *   1. the window is a CHILD and has no surface of its own — it paints into an
+ *      ancestor's, and only that ancestor ever flushes (surface=... here names
+ *      the owner, `child=1 own-surface=0` names the case);
+ *   2. the surface is SMALLER than the window, because get_surface_rect()
+ *      cropped it to the virtual screen — the rows past `surf` are bits win32u
+ *      never allocated and nothing downstream can show them;
+ *   3. the dirty rect the program damaged lies wholly or partly OUTSIDE that
+ *      surface, so the flush carries nothing (dirty vs clipped below);
+ *   4. the client rect is not where the layer thinks it is.
+ *
+ * All four are printed together, first few flushes per window, direct launch
+ * only — so one device log settles which it is without another round. */
+static void winios_overlay_log_flush( struct window_surface *surface, const RECT *dirty )
+{
+    static struct winios_diag_table flush_diag;
+    struct window_rects rects = {0};
+    RECT surf, clipped, client_local;
+    HWND hwnd = surface->hwnd, parent;
+    UINT style, ex_style;
+    int n, is_child;
+
+    if (!(n = winios_overlay_diag_n( &flush_diag, hwnd, 3 ))) return;
+
+    surf = surface->rect;
+    parent = NtUserGetAncestor( hwnd, GA_PARENT );
+    is_child = parent && parent != get_desktop_window();
+    style = get_window_long( hwnd, GWL_STYLE );
+    ex_style = get_window_long( hwnd, GWL_EXSTYLE );
+    get_window_rects( hwnd, COORDS_SCREEN, &rects, get_thread_dpi() );
+
+    clipped = *dirty;
+    if (!intersect_rect( &clipped, &clipped, &surf )) SetRectEmpty( &clipped );
+
+    /* The client area in the SAME window-local space the surface rect uses —
+     * the only way to read "does the surface reach the bottom of the client". */
+    client_local = rects.client;
+    OffsetRect( &client_local, -rects.visible.left, -rects.visible.top );
+
+    dprintf( 2, "[overlay-flush] #%d hwnd=%p parent=%p child=%d own-surface=1 "
+             "style=%08x ex=%08x win={%d,%d,%d,%d} client={%d,%d,%d,%d} "
+             "visible={%d,%d,%d,%d} surf={%d,%d,%d,%d} client-local={%d,%d,%d,%d} "
+             "dirty={%d,%d,%d,%d} -> clipped={%d,%d,%d,%d}%s%s rev=ml1110\n",
+             n, hwnd, parent, is_child, (unsigned)style, (unsigned)ex_style,
+             (int)rects.window.left, (int)rects.window.top,
+             (int)rects.window.right, (int)rects.window.bottom,
+             (int)rects.client.left, (int)rects.client.top,
+             (int)rects.client.right, (int)rects.client.bottom,
+             (int)rects.visible.left, (int)rects.visible.top,
+             (int)rects.visible.right, (int)rects.visible.bottom,
+             (int)surf.left, (int)surf.top, (int)surf.right, (int)surf.bottom,
+             (int)client_local.left, (int)client_local.top,
+             (int)client_local.right, (int)client_local.bottom,
+             (int)dirty->left, (int)dirty->top, (int)dirty->right, (int)dirty->bottom,
+             (int)clipped.left, (int)clipped.top, (int)clipped.right, (int)clipped.bottom,
+             IsRectEmpty( &clipped ) ? "  <-- DAMAGE ENTIRELY OUTSIDE THE SURFACE" : "",
+             (client_local.bottom > surf.bottom || client_local.right > surf.right)
+                 ? "  <-- SURFACE DOES NOT COVER THE WHOLE CLIENT (cropped to the virtual screen)" : "" );
 }
 
 /* ml505 probe. This hook was a pure stub: wine hands the driver the
@@ -706,6 +869,7 @@ static BOOL winios_surface_flush( struct window_surface *surface, const RECT *re
          * Answers 0 in desktop mode, so nothing changes there. */
         if (winios_overlay_skip_hwnd && winios_overlay_skip_hwnd( surface->hwnd )) return TRUE;
         winios_overlay_log_first( surface->hwnd, surf_w, surf_h );
+        winios_overlay_log_flush( surface, dirty );
         winios_surface_present( surface->hwnd,
                                 dirty->left, dirty->top,
                                 dirty->right - dirty->left, dirty->bottom - dirty->top,
@@ -780,6 +944,14 @@ static BOOL winios_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *sur
 
     if (previous) window_surface_release( previous );
 
+    /* ml1110: tell the app side WHERE in the window these bits live, before
+     * any flush of this surface can reach it — see the extern's own comment.
+     * Both modes: the crop is not direct-launch-specific, and desktop mode's
+     * per-window layers scale the same contents the same way. */
+    if (winios_window_surface_rect)
+        winios_window_surface_rect( hwnd, (int)surface_rect->left, (int)surface_rect->top,
+                                    (int)surface_rect->right, (int)surface_rect->bottom );
+
     {
         /* ml505: was capped at 16 GLOBALLY, so a window created late (the
          * login popup) never appeared here at all. Which hwnds get their own
@@ -815,6 +987,41 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
         int visible = !IsRectEmpty( v ) && !(swp_flags & SWP_HIDEWINDOW);
         winios_window_frame( hwnd, v->left, v->top, v->right - v->left, v->bottom - v->top, visible,
                              c->left, c->top, c->right - c->left, c->bottom - c->top );
+    }
+
+    /* ml1110 — THE OTHER HALF OF "WHY IS THE CLIENT AREA BLANK": the windows
+     * that never flush at all. A CHILD window gets NO surface of its own
+     * (get_default_window_surface returns NULL for it and the caller falls back
+     * to the parent's), so it paints into an ancestor's bits and the only trace
+     * it ever leaves is this hook. The existing [win-pos] family deliberately
+     * drops children with an empty visible rect — which is exactly the shape a
+     * client-covering paint-box child can have here — so a child could get an
+     * overlay layer created for it and appear in no other line in the log.
+     * First two events per window, direct launch only; `surface=(none)` is the
+     * "paints into an ancestor's surface" case stated outright. */
+    {
+        static struct winios_diag_table pos_diag;
+        int n = winios_overlay_diag_n( &pos_diag, hwnd, 4 );
+        if (n)
+        {
+            /* First window event in a direct launch: the state every
+             * self-centring dialog is about to read. */
+            winios_log_screen_routes( "first-window-event" );
+            const RECT *v = &new_rects->visible, *w = &new_rects->window, *c = &new_rects->client;
+            HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
+            int is_child = parent && parent != get_desktop_window();
+            dprintf( 2, "[overlay-win] #%d hwnd=%p parent=%p child=%d style=%08x ex=%08x "
+                     "after=%p swp=%08x win={%d,%d,%d,%d} client={%d,%d,%d,%d} "
+                     "visible={%d,%d,%d,%d} surface=%s rev=ml1110\n",
+                     n, hwnd, parent, is_child,
+                     (unsigned)get_window_long( hwnd, GWL_STYLE ),
+                     (unsigned)get_window_long( hwnd, GWL_EXSTYLE ),
+                     insert_after, (unsigned)swp_flags,
+                     (int)w->left, (int)w->top, (int)w->right, (int)w->bottom,
+                     (int)c->left, (int)c->top, (int)c->right, (int)c->bottom,
+                     (int)v->left, (int)v->top, (int)v->right, (int)v->bottom,
+                     surface ? "own" : "(none) — paints into an ancestor's surface" );
+        }
     }
     /* ml505: z-order and geometry churn. If the three same-rect siblings are
      * being reordered, the topmost changes and the surface shows whichever

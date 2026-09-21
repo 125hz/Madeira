@@ -279,6 +279,11 @@ struct FPSOverlay: View {
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
             let t = CFAbsoluteTimeGetCurrent()
             let cur = madeira_get_present_count()
+            // The session's first presented frame makes the drawable's shape
+            // meaningful (MetalBackedView.drawableAspect): lay out again once.
+            if presentCount == MetalBackedView.presentCountAtLaunch && cur != presentCount {
+                MetalBackedView.refreshDisplayMode(reason: "first-present")
+            }
             samples.append((t, cur))
             if samples.count > bufferCapacity { samples.removeFirst() }
             presentCount = cur

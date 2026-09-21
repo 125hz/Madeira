@@ -408,6 +408,18 @@ static int ios_user_lock_knob( const char *name )
     return !(env && *env == '0');
 }
 
+#ifdef WINE_IOS
+/* ml1100 — the monitor-list repairs below (an empty `monitors` list is never
+ * accepted as an answer, and a work area computed from one is never cached).
+ * MADEIRA_MONITOR_HEAL=0 restores the pre-ml1100 behaviour exactly. */
+static int ios_monitor_heal(void)
+{
+    static int on = -1;
+    if (on < 0) on = ios_user_lock_knob( "MADEIRA_MONITOR_HEAL" );
+    return on;
+}
+#endif
+
 static int ios_user_lock_watch(void)
 {
     static int on = -1;
@@ -2678,6 +2690,32 @@ static void monitor_get_info( struct monitor *monitor, MONITORINFO *info, UINT d
     intersect_rect( &info->rcWork, &info->rcWork, &info->rcMonitor );
     info->dwFlags = is_monitor_primary( monitor ) ? MONITORINFOF_PRIMARY : 0;
 
+#ifdef WINE_IOS
+    /* ml1100 — one always-on line, the first time anything asks a monitor for
+     * its rectangles. Everything that places a window off screen on this port
+     * has gone through here: GetMonitorInfo, SPI_GETWORKAREA and
+     * MonitorFromWindow's caller all read these two rects, and a sourceless
+     * (virtual) monitor answers from ios_screen_size() while a sourced one
+     * answers {0,0,0,0} the moment its source is not ATTACHED_TO_DESKTOP.
+     * `source=` and `attached=` say which of the two this is. */
+    if (is_monitor_primary( monitor ))
+    {
+        static int noted;
+        if (!noted++)
+            dprintf( STDERR_FILENO,
+                     "[monitor] ml1100 primary rc={%d,%d,%d,%d} work={%d,%d,%d,%d} source=%s "
+                     "attached=%s monitors=%u dpi=%u\n",
+                     (int)info->rcMonitor.left, (int)info->rcMonitor.top,
+                     (int)info->rcMonitor.right, (int)info->rcMonitor.bottom,
+                     (int)info->rcWork.left, (int)info->rcWork.top,
+                     (int)info->rcWork.right, (int)info->rcWork.bottom,
+                     monitor->source ? "yes" : "none(virtual)",
+                     !monitor->source ? "n/a" :
+                     (monitor->source->state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) ? "yes" : "NO",
+                     (unsigned)list_count( &monitors ), dpi );
+    }
+#endif
+
     if (info->cbSize >= sizeof(MONITORINFOEXW))
     {
         char buffer[CCHDEVICENAME];
@@ -3134,7 +3172,35 @@ static BOOL lock_display_devices( BOOL force )
     pthread_mutex_lock( &display_lock );
 
     serial = get_monitor_update_serial();
+#ifdef WINE_IOS
+    /* ml1100 — AN EMPTY MONITOR LIST IS NOT AN ANSWER.
+     *
+     * get_monitor_update_serial() returns 0 whenever get_shared_desktop()
+     * fails, which is the normal state of a thread that has not resolved a
+     * desktop yet -- i.e. the first win32u call any process makes in a direct
+     * launch, before get_desktop_window() has run. `monitor_update_serial`
+     * starts at 0 too, so `0 >= 0` took this early return and the
+     * virtual-monitor branch below never ran: `monitors` stayed EMPTY, and
+     * every consumer of it silently answered {0,0,0,0} --
+     * get_primary_monitor_rect (SM_CXVIRTUALSCREEN, and the desktop window's
+     * own synthesised rect), get_monitor_from_rect (so MonitorFromWindow
+     * returns NULL and GetMonitorInfoW FAILS, leaving the caller's MONITORINFO
+     * zeroed), NtUserEnumDisplayMonitors (FALSE, no callback) and
+     * SPI_GETWORKAREA -- which then CACHED the zero for the rest of the
+     * session (see its own note). A dialog centred on that lands at
+     * ((0+0-cx)/2, (0+0-cy)/2), which is the {-127,-43,128,43} of log 85.
+     *
+     * A desktop session never showed it because explorer runs first and
+     * populates the list long before any title asks.
+     *
+     * The list is never legitimately empty on this port (the branch below
+     * always adds the virtual monitor), so "empty" means "not built yet",
+     * never "no displays". */
+    if (!force && monitor_update_serial >= serial &&
+        (!ios_monitor_heal() || !list_empty( &monitors ))) return TRUE;
+#else
     if (!force && monitor_update_serial >= serial) return TRUE;
+#endif
 
     /* services do not have any adapters, only a virtual monitor */
     if (
@@ -4113,17 +4179,42 @@ static BOOL ios_virtual_monitor_active(void)
  * is what this used to be) leaves a game no way to ask for anything else, so
  * it renders at whatever it defaulted to and the screen shape never matches.
  *
- * Every entry is 32 bpp / 60 Hz. The list is filtered to modes no larger than
- * twice the current mode's pixel count, which is the same thing a real monitor
- * does by only listing what its panel can actually scan out: on a phone the
- * render cost of a mode is the whole reason not to offer it. */
+ * Every entry is 32 bpp / 60 Hz.
+ *
+ * ml1100 — THE LADDER HAD NO SMALL WIDESCREEN RUNGS, AND THE CAP MOVED.
+ *
+ * Two separate defects, both visible in device log 86:
+ *
+ *  - 960x540 (and 640x360, 854x480, 1024x576 — the whole lower half of the
+ *    16:9 ladder) was simply absent, so ChangeDisplaySettings(960x540) was
+ *    refused with DISP_CHANGE_BADMODE. The program then programmed 1024x768,
+ *    a 4:3 mode, and rendered its 16:9 content into it. Nothing downstream
+ *    can undo that: the aspect was decided inside the guest. A real GPU
+ *    answers this question with a list of dozens; ours answered it with
+ *    nineteen 4:3-and-up entries.
+ *  - the list was filtered against twice the CURRENT mode's pixel count, so
+ *    the set of modes a program could choose from SHRANK as soon as it chose
+ *    a small one, and a program that stepped down and wanted to step back up
+ *    found its own previous mode missing. A monitor's mode list does not
+ *    depend on the mode it is in. The cap now comes from the SESSION DEFAULT
+ *    (this port's stand-in for the panel's native size, and the one value a
+ *    mode change never moves) and is four times its pixel count, which keeps
+ *    the "do not offer what this device cannot drive" intent on a small
+ *    desktop while letting a 720p session reach the full standard ladder. */
 static const struct { short w, h; } ios_standard_modes[] =
 {
-    {  640,  480 }, {  800,  600 }, { 1024,  768 }, { 1152,  864 },
+    /* 16:9 and 16:10, low rungs first — the ones a windowed title actually
+     * asks for, and the ones that were missing */
+    {  640,  360 }, {  640,  400 }, {  640,  480 }, {  720,  480 },
+    {  720,  576 }, {  800,  480 }, {  800,  600 }, {  848,  480 },
+    {  854,  480 }, {  960,  540 }, {  960,  600 }, {  960,  720 },
+    { 1024,  576 }, { 1024,  600 }, { 1024,  640 }, { 1024,  768 },
+    { 1120,  832 }, { 1152,  648 }, { 1152,  864 }, { 1176,  664 },
     { 1280,  720 }, { 1280,  768 }, { 1280,  800 }, { 1280,  960 },
-    { 1280, 1024 }, { 1360,  768 }, { 1366,  768 }, { 1440,  900 },
-    { 1600,  900 }, { 1600, 1200 }, { 1680, 1050 }, { 1920, 1080 },
-    { 1920, 1200 }, { 2048, 1536 }, { 2560, 1440 },
+    { 1280, 1024 }, { 1360,  768 }, { 1366,  768 }, { 1400, 1050 },
+    { 1440,  900 }, { 1600,  900 }, { 1600, 1024 }, { 1600, 1200 },
+    { 1680, 1050 }, { 1920, 1080 }, { 1920, 1200 }, { 2048, 1536 },
+    { 2560, 1440 },
 };
 
 /* Index 0 is always the CURRENT mode: EnumDisplaySettings callers compare the
@@ -4131,7 +4222,7 @@ static const struct { short w, h; } ios_standard_modes[] =
  * missing from the list reads as "this monitor cannot do what it is doing". */
 static BOOL ios_mode_at_index( UINT index, int *w, int *h )
 {
-    int sw, sh;
+    int sw, sh, cw, ch;
     UINT i, n = 0;
 
     ios_screen_size( &sw, &sh );
@@ -4142,12 +4233,19 @@ static BOOL ios_mode_at_index( UINT index, int *w, int *h )
         return TRUE;
     }
 
+    /* ml1100: the cap is measured against the SESSION DEFAULT, not the current
+     * mode, so the list a program sees does not change under it when it
+     * selects a mode. ios_screen_def_* is seeded by the same first
+     * ios_screen_size() call above, so it is always set by this point. */
+    cw = ios_screen_def_w ? ios_screen_def_w : sw;
+    ch = ios_screen_def_h ? ios_screen_def_h : sh;
+
     for (i = 0; i < ARRAY_SIZE(ios_standard_modes); i++)
     {
         int mw = ios_standard_modes[i].w, mh = ios_standard_modes[i].h;
 
         if (mw == sw && mh == sh) continue;                     /* already index 0 */
-        if ((INT64)mw * mh > 2 * (INT64)sw * sh) continue;      /* too big to drive */
+        if ((INT64)mw * mh > 4 * (INT64)cw * ch) continue;      /* too big to drive */
         if (++n != index) continue;
         *w = mw;
         *h = mh;
@@ -4247,12 +4345,21 @@ extern void winios_display_mode_changed( int w, int h ) __attribute__((weak));
  *    the guest.
  *
  * Must not be called with display_lock held. */
+static void ios_invalidate_work_area(void);   /* below, beside the spi_loaded cache */
+
 static void ios_publish_screen_size( BOOL broadcast )
 {
     int w, h;
 
     ios_screen_size( &w, &h );
     update_display_cache( TRUE );
+    /* ml1100: the work area is a CACHED rectangle derived from the monitor, so
+     * a monitor that just changed size leaves a stale one behind -- the same
+     * failure as the never-computed one, only harder to see because the
+     * numbers look plausible. Windows recomputes it on a display change too,
+     * and a shell that reserves a taskbar strip re-applies SPI_SETWORKAREA
+     * from its own WM_DISPLAYCHANGE handler. */
+    ios_invalidate_work_area();
     NtUserClipCursor( NULL );
 
     if (winios_display_mode_changed) winios_display_mode_changed( w, h );
@@ -6538,6 +6645,17 @@ enum spi_index
 /* indicators whether system parameter value is loaded */
 static char spi_loaded[SPI_INDEX_COUNT];
 
+#ifdef WINE_IOS
+/* ml1100 — see ios_publish_screen_size. Declared up there, defined here where
+ * the cache it drops actually lives. A plain word store; SPI_GETWORKAREA then
+ * recomputes under display_lock on the next query. */
+static void ios_invalidate_work_area(void)
+{
+    if (!ios_monitor_heal()) return;
+    spi_loaded[SPI_SETWORKAREA_IDX] = FALSE;
+}
+#endif
+
 static struct sysparam_rgb_entry system_colors[] =
 {
 #define RGB_ENTRY(name,val,reg) { { get_rgb_entry, set_rgb_entry, init_rgb_entry, COLORS_KEY, reg }, (val) }
@@ -7183,19 +7301,52 @@ BOOL WINAPI NtUserSystemParametersInfo( UINT action, UINT val, void *ptr, UINT w
         if (!spi_loaded[spi_idx])
         {
             struct monitor *monitor;
+            BOOL found = FALSE;
+            UINT count;
 
             if (!lock_display_devices( FALSE )) return FALSE;
 
+            count = list_count( &monitors );
             LIST_FOR_EACH_ENTRY( monitor, &monitors, struct monitor, entry )
             {
                 if (!is_monitor_primary( monitor )) continue;
                 monitor_get_info( monitor, &info, dpi );
                 work_area = info.rcWork;
+                found = !IsRectEmpty( &work_area );
                 break;
             }
 
             unlock_display_devices();
+#ifdef WINE_IOS
+            /* ml1100 — NEVER CACHE A WORK AREA THAT WAS NEVER COMPUTED.
+             *
+             * `work_area` and `spi_loaded` are statics, and on this port ONE
+             * win32u serves every pseudo-process in the Mach task, so this
+             * cache is session-wide. The loop above finds nothing when the
+             * monitor list has not been built yet (see lock_display_devices),
+             * and the unconditional `spi_loaded = TRUE` then latched
+             * {0,0,0,0} as THE work area for the whole session -- for every
+             * later process, on every later thread, with no line anywhere
+             * saying so. Every CenterWindow helper that asks for the work area
+             * then puts its window at ((0 - cx)/2, (0 - cy)/2): the
+             * {-127,-43,128,43} of log 85, entirely off screen.
+             *
+             * Latch only a real rectangle; an empty one means "ask again
+             * later", which costs one list walk per query until the display
+             * exists and nothing after that. */
+            if (ios_monitor_heal() && !found)
+            {
+                static int noted;
+                if (noted++ < 2)
+                    dprintf( STDERR_FILENO, "[monitor] ml1100 SPI_GETWORKAREA has no monitor yet "
+                                            "(monitors=%u) — answering {0,0,0,0} WITHOUT caching it; "
+                                            "a cached zero work area is what centres dialogs off "
+                                            "screen\n", (unsigned)count );
+            }
+            else spi_loaded[spi_idx] = TRUE;
+#else
             spi_loaded[spi_idx] = TRUE;
+#endif
         }
         *(RECT *)ptr = work_area;
         ret = TRUE;

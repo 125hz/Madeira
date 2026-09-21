@@ -290,8 +290,39 @@ struct madeira_sync_cell
     unsigned int manual;       /* 1 = manual-reset (NotificationEvent), events   */
     unsigned int kind;         /* ml1010 MADEIRA_CELL_KIND_*                     */
     unsigned int smax;         /* ml1010 semaphore maximum count, immutable      */
-    unsigned int pad[1];       /* keep two cells per 64-byte line                */
+    unsigned int rel_us;       /* ml1110 CLIENT release stamp, see below         */
 };
+
+/* ml1110: WHEN THE LAST CLIENT-SIDE RELEASE RAISED THIS CELL.
+ *
+ * Truncated CLOCK_UPTIME_RAW microseconds, written relaxed by the two client
+ * fast paths that can raise a cell without the server knowing -- the
+ * NtReleaseSemaphore arithmetic and NtSetEvent -- and read by nothing on the
+ * hot path.  It exists for ONE question, which no counter in this port could
+ * answer: a timed wait that ended in STATUS_TIMEOUT while its object was
+ * already signalled is either a genuine race (the token landed a microsecond
+ * ago and the wake is in flight) or a wake that was owed and not delivered,
+ * and the only thing that separates them is HOW LONG the token had been
+ * sitting there.  Truncation to 32 bits wraps every ~71 minutes; the only
+ * consumer subtracts two stamps taken within milliseconds of each other and
+ * unsigned arithmetic makes the wrap invisible to it.
+ *
+ * SERVER-SIDE releases are deliberately NOT stamped.  A release that runs on
+ * the server thread walks its own wait queue in the same call, so it cannot be
+ * late by construction, and a stamp from it would only dilute the measurement
+ * of the mixed protocol this is aimed at.  A cell that has never been raised
+ * by a client keeps rel_us == 0, which the reader reports as "no stamp"
+ * rather than as an age of 71 minutes.
+ *
+ * Relaxed on both sides on purpose: it is a diagnostic, it is never read to
+ * decide anything, and a torn or stale value costs one mis-bucketed age. */
+static inline void madeira_cell_note_release( struct madeira_sync_cell *cell,
+                                              unsigned long long now_ns )
+{
+    unsigned int us = (unsigned int)(now_ns / 1000);
+
+    __atomic_store_n( &cell->rel_us, us ? us : 1u, __ATOMIC_RELAXED );
+}
 
 /* The kind, read without synchronisation on purpose.  It is written once, by
  * the server, BEFORE the store of `sg' that publishes the cell, and every
