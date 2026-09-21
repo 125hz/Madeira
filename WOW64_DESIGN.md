@@ -11240,3 +11240,267 @@ guest-slots=… verdict=…`). Consequences:
   was not, and has no line in any log that distinguishes the two. So the first
   thing this change ships is not the futex; it is the sentence that says which
   one you got.
+
+- **2026-09-21 — one leaked mutex ended every session: the USER lock is
+  process-wide on this port, and a thread that dies holding it takes the whole
+  app with it (the `[user-lock]` family, ml1090). Plus: the desktop window was
+  never actually sized in a direct launch, and the app and win32u disagreed
+  about how big the guest desktop is.**
+
+  **THE REPORT.** After the 2026-09-20 round no title booted. Two device logs
+  say why, and they say the same thing:
+
+  * log 75 — a 32-bit D3D9 title started from Explorer inside the virtual
+    desktop gets past its splash and then goes black, `[frame] n=0` forever;
+  * log 78 — a 32-bit visual-novel engine started from the same desktop shows
+    its chooser dialog, and choosing "fullscreen" does nothing at all.
+
+  **ROOT CAUSE 1 — A `user_lock` LEAK, MADE PERMANENT BY AN `assert`.**
+
+  Both logs contain exactly this, on the title's own thread:
+
+  ```
+  00b8:err:system:user_check_not_lock BUG: holding USER lock
+  Assertion failed: (0), function user_check_not_lock, file sysparams_ios.c, line 376.
+  [exc-disp] raise tid=00b8 code=80000101 ...
+  00b8:err:seh:NtRaiseException Exception frame is not in stack limits => unable to dispatch exception.
+  00b8:err:process:NtTerminateProcess ... MADEIRA-EXIT: ... status=-2147483391
+  ```
+
+  and then, in log 75's last `[thread-stacks]` dump, three threads in three
+  different pseudo-processes parked in `__psynch_mutexwait` on
+  `lock=0x1027a1898` with **no live owner anywhere in the dump**:
+
+  ```
+  user_lock <- get_user_handle_ptr <- NtUserInternalGetWindowText <- winios_dump_window_tree <- wait_message
+  user_lock <- get_user_handle_ptr <- get_window_long_size <- is_window_visible <- process_driver_events
+  user_lock <- get_user_handle_ptr <- get_parent <- get_win_monitor_dpi <- point_phys_to_win_dpi <- peek_message
+  ```
+
+  The owner is not missing from the dump; it no longer exists. `assert(0)`
+  cannot unwind a mutex, so the abort handed win32u's `user_mutex` to a thread
+  that was in the middle of being killed.
+
+  **Why that is fatal HERE and not upstream.** Upstream win32u is loaded once
+  per process and `user_mutex` guards one process's window handles. In this
+  port every pseudo-process is a set of threads in ONE Mach task sharing ONE
+  win32u, so this single mutex serialises the shell, the title, rpcss and
+  every service. Losing it does not kill a process; it ends the session. That
+  is the whole distance between "a program asserted" and "no title boots".
+
+  **What leaked it.** `NtUserGetClassInfoEx` (`class_ios.c`):
+
+  ```c
+  if (!(class = find_class( instance, name ))) return 0;   /* returns with the lock HELD */
+  while ((status = get_shared_class( class, &lock, &class_shm )) == STATUS_PENDING) { ... }
+  if (status) return 0;                                    /* <- lock never released */
+  ```
+
+  That last line is upstream's, and upstream it is unreachable:
+  `get_shared_class` only fails when `class->shared` is NULL, which a
+  registered class never has. It is reachable HERE because this port added the
+  freed-shared-object guard to `get_shared_class`/`get_shared_window_class`
+  (`if (!object->id) return STATUS_INVALID_HANDLE`) — and that guard exists
+  because `class_list` is a SINGLE win32u list shared by every pseudo-process,
+  so a process that dies without unregistering leaves entries whose shared
+  object has been freed (`id == 0`). Before the guard those entries spun
+  forever under the lock (task #21); since the guard they return an error —
+  through the one return that forgets to unlock. Both logs show earlier
+  pseudo-process exits (`[srv-kill] kill_process`), so the stale entries were
+  there. In log 78 the assert fires on a **brand-new** thread moments after its
+  `call_tls_callbacks` (`DLL_THREAD_ATTACH` -> a class lookup -> the leak ->
+  the next win32u entry point asserts), which is why no earlier trace of that
+  tid exists in the log at all.
+
+  So: an added safety guard turned an upstream-unreachable `return` into a
+  session-ending one. **A port that makes a shared-state failure survivable has
+  to check what the newly reachable error paths do with the lock.**
+
+  **THE CHANGES (root cause 1).**
+
+  * `build/win32u-unix/class_ios.c:820` — `release_class_ptr( class )` on the
+    `if (status)` path, with the evidence in a comment beside it. This is the
+    actual bug.
+  * `build/win32u-unix/sysparams_ios.c:357-520` — the lock itself:
+    - the owner is recorded by **Mach port** as well as wine tid
+      (`user_lock_port`), because a wine tid is recycled and cannot answer
+      "does that thread still exist";
+    - `user_check_not_lock()` now **releases and logs** instead of aborting
+      (`[user-lock] ... LEAK ...`); `MADEIRA_USERLOCK_RECOVER=0` restores the
+      upstream assert;
+    - `user_lock_abandon()` (new, exported) drops the calling thread's whole
+      recursion depth, and the pseudo-process teardown paths call it —
+      `build/ntdll-unix/thread_ios.c` `abort_process`, `exit_process`,
+      `exit_thread`, through a weak `ios_drop_user_lock()` so ntdll still
+      links without win32u;
+    - a waiter blocked **more than five seconds** prints one always-on line
+      naming the owner tid, its port, and **whether that thread still exists**;
+      `MADEIRA_USERLOCK_WATCH=0` restores the plain blocking
+      `pthread_mutex_lock`. The watch path is `trylock` -> 256 `sched_yield`
+      -> 1 ms poll, so an uncontended or briefly-contended acquire costs the
+      same as before;
+    - and, for a kill this port cannot hook at all (the server's violent
+      `kill_thread`, a Mach exception that never reaches a handler), a
+      **confirmed dead owner** — the same dead owner seen twice, ten seconds
+      apart — is repaired out from under the waiters: the mutex is
+      re-initialised and handed to the waiter, loudly.
+      `MADEIRA_USERLOCK_REPAIR=0` leaves the waiter blocked, which is the
+      pre-ml1090 behaviour.
+  * `build/ntdll-unix/signal_arm64_ios.c` — `ios_mach_self_port()` /
+    `ios_mach_port_alive()`: `pthread_mach_thread_np` takes no reference (so
+    there is nothing to leak on a path that runs under a lock) and
+    `thread_info()` failing on a name is the "gone" signal. A recycled name
+    can give a false "yes"; the report prints the wine tid too.
+  * `build/ntdll-unix/virtual_ios.c` — `ios_register_unix_lock()`, an
+    append-only table `ios_name_unix_lock()` also consults, so
+    `[thread-stacks]` prints `lock=win32u:user_mutex` instead of the bare
+    `0x1027a1898` these two logs had to be decoded by hand from.
+
+  **Logs 75 and 78 are the same failure.** The only difference is which thread
+  happened to make the leaking class lookup. Log 78's `ChangeDisplaySettings`
+  is a red herring worth recording anyway: at line 782 the title asks for
+  960x540 and gets `-2 (mode is not in the virtual mode list)` — a real
+  refusal, but 4800 lines before the hang, and its window is created at
+  `{125,43,1155,651}` afterwards regardless.
+
+  **ROOT CAUSE 2 — THE DESKTOP WINDOW IS A SYNTHETIC ANSWER, NOT A SIZED
+  WINDOW, AND ml1080 MADE IT NEVER GET SIZED AT ALL.**
+
+  Log 77 (direct launch, same VN engine): the chooser dialog now draws — good —
+  and lands at `win={-127,-43,128,43}`, which is `(0 - 255)/2, (0 - 86)/2`:
+  centred on an origin-sized screen. `[desktop-rect]` had already printed
+  "sized to the virtual screen 1280x720" at line 1028, so last round's
+  diagnosis (a 0x0 desktop window) was right about the *value* and wrong about
+  the *fix*, because the sizing call did not do what it looked like it did:
+
+  * `get_window_rect()` on the desktop handle does not read a stored rectangle.
+    win32u's `get_window_rects()` recognises the desktop via
+    `is_desktop_window()` — which tests **this thread's**
+    `thread_info->top_window` — and SYNTHESISES `get_primary_monitor_rect()`.
+    So ml1080's new "only size it while it is still empty" test could never be
+    true on the one thread that can answer it, and the sizing became a
+    permanent no-op.
+  * That synthetic answer is also why the desktop still looks 0x0 to everything
+    else. It is produced per thread, only for threads that have resolved
+    `top_window`. Every other thread, every other pseudo-process and the
+    server's own hit-testing go through `get_window_rectangles` and see what is
+    actually stored — `{0,0,0,0}` in a direct launch, because nothing sizes it
+    without a shell. Log 77 prints both halves of that split in one line:
+    `[paint-diag] parent=0x10020 desktop=0x10020 parent_style=00000000
+    parent_vis=0` — the same handle answered as "the desktop" and as a
+    style-less invisible foreign window.
+
+  **THE CHANGES (root cause 2).**
+
+  * `build/win32u-unix/winstation_ios.c` `get_desktop_window()` — the emptiness
+    test now asks the **server** (`get_window_rectangles`) for the stored
+    rectangle instead of `get_window_rect()`. The `[desktop-rect]` line is now
+    `ml1090` and prints the stored rect it found and whether the
+    `SWP_ASYNCWINDOWPOS` path was taken. ml1080's two safety properties
+    (only-while-empty, never a synchronous cross-thread send) are kept exactly.
+  * `build/win32u-unix/driver_ios.c` `winios_CreateWindowSurface` — the desktop
+    window never gets a surface in a direct launch. A screen-sized window with
+    a GDI surface is a screen-sized opaque backdrop, and the new overlay would
+    draw it straight over the presented game image. The desktop is a coordinate
+    system here, never a painted surface.
+  * `build/win32u-unix/driver_ios.c` `[paint-diag]` — `get_desktop_window()` is
+    resolved in its own statement before the style query. In one argument list
+    the evaluation order is unspecified and clang evaluated the style first, so
+    the line reported a desktop it had not yet resolved. The line that made
+    this hard to see was itself the reason it was hard to see.
+
+  **ROOT CAUSE 3 — TWO IDEAS OF THE GUEST DESKTOP, AND A POINTER THAT COULD
+  NEVER APPEAR.**
+
+  Log 77 line 36: `[display] virtual monitor 1280x720 (source=view)`. Log 77
+  line 1061: `[overlay] created ... game-rect=320x240 guest=1024x768`. Three
+  numbers, none of which agree, and `[display] apply ... -> rect=(0,7 402x226)`
+  is the rect that was actually laid out.
+
+  * **guest size.** `IOSDisplayShim.m` seeds its cache from `MADEIRA_SCREEN_W/H`
+    on its FIRST read and never re-reads the environment (win32u owns the value
+    afterwards). Any `guestSize()` during the app's own first layout runs before
+    `configureSessionDefault` calls `setenv`, so the cache latched the 1024x768
+    fallback. Fix: `configureSessionDefault` (and the desktop-mode launcher) now
+    **publish** through `winios_display_mode_changed()` — the same call win32u
+    makes on a guest mode change, so there is one publisher and one value.
+  * **game rect.** Everything in direct-launch mode mapped guest pixels through
+    `g_game_layer.bounds`, which is only correct once a drawable has been
+    presented into it. A program whose first window is a dialog has presented
+    nothing. Fix: Swift publishes the rect it actually laid out —
+    `winios_set_game_rect(r.width, r.height)` from `applyDisplayModeAndLog`,
+    beside the `MetalHostView.frame` assignment and the two relayout hooks — and
+    `winios_game_rect_size()` prefers it, falling back to the layer bounds. The
+    drawn cursor, the overlay container, every overlay window layer and Swift's
+    own touch mapping now scale by one number that exists before the first
+    Present.
+  * **the cursor could not appear at all.** Log 77 contains not one cursor line.
+    `winios_drv_set_cursor` is ungated now, but it only runs on `WM_SETCURSOR`,
+    which only arrives once the mouse is over one of the program's windows —
+    impossible while nothing it owns has been drawn, and doubly impossible when
+    the dialog is off-screen (`[srv-input] btn msg=0x201 at (745,402) hit
+    win=00010020` — the desktop). Fix: in a direct launch, **an ordinary GDI
+    window on screen means there is a pointer.** `winios_overlay_refresh_live()`
+    already counts exactly that and now tells the cursor
+    (`winios_cursor_note_gdi_windows`), which ensures the layer, seeds the
+    position to the centre of the guest desktop the first time, and applies one
+    visibility rule: the driver's word wins in both directions once it has
+    spoken (`g_cursor_drv_show`), and the window count decides only before that.
+    A program that calls `ShowCursor(FALSE)`/`SetCursor(NULL)` still hides it.
+
+  **KNOBS ADDED.** `MADEIRA_USERLOCK_RECOVER=0` (restore the upstream assert),
+  `MADEIRA_USERLOCK_WATCH=0` (plain blocking `pthread_mutex_lock`, no >5 s
+  report), `MADEIRA_USERLOCK_REPAIR=0` (never re-initialise a dead owner's
+  mutex). The existing `MADEIRA_DIRECT_OVERLAY=0` still removes the whole
+  direct-launch overlay, cursor hosting included.
+
+  **UNVERIFIED ON DEVICE — all of it,** and the 2026-09-25 lesson applies.
+  Specifically unverified: that `NtUserGetClassInfoEx` was the ONLY leaking
+  path (the recovery in `user_check_not_lock` will now name any other one
+  rather than killing the session, which is the point — a second
+  `[user-lock] ... LEAK ...` line from a different caller is a finding, not a
+  regression); that re-initialising a held mutex behaves on this libpthread (it
+  is a last resort behind a double confirmation and a kill switch, and the
+  alternative state is a permanently wedged session); that the 1 ms poll in the
+  watch path costs nothing measurable under real `user_lock` contention in a
+  desktop session; that the server-truth desktop-rect test actually finds
+  `{0,0,0,0}` and that the async `SetWindowPos` from a non-owner is ever
+  applied (the owning thread must pump); that not giving the desktop a surface
+  is sufficient to keep it off the overlay; and that a cursor shown on "a GDI
+  window exists" does not appear during a desktop-session launch (it is gated
+  on `!winios_cursor_desktop_mode()` in three places, but that gate has now
+  been asserted three times in this file and never tested).
+
+  **WHAT THE NEXT DEVICE LOG SHOULD SHOW, IN THIS ORDER.**
+  1. **No `BUG: holding USER lock` and no
+     `Assertion failed ... user_check_not_lock`.** If a leak still happens,
+     `[user-lock] ml1090 LEAK tid=... (rec=...)` appears INSTEAD and the session
+     keeps running — that line naming a caller other than the class path is the
+     next thing to fix.
+  2. **No `[user-lock] ml1090 tid=... has waited ...`** at all. If one appears,
+     read `owner-thread-alive=`: `NO` means a thread still dies under the lock
+     on a path the teardown hooks do not cover, and the `REPAIR` line that
+     follows ten seconds later says whether the recovery worked. `yes` means a
+     genuine long hold, which is a different bug and the owner tid names it.
+  3. `[thread-stacks]` should now print `lock=win32u:user_mutex` rather than a
+     raw address for any thread parked there.
+  4. `[desktop-rect] ml1090 ... stored rect was {0,0,0,0}; sizing it to the
+     virtual screen 1280x720 at (0,0)` in a direct launch — and, crucially, a
+     SECOND `[desktop-rect]` line (up to four are printed) whose "stored rect
+     was" is **non-empty**, which is the proof the `SetWindowPos` landed. If
+     every line says `{0,0,0,0}`, the async path is being dropped and the sizing
+     has to happen on the owning thread instead.
+  5. `[overlay] created ... game-rect=WxH (layer bounds AxB) guest=GxH` where
+     `WxH` equals the `rect=` of the preceding `[display] apply` line and `GxH`
+     equals the `[display] virtual monitor` line. Those three agreeing is the
+     whole of root cause 3; `layer bounds` may legitimately differ before the
+     first Present and is printed only to show that it does.
+  6. A chooser dialog in a direct launch placed **inside** `{0,0,1280,720}`,
+     and `[srv-input] btn ... hit win=` naming the DIALOG's hwnd rather than
+     `00010020`. A hit on the desktop after this round means the placement is
+     still wrong, and the next thing to instrument is which API the program used
+     to centre itself — `[win-pos] #N ... flags=0000080d` (`SWP_NOSIZE`) is the
+     move to watch, and its `vis=` before and after says what it read.
+  7. `[winios] cursor set ...` and a visible arrow while the dialog is up, in
+     all three pointer modes. Its absence with a drawn dialog on screen means
+     the `winios_overlay_refresh_live` -> cursor hand-off is not firing.

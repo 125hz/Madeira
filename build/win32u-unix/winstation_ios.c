@@ -1003,8 +1003,35 @@ HWND get_desktop_window(void)
          * thread), and from any thread but the owner NtUserSetWindowPos is a
          * cross-thread SEND — a worker thread then waits forever on an owner
          * that is itself blocked waiting for that worker.  Size the window only
-         * while it is still empty, and never synchronously from a non-owner. */
-        get_window_rect( UlongToHandle( thread_info->top_window ), &cur, get_thread_dpi() );
+         * while it is still empty, and never synchronously from a non-owner.
+         *
+         * ml1090: ASK THE SERVER, NOT get_window_rect().
+         *
+         * get_window_rect() on the desktop handle does not read a stored
+         * rectangle at all: win32u's get_window_rects() recognises the desktop
+         * (via is_desktop_window(), i.e. this thread's own top_window) and
+         * SYNTHESISES get_primary_monitor_rect(). So the emptiness test above
+         * could never be true on the one thread that can answer it, and ml1080
+         * turned the sizing into a permanent no-op.
+         *
+         * That synthetic answer is also exactly why the desktop still LOOKS
+         * 0x0 to everything else: it is produced per thread, only for threads
+         * that have resolved top_window. Every other thread, every other
+         * pseudo-process and the server's own hit-testing go through
+         * get_window_rectangles and see whatever is actually stored — {0,0,0,0}
+         * in a direct launch, because nothing sizes it without a shell. Log 77
+         * shows both halves of that split in one line: [paint-diag]
+         * parent=0x10020 desktop=0x10020 parent_style=00000000 parent_vis=0.
+         *
+         * So read the STORED rectangle here. */
+        SERVER_START_REQ( get_window_rectangles )
+        {
+            req->handle = wine_server_user_handle( UlongToHandle( thread_info->top_window ));
+            req->relative = COORDS_SCREEN;
+            req->dpi = get_thread_dpi();
+            if (!wine_server_call( req )) cur = wine_server_get_rect( reply->window );
+        }
+        SERVER_END_REQ;
         /* In a desktop session the shell sizes its own window; stay out of it. */
         const char *dm = getenv( "MADEIRA_DESKTOP" );
 
@@ -1018,13 +1045,17 @@ HWND get_desktop_window(void)
             if (!is_current_thread_window( UlongToHandle( thread_info->top_window ))) swp |= SWP_ASYNCWINDOWPOS;
             NtUserSetWindowPos( UlongToHandle( thread_info->top_window ), 0,
                                 virt.left, virt.top, virt.right - virt.left, virt.bottom - virt.top, swp );
-            if (!sized++)
-                dprintf( STDERR_FILENO, "[desktop-rect] ml1040 desktop window %p sized to the virtual "
-                                        "screen %dx%d at (%d,%d) — without this a DS_CENTER dialog "
-                                        "centres on a 0x0 desktop and lands off screen\n",
+            if (sized++ < 4)
+                dprintf( STDERR_FILENO, "[desktop-rect] ml1090 desktop window %p stored rect was "
+                                        "{%d,%d,%d,%d}; sizing it to the virtual screen %dx%d at "
+                                        "(%d,%d)%s — a 0x0 desktop is what every CenterWindow "
+                                        "helper, GetWindowRect(GetDesktopWindow()) and DS_CENTER "
+                                        "dialog centres on, and they all land off screen\n",
                          UlongToHandle( thread_info->top_window ),
+                         (int)cur.left, (int)cur.top, (int)cur.right, (int)cur.bottom,
                          (int)(virt.right - virt.left), (int)(virt.bottom - virt.top),
-                         (int)virt.left, (int)virt.top );
+                         (int)virt.left, (int)virt.top,
+                         (swp & SWP_ASYNCWINDOWPOS) ? " (async: not this thread's window)" : "" );
         }
         user_driver->pSetDesktopWindow( UlongToHandle( thread_info->top_window ));
     }

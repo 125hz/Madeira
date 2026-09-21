@@ -119,6 +119,16 @@ int winios_desktop_point_from_window(double wx, double wy, int *px, int *py);
  * after registering the same layer with DXMT; pass NULL to clear it. */
 void winios_set_game_layer(void *metal_layer);
 
+/* ml1090 — publish the rect (view points) the game surface has been LAID OUT
+ * to occupy, as opposed to whatever the presented layer's bounds happen to be.
+ * Swift calls this from applyDisplayModeAndLog, the same place it sets
+ * MetalHostView's frame and calls the two relayout hooks below, so the drawn
+ * cursor, the GDI overlay and Swift's own touch mapping all scale guest pixels
+ * by one number — including BEFORE anything has been presented, which is
+ * precisely when a directly-launched program is showing its first dialog.
+ * Pass 0x0 to fall back to the layer's bounds. */
+void winios_set_game_rect(double w, double h);
+
 /* Re-run the guest-pixel -> view-point cursor placement against the
  * CURRENT game layer bounds, without moving the stored guest position.
  * Call after every display-mode/layout apply (rotation, DisplayMode

@@ -1630,6 +1630,41 @@ void winios_set_game_layer(void *metal_layer) {
     });
 }
 
+/* ml1090 — THE GAME RECT, PUBLISHED RATHER THAN INFERRED.
+ *
+ * Everything in direct-launch mode maps guest pixels through one rect: the
+ * drawn cursor, the GDI overlay and its per-window layers, and Swift's own
+ * touch mapping. Until now this file inferred that rect from
+ * g_game_layer.bounds, which is only correct once Swift has sized
+ * MetalHostView AND a drawable has been presented into it. Before the first
+ * Present there may be no correct rect there at all: log 77 created the
+ * overlay against game-rect=320x240 while GameSurfaceLayout had already
+ * chosen 402x226, so the dialog it drew was scaled by a number nothing else
+ * in the app agreed with.
+ *
+ * So Swift publishes the rect it actually laid out (applyDisplayModeAndLog,
+ * the same place it sets MetalHostView's frame and calls the two relayout
+ * hooks), and the layer bounds are only the fallback. One rect, one source,
+ * valid before anything has been presented. */
+static CGSize g_game_rect;   /* main thread only, points */
+
+void winios_set_game_rect(double w, double h) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        g_game_rect = CGSizeMake(w, h);
+    });
+}
+
+/* main thread only. CGSizeZero when neither source has a usable rect yet —
+ * every caller treats that as "nothing to place". */
+static CGSize winios_game_rect_size(void) {
+    if (g_game_rect.width > 0 && g_game_rect.height > 0) return g_game_rect;
+    if (g_game_layer) {
+        CGRect b = g_game_layer.bounds;
+        if (b.size.width > 0 && b.size.height > 0) return b.size;
+    }
+    return CGSizeZero;
+}
+
 /* Implemented in IOSDisplayShim.m; declared there for Swift, not exported
  * through a shared ObjC header this pure-C-safe file could include. Same
  * "read the LIVE published size, not a launch-time constant" reasoning as
@@ -1691,6 +1726,29 @@ static UIImage *winios_cursor_image(void) {
 /* Wine cursor image state (px). w==0 → builtin arrow fallback. */
 static int g_cur_w, g_cur_h, g_cur_hx, g_cur_hy;
 static CGPoint g_cursor_pos_px;
+static int g_cursor_pos_seeded;
+
+/* ml1090 — WHO DECIDES WHETHER THE POINTER IS ON SCREEN IN A DIRECT LAUNCH.
+ *
+ * -1 = the driver has not spoken yet, 0/1 = its last winios_cursor_show().
+ * Before it speaks, "an ordinary GDI window is on screen" means there is a
+ * pointer: a directly-launched program whose first window is a dialog only
+ * ever gets a WM_SETCURSOR — and therefore a winios_drv_set_cursor call —
+ * once the mouse is already over one of its windows, which is impossible
+ * while nothing it owns has been drawn. Log 77 is that deadlock exactly: the
+ * chooser dialog was up, every tap reached the server, and the log has not a
+ * single cursor line in it. Once the driver DOES speak, its word wins in both
+ * directions, so a program that hides the pointer still hides it. */
+static int g_cursor_drv_show = -1;
+static unsigned g_cursor_gdi_windows;
+
+/* main thread only */
+static void winios_cursor_apply_visibility(void) {
+    if (!g_cursor_layer) return;
+    if (winios_cursor_desktop_mode()) return;   /* desktop mode is unchanged */
+    g_cursor_layer.hidden = !(g_cursor_drv_show > 0 ||
+                              (g_cursor_drv_show < 0 && g_cursor_gdi_windows > 0));
+}
 
 /* main thread only. Creates the layer at most once (process lifetime, like
  * every other singleton layer in this file) and re-parents it onto
@@ -1724,6 +1782,10 @@ static void winios_ensure_cursor_layer(void) {
          * pSetCursor(NULL)/show(1) that arrives before any image is never
          * lost to this ordering. */
         g_cursor_layer.hidden = winios_cursor_desktop_mode() ? NO : YES;
+        /* ml1090: …unless an ordinary GDI window is already on screen, which
+         * in a direct launch is the only evidence of a pointer the program
+         * can give us before it is ever asked for one. */
+        winios_cursor_apply_visibility();
     }
     if (g_cursor_layer.superlayer != host) {
         [g_cursor_layer removeFromSuperlayer];
@@ -1751,14 +1813,16 @@ static void winios_cursor_place(void) {
      * for why g_game_layer's own bounds ARE the current game rect and no
      * window-coordinate offset belongs here (these are LOCAL sublayer
      * coordinates, origin at the layer's own top-left). */
-    if (!g_game_layer) return;
     int gw = 0, gh = 0;
     winios_screen_size(&gw, &gh);
     if (gw <= 0) gw = 1024;
     if (gh <= 0) gh = 768;
-    CGRect hb = g_game_layer.bounds;
-    if (hb.size.width <= 0 || hb.size.height <= 0) return;
-    CGFloat sx = hb.size.width / gw, sy = hb.size.height / gh;
+    /* ml1090: the PUBLISHED game rect, not g_game_layer.bounds — see
+     * winios_game_rect_size. Before the first Present the layer's bounds are
+     * not the rect Swift laid out. */
+    CGSize hb = winios_game_rect_size();
+    if (hb.width <= 0 || hb.height <= 0) return;
+    CGFloat sx = hb.width / gw, sy = hb.height / gh;
     /* Cursor GLYPH never shrinks past 1x (spec) even when sx/sy < 1 on a
      * small live-view column, but the drawn POSITION still uses the true,
      * unclamped sx/sy — or the arrow would drift off its real hotspot as
@@ -1800,6 +1864,7 @@ void winios_cursor_move(int x, int y) {
         winios_ensure_cursor_layer();
         if (!g_cursor_layer) return;
         g_cursor_pos_px = CGPointMake(x, y);
+        g_cursor_pos_seeded = 1;
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
         winios_cursor_place();
@@ -1860,9 +1925,43 @@ void winios_cursor_show(int show) {
          * doesn't — winios_cursor_move/winios_cursor_set already do that
          * on the very next call in the exact same order they always have,
          * so behaviour there is unchanged. */
-        if (!winios_cursor_desktop_mode()) winios_ensure_cursor_layer();
+        /* ml1090: record the driver's word, then let the one visibility rule
+         * apply it — from here on it overrides the "a GDI window is on screen"
+         * inference in both directions (see g_cursor_drv_show). */
+        g_cursor_drv_show = show ? 1 : 0;
+        if (!winios_cursor_desktop_mode()) {
+            winios_ensure_cursor_layer();
+            winios_cursor_apply_visibility();
+            return;
+        }
         if (g_cursor_layer) g_cursor_layer.hidden = !show;
     });
+}
+
+/* ml1090. Called from winios_overlay_refresh_live (main thread) with the
+ * number of ordinary GDI windows currently on screen — the direct-launch
+ * stand-in for "the pointer is over something of ours", see
+ * g_cursor_drv_show. Also seeds the pointer position: a cursor that appears
+ * at the guest's top-left corner reads as a stuck artefact, and the centre is
+ * where Windows puts an untouched pointer on a fresh desktop. */
+static void winios_cursor_note_gdi_windows(unsigned n) {
+    if (winios_cursor_desktop_mode()) return;
+    g_cursor_gdi_windows = n;
+    if (!n) { winios_cursor_apply_visibility(); return; }
+    if (!g_cursor_pos_seeded) {
+        int gw = 0, gh = 0;
+        winios_screen_size(&gw, &gh);
+        if (gw <= 0) gw = 1024;
+        if (gh <= 0) gh = 768;
+        g_cursor_pos_px = CGPointMake(gw / 2, gh / 2);
+        g_cursor_pos_seeded = 1;
+    }
+    winios_ensure_cursor_layer();
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    winios_cursor_place();
+    [CATransaction commit];
+    winios_cursor_apply_visibility();
 }
 
 /* Swift trackpad engine → wine. Absolute desktop-pixel coords; the
@@ -2051,8 +2150,8 @@ static CGRect winios_overlay_layer_rect(int x, int y, int w, int h) {
     winios_screen_size(&gw, &gh);
     if (gw <= 0) gw = 1024;
     if (gh <= 0) gh = 768;
-    CGRect hb = g_game_layer ? g_game_layer.bounds : CGRectZero;
-    CGFloat sx = hb.size.width / gw, sy = hb.size.height / gh;
+    CGSize hb = winios_game_rect_size();   /* ml1090 — published rect first */
+    CGFloat sx = hb.width / gw, sy = hb.height / gh;
     return CGRectMake(x * sx, y * sy, w * sx, h * sy);
 }
 
@@ -2070,13 +2169,16 @@ static void winios_ensure_overlay(void) {
     if (!g_surf_sizes) g_surf_sizes = [NSMutableDictionary new];
     g_overlay = [CALayer layer];
     g_overlay.anchorPoint = CGPointMake(0, 0);
-    g_overlay.frame = g_game_layer.bounds;
+    /* ml1090: the published game rect — see winios_game_rect_size. The layer's
+     * own bounds are not yet the laid-out rect before the first Present. */
+    g_overlay.frame = (CGRect){ CGPointZero, winios_game_rect_size() };
     g_overlay.zPosition = 5000;    /* above the drawable, below the cursor's 10000 */
     int gw = 0, gh = 0;
     winios_screen_size(&gw, &gh);
     [g_game_layer addSublayer:g_overlay];
-    fprintf(stderr, "[overlay] created host=%p game-rect=%.0fx%.0f guest=%dx%d\n",
-            g_game_layer, g_overlay.frame.size.width, g_overlay.frame.size.height, gw, gh);
+    fprintf(stderr, "[overlay] created host=%p game-rect=%.0fx%.0f (layer bounds %.0fx%.0f) guest=%dx%d\n",
+            g_game_layer, g_overlay.frame.size.width, g_overlay.frame.size.height,
+            g_game_layer.bounds.size.width, g_game_layer.bounds.size.height, gw, gh);
     fflush(stderr);
 }
 
@@ -2094,6 +2196,9 @@ static void winios_overlay_refresh_live(void) {
         if (l && !l.hidden) n++;
     }
     atomic_store(&g_overlay_live, n);
+    /* ml1090: the same count is the direct-launch pointer's "is there anything
+     * of ours on screen" signal — see winios_cursor_note_gdi_windows. */
+    winios_cursor_note_gdi_windows(n);
     if (!g_overlay || g_layers.count) return;
     [g_overlay removeFromSuperlayer];
     g_overlay = nil;
@@ -2118,7 +2223,7 @@ void winios_overlay_relayout(void) {
         if (!g_overlay || !g_game_layer) return;
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
-        g_overlay.frame = g_game_layer.bounds;
+        g_overlay.frame = (CGRect){ CGPointZero, winios_game_rect_size() };   /* ml1090 */
         for (NSNumber *key in g_px_rects) {
             CALayer *l = g_layers[key];
             CGRect r = g_px_rects[key].CGRectValue;

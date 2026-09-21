@@ -817,7 +817,39 @@ ATOM WINAPI NtUserGetClassInfoEx( HINSTANCE instance, UNICODE_STRING *name, WNDC
         }
         atom = class_shm->atom;
     }
-    if (status) return 0;
+    /* iOS-Madeira ml1090: THIS RETURN LEAKED THE USER LOCK, AND THE LEAK KILLED
+     * THE SESSION.
+     *
+     * find_class() returns with the USER lock HELD (release_class_ptr drops
+     * it), and upstream's `if (status) return 0;` drops out without releasing.
+     * Upstream that path is unreachable: get_shared_class only fails when
+     * class->shared is NULL, which a registered class never has.
+     *
+     * It is reachable HERE because this port added the freed-shared-object
+     * guard to get_shared_class/get_shared_window_class above (`if
+     * (!object->id) return STATUS_INVALID_HANDLE`) — and that guard exists
+     * precisely because class_list is a SINGLE win32u list shared by every
+     * pseudo-process, so a process that dies without unregistering leaves
+     * entries whose shared object has been freed (id == 0). Any later class
+     * lookup that walks onto one of those entries used to spin forever; since
+     * the guard it returns an error — through this return, with the lock still
+     * held.
+     *
+     * What that cost on device (logs 75 and 78, two unrelated titles): the
+     * very next win32u entry point on the same thread hit user_check_not_lock,
+     * which asserted, and the abort could not unwind the mutex — so the
+     * session-wide USER lock was left held by a thread that was being killed
+     * and every other pseudo-process's message pump parked in
+     * __psynch_mutexwait for the rest of the run. Black screen, [frame] n=0.
+     *
+     * user_check_not_lock() now recovers rather than aborting, but the leak
+     * itself is the bug: release the lock on every exit, as every other caller
+     * of find_class/get_class_ptr in this file already does. */
+    if (status)
+    {
+        release_class_ptr( class );
+        return 0;
+    }
 
     if (menu_name) *menu_name = class->menu_name;
     release_class_ptr( class );

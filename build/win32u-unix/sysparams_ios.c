@@ -27,6 +27,7 @@
 #include <pthread.h>
 #include <assert.h>
 #include <unistd.h>  /* iOS-Madeira: dprintf for BADMODE diagnostic */
+#include <sched.h>   /* iOS-Madeira ml1090: sched_yield in the USER-lock wait */
 #include <stdio.h>
 
 #include "ntstatus.h"
@@ -356,25 +357,229 @@ static pthread_mutex_t display_dc_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t user_mutex;
 static unsigned int user_lock_thread, user_lock_rec;
 
+/* iOS-Madeira ml1090: THE USER LOCK IS PROCESS-WIDE HERE IN A WAY IT NEVER IS
+ * ON WINDOWS, SO LOSING IT IS FATAL TO THE WHOLE SESSION.
+ *
+ * Upstream win32u is loaded once per process, so `user_mutex` protects one
+ * process's window handles and a process that dies holding it takes only
+ * itself down. In this port every pseudo-process is a set of threads in ONE
+ * Mach task sharing ONE win32u, so this single mutex serialises the shell, the
+ * title, rpcss and every service. A thread that dies while holding it wedges
+ * everything that ever touches a user handle — which is every message pump.
+ *
+ * Device evidence (logs 75 and 78, two unrelated titles, same shape):
+ *
+ *   00b8:err:system:user_check_not_lock BUG: holding USER lock
+ *   Assertion failed: (0), function user_check_not_lock, ... line 376.
+ *   ... NtTerminateProcess ... MADEIRA-EXIT
+ *
+ * and then, for the rest of the run, three threads in three different
+ * pseudo-processes parked in __psynch_mutexwait on this mutex with no live
+ * owner anywhere in the thread dump — a black screen and [frame] n=0 forever.
+ * The abort is what makes the leak permanent: assert() cannot unwind a lock.
+ *
+ * The changes, each with its own kill switch:
+ *   - the owner is tracked by Mach port as well as by wine tid, so a report
+ *     can say whether the owner thread still EXISTS;
+ *   - user_check_not_lock() RELEASES a leaked lock and logs instead of
+ *     aborting (MADEIRA_USERLOCK_RECOVER=0 restores the assert);
+ *   - user_lock_abandon() lets the pseudo-process teardown path drop the lock
+ *     of a thread that is about to be killed (process_ios.c, thread_ios.c);
+ *   - a waiter that has been blocked more than five seconds prints one
+ *     [user-lock] line naming the owner and whether that thread still exists
+ *     (MADEIRA_USERLOCK_WATCH=0 restores the plain blocking
+ *     pthread_mutex_lock);
+ *   - and, for a kill this port cannot hook at all (the server's violent
+ *     kill_thread), a confirmed dead owner is repaired out from under the
+ *     waiters (MADEIRA_USERLOCK_REPAIR=0). */
+static unsigned int user_lock_port;   /* Mach port name of the current owner */
+
+/* Implemented in build/ntdll-unix/signal_arm64_ios.c. Weak: win32u links and
+ * runs without them, in which case the report degrades to the wine tid only. */
+extern unsigned int ios_mach_self_port(void) __attribute__((weak));
+extern int ios_mach_port_alive( unsigned int port ) __attribute__((weak));
+/* build/ntdll-unix/virtual_ios.c — gives [thread-stacks] a name for this lock
+ * instead of the bare address it printed in logs 75/78. */
+extern void ios_register_unix_lock( const void *lock, const char *name ) __attribute__((weak));
+
+static int ios_user_lock_knob( const char *name )
+{
+    const char *env = getenv( name );
+    return !(env && *env == '0');
+}
+
+static int ios_user_lock_watch(void)
+{
+    static int on = -1;
+    if (on < 0) on = ios_user_lock_knob( "MADEIRA_USERLOCK_WATCH" );
+    return on;
+}
+
+static int ios_user_lock_repair(void)
+{
+    static int on = -1;
+    if (on < 0) on = ios_user_lock_knob( "MADEIRA_USERLOCK_REPAIR" );
+    return on;
+}
+
+/* Contended path only: poll for the lock so a wait that never ends can name
+ * its owner. Yields first (real contention on this lock is measured in
+ * microseconds and never reaches the sleep), then polls at 1 ms, then reports
+ * ONCE at five seconds and keeps waiting. */
+static void ios_user_lock_wait_slow(void)
+{
+    unsigned int waited_ms = 0, spins, confirm_ms = 0;
+    unsigned int owner, port, last_owner = 0, last_port = 0;
+    int reported = 0, alive;
+
+    for (spins = 0; spins < 256; spins++)
+    {
+        sched_yield();
+        if (!pthread_mutex_trylock( &user_mutex )) return;
+    }
+
+    for (;;)
+    {
+        usleep( 1000 );
+        waited_ms++;
+        if (!pthread_mutex_trylock( &user_mutex ))
+        {
+            if (reported)
+                dprintf( STDERR_FILENO, "[user-lock] ml1090 tid=%04x ACQUIRED after %u.%03us\n",
+                         (unsigned)GetCurrentThreadId(), waited_ms / 1000, waited_ms % 1000 );
+            return;
+        }
+        if (waited_ms < 5000) continue;
+        owner = user_lock_thread;
+        port = user_lock_port;
+        alive = !port ? -1 : (ios_mach_port_alive ? !!ios_mach_port_alive( port ) : -1);
+        if (!reported)
+        {
+            reported = 1;
+            dprintf( STDERR_FILENO, "[user-lock] ml1090 tid=%04x has waited %us for the USER lock — "
+                     "owner tid=%04x port=0x%x owner-thread-alive=%s rec=%u. An owner that no longer "
+                     "exists means a thread died holding it and every pseudo-process is now wedged\n",
+                     (unsigned)GetCurrentThreadId(), waited_ms / 1000, owner, port,
+                     alive < 0 ? "unknown" : (alive ? "yes" : "NO"), user_lock_rec );
+        }
+
+        /* LAST-RESORT REPAIR. Every path this port controls now drops the lock
+         * before a thread can die holding it (user_lock_abandon from the
+         * teardown paths, and user_check_not_lock's recovery), but a thread
+         * killed from OUTSIDE its own control flow — the server's violent
+         * kill_thread, a Mach exception that never reaches a handler — cannot
+         * be hooked at all. Without this the session is simply over.
+         *
+         * Repair only when the evidence is unambiguous and stable: the same
+         * dead owner seen twice, ten seconds apart. Re-initialising a held
+         * mutex is not something to do lightly, but the alternative here is a
+         * permanently wedged session, and the owner it belongs to no longer
+         * exists. Several waiters may repair concurrently; that is harmless
+         * (the second re-init finds an unheld mutex) and it is loud either
+         * way. MADEIRA_USERLOCK_REPAIR=0 leaves the waiter blocked instead,
+         * which is the pre-ml1090 behaviour. */
+        if (alive != 0 || owner != last_owner || port != last_port)
+        {
+            last_owner = owner;
+            last_port = port;
+            confirm_ms = waited_ms;
+            continue;
+        }
+        if (waited_ms - confirm_ms < 10000) continue;
+        if (!ios_user_lock_repair()) { confirm_ms = waited_ms; continue; }
+
+        dprintf( STDERR_FILENO, "[user-lock] ml1090 REPAIR: owner tid=%04x port=0x%x no longer "
+                 "exists and has held the USER lock for %us — reinitialising the mutex and "
+                 "handing it to tid=%04x (MADEIRA_USERLOCK_REPAIR=0 to wait instead)\n",
+                 owner, port, waited_ms / 1000, (unsigned)GetCurrentThreadId() );
+        {
+            pthread_mutexattr_t attr;
+            pthread_mutexattr_init( &attr );
+            pthread_mutexattr_settype( &attr, PTHREAD_MUTEX_RECURSIVE );
+            user_lock_rec = 0;
+            user_lock_thread = 0;
+            user_lock_port = 0;
+            pthread_mutex_init( &user_mutex, &attr );
+            pthread_mutexattr_destroy( &attr );
+        }
+        if (!pthread_mutex_trylock( &user_mutex )) return;
+        /* somebody else won the repaired lock: fall back to waiting for it */
+        confirm_ms = waited_ms;
+    }
+}
+
 void user_lock(void)
 {
-    pthread_mutex_lock( &user_mutex );
-    if (!user_lock_rec++) user_lock_thread = GetCurrentThreadId();
+    if (!ios_user_lock_watch()) pthread_mutex_lock( &user_mutex );
+    else if (pthread_mutex_trylock( &user_mutex )) ios_user_lock_wait_slow();
+    if (!user_lock_rec++)
+    {
+        user_lock_thread = GetCurrentThreadId();
+        user_lock_port = ios_mach_self_port ? ios_mach_self_port() : 0;
+    }
 }
 
 void user_unlock(void)
 {
-    if (!--user_lock_rec) user_lock_thread = 0;
+    if (!--user_lock_rec)
+    {
+        user_lock_thread = 0;
+        user_lock_port = 0;
+    }
     pthread_mutex_unlock( &user_mutex );
+}
+
+/***********************************************************************
+ *           user_lock_abandon          (iOS-Madeira ml1090)
+ *
+ * Drop the calling thread's whole hold on the USER lock, however deep the
+ * recursion. Called from the pseudo-process teardown paths so a thread that is
+ * about to stop existing cannot take the session's window handles with it, and
+ * from user_check_not_lock() below when a leak is detected. A no-op on any
+ * thread that does not own the lock, so it is safe to call unconditionally.
+ */
+void user_lock_abandon(void)
+{
+    if (!user_lock_rec || user_lock_thread != GetCurrentThreadId()) return;
+
+    dprintf( STDERR_FILENO, "[user-lock] ml1090 tid=%04x is going away while holding the USER "
+             "lock (rec=%u) — releasing it so the rest of the session keeps running\n",
+             (unsigned)GetCurrentThreadId(), user_lock_rec );
+
+    while (user_lock_rec)
+    {
+        if (!--user_lock_rec)
+        {
+            user_lock_thread = 0;
+            user_lock_port = 0;
+        }
+        pthread_mutex_unlock( &user_mutex );
+    }
 }
 
 void user_check_not_lock(void)
 {
-    if (user_lock_thread == GetCurrentThreadId())
+    static int strict = -1;
+
+    if (user_lock_thread != GetCurrentThreadId()) return;
+
+    if (strict < 0) strict = !ios_user_lock_knob( "MADEIRA_USERLOCK_RECOVER" );
+    if (strict)
     {
         ERR( "BUG: holding USER lock\n" );
         assert( 0 );
     }
+
+    /* A caller reached a blocking win32u entry point (message wait, winproc
+     * dispatch, inter-thread send) without releasing the lock — see this
+     * block's opening comment for why aborting here is worse than recovering:
+     * the abort cannot unwind the mutex, so it would hand a session-wide lock
+     * to a thread that is about to be killed. */
+    dprintf( STDERR_FILENO, "[user-lock] ml1090 LEAK tid=%04x reached a blocking win32u call "
+             "still holding the USER lock (rec=%u) — released here instead of aborting "
+             "(MADEIRA_USERLOCK_RECOVER=0 restores the upstream assert)\n",
+             (unsigned)GetCurrentThreadId(), user_lock_rec );
+    user_lock_abandon();
 }
 
 static HANDLE get_display_device_init_mutex( void )
@@ -6510,6 +6715,9 @@ void sysparams_init(void)
     pthread_mutexattr_settype( &attr, PTHREAD_MUTEX_RECURSIVE );
     pthread_mutex_init( &user_mutex, &attr );
     pthread_mutexattr_destroy( &attr );
+    /* ml1090: so [thread-stacks] prints "lock=win32u:user_mutex" instead of the
+     * bare address logs 75/78 had to be decoded by hand. */
+    if (ios_register_unix_lock) ios_register_unix_lock( &user_mutex, "win32u:user_mutex" );
 
     if ((hkey = reg_create_ascii_key( hkcu_key, "Keyboard Layout\\Preload", 0, NULL )))
     {

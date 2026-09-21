@@ -734,6 +734,17 @@ static BOOL winios_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *sur
     BITMAPINFO *info = (BITMAPINFO *)buffer;
     struct window_surface *previous;
 
+    /* ml1090: NEVER give the DESKTOP window a surface in a direct launch.
+     *
+     * The desktop window is now sized to the virtual screen even without a
+     * shell (winstation_ios.c, [desktop-rect]) so that every CenterWindow
+     * helper and DS_CENTER dialog has a screen to centre on. A screen-sized
+     * window with a GDI surface is a screen-sized opaque backdrop, and the
+     * overlay would draw it straight over the presented game image — the
+     * exact failure winios_ensure_compositor refuses to allow in this mode.
+     * The desktop is a coordinate system here, never a painted surface. */
+    if (winios_direct_overlay() && hwnd == get_desktop_window()) return FALSE;
+
     if ((previous = *window_surface) && previous->funcs == &winios_surface_funcs
         && EqualRect( &previous->rect, surface_rect )) return TRUE;
 
@@ -921,11 +932,27 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
             static unsigned diag_n;
             if (diag_n++ < 8)
             {
+                /* ml1090: RESOLVE THE DESKTOP FIRST, IN ITS OWN STATEMENT.
+                 *
+                 * get_win_ptr() only maps a handle to WND_DESKTOP when
+                 * is_desktop_window() says so, and that test reads THIS
+                 * THREAD's thread_info->top_window — which get_desktop_window()
+                 * is what fills in. As one argument list the evaluation order
+                 * is unspecified, and clang evaluated the style query first: on
+                 * a thread that had not yet resolved the desktop, log 77 printed
+                 * parent=0x10020 desktop=0x10020 parent_style=00000000
+                 * parent_vis=0 — the same handle answered as "the desktop" and
+                 * as a style-less foreign window in one line, which cost real
+                 * time to disbelieve. */
+                HWND desktop = get_desktop_window();
+                HWND msgwin = get_hwnd_message_parent();
                 HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
+                DWORD parent_style = get_window_long( parent, GWL_STYLE );
+                BOOL parent_vis = is_window_visible( parent );
+
                 dprintf( 2, "MADEIRA-TEMP [paint-diag] hwnd=%p swp=%08x parent=%p desktop=%p "
                          "msgwin=%p parent_style=%08x parent_vis=%d\n", hwnd, (unsigned)swp_flags,
-                         parent, get_desktop_window(), get_hwnd_message_parent(),
-                         (unsigned)get_window_long( parent, GWL_STYLE ), is_window_visible( parent ) );
+                         parent, desktop, msgwin, (unsigned)parent_style, parent_vis );
             }
         }
         NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN );

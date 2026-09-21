@@ -235,6 +235,20 @@ enum GuestDisplay {
         setenv("MADEIRA_SCREEN_W", String(mode.w), 1)
         setenv("MADEIRA_SCREEN_H", String(mode.h), 1)
         setenv("MADEIRA_SCREEN_SRC", source, 1)
+        // ml1090 — PUBLISH IT, DON'T ONLY EXPORT IT.
+        //
+        // IOSDisplayShim's cache seeds itself from MADEIRA_SCREEN_W/H on its
+        // FIRST read and then never re-reads the environment (win32u owns the
+        // value afterwards). Any `guestSize()` during the app's own first
+        // layout runs before this function does, so the cache latched the
+        // 1024x768 fallback and everything scaled from it disagreed with the
+        // monitor win32u reports. Log 77: "[display] virtual monitor 1280x720
+        // (source=view)" and, 1000 lines later, "[overlay] created ...
+        // guest=1024x768" — two different ideas of the same desktop, so the
+        // overlay, the drawn cursor and the touch mapping were all scaled by
+        // the wrong number. This is the same call win32u makes when a guest
+        // changes mode, so there is one publisher and one value.
+        winios_display_mode_changed(Int32(mode.w), Int32(mode.h))
         return (mode.w, mode.h, source)
     }
 
@@ -741,6 +755,16 @@ final class MetalBackedView: UIView {
         let rawDrawable = MetalHostView.shared.metalLayer.drawableSize
         let r = gameRect()
         MetalHostView.shared.frame = convert(r, to: w)
+        // ml1090 — PUBLISH THE RECT WE JUST LAID OUT.
+        //
+        // The direct-launch cursor and the GDI overlay used to read the game
+        // rect back off the presented layer's bounds, which are only right
+        // once a drawable has actually been presented into it. A program whose
+        // first window is a dialog has presented nothing yet, so the overlay
+        // was built against a stale rect (log 77: game-rect=320x240 while this
+        // apply had chosen 402x226) and everything it drew was scaled wrong.
+        // This is the same `r` the touch mapping uses, so all three agree.
+        winios_set_game_rect(r.width, r.height)
         // The direct-launch cursor is a sublayer of MetalHostView.shared's own
         // layer, positioned from that layer's LOCAL bounds (see Winios.m's
         // winios_set_game_layer doc comment) — which just changed size/shape
@@ -4587,6 +4611,10 @@ struct ContentView: View {
                     // explorer owns the size in desktop mode; say so in the
                     // [display] virtual monitor line win32u prints at session start.
                     setenv("MADEIRA_SCREEN_SRC", "desktop", 1)
+                    // ml1090 — same reason as configureSessionDefault's own
+                    // publish: the shim's cache may already have latched the
+                    // 1024x768 fallback from an earlier layout pass.
+                    winios_display_mode_changed(Int32(deskW), Int32(deskH))
                     runWineFullSequence()
                 }
                 .buttonStyle(.borderedProminent)

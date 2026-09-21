@@ -13165,6 +13165,37 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
 
 #endif  /* __aarch64__ */
 
+/***********************************************************************
+ *           ios_mach_self_port / ios_mach_port_alive   (iOS-Madeira ml1090)
+ *
+ * Identity for a lock owner that the [user-lock] report can still resolve
+ * AFTER that owner has stopped existing — which is the whole question logs 75
+ * and 78 left open (three threads parked on win32u's user_mutex and no live
+ * owner anywhere in the dump). A wine tid alone cannot answer it: the server
+ * recycles tids, and a dead thread's tid is indistinguishable from a live
+ * one's.
+ *
+ * pthread_mach_thread_np() returns the thread's port NAME and, unlike
+ * mach_thread_self(), takes no reference, so there is nothing to deallocate
+ * and nothing to leak on a path that runs under a lock. A name belonging to a
+ * dead thread has been deallocated, so thread_info() fails on it — which is
+ * exactly the "does it still exist" signal. A recycled name can give a false
+ * "yes"; the report prints the wine tid too, so a human can tell.
+ */
+unsigned int ios_mach_self_port(void)
+{
+    return (unsigned int)pthread_mach_thread_np( pthread_self() );
+}
+
+int ios_mach_port_alive( unsigned int port )
+{
+    struct thread_basic_info bi;
+    mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
+
+    if (!port) return 0;
+    return thread_info( (thread_act_t)port, THREAD_BASIC_INFO, (thread_info_t)&bi, &cnt ) == KERN_SUCCESS;
+}
+
 /* ============================================================ *
  * [thread-stacks] all-thread stack sampler — diagnoses wedged wine
  * threads (S2: explorer main leaves its message pump and blocks

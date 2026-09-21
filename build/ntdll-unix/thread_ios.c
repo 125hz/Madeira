@@ -1762,11 +1762,36 @@ void abort_thread( int status )
 }
 
 
+#ifdef WINE_IOS
+/* iOS-Madeira ml1090: DROP WIN32U'S USER LOCK BEFORE THIS THREAD STOPS
+ * EXISTING.
+ *
+ * win32u is loaded once for the whole Mach task here, so its `user_mutex` is
+ * one lock shared by the shell, every title and every service — see the long
+ * comment on it in build/win32u-unix/sysparams_ios.c. A thread killed while
+ * holding it wedges every message pump in the session (device logs 75 and 78:
+ * three pseudo-processes parked in __psynch_mutexwait with no live owner, and
+ * a black screen for the rest of the run).
+ *
+ * Weak, because ntdll must still link in a build without win32u, and a no-op
+ * on any thread that does not own the lock — so it is safe on every exit path.
+ */
+extern void user_lock_abandon(void) __attribute__((weak));
+
+static void ios_drop_user_lock(void)
+{
+    if (user_lock_abandon) user_lock_abandon();
+}
+#else
+static void ios_drop_user_lock(void) { }
+#endif
+
 /***********************************************************************
  *           abort_process
  */
 void abort_process( int status )
 {
+    ios_drop_user_lock();
 #ifdef WINE_IOS
     /* iOS-Madeira: _exit() KILLS THE WHOLE APP.
      *
@@ -1809,6 +1834,7 @@ static DECLSPEC_NORETURN void exit_thread( int status )
     static void *prev_teb;
     TEB *teb;
 
+    ios_drop_user_lock();
     pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
 
     if (InterlockedDecrement( &nb_threads ) <= 0) exit_process( status );
@@ -1832,6 +1858,7 @@ static DECLSPEC_NORETURN void exit_thread( int status )
  */
 void exit_process( int status )
 {
+    ios_drop_user_lock();
 #ifdef WINE_IOS
     ERR("exit_process: raw_status=0x%x unix_code=%d\n", (unsigned)status, get_unix_exit_code(status));
 #endif

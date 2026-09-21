@@ -6590,6 +6590,22 @@ static pthread_mutex_t ios_wow_mutex = PTHREAD_MUTEX_INITIALIZER;
  * them in the log instead. Addresses only; no state is read, so this is safe to
  * call from a sampler while the lock is held.
  */
+/* ml1090: locks outside ntdll register themselves here (win32u's user_mutex is
+ * the first — see build/win32u-unix/sysparams_ios.c). Append-only, written once
+ * per lock at init and read by a sampler, so no lock of its own. */
+#define IOS_REGISTERED_LOCKS 16
+static struct { const void *p; const char *name; } ios_registered_locks[IOS_REGISTERED_LOCKS];
+static unsigned ios_registered_lock_count;
+
+void ios_register_unix_lock( const void *lock, const char *name )
+{
+    if (!lock || !name) return;
+    if (ios_registered_lock_count >= IOS_REGISTERED_LOCKS) return;
+    ios_registered_locks[ios_registered_lock_count].p = lock;
+    ios_registered_locks[ios_registered_lock_count].name = name;
+    ios_registered_lock_count++;
+}
+
 const char *ios_name_unix_lock( unsigned long long addr )
 {
     struct { const void *p; const char *name; } known[] = {
@@ -6603,6 +6619,9 @@ const char *ios_name_unix_lock( unsigned long long addr )
     if (!addr) return NULL;
     for (i = 0; i < sizeof(known) / sizeof(known[0]); i++)
         if (addr == (unsigned long long)(uintptr_t)known[i].p) return known[i].name;
+    for (i = 0; i < ios_registered_lock_count; i++)
+        if (addr == (unsigned long long)(uintptr_t)ios_registered_locks[i].p)
+            return ios_registered_locks[i].name;
     return NULL;
 }
 
