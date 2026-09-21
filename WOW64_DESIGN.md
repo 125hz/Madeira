@@ -13702,3 +13702,109 @@ Verified release artifact: 154,810,775 bytes (147.64 MiB), modified
 357d934e540c07de8c8f95c7acca1ceecaa2bdb0f7c3cb514359847ec19fd654.
 Fork commits: dxmt 6263d1f (ios-port), Madeira 5b7a1df (main).
 Wine 96c954c75af and FEX 9d3a1ca39 are unchanged. No upstream PR.
+
+## 2026-09-21 — ml1150: asynchronous query pacing, frame tails, and optional session UI
+
+Owner supplied logs 98, 99, 109, prev (9), 110, and 111, plus three interface
+screenshots. Priorities remain generic performance, compatibility, then frontend.
+No executable-name checks or application-specific patches were introduced.
+
+### Evidence and limits
+
+- Log 98 confirms the ml1140 drawable is 1280x720 rather than a 3x-scaled target.
+  Later windows include 42–51 FPS, while the owner reports roughly 35–40 FPS in
+  play. The owner attributes a temporary roughly 30 FPS stretch to screen recording.
+  That interval must not be treated as a renderer regression or a clean baseline.
+- Log 99 has 679,063 D3D9 query polls, with 134,890 parked (19.9%), roughly 170
+  polls per frame and 136 query issues per frame. The old query object counted
+  pending checks across its entire lifetime after Issue(END), so even checks
+  separated by whole frames eventually incurred a bounded cooperative wait.
+  This is a source-level explanation of avoidable waiting, not measured proof
+  that it accounts for every reported hitch.
+- Late log 111 continues presenting near 60 FPS with very low game/encode work.
+  A late ten-second window has only a few milliseconds of file reads. Late-wake
+  counters remain zero. This does not support a file-throughput explanation of
+  the managed loading hang. A fresh-session semaphore-path A/B and the guest
+  runtime's Player.log are still needed; no successful load is claimed.
+- Log 110 fails before graphics initialization. It jumps to guest 0xfffffffe
+  after rewriting entrypoints, then reports an exception code of zero. The FEX
+  synthesized execute-page-fault branch populated execute/address parameters
+  without assigning EXCEPTION_ACCESS_VIOLATION. Correcting that record does not
+  make the invalid destination valid or establish that startup now succeeds.
+  Log 109 contains only app initialization and cannot diagnose guest execution.
+
+### Generic core and instrumentation changes
+
+- DXMT query throttling now tracks pending-poll bursts. A gap above 250us resets
+  the burst; tight loops keep the prior bounded back-pressure, and flush/submit
+  semantics remain unchanged. Completed queries avoid the additional clock read.
+  DXMT_D9_QUERY_ADAPTIVE=0 restores lifetime counting; [query-pacing] ml1150
+  confirms the selected behavior. Compare [d3d9-query] parked ratios on device.
+- [frame-tail] ml1150 reports p99/p99.9/max and counts at/above 50ms and 100ms.
+  Histogram capacity is 4096 one-ms bins rather than 64, so long frames no longer
+  collapse into the 64ms bin. Intervals >=4s remain excluded. Short windows have
+  too few samples for a stable p99.9; compare multiple equivalent windows.
+  MADEIRA_FRAME_STATS=0 disables this with the existing frame instrumentation.
+- Hidden frontend logs stop the display file watcher/parser while full raw file
+  capture continues. [ui-log-idle] ml1150 records transitions. This removes
+  invisible string parsing and SwiftUI publication; MADEIRA_UI_LOG_IDLE=0 restores
+  the old display work. Hidden lines are not replayed into the UI afterwards.
+- Both FEX DLLs now assign access-violation status for generated execute faults.
+  MADEIRA_EXEC_FAULT_CODE=0 restores the inherited code. [exec-fault] ml1150 is
+  limited to four messages per module. No thread_local was added; PE TLS payload
+  sizes match the prior artifacts (24 bytes WOW64, 32 bytes ARM64EC).
+- Quit queues termination on the server thread using Wine's existing process
+  teardown. Main guest-thread pthread cleanup handles both normal and SIGQUIT
+  exits and waits for server shutdown before publishing completion. Server stop
+  flags reset on start. MADEIRA_SESSION_STOP=0 restores Alt-F4; [session-stop]
+  ml1150 identifies request, server handling, and guest-thread retirement.
+
+### Optional frontend
+
+- Equal 2:3 covers and reserved title height, architecture/imported-API badges,
+  removed tagline, JIT/memory dots, explicit Play glyph, artwork detail background,
+  nearest-match Steam metadata, and a first-frame launch artwork/spinner transition.
+  Imported API badges are not proof of the active renderer; dynamic imports can
+  remain API auto. First frame is not proof that application loading is finished.
+- Readable dark session panel, reduced-motion-aware transitions, fading draggable
+  menu button, labeled FPS limit, independent FPS/average-frame-time/RAM/battery
+  fields, and a UIKit key-window keyboard with modifier/navigation accessory keys.
+- Controller D-pad/stick card browsing, A details/play, B back, Y add, shoulders
+  switch tabs, and Back+Start session menu. Guest pad input is neutral while the UI
+  owns it. Detailed settings/browser remain touch-driven, and keyboard typing uses
+  the existing US/ASCII mapping. FRONTEND_CONTROLLER / FRONTEND_KEYBOARD knobs
+  prefixed with MADEIRA_ and set to 0 restore their previous behavior.
+- Library and Settings tabs; Settings hosts Enable JIT, the existing extended
+  diagnostics switch, pointer sensitivity, and existing controller mouse option.
+  The session menu exposes the existing Absolute/Relative/Touch pointer modes.
+  Desktop uses the existing explorer/services virtual-desktop launch sequence;
+  a compositor surface counter lets GDI sessions dismiss startup artwork too.
+- Optional profile fields decode older library JSON. Fast semaphore waits can be
+  disabled per profile for the pending comparison; absent overrides inherit the
+  text environment. Removing MADEIRA_FRONTEND=1 still restores the diagnostic UI.
+  See docs/OPTIONAL_LIBRARY.md for controls, rollback switches, and limitations.
+
+### Build, publication, and required device checks
+
+Rebuilt native Wine (32 ntdll and 46 win32u units successful, zero failed, server
+archive repacked), DXMT (83 native units successful, zero failed, i386 payloads
+installed), WOW64 FEX and ARM64EC FEX. Final release build printed IPA verified.
+Content checks found current markers in native archives and the linked Mach-O,
+and verified packaged PE bytes exactly match the freshly built source artifacts:
+i386 D3D9 machine 0x14c, WOW64 FEX 0xaa64, ARM64EC FEX AMD64 container 0x8664.
+Existing PE TLS payload sizes are unchanged. No emulator/device execution occurred
+on the build PC; compile/content verification is not runtime validation.
+
+IPA: 154,983,223 bytes (147.8035 MiB), 2026-09-21 18:18:04 CDT.
+SHA-256: 81b3863f2b3cfcc376498b41c84b0dc13d132192cb7950840554cc190d014330.
+Pushed submodules first: FEX 471d8bedd to 125hz/FEX ios-port-2607; DXMT 091c2c5
+to 125hz/dxmt ios-port. Root implementation 3bc7159 pushed to 125hz/Madeira main.
+No upstream push or PR. This entry follows that implementation publication.
+
+Next device pass: compare the same scene without screen recording, at unchanged
+resolution/frame cap and similar thermals; collect several [frame-tail], [frame],
+[gpu-work], and [d3d9-query] windows. For the loading hang, restart Madeira between
+Fast semaphore waits on/off runs, and preserve Player.log if available. Retest the
+startup failure for [exec-fault]/[exc-disp]. Separately check keyboard modifiers,
+quit/return, desktop, pointer modes, portrait/landscape layout, controller focus,
+and menu readability/fading. 60 FPS and compatibility fixes remain unverified.
