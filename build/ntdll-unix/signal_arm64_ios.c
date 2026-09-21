@@ -7234,6 +7234,8 @@ static int ios_redeliv_redirect_to_abort( thread_t thread, arm_thread_state64_t 
  * declared here because the Mach path must run the SAME emulator — see the
  * [unaligned-atomic] block below for why the two paths may not disagree. */
 static int ios_emulate_unaligned_guest_access(ucontext_t *ctx, uint32_t insn, uintptr_t addr);
+/* ml1120 kill switch, defined next to ios_handle_unix_fault further down. */
+static int ios_syscall_fault_enabled( void );
 
 static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_state64_t *state,
                                                    arm_neon_state64_t *neon, int have_neon,
@@ -7318,6 +7320,66 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
         }
         if (!teb)
         {
+            /* ml1120: A FAULT ON THE UNIX-SIDE (KERNEL) STACK BELONGS TO THE
+             * SYSCALL, NOT TO THE GUEST — AND THAT IS PRECISELY WHY NO TEB
+             * OWNS THIS SP.
+             *
+             * is_inside_syscall() tests exactly the window checked here, and a
+             * thread inside a syscall is running on its kernel stack, which is
+             * deliberately outside (DeallocationStack, Tib.StackBase] — so the
+             * containment loop above can only fail.  Best-effort delivery then
+             * pushes a guest exception frame with a HOST pc and a HOST sp,
+             * which call_seh_handlers rejects ("invalid frame") and
+             * NtRaiseException turns into NtTerminateProcess.
+             *
+             * Decline instead: the kernel converts the exception to a BSD
+             * signal, bus_handler/segv_handler run on the faulting thread and
+             * ios_handle_unix_fault() applies the upstream semantics (longjmp
+             * out of the probe, or return the status from the syscall).  All
+             * reads go through mach_vm_read_overwrite so a bad candidate
+             * cannot fault this thread. */
+            if (ios_syscall_fault_enabled())
+            {
+                const mach_vm_address_t ks_off = offsetof(TEB, GdiTebBatch)
+                    + offsetof(struct ntdll_thread_data, kernel_stack);
+                const mach_vm_address_t sf_off = offsetof(TEB, GdiTebBatch)
+                    + offsetof(struct ntdll_thread_data, syscall_frame);
+                int k;
+
+                for (k = 0; k < 2; k++)
+                {
+                    uint64_t kstack = 0, sframe = 0;
+                    mach_vm_size_t got = 0;
+
+                    if (cand[k] < 0x10000 || (cand[k] & 0xfff)) continue;
+                    if (mach_vm_read_overwrite( mach_task_self(),
+                            (mach_vm_address_t)(cand[k] + ks_off), 8,
+                            (mach_vm_address_t)&kstack, &got ) != KERN_SUCCESS
+                        || got != 8 || !kstack)
+                        continue;
+                    if (mach_vm_read_overwrite( mach_task_self(),
+                            (mach_vm_address_t)(cand[k] + sf_off), 8,
+                            (mach_vm_address_t)&sframe, &got ) != KERN_SUCCESS
+                        || got != 8 || !sframe)
+                        continue;
+                    if (sp >= kstack && sp <= sframe)
+                    {
+                        static int ks_declines;
+                        if (ks_declines < 16)
+                        {
+                            ks_declines++;
+                            dprintf( 2, "[syscall-fault] ml1120 mach-path DECLINE sp=0x%llx is on the unix "
+                                        "kernel stack [0x%llx..0x%llx] of teb=0x%llx (pc=0x%llx addr=0x%llx) "
+                                        "-> BSD signal path unwinds the syscall\n",
+                                     (unsigned long long)sp, (unsigned long long)kstack,
+                                     (unsigned long long)sframe, (unsigned long long)cand[k],
+                                     (unsigned long long)pc, (unsigned long long)fault_addr );
+                        }
+                        return 0;
+                    }
+                }
+            }
+
             /* ml540: NATIVE (non-guest) THREAD -> DECLINE, before best-effort.
              *
              * ml539 was the first run of a guest exe that EXITS. After Wine's

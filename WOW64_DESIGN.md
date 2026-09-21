@@ -13137,3 +13137,246 @@ guest-slots=… verdict=…`). Consequences:
   7. Desktop session, after any `[display] guest surface is now WxH`: a
      `[winios] compositor layout: ... desk=WxH ...` whose `desk=` is that NEW
      size. The old size there is this round's compositor fix not firing.
+
+- **2026-09-21 — a bad user buffer killed the whole program: on Darwin the
+  probe's fault is a SIGBUS, and the SIGBUS handler had no syscall-unwind
+  path, so a fault taken on the UNIX stack inside `NtWriteFile` was dispatched
+  as a GUEST exception with a host pc and a host sp (`[syscall-fault]`,
+  ml1120).**
+
+  **THE EVIDENCE.** `madeira-log (90).txt` lines ~3855–3945, a 32-bit
+  scripting-engine title writing its own script log. The buffer it handed
+  `WriteFile` starts inside RESERVED-BUT-NOT-COMMITTED memory — `[fault-rgn]
+  addr=0x7105ff2a38 … vprot prev/this/next=23/03/03`, `region=0x7105ff0000
+  +0xc20000 prot=0 max=7`, and the page census prints 96 `X`es: not one 16 KB
+  page of that region ever materialised. The backtrace is unambiguous:
+
+      sym pc=Madeira`virtual_check_buffer_for_read+0x54
+      bt[0] Madeira`NtWriteFile+0x148
+      bt[1] Madeira`__wine_syscall_dispatcher+0xfc
+
+  i.e. the unix side was PROBING the caller's buffer, which is exactly what it
+  is supposed to do and exactly where it is allowed to fault. What followed
+  was not:
+
+      [mach-deliver] ml372 teb cand1=0x717ffc0000 stack=(0x7038120000,0x703891fd20]
+                          does NOT contain sp=0x703811fa10
+      [mach-deliver] ml378 no TEB owns sp=0x703811fa10 -> BEST-EFFORT delivery
+      bus_handler BUS->AV: unreadable target addr=0x7105ff2a38 pc=0x1048dd1b0 rw=0
+      [exc-disp] raise tid=0024 code=c0000005 addr=0x1048dd1b0
+      call_seh_handlers invalid frame 703811fa10 (0000007038128000-000000703891FD20)
+      NtRaiseException Exception frame is not in stack limits => unable to dispatch
+      NtTerminateProcess … exit_code=0xc0000005
+
+  Read the two stack numbers together and the whole bug is in them: the
+  faulting `sp=0x703811fa10` is BELOW `Tib.StackLimit=0x7038128000`, because it
+  is on the thread's KERNEL stack — which is where a thread inside a syscall
+  runs, by construction. "No TEB owns this sp" is not a failure to attribute
+  the thread; it is the signature of being inside a syscall.
+
+  **WHY UPSTREAM NEVER SEES THIS.** `wine/dlls/ntdll/unix/signal_arm64.c:1075`:
+  `segv_handler` calls `virtual_handle_fault` and then `handle_syscall_fault`
+  (:1000), which starts with `if (!is_inside_syscall( SP_sig(context) )) return
+  FALSE;` (`unix_private.h:454` — `sp >= thread_data->kernel_stack && sp <=
+  get_syscall_frame()`). Inside a syscall it does one of two things: if
+  `ntdll_get_thread_data()->jmp_buf` is set — the `__TRY` of
+  `wine/include/wine/unixlib.h:87`, which
+  `virtual_check_buffer_for_read`/`_for_write` (`virtual.c:4822`/`:4856`) wrap
+  their probes in — it rewrites the context to call `longjmp` so the PROBE
+  returns FALSE; otherwise it sets x0 to the exception code, sp to the syscall
+  frame and pc to `__wine_syscall_dispatcher_return`, so the SYSCALL RETURNS
+  that status. `NtWriteFile` then answers `STATUS_INVALID_USER_BUFFER`
+  (`file.c:8829`) and `NtReadFile` `STATUS_ACCESS_VIOLATION` (`file.c:8505`),
+  which is precisely what real Windows answers — see the test table below.
+
+  **ROOT CAUSE: THE FAULT ARRIVES ON A DIFFERENT SIGNAL HERE.** A
+  reserved-but-uncommitted page is a PROT_NONE mapping, so the abort is
+  `KERN_PROTECTION_FAILURE`, and Darwin delivers that as **SIGBUS**, not
+  SIGSEGV. This port's `segv_handler` did call `handle_syscall_fault`
+  (signal_arm64_ios.c, and `ill_handler` was given the same call for unix-side
+  `brk`), but **`bus_handler` never did** — and on this platform `bus_handler`
+  is where the entire PROT_NONE family lands. It repaired what it could
+  (`virtual_handle_fault` for guard pages / write watches / commit-on-fault,
+  `[bus-reheal]`, the unaligned emulator, the exec-fault redirect), correctly
+  reclassified the leftover as an access violation (`BUS->AV`), and then handed
+  that AV to `setup_exception` — building a guest dispatch frame at the host
+  sp, which is on the kernel stack, which `is_valid_frame()`
+  (`wine/dlls/ntdll/ntdll_misc.h:64`) rejects in `call_seh_handlers`
+  (`wine/dlls/ntdll/signal_arm64.c:274`). One bad pointer, whole
+  pseudo-process gone. The long-standing "Exception frame is not in stack
+  limits" signature is this, and the KeUserModeCallback sightings are the same
+  shape.
+
+  The Mach path had the same hole one step earlier:
+  `ios_mach_deliver_guest_exception_inner` fails its stack-containment TEB
+  search for exactly this reason and then takes the ml378 best-effort branch.
+  In log 90 it went no further only because the pc-gate below it declines a
+  host pc; a fault taken in JIT-pool code called from inside a syscall would
+  have been delivered.
+
+  **THE CONTROL FLOW, BEFORE AND AFTER.**
+
+      BEFORE   probe faults -> SIGBUS -> bus_handler -> repairs -> BUS->AV
+               -> setup_exception -> guest frame at host sp
+               -> call_seh_handlers: invalid frame -> NtTerminateProcess
+
+      AFTER    probe faults -> SIGBUS -> bus_handler -> repairs (UNCHANGED,
+               all of them, and all still return first) -> BUS->AV
+               -> ios_handle_unix_fault: is_inside_syscall(sp)?
+                    no  -> setup_exception, exactly as before (the guest's own
+                           fault, on the guest's own stack -- including a fault
+                           taken during a KeUserModeCallback, which runs on the
+                           GUEST stack and therefore always takes this branch)
+                    yes -> jmp_buf set   -> longjmp: the probe returns FALSE
+                        -> no jmp_buf    -> __wine_syscall_dispatcher_return:
+                                            the syscall returns the status
+
+  **THE CHANGES.**
+
+  * `build/ntdll-unix/signal_arm64_ios.c:8450-8540` — new
+    `ios_handle_unix_fault()`: the TEB-less-thread guard (ml483: a CEF/FEX
+    thread has no TEB and `get_syscall_frame()` dereferences it on its first
+    statement), the three-way classification, the log line, and then upstream's
+    `handle_syscall_fault()` unchanged. `:8430` `ios_syscall_fault_enabled()`
+    is the knob.
+  * `build/ntdll-unix/signal_arm64_ios.c:12097` — **the fix**: `bus_handler`
+    calls it, LAST, immediately before its final `setup_exception`. Every
+    existing special case (x18 repair, exec-fault redirect, dual-map store
+    emulation, `virtual_handle_fault`'s guard pages / stack growth /
+    write-watch, `[bus-reheal]`, `[stale-src]`, SMC, unaligned emulation) still
+    runs first and still `return`s before this point, so nothing they handle
+    changes.
+  * `build/ntdll-unix/signal_arm64_ios.c:10542`, `:10772`, `:12262` —
+    `segv_handler`, `ill_handler` and `fpe_handler` now go through the same
+    helper instead of calling `handle_syscall_fault` raw. Same decision as
+    before for segv/ill, plus the TEB guard and the log line; `fpe_handler` is
+    new (an arithmetic trap on the kernel stack was fatal for the same reason).
+  * `build/ntdll-unix/signal_arm64_ios.c:7318-7378` — the Mach path declines a
+    fault whose sp lies in the faulting thread's `[kernel_stack ..
+    syscall_frame]` window, read out of its TEB through
+    `mach_vm_read_overwrite`, instead of best-effort delivery. The kernel then
+    turns it into the BSD signal that the helper above handles properly.
+  * `wine/dlls/ntdll/unix/syscall.c:271` — `ntdll_syscall_name()`, a bounded
+    array lookup over the existing `syscall_names[]` tables so the log line can
+    name the call. Signal-handler safe; returns NULL (and the raw id is
+    printed) when no table is registered.
+
+  **WHY 64-BIT NATIVE, ARM64EC AND WoW64 ARE ALL COVERED BY ONE TEST.** The
+  window is read from the thread's OWN `ntdll_thread_data` via the unix-side
+  `NtCurrentTeb()` (`thread.c:1634` — a pthread key, so it is correct even
+  when x18 is zeroed in a signal context, which log 90 shows it is). A WoW64
+  i386 guest and an ARM64EC x86-64 guest both enter through the same 64-bit
+  `__wine_syscall_dispatcher` onto the same kernel stack, so the same two
+  numbers bound all three. The GUEST stack is never in that window on any of
+  them, which is what keeps case (c) — a guest fault during
+  `KeUserModeCallback` — on the ordinary dispatch path.
+
+  **THE KNOB.** `MADEIRA_SYSCALL_FAULT=0` restores the old behaviour: the new
+  `bus_handler` call and the new Mach decline are both gated on it. segv/ill
+  keep calling the path they already called, because that was not new.
+
+  **THE LOG LINE.** Always on, first 8 then every 256th:
+
+      [syscall-fault] ml1120 <probe|syscall|callback> nt=<name or id>
+                      addr=0x… rw=read|write|exec -> status=… (#N)
+
+  `probe` means a `__TRY` helper was on the stack and returns FALSE;
+  `syscall` means the call returns `status=`; `callback` means a user callback
+  was active AND the fault was still on the kernel stack, i.e. the unix side of
+  the callback faulted, not the guest.
+
+  **THE TEST, AND WHAT REAL WINDOWS ACTUALLY DOES.** New
+  `build/x86-tests/badbuf-x86.c` + `build-badbuf-test.sh` (i386 PE, kernel32
+  only, `-nostdlib`, shipped to `app/Madeira/i386-windows/`) and its twin
+  `build/x64-tests/badbuf-x64.c` (built with `build/x64-tests/build.sh
+  badbuf-x64`, shipped to `app/Madeira/arm64ec-windows/`). Faults are caught
+  with a VECTORED handler, not `__try`, because clang has no SEH for i386.
+  Both were run on THIS PC's real Windows 11 (26200) first and the expected
+  values are that run's output, not a prediction:
+
+  | # | case | real Windows (x86 and x64 identical) |
+  |---|------|--------------------------------------|
+  | 1 | `WriteFile` FROM reserved-but-uncommitted | FALSE, err=**1784** `ERROR_INVALID_USER_BUFFER`, 0 user-mode faults |
+  | 2 | `ReadFile` INTO reserved-but-uncommitted | FALSE, err=**998** `ERROR_NOACCESS`, 0 faults |
+  | 3 | `WriteFile` from a buffer STRADDLING committed→not | FALSE, err=**1784**, 0 faults |
+  | 4 | `ReadFile` INTO a committed READ-ONLY page | FALSE, err=**998**, 0 faults |
+  | 5 | `GetFileSizeEx` out-pointer in uncommitted memory | **TRUE**, err=0, **1 user-mode AV** c0000005 |
+  | 6 | `QueryPerformanceCounter` out-pointer likewise | **TRUE**, err=0, **1 user-mode AV** c0000005 |
+  | 7 | `ReadFile` INTO a `PAGE_GUARD` buffer | FALSE, err=**0x80000001** (raw `STATUS_GUARD_PAGE_VIOLATION`, no DOS mapping), 0 faults |
+  | 8 | plain guest-side AV in the program's own code | 1 AV reaches the program's vectored handler; the retried store lands |
+
+  Three of those contradict the obvious guess and are the reason the truth had
+  to be measured. **Rows 1 and 3 are not `ERROR_NOACCESS`** — the read
+  direction and the write direction of a buffer are different failures and
+  Windows reports them as such; Wine already matches exactly (`file.c:8829`
+  vs `:8505`), so the same numbers are expected on device. **Rows 5 and 6 do
+  not probe at all**: `GetFileSizeEx` stores `*size = info.EndOfFile` in USER
+  mode (`wine/dlls/kernelbase/file.c`), as does `QueryPerformanceCounter`, so a
+  bad out-pointer is an ordinary application access violation. They are in the
+  test precisely to prove the fix did NOT swallow a guest fault into the
+  syscall path. **Row 7** is accepted as either `0x80000001` or `998`: Wine's
+  probe cannot tell a guard hit from any other failed write probe and collapses
+  it, and the property that matters — the call FAILS and the process lives — is
+  the same either way. Exit status 90 = all passed; 94-101 name the case that
+  diverged. Row 8 is the regression guard.
+
+  A test bug worth recording, because it would recur: the VEH bookkeeping
+  globals must be `volatile`. At `-O1` clang folded `g_fault_count` across case
+  8 — which has no opaque call between arming and reading — and the test
+  reported `faults=0` while the handler had demonstrably run.
+
+  **ARTIFACTS, VERIFIED BY CONTENT AND TIMESTAMP.**
+  `.xtool/build-wine-native.sh` (which rsyncs the tracked sources first):
+  ntdll-unix **32/32 compiled, 0 failed**, win32u-unix 46/46, wineserver OK;
+  `obj/syscall.err` 0 bytes, `obj/signal_arm64.err` only the two pre-existing
+  warnings (`%p` vs `uintptr_t` at :2900, `__x[29]` at :5509), no `error:` in
+  any `.err` in the part. `libntdll_unix.a` **1 951 936 B** (was 1 950 424 B),
+  2026-09-21 03:01, copied to the workspace `app/Madeira/`. `strings` finds
+  `[syscall-fault] ml1120 %s nt=%s addr=0x%llx rw=%s -> status=%s (#%lu)`,
+  the mach-path DECLINE format, `MADEIRA_SYSCALL_FAULT` and
+  `probe-returns-FALSE`; `llvm-nm` shows `_ntdll_syscall_name` as `T` in
+  `syscall.o` and `U` in `signal_arm64.o`. `badbuf-x86.exe` 30 720 B (i386 PE,
+  imports kernel32 only, LARGE_ADDRESS_AWARE set) and `badbuf-x64.exe`
+  122 880 B, both copied into the app bundle, both **status=90 on real
+  Windows**.
+
+  **UNVERIFIED ON DEVICE — all of it,** and the 2026-09-25 lesson applies.
+  Specifically: that `is_inside_syscall()` is TRUE for this fault on a real
+  WoW64 thread (the arithmetic says the kernel stack is exactly the region log
+  90's sp fell in, but the two bounds have never been printed together); that
+  `longjmp` out of the probe leaves the `__TRY` frame consistent when the
+  redirect is applied from `bus_handler` under FEX; that
+  `__wine_syscall_dispatcher_return` unwinds correctly when it is entered from
+  `bus_handler` rather than from `segv_handler` (the same code, but never
+  exercised from here); that the Mach-path decline does not re-open the ml378
+  StikDebug loop on a thread that is genuinely inside a syscall; and that no
+  repair in `bus_handler` was depending on falling through to
+  `setup_exception` for a kernel-stack sp.
+
+  **WHAT THE NEXT DEVICE LOG SHOULD SHOW, IN THIS ORDER.**
+  1. `[syscall-fault] ml1120 probe nt=NtWriteFile addr=0x… rw=read ->
+     status=probe-returns-FALSE (#1)` where log 90 had `BUS->AV` followed by
+     `invalid frame`. The `BUS #N`, `[bus-rgn]` and `BUS->AV` lines still print
+     ahead of it — they are the repairs having their turn, not a failure.
+  2. NO `call_seh_handlers invalid frame` and NO `NtRaiseException Exception
+     frame is not in stack limits` for that thread, and the program continuing
+     past the write.
+  3. `nt=` naming the actual call. `nt=<4 hex digits>` instead of a name means
+     the id came from a unix call rather than a syscall and
+     `ntdll_syscall_name` had nothing to look up — informational, not a fault.
+  4. `[syscall-fault] ml1120 syscall …` (no `probe`) would mean a unix-side
+     fault OUTSIDE a probe helper — that is upstream-correct behaviour, but the
+     faulting address is then worth chasing on its own.
+  5. `[syscall-fault] ml1120 callback …` means the unix side of a
+     `KeUserModeCallback` faulted. A GUEST fault during a callback must NOT
+     appear here; if one does, `is_inside_syscall` is matching the guest stack
+     and the window bounds are wrong.
+  6. `[syscall-fault] ml1120 mach-path DECLINE sp=… is on the unix kernel
+     stack […]` — the Mach server refusing a syscall-stack fault. It should be
+     followed by the BSD-path line above for the same address, never by
+     `BEST-EFFORT delivery on guest stack`.
+  7. Running `badbuf-x86.exe` / `badbuf-x64.exe`: eight `MADEIRA-BADBUF` lines
+     whose left half matches the `[windows: …]` half on the same line, then
+     `MADEIRA-EXIT: … status=90`. Any other status names the case; rows 1-4
+     failing with the process still alive is a status mismatch, rows 1-4
+     killing the process is this fix not reaching that call.
