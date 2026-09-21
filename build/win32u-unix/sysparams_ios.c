@@ -4223,6 +4223,9 @@ static const struct { short w, h; } ios_standard_modes[] =
 static BOOL ios_mode_at_index( UINT index, int *w, int *h )
 {
     int sw, sh, cw, ch;
+    const char *extended = getenv( "MADEIRA_EXTENDED_MODES" );
+    BOOL high_modes = extended && !strcmp( extended, "1" );
+    static int announced;
     UINT i, n = 0;
 
     ios_screen_size( &sw, &sh );
@@ -4239,13 +4242,23 @@ static BOOL ios_mode_at_index( UINT index, int *w, int *h )
      * ios_screen_size() call above, so it is always set by this point. */
     cw = ios_screen_def_w ? ios_screen_def_w : sw;
     ch = ios_screen_def_h ? ios_screen_def_h : sh;
+    /* ml1140: applications commonly choose the largest advertised mode on
+     * first launch. A 720p virtual display should not advertise four times its
+     * pixel budget by default. Users can choose a larger session resolution
+     * or restore the extended ladder; current/saved modes remain selectable. */
+    if (!announced)
+    {
+        announced = 1;
+        dprintf( STDERR_FILENO, "[mode-budget] ml1140 default=%dx%d extended=%d (MADEIRA_EXTENDED_MODES=1 restores high modes)\n",
+                 cw, ch, high_modes );
+    }
 
     for (i = 0; i < ARRAY_SIZE(ios_standard_modes); i++)
     {
         int mw = ios_standard_modes[i].w, mh = ios_standard_modes[i].h;
 
         if (mw == sw && mh == sh) continue;                     /* already index 0 */
-        if ((INT64)mw * mh > 4 * (INT64)cw * ch) continue;      /* too big to drive */
+        if ((INT64)mw * mh > (high_modes ? 4 : 1) * (INT64)cw * ch) continue;
         if (++n != index) continue;
         *w = mw;
         *h = mh;
@@ -4444,8 +4457,16 @@ static LONG ios_virtual_change_display_settings( UNICODE_STRING *devname, const 
         /* the session default is always acceptable even when the cap computed
          * from a smaller current mode would have hidden it from the list */
         if (want_w == ios_screen_def_w && want_h == ios_screen_def_h) found = TRUE;
-        for (i = 0; !found && ios_mode_at_index( i, &mw, &mh ); i++)
-            found = (mw == want_w && mh == want_h);
+        /* A saved explicit request may exceed the conservative advertised
+         * ladder. Keep accepting the former supported set; enumeration is a
+         * first-launch preference, not a ban on user-selected resolutions. */
+        for (i = 0; !found && i < ARRAY_SIZE(ios_standard_modes); i++)
+        {
+            mw = ios_standard_modes[i].w;
+            mh = ios_standard_modes[i].h;
+            if ((INT64)mw * mh <= 4 * (INT64)ios_screen_def_w * ios_screen_def_h)
+                found = (mw == want_w && mh == want_h);
+        }
 
         if (!found) ret = DISP_CHANGE_BADMODE, why = "mode is not in the virtual mode list";
         else

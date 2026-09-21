@@ -573,6 +573,7 @@ struct ios_frame_acc
     unsigned long long drawable_ns;
     /* finish thread / GPU */
     unsigned long long gpu_ns, gpu_bufs, qdepth_sum;
+    unsigned long long pass_render, pass_blit, pass_compute, pass_load, pass_store, pass_clear;
     /* distributions, 1 ms per bucket */
     unsigned int wall_hist[IOS_FRAME_HIST_N];
     unsigned int draw_hist[IOS_FRAME_HIST_N];
@@ -642,11 +643,30 @@ static void ios_frame_claim( enum ios_frame_role role )
 void ios_frame_game_tick(void)
 {
     static unsigned long long last_wall, last_cpu;   /* GAME thread only */
+    static pthread_mutex_t tick_lock = PTHREAD_MUTEX_INITIALIZER;
+    static unsigned switches;
     unsigned long long now, cpu, dw;
+    unsigned long long self = (unsigned long long)(uintptr_t)pthread_self(), owner;
+    const char *follow;
 
     if (!ios_frame_stats_on) return;
     ios_frame_claim( IOS_FRAME_ROLE_GAME );
-    if (!ios_frame_is_role( IOS_FRAME_ROLE_GAME )) return;   /* a second presenter */
+    /* ml1140: a loading thread may hand presentation to the render thread.
+     * Pinning the first thread forever produced n=0 beside hundreds of actual
+     * presents. Serialize only this two-clock diagnostic, never the renderer;
+     * a contended hook drops its sample. Never subtract CPU clocks belonging
+     * to different threads. MADEIRA_FRAME_FOLLOW=0 restores the old owner. */
+    if (pthread_mutex_trylock( &tick_lock )) return;
+    owner = __atomic_load_n( &ios_frame_role_tid[IOS_FRAME_ROLE_GAME], __ATOMIC_RELAXED );
+    if (owner != self)
+    {
+        follow = getenv( "MADEIRA_FRAME_FOLLOW" );
+        if (follow && !strcmp( follow, "0" )) { pthread_mutex_unlock( &tick_lock ); return; }
+        __atomic_store_n( &ios_frame_role_tid[IOS_FRAME_ROLE_GAME], self, __ATOMIC_RELAXED );
+        last_wall = last_cpu = 0;
+        if (++switches <= 8)
+            wine_log_write( "[frame-owner] ml1140 presenter changed; resetting thread clocks (#%u)", switches );
+    }
 
     now = ios_frame_now_ns();
     cpu = ios_frame_cpu_ns();
@@ -665,6 +685,20 @@ void ios_frame_game_tick(void)
         }
     }
     last_wall = now; last_cpu = cpu;
+    pthread_mutex_unlock( &tick_lock );
+}
+
+/* ml1140: actual native encoder creation, aggregated once per heartbeat.
+ * Attachment actions are counts (depth/stencil separately), not bytes. */
+void ios_frame_pass( unsigned kind, unsigned loads, unsigned stores, unsigned clears )
+{
+    if (!ios_frame_stats_on) return;
+    if (kind == 0) IOS_FRAME_ADD( pass_render, 1 );
+    else if (kind == 1) IOS_FRAME_ADD( pass_blit, 1 );
+    else if (kind == 2) IOS_FRAME_ADD( pass_compute, 1 );
+    if (loads) IOS_FRAME_ADD( pass_load, loads );
+    if (stores) IOS_FRAME_ADD( pass_store, stores );
+    if (clears) IOS_FRAME_ADD( pass_clear, clears );
 }
 
 void ios_frame_encode_present( int skipped )
@@ -699,9 +733,13 @@ void ios_frame_drawable_wait( unsigned long long ns )
 void ios_frame_gpu( unsigned long long gpu_ns, unsigned long long inflight )
 {
     if (!ios_frame_stats_on) return;
-    ios_frame_claim( IOS_FRAME_ROLE_FINISH );
-    if (gpu_ns) { IOS_FRAME_ADD( gpu_ns, gpu_ns ); IOS_FRAME_ADD( gpu_bufs, 1 ); }
-    IOS_FRAME_ADD( qdepth_sum, inflight );
+    /* GPU completion callbacks need not run on DXMT's finish thread. */
+    if (gpu_ns)
+    {
+        IOS_FRAME_ADD( gpu_ns, gpu_ns );
+        IOS_FRAME_ADD( gpu_bufs, 1 );
+        IOS_FRAME_ADD( qdepth_sum, inflight );
+    }
 }
 
 void ios_frame_limiter( unsigned long long ns )
@@ -875,10 +913,15 @@ void ios_frame_report( unsigned long long win_ns )
             (double)a.enc_cpu_ns * ef,
             ((double)a.enc_wall_ns - (double)a.enc_cpu_ns) * ef,
             (double)a.gpu_ns * gf, a.gpu_bufs,
-            a.frames ? (double)a.qdepth_sum / (double)a.frames : 0.0,
+            a.gpu_bufs ? (double)a.qdepth_sum / (double)a.gpu_bufs : 0.0,
             (double)a.drawable_ns * ef, draw_p95,
             (double)a.wait_ns[IOS_FRAME_WAIT_LIMITER] * ef,
             ios_frame_mode, ios_frame_panel_hz, ios_frame_intent_hz );
+        wine_log_write( "[gpu-work] ml1140 per-present: render=%.1f blit=%.1f compute=%.1f "
+                        "load=%.1f store=%.1f clear=%.1f buffers=%.2f gpu-ms=%.2f (MADEIRA_FRAME_STATS=0 disables)",
+                        a.pass_render * ef * 1e6, a.pass_blit * ef * 1e6, a.pass_compute * ef * 1e6,
+                        a.pass_load * ef * 1e6, a.pass_store * ef * 1e6, a.pass_clear * ef * 1e6,
+                        a.gpu_bufs * ef * 1e6, a.gpu_ns * ef );
     }
 
     /* ml1050: the handoff half, on its own line because it is a distribution

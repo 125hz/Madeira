@@ -17,12 +17,11 @@
  * each arrive a millisecond late.  Those want opposite fixes and the log could
  * not tell them apart.
  *
- * WHAT IT COSTS.  Two clock reads per frame on the presenting thread, two on
- * the encode thread, one per command buffer on the finish thread, and one
- * relaxed add per already-instrumented wait.  At 30fps that is ~150 clock
- * reads per second against a 200Hz profiler that was measured at 0.88%/core.
- * Nothing here samples, allocates, takes a lock or makes a syscall other than
- * clock_gettime/mach_absolute_time.
+ * WHAT IT COSTS. Two clock reads per presenting frame and encode interval,
+ * relaxed counter adds, and a Metal completion handler per command buffer.
+ * The presenter clock hook uses trylock and drops contended samples rather
+ * than blocking. Native encoder counts inspect attachment actions only while
+ * statistics are enabled. MADEIRA_FRAME_STATS=0 bypasses these diagnostics.
  *
  * WHAT IT CANNOT SEE, stated so the line is not over-read.  The producers live
  * on the two sides that can actually observe the events: the winemetal unix
@@ -35,7 +34,8 @@
  * of them bottoms out in an ntdll wait.  `other=` is exactly that remainder.
  *
  * ROLES.  A thread claims a role the first time it reaches the hook that
- * DEFINES that role, and no role is ever reassigned:
+ * DEFINES that role. Since ml1140 GAME follows presenter ownership changes
+ * with fresh clock baselines; MADEIRA_FRAME_FOLLOW=0 restores initial pinning:
  *   GAME    -- the thread that calls WMTQueryDisplaySettingForLayer, which
  *              Presenter::synchronizeLayerProperties() issues exactly once per
  *              Present on the calling thread (dxmt_presenter.cpp:119, reached
@@ -45,8 +45,9 @@
  *   ENCODE  -- the thread that calls MetalLayer_nextDrawable / presentDrawable,
  *              which is DXMT's encode thread by construction (the present
  *              chunk is encoded there).
- *   FINISH  -- the thread that calls MTLCommandBuffer_waitUntilCompleted,
- *              which is DXMT's finish thread.
+ * GPU timestamps and queue retirement are collected in Metal completion
+ * handlers, including buffers that completed before the finish thread waits.
+ * They are not attributed to a CPU thread role.
  *
  * Every counter is a relaxed add and is exchanged to zero when the window is
  * read, exactly like ios_srv_nt_counts: these are rates, not ledgers, and a

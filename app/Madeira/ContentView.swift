@@ -839,6 +839,7 @@ final class MetalBackedView: UIView {
         MetalBackedView.keyboardTarget = self  // keyboard button targets the live view
         defuseAncestorRecognizers()
         let host = MetalHostView.shared
+        host.isHidden = LibraryModel.shared.enabled && LibraryModel.shared.current == nil
         if host.superview !== w {
             host.removeFromSuperview()
             w.addSubview(host)
@@ -3785,6 +3786,7 @@ struct CustomLaunchButton: Codable, Equatable {
 }
 
 struct ContentView: View {
+    @ObservedObject private var library = LibraryModel.shared
     @StateObject private var logStore = LogStore.shared
     @State private var jitStatus: JITStatus = .unknown
     @State private var entitlements: EntitlementStatus?
@@ -3956,6 +3958,8 @@ struct ContentView: View {
                 Group {
                     if fullscreenState.active {
                         fullscreenBody
+                    } else if library.enabled {
+                        LibraryView(play: launchLibraryEntry, enableJIT: enableJITViaStikDebug)
                     } else if geo.size.width > geo.size.height {
                         wideNormalBody
                     } else {
@@ -3980,6 +3984,12 @@ struct ContentView: View {
             .navigationTitle("Madeira")
             .navigationBarTitleDisplayMode(.inline)
             .navigationBarHidden(fullscreenState.active)
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+                if !isLaunching {
+                    library.refreshFlag()
+                    MetalHostView.shared.isHidden = library.enabled && library.current == nil
+                }
+            }
             .onAppear {
                 jit_install_trap_handler()
                 entitlements = EntitlementStatus.check()
@@ -5084,7 +5094,24 @@ struct ContentView: View {
     /// Full sequence: allocate JIT pool, start wineserver, start Wine.
     /// Debugger stays attached during PE loading so mprotect_exec can use BRK
     /// to prepare code pages. Detach happens after Wine finishes + recovery.
-    private func runWineFullSequence() {
+    private func launchLibraryEntry(_ entry: LibraryEntry) {
+        guard !isLaunching, wine_process_is_running() == 0, wineserver_is_running() == 0, library.current == nil else {
+            library.error = "A session is already running."; return
+        }
+        guard jit_check_debugged() else { library.error = "Enable JIT before playing."; return }
+        do { _ = try LibraryModel.executable(entry.relativePath); try entry.validate() }
+        catch { library.error = error.localizedDescription; return }
+        guard entry.windowsPath.utf8.count < 1024, entry.arguments.utf8.count < 1024 else {
+            library.error = "The executable path or launch arguments are too long."; return
+        }
+        setenv("MADEIRA_EXE", entry.windowsPath, 1)
+        setenv("MADEIRA_ARGS", entry.arguments, 1)
+        unsetenv("MADEIRA_DESKTOP")
+        library.begin(entry)
+        runWineFullSequence(profile: entry)
+    }
+
+    private func runWineFullSequence(profile: LibraryEntry? = nil) {
         // ml: THE RELAUNCH GUARD. See isLaunching's doc comment. Every early
         // return on this path — this one included — logs a
         // "[launch] ignored: <reason>" line through the app's normal log
@@ -5573,6 +5600,7 @@ struct ContentView: View {
                 logStore.log("[fex-cfg] host feature probe: " + joined)
             }
             // ===== end FEX JIT settings =========================================
+            profile?.applyEnvironment()
 
             // ml734: Theorafile call tracer. Documents/madeira-tf-trace.txt == "1"
             // redirects libtheorafile's tf_* exports through wrappers in
@@ -5774,7 +5802,7 @@ struct ContentView: View {
                 // `true` forever, silently ignoring (see the guard at the top
                 // of this function) every later tap with no way out short of
                 // relaunching the app.
-                DispatchQueue.main.async { self.isLaunching = false }
+                DispatchQueue.main.async { self.isLaunching = false; LibraryModel.shared.launchFailed() }
                 return
             }
 
@@ -5918,6 +5946,7 @@ struct ContentView: View {
             DispatchQueue.main.async {
                 heartbeat.invalidate()
                 self.isLaunching = false
+                if wine_process_is_running() == 0 { LibraryModel.shared.launchFailed() }
             }
         }
     }
@@ -6652,6 +6681,12 @@ final class ControlsWindow: UIWindow {
     }
 
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        if FullscreenState.shared.active, LibraryModel.shared.current != nil {
+            let library = LibraryModel.shared
+            if library.menu || library.menuButtonRect.contains(point) {
+                return super.hitTest(point, with: event)
+            }
+        }
         let m = TouchControlsModel.shared
         // ml662: the UIKit touch layer gets first refusal in EVERY body — the
         // key row (portraitBody/wideNormalBody) registers its frames here
@@ -6660,6 +6695,7 @@ final class ControlsWindow: UIWindow {
         // there.
         let ov = ControlOverlayView.shared
         if ov.window === self, ov.region(at: convert(point, to: ov)) != nil { return ov }
+        if LibraryModel.shared.current != nil && !m.editing { return nil }
         // ml665: the AssistiveTouch hint banner lives in this window's hosting
         // view, and the guard below hands everything outside a control region
         // straight through in the normal view — which would make the
@@ -6762,6 +6798,7 @@ enum TouchControlsHost {
 }
 
 struct TouchControlsOverlay: View {
+    @ObservedObject private var library = LibraryModel.shared
     @ObservedObject private var m = TouchControlsModel.shared
     @ObservedObject private var hw = HardwareInput.shared
     /// ml: re-keyed from a local `geo.size.width > geo.size.height` read to
@@ -6786,9 +6823,11 @@ struct TouchControlsOverlay: View {
                     if m.visible || m.editing {
                         ForEach(m.controls) { c in
                             TouchControlButton(control: c, screen: geo.size)
+                                .opacity(library.current != nil && !m.editing ? library.opacity : 1)
                         }
                     }
-                    topBar(in: geo)
+                    if library.current != nil && !m.editing { LibraryHUD() }
+                    else { topBar(in: geo) }
                     // ml670: edit mode only. In play mode there is nothing to
                     // adjust and a slider under the thumb would be a control
                     // that eats a press.
@@ -6878,7 +6917,8 @@ struct TouchControlsOverlay: View {
             // commitHudDrag below) rather than needing a second one of its
             // own. A tap exits; only the grip drags.
             glassButton("arrow.down.right.and.arrow.up.left") {
-                fullscreenState.active = false
+                if library.current != nil { m.editing = false; library.showMenu() }
+                else { fullscreenState.active = false }
             }
             glassButton("gamecontroller", dim: !m.visible) { m.visible.toggle() }
             // ml663: landscape is where a keyboard and mouse are actually used,
