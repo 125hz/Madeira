@@ -2658,26 +2658,22 @@ static void ios_mouse_delivery_note( const char *stage, const MSG *msg, INT hit,
              stage, msg->hwnd, msg->message, hit, (long)msg->pt.x, (long)msg->pt.y, (unsigned long)msg->lParam );
 }
 
-/* A hardware click is a window-manager activation, not an unsolicited guest
- * SetForegroundWindow request. iOS has no host window manager to perform that
- * transition before Wine dispatches the click. Keep WM_MOUSEACTIVATE's veto
- * and eat decisions in the caller; only an accepted activation uses this path. */
+/* Record the actual activation target and outcome without changing Wine's
+ * foreground policy. A failed ancestor lookup must be repaired at its source. */
 static BOOL ios_activate_clicked_window( HWND hwnd, UINT mouse_activate )
 {
     static unsigned int count;
-    const char *policy = getenv( "MADEIRA_CLICK_ACTIVATION" );
     const char *logging = getenv( "MADEIRA_MOUSE_DELIVERY" );
-    BOOL internal = !policy || strcmp( policy, "0" );
     BOOL ret;
     DWORD saved_error = RtlGetLastWin32Error(), error;
 
     RtlSetLastWin32Error( 0 );
-    ret = set_foreground_window( hwnd, TRUE, internal );
+    ret = set_foreground_window( hwnd, TRUE, FALSE );
     error = RtlGetLastWin32Error();
     if ((!logging || strcmp( logging, "0" )) &&
         __atomic_fetch_add( &count, 1, __ATOMIC_RELAXED ) < 16)
-        fprintf( stderr, "[click-activation] ml1200 hwnd=%p reply=%u internal=%u ok=%u error=%lu active=%p foreground=%p\n",
-                 hwnd, mouse_activate, internal, ret, (unsigned long)error,
+        fprintf( stderr, "[click-activation] ml1210 hwnd=%p reply=%u ok=%u error=%lu active=%p foreground=%p\n",
+                 hwnd, mouse_activate, ret, (unsigned long)error,
                  get_active_window(), NtUserGetForegroundWindow() );
     RtlSetLastWin32Error( saved_error );
     return ret;

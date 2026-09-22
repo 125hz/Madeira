@@ -60,15 +60,13 @@ harness += r'''
 int main(void)
 {
     for (deny_foreground = 0; deny_foreground <= 1; ++deny_foreground)
-    for (int enabled = 0; enabled <= 1; ++enabled)
     for (invalid_window = 0; invalid_window <= 1; ++invalid_window)
     for (UINT reply = 0; reply <= 4; ++reply)
     {
-        setenv("MADEIRA_CLICK_ACTIVATION", enabled ? "1" : "0", 1);
         calls = 0; active = NULL; last_error = 123;
         BOOL delivered = dispatch(reply);
         BOOL activates = reply <= MA_ACTIVATEANDEAT;
-        BOOL succeeds = activates && (enabled || !deny_foreground) && !invalid_window;
+        BOOL succeeds = activates && !deny_foreground && !invalid_window;
         BOOL eats = reply == MA_ACTIVATEANDEAT || reply == MA_NOACTIVATEANDEAT;
         assert(calls == activates);
         assert(!!active == succeeds);
@@ -76,9 +74,9 @@ int main(void)
         assert(last_error == 123);
     }
     invalid_window = 0;
-    unsetenv("MADEIRA_CLICK_ACTIVATION");
+    deny_foreground = 0;
     assert(dispatch(MA_ACTIVATE));
-    puts("PASS: hardware activation, rollback, explicit veto/eat, invalid window, and last-error preservation");
+    puts("PASS: foreground policy, explicit veto/eat, invalid window, and last-error preservation");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='madeira-click-check-') as directory:

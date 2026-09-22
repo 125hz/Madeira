@@ -259,13 +259,20 @@ record the same scene after warm-up, and send the full saved log. Relevant tags:
   translation units. This resolves the ARM64EC external-initializer link failure
   found while refreshing that architecture; no new TLS slot or FEX change is made.
 
-- Click activation (ml1200): accepted hardware mouse presses now request the
-  native window-manager foreground transition on iOS. This avoids applying
-  unsolicited foreground-request restrictions to a user clicking a window.
-  Application `WM_MOUSEACTIVATE` vetoes and explicit click-discard responses
-  remain effective. `MADEIRA_CLICK_ACTIVATION=0` restores the previous path.
-  The first 16 activation attempts produce `[click-activation] ml1200` with the
-  reply, success/error, and resulting active/foreground handles; disable with
-  `MADEIRA_MOUSE_DELIVERY=0`. Log 137 proves that presses were consumed at
-  activation while releases arrived, but does not identify the exact activation
-  failure. This is a targeted candidate fix pending an on-device launcher test.
+- Desktop lookup and clicks (ml1210): a shell-less desktop can belong to the
+  calling process in Wine's handle table without having a client window object.
+  It is now recognized as a desktop when its handle is valid. This repairs
+  ancestor lookup for child controls and lets desktop rectangle queries return
+  the monitor bounds, so centered dialogs no longer use a zero-size desktop.
+  `MADEIRA_DESKTOP_HANDLE_FIX=0` restores the old lookup; `[desktop-handle] ml1210`
+  reports the first four matches. Invalid/stale handles and real local window
+  objects retain their existing behavior.
+- Log 138 identifies the click failure as activation of handle zero (error
+  1400), while the actual dialog is already active and foreground. Its negative
+  placement also puts part of the displayed dialog outside the mouse's screen
+  bounds. The ml1200 foreground-policy experiment did not address this cause
+  and has been removed; `MADEIRA_CLICK_ACTIVATION` no longer changes behavior.
+  Normal Wine activation policy, including guest veto/eat replies, is restored.
+  `[click-activation] ml1210` retains the first 16 activation outcomes; disable
+  with `MADEIRA_MOUSE_DELIVERY=0`. Host checks pass; launcher interaction and
+  cursor travel still need confirmation on device.
