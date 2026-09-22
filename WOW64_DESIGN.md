@@ -14197,3 +14197,23 @@ Device test: create madeira-frontend.txt with MADEIRA_FRONTEND=1, open Madeira, 
 
 Artifact: 155908821 bytes; 2026-09-22T15:10:12.228697-05:00; SHA-256 3d94e7c4d8fcbbaadc8b41386dec35f3fb47369f1fa32048a9d94aa9ab10f1ca.
 Publication: implementation fb93dd8 pushed to 125hz/Madeira main before this record; submodules unchanged; no upstream push or PR. Logs: .xtool/logs/ml1310-{checks,ipa,verify,publish}.log.
+
+
+### 2026-09-22 - ml1320: HTTPS-capable content servers, zip chunks and attribution
+
+Evidence (logs 154/155, screenshots): QR sign-in succeeded on the second attempt; the first failed with NSURLError -1005 (connection lost). The library reported 523 owned apps, 519 installable on Windows. Installing app 220 started (4 depots, 2584 files) and failed after ~4 s with reason url--1200 (TLS handshake failure). Every later resume (resume=1) failed within ~3 s with reason decompress, including after an app restart.
+
+-1200, proven mechanism: sampling the public GetServersForSteamPipe directory across cells shows CDN entries on *.cdn.steampipe.steamcontent.com with https_support "unavailable", alongside HTTPS-mandatory SteamCache/akamaized servers. The ml1310 filter accepted hosts by name only, so a chunk could be requested over HTTPS from an HTTP-only server. The device's cell list was not logged, so which server failed is not confirmed. Fix: eligibility by https_support (mandatory/optional), use_as_proxy and allowed_app_ids (MADEIRA_STEAM_CDN_FILTER=0 rollback). A per-install ContentHostHealth rotates chunks across servers and demotes a server after repeated failures, with decay on success (MADEIRA_STEAM_HOST_HEALTH=0). The pool is six servers with five attempts per chunk. [steam-cdn] ml1320 reports offered/usable/skipped counts and the first eight demotions.
+
+decompress, likely mechanism (not proven; the log lacked the chunk format): SteamKit's DepotChunk processing handles VZstd, then VZip, then falls back to single-entry PKZip. The port had no zip path, and the failure repeated deterministically on an old depot. Added chunk_zip.c (zlib; deflate/stored; data descriptors; output bounded by the manifest's cb_original; Adler-32/size checks unchanged; MADEIRA_STEAM_ZIP_CHUNKS=0 rollback). Decode failures now report the format (decode-vzip, decode-vzstd, decode-zip<rc> or the leading bytes), so the next log settles it if another encoding is involved.
+
+Also: Steam trace, [steam-play] and [library-sections] lines now go through LogStore. stderr is not captured before a Wine session, which is why [library-sections]/[steam-bridge] were absent from logs 154/155. The install/resume/retry buttons draw their glyphs explicitly: a Label in a bordered button in a Form row rendered title-only.
+
+Attribution: every file derived from Jfishin's Madeira Steam client carries a header ("adapted" or "substantially rewritten"). README.md has a Credits section, and STEAM_INTEGRATION.md states the origin and what Madeira changed or omitted. The ml1320 commit carries a Co-Authored-By trailer for Jfishin (GitHub noreply address from his own commits).
+
+Validation: check-steam-native.py adds directory eligibility using real response shapes, rotation/demotion/recovery/rollback of server health, and zip chunks (deflate, stored, both with data descriptors, truncated, oversized, short header, bzip2 method, non-zip) under ASan/UBSan and TSan. All pass, as does check-steam-library.py. The IPA printed "IPA verified". .xtool/verify-ml1320.py passes: generated-source sync (headers included), new tags/switches present, no emulator/DRM strings or payloads, and 1365 entries identical to ml1310 except the executable. No device run.
+
+Device test: reopen Half-Life 2's install sheet and tap Try again (downloaded parts are kept). Expect [steam-cdn] ml1320 with skipped-no-https ≥ 0 and the download progressing past the previous failure point. If it fails, send the log: the reason now names the format or URL error.
+
+Artifact: 155920772 bytes; 2026-09-22T15:47:18.198639-05:00; SHA-256 c714a9e9339ae996de3bb07361502d9573ebdd297267438841b1f62e9f80546d.
+Publication: implementation 345133b pushed to 125hz/Madeira main before this record; submodules unchanged; no upstream push or PR. Logs: .xtool/logs/ml1320-{checks,ipa,verify,publish}.log.
