@@ -56,12 +56,17 @@ func rejected(_ label: String, _ operation: () throws -> Void) throws {
         profile.steamID = 54321; profile.arguments = "-windowed \"two words\""
         try profile.validate()
         try require(profile.launchArguments.contains("-applaunch 12345"), "launch identity independent of cover")
+        try require(profile.launchArguments.contains(" -silent -applaunch 12345"), "game launch keeps the library window closed")
+        setenv("MADEIRA_STEAM_SILENT", "0", 1)
+        try require(!profile.launchArguments.contains("-silent"), "silent rollback")
+        unsetenv("MADEIRA_STEAM_SILENT")
         try require(profile.launchArguments.contains("\"C:\\Program Files (x86)\\Steam\\Steam.exe\""), "quoted path")
         profile.configureLaunch()
         try require(String(cString: getenv("MADEIRA_EXE")) == "explorer.exe", "desktop wrapper")
         try require(String(cString: getenv("MADEIRA_DESKTOP")) == "1", "desktop memory policy")
         profile.steamInstalled = false
         try require(profile.launchArguments.contains("steam://install/12345"), "reinstall route")
+        try require(!profile.launchArguments.contains("-silent"), "install route shows Steam")
         profile.arguments = Array(repeating: "argument", count: 16).joined(separator: " ")
         try rejected("combined bridge argument overflow") { try profile.validate() }
         profile.arguments = ""; profile.relativePath = "../Steam.exe"

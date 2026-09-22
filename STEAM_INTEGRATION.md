@@ -336,6 +336,43 @@ This removes the demonstrated cause of the transport error. It does not prove
 the login screen now works: the open rendering, crash and CM-login problems in
 STEAM_CEF_HANDOFF.md may be the next thing seen.
 
+## Frozen login window: ml1360
+
+With ml1350 the transport connected and the login window appeared (device log
+prev 15), then froze. Every message to it failed inside the window callback:
+6770 "dispatch_user_callback ignoring exception c0000005" lines, starting with
+a jump to 0xffff0036. That value is a Wine window-procedure handle, not code.
+The 32-bit layer converted it like an address when the browser called
+CallWindowProc (and would do the same for a class registered with such a
+handle), so win32u no longer recognized it and handed it back to be called
+directly. win32u now recognizes a handle that arrives with the calling 32-bit
+process's window base added.
+
+- MADEIRA_WINPROC_HANDLE=0: previous behavior. Tag: [winproc-handle] ml1360.
+
+Game launches through the client now pass -silent, so Steam's library window
+stays closed. Sign-in, Steam Guard and error windows still appear. Open Steam and
+install links are unchanged.
+
+- MADEIRA_STEAM_SILENT=0: show the library window. Tag: [steam-silent] ml1360.
+
+A second run (log 163) reached no login window. One of the two local transport
+connections was established, dropped after about 11 seconds, and afterwards
+Chromium retried only the IPv6 loopback address (refused) and never 127.0.0.1
+again. The cause is not established. The accept trace ran out of its shared
+budget on queued requests, so it now has separate budgets and also records the
+AcceptEx first-data stage ([socket-accept] ml1360: recv-wait, delivered with a
+byte count, recv-failed).
+
+The console window titled steamwebhelper.exe comes from Madeira's diagnostic
+Chromium logging flag. Chromium only writes cef_log.txt in release builds when
+that flag is present, so it stays until the client is stable.
+
+Logging in once in the Windows client is still required: Steam keeps its own
+sign-in, separate from Madeira's native sign-in, and then signs in automatically
+on later launches if "Remember me" is kept. Madeira does not copy its token into
+the Windows client's encrypted credential files.
+
 ## References
 
 - [Valve's official client download](https://store.steampowered.com/about/)

@@ -168,7 +168,16 @@ cef_log.txt while the kernel connect completed. `WSAEnumNetworkEvents` passes it
 the InputBuffer of `IOCTL_AFD_GET_EVENTS`; the WoW64 thunk offset it as a guest pointer, so
 `wine_server_obj_handle` returned `0xfffffff0` and the ioctl failed STATUS_INVALID_HANDLE. Fixed in
 `wine/dlls/ntdll/unix/socket.c` (`afd_event_handle_arg`, `MADEIRA_AFD_EVENT_HANDLE=0` rolls back).
-Device result pending. See WOW64_DESIGN.md ml1350.
+Device result: transport connected and the login window appeared (log prev 15).
+
+**ml1360 — login window froze: winproc handles offset by the WoW64 thunks.** Every message to
+the login window died in `KeUserModeCallback` → guest jump to 0xffff0036 (FEX NoExec), then
+6770 `dispatch_user_callback ignoring exception`. 0xffff0036 is a Wine winproc handle;
+`wow64win` converts `win_proc_params.func` (CallWindowProc) and `lpfnWndProc` (RegisterClass)
+with `guest_ptr32`, so win32u's `get_winproc_ptr` did not recognise B+0xffff0036. Fixed in
+`build/win32u-unix/class_ios.c` (`ios_winproc_handle_arg`, `MADEIRA_WINPROC_HANDLE=0`).
+Separate, unexplained: log 163's transport on one port dropped after ~11 s and Chromium then
+retried only ::1. Accept trace budgets split so the next run records completions.
 
 ---
 

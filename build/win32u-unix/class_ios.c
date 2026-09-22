@@ -26,6 +26,9 @@
 
 #include <pthread.h>
 #include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include "ntstatus.h"
 #include "win32u_private.h"
 #include "ntuser_private.h"
@@ -164,11 +167,47 @@ static WINDOWPROC *find_winproc( WNDPROC func, BOOL ansi )
     return NULL;
 }
 
+/* iOS-Madeira ml1360: a 32-bit program's winproc handle (0xffffNNNN) can
+ * reach win32u with its guest window base added.  The WoW64 thunks for
+ * CallWindowProc (win_proc_params.func) and RegisterClass (lpfnWndProc)
+ * convert those fields as guest addresses, so 0xffff0036 arrives as
+ * B + 0xffff0036.  get_winproc_ptr() then does not recognise it as a handle,
+ * win32u hands it back as a plain procedure, the conversion back to 32 bits
+ * yields 0xffff0036 again, and user32 calls it as code.  Device log prev 15:
+ * FEX "NoExec instruction in entry block: FFFF0036" inside the webhelper's
+ * window callback, then 6770 "dispatch_user_callback ignoring exception"
+ * lines as every message to the login window was dropped.  The top 64 KB of
+ * a 32-bit address space never holds code, so a value of that form inside
+ * the caller's window is the handle.  MADEIRA_WINPROC_HANDLE=0 disables. */
+extern ULONG_PTR ios_wow_base(void);
+static WNDPROC ios_winproc_handle_arg( WNDPROC proc )
+{
+    static int enabled = -1;
+    static unsigned int reported;
+    ULONG_PTR value = (ULONG_PTR)proc, base;
+
+    if (!(value >> 32)) return proc;
+    base = ios_wow_base();
+    if (!base || value - base > 0xffffffffu || (value - base) >> 16 != WINPROC_HANDLE) return proc;
+    if (enabled < 0)
+    {
+        const char *env = getenv( "MADEIRA_WINPROC_HANDLE" );
+        enabled = !env || strcmp( env, "0" );
+    }
+    if (__atomic_load_n( &reported, __ATOMIC_RELAXED ) < 8 &&
+        __atomic_fetch_add( &reported, 1, __ATOMIC_RELAXED ) < 8)
+        fprintf( stderr, "[winproc-handle] ml1360 guest=%#lx handle=%#lx enabled=%d\n",
+                 (unsigned long)value, (unsigned long)(value - base), enabled );
+    return enabled ? (WNDPROC)(value - base) : proc;
+}
+
 /* return the window proc for a given handle, or NULL for an invalid handle,
  * or WINPROC_PROC16 for a handle to a 16-bit proc. */
 static WINDOWPROC *get_winproc_ptr( WNDPROC handle )
 {
-    UINT index = LOWORD(handle);
+    UINT index;
+    handle = ios_winproc_handle_arg( handle );
+    index = LOWORD(handle);
     if ((ULONG_PTR)handle >> 16 != WINPROC_HANDLE) return NULL;
     if (index >= MAX_WINPROCS) return WINPROC_PROC16;
     if (index >= winproc_used) return NULL;

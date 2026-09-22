@@ -140,7 +140,10 @@ struct LibraryEntry: Codable, Identifiable {
         let compatibility = steamSession != "installer" && LibraryFlags.enabled("MADEIRA_STEAM_COMPAT")
             ? " -no-cef-sandbox -cef-disable-gpu -nocrashmonitor" : ""
         let mode: String
-        if let id = steamAppID { mode = steamInstalled == false ? " steam://install/\(id)" : " -applaunch \(id)" }
+        // ml1360: a game launch keeps Steam's library window closed (-silent);
+        // sign-in and error windows still appear. MADEIRA_STEAM_SILENT=0 shows it.
+        let silent = LibraryFlags.enabled("MADEIRA_STEAM_SILENT") ? " -silent" : ""
+        if let id = steamAppID { mode = steamInstalled == false ? " steam://install/\(id)" : silent + " -applaunch \(id)" }
         else { mode = steamBigPicture == true ? " -gamepadui" : "" }
         return "/desktop=madeira,\(resolution) \"\(steamClientWindowsPath)\"" + compatibility + mode + (arguments.isEmpty ? "" : " " + arguments)
     }
@@ -1211,6 +1214,9 @@ struct LibraryDetail: View {
                 error = "The game's files are missing. Uninstall it and install it again."; return
             }
             LogStore.shared.log("[steam-play] ml1310 app=\(entry.steamAppID ?? 0) mode=\(entry.steamClientLaunch == true ? "client" : "direct") client-found=\(entry.steamClientPath == nil ? 0 : 1)")
+            if entry.steamClientLaunch == true {
+                LogStore.shared.log("[steam-silent] ml1360 enabled=\(LibraryFlags.enabled("MADEIRA_STEAM_SILENT") ? 1 : 0)")
+            }
         }
         leaving = true
         let profile = entry
