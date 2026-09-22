@@ -300,3 +300,15 @@ record the same scene after warm-up, and send the full saved log. Relevant tags:
   extension or why it failed. Log 140 proves that the third process previously
   failed its address-space reservation before loading its executable. The host
   allocator checks pass; successful game startup remains a device test.
+
+- Native DLL placement with multiple guest windows (ml1240): guest allocation
+  detection now checks both address bounds. A native DLL's host ceiling can
+  overlap the third guest window without making it a guest allocation. Native
+  images now stay outside those windows and retain normal executable JIT-pool
+  mapping. Log 141 confirms third-slot allocation but faults at the native
+  WOW64 loader entry point before rendering, after the old upper-bound-only
+  check placed that DLL inside guest memory. `MADEIRA_WOW_STRICT_LIMITS=0`
+  restores the old decision; `[wow-placement] ml1240` records the first eight
+  differing classifications. Host checks cover all three windows, ordinary
+  and high-half guest requests, low-address devices, and rollback. Full startup
+  and rendering still require device confirmation.

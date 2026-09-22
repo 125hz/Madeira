@@ -7379,6 +7379,33 @@ void ios_wow_translate_limits( ULONG_PTR *limit_low, ULONG_PTR *limit_high )
     *limit_high = base + high;
 }
 
+/* ml1240: a host placement ceiling may itself lie inside the current window.
+ * This happens with the third slot and the furniture ceiling 0x73ffff0000.
+ * Testing only limit_high then admits native ARM64 images into the guest
+ * reservation and applies guest relocation / execute-data policy to them.
+ * A translated guest request has BOTH bounds inside its own window; a host
+ * request spanning from address_space_start to that ceiling does not. */
+static int ios_wow_limits_in_window( ULONG_PTR low, ULONG_PTR high )
+{
+    ULONG_PTR base = ios_wow_base();
+    int old_match = high && ios_wow_in_window( (void *)high );
+    int match = old_match && low >= base && low <= high;
+    static int enabled = -1;
+    static unsigned notes;
+    int policy = __atomic_load_n( &enabled, __ATOMIC_ACQUIRE );
+
+    if (policy < 0)
+    {
+        const char *s = getenv( "MADEIRA_WOW_STRICT_LIMITS" );
+        policy = !(s && !strcmp( s, "0" ));
+        __atomic_store_n( &enabled, policy, __ATOMIC_RELEASE );
+    }
+    if (old_match && !match && __atomic_fetch_add( &notes, 1, __ATOMIC_RELAXED ) < 8)
+        dprintf( 2, "[wow-placement] ml1240 strict=%d host limits=%p..%p overlap guest window B=%p\n",
+                 policy, (void *)low, (void *)high, (void *)base );
+    return policy ? match : old_match;
+}
+
 /***********************************************************************
  *           ios_wow_image_ceiling
  *
@@ -13629,7 +13656,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
          * a 32-bit pseudo-process's [B, B+4G) and starve it.  Requests that
          * ARE window-constrained (their limits were translated into the
          * window by ios_wow_translate_limits) keep the window. */
-        if (!(limit_high && ios_wow_in_window( (void *)limit_high )))
+        if (!ios_wow_limits_in_window( limit_low, limit_high ))
         {
             void *excl_start = start, *excl_end = end;
 
@@ -13698,12 +13725,12 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
          * never turn a satisfiable allocation into STATUS_NO_MEMORY, which is the
          * ml118 rule ("never impose a constraint we cannot also withdraw").
          *
-         * Only for requests that are already confined to a guest window (limit_high
-         * inside it): host-side placements, and map_image_view's deliberate
+         * Only for requests whose two bounds are confined to a guest window:
+         * host-side placements, and map_image_view's deliberate
          * high-half attempt for builtins (whose limit_low is B + 2 GB, so low_end
          * lands at or below start and the test below fails), are untouched. */
         if (ios_wow_laa_synth && ios_wow_laa_low_first() && !base &&
-            limit_high && ios_wow_in_window( (void *)limit_high ))
+            ios_wow_limits_in_window( limit_low, limit_high ))
         {
             ULONG_PTR wb = ios_wow_base();
             void *low_end = (void *)(wb + limit_2g);
