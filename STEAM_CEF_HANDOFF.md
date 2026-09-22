@@ -160,7 +160,15 @@ all `OUT err=0` — handshakes complete. Some TLS works (`gnutls_handshake COMPL
 failure is at the **TLS/WebSocket layer**, above the socket.
 
 **Real but NOT the blocker:** `GetAdaptersAddresses failed: 2` ×239 — our NSI bypass only serves
-the TCP module; the NDIS path (`eb004a11`) returns table=0.
+the TCP module; the NDIS path (`eb004a11`) returns table=0. (Fixed later in ml1290.)
+
+**ml1350 — the UI transport (localhost WebSocket) was a WoW64 argument bug.** Every
+`ws://localhost:6246x/transportsocket/` attempt logged `Unknown error 10038` (WSAENOTSOCK) in
+cef_log.txt while the kernel connect completed. `WSAEnumNetworkEvents` passes its event HANDLE as
+the InputBuffer of `IOCTL_AFD_GET_EVENTS`; the WoW64 thunk offset it as a guest pointer, so
+`wine_server_obj_handle` returned `0xfffffff0` and the ioctl failed STATUS_INVALID_HANDLE. Fixed in
+`wine/dlls/ntdll/unix/socket.c` (`afd_event_handle_arg`, `MADEIRA_AFD_EVENT_HANDLE=0` rolls back).
+Device result pending. See WOW64_DESIGN.md ml1350.
 
 ---
 

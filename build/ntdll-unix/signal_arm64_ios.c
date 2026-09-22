@@ -7258,6 +7258,39 @@ static int ios_emulate_unaligned_guest_access(ucontext_t *ctx, uint32_t insn, ui
 /* ml1120 kill switch, defined next to ios_handle_unix_fault further down. */
 static int ios_syscall_fault_enabled( void );
 
+/* iOS-Madeira ml1350: whether an identical (thread,pc,addr) delivery extends
+ * the ml461 storm run.  That terminal counted identical deliveries
+ * CUMULATIVELY, but a managed runtime that raises null-reference exceptions
+ * through hardware faults redelivers the same key every frame while the
+ * program runs normally.  Device log 161: about 9 handled faults per frame
+ * across 8 sites on one thread, presents at ~36 FPS throughout, and the task
+ * was killed at one site's 2000th hit.  A storm is a thread that resumes and
+ * refaults at once with nothing in between, so the run continues only when
+ * the same thread's previous delivery had the same key and came within
+ * IOS_REDELIV_GAP_MS.  A fault elsewhere or a pause is progress and restarts
+ * the count.  Called only from the single Mach exception server thread.
+ * MADEIRA_REDELIV_PROGRESS=0 restores cumulative counting. */
+#define IOS_REDELIV_GAP_MS 8
+static int ios_redeliv_run_continues( uint64_t thread, uint64_t key, unsigned long long now,
+                                      unsigned long long ticks_per_ms, unsigned long long *last )
+{
+    static struct { uint64_t thread, key; } recent[64];
+    static int enabled = -1;
+    unsigned int idx = (unsigned int)(thread & 63);
+    int same = recent[idx].thread == thread && recent[idx].key == key;
+    int quick = *last && now >= *last && now - *last <= IOS_REDELIV_GAP_MS * ticks_per_ms;
+
+    if (enabled < 0)
+    {
+        const char *env = getenv( "MADEIRA_REDELIV_PROGRESS" );
+        enabled = !env || strcmp( env, "0" );
+    }
+    recent[idx].thread = thread;
+    recent[idx].key = key;
+    *last = now;
+    return !enabled || (same && quick);
+}
+
 static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_state64_t *state,
                                                    arm_neon_state64_t *neon, int have_neon,
                                                    int exception, uintptr_t fault_addr,
@@ -7889,11 +7922,23 @@ dispatch:
      * progress. */
     if (!is_align)
     {
-        static struct { uint64_t key; uint32_t n; } redeliv[16];
+        static struct { uint64_t key; uint32_t n; unsigned long long last; } redeliv[16];
+        static unsigned int progress_logs;
         static volatile int ios_redeliv_terminating;
         uint64_t rkey = ((uint64_t)thread << 48) ^ pc ^ ((uint64_t)fault_addr << 1);
         int rslot = (int)((rkey >> 4) & 15);
-        if (redeliv[rslot].key != rkey) { redeliv[rslot].key = rkey; redeliv[rslot].n = 1; }
+        int run;
+        if (redeliv[rslot].key != rkey) redeliv[rslot].last = 0;
+        run = ios_redeliv_run_continues( (uint64_t)thread, rkey, mach_absolute_time(),
+                                         ios_sb_ticks_per_ms(), &redeliv[rslot].last );
+        if (redeliv[rslot].key == rkey && !run && redeliv[rslot].n >= 64 && progress_logs < 8)
+        {
+            progress_logs++;
+            dprintf( 2, "[redeliv-progress] ml1350 pc=0x%llx addr=0x%llx count=%u reset: the thread "
+                        "ran elsewhere or paused between identical faults\n",
+                     (unsigned long long)pc, (unsigned long long)fault_addr, redeliv[rslot].n );
+        }
+        if (redeliv[rslot].key != rkey || !run) { redeliv[rslot].key = rkey; redeliv[rslot].n = 1; }
         else if (++redeliv[rslot].n == 256)
             dprintf( 2, "[redeliv] 256 identical redeliveries pc=0x%llx addr=0x%llx — storm forming rev=ml461\n",
                      (unsigned long long)pc, (unsigned long long)fault_addr );

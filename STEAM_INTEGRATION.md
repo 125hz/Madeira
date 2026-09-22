@@ -316,6 +316,26 @@ Madeira log. Useful tags are [steam-launch], [io-status-owner], [cef-logging],
 [socket-accept], [guest-log], [nsi-network] and [nsi-ios]. The visible NLA warning
 may remain. Do not treat its presence alone as a failed startup.
 
+## Transport error: ml1350
+
+The client's own logs (cef_log.txt) show why "Unexpected Transport Error (0x3000)"
+appears. In every run, each connection to the client's local UI transport
+(ws://localhost:6246x/transportsocket/) fails with Windows error 10038
+(WSAENOTSOCK), although the TCP connection itself completes and steam.exe's
+listener sees it. After connecting, Chromium asks winsock which socket events
+fired and passes an event handle to reset. Winsock carries that handle in the
+ioctl's input-buffer argument, and the 32-bit layer translated it like a memory
+address. The resulting value is not a valid handle, so the call failed with
+"not a socket". The native socket code now undoes that translation for this one
+argument, for 32-bit callers only.
+
+- MADEIRA_AFD_EVENT_HANDLE=0: keep the old translation (diagnosis only).
+- Log tag: [afd-event-handle] ml1350 (first eight conversions).
+
+This removes the demonstrated cause of the transport error. It does not prove
+the login screen now works: the open rendering, crash and CM-login problems in
+STEAM_CEF_HANDOFF.md may be the next thing seen.
+
 ## References
 
 - [Valve's official client download](https://store.steampowered.com/about/)
