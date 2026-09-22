@@ -113,6 +113,7 @@ struct LibraryEntry: Codable, Identifiable {
     var metadataRevision: Int?
     var overlayFields: [String]?
     var semaphoreFastPath: Bool?
+    var anisotropyLimit: Int?
     var desktop: Bool?
     static let desktopID = UUID(uuidString: "AF046C35-C32A-497B-92BC-0BBD14F8CB61")!
     static var desktopEntry: LibraryEntry {
@@ -145,6 +146,7 @@ struct LibraryEntry: Codable, Identifiable {
         setenv("MADEIRA_FASTSYNC", fastSync ? "auto" : "0", 1)
         setenv("MADEIRA_FASTSYNC_SEM", semaphoreFastPath == true ? "1" : "0", 1)
         setenv("MADEIRA_EXTENDED_MODES", extendedModes ? "1" : "0", 1)
+        setenv("DXMT_D9_ANISO_LIMIT", String(anisotropyLimit ?? 0), 1)
         GuestDisplay.configureSessionDefault(view: CGSize(width: 1280, height: 720), knob: resolution)
         madeira_set_vsync_locked(Int32(fpsMode))
         fputs("[frontend] ml1140 launch profile applied\n", stderr)
@@ -245,7 +247,7 @@ final class LibraryModel: ObservableObject {
 
     @MainActor
     func refreshMetadata(_ id: UUID) async {
-        let revision = LibraryFlags.enabled("MADEIRA_LIBRARY_INSTALL_SIZE") ? 2 : 1
+        let revision = (LibraryFlags.enabled("MADEIRA_LIBRARY_INSTALL_SIZE") ? 2 : 1) + (LibraryFlags.enabled("MADEIRA_LIBRARY_API_SCAN") ? 10 : 0)
         guard !metadataInFlight.contains(id), let entry = entries.first(where: { $0.id == id }), entry.desktop != true,
               entry.metadataRevision != revision || Date().timeIntervalSince(entry.metadataChecked ?? .distantPast) > 86400,
               let url = try? Self.executable(entry.relativePath) else { return }
@@ -256,7 +258,7 @@ final class LibraryModel: ObservableObject {
         updated.folderBytes = result.bytes
         if let api = result.api { updated.graphicsAPI = api }
         updated.metadataChecked = Date(); updated.metadataRevision = revision; save(updated)
-        fputs("[library-metadata] ml1180 install scan revision=\(revision) api=\(updated.graphicsAPI ?? "unknown") bytes=\(result.bytes ?? -1)\n", stderr)
+        fputs("[library-metadata] ml1250 install scan revision=\(revision) api=\(updated.graphicsAPI ?? "unknown") bytes=\(result.bytes ?? -1)\n", stderr)
     }
 
     static func executable(_ relative: String) throws -> URL {
@@ -293,6 +295,8 @@ final class LibraryModel: ObservableObject {
         var levels = Set<String>()
         for name in imports {
             switch name {
+            case "ddraw.dll": levels.insert("DirectDraw")
+            case "d3d8.dll": levels.insert("D3D8")
             case "d3d9.dll": levels.insert("D3D9")
             case "d3d10.dll", "d3d10_1.dll": levels.insert("D3D10")
             case "d3d11.dll": levels.insert("D3D11")
@@ -503,6 +507,34 @@ enum SteamCatalog {
 // so entering a session stops directory work instead of competing with it.
 private actor LibraryMetadataScanner {
     static let shared = LibraryMetadataScanner()
+    // Dynamic imports do not appear in the PE import table. Look only for
+    // terminated DLL names in bounded reads; these indicate supported APIs,
+    // not which backend an application selects at runtime.
+    private func dynamicAPIs(_ file: URL, budget: inout Int) -> Set<String> {
+        guard budget > 0, let handle = try? FileHandle(forReadingFrom: file) else { return [] }
+        defer { try? handle.close() }
+        guard let signature = try? handle.read(upToCount: 2), signature == Data([0x4d, 0x5a]) else { return [] }
+        let length = (try? handle.seekToEnd()) ?? 0
+        let window = min(budget, 4 * 1024 * 1024)
+        var result = Set<String>()
+        let names = ["ddraw.dll", "d3d8.dll", "d3d9.dll", "d3d10.dll", "d3d10_1.dll", "d3d11.dll", "d3d12.dll", "opengl32.dll", "vulkan-1.dll"]
+        for offset in [UInt64(0), length > UInt64(window) ? length - UInt64(window) : 0] {
+            guard budget > 0, !Task.isCancelled else { break }
+            try? handle.seek(toOffset: offset)
+            guard let bytes = try? handle.read(upToCount: min(window, budget)) else { break }
+            budget -= bytes.count
+            let folded = Data(bytes.map { $0 >= 65 && $0 <= 90 ? $0 + 32 : $0 })
+            for name in names {
+                let ascii = Data((name + "\0").utf8)
+                let wide = Data((name + "\0").utf16.flatMap { [UInt8($0 & 255), UInt8($0 >> 8)] })
+                if folded.range(of: ascii) != nil || folded.range(of: wide) != nil {
+                    result.formUnion(LibraryModel.apiNames([name]))
+                }
+            }
+            if length <= UInt64(window) { break }
+        }
+        return result
+    }
     func scan(_ executable: URL, drive: URL) -> (bytes: Int64?, api: String?) {
         let folder = executable.deletingLastPathComponent()
         guard folder.path.hasPrefix(drive.path + "/"), !Task.isCancelled else { return (nil, nil) }
@@ -540,11 +572,22 @@ private actor LibraryMetadataScanner {
         for file in siblings where file.pathExtension.lowercased() == "dll" {
             if file.resolvingSymlinksInPath().path.hasPrefix(drive.path + "/") { local[file.lastPathComponent.lowercased()] = file }
         }
+        let extended = LibraryFlags.enabled("MADEIRA_LIBRARY_API_SCAN")
+        var budget = 32 * 1024 * 1024
         var pending = [executable], visited = Set<String>(), apis = Set<String>()
+        // A launcher may start a sibling executable rather than import its engine.
+        // Restrict fallback to the same installation directory and a small count.
+        if extended && LibraryModel.graphicsImports(executable) == nil {
+            pending.insert(contentsOf: siblings.filter {
+                $0.pathExtension.lowercased() == "exe" && $0 != executable &&
+                $0.resolvingSymlinksInPath().path.hasPrefix(drive.path + "/")
+            }.sorted { $0.path < $1.path }.prefix(8), at: 0)
+        }
         while let file = pending.popLast(), visited.count < 64, !Task.isCancelled {
             if !visited.insert(file.path).inserted { continue }
             let imports = LibraryModel.importNames(file)
             apis.formUnion(LibraryModel.apiNames(imports))
+            if extended { apis.formUnion(dynamicAPIs(file, budget: &budget)) }
             for name in imports { if let dependency = local[name], !visited.contains(dependency.path) { pending.append(dependency) } }
         }
         return (complete && walker != nil ? bytes : nil, apis.isEmpty ? nil : apis.sorted().joined(separator: "/"))
@@ -830,7 +873,7 @@ struct LibraryView: View {
                 } else {
                     VStack(alignment: .leading, spacing: 6) {
                         LibraryArtwork(entry: entry).aspectRatio(2.0 / 3.0, contentMode: .fit).clipShape(RoundedRectangle(cornerRadius: 12))
-                        Text(entry.title).font(.subheadline.weight(.semibold)).lineLimit(2, reservesSpace: true)
+                        Text(entry.title).font(.subheadline.weight(.semibold)).lineLimit(2)
                         LibraryBadges(entry: entry).foregroundStyle(.secondary)
                     }.padding(4)
                 }
@@ -873,6 +916,16 @@ struct ExecutableBrowser: View {
     }
 }
 
+private struct LibraryPlayStyle: ButtonStyle {
+    var pending: Bool
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label.padding(.horizontal, 18).padding(.vertical, 10)
+            .foregroundStyle(.white)
+            .background(pending || configuration.isPressed ? Color(uiColor: .darkGray) : .accentColor,
+                        in: RoundedRectangle(cornerRadius: 14))
+    }
+}
+
 struct LibraryDetail: View {
     @State var entry: LibraryEntry
     var play: (LibraryEntry) -> Void
@@ -883,6 +936,17 @@ struct LibraryDetail: View {
     @State private var remove = false
     @State private var leaving = false
     @State private var error: String?
+    private let launchPolish = LibraryFlags.enabled("MADEIRA_LAUNCH_POLISH")
+    private func start() {
+        guard !leaving else { return }
+        leaving = true
+        let profile = entry
+        fputs("[launch-feedback] ml1250 pending=1 polish=\(launchPolish ? 1 : 0)\n", stderr)
+        // Give the pressed state a display turn before saving and handing off.
+        DispatchQueue.main.asyncAfter(deadline: .now() + (launchPolish ? 0.12 : 0)) {
+            model.save(profile); play(profile)
+        }
+    }
     var body: some View {
         NavigationStack {
             Form {
@@ -892,8 +956,8 @@ struct LibraryDetail: View {
                         VStack(alignment: .leading, spacing: 12) {
                             Text(entry.title).font(.title2.bold())
                             LibraryBadges(entry: entry)
-                            Button { leaving = true; model.save(entry); play(entry) } label: { HStack(spacing: 10) { Image(systemName: "play.fill"); Text("Play").fontWeight(.semibold) }.frame(minWidth: 100, minHeight: 30) }
-                                .buttonStyle(.borderedProminent).controlSize(.large)
+                            Button(action: start) { HStack(spacing: 10) { Image(systemName: "play.fill"); Text("Play").fontWeight(.semibold) }.frame(minWidth: 100, minHeight: 30) }
+                                .buttonStyle(LibraryPlayStyle(pending: leaving)).disabled(leaving)
                         }
                     }.padding(.vertical, 24)
                         .listRowBackground(
@@ -922,6 +986,10 @@ struct LibraryDetail: View {
                     Toggle("Reduced-precision x87", isOn: $entry.reducedX87)
                     Toggle("Fast synchronization", isOn: $entry.fastSync)
                     Toggle("Fast semaphore waits (experimental)", isOn: Binding(get: { entry.semaphoreFastPath ?? false }, set: { entry.semaphoreFastPath = $0 }))
+                    Picker("D3D9 anisotropic filtering", selection: Binding(get: { entry.anisotropyLimit ?? 0 }, set: { entry.anisotropyLimit = $0 })) {
+                        Text("Application default").tag(0)
+                        ForEach([1, 2, 4, 8], id: \.self) { Text("Up to \($0)×").tag($0) }
+                    }
                     TextField("Launch arguments", text: $entry.arguments, axis: .vertical).autocorrectionDisabled().textInputAutocapitalization(.never)
                 } header: { Text("Compatibility & performance") } footer: {
                     Text("Full x87 precision can improve compatibility at a performance cost. Synchronization settings apply to the next launch. Full precision changes may still require restarting Madeira.")
@@ -975,9 +1043,9 @@ struct LibraryDetail: View {
             }
             .onDisappear { if !leaving { model.save(entry) } }
             .onReceive(LibraryController.shared.commands) { command in
-                guard !findCover, !importCover, !remove else { return }
+                guard !leaving, !findCover, !importCover, !remove else { return }
                 if command == "back" { model.save(entry); dismiss() }
-                if command == "accept" { leaving = true; model.save(entry); play(entry) }
+                if command == "accept" { start() }
             }
         }
     }
@@ -1114,7 +1182,7 @@ struct LibraryFloatingItem: View {
             Color.clear.onAppear { measured = proxy.size }.onChange(of: proxy.size) { _, size in measured = size }
         })
         .contentShape(Rectangle())
-        .simultaneousGesture(DragGesture(minimumDistance: 6, coordinateSpace: .global).updating($drag) { value, state, transaction in
+        .highPriorityGesture(DragGesture(minimumDistance: 6, coordinateSpace: .global).updating($drag) { value, state, transaction in
             transaction.animation = nil; state = value.translation
         }.onEnded { value in
             let end = position(value.translation)
@@ -1138,13 +1206,18 @@ struct LibraryHUD: View {
     @ObservedObject private var controls = TouchControlsModel.shared
     @ObservedObject private var input = InputSettings.shared
     private let sessionTools = LibraryFlags.enabled("MADEIRA_SESSION_TOOLS")
+    private let launchPolish = LibraryFlags.enabled("MADEIRA_LAUNCH_POLISH")
+    @State private var launchVisible = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .topLeading) {
                 if model.launching, let entry = model.entries.first(where: { $0.id == model.current }) {
                     LibraryArtwork(entry: entry, backdrop: true).overlay(.black.opacity(0.65)).ignoresSafeArea()
+                        .opacity(launchVisible || !launchPolish ? 1 : 0)
                     launchView(entry, geometry: geo)
+                        .opacity(launchVisible || !launchPolish ? 1 : 0)
+                        .scaleEffect(launchVisible || reduceMotion || !launchPolish ? 1 : 0.96)
                 }
                 if !model.launching && model.performance { LibraryFloatingItem(isMenu: false, viewport: geo.size, insets: geo.safeAreaInsets) }
                 if model.liveLogs && !model.launching { LibraryLiveLogs().frame(maxWidth: 550, maxHeight: 140).padding(.top, geo.safeAreaInsets.top + 60).padding(.horizontal, 12).allowsHitTesting(false) }
@@ -1162,6 +1235,9 @@ struct LibraryHUD: View {
                 }
             }
             .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.85), value: model.menu)
+            .onAppear {
+                withAnimation(launchPolish ? .easeOut(duration: reduceMotion ? 0.15 : 0.35) : nil) { launchVisible = true }
+            }
             .preferredColorScheme(.dark)
         }.ignoresSafeArea()
         .onAppear { model.saveCurrentProfile(); fputs("[frontend-hud] ml1160 contained menu; stable overlay drag\n", stderr) }
@@ -1180,7 +1256,7 @@ struct LibraryHUD: View {
         let available = max(0, geo.size.height - geo.safeAreaInsets.top - geo.safeAreaInsets.bottom)
         return ScrollView {
             VStack(spacing: compact ? 10 : 18) {
-                LibraryArtwork(entry: entry).frame(width: compact ? 52 : 120, height: compact ? 78 : 180)
+                LibraryArtwork(entry: entry).frame(width: compact ? 90 : 120, height: compact ? 135 : 180)
                     .clipShape(RoundedRectangle(cornerRadius: 14)).shadow(radius: 20)
                 Text(entry.title).font(.title2.bold()).multilineTextAlignment(.center)
                 ProgressView().tint(.white)

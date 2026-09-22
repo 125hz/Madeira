@@ -312,3 +312,37 @@ record the same scene after warm-up, and send the full saved log. Relevant tags:
   differing classifications. Host checks cover all three windows, ordinary
   and high-half guest requests, low-address devices, and rollback. Full startup
   and rendering still require device confirmation.
+
+- Scene batching and launch polish (ml1250): small D3D9 scenes retain their
+  recorded operation stream across EndScene, avoiding repeated vector/cache
+  setup and pass boundaries. At 256 operations the original drain runs;
+  clear-only scenes, Present, query boundaries, readbacks and resource hazards
+  retain their existing drains. `DXMT_D9_SCENE_BATCH=0` restores the old policy.
+  `[d9-batching] ml1250` reports the per-device policy and sparse retained-scene
+  counts. No measured FPS improvement is claimed before device comparison.
+- Per-entry **D3D9 anisotropic filtering** defaults to Application default.
+  Choosing 1x/2x/4x/8x caps sampler anisotropy (never raises it), trading distant
+  texture sharpness for lower sampling cost when the application requests a
+  higher level. It does not change resolution, mip selection or guest-reported
+  sampler state. `DXMT_D9_ANISO_LIMIT=0` or 16 retains the application maximum;
+  the saved launch profile takes precedence over the text-file value. Each new
+  device reads its policy, so switching profiles does not require an app restart.
+- Play gains immediate dark-gray feedback, duplicate-press protection and a
+  short display turn before session handoff; the loading artwork fades/scales
+  into view, respecting Reduce Motion. The landscape loading card is larger.
+  `MADEIRA_LAUNCH_POLISH=0` disables the delayed/animated handoff.
+  `[launch-feedback] ml1250` reports each accepted press. Existing
+  `MADEIRA_HUD_DRAG=0` disables floating-item dragging; recognized drags now
+  take priority over the menu button's tap action.
+- Card titles no longer reserve an unused second line. Renderer metadata now
+  includes bounded dynamic DLL-name scans and sibling executable fallback for
+  launchers; DirectDraw and D3D8 are recognized too. This is supported-API
+  detection, not runtime renderer selection. It reads at most 32 MiB of dynamic
+  names per entry, with cancellation between files/windows, off the main actor.
+  `MADEIRA_LIBRARY_API_SCAN=0` restores import-graph-only detection.
+  `[library-metadata] ml1250` records the revision and result, without titles.
+- The owner confirmed nested launcher startup now works with ml1240. Logs
+  145/146 still show the separate early invalid-return fault at guest FFFFFFFE;
+  experimental semaphore waits are already disabled. There is no evidence
+  that a UI setting fixes that failure, and no executable-specific workaround
+  is included in this round.
