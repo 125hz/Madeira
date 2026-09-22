@@ -27,6 +27,8 @@ private final class SteamDownloadDelegate: NSObject, URLSessionDownloadDelegate,
     @Published var refreshing = false
     @Published var progress = 0.0
     @Published var error: String?
+    @Published var installerPhase = "Downloading installer…"
+    @Published var installerReady = false
     private var operation: Task<Void, Never>?
     private var scan: Task<SteamSnapshot, Error>?
     private var canManage: Bool { LibraryModel.shared.current == nil && wine_process_is_running() == 0 && wineserver_is_running() == 0 }
@@ -52,9 +54,16 @@ private final class SteamDownloadDelegate: NSObject, URLSessionDownloadDelegate,
     }
     func stopScan() { scan?.cancel() }
     func cancel() { operation?.cancel() }
+    private func finishInstaller(bits: Int, ready: (LibraryEntry) -> Void) {
+        installerReady = true
+        progress = 1
+        LogStore.shared.log("[steam-install] ml1270 installer staged bits=\(bits); ready to run")
+        if !LibraryFlags.enabled("MADEIRA_STEAM_STAGED_INSTALL") { ready(installerEntry(bits: bits)) }
+    }
     func download(ready: @escaping (LibraryEntry) -> Void) {
         guard !busy, canManage, LibraryFlags.enabled("MADEIRA_STEAM") else { return }
-        busy = true; error = nil; progress = 0
+        busy = true; error = nil; progress = 0; installerReady = false
+        installerPhase = "Downloading installer…"
         operation = Task {
             defer { busy = false; operation = nil }
             let delegate = SteamDownloadDelegate { value in Task { @MainActor [weak self] in self?.progress = value } }
@@ -63,24 +72,25 @@ private final class SteamDownloadDelegate: NSObject, URLSessionDownloadDelegate,
             let session = URLSession(configuration: config)
             defer { session.invalidateAndCancel() }
             do {
-                fputs("[steam-bridge] ml1260 installer download begin\n", stderr)
+                LogStore.shared.log("[steam-install] ml1270 download begin")
                 let (temporary, response) = try await session.download(from: SteamPaths.installerURL, delegate: delegate)
                 defer { try? FileManager.default.removeItem(at: temporary) }
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200,
                       SteamPaths.trustedDownload(http.url) else { throw SteamFileError.invalid("Steam's installer could not be downloaded. Try again or choose your own installer.") }
+                installerPhase = "Checking installer…"
                 let bits = try await SteamDisk.shared.storeInstaller(temporary, drive: LibraryModel.drive)
                 try Task.checkCancellation()
                 guard canManage else { return }
-                fputs("[steam-bridge] ml1260 installer ready bits=\(bits)\n", stderr)
-                ready(installerEntry(bits: bits))
+                finishInstaller(bits: bits, ready: ready)
             } catch {
-                if !Task.isCancelled { self.error = error.localizedDescription; fputs("[steam-bridge] ml1260 installer download failed\n", stderr) }
+                if !Task.isCancelled { self.error = error.localizedDescription; LogStore.shared.log("[steam-install] ml1270 download or validation failed") }
             }
         }
     }
     func importInstaller(_ source: URL, ready: @escaping (LibraryEntry) -> Void) {
         guard !busy, canManage, LibraryFlags.enabled("MADEIRA_STEAM") else { return }
-        busy = true; error = nil
+        busy = true; error = nil; progress = 0; installerReady = false
+        installerPhase = "Checking installer…"
         operation = Task {
             let access = source.startAccessingSecurityScopedResource()
             defer { if access { source.stopAccessingSecurityScopedResource() }; busy = false; operation = nil }
@@ -88,13 +98,14 @@ private final class SteamDownloadDelegate: NSObject, URLSessionDownloadDelegate,
                 let bits = try await SteamDisk.shared.storeInstaller(source, drive: LibraryModel.drive)
                 try Task.checkCancellation()
                 guard canManage else { return }
-                fputs("[steam-bridge] ml1260 supplied installer ready bits=\(bits)\n", stderr)
-                ready(installerEntry(bits: bits))
+                finishInstaller(bits: bits, ready: ready)
             } catch { if !Task.isCancelled { self.error = error.localizedDescription } }
         }
     }
-    func installerEntry(bits: Int = 32) -> LibraryEntry {
-        var entry = LibraryEntry(title: "Install Steam", relativePath: SteamPaths.installerRelative, bits: bits)
+    func installerEntry(bits: Int? = nil) -> LibraryEntry {
+        let url = SteamPaths.safeRelative(SteamPaths.installerRelative, under: LibraryModel.drive)
+        let detectedBits = bits ?? url.flatMap { try? SteamPaths.executableBits($0) } ?? 32
+        var entry = LibraryEntry(title: "Install Steam", relativePath: SteamPaths.installerRelative, bits: detectedBits)
         entry.steamSession = "installer"; entry.reducedX87 = false
         return entry
     }
@@ -125,6 +136,9 @@ struct SteamLibraryView: View {
         guard jit_check_debugged() else { model.error = "Enable JIT before opening Steam."; return }
         do { try entry.validate() } catch { model.error = error.localizedDescription; return }
         model.stopScan()
+        if entry.steamSession == "installer" {
+            LogStore.shared.log("[steam-install] ml1270 starting cached installer; entering Wine/JIT startup")
+        }
         play(entry)
     }
     var body: some View {
@@ -139,14 +153,17 @@ struct SteamLibraryView: View {
                 }
                 Section {
                     if model.busy {
-                        ProgressView("Preparing installer…", value: model.progress)
+                        ProgressView(model.installerPhase, value: model.progress)
                         Button("Cancel", role: .cancel) { model.cancel() }
                     } else if model.snapshot.client != nil {
                         Button { if let entry = model.clientEntry(bigPicture: false) { launch(entry) } } label: { Label("Open Steam", systemImage: "play.fill") }
                         Button { if let entry = model.clientEntry(bigPicture: true) { launch(entry) } } label: { Label("Big Picture", systemImage: "gamecontroller") }
                     } else {
-                        Button { model.download(ready: launch) } label: { Label("Download & install Steam", systemImage: "arrow.down.circle") }
-                        if model.cachedInstaller { Button("Run downloaded installer") { launch(model.installerEntry()) } }
+                        Button { model.download(ready: launch) } label: { Label("Download Steam installer", systemImage: "arrow.down.circle") }
+                    }
+                    if !model.busy && model.cachedInstaller {
+                        if model.installerReady { Label("Installer ready", systemImage: "checkmark.circle").foregroundStyle(.secondary) }
+                        Button { launch(model.installerEntry()) } label: { Label("Run downloaded installer", systemImage: "play.fill") }
                     }
                     Button(action: enableJIT) { Label("Enable JIT", systemImage: "bolt.fill") }.disabled(model.busy)
                 } footer: {

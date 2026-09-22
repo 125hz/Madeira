@@ -3002,6 +3002,8 @@ void ios_fd_cache_release( void *peb )
 {
     int i, j, n, closed = 0;
     struct ios_fd_cache *c = NULL;
+    const char *env = getenv( "MADEIRA_FD_CACHE_RELEASE_FIX" );
+    const int fixed = !env || strcmp( env, "0" );
 
     pthread_mutex_lock( &ios_fd_cache_alloc_lock );
     n = ios_fd_cache_count;
@@ -3021,17 +3023,26 @@ void ios_fd_cache_release( void *peb )
         union fd_cache_entry *block = c->blocks[i];
         if (!block) continue;
         for (j = 0; j < FD_CACHE_BLOCK_SIZE; j++)
-            if (block[j].s.fd > 0)
+            if (block[j].s.fd > 0 && (!fixed || block[j].s.type != FD_TYPE_INVALID))
             {
-                /* ml586: the prime suspect close — a stale cache entry whose fd
-                 * number was recycled into another thread's comm pipe */
-                ios_fdt_note_close( block[j].s.fd, "fd-cache-release", peb );
-                close( block[j].s.fd );
+                /* ml1270: add_fd_to_cache stores fd+1 (zero means empty).
+                 * Closing that encoded value closes an unrelated descriptor
+                 * and leaks the real one. Invalid entries encode NTSTATUS,
+                 * not a descriptor. Decode exactly as get_cached_fd does. */
+                int fd = block[j].s.fd - (fixed ? 1 : 0);
+                ios_fdt_note_close( fd, "fd-cache-release", peb );
+                close( fd );
                 closed++;
             }
-        if (block != c->initial_block) free( block );
+        if (block != c->initial_block)
+        {
+            /* Additional blocks come from anon_mmap_alloc, not malloc. */
+            if (fixed) munmap( block, FD_CACHE_BLOCK_SIZE * sizeof(*block) );
+            else free( block );
+        }
     }
     free( c );
+    dprintf( 2, "[fd-cache-retire] ml1270 decoded=%d closed=%d\n", fixed, closed );
     dprintf( 2, "[fd-cache] rev=ml571 released peb=%p, closed %d cached fd(s)\n", peb, closed );
 }
 

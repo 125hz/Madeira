@@ -6,7 +6,9 @@ Madeira does not collect Steam credentials or require a Web API key.
 
 ## Try it on device
 
-1. Enable JIT, then open **Library → Steam → Download & install Steam**.
+1. Open **Library → Steam → Download Steam installer**. Wait for **Installer
+   ready**, enable JIT, then choose **Run downloaded installer**. Downloading
+   alone does not start Wine or allocate its JIT pool.
 2. Complete the normal Windows installer. Its default destination is suitable;
    keep the client and additional libraries inside `C:` (`wine/drive_c`). At the
    final installer step, clear **Run Steam**, return using the in-game menu, and
@@ -28,7 +30,9 @@ when requested. No Steam executable is packaged in the IPA. **Use my own Steam
 installer** and **Locate an existing Steam installation** cover offline staging
 and custom locations. Download cancellation leaves any previously staged
 installer intact. Selecting a supplied installer copies it into
-`C:\Madeira\Downloads\SteamSetup.exe` before launch.
+`C:\Madeira\Downloads\SteamSetup.exe`. Choose **Run downloaded installer**
+after staging either kind of installer. That action remains available when a
+partial installation has already created Steam.exe; no repeat download is needed.
 
 ## Status and limitations
 
@@ -57,8 +61,8 @@ not a measurement of the renderer selected at runtime.
 
 Installer and client sessions use Wine's virtual desktop and its existing larger
 JIT-pool policy. Temporary Steam sessions do not create fake game cards. The
-existing CEF host accommodations remain in place; no new native emulator patches
-or account-protection workarounds are part of this change.
+existing CEF host accommodations remain in place. Generic section-mapping and
+descriptor-cache cleanup corrections also apply to installer helper processes.
 
 ## Diagnosis and rollback
 
@@ -68,6 +72,9 @@ Add these settings to `madeira-env.txt` when needed:
 | --- | --- |
 | `MADEIRA_STEAM=0` | Disable Steam integration and Steam-managed launches. Existing direct-executable entries are unaffected. |
 | `MADEIRA_STEAM_COMPAT=0` | Omit the client launch flags `-no-cef-sandbox -cef-disable-gpu -nocrashmonitor` for an A/B test. Existing native CEF policy is unchanged. |
+| `MADEIRA_STEAM_STAGED_INSTALL=0` | Restore automatic launch immediately after downloading/importing the installer. |
+| `MADEIRA_SECTION_PROCESS_LIMIT=0` | Restore the old shared WoW address ceiling for native section mappings (diagnostic rollback). |
+| `MADEIRA_FD_CACHE_RELEASE_FIX=0` | Restore the old descriptor-cache retirement behavior (diagnostic rollback; can close another process's descriptor). |
 | `MADEIRA_COMPACT_API_BADGE=0` | Restore the full detected API chain on badges. |
 
 `[steam-bridge] ml1260` records feature state, scans, installer stages and session
@@ -75,6 +82,14 @@ kind/App ID. It does not log credentials. For a device failure, include the
 Madeira log and the stage reached: installer, bootstrap/update, login, download,
 or application launch. Relevant native tags include `[WineProc]`,
 `[session-handoff]`, `[wow-capacity]`, `[wow-placement]` and CEF diagnostics.
+`[steam-install] ml1270` records download completion and the separate Wine/JIT
+launch handoff, including before native output capture starts. `[section-limits]`
+and `[fd-cache-retire] ml1270` identify the helper-process fixes. In logs 148/149,
+the installer was already downloaded: the first run ended during JIT allocation,
+while the second reached installation and then suffered native-helper mapping
+and process-cleanup faults. The first termination has no crash report establishing
+its cause. Successful installer completion still needs an updated device test.
+
 Steam's own `logs` directory may be needed for login/update problems; redact
 account identifiers and tokens before sharing those files.
 

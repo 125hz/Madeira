@@ -2561,6 +2561,25 @@ void ios_wow_fixup_peb64_ptrs( void )
 }
 
 
+#ifdef WINE_IOS
+/* ml1270: map_section serves both guest and native helpers. The shared WoW
+ * ceiling remains nonzero after a guest starts, but a later native helper has
+ * no guest window. Passing that ceiling to its locale/API-set mapping forces
+ * an impossible sub-4-GB host allocation. Preserve guest limits only for the
+ * calling process that owns a window; never borrow another process's limit. */
+ULONG_PTR ios_section_zero_bits(void)
+{
+    const char *env = getenv( "MADEIRA_SECTION_PROCESS_LIMIT" );
+    ULONG_PTR limit = user_space_wow_limit;
+    static unsigned int reports;
+    if ((!env || strcmp( env, "0" )) && !ios_wow_base()) limit = 0;
+    if (limit != user_space_wow_limit && __atomic_fetch_add( &reports, 1, __ATOMIC_RELAXED ) < 8)
+        dprintf( 2, "[section-limits] ml1270 native mapping drops foreign WoW ceiling=%p\n",
+                 (void *)user_space_wow_limit );
+    return limit;
+}
+#endif
+
 /**************************************************************************
  *      NtGetNlsSectionPtr  (NTDLL.@)
  */
