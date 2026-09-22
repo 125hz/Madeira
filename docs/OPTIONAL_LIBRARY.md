@@ -353,3 +353,19 @@ record the same scene after warm-up, and send the full saved log. Relevant tags:
 Library's Steam action downloads Valve's installer on demand or accepts a supplied installer. Open Steam and Big Picture use the Wine virtual desktop; installed manifests are imported when the session ends. Native Play routes through Steam by App ID, separately from editable artwork metadata. No Steam files or credentials are bundled in the app. Runtime login/download support remains experimental pending device confirmation. See [Steam integration](../STEAM_INTEGRATION.md) for the workflow, diagnostics and rollback switches.
 
 Renderer badges now show one detected capability instead of a chain. `MADEIRA_COMPACT_API_BADGE=0` restores the full chain. This badge does not establish the currently active graphics API.
+
+## Native Steam library (ml1310)
+
+The Library tab is split into **Steam** and **Other games**. Signing in to
+Steam (Steam section or Settings › Steam) lists the account's Windows games;
+**Not installed** entries download directly from Steam inside Madeira, with
+pause, resume, cancel and automatic pausing while a game runs. Installed Steam
+games keep the usual per-game profile, plus a Steam section to start the game
+directly or through the Windows Steam client, pick the program, update, or
+uninstall. Other games still come from folders copied into `wine/drive_c` and
+added with **+**, with Steam Store artwork matching as before. The Windows Steam
+client manager moved to Settings › Windows Steam client. See
+[Steam integration](../STEAM_INTEGRATION.md) for sign-in, storage, limitations,
+switches (`MADEIRA_STEAM_NATIVE`, `MADEIRA_LIBRARY_SECTIONS`,
+`MADEIRA_STEAM_PAUSE_FOR_SESSION`, `MADEIRA_STEAM_APPID_FILE`,
+`MADEIRA_STEAM_TRACE`) and log tags.

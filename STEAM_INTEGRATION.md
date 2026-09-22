@@ -1,8 +1,105 @@
 # Steam in the optional front end
 
-The native front end installs and opens the Windows Steam client. Steam itself
-handles sign-in, Steam Guard, purchases, ownership checks, downloads and updates.
-Madeira does not collect Steam credentials or require a Web API key.
+Since ml1310 the optional library signs in to Steam natively. It shows the
+account's Windows games, and downloads and installs them without the Windows
+desktop. The Windows Steam client (below) remains available for games that need
+Steam running and for anything the native path does not cover.
+
+## Native Steam library (ml1310)
+
+Enable the optional library (`MADEIRA_FRONTEND=1` in `madeira-frontend.txt`).
+The Library tab now has two sections:
+
+- **Steam**: installed Steam games, downloads in progress, and a collapsible
+  **Not installed** list of every owned game that has a Windows build.
+- **Other games**: everything added with **+** from a folder copied into
+  `wine/drive_c` with the Files app. Artwork matching and profiles work as before.
+
+### Sign in
+
+Tap **Sign in to Steam** in the Steam section (or Settings › Steam).
+
+- **Password** (default on iPhone): use the Steam *account name*, then either
+  type the Steam Guard code (Steam app or email) or approve the sign-in in the
+  Steam app. Both options are offered at once when Steam allows both.
+- **QR code** (default on iPad): scan it with the Steam app on another device.
+  **Open in the Steam app on this device** passes the same sign-in link to the
+  Steam app installed on this device. That same-device hand-off has not been
+  tested yet.
+
+Madeira talks to Steam's authentication service directly. The password is
+encrypted with Steam's RSA key before it leaves the device and is never stored.
+The resulting sign-in token is kept in the iOS Keychain (this device only,
+available while unlocked) under the service `madeira.steam.tokens`. **Sign out**
+in Settings removes it. Installed games stay. An expired or revoked token signs
+the app out with a message.
+
+### Install and play
+
+Tap a game under **Not installed** and choose **Install**. Files come directly
+from Steam's content servers with the signed-in account; Steam only issues depot
+keys for games the account owns. Nothing is patched or altered.
+
+- Destination: `C:\Program Files (x86)\Steam\steamapps\common\<folder>`, plus a
+  normal `appmanifest_<appid>.acf`, so a Windows Steam client installed later
+  recognizes the game.
+- Windows depots only: common content, English language content, and 64-bit
+  (or 32-bit when that is all an app publishes). DLC depots, low-violence
+  alternates and shared redistributables are skipped.
+- Progress shows size, speed and time left. **Pause**, **Resume** and
+  **Cancel** (deletes partial files of a first install) are available.
+- Downloads resume where they stopped: completed chunks are journaled in
+  `steamapps/downloading/<appid>`. Existing files are also checked chunk by
+  chunk (SHA-1), so updates only fetch changed data.
+- Downloads pause automatically while a game runs and continue afterwards.
+  Keep Madeira in the foreground while downloading; iOS suspends background apps.
+
+When the download finishes, the game appears under **Steam** with its artwork.
+The program to start comes from Steam's own launch entries, or from the most
+likely executable in the folder. Game details › Steam lets you:
+
+- **Start with: The game** (default) runs the executable directly. A
+  `steam_appid.txt` (Valve's documented developer file) is written next to it.
+  This works for games that do not need Steam running.
+- **Start with: Windows Steam client** runs `steam.exe -applaunch <appid>` in
+  the virtual desktop. It needs the Windows client installed (Settings ›
+  Windows Steam client) and signed in to the same account. This is the only
+  supported route for games that require Steam or use Steam DRM.
+- **Program** picks another executable from the install.
+- **Update available** appears when Steam publishes a newer build.
+- **Uninstall** deletes the game's files and manifest.
+
+### What this does not do
+
+- No Steam emulator, launch loader, DRM unwrapping, app-ticket injection or
+  other circumvention is included. A game that refuses to start without Steam
+  needs the Windows Steam client route. That route depends on the client
+  itself working on device, which is still unproven (see the ml1260–ml1300
+  sections below).
+- No Steam Cloud synchronization, DLC or beta-branch selection yet.
+- Owned games are read from the account's licenses. Family-shared libraries and
+  free weekends may appear; Steam still decides download access.
+
+### Switches (madeira-env.txt)
+
+| Setting | Effect |
+| --- | --- |
+| `MADEIRA_STEAM_NATIVE=0` | Hide native sign-in, the owned library and downloads; the ml1260 Steam button returns. Installed games still launch. |
+| `MADEIRA_LIBRARY_SECTIONS=0` | Keep the native features but use the single combined grid. |
+| `MADEIRA_STEAM_PAUSE_FOR_SESSION=0` | Let downloads continue while a game runs. |
+| `MADEIRA_STEAM_APPID_FILE=0` | Do not write `steam_appid.txt` next to newly installed executables. |
+| `MADEIRA_STEAM_TRACE=1` | Protocol-level `[steam-trace]` lines (no credentials or payloads). |
+
+Always-on log tags (no account names, tokens or game titles):
+`[steam-account] ml1310` (start, sign-in method/result, sign-out, rejected token),
+`[steam-library] ml1310` (owned and Windows-installable counts),
+`[steam-depot] ml1310` (install begin/complete/pause/fail by App ID, uninstall),
+`[steam-play] ml1310` (App ID, direct/client route), `[library-sections] ml1310`.
+
+## Windows Steam client (ml1260–ml1300)
+
+The rest of this document covers the Windows Steam client. It is still
+available from Settings › Windows Steam client.
 
 ## Try it on device
 

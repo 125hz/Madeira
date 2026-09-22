@@ -15,7 +15,7 @@ enum LibraryError: Error { case message(String) }
 enum LibraryFlags {
     static func enabled(_ key: String) -> Bool { getenv(key).map { String(cString: $0) != "0" } ?? true }
 }
-class LibraryModel { static let drive = URL(fileURLWithPath: "/tmp/madeira-profile-fixture"); var entries: [LibraryEntry] = []; var current: UUID?; var readOnly = false; func persist(_ next: [LibraryEntry]) { entries = next }; MERGE_METHODS }
+class LibraryModel { static let drive = URL(fileURLWithPath: "/tmp/madeira-profile-fixture"); var entries: [LibraryEntry] = []; var current: UUID?; var readOnly = false; func persist(_ next: [LibraryEntry]) { entries = next }; static func executable(_ relative: String) throws -> URL { drive.appendingPathComponent(relative) }; MERGE_METHODS }
 enum GuestDisplay { static func configureSessionDefault(view: CGSize, knob: String) {} }
 func madeira_set_vsync_locked(_ mode: Int32) {}
 '''
