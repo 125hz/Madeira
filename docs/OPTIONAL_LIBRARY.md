@@ -276,3 +276,17 @@ record the same scene after warm-up, and send the full saved log. Relevant tags:
   `[click-activation] ml1210` retains the first 16 activation outcomes; disable
   with `MADEIRA_MOUSE_DELIVERY=0`. Host checks pass; launcher interaction and
   cursor travel still need confirmation on device.
+
+- Launcher handoff (ml1220): exiting the original executable no longer stops
+  wineserver while application processes remain in the session. The original
+  session thread waits for the server; Wine's own application count decides
+  when the session is finished, including child and grandchild launchers that
+  have not created a window yet. Quit still requests termination of the entire
+  session. `MADEIRA_SESSION_DESCENDANTS=0` restores immediate stop when the
+  original thread retires. `[session-handoff] ml1220` reports retirement,
+  bounded remaining-process counts, and final completion. Server thread cleanup
+  now clears its running flag on `pthread_exit` as well as normal return.
+  Log 139 confirms the previous click/placement repair and shows a child being
+  loaded before the parent exit triggers premature server shutdown. The new
+  handoff passes host lifecycle checks; successful child startup needs a device
+  retest.

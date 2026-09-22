@@ -1258,6 +1258,8 @@ void main_loop(void)
         static unsigned ios_syn_per_user[64];        /* rolling, low 6 bits of user */
         static int ios_post_inject = 0;  /* trace first N iters after injection */
         static int ios_client_fd_start = -1;  /* first poll index added by injection */
+        int session_processes = -1;
+        unsigned int session_notes = 0;
         unsigned long long ios_next_timer_ns = ~0ull;  /* ns until next timer (deadline-aware sleep) */
 
         /* iOS socketpair bypass: check for injected client fd from app bridge */
@@ -1277,13 +1279,27 @@ void main_loop(void)
         while (active_users)
         {
             extern int g_wineserver_session_stop;
+            extern int g_wineserver_root_retired;
+            extern int ios_server_user_process_count(void);
+            if (__atomic_load_n(&g_wineserver_root_retired, __ATOMIC_ACQUIRE))
+            {
+                int remaining = ios_server_user_process_count();
+                if (remaining != session_processes && session_notes++ < 8)
+                    ws_log("[session-handoff] ml1220 root retired; applications remaining=%d", remaining);
+                session_processes = remaining;
+                if (!remaining)
+                {
+                    ws_log("[session-handoff] ml1220 application processes drained");
+                    break;
+                }
+            }
             if (__atomic_exchange_n(&g_wineserver_session_stop, 0, __ATOMIC_ACQ_REL))
             {
                 ws_log("[session-stop] ml1150 terminating Wine processes on server thread");
                 shutdown_master_socket();
             }
             /* Check stop flag */
-            if (g_wineserver_should_stop)
+            if (__atomic_load_n(&g_wineserver_should_stop, __ATOMIC_ACQUIRE))
             {
                 ws_log("[wineserver-fd] LOOP EXIT: stop requested at iter=%d", ios_iter);
                 break;

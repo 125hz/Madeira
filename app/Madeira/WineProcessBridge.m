@@ -435,7 +435,7 @@ extern void __wine_main(int argc, char *argv[]);
 extern void wine_log_set_file(const char *path);
 
 static pthread_t g_wine_thread;
-static volatile int g_wine_running = 0;
+static int g_wine_running = 0;
 static char *g_prefix_path = NULL;
 
 /***********************************************************************
@@ -599,9 +599,9 @@ static uint16_t madeira_pe_machine(const char *unix_path) {
 
 static void wine_process_finished(void *arg) {
     /* Also runs when SIGQUIT makes the main guest thread call pthread_exit. */
-    wineserver_stop();
-    g_wine_running = 0;
-    dprintf(STDERR_FILENO, "[session-stop] ml1150 main guest thread retired\n");
+    wineserver_finish_session();
+    __atomic_store_n(&g_wine_running, 0, __ATOMIC_RELEASE);
+    dprintf(STDERR_FILENO, "[session-stop] ml1220 guest session retired\n");
 }
 
 static void *wine_process_thread(void *arg) {
@@ -1730,7 +1730,7 @@ static void *wine_process_thread(void *arg) {
 }
 
 int wine_process_start(const char *prefix_path) {
-    if (g_wine_running) {
+    if (__atomic_load_n(&g_wine_running, __ATOMIC_ACQUIRE)) {
         LOG("Wine process already running");
         return 0;
     }
@@ -1740,7 +1740,7 @@ int wine_process_start(const char *prefix_path) {
 
     LOG("Starting Wine process with prefix: %{public}s", prefix_path);
 
-    g_wine_running = 1;
+    __atomic_store_n(&g_wine_running, 1, __ATOMIC_RELEASE);
 
     // Create socketpair to bypass broken iOS UDS accept()
     // pair[0] = wineserver side (injected as client fd)
@@ -1748,7 +1748,7 @@ int wine_process_start(const char *prefix_path) {
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == -1) {
         LOG("socketpair failed: %{public}s", strerror(errno));
-        g_wine_running = 0;
+        __atomic_store_n(&g_wine_running, 0, __ATOMIC_RELEASE);
         return -1;
     }
     LOG("socketpair created: server_fd=%d, client_fd=%d", pair[0], pair[1]);
@@ -1774,7 +1774,7 @@ int wine_process_start(const char *prefix_path) {
         LOG("Failed to create Wine process thread: %d", ret);
         close(pair[0]);
         close(pair[1]);
-        g_wine_running = 0;
+        __atomic_store_n(&g_wine_running, 0, __ATOMIC_RELEASE);
         return -1;
     }
 
@@ -1784,7 +1784,7 @@ int wine_process_start(const char *prefix_path) {
 }
 
 int wine_process_is_running(void) {
-    return g_wine_running;
+    return __atomic_load_n(&g_wine_running, __ATOMIC_ACQUIRE);
 }
 
 int madeira_write_continue_flag(void) {
