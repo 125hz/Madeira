@@ -44,6 +44,8 @@
 
 /// This decoder calls exit(1) when it encounters an error, however a production
 /// library should propagate error codes.
+/// Error-safe wrapper from Jfishin's Madeira Steam client (published with
+/// the author's permission); serialized across threads by Madeira.
 /// Patched: when zstd_safe_decompress arms the jump buffer,
 /// errors longjmp back to it instead of exiting the process.
 #include <setjmp.h>

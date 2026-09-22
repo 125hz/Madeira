@@ -7,6 +7,20 @@ Steam running and for anything the native path does not cover.
 
 ## Native Steam library (ml1310)
 
+**Credit:** the Steam protocol, sign-in, owned-library, manifest, chunk
+decryption and depot-download code under `app/Madeira/SwiftSteam/` comes from
+[Jfishin](https://github.com/Jfishin)'s Madeira Steam client and is published
+here with his permission. Each derived file carries an attribution header.
+
+What Madeira changed:
+
+- The download orchestration and the password + Steam Guard flow were
+  substantially rewritten.
+- New here: the shared authentication transport, logging, zip-chunk decoder,
+  account/download model and library views.
+- Not included from the original: its Steam Cloud, launch-emulator and
+  DRM-related components.
+
 Enable the optional library (`MADEIRA_FRONTEND=1` in `madeira-frontend.txt`).
 The Library tab now has two sections:
 
@@ -95,6 +109,33 @@ Always-on log tags (no account names, tokens or game titles):
 `[steam-library] ml1310` (owned and Windows-installable counts),
 `[steam-depot] ml1310` (install begin/complete/pause/fail by App ID, uninstall),
 `[steam-play] ml1310` (App ID, direct/client route), `[library-sections] ml1310`.
+
+### Download fixes (ml1320)
+
+Device logs 154/155: sign-in and the owned library worked, but installs
+stopped after a few MB.
+
+- **TLS error `-1200` (proven cause).** Steam's content-server directory
+  includes CDN servers marked `https_support: "unavailable"`. The ml1310 host
+  filter accepted any `*.steamcontent.com` name, so HTTPS requests could reach
+  HTTP-only servers. Servers are now filtered by `https_support`, proxy-only
+  entries and servers limited to other apps are skipped, and a server that
+  keeps failing moves to the back of every chunk's rotation. Each chunk tries
+  up to five of six servers.
+- **"Failed to decompress chunk data" (likely cause; the log did not name the
+  format).** Steam chunks come in three encodings: VZstd, VZip (LZMA) and plain
+  PKZip, which older content still uses. Valve's reference client falls back
+  to PKZip; the port did not support it. PKZip chunks (deflate or stored, with
+  or without a data descriptor) are now decoded. Failures name the format, for
+  example `decode-vzip` or `decode-zip-3`.
+- Steam log lines (`[steam-trace]`, `[steam-play]`, `[library-sections]`) now
+  go to the Madeira log directly. Before, they went to stderr, which is only
+  captured during a Wine session.
+- The Install, Resume and Try again buttons show their icons again.
+
+Switches (diagnostic rollback): `MADEIRA_STEAM_CDN_FILTER=0`,
+`MADEIRA_STEAM_HOST_HEALTH=0`, `MADEIRA_STEAM_ZIP_CHUNKS=0`.
+New tag: `[steam-cdn] ml1320` (servers offered/usable/skipped, first demotions).
 
 ## Windows Steam client (ml1260–ml1300)
 

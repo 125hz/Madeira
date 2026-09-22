@@ -902,7 +902,8 @@ struct LibraryView: View {
         .onChange(of: scenePhase) { _, phase in if phase == .active { Task { await SteamLibraryModel.shared.refresh() } } }
         .onAppear { fputs("[steam-bridge] ml1260 enabled=\(LibraryFlags.enabled("MADEIRA_STEAM") ? 1 : 0) compact-badges=\(LibraryFlags.enabled("MADEIRA_COMPACT_API_BADGE") ? 1 : 0)\n", stderr) }
         .onAppear { fputs("[frontend-layout] ml1190 full-height native tab symbols and metadata=\(refinements ? 1 : 0)\n", stderr) }
-        .onAppear { fputs("[library-sections] ml1310 native-steam=\(nativeSteam ? 1 : 0) sections=\(sectioned ? 1 : 0)\n", stderr) }
+        // LogStore: stderr is not captured before a Wine session starts.
+        .onAppear { LogStore.shared.log("[library-sections] ml1310 native-steam=\(nativeSteam ? 1 : 0) sections=\(sectioned ? 1 : 0)") }
         .onReceive(controller.commands) { command in
             if selected == nil, !browser, !steamManager, !steamSignIn, steamGame == nil, command == "tab" { tab = 1 - tab }
         }
@@ -1196,7 +1197,7 @@ struct LibraryDetail: View {
             } else if (try? LibraryModel.executable(entry.relativePath)) == nil {
                 error = "The game's files are missing. Uninstall it and install it again."; return
             }
-            fputs("[steam-play] ml1310 app=\(entry.steamAppID ?? 0) mode=\(entry.steamClientLaunch == true ? "client" : "direct") client-found=\(entry.steamClientPath == nil ? 0 : 1)\n", stderr)
+            LogStore.shared.log("[steam-play] ml1310 app=\(entry.steamAppID ?? 0) mode=\(entry.steamClientLaunch == true ? "client" : "direct") client-found=\(entry.steamClientPath == nil ? 0 : 1)")
         }
         leaving = true
         let profile = entry

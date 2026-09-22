@@ -1,3 +1,7 @@
+// Derived from Jfishin's Madeira Steam client (https://github.com/Jfishin),
+// published in Madeira with the author's permission. Adapted for Madeira;
+// see STEAM_INTEGRATION.md and THIRD-PARTY-NOTICES.md.
+
 #ifndef lzma_shim_h
 #define lzma_shim_h
 
@@ -13,5 +17,6 @@ int lzma_shim_decode(const uint8_t *props, size_t props_size,
                      size_t *out_produced);
 
 #include "zstd_edu.h"
+#include "chunk_zip.h"
 
 #endif

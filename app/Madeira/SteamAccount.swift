@@ -504,6 +504,7 @@ final class SteamAccountModel: ObservableObject {
         case SteamError.insufficientDiskSpace: return "disk-space"
         case SteamError.checksumMismatch: return "checksum"
         case SteamError.decompressionFailed: return "decompress"
+        case SteamError.chunkDecodeFailed(let format): return "decode-\(format)"
         case SteamError.manifestFetchFailed: return "manifest"
         case SteamError.chunkDownloadFailed: return "chunk"
         case let url as URLError: return "url-\(url.code.rawValue)"

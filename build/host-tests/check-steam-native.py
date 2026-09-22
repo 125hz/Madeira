@@ -44,9 +44,10 @@ library = (app / 'Library.swift').read_text()
 vdf = fetcher[fetcher.index('// MARK: - Simple VDF Binary Parser'):]
 helpers = 'enum DD {\n'
 for marker in ['nonisolated static func safeRelativePath(', 'nonisolated static func safeFolderName(',
-               'nonisolated static func usableContentHost(']:
+               'nonisolated static func usableContentHost(', 'nonisolated static func serverEligibility(']:
     helpers += block(downloader, marker).replace('nonisolated ', '')
-helpers += '}\n'
+helpers += '    enum ServerEligibility: Equatable { case usable, noHTTPS, other }\n}\n'
+helpers += block(downloader, 'final class ContentHostHealth')
 journal = block(downloader, 'final class JournalWriter')
 entry = library[library.index('struct LibraryEntry:'):library.index('final class LibraryModel:')]
 model_methods = library[library.index('    func mergeSteam('):library.index('    private func persist(')]
@@ -54,6 +55,7 @@ model_methods = library[library.index('    func mergeSteam('):library.index('   
 stubs = r'''
 import Foundation
 import Glibc
+import Dispatch
 struct TouchControl: Codable {}
 enum LibraryError: Error { case message(String) }
 enum LibraryFlags {
@@ -148,6 +150,32 @@ func appVDF(_ body: String) -> Data { Data(("\"appinfo\" { \"appid\" \"10\" " + 
                      "a.steamcontent.com:8080", "a/b.steamcontent.com"] {
             require(!DD.usableContentHost(host), "rejects content host \(host)")
         }
+
+        // ml1320: content directory entries (shapes from GetServersForSteamPipe).
+        let json = #"""
+        [{"type":"SteamCache","host":"cache1-atl3.steamcontent.com","https_support":"mandatory"},
+         {"type":"CDN","host":"a.cdn.steampipe.steamcontent.com","https_support":"unavailable"},
+         {"type":"CDN","host":"b.akamaized.net","https_support":"optional"},
+         {"type":"CDN","host":"c.steamcontent.com","https_support":"mandatory","use_as_proxy":true},
+         {"type":"CDN","host":"d.steamcontent.com","https_support":"mandatory","allowed_app_ids":[730]},
+         {"type":"CDN","host":"e.steamcontent.com","https_support":"mandatory","allowed_app_ids":[220, 730]},
+         {"type":"SteamCache","host":"f.steamcontent.com"}]
+        """#
+        let servers = try JSONSerialization.jsonObject(with: Data(json.utf8)) as! [[String: Any]]
+        let verdicts = servers.map { DD.serverEligibility($0, appID: 220) }
+        require(verdicts == [.usable, .noHTTPS, .usable, .other, .other, .usable, .usable],
+                "content servers: HTTPS-unavailable, proxy and other-app servers skipped")
+
+        let health = ContentHostHealth(enabled: true)
+        let pool = ["https://a", "https://b", "https://c"]
+        require(health.order(pool, seed: 1) == ["https://b", "https://c", "https://a"], "chunks start on different servers")
+        for _ in 0..<3 { health.recordFailure("https://b", reason: "url-1200") }
+        require(health.order(pool, seed: 1) == ["https://c", "https://a", "https://b"], "failing server moves to the back")
+        for _ in 0..<3 { health.recordSuccess("https://b") }
+        require(health.order(pool, seed: 1).first == "https://b", "recovered server returns to rotation")
+        let plain = ContentHostHealth(enabled: false)
+        plain.recordFailure("https://b", reason: "x")
+        require(plain.order(pool, seed: 1) == ["https://b", "https://c", "https://a"], "health rollback keeps plain rotation")
 
         // Resume journal.
         let dir = URL(fileURLWithPath: "/tmp/madeira-steam-native")
@@ -307,6 +335,30 @@ int main(int argc, char **argv) {
     CHECK(rc != 0, "truncated LZMA1 chunk is rejected");
     CHECK(lzma_shim_decode(props, 4, stream, stream_size, decoded, plain_size, &produced) != 0, "bad LZMA props rejected");
 
+    /* ml1320: single-entry PKZip chunks (older content). */
+    size_t zp_size, z_size;
+    uint8_t *zplain = read_file(argv[4], &zp_size);
+    uint8_t *zout = malloc(zp_size + 64);
+    const char *names[] = {"deflate", "stored", "deflate+descriptor", "stored+descriptor"};
+    for (int i = 0; i < 4; i++) {
+        uint8_t *zip = read_file(argv[5 + i], &z_size);
+        size_t got = 0;
+        int zrc = chunk_zip_decode(zip, z_size, zout, zp_size, &got);
+        char label[96]; snprintf(label, sizeof label, "zip chunk decodes exactly (%s)", names[i]);
+        CHECK(zrc == 0 && got == zp_size && !memcmp(zout, zplain, zp_size), label);
+        if (i == 0) {
+            CHECK(chunk_zip_decode(zip, z_size / 2, zout, zp_size, &got) < 0, "truncated zip chunk is rejected");
+            CHECK(chunk_zip_decode(zip, z_size, zout, zp_size / 2, &got) == -4, "zip chunk larger than expected is rejected");
+            CHECK(chunk_zip_decode(zip, 20, zout, zp_size, &got) == -1, "short zip header is rejected");
+        }
+        free(zip);
+    }
+    uint8_t *bz = read_file(argv[9], &z_size);
+    size_t got = 0;
+    CHECK(chunk_zip_decode(bz, z_size, zout, zp_size, &got) == -2, "unsupported zip method is rejected");
+    CHECK(chunk_zip_decode(plain, plain_size, zout, zp_size, &got) == -1, "non-zip data is rejected");
+    free(bz); free(zplain); free(zout);
+
     for (int i = 0; i < 200; i++) expected[i] = (uint8_t)(i * 31 + 7);
     raw_len = frame(raw_frame, 0, expected, 200);
     uint8_t z = 'Z';
@@ -341,14 +393,35 @@ with tempfile.TemporaryDirectory() as tmp:
     (tmp / 'plain.bin').write_bytes(plain)
     (tmp / 'props.bin').write_bytes(alone[:5])
     (tmp / 'stream.bin').write_bytes(alone[13:])
+    # Single-entry zip chunks: sized headers, and streamed (bit 3 data
+    # descriptor, sizes zero in the local header) like non-seekable writers.
+    import io, zipfile
+
+    class Unseekable(io.RawIOBase):
+        def __init__(self): self.buf = bytearray()
+        def writable(self): return True
+        def write(self, b): self.buf += b; return len(b)
+
+    zplain = bytes((i * 131 + (i >> 7)) & 0xFF for i in range(700_000)) + b'chunk' * 30_000
+    (tmp / 'zplain.bin').write_bytes(zplain)
+    for name, method, streamed in [('zip-deflate', zipfile.ZIP_DEFLATED, False), ('zip-stored', zipfile.ZIP_STORED, False),
+                                   ('zip-deflate-dd', zipfile.ZIP_DEFLATED, True), ('zip-stored-dd', zipfile.ZIP_STORED, True),
+                                   ('zip-bzip2', zipfile.ZIP_BZIP2, False)]:
+        sink = Unseekable() if streamed else io.BytesIO()
+        with zipfile.ZipFile(sink, 'w', method) as archive:
+            with archive.open('z', 'w') as entry:
+                entry.write(zplain)
+        data = bytes(sink.buf) if streamed else sink.getvalue()
+        if streamed: assert data[6] & 8, 'expected a data descriptor'
+        (tmp / f'{name}.bin').write_bytes(data)
     (tmp / 'checks.c').write_text(c_checks)
     zstd_src = (steam / 'zstd_edu.c').read_text()
     unlocked = zstd_src.replace('pthread_mutex_lock(&g_zstd_safe_lock);', '').replace('pthread_mutex_unlock(&g_zstd_safe_lock);', '')
     assert unlocked != zstd_src
     (tmp / 'zstd_unlocked.c').write_text('#include "zstd_edu.h"\n' + unlocked.replace('#include "zstd_edu.h"', ''))
-    common = ['-g', '-O1', '-I', str(steam), str(tmp / 'checks.c'), str(steam / 'lzma_shim.c'), '-llzma', '-lpthread']
+    common = ['-g', '-O1', '-I', str(steam), str(tmp / 'checks.c'), str(steam / 'lzma_shim.c'), str(steam / 'chunk_zip.c'), '-llzma', '-lz', '-lpthread']
     env = dict(os.environ, ASAN_OPTIONS='detect_leaks=0', TSAN_OPTIONS='halt_on_error=1')
-    args = [str(tmp / n) for n in ('plain.bin', 'props.bin', 'stream.bin')]
+    args = [str(tmp / n) for n in ('plain.bin', 'props.bin', 'stream.bin', 'zplain.bin', 'zip-deflate.bin', 'zip-stored.bin', 'zip-deflate-dd.bin', 'zip-stored-dd.bin', 'zip-bzip2.bin')]
     for sanitizer in ['address,undefined', 'thread']:
         exe = tmp / ('c-' + sanitizer.split(',')[0])
         subprocess.run([CLANG, f'-fsanitize={sanitizer}'] + common + [str(steam / 'zstd_edu.c'), '-o', str(exe)], check=True)

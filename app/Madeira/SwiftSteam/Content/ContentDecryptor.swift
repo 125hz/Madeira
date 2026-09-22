@@ -1,3 +1,7 @@
+// Derived from Jfishin's Madeira Steam client (https://github.com/Jfishin),
+// published in Madeira with the author's permission. Adapted for Madeira;
+// see STEAM_INTEGRATION.md and THIRD-PARTY-NOTICES.md.
+
 import Foundation
 import CommonCrypto
 import Compression
@@ -119,7 +123,8 @@ struct ContentDecryptor {
     static func decompressChunk(compressedData: Data, expectedSize: Int) throws -> Data {
         // Check for VZstd header: 'V' 'S' 'Z' 'a' — zstd stream + 15B footer
         if compressedData.count > 23, compressedData.prefix(4).elementsEqual([0x56, 0x53, 0x5A, 0x61]) {
-            return try decompressVZstd(compressedData, expectedSize: expectedSize)
+            do { return try decompressVZstd(compressedData, expectedSize: expectedSize) }
+            catch { throw SteamError.chunkDecodeFailed("vzstd") }
         }
 
         // Check for VZip header (Steam's custom compression wrapper)
@@ -127,8 +132,27 @@ struct ContentDecryptor {
             let header = compressedData.prefix(2)
             if header[0] == 0x56 && header[1] == 0x5A {
                 // VZip format - contains LZMA data with Steam header
-                return try decompressVZip(compressedData, expectedSize: expectedSize)
+                do { return try decompressVZip(compressedData, expectedSize: expectedSize) }
+                catch { throw SteamError.chunkDecodeFailed("vzip") }
             }
+        }
+
+        // ml1320: older content is a single-entry PKZip archive (Valve's
+        // reference client falls back to this form). MADEIRA_STEAM_ZIP_CHUNKS=0
+        // restores the previous behavior for diagnosis.
+        if zipChunksEnabled, compressedData.count >= 30, compressedData.prefix(4).elementsEqual([0x50, 0x4B, 0x03, 0x04]) {
+            guard expectedSize > 0, expectedSize <= maximumChunkBytes else { throw SteamError.chunkDecodeFailed("zip-size") }
+            var output = Data(count: expectedSize)
+            var produced = 0
+            let rc = compressedData.withUnsafeBytes { inPtr in
+                output.withUnsafeMutableBytes { outPtr in
+                    chunk_zip_decode(inPtr.bindMemory(to: UInt8.self).baseAddress, compressedData.count,
+                                     outPtr.bindMemory(to: UInt8.self).baseAddress, expectedSize, &produced)
+                }
+            }
+            guard rc == 0 else { throw SteamError.chunkDecodeFailed("zip\(rc)") }
+            output.count = produced
+            return output
         }
 
         // Check for LZMA header (properties byte + dictionary size)
@@ -145,7 +169,15 @@ struct ContentDecryptor {
             return compressedData
         }
 
-        throw SteamError.decompressionFailed
+        // ml1320: name the format (leading bytes are a format tag, not content).
+        throw SteamError.chunkDecodeFailed(formatTag(compressedData))
+    }
+
+    static let zipChunksEnabled = LibraryFlags.enabled("MADEIRA_STEAM_ZIP_CHUNKS")
+
+    /// Printable form of a chunk's first four bytes, for diagnostics.
+    static func formatTag(_ data: Data) -> String {
+        data.prefix(4).map { $0 >= 0x30 && $0 <= 0x7A ? String(UnicodeScalar($0)) : String(format: "%02x", $0) }.joined()
     }
 
     /// Decompress VZip format (Steam's custom wrapper around LZMA).

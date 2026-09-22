@@ -14,7 +14,9 @@ enum SteamLog {
 
     static func trace(_ message: @autoclosure () -> String) {
         guard tracing else { return }
-        fputs("[steam-trace] " + message() + "\n", stderr)
+        // ml1320: LogStore, not stderr — stderr is only captured into the
+        // log once a Wine session starts, and Steam work happens before one.
+        LogStore.shared.log("[steam-trace] " + message())
     }
 
     static func event(_ message: String) {

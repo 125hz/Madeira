@@ -1,3 +1,7 @@
+// Based on Jfishin's Madeira Steam client (https://github.com/Jfishin),
+// published in Madeira with the author's permission. Substantially
+// rewritten for Madeira; see STEAM_INTEGRATION.md and THIRD-PARTY-NOTICES.md.
+
 import Foundation
 import zlib
 import CommonCrypto
@@ -41,7 +45,8 @@ final class DepotDownloader {
     private var depotKeys: [UInt32: Data] = [:]
     private var cdnAuthTokens: [String: String] = [:]  // "depot|host" -> "?auth=…" fragment
     private let maxConcurrentChunks = 8
-    private let attemptsPerChunk = 4
+    private let attemptsPerChunk = 5
+    private let hostPoolSize = 6
 
     private nonisolated static let http: URLSession = {
         let config = URLSessionConfiguration.ephemeral
@@ -78,10 +83,12 @@ final class DepotDownloader {
         var state = SteamDownloadProgress()
         report(state)
 
-        let hosts = try await contentServers()
+        let hosts = try await contentServers(appID: app.appID)
         guard !hosts.isEmpty else { throw SteamError.chunkDownloadFailed("No content servers are available.") }
 
         // 1. Keys, manifests and per-host authorization for every depot.
+        let health = ContentHostHealth(enabled: LibraryFlags.enabled("MADEIRA_STEAM_HOST_HEALTH"))
+        let pool = Array(hosts.prefix(hostPoolSize))
         var plans: [DepotPlan] = []
         for depot in depots {
             try Task.checkCancellation()
@@ -90,12 +97,12 @@ final class DepotDownloader {
             let manifest = try await fetchManifest(depotID: depot.depotID, appID: app.appID,
                                                    manifestGID: gid, key: key, hosts: hosts)
             var auth: [String: String] = [:]
-            for host in hosts.prefix(attemptsPerChunk) {
+            for host in pool {
                 auth[host] = await cdnAuthFragment(depotID: depot.depotID, appID: app.appID, host: host)
             }
             plans.append(DepotPlan(depotID: depot.depotID, manifestGID: gid, key: key, manifest: manifest,
-                                   hosts: Array(hosts.prefix(attemptsPerChunk)), auth: auth,
-                                   declaredSize: depot.publicSizeBytes))
+                                   hosts: pool, auth: auth,
+                                   declaredSize: depot.publicSizeBytes, health: health))
         }
         guard !plans.isEmpty else { throw SteamError.depotNotFound(app.appID) }
 
@@ -137,7 +144,7 @@ final class DepotDownloader {
                     let verify = existing[item.file]
                     group.addTask {
                         if verify, Self.chunkAlreadyPresent(chunk, path: path) { return (item.key, UInt64(chunk.compressedSize)) }
-                        try await Self.fetchChunk(chunk, plan: plan, path: path, attempts: attempts)
+                        try await Self.fetchChunk(chunk, plan: plan, path: path, attempts: attempts, seed: item.file &+ item.chunk)
                         return (item.key, UInt64(chunk.compressedSize))
                     }
                 }
@@ -189,6 +196,7 @@ final class DepotDownloader {
         let hosts: [String]
         let auth: [String: String]
         let declaredSize: UInt64
+        let health: ContentHostHealth
     }
 
     struct WorkItem: Sendable {
@@ -335,11 +343,13 @@ final class DepotDownloader {
     }
 
     private nonisolated static func fetchChunk(_ chunk: DepotManifest.ChunkEntry, plan: DepotPlan,
-                                               path: String, attempts: Int) async throws {
+                                               path: String, attempts: Int, seed: Int) async throws {
         var lastError: Error = SteamError.chunkDownloadFailed("No content server responded.")
         for attempt in 0..<max(1, attempts) {
             try Task.checkCancellation()
-            let host = plan.hosts[attempt % plan.hosts.count]
+            // Healthy servers first, starting from a per-chunk offset.
+            let order = plan.health.order(plan.hosts, seed: seed)
+            let host = order[attempt % order.count]
             let url = "\(host)/depot/\(plan.depotID)/chunk/\(chunk.shaHex)\(plan.auth[host] ?? "")"
             do {
                 let encrypted = try await download(url)
@@ -348,16 +358,26 @@ final class DepotDownloader {
                                                              expectedSize: Int(chunk.uncompressedSize))
                 guard data.count == Int(chunk.uncompressedSize) else { throw SteamError.checksumMismatch }
                 try write(data, to: path, offset: chunk.offset)
+                plan.health.recordSuccess(host)
                 return
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
+                if Task.isCancelled { throw CancellationError() }
                 lastError = error
-                SteamLog.trace("chunk attempt \(attempt + 1) failed: \(error.localizedDescription)")
+                plan.health.recordFailure(host, reason: failureReason(error))
+                SteamLog.trace("chunk attempt \(attempt + 1) failed: \(failureReason(error))")
                 if attempt + 1 < attempts { try await Task.sleep(nanoseconds: UInt64(attempt + 1) * 400_000_000) }
             }
         }
         throw lastError
+    }
+
+    private nonisolated static func failureReason(_ error: Error) -> String {
+        if let url = error as? URLError { return "url\(url.code.rawValue)" }
+        if case SteamError.chunkDecodeFailed(let format) = error { return "decode-\(format)" }
+        if case SteamError.checksumMismatch = error { return "checksum" }
+        return "other"
     }
 
     private nonisolated static func write(_ data: Data, to path: String, offset: UInt64) throws {
@@ -525,7 +545,26 @@ final class DepotDownloader {
     /// Content server discovery via the public Web API
     /// (IContentServerDirectoryService/GetServersForSteamPipe). No account
     /// token is attached; the directory does not require one.
-    private func contentServers() async throws -> [String] {
+    enum ServerEligibility: Equatable { case usable, noHTTPS, other }
+
+    /// Directory fields as served by GetServersForSteamPipe: https_support
+    /// ("mandatory", "optional", "unavailable"), use_as_proxy, and an optional
+    /// allowed_app_ids restriction.
+    nonisolated static func serverEligibility(_ server: [String: Any], appID: UInt32) -> ServerEligibility {
+        if let https = (server["https_support"] as? String)?.lowercased(), https != "mandatory", https != "optional" {
+            return .noHTTPS
+        }
+        if (server["use_as_proxy"] as? Bool) == true || (server["use_as_proxy"] as? NSNumber)?.boolValue == true {
+            return .other
+        }
+        if let allowed = server["allowed_app_ids"] as? [Any], !allowed.isEmpty,
+           !allowed.contains(where: { ($0 as? NSNumber)?.uint32Value == appID || ($0 as? String) == String(appID) }) {
+            return .other
+        }
+        return .usable
+    }
+
+    private func contentServers(appID: UInt32) async throws -> [String] {
         var hosts: [String] = []
         do {
             guard let url = URL(string: "https://api.steampowered.com/IContentServerDirectoryService/GetServersForSteamPipe/v1/?cell_id=\(session.cellID)&max_servers=20") else {
@@ -540,14 +579,27 @@ final class DepotDownloader {
                   let servers = resp["servers"] as? [[String: Any]] else {
                 throw SteamError.chunkDownloadFailed("Content directory returned unexpected data")
             }
-            // Prefer servers without a load-shedding flag, in the directory's order.
+            // In the directory's order. ml1320: the directory marks some CDN
+            // servers https_support "unavailable"; requesting them over HTTPS
+            // fails the TLS handshake (NSURLError -1200). Such servers,
+            // proxy-only entries and servers restricted to other apps are
+            // skipped. MADEIRA_STEAM_CDN_FILTER=0 restores the old acceptance.
+            let filter = LibraryFlags.enabled("MADEIRA_STEAM_CDN_FILTER")
+            var skippedHTTP = 0, skippedOther = 0
             for server in servers {
                 let host = (server["vhost"] as? String) ?? (server["host"] as? String) ?? ""
-                guard Self.usableContentHost(host) else { continue }
+                guard Self.usableContentHost(host) else { skippedOther += 1; continue }
+                if filter {
+                    switch Self.serverEligibility(server, appID: appID) {
+                    case .usable: break
+                    case .noHTTPS: skippedHTTP += 1; continue
+                    case .other: skippedOther += 1; continue
+                    }
+                }
                 let entry = "https://\(host)"
                 if !hosts.contains(entry) { hosts.append(entry) }
             }
-            SteamLog.trace("content servers offered=\(servers.count) usable=\(hosts.count)")
+            SteamLog.event("[steam-cdn] ml1320 offered=\(servers.count) usable=\(hosts.count) skipped-no-https=\(skippedHTTP) skipped-other=\(skippedOther) filter=\(filter ? 1 : 0)")
         } catch is CancellationError {
             throw CancellationError()
         } catch {
@@ -600,6 +652,48 @@ final class DepotDownloader {
             cdnAuthTokens[cacheKey] = ""
             return ""
         }
+    }
+}
+
+/// ml1320: per-install content-server health. Chunks start on different
+/// servers (spreading load) and servers that keep failing move to the back of
+/// every chunk's rotation, instead of each chunk rediscovering a bad server.
+/// MADEIRA_STEAM_HOST_HEALTH=0 restores plain rotation.
+final class ContentHostHealth: @unchecked Sendable {
+    private let lock = NSLock()
+    private var failures: [String: Int] = [:]
+    private var reported = 0
+    let enabled: Bool
+    init(enabled: Bool) { self.enabled = enabled }
+
+    func order(_ hosts: [String], seed: Int) -> [String] {
+        guard !hosts.isEmpty else { return hosts }
+        let rotated = (0..<hosts.count).map { hosts[($0 + seed) % hosts.count] }
+        guard enabled else { return rotated }
+        lock.lock(); let counts = failures; lock.unlock()
+        return rotated.enumerated()
+            .sorted { ((counts[$0.element] ?? 0), $0.offset) < ((counts[$1.element] ?? 0), $1.offset) }
+            .map(\.element)
+    }
+
+    func recordFailure(_ host: String, reason: String) {
+        guard enabled else { return }
+        lock.lock()
+        failures[host, default: 0] += 1
+        let report = failures[host] == 3 && reported < 8
+        if report { reported += 1 }
+        lock.unlock()
+        if report {
+            let name = host.replacingOccurrences(of: "https://", with: "")
+            DispatchQueue.main.async { SteamLog.event("[steam-cdn] ml1320 host demoted host=\(name) reason=\(reason)") }
+        }
+    }
+
+    func recordSuccess(_ host: String) {
+        guard enabled else { return }
+        lock.lock()
+        if let count = failures[host], count > 0 { failures[host] = count - 1 }
+        lock.unlock()
     }
 }
 

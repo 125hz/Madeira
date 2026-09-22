@@ -316,17 +316,29 @@ struct SteamGameSheet: View {
         } else if let download = steam.downloads[appID] {
             switch download.state {
             case .active, .queued:
-                Button { steam.pause(appID) } label: { Label("Pause", systemImage: "pause.fill").frame(minWidth: 100, minHeight: 30) }
+                Button { steam.pause(appID) } label: { actionLabel("Pause", symbol: "pause.fill") }
                     .buttonStyle(.bordered)
-            case .paused, .failed:
-                Button { steam.install(appID) } label: { Label(download.state == .paused ? "Resume" : "Try again", systemImage: "arrow.down.circle.fill").frame(minWidth: 100, minHeight: 30) }
+            case .paused:
+                Button { steam.install(appID) } label: { actionLabel("Resume", symbol: "arrow.down.circle.fill") }
+                    .buttonStyle(.borderedProminent)
+            case .failed:
+                Button { steam.install(appID) } label: { actionLabel("Try again", symbol: "arrow.clockwise") }
                     .buttonStyle(.borderedProminent)
             }
         } else {
             Button { steam.install(appID) } label: {
-                Label(partial ? "Resume download" : "Install", systemImage: "arrow.down.circle.fill").fontWeight(.semibold).frame(minWidth: 100, minHeight: 30)
+                actionLabel(partial ? "Resume download" : "Install", symbol: "arrow.down.circle.fill")
             }.buttonStyle(.borderedProminent).disabled(steam.phase != .signedIn)
         }
+    }
+
+    /// Explicit glyph + title: a Label inside a bordered button in a Form row
+    /// renders title-only, so the icon is drawn directly (as Play does).
+    private func actionLabel(_ title: String, symbol: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: symbol)
+            Text(title).fontWeight(.semibold)
+        }.frame(minWidth: 100, minHeight: 30)
     }
 
     @ViewBuilder private func downloadControls(_ download: SteamAccountModel.Download) -> some View {

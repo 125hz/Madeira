@@ -1,3 +1,7 @@
+// Derived from Jfishin's Madeira Steam client (https://github.com/Jfishin),
+// published in Madeira with the author's permission. Adapted for Madeira;
+// see STEAM_INTEGRATION.md and THIRD-PARTY-NOTICES.md.
+
 import Foundation
 
 // MARK: - SwiftSteam Error Types
@@ -55,6 +59,9 @@ enum SteamError: LocalizedError {
     case chunkDownloadFailed(String)
     case decryptionFailed(String)
     case decompressionFailed
+    /// ml1320: a downloaded chunk could not be decoded; the associated value
+    /// names the encoding (vzip, vzstd, zip…) or its leading bytes.
+    case chunkDecodeFailed(String)
     case checksumMismatch
     case depotKeyNotFound(UInt32)
     case insufficientDiskSpace(needed: UInt64, available: UInt64)
@@ -130,6 +137,8 @@ enum SteamError: LocalizedError {
             return "Decryption failed: \(reason)"
         case .decompressionFailed:
             return "Failed to decompress chunk data"
+        case .chunkDecodeFailed(let format):
+            return "Part of the game could not be decoded (\(format)). Try again; downloaded parts are kept."
         case .checksumMismatch:
             return "Chunk checksum verification failed"
         case .depotKeyNotFound:
