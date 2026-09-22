@@ -120,15 +120,25 @@ final class SteamAccountModel: ObservableObject {
         guard Self.enabled else { return }
         inSession = running
         if running {
-            guard LibraryFlags.enabled("MADEIRA_STEAM_PAUSE_FOR_SESSION") else { return }
-            if let current = active {
-                resumeAfterSession.insert(current.id)
-                current.task.cancel()
+            let pause = LibraryFlags.enabled("MADEIRA_STEAM_PAUSE_FOR_SESSION")
+            if pause {
+                if let current = active {
+                    resumeAfterSession.insert(current.id)
+                    current.task.cancel()
+                }
+                for id in queue { resumeAfterSession.insert(id); downloads[id]?.state = .paused }
+                queue.removeAll()
+                SteamLog.event("[steam-depot] ml1310 paused for session count=\(resumeAfterSession.count)")
             }
-            for id in queue { resumeAfterSession.insert(id); downloads[id]?.state = .paused }
-            queue.removeAll()
-            Task { await session.disconnectGracefully() }
-            SteamLog.event("[steam-depot] ml1310 paused for session count=\(resumeAfterSession.count)")
+            // ml1340: log off from Steam as the game boots instead of leaving the
+            // connection to its idle timeout, independent of the download switch.
+            // A download allowed to continue (pause switch off) keeps it; the
+            // downloader reconnects on demand either way.
+            // MADEIRA_STEAM_SESSION_DISCONNECT=0 leaves the connection alone.
+            if LibraryFlags.enabled("MADEIRA_STEAM_SESSION_DISCONNECT"), pause || active == nil {
+                Task { await session.disconnectGracefully() }
+                SteamLog.event("[steam-account] ml1340 logged off for game session")
+            }
         } else {
             let resume = resumeAfterSession.sorted()
             resumeAfterSession.removeAll()

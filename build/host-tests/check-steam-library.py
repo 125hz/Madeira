@@ -17,6 +17,7 @@ enum LibraryFlags {
 }
 class LibraryModel { static let drive = URL(fileURLWithPath: "/tmp/madeira-profile-fixture"); var entries: [LibraryEntry] = []; var current: UUID?; var readOnly = false; func persist(_ next: [LibraryEntry]) { entries = next }; static func executable(_ relative: String) throws -> URL { drive.appendingPathComponent(relative) }; MERGE_METHODS }
 enum GuestDisplay { static func configureSessionDefault(view: CGSize, knob: String) {} }
+final class LogStore { static let shared = LogStore(); func log(_ m: String) {} }
 func madeira_set_vsync_locked(_ mode: Int32) {}
 '''
 stubs = stubs.replace('MERGE_METHODS', library[library.index('    func mergeSteam('):library.index('    private func persist(')])

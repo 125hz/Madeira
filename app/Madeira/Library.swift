@@ -191,6 +191,7 @@ struct LibraryEntry: Codable, Identifiable {
         GuestDisplay.configureSessionDefault(view: CGSize(width: 1280, height: 720), knob: resolution)
         madeira_set_vsync_locked(Int32(fpsMode))
         fputs("[frontend] ml1140 launch profile applied\n", stderr)
+        LogStore.shared.log("[display-shape] ml1340 resolution=\(resolution) mode=\(display)")
     }
     func configureLaunch() {
         setenv("MADEIRA_EXE", desktop == true || usesSteam ? "explorer.exe" : windowsPath, 1)
@@ -1185,6 +1186,18 @@ struct LibraryDetail: View {
     @State private var leaving = false
     @State private var error: String?
     private let launchPolish = LibraryFlags.enabled("MADEIRA_LAUNCH_POLISH")
+    /// ml1340: "WxH" matching this screen's landscape aspect at 720 lines
+    /// (width rounded to a multiple of 8), or nil when it equals a preset or
+    /// MADEIRA_SCREEN_SHAPE_RESOLUTION=0.
+    static var screenShapeResolution: String? {
+        guard LibraryFlags.enabled("MADEIRA_SCREEN_SHAPE_RESOLUTION") else { return nil }
+        let bounds = UIScreen.main.bounds
+        let long = max(bounds.width, bounds.height), short = min(bounds.width, bounds.height)
+        guard short > 0 else { return nil }
+        let width = Int((720 * long / short / 8).rounded()) * 8
+        guard (640...4096).contains(width), width != 1280, width != 960 else { return nil }
+        return "\(width)x720"
+    }
     private func start() {
         guard !leaving else { return }
         if entry.steamNative == true {
@@ -1237,6 +1250,11 @@ struct LibraryDetail: View {
                 Section("Display") {
                     Picker("Resolution", selection: $entry.resolution) {
                         ForEach(["640x480", "800x600", "960x540", "1024x768", "1280x720", "1280x960", "1920x1080", "2560x1440"], id: \.self) { Text($0).tag($0) }
+                        // ml1340: this device's own aspect ratio at 720 lines, so
+                        // the game fills the screen without bars or stretching.
+                        if let shape = Self.screenShapeResolution {
+                            Text("Screen shape (\(shape.replacingOccurrences(of: "x", with: "×")))").tag(shape)
+                        }
                     }
                     Picker("Aspect & scaling", selection: $entry.display) { ForEach(DisplayMode.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) } }
                     FPSChoice(mode: $entry.fpsMode)

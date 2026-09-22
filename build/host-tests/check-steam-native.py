@@ -62,6 +62,7 @@ enum LibraryFlags {
     static func enabled(_ key: String, fallback: Bool = true) -> Bool { getenv(key).map { String(cString: $0) != "0" } ?? fallback }
 }
 enum SteamLog { static func trace(_ m: @autoclosure () -> String) {}; static func event(_ m: String) {} }
+final class LogStore { static let shared = LogStore(); func log(_ m: String) {} }
 enum SteamInstallPaths { static var steamApps: URL { URL(fileURLWithPath: "/tmp/madeira-steam-native/steamapps") } }
 class LibraryModel {
     static var drive = URL(fileURLWithPath: "/tmp/madeira-steam-native/drive_c")
