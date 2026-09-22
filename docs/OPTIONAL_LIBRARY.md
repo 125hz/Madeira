@@ -27,9 +27,10 @@ Each profile offers virtual resolution, fit/fill/aspect/stretch presentation,
 30/60/display-maximum/uncapped pacing, reduced x87 precision, fast synchronization,
 extended display modes, arguments, live logs, and touch-control preferences.
 The default virtual display is 1280×720. A previously saved in-application
-resolution can still override it. Engine options apply at launch; restart
-Madeira when changing engine options between sessions, since native libraries
-can cache their configuration. Arguments support double-quoted tokens, up to
+resolution can still override it. Synchronization options refresh after quitting
+the current session and starting the next; experimental semaphore waits default
+off. Other cached engine options, including reduced-precision x87, still require
+restarting Madeira. Arguments support double-quoted tokens, up to
 16 tokens and 1023 UTF-8 bytes, matching the existing launch bridge.
 
 Enable JIT before Play. Sessions open fullscreen with no log panel unless
@@ -69,7 +70,7 @@ Typing currently uses the existing US/ASCII virtual-key mapping.
 
 A controller's D-pad/left stick browses cards; A opens details/plays, B returns,
 Y adds an executable, and shoulder buttons switch Library/Settings. Back+Start
-opens the in-game menu; B closes it. Hints use Xbox-style logical button names.
+opens the in-game menu; B closes it. Controller hints are hidden in the interface.
 Detailed settings and the executable browser still use touch. Controller input
 is neutralized for the guest while the library/menu owns it.
 
@@ -145,3 +146,59 @@ by a build or binary-content check alone.
 Design references: Apple's [drawable pixel dimensions](https://developer.apple.com/documentation/QuartzCore/CAMetalLayer/drawableSize),
 [Metal load/store guidance](https://developer.apple.com/library/archive/documentation/3DDrawing/Conceptual/MTLBestPracticesGuide/LoadandStoreActions.html),
 and [Liquid Glass API](https://developer.apple.com/documentation/swiftui/view/glasseffect(_:in:)).
+
+## Recent updates: ml1160–ml1180
+
+- iOS shader caches now use the app's Caches directory. Disabled blend fields
+  and unused pixel-sampler types no longer multiply equivalent pipeline variants;
+  unused sampler/view setup is skipped. Cold compilation can still cause hitches.
+- Small managed 2D texture mirrors can remain resident instead of triggering a
+  GPU readback on a later lock. The optional cache holds at most 32 MiB per module
+  and accepts resources up to 256 KiB. Existing compressed sole-copy mirrors do
+  not consume that budget. `DXMT_D9_SMALL_MIRROR_CACHE=0` restores eager eviction;
+  `[mirror-cache] ml1180` reports the policy.
+- Completed oversized staging blocks can be reused. Each ring retains at most
+  two extra blocks, each at most 16 MiB, using the existing completion and expiry
+  rules. `DXMT_RING_OVERSIZE_REUSE=0` restores the old policy; `[ring-reuse] ml1180`
+  reports policy and first actual reuse. This reduces allocation churn, not the
+  amount of texture data an application uploads.
+- `[readback-detail] ml1180` splits synchronous readbacks into managed/default
+  mirrors, render targets and front buffers, with byte totals and sampled sizes.
+  `DXMT_D9_READBACK_STATS=0` disables it. Compare with `[submit-causes]`,
+  `[frame-tail]`, `[gpu-work]`, `[pipeline-wait]`, and `[device-load]`.
+- The Windows FEX lookup tables are recommitted after being cleared. This keeps
+  Wine's page bookkeeping consistent when a DEP transition reapplies protections.
+  `FEX_LOOKUP_RECOMMIT=0` rolls back; `[lookup-commit] ml1180` confirms the policy.
+  It does not repair unrelated invalid guest jumps.
+- The native icon-only tab control has no inner rectangular backgrounds. Library
+  cards center in the available width; cards/compact/list layouts and last-played,
+  alphabetical, date-added and size sorting remain available. Detail artwork is
+  restricted to the header and is less blurred. Portrait startup uses centered
+  portrait artwork; landscape uses the wide hero image.
+- Size scans now ascend conventional binary subdirectories such as `bin`,
+  `Binaries` and `Win32` to include the installation's assets. Existing cached
+  sizes refresh automatically. Unusual layouts remain an estimate of the detected
+  folder, not a package manifest. `MADEIRA_LIBRARY_INSTALL_SIZE=0` restores the
+  executable-directory scan; `[library-metadata] ml1180` reports the scan revision.
+- The session menu contains live Display fit choices, saved per profile. After
+  30 seconds on the startup cover, Show live log opens a small log panel below
+  Show game view. It displays the most recently updated log entries. Removing
+  the launch cover returns log visibility to the profile's original preference.
+  `MADEIRA_SESSION_TOOLS=0` hides the new controls; `[session-tools]`,
+  `[session-display]` and `[startup-log] ml1180` identify them.
+- Opening the menu clears held controls and blocks the UIKit touch-control layer,
+  including fingers already tracking. Controls stay hidden during the menu and
+  launch cover. `MADEIRA_MODAL_TOUCH_GUARD=0` restores the old routing;
+  `[modal-input] ml1180` reports the policy. Retest button taps, sticks, scrolling,
+  dismissal and rotation with touch controls enabled.
+- Absolute pointer mode uses trackpad motion; Relative and Touch keep their
+  existing semantics. Cursor size follows guest-pixel scaling, and hosting updates
+  between desktop and direct sessions. These fixes do not prove that an
+  application's input/message loop is responsive.
+- For unresolved loading/startup/input failures, `[guest-log] ml1180` captures
+  bounded error excerpts from guest log-file writes; `[guest-code]` captures safe
+  caller-code candidates around bad guest branches; `[mouse-delivery]` and
+  `[cursor-visibility]` distinguish delivered clicks from guest cursor hiding.
+  Disable with `MADEIRA_GUEST_LOG_ERRORS=0`, `MADEIRA_GUEST_CALLER_CODE=0`, and
+  `MADEIRA_MOUSE_DELIVERY=0`, respectively. These are diagnostics, not compatibility
+  fixes. Native/PE build verification cannot establish a successful device run.

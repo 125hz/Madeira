@@ -2101,6 +2101,14 @@ void winios_cursor_set(unsigned int cur_id, int w, int h, int hot_x, int hot_y, 
 
 void winios_cursor_show(int show) {
     dispatch_async(dispatch_get_main_queue(), ^{
+        static unsigned visibility_notes;
+        const char *diagnostics = getenv("MADEIRA_MOUSE_DELIVERY");
+        if (g_cursor_drv_show != !!show && visibility_notes < 32 &&
+            !(diagnostics && !strcmp(diagnostics, "0"))) {
+            ++visibility_notes;
+            fprintf(stderr, "[cursor-visibility] ml1180 guest-show=%d pos=%.0f,%.0f\n",
+                    !!show, g_cursor_pos_px.x, g_cursor_pos_px.y);
+        }
         /* ml — direct-launch mode only: winios_drv_set_cursor calls
          * show(1)/show(0) BEFORE winios_cursor_set for the very first
          * cursor of a session (see its own ordering in driver_ios.c), so

@@ -2646,6 +2646,18 @@ static WORD pointer_buttons_from_mouse_buttons( WORD mouse_flags )
  *
  * returns TRUE if the contents of 'msg' should be passed to the application
  */
+static void ios_mouse_delivery_note( const char *stage, const MSG *msg, INT hit, BOOL remove )
+{
+    static unsigned count;
+    const char *enabled;
+    if (!remove || msg->message < WM_LBUTTONDOWN || msg->message > WM_MBUTTONDBLCLK) return;
+    enabled = getenv( "MADEIRA_MOUSE_DELIVERY" );
+    if (enabled && !strcmp( enabled, "0" )) return;
+    if (__atomic_fetch_add( &count, 1, __ATOMIC_RELAXED ) >= 32) return;
+    fprintf( stderr, "[mouse-delivery] ml1180 %s hwnd=%p msg=%04x hit=%d point=%ld,%ld lparam=%lx\n",
+             stage, msg->hwnd, msg->message, hit, (long)msg->pt.x, (long)msg->pt.y, (unsigned long)msg->lParam );
+}
+
 static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, HWND hwnd_filter,
                                    UINT first, UINT last, BOOL remove )
 {
@@ -2689,6 +2701,7 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
         accept_hardware_message( hw_id );
         return FALSE;
     }
+    ios_mouse_delivery_note( "candidate", msg, hittest, remove );
     update_current_mouse_window( msg->hwnd, hittest, msg->pt );
 
     msg->pt = point_phys_to_win_dpi( msg->hwnd, msg->pt );
@@ -2826,6 +2839,7 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
     hook.mouseData    = msg->wParam;
     if (call_hooks( WH_MOUSE, remove ? HC_ACTION : HC_NOREMOVE, message, (LPARAM)&hook, sizeof(hook) ))
     {
+        ios_mouse_delivery_note( "hook-consumed", msg, hittest, remove );
         hook.pt           = msg->pt;
         hook.hwnd         = msg->hwnd;
         hook.wHitTestCode = hittest;
@@ -2903,6 +2917,7 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
     send_message( msg->hwnd, WM_SETCURSOR, (WPARAM)msg->hwnd, MAKELONG( hittest, msg->message ));
 
     msg->message = message;
+    ios_mouse_delivery_note( eat_msg ? "activation-consumed" : "delivered", msg, hittest, remove );
     return !eat_msg;
 }
 

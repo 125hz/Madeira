@@ -9354,6 +9354,37 @@ static void ios_dump_guest_frame( ucontext_t *context, ULONG_PTR wow_base )
     dprintf( 2, "[guest-frame]   ('x' = the address that dword points at is EXECUTABLE guest "
                 "memory, i.e. a return address; w/r = data; '-' = not committed; '?' = unreadable)\n" );
 
+    /* Capture actual caller bytes, including self-modified code, instead of
+     * assuming a disk image describes the instructions preceding a bad branch.
+     * Stack words are candidates, not proof of a call chain. Never follow an
+     * unchecked guest pointer directly from this exception handler. */
+    {
+        static unsigned dumps;
+        const char *enabled = getenv( "MADEIRA_GUEST_CALLER_CODE" );
+        if (!(enabled && !strcmp( enabled, "0" )) &&
+            __atomic_fetch_add( &dumps, 1, __ATOMIC_RELAXED ) < 4)
+        {
+            unsigned emitted = 0, j;
+            for (i = 0; i < 16 && emitted < 4; ++i)
+            {
+                unsigned char bytes[48];
+                char hex[sizeof(bytes) * 2 + 1];
+                static const char digits[] = "0123456789abcdef";
+                if (cls[i] != 'x' || words[i] < 32 ||
+                    !ios_guest_read( wow_base, words[i] - 32, bytes, sizeof(bytes) )) continue;
+                for (j = 0; j < sizeof(bytes); ++j)
+                {
+                    hex[j * 2] = digits[bytes[j] >> 4];
+                    hex[j * 2 + 1] = digits[bytes[j] & 15];
+                }
+                hex[sizeof(bytes) * 2] = 0;
+                dprintf( 2, "[guest-code] ml1180 candidate=%08x start=%08x bytes=%s\n",
+                         words[i], words[i] - 32, hex );
+                ++emitted;
+            }
+        }
+    }
+
     /* TEB32 and fs:[0xC0] (WOW32Reserved / Wow64Transition) */
     {
         /* NtCurrentTeb() reads x18, which iOS zeroes on signal delivery — take

@@ -110,6 +110,7 @@ struct LibraryEntry: Codable, Identifiable {
     var graphicsAPI: String?
     var folderBytes: Int64?
     var metadataChecked: Date?
+    var metadataRevision: Int?
     var overlayFields: [String]?
     var semaphoreFastPath: Bool?
     var desktop: Bool?
@@ -175,8 +176,11 @@ final class LibraryModel: ObservableObject {
     private var launchSurface: UInt64 = 0
     private var launchStarted = Date()
     @Published var launchSlow = false
+    @Published var launchLogs = false
     var menuButtonRect = CGRect.zero
     var performanceRect = CGRect.zero
+    private let modalTouchGuard = LibraryFlags.enabled("MADEIRA_MODAL_TOUCH_GUARD")
+    var blocksGameplayTouch: Bool { modalTouchGuard && current != nil && (menu || launching) }
     private var timer: Timer?
     private var sawProcess = false
     private var readOnly = false
@@ -223,6 +227,7 @@ final class LibraryModel: ObservableObject {
             if (next[i].metadataChecked ?? .distantPast) > (entry.metadataChecked ?? .distantPast) {
                 entry.folderBytes = next[i].folderBytes; entry.graphicsAPI = next[i].graphicsAPI
                 entry.metadataChecked = next[i].metadataChecked
+                entry.metadataRevision = next[i].metadataRevision
             }
             next[i] = entry
         } else { next.append(entry) }
@@ -240,8 +245,9 @@ final class LibraryModel: ObservableObject {
 
     @MainActor
     func refreshMetadata(_ id: UUID) async {
+        let revision = LibraryFlags.enabled("MADEIRA_LIBRARY_INSTALL_SIZE") ? 2 : 1
         guard !metadataInFlight.contains(id), let entry = entries.first(where: { $0.id == id }), entry.desktop != true,
-              Date().timeIntervalSince(entry.metadataChecked ?? .distantPast) > 86400,
+              entry.metadataRevision != revision || Date().timeIntervalSince(entry.metadataChecked ?? .distantPast) > 86400,
               let url = try? Self.executable(entry.relativePath) else { return }
         metadataInFlight.insert(id)
         defer { metadataInFlight.remove(id) }
@@ -249,8 +255,8 @@ final class LibraryModel: ObservableObject {
         guard !Task.isCancelled, var updated = entries.first(where: { $0.id == id }) else { return }
         updated.folderBytes = result.bytes
         if let api = result.api { updated.graphicsAPI = api }
-        updated.metadataChecked = Date(); save(updated)
-        fputs("[library-metadata] ml1170 folder scan complete api=\(updated.graphicsAPI ?? "unknown") bytes=\(result.bytes ?? -1)\n", stderr)
+        updated.metadataChecked = Date(); updated.metadataRevision = revision; save(updated)
+        fputs("[library-metadata] ml1180 install scan revision=\(revision) api=\(updated.graphicsAPI ?? "unknown") bytes=\(result.bytes ?? -1)\n", stderr)
     }
 
     static func executable(_ relative: String) throws -> URL {
@@ -354,7 +360,7 @@ final class LibraryModel: ObservableObject {
 
     func begin(_ entry: LibraryEntry) {
         LibraryController.shared.configure(enabled: enabled, ownsInput: false)
-        launchPresent = madeira_get_present_count(); launchStarted = Date(); launchSlow = false
+        launchPresent = madeira_get_present_count(); launchStarted = Date(); launchSlow = false; launchLogs = false
         launchSurface = winios_surface_present_count()
         launching = true; overlayFields = entry.overlayFields ?? ["FPS", "Frame time", "RAM", "Battery"]
         current = entry.id; menu = false; performance = entry.performance; liveLogs = entry.liveLogs
@@ -377,7 +383,7 @@ final class LibraryModel: ObservableObject {
     private func poll() {
         if launching {
             if madeira_get_present_count() >= launchPresent + 3 || winios_surface_present_count() > launchSurface {
-                withAnimation(.easeInOut(duration: UIAccessibility.isReduceMotionEnabled ? 0 : 0.4)) { launching = false }
+                showGameView()
             } else if Date().timeIntervalSince(launchStarted) > 30 { launchSlow = true }
         }
         if wine_process_is_running() != 0 {
@@ -386,6 +392,15 @@ final class LibraryModel: ObservableObject {
         } else if sawProcess && wineserver_is_running() == 0 { finish() }
     }
     func launchFailed() { if current != nil && !sawProcess { finish(); error = "The session could not start. Check the diagnostic log and JIT status." } }
+    func showGameView() {
+        if launchLogs { launchLogs = false; LogStore.shared.setDisplayActive(liveLogs) }
+        withAnimation(.easeInOut(duration: UIAccessibility.isReduceMotionEnabled ? 0 : 0.4)) { launching = false }
+    }
+    func toggleLaunchLogs() {
+        launchLogs.toggle()
+        LogStore.shared.setDisplayActive(liveLogs || launchLogs)
+        fputs("[startup-log] ml1180 visible=\(launchLogs ? 1 : 0)\n", stderr)
+    }
     func setFPS(_ mode: Int) {
         fpsMode = mode; madeira_set_vsync_locked(Int32(mode))
         ProMotionIntent.shared.setActive(true, maxHz: ProMotionIntent.maxHz(for: Int32(mode)))
@@ -396,6 +411,7 @@ final class LibraryModel: ObservableObject {
         LibraryKeyboard.hide()
         LibraryController.shared.configure(enabled: enabled, ownsInput: true)
         menu = true
+        fputs("[modal-input] ml1180 touch guard=\(modalTouchGuard ? 1 : 0)\n", stderr)
     }
     func requestQuit() {
         LibraryKeyboard.hide()
@@ -421,6 +437,7 @@ final class LibraryModel: ObservableObject {
             entry.controls = controls.controls; entry.controlSize = controls.sizeScale
             entry.touchControls = controls.visible; entry.controlOpacity = opacity
             entry.fpsMode = fpsMode; entry.performance = performance
+            if LibraryFlags.enabled("MADEIRA_SESSION_TOOLS") { entry.display = InputSettings.shared.displayMode.rawValue }
             entry.overlayFields = overlayFields; save(entry)
         }
     }
@@ -433,7 +450,7 @@ final class LibraryModel: ObservableObject {
         InputSettings.shared.displayMode = savedDisplay
         current = nil; menu = false; sessionMessage = ""
         LogStore.shared.setDisplayActive(true)
-        launching = false; LibraryKeyboard.hide()
+        launching = false; launchLogs = false; LibraryKeyboard.hide()
         LibraryController.shared.configure(enabled: enabled, ownsInput: enabled)
         FullscreenState.shared.active = false; MetalHostView.shared.isHidden = true
         ProMotionIntent.shared.setActive(false)
@@ -490,9 +507,22 @@ private actor LibraryMetadataScanner {
         let folder = executable.deletingLastPathComponent()
         guard folder.path.hasPrefix(drive.path + "/"), !Task.isCancelled else { return (nil, nil) }
         let manager = FileManager.default
+        // Executables commonly live below the installation root. Only ascend
+        // conventional binary directories, never an arbitrary library parent.
+        var installation = folder
+        if LibraryFlags.enabled("MADEIRA_LIBRARY_INSTALL_SIZE") {
+            let binaryFolders: Set<String> = ["bin", "binaries", "win32", "win64", "x86", "x64", "release"]
+            for _ in 0..<4 {
+                guard binaryFolders.contains(installation.lastPathComponent.lowercased()) else { break }
+                let parent = installation.deletingLastPathComponent()
+                guard parent.path.hasPrefix(drive.path + "/"),
+                      !["program files", "program files (x86)", "games", "common", "steamapps"].contains(parent.lastPathComponent.lowercased()) else { break }
+                installation = parent
+            }
+        }
         var complete = true
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
-        let walker = manager.enumerator(at: folder, includingPropertiesForKeys: Array(keys), options: [], errorHandler: { _, _ in complete = false; return true })
+        let walker = manager.enumerator(at: installation, includingPropertiesForKeys: Array(keys), options: [], errorHandler: { _, _ in complete = false; return true })
         var bytes: Int64 = 0
         var files = 0
         while let file = walker?.nextObject() as? URL {
@@ -531,7 +561,15 @@ private struct LibraryTabControl: UIViewRepresentable {
         control.accessibilityLabel = "Library and Settings"
         control.setWidth(80, forSegmentAt: 0); control.setWidth(80, forSegmentAt: 1)
         control.addTarget(context.coordinator, action: #selector(Coordinator.changed(_:)), for: .valueChanged)
-        control.selectedSegmentTintColor = UIColor.systemBlue.withAlphaComponent(0.18)
+        // Keep native tracking while allowing the surrounding glass capsule to
+        // supply the only background, including during a held selection.
+        let clear = UIGraphicsImageRenderer(size: CGSize(width: 1, height: 1)).image { _ in }
+        for state: UIControl.State in [.normal, .selected, .highlighted, [.selected, .highlighted]] {
+            control.setBackgroundImage(clear, for: state, barMetrics: .default)
+        }
+        control.setDividerImage(clear, forLeftSegmentState: .normal, rightSegmentState: .normal, barMetrics: .default)
+        control.backgroundColor = .clear
+        control.selectedSegmentTintColor = .clear
         control.selectedSegmentIndex = selection
         return control
     }
@@ -539,6 +577,9 @@ private struct LibraryTabControl: UIViewRepresentable {
         context.coordinator.parent = self
         control.selectedSegmentIndex = selection
         control.accessibilityValue = selection == 0 ? "Library" : "Settings"
+        for (index, symbol) in ["square.grid.2x2.fill", "gearshape.fill"].enumerated() {
+            control.setImage(UIImage(systemName: symbol)?.withTintColor(index == selection ? .systemBlue : .secondaryLabel, renderingMode: .alwaysOriginal), forSegmentAt: index)
+        }
     }
     final class Coordinator: NSObject {
         var parent: LibraryTabControl
@@ -558,8 +599,12 @@ struct LibraryArtwork: View {
             if let name = entry.coverFile,
                let image = UIImage(contentsOfFile: LibraryModel.documents.appendingPathComponent("madeira-art/" + URL(fileURLWithPath: name).lastPathComponent).path) {
                 Image(uiImage: image).resizable().scaledToFill()
+                    .frame(width: geometry.size.width, height: geometry.size.height, alignment: .center).clipped()
             } else if let id = entry.steamID {
-                AsyncImage(url: backdrop ? URL(string: "https://cdn.cloudflare.steamstatic.com/steam/apps/\(id)/library_hero.jpg") : SteamCatalog.cover(id)) { image in image.resizable().scaledToFill() } placeholder: { Color.clear }
+                AsyncImage(url: backdrop ? URL(string: "https://cdn.cloudflare.steamstatic.com/steam/apps/\(id)/library_hero.jpg") : SteamCatalog.cover(id)) { image in
+                    image.resizable().scaledToFill()
+                        .frame(width: geometry.size.width, height: geometry.size.height, alignment: .center).clipped()
+                } placeholder: { Color.clear }
             }
         }
         .frame(width: geometry.size.width, height: geometry.size.height)
@@ -850,8 +895,8 @@ struct LibraryDetail: View {
                         }
                     }.padding(.vertical, 24)
                         .listRowBackground(
-                            LibraryArtwork(entry: entry, backdrop: true).blur(radius: 10)
-                                .overlay(Color(uiColor: .secondarySystemGroupedBackground).opacity(0.72))
+                            LibraryArtwork(entry: entry, backdrop: true).blur(radius: 4)
+                                .overlay(Color(uiColor: .secondarySystemGroupedBackground).opacity(0.48))
                                 .overlay(alignment: .bottom) {
                                     LinearGradient(colors: [.clear, Color(uiColor: .secondarySystemGroupedBackground)], startPoint: .top, endPoint: .bottom).frame(height: 70)
                                 }.clipped()
@@ -1089,22 +1134,18 @@ struct LibraryFloatingItem: View {
 struct LibraryHUD: View {
     @ObservedObject private var model = LibraryModel.shared
     @ObservedObject private var controls = TouchControlsModel.shared
+    @ObservedObject private var input = InputSettings.shared
+    private let sessionTools = LibraryFlags.enabled("MADEIRA_SESSION_TOOLS")
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .topLeading) {
                 if model.launching, let entry = model.entries.first(where: { $0.id == model.current }) {
-                    LibraryArtwork(entry: entry, backdrop: true).overlay(.black.opacity(0.65)).ignoresSafeArea()
-                    VStack(spacing: 18) {
-                        LibraryArtwork(entry: entry).frame(width: 120, height: 180).clipShape(RoundedRectangle(cornerRadius: 14)).shadow(radius: 20)
-                        Text(entry.title).font(.title2.bold()).multilineTextAlignment(.center)
-                        ProgressView().tint(.white)
-                        Text(model.launchSlow ? "Still starting…" : "Starting your game…").foregroundStyle(.white.opacity(0.7))
-                        if model.launchSlow { Button("Show game view") { model.launching = false } }
-                    }.frame(width: geo.size.width, height: geo.size.height).foregroundStyle(.white).transition(.opacity)
+                    LibraryArtwork(entry: entry, backdrop: geo.size.width > geo.size.height).overlay(.black.opacity(0.65)).ignoresSafeArea()
+                    launchView(entry, geometry: geo)
                 }
                 if !model.launching && model.performance { LibraryFloatingItem(isMenu: false, viewport: geo.size, insets: geo.safeAreaInsets) }
-                if model.liveLogs { LibraryLiveLogs().frame(maxWidth: 550, maxHeight: 140).padding(.top, geo.safeAreaInsets.top + 60).padding(.horizontal, 12).allowsHitTesting(false) }
+                if model.liveLogs && !model.launching { LibraryLiveLogs().frame(maxWidth: 550, maxHeight: 140).padding(.top, geo.safeAreaInsets.top + 60).padding(.horizontal, 12).allowsHitTesting(false) }
                 if !model.sessionMessage.isEmpty { Text(model.sessionMessage).font(.caption).padding(10).background(.regularMaterial, in: Capsule()).frame(maxWidth: .infinity).padding(.top, geo.safeAreaInsets.top + 12).allowsHitTesting(false) }
                 if !model.launching { LibraryFloatingItem(isMenu: true, viewport: geo.size, insets: geo.safeAreaInsets) }
                 if model.menu {
@@ -1122,6 +1163,7 @@ struct LibraryHUD: View {
             .preferredColorScheme(.dark)
         }.ignoresSafeArea()
         .onAppear { model.saveCurrentProfile(); fputs("[frontend-hud] ml1160 contained menu; stable overlay drag\n", stderr) }
+        .onAppear { fputs("[session-tools] ml1180 display-picker/startup-log=\(sessionTools ? 1 : 0)\n", stderr) }
         .onChange(of: model.menu) { _, open in
             LibraryController.shared.configure(enabled: model.enabled, ownsInput: open)
             if !open { model.saveCurrentProfile() }
@@ -1130,6 +1172,30 @@ struct LibraryHUD: View {
             if command == "menu" { if model.menu { model.menu = false } else { model.showMenu() } }
             else if command == "back", model.menu { model.menu = false }
         }
+    }
+    private func launchView(_ entry: LibraryEntry, geometry geo: GeometryProxy) -> some View {
+        let compact = geo.size.height < 500
+        let available = max(0, geo.size.height - geo.safeAreaInsets.top - geo.safeAreaInsets.bottom)
+        return ScrollView {
+            VStack(spacing: compact ? 10 : 18) {
+                LibraryArtwork(entry: entry).frame(width: compact ? 52 : 120, height: compact ? 78 : 180)
+                    .clipShape(RoundedRectangle(cornerRadius: 14)).shadow(radius: 20)
+                Text(entry.title).font(.title2.bold()).multilineTextAlignment(.center)
+                ProgressView().tint(.white)
+                Text(model.launchSlow ? "Still starting…" : "Starting your game…").foregroundStyle(.white.opacity(0.7))
+                if model.launchSlow {
+                    Button("Show game view") { model.showGameView() }.frame(minHeight: 44)
+                    if sessionTools {
+                        Button(model.launchLogs ? "Hide live log" : "Show live log") { model.toggleLaunchLogs() }.frame(minHeight: 44)
+                    }
+                }
+                if model.liveLogs || model.launchLogs {
+                    LibraryLiveLogs().frame(maxWidth: 550).frame(height: compact ? 90 : 120).clipped()
+                }
+            }.padding(16).frame(maxWidth: .infinity).frame(minHeight: available)
+        }
+        .frame(width: geo.size.width, height: available)
+        .padding(.top, geo.safeAreaInsets.top).foregroundStyle(.white).transition(.opacity)
     }
     private var menu: some View {
         ScrollView {
@@ -1144,6 +1210,19 @@ struct LibraryHUD: View {
                     }
                 }
                 FPSChoice(mode: Binding(get: { model.fpsMode }, set: { model.setFPS($0) }))
+                if sessionTools {
+                    LabeledContent("Display fit") {
+                        Picker("Display fit", selection: $input.displayMode) {
+                            ForEach(DisplayMode.allCases, id: \.self) { mode in
+                                Label(mode.label, systemImage: mode.symbol).tag(mode)
+                            }
+                        }.pickerStyle(.menu).labelsHidden()
+                            .onChange(of: input.displayMode) { _, mode in
+                                model.saveCurrentProfile()
+                                fputs("[session-display] ml1180 mode=\(mode.rawValue)\n", stderr)
+                            }
+                    }
+                }
                 Divider()
                 Text("Mouse & pointer").font(.headline)
                 LibraryPointerSettings()
@@ -1165,8 +1244,17 @@ struct LibraryHUD: View {
 struct LibraryLiveLogs: View {
     @ObservedObject private var logs = LogStore.shared
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) { ForEach(Array(logs.entries.suffix(7))) { Text($0.lastRaw).font(.system(size: 9, design: .monospaced)).lineLimit(2) } }
+        // Rows are coalesced by signature; insertion order isn't recency.
+        // Show the latest updates so a repeating wait still looks live.
+        ScrollView {
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(Array(logs.entries.sorted { $0.lastTimestamp < $1.lastTimestamp }.suffix(7))) {
+                    Text($0.lastRaw).font(.system(size: 9, design: .monospaced)).lineLimit(2)
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading)
+        }.defaultScrollAnchor(.bottom)
             .padding(8).background(.black.opacity(0.65), in: RoundedRectangle(cornerRadius: 10)).foregroundStyle(.white)
+            .accessibilityLabel("Live diagnostic log")
     }
 }
 

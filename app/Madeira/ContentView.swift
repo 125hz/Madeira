@@ -1356,7 +1356,19 @@ final class MetalBackedView: UIView {
         if !tmResolved { tmResetGesture() }
     }
 
+    private func stopTouchForModal() -> Bool {
+        guard LibraryModel.shared.blocksGameplayTouch else { return false }
+        // A finger can still belong to this view after another finger opens
+        // the window-level menu. Forget it without synthesizing a tap on lift.
+        touchGeneration += 1
+        gameTouch = nil; dragTouch = nil; dragActive = false
+        twoFingerActive = false; relCarryX = 0; relCarryY = 0
+        tmResetGesture()
+        return true
+    }
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if stopTouchForModal() { return }
         if pointerButtons(touches, with: event, ending: false) { return }   // ml664
         // ========================================================================
         // ml665 — THE CLICK THAT ARRIVES AS A FINGER.
@@ -1449,6 +1461,7 @@ final class MetalBackedView: UIView {
                   // ml643: in mouse-look the finger is the CAMERA, not a pointer.
                   // Holding still to line up a shot must not press the mouse.
                   !InputSettings.shared.relative else { return }
+            guard !self.stopTouchForModal() else { return }
             self.dragActive = true
             self.dragTouch = t
             self.postPointer(self.F_LDOWN)
@@ -1460,6 +1473,7 @@ final class MetalBackedView: UIView {
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         // ml664: the pan recogniser owns pointer motion — a second delta from
         // here would double every click-drag.
+        if stopTouchForModal() { return }
         if touches.contains(where: { $0.type == .indirectPointer }) { return }
         // ml665: the down was dropped as synthesised, so its moves must be too —
         // otherwise a click-drag with the AssistiveTouch cursor would turn the
@@ -1552,6 +1566,7 @@ final class MetalBackedView: UIView {
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if stopTouchForModal() { return }
         if pointerButtons(touches, with: event, ending: true) { return }    // ml664
         if HardwareInput.shared.shouldIgnore(touches, logging: false) { return }  // ml665
         if desktopMode && touchPointerMode {
@@ -2789,6 +2804,10 @@ final class ControlOverlayView: UIView {
         // Edit mode belongs to SwiftUI — dragging and pinching controls into
         // place is layout, not input, and must not press anything.
         guard !TouchControlsModel.shared.editing else { return nil }
+        // The UIKit control layer sits above the SwiftUI HUD in this window.
+        // Returning the window's normal hit test alone still selects controls
+        // behind a modal sheet unless their own region lookup refuses it.
+        guard !LibraryModel.shared.blocksGameplayTouch else { return nil }
         for id in order.reversed() {
             if let r = regions[id], r.hit(p) { return r }
         }
@@ -2815,6 +2834,7 @@ final class ControlOverlayView: UIView {
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if LibraryModel.shared.blocksGameplayTouch { dropAllTouches("frontend-modal"); return }
         reconcile(event)
         for t in touches { move(t) }
     }
@@ -6837,7 +6857,7 @@ struct TouchControlsOverlay: View {
             let fullscreen = fullscreenState.active
             ZStack(alignment: .top) {
                 if fullscreen {
-                    if m.visible || m.editing {
+                    if (m.visible || m.editing) && !library.blocksGameplayTouch {
                         ForEach(m.controls) { c in
                             TouchControlButton(control: c, screen: geo.size)
                                 .opacity(library.current != nil && !m.editing ? library.opacity : 1)
