@@ -13976,3 +13976,24 @@ On device: launch a small dialog-based program, move over its action button and 
 Artifact: 155070148 bytes; UTC timestamp 2026-09-22T03:21:40.620954+00:00; SHA-256 0a077662e92fc026295ad5a2f38a1f91b7c541d6f7989b1198729d0515debfb8.
 
 Publication: root implementation 1228c68 pushed to 125hz/Madeira before this dated entry. Submodules unchanged; no upstream push or PR.
+
+
+### 2026-09-21 - ml1210: server-only desktop handles, dialog placement and click delivery
+
+Log 138 resolves the ambiguity from ml1200: every recorded accepted activation targets hwnd=0x0, reply=MA_ACTIVATE, ok=0, error=1400, while active and foreground already name the real dialog (0x20034). Therefore the foreground restriction was not the cause. The dialog's window rectangle is {-191,-329,191,330}; desktop screen diagnostics still report a zero-size desktop. The UI expands its displayed source rectangle to include the negative window, but the cursor remains bounded to the nonnegative virtual screen. This explains the visible cursor stopping partway up the displayed dialog independently of activation failure.
+
+The generic source defect is in get_win_ptr. The server force-creates a desktop without a shell, allocates its shared handle under the calling process id, and detaches its thread. It never creates a client WND. get_user_handle_ptr consequently returns NULL to that process, while get_win_ptr previously recognized desktops only for WND_OTHER_PROCESS. A child-control ancestor walk fails on reaching this NULL desktop, and get_window_rects fails before its monitor-rectangle branch. The same lookup defect accounts for both symptoms.
+
+Under WINE_IOS, a NULL client object now becomes WND_DESKTOP only when is_desktop_window recognizes the cached desktop/message-root handle AND its shared entry is still valid. Ordinary null objects and stale handles remain invalid; foreign-process desktops follow the existing path; a real local WND is returned with its lock unchanged. MADEIRA_DESKTOP_HANDLE_FIX=0 restores the old lookup. [desktop-handle] ml1210 logs the first four matches with the policy. No executable-specific code or mouse-clamp bypass is added.
+
+The ml1200 internal foreground experiment has been removed: mouse activation again uses the normal Wine foreground policy. MADEIRA_CLICK_ACTIVATION is retired. Bounded [click-activation] ml1210 diagnostics remain, with MADEIRA_MOUSE_DELIVERY=0 to disable. Guest activation vetoes and eat decisions remain intact.
+
+Validation: build/host-tests/check-desktop-handle.py extracts production get_win_ptr, list_window_parents, NtUserGetAncestor, and the desktop rectangle query branches. A host-only mock reproduces NULL ancestors and failed rectangles with rollback enabled, then verifies top-level and deeply nested control roots, 1280x720 desktop bounds, a centered 382x659 dialog at (449,30), the message-only root, stale/foreign/local objects, and lock balance with the fix enabled. ASan/UBSan PASS. The updated click-activation check verifies ordinary foreground policy, guest veto/eat behavior, invalid-window failure, and last-error preservation: PASS. No emulator or guest executable ran on the PC.
+
+Native Wine rebuilt 32/32 ntdll and 46/46 win32u units and repacked the server archive. The full IPA build printed "IPA verified". Content checks verified [desktop-handle] ml1210 and [click-activation] ml1210 in the native archive and final Mach-O, exact synchronized window.c, payload bytes/machine types, and unchanged renderer/JIT payloads from ml1190.
+
+Device follow-up: boot the dialog launcher again, confirm it is centered within the desktop, move the pointer to its title bar and all controls, and activate its main action. Repeat after opening/closing the session menu and in portrait/landscape. Expected tags: [desktop-handle] fix=1, [screen-routes] desktop bounds matching the monitor, [winios-tree] a nonnegative centered dialog, [click-activation] a real top-level handle with ok=1, and [mouse-delivery] delivered presses. These expected device results have not yet been observed. The server's stored desktop rectangle and old best-effort sizing diagnostic are separate from the repaired client rectangle query.
+
+Artifact: 155069722 bytes; UTC timestamp 2026-09-22T03:34:50.699636+00:00; SHA-256 8b9f05a8ad827524038dffe8e15a954399dbbb9559e8c32d214ce85e737119ff.
+
+Publication: Wine 11ce2e6a613 pushed to 125hz/wine ios-build first, then root implementation 8246cf2 to 125hz/Madeira main. This dated entry follows implementation publication. FEX and DXMT unchanged; no upstream push or PR.
