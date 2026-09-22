@@ -130,16 +130,36 @@ struct SteamLibraryView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var importInstaller = false
     @State private var chooseClient = false
+    @State private var opening = false
+    @State private var launchTask: Task<Void, Never>?
     let play: (LibraryEntry) -> Void
     let enableJIT: () -> Void
     private func launch(_ entry: LibraryEntry) {
-        guard jit_check_debugged() else { model.error = "Enable JIT before opening Steam."; return }
-        do { try entry.validate() } catch { model.error = error.localizedDescription; return }
-        model.stopScan()
-        if entry.steamSession == "installer" {
-            LogStore.shared.log("[steam-install] ml1270 starting cached installer; entering Wine/JIT startup")
+        guard !opening, library.current == nil else { return }
+        opening = true
+        model.error = nil
+        LogStore.shared.log("[steam-launch] ml1300 opening requested; duplicate taps locked")
+        launchTask = Task { @MainActor in
+            defer { opening = false; launchTask = nil }
+            do {
+                // Give the pending state a display turn before synchronous
+                // validation and the Wine/JIT handoff can occupy the UI thread.
+                if LibraryFlags.enabled("MADEIRA_STEAM_LAUNCH_FEEDBACK") {
+                    try await Task.sleep(nanoseconds: 150_000_000)
+                }
+                try Task.checkCancellation()
+                guard jit_check_debugged() else {
+                    model.error = "Enable JIT before opening Steam."; return
+                }
+                try entry.validate()
+                model.stopScan()
+                if entry.steamSession == "installer" {
+                    LogStore.shared.log("[steam-install] ml1270 starting cached installer; entering Wine/JIT startup")
+                }
+                LogStore.shared.log("[steam-launch] ml1300 handing off to Wine")
+                play(entry)
+            } catch is CancellationError {} catch { model.error = error.localizedDescription }
         }
-        play(entry)
     }
     var body: some View {
         NavigationStack {
@@ -152,6 +172,12 @@ struct SteamLibraryView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section {
+                    if opening && LibraryFlags.enabled("MADEIRA_STEAM_LAUNCH_FEEDBACK") {
+                        HStack(spacing: 12) {
+                            ProgressView()
+                            Text("Opening…").foregroundStyle(.secondary)
+                        }.accessibilityElement(children: .combine)
+                    }
                     if model.busy {
                         ProgressView(model.installerPhase, value: model.progress)
                         Button("Cancel", role: .cancel) { model.cancel() }
@@ -201,10 +227,12 @@ struct SteamLibraryView: View {
                 if !model.snapshot.complete { Section { Text("Some Steam files are still being updated or could not be read. Refresh after Steam has finished.").font(.footnote) } }
                 if model.snapshot.skippedLibraries > 0 { Section { Text("Only Steam libraries inside drive_c can be imported.").font(.footnote) } }
             }
+            .disabled(opening)
+            .interactiveDismissDisabled(opening)
             .navigationTitle("Steam").navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() }.disabled(opening) } }
             .task { await model.refresh() }
-            .onDisappear { model.cancel() }
+            .onDisappear { launchTask?.cancel(); model.cancel() }
             .sheet(isPresented: $chooseClient) {
                 NavigationStack { ExecutableBrowser(folder: LibraryModel.drive) { entry in
                     chooseClient = false; Task { await model.chooseClient(entry) }

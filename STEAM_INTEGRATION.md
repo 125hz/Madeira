@@ -133,6 +133,51 @@ No reinstall or extra launch arguments are required. Adapter enumeration and
 TLS handling have build/host-test coverage; Steam login, authenticated downloads,
 and continued UI stability remain unverified until tested on device.
 
+## Startup follow-up: ml1300
+
+Logs 153 and previous 14 confirm successful adapter enumeration after ml1290.
+The remaining WSALookupServiceBegin warning is not proof of a startup failure:
+Chromium falls back to an unknown connection type. The debugger already detached
+before Wine started. IPv6 loopback refusals are followed by successful IPv4
+connections, but the browser repeatedly reconnects and never shows a login UI
+within the captured interval. Successful login remains unverified.
+
+Generic native I/O now chooses the status-block ABI using the calling process's
+guest window, rather than session-global wow_peb. That global can point at a
+sibling or be temporarily cleared during child startup. The wrong choice can
+misinterpret a native status as a 32-bit pointer, or overwrite a 32-bit request's
+host cookie during completion. The change covers synchronous and asynchronous
+file/socket results and preserves full-width native byte counts. The source and
+host regression prove the defect; these logs do not establish it as the sole
+cause of the client reconnect loop.
+
+Open Steam, Big Picture and Run downloaded installer now reserve the launch
+immediately, show Opening, and disable repeated taps. A cancellable main-actor
+task allows the feedback to render before validation and Wine/JIT startup.
+Leaving the management view cancels a pending handoff. Missing JIT or invalid
+executables restore the controls and show the existing error dialog.
+
+Chromium's invalid --enable-logging=file argument is replaced with the supported
+empty-value flag. Single-process and V8 settings remain as before. The bounded
+error-only guest log capture also recognizes cef_log.txt and webhelper.txt;
+normal log messages are not mirrored. Socket acceptance reports metadata only,
+up to 24 lines, to distinguish queueing, completion and accept failures.
+
+Rollback switches (set in madeira-env.txt before a fresh app session):
+
+- MADEIRA_IO_STATUS_OWNER=0: restore the old I/O ABI classification.
+- MADEIRA_STEAM_LAUNCH_FEEDBACK=0: suppress Opening/delay; duplicate-tap protection remains.
+- MADEIRA_CEF_LOGGING_FIX=0: restore the previous Chromium logging argument.
+- MADEIRA_TEXT_LOG_ERRORS=0: exclude the newly recognized text logs.
+- MADEIRA_SOCKET_ACCEPT_TRACE=0: disable accept-stage diagnostics.
+
+Cold-launch the new IPA, enable JIT and tap Open Steam once. Reinstalling Steam
+is unnecessary. Check the immediate feedback and whether a login window appears.
+If it remains blank, keep the session open for about a minute and export the
+Madeira log. Useful tags are [steam-launch], [io-status-owner], [cef-logging],
+[socket-accept], [guest-log], [nsi-network] and [nsi-ios]. The visible NLA warning
+may remain. Do not treat its presence alone as a failed startup.
+
 ## References
 
 - [Valve's official client download](https://store.steampowered.com/about/)
@@ -144,3 +189,6 @@ and continued UI stability remain unverified until tested on device.
 - [Chromium adapter enumeration](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/net/base/network_interfaces_win.cc)
 - [Apple interface-address API](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/getifaddrs.3.html)
 - [Apple routing ABI](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/net/route.h) (vendored public header; original notices retained).
+
+- [Chromium NLA fallback](https://chromium.googlesource.com/chromium/src/net/+/master/base/network_change_notifier_win.cc)
+- [Chromium logging switch parsing](https://chromium.googlesource.com/chromium/src/+/57368cb688f57953997281524e3a9733c535393b/chrome/common/logging_chrome.cc)
