@@ -41,6 +41,14 @@ discovery, path containment, profile migration and launch routing. The IPA build
 validates compilation and packaging. They do not demonstrate a successful Steam
 login, download, DRM check or game launch on iOS.
 
+The owner confirmed installer completion with ml1270. Logs 150/151 also show the
+client updating and starting its Chromium helper, but do not establish a working
+login. ml1280 protects retired 32-bit process windows and their executable copies
+while registered workers remain alive, and supplies the missing 64-bit
+`RtlWow64SuspendThread` export using Wine's `NtSuspendThread` implementation.
+Retained workers may temporarily consume one of the available guest windows;
+keeping their memory is necessary to avoid use-after-retirement crashes.
+
 Earlier port work reached an interactive CEF login window but recorded CEF
 stability and login-networking failures; see `STEAM_CEF_HANDOFF.md`. That older
 evidence cannot establish whether the current self-updating client works. A
@@ -75,6 +83,8 @@ Add these settings to `madeira-env.txt` when needed:
 | `MADEIRA_STEAM_STAGED_INSTALL=0` | Restore automatic launch immediately after downloading/importing the installer. |
 | `MADEIRA_SECTION_PROCESS_LIMIT=0` | Restore the old shared WoW address ceiling for native section mappings (diagnostic rollback). |
 | `MADEIRA_FD_CACHE_RELEASE_FIX=0` | Restore the old descriptor-cache retirement behavior (diagnostic rollback; can close another process's descriptor). |
+| `MADEIRA_WOW_LIVE_WINDOW_GUARD=0` | Restore time-only retirement of guest windows and executable copies. Diagnostic rollback; a surviving worker may still use that memory. |
+| `MADEIRA_WOW_SUSPEND=0` | Return `STATUS_NOT_IMPLEMENTED` from the restored thread-suspension API instead of calling `NtSuspendThread`. |
 | `MADEIRA_COMPACT_API_BADGE=0` | Restore the full detected API chain on badges. |
 
 `[steam-bridge] ml1260` records feature state, scans, installer stages and session
@@ -93,8 +103,19 @@ its cause. Successful installer completion still needs an updated device test.
 Steam's own `logs` directory may be needed for login/update problems; redact
 account identifiers and tokens before sharing those files.
 
+For ml1280, cold-launch Madeira, enable JIT, and use **Open Steam** with the
+existing installation. No reinstall is needed. Check whether updating finishes
+and whether a login window appears. `[wow-lifetime] ml1280` identifies deferred
+memory retirement; `[wow-suspend] ml1280` confirms the formerly missing API ran.
+If the UI remains blank or disconnected, include Steam's files from
+`wine/drive_c/Program Files (x86)/Steam/logs` (especially `cef_log.txt` if present)
+alongside the Madeira log. In log 151 the browser thread remains in its message
+loop while the client reports a UI WebSocket failure; its cause is not yet proven.
+
 ## References
 
 - [Valve's official client download](https://store.steampowered.com/about/)
+- [Wine's thread-suspension implementation](https://github.com/wine-mirror/wine/blob/master/dlls/ntdll/process.c)
+- [Apple's Mach thread query handling](https://github.com/apple/darwin-xnu/blob/main/osfmk/kern/thread_act.c)
 - [Valve's owned-library Web API](https://partner.steamgames.com/doc/webapi/IPlayerService)
   requires an API key and library visibility; it is not a download or login API.

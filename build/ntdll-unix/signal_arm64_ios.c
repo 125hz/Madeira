@@ -1039,6 +1039,27 @@ thread_t ios_thread_registry_mach(int i)
  *
  * The count is not lowered: slots are matched by mach_thread, and a zeroed slot
  * matches no real port (MACH_PORT_NULL is never a live thread). */
+/* A timeout does not prove that a pseudo-process's workers have exited.
+ * Never dereference their TEBs here: only the Mach thread's existence matters.
+ * Recycled ports and unexpected query failures conservatively retain memory. */
+int ios_thread_registry_range_busy( uintptr_t base, uintptr_t size )
+{
+    int count = ios_thread_registry_count(), i;
+    for (i = 0; i < count; i++)
+    {
+        uintptr_t teb = ios_thread_registry[i].teb;
+        thread_t port = ios_thread_registry[i].mach_thread;
+        struct thread_basic_info info;
+        mach_msg_type_number_t length = THREAD_BASIC_INFO_COUNT;
+        kern_return_t kr;
+
+        if (!port || !teb || teb < base || teb - base >= size) continue;
+        kr = thread_info( port, THREAD_BASIC_INFO, (thread_info_t)&info, &length );
+        if (kr != KERN_INVALID_ARGUMENT && kr != MACH_SEND_INVALID_DEST && kr != KERN_TERMINATED) return 1;
+    }
+    return 0;
+}
+
 int ios_thread_registry_purge_range( uintptr_t base, uintptr_t size )
 {
     int count = ios_thread_registry_count(), purged = 0, i;

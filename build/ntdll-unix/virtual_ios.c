@@ -8134,6 +8134,7 @@ static int ios_wow_window_teardown( ULONG_PTR base, void *dead_peb, unsigned gua
  * teardown below is about to replace with PROT_NONE.  Dropping them has to
  * happen first, and the call site below is what asserts that order. */
 extern void d3d9_native_process_teardown( void *peb );
+extern int ios_thread_registry_range_busy( uintptr_t base, uintptr_t size );
 
 static void ios_wow_reclaim_dead_windows(void)
 {
@@ -8173,6 +8174,25 @@ static void ios_wow_reclaim_dead_windows(void)
                         "now and a laggard thread of it may still be unwinding inside the window\n",
                      (void *)base, (long long)ts.tv_sec, dead_peb );
             nanosleep( &ts, NULL );
+        }
+
+        /* ml1280: workers can remain asleep long after their main thread exits.
+         * Keep their TEBs and mappings alive; another unused window can serve
+         * the next process. The grace period alone is not a lifetime fence. */
+        {
+            const char *env = getenv( "MADEIRA_WOW_LIVE_WINDOW_GUARD" );
+            if ((!env || strcmp( env, "0" )) &&
+                ios_thread_registry_range_busy( base, IOS_WOW_WINDOW_SIZE ))
+            {
+                static unsigned reports;
+                if (__atomic_fetch_add( &reports, 1, __ATOMIC_RELAXED ) < 16)
+                    dprintf( 2, "[wow-lifetime] ml1280 retain B=%p: predecessor workers still live\n",
+                             (void *)base );
+                pthread_mutex_lock( &ios_wow_mutex );
+                ios_wow_windows[i].dead = 1;
+                pthread_mutex_unlock( &ios_wow_mutex );
+                continue;
+            }
         }
 
         /* BEFORE the PROT_NONE replace and before ios_jit_purge_window(),
@@ -9498,6 +9518,29 @@ void ios_jit_reclaim_process( void *peb )
     char *rx_base = (char *)ios_jit_rx_base_global;
 
     if (!peb || !rx_base) return;
+
+    /* ml1280: the same surviving workers that pin a guest window also retain
+     * its executable copies. Defer both until a later window teardown. */
+    {
+        const char *env = getenv( "MADEIRA_WOW_LIVE_WINDOW_GUARD" );
+        ULONG_PTR base = 0;
+        if (!env || strcmp( env, "0" ))
+        {
+            pthread_mutex_lock( &ios_wow_mutex );
+            for (i = 0; i < IOS_WOW_MAX_WINDOWS; i++)
+                if (ios_wow_windows[i].base &&
+                    (ios_wow_windows[i].peb == peb || ios_wow_windows[i].dead_peb == peb))
+                { base = ios_wow_windows[i].base; break; }
+            pthread_mutex_unlock( &ios_wow_mutex );
+            if (base && ios_thread_registry_range_busy( base, IOS_WOW_WINDOW_SIZE ))
+            {
+                static unsigned reports;
+                if (__atomic_fetch_add( &reports, 1, __ATOMIC_RELAXED ) < 16)
+                    dprintf( 2, "[wow-lifetime] ml1280 defer executable retirement B=%p\n", (void *)base );
+                return;
+            }
+        }
+    }
 
     pthread_mutex_lock( &ios_pool_lock );
 
