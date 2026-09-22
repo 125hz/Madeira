@@ -17155,6 +17155,14 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
 {
     struct ntdll_thread_data *thread_data;
     sigset_t sigset;
+#ifdef WINE_IOS
+    const char *value = getenv( "MADEIRA_TLS_CLEAR_OWNER" );
+    BOOL owner_safe = !value || strcmp( value, "0" );
+    PEB *owner = NtCurrentTeb()->Peb;
+    static unsigned int reports;
+    if (__atomic_fetch_add( &reports, 1, __ATOMIC_RELAXED ) < 8)
+        dprintf( 2, "[tls-clear] ml1290 owner=%p index=%u owner_safe=%u\n", owner, index, owner_safe );
+#endif
 
     if (index < TLS_MINIMUM_AVAILABLE)
     {
@@ -17162,6 +17170,10 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
         LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct ntdll_thread_data, entry )
         {
             TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+#ifdef WINE_IOS
+            /* The list belongs to the host task; TLS indices belong to one guest process. */
+            if (owner_safe && teb->Peb != owner) continue;
+#endif
 #ifdef _WIN64
             WOW_TEB *wow_teb = get_wow_teb( teb );
             if (wow_teb) wow_teb->TlsSlots[index] = 0;
@@ -17180,12 +17192,28 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
         LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct ntdll_thread_data, entry )
         {
             TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+#ifdef WINE_IOS
+            /* The list belongs to the host task; TLS indices belong to one guest process. */
+            if (owner_safe && teb->Peb != owner) continue;
+#endif
 #ifdef _WIN64
             WOW_TEB *wow_teb = get_wow_teb( teb );
             if (wow_teb)
             {
                 if (wow_teb->TlsExpansionSlots)
-                    ((ULONG *)ULongToPtr( wow_teb->TlsExpansionSlots ))[index] = 0;
+                {
+                    ULONG_PTR slots = wow_teb->TlsExpansionSlots;
+#ifdef WINE_IOS
+                    /* This embedded pointer is a guest address in this TEB's window. */
+                    if (owner_safe)
+                    {
+                        struct ios_wow_window *slot = ios_wow_slot_at_base(
+                            (ULONG_PTR)teb & ~(IOS_WOW_WINDOW_SIZE - 1) );
+                        if (slot) slots += slot->base;
+                    }
+#endif
+                    ((ULONG *)slots)[index] = 0;
+                }
             }
             else
 #endif

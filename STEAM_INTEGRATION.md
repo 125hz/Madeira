@@ -85,6 +85,8 @@ Add these settings to `madeira-env.txt` when needed:
 | `MADEIRA_FD_CACHE_RELEASE_FIX=0` | Restore the old descriptor-cache retirement behavior (diagnostic rollback; can close another process's descriptor). |
 | `MADEIRA_WOW_LIVE_WINDOW_GUARD=0` | Restore time-only retirement of guest windows and executable copies. Diagnostic rollback; a surviving worker may still use that memory. |
 | `MADEIRA_WOW_SUSPEND=0` | Return `STATUS_NOT_IMPLEMENTED` from the restored thread-suspension API instead of calling `NtSuspendThread`. |
+| `MADEIRA_NSI_NETWORK_TABLES=0` | Disable the new interface/IP providers; preserve the previous unsupported-table error. |
+| `MADEIRA_TLS_CLEAR_OWNER=0` | Restore the former cross-process/untranslated TLS clearing for diagnosis. |
 | `MADEIRA_COMPACT_API_BADGE=0` | Restore the full detected API chain on badges. |
 
 `[steam-bridge] ml1260` records feature state, scans, installer stages and session
@@ -112,6 +114,25 @@ If the UI remains blank or disconnected, include Steam's files from
 alongside the Madeira log. In log 151 the browser thread remains in its message
 loop while the client reports a UI WebSocket failure; its cause is not yet proven.
 
+For ml1290, log 152 and its screenshot expose a separate missing path:
+`GetAdaptersAddresses` reaches unsupported NDIS interface enumeration. The iOS
+NSI bridge now connects Wine's BSD interface and IP providers, including native
+and 32-bit parameter reads. `[nsi-network] ml1290` reports table/status/count
+without dumping adapter addresses. The providers use actual host interfaces;
+Wine's existing BSD IPv6 route-table limitation remains. Change notifications
+and `WSALookupServiceBegin` are separate APIs and are not implemented by this fix.
+
+The same log later faults in `virtual_clear_tls_index` while dereferencing an
+untranslated 32-bit expansion-slot pointer. `[tls-clear] ml1290` identifies
+process-scoped TLS clearing with the target TEB's window translation, including
+retiring windows whose workers have not exited. This also prevents one guest
+process's TLS release from clearing another guest process's slot.
+
+Cold-start the new IPA, enable JIT, and open the existing Steam installation.
+No reinstall or extra launch arguments are required. Adapter enumeration and
+TLS handling have build/host-test coverage; Steam login, authenticated downloads,
+and continued UI stability remain unverified until tested on device.
+
 ## References
 
 - [Valve's official client download](https://store.steampowered.com/about/)
@@ -119,3 +140,7 @@ loop while the client reports a UI WebSocket failure; its cause is not yet prove
 - [Apple's Mach thread query handling](https://github.com/apple/darwin-xnu/blob/main/osfmk/kern/thread_act.c)
 - [Valve's owned-library Web API](https://partner.steamgames.com/doc/webapi/IPlayerService)
   requires an API key and library visibility; it is not a download or login API.
+
+- [Chromium adapter enumeration](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/net/base/network_interfaces_win.cc)
+- [Apple interface-address API](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/getifaddrs.3.html)
+- [Apple routing ABI](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/net/route.h) (vendored public header; original notices retained).
