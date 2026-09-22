@@ -13808,3 +13808,40 @@ Fast semaphore waits on/off runs, and preserve Player.log if available. Retest t
 startup failure for [exec-fault]/[exc-disp]. Separately check keyboard modifiers,
 quit/return, desktop, pointer modes, portrait/landscape layout, controller focus,
 and menu readability/fading. 60 FPS and compatibility fixes remain unverified.
+
+## 2026-09-21 — ml1160: persistent shader caches, conservative semaphore policy, and native frontend layouts
+
+Evidence from device logs 112–118 and prev (10–11), plus the supplied frontend screenshots:
+
+- Log 113 is a 32-bit D3D9 workload. It contains frame maxima near 399 ms; later GPU work grows from about 7.3 to 22.8 ms per present while render-pass count changes much less. This proves that neither average FPS nor a CPU-only explanation is sufficient. Thermal state, recording, scene complexity and pipeline stalls were not separately identifiable in the old telemetry.
+- Log 114 is another D3D9 workload. Some windows contain 328–468 ms spikes, while later windows reach about 59–60 FPS with maxima below 47 ms. Shader cold misses are a hypothesis for individual spikes, not a measured attribution yet.
+- Both D3D9 logs report failures resolving the persistent shader-cache path. The shared native resolver used the macOS per-user confstr directory; its failure returned nil before SQLite could open either cache object.
+- Log 117's managed 64-bit workload keeps rendering a simple loading scene with little file I/O. Log 118 explicitly reports `sem=off`, and the owner confirms that loading succeeds with only semaphore acceleration disabled. Later render-pass counts rise to about 17 instead of the stuck scene's four. Event fastsync remains active. This supports a semaphore-path regression, not a file-throughput diagnosis; the precise race is still unresolved.
+- Logs 115/116 retain an invalid guest jump to 0xfffffffe. The ml1150 execute-fault correction is active. In log 115 the subsequent null guest SEH handler reaches CompileBlock(0), whose old return-zero guard sends the native dispatcher to host PC zero. Disassembly maps guest ntdll+0x4db2d to the return after the indirect exception-handler call. The original bad guest control flow is not explained or bypassed.
+
+Generic implementation:
+
+1. DXMT resolves relative iOS shader-cache paths under the app's Library/Caches using NSCachesDirectory, checks directory creation, and avoids passing nil to Metal's cache-path setter. Both translation caches and the existing Metal cache setup share this resolver. Existing cache epochs and content keys remain unchanged. Bounded cache hit/miss counters make warm-run reuse observable. This does not promise to remove first-use shader compilation or guarantee that Metal accepts its private cache-path API.
+2. D3D9 canonicalizes the six ignored blend fields when blending is disabled, before hashing and full pipeline-key comparison. Active blending and draw ordering are unchanged. Slow pipeline readiness waits (>=2 ms) now report their duration, initially 16 lines and then powers of two.
+3. Wine's semaphore cells are opt-in on both client and server; the default uses the established server semaphore implementation. Event fastsync stays enabled. The frontend labels semaphore acceleration experimental and reflects the new default. This is a generic compatibility rollback backed by the device A/B test, not a claim that the experimental algorithm was repaired. Explicit profile/global opt-ins still work; performance of semaphore-heavy workloads needs remeasurement.
+4. FEX no longer returns a null native target merely because guest RIP is below 64 KiB. The normal executable-range-checked decoder emits a guest NoExecOp for an unmapped address, preserving guest execute-fault delivery and reconstruction. Both WOW64 and ARM64EC modules were rebuilt. A successful startup beyond the original invalid jump is unverified.
+5. The frontend offers smaller cards, compact cards and a list; removes controller hints; uses system backgrounds instead of gradients; gives the navigation bar a material background; blurs detail artwork; and uses a centered Library/Settings capsule. iOS 26 uses interactive Liquid Glass for the capsule and floating menu button, with material/opaque accessibility fallbacks.
+6. Menu content is clipped to the rounded panel. The menu button and performance overlay use isolated drag state with global coordinates and safe-area clamping; positions persist. The performance overlay participates in the control window's hit testing. The menu button still fades after inactivity.
+7. A lightweight independent 10-second device-state report records thermal state, Low Power Mode and capture state, including sessions without visible touch controls. Frame-tail statistics remain available; no per-frame logging was added.
+
+Controls and log tags:
+
+- `DXMT_IOS_CACHE_DIR=0`: restore the old relative cache-directory resolver; `[shader-cache] ml1160`.
+- `DXMT_CACHE_STATS=0`: silence cache hit/miss reports.
+- `DXMT_D9_CANONICAL_BLEND=0`: retain redundant disabled-blend pipeline keys; `[pipeline-cache] ml1160`.
+- `DXMT_D9_PIPELINE_STATS=0`: silence slow pipeline-wait reports; `[pipeline-wait] ml1160`.
+- `MADEIRA_FASTSYNC_SEM=1`: opt into experimental semaphore cells; `=0` explicitly keeps the working server path. `[semaphore-policy] ml1160` and `[fastsync]` identify the effective setting.
+- `MADEIRA_LOW_RIP_FAULT=0`: restore the old null-native-target guard; `[low-rip-fault] ml1160`, followed by `[iOS-noexec]` / `[exec-fault]` for normal guest delivery.
+- `MADEIRA_DEVICE_STATS=0`: disable `[device-load] ml1160` samples.
+- `MADEIRA_LIBRARY_LAYOUTS=0`: hide layout selection and use normal cards. `MADEIRA_FRONTEND_GLASS=0`: use material. `MADEIRA_HUD_DRAG=0`: disable overlay dragging. `[frontend-layout]` and `[frontend-hud] ml1160` identify the new UI. The whole frontend remains opt-in through `MADEIRA_FRONTEND=1`.
+
+References checked: Apple's [cache-directory API](https://developer.apple.com/documentation/foundation/filemanager/searchpathdirectory/cachesdirectory?language=objc), [Metal blend attachment contract](https://developer.apple.com/documentation/metal/mtlrenderpipelinecolorattachmentdescriptor), and [shader compilation guidance](https://developer.apple.com/videos/play/wwdc2022/10102/). These support the platform mechanisms; device performance gains remain unmeasured.
+
+Validation and delivery: DXMT native build: 83 succeeded, 0 failed; Wine native stages: 32/32 and 46/46 succeeded; both FEX PE modules and the refreshed native FEXCore archive rebuilt. Swift release build passed. The full IPA build printed "IPA verified" and verified payload hashes/permissions. Additional content checks verified native markers, PE architectures, and byte-for-byte packaged DLL equality. Final IPA: 155,011,661 bytes (147.8 MiB), 2026-09-21 19:12:05 CDT; SHA-256 d84b7b3760ca67e8e3dd6a94220e872ead6f76a1ea4783bf218d97b11977e5f8. Submodules were committed and pushed to 125hz forks before the top-level implementation commit; no upstream push or PR. The local verification script is .xtool/verify-ml1160.py. Runtime and visual verification require the device.
+
+Device follow-up: repeat the same D3D9 route on a first launch and a second launch, with matched resolution and no recording, and compare `[shader-cache]`, `[pipeline-wait]`, `[frame-tail]`, `[gpu-work]` and `[device-load]`. Retest the failing startup for guest rather than host fault delivery. Keep semaphore acceleration off for the previously stuck managed workload. Check all three library layouts in portrait/landscape, controller badge visibility, navigation blur, scrolling menu edges, both draggable overlays, touch passthrough and rotation. Only the owner can perform these device checks; no Windows games or emulator sessions were run on this PC.
