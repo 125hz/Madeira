@@ -115,6 +115,23 @@ struct LibraryEntry: Codable, Identifiable {
     var semaphoreFastPath: Bool?
     var anisotropyLimit: Int?
     var desktop: Bool?
+    // Store identity is independent of the editable artwork match.
+    var steamAppID: Int?
+    var steamInstallPath: String?
+    var steamInstalled: Bool?
+    var steamSession: String?
+    var steamBigPicture: Bool?
+    var usesSteam: Bool { steamAppID != nil || steamSession != nil }
+    var launchArguments: String {
+        if desktop == true { return "/desktop=shell,\(resolution) C:\\windows\\system32\\services.exe" }
+        guard usesSteam else { return arguments }
+        let compatibility = steamSession != "installer" && LibraryFlags.enabled("MADEIRA_STEAM_COMPAT")
+            ? " -no-cef-sandbox -cef-disable-gpu -nocrashmonitor" : ""
+        let mode: String
+        if let id = steamAppID { mode = steamInstalled == false ? " steam://install/\(id)" : " -applaunch \(id)" }
+        else { mode = steamBigPicture == true ? " -gamepadui" : "" }
+        return "/desktop=madeira,\(resolution) \"\(windowsPath)\"" + compatibility + mode + (arguments.isEmpty ? "" : " " + arguments)
+    }
     static let desktopID = UUID(uuidString: "AF046C35-C32A-497B-92BC-0BBD14F8CB61")!
     static var desktopEntry: LibraryEntry {
         var entry = LibraryEntry(title: "Desktop", relativePath: "windows/system32/explorer.exe", bits: 64)
@@ -131,11 +148,19 @@ struct LibraryEntry: Codable, Identifiable {
             throw LibraryError.message("The saved launch profile contains invalid display or argument values.")
         }
         var quoted = false, inToken = false, tokens = 0
-        for character in arguments {
+        for character in launchArguments {
             if character == "\"" { quoted.toggle() }
             if !quoted && (character == " " || character == "\t") { inToken = false }
             else if !inToken { tokens += 1; inToken = true }
         }
+        if usesSteam {
+            guard LibraryFlags.enabled("MADEIRA_STEAM"), SteamPaths.safeRelative(relativePath, under: LibraryModel.drive) != nil,
+                  steamAppID.map(SteamPaths.validAppID) ?? true,
+                  steamSession == nil || ["client", "installer"].contains(steamSession!) else {
+                throw LibraryError.message("The Steam launch profile is invalid or Steam integration is disabled.")
+            }
+        }
+        guard launchArguments.utf8.count < 1024 else { throw LibraryError.message("The complete launch command is too long.") }
         guard !quoted, tokens <= 16 else { throw LibraryError.message("Use balanced double quotes and at most 16 launch arguments.") }
     }
 
@@ -152,9 +177,9 @@ struct LibraryEntry: Codable, Identifiable {
         fputs("[frontend] ml1140 launch profile applied\n", stderr)
     }
     func configureLaunch() {
-        setenv("MADEIRA_EXE", desktop == true ? "explorer.exe" : windowsPath, 1)
-        setenv("MADEIRA_ARGS", desktop == true ? "/desktop=shell,\(resolution) C:\\windows\\system32\\services.exe" : arguments, 1)
-        if desktop == true { setenv("MADEIRA_DESKTOP", "1", 1) } else { unsetenv("MADEIRA_DESKTOP") }
+        setenv("MADEIRA_EXE", desktop == true || usesSteam ? "explorer.exe" : windowsPath, 1)
+        setenv("MADEIRA_ARGS", launchArguments, 1)
+        if desktop == true || usesSteam { setenv("MADEIRA_DESKTOP", "1", 1) } else { unsetenv("MADEIRA_DESKTOP") }
     }
 }
 
@@ -165,6 +190,7 @@ final class LibraryModel: ObservableObject {
     @Published var enabled = false
     @Published var entries: [LibraryEntry] = []
     @Published var current: UUID?
+    @Published var activeEntry: LibraryEntry?
     @Published var menu = false
     @Published var performance = false
     @Published var liveLogs = false
@@ -231,11 +257,45 @@ final class LibraryModel: ObservableObject {
                 entry.metadataChecked = next[i].metadataChecked
                 entry.metadataRevision = next[i].metadataRevision
             }
+            if let appID = next[i].steamAppID, appID == entry.steamAppID {
+                entry.relativePath = next[i].relativePath; entry.steamInstallPath = next[i].steamInstallPath
+                entry.steamInstalled = next[i].steamInstalled; entry.folderBytes = next[i].folderBytes
+            }
             next[i] = entry
         } else { next.append(entry) }
         persist(next)
     }
-    func remove(_ id: UUID) { persist(entries.filter { $0.id != id }) }
+    func mergeSteam(_ snapshot: SteamSnapshot) {
+        guard !readOnly, current == nil, let client = snapshot.client else { return }
+        var next = entries
+        let found = Set(snapshot.apps.map(\.id))
+        let hidden = Set(UserDefaults.standard.array(forKey: "madeiraSteamHidden") as? [Int] ?? [])
+        for app in snapshot.apps where !hidden.contains(app.id) && (app.installed || next.contains(where: { $0.steamAppID == app.id })) {
+            if let index = next.firstIndex(where: { $0.steamAppID == app.id }) {
+                next[index].relativePath = client; next[index].steamInstallPath = app.relativeFolder
+                next[index].steamInstalled = app.installed; next[index].folderBytes = app.bytes
+            } else {
+                var entry = LibraryEntry(title: app.name, relativePath: client, bits: 0)
+                entry.steamAppID = app.id; entry.steamID = app.id; entry.steamInstallPath = app.relativeFolder
+                entry.steamInstalled = true; entry.folderBytes = app.bytes
+                next.append(entry)
+            }
+        }
+        if snapshot.complete {
+            for index in next.indices where next[index].steamAppID != nil && !found.contains(next[index].steamAppID!) {
+                next[index].steamInstalled = false
+            }
+        }
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        if (try? encoder.encode(next)) != (try? encoder.encode(entries)) { persist(next) }
+    }
+    func remove(_ id: UUID) {
+        if let appID = entries.first(where: { $0.id == id })?.steamAppID {
+            var hidden = UserDefaults.standard.array(forKey: "madeiraSteamHidden") as? [Int] ?? []
+            if !hidden.contains(appID) { hidden.append(appID); UserDefaults.standard.set(hidden, forKey: "madeiraSteamHidden") }
+        }
+        persist(entries.filter { $0.id != id })
+    }
     private func persist(_ next: [LibraryEntry]) {
         guard !readOnly else { return }
         do {
@@ -248,7 +308,7 @@ final class LibraryModel: ObservableObject {
     @MainActor
     func refreshMetadata(_ id: UUID) async {
         let revision = (LibraryFlags.enabled("MADEIRA_LIBRARY_INSTALL_SIZE") ? 2 : 1) + (LibraryFlags.enabled("MADEIRA_LIBRARY_API_SCAN") ? 10 : 0)
-        guard !metadataInFlight.contains(id), let entry = entries.first(where: { $0.id == id }), entry.desktop != true,
+        guard !metadataInFlight.contains(id), let entry = entries.first(where: { $0.id == id }), entry.desktop != true, entry.steamAppID == nil,
               entry.metadataRevision != revision || Date().timeIntervalSince(entry.metadataChecked ?? .distantPast) > 86400,
               let url = try? Self.executable(entry.relativePath) else { return }
         metadataInFlight.insert(id)
@@ -367,7 +427,7 @@ final class LibraryModel: ObservableObject {
         launchPresent = madeira_get_present_count(); launchStarted = Date(); launchSlow = false; launchLogs = false
         launchSurface = winios_surface_present_count()
         launching = true; overlayFields = entry.overlayFields ?? ["FPS", "Frame time", "RAM", "Battery"]
-        current = entry.id; menu = false; performance = entry.performance; liveLogs = entry.liveLogs
+        activeEntry = entry; current = entry.id; menu = false; performance = entry.performance; liveLogs = entry.liveLogs
         LogStore.shared.setDisplayActive(entry.liveLogs)
         opacity = entry.controlOpacity; fpsMode = entry.fpsMode; sessionMessage = "Starting…"
         let controls = TouchControlsModel.shared
@@ -379,7 +439,8 @@ final class LibraryModel: ObservableObject {
         FullscreenState.shared.active = true
         MetalHostView.shared.isHidden = false
         ProMotionIntent.shared.setActive(true, maxHz: ProMotionIntent.maxHz(for: Int32(entry.fpsMode)))
-        var played = entry; played.lastPlayed = Date(); save(played)
+        if entry.steamSession == nil { var played = entry; played.lastPlayed = Date(); save(played) }
+        if entry.usesSteam { fputs("[steam-bridge] ml1260 session=\(entry.steamSession ?? "app") appid=\(entry.steamAppID ?? 0) desktop=1\n", stderr) }
         sawProcess = false
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.poll() }
@@ -452,7 +513,7 @@ final class LibraryModel: ObservableObject {
         InputGuard.shared.releaseAll("frontend-exit")
         controls.controls = savedControls; controls.visible = savedVisible; controls.sizeScale = savedSize
         InputSettings.shared.displayMode = savedDisplay
-        current = nil; menu = false; sessionMessage = ""
+        current = nil; activeEntry = nil; menu = false; sessionMessage = ""
         LogStore.shared.setDisplayActive(true)
         launching = false; launchLogs = false; LibraryKeyboard.hide()
         LibraryController.shared.configure(enabled: enabled, ownsInput: enabled)
@@ -668,8 +729,9 @@ struct LibraryBadges: View {
     }
     private var format: some View {
         HStack(spacing: 4) {
-            badge("\(entry.bits)-bit")
-            if let api = entry.graphicsAPI { badge(api) }
+            if entry.bits == 32 || entry.bits == 64 { badge("\(entry.bits)-bit") }
+            if let api = LibraryFlags.enabled("MADEIRA_COMPACT_API_BADGE") ? LibraryRendererBadge.compact(entry.graphicsAPI) : entry.graphicsAPI { badge(api) }
+            if entry.steamAppID != nil { badge(entry.steamInstalled == false ? "Not installed" : "Steam") }
         }
     }
     @ViewBuilder private var size: some View {
@@ -703,6 +765,7 @@ struct LibraryView: View {
     var play: (LibraryEntry) -> Void
     var enableJIT: () -> Void
     @State private var browser = false
+    @State private var steamManager = false
     @State private var selected: LibraryEntry?
     @State private var search = ""
     @State private var focused: UUID?
@@ -741,9 +804,14 @@ struct LibraryView: View {
                 }
             }.padding(.bottom, 5).padding(.top, 8)
         }
+        .sheet(isPresented: $steamManager) { SteamLibraryView(play: { profile in steamManager = false; play(profile) }, enableJIT: enableJIT) }
+        .task { await SteamLibraryModel.shared.refresh() }
+        .onChange(of: model.current) { _, current in if current == nil { Task { await SteamLibraryModel.shared.refresh() } } }
+        .onChange(of: scenePhase) { _, phase in if phase == .active { Task { await SteamLibraryModel.shared.refresh() } } }
+        .onAppear { fputs("[steam-bridge] ml1260 enabled=\(LibraryFlags.enabled("MADEIRA_STEAM") ? 1 : 0) compact-badges=\(LibraryFlags.enabled("MADEIRA_COMPACT_API_BADGE") ? 1 : 0)\n", stderr) }
         .onAppear { fputs("[frontend-layout] ml1190 full-height native tab symbols and metadata=\(refinements ? 1 : 0)\n", stderr) }
         .onReceive(controller.commands) { command in
-            if selected == nil, !browser, command == "tab" { tab = 1 - tab }
+            if selected == nil, !browser, !steamManager, command == "tab" { tab = 1 - tab }
         }
     }
     private func tabButton(_ title: String, symbol: String, index: Int) -> some View {
@@ -785,6 +853,7 @@ struct LibraryView: View {
                     }
                     Spacer()
                 }
+                HStack {
                 Button { selected = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry } label: {
                     Label("Desktop", systemImage: "desktopcomputer")
                         .font(.subheadline.weight(.medium)).padding(.horizontal, 14).frame(minHeight: 44)
@@ -792,6 +861,14 @@ struct LibraryView: View {
                 }.buttonStyle(.plain)
                     .id(LibraryEntry.desktopID)
                     .overlay(RoundedRectangle(cornerRadius: 22).stroke(focused == LibraryEntry.desktopID && controller.connected ? Color.cyan : .clear, lineWidth: 3))
+                if LibraryFlags.enabled("MADEIRA_STEAM") {
+                    Button { steamManager = true } label: {
+                        Label("Steam", systemImage: "storefront").font(.subheadline.weight(.medium))
+                            .padding(.horizontal, 14).frame(minHeight: 44)
+                            .background(Color(uiColor: .secondarySystemGroupedBackground), in: Capsule())
+                    }.buttonStyle(.plain)
+                }
+                }
                 if model.entries.filter({ $0.desktop != true }).isEmpty {
                     ContentUnavailableView("Make yourself at home", systemImage: "gamecontroller", description: Text("Add an executable from Madeira’s drive_c folder to get started."))
                 } else if layoutsEnabled && layout == "list" {
@@ -808,7 +885,7 @@ struct LibraryView: View {
             }.padding(16).frame(maxWidth: 1100).frame(maxWidth: .infinity)
         }
         .onReceive(controller.commands) { command in
-            guard tab == 0, selected == nil, !browser else { return }
+            guard tab == 0, selected == nil, !browser, !steamManager else { return }
             let items = [model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry] + entries
             let index = items.firstIndex(where: { $0.id == focused }) ?? 0
             if command == "add" { browser = true }
@@ -956,7 +1033,7 @@ struct LibraryDetail: View {
                         VStack(alignment: .leading, spacing: 12) {
                             Text(entry.title).font(.title2.bold())
                             LibraryBadges(entry: entry)
-                            Button(action: start) { HStack(spacing: 10) { Image(systemName: "play.fill"); Text("Play").fontWeight(.semibold) }.frame(minWidth: 100, minHeight: 30) }
+                            Button(action: start) { HStack(spacing: 10) { Image(systemName: "play.fill"); Text(entry.steamAppID != nil && entry.steamInstalled == false ? "Install" : "Play").fontWeight(.semibold) }.frame(minWidth: 100, minHeight: 30) }
                                 .buttonStyle(LibraryPlayStyle(pending: leaving)).disabled(leaving)
                         }
                     }.padding(.vertical, 24)
@@ -1029,7 +1106,7 @@ struct LibraryDetail: View {
                 Button("Remove", role: .destructive) { leaving = true; model.remove(entry.id); dismiss() }
             }
             .task {
-                if entry.graphicsAPI == nil, let url = try? LibraryModel.executable(entry.relativePath) { entry.graphicsAPI = LibraryModel.graphicsImports(url) }
+                if entry.steamAppID == nil, entry.graphicsAPI == nil, let url = try? LibraryModel.executable(entry.relativePath) { entry.graphicsAPI = LibraryModel.graphicsImports(url) }
                 guard entry.desktop != true, entry.steamID == nil, entry.coverFile == nil else { return }
                 let original = entry.title
                 do {
@@ -1212,7 +1289,7 @@ struct LibraryHUD: View {
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .topLeading) {
-                if model.launching, let entry = model.entries.first(where: { $0.id == model.current }) {
+                if model.launching, let entry = model.activeEntry {
                     LibraryArtwork(entry: entry, backdrop: true).overlay(.black.opacity(0.65)).ignoresSafeArea()
                         .opacity(launchVisible || !launchPolish ? 1 : 0)
                     launchView(entry, geometry: geo)

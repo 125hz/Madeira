@@ -346,3 +346,10 @@ record the same scene after warm-up, and send the full saved log. Relevant tags:
   experimental semaphore waits are already disabled. There is no evidence
   that a UI setting fixes that failure, and no executable-specific workaround
   is included in this round.
+
+
+## Steam client integration (ml1260)
+
+Library's Steam action downloads Valve's installer on demand or accepts a supplied installer. Open Steam and Big Picture use the Wine virtual desktop; installed manifests are imported when the session ends. Native Play routes through Steam by App ID, separately from editable artwork metadata. No Steam files or credentials are bundled in the app. Runtime login/download support remains experimental pending device confirmation. See [Steam integration](../STEAM_INTEGRATION.md) for the workflow, diagnostics and rollback switches.
+
+Renderer badges now show one detected capability instead of a chain. `MADEIRA_COMPACT_API_BADGE=0` restores the full chain. This badge does not establish the currently active graphics API.

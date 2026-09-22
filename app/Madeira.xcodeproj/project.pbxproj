@@ -53,6 +53,8 @@
 		A1000201 /* LogTail.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000201 /* LogTail.swift */; };
 		A1000202 /* FPSOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000202 /* FPSOverlay.swift */; };
 		A1000203 /* HardwareInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000203 /* HardwareInput.swift */; };
+		A1000205 /* SteamFiles.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000205 /* SteamFiles.swift */; };
+		A1000206 /* SteamLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000206 /* SteamLibrary.swift */; };
 		A1000204 /* Library.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000204 /* Library.swift */; };
 		A1000210 /* i386-windows in Resources */ = {isa = PBXBuildFile; fileRef = A2000210 /* i386-windows */; };
 /* End PBXBuildFile section */
@@ -115,6 +117,8 @@
 		A2000201 /* LogTail.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogTail.swift; sourceTree = "<group>"; };
 		A2000202 /* FPSOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FPSOverlay.swift; sourceTree = "<group>"; };
 		A2000203 /* HardwareInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HardwareInput.swift; sourceTree = "<group>"; };
+		A2000205 /* SteamFiles.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamFiles.swift; sourceTree = "<group>"; };
+		A2000206 /* SteamLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamLibrary.swift; sourceTree = "<group>"; };
 		A2000204 /* Library.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Library.swift; sourceTree = "<group>"; };
 		A2000210 /* i386-windows */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "i386-windows"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -171,6 +175,8 @@
 				A2000201 /* LogTail.swift */,
 				A2000202 /* FPSOverlay.swift */,
 				A2000203 /* HardwareInput.swift */,
+				A2000205 /* SteamFiles.swift */,
+				A2000206 /* SteamLibrary.swift */,
 				A2000204 /* Library.swift */,
 				A2000004 /* JITAllocator.c */,
 				A2000005 /* JITAllocator.h */,
@@ -324,6 +330,8 @@
 				A1000201 /* LogTail.swift in Sources */,
 				A1000202 /* FPSOverlay.swift in Sources */,
 				A1000203 /* HardwareInput.swift in Sources */,
+				A1000205 /* SteamFiles.swift in Sources */,
+				A1000206 /* SteamLibrary.swift in Sources */,
 				A1000204 /* Library.swift in Sources */,
 				A1000004 /* JITAllocator.c in Sources */,
 				A1000005 /* EntitlementChecker.swift in Sources */,
