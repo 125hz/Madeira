@@ -1840,13 +1840,19 @@ static CGSize winios_game_rect_size(void) {
  * every other caller — see winios_screen_size's own doc comment there. */
 extern void winios_screen_size(int *w, int *h);
 
-/* Cached once: MADEIRA_DESKTOP is fixed for a process's lifetime. */
+/* The mode belongs to a session, not to the app process: desktop and direct
+ * launches can alternate without recreating the UIKit host. */
 static int winios_cursor_desktop_mode(void) {
-    static int mode = -1;
-    if (mode < 0) {
-        const char *dm = getenv("MADEIRA_DESKTOP");
-        mode = (dm && *dm == '1') ? 1 : 0;
-    }
+    static int legacy = -1, reported = -1;
+    const char *dm = getenv("MADEIRA_DESKTOP");
+    int mode = dm && *dm == '1', unset = -1;
+    if (__atomic_load_n(&legacy, __ATOMIC_RELAXED) < 0)
+        __atomic_compare_exchange_n(&legacy, &unset, mode, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+    const char *value = getenv("MADEIRA_CURSOR_SESSION_MODE");
+    if (value && !strcmp(value, "0")) return __atomic_load_n(&legacy, __ATOMIC_RELAXED);
+    if (__atomic_load_n(&reported, __ATOMIC_RELAXED) != mode &&
+        __atomic_exchange_n(&reported, mode, __ATOMIC_RELAXED) != mode)
+        fprintf(stderr, "[cursor-session] ml1170 desktop=%d\n", mode);
     return mode;
 }
 
@@ -1896,6 +1902,14 @@ static UIImage *winios_cursor_image(void) {
 static int g_cur_w, g_cur_h, g_cur_hx, g_cur_hy;
 static CGPoint g_cursor_pos_px;
 static int g_cursor_pos_seeded;
+
+/* Main-thread only, like placement. Seed a new trackpad gesture from the
+ * last guest position instead of teleporting to the finger's down point. */
+int winios_get_cursor_position(int *x, int *y) {
+    if (!g_cursor_pos_seeded) return 0;
+    *x = (int)g_cursor_pos_px.x; *y = (int)g_cursor_pos_px.y;
+    return 1;
+}
 
 /* ml1090 — WHO DECIDES WHETHER THE POINTER IS ON SCREEN IN A DIRECT LAUNCH.
  *
@@ -1994,15 +2008,19 @@ static void winios_cursor_place(void) {
     CGFloat x = g_cursor_pos_px.x, y = g_cursor_pos_px.y;
     if (!winios_overlay_map_px(x - (g_cur_w > 0 ? g_cur_hx : 0),
                                y - (g_cur_w > 0 ? g_cur_hy : 0), &pos, &s)) return;
-    /* Cursor GLYPH never shrinks past 1x (spec) even when the scale is < 1 on
-     * a small live-view column, but the drawn POSITION still uses the true,
-     * unclamped scale — or the arrow would drift off its real hotspot as
-     * the gap between "where it should be" and "how big it is drawn"
-     * grows. A few points of hotspot slop on a heavily shrunk view is the
-     * accepted trade for the glyph staying visible at all. */
+    /* Match the same guest-pixel transform as the surface and hotspot. The
+     * previous 1-point minimum drew a 32px cursor at 32pt even in a 0.3x
+     * letterbox, which also separated its visible tip from its click point. */
     if (g_cur_w > 0) {
-        CGFloat imgScale = MAX(1.0, MIN(s.width, s.height));
-        g_cursor_layer.bounds = CGRectMake(0, 0, g_cur_w * imgScale, g_cur_h * imgScale);
+        static int exact = -1;
+        if (exact < 0) {
+            const char *value = getenv("MADEIRA_CURSOR_SCALE");
+            exact = !value || strcmp(value, "0");
+            fprintf(stderr, "[cursor-scale] ml1170 guest-pixel sizing=%d\n", exact);
+        }
+        CGFloat oldScale = MAX(1.0, MIN(s.width, s.height));
+        g_cursor_layer.bounds = CGRectMake(0, 0, g_cur_w * (exact ? s.width : oldScale),
+                                                g_cur_h * (exact ? s.height : oldScale));
     }
     g_cursor_layer.position = pos;
 }

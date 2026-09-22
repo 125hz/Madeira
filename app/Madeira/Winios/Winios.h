@@ -121,6 +121,7 @@ int winios_desktop_point_from_window(double wx, double wy, int *px, int *py);
  * to import QuartzCore. Swift (MetalBackedView) calls this once, right
  * after registering the same layer with DXMT; pass NULL to clear it. */
 void winios_set_game_layer(void *metal_layer);
+int winios_get_cursor_position(int *x, int *y);
 
 /* ml1090 — publish the rect (view points) the game surface has been LAID OUT
  * to occupy, as opposed to whatever the presented layer's bounds happen to be.

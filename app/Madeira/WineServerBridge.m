@@ -153,6 +153,17 @@ int wineserver_start(const char *prefix_path) {
     }
 
     g_wineserver_should_stop = 0;
+    /* Profiles have already been imported. Refresh both halves together;
+     * never flip the cell protocol underneath a running guest session. */
+    extern int wine_process_is_running(void);
+    const char *reload = getenv("MADEIRA_SESSION_SYNC_RELOAD");
+    if (!wine_process_is_running() && (!reload || strcmp(reload, "0"))) {
+        extern void madeira_fast_reload_session(void);
+        extern void madeira_fastsync_reload_session(void);
+        madeira_fast_reload_session();
+        madeira_fastsync_reload_session();
+        wine_log_msg("[session-policy] ml1170 synchronization settings refreshed before launch");
+    }
     __atomic_store_n(&g_wineserver_session_stop, 0, __ATOMIC_RELEASE);
     g_wineserver_running = 1;
 

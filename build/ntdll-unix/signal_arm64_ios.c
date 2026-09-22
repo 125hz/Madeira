@@ -9374,6 +9374,37 @@ static void ios_dump_guest_frame( ucontext_t *context, ULONG_PTR wow_base )
             dprintf( 2, "[guest-frame]   teb32=guest 0x%08x fs:[0xC0]=0x%08x (WOW32Reserved) "
                         "ClientId=%x/%x\n",
                      (uint32_t)g, wow32res, clientid[0], clientid[1] );
+            /* A failed execute fault can recurse through a bad SEH chain.
+             * Capture it at the first fault, before recursive dispatch hides
+             * the original guest context. Read through Mach, never dereference
+             * guest pointers from a host exception handler. This dump already
+             * has a four-fault cap; bound the chain independently as well. */
+            const char *seh = getenv( "MADEIRA_GUEST_SEH" );
+            if (!seh || strcmp( seh, "0" ))
+            {
+                uint32_t link, seen[4];
+                unsigned depth;
+                if (ios_guest_read( wow_base, g, &link, sizeof(link) ))
+                {
+                    dprintf( 2, "[guest-seh] ml1170 head=%08x\n", link );
+                    for (depth = 0; depth < 4 && link != 0xffffffff; depth++)
+                    {
+                        uint32_t pair[2];
+                        unsigned j;
+                        for (j = 0; j < depth && seen[j] != link; j++);
+                        if (j != depth || link > 0xfffffff7 ||
+                            !ios_guest_read( wow_base, link, pair, sizeof(pair) ))
+                        {
+                            dprintf( 2, "[guest-seh] ml1170 unreadable or repeated link=%08x\n", link );
+                            break;
+                        }
+                        seen[depth] = link;
+                        dprintf( 2, "[guest-seh] ml1170 depth=%u record=%08x next=%08x handler=%08x%c\n",
+                                 depth, link, pair[0], pair[1], ios_guest_class( wow_base, pair[1] ));
+                        link = pair[0];
+                    }
+                }
+            }
         }
         else
             dprintf( 2, "[guest-frame]   teb32=%p is not inside this window — fs:[0xC0] not read\n",

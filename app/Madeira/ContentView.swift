@@ -999,6 +999,11 @@ final class MetalBackedView: UIView {
     private let F_MDOWN: UInt32 = 0x20, F_MUP: UInt32 = 0x40
     private let F_WHEEL: UInt32 = 0x800, F_ABS: UInt32 = 0x8000
 
+    private static let unifiedPointer = LibraryFlags.enabled("MADEIRA_POINTER_UNIFIED")
+    private static var reportedUnifiedPointer = false
+    private var trackpadMode: Bool {
+        desktopMode || (Self.unifiedPointer && !touchPointerMode && !InputSettings.shared.relative)
+    }
     private var desktopMode: Bool {
         guard let v = getenv("MADEIRA_DESKTOP") else { return false }
         return v.pointee == 49  // '1'
@@ -1374,7 +1379,7 @@ final class MetalBackedView: UIView {
             touchModeBegan(touches)
             return
         }
-        guard desktopMode else {
+        guard trackpadMode else {
             // Task 2 — "Touch" pointer mode has its own multi-finger state
             // machine (tap/hold/2-3-finger tap), independent of the single-
             // owner `gameTouch` path below.
@@ -1421,6 +1426,14 @@ final class MetalBackedView: UIView {
         }
         guard let t = touches.first else { return }
         let p = t.location(in: self)
+        if Self.unifiedPointer && !desktopMode {
+            var x: Int32 = 0, y: Int32 = 0
+            if winios_get_cursor_position(&x, &y) != 0 { Self.cursor = CGPoint(x: CGFloat(x), y: CGFloat(y)) }
+            if !Self.reportedUnifiedPointer {
+                Self.reportedUnifiedPointer = true
+                fputs("[pointer-routing] ml1170 direct absolute mode uses trackpad motion\n", stderr)
+            }
+        }
         touchStartPoint = p
         lastPanPoint = p
         touchStartTime = now
@@ -1456,7 +1469,7 @@ final class MetalBackedView: UIView {
             touchModeMoved(touches, event)
             return
         }
-        guard desktopMode else {
+        guard trackpadMode else {
             if touchPointerMode {
                 touchModeMoved(touches, event)
                 return
@@ -1529,8 +1542,10 @@ final class MetalBackedView: UIView {
         }
 
         let sens = CGFloat(InputSettings.shared.sensAbs)   // desktop px per view pt
-        let maxX = CGFloat(envInt("MADEIRA_SCREEN_W", 1024) - 1)
-        let maxY = CGFloat(envInt("MADEIRA_SCREEN_H", 768) - 1)
+        var screenW: Int32 = 1280, screenH: Int32 = 720
+        winios_screen_size(&screenW, &screenH)
+        let maxX = CGFloat(max(1, screenW) - 1)
+        let maxY = CGFloat(max(1, screenH) - 1)
         Self.cursor.x = min(max(Self.cursor.x + dx * sens, 0), maxX)
         Self.cursor.y = min(max(Self.cursor.y + dy * sens, 0), maxY)
         postPointer(F_MOVE | F_ABS)
@@ -1543,7 +1558,7 @@ final class MetalBackedView: UIView {
             touchModeEnded(touches, event)
             return
         }
-        guard desktopMode else {
+        guard trackpadMode else {
             if touchPointerMode {
                 touchModeEnded(touches, event)
                 return
@@ -1612,7 +1627,7 @@ final class MetalBackedView: UIView {
             touchModeCancelled(touches)
             return
         }
-        guard desktopMode else {
+        guard trackpadMode else {
             if touchPointerMode {
                 touchModeCancelled(touches)
                 return

@@ -108,6 +108,8 @@ struct LibraryEntry: Codable, Identifiable {
     var controls: [TouchControl]?
     var lastPlayed: Date?
     var graphicsAPI: String?
+    var folderBytes: Int64?
+    var metadataChecked: Date?
     var overlayFields: [String]?
     var semaphoreFastPath: Bool?
     var desktop: Bool?
@@ -140,7 +142,7 @@ struct LibraryEntry: Codable, Identifiable {
         configureLaunch()
         setenv("FEX_X87REDUCEDPRECISION", reducedX87 ? "1" : "0", 1)
         setenv("MADEIRA_FASTSYNC", fastSync ? "auto" : "0", 1)
-        if let semaphoreFastPath { setenv("MADEIRA_FASTSYNC_SEM", semaphoreFastPath ? "1" : "0", 1) }
+        setenv("MADEIRA_FASTSYNC_SEM", semaphoreFastPath == true ? "1" : "0", 1)
         setenv("MADEIRA_EXTENDED_MODES", extendedModes ? "1" : "0", 1)
         GuestDisplay.configureSessionDefault(view: CGSize(width: 1280, height: 720), knob: resolution)
         madeira_set_vsync_locked(Int32(fpsMode))
@@ -178,6 +180,7 @@ final class LibraryModel: ObservableObject {
     private var timer: Timer?
     private var sawProcess = false
     private var readOnly = false
+    private var metadataInFlight = Set<UUID>()
     private var savedControls: [TouchControl] = []
     private var savedVisible = true
     private var savedSize = 1.0
@@ -214,8 +217,15 @@ final class LibraryModel: ObservableObject {
     func save(_ entry: LibraryEntry) {
         guard !readOnly else { error = "The library file could not be read. Preserve or repair it before making changes."; return }
         var next = entries
-        if let i = next.firstIndex(where: { $0.id == entry.id }) { next[i] = entry }
-        else { next.append(entry) }
+        var entry = entry
+        if let i = next.firstIndex(where: { $0.id == entry.id }) {
+            // A details sheet may predate an asynchronous metadata refresh.
+            if (next[i].metadataChecked ?? .distantPast) > (entry.metadataChecked ?? .distantPast) {
+                entry.folderBytes = next[i].folderBytes; entry.graphicsAPI = next[i].graphicsAPI
+                entry.metadataChecked = next[i].metadataChecked
+            }
+            next[i] = entry
+        } else { next.append(entry) }
         persist(next)
     }
     func remove(_ id: UUID) { persist(entries.filter { $0.id != id }) }
@@ -226,6 +236,21 @@ final class LibraryModel: ObservableObject {
             try encoder.encode(Document(version: 1, entries: next)).write(to: file, options: .atomic)
             entries = next
         } catch { self.error = "Could not save the library: " + error.localizedDescription }
+    }
+
+    @MainActor
+    func refreshMetadata(_ id: UUID) async {
+        guard !metadataInFlight.contains(id), let entry = entries.first(where: { $0.id == id }), entry.desktop != true,
+              Date().timeIntervalSince(entry.metadataChecked ?? .distantPast) > 86400,
+              let url = try? Self.executable(entry.relativePath) else { return }
+        metadataInFlight.insert(id)
+        defer { metadataInFlight.remove(id) }
+        let result = await LibraryMetadataScanner.shared.scan(url, drive: Self.drive)
+        guard !Task.isCancelled, var updated = entries.first(where: { $0.id == id }) else { return }
+        updated.folderBytes = result.bytes
+        if let api = result.api { updated.graphicsAPI = api }
+        updated.metadataChecked = Date(); save(updated)
+        fputs("[library-metadata] ml1170 folder scan complete api=\(updated.graphicsAPI ?? "unknown") bytes=\(result.bytes ?? -1)\n", stderr)
     }
 
     static func executable(_ relative: String) throws -> URL {
@@ -258,8 +283,27 @@ final class LibraryModel: ObservableObject {
     }
 
     // Read the PE import directory, rather than guessing from the executable's name.
+    static func apiNames(_ imports: [String]) -> Set<String> {
+        var levels = Set<String>()
+        for name in imports {
+            switch name {
+            case "d3d9.dll": levels.insert("D3D9")
+            case "d3d10.dll", "d3d10_1.dll": levels.insert("D3D10")
+            case "d3d11.dll": levels.insert("D3D11")
+            case "d3d12.dll": levels.insert("D3D12")
+            case "opengl32.dll": levels.insert("OpenGL")
+            case "vulkan-1.dll": levels.insert("Vulkan")
+            default: break
+            }
+        }
+        return levels
+    }
     static func graphicsImports(_ url: URL) -> String? {
-        guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
+        let levels = apiNames(importNames(url))
+        return levels.isEmpty ? nil : levels.sorted().joined(separator: " / ")
+    }
+    static func importNames(_ url: URL) -> [String] {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return [] }
         defer { try? h.close() }
         func read(_ offset: UInt64, _ count: Int) -> Data {
             do { try h.seek(toOffset: offset); return try h.read(upToCount: count) ?? Data() } catch { return Data() }
@@ -268,13 +312,16 @@ final class LibraryModel: ObservableObject {
             guard offset >= 0, offset + 4 <= data.count else { return 0 }
             return (0..<4).reduce(0) { $0 | UInt32(data[offset + $1]) << ($1 * 8) }
         }
-        let dos = read(0, 64); guard dos.count == 64 else { return nil }
-        let base = UInt64(u32(dos, 60)); guard base < 16 * 1024 * 1024 else { return nil }
-        let header = read(base, 264); guard header.count >= 144 else { return nil }
+        let dos = read(0, 64); guard dos.count == 64, dos[0] == 0x4d, dos[1] == 0x5a else { return [] }
+        let base = UInt64(u32(dos, 60)); guard base < 16 * 1024 * 1024 else { return [] }
+        let header = read(base, 264); guard header.count == 264, u32(header, 0) == 0x4550 else { return [] }
         let sections = Int(header[6]) | Int(header[7]) << 8
         let optSize = Int(header[20]) | Int(header[21]) << 8
-        guard sections <= 96, optSize >= 120 else { return nil }
-        let imports = u32(header, header[24] == 0x0b && header[25] == 2 ? 144 : 128)
+        guard sections <= 96, optSize >= 120 else { return [] }
+        let pe64 = header[24] == 0x0b && header[25] == 2
+        guard header[24] == 0x0b, header[25] == 1 || pe64 else { return [] }
+        let imports = u32(header, pe64 ? 144 : 128)
+        let delayed = optSize >= (pe64 ? 224 : 208) ? u32(header, pe64 ? 240 : 224) : 0
         let table = read(base + 24 + UInt64(optSize), sections * 40)
         func fileOffset(_ rva: UInt32) -> UInt64? {
             guard table.count == sections * 40 else { return nil }
@@ -284,25 +331,25 @@ final class LibraryModel: ObservableObject {
             }
             return nil
         }
-        guard imports != 0, let start = fileOffset(imports) else { return nil }
-        var levels = Set<String>()
-        for i in 0..<256 {
-            let descriptor = read(start + UInt64(i * 20), 20)
-            guard descriptor.count == 20 else { break }
-            let nameRVA = u32(descriptor, 12); if nameRVA == 0 { break }
-            guard let offset = fileOffset(nameRVA) else { continue }
-            let data = read(offset, 128)
-            let name = String(decoding: data.prefix(while: { $0 != 0 }), as: UTF8.self).lowercased()
-            switch name {
-            case "d3d9.dll": levels.insert("D3D9")
-            case "d3d10.dll", "d3d10_1.dll": levels.insert("D3D10")
-            case "d3d11.dll": levels.insert("D3D11")
-            case "d3d12.dll": levels.insert("D3D12")
-            case "opengl32.dll": levels.insert("OpenGL")
-            default: break
+        var names: [String] = []
+        for (rva, stride, nameField) in [(imports, 20, 12), (delayed, 32, 4)] {
+            guard rva != 0, let start = fileOffset(rva) else { continue }
+            for i in 0..<256 {
+                let descriptor = read(start + UInt64(i * stride), stride)
+                guard descriptor.count == stride else { break }
+                var nameRVA = u32(descriptor, nameField); if nameRVA == 0 { break }
+                if stride == 32 && u32(descriptor, 0) & 1 == 0 {
+                    let imageBase = u32(header, 52)
+                    guard !pe64, nameRVA >= imageBase else { continue }
+                    nameRVA -= imageBase
+                }
+                guard let offset = fileOffset(nameRVA) else { continue }
+                let data = read(offset, 128)
+                let name = String(decoding: data.prefix(while: { $0 != 0 }), as: UTF8.self).lowercased()
+                names.append(name)
             }
         }
-        return levels.isEmpty ? nil : levels.sorted().joined(separator: " / ")
+        return names
     }
 
     func begin(_ entry: LibraryEntry) {
@@ -435,6 +482,71 @@ enum SteamCatalog {
     static func cover(_ id: Int) -> URL? { URL(string: "https://cdn.cloudflare.steamstatic.com/steam/apps/\(id)/library_600x900.jpg") }
 }
 
+// Serialized off the main actor. Cancellation follows the card's SwiftUI task,
+// so entering a session stops directory work instead of competing with it.
+private actor LibraryMetadataScanner {
+    static let shared = LibraryMetadataScanner()
+    func scan(_ executable: URL, drive: URL) -> (bytes: Int64?, api: String?) {
+        let folder = executable.deletingLastPathComponent()
+        guard folder.path.hasPrefix(drive.path + "/"), !Task.isCancelled else { return (nil, nil) }
+        let manager = FileManager.default
+        var complete = true
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+        let walker = manager.enumerator(at: folder, includingPropertiesForKeys: Array(keys), options: [], errorHandler: { _, _ in complete = false; return true })
+        var bytes: Int64 = 0
+        var files = 0
+        while let file = walker?.nextObject() as? URL {
+            if Task.isCancelled { return (nil, nil) }
+            files += 1
+            if files > 200_000 { complete = false; break }
+            guard let values = try? file.resourceValues(forKeys: keys) else { complete = false; continue }
+            if values.isSymbolicLink == true { walker?.skipDescendants(); continue }
+            if values.isRegularFile == true { bytes += Int64(values.fileSize ?? 0) }
+        }
+        // Engines often import graphics through a local DLL. Follow only their
+        // actual import graph, case-insensitively, never every DLL in drive_c.
+        let siblings = (try? manager.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+        var local: [String: URL] = [:]
+        for file in siblings where file.pathExtension.lowercased() == "dll" {
+            if file.resolvingSymlinksInPath().path.hasPrefix(drive.path + "/") { local[file.lastPathComponent.lowercased()] = file }
+        }
+        var pending = [executable], visited = Set<String>(), apis = Set<String>()
+        while let file = pending.popLast(), visited.count < 64, !Task.isCancelled {
+            if !visited.insert(file.path).inserted { continue }
+            let imports = LibraryModel.importNames(file)
+            apis.formUnion(LibraryModel.apiNames(imports))
+            for name in imports { if let dependency = local[name], !visited.contains(dependency.path) { pending.append(dependency) } }
+        }
+        return (complete && walker != nil ? bytes : nil, apis.isEmpty ? nil : apis.sorted().joined(separator: "/"))
+    }
+}
+
+// UIKit owns the entire hit region and tracking sequence. No SwiftUI button
+// gaps: hold and slide across the native segments to change tabs.
+private struct LibraryTabControl: UIViewRepresentable {
+    @Binding var selection: Int
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+    func makeUIView(context: Context) -> UISegmentedControl {
+        let control = UISegmentedControl(items: [UIImage(systemName: "square.grid.2x2.fill")!, UIImage(systemName: "gearshape.fill")!])
+        control.accessibilityLabel = "Library and Settings"
+        control.setWidth(80, forSegmentAt: 0); control.setWidth(80, forSegmentAt: 1)
+        control.addTarget(context.coordinator, action: #selector(Coordinator.changed(_:)), for: .valueChanged)
+        control.selectedSegmentTintColor = UIColor.systemBlue.withAlphaComponent(0.18)
+        control.selectedSegmentIndex = selection
+        return control
+    }
+    func updateUIView(_ control: UISegmentedControl, context: Context) {
+        context.coordinator.parent = self
+        control.selectedSegmentIndex = selection
+        control.accessibilityValue = selection == 0 ? "Library" : "Settings"
+    }
+    final class Coordinator: NSObject {
+        var parent: LibraryTabControl
+        init(_ parent: LibraryTabControl) { self.parent = parent }
+        @objc func changed(_ control: UISegmentedControl) { parent.selection = control.selectedSegmentIndex }
+    }
+}
+
 struct LibraryArtwork: View {
     let entry: LibraryEntry
     var backdrop = false
@@ -459,10 +571,19 @@ struct LibraryArtwork: View {
 struct LibraryBadges: View {
     let entry: LibraryEntry
     var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 4) { format; size }
+            VStack(alignment: .leading, spacing: 4) { format; size }
+        }
+    }
+    private var format: some View {
         HStack(spacing: 4) {
             badge("\(entry.bits)-bit")
-            badge(entry.graphicsAPI ?? "API auto")
+            if let api = entry.graphicsAPI { badge(api) }
         }
+    }
+    @ViewBuilder private var size: some View {
+        if let bytes = entry.folderBytes { badge(String(format: bytes < 1_000_000_000 ? "%.2f GB" : "%.1f GB", Double(bytes) / 1_000_000_000)) }
     }
     private func badge(_ text: String) -> some View {
         Text(text).font(.caption2.weight(.medium)).lineLimit(1).minimumScaleFactor(0.8)
@@ -499,9 +620,18 @@ struct LibraryView: View {
     @ObservedObject private var input = InputSettings.shared
     @State private var tab = 0
     @AppStorage("madeiraLibraryLayout") private var layout = "cards"
+    @AppStorage("madeiraLibrarySort") private var sort = "played"
+    private let refinements = LibraryFlags.enabled("MADEIRA_LIBRARY_REFINEMENTS")
     private let layoutsEnabled = LibraryFlags.enabled("MADEIRA_LIBRARY_LAYOUTS")
     private var entries: [LibraryEntry] {
-        model.entries.filter { $0.desktop != true && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)) }
+        let visible = model.entries.filter { $0.desktop != true && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)) }
+        guard refinements else { return visible }
+        if sort == "added" { return visible.reversed() }
+        return visible.sorted {
+            if sort == "played", $0.lastPlayed != $1.lastPlayed { return ($0.lastPlayed ?? .distantPast) > ($1.lastPlayed ?? .distantPast) }
+            if sort == "size", $0.folderBytes != $1.folderBytes { return ($0.folderBytes ?? -1) > ($1.folderBytes ?? -1) }
+            return $0.title.localizedStandardCompare($1.title) == .orderedAscending
+        }
     }
     var body: some View {
         Group {
@@ -509,12 +639,19 @@ struct LibraryView: View {
         }
         .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            HStack(spacing: 4) {
-                tabButton("Library", symbol: "square.grid.2x2.fill", index: 0)
-                tabButton("Settings", symbol: "gearshape.fill", index: 1)
-            }.padding(5).modifier(LibraryPillGlass()).padding(.bottom, 5).padding(.top, 8)
+            Group {
+                if refinements {
+                    LibraryTabControl(selection: $tab).frame(width: 160, height: 52)
+                        .modifier(LibraryPillGlass())
+                } else {
+                    HStack(spacing: 4) {
+                        tabButton("Library", symbol: "square.grid.2x2.fill", index: 0)
+                        tabButton("Settings", symbol: "gearshape.fill", index: 1)
+                    }.padding(5).modifier(LibraryPillGlass())
+                }
+            }.padding(.bottom, 5).padding(.top, 8)
         }
-        .onAppear { fputs("[frontend-layout] ml1160 compact navigation layouts=\(layoutsEnabled ? 1 : 0)\n", stderr) }
+        .onAppear { fputs("[frontend-layout] ml1170 native tabs and metadata=\(refinements ? 1 : 0)\n", stderr) }
         .onReceive(controller.commands) { command in
             if selected == nil, !browser, command == "tab" { tab = 1 - tab }
         }
@@ -535,7 +672,7 @@ struct LibraryView: View {
             }
             Section {
                 Toggle("Extended logging", isOn: $input.diagnostics)
-            } header: { Text("Diagnostics") } footer: { Text("The same diagnostics switch as the bug icon. Enable it when collecting a diagnostic run; it can reduce performance.") }
+            } header: { Text("Diagnostics") }
             Section("Pointer") { LibraryPointerSettings() }
             Section("Controller") {
                 Toggle("Right stick controls mouse", isOn: $input.padRightStickMouse)
@@ -547,6 +684,7 @@ struct LibraryView: View {
         }
     }
     private var library: some View {
+        GeometryReader { viewport in
         ScrollViewReader { reader in
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
@@ -558,11 +696,9 @@ struct LibraryView: View {
                     Spacer()
                 }
                 Button { selected = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry } label: {
-                    HStack(spacing: 16) {
-                        Image(systemName: "desktopcomputer").font(.title2).frame(width: 44, height: 44).background(.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 12))
-                        VStack(alignment: .leading, spacing: 4) { Text("Desktop").font(.headline); Text("Explore your Windows environment").font(.caption).foregroundStyle(.secondary) }
-                        Spacer(); Image(systemName: "chevron.right").foregroundStyle(.secondary)
-                    }.padding(12).background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
+                    Label("Desktop", systemImage: "desktopcomputer")
+                        .font(.subheadline.weight(.medium)).padding(.horizontal, 14).frame(minHeight: 44)
+                        .background(Color(uiColor: .secondarySystemGroupedBackground), in: Capsule())
                 }.buttonStyle(.plain)
                     .id(LibraryEntry.desktopID)
                     .overlay(RoundedRectangle(cornerRadius: 22).stroke(focused == LibraryEntry.desktopID && controller.connected ? Color.cyan : .clear, lineWidth: 3))
@@ -572,15 +708,18 @@ struct LibraryView: View {
                     LazyVStack(spacing: 8) { ForEach(entries) { entry in libraryItem(entry, list: true) } }
                 } else {
                     let compact = layoutsEnabled && layout == "compact"
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: compact ? 98 : 124, maximum: compact ? 115 : 150), spacing: 12, alignment: .top)], alignment: .leading, spacing: 18) {
+                    let width = max(1, min(viewport.size.width, 1100) - 32)
+                    let count = max(1, Int((width + 12) / (compact ? 110 : 154)))
+                    let cardWidth = min(compact ? 115.0 : 164.0, (width - CGFloat(count - 1) * 12) / CGFloat(count))
+                    LazyVGrid(columns: Array(repeating: GridItem(.fixed(cardWidth), spacing: 12, alignment: .top), count: count), alignment: .center, spacing: 18) {
                         ForEach(entries) { entry in libraryItem(entry, list: false) }
-                    }
+                    }.frame(maxWidth: .infinity, alignment: .center)
                 }
             }.padding(16).frame(maxWidth: 1100).frame(maxWidth: .infinity)
         }
         .onReceive(controller.commands) { command in
             guard tab == 0, selected == nil, !browser else { return }
-            let items = [model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry] + model.entries.filter { $0.desktop != true && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)) }
+            let items = [model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry] + entries
             let index = items.firstIndex(where: { $0.id == focused }) ?? 0
             if command == "add" { browser = true }
             else if command == "accept", !items.isEmpty { selected = items[index] }
@@ -599,7 +738,15 @@ struct LibraryView: View {
                             Label("Compact cards", systemImage: "square.grid.3x3").tag("compact")
                             Label("List", systemImage: "list.bullet").tag("list")
                         }
-                    } label: { Label("Library layout", systemImage: "rectangle.grid.1x2") }
+                        if refinements {
+                            Picker("Sort by", selection: $sort) {
+                                Label("Last played", systemImage: "clock").tag("played")
+                                Label("Name", systemImage: "textformat.abc").tag("name")
+                                Label("Recently added", systemImage: "plus").tag("added")
+                                Label("Folder size", systemImage: "internaldrive").tag("size")
+                            }
+                        }
+                    } label: { Label("Library options", systemImage: "line.3.horizontal.decrease") }
                 }
             }
             ToolbarItem(placement: .topBarTrailing) { Button { browser = true } label: { Label("Add executable", systemImage: "plus") } }
@@ -619,6 +766,7 @@ struct LibraryView: View {
         .onAppear { if focused == nil { focused = LibraryEntry.desktopID } }
         .onChange(of: focused) { _, id in
             if let id { withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .easeInOut(duration: 0.2)) { reader.scrollTo(id, anchor: .center) } }
+        }
         }
         }
     }
@@ -643,6 +791,7 @@ struct LibraryView: View {
         }.buttonStyle(.plain)
             .overlay(RoundedRectangle(cornerRadius: 16).stroke(focused == entry.id && controller.connected ? Color.accentColor : .clear, lineWidth: 2))
             .id(entry.id)
+            .task(id: entry.id, priority: .utility) { if refinements { await model.refreshMetadata(entry.id) } }
     }
 }
 
@@ -699,8 +848,16 @@ struct LibraryDetail: View {
                             Button { leaving = true; model.save(entry); play(entry) } label: { HStack(spacing: 10) { Image(systemName: "play.fill"); Text("Play").fontWeight(.semibold) }.frame(minWidth: 100, minHeight: 30) }
                                 .buttonStyle(.borderedProminent).controlSize(.large)
                         }
-                    }.padding(.vertical, 48)
-                        .listRowBackground(Color(uiColor: .secondarySystemGroupedBackground).opacity(0.8))
+                    }.padding(.vertical, 24)
+                        .listRowBackground(
+                            LibraryArtwork(entry: entry, backdrop: true).blur(radius: 10)
+                                .overlay(Color(uiColor: .secondarySystemGroupedBackground).opacity(0.72))
+                                .overlay(alignment: .bottom) {
+                                    LinearGradient(colors: [.clear, Color(uiColor: .secondarySystemGroupedBackground)], startPoint: .top, endPoint: .bottom).frame(height: 70)
+                                }.clipped()
+                        )
+                }
+                Section("Library details") {
                     TextField("Title", text: $entry.title)
                     Button("Find on Steam", systemImage: "magnifyingglass") { findCover = true }
                     Button("Choose cover image", systemImage: "photo") { importCover = true }
@@ -717,10 +874,10 @@ struct LibraryDetail: View {
                 Section {
                     Toggle("Reduced-precision x87", isOn: $entry.reducedX87)
                     Toggle("Fast synchronization", isOn: $entry.fastSync)
-                    Toggle("Fast semaphore waits (experimental)", isOn: Binding(get: { entry.semaphoreFastPath ?? LibraryFlags.enabled("MADEIRA_FASTSYNC_SEM", fallback: false) }, set: { entry.semaphoreFastPath = $0 }))
+                    Toggle("Fast semaphore waits (experimental)", isOn: Binding(get: { entry.semaphoreFastPath ?? false }, set: { entry.semaphoreFastPath = $0 }))
                     TextField("Launch arguments", text: $entry.arguments, axis: .vertical).autocorrectionDisabled().textInputAutocapitalization(.never)
                 } header: { Text("Compatibility & performance") } footer: {
-                    Text("Full x87 precision can improve compatibility at a performance cost. Engine settings apply at launch; restart Madeira before changing them between sessions.")
+                    Text("Full x87 precision can improve compatibility at a performance cost. Synchronization settings apply to the next launch. Full precision changes may still require restarting Madeira.")
                 }
                 Section("On screen") {
                     Toggle("Performance overlay", isOn: $entry.performance)
@@ -733,13 +890,6 @@ struct LibraryDetail: View {
                 Section("Executable") { Text(entry.windowsPath).font(.caption.monospaced()).textSelection(.enabled) }
                 Section { Button("Remove from library", role: .destructive) { remove = true } }
                 if let error { Section { Text(error).foregroundStyle(.red) } }
-            }
-            .scrollContentBackground(.hidden)
-            .background {
-                GeometryReader { geo in
-                    LibraryArtwork(entry: entry, backdrop: true).frame(width: geo.size.width, height: geo.size.height)
-                        .blur(radius: 8).overlay(Color(uiColor: .systemBackground).opacity(0.55))
-                }.ignoresSafeArea()
             }
             .navigationTitle("Game details").navigationBarTitleDisplayMode(.inline)
             .toolbarBackground(.regularMaterial, for: .navigationBar)
@@ -953,10 +1103,10 @@ struct LibraryHUD: View {
                         if model.launchSlow { Button("Show game view") { model.launching = false } }
                     }.frame(width: geo.size.width, height: geo.size.height).foregroundStyle(.white).transition(.opacity)
                 }
-                if model.performance { LibraryFloatingItem(isMenu: false, viewport: geo.size, insets: geo.safeAreaInsets) }
+                if !model.launching && model.performance { LibraryFloatingItem(isMenu: false, viewport: geo.size, insets: geo.safeAreaInsets) }
                 if model.liveLogs { LibraryLiveLogs().frame(maxWidth: 550, maxHeight: 140).padding(.top, geo.safeAreaInsets.top + 60).padding(.horizontal, 12).allowsHitTesting(false) }
                 if !model.sessionMessage.isEmpty { Text(model.sessionMessage).font(.caption).padding(10).background(.regularMaterial, in: Capsule()).frame(maxWidth: .infinity).padding(.top, geo.safeAreaInsets.top + 12).allowsHitTesting(false) }
-                LibraryFloatingItem(isMenu: true, viewport: geo.size, insets: geo.safeAreaInsets)
+                if !model.launching { LibraryFloatingItem(isMenu: true, viewport: geo.size, insets: geo.safeAreaInsets) }
                 if model.menu {
                     Color.black.opacity(0.5).ignoresSafeArea().onTapGesture { model.menu = false }.transition(.opacity)
                     menu.frame(width: min(460, geo.size.width - 32), height: min(650, geo.size.height - geo.safeAreaInsets.top - geo.safeAreaInsets.bottom - 24))
