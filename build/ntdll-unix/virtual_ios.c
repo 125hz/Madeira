@@ -1704,6 +1704,9 @@ static unsigned ios_soft_n;
 #define IOS_CAGE_BASE      0x7200000000ULL
 #define IOS_CAGE_REAL_SIZE 0x1ffff0000ULL   /* 8GB - 64KB */
 static int ios_cage_holdback_live;
+/* Set only after the lower window is carved. The unregistered PROT_NONE
+ * remainder stays ours; the original whole-cage grant is then disabled. */
+static int ios_cage_window_tail_live;
 
 static int ios_soft_find( uint64_t addr )
 {
@@ -7808,7 +7811,8 @@ ULONG_PTR ios_wow_candidate_slot(void)
  * that only a CEF session ever asks for.  0x7300000000 is NOT a third
  * candidate: its top 64 KB is the PA guard pool's home base, which is exactly
  * where the furniture ceiling stops, so cand + 4 GB > ceil and no amount of
- * cage-trading makes it usable.  Two windows is what this address space has.
+ * cage-trading alone makes it usable. ml1230 can extend the held remainder
+ * into that last 64 KB plus an overrun guard, but only if both are still free.
  *
  * THE TRADE, and why it is taken only here.  This runs from
  * ios_wow_window_pick() AFTER every ordinary candidate has been refused, and
@@ -7898,6 +7902,7 @@ static ULONG_PTR ios_wow_carve_holdback_slots(void)
     if (made)
     {
         ios_cage_holdback_live = 0;
+        ios_cage_window_tail_live = 1;
         ERR( "[cage] holdback TRADED for %u guest-window slot(s): the 8GB V8/cppgc reservation can "
              "no longer be granted from 0x%llx (it is no longer contiguous, and the grant path "
              "munmaps the whole range). A CEF session and concurrent 32-bit pseudo-processes cannot "
@@ -7906,6 +7911,62 @@ static ULONG_PTR ios_wow_carve_holdback_slots(void)
              made, (unsigned long long)IOS_CAGE_BASE );
     }
     return first;
+}
+
+/* ml1230: a launcher -> helper -> application chain needs a THIRD window.
+ * Keep the original session window intact: shared native state can still
+ * reference its PEB after its guest exits. Instead finish the held upper
+ * half of the cage, [0x7300000000,0x73ffff0000), on demand.
+ *
+ * The missing 64 KB and the FB3 guard are acquired together with tryfixed,
+ * which refuses existing mappings (including a previously granted PA pool).
+ * The remainder was never a Wine reserved area, so ordinary views cannot
+ * consume it. No existing mapping is replaced or unmapped here. After the
+ * acquisition, register the contiguous PROT_NONE range as a placeholder;
+ * normal adoption, window exclusions, guest-floor rules and deferred release
+ * apply. The previous window's borrowed guard remains below our guest floor.
+ * This trades the first PA pool slot only when another 32-bit process needs
+ * it; it never touches the FEX band. Called with ios_wow_mutex held. */
+static ULONG_PTR ios_wow_extend_holdback_tail( unsigned *guard_owned )
+{
+    const ULONG_PTR held_end = IOS_CAGE_BASE + IOS_CAGE_REAL_SIZE;
+    const ULONG_PTR base = held_end & ~(IOS_WOW_WINDOW_SIZE - 1);
+    const ULONG_PTR end = base + IOS_WOW_WINDOW_SIZE;
+    ULONG_PTR guard = ios_wow_guard_size();
+    const char *policy = getenv( "MADEIRA_WOW_EXTRA_WINDOW" );
+    struct ios_wow_placeholder *ph;
+
+    if (policy && !strcmp( policy, "0" ))
+    {
+        dprintf( 2, "[wow-capacity] ml1230 extra window disabled\n" );
+        return 0;
+    }
+    if (ios_wow_slot_at_base( base )) return 0;
+    /* A released extra window keeps its placeholder. Adopt it again through
+     * the same checks as an ordinary window, without extending twice. */
+    if ((ph = ios_wow_placeholder_find( base )))
+        return !ph->adopted && ios_wow_window_try( base, guard_owned ) ? base : 0;
+    if (!ios_cage_window_tail_live || ios_cage_holdback_live ||
+        ios_wow_placeholder_count >= IOS_WOW_MAX_WINDOWS) return 0;
+    if (anon_mmap_tryfixed( (void *)held_end, end - held_end + guard,
+                            PROT_NONE, MAP_NORESERVE ) == MAP_FAILED)
+    {
+        dprintf( 2, "[wow-capacity] ml1230 extra window unavailable: tail=%p size=0x%llx errno=%d\n",
+                 (void *)held_end, (unsigned long long)(end - held_end + guard), errno );
+        return 0;
+    }
+    /* The guard remains a raw host reservation, NOT allocatable Wine space.
+     * Otherwise map_fixed_area could consume it for a later PA pool reserve.
+     * Its no-clobber attempt outside the registered window must fail instead. */
+    mmap_add_reserved_area( (void *)base, IOS_WOW_WINDOW_SIZE );
+    ph = &ios_wow_placeholders[ios_wow_placeholder_count++];
+    ph->base = base;
+    ph->guard_owned = 1;
+    ph->adopted = 0;
+    ios_cage_window_tail_live = 0;
+    dprintf( 2, "[wow-capacity] ml1230 extended held tail: B=%p end=%p guard=0x%llx; prior windows preserved\n",
+             (void *)base, (void *)end, (unsigned long long)guard );
+    return ios_wow_window_try( base, guard_owned ) ? base : 0;
 }
 
 static ULONG_PTR ios_wow_window_pick( unsigned *guard_owned )
@@ -7938,6 +7999,7 @@ static ULONG_PTR ios_wow_window_pick( unsigned *guard_owned )
      * and why it is decided here and not at session start. */
     if ((cand = ios_wow_carve_holdback_slots()) && ios_wow_window_try( cand, guard_owned ))
         return cand;
+    if ((cand = ios_wow_extend_holdback_tail( guard_owned ))) return cand;
 
     ERR( "[wow-window] no free 4GB-ALIGNED slot in [%p,%p) — a 32-bit process "
          "cannot start (misaligned windows are not allowed, and a slot whose "

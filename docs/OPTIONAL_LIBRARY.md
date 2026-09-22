@@ -290,3 +290,13 @@ record the same scene after warm-up, and send the full saved log. Relevant tags:
   loaded before the parent exit triggers premature server shutdown. The new
   handoff passes host lifecycle checks; successful child startup needs a device
   retest.
+
+- Nested 32-bit launchers (ml1230): if both normal guest windows are occupied,
+  Madeira can complete the unused upper half of its held address reservation
+  into a third window. It acquires the missing 64 KB and overrun guard only
+  when that space is free; existing mappings and the original session PEB
+  remain intact. A previously allocated large pool can prevent this extension.
+  `MADEIRA_WOW_EXTRA_WINDOW=0` disables it. `[wow-capacity] ml1230` reports the
+  extension or why it failed. Log 140 proves that the third process previously
+  failed its address-space reservation before loading its executable. The host
+  allocator checks pass; successful game startup remains a device test.
