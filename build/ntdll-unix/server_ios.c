@@ -712,8 +712,148 @@ static void ios_thread_sampler_pass(int burst)
     vm_deallocate(mach_task_self(), (vm_address_t)tlist, tcount * sizeof(*tlist));
 }
 
+/* ml979: is the guest looping tightly, or grinding forward slowly?
+ *
+ * rdr48/rdr49 plateau with four guest threads at ~35% CPU each, all with RIPs
+ * inside EMP.dll's obfuscation VM, while every other signal is frozen: the
+ * sub-floor counter stops dead, memory is flat, and there is no I/O. That is
+ * either a small hot loop waiting for a condition that never becomes true, or
+ * a slow sweep that is genuinely progressing. Those need completely different
+ * responses, and the existing ml876 sampler cannot tell them apart -- it takes
+ * 4 samples 250 ms apart every 20 s, which yielded 3 distinct RIPs across an
+ * entire 15-minute run.
+ *
+ * So take a proper profile: many samples, close together, bucketed. A tight
+ * loop concentrates in a handful of buckets; a sweep spreads across many and
+ * the SPAN between the lowest and highest RIP grows between profiles.
+ *
+ * Deliberately does NOT suspend the threads -- we want them running, and a
+ * sampling profiler tolerates the occasional torn read. Ports and the thread
+ * array are released every pass; at 200 passes a leak here would exhaust the
+ * port table. */
+#define ML979_PASSES  200
+#define ML979_BUCKETS 32
+#define ML979_GRAIN   0x40ull        /* 64-byte buckets */
+#define ML979_MAXTHREADS 12          /* guest threads tracked per profile */
+
+static void ios_guest_rip_profile( int gen )
+{
+    extern uint64_t ios_native_rip_from_hostpc( uint64_t, uint64_t, const char ** );
+    struct { uint64_t base; unsigned n; } b[ML979_BUCKETS];
+    mach_port_t self_port = pthread_mach_thread_np( pthread_self() );
+    uint64_t lo = ~0ull, hi = 0;
+    unsigned total = 0, distinct = 0, dropped = 0;
+    int nb = 0, pass, i;
+    thread_act_t tg[ML979_MAXTHREADS];
+    int ntg = 0;
+
+    /* ml980 FIX: the state read MUST be bracketed by thread_suspend/resume.
+     *
+     * The first cut skipped it on the theory that a sampling profiler tolerates
+     * torn reads. On Darwin that is simply wrong -- thread_get_state on a
+     * thread that is not suspended does not reliably return its registers, and
+     * the sampler immediately above this function has always suspended for
+     * exactly that reason. Result: 3 profiles x 200 passes resolved ZERO guest
+     * RIPs and printed nothing at all (rdr50: 9 bursts, 0 rip-profile lines).
+     *
+     * Suspending every thread 200 times would be far too heavy (~40 threads),
+     * so identify the guest threads ONCE per profile and then sample only those.
+     * A guest thread is one whose x28 points at a readable FEX CpuStateFrame,
+     * which is the same test the ml876 sampler uses. */
+    {
+        thread_act_array_t tl; mach_msg_type_number_t tc; unsigned k;
+        if (task_threads( mach_task_self(), &tl, &tc ) != KERN_SUCCESS) return;
+        for (k = 0; k < tc && ntg < ML979_MAXTHREADS; k++) {
+            arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+            uint64_t bb = 0;
+            if (tl[k] == self_port) continue;
+            if (thread_suspend( tl[k] ) != KERN_SUCCESS) continue;
+            /* ml981: a guest thread is one whose frame yields a plausible RIP at
+             * x28+0x18 -- the same test the sampling loop uses, so a thread can
+             * never be selected here and then fail to resolve below. */
+            if (thread_get_state( tl[k], ARM_THREAD_STATE64, (thread_state_t)&st, &cnt ) == KERN_SUCCESS
+                && ios_ts_read( st.__x[28] + 0x18, &bb, 8 )
+                && bb > 0x10000 && bb < 0x8000000000ull)
+            {
+                tg[ntg] = tl[k];
+                mach_port_mod_refs( mach_task_self(), tl[k], MACH_PORT_RIGHT_SEND, 1 ); /* keep it */
+                ntg++;
+            }
+            thread_resume( tl[k] );
+        }
+        for (k = 0; k < tc; k++) mach_port_deallocate( mach_task_self(), tl[k] );
+        vm_deallocate( mach_task_self(), (vm_address_t)tl, tc * sizeof(*tl) );
+    }
+    if (!ntg) {
+        wine_log_write( "[rip-profile] ml981 gen=%d: no guest threads found (no plausible RIP at x28+0x18)", gen );
+        return;
+    }
+
+    memset( b, 0, sizeof(b) );
+    for (pass = 0; pass < ML979_PASSES; pass++) {
+        int t;
+        for (t = 0; t < ntg; t++) {
+            arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+            uint64_t bb = 0, rip; const char *why = "";
+            if (thread_suspend( tg[t] ) != KERN_SUCCESS) continue;
+            /* ml981: read the guest RIP DIRECTLY out of the FEX frame, not via
+             * ios_native_rip_from_hostpc().
+             *
+             * That helper infers the guest RIP from the HOST pc plus block
+             * metadata, which only works when the pc happens to sit inside a
+             * block whose tail is intact -- at arbitrary sampling points it is
+             * usually in a dispatcher or thunk instead, and it returns 0 with
+             * reasons like "hostPC outside block". ml980 measured that directly:
+             * 6 profiles found 2-3 guest threads each and resolved ZERO RIPs.
+             * The ml876 sampler has the same weakness (2 resolutions in an
+             * entire run), which is why the earlier data was so sparse.
+             *
+             * The SEGV handler does not infer: it reads the frame, whose layout
+             * it documents as "+0x18 rip, then gregs[0..15]". Do the same -- one
+             * 8-byte read at x28+0x18 is authoritative wherever the host pc is. */
+            if (thread_get_state( tg[t], ARM_THREAD_STATE64, (thread_state_t)&st, &cnt ) == KERN_SUCCESS
+                && ios_ts_read( st.__x[28] + 0x18, &bb, 8 )
+                && (rip = bb) > 0x10000 && rip < 0x8000000000ull)
+            {
+                total++;
+                if (rip < lo) lo = rip;
+                if (rip > hi) hi = rip;
+                for (i = 0; i < nb; i++) if (b[i].base == (rip & ~(ML979_GRAIN - 1))) { b[i].n++; break; }
+                if (i == nb) {
+                    if (nb < ML979_BUCKETS) { b[nb].base = rip & ~(ML979_GRAIN - 1); b[nb].n = 1; nb++; distinct++; }
+                    else dropped++;
+                }
+            }
+            thread_resume( tg[t] );
+        }
+        usleep( 5000 );                       /* 200 x 5ms = ~1s of profiling */
+    }
+    for (i = 0; i < ntg; i++) mach_port_deallocate( mach_task_self(), tg[i] );
+    if (!total) {
+        wine_log_write( "[rip-profile] ml981 gen=%d: %d guest thread(s) but no RIP resolved", gen, ntg );
+        return;
+    }
+
+    /* crude descending sort, tiny N */
+    for (i = 0; i < nb; i++) { int j, m = i; for (j = i + 1; j < nb; j++) if (b[j].n > b[m].n) m = j;
+        if (m != i) { uint64_t tb = b[i].base; unsigned tn = b[i].n; b[i] = b[m]; b[m].base = tb; b[m].n = tn; } }
+
+    {
+        char line[900]; int n;
+        n = snprintf( line, sizeof(line),
+                      "[rip-profile] ml981 gen=%d threads=%d samples=%u buckets=%u%s span=0x%llx [%#llx..%#llx] top:",
+                      gen, ntg, total, distinct, dropped ? "(+overflow)" : "",
+                      (unsigned long long)(hi - lo), (unsigned long long)lo, (unsigned long long)hi );
+        for (i = 0; i < nb && i < 8 && n < (int)sizeof(line) - 60; i++)
+            n += snprintf( line + n, sizeof(line) - n, " %#llx=%u%%",
+                           (unsigned long long)b[i].base, (b[i].n * 100) / total );
+        wine_log_write( "%s", line );
+    }
+}
+
 static void ios_thread_sampler_main(void)
 {
+    int gen = 0;
     ios_ts_calibrate();
     wine_log_write("[thread-sample] ml876 armed (task-wide: burst of 4 passes / 250 ms every 20 s)");
     for (;;) {
@@ -721,6 +861,10 @@ static void ios_thread_sampler_main(void)
         sleep(20);
         for (b = 0; b < 4; b++) { ios_thread_sampler_pass(b); usleep(250000); }
         wine_log_write("[thread-sample] ml876 burst done");
+        /* ml979: profile the guest every third burst (~once a minute). Two
+         * successive profiles are what distinguish a loop from a sweep: a
+         * sweep's span and bucket set move, a loop's do not. */
+        if ((++gen % 3) == 0) ios_guest_rip_profile( gen / 3 );
     }
 }
 
@@ -1795,6 +1939,7 @@ static struct ios_fd_cache *ios_get_fd_cache(void)
  * its cached fds and pinned the unlinked inodes behind them. */
 void ios_fd_cache_release( void *peb )
 {
+    { extern void ios_inproc_cache_release( void *peb ); ios_inproc_cache_release( peb ); }   /* ml1058 */
     int i, j, n, closed = 0;
     struct ios_fd_cache *c = NULL;
 
@@ -1816,18 +1961,55 @@ void ios_fd_cache_release( void *peb )
         union fd_cache_entry *block = c->blocks[i];
         if (!block) continue;
         for (j = 0; j < FD_CACHE_BLOCK_SIZE; j++)
-            if (block[j].s.fd > 0)
-            {
-                /* ml586: the prime suspect close — a stale cache entry whose fd
-                 * number was recycled into another thread's comm pipe */
-                ios_fdt_note_close( block[j].s.fd, "fd-cache-release", peb );
-                close( block[j].s.fd );
-                closed++;
-            }
-        if (block != c->initial_block) free( block );
+        {
+            /* ml961: `s.fd` holds fd+1, not fd. add_fd_to_cache stores it that
+             * way so 0 can mean "unset" ("store fd+1 so that 0 can be used as
+             * the unset value"), and both readers decode it: get_cached_fd does
+             * `*fd = cache.s.fd - 1` and remove_fd_from_cache does
+             * `fd = cache.s.fd - 1`. This loop was the only place that passed
+             * the stored word straight to close(), so it closed the descriptor
+             * AFTER the one this pseudo-process owned -- leaking the real one
+             * and closing an unrelated live fd.
+             *
+             * Measured in rdr25, three consecutive lines:
+             *   CROSS! close fd=30 why=fd-cache-release kind=request_wr
+             *          owner_peb=0x6fdff0000 closer_tid=007c dead_peb=0x48ff84000
+             *   read_request EOF tid=0024 pid=0020 request_unixfd=27 -> kill_thread
+             *   kill_thread tid=0024 pid=0020 violent=0
+             * The exiting launcher closed another pseudo-process's request-pipe
+             * write end, and wineserver killed that thread on the EOF. The
+             * other entries show the same shift (221/225/229 closed for real
+             * fds 220/224/228).
+             *
+             * Decode ONCE and use the same value for the ownership log and the
+             * close, so the two can never disagree. Descriptor 0 is a valid
+             * descriptor (stored as 1), so the populated test is on the stored
+             * word being non-zero, not on the decoded fd being positive.
+             *
+             * FD_TYPE_INVALID entries do not hold a descriptor at all -- they
+             * cache an NTSTATUS ("if fd type is invalid, fd stores an error
+             * value"), so closing them closes an arbitrary number. Skip them. */
+            int stored = block[j].s.fd;
+            int real_fd;
+
+            if (!stored) continue;                              /* unset entry      */
+            if (block[j].s.type == FD_TYPE_INVALID) continue;   /* cached NTSTATUS  */
+            real_fd = stored - 1;
+            ios_fdt_note_close( real_fd, "fd-cache-release", peb );
+            close( real_fd );
+            closed++;
+        }
+        /* ml961: secondary blocks come from anon_mmap_alloc (mmap), so they must
+         * be released with munmap at the same size -- free() on an mmap'd
+         * pointer is undefined and corrupts the malloc heap. Only the enclosing
+         * cache object below belongs to free(); initial_block is an inline
+         * array inside *c and is released with it. */
+        if (block != c->initial_block)
+            munmap( block, FD_CACHE_BLOCK_SIZE * sizeof(union fd_cache_entry) );
     }
     free( c );
-    dprintf( 2, "[fd-cache] rev=ml571 released peb=%p, closed %d cached fd(s)\n", peb, closed );
+    dprintf( 2, "[fd-cache] rev=ml961 released peb=%p, closed %d cached fd(s) (decoded fd+1; "
+             "skipped FD_TYPE_INVALID; munmap for secondary blocks)\n", peb, closed );
 }
 
 #define fd_cache           (ios_get_fd_cache()->blocks)
@@ -2431,9 +2613,14 @@ void process_exit_wrapper( int status )
     if (i >= 0)
     {
         extern void ios_jit_reclaim_process( void *peb );
+        extern void ios_retire_own_fixed_base_image( void *peb );
         void *dead_peb = ios_proc_sockets[i].peb;
         wine_log_write("[Wine ntdll/server] process_exit_wrapper(%d): closing child fd_socket=%d",
                        status, ios_proc_sockets[i].fd);
+        /* ml987: hand back the fixed-base main image BEFORE the socket closes.
+         * NtUnmapViewOfSection needs a live server connection, and this is the
+         * last moment we have one while still on the owning process's thread. */
+        ios_retire_own_fixed_base_image( dead_peb );
         ios_fdt_note_close( ios_proc_sockets[i].fd, "exit-master", dead_peb );
         close( ios_proc_sockets[i].fd );
         ios_proc_sockets[i].peb = NULL;
@@ -2449,6 +2636,13 @@ void process_exit_wrapper( int status )
          * the session (else-branch) lives as long as the app. Reuse is
          * grace-delayed inside the allocator for laggard exit threads. */
         ios_jit_reclaim_process( dead_peb );
+        /* ml988 phase 2: only now may the retired fixed base be handed on. Until
+         * this point the old generation's pool mappings and FEX translations are
+         * still live, so a new claimant taking the same VA would race them. */
+        {
+            extern void ios_exe_win_mark_ready( void *peb );
+            ios_exe_win_mark_ready( dead_peb );
+        }
     }
     else close( fd_socket );
 #else
@@ -2692,8 +2886,9 @@ size_t server_init_process(void)
             supported_machines_count = wine_server_reply_size( reply ) / sizeof(*supported_machines);
             if (reply->inproc_device)
             {
-                inproc_device_fd = wine_server_receive_fd( &handle );
-                assert( handle == reply->inproc_device );
+                /* ml1058: userspace ntsync (build/madsync). The "device" is a constant
+                 * pseudo fd and the server sends nothing for it. */
+                inproc_device_fd = 0x6fffffff /* MADSYNC_DEVICE_FD */;
             }
         }
     }
@@ -2802,9 +2997,8 @@ size_t server_init_process_child( int child_fd_socket )
             info_size = reply->info_size;
             if (reply->inproc_device)
             {
-                int devfd = wine_server_receive_fd( &handle );
-                /* child doesn't need its own inproc device, close it */
-                if (devfd >= 0) close( devfd );
+                /* ml1058: nothing was sent, so nothing to receive or close. */
+                if (inproc_device_fd < 0) inproc_device_fd = 0x6fffffff /* MADSYNC_DEVICE_FD */;
             }
         }
     }

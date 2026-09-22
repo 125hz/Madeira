@@ -31,6 +31,9 @@ FAILED_FILES=""
 
 compile_objc() {
     local src=$1 name=$2
+    # MADEIRA_ONLY=<name>: recompile one object only. madeira_ir_unix carries a __DATE__
+    # stamp in the shader-cache key, so a full rebuild costs a full shader recompile on device.
+    if [ -n "${MADEIRA_ONLY:-}" ] && [ "$name" != "$MADEIRA_ONLY" ]; then return 0; fi
     printf "  %-40s " "$name"
     if xcrun -sdk iphoneos clang $COMMON_FLAGS -x objective-c $INCLUDES \
         -c "$src" -o "$OBJ_DIR/$name.o" 2>"$OBJ_DIR/$name.err"; then
@@ -42,6 +45,9 @@ compile_objc() {
 
 compile_cxx() {
     local src=$1 name=$2 extra="${3:-}"
+    # MADEIRA_ONLY=<name>: recompile one object only. madeira_ir_unix carries a __DATE__
+    # stamp in the shader-cache key, so a full rebuild costs a full shader recompile on device.
+    if [ -n "${MADEIRA_ONLY:-}" ] && [ "$name" != "$MADEIRA_ONLY" ]; then return 0; fi
     printf "  %-40s " "$name"
     if xcrun -sdk iphoneos clang++ $COMMON_FLAGS $CXX_FLAGS $INCLUDES $INCLUDES_DIRECTX $INCLUDES_SHADERS $LLVM_INCLUDES $AIRCONV_DEFS $extra \
         -c "$src" -o "$OBJ_DIR/$name.o" 2>"$OBJ_DIR/$name.err"; then
@@ -57,6 +63,9 @@ compile_cxx() {
 # and the DXMT build must not start failing when it is absent.
 compile_objcxx_arc() {
     local src=$1 name=$2 extra="${3:-}"
+    # MADEIRA_ONLY=<name>: recompile one object only. madeira_ir_unix carries a __DATE__
+    # stamp in the shader-cache key, so a full rebuild costs a full shader recompile on device.
+    if [ -n "${MADEIRA_ONLY:-}" ] && [ "$name" != "$MADEIRA_ONLY" ]; then return 0; fi
     printf "  %-40s " "$name"
     if xcrun -sdk iphoneos clang++ $COMMON_FLAGS -std=c++20 -fobjc-arc -x objective-c++ $extra \
         -c "$src" -o "$OBJ_DIR/$name.o" 2>"$OBJ_DIR/$name.err"; then
@@ -75,8 +84,15 @@ if [[ -f "$BUILD_DIR/../madeira-d3d12/deps.sh" ]] && \
     # here: the converter's runtime header emits its bind points and helper
     # bodies only where that macro is set, and defining it in a second
     # translation unit gives duplicate symbols. The canary owns the one copy.
+    # ml1008: also needs airconv_public.h -- shader-model-5.x DXBC goes to the
+    # in-tree AIR compiler, which is linked into this same archive, so the shim
+    # includes the compiler's real header rather than restating its structs.
     compile_objcxx_arc "$REPO_ROOT/research/madeira-d3d12/src/unix/madeira_ir_unix.mm" \
-                       madeira_ir_unix "-I$MSC_INCLUDE -I$REPO_ROOT/research/madeira-d3d12/src"
+                       madeira_ir_unix "-I$MSC_INCLUDE -I$REPO_ROOT/research/madeira-d3d12/src $INCLUDES $INCLUDES_DIRECTX"
+    # ml1011: the input-layout resolver, plain C++ because DXBCParser's signature
+    # reader includes a Windows shim whose BOOL clashes with Objective-C's.
+    compile_cxx "$REPO_ROOT/research/madeira-d3d12/src/unix/madeira_sm5_ia.cpp" \
+                madeira_sm5_ia "-I$REPO_ROOT/research/madeira-d3d12/src"
 else
     echo "=== madeira-d3d12 canary SKIPPED (converter package not resolvable) ==="
 fi

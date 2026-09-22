@@ -22,8 +22,31 @@ import struct, sys
 p = sys.argv[1]; d = open(p, 'rb').read()
 pe = struct.unpack_from('<I', d, 0x3c)[0]
 soi = struct.unpack_from('<I', d, pe + 24 + 56)[0]     # OptionalHeader.SizeOfImage
-assert len(d) == soi, "stripped size %d != SizeOfImage %d" % (len(d), soi)
-open(p, 'ab').write(b'\0' * 0x50000)
-print("ntdll.dll: %d bytes = SizeOfImage %d + 0x50000" % (soi + 0x50000, soi))
+# ml1004: PAD UP TO the target, do not blindly append.
+#
+# The old code asserted `len(d) == soi` and then appended 0x50000. Stripping
+# removes sections and debug data, so the stripped file is SMALLER than
+# SizeOfImage (measured: 0x120000 stripped vs 0x140000 SizeOfImage) and the
+# assert failed on every single run -- this script has never completed, and the
+# file was being padded by hand instead. Appending a fixed 0x50000 would also
+# have produced the wrong total even if the assert had passed.
+#
+# The header comment states the intent: pad to SizeOfImage + 0x50000. Compute
+# that target and fill up to it, which reproduces the known-good hand-built
+# size exactly (0x140000 + 0x50000 = 0x190000 = 1,638,400 bytes).
+target = soi + 0x50000
+if len(d) > target:
+    raise SystemExit("stripped ntdll is %d bytes, already larger than the "
+                     "target SizeOfImage(%d) + 0x50000 = %d -- the padding "
+                     "assumption no longer holds, do not guess"
+                     % (len(d), soi, target))
+pad = target - len(d)
+with open(p, 'ab') as f:
+    f.write(b'\0' * pad)
+final = len(open(p, 'rb').read())
+if final != target:
+    raise SystemExit("padding produced %d bytes, expected %d" % (final, target))
+print("ntdll.dll: stripped %d + pad %d = %d bytes (SizeOfImage %d + 0x50000)"
+      % (len(d), pad, final, soi))
 PY
 mv "$OUT.tmp" "$OUT"; ls -l "$OUT"

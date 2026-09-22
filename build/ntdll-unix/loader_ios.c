@@ -2770,6 +2770,15 @@ static void start_main_thread(void)
      * first PE placement. */
     WINE_IOS_LOG("ios_reserve_fex_arena...");
     ios_reserve_fex_arena();
+    /* ml997: the guest jumbo holdback runs AFTER the arena, never before.
+     * rdr65 held 9216 MB at jit-pool-init and the arena then found nothing in 9
+     * candidates ("ml774 NO ARENA RESERVED"), which cost FEX its private band
+     * and produced 683 failed 64KB RWX CodeBuffer allocations. The arena is
+     * small and must win; the holdback takes what is left. */
+    {
+        extern void ios_jumbo_holdback_init( void );
+        ios_jumbo_holdback_init();
+    }
 
     WINE_IOS_LOG("load_ntdll...");
     load_ntdll();

@@ -143,15 +143,80 @@ static id rm_resolve(uint64_t h, uint32_t *err) {
  * an open encoder; the host must not die for it. Track open encoders and end
  * them before the final release. */
 #define RM_MAX_OPEN_ENC 256
-static id g_open_enc[RM_MAX_OPEN_ENC];
-static void rm_enc_opened(id e) {
+/* ml1010: remember WHICH command buffer each open encoder belongs to.
+ *
+ * Tracking encoders alone covered release-time teardown, but not commit:
+ * RM_OP_COMMIT called [cb commit] unconditionally, and Metal aborts the whole
+ * daemon on `commit command buffer with uncommitted encoder`. That is exactly
+ * how rmetald died mid-run -- and when the host dies the guest reports "cannot
+ * reach" and silently falls back to local, which looks like a successful
+ * render. The guest can legitimately abandon a list with an encoder still open
+ * (it does so on every failed pipeline), so the host must close it rather than
+ * die for it, and to close it we have to know its command buffer. */
+static struct { id enc; id cb; } g_open_enc[RM_MAX_OPEN_ENC];
+/* ml1016: if the table ever overflows we STOP KNOWING which encoders are open,
+ * and the is-open guard below must not then treat every untracked encoder as
+ * ended -- that would silently drop all rendering. Once this is set the guard
+ * degrades to permissive, i.e. exactly the pre-ml1016 behaviour. */
+static int g_enc_table_overflowed;
+static void rm_enc_opened(id e, id cb) {
     if (!e) return;
-    for (int i = 0; i < RM_MAX_OPEN_ENC; i++) if (!g_open_enc[i]) { g_open_enc[i] = e; return; }
-    fprintf(stderr, "[rmetald] open-encoder table full\n");
+    for (int i = 0; i < RM_MAX_OPEN_ENC; i++)
+        if (!g_open_enc[i].enc) { g_open_enc[i].enc = e; g_open_enc[i].cb = cb; return; }
+    if (!g_enc_table_overflowed) {
+        g_enc_table_overflowed = 1;
+        fprintf(stderr, "[rmetald] open-encoder table full -- ml1016 is now permissive "
+                        "(cannot distinguish ended encoders any more)\n");
+    }
 }
 static int rm_enc_closed(id e) {
-    for (int i = 0; i < RM_MAX_OPEN_ENC; i++) if (g_open_enc[i] == e) { g_open_enc[i] = nil; return 1; }
+    for (int i = 0; i < RM_MAX_OPEN_ENC; i++)
+        if (g_open_enc[i].enc == e) { g_open_enc[i].enc = nil; g_open_enc[i].cb = nil; return 1; }
     return 0;
+}
+/* ml1016: is this encoder still open? The open-encoder table is the only record
+ * of that, and ml1010 removes an encoder from it when it auto-closes one before
+ * a commit -- so anything the guest sends to that encoder AFTERWARDS must be
+ * refused rather than passed to Metal. Issuing into an ended encoder makes AGX
+ * dereference a torn-down context and segfaults the whole daemon
+ * (-[AGXG16XFamilyBlitContext copyFromBuffer:...], KERN_INVALID_ADDRESS). */
+static int rm_enc_is_open(id e) {
+    if (!e) return 0;
+    if (g_enc_table_overflowed) return 1;   /* fail permissive, never drop blind */
+    for (int i = 0; i < RM_MAX_OPEN_ENC; i++) if (g_open_enc[i].enc == e) return 1;
+    return 0;
+}
+
+/* ml1010: end every encoder still open on this command buffer. Returns how many
+ * it had to close -- non-zero means the guest left one open, which is worth
+ * seeing in the log even though the host now survives it. */
+static int rm_enc_end_for_cb(id cb) {
+    int n = 0;
+    if (!cb) return 0;
+    for (int i = 0; i < RM_MAX_OPEN_ENC; i++) {
+        if (!g_open_enc[i].enc || g_open_enc[i].cb != cb) continue;
+        [(id<MTLCommandEncoder>)g_open_enc[i].enc endEncoding];
+        g_open_enc[i].enc = nil; g_open_enc[i].cb = nil;
+        n++;
+    }
+    return n;
+}
+
+/* ml1019: Metal permits ONE active encoder per command buffer and aborts the
+ * process on a second (`A command encoder is already encoding to this command
+ * buffer`, -[AGXG16XFamilyCommandBuffer blitCommandEncoderCommon:]). The guest
+ * can reach that state -- ml1016 already showed it confused about encoder
+ * lifetime -- so end the outstanding one here rather than die for it. */
+static void rm_enc_end_open_on_cb(id cb, const char *what) {
+    int n;
+    if (!cb) return;
+    n = rm_enc_end_for_cb(cb);
+    if (n) {
+        static unsigned said;
+        if (said++ < 16)
+            fprintf(stderr, "[rmetald] ml1019 ended %d encoder(s) still open on command buffer %p "
+                    "before creating a %s encoder\n", n, (__bridge void *)cb, what);
+    }
 }
 
 /* ---- ml898: frame dump ----------------------------------------------------
@@ -226,25 +291,35 @@ static void rm_pixel_to_rgba(MTLPixelFormat f, const uint8_t *p, uint8_t *o) {
     }
     o[3]=255;
 }
-static id<MTLComputePipelineState> rm_depth_copy_pso(id<MTLDevice> dev) {
-    static id<MTLComputePipelineState> pso; static int tried;
-    if (pso || tried) return pso;
-    tried = 1;
+static id<MTLComputePipelineState> rm_depth_copy_pso(id<MTLDevice> dev, int array) {
+    static id<MTLComputePipelineState> pso[2]; static int tried[2];
+    if (pso[array] || tried[array]) return pso[array];
+    tried[array] = 1;
     NSError *err = nil;
-    NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"
-        "kernel void depth_copy(depth2d<float, access::read> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]], uint2 gid [[thread_position_in_grid]]) {"
-        " if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return; dst.write(float4(src.read(gid), 0, 0, 1), gid); }";
+    /* ml933: the D3D12 runtime allocates EVERY 2D texture as a 2D array, so a
+     * depth2d binding read nothing and every depth dump came back 100 %
+     * uniform -- including the shadow atlas, which looked empty while 1424
+     * draws a frame were writing it. Pick the kernel the source type needs. */
+    NSString *src = array
+        ? @"#include <metal_stdlib>\nusing namespace metal;\n"
+           "kernel void depth_copy(depth2d_array<float, access::read> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]], constant uint &slice [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {"
+           " if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return; dst.write(float4(src.read(gid, slice), 0, 0, 1), gid); }"
+        : @"#include <metal_stdlib>\nusing namespace metal;\n"
+           "kernel void depth_copy(depth2d<float, access::read> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]], uint2 gid [[thread_position_in_grid]]) {"
+           " if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return; dst.write(float4(src.read(gid), 0, 0, 1), gid); }";
     id<MTLLibrary> lib = [dev newLibraryWithSource:src options:nil error:&err];
     id<MTLFunction> fn = [lib newFunctionWithName:@"depth_copy"];
-    if (fn) pso = [dev newComputePipelineStateWithFunction:fn error:&err];
-    if (!pso) fprintf(stderr, "[rmetald-dump] depth copy kernel unavailable: %s\n", err.localizedDescription.UTF8String);
-    return pso;
+    if (fn) pso[array] = [dev newComputePipelineStateWithFunction:fn error:&err];
+    if (!pso[array]) fprintf(stderr, "[rmetald-dump] depth copy kernel (%s) unavailable: %s\n",
+                             array ? "array" : "2d", err.localizedDescription.UTF8String);
+    return pso[array];
 }
-static void rm_dump_texture(id<MTLCommandQueue> q, id<MTLTexture> t, const char *path, const char *tag);
+static void rm_dump_slice(id<MTLCommandQueue> q, id<MTLTexture> t, const char *path, const char *tag, NSUInteger slice);
 /* ml903: depth/stencil formats cannot be blitted to a readable copy; run a
  * compute copy of the depth plane into an R32Float texture and dump that. */
-static void rm_dump_depth(id<MTLCommandQueue> q, id<MTLTexture> t, const char *path, const char *tag) {
-    id<MTLComputePipelineState> pso = rm_depth_copy_pso(t.device);
+static void rm_dump_depth(id<MTLCommandQueue> q, id<MTLTexture> t, const char *path, const char *tag, NSUInteger slice) {
+    int array = (t.textureType == MTLTextureType2DArray);
+    id<MTLComputePipelineState> pso = rm_depth_copy_pso(t.device, array);
     if (!pso || t.sampleCount > 1 || (t.textureType != MTLTextureType2D && t.textureType != MTLTextureType2DArray)) return;
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float width:t.width height:t.height mipmapped:NO];
     td.storageMode = MTLStorageModePrivate; td.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
@@ -252,17 +327,18 @@ static void rm_dump_depth(id<MTLCommandQueue> q, id<MTLTexture> t, const char *p
     id<MTLCommandBuffer> cb = [q commandBuffer];
     id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
     [ce setComputePipelineState:pso]; [ce setTexture:t atIndex:0]; [ce setTexture:dst atIndex:1];
+    if (array) { uint32_t s32 = (uint32_t)slice; [ce setBytes:&s32 length:sizeof s32 atIndex:0]; }
     [ce dispatchThreads:MTLSizeMake(t.width, t.height, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
     [ce endEncoding]; [cb commit]; [cb waitUntilCompleted];
     char tag2[96]; snprintf(tag2, sizeof tag2, "%s DEPTH(fmt%lu)", tag, (unsigned long)t.pixelFormat);
-    rm_dump_texture(q, dst, path, tag2);
+    rm_dump_slice(q, dst, path, tag2, 0);
 }
-static void rm_dump_texture(id<MTLCommandQueue> q, id<MTLTexture> t, const char *path, const char *tag) {
+static void rm_dump_slice(id<MTLCommandQueue> q, id<MTLTexture> t, const char *path, const char *tag, NSUInteger slice) {
     unsigned bpp = rm_fmt_bpp(t.pixelFormat);
     if (!bpp && (t.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 || t.pixelFormat == MTLPixelFormatDepth24Unorm_Stencil8 || t.pixelFormat == MTLPixelFormatDepth16Unorm)) {
-        rm_dump_depth(q, t, path, tag); return;
+        rm_dump_depth(q, t, path, tag, slice); return;
     }
-    if (!bpp || t.sampleCount > 1 || t.textureType == MTLTextureType3D) {
+    if (!bpp || t.sampleCount > 1) {
         fprintf(stderr, "[rmetald-dump] %s: skipped fmt=%lu type=%lu samples=%lu %lux%lu\n", tag,
                 (unsigned long)t.pixelFormat, (unsigned long)t.textureType, (unsigned long)t.sampleCount,
                 (unsigned long)t.width, (unsigned long)t.height);
@@ -275,7 +351,11 @@ static void rm_dump_texture(id<MTLCommandQueue> q, id<MTLTexture> t, const char 
     if (!copy) { fprintf(stderr, "[rmetald-dump] %s: no shared copy for fmt %lu\n", tag, (unsigned long)t.pixelFormat); return; }
     id<MTLCommandBuffer> cb = [q commandBuffer];
     id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
-    [be copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(w,ht,1)
+    /* ml933: for a 3D texture `slice` is the z plane, not an array slice. The
+     * colour-grading LUT is a 32^3 volume and was being skipped entirely. */
+    int is3d = (t.textureType == MTLTextureType3D);
+    [be copyFromTexture:t sourceSlice:(is3d ? 0 : slice) sourceLevel:0
+           sourceOrigin:MTLOriginMake(0,0,is3d ? slice : 0) sourceSize:MTLSizeMake(w,ht,1)
               toTexture:copy destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
     [be endEncoding]; [cb commit]; [cb waitUntilCompleted];
     size_t bpr = (size_t)w * bpp; uint8_t *px = malloc(bpr * ht);
@@ -293,16 +373,75 @@ static void rm_dump_texture(id<MTLCommandQueue> q, id<MTLTexture> t, const char 
         for (unsigned k = 0; k < bpp; k++) if (p[k]) { nonzero++; break; }
         if (!memcmp(p, ref, bpp)) same++;
     }
+    /* ml933: the PNG preview runs every float through rm_tone, which clamps
+     * negatives to 0 and saturates large values at 255 -- and for a tiny
+     * control buffer (the local-exposure bilateral grid is 7x4x32 RG32Float)
+     * those are exactly the values that matter. Write the raw numbers beside
+     * the PNG so a grid cell can be read instead of guessed at. */
+    if (w * ht <= 8192) {
+        int isf = (t.pixelFormat == MTLPixelFormatR32Float || t.pixelFormat == MTLPixelFormatRG32Float ||
+                   t.pixelFormat == MTLPixelFormatRGBA32Float || t.pixelFormat == MTLPixelFormatR16Float ||
+                   t.pixelFormat == MTLPixelFormatRG16Float || t.pixelFormat == MTLPixelFormatRGBA16Float);
+        unsigned nch = (t.pixelFormat == MTLPixelFormatR32Float || t.pixelFormat == MTLPixelFormatR16Float) ? 1
+                     : (t.pixelFormat == MTLPixelFormatRG32Float || t.pixelFormat == MTLPixelFormatRG16Float) ? 2 : 4;
+        int half = (t.pixelFormat == MTLPixelFormatR16Float || t.pixelFormat == MTLPixelFormatRG16Float ||
+                    t.pixelFormat == MTLPixelFormatRGBA16Float);
+        if (isf) {
+            char tp[288]; const char *dot = strrchr(path, '.');
+            int stem = dot ? (int)(dot - path) : (int)strlen(path);
+            snprintf(tp, sizeof tp, "%.*s.txt", stem, path);
+            FILE *tf = fopen(tp, "w");
+            if (tf) {
+                fprintf(tf, "%s %lux%lu fmt=%lu ch=%u\n", tag, (unsigned long)w, (unsigned long)ht,
+                        (unsigned long)t.pixelFormat, nch);
+                for (NSUInteger y = 0; y < ht; y++) {
+                    for (NSUInteger x = 0; x < w; x++) {
+                        const uint8_t *px2 = px + y * bpr + x * bpp;
+                        fputc('[', tf);
+                        for (unsigned k = 0; k < nch; k++) {
+                            float v = half ? rm_half(((const uint16_t *)px2)[k]) : ((const float *)px2)[k];
+                            fprintf(tf, "%s%.6g", k ? " " : "", v);
+                        }
+                        fputs("]", tf);
+                    }
+                    fputc('\n', tf);
+                }
+                fclose(tf);
+            }
+        }
+    }
     rm_write_png(path, rgba, (unsigned)w, (unsigned)ht);
     fprintf(stderr, "[rmetald-dump] %s: %lux%lu fmt=%lu usage=0x%lx nonzero=%lu/%lu (%.1f%%) uniform=%.1f%% -> %s\n", tag,
             (unsigned long)w, (unsigned long)ht, (unsigned long)t.pixelFormat, (unsigned long)t.usage,
             nonzero, (unsigned long)(w * ht), 100.0 * nonzero / (double)(w * ht), 100.0 * same / (double)(w * ht), path);
     free(px); free(rgba);
 }
+/* ml933: every 2D texture the guest allocates is a 2D ARRAY now, and some of
+ * them carry real content outside slice 0 (the TSR history lives in slice 3).
+ * Dumping slice 0 only was showing an empty buffer for a populated texture, so
+ * write one PNG per slice and name the extra ones _sN. */
+static void rm_dump_texture(id<MTLCommandQueue> q, id<MTLTexture> t, const char *path, const char *tag) {
+    NSUInteger planes = (t.textureType == MTLTextureType3D) ? (t.depth ? t.depth : 1)
+                      : (t.textureType == MTLTextureType2DArray ? (t.arrayLength ? t.arrayLength : 1) : 1);
+    NSUInteger n = planes > 8 ? 8 : planes;
+    NSUInteger step = planes > 8 ? planes / 8 : 1;
+    for (NSUInteger i = 0; i < n; i++) {
+        NSUInteger s = i * step;
+        char p2[256], tag2[96];
+        if (s == 0) { snprintf(p2, sizeof p2, "%s", path); snprintf(tag2, sizeof tag2, "%s", tag); }
+        else {
+            const char *dot = strrchr(path, '.');
+            int stem = dot ? (int)(dot - path) : (int)strlen(path);
+            snprintf(p2, sizeof p2, "%.*s_s%lu.png", stem, path, (unsigned long)s);
+            snprintf(tag2, sizeof tag2, "%s s%lu", tag, (unsigned long)s);
+        }
+        rm_dump_slice(q, t, p2, tag2, s);
+    }
+}
 static void rm_frame_dump(id<MTLCommandQueue> q) {
     static unsigned dumps;
     char dir[128]; snprintf(dir, sizeof dir, "/tmp/rmetald-dump/f%u", ++dumps);
-    char mk[160]; snprintf(mk, sizeof mk, "mkdir -p %s", dir); system(mk);
+    char mk[256]; snprintf(mk, sizeof mk, "rm -rf %s && mkdir -p %s", dir, dir); system(mk);   /* ml933: stale PNGs from a previous run read as this frame */
     fprintf(stderr, "[rmetald-dump] frame dump #%u: %u attachments -> %s\n", dumps, g_frame_att_n, dir);
     for (unsigned i = 0; i < g_frame_att_n; i++) {
         uint32_t e = RM_OK; id t = rm_resolve(g_frame_att[i], &e);
@@ -323,7 +462,9 @@ static void rm_frame_dump(id<MTLCommandQueue> q) {
             id o = g_slots[slot].obj;
             if (![o respondsToSelector:@selector(pixelFormat)] || ![o respondsToSelector:@selector(textureType)]) continue;
             id<MTLTexture> t = o;
-            if ((t.textureType != MTLTextureType2D && t.textureType != MTLTextureType2DArray) || t.width < 200 || t.height < 100) continue;   /* ml916: arrays too (slice 0) */
+            int vol = (t.textureType == MTLTextureType3D);
+            if (t.textureType != MTLTextureType2D && t.textureType != MTLTextureType2DArray && !vol) continue;   /* ml916: arrays too; ml933: volumes */
+            if (!vol && (t.width < 200 || t.height < 100)) continue;
             if (!rm_fmt_bpp(t.pixelFormat) && t.pixelFormat != MTLPixelFormatDepth32Float_Stencil8 && t.pixelFormat != MTLPixelFormatDepth24Unorm_Stencil8) continue;   /* ml903: skip BC/ASTC material textures */
             if (!(t.usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget))) continue;   /* only things the GPU writes */
             uint64_t h = RM_HANDLE(g_slots[slot].generation, slot);
@@ -1690,7 +1831,8 @@ static void serve(int fd) {
             if (i->render_target_width)  rp.renderTargetWidth  = i->render_target_width;
             if (i->default_raster_sample_count) rp.defaultRasterSampleCount = i->default_raster_sample_count;
             id<MTLRenderCommandEncoder> enc =
-                [(id<MTLCommandBuffer>)cb renderCommandEncoderWithDescriptor:rp];
+                (rm_enc_end_open_on_cb((id)cb, "render"),
+                 [(id<MTLCommandBuffer>)cb renderCommandEncoderWithDescriptor:rp]);
             if (enc) enc.label = [NSString stringWithFormat:@"enc#%lu render", (unsigned long)++g_enc_seq];
             if (!enc) {
                 /* Nil here used to be reported as a bare refusal, and the guest
@@ -1714,7 +1856,7 @@ static void serve(int fd) {
                         fprintf(stderr, "[rmetald]   colour %u wanted handle 0x%llx but it did not resolve\n",
                                 c, (unsigned long long)i->colors[c].texture);
             }
-            rm_enc_opened(enc);   /* ml898 */
+            rm_enc_opened(enc, (id)cb);   /* ml898 + ml1010: remember its command buffer */
             struct rm_ret_handle r = { rm_intern(enc) };
             reply(fd, &h, enc ? RM_OK : RM_ERR_WRONG_CLASS, &r, sizeof r); break;
         }
@@ -1728,6 +1870,13 @@ static void serve(int fd) {
             id e2 = rm_resolve(a->handle, &err);
             if (err != RM_OK) { reply(fd,&h,err,NULL,0); break; }
             if (!e2) { static unsigned said2; if (said2++ < 20) fprintf(stderr, "[rmetald] encodeCommands: handle %#llx resolves to nil, REFUSED\n", (unsigned long long)a->handle); reply(fd, &h, RM_ERR_BAD_HANDLE, NULL, 0); break; }
+            if (!rm_enc_is_open(e2)) {   /* ml1016: same hazard as the blit stream */
+                static unsigned said3;
+                if (said3++ < 16)
+                    fprintf(stderr, "[rmetald] ml1016 dropping a render batch for encoder %p: "
+                            "it was already ended\n", (__bridge void *)e2);
+                reply(fd, &h, RM_OK, NULL, 0); break;
+            }
             struct wmtw_view v; struct wmtw_dec_result dr;
             if (wmtw_validate_batch((const uint8_t *)payload + sizeof *a,
                                     h.payload_len - (uint32_t)sizeof *a, &v, &dr) != WMTW_DEC_OK) {
@@ -1816,6 +1965,30 @@ static void serve(int fd) {
         case RM_OP_COMMIT: {
             id o = rm_resolve(((struct rm_arg_handle *)payload)->handle, &err);
             if (err != RM_OK) { reply(fd,&h,err,NULL,0); break; }
+            /* ml1015: refuse a SECOND commit of the same command buffer.
+             *
+             * Other ops commit internally, so a command buffer can already be
+             * committed by the time the guest's own COMMIT arrives. Metal then
+             * aborts the whole daemon on the addCompletedHandler below --
+             * `Completed handler provided after commit call` -- which is exactly
+             * how rmetald died. And when the host dies its calls start returning
+             * 0, the guest throws away every command list ("no command buffer"
+             * x81), and the GAME then crashes dereferencing those failures. The
+             * guest-side crash we chased for four runs was downstream of this.
+             *
+             * Metal's own status is the discriminator, so there is no side table
+             * to keep in sync: NotEnqueued/Enqueued mean "not yet committed". */
+            {
+                MTLCommandBufferStatus st = [(id<MTLCommandBuffer>)o status];
+                if (st != MTLCommandBufferStatusNotEnqueued && st != MTLCommandBufferStatusEnqueued) {
+                    static unsigned said;
+                    if (said++ < 16)
+                        fprintf(stderr, "[rmetald] ml1015 command buffer %p is already committed "
+                                "(status %ld); ignoring the duplicate commit\n",
+                                (__bridge void *)o, (long)st);
+                    reply(fd, &h, RM_OK, NULL, 0); break;
+                }
+            }
             /* ml819: nothing here ever looked at a command buffer's outcome. A draw the
              * GPU rejected (missing resource, bad binding, fault) completes with an
              * error and simply does not appear -- exactly what 'objects not rendered'
@@ -1840,6 +2013,15 @@ static void serve(int fd) {
                     }
                 }
             }];
+            {   /* ml1010: never commit with an encoder still open -- Metal aborts. */
+                int left = rm_enc_end_for_cb(o);
+                if (left) {
+                    static unsigned said;
+                    if (said++ < 16)
+                        fprintf(stderr, "[rmetald] ml1010 closed %d encoder(s) the guest left open "
+                                        "before commit\n", left);
+                }
+            }
             [(id<MTLCommandBuffer>)o commit];
             reply(fd, &h, RM_OK, NULL, 0); break;
         }
@@ -2018,9 +2200,10 @@ static void serve(int fd) {
         case RM_OP_BLIT_ENCODER: {
             id cb = rm_resolve(((struct rm_arg_handle *)payload)->handle, &err);
             if (err != RM_OK) { reply(fd,&h,err,NULL,0); break; }
+            rm_enc_end_open_on_cb((id)cb, "blit");   /* ml1019 */
             id<MTLBlitCommandEncoder> e2 = [(id<MTLCommandBuffer>)cb blitCommandEncoder];
             if (e2) e2.label = [NSString stringWithFormat:@"enc#%lu blit", (unsigned long)++g_enc_seq];
-            rm_enc_opened(e2);   /* ml898 */
+            rm_enc_opened(e2, (id)cb);   /* ml898 + ml1010 */
             struct rm_ret_handle r = { rm_intern(e2) };
             reply(fd, &h, e2 ? RM_OK : RM_ERR_WRONG_CLASS, &r, sizeof r); break;
         }
@@ -2088,6 +2271,18 @@ static void serve(int fd) {
             id eo = rm_resolve(a->handle, &err);
             if (err != RM_OK) { reply(fd,&h,err,NULL,0); break; }
             id<MTLBlitCommandEncoder> enc = eo;
+            /* ml1016: the guest legitimately keeps recording after abandoning a
+             * list, and ml1010 may already have ended this encoder to make its
+             * command buffer committable. Passing commands to an ended encoder
+             * kills the daemon, and a dead host makes every guest Metal call
+             * return 0 -- which is what took the GAME down. Refuse instead. */
+            if (!rm_enc_is_open(eo)) {
+                static unsigned said;
+                if (said++ < 16)
+                    fprintf(stderr, "[rmetald] ml1016 dropping a blit batch for encoder %p: "
+                            "it was already ended\n", (__bridge void *)eo);
+                reply(fd, &h, RM_OK, NULL, 0); break;
+            }
             const uint8_t *p = (const uint8_t *)payload + sizeof *a;
             const uint8_t *end = (const uint8_t *)payload + h.payload_len;
             uint64_t done = 0, skipped = 0;
@@ -2104,6 +2299,46 @@ static void serve(int fd) {
                     const struct wmtcmd_blit_copy_from_buffer_to_buffer *c = (const void *)rec;
                     id sb = RES(c->src), db = RES(c->dst);
                     if (e2 != RM_OK || !sb || !db) { skipped++; break; }
+                    /* ml1013: bounds-check the extents before handing them to
+                     * Metal. A valid handle is not enough -- an out-of-range
+                     * blit walks off the allocation inside AGX and takes the
+                     * whole daemon with it (SIGSEGV in
+                     * -[AGXG16XFamilyBlitContext copyFromBuffer:...], which is
+                     * how rmetald died mid-run). D3D12 validates this; with
+                     * Metal validation off in a release build nothing else does,
+                     * and when the host dies the guest reports "cannot reach"
+                     * and silently falls back to local. */
+                    {
+                        /* ml1014: the ml1013 extent check PASSED and the daemon
+                         * still died in AGX at the same address, so the extents
+                         * were never the problem. Validate what the handles
+                         * actually ARE -- a slot holds an untyped id, so a
+                         * texture or a stale object resolves just as happily as
+                         * a buffer -- and describe every copy that looks wrong,
+                         * so the offender names itself instead of being guessed
+                         * at a second time. */
+                        NSUInteger slen = 0, dlen = 0;
+                        int sok = [sb conformsToProtocol:@protocol(MTLBuffer)];
+                        int dok = [db conformsToProtocol:@protocol(MTLBuffer)];
+                        if (sok) slen = [(id<MTLBuffer>)sb length];
+                        if (dok) dlen = [(id<MTLBuffer>)db length];
+                        int bad = !sok || !dok || !c->copy_length ||
+                                  c->copy_length > slen || c->src_offset > slen - c->copy_length ||
+                                  c->copy_length > dlen || c->dst_offset > dlen - c->copy_length;
+                        static unsigned said, shown;
+                        if (bad || shown < 8) {
+                            if (bad ? (said++ < 24) : (shown++ < 8))
+                                fprintf(stderr, "[rmetald] ml1014 %s buffer copy: %llu bytes "
+                                        "src=%s(%p,len=%lu)+%llu dst=%s(%p,len=%lu)+%llu\n",
+                                        bad ? "REFUSING" : "ok",
+                                        (unsigned long long)c->copy_length,
+                                        sok ? "MTLBuffer" : [NSStringFromClass([sb class]) UTF8String],
+                                        (__bridge void *)sb, (unsigned long)slen, (unsigned long long)c->src_offset,
+                                        dok ? "MTLBuffer" : [NSStringFromClass([db class]) UTF8String],
+                                        (__bridge void *)db, (unsigned long)dlen, (unsigned long long)c->dst_offset);
+                        }
+                        if (bad) { skipped++; break; }
+                    }
                     [enc copyFromBuffer:sb sourceOffset:c->src_offset toBuffer:db
               destinationOffset:c->dst_offset size:c->copy_length];
                     done++; break;
@@ -2220,11 +2455,12 @@ static void serve(int fd) {
             if (err != RM_OK) { reply(fd,&h,err,NULL,0); break; }
             /* Concurrent vs serial changes how Metal may reorder the work, so
              * it is honoured rather than defaulted. */
+            rm_enc_end_open_on_cb((id)cb, "compute");   /* ml1019 */
             id<MTLComputeCommandEncoder> e2 =
                 [(id<MTLCommandBuffer>)cb computeCommandEncoderWithDispatchType:
                     a->arg ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
             if (e2) e2.label = [NSString stringWithFormat:@"enc#%lu compute", (unsigned long)++g_enc_seq];
-            rm_enc_opened(e2);   /* ml898 */
+            rm_enc_opened(e2, (id)cb);   /* ml898 + ml1010 */
             struct rm_ret_handle r = { rm_intern(e2) };
             reply(fd, &h, e2 ? RM_OK : RM_ERR_WRONG_CLASS, &r, sizeof r); break;
         }
@@ -2237,6 +2473,13 @@ static void serve(int fd) {
             id eo = rm_resolve(a->handle, &err);
             if (err != RM_OK) { reply(fd,&h,err,NULL,0); break; }
             id<MTLComputeCommandEncoder> enc = eo;
+            if (!rm_enc_is_open(eo)) {   /* ml1016: same hazard as the blit stream */
+                static unsigned said;
+                if (said++ < 16)
+                    fprintf(stderr, "[rmetald] ml1016 dropping a compute batch for encoder %p: "
+                            "it was already ended\n", (__bridge void *)eo);
+                reply(fd, &h, RM_OK, NULL, 0); break;
+            }
             const uint8_t *p = (const uint8_t *)payload + sizeof *a;
             const uint8_t *end = (const uint8_t *)payload + h.payload_len;
             uint64_t done = 0, skipped = 0;

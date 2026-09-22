@@ -1448,8 +1448,7 @@ struct ContentView: View {
                     setenv("MADEIRA_EXE",
                            "C:\\Program Files\\Stray\\Hk_project\\Binaries\\Win64\\Stray-Win64-Shipping.exe", 1)
                     var args = "Hk_project -dx11 -windowed"
-                    if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-                       let txt = try? String(contentsOf: d.appendingPathComponent("madeira-args.txt"), encoding: .utf8) {
+                    if let txt = MadeiraConfig.get("args") {
                         let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                         if !v.isEmpty { args = v }
                     }
@@ -1479,8 +1478,7 @@ struct ContentView: View {
                     setenv("MADEIRA_EXE",
                            "C:\\Program Files\\Valley of the Ancient - DX12\\ValleyoftheAncient\\Binaries\\Win64\\AncientGame-Win64-Shipping.exe", 1)
                     var args = "ValleyoftheAncient -windowed -ansimalloc"
-                    if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-                       let txt = try? String(contentsOf: d.appendingPathComponent("madeira-valley-args.txt"), encoding: .utf8) {
+                    if let txt = MadeiraConfig.get("valley-args") {
                         let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                         if !v.isEmpty { args = v }
                     }
@@ -1795,6 +1793,15 @@ struct ContentView: View {
             logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
             return
         }
+        /* ml1095: one config file. Written once from any legacy madeira-*.txt. */
+        MadeiraConfig.migrateLegacy { self.logStore.log($0) }
+        MadeiraConfig.deleteLegacyFiles { self.logStore.log($0) }   /* ml1096: the old files go once the cfg exists */
+        if MadeiraConfig.present {
+            let cfg = MadeiraConfig.all().sorted { $0.key < $1.key }
+            logStore.log("madeira.cfg: " + (cfg.isEmpty ? "(empty)" : cfg.map { "\($0.key)=\($0.value)" }.joined(separator: " ")))
+        } else {
+            logStore.log("madeira.cfg absent: legacy madeira-*.txt files apply")
+        }
 
         logStore.log("Running full Wine sequence...")
 
@@ -1904,23 +1911,21 @@ struct ContentView: View {
             // the file reverts to the proven default. Clamped to sane values --
             // a typo here would otherwise move the VA floor with it.
             var poolSizeMB = 896
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-pool.txt"), encoding: .utf8),
+            if let txt = MadeiraConfig.get("pool"),
                let mb = Int(txt.trimmingCharacters(in: .whitespacesAndNewlines)),
                mb >= 256, mb <= 1152 {
                 poolSizeMB = mb
-                logStore.log("JIT pool overridden to \(mb)MB via madeira-pool.txt")
+                logStore.log("JIT pool overridden to \(mb)MB via madeira.cfg pool")
             }
             // ml694: W^X A/B switch. Documents/madeira-wx.txt containing "0"
             // disables page demotion for the SAME binary, so the on/off
             // comparison needs one rebuild, not two. The previous gate read
             // container paths that can never exist, so it silently forced
             // ENABLED and no A/B was actually possible.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-wx.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("wx") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 setenv("MADEIRA_WX", v, 1)
-                logStore.log("W^X override: MADEIRA_WX=\(v) via madeira-wx.txt")
+                logStore.log("W^X override: MADEIRA_WX=\(v) via madeira.cfg wx")
             }
 
             // ml727: wine-mono backpatcher bridge A/B. Documents/madeira-mono-bridge.txt
@@ -1932,12 +1937,11 @@ struct ContentView: View {
             // Worth arming here: the dominant fault site emits SWPAL, which is exactly
             // what FEX generates for a guest XCHG, and the patching XCHGs sit inside
             // libmono -- so the bridge's "RIP must lie inside Mono" test should pass.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-mono-bridge.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("mono-bridge") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !v.isEmpty {
                     setenv("MADEIRA_WINEMONO_BRIDGE", v, 1)
-                    logStore.log("Mono bridge: MADEIRA_WINEMONO_BRIDGE=\(v) via madeira-mono-bridge.txt")
+                    logStore.log("Mono bridge: MADEIRA_WINEMONO_BRIDGE=\(v) via madeira.cfg mono-bridge")
                 }
             }
 
@@ -1946,12 +1950,11 @@ struct ContentView: View {
             // using its saved Wine syscall frame (TEB+0x378) instead of the Mach-O
             // registers it happens to be executing. Off by default; native code reads
             // only the environment variable.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-ctx-frame.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("ctx-frame") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !v.isEmpty {
                     setenv("MADEIRA_CTX_FRAME", v, 1)
-                    logStore.log("Context source: MADEIRA_CTX_FRAME=\(v) via madeira-ctx-frame.txt")
+                    logStore.log("Context source: MADEIRA_CTX_FRAME=\(v) via madeira.cfg ctx-frame")
                 }
             }
 
@@ -1961,12 +1964,11 @@ struct ContentView: View {
             // d3d11.mipClampBC=N is the one that matters for memory: this GPU cannot
             // sample BC, so those textures are expanded to uncompressed and cost 2-8x
             // their shipped size.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-dxmt.txt"), encoding: .utf8) {
-                let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let txt = MadeiraConfig.get("dxmt") {
+                let v = txt.replacingOccurrences(of: ";", with: "\n").trimmingCharacters(in: .whitespacesAndNewlines)   /* ml1095: "a=b;c=d" on one line */
                 if !v.isEmpty {
                     setenv("DXMT_CONFIG", v, 1)
-                    logStore.log("DXMT config: \(v) via madeira-dxmt.txt")
+                    logStore.log("DXMT config: \(v) via madeira.cfg dxmt")
                 }
             }
 
@@ -1978,12 +1980,11 @@ struct ContentView: View {
             // leaves VideoContext. File EOF is not decoder EOS, and a call
             // count cannot tell "tf_eos returns false forever" from "it returns
             // true and the managed side ignores it". Only the return value can.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-tf-trace.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("tf-trace") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !v.isEmpty {
                     setenv("MADEIRA_TF_TRACE", v, 1)
-                    logStore.log("Theorafile tracer: MADEIRA_TF_TRACE=\(v) via madeira-tf-trace.txt")
+                    logStore.log("Theorafile tracer: MADEIRA_TF_TRACE=\(v) via madeira.cfg tf-trace")
                 }
             }
 
@@ -1994,12 +1995,11 @@ struct ContentView: View {
             // every time-gated transition in a managed game waits forever while the
             // renderer keeps drawing. Opt-in only because the old code claimed the
             // write faulted; this should become unconditional once proven.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-usd-time.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("usd-time") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !v.isEmpty {
                     setenv("MADEIRA_USD_TIME", v, 1)
-                    logStore.log("Shared-data clock: MADEIRA_USD_TIME=\(v) via madeira-usd-time.txt")
+                    logStore.log("Shared-data clock: MADEIRA_USD_TIME=\(v) via madeira.cfg usd-time")
                 }
             }
 
@@ -2013,12 +2013,11 @@ struct ContentView: View {
             // freezing a thread that holds the malloc lock or FEX's CodeInvalidationMutex
             // can deadlock whoever suspended it. Windows apps tolerate preemptive suspend
             // because the suspender does not share their heap; here it does.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-real-suspend.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("real-suspend") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !v.isEmpty {
                     setenv("MADEIRA_REAL_SUSPEND", v, 1)
-                    logStore.log("Thread suspension: MADEIRA_REAL_SUSPEND=\(v) via madeira-real-suspend.txt")
+                    logStore.log("Thread suspension: MADEIRA_REAL_SUSPEND=\(v) via madeira.cfg real-suspend")
                 }
             }
 
@@ -2035,12 +2034,11 @@ struct ContentView: View {
             // mid-JIT-block, and that path has never been exercised under FEX. It may
             // trade a deadlock for a worse failure. If it does get in-game, that is NOT
             // evidence for any particular theory of the deadlock.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-mono-suspend.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("mono-suspend") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !v.isEmpty {
                     setenv("MONO_THREADS_SUSPEND", v, 1)
-                    logStore.log("Mono suspend policy: MONO_THREADS_SUSPEND=\(v) via madeira-mono-suspend.txt")
+                    logStore.log("Mono suspend policy: MONO_THREADS_SUSPEND=\(v) via madeira.cfg mono-suspend")
                 }
             }
 
@@ -2056,8 +2054,7 @@ struct ContentView: View {
             // "churn:N", "ramp:N" or "random:N". Deliberately a SEPARATE file
             // from madeira-arena.txt: a test that only runs when the feature is
             // enabled cannot be used to decide whether to enable it.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-arena-test.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("arena-test") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !v.isEmpty {
                     setenv("MADEIRA_ARENA_TEST", v, 1)
@@ -2072,12 +2069,11 @@ struct ContentView: View {
             // half occurs at all -- an untested cleanup path is an assumption,
             // so this makes both reproducible on demand. Absent the file
             // nothing is injected.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-fexfail.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("fexfail") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !v.isEmpty {
                     setenv("MADEIRA_FEX_FAIL_CALLRET", v, 1)
-                    logStore.log("call-ret failure injection: \(v) via madeira-fexfail.txt", level: .error)
+                    logStore.log("call-ret failure injection: \(v) via madeira.cfg fexfail", level: .error)
                 }
             }
 
@@ -2087,16 +2083,15 @@ struct ContentView: View {
             // process: flipping it later would leave handles from two address
             // spaces alive at the same time, which is precisely what the handle
             // tag exists to make impossible.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-remote.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("remote") {
                 let parts = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                                 .split(separator: " ", maxSplits: 1).map(String.init)
                 if parts.count == 2 {
                     setenv("DXMT_REMOTE_METAL", parts[0], 1)
                     setenv("RMETAL_TOKEN", parts[1], 1)
-                    logStore.log("remote Metal: host=\(parts[0]) via madeira-remote.txt", level: .success)
+                    logStore.log("remote Metal: host=\(parts[0]) via madeira.cfg remote", level: .success)
                 } else if !parts.isEmpty {
-                    logStore.log("madeira-remote.txt needs '<host-ip> <token>'", level: .error)
+                    logStore.log("madeira.cfg remote needs '<host-ip> <token>'", level: .error)
                 }
             }
 
@@ -2109,9 +2104,8 @@ struct ContentView: View {
             // declines to run is indistinguishable from one that never executed,
             // which cost a device run to work out.
             if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
-                let url = d.appendingPathComponent("madeira-d3d12.txt")
-                let raw = try? String(contentsOf: url, encoding: .utf8)
-                let val = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let raw = MadeiraConfig.get("d3d12")   /* ml1095 */
+                let val = raw ?? ""
                 if val == "1" {
                     let dir = Bundle.main.bundlePath + "/d3d12"
                     let dylib = dir + "/libmetalirconverter.dylib"
@@ -2127,7 +2121,7 @@ struct ContentView: View {
                         logStore.log("madeira-d3d12: M1 canary FAILED (\(fails) checks)", level: .error)
                     }
                 } else {
-                    logStore.log("madeira-d3d12: gate off (madeira-d3d12.txt \(raw == nil ? "unreadable" : "= '\(val)'"))", level: .debug)
+                    logStore.log("madeira-d3d12: gate off (madeira.cfg d3d12 \(raw == nil ? "unset" : "= '\(val)'"))", level: .debug)
                 }
             }
 
@@ -2138,11 +2132,10 @@ struct ContentView: View {
             // baseline: with the file absent the process behaves exactly as
             // ml820 did. Round-trip COUNT is the cost being attacked -- one
             // gameplay frame spent 369 ms of 524 ms on 2,197 serialized calls.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-remote-batch.txt"), encoding: .utf8),
+            if let txt = MadeiraConfig.get("remote-batch"),
                txt.trimmingCharacters(in: .whitespacesAndNewlines) == "1" {
                 setenv("DXMT_REMOTE_BATCH", "1", 1)
-                logStore.log("remote Metal: message coalescing ON via madeira-remote-batch.txt", level: .success)
+                logStore.log("remote Metal: message coalescing ON via madeira.cfg remote-batch", level: .success)
             }
 
             // ml761: top-level API census. Documents/madeira-apicensus.txt == "1"
@@ -2152,11 +2145,10 @@ struct ContentView: View {
             // batch carries GUEST handles -- raw pointer casts, meaningless on
             // another machine -- so every handle producer and consumer has to
             // be redirected together.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-apicensus.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("apicensus") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 setenv("DXMT_API_CENSUS", v, 1)
-                logStore.log("API census: DXMT_API_CENSUS=\(v) via madeira-apicensus.txt")
+                logStore.log("API census: DXMT_API_CENSUS=\(v) via madeira.cfg apicensus")
             }
 
             // ml760: shadow-pack mode. Documents/madeira-shadow.txt == "1" packs
@@ -2166,11 +2158,10 @@ struct ContentView: View {
             // check that matters is packed counts equalling census counts: a
             // silently skipped command would otherwise surface as a subtly wrong
             // frame on another machine.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-shadow.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("shadow") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 setenv("DXMT_SHADOW_PACK", v, 1)
-                logStore.log("shadow pack: DXMT_SHADOW_PACK=\(v) via madeira-shadow.txt")
+                logStore.log("shadow pack: DXMT_SHADOW_PACK=\(v) via madeira.cfg shadow")
             }
 
             // ml758: wmtcmd census. Documents/madeira-census.txt == "1" counts
@@ -2179,11 +2170,10 @@ struct ContentView: View {
             // before serialising wmtcmd_* for the remote Metal transport --
             // building a schema for all 59 on speculation would be weeks of
             // work for commands no title may ever issue.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-census.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("census") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 setenv("DXMT_CMD_CENSUS", v, 1)
-                logStore.log("wmtcmd census: DXMT_CMD_CENSUS=\(v) via madeira-census.txt")
+                logStore.log("wmtcmd census: DXMT_CMD_CENSUS=\(v) via madeira.cfg census")
             }
 
             // ml757: FEX arena placeholder. Documents/madeira-arena.txt == "1"
@@ -2193,11 +2183,10 @@ struct ContentView: View {
             // x64 before the first window. Proven correct on the research VM
             // (8GB held, 0 of 123 guest images inside it) -- turn on only once
             // FEX consumes WINE_IOS_FEX_ARENA_BASE/SIZE instead of choosing.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-arena.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("arena") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 setenv("MADEIRA_FEX_ARENA", v, 1)
-                logStore.log("FEX arena placeholder: MADEIRA_FEX_ARENA=\(v) via madeira-arena.txt")
+                logStore.log("FEX arena placeholder: MADEIRA_FEX_ARENA=\(v) via madeira.cfg arena")
             }
 
             // ml748: W^X A/B probe. Documents/madeira-wxprobe.txt == "1" runs it.
@@ -2211,10 +2200,9 @@ struct ContentView: View {
             // machines can. Runs here because it needs the real container, the
             // real sandbox and a live cs_wx_enabled map -- a standalone binary
             // over SSH already answered this wrongly once.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-wxprobe.txt"), encoding: .utf8),
+            if let txt = MadeiraConfig.get("wxprobe"),
                txt.trimmingCharacters(in: .whitespacesAndNewlines) == "1" {
-                logStore.log("W^X probe armed via madeira-wxprobe.txt", level: .success)
+                logStore.log("W^X probe armed via madeira.cfg wxprobe", level: .success)
                 jit_wx_probe()
             }
 

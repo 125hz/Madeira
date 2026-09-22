@@ -1471,3 +1471,146 @@ Still wrong, in the order to look at them:
    (restart the rmetald loop without MTL_SHADER_VALIDATION) before any FPS
    number is quoted. Then transport batching.
 5. Re-enable r.Nanite, GI, VSM, volumetrics in the batch one at a time.
+
+## Addendum 34 — 2026-09-16: NANITE RENDERS; the hatching was never ours; four Lumen theories killed; Lumen still floods the cave (ml933-ml935)
+
+Written for review. The headline results are solid; several of my own
+intermediate conclusions were wrong and are retracted explicitly below, so
+they do not get re-inherited.
+
+### Milestones
+
+1. **Nanite renders.** `r.Nanite=1` works. `MicropolyRasterize`,
+   `HWRasterizeVS/PS`, `NodeAndClusterCull`, `RasterBinBuild`, `PatchSplit`,
+   `CalculateSafeRasterizerArgs` all convert and dispatch. In the best run
+   `HWRasterize=1454` vs `MicropolyRasterize=750`, i.e. the hardware path
+   carries more work than the compute path.
+2. **The black hatching on rock faces is gone, and it was never a defect in
+   our stack.** It is UE's interleaved-gradient dither for LOD crossfades on
+   *non-Nanite* meshes. Nanite has continuous LOD and never dithers, so
+   turning Nanite on removed the source. ⚠️ This also means the earlier
+   CrossOver reference screenshot was taken with Nanite ON and therefore
+   never had the dither either — several rounds of "our tonemapper amplifies
+   noise ~6x versus the reference" were measured against a reference whose
+   input had nothing to amplify. The tonemapper and TSR were behaving
+   correctly the whole time. See Retractions.
+
+### Code changes
+
+| rev | change | why |
+| --- | --- | --- |
+| ml933 | rmetald dump: array-aware depth copy (`depth2d_array`), per-slice dumps (`_sN`), 3D volumes dumped by z-plane, raw float `.txt` beside small float textures, dump dir wiped per dump | every depth dump had been a constant since ml932 made all 2D textures arrays; slice 0 only hid array content; 3D textures were skipped outright; `rm_tone` clamps negatives to 0 and saturates at 255, which is exactly where control-buffer values live |
+| **ml934** | `exec_begin_render`: allow a render pass with **no colour target and no depth**; area comes from the viewport | Nanite's HW rasteriser binds neither and writes only UAVs. We returned 0, so every such draw was dropped — and dropped *before* the skip counter, so nothing logged it. This is the Nanite hole fix. |
+| ml934b | `exec_same_targets`: include the render area for attachment-less passes (`enc_w/enc_h`), via one shared `exec_attachless_area()` helper | with no attachments there was nothing to compare, so a pass at 12288x2048 could inherit an encoder created at 736x416 |
+| ml934d | `MC_RTS`: end the open encoder when either side of the boundary is attachment-less | Metal tracks hazards only BETWEEN encoders. Consecutive attachment-less passes shared one encoder, so a cull pass could read a list the previous pass had not finished writing — raced differently every frame. This is the "geometry cycles in and out" fix. |
+| ml935 | probe only: log `FirstWSlice`/`WSize` for 3D UAVs | see Killed theories #4 |
+
+Deployed hashes (bundle `35903541-…`, VM `192.168.64.9`): ml934 `2ddffe69`,
+ml934b `be8117a3`, ml934d `df80f623`, ml935 `a90f5749`. `Madeira-ml934.ipa`
+at the repo root contains ml934 **only** — not ml934b/d/ml935.
+
+### Solid, with evidence
+
+- Attachment-less passes are used by four shader pairs, not just Nanite:
+  `HWRasterizeVS/PS` (294 draws), `ShadowObjectCullVS/PS` (12),
+  `RasterizeToRectsVS/ClearTextureRWPS` (3), `MeshSDFObjectCullVS/PS` (3).
+  The latter three had been silently dropped since long before Nanite or
+  Lumen — ml934 is the first time they have ever executed.
+- ml934 tripled shadow-caster coverage: the 12288x2048 atlas went from
+  **63.2%** still at the cleared value to **20.5%**. Nanite rasterises shadow
+  depths, so the dropped draws were removing casters as well as visible
+  geometry. That is why light streamed through solid rock.
+- 64-bit atomics are real, measured: `InterlockedMax` on `RWTexture2D<uint64_t>`
+  and `InterlockedMax64` on `RWByteAddressBuffer` both convert through MSC and
+  return the correct maximum with 64 threads contending. Nanite's raster is
+  not bluffing. **M4 Max (Apple9) only** — the A15 and the paravirtual device
+  are untested, and matter if we ever render locally.
+- Array-slice mapping is correct in both directions: UAV write and SRV read
+  through a one-slice view of a 4-slice array, with `ForceTextureArray`, 3/3.
+- `ExecuteIndirect` has never been called, even with Nanite on. The
+  count-buffer gap is still unimplemented but still dormant.
+- Lumen executes and its surface cache carries light: card depth 0% blank,
+  albedo 74%, normal 55%, and **two of four** RG11B10F card lighting atlases
+  populated at 78% blank — the same footprint as the geometry atlases.
+  `LumenCardBatchDirectLightingCS` dispatches 29 threadgroups; radiosity and
+  `CombineLumenSceneLightingCS` run. `ConeTraceGlobalOcclusion` goes 1 -> 0
+  when Lumen turns on, so DFAO is correctly handed over, not double-counted.
+
+### Killed theories (all tested, none cost a device run except #4)
+
+1. **Tonemapper amplifies noise.** Refuted by the Nanite result: the dither
+   source was the non-Nanite mesh path. The tonemapper is a monotone
+   per-pixel curve — 98.7% sign agreement with its input, 46.8% (i.e.
+   uncorrelated) with the pre-TSR buffer, so it reads the right resource.
+2. **RG11B10Float not writable from compute.** `RGBA8Unorm`, `RGBA16Float`,
+   `RG11B10Float`, `RGB9E5Float` all accept `ShaderWrite` and the data lands.
+3. **3D UAV writes broken.** Full production path (DXIL -> MSC with
+   `ForceTextureArray` -> descriptor table -> `kIRArgumentBufferBindPoint`):
+   all 8 depth slices of an 8^3 `RWTexture3D<float>` wrote exactly.
+4. **3D UAV depth windows ignored.** True — `FirstWSlice`/`WSize` are read
+   for RTVs and never for UAVs, and Metal cannot express a depth window in a
+   view. But the ml935 probe shows **`FirstWSlice=0` in all 16 cases**, so it
+   is dormant. Worth fixing for correctness, not a current cause.
+5. **Oversized attachment-less render area page-faults.** A 100 MB overrun
+   into a 16 KB buffer completes cleanly; out-of-bounds fragment writes do
+   not fault on this GPU. So the GPU page fault seen with Lumen (30 errors,
+   `enc#166583 render`, `kIOGPUCommandBufferCallbackErrorPageFault`) was not
+   this. Those errors have not recurred since ml934b.
+
+### Retractions (my errors — please check the surviving reasoning too)
+
+- "The shadow atlas is empty" — false. The depth dump path was broken by
+  ml932 (a `depth2d` binding fed a 2DArray), so every depth dump read a
+  constant. 1424 shadow-depth draws/frame were happening all along.
+- "TSR locks the dither into its history" then "TSR works, the tonemapper
+  amplifies" — both overstated. I mislabelled the 816x460 RGB10A2 render
+  targets as TSR's output; they are the tonemapper's. Superseded entirely
+  by the Nanite finding.
+- "Lumen isn't lighting anything" — over-read. Two of the four card lighting
+  atlases are populated.
+- "The distance field is 93% saturated" — **false, and the worst of these.**
+  Those 1224x692 R8 volumes are the TSR history guide planes, which I had
+  already characterised at 75-82% saturated earlier in the same session. The
+  actual candidate volumes (1024^2 and 512^2, 8 planes) are ~75% near-zero,
+  plausibly normal for a sparse brick atlas. **There is no evidence the
+  distance field is broken.**
+- "The bloom flashes are downstream of the missing geometry" — false; they
+  persist with geometry complete. Scene colour peaks at 18.6 linear with
+  0.05% of pixels above 10, which is sane. The flashes are downstream of the
+  cave being too bright: auto-exposure lifts the frame to make a dim cave
+  visible, which blows the genuinely bright exit past the bloom threshold.
+
+### Open
+
+1. **Lumen floods the cave.** Cave-to-sky ratio ~196x against the
+   reference's >=48,000x (reference numbers are display values, so the true
+   linear gap is larger). Cave median linear radiance 0.095. The one
+   remaining anomaly is lopsided trace counts —
+   `ScreenProbeTraceScreenTextures=33`, `TraceMeshSDFs=3`, `TraceVoxels=1` —
+   but **I do not know what those should be**, which is why four theories
+   died. Recommended: stop theorising and get ground truth from D3DMetal.
+   Both sides now carry matched `UserEngine.ini` (Nanite on, Lumen on,
+   960x540, identical scalability groups); `xcap.dylib` in the bottle is now
+   a **universal** binary (the arm64-only build killed every wine process —
+   `cxbottle.conf` backup is `cxbottle.conf.bak-madeira`).
+2. **Intermittent crash, ~50% of launches, unrelated to Nanite or Lumen.**
+   Presents as a hang because a UE fatal deadlocks against its own crash
+   reporter. Signature: 7-8 `C0000005`, first at `exe+0x5F63/0x5F64` band —
+   a **store**, `movq %rax,0x8(%rbx)`, inside a bounds-checked unrolled copy
+   loop — then repeated `exe+0xF46D55`, `lock cmpxchgq %r14,(%rcx)` with rcx
+   NULL. Runs that reach the level have **zero** C0000005. So some buffer is
+   shorter than the game believes. Eliminated: ClearUAV byte-fill (4
+   occurrences in healthy runs, 0 in one crashing run), QueryInterface
+   refusals (identical 16 IIDs in all runs), unknown formats (same 6),
+   pipeline failures (none), GPU errors (0), `GetCopyableFootprints`
+   (conservative; unknown formats fall back to 4 bytes/pixel and log).
+   Needs a probe mapping a faulting address to the owning D3D12 resource.
+3. **`ClearUnorderedAccessViewUint` with value 1 writes `0x01010101`** — the
+   fill is byte-granular. Real, fires ~4x/run, does not correlate with any
+   crash. Texture UAV clears are also a silent no-op (never fired yet).
+4. **FPS** ~2 with Nanite, transport-latency bound: RPCs are 50-70% of wall
+   at ~0.2 ms mean, ~30-60 flushes per census window. Batching is the fix.
+5. ⚠️ **The periodic auto-dump (ml899, every 100 presents from 1500) is
+   gated by `/tmp/rmetald-no-autodump`, which a `/tmp` wipe deletes.** It
+   then freezes rendering for seconds every 100 frames and reads as a
+   rendering bug. Recreate that file after any reboot.

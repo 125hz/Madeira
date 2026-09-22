@@ -1733,6 +1733,43 @@ void abort_thread( int status )
  */
 void abort_process( int status )
 {
+#ifdef WINE_IOS
+    /* ml937: _exit() HERE KILLED THE WHOLE APP.
+     *
+     * On a normal Wine host one Windows process is one Unix process, so
+     * `_exit()` is the correct immediate kill for TerminateProcess(). On iOS
+     * every Windows process is a PSEUDO-process inside the single Mach task,
+     * and `_exit()` is not shimmed the way exit() is (shims/wine_ios_exit.h) —
+     * so any guest calling TerminateProcess(GetCurrentProcess(), code) took the
+     * app, wineserver, and every other pseudo-process down with it, with no
+     * crash report and no further log output because the exit is clean.
+     *
+     * Found by a game whose exe spawns its own bundled launcher and then
+     * terminates itself with code 0: the child had a full PEB, private
+     * ARM64EC ntdll, TEB and Mach handler and was one instruction from its PE
+     * entry point when the parent's self-terminate erased the task. That is
+     * ordinary Windows behaviour for a bootstrapper exe, and there were ZERO
+     * exceptions in the run — nothing said "the app should have died here".
+     *
+     * Correct mapping: tear down THIS pseudo-process only, exactly as
+     * exit_process() does. The two paths differ on Windows in that abort skips
+     * LdrShutdownProcess (no DLL_PROCESS_DETACH, no atexit), which has already
+     * happened by the time we get here — the unix-side teardown is the same
+     * work either way: close this process's wineserver master socket (the EOF
+     * is how the server learns the process died and wakes its waiters), drop
+     * its fd cache and reclaim its JIT-pool allocations.
+     *
+     * Still owed: process_exit_wrapper's exit() only longjmps on a
+     * pseudo-process's MAIN thread; a non-main thread calling it falls back to
+     * pthread_exit and leaves that process's other threads running on a
+     * reclaimed pool. That hole predates this change and is shared with
+     * exit_process. */
+    pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
+    ERR( "abort_process: status=0x%x — tearing down this pseudo-process only (ml937; was _exit, which killed the app)\n",
+         (unsigned int)status );
+    process_exit_wrapper( get_unix_exit_code( status ));
+    /* noreturn */
+#endif
     _exit( get_unix_exit_code( status ));
 }
 

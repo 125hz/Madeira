@@ -95,6 +95,7 @@ struct FPSOverlay: View {
                     Text(String(format: "%.1f", fps))
                         .foregroundColor(fpsColor)
                     pacingPill
+                    capturePill
                 }
                 .font(.system(.caption, design: .monospaced))
                 .padding(6)
@@ -123,6 +124,7 @@ struct FPSOverlay: View {
                         .foregroundColor(fpsColor)
                         .frame(width: 40, alignment: .trailing)
                     pacingPill
+                    capturePill
                 }
                 .font(.system(.caption, design: .monospaced))
                 .padding(.horizontal, 8)
@@ -158,6 +160,24 @@ struct FPSOverlay: View {
                 vsyncMode = vsyncMode == 1 ? 0 : (vsyncMode == 0 ? 2 : 1)
                 madeira_set_vsync_locked(vsyncMode)
                 ProMotionIntent.shared.setActive(vsyncMode != 1)
+            }
+    }
+
+    /// ml1098: one tap = capture the next frame (every render pass's attachments
+    /// to Documents/capture/, plus the full draw-dump in the log). The pill
+    /// flashes for a second so a tap is visibly taken.
+    @State private var captureFlash = false
+    private var capturePill: some View {
+        Text("CAP")
+            .foregroundColor(captureFlash ? .black : .cyan)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(captureFlash ? Color.cyan : Color.clear)
+            .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.cyan, lineWidth: 1))
+            .onTapGesture {
+                madeira_capture_request(1)
+                captureFlash = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { captureFlash = false }
             }
     }
 

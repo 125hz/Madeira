@@ -250,7 +250,7 @@ void winios_dump_window_tree(void)
 /* Implemented in app/Madeira/Winios/Winios.m (weak, same pattern as the
  * driver hooks below). Called on wine threads — the app side copies the
  * bits before returning and uploads on the main thread. */
-extern void winios_surface_present( HWND hwnd, int dirty_x, int dirty_y, int dirty_w, int dirty_h,
+extern int winios_surface_present( HWND hwnd, int dirty_x, int dirty_y, int dirty_w, int dirty_h,
                                     int surf_w, int surf_h, int stride, const void *bits ) __attribute__((weak));
 extern void winios_window_frame( HWND hwnd, int x, int y, int w, int h, int visible,
                                  int cx, int cy, int cw, int ch ) __attribute__((weak));
@@ -419,10 +419,15 @@ static BOOL winios_surface_flush( struct window_surface *surface, const RECT *re
         int surf_w = color_info->bmiHeader.biWidth;
         int surf_h = color_info->bmiHeader.biHeight;
         if (surf_h < 0) surf_h = -surf_h;
-        winios_surface_present( surface->hwnd,
-                                dirty->left, dirty->top,
-                                dirty->right - dirty->left, dirty->bottom - dirty->top,
-                                surf_w, surf_h, surf_w * 4, color_bits );
+        /* ml1028: propagate the snapshot allocation result. dce.c only calls
+         * reset_bounds() when we return TRUE, so returning FALSE keeps the
+         * dirty region and the frame is repainted on a later flush instead of
+         * the copy throwing an uncaught ObjC exception and killing us. */
+        if (!winios_surface_present( surface->hwnd,
+                                     dirty->left, dirty->top,
+                                     dirty->right - dirty->left, dirty->bottom - dirty->top,
+                                     surf_w, surf_h, surf_w * 4, color_bits ))
+            return FALSE;
     }
     return TRUE;
 }

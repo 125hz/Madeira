@@ -1,0 +1,15 @@
+# Madeira configuration (ml1095): one file for every switch.
+# key = value; lines starting with # are comments; the last line wins.
+# Keys are the old file names without 'madeira-' and '.txt'.
+# Environment exports: env.NAME = value. DXMT options: dxmt = a=b;c=d.
+
+# memory
+swap-mb = 3072
+vram-mb = 1536
+pool = 640
+totalphys = 4096
+swap-canary = 0
+
+# emulator environment (FEX reads FEX_* from the process environment)
+env.FEX_TSOENABLED = 1
+env.FEX_EXTENDEDVOLATILEMETADATA = oo2core_5_win64.dll:bink2w64.dll
