@@ -256,6 +256,8 @@ enum StikJITHelper {
         }
         var rxPtrOpt: UnsafeMutableRawPointer? = nil
         var attempts = 0
+        let fastPlacement = getenv("MADEIRA_JIT_FAST_PLACEMENT").map { String(cString: $0) != "0" } ?? true
+        LogStore.shared.log("[jit-placement] ml1190 early fixed-address fallback=\(fastPlacement ? 1 : 0)")
 
         // Phase 1: the kernel's own pick, via the debugger's _M (ANYWHERE-only).
         for _ in 0..<8 {
@@ -284,6 +286,10 @@ enum StikJITHelper {
             } else {
                 LogStore.shared.log("  bad region kept as pin (vm_deallocate kr=\(dkr))")
             }
+            // A large ANYWHERE allocation can keep walking the forbidden band.
+            // Each debugger round trip suspends the entire app for seconds.
+            // Try the existing verified fixed-address path after one rejection.
+            if fastPlacement { break }
         }
 
         // Phase 2 (ml962): EXPLICIT PLACEMENT. The debugger's allocator is

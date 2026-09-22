@@ -563,7 +563,9 @@ private struct LibraryTabControl: UIViewRepresentable {
         control.addTarget(context.coordinator, action: #selector(Coordinator.changed(_:)), for: .valueChanged)
         // Keep native tracking while allowing the surrounding glass capsule to
         // supply the only background, including during a held selection.
-        let clear = UIGraphicsImageRenderer(size: CGSize(width: 1, height: 1)).image { _ in }
+        // Background image height participates in UIKit's segment layout.
+        // Keep a full-height transparent canvas so the symbol is not clipped.
+        let clear = UIGraphicsImageRenderer(size: CGSize(width: 1, height: 52)).image { _ in }
         for state: UIControl.State in [.normal, .selected, .highlighted, [.selected, .highlighted]] {
             control.setBackgroundImage(clear, for: state, barMetrics: .default)
         }
@@ -696,7 +698,7 @@ struct LibraryView: View {
                 }
             }.padding(.bottom, 5).padding(.top, 8)
         }
-        .onAppear { fputs("[frontend-layout] ml1170 native tabs and metadata=\(refinements ? 1 : 0)\n", stderr) }
+        .onAppear { fputs("[frontend-layout] ml1190 full-height native tab symbols and metadata=\(refinements ? 1 : 0)\n", stderr) }
         .onReceive(controller.commands) { command in
             if selected == nil, !browser, command == "tab" { tab = 1 - tab }
         }
@@ -902,12 +904,12 @@ struct LibraryDetail: View {
                                 }.clipped()
                         )
                 }
-                Section("Library details") {
+                if entry.desktop != true { Section("Library details") {
                     TextField("Title", text: $entry.title)
                     Button("Find on Steam", systemImage: "magnifyingglass") { findCover = true }
                     Button("Choose cover image", systemImage: "photo") { importCover = true }
                     if entry.coverFile != nil { Button("Use Steam artwork") { entry.coverFile = nil } }
-                }
+                } }
                 Section("Display") {
                     Picker("Resolution", selection: $entry.resolution) {
                         ForEach(["640x480", "800x600", "960x540", "1024x768", "1280x720", "1280x960", "1920x1080", "2560x1440"], id: \.self) { Text($0).tag($0) }
@@ -1141,7 +1143,7 @@ struct LibraryHUD: View {
         GeometryReader { geo in
             ZStack(alignment: .topLeading) {
                 if model.launching, let entry = model.entries.first(where: { $0.id == model.current }) {
-                    LibraryArtwork(entry: entry, backdrop: geo.size.width > geo.size.height).overlay(.black.opacity(0.65)).ignoresSafeArea()
+                    LibraryArtwork(entry: entry, backdrop: true).overlay(.black.opacity(0.65)).ignoresSafeArea()
                     launchView(entry, geometry: geo)
                 }
                 if !model.launching && model.performance { LibraryFloatingItem(isMenu: false, viewport: geo.size, insets: geo.safeAreaInsets) }

@@ -9380,6 +9380,54 @@ static void ios_dump_guest_frame( ucontext_t *context, ULONG_PTR wow_base )
                 hex[sizeof(bytes) * 2] = 0;
                 dprintf( 2, "[guest-code] ml1180 candidate=%08x start=%08x bytes=%s\n",
                          words[i], words[i] - 32, hex );
+                /* Resolve common position-independent call/pop address builders
+                 * in the captured bytes. This is diagnostic only: candidates
+                 * are not a disassembly or proof that the call executed. Stop
+                 * at any unrecognized instruction and never alter guest state. */
+                for (j = 0; j + 6 <= 32; ++j)
+                {
+                    unsigned k, reg, steps;
+                    uint32_t target, immediate;
+                    unsigned char called[48];
+                    char called_hex[sizeof(called) * 2 + 1];
+                    if (bytes[j] != 0xe8 || bytes[j+1] || bytes[j+2] || bytes[j+3] || bytes[j+4] ||
+                        bytes[j+5] < 0x58 || bytes[j+5] > 0x5f) continue;
+                    reg = bytes[j+5] - 0x58;
+                    target = words[i] - 32 + j + 5;
+                    k = j + 6;
+                    for (steps = 0; steps < 8 && k + 2 <= 32; ++steps)
+                    {
+                        if (bytes[k] == 0xff && bytes[k+1] == 0xd0 + reg)
+                        {
+                            unsigned n;
+                            if (ios_guest_class( wow_base, target ) != 'x' ||
+                                !ios_guest_read( wow_base, target, called, sizeof(called) )) break;
+                            for (n = 0; n < sizeof(called); ++n)
+                            {
+                                called_hex[2*n] = digits[called[n] >> 4];
+                                called_hex[2*n+1] = digits[called[n] & 15];
+                            }
+                            called_hex[sizeof(called)*2] = 0;
+                            dprintf( 2, "[guest-callee] ml1190 caller=%08x target=%08x bytes=%s\n",
+                                     words[i], target, called_hex );
+                            break;
+                        }
+                        if (k + 5 <= 32 && bytes[k] == 0x05 && reg == 0)
+                        {
+                            memcpy( &immediate, bytes + k + 1, 4 );
+                            target += immediate;
+                            k += 5;
+                        }
+                        else if (k + 3 <= 32 && bytes[k] == 0x83 && bytes[k+1] == 0xc0 + reg)
+                        {
+                            target += (int8_t)bytes[k+2];
+                            k += 3;
+                        }
+                        else if (k + 5 <= 32 && bytes[k] >= 0xb8 && bytes[k] <= 0xbf && bytes[k] != 0xb8 + reg)
+                            k += 5;
+                        else break;
+                    }
+                }
                 ++emitted;
             }
         }

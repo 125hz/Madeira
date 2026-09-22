@@ -173,8 +173,7 @@ and [Liquid Glass API](https://developer.apple.com/documentation/swiftui/view/gl
 - The native icon-only tab control has no inner rectangular backgrounds. Library
   cards center in the available width; cards/compact/list layouts and last-played,
   alphabetical, date-added and size sorting remain available. Detail artwork is
-  restricted to the header and is less blurred. Portrait startup uses centered
-  portrait artwork; landscape uses the wide hero image.
+  restricted to the header and is less blurred. Startup uses the wide hero image in both orientations (restored in ml1190).
 - Size scans now ascend conventional binary subdirectories such as `bin`,
   `Binaries` and `Win32` to include the installation's assets. Existing cached
   sizes refresh automatically. Unusual layouts remain an estimate of the detected
@@ -202,3 +201,60 @@ and [Liquid Glass API](https://developer.apple.com/documentation/swiftui/view/gl
   Disable with `MADEIRA_GUEST_LOG_ERRORS=0`, `MADEIRA_GUEST_CALLER_CODE=0`, and
   `MADEIRA_MOUSE_DELIVERY=0`, respectively. These are diagnostics, not compatibility
   fixes. Native/PE build verification cannot establish a successful device run.
+
+
+## ml1190: fewer readback waits and redundant attachment stores
+
+- Restoring a managed 2D/cube mirror now batches stale mip/face transfers into
+  one submission and wait, with a 16 MiB batch budget. A single larger surface
+  keeps its old allocation size. Allocation failure falls back to individual
+  downloads. CPU mirrors are populated only after GPU completion; decoded BC
+  sole-copy mirrors remain untouched. `DXMT_D9_BATCH_READBACK=0` restores separate
+  waits. `[readback-batch] ml1190` reports policy, actual batches and waits saved.
+- A render target immediately overwritten by a matching full clear no longer
+  needs its previous contents stored to memory. Matching requires the same view,
+  dimensions, array coverage and base subresource, with no resolve attachment.
+  Dependency ordering is retained. `DXMT_CLEAR_DISCARD_STORE=0` disables this;
+  `[clear-store] ml1190` reports actual stores omitted. Device correctness and
+  performance still need checking, especially after resolution changes.
+- JIT allocation enters the existing verified fixed-address fallback after one
+  rejected debugger allocation, avoiding repeated multi-second suspension in the
+  forbidden guest address band. `MADEIRA_JIT_FAST_PLACEMENT=0` restores eight
+  attempts; `[jit-placement] ml1190` reports policy. This addresses an observed
+  retry sequence, not a proven cause of every desktop crash.
+- Native tab backgrounds now have a full-height transparent canvas; the previous
+  one-pixel canvas could clip the symbols. Desktop omits Library details, and
+  portrait startup again uses the same wide artwork as landscape.
+- `[guest-callee] ml1190` adds bounded runtime-code candidates for recognized
+  position-independent indirect-call address builders. It shares the existing
+  `MADEIRA_GUEST_CALLER_CODE=0` switch and four-dump limit. It never changes guest
+  execution. The invalid guest return remains unresolved. A successful build
+  does not establish that a device startup/loading problem is fixed.
+
+For comparisons, keep resolution, frame cap and thermal conditions consistent,
+record the same scene after warm-up, and send the full saved log. Relevant tags:
+`[frame]`, `[frame-tail]`, `[gpu-work]`, `[readback-batch]`, `[clear-store]`,
+`[submit-causes]`, `[device-load]`, `[pipeline-wait]`, `[guest-log]`,
+`[guest-callee]`, `[guest-frame]`, `[guest-seh]`, and `[jit-placement]`.
+
+- The PE headless display backend now returns user32's real primary monitor
+  handle in DXGI output descriptions. A private sentinel previously disagreed
+  with Wine's virtual-monitor identity, so clients comparing the handles could
+  fail to associate an otherwise valid output. `DXMT_WSI_MONITOR_IDENTITY=0`
+  restores the sentinel. `[monitor-identity] ml1190` records the selected handle;
+  `[dxgi-modes] ml1190` reports the first 16 supported-format mode queries
+  (`DXMT_DISPLAY_MODE_STATS=0` disables those reports).
+- All three DXMT PE architectures are refreshed, including the previously stale
+  64-bit display DLLs. Release optimization is now the default for each; existing
+  Meson trees are explicitly reconfigured rather than silently keeping debug
+  settings. `MADEIRA_DXMT_PE_BUILDTYPE=debug` is the build-time rollback.
+  `[dxmt-pe-build] ml1190` records the selected build type in the build log.
+- The additional local device log 135 identifies a resolution-list exception
+  before settings-dependent loading failures. Static IL inspection is consistent
+  with an empty list, and the display identity fix addresses a concrete API
+  mismatch. The owner still needs to confirm that mode enumeration resumes and
+  loading succeeds; this is not evidence of a storage-speed problem.
+
+- The existing D3D9 census TLS pointer is explicitly constant-initialized across
+  translation units. This resolves the ARM64EC external-initializer link failure
+  found while refreshing that architecture; no new TLS slot or FEX change is made.

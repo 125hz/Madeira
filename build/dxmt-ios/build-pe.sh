@@ -118,17 +118,11 @@ install_as() {
 # winemetal_thunks.c's UNIX_CALL from the asserting form to the quiet one
 # (src/winemetal/winemetal_thunks.c:35-44) -- confirmed to still compile.
 #
-# The aarch64/arm64ec stages are untouched by this: their default stays
-# `debug`, scoping the change to the i386 (D3D9) stage only.  Set
-# MADEIRA_DXMT_PE_BUILDTYPE=debug (and delete research/dxmt/build-pe-<arch>,
-# since meson only reads this at setup time) to go back to an unoptimised
-# i386 build for a bisect; MADEIRA_DXMT_PE_BUILDTYPE, when set, still applies
-# to every requested arch, matching the previous single-knob behaviour.
+# Use release for every shipped architecture. Reconfigure existing trees too:
+# otherwise a cached debug setup silently defeats the requested build type.
+# MADEIRA_DXMT_PE_BUILDTYPE=debug restores unoptimized builds for a bisect.
 default_pe_buildtype() {
-    case "$1" in
-        i386) echo release ;;
-        *)    echo debug ;;
-    esac
+    echo release
 }
 
 should_install() {
@@ -287,7 +281,9 @@ EOF
             "$build_sub"
     else
         echo "--- reusing configured $build_sub"
+        meson configure "$build_sub" -Dbuildtype="$buildtype"
     fi
+    echo "[dxmt-pe-build] ml1190 arch=$arch buildtype=$buildtype"
 
     if [ ${#targets[@]} -gt 0 ]; then
         want=()
