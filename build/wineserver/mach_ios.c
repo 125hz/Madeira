@@ -1138,6 +1138,22 @@ int ios_ctx_set_enabled(void)
     return env;
 }
 
+/* ml1330: a thread created suspended reports its own start context (see
+ * stop_thread() in thread.c). MADEIRA_CTX_START_WAIT=0 restores the immediate
+ * Mach snapshot of a thread that has not finished starting. */
+int ios_ctx_start_wait_enabled(void)
+{
+    static int env = -1;
+    if (env < 0)
+    {
+        const char *e = getenv( "MADEIRA_CTX_START_WAIT" );
+        env = (e && e[0] == '0') ? 0 : 1;
+        fprintf( stderr, "[ctx-start] ml1330 MADEIRA_CTX_START_WAIT=%d (0 = snapshot a thread "
+                 "that is still starting)\n", env );
+    }
+    return env;
+}
+
 int ios_apply_thread_context( struct thread *thread, const struct context_data *native )
 {
     mach_msg_type_name_t type;

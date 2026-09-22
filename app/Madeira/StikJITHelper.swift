@@ -56,17 +56,98 @@ enum StikJITHelper {
         }
     }
 
-    /// Poll every 0.5s until CS_DEBUGGED is set, then call completion.
+    /// Poll every 0.5s until a debugger is attached, then call completion.
+    /// ml1330: waits for P_TRACED (jit_debugger_attached), not the sticky
+    /// CS_DEBUGGED flag, which stays set after StikDebug has gone and would
+    /// report success before any re-attach. Gives up after 60 s. On success the
+    /// JIT pool is allocated immediately, while StikDebug is certainly alive.
     private static func pollForJIT(completion: @escaping (Bool) -> Void) {
+        let started = Date()
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { timer in
-            if jit_check_debugged() {
+            if jit_debugger_attached() {
                 timer.invalidate()
                 // ml962: a fresh attach re-arms BRK servicing, so a pool CAN be
                 // allocated again after an earlier detach.
                 debuggerDetached = false
                 unsetenv("MADEIRA_DETACHED")
-                LogStore.shared.log("JIT enabled! (CS_DEBUGGED set)", level: .success)
-                completion(true)
+                LogStore.shared.log("JIT enabled! (debugger attached)", level: .success)
+                prepareEarlyPool(trigger: "enable") { _ in completion(true) }
+            } else if Date().timeIntervalSince(started) > 60 {
+                timer.invalidate()
+                LogStore.shared.log("[jit-early] ml1330 no debugger attached within 60 s of opening StikDebug", level: .error)
+                completion(false)
+            }
+        }
+    }
+
+    // ── ml1330: allocate while the debugger is fresh ─────────────────────────
+    //
+    // Device logs 148 and 156: the first launch of a run died on the pool
+    // allocation BRK, 1 and 14 minutes after JIT was enabled (downloads ran in
+    // between). Every run that allocated within ~15 s succeeded (150, 153, 157).
+    // StikDebug is killed by iOS for CPU use ~52 s after attaching (see the
+    // ml524 early-detach note in ContentView), and nothing in this process
+    // catches a BRK before a Wine session installs its handlers, so a late BRK
+    // ended the app. The pool is a process-lifetime resource anyway (ml962), so
+    // take it the moment a debugger is observed, then detach cleanly.
+    // MADEIRA_JIT_EARLY_POOL=0 restores allocation at first launch.
+
+    /// Pool that the next launch will reuse without a debugger round trip.
+    /// Read without poolLock: that lock is held across the multi-second
+    /// allocation BRK, and the UI polls this every two seconds.
+    private static var poolAvailable = false
+    static var poolReady: Bool { poolAvailable }
+
+    /// Whether a launch can obtain its pool: one already exists, or a debugger
+    /// that can service the allocation BRK is attached now.
+    static var readyToLaunch: Bool {
+        poolReady || (!debuggerDetached && jit_debugger_attached())
+    }
+
+    private static var earlyInFlight = false
+
+    /// Install the SIGTRAP fallback (skip a stray BRK, x0 = 0) once no debugger
+    /// is attached -- but only before any Wine session was set up, because
+    /// Wine installs and owns its own SIGTRAP handler from then on. Retried
+    /// once after a second: right after a detach P_TRACED can still read set.
+    private static func armTrapFallback() {
+        guard getenv("WINE_IOS_JIT_RX") == nil else { return }
+        jit_install_trap_handler()
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) {
+            if getenv("WINE_IOS_JIT_RX") == nil { jit_install_trap_handler() }
+        }
+    }
+
+    /// Allocate the JIT pool now if a debugger is attached and no pool exists,
+    /// then detach. Size: madeira-pool.txt, else the last session's size,
+    /// else the direct-launch default (512 MB).
+    static func prepareEarlyPool(trigger: String, completion: ((Bool) -> Void)? = nil) {
+        guard LibraryFlags.enabled("MADEIRA_JIT_EARLY_POOL"), !earlyInFlight, !poolReady, !debuggerDetached,
+              jit_debugger_attached(), wine_process_is_running() == 0 else {
+            completion?(poolReady); return
+        }
+        earlyInFlight = true
+        var sizeMB = UserDefaults.standard.integer(forKey: "madeiraLastPoolMB")
+        if !(256...1152).contains(sizeMB) { sizeMB = 512 }
+        var source = UserDefaults.standard.object(forKey: "madeiraLastPoolMB") == nil ? "default" : "last session"
+        if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+           let txt = try? String(contentsOf: d.appendingPathComponent("madeira-pool.txt"), encoding: .utf8),
+           let mb = Int(txt.trimmingCharacters(in: .whitespacesAndNewlines)), (256...1152).contains(mb) {
+            sizeMB = mb; source = "madeira-pool.txt"
+        }
+        LogStore.shared.log("[jit-early] ml1330 trigger=\(trigger) allocating \(sizeMB)MB (\(source)) while the debugger is attached")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let pool = allocatePool(poolSize: sizeMB * 1024 * 1024)
+            if pool != nil { detachDebugger() }
+            let seconds = CFAbsoluteTimeGetCurrent() - t0
+            LogStore.shared.log(String(format: "[jit-early] ml1330 trigger=%@ pool=%@ size=%dMB seconds=%.2f detached=%d",
+                                       trigger, pool == nil ? "failed" : "ready", (pool?.size ?? 0) / 1024 / 1024,
+                                       seconds, debuggerDetached ? 1 : 0),
+                                level: pool == nil ? .error : .success)
+            DispatchQueue.main.async {
+                earlyInFlight = false
+                completion?(pool != nil)
             }
         }
     }
@@ -171,6 +252,7 @@ enum StikJITHelper {
                 "[jit-pool] cached pool RX=%p RW=%p is no longer intact (rx_ok=%d rw_ok=%d) — allocating a new one",
                 Int(bitPattern: p.rx), Int(bitPattern: p.rw), rxOK ? 1 : 0, rwOK ? 1 : 0), level: .error)
             cachedPool = nil
+            poolAvailable = false
         }
 
         if debuggerDetached || getenv("MADEIRA_DETACHED") != nil {
@@ -181,6 +263,16 @@ enum StikJITHelper {
                 "no pool to reuse. Only the debugger can bless executable pages.", level: .error)
             LogStore.shared.log("  Press 'Enable JIT' to re-attach StikDebug, then launch again. " +
                 "The app stays usable — nothing is being killed.")
+            return nil
+        }
+
+        // ml1330: a BRK with nobody attached ends the app before any Wine
+        // handler exists. CS_DEBUGGED cannot tell (sticky); P_TRACED can.
+        if !jit_debugger_attached() {
+            debuggerDetached = true
+            armTrapFallback()
+            LogStore.shared.log("[jit-early] ml1330 NO POOL: StikDebug is no longer attached (it is closed by iOS " +
+                "about a minute after attaching). Enable JIT again, then launch.", level: .error)
             return nil
         }
 
@@ -484,6 +576,7 @@ enum StikJITHelper {
         // ml962: this pool now belongs to the APP RUN, not to this session. Every
         // later launch gets it back from the cache above — see the CachedPool note.
         cachedPool = CachedPool(rx: rxPtr, rw: rwPtr, size: poolSize)
+        poolAvailable = true   // ml1330: lock-free readiness for the UI
         LogStore.shared.log(String(format:
             "[jit-pool] placed at RX=%p RW=%p size=%dMB after %d attempt(s) (session %d) — held for the app's lifetime",
             rxAddr, Int(bitPattern: rwPtr), poolSize / 1024 / 1024, attempts, session), level: .success)
@@ -495,8 +588,22 @@ enum StikJITHelper {
 
     /// Detach the debugger. Call this after Wine is done loading PE DLLs.
     static func detachDebugger() {
+        // ml1330: the detach is itself a BRK. After an earlier detach (or after
+        // iOS closed StikDebug) nobody services it, and before a Wine session
+        // installs its handlers that ends the app. Only send it to a debugger
+        // that is attached now; otherwise record the detach and arm the SIGTRAP
+        // fallback so any later stray BRK is skipped.
+        if debuggerDetached || !jit_debugger_attached() {
+            let already = debuggerDetached
+            debuggerDetached = true
+            setenv("MADEIRA_DETACHED", "1", 1)
+            armTrapFallback()
+            LogStore.shared.log("[jit-early] ml1330 detach skipped: \(already ? "already detached" : "no debugger attached")")
+            return
+        }
         LogStore.shared.log("Detaching debugger...")
         jit26_detach()
+        armTrapFallback()
         // ml962: remember it. CS_DEBUGGED stays SET after detach, so csops cannot
         // tell a later caller that nobody is servicing BRK any more — this can, and
         // that is what turns m56's mystery "BAD POOL" into an accurate message.

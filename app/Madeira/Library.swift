@@ -806,7 +806,7 @@ struct LibraryStatus: View {
         HStack(spacing: 5) { Circle().fill(enabled ? Color.green : Color.orange).frame(width: 6, height: 6); Text(label).font(.caption2) }
             .accessibilityElement(children: .ignore).accessibilityLabel("\(label): \(enabled ? "enabled" : "unavailable")")
     }
-    private func update() { jit = jit_check_debugged(); memory = EntitlementStatus.check().increasedMemory }
+    private func update() { jit = StikJITHelper.readyToLaunch; memory = EntitlementStatus.check().increasedMemory }
 }
 
 struct LibraryView: View {

@@ -4029,6 +4029,9 @@ struct ContentView: View {
             }
             .onAppear {
                 jit_install_trap_handler()
+                // ml1330: StikDebug is closed by iOS about a minute after it
+                // attaches; take the process-lifetime JIT pool while it is here.
+                StikJITHelper.prepareEarlyPool(trigger: "start")
                 entitlements = EntitlementStatus.check()
                 logEntitlementStatus()
                 // WOW64_DESIGN.md §9.2 step 0: measure the free VA map before
@@ -5136,7 +5139,15 @@ struct ContentView: View {
         guard !isLaunching, wine_process_is_running() == 0, wineserver_is_running() == 0, library.current == nil else {
             library.error = "A session is already running."; return
         }
-        guard jit_check_debugged() else { library.error = "Enable JIT before playing."; return }
+        // ml1330: "ready" means a JIT pool exists or a debugger that can grant one
+        // is attached now. CS_DEBUGGED alone stays set after StikDebug is gone.
+        guard StikJITHelper.readyToLaunch else {
+            guard jit_check_debugged(), LibraryFlags.enabled("MADEIRA_JIT_RECONNECT") else {
+                library.error = "Enable JIT before playing."; return
+            }
+            reconnectJIT(then: entry)
+            return
+        }
         do { if entry.desktop != true { _ = try LibraryModel.executable(entry.relativePath) }; try entry.validate() }
         catch { library.error = error.localizedDescription; return }
         guard entry.windowsPath.utf8.count < 1024, entry.arguments.utf8.count < 1024 else {
@@ -5146,6 +5157,29 @@ struct ContentView: View {
         entry.configureLaunch()
         library.begin(entry)
         runWineFullSequence(profile: entry)
+    }
+
+    /// ml1330: JIT was enabled earlier in this run but StikDebug has since gone
+    /// and no pool was taken. Re-open StikDebug (which re-attaches and, through
+    /// pollForJIT, allocates the pool immediately), then continue this launch
+    /// once Madeira is in the foreground again.
+    private func reconnectJIT(then entry: LibraryEntry) {
+        logStore.log("[jit-early] ml1330 JIT connection lost before the first launch; reopening StikDebug")
+        library.error = nil
+        StikJITHelper.enableJIT { ok in
+            guard ok, StikJITHelper.readyToLaunch else {
+                library.error = "Madeira could not reconnect JIT. Open StikDebug, enable JIT for Madeira, then press Play again."
+                return
+            }
+            let launch = { self.launchLibraryEntry(entry) }
+            if UIApplication.shared.applicationState == .active { launch(); return }
+            var token: NSObjectProtocol?
+            token = NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification,
+                                                           object: nil, queue: .main) { _ in
+                if let token { NotificationCenter.default.removeObserver(token) }
+                launch()
+            }
+        }
     }
 
     private func runWineFullSequence(profile: LibraryEntry? = nil) {
@@ -5160,8 +5194,8 @@ struct ContentView: View {
                          level: .error)
             return
         }
-        guard jit_check_debugged() else {
-            logStore.log("[launch] ignored: JIT not enabled — press 'Enable JIT' first", level: .error)
+        guard StikJITHelper.readyToLaunch else {
+            logStore.log("[launch] ignored: no JIT pool and no attached debugger — press 'Enable JIT' first", level: .error)
             return
         }
         isLaunching = true
@@ -5323,6 +5357,8 @@ struct ContentView: View {
             logStore.log("JIT pool \(poolSizeMB)MB (\(poolSource)) — raise it with " +
                          "Documents/madeira-pool.txt (bare MB, 256..1152) if the log shows [jit-pool] EXHAUSTED")
             setenv("MADEIRA_POOL_MB", String(poolSizeMB), 1)
+            // ml1330: the early pool of the next app run is sized like this session.
+            UserDefaults.standard.set(poolSizeMB, forKey: "madeiraLastPoolMB")
             // ml901: [prof] sampling profiler. Documents/madeira-prof.txt holds
             // "period_ms[,report_s]" -- "0" turns it off, absent means ON at the
             // 5ms / 10s default. It samples every thread's PC and buckets it by
@@ -5818,6 +5854,7 @@ struct ContentView: View {
                 setenv("WINE_IOS_JIT_RX", String(format: "%lx", Int(bitPattern: pool.rx)), 1)
                 setenv("WINE_IOS_JIT_RW", String(format: "%lx", Int(bitPattern: pool.rw)), 1)
                 setenv("WINE_IOS_JIT_SIZE", String(format: "%lx", pool.size), 1)
+                setenv("MADEIRA_POOL_MB", String(pool.size / 1024 / 1024), 1)   // ml1330: actual (early/reused) size
             } else {
                 // ml596: ABORT. "Continuing without it" produced ml595 — a run that
                 // looked like an ARM64EC/optimizer regression but was only Wine

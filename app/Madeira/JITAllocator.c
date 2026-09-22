@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <mach-o/dyld.h>
 #include <os/log.h>
+#include <sys/sysctl.h>
 
 // csops syscall - used to check CS_DEBUGGED flag
 #ifndef CS_DEBUGGED
@@ -430,11 +431,29 @@ static void sigtrap_handler(int sig, siginfo_t *info, void *context) {
     uc->uc_mcontext->__ss.__x[0] = 0;
 }
 
+/* ml1330: is a debugger attached RIGHT NOW (P_TRACED)? CS_DEBUGGED is sticky:
+ * it stays set after StikDebug detaches or is killed by iOS (its CPU budget
+ * ends it ~52 s after attach), so it cannot tell whether a BRK will be
+ * serviced. MADEIRA_JIT_TRACE_GUARD=0 falls back to CS_DEBUGGED everywhere
+ * this is used. */
+bool jit_debugger_attached(void) {
+    const char *guard = getenv("MADEIRA_JIT_TRACE_GUARD");
+    if (guard && guard[0] == '0') return jit_check_debugged();
+    struct kinfo_proc info;
+    size_t size = sizeof(info);
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
+    memset(&info, 0, sizeof(info));
+    if (sysctl(mib, 4, &info, &size, NULL, 0) != 0) return jit_check_debugged();
+    return (info.kp_proc.p_flag & P_TRACED) != 0;
+}
+
 void jit_install_trap_handler(void) {
     // Only install if no debugger is attached.
     // When StikDebug is attached, it handles BRK/SIGTRAP directly.
     // Our handler would steal signals from the debugger and break the protocol.
-    if (jit_check_debugged()) {
+    // ml1330: "attached" means traced now, not the sticky CS_DEBUGGED flag, so
+    // after StikDebug is gone a stray BRK is skipped instead of killing the app.
+    if (jit_debugger_attached()) {
         jit_log("Debugger attached — skipping SIGTRAP handler (debugger handles BRK)");
         return;
     }
