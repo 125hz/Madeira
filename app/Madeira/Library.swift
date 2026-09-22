@@ -6,6 +6,34 @@ import ImageIO
 import GameController
 import Combine
 
+enum DeviceLoadDiagnostics {
+    private static var lastReport = 0.0
+    private static var timer: Timer?
+    static func start() {
+        guard timer == nil else { return }
+        let value = Timer(timeInterval: 10, repeats: true) { _ in report() }
+        timer = value
+        RunLoop.main.add(value, forMode: .common)
+    }
+    static func report() {
+        guard wine_process_is_running() != 0 else { return }
+        let now = CACurrentMediaTime()
+        guard now - lastReport >= 10 else { return }
+        lastReport = now
+        guard getenv("MADEIRA_DEVICE_STATS").map({ String(cString: $0) != "0" }) ?? true else { return }
+        let process = ProcessInfo.processInfo
+        let thermal: String
+        switch process.thermalState {
+        case .nominal: thermal = "nominal"
+        case .fair: thermal = "fair"
+        case .serious: thermal = "serious"
+        case .critical: thermal = "critical"
+        @unknown default: thermal = "unknown"
+        }
+        fputs("[device-load] ml1160 thermal=\(thermal) low-power=\(process.isLowPowerModeEnabled ? 1 : 0) capture=\(UIScreen.main.isCaptured ? 1 : 0)\n", stderr)
+    }
+}
+
 enum LibraryFlags {
     static func enabled(_ key: String, fallback: Bool = true) -> Bool {
         // UI preferences are needed before the launch worker imports the file.
@@ -146,6 +174,7 @@ final class LibraryModel: ObservableObject {
     private var launchStarted = Date()
     @Published var launchSlow = false
     var menuButtonRect = CGRect.zero
+    var performanceRect = CGRect.zero
     private var timer: Timer?
     private var sawProcess = false
     private var readOnly = false
@@ -412,8 +441,8 @@ struct LibraryArtwork: View {
     var body: some View {
         GeometryReader { geometry in
         ZStack {
-            LinearGradient(colors: [.indigo.opacity(0.6), .teal.opacity(0.25)], startPoint: .topLeading, endPoint: .bottomTrailing)
-            Image(systemName: entry.desktop == true ? "desktopcomputer" : "gamecontroller.fill").font(.largeTitle).foregroundStyle(.white.opacity(0.6))
+            Color(uiColor: .secondarySystemFill)
+            Image(systemName: entry.desktop == true ? "desktopcomputer" : "gamecontroller.fill").font(.largeTitle).foregroundStyle(.secondary)
             if let name = entry.coverFile,
                let image = UIImage(contentsOfFile: LibraryModel.documents.appendingPathComponent("madeira-art/" + URL(fileURLWithPath: name).lastPathComponent).path) {
                 Image(uiImage: image).resizable().scaledToFill()
@@ -430,14 +459,15 @@ struct LibraryArtwork: View {
 struct LibraryBadges: View {
     let entry: LibraryEntry
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 4) {
             badge("\(entry.bits)-bit")
             badge(entry.graphicsAPI ?? "API auto")
         }
     }
     private func badge(_ text: String) -> some View {
-        Text(text).font(.caption2.weight(.semibold)).padding(.horizontal, 8).padding(.vertical, 5)
-            .background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 6))
+        Text(text).font(.caption2.weight(.medium)).lineLimit(1).minimumScaleFactor(0.8)
+            .padding(.horizontal, 5).padding(.vertical, 4)
+            .background(.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
     }
 }
 
@@ -468,14 +498,34 @@ struct LibraryView: View {
     @ObservedObject private var controller = LibraryController.shared
     @ObservedObject private var input = InputSettings.shared
     @State private var tab = 0
+    @AppStorage("madeiraLibraryLayout") private var layout = "cards"
+    private let layoutsEnabled = LibraryFlags.enabled("MADEIRA_LIBRARY_LAYOUTS")
+    private var entries: [LibraryEntry] {
+        model.entries.filter { $0.desktop != true && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)) }
+    }
     var body: some View {
-        TabView(selection: $tab) {
-            library.tabItem { Label("Library", systemImage: "square.grid.2x2.fill") }.tag(0)
-            settings.tabItem { Label("Settings", systemImage: "gearshape.fill") }.tag(1)
-        }.preferredColorScheme(.dark)
+        Group {
+            if tab == 0 { library } else { settings }
+        }
+        .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            HStack(spacing: 4) {
+                tabButton("Library", symbol: "square.grid.2x2.fill", index: 0)
+                tabButton("Settings", symbol: "gearshape.fill", index: 1)
+            }.padding(5).modifier(LibraryPillGlass()).padding(.bottom, 5).padding(.top, 8)
+        }
+        .onAppear { fputs("[frontend-layout] ml1160 compact navigation layouts=\(layoutsEnabled ? 1 : 0)\n", stderr) }
         .onReceive(controller.commands) { command in
             if selected == nil, !browser, command == "tab" { tab = 1 - tab }
         }
+    }
+    private func tabButton(_ title: String, symbol: String, index: Int) -> some View {
+        Button { tab = index } label: {
+            Label(title, systemImage: symbol).font(.subheadline.weight(.semibold))
+                .padding(.horizontal, 16).frame(minHeight: 44)
+                .foregroundStyle(tab == index ? Color.accentColor : .secondary)
+                .background(tab == index ? Color.accentColor.opacity(0.12) : .clear, in: Capsule())
+        }.buttonStyle(.plain).accessibilityAddTraits(tab == index ? .isSelected : [])
     }
     private var settings: some View {
         Form {
@@ -489,7 +539,6 @@ struct LibraryView: View {
             Section("Pointer") { LibraryPointerSettings() }
             Section("Controller") {
                 Toggle("Right stick controls mouse", isOn: $input.padRightStickMouse)
-                Text("Use the D-pad or left stick to browse, A to open or play, and B to go back. Back + Start opens the in-game menu.").font(.caption).foregroundStyle(.secondary)
             }
             Section("Library") {
                 Text("Add complete application folders to Madeira/wine/drive_c using Files. Display, frame limit, and compatibility options are saved per game.")
@@ -510,38 +559,24 @@ struct LibraryView: View {
                 }
                 Button { selected = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry } label: {
                     HStack(spacing: 16) {
-                        Image(systemName: "desktopcomputer").font(.title2).frame(width: 52, height: 52).background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 14))
+                        Image(systemName: "desktopcomputer").font(.title2).frame(width: 44, height: 44).background(.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 12))
                         VStack(alignment: .leading, spacing: 4) { Text("Desktop").font(.headline); Text("Explore your Windows environment").font(.caption).foregroundStyle(.secondary) }
                         Spacer(); Image(systemName: "chevron.right").foregroundStyle(.secondary)
-                    }.padding(16).background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 22))
+                    }.padding(12).background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
                 }.buttonStyle(.plain)
                     .id(LibraryEntry.desktopID)
                     .overlay(RoundedRectangle(cornerRadius: 22).stroke(focused == LibraryEntry.desktopID && controller.connected ? Color.cyan : .clear, lineWidth: 3))
                 if model.entries.filter({ $0.desktop != true }).isEmpty {
                     ContentUnavailableView("Make yourself at home", systemImage: "gamecontroller", description: Text("Add an executable from Madeira’s drive_c folder to get started."))
+                } else if layoutsEnabled && layout == "list" {
+                    LazyVStack(spacing: 8) { ForEach(entries) { entry in libraryItem(entry, list: true) } }
                 } else {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 145, maximum: 210), spacing: 18, alignment: .top)], alignment: .leading, spacing: 24) {
-                        ForEach(model.entries.filter { $0.desktop != true && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)) }) { entry in
-                            Button { selected = entry } label: {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    LibraryArtwork(entry: entry).aspectRatio(2.0 / 3.0, contentMode: .fit).clipShape(RoundedRectangle(cornerRadius: 18))
-                                        .shadow(color: .black.opacity(0.35), radius: 12, y: 8)
-                                    Text(entry.title).font(.headline).lineLimit(2, reservesSpace: true).foregroundStyle(.primary)
-                                    LibraryBadges(entry: entry).foregroundStyle(.secondary)
-                                }
-                            }.buttonStyle(.plain)
-                                .padding(5).overlay(RoundedRectangle(cornerRadius: 22).stroke(focused == entry.id && controller.connected ? Color.cyan : .clear, lineWidth: 3))
-                                .scaleEffect(focused == entry.id && controller.connected ? 1.02 : 1)
-                                .id(entry.id)
-                        }
+                    let compact = layoutsEnabled && layout == "compact"
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: compact ? 98 : 124, maximum: compact ? 115 : 150), spacing: 12, alignment: .top)], alignment: .leading, spacing: 18) {
+                        ForEach(entries) { entry in libraryItem(entry, list: false) }
                     }
                 }
-            }.padding(24).frame(maxWidth: 1100)
-        }
-        .background(LinearGradient(colors: [Color(red: 0.08, green: 0.10, blue: 0.18), .black], startPoint: .topLeading, endPoint: .bottomTrailing).ignoresSafeArea())
-        .preferredColorScheme(.dark)
-        .safeAreaInset(edge: .bottom) {
-            if controller.connected { Text("D-pad / stick  Browse     A  Details     Y  Add").font(.caption.weight(.medium)).padding(14).frame(maxWidth: .infinity).background(.ultraThinMaterial) }
+            }.padding(16).frame(maxWidth: 1100).frame(maxWidth: .infinity)
         }
         .onReceive(controller.commands) { command in
             guard tab == 0, selected == nil, !browser else { return }
@@ -555,7 +590,20 @@ struct LibraryView: View {
             }
         }
         .searchable(text: $search, prompt: "Search your library")
-        .toolbar { ToolbarItem(placement: .topBarTrailing) { Button { browser = true } label: { Label("Add executable", systemImage: "plus") } } }
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                if layoutsEnabled {
+                    Menu {
+                        Picker("Library layout", selection: $layout) {
+                            Label("Cards", systemImage: "square.grid.2x2").tag("cards")
+                            Label("Compact cards", systemImage: "square.grid.3x3").tag("compact")
+                            Label("List", systemImage: "list.bullet").tag("list")
+                        }
+                    } label: { Label("Library layout", systemImage: "rectangle.grid.1x2") }
+                }
+            }
+            ToolbarItem(placement: .topBarTrailing) { Button { browser = true } label: { Label("Add executable", systemImage: "plus") } }
+        }
         .sheet(isPresented: $browser) {
             NavigationStack { ExecutableBrowser(folder: LibraryModel.drive) { entry in
                 model.save(entry); browser = false; selected = entry
@@ -573,6 +621,28 @@ struct LibraryView: View {
             if let id { withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .easeInOut(duration: 0.2)) { reader.scrollTo(id, anchor: .center) } }
         }
         }
+    }
+    private func libraryItem(_ entry: LibraryEntry, list: Bool) -> some View {
+        Button { selected = entry } label: {
+            Group {
+                if list {
+                    HStack(spacing: 14) {
+                        LibraryArtwork(entry: entry).frame(width: 48, height: 72).clipShape(RoundedRectangle(cornerRadius: 8))
+                        VStack(alignment: .leading, spacing: 8) { Text(entry.title).font(.headline).lineLimit(2); LibraryBadges(entry: entry).foregroundStyle(.secondary) }
+                        Spacer(minLength: 0)
+                        Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+                    }.padding(10).background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
+                } else {
+                    VStack(alignment: .leading, spacing: 6) {
+                        LibraryArtwork(entry: entry).aspectRatio(2.0 / 3.0, contentMode: .fit).clipShape(RoundedRectangle(cornerRadius: 12))
+                        Text(entry.title).font(.subheadline.weight(.semibold)).lineLimit(2, reservesSpace: true)
+                        LibraryBadges(entry: entry).foregroundStyle(.secondary)
+                    }.padding(4)
+                }
+            }.foregroundStyle(.primary)
+        }.buttonStyle(.plain)
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(focused == entry.id && controller.connected ? Color.accentColor : .clear, lineWidth: 2))
+            .id(entry.id)
     }
 }
 
@@ -630,7 +700,7 @@ struct LibraryDetail: View {
                                 .buttonStyle(.borderedProminent).controlSize(.large)
                         }
                     }.padding(.vertical, 48)
-                        .listRowBackground(Color.black.opacity(0.25))
+                        .listRowBackground(Color(uiColor: .secondarySystemGroupedBackground).opacity(0.8))
                     TextField("Title", text: $entry.title)
                     Button("Find on Steam", systemImage: "magnifyingglass") { findCover = true }
                     Button("Choose cover image", systemImage: "photo") { importCover = true }
@@ -647,7 +717,7 @@ struct LibraryDetail: View {
                 Section {
                     Toggle("Reduced-precision x87", isOn: $entry.reducedX87)
                     Toggle("Fast synchronization", isOn: $entry.fastSync)
-                    Toggle("Fast semaphore waits", isOn: Binding(get: { entry.semaphoreFastPath ?? LibraryFlags.enabled("MADEIRA_FASTSYNC_SEM") }, set: { entry.semaphoreFastPath = $0 }))
+                    Toggle("Fast semaphore waits (experimental)", isOn: Binding(get: { entry.semaphoreFastPath ?? LibraryFlags.enabled("MADEIRA_FASTSYNC_SEM", fallback: false) }, set: { entry.semaphoreFastPath = $0 }))
                     TextField("Launch arguments", text: $entry.arguments, axis: .vertical).autocorrectionDisabled().textInputAutocapitalization(.never)
                 } header: { Text("Compatibility & performance") } footer: {
                     Text("Full x87 precision can improve compatibility at a performance cost. Engine settings apply at launch; restart Madeira before changing them between sessions.")
@@ -668,11 +738,12 @@ struct LibraryDetail: View {
             .background {
                 GeometryReader { geo in
                     LibraryArtwork(entry: entry, backdrop: true).frame(width: geo.size.width, height: geo.size.height)
-                        .overlay(LinearGradient(colors: [.black.opacity(0.1), .black.opacity(0.8), .black], startPoint: .top, endPoint: .bottom))
+                        .blur(radius: 8).overlay(Color(uiColor: .systemBackground).opacity(0.55))
                 }.ignoresSafeArea()
             }
-            .preferredColorScheme(.dark)
             .navigationTitle("Game details").navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(.regularMaterial, for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { model.save(entry); dismiss() } } }
             .sheet(isPresented: $findCover) { SteamSearchView(query: entry.title) { match in entry.steamID = match.id; entry.title = match.name; entry.coverFile = nil } }
             .fileImporter(isPresented: $importCover, allowedContentTypes: [.image]) { result in
@@ -710,9 +781,6 @@ struct LibraryDetail: View {
                 guard !findCover, !importCover, !remove else { return }
                 if command == "back" { model.save(entry); dismiss() }
                 if command == "accept" { leaving = true; model.save(entry); play(entry) }
-            }
-            .safeAreaInset(edge: .bottom) {
-                if LibraryController.shared.connected { Text("A  Play     B  Back").font(.caption).padding(12).frame(maxWidth: .infinity).background(.ultraThinMaterial) }
             }
         }
     }
@@ -791,19 +859,89 @@ struct LibraryGlass: ViewModifier {
     }
 }
 
+struct LibraryPillGlass: ViewModifier {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    private static let enabled = LibraryFlags.enabled("MADEIRA_FRONTEND_GLASS")
+    func body(content: Content) -> some View {
+        if reduceTransparency { content.background(Color(uiColor: .secondarySystemBackground), in: Capsule()) }
+        else if #available(iOS 26, *), Self.enabled { content.glassEffect(.regular.interactive(), in: Capsule()) }
+        else { content.background(.regularMaterial, in: Capsule()) }
+    }
+}
+
+// Keep frame-rate drag state in this small view. Global translation remains
+// stable while the view moves; local coordinates feed its own movement back in.
+struct LibraryFloatingItem: View {
+    let isMenu: Bool
+    let viewport: CGSize
+    let insets: EdgeInsets
+    @ObservedObject private var model = LibraryModel.shared
+    @AppStorage private var nx: Double
+    @AppStorage private var ny: Double
+    @GestureState private var drag = CGSize.zero
+    @State private var measured = CGSize(width: 48, height: 48)
+    @State private var faded = false
+    @State private var touched = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    private let draggable = LibraryFlags.enabled("MADEIRA_HUD_DRAG")
+
+    init(isMenu: Bool, viewport: CGSize, insets: EdgeInsets) {
+        self.isMenu = isMenu; self.viewport = viewport; self.insets = insets
+        _nx = AppStorage(wrappedValue: isMenu ? 0.92 : 0.25, isMenu ? "madeiraLibraryMenuX" : "madeiraLibraryMetricsX")
+        _ny = AppStorage(wrappedValue: isMenu ? 0.12 : 0.08, isMenu ? "madeiraLibraryMenuY" : "madeiraLibraryMetricsY")
+    }
+    private func position(_ translation: CGSize) -> CGPoint {
+        let left = insets.leading + measured.width / 2 + 8
+        let top = insets.top + measured.height / 2 + 8
+        return CGPoint(x: min(max(left, viewport.width * nx + translation.width), max(left, viewport.width - insets.trailing - measured.width / 2 - 8)),
+                       y: min(max(top, viewport.height * ny + translation.height), max(top, viewport.height - insets.bottom - measured.height / 2 - 8)))
+    }
+    private func record(_ rect: CGRect) {
+        if isMenu { model.menuButtonRect = rect } else { model.performanceRect = rect }
+    }
+    var body: some View {
+        let center = position(drag)
+        let rect = CGRect(x: center.x - measured.width / 2, y: center.y - measured.height / 2, width: measured.width, height: measured.height)
+        Group {
+            if isMenu {
+                Button { touched += 1; model.showMenu() } label: {
+                    Image(systemName: "line.3.horizontal").font(.title3.weight(.semibold)).frame(width: 48, height: 48)
+                }.buttonStyle(.plain).modifier(LibraryPillGlass())
+                    .opacity(faded && drag == .zero && !model.menu ? 0.3 : 1)
+                    .accessibilityLabel("Game menu").accessibilityHint("Drag to move")
+            } else { LibraryMetrics().accessibilityHint("Drag to move") }
+        }
+        .frame(maxWidth: isMenu ? 48 : max(48, min(390, viewport.width - insets.leading - insets.trailing - 16)))
+        .fixedSize(horizontal: false, vertical: true)
+        .background(GeometryReader { proxy in
+            Color.clear.onAppear { measured = proxy.size }.onChange(of: proxy.size) { _, size in measured = size }
+        })
+        .contentShape(Rectangle())
+        .simultaneousGesture(DragGesture(minimumDistance: 6, coordinateSpace: .global).updating($drag) { value, state, transaction in
+            transaction.animation = nil; state = value.translation
+        }.onEnded { value in
+            let end = position(value.translation)
+            withTransaction(Transaction(animation: nil)) {
+                nx = end.x / max(1, viewport.width); ny = end.y / max(1, viewport.height); touched += 1
+            }
+        }, including: draggable ? .all : .none)
+        .position(center)
+        .onAppear { record(rect) }.onChange(of: rect) { _, value in record(value) }
+        .onDisappear { record(.zero) }
+        .task(id: touched) {
+            guard isMenu else { return }
+            faded = false
+            do { try await Task.sleep(for: .seconds(3)); withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.5)) { faded = true } } catch { }
+        }
+    }
+}
+
 struct LibraryHUD: View {
     @ObservedObject private var model = LibraryModel.shared
     @ObservedObject private var controls = TouchControlsModel.shared
-    @AppStorage("madeiraLibraryMenuX") private var nx = 0.92
-    @AppStorage("madeiraLibraryMenuY") private var ny = 0.12
-    @GestureState private var drag = CGSize.zero
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var faded = false
-    @State private var touched = 0
     var body: some View {
         GeometryReader { geo in
-            let x = min(max(30, geo.size.width * nx + drag.width), max(30, geo.size.width - 30))
-            let y = min(max(geo.safeAreaInsets.top + 30, geo.size.height * ny + drag.height), max(30, geo.size.height - geo.safeAreaInsets.bottom - 30))
             ZStack(alignment: .topLeading) {
                 if model.launching, let entry = model.entries.first(where: { $0.id == model.current }) {
                     LibraryArtwork(entry: entry, backdrop: true).overlay(.black.opacity(0.65)).ignoresSafeArea()
@@ -815,26 +953,15 @@ struct LibraryHUD: View {
                         if model.launchSlow { Button("Show game view") { model.launching = false } }
                     }.frame(width: geo.size.width, height: geo.size.height).foregroundStyle(.white).transition(.opacity)
                 }
-                if model.performance { LibraryMetrics().padding(.top, geo.safeAreaInsets.top + 8).padding(.leading, geo.safeAreaInsets.leading + 12).allowsHitTesting(false) }
+                if model.performance { LibraryFloatingItem(isMenu: false, viewport: geo.size, insets: geo.safeAreaInsets) }
                 if model.liveLogs { LibraryLiveLogs().frame(maxWidth: 550, maxHeight: 140).padding(.top, geo.safeAreaInsets.top + 60).padding(.horizontal, 12).allowsHitTesting(false) }
                 if !model.sessionMessage.isEmpty { Text(model.sessionMessage).font(.caption).padding(10).background(.regularMaterial, in: Capsule()).frame(maxWidth: .infinity).padding(.top, geo.safeAreaInsets.top + 12).allowsHitTesting(false) }
-                Button { touched += 1; model.showMenu() } label: { Image(systemName: "line.3.horizontal").font(.title3.weight(.semibold)).foregroundStyle(.white).frame(width: 48, height: 48).background(.black.opacity(0.75), in: Circle()).overlay(Circle().stroke(.white.opacity(0.2))) }
-                    .opacity(faded && drag == .zero && !model.menu ? 0.3 : 1)
-                    .accessibilityLabel("Game menu. Drag to move.")
-                    .simultaneousGesture(DragGesture(minimumDistance: 8).updating($drag) { value, state, _ in state = value.translation }.onEnded { value in
-                        touched += 1
-                        nx = min(max(0.05, (geo.size.width * nx + value.translation.width) / max(1, geo.size.width)), 0.95)
-                        ny = min(max(0.05, (geo.size.height * ny + value.translation.height) / max(1, geo.size.height)), 0.95)
-                    })
-                    .position(x: x, y: y)
-                    .background(GeometryReader { measure in
-                        let rect = CGRect(x: x - 26, y: y - 26, width: 52, height: 52)
-                        Color.clear.onAppear { model.menuButtonRect = rect }.onChange(of: rect) { _, value in model.menuButtonRect = value }
-                    })
+                LibraryFloatingItem(isMenu: true, viewport: geo.size, insets: geo.safeAreaInsets)
                 if model.menu {
                     Color.black.opacity(0.5).ignoresSafeArea().onTapGesture { model.menu = false }.transition(.opacity)
                     menu.frame(width: min(460, geo.size.width - 32), height: min(650, geo.size.height - geo.safeAreaInsets.top - geo.safeAreaInsets.bottom - 24))
-                        .background(Color(red: 0.075, green: 0.085, blue: 0.12), in: RoundedRectangle(cornerRadius: 28))
+                        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 28))
+                        .clipShape(RoundedRectangle(cornerRadius: 28))
                         .overlay(RoundedRectangle(cornerRadius: 28).stroke(.white.opacity(0.15)))
                         .shadow(color: .black.opacity(0.6), radius: 30, y: 12)
                         .position(x: geo.size.width / 2, y: geo.size.height / 2)
@@ -844,11 +971,7 @@ struct LibraryHUD: View {
             .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.85), value: model.menu)
             .preferredColorScheme(.dark)
         }.ignoresSafeArea()
-        .task(id: touched) {
-            faded = false
-            do { try await Task.sleep(for: .seconds(3)); withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.5)) { faded = true } } catch { }
-        }
-        .onAppear { model.saveCurrentProfile() }
+        .onAppear { model.saveCurrentProfile(); fputs("[frontend-hud] ml1160 contained menu; stable overlay drag\n", stderr) }
         .onChange(of: model.menu) { _, open in
             LibraryController.shared.configure(enabled: model.enabled, ownsInput: open)
             if !open { model.saveCurrentProfile() }
@@ -882,9 +1005,10 @@ struct LibraryHUD: View {
                 Divider()
                 Button("Quit game", systemImage: "stop.circle", role: .destructive) { model.requestQuit() }
                 Text("Closes the running session. Unsaved progress will be lost.").font(.caption).foregroundStyle(.secondary)
-            }.padding(22)
-                .foregroundStyle(.white).tint(.cyan)
+            }.frame(maxWidth: .infinity, alignment: .leading).padding(22)
+                .foregroundStyle(.primary)
         }
+        .scrollIndicators(.visible)
     }
 }
 

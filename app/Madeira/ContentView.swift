@@ -3983,6 +3983,8 @@ struct ContentView: View {
             // a fresh placeholder only re-parents the same CAMetalLayer.
             .navigationTitle("Madeira")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(.regularMaterial, for: .navigationBar)
+            .toolbarBackground(library.enabled ? .visible : .automatic, for: .navigationBar)
             .navigationBarHidden(fullscreenState.active)
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
                 if !isLaunching {
@@ -4001,6 +4003,7 @@ struct ContentView: View {
                 // devices that arrive AFTER an observer exists, so this has to
                 // run before the user can plug anything in. Idempotent.
                 HardwareInput.shared.start()
+                DeviceLoadDiagnostics.start()
             }
         }
     }
@@ -6681,7 +6684,8 @@ final class ControlsWindow: UIWindow {
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         if FullscreenState.shared.active, LibraryModel.shared.current != nil {
             let library = LibraryModel.shared
-            if library.menu || library.launching || library.menuButtonRect.contains(point) {
+            if library.menu || library.launching || library.menuButtonRect.contains(point) ||
+                (library.performance && library.performanceRect.contains(point)) {
                 return super.hitTest(point, with: event)
             }
         }
