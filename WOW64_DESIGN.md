@@ -14381,3 +14381,69 @@ Validation: 12 host suites pass (ASan/UBSan), including new check-async-cancel-h
 
 Artifact: 155,876,982 bytes; 2026-09-23 00:33:48 CDT; SHA-256 d8115eb7436402a921cb3be11db780ebd7fbb4b1f3632d4fd45df62a4b4b3c04.
 Publication: wine 981a2c80e97 pushed to 125hz/wine ios-build, then root implementation 198f96d (gitlink to 981a2c80e97) pushed to 125hz/Madeira main before this record. No upstream push or PR. Logs: .xtool/logs/ml1410-{native,checks,ipa,verify}.log.
+
+
+### 2026-09-23 - ml1420: client logon stall (512 MB early pool + endless unwind), touch pointer reveal, lowercase app types, client download progress, build label
+
+Device results (logs 173-176, prev16, screenshots). Logs 173 and prev16 were still the ml1400 build: no ml1410 tag appears, and every client launch writes `[loopback-wait]`. Log 173 (client) logged on in 1 s and started downloading apps 340/380/420 plus 220's own update (~3.8 GB total). The earlier "667 MB" was only 220's share. The CM connection stayed healthy.
+
+Client logon stall (log 175, ml1410 build). Proven:
+- The loopback transport completed. Both connections and the 27 KB exchange show in the new `[loopback-wait]` lines: steam.exe does non-blocking forced-async receives, woken by `wake-read`.
+- No LogOn() happened in 5 minutes.
+- The early JIT pool was 512 MB. It is sized at app start from the previous session's request, which was a direct launch, and the client session asks for 896 MB. Result: `TAIL REFUSED` for FEX EC_CODE, then `EXEC ALLOC FAILED ... honest fault at 0xdead` (line 12387).
+- From line ~13146 on, Chrome_IOThread in the browser process sat at ~70% of a core, jit 0%, in 35 of 37 profiler windows.
+  - Thread stacks: aarch64 ntdll RVAs 0x67c20 / 0x777c4 / 0x3fc48 (virtual_unwind, RtlLookupFunctionEntry, LdrFindEntryForAddress), constant sp=0x174ffdbf0.
+  - ios_jit_reverse_translate_addr was the top profile entry at 41-46% of all CPU. Its loop index was small, so lookups succeeded and it was simply called endlessly.
+  - The sessions that logged on (170, 173) show no such thread.
+
+Inferred: the 0xdead fault frame lies outside every image and cannot be unwound. call_seh_handlers and RtlUnwindEx stop only at a NULL or invalid frame or the stack base, so a step that changes neither Pc nor Sp repeats forever.
+
+Fixes:
+- (1) The early pool is remembered as the largest recent session's size, and a library with Windows Steam client entries starts at 896 MB or more. MADEIRA_POOL_STICKY_MAX=0; `[jit-early] ml1420`.
+- (2) signal_arm64.c ios_unwind_stalled: three identical Pc/Sp steps end the walk. The handler search then returns STATUS_UNHANDLED_EXCEPTION, and RtlUnwindEx raises STATUS_INVALID_DISPOSITION. The switch MADEIRA_UNWIND_GUARD=0 is read only once a stall is seen. `[unwind-stall] ml1420` logs pc/lr/sp/fp, up to 16 lines.
+- (3) ios_jit_reverse_translate_addr rejects addresses outside the pool at once, tries the last hit first, and never matches freed slots (pe_base NULL; the old scan did). The switch is read at image registration, because the lookup runs on the PE caller's stack through a tail branch. MADEIRA_JIT_REV_FAST=0; `[jit-rev] ml1420`.
+
+Host checks:
+- check-unwind-stall: stops after three no-progress steps, never stops a progressing walk, caps its log, rollback keeps walking.
+- check-jit-rev-fast: 400k random and repeated lookups equal the scan over 300 mappings with a freed slot, out-of-pool addresses are rejected, and the rollback shows the stale-slot match.
+
+Touch pointer reveal (log 176):
+- The program hid its cursor ~10 s after the last click (`[cursor-visibility] ml1180 guest-show=0`), which is the ordinary idle hide. Clicks were delivered normally.
+- With a finger, "moving" in Touch pointer mode is a tap, which is also a click.
+- Winios.m: while a finger points (touchesBegan/Moved after the synthesized-click filter, not in relative mouse-look), the drawn arrow stays visible for 3 s after the last touch, even if the program hid it. The program's own show/hide applies otherwise; desktop sessions are unchanged.
+- MADEIRA_CURSOR_REVEAL=0; `[cursor-reveal] ml1420`.
+- Risk: a program that draws its own cursor shows both for up to 3 s after a touch.
+
+Library, progress and starting screen (Swift):
+- Owned app missing: PICS spells `common/type` in lowercase for many older apps ("game"). Exact matching made it unknown, so the app was dropped before the owned count. Proven with the public app info run through the production parser. Type names now match case-insensitively (MADEIRA_STEAM_TYPE_FOLD=0). A cache from before this change is refreshed at start. `[steam-library] ml1420 hidden` lists hidden App IDs with reason tokens, once per fetch (MADEIRA_STEAM_HIDDEN_LOG=0).
+- Client download progress: every 2 s, off the main thread, Madeira reads the appmanifest acf of the launched app and of its SharedDepots owners. The starting screen shows "Steam is downloading game content: X of Y GB (N%)" and other phases; a small banner stays while the client window covers it. MADEIRA_STEAM_CLIENT_PROGRESS=0; `[steam-progress] ml1420`, rate-limited.
+- Starting screen stuck after "Show live log" (log 176):
+  - Proven: showGameView ran (`[ui-log-idle]` suspended=1 without a second `[startup-log]`). Later taps on the launch buttons did nothing (no further `[startup-log]`). The main thread was idle in its run loop.
+  - Suspected, unproven: the animated removal of a scroll view whose live log keeps updating.
+  - Both flags now change in one transaction without animation (MADEIRA_LAUNCH_VIEW_INSTANT=0). `[launch-view] ml1420 dismissed reason=` and `hud launching=` prove it next time.
+- Build label: the xtool staging writes MadeiraBuild (round tag from .xtool/build-round and build time, CDT) into Info.plist. The app shows it in light grey beside the JIT/Memory+ badges and logs `[build] ml1420 <label>` at start (MADEIRA_BUILD_LABEL=0 hides the label). From now on every IPA's Info.plist changes, and verifiers expect that.
+
+64-bit Unity/Mono title black screen (log 174), not fixed this round:
+- The load thread paid ~7 M emulated stores (13.7 s of handler time, 97% one thread), and the Mach handler thread used ~60% of CPU.
+- Cause: PAGE_EXECUTE_READWRITE anonymous allocations (0x40001 bytes, i.e. the Boehm GC heap with VIRTUAL_ALLOC_PAD; inferred) are served as R+X pool aliases (mprotect_exec anon carve, ml625-ml640 lineage). Every data store faults.
+- `[store-batch]` windows cannot re-promote to R+X (errno 13).
+- Read-only research (file:line in the session notes) found:
+  - No guest page ever needs host execute. Native branches only reach EC-bitmap targets, and non-EC plain-RW regions are never branched into natively.
+  - Pool-backed regions have no SMC tracking today. The store emulator also ignores logical PAGE_EXECUTE_READ.
+  - FEX mtrack SMC works for non-pool memory, but its 4 KB traps are ineffective inside 16 KB host pages that stay writable.
+  - FEX's Mono backpatcher would self-deadlock on CodeInvalidationMutex if it wrote a trapped page without an alias.
+
+Plan for ml1430:
+- An ios_anon_rwx_is_guest_data() policy in mprotect_exec strips PROT_EXEC for non-pool, non-alias, non-image valloc ranges that are either in the WoW window or ARM64EC non-EC. An in-flight EC_CODE flag covers the window before the bitmap is set. MADEIRA_ANON_RWX_PLAIN.
+- An exec-fault diagnostic; promotion only for EC-marked pages, with a real exec check in the DEP-off branch.
+- FEX: 16 KB rounding in ReprotectRWXIntervals and HandleRWXAccessViolation, and DisableSMCDetection on iOS for alias-less backpatch targets.
+- An x64/x86 device test: RWX store throughput, patch-without-flush, and PAGE_EXECUTE_READ write raising an AV.
+
+Validation:
+- 14 host suites pass (ASan/UBSan), including the new check-unwind-stall and check-jit-rev-fast, and check-steam-native with ~30 new checks (it fails 5 with the type fold off).
+- Native ntdll 35/35, win32u 46/46. The aarch64 ntdll.dll was rebuilt (both markers present, 0 missing imports). The IPA printed "IPA verified".
+- .xtool/verify-ml1420.py passes 45 checks: workspace sync, archive/PE/binary tags, the Info.plist label, generated Swift in sync, cacert.pem unchanged, same entry list as ml1410, and only Info.plist, the executable and aarch64 ntdll.dll changed.
+- No Wine, Steam or Windows program ran on this PC. Everything above is device-unverified.
+
+Artifact: 155,936,489 bytes; 2026-09-23 01:30:26 CDT; SHA-256 1f92d3a915c12fb265a6b846a0fd9c1d8fe2bcdb45e16ceb15010b5f81fe8c60.
+Publication: wine 2178a01c756 pushed to 125hz/wine ios-build, then root implementation a25a3db (gitlink to 2178a01c756) pushed to 125hz/Madeira main before this record. No upstream push or PR. Logs: .xtool/logs/ml1420-{native,pe64,checks,ipa,verify}.log.
