@@ -660,6 +660,8 @@ struct CMsgClientPICSProductInfoResponse {
     struct AppInfo {
         var appid: UInt32 = 0
         var changeNumber: UInt32 = 0
+        /// Madeira ml1420: field 3, set when the request lacked a valid access token.
+        var missingToken = false
         var buffer: Data = Data()  // VDF binary format app info
     }
     struct PackageInfo {
@@ -690,6 +692,7 @@ struct CMsgClientPICSProductInfoResponse {
                     switch subTag.fieldNumber {
                     case 1: app.appid = UInt32(truncatingIfNeeded: try subDecoder.readVarint())
                     case 2: app.changeNumber = UInt32(truncatingIfNeeded: try subDecoder.readVarint())
+                    case 3 where subTag.wireType == .varint: app.missingToken = try subDecoder.readVarint() != 0
                     case 5: app.buffer = try subDecoder.readBytes()
                     default: try subDecoder.skip(wireType: subTag.wireType)
                     }

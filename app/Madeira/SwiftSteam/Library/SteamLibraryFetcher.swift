@@ -38,8 +38,12 @@ class SteamLibraryFetcher {
 
         // Step 5: Get app info (name, depots, platform support, etc.)
         SteamLog.trace("Fetching app info...")
-        let appInfos = try await fetchAppInfo(appIDs: Array(appIDs), tokens: appTokens)
+        let detail = try await fetchAppInfoDetail(appIDs: Array(appIDs), tokens: appTokens)
+        let appInfos = detail.apps
         SteamLog.trace("Got info for \(appInfos.count) apps")
+        // Madeira ml1420: remember what was left out and why, for the hidden-app log.
+        lastVisibility = SteamLibraryVisibilityReport(requested: Array(appIDs), parsed: appInfos, unknown: detail.unknown,
+                                                      failed: detail.failed, missingToken: detail.missingToken)
 
         // Keep playable types — games, demos, and applications (software-style
         // titles). Drops DLC, soundtracks, and tools
@@ -160,7 +164,19 @@ class SteamLibraryFetcher {
     // MARK: - App Info
 
     private func fetchAppInfo(appIDs: [UInt32], tokens: [UInt32: UInt64]) async throws -> [SteamAppInfo] {
+        try await fetchAppInfoDetail(appIDs: appIDs, tokens: tokens).apps
+    }
+
+    /// Madeira ml1420: the owned-library fetch's last report of hidden apps.
+    private(set) var lastVisibility: SteamLibraryVisibilityReport?
+
+    /// Madeira ml1420: app info plus what PICS did not describe: unknown app
+    /// IDs, apps whose info did not parse (with the reason) and apps sent
+    /// without a valid access token.
+    private func fetchAppInfoDetail(appIDs: [UInt32], tokens: [UInt32: UInt64]) async throws
+        -> (apps: [SteamAppInfo], unknown: Set<UInt32>, failed: [UInt32: String], missingToken: Set<UInt32>) {
         var allApps: [SteamAppInfo] = []
+        var unknown = Set<UInt32>(), failed: [UInt32: String] = [:], missingToken = Set<UInt32>()
 
         // Batch app info requests (50 at a time)
         let batches = stride(from: 0, to: appIDs.count, by: 50).map {
@@ -184,15 +200,19 @@ class SteamLibraryFetcher {
 
             for response in responses {
                 let picsResponse = try CMsgClientPICSProductInfoResponse.deserialize(from: response.body)
+                unknown.formUnion(picsResponse.unknownApps)
                 for app in picsResponse.apps {
+                    if app.missingToken { missingToken.insert(app.appid) }
                     if let info = SteamAppInfo.parse(appID: app.appid, from: app.buffer) {
                         allApps.append(info)
+                    } else {
+                        failed[app.appid] = SteamAppInfo.parseFailure(app.buffer)
                     }
                 }
             }
         }
 
-        return allApps
+        return (allApps, unknown, failed, missingToken)
     }
 }
 

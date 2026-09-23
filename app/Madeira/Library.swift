@@ -225,6 +225,7 @@ final class LibraryModel: ObservableObject {
     private var launchStarted = Date()
     @Published var launchSlow = false
     @Published var launchLogs = false
+    private var launchDismissLogged = false
     var menuButtonRect = CGRect.zero
     var performanceRect = CGRect.zero
     private let modalTouchGuard = LibraryFlags.enabled("MADEIRA_MODAL_TOUCH_GUARD")
@@ -494,14 +495,19 @@ final class LibraryModel: ObservableObject {
         ProMotionIntent.shared.setActive(true, maxHz: ProMotionIntent.maxHz(for: Int32(entry.fpsMode)))
         if entry.steamSession == nil { var played = entry; played.lastPlayed = Date(); save(played) }
         if entry.usesSteam { fputs("[steam-bridge] ml1260 session=\(entry.steamSession ?? "app") appid=\(entry.steamAppID ?? 0) desktop=1\n", stderr) }
+        // ml1420: what the Windows Steam client downloads before the game starts.
+        SteamClientProgressModel.shared.start(entry)
+        launchDismissLogged = false
         sawProcess = false
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.poll() }
     }
     private func poll() {
         if launching {
-            if madeira_get_present_count() >= launchPresent + 3 || winios_surface_present_count() > launchSurface {
-                showGameView()
+            if madeira_get_present_count() >= launchPresent + 3 {
+                showGameView(reason: "present")
+            } else if winios_surface_present_count() > launchSurface {
+                showGameView(reason: "surface")
             } else if Date().timeIntervalSince(launchStarted) > 30 { launchSlow = true }
         }
         if wine_process_is_running() != 0 {
@@ -510,9 +516,25 @@ final class LibraryModel: ObservableObject {
         } else if sawProcess && wineserver_is_running() == 0 { finish() }
     }
     func launchFailed() { if current != nil && !sawProcess { finish(); error = "The session could not start. Check the diagnostic log and JIT status." } }
-    func showGameView() {
-        if launchLogs { launchLogs = false; LogStore.shared.setDisplayActive(liveLogs) }
-        withAnimation(.easeInOut(duration: UIAccessibility.isReduceMotionEnabled ? 0 : 0.4)) { launching = false }
+    /// ml1420: the starting screen could stay visible (and unresponsive) after
+    /// the game was presenting. The animated removal of a scrolling view with
+    /// live content is the suspected cause (unproven). Both flags now change in
+    /// one transaction without animation. MADEIRA_LAUNCH_VIEW_INSTANT=0 restores
+    /// the animated dismissal.
+    func showGameView(reason: String = "button") {
+        let instant = LibraryFlags.enabled("MADEIRA_LAUNCH_VIEW_INSTANT")
+        if launching && !launchDismissLogged {
+            launchDismissLogged = true
+            fputs("[launch-view] ml1420 dismissed reason=\(reason) logs=\(launchLogs ? 1 : 0) instant=\(instant ? 1 : 0)\n", stderr)
+        }
+        if launchLogs { LogStore.shared.setDisplayActive(liveLogs) }
+        if instant {
+            var transaction = Transaction(); transaction.disablesAnimations = true
+            withTransaction(transaction) { launchLogs = false; launching = false }
+        } else {
+            if launchLogs { launchLogs = false }
+            withAnimation(.easeInOut(duration: UIAccessibility.isReduceMotionEnabled ? 0 : 0.4)) { launching = false }
+        }
     }
     func toggleLaunchLogs() {
         launchLogs.toggle()
@@ -561,6 +583,7 @@ final class LibraryModel: ObservableObject {
     }
     private func finish() {
         timer?.invalidate(); timer = nil
+        SteamClientProgressModel.shared.stop()
         saveCurrentProfile()
         let controls = TouchControlsModel.shared
         InputGuard.shared.releaseAll("frontend-exit")
@@ -1500,6 +1523,9 @@ struct LibraryHUD: View {
     private let sessionTools = LibraryFlags.enabled("MADEIRA_SESSION_TOOLS")
     private let launchPolish = LibraryFlags.enabled("MADEIRA_LAUNCH_POLISH")
     @State private var launchVisible = false
+    @State private var launchChanges = 0
+    // ml1420: the Windows Steam client's downloads for a client-routed launch.
+    @ObservedObject private var steamProgress = SteamClientProgressModel.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         GeometryReader { geo in
@@ -1514,6 +1540,16 @@ struct LibraryHUD: View {
                 if !model.launching && model.performance { LibraryFloatingItem(isMenu: false, viewport: geo.size, insets: geo.safeAreaInsets) }
                 if model.liveLogs && !model.launching { LibraryLiveLogs().frame(maxWidth: 550, maxHeight: 140).padding(.top, geo.safeAreaInsets.top + 60).padding(.horizontal, 12).allowsHitTesting(false) }
                 if !model.sessionMessage.isEmpty { Text(model.sessionMessage).font(.caption).padding(10).background(.regularMaterial, in: Capsule()).frame(maxWidth: .infinity).padding(.top, geo.safeAreaInsets.top + 12).allowsHitTesting(false) }
+                // ml1420: once the starting screen is gone (the Steam window
+                // itself presents frames), keep showing an active download.
+                if !model.launching && !model.menu, let progress = steamProgress.progress, progress.working {
+                    SteamClientProgressBanner(progress: progress, compact: true)
+                        .padding(.horizontal, 14).padding(.vertical, 10)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                        .frame(maxWidth: 420).padding(.horizontal, 16).frame(maxWidth: .infinity)
+                        .padding(.top, geo.safeAreaInsets.top + (model.sessionMessage.isEmpty ? 12 : 56))
+                        .allowsHitTesting(false)
+                }
                 if !model.launching { LibraryFloatingItem(isMenu: true, viewport: geo.size, insets: geo.safeAreaInsets) }
                 if model.menu {
                     Color.black.opacity(0.5).ignoresSafeArea().onTapGesture { model.menu = false }.transition(.opacity)
@@ -1538,6 +1574,12 @@ struct LibraryHUD: View {
             LibraryController.shared.configure(enabled: model.enabled, ownsInput: open)
             if !open { model.saveCurrentProfile() }
         }
+        // ml1420: proves the HUD saw the starting screen's state change.
+        .onChange(of: model.launching) { _, launching in
+            guard launchChanges < 4 else { return }
+            launchChanges += 1
+            fputs("[launch-view] ml1420 hud launching=\(launching ? 1 : 0)\n", stderr)
+        }
         .onReceive(LibraryController.shared.commands) { command in
             if command == "menu" { if model.menu { model.menu = false } else { model.showMenu() } }
             else if command == "back", model.menu { model.menu = false }
@@ -1553,8 +1595,11 @@ struct LibraryHUD: View {
                 Text(entry.title).font(.title2.bold()).multilineTextAlignment(.center)
                 ProgressView().tint(.white)
                 Text(model.launchSlow ? "Still starting…" : "Starting your game…").foregroundStyle(.white.opacity(0.7))
+                if let progress = steamProgress.progress, progress.active {
+                    SteamClientProgressBanner(progress: progress).tint(.white).frame(maxWidth: 360)
+                }
                 if model.launchSlow {
-                    Button("Show game view") { model.showGameView() }.frame(minHeight: 44)
+                    Button("Show game view") { model.showGameView(reason: "button") }.frame(minHeight: 44)
                     if sessionTools {
                         Button(model.launchLogs ? "Hide live log" : "Show live log") { model.toggleLaunchLogs() }.frame(minHeight: 44)
                     }
@@ -1625,6 +1670,28 @@ struct LibraryLiveLogs: View {
         }.defaultScrollAnchor(.bottom)
             .padding(8).background(.black.opacity(0.65), in: RoundedRectangle(cornerRadius: 10)).foregroundStyle(.white)
             .accessibilityLabel("Live diagnostic log")
+    }
+}
+
+/// ml1420: what the Windows Steam client is downloading or installing before
+/// a client-routed game can start.
+struct SteamClientProgressBanner: View {
+    let progress: SteamClientProgress
+    var compact = false
+    var body: some View {
+        VStack(spacing: compact ? 4 : 6) {
+            if let summary = progress.summary {
+                Text(summary).font(compact ? .caption.weight(.medium) : .subheadline)
+                    .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
+            }
+            if let fraction = progress.fraction {
+                ProgressView(value: fraction).frame(maxWidth: compact ? 240 : 300)
+            }
+            if let detail = progress.detail {
+                Text(detail).font(.caption2).opacity(0.75)
+            }
+        }
+        .accessibilityElement(children: .combine)
     }
 }
 

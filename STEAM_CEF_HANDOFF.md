@@ -232,6 +232,25 @@ webhelper retries to 52649 show only refused `[::1]` attempts. New `[loopback-wa
 recv verdict / AFD poll / read-queue wake per loopback socket) and `[loopback-io] ml1410 recv-would-block`
 will split "never requested" / "pending, wake lost" / "woken, no data". OPEN.
 
+**ml1420 — logs 173-176.** Proven:
+- Log 173 (ml1400 build) logged on in 1 s and started the 340/380/420 + 220 downloads (~3.8 GB).
+- Log 175 (ml1410 build): transport fine (both loopback connections, 27 KB exchange, `wake-read`
+  seen), but no `LogOn()` in 5 min:
+  - The early JIT pool was 512 MB (sized from a direct launch; the client asks for 896) →
+    `TAIL REFUSED` → `EXEC ALLOC FAILED … honest fault at 0xdead`.
+  - Then Chrome_IOThread (webhelper) pegged at ~70% in `virtual_unwind` → `RtlLookupFunctionEntry`
+    → `LdrFindEntryForAddress` (aarch64 ntdll RVAs 0x67c20 / 0x777c4 / 0x3fc48) with a constant sp,
+    with `ios_jit_reverse_translate_addr` at 41-46% of all CPU.
+  - Inferred link: the 0xdead fault frame cannot be unwound, and call_seh_handlers / RtlUnwindEx
+    have no progress check.
+- Fixes:
+  - sticky-max early pool plus an 896 MB floor when the library has client entries
+    (`MADEIRA_POOL_STICKY_MAX=0`);
+  - unwind no-progress guard in signal_arm64.c (`MADEIRA_UNWIND_GUARD=0`, `[unwind-stall]`);
+  - pool-range reject + hint in the reverse lookup (`MADEIRA_JIT_REV_FAST=0`).
+- 64-bit Unity title black screen (log 174): 7 M emulated stores (anon RWX served as R+X pool
+  aliases). The durable plain-RW design is written up for ml1430 (needs FEX 16 KB SMC rounding).
+
 ---
 
 ## 3. Solved walls (context — these are done, and the *methods* may be reusable)

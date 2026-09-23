@@ -1925,12 +1925,68 @@ int winios_get_cursor_position(int *x, int *y) {
 static int g_cursor_drv_show = -1;
 static unsigned g_cursor_gdi_windows;
 
+/* ml1420 — TOUCH POINTER REVEAL. Programs commonly hide their cursor after a
+ * few seconds without mouse movement and show it again on the next movement;
+ * device log: the pointer vanished ~10 s after the last click. With a mouse
+ * that costs a wiggle. With a finger, the only way to "move" in Touch pointer
+ * mode is a tap, which is also a click, so the user points blind. While a
+ * finger is pointing, the drawn arrow stays visible until REVEAL_SECONDS
+ * after the last touch even if the program hid its cursor; the program's own
+ * show/hide still applies otherwise, and relative mouse-look never reveals
+ * (the caller skips it). MADEIRA_CURSOR_REVEAL=0 disables. */
+#define WINIOS_CURSOR_REVEAL_SECONDS 3.0
+static CFAbsoluteTime g_cursor_reveal_until;
+
+static int winios_cursor_reveal_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *v = getenv("MADEIRA_CURSOR_REVEAL");
+        enabled = !(v && !strcmp(v, "0"));
+    }
+    return enabled;
+}
+
 /* main thread only */
 static void winios_cursor_apply_visibility(void) {
     if (!g_cursor_layer) return;
     if (winios_cursor_desktop_mode()) return;   /* desktop mode is unchanged */
-    g_cursor_layer.hidden = !(g_cursor_drv_show > 0 ||
-                              (g_cursor_drv_show < 0 && g_cursor_gdi_windows > 0));
+    int program = g_cursor_drv_show > 0 || (g_cursor_drv_show < 0 && g_cursor_gdi_windows > 0);
+    int revealed = winios_cursor_reveal_enabled() && CFAbsoluteTimeGetCurrent() < g_cursor_reveal_until;
+    g_cursor_layer.hidden = !(program || revealed);
+}
+
+static void winios_ensure_cursor_layer(void);
+
+/* main thread only. Hides the arrow again once the reveal window has passed;
+ * a later touch only moves the deadline, so at most one of these is pending. */
+static void winios_cursor_reveal_recheck(void) {
+    CFAbsoluteTime left = g_cursor_reveal_until - CFAbsoluteTimeGetCurrent();
+    if (left > 0) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((left + 0.05) * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ winios_cursor_reveal_recheck(); });
+        return;
+    }
+    winios_cursor_apply_visibility();
+}
+
+void winios_cursor_reveal(void) {
+    static unsigned notes;
+    static CFAbsoluteTime last_note;
+    if (!winios_cursor_reveal_enabled() || winios_cursor_desktop_mode()) return;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    int pending = now < g_cursor_reveal_until;
+    g_cursor_reveal_until = now + WINIOS_CURSOR_REVEAL_SECONDS;
+    /* Touch moves arrive at display rate: an open window only moves its
+     * deadline; the pending recheck picks the new one up. */
+    if (pending) return;
+    if (g_cursor_drv_show == 0 && notes < 16 && now - last_note > 10) {
+        ++notes; last_note = now;
+        fprintf(stderr, "[cursor-reveal] ml1420 program hid the cursor; shown for %.0fs after touch\n",
+                WINIOS_CURSOR_REVEAL_SECONDS);
+    }
+    winios_ensure_cursor_layer();
+    winios_cursor_apply_visibility();
+    winios_cursor_reveal_recheck();
 }
 
 /* main thread only. Creates the layer at most once (process lifetime, like

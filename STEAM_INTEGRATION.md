@@ -516,6 +516,109 @@ selection (`ml1390 selection`) is now logged before the key requests, so a
 refusal still shows the layout. Device-unverified: if the refused depot is one
 the licenses include, the log will show that, and the cause is elsewhere.
 
+## ml1420: missing owned games, client download progress, stuck starting screen
+
+**Owned games missing from the library (proven cause, fixed).** Steam's app
+information (PICS) does not capitalize `common/type` consistently. Newer apps
+send `"Game"`, many older ones send `"game"`. The parser matched type names
+exactly, so a lowercase type became "unknown" and the app was dropped as not
+playable. That happened before the `[steam-library] ml1310 owned apps=` count,
+so the log never showed it. The public app information of the reported
+multi-platform game has `"type" "game"`. Run through the production parser,
+it is dropped with exact matching. With case-insensitive matching it is
+offered, with its platform-neutral and Windows depots selected. Type names
+now match without case (`MADEIRA_STEAM_TYPE_FOLD=0` restores exact matching). A
+library list cached before this change is refreshed at the next start instead
+of after six hours.
+
+Once per library fetch, `[steam-library] ml1420 hidden` lists the owned apps
+that are not shown and why (App IDs and reason tokens only; up to 40 listed,
+`MADEIRA_STEAM_HIDDEN_LOG=0` disables):
+`shown=<n> type-fold=<0|1> requested=<n> hidden=<n> types=dlc:<n>,… ids=<appid>:<reason>,… more=<n>`
+(`requested`: distinct App IDs in the account's packages).
+Valve's non-playable types (DLC, soundtracks, tools, configs, videos and so on)
+are only counted under `types=`. Everything else is listed by App ID:
+
+| Reason | Meaning |
+| --- | --- |
+| `unknown` | PICS does not know the App ID |
+| `missing` | the app was requested but absent from every PICS response |
+| `parse-empty` / `parse-utf8` / `parse-noname` | PICS sent the app, but its information did not parse |
+| `type-<name>` | an unexpected type (`type-none`: no type at all) |
+| `os` | no Windows build (`common/oslist`) |
+| `nodepots` / `nodepot/<rule><count>+…` | no installable Windows depot; counts per skipped-depot rule (`os`, `dlc`, `shared`, `nomanifest`, `lowviolence`, `lang`, `arch`) |
+| `+token` | PICS flagged the app as requested without a valid access token |
+
+**Windows client download progress.** A game started through the Windows Steam
+client often has to download content first, including shared content installed
+as other apps. While such a session runs, Madeira reads (never writes) the
+client's install records every 2 s off the main thread. It reads
+`appmanifest_<appid>.acf` for the launched app and for every app named in its
+`SharedDepots`, in the client's library folders inside `drive_c`.
+
+- The starting screen shows, for example, "Steam is downloading game content:
+  1.2 of 3.8 GB (31%)" with a progress bar. Other states are installing
+  (staging), verifying, paused and "needs to update". It also says how many items
+  are still to update.
+- The client's window can replace the starting screen. While Steam is still
+  downloading, installing or verifying, a small banner then stays at the top.
+  It is hidden while the session menu is open.
+- A record the client is rewriting, or has briefly removed, keeps its last
+  complete reading.
+- `[steam-progress] ml1420` logs start, stop, phase changes (at most one per 5 s)
+  and changed figures while something is pending (at most every 30 s), up to
+  240 lines per session. Each line has App IDs and byte counts only.
+- `MADEIRA_STEAM_CLIENT_PROGRESS=0` disables it.
+
+Device-unverified: how often the client rewrites the byte counters during a
+download. If it rewrites them rarely, the figures will lag while the phase is
+still correct.
+
+**Starting screen left on screen (suspected cause, unproven).** Log 176: after
+"Show live log", the starting screen stayed visible and unresponsive although
+the game was presenting. The suspected cause is the animated removal of the
+starting screen. That screen is a scroll view whose live log keeps updating,
+and `launchLogs` changed outside the animation in the same update. Both flags
+now change in one transaction without animation
+(`MADEIRA_LAUNCH_VIEW_INSTANT=0` restores the animated dismissal).
+`[launch-view] ml1420 dismissed reason=<present|surface|button> logs=<0|1> instant=<0|1>`
+is logged once per session. `[launch-view] ml1420 hud launching=<0|1>` shows
+that the overlay received the change.
+
+**Client never logged on (log 175).** The session never called `LogOn()`.
+Two causes are proven from the log; the link between them is inferred.
+
+1. The code pool was the wrong size (proven). Madeira takes its JIT pool once
+   at app start, sized like the previous session's request, and keeps it for
+   the whole run. The previous run was a direct game launch (512 MB), so the
+   client session, which asks for 896 MB, got
+   `keeping the 512MB pool of session 1`. FEX's code buffers were refused
+   (`TAIL REFUSED`), and one thread died at the deliberate out-of-pool fault
+   (`EXEC ALLOC FAILED ... honest fault at 0xdead`).
+2. A thread was stuck in an unwind loop (proven). Shortly afterwards the
+   browser process's network thread spent 35 of 37 profiler windows at
+   ~70% of a core. It was in `virtual_unwind` → `RtlLookupFunctionEntry` with
+   a constant stack pointer (`ios_jit_reverse_translate_addr` was the top
+   profile entry, 41-46% of all CPU). In the sessions that logged on (170,
+   173) this never happened.
+
+(inferred) The 0xdead fault is the kind of frame the unwinder cannot get past,
+since it sits outside every image, which would link cause 1 to cause 2. The
+fixes:
+
+- The next run's early pool is the largest recent session's size, and a
+  library with Windows Steam client entries starts at 896 MB at least
+  (`MADEIRA_POOL_STICKY_MAX=0`; `[jit-early] ml1420`).
+- The 64-bit ntdll stops an unwind after three steps without progress. The
+  exception is then reported unhandled instead of spinning forever
+  (`MADEIRA_UNWIND_GUARD=0`; `[unwind-stall] ml1420` names pc/lr/sp).
+- The reverse lookup rejects addresses outside the pool at once and tries the
+  last hit first (`MADEIRA_JIT_REV_FAST=0`; `[jit-rev] ml1420`).
+
+The 0x3000 transport trace from ml1410 worked in log 175: both loopback
+connections completed, with steam.exe reading through non-blocking forced-async
+receives woken by `wake-read`.
+
 ## References
 
 - [Valve's official client download](https://store.steampowered.com/about/)

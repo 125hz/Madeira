@@ -190,3 +190,260 @@ struct AppManifestWriter {
             .replacingOccurrences(of: "\"", with: "\\\"")
     }
 }
+
+// MARK: - Madeira ml1420: the Windows client's download progress
+
+/// Madeira ml1420: one app's update state, read from the appmanifest the
+/// Windows Steam client rewrites while it downloads. StateFlags bits follow
+/// the client's EAppState values. Read-only: Madeira never writes these
+/// records while the client runs.
+struct SteamClientAppState: Equatable {
+    enum Phase: Int, Comparable {
+        case idle = 0, installed, queued, paused, verifying, staging, downloading
+        static func < (a: Phase, b: Phase) -> Bool { a.rawValue < b.rawValue }
+        var name: String {
+            switch self {
+            case .idle: return "idle"
+            case .installed: return "installed"
+            case .queued: return "queued"
+            case .paused: return "paused"
+            case .verifying: return "verifying"
+            case .staging: return "staging"
+            case .downloading: return "downloading"
+            }
+        }
+    }
+
+    var appID: Int
+    var flags: UInt64
+    var bytesToDownload: UInt64 = 0
+    var bytesDownloaded: UInt64 = 0
+    var bytesToStage: UInt64 = 0
+    var bytesStaged: UInt64 = 0
+    /// Apps that own depots this app uses (`SharedDepots` values), in order.
+    var sharedOwners: [Int] = []
+
+    /// nil for a missing, oversized, partially written or foreign record.
+    static func parse(_ data: Data, appID: Int) -> SteamClientAppState? {
+        guard !data.isEmpty, data.count <= 1 << 20, var parser = try? SteamKeyValues(data),
+              let root = try? parser.read(), let record = root["AppState"],
+              record["appid"]?.string == String(appID),
+              let flags = UInt64(record["StateFlags"]?.string ?? "") else { return nil }
+        func number(_ key: String) -> UInt64 { UInt64(record[key]?.string ?? "") ?? 0 }
+        var state = SteamClientAppState(appID: appID, flags: flags)
+        state.bytesToDownload = number("BytesToDownload"); state.bytesDownloaded = number("BytesDownloaded")
+        state.bytesToStage = number("BytesToStage"); state.bytesStaged = number("BytesStaged")
+        for (_, owner) in (record["SharedDepots"]?.fields ?? [:]).sorted(by: { $0.key < $1.key }) {
+            if let id = owner.string.flatMap({ Int($0) }), id > 0, id <= Int(UInt32.max), id != appID,
+               !state.sharedOwners.contains(id) { state.sharedOwners.append(id) }
+        }
+        return state
+    }
+
+    var phase: Phase {
+        if flags & (0x100000 | 0x80000 | 0x40000) != 0 { return .downloading }  // Downloading, Preallocating, AddingFiles
+        if flags & (0x200000 | 0x400000) != 0 { return .staging }                // Staging, Committing
+        if flags & 0x20000 != 0 { return .verifying }                            // Validating
+        if flags & 0x200 != 0 { return .paused }                                 // UpdatePaused
+        if flags & (0x100 | 0x400) != 0 {                                        // UpdateRunning, UpdateStarted
+            return bytesDownloaded >= bytesToDownload && bytesToDownload > 0 && bytesStaged < bytesToStage ? .staging : .downloading
+        }
+        if flags & 2 != 0 { return .queued }                                     // UpdateRequired
+        if flags & 4 != 0 { return .installed }                                  // FullyInstalled
+        return .idle
+    }
+}
+
+/// Madeira ml1420: combined progress of a launched app and the apps that own
+/// its shared depots.
+struct SteamClientProgress: Equatable {
+    typealias Phase = SteamClientAppState.Phase
+    var phase: Phase = .idle
+    var downloaded: UInt64 = 0
+    var total: UInt64 = 0
+    var staged: UInt64 = 0
+    var toStage: UInt64 = 0
+    /// App IDs still updating or waiting to update, ascending.
+    var pending: [Int] = []
+    var tracked = 0
+    var unreadable = 0
+
+    /// Something is left to do before the game can start.
+    var active: Bool { phase >= .queued }
+    /// Steam is verifying, downloading or installing right now. (Steam pauses
+    /// other downloads while a game runs, so a paused record is not shown
+    /// over gameplay.)
+    var working: Bool { phase >= .verifying }
+
+    private static func sum(_ a: UInt64, _ b: UInt64) -> UInt64 {
+        let (value, overflow) = a.addingReportingOverflow(b); return overflow ? .max : value
+    }
+
+    /// `involved`: apps seen updating earlier in this session; they stay in
+    /// the totals after they finish, so the figures do not jump back.
+    static func combine(_ states: [SteamClientAppState], involved: Set<Int>) -> SteamClientProgress {
+        var result = SteamClientProgress()
+        result.tracked = states.count
+        for state in states {
+            let phase = state.phase
+            result.phase = max(result.phase, phase)
+            if phase >= .queued { result.pending.append(state.appID) }
+            // A waiting record's counters may be left over from an earlier
+            // update; count them only when they describe unfinished work.
+            guard phase >= .paused || involved.contains(state.appID) ||
+                  (phase == .queued && state.bytesToDownload > state.bytesDownloaded) else { continue }
+            result.total = sum(result.total, state.bytesToDownload)
+            result.downloaded = sum(result.downloaded, min(state.bytesDownloaded, state.bytesToDownload))
+            result.toStage = sum(result.toStage, state.bytesToStage)
+            result.staged = sum(result.staged, min(state.bytesStaged, state.bytesToStage))
+        }
+        result.pending.sort()
+        return result
+    }
+
+    private var staging: Bool { phase == .staging && toStage > 0 }
+    /// The figures the current phase reports: staged bytes while staging, else downloaded bytes.
+    private var counts: (done: UInt64, all: UInt64)? {
+        if staging { return (min(staged, toStage), toStage) }
+        guard total > 0, phase >= .queued else { return nil }
+        return (min(downloaded, total), total)
+    }
+    var fraction: Double? { counts.map { Double($0.done) / Double($0.all) } }
+    var percent: Int? { counts.map { Int((Double($0.done) * 100 / Double($0.all)).rounded(.down)) } }
+
+    static func size(_ bytes: UInt64) -> String {
+        bytes >= 1_000_000_000 ? String(format: "%.1f GB", Double(bytes) / 1e9) : String(format: "%.0f MB", Double(bytes) / 1e6)
+    }
+    static func amount(_ done: UInt64, of total: UInt64) -> String {
+        if done >= 1_000_000_000 || (total >= 1_000_000_000 && done == 0) {
+            return String(format: "%.1f of %.1f GB", Double(done) / 1e9, Double(total) / 1e9)
+        }
+        return size(done) + " of " + size(total)
+    }
+
+    /// One line for the starting screen, or nil when there is nothing to report.
+    var summary: String? {
+        let figures: String? = staging ? Self.amount(staged, of: toStage) : total > 0 ? Self.amount(downloaded, of: total) : nil
+        let suffix = figures.map { ": \($0) (\(percent ?? 0)%)" }
+        switch phase {
+        case .downloading: return "Steam is downloading game content" + (suffix ?? "…")
+        case .staging: return "Steam is installing downloaded content" + (suffix ?? "…")
+        case .verifying: return "Steam is verifying game files…"
+        case .paused: return "Steam paused the content download" + (suffix ?? ".")
+        case .queued: return "Steam needs to update game content before the game can start."
+        case .installed, .idle: return nil
+        }
+    }
+    var detail: String? { pending.count > 1 ? "\(pending.count) items still to update" : nil }
+
+    /// Numbers only: App IDs, byte counts, phase.
+    var logFields: String {
+        "phase=\(phase.name) done=\(downloaded) total=\(total) pct=\(percent.map(String.init) ?? "-") " +
+        "stage=\(staged)/\(toStage) pending=\(pending.isEmpty ? "-" : pending.map(String.init).joined(separator: ",")) " +
+        "apps=\(tracked) unreadable=\(unreadable)"
+    }
+}
+
+/// Madeira ml1420: follows one launched app and the owners of its shared
+/// depots across polls. A record the client is rewriting (or has briefly
+/// removed) keeps its last complete reading.
+struct SteamClientProgressTracker {
+    static let maxApps = 16
+    let appID: Int
+    private(set) var states: [Int: SteamClientAppState] = [:]
+    private(set) var involved = Set<Int>()
+    private(set) var unreadable = 0
+    private var peaks: [Int: (download: UInt64, stage: UInt64)] = [:]
+
+    init(appID: Int) { self.appID = appID }
+
+    /// The launched app first, then the apps its record names as owners.
+    var appIDs: [Int] {
+        var ids = [appID]
+        for owner in states[appID]?.sharedOwners ?? [] where ids.count < Self.maxApps && !ids.contains(owner) { ids.append(owner) }
+        return ids
+    }
+
+    /// `data` nil: no record found. Unreadable data counts as a partial write.
+    mutating func record(_ id: Int, data: Data?) {
+        guard let data else { return }
+        guard var state = SteamClientAppState.parse(data, appID: id) else { unreadable += 1; return }
+        if state.phase >= .paused {
+            involved.insert(id)
+            let peak = peaks[id] ?? (0, 0)
+            peaks[id] = (max(peak.download, state.bytesToDownload), max(peak.stage, state.bytesToStage))
+        } else if state.phase < .queued, state.bytesToDownload == 0, let peak = peaks[id] {
+            // A finished update may reset its counters; keep its share complete.
+            state.bytesToDownload = peak.download; state.bytesDownloaded = peak.download
+            state.bytesToStage = peak.stage; state.bytesStaged = peak.stage
+        }
+        states[id] = state
+    }
+
+    /// Reads the launched app first, so a newly listed owner is followed in the same pass.
+    mutating func poll(libraries: [URL]) {
+        record(appID, data: Self.read(appID, libraries: libraries))
+        for id in appIDs.dropFirst() { record(id, data: Self.read(id, libraries: libraries)) }
+    }
+
+    var progress: SteamClientProgress {
+        var result = SteamClientProgress.combine(appIDs.compactMap { states[$0] }, involved: involved)
+        result.unreadable = unreadable
+        return result
+    }
+
+    static func readBounded(_ url: URL) -> Data? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        return (try? handle.read(upToCount: (1 << 20) + 1)) ?? Data()
+    }
+
+    static func read(_ id: Int, libraries: [URL]) -> Data? {
+        for library in libraries {
+            if let data = readBounded(library.appendingPathComponent("appmanifest_\(id).acf")) { return data }
+        }
+        return nil
+    }
+
+    /// Steam library folders to search: the given steamapps folders, then the
+    /// libraries their libraryfolders.vdf lists inside drive_c. At most 8.
+    static func libraries(primary: [URL], drive: URL) -> [URL] {
+        var result: [URL] = [], seen = Set<String>()
+        func add(_ url: URL) {
+            if result.count < 8, seen.insert(url.standardizedFileURL.path.lowercased()).inserted { result.append(url) }
+        }
+        primary.forEach(add)
+        for folder in primary {
+            guard let data = readBounded(folder.appendingPathComponent("libraryfolders.vdf")), data.count <= 1 << 20,
+                  var parser = try? SteamKeyValues(data), let table = try? parser.read()["libraryfolders"] else { continue }
+            for (key, value) in table.fields.sorted(by: { $0.key < $1.key }) where Int(key) != nil {
+                if let path = value["path"]?.string ?? value.string, let root = SteamPaths.windowsFolder(path, drive: drive) {
+                    add(root.appendingPathComponent("steamapps", isDirectory: true))
+                }
+            }
+        }
+        return result
+    }
+}
+
+/// Madeira ml1420: when to write a progress line. Phase changes (at most one
+/// per 5 s) and, while something is left to do, changed figures at most every
+/// 30 s; never more than `cap` lines per session.
+struct SteamClientProgressLog {
+    static let interval: Double = 30, phaseInterval: Double = 5, cap = 240
+    private var phase: SteamClientProgress.Phase?
+    private var fields = ""
+    private var last = 0.0
+    private(set) var lines = 0
+
+    mutating func line(_ progress: SteamClientProgress, now: Double) -> String? {
+        guard lines < Self.cap else { return nil }
+        let text = progress.logFields
+        let changed = progress.phase != phase
+        let due = changed ? (phase == nil || now - last >= Self.phaseInterval)
+                          : (progress.active && text != fields && now - last >= Self.interval)
+        guard due else { return nil }
+        phase = progress.phase; fields = text; last = now; lines += 1
+        return text
+    }
+}

@@ -9,6 +9,8 @@ struct SteamAppInfo {
     let appID: UInt32
     var name: String = ""
     var type: AppType = .game
+    /// Madeira ml1420: `common.type` as PICS sent it, for the hidden-app log.
+    var rawType: String = ""
     var installDir: String = ""
     var oslist: String = ""         // "macos", "windows", "macos,windows", etc.
     var depots: [DepotInfo] = []
@@ -30,6 +32,19 @@ struct SteamAppInfo {
 
         var isPlayable: Bool {
             self == .game || self == .demo || self == .application
+        }
+
+        /// Madeira ml1420: PICS does not capitalize type names consistently;
+        /// many older apps send "game" rather than "Game", and exact matching
+        /// left them out of the library. Match case-insensitively.
+        /// MADEIRA_STEAM_TYPE_FOLD=0 restores exact matching.
+        static let foldsCase = LibraryFlags.enabled("MADEIRA_STEAM_TYPE_FOLD")
+
+        init(pics raw: String, foldCase: Bool = AppType.foldsCase) {
+            if let exact = AppType(rawValue: raw) { self = exact; return }
+            guard foldCase else { self = .unknown; return }
+            self = [AppType.game, .dlc, .tool, .demo, .application, .music]
+                .first { $0.rawValue.caseInsensitiveCompare(raw) == .orderedSame } ?? .unknown
         }
     }
 
@@ -136,23 +151,52 @@ struct SteamAppInfo {
                                language: String = "english", limit: Int = 24) -> String {
         let chosen = Set(installDepots(os: os, arch: arch, language: language).map(\.depotID))
         return depots.sorted { $0.depotID < $1.depotID }.prefix(limit).map { d in
-            let why: String
-            if chosen.contains(d.depotID) { why = "sel" }
-            else if !d.supports(os: os) { why = "os" }
-            else if d.dlcAppID != nil { why = "dlc" }
-            else if d.isSharedInstall { why = "shared" }
-            else if d.publicManifestID == nil { why = "nomanifest" }
-            else if d.lowViolence { why = "lowviolence" }
-            else if !d.language.isEmpty && d.language.caseInsensitiveCompare(language) != .orderedSame { why = "lang" }
-            else { why = "arch" }
+            let why = selectionRule(d, chosen: chosen, os: os, language: language)
             let from = d.fromApp.map { "<\($0)" } ?? ""
             return "\(d.depotID)[\(d.osarch.isEmpty ? "-" : d.osarch)]\(why)\(from)"
         }.joined(separator: ",")
     }
 
+    /// "sel" or the first rule that left the depot out.
+    private func selectionRule(_ d: DepotInfo, chosen: Set<UInt32>, os: String, language: String) -> String {
+        if chosen.contains(d.depotID) { return "sel" }
+        if !d.supports(os: os) { return "os" }
+        if d.dlcAppID != nil { return "dlc" }
+        if d.isSharedInstall { return "shared" }
+        if d.publicManifestID == nil { return "nomanifest" }
+        if d.lowViolence { return "lowviolence" }
+        if !d.language.isEmpty && d.language.caseInsensitiveCompare(language) != .orderedSame { return "lang" }
+        return "arch"
+    }
+
     /// Madeira: owned apps that can be installed for Windows at all.
     var installableOnWindows: Bool {
         supportsWindows && type.isPlayable && !installDepots().isEmpty
+    }
+
+    /// Madeira ml1420: why the library leaves this owned app out, or nil when
+    /// it is shown (the same rules as `installableOnWindows`). Short tokens only:
+    /// "type-<name>", "os", "nodepots", or "nodepot/" + skipped-depot rule counts.
+    var hiddenReason: String? {
+        if !type.isPlayable {
+            let allowed = Set("abcdefghijklmnopqrstuvwxyz0123456789")
+            let name = String(rawType.lowercased().filter { allowed.contains($0) }.prefix(12))
+            return "type-" + (name.isEmpty ? "none" : name)
+        }
+        if !supportsWindows { return "os" }
+        guard installDepots().isEmpty else { return nil }
+        if depots.isEmpty { return "nodepots" }
+        var counts: [String: Int] = [:]
+        for depot in depots { counts[selectionRule(depot, chosen: [], os: "windows", language: "english"), default: 0] += 1 }
+        return "nodepot/" + counts.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
+            .map { "\($0.key)\($0.value)" }.joined(separator: "+")
+    }
+
+    /// Madeira ml1420: short reason for app info that did not parse.
+    static func parseFailure(_ buffer: Data) -> String {
+        if buffer.isEmpty { return "parse-empty" }
+        if String(data: buffer, encoding: .utf8) == nil { return "parse-utf8" }
+        return "parse-noname"
     }
 
     /// Approximate download size for a platform. Per depot, prefers the
@@ -205,7 +249,8 @@ struct SteamAppInfo {
         // Common section
         if let common = appInfo["common"] as? [String: Any] {
             info.name = common["name"] as? String ?? ""
-            info.type = AppType(rawValue: common["type"] as? String ?? "") ?? .unknown
+            info.rawType = common["type"] as? String ?? ""
+            info.type = AppType(pics: info.rawType)
             info.oslist = common["oslist"] as? String ?? ""
         }
 
@@ -318,5 +363,52 @@ struct SteamAppInfo {
         guard !info.name.isEmpty else { return nil }
 
         return info
+    }
+}
+
+/// Madeira ml1420: which owned apps one library fetch left out, and why.
+/// App IDs and short reason tokens only.
+struct SteamLibraryVisibilityReport {
+    /// Valve's non-playable app types; counted, not listed one by one.
+    static let expectedTypes: Set<String> = ["type-dlc", "type-music", "type-tool", "type-config", "type-video",
+                                             "type-series", "type-episode", "type-media", "type-beta", "type-hardware",
+                                             "type-advertising", "type-guide", "type-comic", "type-driver", "type-plugin",
+                                             "type-franchise"]
+    private(set) var requested = 0
+    /// Hidden app → reason: parse-*, unknown (PICS does not know it), missing
+    /// (absent from every response), or `SteamAppInfo.hiddenReason`. "+token"
+    /// marks apps PICS flagged as sent without a valid access token.
+    private(set) var reasons: [UInt32: String] = [:]
+
+    init(requested: [UInt32], parsed: [SteamAppInfo], unknown: Set<UInt32>, failed: [UInt32: String], missingToken: Set<UInt32>) {
+        let ids = Set(requested)
+        self.requested = ids.count
+        var infos: [UInt32: SteamAppInfo] = [:]
+        for info in parsed { infos[info.appID] = info }
+        for id in ids {
+            let reason: String?
+            if let info = infos[id] { reason = info.hiddenReason }
+            else if let failure = failed[id] { reason = failure }
+            else if unknown.contains(id) { reason = "unknown" }
+            else { reason = "missing" }
+            if let reason { reasons[id] = reason + (missingToken.contains(id) ? "+token" : "") }
+        }
+    }
+
+    /// "requested=… hidden=… types=dlc:12,… ids=7001:nodepot/os2,… more=…"
+    func summary(limit: Int = 40) -> String {
+        var types: [String: Int] = [:]
+        var listed: [(UInt32, String)] = []
+        for (id, reason) in reasons {
+            let base = reason.hasSuffix("+token") ? String(reason.dropLast(6)) : reason
+            if Self.expectedTypes.contains(base) { types[String(base.dropFirst(5)), default: 0] += 1 }
+            else { listed.append((id, reason)) }
+        }
+        listed.sort { $0.0 < $1.0 }
+        let typeText = types.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }.prefix(16)
+            .map { "\($0.key):\($0.value)" }.joined(separator: ",")
+        let idText = listed.prefix(limit).map { "\($0.0):\($0.1)" }.joined(separator: ",")
+        return "requested=\(requested) hidden=\(reasons.count) types=\(typeText.isEmpty ? "-" : typeText) " +
+               "ids=\(idText.isEmpty ? "-" : idText) more=\(max(0, listed.count - limit))"
     }
 }

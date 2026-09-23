@@ -119,8 +119,9 @@ enum StikJITHelper {
     }
 
     /// Allocate the JIT pool now if a debugger is attached and no pool exists,
-    /// then detach. Size: madeira-pool.txt, else the last session's size,
-    /// else the direct-launch default (512 MB).
+    /// then detach. Size: madeira-pool.txt, else the remembered size (the
+    /// largest recent session's, ml1420; see ContentView), else the
+    /// direct-launch default (512 MB).
     static func prepareEarlyPool(trigger: String, completion: ((Bool) -> Void)? = nil) {
         guard LibraryFlags.enabled("MADEIRA_JIT_EARLY_POOL"), !earlyInFlight, !poolReady, !debuggerDetached,
               jit_debugger_attached(), wine_process_is_running() == 0 else {
@@ -134,6 +135,13 @@ enum StikJITHelper {
            let txt = try? String(contentsOf: d.appendingPathComponent("madeira-pool.txt"), encoding: .utf8),
            let mb = Int(txt.trimmingCharacters(in: .whitespacesAndNewlines)), (256...1152).contains(mb) {
             sizeMB = mb; source = "madeira-pool.txt"
+        }
+        // ml1420: an entry that starts through the Windows Steam client runs a
+        // desktop session (896 MB default), and this pool is kept for the whole
+        // app run, so a library that has one starts with at least that much.
+        if source != "madeira-pool.txt", sizeMB < 896, LibraryFlags.enabled("MADEIRA_POOL_STICKY_MAX"),
+           LibraryModel.shared.entries.contains(where: { $0.usesSteam }) {
+            sizeMB = 896; source = "library has Windows Steam client entries, ml1420"
         }
         LogStore.shared.log("[jit-early] ml1330 trigger=\(trigger) allocating \(sizeMB)MB (\(source)) while the debugger is attached")
         DispatchQueue.global(qos: .userInitiated).async {

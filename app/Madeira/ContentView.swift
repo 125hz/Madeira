@@ -59,6 +59,22 @@ enum DisplayMode: String, CaseIterable {
     }
 }
 
+/// ml1420: which build is installed, shown in light grey beside the
+/// entitlement badges and logged once at start ([build] ml1420). The local
+/// xtool build writes MadeiraBuild (round tag and build time) into Info.plist;
+/// other builds fall back to the bundle version. MADEIRA_BUILD_LABEL=0 hides
+/// the label (the log line stays). Read once: the badge row redraws every 2 s.
+enum BuildStamp {
+    static let text: String = {
+        let info = Bundle.main.infoDictionary ?? [:]
+        if let stamp = info["MadeiraBuild"] as? String, !stamp.isEmpty { return stamp }
+        let version = info["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info["CFBundleVersion"] as? String ?? "?"
+        return "v\(version) (\(build))"
+    }()
+    static let visible = LibraryFlags.enabled("MADEIRA_BUILD_LABEL")
+}
+
 /// Fullscreen is a MODE the user enters with a button (ContentView's
 /// fullscreenToggle, or the HUD cluster's exit button in TouchControlsOverlay)
 /// — never a side effect of rotation, size class, or `UIDevice.current.
@@ -1012,6 +1028,12 @@ final class MetalBackedView: UIView {
         guard let v = getenv(name), let i = Int(String(cString: v)) else { return def }
         return i
     }
+    /// ml1420: a finger is pointing, so keep the drawn arrow visible briefly
+    /// even if the program hid its cursor (see winios_cursor_reveal). Relative
+    /// mouse-look never reveals; desktop sessions are handled in Winios.m.
+    private func revealPointer() {
+        if !InputSettings.shared.relative || trackpadMode { winios_cursor_reveal() }
+    }
     private func postPointer(_ flags: UInt32, data: Int32 = 0) {
         winios_pointer(Int32(Self.cursor.x), Int32(Self.cursor.y), flags, UInt32(bitPattern: data))
     }
@@ -1387,6 +1409,7 @@ final class MetalBackedView: UIView {
         // de-duplication, and it only applies while a real mouse is live.
         // ========================================================================
         if HardwareInput.shared.shouldIgnore(touches, logging: true) { return }
+        revealPointer()
         if desktopMode && touchPointerMode {
             touchModeBegan(touches)
             return
@@ -1479,6 +1502,7 @@ final class MetalBackedView: UIView {
         // otherwise a click-drag with the AssistiveTouch cursor would turn the
         // camera a second time on top of the GCMouse deltas already doing it.
         if HardwareInput.shared.shouldIgnore(touches, logging: false) { return }
+        revealPointer()
         if desktopMode && touchPointerMode {
             touchModeMoved(touches, event)
             return
@@ -4034,6 +4058,7 @@ struct ContentView: View {
                 StikJITHelper.prepareEarlyPool(trigger: "start")
                 entitlements = EntitlementStatus.check()
                 logEntitlementStatus()
+                logStore.log("[build] ml1420 \(BuildStamp.text)")
                 // WOW64_DESIGN.md §9.2 step 0: measure the free VA map before
                 // Wine/JIT touches it. Read-only, no behaviour change.
                 mad_va_probe(entitlements?.extendedVA ?? false)
@@ -4617,6 +4642,13 @@ struct ContentView: View {
             entitlementBadge("JIT", granted: debuggerAttached)
             entitlementBadge("Memory+", granted: ents.increasedMemory)
             entitlementBadge("64-bit VA", granted: ents.extendedVA)
+            if BuildStamp.visible {
+                Text(BuildStamp.text)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(Color(.systemGray2))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            }
             Spacer()
             // Device model rides in this row (the old standalone statusHeader
             // row above it spent ~50pt of vertical space on nothing else).
@@ -5358,7 +5390,21 @@ struct ContentView: View {
                          "Documents/madeira-pool.txt (bare MB, 256..1152) if the log shows [jit-pool] EXHAUSTED")
             setenv("MADEIRA_POOL_MB", String(poolSizeMB), 1)
             // ml1330: the early pool of the next app run is sized like this session.
-            UserDefaults.standard.set(poolSizeMB, forKey: "madeiraLastPoolMB")
+            // ml1420: like the LARGEST recent session. The early pool is taken at
+            // app start and kept for the whole run, and one run can host any kind
+            // of session: after a direct launch (512 MB) the next run's Steam
+            // client session got a 512 MB pool instead of 896, ran it dry and
+            // lost threads to the deliberate out-of-pool fault (device log 175).
+            // An explicit madeira-pool.txt still wins at allocation time.
+            // MADEIRA_POOL_STICKY_MAX=0 restores "last session".
+            let previousPoolMB = UserDefaults.standard.integer(forKey: "madeiraLastPoolMB")
+            var rememberedPoolMB = poolSizeMB
+            if LibraryFlags.enabled("MADEIRA_POOL_STICKY_MAX"), poolSource != "madeira-pool.txt override",
+               (256...1152).contains(previousPoolMB), previousPoolMB > poolSizeMB {
+                rememberedPoolMB = previousPoolMB
+            }
+            UserDefaults.standard.set(rememberedPoolMB, forKey: "madeiraLastPoolMB")
+            logStore.log("[jit-early] ml1420 next run's early pool \(rememberedPoolMB)MB (session \(poolSizeMB)MB, previous \(previousPoolMB)MB)")
             // ml901: [prof] sampling profiler. Documents/madeira-prof.txt holds
             // "period_ms[,report_s]" -- "0" turns it off, absent means ON at the
             // 5ms / 10s default. It samples every thread's PC and buckets it by

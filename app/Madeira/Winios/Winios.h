@@ -243,6 +243,12 @@ int winios_overlay_fit_source(double *x, double *y, double *w, double *h);
  * cursor a game was showing does not survive back into the normal UI. */
 void winios_cursor_show(int show);
 
+/* ml1420: a finger is pointing (touch pointer or trackpad, not relative
+ * mouse-look). In a direct launch, keeps the drawn arrow visible for a short
+ * while even if the program has hidden its cursor, so a touch user can see
+ * where the pointer is. Call from the main thread. */
+void winios_cursor_reveal(void);
+
 /* ========================================================================
  * ml668 — THE GAMEPAD SLOT.
  *

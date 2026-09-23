@@ -93,7 +93,12 @@ final class SteamAccountModel: ObservableObject {
     private var started = false
 
     private static var cacheURL: URL { LibraryModel.documents.appendingPathComponent("madeira-steam-library.json") }
-    private struct Cache: Codable { var version: Int; var updated: Date; var games: [SteamOwnedGame] }
+    private struct Cache: Codable { var version: Int; var updated: Date; var games: [SteamOwnedGame]; var revision: Int? }
+    /// ml1420: the owned-library filter changed (app types match without
+    /// case). A list cached before it is refreshed at the next start instead
+    /// of after six hours. Follows MADEIRA_STEAM_TYPE_FOLD.
+    private static var libraryRevision: Int? { SteamAppInfo.AppType.foldsCase ? 1420 : nil }
+    private var cacheRevision: Int?
 
     // MARK: Lifecycle
 
@@ -105,11 +110,13 @@ final class SteamAccountModel: ObservableObject {
             phase = .signedIn
             if let data = try? Data(contentsOf: Self.cacheURL),
                let cache = try? JSONDecoder().decode(Cache.self, from: data), cache.version == 1 {
-                owned = cache.games; libraryUpdated = cache.updated
+                owned = cache.games; libraryUpdated = cache.updated; cacheRevision = cache.revision
             }
         }
         SteamLog.event("[steam-account] ml1310 start signed-in=\(phase == .signedIn ? 1 : 0) cached=\(owned.count)")
-        if phase == .signedIn, Date().timeIntervalSince(libraryUpdated ?? .distantPast) > 6 * 3600 {
+        let outdated = libraryUpdated != nil && Self.libraryRevision != nil && cacheRevision != Self.libraryRevision
+        if outdated { SteamLog.event("[steam-library] ml1420 cached list predates the type filter fix; refreshing") }
+        if phase == .signedIn, outdated || Date().timeIntervalSince(libraryUpdated ?? .distantPast) > 6 * 3600 {
             Task { await refreshLibrary(interactive: false) }
         }
     }
@@ -255,9 +262,15 @@ final class SteamAccountModel: ObservableObject {
                 .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
             owned = games
             libraryUpdated = Date()
+            cacheRevision = Self.libraryRevision
             let encoder = JSONEncoder()
-            try? encoder.encode(Cache(version: 1, updated: libraryUpdated!, games: games)).write(to: Self.cacheURL, options: .atomic)
+            try? encoder.encode(Cache(version: 1, updated: libraryUpdated!, games: games, revision: cacheRevision)).write(to: Self.cacheURL, options: .atomic)
             SteamLog.event("[steam-library] ml1310 owned apps=\(apps.count) windows-installable=\(games.count)")
+            // ml1420: once per fetch, which owned apps the library leaves out
+            // and why (App IDs and reason tokens). MADEIRA_STEAM_HIDDEN_LOG=0 disables.
+            if LibraryFlags.enabled("MADEIRA_STEAM_HIDDEN_LOG"), let report = fetcher.lastVisibility {
+                SteamLog.event("[steam-library] ml1420 hidden shown=\(games.count) type-fold=\(SteamAppInfo.AppType.foldsCase ? 1 : 0) " + report.summary(limit: 40))
+            }
         } catch {
             handleSessionError(error, context: "library", report: interactive)
         }
@@ -543,6 +556,94 @@ final class SteamAccountModel: ObservableObject {
         case SteamError.chunkDownloadFailed: return "chunk"
         case let url as URLError: return "url-\(url.code.rawValue)"
         default: return String(describing: type(of: error))
+        }
+    }
+}
+
+/// ml1420: while a game starts through the Windows Steam client, follow what
+/// the client is downloading for it. Every 2 s (off the main thread) the
+/// client's install records are read: the launched app's
+/// appmanifest_<appid>.acf and those of the apps that own its shared depots.
+/// Read-only. A record the client is rewriting keeps its last complete
+/// reading. Stops when the session ends. MADEIRA_STEAM_CLIENT_PROGRESS=0 disables.
+/// Hook: `LibraryModel.begin` / `finish`; views observe `progress`.
+final class SteamClientProgressModel: ObservableObject {
+    static let shared = SteamClientProgressModel()
+    /// nil when no client-routed session is being followed.
+    @Published private(set) var progress: SteamClientProgress?
+
+    private let queue = DispatchQueue(label: "madeira.steam-client-progress", qos: .utility)
+    private var timer: Timer?
+    private var generation = 0
+    private var busy = false
+    private var session: Session?
+
+    /// State touched only on `queue`.
+    private final class Session {
+        let appID: Int
+        let client: String?
+        let drive: URL
+        var tracker: SteamClientProgressTracker
+        var log = SteamClientProgressLog()
+        var libraries: [URL] = []
+        var librariesRead = -Double.infinity
+        init(appID: Int, client: String?, drive: URL) {
+            self.appID = appID; self.client = client; self.drive = drive
+            tracker = SteamClientProgressTracker(appID: appID)
+        }
+        func poll(now: Double) -> (SteamClientProgress, String?) {
+            if now - librariesRead >= 60 {
+                librariesRead = now
+                let clientApps = client.flatMap { SteamPaths.safeRelative($0, under: drive) }?
+                    .deletingLastPathComponent().appendingPathComponent("steamapps", isDirectory: true)
+                libraries = SteamClientProgressTracker.libraries(primary: [clientApps, SteamInstallPaths.steamApps].compactMap { $0 }, drive: drive)
+            }
+            tracker.poll(libraries: libraries)
+            let progress = tracker.progress
+            return (progress, log.line(progress, now: now))
+        }
+    }
+
+    /// Main thread. Starts following `entry` when it is launched through the client.
+    func start(_ entry: LibraryEntry) {
+        stop()
+        guard entry.usesSteam, let appID = entry.steamAppID, SteamPaths.validAppID(appID),
+              LibraryFlags.enabled("MADEIRA_STEAM_CLIENT_PROGRESS") else { return }
+        generation += 1
+        busy = false
+        session = Session(appID: appID, client: entry.steamNative == true ? entry.steamClientPath : entry.relativePath,
+                          drive: LibraryModel.drive)
+        progress = SteamClientProgress()
+        LogStore.shared.log("[steam-progress] ml1420 start app=\(appID)")
+        let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.tick() }
+        self.timer = timer
+        RunLoop.main.add(timer, forMode: .common)
+        tick()
+    }
+
+    /// Main thread. Safe to call when nothing is being followed.
+    func stop() {
+        timer?.invalidate(); timer = nil
+        guard let session else { return }
+        self.session = nil
+        generation += 1
+        busy = false
+        LogStore.shared.log("[steam-progress] ml1420 stop app=\(session.appID) last=\(progress?.phase.name ?? "idle")")
+        progress = nil
+    }
+
+    private func tick() {
+        guard !busy, let session else { return }
+        busy = true
+        let token = generation
+        queue.async { [weak self] in
+            let (next, line) = session.poll(now: ProcessInfo.processInfo.systemUptime)
+            DispatchQueue.main.async {
+                guard let self, token == self.generation else { return }
+                self.busy = false
+                if let line { LogStore.shared.log("[steam-progress] ml1420 app=\(session.appID) " + line) }
+                if self.progress != next { self.progress = next }
+            }
         }
     }
 }

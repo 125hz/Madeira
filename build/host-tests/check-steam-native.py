@@ -148,6 +148,165 @@ func appVDF(_ body: String) -> Data { Data(("\"appinfo\" { \"appid\" \"10\" " + 
                 "depotfromapp parsed; borrowed depot not installed")
         require(shared.depotSelectionSummary().contains("7109[-]nomanifest<7108"), "selection log marks the owning app")
 
+        // ml1420: PICS type names are not consistently capitalized. Shape of a
+        // real multi-platform app: neutral content, per-OS binaries, language
+        // packs and an optional DLC depot, no osarch anywhere.
+        let lower = SteamAppInfo.parse(appID: 7200, from: appVDF(#"""
+        "common" { "name" "Lower" "type" "game" "oslist" "windows,macos,linux" }
+        "depots" { "7201" { "systemdefined" "1" "manifests" { "public" { "gid" "1" "size" "9" "download" "5" } } }
+                   "7202" { "config" { "oslist" "windows" } "manifests" { "public" { "gid" "2" "download" "3" } } }
+                   "7203" { "config" { "oslist" "macos" } "manifests" { "public" { "gid" "3" } } }
+                   "7204" { "config" { "language" "french" } "manifests" { "public" { "gid" "4" } } }
+                   "7205" { "config" { "oslist" "windows" "optionaldlc" "7209" } "dlcappid" "7209" "optional" "1" "manifests" { "public" { "gid" "5" } } }
+                   "7206" { "config" { "oslist" "linux" } "manifests" { "public" { "gid" "6" } } }
+                   "branches" { "public" { "buildid" "77" } } "baselanguages" "english,french" }
+        """#))!
+        require(lower.type == .game && lower.rawType == "game", "lowercase PICS type is a game")
+        require(lower.installableOnWindows && lower.hiddenReason == nil && lower.installDepots().map(\.depotID) == [7201, 7202],
+                "lowercase-typed multi-platform app is offered with its Windows depots")
+        require(SteamAppInfo.AppType(pics: "game", foldCase: false) == .unknown, "type fold rollback keeps exact matching")
+        require(SteamAppInfo.AppType(pics: "APPLICATION") == .application && SteamAppInfo.AppType(pics: "demo") == .demo &&
+                SteamAppInfo.AppType(pics: "dlc") == .dlc && SteamAppInfo.AppType(pics: "Game") == .game &&
+                SteamAppInfo.AppType(pics: "config") == .unknown && SteamAppInfo.AppType(pics: "") == .unknown,
+                "type names match without case; unknown names stay unknown")
+        require(!SteamAppInfo.AppType(pics: "tool").isPlayable && !SteamAppInfo.AppType(pics: "DLC").isPlayable,
+                "lowercase tools and DLC stay hidden")
+
+        // ml1420: hidden reasons and the once-per-fetch summary.
+        require(macOnly.hiddenReason == "os" && tool.hiddenReason == "type-tool", "hidden reasons: os, type")
+        let noManifest = SteamAppInfo.parse(appID: 7310, from: appVDF(#"""
+        "common" { "name" "NoManifest" "type" "Game" "oslist" "windows" }
+        "depots" { "7311" { "config" { "oslist" "windows" } } "7312" { "config" { "oslist" "windows" } } "7313" { "config" { "oslist" "macos" } } }
+        """#))!
+        require(noManifest.hiddenReason == "nodepot/nomanifest2+os1", "no installable depot names the skipped-depot rules")
+        let noDepots = SteamAppInfo.parse(appID: 7320, from: appVDF(#""common" { "name" "Empty" "type" "Game" }"#))!
+        require(noDepots.hiddenReason == "nodepots", "app without depots")
+        let untyped = SteamAppInfo.parse(appID: 7307, from: appVDF(#""common" { "name" "Untyped" }"#))!
+        let toolApp = SteamAppInfo.parse(appID: 7303, from: appVDF(#""common" { "name" "T" "type" "Tool" }"#))!
+        let dlcApp = SteamAppInfo.parse(appID: 7308, from: appVDF(#""common" { "name" "D" "type" "DLC" }"#))!
+        let macApp = SteamAppInfo.parse(appID: 7305, from: appVDF(#""common" { "name" "M" "type" "Game" "oslist" "macos" }"#))!
+        let report = SteamLibraryVisibilityReport(requested: [7200, 7301, 7302, 7303, 7304, 7305, 7307, 7308, 7200],
+                                                  parsed: [lower, toolApp, macApp, untyped, dlcApp], unknown: [7301],
+                                                  failed: [7302: "parse-empty"], missingToken: [7305])
+        let summary = report.summary(limit: 40)
+        require(summary == "requested=8 hidden=7 types=dlc:1,tool:1 ids=7301:unknown,7302:parse-empty,7304:missing,7305:os+token,7307:type-none more=0",
+                "hidden summary: expected types counted, other reasons listed by App ID (\(summary))")
+        require(report.summary(limit: 2).hasSuffix("ids=7301:unknown,7302:parse-empty more=3"), "hidden summary is capped")
+        require(SteamAppInfo.parseFailure(Data()) == "parse-empty" && SteamAppInfo.parseFailure(Data([0x22, 0xff, 0xfe, 0x22])) == "parse-utf8" &&
+                SteamAppInfo.parseFailure(Data(#""x" { }"#.utf8)) == "parse-noname", "parse failure reasons")
+
+        // ml1420: PICS product info carries missing_token (field 3) per app.
+        var sub = ProtobufEncoder()
+        sub.writeUInt32(fieldNumber: 1, value: 7305); sub.writeBool(fieldNumber: 3, value: true)
+        sub.writeBytes(fieldNumber: 5, value: Data("x".utf8))
+        var outer = ProtobufEncoder()
+        outer.writeSubmessage(fieldNumber: 1, value: sub.data); outer.writeUInt32(fieldNumber: 2, value: 7301)
+        let pics = try CMsgClientPICSProductInfoResponse.deserialize(from: outer.data)
+        require(pics.apps.first?.missingToken == true && pics.apps.first?.buffer == Data("x".utf8) && pics.unknownApps == [7301],
+                "PICS response: missing token, buffer and unknown apps")
+
+        // ml1420: the Windows client's appmanifest progress.
+        func acf(_ id: Int, flags: Int, toDownload: UInt64 = 0, downloaded: UInt64 = 0, toStage: UInt64 = 0, staged: UInt64 = 0,
+                 shared: [(Int, Int)] = []) -> Data {
+            var text = "\"AppState\"\n{\n\t\"appid\"\t\t\"\(id)\"\n\t\"StateFlags\"\t\t\"\(flags)\"\n"
+            text += "\t\"BytesToDownload\"\t\t\"\(toDownload)\"\n\t\"BytesDownloaded\"\t\t\"\(downloaded)\"\n"
+            text += "\t\"BytesToStage\"\t\t\"\(toStage)\"\n\t\"BytesStaged\"\t\t\"\(staged)\"\n"
+            text += "\t\"InstalledDepots\"\n\t{\n\t\t\"1\"\n\t\t{\n\t\t\t\"manifest\"\t\t\"2\"\n\t\t}\n\t}\n"
+            if !shared.isEmpty {
+                text += "\t\"SharedDepots\"\n\t{\n" + shared.map { "\t\t\"\($0.0)\"\t\t\"\($0.1)\"\n" }.joined() + "\t}\n"
+            }
+            return Data((text + "}\n").utf8)
+        }
+        typealias Phase = SteamClientAppState.Phase
+        let phases: [(Int, Phase)] = [(0x100000 | 0x400 | 2, .downloading), (0x80000, .downloading), (0x200000 | 0x400, .staging),
+                                      (0x400000, .staging), (0x20000, .verifying), (0x200 | 2, .paused), (6, .queued), (4, .installed),
+                                      (1, .idle), (0, .idle)]
+        require(phases.allSatisfy { SteamClientAppState.parse(acf(7000, flags: $0.0), appID: 7000)?.phase == $0.1 },
+                "StateFlags map to phases")
+        require(SteamClientAppState.parse(acf(7000, flags: 0x400 | 2, toDownload: 10, downloaded: 4), appID: 7000)?.phase == .downloading &&
+                SteamClientAppState.parse(acf(7000, flags: 0x100, toDownload: 10, downloaded: 10, toStage: 10, staged: 3), appID: 7000)?.phase == .staging,
+                "a running update without a specific bit follows its counters")
+        let record = acf(7000, flags: 6, shared: [(7101, 7100), (7102, 7100), (7103, 7000), (7201, 7200)])
+        require(SteamClientAppState.parse(record, appID: 7000)?.sharedOwners == [7100, 7200], "shared depot owners, once each, never the app itself")
+        require(SteamClientAppState.parse(record, appID: 7001) == nil, "record for another app is rejected")
+        require((1..<record.count).allSatisfy { SteamClientAppState.parse(record.prefix($0), appID: 7000) == nil ||
+                                               SteamClientAppState.parse(record.prefix($0), appID: 7000) == SteamClientAppState.parse(record, appID: 7000) },
+                "every truncated record is rejected or complete")
+        require(SteamClientAppState.parse(Data(), appID: 7000) == nil &&
+                SteamClientAppState.parse(Data(repeating: 32, count: (1 << 20) + 1), appID: 7000) == nil &&
+                SteamClientAppState.parse(Data("\"AppState\" { \"appid\" \"7000\" }".utf8), appID: 7000) == nil,
+                "empty, oversized and flagless records are rejected")
+
+        let progressRoot = URL(fileURLWithPath: "/tmp/madeira-steam-progress")
+        try? FileManager.default.removeItem(at: progressRoot)
+        let drive = progressRoot.appendingPathComponent("drive_c")
+        let apps = drive.appendingPathComponent("Program Files (x86)/Steam/steamapps")
+        let extra = drive.appendingPathComponent("Games Library/steamapps")
+        try FileManager.default.createDirectory(at: apps, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: extra, withIntermediateDirectories: true)
+        try Data(#"""
+        "libraryfolders" { "0" { "path" "C:\\Program Files (x86)\\Steam" } "1" { "path" "C:\\Games Library" } "2" { "path" "D:\\External" } }
+        """#.utf8).write(to: apps.appendingPathComponent("libraryfolders.vdf"))
+        let libraries = SteamClientProgressTracker.libraries(primary: [apps, apps], drive: drive)
+        require(libraries.map(\.lastPathComponent) == ["steamapps", "steamapps"] && libraries.last?.path.contains("Games Library") == true,
+                "progress searches the client's libraries inside drive_c, once each")
+        var tracker = SteamClientProgressTracker(appID: 7000)
+        tracker.poll(libraries: libraries)
+        require(tracker.progress == SteamClientProgress() && tracker.appIDs == [7000], "no record yet: idle, nothing tracked")
+        try record.write(to: apps.appendingPathComponent("appmanifest_7000.acf"))
+        try acf(7100, flags: 0x100000 | 0x400 | 2, toDownload: 2_000_000_000, downloaded: 1_200_000_000).write(to: apps.appendingPathComponent("appmanifest_7100.acf"))
+        try acf(7200, flags: 6, toDownload: 1_800_000_000).write(to: extra.appendingPathComponent("appmanifest_7200.acf"))
+        tracker.poll(libraries: libraries)
+        var progress = tracker.progress
+        require(tracker.appIDs == [7000, 7100, 7200] && progress.phase == .downloading && progress.total == 3_800_000_000 &&
+                progress.downloaded == 1_200_000_000 && progress.pending == [7000, 7100, 7200] && progress.percent == 31,
+                "launched app plus shared-depot owners, across libraries")
+        require(progress.summary == "Steam is downloading game content: 1.2 of 3.8 GB (31%)" && progress.detail == "3 items still to update" &&
+                progress.active && progress.working, "progress text (\(progress.summary ?? "nil"))")
+        try record.prefix(record.count / 2).write(to: apps.appendingPathComponent("appmanifest_7000.acf"))
+        try Data(acf(7100, flags: 0x100000, toDownload: 2_000_000_000, downloaded: 1_500_000_000).prefix(40)).write(to: apps.appendingPathComponent("appmanifest_7100.acf"))
+        try FileManager.default.removeItem(at: extra.appendingPathComponent("appmanifest_7200.acf"))
+        tracker.poll(libraries: libraries)
+        require(tracker.progress.unreadable == 2 && tracker.progress.downloaded == 1_200_000_000 && tracker.appIDs == [7000, 7100, 7200],
+                "partial writes and a briefly missing record keep the last complete reading")
+        try record.write(to: apps.appendingPathComponent("appmanifest_7000.acf"))
+        try acf(7100, flags: 4).write(to: apps.appendingPathComponent("appmanifest_7100.acf"))
+        try acf(7200, flags: 0x200000 | 0x400, toDownload: 1_800_000_000, downloaded: 1_800_000_000, toStage: 1_000_000_000,
+                staged: 250_000_000).write(to: extra.appendingPathComponent("appmanifest_7200.acf"))
+        tracker.poll(libraries: libraries)
+        progress = tracker.progress
+        require(progress.phase == .staging && progress.downloaded == 3_800_000_000 && progress.total == 3_800_000_000 &&
+                progress.pending == [7000, 7200], "a finished owner keeps its share after its counters reset")
+        require(progress.summary == "Steam is installing downloaded content: 250 MB of 1.0 GB (25%)", "staging text (\(progress.summary ?? "nil"))")
+        try acf(7000, flags: 4, shared: [(7101, 7100), (7201, 7200)]).write(to: apps.appendingPathComponent("appmanifest_7000.acf"))
+        try acf(7200, flags: 4, toDownload: 1_800_000_000, downloaded: 1_800_000_000).write(to: extra.appendingPathComponent("appmanifest_7200.acf"))
+        tracker.poll(libraries: libraries)
+        progress = tracker.progress
+        require(progress.phase == .installed && !progress.active && progress.summary == nil && progress.pending.isEmpty, "all installed: nothing to show")
+        var queued = SteamClientProgress.combine([SteamClientAppState.parse(acf(7000, flags: 6, toDownload: 9, downloaded: 9), appID: 7000)!], involved: [])
+        require(queued.phase == .queued && queued.total == 0 && queued.summary == "Steam needs to update game content before the game can start." &&
+                !queued.working, "leftover counters of a waiting record are not counted")
+        queued = SteamClientProgress.combine([SteamClientAppState.parse(acf(7000, flags: 0x200 | 2, toDownload: 3_000_000_000, downloaded: 450_000_000), appID: 7000)!], involved: [])
+        require(queued.summary == "Steam paused the content download: 450 MB of 3.0 GB (15%)" && queued.active && !queued.working,
+                "paused: shown while starting, not over gameplay (\(queued.summary ?? "nil"))")
+        require(SteamClientProgress.amount(0, of: 3_800_000_000) == "0.0 of 3.8 GB" && SteamClientProgress.size(12_000_000) == "12 MB",
+                "size formatting")
+
+        var limiter = SteamClientProgressLog()
+        var sample = SteamClientProgress(); sample.phase = .downloading; sample.total = 100; sample.downloaded = 10
+        var logged = [limiter.line(sample, now: 0) != nil]
+        sample.downloaded = 20; logged.append(limiter.line(sample, now: 10) != nil)
+        logged.append(limiter.line(sample, now: 31) != nil)
+        logged.append(limiter.line(sample, now: 70) != nil)
+        sample.phase = .staging; logged.append(limiter.line(sample, now: 33) != nil)
+        logged.append(limiter.line(sample, now: 37) != nil)
+        sample.phase = .installed; logged.append(limiter.line(sample, now: 45) != nil)
+        sample.downloaded = 100; logged.append(limiter.line(sample, now: 500) != nil)
+        require(logged == [true, false, true, false, false, true, true, false], "progress log: first, 30 s figures, 5 s phase floor, quiet when done (\(logged))")
+        var capped = SteamClientProgressLog(), lines = 0
+        for step in 0..<1000 { sample.phase = step % 2 == 0 ? .downloading : .staging; if capped.line(sample, now: Double(step) * 10) != nil { lines += 1 } }
+        require(lines == SteamClientProgressLog.cap, "progress log is capped per session")
+
         // Manifest paths.
         var folded: [String: String] = [:]
         for bad in ["../x", "a/../b", "a/./b", "C:/x", "a/b\u{1}c", "", "////"] {
@@ -274,7 +433,8 @@ with tempfile.TemporaryDirectory() as tmp:
     (tmp / 'helpers.swift').write_text('import Foundation\nimport Glibc\n' + helpers + journal)
     (tmp / 'checks.swift').write_text(checks)
     sources = [tmp / 'stubs.swift', tmp / 'vdf.swift', tmp / 'helpers.swift', tmp / 'checks.swift',
-               app / 'SteamFiles.swift', steam / 'Library/SteamAppInfo.swift', steam / 'Install/AppManifestWriter.swift']
+               app / 'SteamFiles.swift', steam / 'Library/SteamAppInfo.swift', steam / 'Install/AppManifestWriter.swift',
+               steam / 'Proto/SteamProtoMessages.swift', steam / 'Core/SteamError.swift']
     exe = tmp / 'swift-checks'
     subprocess.run([SWIFTC, '-parse-as-library', '-swift-version', '5', '-sanitize=address', '-o', str(exe)] + [str(s) for s in sources], check=True)
     # Address checking stays on; LeakSanitizer is off because it reports

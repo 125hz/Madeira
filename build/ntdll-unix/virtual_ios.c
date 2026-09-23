@@ -166,6 +166,7 @@ struct ios_jit_mapping {
 };
 static struct ios_jit_mapping ios_jit_mappings[IOS_JIT_MAX_MAPPINGS];
 static int ios_jit_mapping_count = 0;
+static void ios_jit_rev_read_switch(void);   /* ml1420, next to ios_jit_reverse_translate_addr */
 
 /* JIT pool head bump allocator. Owned by mprotect_exec's PE-image copy path
  * (was a function-local static there); file-scope so the S1 per-child
@@ -3297,6 +3298,7 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
      * written before pe_base (the readers' match key), with a barrier. */
     {
         int slot = -1;
+        ios_jit_rev_read_switch();
         for (i = 0; i < ios_jit_mapping_count; i++)
             if (!ios_jit_mappings[i].pe_base) { slot = i; break; }
         if (slot < 0)
@@ -4657,11 +4659,62 @@ void *ios_jit_pool_copy_owner(const void *addr, void **pe_base_out)
     return (void *)(uintptr_t)-1;  /* not in any pool mapping */
 }
 
+/* iOS-Madeira ml1420: FAST REVERSE LOOKUP. Every unwind step in the PE
+ * ntdlls calls ios_jit_reverse_translate_addr (virtual_unwind,
+ * RtlWalkFrameChain), and the plain scan below walks the whole table even for
+ * addresses no image copy can hold (guest memory, FEX-emitted code). Device
+ * log: the function was the top profile entry at 41-46% of all CPU while one
+ * thread unwound in a loop. Addresses outside the pool now return at once,
+ * and the last matching entry is tried first; freed slots (pe_base NULL) never
+ * match. The hint is a plain index, so a stale one only costs the scan.
+ * MADEIRA_JIT_REV_FAST=0 restores the plain scan. The switch is read at
+ * image registration (native context), never in the lookup, which runs on
+ * whatever stack the PE caller had. */
+static int ios_jit_rev_fast = 1;
+static int ios_jit_rev_hint = -1;
+
+static void ios_jit_rev_read_switch(void)
+{
+    static int done;
+    const char *v;
+    if (done) return;
+    done = 1;
+    v = getenv("MADEIRA_JIT_REV_FAST");
+    ios_jit_rev_fast = !(v && !strcmp(v, "0"));
+    dprintf(2, "[jit-rev] ml1420 fast=%d (MADEIRA_JIT_REV_FAST=0 restores the plain scan)\n", ios_jit_rev_fast);
+}
+
 /* Reverse-translate a JIT pool address back to the original PE address.
  * Used when PE code passes ADRP-computed addresses to syscalls. */
 void *ios_jit_reverse_translate_addr(const void *addr)
 {
     int i;
+    if (ios_jit_rev_fast)
+    {
+        uintptr_t a = (uintptr_t)addr, rx = (uintptr_t)ios_jit_rx_base_global;
+        int n = ios_jit_mapping_count, h;
+
+        if (!rx || a < rx || a - rx >= ios_jit_pool_size_global) return (void *)addr;
+        h = __atomic_load_n(&ios_jit_rev_hint, __ATOMIC_RELAXED);
+        if (h >= 0 && h < n)
+        {
+            uintptr_t pe = (uintptr_t)ios_jit_mappings[h].pe_base;
+            uintptr_t jit_base = (uintptr_t)ios_jit_mappings[h].jit_base;
+            if (pe && a >= jit_base && a < jit_base + ios_jit_mappings[h].size)
+                return (void *)(pe + (a - jit_base));
+        }
+        for (i = 0; i < n; i++)
+        {
+            uintptr_t pe = (uintptr_t)ios_jit_mappings[i].pe_base;
+            uintptr_t jit_base = (uintptr_t)ios_jit_mappings[i].jit_base;
+            if (pe && a >= jit_base && a < jit_base + ios_jit_mappings[i].size)
+            {
+                __atomic_store_n(&ios_jit_rev_hint, i, __ATOMIC_RELAXED);
+                return (void *)(pe + (a - jit_base));
+            }
+        }
+        return (void *)addr;
+    }
     for (i = 0; i < ios_jit_mapping_count; i++)
     {
         uintptr_t a = (uintptr_t)addr;
@@ -12869,6 +12922,7 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
      * last (readers' match key) behind a barrier. */
     {
         int slot = -1, si;
+        ios_jit_rev_read_switch();
         for (si = 0; si < ios_jit_mapping_count; si++)
             if (!ios_jit_mappings[si].pe_base) { slot = si; break; }
         if (slot < 0) slot = ios_jit_mapping_count;
