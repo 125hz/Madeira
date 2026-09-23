@@ -859,6 +859,8 @@ void jit_wx_probe(void) {
 #include <mach/mach.h>
 unsigned long madeira_early_window_base, madeira_early_window_size;
 unsigned long madeira_early_pool_base, madeira_early_pool_size;
+unsigned long madeira_early_intruder_base, madeira_early_intruder_size;   /* ml1135 */
+unsigned madeira_early_intruder_tag, madeira_early_intruder_prot;
 
 __attribute__((constructor(101), used)) static void madeira_early_va_claim(void)
 {
@@ -877,6 +879,23 @@ __attribute__((constructor(101), used)) static void madeira_early_va_claim(void)
             vm_protect(mach_task_self(), a, sz, 0, VM_PROT_NONE);
             madeira_early_pool_base = a; madeira_early_pool_size = sz;
             break;
+        }
+    }
+    /* ml1135: NAME what blocked it. ph-rdr90 got no placeholder because a ~31MB
+     * mapping already sat at ~0x157d00000 before this constructor ran, leaving
+     * 253MB above the window; the pool fell back to a 432MB hole below it and FEX
+     * rolled its code cache over 52 times (a ~1 s freeze each). Record the first
+     * mapped region above the window so the log can say what it is. */
+    if (!madeira_early_pool_size) {
+        vm_address_t ra = win + winsz;
+        vm_size_t rs = 0;
+        natural_t depth = 0;
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+        if (vm_region_recurse_64(mach_task_self(), &ra, &rs, &depth, (vm_region_recurse_info_t)&info, &cnt) == KERN_SUCCESS
+            && ra < 0x190000000ul) {
+            madeira_early_intruder_base = ra; madeira_early_intruder_size = rs;
+            madeira_early_intruder_tag = info.user_tag; madeira_early_intruder_prot = (unsigned)info.protection;
         }
     }
 }

@@ -4146,6 +4146,24 @@ static int ios_va_is_x86_code( uint64_t va )
 /* [xlate-exec] forensics: which mapping's pool range contains `addr`, and
  * who owns it. Names the COPY a thread is executing (session vs child),
  * which reverse_translate alone can't — copies share PE VAs. */
+/* ml1123: for the CPU-split profiler -- is this executing address inside a pool
+ * image copy? If so return the PE address it corresponds to (for offline
+ * symbolisation against the [jit-pool] image table). Lock-free read, like
+ * ios_jit_pool_copy_owner below; a torn read only misclassifies one sample. */
+int ios_jit_pool_image_pc(uintptr_t pc, uintptr_t *pe_addr_out)
+{
+    int i;
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uintptr_t jb = (uintptr_t)ios_jit_mappings[i].jit_base;
+        if (ios_jit_mappings[i].pe_base && pc >= jb && pc < jb + ios_jit_mappings[i].size)
+        {
+            if (pe_addr_out) *pe_addr_out = (uintptr_t)ios_jit_mappings[i].pe_base + (pc - jb);
+            return 1;
+        }
+    }
+    return 0;
+}
 void *ios_jit_pool_copy_owner(const void *addr, void **pe_base_out)
 {
     int i;

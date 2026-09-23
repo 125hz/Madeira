@@ -5507,7 +5507,7 @@ and approval. Config on the VM: `totalphys=2048` (inert), `jumbo-mb=9856`,
 ## §51 — iPhone 18 Pro (2026-09-20/21): menu + benchmark reached on LOCAL Metal; the open wall is a write-permission fault on ordinary guest data
 
 **Development target is now the iPhone 18 Pro** (A20 Pro, 12GB, iOS 27, local Metal,
-bundle `com.willfaust.madeora`, UDID `00008160-00086DD82021400A`). The same build
+bundle `com.willfaust.madeora`, UDID redacted). The same build
 that showed one icon through rmetald renders RDR2's splash video, full menu and
 settings on the phone => **rmetald is the inaccurate layer**, not the D3D12 runtime.
 Logs: scratchpad `ph-rdr01..15.txt`. Game Mode is on (Info.plist
@@ -7300,3 +7300,1690 @@ fence-chain / store-action work matters there; the 92 % segment is pure GPU.
 Built `build/ipa/Madeira-20260923-0252-ml1109.ipa`, NOT installed (app was
 running). Tool: `build/tools/dxbc-disasm.py` (opcode table generated from
 libs/DXBCParser/d3d12tokenizedprogramformat.hpp).
+
+## §99 — ph-rdr62 (ml1109): halo CONFIRMED FIXED by the user; sync census; everything committed; ml1110 = fence-chain A/B
+
+Committed 2026-09-23: main 1b7f2af, FEX 89db11f58, DXMT 4c86e09, Wine
+d88d55eee00 (tests/offline/sm51 ignored; wine/dlls/ntdll/arm64ec_x64_export_iat.c
+is an unbuilt review candidate, left untracked). Not pushed.
+
+**Sync census (ml1109) in the camp (19 fps, GPU 24 %):** fence waits 0.0 per
+frame, game blocked 0.0 ms, 1 GetCompletedValue poll per frame, 0 Queue::Wait
+sleeps, our GPU-done -> fence-advanced 0.03 ms, 11-15 ExecuteCommandLists per
+frame. The game is NOT waiting on us there. The ml981 guest RIP profile at
+t=268 s: 56 % of guest-thread samples sit at a native address (threads inside
+waits), then RDR2.exe+0x25501c0 = 28 %, +0x2599480 = 9 %, +0x2550340 = 3 %:
+ONE 64-byte bucket holds a quarter of all guest samples -- a hot loop, most
+likely the job system's spin-wait or a copy loop. ml1110 prints 64 bytes of
+guest code at the top 6 buckets (`[rip-profile] ml1110 code @...`); read them
+with capstone (installed on the Mac). If it is a spin loop, the CPU side is
+"threads spinning on the game's own semaphores under FEX", not our sync.
+City: GPU 72-86 % with the same zero blocking -> GPU-led.
+
+**ml1110** (built, `build/ipa/Madeira-20260923-0316-ml1110.ipa`, NOT installed
+yet, app was running): `fence-chain = 0` in madeira.cfg disables the ml1091
+per-encoder fence (mad_enc_fence returns 0; all three exec_fence_* become
+no-ops). Pushed to the phone as 0 for the A/B: baseline = ph-rdr62 city
+(22 fps, 72-86 % GPU, 35-40 ms GPU/frame). Expect the forest flicker to
+return; only the GPU ms/frame and fps in the city matter for the experiment.
+Multiblock is FEX's default (true), MaxInst 5000; TSO on, halfbar on.
+
+## §100 — ph-rdr63 (ml1110, fence-chain = 0): GPU time HALVED, fps unchanged; the render thread's hot spot is OUR address resolver
+
+City segment, same scene: fences on (ph-rdr62) 30-42 ms GPU/frame at 20-23
+fps, 60-80 % busy; fences off (ph-rdr63) 18 ms GPU/frame at 25.9 fps, 47 %
+busy. So the per-encoder chain costs ~15 ms of GPU per frame in the city, and
+with it gone the frame is CPU-limited at ~38 ms. Forest flicker returned as
+expected. Config restored to fence-chain = 1.
+
+ml981 profile (all guest threads, running or parked) in the city:
+0x15a0c8680 = 8-11 % and 0x15a0ca640 = 2 % are HOST addresses inside the
+pool copy of madeira_d3d12.dll (image 0x15a0aa000): RVA 0x1e680 =
+list_IASetVertexBuffers entry, RVA 0x1f640/0x1f678 = list_IASetIndexBuffer
+entry (symbolised with llvm-objdump --syms; the DLL keeps COFF symbols). The
+guest RIP of a thread inside an ARM64EC callee stays at the callee's entry,
+so those buckets are time INSIDE those calls: both call mad_resolve_address,
+a linear walk of d->live[] (every live resource, tens of thousands) under
+live_lock, per vertex-buffer slot, per index buffer, per root descriptor,
+per draw. The x86 buckets 0x1425a2cd0 (QueryPerformanceCounter-style timer
+stop through the IAT, 2-3 %) and 0x1425a36b6 / 0x142595049 (IAT calls in a
+loop) are the game calling into Wine DLLs. 0x1425501c0 (13-24 %) is
+unreadable through vm_read (page not readable at the image address) and may
+be parked threads: the profile had no run-state filter.
+
+**ml1111** (installed, `build/ipa/Madeira-20260923-0341-ml1111.ipa`):
+- mad_resolve_address: sorted address index over live buffers (lazy rebuild
+  on track/untrack, binary search, backward scan bounded by the largest
+  size for aliasing placed resources, live-order first match kept; a miss
+  falls back to the old walk and re-syncs). Pure optimisation.
+- fence-chain = 2: an encoder waits only if a ResourceBarrier was replayed
+  since the last wait, or at the start of a list; updates unchanged. This
+  run has fence-chain = 1 (accurate) to isolate the index; next run = 2.
+- rip-profile: RUNNING-only histograms (guest RIP, and host pc for threads
+  inside native callees) next to the old all-threads one.
+
+## §101 — ph-rdr64 (ml1111, address index, fence-chain = 1): benchmark 32.6 fps avg (user), city now GPU-bound
+
+User: ~60 snow, 35 forest, 39 night landscape, 23 camp, ~23 store/city with
+30+ in static city shots; benchmark average 32.6 (was ~20-25). Perf lines:
+city t=380-415 s 28-33 fps at 91-92 % GPU, 32 ms GPU/frame -> the accurate
+fence chain is the city wall now; store 21 fps at 72 %, 34 ms; camp 24 fps
+at 30-73 %. Sync census: camp/store still block ~0-5 ms on fences; city
+blocks 6-11 ms/frame (18-31 %) = waiting for the GPU. Next lever there is
+fence-chain = 2 (pushed to the phone, config only).
+
+RUNNING-only profiles (ml1111): the top guest buckets are IAT call sites
+(0x1425a3680 5-32 %, 0x1425a0080, 0x1425a5100, 0x1425a2cc0 = QPC-style timer
+stop, 0x142595040 = loop calling an import per item); native callees: a
+shared-cache function at 0x244b60c80 (90-97 % of native samples in two
+profiles; the Wine watchdog saw it at PC=0x244b60c2c with LR in
+Madeira.debug.dylib) -- ml1112 names it with dladdr; libarm64ecfex.dll
+RVA 0xa4c0/0xa500 (transition thunks); madeira_d3d12 mad_resolve_address+0x164
+(the per-change qsort of the ml1111 index) -> ml1113 keeps the index sorted
+incrementally (insert/remove, seq counter); ntdll memmove+0x140.
+
+Redirect target 0x71f7f43d98 explained: the game process loads the ARM64EC
+kernelbase from C:\windows\sysx64 (mixed-arch fallback, 0x2f0000), pool copy
+0x15656c000; the native-session kernelbase at 0x71ffb00000 is the ARM64 one.
+So the target IS EC code with a pool alias, yet every call still exits to the
+PE address and faults: the exit path is not translating it through
+IosAliasEntries (pushback callback exists for late loads; verify the entry is
+present, and which exit path ExitFunctionEC vs the ios_ffs bypass takes).
+~250 k faults/run, ~70 % this one export. Astra-grade FEX question.
+
+Builds: ml1112 = profiler symbolisation (dladdr) + IAT-slot resolution for
+the hot guest buckets (`build/ipa/Madeira-20260923-0355-ml1112.ipa`);
+ml1113 = incremental index on top (`...-0356-ml1113.ipa`). Neither installed
+yet: the app was running (fence-chain = 2 run).
+
+## §102 — ph-rdr65: fence-chain = 2 NEVER RAN (parse clamp); the game's hot code is critical sections
+
+`g_fence_chain = mad_cfg_int_pe(...) ? 1 : 0` (ml1110) clamped 2 to 1, so
+ph-rdr65 was another mode-1 run (log: "fence-chain = 1"); fixed in ml1114
+(`build/ipa/...-0414-ml1114.ipa`). Mode 2 is still untested.
+
+ml1112's import-slot resolution names the hot guest call sites (RUNNING
+threads only):
+    0x1425a3680 (38/14/12 %)  -> ntdll    RtlLeaveCriticalSection
+    0x1425a0080 (17/10/4 %)   -> ntdll    RtlEnterCriticalSection
+    0x1425a5100 (12 %)        -> kernel32 WaitForSingleObject
+    0x1425a2cc0 + 3 (5-11 %)  -> kernel32 QueryPerformanceCounter
+    0x142595040 (loop, 4-5 %) -> kernel32 SetEvent
+(export tables parsed from app/Madeira/arm64ec-windows/{ntdll,kernel32}.dll;
+IAT slots 0x145f65378..570.) Native callee samples: 67-89 % at a
+libsystem_kernel trap stub that dladdr names mach_generate_activity_id+0x8
+(nearest export; probably a neighbouring ulock/semaphore trap), then
+libarm64ecfex.dll RVA 0xa4c0/0xa500 (the EC transition), ntdll memmove.
+Reading: the game's frame is dominated by lock traffic; each Enter/Leave is
+an x64->EC transition (ExitFunctionEC walks IosAliasEntries linearly per
+call) and contended ones are ulock syscalls. ml1115 adds: x16 (trap number)
+and lr for native samples, and `[sync-census] ml1115 thread alerts: N
+wakes/s, N waits/s` from the unix sync path (NtAlert/NtWaitForAlertByThreadId
+counters). Candidate levers after that: cheaper EC transitions (hash the alias
+table instead of the linear walk; per-call cost), spin counts, and the
+per-frame QueryPerformanceCounter redirect faults.
+
+## §103 — ph-rdr66 (ml1115, fence-chain = 2 REALLY ran): no gain; lock traffic confirmed; ml1116
+
+Mode 2 is live in this log ("fence-chain = 2 (ml1111 ...)"), no flicker seen,
+but the city still spends 33 ms GPU/frame at 85 % (25.7 fps) -- the same as
+mode 1. So "wait after any barrier / list start" waits nearly as often as
+"wait at every encoder": RDR2 issues barriers between most passes. ml1116
+logs `[perf] ml1116 encoders per frame: fence waits, fence updates, barriers`
+to show it directly.
+
+Sync census: 30-53 k thread alerts per second in gameplay (wakes == waits),
+~4 k/s in the menu. Every one is a futex wake plus a futex wait, i.e. two
+syscalls and a context switch, behind the Enter/LeaveCriticalSection hot spots
+of §102. Windows critical sections spin before sleeping; this is the next
+CPU lever to examine (spin count in RtlpWaitForCriticalSection / RtlWaitOnAddress).
+
+Native-callee samples of ml1111-1115 were MISATTRIBUTED: the "hot trap" was
+threads with no TEB (Mach exception thread, UIKit run loop: x16 = -47
+mach_msg2, lr mach_msg2_internal) that passed the x28-frame test. ml1116 only
+profiles threads that have a TEB.
+
+**ml1116** (built, `build/ipa/Madeira-20260923-0438-ml1116.ipa`, not installed:
+app running):
+- FEX exit thunk (Module.S ExitFunctionEC + the ios_ffs bypass): check the
+  last-hit alias entry (`IosAliasLast`, pointer, set on a walk hit) before the
+  walk, and walk NEWEST-FIRST (the game's EC ntdll/kernel32/kernelbase and the
+  D3D12 runtime are registered late; oldest-first was ~150 compares per
+  x64->EC call at tens of thousands of calls a second).
+- fence-chain = 3 (pushed to the phone): ResourceBarrier records up to 8
+  transitioned/UAV resources; the replay tracks resources written since the
+  last wait (render targets and depth at pass begin, fill/copy destinations;
+  dispatches and texture copies mark "everything"); a barrier arms the wait
+  only if it names a written resource. Pixel-shader UAV writes from draws are
+  NOT tracked yet -- if anything flickers in mode 3, that is the first suspect.
+- rip-profile: Wine threads only.
+
+## §104 — ph-rdr67 (ml1116, fence-chain = 3): BROKEN rendering (glowing ground), reverted to 1; city is CPU-capped ~40 ms
+
+Mode 3 corrupted the forest ground and Saint Denis (untracked pixel-shader UAV
+writes / texture-copy destinations are the likely misses). Config set back to
+fence-chain = 1 on the phone. Keep modes 2/3 as experiments only.
+
+Decisive result anyway: mode 3 cut the city's GPU time 31 -> 24 ms/frame and
+busy 79 -> 61 %, yet fps stayed 25.3. With fences fully off (ph-rdr63) it was
+18 ms and 26 fps. The city frame is CPU-bound at ~38-40 ms; GPU fence work
+cannot raise its fps until the CPU side shrinks. Stop spending on fences.
+
+Wine-thread-only profile, hot imports (export tables parsed):
+RtlLeaveCriticalSection, RtlEnterCriticalSection, QueryPerformanceCounter,
+WaitForSingleObject, SetEvent, SetThreadAffinityMask (0x1425a3f80, 10 %),
+SetLastError. Thread alerts 11-51 k/s.
+
+**ml1117** (built, `build/ipa/Madeira-20260923-0452-ml1117.ipa`, not installed:
+app running). Pure performance, no behaviour change:
+- ntdll (PE, sync.c): ios_cs_note (ml810 lock history) compiled out unless
+  -DIOS_CS_HISTORY: it did an InterlockedIncrement on ONE global counter on
+  every Enter and Leave from every thread (a cross-core cache-line ping-pong at
+  the hottest call sites). ntdll SizeOfImage 0x140000 -> 0x120000 (the unused
+  80 KB history table is gone); every other source marker matches the
+  deployed DLL.
+- ntdll (PE, time.c): RtlQueryPerformanceCounter reads CNTVCT_EL0 in user mode
+  (offset to the syscall's mach_continuous_time counter measured, re-checked
+  once per counter-second, moves forward only and only by > 1 ms).
+- unix counters on the sync-census line: server requests/s, QPC syscalls/s,
+  SetThreadAffinityMask/s (each is two wineserver round trips today: a
+  ThreadBasicInformation query, then set_thread_info).
+FEX exit-thunk last-hit cache (ml1116) kept: pure optimisation, no failure
+mode seen; revert it if anything odd appears.
+
+## §105 — ph-rdr68 (ml1117): best run so far; city GPU-bound again, camp bound by OUR replay
+
+User: 60 snow, 39 forest, 44 night landscape, 24 camp, city 24-25 with 30+
+standing still (thermals "fair"). Log capped at 10 MB (~400 s, ends mid-city).
+ml1117 worked: thread alerts 30-53 k/s -> 11-18 k/s (the global atomic in
+ios_cs_note made every lock hold longer), QPC syscalls 1/s, SetThreadAffinityMask
+0/s (the §104 attribution of 0x1425a3f80 to it was wrong), server requests
+~450/s (fine).
+
+Perf lines: city 29 fps at 91 % GPU, 31.7 ms GPU/frame (GPU-bound with the
+accurate chain; fences off measured 18 ms); store 21-24 fps at 72-76 %; camp
+25 fps at 28 % GPU (CPU). Running-only profile: guest RIP bucket 0x15a064240
+(14-42 %) = madeira_d3d12 RVA 0x1a240..0x1a27f = the ENTRY of
+queue_ExecuteCommandLists (0x1a278): the game's submit thread inside OUR
+replay; native samples in mad_air_resolve (+0x68/+0xe8/+0x128) and
+mad_resolve_address. Our per-draw argument-table build runs serially on the
+game's render thread at ExecuteCommandLists.
+
+Next levers, ranked:
+1. GPU (city/store): fence overlap. ml1118 = fence-chain 5 (installed, set):
+   full chain kept (transitivity), render passes wait at the FRAGMENT stage
+   unless a compute/blit encoder ran since the last vertex-stage wait. Risk:
+   a vertex shader sampling the previous pass's render target. If 5 is clean
+   but small, the real fix is per-writer fences: a pool of MTLFences, each
+   encoder updates its own, resources remember their last writer's encoder,
+   a barrier waits on exactly those writers, with a full wait every 32
+   encoders to keep transitivity (mode 3's defect: a skipped wait broke the
+   chain, a later wait only covers the immediately previous encoder).
+2. CPU (camp, and the city once the GPU drops): an asynchronous submission
+   thread per queue (ExecuteCommandLists/Signal/Wait/Present into a FIFO;
+   hand the list's command array to the job, the list gets a fresh one so an
+   immediate Reset is safe), plus caching argument tables across draws whose
+   root arguments did not change.
+3. Remaining lock traffic (11-18 k wakes/s), native Oodle (streaming),
+   FEX TSO cost (fundamental).
+
+## §106 — ph-rdr69 (mode 5) and ph-rdr70 (mode 0): ALL slow scenes are CPU-bound; fences closed as a lever
+
+(ph-rdr70 is the .prev log; the run starts ~24 s later than ph-rdr68, so
+align scenes by fps pattern, not by time.) Mode 5 saved ~2 ms GPU/frame, no
+fps. Mode 0 (fences off) halves GPU ms/frame in store (23-38 -> 10-20) and city
+(31 -> 9-18) and leaves fps unchanged (camp 23-24, store 19-25, city ~27);
+snow was slower (42 vs 53-60, unexplained; flicker in that run anyway).
+Conclusion: the "91 % GPU busy" in the city was fence-stall time inside
+command buffers, not shader load. Camp, store and city are CPU-limited.
+Config restored to fence-chain = 1.
+
+ml1119 (installed, `build/ipa/Madeira-20260923-0535-ml1119.ipa`): `[perf]
+ml1119 caller thread per frame: ExecuteCommandLists X ms, Present Y ms
+(frame Z ms)` -- how much of the game's render thread is our replay. Decides
+the asynchronous submission thread (list payload hand-off: cmds, cdata, used,
+rings move to the job; Present drains the FIFO; queue_Wait drains the
+signalling queue).
+
+## §107 — ph-rdr71 (ml1119): the game's render thread spends 10-24 ms per frame inside OUR ExecuteCommandLists -> ml1120 async submission
+
+Caller-thread time per frame (fence-chain 1): forest 10-13 ms of 24-31
+(41-47 %), camp 13-14 of 42-45 (31 %), store 11-24 of 40-53 (25-50 %), city
+10-20 of 30-41 (27-59 %). Present < 1 ms. Retire waits ~0. ~2900 draws and
+dispatches per frame -> ~4.5 us of replay per call, all on the thread the
+game waits for.
+
+**ml1120** (built, `build/ipa/Madeira-20260923-1122-ml1120.ipa`; madeira.cfg
+`async-submit = 1` pushed; NOT installed: app still running):
+- Every queue owns a worker thread and a FIFO (CRITICAL_SECTION + two
+  CONDITION_VARIABLEs). ExecuteCommandLists validates on the caller (closed,
+  allocator generation), AddRefs each list and counts `inflight`, enqueues,
+  returns. Signal does the `submitted` CAS on the caller and enqueues; Wait
+  enqueues. The worker runs the old bodies (mad_ecl_run / mad_signal_run)
+  in order, each job under its own autorelease pool.
+- New `mad_fence.committed`: set once a Signal's batch is committed (and by
+  CPU fence Signal). A Wait job blocks its worker until committed >= value
+  (5 s cap + log) -- NOT "drain the other queue", which would deadlock the
+  direct<->compute ping-pong.
+- list_Reset waits for `inflight == 0` (spin, then Sleep(0), then Sleep(1));
+  Present and ResizeBuffers drain their own queue; queue Release drains and
+  stops the worker.
+- `[perf] ml1120 async per frame: worker busy, jobs, Present drain, list Reset
+  waits, queue-Wait jobs blocked`.
+Hazards reviewed: descriptors/upload data/resource lifetime are all legal
+only if unchanged until GPU completion, which now comes later but still after
+our replay; no tile mappings implemented; a Wait on a signal the same thread
+submits later behaves as before (5 s timeout either way).
+Backup of the pre-change source: scratchpad madeira_d3d12.c.pre-ml1120.
+
+## §108 — ph-rdr72 (ml1120): the wait MOVED into Present; ml1121 makes Present asynchronous
+
+ExecuteCommandLists on the caller fell to 0.02 ms and nothing broke (no
+Wait-job timeouts, no GPU errors, Reset waits 0), but Present drain = worker
+busy time in every scene (forest 13/13 ms, camp 12-13, store 10-15, city
+10-12): RDR2 submits nearly all of a frame's lists in one burst right before
+Present, so the worker only starts when the game is already presenting. No
+overlap, no fps change (user: snow 60, forest 36, landscape 45, camp 23,
+city 20-30).
+
+**ml1121** (installed, `build/ipa/Madeira-20260923-1138-ml1121.ipa`, active
+with async-submit = 1): Present is a queue job. The caller advances
+s->index (GetCurrentBackBufferIndex moves on at once), enqueues
+MAD_SUB_PRESENT {swapchain, index} and returns after the throttle
+(`async-present-ahead`, default 1: at most one present queued behind the
+worker). mad_present_run (worker) = the old body: flush_all, capture
+bookkeeping, the ml1070 GPU N-latency wait, nextDrawable, blit, present,
+perf. Jobs hold NO swapchain reference; swap_Release drains the queue before
+freeing (a final Release on the worker would release the queue and make the
+worker wait for itself). ResizeBuffers drains. Expected: frame = max(game
+CPU, worker encode, GPU) instead of game + worker; the "Present drain" perf
+figure now means time the game waits in the throttle.
+
+## §109 — ph-rdr73 (ml1121 async Present): the game thread never waits on us any more; the frame is the game's own threads
+
+Caller time per frame: ExecuteCommandLists 0.02 ms, Present 0.00 ms, throttle
+0, worker 10-14 ms in parallel. Frames unchanged (camp 37-43 ms at 11 ms GPU,
+store 40-50, city 29-39). So the thread that submits is not the critical
+path; removing 13 ms from it moved nothing. No guest thread is saturated
+(busiest 35-55 % of a core; sum ~3.6 of 6 cores = latency-bound handoffs).
+
+Sync traffic in gameplay (madsync counters, ph-rdr73): 10-16 k waits/s,
+6-11 k sleep, 5-10 k wakes, and 340-610 k ZERO-TIMEOUT POLLS per second
+(WaitForSingleObject(h, 0) spin loops; each = FEX x64->EC transition + Wine
+syscall dispatcher + madsync lock-free check, est. 1-2 us -> ~0.5-1 core).
+Thread alerts (CS / WaitOnAddress / SRW / CV) 11-18 k/s. madsync uses ONE
+global pthread mutex + 2 pthread_sigmask syscalls per lock/unlock; a city
+sample caught a game thread in __psynch_mutexwait on it.
+
+Running-guest profile across ph-rdr68/72/73 (1924 samples): the hottest RIP
+buckets are the game's import call sites: LeaveCriticalSection 17 %,
+EnterCriticalSection 7 %, QueryPerformanceCounter 5 %, WaitForSingleObject
+4 %, SetEvent loop 3 %. CAUTION: FEX only stores the guest RIP when leaving
+compiled code, so a RIP at a call site can also cover x64 code that ran after
+the call returned; this over-attributes to call sites. Hence ml1123.
+
+**ml1122** (installed, then superseded): wake-latency histograms for madsync
+(`[madsync] ml1122 wake latency ... lock contended ...`) and thread alerts
+(`[sync-census] ml1122 alert wake latency ...`); experiments, all 0 = off:
+`madsync-spin-us`, `alert-spin-us` (lock-free spin before sleeping, <= 200),
+`cpu-count` (processors reported to Windows; iPhone = 2 P + 4 E).
+**ml1123** (installed, `build/ipa/Madeira-20260923-1201-ml1123.ipa`): the
+profiler runs every burst (20 s) and prints `[cpu-split] ml1123 gen=N
+running samples=M: x64 JIT a%, ARM64EC images b%, native c%` by HOST pc, with
+the top image PE addresses (/256; symbolise with the [jit-pool] image table:
+ntdll/kernelbase unstripped in wine/build-arm64ec, madeira_d3d12 with
+llvm-objdump --syms, libarm64ecfex.dll = FEX runtime/transitions/compiler)
+and top native symbols.
+
+Decision tree for the next lever:
+- x64 JIT dominant -> FEX codegen/TSO (hard; memory-ordering cost is
+  fundamental on iOS).
+- ARM64EC images dominant, in libarm64ecfex -> x64<->EC transition cost: give
+  the hottest imports (Enter/LeaveCriticalSection, QPC, TryEnter...) x64
+  implementations the JIT can inline (a small x86-64 helper DLL + loader IAT
+  rebinding for x64 modules; slow paths call the EC originals).
+- native dominant in madsync/sync -> per-object locks instead of the global
+  mutex, drop the sigmask syscalls, cheapen zero-timeout polls.
+- wake latency high (tens of us) -> spin experiments via the ml1122 keys.
+
+## §110 — ph-rdr74 (ml1123): where game-thread CPU goes, measured by HOST pc
+
+~2000 running Wine-thread samples over the benchmark:
+- **x64 JIT (the game's own code as compiled by FEX): ~68 %** (53-82 % per
+  20 s window). The dominant block; still opaque -> ml1124 dumps the hottest
+  compiled host code (`[cpu-split] ml1124 JIT code @...`) for offline
+  disassembly.
+- **ARM64EC images ~15 %, almost all FEX's own runtime (libarm64ecfex.dll)**:
+  * ExitFunctionEC region (RVA 0xa500 bucket, 94+7+7 samples, ~5 %): the
+    x64->EC call transition. It starts with `mrs FPCR / bic / msr FPCR`
+    (clears AFP NEP/AH), and FillSpecialRegs sets them again on the way back:
+    TWO FPCR writes per call into Wine; samples land right after the msr.
+  * L1-miss path (~5.5 %): GuestToHostMap `do_find` (83), UpdateDynamicL1Stats,
+    FindBlock, emplace. L2 is DISABLED on iOS (ml606, 50 MB/thread) and L1 is
+    already at its iOS max (128 K entries), so every L1 miss takes the
+    WritePriorityMutex read lock + a hash probe. ml1124 counts misses/s.
+  * ntdll/kernelbase/madeira_d3d12 together < 2 %. So the earlier "24 % at
+    Enter/LeaveCriticalSection call sites" was stale-RIP attribution (FEX's
+    frame RIP is a block entry and goes stale across linked blocks).
+- **native ~15 %**: swtch_pri (sched_yield from the game's spin-wait loops)
+  ~7 %, mach traps, the syscall dispatcher.
+
+Sync latency (ml1122 baseline, spin experiments off): madsync wake->run avg
+16-18 us (50 % < 5 us, 10 % > 50 us); thread alerts avg 4-11 us. madsync
+global lock: ~3.4 k contended acquisitions/s, avg ~20 us each (kernel
+psynch sleep), ~70 ms/s blocked in total.
+
+Freeze at the end of ph-rdr74 (not chased, per user): 1.77 M faults,
+EXECUTE on ntdll's non-executable backing at 0x71f88d13e8 (hinsn d11343ff =
+a function prologue, i.e. a call that landed on the PE copy instead of the
+pool alias) alternating with PROTECTION faults writing 0x145728060 inside
+RDR2.exe (entryprot 0), both from guest rip 0x1425a316e (the return address
+of the game's WaitForSingleObject wrapper). The fault-loop family.
+
+**ml1124** (installed, `build/ipa/Madeira-20260923-1219-ml1124.ipa`):
+- madsync: spin on trylock (madsync-lock-spin, default 256) before a
+  contended pthread_mutex_lock sleeps. Pure performance.
+- NtYieldExecution's ml1063 throttle is configurable (yield-sleep-us default
+  100, yield-streak 256). THIS RUN: yield-sleep-us = 0 (throttle off) --
+  hypothesis: the game's workers wait by poll+yield, and the 100 us sleep
+  after 256 yields delays job pickup on the critical path.
+- profiler: JIT host-pc buckets + code dumps; FEX `[l1-miss] ml1124` rate.
+
+Bigger levers, ranked (not built):
+1. x64 implementations of the hottest imports (Enter/Leave/TryEnter
+   CriticalSection first) in a small x86-64 helper DLL, bound into x64
+   modules' IATs by the loader; slow paths call the EC originals. Removes
+   the transition AND both FPCR writes per call. Needs a call-count probe
+   first to size it.
+2. FEX L1: 2-way lookup or a larger iOS L1 (memory!) or a cheaper miss path.
+3. Only after the JIT code dump: codegen items specific to what is hot.
+
+## §111 — ph-rdr75 (ml1124): the hottest "JIT" code is FEX switching FPCR; ml1125 = FEX without AFP
+
+User: slightly worse than ph-rdr74 (snow fell to the 30s, forest 36, landscape
+40, camp 23, city 20+). yield-sleep-us = 0 was the change: native share rose
+to 28-79 % in windows (threads spinning in sched_yield), heat. REVERTED to 100.
+madsync-lock-spin (256) did NOT reduce contended wait (still ~16 us avg): the
+lock is not held long, it CONVOYS -- obj_wake calls semaphore_signal while
+holding g_lock, the kernel hands the CPU to the woken thread, which then
+blocks re-acquiring g_lock. Fix (not built): collect the semaphores in
+obj_wake and signal them after ms_unlock (stale posts are already tolerated
+by the do_wait loop).
+
+FEX L1 misses: 80-190 k/s steady, spikes to 1.38 M/s.
+
+JIT host-pc profile: the compiled game code is FLAT (64 distinct 64-byte
+buckets, 1-3 samples each) -- no hot loop to optimise. The recurring hot
+buckets are FEX's DISPATCHER: 0x16bff4140 (re-entry after an EC call:
+`mrs fpcr; orr #6; msr fpcr` = FillSpecialRegs) and 0x16bff4400 (re-entry
+after a C++ helper such as the L1-miss lookup: `bfxil DAZ; msr fpcr`). They
+average 5.8 % of running game-thread samples, 12-18 % in heavy windows; add
+ExitFunctionEC's own `msr fpcr` (~5 % in ph-rdr74) -> FPCR switching is
+~10 % of game CPU, up to ~25 % in the worst windows. Every x64->Wine call and
+every L1 miss pays two FPCR writes, and an FPCR write stalls on Apple cores.
+
+**ml1125** (installed, `build/ipa/Madeira-20260923-1238-ml1125.ipa`):
+- madeira.cfg `env.FEX_HOSTFEATURES = disableafp` (FEX's own supported
+  switch; the M1-class path): SupportsAFP = false -> FillSpecialRegs /
+  SpillStaticRegs never touch FPCR; scalar SSE ops get a few extra
+  instructions (NEP/AH emulated in code), MXCSR.DAZ is no longer applied
+  (FIZ needs AFP; denormal inputs are no longer flushed -- harmless for
+  games, Apple FP handles denormals at full speed).
+- Module.S ExitFunctionEC: `tst x17, #6; b.eq` -- the FPCR write only
+  happens if NEP/AH are set (always safe; with AFP off it never happens).
+Check in the log: `FEX: HostFeatures=<nonzero>`; the dispatcher buckets
+0x16bff4140/0x16bff4400 should lose their weight in `[cpu-split] ml1124`.
+Revert = delete the env line (no reinstall).
+
+## §112 — ph-rdr76 (ml1125): the AFP experiment NEVER APPLIED; where the perf work stands, honestly
+
+User: no change (snow ~60 then 30s, forest 36, landscape 40+, camp 24, city
+20+ topping 30 late). User instruction going forward: if not really sure a
+change gives a meaningful FPS gain, write to the handoff instead of building.
+
+**Why ml1125 tested nothing.** FEX/Source/Windows/Common/CPUFeatures.cpp,
+iOS branch of FetchHostFeatures: synthesises the feature set, HARDCODES
+`HostFeatures.SupportsAFP = true` and returns WITHOUT calling
+OverrideFeatures(), so FEX_HOSTFEATURES (disableafp) is read (log
+"HostFeatures=32") but never applied. The dispatcher in ph-rdr76 still has
+`mrs fpcr; orr #6; msr fpcr` (0x16cff4154) and `bfxil; msr fpcr`
+(0x16cff4404). The ExitFunctionEC `tst/b.eq` guard is therefore inert too
+(NEP/AH are set whenever JIT code runs). I verified the override against the
+non-iOS branch of the same function -- the error. The env line in madeira.cfg
+is harmless and inert.
+
+**What is actually known (not guesses):**
+1. The game's submit thread no longer waits on our D3D12 layer at all
+   (ml1121: ECL 0.02 ms, Present 0.00). Removing 10-13 ms per frame from that
+   thread changed nothing -> it is not the critical path.
+2. Fences off halves GPU time in store/city and changes nothing -> not GPU.
+3. Game-thread CPU by host pc: ~65 % FEX-compiled game code (flat, no hot
+   loop), ~15 % ARM64EC images (almost all FEX runtime: ExitFunctionEC,
+   L1-miss lookup), ~15 % native (sched_yield from the game's spin loops,
+   traps). No thread saturated (35-55 % each, ~3.6 of 6 cores busy).
+4. Sync: wake latency modest (madsync avg 16 us, alerts 4-11 us); madsync
+   global lock convoys (~3.4 k contended/s, ~16 us each; semaphore_signal is
+   called while holding the lock).
+5. FEX L1 misses 80-190 k/s (spikes 1.4 M/s), each through the
+   WritePriorityMutex read lock + hash probe.
+6. Four "CPU overhead" changes produced no FPS change: async submit (13 ms
+   off the submit thread), madsync lock spin, yield throttle off (worse),
+   AFP (not applied). The consistent message: shaving CPU from arbitrary game
+   threads does not move the frame. The frame is bounded by a dependency
+   chain we have NOT identified.
+
+**What would actually be confident next (measurement before any fix):**
+- Critical-path trace: for the thread that calls Present and the threads it
+  waits on, record per frame every blocking wait (object, duration, waker
+  tid) -- madsync already knows the waker (obj_wake) and the waiter; add the
+  waker tid to the waiter and accumulate per (waiter, waker) pair per frame.
+  That names the chain: e.g. "render thread waits 18 ms/frame on an event
+  set by thread X", then profile thread X specifically.
+- Per-thread CPU with thread identities: name the game's threads (RDR2 names
+  them via SetThreadDescription / the 0x406D1388 exception) and attribute the
+  cpu-split per thread, so the chain's threads can be profiled in isolation.
+- FPCR: a native microbenchmark (N x `msr fpcr` with alternating values) on
+  the 18 Pro gives its real cost in ns; the sample bucket 0x16cff4140 also
+  contains a TLS pointer chase + code-bitmap load, so sample skid alone does
+  not prove the msr is the cost. Only if the benchmark shows it is expensive:
+  fix FetchHostFeatures(iOS) to call OverrideFeatures() and rerun.
+Levers already documented and NOT built (none has proven critical-path
+impact): madsync deferred wake (signal after unlock), x64 fast paths for the
+hottest imports, FEX L1 2-way / cheaper miss path.
+
+## §113 — story-mode jetsam (ph-rdr77-story-jetsam.txt): vram-mb 2304 -> 1950; swap eligibility is the real headroom (not built)
+
+Footprint plateaued at 8100-8185 MB from t=200 s to the kill at 8192 (peak
+8185). Composition (last [phys-map], cycle 175): guest band 3939 MB dirty /
+3737 resident; tag 0 3461 dirty (1231 compressed); tag 100 3060 (unidentified,
+see the ml677 warning); pool RX/RW 592; hostlow 704 dirty / 1069 resident.
+Our live GPU estimate is only ~1.4 GB (rt 281, tex 302, buf ~650) against the
+2304 MB budget, yet budget size drives memory (user: 1536 -> 3072 added
+~1.4 GB in the benchmark).
+
+The file-backed swap tier had 750 MB spare (2325 of 3072 used, 0 refused):
+the CAP is not the limit, ELIGIBILITY is. ios_swap_eligible() takes only
+writable non-exec private valloc views in the guest band with a single commit
+>= 8 MB; a heap reserved big and committed in small pieces never qualifies,
+which is why ~3.9 GB of guest heap stays resident. Candidate (NOT built, perf
+effect unknown): make the threshold configurable (e.g. 1-2 MB) and raise
+swap-mb; watch the 16384-extent table, first-touch cost (2-40 us/page
+measured in ml1076) and write-back hitches. That would free memory without
+cutting the texture budget.
+
+Applied (config only, user request): vram-mb = 1950 (-354 MB).
+vram-mb restored to 2304 at the user's request (story perf lower at 1950).
+
+## §114 — ph-rdr78 (story, 23 min riding): the end-of-run "freeze" is an IOGPU abort from a residency-set leak; ml1126
+
+**Performance, riding:** 23-33 fps, GPU busy 61-91 % (27-34 ms GPU per frame,
+so on this workload the GPU is near the frame budget), 0 command buffers in
+error. Pause/map screens run at 58-60 fps.
+
+**How the run ended (confirmed):** at 14:06:41 (cycle ~683) the phone's
+system log (`log collect`, root, `scratchpad/rdr78-abort.logarchive`) has a
+FAULT from IOGPU on the game's thread:
+`Unable to add allocation to set, current resource count: 216836`.
+Our census two seconds earlier: `residency set: 292888 added, 76120 removed
+(216768 members)`. IOGPU called abort(). Our SIGABRT handler turned it into
+EXCEPTION_WINE_ASSERTION (0x80000101) on thread 0164, which was unhandled, so the
+game process was terminated. Its pool mappings were reclaimed after the 3 s
+grace while some of its threads were still running. Those threads then
+executed ntdll at 0x71f88d13e8 on reclaimed pages ("pc pool-copy pe=0x0
+owner=-1"), which produced a fault storm of about 140k faults/s. The user
+sees a freeze. ph-rdr74's benchmark "freeze" has the identical signature (same
+code 80000101, same abort pc 0x244b6afd8), but it died at only 63,876 members,
+and its device log is gone, so its IOGPU reason is unconfirmed.
+
+**Why the set grew:** mad_typed_buffer_view() makes one Metal texture-buffer
+view per distinct (format, byte offset, element count, uav). It adds each view
+to the residency set and keeps it until the BUFFER is released. The game
+sub-allocates typed-buffer SRVs out of long-lived pools, and the census
+printed several of them:
+
+- a 128 MB 'Resource' passed 16,384 views by cycle ~95;
+- several 4 MB ones reached 4,096 to 16,384 views.
+
+The census stops printing above 16,384. Membership rose linearly by about
+170 per second (3,345 at cycle 19, 214,000 at cycle 673).
+
+**The same leak explains most of the memory growth:**
+
+- DefaultMallocZone grew about 615 blocks/s and about 13 MB/min, linearly,
+  while the FEX compile rate varied 5x. Allocation rate is therefore not
+  compile-driven, and it is near 0 on 60 fps pause screens, so it is not
+  per-frame either.
+- used +262 MB against about 200k views works out to about 1.2 KB per view.
+- IOAccelerator (tag 100) grew +200 MB after load and is probably partly the
+  same views (unconfirmed).
+
+Other growth from cycle 127 to cycle 690:
+
+- The guest band grew +960 MB dirty but is DECELERATING: +532 MB in the
+  first 4 min, then about 130 MB per 4 min. This looks like the game filling
+  its own heap, not a leak.
+- Swap was flat at 2211 MB. The §113 eligibility point stands.
+
+**ml1126 (installed, `build/ipa/Madeira-20260923-1430-ml1126.ipa`):**
+typed-buffer views are no longer added to the residency set, and release no
+longer removes them. A texture-buffer view aliases its buffer's storage, the
+buffer is always a member (every r->buffer comes from mad_create_resource ->
+mad_resident), and heap-placed textures already rely on the same rule (138k
+placed textures render with only the heap resident, ml1072). Texture views of
+textures (xviews, few) are unchanged. New log line `ml1126 views:` gives the
+live and made counts.
+
+- Expected: members stay around 20k instead of climbing.
+- Risk: if the driver did need the view itself resident, typed-buffer reads
+  would come back wrong. Look for garbage vertex/instance data or command
+  buffers ENDED IN ERROR.
+- ml1126 does NOT fix the view leak itself (malloc +13 MB/min continues).
+
+**The real fix (NOT built, needs a design decision):** bound the views.
+
+- Our DXBC backend reads (count, first) from the table we write at encode
+  time (32-bit first). So ONE view per (buffer, format, uav) spanning the
+  buffer could serve every offset if count and first come from the descriptor
+  (metadata low 32 = byte length; bits 32+ = element offset) instead of the
+  per-id vmap.
+- BUT DXIL shaders (Metal Shader Converter) read the descriptor themselves,
+  and the MSC runtime header (MSC 4.0b2, extracted to scratchpad/msc-x) has
+  `kIRTexViewMask = 0xff`. An MSC shader sees only 8 bits of element offset,
+  so its view must start within 255 elements of FirstElement.
+- Options:
+  - (a) granule views: base aligned to 256 x element size, width to buffer
+    end, count from the descriptor. Bounded by size/granule, 131k worst case
+    for the 128 MB pool, and it changes out-of-bounds behaviour unless both
+    backends bounds-check with the descriptor length (check airconv and MSC).
+  - (b) whole-buffer views when the device has no DXIL pipelines, with a
+    one-time rewrite of existing typed-buffer descriptors when the first DXIL
+    PSO appears.
+  - (c) descriptor-slot refcounting so views can be freed. This is exact, but
+    it adds work to CopyDescriptors on the render thread.
+- Measure first: the distribution of offsets and counts per pool buffer.
+
+**Second defect, not fixed:** after a game process dies, pool reclaim runs
+while its threads are still executing, which turns a clean exit into a hang.
+Reclaim should wait until every thread of that peb has left guest code, or
+the thread kill must be synchronous.
+
+**Astra's review (RDR2-ph-rdr76-performance-review.md), acknowledged:**
+- The JIT host-pc table keeps only the first 64 buckets (`jb[64]`,
+  server_ios.c), and the EC/native tables keep 48, so "no hot guest function"
+  is NOT established. Rankings are first-seen-biased. Totals by class stand.
+- `game blocked on fence` is registration-to-completion latency, not
+  blocking time. Rename it; measure real blocking in the wait path.
+- The GPU is not ruled out: city at ~31 ms GPU per frame and 84-86 % busy is
+  near-GPU-bound, and this riding run is 27-34 ms GPU per frame.
+- A madsync deferred wake needs a semaphore lifetime protocol
+  (ms_thread_destroy frees the waiter). Its wake histogram also stops before
+  lock reacquisition.
+- The FPCR/AFP change never applied (iOS FetchHostFeatures). A benchmark
+  measures switch cost, not frame-critical frequency.
+- Oodle is not a priority until decode is shown on the critical chain.
+- Next perf step per Astra: a bounded frame-dependency trace (per-thread
+  wait/wake/poll episodes, queue and fence completion, present timeline) in
+  one 2-3 s window. Not built yet; the crash took priority.
+
+## §115 — ph-rdr79 (ml1126, story): residency fix confirmed; the "60 fps for a few seconds, then 30" drop happens in two steps
+
+**ml1126 works:** residency membership held flat at ~4,100 (ph-rdr78: 216k and
+climbing), 0 command buffers ended in error, no abort, and the user saw no
+rendering problems. Typed-buffer views are still leaking as expected (58,197
+live and 65,597 made after ~6 min). The log hit the 10 MB cap, so only the
+first ~6 min are recorded.
+
+**The user's 60 fps is real, but short.** The Metal HUD lines (one per second,
+wall clock) show:
+- 14:36:00-17: 54-60 fps, 3D scene (about 2,100 draws/frame), GPU 8-10 ms.
+- 14:36:18-26: drops to 26-42 fps; GPU time rises 9.6 -> 25 ms while draws per
+  frame FELL (~2,100 -> ~1,460).
+- 14:36:27-14:37:00: a light screen (loading/menu/map: ~300 draws, ~90
+  encoders/frame, GPU 4-7 ms) at 60 fps. This is what I first mistook for 40 s
+  of in-game 60.
+- 14:37:01-07: in-game 60 fps, ~1,450 draws/frame, GPU ~8 ms. The game waited
+  ~2 ms/frame in Present, so it had headroom.
+- 14:37:08: fps -> 25-42 with the SAME draw count and GPU still 8.5-10.6
+  ms/frame. The game never waits in Present any more (0.00 ms) and its own frame
+  is 26-32 ms, so this is a CPU-side step. Probably the player starting to move
+  (streaming/simulation), but thread samples run only every 20 s, so the thread
+  is unknown.
+- 14:37:18 onward: GPU time per frame rises to 23-33 ms (80-92 % busy) while
+  draws grow only ~1.5x and attachment traffic stays flat.
+
+**Hypothesis (NOT proven):** once the frame rate falls for CPU reasons, the
+iOS performance controller lowers the GPU clock to just meet the slower
+cadence, so GPU time per frame stretches to fill ~80-90 % of the interval.
+- Supporting: both episodes show the fps drop FIRST and the GPU-time rise
+  after it (1-2 s, then ~10 s).
+- Supporting: in episode 1 GPU time tripled while draws fell.
+- Supporting: ml1110 (fence chain off) halved GPU time with no fps change.
+- If true, "85-90 % GPU busy at 30 fps" (city, riding, Astra's point 3) does
+  NOT mean GPU-bound; the limit is still the CPU chain.
+
+**Test (no build needed):** Xcode -> Window -> Devices and Simulators -> the
+phone -> Device Conditions -> GPU Performance State = Maximum, then play the
+same scene.
+- GPU ms/frame falls back to ~9-13 and fps is unchanged: clock scaling
+  confirmed, CPU-bound.
+- fps rises: the GPU was the limit at the lowered clock.
+- Nothing changes: the extra GPU time is real work (heavier shading or
+  streaming uploads).
+Record the time the condition was set.
+
+## §116 — ph-rdr80: the 60 -> 30 drop is THERMAL/POWER capping (device log proves it); supersedes the §115 hypothesis
+
+Same shape as ph-rdr79: 60 fps at 10.5 ms GPU from 14:59:53 to 15:00:01. Then
+at 15:00:02, 25-37 fps with the GPU unchanged; at 15:00:10 GPU time rises to
+22-24 ms (fps actually rises to ~40). The device log (root `log collect`,
+`scratchpad/rdr80-sys.logarchive`) lines up to the second:
+
+- 14:57:20 thermalmonitord `Thermal pressure level 10` (already raised before
+  gameplay).
+- 15:00:01.371 kernel `ApplePPMPolicyCPMS::setDetailedThermalPowerBudget`
+  STARTS budgeting clientIds 9 (1877 mW) and 10 (2495 mW), lowering them every
+  second (to ~1.8 W / 2.35 W). clientId 11 (display) is cut and backboardd drops
+  the brightness cap from 1600 to 1098 nits, then down to 545.
+- 15:00:02: fps drops.
+- 15:00:10.185 `Thermal pressure level 20`, and GPU time per frame jumps.
+- 15:00:13: clientId 7 budget ~3.9 W (with a details word) appears and keeps
+  being adjusted.
+
+Which clientId is the CPU and which the GPU is not labelled; do not guess. The
+"60 fps for a few seconds" is the phone at full power after a light loading
+screen, until CPMS clamps it about 8 s into gameplay. Sustained fps in these
+runs is set by the power budget. That is consistent with:
+- "yield throttle off" being worse (more spinning = more watts),
+- the best run having "fair" thermals,
+- snow dropping from ~60 to the 30s mid-scene in two runs.
+
+**Consequences for perf work:**
+1. Every run needs the thermal state logged, or fps comparisons between builds
+   are confounded by how hot the phone was.
+2. Under a power cap, WASTED work costs fps even when it is off the critical
+   path: zero-timeout polling (340-610k/s), yield/spin loops, FEX overhead,
+   redundant attachment load/store (our estimate ~470 MB/frame, about 14 GB/s
+   at 30 fps), and fence/encoder overhead. Energy per frame, not CPU %, is the
+   metric to cut.
+3. The Xcode GPU Performance State test (§115) is not decisive under thermal
+   capping; skip it.
+
+**Measurement to add (small, not built):** log ProcessInfo.thermalState
+(nominal/fair/serious/critical) with every [perf] window, plus task energy
+from `task_info(TASK_POWER_INFO_V2)` (task_energy, gpu_energy) as mW and mJ
+per frame. Then A/B builds on energy per frame at a matched thermal state.
+**User-side test:** an external phone cooler, a lower fixed brightness, and
+not charging should hold 60 longer if this is right.
+
+## §117 — ph-rdr81 (720p, vram 3072, ml1127): the 60 -> 30 drop is NOT thermal (corrects §116); jetsam from Game Mode dropping the memory limit
+
+**§116 corrected.** ph-rdr81 repeats the drop with NO thermal change:
+- in-game 60 fps from 15:13:46 to 15:13:55 at 720p, GPU ~13 ms/frame;
+- 15:13:56: 22-34 fps with the GPU time UNCHANGED (~13 ms);
+- no kernel CPMS budget events anywhere in 15:07-15:14 (the archive did
+  capture them at 15:00-15:08, so logging works);
+- thermal pressure stayed at level 10 (since 15:08:05) and fell to 0 at
+  15:14:50;
+- the user held the phone at a fan and saw "Fair".
+
+The ph-rdr80 CPMS event one second before its drop was coincidence or a
+secondary factor. The drop comes 7 s (ph-rdr79), 9 s (ph-rdr80) and 10 s
+(ph-rdr81) after the full scene starts. At the drop, draws/frame, FEX
+compiles (tens/s) and FEX lookups per frame are all unchanged; the game simply
+stops waiting in Present and its CPU frame becomes 26-40 ms. The user says
+the scenery was fully rendered at 60 and nothing visibly loaded at the drop.
+
+**Open hypotheses; the logs cannot separate them** (thread samples fire every
+20 s and none landed in a 60 fps window):
+- (a) An OS performance cap on the CPU. gamepolicyd puts the app in Game Mode
+  with `Sustained execution mode set to Auto`, `Set DPS to 2` (CLPC), so a
+  burst-then-sustain clamp is plausible.
+- (b) Loss of the 2 P-cores: more game/runtime threads become runnable about
+  10 s after spawn (ambient simulation, streaming, decompression), and the
+  critical threads land on E-cores.
+- (c) The game really does more CPU work per frame after its spawn window.
+
+**Measurement that separates them (NOT built):** once a second, log
+`proc_pid_rusage(getpid(), RUSAGE_INFO_V6)` deltas (unix side or a Swift
+timer):
+
+| Field | What it separates |
+|---|---|
+| ri_cycles / (ri_user_time + ri_system_time) | effective clock; (a) shows up here |
+| ri_user_ptime + ri_system_ptime share | P-core share; (b) |
+| ri_runnable_time | starvation; (b) |
+| ri_instructions per frame | (c) |
+| ri_energy_nj, ri_penergy_nj | energy |
+
+Also log ProcessInfo.thermalState. Candidate levers by outcome:
+- (b): map Win32 thread priority to pthread QoS (TIME_CRITICAL/HIGHEST ->
+  USER_INTERACTIVE) so the scheduler keeps the game's critical threads on
+  P-cores, and cut our own busy/spinning threads.
+- (a): cut energy per frame. Whether an app can leave SEM Auto without losing
+  Game Mode's memory limit is unknown.
+- (c): only faster translation helps.
+
+**The crash (confirmed from the device log):** 15:14:08 SpringBoard
+_UISystemGestureWindow received the user's bottom-edge trackpad drag (our log:
+`[trackpad] CANCELLED` at y ~661-665). The scene was deactivated ('systemAnimation') and
+gamepolicyd ended Game Mode: `Sustained execution mode set to Unsupported`,
+`Increased memory limit disabled`. The kernel then logged `Madeira [5588]
+exceeded mem limit: ActiveHard 6144 MB (fatal)` with a footprint of
+6,697,724 KB. So the limit is 8192 MB only while Game Mode holds, and ANY
+system gesture that ends it kills the app above 6 GB (720p + vram 3072 ran at
+~6.5 GB). The same toggle happens when switching to StikDebug.
+
+**Fix (NOT built, low risk):** defer system gestures on every window. Nothing
+in the app does this today. Add `.defersSystemGestures(on: .all)` and
+`.persistentSystemOverlays(.hidden)` to ContentView and to the hosting
+controllers of PassthroughWindow and ControlsWindow (ControlsWindow does
+become key sometimes). A first edge swipe then goes to the app and only a
+second reaches iOS. Independently, keeping the footprint under 6 GB (lower
+vram-mb) survives Game Mode flickers.
+
+Also seen: IOGPU kernel faults `IOGPUCommandDescriptor::prepare ...
+requiredBytes ~2.6-2.9 GB, preparedBytes != requiredBytes` on many command
+buffers. Each submission wires ~2.6 GB of resident allocations, and the
+per-submit cost is unmeasured.
+
+## §118 — ml1128: 250 ms transition probe (measurement only), per Astra's ph-rdr81 spec
+
+Installed as `build/ipa/Madeira-20260923-1550-ml1128.ipa`. Nothing in it
+changes behaviour. The user asked for the root cause of the 60 -> 30 step and
+said not to build a fix until the cause is confirmed.
+
+- `server_ios.c ios_xprobe_main` (dispatch utility thread, armed with the thread
+  sampler) runs every 250 ms and prints two lines:
+  - `[xp] <wall> +<s> dt cpu (thr <sum of threads>) P E run pgw GHz P/E Minst IPC mJ pin rdKB fpMB | pres <enq>/<done> thr ecl n/ms sig wait prs (flush lat n/ms draw cmt) pool caller-ecl`.
+    - This is proc_pid_rusage v6 plus the madeira_d3d12 counter block.
+    - `cpu` is converted as Mach ticks. `thr` is the per-thread sum and
+      validates the unit.
+  - `[xp-t] <wall> <role><wintid>:<P ms>/<E ms>:<P GHz>/<E GHz>:<M instr> ...`
+    - Role threads are always printed, then the busiest threads (>= 2 ms per
+      interval, up to 14).
+    - Counters come from PROC_PIDTHREADCOUNTS (34): perf level 0 = P, 1 = E.
+      The armed line logs hw.perflevel names.
+- Roles, registered via MadeiraCtl op 4 on the thread itself: W = submission
+  worker, P = Present caller, E = ExecuteCommandLists caller.
+- MadeiraCtl op 5 publishes `g_xp` (madeira_d3d12.c). The layout is mirrored
+  in `struct ios_xp_pe`: append only.
+- Wall clock in each line aligns with the metal-HUD NSLog lines.
+
+**Reading it (Astra's table):**
+- P-share of the E/P role threads falls -> P-core loss.
+- Same placement but P GHz falls -> clock cap.
+- Minst per frame of the game threads rises at the same GHz -> more game work.
+- `run` (runnable) rises -> core starvation.
+- `pgw` rises -> paging.
+- Present stage (lat/draw/cmt) grows while enqueue holds -> pacing.
+
+## §119 — ph-rdr82 (ml1128 probe): ROOT CAUSE of the 60 -> 30 step = the SoC clamps CPU clocks under a sustained power budget; work per frame is unchanged
+
+**Transition:** in-game 60 fps 15:54:06-14 (GPU 12 ms). At 15:54:14.8 the
+probe shows the clock cut:
+- P-core effective clock 3.5-4.75 GHz -> 2.14 -> 1.54 -> **1.44 GHz, flat**
+  (15:54:15-15:54:28);
+- E-core 2.62 -> **1.72 GHz**;
+- process CPU power 4-7 W -> ~0.9 W, then ~1.5 W;
+- busy cores unchanged (3.3 -> 3.5-4.0).
+
+fps halves at once while GPU time stays 12 ms. From ~15:54:30 the CPU clock
+recovers to ~2.0-2.3 GHz while GPU time doubles (12 -> 24 ms): one power
+budget shared between CPU and GPU. The phone was not in a hot state:
+thermalmonitord showed no change and no CPMS events. The device log has
+NOTHING at the clamp (it is the power controller acting silently).
+
+**Same work before and after:** instructions per frame summed over all threads
+were ~247 M at 60 fps and ~240 M capped.
+- The submission worker W00f8 alone is ~52 M instr/frame, almost all on
+  P-cores: the single biggest instruction consumer (native Metal encoding and
+  replay).
+- Game threads (00ac main/E, 00b0, 00b4, 00b8, 00bc, the 0154-0164 job
+  threads) make up ~190 M/frame.
+- CPU energy per frame: ~70 mJ at 60 fps, ~42 mJ capped.
+
+So no emulator or game bug causes the step. Sustained fps ~= power budget /
+energy per frame.
+
+**Why the 60 lasts a few seconds:** an energy-bucket model fits.
+- Loading ran at ~7 W for ~35 s without a clamp, the light screen let the
+  budget recover, and gameplay at 4-6 W used the rest.
+- Every observed run shows 60 for several seconds after a loading screen.
+- The Game Mode policy in force is `Sustained execution mode = Auto`
+  (gamepolicyd; Info.plist sets `GCSupportsGameMode = true` and the games
+  category). Whether SEM or the ordinary power controller applies this clamp
+  is NOT determined.
+
+**Levers, by confidence (none built):**
+1. **Energy per frame** (certain direction, work required). Every % cut raises
+   sustained fps under a fixed budget.
+   - Biggest single item: our D3D12 worker at ~52 M instr/frame (~21 %);
+     profile mad_ecl_run and the Metal encode calls.
+   - Then FEX-translated game work, the zero-timeout polling, spin/yield loops.
+2. **Game Mode off** (`GCSupportsGameMode = false`) as an EXPERIMENT. It may
+   change the policy (SEM Unsupported) or may not, and it very likely drops
+   the memory limit from 8192 to 6144 (ph-rdr81). It needs 540p and a lower
+   vram-mb to fit under 6 GB. Outcome unknown.
+3. **User-side:** test unplugged (the device log shows the battery power
+   negative, i.e. charging, and charging adds heat), and try an active (Peltier)
+   phone cooler. If the controller models real temperature, both extend the
+   burst and raise the sustained level.
+
+## §120 — Game Mode / power research: no bypass; the clamp is Apple's default burst -> steady-state profile
+
+Sources: Apple tech talk 111372, the sustained-execution entitlement doc,
+LSSupportsGameMode doc, and the iOS 27 GamePolicyFoundation strings from
+Xcode DeviceSupport (iPhone18,1 24A5424a).
+
+**How the performance profile works:**
+- Apple documents three stages: burst, consistent, then steady state "honoring
+  device constraints". The 8-10 s at 60 fps followed by the clamp is that
+  default profile. It is not a Game-Mode-only throttle.
+- The `com.apple.developer.sustained-execution` entitlement holds an app at the
+  steady state from launch (it limits burst). It is paid-program only and would
+  not help.
+
+**What Game Mode does for us:**
+- gamepolicyd logs for us: GM:true DPS:true SEM:Auto MMA:true TXN:true MEM:true.
+- DPS = Dynamic Power Splitter, the CPU/GPU split of one budget. After the clamp
+  the P-cores ran below the E-cores (1.44 vs 1.72 GHz), which suggests the
+  split favours the GPU.
+- MEM = the increased memory limit is applied via Game Mode for games: 6144 MB
+  without it (ph-rdr81 kill). Whether a NON-game with our entitlement gets more
+  is unverified; log os_proc_available_memory() before relying on it.
+- The CLPC controls (setPowerTarget:toTargetWatts:, setSustainableMode:,
+  setWorkloadPowerBudget:, the SEM allowlist, enablement strategies) all need
+  Apple-private entitlements. There is no free-account path.
+- The "gaming energy mode" High/Low Power preference (macOS gamepolicyd)
+  appears Mac-only; the iPhone logs never show it.
+
+**User-side Game Mode off:** Control Center -> Game Overlay -> Controls. It
+persists per game. The memory limit likely drops to 6144 MB, so test only at
+540p with a low vram-mb.
+
+**Levers inside the steady-state budget:**
+1. Fewer concurrently busy cores. Power per core grows about cubically with
+   clock, so the same watts buy much higher clocks for the critical threads.
+   Test with `cpu-count` 4 and 3 (ml1122 switch, never measured with the
+   probe).
+2. Less GPU power moves DPS budget to the CPU. Test 540p vs 720p on the same
+   scene.
+3. Less work per frame: worker (§119; static review candidates below), FEX
+   overhead, polling and spinning (Apple's CPU-scheduling talk explicitly
+   warns against busy-waits and yield).
+
+**Static review of the worker (not measured; confirm with the ml1129 wprof
+profile first):**
+- mad_air_build_tables_ex / mad_air_resolve are rebuilt twice per draw with
+  O(ranges x params) walks plus vmap_get under view_lock. Precompute a plan
+  per (pso stage, root signature) and dirty-track.
+- ~22 unfiltered Metal state sets per draw (pso, viewport, scissor, 7
+  setBuffer, depth/stencil, blend, 5 raster calls). Filter redundant ones
+  per encoder.
+- useResource every draw (heaps, 16 IA slots, the index buffer, up to 64
+  used) even though a residency set exists, plus an 8 KB memset of `ur`
+  every draw.
+- Argument ring: 7-10 zeroed 1088 B slots per draw (~12-16 MB/frame written
+  into shared memory) and a 64 KB chunk refill every ~7 draws.
+- ~4 bridge transitions per encoder for create, fence wait, fence update and
+  end (~1,040/frame).
+
+## §121 — ph-rdr83: Game Mode off changes nothing; first worker profile; ml1130 cuts memsets
+
+**Game Mode turned off mid-session** (Control Center, during shader loading):
+- the memory limit STAYED at 8.6 GB (HUD); from launch without Game Mode it
+  is ~6.47 GB;
+- the clamp still hit at ~16:49:30 (P 4.7 -> 1.44 GHz, then ~1.8 GHz,
+  ~1.5 W, 4.2 cores busy).
+So SEM and DPS are not the cause; it is the default steady state (§120).
+
+**Worker profile** (ml1129 wprof, ~8,900 running samples of the W thread,
+9 bursts):
+
+| Cost | Share |
+|---|---|
+| encoder create/end (render 19.3, compute 7.3, blit 3.7, endEncoding 5.8) | ~36 % (AGX driver self 23.5 %) |
+| encodeCommands (render 15.4, compute 3.9, blit 3.0) | ~22 % |
+| ucrtbase memset (its q-register loop) | ~11.7 % |
+| libsystem bzero/memset/memmove | ~6.5 % |
+| kevent_id | 9.6 % (origin unknown) |
+| D3D12.DLL self | ~20 %, of which mad_air_resolve 9.4 % |
+
+- Our DLL loads as D3D12.DLL, so the inclusive-by-our-function table was
+  empty. Fixed in ml1130: the profiler also matches d3d12.dll.
+- Symbolize with `llvm-objdump --syms` on the same DLL: RVA = .text offset +
+  0x1000. Keep a copy per build (scratchpad/madeira_d3d12-ml11xx.dll).
+
+**ml1130** (installed, `build/ipa/Madeira-20260923-1700-ml1130.ipa`):
+exec_ring_take_z clears only the bytes each table uses:
+- arg table: arg_qwords*8;
+- cb table: up to the highest cb entry + 2;
+- VB table: popcount entries;
+- root-constant CBV: 256 B;
+- draw args: 64 B;
+- root slot: the root layout end, plus 512..576 for draw params and draw info.
+The `ur` useResource arrays (render and compute) are no longer bulk-cleared;
+each entry is zeroed as it is used. Before, ~14.5 KB were zeroed per draw;
+now ~1-1.5 KB.
+- Expected: memset largely gone from wprof, W instructions/frame down.
+- Risk: a shader reading an unwritten table word (previously zero). Watch
+  for rendering changes.
+
+**Next candidates, by measured share:**
+1. Encoder count (~260/frame; creation is the biggest single cost).
+2. Redundant per-draw state in encodeCommands.
+3. mad_air_resolve plan caching.
+4. What the worker does in kevent_id.
+
+## §122 — ph-rdr84 (ml1130): memset cut worked but the worker is only ~18 % of CPU; RDR2.exe has NO volatile metadata, so every game load/store pays TSO
+
+**ml1130 memset reduction:**
+- worker wprof memset share ~12 % -> ~5 % (the rest is the small per-entry
+  clears, ucrtbase+62e20 small-size path);
+- worker instructions/frame 47.8 M -> 45.1 M;
+- all listed threads 253 M/frame (unchanged overall).
+- The user saw no fps change, as expected: the worker is ~18 % of CPU
+  instructions/frame.
+- Game Mode toggles: the clamp still hit at 17:11:22; the log ended ~40 s
+  later, too short to compare Game Mode on and off after the clamp.
+
+**Game threads:** cpu-split samples are 78-85 % x64 JIT (the game's own
+translated code), with the rest ARM64EC images and kernel. So ~80 % of all CPU
+is translated game code, and FEX's code quality and TSO cost dominate.
+
+**RDR2.exe (pulled from the phone, 114 MB):**
+- PE32+, image base 0x140000000;
+- data directory 10 (load config) is rva 0 / size 0, so there is no load
+  config, no CFG and **no volatile metadata**.
+- FEX's VolatileMetadata=true therefore has nothing to use: every
+  non-exempt load/store in the game's code is emitted with TSO ordering
+  (LDAPR/STLR-class) because TSOEnabled=1.
+- Only oo2core_5_win64.dll and bink2w64.dll are exempted (our
+  FEX_EXTENDEDVOLATILEMETADATA).
+
+**Experiment, config only (NOT applied):**
+`env.FEX_EXTENDEDVOLATILEMETADATA = oo2core_5_win64.dll:bink2w64.dll:RDR2.exe`
+- Effect: TSO off for the game module; other x64 modules keep it.
+- Risk: MSVC x64 std::atomic acquire/release compiles to plain MOVs, so any
+  lock-free publication in the game can misbehave (rare corruption, hangs,
+  crashes). LOCK-prefixed atomics stay atomic.
+- Measure: probe IPC and Minst/frame, and fps before and after the clamp.
+- Do not save the game during the test.
+- If the gain is large, the follow-up is a selective map: keep TSO only
+  around instructions near LOCK ops or in known synchronisation code (FEX
+  extended metadata supports instruction-level TSO re-enable).
+
+## §123 — Deep lever analysis for "double FPS" at 720p low / ultra textures (from ph-rdr78/82/83/84/85 + code; no phone)
+
+**Framing.** After the clamp both sides are saturated under one shared
+budget (DPS): CPU ~4 busy cores at ~1.8/2.3 GHz, ~1.5 W; GPU ~24 ms/frame,
+~90 % busy. 2x fps needs roughly half the energy per frame on BOTH sides,
+several multipliers stacked, or frame generation.
+
+### Finding A (strongest, new): the game's critical threads spend ~35-40 % of running time INSIDE Win32 imports, mostly transition + sync overhead
+
+Guest-RIP profile (ml1111/1112: the RIP sits at the IAT call site while host
+code runs the import), aggregated per run:
+
+| Import | ph-rdr78 (9,879 samples) | ph-rdr82 | ph-rdr83 |
+|---|---|---|---|
+| ntdll RtlLeaveCriticalSection | 13.2 % | 15.9 % | 16.1 % |
+| kernel32 QueryPerformanceCounter | 16.5 % | 12.2 % | 8.3 % |
+| kernel32 SetEvent (loop over an array of 0x30-byte structs at RDR2+0x2595040 = waking job workers) | 3.5 % | 4.6 % | 5.4 % |
+| GetLastError | | ~2.9 % | ~2.3 % |
+| HeapFree | | ~2.9 % | ~2.3 % |
+
+Also present: RtlEnterCriticalSection 0.6-2.5 %, SetThreadAffinityMask,
+WaitForSingleObject ~1 %, SetLastError, TlsGetValue.
+- Taken from kernel32 RVAs 0x34800/0x34740/0x34870/0x35ec0/0x34540/0x41870 and
+  ntdll 0x91ce0/0x91120/0x91490 against the export tables.
+- The FEX CB_SUMMARY "hottest_rip" 0x71f8901490 is ntdll RtlFreeHeap.
+- GetLastError is one TEB load; for it to reach ~2.5 %, the x64->ARM64EC
+  round trip itself must be expensive. MSVC's CRT wraps per-thread data in
+  GetLastError + Tls/FlsGetValue + SetLastError, so these calls are very
+  frequent.
+- FPCR microbenchmark (M4, scratchpad fpcr_bench.c): an MSR FPCR toggle pair
+  (value changes) costs 27 ns; the same value, or mrs+skip, is free. That is
+  part of each transition if AFP bits differ between JIT and EC code. It is
+  not the whole cost.
+- LeaveCriticalSection at 13-16 % is contended wakes. Wine's CS spins ONLY if
+  SpinCount != 0. Otherwise Enter sleeps immediately (RtlWaitOnAddress ->
+  NtWaitForAlertByThreadId), and every Leave with a waiter does
+  RtlWakeAddressSingle -> NtAlertThreadByThreadId, a full syscall-dispatcher
+  round trip. That matches the ~31-33k alert wakes/s (sync-census) plus
+  madsync's ~10-20k waits/s: ~1,200 sleep/wake pairs PER FRAME.
+- QPC at 8-16 % despite the ml1117 user-mode counter: either transition
+  overhead or the game spin-waiting on time (a timer loop) -- undetermined.
+
+**Levers:**
+1. **Guest-side (x64) bodies for trivial hot imports**: GetLastError,
+   SetLastError, TlsGetValue, FlsGetValue, GetCurrentThreadId, QPC via
+   RDTSC/CNTVCT (QPF must match).
+   - Redirect those IAT entries of x64 modules to small x64 stubs in guest
+     memory, so FEX JITs them inline with no transition.
+   - Generic (any x64 app), not per-game.
+   - Removes ~5-20 % of critical-thread time (all of GetLast/SetLast/Tls,
+     most of QPC if it is transition-bound).
+2. **Adaptive spin in RtlEnterCriticalSection when SpinCount == 0**: spin a
+   few microseconds on LockCount before registering as a waiter.
+   - A spinning waiter never increments LockCount, so Leave does no wake
+     syscall either. This could remove most of the ~32k wake pairs/s. Short
+     spins cost less power than a sleep/wake round trip.
+   - Check Windows' own dynamic-spin behaviour to stay faithful.
+3. **Cheaper wake/signal paths**: SetEvent and NtAlertThreadByThreadId as
+   minimal unix calls with no madsync global lock / pthread_sigmask pair
+   (Astra: this needs a lifetime protocol).
+4. **cpu-count 4/3** (config): fewer job workers means fewer SetEvent/CS
+   wakes and less contention. The cheapest test.
+5. **Heap**: HeapFree ~2.5 % plus RtlFreeHeap as the most frequent dispatcher
+   target. Check Wine's heap lock/LFH use under this workload.
+
+### Finding B: GPU side (the other half of the shared budget)
+1. **Encoder fence chain**: fence-chain 0 HALVED GPU time (§100) but broke
+   rendering. Per-resource hazard tracking (wait only on the last writer or
+   reader of what an encoder touches) could recover most of that. Under DPS,
+   GPU savings buy CPU clock.
+2. **Attachment traffic**: our estimate is ~470-580 MB/frame of attachment
+   load+store (~18 GB/s at 37 fps), which is significant DRAM energy on a
+   phone.
+   - ~180 passes per 600 lists end at "list-end" and ~150 at "dispatch", i.e.
+     store+reload round trips.
+   - Merge passes across list boundaries; Clear/DontCare loads when fully
+     overwritten; DontCare stores for discarded or transient targets
+     (DiscardResource hints).
+3. **Programmatic Metal GPU capture** (MTLCaptureManager to a .gputrace in
+   Documents; needs MetalCaptureEnabled in Info.plist) to get real per-pass
+   GPU cost and limiter counters in Xcode. Do this before choosing among
+   B1-B2.
+4. Upscaling (render below 720p + MetalFX spatial): a straight GPU saving.
+
+### Finding C: presentation
+The HUD frame intervals are exact 16.67 ms multiples: presentation is at
+60 Hz even though CADisableMinimumFrameDurationOnPhone = true (nothing
+requests 120 Hz). With 25-30 ms frames, 60 Hz quantization costs throughput
+and smoothness. ProMotion (CADisplayLink / preferredFrameRateRange, or
+presentDrawable afterMinimumDuration) plus an explicit cap could give
++5-15 % delivered fps in the 30-60 band.
+
+### Finding D: the only literal 2x
+Frame interpolation: MetalFX Frame Interpolation (iOS 26+) with the game's
+motion vectors and depth (RDR2 has TAA velocity), or a generic optical-flow
+interpolator on final frames. It doubles DISPLAYED fps, not simulation or
+input latency, and needs buffer identification plus UI handling.
+
+### Already measured / not levers
+- BC textures are native (supportsBCTextureCompression=YES).
+- The game preset is already low.
+- Game Mode is not the cap.
+- Global TSO off livelocks (selective TSO: +14 % IPC measured in loading).
+- Worker memsets done (ml1130).
+
+### Proposed next probe build (measurement only, when the phone is back)
+- Per-second call counts for the hot imports (count in the EC DLLs:
+  kernelbase GetLastError/SetLastError/TlsGetValue/QPC/SetEvent; ntdll
+  Enter/Leave CS split contended/uncontended, plus the SpinCount distribution
+  of contended sections).
+- The QPC caller pattern (spin loop or not).
+- Divide by the sampled shares to get the per-call transition cost.
+
+## §124 — ml1131: the call-cost / sync probe build (measurement only; built, NOT yet installed — phone unavailable)
+
+IPA: `build/ipa/Madeira-20260923-1811-ml1131.ipa` (the ml1130 D3D12 DLL, unchanged).
+Everything below only counts or samples; no behaviour changes.
+
+**1. FEX (xtajit64.dll; Module.S / Module.cpp / libarm64ecfex.def)**
+- `IosXpFex` DATA export, 4496 u64 words:
+  - [0] magic;
+  - x64->EC calls: sp-sharded 16x64 B, STADD/LDADD, in ExitFunctionEC;
+  - FPCR writes actually performed in ExitFunctionEC;
+  - EC->x64 calls through ExitToX64 (non-bypass);
+  - a 4096-entry ring: every 64th x64->EC call of a shard stores its target
+    (as the caller addressed it). Word indices 8/136/264, ring index at 392,
+    ring at 400.
+- The disassembly was verified: the TEB-load triplet the x18 patcher matches is
+  untouched; all registers used are already clobbered on those paths.
+- Copy: scratchpad/xtajit64-ml1131.dll.
+
+**2. PE ntdll (sync.c, time.c, ntdll_misc.h, ntdll.spec)**
+- `ios_xp_nt` DATA export (layout in ntdll_misc.h, mirrored as
+  ios_xp_nt_view in server_ios.c).
+- Contended critical-section enters, with the SpinCount==0 share, spin wins,
+  CNTVCT wait time plus a histogram (<2/10/50/200/1000 us, >=1 ms), and leave
+  wakes.
+- RtlWaitOnAddress / WakeAddressSingle / WakeAddressAll counts.
+- Every 4th contended enter stores its section in a 1024-entry ring.
+- A per-thread-slot (tid hash) histogram of the gap between successive QPC
+  reads (<1/10/100 us, <1 ms, >=1 ms), which answers "spin loop or not".
+- Built with build/wine-pe/build-ntdll.sh: 1,572,864 bytes = SizeOfImage
+  1,245,184 + 0x50000.
+- Previous ntdll: scratchpad/ntdll-ec.pre-ml1131.dll.
+
+**3. Unix ntdll**
+- wine/dlls/ntdll/unix/sync.c: NtSetEvent/Reset/Pulse; NtWaitForSingle/Multiple
+  with zero-timeout polls and empty polls; NtYieldExecution (and how many slept
+  via ml1063); NtDelayExecution with a requested-delay histogram.
+- build/ntdll-unix/server_ios.c `ios_xp_api_report`, every 4th xprobe tick
+  (~1 s). It finds both blocks via a PRIVATE module map of the game PEB (TEB
+  from a P/E role thread) and cached PE export parsing. Lines:
+  - `[xp-api]`: x64->EC/s, FPCR writes/s, EC->x64/s | CS contended/s (spin0 %),
+    spin-won/s, wait ms/s, wait histogram/s, wakes/s | WaitOnAddress/wake1/
+    wakeAll per s | SetEvent/Reset/Pulse per s | wait1/waitN/polls/empty per s
+    | yield/s (slept) | delay/s with histogram | alert wait/wake per s.
+  - `[xp-api-top]`: the top 28 x64->EC call targets as `module!export`, with
+    estimated calls/s (share of the new ring entries x total rate).
+  - `[xp-api-qpc]`: QPC/s, the global gap distribution, and the busiest four
+    threads with their <1 us / <10 us gap shares.
+  - `[xp-api-cs]`: the top 8 contended sections, with share, SpinCount,
+    ContentionCount, heap+off or module+off, and Wine's internal name if any.
+
+**4. `calltest-x64.exe`** (build/x64-tests; app button "x64 call cost").
+- Best-of-3 ns/op for: empty loop, integer chain, lock inc, plain store,
+  GetLastError, SetLastError, TlsGetValue, GetCurrentThreadId, QPC, free CS
+  pair, SetEvent (set / auto), ResetEvent, WaitForSingleObject (signaled / empty
+  poll), HeapAlloc+Free, malloc+free, SwitchToThread, Sleep(0), an event
+  ping-pong round trip, and a contended CS with spin 0 vs spin 4000.
+- Output goes to stdout AND C:\calltest.txt.
+
+**Test plan when the phone is back:**
+1. Install ml1131 and tap "x64 call cost" (cool phone, ~10 s); pull the log plus
+   `Documents/wine/drive_c/calltest.txt`.
+2. Play the usual scene ~3 min; pull the log.
+3. Optionally `cpu-count = 4` for a third run.
+
+**Reading it:**
+- Per-call transition cost = calltest GetLastError ns (pure transition).
+- Share of critical threads = [xp-api-top] rates x calltest costs.
+- If most contended waits are <10-50 us and SpinCount==0 dominates, adaptive
+  spinning is the lever.
+- QPC gaps mostly <1-10 us on one thread means a time-spin loop; otherwise it
+  is call overhead.
+
+## §125 — calltest on the iPhone 18 Pro (ml1131b) + ph-rdr86 unix sync counters
+
+**calltest-x64.exe** (best of 3; `research/logs-rdr2/calltest-ml1131-iphone18pro.txt`;
+the clock ended clamped at P ~1.8 GHz):
+
+| Operation from x64 | ns/op |
+|---|---|
+| empty loop / integer chain / lock inc | 2.3 / 1.6 / 2.3 |
+| GetLastError / SetLastError / TlsGetValue / GetCurrentThreadId | 51 / 52 / 52 / 51 (pure x64->EC round trip, ~90 cycles at the measured ~1.8 GHz) |
+| QueryPerformanceCounter | 70 |
+| Enter+Leave CS, uncontended | 118 |
+| HeapAlloc+HeapFree 64 B | 141 |
+| WaitForSingleObject(empty, 0), the ml1063 lock-free poll | 174 |
+| SetEvent (set / auto) / ResetEvent | 544 / 546 / 540 |
+| WaitForSingleObject(signaled, 0) | 642 |
+| SwitchToThread, Sleep(0) back-to-back | 122,000 (the ml1063 yield throttle's 100 us sleep) |
+| event ping-pong ROUND TRIP, 2 threads | 24,500 (~12 us per wake) |
+| contended CS spin 0 | 422 |
+| **contended CS spin 4000** | **58,456**, i.e. spinning is ~140x WORSE |
+
+(malloc+free and plain store were optimised away by the compiler: 0.0.)
+
+**ph-rdr86** (20.6 min desert/combat at 29.8 fps avg; unix counters only,
+since the FEX/nt blocks were read from the stale PE-mapped .data, fixed in
+ml1131b). Per second:
+- SetEvent 7.3k;
+- WaitForSingleObject 33.5k, of which zero-timeout polls 25.5k (96 % empty);
+- WaitForMultiple 0.3k;
+- Sleep(0) 9.3k, Sleep(1-4 ms) 1.6k;
+- yields 10.8k, of which 2.7k were throttled into 100 us sleeps;
+- alert waits 21k (~700/frame);
+- CPU capped ~2.25 GHz / 1.7 W / 3.6 busy cores.
+
+**Consequences for the §123 levers:**
+- Guest (x64) bodies for trivial imports: CONFIRMED worthwhile. Each call is
+  ~51 ns (~90 cycles) of pure transition at the clamped clock.
+- **Adaptive CS spinning: REFUTED here** (spin 4000 = 58 us/op vs 0.42 us).
+  Threads share cores and the clock is capped, so a spinner steals the owner's
+  core. Do not build it.
+- SetEvent/ResetEvent/Wait(signaled) at ~0.55-0.65 us each: the syscall
+  dispatcher plus madsync (global lock, sigmask) path. A user-mode fast path for
+  "state unchanged / no waiter" would cut most of the 7.3k SetEvent/s and the
+  signaled-wait cost.
+- **Cross-thread event wake ~12 us** (ping-pong 24.5 us round trip) vs thread
+  alerts ~4 us (ml1122 census). ml1122 also measured madsync wake latency avg
+  26.6 us. If job-system wakes are on the frame's critical path this is the
+  biggest latency item; it is the madsync wake path (Astra: deferred wake needs
+  a lifetime protocol).
+
+## §126 — ph-rdr87 (ml1131b, 8 min gameplay): the import-transition lever is small; ONE lock of ours is contended 100-170k times/s -> ml1132
+
+Log: `research/logs-rdr2/ph-rdr87-ml1131b-xpapi.txt`. The ml1131b block line
+read valid magic on both blocks, so all counters are live this time. Gameplay
+23:00-23:08:50, 30-35 fps. Figures are steady-state gameplay rates.
+
+**Transitions (FEX ExitFunctionEC counter):**
+- x64->EC ~1.0-1.2 M calls/s, each with an FPCR write; EC->x64 ~30/s.
+- At the calltest cost (51 ns) that is ~60 ms/s, ~1.7 % of the process's
+  ~3.65 busy cores.
+- **§123 Finding A (35-40 % of critical-thread time "in imports") is NOT
+  borne out.** Likely cause: the guest-RIP profile's RIP is only synced at
+  transitions, so the guest code AFTER an import is charged to that import.
+  That fits Leave 13-16 % vs Enter 0.6-2.5 % (long body after Leave, short
+  CS body after Enter) and QPC 8-16 % (job runs after its timestamp).
+- Lever 1 (x64 bodies for trivial imports) is therefore worth at most ~2 %
+  CPU. Deprioritised.
+
+**Top call targets (sampled every 64th transition, calls/s):**
+
+| Target | Calls/s |
+|---|---|
+| ntdll RtlLeaveCriticalSection / RtlEnterCriticalSection | ~100-114k each |
+| ntdll RtlQueryPerformanceCounter | ~102k (4 threads 00b0-00bc at ~20k each; 56 % of gaps < 1 us, so per-job timing, not a time spin) |
+| D3D12 res_GetGPUVirtualAddress / res_GetDesc | ~89k / ~80k |
+| D3D12 device_CopyDescriptors | ~82k |
+| D3D12 CreateShaderResourceView / CreateConstantBufferView | ~76-83k / ~73-76k |
+| D3D12 SetGraphicsRootDescriptorTable | ~68-70k |
+| D3D12 IASetVertexBuffers / IASetIndexBuffer / DrawIndexedInstanced | ~36-49k / ~30k / ~21-25k |
+| kernelbase InitOnceExecuteOnce | ~27k |
+
+Symbolise: our DLL `llvm-objdump --syms`, RVA = value + 0x1000. Wine EC DLLs
+in wine/build-arm64ec: **RVA = value + 0x10000** (.text is at 0x10000 there).
+
+**THE FINDING: contended critical sections**
+- 95-170k contended entries/s.
+- **100 % of the sampled ones are one lock: madeira_d3d12's `live_lock`.**
+  - Its address is device + 0x78. The device is the parameter of the
+    mad_fence_worker thread in `[thr-create]`; the offset was matched against
+    `struct mad_device`.
+  - It has spin 0.
+- The game's own locks are essentially uncontended.
+
+| Counter | Value |
+|---|---|
+| Wait inside RtlpWaitForCriticalSection | 190-300 ms/s |
+| Wait histogram | mostly < 2 us, a tail to 1 ms |
+| RtlWakeAddressSingle | ~95-170k/s |
+| WaitOnAddress | 20-40k/s |
+| Real thread sleep/wake pairs (alert wait/wake) | 16-32k/s |
+
+- Who takes it: `mad_resolve_address`, on every GPU address lookup:
+  - at record time on the game's 4+ recording threads (IASetVertexBuffers,
+    IASetIndexBuffer, root descriptors);
+  - at replay on the submission worker (root descriptors and descriptor-table
+    buffer entries).
+
+**Other rates (per second):**
+- SetEvent ~9.5k; WaitForSingleObject ~11.7k; zero-timeout polls only ~1k
+  (ph-rdr86 had 25.5k: a different scene or phase).
+- Yields 6-10k, of which 2.7-3.5k were throttled into 100 us sleeps.
+- Sleep(0) ~5k; Sleep(1-4 ms) ~1.6k.
+
+**GPU:** 82-91 % busy, 25-27 ms GPU per frame at 30-35 fps, ~225 encoder
+fence waits per frame. This scene is close to GPU-bound as well as
+CPU-power-capped.
+
+**Threads (35 fps window):**
+- ~3.65 cores busy (P 1.9 GHz, E 2.36 GHz, 1.34 W, ~39 mJ and ~310 M
+  instructions per frame).
+- No thread above ~41 % of a core.
+- Our submission worker W00f8 is ~45 M instr/frame.
+
+### ml1132 (installed, `build/ipa/Madeira-20260923-2328-ml1132.ipa`): lock-free address lookup
+
+- `mad_resolve_address` now searches the sorted index under a sequence count
+  (`aidx_ver`) instead of `live_lock`.
+- Writers are unchanged and still hold `live_lock`: track, untrack and
+  rebuild bracket every index change with mad_aidx_begin/end (count odd while
+  changing).
+- A reader falls back to the unchanged locked path, so every answer is one
+  the locked search would give, when it sees any of:
+  - an odd or moved count;
+  - a pending rebuild (`aidx_dirty`);
+  - an empty index;
+  - no match.
+- The index block is never freed on growth (a reader may still be in it);
+  the retired blocks are bounded by the final size.
+- `naidx` is stored with release after its block; readers load `naidx`
+  (acquire) before `aidx`.
+- Disassembly checked: ldar loads, `dmb ishld` before the re-check, and a
+  full fence after the writer's first increment.
+- One variable: nothing else changed.
+
+**Next run, check:**
+- `[xp-api] CS contended` should drop from 100-170k/s to near zero, or name
+  the next hot lock.
+- `[madeira-d3d12] ml1132 address lookups on the locked path: N (true misses
+  M)`: N must be a small fraction of the lookups. If true misses are high,
+  those lookups still serialise on the lock; the next step is a negative
+  cache or finding what the unmatched addresses are.
+- Compare energy (mJ) and Minst per present in `[xp]`, and fps, at matched
+  scenes. No fps prediction: this removes measured waste (blocking, ~170k
+  wake calls/s, ~30k context switches/s), but the scene is near GPU-bound.
+
+**Remaining big levers (ranked by evidence):**
+1. GPU: per-resource hazard tracking to replace the global encoder fence
+   chain. fence-chain 0 halved GPU time (§100) but broke rendering; ~225
+   waits per frame now.
+2. CPU: ~80 % of CPU is the game's translated code (cpu-split): FEX codegen
+   and selective TSO (+14 % IPC in loading with TSO off; RDR2.exe has no
+   volatile metadata).
+3. Presentation: 120 Hz / ProMotion pacing (Finding C).
+4. Frame interpolation (Finding D, the only literal 2x).
+
+## §127 — ph-rdr88 (ml1132): lock fix confirmed; THE CLAMP IS A CPU ENERGY BUDGET, and loading spends it -> ml1133 ECO
+
+Log: `research/logs-rdr2/ph-rdr88-ml1132.txt`.
+
+**ml1132 confirmed:**
+
+| Counter | ph-rdr87 | ph-rdr88 |
+|---|---|---|
+| Contended CS entries/s | 95-170k | ~150-250 |
+| CS wait | 190-300 ms/s | 25-30 ms/s |
+| Alert sleep/wake pairs/s | 16-32k | ~150 |
+
+- `ml1132 address lookups on the locked path: 0 (true misses 0)`.
+
+**60 fps in game: 38-39 s** (in-game rendering from 23:49:35.4, locked 60
+until 23:50:13, clamp at 23:50:14).
+- Earlier runs, in-game time before the clamp:
+  - ph-rdr82: 9 s; ph-rdr83: 8 s; ph-rdr84: 6 s; ph-rdr86: 5 s;
+  - ph-rdr87: 11 s, at 47-53 fps.
+- Confound: this run started in a lighter area.
+  - ~220 M instr per frame vs 400-480 M in ph-rdr87.
+  - In-game CPU power at 60 fps was 2.1-4.2 W (avg 2.97 W, P 3.2-4.1 GHz)
+    vs 4.1-4.8 W in the other runs.
+
+**The model (scratchpad clamp2.py over the [xp] 250 ms lines):**
+- Every run clamps after the same CPU energy counted from app start:
+  422 / 426 / 430 / 430 / 442 J (ph-rdr82-87), and 478 J in ph-rdr88.
+- Counting only power ABOVE ~2.3 W, all six agree within +-3 %:
+  249 / 246 / 248 / 245 / 251 / 249 J.
+- So the governor allows ~2.3 W of CPU indefinitely plus a burst credit of
+  ~250 J. When the credit is gone, it clamps the CPU clock (the process then
+  sits at ~1.3-1.4 W, P ~1.8-2.1 GHz).
+- The credit refills below ~2.3 W:
+  - ph-rdr86: after ~30 s of ~0.8 W spells (menus), P went back above 3 GHz
+    for 15 s;
+  - ph-rdr87: the same once, for 12 s.
+- The GPU does not visibly count: the loading screen, with the GPU idle,
+  spends the same credit.
+
+**Where the credit goes (credit above 2.3 W):**
+
+| Run | Loading | Gameplay |
+|---|---|---|
+| ph-rdr82 | 231 J (93 %) | 19 J |
+| ph-rdr83 | 232 J (94 %) | 14 J |
+| ph-rdr84 | 233 J (94 %) | 15 J |
+| ph-rdr86 | 235 J (96 %) | 11 J |
+| ph-rdr87 | 229 J (91 %) | 22 J |
+| ph-rdr88 | 222 J (89 %) | 27 J |
+
+Loading runs 65-87 s at 4.5-5.6 W. **The game gets only the scraps.**
+
+**Consequences:**
+- With the full ~250 J at the start of gameplay:
+  - ph-rdr88's light scene (~3.0 W at 60 fps, 0.7 W over): ~6 min at 60 fps;
+  - heavy scenes (~4.5 W, 2.2 W over): ~2 min.
+- Sustained 60 needs CPU power at 60 fps <= ~2.3 W at burst clocks, or
+  <= the clamped allowance once clamped. Post-clamp here was ~28 mJ/frame at
+  ~2 GHz, i.e. 1.7 W at 60 fps: the light scene is ~25 % away on CPU.
+- The GPU also slows after the clamp: 15 -> 19-23 ms per frame for the same
+  area. So GPU work per frame must also fall ~25 % there.
+- Pausing in a menu refills the credit.
+
+### ml1133 (installed, `build/ipa/Madeira-20260924-0015-ml1133.ipa`): ECO switch
+
+- `wine/dlls/ntdll/unix/sync.c`:
+  - `madeira_set_eco()` bumps `ios_eco_gen`.
+  - Every guest thread re-applies its QoS on its next NtWaitForSingleObject /
+    NtWaitForMultipleObjects / NtYieldExecution / NtDelayExecution /
+    NtWaitForAlertByThreadId (a `__thread` generation check).
+  - QoS can only be set on self.
+- Class while ECO is on: madeira.cfg `eco-qos` = utility (default),
+  background or initiated. Otherwise USER_INTERACTIVE, as before.
+- `thread_ios.c` thread start now goes through `ios_eco_apply_self()`.
+- `madeira.cfg eco = 1` starts with ECO on.
+- Overlay: green `ECO` pill next to CAP (filled = on).
+- Toggles are logged: `[eco] ml1133 HH:MM:SS.mmm eco ON/OFF (guest threads -> class)`.
+- The phone's madeira.cfg now has `eco = 1`. Backup:
+  scratchpad `madeira-cur.cfg.pre-ml1133`.
+
+**Test:**
+- Launch with ECO on; the loading screen should be slower.
+- Tap ECO off as soon as gameplay appears.
+
+**Read from the log:**
+- Loading duration and CPU W during loading: the target is <= ~2.3 W.
+- P vs E ms in `[xp-t]`.
+- Credit above 2.3 W spent before gameplay.
+- In-game seconds of 60 before the clamp.
+- Risks: audio crackle or timeouts in the loading screen at low QoS;
+  utility QoS also throttles I/O.
+
+**If confirmed, next:**
+- An automatic ECO: generic "spend burst only while rendering real frames",
+  e.g. GPU ms/frame < 2 while CPU > 2.3 W.
+- Or a governor that holds the process at a chosen power, now that the budget
+  is known.
+
+### Resolution: screen-shaped virtual desktop
+
+- The phone is 2622x1206 in landscape (2.174:1; 874x402 pt).
+- madeira.cfg `desktop-size = 1408x648`: 2.173:1, 912k px = 99 % of 720p.
+  The compositor aspect-fits it to 873.5x402 pt, so it fills the screen
+  (1280x720 left 80 pt bars each side).
+- RDR2 `Settings/system.xml` (in `C:\Program Files\Red Dead Redemption 2\Settings`):
+  - `windowed = 2` (borderless) follows the desktop;
+  - screenWidth/Height edited 1280x720 -> 1408x648. Backup: scratchpad
+    `rdr2-system.xml.pre-ml1133`.
+- Aspect ratio is Auto (Hor+: the same vertical FOV, wider view, a little more
+  scene to draw).
+- The Dynamic Island and the rounded corners cover the screen edges; RDR2's
+  HUD safezone setting can pull the HUD in.
+
+## §128 — ph-rdr89 (ml1133): ECO through loading doubled in-game 60 fps (38 s -> 85 s); corrected budget model; post-clamp is GPU-bound
+
+Log: `research/logs-rdr2/ph-rdr89-ml1133-eco.txt`. Setup:
+- ECO on from launch, off at 00:21:21.6 when gameplay appeared;
+- same spot as ph-rdr88, camera untouched;
+- desktop 1408x648 (swapchain 1408x648, compositor fills the screen).
+
+| Phase | Time | Avg CPU | CPU energy | fps | Instr/frame |
+|---|---|---|---|---|---|
+| Loading + menus, ECO on | 00:18:49-00:21:21, 152 s | 1.17 W | 178 J | ~30 | |
+| In game, ECO off | 00:21:21-00:22:46, **85 s** | 2.76 W | 235 J | 59.4 | 256 M |
+| Clamped steady | 00:23:00-00:28:10 | 1.34 W | | 40.1 | |
+| ECO taps in game | 00:28:45-00:30:03 | 1.27 W | | 33.8 | |
+
+- The user's stopwatch said 1:25 for the in-game period, which matches.
+- Loading used 178 J vs ~370 J in the full-clock runs and took ~2x longer.
+- Clamped steady was 33 mJ/frame.
+
+**Model correction (§127 was wrong):**
+- The "2.3 W free + 250 J credit" fit is REFUTED: it predicted ~6 min, and
+  ph-rdr89 clamped after only 58 J of such credit.
+- The first clamp is best fit by a ONE-TIME allowance of ~425 J of CPU energy
+  counted from app launch, with no cooling term over these minutes
+  (scratchpad heat-model grid).
+- Clamp-time error per run:
+
+| Run | Error |
+|---|---|
+| ph-rdr82 | -1 s |
+| ph-rdr83 | -2 s |
+| ph-rdr84 | -2 s |
+| ph-rdr86 | +3 s |
+| ph-rdr87 | -5 s |
+| ph-rdr88 | -18 s (probably a cooler start) |
+| ph-rdr89 | +9 s |
+
+  rmse 8 s over 7 runs.
+- ECO worked by halving the loading's share: 178 J instead of ~370 J, so
+  gameplay got ~235 J instead of ~116 J.
+
+**After the clamp: a ~1.35 W average limiter with a short window.**
+- ECO for 21 s (0.82 W, 26 fps) bought a 6 s burst (4.23 W, 56 fps).
+- Burst frames cost **75 mJ** vs 31-33 mJ clamped (full clock is 2.3x less
+  energy-efficient). In-game toggling therefore averaged 33.8 fps vs 40.1
+  steady: it time-shifts frames and loses some.
+- Same for the one-time allowance: the in-game burst ran at ~46 mJ/frame.
+  An allowance spent at lower clocks buys more frames.
+
+**The GPU is throttled by the clamp too, and is then the limit:**
+- The camera was static. At full clock: 15.0 ms GPU per frame at 60 fps, 90 %
+  busy.
+- Right after the clamp: 20-26 ms per frame at 88-92 % busy for the SAME view,
+  so the GPU clock dropped ~1/3.
+- Post-clamp fps (~40) is GPU-bound. A perfect CPU would still give ~44 fps
+  here.
+- Sustained 60 in this light spot therefore needs:
+  - GPU time per frame at the clamped clock from ~22 ms to <= 16 ms (-27 %);
+  - CPU energy per frame from ~33 mJ to <= ~22 mJ (-33 %).
+- The GPU items are the ranked levers of §126:
+  - per-resource hazard tracking instead of the global encoder fence chain
+    (fence-chain 0 halved GPU time, §100);
+  - attachment load/store actions;
+  - render scale / MetalFX.
+
+**Next:**
+1. User test, config only: RDR2 Resolution Scale 5/6 (or 3/4). Post-clamp fps
+   should rise if it is GPU-bound as above.
+2. Automatic ECO (generic): ECO while GPU ms/frame < ~2 for a few seconds with
+   the CPU busy (loading screens and menus), off once real frames render. It
+   preserves the one-time allowance with no taps.
+3. GPU: per-resource hazard tracking.
+
+## §129 — ml1134: fence-chain = 6, barrier-driven encoder sync (the GPU lever)
+
+**Why now:**
+- After the clamp the GPU is ~90 % busy at 20-26 ms per frame, so the frame
+  is GPU-bound (§128).
+- Fences off halved GPU time (§100, §106), but rendering broke.
+- ph-rdr89 per frame: ~260 encoders, each waiting for the whole previous one
+  (mode 1), and ~239 barriers.
+- Only ~54 of the encoders are render passes. Almost all the rest are compute
+  encoders that `MC_BARRIER` closed, each reopened behind a full GPU drain.
+- ~400 MB per frame of attachment load+store (upper-bound estimate) is a
+  separate lever, not touched here.
+
+**Mode 6 (see the comment at f6_begin in madeira_d3d12.c):**
+- Every encoder updates its own fence from a per-queue pool of 64 and joins
+  `q->f6_pend` (max 40, with the attachments it wrote).
+- An encoder waits for every pending encoder when any of these holds:
+  - a ResourceBarrier or list start since the last sync point;
+  - it is a render pass whose attachments a pending encoder wrote (D3D12
+    orders render-target and depth writes without barriers);
+  - it is a blit after a pending blit;
+  - the pending set is full.
+- Otherwise it waits for nothing and overlaps its predecessors.
+- At a barrier:
+  - an open encoder that did not sync at its start is closed;
+  - a synced compute encoder stays open (serial dispatch orders the
+    dispatches after the barrier); `f6-compute-open = 0` disables that;
+  - a synced render pass stays open, as in mode 1.
+- The device fence is waited for at every list's first sync and updated only
+  by a join blit encoder in `mad_queue_flush`, which waits for all pending
+  encoders. So the cross-queue and cross-batch order is the same as mode 1.
+  The Present blit also waits for it.
+- Stats: `[perf] ml1134 fence-chain 6 per frame: N encoders, N synced (N for a
+  shared attachment), N overlapped; N compute encoders kept open at a barrier;
+  N overlapped render passes closed at a barrier; N joins`.
+- Installed: `build/ipa/Madeira-20260924-0100-ml1134.ipa`. Phone cfg:
+  `fence-chain = 6` (backup `madeira-cur.cfg.pre-ml1134`) and `eco = 1`.
+
+**Test (same spot as ph-rdr88/89):**
+- ECO on through loading, off in game, camera still.
+- Compare:
+  - GPU ms/frame at 60 (ph-rdr89: 15.0 ms, 90 % busy);
+  - post-clamp GPU ms/frame and fps (20-26 ms, ~40 fps);
+  - seconds of 60 before the clamp (85 s).
+- Check rendering carefully: flicker, missing geometry, wrong shadows or
+  lighting.
+- If it is broken:
+  - first try `f6-compute-open = 0`: it separates "serial dispatch does not
+    order untracked writes" from "the overlap rule is wrong";
+  - then `fence-chain = 1` to revert.
+
+**Open risks:**
+- Serial compute dispatch coherence for untracked resources (assumed, not
+  proven on device).
+- Hazards D3D12 orders without barriers that are not attachments.
+- The overlapped-then-closed render passes cost an extra attachment store and
+  load (counted).
+
+## §130 — ph-rdr90 (ml1134, fence-chain 6): no GPU gain in the matched view; the freezes were a SMALL JIT POOL (VA layout lottery); reverted to mode 1
+
+Log: `research/logs-rdr2/ph-rdr90-ml1134-f6.txt`. User report:
+- ~1:10 of 60 fps, with hitches;
+- then 35-40 fps with constant freezes (camera, walking);
+- no visual glitches.
+
+**Mode 6 did what it was built to do, but it bought nothing:**
+
+| Per frame | Mode 1 | Mode 6 |
+|---|---|---|
+| Encoders | ~260 | ~186 |
+| Compute encoders kept open across a barrier | | ~104 |
+| Synced encoders | | ~163 (RDR2 puts a barrier before nearly every encoder) |
+| Overlapped encoders | | ~23 |
+| Shared-attachment syncs | | ~15 |
+
+- **Matched static view at 60 fps:** 15.0 ms GPU per frame at 89-90 % busy,
+  identical to mode 1 (ph-rdr89). Encoder boundaries are cheap here.
+- Post-clamp GPU 9.5 ms/frame at 25-40 % busy looks better than ph-rdr89's
+  22 ms, but the user was moving (a different view). CONFOUNDED; do not cite it.
+- Without the freeze and hitch seconds, post-clamp fps was 39.3 vs 40.1: the
+  CPU limit.
+- Config reverted to fence-chain = 1 on the phone. The mode 6 code stays for
+  later experiments.
+
+**The freezes (~1 s, one every ~14 s after the clamp) are NOT mode 6.** They
+are FEX translation-cache generation rollovers:
+
+| Run | JIT pool | Rollovers (`[gen] alloc#`) | Code buffers |
+|---|---|---|---|
+| ph-rdr86 | | 6 | |
+| ph-rdr87-89 | 544-560 MB | 4 | |
+| **ph-rdr90** | **432 MB** | **52** | 49 degraded to 16-32 MB ("pool pressure") |
+
+- Each rollover migrates ~50 threads to a new code generation, and
+  real_compiles jumps ~20k in under a second.
+- During a freeze the game submits nothing (ecl 0, pres 0) while its threads
+  burn CPU (x64->EC 55k/s, instructions per second unchanged).
+- Seconds under 5 fps in gameplay:
+
+| Run | Freeze seconds | Gameplay |
+|---|---|---|
+| ph-rdr86 | 1 | 1181 s |
+| ph-rdr87-89 | 0 | |
+| ph-rdr90 | 12 | 167 s |
+
+**Why the pool was small (hole census, ml1036):**
+- ph-rdr90 free holes: 0x12453c000+442MB | window | 0x148000000+253MB |
+  0x159c00000+276MB | 0x16b748000+328MB. A ~31 MB mapping at ~0x157d00000
+  split the hole above the window.
+- ph-rdr89 had 0x148000000+562MB there.
+- The ml1040 constructor (JITAllocator.c, runs before main) reserves 256-1024 MB
+  at 0x148000000. It failed ("no early pool placeholder was obtained") because
+  253 < 256: the intruder was there BEFORE our constructor.
+- It is not Madeira.debug.dylib (that loads at 0x104ee8000). The JITAllocator
+  comment records the same 31 MB intruder at 0x15dd00000 on an earlier bad
+  launch ("launch C").
+- ~400 MB of the pool is PE image copies, so a 432 MB pool leaves FEX
+  ~20-30 MB of code buffer.
+
+**Next for this bug:**
+1. Name the intruder: at constructor time, vm_region_recurse over
+   [0x148000000, 0x190000000), stash base/size/user_tag in globals, and have
+   StikJITHelper log them.
+2. Mitigation: when the pool is < ~500 MB, show the user "unlucky memory layout
+   this launch, relaunch for a smooth session" before the game starts.
+3. Real fix, depending on (1): reserve earlier, or shrink the image-copy share
+   of the pool.
+
+**GPU, next:** the static-view GPU time (15 ms at full clock, ~22 ms clamped) is
+not encoder-boundary stalls. Test RDR2 Resolution Scale 5/6 or 3/4 (mode 1)
+to see how much of it scales with pixels. If it does, attachment load/store
+traffic (~400 MB/frame upper bound) and render scale are the levers.
+
+**ml1135** (installed, `build/ipa/Madeira-20260924-0128-ml1135.ipa`; the D3D12 DLL is ml1134's, run in mode 1):
+- The JITAllocator.c constructor records the first mapping above the window
+  when no placeholder fits.
+- StikJITHelper logs it: `ml1135: the placeholder was blocked at image load by
+  a mapping at 0x..+NMB (VM tag T, prot P)`.
+- A pool shrunk below 500 MB logs `⚠️ SMALL JIT POOL (N MB) on this launch ...
+  relaunch`.

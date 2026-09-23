@@ -273,6 +273,13 @@ enum StikJITHelper {
                                        Int(earlyPoolBase), Int(earlyPoolSize >> 20)))
         } else {
             LogStore.shared.log("ml1040: no early pool placeholder was obtained — placement is left to chance", level: .error)
+            // ml1135: what was already mapped above the window at image load (user_tag
+            // is the VM_MEMORY_* allocation tag; 0 = untagged anonymous memory).
+            if madeira_early_intruder_base != 0 {
+                LogStore.shared.log(String(format: "ml1135: the placeholder was blocked at image load by a mapping at 0x%lx+%luMB (VM tag %u, prot %u) -- this is what shrinks the JIT pool",
+                                           Int(madeira_early_intruder_base), Int(madeira_early_intruder_size >> 20),
+                                           madeira_early_intruder_tag, madeira_early_intruder_prot), level: .error)
+            }
         }
         do {
             var holes: [(base: vm_address_t, size: vm_address_t)] = []
@@ -305,6 +312,13 @@ enum StikJITHelper {
                         + "(the alternative is a pool in the guest window or on top of 0x140000000, "
                         + "both of which are fatal)", level: .error)
                     poolSize = fit
+                    // ml1135: ~400MB of the pool is PE image copies, so below ~500MB FEX's
+                    // code cache is starved and rolls over every few seconds in game
+                    // (ph-rdr90: 432MB pool, 52 rollovers, a ~1 s freeze each).
+                    if fit < 500 << 20 {
+                        LogStore.shared.log("⚠️ SMALL JIT POOL (\(fit >> 20)MB) on this launch: expect ~1 s freezes in heavy games. "
+                            + "Quit and relaunch the app for a smooth session.", level: .error)
+                    }
                 } else {
                     LogStore.shared.log("ml1036: largest hole is only \(largest >> 20)MB — cannot place a usable pool",
                                         level: .error)

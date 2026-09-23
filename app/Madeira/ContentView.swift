@@ -1422,7 +1422,12 @@ struct ContentView: View {
                     // Known risk: if shellwindows_init beats services.exe's
                     // RPC_Init, OpenSCManager fails → watch whether that
                     // fails fast or hits the RaiseException→CS wedge again.
-                    let deskW = 960, deskH = 540
+                    // ml1127: `desktop-size = WxH` in madeira.cfg; 960x540 otherwise.
+                    var deskW = 960, deskH = 540
+                    if let txt = MadeiraConfig.get("desktop-size") {
+                        let p = txt.lowercased().split(separator: "x").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+                        if p.count == 2, p[0] >= 640, p[1] >= 360, p[0] <= 3840, p[1] <= 2160 { deskW = p[0]; deskH = p[1] }
+                    }
                     setenv("MADEIRA_EXE", "explorer.exe", 1)
                     setenv("MADEIRA_ARGS",
                            "/desktop=shell,\(deskW)x\(deskH) C:\\windows\\system32\\services.exe", 1)
@@ -1547,6 +1552,19 @@ struct ContentView: View {
                 // itself: QPC passing alone is the shared-page signature.
                 Button("x64 clock test") {
                     setenv("MADEIRA_EXE", "clocktest-x64.exe", 1)
+                    unsetenv("MADEIRA_ARGS")
+                    unsetenv("MADEIRA_DESKTOP")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.teal)
+
+                // ml1131: per-call cost of the imports the game's critical threads
+                // live in (GetLastError, QPC, SetEvent, critical sections, heap,
+                // event ping-pong, contended sections). Results in the log and in
+                // C:\calltest.txt.
+                Button("x64 call cost") {
+                    setenv("MADEIRA_EXE", "calltest-x64.exe", 1)
                     unsetenv("MADEIRA_ARGS")
                     unsetenv("MADEIRA_DESKTOP")
                     runWineFullSequence()

@@ -27,6 +27,7 @@
 #include <signal.h>
 #include <mach/mach.h>
 #include <mach/semaphore.h>
+#include <mach/mach_time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,6 +55,7 @@ struct ms_waiter
     unsigned       count;        /* real objects (alert excluded) */
     int            all, has_alert, done, ownerdead;
     uint32_t       owner, index;
+    uint64_t       wake_t;       /* ml1122: mach_absolute_time when a waker satisfied us */
 };
 
 static pthread_mutex_t  g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -61,6 +63,22 @@ static struct ms_obj  **g_tab;
 static unsigned         g_cap;
 static unsigned        *g_freelist; static unsigned g_nfree, g_freecap;
 static unsigned long long g_waits, g_blocked, g_wakes, g_creates, g_polls;
+/* ml1122: how long a satisfied waiter takes to run again, lock contention, and
+ * the madsync-spin-us experiment (spin lock-free before sleeping). */
+static volatile unsigned long long g_lat_n, g_lat_ticks, g_lat_hist[6], g_contended, g_lock_wait_ticks, g_spin_tries, g_spin_hits;
+static uint64_t g_spin_ticks; static int g_spin_loaded;
+static double ms_ticks_per_us(void)
+{
+    static double v;
+    if (!v) { mach_timebase_info_data_t tb; mach_timebase_info( &tb ); v = 1000.0 * tb.denom / tb.numer; }
+    return v;
+}
+static void ms_lat_note( uint64_t ticks )
+{
+    double us = ticks / ms_ticks_per_us();
+    int b = us < 5 ? 0 : us < 20 ? 1 : us < 50 ? 2 : us < 100 ? 3 : us < 500 ? 4 : 5;
+    __sync_fetch_and_add( &g_lat_n, 1 ); __sync_fetch_and_add( &g_lat_ticks, ticks ); __sync_fetch_and_add( &g_lat_hist[b], 1 );
+}
 
 /* ---- locking -----------------------------------------------------------------
  * A Wine thread can be TERMINATED from a signal handler (pthread_exit). If that
@@ -74,7 +92,26 @@ static void ms_lock( sigset_t *old )
     sigset_t all;
     sigfillset( &all );
     pthread_sigmask( SIG_BLOCK, &all, old );
-    pthread_mutex_lock( &g_lock );
+    if (pthread_mutex_trylock( &g_lock ))   /* ml1122: count and time contention */
+    {
+        /* ml1124: the lock is held for well under a microsecond; a contended
+         * pthread_mutex_lock sleeps in the kernel (__psynch_mutexwait, ~20 us
+         * measured on average in ph-rdr74, 3.4 k times a second). Spin on
+         * trylock first. madeira.cfg madsync-lock-spin = N tries (default 256,
+         * 0 = off). */
+        static int spin = -1;
+        int k;
+        uint64_t t0 = mach_absolute_time();
+        if (spin < 0) { long long v = madeira_cfg_int( "madsync-lock-spin", 256 ); spin = v < 0 ? 0 : v > 100000 ? 100000 : (int)v; }
+        for (k = 0; k < spin; k++)
+        {
+            __asm__ __volatile__( "yield" );
+            if (!pthread_mutex_trylock( &g_lock )) goto got;
+        }
+        pthread_mutex_lock( &g_lock );
+    got:
+        g_contended++; g_lock_wait_ticks += mach_absolute_time() - t0;
+    }
 }
 static void ms_unlock( const sigset_t *old )
 {
@@ -284,6 +321,7 @@ static void obj_wake( struct ms_obj *o )
         {
             waiter_unlink( w );
             g_wakes++;
+            w->wake_t = mach_absolute_time();   /* ml1122 */
             semaphore_signal( w->sem );
             next = o->head.next;               /* the list changed under us */
         }
@@ -409,9 +447,34 @@ static int do_wait( struct ntsync_wait_args *args, int all )
         errno = ETIMEDOUT;
         return -1;
     }
+    if (!g_spin_loaded)   /* ml1122: madeira.cfg madsync-spin-us (default 0 = sleep at once) */
+    {
+        long long us = madeira_cfg_int( "madsync-spin-us", 0 );
+        if (us < 0) us = 0; if (us > 200) us = 200;
+        g_spin_ticks = (uint64_t)(us * ms_ticks_per_us());
+        g_spin_loaded = 1;
+        dprintf( 2, "[madsync] ml1122 spin before sleeping: %lld us\n", us );
+    }
+    if (!w->done && g_spin_ticks)
+    {
+        /* Lock-free, like the ml1063 poll: every object is pinned by the
+         * caller's cached descriptor, and a stale read only costs a re-check. */
+        uint64_t end = mach_absolute_time() + g_spin_ticks;
+        int ready = 0;
+        g_spin_tries++;
+        ms_unlock( &old );
+        while (!ready && mach_absolute_time() < end)
+        {
+            for (i = 0; i < n && !ready; i++) ready = obj_ready( w->objs[i], w->owner );
+            if (!ready) __asm__ __volatile__( "yield" );
+        }
+        ms_lock( &old );
+        if (ready && waiter_try( w )) g_spin_hits++;
+    }
     if (!w->done)
     {
         const int realtime = (args->flags & NTSYNC_WAIT_REALTIME) != 0;
+        uint64_t woke_t = 0;
         for (i = 0; i < n; i++)
         {
             struct ms_obj *o = w->objs[i];
@@ -429,6 +492,7 @@ static int do_wait( struct ntsync_wait_args *args, int all )
             {
                 ms_unlock( &old );                       /* asleep with NO lock held and signals deliverable */
                 kr = semaphore_wait( sem );
+                woke_t = mach_absolute_time();
             }
             else
             {
@@ -440,10 +504,12 @@ static int do_wait( struct ntsync_wait_args *args, int all )
                 rel.tv_nsec = (clock_res_t)(left % 1000000000ull);
                 ms_unlock( &old );
                 kr = semaphore_timedwait( sem, rel );
+                woke_t = mach_absolute_time();
             }
             (void)kr;                                    /* ABORTED, TIMED_OUT, a stale post: all re-checked under the lock */
             ms_lock( &old );
         }
+        if (w->done && w->wake_t && woke_t > w->wake_t) ms_lat_note( woke_t - w->wake_t );   /* ml1122 */
         if (!w->done) waiter_try( w );                   /* a last look before declaring a timeout */
         waiter_unlink( w );
         ms_release_refs_locked( w );
@@ -573,6 +639,11 @@ int madsync_ioctl( int fd, unsigned long req, void *arg )
         g_waits++;
         dprintf( 2, "[madsync] ml1058 %llu waits (%llu slept, %llu empty polls), %llu wakes, %llu objects created, table %u\n",
                  g_waits, g_blocked, g_polls, g_wakes, g_creates, g_cap );
+        dprintf( 2, "[madsync] ml1122 wake latency: %llu samples, avg %.1f us, <5us %llu, <20 %llu, <50 %llu, <100 %llu, <500 %llu, >=500 %llu; "
+                 "lock contended %llu times, %.1f ms waiting; spin %llu tries, %llu hits\n",
+                 g_lat_n, g_lat_n ? g_lat_ticks / ms_ticks_per_us() / g_lat_n : 0.0,
+                 g_lat_hist[0], g_lat_hist[1], g_lat_hist[2], g_lat_hist[3], g_lat_hist[4], g_lat_hist[5],
+                 g_contended, g_lock_wait_ticks / ms_ticks_per_us() / 1000.0, g_spin_tries, g_spin_hits );
     }
     ms_unlock( &ms_old );
     return ret;

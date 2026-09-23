@@ -17,6 +17,10 @@ void wine_set_ui_log_callback(wine_ui_log_callback_t cb);
 uint64_t madeira_get_present_count(void);
 // ml1098: ask the D3D12 runtime to capture the next N frames (winemetal_unix.c)
 void madeira_capture_request(int frames);
+// ml1133: ECO switch (ntdll unix sync.c). 1 = every guest thread drops to a
+// low QoS class (efficiency cores, lower clocks) to save the SoC burst budget.
+void madeira_set_eco(int on);
+int madeira_get_eco(void);
 
 // DXMT vsync-lock toggle (winemetal_unix.c) — 1 = pace presents to 60
 // via afterMinimumDuration, 0 = free-run to display max (120 ProMotion,

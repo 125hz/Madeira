@@ -34,6 +34,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <pthread/qos.h>
+volatile long long ios_affinity_sets;   /* ml1117 */
 #include <signal.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -1261,8 +1262,13 @@ static void start_thread( TEB *teb )
      * select/nanosleep). [PROF] showed the game thread parked ~87% of each
      * 59ms frame in one system wait — if that's a frame-limiter sleep being
      * coalesced, this alone can collapse the wait to its requested length.
-     * USER_INTERACTIVE = P-core scheduling + minimal timer leeway. */
-    pthread_set_qos_class_self_np( QOS_CLASS_USER_INTERACTIVE, 0 );
+     * USER_INTERACTIVE = P-core scheduling + minimal timer leeway.
+     * ml1133: through ios_eco_apply_self (sync.c), which picks the eco class
+     * instead while the ECO switch is on. */
+    {
+        extern void ios_eco_apply_self(void);
+        ios_eco_apply_self();
+    }
 
     thread_data->syscall_table = KeServiceDescriptorTable;
     thread_data->syscall_trace = TRACE_ON(syscall);
@@ -2934,6 +2940,7 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
         if (length != sizeof(ULONG_PTR)) return STATUS_INVALID_PARAMETER;
         req_aff = *(const ULONG_PTR *)data & affinity_mask;
         if (!req_aff) return STATUS_INVALID_PARAMETER;
+        { extern volatile long long ios_affinity_sets; __sync_fetch_and_add( &ios_affinity_sets, 1 ); }   /* ml1117 */
 
         SERVER_START_REQ( set_thread_info )
         {

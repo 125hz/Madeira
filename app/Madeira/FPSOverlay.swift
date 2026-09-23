@@ -96,6 +96,7 @@ struct FPSOverlay: View {
                         .foregroundColor(fpsColor)
                     pacingPill
                     capturePill
+                    ecoPill
                 }
                 .font(.system(.caption, design: .monospaced))
                 .padding(6)
@@ -125,6 +126,7 @@ struct FPSOverlay: View {
                         .frame(width: 40, alignment: .trailing)
                     pacingPill
                     capturePill
+                    ecoPill
                 }
                 .font(.system(.caption, design: .monospaced))
                 .padding(.horizontal, 8)
@@ -178,6 +180,25 @@ struct FPSOverlay: View {
                 madeira_capture_request(1)
                 captureFlash = true
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { captureFlash = false }
+            }
+    }
+
+    /// ml1133: ECO. The SoC clamps the CPU clock once ~250 J of CPU energy has
+    /// been spent above ~2.3 W, and a loading screen at full clock spends nearly
+    /// all of it before gameplay starts. ECO on = guest threads run at a low QoS
+    /// class (efficiency cores, lower clocks): loading is slower but keeps the
+    /// budget for gameplay. Turn it off once in game. Green = on.
+    @State private var ecoOn = madeira_get_eco() != 0
+    private var ecoPill: some View {
+        Text("ECO")
+            .foregroundColor(ecoOn ? .black : .green)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(ecoOn ? Color.green : Color.clear)
+            .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.green, lineWidth: 1))
+            .onTapGesture {
+                ecoOn.toggle()
+                madeira_set_eco(ecoOn ? 1 : 0)
             }
     }
 
