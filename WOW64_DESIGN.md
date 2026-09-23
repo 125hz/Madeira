@@ -14327,3 +14327,25 @@ Validation: crypt32 i386/aarch64/arm64ec builds report 0 failures and 0 missing 
 
 Artifact: 155862143 bytes; 2026-09-22T22:38:20.652544-05:00; SHA-256 8c4d0bc1c6c4447548ea26d027fb08245ba21f6eecdf3e19753098270aaec8d2.
 Publication: Wine e82737d7aff pushed to 125hz/wine ios-build first; root implementation 716bf3d pushed to 125hz/Madeira main before this record. No upstream push or PR. Logs: .xtool/logs/ml1380-{pe32,pe64,ipa,verify}.log.
+
+
+### 2026-09-22 - ml1390: client refuses the native install as out of date; content-log mirror and install-record logs
+
+Device result for ml1380 (log 168 and a screenshot). "Play anyway" responded this time. The client then refused to start app 220: "Failed to start game with shared content. Please update these games first: 220", still at NO CONNECTION. The connection log repeats ml1380's pattern with other hosts (cmp1-dfw1, cmp1-sea1): GetCMListForConnect "status = 0", pings failing in the same second, ConnectFailed with port 0, "can't request new access token [3]". [lse-emul] handled three more LDADDAL faults. The JIT pool ran out again at about t+160 s: TAIL REFUSED #1-5, and a browser worker thread (tid 018c, not the UI thread this time) took the 0xdead fault. So the client and its Chromium UI alone fill the 896 MB pool within a few minutes.
+
+The ml1380 crypt32 diagnostic did not reach the server chains. Its 16-chain budget was spent by rootstore's import self-check, which validates each bundled root as a one-element chain with CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL (flags=4). Those chains are now skipped. The one failure logged there is itself informative: e-Szigno TLS Root CA 2023 has status 0x8 (CERT_TRUST_IS_NOT_SIGNATURE_VALID, not relevant to Let's Encrypt), so Wine rejects at least one bundled root's self-signature. No [cert-policy] failure appeared in any process, so steam.exe's rejection is not a failed CertVerifyCertificateChainPolicy call.
+
+Interpretation of the refusal (inference): Steam shows this message when an app, or content it depends on, needs an update before it can start. A client that has never reached a connection manager may have no current app information for 220, so it cannot confirm Madeira's appmanifest and cannot fetch anything. Madeira's install record also has no SharedDepots section, because shared-install redistributable depots are skipped. Both are hypotheses. No install-record or depot-selection behavior is changed without the client's own reason.
+
+Evidence feeds:
+- content_log.txt is mirrored like connection_log.txt: [steam-contentlog] ml1390, own 96-line budget, SteamIDs and IPv4 addresses masked. The Steam keyword prefilter now also accepts appid/depot/update/state. Those keywords cost a path lookup per text write, so they stop being used after 16384 lookups that were not a Steam log. MADEIRA_STEAM_LOG_MIRROR=0 still disables all of it.
+- Before each Windows-client launch: [steam-acf] ml1390 with StateFlags, buildid, TargetBuildID, UpdateResult, InstalledDepots id:manifest and SharedDepots, read with the existing bounded VDF parser (MADEIRA_STEAM_ACF_LOG=0).
+- On each native install: [steam-depot] ml1390 selection, listing every depot with osarch and whether it was selected or skipped (os/dlc/shared/nomanifest/lowviolence/lang/arch).
+- crypt32 [cert-chain] ml1380 skips one-element cache-only chains, so server chains are logged.
+
+The owner asked about -no-browser / steam://open/minigameslist (a 2021 post). Valve ended support for -no-browser in the January 2023 client (Steam Client Beta announcement). The remaining community workarounds rename steamwebhelper files, which Madeira does not do, and the current client's login and dialogs are web UI.
+
+Validation: host checks (9 suites) pass under ASan/UBSan. Native ntdll 35/35 and win32u 46/46. crypt32 i386/aarch64/arm64ec rebuilt with 0 missing imports. The IPA printed "IPA verified". .xtool/verify-ml1390.py passes 40 checks: sync, tags in the archive and binary, fresh and changed crypt32 copies, and only the executable, seal and crypt32 changed. No Wine, Steam or Windows program ran on this PC.
+
+Artifact: 155865408 bytes; 2026-09-22T23:05:52.661428-05:00; SHA-256 1bf6a83f22d50ddf12dc9e8ce17a4b2e53d99fb6b974a9c5ec2cd1195df86fb0.
+Publication: Wine e531b4d537a pushed to 125hz/wine ios-build first; root implementation 8941eb7 pushed to 125hz/Madeira main before this record. No upstream push or PR. Logs: .xtool/logs/ml1390-{native,pe32,pe64,checks,ipa,verify}.log.
