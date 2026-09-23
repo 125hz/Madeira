@@ -429,6 +429,28 @@ manifest IDs; MADEIRA_STEAM_ACF_LOG=0 disables). New installs log every depot an
 why it was selected or skipped ([steam-depot] ml1390 selection). The crypt32
 verdict log no longer spends its budget on the root-store self-check.
 
+### ml1400: why the client never reached Steam's servers
+
+Log 169's certificate verdicts named the cause. Every api.steampowered.com chain
+in steam.exe built correctly (leaf, YR1, Root YR, ISRG Root X1; no revocation
+errors) but ended with CERT_TRUST_IS_UNTRUSTED_ROOT on ISRG Root X1, although
+the same process had validated chains earlier. Madeira's native crypt32 side is
+shared by every Windows process, and its host-root enumerator gave each
+certificate out once and then freed it. The first process to import roots used
+up the list, the next process's import saw no host roots, and Wine's root sync
+deleted the previously imported roots from the registry. The enumerator now
+keeps the bundle and gives every caller the full list
+(MADEIRA_ROOT_ENUM_SHARED=0 restores the old behavior; [root-enum] ml1400 logs
+each completed enumeration).
+
+The same log explains the update refusal. content_log.txt says
+"Failed running app 220 (required app 380 not ready)", and Steam rewrote HL2's
+record to StateFlags 6 with SharedDepots 340, 380, 389 and 420 (Lost Coast,
+Episode One, Episode Two). HL2 now depends on content that Steam installs as
+those apps, and Madeira's downloader does not install it. Once the client is
+online it can download them itself. Installing them from Madeira's downloader
+is a follow-up; the selection log now marks such depots (<appid).
+
 `-no-browser` / `steam://open/minigameslist` (a 2021 tip) does not apply: Valve
 removed -no-browser in January 2023, and the current client's login and dialogs
 are all steamwebhelper pages.

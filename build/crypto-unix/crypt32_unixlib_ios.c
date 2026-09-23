@@ -850,6 +850,105 @@ static void load_root_certs(void)
         import_certs_from_path( CRYPT_knownLocations[i], TRUE );
 }
 
+/* iOS-Madeira ml1400: PER-CALLER ENUMERATION OF THE HOST ROOTS.
+ *
+ * Upstream hands out the head of root_cert_list and frees it, which is right
+ * when every process has its own unix side. Here every pseudo-process shares
+ * this one, so the first process to import roots consumed the whole bundle
+ * and every later import saw none. rootstore.c then treats certificates it
+ * imported earlier but no longer sees on the host as removed there, and
+ * deletes them from HKLM\...\SystemCertificates\Root. Device log 169: the
+ * Windows Steam client (pid 0034) validated its first server chains, then
+ * after the browser helper's crypt32 started, every api.steampowered.com
+ * chain ended at ISRG Root X1 with CERT_TRUST_IS_UNTRUSTED_ROOT (0x20), and
+ * the client never reached its servers.
+ *
+ * The list is now kept for the whole session and each enumerating thread has
+ * its own position. The rootstore loop runs on one thread and calls until
+ * STATUS_NO_MORE_ENTRIES, asking again for the same certificate after growing
+ * its buffer, so the position advances only when a certificate was copied. It
+ * is dropped at the end of the list, and a position idle for more than 10 s is
+ * restarted, so an interrupted enumeration cannot truncate a later one.
+ * MADEIRA_ROOT_ENUM_SHARED=0 restores the consuming behavior. */
+#include <pthread.h>
+#include <stdint.h>
+#include <time.h>
+#define IOS_ROOT_CURSORS 32
+static struct { uintptr_t thread; unsigned int index; unsigned long long stamp; } ios_root_cursor[IOS_ROOT_CURSORS];
+static pthread_mutex_t ios_root_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static unsigned long long ios_root_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (unsigned long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int ios_root_enum_shared(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        const char *env = getenv( "MADEIRA_ROOT_ENUM_SHARED" );
+        enabled = !env || strcmp( env, "0" );
+    }
+    return enabled;
+}
+
+static NTSTATUS ios_enum_root_certs_shared( struct enum_root_certs_params *params )
+{
+    static unsigned int reported;
+    uintptr_t self = (uintptr_t)pthread_self();
+    unsigned long long now = ios_root_now_ms();
+    unsigned int i, slot = IOS_ROOT_CURSORS, oldest = 0, n = 0;
+    struct list *ptr;
+    NTSTATUS status;
+
+    pthread_mutex_lock( &ios_root_lock );
+    for (i = 0; i < IOS_ROOT_CURSORS; i++)
+    {
+        if (ios_root_cursor[i].thread == self) { slot = i; break; }
+        if (ios_root_cursor[i].stamp < ios_root_cursor[oldest].stamp) oldest = i;
+    }
+    if (slot == IOS_ROOT_CURSORS)
+    {
+        slot = oldest;
+        ios_root_cursor[slot].thread = self;
+        ios_root_cursor[slot].index = 0;
+    }
+    else if (now - ios_root_cursor[slot].stamp > 10000) ios_root_cursor[slot].index = 0;
+    ios_root_cursor[slot].stamp = now;
+
+    LIST_FOR_EACH( ptr, &root_cert_list )
+        if (n++ == ios_root_cursor[slot].index) break;
+    if (ptr == &root_cert_list)
+    {
+        if (reported < 16)
+        {
+            reported++;
+            dprintf( 2, "[root-enum] ml1400 thread=%#lx served=%u of %u host roots\n",
+                     (unsigned long)self, ios_root_cursor[slot].index, n );
+        }
+        ios_root_cursor[slot].thread = 0;
+        ios_root_cursor[slot].index = 0;
+        ios_root_cursor[slot].stamp = 0;
+        status = STATUS_NO_MORE_ENTRIES;
+    }
+    else
+    {
+        struct root_cert *cert = LIST_ENTRY( ptr, struct root_cert, entry );
+        *params->needed = cert->size;
+        if (cert->size <= params->size)
+        {
+            memcpy( params->buffer, cert->data, cert->size );
+            ios_root_cursor[slot].index++;
+        }
+        status = STATUS_SUCCESS;
+    }
+    pthread_mutex_unlock( &ios_root_lock );
+    return status;
+}
+
 static NTSTATUS enum_root_certs( void *args )
 {
     struct enum_root_certs_params *params = args;
@@ -857,9 +956,12 @@ static NTSTATUS enum_root_certs( void *args )
     struct list *ptr;
     struct root_cert *cert;
 
+    pthread_mutex_lock( &ios_root_lock );
     if (!loaded) load_root_certs();
     loaded = TRUE;
+    pthread_mutex_unlock( &ios_root_lock );
 
+    if (ios_root_enum_shared()) return ios_enum_root_certs_shared( params );
     if (!(ptr = list_head( &root_cert_list ))) return STATUS_NO_MORE_ENTRIES;
     cert = LIST_ENTRY( ptr, struct root_cert, entry );
     *params->needed = cert->size;

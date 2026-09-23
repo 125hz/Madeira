@@ -56,6 +56,9 @@ struct SteamAppInfo {
         var language: String = ""
         /// `config.lowviolence "1"`: regional alternate content.
         var lowViolence: Bool = false
+        /// Madeira ml1400: `depotfromapp`: the depot belongs to another app and
+        /// the Windows client installs it as that app ("required app N").
+        var fromApp: UInt32? = nil
 
         /// Check if depot is for the specified OS
         func supports(os: String) -> Bool {
@@ -142,7 +145,8 @@ struct SteamAppInfo {
             else if d.lowViolence { why = "lowviolence" }
             else if !d.language.isEmpty && d.language.caseInsensitiveCompare(language) != .orderedSame { why = "lang" }
             else { why = "arch" }
-            return "\(d.depotID)[\(d.osarch.isEmpty ? "-" : d.osarch)]\(why)"
+            let from = d.fromApp.map { "<\($0)" } ?? ""
+            return "\(d.depotID)[\(d.osarch.isEmpty ? "-" : d.osarch)]\(why)\(from)"
         }.joined(separator: ",")
     }
 
@@ -252,6 +256,9 @@ struct SteamAppInfo {
                     di.dlcAppID = dlc
                 }
                 di.isSharedInstall = (depot["sharedinstall"] as? String) == "1"
+                if let from = (depot["depotfromapp"] as? String).flatMap(UInt32.init), from != appID {
+                    di.fromApp = from
+                }
                 if let manifests = depot["manifests"] as? [String: Any] {
                     for (branch, entry) in manifests {
                         if let gidStr = entry as? String, let gid = UInt64(gidStr) {

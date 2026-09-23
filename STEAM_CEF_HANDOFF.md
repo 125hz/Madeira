@@ -204,6 +204,16 @@ ECDSA P-384 signature verification through bcrypt, or SSL policy. `[cert-chain]`
 ml1380 diagnostics in crypt32 (all three PE builds) will name it. Also: the UI thread died of JIT
 pool exhaustion (896 MB, 32 carves / 738 MB tail, `free=0`, 0xdead fault) → frozen "Play anyway".
 
+**ml1400 — §2.3 ROOT CAUSE FOUND (log 169).** `[cert-chain]`: steam.exe's api.steampowered.com chains
+build fully (leaf ← YR1 ← Root YR ← ISRG Root X1, revocation clean) but X1 carries
+CERT_TRUST_IS_UNTRUSTED_ROOT (0x20), after earlier chains in the same process were trusted. Cause:
+`build/crypto-unix/crypt32_unixlib_ios.c` `enum_root_certs` popped+freed each host root — correct for
+per-process unix sides, wrong for Madeira's single shared unix side: the first importing pseudo-process
+drained the list, the next saw zero host roots, and rootstore's sync deleted the imported roots from
+HKLM\...\Root. Fixed with a persistent list and per-thread enumeration cursor (`MADEIRA_ROOT_ENUM_SHARED=0`
+rollback). The long-standing "Failed to start auth session: result 3" / PingWebSocketCM failures are
+expected to follow from this. Device-unverified.
+
 ---
 
 ## 3. Solved walls (context — these are done, and the *methods* may be reusable)
