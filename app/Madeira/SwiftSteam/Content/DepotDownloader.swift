@@ -68,9 +68,12 @@ final class DepotDownloader {
     /// appmanifest. Returns the install folder. Throws CancellationError when
     /// the calling task is cancelled; completed chunks stay journaled.
     func install(_ app: SteamAppInfo, steamApps: URL,
+                 ownedDepots: @escaping () async -> Set<UInt32>? = { nil },
                  progress report: @escaping (SteamDownloadProgress) -> Void) async throws -> URL {
         let depots = app.installDepots()
         guard !depots.isEmpty else { throw SteamError.depotNotFound(app.appID) }
+        // Before the key requests, so a refused depot still has its selection logged.
+        SteamLog.event("[steam-depot] ml1390 selection app=\(app.appID) build=\(app.buildID) \(app.depotSelectionSummary())")
 
         let folderName = Self.safeFolderName(app.installDir.isEmpty ? "app_\(app.appID)" : app.installDir)
         let installURL = steamApps.appendingPathComponent("common", isDirectory: true)
@@ -90,10 +93,25 @@ final class DepotDownloader {
         let health = ContentHostHealth(enabled: LibraryFlags.enabled("MADEIRA_STEAM_HOST_HEALTH"))
         let pool = Array(hosts.prefix(hostPoolSize))
         var plans: [DepotPlan] = []
+        var licenseSkipped: [UInt32] = []
         for depot in depots {
             try Task.checkCancellation()
             guard let gid = depot.publicManifestID else { continue }
-            let key = try await depotKey(depotID: depot.depotID, appID: app.appID)
+            let key: Data
+            do {
+                key = try await depotKey(depotID: depot.depotID, appID: app.appID)
+            } catch SteamError.depotKeyNotFound(let refused) where LibraryFlags.enabled("MADEIRA_STEAM_LICENSE_DEPOTS") {
+                // ml1410: a depot Steam refuses AND the account's licenses do
+                // not include is content this account does not own (another
+                // edition, extra content); leave it out as Valve's
+                // DepotDownloader does. Any other refusal still fails.
+                // MADEIRA_STEAM_LICENSE_DEPOTS=0 fails on every refusal.
+                if let owned = await ownedDepots(), !owned.isEmpty, !owned.contains(refused) {
+                    licenseSkipped.append(refused)
+                    continue
+                }
+                throw SteamError.depotKeyNotFound(refused)
+            }
             let manifest = try await fetchManifest(depotID: depot.depotID, appID: app.appID,
                                                    manifestGID: gid, key: key, hosts: hosts)
             var auth: [String: String] = [:]
@@ -104,7 +122,13 @@ final class DepotDownloader {
                                    hosts: pool, auth: auth,
                                    declaredSize: depot.publicSizeBytes, health: health))
         }
-        guard !plans.isEmpty else { throw SteamError.depotNotFound(app.appID) }
+        if !licenseSkipped.isEmpty {
+            SteamLog.event("[steam-depot] ml1410 license app=\(app.appID) skipped=\(licenseSkipped.map(String.init).joined(separator: ",")) kept=\(plans.map { String($0.depotID) }.joined(separator: ","))")
+        }
+        guard !plans.isEmpty else {
+            if let refused = licenseSkipped.first { throw SteamError.depotKeyNotFound(refused) }
+            throw SteamError.depotNotFound(app.appID)
+        }
 
         // 2. Prepare files and load journals off the main actor.
         let prepared = try await Task.detached(priority: .userInitiated) {
@@ -115,7 +139,6 @@ final class DepotDownloader {
         state.phase = .downloading
         report(state)
         SteamLog.event("[steam-depot] ml1310 install begin app=\(app.appID) depots=\(plans.count) files=\(prepared.fileCount) resume=\(prepared.doneBytes > 0 ? 1 : 0)")
-        SteamLog.event("[steam-depot] ml1390 selection app=\(app.appID) build=\(app.buildID) \(app.depotSelectionSummary())")
 
         let remaining = prepared.remainingUncompressed
         if remaining > 0 {
@@ -507,6 +530,7 @@ final class DepotDownloader {
         // Steam only issues keys for depots this account owns.
         guard EResult(rawValue: UInt32(keyResponse.eresult))?.isSuccess == true,
               keyResponse.depotEncryptionKey.count == 32 else {
+            SteamLog.event("[steam-depot] ml1410 depot-key refused app=\(appID) depot=\(depotID) eresult=\(keyResponse.eresult)")
             throw SteamError.depotKeyNotFound(depotID)
         }
 

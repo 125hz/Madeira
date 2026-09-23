@@ -377,7 +377,8 @@ final class SteamAccountModel: ObservableObject {
                 throw SteamError.appInfoNotFound(UInt32(appID))
             }
             try FileManager.default.createDirectory(at: SteamInstallPaths.common, withIntermediateDirectories: true)
-            let folder = try await downloader.install(info, steamApps: SteamInstallPaths.steamApps) { [weak self] progress in
+            let folder = try await downloader.install(info, steamApps: SteamInstallPaths.steamApps,
+                                                      ownedDepots: { [weak self] in try? await self?.fetcher.ownedDepotIDs() }) { [weak self] progress in
                 self?.downloads[appID]?.progress = progress
             }
             try await completeInstall(info, folder: folder)

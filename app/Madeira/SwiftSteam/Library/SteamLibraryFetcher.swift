@@ -49,6 +49,33 @@ class SteamLibraryFetcher {
         return games
     }
 
+    /// Madeira ml1410: depot IDs included in the account's licenses, from the
+    /// same package info the library uses (`depotids`). Valve's DepotDownloader
+    /// uses this to leave out depots an account does not own; the installer
+    /// consults it only when Steam refuses a depot key. Cached per session.
+    private var ownedDepotCache: Set<UInt32>?
+    func ownedDepotIDs() async throws -> Set<UInt32> {
+        if let cached = ownedDepotCache { return cached }
+        try await session.ensureConnected()
+        let packageIDs = try await fetchLicenseList()
+        let tokens = try await fetchPICSAccessTokens(packageIDs: packageIDs)
+        var depots = Set<UInt32>()
+        for start in stride(from: 0, to: packageIDs.count, by: 50) {
+            var request = CMsgClientPICSProductInfoRequest()
+            request.packages = packageIDs[start..<min(start + 50, packageIDs.count)].map {
+                CMsgClientPICSProductInfoRequest.PackageInfo(packageid: $0, accessToken: tokens[$0] ?? 0)
+            }
+            let responses = try await session.sendAndWaitPICS(eMsg: .clientPICSProductInfoRequest,
+                                                              body: request.serialize(), timeout: 30)
+            for response in responses {
+                let pics = try CMsgClientPICSProductInfoResponse.deserialize(from: response.body)
+                for pkg in pics.packages { depots.formUnion(VDFParser.parsePackageIDs(key: "depotids", from: pkg.buffer)) }
+            }
+        }
+        ownedDepotCache = depots
+        return depots
+    }
+
     /// Fetch PICS info for a single app on demand — used by the install
     /// panel to surface the download size before the user commits to an
     /// install. Connects the session if needed (it may sit idle-disconnected)
@@ -253,12 +280,17 @@ enum VDFParser {
 
     /// Extract app IDs from a binary VDF package info buffer
     static func parsePackageAppIDs(from data: Data) -> [UInt32] {
+        parsePackageIDs(key: "appids", from: data)
+    }
+
+    /// Madeira ml1410: the same scan for any id list in a package ("appids",
+    /// "depotids").
+    static func parsePackageIDs(key searchKey: String, from data: Data) -> [UInt32] {
         var appIDs: [UInt32] = []
         var offset = 0
 
-        // Look for "appids" section and extract UInt32 values
+        // Look for the requested section and extract UInt32 values
         // This is a simplified parser that searches for known patterns
-        let searchKey = "appids"
         if let range = findKey(searchKey, in: data) {
             offset = range
             // After "appids" key, we expect sub-keys with numeric names and uint32 values

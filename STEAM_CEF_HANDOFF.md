@@ -214,6 +214,24 @@ HKLM\...\Root. Fixed with a persistent list and per-thread enumeration cursor (`
 rollback). The long-standing "Failed to start auth session: result 3" / PingWebSocketCM failures are
 expected to follow from this. Device-unverified.
 
+**ml1410 — ml1400 CONFIRMED (log 170): steam.exe logged on** (GetCMListForConnect, WebSocket pings,
+`RecvMsgClientLogOnResponse() : processing complete`), started the 340/380/420 downloads, lost the CM
+once (`ConnectionDisconnected('I/O Operation Failed')`, 27018 WebSocket) and re-logged on 9 s later.
+The freeze after it was a **wineserver use-after-free**: `[srv-own] read_request EOF tid=0240 pid=0060 ->
+kill_thread` (kill_thread does not cancel the thread's asyncs), then `list_remove` in
+`cancel_process_async` faulted (`req_cancel_async+0x158`, the store after `cancel_async()`). Inferred
+path (not observed): `async_terminate` → `thread_queue_apc` does not queue (owner TERMINATED; the
+other-thread fallback depends on `is_in_apc_wait`/`send_thread_signal`) → APC destroy →
+`async_set_result` → last ref dropped inside `cancel_async()`. Fix: hold a ref across the cancel; a request completed during its
+own cancel gets no `async_cancel` (explicit `ios_completed` bit, because a pending non-blocking async is
+already `signaled`). `MADEIRA_ASYNC_CANCEL_HOLD=0`; ASan host test reproduces the UAF with rollback.
+**Log 171: "Unexpected Transport Error (0x3000)"** = steam.exe↔steamwebhelper loopback transport. Two
+AcceptEx listeners (52649/52650) accepted both connections; both got the 554-byte upgrade request; only
+52650 was read (the 52649 side, which in logs 169/170 carries the 27 KB exchange, logged no read). Later
+webhelper retries to 52649 show only refused `[::1]` attempts. New `[loopback-wait] ml1410` (server:
+recv verdict / AFD poll / read-queue wake per loopback socket) and `[loopback-io] ml1410 recv-would-block`
+will split "never requested" / "pending, wake lost" / "woken, no data". OPEN.
+
 ---
 
 ## 3. Solved walls (context — these are done, and the *methods* may be reusable)

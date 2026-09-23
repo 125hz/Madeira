@@ -133,6 +133,21 @@ func appVDF(_ body: String) -> Data { Data(("\"appinfo\" { \"appid\" \"10\" " + 
         """#))!
         require(!tool.installableOnWindows, "tools and redistributables are not offered")
 
+        // ml1410: package depot lists (binary VDF) and depots installed from another app.
+        func le(_ v: UInt32) -> [UInt8] { [UInt8(v & 0xff), UInt8(v >> 8 & 0xff), UInt8(v >> 16 & 0xff), UInt8(v >> 24)] }
+        var pkg: [UInt8] = [0x00] + Array("appids".utf8) + [0, 0x02] + Array("0".utf8) + [0] + le(7000) + [0x08]
+        pkg += [0x00] + Array("depotids".utf8) + [0, 0x02] + Array("0".utf8) + [0] + le(7001)
+        pkg += [0x02] + Array("1".utf8) + [0] + le(7002) + [0x08]
+        require(VDFParser.parsePackageIDs(key: "depotids", from: Data(pkg)) == [7001, 7002], "package depot ids")
+        require(VDFParser.parsePackageAppIDs(from: Data(pkg)) == [7000], "package app ids unchanged")
+        let shared = SteamAppInfo.parse(appID: 7100, from: appVDF(#"""
+        "common" { "name" "Shared" "type" "Game" "oslist" "windows" }
+        "depots" { "7101" { "manifests" { "public" "71011" } } "7109" { "depotfromapp" "7108" } }
+        """#))!
+        require(shared.depots.first { $0.depotID == 7109 }?.fromApp == 7108 && shared.installDepots().map(\.depotID) == [7101],
+                "depotfromapp parsed; borrowed depot not installed")
+        require(shared.depotSelectionSummary().contains("7109[-]nomanifest<7108"), "selection log marks the owning app")
+
         // Manifest paths.
         var folded: [String: String] = [:]
         for bad in ["../x", "a/../b", "a/./b", "C:/x", "a/b\u{1}c", "", "////"] {

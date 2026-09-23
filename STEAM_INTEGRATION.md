@@ -465,6 +465,57 @@ sign-in, separate from Madeira's native sign-in, and then signs in automatically
 on later launches if "Remember me" is kept. Madeira does not copy its token into
 the Windows client's encrypted credential files.
 
+## Online, then a frozen session: ml1410
+
+Log 170 confirmed ml1400. The client fetched its server list, pinged the
+WebSocket servers and logged on ("RecvMsgClientLogOnResponse() : processing
+complete"). It then started downloading the shared content (apps 340, 380 and
+420) that the game now needs. Its connection dropped once ("I/O Operation Failed") and it logged
+on again by itself 9 seconds later.
+
+The freeze that followed was the wineserver crashing, which stops every Windows
+process at once. A web helper thread had exited
+(`read_request EOF -> kill_thread`), and the server then faulted in
+`cancel_process_async()` on the list update right after `cancel_async()`
+(`req_cancel_async+0x158`). Cancelling queues a completion to the owning
+thread. The source shows that when the completion cannot be queued it runs at
+once and can free the request inside `cancel_async()`, which fits the fault;
+the log does not show that step directly. The server now holds a reference to each
+request across its cancellation. A request that completes during its own
+cancellation gets no cancel wait attached, since nothing would ever release it
+(`MADEIRA_ASYNC_CANCEL_HOLD=0` restores the old loop; `[async-cancel] ml1410`
+logs each case). The host test reproduces the use-after-free under ASan with the
+rollback.
+
+Log 171 (the relaunch) stopped at "Unexpected Transport Error (0x3000)". That
+dialog is about the local link between steam.exe and steamwebhelper, not
+Steam's servers. The web helper opened its two usual loopback connections, and
+steam.exe accepted both. The web helper sent its 554-byte upgrade request on
+each. steam.exe read and answered one; nothing was ever read from the other. Logs
+169 and 170 show both being read at once. The existing probe records only
+completed transfers, so ml1410 adds `[loopback-wait] ml1410` in the wineserver:
+read requests with the server's verdict, poll requests and read-queue wake-ups,
+for loopback stream sockets only, 12 lines per socket
+(`MADEIRA_LOOPBACK_WAIT_TRACE=0`). It also logs the first receive per loopback
+connection that would block (`[loopback-io] ml1410 ... recv-would-block`). The
+next occurrence will show whether steam.exe never asked for the data, asked and
+was never woken, or was woken without it. Choosing "Restart Steam" in that
+dialog is the workaround.
+
+Installing another game from Madeira's library (log 172) failed with "Steam did
+not allow this account to download": Steam refused the first depot key it was
+asked for. Valve's own DepotDownloader leaves out depots the account's licenses
+do not include (another edition, extra content). Madeira now does the same, but
+only when Steam refuses a key: it reads the licensed depot IDs from the same
+package info the library uses, skips a refused depot the licenses do not
+include, and still fails on any other refusal
+(`MADEIRA_STEAM_LICENSE_DEPOTS=0` fails on every refusal).
+`[steam-depot] ml1410 depot-key refused` names the depot and Steam's result
+code, and `[steam-depot] ml1410 license` lists what was skipped. The depot
+selection (`ml1390 selection`) is now logged before the key requests, so a
+refusal still shows the layout. Device-unverified: if the refused depot is one
+the licenses include, the log will show that, and the cause is elsewhere.
+
 ## References
 
 - [Valve's official client download](https://store.steampowered.com/about/)
