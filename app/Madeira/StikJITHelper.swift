@@ -226,7 +226,30 @@ enum StikJITHelper {
     ///
     /// Idempotent per app run: the first call allocates, every later call returns
     /// the same pool (see the CachedPool note above).
+    /// ml1440: the requested size, then smaller ones if no home is found. The
+    /// pool must be one contiguous range in [0x119000000, 64 GB) outside the
+    /// guest window, and that band is fragmented differently on every launch.
+    /// Device log 178: the largest usable holes were 697 and 608 MB, so the
+    /// 896 MB request (ml1420 asks for it whenever the library has Windows
+    /// Steam client entries) failed twice and Wine never started. A smaller
+    /// pool that starts beats none; 512 MB is the direct-launch default.
+    /// MADEIRA_POOL_FALLBACK=0 restores fail-at-the-requested-size.
     static func allocatePool(poolSize: Int = 128 * 1024 * 1024) -> (rx: UnsafeMutableRawPointer, rw: UnsafeMutableRawPointer, size: Int)? {
+        if let pool = allocatePoolSized(poolSize: poolSize) { return pool }
+        guard LibraryFlags.enabled("MADEIRA_POOL_FALLBACK"), !debuggerDetached, cachedPool == nil else { return nil }
+        let MiB = 1024 * 1024
+        for mb in [768, 640, 512] where mb * MiB < poolSize {
+            LogStore.shared.log("[jit-pool] ml1440 no home for \(poolSize / MiB)MB; trying \(mb)MB")
+            if let pool = allocatePoolSized(poolSize: mb * MiB) {
+                LogStore.shared.log("[jit-pool] ml1440 fell back to \(mb)MB (asked \(poolSize / MiB)MB)", level: .success)
+                return pool
+            }
+            if debuggerDetached { break }
+        }
+        return nil
+    }
+
+    private static func allocatePoolSized(poolSize: Int) -> (rx: UnsafeMutableRawPointer, rw: UnsafeMutableRawPointer, size: Int)? {
         poolLock.lock()
         defer { poolLock.unlock() }
         poolSession += 1
@@ -419,12 +442,18 @@ enum StikJITHelper {
             while h + poolSize <= guestLo && hints.count < 160 { hints.append(h); h += 0x40000000 }
 
             var probes = 0
+            var refused: [String] = []   // ml1440: first refusals, to tell "occupied" from "not allocatable"
             for hint in hints {
                 guard placementIsGood(hint) else { continue }
                 probes += 1
                 var got = vm_address_t(hint)
-                guard vm_allocate(mach_task_self_, &got, vm_size_t(poolSize), VM_FLAGS_FIXED) == KERN_SUCCESS,
-                      got == vm_address_t(hint) else { continue }
+                let akr = vm_allocate(mach_task_self_, &got, vm_size_t(poolSize), VM_FLAGS_FIXED)
+                guard akr == KERN_SUCCESS, got == vm_address_t(hint) else {
+                    if refused.count < 6 && (refused.isEmpty || hint >= 0x200000000) {
+                        refused.append(String(format: "0x%lx:kr%d", hint, akr))
+                    }
+                    continue
+                }
                 attempts += 1
                 let blessed = jit26_prepare_region(UnsafeMutableRawPointer(bitPattern: hint), poolSize)
                 let ok = blessed != nil && Int(bitPattern: blessed!) == hint
@@ -439,7 +468,8 @@ enum StikJITHelper {
                 vm_deallocate(mach_task_self_, got, vm_size_t(poolSize))
             }
             if rxPtrOpt == nil {
-                LogStore.shared.log("[jit-pool] hinted placement found no home in [0x119000000, 0x7000000000) after \(probes) probes")
+                LogStore.shared.log("[jit-pool] hinted placement found no home in [0x119000000, 0x7000000000) after \(probes) probes" +
+                                    " for \(poolSize / 1024 / 1024)MB; refused: \(refused.joined(separator: " "))")
             }
         }
 

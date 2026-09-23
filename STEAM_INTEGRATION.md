@@ -664,6 +664,24 @@ The fix (FEX WoW64 module, `xtajit.dll`):
 state, the first resumes and anything declined. `[gen-sweep]` now shows
 32-bit moves too.
 
+**ml1440: no pool at all (logs 178, prev17).** Placement failed twice and Wine
+never started ("The session could not start").
+
+- The debugger's own pick was 0x7000000000, inside the guest window.
+- None of the 160 fixed-address probes fit 896 MB. The usable holes above
+  0x119000000 were 697, 608 and 292 MB. The map's "517 GB hole" above them
+  comes from a region walk truncated at 200,001 entries, and everything from
+  64 GB up is the GPU carve-out.
+- ml1420 made this likelier: a library with Windows client entries now asks
+  for 896 MB at start.
+
+Placement now falls back to 768, 640 and then 512 MB when the requested size
+has no home. A pool that starts beats none, and with ml1430 the client should
+need far less than 896 MB. `MADEIRA_POOL_FALLBACK=0` restores failing at the
+requested size. The "no home" line now also lists the first `vm_allocate`
+refusals, to tell occupied ranges from unallocatable ones. Workaround for
+older builds: `Documents/madeira-pool.txt` containing `640`.
+
 Also: the download banner sat under the clock and battery when the game view
 was in portrait. The HUD's reported top inset was zero while the status bar
 showed, so its top overlays now use the status bar's height when it is larger.
