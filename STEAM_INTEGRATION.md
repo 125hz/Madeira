@@ -619,6 +619,55 @@ The 0x3000 transport trace from ml1410 worked in log 175: both loopback
 connections completed, with steam.exe reading through non-blocking forced-async
 receives woken by `wake-read`.
 
+## ml1430: the Steam client runs the code pool dry
+
+Log 177 (ml1420). The client started with the full 896 MB pool and showed its
+download progress (202 MB of 3.8 GB). About a minute later the desktop stopped
+responding. Proven from the log:
+
+- FEX's code buffers had reserved 720 MB of the pool: 30 buffers, all live, 17
+  of them 32 MB. Images used 85 MB. FEX's next buffer was refused, and a thread
+  died at the deliberate out-of-pool fault.
+- That thread was holding FEX's shared lock
+  (`[deliver-hold] ... HOLDS FEX shared lock`). Every other thread of that
+  process that needed new code then waited forever. The ml1420 unwind guard
+  fired once (`[unwind-stall]`), so the endless spin of log 175 did not recur.
+
+Why 720 MB (proven from source):
+
+- Each process shares one code buffer. When it fills, a new generation
+  replaces it, and an old generation is freed only when no thread still holds
+  it.
+- The ml460 sweeper moves idle threads to the newest generation. Only FEX's
+  64-bit (ARM64EC) side ever registered threads with it. There, a system call
+  leaves translated code.
+- The client and its browser helpers are 32-bit (WoW64). There a system call
+  is a call out of a translated block, so a thread blocked in a wait has a
+  return address into its generation and could never be moved.
+- Chromium keeps hundreds of threads parked in waits, and one process was
+  on generation 16.
+
+The fix (FEX WoW64 module, `xtajit.dll`):
+
+- 32-bit threads now register with the sweeper.
+- While a thread is blocked in an outermost-level system call, it is marked
+  movable.
+- If the sweeper moves it, the call returns to FEX's permanent dispatcher
+  instead of the old block. This is equivalent because these calls always end
+  their block: the block only refills registers and dispatches at the address
+  the call left in the thread state.
+- Callbacks that re-enter translated code, nested calls, and a stack that does
+  not match are never moved, so the change can only free memory and never
+  redirect a return it cannot account for.
+
+`MADEIRA_WOW_SYSCALL_SWEEP=0` disables it. `[wow-sweep] ml1430` logs the switch
+state, the first resumes and anything declined. `[gen-sweep]` now shows
+32-bit moves too.
+
+Also: the download banner sat under the clock and battery when the game view
+was in portrait. The HUD's reported top inset was zero while the status bar
+showed, so its top overlays now use the status bar's height when it is larger.
+
 ## References
 
 - [Valve's official client download](https://store.steampowered.com/about/)

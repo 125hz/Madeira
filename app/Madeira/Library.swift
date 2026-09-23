@@ -826,7 +826,15 @@ struct LibraryStatus: View {
     @State private var memory = false
     let ticks = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
     var body: some View {
-        HStack(spacing: 14) { status("JIT", jit); status("Memory+", memory) }
+        HStack(spacing: 14) {
+            status("JIT", jit); status("Memory+", memory)
+            // ml1420: which build is installed (BuildStamp, ContentView.swift).
+            if BuildStamp.visible {
+                Text(BuildStamp.text).font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(Color(.systemGray2)).lineLimit(1).minimumScaleFactor(0.7)
+                    .accessibilityLabel("Build \(BuildStamp.text)")
+            }
+        }
             .onAppear { update() }.onReceive(ticks) { _ in update() }
     }
     private func status(_ label: String, _ enabled: Bool) -> some View {
@@ -1517,6 +1525,15 @@ struct LibraryFloatingItem: View {
 }
 
 struct LibraryHUD: View {
+    /// ml1430: top offset for the overlays pinned to the top edge. This HUD ignores the safe
+    /// area, and with the game view in portrait its reported top inset came out as zero while
+    /// the status bar was showing, so the download banner sat under the clock and battery.
+    /// The larger of the reported inset and the visible status bar's height is used.
+    static func topInset(_ geo: GeometryProxy) -> CGFloat {
+        let bar = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }?.statusBarManager?.statusBarFrame.height ?? 0
+        return max(geo.safeAreaInsets.top, bar)
+    }
     @ObservedObject private var model = LibraryModel.shared
     @ObservedObject private var controls = TouchControlsModel.shared
     @ObservedObject private var input = InputSettings.shared
@@ -1538,8 +1555,8 @@ struct LibraryHUD: View {
                         .scaleEffect(launchVisible || reduceMotion || !launchPolish ? 1 : 0.96)
                 }
                 if !model.launching && model.performance { LibraryFloatingItem(isMenu: false, viewport: geo.size, insets: geo.safeAreaInsets) }
-                if model.liveLogs && !model.launching { LibraryLiveLogs().frame(maxWidth: 550, maxHeight: 140).padding(.top, geo.safeAreaInsets.top + 60).padding(.horizontal, 12).allowsHitTesting(false) }
-                if !model.sessionMessage.isEmpty { Text(model.sessionMessage).font(.caption).padding(10).background(.regularMaterial, in: Capsule()).frame(maxWidth: .infinity).padding(.top, geo.safeAreaInsets.top + 12).allowsHitTesting(false) }
+                if model.liveLogs && !model.launching { LibraryLiveLogs().frame(maxWidth: 550, maxHeight: 140).padding(.top, Self.topInset(geo) + 60).padding(.horizontal, 12).allowsHitTesting(false) }
+                if !model.sessionMessage.isEmpty { Text(model.sessionMessage).font(.caption).padding(10).background(.regularMaterial, in: Capsule()).frame(maxWidth: .infinity).padding(.top, Self.topInset(geo) + 12).allowsHitTesting(false) }
                 // ml1420: once the starting screen is gone (the Steam window
                 // itself presents frames), keep showing an active download.
                 if !model.launching && !model.menu, let progress = steamProgress.progress, progress.working {
@@ -1547,7 +1564,7 @@ struct LibraryHUD: View {
                         .padding(.horizontal, 14).padding(.vertical, 10)
                         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
                         .frame(maxWidth: 420).padding(.horizontal, 16).frame(maxWidth: .infinity)
-                        .padding(.top, geo.safeAreaInsets.top + (model.sessionMessage.isEmpty ? 12 : 56))
+                        .padding(.top, Self.topInset(geo) + (model.sessionMessage.isEmpty ? 12 : 56))
                         .allowsHitTesting(false)
                 }
                 if !model.launching { LibraryFloatingItem(isMenu: true, viewport: geo.size, insets: geo.safeAreaInsets) }

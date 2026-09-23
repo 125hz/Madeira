@@ -251,6 +251,29 @@ will split "never requested" / "pending, wake lost" / "woken, no data". OPEN.
 - 64-bit Unity title black screen (log 174): 7 M emulated stores (anon RWX served as R+X pool
   aliases). The durable plain-RW design is written up for ml1430 (needs FEX 16 KB SMC rounding).
 
+**ml1430 — THE STEAM POOL WALL (log 177).**
+- Symptom: the 896 MB pool is still exhausted — tail 720 MB, 30 live carves (17×32 MB), head 85 MB.
+  Then `EXEC ALLOC FAILED` → 0xdead on tid 02b4 while holding the FEX shared lock (`[deliver-hold]`) →
+  process deadlock → desktop frozen.
+- Root cause: generation pinning. `CodeBufferManager` is per process, and old generations live until
+  every thread's `CurrentCodeBuffer` moves on. The ml460 sweeper (CPUBackend.cpp
+  `IosMaybeSweepCodeBuffers`) only had ARM64EC threads registered (Module.cpp:1998). WoW64 syscalls
+  are a BLR out of the emitted block (BranchOps.cpp `DEF_OP(Syscall)`), so blocked threads pin their
+  generation.
+- Fix:
+  - WoW64 `BTCpuThreadInit` registers (`IosSweepRegisterThreadEx`, new `Migrated` flag) and points
+    `Pointers.SyscallHandlerFunc` at `IosWowSyscallEntry`.
+  - `HandleSyscallImpl` parks (`IosInSim=0`) around `Wow64SystemServiceEx` / `WineUnixCall` for
+    depth-0 syscalls whose `ReturningStackLocation` lies within 8 KB above the caller SP.
+  - A moved thread returns via `mov sp, RSL; mov x1, #0; br LoopTopFillSRA`.
+- Why the redirect is equivalent:
+  - `int 0x2e` bridges carry `FLAGS_BLOCK_END` on `_WIN32`.
+  - `SyscallOp` exits with RIP loaded from the context.
+  - OS_GENERIC writes no result.
+  - `FillStaticRegs` covers every SRA register.
+  - `ENTRY_FILL_SRA_SINGLE_INST_REG` is x1 on non-EC.
+- `MADEIRA_WOW_SYSCALL_SWEEP=0`. check-wow-sweep.py covers the invariants and the parking model. Device-unverified.
+
 ---
 
 ## 3. Solved walls (context — these are done, and the *methods* may be reusable)
