@@ -218,6 +218,7 @@ Add these settings to `madeira-env.txt` when needed:
 | --- | --- |
 | `MADEIRA_STEAM=0` | Disable Steam integration and Steam-managed launches. Existing direct-executable entries are unaffected. |
 | `MADEIRA_STEAM_COMPAT=0` | Omit the client launch flags `-no-cef-sandbox -cef-disable-gpu -nocrashmonitor` for an A/B test. Existing native CEF policy is unchanged. |
+| `MADEIRA_APC_REQUEUE=0` | Restore dropping an I/O completion step for a busy thread (ml1480). Diagnostic rollback: reintroduces empty accepts and 0-byte reads. |
 | `MADEIRA_STEAM_LIGHT=0` | Omit the ml1470 client flags `-cef-disable-hang-timeouts -nooverlay -nofriendsui -noshaders`. |
 | `MADEIRA_STEAM_ORDERED_CLIENT=0` | Do not give the Windows Steam client FEX's stricter ordering (ml1470). Chromium helpers still get it. |
 | `MADEIRA_ORDERED_PROFILE=0` | Turn off FEX's stricter ordering profile for every process (ml1470). |
@@ -802,6 +803,51 @@ for the Windows Steam client and other launchers:
 
 Cost: the client and its helper run slower with Multiblock off. The game is
 unaffected.
+
+## ml1480: the root cause, a dropped I/O completion step
+
+**Log 184 (ml1470 build).** The stricter ordering was active in both client
+processes (`[ordered-profile] … reason=listed` and `reason=chromium-host`),
+and "unexpected error during startup" still appeared. `[accept-chain]` caught
+it:
+
+```
+[accept-chain] ml1460 accepted; completion goes to thread 0094 (alive, in server wait=0)
+[accept-chain] ml1460 result status=00000101 pending=1 port=1 posted=1 value=38c0180
+[accept-chain] ml1460 completion APC status=00000101 to thread 0094 queued=0
+```
+
+The client never read that connection. The helper sent its 554-byte request
+and waited.
+
+What happened. When an overlapped operation becomes ready, the server queues
+a system APC to the thread that started it, and that thread's ntdll does the
+client half: the actual `recv`, or fetching an accept's addresses. A thread
+that is not waiting in the server has to be interrupted. Upstream does that
+with SIGUSR1, but on iOS `send_thread_signal` always fails, because there is
+no per-process task port. So the APC was dropped, and the async completed with
+the APC's own status, `STATUS_ALERTED` (0x101), and 0 bytes. The program saw:
+- an accept that "succeeded" with nothing filled in (the startup error);
+- for a receive, a successful read of 0 bytes, which every TCP program treats
+  as the peer closing.
+
+This hits any program whenever data or a connection arrives while the issuing
+thread is busy. It fits the WebSocket drops too: a 0-byte TCP read ends the
+session, while a UDP session ignores an empty datagram. That the WebSocket
+drops share this cause is not yet proven.
+
+**Fix (`[apc-requeue] ml1480`, wineserver).** An async I/O APC for a thread
+that cannot be signalled is:
+- given to another thread of the same process that is waiting in the server;
+- or, if no thread is waiting, kept queued on the issuing thread, which runs it
+  at its next server wait.
+
+The client half is not tied to the issuing thread (upstream already hands it
+over when that thread has exited). The server wakes only one alerted async per
+socket queue at a time, so ordering is unchanged. Other system APCs keep the
+upstream behaviour. `MADEIRA_APC_REQUEUE=0` restores dropping. The log line
+prints the first 32 handovers and every 1024th after that, with the APC
+status, so the next log also shows how often this was happening.
 
 ## References
 

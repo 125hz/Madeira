@@ -289,6 +289,19 @@ will split "never requested" / "pending, wake lost" / "woken, no data". OPEN.
   seen stale is one mechanism for wrong destinations with otherwise-correct pixels (hypothesis).
   `MADEIRA_ORDERED_PROFILE=0`.
 
+**ml1480 — ROOT CAUSE OF THE UNREAD CONNECTIONS (log 184).** The ordered profile was active and the error
+still came. `[accept-chain]`: accept for thread 0094 while it was busy (`in server wait=0`), completion
+APC `queued=0`, result posted as `STATUS_ALERTED` (0x101). The client never read that socket.
+- On iOS `send_thread_signal` always fails (`get_process_port` is `trace_data`, always 0). So
+  `queue_apc` returned 0 for any system APC to a thread not in an interruptible server wait, and
+  `thread_apc_destroy` completed the async with the APC status (`STATUS_ALERTED`, 0 bytes). For a
+  recv that is a 0-byte success, i.e. EOF. That plausibly explains the WebSocket CM drops too (UDP
+  shrugs off empty datagrams). Hypothesis until a log shows it.
+- Fix in `wine/server/thread.c` `queue_apc`, iOS only: APC_ASYNC_IO that cannot be signalled goes to
+  a same-process thread in an interruptible, non-suspended server wait, else stays queued on the
+  issuer. `[apc-requeue] ml1480`, `MADEIRA_APC_REQUEUE=0`. check-apc-requeue.py compiles the
+  production `queue_apc`.
+
 ---
 
 ## 3. Solved walls (context — these are done, and the *methods* may be reusable)
