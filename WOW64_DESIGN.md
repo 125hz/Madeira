@@ -14530,3 +14530,33 @@ Validation:
 
 Artifact: 155,940,300 bytes; 2026-09-23 02:27:53 CDT; SHA-256 6eab7165ca535b14da3079ed075cd3ec0370870108a9ea6f2c16e71c89fd31e8.
 Publication: root implementation 68adc87 pushed to 125hz/Madeira main before this record (submodules unchanged). No upstream push or PR. Logs: .xtool/logs/ml1440-{checks,ipa,verify}.log.
+
+
+### 2026-09-23 - ml1450: how remote TCP connections end ([tcp-end]), saved errno on socket error paths
+
+Device result for ml1440 (log 179, taken live while the session ran). Proven:
+- **ml1430 works on device.** The early pool placed at 896 MB. `[wow-sweep] ml1430 syscall parking on` appears in every 32-bit process, and parked threads were resumed at the dispatcher after moves. `[gen-sweep]` ran to gen 54, moving 45-49 of 54 threads per sweep. The tail kept 4-5 of 12 carves free, with no TAIL REFUSED, no out-of-pool fault and no freeze; the user reported the app stayed responsive.
+- Some threads are declined as "not parked: dispatcher sp X caller sp Y" with RSL about 0xdf0 below the caller. They stay pinned, as designed (inferred: a stale value left by a nested entry).
+
+The Steam download bar stuck at 238 MB because the download stalled. Proven from the mirrored Steam logs:
+- The client logged on at 02:29:58 and started depot 420 (3065 chunks) at 02:30:00, raising connections at rate 13.5 → 29.1.
+- The CM WebSocket (27018) then dropped with `ConnectionDisconnected('I/O Operation Failed')` 8 s after logon. In the same second the client's own HTTP test of test.steampowered.com/204 failed ("HTTP fetch failed"). It reconnected at 02:30:10, logged on and dropped again at once.
+- At 02:30:50: `BYieldingGetServersForSteamPipe failed (Transport Response Not Received / Result No Connection)` and `Failed to get list of download sources`.
+- The CM socket (fd 1391) carried normal traffic through its last [sock-tl] snapshot and was then closed; fd 1391 was reused for a new port-443 connection 50 lines later. No socket error or peer close was recorded anywhere, so the cause is unknown.
+- The connection-log mirror had spent all 96 lines within 15 s of the first logon.
+- There were no EMFILE markers, and the highest fd seen was 1989 (so fd exhaustion is not supported, not excluded).
+
+Changes:
+- **`[tcp-end] ml1450`.** Stream sockets with a non-loopback peer; 48 lines per app lifetime each side; MADEIRA_TCP_END_TRACE=0.
+  - ntdll socket.c ios_tcp_end_trace logs a zero-byte receive (peer closed) and any receive/send error other than would-block/EINTR, with local port, peer port and errno. Loopback is decided from the LOCAL address, because getpeername fails after a reset, which the host test showed: the first version silently skipped exactly the reset case. The peer port is printed as 0 when the peer is gone.
+  - wineserver sock.c ios_tcp_close_trace in sock_destroy logs a connected remote socket's last close, with age and hangup/rd_shut/wr_shut/reset/aborted. This tells a program-initiated close of a healthy connection apart from one that had already failed.
+- **Saved errno.** In try_recv/try_send the error path handed each probe (ios_sock_big_note, ios_sock_wire, ios_sock_tl, ios_loopback_io) a freshly read errno and then returned sock_errno_to_status(errno). The probes call getpeername/getsockname, which set errno when they fail, as on a reset connection, so the status the program saw could become "not connected" instead of "connection reset". The call's own error is now saved once and passed everywhere, including the returned status.
+- **Steam log mirror.** IOS_STEAM_MIRROR_LINES = 320 for connection_log.txt and content_log.txt (was 96 each); both stay keyword-filtered.
+
+Validation:
+- The host suites pass (ASan/UBSan), including new check-tcp-end. Part A covers source invariants for the saved errno and the server close hook. Part B runs the production tracer on real sockets through a non-loopback interface address: peer close and reset (ECONNRESET, peer port 0) are logged; data, would-block, zero-length sends, loopback and datagram sockets are not; the 48-line cap holds; the rollback is silent.
+- Native ntdll 35/35, win32u 46/46, server sock compiled. The IPA printed "IPA verified". .xtool/verify-ml1450.py passes 25 checks: workspace sync, archive and binary tags, the Info.plist label, same entry list as ml1440, only the executable and Info.plist (and seal) changed.
+- No Wine, Steam or Windows program ran on this PC. The new lines are device-unverified.
+
+Artifact: 155,941,709 bytes; 2026-09-23 02:46:46 CDT; SHA-256 ea4a27f570aa4ccd9c38421bcb275a74ac153c3adaa8d76c06e25eef7d6af343.
+Publication: wine b0e58b3d98f pushed to 125hz/wine ios-build, then root implementation 20a3a4b (gitlink to b0e58b3d98f) pushed to 125hz/Madeira main before this record. No upstream push or PR. Logs: .xtool/logs/ml1450-{native,checks,ipa,verify}.log.
