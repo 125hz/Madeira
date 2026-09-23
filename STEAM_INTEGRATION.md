@@ -391,6 +391,30 @@ is not yet established.
   such atomics through the page's writable alias (MADEIRA_ALIAS_LSE_ATOMICS=0
   restores the old behavior; [lse-emul] ml1370).
 
+### ml1380: what the connection log showed
+
+Log 167 (first run with the mirror) shows the client's connection-manager
+sequence directly. The server-list Web API call fails with "status = 0" after
+8–43 s, and every WebSocket ping and connect fails at once ("timeout/neterror -
+Invalid", then ConnectFailed with port 0). DNS and TCP work, and the TLS
+handshake completes: steam.exe sends its Finished message without an alert,
+then closes without sending the WebSocket upgrade, while Windows' cryptnet
+(certificate retrieval and revocation) is active. So the client rejects the
+server certificate in a CryptoAPI check after the handshake. Steam's servers
+use Let's Encrypt's 2026 "Gen Y" chain (YE2/YR1 intermediates, Root YE/YR
+cross-signed by ISRG Root X2/X1). OpenSSL validates both chains against
+Madeira's bundle, and the issuer URL serves the cross-signed Root YE, so a
+missing root is not the explanation. crypt32 now logs its chain and policy
+verdicts ([cert-chain] / [cert-policy] ml1380, first 16 per process,
+certificate names and status bits only; WINEDEBUG=err-chain turns them off),
+so the next log names the exact failing check.
+
+The same log also shows the browser's UI thread ending when Madeira's 896 MB
+JIT code pool was full ("TAIL REFUSED", fault at 0xdead). That is why "Play
+anyway" stopped responding. The Steam client plus its Chromium UI can fill the
+pool on its own. Earlier sessions did not, so it depends on what the UI is
+doing.
+
 The red "Steam no longer supports running on 32-bit Windows" banner is
 expected. Madeira reports an ARM64 machine, and Steam treats real Windows on
 ARM64 PCs the same way (it runs its 32-bit client there too). The 32-bit client

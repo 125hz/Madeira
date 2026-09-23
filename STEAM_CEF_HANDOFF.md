@@ -190,6 +190,20 @@ the RW alias (`ios_lse_atomic_op`). New evidence feeds: `[steam-connlog]` (conne
 masked) and `[loopback-io]`. The "32-bit Windows" banner matches real Windows-on-ARM64 behavior
 (native ARM64 reported) and is not a defect.
 
+**ml1380 — §2.3 narrowed with Steam's own connection log (log 167).** GetCMListForConnect
+Web API: `status = 0` after 8–43 s. PingWebSocketCM to cmp1-iad1/lax1 (443 and 27018): fails in
+the same second, `timeout/neterror - Invalid`; Connect() → `ConnectFailed … (x.x.x.x:0)`. On the
+wire: TCP connects, TLS 1.3 handshake completes including the client Finished, no alert, then no
+WebSocket Upgrade (ml590's observation, now explained): the client rejects the peer after the
+handshake via CryptoAPI (cryptnet active at that moment). Server chains = Let's Encrypt Gen Y:
+leaf ← YE2 ← Root YE (cross-signed by ISRG Root X2) ← X2 (cross-signed by X1); api.steampowered.com
+leaf ← YR1 ← Root YR (cross by X1). OpenSSL validates both with Madeira's cacert.pem; AIA
+`ye.i.lencr.org` serves the CROSS-SIGNED Root YE, so "missing Root YE/YR" is refuted. Candidates
+left: revocation (CRL DPs ye2.c.lencr.org/117.crl, ye.c.lencr.org, x2.c.lencr.org; no OCSP),
+ECDSA P-384 signature verification through bcrypt, or SSL policy. `[cert-chain]`/`[cert-policy]`
+ml1380 diagnostics in crypt32 (all three PE builds) will name it. Also: the UI thread died of JIT
+pool exhaustion (896 MB, 32 carves / 738 MB tail, `free=0`, 0xdead fault) → frozen "Play anyway".
+
 ---
 
 ## 3. Solved walls (context — these are done, and the *methods* may be reusable)
