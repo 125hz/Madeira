@@ -1,4 +1,4 @@
-# Madeira licensing: the assembled iOS app (DRAFT 2026-09-16, for review)
+# Madeira licensing: the assembled iOS app (working document of 2026-09-16, updated 2026-09-24; not legal advice)
 
 This is a working document by the Madeira author, not legal advice. It
 records what the shipped app contains, under which terms, and which
@@ -12,11 +12,11 @@ Statically linked into the main executable (`Madeira` / `Madeira.debug.dylib`):
 | Component | Upstream licence | Madeira changes | Notes |
 |---|---|---|---|
 | Wine unix side (ntdll, wineserver, win32u, wineios.drv) from the `wine` fork (branch `madeira-lgpl`) and `build/*-unix` | LGPL-2.1-or-later | LGPL-2.1-or-later (rebuilt from upstream wine-11.4, see `docs/wine-lgpl-provenance.md`); the earlier GPL-converted branch is retired | statically linked |
-| FEXCore and helpers (`FEX/build-ios/*.a`), including the rpmalloc fork under FEX/External | MIT (rpmalloc: 0BSD) | GPL-3.0-or-later + draft additional permission (Will Faust commits; Ryan Houdek rpmalloc commits stay 0BSD) | statically linked |
-| DXMT unix side + airconv (`libdxmt_combined.a`) | MIT | GPL-3.0-or-later + draft additional permission | statically linked |
+| FEXCore and helpers (`FEX/build-ios/*.a`), including the rpmalloc fork under FEX/External | MIT (rpmalloc: 0BSD) | GPL-3.0-or-later + additional permission (Will Faust commits; Ryan Houdek rpmalloc commits stay 0BSD) | statically linked |
+| DXMT unix side + airconv (`libdxmt_combined.a`) | MIT | GPL-3.0-or-later + additional permission | statically linked |
 | LLVM (inside `libdxmt_combined.a`) | Apache-2.0 with LLVM exception | none | statically linked |
 | gnutls 3.8.9, nettle 3.10.1, hogweed 3.10.1, gmp 6.3.0 | LGPL-2.1+ / dual LGPL-3+ or GPL-2+ / dual LGPL-3+ or GPL-2+ | none; Madeira elects LGPL-3.0-or-later for the dual-licensed three | statically linked; LGPL obligations apply; sources tracked in build/gnutls-ios/src |
-| Madeira app (Swift/ObjC), native D3D12 runtime (`madeira_d3d12.dll`, PE) | GPL-3.0-or-later + draft additional permission | author-owned | |
+| Madeira app (Swift/ObjC), native D3D12 runtime (`madeira_d3d12.dll`, PE) | GPL-3.0-or-later + additional permission | author-owned | |
 
 Dynamically loaded at runtime (dlopen; this is NOT a GPL-compatibility
 exemption, the combination is still a combined work, see the GNU FAQ on
@@ -31,9 +31,9 @@ plugins):
 ## Obligations that follow
 
 1. **GPL-3.0 code combined with the proprietary converter.** Allowed only
-   where the copyright holder grants an additional permission. Proposed
-   for author-owned code in `LICENSE-EXCEPTION.md`; not effective until
-   adopted in a tagged release. NOT grantable for upstream
+   where the copyright holder grants an additional permission. Granted
+   for author-owned code in `LICENSE-EXCEPTION.md` (adopted 2026-09-24,
+   before the first public push). NOT grantable for upstream
    Wine code in the GPL-converted fork; hence the LGPL branch.
 2. **LGPL components statically linked (Wine on the LGPL branch, gnutls,
    nettle, hogweed, gmp).** LGPL-2.1 s.6 / LGPL-3 s.4 require, for the
@@ -76,7 +76,7 @@ plugins):
   missing inputs and the reconstructed recipes are in `docs/BUILDING.md`.
   Still open: re-executing every UNVERIFIED step there from scratch, then
   signing and installing.
-- DONE 2026-09-16: the bundle carries `licenses/` (GPL-3.0, the draft
+- DONE 2026-09-16: the bundle carries `licenses/` (GPL-3.0, the
   exception, LGPL-2.1, LGPL-3.0, MIT, 0BSD, LLVM texts and
   THIRD-PARTY-NOTICES.txt); `build/stage-licenses.sh` refreshes the two
   generated copies and the Xcode build fails if they are stale.

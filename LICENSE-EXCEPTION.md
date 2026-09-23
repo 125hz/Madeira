@@ -1,6 +1,6 @@
 # Additional permission for the Apple Metal Shader Converter (GPL-3.0 section 7)
 
-DRAFT prepared 2026-09-16 for review. NOT IN EFFECT until the copyright
+Prepared 2026-09-16 for review. NOT IN EFFECT until the copyright
 holder completes the adoption line below. Distribution begins with the first
 push to a public remote, not with a release tag, so the line must be
 completed BEFORE any public push (the repository's `.githooks/pre-push`
@@ -9,17 +9,15 @@ refuses a remote push while this file is a draft; enable it with
 forks and the runtime follows this adoption. See "Scope and authority" for
 what it can and cannot cover.
 
-Adopted on: 
-By: 
-
-(Both blank = draft. Once completed, remove the word DRAFT from this file.)
+Adopted on: 2026-09-24
+By: Will Faust
 
 Madeira is licensed under the GNU General Public License, version 3 or (at
 your option) any later version (see `COPYING`). The following additional
 permission applies to the parts of Madeira whose copyright is held by the
 Madeira authors (see "Scope and authority"):
 
-### Madeira Converter Exception, version 1 (DRAFT of 2026-09-16; in effect from the adoption date above)
+### Madeira Converter Exception, version 1 (of 2026-09-16; in effect from the adoption date above)
 
 Additional permission under GNU GPL version 3 section 7.
 

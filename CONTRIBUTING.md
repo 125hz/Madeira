@@ -20,7 +20,7 @@ prohibits AI-generated code; see the note in `README.md`.
 Madeira links with Apple's proprietary Metal Shader Converter library and
 Apple system frameworks. Contributions to this repository are accepted under
 GPL-3.0-or-later **with the Madeira Converter Exception, version 1** (the
-additional permission in `LICENSE-EXCEPTION.md`, a draft of 2026-09-16 that
-takes effect when its adoption line is completed, before any public push), so that the combination
+additional permission in `LICENSE-EXCEPTION.md`, prepared 2026-09-16 and
+adopted on 2026-09-24, before any public push), so that the combination
 can be conveyed. By submitting a contribution you
 agree that your contribution carries that additional permission too.
