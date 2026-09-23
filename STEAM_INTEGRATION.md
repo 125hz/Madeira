@@ -218,6 +218,9 @@ Add these settings to `madeira-env.txt` when needed:
 | --- | --- |
 | `MADEIRA_STEAM=0` | Disable Steam integration and Steam-managed launches. Existing direct-executable entries are unaffected. |
 | `MADEIRA_STEAM_COMPAT=0` | Omit the client launch flags `-no-cef-sandbox -cef-disable-gpu -nocrashmonitor` for an A/B test. Existing native CEF policy is unchanged. |
+| `MADEIRA_STEAM_LIGHT=0` | Omit the ml1470 client flags `-cef-disable-hang-timeouts -nooverlay -nofriendsui -noshaders`. |
+| `MADEIRA_STEAM_ORDERED_CLIENT=0` | Do not give the Windows Steam client FEX's stricter ordering (ml1470). Chromium helpers still get it. |
+| `MADEIRA_ORDERED_PROFILE=0` | Turn off FEX's stricter ordering profile for every process (ml1470). |
 | `MADEIRA_STEAM_STAGED_INSTALL=0` | Restore automatic launch immediately after downloading/importing the installer. |
 | `MADEIRA_SECTION_PROCESS_LIMIT=0` | Restore the old shared WoW address ceiling for native section mappings (diagnostic rollback). |
 | `MADEIRA_FD_CACHE_RELEASE_FIX=0` | Restore the old descriptor-cache retirement behavior (diagnostic rollback; can close another process's descriptor). |
@@ -706,6 +709,82 @@ New in ml1450:
   - The server logs when a program closes a connected socket, with its age and whether a hangup, shutdown, reset or error had been seen first.
 - **Saved errno on socket error paths.** The existing probes query the socket after a failed receive or send, and on a reset connection those queries fail and overwrite errno. The status returned to the program could then say "not connected" instead of "connection reset". Every probe and the returned status now use the call's own error.
 - **Mirror budget.** The Steam connection-log and content-log mirrors now keep up to 320 lines each (was 96).
+
+## ml1460–ml1470: "unexpected error during startup", and what GameNative does
+
+**Log 181 (ml1450 build).** The client showed "Steam encountered an unexpected
+error during startup" after a few minutes.
+
+What the log proves:
+- The error is the client losing its own helper. The Chromium helper opened
+  new connections to the client's loopback listener at about 25 s and 4 min.
+  The server accepted and delivered each one, and the helper sent its
+  554-byte upgrade request. The client never issued a receive or a poll on
+  any of them.
+- `[tcp-end]` shows the CM WebSocket closed by the client itself about 7 s
+  after the first logon (`closed by program … age=7s`), with no hangup, reset
+  or error on the socket. The reconnect held. Most other `[tcp-end]` lines are
+  short HTTPS connections the client closes on purpose.
+- The ml1410 cancel hold fired 8 times without a crash.
+
+Not proven: why the client never picks up the accepted connections. Two
+explanations fit:
+- a completion lost between the server and the thread that should run it;
+- a message lost between the client's threads.
+
+**ml1460: follow one accept end to end.** `[accept-chain] ml1460` (wineserver,
+48 lines per app lifetime, `MADEIRA_ACCEPT_CHAIN_TRACE=0` disables it) marks
+each accept on a loopback listener and logs, for that accept only:
+- which thread the completion goes to, and whether that thread is waiting in
+  the server;
+- whether the completion APC was queued;
+- the result, including whether it was posted to a completion port, and with
+  what value;
+- whether and how (immediately or after a wait) a thread took that value off
+  the port.
+
+The first missing step in the next log shows where the chain breaks.
+
+**GameNative.** Jfishin, whose Steam work Madeira's is based on, referenced
+[GameNative](https://github.com/utkarshdalal/GameNative) heavily. What it does
+for the Windows Steam client and other launchers:
+- **Stricter FEX ordering for the client and its helper.** GameNative's FEX
+  configuration gives Chromium-based launcher processes Multiblock off and x86
+  ordering for vector accesses as well as normal ones (VectorTSOEnabled,
+  HalfBarrierTSOEnabled). Madeira's 32-bit default orders normal accesses only
+  (log 181: `VectorTSOEnabled=0 Multiblock=1` in both Steam processes).
+  Chromium passes messages through shared memory, so a message published with a
+  vector store can be seen before its contents. That fits "the helper spoke and
+  the client never heard".
+- **A long list of client flags** that turn off the overlay, friends window,
+  shader pre-caching, crash handlers and Chromium's hang timeouts.
+- Its Steam-without-the-client mode (a Steam API emulator and a stub loader)
+  is not used. It replaces Steam's DRM, and Madeira runs the real client.
+
+**ml1470: what Madeira took.**
+- **`[ordered-profile] ml1470`** (FEX, 32-bit). A process gets the stricter
+  profile (Multiblock=0, VectorTSOEnabled=1, HalfBarrierTSOEnabled=1) when
+  either:
+  - `libcef.dll` or `chrome_elf.dll` sits next to its executable (any Chromium
+    host, found by what it is, not by name), or
+  - its executable name is listed in `MADEIRA_ORDERED_PROFILE_EXES` (the user's
+    list) or `MADEIRA_ORDERED_PROFILE_CLIENT`. Madeira sets the latter to the
+    client's executable for a Windows-client launch, so the client gets the
+    helper's ordering and the games it starts keep the fast default.
+
+  An option set in `madeira-fex.txt` is never replaced. `[fex-cfg]` marks the
+  profile's own settings as `(ordered-profile)`. `MADEIRA_ORDERED_PROFILE=0`
+  turns it off in FEX; `MADEIRA_STEAM_ORDERED_CLIENT=0` stops Madeira naming
+  the client.
+- **Lighter client flags.** `-cef-disable-hang-timeouts -nooverlay
+  -nofriendsui -noshaders` are added to Windows-client launches (not to the
+  installer). `MADEIRA_STEAM_LIGHT=0` omits them.
+- Not taken yet: `-cef-single-process` and GameNative's other Chromium flags.
+  They change how the helper is built up and would make any result harder to
+  read. Revisit if the stricter ordering alone does not stop the startup error.
+
+Cost: the client and its helper run slower with Multiblock off. The game is
+unaffected.
 
 ## References
 

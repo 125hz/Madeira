@@ -273,6 +273,21 @@ will split "never requested" / "pending, wake lost" / "woken, no data". OPEN.
   - `FillStaticRegs` covers every SRA register.
   - `ENTRY_FILL_SRA_SINGLE_INST_REG` is x1 on non-EC.
 - `MADEIRA_WOW_SYSCALL_SWEEP=0`. check-wow-sweep.py covers the invariants and the parking model. Device-unverified.
+- Log 179 confirmed it: 54 generations, 45-49 of 54 threads moved per sweep, the pool healthy.
+
+**ml1460/ml1470 — HELPER CONNECTIONS NEVER READ (log 181).**
+- Symptom: "unexpected error during startup". The webhelper's later connections to steam.exe's
+  loopback listener (~25 s, ~4 min) were accepted and delivered in the server, and the helper sent its
+  554-byte request. steam.exe never issued a recv or poll on them.
+- ml1460 `[accept-chain]` (server, `MADEIRA_ACCEPT_CHAIN_TRACE=0`) follows each marked loopback accept:
+  APC queued → result → IOCP post (value) → dequeue (immediate / after wait). This locates the break.
+- ml1470 `[ordered-profile]` (FEX WoW64): Multiblock=0, VectorTSOEnabled=1, HalfBarrierTSOEnabled=1 for
+  any process with `libcef.dll`/`chrome_elf.dll` beside its exe, or named in
+  `MADEIRA_ORDERED_PROFILE_EXES` / `_CLIENT` (the app names the Steam client). This follows GameNative's
+  FEX profile for launcher/CEF processes. Madeira's default had VectorTSO=0 and Multiblock=1 in both
+  processes. It might also bear on §7's Skia destination-pointer question: a vector-published pointer
+  seen stale is one mechanism for wrong destinations with otherwise-correct pixels (hypothesis).
+  `MADEIRA_ORDERED_PROFILE=0`.
 
 ---
 

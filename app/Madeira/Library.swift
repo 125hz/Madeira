@@ -139,13 +139,18 @@ struct LibraryEntry: Codable, Identifiable {
         guard usesSteam else { return arguments }
         let compatibility = steamSession != "installer" && LibraryFlags.enabled("MADEIRA_STEAM_COMPAT")
             ? " -no-cef-sandbox -cef-disable-gpu -nocrashmonitor" : ""
+        // ml1470: a lighter client, after GameNative's Steam profile: no hang watchdog to kill a
+        // helper that is slow under emulation, no overlay injected into games, no friends window and
+        // no shader pre-cache downloads. MADEIRA_STEAM_LIGHT=0 omits these flags.
+        let light = steamSession != "installer" && LibraryFlags.enabled("MADEIRA_STEAM_LIGHT")
+            ? " -cef-disable-hang-timeouts -nooverlay -nofriendsui -noshaders" : ""
         let mode: String
         // ml1360: a game launch keeps Steam's library window closed (-silent);
         // sign-in and error windows still appear. MADEIRA_STEAM_SILENT=0 shows it.
         let silent = LibraryFlags.enabled("MADEIRA_STEAM_SILENT") ? " -silent" : ""
         if let id = steamAppID { mode = steamInstalled == false ? " steam://install/\(id)" : silent + " -applaunch \(id)" }
         else { mode = steamBigPicture == true ? " -gamepadui" : "" }
-        return "/desktop=madeira,\(resolution) \"\(steamClientWindowsPath)\"" + compatibility + mode + (arguments.isEmpty ? "" : " " + arguments)
+        return "/desktop=madeira,\(resolution) \"\(steamClientWindowsPath)\"" + compatibility + light + mode + (arguments.isEmpty ? "" : " " + arguments)
     }
     static let desktopID = UUID(uuidString: "AF046C35-C32A-497B-92BC-0BBD14F8CB61")!
     static var desktopEntry: LibraryEntry {
@@ -200,6 +205,16 @@ struct LibraryEntry: Codable, Identifiable {
         setenv("MADEIRA_EXE", desktop == true || usesSteam ? "explorer.exe" : windowsPath, 1)
         setenv("MADEIRA_ARGS", launchArguments, 1)
         if desktop == true || usesSteam { setenv("MADEIRA_DESKTOP", "1", 1) } else { unsetenv("MADEIRA_DESKTOP") }
+        // ml1470: the Steam client trades messages with its Chromium helper, which FEX already
+        // runs with stricter ordering (found by its libcef.dll). Give the client the same; the
+        // games it starts keep the default. MADEIRA_STEAM_ORDERED_CLIENT=0 turns this off.
+        let client = steamClientWindowsPath.split(separator: "\\").last.map(String.init) ?? ""
+        if usesSteam, !client.isEmpty, LibraryFlags.enabled("MADEIRA_STEAM_ORDERED_CLIENT") {
+            setenv("MADEIRA_ORDERED_PROFILE_CLIENT", client, 1)
+            LogStore.shared.log("[ordered-profile] ml1470 Steam client \(client) gets the stricter ordering")
+        } else {
+            unsetenv("MADEIRA_ORDERED_PROFILE_CLIENT")
+        }
     }
 }
 
