@@ -14500,3 +14500,33 @@ Validation:
 
 Artifact: 155,937,563 bytes; 2026-09-23 02:13:35 CDT; SHA-256 8b95c35c33e8c4e320f300799c2ba4f7583beaafe2f498eeab9fea29e8c27cd1.
 Publication: FEX 2dd0c11c3 pushed to 125hz/FEX ios-port-2607, then root implementation b15fe33 (gitlink to 2dd0c11c3) pushed to 125hz/Madeira main before this record. No upstream push or PR. Logs: .xtool/logs/ml1430-{fex,checks,ipa,verify}.log.
+
+
+### 2026-09-23 - ml1440: JIT pool placement falls back to smaller sizes
+
+Device result for ml1430 (logs 178, prev17, screenshot). The Library now shows the build label (`ml1430 · 09-23 02:09`). Neither launch could start Wine ("The session could not start").
+
+Proven from the logs:
+- The early pool (896 MB, "last session") and the session's own attempt both failed placement.
+- Phase 1: the debugger's ANYWHERE pick was 0x7000000000 / 0x7038000000, inside the guest 64 GB window. It was rejected and blocked.
+- Phase 2: none of the 160 FIXED probes in [0x119000000, 0x7000000000) was allocatable for 896 MB.
+- The va-map's usable holes above the mode-A floor were 697, 608 and 292 MB (log 178) and 677 and 605 MB (prev17). In log 177 the same request had fit at 0x119400000.
+- The map's "517934 MB hole" above 0x18d130000 is not evidence of free space: the region walk was truncated at 200001 entries, and [64 GB, 448 GB) is the GPU carve-out.
+- Inferred: why every probe between 0x200000000 and 64 GB was refused is unknown, because the probe loop did not log refusals.
+- ml1420's 896 MB floor for libraries with Windows client entries made this failure likelier. Before it, the startup size usually followed a 512 MB direct launch.
+
+Fix (StikJITHelper.swift):
+- allocatePool tries the requested size, then 768, 640 and 512 MB, but only while the debugger is attached and no pool is cached.
+- The placement body is unchanged, now allocatePoolSized. Each fallback runs both phases again (about 2.4 s of debugger round trip per size in the worst case).
+- `[jit-pool] ml1440 no home for N MB; trying M MB` / `fell back to M MB`. MADEIRA_POOL_FALLBACK=0 restores failing at the requested size.
+- The Phase 2 "no home" line now carries the size and the first six vm_allocate refusals (address:kr, sampling above 0x200000000), so the next log can tell "occupied" from "not allocatable".
+- Why a smaller pool is acceptable now: ml1430 lets the sweeper free pinned WoW64 generations, so the Steam client's steady-state tail should be a few generations per process rather than 720 MB. That is device-unverified.
+- Workaround for ml1420/ml1430: Documents/madeira-pool.txt with `640` (the override skips the floor).
+
+Validation:
+- The host suites pass (no native change).
+- The IPA printed "IPA verified". .xtool/verify-ml1440.py passes 20 checks: generated StikJITHelper.swift in sync with the fallback, binary tags, the Info.plist label, the ml1430 xtajit.dll carried unchanged, and only the executable and Info.plist (and its seal) changed.
+- No Wine, Steam or Windows program ran on this PC. Device-unverified.
+
+Artifact: 155,940,300 bytes; 2026-09-23 02:27:53 CDT; SHA-256 6eab7165ca535b14da3079ed075cd3ec0370870108a9ea6f2c16e71c89fd31e8.
+Publication: root implementation 68adc87 pushed to 125hz/Madeira main before this record (submodules unchanged). No upstream push or PR. Logs: .xtool/logs/ml1440-{checks,ipa,verify}.log.
