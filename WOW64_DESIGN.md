@@ -14605,3 +14605,47 @@ Validation:
 
 Artifact: 155,945,593 bytes; 2026-09-23 03:19:10 CDT; SHA-256 e623d3175e166ab9c2ab1b749282b30fe8b771469d2aef34dcfa5ab241b2f401.
 Publication: FEX e6f628092 pushed to 125hz/FEX ios-port-2607; wine b124bc42e69 pushed to 125hz/wine ios-build; then root implementation 1b7f222 (gitlinks to both) pushed to 125hz/Madeira main before this record. No upstream push or PR. Logs: .xtool/logs/ml1460-native.log, ml1470-{checks,fex,ipa,verify}.log.
+
+
+### 2026-09-23 - ml1480: async I/O APCs for busy threads are handed over instead of dropped ([apc-requeue])
+
+Device result for ml1470 (log 184). Proven:
+- `[ordered-profile] ml1470` applied Multiblock=0, VectorTSOEnabled=1, HalfBarrierTSOEnabled=1 to steam.exe (reason=listed) and steamwebhelper.exe (reason=chromium-host), and `[fex-cfg]` agrees. "Unexpected error during startup" still appeared, so ordering was not the cause.
+- `[accept-chain]` caught the failure on the 4th loopback accept:
+  - the accept for thread 0094 completed while that thread was not in a server wait;
+  - its APC_ASYNC_IO was not queued (`queued=0`);
+  - the result was posted to the completion port with status 0x101 (STATUS_ALERTED), and thread 0090 dequeued it;
+  - steam.exe never issued a receive on that connection. The helper sent its 554-byte request and waited.
+  The three accepts whose thread was in a server wait were fine.
+
+Root cause (proven from source, and consistent with the log):
+- queue_apc sends SIGUSR1 to a thread that is not in an interruptible wait when its system APC queue is empty. On iOS, send_thread_signal always fails: get_process_port() is process->trace_data, which is always 0 here (see mach_ios.c).
+- So queue_apc returned 0 and thread_apc_destroy completed the async with the call status. For an accept or receive, that status is STATUS_ALERTED with 0 bytes. The client half never ran: no accept addresses fetched, no recv done.
+- A 0-byte successful TCP receive is EOF to the program. This probably also explains the WebSocket CM drops ("closed by program", no socket error, ~7 s after logon), while UDP CM sessions survive empty datagrams. That link is a hypothesis.
+
+Change (wine/server/thread.c, WINE_IOS only):
+- When the signal fails for an APC_ASYNC_IO, queue_apc now picks another thread of the same process that is in an interruptible, non-suspended server wait. If there is none, the APC stays on the issuing thread, which runs it at its next server wait.
+- Why this is safe: the client half is process-scoped (get_async_result searches the process's asyncs; upstream already reroutes when the issuer has exited). async_wake_up alerts one async per queue at a time, so per-socket ordering holds.
+- Other system APC types and process-wide APCs keep the upstream behaviour.
+- `[apc-requeue] ml1480` logs the switch state and handovers (first 32, then every 1024th) with the APC status. MADEIRA_APC_REQUEUE=0 restores the drop.
+
+Validation:
+- New check-apc-requeue compiles the production queue_apc, is_in_apc_wait, get_apc_queue, is_thread_suspended and the ml1480 helpers, with a send_thread_signal that always fails. ASan/UBSan/LSan cover:
+  - a busy issuer's APC goes to the waiting thread, which is woken;
+  - with no waiter it stays on the issuer;
+  - suspended, terminated and non-interruptible waiters are skipped;
+  - a waiting issuer, or one with a non-empty queue, keeps the upstream path with no signal;
+  - non-I/O system APCs and user APCs are unchanged;
+  - the rollback reproduces the drop.
+- All 19 host suites pass.
+- Native ntdll 35/35, win32u 46/46, server thread compiled. The IPA printed "IPA verified".
+- .xtool/verify-ml1480.py passes 25 checks against the ml1470 IPA:
+  - workspace sync, and the server archive and binary tags;
+  - no DRM-replacement names;
+  - Info.plist label `ml1480 · 09-23 03:31`;
+  - xtajit.dll unchanged;
+  - same 1365 entries, with only the executable, Info.plist and the seal changed.
+- No Wine, Steam or Windows program ran on this PC. ml1480 is device-unverified.
+
+Artifact: 155,946,804 bytes; 2026-09-23 03:34:42 CDT; SHA-256 4bbe41032655b10b3e1b071298554c834cb604e8ee4df3a54ededef937d8d5e2.
+Publication: wine 932a390d9cb pushed to 125hz/wine ios-build, then root implementation 3546ea0 (gitlink to 932a390d9cb) pushed to 125hz/Madeira main before this record. No upstream push or PR. Logs: .xtool/logs/ml1480-{checks,native,ipa,verify}.log.
