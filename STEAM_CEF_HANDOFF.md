@@ -179,6 +179,17 @@ with `guest_ptr32`, so win32u's `get_winproc_ptr` did not recognise B+0xffff0036
 Separate, unexplained: log 163's transport on one port dropped after ~11 s and Chromium then
 retried only ::1. Accept trace budgets split so the next run records completions.
 
+**ml1370 — device status after ml1360 (logs 164–166).** Winproc fix confirmed (`[winproc-handle]`
+fired, zero "ignoring exception"). QR login completed once; a later start signed in from the
+saved login and showed the main UI with **NO CONNECTION** (CM not connected; the login page also
+logged `Failed to start auth session: result 3`). This is §2.3 again, now the main blocker.
+Accepts complete (`completing/accepted/delivered`) even in the run where the transport stalled
+(log 166: both accepted at 00:10:46, browser gave up 11 s later, then retried ::1 only).
+Browser UI thread fault: `LDADDAL w5,w5,[x24]` into an RX page → LSE atomics now emulated through
+the RW alias (`ios_lse_atomic_op`). New evidence feeds: `[steam-connlog]` (connection_log.txt,
+masked) and `[loopback-io]`. The "32-bit Windows" banner matches real Windows-on-ARM64 behavior
+(native ARM64 reported) and is not a defect.
+
 ---
 
 ## 3. Solved walls (context — these are done, and the *methods* may be reusable)

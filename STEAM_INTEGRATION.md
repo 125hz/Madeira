@@ -368,6 +368,34 @@ The console window titled steamwebhelper.exe comes from Madeira's diagnostic
 Chromium logging flag. Chromium only writes cef_log.txt in release builds when
 that flag is present, so it stays until the client is stable.
 
+## Login works, connection does not: ml1370
+
+Device logs 164–166: with ml1360 the login window worked (QR sign-in completed
+once, and a later start signed in from Steam's saved login and opened the
+library). The status bar then read NO CONNECTION: steam.exe is not connected to
+Steam's connection-manager servers, so the library cannot act and -applaunch
+cannot start a game. The login page itself reported "Failed to start auth
+session: result 3 (Connection failed)" before one attempt succeeded. The cause
+is not yet established.
+
+- Steam's connection_log.txt is now mirrored into the Madeira log as
+  [steam-connlog] ml1370 (up to 96 lines), with SteamIDs and IPv4 addresses
+  masked. MADEIRA_STEAM_LOG_MIRROR=0 disables it. Chromium VERBOSE lines no
+  longer use the error-excerpt budget.
+- Loopback connections record their first send/receive sizes as
+  [loopback-io] ml1370 (metadata only; MADEIRA_LOOPBACK_IO_TRACE=0), to explain
+  the intermittent "Unexpected Transport Error" where both local connections
+  were accepted but the browser gave up after 11 seconds.
+- The browser's UI thread faulted on an atomic add (x86 LOCK XADD) to a data
+  word that shares a page with code. Madeira now performs the whole family of
+  such atomics through the page's writable alias (MADEIRA_ALIAS_LSE_ATOMICS=0
+  restores the old behavior; [lse-emul] ml1370).
+
+The red "Steam no longer supports running on 32-bit Windows" banner is
+expected. Madeira reports an ARM64 machine, and Steam treats real Windows on
+ARM64 PCs the same way (it runs its 32-bit client there too). The 32-bit client
+keeps working but no longer receives updates.
+
 Logging in once in the Windows client is still required: Steam keeps its own
 sign-in, separate from Madeira's native sign-in, and then signs in automatically
 on later launches if "Remember me" is kept. Madeira does not copy its token into

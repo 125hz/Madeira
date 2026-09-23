@@ -498,6 +498,106 @@ static int ios_decode_exclusive_alias( uint32_t insn, uintptr_t fault_addr,
     return 1;
 }
 
+/* iOS-Madeira ml1370: LSE ATOMIC MEMORY OPERATIONS through the RW alias.
+ *
+ * FEX lowers x86 LOCK ADD/XADD/SUB/INC/DEC to LDADD{A}{L}, LOCK AND to LDCLR
+ * (with the operand inverted), LOCK OR to LDSET and LOCK XOR to LDEOR. When the
+ * target word shares a page with code, that page is mapped RX and the atomic
+ * takes a write fault. The ml626 SWP emulator covered only exchange. Device
+ * log 165: the Steam client's browser UI thread faulted on LDADDAL w5, w5, [x24]
+ * (0xb8e50305) during a window-destroy callback, "[store-undecoded] ... ADD THIS
+ * ENCODING", and the fault went to the guest twice as an access violation.
+ *
+ * Encoding: size 111 V=0 00 A R 1 Rs o3=0 opc(3) 00 Rn Rt
+ *   mask 0x3F208C00, value 0x38200000 (SWP is o3=1 and stays with ml626).
+ *   opc 000 ADD, 001 CLR (mem &= ~Rs), 010 EOR, 011 SET (mem |= Rs),
+ *       100 SMAX, 101 SMIN, 110 UMAX, 111 UMIN.
+ * Rt receives the OLD value zero-extended to 64 bits; Rt == 31 is the ST<op>
+ * alias and discards it. The operation is performed with a real atomic on the
+ * RW alias, which maps the same physical memory as the faulting RX view, so
+ * other threads see one indivisible update. __ATOMIC_SEQ_CST is at least as
+ * strong as any A/R combination. An unaligned address is refused (returns 0)
+ * because it cannot be made atomic here. Returns 1 and sets *old when done. */
+static int ios_lse_atomic_op( uint32_t insn, uintptr_t rw_addr, uint64_t operand, uint64_t *old )
+{
+    const int size_lg2 = (insn >> 30) & 3;
+    const int opc = (insn >> 12) & 7;
+    uint64_t mask = size_lg2 == 3 ? ~0ull : ((1ull << (8 << size_lg2)) - 1);
+    uint64_t cur, next;
+    int sign_bit = (8 << size_lg2) - 1;
+
+    if ((insn & 0x3F208C00u) != 0x38200000u) return 0;
+    if (rw_addr & ((1u << size_lg2) - 1)) return 0;
+    operand &= mask;
+
+    if (opc <= 3)
+    {
+#define IOS_LSE_OP(T) do { T *p = (T *)rw_addr; T v = (T)operand; switch (opc) {        \
+        case 0: cur = __atomic_fetch_add( p, v, __ATOMIC_SEQ_CST ); break;              \
+        case 1: cur = __atomic_fetch_and( p, (T)~v, __ATOMIC_SEQ_CST ); break;          \
+        case 2: cur = __atomic_fetch_xor( p, v, __ATOMIC_SEQ_CST ); break;              \
+        default: cur = __atomic_fetch_or( p, v, __ATOMIC_SEQ_CST ); break; } } while (0)
+        switch (size_lg2)
+        {
+        case 0: IOS_LSE_OP(uint8_t); break;
+        case 1: IOS_LSE_OP(uint16_t); break;
+        case 2: IOS_LSE_OP(uint32_t); break;
+        default: IOS_LSE_OP(uint64_t); break;
+        }
+#undef IOS_LSE_OP
+        *old = cur & mask;
+        return 1;
+    }
+
+    /* min/max: compare-and-swap loop on the aligned element */
+    for (;;)
+    {
+        int64_t sc, so;
+        switch (size_lg2)
+        {
+        case 0: cur = __atomic_load_n( (uint8_t *)rw_addr, __ATOMIC_SEQ_CST ); break;
+        case 1: cur = __atomic_load_n( (uint16_t *)rw_addr, __ATOMIC_SEQ_CST ); break;
+        case 2: cur = __atomic_load_n( (uint32_t *)rw_addr, __ATOMIC_SEQ_CST ); break;
+        default: cur = __atomic_load_n( (uint64_t *)rw_addr, __ATOMIC_SEQ_CST ); break;
+        }
+        /* sign-extend both to 64 bits for the signed forms */
+        sc = (int64_t)(cur << (63 - sign_bit)) >> (63 - sign_bit);
+        so = (int64_t)(operand << (63 - sign_bit)) >> (63 - sign_bit);
+        switch (opc)
+        {
+        case 4: next = sc >= so ? cur : operand; break;
+        case 5: next = sc <= so ? cur : operand; break;
+        case 6: next = cur >= operand ? cur : operand; break;
+        default: next = cur <= operand ? cur : operand; break;
+        }
+        {
+            int ok;
+            switch (size_lg2)
+            {
+            case 0: { uint8_t e = (uint8_t)cur; ok = __atomic_compare_exchange_n( (uint8_t *)rw_addr, &e, (uint8_t)next, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ); break; }
+            case 1: { uint16_t e = (uint16_t)cur; ok = __atomic_compare_exchange_n( (uint16_t *)rw_addr, &e, (uint16_t)next, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ); break; }
+            case 2: { uint32_t e = (uint32_t)cur; ok = __atomic_compare_exchange_n( (uint32_t *)rw_addr, &e, (uint32_t)next, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ); break; }
+            default: { uint64_t e = cur; ok = __atomic_compare_exchange_n( (uint64_t *)rw_addr, &e, next, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ); break; }
+            }
+            if (ok) break;
+        }
+    }
+    *old = cur & mask;
+    return 1;
+}
+
+/* MADEIRA_ALIAS_LSE_ATOMICS=0 leaves LSE atomics undecoded (previous behavior). */
+static int ios_lse_alias_enabled( void )
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        const char *env = getenv( "MADEIRA_ALIAS_LSE_ATOMICS" );
+        enabled = !env || strcmp( env, "0" );
+    }
+    return enabled;
+}
+
 /* ml691: pages demoted to RW by the W^X path, so an execute fault on one can be
  * recovered. Kept OUTSIDE the store handler's static so the exec path can reach
  * it. Restoring RX is synchronous -- the faulting thread does not resume until
@@ -3723,6 +3823,31 @@ static void *ios_mach_exception_thread( void *arg )
                                         (unsigned long long)in, (unsigned long long)old);
                             }
                         }
+                    }
+                    /* ml1370: LD<op>/ST<op> atomic memory operations (see
+                     * ios_lse_atomic_op). Rs == 31 reads as zero; Rt == 31 is the
+                     * ST<op> alias and discards the old value. */
+                    else if (ios_lse_alias_enabled() && (insn & 0x3F208C00u) == 0x38200000u)
+                    {
+                        int rs = (insn >> 16) & 0x1f;
+                        int rt = insn & 0x1f;
+                        uint64_t old = 0;
+                        static int lse_n, lse_refused_n;
+
+                        if (ios_lse_atomic_op( insn, rw_addr, IOS_STORE_SRC(rs), &old ))
+                        {
+                            if (rt != 31) state.__x[rt] = old;
+                            emulated = 1;
+                            if (lse_n < 8)
+                                dprintf(STDERR_FILENO,
+                                    "[lse-emul] ml1370 #%d insn=0x%08x opc=%d size=%d addr=0x%llx\n",
+                                    ++lse_n, insn, (insn >> 12) & 7, 1 << ((insn >> 30) & 3),
+                                    (unsigned long long)fault_addr);
+                        }
+                        else if (lse_refused_n < 4)
+                            dprintf(STDERR_FILENO,
+                                "[lse-emul] ml1370 REFUSING unaligned atomic #%d insn=0x%08x addr=0x%llx\n",
+                                ++lse_refused_n, insn, (unsigned long long)fault_addr);
                     }
                     /* 2026-09-23 STLR/STLRB/STLRH/STLR-64 — STORE-RELEASE, not
                      * exclusive. FEX lowers an x86 TSO store to STLR, and a guest
