@@ -115,6 +115,7 @@ final class DepotDownloader {
         state.phase = .downloading
         report(state)
         SteamLog.event("[steam-depot] ml1310 install begin app=\(app.appID) depots=\(plans.count) files=\(prepared.fileCount) resume=\(prepared.doneBytes > 0 ? 1 : 0)")
+        SteamLog.event("[steam-depot] ml1390 selection app=\(app.appID) build=\(app.buildID) \(app.depotSelectionSummary())")
 
         let remaining = prepared.remainingUncompressed
         if remaining > 0 {

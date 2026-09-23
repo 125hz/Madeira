@@ -272,6 +272,29 @@ final class SteamAccountModel: ObservableObject {
 
     func game(_ appID: Int) -> SteamOwnedGame? { owned.first { $0.id == appID } }
 
+    /// ml1390: before a Windows-client launch, record what the install record
+    /// says, so a client refusal ("please update these games first") can be
+    /// compared with it. Fields and depot/manifest IDs only; no account data.
+    /// MADEIRA_STEAM_ACF_LOG=0 disables.
+    static func logInstallRecord(appID: Int) {
+        guard LibraryFlags.enabled("MADEIRA_STEAM_ACF_LOG") else { return }
+        let url = SteamInstallPaths.steamApps.appendingPathComponent("appmanifest_\(appID).acf")
+        guard let data = try? Data(contentsOf: url), data.count <= 1 << 20,
+              var parser = try? SteamKeyValues(data), let root = try? parser.read(),
+              let state = root["AppState"] else {
+            LogStore.shared.log("[steam-acf] ml1390 app=\(appID) record=unreadable")
+            return
+        }
+        func text(_ key: String) -> String { state[key]?.string ?? "-" }
+        let depots = (state["InstalledDepots"]?.fields ?? [:]).sorted { $0.key < $1.key }.prefix(16)
+            .map { "\($0.key):\($0.value["manifest"]?.string ?? "-")" }.joined(separator: ",")
+        let shared = (state["SharedDepots"]?.fields ?? [:]).sorted { $0.key < $1.key }.prefix(16)
+            .map { "\($0.key)>\($0.value.string ?? "-")" }.joined(separator: ",")
+        LogStore.shared.log("[steam-acf] ml1390 app=\(appID) state=\(text("StateFlags")) buildid=\(text("buildid")) " +
+                            "target=\(text("TargetBuildID")) update=\(text("UpdateResult")) " +
+                            "depots=\(depots.isEmpty ? "-" : depots) shared=\(shared.isEmpty ? "-" : shared)")
+    }
+
     func updateAvailable(for entry: LibraryEntry) -> Bool {
         guard entry.steamNative == true, let appID = entry.steamAppID, let build = entry.steamBuildID,
               let latest = game(appID)?.buildID else { return false }

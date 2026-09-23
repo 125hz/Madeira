@@ -1216,6 +1216,7 @@ struct LibraryDetail: View {
             LogStore.shared.log("[steam-play] ml1310 app=\(entry.steamAppID ?? 0) mode=\(entry.steamClientLaunch == true ? "client" : "direct") client-found=\(entry.steamClientPath == nil ? 0 : 1)")
             if entry.steamClientLaunch == true {
                 LogStore.shared.log("[steam-silent] ml1360 enabled=\(LibraryFlags.enabled("MADEIRA_STEAM_SILENT") ? 1 : 0)")
+                if let appID = entry.steamAppID { SteamAccountModel.logInstallRecord(appID: appID) }
             }
         }
         leaving = true

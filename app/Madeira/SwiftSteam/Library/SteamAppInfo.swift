@@ -127,6 +127,25 @@ struct SteamAppInfo {
         return preferred
     }
 
+    /// Madeira ml1390: every depot with why it was or was not selected, for the
+    /// install log ("sel", or the first failing rule). IDs and flags only.
+    func depotSelectionSummary(os: String = "windows", arch: String = "64",
+                               language: String = "english", limit: Int = 24) -> String {
+        let chosen = Set(installDepots(os: os, arch: arch, language: language).map(\.depotID))
+        return depots.sorted { $0.depotID < $1.depotID }.prefix(limit).map { d in
+            let why: String
+            if chosen.contains(d.depotID) { why = "sel" }
+            else if !d.supports(os: os) { why = "os" }
+            else if d.dlcAppID != nil { why = "dlc" }
+            else if d.isSharedInstall { why = "shared" }
+            else if d.publicManifestID == nil { why = "nomanifest" }
+            else if d.lowViolence { why = "lowviolence" }
+            else if !d.language.isEmpty && d.language.caseInsensitiveCompare(language) != .orderedSame { why = "lang" }
+            else { why = "arch" }
+            return "\(d.depotID)[\(d.osarch.isEmpty ? "-" : d.osarch)]\(why)"
+        }.joined(separator: ",")
+    }
+
     /// Madeira: owned apps that can be installed for Windows at all.
     var installableOnWindows: Bool {
         supportsWindows && type.isPlayable && !installDepots().isEmpty

@@ -415,6 +415,24 @@ anyway" stopped responding. The Steam client plus its Chromium UI can fill the
 pool on its own. Earlier sessions did not, so it depends on what the UI is
 doing.
 
+### ml1390: "Please update these games first"
+
+Log 168: "Play anyway" worked, and the client then refused with "Failed to start
+game with shared content. Please update these games first: 220". The client
+treats Madeira's HL2 install as out of date. It is still NO CONNECTION, so it
+can neither confirm the install from current app information nor download
+anything. The exact reason is recorded in Steam's content_log.txt, which is now
+mirrored too ([steam-contentlog] ml1390, masked, 96 lines). Before each
+Windows-client launch, Madeira logs what its install record says
+([steam-acf] ml1390: StateFlags, build IDs, installed and shared depots with
+manifest IDs; MADEIRA_STEAM_ACF_LOG=0 disables). New installs log every depot and
+why it was selected or skipped ([steam-depot] ml1390 selection). The crypt32
+verdict log no longer spends its budget on the root-store self-check.
+
+`-no-browser` / `steam://open/minigameslist` (a 2021 tip) does not apply: Valve
+removed -no-browser in January 2023, and the current client's login and dialogs
+are all steamwebhelper pages.
+
 The red "Steam no longer supports running on 32-bit Windows" banner is
 expected. Madeira reports an ARM64 machine, and Steam treats real Windows on
 ARM64 PCs the same way (it runs its 32-bit client there too). The 32-bit client
