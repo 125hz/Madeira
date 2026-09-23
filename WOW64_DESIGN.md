@@ -14447,3 +14447,56 @@ Validation:
 
 Artifact: 155,936,489 bytes; 2026-09-23 01:30:26 CDT; SHA-256 1f92d3a915c12fb265a6b846a0fd9c1d8fe2bcdb45e16ceb15010b5f81fe8c60.
 Publication: wine 2178a01c756 pushed to 125hz/wine ios-build, then root implementation a25a3db (gitlink to 2178a01c756) pushed to 125hz/Madeira main before this record. No upstream push or PR. Logs: .xtool/logs/ml1420-{native,pe64,checks,ipa,verify}.log.
+
+
+### 2026-09-23 - ml1430: WoW64 syscall parking for the code-buffer sweeper (Windows Steam client pool exhaustion)
+
+Device result for ml1420 (log 177, screenshot). Device-verified:
+- The Library found the previously missing owned app (lowercase PICS type).
+- After "Show live log" the starting screen now dismisses, and its buttons respond.
+- The starting screen showed the client's download progress (202 MB of 3.8 GB, 5%, 4 apps pending).
+- The early pool was 896 MB ("last session"), and the new unwind guard fired once (`[unwind-stall] ml1420 dispatch code=c0000005 pc=lr=1373f8160`) instead of spinning.
+
+Then the desktop froze within about a minute. Proven from the log:
+- The pool tail was 720 MB: 30 live carves (17 × 32 MB, 11 × 16 MB, 2 × 16 KB) with 0 free, against a budget of 713 MB and a head of 85 MB.
+- `TAIL REFUSED` ×4, then `EXEC ALLOC FAILED ... honest fault at 0xdead` on tid 02b4 (third pseudo-process, window 0x73).
+- That delivery `HOLDS FEX shared lock` (`[deliver-hold]`), so every thread of that process that needed code waited forever.
+- The per-process code buffers rotated repeatedly: `[code-buffer] recycled #N ... pinned=15..30`, one process at gen 16.
+- There were no `[gen-sweep]` lines at all.
+
+Root cause, proven from source:
+- CodeBufferManager is per process, and a generation lives while any thread's CurrentCodeBuffer holds it.
+- The ml460 sweeper (CPUBackend.cpp IosMaybeSweepCodeBuffers) migrates only registered threads that are outside emitted code. Only the ARM64EC frontend registers threads (Module.cpp:1998, InSimulation, cleared on syscall exits).
+- In the WoW64 frontend a syscall is `blr` out of the emitted block (BranchOps.cpp DEF_OP(Syscall)): the handler runs Wow64SystemServiceEx with a return address into its generation on the stack. Every blocked WoW64 thread therefore pinned a generation for as long as it waited.
+- steam.exe and every steamwebhelper are 32-bit, and Chromium parks hundreds of threads.
+
+Fix (FEX WOW64 Module.cpp, FEXCore CPUBackend.cpp; `xtajit.dll` rebuilt):
+- FEXCore: IosSweepRegisterThreadEx adds an optional per-thread Migrated flag, which the sweep sets under the gate when IosRemoteMigrateStale returns 1. IosSweepRegisterThread delegates with nullptr, so the ARM64EC module is unchanged and not rebuilt.
+- BTCpuThreadInit registers the thread (IosInSim=1, Migrated) and points Pointers.SyscallHandlerFunc at IosWowSyscallEntry, a naked stub that passes the caller SP.
+- IosWowSyscallC arms parking only in these cases:
+  - for the outermost syscall (depth 0; restored from a local, so a long-jumped nested call cannot leave it raised);
+  - when Frame->ReturningStackLocation lies 0..8 KB above the caller SP and is 16-aligned (a stale deeper value left by a long-jumped callback is declined);
+  - when DispatcherLoopTopFillSRA is known.
+- HandleSyscallImpl parks around WineUnixCall and Wow64SystemServiceEx after UnlockJITContext: `IosInSim=0` with a release store. It unparks before LockJITContext: `IosInSim=1`, seq_cst fence, spin while IosCodeBufferSweepGate (the Dekker pair of the ARM64EC funnels). BTCpuSimulateImpl unparks too, so a callback that re-enters simulation is never movable.
+- When moved, the C side restores ReturningStackLocation and clears InSyscallInfo. The stub switches SP to the dispatcher's, zeroes x1 (ENTRY_FILL_SRA_SINGLE_INST_REG on non-EC) and branches to LoopTopFillSRA.
+- Why this is equivalent to returning (all verified in source and asserted by the host test):
+  - The bridges are `int 0x2e` (0x2ecd2ecd), INT carries DEFAULT_SYSCALL_FLAGS, and FLAGS_BLOCK_END holds on _WIN32. INTOp routes 0x2E to SyscallOp on WoW64.
+  - SyscallOp ends with `ExitFunction(LoadContext(rip))`, and OS_GENERIC writes no result.
+  - The emitted tail only restores SP, runs FillStaticRegs (all masks), clears InSyscallInfo and pops dynamic registers, which are dead at the block end.
+  - LoopTopFillSRA refills every static register and dispatches at State.rip. Callee-saved registers (STATE x28, PF/AF x26/x27, callret x25) are restored by the C epilogue before the stub branches.
+- BTCpuThreadTerm unregisters before freeing the frontend data (IosSweepUnregisterThread waits out a sweep in flight).
+- MADEIRA_WOW_SYSCALL_SWEEP=0 restores the old behaviour exactly (no registration, the original handler pointer). `[wow-sweep] ml1430` logs the switch state once per process, the first 8 resumes then every 1024th, and the first 4 declines. `[gen-sweep]` now also counts WoW64 moves.
+- The stub was checked by disassembly of the built module: mov x3,sp; stp; bl IosWowSyscallC; ldp; cbnz x0; ret; mov sp,x0; mov x16,x1; mov x1,#0; br x16.
+
+UI:
+- The Library screen (where the JIT/Memory+ dots are) now shows the build label.
+- The HUD's top overlays (download banner, session message, live log) use the larger of the reported safe-area inset and the status bar height. In portrait the reported inset was 0 and the banner sat under the clock.
+
+Validation:
+- 15 host suites pass (ASan/UBSan), including new check-wow-sweep. Its Part A covers source invariants (emitted syscall tail, block-end flags, bridge bytes, stub order, park/unpark placement, registration and unregistration order, sweeper flag). Its Part B runs the production IosWowPark/IosWowUnpark/IosWowSyscallC against a model sweeper: a moved blocked call resumes at the dispatcher, an unmoved one returns, nested callbacks stay pinned, a stale stack is declined, a long-jumped depth is restored, and the rollback never parks.
+- The FEX WOW64 build succeeded. The first build failed on a missing `.seh_nop` for the stub's first prologue instruction, which was fixed.
+- The IPA printed "IPA verified". .xtool/verify-ml1430.py passes 26 checks: xtajit tags, the CodeResources seal of the new xtajit.dll, the Info.plist label, generated Library.swift in sync, same entry list as ml1420, and only Info.plist, the executable, xtajit.dll and the seal changed.
+- No Wine, Steam or Windows program ran on this PC. Device-unverified. On device, look for `[gen-sweep] ... migrated=` with WoW64 threads and `[wow-sweep] ml1430 resumed`; the pool tail should stay near two live generations per process.
+
+Artifact: 155,937,563 bytes; 2026-09-23 02:13:35 CDT; SHA-256 8b95c35c33e8c4e320f300799c2ba4f7583beaafe2f498eeab9fea29e8c27cd1.
+Publication: FEX 2dd0c11c3 pushed to 125hz/FEX ios-port-2607, then root implementation b15fe33 (gitlink to 2dd0c11c3) pushed to 125hz/Madeira main before this record. No upstream push or PR. Logs: .xtool/logs/ml1430-{fex,checks,ipa,verify}.log.
