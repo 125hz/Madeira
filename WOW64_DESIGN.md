@@ -14560,3 +14560,48 @@ Validation:
 
 Artifact: 155,941,709 bytes; 2026-09-23 02:46:46 CDT; SHA-256 ea4a27f570aa4ccd9c38421bcb275a74ac153c3adaa8d76c06e25eef7d6af343.
 Publication: wine b0e58b3d98f pushed to 125hz/wine ios-build, then root implementation 20a3a4b (gitlink to b0e58b3d98f) pushed to 125hz/Madeira main before this record. No upstream push or PR. Logs: .xtool/logs/ml1450-{native,checks,ipa,verify}.log.
+
+
+### 2026-09-23 - ml1460/ml1470: accept completion chain trace, ordered FEX profile for Chromium hosts, lighter Steam client
+
+Device result for ml1450 (log 181). Proven:
+- "Steam encountered an unexpected error during startup". The Chromium helper's later connections to the client's loopback listener (about 25 s and 4 min in) were accepted and delivered in the server, and the helper sent its 554-byte request. The client never issued a receive or poll on them.
+- `[tcp-end]`: the CM WebSocket was closed by the client itself about 7 s after logon, with no hangup, reset or error. The UDP reconnect held. The other lines are short HTTPS connections closed on purpose.
+- The ml1410 cancel hold fired 8 times without a crash.
+
+ml1460 was built (not published on its own) and ran as logs 182/183. Proven:
+- **The completion chain is intact.** All 5 marked loopback accepts went accepted → APC queued → result posted to the port → dequeued by a client thread (4 after a wait, 1 immediately). The client read the helper's 554-byte request on every connection and sent its 129-byte reply. The startup error did not reproduce in this run (about 8 min).
+- **A consistent pattern across logs 179-183.**
+  - Every WebSocket CM connection (27018 or 443) drops with `ConnectionDisconnected('I/O Operation Failed')` 0-8 s after logon. Its socket carries normal TLS traffic up to a close by the program, with no socket error.
+  - Every UDP CM connection (27017) holds, with heartbeats passing through repeated "network device lost/up" notices.
+  - The client rolls its protocol at random (85-88 % WebSocket), so a session is healthy once it lands on UDP. Cause of the WebSocket drop: unknown.
+- **Downloads.** Depot 420's remaining 217 MB finished in 5.2 min (about 0.7 MB/s), and depot 389 started. The Library bar read 14 % from the stale acf at start and about 49 % once Steam saved it (Steam's own totals: 1.91 of 3.84 GB), then 55 %.
+
+ml1470 changes (GameNative-derived, credited in STEAM_INTEGRATION.md):
+- **`[ordered-profile] ml1470`** (FEX WoW64 BTCpuProcessInit, before CreateNewContext): Multiblock=0, VectorTSOEnabled=1, HalfBarrierTSOEnabled=1.
+  - Applied when libcef.dll or chrome_elf.dll is next to the executable, or when the executable's base name is in MADEIRA_ORDERED_PROFILE_EXES (the user's list) or MADEIRA_ORDERED_PROFILE_CLIENT (set by the app).
+  - An option already set (FEX_<NAME>, madeira-fex.txt) is kept and reported as user-set.
+  - `[fex-cfg]` lists the profile's own settings as `(ordered-profile)`, not as overrides.
+  - MADEIRA_ORDERED_PROFILE=0 turns it off.
+  - Why: Madeira's 32-bit default orders GPR accesses only (VectorTSO=0), and Chromium publishes messages through shared memory. GameNative runs launcher/CEF processes with exactly this profile. Hypothesis, device-unverified.
+- **Executable name lifetime fix.** BTCpuProcessInit took a string_view (BaseName) of the temporary returned by GetExecutableFilePath(), which was destroyed at the end of the statement. The path is now kept in a local. The ARM64EC module has the same pattern and is unchanged this round.
+- **App (Library.swift).**
+  - For a Windows-client launch, configureLaunch sets MADEIRA_ORDERED_PROFILE_CLIENT to the client executable's base name (MADEIRA_STEAM_ORDERED_CLIENT=0 disables this). Games the client starts keep the default.
+  - Client launches (not the installer) add `-cef-disable-hang-timeouts -nooverlay -nofriendsui -noshaders` (MADEIRA_STEAM_LIGHT=0 omits them).
+  - `-cef-single-process` and GameNative's other Chromium flags are deferred.
+  - GameNative's Steam API emulator and stub loader are not ported: they replace Steam's DRM.
+
+Validation:
+- New check-ordered-profile. It compiles the production name matcher with ASan/UBSan, covering exact and case-insensitive matches with separators and no substring matches. It also checks the source invariants: CEF detection, both lists, the kill switch, Exists before Set, placement after logging and before the context, the [fex-cfg] reporting, no product names in the hook, and the path lifetime.
+- check-steam-library covers the light flags, their rollback, and the client name and its rollback.
+- All 18 host suites pass.
+- Native ntdll 35/35, win32u 46/46; server async, completion and sock compiled (ml1460 native build). The FEX WOW64 module built with no compiler errors. The IPA printed "IPA verified".
+- .xtool/verify-ml1470.py passes 44 checks against the ml1450 IPA:
+  - workspace sync, and the server archive, xtajit.dll and binary tags;
+  - no DRM-replacement names in the binary or xtajit.dll;
+  - Info.plist label `ml1470 · 09-23 03:14`, and CodeResources seals the new xtajit.dll;
+  - same 1365 entries; only Info.plist, the executable, xtajit.dll and the seal changed.
+- No Wine, Steam or Windows program ran on this PC. ml1470 is device-unverified.
+
+Artifact: 155,945,593 bytes; 2026-09-23 03:19:10 CDT; SHA-256 e623d3175e166ab9c2ab1b749282b30fe8b771469d2aef34dcfa5ab241b2f401.
+Publication: FEX e6f628092 pushed to 125hz/FEX ios-port-2607; wine b124bc42e69 pushed to 125hz/wine ios-build; then root implementation 1b7f222 (gitlinks to both) pushed to 125hz/Madeira main before this record. No upstream push or PR. Logs: .xtool/logs/ml1460-native.log, ml1470-{checks,fex,ipa,verify}.log.
