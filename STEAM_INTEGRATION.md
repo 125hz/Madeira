@@ -664,6 +664,10 @@ The fix (FEX WoW64 module, `xtajit.dll`):
 state, the first resumes and anything declined. `[gen-sweep]` now shows
 32-bit moves too.
 
+Also: the download banner sat under the clock and battery when the game view
+was in portrait. The HUD's reported top inset was zero while the status bar
+showed, so its top overlays now use the status bar's height when it is larger.
+
 **ml1440: no pool at all (logs 178, prev17).** Placement failed twice and Wine
 never started ("The session could not start").
 
@@ -682,9 +686,26 @@ requested size. The "no home" line now also lists the first `vm_allocate`
 refusals, to tell occupied ranges from unallocatable ones. Workaround for
 older builds: `Documents/madeira-pool.txt` containing `640`.
 
-Also: the download banner sat under the clock and battery when the game view
-was in portrait. The HUD's reported top inset was zero while the status bar
-showed, so its top overlays now use the status bar's height when it is larger.
+**ml1450: why the download stalls (log 179, ml1440 build).**
+
+What log 179 proves about ml1430:
+- The fix works on device. The 896 MB pool placed normally.
+- The sweep ran 54 generations, moving 45-49 of 54 threads each time. The tail kept 4-5 of 12 carves free.
+- There was no `TAIL REFUSED`, no out-of-pool fault and no freeze. The user reported the app stayed responsive.
+
+Why the download stalled at 238 MB:
+- The client logged on and started depot 420 (3,065 chunks), ramping up by its own rate counter.
+- About 8 s after each logon, the CM WebSocket dropped with `ConnectionDisconnected('I/O Operation Failed')`. In the same second, the client's own HTTP connectivity test failed.
+- At 02:30:50 it logged `BYieldingGetServersForSteamPipe failed (Transport Response Not Received / Result No Connection)` and `Failed to get list of download sources`. The download had no sources after that.
+- Nothing in the log said how the CM connection ended. Its socket carried normal traffic, then closed with no recorded error.
+- The connection-log mirror had used its 96 lines by then.
+
+New in ml1450:
+- **`[tcp-end] ml1450`** covers stream sockets with a non-loopback peer, 48 lines per app lifetime, and `MADEIRA_TCP_END_TRACE=0` disables it:
+  - ntdll logs a receive that returns 0 (the peer closed) and any receive or send error other than would-block, with local port, peer port (0 when the peer is already gone) and errno.
+  - The server logs when a program closes a connected socket, with its age and whether a hangup, shutdown, reset or error had been seen first.
+- **Saved errno on socket error paths.** The existing probes query the socket after a failed receive or send, and on a reset connection those queries fail and overwrite errno. The status returned to the program could then say "not connected" instead of "connection reset". Every probe and the returned status now use the call's own error.
+- **Mirror budget.** The Steam connection-log and content-log mirrors now keep up to 320 lines each (was 96).
 
 ## References
 
