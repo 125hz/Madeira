@@ -745,6 +745,23 @@ each accept on a loopback listener and logs, for that accept only:
 
 The first missing step in the next log shows where the chain breaks.
 
+**Logs 182/183 (ml1460 build), about 8 minutes of one session.**
+- The chain completed for all five accepts. The client read the helper's
+  request on every connection and answered it, and the startup error did not
+  appear.
+- **The CM protocol decides whether a session holds.** In logs 179-183, every
+  WebSocket CM connection (27018 or 443) dropped with
+  `ConnectionDisconnected('I/O Operation Failed')` 0-8 s after logon, closed by
+  the client with no socket error. Every UDP connection (27017) held, and its
+  heartbeats kept passing. The client picks WebSocket 85-88 % of the time and
+  re-rolls after each drop. So a session is healthy once it lands on UDP, and a
+  run of WebSocket picks is what starved the log 179 download. The cause of the
+  WebSocket drop is unknown.
+- **The download progressed.** Depot 420's last 217 MB took 5.2 min (about
+  0.7 MB/s) before depot 389 started. The Library bar read 14 % from the saved
+  manifest at start, about 49 % once Steam rewrote it (Steam's own totals:
+  1.91 of 3.84 GB), then 55 %.
+
 **GameNative.** Jfishin, whose Steam work Madeira's is based on, referenced
 [GameNative](https://github.com/utkarshdalal/GameNative) heavily. What it does
 for the Windows Steam client and other launchers:
