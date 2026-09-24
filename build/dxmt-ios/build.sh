@@ -146,6 +146,9 @@ if [[ -f "$BUILD_DIR/../madeira-d3d12/deps.sh" ]] && \
     # reader includes a Windows shim whose BOOL clashes with Objective-C's.
     compile_cxx "$REPO_ROOT/research/madeira-d3d12/src/unix/madeira_sm5_ia.cpp" \
                 madeira_sm5_ia "-I$REPO_ROOT/research/madeira-d3d12/src"
+    # ml1149: AMD AGS 64-bit atomics -> native SM6.6 atomics, a DXIL rewrite on
+    # the LLVM 15 that airconv already links (bitcode reader + writer).
+    compile_cxx "$REPO_ROOT/research/madeira-d3d12/src/unix/madeira_ags.cpp" madeira_ags
 else
     echo "=== madeira-d3d12 canary SKIPPED (converter package not resolvable) ==="
 fi
