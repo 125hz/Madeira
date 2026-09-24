@@ -1760,9 +1760,16 @@ done:
 /***********************************************************************
  *           abort_thread
  */
+static void ios_drop_user_lock(void);
+
 void abort_thread( int status )
 {
     pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
+#ifdef WINE_IOS
+    /* ml1650: a server call that hits EOF lands here while its caller may still
+     * be inside an uninterrupted section (fd_cache_mutex) or hold the user lock. */
+    ios_drop_user_lock();
+#endif
     if (InterlockedDecrement( &nb_threads ) <= 0) abort_process( status );
     pthread_exit_wrapper( status );
 }
@@ -1784,9 +1791,12 @@ void abort_thread( int status )
  */
 extern void user_lock_abandon(void) __attribute__((weak));
 
+extern void ios_drop_fd_cache_lock( const char *why );   /* ml1650, server_ios.c */
+
 static void ios_drop_user_lock(void)
 {
     if (user_lock_abandon) user_lock_abandon();
+    ios_drop_fd_cache_lock( "thread exit" );   /* ml1650: same rule for ntdll's fd cache lock */
 }
 #else
 static void ios_drop_user_lock(void) { }

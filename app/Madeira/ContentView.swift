@@ -3890,6 +3890,8 @@ struct ContentView: View {
     @State private var renameLaunchButtonText: String = ""
     /// ml1520: "Use New Interface" (actionButtons) applies at the next start.
     @State private var showFrontendRestart = false
+    @State private var eulaPrompt: SteamEulaPrompt?   // ml1710
+    @State private var eulaCleared: Set<Int> = []      // ml1710: apps checked this app run
     /// Fixed tint cycle for `customLaunchButtons` so neighbouring
     /// user-added buttons are visually distinct; wraps by index.
     private static let customButtonTints: [Color] = [
@@ -4043,6 +4045,14 @@ struct ContentView: View {
                     } else {
                         portraitBody
                     }
+                }
+                .sheet(item: $eulaPrompt) { prompt in
+                    SteamEulaSheet(prompt: prompt,
+                                   accept: { acceptEula(prompt) },
+                                   cancel: {
+                                       eulaPrompt = nil; eulaCleared.remove(prompt.appID)
+                                       LogStore.shared.log("[steam-eula] ml1710 app \(prompt.appID) declined; launch cancelled")
+                                   })
                 }
                 // ml — belt-and-suspenders for the cold-landscape-launch fix in
                 // `controlOverlayWindowBounds`: this `geo` is the exact source
@@ -5227,10 +5237,42 @@ struct ContentView: View {
         guard entry.windowsPath.utf8.count < 1024, entry.arguments.utf8.count < 1024 else {
             library.error = "The executable path or launch arguments are too long."; return
         }
+        // ml1710: answer the game's license agreements here, before the client starts, instead
+        // of inside the client window a -silent launch keeps hidden. Only games whose Steam app
+        // info lists an agreement that this prefix has not recorded ever see the sheet.
+        // MADEIRA_STEAM_EULA_NATIVE=0 leaves it to the client as before.
+        if entry.steamGameLaunch, let appID = entry.steamAppID, !eulaCleared.contains(appID),
+           LibraryFlags.enabled("MADEIRA_STEAM_EULA_NATIVE") {
+            let steamRoot = LibraryModel.drive.appendingPathComponent(entry.relativePath).deletingLastPathComponent()
+            eulaCleared.insert(appID)
+            library.error = nil
+            Task { @MainActor in
+                let eulas = await SteamAccountModel.shared.eulas(for: appID)
+                let missing = eulas.map { SteamEulaStore.missing(appID: appID, eulas: $0, steamRoot: steamRoot) } ?? []
+                LogStore.shared.log("[steam-eula] ml1710 app \(appID) listed=\(eulas?.count ?? -1) missing=\(missing.count)")
+                if missing.isEmpty { launchLibraryEntry(entry) }
+                else { eulaPrompt = SteamEulaPrompt(entry: entry, appID: appID, eulas: missing, steamRoot: steamRoot) }
+            }
+            return
+        }
         SteamLibraryModel.shared.stopScan()
         entry.configureLaunch()
         library.begin(entry)
         runWineFullSequence(profile: entry)
+    }
+
+    /// ml1710: the user accepted in Madeira's sheet; record it where the client looks, then launch.
+    /// A failed write still launches: the client then asks as it always did.
+    private func acceptEula(_ prompt: SteamEulaPrompt) {
+        eulaPrompt = nil
+        do {
+            let files = try SteamEulaStore.record(appID: prompt.appID, eulas: prompt.eulas, steamRoot: prompt.steamRoot)
+            LogStore.shared.log("[steam-eula] ml1710 app \(prompt.appID) accepted \(prompt.eulas.map(\.id).joined(separator: ",")) recorded in \(files) file(s)")
+        } catch {
+            LogStore.shared.log("[steam-eula] ml1710 app \(prompt.appID) accepted but could not be recorded: \(error.localizedDescription)", level: .error)
+        }
+        // Let the sheet finish dismissing before the session takes the screen.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { launchLibraryEntry(prompt.entry) }
     }
 
     /// ml1330: JIT was enabled earlier in this run but StikDebug has since gone

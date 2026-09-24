@@ -507,3 +507,52 @@ struct SteamEntrySection: View {
         return String(path.dropFirst(base.count + 1))
     }
 }
+
+/// ml1710: a game's license agreements, answered in Madeira before the Windows Steam client
+/// starts (see SteamEulaStore).
+struct SteamEulaPrompt: Identifiable {
+    let id = UUID()
+    let entry: LibraryEntry
+    let appID: Int
+    let eulas: [SteamEula]
+    let steamRoot: URL
+}
+
+struct SteamEulaSheet: View {
+    let prompt: SteamEulaPrompt
+    let accept: () -> Void
+    let cancel: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Text("\(prompt.entry.title) asks you to accept \(prompt.eulas.count == 1 ? "a license agreement" : "\(prompt.eulas.count) license agreements") before it starts. Steam records your answer, so you are asked only once.")
+                        .font(.subheadline)
+                }
+                Section("Agreements") {
+                    ForEach(prompt.eulas, id: \.id) { eula in
+                        if let url = URL(string: eula.url), url.scheme == "https" || url.scheme == "http" {
+                            Link(destination: url) {
+                                Label(eula.name.isEmpty ? "License agreement" : eula.name, systemImage: "doc.text")
+                            }
+                        } else {
+                            Label(eula.name.isEmpty ? "License agreement" : eula.name, systemImage: "doc.text")
+                        }
+                    }
+                }
+                Section {
+                    Button(action: accept) {
+                        Text("Accept and Play").fontWeight(.semibold).frame(maxWidth: .infinity)
+                    }
+                    Button("Cancel", role: .cancel, action: cancel).frame(maxWidth: .infinity)
+                } footer: {
+                    Text("Tap an agreement to read it. Accepting records it in Steam's settings on this device, the same way the Steam client does.")
+                }
+            }
+            .navigationTitle("License Agreement")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+        .interactiveDismissDisabled()
+    }
+}

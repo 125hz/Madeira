@@ -17741,7 +17741,12 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
      * Register the window so the Mach fault handler can service accesses to
      * it against THIS mapping -- same memory, so the two views cannot diverge.
      * Registered after relocation so real_base is final. */
-    if (image_info->base && image_info->base < 0x100000000ull)
+    /* ml1670: PE32+ only. A PE32 image's base is always below 4GB and, in a
+     * WoW64 pseudo-process, it lives inside that process's own window; one
+     * session-wide table would redirect one 32-bit process's accesses into
+     * another's copy (see mapping_ios.c ml1670). MADEIRA_SUBFLOOR_PE32=1 restores it. */
+    if (image_info->base && image_info->base < 0x100000000ull
+        && (nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC || getenv( "MADEIRA_SUBFLOOR_PE32" )))
     {
         extern void ios_register_subfloor_image( unsigned long long pref_base,
                                                  unsigned long long size,
@@ -23229,6 +23234,25 @@ void ios_reserve_fex_arena(void)
 
     for (i = 0; i < ARRAY_SIZE(plan); i++)
     {
+        /* ml1680: on a map without the high band (the 63 GB devices) every
+         * later step lands inside or beside the band the WOW64 emulator selects
+         * for itself ([0xc00000000,0xeffffffff], ios_fex_band_select), and a
+         * FEX_ONLY reservation only serves requests CONTAINED in it: the 32-bit
+         * emulator's band requests were refused over the overlap, the band shrank
+         * from 12 GB to ~7 GB, and the Steam web helper died on FEXAlloc. Without
+         * a published arena both emulators select their own band, which is how
+         * every run up to ml1620 worked. MADEIRA_FEX_ARENA_SMALL=1 keeps the old
+         * ladder. */
+        if (i > 0)
+        {
+            const char *s = getenv( "MADEIRA_FEX_ARENA_SMALL" );
+            if (!(s && s[0] == '1'))
+            {
+                dprintf( 2, "[fex-arena] ml1680 no high band on this map: arena not reserved, the "
+                            "emulators select their own bands (MADEIRA_FEX_ARENA_SMALL=1 reserves one)\n" );
+                break;
+            }
+        }
         if (arena_size_cap && (unsigned long long)plan[i].size > arena_size_cap)
         {
             dprintf( 2, "[fex-arena] ml995 SKIP %s (%llu MB) -- over the %llu MB cap\n",

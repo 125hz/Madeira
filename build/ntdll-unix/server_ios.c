@@ -3130,10 +3130,48 @@ NTSTATUS unixcall_wine_server_call( void *args )
 /***********************************************************************
  *           server_enter_uninterrupted_section
  */
+#ifdef WINE_IOS
+/* iOS-Madeira ml1650: fd_cache_mutex MUST NOT OUTLIVE ITS OWNER.
+ *
+ * One ntdll unix side serves every pseudo-process, so this is one lock for the
+ * whole session. It is held across server calls (NtClose, NtDuplicateObject,
+ * get_unix_fd), and a thread whose process is torn down in the middle of one
+ * leaves through abort_thread/exit without ever reaching the leave call. With
+ * Steam restarting itself after its update, both test devices ended with
+ * steam.exe and the web helper parked in __psynch_mutexwait on this lock and no
+ * live owner (the same shape as ml1090's user lock). Record the owner, and let
+ * every thread-exit path give the lock back if the exiting thread holds it.
+ * MADEIRA_FD_CACHE_LOCK_DROP=0 disables the release (the owner is still logged). */
+static pthread_t ios_fd_cache_owner;
+static void *ios_fd_cache_owner_at;
+static volatile int ios_fd_cache_owned;
+
+void ios_drop_fd_cache_lock( const char *why )
+{
+    static int enabled = -1;
+    if (!ios_fd_cache_owned || !pthread_equal( ios_fd_cache_owner, pthread_self() )) return;
+    if (enabled < 0) { const char *e = getenv( "MADEIRA_FD_CACHE_LOCK_DROP" ); enabled = !(e && e[0] == '0'); }
+    dprintf( 2, "[fd-cache-lock] ml1650 %s: exiting thread mach=%#x holds fd_cache_mutex (taken at %p) -- %s\n",
+             why, (unsigned)pthread_mach_thread_np( pthread_self() ), ios_fd_cache_owner_at,
+             enabled ? "released" : "NOT released (MADEIRA_FD_CACHE_LOCK_DROP=0)" );
+    if (!enabled) return;
+    ios_fd_cache_owned = 0;
+    pthread_mutex_unlock( &fd_cache_mutex );
+}
+#endif
+
 void server_enter_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset )
 {
     pthread_sigmask( SIG_BLOCK, &server_block_set, sigset );
     mutex_lock( mutex );
+#ifdef WINE_IOS
+    if (mutex == &fd_cache_mutex)
+    {
+        ios_fd_cache_owner = pthread_self();
+        ios_fd_cache_owner_at = __builtin_return_address( 0 );
+        ios_fd_cache_owned = 1;
+    }
+#endif
 }
 
 
@@ -3142,6 +3180,9 @@ void server_enter_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigse
  */
 void server_leave_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset )
 {
+#ifdef WINE_IOS
+    if (mutex == &fd_cache_mutex) ios_fd_cache_owned = 0;
+#endif
     mutex_unlock( mutex );
     pthread_sigmask( SIG_SETMASK, sigset, NULL );
 }
@@ -5438,6 +5479,22 @@ void server_init_process_done(void)
         /* ml875 [thread-sample]: ONE task-wide sampler (ml873 armed seven, one
          * per pseudo-process, each suspending the others' threads). Body in
          * ios_thread_sampler_main() above. */
+        /* ml1640: OPT-IN. These three suspend every thread in the task on a
+         * timer. Up to ml1620 this fork never ran them, and with them on the
+         * Steam client stalled on both test devices with steam.exe and the web
+         * helper parked on fd_cache_mutex that nothing ever released; a Mach
+         * suspend taken here can interleave with the server's own Mach
+         * suspend/resume bookkeeping for SuspendThread. They are profilers, so
+         * the default is off. MADEIRA_THREAD_SAMPLERS=1 turns them on. */
+        {
+            const char *ts = getenv( "MADEIRA_THREAD_SAMPLERS" );
+            static int said;
+            if (!(ts && ts[0] == '1'))
+            {
+                if (!said++) dprintf( 2, "[samplers] ml1640 thread-sample/xprobe/wprof off (MADEIRA_THREAD_SAMPLERS=1 enables)\n" );
+                ios_ts_armed = 1;   /* never arm */
+            }
+        }
         if (__sync_bool_compare_and_swap(&ios_ts_armed, 0, 1))
         {
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_thread_sampler_main(); });

@@ -300,6 +300,24 @@ final class SteamAccountModel: ObservableObject {
 
     func game(_ appID: Int) -> SteamOwnedGame? { owned.first { $0.id == appID } }
 
+    /// ml1710: the license agreements an app lists, from its PICS info. nil when signed out, on
+    /// error, or after 8 s: the launch then goes ahead and the client asks as it always did.
+    private var eulaCache: [Int: [SteamEula]] = [:]
+    func eulas(for appID: Int) async -> [SteamEula]? {
+        if let cached = eulaCache[appID] { return cached }
+        guard phase == .signedIn else { return nil }
+        let fetcher = self.fetcher
+        let result = await withTaskGroup(of: [SteamEula]?.self) { group -> [SteamEula]? in
+            group.addTask { @MainActor in (try? await fetcher.fetchAppInfo(appID: UInt32(appID)))?.eulas }
+            group.addTask { try? await Task.sleep(nanoseconds: 8_000_000_000); return nil }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+        if let result { eulaCache[appID] = result }
+        return result
+    }
+
     /// ml1390: before a Windows-client launch, record what the install record
     /// says, so a client refusal ("please update these games first") can be
     /// compared with it. Fields and depot/manifest IDs only; no account data.

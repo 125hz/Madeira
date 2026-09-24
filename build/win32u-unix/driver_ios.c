@@ -987,11 +987,56 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
      * side keeps that gate, so its backdrop can still never cover a game. */
     if (winios_window_frame && (winios_desktop_mode() || winios_direct_overlay()))
     {
-        const RECT *v = &new_rects->visible;
-        const RECT *c = &new_rects->client;
+        RECT vr = new_rects->visible, cr = new_rects->client;
+        const RECT *v = &vr, *c = &cr;
         int visible = !IsRectEmpty( v ) && !(swp_flags & SWP_HIDEWINDOW);
+        /* ml1690: a CHILD window's rects arrive in its parent's client
+         * coordinates, but every window layer is a sibling under the one
+         * compositor root, framed in desktop pixels. So a child with its own
+         * layer -- the embedded browser view of a sign-in dialog, drawn through
+         * a swapchain -- was placed at the desktop's origin instead of inside
+         * its dialog. Map child rects to the desktop first.
+         * MADEIRA_CHILD_LAYER_SCREEN=0 restores parent-relative placement. */
+        {
+            static int enabled = -1;
+            HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
+            if (enabled < 0) { const char *e = getenv( "MADEIRA_CHILD_LAYER_SCREEN" ); enabled = !(e && e[0] == '0'); }
+            if (enabled && parent && parent != get_desktop_window())
+            {
+                UINT dpi = get_thread_dpi();
+                map_window_points( parent, 0, (POINT *)&vr, 2, dpi );
+                map_window_points( parent, 0, (POINT *)&cr, 2, dpi );
+            }
+        }
         winios_window_frame( hwnd, v->left, v->top, v->right - v->left, v->bottom - v->top, visible,
                              c->left, c->top, c->right - c->left, c->bottom - c->top );
+
+        /* ml1690: children do not get a WindowPosChanged when only their parent
+         * moves (their parent-relative rects are unchanged), so their layers
+         * would stay where the dialog used to be. Re-send the direct children's
+         * desktop rects whenever a top-level window moves or resizes. */
+        if (!(swp_flags & SWP_NOMOVE) || !(swp_flags & SWP_NOSIZE))
+        {
+            HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
+            const char *e = getenv( "MADEIRA_CHILD_LAYER_SCREEN" );
+            if (!(e && e[0] == '0') && (!parent || parent == get_desktop_window()))
+            {
+                HWND *list = list_window_children( hwnd );
+                UINT dpi = get_thread_dpi();
+                int i;
+                for (i = 0; list && list[i] && i < 64; i++)
+                {
+                    RECT wr, cl;
+                    DWORD style = NtUserGetWindowLongW( list[i], GWL_STYLE );
+                    if (!NtUserGetWindowRect( list[i], &wr, dpi ) || !NtUserGetClientRect( list[i], &cl, dpi )) continue;
+                    map_window_points( list[i], 0, (POINT *)&cl, 2, dpi );
+                    winios_window_frame( list[i], wr.left, wr.top, wr.right - wr.left, wr.bottom - wr.top,
+                                         (style & WS_VISIBLE) && !IsRectEmpty( &wr ),
+                                         cl.left, cl.top, cl.right - cl.left, cl.bottom - cl.top );
+                }
+                free( list );
+            }
+        }
     }
 
     /* ml1110 — THE OTHER HALF OF "WHY IS THE CLIENT AREA BLANK": the windows

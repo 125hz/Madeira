@@ -975,7 +975,14 @@ static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_s
      * mapping -- fixups that were applied resolve high, the rest resolve through
      * the window, and both reach the same bytes. Without ml938 this branch
      * would be producing a half-relocated image; with it, the image is whole. */
-    else if (reloc_dir && mapping->image.base && mapping->image.base < PE_LOW_BASE_FLOOR)
+    /* ml1670: 64-bit images only. Every PE32 image has a base below 4GB, and in
+     * a WoW64 pseudo-process it is mapped at that base inside the process's own
+     * 4GB window, so "unmappable" does not apply to it. Forcing those to
+     * relocate also fed each one into ml938's single session-wide sub-floor
+     * table, where the 32-bit Steam client and its web helper re-pointed each
+     * other's DLL windows. MADEIRA_SUBFLOOR_PE32=1 restores the old reach. */
+    else if (reloc_dir && mapping->image.base && mapping->image.base < PE_LOW_BASE_FLOOR
+             && (nt.opt.hdr32.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC || getenv( "MADEIRA_SUBFLOOR_PE32" )))
     {
         fprintf( stderr, "ml936: image base %#llx below the %#llx floor, unmappable here; "
                  "relocating anyway (dynamic_base=%d relocs_stripped=%d) -- ml938 will "

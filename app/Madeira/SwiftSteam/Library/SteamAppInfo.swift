@@ -16,6 +16,8 @@ struct SteamAppInfo {
     var depots: [DepotInfo] = []
     var launchConfigs: [LaunchConfig] = []
     var buildID: UInt32 = 0
+    /// Madeira ml1710: third-party license agreements (`common.eulas`), in list order.
+    var eulas: [SteamEula] = []
 
     // Cloud save info
     var cloudSaveEnabled: Bool = false
@@ -252,6 +254,13 @@ struct SteamAppInfo {
             info.rawType = common["type"] as? String ?? ""
             info.type = AppType(pics: info.rawType)
             info.oslist = common["oslist"] as? String ?? ""
+            if let list = common["eulas"] as? [String: Any] {
+                info.eulas = list.keys.sorted { (Int($0) ?? 0) < (Int($1) ?? 0) }.compactMap { key in
+                    guard let item = list[key] as? [String: Any], let id = item["id"] as? String, !id.isEmpty else { return nil }
+                    return SteamEula(id: id, name: item["name"] as? String ?? "", url: item["url"] as? String ?? "",
+                                     version: item["version"].map { "\($0)" } ?? "0")
+                }
+            }
         }
 
         // Config section

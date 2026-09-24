@@ -383,6 +383,173 @@ enum SteamLaunchScene: Equatable {
 /// been gone for `coverDelay` s the starting screen returns, at most
 /// `maxAutoReveals` times, after which the desktop stays. "Show Steam" reveals
 /// it for good.
+/// A third-party license agreement listed in an app's PICS info (`common/eulas`).
+struct SteamEula: Equatable, Sendable {
+    var id: String        // e.g. "17410_eula_1"; also the key the client records
+    var name: String
+    var url: String
+    var version: String
+}
+
+/// ml1710: LICENSE AGREEMENTS ARE ANSWERED IN MADEIRA, BEFORE THE CLIENT STARTS.
+///
+/// The Windows Steam client records an accepted agreement in
+/// userdata/<account>/config/localconfig.vdf as
+///     UserLocalConfigStore/Software/Valve/Steam/apps/<appid>/"<eula id>" = "<version>"
+/// and, when one is missing, stops a launch to ask. A -silent launch asks inside a window it
+/// keeps hidden, so on this device the launch sat at "waiting for user response to ShowEula"
+/// with nothing to answer. Madeira shows the agreement in its own sheet instead and records
+/// it only after the user accepts. This is the one place Madeira writes a Steam file: the
+/// edit inserts lines as text and leaves everything else byte for byte as the client wrote it.
+enum SteamEulaStore {
+    static func configFiles(steamRoot: URL) -> [URL] {
+        let userdata = steamRoot.appendingPathComponent("userdata")
+        let accounts = (try? FileManager.default.contentsOfDirectory(at: userdata, includingPropertiesForKeys: nil)) ?? []
+        return accounts.filter { Int($0.lastPathComponent) != nil }
+            .map { $0.appendingPathComponent("config/localconfig.vdf") }
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    /// Agreements not yet recorded in the given localconfig text.
+    static func missing(appID: Int, eulas: [SteamEula], in text: String) -> [SteamEula] {
+        guard let root = parse(Array(text.utf8)) else { return eulas }
+        var nodes = root, app: Node?
+        for key in ["userlocalconfigstore", "software", "valve", "steam", "apps", String(appID)] {
+            guard let node = nodes.first(where: { $0.key.lowercased() == key }) else { return eulas }
+            app = node; nodes = node.children
+        }
+        return eulas.filter { app?.leaves[$0.id.lowercased()] == nil }
+    }
+
+    /// Agreements missing from any account's localconfig on this drive. Empty when there is
+    /// no localconfig yet (nothing to record into; the client then asks as it always did).
+    static func missing(appID: Int, eulas: [SteamEula], steamRoot: URL) -> [SteamEula] {
+        var result: [SteamEula] = []
+        for file in configFiles(steamRoot: steamRoot) {
+            guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
+            for eula in missing(appID: appID, eulas: eulas, in: text) where !result.contains(eula) { result.append(eula) }
+        }
+        return result
+    }
+
+    /// Records the agreements in every account's localconfig. Returns the number of files changed.
+    @discardableResult
+    static func record(appID: Int, eulas: [SteamEula], steamRoot: URL) throws -> Int {
+        var changed = 0
+        for file in configFiles(steamRoot: steamRoot) {
+            let text = try String(contentsOf: file, encoding: .utf8)
+            guard let updated = record(appID: appID, eulas: eulas, in: text), updated != text else { continue }
+            let backup = file.appendingPathExtension("madeira-bak")
+            if !FileManager.default.fileExists(atPath: backup.path) { try? FileManager.default.copyItem(at: file, to: backup) }
+            try updated.write(to: file, atomically: true, encoding: .utf8)
+            changed += 1
+        }
+        return changed
+    }
+
+    // MARK: text edit
+
+    private struct Node { var key: String; var open: Int; var close: Int; var children: [Node]; var leaves: [String: Range<Int>] }
+
+    /// Returns the text with the agreements inserted, or nil when the file has no
+    /// UserLocalConfigStore/Software/Valve/Steam section to put them in.
+    static func record(appID: Int, eulas: [SteamEula], in text: String) -> String? {
+        var bytes = Array(text.utf8)
+        let newline = text.contains("\r\n") ? "\r\n" : "\n"
+        for eula in eulas {
+            guard let root = parse(bytes) else { return nil }
+            func find(_ path: [String], in nodes: [Node]) -> Node? {
+                guard let first = path.first, let node = nodes.first(where: { $0.key.lowercased() == first }) else { return nil }
+                return path.count == 1 ? node : find(Array(path.dropFirst()), in: node.children)
+            }
+            guard let steam = find(["userlocalconfigstore", "software", "valve", "steam"], in: root) else { return nil }
+            let apps = steam.children.first { $0.key.lowercased() == "apps" }
+            let app = apps?.children.first { $0.key == String(appID) }
+            let entry = "\"\(escape(eula.id))\"\t\t\"\(escape(eula.version))\""
+            if let app, let range = app.leaves[eula.id.lowercased()] {
+                bytes.replaceSubrange(range, with: Array("\"\(escape(eula.version))\"".utf8))   // value only
+            } else if let app {
+                let indent = indentation(bytes, before: app.close) + "\t"
+                insert(&bytes, at: lineStart(bytes, app.close), indent + entry + newline)
+            } else if let apps {
+                let indent = indentation(bytes, before: apps.close) + "\t"
+                insert(&bytes, at: lineStart(bytes, apps.close),
+                       indent + "\"\(appID)\"" + newline + indent + "{" + newline + indent + "\t" + entry + newline + indent + "}" + newline)
+            } else {
+                let indent = indentation(bytes, before: steam.close) + "\t"
+                insert(&bytes, at: lineStart(bytes, steam.close),
+                       indent + "\"apps\"" + newline + indent + "{" + newline
+                       + indent + "\t\"\(appID)\"" + newline + indent + "\t{" + newline + indent + "\t\t" + entry + newline
+                       + indent + "\t}" + newline + indent + "}" + newline)
+            }
+        }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    private static func escape(_ s: String) -> String { s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") }
+    private static func insert(_ bytes: inout [UInt8], at index: Int, _ text: String) { bytes.insert(contentsOf: Array(text.utf8), at: index) }
+    private static func lineStart(_ bytes: [UInt8], _ index: Int) -> Int {
+        var i = index
+        while i > 0, bytes[i - 1] != 10 { i -= 1 }
+        return i
+    }
+    private static func indentation(_ bytes: [UInt8], before index: Int) -> String {
+        let start = lineStart(bytes, index)
+        return String(decoding: bytes[start..<index].filter { $0 == 9 || $0 == 32 }, as: UTF8.self)
+    }
+
+    /// A position-keeping reader for the same grammar SteamKeyValues accepts.
+    private static func parse(_ bytes: [UInt8]) -> [Node]? {
+        var i = bytes.starts(with: [0xef, 0xbb, 0xbf]) ? 3 : 0
+        enum Tok { case word(String, Range<Int>), open(Int), close(Int) }
+        func next() -> Tok? {
+            while i < bytes.count {
+                if bytes[i] <= 32 { i += 1; continue }
+                if bytes[i] == 47, i + 1 < bytes.count, bytes[i + 1] == 47 { while i < bytes.count && bytes[i] != 10 { i += 1 }; continue }
+                break
+            }
+            guard i < bytes.count else { return nil }
+            let start = i
+            if bytes[i] == 123 { i += 1; return .open(start) }
+            if bytes[i] == 125 { i += 1; return .close(start) }
+            var value: [UInt8] = []
+            if bytes[i] == 34 {
+                i += 1
+                while i < bytes.count, bytes[i] != 34 {
+                    if bytes[i] == 92, i + 1 < bytes.count { value.append(bytes[i + 1]); i += 2; continue }
+                    value.append(bytes[i]); i += 1
+                }
+                guard i < bytes.count else { return nil }
+                i += 1
+            } else {
+                while i < bytes.count, bytes[i] > 32, bytes[i] != 123, bytes[i] != 125 { value.append(bytes[i]); i += 1 }
+            }
+            return .word(String(decoding: value, as: UTF8.self), start..<i)
+        }
+        func object(depth: Int) -> (nodes: [Node], leaves: [String: Range<Int>], close: Int)? {
+            guard depth < 64 else { return nil }
+            var nodes: [Node] = [], leaves: [String: Range<Int>] = [:]
+            while let tok = next() {
+                switch tok {
+                case .close(let at): return depth > 0 ? (nodes, leaves, at) : nil
+                case .open: return nil
+                case .word(let key, _):
+                    guard let value = next() else { return nil }
+                    switch value {
+                    case .open(let at):
+                        guard let inner = object(depth: depth + 1) else { return nil }
+                        nodes.append(Node(key: key, open: at, close: inner.close, children: inner.nodes, leaves: inner.leaves))
+                    case .word(_, let range): leaves[key.lowercased()] = range
+                    case .close: return nil
+                    }
+                }
+            }
+            return depth == 0 ? (nodes, leaves, bytes.count) : nil
+        }
+        return object(depth: 0)?.nodes
+    }
+}
+
 struct SteamLaunchHold {
     enum Action: Equatable { case none, showGame, reveal, cover }
     static let revealDelay = 2.0, coverDelay = 4.0, maxAutoReveals = 6

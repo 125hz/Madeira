@@ -74,6 +74,52 @@ func rejected(_ label: String, _ operation: () throws -> Void) throws {
         try profile.validate()
         try require(profile.launchArguments.contains("-applaunch 12345"), "launch identity independent of cover")
         try require(profile.launchArguments.contains(" -silent -applaunch 12345"), "game launch keeps the library window closed")
+        // ml1710: license agreements recorded where the client looks, as a text insertion.
+        let eula = SteamEula(id: "17410_eula_1", name: "EULA", url: "https://example.invalid/eula", version: "0")
+        let config = #"""
+"UserLocalConfigStore"
+{
+	"Software"
+	{
+		"Valve"
+		{
+			"Steam"
+			{
+				"apps"
+				{
+					"17410"
+					{
+						"LastPlayed"		"1"
+					}
+					"20"
+					{
+						"Playtime"		"5"
+					}
+				}
+			}
+		}
+	}
+	"friends"
+	{
+		"x"		"y"
+	}
+}
+"""#
+        try require(SteamEulaStore.missing(appID: 17410, eulas: [eula], in: config) == [eula], "agreement missing before")
+        guard let recorded = SteamEulaStore.record(appID: 17410, eulas: [eula], in: config) else { throw SteamFileError.invalid("FAIL: record into existing app") }
+        try require(SteamEulaStore.missing(appID: 17410, eulas: [eula], in: recorded).isEmpty, "agreement recorded in the app block")
+        try require(recorded.contains("\t\t\t\t\t\t\"17410_eula_1\"\t\t\"0\"\n") && recorded.contains("\"LastPlayed\"\t\t\"1\"") && recorded.contains("\"x\"\t\t\"y\""), "insertion keeps indentation and the rest of the file")
+        try require(SteamEulaStore.record(appID: 17410, eulas: [eula], in: recorded) == recorded, "recording twice changes nothing")
+        let bumped = SteamEula(id: eula.id, name: eula.name, url: eula.url, version: "2")
+        guard let replaced = SteamEulaStore.record(appID: 17410, eulas: [bumped], in: recorded) else { throw SteamFileError.invalid("FAIL: version replace") }
+        try require(replaced.contains("\"17410_eula_1\"\t\t\"2\"") && !replaced.contains("\"17410_eula_1\"\t\t\"0\""), "a newer version replaces the value")
+        let other30 = SteamEula(id: "30_eula_1", name: "", url: "", version: "1")
+        guard let newApp = SteamEulaStore.record(appID: 30, eulas: [other30], in: config) else { throw SteamFileError.invalid("FAIL: new app block") }
+        try require(SteamEulaStore.missing(appID: 30, eulas: [other30], in: newApp).isEmpty && SteamEulaStore.missing(appID: 17410, eulas: [eula], in: newApp) == [eula], "new app block created")
+        let noApps = config.replacingOccurrences(of: "\"apps\"", with: "\"notapps\"")
+        guard let withApps = SteamEulaStore.record(appID: 30, eulas: [other30], in: noApps) else { throw SteamFileError.invalid("FAIL: apps block") }
+        try require(SteamEulaStore.missing(appID: 30, eulas: [other30], in: withApps).isEmpty, "apps block created")
+        try require(SteamEulaStore.record(appID: 30, eulas: [other30], in: "\"UserLocalConfigStore\"\n{\n}\n") == nil, "no Steam section: nothing written")
         setenv("MADEIRA_STEAM_SILENT", "0", 1)
         try require(!profile.launchArguments.contains("-silent"), "silent rollback")
         unsetenv("MADEIRA_STEAM_SILENT")

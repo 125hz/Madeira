@@ -308,17 +308,26 @@ struct CAuthentication_BeginAuthSessionViaCredentials_Request {
 
     func serialize() -> Data {
         var encoder = ProtobufEncoder()
-        // Field numbers from steammessages_auth.steamclient.proto
-        encoder.writeString(fieldNumber: 1, value: accountName)
-        encoder.writeString(fieldNumber: 2, value: encryptedPassword)
-        encoder.writeUInt64(fieldNumber: 3, value: encryptionTimestamp)
-        // DeviceDetails as a sub-message (field 6)
+        // Field numbers from steammessages_auth.steamclient.proto:
+        //   1 device_friendly_name, 2 account_name, 3 encrypted_password,
+        //   4 encryption_timestamp, 6 platform_type, 7 persistence,
+        //   8 website_id, 9 device_details.
+        // ml1690: this used to send the account name as field 1 and the
+        // encrypted password as field 2, so Steam read the password blob as the
+        // account name and every typed sign-in failed with InvalidPassword /
+        // AccountNotFound ("account name or password is incorrect").
+        encoder.writeString(fieldNumber: 1, value: deviceFriendlyName)
+        encoder.writeString(fieldNumber: 2, value: accountName)
+        encoder.writeString(fieldNumber: 3, value: encryptedPassword)
+        encoder.writeUInt64(fieldNumber: 4, value: encryptionTimestamp)
+        encoder.writeUInt32(fieldNumber: 6, value: platformType)
+        encoder.writeUInt32(fieldNumber: 7, value: persistence)
+        encoder.writeString(fieldNumber: 8, value: websiteId)
+        // CAuthentication_DeviceDetails: 1 device_friendly_name, 2 platform_type.
         var deviceEncoder = ProtobufEncoder()
         deviceEncoder.writeString(fieldNumber: 1, value: deviceFriendlyName)
         deviceEncoder.writeUInt32(fieldNumber: 2, value: platformType)
-        encoder.writeSubmessage(fieldNumber: 6, value: deviceEncoder.data)
-        encoder.writeUInt32(fieldNumber: 7, value: persistence)
-        encoder.writeString(fieldNumber: 8, value: websiteId)
+        encoder.writeSubmessage(fieldNumber: 9, value: deviceEncoder.data)
         return encoder.data
     }
 }
@@ -358,7 +367,8 @@ struct CAuthentication_BeginAuthSessionViaCredentials_Response {
                     }
                 }
                 msg.allowedConfirmations.append(confirmation)
-            case 5: msg.steamid = try decoder.readFixed64()
+            // steamid: accept either encoding rather than trust one.
+            case 5: msg.steamid = try (tag.wireType == .fixed64 ? decoder.readFixed64() : decoder.readVarint())
             default: try decoder.skip(wireType: tag.wireType)
             }
         }
@@ -414,7 +424,7 @@ struct CAuthentication_UpdateAuthSessionWithSteamGuardCode_Request {
     func serialize() -> Data {
         var encoder = ProtobufEncoder()
         encoder.writeUInt64(fieldNumber: 1, value: clientID)
-        encoder.writeUInt64(fieldNumber: 2, value: steamid)
+        encoder.writeFixed64(fieldNumber: 2, value: steamid)   // fixed64 steamid = 2 in the proto
         encoder.writeString(fieldNumber: 3, value: code)
         encoder.writeUInt32(fieldNumber: 4, value: codeType)
         return encoder.data

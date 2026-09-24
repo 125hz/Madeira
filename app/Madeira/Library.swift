@@ -222,6 +222,8 @@ struct LibraryEntry: Codable, Identifiable {
         let mode: String
         // ml1360: a game launch keeps Steam's library window closed (-silent);
         // sign-in and error windows still appear. MADEIRA_STEAM_SILENT=0 shows it.
+        // ml1710: license agreements are answered in Madeira before launch (SteamEulaStore), so
+        // every game launch stays silent.
         let silent = LibraryFlags.enabled("MADEIRA_STEAM_SILENT") ? " -silent" : ""
         if let id = steamAppID { mode = steamInstalled == false ? " steam://install/\(id)" : silent + " -applaunch \(id)" }
         else { mode = steamBigPicture == true ? " -gamepadui" : "" }
