@@ -28,6 +28,38 @@ extern "C" {
 // Updated when a GDI surface reaches the compositor, including desktop sessions.
 unsigned long long winios_surface_present_count(void);
 
+/* ml1490 — TOP-LEVEL WINDOW CENSUS, for the starting screen of a game started
+ * through the Windows Steam client. That launch is a desktop session, and the
+ * starting screen used to disappear on the desktop's first GDI frame, so the
+ * user watched the client's console and helper windows instead of the game.
+ * The app now keeps the starting screen until a window of the started game is
+ * up, and needs to know, per top-level window: is it shown, how big, has it put
+ * a frame on screen, and which program owns it.
+ *
+ * Fed from the driver hooks on the window's own wine thread (WindowPosChanged,
+ * the GDI flush, DestroyWindow, the desktop-mode swapchain), so nothing polls
+ * win32u. Costs nothing while off; the app turns it on only for such a launch.
+ * `image` is the owning process's executable base name, lower case ASCII
+ * ("" when it could not be read). Only top-level windows are listed. */
+#define WINIOS_CENSUS_MAX 64
+struct winios_census_window {
+    unsigned long long hwnd;
+    int x, y, w, h;               /* visible rect, desktop pixels */
+    unsigned int pid;             /* owning Windows process id, 0 = unknown */
+    unsigned int presents;        /* GDI frames this window put on screen */
+    unsigned char visible;        /* WS_VISIBLE, not minimized, non-empty rect */
+    unsigned char metal;          /* a D3D swapchain presents into it (DXMT) */
+    unsigned char reserved[2];
+    char image[48];
+};
+
+/* Main thread. on=1 starts an empty census (and forgets cached process names,
+ * whose ids a new session may reuse); on=0 stops and empties it. */
+void winios_window_census_enable(int on);
+
+/* Main thread. Copies up to `max` entries; returns how many were copied. */
+int winios_window_census(struct winios_census_window *out, int max);
+
 /* Build the driver-funcs struct and register it via __wine_set_user_driver.
  * Idempotent: safe to call repeatedly; first call wins. */
 void winios_drv_register(void);
@@ -152,6 +184,8 @@ void winios_cursor_relayout(void);
  * size. Call it from the same place as winios_cursor_relayout/
  * winios_overlay_relayout. No-op in a direct launch (no compositor). */
 void winios_compositor_relayout(void);
+/* ml1530: hide/show a desktop session's compositor view (library front end, ended session). */
+int winios_compositor_set_hidden(int hidden);
 
 /* ========================================================================
  * ml — THE DIRECT-LAUNCH GDI OVERLAY.
@@ -348,3 +382,8 @@ void winios_gamepad_stats(unsigned int *samples, unsigned int *packets);
  * something two separate builds can never give you. */
 void madeira_set_diag_enabled(int on);
 int  madeira_get_diag_enabled(void);
+
+/* ml1510: turn the per-program scheduling classes (MADEIRA_QOS_*_EXES) on once
+ * the game's window is up and off when the session ends. Implemented in
+ * build/ntdll-unix/signal_arm64_ios.c; each listed thread moves at its next wait. */
+void madeira_set_background_qos(int on);

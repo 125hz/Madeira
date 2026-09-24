@@ -49,6 +49,16 @@ for marker in ['nonisolated static func safeRelativePath(', 'nonisolated static 
 helpers += '    enum ServerEligibility: Equatable { case usable, noHTTPS, other }\n}\n'
 helpers += block(downloader, 'final class ContentHostHealth')
 journal = block(downloader, 'final class JournalWriter')
+# ml1490: the native install's program choice, from SteamAccount.swift (which
+# needs UIKit as a whole). SA holds the static members of SteamAccountModel.
+account = (app / 'SteamAccount.swift').read_text()
+exe_search = block(account, 'struct SteamLaunchOption') + 'enum SA {\n'
+exe_search += block(account, 'struct ExecutableChoice') + block(account, 'struct ExecutableSearch')
+helpers_at = account.index('private nonisolated static let helperNames')
+exe_search += '    static let helperNames' + account[account.index(' = [', helpers_at):account.index(']', helpers_at) + 1] + '\n'
+for marker in ['nonisolated static func searchExecutable(', 'nonisolated static func executableCandidates(']:
+    exe_search += block(account, marker).replace('nonisolated ', '')
+exe_search += '}\n'
 entry = library[library.index('struct LibraryEntry:'):library.index('final class LibraryModel:')]
 model_methods = library[library.index('    func mergeSteam('):library.index('    private func persist(')]
 
@@ -72,6 +82,11 @@ class LibraryModel {
         let url = drive.appendingPathComponent(relative)
         guard FileManager.default.fileExists(atPath: url.path) else { throw LibraryError.message("missing") }
         return url
+    }
+    // A Windows program: "MZ" at the start (the production reader also checks the PE header).
+    static func inspect(_ url: URL) throws -> LibraryEntry {
+        guard url.path.hasPrefix(drive.path + "/"), (try? Data(contentsOf: url))?.prefix(2) == Data([0x4d, 0x5a]) else { throw LibraryError.message("not a program") }
+        return LibraryEntry(title: url.deletingPathExtension().lastPathComponent, relativePath: String(url.path.dropFirst(drive.path.count + 1)), bits: 32)
     }
     MODEL_METHODS
 }
@@ -420,6 +435,47 @@ func appVDF(_ body: String) -> Data { Data(("\"appinfo\" { \"appid\" \"10\" " + 
         model.removeSteamInstall(model.entries[0].id)
         require(model.entries.isEmpty, "uninstall removes the entry")
 
+        // ml1490: the folder scan never chooses a redistributable's installer.
+        let installRelative = "Program Files (x86)/Steam/steamapps/common/Scan Game"
+        let game = LibraryModel.drive.appendingPathComponent(installRelative)
+        try? FileManager.default.removeItem(at: game)
+        for (path, size) in [("Binaries/Game.exe", 2_000), ("PhysX/PhysX_SystemSoftware.exe", 64_000), ("unins000.exe", 1_000),
+                             ("_CommonRedist/vcredist/2010/vcredist_x86.exe", 9_000), ("Support/Tool.exe", 70_000),
+                             ("Binaries/readme.txt", 10)] {
+            let url = game.appendingPathComponent(path)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            var bytes = Data(repeating: 0, count: size); if path.hasSuffix(".exe") { bytes[0] = 0x4d; bytes[1] = 0x5a }
+            try bytes.write(to: url)
+        }
+        let unresolved = [SteamLaunchOption(executable: "Binaries\\Missing.exe", arguments: "", label: "", arch: "64", type: "default"),
+                          SteamLaunchOption(executable: "..\\escape.exe", arguments: "", label: "", arch: "", type: "default")]
+        var search = SA.searchExecutable(folder: game, options: unresolved, drive: LibraryModel.drive)
+        require(search.choice?.url.lastPathComponent == "Game.exe" && search.choice?.source == "scan" && search.skipped == 4,
+                "scan skips installers by name and folder (\(search.choice?.url.path ?? "none"), skipped \(search.skipped))")
+        require(search.rejected == ["exe=Binaries\\Missing.exe reason=missing", "exe=..\\escape.exe reason=unsafe-path"],
+                "rejected launch options carry their reason (\(search.rejected))")
+        setenv("MADEIRA_STEAM_EXE_FILTER", "0", 1)
+        search = SA.searchExecutable(folder: game, options: [], drive: LibraryModel.drive)
+        require(search.choice?.url.lastPathComponent == "Tool.exe" && search.skipped == 0, "filter rollback: the old size-first choice")
+        unsetenv("MADEIRA_STEAM_EXE_FILTER")
+        search = SA.searchExecutable(folder: game, options: [SteamLaunchOption(executable: "binaries\\GAME.EXE", arguments: "-x", label: "", arch: "", type: "")],
+                                     drive: LibraryModel.drive)
+        require(search.choice?.source == "launch" && search.choice?.arguments == "-x" && search.rejected.isEmpty, "a resolving launch option wins")
+        try FileManager.default.removeItem(at: game.appendingPathComponent("Binaries/Game.exe"))
+        require(SA.searchExecutable(folder: game, options: [], drive: LibraryModel.drive).choice == nil, "only installers: nothing is chosen")
+
+        // ...and an installer chosen before the filter is not kept by an update.
+        try Data([0x4d, 0x5a]).write(to: game.appendingPathComponent("Binaries/Game.exe"))
+        var stale = native; stale.id = UUID(); stale.steamClientLaunch = nil; stale.steamInstallPath = installRelative
+        stale.relativePath = installRelative + "/PhysX/PhysX_SystemSoftware.exe"
+        model.entries = [stale]
+        var refreshed = stale; refreshed.relativePath = installRelative + "/Binaries/Game.exe"
+        model.upsertNativeSteam(refreshed)
+        require(model.entries[0].relativePath == refreshed.relativePath, "update replaces an installer chosen earlier")
+        model.entries = [stale]
+        setenv("MADEIRA_STEAM_EXE_FILTER", "0", 1); model.upsertNativeSteam(refreshed); unsetenv("MADEIRA_STEAM_EXE_FILTER")
+        require(model.entries[0].relativePath == stale.relativePath, "filter rollback keeps the earlier choice")
+
         if failures > 0 { print("FAILURES: \(failures)"); exit(1) }
         print("PASS: all ml1310 Swift checks")
     }
@@ -430,7 +486,7 @@ with tempfile.TemporaryDirectory() as tmp:
     tmp = Path(tmp)
     (tmp / 'stubs.swift').write_text(stubs + entry)
     (tmp / 'vdf.swift').write_text('import Foundation\n' + vdf)
-    (tmp / 'helpers.swift').write_text('import Foundation\nimport Glibc\n' + helpers + journal)
+    (tmp / 'helpers.swift').write_text('import Foundation\nimport Glibc\n' + helpers + journal + exe_search)
     (tmp / 'checks.swift').write_text(checks)
     sources = [tmp / 'stubs.swift', tmp / 'vdf.swift', tmp / 'helpers.swift', tmp / 'checks.swift',
                app / 'SteamFiles.swift', steam / 'Library/SteamAppInfo.swift', steam / 'Install/AppManifestWriter.swift',

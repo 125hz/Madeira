@@ -1034,6 +1034,14 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         }
     }
 
+    /* ml1520: a program parked while the game runs (ios_park_check,
+     * signal_arm64_ios.c) may not start again until the session ends. */
+    {
+        extern int ios_park_refuse( const WCHAR *path, size_t len );
+        if (ios_park_refuse( params->ImagePathName.Buffer, params->ImagePathName.Length / sizeof(WCHAR) ))
+            return STATUS_ACCESS_DENIED;
+    }
+
     /* ml526: stamp every accepted spawn on the startup timeline. This is the
      * boundary the coarse phase accounting could not see — steam.exe -> the
      * webhelper spawn was a ~16s block with no internal detail. */
@@ -1042,6 +1050,53 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         char pbuf[160];
         snprintf( pbuf, sizeof(pbuf), "spawn:%s", debugstr_us( &params->ImagePathName ) );
         winios_phase( pbuf );
+    }
+
+    /* ml1620: the launcher client started by its own installer or by its
+     * self-update restart carries none of the front end's arguments, so it
+     * kept its browser-helper hang timeout. On a slower tablet the helper's
+     * first page took longer than that and the client killed it ("Assertion
+     * Failed: killing unresponsive browser", tablet log 3 (2)); the sign-in
+     * window never came. Append -cef-disable-hang-timeouts to any steam.exe
+     * spawn that lacks it (the front end already passes it on game launches).
+     * MADEIRA_STEAM_NO_HANG_KILL=0 disables it; [proc-gate] logs it. */
+    {
+        static const char client[] = "\\steam.exe", flag[] = " -cef-disable-hang-timeouts";
+        const WCHAR *ip = params->ImagePathName.Buffer, *cl = params->CommandLine.Buffer;
+        int ip_len = params->ImagePathName.Length / sizeof(WCHAR), cl_len = params->CommandLine.Length / sizeof(WCHAR);
+        int nl = sizeof(client) - 1, fl = sizeof(flag) - 1, k, j, match = 0, has = 0;
+        const char *off = getenv( "MADEIRA_STEAM_NO_HANG_KILL" );
+
+        if (!(off && off[0] == '0') && ip && cl && ip_len >= nl)
+        {
+            for (j = 0; j < nl; j++)
+            {
+                WCHAR c = ip[ip_len - nl + j];
+                if (c >= 'A' && c <= 'Z') c += 32;
+                if (c == '/') c = '\\';
+                if (c != (WCHAR)client[j]) break;
+            }
+            match = (j == nl);
+            for (k = 0; match && k + fl - 1 <= cl_len && !has; k++)
+            {
+                for (j = 1; j < fl; j++) if (cl[k + j - 1] != (WCHAR)flag[j]) break;
+                if (j == fl) has = 1;
+            }
+        }
+        if (match && !has)
+        {
+            WCHAR *nbuf = malloc( (cl_len + fl + 1) * sizeof(WCHAR) );
+            if (nbuf)
+            {
+                memcpy( nbuf, cl, cl_len * sizeof(WCHAR) );
+                for (j = 0; j < fl; j++) nbuf[cl_len + j] = (WCHAR)flag[j];
+                nbuf[cl_len + fl] = 0;
+                params->CommandLine.Buffer = nbuf;
+                params->CommandLine.Length = (cl_len + fl) * sizeof(WCHAR);
+                params->CommandLine.MaximumLength = params->CommandLine.Length + sizeof(WCHAR);
+                dprintf( 2, "[proc-gate] ml1620 steam.exe: appended -cef-disable-hang-timeouts\n" );
+            }
+        }
     }
 
     /* task #34 single-process CEF: the 64GB VA window above the GPU carveout
@@ -1254,13 +1309,24 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                  * MADEIRA_JITLESS=0 turns it off; default stays ON (unchanged). */
                 const char *jl = getenv( "MADEIRA_JITLESS" );
                 const char *lf = getenv( "MADEIRA_CEF_LOGGING_FIX" );
+                /* ml1520: VERBOSE browser logging only with diagnostics on.
+                 * --v=1 at verbose severity had the helper formatting and
+                 * writing every VLOG line for the whole session, game running
+                 * or not; the quiet build keeps warnings and errors, which is
+                 * all the [guest-log] mirror reads. MADEIRA_CEF_QUIET_LOG=0
+                 * restores verbose always. */
+                const char *ql = getenv( "MADEIRA_CEF_QUIET_LOG" );
+                extern int madeira_diag_on( void );
+                int verbose = (ql && ql[0] == '0') || madeira_diag_on();
                 int jitless_on = !(jl && jl[0] == '0');
                 int logging_fix = !(lf && lf[0] == '0');
                 char sp[256];
-                snprintf( sp, sizeof(sp), " --single-process --enable-logging%s --v=1 --log-severity=verbose"
+                snprintf( sp, sizeof(sp), " --single-process --enable-logging%s%s"
                           " --no-proxy-server --winhttp-proxy-resolver%s",
-                          logging_fix ? "" : "=file", jitless_on ? " --js-flags=--jitless" : "" );
-                dprintf(2, "[cef-logging] ml1300 valid-destination=%d jitless=%d\n", logging_fix, jitless_on);
+                          logging_fix ? "" : "=file", verbose ? " --v=1 --log-severity=verbose" : " --log-severity=warning",
+                          jitless_on ? " --js-flags=--jitless" : "" );
+                dprintf(2, "[cef-logging] ml1300 valid-destination=%d jitless=%d verbose=%d (ml1520)\n",
+                        logging_fix, jitless_on, verbose);
                 static const char dfs[] = "--disable-features=";
                 /* ml426 (#70): + segmentation-platform features. Four CreateBrowser
                  * runs died C00000FD in the CreateResponse→BrowserReady gap, and

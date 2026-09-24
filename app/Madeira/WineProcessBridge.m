@@ -597,6 +597,78 @@ static uint16_t madeira_pe_machine(const char *unix_path) {
 #define MADEIRA_IMAGE_FILE_MACHINE_AMD64 0x8664
 #define MADEIRA_IMAGE_FILE_MACHINE_ARM64 0xaa64
 
+/* ml1490: the Steam identity (SteamAppPath / SteamAppId / SteamGameId) belongs to
+ * the launch, not to the app. It used to be one title's hard-coded values
+ * published to every guest, so any other Steam game started directly saw a
+ * foreign app ID (device log 188: a Source title started with another game's ID
+ * and exited with status 1 inside two seconds).
+ *
+ * Now, every launch starts from none of the three:
+ *  - a desktop launch (MADEIRA_DESKTOP=1, which is also how the Windows Steam
+ *    client is started) publishes nothing; the Steam client sets them for the
+ *    games it starts;
+ *  - a direct launch of a full path gets SteamAppPath = the executable's
+ *    folder, and an app ID from MADEIRA_STEAM_APPID (the library's store
+ *    identity) or else the game's own steam_appid.txt; no ID if neither exists.
+ * MADEIRA_STEAM_ENV=0 publishes nothing at all. [steam-env] logs the choice. */
+static void madeira_publish_steam_identity(void) {
+    unsetenv("SteamAppPath");
+    unsetenv("SteamGameId");
+    unsetenv("SteamAppId");
+    const char *sw = getenv("MADEIRA_STEAM_ENV");
+    const char *exe = getenv("MADEIRA_EXE");
+    const char *desktop = getenv("MADEIRA_DESKTOP");
+    if (sw && sw[0] == '0') {
+        dprintf(STDERR_FILENO, "[steam-env] ml1490 off (MADEIRA_STEAM_ENV=0): nothing published\n");
+        return;
+    }
+    if ((desktop && desktop[0] == '1') || !exe || strlen(exe) < 4 || exe[1] != ':' || !strchr(exe, '\\')) {
+        dprintf(STDERR_FILENO, "[steam-env] ml1490 %s launch: nothing published\n",
+                (desktop && desktop[0] == '1') ? "desktop" : "non-path");
+        return;
+    }
+    char dir[1024];
+    if (snprintf(dir, sizeof(dir), "%s", exe) >= (int)sizeof(dir)) return;
+    char *slash = strrchr(dir, '\\');
+    if (!slash || slash - dir < 2) return;
+    *slash = 0;
+    if (dir[2] == 0) { dir[2] = '\\'; dir[3] = 0; }   /* "C:" -> "C:\" */
+    setenv("SteamAppPath", dir, 1);
+
+    char id[16] = "";
+    const char *source = "none";
+    const char *given = getenv("MADEIRA_STEAM_APPID");
+    if (given && *given && strspn(given, "0123456789") == strlen(given) && strlen(given) < sizeof(id)) {
+        snprintf(id, sizeof(id), "%s", given);
+        source = "library";
+    } else if (g_prefix_path && strlen(dir) > 3) {
+        char unix_path[1200];
+        char rel[1024];
+        snprintf(rel, sizeof(rel), "%s", dir + 3);
+        for (char *p = rel; *p; p++) if (*p == '\\') *p = '/';
+        snprintf(unix_path, sizeof(unix_path), "%s/drive_c/%s/steam_appid.txt", g_prefix_path, rel);
+        FILE *f = fopen(unix_path, "r");
+        if (f) {
+            char line[32] = "";
+            if (fgets(line, sizeof(line), f)) {
+                size_t n = strspn(line, "0123456789");
+                if (n > 0 && n < sizeof(id)) {
+                    memcpy(id, line, n);
+                    id[n] = 0;
+                    source = "steam_appid.txt";
+                }
+            }
+            fclose(f);
+        }
+    }
+    if (id[0]) {
+        setenv("SteamAppId", id, 1);
+        setenv("SteamGameId", id, 1);
+    }
+    dprintf(STDERR_FILENO, "[steam-env] ml1490 direct launch: SteamAppPath=%s app-id=%s (%s)\n",
+            dir, id[0] ? id : "-", source);
+}
+
 static void wine_process_finished(void *arg) {
     /* Also runs when SIGQUIT makes the main guest thread call pthread_exit. */
     wineserver_finish_session();
@@ -755,26 +827,11 @@ static void *wine_process_thread(void *arg) {
          * is the pure branch-feeder) or a writer-side fix. Healer stays
          * opt-in-off. */
 
-        /* Steam game vars. One title reads SteamAppPath as its asset base path and
-         * queries it dozens of times during init, so it must be present before that
-         * title starts.
-         *
-         * KNOWN DEFECT, deliberately left in place for now: this publishes ONE title's
-         * identity to EVERY guest, with overwrite=1. A different title that links a Steam
-         * wrapper therefore sees the wrong app ID. Removing it outright was tested and is
-         * NOT the fix -- it regresses the title that needs the path, and it did not change
-         * the behaviour of the title that was mis-identified, so the mismatch is real but
-         * was not the failure being chased.
-         *
-         * The durable design belongs in the title-launch layer: publish nothing by
-         * default, take the ID from explicit title metadata or the game's own
-         * steam_appid.txt, set SteamAppPath to that game's directory, and give each child
-         * its own environment rather than mutating one process-global set shared by every
-         * pseudo-process. This path usually launches explorer.exe and cannot know which
-         * title the desktop will start later, so a conditional here cannot work. */
-        setenv("SteamAppPath", "C:\\Program Files\\Thumper", 1);
-        setenv("SteamGameId", "356400", 1);
-        setenv("SteamAppId",  "356400", 1);
+        /* Steam game vars. Some titles read SteamAppPath as their asset base path
+         * during init, so it must be present before the title starts. ml1490
+         * replaced the single hard-coded identity that used to be published here
+         * with a per-launch one; see madeira_publish_steam_identity. */
+        madeira_publish_steam_identity();
 
         /* iOS-Madeira 2026-07-02: publish the TRUE JIT-pool RX->RW offset to
          * xtajit64.dll (its own FEXCore copy reads this via getenv in
@@ -1565,7 +1622,8 @@ static void *wine_process_thread(void *arg) {
             snprintf(exe_path, sizeof(exe_path), "C:\\windows\\system32\\%s", madeira_exe);
         }
 
-        // Optional MADEIRA_ARGS env var: args appended to argv, max 16 tokens.
+        // Optional MADEIRA_ARGS env var: args appended to argv, max 64 tokens
+        // (ml1500: was 16, too few for a launcher plus its lightweight-mode flags).
         //
         // Tokenized in place, honouring DOUBLE QUOTES. The old split was a plain
         // strtok_r on " ", so an argument containing a space (any Windows path —
@@ -1576,8 +1634,8 @@ static void *wine_process_thread(void *arg) {
         // guest sees the argument whole again. Apostrophes are ordinary
         // characters here and in the shell-free path below — nothing strips or
         // escapes them.
-        static char args_buf[1024];
-        char *extra_argv[16] = {0};
+        static char args_buf[4096];
+        char *extra_argv[64] = {0};
         int extra_argc = 0;
         const char *madeira_args = getenv("MADEIRA_ARGS");
         if (madeira_args && *madeira_args) {
@@ -1589,7 +1647,7 @@ static void *wine_process_thread(void *arg) {
 
             char *src = args_buf;      /* read cursor */
             char *dst = args_buf;      /* write cursor: always <= src, so in place */
-            while (*src && extra_argc < 16) {
+            while (*src && extra_argc < 64) {
                 while (*src == ' ' || *src == '\t') src++;
                 if (!*src) break;
                 extra_argv[extra_argc++] = dst;
@@ -1606,11 +1664,11 @@ static void *wine_process_thread(void *arg) {
                 if (had_separator) src++;
             }
             if (*src)
-                dprintf(STDERR_FILENO, "[WineProc] WARNING: MADEIRA_ARGS has more than 16 tokens, "
+                dprintf(STDERR_FILENO, "[WineProc] WARNING: MADEIRA_ARGS has more than 64 tokens, "
                                        "the rest are dropped: %s\n", src);
         }
 
-        char *argv[24];
+        char *argv[72];
         int argc = 0;
         argv[argc++] = "wine";
         argv[argc++] = exe_path;

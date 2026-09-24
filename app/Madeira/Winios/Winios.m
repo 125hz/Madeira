@@ -406,8 +406,197 @@ BOOL winios_pCreateWindow(HWND hwnd) {
 
 static void winios_remove_layer(HWND hwnd);   /* compositor, below */
 
+/* ============================================================ *
+ * ml1490 — top-level window census (see Winios.h)
+ * ============================================================
+ *
+ * A game started through the Windows Steam client runs in a desktop session:
+ * explorer, the client, its Chromium helper and their console hosts all put
+ * windows up before the game does. Device logs 185-187 show the pattern: the
+ * helper's console window (titled with its path), explorer's small tray window,
+ * hidden client windows, and only later the game's own window, each from a
+ * different thread. Nothing on the app side could tell those apart, so the
+ * starting screen went away on the desktop's first GDI frame.
+ *
+ * The one fact that separates them generically is WHICH PROGRAM owns the
+ * window. win32u knows the owning process id (get_window_thread, the same call
+ * [winios-tree] makes) and the server knows every process's image path
+ * (SystemProcessIdInformation, which asks it by id without opening a handle).
+ * Both are read on the wine thread inside the WindowPosChanged hook, where
+ * win32u itself has just made the same kind of calls; each process's name is
+ * looked up once. The app decides what the names mean.
+ *
+ * Only while the app has switched it on (winios_window_census_enable), so a
+ * normal session never pays a lookup. */
+#define WINIOS_GA_PARENT     1
+#define WINIOS_GWL_STYLE     (-16)
+#define WINIOS_WS_CHILD      0x40000000u
+#define WINIOS_WS_VISIBLE    0x10000000u
+#define WINIOS_WS_MINIMIZE   0x20000000u
+#define WINIOS_SYSTEM_PROCESS_ID_INFORMATION 88
+
+/* win32u / ntdll unix entry points, linked into the same image. Declared by
+ * hand for the reason given at the top of this file: the Wine headers collide
+ * with Apple's. Wine's LONG/ULONG/DWORD/UINT are all 32-bit here. */
+extern HWND NtUserGetAncestor(HWND hwnd, unsigned int type);
+extern unsigned int get_window_thread(HWND hwnd, unsigned int *process);
+extern int get_window_long(HWND hwnd, int offset);
+extern int NtQuerySystemInformation(int info_class, void *info, unsigned int size, unsigned int *ret_size);
+
+/* SYSTEM_PROCESS_ID_INFORMATION: a process id and a UNICODE_STRING the caller
+ * points at its own buffer (Length must be 0 on input). */
+struct winios_process_id_info {
+    void *pid;
+    unsigned short length, maximum;
+    unsigned short *buffer;
+};
+
+static pthread_mutex_t g_census_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int g_census_on;
+static struct winios_census_window g_census[WINIOS_CENSUS_MAX];
+static int g_census_n;
+#define WINIOS_CENSUS_IMAGES 48
+static struct { unsigned int pid; int known; char image[48]; } g_census_images[WINIOS_CENSUS_IMAGES];
+static int g_census_images_n;
+static _Atomic unsigned g_census_failures;
+
+/* The owning program's executable base name, lower case ASCII, "" when the
+ * server could not name it. Cached per process id for the census's lifetime.
+ * Wine thread only (the lookup is a server call). */
+static int winios_census_image(unsigned int pid, char out[48]) {
+    out[0] = 0;
+    if (!pid) return 0;
+    pthread_mutex_lock(&g_census_lock);
+    for (int i = 0; i < g_census_images_n; i++) {
+        if (g_census_images[i].pid != pid) continue;
+        memcpy(out, g_census_images[i].image, 48);
+        int known = g_census_images[i].known;
+        pthread_mutex_unlock(&g_census_lock);
+        return known;
+    }
+    pthread_mutex_unlock(&g_census_lock);
+
+    unsigned short path[520];
+    struct winios_process_id_info info = { (void *)(uintptr_t)pid, 0, sizeof(path) - sizeof(path[0]), path };
+    unsigned int got = 0;
+    int status = NtQuerySystemInformation(WINIOS_SYSTEM_PROCESS_ID_INFORMATION, &info, sizeof(info), &got);
+    int known = 0;
+    if (!status && info.buffer == path && info.length < sizeof(path)) {
+        size_t n = info.length / sizeof(path[0]), start = 0, j = 0;
+        for (size_t i = 0; i < n; i++) if (path[i] == '\\' || path[i] == '/') start = i + 1;
+        for (size_t i = start; i < n && j < 47; i++) {
+            unsigned short c = path[i];
+            out[j++] = c >= 'A' && c <= 'Z' ? (char)(c + 32) : (c >= 32 && c < 127 ? (char)c : '?');
+        }
+        out[j] = 0;
+        known = j > 0;
+    } else if (atomic_fetch_add(&g_census_failures, 1) < 4) {
+        fprintf(stderr, "[window-census] ml1490 no image name for pid %04x status=%08x\n", pid, (unsigned)status);
+        fflush(stderr);
+    }
+    pthread_mutex_lock(&g_census_lock);
+    if (g_census_images_n < WINIOS_CENSUS_IMAGES) {
+        g_census_images[g_census_images_n].pid = pid;
+        g_census_images[g_census_images_n].known = known;
+        memcpy(g_census_images[g_census_images_n].image, out, 48);
+        g_census_images_n++;
+    }
+    pthread_mutex_unlock(&g_census_lock);
+    return known;
+}
+
+/* Caller holds g_census_lock. */
+static struct winios_census_window *winios_census_find(HWND hwnd) {
+    for (int i = 0; i < g_census_n; i++)
+        if (g_census[i].hwnd == (unsigned long long)(uintptr_t)hwnd) return &g_census[i];
+    return NULL;
+}
+
+/* Wine thread, from winios_window_frame (the WindowPosChanged hook, which runs
+ * on the window's own thread). Records top-level windows only. */
+static void winios_census_note_frame(HWND hwnd, int x, int y, int w, int h, int visible) {
+    if (!atomic_load_explicit(&g_census_on, memory_order_relaxed) || !hwnd) return;
+    /* win32u calls stay outside the census lock: they take win32u's own. */
+    unsigned int style = (unsigned int)get_window_long(hwnd, WINIOS_GWL_STYLE);
+    if (style & WINIOS_WS_CHILD) return;
+    if (!NtUserGetAncestor(hwnd, WINIOS_GA_PARENT)) return;       /* the desktop itself */
+    unsigned int pid = 0;
+    get_window_thread(hwnd, &pid);
+    char image[48];
+    winios_census_image(pid, image);
+    int shown = visible && (style & WINIOS_WS_VISIBLE) && !(style & WINIOS_WS_MINIMIZE) && w > 0 && h > 0;
+
+    pthread_mutex_lock(&g_census_lock);
+    struct winios_census_window *e = winios_census_find(hwnd);
+    if (!e && g_census_n < WINIOS_CENSUS_MAX) e = &g_census[g_census_n++];
+    if (!e && shown) {
+        /* Full: reuse a hidden window's slot rather than lose a shown one. */
+        for (int i = 0; i < g_census_n && !e; i++) if (!g_census[i].visible) e = &g_census[i];
+    }
+    if (e) {
+        if (e->hwnd != (unsigned long long)(uintptr_t)hwnd) memset(e, 0, sizeof(*e));
+        e->hwnd = (unsigned long long)(uintptr_t)hwnd;
+        e->x = x; e->y = y; e->w = w; e->h = h;
+        e->pid = pid;
+        e->visible = (unsigned char)shown;
+        memcpy(e->image, image, sizeof(e->image));
+    }
+    pthread_mutex_unlock(&g_census_lock);
+}
+
+/* Wine thread, from the GDI flush: count frames of listed windows only. */
+static void winios_census_note_present(HWND hwnd) {
+    if (!atomic_load_explicit(&g_census_on, memory_order_relaxed)) return;
+    pthread_mutex_lock(&g_census_lock);
+    struct winios_census_window *e = winios_census_find(hwnd);
+    if (e && e->presents < 0xffffffffu) e->presents++;
+    pthread_mutex_unlock(&g_census_lock);
+}
+
+/* A desktop-mode swapchain was made for this window (any thread). A swapchain
+ * on a child window is not listed; the app also watches DXMT's present count. */
+static void winios_census_note_metal(HWND hwnd) {
+    if (!atomic_load_explicit(&g_census_on, memory_order_relaxed)) return;
+    pthread_mutex_lock(&g_census_lock);
+    struct winios_census_window *e = winios_census_find(hwnd);
+    if (e) e->metal = 1;
+    pthread_mutex_unlock(&g_census_lock);
+}
+
+static void winios_census_forget(HWND hwnd) {
+    if (!atomic_load_explicit(&g_census_on, memory_order_relaxed)) return;
+    pthread_mutex_lock(&g_census_lock);
+    struct winios_census_window *e = winios_census_find(hwnd);
+    if (e) { *e = g_census[--g_census_n]; memset(&g_census[g_census_n], 0, sizeof(g_census[0])); }
+    pthread_mutex_unlock(&g_census_lock);
+}
+
+void winios_window_census_enable(int on) {
+    pthread_mutex_lock(&g_census_lock);
+    int was = atomic_load(&g_census_on);
+    g_census_n = 0;
+    g_census_images_n = 0;
+    memset(g_census, 0, sizeof(g_census));
+    atomic_store(&g_census_on, on ? 1 : 0);
+    pthread_mutex_unlock(&g_census_lock);
+    if (!was != !on) {
+        fprintf(stderr, "[window-census] ml1490 %s\n", on ? "on" : "off");
+        fflush(stderr);
+    }
+}
+
+int winios_window_census(struct winios_census_window *out, int max) {
+    if (!out || max <= 0) return 0;
+    pthread_mutex_lock(&g_census_lock);
+    int n = g_census_n < max ? g_census_n : max;
+    memcpy(out, g_census, (size_t)n * sizeof(*out));
+    pthread_mutex_unlock(&g_census_lock);
+    return n;
+}
+
 void winios_pDestroyWindow(HWND hwnd) {
     WLOG("pDestroyWindow hwnd=%p", hwnd);
+    winios_census_forget(hwnd);
     winios_remove_layer(hwnd);
 }
 
@@ -853,6 +1042,25 @@ BOOL winios_pProcessEvents(DWORD mask) {
     }
     BOOL drained = FALSE;
     unsigned int depth = 0;
+    /* ml1530: ONE DRAINER AT A TIME. Every GUI thread's message pump lands
+     * here, and the pop below is locked but the post after it is not, so two
+     * threads could each take one event and post them in the wrong order:
+     * device log 198 drained a click as down then up and posted it to wine as
+     * up then down (#267 flags=0x4, #268 flags=0x2), which leaves the button
+     * held and the click lost (a dialog's accept did nothing). A thread that
+     * finds another one draining returns; that one empties the whole queue in
+     * order. MADEIRA_INPUT_DRAIN_ORDER=0 restores concurrent draining. */
+    static pthread_mutex_t drain_lock = PTHREAD_MUTEX_INITIALIZER;
+    static int ordered = -1;
+    if (ordered < 0) {
+        const char *o = getenv("MADEIRA_INPUT_DRAIN_ORDER");
+        ordered = !(o && o[0] == '0');
+    }
+    if (ordered && pthread_mutex_trylock(&drain_lock) != 0) {
+        static unsigned busy;
+        if (busy++ < 4) { fprintf(stderr, "[input-order] ml1530 drain busy on another thread; left to it (n=%u)\n", busy); fflush(stderr); }
+        return FALSE;
+    }
     for (;;) {
         winios_input_event_t e;
         pthread_mutex_lock(&g_input_q.lock);
@@ -909,6 +1117,7 @@ BOOL winios_pProcessEvents(DWORD mask) {
             winios_drv_post_mouse(e.x, e.y, e.flags, e.data, NULL);
         drained = TRUE;
     }
+    if (ordered) pthread_mutex_unlock(&drain_lock);
     winios_q_report(depth);
     return drained;
 }
@@ -1200,6 +1409,23 @@ void winios_set_compositor_frame(double x, double y, double w, double h) {
  * letterboxes the guest desktop inside its frame, and a GUEST mode change
  * moves that mapping without moving the frame — so winios_set_compositor_frame
  * (which deliberately skips a no-op frame) can never notice it. */
+/* ml1530: the library front end hides a desktop session's compositor view once
+ * the session has ended (it sits directly on the app window above the library
+ * and otherwise keeps the last frame: device log prev-20, a frozen installer
+ * desktop after setup finished), and shows it again for the next session.
+ * Returns 1 when there was a view to change. */
+int winios_compositor_set_hidden(int hidden) {
+    if (!g_compositor_view) return 0;
+    BOOL h = hidden ? YES : NO;
+    if (NSThread.isMainThread) {
+        if (g_compositor_view.hidden == h) return 0;
+        g_compositor_view.hidden = h;
+    } else {
+        dispatch_async(dispatch_get_main_queue(), ^{ g_compositor_view.hidden = h; });
+    }
+    return 1;
+}
+
 void winios_compositor_relayout(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (g_compositor_view) winios_layout_compositor();
@@ -1225,9 +1451,16 @@ static void winios_ensure_compositor(void) {
     g_compositor_view = [[UIView alloc] initWithFrame:win.bounds];
     g_compositor_view.userInteractionEnabled = NO;  /* touches fall through */
     g_compositor_view.clipsToBounds = YES;
-    /* letterbox area: near-black; desktop area: classic teal (until
-     * explorer's own background paint works) */
-    g_compositor_view.backgroundColor = [UIColor colorWithWhite:0.08 alpha:1.0];
+    /* letterbox area: black; desktop area: classic teal (until explorer's own
+     * background paint works).
+     * ml1490: the letterbox was 8 % grey, so a portrait phone showed grey bands
+     * above and below the desktop where a direct launch shows black (its host
+     * view is black). This view exists only in the live view of a desktop
+     * session. MADEIRA_LIVE_BLACK_BARS=0 restores the grey. */
+    const char *bars = getenv("MADEIRA_LIVE_BLACK_BARS");
+    int black = !(bars && bars[0] == '0');
+    g_compositor_view.backgroundColor = black ? UIColor.blackColor : [UIColor colorWithWhite:0.08 alpha:1.0];
+    fprintf(stderr, "[live-bars] ml1490 desktop letterbox=%s\n", black ? "black" : "grey");
     g_desk_bg = [CALayer layer];
     g_desk_bg.backgroundColor = [UIColor colorWithRed:0.0 green:0.502 blue:0.502 alpha:1.0].CGColor;
     [g_compositor_view.layer addSublayer:g_desk_bg];
@@ -1349,6 +1582,7 @@ CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
                     hwnd, ml.frame.origin.x, ml.frame.origin.y,
                     ml.frame.size.width, ml.frame.size.height);
             fflush(stderr);
+            winios_census_note_metal((HWND)hwnd);   /* ml1490 */
         }
         result = ml;
     };
@@ -1361,6 +1595,9 @@ CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
  * x/y/w/h = visible rect, cx/cy/cw/ch = client rect, desktop pixels. */
 void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
                          int cx, int cy, int cw, int ch) {
+    /* ml1490: here, not in the block below — the census asks win32u about the
+     * window, which needs this wine thread. No-op unless the app turned it on. */
+    winios_census_note_frame(hwnd, x, y, w, h, visible);
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!winios_ensure_window_host()) return;
         CALayer *l = winios_layer_for(hwnd, true);
@@ -1526,6 +1763,7 @@ void winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
      * a window; this is the backstop for a flush already in flight when the
      * swapchain registered. Desktop mode never skips — see that function. */
     if (winios_overlay_skip_hwnd(hwnd)) return;
+    winios_census_note_present(hwnd);   /* ml1490: no-op unless the census is on */
     NSData *data = [NSData dataWithBytes:bits length:(size_t)stride * sh];
     static int dumpSurf = -1;
     if (dumpSurf < 0) dumpSurf = getenv("MADEIRA_DUMP_SURFACES") != NULL;

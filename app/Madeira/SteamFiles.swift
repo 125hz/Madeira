@@ -248,6 +248,203 @@ actor SteamDisk {
     }
 }
 
+// MARK: - ml1490: programs in a game's folder that are not the game
+
+/// ml1490: when none of Steam's launch options resolve, a native install falls
+/// back to scanning its folder for the program to start. That scan chose a
+/// physics redistributable's installer that a game ships beside itself, so a
+/// direct launch ran the installer ("Installation ended prematurely") instead
+/// of the game. Redistributables, their installers and uninstallers are now
+/// never chosen, recognized by name or by the folder that holds them.
+/// Callers apply MADEIRA_STEAM_EXE_FILTER (0 restores the old behavior).
+enum SteamExecutableRules {
+    /// Name fragments of programs that are never the game.
+    static let installerNameParts = ["physx", "dxwebsetup", "dxsetup", "oalinst", "redist", "vcredist", "vc_redist",
+                                     "redistributable", "commonredist", "dotnetfx", "prereq", "ue3redist", "ue4prereq",
+                                     "uninstall", "xnafx"]
+    /// Name starts of such programs ("DirectX_Jun2010_redist", "unins000", offline .NET installers).
+    static let installerNamePrefixes = ["directx", "unins", "ndp4"]
+    /// Folders that hold such programs, at any depth inside the install folder.
+    static let installerFolders: Set<String> = ["redist", "_redist", "redistributable", "redistributables", "_commonredist",
+                                                "commonredist", "directx", "dxsdk", "physx", "vcredist", "installers",
+                                                "__installer", "prerequisites", "support"]
+
+    /// Why the program at `relative` (inside the install folder, either
+    /// separator) is not the game, or nil when it may be: "folder:<name>" or "name:<fragment>".
+    static func installerReason(_ relative: String) -> String? {
+        let parts = relative.replacingOccurrences(of: "\\", with: "/").split(separator: "/").map { $0.lowercased() }
+        guard let file = parts.last else { return nil }
+        if let folder = parts.dropLast().first(where: { installerFolders.contains($0) }) { return "folder:" + folder }
+        let name = file.hasSuffix(".exe") ? String(file.dropLast(4)) : file
+        if let part = installerNameParts.first(where: { name.contains($0) }) { return "name:" + part }
+        if let prefix = installerNamePrefixes.first(where: { name.hasPrefix($0) }) { return "name:" + prefix }
+        return nil
+    }
+
+    /// The same for an entry's drive_c-relative executable, judged only inside
+    /// its install folder (drive_c-relative too). A program elsewhere is the
+    /// user's own choice and is never judged.
+    static func installerReason(executable: String, installFolder: String?) -> String? {
+        guard let installFolder, !installFolder.isEmpty else { return nil }
+        let folder = installFolder.replacingOccurrences(of: "\\", with: "/").lowercased() + "/"
+        let path = executable.replacingOccurrences(of: "\\", with: "/")
+        guard path.lowercased().hasPrefix(folder) else { return nil }
+        return installerReason(String(path.dropFirst(folder.count)))
+    }
+}
+
+// MARK: - ml1490: the started game's window versus the Windows Steam client's own
+
+/// ml1490: one top-level window of a client-routed launch's Wine desktop, as
+/// Winios.m's census reports it. `image`: the owning program's executable name,
+/// lower case, empty when it could not be read.
+struct SteamLaunchWindow: Equatable {
+    var image: String
+    var width: Int
+    var height: Int
+    var visible: Bool
+    /// The window put a frame on screen: GDI content, or a D3D swapchain of its own.
+    var drawn: Bool
+    var pid: UInt32 = 0
+}
+
+/// ml1490: what a game launch through the Windows Steam client is showing.
+/// The decision is by owning program, not by title or window class: the
+/// client, its Chromium helper, their console hosts, Wine's shell and the
+/// installers Steam runs before a first start each own their windows, and any
+/// other program's shown window belongs to the game that Steam started.
+enum SteamLaunchScene: Equatable {
+    /// Nothing for the user yet; the client works in the background.
+    case waiting
+    /// The client shows a window of its own: sign-in, Steam Guard, an error or a question.
+    case steamWindow
+    /// A window of the started game is up.
+    case game
+
+    var name: String {
+        switch self {
+        case .waiting: return "waiting"
+        case .steamWindow: return "steam-window"
+        case .game: return "game"
+        }
+    }
+
+    enum Owner: String { case client = "steam-client", helper, other, unknown }
+
+    /// The client's own programs that show windows the user may have to answer.
+    static let clientImages: Set<String> = ["steam.exe", "steamwebhelper.exe", "steamerrorreporter.exe", "steamerrorreporter64.exe"]
+    /// Programs that are neither the game nor something to answer: Wine's shell,
+    /// services and console hosts, the client's background tools, and the shared
+    /// redistributable installers Steam runs silently before a first start.
+    static let helperImages: Set<String> = [
+        "explorer.exe", "conhost.exe", "services.exe", "winedevice.exe", "plugplay.exe", "svchost.exe", "rpcss.exe",
+        "wineboot.exe", "winemenubuilder.exe", "tabtip.exe", "start.exe", "cmd.exe", "rundll32.exe", "msiexec.exe",
+        "steamservice.exe", "steamsysinfo.exe", "iscriptevaluator.exe", "gameoverlayui.exe", "gameoverlayui64.exe",
+        "gldriverquery.exe", "gldriverquery64.exe", "vulkandriverquery.exe", "vulkandriverquery64.exe",
+        "fossilize_replay.exe", "x64launcher.exe", "x86launcher.exe", "dxsetup.exe",
+    ]
+    static let helperPrefixes = ["vcredist", "vc_redist", "dotnetfx", "ndp4", "oalinst", "physx", "xnafx", "ue4prereq"]
+    /// Smaller shown windows are tray lists, tool strips and caption fragments.
+    static let gameMinimum = (width: 160, height: 120)
+    static let dialogMinimum = (width: 240, height: 120)
+
+    static func owner(_ image: String) -> Owner {
+        let name = image.lowercased()
+        if name.isEmpty { return .unknown }
+        if clientImages.contains(name) { return .client }
+        if helperImages.contains(name) || helperPrefixes.contains(where: { name.hasPrefix($0) }) { return .helper }
+        return .other
+    }
+
+    /// `rendered`: D3D frames reached the screen since the launch began. Stands
+    /// in for a window whose owner could not be read, never for a known one.
+    /// Returns the window that decided, for the log.
+    static func decide(_ windows: [SteamLaunchWindow], rendered: Bool) -> (scene: SteamLaunchScene, window: SteamLaunchWindow?) {
+        var steam: SteamLaunchWindow?
+        for window in windows where window.visible {
+            let gameSized = window.width >= gameMinimum.width && window.height >= gameMinimum.height
+            switch owner(window.image) {
+            case .other where gameSized && (window.drawn || rendered): return (.game, window)
+            case .unknown where gameSized && rendered: return (.game, window)
+            case .client where steam == nil && window.drawn &&
+                               window.width >= dialogMinimum.width && window.height >= dialogMinimum.height:
+                steam = window
+            default: break
+            }
+        }
+        return steam.map { (.steamWindow, $0) } ?? (.waiting, nil)
+    }
+}
+
+/// ml1490: whether the starting screen covers the Wine desktop during a game
+/// launch through the Windows Steam client. LibraryModel feeds it the scene
+/// every 0.5 s. The game's window ends the hold. A client window shown for
+/// `revealDelay` s reveals the desktop (when auto-reveal is on); once it has
+/// been gone for `coverDelay` s the starting screen returns, at most
+/// `maxAutoReveals` times, after which the desktop stays. "Show Steam" reveals
+/// it for good.
+struct SteamLaunchHold {
+    enum Action: Equatable { case none, showGame, reveal, cover }
+    static let revealDelay = 2.0, coverDelay = 4.0, maxAutoReveals = 6
+    let autoReveal: Bool
+    private(set) var scene = SteamLaunchScene.waiting
+    private(set) var revealed = false
+    private(set) var manual = false
+    private(set) var finished = false
+    private(set) var autoReveals = 0
+    private var steamSince: Double?
+    private var clearSince: Double?
+    /// ml1530: "Show Steam" was tapped before the client had a window (device log 198: tapped
+    /// at 37 s, the license agreement drew at 50 s); reveal as soon as one is up.
+    private(set) var pendingReveal = false
+
+    init(autoReveal: Bool) { self.autoReveal = autoReveal }
+
+    /// A client window is up and the starting screen still hides it.
+    var needsAttention: Bool { !finished && !revealed && scene == .steamWindow }
+
+    mutating func step(_ next: SteamLaunchScene, now: Double) -> Action {
+        guard !finished else { return .none }
+        scene = next
+        switch next {
+        case .game:
+            finished = true
+            return .showGame
+        case .steamWindow:
+            clearSince = nil
+            if pendingReveal, !revealed {
+                pendingReveal = false; revealed = true; manual = true
+                return .reveal
+            }
+            let since = steamSince ?? now
+            steamSince = since
+            guard autoReveal, !revealed, autoReveals < Self.maxAutoReveals, now - since >= Self.revealDelay else { return .none }
+            revealed = true
+            autoReveals += 1
+            return .reveal
+        case .waiting:
+            steamSince = nil
+            guard revealed, !manual, autoReveals < Self.maxAutoReveals else { clearSince = nil; return .none }
+            let since = clearSince ?? now
+            clearSince = since
+            guard now - since >= Self.coverDelay else { return .none }
+            revealed = false
+            clearSince = nil
+            return .cover
+        }
+    }
+
+    /// The user asked to see Steam. Returns false when it is already shown that way.
+    mutating func showSteam(waitForWindow: Bool = true) -> Bool {
+        guard !finished, !manual else { return false }
+        // ml1530: nothing to show yet; remember the tap and reveal when the client's window is up.
+        if scene == .waiting, waitForWindow { pendingReveal = true; return false }
+        revealed = true
+        manual = true
+        return true
+    }
+}
+
 enum LibraryRendererBadge {
     static func compact(_ detected: String?) -> String? {
         guard let detected else { return nil }

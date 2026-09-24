@@ -143,6 +143,24 @@ enum StikJITHelper {
            LibraryModel.shared.entries.contains(where: { $0.usesSteam }) {
             sizeMB = 896; source = "library has Windows Steam client entries, ml1420"
         }
+        // ml1540: a new install goes straight into setup, whose first session installs and runs
+        // the Windows Steam client (and its self-update). Device log 202: that session got the
+        // 512 MB default, ran the pool dry ([jit-pool] EXHAUSTED) and the desktop froze. Same for
+        // a run where a client was chosen before. MADEIRA_POOL_SETUP_896=0 turns this off.
+        if source != "madeira-pool.txt", sizeMB < 896, LibraryFlags.enabled("MADEIRA_POOL_SETUP_896"),
+           !UserDefaults.standard.bool(forKey: OnboardingRules.doneKey)
+            || UserDefaults.standard.string(forKey: "madeiraSteamClient") != nil
+            || FileManager.default.fileExists(atPath: LibraryModel.drive.appendingPathComponent("Program Files (x86)/Steam/steam.exe").path) {
+            sizeMB = 896; source = "setup or a Steam client ahead, ml1540"
+        }
+        // ml1570: setup's one session runs the installer, the client's self-update AND the
+        // restarted client with its web helper; device log prev-21 ran 896 MB dry there
+        // ("EXEC ALLOC FAILED ... no free carve AND no budget", the client died at 0xdead).
+        // Until setup is done the early pool is the largest allowed size.
+        if source != "madeira-pool.txt", sizeMB < 1152, LibraryFlags.enabled("MADEIRA_POOL_SETUP_896"),
+           !UserDefaults.standard.bool(forKey: OnboardingRules.doneKey) {
+            sizeMB = 1152; source = "setup's Steam install and update, ml1570"
+        }
         LogStore.shared.log("[jit-early] ml1330 trigger=\(trigger) allocating \(sizeMB)MB (\(source)) while the debugger is attached")
         DispatchQueue.global(qos: .userInitiated).async {
             let t0 = CFAbsoluteTimeGetCurrent()

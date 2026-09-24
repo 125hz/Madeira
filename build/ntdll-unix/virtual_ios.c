@@ -1143,6 +1143,13 @@ static void *ios_pool_warmer_thread( void *arg )
                         ios_perf_peak_mb = peak_mb;
                         ios_perf_comp_mb = (unsigned long long)vmi.compressed >> 20;
                     }
+                    /* ml1520: every third heartbeat (30 s), who holds it */
+                    if (do_beat)
+                    {
+                        extern void ios_wow_window_census( unsigned long long footprint_mb );
+                        static unsigned census_beats;
+                        if (!(census_beats++ % 3)) ios_wow_window_census( fp_mb );
+                    }
                 }
             }
 
@@ -7625,6 +7632,8 @@ static int ios_wow_guard_borrowed_from( ULONG_PTR addr )
  * furniture (TEBs, stacks, PE images), which packs downward from the end of
  * the map.  Lowest first, same as the high band.
  */
+/* ml1570: on a small map, how many placeholders session start takes (0 = the normal band's rule). */
+static unsigned ios_wow_small_va_slots;
 static void ios_wow_band( ULONG_PTR *floor, ULONG_PTR *ceil )
 {
     static ULONG_PTR kern_max;      /* 0 = not asked yet, 1 = unavailable */
@@ -7655,7 +7664,28 @@ static void ios_wow_band( ULONG_PTR *floor, ULONG_PTR *ceil )
          * a 4 GB placeholder at session start, and a band of ten would take
          * 32 GB out of a 63 GB map -- and ios_wow_candidate_slot() would bias
          * top-down furniture below whichever slot was left unreserved. */
-        if (hi > lo + 2 * IOS_WOW_WINDOW_SIZE) hi = lo + 2 * IOS_WOW_WINDOW_SIZE;
+        /* ml1570: TWO WAS NOT ENOUGH, AND NOT ALWAYS TWO. A tablet (63 GB map, no
+         * extended-VA entitlement, which the owner's phone does not have either but
+         * its map is 512 GB) got ONE window: iOS refused 0x500000000 at session
+         * start although it looked free (the startup probe had mapped it; after
+         * graphics set up, even 16 KB at 0x100010000 failed with ENOMEM), so a
+         * launcher's installer and its 32-bit helper could not run side by side.
+         * The band is now [16 GB, 44 GB): up to MADEIRA_WOW_SMALL_VA_SLOTS
+         * (default 4, like the phone's usable slots) placeholders are taken from
+         * whatever iOS grants in it (ios_wow_reserve_placeholders stops at that
+         * count), staying below the FEX host arena at 48 GB and its guard. =2
+         * restores the old two-slot band. */
+        {
+            const char *e = getenv( "MADEIRA_WOW_SMALL_VA_SLOTS" );
+            long want = e && *e ? strtol( e, NULL, 10 ) : 4;
+            ULONG_PTR band_end = (ULONG_PTR)0xb00000000ULL;   /* 44 GB */
+
+            if (want < 1) want = 1;
+            if (want > IOS_WOW_MAX_WINDOWS) want = IOS_WOW_MAX_WINDOWS;
+            ios_wow_small_va_slots = (unsigned)want;
+            if (want <= 2) band_end = lo + 2 * IOS_WOW_WINDOW_SIZE;
+            if (hi > band_end) hi = band_end;
+        }
         if (hi > lo + IOS_WOW_WINDOW_SIZE)
         {
             *floor = lo;
@@ -8133,6 +8163,8 @@ static void ios_wow_reserve_placeholders(void)
         unsigned guard_owned = 0;
 
         if (ios_wow_placeholder_count >= IOS_WOW_MAX_WINDOWS) break;
+        /* ml1570: a small map takes only as many as it needs from its wider band */
+        if (ios_wow_small_va_slots && ios_wow_placeholder_count >= ios_wow_small_va_slots) break;
         if (!ios_wow_window_try( cand, &guard_owned ))
         {
             dprintf( 2, "[wow-window] placeholder NOT reserved B=%p: the slot is already "
@@ -8273,6 +8305,129 @@ static void ios_wow_reclaim_dead_windows(void)
         }
         pthread_mutex_unlock( &ios_wow_mutex );
     }
+}
+
+/* ml1520: the same teardown, on demand, for a program the front end ended on
+ * purpose (ios_park_check, signal_arm64_ios.c) — its window would otherwise
+ * keep the dead process's memory until the next 32-bit program starts, which
+ * during a game is never. Runs on a Wine thread with no lock held, and only
+ * once every dead window has settled, so the teardown never sleeps. Returns
+ * how many dead windows are still waiting (0 = all given back). */
+int ios_wow_reclaim_settled( void )
+{
+    unsigned i, pending = 0, unsettled = 0;
+    time_t now = time( NULL );
+
+    pthread_mutex_lock( &ios_wow_mutex );
+    for (i = 0; i < IOS_WOW_MAX_WINDOWS; i++)
+    {
+        if (!ios_wow_windows[i].base || !ios_wow_windows[i].dead) continue;
+        pending++;
+        if (ios_wow_windows[i].dead != 1 || now < ios_wow_windows[i].released_at ||
+            now - ios_wow_windows[i].released_at < IOS_WOW_SETTLE_SEC) unsettled++;
+    }
+    pthread_mutex_unlock( &ios_wow_mutex );
+    if (!pending || unsettled) return pending;
+    ios_wow_reclaim_dead_windows();
+    pending = 0;
+    pthread_mutex_lock( &ios_wow_mutex );
+    for (i = 0; i < IOS_WOW_MAX_WINDOWS; i++)
+        if (ios_wow_windows[i].base && ios_wow_windows[i].dead) pending++;
+    pthread_mutex_unlock( &ios_wow_mutex );
+    return pending;
+}
+
+/* ml1520: [proc-mem] — WHICH 32-BIT PROGRAM HOLDS THE MEMORY.
+ *
+ * phys_footprint says how much the app holds, not who: device logs 195-197 sat
+ * at ~4.1 GB with a game and a launcher's two programs alive. Every 32-bit
+ * pseudo-process lives inside its own 4 GB window, so the pages the kernel
+ * reports for that range (dirty resident + compressed, which is what the
+ * footprint charges) are that program's. Called every 30 s from the footprint
+ * heartbeat; one line per live window plus what is outside all of them.
+ * The image name is copied with mach_vm_read_overwrite because the window can
+ * be torn down under us. MADEIRA_PROC_MEM=0 disables it. */
+void ios_wow_window_census( unsigned long long footprint_mb )
+{
+    static int enabled = -1;
+    struct { ULONG_PTR base; void *peb; unsigned dead; } snap[IOS_WOW_MAX_WINDOWS];
+    unsigned i, n = 0;
+    unsigned long long inside = 0;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_PROC_MEM" );
+        enabled = !(e && e[0] == '0');
+    }
+    if (!enabled) return;
+    pthread_mutex_lock( &ios_wow_mutex );
+    for (i = 0; i < IOS_WOW_MAX_WINDOWS; i++)
+    {
+        if (!ios_wow_windows[i].base || ios_wow_windows[i].leaked) continue;
+        snap[n].base = ios_wow_windows[i].base;
+        snap[n].peb  = ios_wow_windows[i].dead ? ios_wow_windows[i].dead_peb : ios_wow_windows[i].peb;
+        snap[n].dead = ios_wow_windows[i].dead;
+        n++;
+    }
+    pthread_mutex_unlock( &ios_wow_mutex );
+
+    for (i = 0; i < n; i++)
+    {
+        mach_vm_address_t addr = snap[i].base, end = snap[i].base + IOS_WOW_WINDOW_SIZE;
+        unsigned long long dirty = 0, comp = 0, resident = 0;
+        unsigned regions = 0;
+        char name[64] = "?";
+
+        while (addr < end && regions < 65536)
+        {
+            mach_vm_size_t size = 0;
+            natural_t depth = 0;
+            vm_region_submap_info_data_64_t info;
+            mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+
+            if (mach_vm_region_recurse( mach_task_self(), &addr, &size, &depth,
+                                        (vm_region_recurse_info_t)&info, &cnt ) != KERN_SUCCESS) break;
+            if (addr >= end) break;
+            regions++;
+            dirty    += info.pages_dirtied;
+            comp     += info.pages_swapped_out;
+            resident += info.pages_resident;
+            addr += size;
+        }
+        /* PEB64 -> ProcessParameters (+0x20) -> ImagePathName {Length +0x60, Buffer +0x68} */
+        if (!snap[i].dead && snap[i].peb)
+        {
+            ULONG_PTR pp = 0, buf = 0;
+            USHORT len = 0;
+            WCHAR w[260];
+            mach_vm_size_t got;
+
+            if (mach_vm_read_overwrite( mach_task_self(), (ULONG_PTR)snap[i].peb + 0x20, sizeof(pp),
+                                        (mach_vm_address_t)&pp, &got ) == KERN_SUCCESS && pp &&
+                mach_vm_read_overwrite( mach_task_self(), pp + 0x60, sizeof(len),
+                                        (mach_vm_address_t)&len, &got ) == KERN_SUCCESS &&
+                mach_vm_read_overwrite( mach_task_self(), pp + 0x68, sizeof(buf),
+                                        (mach_vm_address_t)&buf, &got ) == KERN_SUCCESS && buf && len)
+            {
+                unsigned k, start = 0, cnt = min( len / sizeof(WCHAR), ARRAY_SIZE(w) );
+                if (mach_vm_read_overwrite( mach_task_self(), buf, cnt * sizeof(WCHAR),
+                                            (mach_vm_address_t)w, &got ) == KERN_SUCCESS)
+                {
+                    for (k = 0; k < cnt; k++) if (w[k] == '\\' || w[k] == '/') start = k + 1;
+                    for (k = 0; start + k < cnt && k < sizeof(name) - 1; k++)
+                        name[k] = w[start + k] < 128 ? (char)w[start + k] : '?';
+                    name[k] = 0;
+                }
+            }
+        }
+        else if (snap[i].dead) strcpy( name, "(ended)" );
+        inside += (dirty + comp) * vm_page_size;
+        dprintf( 2, "[proc-mem] ml1520 B=%p %s dirty=%llu MB compressed=%llu MB resident=%llu MB regions=%u\n",
+                 (void *)snap[i].base, name, (dirty * vm_page_size) >> 20, (comp * vm_page_size) >> 20,
+                 (resident * vm_page_size) >> 20, regions );
+    }
+    dprintf( 2, "[proc-mem] ml1520 footprint=%llu MB, 32-bit windows=%llu MB, outside them=%lld MB\n",
+             footprint_mb, inside >> 20, (long long)footprint_mb - (long long)(inside >> 20) );
 }
 
 NTSTATUS ios_wow_window_reserve(void)
@@ -16290,6 +16445,9 @@ static void *alloc_virtual_heap( SIZE_T size )
 /***********************************************************************
  *           virtual_init
  */
+/* MADEIRA ml1590: is_wow64() also asks the current TEB (unix_private.h); MADEIRA_WOW64_BY_TEB=0 disables. */
+int ios_wow64_by_teb = 1;
+
 void virtual_init(void)
 {
     const struct preload_info **preload_info = dlsym( RTLD_DEFAULT, "wine_main_preload_info" );
@@ -16298,6 +16456,11 @@ void virtual_init(void)
     int i;
     pthread_mutexattr_t attr;
 
+    {
+        const char *e = getenv( "MADEIRA_WOW64_BY_TEB" );
+        if (e && e[0] == '0') ios_wow64_by_teb = 0;
+        dprintf( 2, "[wow64-by-teb] ml1590 %s\n", ios_wow64_by_teb ? "on" : "off" );
+    }
     pthread_mutexattr_init( &attr );
     pthread_mutexattr_settype( &attr, PTHREAD_MUTEX_RECURSIVE );
     pthread_mutex_init( &virtual_mutex, &attr );

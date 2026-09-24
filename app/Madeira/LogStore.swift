@@ -119,6 +119,15 @@ final class LogStore: ObservableObject {
         }
     }
 
+    private static let viaStderr = LibraryFlags.enabled("MADEIRA_LOG_VIA_STDERR")
+
+    /// ml1500: is fd 2 the log file itself (same device and inode)?
+    private static func stderrIsFile(_ path: String) -> Bool {
+        var err = stat(), file = stat()
+        guard fstat(STDERR_FILENO, &err) == 0, stat(path, &file) == 0 else { return false }
+        return err.st_dev == file.st_dev && err.st_ino == file.st_ino
+    }
+
     /// Public entry point for Swift-side logging (kept for ContentView calls)
     func log(_ message: String, level: LogEntry.Level = .info) {
         handleRawLine(message)
@@ -282,6 +291,17 @@ final class LogStore: ObservableObject {
     /// reader).
     private func appendToFile(_ message: String, level: LogEntry.Level = .info) {
         let line = "[\(dateFormatter.string(from: Date()))] [\(level.rawValue)] \(message)\n"
+        // ml1500: once Wine has pointed stderr at this same file (O_APPEND,
+        // WineProcessBridge), write through it. Device logs 189-194 kept not
+        // one line from here after Wine started, while every stderr line
+        // arrived; the per-call handle below is the only difference, so the
+        // one writer that demonstrably works is used. The tail reader already
+        // shows stderr lines in the UI, exactly as it showed this file before.
+        // MADEIRA_LOG_VIA_STDERR=0 keeps the per-call handle.
+        if Self.viaStderr && Self.stderrIsFile(logFileURL.path) {
+            fputs(line, stderr)
+            return
+        }
         if let data = line.data(using: .utf8) {
             if let handle = try? FileHandle(forWritingTo: logFileURL) {
                 handle.seekToEndOfFile()

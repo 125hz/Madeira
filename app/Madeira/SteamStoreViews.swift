@@ -244,6 +244,7 @@ struct SteamGameSheet: View {
     var openEntry: (LibraryEntry) -> Void
     @ObservedObject private var steam = SteamAccountModel.shared
     @ObservedObject private var library = LibraryModel.shared
+    @ObservedObject private var client = SteamLibraryModel.shared
     @Environment(\.dismiss) private var dismiss
     @State private var freeSpace: Int64?
     @State private var partial = false
@@ -324,6 +325,18 @@ struct SteamGameSheet: View {
             case .failed:
                 Button { steam.install(appID) } label: { actionLabel("Try again", symbol: "arrow.clockwise") }
                     .buttonStyle(.borderedProminent)
+            }
+        } else if OnboardingRules.installNeedsClient(clientInstalled: client.snapshot.client != nil,
+                                                     required: LibraryFlags.enabled("MADEIRA_STEAM_REQUIRE_CLIENT")) {
+            // ml1530: games start through Steam for Windows, and a Steam folder made by a
+            // download first stopped its installer. MADEIRA_STEAM_REQUIRE_CLIENT=0 allows it.
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Install the Steam client first").font(.subheadline.weight(.semibold))
+                Text("Steam for Windows starts your games. Install it once, then install this game.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Button { dismiss(); OnboardingModel.shared.openSteamClientSetup(appID: appID) } label: {
+                    actionLabel("Install Steam", symbol: "desktopcomputer")
+                }.buttonStyle(.borderedProminent)
             }
         } else {
             Button { steam.install(appID) } label: {
@@ -435,11 +448,14 @@ struct SteamEntrySection: View {
 
     var body: some View {
         Section {
-            Picker("Start with", selection: Binding(get: { entry.steamClientLaunch == true }, set: { entry.steamClientLaunch = $0 })) {
+            // ml1530: without a stored choice the default shows (startsWithClient); only a
+            // change here stores one.
+            Picker("Start with", selection: Binding(get: { entry.startsWithClient }, set: { entry.steamClientLaunch = $0 })) {
                 Text("The game").tag(false)
-                Text("Windows Steam client").tag(true)
+                // ml1520: short enough for the row; the footer names the Windows client.
+                Text("Steam client").tag(true)
             }
-            if entry.steamClientLaunch == true && client.snapshot.client == nil {
+            if entry.startsWithClient && client.snapshot.client == nil {
                 Text("Install the Windows Steam client from Settings first, then sign in to it with the same account.")
                     .font(.caption).foregroundStyle(.orange)
             }
@@ -464,7 +480,7 @@ struct SteamEntrySection: View {
         } header: {
             Text("Steam")
         } footer: {
-            Text("Starting the game directly works for games that do not need Steam running. Games that require Steam need the Windows Steam client, signed in to the same account.")
+            Text("“The game” starts it directly, which works for games that do not need Steam running. “Steam client” starts it through the Windows Steam client, which games that require Steam need; sign in to it with the same account. “Steam client” is the default once it is installed.")
         }
         .task(id: entry.steamInstallPath) {
             guard let folder = entry.steamInstallPath.flatMap({ SteamPaths.safeRelative($0, under: LibraryModel.drive) }) else { return }

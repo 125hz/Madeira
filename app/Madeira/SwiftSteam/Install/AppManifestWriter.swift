@@ -267,13 +267,24 @@ struct SteamClientProgress: Equatable {
     var pending: [Int] = []
     var tracked = 0
     var unreadable = 0
+    /// Madeira ml1490: the launched app's Workshop update, when one runs.
+    var workshop: SteamWorkshopProgress?
+    /// Madeira ml1510: what the client is doing, for the starting screen.
+    var stage: SteamLaunchStage?
 
     /// Something is left to do before the game can start.
-    var active: Bool { phase >= .queued }
+    var active: Bool { phase >= .queued || workshop?.active == true }
     /// Steam is verifying, downloading or installing right now. (Steam pauses
     /// other downloads while a game runs, so a paused record is not shown
     /// over gameplay.)
-    var working: Bool { phase >= .verifying }
+    var working: Bool { phase >= .verifying || workshop?.working == true }
+    /// ml1490: report the Workshop update, unless the app's own content still
+    /// has unfinished figures (Steam updates the app first, then its Workshop items).
+    private var showsWorkshop: Bool {
+        guard workshop?.active == true else { return false }
+        guard phase >= .verifying, let counts else { return true }
+        return counts.done >= counts.all
+    }
 
     private static func sum(_ a: UInt64, _ b: UInt64) -> UInt64 {
         let (value, overflow) = a.addingReportingOverflow(b); return overflow ? .max : value
@@ -308,7 +319,10 @@ struct SteamClientProgress: Equatable {
         guard total > 0, phase >= .queued else { return nil }
         return (min(downloaded, total), total)
     }
-    var fraction: Double? { counts.map { Double($0.done) / Double($0.all) } }
+    var fraction: Double? {
+        if showsWorkshop { return workshop?.fraction }
+        return counts.map { Double($0.done) / Double($0.all) }
+    }
     var percent: Int? { counts.map { Int((Double($0.done) * 100 / Double($0.all)).rounded(.down)) } }
 
     static func size(_ bytes: UInt64) -> String {
@@ -323,6 +337,7 @@ struct SteamClientProgress: Equatable {
 
     /// One line for the starting screen, or nil when there is nothing to report.
     var summary: String? {
+        if showsWorkshop, let workshop { return workshop.summary }
         let figures: String? = staging ? Self.amount(staged, of: toStage) : total > 0 ? Self.amount(downloaded, of: total) : nil
         let suffix = figures.map { ": \($0) (\(percent ?? 0)%)" }
         switch phase {
@@ -334,13 +349,339 @@ struct SteamClientProgress: Equatable {
         case .installed, .idle: return nil
         }
     }
-    var detail: String? { pending.count > 1 ? "\(pending.count) items still to update" : nil }
+    var detail: String? {
+        if showsWorkshop, let workshop { return workshop.detail }
+        return pending.count > 1 ? "\(pending.count) items still to update" : nil
+    }
 
     /// Numbers only: App IDs, byte counts, phase.
     var logFields: String {
         "phase=\(phase.name) done=\(downloaded) total=\(total) pct=\(percent.map(String.init) ?? "-") " +
         "stage=\(staged)/\(toStage) pending=\(pending.isEmpty ? "-" : pending.map(String.init).joined(separator: ",")) " +
-        "apps=\(tracked) unreadable=\(unreadable)"
+        "apps=\(tracked) unreadable=\(unreadable)" + (workshop.map { " workshop=" + $0.logFields } ?? "")
+    }
+}
+
+// MARK: - Madeira ml1510: what the client is doing while the starting screen waits
+
+/// Madeira ml1510: the client's progress through a game launch, read from the
+/// lines it appends to logs/connection_log.txt and logs/content_log.txt:
+///   [..] [Logged Off, 4, 0] [U:1:#] LogOn() called; not connected yet, scheduling connection. ...
+///   [..] [Logged On, 4, 7] [U:1:#] RecvMsgClientLogOnResponse() : processing complete
+///   [..] ConnectionDisconnected() not auto reconnecting due to Invalid Password
+///   [..] AppID 7000 state changed : Fully Installed,Update Queued,Update Running,
+///   [..] AppID 7000 state changed : Fully Installed,App Running,
+/// ml1520: and from logs/console_log.txt, the launch task the client is on:
+///   [..] GameAction [AppID 7000, ActionID 1] : LaunchApp changed task to ProcessingInstallScript with ""
+/// Stages only move forward, except that a rejected sign-in can follow any of them.
+enum SteamLaunchStage: Int, Comparable {
+    case starting, signingIn, signedIn, updating, preparing, needsInput, installers, cloudSync, gameStarting, needsSignIn
+
+    static func < (a: Self, b: Self) -> Bool { a.rawValue < b.rawValue }
+    static let all: [SteamLaunchStage] = [.starting, .signingIn, .signedIn, .updating, .preparing, .needsInput, .installers,
+                                          .cloudSync, .gameStarting, .needsSignIn]
+    static var allTextsDistinct: Bool { Set(all.map(\.text)).count == all.count }
+
+    var name: String {
+        switch self {
+        case .starting: return "starting"
+        case .signingIn: return "signing-in"
+        case .signedIn: return "signed-in"
+        case .updating: return "updating"
+        case .preparing: return "preparing"
+        case .needsInput: return "needs-input"
+        case .installers: return "installers"
+        case .cloudSync: return "cloud-sync"
+        case .gameStarting: return "game-starting"
+        case .needsSignIn: return "needs-sign-in"
+        }
+    }
+
+    /// The starting screen's main line.
+    var text: String {
+        switch self {
+        case .starting: return "Starting Steam…"
+        case .signingIn: return "Signing in to Steam…"
+        case .signedIn: return "Signed in. Steam is getting the game ready…"
+        case .updating: return "Steam is updating the game…"
+        case .preparing: return "Steam is preparing the game…"
+        case .needsInput: return "Steam is waiting for you. Its window opens here in a moment."
+        case .installers: return "Steam is checking the game's one-time installs…"
+        case .cloudSync: return "Steam is syncing cloud saves…"
+        case .gameStarting: return "Starting the game…"
+        case .needsSignIn: return "Steam needs you to sign in. Tap Show Steam."
+        }
+    }
+
+    /// A second line, or nil.
+    var detail: String? {
+        switch self {
+        case .signedIn, .preparing:
+            return "The first start of a game can include one-time installs such as DirectX."
+        case .needsInput: return "Usually a license agreement or a notice for this game. Steam can take a few seconds to draw it."
+        case .installers: return "DirectX, Visual C++ and similar. Steam checks them before a start."
+        case .gameStarting: return "The game is loading. This can take a moment."
+        default: return nil
+        }
+    }
+
+    /// The next stage after one client log line, for the launched `appID`.
+    func after(_ line: String, appID: Int) -> SteamLaunchStage {
+        if line.contains("Invalid Password") || line.contains("not auto reconnecting") { return .needsSignIn }
+        let signedIn = line.contains("[Logged On") || line.contains("RecvMsgClientLogOnResponse() : processing complete")
+        // After a rejected sign-in, only a later sign-in moves on.
+        if self == .needsSignIn { return signedIn ? .signedIn : self }
+        var next = self
+        if line.contains("LogOn() called") || line.contains("Logging on") { next = .signingIn }
+        if signedIn { next = .signedIn }
+        if let range = line.range(of: "AppID \(appID) state changed :") {
+            let states = line[range.upperBound...].lowercased()
+            if states.contains("app running") { next = .gameStarting }
+            else if states.contains("update running") || states.contains("update started") { next = .updating }
+            else if states.contains("fully installed") { next = .preparing }
+        }
+        // ml1530: "waiting for user response to <task>" is Steam holding the launch for a screen
+        // (license agreement, interstitials; device logs 198/199) whatever came before it, so it
+        // wins over the forward order; "continues with user response" or the next task ends it.
+        // CreatingProcess also "waits" for a moment on every start, and is not a screen.
+        if line.contains("GameAction [AppID \(appID),") {
+            if let range = line.range(of: "waiting for user response to ") {
+                let task = line[range.upperBound...].prefix { !$0.isWhitespace }.lowercased()
+                if !task.contains("creatingprocess") && self != .needsSignIn { return .needsInput }
+            }
+            if self == .needsInput, line.contains("continues with user response") { return .preparing }
+        }
+        if self == .needsInput, line.contains("GameAction [AppID \(appID),"), line.contains("changed task to ") {
+            return SteamLaunchStage.preparing.after(line, appID: appID)
+        }
+        // ml1520: console_log.txt launch tasks
+        if line.contains("GameAction [AppID \(appID),"), let range = line.range(of: "changed task to ") {
+            let task = line[range.upperBound...].prefix { !$0.isWhitespace }.lowercased()
+            if task.contains("eula") || task.contains("cdkey") || task.contains("dialog") { next = .needsInput }
+            else if task.contains("installscript") { next = .installers }
+            else if task.contains("cloud") { next = .cloudSync }
+            else if task.contains("creatingprocess") || task.contains("waitinggamewindow") || task.contains("completed") {
+                next = .gameStarting
+            }
+        }
+        return max(self, next)
+    }
+}
+
+/// Madeira ml1510: follows the client logs for one launch (ml1520: and its console log).
+struct SteamLaunchStageTracker {
+    let appID: Int
+    private(set) var stage = SteamLaunchStage.starting
+    private var connection = SteamLogTail()
+    private var content = SteamLogTail()
+    private var console = SteamLogTail()
+
+    init(appID: Int) { self.appID = appID }
+
+    mutating func poll(connectionLog: URL?, contentLog: URL?, consoleLog: URL? = nil) {
+        for url in [connectionLog, contentLog, consoleLog].compactMap({ $0 }) {
+            let lines = url == connectionLog ? connection.read(url) : url == contentLog ? content.read(url) : console.read(url)
+            for line in lines { stage = stage.after(line, appID: appID) }
+        }
+    }
+}
+
+// MARK: - Madeira ml1490: Workshop content the client updates before a start
+
+/// Madeira ml1490: the launched app's Workshop update, read from the Windows
+/// client's content_log.txt. The client holds a game's start while it updates
+/// the Workshop items the account subscribes to. Those can be far larger than
+/// the game (device log 187: 36 GB) and the app's own manifest does not show
+/// them. The client writes, for example:
+///   [date time] AppID 7000 Workshop update changed : Running Update,Downloading,Staging,
+///   [date time] AppID 7000 update started : download 396293552/36271038464, store 0/0, reuse 0/0, delta 0/0, stage 762126893/72100190136
+/// An "update started" line belongs to whichever update ("App" or "Workshop")
+/// the same app reported last. Its figures describe the update when it started;
+/// the log reports no progress after that.
+struct SteamWorkshopLog: Equatable {
+    typealias Phase = SteamClientAppState.Phase
+    let appID: Int
+    private(set) var phase: Phase = .idle
+    private(set) var downloaded: UInt64 = 0
+    private(set) var total: UInt64 = 0
+    private(set) var staged: UInt64 = 0
+    private(set) var toStage: UInt64 = 0
+    private var workshopLast = false
+
+    init(appID: Int) { self.appID = appID }
+
+    /// The client's comma-separated update states.
+    static func phase(_ states: String) -> Phase {
+        let text = states.lowercased().trimmingCharacters(in: .whitespaces)
+        if text.isEmpty || text.hasPrefix("none") { return .idle }
+        if text.contains("downloading") || text.contains("preallocating") { return .downloading }
+        if text.contains("staging") || text.contains("committing") { return .staging }
+        if text.contains("verifying") || text.contains("validating") { return .verifying }
+        if text.contains("paused") || text.contains("suspended") { return .paused }
+        return .queued   // "Running Update", "Reconfiguring": preparing
+    }
+
+    /// `done/all` after `key ` in an "update started" line.
+    static func figures(_ text: Substring, _ key: String) -> (UInt64, UInt64)? {
+        guard let range = text.range(of: key + " ") else { return nil }
+        let pair = text[range.upperBound...].prefix { $0.isNumber || $0 == "/" }.split(separator: "/")
+        guard pair.count == 2, let done = UInt64(pair[0]), let all = UInt64(pair[1]) else { return nil }
+        return (done, all)
+    }
+
+    mutating func feed(_ line: String) {
+        guard let range = line.range(of: "AppID \(appID) ") else { return }
+        let rest = line[range.upperBound...]
+        if rest.hasPrefix("Workshop update changed :") {
+            workshopLast = true
+            phase = Self.phase(String(rest.dropFirst("Workshop update changed :".count)))
+            if phase == .idle { downloaded = 0; total = 0; staged = 0; toStage = 0 }
+        } else if rest.hasPrefix("App update changed :") {
+            workshopLast = false
+        } else if workshopLast, rest.hasPrefix("update started :") {
+            if let pair = Self.figures(rest, "download") { downloaded = min(pair.0, pair.1); total = pair.1 }
+            if let pair = Self.figures(rest, "stage") { staged = min(pair.0, pair.1); toStage = pair.1 }
+        }
+    }
+}
+
+/// Madeira ml1490: counts from the client's record of an app's Workshop items,
+/// steamapps/workshop/appworkshop_<appid>.acf. Item IDs and the subscribing
+/// account in that record are never kept or logged.
+struct SteamWorkshopItems: Equatable {
+    /// Items the record lists as subscribed (its item details), else those installed.
+    var subscribed = 0
+    /// Of those, the items with installed content.
+    var installed = 0
+    var needsDownload = false
+
+    static func parse(_ data: Data, appID: Int) -> SteamWorkshopItems? {
+        guard !data.isEmpty, data.count <= 4 << 20, var parser = try? SteamKeyValues(data),
+              let root = try? parser.read(), let record = root["AppWorkshop"],
+              record["appid"]?.string == String(appID) else { return nil }
+        let installed = Set((record["WorkshopItemsInstalled"]?.fields ?? [:]).keys)
+        let details = Set((record["WorkshopItemDetails"]?.fields ?? [:]).keys)
+        var items = SteamWorkshopItems()
+        items.subscribed = details.isEmpty ? installed.count : details.count
+        items.installed = details.isEmpty ? installed.count : details.intersection(installed).count
+        items.needsDownload = record["NeedsDownload"]?.string == "1" || record["NeedsUpdate"]?.string == "1"
+        return items
+    }
+}
+
+/// Madeira ml1490: what the starting screen says about a Workshop update.
+struct SteamWorkshopProgress: Equatable {
+    typealias Phase = SteamClientAppState.Phase
+    var phase: Phase = .idle
+    /// The update's download size and what was already downloaded, when it started.
+    var downloaded: UInt64 = 0
+    var total: UInt64 = 0
+    var items: SteamWorkshopItems?
+    /// The installed-item count changed during this launch, so it measures progress.
+    var itemsLive = false
+
+    var active: Bool { phase >= .queued }
+    var working: Bool { phase >= .verifying }
+
+    var fraction: Double? {
+        guard itemsLive, let items, items.subscribed > 0 else { return nil }
+        return Double(min(items.installed, items.subscribed)) / Double(items.subscribed)
+    }
+
+    var summary: String {
+        let size = total > 0 ? " (\(SteamClientProgress.size(total)))" : ""
+        switch phase {
+        case .downloading: return "Steam is downloading Workshop items\(size) before the game starts."
+        case .staging: return "Steam is installing Workshop items before the game starts."
+        case .verifying: return "Steam is checking Workshop items before the game starts."
+        case .paused: return "Steam paused the Workshop update for this game."
+        default: return "Steam is updating Workshop items before the game starts."
+        }
+    }
+
+    var detail: String {
+        var text = "Workshop items are add-ons you subscribed to in Steam for this game."
+        if let items, items.subscribed > 0 {
+            text += itemsLive ? " \(items.installed) of \(items.subscribed) installed."
+                              : " \(items.subscribed) subscribed item\(items.subscribed == 1 ? "" : "s")."
+        }
+        return text
+    }
+
+    /// Numbers only.
+    var logFields: String {
+        "\(phase.name) download=\(downloaded)/\(total) items=\(items.map { "\($0.installed)/\($0.subscribed)" } ?? "-") live=\(itemsLive ? 1 : 0)"
+    }
+}
+
+/// Madeira ml1490: new complete lines of a text log the client appends to,
+/// from where it ended when following began (the first read only records the
+/// end). Bounded per read. A log that shrank was rotated and is read from its start.
+struct SteamLogTail {
+    static let limit = 256 * 1024, maxLine = 16 * 1024
+    private var offset: UInt64?
+    private var partial = Data()
+
+    mutating func read(_ url: URL) -> [String] {
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            if offset == nil { offset = 0 }   // not written yet: follow it from its start
+            return []
+        }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        guard var start = offset else { offset = size; return [] }
+        if size < start { start = 0; partial.removeAll() }
+        guard size > start, (try? handle.seek(toOffset: start)) != nil,
+              let data = try? handle.read(upToCount: Int(min(size - start, UInt64(Self.limit)))) else { offset = start; return [] }
+        offset = start + UInt64(data.count)
+        partial.append(data)
+        var lines: [String] = []
+        var lineStart = partial.startIndex
+        for index in partial.indices where partial[index] == 10 {
+            lines.append(String(decoding: partial[lineStart..<index], as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
+            lineStart = index + 1
+        }
+        partial = Data(partial[lineStart...])
+        if partial.count > Self.maxLine { partial.removeAll() }
+        return lines
+    }
+}
+
+/// Madeira ml1490: follows the launched app's Workshop update during one
+/// launch: the client's content log every poll, its Workshop record at most
+/// every `itemsInterval` s while an update runs.
+struct SteamWorkshopTracker {
+    static let itemsInterval = 10.0
+    private(set) var log: SteamWorkshopLog
+    private var tail = SteamLogTail()
+    private(set) var items: SteamWorkshopItems?
+    private var firstInstalled: Int?
+    private(set) var itemsLive = false
+    private var itemsRead = -Double.infinity
+
+    init(appID: Int) { log = SteamWorkshopLog(appID: appID) }
+
+    mutating func poll(logFile: URL?, libraries: [URL], now: Double) {
+        if let logFile { for line in tail.read(logFile) { log.feed(line) } }
+        guard log.phase >= .queued, now - itemsRead >= Self.itemsInterval else { return }
+        itemsRead = now
+        for library in libraries {
+            let file = library.appendingPathComponent("workshop/appworkshop_\(log.appID).acf")
+            guard let data = SteamClientProgressTracker.readBounded(file, limit: 4 << 20) else { continue }
+            // A record being rewritten keeps the last complete reading.
+            if let parsed = SteamWorkshopItems.parse(data, appID: log.appID) {
+                items = parsed
+                if let first = firstInstalled { if parsed.installed != first { itemsLive = true } }
+                else { firstInstalled = parsed.installed }
+            }
+            break
+        }
+    }
+
+    /// nil while no Workshop update runs.
+    var progress: SteamWorkshopProgress? {
+        guard log.phase != .idle else { return nil }
+        return SteamWorkshopProgress(phase: log.phase, downloaded: log.downloaded, total: log.total, items: items, itemsLive: itemsLive)
     }
 }
 
@@ -392,10 +733,10 @@ struct SteamClientProgressTracker {
         return result
     }
 
-    static func readBounded(_ url: URL) -> Data? {
+    static func readBounded(_ url: URL, limit: Int = 1 << 20) -> Data? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
-        return (try? handle.read(upToCount: (1 << 20) + 1)) ?? Data()
+        return (try? handle.read(upToCount: limit + 1)) ?? Data()
     }
 
     static func read(_ id: Int, libraries: [URL]) -> Data? {

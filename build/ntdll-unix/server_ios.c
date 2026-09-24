@@ -2337,6 +2337,7 @@ static void invoke_system_apc( const union apc_call *call, union apc_result *res
 unsigned int server_select( const union select_op *select_op, data_size_t size, UINT flags,
                             timeout_t abs_timeout, struct context_data *context, struct user_apc *user_apc )
 {
+    extern void ios_qos_refresh( void );   /* ml1510: see signal_arm64_ios.c */
     unsigned int ret;
     int cookie;
     obj_handle_t apc_handle = 0;
@@ -2352,6 +2353,7 @@ unsigned int server_select( const union select_op *select_op, data_size_t size, 
     } reply_data;
 
     memset( &result, 0, sizeof(result) );
+    ios_qos_refresh();
 
     do
     {

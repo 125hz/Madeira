@@ -13,7 +13,7 @@ import Glibc
 struct TouchControl: Codable {}
 enum LibraryError: Error { case message(String) }
 enum LibraryFlags {
-    static func enabled(_ key: String) -> Bool { getenv(key).map { String(cString: $0) != "0" } ?? true }
+    static func enabled(_ key: String, fallback: Bool = true) -> Bool { getenv(key).map { String(cString: $0) != "0" } ?? fallback }
 }
 class LibraryModel { static let drive = URL(fileURLWithPath: "/tmp/madeira-profile-fixture"); var entries: [LibraryEntry] = []; var current: UUID?; var readOnly = false; func persist(_ next: [LibraryEntry]) { entries = next }; static func executable(_ relative: String) throws -> URL { drive.appendingPathComponent(relative) }; MERGE_METHODS }
 enum GuestDisplay { static func configureSessionDefault(view: CGSize, knob: String) {} }
@@ -51,6 +51,23 @@ func rejected(_ label: String, _ operation: () throws -> Void) throws {
         }
         try require(SteamPaths.trustedDownload(SteamPaths.installerURL), "official HTTPS installer")
         try require(LibraryRendererBadge.compact("OpenGL/D3D9/D3D11") == "D3D11", "compact capability badge")
+        // ml1490: redistributables and installers are never the game.
+        for (path, reason) in [("PhysX/PhysX_SystemSoftware.exe", "folder:physx"), ("_CommonRedist\\vcredist\\2010\\vcredist_x86.exe", "folder:_commonredist"),
+                               ("Redist/setup.exe", "folder:redist"), ("Support\\tool.exe", "folder:support"), ("DirectX/DXSETUP.exe", "folder:directx"),
+                               ("PhysX_9.21_SystemSoftware.exe", "name:physx"), ("dxwebsetup.exe", "name:dxwebsetup"), ("oalinst.exe", "name:oalinst"),
+                               ("VC_redist.x64.exe", "name:redist"), ("dotNetFx40_Full_x86_x64.exe", "name:dotnetfx"), ("UE3Redist.exe", "name:redist"),
+                               ("UE4PrereqSetup_x64.exe", "name:prereq"), ("unins000.exe", "name:unins"), ("Uninstall.exe", "name:uninstall"),
+                               ("DirectX_Jun2010_redist.exe", "name:redist"), ("NDP472-KB4054530-x86-x64-AllOS-ENU.exe", "name:ndp4")] {
+            try require(SteamExecutableRules.installerReason(path) == reason, "installer \(path) -> \(SteamExecutableRules.installerReason(path) ?? "nil")")
+        }
+        for path in ["Binaries/Game.exe", "bin/win64/game-dx11.exe", "Launcher.exe", "Game_DX9.exe", "Supported/Game.exe"] {
+            try require(SteamExecutableRules.installerReason(path) == nil, "may be the game: \(path)")
+        }
+        try require(SteamExecutableRules.installerReason(executable: "Games/X/PhysX/a.exe", installFolder: "Games/X") == "folder:physx" &&
+                    SteamExecutableRules.installerReason(executable: "Other/PhysX/a.exe", installFolder: "Games/X") == nil &&
+                    SteamExecutableRules.installerReason(executable: "Games/X/PhysX/a.exe", installFolder: nil) == nil &&
+                    SteamExecutableRules.installerReason(executable: "games/x/Binaries/a.exe", installFolder: "Games/X") == nil,
+                    "entries are judged only inside their install folder")
         var profile = LibraryEntry(title: "Fixture", relativePath: "Program Files (x86)/Steam/Steam.exe", bits: 0)
         profile.steamAppID = 12345; profile.steamInstalled = true
         profile.steamID = 54321; profile.arguments = "-windowed \"two words\""
@@ -61,21 +78,54 @@ func rejected(_ label: String, _ operation: () throws -> Void) throws {
         try require(!profile.launchArguments.contains("-silent"), "silent rollback")
         unsetenv("MADEIRA_STEAM_SILENT")
         try require(profile.launchArguments.contains("\"C:\\Program Files (x86)\\Steam\\Steam.exe\""), "quoted path")
-        try require(profile.launchArguments.contains(" -cef-disable-hang-timeouts -nooverlay -nofriendsui -noshaders -silent -applaunch 12345"), "light client flags")
+        try require(profile.launchArguments.contains(" -cef-disable-hang-timeouts -nooverlay -nofriendsui -noshaders -cef-disable-breakpad"), "light client flags")
+        // ml1500: the helper trim rides a game launch; the crash reporter process is gone.
+        try require(profile.launchArguments.contains(" -skipstreamingdrivers -no-dwrite -silent -applaunch 12345") && profile.launchArguments.contains("-cef-single-process"), "lighter client flags on a game launch")
+        setenv("MADEIRA_STEAM_CEF_LIGHT", "0", 1)
+        try require(!profile.launchArguments.contains("-cef-disable-breakpad") && profile.launchArguments.contains("-noshaders -silent -applaunch 12345"), "lighter flags rollback")
+        unsetenv("MADEIRA_STEAM_CEF_LIGHT")
         setenv("MADEIRA_STEAM_LIGHT", "0", 1)
-        try require(!profile.launchArguments.contains("-nooverlay") && profile.launchArguments.contains("-applaunch 12345"), "light flags rollback")
+        try require(!profile.launchArguments.contains("-nooverlay") && !profile.launchArguments.contains("-cef-disable-breakpad") && profile.launchArguments.contains("-applaunch 12345"), "light flags rollback")
         unsetenv("MADEIRA_STEAM_LIGHT")
         profile.configureLaunch()
         try require(String(cString: getenv("MADEIRA_EXE")) == "explorer.exe", "desktop wrapper")
         try require(String(cString: getenv("MADEIRA_DESKTOP")) == "1", "desktop memory policy")
-        try require(String(cString: getenv("MADEIRA_ORDERED_PROFILE_CLIENT")) == "Steam.exe", "client ordering names the client executable")
+        // ml1500: the client and its helpers get background scheduling classes; the game does not.
+        try require(String(cString: getenv("MADEIRA_QOS_DEFAULT_EXES")) == "Steam.exe" && String(cString: getenv("MADEIRA_QOS_UTILITY_EXES")).contains("steamwebhelper.exe"), "client background classes")
+        setenv("MADEIRA_STEAM_BACKGROUND_QOS", "0", 1); profile.configureLaunch()
+        try require(getenv("MADEIRA_QOS_UTILITY_EXES") == nil && getenv("MADEIRA_QOS_DEFAULT_EXES") == nil, "background classes rollback")
+        unsetenv("MADEIRA_STEAM_BACKGROUND_QOS"); profile.configureLaunch()
+        // ml1490: the ordered profile is off unless asked for.
+        try require(String(cString: getenv("MADEIRA_ORDERED_PROFILE")) == "0" && getenv("MADEIRA_ORDERED_PROFILE_CLIENT") == nil,
+                    "ordered profile off by default, client not named")
+        setenv("MADEIRA_ORDERED_PROFILE", "1", 1); setenv("MADEIRA_STEAM_ORDERED_CLIENT", "1", 1); profile.configureLaunch()
+        try require(String(cString: getenv("MADEIRA_ORDERED_PROFILE")) == "1"
+                    && String(cString: getenv("MADEIRA_ORDERED_PROFILE_CLIENT")) == "Steam.exe", "opt-in names the client executable")
         setenv("MADEIRA_STEAM_ORDERED_CLIENT", "0", 1); profile.configureLaunch()
         try require(getenv("MADEIRA_ORDERED_PROFILE_CLIENT") == nil, "client ordering rollback")
-        unsetenv("MADEIRA_STEAM_ORDERED_CLIENT")
+        unsetenv("MADEIRA_STEAM_ORDERED_CLIENT"); setenv("MADEIRA_ORDERED_PROFILE", "0", 1)
+        // ml1490: the store identity reaches only a direct launch; the client sets it for the games it starts.
+        setenv("MADEIRA_STEAM_APPID", "999", 1); profile.configureLaunch()
+        try require(getenv("MADEIRA_STEAM_APPID") == nil, "client-routed launch publishes no store identity")
+        try require(profile.steamGameLaunch, "client-routed game launch holds the starting screen")
+        var direct = LibraryEntry(title: "Direct", relativePath: "Games/Fixture/game.exe", bits: 32)
+        direct.steamAppID = 12345; direct.steamNative = true; direct.steamInstalled = true
+        direct.configureLaunch()
+        try require(!direct.usesSteam && String(cString: getenv("MADEIRA_STEAM_APPID")) == "12345", "direct launch publishes its store identity")
+        try require(!direct.steamGameLaunch, "a direct launch has no client to wait for")
+        direct.steamClientLaunch = true; direct.steamClientPath = "Program Files (x86)/Steam/steam.exe"; direct.configureLaunch()
+        try require(direct.usesSteam && getenv("MADEIRA_STEAM_APPID") == nil && direct.steamGameLaunch, "client-routed native entry: none, and held")
+        var artwork = LibraryEntry(title: "Art only", relativePath: "Games/Fixture/game.exe", bits: 32)
+        artwork.steamID = 54321; setenv("MADEIRA_STEAM_APPID", "999", 1); artwork.configureLaunch()
+        try require(getenv("MADEIRA_STEAM_APPID") == nil, "artwork identity is not a store identity")
+        var openSteam = LibraryEntry(title: "Steam", relativePath: "Program Files (x86)/Steam/steam.exe", bits: 32)
+        openSteam.steamSession = "client"
+        try require(openSteam.usesSteam && !openSteam.steamGameLaunch, "opening the client itself shows it")
         profile.steamInstalled = false
         try require(profile.launchArguments.contains("steam://install/12345"), "reinstall route")
         try require(!profile.launchArguments.contains("-silent"), "install route shows Steam")
-        profile.arguments = Array(repeating: "argument", count: 16).joined(separator: " ")
+        try require(!profile.steamGameLaunch, "install route shows the client instead of holding")
+        profile.arguments = Array(repeating: "argument", count: 64).joined(separator: " ")
         try rejected("combined bridge argument overflow") { try profile.validate() }
         profile.arguments = ""; profile.relativePath = "../Steam.exe"
         try rejected("launch outside drive_c") { try profile.validate() }

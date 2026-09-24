@@ -3776,6 +3776,39 @@ DECL_HANDLER(get_volume_info)
     release_object( fd );
 }
 
+/* ml1490: which device paths a program opens through the server, sampled.
+ * Device log 193: with a game running, the Steam client's engine thread made
+ * about 1,600 of these opens per second (open_file_object from NtCreateFile,
+ * i.e. a pipe or other device path), with the server at 0.4 of a core. This
+ * names them: the first 24, then every 4096th, with the result and the
+ * running count. MADEIRA_OPEN_OBJECT_TRACE=0 disables it. */
+static void ios_open_object_trace( const struct unicode_str *name, int has_root )
+{
+    static int enabled = -1;
+    static unsigned int count;
+    char text[160];
+    data_size_t i, n;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_OPEN_OBJECT_TRACE" );
+        enabled = !(e && e[0] == '0');
+    }
+    if (!enabled) return;
+    count++;
+    if (count > 24 && (count & 4095)) return;
+    n = name->len / sizeof(WCHAR);
+    if (n > sizeof(text) - 1) n = sizeof(text) - 1;
+    for (i = 0; i < n; i++)
+    {
+        WCHAR c = name->str[i];
+        text[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+    }
+    text[n] = 0;
+    fprintf( stderr, "[open-obj] ml1490 #%u tid=%04x pid=%04x status=%08x root=%d name=%s\n",
+             count, current->id, current->process->id, get_error(), has_root, text );
+}
+
 /* open a file object */
 DECL_HANDLER(open_file_object)
 {
@@ -3786,7 +3819,11 @@ DECL_HANDLER(open_file_object)
 
     obj = open_named_object( root, NULL, &name, req->attributes );
     if (root) release_object( root );
-    if (!obj) return;
+    if (!obj)
+    {
+        ios_open_object_trace( &name, req->rootdir != 0 );
+        return;
+    }
 
     if ((result = obj->ops->open_file( obj, req->access, req->sharing, req->options )))
     {
@@ -3794,6 +3831,7 @@ DECL_HANDLER(open_file_object)
         release_object( result );
     }
     release_object( obj );
+    ios_open_object_trace( &name, req->rootdir != 0 );
 }
 
 /* get the Unix name from a file handle */

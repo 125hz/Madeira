@@ -40,6 +40,8 @@ private final class SteamDownloadDelegate: NSObject, URLSessionDownloadDelegate,
         guard LibraryFlags.enabled("MADEIRA_STEAM"), canManage, !refreshing, !busy else { return }
         refreshing = true
         defer { refreshing = false; scan = nil }
+        // ml1530: a Steam folder set aside for the installer returns before the scan.
+        await restorePendingInstallFolder()
         let drive = LibraryModel.drive
         let preferred = UserDefaults.standard.string(forKey: "madeiraSteamClient")
         let task = Task { try await SteamDisk.shared.snapshot(drive: drive, preferredClient: preferred) }
@@ -51,6 +53,41 @@ private final class SteamDownloadDelegate: NSObject, URLSessionDownloadDelegate,
             LibraryModel.shared.mergeSteam(result)
             fputs("[steam-bridge] ml1260 scan client=\(result.client == nil ? 0 : 1) apps=\(result.apps.count) complete=\(result.complete ? 1 : 0) skipped=\(result.skippedLibraries) unreadable=\(result.unreadableManifests)\n", stderr)
         } catch is CancellationError {} catch { self.error = error.localizedDescription }
+    }
+    /// ml1530: Steam's installer refuses a non-empty C:\Program Files (x86)\Steam,
+    /// which Madeira's downloader creates before the client exists. Called right
+    /// before the installer's session starts; see SteamInstallFolder.
+    /// MADEIRA_STEAM_INSTALL_MOVE_ASIDE=0 leaves the folder alone.
+    func prepareInstallerFolder() {
+        guard LibraryFlags.enabled("MADEIRA_STEAM_INSTALL_MOVE_ASIDE") else {
+            LogStore.shared.log("[steam-install] ml1530 move-aside disabled"); return
+        }
+        let root = SteamInstallPaths.root
+        do {
+            if let pending = try SteamInstallFolder.moveAside(root) {
+                LogStore.shared.log("[steam-install] ml1530 moved Steam folder aside to \(pending.lastPathComponent)")
+            } else {
+                LogStore.shared.log("[steam-install] ml1530 move-aside not needed client=\(SteamInstallFolder.hasClient(root) ? 1 : 0)")
+            }
+        } catch {
+            LogStore.shared.log("[steam-install] ml1530 move-aside failed reason=\(String(describing: type(of: error)))")
+        }
+    }
+    /// ml1530: once no session runs, a set-aside folder's contents move back
+    /// into the Steam folder without replacing what Steam created.
+    func restorePendingInstallFolder() async {
+        guard canManage else { return }
+        let root = SteamInstallPaths.root
+        guard !SteamInstallFolder.pendingFolders(root).isEmpty else { return }
+        let result = await Task.detached(priority: .userInitiated) { () -> Result<SteamInstallFolder.Report, Error> in
+            Result { try SteamInstallFolder.mergeBack(root) }
+        }.value
+        switch result {
+        case .success(let report):
+            LogStore.shared.log("[steam-install] ml1530 merged back folders=\(report.folders) moved=\(report.moved) kept=\(report.kept) removed=\(report.removed) client=\(SteamInstallFolder.hasClient(root) ? 1 : 0)")
+        case .failure(let error):
+            LogStore.shared.log("[steam-install] ml1530 merge back failed reason=\(String(describing: type(of: error)))")
+        }
     }
     func stopScan() { scan?.cancel() }
     func cancel() { operation?.cancel() }
@@ -155,6 +192,11 @@ struct SteamLibraryView: View {
                 model.stopScan()
                 if entry.steamSession == "installer" {
                     LogStore.shared.log("[steam-install] ml1270 starting cached installer; entering Wine/JIT startup")
+                    // ml1530: downloads stop writing into the Steam folder, which moves
+                    // aside when it holds only downloaded games (the installer needs it empty).
+                    await SteamAccountModel.shared.holdForSteamInstall()
+                    try Task.checkCancellation()
+                    model.prepareInstallerFolder()
                 }
                 LogStore.shared.log("[steam-launch] ml1300 handing off to Wine")
                 play(entry)

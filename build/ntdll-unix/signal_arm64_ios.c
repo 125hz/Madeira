@@ -12874,6 +12874,302 @@ static inline ULONG ios_wow_guest_in( const void *host, ULONG_PTR wow_base )
     return host ? (ULONG)((ULONG_PTR)host - wow_base) : 0;
 }
 
+/* ml1500: A PER-PROGRAM SCHEDULING CLASS.
+ *
+ * start_thread promotes every guest thread to QOS_CLASS_USER_INTERACTIVE (P-cores,
+ * minimal timer leeway), which is right for a game and wrong for a launcher's
+ * background programs: device log 194 had a launcher's ~100 threads (its Chromium
+ * helper's renderer and its engine thread about a quarter of all samples) sharing
+ * the performance cores with the game. A front end can now name programs by base
+ * name in MADEIRA_QOS_UTILITY_EXES and MADEIRA_QOS_DEFAULT_EXES (';' or ','
+ * separated, case-insensitive); their threads drop to that class here, just before
+ * each one first enters PE code. Everything else keeps USER_INTERACTIVE.
+ * MADEIRA_THREAD_QOS=0 disables it; [thread-qos] logs the first 24 demotions. */
+static int ios_qos_listed( const char *list, const WCHAR *name, size_t len )
+{
+    while (list && *list)
+    {
+        const char *end = list;
+        size_t n, i;
+        while (*end && *end != ';' && *end != ',') end++;
+        n = end - list;
+        if (n == len)
+        {
+            for (i = 0; i < n; i++)
+            {
+                WCHAR a = name[i], b = (unsigned char)list[i];
+                if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+                if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+                if (a != b) break;
+            }
+            if (i == n) return 1;
+        }
+        list = *end ? end + 1 : end;
+    }
+    return 0;
+}
+
+/* ml1510: THE CLASSES APPLY ONLY WHILE THE GAME RUNS.
+ *
+ * ml1500 set them at thread start, so the launcher's own start-up ran on the
+ * efficiency cores too (device log 195: the launcher needed ~46 s to reach its
+ * installers, ~32 s with every thread interactive in log 194). Now a front end
+ * turns them on once the game's window is up (madeira_set_background_qos), and
+ * each listed thread moves at its next wait (server_select, NtWait*,
+ * NtDelayExecution), comparing a global epoch with the one it last applied;
+ * off again restores USER_INTERACTIVE the same way. MADEIRA_THREAD_QOS_ALWAYS=1
+ * applies them from thread start as ml1500 did. */
+static volatile int ios_bgqos_on = -1;
+static volatile int ios_bgqos_epoch;
+static pthread_key_t ios_bgqos_key;
+static pthread_once_t ios_bgqos_key_once = PTHREAD_ONCE_INIT;
+
+static void ios_bgqos_key_init( void ) { pthread_key_create( &ios_bgqos_key, NULL ); }
+
+static int ios_bgqos_active( void )
+{
+    int on = __atomic_load_n( &ios_bgqos_on, __ATOMIC_RELAXED );
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_THREAD_QOS_ALWAYS" );
+        on = (e && e[0] == '1') ? 1 : 0;
+        __atomic_store_n( &ios_bgqos_on, on, __ATOMIC_RELAXED );
+    }
+    return on;
+}
+
+static void ios_apply_program_qos( TEB *teb, int demote )
+{
+    static int enabled = -1;
+    static int logged;
+    const RTL_USER_PROCESS_PARAMETERS *pp;
+    const WCHAR *path;
+    size_t len, start = 0, i;
+    qos_class_t cls;
+    const char *name;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_THREAD_QOS" );
+        enabled = !(e && e[0] == '0');
+    }
+    if (!enabled || !teb || !teb->Peb || !(pp = teb->Peb->ProcessParameters)) return;
+    if (!(path = pp->ImagePathName.Buffer) || !pp->ImagePathName.Length) return;
+    len = pp->ImagePathName.Length / sizeof(WCHAR);
+    for (i = 0; i < len; i++) if (path[i] == '\\' || path[i] == '/') start = i + 1;
+    /* ml1530: MADEIRA_QOS_BACKGROUND_EXES, the lowest class, for a helper that
+     * must stay alive while the game runs but should only get spare cycles
+     * (ml1520's ending of it froze the game in device logs 199/200). */
+    if (ios_qos_listed( getenv( "MADEIRA_QOS_BACKGROUND_EXES" ), path + start, len - start ))
+    {
+        cls = QOS_CLASS_BACKGROUND; name = "background";
+    }
+    else if (ios_qos_listed( getenv( "MADEIRA_QOS_UTILITY_EXES" ), path + start, len - start ))
+    {
+        cls = QOS_CLASS_UTILITY; name = "utility";
+    }
+    else if (ios_qos_listed( getenv( "MADEIRA_QOS_DEFAULT_EXES" ), path + start, len - start ))
+    {
+        cls = QOS_CLASS_DEFAULT; name = "default";
+    }
+    else return;
+    if (!demote) { cls = QOS_CLASS_USER_INTERACTIVE; name = "interactive"; }
+    pthread_set_qos_class_self_np( cls, 0 );
+    if (__atomic_fetch_add( &logged, 1, __ATOMIC_RELAXED ) < 24)
+        fprintf( stderr, "[thread-qos] ml1500 tid=%04x image=%s class=%s\n",
+                 (unsigned int)HandleToULong( teb->ClientId.UniqueThread ),
+                 debugstr_wn( path + start, len - start ), name );
+}
+
+/* ml1510: move this thread to its program's current class if the epoch moved. */
+static void ios_qos_refresh_teb( TEB *teb )
+{
+    int epoch = __atomic_load_n( &ios_bgqos_epoch, __ATOMIC_RELAXED );
+    uintptr_t seen;
+
+    pthread_once( &ios_bgqos_key_once, ios_bgqos_key_init );
+    seen = (uintptr_t)pthread_getspecific( ios_bgqos_key );
+    if (seen == (uintptr_t)epoch + 1) return;
+    pthread_setspecific( ios_bgqos_key, (void *)((uintptr_t)epoch + 1) );
+    if (!seen && !ios_bgqos_active()) return;   /* first look, classes off: nothing to change */
+    ios_apply_program_qos( teb, ios_bgqos_active() );
+}
+
+void ios_qos_refresh( void ) { ios_qos_refresh_teb( NtCurrentTeb() ); }
+
+/* ml1510: called by the front end (the game's window is up, or the session ended). */
+static void ios_park_set( int on );
+
+void madeira_set_background_qos( int on )
+{
+    on = on ? 1 : 0;
+    ios_park_set( on );
+    if (ios_bgqos_active() == on) return;
+    __atomic_store_n( &ios_bgqos_on, on, __ATOMIC_RELAXED );
+    __atomic_add_fetch( &ios_bgqos_epoch, 1, __ATOMIC_RELAXED );
+    fprintf( stderr, "[thread-qos] ml1510 background classes %s\n", on ? "on (the game is running)" : "off" );
+}
+
+/* ml1520: A LAUNCHER'S HELPER ENDS WHILE THE GAME RUNS.
+ *
+ * Device log 196 (game running, quiet build, 2.4 cores busy): a launcher's
+ * embedded-browser helper kept its renderer thread at 16% of all CPU plus its
+ * browser, GPU and COM threads, and the wineserver thread spent another ~19%
+ * answering them; phys_footprint sat at ~4.09 GB with 1.6 GB of it compressed,
+ * i.e. memory nobody was touching. Nothing the game needs lives in that helper
+ * (its launcher keeps the game's API connection itself), so programs named in
+ * MADEIRA_PARK_EXES (base names, ';' or ',' separated; set by the front end)
+ * exit MADEIRA_PARK_DELAY_S seconds (default 10) after the front end reports
+ * the game's window (madeira_set_background_qos(1)), and may not start again
+ * until the session ends (ios_park_refuse, the spawn gate in process_ios.c).
+ * Each listed thread checks at its next wait (NtWait*, NtDelayExecution); the
+ * first one of a process ends it the way ExitProcess would, without DLL detach
+ * - the same as a TerminateProcess from outside. A thread of a program named in
+ * MADEIRA_PARK_OWNER_EXES (the launcher itself) then tears the dead process's
+ * 4 GB window down at its own next wait, instead of when the next 32-bit
+ * program starts (ios_wow_reclaim_settled, virtual_ios.c), which is what gives
+ * the memory back. MADEIRA_PARK=0 disables all of it; [park] logs each step. */
+static volatile long long ios_park_since;     /* CLOCK_MONOTONIC ns of the game window; 0 = off */
+static volatile int ios_park_reclaim;         /* 1: a parked program ended, its window is not back yet */
+static volatile long long ios_park_reclaim_at;
+static volatile unsigned int ios_park_ended[4];
+static pthread_key_t ios_park_key;
+static pthread_once_t ios_park_key_once = PTHREAD_ONCE_INIT;
+
+static void ios_park_key_init( void ) { pthread_key_create( &ios_park_key, NULL ); }
+
+static long long ios_park_now( void )
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+static int ios_park_enabled( void )
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_PARK" ), *list = getenv( "MADEIRA_PARK_EXES" );
+        enabled = !(e && e[0] == '0') && list && list[0] && strcmp( list, "0" );
+    }
+    return enabled;
+}
+
+static long long ios_park_delay_ns( void )
+{
+    static long long delay = -1;
+    if (delay < 0)
+    {
+        const char *e = getenv( "MADEIRA_PARK_DELAY_S" );
+        long s = e && e[0] ? strtol( e, NULL, 10 ) : 10;
+        delay = (long long)(s < 0 ? 0 : s) * 1000000000LL;
+    }
+    return delay;
+}
+
+static void ios_park_set( int on )
+{
+    long long was;
+    if (!ios_park_enabled()) return;
+    was = __atomic_exchange_n( &ios_park_since, on ? ios_park_now() : 0, __ATOMIC_RELAXED );
+    if (!!was != !!on)
+        fprintf( stderr, "[park] ml1520 %s (list=%s delay=%llds)\n",
+                 on ? "armed: listed programs end once the game has run" : "off: listed programs may start again",
+                 getenv( "MADEIRA_PARK_EXES" ), ios_park_delay_ns() / 1000000000LL );
+}
+
+/* base name of this process's image, or NULL */
+static const WCHAR *ios_park_image( TEB *teb, size_t *len )
+{
+    const RTL_USER_PROCESS_PARAMETERS *pp;
+    const WCHAR *path;
+    size_t n, start = 0, i;
+
+    if (!teb || !teb->Peb || !(pp = teb->Peb->ProcessParameters)) return NULL;
+    if (!(path = pp->ImagePathName.Buffer) || !pp->ImagePathName.Length) return NULL;
+    n = pp->ImagePathName.Length / sizeof(WCHAR);
+    for (i = 0; i < n; i++) if (path[i] == '\\' || path[i] == '/') start = i + 1;
+    *len = n - start;
+    return path + start;
+}
+
+/* spawn gate: 1 = refuse this image while the game runs */
+int ios_park_refuse( const WCHAR *path, size_t len )
+{
+    static unsigned int refused;
+    size_t start = 0, i;
+    unsigned int n;
+
+    if (!__atomic_load_n( &ios_park_since, __ATOMIC_RELAXED ) || !ios_park_enabled()) return 0;
+    for (i = 0; i < len; i++) if (path[i] == '\\' || path[i] == '/') start = i + 1;
+    if (!ios_qos_listed( getenv( "MADEIRA_PARK_EXES" ), path + start, len - start )) return 0;
+    n = __atomic_add_fetch( &refused, 1, __ATOMIC_RELAXED );
+    if (n <= 4 || !(n & 63))
+        fprintf( stderr, "[park] ml1520 refused restart #%u of %s while the game runs\n",
+                 n, debugstr_wn( path + start, len - start ) );
+    return 1;
+}
+
+void ios_park_check( void )
+{
+    enum { UNKNOWN, LISTED, RECLAIMER, OTHER };
+    extern int ios_wow_reclaim_settled( void );
+    long long since = __atomic_load_n( &ios_park_since, __ATOMIC_RELAXED ), now;
+    TEB *teb;
+    uintptr_t kind;
+    const WCHAR *image;
+    size_t len = 0;
+
+    if (!since) return;
+    pthread_once( &ios_park_key_once, ios_park_key_init );
+    kind = (uintptr_t)pthread_getspecific( ios_park_key );
+    if (kind == OTHER) return;
+    teb = NtCurrentTeb();
+    if (kind == UNKNOWN)
+    {
+        image = ios_park_image( teb, &len );
+        if (image && ios_qos_listed( getenv( "MADEIRA_PARK_EXES" ), image, len )) kind = LISTED;
+        else if (image && ios_qos_listed( getenv( "MADEIRA_PARK_OWNER_EXES" ), image, len )) kind = RECLAIMER;
+        else kind = OTHER;
+        pthread_setspecific( ios_park_key, (void *)kind );
+        if (kind == OTHER) return;
+    }
+    now = ios_park_now();
+    if (kind == LISTED)
+    {
+        unsigned int pid = (unsigned int)HandleToULong( teb->ClientId.UniqueProcess ), i;
+
+        if (now - since < ios_park_delay_ns()) return;
+        /* one thread per process ends it; the rest are ended by it */
+        for (i = 0; i < ARRAY_SIZE(ios_park_ended); i++)
+        {
+            unsigned int expected = 0;
+            if (__atomic_load_n( &ios_park_ended[i], __ATOMIC_RELAXED ) == pid) return;
+            if (__atomic_compare_exchange_n( &ios_park_ended[i], &expected, pid, 0,
+                                             __ATOMIC_RELAXED, __ATOMIC_RELAXED )) break;
+        }
+        if (i == ARRAY_SIZE(ios_park_ended)) return;
+        image = ios_park_image( teb, &len );
+        fprintf( stderr, "[park] ml1520 ending %s pid=%04x: the game has run %llds (MADEIRA_PARK=0 keeps it)\n",
+                 image ? debugstr_wn( image, len ) : "?", pid, (now - since) / 1000000000LL );
+        __atomic_store_n( &ios_park_reclaim_at, now, __ATOMIC_RELAXED );
+        __atomic_store_n( &ios_park_reclaim, 1, __ATOMIC_RELAXED );
+        NtTerminateProcess( 0, 0 );
+        NtTerminateProcess( NtCurrentProcess(), 0 );
+        return;
+    }
+    /* RECLAIMER: at most every 2 s, until no ended window is left */
+    if (!__atomic_load_n( &ios_park_reclaim, __ATOMIC_RELAXED )) return;
+    if (now - __atomic_load_n( &ios_park_reclaim_at, __ATOMIC_RELAXED ) < 2000000000LL) return;
+    __atomic_store_n( &ios_park_reclaim_at, now, __ATOMIC_RELAXED );
+    if (!ios_wow_reclaim_settled())
+    {
+        __atomic_store_n( &ios_park_reclaim, 0, __ATOMIC_RELAXED );
+        fprintf( stderr, "[park] ml1520 ended program's window returned to the system\n" );
+    }
+}
+
 void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, TEB *teb )
 {
     struct syscall_frame *frame = ((struct ntdll_thread_data *)&teb->GdiTebBatch)->syscall_frame;
@@ -13226,6 +13522,7 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
     ERR("init_syscall_frame: mach exc thread alive=%d, slot=%d\n",
         ios_exc_thread_alive, ios_my_slot);
 
+    ios_qos_refresh_teb( teb );   /* ml1500/ml1510: this program's class, if the classes are on */
     ERR("init_syscall_frame: signals_total=%d before PE entry\n", ios_signal_total);
     ERR("init_syscall_frame: frame=%p pc=%p x0=%p sp=%p x18=%p restore_flags=0x%x\n",
         frame, (void*)(uintptr_t)frame->pc, (void*)(uintptr_t)frame->x[0],

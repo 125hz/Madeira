@@ -849,6 +849,82 @@ upstream behaviour. `MADEIRA_APC_REQUEUE=0` restores dropping. The log line
 prints the first 32 handovers and every 1024th after that, with the APC
 status, so the next log also shows how often this was happening.
 
+## ml1490: the client stays hidden, and games load and run lighter
+
+What logs 185-193 proved after ml1480:
+- **ml1480 fixed both failures.**
+  - The WebSocket CM connection held for a whole session (log 185).
+  - The client downloaded at up to 93 Mbit/s and launched the game with no startup error.
+  - `[apc-requeue]` handed over 30-55 completion steps per session that the old server would have dropped.
+- **A title stalled while loading, and it was not the client.** DXMT's D3D9 upload ring grew to 955 MB during a long loading screen. The ring only recycles after a submission, and a loading screen barely submits. The process reached its memory ceiling and slowed under compression.
+- **Portal and Mirror's Edge reached gameplay through the client.**
+- **Direct starts of Steam-DRM titles cannot work.** One also ran with a foreign hard-coded Steam ID. Another ran a PhysX installer the native install had picked as its program.
+- **Client-routed play costs frame rate.** A client-routed title ran at 35-42 fps against 53-59 fps for the same game DRM-free. During play the client used about one extra core:
+  - its engine thread's polling loop kept the Wine server at 0.4 core;
+  - its hidden UI renderer used about 15 %;
+  - the ordered profile slowed both.
+- **Other log findings.**
+  - A saved logon was rejected once, after the network changed (European CM list, new interface).
+  - One launch was held by a 36 GB Workshop update: 52 subscribed items.
+
+Changes:
+- **Starting screen instead of the desktop.** A client-routed launch stays on the starting screen until the game's own window appears. The client's windows are revealed only when it needs you (sign-in, Steam Guard, EULA, errors) or when you press "Show Steam". Workshop updates are shown with their size and the note that they come from your subscriptions.
+- **Loading memory (DXMT).** Uploads commit every 64 MB, with at most two batches in flight. A host run of the production ring allocator peaks at 192 MB instead of 1088 MB.
+- **Steam identity per launch.** Nothing is published for client launches (the client sets it). A direct launch gets its folder and its library ID or steam_appid.txt.
+- **Installers are never picked as a game's program.** Existing entries are repaired.
+- **The ordered profile is off by default** (MADEIRA_ORDERED_PROFILE=1 re-enables it).
+- **`[open-obj]` names what the client's engine thread keeps opening.** That comes next.
+- Not done, and will not be: GameNative's client-less mode. It replaces Steam's DRM with an API emulator, a stub loader and an unpacker.
+
+Switches added: MADEIRA_STEAM_HIDE_DESKTOP, MADEIRA_STEAM_AUTO_REVEAL, MADEIRA_STEAM_WORKSHOP_PROGRESS, MADEIRA_LIVE_BLACK_BARS, MADEIRA_STEAM_EXE_FILTER, MADEIRA_STEAM_ENV, MADEIRA_OPEN_OBJECT_TRACE, DXMT_D9_UPLOAD_COMMIT_MB, DXMT_ZERO_BUFFER_POW2.
+
+## ml1500: keeping the client out of the game's way
+
+Log 194, a client-routed title against the same title DRM-free:
+- **Frame rate and memory:** 35-40 fps and 4.5 GB, against 60 fps and 2 GB.
+- **The game itself costs the same:** renderer 448 MB against 491 MB.
+- **Everything else is the client:**
+  - 137 threads instead of 38;
+  - about 290 MB more compiled code;
+  - a second Chromium process that is only a crash uploader;
+  - an engine thread keeping the Wine server busy at a third of a core;
+  - all of it scheduled at the same top iOS priority as the game.
+
+Changes:
+- **Scheduling.** The client and its helpers now run at lower iOS scheduling classes: DEFAULT for the client, UTILITY for its helpers and tools. The game keeps the top class.
+- **Client flags.** Game launches add the rest of GameNative's client options. `-cef-disable-breakpad` removes the crash-uploader process; the others turn off chat, Big Picture, VR, streaming drivers, the intro, helper extensions, remote fonts, video decode, D3D11 and DirectWrite in the helper.
+
+What would save the most, and is not done:
+- **GameNative's DRM-free mode** (Steam API emulator + stub loader + Steamless) is circumvention and is out.
+- **A headless client host** is the legitimate equivalent. It would run Valve's genuine steamclient.dll without the Chromium UI, so games still pass Steam's checks against the signed-in account. It needs its own investigation.
+
+Other findings:
+- **Diagnostics on skews measurements.** The settings toggle (200 Hz profiler, 20 s thread walk) costs more with the client's thread count, so compare frame rates with it off.
+- **Unsolved:** the client reruns a title's redistributable installers at every launch (DirectX, PhysX, VC++; about 16 s).
+
+Switches: MADEIRA_THREAD_QOS, MADEIRA_STEAM_BACKGROUND_QOS, MADEIRA_STEAM_CEF_LIGHT, MADEIRA_LOG_VIA_STDERR, MADEIRA_PANEL_BINDING_COLLAPSED.
+
+## ml1520: the web helper stops while the game plays
+
+Logs 196/197 (ml1510), a client-routed title:
+- **Frame rate and memory:** 45-55 fps and about 4.1 GB. About 1.6 GB of that is compressed, meaning nothing touches it.
+- **CPU during play:**
+  - The web helper's renderer thread alone is about 16% of all CPU. The helper's other threads, and the Wine server answering them, come on top.
+  - The client's gamepad task is up to 10%.
+- **Network polling:** about 40 adapter enumerations a second, all session long.
+- **Installers:** the rerun of a title's redistributable installers is not the installers running. They cannot start, because SteamService takes the last of the three 32-bit process slots. So they fail at once, and the client retries them at every launch.
+
+Changes (all device-unverified):
+- **The helper ends 10 s after the game's window appears.** Its restart is refused until the session ends, and its 4 GB process window, with the memory in it, goes back to iOS right away. The client itself stays up and keeps the game's connection. A Windows tool does the same for PCs; whether this client build tolerates it here is what the next log shows ([park] lines).
+- **Network change requests wait instead of failing,** so a caller waiting for an address change no longer re-reads the adapters in a loop.
+- **The helper's verbose logging follows the diagnostics switch.**
+- **`[proc-mem]` names what each 32-bit program holds,** every 30 s.
+- **The starting screen follows the client's launch tasks** (console_log.txt), including a "Steam is waiting for you" line for a license agreement.
+
+What stays out: GameNative's DRM-free mode and any client-less use of steamclient.dll.
+
+Switches: MADEIRA_STEAM_WEBHELPER_STOP, MADEIRA_PARK, MADEIRA_PARK_DELAY_S, MADEIRA_NSI_NOTIFY_PENDING, MADEIRA_CEF_QUIET_LOG, MADEIRA_PROC_MEM, MADEIRA_STEAM_LAUNCH_STAGES.
+
 ## References
 
 - [Valve's official client download](https://store.steampowered.com/about/)

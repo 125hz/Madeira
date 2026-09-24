@@ -119,6 +119,7 @@ final class SteamAccountModel: ObservableObject {
         if phase == .signedIn, outdated || Date().timeIntervalSince(libraryUpdated ?? .distantPast) > 6 * 3600 {
             Task { await refreshLibrary(interactive: false) }
         }
+        repairLaunchExecutables()
     }
 
     /// Called when a Wine session starts or ends. Downloads pause for the
@@ -152,6 +153,20 @@ final class SteamAccountModel: ObservableObject {
             for id in resume { install(id) }
             if !resume.isEmpty { SteamLog.event("[steam-depot] ml1310 resumed after session count=\(resume.count)") }
         }
+    }
+
+    /// ml1530: before Steam's installer runs, downloads stop writing into the
+    /// Steam folder (it may be moved aside). They continue after the session,
+    /// as for a game session; waits for the running one to stop.
+    func holdForSteamInstall() async {
+        guard Self.enabled else { return }
+        let running = active?.task
+        if let current = active { resumeAfterSession.insert(current.id); current.task.cancel() }
+        for id in queue { resumeAfterSession.insert(id); downloads[id]?.state = .paused }
+        let count = queue.count + (running == nil ? 0 : 1)
+        queue.removeAll()
+        if count > 0 { SteamLog.event("[steam-depot] ml1530 paused for Steam install count=\(count)") }
+        await running?.value
     }
 
     // MARK: Sign-in
@@ -415,10 +430,11 @@ final class SteamAccountModel: ObservableObject {
     private func completeInstall(_ info: SteamAppInfo, folder: URL) async throws {
         let game = SteamOwnedGame(info)
         let drive = LibraryModel.drive
-        let choice = await Task.detached(priority: .userInitiated) {
-            Self.chooseExecutable(folder: folder, options: game.launch, drive: drive)
+        let search = await Task.detached(priority: .userInitiated) {
+            Self.searchExecutable(folder: folder, options: game.launch, drive: drive)
         }.value
-        guard let choice else {
+        Self.logSearch(search, appID: game.id)
+        guard let choice = search.choice else {
             throw SteamError.chunkDownloadFailed("The download finished, but no Windows program was found in it.")
         }
         var entry = try LibraryModel.inspect(choice.url)
@@ -477,7 +493,16 @@ final class SteamAccountModel: ObservableObject {
     // MARK: Executables
 
     struct ExecutableChoice { var url: URL; var arguments: String; var source: String }
+    /// ml1490: the choice, plus what was passed over and why, for the log.
+    struct ExecutableSearch {
+        var choice: ExecutableChoice?
+        /// Steam launch options that did not resolve: "exe=<as listed> reason=<unsafe-path|missing|not-exe|inspect-failed>".
+        var rejected: [String] = []
+        /// Folder-scan programs skipped as redistributables or installers (SteamExecutableRules).
+        var skipped = 0
+    }
 
+    /// Programs the folder scan prefers not to choose; still chosen when nothing else exists.
     private nonisolated static let helperNames = ["unins", "vcredist", "vc_redist", "dxsetup", "dotnet", "crashhandler", "crashreport",
                                       "crashpad", "prereq", "redist", "setup", "installer", "easyanticheat", "eac_", "be_service",
                                       "launcherhelper", "cefprocess", "webhelper", "updater", "touchup"]
@@ -485,19 +510,41 @@ final class SteamAccountModel: ObservableObject {
     /// Prefer Steam's own launch entries (default type, 64-bit or neutral
     /// first), falling back to the most likely program in the folder.
     nonisolated static func chooseExecutable(folder: URL, options: [SteamLaunchOption], drive: URL) -> ExecutableChoice? {
+        searchExecutable(folder: folder, options: options, drive: drive).choice
+    }
+
+    /// ml1490: chooseExecutable with its reasons. The folder scan never chooses
+    /// a redistributable or installer (SteamExecutableRules; a direct launch
+    /// ran one instead of the game). MADEIRA_STEAM_EXE_FILTER=0 restores the
+    /// old preference-only filter.
+    nonisolated static func searchExecutable(folder: URL, options: [SteamLaunchOption], drive: URL) -> ExecutableSearch {
         func rank(_ option: SteamLaunchOption) -> Int {
             (option.type.isEmpty || option.type == "default" ? 0 : 10) + (option.arch == "64" ? 0 : option.arch.isEmpty ? 1 : 2)
         }
+        var search = ExecutableSearch()
         for option in options.sorted(by: { rank($0) < rank($1) }) {
             let relative = option.executable.replacingOccurrences(of: "\\", with: "/")
-            guard let candidate = SteamPaths.safeRelative(relative, under: folder),
-                  let url = SteamPaths.existing(candidate, drive: drive),
-                  (try? LibraryModel.inspect(url)) != nil else { continue }
-            return ExecutableChoice(url: url, arguments: option.arguments, source: "launch")
+            let reason: String
+            if let candidate = SteamPaths.safeRelative(relative, under: folder) {
+                if let url = SteamPaths.existing(candidate, drive: drive) {
+                    if url.pathExtension.lowercased() != "exe" { reason = "not-exe" }
+                    else if (try? LibraryModel.inspect(url)) == nil { reason = "inspect-failed" }
+                    else {
+                        search.choice = ExecutableChoice(url: url, arguments: option.arguments, source: "launch")
+                        return search
+                    }
+                } else { reason = "missing" }
+            } else { reason = "unsafe-path" }
+            search.rejected.append("exe=\(option.executable) reason=\(reason)")
         }
         let candidates = executableCandidates(folder: folder)
-        let preferred = candidates.filter { url in !helperNames.contains { url.lastPathComponent.lowercased().contains($0) } }
-        let pool = preferred.isEmpty ? candidates : preferred
+        let base = folder.pathComponents.count
+        let usable = LibraryFlags.enabled("MADEIRA_STEAM_EXE_FILTER")
+            ? candidates.filter { SteamExecutableRules.installerReason($0.pathComponents.dropFirst(base).joined(separator: "/")) == nil }
+            : candidates
+        search.skipped = candidates.count - usable.count
+        let preferred = usable.filter { url in !helperNames.contains { url.lastPathComponent.lowercased().contains($0) } }
+        let pool = preferred.isEmpty ? usable : preferred
         let best = pool.min { a, b in
             let da = a.pathComponents.count, db = b.pathComponents.count
             if da != db { return da < db }
@@ -505,7 +552,54 @@ final class SteamAccountModel: ObservableObject {
             let sb = (try? b.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
             return sa > sb
         }
-        return best.map { ExecutableChoice(url: $0, arguments: "", source: "scan") }
+        search.choice = best.map { ExecutableChoice(url: $0, arguments: "", source: "scan") }
+        return search
+    }
+
+    /// ml1490: at most eight rejected launch options per search, and the skip count.
+    static func logSearch(_ search: ExecutableSearch, appID: Int) {
+        for line in search.rejected.prefix(8) { SteamLog.event("[steam-depot] ml1490 launch option rejected app=\(appID) " + line) }
+        if search.rejected.count > 8 { SteamLog.event("[steam-depot] ml1490 launch options rejected app=\(appID) more=\(search.rejected.count - 8)") }
+        if search.skipped > 0 { SteamLog.event("[steam-depot] ml1490 scan skipped installers app=\(appID) count=\(search.skipped)") }
+    }
+
+    /// ml1490: a native entry made before the installer filter can still start
+    /// a redistributable's installer. Once per app start, such an entry's
+    /// program is chosen again: Steam's launch options when the cached library
+    /// still lists them, else the filtered folder scan. Only programs inside the
+    /// entry's install folder are judged; one the user picked elsewhere stays.
+    /// Off with MADEIRA_STEAM_EXE_FILTER=0.
+    private func repairLaunchExecutables() {
+        guard LibraryFlags.enabled("MADEIRA_STEAM_EXE_FILTER") else { return }
+        let drive = LibraryModel.drive
+        for entry in LibraryModel.shared.entries where entry.steamNative == true && entry.steamInstalled == true {
+            guard let appID = entry.steamAppID, let install = entry.steamInstallPath,
+                  let reason = SteamExecutableRules.installerReason(executable: entry.relativePath, installFolder: install),
+                  let folder = SteamPaths.safeRelative(install, under: drive) else { continue }
+            let options = game(appID)?.launch ?? []
+            Task { @MainActor in
+                let found = await Task.detached(priority: .utility) { () -> (ExecutableSearch, LibraryEntry?) in
+                    let search = Self.searchExecutable(folder: folder, options: options, drive: drive)
+                    return (search, search.choice.flatMap { try? LibraryModel.inspect($0.url) })
+                }.value
+                Self.logSearch(found.0, appID: appID)
+                guard let choice = found.0.choice, let inspected = found.1,
+                      var current = LibraryModel.shared.entries.first(where: { $0.id == entry.id }),
+                      current.relativePath == entry.relativePath, inspected.relativePath != entry.relativePath else {
+                    SteamLog.event("[steam-depot] ml1490 launch exe not repaired app=\(appID) reason=\(reason) found=\(found.0.choice == nil ? 0 : 1)")
+                    return
+                }
+                current.relativePath = inspected.relativePath; current.bits = inspected.bits
+                current.arguments = choice.arguments
+                if let api = inspected.graphicsAPI { current.graphicsAPI = api }
+                LibraryModel.shared.save(current)
+                SteamLog.event("[steam-depot] ml1490 repaired launch exe app=\(appID) reason=\(reason) from=\(entry.relativePath) to=\(inspected.relativePath) source=\(choice.source)")
+                if LibraryFlags.enabled("MADEIRA_STEAM_APPID_FILE") {
+                    try? "\(appID)".write(to: choice.url.deletingLastPathComponent().appendingPathComponent("steam_appid.txt"),
+                                          atomically: true, encoding: .ascii)
+                }
+            }
+        }
     }
 
     /// Windows programs inside an install folder, at most four levels deep.
@@ -566,6 +660,10 @@ final class SteamAccountModel: ObservableObject {
 /// appmanifest_<appid>.acf and those of the apps that own its shared depots.
 /// Read-only. A record the client is rewriting keeps its last complete
 /// reading. Stops when the session ends. MADEIRA_STEAM_CLIENT_PROGRESS=0 disables.
+/// ml1490: also the app's Workshop update, which the client runs before it
+/// starts the game: new lines of its logs/content_log.txt every poll and its
+/// workshop/appworkshop_<appid>.acf while that update runs
+/// (MADEIRA_STEAM_WORKSHOP_PROGRESS=0 disables; [steam-workshop] ml1490).
 /// Hook: `LibraryModel.begin` / `finish`; views observe `progress`.
 final class SteamClientProgressModel: ObservableObject {
     static let shared = SteamClientProgressModel()
@@ -587,11 +685,29 @@ final class SteamClientProgressModel: ObservableObject {
         var log = SteamClientProgressLog()
         var libraries: [URL] = []
         var librariesRead = -Double.infinity
-        init(appID: Int, client: String?, drive: URL) {
+        /// ml1490: the app's Workshop update, from the client's content log
+        /// (nil: MADEIRA_STEAM_WORKSHOP_PROGRESS=0).
+        var workshop: SteamWorkshopTracker?
+        let contentLog: URL?
+        var workshopPhase = SteamClientAppState.Phase.idle
+        var workshopLines = 0
+        /// ml1510: the client's launch stage (nil: MADEIRA_STEAM_LAUNCH_STAGES=0).
+        var stages: SteamLaunchStageTracker?
+        let connectionLog: URL?
+        let consoleLog: URL?   // ml1520: launch tasks
+        var stageLogged = SteamLaunchStage.starting
+        init(appID: Int, client: String?, drive: URL, workshop: Bool, stages: Bool) {
             self.appID = appID; self.client = client; self.drive = drive
             tracker = SteamClientProgressTracker(appID: appID)
+            self.workshop = workshop ? SteamWorkshopTracker(appID: appID) : nil
+            self.stages = stages ? SteamLaunchStageTracker(appID: appID) : nil
+            let folder = client.flatMap { SteamPaths.safeRelative($0, under: drive) }?.deletingLastPathComponent()
+            contentLog = folder.map { $0.appendingPathComponent("logs", isDirectory: true).appendingPathComponent("content_log.txt") }
+            connectionLog = folder.map { $0.appendingPathComponent("logs", isDirectory: true).appendingPathComponent("connection_log.txt") }
+            consoleLog = folder.map { $0.appendingPathComponent("logs", isDirectory: true).appendingPathComponent("console_log.txt") }
         }
-        func poll(now: Double) -> (SteamClientProgress, String?) {
+        /// The progress, a [steam-progress] line and a [steam-workshop] line (each when due).
+        func poll(now: Double) -> (SteamClientProgress, String?, String?, String?) {
             if now - librariesRead >= 60 {
                 librariesRead = now
                 let clientApps = client.flatMap { SteamPaths.safeRelative($0, under: drive) }?
@@ -599,8 +715,32 @@ final class SteamClientProgressModel: ObservableObject {
                 libraries = SteamClientProgressTracker.libraries(primary: [clientApps, SteamInstallPaths.steamApps].compactMap { $0 }, drive: drive)
             }
             tracker.poll(libraries: libraries)
-            let progress = tracker.progress
-            return (progress, log.line(progress, now: now))
+            var progress = tracker.progress
+            var workshopLine: String?
+            if var workshop {
+                workshop.poll(logFile: contentLog.map { SteamPaths.existing($0, drive: drive) ?? $0 }, libraries: libraries, now: now)
+                self.workshop = workshop
+                progress.workshop = workshop.progress
+                // Phase changes only, at most 32 per launch.
+                if workshop.log.phase != workshopPhase, workshopLines < 32 {
+                    workshopPhase = workshop.log.phase; workshopLines += 1
+                    workshopLine = progress.workshop?.logFields ?? "idle"
+                }
+            }
+            var stageLine: String?
+            if var stages {
+                stages.poll(connectionLog: connectionLog.map { SteamPaths.existing($0, drive: drive) ?? $0 },
+                            contentLog: contentLog.map { SteamPaths.existing($0, drive: drive) ?? $0 },
+                            consoleLog: consoleLog.map { SteamPaths.existing($0, drive: drive) ?? $0 })
+                self.stages = stages
+                progress.stage = stages.stage
+                if stages.stage != stageLogged {
+                    stageLogged = stages.stage
+                    // Stage changes only (at most ten per launch).
+                    stageLine = "[steam-stage] ml1510 app=\(appID) stage=\(stages.stage.name)"
+                }
+            }
+            return (progress, log.line(progress, now: now), workshopLine, stageLine)
         }
     }
 
@@ -611,10 +751,16 @@ final class SteamClientProgressModel: ObservableObject {
               LibraryFlags.enabled("MADEIRA_STEAM_CLIENT_PROGRESS") else { return }
         generation += 1
         busy = false
+        // ml1490: MADEIRA_STEAM_WORKSHOP_PROGRESS=0 leaves the content log and
+        // Workshop record unread.
+        let workshop = LibraryFlags.enabled("MADEIRA_STEAM_WORKSHOP_PROGRESS")
+        // ml1510: MADEIRA_STEAM_LAUNCH_STAGES=0 keeps the plain "Steam is starting your game…".
         session = Session(appID: appID, client: entry.steamNative == true ? entry.steamClientPath : entry.relativePath,
-                          drive: LibraryModel.drive)
+                          drive: LibraryModel.drive, workshop: workshop,
+                          stages: LibraryFlags.enabled("MADEIRA_STEAM_LAUNCH_STAGES"))
         progress = SteamClientProgress()
         LogStore.shared.log("[steam-progress] ml1420 start app=\(appID)")
+        LogStore.shared.log("[steam-workshop] ml1490 follow app=\(appID) enabled=\(workshop ? 1 : 0)")
         let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.tick() }
         self.timer = timer
         RunLoop.main.add(timer, forMode: .common)
@@ -637,11 +783,13 @@ final class SteamClientProgressModel: ObservableObject {
         busy = true
         let token = generation
         queue.async { [weak self] in
-            let (next, line) = session.poll(now: ProcessInfo.processInfo.systemUptime)
+            let (next, line, workshopLine, stageLine) = session.poll(now: ProcessInfo.processInfo.systemUptime)
             DispatchQueue.main.async {
                 guard let self, token == self.generation else { return }
                 self.busy = false
                 if let line { LogStore.shared.log("[steam-progress] ml1420 app=\(session.appID) " + line) }
+                if let workshopLine { LogStore.shared.log("[steam-workshop] ml1490 app=\(session.appID) " + workshopLine) }
+                if let stageLine { LogStore.shared.log(stageLine) }
                 if self.progress != next { self.progress = next }
             }
         }

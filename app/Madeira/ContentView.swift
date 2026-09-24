@@ -2463,6 +2463,23 @@ final class OnScreenPad {
         HardwareInput.shared.padScreenPresence(n > 0)
     }
 
+    /// ml1490: unplug and plug the on-screen pad back in, as hiding and showing
+    /// the controls does. Main thread. Nothing to do without pad controls.
+    func rearm() {
+        lock.lock()
+        let n = present
+        lock.unlock()
+        guard n > 0 else { return }
+        fputs("[xinput] ml1490 onscreen controls re-armed after editing (regions=\(n))\n", stderr)
+        HardwareInput.shared.padScreenPresence(false)
+        // Long enough for a game polling once a frame or slower to see the
+        // pad go away, which a toggle by hand always was.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self, self.isLive else { return }
+            HardwareInput.shared.padScreenPresence(true)
+        }
+    }
+
     // MARK: contributions (main thread)
 
     func press(_ rid: String, _ b: PadButton) {
@@ -3871,6 +3888,8 @@ struct ContentView: View {
     @State private var showRenameLaunchAlert = false
     @State private var renameLaunchButtonPath: String?
     @State private var renameLaunchButtonText: String = ""
+    /// ml1520: "Use New Interface" (actionButtons) applies at the next start.
+    @State private var showFrontendRestart = false
     /// Fixed tint cycle for `customLaunchButtons` so neighbouring
     /// user-added buttons are visually distinct; wraps by index.
     private static let customButtonTints: [Color] = [
@@ -4059,6 +4078,7 @@ struct ContentView: View {
                 entitlements = EntitlementStatus.check()
                 logEntitlementStatus()
                 logStore.log("[build] ml1420 \(BuildStamp.text)")
+                FrontendChoice.logStartup()
                 // WOW64_DESIGN.md §9.2 step 0: measure the free VA map before
                 // Wine/JIT touches it. Read-only, no behaviour change.
                 mad_va_probe(entitlements?.extendedVA ?? false)
@@ -4742,6 +4762,7 @@ struct ContentView: View {
                     setenv("MADEIRA_ARGS",
                            "/desktop=shell,\(deskW)x\(deskH) C:\\windows\\system32\\services.exe", 1)
                     setenv("MADEIRA_DESKTOP", "1", 1)
+                    unsetenv("MADEIRA_STEAM_APPID")   // ml1490: no leaked store identity
                     setenv("MADEIRA_SCREEN_W", String(deskW), 1)
                     setenv("MADEIRA_SCREEN_H", String(deskH), 1)
                     // explorer owns the size in desktop mode; say so in the
@@ -4770,6 +4791,7 @@ struct ContentView: View {
                         setenv("MADEIRA_EXE", test.exe, 1)
                         unsetenv("MADEIRA_ARGS")
                         unsetenv("MADEIRA_DESKTOP")
+                        unsetenv("MADEIRA_STEAM_APPID")   // ml1490: no leaked store identity
                         runWineFullSequence()
                     }
                     .buttonStyle(.borderedProminent)
@@ -4816,8 +4838,21 @@ struct ContentView: View {
                 }
                 .buttonStyle(.bordered)
                 .tint(.red)
+
+                // ml1520: back to the library interface (FrontendChoice), at the next start.
+                Button("Use New Interface") {
+                    FrontendChoice.choose(new: true)
+                    showFrontendRestart = true
+                }
+                .buttonStyle(.bordered)
+                .tint(.indigo)
             }
             .padding()
+        }
+        .alert("Restart Madeira", isPresented: $showFrontendRestart) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Close Madeira from the app switcher and open it again to use the new interface.")
         }
         // Modal popup rather than the old 2-line text-field row (removed —
         // it crashed): an .alert can't be laid out wrong, and it cannot
@@ -4882,6 +4917,8 @@ struct ContentView: View {
         setenv("MADEIRA_EXE", trimmed, 1)
         unsetenv("MADEIRA_ARGS")
         unsetenv("MADEIRA_DESKTOP")
+        // ml1490: a library launch's store identity must not reach this program.
+        unsetenv("MADEIRA_STEAM_APPID")
         runWineFullSequence()
     }
 
@@ -5170,6 +5207,11 @@ struct ContentView: View {
     private func launchLibraryEntry(_ entry: LibraryEntry) {
         guard !isLaunching, wine_process_is_running() == 0, wineserver_is_running() == 0, library.current == nil else {
             library.error = "A session is already running."; return
+        }
+        // ml1540: setup's Steam install ran a session in this app run; a game needs a fresh run.
+        if OnboardingModel.restartAdvised, OnboardingModel.restartPromptEnabled, entry.steamSession != "installer" {
+            LogStore.shared.log("[onboarding] ml1540 launch held until Madeira restarts")
+            library.error = OnboardingModel.restartMessage; return
         }
         // ml1330: "ready" means a JIT pool exists or a debugger that can grant one
         // is attached now. CS_DEBUGGED alone stays set after StikDebug is gone.
@@ -6559,14 +6601,351 @@ struct TouchControl: Codable, Identifiable, Equatable {
     var regionID: String { "ctl." + id.uuidString.prefix(8) }
 }
 
+// ============================================================================
+// ml1530 — TOUCH-CONTROL PRESETS, the pure half.
+//
+// Named layouts a user can save, load, rename and delete, kept app-wide in
+// Documents/madeira-control-presets.json (beside madeira-controls.json, so a
+// device backup carries them), plus built-ins that ship in code and can be
+// loaded but never changed. A preset is what the editor edits: the controls
+// and the layout-wide size scale. The on-screen opacity is not part of it —
+// that is a per-game overlay setting (LibraryEntry), not layout.
+//
+// Loading a preset only replaces `TouchControlsModel.controls`/`sizeScale`;
+// the game's own profile then picks the layout up through the existing save
+// path (LibraryModel.saveCurrentProfile), which this does not touch.
+//
+// Foundation-only on purpose, from `ControlPreset` to `ControlPresetStore`:
+// build/host-tests/check-control-presets.py compiles this block together with
+// PadButton/ControlAction/TouchControl above it on the host.
+// ============================================================================
+
+struct ControlPreset: Codable, Identifiable, Equatable {
+    var id: String
+    var name: String
+    var controls: [TouchControl]
+    /// Optional for the reason `TouchControlsModel.Saved.sizeScale` is: a
+    /// missing key must decode, not throw.
+    var sizeScale: Double?
+}
+
+/// ml1530: the screen a built-in layout is placed on, in points, with its
+/// safe-area insets. Built-ins are laid out in points from the edges and then
+/// normalised to THIS screen, so one layout reads right on a phone and a tablet.
+struct ControlPresetScreen: Equatable {
+    var width: Double
+    var height: Double
+    var left = 0.0, right = 0.0, top = 0.0, bottom = 0.0
+
+    /// The layout is landscape-only (see `TouchControlsModel.sizeScale`), so a
+    /// portrait screen is laid out as the landscape one it rotates to: the
+    /// top/bottom insets (sensor housing, home indicator) move to the sides.
+    var landscape: ControlPresetScreen {
+        guard height > width else { return self }
+        let side = max(top, bottom)
+        return ControlPresetScreen(width: height, height: width, left: side, right: side,
+                                   top: 0, bottom: min(bottom, 21))
+    }
+
+    /// A 6.3-inch phone in landscape: what the stored copy of a built-in is
+    /// laid out for. Loading lays it out again for the real screen.
+    static let referencePhone = ControlPresetScreen(width: 874, height: 402,
+                                                    left: 59, right: 59, top: 0, bottom: 21)
+}
+
+enum ControlPresetLayout {
+    static let xboxID = "builtin.xbox"
+    static let xboxName = "Xbox controller"
+
+    /// The margins a built-in keeps from each edge, whatever the reported insets.
+    static func margins(_ s: ControlPresetScreen) -> (left: Double, right: Double, top: Double, bottom: Double) {
+        (max(s.left, 16), max(s.right, 16), max(s.top, 8), max(s.bottom, 8))
+    }
+
+    /// Where the in-game menu button sits by default (LibraryFloatingItem in
+    /// Library.swift: 48pt, at 0.92 × 0.12 of the screen, kept inside the safe
+    /// area). The right shoulder column stays clear of it, or the menu button
+    /// would take the RT/RB touches landing under it.
+    static func menuButtonRect(_ s: ControlPresetScreen) -> CGRect {
+        let x = min(max(0.92 * s.width, s.left + 32), s.width - s.right - 32)
+        let y = max(0.12 * s.height, s.top + 32)
+        return CGRect(x: CGFloat(x - 24), y: CGFloat(y - 24), width: 48, height: 48)
+    }
+
+    /// The drawn box of a control, in points — the same size
+    /// `TouchControlButton` draws: `ControlAction.controlSize` of
+    /// base × the control's scale × the layout-wide size scale.
+    static func box(_ c: TouchControl, screen s: ControlPresetScreen,
+                    base: Double = 64, sizeScale: Double = 1) -> CGRect {
+        let size = c.action.controlSize(diameter: CGFloat(base * c.scale * sizeScale))
+        return CGRect(x: CGFloat(c.nx * s.width) - size.width / 2,
+                      y: CGFloat(c.ny * s.height) - size.height / 2,
+                      width: size.width, height: size.height)
+    }
+
+    /// ml1530 — THE BUILT-IN XBOX CONTROLLER, a full XInput layout.
+    ///
+    ///   LT LB   (top-left)                          (top-right)   RT RB
+    ///   D-pad   above the left stick     A/B/X/Y diamond above the right stick
+    ///   L-stick (bottom-left)  L3   Back Start   R3  R-stick (bottom-right)
+    ///
+    /// Everything is placed in points from the edges and safe-area insets, then
+    /// normalised, so the thumbs find the same spots on a phone and a tablet.
+    /// `k` scales the whole thing up on a tall (tablet) screen, where a
+    /// phone-sized stick would be lost; the pinch clamp (0.5–3.0) still holds.
+    /// Base 64 mirrors `TouchControlsModel.baseDiameter`.
+    static func xbox(for screen: ControlPresetScreen, base: Double = 64) -> [TouchControl] {
+        let s = screen.landscape
+        let W = s.width, H = s.height
+        guard W > 0, H > 0 else { return [] }
+        let k = min(max(H / 400, 1.0), 1.3)
+        let (L, R, T, B) = margins(s)
+        var out: [TouchControl] = []
+        func add(_ a: ControlAction, _ scale: Double, _ x: Double, _ y: Double) {
+            var c = TouchControl()
+            c.action = a
+            c.scale = scale
+            c.nx = x / W
+            c.ny = y / H
+            out.append(c)
+        }
+        func size(_ a: ControlAction, _ scale: Double) -> (w: Double, h: Double) {
+            let z = a.controlSize(diameter: CGFloat(base * scale))
+            return (Double(z.width), Double(z.height))
+        }
+        let stickScale = 1.45 * k, faceScale = 0.78 * k, dpadScale = 0.8 * k
+        let shoulderScale = 0.8 * k, systemScale = 1.25 * k, clickScale = 0.9 * k
+
+        // Sticks: bottom corners, clear of the home indicator.
+        let stick = size(.gamepad(.leftStick), stickScale).w
+        let stickY = H - B - 12 * k - stick / 2
+        let lStickX = L + 76 * k, rStickX = W - R - 76 * k
+        add(.gamepad(.leftStick), stickScale, lStickX, stickY)
+        add(.gamepad(.rightStick), stickScale, rStickX, stickY)
+
+        // Shoulders: triggers on top, bumpers under them, in the top corners —
+        // the right column kept left of the in-game menu button, the left one
+        // mirrored so the two sides match.
+        let sh = size(.gamepad(.lt), shoulderScale)
+        let menu = menuButtonRect(s)
+        let rShoulderX = min(W - R - 108 * k, Double(menu.minX) - 10 - sh.w / 2)
+        let lShoulderX = max(W - rShoulderX, L + 8 + sh.w / 2)
+        let triggerY = T + 6 * k + sh.h / 2
+        let bumperY = triggerY + sh.h + 8 * k
+        add(.gamepad(.lt), shoulderScale, lShoulderX, triggerY)
+        add(.gamepad(.rt), shoulderScale, rShoulderX, triggerY)
+        add(.gamepad(.lb), shoulderScale, lShoulderX, bumperY)
+        add(.gamepad(.rb), shoulderScale, rShoulderX, bumperY)
+        let bumperBottom = bumperY + sh.h / 2
+        let stickTop = stickY - stick / 2
+
+        // D-pad: just above the left stick (not mid-screen on a tall tablet).
+        let dp = size(.gamepadDPad, dpadScale).w
+        add(.gamepadDPad, dpadScale, lStickX,
+            max(stickTop - 18 * k - dp / 2, bumperBottom + 8 * k + dp / 2))
+
+        // A/B/X/Y: a diamond just above the right stick. Diagonal neighbours
+        // sit o·√2 apart, which clears one face button's diameter.
+        let face = size(.gamepad(.a), faceScale).w
+        let o = face / 2 + 17 * k
+        let span = 2 * o + face
+        let cx = rStickX - 8 * k
+        let cy = max(stickTop - 18 * k - span / 2, bumperBottom + 8 * k + span / 2)
+        add(.gamepad(.y), faceScale, cx, cy - o)
+        add(.gamepad(.x), faceScale, cx - o, cy)
+        add(.gamepad(.b), faceScale, cx + o, cy)
+        add(.gamepad(.a), faceScale, cx, cy + o)
+
+        // Back / Start: bottom centre, between the sticks.
+        let sys = size(.gamepad(.start), systemScale)
+        let sysY = H - B - 20 * k - sys.h / 2
+        add(.gamepad(.back), systemScale, W / 2 - 40 * k, sysY)
+        add(.gamepad(.start), systemScale, W / 2 + 40 * k, sysY)
+
+        // L3 / R3: small buttons on the inner side of each stick, level with
+        // its bottom edge.
+        let click = size(.gamepad(.l3), clickScale).w
+        let clickY = stickY + stick / 2 - click / 2
+        add(.gamepad(.l3), clickScale, lStickX + stick / 2 + 14 * k + click / 2, clickY)
+        add(.gamepad(.r3), clickScale, rStickX - stick / 2 - 14 * k - click / 2, clickY)
+        return out
+    }
+}
+
+/// ml1530: the preset list — built-ins (read-only, in code) then the user's
+/// own (persisted). Pure value type; `ControlPresetsModel` owns the file.
+struct ControlPresetStore: Equatable {
+    static let builtIns: [ControlPreset] = [
+        ControlPreset(id: ControlPresetLayout.xboxID, name: ControlPresetLayout.xboxName,
+                      controls: ControlPresetLayout.xbox(for: .referencePhone), sizeScale: 1.0),
+    ]
+    static let maxNameLength = 40
+
+    private(set) var user: [ControlPreset] = []
+
+    init(user: [ControlPreset] = []) { self.user = user.filter { !Self.isBuiltIn($0.id) } }
+
+    var all: [ControlPreset] { Self.builtIns + user }
+
+    static func isBuiltIn(_ id: String) -> Bool { builtIns.contains { $0.id == id } }
+
+    func preset(_ id: String) -> ControlPreset? { all.first { $0.id == id } }
+
+    static func clean(_ name: String) -> String {
+        String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(maxNameLength))
+    }
+
+    /// Case-insensitive, whitespace-trimmed: "xbox controller " IS the built-in.
+    func named(_ name: String) -> ControlPreset? {
+        let n = Self.clean(name).lowercased()
+        guard !n.isEmpty else { return nil }
+        return all.first { $0.name.lowercased() == n }
+    }
+
+    /// A free name for a copy, e.g. "Xbox controller (custom)", "… (custom 2)".
+    func copyName(for name: String) -> String {
+        let root = Self.clean(name)
+        var candidate = Self.clean(root + " (custom)")
+        var i = 2
+        while named(candidate) != nil {
+            candidate = Self.clean(root + " (custom \(i))")
+            i += 1
+        }
+        return candidate
+    }
+
+    enum SaveResult: Equatable {
+        case created(String)      // new user preset, its id
+        case replaced(String)     // an existing user preset of that name, its id
+        case refusedBuiltIn       // the name is a built-in's: pick another
+        case refusedEmpty
+    }
+
+    /// Save a layout under a name. A built-in's name is refused (built-ins are
+    /// never overwritten); a user preset's name replaces that preset in place.
+    mutating func save(name: String, controls: [TouchControl], sizeScale: Double,
+                       newID: () -> String = { UUID().uuidString }) -> SaveResult {
+        let n = Self.clean(name)
+        guard !n.isEmpty else { return .refusedEmpty }
+        if let existing = named(n) {
+            if Self.isBuiltIn(existing.id) { return .refusedBuiltIn }
+            guard let i = user.firstIndex(where: { $0.id == existing.id }) else { return .refusedEmpty }
+            user[i].controls = controls
+            user[i].sizeScale = sizeScale
+            return .replaced(existing.id)
+        }
+        let id = newID()
+        user.append(ControlPreset(id: id, name: n, controls: controls, sizeScale: sizeScale))
+        return .created(id)
+    }
+
+    /// Overwrite a user preset's layout. false for a built-in or a missing id.
+    mutating func overwrite(id: String, controls: [TouchControl], sizeScale: Double) -> Bool {
+        guard let i = user.firstIndex(where: { $0.id == id }) else { return false }
+        user[i].controls = controls
+        user[i].sizeScale = sizeScale
+        return true
+    }
+
+    /// false for a built-in, an empty name, or a name another preset has.
+    mutating func rename(id: String, to name: String) -> Bool {
+        let n = Self.clean(name)
+        guard !n.isEmpty, let i = user.firstIndex(where: { $0.id == id }) else { return false }
+        if let other = named(n), other.id != id { return false }
+        user[i].name = n
+        return true
+    }
+
+    /// false for a built-in or a missing id.
+    mutating func delete(id: String) -> Bool {
+        guard let i = user.firstIndex(where: { $0.id == id }) else { return false }
+        user.remove(at: i)
+        return true
+    }
+
+    private struct File: Codable { var version: Int; var presets: [ControlPreset] }
+
+    /// Only the user's presets are written; built-ins live in code.
+    func encoded() throws -> Data {
+        let e = JSONEncoder()
+        e.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try e.encode(File(version: 1, presets: user))
+    }
+
+    static func decoded(_ data: Data) throws -> ControlPresetStore {
+        let f = try JSONDecoder().decode(File.self, from: data)
+        guard f.version == 1 else {
+            throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "preset file version \(f.version)"))
+        }
+        return ControlPresetStore(user: f.presets)
+    }
+
+    /// What loading a preset puts in the editor: its controls with FRESH ids
+    /// (a control's id is its touch region's id, and two loads of one preset
+    /// must not share them), positions inside the editor's drag clamp, and a
+    /// size scale inside the slider's range. A built-in is laid out again for
+    /// the screen it is loaded on.
+    static func layout(of p: ControlPreset, screen: ControlPresetScreen?)
+        -> (controls: [TouchControl], sizeScale: Double) {
+        var controls = p.controls
+        if p.id == ControlPresetLayout.xboxID, let screen {
+            let fitted = ControlPresetLayout.xbox(for: screen)
+            if !fitted.isEmpty { controls = fitted }
+        }
+        controls = controls.map { c in
+            var c = c
+            c.id = UUID()
+            c.nx = min(max(c.nx, 0.03), 0.97)
+            c.ny = min(max(c.ny, 0.03), 0.97)
+            c.scale = min(max(c.scale, 0.5), 3.0)
+            return c
+        }
+        return (controls, min(max(p.sizeScale ?? 1.0, 0.5), 2.0))
+    }
+}
+
 final class TouchControlsModel: ObservableObject {
     static let shared = TouchControlsModel()
     static let baseDiameter: CGFloat = 64
 
     @Published var controls: [TouchControl] = [] { didSet { save() } }
     @Published var visible = true               { didSet { save() } }
-    @Published var editing = false              // transient, never persisted
+    @Published var editing = false {            // transient, never persisted
+        didSet { if oldValue && !editing { editingEnded() } }
+    }
     @Published var selected: UUID?              // transient
+
+    /// ml1490: bumped when an edit session ends; the overlay keys the controls
+    /// on it, so every control is rebuilt and registers afresh.
+    @Published var epoch = 0
+
+    static let hudRectFix = LibraryFlags.enabled("MADEIRA_HUD_RECT_FIX")
+    private static let refreshAfterEdit = LibraryFlags.enabled("MADEIRA_CONTROLS_REFRESH")
+    private var editsLogged = 0
+
+    /// ml1490 — DEVICE REPORT: after editing, the game did not see the
+    /// on-screen controller until the controls were hidden and shown again.
+    /// That toggle rebuilds every control view (fresh region registrations)
+    /// and takes the on-screen pad to zero and back, which a game reads as
+    /// the controller being plugged in again. Ending an edit now does both,
+    /// and logs the input state it found so a log shows what was stale if
+    /// this is not enough. MADEIRA_CONTROLS_REFRESH=0 turns the refresh off.
+    private func editingEnded() {
+        let ov = ControlOverlayView.shared
+        if editsLogged < 16 {
+            editsLogged += 1
+            let library = LibraryModel.shared
+            fputs("[controls-edit] ml1490 editing ended: controls=\(controls.count) visible=\(visible) "
+                  + "pad-live=\(OnScreenPad.shared.isLive) overlay-window=\(ov.window != nil) "
+                  + "owns-input=\(LibraryController.shared.ownsInput) blocks-touch=\(library.blocksGameplayTouch) "
+                  + "refresh=\(Self.refreshAfterEdit)\n", stderr)
+        }
+        guard Self.refreshAfterEdit else { return }
+        epoch &+= 1
+        // After SwiftUI has rebuilt the controls, so the re-arm sees the new
+        // registrations.
+        DispatchQueue.main.async { OnScreenPad.shared.rearm() }
+    }
 
     /// ml670 — ONE SIZE KNOB FOR THE WHOLE LAYOUT, 0.5…2.0.
     ///
@@ -6680,6 +7059,128 @@ final class TouchControlsModel: ObservableObject {
     }
 }
 
+/// ml1530 — the presets file and the editor's actions on it. The list itself
+/// is `ControlPresetStore` (pure, host-tested); this owns persistence, the
+/// log lines, and applying a preset to `TouchControlsModel`.
+/// MADEIRA_CONTROL_PRESETS=0 hides the presets UI (nothing else reads this).
+final class ControlPresetsModel: ObservableObject {
+    static let shared = ControlPresetsModel()
+    static let enabled = LibraryFlags.enabled("MADEIRA_CONTROL_PRESETS")
+
+    @Published private(set) var store = ControlPresetStore()
+    /// The preset last loaded or saved in this run; "Save changes" targets it.
+    /// Transient: a relaunch starts with none.
+    @Published private(set) var activeID: String?
+    /// A file that exists and cannot be read is left untouched, as the library
+    /// does with its own file: saving is refused instead of overwriting it.
+    private(set) var readOnly = false
+    private var logged = 0
+
+    private static var url: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("madeira-control-presets.json")
+    }
+
+    private init() {
+        guard let d = try? Data(contentsOf: Self.url) else { return }
+        do {
+            store = try ControlPresetStore.decoded(d)
+        } catch {
+            readOnly = true
+            log("unreadable file kept, saving disabled: \(error.localizedDescription)")
+        }
+    }
+
+    var active: ControlPreset? { activeID.flatMap { store.preset($0) } }
+
+    private func log(_ line: String) {
+        guard logged < 64 else { return }
+        logged += 1
+        fputs("[control-presets] ml1530 \(line)\n", stderr)
+    }
+
+    private func log(_ verb: String, _ p: ControlPreset?, _ count: Int) {
+        log("\(verb) name=\(p?.name ?? "?") controls=\(count)")
+    }
+
+    @discardableResult private func persist() -> Bool {
+        guard !readOnly else { return false }
+        do {
+            try store.encoded().write(to: Self.url, options: .atomic)
+            return true
+        } catch {
+            log("write failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// Replace the editor's layout with this preset. The game's profile takes
+    /// it from `TouchControlsModel` through the existing profile save.
+    func load(_ id: String, screen: ControlPresetScreen) {
+        guard let p = store.preset(id) else { return }
+        let m = TouchControlsModel.shared
+        let l = ControlPresetStore.layout(of: p, screen: screen)
+        m.selected = nil
+        m.controls = l.controls
+        m.sizeScale = l.sizeScale
+        activeID = p.id
+        log("loaded", p, l.controls.count)
+    }
+
+    /// Save the editor's current layout under a name. See `ControlPresetStore.save`.
+    func save(name: String) -> ControlPresetStore.SaveResult {
+        guard !readOnly else { return .refusedEmpty }
+        let m = TouchControlsModel.shared
+        var s = store
+        let r = s.save(name: name, controls: m.controls, sizeScale: m.sizeScale)
+        switch r {
+        case .created(let id), .replaced(let id):
+            store = s
+            activeID = id
+            persist()
+            log("saved", store.preset(id), m.controls.count)
+        case .refusedBuiltIn, .refusedEmpty:
+            break
+        }
+        return r
+    }
+
+    /// "Save changes" to the active user preset. false for a built-in.
+    func saveActive() -> Bool {
+        guard !readOnly, let id = activeID else { return false }
+        let m = TouchControlsModel.shared
+        var s = store
+        guard s.overwrite(id: id, controls: m.controls, sizeScale: m.sizeScale) else { return false }
+        store = s
+        persist()
+        log("saved", store.preset(id), m.controls.count)
+        return true
+    }
+
+    func rename(_ id: String, to name: String) -> Bool {
+        guard !readOnly else { return false }
+        var s = store
+        let old = s.preset(id)?.name ?? "?"
+        guard s.rename(id: id, to: name) else { return false }
+        store = s
+        persist()
+        log("renamed name=\(old) -> \(store.preset(id)?.name ?? "?")")
+        return true
+    }
+
+    func delete(_ id: String) -> Bool {
+        guard !readOnly else { return false }
+        var s = store
+        let p = s.preset(id)
+        guard s.delete(id: id) else { return false }
+        store = s
+        if activeID == id { activeID = nil }
+        persist()
+        log("deleted", p, p?.controls.count ?? 0)
+        return true
+    }
+}
+
 /// ml — THE SIZE TO GIVE A WINDOW-LEVEL OVERLAY, root-caused from a device
 /// report: app launched STRAIGHT INTO landscape (wide normal view) had a dead
 /// toolbar joystick and a key row that scrolled instead of pressing — i.e. the
@@ -6748,7 +7249,8 @@ final class ControlsWindow: UIWindow {
         if FullscreenState.shared.active, LibraryModel.shared.current != nil {
             let library = LibraryModel.shared
             if library.menu || library.launching || library.menuButtonRect.contains(point) ||
-                (library.performance && library.performanceRect.contains(point)) {
+                (library.performance && library.performanceRect.contains(point)) ||
+                library.finishButtonRect.contains(point) {   // ml1570: setup's finish button
                 return super.hitTest(point, with: event)
             }
         }
@@ -6804,6 +7306,28 @@ final class ControlsWindow: UIWindow {
 
 enum TouchControlsHost {
     private static var window: ControlsWindow?
+
+    // ml1530: the presets editor asks for a NAME, and UIKit text input needs a
+    // key window (see LibraryKeyboard in Library.swift); this window is
+    // otherwise never made key. It is key only while that name field is up,
+    // then the window that was key before gets it back.
+    private static weak var keyBeforeTextEntry: UIWindow?
+
+    static func beginTextEntry() {
+        guard let w = window, !w.isKeyWindow else { return }
+        keyBeforeTextEntry = w.windowScene?.windows.first { $0.isKeyWindow }
+        w.makeKey()
+        fputs("[control-presets] ml1530 name field: overlay window made key (had=\(keyBeforeTextEntry != nil))\n", stderr)
+    }
+
+    static func endTextEntry() {
+        guard let w = window, w.isKeyWindow else { keyBeforeTextEntry = nil; return }
+        let back = keyBeforeTextEntry ?? w.windowScene?.windows.first {
+            !($0 is ControlsWindow) && !($0 is PassthroughWindow) && !$0.isHidden
+        }
+        keyBeforeTextEntry = nil
+        back?.makeKey()
+    }
 
     static func attach() {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
@@ -6890,6 +7414,7 @@ struct TouchControlsOverlay: View {
                             TouchControlButton(control: c, screen: geo.size)
                                 .opacity(library.current != nil && !m.editing ? library.opacity : 1)
                         }
+                        .id(m.epoch)   // ml1490: rebuilt when an edit session ends
                     }
                     if library.current != nil && !m.editing { LibraryHUD() }
                     else { topBar(in: geo) }
@@ -7019,16 +7544,33 @@ struct TouchControlsOverlay: View {
                     m.selected = c.id
                 }
                 .transition(.opacity.combined(with: .scale))
+                // ml1530: named layouts (load / save / manage), edit mode only.
+                // MADEIRA_CONTROL_PRESETS=0 hides it.
+                if ControlPresetsModel.enabled {
+                    ControlPresetsMenu(screen: presetScreen(in: geo))
+                        .transition(.opacity.combined(with: .scale))
+                }
             }
         }
         .padding(.top, 10)
         .animation(.easeInOut(duration: 0.22), value: m.editing)
+        // Window coords, same trick (and the same reason) as
+        // HardwareInput.hintRect above: ControlsWindow.hitTest has no access
+        // to SwiftUI layout, so the measured frame is published here for it
+        // to read.
+        // ml1490: attached BEFORE .position, as TouchControlButton's region
+        // probe is. After it, the probe measured the whole screen (.position
+        // expands to fill its parent), so the size bar found "no room below
+        // the cluster", was clamped to the top edge and sat on the edit
+        // buttons in landscape, and hitsInteractive claimed every point.
+        // MADEIRA_HUD_RECT_FIX=0 restores the old measurement.
+        .background(TouchControlsModel.hudRectFix ? GeometryReader { g -> Color in
+            let f = g.frame(in: .global)
+            DispatchQueue.main.async { m.hudClusterRect = f }
+            return Color.clear
+        } : nil)
         .position(x: center.x + hudDragState.width, y: center.y + hudDragState.height)
-        .background(GeometryReader { g -> Color in
-            // Window coords, same trick (and the same reason) as
-            // HardwareInput.hintRect above: ControlsWindow.hitTest has no
-            // access to SwiftUI layout, so the measured frame is published
-            // here for it to read.
+        .background(TouchControlsModel.hudRectFix ? nil : GeometryReader { g -> Color in
             let f = g.frame(in: .global)
             DispatchQueue.main.async { m.hudClusterRect = f }
             return Color.clear
@@ -7187,6 +7729,16 @@ struct TouchControlsOverlay: View {
         else { InputSettings.shared.hudPosLandscapeLeft = normalized }
     }
 
+    /// ml1530: the screen a built-in preset is laid out on — this overlay's
+    /// full size (it ignores the safe area, as the controls' normalised
+    /// positions do) and the insets it reports.
+    private func presetScreen(in geo: GeometryProxy) -> ControlPresetScreen {
+        let i = geo.safeAreaInsets
+        return ControlPresetScreen(width: Double(geo.size.width), height: Double(geo.size.height),
+                                   left: Double(i.leading), right: Double(i.trailing),
+                                   top: Double(i.top), bottom: Double(i.bottom))
+    }
+
     /// Pinch anywhere scales the SELECTED control. With nothing selected it does
     /// nothing rather than guessing which one you meant.
     private var scalePinch: some Gesture {
@@ -7217,6 +7769,195 @@ struct TouchControlsOverlay: View {
                 .background(GlassShape(circle: true))
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// ml1530 — the presets button in the editor's HUD cluster (edit mode only):
+/// Load ▸ (built-ins, then the user's), Save changes, Save as preset…,
+/// Manage ▸ (rename / delete the user's). Loading asks first, since it
+/// replaces the layout being edited.
+struct ControlPresetsMenu: View {
+    let screen: ControlPresetScreen
+    @ObservedObject private var presets = ControlPresetsModel.shared
+
+    private enum NamePrompt: Equatable { case saveAs, rename(String) }
+    @State private var prompt: NamePrompt?
+    @State private var promptNote = ""
+    @State private var promptRename = false        // kept past dismissal, so the title does not flip
+    @State private var nameText = ""
+    @State private var confirmLoad: ControlPreset?
+    @State private var confirmReplace: String?     // a user preset's name, from Save as
+    @State private var confirmDelete: ControlPreset?
+    @State private var notice: String?
+
+    var body: some View {
+        Menu {
+            Menu("Load") {
+                ForEach(ControlPresetStore.builtIns) { loadButton($0, icon: "gamecontroller") }
+                if !presets.store.user.isEmpty {
+                    Divider()
+                    ForEach(presets.store.user) { loadButton($0, icon: nil) }
+                }
+            }
+            if let a = presets.active {
+                Button(ControlPresetStore.isBuiltIn(a.id) ? "Save changes as new preset…"
+                                                          : "Save changes to “\(a.name)”",
+                       systemImage: "square.and.arrow.down") { saveActive(a) }
+            }
+            Button("Save as preset…", systemImage: "plus.square.on.square") {
+                askName(.saveAs, prefill: presets.active.map { presets.store.copyName(for: $0.name) } ?? "",
+                        note: "Saves the current layout and size.")
+            }
+            if !presets.store.user.isEmpty {
+                Menu("Manage") {
+                    ForEach(presets.store.user) { p in
+                        Menu(p.name) {
+                            Button("Rename…", systemImage: "pencil") {
+                                askName(.rename(p.id), prefill: p.name, note: "")
+                            }
+                            Button("Delete", systemImage: "trash", role: .destructive) { confirmDelete = p }
+                        }
+                    }
+                }
+            }
+        } label: {
+            // Same look as the cluster's glass buttons; stroke glyph only.
+            Image(systemName: "square.stack.3d.up")
+                .font(.system(size: 18, weight: .regular))
+                .foregroundStyle(.white)
+                .frame(width: 44, height: 44)
+                .background(GlassShape(circle: true))
+        }
+        .accessibilityLabel("Control presets")
+        .alert(promptRename ? "Rename preset" : "Save as preset", isPresented: shown($prompt)) {
+            TextField("Name", text: $nameText)
+                .textInputAutocapitalization(.sentences)
+            Button(promptRename ? "Rename" : "Save") { commitName() }
+            Button("Cancel", role: .cancel) { prompt = nil }
+        } message: {
+            Text(promptNote)
+        }
+        .alert("Replace your current controls with “\(confirmLoad?.name ?? "")”?",
+               isPresented: shown($confirmLoad)) {
+            Button("Replace", role: .destructive) {
+                if let p = confirmLoad { presets.load(p.id, screen: screen) }
+                confirmLoad = nil
+            }
+            Button("Cancel", role: .cancel) { confirmLoad = nil }
+        } message: {
+            Text("The layout on screen is replaced. Save it as a preset first to keep it.")
+        }
+        .alert("Replace preset “\(confirmReplace ?? "")”?", isPresented: shown($confirmReplace)) {
+            Button("Replace", role: .destructive) {
+                if let n = confirmReplace { finishSave(n) }
+                confirmReplace = nil
+            }
+            Button("Cancel", role: .cancel) { confirmReplace = nil }
+        } message: {
+            Text("It is overwritten with the current layout.")
+        }
+        .alert("Delete “\(confirmDelete?.name ?? "")”?", isPresented: shown($confirmDelete)) {
+            Button("Delete", role: .destructive) {
+                if let p = confirmDelete, !presets.delete(p.id) { later { notice = "That preset could not be deleted." } }
+                confirmDelete = nil
+            }
+            Button("Cancel", role: .cancel) { confirmDelete = nil }
+        }
+        .alert(notice ?? "", isPresented: shown($notice)) {
+            Button("OK", role: .cancel) { notice = nil }
+        }
+        // The overlay window is key only while a name field is up.
+        .onChange(of: prompt) { _, p in if p == nil { TouchControlsHost.endTextEntry() } }
+        .onDisappear { TouchControlsHost.endTextEntry() }
+    }
+
+    private func loadButton(_ p: ControlPreset, icon: String?) -> some View {
+        Button {
+            confirmLoad = p
+        } label: {
+            if presets.activeID == p.id { Label(p.name, systemImage: "checkmark") }
+            else if let icon { Label(p.name, systemImage: icon) }
+            else { Text(p.name) }
+        }
+    }
+
+    private func shown<T>(_ b: Binding<T?>) -> Binding<Bool> {
+        Binding(get: { b.wrappedValue != nil }, set: { if !$0 { b.wrappedValue = nil } })
+    }
+
+    /// A second alert raised from the first one's button waits for that one to
+    /// finish dismissing, or SwiftUI drops it.
+    private func later(_ f: @escaping () -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: f)
+    }
+
+    private func askName(_ p: NamePrompt, prefill: String, note: String) {
+        nameText = prefill
+        promptNote = note
+        promptRename = p != .saveAs
+        TouchControlsHost.beginTextEntry()
+        prompt = p
+    }
+
+    private func commitName() {
+        let current = prompt
+        let name = ControlPresetStore.clean(nameText)
+        prompt = nil
+        switch current {
+        case .saveAs:
+            if name.isEmpty {
+                later { askName(.saveAs, prefill: "", note: "Enter a name for the preset.") }
+            } else if let existing = presets.store.named(name) {
+                if ControlPresetStore.isBuiltIn(existing.id) {
+                    // Built-ins are never overwritten: ask again, with a free name.
+                    later {
+                        askName(.saveAs, prefill: presets.store.copyName(for: existing.name),
+                                note: "“\(existing.name)” is built in and can't be changed. Choose a new name.")
+                    }
+                } else {
+                    later { confirmReplace = existing.name }
+                }
+            } else {
+                finishSave(name)
+            }
+        case .rename(let id):
+            if !presets.rename(id, to: name) {
+                later { notice = name.isEmpty ? "A preset needs a name." : "“\(name)” is already used." }
+            }
+        case nil:
+            break
+        }
+    }
+
+    private func finishSave(_ name: String) {
+        switch presets.save(name: name) {
+        case .created, .replaced:
+            break
+        case .refusedBuiltIn:
+            later {
+                askName(.saveAs, prefill: presets.store.copyName(for: name),
+                        note: "Built-in presets can't be changed. Choose a new name.")
+            }
+        case .refusedEmpty:
+            later {
+                notice = presets.readOnly
+                    ? "The presets file could not be read, so saving is off to keep it intact."
+                    : "A preset needs a name."
+            }
+        }
+    }
+
+    private func saveActive(_ a: ControlPreset) {
+        if ControlPresetStore.isBuiltIn(a.id) {
+            askName(.saveAs, prefill: presets.store.copyName(for: a.name),
+                    note: "“\(a.name)” is built in and can't be changed. Save your layout under a new name.")
+        } else if !presets.saveActive() {
+            later {
+                notice = presets.readOnly
+                    ? "The presets file could not be read, so saving is off to keep it intact."
+                    : "That preset could not be saved."
+            }
+        }
     }
 }
 
@@ -7517,6 +8258,7 @@ struct MappingPanel: View {
     /// this object.
     @ObservedObject private var input = InputSettings.shared
     @State private var tab = 0                    // 0 keyboard, 1 controller
+    @State private var bindingOpen = false        // ml1500: physical-binding rows folded
 
 
     var body: some View {
@@ -7529,6 +8271,8 @@ struct MappingPanel: View {
             ScrollView {
                 (tab == 0 ? AnyView(keyboardTab) : AnyView(controllerTab))
                     .padding(10)
+                    // ml1490: lets the last row scroll clear of the panel's edge.
+                    .padding(.bottom, Self.bottomMargin ? 16 : 0)
             }
         }
         .frame(width: layout.size.width, height: layout.size.height)
@@ -7561,13 +8305,19 @@ struct MappingPanel: View {
         let box = control.action.controlSize(diameter: TouchControlsModel.diameter(control))
         let r  = max(box.width, box.height) / 2
         let gap: CGFloat = 14, edge: CGFloat = 8
+        // ml1490: the bottom edge is the home indicator's. A panel flush with
+        // it put its last chip rows (System: Start/Back are the last action
+        // row) where iOS keeps the touch for its own gesture, and on device
+        // those two chips could not be selected. MADEIRA_PANEL_BOTTOM_MARGIN=0
+        // restores the plain edge.
+        let bottom: CGFloat = Self.bottomMargin ? 30 : edge
 
         for size in [CGSize(width: 340, height: 236),
                      CGSize(width: 300, height: 196),
                      CGSize(width: 264, height: 164)] {
             let clampX = min(max(cx, size.width  / 2 + edge), screen.width  - size.width  / 2 - edge)
-            let clampY = min(max(cy, size.height / 2 + edge), screen.height - size.height / 2 - edge)
-            if cy + r + gap + size.height <= screen.height - edge {
+            let clampY = min(max(cy, size.height / 2 + edge), screen.height - size.height / 2 - bottom)
+            if cy + r + gap + size.height <= screen.height - bottom {
                 return Placement(center: CGPoint(x: clampX, y: cy + r + gap + size.height / 2), size: size)
             }
             if cy - r - gap - size.height >= edge {
@@ -7586,9 +8336,20 @@ struct MappingPanel: View {
         return Placement(
             center: CGPoint(x: cx < screen.width  / 2 ? screen.width  - size.width  / 2 - edge
                                                       : size.width  / 2 + edge,
-                            y: cy < screen.height / 2 ? screen.height - size.height / 2 - edge
+                            y: cy < screen.height / 2 ? screen.height - size.height / 2 - bottom
                                                       : size.height / 2 + edge),
             size: size)
+    }
+
+    private static let bottomMargin = LibraryFlags.enabled("MADEIRA_PANEL_BOTTOM_MARGIN")
+    private static var chipLogs = 0
+    /// ml1490: one line per chip tap (first 48), with what the control was and
+    /// became, so a chip that "does nothing" shows whether the tap arrived.
+    static func logChip(_ kind: String, _ control: TouchControl, _ to: String) {
+        guard chipLogs < 48 else { return }
+        chipLogs += 1
+        fputs("[controls-edit] ml1490 \(kind) chip control=\(control.regionID) action=\(control.action.label) "
+              + "binding=\(control.padBinding?.label ?? "none") -> \(to)\n", stderr)
     }
 
     private func tabButton(_ i: Int, _ icon: String) -> some View {
@@ -7678,7 +8439,7 @@ struct MappingPanel: View {
     // Both at once is legal and occasionally useful; neither implies the other.
     private var controllerTab: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Make this control a virtual controller button. A game that "
+            Text("What this control sends: a virtual controller button. A game that "
                  + "reads XInput sees it as controller 1, with or without a "
                  + "physical pad plugged in.")
                 .font(.system(size: 11))
@@ -7697,17 +8458,24 @@ struct MappingPanel: View {
 
             Rectangle().fill(.white.opacity(0.15)).frame(height: 1).padding(.vertical, 2)
 
-            Text("Also press this control with a physical controller button. "
-                 + "Games that read XInput get the controller either way.")
-                .font(.system(size: 11))
-                .foregroundStyle(.white.opacity(0.55))
-                .fixedSize(horizontal: false, vertical: true)
-            padSection("Face", [.a, .b, .x, .y])
-            padSection("Bumpers & triggers", [.lb, .rb, .lt, .rt])
-            padSection("D-pad", [.dpadUp, .dpadDown, .dpadLeft, .dpadRight])
-            padSection("Sticks & clicks", [.leftStick, .rightStick, .l3, .r3])
-            padSection("System", [.start, .back])
-            padSection("", [nil])            // the "None" chip, on its own row
+            // ml1490 device report: "I can select Start/Back but the button does not
+            // become Start/Back". The rows below repeat the same labels but only choose
+            // which PHYSICAL button also presses this control; the rows above choose
+            // what it sends. They are now folded away under a title that says so.
+            // MADEIRA_PANEL_BINDING_COLLAPSED=0 shows them inline as before.
+            if Self.bindingCollapsed {
+                DisclosureGroup(isExpanded: $bindingOpen) {
+                    VStack(alignment: .leading, spacing: 12) { bindingSections }.padding(.top, 8)
+                } label: {
+                    Text(control.padBinding.map { "Physical button that also presses it: \($0.label)" }
+                         ?? "Physical button that also presses it (optional)")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.8))
+                }
+                .tint(.white)
+            } else {
+                bindingSections
+            }
             Text("A stick binding wants a stick control: L-stick steers a WASD "
                  + "or arrows control, R-stick drives mouse-look. With nothing "
                  + "bound at all, A/B/X/Y and the bumpers fall to the first "
@@ -7743,6 +8511,23 @@ struct MappingPanel: View {
         }
     }
 
+    private static let bindingCollapsed = LibraryFlags.enabled("MADEIRA_PANEL_BINDING_COLLAPSED")
+
+    /// The physical-button binding rows (ml1500: folded under a disclosure).
+    @ViewBuilder private var bindingSections: some View {
+        Text("A physical controller button that also presses this control. This does not "
+             + "change what the control sends; that is chosen above.")
+            .font(.system(size: 11))
+            .foregroundStyle(.white.opacity(0.55))
+            .fixedSize(horizontal: false, vertical: true)
+        padSection("Face", [.a, .b, .x, .y])
+        padSection("Bumpers & triggers", [.lb, .rb, .lt, .rt])
+        padSection("D-pad", [.dpadUp, .dpadDown, .dpadLeft, .dpadRight])
+        padSection("Sticks & clicks", [.leftStick, .rightStick, .l3, .r3])
+        padSection("System", [.start, .back])
+        padSection("", [nil])            // the "None" chip, on its own row
+    }
+
     /// One row of pad-binding chips. `nil` is the unbind chip.
     private func padSection(_ title: String, _ items: [PadButton?]) -> some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -7763,6 +8548,7 @@ struct MappingPanel: View {
         let on = control.padBinding == button
         return Button {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            MappingPanel.logChip("binding", control, button?.label ?? "none")
             guard let i = m.index(of: control.id) else { return }
             // ONE control per button. Binding B to a control that already has
             // A silently leaves A unbound would be surprising; binding a button
@@ -7810,6 +8596,7 @@ struct MappingPanel: View {
         let on = control.action == action
         return Button {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            MappingPanel.logChip("action", control, action.label)
             if let i = m.index(of: control.id) { m.controls[i].action = action }
         } label: {
             Text(label)
