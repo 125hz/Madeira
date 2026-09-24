@@ -28,6 +28,7 @@ CC_FLAGS=(
     -I"$WINE_SRC/build-macos/include"
     -I"$BUILD_DIR" -I"$WINE_SRC/server"
     -I"$SHIMS_DIR"
+    -I"$BUILD_DIR/../madsync" -DHAVE_LINUX_NTSYNC_H=1
     -include "$BUILD_DIR/config_ios.h"
     -include stdarg.h
     -include "$BUILD_DIR/unicode_fix.h"
@@ -69,6 +70,11 @@ PATCHED_FILES=(
     # REPLACEMENTS inserts it into the prebuilt base archive. An entry in
     # only the first compiles, prints OK, and is silently discarded.
     "object:$WINE_SRC/server/object.c:object.o"
+    # ml805: event/handle carry the [evt-hist] instrumentation. Both MUST be
+    # listed here -- they are otherwise linked from a prebuilt object and the
+    # source edits would be dead code, the same trap as the unix/*.c forks.
+    "event:$WINE_SRC/server/event.c:event.o"
+    "handle:$WINE_SRC/server/handle.c:handle.o"
     # ml575: async.c carries the free_async_queue UAF fix.
     "async:$WINE_SRC/server/async.c:async.o"
     "process_ios:$WINE_SRC/server/process.c:process.o"
@@ -87,11 +93,9 @@ PATCHED_FILES=(
     # suspend is dead) lives in the submodule's thread.c
     # ml952 also puts the fastsync claim release in check_wait() here.
     "thread:$WINE_SRC/server/thread.c:thread.o"
-    # ml952 fastsync: event.c DEFINES the shared cell table that
-    # dlls/ntdll/unix/sync.c references, and inproc_sync.c's
-    # get_inproc_sync_fd handler is the handle -> cell learn request.
-    # Both must be rebuilt with WINE_IOS and the shims include path.
-    "event:$WINE_SRC/server/event.c:event.o"
+    # ml1058: in-process synchronisation. The archive's copy was compiled with no
+    # ntsync header, i.e. as the all-stubs variant; build the real one against the
+    # userspace driver in build/madsync.
     "inproc_sync:$WINE_SRC/server/inproc_sync.c:inproc_sync.o"
     # ml474 (#79): sock.c now builds from the submodule. Before this entry
     # the archive carried a hand-inserted Jul-10 sock.o (probed, source
@@ -168,6 +172,13 @@ REPLACEMENTS=(
     "sock.o:sock.o"
     "object.o:object.o"
     "async.o:async.o"
+    # ml805: BOTH lists matter. PATCHED_FILES only compiles; REPLACEMENTS is what
+    # actually swaps the object into the archive. Adding to one and not the other
+    # compiles cleanly, ships the OLD object, and fails at link with an undefined
+    # symbol -- which is exactly what happened first try.
+    "event.o:event.o"
+    "handle.o:handle.o"
+    "inproc_sync.o:inproc_sync.o"   # ml1058
 )
 
 for entry in "${REPLACEMENTS[@]}"; do
