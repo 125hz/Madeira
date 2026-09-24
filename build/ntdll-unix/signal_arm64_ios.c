@@ -13250,7 +13250,7 @@ static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *
         ok = ios_emulate_load( ctx, insn, real );
         if (ok) claimed = 'L';
         if (!ok) { ok = ios_emulate_store_rel( ctx, insn, real ); if (ok) claimed = 'R'; }
-        if (!ok) { ok = ios_emulate_store( ctx, insn, real );     if (ok) claimed = 'S'; }
+        if (!ok) { ok = ios_emulate_store( ctx, insn, real, addr ); if (ok) claimed = 'S'; }
 
         if (ok && cls && ((is_write && claimed == 'L') || (!is_write && claimed != 'L')))
         {

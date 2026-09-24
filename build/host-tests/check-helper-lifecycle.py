@@ -48,6 +48,7 @@ static unsigned closes;
 static void ios_fdt_note_close(int fd, const char *why, void *peb) { assert(fd >= 0); closes++; }
 static ULONG_PTR user_space_wow_limit, guest_base, observed_limit;
 static ULONG_PTR ios_wow_base(void) { return guest_base; }
+void ios_inproc_cache_release( void *peb ) { (void)peb; }   /* merge: upstream inproc cache (sync.c) */
 #define NtCurrentProcess() ((void *)-1)
 #define ViewShare 1
 static NTSTATUS NtMapViewOfSection(HANDLE section, HANDLE process, void **ptr,

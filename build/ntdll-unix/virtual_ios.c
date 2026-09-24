@@ -1629,6 +1629,7 @@ static void *ios_pool_warmer_thread( void *arg )
                                "NOT footprint)=%llu MB vs hostlow dirty(ours: malloc+statics)=%llu MB\n",
                             (total_dirty - pool_once) >> 20, low_clean >> 20,
                             band_dirty[B_HOST_LOW] >> 20);
+                }
                 for (ti = 0; ti < B_MAX; ti++)
                 {
                     int q;

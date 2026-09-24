@@ -67,6 +67,8 @@ const struct module ipv6_module = {&NPI_MS_IPV6_MODULEID, tables};
 static unsigned char arena[8192] __attribute__((aligned(16)));
 static void *ios_wow_host_ptr(ULONG guest) { return guest ? arena + guest : NULL; }
 static NTSTATUS ios_nsi_enumerate_all_ex(void *p) { return nsi_enumerate_all_ex(p); }
+static TEB test_teb;   /* ml1520 [nsi-rate] reader attribution reads the current TEB */
+TEB * WINAPI NtCurrentTeb(void) { return &test_teb; }
 """
 main = r"""
 int main(void)
