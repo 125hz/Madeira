@@ -4,7 +4,7 @@ import Foundation
 import UIKit
 import SwiftUI
 
-/// ml1920: physical-controller part of the fork's HardwareInput bridge.
+/// ml1930: physical and touch controller snapshots share the same serial publisher.
 /// Slot/profile/timer state belongs exclusively to `queue`. The app lifecycle
 /// and observer registration belong to the main actor. Guest readers use the
 /// C snapshot lock; no Swift objects cross into Wine.
@@ -16,11 +16,32 @@ final class GamepadInput: @unchecked Sendable {
         return value != "0"
     }()
 
+    @MainActor static let touchEnabled: Bool = {
+        let value = MadeiraConfig.get("env.MADEIRA_TOUCH_XINPUT")
+            ?? ProcessInfo.processInfo.environment["MADEIRA_TOUCH_XINPUT"]
+        return enabled && value != "0"
+    }()
+
+    @MainActor func configureTouch(controls: Set<UUID>) {
+        let allowed = Self.touchEnabled ? controls : []
+        queue.async { [self] in touchState.configure(allowed); sample() }
+    }
+
+    @MainActor func touch(owner: UUID, control: UUID, value: GamepadSample?) {
+        guard Self.touchEnabled else { return }
+        queue.async { [self] in
+            guard active || value == nil else { return }
+            touchState.update(owner: owner, control: control, value: value)
+            sample()
+        }
+    }
+
     private let queue = DispatchQueue(label: "madeira.gamepad", qos: .userInteractive)
     private var controllers = [GCController?](repeating: nil, count: 4)
     private var profiles = [GCExtendedGamepad?](repeating: nil, count: 4)
     private var timer: DispatchSourceTimer?
     private var active = false
+    private var touchState = TouchGamepadState()
     @MainActor private var observers: [NSObjectProtocol] = []
     @MainActor private var started = false
 
@@ -28,6 +49,7 @@ final class GamepadInput: @unchecked Sendable {
         guard !started else { return }
         started = true
         LogStore.shared.log("[xinput] ml1920 physical controllers enabled=\(Self.enabled ? 1 : 0)")
+        LogStore.shared.log("[touch-xinput] ml1930 enabled=\(Self.touchEnabled ? 1 : 0)")
         guard Self.enabled else { return }
         let center = NotificationCenter.default
         for name in [Notification.Name.GCControllerDidConnect, .GCControllerDidDisconnect] {
@@ -63,7 +85,6 @@ final class GamepadInput: @unchecked Sendable {
                 profiles[i]?.valueChangedHandler = nil
                 controllers[i] = nil
                 profiles[i] = nil
-                winios_gamepad_set_state(Int32(i), nil)
                 fputs("[xinput] ml1920 slot=\(i) disconnected\n", stderr)
             }
             for (controller, profile) in live {
@@ -86,6 +107,7 @@ final class GamepadInput: @unchecked Sendable {
     private func setActive(_ value: Bool) {
         queue.async { [self] in
             active = value
+            if !value { touchState.clear() }
             updateTimer()
             sample()
         }
@@ -115,12 +137,17 @@ final class GamepadInput: @unchecked Sendable {
 
     private func sample() {
         for i in profiles.indices {
-            guard let pad = profiles[i] else { continue }
+            let pad = profiles[i]
+            let touchConnected = i == 0 && touchState.connected
+            guard pad != nil || touchConnected else {
+                winios_gamepad_set_state(Int32(i), nil)
+                continue
+            }
             var state = winios_gamepad()
             state.connected = 1
             // Keep the connected identity, but release all controls while the
             // app is inactive. A delayed callback cannot republish a held key.
-            if active {
+            if active, let pad {
                 let buttons: [(GCControllerButtonInput?, UInt16)] = [
                     (pad.dpad.up, 0x0001), (pad.dpad.down, 0x0002),
                     (pad.dpad.left, 0x0004), (pad.dpad.right, 0x0008),
@@ -137,6 +164,15 @@ final class GamepadInput: @unchecked Sendable {
                 state.ly = Self.axis(pad.leftThumbstick.yAxis.value)
                 state.rx = Self.axis(pad.rightThumbstick.xAxis.value)
                 state.ry = Self.axis(pad.rightThumbstick.yAxis.value)
+            }
+            if active && touchConnected {
+                let physical = GamepadSample(buttons: state.buttons,
+                    lt: state.left_trigger, rt: state.right_trigger,
+                    lx: state.lx, ly: state.ly, rx: state.rx, ry: state.ry)
+                let merged = GamepadSample.merge(physical: physical, touch: touchState.sample)
+                state.buttons = merged.buttons
+                state.left_trigger = merged.lt; state.right_trigger = merged.rt
+                state.lx = merged.lx; state.ly = merged.ly; state.rx = merged.rx; state.ry = merged.ry
             }
             winios_gamepad_set_state(Int32(i), &state)
         }
