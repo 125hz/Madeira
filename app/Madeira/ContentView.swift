@@ -35,6 +35,7 @@ final class MetalHostView: UIView {
     var metalLayer: CAMetalLayer { return layer as! CAMetalLayer }
     override init(frame: CGRect) {
         super.init(frame: frame)
+        GamepadEventClaim.install(on: self)
         isUserInteractionEnabled = false   // touches fall through to SwiftUI
         backgroundColor = .black
         contentScaleFactor = UIScreen.main.scale
@@ -97,6 +98,7 @@ final class MetalBackedView: UIView {
 
     override init(frame: CGRect) {
         super.init(frame: frame)
+        GamepadEventClaim.install(on: self)
         // Multi-touch REQUIRED: with it off, a fast double-tap's second
         // touch (landing before the first lift is processed) is silently
         // swallowed — drag-arm never fired (2026-07-06). Two-finger
@@ -105,7 +107,10 @@ final class MetalBackedView: UIView {
         self.isUserInteractionEnabled = true
         self.backgroundColor = .clear
     }
-    required init?(coder: NSCoder) { super.init(coder: coder) }
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        GamepadEventClaim.install(on: self)
+    }
 
     // Visibility-stall postmortem (2026-07-03): the intermittent "presents
     // count but the screen stays black until a bg/fg or screenshot" state
