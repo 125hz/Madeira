@@ -21,6 +21,11 @@ Statically linked into the application binary:
   elects LGPL-3.0-or-later (LGPL-3.0.txt).
   Source tarballs and SHA-256 sums for GnuTLS, Nettle and GMP: the Madeira
   repository, build/gnutls-ios/src, built by build/gnutls-ios/build.sh.
+- FFmpeg 7.1.1 (libavformat, libavcodec, libavutil, libswresample):
+  LGPL-2.1-or-later (LGPL-2.1.txt), configured without any GPL, version3 or
+  non-free component. Unmodified upstream release from ffmpeg.org, SHA-256
+  733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1, built by
+  build/ffmpeg/build.sh in the Madeira repository.
 
 Dynamically loaded at runtime:
 - Apple Metal Shader Converter dynamic library: Apple proprietary, under the
