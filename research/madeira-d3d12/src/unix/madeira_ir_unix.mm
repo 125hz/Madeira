@@ -27,6 +27,7 @@
 #include <Foundation/Foundation.h>
 
 #include "madeira_ir_abi.h"
+#include "madeira_dxil_cache.h"   /* ml1990 */
 
 #define IR_PRIVATE_IMPLEMENTATION 0   /* the canary owns the one definition */
 #include <metal_irconverter/metal_irconverter.h>
@@ -75,6 +76,7 @@ struct IRFns {
     void *handle;
     int   ready;
     int   status;          /* madeira_ir_status when not ready */
+    uint64_t ident;        /* ml1990: the loaded converter's identity, for the DXIL cache key */
 #define IR_DECL(n) decltype(&::n) n;
     IR_FUNC_LIST(IR_DECL)
 #undef IR_DECL
@@ -128,6 +130,23 @@ bind:
     }
     IR_FUNC_LIST(IR_BIND)
 #undef IR_BIND
+
+    /* ml1990: a different converter is a different compiler, and every DXIL
+     * cache entry it did not produce must miss. The header version says which
+     * API we compiled against; the dylib's size tells two builds of it apart
+     * (its path is the bundle's, which moves on every install, so not that). */
+    {
+        Dl_info info;
+        struct stat st;
+        uint64_t h = 1469598103934665603ull;
+        uint32_t v[3] = { IR_VERSION_MAJOR, IR_VERSION_MINOR, IR_VERSION_PATCH };
+        for (size_t i = 0; i < sizeof v; i++) { h ^= ((const unsigned char *)v)[i]; h *= 1099511628211ull; }
+        if (dladdr((const void *)g_ir.IRCompilerCreate, &info) && info.dli_fname && stat(info.dli_fname, &st) == 0) {
+            uint64_t sz = (uint64_t)st.st_size;
+            for (size_t i = 0; i < sizeof sz; i++) { h ^= ((const unsigned char *)&sz)[i]; h *= 1099511628211ull; }
+        }
+        g_ir.ident = h;
+    }
 
     g_ir.ready = 1;
     g_ir.status = MADEIRA_IR_OK;
@@ -308,16 +327,21 @@ static void mad_sc_hash_add(uint64_t *h, const void *p, size_t n)
     for (size_t i = 0; i < n; i++) { *h ^= b[i]; *h *= 1099511628211ull; }
 }
 
-/* Returns 0 if the cache directory is unavailable. */
-static int mad_sc_path(uint64_t key, char *out, size_t cap)
+/* Returns 0 if the cache directory is unavailable. ml1990: the DXIL cache
+ * shares the directory under its own extension. */
+static int mad_sc_path_ext(uint64_t key, const char *ext, char *out, size_t cap)
 {
     const char *docs = getenv( "MADEIRA_DOCS_DIR" );
     if (!docs || !*docs) return 0;
     if (snprintf(out, cap, "%s/shadercache", docs) >= (int)cap) return 0;
     mkdir(out, 0755);   /* harmless if it exists */
-    if (snprintf(out, cap, "%s/shadercache/%016llx.mdsc", docs,
-                 (unsigned long long)key) >= (int)cap) return 0;
+    if (snprintf(out, cap, "%s/shadercache/%016llx.%s", docs,
+                 (unsigned long long)key, ext) >= (int)cap) return 0;
     return 1;
+}
+static int mad_sc_path(uint64_t key, char *out, size_t cap)
+{
+    return mad_sc_path_ext(key, "mdsc", out, cap);
 }
 
 static int mad_sc_load(uint64_t key, struct madeira_ir_convert_args *a,
@@ -1085,6 +1109,150 @@ done:
     return status;
 }
 
+/* ---------------------------------------------------------------------------
+ * ml1990: DXIL conversion reuse (see madeira_dxil_cache.h for the key).
+ *
+ * Two independent pieces, each with its own kill switch:
+ *   - a persistent, content-keyed entry per conversion in the same shadercache
+ *     directory as the DXBC cache (.mdxc), bounded by size with LRU eviction;
+ *     MADEIRA_D3D12_DXIL_CACHE=0 disables it, MADEIRA_D3D12_DXIL_CACHE_MB sets
+ *     the bound (default 512).
+ *   - a few in-memory slots holding a finished conversion whose caller's buffer
+ *     was too small, so the immediate retry with a bigger buffer does not run
+ *     the compiler a second time; MADEIRA_D3D12_ONEPASS=0 disables it (the PE
+ *     side reads the same switch and returns to size-then-fill).
+ * ------------------------------------------------------------------------- */
+static pthread_once_t g_dxc_once = PTHREAD_ONCE_INIT;
+static int g_dxc_disk_on, g_dxc_slot_on;
+static uint64_t g_dxc_cap, g_dxc_target, g_dxc_bytes;
+static uint32_t g_dxc_hits, g_dxc_misses, g_dxc_store_fail;
+static pthread_mutex_t g_dxc_prune_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int mad_env_is_zero(const char *name)
+{
+    const char *v = getenv(name);
+    return v && v[0] == '0' && !v[1];
+}
+
+static int mad_dxc_dir(char *out, size_t cap)
+{
+    const char *docs = getenv("MADEIRA_DOCS_DIR");
+    if (!docs || !*docs) return 0;
+    return snprintf(out, cap, "%s/shadercache", docs) < (int)cap;
+}
+
+static void mad_dxc_init_once(void)
+{
+    char dir[1200];
+    const char *mb = getenv("MADEIRA_D3D12_DXIL_CACHE_MB");
+    unsigned long long cap_mb = 512;
+    if (mb && *mb) { char *end = NULL; unsigned long long v = strtoull(mb, &end, 10); if (end && !*end && v) cap_mb = v; }
+    g_dxc_cap = cap_mb << 20;
+    g_dxc_target = g_dxc_cap / 4 * 3;
+    g_dxc_slot_on = !mad_env_is_zero("MADEIRA_D3D12_ONEPASS");
+    g_dxc_disk_on = !mad_env_is_zero("MADEIRA_D3D12_DXIL_CACHE");
+    if (!g_dxc_disk_on) {
+        dprintf(2, "[d3d12-dxil-cache] ml1990 disabled (MADEIRA_D3D12_DXIL_CACHE=0); retry slots %s\n",
+                g_dxc_slot_on ? "on" : "off");
+        return;
+    }
+    if (!mad_dxc_dir(dir, sizeof dir)) {
+        g_dxc_disk_on = 0;
+        dprintf(2, "[d3d12-dxil-cache] ml1990 no documents directory; persistent cache off\n");
+        return;
+    }
+    mkdir(dir, 0755);
+    {
+        unsigned nfiles = 0, removed = 0;
+        g_dxc_bytes = mad_dxc_prune(dir, MAD_DXC_EXT, g_dxc_cap, g_dxc_target, &nfiles, &removed);
+        dprintf(2, "[d3d12-dxil-cache] ml1990 enabled: %u entries, %llu KB, bound %llu MB, %u evicted; retry slots %s\n",
+                nfiles, (unsigned long long)(g_dxc_bytes >> 10), cap_mb,
+                removed, g_dxc_slot_on ? "on" : "off");
+    }
+}
+
+static void mad_dxc_count(int hit)
+{
+    uint32_t h = hit ? __atomic_add_fetch(&g_dxc_hits, 1, __ATOMIC_RELAXED) : __atomic_load_n(&g_dxc_hits, __ATOMIC_RELAXED);
+    uint32_t m = hit ? __atomic_load_n(&g_dxc_misses, __ATOMIC_RELAXED) : __atomic_add_fetch(&g_dxc_misses, 1, __ATOMIC_RELAXED);
+    uint32_t t = h + m;
+    if (t == 1 || t == 16 || t == 64 || !(t % 128))
+        dprintf(2, "[d3d12-dxil-cache] ml1990 hits=%u misses=%u\n", h, m);
+}
+
+static void mad_dxc_store(uint64_t key, const void *blob, size_t len)
+{
+    char path[1200], dir[1200];
+    uint64_t total;
+    if (!mad_sc_path_ext(key, MAD_DXC_EXT, path, sizeof path)) return;
+    if (!mad_dxc_file_store(path, blob, len)) {
+        if (__atomic_add_fetch(&g_dxc_store_fail, 1, __ATOMIC_RELAXED) <= 3)
+            dprintf(2, "[d3d12-dxil-cache] ml1990 could not write an entry (errno %d)\n", errno);
+        return;
+    }
+    total = __atomic_add_fetch(&g_dxc_bytes, (uint64_t)len, __ATOMIC_RELAXED);
+    if (total > g_dxc_cap && mad_dxc_dir(dir, sizeof dir) && pthread_mutex_trylock(&g_dxc_prune_lock) == 0) {
+        unsigned nfiles = 0, removed = 0;
+        uint64_t left = mad_dxc_prune(dir, MAD_DXC_EXT, g_dxc_cap, g_dxc_target, &nfiles, &removed);
+        __atomic_store_n(&g_dxc_bytes, left, __ATOMIC_RELAXED);
+        pthread_mutex_unlock(&g_dxc_prune_lock);
+        dprintf(2, "[d3d12-dxil-cache] ml1990 bound reached: %u evicted, %u entries, %llu KB left\n",
+                removed, nfiles, (unsigned long long)(left >> 10));
+    }
+}
+
+/* Pipelines are created from several threads at once, so a single slot would
+ * be stolen between one caller's too-small call and its retry. Eight is far
+ * more than the number of threads that are ever between those two calls. */
+#define MAD_DXC_SLOTS 8
+static struct { uint64_t key, check, seq; void *blob; size_t len; } g_dxc_slots[MAD_DXC_SLOTS];
+static uint64_t g_dxc_slot_seq;
+static pthread_mutex_t g_dxc_slot_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void *mad_dxc_slot_take(uint64_t key, uint64_t check, size_t *len)
+{
+    void *blob = NULL;
+    pthread_mutex_lock(&g_dxc_slot_lock);
+    for (int i = 0; i < MAD_DXC_SLOTS; i++) {
+        if (g_dxc_slots[i].blob && g_dxc_slots[i].key == key && g_dxc_slots[i].check == check) {
+            blob = g_dxc_slots[i].blob; *len = g_dxc_slots[i].len;
+            g_dxc_slots[i].blob = NULL;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_dxc_slot_lock);
+    return blob;
+}
+
+/* Takes ownership of `blob`. */
+static void mad_dxc_slot_put(uint64_t key, uint64_t check, void *blob, size_t len)
+{
+    void *old = NULL;
+    int pick = 0;
+    pthread_mutex_lock(&g_dxc_slot_lock);
+    for (int i = 0; i < MAD_DXC_SLOTS; i++) {
+        if (!g_dxc_slots[i].blob) { pick = i; break; }
+        if (g_dxc_slots[i].seq < g_dxc_slots[pick].seq) pick = i;
+    }
+    old = g_dxc_slots[pick].blob;
+    g_dxc_slots[pick].key = key; g_dxc_slots[pick].check = check;
+    g_dxc_slots[pick].blob = blob; g_dxc_slots[pick].len = len;
+    g_dxc_slots[pick].seq = ++g_dxc_slot_seq;
+    pthread_mutex_unlock(&g_dxc_slot_lock);
+    free(old);
+}
+
+/* ml1149: read once; madeira.cfg ags-rewrite = 0 turns the rewrite off. */
+static int mad_ags_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        char v[16];
+        enabled = !(madeira_cfg_get("ags-rewrite", v, sizeof v) && v[0] == '0');
+    }
+    return enabled;
+}
+
 extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
     pthread_once(&g_ir_once, ir_load_once);
     if (!a) return MADEIRA_IR_UNSUPPORTED;
@@ -1156,6 +1324,46 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
     size_t need = 0;
     const char *nm = NULL;
     IRVersionedRootSignatureDescriptor desc;
+    /* ml1990: the finished conversion, gathered before it is handed over. */
+    uint8_t *lib_bytes = NULL, *lib2_bytes = NULL;
+    struct madeira_ir_loc *all_locs = NULL;
+    struct madeira_ir_vs_input *all_vsin = NULL;
+    uint32_t n_locs = 0, n_vsin = 0, vs_count = 0, vs_out_size = 0;
+    uint32_t tg[3] = { 0, 0, 0 }, gs_max = 0, gs_payload = 0, gs_pt = 0;
+    size_t lib2_len = 0, dxc_len = 0;
+    char dxc_note[128] = "";
+    void *dxc_blob = NULL;
+    uint64_t dxc_key = 0, dxc_check = 0;
+    int dxc_disk = 0, dxc_slot = 0;
+
+    /* ml1990: a conversion already done -- by this caller's too-small first
+     * call, or by any earlier run -- is handed back without the compiler. */
+    pthread_once(&g_dxc_once, mad_dxc_init_once);
+    dxc_disk = g_dxc_disk_on;
+    dxc_slot = g_dxc_slot_on;
+    if (dxc_disk || dxc_slot) {
+        struct mad_dxc_env env;
+        void *hit = NULL;
+        size_t hit_len = 0;
+        env.converter_ident = g_ir.ident;
+        env.build_stamp = __DATE__ " " __TIME__;
+        env.ags_rewrite = (uint32_t)mad_ags_enabled();
+        env.compat_flags = (uint32_t)IRCompatibilityFlagForceTextureArray;
+        mad_dxc_key(a, &env, &dxc_key, &dxc_check);
+        if (dxc_slot) hit = mad_dxc_slot_take(dxc_key, dxc_check, &hit_len);
+        if (!hit && dxc_disk) {
+            char path[1200];
+            int found = mad_sc_path_ext(dxc_key, MAD_DXC_EXT, path, sizeof path) &&
+                        mad_dxc_file_load(path, dxc_key, dxc_check, &hit, &hit_len);
+            mad_dxc_count(found);
+        }
+        if (hit) {
+            int st = mad_dxc_deliver(hit, a);
+            if (st == MADEIRA_IR_BUFFER_TOO_SMALL && dxc_slot) mad_dxc_slot_put(dxc_key, dxc_check, hit, hit_len);
+            else free(hit);
+            return st;
+        }
+    }
 
     if (np) {
         irp = (IRRootParameter1 *)calloc((size_t)np, sizeof *irp);
@@ -1245,16 +1453,13 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
      * native SM6.6 64-bit atomics before the converter sees the module; it
      * refuses the magic space outright. madeira.cfg ags-rewrite = 0 turns it off. */
     {
-        static int enabled = -1;
         const uint8_t *src = (const uint8_t *)(uintptr_t)a->dxil;
         size_t src_len = (size_t)a->dxil_len, ags_len = 0;
         char note[192];
-        if (enabled < 0) {
-            char v[16];
-            enabled = !(madeira_cfg_get("ags-rewrite", v, sizeof v) && v[0] == '0');
-        }
-        int rc = enabled ? madeira_ags_rewrite(src, src_len, &ags_buf, &ags_len, note, sizeof note) : 0;
-        if (rc != 0 && a->out_buf) {   /* the sizing pass converts too; say it once */
+        int rc = mad_ags_enabled() ? madeira_ags_rewrite(src, src_len, &ags_buf, &ags_len, note, sizeof note) : 0;
+        /* ml1990: a legacy sizing pass (out_buf 0) now compiles once and its
+         * retry is served from the slot, so that pass is the one to report. */
+        if (rc != 0 && (a->out_buf || dxc_slot)) {
             char nm[MADEIRA_IR_ENTRY_MAX];
             mad_air_entry_name(src, src_len, nm, sizeof nm);
             dprintf(2, "[madeira-ir] ml1149 AGS %s: %s%s\n", nm + 4, note,
@@ -1343,8 +1548,14 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
     need = g_ir.IRMetalLibGetBytecodeSize(lib);
     a->ret_len = need;
     if (!need) { status = MADEIRA_IR_NO_METALLIB; goto done; }
-    if (!a->out_buf || a->out_cap < need) { status = MADEIRA_IR_BUFFER_TOO_SMALL; goto done; }
-    a->ret_len = g_ir.IRMetalLibGetBytecode(lib, (uint8_t *)(uintptr_t)a->out_buf);
+    /* ml1990: the library, reflection and stage-in function are gathered into
+     * one entry first and handed over from it, so a caller whose buffer was too
+     * small gets the SAME finished conversion on its retry instead of a second
+     * compile (the size-then-fill protocol used to compile every shader twice). */
+    lib_bytes = (uint8_t *)malloc(need);
+    if (!lib_bytes) { status = MADEIRA_IR_NO_MEMORY; goto done; }
+    need = g_ir.IRMetalLibGetBytecode(lib, lib_bytes);
+    if (!need) { status = MADEIRA_IR_NO_METALLIB; goto done; }
 
     /* The converter RENAMES entry points, so the name to give Metal comes from
      * reflection rather than from what D3D called it.
@@ -1356,33 +1567,30 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
     refl = g_ir.IRShaderReflectionCreate();
     if (refl && g_ir.IRObjectGetReflection(output, stage, refl)) {
         nm = g_ir.IRShaderReflectionGetEntryPointFunctionName(refl);
-        if (nm && nm[0] && a->out_entry)
-            snprintf((char *)(uintptr_t)a->out_entry, MADEIRA_IR_ENTRY_MAX, "%s", nm);
-        a->ret_vs_input_count = 0;
-        a->ret_loc_count = 0;
-        if (a->out_locs && g_ir.IRShaderReflectionGetResourceCount && g_ir.IRShaderReflectionGetResourceLocations) {
+        /* ml1990: every location, whether or not this caller asked for them;
+         * the entry serves later callers that do. */
+        if (g_ir.IRShaderReflectionGetResourceCount && g_ir.IRShaderReflectionGetResourceLocations) {
             size_t n = g_ir.IRShaderReflectionGetResourceCount(refl);
-            a->ret_loc_count = (uint32_t)n;
             if (n) {
                 IRResourceLocation *rl = (IRResourceLocation *)calloc(n, sizeof *rl);
-                if (rl) {
-                    struct madeira_ir_loc *out = (struct madeira_ir_loc *)(uintptr_t)a->out_locs;
-                    g_ir.IRShaderReflectionGetResourceLocations(refl, rl);
-                    for (size_t i = 0; i < n && i < a->loc_cap; i++) {
-                        out[i].type = (uint32_t)rl[i].resourceType; out[i].space = rl[i].space; out[i].slot = rl[i].slot;
-                        out[i].offset = rl[i].topLevelOffset; out[i].size = rl[i].sizeBytes;
-                    }
-                    free(rl);
+                all_locs = (struct madeira_ir_loc *)calloc(n, sizeof *all_locs);
+                if (!rl || !all_locs) { free(rl); status = MADEIRA_IR_NO_MEMORY; goto done; }
+                g_ir.IRShaderReflectionGetResourceLocations(refl, rl);
+                for (size_t i = 0; i < n; i++) {
+                    all_locs[i].type = (uint32_t)rl[i].resourceType; all_locs[i].space = rl[i].space; all_locs[i].slot = rl[i].slot;
+                    all_locs[i].offset = rl[i].topLevelOffset; all_locs[i].size = rl[i].sizeBytes;
                 }
+                n_locs = (uint32_t)n;
+                free(rl);
             }
         }
         if (stage == IRShaderStageCompute && g_ir.IRShaderReflectionCopyComputeInfo && g_ir.IRShaderReflectionReleaseComputeInfo) {
             IRVersionedCSInfo csi;
             memset(&csi, 0, sizeof csi);
             if (g_ir.IRShaderReflectionCopyComputeInfo(refl, IRReflectionVersion_1_0, &csi)) {
-                a->ret_tg_size[0] = csi.info_1_0.tg_size[0];
-                a->ret_tg_size[1] = csi.info_1_0.tg_size[1];
-                a->ret_tg_size[2] = csi.info_1_0.tg_size[2];
+                tg[0] = csi.info_1_0.tg_size[0];
+                tg[1] = csi.info_1_0.tg_size[1];
+                tg[2] = csi.info_1_0.tg_size[2];
                 g_ir.IRShaderReflectionReleaseComputeInfo(&csi);
             }
         }
@@ -1390,14 +1598,18 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
             IRVersionedVSInfo vsi;
             memset(&vsi, 0, sizeof vsi);
             if (g_ir.IRShaderReflectionCopyVertexInfo(refl, IRReflectionVersion_1_0, &vsi)) {
-                struct madeira_ir_vs_input *out = (struct madeira_ir_vs_input *)(uintptr_t)a->out_vs_inputs;
                 size_t n = vsi.info_1_0.num_vertex_inputs;
-                a->ret_vs_output_size = vsi.info_1_0.vertex_output_size_in_bytes;   /* ml927 */
-                a->ret_vs_input_count = (uint32_t)n;
-                for (size_t i = 0; out && i < n && i < a->vs_input_cap; i++) {
-                    const IRVertexInputInfo_1_0 *vi = &vsi.info_1_0.vertex_inputs[i];
-                    snprintf(out[i].name, sizeof out[i].name, "%s", vi->name ? vi->name : "");
-                    out[i].attribute = vi->attributeIndex;
+                vs_out_size = vsi.info_1_0.vertex_output_size_in_bytes;   /* ml927 */
+                vs_count = (uint32_t)n;
+                if (n) {
+                    all_vsin = (struct madeira_ir_vs_input *)calloc(n, sizeof *all_vsin);
+                    if (!all_vsin) { g_ir.IRShaderReflectionReleaseVertexInfo(&vsi); status = MADEIRA_IR_NO_MEMORY; goto done; }
+                    for (size_t i = 0; i < n; i++) {
+                        const IRVertexInputInfo_1_0 *vi = &vsi.info_1_0.vertex_inputs[i];
+                        snprintf(all_vsin[i].name, sizeof all_vsin[i].name, "%s", vi->name ? vi->name : "");
+                        all_vsin[i].attribute = vi->attributeIndex;
+                    }
+                    n_vsin = (uint32_t)n;
                 }
                 g_ir.IRShaderReflectionReleaseVertexInfo(&vsi);
             }
@@ -1423,10 +1635,12 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
                 }
                 if (lib2 && g_ir.IRMetalLibSynthesizeStageInFunction(compiler, refl, &il, lib2)) {
                     size_t n2 = g_ir.IRMetalLibGetBytecodeSize(lib2);
-                    a->ret_len2 = n2;
-                    if (a->out_buf2 && a->out_cap2 >= n2) g_ir.IRMetalLibGetBytecode(lib2, (uint8_t *)(uintptr_t)a->out_buf2);
-                    else snprintf(a->ret_note, sizeof a->ret_note, "stage-in metallib needs %zu bytes", n2);
-                } else snprintf(a->ret_note, sizeof a->ret_note, "stage-in function synthesis failed (%u elements)", il.desc_1_0.numElements);
+                    if (n2) {
+                        lib2_bytes = (uint8_t *)malloc(n2);
+                        if (!lib2_bytes) { g_ir.IRMetalLibBinaryDestroy(lib2); status = MADEIRA_IR_NO_MEMORY; goto done; }
+                        lib2_len = g_ir.IRMetalLibGetBytecode(lib2, lib2_bytes);
+                    }
+                } else snprintf(dxc_note, sizeof dxc_note, "stage-in function synthesis failed (%u elements)", il.desc_1_0.numElements);
                 if (lib2) g_ir.IRMetalLibBinaryDestroy(lib2);
             }
         }
@@ -1434,19 +1648,40 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
             IRVersionedGSInfo gsi;
             memset(&gsi, 0, sizeof gsi);
             if (g_ir.IRShaderReflectionCopyGeometryInfo(refl, IRReflectionVersion_1_0, &gsi)) {
-                a->ret_gs_max_prims = gsi.info_1_0.max_input_primitives_per_mesh_threadgroup;
-                a->ret_gs_payload = gsi.info_1_0.max_payload_size_in_bytes;
-                a->ret_gs_passthrough = gsi.info_1_0.is_passthrough ? 1u : 0u;
+                gs_max = gsi.info_1_0.max_input_primitives_per_mesh_threadgroup;
+                gs_payload = gsi.info_1_0.max_payload_size_in_bytes;
+                gs_pt = gsi.info_1_0.is_passthrough ? 1u : 0u;
                 g_ir.IRShaderReflectionReleaseGeometryInfo(&gsi);
             }
         }
     }
-    if (!a->out_entry || !*(const char *)(uintptr_t)a->out_entry) {
+    if (!nm || !nm[0]) {
         status = MADEIRA_IR_EMPTY_ENTRY;
         goto done;
     }
 
-    status = MADEIRA_IR_OK;
+    {
+        struct mad_dxc_parts parts;
+        memset(&parts, 0, sizeof parts);
+        parts.stage = (uint32_t)stage;
+        parts.entry = nm; parts.note = dxc_note;
+        parts.locs = all_locs; parts.nlocs = n_locs;
+        parts.vsin = all_vsin; parts.nvsin = n_vsin; parts.vs_input_count = vs_count;
+        parts.tg[0] = tg[0]; parts.tg[1] = tg[1]; parts.tg[2] = tg[2];
+        parts.vs_output_size = vs_out_size;
+        parts.gs_max_prims = gs_max; parts.gs_payload = gs_payload; parts.gs_passthrough = gs_pt;
+        parts.lib = lib_bytes; parts.lib_len = need;
+        parts.lib2 = lib2_bytes; parts.lib2_len = lib2_len;
+        dxc_blob = mad_dxc_blob_build(dxc_key, dxc_check, &parts, &dxc_len);
+    }
+    if (!dxc_blob) { status = MADEIRA_IR_NO_MEMORY; goto done; }
+    if (dxc_disk) mad_dxc_store(dxc_key, dxc_blob, dxc_len);
+    status = mad_dxc_deliver(dxc_blob, a);
+    if (status == MADEIRA_IR_BUFFER_TOO_SMALL && dxc_slot) {
+        mad_dxc_slot_put(dxc_key, dxc_check, dxc_blob, dxc_len);   /* the retry takes it */
+        dxc_blob = NULL;
+    }
+
 done:
     if (refl) g_ir.IRShaderReflectionDestroy(refl);
     if (lib) g_ir.IRMetalLibBinaryDestroy(lib);
@@ -1459,6 +1694,11 @@ done:
     free(irr);
     free(irp);
     free(ags_buf);
+    free(dxc_blob);
+    free(lib_bytes);
+    free(lib2_bytes);
+    free(all_locs);
+    free(all_vsin);
     a->ret_status = (uint32_t)status;
     return status;
 }
