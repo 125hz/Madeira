@@ -7194,6 +7194,7 @@ static ULONG STDMETHODCALLTYPE pso_Release(ID3D12PipelineState *T) {
  *                 u32 flags, u32 table offset                          (1.1)
  *
  * Every offset is relative to the start of the chunk payload. */
+/* rsdeser-test:begin (tests/windows/rsdeser_test.c compiles the marked regions on their own) */
 static UINT32 rs_rd(const unsigned char *b, SIZE_T n, SIZE_T off, int *bad) {
     if (off + 4 > n) { *bad = 1; return 0; }
     return (UINT32)b[off] | ((UINT32)b[off+1] << 8) |
@@ -7232,6 +7233,7 @@ static const unsigned char *rs_find_chunk(const unsigned char *b, SIZE_T n,
     *why = "no RTS0 chunk";
     return NULL;
 }
+/* rsdeser-test:end */
 
 static HRESULT STDMETHODCALLTYPE device_CreateRootSignature(ID3D12Device *This, UINT node,
         const void *blob, SIZE_T blob_len, REFIID riid, void **out) {
@@ -7435,6 +7437,7 @@ truncated:
     return E_INVALIDARG;
 }
 
+/* rsdeser-test:begin */
 /* Emits the same container the parser above reads, so a test can build a real
  * root signature instead of the runtime accepting a private shortcut. The DXBC
  * digest is left zero: nothing in this path verifies it, and writing a
@@ -7520,6 +7523,376 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12SerializeRootSignature(
     *io_len = total;
     return S_OK;
 }
+
+/* ---- ml1980: root signature deserializers ---------------------------------
+ * D3D12CreateRootSignatureDeserializer and its versioned sibling turn a
+ * serialized root signature back into a description. An engine may run every
+ * blob through one before CreateRootSignature, so the old E_NOTIMPL meant no
+ * pipeline was ever created. The reader follows device_CreateRootSignature's
+ * rules -- the same chunk lookup, version check, range stride and bounds --
+ * but fills the public D3D12 structures instead of the converter's.
+ *
+ * Both description versions are built once, at creation, each in one heap
+ * block the object owns. Every pointer handed out therefore stays valid until
+ * the last Release, and no method allocates or races another thread.
+ *
+ * Converting 1.0 up to 1.1 uses the flags D3D12 defines as 1.0's behaviour:
+ * ranges DESCRIPTORS_VOLATILE (plus DATA_VOLATILE unless they hold samplers),
+ * root descriptors DATA_VOLATILE. Converting 1.1 down to 1.0 drops the flags.
+ * MADEIRA_D3D12_RS_DESERIALIZER=0 restores the old E_NOTIMPL. */
+struct mad_rsd {
+    union {
+        const ID3D12RootSignatureDeserializerVtbl *plain;
+        const ID3D12VersionedRootSignatureDeserializerVtbl *versioned;
+    } vtbl;
+    LONG refs;
+    int versioned;                        /* which of the two interfaces this is */
+    D3D_ROOT_SIGNATURE_VERSION native;    /* the version the blob declared */
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC *v10, *v11;
+    UINT32 nranges;
+};
+
+static LONG g_rsd_refusals;
+#define RSD_REFUSE(...) do { \
+        if (InterlockedIncrement(&g_rsd_refusals) <= 8) d3d12_log(__VA_ARGS__); } while (0)
+#define RSD_ALIGN8(x) (((SIZE_T)(x) + 7) & ~(SIZE_T)7)
+
+/* One block per version: the header, then the parameters, ranges and static
+ * samplers. Empty arrays get NULL pointers, as the D3D12 runtime hands out. */
+static D3D12_VERSIONED_ROOT_SIGNATURE_DESC *rsd_alloc(int v11, UINT32 np, UINT32 nr, UINT32 ns,
+        void **params, void **ranges, D3D12_STATIC_SAMPLER_DESC **samplers) {
+    SIZE_T psz = v11 ? sizeof(D3D12_ROOT_PARAMETER1) : sizeof(D3D12_ROOT_PARAMETER);
+    SIZE_T rsz = v11 ? sizeof(D3D12_DESCRIPTOR_RANGE1) : sizeof(D3D12_DESCRIPTOR_RANGE);
+    SIZE_T at_p = RSD_ALIGN8(sizeof(D3D12_VERSIONED_ROOT_SIGNATURE_DESC));
+    SIZE_T at_r = RSD_ALIGN8(at_p + psz * np);
+    SIZE_T at_s = RSD_ALIGN8(at_r + rsz * nr);
+    char *b = calloc(1, at_s + sizeof(D3D12_STATIC_SAMPLER_DESC) * ns);
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC *v = (D3D12_VERSIONED_ROOT_SIGNATURE_DESC *)b;
+    if (!b) return NULL;
+    *params = np ? (void *)(b + at_p) : NULL;
+    *ranges = nr ? (void *)(b + at_r) : NULL;
+    *samplers = ns ? (D3D12_STATIC_SAMPLER_DESC *)(b + at_s) : NULL;
+    if (v11) {
+        v->Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+        v->Desc_1_1.NumParameters = np;
+        v->Desc_1_1.pParameters = *params;
+        v->Desc_1_1.NumStaticSamplers = ns;
+        v->Desc_1_1.pStaticSamplers = *samplers;
+    } else {
+        v->Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
+        v->Desc_1_0.NumParameters = np;
+        v->Desc_1_0.pParameters = *params;
+        v->Desc_1_0.NumStaticSamplers = ns;
+        v->Desc_1_0.pStaticSamplers = *samplers;
+    }
+    return v;
+}
+
+/* Parses the blob into o->v11 (1.0 blobs get 1.0's flags), then derives
+ * o->v10 from it. On failure the caller frees whatever was allocated. */
+static HRESULT rsd_parse(const void *blob, SIZE_T blob_len, struct mad_rsd *o) {
+    SIZE_T n = 0;
+    const char *why = "?";
+    const unsigned char *p = rs_find_chunk((const unsigned char *)blob, blob_len, &n, &why);
+    UINT32 version, nparam, poff, nsampler, soff, flags, total_ranges = 0, used = 0, i, j;
+    D3D12_ROOT_PARAMETER1 *p11; D3D12_DESCRIPTOR_RANGE1 *r11; D3D12_STATIC_SAMPLER_DESC *s11;
+    D3D12_ROOT_PARAMETER *p10;  D3D12_DESCRIPTOR_RANGE *r10;  D3D12_STATIC_SAMPLER_DESC *s10;
+    void *vp, *vr;
+    int bad = 0;
+
+    if (!p) { RSD_REFUSE("[d3d12-rsdeser] %s -- refusing\n", why); return E_INVALIDARG; }
+    version  = rs_rd(p, n, 0,  &bad);
+    nparam   = rs_rd(p, n, 4,  &bad);
+    poff     = rs_rd(p, n, 8,  &bad);
+    nsampler = rs_rd(p, n, 12, &bad);
+    soff     = rs_rd(p, n, 16, &bad);
+    flags    = rs_rd(p, n, 20, &bad);
+    if (bad) { RSD_REFUSE("[d3d12-rsdeser] truncated RTS0 header\n"); return E_INVALIDARG; }
+    if (version == 3) {   /* 1.2 adds a flags word per static sampler; not read here */
+        RSD_REFUSE("[d3d12-rsdeser] root signature version 1.2 is not supported\n");
+        return E_NOTIMPL;
+    }
+    if (version != 1 && version != 2) {
+        RSD_REFUSE("[d3d12-rsdeser] unknown root signature version %u\n", version);
+        return E_INVALIDARG;
+    }
+    if (nsampler > 32) {
+        RSD_REFUSE("[d3d12-rsdeser] %u static samplers exceeds the 32 this build handles\n", nsampler);
+        return E_NOTIMPL;
+    }
+    if (nparam > MAD_ROOT_PARAM_MAX) {
+        RSD_REFUSE("[d3d12-rsdeser] %u parameters exceeds the %u this build handles\n",
+                   nparam, (unsigned)MAD_ROOT_PARAM_MAX);
+        return E_NOTIMPL;
+    }
+    /* Pre-pass: validate the parameter headers and count the ranges, so the
+     * blocks are sized to this blob and a corrupt count cannot become a huge
+     * allocation. */
+    for (i = 0; i < nparam; i++) {
+        UINT32 type = rs_rd(p, n, (SIZE_T)poff + 12 * i,     &bad);
+        UINT32 off  = rs_rd(p, n, (SIZE_T)poff + 12 * i + 8, &bad);
+        UINT32 nr;
+        if (bad) { RSD_REFUSE("[d3d12-rsdeser] RTS0 chunk is truncated\n"); return E_INVALIDARG; }
+        if (type > D3D12_ROOT_PARAMETER_TYPE_UAV) {
+            RSD_REFUSE("[d3d12-rsdeser] unknown root parameter type %u\n", type);
+            return E_INVALIDARG;
+        }
+        if (type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) continue;
+        nr = rs_rd(p, n, off, &bad);
+        if (bad) { RSD_REFUSE("[d3d12-rsdeser] RTS0 chunk is truncated\n"); return E_INVALIDARG; }
+        if (nr > MAD_ROOT_RANGE_SANE || total_ranges + nr > MAD_ROOT_RANGE_SANE) {
+            RSD_REFUSE("[d3d12-rsdeser] implausible descriptor range count "
+                       "(parameter %u asks for %u, running total %u, sane bound %u)\n",
+                       i, nr, total_ranges, (unsigned)MAD_ROOT_RANGE_SANE);
+            return E_NOTIMPL;
+        }
+        total_ranges += nr;
+    }
+
+    o->v11 = rsd_alloc(1, nparam, total_ranges, nsampler, &vp, &vr, &s11);
+    if (!o->v11) return E_OUTOFMEMORY;
+    p11 = vp; r11 = vr;
+    o->v11->Desc_1_1.Flags = (D3D12_ROOT_SIGNATURE_FLAGS)flags;
+    for (i = 0; i < nparam; i++) {
+        UINT32 type = rs_rd(p, n, (SIZE_T)poff + 12 * i,     &bad);
+        UINT32 vis  = rs_rd(p, n, (SIZE_T)poff + 12 * i + 4, &bad);
+        UINT32 off  = rs_rd(p, n, (SIZE_T)poff + 12 * i + 8, &bad);
+        D3D12_ROOT_PARAMETER1 *q = &p11[i];
+        if (bad) goto truncated;
+        if (vis > D3D12_SHADER_VISIBILITY_MESH) {
+            RSD_REFUSE("[d3d12-rsdeser] unknown shader visibility %u\n", vis);
+            return E_INVALIDARG;
+        }
+        q->ParameterType = (D3D12_ROOT_PARAMETER_TYPE)type;
+        q->ShaderVisibility = (D3D12_SHADER_VISIBILITY)vis;
+        switch (type) {
+        case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
+            q->Constants.ShaderRegister = rs_rd(p, n, off,     &bad);
+            q->Constants.RegisterSpace  = rs_rd(p, n, off + (SIZE_T)4, &bad);
+            q->Constants.Num32BitValues = rs_rd(p, n, off + (SIZE_T)8, &bad);
+            break;
+        case D3D12_ROOT_PARAMETER_TYPE_CBV:
+        case D3D12_ROOT_PARAMETER_TYPE_SRV:
+        case D3D12_ROOT_PARAMETER_TYPE_UAV:
+            /* 1.0 root descriptors are two words; 1.1 adds the flags word. */
+            q->Descriptor.ShaderRegister = rs_rd(p, n, off,     &bad);
+            q->Descriptor.RegisterSpace  = rs_rd(p, n, off + (SIZE_T)4, &bad);
+            q->Descriptor.Flags = version == 2
+                ? (D3D12_ROOT_DESCRIPTOR_FLAGS)rs_rd(p, n, off + (SIZE_T)8, &bad)
+                : D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
+            break;
+        default: {   /* descriptor table; the pre-pass refused anything else */
+            UINT32 nr   = rs_rd(p, n, off,     &bad);
+            UINT32 roff = rs_rd(p, n, off + (SIZE_T)4, &bad);
+            UINT32 stride = (version == 2) ? 24 : 20;   /* same rule as CreateRootSignature */
+            if (bad) goto truncated;
+            if (used + nr > total_ranges) {   /* our bug if it trips: the pre-pass read the same words */
+                RSD_REFUSE("[d3d12-rsdeser] range count disagrees with the pre-pass (%u + %u > %u)\n",
+                           used, nr, total_ranges);
+                return E_INVALIDARG;
+            }
+            q->DescriptorTable.NumDescriptorRanges = nr;
+            q->DescriptorTable.pDescriptorRanges = nr ? r11 + used : NULL;
+            for (j = 0; j < nr; j++) {
+                D3D12_DESCRIPTOR_RANGE1 *rg = &r11[used + j];
+                SIZE_T b0 = (SIZE_T)roff + (SIZE_T)stride * j;
+                UINT32 rt = rs_rd(p, n, b0, &bad);
+                if (bad) goto truncated;
+                if (rt > D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) {
+                    RSD_REFUSE("[d3d12-rsdeser] unknown descriptor range type %u\n", rt);
+                    return E_INVALIDARG;
+                }
+                rg->RangeType          = (D3D12_DESCRIPTOR_RANGE_TYPE)rt;
+                rg->NumDescriptors     = rs_rd(p, n, b0 + 4,  &bad);
+                rg->BaseShaderRegister = rs_rd(p, n, b0 + 8,  &bad);
+                rg->RegisterSpace      = rs_rd(p, n, b0 + 12, &bad);
+                if (stride == 24) {
+                    rg->Flags = (D3D12_DESCRIPTOR_RANGE_FLAGS)rs_rd(p, n, b0 + 16, &bad);
+                    rg->OffsetInDescriptorsFromTableStart = rs_rd(p, n, b0 + 20, &bad);
+                } else {
+                    rg->Flags = rt == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER
+                        ? D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                        : (D3D12_DESCRIPTOR_RANGE_FLAGS)(D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE |
+                                                         D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);
+                    rg->OffsetInDescriptorsFromTableStart = rs_rd(p, n, b0 + 16, &bad);
+                }
+            }
+            used += nr;
+            break;
+        }
+        }
+        if (bad) goto truncated;
+    }
+    /* Static samplers: thirteen words, the same in 1.0 and 1.1. */
+    for (i = 0; i < nsampler; i++) {
+        D3D12_STATIC_SAMPLER_DESC *ss = &s11[i];
+        SIZE_T at = (SIZE_T)soff + 52 * (SIZE_T)i;
+        UINT32 w[13], k;
+        for (k = 0; k < 13; k++) w[k] = rs_rd(p, n, at + 4 * k, &bad);
+        if (bad) goto truncated;
+        ss->Filter = (D3D12_FILTER)w[0];
+        ss->AddressU = (D3D12_TEXTURE_ADDRESS_MODE)w[1];
+        ss->AddressV = (D3D12_TEXTURE_ADDRESS_MODE)w[2];
+        ss->AddressW = (D3D12_TEXTURE_ADDRESS_MODE)w[3];
+        memcpy(&ss->MipLODBias, &w[4], 4);
+        ss->MaxAnisotropy = w[5];
+        ss->ComparisonFunc = (D3D12_COMPARISON_FUNC)w[6];
+        ss->BorderColor = (D3D12_STATIC_BORDER_COLOR)w[7];
+        memcpy(&ss->MinLOD, &w[8], 4);
+        memcpy(&ss->MaxLOD, &w[9], 4);
+        ss->ShaderRegister = w[10];
+        ss->RegisterSpace = w[11];
+        ss->ShaderVisibility = (D3D12_SHADER_VISIBILITY)w[12];
+    }
+
+    /* The 1.0 view: the same description without the flags. */
+    o->v10 = rsd_alloc(0, nparam, total_ranges, nsampler, &vp, &vr, &s10);
+    if (!o->v10) return E_OUTOFMEMORY;
+    p10 = vp; r10 = vr;
+    o->v10->Desc_1_0.Flags = (D3D12_ROOT_SIGNATURE_FLAGS)flags;
+    for (i = 0; i < nparam; i++) {
+        const D3D12_ROOT_PARAMETER1 *q = &p11[i];
+        D3D12_ROOT_PARAMETER *d = &p10[i];
+        d->ParameterType = q->ParameterType;
+        d->ShaderVisibility = q->ShaderVisibility;
+        switch (q->ParameterType) {
+        case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
+            d->Constants = q->Constants;
+            break;
+        case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE: {
+            UINT32 nr = q->DescriptorTable.NumDescriptorRanges;
+            SIZE_T at = nr ? (SIZE_T)(q->DescriptorTable.pDescriptorRanges - r11) : 0;
+            d->DescriptorTable.NumDescriptorRanges = nr;
+            d->DescriptorTable.pDescriptorRanges = nr ? r10 + at : NULL;
+            for (j = 0; j < nr; j++) {
+                const D3D12_DESCRIPTOR_RANGE1 *a = &r11[at + j];
+                D3D12_DESCRIPTOR_RANGE *b = &r10[at + j];
+                b->RangeType = a->RangeType;
+                b->NumDescriptors = a->NumDescriptors;
+                b->BaseShaderRegister = a->BaseShaderRegister;
+                b->RegisterSpace = a->RegisterSpace;
+                b->OffsetInDescriptorsFromTableStart = a->OffsetInDescriptorsFromTableStart;
+            }
+            break;
+        }
+        default:
+            d->Descriptor.ShaderRegister = q->Descriptor.ShaderRegister;
+            d->Descriptor.RegisterSpace = q->Descriptor.RegisterSpace;
+            break;
+        }
+    }
+    if (nsampler) memcpy(s10, s11, sizeof *s10 * nsampler);
+
+    o->native = version == 2 ? D3D_ROOT_SIGNATURE_VERSION_1_1 : D3D_ROOT_SIGNATURE_VERSION_1_0;
+    o->nranges = total_ranges;
+    return S_OK;
+
+truncated:
+    RSD_REFUSE("[d3d12-rsdeser] RTS0 chunk is truncated\n");
+    return E_INVALIDARG;
+}
+
+static ULONG rsd_addref(struct mad_rsd *o) { return (ULONG)InterlockedIncrement(&o->refs); }
+static ULONG rsd_release(struct mad_rsd *o) {
+    LONG n = InterlockedDecrement(&o->refs);
+    if (n == 0) { free(o->v10); free(o->v11); free(o); }
+    return (ULONG)n;
+}
+static HRESULT rsd_qi(struct mad_rsd *o, REFIID riid, void **out) {
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!riid) return E_INVALIDARG;
+    if (IsEqualGUID(riid, &IID_IUnknown) ||
+        IsEqualGUID(riid, o->versioned ? &IID_ID3D12VersionedRootSignatureDeserializer
+                                       : &IID_ID3D12RootSignatureDeserializer)) {
+        rsd_addref(o); *out = o; return S_OK;
+    }
+    return E_NOINTERFACE;
+}
+
+static HRESULT STDMETHODCALLTYPE rsd0_QI(ID3D12RootSignatureDeserializer *T, REFIID riid, void **out) {
+    return rsd_qi((struct mad_rsd *)T, riid, out);
+}
+static ULONG STDMETHODCALLTYPE rsd0_AddRef(ID3D12RootSignatureDeserializer *T) { return rsd_addref((struct mad_rsd *)T); }
+static ULONG STDMETHODCALLTYPE rsd0_Release(ID3D12RootSignatureDeserializer *T) { return rsd_release((struct mad_rsd *)T); }
+static const D3D12_ROOT_SIGNATURE_DESC * STDMETHODCALLTYPE rsd0_GetRootSignatureDesc(ID3D12RootSignatureDeserializer *T) {
+    return &((struct mad_rsd *)T)->v10->Desc_1_0;
+}
+static const ID3D12RootSignatureDeserializerVtbl g_rsd0_vtbl = {
+    rsd0_QI, rsd0_AddRef, rsd0_Release, rsd0_GetRootSignatureDesc,
+};
+
+static HRESULT STDMETHODCALLTYPE rsdv_QI(ID3D12VersionedRootSignatureDeserializer *T, REFIID riid, void **out) {
+    return rsd_qi((struct mad_rsd *)T, riid, out);
+}
+static ULONG STDMETHODCALLTYPE rsdv_AddRef(ID3D12VersionedRootSignatureDeserializer *T) { return rsd_addref((struct mad_rsd *)T); }
+static ULONG STDMETHODCALLTYPE rsdv_Release(ID3D12VersionedRootSignatureDeserializer *T) { return rsd_release((struct mad_rsd *)T); }
+static HRESULT STDMETHODCALLTYPE rsdv_GetRootSignatureDescAtVersion(ID3D12VersionedRootSignatureDeserializer *T,
+        D3D_ROOT_SIGNATURE_VERSION version, const D3D12_VERSIONED_ROOT_SIGNATURE_DESC **desc) {
+    struct mad_rsd *o = (struct mad_rsd *)T;
+    if (!desc) return E_INVALIDARG;
+    if (version == D3D_ROOT_SIGNATURE_VERSION_1_0) { *desc = o->v10; return S_OK; }
+    if (version == D3D_ROOT_SIGNATURE_VERSION_1_1) { *desc = o->v11; return S_OK; }
+    *desc = NULL;
+    RSD_REFUSE("[d3d12-rsdeser] conversion to root signature version %#x is not supported\n", (unsigned)version);
+    return E_INVALIDARG;
+}
+static const D3D12_VERSIONED_ROOT_SIGNATURE_DESC * STDMETHODCALLTYPE rsdv_GetUnconvertedRootSignatureDesc(
+        ID3D12VersionedRootSignatureDeserializer *T) {
+    struct mad_rsd *o = (struct mad_rsd *)T;
+    return o->native == D3D_ROOT_SIGNATURE_VERSION_1_1 ? o->v11 : o->v10;
+}
+static const ID3D12VersionedRootSignatureDeserializerVtbl g_rsdv_vtbl = {
+    rsdv_QI, rsdv_AddRef, rsdv_Release, rsdv_GetRootSignatureDescAtVersion, rsdv_GetUnconvertedRootSignatureDesc,
+};
+
+/* Read once. The switch exists so a device regression can be separated from
+ * this path without a rebuild. */
+static int mad_rsd_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        char v[4] = {0};
+        DWORD n = GetEnvironmentVariableA("MADEIRA_D3D12_RS_DESERIALIZER", v, sizeof v);
+        enabled = !(n == 1 && v[0] == '0');
+        if (!enabled) d3d12_log("[d3d12-rsdeser] ml1980 deserializer disabled (rollback)\n");
+    }
+    return enabled;
+}
+
+/* Shared body of both exports. */
+static HRESULT mad_rsd_create(const void *blob, SIZE_T n, REFIID riid, void **out, int versioned) {
+    struct mad_rsd *o;
+    HRESULT hr;
+    if (!mad_rsd_enabled()) {
+        if (out) *out = NULL;
+        d3d12_log(versioned ? "[madeira-d3d12] D3D12CreateVersionedRootSignatureDeserializer: not implemented\n"
+                            : "[madeira-d3d12] D3D12CreateRootSignatureDeserializer: not implemented\n");
+        return E_NOTIMPL;
+    }
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!riid || !blob || !n) return E_INVALIDARG;
+    o = calloc(1, sizeof *o);
+    if (!o) return E_OUTOFMEMORY;
+    o->refs = 1;
+    o->versioned = versioned;
+    if (versioned) o->vtbl.versioned = &g_rsdv_vtbl;
+    else           o->vtbl.plain = &g_rsd0_vtbl;
+    hr = rsd_parse(blob, n, o);
+    if (FAILED(hr)) { rsd_release(o); return hr; }
+    {
+        static LONG said;
+        const D3D12_ROOT_SIGNATURE_DESC1 *d = &o->v11->Desc_1_1;
+        if (InterlockedIncrement(&said) <= 8)
+            d3d12_log("[d3d12-rsdeser] ml1980 version=1.%u params=%u ranges=%u samplers=%u\n",
+                      o->native == D3D_ROOT_SIGNATURE_VERSION_1_1 ? 1u : 0u,
+                      d->NumParameters, o->nranges, d->NumStaticSamplers);
+    }
+    hr = rsd_qi(o, riid, out);
+    rsd_release(o);
+    return hr;
+}
+/* rsdeser-test:end */
 
 static HRESULT STDMETHODCALLTYPE device_CreateDescriptorHeap(ID3D12Device *This,
         const D3D12_DESCRIPTOR_HEAP_DESC *desc, REFIID riid, void **out) {
@@ -11204,20 +11577,15 @@ HRESULT WINAPI D3D12EnableExperimentalFeatures(UINT n, const IID *iids,
     return E_NOTIMPL;
 }
 
+/* ml1980: real deserializers (see mad_rsd_create next to the serializer). */
 HRESULT WINAPI D3D12CreateRootSignatureDeserializer(
         const void *blob, SIZE_T n, REFIID riid, void **out) {
-    (void)blob; (void)n; (void)riid;
-    if (out) *out = NULL;
-    d3d12_log("[madeira-d3d12] D3D12CreateRootSignatureDeserializer: not implemented\n");
-    return E_NOTIMPL;
+    return mad_rsd_create(blob, n, riid, out, 0);
 }
 
 HRESULT WINAPI D3D12CreateVersionedRootSignatureDeserializer(
         const void *blob, SIZE_T n, REFIID riid, void **out) {
-    (void)blob; (void)n; (void)riid;
-    if (out) *out = NULL;
-    d3d12_log("[madeira-d3d12] D3D12CreateVersionedRootSignatureDeserializer: not implemented\n");
-    return E_NOTIMPL;
+    return mad_rsd_create(blob, n, riid, out, 1);
 }
 
 HRESULT WINAPI D3D12CoreCreateLayeredDevice(const void *a, DWORD b, const void *c, REFIID d, void **e) {
