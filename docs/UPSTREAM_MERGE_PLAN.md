@@ -247,7 +247,7 @@ Estimated effort: **about 5–8 working days plus 3–6 device rounds**. Phase 4
 
 > **HARD GATES — do not start submitting until BOTH hold:**
 > 1. **The owner explicitly says to open the merge request(s).** Until then: no PR, no push to any `willfaust/*` repo (hard rule 2). The `upstream` remotes stay fetch-only (`DISABLED` push URL).
-> 2. **Steam works properly on device.** Client-routed game launches through the Windows Steam client must start and run reliably, proven by the owner's device logs. Status 2026-09-24: Steam client setup and sign-in work on the iPhone and the A16 iPad on the merged build (ml1680); client-routed game launches are still to be confirmed.
+> 2. **Steam works properly on device.** Client-routed game launches through the Windows Steam client must start and run reliably, proven by the owner's device logs. Status 2026-09-24: Steam client setup and sign-in work on the iPhone and the A16 iPad on the merged build (ml1680); client-routed game launches are still to be confirmed. Status 2026-09-25: Madeira Dock launches reach gameplay on device (ml1990/ml2000 logs); Gate 2 still applies to the Steam and Dock series only (PRs 5 and 6), not to PR 1. The owner is starting the series with PR 1 (32-bit) on 2026-09-25.
 
 ### 6.1 What upstream accepts today (checked read-only)
 - `willfaust/Madeira`: 436 stars, 124 forks. **No external PR has ever been merged.** PRs #5–#19 are all open or closed-unmerged. Examples: XInput host controllers (#16), resolution presets (#11), iPad game mode (#10), JIT disconnect hardening (#7), CI workflow (#18, #5). Will commits directly to `main`.
@@ -256,27 +256,64 @@ Estimated effort: **about 5–8 working days plus 3–6 device rounds**. Phase 4
 - Style: Will's subjects are topic-first (`Native D3D12: …`, `Licensing: …`, `ntdll iOS: …`). Bodies are measured-evidence narratives. `mlNNNN` tags are used heavily in code. There is no CI and no clang-format config. Heavy comments are house style, the same as ours.
 - Upstream tracks built binaries: 268 DLL/EXE files, the dylib, `libdxmt_unix.a` and the GnuTLS archives. Ours tracks **1,235**, of which the i386 farm is 174 MB.
 
-### 6.2 Split into focused PRs, in dependency order (rev. 2026-09-24)
+### 6.2 Split into focused PRs, in submission order (rev. 2026-09-25)
 
-Will asked (Discord, 2026-09-23) for separate PRs: 32-bit, Steam/UI and controller support. The owner added the new front end and XInput. The series below follows those lines. Each PR has a submodule part (to `willfaust/FEX` `ios-port-2607`, `willfaust/wine` `madeira-lgpl`, `willfaust/dxmt` `ios-port`) and a top-level part that bumps the pins only after its submodule parts have landed. Every new behaviour keeps its kill switch, moved onto a `madeira.cfg` key with the env name kept as an alias.
+**What changed since rev. 2026-09-24.**
+- The first 125hz contribution has already landed. `willfaust/Madeira#22` ("Add physical and touch controller input through host XInput", 125hz, `c7434df` + `ebe8c28`) and `willfaust/wine#1` (`feb96ad2be4`) are merged. Will then pinned wine and rebuilt XInput 1.1–1.4 himself (`8c050d0`).
+- That fixes the working pattern for every PR below:
+  - the top-level PR ships source, tests and `docs/` only;
+  - each submodule part is its own PR against the fork's branch;
+  - Will moves the pin and rebuilds the binaries.
+  - Commits are signed off as `125hz <nickfugitives@gmail.com>` with a Co-Authored-By trailer.
+- Upstream is now `upstream/main` `8c050d0` (4 commits past our merge base `c8f6f27`), `willfaust/wine` `madeira-lgpl` `723d1bf5132`. FEX `ios-port-2607` and dxmt `ios-port` have not moved.
+- Upstream **still does not track** `dlls/ntdll/arm64ec_x64_export_iat.c` (checked 2026-09-25).
+- Will asked for the 32-bit work first, so it is now PR 1. The warm-up "fixes to upstream" PR moved to the end of the series and is optional.
 
-| # | PR | Repos | Scope | Depends on |
-|---|---|---|---|---|
-| **0** | **Fixes to upstream found during the merge** (warm-up; no features) | FEX, wine, Madeira | FEX `AllocatorHooks.cpp`: no `IOS_RPM_GUARD` in the system-malloc path (the iOS-host FEXCore build fails). wine: commit the missing `dlls/ntdll/arm64ec_x64_export_iat.c` (upstream's `loader.c` includes it; Will's copy is untracked, so upstream does not build from a clean clone. Ask Will for his file rather than ours.) and `config.h` first in `unix/sync.c` (makedep rejects the current order). `StikJITHelper`: the pool census drops the free space after the last mapping (shrinks the pool on 512 GB maps); the RW-alias hint `0x7000000000` is above the task map on 63 GB devices (no pool at all); release the early placeholder once. `server_ios.c`/`thread_ios.c`: an exiting thread releases `fd_cache_mutex` (seen wedging whole sessions). win32u `driver_ios.c`: child-window layers framed in desktop coordinates (swapchains in child windows drew at the desktop origin). | — |
-| 1 | rpmalloc available-list invariant | rpmalloc | Small allocator fix. | — |
-| **2** | **32-bit (WoW64) support** | FEX, wine, Madeira | FEX: the WOW64 module on iOS (guest-window base register, 32-bit dispatcher/codegen, x87 default, DEP promotion, syscall-blocked thread sweeper). wine: window-aware pointer conversion (ntdll/wow64, wow64win, dwrite, dnsapi, process attributes), per-thread `is_wow64()`, exception params, per-process zero_bits/GDI, initial-context retry. Madeira: `virtual_ios.c` 4 GB windows (512 GB and 63 GB layouts, small-VA band), guest fault routing in `signal_arm64_ios.c`, 32-bit unixlib tables (ntdll, winemetal wow64 slots), i386 farm build script (macOS form, not the WSL adapter), `docs/WOW64.md`. **Coexistence with upstream (must ship with it):** sub-floor relocation/windows for PE32+ only (`MADEIRA_SUBFLOOR_PE32`); no FEX arena reservation on maps without the high band (`MADEIRA_FEX_ARENA_SMALL`); JIT pool outranks the 0x140000000 window when only giving the window back makes the pool fit (`MADEIRA_POOL_OVER_EXE_WINDOW`). Must not regress 64-bit titles: Will's RDR2 run is the check. | 0 |
-| 3 | D3D9 via DXMT | dxmt, Madeira | D3D9 frontend + i386 DXMT build + wow64 thunks + d3d9shim, DXTn CPU decode; app wiring. **Licence decision on the D3D9 import first.** | 2 |
-| **4** | **Controllers and XInput** | wine, Madeira | wine: XInput through win32u (host gamepads), dinput host joystick (opt-in). Madeira: `HardwareInput.swift`, on-screen controls, the layout editor, **control presets** (save/load; built-in Xbox preset offered, never auto-loaded). Replaces/extends upstream's own open PR #16 (XInput host controllers); check with Will which he prefers. | 0 (independent of 2) |
-| **5** | **New front end** | Madeira | Library UI (default front end, switch to the developer UI and back with a restart notice), game details, in-game menu (touch controls/edit/keyboard on top, overlay settings at the bottom, red Quit), build stamp on the Library and Settings. No Steam code; Steam entries appear only once 6 lands. Launch rows follow Will's app conventions. | 0 |
-| **6** | **Steam** | wine, Madeira | Madeira: SwiftSteam sign-in (password + Steam Guard, QR; **field-number fix for typed passwords**), library and depot downloads, the Windows Steam client path (installer keep-alive, headless consoles, `-cef-disable-hang-timeouts`, web-helper QoS, launch-progress view), onboarding (install client, sign in, restart prompt, "Run setup again"), the Steam button. wine: NSI pending change requests, loopback accept/socket fixes, async/APC hand-off. **Credited to Jfishin**; get his explicit OK for GPL-3 + converter exception. **No DRM circumvention** (none exists in this fork). **Gate 2 applies.** | 2, 5 |
-| 7 | Sync and I/O fast paths | wine | fastsync cells (opt-in while madsync is upstream's default; benchmark both first, as Will suggested), FS directory/case cache, negative lookup (off by default). | 2 |
-| 8 | ARM64EC/iOS FEX perf | FEX | Lock-free JIT test, two-way L1, pool-return fast path, CPUID bound, unaligned-atomic counters. | 1 |
+Each row is a *series*: one PR per repo it touches (FEX `ios-port-2607`, wine `madeira-lgpl`, dxmt `ios-port`, `research/madeira-d3d12` in the top level), plus a top-level PR. Every new behaviour keeps its kill switch, moved onto a `madeira.cfg` key with the env name kept as an alias. Built on a fresh branch off the then-current upstream head, never from our fork branch wholesale.
 
-**Order:** 0 → (1) → 2 → 4 and 5 in parallel → 3 → 6 → 7/8. PR 0 lands useful fixes for Will's own tree with nothing to argue about and shows how he reviews. PR 2 is the core value and the heaviest review. PR 6 goes last because of Gate 2 and its provenance and ToS sensitivity.
+| # | PR | Repos | Scope | Depends on | Gate / blocker |
+|---|---|---|---|---|---|
+| **1** | **32-bit (WoW64) support** | FEX, wine, dxmt, Madeira | FEX: WOW64 module on iOS (guest-window base register, 32-bit dispatcher/codegen, x87 default, DEP promotion, syscall-blocked thread sweeper, 12 GB small-map arena constant). wine: window-aware pointer conversion (ntdll/wow64, wow64win, dwrite, dnsapi, process attributes), per-thread `is_wow64()`, exception params, per-process zero_bits/GDI, initial-context retry. dxmt: **i386 build of d3d11/dxgi/winemetal + winemetal wow64 thunks** (slots 139–144 NULL, 145–150 ours, count 151); no D3D9 yet. Madeira: `virtual_ios.c` 4 GB windows (512 GB and 63 GB layouts, small-VA band), guest fault routing in `signal_arm64_ios.c`, 32-bit unixlib tables (ntdll, audio, winemetal), an i386 Wine farm script in macOS form (`build/wine-i386/build.sh`), `docs/WOW64.md`. Coexistence switches that must ship with it: `MADEIRA_SUBFLOOR_PE32`, `MADEIRA_FEX_ARENA_SMALL`, `MADEIRA_POOL_OVER_EXE_WINDOW`. | — | Converter-exception grant; game-name scrub of the touched files; must not regress 64-bit (Will's own titles are the check). |
+| 2 | D3D9 via DXMT | dxmt, Madeira | D3D9 frontend, i386 + arm64ec builds, wow64 thunks, d3d9shim, DXTn CPU decode, batch budget / drain / mirror batching (ml1970–1990), app wiring. Makes most 32-bit games render. | 1 | **Licence decision on the D3D9 import** (keep LGPL-2.1 vs §3 conversion). |
+| 3 | Controllers and touch, follow-up to #22 | wine, Madeira | Rebase our remaining input work onto upstream's `GamepadInput.swift` / `TouchGamepad.swift` / `WiniosGamepad.c` (do **not** resubmit the fork's `HardwareInput.swift` wholesale): control presets (save/load, built-in Xbox default for new users, "Custom Layout N"), layout editor (Done button, presets in the menu, only while touch controls are on), pad slot published at session start (`MADEIRA_PAD_EARLY_SLOT`), dinput host joystick (opt-in), controller audio-route fix, the multitouch modifier case of open PR #19 if Will wants it. | — (parallel with 1) | None beyond review. |
+| 4 | New front end | Madeira | Library UI, game details (stay until boot, "Start with" picker without Steam modes), compact list, collapsible sections, in-game menu, per-game CPU cores, session exit report, build stamp, custom artwork for non-Steam entries. No Steam code: Steam rows appear once 5 lands. | — | Launch rows follow Will's conventions; no per-test buttons. |
+| 5 | Steam account, library and downloads | wine, Madeira | SwiftSteam sign-in (password + Steam Guard, QR, typed-password field-number fix), library, playtime, artwork, depot downloads (shared-depot/owner records, CEG `CheckGuid`/depotcache records), background downloads and notifications, onboarding, the regular Windows Steam client path (install, headless consoles, web-helper QoS, launch-progress view). wine: NSI pending change requests, loopback accept/socket fixes, async/APC hand-off. **Credited to Jfishin.** | 4 | Jfishin's OK for GPL-3 + exception; **Gate 2**. No DRM circumvention (none exists). |
+| 6 | Madeira Dock (binary + public adapter) | Madeira | `MadeiraDock.swift`, report parser/messages, Dock installer scripts, content/CEG waits as surfaced by the app, `arm64ec-windows/dockhost.exe` + `dock-notices.txt`. **Never the Dock source** (private `125hz/madeira-dock`). | 5 | Will must explicitly accept a **proprietary** binary in a GPL-3 repo (CONTRIBUTING expects GPL + exception). Offer the alternative: the app downloads the signed EXE from a 125hz release on first use, so his repo carries only the adapter. Gate 2 (Dock game launches device-proven). |
+| 7 | Media: winegstreamer on FFmpeg + VideoToolbox | wine, Madeira | wg_parser via libavformat (MP3/WAV/MOV/MP4 demux), FFmpeg LGPL decoders (MP1-3, PCM, WMA), VideoToolbox H.264/HEVC and AudioToolbox AAC (no FFmpeg patent codecs). The FFmpeg build becomes a tracked `build/ffmpeg/build.sh` (macOS form). Notices. | — | LGPL notices for the FFmpeg build. |
+| 8 | Native D3D12 contributions | Madeira (`research/madeira-d3d12`) | Root-signature deserializers, one-pass DXIL conversion, persistent metallib cache, typed-UAV-load caps, CS dump opt-in, dcomp/ktmw32 stubs. This is Will's runtime, so small and separate. | — | Ask Will first; he may prefer issues. |
+| 9 | Emulator core stability | FEX, wine, Madeira | Only fixes that have been device-proven: JIT pool quarantine / section clamp / pressure feedback, thread-registry and trampoline reclaim, exclusive-alias keepbase, start-context clear, TLS/TEB reuse delay, dead-process layer sweep, desktop fit, guest RWX as host data (if ml2000 proves it). Split per area if large. | 1 (32-bit parts) | Device proof per item. |
+| 10 | Sync and I/O fast paths | wine | fastsync cells (opt-in while madsync is upstream's default; benchmark both, as Will suggested), FS directory/case cache, negative lookup (off by default). | 1 | Benchmark vs madsync. |
+| 11 | ARM64EC/iOS FEX perf | FEX (+ rpmalloc) | Lock-free JIT test, two-way L1, pool-return fast path, CPUID bound, unaligned-atomic counters; the rpmalloc available-list invariant fix. | — | — |
+| 12 | Fixes to upstream found during the merge (optional) | FEX, wine, dxmt, Madeira | FEX `AllocatorHooks.cpp` `IOS_RPM_GUARD` in the system-malloc path (`039dd4051`); dxmt `WMTNop` brace (`2d0a3bf`, only if upstream has it); wine: ask Will to commit his `arm64ec_x64_export_iat.c` (ours is a reconstruction) and `config.h` first in `unix/sync.c`; `StikJITHelper` census/RW-hint/placeholder fixes; `fd_cache_mutex` release on thread exit; child-window layers in desktop coordinates. | — | Nothing to argue about; can go any time. |
 
-**Test matrix per PR** (device, owner): iPhone (512 GB map) and A16 iPad (63 GB map), each series built alone on the then-current upstream head. 32-bit: a D3D9 title and the Steam client install. Front end: fresh install and "Run setup again". Controllers: a USB pad and on-screen controls. Steam: fresh onboarding, QR sign-in and typed-password sign-in, a client-routed launch. Every PR: one 64-bit title, and ask Will to run RDR2.
+**Order:** 1 first, alone. Then 3 and 4 in parallel with its review. Then 2 once the D3D9 licence is settled, and 7, 8, 11 and 12 whenever there is capacity. Then 5, then 6 (Gate 2, provenance and binary-licence questions), then 9 and 10 as device proof accumulates. No more than two series in review at once. Each later series is rebased on whatever landed.
 
-**Build-side caveat:** Will builds with Xcode on macOS; this fork builds with the WSL/xtool adapter. Every PR must express its build changes in `build/*/build.sh` + the Xcode project. We cannot run Will's Xcode build here, so ask Will (or a macOS machine) for one clean build of each PR before merging.
+**Tonight (PR 1) prerequisites, in order:**
+1. **Park the fork.**
+   - Finish or park the in-flight ml2000 round.
+   - Commit the fork's uncommitted work (ml1720–ml2000, about 60 files plus the submodules) to a 125hz `wip/` branch, so PR branches can be extracted from committed history.
+2. **Merge `upstream/main` `8c050d0` into `upstream-merge`** and pin wine `723d1bf5132`.
+   - Resolve the duplicate controller paths: upstream's `GamepadInput`/`TouchGamepad`/`WiniosGamepad` are now the base.
+   - Our `HardwareInput.swift` extras become PR 3.
+3. **Cut `pr/wow64` branches off the upstream heads** in FEX, wine, dxmt and the top level.
+   - Carry only the WoW64 files and hunks.
+   - Squash into topic-first commits (`WoW64: …`, `ntdll iOS: …`) with `Signed-off-by` and the Co-Authored-By trailer.
+4. **Scrub game names** in the touched files.
+   - `virtual_ios.c`, `signal_arm64_ios.c`, `process_ios.c`, `env_ios.c`, `audio_null_ios.c`, `ntdll-unix/build.sh`, `win32u` `message/sysparams_ios.c` and wineserver `fd/mapping_ios.c` still contain title names in comments or log strings.
+   - Also drop one-shot probes and spent censuses.
+5. **Write the macOS i386 farm script and `docs/WOW64.md`.**
+   - We cannot run Will's Xcode build, so the PR text asks him for one clean macOS build.
+   - Binaries are left to Will, as with #22.
+6. **Build each part here with the WSL adapter** and run the host tests, then open the PRs (owner's explicit go at that moment).
+
+**Test matrix per PR** (device, owner): iPhone (512 GB map) and A16 iPad (63 GB map), each series built alone on the then-current upstream head.
+- **Every PR:** one 64-bit title, and ask Will to run his large titles.
+- **32-bit:** a D3D11 32-bit title (D3D9 titles need PR 2) and the Steam client install.
+- **Front end:** fresh install and "Run setup again".
+- **Controllers:** a USB pad and on-screen controls.
+- **Steam/Dock:** fresh onboarding, QR and typed-password sign-in, a Dock launch, a client-routed launch.
+
+**Build-side caveat:** Will builds with Xcode on macOS; this fork builds with the WSL/xtool adapter. Every PR must express its build changes in `build/*/build.sh` + the Xcode project, and ask Will (or a macOS machine) for one clean build before merging.
 
 ### 6.3 Clean-up before submitting
 - **Branch hygiene**: build each PR on a fresh branch off the then-current upstream head. Squash our `ml`-series into logical commits using the topic-first subject style, with `Signed-off-by` (DCO) and the Co-Authored-By trailer. Keep full history on the 125hz `main` for reference and link it in the PR text.
@@ -303,7 +340,7 @@ Will asked (Discord, 2026-09-23) for separate PRs: 32-bit, Steam/UI and controll
 5. [ ] Write the condensed docs (about 1 day).
 6. [ ] Diagnostics and flag clean-up per series (1–2 days).
 7. [ ] Build each series on a clean upstream base using upstream's build scripts, plus a device smoke test of each series alone. Upstream's layout must not regress 64-bit titles: 3–5 device rounds.
-8. [ ] Open PRs in order: 1/3/11 → 2/4 → 5/6/7 → 8 → 9/10 → 12 → 13. One or two at a time, following Will's feedback.
+8. [ ] Open PRs in the 6.2 order: 1 → 3/4 → 2 → 7/8/11/12 → 5 → 6 → 9/10. One or two at a time, following Will's feedback.
 
 Total: about **1.5–3 weeks** of preparation plus review latency. Upstream has merged nothing external so far, so expect long or no review.
 

@@ -3920,6 +3920,7 @@ struct ContentView: View {
     /// boot-failure timeout, or a pool-allocation failure) — see the three
     /// `isLaunching = false` sites inside that function.
     @State private var isLaunching = false
+    @State private var dockPreparing = false
 
     /// ml — THE LOADING SPINNER.
     ///
@@ -4054,6 +4055,22 @@ struct ContentView: View {
                                        LogStore.shared.log("[steam-eula] ml1710 app \(prompt.appID) declined; launch cancelled")
                                    })
                 }
+                // ml1780: "Skip one-time installs" ended the session; start the game again once
+                // Wine has fully stopped (launchLibraryEntry marks the installs first).
+                .onChange(of: library.relaunchRequest?.id) { _, id in
+                    guard id != nil, let entry = library.relaunchRequest else { return }
+                    library.relaunchRequest = nil
+                    relaunchWhenStopped(entry, attempt: 0)
+                }
+                // ml1790: a second session cannot start in this process; offer to close Madeira.
+                .alert("Restart Madeira", isPresented: Binding(get: { library.restartNotice != nil },
+                                                                set: { if !$0 { library.restartNotice = nil } })) {
+                    Button("Close Madeira") {
+                        LogStore.shared.log("[session-once] ml1790 closed by the user for a restart")
+                        exit(0)
+                    }
+                    Button("Later", role: .cancel) { library.restartNotice = nil }
+                } message: { Text(library.restartNotice ?? "") }
                 // ml — belt-and-suspenders for the cold-landscape-launch fix in
                 // `controlOverlayWindowBounds`: this `geo` is the exact source
                 // of truth this same reader uses to pick wideNormalBody over
@@ -4084,7 +4101,19 @@ struct ContentView: View {
                 jit_install_trap_handler()
                 // ml1330: StikDebug is closed by iOS about a minute after it
                 // attaches; take the process-lifetime JIT pool while it is here.
-                StikJITHelper.prepareEarlyPool(trigger: "start")
+                // ml1780: optionally after the first frame. The allocation BRK stops the whole
+                // process while StikDebug maps the pool (3.2-4.0 s in device logs 49-51).
+                // ml1790: OPT-IN again (MADEIRA_JIT_EARLY_DEFER=1). Deferred, the library showed
+                // but ignored touches for those seconds and read as a hang (owner), and the later
+                // placement in log 52 took 23.6 s and settled for a 640 MB pool.
+                if LibraryFlags.enabled("MADEIRA_JIT_EARLY_DEFER", fallback: false) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                        logStore.log("[jit-early] ml1780 deferred past the first frame")
+                        StikJITHelper.prepareEarlyPool(trigger: "start")
+                    }
+                } else {
+                    StikJITHelper.prepareEarlyPool(trigger: "start")
+                }
                 entitlements = EntitlementStatus.check()
                 logEntitlementStatus()
                 logStore.log("[build] ml1420 \(BuildStamp.text)")
@@ -5215,13 +5244,19 @@ struct ContentView: View {
     /// Debugger stays attached during PE loading so mprotect_exec can use BRK
     /// to prepare code pages. Detach happens after Wine finishes + recovery.
     private func launchLibraryEntry(_ entry: LibraryEntry) {
-        guard !isLaunching, wine_process_is_running() == 0, wineserver_is_running() == 0, library.current == nil else {
+        let entry = SteamAccountModel.shared.restoreDefaultArguments(entry)
+        guard !isLaunching, !dockPreparing, wine_process_is_running() == 0, wineserver_is_running() == 0, library.current == nil else {
             library.error = "A session is already running."; return
         }
         // ml1540: setup's Steam install ran a session in this app run; a game needs a fresh run.
         if OnboardingModel.restartAdvised, OnboardingModel.restartPromptEnabled, entry.steamSession != "installer" {
             LogStore.shared.log("[onboarding] ml1540 launch held until Madeira restarts")
             library.error = OnboardingModel.restartMessage; return
+        }
+        // ml1790: one Wine session per app run (see LibraryModel.sessionsThisRun).
+        if LibraryModel.sessionsThisRun > 0, LibraryFlags.enabled("MADEIRA_ONE_SESSION_PER_RUN") {
+            LogStore.shared.log("[session-once] ml1790 launch held: \(LibraryModel.sessionsThisRun) session(s) already ran in this app run")
+            library.restartNotice = LibraryModel.restartMessage; return
         }
         // ml1330: "ready" means a JIT pool exists or a debugger that can grant one
         // is attached now. CS_DEBUGGED alone stays set after StikDebug is gone.
@@ -5233,7 +5268,11 @@ struct ContentView: View {
             return
         }
         do { if entry.desktop != true { _ = try LibraryModel.executable(entry.relativePath) }; try entry.validate() }
-        catch { library.error = error.localizedDescription; return }
+        catch {
+            library.error = error.localizedDescription
+            logStore.log("[launch-preflight] ml1960 profile validation failed: \(error.localizedDescription)", level: .error)
+            return
+        }
         guard entry.windowsPath.utf8.count < 1024, entry.arguments.utf8.count < 1024 else {
             library.error = "The executable path or launch arguments are too long."; return
         }
@@ -5243,22 +5282,104 @@ struct ContentView: View {
         // MADEIRA_STEAM_EULA_NATIVE=0 leaves it to the client as before.
         if entry.steamGameLaunch, let appID = entry.steamAppID, !eulaCleared.contains(appID),
            LibraryFlags.enabled("MADEIRA_STEAM_EULA_NATIVE") {
-            let steamRoot = LibraryModel.drive.appendingPathComponent(entry.relativePath).deletingLastPathComponent()
+            // ml1720: the CLIENT's folder. relativePath is the game's executable for a native
+            // install, which put this check in the game's Binaries folder: no userdata there,
+            // so every agreement read as already accepted and the sheet never appeared.
+            let steamRoot = LibraryModel.drive.appendingPathComponent(entry.steamClientRelativePath).deletingLastPathComponent()
             eulaCleared.insert(appID)
             library.error = nil
             Task { @MainActor in
                 let eulas = await SteamAccountModel.shared.eulas(for: appID)
                 let missing = eulas.map { SteamEulaStore.missing(appID: appID, eulas: $0, steamRoot: steamRoot) } ?? []
-                LogStore.shared.log("[steam-eula] ml1710 app \(appID) listed=\(eulas?.count ?? -1) missing=\(missing.count)")
+                LogStore.shared.log("[steam-eula] ml1720 app \(appID) listed=\(eulas?.count ?? -1) missing=\(missing.count) configs=\(SteamEulaStore.configFiles(steamRoot: steamRoot).count)")
                 if missing.isEmpty { launchLibraryEntry(entry) }
-                else { eulaPrompt = SteamEulaPrompt(entry: entry, appID: appID, eulas: missing, steamRoot: steamRoot) }
+                else {
+                    // ml1970: the held details page closes first so this sheet can present.
+                    library.closeDetail &+= 1
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                        eulaPrompt = SteamEulaPrompt(entry: entry, appID: appID, eulas: missing, steamRoot: steamRoot)
+                    }
+                }
             }
             return
         }
+        // ml1780: mark the game's one-time installs done before the client starts (no session runs
+        // here, so the registry is on disk). MADEIRA_STEAM_SKIP_INSTALLERS=0 leaves them to the client.
+        // ml1970: a Madeira Dock start handles them itself (DockInstallScripts).
+        MadeiraDock.installerScript = nil
+        if entry.steamGameLaunch, MadeiraDock.routes(entry), LibraryFlags.enabled("MADEIRA_DOCK_INSTALLERS") {
+            LibraryModel.prepareDockInstallers(entry)
+        } else if entry.steamGameLaunch, entry.steamRunInstallers != true, LibraryFlags.enabled("MADEIRA_STEAM_SKIP_INSTALLERS") {
+            LibraryModel.markSteamInstallers(entry, reason: "launch")
+        }
+        if entry.steamGameLaunch, LibraryFlags.enabled("MADEIRA_STEAM_INSTALL_REGISTRY"),
+           let folder = LibraryModel.steamInstallFolder(entry) {
+            do {
+                let root = LibraryModel.drive.appendingPathComponent(entry.steamClientRelativePath).deletingLastPathComponent()
+                let count = try SteamInstallRegistry.prepare(folder: folder, drive: LibraryModel.drive, steamRoot: root)
+                logStore.log("[steam-registry] ml1960 app=\(entry.steamAppID ?? 0) values-written=\(count)")
+            } catch {
+                library.error = "Game installation setup failed. " + error.localizedDescription
+                logStore.log("[steam-registry] ml1960 preparation failed", level: .error)
+                return
+            }
+        }
         SteamLibraryModel.shared.stopScan()
-        entry.configureLaunch()
+        if MadeiraDock.routes(entry) {
+            dockPreparing = true
+            Task { @MainActor in
+                do {
+                    try await SteamAccountModel.shared.prepareDock(entry)
+                    guard StikJITHelper.readyToLaunch, wine_process_is_running() == 0,
+                          wineserver_is_running() == 0, library.current == nil else {
+                        throw LibraryError.message("The launch state changed. Enable JIT and try again.")
+                    }
+                    entry.configureLaunch(dock: true)
+                    // ml1990: the install record lists per-user custom executables (CEG); Dock asks
+                    // Valve's client to prepare them before it launches. MADEIRA_DOCK_CEG=0 never asks.
+                    let ceg = LibraryFlags.enabled("MADEIRA_DOCK_CEG") && MadeiraDock.hasCustomExecutables(appID: entry.steamAppID ?? 0)
+                    if ceg { setenv("MADEIRA_STEAM_HOST_CEG", "1", 1) } else { unsetenv("MADEIRA_STEAM_HOST_CEG") }
+                    LogStore.shared.log("[dock-ceg] ml1990 app=\(entry.steamAppID ?? 0) custom-executables=\(ceg ? 1 : 0)")
+                    library.begin(entry, dock: true)
+                    dockPreparing = false
+                    LogStore.shared.log("[madeira-dock] ml1830 starting bundled host; Valve must authenticate and authorize launch")
+                    runWineFullSequence(profile: entry, dock: true)
+                } catch {
+                    dockPreparing = false
+                    SteamAccountModel.shared.sessionChanged(active: false)
+                    MadeiraDock.cleanup()
+                    library.error = "Madeira Dock could not prepare the Steam session. " + error.localizedDescription
+                    LogStore.shared.log("[madeira-dock] ml1830 preparation failed; game not launched", level: .error)
+                }
+            }
+            return
+        }
+        entry.configureLaunch(dock: false)
         library.begin(entry)
+        // ml1720: log Madeira's own Steam connection off before the Windows client signs in.
+        // This was left to the library view's onChange, which does not fire when the game view
+        // replaces the library first; the two sign-ins then replaced each other's session
+        // ("not auto reconnecting due to Session Replaced") in 5 of 9 device launches.
+        if entry.usesSteam { SteamAccountModel.shared.sessionChanged(active: true) }
         runWineFullSequence(profile: entry)
+    }
+
+    /// ml1780: waits (up to 15 s) for the ended session's Wine threads (the wineserver writes the
+    /// registry as it stops), then marks the installs. ml1790: no relaunch in this process (a
+    /// second session aborts in init_registry, device log 52); Madeira asks for a restart.
+    private func relaunchWhenStopped(_ entry: LibraryEntry, attempt: Int) {
+        if wine_process_is_running() == 0, wineserver_is_running() == 0, library.current == nil {
+            let found = LibraryModel.markSteamInstallers(entry, reason: "skip")
+            LogStore.shared.log("[steam-installers] ml1790 skip marked app=\(entry.steamAppID ?? 0) entries=\(found) after=\(attempt * 500)ms")
+            library.restartNotice = found > 0
+                ? "The one-time installs are skipped. " + LibraryModel.restartMessage + " Then tap Play."
+                : "Madeira could not find this game's install script, so Steam will ask again. " + LibraryModel.restartMessage
+        } else if attempt < 30 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { relaunchWhenStopped(entry, attempt: attempt + 1) }
+        } else {
+            LogStore.shared.log("[steam-installers] ml1790 skip gave up: the session did not stop")
+            library.restartNotice = LibraryModel.restartMessage
+        }
     }
 
     /// ml1710: the user accepted in Madeira's sheet; record it where the client looks, then launch.
@@ -5298,13 +5419,13 @@ struct ContentView: View {
         }
     }
 
-    private func runWineFullSequence(profile: LibraryEntry? = nil) {
+    private func runWineFullSequence(profile: LibraryEntry? = nil, dock: Bool = false) {
         // ml: THE RELAUNCH GUARD. See isLaunching's doc comment. Every early
         // return on this path — this one included — logs a
         // "[launch] ignored: <reason>" line through the app's normal log
         // function (so it lands in the exported log, not just stderr), so a
         // tap that does nothing visible ALWAYS has a reason on record.
-        guard !isLaunching else {
+        guard !isLaunching, !dockPreparing else {
             logStore.log("[launch] ignored: a session is already launching or running — "
                          + "wait for it to finish (or its boot to fail/time out) before trying again",
                          level: .error)
@@ -5312,6 +5433,11 @@ struct ContentView: View {
         }
         guard StikJITHelper.readyToLaunch else {
             logStore.log("[launch] ignored: no JIT pool and no attached debugger — press 'Enable JIT' first", level: .error)
+            return
+        }
+        if StikJITHelper.reserveDesktopPoolIfNeeded(desktop: getenv("MADEIRA_DESKTOP") != nil, dock: dock) {
+            library.launchFailed()
+            library.error = "Opening the Windows desktop needs more memory reserved at startup. Close Madeira completely, reopen it, enable JIT, then open the desktop again."
             return
         }
         isLaunching = true
@@ -5470,14 +5596,22 @@ struct ContentView: View {
             //     [jit-pool] TAIL REFUSED (FEX EC_CODE): ...
             // with the exact numbers. The line below names the knob in the same
             // breath so a log reader never has to know this file exists.
-            let isDesktopFanout = getenv("MADEIRA_DESKTOP") != nil
+            // ml1880: Dock keeps explorer as a launcher, but has no desktop
+            // Steam/CEF fan-out. Device logs 62/63 used about 230 MB of code.
+            let compactDock = dock && LibraryFlags.enabled("MADEIRA_DOCK_COMPACT_POOL")
+            let isDesktopFanout = getenv("MADEIRA_DESKTOP") != nil && !compactDock
             var poolSizeMB = isDesktopFanout ? 896 : 512
             var poolSource = isDesktopFanout ? "desktop-session default" : "direct-launch default"
+            if compactDock { poolSource = "Dock compact default, ml1880" }
             if let txt = MadeiraConfig.get("pool"),
                let mb = Int(txt.trimmingCharacters(in: .whitespacesAndNewlines)),
                mb >= 256, mb <= 1152 {
                 poolSizeMB = mb
                 poolSource = "madeira-pool.txt override"
+            }
+            let pressureFloor = StikJITHelper.poolPressureFloorMB
+            if poolSource != "madeira-pool.txt override", pressureFloor > poolSizeMB {
+                poolSizeMB = pressureFloor; poolSource = "an earlier session ran the pool dry, ml2000"
             }
             logStore.log("JIT pool \(poolSizeMB)MB (\(poolSource)) — raise it with " +
                          "Documents/madeira-pool.txt (bare MB, 256..1152) if the log shows [jit-pool] EXHAUSTED")
@@ -5620,22 +5754,39 @@ struct ContentView: View {
             // rebuild. Applied before the launch so native code sees it from the
             // first getenv. Only MADEIRA_ and DXMT_ names are honoured, so a stray
             // line cannot redirect PATH or the loader.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-env.txt"), encoding: .utf8) {
-                for raw in txt.split(whereSeparator: { $0.isNewline }) {
-                    let line = raw.trimmingCharacters(in: .whitespaces)
-                    if line.isEmpty || line.hasPrefix("#") { continue }
-                    guard let eq = line.firstIndex(of: "=") else { continue }
-                    let name = String(line[..<eq]).trimmingCharacters(in: .whitespaces)
-                    let value = String(line[line.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
-                    guard name.hasPrefix("MADEIRA_") || name.hasPrefix("DXMT_") else {
-                        logStore.log("madeira-env.txt: ignoring \(name) (only MADEIRA_*/DXMT_* names are honoured)")
-                        continue
-                    }
-                    setenv(name, value, 1)
-                    logStore.log("Env override: \(name)=\(value) via madeira-env.txt")
-                }
+            // ml1840: canonical env.* survives legacy-file cleanup. Both Swift
+            // route selection and the guest must consume the same configuration.
+            let environment = MadeiraConfig.environmentValues()
+            for name in environment.keys.sorted() {
+                setenv(name, environment[name]!, 1)
             }
+            logStore.log("[config-env] ml1840 exported \(environment.count) runtime overrides")
+
+            // ml1880: the census observed >32k calls/frame. Keep frame/memory
+            // telemetry, but avoid counting every D3D9 call in normal Dock play.
+            // Explicit census/diagnostic/forensic requests retain full tracing.
+            if let value = DockPerformancePolicy.censusDefault(dock: dock,
+                lightweight: LibraryFlags.enabled("MADEIRA_DOCK_LIGHT_DIAGNOSTICS"),
+                diagnostic: LibraryFlags.enabled("MADEIRA_DIAG", fallback: false),
+                forensic: LibraryFlags.enabled("MADEIRA_D3D9_LAST", fallback: false)),
+               getenv("MADEIRA_D3D9_CENSUS") == nil {
+                setenv("MADEIRA_D3D9_CENSUS", value, 0)
+            }
+            logStore.log("[dock-perf] ml1880 census=\(getenv("MADEIRA_D3D9_CENSUS").map { String(cString: $0) } ?? "default") frame/memory telemetry retained")
+
+            // ml1940: bound 32-bit Wine heap growth and combine full reserve /
+            // commit requests. Native 64-bit heaps ignore these opt-ins. Keep
+            // explicit per-feature =0 overrides for independent device A/B.
+            if dock {
+                setenv("MADEIRA_HEAP_COMPACT", "1", 0)
+                setenv("MADEIRA_HEAP_COMBINED", "1", 0)
+                setenv("MADEIRA_HEAP_RECLAIM", "1", 0)
+                setenv("MADEIRA_HEAP_STATS", "1", 0)
+                setenv("MADEIRA_CPU_DIAGNOSTICS", "1", 0)
+                setenv("MADEIRA_VA_DIAGNOSTICS", "1", 0)
+            }
+            logStore.log("[dock-heap] ml1940 compact=\(getenv("MADEIRA_HEAP_COMPACT").map { String(cString: $0) } ?? "0") combined=\(getenv("MADEIRA_HEAP_COMBINED").map { String(cString: $0) } ?? "0")")
+            logStore.log("[dock-diagnostics] ml1950 reclaim=\(getenv("MADEIRA_HEAP_RECLAIM").map { String(cString: $0) } ?? "0") heap=\(getenv("MADEIRA_HEAP_STATS").map { String(cString: $0) } ?? "0") cpu=\(getenv("MADEIRA_CPU_DIAGNOSTICS").map { String(cString: $0) } ?? "0")")
 
             // ml962: the 512MB JIT-pool dump is now OPT-IN.
             //
@@ -5808,7 +5959,11 @@ struct ContentView: View {
                 logStore.log("[fex-cfg] host feature probe: " + joined)
             }
             // ===== end FEX JIT settings =========================================
-            profile?.applyEnvironment()
+            // ml1840: the route selected before credential preparation survives
+            // config migration and worker setup. Never silently launch desktop
+            // Steam after a Dock handoff has been prepared.
+            profile?.applyEnvironment(dock: dock)
+            if profile != nil { logStore.log("[launch-route] ml1840 selected=\(dock ? "dock" : "profile") applied-after-config=1") }
 
             // ml734: Theorafile call tracer. Documents/madeira-tf-trace.txt == "1"
             // redirects libtheorafile's tf_* exports through wrappers in
@@ -5884,6 +6039,7 @@ struct ContentView: View {
             logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
             let t0 = CFAbsoluteTimeGetCurrent()
             let pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)
+            if let pool { StikJITHelper.rememberCompactPool(sizeMB: pool.size / 1024 / 1024, selected: compactDock) }
             let elapsed = CFAbsoluteTimeGetCurrent() - t0
             winios_phase("pool-ready")
             logStore.log("BRK suspension lasted \(String(format: "%.2f", elapsed))s")
@@ -7054,6 +7210,18 @@ final class TouchControlsModel: ObservableObject {
         DispatchQueue.main.async { OnScreenPad.shared.rearm() }
     }
 
+    /// ml1970 — DEVICE REPORT: with touch controls on, loading the Xbox layout left
+    /// every control dead until touch controls were turned off and on again. A layout
+    /// replaced outside an edit session never got the rebuild and pad re-arm an ended
+    /// edit gets (the toggle's effect). Do the same here, once SwiftUI has laid out the
+    /// new controls. MADEIRA_CONTROLS_LAYOUT_REFRESH=0 skips it.
+    func layoutReplaced(reason: String) {
+        guard LibraryFlags.enabled("MADEIRA_CONTROLS_LAYOUT_REFRESH") else { return }
+        epoch &+= 1
+        fputs("[controls-layout] ml1970 refreshed reason=\(reason) controls=\(controls.count) visible=\(visible)\n", stderr)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { OnScreenPad.shared.rearm() }
+    }
+
     /// ml670 — ONE SIZE KNOB FOR THE WHOLE LAYOUT, 0.5…2.0.
     ///
     /// The pinch that already exists scales ONE control, which is the right
@@ -7232,6 +7400,45 @@ final class ControlPresetsModel: ObservableObject {
         m.sizeScale = l.sizeScale
         activeID = p.id
         log("loaded", p, l.controls.count)
+        m.layoutReplaced(reason: "preset")
+    }
+
+    /// ml1970: the layout a game session remembers (LibraryEntry.controlLayout).
+    func setActive(_ id: String?) { activeID = id.flatMap { store.preset($0) != nil ? $0 : nil } }
+
+    /// ml1970: the landscape screen the session's controls are laid out on.
+    static func currentScreen() -> ControlPresetScreen {
+        let window = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows).first { $0.isKeyWindow }
+        guard let window, window.bounds.width > 0 else { return ControlPresetScreen.referencePhone }
+        let i = window.safeAreaInsets
+        let s = ControlPresetScreen(width: Double(window.bounds.width), height: Double(window.bounds.height),
+                                    left: Double(i.left), right: Double(i.right), top: Double(i.top), bottom: Double(i.bottom))
+        return s.width >= s.height ? s : s.landscape
+    }
+
+    /// ml1970: "Custom Layout N", the lowest N not taken.
+    func nextCustomName() -> String {
+        var n = 1
+        while store.named("Custom Layout \(n)") != nil { n += 1 }
+        return "Custom Layout \(n)"
+    }
+
+    /// ml1970: "Create new layout": an empty user layout, made active, for the editor to fill.
+    @discardableResult func createLayout() -> String? {
+        guard !readOnly else { return nil }
+        var s = store
+        guard case .created(let id) = s.save(name: nextCustomName(), controls: [], sizeScale: 1.0) else { return nil }
+        store = s
+        persist()
+        let m = TouchControlsModel.shared
+        m.selected = nil
+        m.controls = []
+        m.sizeScale = 1.0
+        activeID = id
+        log("created", store.preset(id), 0)
+        m.layoutReplaced(reason: "new-layout")
+        return id
     }
 
     /// Save the editor's current layout under a name. See `ControlPresetStore.save`.
@@ -7613,11 +7820,26 @@ struct TouchControlsOverlay: View {
             // cluster's own clamped, persisted position (hudBaseCenter/
             // commitHudDrag below) rather than needing a second one of its
             // own. A tap exits; only the grip drags.
-            glassButton("arrow.down.right.and.arrow.up.left") {
-                if library.current != nil { m.editing = false; library.showMenu() }
-                else { fullscreenState.active = false }
+            // ml1970: while editing, a Done button ends the edit (and keeps it in the active
+            // custom layout) in place of the exit arrows; the show/hide-controls glyph from the
+            // older interface is gone from the editor. MADEIRA_CONTROLS_EDITOR_DONE=0 restores both.
+            if m.editing && Self.editorDone {
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    finishEditing()
+                } label: {
+                    Text("Done").font(.system(size: 16, weight: .semibold)).foregroundStyle(.white)
+                        .padding(.horizontal, 18).frame(height: 44).background(GlassShape())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Done editing controls")
+            } else {
+                glassButton("arrow.down.right.and.arrow.up.left") {
+                    if library.current != nil { m.editing = false; library.showMenu() }
+                    else { fullscreenState.active = false }
+                }
+                glassButton("gamecontroller", dim: !m.visible) { m.visible.toggle() }
             }
-            glassButton("gamecontroller", dim: !m.visible) { m.visible.toggle() }
             // ml663: landscape is where a keyboard and mouse are actually used,
             // so the escape hatch from pointer lock has to be reachable HERE —
             // by touch, which pointer lock does not affect. (Ctrl+Alt+P does the
@@ -7637,9 +7859,11 @@ struct TouchControlsOverlay: View {
                     HardwareInput.shared.togglePointerLock()
                 }
             }
-            glassButton(m.editing ? "checkmark" : "pencil") {
-                m.editing.toggle()
-                if !m.editing { m.selected = nil }
+            if !(m.editing && Self.editorDone) {
+                glassButton(m.editing ? "checkmark" : "pencil") {
+                    m.editing.toggle()
+                    if !m.editing { m.selected = nil }
+                }
             }
             if m.editing {
                 glassButton("plus") {
@@ -7653,7 +7877,8 @@ struct TouchControlsOverlay: View {
                 .transition(.opacity.combined(with: .scale))
                 // ml1530: named layouts (load / save / manage), edit mode only.
                 // MADEIRA_CONTROL_PRESETS=0 hides it.
-                if ControlPresetsModel.enabled {
+                // ml1970: layouts are chosen in the session menu now (Controller layout).
+                if ControlPresetsModel.enabled && !Self.editorDone {
                     ControlPresetsMenu(screen: presetScreen(in: geo))
                         .transition(.opacity.combined(with: .scale))
                 }
@@ -7839,6 +8064,19 @@ struct TouchControlsOverlay: View {
     /// ml1530: the screen a built-in preset is laid out on — this overlay's
     /// full size (it ignores the safe area, as the controls' normalised
     /// positions do) and the insets it reports.
+    static let editorDone = LibraryFlags.enabled("MADEIRA_CONTROLS_EDITOR_DONE")
+
+    /// ml1970: Done in the editor. Edits to a custom layout are kept in that layout (a
+    /// built-in stays as shipped; the game's own profile still saves the edited copy).
+    private func finishEditing() {
+        let presets = ControlPresetsModel.shared
+        if let active = presets.active, !ControlPresetStore.isBuiltIn(active.id) { _ = presets.saveActive() }
+        m.selected = nil
+        m.editing = false
+        if library.current != nil { library.saveCurrentProfile() }
+        fputs("[controls-edit] ml1970 done layout=\(presets.active?.name ?? "-") controls=\(m.controls.count)\n", stderr)
+    }
+
     private func presetScreen(in geo: GeometryProxy) -> ControlPresetScreen {
         let i = geo.safeAreaInsets
         return ControlPresetScreen(width: Double(geo.size.width), height: Double(geo.size.height),

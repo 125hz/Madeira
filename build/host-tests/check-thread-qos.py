@@ -50,6 +50,10 @@ static TEB make( const char *path ) {
 }
 #define CHECK(c, m) do { if (!(c)) { printf( "FAIL: %s\n", m ); return 1; } } while (0)
 static void as( TEB *t ) { current_teb = t; pthread_setspecific( ios_park_key, NULL ); }  /* a different guest thread */
+static TEB freeze_teb; static volatile int freeze_released;
+static void *freeze_run( void *arg ) {   /* a listed thread of its own (pthread keys are per thread) */
+    (void)arg; current_teb = &freeze_teb; ios_park_check(); freeze_released = 1; return NULL;
+}
 static int park_tests( const char *mode ) {
     static WCHAR hp[] = { 'C',':','/','x','/','H','e','l','p','e','r','.','e','x','e' };
     static WCHAR gp[] = { 'C',':','/','x','/','g','a','m','e','.','e','x','e' };
@@ -64,6 +68,25 @@ static int park_tests( const char *mode ) {
     as( &h1 ); ios_park_check(); CHECK( term_calls == 0, "not armed: nothing ends" );
     madeira_set_background_qos( 1 );
     CHECK( ios_park_refuse( hp, 15 ) && !ios_park_refuse( gp, 13 ), "armed: only the listed program is refused (case-insensitive)" );
+    if (!strcmp( mode, "freeze" )) {   /* ml1790: held at the wait until the session ends */
+        pthread_t th;
+        freeze_teb = h1; pthread_create( &th, NULL, freeze_run, NULL );
+        usleep( 600000 ); CHECK( !freeze_released && term_calls == 0, "freeze: the listed thread is held, nothing ends" );
+        as( &h2 ); { TEB gg = make( "C:/x/game.exe" ); gg.ClientId.UniqueProcess = (void *)0x60; as( &gg ); ios_park_check(); }
+        CHECK( term_calls == 0, "freeze: the game passes its wait" );
+        CHECK( madeira_park_frozen() == 1, "freeze: the front end sees one held thread" );
+        if (!strcmp( getenv( "THAW" ) ? getenv( "THAW" ) : "", "1" )) {   /* ml1800: the watchdog */
+            madeira_park_thaw(); pthread_join( th, NULL );
+            CHECK( freeze_released && madeira_park_frozen() == 0, "thaw: the held thread goes on" );
+            freeze_released = 0; pthread_create( &th, NULL, freeze_run, NULL ); pthread_join( th, NULL );
+            CHECK( freeze_released && term_calls == 0, "thaw: no more freezing this session" );
+            madeira_set_background_qos( 0 );
+            printf( "PASS: the watchdog's thaw releases a frozen helper and stops further freezing\n" ); return 0;
+        }
+        madeira_set_background_qos( 0 ); pthread_join( th, NULL );
+        CHECK( freeze_released && term_calls == 0, "freeze: released when the session ends, never ended" );
+        printf( "PASS: a frozen helper is held at its wait, never ended, and released when the session ends\n" ); return 0;
+    }
     if (!strcmp( mode, "delay" )) {
         as( &h1 ); ios_park_check(); CHECK( term_calls == 0, "inside the delay: nothing ends" );
         printf( "PASS: the delay holds the helper\n" ); return 0;
@@ -147,6 +170,12 @@ with tempfile.TemporaryDirectory() as t:
     print(out.stdout, end=""); assert out.returncode == 0, out.stdout + out.stderr
     assert "[park] ml1520 ending helper.exe pid=0050" in out.stderr and "window returned" in out.stderr, out.stderr
     assert "[park] ml1520 refused restart #1 of Helper.exe" in out.stderr, out.stderr
+    out = subprocess.run([str(exe), "x", "freeze"], env=dict(park, MADEIRA_PARK_MODE="freeze"), capture_output=True, text=True)
+    print(out.stdout, end=""); assert out.returncode == 0, out.stdout + out.stderr
+    assert "[park] ml1790 freezing thread #1" in out.stderr and "[park] ml1790 frozen threads released" in out.stderr, out.stderr
+    out = subprocess.run([str(exe), "x", "freeze"], env=dict(park, MADEIRA_PARK_MODE="freeze", THAW="1"), capture_output=True, text=True)
+    print(out.stdout, end=""); assert out.returncode == 0, out.stdout + out.stderr
+    assert "[park] ml1800 thaw: 1 held thread(s) released" in out.stderr, out.stderr
     out = subprocess.run([str(exe), "x", "delay"], env=dict(park, MADEIRA_PARK_DELAY_S="30"), capture_output=True, text=True)
     print(out.stdout, end=""); assert out.returncode == 0, out.stdout + out.stderr
     out = subprocess.run([str(exe), "x", "parkoff"], env=dict(park, MADEIRA_PARK="0"), capture_output=True, text=True)

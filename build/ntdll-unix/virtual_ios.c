@@ -3112,7 +3112,7 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
  * RECYCLES already-poisoned VA (68 freelist/reclaim events this run) so it arrives poisoned.
  * Checking maxprot at hand-out time -- BEFORE anything is written -- separates them.
  * VM_PROT_COPY was already ruled out (zero RW+COPY events in the failing run). */
-static void ios_pool_check_range_exec( size_t off, size_t size, int reused )
+static unsigned ios_pool_check_range_exec( size_t off, size_t size, int reused )
 {
     extern void *ios_jit_rx_base_global;
     uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
@@ -3126,7 +3126,7 @@ static void ios_pool_check_range_exec( size_t off, size_t size, int reused )
      * ...). It reported "CLEAN at hand-out 24/24" and I wrongly concluded the copy path was
      * to blame; [poison-step] pre-memcpy then showed the pages already non-exec BEFORE the
      * copy. Check everything, print only what is interesting. */
-    if (!rx) return;
+    if (!rx) return 0;
 
     for (o = 0; o < size; o += 0x4000)
     {
@@ -3172,16 +3172,78 @@ static void ios_pool_check_range_exec( size_t off, size_t size, int reused )
     if (bad && checked < 30)
         dprintf( 2, "[pool-poison] off=0x%lx +0x%lx : %u poisoned pages, reused=%d\n",
                  (unsigned long)off, (unsigned long)size, bad, reused );
+    return bad;
+}
+
+/* ml2000: POOL-PRESSURE MARK. The early pool is sized by the app before Wine
+ * starts and cannot grow after the debugger detaches, so a session that runs
+ * the pool dry can only be fixed by the NEXT app run. Record the pressure once
+ * per process in Documents/madeira-pool-pressure.txt (the size in MB that was
+ * too small); the app reads and deletes it at its next start and sizes that
+ * run's early pool one step larger. Plain open/write: no allocation, no locks.
+ * MADEIRA_POOL_PRESSURE_MARK=0 disables the file. */
+static void ios_pool_pressure_mark( const char *why )
+{
+    static int marked;
+    const char *e = getenv( "MADEIRA_POOL_PRESSURE_MARK" );
+    const char *wp = getenv( "WINEPREFIX" );
+    const char *mb = getenv( "MADEIRA_POOL_MB" );
+    char path[512], line[64];
+    int fd, n;
+
+    if (marked || (e && e[0] == '0')) return;
+    marked = 1;
+    if (!wp || strlen( wp ) >= 440) return;
+    snprintf( path, sizeof(path), "%s/../madeira-pool-pressure.txt", wp );
+    if ((fd = open( path, O_WRONLY | O_CREAT | O_TRUNC, 0644 )) < 0) return;
+    n = snprintf( line, sizeof(line), "%d\n", mb ? atoi( mb ) : 0 );
+    if (n > 0 && write( fd, line, n ) < 0) n = 0;
+    close( fd );
+    dprintf( 2, "[pool-pressure] ml2000 %s pool=%s MB: next app run sizes the pool one step larger\n",
+             why, mb ? mb : "?" );
 }
 
 static size_t ios_pool_alloc_range( size_t alloc_size, size_t pool_limit )
 {
-    size_t off = ios_pool_alloc_range_ex( alloc_size, pool_limit, (size_t)-1, 0 );
+    /* ml1970: QUARANTINE A RANGE THAT IS ALREADY NON-EXECUTABLE.
+     *
+     * ml239 only reported such a range and handed it out anyway; the code copied
+     * there (the next 32-bit process's ntdll, device logs) then faulted NOEXEC at
+     * its first instruction, 2000 redeliveries, dead process. EXEC can never be
+     * restored to those pages, so leave them allocated forever and take the next
+     * range. Bounded: at most 16 attempts and 64 MB skipped per session, after
+     * which the old report-only behaviour resumes rather than draining the pool.
+     * MADEIRA_POOL_QUARANTINE=0 restores report-only at once. */
+    static int quarantine = -1;
+    static size_t skipped_total;
+    int attempt;
+    size_t off = (size_t)-1;
 
-    /* ml239: see ios_pool_check_range_exec. ios_pool_last_alloc_reused tells us whether
-     * this came off the freelist or the virgin bump, which is exactly the discriminator. */
-    if (off != (size_t)-1)
-        ios_pool_check_range_exec( off, alloc_size, ios_pool_last_alloc_reused );
+    if (quarantine < 0)
+    {
+        const char *e = getenv( "MADEIRA_POOL_QUARANTINE" );
+        quarantine = !(e && e[0] == '0');
+    }
+    for (attempt = 0; attempt < 16; attempt++)
+    {
+        unsigned bad;
+        off = ios_pool_alloc_range_ex( alloc_size, pool_limit, (size_t)-1, 0 );
+        if (off == (size_t)-1) break;
+        /* ml239: see ios_pool_check_range_exec. ios_pool_last_alloc_reused tells us whether
+         * this came off the freelist or the virgin bump, which is exactly the discriminator. */
+        bad = ios_pool_check_range_exec( off, alloc_size, ios_pool_last_alloc_reused );
+        if (!bad || !quarantine || skipped_total + alloc_size > (64u << 20)) break;
+        skipped_total += alloc_size;
+        {
+            static unsigned int n_q;
+            if (++n_q <= 24)
+                dprintf( 2, "[pool-quarantine] ml1970 off=0x%lx size=0x%lx poisoned=%u reused=%d "
+                         "(maxprot lacks EXEC) left allocated; skipped=%lu KB\n",
+                         (unsigned long)off, (unsigned long)alloc_size, bad,
+                         ios_pool_last_alloc_reused, (unsigned long)(skipped_total >> 10) );
+        }
+        off = (size_t)-1;
+    }
     return off;
 }
 
@@ -3371,6 +3433,20 @@ static int ios_tail_gen_livefit(void)
     return cached;
 }
 
+/* ml1990: see the wide-generation block in ios_tail_gen_cap(). */
+static int ios_tail_gen_wide(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *e = getenv( "MADEIRA_TAIL_GEN_WIDE" );
+        cached = (e && e[0] == '0') ? 0 : 1;
+        if (!cached)
+            dprintf( 2, "[pool-tail] ml1990 wide generation DISABLED by MADEIRA_TAIL_GEN_WIDE=0\n" );
+    }
+    return cached;
+}
+
 /* Bytes the tail may reserve in total. Callers must treat 0 as "refuse". */
 static size_t ios_tail_budget(void)
 {
@@ -3397,8 +3473,9 @@ static size_t ios_tail_live_hw;
 static size_t ios_tail_gen_cap(void)
 {
     enum { IOS_TAIL_GEN_MIN = 4u * 1024 * 1024, IOS_TAIL_GEN_MAX = 32u * 1024 * 1024,
-           IOS_TAIL_GENERATIONS = 16, IOS_TAIL_GEN_INFLIGHT = 4 };
-    size_t budget, cap, live = 0, headroom, want;
+           IOS_TAIL_GENERATIONS = 16, IOS_TAIL_GEN_INFLIGHT = 4,
+           IOS_TAIL_GEN_WIDE_HEADROOM = 64u * 1024 * 1024 };   /* ml1990 */
+    size_t budget, cap, live = 0, headroom = 0, want;
     static size_t forced;
     static int forced_done;
 
@@ -3468,6 +3545,41 @@ static size_t ios_tail_gen_cap(void)
     }
     if (cap > IOS_TAIL_GEN_MAX) cap = IOS_TAIL_GEN_MAX;
     if (cap < IOS_TAIL_GEN_MIN) cap = IOS_TAIL_GEN_MIN;
+    /* ml1990: A WIDE GENERATION WHEN THE TAIL CAN CLEARLY HOLD ONE.
+     *
+     * Device log: budget=104 MB, live=32 MB, gen_cap=16 MB, and FEX replaced its
+     * code buffer about every 0.7 s — each rotation throws away every block
+     * compiled into the outgoing buffer.  The live-fit rule above divides the
+     * headroom by four in-flight generations, so 72 MB of headroom rounds to
+     * 18 -> 16 MB even though a 32 MB generation plus the swap's own outgoing
+     * buffer fits twice over.  With >= 64 MB of headroom over the measured live
+     * high-water, grant the full 32 MB.  Below that the previous rule stands,
+     * the three-quarters-committed halving below still applies, and the
+     * reservation-site budget check still bounds total tail use.
+     * MADEIRA_TAIL_GEN_WIDE=0 restores the ml1100 cap exactly. */
+    /* ml2000: ...and only while iOS itself has room. A device log's scene load
+     * reached the jetsam limit with a 32 MB generation just granted; the pool
+     * counts against that limit. Below 512 MB of process headroom keep the
+     * previous cap. */
+    if (headroom >= IOS_TAIL_GEN_WIDE_HEADROOM && cap < IOS_TAIL_GEN_MAX && ios_tail_gen_wide())
+    {
+        extern size_t os_proc_available_memory( void );
+        size_t avail = os_proc_available_memory();
+        if (avail && avail < ((size_t)512 << 20)) goto ios_tail_gen_narrow;
+    }
+    if (headroom >= IOS_TAIL_GEN_WIDE_HEADROOM && cap < IOS_TAIL_GEN_MAX && ios_tail_gen_wide())
+    {
+        static volatile int wide_logged;
+        if (__sync_bool_compare_and_swap( &wide_logged, 0, 1 ))
+            dprintf( 2, "[pool-tail] ml1990 wide generation: headroom=%lu MB (budget %lu MB - live hw %lu MB) "
+                        ">= %lu MB -> gen_cap %lu -> %lu MB (MADEIRA_TAIL_GEN_WIDE=0 disables)\n",
+                     (unsigned long)(headroom >> 20), (unsigned long)(budget >> 20),
+                     (unsigned long)(ios_tail_live_hw >> 20),
+                     (unsigned long)(IOS_TAIL_GEN_WIDE_HEADROOM >> 20),
+                     (unsigned long)(cap >> 20), (unsigned long)(IOS_TAIL_GEN_MAX >> 20) );
+        cap = IOS_TAIL_GEN_MAX;
+    }
+ios_tail_gen_narrow:
     /* Late threads must still get a REAL buffer: once three quarters of the
      * budget is committed, halve the grant once so the remaining quarter is
      * shared rather than swallowed by one hot thread. */
@@ -3655,11 +3767,69 @@ void *ios_jit_teb_trampoline = NULL;  /* RX address of slot 0 trampoline (offset
 #define IOS_JIT_MAX_SLOTS 256         /* Max threads with trampolines */
 static volatile int32_t ios_jit_next_slot = 0;  /* Next slot to allocate */
 
-/* Allocate a per-thread trampoline slot. Returns slot index (0-based). */
+/* ml1990: TRAMPOLINE SLOTS ARE RETURNED WHEN THEIR THREAD EXITS.
+ *
+ * Slots were append-only, so after 256 thread starts in a session every new
+ * thread got slot 0 — and init_syscall_frame then wrote ITS TEB into slot 0,
+ * which is the session's first thread's slot: that thread's next x18 restore
+ * loaded a foreign TEB.  Now the exiting thread hands its slot back
+ * (ios_thread_registry_exit_self, on the thread itself, after its last guest
+ * code), or the registry does when it reclaims a provably dead thread's row.
+ * Slot 0 is never recycled and never handed out twice.  Exhaustion returns -1:
+ * the thread runs without a trampoline, which every redirect site already
+ * handles (they all require a non-NULL trampoline).
+ * MADEIRA_TRAMP_RECLAIM=0 restores the append-only allocator and its slot-0
+ * fallback. */
+static volatile int32_t ios_jit_slot_free[IOS_JIT_MAX_SLOTS];   /* 1 = on the free list */
+
+int ios_jit_tramp_reclaim_enabled(void)
+{
+    static volatile int cached = -1;
+    if (cached < 0)
+    {
+        const char *e = getenv( "MADEIRA_TRAMP_RECLAIM" );
+        int v = (e && e[0] == '0') ? 0 : 1;
+        if (__sync_bool_compare_and_swap( &cached, -1, v ))
+            dprintf( 2, "[tramp-slot] ml1990 reclaim=%d max=%d (MADEIRA_TRAMP_RECLAIM=0 rolls back)\n",
+                     v, IOS_JIT_MAX_SLOTS );
+    }
+    return cached;
+}
+
+/* Allocate a per-thread trampoline slot. Returns slot index (0-based), or -1
+ * (ml1990) when every slot belongs to a live thread. */
 int ios_jit_alloc_trampoline_slot(void)
 {
-    int slot = __sync_fetch_and_add(&ios_jit_next_slot, 1);
-    if (slot >= IOS_JIT_MAX_SLOTS) return 0;  /* fallback to slot 0 */
+    int slot;
+
+    if (!ios_jit_tramp_reclaim_enabled())
+    {
+        slot = __sync_fetch_and_add(&ios_jit_next_slot, 1);
+        if (slot >= IOS_JIT_MAX_SLOTS) return 0;  /* pre-ml1990: fallback to slot 0 */
+    }
+    else
+    {
+        for (;;)   /* a never-used slot first, without pushing the counter past the page */
+        {
+            int n = ios_jit_next_slot;
+            if (n >= IOS_JIT_MAX_SLOTS) { slot = -1; break; }
+            if (__sync_bool_compare_and_swap( &ios_jit_next_slot, n, n + 1 )) { slot = n; break; }
+        }
+        if (slot < 0)
+            for (slot = 1; slot < IOS_JIT_MAX_SLOTS; slot++)
+                if (ios_jit_slot_free[slot] &&
+                    __sync_bool_compare_and_swap( &ios_jit_slot_free[slot], 1, 0 ))
+                    break;
+        if (slot >= IOS_JIT_MAX_SLOTS || slot < 0)
+        {
+            static int exhausted_n;
+            if (++exhausted_n <= 8 || !(exhausted_n & (exhausted_n - 1)))
+                dprintf( 2, "[tramp-slot] ml1990 EXHAUSTED #%d: all %d slots owned by live threads -> "
+                            "this thread gets NO trampoline (slot 0 left alone)\n",
+                         exhausted_n, IOS_JIT_MAX_SLOTS );
+            return -1;
+        }
+    }
 
     /* Write trampoline code to this slot's RW view */
     if (ios_jit_rw_base_global)
@@ -3689,6 +3859,34 @@ void *ios_jit_get_trampoline(int slot)
     if (ios_jit_rx_base_global && slot >= 0 && slot < IOS_JIT_MAX_SLOTS)
         return (char *)ios_jit_rx_base_global + slot * 16 + 8;
     return NULL;
+}
+
+/* ml1990: return a slot.  Its TEB word is zeroed first, so a stale jump through
+ * it can only load x18 = 0 (the ordinary "x18 lost" case every handler already
+ * services), never a TEB that belongs to nobody or to a later owner's peer. */
+void ios_jit_free_trampoline_slot(int slot)
+{
+    if (!ios_jit_tramp_reclaim_enabled()) return;
+    if (slot <= 0 || slot >= IOS_JIT_MAX_SLOTS) return;   /* slot 0 is never recycled */
+    if (slot >= ios_jit_next_slot) return;                /* never handed out */
+    ios_jit_set_teb_slot( slot, 0 );
+    __sync_synchronize();
+    if (!__sync_bool_compare_and_swap( &ios_jit_slot_free[slot], 0, 1 ))
+    {
+        static int dbl_n;
+        if (++dbl_n <= 8)
+            dprintf( 2, "[tramp-slot] ml1990 slot %d freed twice (ignored)\n", slot );
+    }
+}
+
+/* ml1990: the registry stores the RX trampoline address, not the slot. */
+void ios_jit_free_trampoline(void *rx_trampoline)
+{
+    uintptr_t rx = (uintptr_t)ios_jit_rx_base_global, t = (uintptr_t)rx_trampoline;
+
+    if (!rx || t < rx + 8) return;
+    if ((t - rx - 8) % IOS_JIT_TRAMPOLINE_SIZE) return;
+    ios_jit_free_trampoline_slot( (int)((t - rx - 8) / IOS_JIT_TRAMPOLINE_SIZE) );
 }
 
 /* Reverse of the JIT translation: pool alias → original PE VA. For the
@@ -6245,7 +6443,9 @@ struct file_view
     void         *base;          /* base address */
     size_t        size;          /* size in bytes */
     unsigned int  protect;       /* protection for all pages at allocation time and SEC_* flags */
+    unsigned int  madeira_creator_tid; /* ml1950: creation attribution, not current ownership */
 };
+static int madeira_va_diagnostics;
 
 /* per-page protection flags */
 #define VPROT_READ       0x01
@@ -9137,8 +9337,14 @@ static void ios_wow_band( ULONG_PTR *floor, ULONG_PTR *ceil )
     }
 }
 
+/* ml1750: set only while ios_wow_window_pick walks the spill range below. */
+static int ios_wow_spill_walk;
+#define IOS_WOW_SPILL_TOP ((ULONG_PTR)0x7b00000000)   /* one slot below the FEX band's start */
+
 static int ios_wow_band_ok( ULONG_PTR base, ULONG_PTR total )
 {
+    if (ios_wow_spill_walk)
+        return base >= IOS_WOW_CEF_POOLS_START && base + total <= IOS_WOW_SPILL_TOP;
     if (base < IOS_WOW_CEF_POOLS_START && base + total > IOS_WOW_CEF_POOLS_START)
         return 0;   /* would cross into the CEF pools / FEX band */
     if (base >= IOS_WOW_CEF_POOLS_START && base < IOS_WOW_FEX_BAND_END) return 0;
@@ -9546,6 +9752,37 @@ static ULONG_PTR ios_wow_window_pick( unsigned *guard_owned )
     if ((cand = ios_wow_carve_holdback_slots()) && ios_wow_window_try( cand, guard_owned ))
         return cand;
     if ((cand = ios_wow_extend_holdback_tail( guard_owned ))) return cand;
+
+    /* ml1750: THREE SLOTS ARE NOT ENOUGH FOR THE STEAM CLIENT'S FIRST GAME LAUNCH.
+     * On the 512 GB map the band is [0x7000000000 + pool, 0x7400000000): three
+     * windows. steam.exe, its web helper and SteamService.exe are all 32-bit, so
+     * the game's one-time installers (DirectX, PhysX, VC++ run by the install
+     * script) found no window, failed to boot (c00000e5) and the launch stalled at
+     * the next screen for minutes. The range above, [0x7400000000, 0x7c00000000),
+     * is kept for a 64-bit Chromium's PartitionAlloc pools; a 32-bit client uses
+     * none of it. Spill into it top-down, from 0x7a, when the band is full; each
+     * slot is still checked free before it is taken, so a 64-bit Chromium already
+     * there keeps its pools. MADEIRA_WOW_SPILL_CEF=0 disables this. */
+    {
+        const char *e = getenv( "MADEIRA_WOW_SPILL_CEF" );
+        if (!(e && e[0] == '0') && ceil <= IOS_WOW_CEF_POOLS_START && floor >= (ULONG_PTR)0x7000000000ULL)
+        {
+            ios_wow_spill_walk = 1;
+            for (cand = IOS_WOW_SPILL_TOP - IOS_WOW_WINDOW_SIZE; cand >= IOS_WOW_CEF_POOLS_START;
+                 cand -= IOS_WOW_WINDOW_SIZE)
+            {
+                if (ios_wow_window_try( cand, guard_owned ))
+                {
+                    ios_wow_spill_walk = 0;
+                    dprintf( 2, "[wow-window] ml1750 band full: SPILLED into the Chromium pool range "
+                                "B=%p..%p (MADEIRA_WOW_SPILL_CEF=0 disables)\n",
+                             (void *)cand, (void *)(cand + IOS_WOW_WINDOW_SIZE) );
+                    return cand;
+                }
+            }
+            ios_wow_spill_walk = 0;
+        }
+    }
 
     ERR( "[wow-window] no free 4GB-ALIGNED slot in [%p,%p) — a 32-bit process "
          "cannot start (misaligned windows are not allowed, and a slot whose "
@@ -10603,7 +10840,7 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
              * the stub): a 32-bit title is the whole reason this exists, and
              * its thunks convert the struct wg_media_type / struct wg_sample
              * pointers that the 32-bit layouts place at different offsets. */
-            libname = "winegstreamer (wma via libavcodec)";
+            libname = "winegstreamer (wma + wg_parser ml1980, libav*)";
             funcs64 = (const void *)winegstreamer_unix_call_funcs;
             funcs_wow64 = (const void *)winegstreamer_unix_call_wow64_funcs;
         } else if (match && strstr(match, "nsi.dll")) {
@@ -12087,11 +12324,45 @@ static void unregister_view( struct file_view *view )
  *
  * Deletes a view. virtual_mutex must be held by caller.
  */
+/* ml1850: FreeLibrary can release an image and map another of the SAME size
+ * at the SAME base. The mprotect_exec containment check then accepts the old
+ * pool copy, even though its code belongs to the unloaded module. Retire the
+ * translations before the VA can be reused. Keep the pool allocation in its
+ * existing process ledger; recycling executable bytes here would race readers.
+ * virtual_mutex is held by delete_view, as for the existing window purge.
+ * MADEIRA_JIT_IMAGE_RETIRE=0 restores the previous lifetime for diagnosis. */
+static void ios_jit_retire_image( void *base, size_t size )
+{
+    const char *env = getenv( "MADEIRA_JIT_IMAGE_RETIRE" );
+    uintptr_t start = (uintptr_t)base;
+    int i, retired = 0;
+    static unsigned reports;
+    if (!size || (env && !strcmp( env, "0" ))) return;
+    pthread_mutex_lock( &ios_pool_lock );
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uintptr_t mapped = (uintptr_t)ios_jit_mappings[i].pe_base;
+        size_t length = ios_jit_mappings[i].size;
+        if (!mapped || !length) continue;
+        /* Subtraction avoids overflowing either end of an address interval. */
+        if (mapped >= start ? mapped - start >= size : start - mapped >= length) continue;
+        ios_jit_mappings[i].size = 0;
+        __sync_synchronize();
+        ios_jit_mappings[i].pe_base = NULL;
+        retired++;
+    }
+    pthread_mutex_unlock( &ios_pool_lock );
+    if (retired && __atomic_fetch_add( &reports, 1, __ATOMIC_RELAXED ) < 32)
+        dprintf( 2, "[jit-image-retire] ml1850 unmapped=%p size=%#lx translations=%d\n",
+                 base, (unsigned long)size, retired );
+}
+
 static void delete_view( struct file_view *view ) /* [in] View */
 {
     /* ml989: entered BEFORE any field of `view` is read, so "call never
      * entered" is distinguishable from "died reading the view". */
     if (ios_retire_trace_armed) ios_retire_mark( "D0>\n" );
+    if (view->protect & SEC_IMAGE) ios_jit_retire_image( view->base, view->size );
     ios_swap_release_range( view->base, view->size, 0 );   /* ml1077 */
     if (!(view->protect & VPROT_SYSTEM)) unmap_area( view->base, view->size );
     if (ios_retire_trace_armed) ios_retire_mark( "D1u\n" );   /* unmap_area done */
@@ -12161,6 +12432,8 @@ static NTSTATUS create_view( struct file_view **view_ret, void *base, size_t siz
     view->base    = base;
     view->size    = size;
     view->protect = vprot;
+    view->madeira_creator_tid = madeira_va_diagnostics && NtCurrentTeb()
+        ? (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0;
     if (use_kernel_writewatch) vprot &= ~VPROT_WRITEWATCH;
     set_page_vprot( base, size, vprot );
 
@@ -12879,6 +13152,11 @@ static void *ios_share_probe_thread(void *arg)
  * dprintf(2,...), never a wine log macro. This flag lets shared helpers that
  * legitimately log on normal threads stay silent on that one. */
 volatile int ios_in_mach_exc;
+/* ml2000: the faulting thread's TEB while ios_in_mach_exc is raised (set by
+ * signal_arm64_ios.c's delivery wrapper; there is one exception-server thread),
+ * so a helper running on that TEB-less thread can still ask "which
+ * pseudo-process is this for?".  0 otherwise. */
+volatile uintptr_t ios_mach_exc_teb;
 
 /***********************************************************************
  *           ios_guest_image_is_host_data      (iOS-Madeira ml1030)
@@ -12921,6 +13199,146 @@ static int ios_guest_image_is_host_data( const void *base, size_t size )
     if (!ios_wow_in_window( base )) return 0;
     if (!(view = find_view( base, size ))) return 0;
     return (view->protect & SEC_IMAGE) != 0;
+#else
+    return 0;
+#endif
+}
+
+/***********************************************************************
+ *           ios_guest_rwx_is_host_data      (iOS-Madeira ml2000)
+ *
+ * TRUE for an anonymous PAGE_EXECUTE_* request in an ARM64EC (x64-guest)
+ * process whose bytes the host never executes.
+ *
+ * WHY. By the ARM64EC rules, executable memory that was NOT allocated with
+ * MEM_EXTENDED_PARAMETER_EC_CODE is x64 code: arm64x_check_call finds no bit
+ * in the EC bitmap and hands every branch into it to the emulator, which READS
+ * the bytes and runs its own translation out of the JIT pool.  So VPROT_EXEC on
+ * such a page is Wine bookkeeping with no host meaning (the ml1030 argument,
+ * extended from 32-bit image pages to 64-bit anonymous memory).
+ *
+ * WHAT IT COST. The anonymous-RWX path below carves every such region into the
+ * JIT pool (guest VA = pool RX alias, writes Mach-fault into the store
+ * emulator).  A managed runtime that allocates its whole GC heap with
+ * PAGE_EXECUTE_READWRITE then pays one emulated store fault per guest store to
+ * its own heap (measured ~120-134k faults/s, the exception thread at ~70% of a
+ * core during load) and grows the pool towards exhaustion.  Evidence that the
+ * host never needs execute there: store-batch windows that failed to re-promote
+ * left such regions plain RW and the program kept running, and every observed
+ * exec redirect targets a copied DLL image, never an anonymous carve.
+ *
+ * THE CONTRACT. Such a range simply stays plain host memory: RW when the guest
+ * asks for write, R when the emulator arms its SMC write-trap
+ * (PAGE_EXECUTE_READ).  The emulator's normal protect-on-compile /
+ * unprotect-on-write-fault tracking then provides code coherence exactly as on
+ * Windows (see InvalidationTracker.cpp ml2000).
+ *
+ * Returns 1 only when ALL of these hold, otherwise the old path runs:
+ *   - MADEIRA_GUEST_RWX_DATA is not "0";
+ *   - this is a normal thread (not the Mach exception server) whose own
+ *     pseudo-process is ARM64EC with an x64 main image, and is not WoW64
+ *     (pseudo-processes share one address space, so the CURRENT process is
+ *     asked, and the address must not lie in ANY 32-bit guest window);
+ *   - the address is not inside the JIT pool;
+ *   - a Wine view covers the range and it is not SEC_IMAGE (loaded images
+ *     keep the proven image-copy path), not a system view and not an
+ *     ARM64EC-code view;
+ *   - the request is not an EC_CODE allocation in progress and no EC-bitmap
+ *     bit is set anywhere in the range (host ARM64 code needs real execute);
+ *   - no existing anonymous JIT alias overlaps it (ranges carved earlier keep
+ *     their old handling for their whole lifetime).
+ * virtual_mutex is held by every caller (mprotect_range from set_vprot). */
+static int ios_ec_code_request;    /* ml2000: EC_CODE allocation in progress (under virtual_mutex) */
+static unsigned long long ios_rwx_data_bytes;   /* ml2000: bytes of RWX requests served as host data */
+static unsigned long ios_rwx_data_n;
+
+static int ios_guest_rwx_data_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *s = getenv( "MADEIRA_GUEST_RWX_DATA" );
+        cached = (s && *s == '0') ? 0 : 1;
+        dprintf( 2, "[rwx-data] ml2000 MADEIRA_GUEST_RWX_DATA=%s -> %s (anonymous x64-guest RWX memory stays "
+                    "plain host RW/R instead of being carved into the JIT pool)\n",
+                 s ? s : "(unset)", cached ? "ENABLED" : "DISABLED (legacy pool carve)" );
+    }
+    return cached;
+}
+
+/* ml2000 ec-bitmap scan begin */
+/* Nonzero when any ARM64EC bitmap bit is set for a 4 KB page overlapping
+ * [b, e), or when the range reaches past the bitmap (`words` UINT64s).  Same
+ * 4KB-page indexing as set_arm64ec_range / arm64x_check_call; the bitmap view
+ * is mapped committed-readable for its whole size, so an untouched word reads
+ * as zero. */
+static int ios_ec_bitmap_any( const UINT64 *map, size_t words, uintptr_t b, uintptr_t e )
+{
+    size_t idx = b >> 12, end = (e + 0xfff) >> 12, pos;
+
+    if (e <= b) return 0;
+    for (pos = idx / 64; pos <= (end - 1) / 64; pos++)
+    {
+        UINT64 bits;
+        if (pos >= words) return 1;
+        bits = map[pos];
+        if (pos == idx / 64) bits &= ~(UINT64)0 << (idx & 63);
+        if (pos == (end - 1) / 64 && (end & 63)) bits &= ~(~(UINT64)0 << (end & 63));
+        if (bits) return 1;
+    }
+    return 0;
+}
+/* ml2000 ec-bitmap scan end */
+
+static int ios_guest_rwx_is_host_data( const void *base, size_t size )
+{
+#ifdef WINE_IOS
+    extern const SECTION_IMAGE_INFORMATION *ios_image_info_for_peb( void *peb_id );
+    extern void *ios_jit_rx_base_global;
+    extern void *ios_jit_rw_base_global;
+    extern size_t ios_jit_pool_size_global;
+    struct file_view *view;
+    uintptr_t b = (uintptr_t)base, e = (uintptr_t)base + size;
+    uintptr_t ov_b = 0, ov_e = 0;
+    void *peb;
+
+    if (!size || e < b) return 0;
+    if (!ios_guest_rwx_data_enabled()) return 0;
+    if (!arm64ec_view) return 0;
+    if (ios_ec_code_request) return 0;
+
+    /* Which pseudo-process asks?  A normal thread answers through its own TEB.
+     * The Mach exception-server thread has none; while it services a fault it
+     * publishes the FAULTING thread's TEB (ios_mach_exc_teb), which is the
+     * process the page/SEH machinery is acting for.  Unknown => old path. */
+    peb = ios_jit_current_peb();
+    if (!peb && ios_in_mach_exc && ios_mach_exc_teb)
+    {
+        uint64_t p = 0;
+        if (!ios_safe_read64( (uint64_t)ios_mach_exc_teb + 0x60, &p )) peb = (void *)(uintptr_t)p;
+    }
+    if (!peb) return 0;
+    if (ios_wow_base_for_peb( peb )) return 0;     /* the ASKING process is 32-bit */
+    if (peb == ios_jit_current_peb() && ios_wow_base()) return 0;   /* window reserved, not yet bound */
+    if (ios_wow_addr_in_any_window( base ) || ios_wow_addr_in_any_window( (const char *)base + size - 1 ))
+        return 0;
+    /* x64 main image => ARM64EC on this (always ARM64) host; anything else keeps the old path */
+    if (ios_image_info_for_peb( peb )->Machine != IMAGE_FILE_MACHINE_AMD64) return 0;
+    {
+        uintptr_t rx = (uintptr_t)ios_jit_rx_base_global, rw = (uintptr_t)ios_jit_rw_base_global;
+        size_t ps = ios_jit_pool_size_global;
+        if (ps && rx && b < rx + ps && e > rx) return 0;
+        if (ps && rw && b < rw + ps && e > rw) return 0;
+    }
+    if (!(view = find_view( base, size ))) return 0;
+    if (view->protect & (SEC_IMAGE | VPROT_SYSTEM | VPROT_ARM64EC)) return 0;
+
+    /* Any EC-bitmap bit in the range means host ARM64 code lives here; beyond
+     * the bitmap is "unknown".  Either way: keep the old path. */
+    if (ios_ec_bitmap_any( arm64ec_view->base, arm64ec_view->size / sizeof(UINT64), b, e )) return 0;
+
+    if (ios_jit_anon_alias_overlaps( (void *)base, size, &ov_b, &ov_e )) return 0;
+    return 1;
 #else
     return 0;
 #endif
@@ -12978,6 +13396,28 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                      (unix_prot & PROT_WRITE) ? 'w' : '-' );
         unix_prot &= ~PROT_EXEC;
         if (!unix_prot) unix_prot = PROT_READ;   /* PAGE_EXECUTE alone: readable is the honest answer */
+    }
+
+    /* iOS-Madeira ml2000: ANONYMOUS x64-GUEST RWX MEMORY IS DATA TO THE HOST.
+     * See ios_guest_rwx_is_host_data() for the argument and every condition.
+     * Dropping PROT_EXEC here routes the request to the plain vm_protect(RW) /
+     * mprotect step below; it never reaches the MZ scan or the anonymous pool
+     * carve.  MADEIRA_GUEST_RWX_DATA=0 restores the previous behaviour. */
+    if ((unix_prot & PROT_EXEC) && ios_guest_rwx_is_host_data( base, size ))
+    {
+        ios_rwx_data_bytes += size;
+        if (++ios_rwx_data_n <= 24 || !(ios_rwx_data_n & 0xfff))
+            dprintf( 2, "[rwx-data] ml2000 #%lu %p+0x%lx prot=%c%c%c — x64-guest anonymous RWX, host never "
+                        "executes it; applying %c%c- (no JIT-pool carve). cumulative=%llu KB of such requests\n",
+                     ios_rwx_data_n, base, (unsigned long)size,
+                     (unix_prot & PROT_READ)  ? 'r' : '-',
+                     (unix_prot & PROT_WRITE) ? 'w' : '-',
+                     (unix_prot & PROT_EXEC)  ? 'x' : '-',
+                     (unix_prot & PROT_READ)  ? 'r' : '-',
+                     (unix_prot & PROT_WRITE) ? 'w' : '-',
+                     ios_rwx_data_bytes >> 10 );
+        unix_prot &= ~PROT_EXEC;
+        if (!unix_prot) unix_prot = PROT_READ;
     }
 #endif
 
@@ -13657,6 +14097,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                             (unsigned long)alloc_size, (unsigned long)jit_pool_offset, (unsigned long)jit_pool_size,
                             (unsigned long)ios_jit_tail_reserved, ios_pool_free_count,
                             getenv("MADEIRA_POOL_MB") ? getenv("MADEIRA_POOL_MB") : "?");
+                    ios_pool_pressure_mark( "anon-rwx" );
                     mprotect( base, size, PROT_READ );
                     errno = ENOMEM;
                     return -1;
@@ -13869,6 +14310,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                         (unsigned long)jit_pool_offset, (unsigned long)jit_pool_size,
                         (unsigned long)ios_jit_tail_reserved, ios_pool_free_count,
                         getenv("MADEIRA_POOL_MB") ? getenv("MADEIRA_POOL_MB") : "?");
+                ios_pool_pressure_mark( "image" );
                 mprotect( base, size, PROT_READ );
                 errno = ENOMEM;
                 return -1;
@@ -14168,7 +14610,43 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                         uintptr_t sec_abs = (uintptr_t)((char *)jit_rx_base + offset + sec_rva);
                         uintptr_t sec_abs_end = (sec_abs + sec_vsize + page_size - 1) & ~(page_size - 1);
                         void *target = (void *)(sec_abs & ~(uintptr_t)(page_size - 1));
-                        size_t sec_page_size = sec_abs_end - (uintptr_t)target;
+                        size_t sec_page_size;
+                        /* ml1970: NEVER PROTECT POOL PAGES BEYOND THIS COPY.
+                         *
+                         * A manually mapped image (a DRM loader's in-memory DLL, not
+                         * a loader-mapped file) can declare a writable section that
+                         * runs past the memory its mapper allocated -- and so past
+                         * the image_size bytes copied here. The RW mprotect above
+                         * then reached the NEXT pool pages. On blessed pool memory
+                         * that drops EXECUTE from max_protection for good (ml140),
+                         * so every later hand-out there was born non-executable:
+                         * device logs show [pool-poison] starting exactly at such an
+                         * image's allocation end, after which the next 32-bit
+                         * process's ntdll copy faulted at its very first instruction.
+                         * Clamp to the pages this copy owns. MADEIRA_POOL_SECTION_CLAMP=0
+                         * restores the unclamped range. */
+                        {
+                            static int clamp = -1;
+                            uintptr_t limit = ((uintptr_t)((char *)jit_rx_base + offset + image_size)
+                                               + page_size - 1) & ~(uintptr_t)(page_size - 1);
+                            if (clamp < 0)
+                            {
+                                const char *e = getenv( "MADEIRA_POOL_SECTION_CLAMP" );
+                                clamp = !(e && e[0] == '0');
+                            }
+                            if (clamp && sec_abs_end > limit)
+                            {
+                                static unsigned int n_clamped;
+                                if (++n_clamped <= 16)
+                                    dprintf( 2, "[pool-guard] ml1970 %s section rva=0x%x vsize=0x%x runs past "
+                                             "the 0x%lx-byte pool copy: RW limited to the copy's own pages\n",
+                                             ios_pe_module_name( image_base, image_size ), sec_rva, sec_vsize,
+                                             (unsigned long)image_size );
+                                sec_abs_end = limit;
+                            }
+                            if (sec_abs_end <= (uintptr_t)target) continue;
+                        }
+                        sec_page_size = sec_abs_end - (uintptr_t)target;
 
                         /* Try mprotect to make data section writable (drops execute) */
                         if (mprotect(target, sec_page_size, PROT_READ | PROT_WRITE) == 0)
@@ -14640,7 +15118,15 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
             if ((chars & 0x80000000) && vsz)  /* IMAGE_SCN_MEM_WRITE */
             {
                 size_t p_off = rva & ~(pg - 1);
-                size_t p_sz = ((rva + vsz + pg - 1) & ~(pg - 1)) - p_off;
+                size_t p_end = ((size_t)rva + vsz + pg - 1) & ~(pg - 1);
+                size_t p_lim = ((size_t)m->size + pg - 1) & ~(pg - 1);
+                size_t p_sz;
+                /* ml1970: as in the image copy, never reach past this copy's pages. */
+                if (p_end > p_lim && !(getenv( "MADEIRA_POOL_SECTION_CLAMP" ) &&
+                                       getenv( "MADEIRA_POOL_SECTION_CLAMP" )[0] == '0'))
+                    p_end = p_lim;
+                if (p_end <= p_off) continue;
+                p_sz = p_end - p_off;
                 if (mprotect(rx_dest + p_off, p_sz, PROT_READ | PROT_WRITE) != 0)
                     dprintf(2, "[child-ntdll] mprotect RW failed for section RVA 0x%x (errno=%d)\n",
                             rva, errno);
@@ -15403,6 +15889,9 @@ static void ios_wow_va_census( const void *scan_start, const void *scan_end, siz
     unsigned nviews = 0, arena_chunks = 0, above_2g = 0, i, k;
     unsigned long long above_2g_bytes = 0;
     struct file_view *view;
+    struct { size_t size; unsigned int tid, n; unsigned long long bytes; } origins[128] = {{0}};
+    unsigned int origins_used = 0;
+    unsigned long long origins_other = 0;
 
     if (!base) return;
 
@@ -15414,6 +15903,20 @@ static void ios_wow_va_census( const void *scan_start, const void *scan_end, siz
         if (vb < base || vb >= base + IOS_WOW_WINDOW_SIZE) continue;
         nviews++;
         mapped += view->size;
+        if (madeira_va_diagnostics && view->size >= 0x100000 && !(view->protect & (SEC_IMAGE | SEC_FILE)))
+        {
+            for (i = 0; i < origins_used; i++)
+                if (origins[i].size == view->size && origins[i].tid == view->madeira_creator_tid) break;
+            if (i == ARRAY_SIZE(origins)) origins_other += view->size;
+            else
+            {
+                if (i == origins_used) origins_used++;
+                origins[i].size = view->size;
+                origins[i].tid = view->madeira_creator_tid;
+                origins[i].n++;
+                origins[i].bytes += view->size;
+            }
+        }
         if (vb >= base + limit_2g) { above_2g++; above_2g_bytes += view->size; }
 
         if (vb > prev_end)
@@ -15478,6 +15981,20 @@ static void ios_wow_va_census( const void *scan_start, const void *scan_end, siz
     for (i = 0; i < 8 && gap[i]; i++)
         dprintf( 2, "[wow-va]   gap#%u 0x%llx (%llu MB) at guest 0x%llx\n",
                  i + 1, gap[i], gap[i] >> 20, (unsigned long long)(gap_at[i] - base) );
+    if (madeira_va_diagnostics)
+    {
+        dprintf( 2, "[va-origin] ml1950 tracked-pairs=%u overflow=%lluKiB (anonymous live views >=1MiB; creator thread, not current owner)\n",
+                 origins_used, origins_other >> 10 );
+        for (k = 0; k < 8 && k < origins_used; k++)
+        {
+            unsigned int best = 0;
+            for (i = 1; i < origins_used; i++) if (origins[i].bytes > origins[best].bytes) best = i;
+            if (!origins[best].bytes) break;
+            dprintf( 2, "[va-origin] ml1950 tid=%04x size=%#lx live=%u bytes=%lluKiB\n",
+                     origins[best].tid, (unsigned long)origins[best].size, origins[best].n, origins[best].bytes >> 10 );
+            origins[best].bytes = 0;
+        }
+    }
 }
 #endif  /* WINE_IOS */
 
@@ -16717,6 +17234,7 @@ static NTSTATUS remove_pages_from_view( struct file_view *view, char *base, size
         new_view->base    = base + size;
         new_view->size    = (char *)view->base + view->size - (char *)new_view->base;
         new_view->protect = view->protect;
+        new_view->madeira_creator_tid = view->madeira_creator_tid;
 
         unregister_view( view );
         view->size = base - (char *)view->base;
@@ -18566,6 +19084,12 @@ void virtual_init(void)
     pthread_mutexattr_t attr;
 
     {
+        const char *e = getenv( "MADEIRA_VA_DIAGNOSTICS" );
+        madeira_va_diagnostics = e && !strcmp( e, "1" );
+        dprintf( 2, "[va-origin] ml1950 enabled=%d\n", madeira_va_diagnostics );
+    }
+
+    {
         const char *e = getenv( "MADEIRA_WOW64_BY_TEB" );
         if (e && e[0] == '0') ios_wow64_by_teb = 0;
         dprintf( 2, "[wow64-by-teb] ml1590 %s\n", ios_wow64_by_teb ? "on" : "off" );
@@ -19285,6 +19809,75 @@ TEB *virtual_alloc_first_teb(void)
 
 
 /***********************************************************************
+ *           teb_fifo_enabled / teb_fifo_take_oldest   (iOS-Madeira ml2000)
+ *
+ * [teb-fifo] Delay the reuse of an exited thread's TEB.
+ *
+ * DEVICE EVIDENCE (three identical runs of a 32-bit program): a short-lived
+ * thread exits and the very next thread created lands on exactly its TEB
+ * (and, through the heap, its TLS) because the free list is a LIFO stack.
+ * Anything still holding a pointer into the dead thread's TEB/TLS then
+ * writes into the live thread.  Windows does not recycle that aggressively.
+ *
+ * virtual_free_teb still pushes at the head (unchanged, address-keyed per
+ * window).  Allocation now takes the TAIL -- the block freed longest ago --
+ * and only when at least TEB_FIFO_MIN_FREE blocks are free; otherwise a
+ * fresh block is carved from the current 32-block reservation as before.
+ * The WoW64 window constraints are unaffected: each window keeps its own
+ * list, every block on it was allocated inside that window (the TEB32/PEB32
+ * layout derives from the block address exactly as for a fresh block), and
+ * init_teb/the [teb-window] check run identically on a recycled block.
+ * Cost: at most TEB_FIFO_MIN_FREE parked 64 KB blocks per list.
+ * MADEIRA_TEB_FIFO=0 restores newest-first reuse.
+ */
+#define TEB_FIFO_MIN_FREE 8
+
+static int teb_fifo_enabled(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_TEB_FIFO" );
+
+        on = !(e && e[0] == '0' && !e[1]);
+        dprintf( 2, "[teb-fifo] ml2000 enabled=%d min-free=%d\n", on, TEB_FIFO_MIN_FREE );
+    }
+    return on;
+}
+
+/* Unlink and return the oldest block of a TEB free list (frees push at the
+ * head, so the oldest is the tail), provided the list holds at least
+ * `min_free` blocks.  NULL otherwise.  virtual_mutex must be held. */
+static void *teb_fifo_take_oldest( void ***head, unsigned int min_free )
+{
+    void *cur = *head, *prev = NULL;
+    unsigned int n = 0;
+
+    if (!cur) return NULL;
+    for (;;)
+    {
+        void *next = *(void **)cur;
+
+        n++;
+        if (!next) break;
+        if (n >= 65536)  /* corrupt/cyclic list: never walk forever */
+        {
+            static int warned;
+            if (!warned++) dprintf( 2, "[teb-fifo] ml2000 free list too long or cyclic; not recycling\n" );
+            return NULL;
+        }
+        prev = cur;
+        cur = next;
+    }
+    if (n < min_free) return NULL;
+    if (prev) *(void **)prev = NULL;
+    else *head = NULL;
+    return cur;
+}
+
+
+/***********************************************************************
  *           virtual_alloc_teb
  */
 NTSTATUS virtual_alloc_teb( TEB **ret_teb )
@@ -19321,12 +19914,16 @@ NTSTATUS virtual_alloc_teb( TEB **ret_teb )
 #endif
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
-    if (*p_next_free_teb)
+    /* ml2000 [teb-fifo]: hand out the OLDEST free TEB, and only once at least
+     * TEB_FIFO_MIN_FREE are free; otherwise carve a fresh one (see
+     * teb_fifo_take_oldest).  MADEIRA_TEB_FIFO=0 restores newest-first reuse. */
+    if (teb_fifo_enabled()) ptr = teb_fifo_take_oldest( p_next_free_teb, TEB_FIFO_MIN_FREE );
+    else if (*p_next_free_teb)
     {
         ptr = *p_next_free_teb;
         *p_next_free_teb = *(void **)ptr;
-        memset( ptr, 0, teb_size );
     }
+    if (ptr) memset( ptr, 0, teb_size );
     else
     {
         if (!*p_teb_block_pos)
@@ -19381,8 +19978,18 @@ NTSTATUS virtual_alloc_teb( TEB **ret_teb )
             if (status && (status = NtAllocateVirtualMemory( NtCurrentProcess(), &ptr, zbits,
                                                              &total, MEM_RESERVE, PAGE_READWRITE )))
             {
-                server_leave_uninterrupted_section( &virtual_mutex, &sigset );
-                return status;
+                /* ml2000 [teb-fifo]: no room for a fresh block.  Reusing the
+                 * oldest free TEB (below the FIFO minimum) beats refusing the
+                 * thread; with the FIFO off the list is already empty here. */
+                ptr = teb_fifo_take_oldest( p_next_free_teb, 1 );
+                if (!ptr)
+                {
+                    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+                    return status;
+                }
+                memset( ptr, 0, teb_size );
+                status = STATUS_SUCCESS;
+                goto teb_ready;
             }
             *p_teb_block = ptr;
             *p_teb_block_pos = 32;
@@ -19391,6 +19998,7 @@ NTSTATUS virtual_alloc_teb( TEB **ret_teb )
         NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&ptr, 0, &block_size,
                                  MEM_COMMIT, PAGE_READWRITE );
     }
+teb_ready:
 #ifdef WINE_IOS
     /* LOUD, LOCAL FAILURE instead of a task-wide death.
      *
@@ -20249,6 +20857,35 @@ int ios_page_expected_prot( const void *addr )
     BYTE vprot = get_page_vprot( addr );
     if (!(vprot & VPROT_COMMITTED)) return -1;
     return get_unix_prot( vprot );
+}
+
+/* iOS-Madeira ml2000: the [wr-strip] reheal (signal_arm64_ios.c) restores
+ * ios_page_expected_prot() on a host page whose write was stripped.  For an
+ * anonymous x64-guest RWX page that is PROT_READ|PROT_WRITE|PROT_EXEC, which
+ * mprotect() refuses outside the JIT pool (EACCES) -- turning a healable strip
+ * into an access violation.  mprotect_exec() never applies EXEC to such a page
+ * (ios_guest_rwx_is_host_data), so the reheal must not ask for it either.
+ * Returns `want` unchanged unless the page qualifies.  Called from the faulting
+ * thread's own signal handler, like ios_page_vprot_explain(), which takes
+ * virtual_mutex the same way.  MADEIRA_GUEST_RWX_DATA=0 disables it. */
+int ios_guest_rwx_heal_prot( const void *addr, int want )
+{
+    sigset_t sigset;
+    int host_data;
+
+    if (want < 0 || !(want & PROT_EXEC) || !(want & PROT_WRITE)) return want;
+    if (!ios_guest_rwx_data_enabled() || ios_in_mach_exc) return want;
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    host_data = ios_guest_rwx_is_host_data( ROUND_ADDR( addr, host_page_mask ), host_page_size );
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    if (!host_data) return want;
+    {
+        static unsigned long heal_n;
+        if (++heal_n <= 8)
+            dprintf( 2, "[rwx-data] ml2000 wr-strip heal #%lu %p: x64-guest data page, restoring prot=%d "
+                        "instead of %d\n", heal_n, addr, want & ~PROT_EXEC, want );
+    }
+    return want & ~PROT_EXEC;
 }
 
 /***********************************************************************
@@ -21127,6 +21764,11 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
     if (va_stats) va_lock_ns = ios_va_now_ns() - va_t0;
+    /* ml2000: set_arm64ec_range() below runs AFTER the reserve/commit has already
+     * applied the protection through mprotect_range -> mprotect_exec, so tell
+     * ios_guest_rwx_is_host_data() now that this is host ARM64 code. Cleared
+     * before virtual_mutex is released. */
+    ios_ec_code_request = (attributes & MEM_EXTENDED_PARAMETER_EC_CODE) != 0;
 
     if ((type & MEM_RESERVE) || !base)
     {
@@ -21265,6 +21907,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
         commit_arm64ec_map( view );
         set_arm64ec_range( base, size );
     }
+    ios_ec_code_request = 0;   /* ml2000 */
 
     if (!status) VIRTUAL_DEBUG_DUMP_VIEW( view );
 
@@ -21344,9 +21987,22 @@ static void ios_vm_note_alloc( void *base, SIZE_T size, ULONG type, ULONG protec
      * which printed only the RESULT. Always log a violating or low-limited
      * request, regardless of the census budget. */
     int viol = (lim && b > lim);
+    /* ml1720: bounded. A WOW64 process lives in its own 4 GB window, so every one of its
+     * allocations carries zero_bits and lands "above" its 32-bit limit by design; the
+     * uncapped branch below logged each of them, 3.5 million lines (562 MB) in one device
+     * log. WOW64 is skipped except for the watch address, and the always-log branch is
+     * capped. MADEIRA_VALLOC_LOG_ALL=1 restores the old reach. */
+    static int log_all = -1;
+    static unsigned long special_logged;
+    int special = viol || zbits;
+    if (log_all < 0) { const char *e = getenv( "MADEIRA_VALLOC_LOG_ALL" ); log_all = e && e[0] == '1'; }
+    if (!log_all && !covers && is_wow64()) return;
     if (b < 0x100000000ull && !viol && !zbits) return;
-    if (covers || viol || zbits || ios_vm_alloc_logged < 3000)
+    if (covers || (special && (log_all || special_logged < 200)) || (!special && ios_vm_alloc_logged < 3000))
     {
+        if (special && !covers && ++special_logged == 200)
+            dprintf( 2, "[valloc] ml1720 limited/violating allocations: first 200 logged, the rest are not "
+                        "(MADEIRA_VALLOC_LOG_ALL=1 logs all)\n" );
         ios_vm_alloc_logged++;
         dprintf( 2, "[valloc] ml959 %s base=0x%llx size=0x%llx type=0x%x prot=0x%x tid=%04x"
                  " | req_hint=0x%llx zero_bits=0x%llx limit=0x%llx%s\n",
@@ -23711,6 +24367,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
                             (unsigned long)jit_pool_offset, (unsigned long)ios_jit_pool_size_global,
                             fn, (unsigned long)fb,
                             getenv("MADEIRA_POOL_MB") ? getenv("MADEIRA_POOL_MB") : "?");
+                ios_pool_pressure_mark( "fex-tail" );
             }
             return STATUS_NO_MEMORY;
         }

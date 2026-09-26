@@ -1243,6 +1243,14 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
             extern void ios_thread_died( unsigned tid );
             ios_thread_died( (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread );
         }
+        /* ml1990: this thread will never run guest code again — mark its Mach
+         * registry row EXITING (reclaimed once the kernel thread is dead) and
+         * return its x18 trampoline slot. Both used to leak for the session.
+         * MADEIRA_THREAD_REG_RECLAIM=0 / MADEIRA_TRAMP_RECLAIM=0 roll back. */
+        {
+            extern void ios_thread_registry_exit_self(void);
+            ios_thread_registry_exit_self();
+        }
     }
     pthread_exit( UIntToPtr(status) );
 }

@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import tempfile
+import dock_contract
 
 root = Path(__file__).resolve().parents[2]
 app = root / 'app/Madeira'
@@ -406,6 +407,9 @@ func appVDF(_ body: String) -> Data { Data(("\"appinfo\" { \"appid\" \"10\" " + 
         require(String(cString: getenv("MADEIRA_EXE")) == native.windowsPath && getenv("MADEIRA_DESKTOP") == nil,
                 "direct launch uses the game executable without a desktop session")
         native.steamClientLaunch = true
+        // ml1970: "Steam (more usage)": the regular client even while Madeira Dock is on.
+        native.steamDesktopLaunch = true
+        require(!MadeiraDock.routes(native), "the regular Steam choice bypasses Madeira Dock")
         do { try native.validate(); require(false, "client route needs an installed client") }
         catch { require(true, "client route needs an installed client") }
         native.steamClientPath = "Program Files (x86)/Steam/steam.exe"
@@ -484,7 +488,7 @@ func appVDF(_ body: String) -> Data { Data(("\"appinfo\" { \"appid\" \"10\" " + 
 
 with tempfile.TemporaryDirectory() as tmp:
     tmp = Path(tmp)
-    (tmp / 'stubs.swift').write_text(stubs + entry)
+    (tmp / 'stubs.swift').write_text(stubs + entry + dock_contract.source(app))
     (tmp / 'vdf.swift').write_text('import Foundation\n' + vdf)
     (tmp / 'helpers.swift').write_text('import Foundation\nimport Glibc\n' + helpers + journal + exe_search)
     (tmp / 'checks.swift').write_text(checks)

@@ -261,6 +261,9 @@ enum SteamServiceMethod: String {
     case getManifestRequestCode = "ContentServerDirectory.GetManifestRequestCode#1"
     case getCDNAuthToken = "ContentServerDirectory.GetCDNAuthToken#1"
     case getContentServers = "ContentServerDirectory.GetServers#1"
+
+    // Madeira ml1970: the account's own playtime / last played.
+    case getOwnedGames = "Player.GetOwnedGames#1"
 }
 
 // MARK: - Steam Result Codes

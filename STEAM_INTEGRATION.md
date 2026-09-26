@@ -925,6 +925,80 @@ What stays out: GameNative's DRM-free mode and any client-less use of steamclien
 
 Switches: MADEIRA_STEAM_WEBHELPER_STOP, MADEIRA_PARK, MADEIRA_PARK_DELAY_S, MADEIRA_NSI_NOTIFY_PENDING, MADEIRA_CEF_QUIET_LOG, MADEIRA_PROC_MEM, MADEIRA_STEAM_LAUNCH_STAGES.
 
+## ml1720–ml1780 (2026-09-24): first launch, one-time installs, what the client costs
+
+Rounds on the merged tree (Will's upstream through c8f6f27 / DXMT ca8a251). Device
+logs 44–51. All device-unverified unless stated.
+
+- **ml1720:** the license-agreement check reads the client's own folder (it read the
+  game's folder, so every agreement looked accepted). "Session Replaced" is another
+  login of the same account, not a rejected sign-in. valloc logging is capped (a log
+  reached 562 MB). Show Steam shows the desktop at once.
+- **ml1750 (verified):** when the 32-bit window band is full, a window spills into
+  [0x74_0000_0000, 0x7b_0000_0000) (`MADEIRA_WOW_SPILL_CEF=0`). The client's
+  redistributable installers got windows again (log 47).
+- **ml1760:** a drawn, dialog-sized window from an installer image (msiexec, DXSETUP,
+  vcredist/PhysX/dotnetfx helpers) auto-reveals the desktop
+  (`MADEIRA_STEAM_INSTALLER_REVEAL=0`).
+- **ml1770:** setup shows the client's install stage from `logs/bootstrap_log.txt`
+  ("Downloading Steam's update… 45%", "Opening Steam's sign-in window…";
+  `MADEIRA_SETUP_STAGES=0`, `[setup-stage] ml1770`). Log 48: a fresh install reaches
+  the web helper ~90 s after the installer starts and draws the login ~50 s later.
+- **ml1780, one-time installs:** logs 49/51 show the installers failing
+  (DXSETUP -9 every time, an MSI "Fatal Error", a vcredist child without a window)
+  and then the client itself ending (crash dump + exit 1) or its main thread looping
+  on a fault right after the install script. Before a client start Madeira now reads
+  the game's install scripts (`*.vdf` with "Run Process" in the install folder and one
+  level down, plus `Steamworks Shared/_CommonRedist`) and writes each entry's
+  HasRunKey value (DWORD ≥ MinimumHasRunValue, under both the key and its
+  `Wow6432Node` view) into the prefix's `system.reg`/`user.reg` while no session runs —
+  exactly the record the client writes after a successful run, so it skips them.
+  Wine supplies those runtimes. Per-game "Run Steam's one-time installs" opts back
+  in; `MADEIRA_STEAM_SKIP_INSTALLERS=0` disables; a "Skip one-time installs" button on
+  the starting screen (installers stage) ends the session and relaunches.
+  `[steam-installers] ml1780`. Reference: Steamworks "Creating and using InstallScripts".
+- **ml1780, app:** the early JIT pool starts 0.6 s after the first frame (its
+  debugger round trip stops the whole app for 3–4 s and kept the launch screen black;
+  `MADEIRA_JIT_EARLY_DEFER=0`); the renderer badge names an API only when the files
+  name exactly one (`MADEIRA_API_BADGE_STRICT=0`); the live log sits beside the status
+  on a landscape phone (`MADEIRA_LAUNCH_SIDE_LOG=0`).
+
+**ml1790** (device logs 52/53 of ml1780):
+- The install-script reader kept only the last of the repeated `"Run Process"`
+  sections (1 of 3 entries marked; the client still ran the others). A text reader
+  now keeps every section.
+- A second Wine session in one app run aborts in the wineserver's `init_registry`
+  (`Assertion failed: (root_key)`, log 52) — the skip button's in-process relaunch
+  and any Play after a session. Launches after the first session now ask for a
+  restart ("Close Madeira"); the skip button marks the installs after the session
+  stops and asks for a restart (`MADEIRA_ONE_SESSION_PER_RUN=0`, `[session-once] ml1790`).
+- The early JIT pool starts at app start again (`MADEIRA_JIT_EARLY_DEFER=1` defers).
+- Opt-in experiment `MADEIRA_STEAM_WEBHELPER_FREEZE=1`: the web helper's threads are
+  held at their next wait from 10 s after the game's window until the session ends
+  (`[park] ml1790`).
+- Log 53, game through the client: footprint ~4.6 GB (game 1.21 GB, helper 0.69 GB,
+  client 0.13 GB, 2.59 GB outside the 32-bit windows), 15–59 fps. Direct launches were
+  ~2.4–2.5 GB. Next: a headless host around the genuine client library,
+  `docs/STEAM_HOST_PLAN.md`.
+
+**ml1800:** the web helper freezes by default while a client-started game plays
+(`MADEIRA_STEAM_WEBHELPER_FREEZE=0` to keep it running), with a watchdog that thaws it
+if the game presents nothing for 6 s (`MADEIRA_STEAM_FREEZE_WATCHDOG=0`, `[park] ml1800`).
+Log 54 (freeze requested) stalled before sign-in with no freeze line: an unrelated,
+intermittent client start-up wait. Log 55: the scripts declare a HasRunKey only for one
+entry, so DirectX still runs (~14 s) each start.
+
+What the client costs while a game plays (log 5 (2), ml1710, ~6 min of play, no
+change made yet):
+- Web helper ~680 MB (dirty + compressed) of a ~4.5 GB footprint; client ~127 MB.
+- Web helper 0.27–0.42 cores for the first ~2.5 min while hidden, then 0.03–0.1. Most
+  of it is re-translation: its FEX code buffer (iOS cap 32 MB) rotates about once a
+  second (`[fex-stats] … +10 rotations` per 13 s, ~12k blocks/s compiled).
+- The client's main thread traps on one unaligned compare-and-swap ~45/s in play
+  (~220/s at startup) and FEX never patches it (`ua_patch=0`).
+- Ending the helper during play froze the game before (logs 199/200); a replacement
+  for the client or its API library is out of scope (DRM).
+
 ## References
 
 - [Valve's official client download](https://store.steampowered.com/about/)
@@ -939,3 +1013,552 @@ Switches: MADEIRA_STEAM_WEBHELPER_STOP, MADEIRA_PARK, MADEIRA_PARK_DELAY_S, MADE
 
 - [Chromium NLA fallback](https://chromium.googlesource.com/chromium/src/net/+/master/base/network_change_notifier_win.cc)
 - [Chromium logging switch parsing](https://chromium.googlesource.com/chromium/src/+/57368cb688f57953997281524e3a9733c535393b/chrome/common/logging_chrome.cc)
+
+### 2026-09-24 — ml1820: native genuine-client headless host
+
+The owner authorized native Windows host/game tests and asked that desktop
+Steam remain closed. `build/steam-host/` now contains an independent C host:
+exact client SHA-256/method gates, genuine cached logon, connected-state and
+subscription-list checks, Valve's own asynchronous `LaunchApp`, callback pumping
+while playing, and restoration of real process/account discovery values.
+There are no game-specific patches, replacement Steam APIs, fabricated tickets
+or removed DRM. The production Madeira launch path was not changed.
+
+The owner confirmed startup for three installed games: a 32-bit C: title and
+64-bit Steamworks titles on C: and D:. The C: installation was explicitly
+selected for the benchmark. One game loaded the original Steam API alongside
+the installed Valve-signed client DLL. Desktop Steam/CEF were absent. A reported
+menu crash did not reproduce; the owner said they likely closed it accidentally.
+Normal exits released the client and restored discovery with exit code zero.
+
+Private `BIsSubscribedApp` returned true even for invalid IDs in this context;
+it is not sufficient to authorize launch. The real subscription-list gate
+rejected a missing App ID. A real non-entitled-account test remains outstanding.
+The current DLL's asynchronous launch payload is 524 bytes, not 528. The first
+launch exposed this mismatch; the corrected attempt retained the host properly.
+
+Checks: both PE architectures compile; 11 lifecycle/failure and 16 entitlement/
+payload validation cases pass under ASan/UBSan. Session/launch is x64-only.
+A 5.17-second authenticated-session sample measured 99.93 MiB private host
+memory and 0.0469 seconds host CPU; this excludes game/service processes and
+does not predict Wine/FEX overhead. Both installed Valve client hashes remain
+unchanged. Experimental code is uncommitted; no app payloads were staged and
+no IPA was built for this native-only milestone.
+
+Next: secure native-token handoff and a device probe using the existing Steam
+prefix before changing onboarding. Desired onboarding is one native sign-in,
+background installation of genuine client components and the headless host at
+Play. See `build/steam-host/README.md` and `docs/STEAM_HOST_PLAN.md` for commands,
+the exact supported DLL, original sources and remaining limitations.
+
+### 2026-09-24 — ml1830: Madeira Dock private source and first iOS integration
+
+Madeira Dock is the legitimate headless host for Valve's genuine client. It
+requires real Steam authentication and authenticated subscription-list checks,
+then uses Valve's launch path with original game APIs/DRM. It is not a DRM
+bypasser. No fabricated ownership, Steam API replacements or protection patches.
+
+The owner requires closed source. All independently written host source moved
+out of the public checkout into the PRIVATE sibling ../madeira-dock repository
+(125hz/madeira-dock) before any public source commit. The default GPL license
+was replaced with an owner-authorized proprietary license permitting unmodified
+binary distribution with Madeira. No third-party implementation was relicensed.
+Public Madeira includes only the stripped EXE, notices and public Swift adapter.
+Source/privacy Git hooks reject private paths and renamed markers, including
+source removed before a push. No developer cached login, account token, Steam
+config, Valve DLL or game content is included in the repository or IPA.
+
+The app adapter is MadeiraDock.swift, included in the normal Xcode project.
+MADEIRA_DOCK=1 opts into the device trial; =0 restores the desktop client route.
+The native QR/password flow obtains each user's token from Steam and stores it
+in Keychain. Before launch, downloads pause and the native Steam session logs
+off/closes; reconnect is blocked while Dock owns the token. A protected,
+backup-excluded one-use file carries it into Wine. Only the path is in the
+environment. Dock consumes/deletes the file before login; malformed input fails
+without cached fallback. Selected numeric results are copied into the app log;
+leftover handoffs are cleared at failure, session end, sign-out and next start.
+
+Onboarding with Dock enabled puts native sign-in first, then installs Valve's
+Windows files using the existing official installer. The user is told to stop
+at Steam's updated sign-in screen, without signing in there. This initial
+trial still requires those installed files and the supported exact client
+build. It supports Steam's default launch option with no custom arguments.
+Automatic component installation/removing the desktop installer is later work.
+The intended single-login path is implemented but not yet proven on a device.
+
+Validation: 27 existing host sanitizer scenarios, bounded handoff/parser tests
+(including 2,000 malformed inputs), Windows file consumption/deletion/replay,
+real-host malformed-handoff rejection before login, and the existing cached
+Windows authentication/subscription check pass. The public onboarding, launch
+routing/contract and native Steam suites pass. The iOS build succeeds with
+existing unrelated warnings. All Dock static imports resolve against bundled
+Wine exports; no runtime compatibility is inferred from that alone. Wine source
+is 11.4 and the bundled prefix template is Windows 10 Pro build 19045, not Win7.
+
+Artifact: xtool/Madeira.ipa, label ml1830 · 09-24 19:39, 1,389 entries,
+166,284,871 bytes, SHA-256 bd426d2b3172bf0160050338879d3b8712671af37fbd399509fd4ca49bf59b28.
+Bundled stripped x64 Dock: 30,208 bytes, SHA-256
+ddefca17379dda5e274f065913a7215a7f49a504ccb37a657a5257cc8d48804b.
+CRC, all 1,271 Windows resource files, both new seals, integration strings,
+source/debug exclusion and cached-login-file exclusion verified. The master
+trial switch defaults off pending device results. No public Madeira push.
+
+Read docs/MADEIRA_DOCK.md for the current device workflow; private README.md,
+AGENTS.md and docs/HANDOFF.md for how to work on Dock. Next: owner device test
+of live native token authentication, ownership gating, game launch and cleanup
+using the existing prefix, then clean-prefix/component installation. Extended
+play, a genuinely non-entitled account, revoked licenses, network loss, Steam
+Guard/expiry, cloud/multiplayer and other client versions remain open.
+
+Private Dock upload completed: origin/main commit 390eec9 (2026-09-24). Repository private visibility was rechecked immediately before pushing. Working tree clean in ../madeira-dock. Public Madeira changes and the device-trial binary remain uncommitted/unpushed; owner device validation is next.
+
+
+
+## ml1840 — Dock routing and startup diagnostics (2026-09-24)
+
+Device log 58 from ml1830 did NOT exercise Dock. At 19:59:28 the app prepared
+its one-use handoff, then deleted madeira-env.txt because madeira.cfg existed.
+The canonical file contained only the webhelper-freeze setting. LibraryFlags
+read legacy env/getenv only, and the worker recomputed the route after deletion,
+overwriting Dock's command with desktop steam.exe. The log contains the actual
+steam.exe argv/child startup. This is a Swift integration bug, not evidence of
+failed Dock authentication or Wine incompatibility.
+
+ml1840 reads canonical env.* for both UI decisions and runtime export, merges
+new legacy environment overrides atomically before cleanup, and verifies each
+legacy file's values before deleting it. Conflicting/unreadable files remain.
+The launch decision is passed explicitly through configuration and worker
+startup; it cannot silently change when a file disappears. The session stores
+that route for status text and final Dock diagnostics. [launch-route] ml1840
+selected=dock is the app-side marker; dockhost.exe argv and guest host stages
+are still required to establish that Dock actually ran.
+
+The log toggle is pinned above the starting-screen scroll view from the start.
+The log pane uses its full landscape height and up to 200 recent coalesced rows
+instead of seven bottom-anchored rows. Short histories align to the top. The
+profile's initial live-log choice can now be toggled off during startup too.
+Dock gets its own honest starting/waiting label and Show desktop button.
+
+Rollback/configuration: MADEIRA_DOCK=0 chooses desktop Steam before launch;
+MADEIRA_FLAGS_CONFIG=0 restores legacy-only UI flag lookup;
+MADEIRA_CONFIG_ENV_MERGE=0 retains unimported legacy environment overrides;
+MADEIRA_STARTUP_LOG_ALWAYS=0 restores the delayed log button;
+MADEIRA_STARTUP_LOG_FILL=0 restores seven rows. Use env.NAME = value lines in
+Documents/madeira.cfg. Legacy madeira-env.txt remains accepted and imported.
+A device affected by ml1830 must re-add env.MADEIRA_DOCK = 1: the deleted flag
+cannot be recovered automatically. Dock remains opt-in; no account data or
+private host source is introduced. Private host EXE is unchanged.
+
+Validation: production configuration/LibraryFlags filesystem regression,
+explicit route snapshot tests, Steam library/contract, onboarding, and launch
+view suites pass (launch scene/census uses ASan/UBSan and TSan). Visual layout,
+live native-token authentication, entitlement rejection, and Wine/FEX launch
+still require device testing. Do not describe log 58 as a Dock failure or success.
+
+Verified ml1840 artifact: `ml1840 · 09-24 20:11`, 1,389 ZIP entries,
+166,299,430 bytes, SHA-256 `c07ad624c0924b89a427081e757a553f90a15744721f819501b3ac7216f521cc`.
+All 1,271 Windows resources match their source copies and remain unchanged from
+ml1830. Only the app executable, Info.plist and signature seal changed. Dock
+remains the same stripped 30,208-byte PE; CRC, resource seals, integration
+markers and source/cached-login exclusions pass. IPA: `xtool/Madeira.ipa`.
+No public commit/push this round. Device authentication/gameplay and visual
+layout confirmation remain pending.
+
+
+## ml1850 — log 59: unloaded DLL mapping reused (2026-09-24)
+
+The ml1840 device run selected Dock correctly: [launch-route] selected=dock,
+argv[3]=C:\windows\system32\dockhost.exe, and a real x64 host child. It crashed
+with 0xc0000005 during LoadLibraryExW of the genuine client, before live-token
+authentication. The surviving explorer desktop made the UI wait indefinitely.
+This is NOT evidence of a rejected Steam login or an ownership failure.
+
+Exact evidence: bcrypt.dll at PE 0x70fb8a0000 (size 0x90000) received pool copy
+0x11d134000. After crypto-provider teardown, coml2.dll reused the same base and
+size but received no fresh pool-copy log. The fault PC 0x11d14bba0 equals the
+old bcrypt pool +0x17ba0, whose actual instruction is `str w8,[x22]` inside
+generic_alg_property. x22 was 1. The log's coml2+0x17ba0 attribution reads the
+NEW PE header; coml2's real text ends at RVA 0x13216. The recorded instruction
+bytes match bundled bcrypt exactly. Dock's return RVA 0x1e1f is its client
+LoadLibraryExW call. Do not patch coml2, bypass SHA-256, or disable client DRM.
+
+Fix: delete_view retires overlapping PE-to-pool translations for SEC_IMAGE
+before releasing the address. This covers all owners of that unmapped VA and
+preserves adjacent mappings. It leaves executable allocation reclamation to
+the existing process ledger; it does not immediately recycle executable bytes.
+The old mprotect containment test checked only MZ and SizeOfImage, so equal-size
+address reuse wrongly counted as the old live image. A fresh mapping now gets
+a fresh code copy and the existing FEX alias registration replaces its overlap.
+MADEIRA_JIT_IMAGE_RETIRE=0 rolls back; [jit-image-retire] ml1850 is capped at 32.
+
+A weak native self-exit callback now publishes only Dock's numeric exit status
+through an atomic session record. Swift polls it independently of explorer,
+reads only whitelisted numeric guest report events, and displays a failure plus
+Close session instead of spinning forever. Zero status is distinct from no
+exit event. First event wins, and the record resets at session begin.
+MADEIRA_DOCK_STATUS=0 disables this observation; [dock-status] ml1850 logs it.
+The guest report is still not an ownership assertion; original checks remain.
+
+Live-log control: the previous top placement was outside the known visible
+Show desktop controls, under the general session tools gate and near the
+session-message overlay. Log 59 does not prove which UI condition hid it.
+The button is now directly above Show desktop, bordered, immediately available,
+and independent of MADEIRA_SESSION_TOOLS. MADEIRA_STARTUP_LOG_ALWAYS=0 retains
+the delayed legacy control; [launch-log] ml1850 logs via LogStore, not an early
+stderr write. The ml1840 full-height/200-row log implementation remains.
+
+Validation: new source-extracted ASan/UBSan host checks cover equal-base/equal-size
+image reuse, both ownership records, adjacency, partial overlap, rollback,
+zero-length ranges, first/zero/error exit status, concurrent publishers and
+session reset. Existing config, library/contract, and session lifetime tests
+pass. Native rebuild: ntdll 36/36, win32u 46/46, wineserver successful. No actual
+Wine/game runs on this PC. Device authentication, game launch, and visual
+button/layout confirmation remain pending. No private Dock implementation or
+binary changes; no source or account data added to the app. No public push.
+
+Verified ml1850 IPA: `ml1850 · 09-24 21:00`, 1,389 entries,
+166,303,597 bytes, SHA-256 `bdc7e6a944f1a1dd24f276bfc9350cb2040187d6bae3c6d1bd5167cb145aac87`.
+CRC, new native/UI diagnostic strings, all 1,271 Windows resources, resource
+seals, and private-source/cached-login exclusions pass. Compared with ml1840,
+only Madeira, Info.plist and CodeResources changed. Dock remains 30,208 bytes
+with SHA-256 `ddefca17379dda5e274f065913a7215a7f49a504ccb37a657a5257cc8d48804b`. Linked host-exit callback and
+status reader verified with llvm-nm. Existing unrelated compiler warnings remain.
+Install over the current app and retain env.MADEIRA_DOCK = 1; no config change
+needed. Device retest required; no authentication/game-launch success claimed.
+
+## ml1860 — client compatibility and normal-exit reporting
+
+Log 60 loaded Valve's client successfully; the owner's Dock report identified
+an unsupported January client, before authentication. The private host now has
+an independently verified adapter for that exact official DLL; unknown builds
+still fail closed. MADEIRA_DOCK_CLIENT_202601=0 disables the new adapter.
+The public app observes normal Dock exit through the common Wine exit wrapper
+and includes only whitelisted report fields in its exported diagnostic log.
+MADEIRA_DOCK_STATUS=0 rolls back that observation. The owner confirmed the
+live-log button works. Windows no-login ABI/rollback checks and host regression
+checks pass. Device authentication/game launch remain unproven. Keep the
+existing env.MADEIRA_DOCK=1; no Steam reinstall should be needed for this DLL.
+Read HANDOFF.md and docs/MADEIRA_DOCK.md for current test instructions. Private
+adapter source stays only in ../madeira-dock; only its stripped EXE is bundled.
+
+ml1860 artifact verified: `ml1860 · 09-24 21:30`, `xtool/Madeira.ipa`,
+166,306,898 bytes / 1,389 entries. IPA SHA-256:
+`78a10b3ce35fc5da9aee957f8e3ce0f5c6ce493fc3b8811daa7c3b73176373ca`.
+Dock remains stripped x64, 30,208 bytes, new SHA-256:
+`61976bb68737c9e39f1acd387b22c7aece406f34784352bb0307bf21a1b0f3fa`.
+Only the app executable, Dock EXE, Info.plist and CodeResources changed versus
+ml1850; no removed entries. All 1,271 Windows resource files match the source
+bundle; CRC, notices, signatures' resource seals and source/login/Valve-DLL
+exclusion checks pass. Common exit wrapper and both bridge symbols are linked.
+Existing unrelated compiler warnings remain. No commit/push performed.
+
+## ml1870 — protected handoff path
+
+Log 61 passes the exact client/session ABI checks and reports a normal exit,
+but rejects the one-use native transfer before submitting a token to Valve.
+The app's Z: path assumption is wrong for a normally seeded prefix. ml1870
+uses Wine's Unix namespace for the same protected Application Support file;
+MADEIRA_DOCK_UNIX_HANDOFF=0 rolls back. The private host also adds numeric
+operation/error diagnostics (MADEIRA_DOCK_HANDOFF_DIAGNOSTICS=0 disables them).
+Code 37 now has a specific message. No token/path/account data is logged.
+The existing exclusive-open, bounds, delete-on-close and clearing checks stay.
+Source-extracted namespace and synthetic Windows consumption/replay tests pass.
+The full host rejects a malformed synthetic transfer before login, reports
+stage=5/error=0 and removes it. Its isolated official-client probe emits known
+missing-helper warnings; these do not change that pre-login rejection result.
+No cached-login fallback, Wine-on-PC run, installed client modification, or game
+test. Desktop Steam remains closed. Keep env.MADEIRA_DOCK=1; install over the
+app and export the normal log after a failure. See HANDOFF.md for the evidence
+limits: iOS authentication/game launch is still unproven. Dock source is private.
+
+ml1870 verified artifact: `ml1870 · 09-24 21:46`, `xtool/Madeira.ipa`,
+166,307,354 bytes / 1,389 entries. SHA-256:
+`defe7ed39691534563d027ae813054eb709e5a30169ad6aef22680aa1df3a124`.
+Stripped x64 Dock is 30,720 bytes, SHA-256:
+`26bc7b1ace2846191f67d7673219e7bae132be5b0ec0db84d5e9795c65b45044`.
+CRC, all 1,271 Windows resources, new app/host diagnostic strings, resource
+seals and source/login/Valve-DLL exclusions pass. Only Madeira, Dock EXE,
+Info.plist and CodeResources changed from ml1860; no entries removed.
+Dock imports resolve against bundled Wine exports. Existing unrelated compiler
+warnings remain. No commit/push performed. Device verification is outstanding.
+
+## ml1880 — first authenticated device launches; performance trial
+
+Device logs 62/63 (ml1870) report session-authenticated-online=1 and
+session-requested-app-listed=1; the owner confirms the installed 32-bit game
+runs on iOS through Dock. This proves the tested native-token/Valve-client
+path, not broad compatibility, clean-prefix provisioning or all online APIs.
+Source remains private; the stripped host and real authentication/DRM are
+unchanged this round. No developer login is included.
+
+Evidence: late whole-app footprint is about 2,713 / 2,832 MiB, versus the
+owner's earlier roughly 4.5 GB observation (not a controlled matched scene).
+The 896 MiB JIT allocation is still selected as a desktop session, although
+head + reserved tail reaches only about 230 MiB. Pool blessing dirties the
+whole allocation. Metal allocated size is roughly 450–470 MiB; the larger
+resource census is logical capacity, not another resident-memory total.
+Frame reports vary by scene: later log 63 windows show about 47–58 fps,
+4–8 ms GPU time and substantial unattributed CPU-side waiting. Do not call
+all of that waiting CPU computation or promise an FPS increase from it.
+
+Changes in public Swift only:
+- With Dock enabled and onboarding complete, the early pool defaults to
+  512 MiB despite the old desktop/setup sticky high-water. This reduces the
+  reservation by 384 MiB. Actual footprint/FPS improvement needs device A/B.
+  Explicit pool=256..1152 wins; unfinished setup retains its larger pool.
+  env.MADEIRA_DOCK_COMPACT_POOL=0 restores previous sizing after restart.
+- A desktop launch after a compact allocation stops before Wine starts,
+  requests a restart and reserves at least 896 MiB on the next run. That
+  reservation is cleared only after a large allocation succeeds. The pool
+  cannot be enlarged or safely discarded after debugger detach. Existing
+  one-session-per-app-run behavior remains. Explicit small pool overrides
+  retain their deliberate user-selected behavior.
+- Normal Dock gameplay defaults the guest D3D9 census to off: log 63 counted
+  over 32,000 API calls/frame, plus histogram work. Frame/memory telemetry
+  remains. env.MADEIRA_DOCK_LIGHT_DIAGNOSTICS=0 restores the old default;
+  env.MADEIRA_D3D9_CENSUS=1 explicitly enables it. MADEIRA_DIAG or
+  MADEIRA_D3D9_LAST opt-ins also prevent the new default. This targets the
+  emulated PE frontend loaded in these logs; the native frontend's static
+  initializers run earlier and are not reconfigured by this launch policy.
+  This reduces diagnostic work, with no measured FPS claim yet.
+
+Host checks compile the production policy and cover setup, manual overrides,
+rollback, desktop recovery and diagnostic precedence; config/onboarding
+regressions pass. Tags: [dock-pool] ml1880 and [dock-perf] ml1880.
+Install the new IPA, fully quit/reopen Madeira, enable JIT and repeat the same
+scene/settings for several minutes. Check the actual pool is 512 MB, then
+compare footprint and [frame] windows. For independent A/B: pool=896 keeps
+old memory sizing; env.MADEIRA_D3D9_CENSUS=1 keeps old per-call counting.
+Restart between changes. If [jit-pool] EXHAUSTED or tail allocation failure
+occurs, restore pool=896 and send the log. Larger/other games are untested.
+No private host code changes, commit or push in this round.
+
+ml1880 verified artifact: `ml1880 · 09-24 22:11`, `xtool/Madeira.ipa`,
+166,312,103 bytes / 1,389 entries. SHA-256:
+`5096bec2dcef89ea62c258736acd0c86514e96a95f07fce901a1335915b1d264`.
+All 1,271 Windows resources match the staging tree. CRC, build/policy tags,
+stripped host, license notices, source/login/Valve-DLL exclusions and resource
+seals pass. Only Madeira, Info.plist and CodeResources changed from ml1870;
+no entries were added or removed. Dock EXE remains byte-identical:
+`26bc7b1ace2846191f67d7673219e7bae132be5b0ec0db84d5e9795c65b45044`.
+Public config/onboarding/library/runtime/report and performance policy tests
+pass; the production desktop-reservation methods are also exercised with
+isolated preferences. Existing unrelated compiler warnings remain. No
+commit/push. RAM/FPS improvement from ml1880 requires owner device testing.
+
+## ml1890 — hide unreliable pre-download sizes
+
+The owner reports ml1880 runs well; there is no new log or controlled RAM/FPS
+comparison yet. They also reported implausible sizes on uninstalled entries.
+The public downloadSize estimator sums selected PICS depots, mixes compressed
+public.download values with legacy maxsize, and skips missing sizes. This can
+produce partial or misleading totals. No raw per-app metadata was supplied to
+establish which exact field caused each reported value.
+
+The owner authorized removing the estimates if a reliable fix was unavailable.
+SteamOwnedGame.displayedDownloadBytes now suppresses the cached estimate by
+default, in both the library card/list badge and the download-options sheet.
+No arbitrary size clamp or title-specific patch. Stored downloadBytes is kept
+for cache decoding and rollback; old bad cached values are hidden immediately
+without sign-out, cache deletion or a refresh. Actual manifest-based download
+progress, installed folder sizes and free-space display remain unchanged.
+MADEIRA_STEAM_HIDE_SIZE_ESTIMATES=0 restores the legacy estimate after restart;
+[steam-size] ml1890 logs the policy once. A future estimate needs a complete,
+validated install plan with consistent units, rather than a partial metadata
+sum presented as the full game size. No additional library network requests.
+
+Swift-only change; no private Dock or native runtime changes. Keep the ml1880
+pool/diagnostic improvements. Build/IPA verification recorded below when done.
+No commit/push.
+
+## ml1900 — native Dock onboarding prototype (build stopped)
+
+The owner explicitly stopped the ml1890 build and requested planning and
+implementation of onboarding without an interactive Steam installation.
+The build was terminated after compile/before packaging; the IPA is still
+ml1880, SHA-256 5096bec2dcef89ea62c258736acd0c86514e96a95f07fce901a1335915b1d264.
+The ml1890 library-size change remains in source and is not shipped yet.
+
+Read docs/DOCK_ONBOARDING_PLAN.md for the complete plan, verified package
+provenance, implementation, test evidence and remaining clean-prefix tests.
+A public native preparer and opt-in onboarding page now download three pinned
+Valve packages (~73 MB), verify hashes, safely extract them, seed the prefix
+and create client-discovery registry entries. No Wine/JIT session or second
+Steam login is started. Progress/cancel/retry and desktop fallback are present.
+MADEIRA_DOCK_NATIVE_SETUP=1 (with MADEIRA_DOCK=1) opts in; default remains off.
+[dock-setup] ml1900 is the low-volume tag. Private Dock code/binary are unchanged.
+
+Host ZIP/path/registry checks pass against synthetic cases and all three real
+Valve archives. Existing onboarding/library regressions pass; installer code
+passes isolated arm64-iOS SDK type-checking and UI source parsing. This is NOT
+a full app link or a clean-prefix device authentication/gameplay test. No IPA
+build was restarted. Use a separate clean test container for the next device
+trial; preserve the owner's currently working install. Never claim native
+provisioning proven from the earlier existing-prefix Dock launch logs.
+No commit/push. Next IPA round should be ml1900 when build work resumes.
+
+## ml1900 packaged for device testing (2026-09-25)
+
+The owner explicitly resumed IPA building. The full app compiled, linked and
+packaged successfully; the earlier build-stopped notes below are historical.
+Current artifact: `xtool/Madeira.ipa`, label `ml1900 · 09-25 00:08`,
+166,360,928 bytes / 1,389 entries. SHA-256:
+`3c25ddff4b740aa32428078b1485a9bc2f8526f0728802739a0421b46bb53caf`.
+
+The IPA includes native Dock onboarding and ml1890's hidden unreliable size
+estimates. Native setup remains opt-in: set `env.MADEIRA_DOCK=1` and
+`env.MADEIRA_DOCK_NATIVE_SETUP=1` in Documents/madeira.cfg, fully reopen the app,
+then Settings > Run setup again. Existing Steam files are retained and skip
+component preparation; download/provisioning needs a separate clean test
+container, preserving the owner's working installation. Fresh-prefix device
+authentication/game launch is still unverified. Prepare components before JIT.
+
+Content verification passed: CRC, build/new-feature tags, 1,271 runtime resources,
+stripped Dock, notices, source/login/Valve-DLL exclusions and resource seals.
+Only the app executable, Info.plist and CodeResources differ from ml1880; no
+entries added/removed. Dock's hash is unchanged. Existing compiler warnings
+remain. Reports: .xtool/logs/ml1900-verified.json and ml1900-build.log;
+verifier: .xtool/verify-ml1900.py. No commit/push or private source changes.
+
+## ml1910 — Dock onboarding enabled by default (2026-09-25)
+
+The owner requested a fresh-install IPA with Dock and native setup already
+enabled because they cannot edit madeira.cfg during onboarding. This explicitly
+supersedes ml1900's opt-in-only decision. Both MADEIRA_DOCK and
+MADEIRA_DOCK_NATIVE_SETUP now default true; explicit =0 overrides still work.
+MadeiraDock.nativeSetupEnabled is shared by onboarding routing and its low-volume
+[dock-defaults] ml1910 diagnostic. No configuration file is needed on a fresh
+install. Flow: welcome, native Steam sign-in, Prepare Madeira Dock (download and
+verify ~73 MB of official Valve components), library. Wine desktop installation
+is only an explicit fallback. Genuine client files are still downloaded; they
+are not bundled in the IPA. Private Dock/authentication/DRM checks are unchanged.
+Existing Steam files are retained. Clean-prefix device authentication/launch
+is still awaiting the owner's test, not proven by changing these defaults.
+Host onboarding/configuration/performance regressions pass. Full build and
+content verification passed: `ml1910 · 09-25 00:19`, 166,360,404 bytes,
+1,389 entries. SHA-256 `9ee0011365a1f1769837cc8c4587e32e2772f66b2410a77a919684435eb6b0a8`.
+All 1,271 runtime resources match; stripped Dock, notices, source/login/Valve-DLL
+exclusions, ZIP CRC and seals pass. Only app executable, Info.plist and seals
+differ from ml1880. Reports: .xtool/logs/ml1910-build.log and
+ml1910-verified.json; verifier: .xtool/verify-ml1910.py. Existing unrelated
+compiler warnings remain. The IPA is ready at xtool/Madeira.ipa.
+No private source edits, commit or push.
+
+## ml1940 — log 64 address-space pressure and heap performance trial
+
+Log 64 ends with STATUS_NO_MEMORY for a 0x240000-byte guest reservation:
+3,877 MiB mapped, 218 MiB aggregate free, largest gap 0x230000. The 32-bit
+guest exits status 3; later access violations are during teardown. Dock exits
+normally, and the 512 MiB JIT pool does not report exhaustion. The `reserved`
+census class is an initial-allocation flag, not proof of currently uncommitted
+pages. Do not describe this as an authenticated Dock failure or proven leak.
+
+See docs/RUNTIME_MEMORY_PERFORMANCE.md for evidence, primary API references,
+implementation and retest plan. New Wine i386 heap policies initialized after
+process parameters, before application threads: MADEIRA_HEAP_COMPACT=1 caps
+subheap growth at 2 MiB and retries to the actual aligned need under pressure;
+MADEIRA_HEAP_COMBINED=1 joins full reserve+commit into one VM call. Either enabled
+also releases a new reservation if its split commit fails (verified source bug,
+not established as this crash's cause). No caching of freed blocks, changed
+requested sizes/VA ceilings, game-specific logic, auth or private Dock changes.
+Dock launches default both switches on after config export; explicit =0 wins.
+Native 64-bit heaps are unaffected. Logs: [dock-heap] / [heap-policy] ml1940.
+This mitigates guest address pressure; a long-session device repeat is required
+to prove crash prevention. No FPS gain measured. User's current IPA was ml1910.
+
+Production-path ASan/UBSan host test check-heap-policy.py passes: combined and
+split VM contracts, failure injection/cleanup, aliasing, fixed heap rejection,
+growth bounds, small-gap retry and rollback. Existing Dock performance/config
+regressions pass. i386 build initially exposed ARM-specific probes in shared
+sources: CHPE detach/counter diagnostics now architecture-guarded. The local
+build-wine-i386.sh now checks make exit status, not merely old target existence.
+Fresh i386 ntdll compile/link passes; architecture and new strings verified.
+Full IPA build/content verification passed; artifact details recorded below. No commit/push.
+Current controller PRs/worktrees are not changed by this round.
+
+
+ml1940 build completed and content-verified (2026-09-25):
+`xtool/Madeira.ipa`, label `ml1940 · 09-25 01:50`, 166,363,201 bytes,
+1,389 entries. SHA-256:
+`55bdb43208945e6363d446698f36c58305f9a0fd83d086c9c992e2d8ef48a498`.
+Only the app executable, i386 ntdll, Info.plist and resource seals differ from
+ml1910. All 1,271 Windows resources match the source bundle; no entries removed.
+CRC, new Swift/PE markers, stripped unchanged Dock, source/login/Valve-DLL
+exclusions and seals pass. Native/PE build had zero missing cross-imports.
+Reports: .xtool/logs/ml1940-build.log, ml1940-wine-i386-build.log,
+ml1940-verified.json and ml1940-log64-analysis.json. Existing unrelated Swift
+warnings remain. No device run, measured FPS gain, commit or push in this round.
+Install over the app, fully restart and repeat the transition/long session.
+
+
+## ml1950 — pressure recovery and useful performance diagnostics
+
+Log 65 confirms ml1940 is active but repeats the allocation failure: guest VA
+mapped 3,945 MiB, total free 150 MiB, largest hole 0x1e0000, failed request
+0x230000, followed by guest exit 3. Do not call ml1940 a confirmed crash fix.
+See HANDOFF.md and docs/RUNTIME_MEMORY_PERFORMANCE.md for this round.
+
+Wine i386 now atomically detaches and releases wholly empty LFH groups on a
+failed RtlAllocateHeap, then retries once if any were released. Partially used
+groups are republished and live pointers never move. MADEIRA_HEAP_RECLAIM=0
+rolls back. Empty-group retention has not been proven as the main consumer in
+this log; recovery does not solve arbitrary live-block/VirtualAlloc exhaustion.
+
+MADEIRA_HEAP_STATS reports live large/subheap/free capacity and large allocation
+sites. MADEIRA_VA_DIAGNOSTICS adds size/creator-thread attribution to the failure
+census. MADEIRA_CPU_DIAGNOSTICS reports per-thread cumulative CPU deltas every
+10 seconds without suspending threads or reading registers/stacks. All default
+on for Dock; explicit =0 wins. Logs use ml1950. Keep existing intrusive samplers
+off. Snapshot capacities/overflow and unmatched/new/dead CPU threads are explicit;
+do not interpret the counters as proof of a leak or a measured FPS improvement.
+Log 65 median FPS 43.75, presenter CPU 4.9 ms / wait 17.55 ms; the dominant busy
+worker or wait dependency remains unproven. Keep compact JIT sizing and light
+D3D9 diagnostics. No private Dock/source/authentication changes.
+
+Production-source sanitizer tests for reclaim (including 2,000 concurrent frees)
+and CPU metadata/query-failure/port-cleanup/ID-reuse/capacity pass, as do existing
+heap/Dock/guest-window regressions. i386 ntdll and native Wine compile. Full IPA
+verification is recorded in HANDOFF.md once complete. Device long-play and FPS
+confirmation remain pending. No upstream PR changes, commit or push.
+
+
+ml1950 final IPA verified (2026-09-25): `xtool/Madeira.ipa`, label
+`ml1950 · 09-25 02:37`, 166,368,757 bytes / 1,389 entries.
+SHA-256: `c57e3000dd41a513736ebe2c784ed27507f9447da58f51fa0c2fbb4b280b68fc`.
+i386 ntdll: `04f8314e250ba02418db6878dbc25fcb62cb8646fbfa89e7713727afc90ca4c9`.
+All 1,271 Windows resources match the current source bundle; CRC, final CPU
+Mach-port marker, new heap/VA diagnostics, stripped unchanged Dock, notices,
+source/login/Valve-DLL exclusions and seals pass. Only Madeira, i386 ntdll,
+Info.plist and CodeResources differ from ml1940; no entries added or removed.
+The final rebuild includes the acquire read pairing with concurrent frees.
+Native build: 36/36 ntdll and 46/46 win32u objects, wineserver success; PE import
+closure has zero missing imports. Production VA-census sanitizer tests also
+pass (grouping, exclusions, empty window, capacity overflow and rollback).
+Existing unrelated Swift/toolchain warnings remain. No device crash prevention
+or FPS gain is confirmed yet. Install over the current app, fully quit/reopen,
+enable JIT, repeat the long session and export the log, even on success.
+Reports: .xtool/logs/ml1950-build.log, ml1950-native-build.log,
+ml1950-wine-i386-build.log, ml1950-log65-analysis.json, ml1950-verified.json.
+Verifier: .xtool/verify-ml1950.py. No private Dock changes, commit or push.
+
+
+## ml1960 — public installation/launch compatibility
+
+See [docs/COMPATIBILITY_ML1960.md](docs/COMPATIBILITY_ML1960.md). Imported default
+launch arguments retain provenance so Dock can select Valve's default option;
+custom arguments remain explicit unsupported input. Downloads resolve missing
+shared-depot manifests from their exact owner references, bounded and cancellable,
+while all key/content authorization remains with Valve. Supported publisher
+Registry values are applied inside the stopped Wine prefix before launch.
+Private Dock source/binary/authentication are unchanged. Existing installations
+receive registry/default-argument handling immediately; omitted depot content
+requires download/update. Device tests remain pending. Each policy has an
+independent MADEIRA_* rollback and ml1960 diagnostic listed in the document.
+
+
+ml1960 repair entry point: installed native entries now expose **Repair installed
+files** in their Steam settings even when the build ID is current. It uses the
+existing queue, chunk verification and resumable downloader, with the new shared
+metadata resolver. `MADEIRA_STEAM_REPAIR=0` hides/disables it; `[steam-repair] ml1960`.
+No automatic redownload or uninstall is performed. The final app rebuild includes
+this control, shared-lookup cancellation and saved argument-provenance handling.

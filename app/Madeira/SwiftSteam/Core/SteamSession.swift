@@ -15,6 +15,8 @@ class SteamSession {
     private(set) var accountName: String = ""
     private(set) var personaName: String = ""
     private(set) var cellID: UInt32 = 0
+    // ml1830: one native-or-guest connection owns the token during a Dock run.
+    var dockOwnsConnection = false
 
     // MARK: - Internal State
 
@@ -51,6 +53,7 @@ class SteamSession {
 
     /// Connect and authenticate using stored tokens (auto-login)
     func connectAndLogin() async throws {
+        guard !dockOwnsConnection else { throw SteamError.disconnected }
         guard connectionState == .disconnected || connectionState == .reconnecting else { return }
 
         connectionState = .connecting
@@ -116,6 +119,7 @@ class SteamSession {
                             try await connection.send(helloRetry)
                             SteamLog.trace("Sent ClientHello to new server (attempt \(attempt))")
                         }
+                        guard !dockOwnsConnection else { throw SteamError.disconnected }
                         try await loginWithToken(accessToken: tokens.refreshToken, accountName: tokens.accountName)
                         loggedIn = true
                         break
@@ -140,6 +144,7 @@ class SteamSession {
     /// Connect on demand if not already connected/authenticated.
     /// Call this before any operation that needs the CM connection.
     func ensureConnected() async throws {
+        guard !dockOwnsConnection else { throw SteamError.disconnected }
         guard connectionState != .authenticated else {
             resetIdleTimer()
             return
@@ -199,6 +204,8 @@ class SteamSession {
             try? await connection.send(logoffData)
         }
         disconnect()
+        // ml1830: callers handing a session to Dock must await the socket close.
+        if dockOwnsConnection { await connection.disconnect() }
     }
 
     /// Log in using the refresh token from the auth flow.
@@ -439,8 +446,9 @@ class SteamSession {
                 do {
                     try await connection.send(data)
                 } catch {
-                    pendingJobs.removeValue(forKey: jobID)
-                    continuation.resume(throwing: error)
+                    if pendingJobs.removeValue(forKey: jobID) != nil {
+                        continuation.resume(throwing: error)
+                    }
                 }
             }
 

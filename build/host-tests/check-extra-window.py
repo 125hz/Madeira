@@ -31,6 +31,8 @@ typedef uintptr_t ULONG_PTR;
 #define IOS_CAGE_REAL_SIZE 0x1ffff0000ULL
 #define IOS_WOW_CEF_POOLS_START 0x7400000000ULL
 #define IOS_WOW_FEX_BAND_END 0x8000000000ULL
+#define IOS_WOW_SPILL_TOP 0x7b00000000ULL
+static int ios_wow_spill_walk;
 struct ios_wow_window { ULONG_PTR base; int dead, leaked; void *peb, *dead_peb; };
 struct ios_wow_placeholder { ULONG_PTR base; unsigned guard_owned, adopted; };
 static struct ios_wow_window slots[8];

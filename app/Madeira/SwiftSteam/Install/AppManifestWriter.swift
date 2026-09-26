@@ -44,6 +44,8 @@ struct AppManifestWriter {
         sizeOnDisk: UInt64 = 0,
         steamAppsPath: String? = nil,
         installedDepots: [InstalledDepot]? = nil,
+        sharedDepots: [(depotID: Int, ownerAppID: Int)] = [],
+        customExecutables: [String] = [],
         launcherPath: String? = nil
     ) throws {
         let path = steamAppsPath ?? defaultSteamAppsPath()
@@ -122,6 +124,28 @@ struct AppManifestWriter {
             lines.append("\t}")
         }
 
+        // ml1970: Valve's client records a depot taken from another app
+        // (`depotfromapp`) here, not under InstalledDepots, and requires the
+        // owner app's own record before it starts the game.
+        if !sharedDepots.isEmpty {
+            lines.append("\t\"SharedDepots\"")
+            lines.append("\t{")
+            for shared in sharedDepots.sorted(by: { $0.depotID < $1.depotID }) {
+                lines.append("\t\t\"\(shared.depotID)\"\t\t\"\(shared.ownerAppID)\"")
+            }
+            lines.append("\t}")
+        }
+
+        // ml1990: per-user custom executables (CEG) Valve's client prepares before launch.
+        if !customExecutables.isEmpty {
+            lines.append("\t\"CheckGuid\"")
+            lines.append("\t{")
+            for (index, path) in customExecutables.prefix(256).enumerated() {
+                lines.append("\t\t\"\(index)\"\t\t\"\(escapeVDFString(path))\"")
+            }
+            lines.append("\t}")
+        }
+
         // UserConfig + MountedConfig blocks are present in every real
         // Steam-written ACF. Most games default to English; Steam uses
         // these to drive language-pack depot selection. We always write
@@ -143,6 +167,33 @@ struct AppManifestWriter {
         // Madeira: a failed install record fails the install instead of
         // leaving downloaded files that no library scan can identify.
         try content.write(toFile: manifestPath, atomically: true, encoding: .utf8)
+    }
+
+    /// Madeira ml1970: record depots installed for another app's shared use under
+    /// their owner app, as Valve's client does ("required app N not ready" otherwise).
+    /// Depots already in an existing owner record are kept; the depots installed
+    /// now replace their older entries. Nothing is recorded that was not installed.
+    static func mergeOwnerManifest(ownerAppID: UInt32, ownerName: String, ownerBuildID: UInt32, installDir: String,
+                                   steamID: UInt64, steamAppsPath: String,
+                                   depots: [InstalledDepot]) throws {
+        let path = (steamAppsPath as NSString).appendingPathComponent("appmanifest_\(ownerAppID).acf")
+        var merged: [Int: InstalledDepot] = [:]
+        if let data = FileManager.default.contents(atPath: path), data.count <= 1 << 20,
+           var parser = try? SteamKeyValues(data), let root = try? parser.read(),
+           let record = root["AppState"], record["appid"]?.string == String(ownerAppID) {
+            for (key, value) in record["InstalledDepots"]?.fields ?? [:] {
+                guard let id = Int(key), id > 0 else { continue }
+                merged[id] = InstalledDepot(depotID: id, manifestGID: value["manifest"]?.string.flatMap { UInt64($0) },
+                                            size: value["size"]?.string.flatMap { Int64($0) },
+                                            dlcAppID: value["dlcappid"]?.string.flatMap { Int($0) })
+            }
+        }
+        for depot in depots { merged[depot.depotID] = depot }
+        let all = merged.values.sorted { $0.depotID < $1.depotID }
+        let size = all.reduce(UInt64(0)) { $0 &+ UInt64(max(0, $1.size ?? 0)) }
+        try writeManifest(appID: ownerAppID, name: ownerName.isEmpty ? "App \(ownerAppID)" : ownerName,
+                          installDir: installDir, buildID: ownerBuildID, steamID: steamID,
+                          sizeOnDisk: size, steamAppsPath: steamAppsPath, installedDepots: all)
     }
 
     /// Remove an appmanifest file
@@ -271,6 +322,19 @@ struct SteamClientProgress: Equatable {
     var workshop: SteamWorkshopProgress?
     /// Madeira ml1510: what the client is doing, for the starting screen.
     var stage: SteamLaunchStage?
+    /// ml1970: download speed measured by the app from the counters above; nil when unknown.
+    var bytesPerSecond: Double?
+
+    /// ml1970: "12.4 MB/s · about 3 min left", when a speed is known.
+    var speedLine: String? {
+        guard phase == .downloading, let rate = bytesPerSecond, rate > 0 else { return nil }
+        let speed = String(format: "%.1f MB/s", rate / 1e6)
+        guard total > downloaded else { return speed }
+        let seconds = Double(total - downloaded) / rate
+        let left = seconds < 90 ? "under 2 min" : seconds < 3600 ? "about \(Int((seconds / 60).rounded())) min"
+            : String(format: "about %.1f h", seconds / 3600)
+        return speed + " · " + left + " left"
+    }
 
     /// Something is left to do before the game can start.
     var active: Bool { phase >= .queued || workshop?.active == true }
@@ -405,7 +469,7 @@ enum SteamLaunchStage: Int, Comparable {
         case .signedIn: return "Signed in. Steam is getting the game ready…"
         case .updating: return "Steam is updating the game…"
         case .preparing: return "Steam is preparing the game…"
-        case .needsInput: return "Steam is waiting for you. Its window opens here in a moment."
+        case .needsInput: return "Steam needs an answer from you for this game. Tap Show Steam."
         case .installers: return "Steam is checking the game's one-time installs…"
         case .cloudSync: return "Steam is syncing cloud saves…"
         case .gameStarting: return "Starting the game…"
@@ -418,7 +482,8 @@ enum SteamLaunchStage: Int, Comparable {
         switch self {
         case .signedIn, .preparing:
             return "The first start of a game can include one-time installs such as DirectX."
-        case .needsInput: return "Usually a license agreement or a notice for this game. Steam can take a few seconds to draw it."
+        case .needsInput: return "Usually a license agreement, a product key or a notice. Steam can take a few seconds to draw it."
+        case .needsSignIn: return "Steam rejected the saved sign-in. Sign in again in Steam's window."
         case .installers: return "DirectX, Visual C++ and similar. Steam checks them before a start."
         case .gameStarting: return "The game is loading. This can take a moment."
         default: return nil
@@ -427,10 +492,19 @@ enum SteamLaunchStage: Int, Comparable {
 
     /// The next stage after one client log line, for the launched `appID`.
     func after(_ line: String, appID: Int) -> SteamLaunchStage {
-        if line.contains("Invalid Password") || line.contains("not auto reconnecting") { return .needsSignIn }
+        // ml1720: only a rejected sign-in asks for one. "not auto reconnecting due to Session
+        // Replaced" is another login of the same account taking the session (Madeira's own
+        // connection), not a sign-in the user has to make; the launch went on in every such log.
+        if line.contains("Invalid Password") || line.contains("InvalidPassword") { return .needsSignIn }
+        if line.contains("not auto reconnecting"),
+           ["Password", "Denied", "Expired", "Invalid"].contains(where: { line.contains($0) }) { return .needsSignIn }
         let signedIn = line.contains("[Logged On") || line.contains("RecvMsgClientLogOnResponse() : processing complete")
-        // After a rejected sign-in, only a later sign-in moves on.
-        if self == .needsSignIn { return signedIn ? .signedIn : self }
+        // After a rejected sign-in, a later sign-in or any launch progress for this app moves on.
+        if self == .needsSignIn {
+            if signedIn { return .signedIn }
+            guard line.contains("GameAction [AppID \(appID),") || line.contains("AppID \(appID) state changed") else { return self }
+            return SteamLaunchStage.signedIn.after(line, appID: appID)
+        }
         var next = self
         if line.contains("LogOn() called") || line.contains("Logging on") { next = .signingIn }
         if signedIn { next = .signedIn }
@@ -447,7 +521,8 @@ enum SteamLaunchStage: Int, Comparable {
         if line.contains("GameAction [AppID \(appID),") {
             if let range = line.range(of: "waiting for user response to ") {
                 let task = line[range.upperBound...].prefix { !$0.isWhitespace }.lowercased()
-                if !task.contains("creatingprocess") && self != .needsSignIn { return .needsInput }
+                // ml1720: interstitials answer themselves in seconds (every device log); not a screen.
+                if !task.contains("creatingprocess") && !task.contains("interstitial") && self != .needsSignIn { return .needsInput }
             }
             if self == .needsInput, line.contains("continues with user response") { return .preparing }
         }
@@ -483,6 +558,66 @@ struct SteamLaunchStageTracker {
             let lines = url == connectionLog ? connection.read(url) : url == contentLog ? content.read(url) : console.read(url)
             for line in lines { stage = stage.after(line, appID: appID) }
         }
+    }
+}
+
+/// Madeira ml1770: where setup's Steam install is, from the client's updater
+/// log, logs/bootstrap_log.txt:
+///   [..] Checking for available updates...
+///   [..] Downloading update (12,345 of 229,383 KB)...
+///   [..] Extracting package...
+///   [..] Installing update...
+///   [..] Update complete, launching...
+/// Without it setup showed only a spinner for the two to three minutes before
+/// Steam's sign-in window draws, and a fresh install looked stuck (device log 48:
+/// the window was about 30 s away when the session was abandoned).
+/// Opening is not undone by the checks a relaunched client makes; a second
+/// download or unpack is shown again.
+enum SteamSetupStage: Equatable {
+    case installing, checking, downloading(percent: Int?), unpacking, opening
+
+    var name: String {
+        switch self {
+        case .installing: return "installing"
+        case .checking: return "checking"
+        case .downloading(let percent): return percent.map { "downloading-\($0)" } ?? "downloading"
+        case .unpacking: return "unpacking"
+        case .opening: return "opening"
+        }
+    }
+
+    var text: String {
+        switch self {
+        case .installing: return "Installing Steam…"
+        case .checking: return "Checking for Steam updates…"
+        case .downloading(let percent): return "Downloading Steam's update…" + (percent.map { " \($0)%" } ?? "")
+        case .unpacking: return "Unpacking Steam's update…"
+        case .opening: return "Opening Steam's sign-in window…"
+        }
+    }
+
+    var detail: String {
+        self == .opening ? "This takes about a minute the first time. The window opens by itself."
+                         : "The first setup takes about three minutes. Steam's sign-in window opens by itself."
+    }
+
+    /// "12,345 of 229,383 KB" -> 5.
+    static func percent(_ line: String) -> Int? {
+        guard let open = line.range(of: "(") else { return nil }
+        let numbers = line[open.upperBound...].split(whereSeparator: { !$0.isNumber && $0 != "," })
+            .compactMap { UInt64($0.replacingOccurrences(of: ",", with: "")) }
+        guard numbers.count >= 2, numbers[1] > 0 else { return nil }
+        return Int(min(100, numbers[0] * 100 / numbers[1]))
+    }
+
+    func after(_ line: String) -> SteamSetupStage {
+        let text = line.lowercased()
+        if text.contains("downloading update (") { return .downloading(percent: Self.percent(line)) }
+        if text.contains("extracting package") || text.contains("installing update") || text.contains("cleaning up") { return .unpacking }
+        if text.contains("update complete") || text.contains("download skipped") || text.contains("verification complete") { return .opening }
+        if self == .opening { return self }
+        if text.contains("checking for") || text.contains("downloading manifest") || text.contains("verifying installation") { return .checking }
+        return self
     }
 }
 

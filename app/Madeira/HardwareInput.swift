@@ -1253,6 +1253,36 @@ final class HardwareInput: ObservableObject {
     // on change — which is the one optimisation that field exists for.
     // ========================================================================
 
+    /// ml1990 — PUBLISH SLOT 0 BEFORE THE GAME LOOKS. Device log: a game's input layer
+    /// (SDL) enumerated XInput once at startup, before the on-screen layout registered and
+    /// before a paired controller woke, and it only rescans on a device-arrival broadcast
+    /// that this port cannot deliver (no plug-and-play service). The pad then never existed
+    /// for that game. When the session will have a controller source (touch controls with
+    /// the layout shown, or a controller already paired), slot 0 is connected at rest from
+    /// the start; the live sampler takes it over as soon as a source arrives.
+    /// MADEIRA_PAD_EARLY_SLOT=0 restores on-demand connection.
+    func reservePadSlotForSession(touchControls: Bool) {
+        guard LibraryFlags.enabled("MADEIRA_PAD_EARLY_SLOT") else { return }
+        let paired = !GCController.controllers().isEmpty
+        guard touchControls || paired else { return }
+        padQueue.async { [weak self] in
+            guard let self, self.padTimer == nil else { return }
+            var st = winios_gamepad()
+            st.connected = 1
+            winios_gamepad_set_state(0, &st)
+        }
+        xlog("pad0 reserved for the session (touch=\(touchControls ? 1 : 0) paired=\(paired ? 1 : 0)) ml1990")
+    }
+
+    /// ml1990: the session ended; clear a reserved slot no source took over.
+    func releaseReservedPadSlot() {
+        guard LibraryFlags.enabled("MADEIRA_PAD_EARLY_SLOT"), !gamepadConnected, !OnScreenPad.shared.isLive else { return }
+        padQueue.async { [weak self] in
+            guard self?.padTimer == nil else { return }
+            winios_gamepad_set_state(0, nil)
+        }
+    }
+
     /// The layout gained or lost its last virtual-controller control. Called
     /// from `OnScreenPad.setPresent` on the main thread.
     func padScreenPresence(_ present: Bool) {

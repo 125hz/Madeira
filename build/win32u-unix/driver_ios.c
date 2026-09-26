@@ -1033,6 +1033,18 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
                     winios_window_frame( list[i], wr.left, wr.top, wr.right - wr.left, wr.bottom - wr.top,
                                          (style & WS_VISIBLE) && !IsRectEmpty( &wr ),
                                          cl.left, cl.top, cl.right - cl.left, cl.bottom - cl.top );
+                    {
+                        static unsigned logged;
+                        if (logged < 60)
+                        {
+                            logged++;
+                            dprintf( 2, "[child-layer] ml1730 parent=%p flags=%#x child=%p window={%d,%d,%d,%d} "
+                                        "client={%d,%d,%d,%d} vis=%d\n", hwnd, swp_flags, list[i],
+                                     (int)wr.left, (int)wr.top, (int)wr.right, (int)wr.bottom,
+                                     (int)cl.left, (int)cl.top, (int)cl.right, (int)cl.bottom,
+                                     (style & WS_VISIBLE) ? 1 : 0 );
+                        }
+                    }
                 }
                 free( list );
             }

@@ -93,6 +93,66 @@ class SteamLibraryFetcher {
 
     // MARK: - License List
 
+    /// Resolve only referenced content metadata; this never supplies depot keys
+    /// or grants access. Every subsequent content request still goes to Valve.
+    func fetchInstallInfo(appID: UInt32) async throws -> SteamAppInfo? {
+        try Task.checkCancellation()
+        guard var app = try await fetchAppInfo(appID: appID) else { return nil }
+        try Task.checkCancellation()
+        guard LibraryFlags.enabled("MADEIRA_STEAM_SHARED_METADATA") else { return app }
+        var owners: [UInt32: SteamAppInfo] = [appID: app]
+        var visited: Set<UInt32> = [appID], references = Set<String>()
+        func eligible(_ d: SteamAppInfo.DepotInfo) -> Bool {
+            !d.isSharedInstall && d.dlcAppID == nil && d.supports(os: "windows") &&
+                !d.lowViolence && (d.language.isEmpty || d.language.lowercased() == "english")
+        }
+        var pending = app.depots.filter { eligible($0) && $0.publicManifestID == nil && $0.fromApp != nil }
+            .map { ($0.fromApp!, $0.depotID) }
+        while let (id, depotID) = pending.popLast() {
+            try Task.checkCancellation()
+            if !references.insert("\(id):\(depotID)").inserted { continue }
+            guard references.count <= 1024 else { throw SteamFileError.invalid("Too many shared content references.") }
+            if visited.insert(id).inserted {
+                guard visited.count <= 32 else { throw SteamFileError.invalid("Too many shared content dependencies.") }
+                owners[id] = try await fetchAppInfo(appID: id)
+            }
+            if let source = owners[id]?.depots.first(where: { $0.depotID == depotID }),
+               source.publicManifestID == nil, let next = source.fromApp {
+                pending.append((next, depotID))
+            }
+        }
+        // Bounded fixed point handles nested sharing without recursion/cycles.
+        try Task.checkCancellation()
+        for _ in 0..<owners.count {
+            var changed = 0
+            for id in owners.keys.sorted() {
+                var owner = owners[id]!
+                changed += owner.inheritDepots(from: owners)
+                owners[id] = owner
+            }
+            if changed == 0 { break }
+        }
+        let resolved = app.inheritDepots(from: owners)
+        let missing = app.depots.filter { eligible($0) && $0.fromApp != nil && $0.publicManifestID == nil }
+        SteamLog.event("[steam-shared] ml1960 app=\(appID) owners=\(visited.count - 1) resolved=\(resolved) missing=\(missing.count)")
+        guard missing.isEmpty else { throw SteamFileError.invalid("Steam did not provide required shared content metadata. Refresh and retry the download.") }
+        // ml1970: the direct owner of each selected shared depot, for its install
+        // record. Metadata only; Valve still decides access and launch readiness.
+        if LibraryFlags.enabled("MADEIRA_STEAM_SHARED_RECORDS") {
+            for id in Set(app.installDepots().compactMap(\.fromApp)).subtracting([appID]).sorted() {
+                try Task.checkCancellation()
+                if owners[id] == nil {
+                    guard owners.count <= 64 else { break }
+                    owners[id] = try await fetchAppInfo(appID: id)
+                }
+                if let owner = owners[id] {
+                    app.sharedOwners[id] = .init(name: owner.name, installDir: owner.installDir, buildID: owner.buildID)
+                }
+            }
+        }
+        return app
+    }
+
     private func fetchLicenseList() async throws -> [UInt32] {
         try await session.awaitLicenseList(timeout: 15)
     }

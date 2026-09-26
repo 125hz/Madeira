@@ -219,8 +219,17 @@ def function(source, start):
 
 assert 'static let enabled = LibraryFlags.enabled("MADEIRA_CONTROL_PRESETS")' in src, 'kill switch'
 bar = function(src, "private func topBar(in geo: GeometryProxy) -> some View {")
-assert "if m.editing {" in bar and bar.index("if m.editing {") < bar.index("if ControlPresetsModel.enabled {") \
-    < bar.index("ControlPresetsMenu(screen: presetScreen(in: geo))"), 'presets button in the editor only, behind the switch'
+assert "if m.editing {" in bar and bar.index("if m.editing {") < bar.index("if ControlPresetsModel.enabled && !Self.editorDone {") \
+    < bar.index("ControlPresetsMenu(screen: presetScreen(in: geo))"), 'legacy presets button in the editor only, behind the switches'
+# ml1970: Done replaces the exit arrows in the editor; the show/hide glyph and pencil are hidden
+# there; layouts are chosen in the session menu, which refreshes the controls after a load.
+assert 'static let editorDone = LibraryFlags.enabled("MADEIRA_CONTROLS_EDITOR_DONE")' in src
+assert bar.index('if m.editing && Self.editorDone {') < bar.index('Text("Done")') < bar.index('glassButton("gamecontroller"')
+assert 'if !(m.editing && Self.editorDone) {' in bar
+library_src = (root / 'app/Madeira/Library.swift').read_text()
+assert 'if controls.visible && ControlPresetsModel.enabled { ControllerLayoutPicker' in library_src, 'layout picker only with touch controls on'
+assert 'Button("Create new layout", systemImage: "plus")' in library_src and 'while store.named("Custom Layout \\(n)")' in src
+assert 'm.layoutReplaced(reason: "preset")' in src and 'OnScreenPad.shared.rearm()' in function(src, "func layoutReplaced(reason: String) {")
 model = src[src.index("final class ControlPresetsModel"):src.index("/// ml — THE SIZE TO GIVE A WINDOW-LEVEL OVERLAY")]
 assert 'fputs("[control-presets] ml1530 \\(line)\\n", stderr)' in model and 'logged < 64' in model, 'log tag, capped'
 assert 'log("\\(verb) name=\\(p?.name ?? "?") controls=\\(count)")' in model

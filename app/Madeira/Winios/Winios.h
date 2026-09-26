@@ -387,3 +387,7 @@ int  madeira_get_diag_enabled(void);
  * the game's window is up and off when the session ends. Implemented in
  * build/ntdll-unix/signal_arm64_ios.c; each listed thread moves at its next wait. */
 void madeira_set_background_qos(int on);
+/* ml1800: threads of a frozen helper (MADEIRA_PARK_MODE=freeze) held right now, and the
+ * release used by the front end's watchdog when the game stops presenting. */
+int madeira_park_frozen(void);
+void madeira_park_thaw(void);

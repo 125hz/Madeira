@@ -106,6 +106,67 @@ enum StikJITHelper {
 
     private static var earlyInFlight = false
 
+    // ml1880: an early Dock pool cannot grow after debugger detach. If the user
+    // chooses desktop Steam instead, reserve its normal capacity for the next
+    // app run and stop before Wine starts. Explicit pool overrides still win.
+    private static let desktopPoolKey = "madeiraDockDesktopPoolNextRun"
+    // ml2000: Wine writes Documents/madeira-pool-pressure.txt (the pool size in MB)
+    // when a session runs the early pool dry; the pool cannot grow in that app run.
+    // The next run takes one step more (512 -> 896 -> 1152) and keeps it as a floor.
+    // MADEIRA_POOL_FEEDBACK=0 ignores the record (Wine: MADEIRA_POOL_PRESSURE_MARK=0).
+    private static let pressurePoolKey = "madeiraPoolPressureMB"
+    static func consumePoolPressure() -> Int {
+        guard LibraryFlags.enabled("MADEIRA_POOL_FEEDBACK") else { return 0 }
+        var floor = UserDefaults.standard.integer(forKey: pressurePoolKey)
+        if let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+            let url = docs.appendingPathComponent("madeira-pool-pressure.txt")
+            if let text = try? String(contentsOf: url, encoding: .utf8) {
+                try? FileManager.default.removeItem(at: url)
+                let used = Int(text.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+                let next = DockPerformancePolicy.poolAfterPressure(usedMB: max(used, floor))
+                if next > floor { floor = next; UserDefaults.standard.set(floor, forKey: pressurePoolKey) }
+                LogStore.shared.log("[pool-pressure] ml2000 last session ran a \(used)MB pool dry; early pool floor now \(floor)MB")
+            }
+        }
+        return (512...1152).contains(floor) ? floor : 0
+    }
+    static var poolPressureFloorMB: Int {
+        guard LibraryFlags.enabled("MADEIRA_POOL_FEEDBACK") else { return 0 }
+        let floor = UserDefaults.standard.integer(forKey: pressurePoolKey)
+        return (512...1152).contains(floor) ? floor : 0
+    }
+    /// ml2000: did the running session run the pool dry (file present, not yet consumed)?
+    static var poolPressureRecorded: Bool {
+        guard LibraryFlags.enabled("MADEIRA_POOL_FEEDBACK"),
+              let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return false }
+        return FileManager.default.fileExists(atPath: docs.appendingPathComponent("madeira-pool-pressure.txt").path)
+    }
+    private static let poolPolicyLock = NSLock() // never held across debugger allocation
+    private static var compactPoolSizeMB = 0 // protected by poolPolicyLock
+    static var explicitPoolMB: Int? {
+        guard let text = MadeiraConfig.get("pool"),
+              let mb = Int(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+              (256...1152).contains(mb) else { return nil }
+        return mb
+    }
+    static func rememberCompactPool(sizeMB: Int, selected: Bool) {
+        poolPolicyLock.lock()
+        if selected && sizeMB < 896 { compactPoolSizeMB = sizeMB }
+        poolPolicyLock.unlock()
+        if sizeMB >= 896 { UserDefaults.standard.removeObject(forKey: desktopPoolKey) }
+    }
+    static func reserveDesktopPoolIfNeeded(desktop: Bool, dock: Bool) -> Bool {
+        guard poolReady else { return false }
+        poolPolicyLock.lock()
+        let compactMB = compactPoolSizeMB
+        poolPolicyLock.unlock()
+        guard DockPerformancePolicy.needsDesktopRestart(compactPoolMB: compactMB,
+                explicit: explicitPoolMB, desktop: desktop, dock: dock) else { return false }
+        UserDefaults.standard.set(true, forKey: desktopPoolKey)
+        LogStore.shared.log("[dock-pool] ml1880 desktop held: compact pool=\(compactMB)MB; next run reserves desktop capacity")
+        return true
+    }
+
     /// Install the SIGTRAP fallback (skip a stray BRK, x0 = 0) once no debugger
     /// is attached -- but only before any Wine session was set up, because
     /// Wine installs and owns its own SIGTRAP handler from then on. Retried
@@ -161,10 +222,24 @@ enum StikJITHelper {
            !UserDefaults.standard.bool(forKey: OnboardingRules.doneKey) {
             sizeMB = 1152; source = "setup's Steam install and update, ml1570"
         }
+        let compactSelected = MadeiraDock.enabled && LibraryFlags.enabled("MADEIRA_DOCK_COMPACT_POOL")
+            && UserDefaults.standard.bool(forKey: OnboardingRules.doneKey)
+            && explicitPoolMB == nil && !UserDefaults.standard.bool(forKey: desktopPoolKey)
+        let pressureMB = consumePoolPressure()
+        sizeMB = DockPerformancePolicy.earlyPoolMB(legacy: sizeMB, explicit: explicitPoolMB,
+            dock: MadeiraDock.enabled, compact: LibraryFlags.enabled("MADEIRA_DOCK_COMPACT_POOL"),
+            setupComplete: UserDefaults.standard.bool(forKey: OnboardingRules.doneKey),
+            desktopReserved: UserDefaults.standard.bool(forKey: desktopPoolKey), pressureMB: pressureMB)
+        if compactSelected { source = "Dock compact default, ml1880" }
+        if pressureMB > 0 && sizeMB == pressureMB && explicitPoolMB == nil {
+            source = "an earlier session ran the pool dry, ml2000"
+        }
+        LogStore.shared.log("[dock-pool] ml1880 early=\(sizeMB)MB compact=\(compactSelected ? 1 : 0); MADEIRA_DOCK_COMPACT_POOL=0 restores desktop sizing")
         LogStore.shared.log("[jit-early] ml1330 trigger=\(trigger) allocating \(sizeMB)MB (\(source)) while the debugger is attached")
         DispatchQueue.global(qos: .userInitiated).async {
             let t0 = CFAbsoluteTimeGetCurrent()
             let pool = allocatePool(poolSize: sizeMB * 1024 * 1024)
+            if let pool { rememberCompactPool(sizeMB: pool.size / 1024 / 1024, selected: compactSelected) }
             if pool != nil { detachDebugger() }
             let seconds = CFAbsoluteTimeGetCurrent() - t0
             LogStore.shared.log(String(format: "[jit-early] ml1330 trigger=%@ pool=%@ size=%dMB seconds=%.2f detached=%d",
@@ -584,6 +659,8 @@ enum StikJITHelper {
                     }
                 }
                 let ceiling = min(vm_address_t(guestLo), vkr == KERN_SUCCESS && vmi.max_address > 0 ? vm_address_t(vmi.max_address) : 0)
+                LogStore.shared.log(String(format: "[pool-census] ml1740 walk ended at 0x%lx; ceiling 0x%lx (task_info kr=%d max=0x%llx)",
+                                           Int(prevEnd), Int(ceiling), vkr, UInt64(vmi.max_address)))
                 if ceiling > prevEnd && ceiling - prevEnd >= 64 << 20 {
                     holes.append((prevEnd, ceiling - prevEnd))
                     LogStore.shared.log(String(format: "[pool-census] ml1690 tail hole 0x%lx+%luMB counted (ceiling 0x%lx)",
@@ -623,7 +700,16 @@ enum StikJITHelper {
                         + "an x64 main image with no relocations will load elsewhere this run", level: .info)
                 }
             }
-            if largest < vm_address_t(poolSize) && !windowSurrenderedNow {
+            // ml1740: NO SHRINK BY DEFAULT. This fork's placement (the kernel's pick, then
+            // explicit 1 GB-stepped candidates below the guest band) always found room for
+            // the full pool above the shared cache before the merge; shrinking here first
+            // turned an unlucky low layout into a 608 MB pool that stalled the Steam client
+            // (device logs ml1640 and ml1730). MADEIRA_POOL_SHRINK=1 restores upstream's shrink.
+            if largest < vm_address_t(poolSize) && !windowSurrenderedNow
+                && !LibraryFlags.enabled("MADEIRA_POOL_SHRINK", fallback: false) {
+                LogStore.shared.log("[pool-census] ml1740 no low hole fits \(poolSize >> 20)MB (largest \(largest >> 20)MB); "
+                    + "keeping the size, placement looks higher")
+            } else if largest < vm_address_t(poolSize) && !windowSurrenderedNow {
                 let fit = Int(largest) & ~((16 << 20) - 1)
                 if fit >= 256 << 20 {
                     LogStore.shared.log("ml1036: no hole fits a \(poolSize >> 20)MB pool — SHRINKING to \(fit >> 20)MB "

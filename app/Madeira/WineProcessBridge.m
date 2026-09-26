@@ -437,6 +437,70 @@ extern void wine_log_set_file(const char *path);
 
 static pthread_t g_wine_thread;
 static int g_wine_running = 0;
+// ml1850: publish status and validity together; guest exits run off-main.
+// Only the known host's numeric status is retained, never arbitrary names.
+static uint64_t g_dock_exit = 0;
+// ml2000: the last program that ended with an NTSTATUS error (0xC...) in this
+// session, so the library can say the game stopped instead of just returning.
+// Numeric status only. Launcher/helper images are not programs the user ran.
+// MADEIRA_EXIT_REPORT=0 turns the record off.
+static uint64_t g_crash_exit = 0;
+void wine_dock_exit_reset(void) {
+    __atomic_store_n(&g_dock_exit, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_crash_exit, 0, __ATOMIC_RELEASE);
+}
+static int madeira_exit_is_helper(const char *image) {
+    static const char *const helpers[] = { "dockhost.exe", "steam.exe", "steamwebhelper.exe",
+        "steamservice.exe", "steamerrorreporter.exe", "steamerrorreporter64.exe", "services.exe",
+        "winedevice.exe", "explorer.exe", "plugplay.exe", "rpcss.exe", "svchost.exe", "conhost.exe",
+        "cmd.exe", "rundll32.exe", "wineboot.exe", "start.exe", "tabtip.exe", "crashpad_handler.exe" };
+    for (size_t i = 0; i < sizeof(helpers) / sizeof(helpers[0]); i++)
+        if (!strcasecmp(image, helpers[i])) return 1;
+    return 0;
+}
+int wine_crash_exit_status(uint32_t *status) {
+    uint64_t value = __atomic_load_n(&g_crash_exit, __ATOMIC_ACQUIRE);
+    if (!(value >> 32)) return 0;
+    if (status) *status = (uint32_t)value;
+    return 1;
+}
+// ml2000: programs (not launcher/helper images) started and still running in
+// this session. A Dock session's desktop outlives its game; the library ends
+// the session once every program it saw has exited. Counters only.
+static int g_programs_started = 0, g_programs_live = 0;
+void wine_process_did_start(const char *image) {
+    if (!image || madeira_exit_is_helper(image)) return;
+    __atomic_add_fetch(&g_programs_started, 1, __ATOMIC_ACQ_REL);
+    __atomic_add_fetch(&g_programs_live, 1, __ATOMIC_ACQ_REL);
+}
+int wine_programs_started(void) { return __atomic_load_n(&g_programs_started, __ATOMIC_ACQUIRE); }
+int wine_programs_live(void) { return __atomic_load_n(&g_programs_live, __ATOMIC_ACQUIRE); }
+void wine_programs_reset(void) {
+    __atomic_store_n(&g_programs_started, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_programs_live, 0, __ATOMIC_RELEASE);
+}
+void wine_process_did_exit(const char *image, int status) {
+    if (image && !madeira_exit_is_helper(image)) {
+        int live = __atomic_load_n(&g_programs_live, __ATOMIC_ACQUIRE);
+        while (live > 0 && !__atomic_compare_exchange_n(&g_programs_live, &live, live - 1, 0,
+                                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {}
+    }
+    if (image && (uint32_t)status >= 0xC0000000u && !madeira_exit_is_helper(image)) {
+        const char *off = getenv("MADEIRA_EXIT_REPORT");
+        if (!off || off[0] != '0')
+            __atomic_store_n(&g_crash_exit, (UINT64_C(1) << 32) | (uint32_t)status, __ATOMIC_RELEASE);
+    }
+    if (!image || strcasecmp(image, "dockhost.exe")) return;
+    uint64_t expected = 0;
+    __atomic_compare_exchange_n(&g_dock_exit, &expected,
+        (UINT64_C(1) << 32) | (uint32_t)status, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+}
+int wine_dock_exit_status(int *status) {
+    uint64_t value = __atomic_load_n(&g_dock_exit, __ATOMIC_ACQUIRE);
+    if (!(value >> 32)) return 0;
+    if (status) *status = (int32_t)(uint32_t)value;
+    return 1;
+}
 static char *g_prefix_path = NULL;
 
 /***********************************************************************

@@ -7,6 +7,7 @@ steam.exe aside and back on a temporary directory. Never runs Wine."""
 from pathlib import Path
 import subprocess
 import tempfile
+import dock_contract
 
 root = Path(__file__).resolve().parents[2]
 app = root / 'app/Madeira'
@@ -75,6 +76,7 @@ func madeira_set_vsync_locked(_ mode: Int32) {}
 '''
 stubs = stubs.replace('MERGE_METHODS', library[library.index('    func mergeSteam('):library.index('    private func persist(')])
 
+stubs += dock_contract.source(app)
 checks = r'''
 import Foundation
 @main struct Checks {
@@ -136,6 +138,9 @@ import Foundation
         defaults.removePersistentDomain(forName: "madeira-onboarding-check")
 
         require(R.steps(steam: true, nativeSteam: true) == [.welcome, .steamClient, .signIn, .done], "full setup")
+        require(R.steps(steam: true, nativeSteam: true, dock: true) == [.welcome, .signIn, .steamClient, .done], "Dock signs in natively before installing files")
+        require(R.steps(steam: false, nativeSteam: true, dock: true) == [.welcome, .done], "Dock cannot enable disabled Steam")
+        require(R.steps(steam: true, nativeSteam: false, dock: true) == [.welcome, .steamClient, .done], "Dock requires native sign-in")
         require(R.steps(steam: true, nativeSteam: false) == [.welcome, .steamClient, .done], "no native sign-in page")
         require(R.steps(steam: false, nativeSteam: true) == [.welcome, .done], "no Steam pages without Steam")
         require(R.Step.steamClient.rawValue == "steam-client" && R.Step.signIn.rawValue == "sign-in", "log step names")

@@ -4,10 +4,8 @@ import Combine
 
 // ml1530: first-run setup. On a new install (no `madeiraOnboardingDone` in
 // UserDefaults, which iOS removes with the app) the library opens this full-screen
-// setup: welcome, install the Windows Steam client (which also creates drive_c on
-// its first start), sign in to Steam in Madeira, done. The Steam install runs in
-// the Wine desktop with a "Tap when Steam is installed…" button over it; that
-// button closes the session gracefully and setup checks for steam.exe.
+// setup. ml1910 defaults to native sign-in, verified Valve component preparation,
+// then the library. The desktop installer remains an explicit fallback.
 // MADEIRA_ONBOARDING=0 never opens it. Settings › "Run setup again" reopens it.
 // Log tag: [onboarding] ml1530.
 
@@ -23,8 +21,9 @@ enum OnboardingRules {
 
     /// The pages of the first-run setup. The Steam client page needs Steam
     /// support; the sign-in page needs Madeira's own Steam client too.
-    static func steps(steam: Bool, nativeSteam: Bool) -> [Step] {
+    static func steps(steam: Bool, nativeSteam: Bool, dock: Bool = false) -> [Step] {
         guard steam else { return [.welcome, .done] }
+        if nativeSteam && dock { return [.welcome, .signIn, .steamClient, .done] }
         return nativeSteam ? [.welcome, .steamClient, .signIn, .done] : [.welcome, .steamClient, .done]
     }
 
@@ -173,9 +172,16 @@ extension LibraryEntry {
     @Published private(set) var finishing = false
     @Published private(set) var starting = false
     @Published private(set) var checking = false
+    @Published private(set) var runtimePhase = ""
+    private var runtimeTask: Task<Void, Never>?
     /// The last check after an install session found no steam.exe.
     @Published private(set) var installMissing = false
     @Published var message: String?
+    /// ml1770: the Steam install's stage for the starting screen; nil outside setup's
+    /// session or with MADEIRA_SETUP_STAGES=0.
+    @Published private(set) var setupStage: SteamSetupStage?
+    private var stageTimer: Timer?
+    private var stageLines = 0
     private var watch: AnyCancellable?
     private var considered = false
 
@@ -190,7 +196,7 @@ extension LibraryEntry {
 
     var steps: [Step] {
         guard purpose == .firstRun else { return [.steamClient] }
-        return OnboardingRules.steps(steam: LibraryFlags.enabled("MADEIRA_STEAM"), nativeSteam: SteamAccountModel.enabled)
+        return OnboardingRules.steps(steam: LibraryFlags.enabled("MADEIRA_STEAM"), nativeSteam: SteamAccountModel.enabled, dock: MadeiraDock.enabled)
     }
 
     /// The library appeared: open setup once per run on a new install.
@@ -217,6 +223,7 @@ extension LibraryEntry {
         guard LibraryModel.shared.current == nil else { return }
         self.purpose = purpose; message = nil; installMissing = false
         LogStore.shared.log("[onboarding] ml1530 shown reason=\(reason) purpose=\(purpose.rawValue)")
+        LogStore.shared.log("[dock-defaults] ml1910 dock=\(MadeiraDock.enabled ? 1 : 0) native-setup=\(MadeiraDock.nativeSetupEnabled ? 1 : 0)")
         go(step)
         presented = true
     }
@@ -254,6 +261,35 @@ extension LibraryEntry {
 
     // MARK: Steam client install
 
+    // ml1900: trial native preparation; retain the installer as an explicit
+    // fallback until the owner confirms authentication on a clean prefix.
+    func prepareRuntime() {
+        guard !starting, !checking, LibraryModel.shared.current == nil else { return }
+        starting = true; message = nil
+        runtimePhase = "Preparing download…"
+        LogStore.shared.log("[dock-setup] ml1900 native preparation started")
+        let prefix = LibraryModel.drive.deletingLastPathComponent()
+        runtimeTask = Task {
+            defer { starting = false; runtimeTask = nil }
+            do {
+                try await SteamRuntimeInstaller.shared.prepare(prefix: prefix) { phase in
+                    await MainActor.run { self.runtimePhase = phase }
+                }
+                await checkClient()
+                guard SteamLibraryModel.shared.snapshot.client != nil else { throw SteamRuntimeFiles.Failure.prefixMissing }
+                LogStore.shared.log("[dock-setup] ml1900 verified runtime prepared; no Wine session started")
+            } catch where Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
+                message = "Setup cancelled. You can try again when you're ready."
+                LogStore.shared.log("[dock-setup] ml1900 native preparation cancelled")
+            } catch {
+                message = error.localizedDescription
+                LogStore.shared.log("[dock-setup] ml1900 preparation failed; existing files retained", level: .error)
+            }
+        }
+    }
+
+    func cancelRuntime() { runtimeTask?.cancel() }
+
     func downloadInstaller() {
         message = nil; SteamLibraryModel.shared.error = nil
         LogStore.shared.log("[onboarding] ml1530 installer download")
@@ -279,6 +315,7 @@ extension LibraryEntry {
             await SteamAccountModel.shared.holdForSteamInstall()
             client.stopScan()
             installSession = true; finishing = false
+            startStages()
             presented = false
             // The setup screen finishes dismissing before the session takes over.
             try? await Task.sleep(nanoseconds: 500_000_000)
@@ -290,6 +327,7 @@ extension LibraryEntry {
             }
             // The session did not start (JIT, validation): back to this page.
             installSession = false
+            stopStages()
             message = LibraryModel.shared.error ?? "Steam's installer could not start. Try again."
             LibraryModel.shared.error = nil
             LogStore.shared.log("[onboarding] ml1530 installer did not start")
@@ -315,6 +353,7 @@ extension LibraryEntry {
     private func sessionChanged(running: Bool) {
         guard !running, installSession else { return }
         installSession = false; finishing = false
+        stopStages()
         LogStore.shared.log("[onboarding] ml1530 install session ended")
         EndedSessionSurface.hide(reason: "install-session-ended")
         go(.steamClient)
@@ -323,6 +362,35 @@ extension LibraryEntry {
             self?.presented = true
             Task { await self?.checkClient(afterInstall: true) }
         }
+    }
+
+    // MARK: ml1770 install stage
+
+    /// Follows the client's updater log every 2 s, off the main thread.
+    private func startStages() {
+        stopStages()
+        guard LibraryFlags.enabled("MADEIRA_SETUP_STAGES") else { return }
+        let follower = SetupStageFollower(log: SteamInstallPaths.root.appendingPathComponent("logs/bootstrap_log.txt"),
+                                          drive: LibraryModel.drive)
+        setupStage = .installing; stageLines = 0
+        LogStore.shared.log("[setup-stage] ml1770 follow stage=installing")
+        let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+            follower.poll { stage in
+                Task { @MainActor in
+                    guard let self, self.stageTimer != nil, self.setupStage != stage else { return }
+                    self.setupStage = stage
+                    // Changes only; download percentages make this at most 24 lines per install.
+                    if self.stageLines < 24 { self.stageLines += 1; LogStore.shared.log("[setup-stage] ml1770 stage=\(stage.name)") }
+                }
+            }
+        }
+        stageTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopStages() {
+        stageTimer?.invalidate(); stageTimer = nil
+        setupStage = nil
     }
 
     /// Scans drive_c for steam.exe (and moves a set-aside Steam folder back).
@@ -393,6 +461,10 @@ struct OnboardingView: View {
     @State private var signIn = false
     @State private var restartAlert = false   // ml1540
     @State private var jitReady = StikJITHelper.readyToLaunch
+    @State private var desktopSetup = false
+    private var nativeSetup: Bool {
+        MadeiraDock.nativeSetupEnabled && !desktopSetup
+    }
     private let ticks = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -465,17 +537,54 @@ struct OnboardingView: View {
                 .font(.title3)
             if model.steps.contains(.steamClient) {
                 Text("A few steps get you ready:").foregroundStyle(.secondary)
-                point(1, "Install Steam for Windows inside Madeira.")
-                if model.steps.contains(.signIn) { point(2, "Sign in to Steam in Madeira, so your games show up here.") }
+                if MadeiraDock.enabled {
+                    point(1, "Sign in to Steam in Madeira.")
+                    point(2, nativeSetup ? "Let Madeira prepare Steam's official components." : "Install Steam's Windows files for Madeira Dock.")
+                } else {
+                    point(1, "Install Steam for Windows inside Madeira.")
+                    if model.steps.contains(.signIn) { point(2, "Sign in to Steam in Madeira, so your games show up here.") }
+                }
             }
             primary("Get started", symbol: "arrow.right") { model.next() }.padding(.top, 8)
         }
     }
 
-    private var steamClient: some View {
+    @ViewBuilder private var steamClient: some View {
+        if nativeSetup { nativeRuntimePage } else { desktopClientPage }
+    }
+
+    private var nativeRuntimePage: some View {
         VStack(alignment: .leading, spacing: 18) {
-            header("Install Steam for Windows", symbol: "desktopcomputer")
-            Text("Steam for Windows runs inside Madeira. Madeira needs it to start the games in your Steam library.")
+            header("Prepare Madeira Dock", symbol: "shippingbox")
+            Text("Madeira downloads Steam's official components directly from Valve. You won't need to open a Windows desktop or sign in a second time.")
+            if client.snapshot.client != nil {
+                Label("Steam components are available.", systemImage: "checkmark.circle.fill")
+                    .font(.headline).foregroundStyle(.green)
+                primary(model.purpose == .steamClient ? "Done" : "Continue", symbol: "arrow.right") {
+                    if model.purpose == .steamClient { model.finish() } else { model.next() }
+                }
+            } else if model.starting || model.checking {
+                HStack(spacing: 12) {
+                    ProgressView()
+                    Text(model.starting ? model.runtimePhase : "Checking Steam components…").foregroundStyle(.secondary)
+                }
+                if model.starting { secondary("Cancel") { model.cancelRuntime() } }
+            } else {
+                Text("About 73 MB to download. Keep Madeira open while setup finishes.").foregroundStyle(.secondary)
+                if let message = model.message { Text(message).foregroundStyle(.red) }
+                primary("Prepare Steam components", symbol: "arrow.down.circle.fill") { model.prepareRuntime() }
+                secondary("Use desktop setup instead") { desktopSetup = true }
+                if model.purpose == .firstRun { secondary("Set up later") { model.next() } }
+            }
+        }
+    }
+
+    private var desktopClientPage: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            header(MadeiraDock.enabled ? "Prepare Madeira Dock" : "Install Steam for Windows", symbol: "desktopcomputer")
+            Text(MadeiraDock.enabled
+                 ? "Madeira Dock uses Steam's official Windows files to start your games. This first test still uses Valve's installer to prepare those files."
+                 : "Steam for Windows runs inside Madeira. Madeira needs it to start the games in your Steam library.")
             if client.snapshot.client != nil {
                 Label("Steam for Windows is installed.", systemImage: "checkmark.circle.fill")
                     .font(.headline).foregroundStyle(.green)
@@ -488,8 +597,8 @@ struct OnboardingView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     point(1, "Madeira downloads Steam's official installer from Valve.")
                     point(2, "The installer opens in a Windows desktop. Follow its steps. Steam then updates itself, which can take several minutes.")
-                    point(3, "Sign in to Steam in its window.")
-                    point(4, "Then tap “Tap when Steam is installed and you're signed in” at the top of the screen to come back here.")
+                    point(3, MadeiraDock.enabled ? "Wait until Steam finishes updating and its sign-in window appears. Dock uses your Madeira sign-in when you play." : "Sign in to Steam in its window.")
+                    point(4, MadeiraDock.enabled ? "Tap “Steam files are installed” at the top to return to Madeira." : "Then tap “Tap when Steam is installed and you're signed in” at the top of the screen to come back here.")
                 }
                 if model.installMissing {
                     Label("Madeira could not find Steam yet. The installer may not have finished. Try again, and wait for Steam's sign-in window before you tap the button.",
@@ -523,11 +632,13 @@ struct OnboardingView: View {
     private var signInPage: some View {
         VStack(alignment: .leading, spacing: 18) {
             header("Sign in to Steam in Madeira", symbol: "person.crop.circle.badge.checkmark")
-            Text("This second sign-in lets Madeira show your Steam library and install your games from inside Madeira, instead of in the Steam window.")
+            Text(MadeiraDock.enabled
+                 ? "Sign in here to see your library and download games. When you play, Madeira Dock hands your sign-in to Steam's official client, which checks your license."
+                 : "Sign in here to show your Steam library and install your games from inside Madeira.")
             VStack(alignment: .leading, spacing: 10) {
-                Label("Your account name and password go only to Steam, never to Madeira or anyone else.", systemImage: "lock.fill")
-                Label("Your sign-in is stored only on this device, in its Keychain.", systemImage: "iphone")
-                Label("We care about your privacy and security.", systemImage: "hand.raised.fill")
+                Label("Madeira sends your sign-in directly to Steam. Your password is not saved.", systemImage: "lock.fill")
+                Label("Madeira saves your Steam sign-in in this device's Keychain.", systemImage: "iphone")
+                if MadeiraDock.enabled { Label("Steam Guard may ask you to approve your sign-in.", systemImage: "checkmark.shield") }
             }.font(.subheadline).foregroundStyle(.secondary)
             if steam.phase == .signedIn {
                 Label("Signed in as \(steam.accountName)", systemImage: "checkmark.circle.fill").font(.headline).foregroundStyle(.green)
@@ -570,6 +681,26 @@ struct OnboardingView: View {
     }
 }
 
+/// ml1770: the updater log's tail and stage, touched only on its own queue.
+private final class SetupStageFollower: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "madeira.setup-stage", qos: .utility)
+    private let log: URL, drive: URL
+    private var tail = SteamLogTail()
+    private var stage = SteamSetupStage.installing
+    private var busy = false
+
+    init(log: URL, drive: URL) { self.log = log; self.drive = drive }
+
+    func poll(_ done: @escaping @Sendable (SteamSetupStage) -> Void) {
+        queue.async { [self] in
+            guard !busy else { return }
+            busy = true; defer { busy = false }
+            for line in tail.read(SteamPaths.existing(log, drive: drive) ?? log) { stage = stage.after(line) }
+            done(stage)
+        }
+    }
+}
+
 /// ml1530: over the Wine desktop while setup's Steam install runs.
 struct OnboardingFinishButton: View {
     @ObservedObject private var model = OnboardingModel.shared
@@ -577,7 +708,7 @@ struct OnboardingFinishButton: View {
         Button { model.finishInstall() } label: {
             HStack(spacing: 8) {
                 if model.finishing { ProgressView().tint(.white) } else { Image(systemName: "checkmark.circle.fill") }
-                Text(model.finishing ? "Closing Steam…" : "Tap when Steam is installed and you're signed in")
+                Text(model.finishing ? "Closing Steam…" : (MadeiraDock.enabled ? "Steam files are installed" : "Tap when Steam is installed and you're signed in"))
                     .fontWeight(.semibold).multilineTextAlignment(.center)
             }.padding(.horizontal, 6).frame(minHeight: 36)
         }
@@ -599,5 +730,26 @@ struct OnboardingFinishButton: View {
     private static func publish(_ frame: CGRect) {
         guard LibraryFlags.enabled("MADEIRA_SETUP_BUTTON_HITTEST") else { return }
         LibraryModel.shared.finishButtonRect = frame.insetBy(dx: -8, dy: -8)
+    }
+}
+
+// MARK: - ml1970 start modes
+
+/// ml1970: how a Steam game starts. Madeira Dock is the default whenever it is enabled and
+/// Valve's client components are present; regular Steam needs the desktop client.
+enum SteamStartMode: Hashable { case dock, game, steam }
+
+extension LibraryEntry {
+    @MainActor var steamStartMode: SteamStartMode {
+        guard startsWithClient else { return .game }
+        return MadeiraDock.enabled && steamDesktopLaunch != true ? .dock : .steam
+    }
+    mutating func setSteamStartMode(_ mode: SteamStartMode) {
+        switch mode {
+        case .game: steamClientLaunch = false; steamDesktopLaunch = nil
+        case .dock: steamClientLaunch = true; steamDesktopLaunch = nil
+        case .steam: steamClientLaunch = true; steamDesktopLaunch = MadeiraDock.enabled ? true : nil
+        }
+        LogStore.shared.log("[steam-start] ml1970 app=\(steamAppID ?? 0) mode=\(mode)")
     }
 }

@@ -1211,6 +1211,52 @@ static NSMutableDictionary<NSNumber *, NSValue *> *g_surf_sizes; /* hwnd → sur
 static NSMutableDictionary<NSNumber *, NSValue *> *g_surf_org;   /* hwnd → surface origin, window-local px */
 static NSMutableDictionary<NSNumber *, CAMetalLayer *> *g_metal_layers; /* hwnd → DXMT layer */
 static NSMutableDictionary<NSNumber *, NSValue *> *g_client_rects;      /* hwnd → client px rect */
+/* ml2000: hwnd → PEB of the process that framed it (main thread only). A
+ * process that dies without destroying its windows (crash, TerminateProcess)
+ * never runs pDestroyWindow, and its last frame stayed on screen after exit.
+ * MADEIRA_WINIOS_EXIT_SWEEP=0 keeps such layers. */
+static NSMutableDictionary<NSNumber *, NSNumber *> *g_hwnd_owner;
+/* ml2000: desktop fit state (winios_desktop_fit below), main thread only. */
+static NSNumber *g_fit_key;
+static CGRect g_fit_client_px;   /* the window's client rect, desktop px */
+static CGRect g_fit_view_pt;     /* where it is shown, compositor-view points */
+extern void *madeira_current_peb(void) __attribute__((weak));
+static uintptr_t winios_caller_owner(void) {
+    if ([NSThread isMainThread] || !madeira_current_peb) return 0;
+    static int enabled = -1;
+    if (enabled < 0) { const char *e = getenv("MADEIRA_WINIOS_EXIT_SWEEP"); enabled = !(e && e[0] == '0'); }
+    return enabled ? (uintptr_t)madeira_current_peb() : 0;
+}
+static void winios_note_owner(NSNumber *key, uintptr_t owner) {   /* main thread */
+    if (!owner) return;
+    if (!g_hwnd_owner) g_hwnd_owner = [NSMutableDictionary new];
+    g_hwnd_owner[key] = @(owner);
+}
+
+/* ml2000: called by ntdll's exit wrapper on a thread of the exiting process. */
+void winios_process_exited(void *peb) {
+    uintptr_t owner = (uintptr_t)peb;
+    if (!owner) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!g_hwnd_owner.count) return;
+        NSMutableArray<NSNumber *> *gone = [NSMutableArray new];
+        [g_hwnd_owner enumerateKeysAndObjectsUsingBlock:^(NSNumber *key, NSNumber *value, BOOL *stop) {
+            if (value.unsignedLongLongValue == owner) [gone addObject:key];
+        }];
+        if (!gone.count) return;
+        unsigned metal = 0;
+        for (NSNumber *key in gone) {
+            HWND hwnd = (HWND)(uintptr_t)key.unsignedLongLongValue;
+            [g_hwnd_owner removeObjectForKey:key];
+            if (g_metal_layers[key]) metal++;
+            winios_census_forget(hwnd);
+            winios_remove_layer(hwnd);
+        }
+        fprintf(stderr, "[winios] ml2000 process exit: retired %lu window layer(s), %u Metal\n",
+                (unsigned long)gone.count, metal);
+        fflush(stderr);
+    });
+}
 static void winios_place_metal_layer(NSNumber *key);
 
 /* ml1110 — MADEIRA_SURFACE_EXACT=0 restores the pre-ml1110 placement (layer
@@ -1516,6 +1562,7 @@ static void winios_remove_layer(HWND hwnd) {
             [ml removeFromSuperlayer];
             [g_metal_layers removeObjectForKey:key];
             [g_client_rects removeObjectForKey:key];
+            if (g_fit_key && [g_fit_key isEqual:key]) g_fit_key = nil;   /* ml2000 */
             fprintf(stderr, "[winios] metal layer removed for hwnd=%p\n", hwnd);
             fflush(stderr);
         }
@@ -1537,6 +1584,54 @@ static void winios_remove_layer(HWND hwnd) {
 /* main thread only — frame the metal sublayer to the client rect in the
  * parent (window) layer's coordinate space. Parent bounds are the window
  * rect in points, so client offset = (client_px - window_px) * scale. */
+/* ml2000: DESKTOP FIT. A presenting window whose client area does not fit the
+ * wine desktop (a 1920x1080 window on a 1280x720 desktop) was cropped: only its
+ * top-left showed, under a title bar, which looked like a frozen, non-fullscreen
+ * game. Its Metal layer is instead aspect-fitted to the whole desktop, and taps
+ * and the arrow are mapped through the same rectangle so the program still gets
+ * its own client coordinates. Main thread only. MADEIRA_DESKTOP_FIT=0 crops. */
+static int winios_desktop_fit_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) { const char *e = getenv("MADEIRA_DESKTOP_FIT"); enabled = !(e && e[0] == '0'); }
+    return enabled;
+}
+static BOOL winios_desktop_fit(NSNumber *key, CAMetalLayer *ml, CGRect c) {
+    int desk_w = 0, desk_h = 0;
+    winios_screen_size(&desk_w, &desk_h);
+    CGRect desk = CGRectMake(0, 0, desk_w, desk_h);
+    BOOL outside = desk_w > 0 && desk_h > 0 && c.size.width >= 64 && c.size.height >= 64
+        && !CGRectContainsRect(CGRectInset(desk, -8, -8), c);
+    if (!winios_desktop_fit_enabled() || !outside || !ml.superlayer || !g_compositor_view) {
+        if (g_fit_key && [g_fit_key isEqual:key]) g_fit_key = nil;
+        return NO;
+    }
+    CGFloat k = MIN(desk_w / c.size.width, desk_h / c.size.height) * g_px_to_pt;
+    CGSize sz = CGSizeMake(c.size.width * k, c.size.height * k);
+    CGRect view = CGRectMake(g_desk_origin.x + (desk_w * g_px_to_pt - sz.width) / 2,
+                             g_desk_origin.y + (desk_h * g_px_to_pt - sz.height) / 2, sz.width, sz.height);
+    ml.frame = [ml.superlayer convertRect:view fromLayer:g_compositor_view.layer];
+    BOOL changed = !g_fit_key || ![g_fit_key isEqual:key] || !CGRectEqualToRect(g_fit_client_px, c);
+    g_fit_key = key; g_fit_client_px = c; g_fit_view_pt = view;
+    static unsigned logged;
+    if (changed && logged < 16) {
+        logged++;
+        fprintf(stderr, "[desktop-fit] ml2000 hwnd=0x%llx client-px={%.0f,%.0f %.0fx%.0f} desk=%dx%d -> view=(%.1f,%.1f %.1fx%.1f)\n",
+                key.unsignedLongLongValue, c.origin.x, c.origin.y, c.size.width, c.size.height, desk_w, desk_h,
+                view.origin.x, view.origin.y, view.size.width, view.size.height);
+    }
+    return YES;
+}
+/* ml2000: desktop px -> compositor-view points through the fitted window, if any. */
+static BOOL winios_desktop_fit_map(CGFloat x, CGFloat y, CGPoint *pt, CGFloat *scale) {
+    if (!g_fit_key || g_fit_client_px.size.width <= 0 || !CGRectContainsPoint(g_fit_client_px, CGPointMake(x, y)))
+        return NO;
+    CGFloat k = g_fit_view_pt.size.width / g_fit_client_px.size.width;
+    if (pt) *pt = CGPointMake(g_fit_view_pt.origin.x + (x - g_fit_client_px.origin.x) * k,
+                              g_fit_view_pt.origin.y + (y - g_fit_client_px.origin.y) * k);
+    if (scale) *scale = k;
+    return YES;
+}
+
 static void winios_place_metal_layer(NSNumber *key) {
     CAMetalLayer *ml = g_metal_layers[key];
     if (!ml) return;
@@ -1553,6 +1648,20 @@ static void winios_place_metal_layer(NSNumber *key) {
     ml.frame = CGRectMake((c.origin.x - org.x) * s,
                           (c.origin.y - org.y) * s,
                           c.size.width * s, c.size.height * s);
+    winios_desktop_fit(key, ml, c);   /* ml2000 */
+    {   /* ml1730: where the swapchain layer went, and where its window layer is. */
+        static unsigned logged;
+        if (logged < 60) {
+            logged++;
+            CALayer *parent = ml.superlayer;
+            fprintf(stderr, "[metal-place] ml1730 hwnd=0x%llx win-px={%.0f,%.0f %.0fx%.0f} client-px={%.0f,%.0f %.0fx%.0f} "
+                            "metal=(%.1f,%.1f %.1fx%.1f) in window-layer=(%.1f,%.1f %.1fx%.1f)\n",
+                    key.unsignedLongLongValue, w.origin.x, w.origin.y, w.size.width, w.size.height,
+                    c.origin.x, c.origin.y, c.size.width, c.size.height,
+                    ml.frame.origin.x, ml.frame.origin.y, ml.frame.size.width, ml.frame.size.height,
+                    parent.frame.origin.x, parent.frame.origin.y, parent.frame.size.width, parent.frame.size.height);
+        }
+    }
 }
 
 /* Called by IOSDisplayShim on a wine thread when DXMT creates a swapchain
@@ -1560,11 +1669,13 @@ static void winios_place_metal_layer(NSNumber *key) {
  * the shim CFRetains it for DXMT's lifetime handling. */
 CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
     __block CAMetalLayer *result = nil;
+    uintptr_t owner = winios_caller_owner();   /* ml2000 */
     void (^make)(void) = ^{
         winios_ensure_compositor();
         if (!g_compositor_view) return;
         if (!g_metal_layers) g_metal_layers = [NSMutableDictionary new];
         NSNumber *key = @((uintptr_t)hwnd);
+        winios_note_owner(key, owner);
         CAMetalLayer *ml = g_metal_layers[key];
         if (!ml) {
             CALayer *win = winios_layer_for(hwnd, true);
@@ -1598,11 +1709,13 @@ void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
     /* ml1490: here, not in the block below — the census asks win32u about the
      * window, which needs this wine thread. No-op unless the app turned it on. */
     winios_census_note_frame(hwnd, x, y, w, h, visible);
+    uintptr_t owner = winios_caller_owner();   /* ml2000 */
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!winios_ensure_window_host()) return;
         CALayer *l = winios_layer_for(hwnd, true);
         if (!l) return;
         NSNumber *key = @((uintptr_t)hwnd);
+        winios_note_owner(key, owner);
         g_px_rects[key] = [NSValue valueWithCGRect:CGRectMake(x, y, w, h)];
         if (!g_client_rects) g_client_rects = [NSMutableDictionary new];
         g_client_rects[key] = [NSValue valueWithCGRect:CGRectMake(cx, cy, cw, ch)];
@@ -2259,6 +2372,25 @@ void winios_cursor_reveal(void) {
     static unsigned notes;
     static CFAbsoluteTime last_note;
     if (!winios_cursor_reveal_enabled() || winios_cursor_desktop_mode()) return;
+    /* ml1980: a program that has never supplied a cursor image draws its own pointer
+     * (device log: no cursor ever set, fullscreen D3D window, input through raw input).
+     * Revealing the fallback arrow then shows a second pointer the program ignores, and
+     * the user aims with it. MADEIRA_CURSOR_REVEAL_UNSET=1 reveals it anyway. */
+    if (g_cur_w == 0) {
+        static int reveal_unset = -1;
+        static int logged;
+        if (reveal_unset < 0) {
+            const char *value = getenv("MADEIRA_CURSOR_REVEAL_UNSET");
+            reveal_unset = value && !strcmp(value, "1");
+        }
+        if (!reveal_unset) {
+            if (!logged) {
+                logged = 1;
+                fprintf(stderr, "[cursor-reveal] ml1980 program never set a cursor; no drawn arrow (it draws its own)\n");
+            }
+            return;
+        }
+    }
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     int pending = now < g_cursor_reveal_until;
     g_cursor_reveal_until = now + WINIOS_CURSOR_REVEAL_SECONDS;
@@ -2324,6 +2456,16 @@ static void winios_cursor_place(void) {
     if (!g_cursor_layer) return;
     if (winios_cursor_desktop_mode()) {
         CGFloat x = g_cursor_pos_px.x, y = g_cursor_pos_px.y;
+        CGPoint fitted; CGFloat k = 0;
+        if (winios_desktop_fit_map(x, y, &fitted, &k)) {   /* ml2000 */
+            if (g_cur_w > 0) {
+                g_cursor_layer.bounds = CGRectMake(0, 0, g_cur_w * k, g_cur_h * k);
+                g_cursor_layer.position = CGPointMake(fitted.x - g_cur_hx * k, fitted.y - g_cur_hy * k);
+            } else {
+                g_cursor_layer.position = fitted;
+            }
+            return;
+        }
         if (g_cur_w > 0) {
             g_cursor_layer.bounds = CGRectMake(0, 0, g_cur_w * g_px_to_pt, g_cur_h * g_px_to_pt);
             g_cursor_layer.position = CGPointMake(g_desk_origin.x + (x - g_cur_hx) * g_px_to_pt,
@@ -2363,6 +2505,20 @@ static void winios_cursor_place(void) {
         CGFloat oldScale = MAX(1.0, MIN(s.width, s.height));
         g_cursor_layer.bounds = CGRectMake(0, 0, g_cur_w * (exact ? s.width : oldScale),
                                                 g_cur_h * (exact ? s.height : oldScale));
+    } else {
+        /* ml1980: the builtin fallback arrow was a fixed 14x21 POINTS, about twice a
+         * Windows arrow at the game's resolution (device log: 0.56 pt per guest px).
+         * Size it as guest pixels like a real cursor, with a small floor.
+         * MADEIRA_CURSOR_FALLBACK_SCALE=0 keeps the fixed size. */
+        static int scaled = -1;
+        if (scaled < 0) {
+            const char *value = getenv("MADEIRA_CURSOR_FALLBACK_SCALE");
+            scaled = !value || strcmp(value, "0");
+        }
+        if (scaled) {
+            CGSize img = winios_cursor_image().size;
+            g_cursor_layer.bounds = CGRectMake(0, 0, MAX(7.0, img.width * s.width), MAX(10.5, img.height * s.height));
+        }
     }
     g_cursor_layer.position = pos;
 }
@@ -2378,6 +2534,13 @@ int winios_desktop_point_from_window(double wx, double wy, int *px, int *py) {
     /* g_desk_origin is relative to the compositor view, whose frame is in
      * window coordinates (see winios_layout_compositor). */
     CGRect f = g_compositor_view.frame;
+    /* ml2000: a tap on a fitted window lands in that window's own client pixels. */
+    if (g_fit_key && CGRectContainsPoint(g_fit_view_pt, CGPointMake(wx - f.origin.x, wy - f.origin.y))) {
+        CGFloat k = g_fit_client_px.size.width / g_fit_view_pt.size.width;
+        if (px) *px = (int)(g_fit_client_px.origin.x + (wx - f.origin.x - g_fit_view_pt.origin.x) * k);
+        if (py) *py = (int)(g_fit_client_px.origin.y + (wy - f.origin.y - g_fit_view_pt.origin.y) * k);
+        return 1;
+    }
     double x = (wx - f.origin.x - g_desk_origin.x) / g_px_to_pt;
     double y = (wy - f.origin.y - g_desk_origin.y) / g_px_to_pt;
     if (x < 0) x = 0;

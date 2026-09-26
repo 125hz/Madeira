@@ -3,6 +3,24 @@
 # draft. Distribution starts with the push, not with a tag. Enable with:
 #   git config core.hooksPath .githooks
 url="$2"
+# Check every pushed commit, including source added and removed before HEAD.
+while read local_ref local_sha remote_ref remote_sha; do
+    case "$local_sha" in 0000000000000000000000000000000000000000) continue ;; esac
+    case "$remote_sha" in
+        0000000000000000000000000000000000000000) range="$local_sha" ;;
+        *) range="$remote_sha..$local_sha" ;;
+    esac
+    if git log --format= --name-only "$range" -- build/steam-host madeira-dock private docs/STEAM_HOST_PLAN.md | grep -q .; then
+        echo "pre-push: private Madeira Dock source is present in pushed history; refusing upload" >&2
+        exit 1
+    fi
+    for commit in $(git rev-list "$range"); do
+        if git grep -I -l 'MADEIRA_DOCK_PRIVATE_SOURCE' "$commit" -- . ':!.githooks/*' >/dev/null 2>&1; then
+            echo "pre-push: private Madeira Dock source marker found in pushed history" >&2
+            exit 1
+        fi
+    done
+done
 case "$url" in /*|file:*) exit 0 ;; esac
 if grep -q "^Adopted on: *$" LICENSE-EXCEPTION.md 2>/dev/null || grep -q "DRAFT" LICENSE-EXCEPTION.md 2>/dev/null; then
     echo "pre-push: LICENSE-EXCEPTION.md is still a draft (adoption line not completed); refusing to publish to $url" >&2

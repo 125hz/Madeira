@@ -171,6 +171,26 @@ struct SteamLibraryView: View {
     @State private var launchTask: Task<Void, Never>?
     let play: (LibraryEntry) -> Void
     let enableJIT: () -> Void
+    private let regularSteamActions = LibraryFlags.enabled("MADEIRA_STEAM_REGULAR_ACTIONS")
+    /// ml1970: without any client, Valve's installer runs in a Wine session. With Madeira
+    /// Dock's components already in place (steam.exe present), Steam's own bootstrapper
+    /// downloads the rest of the regular client the first time it starts; the installer
+    /// would refuse the non-empty Steam folder.
+    private func installRegularSteam() {
+        if model.snapshot.client == nil {
+            LogStore.shared.log("[steam-regular] ml1970 install via=installer")
+            model.download(ready: launch)
+        } else if let entry = model.clientEntry(bigPicture: false) {
+            LogStore.shared.log("[steam-regular] ml1970 install via=bootstrap")
+            launch(entry)
+        }
+    }
+    /// ml1970: the regular client on a Wine desktop, for users who want normal Steam.
+    private func bootSteam(bigPicture: Bool) {
+        guard model.snapshot.desktopClient, let entry = model.clientEntry(bigPicture: bigPicture) else { return }
+        LogStore.shared.log("[steam-regular] ml1970 boot big-picture=\(bigPicture ? 1 : 0)")
+        launch(entry)
+    }
     private func launch(_ entry: LibraryEntry) {
         guard !opening, library.current == nil else { return }
         opening = true
@@ -223,6 +243,19 @@ struct SteamLibraryView: View {
                     if model.busy {
                         ProgressView(model.installerPhase, value: model.progress)
                         Button("Cancel", role: .cancel) { model.cancel() }
+                    } else if regularSteamActions {
+                        // ml1970: regular Steam is the fallback to Madeira Dock. Madeira Dock's
+                        // setup installs only Valve's client components, so "installed" means the
+                        // full desktop client. MADEIRA_STEAM_REGULAR_ACTIONS=0 restores the old rows.
+                        LabeledContent("Regular Steam", value: model.snapshot.desktopClient ? "Installed"
+                                       : model.snapshot.client != nil ? "Madeira Dock components only" : "Not installed")
+                        if !model.snapshot.desktopClient {
+                            Button { installRegularSteam() } label: { Label("Download and install Steam", systemImage: "arrow.down.circle") }
+                        }
+                        Button { bootSteam(bigPicture: false) } label: { Label("Boot Steam", systemImage: "play.fill") }
+                            .disabled(!model.snapshot.desktopClient)
+                        Button { bootSteam(bigPicture: true) } label: { Label("Big Picture", systemImage: "gamecontroller") }
+                            .disabled(!model.snapshot.desktopClient)
                     } else if model.snapshot.client != nil {
                         Button { if let entry = model.clientEntry(bigPicture: false) { launch(entry) } } label: { Label("Open Steam", systemImage: "play.fill") }
                         Button { if let entry = model.clientEntry(bigPicture: true) { launch(entry) } } label: { Label("Big Picture", systemImage: "gamecontroller") }
@@ -235,7 +268,11 @@ struct SteamLibraryView: View {
                     }
                     Button(action: enableJIT) { Label("Enable JIT", systemImage: "bolt.fill") }.disabled(model.busy)
                 } footer: {
-                    Text("The Windows client is downloaded from Valve, then installed in drive_c. Your sign-in and Steam Guard stay inside Steam. Use the in-game menu’s Quit game action to return here.")
+                    if regularSteamActions {
+                        Text("Games start through Madeira Dock, which uses less memory and CPU. Regular Steam is an optional fallback: it is downloaded from Valve and installed in drive_c, and Boot Steam opens it on a Windows desktop. Your sign-in and Steam Guard stay inside Steam. Updating regular Steam also updates the Valve client files Madeira Dock uses. Use the in-game menu’s Quit game action to return here.")
+                    } else {
+                        Text("The Windows client is downloaded from Valve, then installed in drive_c. Your sign-in and Steam Guard stay inside Steam. Use the in-game menu’s Quit game action to return here.")
+                    }
                 }
                 if !model.snapshot.apps.isEmpty {
                     Section("On this device") {

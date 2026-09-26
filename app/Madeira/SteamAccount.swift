@@ -1,5 +1,7 @@
 import SwiftUI
 import UIKit
+import BackgroundTasks
+import UserNotifications
 
 // ml1310: native Steam account, owned library and downloads for the optional
 // library. Steam itself authenticates the account and decides ownership:
@@ -31,6 +33,26 @@ struct SteamOwnedGame: Codable, Identifiable, Hashable {
     var downloadBytes: Int64
     var buildID: Int
     var launch: [SteamLaunchOption]
+    // ml1970: store artwork names from PICS (see SteamAppInfo); nil in older caches.
+    var libraryCapsule: String?
+    var libraryHero: String?
+    var headerImage: String?
+    var parentID: Int?
+
+    // ml1890: PICS totals can mix compressed sizes with legacy maxsize and
+    // omit unknown depots. Keep the cached field for decoding/rollback, but
+    // do not present it as the size of a complete download. Progress uses
+    // the downloader's actual manifests instead and is unaffected.
+    private static let hideSizeEstimates: Bool = {
+        let hide = LibraryFlags.enabled("MADEIRA_STEAM_HIDE_SIZE_ESTIMATES")
+        SteamLog.event("[steam-size] ml1890 library estimates=\(hide ? "hidden" : "legacy") manifest progress retained")
+        return hide
+    }()
+
+    var displayedDownloadBytes: Int64? {
+        guard !Self.hideSizeEstimates, downloadBytes > 0 else { return nil }
+        return downloadBytes
+    }
 
     init(_ info: SteamAppInfo) {
         id = Int(info.appID)
@@ -38,6 +60,8 @@ struct SteamOwnedGame: Codable, Identifiable, Hashable {
         installDir = info.installDir
         downloadBytes = Int64(clamping: info.downloadSize(for: "windows"))
         buildID = Int(info.buildID)
+        libraryCapsule = info.libraryCapsule; libraryHero = info.libraryHero; headerImage = info.headerImage
+        parentID = info.parentID.map(Int.init)
         launch = info.launchConfigs(for: "windows").compactMap { config in
             let exe = config.executable.trimmingCharacters(in: .whitespaces)
             guard exe.lowercased().hasSuffix(".exe") else { return nil }
@@ -62,6 +86,19 @@ final class SteamAccountModel: ObservableObject {
     @Published private(set) var owned: [SteamOwnedGame] = []
     @Published private(set) var refreshing = false
     @Published private(set) var libraryUpdated: Date?
+    /// ml1970: Steam playtime / last played by App ID (see SteamPlaytime).
+    @Published var playtime: [Int: SteamPlaytime] = [:]
+
+    /// ml1970: the account's own Player.GetOwnedGames over the existing connection.
+    func requestOwnedGamesPlaytime() async throws -> Data {
+        try await session.ensureConnected()
+        var request = ProtobufEncoder()
+        request.writeUInt64(fieldNumber: 1, value: session.steamID)   // steamid
+        request.writeBool(fieldNumber: 2, value: false)                // include_appinfo
+        request.writeBool(fieldNumber: 3, value: true)                 // include_played_free_games
+        request.writeBool(fieldNumber: 5, value: true)                 // include_free_sub
+        return try await session.callServiceMethod(method: .getOwnedGames, body: request.data, timeout: 20)
+    }
     @Published var error: String?
 
     // Sign-in
@@ -83,6 +120,23 @@ final class SteamAccountModel: ObservableObject {
     private var active: (id: Int, task: Task<Void, Never>)?
     private var inSession = false
     private var resumeAfterSession = Set<Int>()
+    /// ml1980: downloads paused because iOS ended Madeira's background time.
+    private var resumeAfterBackgroundIDs = Set<Int>()
+
+    /// ml1980: pause everything, to resume when Madeira is active again (SteamDownloadBackground).
+    func pauseForBackground() {
+        if let current = active { resumeAfterBackgroundIDs.insert(current.id); current.task.cancel() }
+        for id in queue { resumeAfterBackgroundIDs.insert(id); downloads[id]?.state = .paused }
+        queue.removeAll()
+        SteamLog.event("[bg-download] ml1980 paused count=\(resumeAfterBackgroundIDs.count)")
+    }
+    func resumeAfterBackground() {
+        guard !resumeAfterBackgroundIDs.isEmpty else { return }
+        let ids = resumeAfterBackgroundIDs.sorted()
+        resumeAfterBackgroundIDs.removeAll()
+        for id in ids { install(id) }
+        SteamLog.event("[bg-download] ml1980 resumed count=\(ids.count)")
+    }
 
     private let session = SteamSession()
     private lazy var fetcher = SteamLibraryFetcher(session: session)
@@ -97,13 +151,15 @@ final class SteamAccountModel: ObservableObject {
     /// ml1420: the owned-library filter changed (app types match without
     /// case). A list cached before it is refreshed at the next start instead
     /// of after six hours. Follows MADEIRA_STEAM_TYPE_FOLD.
-    private static var libraryRevision: Int? { SteamAppInfo.AppType.foldsCase ? 1420 : nil }
+    // ml1970: 1970 refetches a cached list once so it gains store artwork names.
+    private static var libraryRevision: Int? { SteamAppInfo.AppType.foldsCase ? (LibraryFlags.enabled("MADEIRA_STEAM_ARTWORK") ? 1970 : 1420) : nil }
     private var cacheRevision: Int?
 
     // MARK: Lifecycle
 
     func start() {
         guard Self.enabled, !started else { return }
+        MadeiraDock.cleanup()
         started = true
         if let tokens = session.tokenStore.loadTokens() {
             accountName = tokens.accountName
@@ -114,10 +170,13 @@ final class SteamAccountModel: ObservableObject {
             }
         }
         SteamLog.event("[steam-account] ml1310 start signed-in=\(phase == .signedIn ? 1 : 0) cached=\(owned.count)")
+        if phase == .signedIn { loadPlaytimeCache() }
         let outdated = libraryUpdated != nil && Self.libraryRevision != nil && cacheRevision != Self.libraryRevision
         if outdated { SteamLog.event("[steam-library] ml1420 cached list predates the type filter fix; refreshing") }
         if phase == .signedIn, outdated || Date().timeIntervalSince(libraryUpdated ?? .distantPast) > 6 * 3600 {
             Task { await refreshLibrary(interactive: false) }
+        } else if phase == .signedIn {
+            Task { await refreshPlaytime() }   // ml1970: playtime changes more often than the library
         }
         repairLaunchExecutables()
     }
@@ -126,6 +185,9 @@ final class SteamAccountModel: ObservableObject {
     /// session (memory and I/O belong to the game) and resume afterwards.
     func sessionChanged(active running: Bool) {
         guard Self.enabled else { return }
+        // ml1720: called from the launch itself and from the library's onChange (which does not
+        // fire when the game view replaces the library first); only the first call acts.
+        guard running != inSession else { return }
         inSession = running
         if running {
             let pause = LibraryFlags.enabled("MADEIRA_STEAM_PAUSE_FOR_SESSION")
@@ -148,10 +210,14 @@ final class SteamAccountModel: ObservableObject {
                 SteamLog.event("[steam-account] ml1340 logged off for game session")
             }
         } else {
+            session.dockOwnsConnection = false
+            MadeiraDock.cleanup()
             let resume = resumeAfterSession.sorted()
             resumeAfterSession.removeAll()
             for id in resume { install(id) }
             if !resume.isEmpty { SteamLog.event("[steam-depot] ml1310 resumed after session count=\(resume.count)") }
+            // ml1970: Steam records the session's playtime when the game ends.
+            Task { try? await Task.sleep(nanoseconds: 5_000_000_000); await self.refreshPlaytime() }
         }
     }
 
@@ -170,6 +236,30 @@ final class SteamAccountModel: ObservableObject {
     }
 
     // MARK: Sign-in
+
+    /// ml1830: stop native activity before giving the same login to Valve's
+    /// guest client. The token is read from Keychain only after quiescing.
+    func prepareDock(_ entry: LibraryEntry) async throws {
+        guard Self.enabled, phase == .signedIn, !inSession, let appID = entry.steamAppID else {
+            throw LibraryError.message("Sign in to Steam in Madeira before starting Dock.")
+        }
+        try MadeiraDock.validate(entry)
+        inSession = true
+        session.dockOwnsConnection = true
+        do {
+            await holdForSteamInstall()
+            await session.disconnectGracefully()
+            try Task.checkCancellation()
+            guard phase == .signedIn, let tokens = session.tokenStore.loadTokens() else {
+                throw LibraryError.message("Steam sign-in is no longer available. Sign in again.")
+            }
+            try MadeiraDock.writeHandoff(account: tokens.accountName, token: tokens.refreshToken, appID: appID)
+            SteamLog.event("[madeira-dock] ml1830 native connection closed; one-use sign-in ready")
+        } catch {
+            sessionChanged(active: false)
+            throw error
+        }
+    }
 
     func beginQR() {
         cancelSignIn()
@@ -255,6 +345,7 @@ final class SteamAccountModel: ObservableObject {
     }
 
     func signOut() {
+        MadeiraDock.cleanup()
         for id in Array(downloads.keys) { pause(id) }
         session.logout()
         try? FileManager.default.removeItem(at: Self.cacheURL)
@@ -286,6 +377,7 @@ final class SteamAccountModel: ObservableObject {
             if LibraryFlags.enabled("MADEIRA_STEAM_HIDDEN_LOG"), let report = fetcher.lastVisibility {
                 SteamLog.event("[steam-library] ml1420 hidden shown=\(games.count) type-fold=\(SteamAppInfo.AppType.foldsCase ? 1 : 0) " + report.summary(limit: 40))
             }
+            await refreshPlaytime()
         } catch {
             handleSessionError(error, context: "library", report: interactive)
         }
@@ -305,7 +397,7 @@ final class SteamAccountModel: ObservableObject {
     private var eulaCache: [Int: [SteamEula]] = [:]
     func eulas(for appID: Int) async -> [SteamEula]? {
         if let cached = eulaCache[appID] { return cached }
-        guard phase == .signedIn else { return nil }
+        guard phase == .signedIn, !inSession else { return nil }
         let fetcher = self.fetcher
         let result = await withTaskGroup(of: [SteamEula]?.self) { group -> [SteamEula]? in
             group.addTask { @MainActor in (try? await fetcher.fetchAppInfo(appID: UInt32(appID)))?.eulas }
@@ -361,6 +453,13 @@ final class SteamAccountModel: ObservableObject {
 
     // MARK: Downloads
 
+    func repair(_ appID: Int) {
+        guard LibraryFlags.enabled("MADEIRA_STEAM_REPAIR"),
+              LibraryModel.shared.entries.contains(where: { $0.steamAppID == appID && $0.steamNative == true }) else { return }
+        SteamLog.event("[steam-repair] ml1960 app=\(appID) requested=1")
+        install(appID)
+    }
+
     func install(_ appID: Int) {
         guard Self.enabled else { return }
         guard phase == .signedIn else { error = "Sign in to Steam to download games."; return }
@@ -410,6 +509,7 @@ final class SteamAccountModel: ObservableObject {
         guard active == nil, !inSession, !queue.isEmpty else { return }
         let appID = queue.removeFirst()
         downloads[appID]?.state = .active
+        SteamDownloadBackground.shared.downloadStarted(appID: appID, name: game(appID)?.name ?? "Steam game")
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             await self.run(appID)
@@ -418,17 +518,20 @@ final class SteamAccountModel: ObservableObject {
     }
 
     private func run(_ appID: Int) async {
+        var outcome = SteamDownloadBackground.Outcome.paused
         do {
-            guard let info = try await fetcher.fetchAppInfo(appID: UInt32(appID)) else {
+            guard let info = try await fetcher.fetchInstallInfo(appID: UInt32(appID)) else {
                 throw SteamError.appInfoNotFound(UInt32(appID))
             }
             try FileManager.default.createDirectory(at: SteamInstallPaths.common, withIntermediateDirectories: true)
             let folder = try await downloader.install(info, steamApps: SteamInstallPaths.steamApps,
                                                       ownedDepots: { [weak self] in try? await self?.fetcher.ownedDepotIDs() }) { [weak self] progress in
                 self?.downloads[appID]?.progress = progress
+                SteamDownloadBackground.shared.progress(progress)
             }
             try await completeInstall(info, folder: folder)
             downloads[appID] = nil
+            outcome = .completed
         } catch {
             if Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
                 if downloads[appID] != nil { downloads[appID]?.state = .paused }
@@ -436,12 +539,16 @@ final class SteamAccountModel: ObservableObject {
             } else if case SteamError.logonDenied = error {
                 downloads[appID]?.state = .failed(Self.message(error))
                 handleSessionError(error, context: "depot")
+                outcome = .failed(Self.message(error))
             } else {
                 downloads[appID]?.state = .failed(Self.message(error))
                 SteamLog.event("[steam-depot] ml1310 failed app=\(appID) reason=\(Self.reason(error))")
+                outcome = .failed(Self.message(error))
             }
         }
         active = nil
+        SteamDownloadBackground.shared.downloadEnded(appID: appID, name: game(appID)?.name ?? "Steam game",
+                                                     outcome: outcome, queueEmpty: queue.isEmpty)
         pump()
     }
 
@@ -464,6 +571,10 @@ final class SteamAccountModel: ObservableObject {
         entry.steamBuildID = game.buildID
         entry.steamInstallPath = SteamPaths.relative(folder, drive: drive)
         entry.arguments = choice.arguments
+        entry.steamDefaultArguments = game.launch.first {
+            ($0.type.isEmpty || $0.type == "default") && $0.arguments == choice.arguments &&
+                SteamPaths.safeRelative($0.executable.replacingOccurrences(of: "\\", with: "/"), under: folder)?.standardizedFileURL == choice.url.standardizedFileURL
+        }?.arguments
         entry.folderBytes = manifestSize(appID: game.id)
         entry.metadataChecked = Date()
         if LibraryFlags.enabled("MADEIRA_STEAM_APPID_FILE") {
@@ -475,6 +586,23 @@ final class SteamAccountModel: ObservableObject {
         }
         LibraryModel.shared.upsertNativeSteam(entry)
         SteamLog.event("[steam-depot] ml1310 library entry app=\(game.id) exe-source=\(choice.source) bits=\(entry.bits)")
+    }
+
+    /// Recover provenance for entries saved before the default-argument field existed.
+    func restoreDefaultArguments(_ entry: LibraryEntry) -> LibraryEntry {
+        var result = entry
+        guard LibraryFlags.enabled("MADEIRA_DOCK_DEFAULT_ARGUMENTS"),
+              entry.steamDefaultArguments == nil, let appID = entry.steamAppID,
+              let folder = LibraryModel.steamInstallFolder(entry), let game = game(appID) else { return result }
+        let target = LibraryModel.drive.appendingPathComponent(entry.relativePath).standardizedFileURL.path.lowercased()
+        if let option = game.launch.first(where: {
+            ($0.type.isEmpty || $0.type == "default") && $0.arguments == entry.arguments &&
+                SteamPaths.safeRelative($0.executable.replacingOccurrences(of: "\\", with: "/"), under: folder)?.standardizedFileURL.path.lowercased() == target
+        }) {
+            result.steamDefaultArguments = option.arguments
+            SteamLog.event("[dock-arguments] ml1960 app=\(appID) imported-default=1")
+        }
+        return result
     }
 
     private func manifestSize(appID: Int) -> Int64? {
@@ -493,7 +621,20 @@ final class SteamAccountModel: ObservableObject {
         if folder.path.hasPrefix(common.path + "/"), folder.deletingLastPathComponent().path == common.path {
             try? fm.removeItem(at: folder)
         }
-        try? fm.removeItem(at: SteamInstallPaths.steamApps.appendingPathComponent("appmanifest_\(appID).acf"))
+        // ml1970: owner records describing shared depots in this same folder go too.
+        let record = SteamInstallPaths.steamApps.appendingPathComponent("appmanifest_\(appID).acf")
+        if let data = try? Data(contentsOf: record), let state = SteamClientAppState.parse(data, appID: appID) {
+            for owner in state.sharedOwners {
+                let url = SteamInstallPaths.steamApps.appendingPathComponent("appmanifest_\(owner).acf")
+                guard let ownerData = try? Data(contentsOf: url), ownerData.count <= 1 << 20,
+                      var parser = try? SteamKeyValues(ownerData), let root = try? parser.read(),
+                      let dir = root["AppState"]?["installdir"]?.string,
+                      DepotDownloader.safeFolderName(dir).caseInsensitiveCompare(DepotDownloader.safeFolderName(folderName)) == .orderedSame
+                else { continue }
+                try? fm.removeItem(at: url)
+            }
+        }
+        try? fm.removeItem(at: record)
         try? fm.removeItem(at: SteamInstallPaths.steamApps.appendingPathComponent("downloading/\(appID)", isDirectory: true))
     }
 
@@ -796,6 +937,18 @@ final class SteamClientProgressModel: ObservableObject {
         progress = nil
     }
 
+    /// ml1970: download speed from the client's own byte counters over the last ~20 s.
+    private var samples: [(time: Double, bytes: UInt64)] = []
+    private func rate(_ progress: SteamClientProgress) -> Double? {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard progress.phase == .downloading, progress.total > 0 else { samples.removeAll(); return nil }
+        if let last = samples.last, progress.downloaded < last.bytes { samples.removeAll() }
+        samples.append((now, progress.downloaded))
+        samples.removeAll { now - $0.time > 20 }
+        guard let first = samples.first, now - first.time >= 4, progress.downloaded > first.bytes else { return nil }
+        return Double(progress.downloaded - first.bytes) / (now - first.time)
+    }
+
     private func tick() {
         guard !busy, let session else { return }
         busy = true
@@ -808,8 +961,293 @@ final class SteamClientProgressModel: ObservableObject {
                 if let line { LogStore.shared.log("[steam-progress] ml1420 app=\(session.appID) " + line) }
                 if let workshopLine { LogStore.shared.log("[steam-workshop] ml1490 app=\(session.appID) " + workshopLine) }
                 if let stageLine { LogStore.shared.log(stageLine) }
+                var next = next
+                next.bytesPerSecond = self.rate(next)
                 if self.progress != next { self.progress = next }
             }
         }
+    }
+}
+
+// MARK: - ml1970 playtime and last played
+
+/// ml1970: Steam's own playtime record for one app (Player.GetOwnedGames, the signed-in
+/// account's own library through its existing connection). Minutes played in total and the
+/// last time played (Unix seconds, 0 = never). Cached beside the library.
+struct SteamPlaytime: Codable, Equatable {
+    var minutes: Int
+    var lastPlayed: Int
+
+    var played: String? {
+        guard minutes > 0 else { return nil }
+        if minutes < 60 { return "\(minutes) min played" }
+        let hours = Double(minutes) / 60
+        return hours < 10 ? String(format: "%.1f hrs played", hours) : "\(Int(hours.rounded())) hrs played"
+    }
+    var lastPlayedText: String? {
+        guard lastPlayed > 0 else { return nil }
+        let date = Date(timeIntervalSince1970: TimeInterval(lastPlayed))
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium; formatter.timeStyle = .none; formatter.doesRelativeDateFormatting = true
+        return "Last played " + formatter.string(from: date)
+    }
+    /// "12.5 hrs played · Last played Yesterday"
+    var summary: String? {
+        let parts = [played, lastPlayedText].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// CPlayer_GetOwnedGames_Response: games = 2 { appid = 1, playtime_forever = 4, rtime_last_played = 11 }.
+    static func parse(_ data: Data) throws -> [Int: SteamPlaytime] {
+        var decoder = ProtobufDecoder(data)
+        var result: [Int: SteamPlaytime] = [:]
+        while let tag = try decoder.readTag() {
+            guard tag.fieldNumber == 2, tag.wireType == .lengthDelimited else { try decoder.skip(wireType: tag.wireType); continue }
+            var game = ProtobufDecoder(try decoder.readBytes())
+            var app = 0, minutes = 0, last = 0
+            while let field = try game.readTag() {
+                switch (field.fieldNumber, field.wireType) {
+                case (1, .varint): app = Int(truncatingIfNeeded: Int32(truncatingIfNeeded: try game.readVarint()))
+                case (4, .varint): minutes = Int(truncatingIfNeeded: Int32(truncatingIfNeeded: try game.readVarint()))
+                case (11, .varint): last = Int(truncatingIfNeeded: UInt32(truncatingIfNeeded: try game.readVarint()))
+                default: try game.skip(wireType: field.wireType)
+                }
+            }
+            if app > 0, minutes > 0 || last > 0 { result[app] = SteamPlaytime(minutes: max(0, minutes), lastPlayed: max(0, last)) }
+            if result.count > 100_000 { break }
+        }
+        return result
+    }
+}
+
+extension SteamAccountModel {
+    private static var playtimeURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("madeira-steam-playtime.json")
+    }
+    static let playtimeEnabled = LibraryFlags.enabled("MADEIRA_STEAM_PLAYTIME")
+
+    func loadPlaytimeCache() {
+        guard Self.playtimeEnabled, playtime.isEmpty, let data = try? Data(contentsOf: Self.playtimeURL),
+              let cached = try? JSONDecoder().decode([Int: SteamPlaytime].self, from: data) else { return }
+        playtime = cached
+    }
+
+    /// ml1970: [steam-playtime] ml1970; MADEIRA_STEAM_PLAYTIME=0 hides playtime and never asks.
+    func refreshPlaytime() async {
+        guard Self.playtimeEnabled, phase == .signedIn, !inSession else { return }
+        do {
+            let data = try await requestOwnedGamesPlaytime()
+            let parsed = try SteamPlaytime.parse(data)
+            playtime = parsed
+            try? JSONEncoder().encode(parsed).write(to: Self.playtimeURL, options: .atomic)
+            SteamLog.event("[steam-playtime] ml1970 apps=\(parsed.count)")
+        } catch {
+            SteamLog.event("[steam-playtime] ml1970 unavailable: \(error.localizedDescription)")
+        }
+    }
+}
+
+
+// MARK: - ml1980 downloads in the background
+
+/// ml1980: Steam downloads keep going when Madeira leaves the foreground.
+///
+/// iOS 26 and later: a BGContinuedProcessingTask, submitted when the user starts a download,
+/// lets the app keep running in the background for the whole queue; iOS shows its own progress
+/// UI for it (title, game, percentage, a cancel control) fed from the downloader's byte counts.
+/// Earlier iOS, or when iOS refuses the request (for example because a re-signed bundle
+/// identifier no longer matches the permitted task identifier): the usual short background
+/// grace period, then the download pauses cleanly (every finished chunk is journaled) and
+/// resumes when Madeira is opened again, with a notification saying so. A local notification
+/// also reports a finished or failed download while Madeira is in the background.
+/// MADEIRA_BACKGROUND_DOWNLOADS=0 restores the old behaviour (downloads stop with the app).
+@MainActor final class SteamDownloadBackground {
+    static let shared = SteamDownloadBackground()
+    static var enabled: Bool { LibraryFlags.enabled("MADEIRA_BACKGROUND_DOWNLOADS") }
+
+    private var graceTask: UIBackgroundTaskIdentifier = .invalid
+    private var continued: AnyObject?            // BGContinuedProcessingTask (iOS 26+)
+    private var continuedPending = false
+    private var registered: String?
+    private var observing = false
+    private var askedNotifications = false
+    private var logged = 0
+    private var currentName = ""
+
+    private func log(_ line: String) {
+        guard logged < 48 else { return }
+        logged += 1
+        SteamLog.event("[bg-download] ml1980 " + line)
+    }
+
+    private var isBackground: Bool { UIApplication.shared.applicationState != .active }
+
+    /// The permitted "<bundle id>.download.*" identifier from Info.plist, made concrete.
+    private var taskIdentifier: String? {
+        let permitted = Bundle.main.object(forInfoDictionaryKey: "BGTaskSchedulerPermittedIdentifiers") as? [String] ?? []
+        guard let wildcard = permitted.first(where: { $0.hasSuffix(".download.*") }) else { return nil }
+        return String(wildcard.dropLast()) + "queue"
+    }
+
+    /// A download became active (always a user action or its queue).
+    func downloadStarted(appID: Int, name: String) {
+        guard Self.enabled else { return }
+        currentName = name
+        observe()
+        requestNotificationPermission()
+        if #available(iOS 26.0, *) { submitContinued() }
+        if #available(iOS 26.0, *), let task = continued as? BGContinuedProcessingTask {
+            task.updateTitle("Downloading \(name)", subtitle: "Steam download in Madeira")
+        }
+        if isBackground { beginGrace() }
+    }
+
+    func progress(_ progress: SteamDownloadProgress) {
+        guard Self.enabled else { return }
+        if #available(iOS 26.0, *), let task = continued as? BGContinuedProcessingTask {
+            let total = Int64(clamping: max(progress.totalBytes, 1))
+            if task.progress.totalUnitCount != total { task.progress.totalUnitCount = total }
+            task.progress.completedUnitCount = Int64(clamping: min(progress.doneBytes, progress.totalBytes))
+        }
+    }
+
+    enum Outcome { case completed, failed(String), paused }
+
+    /// One download ended. `queueEmpty`: nothing else is waiting.
+    func downloadEnded(appID: Int, name: String, outcome: Outcome, queueEmpty: Bool) {
+        guard Self.enabled else { return }
+        if isBackground {
+            switch outcome {
+            case .completed: notify("\(name) is ready to play", body: "The Steam download finished.")
+            case .failed(let reason): notify("\(name) download stopped", body: reason)
+            case .paused: break
+            }
+        }
+        guard queueEmpty else { return }
+        finishContinued(success: { if case .completed = outcome { return true }; return false }())
+        endGrace()
+    }
+
+    // MARK: iOS 26 continued processing
+
+    @available(iOS 26.0, *)
+    private func submitContinued() {
+        guard continued == nil, !continuedPending, let identifier = taskIdentifier else { return }
+        if registered != identifier {
+            let ok = BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: .main) { [weak self] task in
+                guard let task = task as? BGContinuedProcessingTask else { task.setTaskCompleted(success: false); return }
+                MainActor.assumeIsolated { self?.attach(task) }
+            }
+            guard ok else { log("register refused id-suffix=queue"); return }
+            registered = identifier
+        }
+        let request = BGContinuedProcessingTaskRequest(identifier: identifier, title: "Downloading \(currentName)",
+                                                       subtitle: "Steam download in Madeira")
+        request.strategy = .fail
+        do {
+            try BGTaskScheduler.shared.submit(request)
+            continuedPending = true
+            log("continued-processing submitted")
+        } catch {
+            log("continued-processing refused: \(error.localizedDescription)")
+        }
+    }
+
+    @available(iOS 26.0, *)
+    private func attach(_ task: BGContinuedProcessingTask) {
+        continuedPending = false
+        continued = task
+        task.progress.totalUnitCount = 1
+        task.expirationHandler = { [weak self] in
+            DispatchQueue.main.async {
+                self?.log("continued-processing expired; pausing downloads")
+                SteamAccountModel.shared.pauseForBackground()
+                self?.notify("Download paused", body: "Open Madeira to continue downloading.")
+                self?.finishContinued(success: false)
+            }
+        }
+        log("continued-processing running")
+        if !SteamAccountModel.shared.hasActiveDownload { finishContinued(success: true) }
+    }
+
+    private func finishContinued(success: Bool) {
+        if #available(iOS 26.0, *), let task = continued as? BGContinuedProcessingTask {
+            task.setTaskCompleted(success: success)
+            log("continued-processing completed success=\(success ? 1 : 0)")
+        }
+        continued = nil
+    }
+
+    // MARK: Short grace period (all iOS versions)
+
+    private func beginGrace() {
+        guard graceTask == .invalid, continued == nil, SteamAccountModel.shared.hasActiveDownload else { return }
+        graceTask = UIApplication.shared.beginBackgroundTask(withName: "Madeira Steam download") { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                // Continued processing keeps the app running; only pause without it.
+                if self.continued == nil {
+                    self.log("background time over; pausing downloads")
+                    SteamAccountModel.shared.pauseForBackground()
+                    self.notify("Download paused", body: "Open Madeira to continue downloading.")
+                }
+                self.endGrace()
+            }
+        }
+        log("background grace begun continued=\(continued == nil ? 0 : 1)")
+    }
+
+    private func endGrace() {
+        guard graceTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(graceTask)
+        graceTask = .invalid
+    }
+
+    private func observe() {
+        guard !observing else { return }
+        observing = true
+        NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.beginGrace() }
+        }
+        NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.endGrace()
+                SteamAccountModel.shared.resumeAfterBackground()
+            }
+        }
+    }
+
+    // MARK: Notifications
+
+    private func requestNotificationPermission() {
+        guard !askedNotifications, LibraryFlags.enabled("MADEIRA_DOWNLOAD_NOTIFICATIONS") else { return }
+        askedNotifications = true
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            DispatchQueue.main.async { SteamDownloadBackground.shared.log("notifications granted=\(granted ? 1 : 0)") }
+        }
+    }
+
+    private func notify(_ title: String, body: String) {
+        guard LibraryFlags.enabled("MADEIRA_DOWNLOAD_NOTIFICATIONS") else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "madeira.download.\(UUID().uuidString)",
+                                                                     content: content, trigger: nil))
+    }
+}
+
+extension SteamAccountModel {
+    var hasActiveDownload: Bool { downloads.values.contains { $0.state == .active || $0.state == .queued } }
+}
+
+extension MadeiraDock {
+    /// ml1990: the game's install record has a non-empty CheckGuid block (per-user custom executables).
+    static func hasCustomExecutables(appID: Int) -> Bool {
+        let url = SteamInstallPaths.steamApps.appendingPathComponent("appmanifest_\(appID).acf")
+        guard let data = try? Data(contentsOf: url), data.count <= 1 << 20,
+              var parser = try? SteamKeyValues(data), let root = try? parser.read() else { return false }
+        return !(root["AppState"]?["CheckGuid"]?.fields.isEmpty ?? true)
     }
 }

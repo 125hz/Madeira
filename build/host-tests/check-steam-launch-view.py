@@ -70,6 +70,13 @@ func window(_ image: String, _ w: Int, _ h: Int, visible: Bool = true, drawn: Bo
         for helper in ["vcredist_x86.exe", "VC_redist.x64.exe", "dxsetup.exe", "iscriptevaluator.exe", "msiexec.exe", "wineboot.exe"] {
             require(SteamLaunchScene.owner(helper) == .helper, "first-start helper \(helper)")
         }
+        // ml1760: an installer's error box holds the launch, so it needs the user too.
+        let fatal = window("msiexec.exe", 326, 140)
+        require(SteamLaunchScene.decide([fatal], rendered: false).scene == .steamWindow, "an installer dialog needs the user")
+        require(SteamLaunchScene.decide([window("msiexec.exe", 200, 100)], rendered: false).scene == .waiting, "a small installer window does not")
+        require(SteamLaunchScene.decide([window("PhysX_SystemSoftware.exe", 480, 360, drawn: false)], rendered: false).scene == .waiting, "an undrawn installer window does not")
+        require(SteamLaunchScene.decide([window("explorer.exe", 480, 360)], rendered: false).scene == .waiting, "other helpers stay ignored")
+        require(SteamLaunchScene.decide([fatal, game], rendered: false).scene == .game, "the game's window still wins")
         require(SteamLaunchScene.owner("STEAMWEBHELPER.EXE") == .client && SteamLaunchScene.owner("") == .unknown &&
                 SteamLaunchScene.owner("program.exe") == .other, "owner classes")
 
@@ -147,9 +154,10 @@ func window(_ image: String, _ w: Int, _ h: Int, visible: Bool = true, drawn: Bo
         // --- ml1530: "waiting for user response" wins over the forward order (device log 199)
         var wait = SteamLaunchStage.installers
         wait = wait.after("[2026-09-23 17:42:57] GameAction [AppID 7000, ActionID 1] : LaunchApp waiting for user response to ShowInterstitials \"\"", appID: 7000)
-        require(wait == .needsInput, "a waiting screen after the installers -> needs input")
+        // ml1720: interstitials answer themselves within seconds in every device log; not a screen.
+        require(wait == .installers, "interstitials are not a screen")
         wait = wait.after("[2026-09-23 17:43:07] GameAction [AppID 7000, ActionID 1] : LaunchApp continues with user response \"ShowInterstitials\"", appID: 7000)
-        require(wait == .preparing, "answered -> preparing")
+        require(wait == .installers, "their answer changes nothing")
         wait = wait.after("[2026-09-23 17:43:07] GameAction [AppID 7000, ActionID 1] : LaunchApp changed task to CreatingProcess with \"\"", appID: 7000)
         wait = wait.after("[2026-09-23 17:43:07] GameAction [AppID 7000, ActionID 1] : LaunchApp waiting for user response to CreatingProcess \"\"", appID: 7000)
         require(wait == .gameStarting, "the process step's brief wait is not a screen")
@@ -157,14 +165,18 @@ func window(_ image: String, _ w: Int, _ h: Int, visible: Bool = true, drawn: Bo
         require(eula == .needsInput, "license agreement waiting -> needs input")
         eula = eula.after("[..] GameAction [AppID 7000, ActionID 1] : LaunchApp changed task to RunningInstallScript with \"\"", appID: 7000)
         require(eula == .installers, "the next task ends the wait")
-        require(SteamLaunchStage.needsSignIn.after("[..] GameAction [AppID 7000, ActionID 1] : LaunchApp waiting for user response to ShowEula \"\"", appID: 7000) == .needsSignIn,
-                "a rejected sign-in stays")
+        require(SteamLaunchStage.needsSignIn.after("[..] GameAction [AppID 7000, ActionID 1] : LaunchApp waiting for user response to ShowEula \"\"", appID: 7000) == .needsInput,
+                "launch progress ends a sign-in state (the client is signed in)")
+        require(SteamLaunchStage.signedIn.after("[..] [Logged Off, 4, 0] [U:1:#] ConnectionDisconnected() not auto reconnecting due to Session Replaced", appID: 7000) == .signedIn,
+                "a replaced session is not a sign-in the user must make")
         var rejected = SteamLaunchStage.signingIn.after("[..] ConnectionDisconnected() not auto reconnecting due to Invalid Password", appID: 7000)
         require(rejected == .needsSignIn, "rejected sign-in -> needs sign-in")
-        rejected = rejected.after("[..] AppID 7000 state changed : Fully Installed,", appID: 7000)
-        require(rejected == .needsSignIn, "needs sign-in holds until a sign-in")
-        rejected = rejected.after("[..] [Logged On, 4, 7] [U:1:#] RecvMsgClientLogOnResponse() : processing complete", appID: 7000)
-        require(rejected == .signedIn, "a later sign-in moves on")
+        rejected = rejected.after("[..] ClientConnectionStatus changed", appID: 7000)
+        require(rejected == .needsSignIn, "needs sign-in holds on unrelated lines")
+        var progressed = rejected.after("[..] AppID 7000 state changed : Fully Installed,", appID: 7000)
+        require(progressed == .preparing, "this app's progress moves on")
+        progressed = rejected.after("[..] [Logged On, 4, 7] [U:1:#] RecvMsgClientLogOnResponse() : processing complete", appID: 7000)
+        require(progressed == .signedIn, "a later sign-in moves on")
         require(SteamLaunchStage.allTextsDistinct, "every stage has its own text")
 
         // --- The Workshop update, from the client's own lines.
@@ -272,6 +284,34 @@ func window(_ image: String, _ w: Int, _ h: Int, visible: Bool = true, drawn: Bo
         append("[t] AppID 7000 Workshop update changed : None\n")
         tracker.poll(logFile: contentLog, libraries: [apps], now: 30)
         require(tracker.progress == nil, "finished workshop update disappears")
+
+        // --- ml1770: setup's Steam install stage from the updater log.
+        var setup = SteamSetupStage.installing
+        let bootstrap = ["[2026-09-24 16:13:50] Startup - updater built Sep 10 2026 12:00:00",
+                         "[2026-09-24 16:13:50] Checking for update on startup",
+                         "[2026-09-24 16:13:50] Checking for available updates...",
+                         "[2026-09-24 16:13:51] Downloading manifest: https://client-update.steamstatic.com/steam_client_win32",
+                         "[2026-09-24 16:13:52] Downloaded new manifest",
+                         "[2026-09-24 16:13:52] Downloading update (0 of 229,383 KB)...",
+                         "[2026-09-24 16:14:02] Downloading update (114,692 of 229,383 KB)..."]
+        var seen: [String] = []
+        for line in bootstrap { setup = setup.after(line); seen.append(setup.name) }
+        require(seen == ["installing", "checking", "checking", "checking", "checking", "downloading-0", "downloading-50"], "updater stages (\(seen))")
+        require(setup.text == "Downloading Steam's update… 50%", "download text (\(setup.text))")
+        setup = setup.after("[t] Download Complete.")
+        require(setup == .downloading(percent: 50), "unknown lines keep the stage")
+        setup = setup.after("[t] Extracting package...")
+        require(setup == .unpacking, "extracting")
+        setup = setup.after("[t] Update complete, launching...")
+        require(setup == .opening && setup.detail.contains("minute"), "launching the client opens the sign-in window")
+        for line in ["[t] Startup - updater built", "[t] Checking for available updates...", "[t] Verifying installation...",
+                     "[t] Verification complete"] { setup = setup.after(line) }
+        require(setup == .opening, "a relaunched client's checks do not undo opening")
+        setup = setup.after("[t] Downloading update (1 of 4 KB)...")
+        require(setup == .downloading(percent: 25), "a second update shows again")
+        require(SteamSetupStage.percent("[t] Downloading update (5 of 0 KB)...") == nil, "no division by zero")
+        require(SteamSetupStage.installing.after("[t] Download skipped: /client/steam_client_win32 version 1, installed version 1") == .opening,
+                "an up-to-date client opens straight away")
 
         if failures > 0 { print("FAILURES: \(failures)"); exit(1) }
         print("PASS: all ml1490 Swift checks")

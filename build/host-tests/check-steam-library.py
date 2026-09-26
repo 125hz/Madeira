@@ -3,6 +3,7 @@
 from pathlib import Path
 import subprocess
 import tempfile
+import dock_contract
 
 root = Path(__file__).resolve().parents[2]
 library = (root / 'app/Madeira/Library.swift').read_text()
@@ -21,6 +22,7 @@ final class LogStore { static let shared = LogStore(); func log(_ m: String) {} 
 func madeira_set_vsync_locked(_ mode: Int32) {}
 '''
 stubs = stubs.replace('MERGE_METHODS', library[library.index('    func mergeSteam('):library.index('    private func persist(')])
+stubs += dock_contract.source(root / 'app/Madeira')
 checks = r'''
 import Foundation
 import Glibc
@@ -33,6 +35,66 @@ func rejected(_ label: String, _ operation: () throws -> Void) throws {
 }
 @main struct Checks {
     static func main() async throws {
+        // ml1830: public contract and rollback. Fixture credentials are invented;
+        // these tests do not contact Steam or assert successful authentication.
+        let envelope = try MadeiraDock.envelope(account: "user", token: "a.b-c", steamID: 76561197960265729, appID: 123)
+        let expected = Data(Array("MDOCK001".utf8) + [1, 0, 0, 0, 1, 0, 16, 1, 123, 0, 0, 0, 4, 0, 5, 0] + Array("usera.b-c".utf8))
+        try require(envelope == expected, "one-use envelope matches versioned binary contract")
+        for id in [0, -1, Int(UInt32.max)] {
+            try rejected("invalid app identifier") { _ = try MadeiraDock.envelope(account: "user", token: "a.b-c", steamID: 76561197960265729, appID: id) }
+        }
+        for token in ["", "contains a space", "embedded\u{0}null", String(repeating: "a", count: 8193)] {
+            try rejected("invalid credential envelope") { _ = try MadeiraDock.envelope(account: "user", token: token, steamID: 76561197960265729, appID: 123) }
+        }
+        let payload = Data(#"{"sub":"76561197960265729"}"#.utf8).base64EncodedString().replacingOccurrences(of: "=", with: "")
+        let subject = try MadeiraDock.subject("e30." + payload + ".test")
+        try require(subject == 76561197960265729, "JWT subject used only for account selection")
+        for token in ["missing", "x.!.y", "x.e30.y", String(repeating: "a", count: 8193)] {
+            try rejected("invalid account metadata") { _ = try MadeiraDock.subject(token) }
+        }
+        var dockEntry = LibraryEntry(title: "Fixture", relativePath: "Steam/steamapps/common/Fixture/run.exe", bits: 64)
+        dockEntry.steamNative = true; dockEntry.steamClientLaunch = true; dockEntry.steamInstalled = true
+        dockEntry.steamAppID = 123; dockEntry.steamInstallPath = "Steam/steamapps/common/Fixture"; dockEntry.steamClientPath = "Steam/steam.exe"
+        setenv("MADEIRA_DOCK", "1", 1)
+        dockEntry.arguments = "-mode fixture";
+        try require(!MadeiraDock.supportsArguments(dockEntry), "unknown arguments are not silently discarded")
+        dockEntry.steamDefaultArguments = dockEntry.arguments
+        try require(MadeiraDock.supportsArguments(dockEntry), "imported default arguments use Valve's default launch")
+        let encodedEntry = try JSONEncoder().encode(dockEntry)
+        let decodedEntry = try JSONDecoder().decode(LibraryEntry.self, from: encodedEntry)
+        try require(decodedEntry.steamDefaultArguments == dockEntry.arguments, "argument provenance survives saving")
+        var legacyObject = try JSONSerialization.jsonObject(with: encodedEntry) as! [String: Any]
+        legacyObject.removeValue(forKey: "steamDefaultArguments")
+        let legacyEntry = try JSONDecoder().decode(LibraryEntry.self, from: JSONSerialization.data(withJSONObject: legacyObject))
+        try require(legacyEntry.steamDefaultArguments == nil && legacyEntry.arguments == dockEntry.arguments, "older library entry preserves arguments without inventing provenance")
+        dockEntry.arguments += " -custom"
+        try require(!MadeiraDock.supportsArguments(dockEntry), "edited default arguments are custom")
+        dockEntry.arguments = dockEntry.steamDefaultArguments!
+        setenv("MADEIRA_DOCK_DEFAULT_ARGUMENTS", "0", 1)
+        try require(!MadeiraDock.supportsArguments(dockEntry), "default argument rollback")
+        unsetenv("MADEIRA_DOCK_DEFAULT_ARGUMENTS")
+        dockEntry.arguments = ""
+        try require(MadeiraDock.routes(dockEntry) && dockEntry.launchArguments.contains("dockhost.exe"), "opt-in routes game through Dock")
+        try require(!dockEntry.launchArguments.contains("-applaunch") && !dockEntry.launchArguments.contains("a.b-c"), "command line has no token or desktop-client flags")
+        MadeiraDock.configure(dockEntry)
+        try require(String(cString: getenv("MADEIRA_STEAM_HOST_APPID")) == "123", "requested app configured")
+        try require(String(cString: getenv("MADEIRA_STEAM_HOST_LAUNCH")) == "1", "host launch enabled")
+        try require(SteamLaunchScene.owner("dockhost.exe") == .helper, "host console is not mistaken for game")
+        setenv("MADEIRA_DOCK", "0", 1)
+        try require(!MadeiraDock.routes(dockEntry) && dockEntry.launchArguments.contains("-applaunch"), "kill switch restores desktop route")
+        dockEntry.configureLaunch(dock: true)
+        try require(String(cString: getenv("MADEIRA_ARGS")).contains("dockhost.exe"), "selected Dock route survives later flag change")
+        try require(String(cString: getenv("MADEIRA_STEAM_HOST_PROBE")) == "1", "selected route preserves genuine host configuration")
+        setenv("MADEIRA_DOCK", "1", 1)
+        dockEntry.configureLaunch(dock: false)
+        try require(String(cString: getenv("MADEIRA_ARGS")).contains("-applaunch"), "selected desktop route remains consistent too")
+        setenv("MADEIRA_DOCK", "0", 1)
+        MadeiraDock.configure(dockEntry)
+        try require(String(cString: getenv("MADEIRA_STEAM_HOST_PROBE")) == "0", "rollback disables host")
+        unsetenv("MADEIRA_DOCK")
+        try require(MadeiraDock.enabled, "Dock is enabled by default")
+        // Remaining fixtures exercise the desktop client contract.
+        setenv("MADEIRA_DOCK", "0", 1)
         var parser = try SteamKeyValues(Data(#"// comment
         "LibraryFolders" { "0" { "path" "C:\\Steam" } "literal" "}" "quote" "a\"b" }
         "#.utf8))
@@ -50,7 +112,97 @@ func rejected(_ label: String, _ operation: () throws -> Void) throws {
             try require(!SteamPaths.trustedDownload(URL(string: url)), "untrusted redirect")
         }
         try require(SteamPaths.trustedDownload(SteamPaths.installerURL), "official HTTPS installer")
-        try require(LibraryRendererBadge.compact("OpenGL/D3D9/D3D11") == "D3D11", "compact capability badge")
+        try require(LibraryRendererBadge.compact("OpenGL/D3D9/D3D11", strict: false) == "D3D11", "compact capability badge (old rule)")
+        // ml1780: only an unambiguous API is named.
+        try require(LibraryRendererBadge.compact("D3D10/D3D9") == nil, "two renderers: no API badge")
+        try require(LibraryRendererBadge.compact("D3D10 / D3D9") == nil, "inspect's separator is understood")
+        try require(LibraryRendererBadge.compact("D3D9") == "D3D9" && LibraryRendererBadge.compact(" D3D11 ") == "D3D11", "one renderer is named")
+        try require(LibraryRendererBadge.compact("Wine desktop") == "Wine desktop" && LibraryRendererBadge.compact(nil) == nil, "labels pass through")
+
+        // ml1780: one-time installs marked done in the prefix registry.
+        let script = """
+        "InstallScript"
+        {
+            "Registry" { "HKEY_LOCAL_MACHINE\\\\Software\\\\Game" { "string" { "english" { "Installed" "1" } } } }
+            "Run Process"
+            {
+                "DirectX"
+                {
+                    "HasRunKey"     "HKEY_LOCAL_MACHINE\\\\Software\\\\Valve\\\\Steam\\\\Apps\\\\7000"
+                    "process 1"     "%INSTALLDIR%\\\\DirectX\\\\DXSETUP.exe"
+                    "command 1"     "/silent"
+                }
+                "PhysX"
+                {
+                    "HasRunKey"     "HKEY_LOCAL_MACHINE\\\\Software\\\\Valve\\\\Steam\\\\Apps\\\\7000"
+                    "MinimumHasRunValue" "3"
+                    "process 1"     "%INSTALLDIR%\\\\PhysX\\\\PhysX.exe"
+                }
+                "NoKey" { "process 1" "x.exe" }
+                "User" { "HasRunKey" "HKCU\\\\Software\\\\Vendor\\\\Game" }
+            }
+            "Run Process On Uninstall" { "Cleanup" { "HasRunKey" "HKEY_LOCAL_MACHINE\\\\Software\\\\Other" } }
+        }
+        """
+        var scriptParser = try SteamKeyValues(Data(script.utf8))
+        let scriptRuns = SteamInstallScripts.runs(try scriptParser.read())
+        try require(scriptRuns.map(\.name) == ["directx", "physx", "user"], "run entries with a HasRunKey (\(scriptRuns.map(\.name)))")
+        try require(scriptRuns[0].hive == .machine && scriptRuns[0].key == #"Software\Valve\Steam\Apps\7000"# && scriptRuns[0].value == 1, "HKLM key and default value")
+        try require(scriptRuns[1].value == 3 && scriptRuns[2].hive == .user, "minimum value and HKCU hive")
+        try require(SteamInstallScripts.keys(scriptRuns[0]) == [#"Software\Valve\Steam\Apps\7000"#, #"Software\Wow6432Node\Valve\Steam\Apps\7000"#], "32-bit view key too")
+        let reg = #"""
+        WINE REGISTRY Version 2
+        ;; All keys relative to \\Machine
+
+        [Software\\Valve\\Steam\\Apps\\7000] 1700000000
+        #time=1d0
+        "DirectX"=dword:00000000
+
+        [Software\\Zed] 1700000000
+        "a"="b"
+
+        """#
+        let machineRuns = scriptRuns.filter { $0.hive == .machine }
+        let (marked, changed) = SteamInstallScripts.mark(machineRuns, in: reg, now: 1800000000)
+        try require(changed == 4, "four values written (\(changed))")
+        try require(marked.contains(#"""
+        [Software\\Valve\\Steam\\Apps\\7000] 1700000000
+        #time=1d0
+        "directx"=dword:00000001
+        "physx"=dword:00000003
+
+        [Software\\Zed]
+        """#), "existing key: zero raised, missing value added in the section (\(marked))")
+        try require(marked.hasSuffix(#"""
+        "a"="b"
+
+        [Software\\Wow6432Node\\Valve\\Steam\\Apps\\7000] 1800000000
+        "directx"=dword:00000001
+        "physx"=dword:00000003
+
+        """#), "new key appended after one blank line (\(marked))")
+        try require(SteamInstallScripts.mark(machineRuns, in: marked, now: 0).changed == 0, "idempotent")
+        let folder = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("madeira-installscript-\(getpid())/common/Game")
+        try FileManager.default.createDirectory(at: folder.appendingPathComponent("sub"), withIntermediateDirectories: true)
+        try Data(script.utf8).write(to: folder.appendingPathComponent("sub/runasadmin.vdf"))
+        try Data("\"x\" { }".utf8).write(to: folder.appendingPathComponent("other.vdf"))
+        try require(SteamInstallScripts.scripts(folder: folder).map(\.lastPathComponent) == ["runasadmin.vdf"], "scripts found one level down")
+        try require(SteamInstallScripts.runs(installFolder: folder).count == 3, "runs from the install folder")
+        // ml1790: one "Run Process" section per installer (log 52 found only the last one).
+        let repeated = #"""
+        "InstallScript"
+        {
+            "Run Process" { "DirectX" { "HasRunKey" "HKEY_LOCAL_MACHINE\\Software\\Valve\\Steam\\Apps\\7000" "process 1" "a.exe" } }
+            // comment { "not" "a key" }
+            "Run Process" { "VCRedist" { "HasRunKey" "HKEY_LOCAL_MACHINE\\Software\\Valve\\Steam\\Apps\\7000" } }
+            "Run Process On Uninstall" { "Cleanup" { "HasRunKey" "HKEY_LOCAL_MACHINE\\Software\\Other" } }
+            "Run Process" { "PhysX Version" { "HasRunKey" "HKEY_LOCAL_MACHINE\\Software\\Valve\\Steam\\Apps\\7000" "MinimumHasRunValue" "2" } }
+        }
+        """#
+        let repeatedRuns = SteamInstallScripts.runs(script: Data(repeated.utf8))
+        try require(repeatedRuns.map(\.name) == ["directx", "vcredist", "physx version"], "every repeated section counts (\(repeatedRuns.map(\.name)))")
+        try require(repeatedRuns[2].value == 2 && repeatedRuns[0].key == #"Software\Valve\Steam\Apps\7000"#, "values and keys from repeated sections")
+        try require(SteamInstallScripts.runs(script: Data(script.utf8)).map(\.name) == ["directx", "physx", "user"], "text reader matches the parsed reader")
         // ml1490: redistributables and installers are never the game.
         for (path, reason) in [("PhysX/PhysX_SystemSoftware.exe", "folder:physx"), ("_CommonRedist\\vcredist\\2010\\vcredist_x86.exe", "folder:_commonredist"),
                                ("Redist/setup.exe", "folder:redist"), ("Support\\tool.exe", "folder:support"), ("DirectX/DXSETUP.exe", "folder:directx"),

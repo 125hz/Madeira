@@ -2051,6 +2051,331 @@ void ios_frame_stats_init(void)
                     ios_frame_stats_on ? "ON" : "OFF" );
 }
 
+/* ml2000 [spin-probe]: WHERE is a saturated thread spinning while another
+ * thread sits in a long server wait?
+ *
+ * Logs 80/89 froze with one worker at ~99.9% CPU in pure user mode (no server
+ * requests, no faults) while the main thread waited INFINITE on an event that
+ * worker should set.  [cpu-thread] names the thread but not the loop, and the
+ * task-wide samplers were off (they stalled things before, ml1640).  This
+ * reads ONE thread's registers 8 times with thread_get_state -- XNU briefly
+ * stops only that thread to copy its saved state; no task-wide suspend -- and
+ * resolves the host pc (dladdr, 64-bit PE loader list, JIT pool) plus, when
+ * the thread is in FEX JIT code, the guest EIP/RIP (block-tail resolver on
+ * [x28+0], same as ml876) against the guest loader list (PEB32 for WoW64).
+ * Trigger: a thread >= 90% of a core for 2 consecutive 10 s intervals while
+ * any registered server wait is >= 10 s old.  Once per thread per continuous
+ * hot episode, at most 16 episodes per run.  MADEIRA_SPIN_PROBE=0 disables. */
+static unsigned int ios_spin_long_waits( unsigned long long min_ms, unsigned int *oldest_tid,
+                                         unsigned long long *oldest_ms );
+
+static void ios_spin_wname( uint64_t buf, unsigned int bytes, char *out, size_t cap )
+{
+    uint16_t w[48]; unsigned int k, n = bytes / 2;
+    if (n > 47) n = 47;
+    if (n >= cap) n = (unsigned int)cap - 1;
+    out[0] = 0;
+    if (!n || !ios_ts_read( buf, w, n * 2 )) { snprintf( out, cap, "?" ); return; }
+    for (k = 0; k < n; k++) out[k] = (w[k] >= 32 && w[k] < 127) ? (char)w[k] : '?';
+    out[n] = 0;
+}
+
+/* Stateless: walks the 64-bit loader list once per lookup (bounded). */
+static int ios_spin_mod64( uint64_t teb, uint64_t va, char *name, size_t cap, uint64_t *rva )
+{
+    uint64_t peb = 0, ldr = 0, head, cur = 0;
+    int guard = 0;
+    if (!teb || !ios_ts_read( teb + 0x60, &peb, 8 ) || !peb || !ios_ts_read( peb + 0x18, &ldr, 8 ) || !ldr) return 0;
+    head = ldr + 0x10;                                 /* InLoadOrderModuleList */
+    if (!ios_ts_read( head, &cur, 8 )) return 0;
+    while (cur && cur != head && guard++ < 256)
+    {
+        uint64_t base = 0, buf = 0, next = 0; uint32_t size = 0; uint16_t len = 0;
+        if (!ios_ts_read( cur + 0x30, &base, 8 ) || !ios_ts_read( cur + 0x40, &size, 4 )) break;
+        if (base && size && va >= base && va < base + size)
+        {
+            ios_ts_read( cur + 0x58, &len, 2 ); ios_ts_read( cur + 0x60, &buf, 8 );
+            ios_spin_wname( buf, len, name, cap );
+            *rva = va - base;
+            return 1;
+        }
+        if (!ios_ts_read( cur, &next, 8 )) break;
+        cur = next;
+    }
+    return 0;
+}
+
+/* Same for a WoW64 guest: guest address g lives at host B + g (ios_wow.h). */
+static int ios_spin_mod32( uint64_t B, uint32_t peb32, uint32_t eip, char *name, size_t cap, uint32_t *rva )
+{
+    uint32_t ldr = 0, head32, cur32 = 0;
+    int guard = 0;
+    if (!B || !peb32 || !ios_ts_read( B + peb32 + 0x0c, &ldr, 4 ) || !ldr) return 0;
+    head32 = ldr + 0x0c;                               /* PEB_LDR_DATA32.InLoadOrderModuleList */
+    if (!ios_ts_read( B + head32, &cur32, 4 )) return 0;
+    while (cur32 && cur32 != head32 && guard++ < 256)
+    {
+        uint32_t base = 0, size = 0, buf = 0, next = 0; uint16_t len = 0;
+        if (!ios_ts_read( B + cur32 + 0x18, &base, 4 ) || !ios_ts_read( B + cur32 + 0x20, &size, 4 )) break;
+        if (base && size && eip >= base && eip - base < size)
+        {
+            ios_ts_read( B + cur32 + 0x2c, &len, 2 ); ios_ts_read( B + cur32 + 0x30, &buf, 4 );
+            ios_spin_wname( buf ? B + buf : 0, len, name, cap );
+            *rva = eip - base;
+            return 1;
+        }
+        if (!ios_ts_read( B + cur32, &next, 4 )) break;
+        cur32 = next;
+    }
+    return 0;
+}
+
+static void ios_spin_host_where( uint64_t teb, uint64_t a, char *out, size_t cap )
+{
+    extern void *ios_jit_rx_base_global;
+    extern size_t ios_jit_pool_size_global;
+    uint64_t rx = (uint64_t)(uintptr_t)ios_jit_rx_base_global, rva = 0;
+    char nm[48];
+    if (ios_ts_sym( a, out, cap )) return;
+    if (ios_spin_mod64( teb, a, nm, sizeof(nm), &rva )) { snprintf( out, cap, "%s+0x%llx", nm, (unsigned long long)rva ); return; }
+    if (rx && ios_jit_pool_size_global && a >= rx && a < rx + ios_jit_pool_size_global)
+    { snprintf( out, cap, "jit-pool+0x%llx", (unsigned long long)(a - rx) ); return; }
+    snprintf( out, cap, "0x%llx(anon)", (unsigned long long)a );
+}
+
+static void ios_spin_probe_thread( thread_act_t port, uint64_t id, double pct,
+                                   unsigned int nlong, unsigned int wtid, unsigned long long wms )
+{
+    extern uint64_t ios_native_rip_from_hostpc( uint64_t, uint64_t, const char ** );
+    pthread_t pt = pthread_from_mach_thread_np( port );
+    uint64_t teb = ios_ts_teb( pt ), peb = 0, B = 0, tstate = 0, tframe = 0;
+    uint32_t tid = 0, peb32 = 0;
+    int s;
+
+    if (!teb)
+    {
+        /* ios_ts_teb needs the TSD offset, calibrated once from a live thread. */
+        if (ios_ts_tsd_off < 0) ios_ts_calibrate();
+        teb = ios_ts_teb( pt );
+    }
+    if (teb)
+    {
+        ios_ts_read( teb + 0x48, &tid, 4 );                          /* ClientId.UniqueThread */
+        if (ios_ts_read( teb + 0x60, &peb, 8 ) && peb) B = ios_wow_base_for_peb( (void *)(uintptr_t)peb );
+        if (B)
+        {
+            int32_t wow_off = 0; uint32_t tmp = 0;
+            /* FEX WoW64 keeps its ThreadState in TlsSlots[14] ([wow64-tls]);
+             * InternalThreadState starts with CurrentFrame. */
+            if (ios_ts_read( teb + offsetof(TEB, TlsSlots) + 14 * 8, &tstate, 8 ) && tstate >= 0x10000)
+                ios_ts_read( tstate, &tframe, 8 );
+            if (ios_ts_read( teb + offsetof(TEB, WowTebOffset), &wow_off, 4 ) && wow_off &&
+                ios_ts_read( teb + (int64_t)wow_off + 0x30, &tmp, 4 )) peb32 = tmp;   /* TEB32.Peb */
+        }
+    }
+    wine_log_write( "[spin-probe] ml2000 HOT tid=%04x id=%llu mach=%#x cpu=%.1f%% x2 intervals; long-waits(>=10s)=%u oldest tid=%04x age=%llums "
+                    "teb=0x%llx wow=%s B=0x%llx fex-ts=0x%llx frame=0x%llx; 8 register reads, this thread only",
+                    tid, (unsigned long long)id, port, pct, nlong, wtid, wms, (unsigned long long)teb, B ? "yes" : "no",
+                    (unsigned long long)B, (unsigned long long)tstate, (unsigned long long)tframe );
+    for (s = 0; s < 8; s++)
+    {
+        arm_thread_state64_t st;
+        mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+        uint64_t pc, lr, sp, x28, bb = 0, rip = 0, srip = 0;
+        const char *why = "no block", *src = "-";
+        char wpc[112], wlr[112], gm[48] = "", line[640];
+        int n;
+
+        if (s) usleep( 2000 );
+        if (thread_get_state( port, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt ) != KERN_SUCCESS)
+        {
+            wine_log_write( "[spin-probe] ml2000 s%d thread_get_state failed (thread gone?)", s );
+            break;
+        }
+        pc = arm_thread_state64_get_pc( st ); lr = arm_thread_state64_get_lr( st );
+        sp = arm_thread_state64_get_sp( st ); x28 = st.__x[28];
+        ios_spin_host_where( teb, pc, wpc, sizeof(wpc) );
+        ios_spin_host_where( teb, lr, wlr, sizeof(wlr) );
+        /* In JIT code x28 is the FEX CpuStateFrame: [+0] InlineJITBlockHeader,
+         * [+0x18] State.rip (stale while the JIT runs). */
+        if (ios_ts_read( x28, &bb, 8 ) && bb > 0x10000) { rip = ios_native_rip_from_hostpc( bb, pc, &why ); if (rip) src = "jit-pc"; }
+        if (!rip && tframe && tframe != x28 && ios_ts_read( tframe, &bb, 8 ) && bb > 0x10000)
+        { rip = ios_native_rip_from_hostpc( bb, pc, &why ); if (rip) src = "ts-frame"; }
+        if (!ios_ts_read( (tframe ? tframe : x28) + 0x18, &srip, 8 )) srip = 0;
+        n = snprintf( line, sizeof(line), "[spin-probe] ml2000 s%d tid=%04x pc=0x%llx(%s) lr=0x%llx(%s) sp=0x%llx x18=0x%llx x28=0x%llx%s",
+                      s, tid, (unsigned long long)pc, wpc, (unsigned long long)lr, wlr, (unsigned long long)sp,
+                      (unsigned long long)st.__x[18], (unsigned long long)x28, (tframe && x28 == tframe) ? "(=frame)" : "" );
+        if (rip)
+        {
+            if (B && rip < 0x100000000ull)
+            {
+                uint32_t rva32 = 0;
+                if (ios_spin_mod32( B, peb32, (uint32_t)rip, gm, sizeof(gm), &rva32 ))
+                    n += snprintf( line + n, sizeof(line) - n, " GUEST eip=0x%08x(%s+0x%x) via %s", (unsigned)rip, gm, rva32, src );
+                else
+                    n += snprintf( line + n, sizeof(line) - n, " GUEST eip=0x%08x(?) via %s", (unsigned)rip, src );
+            }
+            else
+            {
+                uint64_t rva = 0;
+                if (ios_spin_mod64( teb, rip, gm, sizeof(gm), &rva ))
+                    n += snprintf( line + n, sizeof(line) - n, " GUEST rip=0x%llx(%s+0x%llx) via %s", (unsigned long long)rip, gm, (unsigned long long)rva, src );
+                else
+                    n += snprintf( line + n, sizeof(line) - n, " GUEST rip=0x%llx(?) via %s", (unsigned long long)rip, src );
+            }
+        }
+        else n += snprintf( line + n, sizeof(line) - n, " GUEST ? (%s)", why );
+        if (srip && n < (int)sizeof(line) - 40)
+            n += snprintf( line + n, sizeof(line) - n, " state-rip=0x%llx", (unsigned long long)srip );
+        wine_log_write( "%s", line );
+    }
+}
+
+/* Called from ios_cpu_diagnostics with the live port list, BEFORE the ports
+ * are released. rows[] carry the per-interval CPU deltas. */
+static void ios_spin_probe( const uint64_t *ids, const unsigned int *ports, const uint64_t *deltas,
+                            unsigned int n, uint64_t elapsed )
+{
+    static struct { uint64_t id; unsigned int streak, probed, seen; } hot[16];
+    static int enabled = -1;
+    static unsigned int epoch, episodes;
+    mach_port_t self = pthread_mach_thread_np( pthread_self() );
+    unsigned int i, k, probes = 0, nlong = 0, wtid = 0;
+    unsigned long long wms = 0;
+    int waits_checked = 0;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_SPIN_PROBE" );
+        enabled = !(e && !strcmp( e, "0" ));
+        wine_log_write( "[spin-probe] ml2000 %s (>=90%% CPU for 2 intervals + a >=10 s server wait -> 8 single-thread "
+                        "register reads; MADEIRA_SPIN_PROBE=0 disables)", enabled ? "armed" : "OFF" );
+    }
+    if (!enabled || !elapsed) return;
+    epoch++;
+    for (k = 0; k < n; k++)
+    {
+        unsigned int slot = 16;
+        if (deltas[k] * 10 < elapsed * 9) continue;           /* < 90% of one core */
+        for (i = 0; i < 16; i++) if (hot[i].id == ids[k]) { slot = i; break; }
+        if (slot == 16)
+            for (i = 0; i < 16; i++) if (!hot[i].id || hot[i].seen + 1 < epoch) { slot = i; hot[i].id = ids[k]; hot[i].streak = 0; hot[i].probed = 0; break; }
+        if (slot == 16) continue;
+        /* A gap of one interval ends the episode. */
+        if (hot[slot].seen + 1 != epoch) { hot[slot].streak = 0; hot[slot].probed = 0; }
+        hot[slot].seen = epoch;
+        hot[slot].streak++;
+        if (hot[slot].streak < 2 || hot[slot].probed || probes >= 2 || episodes >= 16 || ports[k] == self) continue;
+        if (!waits_checked) { nlong = ios_spin_long_waits( 10000, &wtid, &wms ); waits_checked = 1; }
+        if (!nlong) continue;
+        hot[slot].probed = 1;
+        probes++; episodes++;
+        ios_spin_probe_thread( ports[k], ids[k], 100.0 * deltas[k] / elapsed, nlong, wtid, wms );
+    }
+}
+
+/* ml1950: cumulative thread CPU deltas, without suspending a thread or reading
+ * its registers/stack. Ten-second cadence separates a busy worker from a waiting
+ * presenter; wall-minus-CPU alone cannot establish CPU saturation. Kernel thread
+ * IDs distinguish a new thread from a recycled Mach port name. Dead/new threads
+ * are deliberately excluded from deltas, so the sum is not whole-task CPU. */
+static void ios_cpu_diagnostics(void)
+{
+    struct sample { uint64_t id, cpu; unsigned int generation; };
+    struct row { uint64_t id, delta; unsigned int port; int state, role; char name[64]; };
+    static struct sample previous[256];
+    static struct row rows[256];
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t last;
+    static unsigned int generation;
+    thread_act_array_t threads = NULL;
+    mach_msg_type_number_t count = 0;
+    uint64_t now, elapsed, total = 0;
+    unsigned int k, n = 0, dropped = 0, matched = 0;
+    const char *enabled = getenv( "MADEIRA_CPU_DIAGNOSTICS" );
+
+    if (!enabled || strcmp( enabled, "1" ) || pthread_mutex_trylock( &lock )) return;
+    now = ios_frame_now_ns();
+    if (last && now - last < 10000000000ull) goto done;
+    if (task_threads( mach_task_self(), &threads, &count ) != KERN_SUCCESS) goto done;
+    elapsed = last ? now - last : 0;
+    generation++;
+    for (k = 0; k < count; k++)
+    {
+        thread_identifier_info_data_t identity;
+        thread_basic_info_data_t basic;
+        mach_msg_type_number_t ic = THREAD_IDENTIFIER_INFO_COUNT, bc = THREAD_BASIC_INFO_COUNT;
+        unsigned int i, slot = 256;
+        uint64_t cpu;
+        if (thread_info( threads[k], THREAD_IDENTIFIER_INFO, (thread_info_t)&identity, &ic ) != KERN_SUCCESS ||
+            thread_info( threads[k], THREAD_BASIC_INFO, (thread_info_t)&basic, &bc ) != KERN_SUCCESS) continue;
+        cpu = ((uint64_t)basic.user_time.seconds + basic.system_time.seconds) * 1000000000ull +
+              ((uint64_t)basic.user_time.microseconds + basic.system_time.microseconds) * 1000ull;
+        for (i = 0; i < 256; i++)
+            if (previous[i].id == identity.thread_id) { slot = i; break; }
+        if (slot == 256)
+            for (i = 0; i < 256; i++)
+                if (!previous[i].id || previous[i].generation + 1 < generation) { slot = i; break; }
+        if (slot == 256) { dropped++; continue; }
+        if (elapsed && previous[slot].id == identity.thread_id &&
+            previous[slot].generation + 1 == generation && cpu >= previous[slot].cpu)
+        {
+            struct row *r = &rows[n++];
+            thread_extended_info_data_t extended;
+            mach_msg_type_number_t ec = THREAD_EXTENDED_INFO_COUNT;
+            pthread_t pt = pthread_from_mach_thread_np( threads[k] );
+            r->id = identity.thread_id;
+            r->port = threads[k];
+            r->delta = cpu - previous[slot].cpu;
+            r->state = basic.run_state;
+            r->role = -1;
+            r->name[0] = 0;
+            total += r->delta;
+            matched++;
+            for (i = 0; i < IOS_FRAME_ROLE_MAX; i++)
+                if ((uint64_t)(uintptr_t)pt == __atomic_load_n( &ios_frame_role_tid[i], __ATOMIC_RELAXED )) r->role = i;
+            if (thread_info( threads[k], THREAD_EXTENDED_INFO, (thread_info_t)&extended, &ec ) == KERN_SUCCESS)
+            {
+                memcpy( r->name, extended.pth_name, sizeof(r->name) - 1 );
+                r->name[sizeof(r->name) - 1] = 0;
+                for (i = 0; r->name[i]; i++) if ((unsigned char)r->name[i] < 32 || (unsigned char)r->name[i] > 126) r->name[i] = '?';
+            }
+        }
+        previous[slot].id = identity.thread_id;
+        previous[slot].cpu = cpu;
+        previous[slot].generation = generation;
+    }
+    /* ml2000: probe a saturated thread while its port is still held. */
+    if (elapsed && n)
+    {
+        static uint64_t sp_ids[256], sp_deltas[256];
+        static unsigned int sp_ports[256];
+        for (k = 0; k < n; k++) { sp_ids[k] = rows[k].id; sp_ports[k] = rows[k].port; sp_deltas[k] = rows[k].delta; }
+        ios_spin_probe( sp_ids, sp_ports, sp_deltas, n, elapsed );
+    }
+    /* Release every port even if metadata queries failed. */
+    for (k = 0; k < count; k++) mach_port_deallocate( mach_task_self(), threads[k] );
+    vm_deallocate( mach_task_self(), (vm_address_t)threads, count * sizeof(*threads) );
+    if (elapsed)
+    {
+        wine_log_write( "[cpu-budget] ml1950 interval=%.2fs live-threads=%u matched=%u dropped=%u live-core-equivalents=%.2f (no thread suspension)",
+                        elapsed * 1e-9, count, matched, dropped, (double)total / elapsed );
+        for (k = 0; k < 6 && k < n; k++)
+        {
+            unsigned int i, best = 0;
+            for (i = 1; i < n; i++) if (rows[i].delta > rows[best].delta) best = i;
+            if (!rows[best].delta) break;
+            wine_log_write( "[cpu-thread] ml1950 id=%llu mach=%#x name=%s role=%d cpu=%.1f%% state=%d",
+                            (unsigned long long)rows[best].id, rows[best].port, rows[best].name, rows[best].role,
+                            100.0 * rows[best].delta / elapsed, rows[best].state );
+            rows[best].delta = 0;
+        }
+    }
+    last = now;
+done:
+    pthread_mutex_unlock( &lock );
+}
+
 /* One line per heartbeat window.  Everything is per-frame except fps, n and
  * the two percentiles, because a per-window total cannot be compared against
  * a refresh interval and the refresh interval is the thing every number here
@@ -2063,6 +2388,8 @@ void ios_frame_report( unsigned long long win_ns )
     unsigned i;
 
     if (!ios_frame_stats_on) return;
+
+    ios_cpu_diagnostics();
 
     /* Exchange the 64-bit prefix to zero: these are per-window rates.  A
      * producer racing this loses at most one frame's contribution.  The bound
@@ -3745,6 +4072,35 @@ static void ios_wait_leave(void)
     e->seq++;                       /* -> even: no longer waiting */
 }
 
+/* ml2000 [spin-probe] gate: registered waits at least min_ms old (same torn-
+ * read discipline as ios_dump_stuck_waits in queue_ios.c). */
+static unsigned int ios_spin_long_waits( unsigned long long min_ms, unsigned int *oldest_tid,
+                                         unsigned long long *oldest_ms )
+{
+    struct timespec ts;
+    unsigned long long now_ns;
+    unsigned int i, n = 0;
+
+    *oldest_tid = 0; *oldest_ms = 0;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    now_ns = (unsigned long long)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+    for (i = 0; i < IOS_WAITREG_SLOTS; i++)
+    {
+        struct ios_wait_entry *e = &ios_wait_reg[i];
+        unsigned int s0 = e->seq, tid;
+        unsigned long long t0, age;
+        if (!(s0 & 1)) continue;
+        t0 = e->t0_ns; tid = e->wine_tid;
+        __sync_synchronize();
+        if (e->seq != s0 || !t0 || now_ns < t0) continue;
+        age = (now_ns - t0) / 1000000ull;
+        if (age < min_ms) continue;
+        n++;
+        if (age > *oldest_ms) { *oldest_ms = age; *oldest_tid = tid; }
+    }
+    return n;
+}
+
 unsigned int server_wait( const union select_op *select_op, data_size_t size, UINT flags,
                           const LARGE_INTEGER *timeout )
 {
@@ -4893,9 +5249,73 @@ static int init_thread_pipe(void)
  *
  * Close server socket and exit process normally.
  */
+/* ml1860: normal ExitProcess first marks exiting with a NULL handle. Its
+ * subsequent self-termination takes an early fast path in NtTerminateProcess,
+ * bypassing the ml1850 observer there. Notify at the common exit wrapper,
+ * before reclaiming the PEB or its image. No guest strings are logged here. */
+/* ml2000: the app's compositor keys window layers by the PEB of the process
+ * that framed them, so the layers of a process that died without destroying
+ * its windows (a crash, TerminateProcess) are retired at its exit. */
+void *madeira_current_peb( void )
+{
+    TEB *teb = NtCurrentTeb();
+    return teb ? teb->Peb : NULL;
+}
+
+/* ml2000: program starts too, so the app knows when every program it launched
+ * has ended (a Dock session otherwise outlives its game). Same name rules as
+ * the exit notification below. */
+static void ios_notify_process_start( void )
+{
+    extern void wine_process_did_start( const char * ) __attribute__((weak));
+    PEB *peb = NtCurrentTeb() ? NtCurrentTeb()->Peb : NULL;
+    RTL_USER_PROCESS_PARAMETERS *params = peb ? peb->ProcessParameters : NULL;
+    unsigned int i, start = 0, length, used = 0;
+    char name[64];
+    if (!wine_process_did_start || !params || !params->ImagePathName.Buffer) return;
+    length = params->ImagePathName.Length / sizeof(WCHAR);
+    for (i = 0; i < length; i++)
+        if (params->ImagePathName.Buffer[i] == '\\' || params->ImagePathName.Buffer[i] == '/') start = i + 1;
+    if (length - start >= sizeof(name)) return;
+    for (i = start; i < length; i++)
+    {
+        WCHAR c = params->ImagePathName.Buffer[i];
+        if (!c || c > 127) return;
+        name[used++] = (char)c;
+    }
+    name[used] = 0;
+    if (used) wine_process_did_start( name );
+}
+
+static void ios_notify_process_exit( int status )
+{
+    extern void wine_process_did_exit( const char *, int ) __attribute__((weak));
+    extern void winios_process_exited( void *peb ) __attribute__((weak));
+    PEB *peb = NtCurrentTeb() ? NtCurrentTeb()->Peb : NULL;
+    RTL_USER_PROCESS_PARAMETERS *params = peb ? peb->ProcessParameters : NULL;
+    unsigned int i, start = 0, length, used = 0;
+    char name[64];
+    if (winios_process_exited && peb) winios_process_exited( peb );   /* ml2000 */
+    if (!wine_process_did_exit || !params || !params->ImagePathName.Buffer) return;
+    length = params->ImagePathName.Length / sizeof(WCHAR);
+    for (i = 0; i < length; i++)
+        if (params->ImagePathName.Buffer[i] == '\\' || params->ImagePathName.Buffer[i] == '/') start = i + 1;
+    /* A truncated/non-ASCII name must never masquerade as the known host. */
+    if (length - start >= sizeof(name)) return;
+    for (i = start; i < length; i++)
+    {
+        WCHAR c = params->ImagePathName.Buffer[i];
+        if (!c || c > 127) return;
+        name[used++] = (char)c;
+    }
+    name[used] = 0;
+    if (used) wine_process_did_exit( name, status );
+}
+
 void process_exit_wrapper( int status )
 {
 #ifdef WINE_IOS
+    ios_notify_process_exit( status );
     /* Close THIS pseudo-process's master socket — the EOF is how wineserver
      * learns the process died (signals its process object, wakes waiters).
      * Clear the registry slot so a stray second call can't double-close. */
@@ -5342,6 +5762,7 @@ void server_init_process_done(void)
      * madeira_fast_flush_pid() in ntdll/unix/sync.c for why that is a
      * correctness problem and not just a leak. */
     madeira_fast_flush_pid();
+    ios_notify_process_start();   /* ml2000 */
 
     if (!get_device_info( initial_cwd, &info ) && (info.Characteristics & FILE_REMOVABLE_MEDIA))
         chdir( "/" );

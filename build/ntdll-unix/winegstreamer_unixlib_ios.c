@@ -43,11 +43,20 @@
  * create / destroy / push_data / read_data / get_output_type /
  * set_output_type / drain / flush / get_status (+ notify_qos as a no-op, and
  * wg_init_gstreamer as a benign success so main.c's init_gstreamer_proc lets
- * the DLL load).  Everything else -- the wg_parser side (quartz splitter,
- * media source, wm_reader) and the wg_muxer side -- returns
- * STATUS_NOT_IMPLEMENTED.  Those callers already handle a decoder that is not
- * available; what they must never get is a success with an untouched output
- * field (WOW64_DESIGN.md §7.4 rule 4: no fake success).
+ * the DLL load).  The wg_muxer side returns STATUS_NOT_IMPLEMENTED.  Those
+ * callers already handle a component that is not available; what they must
+ * never get is a success with an untouched output field (WOW64_DESIGN.md
+ * §7.4 rule 4: no fake success).
+ *
+ * ml1980: the wg_parser side (quartz's splitters, and the same pull protocol
+ * for the MF media source) is implemented for AUDIO files only -- MP3 (and
+ * MPEG-1 layer I/II) and WAV/PCM, decoded to interleaved PCM -- by
+ * wg_parser_av_ios.c on libavformat/libavcodec; its header has the details.
+ * Video and anything else unrecognised fail connect() with an error so quartz
+ * moves on to its next filter.  MADEIRA_WG_PARSER=0 restores the refusal.
+ * ml1990 adds MP4/MOV (H.264 / HEVC on VideoToolbox, AAC on AudioToolbox, in
+ * wg_parser_apple_ios.c) for the Media Foundation source; MADEIRA_WG_VIDEO=0
+ * restores the MP3/WAV-only parser.
  *
  * wg_transform_create also REFUSES anything that is not a WMA family stream.
  * winegstreamer's other transforms (aac, h264, wmv, the resampler, the colour
@@ -232,6 +241,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -243,6 +253,11 @@
 #include <libavutil/opt.h>
 #include <libavutil/samplefmt.h>
 #include <libswresample/swresample.h>
+
+/* ml1980: the wg_parser core (libavformat demux + decode, the PE read-thread
+ * pull protocol).  It includes no Wine header, so it comes first; the Wine
+ * side of the wg_parser entries is at the end of this file. */
+#include "wg_parser_av_ios.c"
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -475,26 +490,42 @@ static unsigned int wma_log_count;
 
 static unsigned int wma_av_log_count;
 
+/* ml1980: the same callback serves the wg_parser core, whose demuxer and
+ * decoder contexts are told apart by their class (the demuxer / its I/O) or
+ * by the marker the core leaves in AVCodecContext.opaque, so a parser
+ * diagnostic is not reported as a WMA one.  One cap for both. */
+static const char *av_log_owner( void *avcl )
+{
+    const AVClass *cls = avcl ? *(const AVClass **)avcl : NULL;
+
+    if (!cls || !cls->class_name) return "[wma] av:";
+    if (!strcmp( cls->class_name, "AVFormatContext" ) || !strcmp( cls->class_name, "AVIOContext" ))
+        return "[wg-parser] av:";
+    if (!strcmp( cls->class_name, "AVCodecContext" )
+        && ((AVCodecContext *)avcl)->opaque == MAV_DECODER_MARKER)
+        return "[wg-parser] av:";
+    return "[wma] av:";
+}
+
 static void wma_av_log( void *avcl, int level, const char *fmt, va_list args )
 {
     char buf[512];
     int n;
 
-    (void)avcl;
     if (level > AV_LOG_WARNING) return;
     if (wma_av_log_count >= MADEIRA_WMA_MAX_AV_LOGS)
     {
         if (wma_av_log_count == MADEIRA_WMA_MAX_AV_LOGS)
         {
             wma_av_log_count++;
-            dprintf( 2, "[wma] av: further libavcodec diagnostics suppressed\n" );
+            dprintf( 2, "[wma] av: further libavcodec/libavformat diagnostics suppressed\n" );
         }
         return;
     }
     wma_av_log_count++;
     n = vsnprintf( buf, sizeof(buf), fmt, args );
     if (n <= 0) return;
-    dprintf( 2, "[wma] av: %s%s", buf, buf[strlen(buf) - 1] == '\n' ? "" : "\n" );
+    dprintf( 2, "%s %s%s", av_log_owner( avcl ), buf, buf[strlen(buf) - 1] == '\n' ? "" : "\n" );
 }
 
 static pthread_once_t wma_av_log_once = PTHREAD_ONCE_INIT;
@@ -2038,6 +2069,564 @@ static NTSTATUS wma_transform_notify_qos( void *args )
     return STATUS_SUCCESS;
 }
 
+/***********************************************************************
+ *           wg_parser   (MADEIRA ml1980, ml1990)
+ *
+ * The Wine side of wg_parser_av_ios.c: handle validation, struct wg_format /
+ * struct wg_parser_buffer mapping, and the HRESULTs wg_parser.c returns.
+ * See that file's header for the protocol and what is accepted.
+ *
+ * MADEIRA_WG_PARSER=0 restores the pre-ml1980 behaviour: create is refused
+ * with STATUS_NOT_IMPLEMENTED, so quartz_parser.c's parser_create() fails
+ * exactly as before.
+ *
+ * ml1990: MP4/MOV (H.264 / HEVC video on VideoToolbox, AAC audio on
+ * AudioToolbox, wg_parser_apple_ios.c).  MADEIRA_WG_VIDEO=0 restores the
+ * ml1980 MP3/WAV-only behaviour (an MP4 is refused at connect).
+ * MADEIRA_WG_VIDEO_FORMAT=nv12|i420|yv12|yuy2|rgb32|argb32|abgr32 picks the
+ * native format a video stream reports (default nv12: what the hardware
+ * decoder produces, and the first format media_source.c offers anyway); only
+ * the native format and media_source.c's YUV list become media types, so a
+ * consumer that insists on RGB can be served by choosing it here.
+ *
+ * A parser has up to MAV_MAX_STREAMS streams.  Each stream handle is a
+ * separate object inside the parser so a parser handle passed as a stream
+ * (or the reverse) is caught by the magic, not dereferenced.
+ */
+#define MADEIRA_WG_PARSER_MAGIC 0x57475052  /* 'WGPR' */
+#define MADEIRA_WG_STREAM_MAGIC 0x57475354  /* 'WGST' */
+
+struct wgp_parser;
+
+struct wgp_stream
+{
+    UINT32 magic;
+    UINT32 index;
+    struct wgp_parser *parser;
+};
+
+struct wgp_parser
+{
+    UINT32 magic;
+    struct mav_parser *core;
+    struct wgp_stream streams[MAV_MAX_STREAMS];
+};
+
+C_ASSERT( (int)MAV_FMT_U8 == (int)WG_AUDIO_FORMAT_U8 && (int)MAV_FMT_S16 == (int)WG_AUDIO_FORMAT_S16LE
+          && (int)MAV_FMT_S24 == (int)WG_AUDIO_FORMAT_S24LE && (int)MAV_FMT_S32 == (int)WG_AUDIO_FORMAT_S32LE
+          && (int)MAV_FMT_F32 == (int)WG_AUDIO_FORMAT_F32LE && (int)MAV_FMT_F64 == (int)WG_AUDIO_FORMAT_F64LE );
+C_ASSERT( (int)MAV_PIX_BGRA == (int)WG_VIDEO_FORMAT_BGRA && (int)MAV_PIX_BGRx == (int)WG_VIDEO_FORMAT_BGRx
+          && (int)MAV_PIX_RGBA == (int)WG_VIDEO_FORMAT_RGBA && (int)MAV_PIX_I420 == (int)WG_VIDEO_FORMAT_I420
+          && (int)MAV_PIX_NV12 == (int)WG_VIDEO_FORMAT_NV12 && (int)MAV_PIX_YUY2 == (int)WG_VIDEO_FORMAT_YUY2
+          && (int)MAV_PIX_YV12 == (int)WG_VIDEO_FORMAT_YV12 );
+
+static BOOL wg_parser_switch_on(void)
+{
+    const char *v = getenv( "MADEIRA_WG_PARSER" );
+    return !(v && v[0] == '0' && !v[1]);
+}
+
+static BOOL wg_video_switch_on(void)
+{
+    const char *v = getenv( "MADEIRA_WG_VIDEO" );
+    return !(v && v[0] == '0' && !v[1]);
+}
+
+static enum mav_pixel_format wg_video_native_format(void)
+{
+    static const struct { const char *name; enum mav_pixel_format fmt; } names[] =
+    {
+        { "nv12", MAV_PIX_NV12 }, { "i420", MAV_PIX_I420 }, { "iyuv", MAV_PIX_I420 },
+        { "yv12", MAV_PIX_YV12 }, { "yuy2", MAV_PIX_YUY2 }, { "rgb32", MAV_PIX_BGRx },
+        { "argb32", MAV_PIX_BGRA }, { "abgr32", MAV_PIX_RGBA },
+    };
+    const char *v = getenv( "MADEIRA_WG_VIDEO_FORMAT" );
+    unsigned int i;
+
+    if (!v || !*v) return MAV_PIX_NV12;
+    for (i = 0; i < ARRAY_SIZE(names); i++)
+        if (!strcasecmp( v, names[i].name )) return names[i].fmt;
+    mav_log( "MADEIRA_WG_VIDEO_FORMAT=%.16s is not one of nv12/i420/yv12/yuy2/rgb32/argb32/abgr32; using nv12", v );
+    return MAV_PIX_NV12;
+}
+
+static pthread_once_t wgp_config_once = PTHREAD_ONCE_INIT;
+
+static void wgp_configure(void)
+{
+    BOOL video = wg_video_switch_on();
+    enum mav_pixel_format native = wg_video_native_format();
+
+#ifdef __APPLE__
+    mav_configure( video, &mav_apple_video_backend, &mav_apple_audio_backend, native );
+    mav_log( "mp4/mov %s (MADEIRA_WG_VIDEO=0 disables): video on %s, aac on %s, native video format %s",
+             video ? "enabled" : "disabled", mav_apple_video_backend.name, mav_apple_audio_backend.name,
+             mav_pix_name( native ) );
+#else
+    mav_configure( FALSE, NULL, NULL, native );
+#endif
+}
+
+static struct wgp_parser *get_wgp_parser( wg_parser_t handle )
+{
+    struct wgp_parser *parser = (struct wgp_parser *)(UINT_PTR)handle;
+
+    if (!parser || parser->magic != MADEIRA_WG_PARSER_MAGIC) return NULL;
+    return parser;
+}
+
+static struct wgp_parser *get_wgp_stream( wg_parser_stream_t handle, UINT32 *index )
+{
+    struct wgp_stream *stream = (struct wgp_stream *)(UINT_PTR)handle;
+
+    if (!stream || stream->magic != MADEIRA_WG_STREAM_MAGIC) return NULL;
+    if (!stream->parser || stream->parser->magic != MADEIRA_WG_PARSER_MAGIC) return NULL;
+    if (stream->index >= MAV_MAX_STREAMS || &stream->parser->streams[stream->index] != stream) return NULL;
+    *index = stream->index;
+    return stream->parser;
+}
+
+/* The HRESULTs wg_parser.c / quartz_parser.c expect. */
+static NTSTATUS wgp_status( int status )
+{
+    switch (status)
+    {
+    case MAV_OK:            return S_OK;
+    case MAV_NO_BUFFER:     return S_FALSE;
+    case MAV_E_STATE:       return VFW_E_WRONG_STATE;
+    case MAV_E_UNSUPPORTED: return VFW_E_UNSUPPORTED_STREAM;
+    case MAV_E_NOMEM:       return E_OUTOFMEMORY;
+    case MAV_E_PARAM:       return STATUS_INVALID_PARAMETER;
+    case MAV_E_IO:
+    default:                return E_FAIL;
+    }
+}
+
+static void wgp_format_from_output( struct wg_format *format, const struct mav_output *out )
+{
+    memset( format, 0, sizeof(*format) );
+    format->major_type = WG_MAJOR_TYPE_AUDIO;
+    format->u.audio.format = out->fmt;
+    format->u.audio.channels = out->channels;
+    format->u.audio.channel_mask = out->channel_mask;
+    format->u.audio.rate = out->rate;
+}
+
+static void wgp_format_from_video( struct wg_format *format, const struct mav_video_output *out )
+{
+    memset( format, 0, sizeof(*format) );
+    format->major_type = WG_MAJOR_TYPE_VIDEO;
+    format->u.video.format = out->fmt;
+    format->u.video.width = out->width;
+    format->u.video.height = out->height;
+    format->u.video.fps_n = out->fps_n;
+    format->u.video.fps_d = out->fps_d;
+}
+
+static NTSTATUS wgp_create( void *args )
+{
+    struct wg_parser_create_params *params = args;
+    struct wgp_parser *parser;
+    unsigned int i;
+
+    if (!wg_parser_switch_on())
+    {
+        static int once;
+        if (!__atomic_exchange_n( &once, 1, __ATOMIC_RELAXED ))
+            mav_log( "disabled by MADEIRA_WG_PARSER=0; parser creation refused" );
+        return STATUS_NOT_IMPLEMENTED;
+    }
+    pthread_once( &wma_av_log_once, wma_install_av_log );
+    pthread_once( &wgp_config_once, wgp_configure );
+    if (!(parser = calloc( 1, sizeof(*parser) ))) return E_OUTOFMEMORY;
+    if (!(parser->core = mav_create( params->output_compressed )))
+    {
+        free( parser );
+        return E_OUTOFMEMORY;
+    }
+    parser->magic = MADEIRA_WG_PARSER_MAGIC;
+    for (i = 0; i < MAV_MAX_STREAMS; i++)
+    {
+        parser->streams[i].magic = MADEIRA_WG_STREAM_MAGIC;
+        parser->streams[i].index = i;
+        parser->streams[i].parser = parser;
+    }
+    params->parser = (wg_parser_t)(UINT_PTR)parser;
+    return S_OK;
+}
+
+static NTSTATUS wgp_destroy( void *args )
+{
+    struct wgp_parser *parser = get_wgp_parser( *(wg_parser_t *)args );
+    unsigned int i;
+
+    if (!parser) return STATUS_INVALID_HANDLE;
+    mav_destroy( parser->core );
+    parser->magic = 0;
+    for (i = 0; i < MAV_MAX_STREAMS; i++) parser->streams[i].magic = 0;
+    free( parser );
+    return S_OK;
+}
+
+static NTSTATUS wgp_connect( wg_parser_t handle, UINT64 file_size )
+{
+    struct wgp_parser *parser = get_wgp_parser( handle );
+
+    if (!parser) return STATUS_INVALID_HANDLE;
+    return wgp_status( mav_connect( parser->core, file_size ) );
+}
+
+static NTSTATUS wgp_connect64( void *args )
+{
+    const struct wg_parser_connect_params *params = args;
+    /* params->uri is only used by GStreamer's own URI source; data always
+     * comes through the read protocol here. */
+    return wgp_connect( params->parser, params->file_size );
+}
+
+static NTSTATUS wgp_disconnect( void *args )
+{
+    struct wgp_parser *parser = get_wgp_parser( *(wg_parser_t *)args );
+
+    if (!parser) return STATUS_INVALID_HANDLE;
+    mav_disconnect( parser->core );
+    return S_OK;
+}
+
+static NTSTATUS wgp_get_next_read_offset( void *args )
+{
+    struct wg_parser_get_next_read_offset_params *params = args;
+    struct wgp_parser *parser = get_wgp_parser( params->parser );
+    uint64_t offset;
+    uint32_t size;
+    int status;
+
+    if (!parser) return STATUS_INVALID_HANDLE;
+    if ((status = mav_get_next_read_offset( parser->core, &offset, &size ))) return wgp_status( status );
+    params->offset = offset;
+    params->size = size;
+    return S_OK;
+}
+
+static NTSTATUS wgp_push_data( wg_parser_t handle, const void *data, UINT32 size )
+{
+    struct wgp_parser *parser = get_wgp_parser( handle );
+
+    if (!parser) return STATUS_INVALID_HANDLE;
+    return wgp_status( mav_push_data( parser->core, data, size ) );
+}
+
+static NTSTATUS wgp_push_data64( void *args )
+{
+    const struct wg_parser_push_data_params *params = args;
+    return wgp_push_data( params->parser, params->data, params->size );
+}
+
+static NTSTATUS wgp_get_stream_count( void *args )
+{
+    struct wg_parser_get_stream_count_params *params = args;
+    struct wgp_parser *parser = get_wgp_parser( params->parser );
+
+    if (!parser) return STATUS_INVALID_HANDLE;
+    params->count = mav_stream_count( parser->core );
+    return S_OK;
+}
+
+static NTSTATUS wgp_get_stream( void *args )
+{
+    struct wg_parser_get_stream_params *params = args;
+    struct wgp_parser *parser = get_wgp_parser( params->parser );
+
+    if (!parser) return STATUS_INVALID_HANDLE;
+    if (params->index >= mav_stream_count( parser->core ) || params->index >= MAV_MAX_STREAMS)
+    {
+        params->stream = 0;
+        return STATUS_INVALID_PARAMETER;
+    }
+    params->stream = (wg_parser_stream_t)(UINT_PTR)&parser->streams[params->index];
+    return S_OK;
+}
+
+static NTSTATUS wgp_get_current_format( wg_parser_stream_t handle, struct wg_format *format )
+{
+    UINT32 index;
+    struct wgp_parser *parser = get_wgp_stream( handle, &index );
+    struct mav_stream_info info;
+    struct mav_video_output vout;
+    struct mav_output out;
+
+    if (!parser) return STATUS_INVALID_HANDLE;
+    if (!format) return STATUS_INVALID_PARAMETER;
+    /* wg_parser.c: a stream without caps reports an all-zero format (UNKNOWN) */
+    memset( format, 0, sizeof(*format) );
+    if (mav_stream_info( parser->core, index, &info )) return S_OK;
+    if (info.type == MAV_STREAM_VIDEO)
+    {
+        if (!mav_current_video( parser->core, index, &vout )) wgp_format_from_video( format, &vout );
+    }
+    else if (!mav_current_output( parser->core, index, &out ))
+        wgp_format_from_output( format, &out );
+    return S_OK;
+}
+
+static NTSTATUS wgp_get_current_format64( void *args )
+{
+    const struct wg_parser_stream_get_current_format_params *params = args;
+    return wgp_get_current_format( params->stream, params->format );
+}
+
+/* The compressed format (what a separate decoder would be given), or the
+ * current one for PCM -- wg_parser.c's caps_is_compressed() split.  Only the
+ * compressed formats unixlib.h can describe are reported as such. */
+static NTSTATUS wgp_get_codec_format( wg_parser_stream_t handle, struct wg_format *format )
+{
+    UINT32 index;
+    struct wgp_parser *parser = get_wgp_stream( handle, &index );
+    struct mav_stream_info info;
+
+    if (!parser) return STATUS_INVALID_HANDLE;
+    if (!format) return STATUS_INVALID_PARAMETER;
+    if (mav_stream_info( parser->core, index, &info ))
+    {
+        memset( format, 0, sizeof(*format) );
+        return S_OK;
+    }
+    switch (info.kind)
+    {
+    case MAV_CODEC_MPEG_AUDIO:
+        memset( format, 0, sizeof(*format) );
+        format->major_type = WG_MAJOR_TYPE_AUDIO_MPEG1;
+        format->u.audio.layer = info.layer;
+        format->u.audio.channels = info.native.channels;
+        format->u.audio.rate = info.native.rate;
+        format->u.audio.bitrate = info.bitrate;
+        return S_OK;
+    case MAV_CODEC_AAC:
+        memset( format, 0, sizeof(*format) );
+        format->major_type = WG_MAJOR_TYPE_AUDIO_MPEG4;
+        format->u.audio.payload_type = 0;   /* raw access units */
+        format->u.audio.codec_data_len = info.codec_data_len < sizeof(format->u.audio.codec_data) ? info.codec_data_len : sizeof(format->u.audio.codec_data);
+        memcpy( format->u.audio.codec_data, info.codec_data, format->u.audio.codec_data_len );
+        format->u.audio.channels = info.native.channels;
+        format->u.audio.rate = info.native.rate;
+        return S_OK;
+    case MAV_CODEC_H264:
+        memset( format, 0, sizeof(*format) );
+        format->major_type = WG_MAJOR_TYPE_VIDEO_H264;
+        format->u.video.width = info.vnative.width;
+        format->u.video.height = info.vnative.height;
+        format->u.video.fps_n = info.vnative.fps_n;
+        format->u.video.fps_d = info.vnative.fps_d;
+        format->u.video.profile = info.profile;
+        format->u.video.level = info.level;
+        /* codec_data stays empty: wg_format's H.264 codec data is an Annex B
+         * sequence header, and the container holds avcC -- reporting one as
+         * the other would be wrong data, not missing data. */
+        return S_OK;
+    default:
+        return wgp_get_current_format( handle, format );
+    }
+}
+
+static NTSTATUS wgp_get_codec_format64( void *args )
+{
+    const struct wg_parser_stream_get_codec_format_params *params = args;
+    return wgp_get_codec_format( params->stream, params->format );
+}
+
+static NTSTATUS wgp_enable( wg_parser_stream_t handle, const struct wg_format *format )
+{
+    UINT32 index;
+    struct wgp_parser *parser = get_wgp_stream( handle, &index );
+    struct mav_stream_info info;
+    int status;
+
+    if (!parser) return STATUS_INVALID_HANDLE;
+    if (!format) return STATUS_INVALID_PARAMETER;
+    if (mav_stream_info( parser->core, index, &info )) return VFW_E_WRONG_STATE;
+
+    if (info.type == MAV_STREAM_VIDEO)
+    {
+        struct mav_video_output out;
+
+        if (format->major_type != WG_MAJOR_TYPE_VIDEO)
+        {
+            /* only decoded pictures are produced here; the stream stays disabled */
+            mav_disable( parser->core, index );
+            mav_log( "stream %u: enable refused: major type %u is not raw video", index, format->major_type );
+            return STATUS_NOT_SUPPORTED;
+        }
+        out.fmt = format->u.video.format;
+        out.width = format->u.video.width;
+        out.height = format->u.video.height;
+        out.fps_n = format->u.video.fps_n;
+        out.fps_d = format->u.video.fps_d;
+        if ((status = mav_enable_video( parser->core, index, &out )))
+        {
+            mav_log( "stream %u: enable refused: video format %u %dx%d (native %s %dx%d)", index, out.fmt,
+                     out.width, out.height, mav_pix_name( info.vnative.fmt ), info.vnative.width,
+                     info.vnative.height );
+            return wgp_status( status );
+        }
+        return S_OK;
+    }
+    else
+    {
+        struct mav_output out;
+
+        if (format->major_type != WG_MAJOR_TYPE_AUDIO)
+        {
+            /* only decoded PCM is produced here; the stream stays disabled */
+            mav_disable( parser->core, index );
+            mav_log( "enable refused: major type %u is not PCM audio", format->major_type );
+            return STATUS_NOT_SUPPORTED;
+        }
+        out.fmt = format->u.audio.format;
+        out.rate = format->u.audio.rate;
+        out.channels = format->u.audio.channels;
+        out.channel_mask = format->u.audio.channel_mask;
+        if ((status = mav_enable( parser->core, index, &out )))
+        {
+            mav_log( "enable refused: format %u rate %u channels %u", out.fmt, out.rate, out.channels );
+            return wgp_status( status );
+        }
+        return S_OK;
+    }
+}
+
+static NTSTATUS wgp_enable64( void *args )
+{
+    const struct wg_parser_stream_enable_params *params = args;
+    return wgp_enable( params->stream, params->format );
+}
+
+static NTSTATUS wgp_disable( void *args )
+{
+    UINT32 index;
+    struct wgp_parser *parser = get_wgp_stream( *(wg_parser_stream_t *)args, &index );
+
+    if (!parser) return STATUS_INVALID_HANDLE;
+    mav_disable( parser->core, index );
+    return S_OK;
+}
+
+/* `stream` may be 0 ("the earliest buffer of any stream", used by the WM
+ * reader); buffer->stream then says which one it is. */
+static NTSTATUS wgp_get_buffer( wg_parser_t parser_handle, wg_parser_stream_t stream_handle,
+                                struct wg_parser_buffer *buffer )
+{
+    struct wgp_parser *parser = get_wgp_parser( parser_handle );
+    struct mav_buffer buf;
+    UINT32 index = 0;
+    int status;
+
+    if (!parser) return STATUS_INVALID_HANDLE;
+    if (stream_handle && get_wgp_stream( stream_handle, &index ) != parser) return STATUS_INVALID_HANDLE;
+    if (!buffer) return STATUS_INVALID_PARAMETER;
+    if ((status = mav_get_buffer( parser->core, stream_handle ? (int)index : -1, &buf )))
+        return wgp_status( status );
+
+    memset( buffer, 0, sizeof(*buffer) );
+    buffer->pts = buf.pts;
+    buffer->duration = buf.duration;
+    buffer->size = buf.size;
+    buffer->stream = buf.stream;
+    buffer->discontinuity = !!buf.discontinuity;
+    buffer->delta = !!buf.delta;
+    buffer->has_pts = 1;
+    buffer->has_duration = 1;
+    return S_OK;
+}
+
+static NTSTATUS wgp_get_buffer64( void *args )
+{
+    const struct wg_parser_stream_get_buffer_params *params = args;
+    return wgp_get_buffer( params->parser, params->stream, params->buffer );
+}
+
+static NTSTATUS wgp_copy_buffer( wg_parser_stream_t handle, void *data, UINT32 offset, UINT32 size )
+{
+    UINT32 index;
+    struct wgp_parser *parser = get_wgp_stream( handle, &index );
+
+    if (!parser) return STATUS_INVALID_HANDLE;
+    return wgp_status( mav_copy_buffer( parser->core, index, data, offset, size ) );
+}
+
+static NTSTATUS wgp_copy_buffer64( void *args )
+{
+    const struct wg_parser_stream_copy_buffer_params *params = args;
+    return wgp_copy_buffer( params->stream, params->data, params->offset, params->size );
+}
+
+static NTSTATUS wgp_release_buffer( void *args )
+{
+    UINT32 index;
+    struct wgp_parser *parser = get_wgp_stream( *(wg_parser_stream_t *)args, &index );
+
+    if (!parser) return STATUS_INVALID_HANDLE;
+    mav_release_buffer( parser->core, index );
+    return S_OK;
+}
+
+static NTSTATUS wgp_notify_qos( void *args )
+{
+    const struct wg_parser_stream_notify_qos_params *params = args;
+    UINT32 index;
+
+    /* QoS only tells a GStreamer pipeline which frames it may drop; this
+     * core decodes on demand and drops nothing, so there is nothing to do and
+     * nothing to report back (the PE side ignores the status). */
+    if (!get_wgp_stream( params->stream, &index )) return STATUS_INVALID_HANDLE;
+    return S_OK;
+}
+
+static NTSTATUS wgp_get_duration( void *args )
+{
+    struct wg_parser_stream_get_duration_params *params = args;
+    UINT32 index;
+    struct wgp_parser *parser = get_wgp_stream( params->stream, &index );
+    struct mav_stream_info info;
+
+    if (!parser) return STATUS_INVALID_HANDLE;
+    /* wg_parser.c reports 0 when the duration could not be determined */
+    params->duration = mav_stream_info( parser->core, index, &info ) ? 0 : info.duration;
+    return S_OK;
+}
+
+/* No tags are extracted: STATUS_NOT_FOUND is wg_parser.c's "this stream has
+ * no such tag", which main.c turns into a NULL string. */
+static NTSTATUS wgp_get_tag( wg_parser_stream_t handle, wg_parser_tag tag )
+{
+    UINT32 index;
+
+    if (!get_wgp_stream( handle, &index )) return STATUS_INVALID_HANDLE;
+    if (tag >= WG_PARSER_TAG_COUNT) return STATUS_INVALID_PARAMETER;
+    return STATUS_NOT_FOUND;
+}
+
+static NTSTATUS wgp_get_tag64( void *args )
+{
+    const struct wg_parser_stream_get_tag_params *params = args;
+    return wgp_get_tag( params->stream, params->tag );
+}
+
+static NTSTATUS wgp_seek( void *args )
+{
+    const struct wg_parser_stream_seek_params *params = args;
+    UINT32 index;
+    struct wgp_parser *parser = get_wgp_stream( params->stream, &index );
+    BOOL set_start, set_stop;
+
+    if (!parser) return STATUS_INVALID_HANDLE;
+    set_start = (params->start_flags & AM_SEEKING_PositioningBitsMask) != AM_SEEKING_NoPositioning;
+    set_stop = (params->stop_flags & AM_SEEKING_PositioningBitsMask) != AM_SEEKING_NoPositioning;
+    /* rate: the PE side scales timestamps itself (send_sample); the streams
+     * are decoded the same at any rate.  Seeking one stream seeks all of
+     * them, as a GStreamer seek on one pad does. */
+    return wgp_status( mav_seek( parser->core, index, set_start, params->start_pos, set_stop, params->stop_pos ) );
+}
+
 /* The index layout below is dlls/winegstreamer/unixlib.h `enum unix_funcs`,
  * entry for entry.  Do not reorder; add new entries only where the header
  * adds them. */
@@ -2045,31 +2634,31 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     wma_init,                           /* unix_wg_init_gstreamer */
 
-    wma_not_implemented,                /* unix_wg_parser_create */
-    wma_not_implemented,                /* unix_wg_parser_destroy */
+    wgp_create,                         /* unix_wg_parser_create */
+    wgp_destroy,                        /* unix_wg_parser_destroy */
 
-    wma_not_implemented,                /* unix_wg_parser_connect */
-    wma_not_implemented,                /* unix_wg_parser_disconnect */
+    wgp_connect64,                      /* unix_wg_parser_connect */
+    wgp_disconnect,                     /* unix_wg_parser_disconnect */
 
-    wma_not_implemented,                /* unix_wg_parser_get_next_read_offset */
-    wma_not_implemented,                /* unix_wg_parser_push_data */
+    wgp_get_next_read_offset,           /* unix_wg_parser_get_next_read_offset */
+    wgp_push_data64,                    /* unix_wg_parser_push_data */
 
-    wma_not_implemented,                /* unix_wg_parser_get_stream_count */
-    wma_not_implemented,                /* unix_wg_parser_get_stream */
+    wgp_get_stream_count,               /* unix_wg_parser_get_stream_count */
+    wgp_get_stream,                     /* unix_wg_parser_get_stream */
 
-    wma_not_implemented,                /* unix_wg_parser_stream_get_current_format */
-    wma_not_implemented,                /* unix_wg_parser_stream_get_codec_format */
-    wma_not_implemented,                /* unix_wg_parser_stream_enable */
-    wma_not_implemented,                /* unix_wg_parser_stream_disable */
+    wgp_get_current_format64,           /* unix_wg_parser_stream_get_current_format */
+    wgp_get_codec_format64,             /* unix_wg_parser_stream_get_codec_format */
+    wgp_enable64,                       /* unix_wg_parser_stream_enable */
+    wgp_disable,                        /* unix_wg_parser_stream_disable */
 
-    wma_not_implemented,                /* unix_wg_parser_stream_get_buffer */
-    wma_not_implemented,                /* unix_wg_parser_stream_copy_buffer */
-    wma_not_implemented,                /* unix_wg_parser_stream_release_buffer */
-    wma_not_implemented,                /* unix_wg_parser_stream_notify_qos */
+    wgp_get_buffer64,                   /* unix_wg_parser_stream_get_buffer */
+    wgp_copy_buffer64,                  /* unix_wg_parser_stream_copy_buffer */
+    wgp_release_buffer,                 /* unix_wg_parser_stream_release_buffer */
+    wgp_notify_qos,                     /* unix_wg_parser_stream_notify_qos */
 
-    wma_not_implemented,                /* unix_wg_parser_stream_get_duration */
-    wma_not_implemented,                /* unix_wg_parser_stream_get_tag */
-    wma_not_implemented,                /* unix_wg_parser_stream_seek */
+    wgp_get_duration,                   /* unix_wg_parser_stream_get_duration */
+    wgp_get_tag64,                      /* unix_wg_parser_stream_get_tag */
+    wgp_seek,                           /* unix_wg_parser_stream_seek */
 
     wma_transform_create,               /* unix_wg_transform_create */
     wma_transform_destroy,              /* unix_wg_transform_destroy */
@@ -2225,35 +2814,145 @@ static NTSTATUS wow64_wma_transform_set_output_type( void *args )
     return transform_set_output_type( params32->transform, &type );
 }
 
+/* ml1980: the wg_parser entries whose argument block holds a pointer -- the
+ * same set upstream wg_parser.c thunks with X64() -- converted here.  The rest
+ * (create, destroy, disconnect, get_next_read_offset, get_stream_count,
+ * get_stream, disable, release_buffer, notify_qos, get_duration, seek) carry
+ * only handles and fixed-width scalars, which i386 lays out exactly like the
+ * host (INT64/UINT64/DOUBLE are 8-aligned in the PE ABI), so they share the
+ * 64-bit entries.  struct wg_format and struct wg_parser_buffer are
+ * fixed-width too; only the pointers TO them are guest addresses. */
+struct wg_parser_connect_params32
+{
+    wg_parser_t parser;
+    PTR32 uri;
+    UINT64 file_size;
+};
+C_ASSERT( offsetof(struct wg_parser_connect_params32, file_size) == 16 );
+
+struct wg_parser_push_data_params32
+{
+    wg_parser_t parser;
+    PTR32 data;
+    UINT32 size;
+};
+C_ASSERT( sizeof(struct wg_parser_push_data_params32) == 16 );
+
+struct wg_parser_stream_format_params32
+{
+    wg_parser_stream_t stream;
+    PTR32 format;
+};
+
+struct wg_parser_stream_get_buffer_params32
+{
+    wg_parser_t parser;
+    wg_parser_stream_t stream;
+    PTR32 buffer;
+};
+
+struct wg_parser_stream_copy_buffer_params32
+{
+    wg_parser_stream_t stream;
+    PTR32 data;
+    UINT32 offset;
+    UINT32 size;
+};
+C_ASSERT( offsetof(struct wg_parser_stream_copy_buffer_params32, size) == 16 );
+
+struct wg_parser_stream_get_tag_params32
+{
+    wg_parser_stream_t stream;
+    wg_parser_tag tag;
+    PTR32 buffer;
+    PTR32 size;
+};
+
+C_ASSERT( sizeof(struct wg_format) == 120 );
+C_ASSERT( sizeof(struct wg_parser_buffer) == 32 );
+C_ASSERT( offsetof(struct wg_parser_stream_seek_params, stop_flags) == 36 );
+C_ASSERT( offsetof(struct wg_parser_stream_notify_qos_params, timestamp) == 32 );
+C_ASSERT( offsetof(struct wg_parser_get_next_read_offset_params, offset) == 16 );
+
+static NTSTATUS wow64_wgp_connect( void *args )
+{
+    const struct wg_parser_connect_params32 *params32 = args;
+    return wgp_connect( params32->parser, params32->file_size );
+}
+
+static NTSTATUS wow64_wgp_push_data( void *args )
+{
+    const struct wg_parser_push_data_params32 *params32 = args;
+    return wgp_push_data( params32->parser, ios_wow_host_ptr( params32->data ), params32->size );
+}
+
+static NTSTATUS wow64_wgp_get_current_format( void *args )
+{
+    const struct wg_parser_stream_format_params32 *params32 = args;
+    return wgp_get_current_format( params32->stream, ios_wow_host_ptr( params32->format ) );
+}
+
+static NTSTATUS wow64_wgp_get_codec_format( void *args )
+{
+    const struct wg_parser_stream_format_params32 *params32 = args;
+    return wgp_get_codec_format( params32->stream, ios_wow_host_ptr( params32->format ) );
+}
+
+static NTSTATUS wow64_wgp_enable( void *args )
+{
+    const struct wg_parser_stream_format_params32 *params32 = args;
+    return wgp_enable( params32->stream, ios_wow_host_ptr( params32->format ) );
+}
+
+static NTSTATUS wow64_wgp_get_buffer( void *args )
+{
+    const struct wg_parser_stream_get_buffer_params32 *params32 = args;
+    return wgp_get_buffer( params32->parser, params32->stream, ios_wow_host_ptr( params32->buffer ) );
+}
+
+static NTSTATUS wow64_wgp_copy_buffer( void *args )
+{
+    const struct wg_parser_stream_copy_buffer_params32 *params32 = args;
+    return wgp_copy_buffer( params32->stream, ios_wow_host_ptr( params32->data ),
+                            params32->offset, params32->size );
+}
+
+static NTSTATUS wow64_wgp_get_tag( void *args )
+{
+    const struct wg_parser_stream_get_tag_params32 *params32 = args;
+    /* buffer / size are never dereferenced: no tag is ever found */
+    return wgp_get_tag( params32->stream, params32->tag );
+}
+
 const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
 {
     wma_init,                             /* unix_wg_init_gstreamer */
 
-    wma_not_implemented,                  /* unix_wg_parser_create */
-    wma_not_implemented,                  /* unix_wg_parser_destroy */
+    wgp_create,                           /* unix_wg_parser_create */
+    wgp_destroy,                          /* unix_wg_parser_destroy */
 
-    wma_not_implemented,                  /* unix_wg_parser_connect */
-    wma_not_implemented,                  /* unix_wg_parser_disconnect */
+    wow64_wgp_connect,                    /* unix_wg_parser_connect */
+    wgp_disconnect,                       /* unix_wg_parser_disconnect */
 
-    wma_not_implemented,                  /* unix_wg_parser_get_next_read_offset */
-    wma_not_implemented,                  /* unix_wg_parser_push_data */
+    wgp_get_next_read_offset,             /* unix_wg_parser_get_next_read_offset */
+    wow64_wgp_push_data,                  /* unix_wg_parser_push_data */
 
-    wma_not_implemented,                  /* unix_wg_parser_get_stream_count */
-    wma_not_implemented,                  /* unix_wg_parser_get_stream */
+    wgp_get_stream_count,                 /* unix_wg_parser_get_stream_count */
+    wgp_get_stream,                       /* unix_wg_parser_get_stream */
 
-    wma_not_implemented,                  /* unix_wg_parser_stream_get_current_format */
-    wma_not_implemented,                  /* unix_wg_parser_stream_get_codec_format */
-    wma_not_implemented,                  /* unix_wg_parser_stream_enable */
-    wma_not_implemented,                  /* unix_wg_parser_stream_disable */
+    wow64_wgp_get_current_format,         /* unix_wg_parser_stream_get_current_format */
+    wow64_wgp_get_codec_format,           /* unix_wg_parser_stream_get_codec_format */
+    wow64_wgp_enable,                     /* unix_wg_parser_stream_enable */
+    wgp_disable,                          /* unix_wg_parser_stream_disable */
 
-    wma_not_implemented,                  /* unix_wg_parser_stream_get_buffer */
-    wma_not_implemented,                  /* unix_wg_parser_stream_copy_buffer */
-    wma_not_implemented,                  /* unix_wg_parser_stream_release_buffer */
-    wma_not_implemented,                  /* unix_wg_parser_stream_notify_qos */
+    wow64_wgp_get_buffer,                 /* unix_wg_parser_stream_get_buffer */
+    wow64_wgp_copy_buffer,                /* unix_wg_parser_stream_copy_buffer */
+    wgp_release_buffer,                   /* unix_wg_parser_stream_release_buffer */
+    wgp_notify_qos,                       /* unix_wg_parser_stream_notify_qos */
 
-    wma_not_implemented,                  /* unix_wg_parser_stream_get_duration */
-    wma_not_implemented,                  /* unix_wg_parser_stream_get_tag */
-    wma_not_implemented,                  /* unix_wg_parser_stream_seek */
+    wgp_get_duration,                     /* unix_wg_parser_stream_get_duration */
+    wow64_wgp_get_tag,                    /* unix_wg_parser_stream_get_tag */
+    wgp_seek,                             /* unix_wg_parser_stream_seek */
 
     wow64_wma_transform_create,           /* unix_wg_transform_create */
     wma_transform_destroy,                /* unix_wg_transform_destroy */

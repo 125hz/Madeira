@@ -79,6 +79,14 @@ toolchains/
 /AGENTS.md
 /CLAUDE.md
 
+# Madeira Dock implementation belongs only to its separate private repository.
+# The app may track dockhost.exe and the public launch adapter, never host source.
+/build/steam-host/
+/madeira-dock/
+/private/
+/docs/STEAM_HOST_PLAN.md
+/build/host-tests/__pycache__/
+
 # Xcode
 *.xcuserdata
 *.xcworkspace

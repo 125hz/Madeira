@@ -20,7 +20,7 @@ dependency license texts are in `LICENSES/`. See "Why GPL-3.0-or-later" below.
 | **GMP** 6.3.0 | **LGPL-3.0-or-later** or GPL-2.0-or-later | Static (`libgmp.a`). |
 | **Nettle / Hogweed** 3.10.1 | **LGPL-3.0-or-later** or GPL-2.0-or-later | Static (`libnettle.a`, `libhogweed.a`). |
 | **GnuTLS** 3.8.9 | LGPL-2.1-or-later | Static (`libgnutls.a`). Used by Wine's bcrypt/secur32/crypt32. |
-| **FFmpeg** 7.1.1 — libavcodec, libavutil, libswresample | **LGPL-2.1-or-later** | Static (`libavcodec.a`, `libavutil.a`, `libswresample.a`). Configured `--disable-gpl --disable-nonfree --disable-version3`, `--disable-everything` plus the six WMA-family decoders (`wmav1,wmav2,wmapro,wmalossless,xma1,xma2`); no GPL or non-free component is enabled, and no `--enable-version3` component, so the result is LGPL-2.1-or-later. Used only by `build/ntdll-unix/winegstreamer_unixlib_ios.c`, which is winegstreamer's unix side on this port (the Windows WMA decoder MFT/DMO — upstream decodes it with GStreamer, which does not exist on iOS). |
+| **FFmpeg** 7.1.1 — libavformat, libavcodec, libavutil, libswresample | **LGPL-2.1-or-later** | Static (`libavformat.a`, `libavcodec.a`, `libavutil.a`, `libswresample.a`). Configured `--disable-gpl --disable-nonfree --disable-version3`, `--disable-everything` plus the six WMA-family decoders (`wmav1,wmav2,wmapro,wmalossless,xma1,xma2`) and, since ml1980, the `mp3` and `wav` demuxers, the `mpegaudio` parser and the `mp1,mp2,mp3,pcm_u8,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_f64le` decoders, and since ml1990 the `mov` (MP4/MOV/M4A) demuxer -- still no H.264, HEVC or AAC decoder or parser, those streams are decoded by Apple's VideoToolbox/AudioToolbox (no protocols, no muxers); no GPL or non-free component is enabled, and no `--enable-version3` component, so the result is LGPL-2.1-or-later. Used only by `build/ntdll-unix/winegstreamer_unixlib_ios.c` and `build/ntdll-unix/wg_parser_av_ios.c`, which are winegstreamer's unix side on this port (the Windows WMA decoder MFT/DMO, and the wg_parser behind quartz's MP3/WAV splitters and, since ml1990, Media Foundation's MP4 source — upstream implements both with GStreamer, which does not exist on iOS). |
 | **{fmt}** | MIT | Static (`libfmt.a`), via FEX. |
 | **xxHash** | BSD-2-Clause | Static (`libxxhash.a`). |
 | **Cephes** | permissive (Moshier) | Static (`libcephes_128bit.a`), via FEX. |
@@ -185,3 +185,14 @@ into a signed app.
 `LiveContainer/` and `research/LiveContainer/` are AGPL-3.0 reference copies
 used for local research. Both are gitignored, untracked, and no part of them is
 linked into or shipped with the app. They form no part of the combined work.
+# Madeira Dock executable
+
+The optional `arm64ec-windows/dockhost.exe` is a separately built proprietary
+Madeira Dock release, copyright (c) 2026 125hz. Its license permits distribution
+of unmodified executable releases with Madeira. Its source is maintained in a
+private repository and is not part of this source distribution.
+
+`arm64ec-windows/dock-notices.txt` accompanies the executable and contains its
+binary license plus the LLVM and MinGW-w64 runtime notices. Dock includes no
+Valve client files, game content or developer login. Users install official
+Steam files and authenticate their own account at runtime.

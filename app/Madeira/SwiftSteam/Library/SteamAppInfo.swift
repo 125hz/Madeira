@@ -16,8 +16,25 @@ struct SteamAppInfo {
     var depots: [DepotInfo] = []
     var launchConfigs: [LaunchConfig] = []
     var buildID: UInt32 = 0
+    var freeToDownload = false
     /// Madeira ml1710: third-party license agreements (`common.eulas`), in list order.
     var eulas: [SteamEula] = []
+    /// Madeira ml1970: apps owning depots this app installs through `depotfromapp`,
+    /// so the install record names them the way Valve's client does.
+    var sharedOwners: [UInt32: SharedOwner] = [:]
+    /// Madeira ml1970: store artwork file names from `common.library_assets_full` /
+    /// `common.header_image`. Newer apps publish them under a hashed folder, so the
+    /// fixed legacy URL is missing for them. `parentID` names a demo's full game.
+    var libraryCapsule: String?
+    var libraryHero: String?
+    var headerImage: String?
+    var parentID: UInt32?
+
+    struct SharedOwner: Equatable {
+        var name: String
+        var installDir: String
+        var buildID: UInt32
+    }
 
     // Cloud save info
     var cloudSaveEnabled: Bool = false
@@ -109,6 +126,27 @@ struct SteamAppInfo {
     }
 
     // MARK: - Computed Properties
+
+    // ml1960: shared depots often omit manifests in the consuming app's PICS.
+    // Copy content metadata from the exact depot, preserving consumer filters.
+    mutating func inheritDepots(from owners: [UInt32: SteamAppInfo]) -> Int {
+        var changed = 0
+        for index in depots.indices {
+            let local = depots[index]
+            guard local.publicManifestID == nil, let owner = local.fromApp,
+                  let source = owners[owner]?.depots.first(where: { $0.depotID == local.depotID }),
+                  source.publicManifestID != nil else { continue }
+            depots[index].manifests = source.manifests
+            depots[index].publicDownloadBytes = source.publicDownloadBytes
+            depots[index].publicSizeBytes = source.publicSizeBytes
+            if local.oslist.isEmpty { depots[index].oslist = source.oslist }
+            if local.osarch.isEmpty { depots[index].osarch = source.osarch }
+            if local.language.isEmpty { depots[index].language = source.language }
+            depots[index].lowViolence = local.lowViolence || source.lowViolence
+            changed += 1
+        }
+        return changed
+    }
 
     var supportsMac: Bool {
         oslist.lowercased().contains("macos") || oslist.lowercased().contains("mac")
@@ -254,6 +292,23 @@ struct SteamAppInfo {
             info.rawType = common["type"] as? String ?? ""
             info.type = AppType(pics: info.rawType)
             info.oslist = common["oslist"] as? String ?? ""
+            info.freeToDownload = (common["freetodownload"] as? String) == "1"
+            // ml1970: artwork names, english first, else any language.
+            func asset(_ node: Any?) -> String? {
+                guard let languages = node as? [String: Any] else { return nil }
+                let value = (languages["english"] as? String) ?? languages.keys.sorted().compactMap { languages[$0] as? String }.first
+                guard let value, !value.isEmpty, value.utf8.count <= 256, !value.contains(".."), !value.hasPrefix("/") else { return nil }
+                return value
+            }
+            if let assets = common["library_assets_full"] as? [String: Any] {
+                let capsule = assets["library_capsule"] as? [String: Any]
+                info.libraryCapsule = asset(capsule?["image2x"]) ?? asset(capsule?["image"])
+                info.libraryHero = asset((assets["library_hero"] as? [String: Any])?["image"])
+            }
+            info.headerImage = asset(common["header_image"])
+            if let parent = (common["parent"] as? String).flatMap(UInt32.init), parent != 0, parent != info.appID {
+                info.parentID = parent
+            }
             if let list = common["eulas"] as? [String: Any] {
                 info.eulas = list.keys.sorted { (Int($0) ?? 0) < (Int($1) ?? 0) }.compactMap { key in
                     guard let item = list[key] as? [String: Any], let id = item["id"] as? String, !id.isEmpty else { return nil }

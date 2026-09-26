@@ -139,6 +139,23 @@ compile_unixlib "$BUILD_DIR/dnsapi_unixlib_ios.c" "dnsapi_unixlib" "dnsapi" \
 FFMPEG_PREFIX="$REPO_ROOT/toolchains/ffmpeg-ios"
 compile_unixlib "$BUILD_DIR/winegstreamer_unixlib_ios.c" "winegstreamer_unixlib" "winegstreamer" \
     -I"$WINE_SRC/dlls/winegstreamer" -I"$FFMPEG_PREFIX/include"
+# MADEIRA ml1990: the wg_parser's H.264/HEVC (VideoToolbox) and AAC
+# (AudioToolbox) decoders.  Its own translation unit with NO Wine header --
+# CoreFoundation and winnt.h disagree about several names -- so it is compiled
+# without the Wine include paths and config.h.  The app links VideoToolbox,
+# CoreMedia, CoreVideo and AudioToolbox (.xtool/prepare.py `frameworks`).
+echo -n "  wg_parser_apple_ios... "
+if xcrun -sdk iphoneos clang \
+    -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 \
+    -O2 -fPIC -fvisibility=hidden -fno-stack-protector -fno-strict-aliasing -Wall -Werror=implicit-function-declaration \
+    -c "$BUILD_DIR/wg_parser_apple_ios.c" -o "$OBJ_DIR/wg_parser_apple_ios.o" 2>"$OBJ_DIR/wg_parser_apple_ios.err"; then
+    echo "OK"
+    SUCCEEDED=$((SUCCEEDED + 1))
+else
+    echo "FAILED"
+    FAILED=$((FAILED + 1))
+    FAILED_FILES="$FAILED_FILES wg_parser_apple_ios"
+fi
 
 for src in $WINE_SRC/dlls/ntdll/unix/*.c; do
     name=$(basename "$src" .c)
@@ -189,7 +206,7 @@ ar rcs "$OBJ_DIR/libntdll_unix.a" \
     "$OBJ_DIR/gnutls_symtab_ios.o" "$OBJ_DIR/ws2_32_unixlib.o" \
     "$OBJ_DIR/bcrypt_unixlib.o" "$OBJ_DIR/secur32_unixlib.o" "$OBJ_DIR/crypt32_unixlib.o" \
     "$OBJ_DIR/dwrite_unixlib.o" "$OBJ_DIR/dnsapi_unixlib.o" \
-    "$OBJ_DIR/winegstreamer_unixlib.o" \
+    "$OBJ_DIR/winegstreamer_unixlib.o" "$OBJ_DIR/wg_parser_apple_ios.o" \
     "$OBJ_DIR/cdrom.o" "$OBJ_DIR/debug.o" "$OBJ_DIR/env.o" "$OBJ_DIR/file.o" \
     "$OBJ_DIR/loader.o" "$OBJ_DIR/loadorder.o" "$OBJ_DIR/process.o" "$OBJ_DIR/registry.o" \
     "$OBJ_DIR/security.o" "$OBJ_DIR/serial.o" "$OBJ_DIR/server.o" \

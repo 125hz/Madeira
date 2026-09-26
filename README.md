@@ -7,6 +7,13 @@ Madeira combines [Wine](https://www.winehq.org/) (ARM64EC),
 [DXMT](https://github.com/3Shain/DXMT) for D3D11 → Metal, running as a single
 Mach process on iOS with wineserver as a thread rather than a separate process.
 
+This fork also has an opt-in [Madeira Dock trial](docs/MADEIRA_DOCK.md): a
+separately built, closed-source headless host for Valve's genuine Steam client.
+It preserves real authentication, ownership checks and original game DRM.
+Dock source stays private; only its executable, notices and public app adapter
+are included here. Windows startup has been tested; the new iOS path awaits
+device validation.
+
 ## Status
 
 Thumper and ULTRAKILL are playable. Marvel Cosmic Invasion has reached

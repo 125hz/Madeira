@@ -6,6 +6,8 @@ import Foundation
 
 /// Represents a parsed Steam depot manifest - lists all files and their chunks
 struct DepotManifest {
+    /// ml1990: EDepotFileFlag.CustomExecutable — a file Valve's client customizes per user (CEG).
+    static let customExecutableFlag: UInt32 = 0x80
     let depotID: UInt32
     let manifestGID: UInt64
     let creationTime: UInt32

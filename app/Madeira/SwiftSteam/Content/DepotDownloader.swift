@@ -86,6 +86,8 @@ final class DepotDownloader {
         var state = SteamDownloadProgress()
         report(state)
 
+        cegDepotCache = LibraryFlags.enabled("MADEIRA_STEAM_CEG_RECORDS")
+            ? steamApps.appendingPathComponent("depotcache", isDirectory: true) : nil
         let hosts = try await contentServers(appID: app.appID)
         guard !hosts.isEmpty else { throw SteamError.chunkDownloadFailed("No content servers are available.") }
 
@@ -112,11 +114,12 @@ final class DepotDownloader {
                 }
                 throw SteamError.depotKeyNotFound(refused)
             }
-            let manifest = try await fetchManifest(depotID: depot.depotID, appID: app.appID,
+            let contentAppID = LibraryFlags.enabled("MADEIRA_STEAM_SHARED_METADATA") && !app.freeToDownload ? (depot.fromApp ?? app.appID) : app.appID
+            let manifest = try await fetchManifest(depotID: depot.depotID, appID: contentAppID,
                                                    manifestGID: gid, key: key, hosts: hosts)
             var auth: [String: String] = [:]
             for host in pool {
-                auth[host] = await cdnAuthFragment(depotID: depot.depotID, appID: app.appID, host: host)
+                auth[host] = await cdnAuthFragment(depotID: depot.depotID, appID: contentAppID, host: host)
             }
             plans.append(DepotPlan(depotID: depot.depotID, manifestGID: gid, key: key, manifest: manifest,
                                    hosts: pool, auth: auth,
@@ -195,10 +198,47 @@ final class DepotDownloader {
             AppManifestWriter.InstalledDepot(depotID: Int(plan.depotID), manifestGID: plan.manifestGID,
                                              size: Int64(plan.manifest.totalUncompressedSize))
         }
+        // ml1970: depots taken from another app are that app's content. Valve's
+        // client refuses a launch until the owner app has its own record, so write
+        // both records the way it does. MADEIRA_STEAM_SHARED_RECORDS=0 restores
+        // the previous single record.
+        var owners: [UInt32: UInt32] = [:]
+        if LibraryFlags.enabled("MADEIRA_STEAM_SHARED_RECORDS") {
+            for depot in depots { if let from = depot.fromApp, from != app.appID { owners[depot.depotID] = from } }
+        }
+        let own = installed.filter { owners[UInt32($0.depotID)] == nil }
+        let shared = installed.filter { owners[UInt32($0.depotID)] != nil }
+        // ml1990: files Valve's client must customize per user before they run (CEG), as
+        // Windows-style install-relative paths for the record's CheckGuid block.
+        let custom = cegDepotCache == nil ? [] : plans.flatMap { plan in
+            plan.manifest.files.filter { $0.flags & DepotManifest.customExecutableFlag != 0 && !$0.isDirectory }
+                .map { $0.filename.replacingOccurrences(of: "/", with: "\\") }
+        }
+        if !custom.isEmpty { SteamLog.event("[steam-ceg] ml1990 app=\(app.appID) custom=\(custom.count)") }
         try AppManifestWriter.writeManifest(
             appID: app.appID, name: app.name, installDir: folderName, buildID: app.buildID,
             steamID: session.steamID, sizeOnDisk: prepared.totalUncompressed,
-            steamAppsPath: steamApps.path, installedDepots: installed)
+            steamAppsPath: steamApps.path, installedDepots: own,
+            sharedDepots: shared.map { ($0.depotID, Int(owners[UInt32($0.depotID)]!)) },
+            customExecutables: custom)
+        if !shared.isEmpty {
+            var written = 0, skipped = 0
+            for ownerID in Set(owners.values).sorted() {
+                let depots = shared.filter { owners[UInt32($0.depotID)] == ownerID }
+                guard !depots.isEmpty else { continue }
+                // Only when the owner installs to this same folder, where the files are.
+                guard let owner = app.sharedOwners[ownerID],
+                      Self.safeFolderName(owner.installDir).caseInsensitiveCompare(folderName) == .orderedSame else {
+                    skipped += 1; continue
+                }
+                try AppManifestWriter.mergeOwnerManifest(ownerAppID: ownerID, ownerName: owner.name, ownerBuildID: owner.buildID,
+                                                         installDir: folderName,
+                                                         steamID: session.steamID, steamAppsPath: steamApps.path,
+                                                         depots: depots)
+                written += 1
+            }
+            SteamLog.event("[steam-shared-record] ml1970 app=\(app.appID) shared=\(shared.count) owners-written=\(written) owners-skipped=\(skipped)")
+        }
         try? FileManager.default.removeItem(at: journalDir)
         SteamLog.event("[steam-depot] ml1310 install complete app=\(app.appID) bytes=\(prepared.totalUncompressed) seconds=\(Int(Date().timeIntervalSince(started)))")
         return installURL
@@ -439,8 +479,18 @@ final class DepotDownloader {
             let code = requestCode == 0 ? "" : "/\(requestCode)"
             do {
                 let raw = try await Self.download("\(host)/depot/\(depotID)/manifest/\(manifestGID)/5\(code)\(auth)")
+                let cache = cegDepotCache
                 return try await Task.detached(priority: .userInitiated) {
-                    try Self.parseManifest(raw, depotID: depotID, manifestGID: manifestGID, key: key)
+                    let (manifest, payload) = try Self.parseManifestKeepingPayload(raw, depotID: depotID, manifestGID: manifestGID, key: key)
+                    // ml1990: Valve's client reads a depot's manifest from steamapps/depotcache
+                    // when it prepares a per-user custom executable (CEG). Keep it for such depots.
+                    if let cache, manifest.files.contains(where: { $0.flags & DepotManifest.customExecutableFlag != 0 }) {
+                        try? FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+                        let file = cache.appendingPathComponent("\(depotID)_\(manifestGID).manifest")
+                        let existing = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
+                        if existing != payload.count { try? payload.write(to: file, options: .atomic) }
+                    }
+                    return manifest
                 }.value
             } catch is CancellationError {
                 throw CancellationError()
@@ -453,17 +503,26 @@ final class DepotDownloader {
     }
 
     private nonisolated static func parseManifest(_ raw: Data, depotID: UInt32, manifestGID: UInt64, key: Data) throws -> DepotManifest {
+        try parseManifestKeepingPayload(raw, depotID: depotID, manifestGID: manifestGID, key: key).0
+    }
+
+    /// The manifest and the binary manifest bytes it was parsed from (unzipped, decrypted).
+    private nonisolated static func parseManifestKeepingPayload(_ raw: Data, depotID: UInt32, manifestGID: UInt64,
+                                                                key: Data) throws -> (DepotManifest, Data) {
         // Content servers deliver the manifest as a single-entry ZIP.
         let payload = raw.starts(with: [0x50, 0x4B]) ? try unzipSingleFile(raw) : raw
         if let plain = try? DepotManifest.parse(depotID: depotID, manifestGID: manifestGID, data: payload, depotKey: key),
            !plain.files.isEmpty {
-            return plain
+            return (plain, payload)
         }
         // Older depots encrypt the whole manifest with the depot key.
         let decrypted = try ContentDecryptor.decryptChunk(encryptedData: payload, depotKey: key)
         let inflated = (try? ContentDecryptor.decompressChunk(compressedData: decrypted, expectedSize: 0)) ?? decrypted
-        return try DepotManifest.parse(depotID: depotID, manifestGID: manifestGID, data: inflated, depotKey: key)
+        return (try DepotManifest.parse(depotID: depotID, manifestGID: manifestGID, data: inflated, depotKey: key), inflated)
     }
+
+    /// ml1990: steamapps/depotcache while an install runs (nil: MADEIRA_STEAM_CEG_RECORDS=0).
+    private var cegDepotCache: URL?
 
     /// Extract the single deflated entry from a manifest ZIP. No zip lib needed —
     /// parse the local file header and inflate the raw deflate stream.

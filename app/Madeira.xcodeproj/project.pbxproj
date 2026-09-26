@@ -59,6 +59,9 @@
 		A1000202 /* FPSOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000202 /* FPSOverlay.swift */; };
 		A1000203 /* HardwareInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000203 /* HardwareInput.swift */; };
 		A1000205 /* SteamFiles.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000205 /* SteamFiles.swift */; };
+		A1000242 /* SteamRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000242 /* SteamRuntime.swift */; };
+		A1000283 /* MadeiraDock.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000283 /* MadeiraDock.swift */; };
+		A1000296 /* SteamInstallRegistry.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000296 /* SteamInstallRegistry.swift */; };
 		A1000206 /* SteamLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000206 /* SteamLibrary.swift */; };
 		A100023A /* SwiftSteam/chunk_zip.c in Sources */ = {isa = PBXBuildFile; fileRef = A200023A /* SwiftSteam/chunk_zip.c */; };
 		A1000220 /* SteamAccount.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000220 /* SteamAccount.swift */; };
@@ -153,6 +156,9 @@
 		A2000202 /* FPSOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FPSOverlay.swift; sourceTree = "<group>"; };
 		A2000203 /* HardwareInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HardwareInput.swift; sourceTree = "<group>"; };
 		A2000205 /* SteamFiles.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamFiles.swift; sourceTree = "<group>"; };
+		A2000242 /* SteamRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamRuntime.swift; sourceTree = "<group>"; };
+		A2000283 /* MadeiraDock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MadeiraDock.swift; sourceTree = "<group>"; };
+		A2000296 /* SteamInstallRegistry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamInstallRegistry.swift; sourceTree = "<group>"; };
 		A2000206 /* SteamLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamLibrary.swift; sourceTree = "<group>"; };
 		A200023A /* SwiftSteam/chunk_zip.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = SwiftSteam/chunk_zip.c; sourceTree = "<group>"; };
 		A200023B /* SwiftSteam/chunk_zip.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = SwiftSteam/chunk_zip.h; sourceTree = "<group>"; };
@@ -242,6 +248,9 @@
 				A2000202 /* FPSOverlay.swift */,
 				A2000203 /* HardwareInput.swift */,
 				A2000205 /* SteamFiles.swift */,
+				A2000242 /* SteamRuntime.swift */,
+				A2000283 /* MadeiraDock.swift */,
+				A2000296 /* SteamInstallRegistry.swift */,
 				A2000206 /* SteamLibrary.swift */,
 				A200023A /* SwiftSteam/chunk_zip.c */,
 				A200023B /* SwiftSteam/chunk_zip.h */,
@@ -451,6 +460,9 @@
 				A1000202 /* FPSOverlay.swift in Sources */,
 				A1000203 /* HardwareInput.swift in Sources */,
 				A1000205 /* SteamFiles.swift in Sources */,
+				A1000242 /* SteamRuntime.swift in Sources */,
+				A1000283 /* MadeiraDock.swift in Sources */,
+				A1000296 /* SteamInstallRegistry.swift in Sources */,
 				A1000206 /* SteamLibrary.swift in Sources */,
 				A100023A /* SwiftSteam/chunk_zip.c in Sources */,
 				A1000220 /* SteamAccount.swift in Sources */,

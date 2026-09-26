@@ -1,0 +1,11 @@
+#!/bin/sh
+# Keep the independently maintained private host out of the public app history.
+bad=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '(^build/steam-host/|^madeira-dock/|^private/|^docs/STEAM_HOST_PLAN\.md$)' || true)
+if [ -n "$bad" ]; then
+    echo "pre-commit: private Madeira Dock source cannot be committed to Madeira" >&2
+    exit 1
+fi
+if git grep --cached -I -l 'MADEIRA_DOCK_PRIVATE_SOURCE' -- . ':!.githooks/*' >/dev/null 2>&1; then
+    echo "pre-commit: private Madeira Dock source marker found in the app index" >&2
+    exit 1
+fi
