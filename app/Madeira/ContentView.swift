@@ -734,7 +734,7 @@ extension MetalBackedView: UIKeyInput {
     var hasText: Bool { false }
 
     // US-keyboard VK + shift for a character. Returns nil for chars we can't map.
-    private static func vkForChar(_ ch: Character) -> (Int32, Bool)? {
+    static func vkForChar(_ ch: Character) -> (Int32, Bool)? {
         if ch == "\n" || ch == "\r" { return (0x0D, false) }   // VK_RETURN
         if ch == "\t" { return (0x09, false) }                 // VK_TAB
         if ch == " " { return (0x20, false) }                  // VK_SPACE
@@ -859,6 +859,12 @@ struct ContentView: View {
     @Namespace private var pointerNS
     /// .compact = iPhone landscape: game surface expands, arrow keys appear.
     @Environment(\.verticalSizeClass) private var vSizeClass
+    /// The library front end (Library.swift). When it is the chosen interface it
+    /// replaces both bodies below, and a running library session gets the
+    /// full-screen `sessionBody`.
+    @ObservedObject private var library = LibraryModel.shared
+    /// "Use New Interface" (actionButtons) applies at the next start.
+    @State private var showFrontendRestart = false
 
     enum JITStatus {
         case unknown
@@ -878,7 +884,11 @@ struct ContentView: View {
          * two-column selection behaviour. */
         NavigationStack {
             Group {
-                if vSizeClass == .compact {
+                if library.enabled && library.current != nil {
+                    sessionBody
+                } else if library.enabled {
+                    LibraryView(play: launchLibraryEntry, enableJIT: enableJITViaStikDebug)
+                } else if vSizeClass == .compact {
                     landscapeBody
                 } else {
                     portraitBody
@@ -890,13 +900,49 @@ struct ContentView: View {
             // a fresh placeholder only re-parents the same CAMetalLayer.
             .navigationTitle("Madeira")
             .navigationBarTitleDisplayMode(.inline)
-            .navigationBarHidden(vSizeClass == .compact)
+            .toolbarBackground(.regularMaterial, for: .navigationBar)
+            .toolbarBackground(library.enabled ? .visible : .automatic, for: .navigationBar)
+            .navigationBarHidden(library.enabled ? library.current != nil : vSizeClass == .compact)
+            // A second session cannot start in this process; offer to close Madeira.
+            .alert("Restart Madeira", isPresented: Binding(get: { library.restartNotice != nil },
+                                                            set: { if !$0 { library.restartNotice = nil } })) {
+                Button("Close Madeira") {
+                    LogStore.shared.log("[session-once] closed by the user for a restart")
+                    exit(0)
+                }
+                Button("Later", role: .cancel) { library.restartNotice = nil }
+            } message: { Text(library.restartNotice ?? "") }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+                library.refreshFlag()
+                if library.enabled && library.current == nil { MetalHostView.shared.isHidden = true }
+            }
             .onAppear {
                 jit_install_trap_handler()
                 entitlements = EntitlementStatus.check()
                 logEntitlementStatus()
+                logStore.log("[build] \(BuildStamp.text)")
+                FrontendChoice.logStartup()
+                DeviceLoadDiagnostics.start()
             }
         }
+    }
+
+    /// A library session: the game full screen in either orientation, with the
+    /// library's menu button, starting screen and in-game menu drawn above it by
+    /// TouchControlsOverlay (LibraryHUD), in the window above the game surface.
+    private var sessionBody: some View {
+        ZStack {
+            Color.black
+            MadeiraMetalView()
+                .onAppear { TouchControlsHost.attach() }
+                .onReceive(NotificationCenter.default.publisher(
+                    for: UIDevice.orientationDidChangeNotification)) { _ in
+                    TouchControlsHost.attach()   // re-frame to the new bounds
+                }
+        }
+        .ignoresSafeArea()
+        .background(Color.black)
+        .statusBarHidden(true)
     }
 
     /// Portrait: classic tooling layout — header, badges, 240pt game strip,
@@ -1094,6 +1140,14 @@ struct ContentView: View {
                 Text(deviceInfo)
                     .font(.caption2)
                     .foregroundColor(.secondary)
+                // Which build is installed (BuildStamp, Library.swift).
+                if BuildStamp.visible {
+                    Text(BuildStamp.text)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(Color(.systemGray2))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                }
             }
         }
         .padding(.horizontal)
@@ -1588,8 +1642,21 @@ struct ContentView: View {
                 }
                 .buttonStyle(.bordered)
                 .tint(.red)
+
+                // Back to the library interface (FrontendChoice), at the next start.
+                Button("Use New Interface") {
+                    FrontendChoice.choose(new: true)
+                    showFrontendRestart = true
+                }
+                .buttonStyle(.bordered)
+                .tint(.indigo)
             }
             .padding()
+        }
+        .alert("Restart Madeira", isPresented: $showFrontendRestart) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Close Madeira from the app switcher and open it again to use the new interface.")
         }
     }
 
@@ -1808,12 +1875,45 @@ struct ContentView: View {
         }
     }
 
+    /// Play in the library (Library.swift): checks that a session can start,
+    /// applies the entry's launch profile and runs the same full sequence as the
+    /// developer interface's buttons.
+    private func launchLibraryEntry(_ entry: LibraryEntry) {
+        guard wine_process_is_running() == 0, wineserver_is_running() == 0, library.current == nil else {
+            library.error = "A session is already running."; return
+        }
+        // One Wine session per app run (see LibraryModel.sessionsThisRun).
+        if LibraryModel.sessionsThisRun > 0, MadeiraConfig.flag("MADEIRA_ONE_SESSION_PER_RUN") {
+            LogStore.shared.log("[session-once] launch held: \(LibraryModel.sessionsThisRun) session(s) already ran in this app run")
+            library.restartNotice = LibraryModel.restartMessage; return
+        }
+        // The same precondition runWineFullSequence checks: the JIT pool is
+        // taken at launch, through the debugger.
+        guard jit_check_debugged() else {
+            library.error = "Enable JIT before playing."; return
+        }
+        do { if entry.desktop != true { _ = try LibraryModel.executable(entry.relativePath) }; try entry.validate() }
+        catch {
+            library.error = error.localizedDescription
+            logStore.log("[launch-preflight] profile validation failed: \(error.localizedDescription)", level: .error)
+            return
+        }
+        guard entry.windowsPath.utf8.count < 1024, entry.arguments.utf8.count < 1024 else {
+            library.error = "The executable path or launch arguments are too long."; return
+        }
+        entry.configureLaunch()
+        library.begin(entry)
+        runWineFullSequence(profile: entry)
+    }
+
     /// Full sequence: allocate JIT pool, start wineserver, start Wine.
     /// Debugger stays attached during PE loading so mprotect_exec can use BRK
     /// to prepare code pages. Detach happens after Wine finishes + recovery.
-    private func runWineFullSequence() {
+    /// `profile` is a library entry whose launch profile applies to this run.
+    private func runWineFullSequence(profile: LibraryEntry? = nil) {
         guard jit_check_debugged() else {
             logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
+            if profile != nil { LibraryModel.shared.launchFailed() }
             return
         }
         /* ml1095: one config file. Written once from any legacy madeira-*.txt. */
@@ -1844,6 +1944,13 @@ struct ContentView: View {
         ws_log_quiet = 1
 
         DispatchQueue.global(qos: .userInitiated).async {
+            // A library entry's launch profile (executable, arguments, x87
+            // precision, frame limit).
+            if let profile {
+                profile.applyEnvironment()
+                logStore.log("[launch-route] library profile applied")
+            }
+
             // Step 1: Allocate JIT pool (BRK suspends entire process)
             // 128 MB was enough for cube but Thumper exhausts it (more PE
             // copies + larger FEX block cache). Desktop mode holds the
@@ -2246,6 +2353,8 @@ struct ContentView: View {
                 logStore.log("  and depends on current memory layout, so a fresh process", level: .info)
                 logStore.log("  usually lands somewhere valid.", level: .info)
                 logStore.uiPaused = false
+                // A library session that never started returns to the library.
+                DispatchQueue.main.async { LibraryModel.shared.launchFailed() }
                 return
             }
 
@@ -2377,7 +2486,10 @@ struct ContentView: View {
             logStore.log("Detaching debugger...")
             StikJITHelper.detachDebugger()
 
-            DispatchQueue.main.async { heartbeat.invalidate() }
+            DispatchQueue.main.async {
+                heartbeat.invalidate()
+                if wine_process_is_running() == 0 { LibraryModel.shared.launchFailed() }
+            }
         }
     }
 
@@ -2730,13 +2842,14 @@ final class TouchControlsModel: ObservableObject {
     /// included, and ml643's "is it the root view?" test therefore rejected every
     /// touch in the window. Nothing responded, and edit mode — whose branch
     /// captured everything — could never be entered to mask it.
-    func hitsInteractive(_ p: CGPoint, in bounds: CGRect) -> Bool {
+    /// `topBar: false` in a library session, where LibraryHUD replaces the bar.
+    func hitsInteractive(_ p: CGPoint, in bounds: CGRect, topBar: Bool = true) -> Bool {
         // Top bar: two 44pt buttons 10pt apart in play mode, centred, 10pt down.
         // Padded generously; a few points of slop costs nothing and a missed tap
         // costs a build.
         let barW: CGFloat = 2 * 44 + 10
-        if CGRect(x: bounds.midX - barW / 2 - 10, y: 0,
-                  width: barW + 20, height: 68).contains(p) { return true }
+        if topBar, CGRect(x: bounds.midX - barW / 2 - 10, y: 0,
+                          width: barW + 20, height: 68).contains(p) { return true }
         guard visible else { return false }
         for c in controls {
             let r = Self.baseDiameter * CGFloat(c.scale) / 2
@@ -2760,6 +2873,18 @@ final class ControlsWindow: UIWindow {
         // Edit mode owns the whole screen: drags and the scale pinch must not
         // leak through and swing the camera while you are arranging buttons.
         if m.editing { return super.hitTest(point, with: event) }
+        // A library session (Library.swift), in either orientation: its in-game
+        // menu and starting screen take every touch; otherwise only its menu
+        // button, its performance overlay and the touch controls do.
+        let library = LibraryModel.shared
+        if library.current != nil {
+            if library.menu || library.launching || library.menuButtonRect.contains(point) ||
+                (library.performance && library.performanceRect.contains(point)) {
+                return super.hitTest(point, with: event)
+            }
+            guard m.hitsInteractive(point, in: bounds, topBar: false) else { return nil }
+            return super.hitTest(point, with: event)
+        }
         // Portrait draws nothing here, so it must consume nothing.
         guard bounds.width > bounds.height else { return nil }
         guard m.hitsInteractive(point, in: bounds) else { return nil }
@@ -2798,20 +2923,25 @@ enum TouchControlsHost {
 
 struct TouchControlsOverlay: View {
     @ObservedObject private var m = TouchControlsModel.shared
+    @ObservedObject private var library = LibraryModel.shared
     @State private var pinchBase: Double?
 
     var body: some View {
         GeometryReader { geo in
             // Landscape only; portrait keeps the existing key row and joystick.
-            let landscape = geo.size.width > geo.size.height
+            // A library session is full screen in either orientation, and its
+            // HUD (menu button, starting screen, in-game menu) replaces the top
+            // bar; the controls hide while its menu or starting screen is up.
+            let session = library.current != nil
+            let landscape = geo.size.width > geo.size.height || session
             ZStack(alignment: .top) {
                 if landscape {
-                    if m.visible || m.editing {
+                    if (m.visible || m.editing) && !library.blocksGameplayTouch {
                         ForEach(m.controls) { c in
                             TouchControlButton(control: c, screen: geo.size)
                         }
                     }
-                    topBar
+                    if session && !m.editing { LibraryHUD() } else { topBar }
                     if m.editing, let i = m.index(of: m.selected) {
                         MappingPanel(control: m.controls[i], screen: geo.size)
                     }
@@ -2825,13 +2955,14 @@ struct TouchControlsOverlay: View {
             .onChange(of: m.controls) { _, _ in configureGamepad(landscape: landscape) }
             .onChange(of: m.visible) { _, _ in configureGamepad(landscape: landscape) }
             .onChange(of: m.editing) { _, _ in configureGamepad(landscape: landscape) }
+            .onChange(of: library.blocksGameplayTouch) { _, _ in configureGamepad(landscape: landscape) }
             .onDisappear { GamepadInput.shared.configureTouch(controls: []) }
         }
         .ignoresSafeArea()
     }
 
     private func configureGamepad(landscape: Bool) {
-        let ids = landscape && m.visible && !m.editing
+        let ids = landscape && m.visible && !m.editing && !library.blocksGameplayTouch
             ? m.controls.filter { $0.action.padName.map(TouchPadAction.supported) ?? false }.map(\.id) : []
         GamepadInput.shared.configureTouch(controls: Set(ids))
     }
