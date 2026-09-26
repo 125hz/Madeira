@@ -8329,6 +8329,80 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
                                       struct madeira_ir_vs_input *vsin, unsigned vsin_cap, unsigned *vsin_n,
                                       UINT *tg_out, struct madeira_ir_loc *locs, unsigned *nlocs,
                                       const struct mad_convert_opts *o);
+/* ml1990: the inputs of one conversion request, shared by the first call and
+ * any retry so the two can never disagree about what is being converted. */
+static void mad_fill_convert_inputs(struct madeira_ir_convert_args *a, struct mad_rootsig *rs,
+                                    const void *dxil, SIZE_T dxil_len, const char *entry,
+                                    const struct mad_convert_opts *o) {
+    memset(a, 0, sizeof *a);
+    a->dxil = (uint64_t)(uintptr_t)dxil;
+    a->dxil_len = (uint64_t)dxil_len;
+    a->entry_point = (uint64_t)(uintptr_t)entry;
+    a->params = (uint64_t)(uintptr_t)(rs ? rs->params : NULL);
+    a->num_params = rs ? rs->nparams : 0;
+    a->ranges = (uint64_t)(uintptr_t)(rs ? rs->ranges : NULL);
+    a->num_ranges = rs ? rs->nranges : 0;
+    a->target_os = g_target.os;
+    a->gpu_family = g_target.family;
+    a->os_version = (uint64_t)(uintptr_t)g_target.os_version;
+    a->samplers = (uint64_t)(uintptr_t)(rs ? rs->samplers : NULL);
+    a->num_samplers = rs ? rs->nsamplers : 0;
+    if (o) { a->gs_emulation = o->gs_emulation ? 1u : 0u; a->input_topology = o->topology; a->layout = (uint64_t)(uintptr_t)o->layout; }   /* ml927 */
+    if (o && o->vs_bc && o->vs_bc_len) {   /* ml1031 */
+        a->vs_bytecode = (uint64_t)(ULONG_PTR)o->vs_bc;
+        a->vs_bytecode_len = (uint64_t)o->vs_bc_len;
+    }
+    if (o && o->ps_valid) {   /* ml1023 */
+        a->ps_valid = 1; a->ps_sample_mask = o->ps_sample_mask;
+        a->ps_flags = o->ps_flags; a->ps_unorm_output_mask = o->ps_unorm_mask;
+    }
+    if (o && o->air) {   /* ml1008 */
+        a->out_air_ranges = (uint64_t)(uintptr_t)o->air->ranges;
+        a->air_range_cap = MADEIRA_IR_AIR_RANGE_MAX;
+    }
+    if (o && o->tess_stage) {   /* ml1083 */
+        a->tess_stage = o->tess_stage; a->tess_index_format = o->tess_index_format;
+        a->hs_bytecode = (uint64_t)(ULONG_PTR)o->hs_bc; a->hs_bytecode_len = (uint64_t)o->hs_bc_len;
+        a->ds_bytecode = (uint64_t)(ULONG_PTR)o->ds_bc; a->ds_bytecode_len = (uint64_t)o->ds_bc_len;
+        if (o->air2) { a->out_air_ranges2 = (uint64_t)(uintptr_t)o->air2->ranges; a->air_range_cap2 = MADEIRA_IR_AIR_RANGE_MAX; }
+    }
+    if (o && o->gs_stage) {   /* ml1147 */
+        a->gs_stage = o->gs_stage; a->gs_strip = o->gs_strip; a->tess_index_format = o->tess_index_format;
+        a->gs_bytecode = (uint64_t)(ULONG_PTR)o->gs_bc; a->gs_bytecode_len = (uint64_t)o->gs_bc_len;
+    }
+}
+
+/* ml1990: one conversion call instead of two. The size-then-fill protocol ran
+ * the whole compiler for the size query and again for the fill (the DXIL path
+ * had no cache to catch the second). A first buffer of four times the input
+ * plus 64 KB holds nearly every metallib; a larger one reports its size and is
+ * retried once, and the service keeps the finished result for that retry.
+ * MADEIRA_D3D12_ONEPASS=0 restores size-then-fill (the service reads it too). */
+static int mad_onepass_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        char v[4] = {0};
+        DWORD n = GetEnvironmentVariableA("MADEIRA_D3D12_ONEPASS", v, sizeof v);
+        enabled = !(n == 1 && v[0] == '0');
+        d3d12_log(enabled ? "[d3d12-onepass] ml1990 single-call shader conversion enabled\n"
+                          : "[d3d12-onepass] ml1990 single-call shader conversion disabled (rollback)\n");
+    }
+    return enabled;
+}
+static volatile LONG g_conv_calls, g_conv_retries; static volatile LONG64 g_conv_ticks;
+static void mad_convert_note_time(LONG64 t0, int retried) {
+    LONG n = InterlockedIncrement(&g_conv_calls);
+    LONG r = retried ? InterlockedIncrement(&g_conv_retries) : g_conv_retries;
+    LONG64 dt = mad_qpc() - t0;
+    LONG64 ticks = InterlockedExchangeAdd64(&g_conv_ticks, dt) + dt;
+    if (n == 1 || n == 16 || n == 64 || !(n % 128)) {
+        static LONG64 qpf;
+        if (!qpf) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); qpf = f.QuadPart ? f.QuadPart : 1; }
+        d3d12_log("[d3d12-onepass] ml1990 conversions=%ld retries=%ld convert-ms=%lld\n",
+                  (long)n, (long)r, (long long)(ticks * 1000 / qpf));
+    }
+}
+
 /* ml1011: mad_convert_stage (the no-options wrapper) was removed -- every
  * caller now passes options, because the DXBC backend needs them. */
 static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_rootsig *rs,
@@ -8340,46 +8414,32 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
     struct madeira_ir_convert_args a;
     char name[MADEIRA_IR_ENTRY_MAX];
     unsigned char *buf2 = NULL; const SIZE_T cap2 = 256u * 1024u;
-    memset(&a, 0, sizeof a);
-    a.dxil = (uint64_t)(uintptr_t)dxil;
-    a.dxil_len = (uint64_t)dxil_len;
-    a.entry_point = (uint64_t)(uintptr_t)entry;
-    a.params = (uint64_t)(uintptr_t)(rs ? rs->params : NULL);
-    a.num_params = rs ? rs->nparams : 0;
-    a.ranges = (uint64_t)(uintptr_t)(rs ? rs->ranges : NULL);
-    a.num_ranges = rs ? rs->nranges : 0;
-    a.target_os = g_target.os;
-    a.gpu_family = g_target.family;
-    a.os_version = (uint64_t)(uintptr_t)g_target.os_version;
-    a.out_entry = (uint64_t)(uintptr_t)name;
-    a.samplers = (uint64_t)(uintptr_t)(rs ? rs->samplers : NULL);
-    a.num_samplers = rs ? rs->nsamplers : 0;
-    if (o) { a.gs_emulation = o->gs_emulation ? 1u : 0u; a.input_topology = o->topology; a.layout = (uint64_t)(uintptr_t)o->layout; }   /* ml927 */
-    if (o && o->vs_bc && o->vs_bc_len) {   /* ml1031 */
-        a.vs_bytecode = (uint64_t)(ULONG_PTR)o->vs_bc;
-        a.vs_bytecode_len = (uint64_t)o->vs_bc_len;
-    }
-    if (o && o->ps_valid) {   /* ml1023 */
-        a.ps_valid = 1; a.ps_sample_mask = o->ps_sample_mask;
-        a.ps_flags = o->ps_flags; a.ps_unorm_output_mask = o->ps_unorm_mask;
-    }
-    if (o && o->air) {   /* ml1008 */
-        memset(o->air, 0, sizeof *o->air);
-        a.out_air_ranges = (uint64_t)(uintptr_t)o->air->ranges;
-        a.air_range_cap = MADEIRA_IR_AIR_RANGE_MAX;
-    }
-    if (o && o->tess_stage) {   /* ml1083 */
-        a.tess_stage = o->tess_stage; a.tess_index_format = o->tess_index_format;
-        a.hs_bytecode = (uint64_t)(ULONG_PTR)o->hs_bc; a.hs_bytecode_len = (uint64_t)o->hs_bc_len;
-        a.ds_bytecode = (uint64_t)(ULONG_PTR)o->ds_bc; a.ds_bytecode_len = (uint64_t)o->ds_bc_len;
-        if (o->air2) { memset(o->air2, 0, sizeof *o->air2); a.out_air_ranges2 = (uint64_t)(uintptr_t)o->air2->ranges; a.air_range_cap2 = MADEIRA_IR_AIR_RANGE_MAX; }
-    }
-    if (o && o->gs_stage) {   /* ml1147 */
-        a.gs_stage = o->gs_stage; a.gs_strip = o->gs_strip; a.tess_index_format = o->tess_index_format;
-        a.gs_bytecode = (uint64_t)(ULONG_PTR)o->gs_bc; a.gs_bytecode_len = (uint64_t)o->gs_bc_len;
+    unsigned char *buf = NULL;
+    SIZE_T need = 0;
+    const int onepass = mad_onepass_enabled();
+    int retried = 0;
+    LONG64 t0 = mad_qpc();
+
+    if (o && o->air) memset(o->air, 0, sizeof *o->air);   /* ml1008 */
+    if (o && o->tess_stage && o->air2) memset(o->air2, 0, sizeof *o->air2);   /* ml1083 */
+    name[0] = 0;
+    if (onepass) {
+        need = dxil_len * 4 + 64u * 1024u;
+        buf = malloc(need);
+        if (!buf) return 0;
+        if (o && o->layout) { buf2 = malloc(cap2); if (!buf2) { free(buf); return 0; } }   /* ml927: the stage-in metallib */
     }
 
-    /* Ask for the size, then convert into a buffer that fits. */
+    /* Size-then-fill (rollback) asks with no buffer; one-pass converts
+     * straight into the first buffer and only comes back if it was too small. */
+    mad_fill_convert_inputs(&a, rs, dxil, dxil_len, entry, o);
+    a.out_entry = (uint64_t)(uintptr_t)name;
+    if (onepass) {
+        a.out_buf = (uint64_t)(uintptr_t)buf; a.out_cap = (uint64_t)need;
+        a.out_vs_inputs = (uint64_t)(uintptr_t)vsin; a.vs_input_cap = vsin ? vsin_cap : 0;
+        a.out_locs = (uint64_t)(uintptr_t)locs; a.loc_cap = locs ? MAD_LOC_MAX : 0;
+        if (buf2) { a.out_buf2 = (uint64_t)(uintptr_t)buf2; a.out_cap2 = cap2; }
+    }
     MadeiraIRConvert(&a);
     if (a.ret_status != MADEIRA_IR_BUFFER_TOO_SMALL && a.ret_status != MADEIRA_IR_OK) {
         const unsigned char *b = (const unsigned char *)dxil;
@@ -8402,68 +8462,40 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
                 d3d12_log("[madeira-d3d12]   %04x: %s\n", (unsigned)off, line);
             }
         }
-        return 0;
-    }
-    SIZE_T need = (SIZE_T)a.ret_len;
-    if (!need) {
-        d3d12_log("[madeira-d3d12] %s conversion produced no bytes\n", tag);
-        return 0;
-    }
-    unsigned char *buf = malloc(need);
-    if (!buf) return 0;
-    if (o && o->layout) { buf2 = malloc(cap2); if (!buf2) { free(buf); return 0; } }   /* ml927: the stage-in metallib */
-
-    memset(&a, 0, sizeof a);
-    a.dxil = (uint64_t)(uintptr_t)dxil;
-    a.dxil_len = (uint64_t)dxil_len;
-    a.entry_point = (uint64_t)(uintptr_t)entry;
-    a.params = (uint64_t)(uintptr_t)(rs ? rs->params : NULL);
-    a.num_params = rs ? rs->nparams : 0;
-    a.ranges = (uint64_t)(uintptr_t)(rs ? rs->ranges : NULL);
-    a.num_ranges = rs ? rs->nranges : 0;
-    a.target_os = g_target.os;
-    a.gpu_family = g_target.family;
-    a.os_version = (uint64_t)(uintptr_t)g_target.os_version;
-    a.out_buf = (uint64_t)(uintptr_t)buf;
-    a.out_cap = (uint64_t)need;
-    a.out_vs_inputs = (uint64_t)(uintptr_t)vsin;
-    a.vs_input_cap = vsin ? vsin_cap : 0;
-    a.out_locs = (uint64_t)(uintptr_t)locs;
-    a.loc_cap = locs ? MAD_LOC_MAX : 0;
-    a.samplers = (uint64_t)(uintptr_t)(rs ? rs->samplers : NULL);
-    a.num_samplers = rs ? rs->nsamplers : 0;
-    if (o) { a.gs_emulation = o->gs_emulation ? 1u : 0u; a.input_topology = o->topology; a.layout = (uint64_t)(uintptr_t)o->layout; }   /* ml927 */
-    if (o && o->vs_bc && o->vs_bc_len) {   /* ml1031 */
-        a.vs_bytecode = (uint64_t)(ULONG_PTR)o->vs_bc;
-        a.vs_bytecode_len = (uint64_t)o->vs_bc_len;
-    }
-    if (o && o->ps_valid) {   /* ml1023 */
-        a.ps_valid = 1; a.ps_sample_mask = o->ps_sample_mask;
-        a.ps_flags = o->ps_flags; a.ps_unorm_output_mask = o->ps_unorm_mask;
-    }
-    if (o && o->air) {   /* ml1008 */
-        a.out_air_ranges = (uint64_t)(uintptr_t)o->air->ranges;
-        a.air_range_cap = MADEIRA_IR_AIR_RANGE_MAX;
-    }
-    if (o && o->tess_stage) {   /* ml1083 */
-        a.tess_stage = o->tess_stage; a.tess_index_format = o->tess_index_format;
-        a.hs_bytecode = (uint64_t)(ULONG_PTR)o->hs_bc; a.hs_bytecode_len = (uint64_t)o->hs_bc_len;
-        a.ds_bytecode = (uint64_t)(ULONG_PTR)o->ds_bc; a.ds_bytecode_len = (uint64_t)o->ds_bc_len;
-        if (o->air2) { a.out_air_ranges2 = (uint64_t)(uintptr_t)o->air2->ranges; a.air_range_cap2 = MADEIRA_IR_AIR_RANGE_MAX; }
-    }
-    if (o && o->gs_stage) {   /* ml1147 */
-        a.gs_stage = o->gs_stage; a.gs_strip = o->gs_strip; a.tess_index_format = o->tess_index_format;
-        a.gs_bytecode = (uint64_t)(ULONG_PTR)o->gs_bc; a.gs_bytecode_len = (uint64_t)o->gs_bc_len;
-    }
-    a.out_entry = (uint64_t)(uintptr_t)name;
-    if (buf2) { a.out_buf2 = (uint64_t)(uintptr_t)buf2; a.out_cap2 = cap2; }
-    MadeiraIRConvert(&a);
-    if (a.ret_status != MADEIRA_IR_OK) {
-        d3d12_log("[madeira-d3d12] %s conversion failed: %s (converter code %u)\n",
-                  tag, mad_ir_status_name(a.ret_status), a.ret_error_code);
         free(buf); free(buf2);
         return 0;
     }
+    if (a.ret_status == MADEIRA_IR_BUFFER_TOO_SMALL || !buf) {
+        need = (SIZE_T)a.ret_len;
+        if (!need) {
+            d3d12_log("[madeira-d3d12] %s conversion produced no bytes\n", tag);
+            free(buf); free(buf2);
+            return 0;
+        }
+        free(buf);
+        buf = malloc(need);
+        if (!buf) { free(buf2); return 0; }
+        if (!buf2 && o && o->layout) { buf2 = malloc(cap2); if (!buf2) { free(buf); return 0; } }   /* ml927 */
+        retried = onepass;
+
+        mad_fill_convert_inputs(&a, rs, dxil, dxil_len, entry, o);
+        a.out_buf = (uint64_t)(uintptr_t)buf;
+        a.out_cap = (uint64_t)need;
+        a.out_vs_inputs = (uint64_t)(uintptr_t)vsin;
+        a.vs_input_cap = vsin ? vsin_cap : 0;
+        a.out_locs = (uint64_t)(uintptr_t)locs;
+        a.loc_cap = locs ? MAD_LOC_MAX : 0;
+        a.out_entry = (uint64_t)(uintptr_t)name;
+        if (buf2) { a.out_buf2 = (uint64_t)(uintptr_t)buf2; a.out_cap2 = cap2; }
+        MadeiraIRConvert(&a);
+        if (a.ret_status != MADEIRA_IR_OK) {
+            d3d12_log("[madeira-d3d12] %s conversion failed: %s (converter code %u)\n",
+                      tag, mad_ir_status_name(a.ret_status), a.ret_error_code);
+            free(buf); free(buf2);
+            return 0;
+        }
+    }
+    mad_convert_note_time(t0, retried);
     if (o && o->air) {   /* ml1008 */
         o->air->backend    = a.ret_backend;
         o->air->cb_bind    = a.ret_cb_table_bind;
