@@ -116,6 +116,38 @@ compile_unixlib "$CRYPTO_DIR/crypt32_unixlib_ios.c" "crypt32_unixlib" "crypt32" 
 # iOS-Madeira 2026-08-03 (#79 transport): in-process NSI TCP connection
 # tables (nsiproxy.sys is not shipped; PE nsi.dll falls back to this).
 compile_one "$BUILD_DIR/nsi_unixlib_ios.c" "nsi_unixlib_ios"
+# MADEIRA 2026-09-19: winegstreamer's unix side is GStreamer, which does not
+# exist on iOS -- so the Windows WMA decoder MFT (CLSID_CWMADecMediaObject ->
+# wmadmod.dll -> CLSID_wg_wma_decoder in winegstreamer.dll) was absent and
+# FAudio fed xaudio2's mixer the COMPRESSED xWMA bytes as PCM (the static, and
+# the 8x-full-scale peaks in the audio census).  winegstreamer_unixlib_ios.c
+# replaces the wg_transform subset that dlls/winegstreamer/wma_decoder.c needs
+# with libavcodec, and the wg_parser (quartz's MP3/WAV splitters, Media
+# Foundation's MP4 source; wg_parser_av_ios.c, #included by it) with
+# libavformat.  FFmpeg comes from build/ffmpeg/build.sh (LGPL configuration).
+# The widl-generated mfobjects.h/mftransform.h that unixlib.h pulls in only
+# exist in a configured build tree's include dir, which $WINE_BUILD already is.
+FFMPEG_PREFIX="$REPO_ROOT/toolchains/ffmpeg-ios"
+compile_unixlib "$BUILD_DIR/winegstreamer_unixlib_ios.c" "winegstreamer_unixlib" "winegstreamer" \
+    -I"$WINE_SRC/dlls/winegstreamer" -I"$FFMPEG_PREFIX/include"
+# MADEIRA ml1990: the wg_parser's H.264/HEVC (VideoToolbox) and AAC
+# (AudioToolbox) decoders.  Its own translation unit with NO Wine header --
+# CoreFoundation and winnt.h disagree about several names -- so it is compiled
+# without the Wine include paths and config.h.  The app target links
+# VideoToolbox, CoreMedia, CoreVideo, AudioToolbox and CoreFoundation
+# (app/Madeira.xcodeproj, Frameworks phase) next to the FFmpeg archives.
+echo -n "  wg_parser_apple_ios... "
+if xcrun -sdk iphoneos clang \
+    -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 \
+    -O2 -fPIC -fvisibility=hidden -fno-stack-protector -fno-strict-aliasing -Wall -Werror=implicit-function-declaration \
+    -c "$BUILD_DIR/wg_parser_apple_ios.c" -o "$OBJ_DIR/wg_parser_apple_ios.o" 2>"$OBJ_DIR/wg_parser_apple_ios.err"; then
+    echo "OK"
+    SUCCEEDED=$((SUCCEEDED + 1))
+else
+    echo "FAILED"
+    FAILED=$((FAILED + 1))
+    FAILED_FILES="$FAILED_FILES wg_parser_apple_ios"
+fi
 
 for src in $WINE_SRC/dlls/ntdll/unix/*.c; do
     name=$(basename "$src" .c)
@@ -165,6 +197,7 @@ ar rcs "$OBJ_DIR/libntdll_unix.a" \
     "$OBJ_DIR/gnutls_symtab_ios.o" "$OBJ_DIR/ws2_32_unixlib.o" \
     "$OBJ_DIR/bcrypt_unixlib.o" "$OBJ_DIR/secur32_unixlib.o" "$OBJ_DIR/crypt32_unixlib.o" \
     "$OBJ_DIR/dwrite_unixlib.o" \
+    "$OBJ_DIR/winegstreamer_unixlib.o" "$OBJ_DIR/wg_parser_apple_ios.o" \
     "$OBJ_DIR/cdrom.o" "$OBJ_DIR/debug.o" "$OBJ_DIR/env.o" "$OBJ_DIR/file.o" \
     "$OBJ_DIR/loader.o" "$OBJ_DIR/loadorder.o" "$OBJ_DIR/process.o" "$OBJ_DIR/registry.o" \
     "$OBJ_DIR/security.o" "$OBJ_DIR/serial.o" "$OBJ_DIR/server.o" \

@@ -36,6 +36,13 @@ upstream = [  # (match test, 64-bit table) in upstream order
     ('strstr(match, "opengl32")', "ios_gl_stub_unix_call_table"),
 ]
 branches = re.split(r"\n        \} else ", chain[chain.index('if (match && strstr(match, "winemetal"))'):])
+# winegstreamer's branch is new (upstream has no winegstreamer unix side on iOS): it must hand
+# a 32-bit caller its own wow64 table, never a 64-bit one.  It is checked here and then left
+# out of the comparison with upstream's chain.
+wg = [b for b in branches if 'strstr(match, "winegstreamer")' in b.split("\n")[0]]
+assert len(wg) == 1, len(wg)
+assert "funcs_wow64 = (const void *)winegstreamer_unix_call_wow64_funcs;" in wg[0], wg[0]
+branches = [b for b in branches if b is not wg[0]]
 assert len(branches) == len(upstream) + 1, len(branches)
 for (test, table), body in zip(upstream, branches):
     assert test in body.split("\n")[0], (test, body.split("\n")[0])
