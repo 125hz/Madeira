@@ -27,6 +27,11 @@ final class GamepadInput: @unchecked Sendable {
         queue.async { [self] in touchState.configure(allowed); sample() }
     }
 
+    /// Documents/madeira.cfg `env.NAME`, else the process environment; only "0" disables.
+    static func flag(_ name: String) -> Bool {
+        (MadeiraConfig.get("env.\(name)") ?? ProcessInfo.processInfo.environment[name]) != "0"
+    }
+
     @MainActor func touch(owner: UUID, control: UUID, value: GamepadSample?) {
         guard Self.touchEnabled else { return }
         queue.async { [self] in
