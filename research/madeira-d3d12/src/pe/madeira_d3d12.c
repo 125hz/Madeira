@@ -9509,9 +9509,17 @@ static HRESULT STDMETHODCALLTYPE device_CreateComputePipelineState(ID3D12Device 
                 }
             }
         }
-        {   /* ml931 */
-            char fn[96]; static unsigned ndump;
-            if (ndump++ < 400) { snprintf(fn, sizeof fn, "cs_%p_%u.dxil", (void *)p, (unsigned)desc->CS.BytecodeLength); mad_dump_blob(fn, desc->CS.pShaderBytecode, desc->CS.BytecodeLength); }
+        {   /* ml931; ml1990: opt-in (MADEIRA_D3D12_CS_DUMP=1). Writing up to
+             * 400 files into C:\madeira-cs on every run cost startup time for
+             * a diagnostic that is only wanted while chasing one kernel. */
+            char fn[96]; static unsigned ndump; static int dump_on = -1;
+            if (dump_on < 0) {
+                char v[4] = {0};
+                DWORD n = GetEnvironmentVariableA("MADEIRA_D3D12_CS_DUMP", v, sizeof v);
+                dump_on = n == 1 && v[0] == '1';
+                if (dump_on) d3d12_log("[madeira-d3d12] ml1990 compute bytecode dump to C:\\madeira-cs enabled (MADEIRA_D3D12_CS_DUMP=1)\n");
+            }
+            if (dump_on && ndump++ < 400) { snprintf(fn, sizeof fn, "cs_%p_%u.dxil", (void *)p, (unsigned)desc->CS.BytecodeLength); mad_dump_blob(fn, desc->CS.pShaderBytecode, desc->CS.BytecodeLength); }
         }
         snprintf(p->vs_name, sizeof p->vs_name, "%s", entry[0] ? entry : g_last_entry);   /* ml880 */
         /* ml1008: the reflected top-level layout is the DXIL converter's, and
