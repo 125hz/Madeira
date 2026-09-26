@@ -118,6 +118,30 @@ bcrypt, secur32, crypt32, dwrite, dnsapi (new unix side on the system resolver),
 nsi, and the null audio driver. win32u goes through `wow64win.dll` as upstream
 Wine does.
 
+### Direct3D 9
+
+Most 32-bit games are D3D9 programs. The i386 `d3d9.dll` in the farm is DXMT's
+thin shim (`research/dxmt/src/d3d9shim`, exported as `d3d9shim.dll` whatever
+file name it is installed under):
+
+- By default its DllMain forwards every export to `d3d9-emulated.dll`, DXMT's
+  D3D9 frontend built for i386 and translated by FEX like the program itself.
+  That frontend talks to Metal through winemetal's wow64 table.
+- With `d3d9 = native` in madeira.cfg (ContentView exports it as
+  `MADEIRA_D3D9`), the shim binds its own unix side instead and the frontend
+  runs as native ARM64 code in `libdxmt_combined.a`
+  (`build/dxmt-ios/build.sh`, the `dxmt_madeira_native` objects).
+  `load_builtin_unixlib()` binds `dxmt_d3d9_unix_call_{,wow64_}funcs` to a
+  module whose export name is `d3d9shim`, never to the emulated frontend.
+  Native D3D9 objects hold host pointers into the guest window, so
+  `d3d9_native_process_teardown()` drops them before a dead process's window
+  is replaced with `PROT_NONE`.
+
+`build/wine-i386/build.sh` installs the shim as `d3d9.dll` and `d3d9shim.dll`
+and the emulated frontend as `d3d9-emulated.dll`. `build/x86-tests/
+d3d9-cube-x86.c` is the acceptance test: a spinning cube through a real device
+with a dynamic vertex buffer the guest locks every frame.
+
 ## 5. Faults
 
 - **Guest faults** arrive as host addresses inside a window. The Mach handler

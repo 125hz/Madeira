@@ -25,6 +25,7 @@ enum MadeiraConfig {
         "arena", "arena-mb", "arena-test", "fexfail", "remote", "remote-batch", "d3d12",
         "apicensus", "shadow", "census", "wxprobe", "args", "valley-args",
         "jumbo-mb", "jumbo-keep-mb", "iat-noexec", "vmwatch", "no-local-read", "vsps-fill",
+        "d3d9",
     ]
 
     static var documents: URL? {

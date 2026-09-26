@@ -1998,6 +1998,21 @@ struct ContentView: View {
                 }
             }
 
+            // Native D3D9 frontend A/B. The i386 d3d9.dll a 32-bit program imports
+            // is DXMT's thin shim; with no setting its DllMain forwards every export
+            // to d3d9-emulated.dll (DXMT's D3D9 frontend running as i386 code under
+            // FEX), which is the default. "native" makes the same shim bind its unix
+            // side and run the frontend as native ARM64 code in libdxmt_combined.a.
+            // Both ship in the bundle, so the A/B is one madeira.cfg line
+            // (d3d9 = native) and a relaunch; "emulated" spells the default.
+            if let txt = MadeiraConfig.get("d3d9") {
+                let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !v.isEmpty {
+                    setenv("MADEIRA_D3D9", v, 1)
+                    logStore.log("D3D9 frontend: MADEIRA_D3D9=\(v) via madeira.cfg d3d9")
+                }
+            }
+
             // 2026-09-23: HOST FEATURES ARE PROBED, NOT ASSUMED.
             //
             // CPUFeatures.cpp (a PE module that cannot call sysctl) used to claim a
