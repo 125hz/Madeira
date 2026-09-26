@@ -34,13 +34,23 @@ git-ignored and consumed by the app project.
    `app/Madeira/lib{gmp,nettle,hogweed,gnutls}.a` (these four outputs are
    also tracked). Verified: built on the development machine; not re-run
    from a clean checkout.
+   `build/ffmpeg/build.sh`: FFmpeg 7.1.1 in an LGPL-only configuration (WMA,
+   MPEG audio and PCM decoders; mp3/wav/mov demuxers; no H.264/HEVC/AAC),
+   fetched from ffmpeg.org into `build/ffmpeg/src` and verified against the
+   SHA-256 pinned in the script -> headers in `toolchains/ffmpeg-ios/include`
+   (read by `build/ntdll-unix/build.sh` for winegstreamer's unix side) and
+   `app/Madeira/lib{avformat,avcodec,swresample,avutil}.a` (ignored; the app
+   target links them together with VideoToolbox, CoreMedia, CoreVideo,
+   AudioToolbox and CoreFoundation). The configure arguments are the ones the
+   port was built and device-tested with on the WSL toolchain; the macOS form
+   of the script is UNVERIFIED.
 2. FEX (submodule, branch ios-port-2607):
    - `FEX/build-ios`: `build/fex-ios/build.sh` (same options as the development CMakeCache) -> `FEX/build-ios/FEXCore/Source/lib{FEXCore,FEXCore_Base,JemallocLibs}.a` and the `External/{cephes,fmt,SoftFloat-3e,xxhash}` archives. UNVERIFIED from clean.
    - `FEX/build-arm64ec`: `build/fex-arm64ec/build.sh` (configures with `FEX/Data/CMake/toolchain_mingw.cmake` and the recorded options on first run, builds target `arm64ecfex`, copies `Bin/libarm64ecfex.dll` to `app/Madeira/arm64ec-windows/xtajit64.dll`). The build step was verified this session; the first-run configure in the script is reconstructed from CMakeCache and UNVERIFIED.
 3. Wine (submodule, branch madeira-lgpl):
    - unix side: `build/ntdll-unix/build.sh`, `build/wineserver/build.sh`,
      `build/win32u-unix/build.sh` -> `app/Madeira/lib{ntdll_unix,wineserver,win32u_unix}.a`. Verified on the development machine.
-   - PE side: `build/wine-pe/build-ntdll.sh` (configures `wine/build-arm64ec` with `--enable-archs=arm64ec --without-x --disable-tests` on first run, builds `dlls/ntdll`, strips, pads to SizeOfImage + 0x50000, copies to the app). Other PE modules: `make -C dlls/<name>` in that tree and copy the DLL, as the script's header says. The strip/pad step was verified this session; the configure step is UNVERIFIED from clean.
+   - PE side: `build/wine-pe/build-ntdll.sh` (configures `wine/build-arm64ec` with `--enable-archs=arm64ec --without-x --disable-tests --enable-winegstreamer` on first run, builds `dlls/ntdll`, strips, pads to SizeOfImage + 0x50000, copies to the app). Other PE modules: `make -C dlls/<name>` in that tree and copy the DLL, as the script's header says; winegstreamer (enabled by `--enable-winegstreamer` although GStreamer is absent, since its unix side is `build/ntdll-unix/winegstreamer_unixlib_ios.c`) is built as the target `dlls/winegstreamer/arm64ec-windows/winegstreamer.dll`, never with `make -C`. The strip/pad step was verified this session; the configure step is UNVERIFIED from clean.
 4. DXMT (submodule, branch ios-port):
    - unix side: `build/dxmt-ios/build.sh` (needs `toolchains/llvm-ios-build`) -> `app/Madeira/libdxmt_combined.a` (ignored; the app links it). Verified this session.
    - PE side: `meson setup research/dxmt/build-arm64ec research/dxmt -Dbuildtype=release -Dwine_build_path=../../wine/build-arm64ec --cross-file=research/dxmt/build-arm64ec-win.txt` then `ninja -C research/dxmt/build-arm64ec src/winemetal/winemetal.dll` (and d3d11.dll) -> copied to `app/Madeira/arm64ec-windows/`. Verified this session (winemetal.dll).
@@ -51,7 +61,8 @@ git-ignored and consumed by the app project.
 
 A recipient of a built package can obtain the complete corresponding
 source of every LGPL library (Wine fork, GnuTLS, Nettle, GMP) from the
-repository, and the application source and build scripts above. Whether
+repository (FFmpeg: the unmodified ffmpeg.org release that
+`build/ffmpeg/build.sh` pins by version and SHA-256), and the application source and build scripts above. Whether
 they can actually relink depends on assembling the "not in the repository"
 inputs and re-executing the UNVERIFIED steps; that end-to-end clean-machine
 rebuild, signing and installation has NOT been performed. Until it is,

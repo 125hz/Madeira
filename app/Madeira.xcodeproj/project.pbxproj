@@ -48,6 +48,15 @@
 		A1000091 /* libhogweed.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000091 /* libhogweed.a */; };
 		A1000092 /* libnettle.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000092 /* libnettle.a */; };
 		A1000093 /* libgmp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000093 /* libgmp.a */; };
+		A1000300 /* VideoToolbox.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000300 /* VideoToolbox.framework */; };
+		A1000301 /* CoreMedia.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000301 /* CoreMedia.framework */; };
+		A1000302 /* CoreVideo.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000302 /* CoreVideo.framework */; };
+		A1000303 /* AudioToolbox.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000303 /* AudioToolbox.framework */; };
+		A1000304 /* CoreFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000304 /* CoreFoundation.framework */; };
+		A1000305 /* libavformat.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000305 /* libavformat.a */; };
+		A1000306 /* libavcodec.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000306 /* libavcodec.a */; };
+		A1000307 /* libswresample.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000307 /* libswresample.a */; };
+		A1000308 /* libavutil.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000308 /* libavutil.a */; };
 		A1000094 /* cacert.pem in Resources */ = {isa = PBXBuildFile; fileRef = A2000094 /* cacert.pem */; };
 		A10000D1 /* d3d12 in Resources */ = {isa = PBXBuildFile; fileRef = A20000D1 /* d3d12 */; };
 		A10000D2 /* licenses in Resources */ = {isa = PBXBuildFile; fileRef = A20000D2 /* licenses */; };
@@ -113,6 +122,15 @@
 		A2000091 /* libhogweed.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libhogweed.a; sourceTree = "<group>"; };
 		A2000092 /* libnettle.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libnettle.a; sourceTree = "<group>"; };
 		A2000093 /* libgmp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libgmp.a; sourceTree = "<group>"; };
+		A2000300 /* VideoToolbox.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = VideoToolbox.framework; path = System/Library/Frameworks/VideoToolbox.framework; sourceTree = SDKROOT; };
+		A2000301 /* CoreMedia.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreMedia.framework; path = System/Library/Frameworks/CoreMedia.framework; sourceTree = SDKROOT; };
+		A2000302 /* CoreVideo.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreVideo.framework; path = System/Library/Frameworks/CoreVideo.framework; sourceTree = SDKROOT; };
+		A2000303 /* AudioToolbox.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AudioToolbox.framework; path = System/Library/Frameworks/AudioToolbox.framework; sourceTree = SDKROOT; };
+		A2000304 /* CoreFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreFoundation.framework; path = System/Library/Frameworks/CoreFoundation.framework; sourceTree = SDKROOT; };
+		A2000305 /* libavformat.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libavformat.a; sourceTree = "<group>"; };
+		A2000306 /* libavcodec.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libavcodec.a; sourceTree = "<group>"; };
+		A2000307 /* libswresample.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libswresample.a; sourceTree = "<group>"; };
+		A2000308 /* libavutil.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libavutil.a; sourceTree = "<group>"; };
 		A2000094 /* cacert.pem */ = {isa = PBXFileReference; lastKnownFileType = text; path = cacert.pem; sourceTree = "<group>"; };
 		A20000D1 /* d3d12 */ = {isa = PBXFileReference; lastKnownFileType = folder; path = d3d12; sourceTree = "<group>"; };
 		A20000D2 /* licenses */ = {isa = PBXFileReference; lastKnownFileType = folder; path = licenses; sourceTree = "<group>"; };
@@ -152,6 +170,15 @@
 				A1000091 /* libhogweed.a in Frameworks */,
 				A1000092 /* libnettle.a in Frameworks */,
 				A1000093 /* libgmp.a in Frameworks */,
+				A1000300 /* VideoToolbox.framework in Frameworks */,
+				A1000301 /* CoreMedia.framework in Frameworks */,
+				A1000302 /* CoreVideo.framework in Frameworks */,
+				A1000303 /* AudioToolbox.framework in Frameworks */,
+				A1000304 /* CoreFoundation.framework in Frameworks */,
+				A1000305 /* libavformat.a in Frameworks */,
+				A1000306 /* libavcodec.a in Frameworks */,
+				A1000307 /* libswresample.a in Frameworks */,
+				A1000308 /* libavutil.a in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -246,6 +273,15 @@
 				A2000091 /* libhogweed.a */,
 				A2000092 /* libnettle.a */,
 				A2000093 /* libgmp.a */,
+				A2000300 /* VideoToolbox.framework */,
+				A2000301 /* CoreMedia.framework */,
+				A2000302 /* CoreVideo.framework */,
+				A2000303 /* AudioToolbox.framework */,
+				A2000304 /* CoreFoundation.framework */,
+				A2000305 /* libavformat.a */,
+				A2000306 /* libavcodec.a */,
+				A2000307 /* libswresample.a */,
+				A2000308 /* libavutil.a */,
 			);
 			name = Libraries;
 			sourceTree = "<group>";
