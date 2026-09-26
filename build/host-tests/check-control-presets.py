@@ -8,7 +8,7 @@ controller layout on phone and tablet screens, built-ins read-only, "Custom
 Layout N" naming, encode/decode and what loading a layout puts on screen.
 
 Part B checks the UI wiring in the same files: kill switches, the write-back
-on the end of an edit and the default for new users only.
+on the end of an edit, the default for new users only, and the session slot.
 Set SWIFTC if Swift is not on PATH.
 """
 from pathlib import Path
@@ -169,7 +169,7 @@ def function(source, start):
 
 gamepad = (app / 'GamepadInput.swift').read_text()
 for flag, where in (('MADEIRA_CONTROL_PRESETS', presets), ('MADEIRA_CONTROLS_XBOX_DEFAULT', presets),
-                    ('MADEIRA_CONTROLS_EDITOR_DONE', content)):
+                    ('MADEIRA_CONTROLS_EDITOR_DONE', content), ('MADEIRA_PAD_EARLY_SLOT', gamepad)):
     assert f'.flag("{flag}")' in where, flag + ' is a kill switch'
 assert '!= "0"' in function(gamepad, 'static func flag('), 'only "0" disables'
 
@@ -189,4 +189,8 @@ assert 'TouchControlsOverlay.showsLayoutMenu(self) ? 3 : 2' in model, 'the menu 
 window = function(content, 'final class ControlsWindow: UIWindow {')
 assert window.index('if m.editing {') < window.index('!hit.isDescendant(of: root)') \
     < window.index('guard m.hitsInteractive('), 'menu and dialog presentations take their touches in play mode'
-print('PASS: switches, edit write-back, new-user default and layout menu wiring')
+reserve = function(gamepad, '@MainActor func reserveSessionSlot(touchControls: Bool) {')
+assert reserve.index('guard Self.enabled, Self.flag("MADEIRA_PAD_EARLY_SLOT")') < reserve.index('touchState.reserved = true')
+run = function(content, 'private func runWineFullSequence() {')
+assert run.index('GamepadInput.shared.reserveSessionSlot(') < run.index('DispatchQueue.global'), 'reserved before Wine starts'
+print('PASS: switches, edit write-back, new-user default, layout menu and session slot wiring')

@@ -1819,6 +1819,8 @@ struct ContentView: View {
         /* ml1095: one config file. Written once from any legacy madeira-*.txt. */
         MadeiraConfig.migrateLegacy { self.logStore.log($0) }
         MadeiraConfig.deleteLegacyFiles { self.logStore.log($0) }   /* ml1096: the old files go once the cfg exists */
+        /* ml1990: player 1 exists before the game enumerates XInput. */
+        GamepadInput.shared.reserveSessionSlot(touchControls: TouchControlsModel.shared.offersControllerInput)
         if MadeiraConfig.present {
             let cfg = MadeiraConfig.all().sorted { $0.key < $1.key }
             logStore.log("madeira.cfg: " + (cfg.isEmpty ? "(empty)" : cfg.map { "\($0.key)=\($0.value)" }.joined(separator: " ")))
@@ -2730,6 +2732,13 @@ final class TouchControlsModel: ObservableObject {
         guard let d = try? JSONEncoder().encode(Saved(controls: controls, visible: visible, layout: layoutID))
         else { return }
         try? d.write(to: Self.url, options: .atomic)
+    }
+
+    /// ml1990: touch controls will feed player 1 this session (visible
+    /// controller mappings, or the controller layout a new user is about to get).
+    var offersControllerInput: Bool {
+        visible && (controls.contains { $0.action.padName.map(TouchPadAction.supported) ?? false }
+                    || ControlPresetsModel.shared.defaultPending)
     }
 
     func index(of id: UUID?) -> Int? {
