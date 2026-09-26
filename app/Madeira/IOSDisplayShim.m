@@ -95,6 +95,27 @@ void winios_display_mode_changed(int w, int h) {
     });
 }
 
+// --- DXMT display-rate hook -----------------------------------------------
+//
+// DXMT from willfaust/dxmt#1 on defines madeira_set_display_max_fps() (the
+// panel and intent rates for its [frame] line) together with the 30 FPS cap
+// (vsync mode 3). main's DXMT has neither. This weak no-op definition keeps
+// the app linking against either: when DXMT's strong definition is linked it
+// replaces this one, and this one never runs. When it does run, DXMT lacks the
+// 30 FPS cap too (mode 3 would present uncapped), so the front end hides it.
+
+static volatile int g_dxmt_display_pacing_missing;
+
+__attribute__((weak)) void madeira_set_display_max_fps(int panel_hz, int intent_hz) {
+    (void)panel_hz;
+    (void)intent_hz;
+    g_dxmt_display_pacing_missing = 1;
+}
+
+int madeira_dxmt_has_display_pacing(void) {
+    return !g_dxmt_display_pacing_missing;
+}
+
 // --- macdrv_* implementations ---
 
 // DXMT only dereferences client_cocoa_view (passing it straight back to
