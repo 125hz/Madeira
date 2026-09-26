@@ -5115,6 +5115,22 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
         o->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_2;
         o->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_2;   /* heaps here are descriptions; any mix is fine */
         o->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation = TRUE;
+        /* ml1970: FORMAT_SUPPORT below already reports UAV_TYPED_LOAD for every
+         * uncompressed colour format (Metal read-write textures), so the device
+         * option must agree. Leaving it FALSE made an engine that requires it
+         * reject the device before creating anything, then exhaust its other
+         * renderers. MADEIRA_D3D12_TYPED_UAV_LOAD=0 reports FALSE again. */
+        {
+            static int typed = -1;
+            if (typed < 0) {
+                char v[4] = {0};
+                DWORD n = GetEnvironmentVariableA("MADEIRA_D3D12_TYPED_UAV_LOAD", v, sizeof v);
+                typed = !(n == 1 && v[0] == '0');
+                OutputDebugStringA(typed ? "[d3d12-caps] ml1970 typed-uav-load-additional=1\n"
+                                         : "[d3d12-caps] ml1970 typed-uav-load-additional=0 (rollback)\n");
+            }
+            o->TypedUAVLoadAdditionalFormats = typed ? TRUE : FALSE;
+        }
         return S_OK;
     }
     case D3D12_FEATURE_ARCHITECTURE: {
