@@ -8672,6 +8672,13 @@ extern ULONG_PTR ios_gamepad_query( UINT index, UINT op, void *buffer );
 /***********************************************************************
  *	     NtUserCallTwoParam    (win32u.@)
  */
+/* ml668: the gamepad slot reader, in build/win32u-unix/driver_ios.c (same
+ * unix library). Declared rather than headered for the same reason every other
+ * winios bridge symbol in that file is. */
+#ifdef WINE_IOS
+extern ULONG_PTR ios_gamepad_query( UINT index, UINT op, void *buffer );
+#endif
+
 ULONG_PTR WINAPI NtUserCallTwoParam( ULONG_PTR arg1, ULONG_PTR arg2, ULONG code )
 {
     switch(code)

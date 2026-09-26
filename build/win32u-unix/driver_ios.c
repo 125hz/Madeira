@@ -2780,3 +2780,4 @@ struct client_surface *nulldrv_client_surface_create( HWND hwnd )
 {
     return client_surface_create( sizeof(struct client_surface), &nulldrv_surface_funcs, hwnd );
 }
+
