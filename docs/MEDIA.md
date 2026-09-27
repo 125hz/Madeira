@@ -54,7 +54,7 @@ Environment variables (`env.NAME = value` in `madeira.cfg`):
 | `MADEIRA_WG_PARSER` | on | `0`: `wg_parser_create` returns `STATUS_NOT_IMPLEMENTED` again, as before this series; quartz and the MF source then fail the way they did. The WMA decoder is unaffected. |
 | `MADEIRA_WG_VIDEO` | on | `0`: MP3/WAV only; an MP4/MOV is refused at connect. |
 | `MADEIRA_WG_VIDEO_FORMAT` | `nv12` | Native format a video stream reports: `nv12`, `i420`, `yv12`, `yuy2`, `rgb32`, `argb32` or `abgr32`. |
-| `MADEIRA_WMA_SEARCH` | on | `0`: keep the WMA decoder at the bit rate it opened with; no fallback to other candidate rates when a stream fails before producing output. (An xWMA stream still opens at the rate libavformat's xWMA table normalises to.) |
+| `MADEIRA_WMA_SEARCH` | on | `0`: keep the WMA v1/v2 decoder at the bit rate and flags it opened with; no search over other candidates when a bit-reservoir stream fails. A packet that fails is concealed with silence of its length and the next one is decoded as usual. (An xWMA stream still opens at the rate libavformat's xWMA table normalises to.) |
 | `MADEIRA_WMA_DUMP` | off | Set: write each WMA decoder's input to `wma-dump-<n>.bin` in the Documents folder, for reproducing a decode failure on a host. |
 
 Log tags: `[wma]` for the decoder, `[wg-parser]` for the parser; both are
@@ -67,6 +67,16 @@ rate-limited per process (`MADEIRA_DIAG=1` lifts the `[wma]` cap).
   builds a host FFmpeg from the same tarball and runs the parser core under
   ASan/UBSan against MP3, MPEG layer II, WAV and synthetic MP4 (stub video and
   AAC backends).
+- `build/host-tests/check-wma-decoder.py` (Linux or macOS, needs a configured
+  Wine tree for the generated headers): compiles the production
+  `winegstreamer_unixlib_ios.c` under ASan/UBSan against a host FFmpeg built
+  from the tracked tarball, encodes WMA v1 and v2 streams (a 440 Hz tone) with
+  FFmpeg's own encoders at several rates and channel counts, drives them
+  through the `wg_transform` entries the way `wma_decoder.c` does, to s16 and
+  to float, with the parameter search on and off, and requires audio with the
+  right level and fundamental back. Also checks that 64-bit callers keep the
+  stub table by default. Bit-reservoir (superframe) streams are not covered:
+  FFmpeg cannot encode them.
 - `build/x86-tests/wma-x86.c` (`build-wma-test.sh`): a 32-bit program that
   reaches the WMA decoder exactly as FAudio does and checks that the decoded
   PCM has the 440 Hz fundamental it was encoded from. Exit 62 pass, 63 decode
