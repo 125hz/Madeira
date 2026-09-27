@@ -94,6 +94,24 @@ extern int ios_wow_in_window( const void *addr );
  * address truncated unchanged when the caller has no window.  NULL stays 0. */
 extern ULONG ios_wow_guest_addr( const void *host );
 
+/* Map a read-only second view of KUSER_SHARED_DATA at host B + 0x7ffe0000,
+ * i.e. at guest 0x7ffe0000.  No-op outside a window. */
+extern void ios_wow_map_user_shared_data(void);
+
+/* Hold guest 0x7ffe0000 from before the first TEB block is reserved until the
+ * real KUSER_SHARED_DATA view replaces it; otherwise the MEM_TOP_DOWN search
+ * for the TEB block takes that address and every 32-bit tick read in the
+ * process is frozen. */
+extern void ios_wow_reserve_usd_slot( ULONG_PTR base );
+extern void ios_wow_release_usd_slot(void);
+
+/* Convert the PEB64 pointer fields that the 32-bit ntdll writes itself with
+ * the classic WoW64 identity (`peb64->X = PtrToUlong( guest_ptr )`) into HOST
+ * pointers for the native readers of those fields.  Exact test: nothing is
+ * mapped below iOS's 4 GB __PAGEZERO, so a non-zero sub-4 GB value is a guest
+ * address.  Idempotent; no-op without a window.  Implemented in env_ios.c. */
+extern void ios_wow_fixup_peb64_ptrs(void);
+
 /* A pointer EMBEDDED in a 32-bit unix-call argument block is a GUEST address:
  * the WoW64 module converts only the OUTER `args` pointer.  ios_wow_host_ptr()
  * is the +B conversion for those, NULL-preserving; ios_wow_guest_ptr32() writes

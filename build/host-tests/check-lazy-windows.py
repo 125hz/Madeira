@@ -24,6 +24,11 @@ src = (root / "build/ntdll-unix/virtual_ios.c").read_text()
 a = src.index("/* ==== WoW64 guest windows: registry and placement ==== */")
 b = src.index("/* ==== end of WoW64 guest windows ==== */")
 block = src[a:b]
+# the 32-bit image-ceiling policy lives in the same block but needs Wine's image types
+if " *           ios_laa_forced / ios_wow_ceiling_for_charact" in block:
+    la = block.index("/***********************************************************************\n *           ios_laa_forced")
+    lb = block.index("/* Clamp [*start, *end) off the reserved slot [wb, we).")
+    block = block[:la] + block[lb:]
 
 # ---- call-site invariants
 init = src[src.index("void virtual_init(void)\n{"):]
@@ -112,6 +117,7 @@ static void ios_va_describe_range( void *addr, ULONG_PTR len, char *buf, size_t 
 static void *ios_jit_current_peb( void ) { return NULL; }
 """ + block + r"""
 static int teardowns;
+int ios_thread_registry_range_busy( uintptr_t base, uintptr_t size ) { (void)base; (void)size; return 0; }
 static int ios_wow_window_teardown( ULONG_PTR base, void *dead_peb, unsigned guard_owned )
 { (void)base; (void)dead_peb; (void)guard_owned; teardowns++; return 1; }
 
