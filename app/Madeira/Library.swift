@@ -181,6 +181,10 @@ struct LibraryEntry: Codable, Identifiable {
     var overlayFields: [String]?
     /// The Wine desktop (explorer and services in a virtual desktop).
     var desktop: Bool?
+    /// Touch controls' opacity (0.15...1, nil = 0.7) and overall size (0.5...2,
+    /// nil = 1) in this game's sessions.
+    var controlOpacity: Double?
+    var controlSize: Double?
 
     var displayMode: DisplayMode { display.flatMap(DisplayMode.init(rawValue:)) ?? .fit }
 
@@ -253,6 +257,8 @@ final class LibraryModel: ObservableObject {
     @Published var performance = false
     @Published var liveLogs = false
     @Published var fpsMode = 1
+    /// The session's touch-control opacity (the entry's Control opacity).
+    @Published var opacity = 0.7
     /// The session's Aspect & scaling; MetalBackedView lays the game out with it.
     @Published var displayMode = DisplayMode.fit {
         didSet { if displayMode != oldValue { MetalBackedView.refreshDisplayMode(reason: "mode-toggle") } }
@@ -291,6 +297,7 @@ final class LibraryModel: ObservableObject {
     private var metadataInFlight = Set<UUID>()
     private var savedControls: [TouchControl] = []
     private var savedVisible = true
+    private var savedSize = 1.0
     /// The session's first frame makes the drawable's shape known (Aspect).
     private var laidOutAfterFirstPresent = false
     private struct Document: Codable { var version: Int; var entries: [LibraryEntry] }
@@ -486,10 +493,12 @@ final class LibraryModel: ObservableObject {
         activeEntry = entry; current = entry.id; menu = false; performance = entry.performance; liveLogs = entry.liveLogs
         LogStore.shared.setDisplayActive(entry.liveLogs)
         fpsMode = entry.fpsMode; sessionMessage = "Starting…"
+        opacity = min(max(entry.controlOpacity ?? 0.7, 0.15), 1)
         let controls = TouchControlsModel.shared
-        savedControls = controls.controls; savedVisible = controls.visible
+        savedControls = controls.controls; savedVisible = controls.visible; savedSize = controls.sizeScale
         if let profile = entry.controls { controls.controls = profile }
         controls.visible = entry.touchControls
+        controls.sizeScale = min(max(entry.controlSize ?? 1, 0.5), 2)
         MetalHostView.shared.isHidden = false
         ProMotionIntent.apply(mode: entry.effectiveFPSMode)
         var played = entry; played.lastPlayed = Date()
@@ -568,6 +577,7 @@ final class LibraryModel: ObservableObject {
             entry.touchControls = controls.visible
             entry.fpsMode = fpsMode; entry.performance = performance
             entry.overlayFields = overlayFields
+            entry.controlOpacity = opacity; entry.controlSize = controls.sizeScale
             // The in-game Aspect & scaling choice sticks to the game. MADEIRA_SESSION_TOOLS=0
             // hides that picker and leaves the stored choice alone.
             if MadeiraConfig.flag("MADEIRA_SESSION_TOOLS") { entry.display = displayMode.rawValue }
@@ -580,7 +590,7 @@ final class LibraryModel: ObservableObject {
         saveCurrentProfile()
         let controls = TouchControlsModel.shared
         controls.editing = false; controls.selected = nil
-        controls.controls = savedControls; controls.visible = savedVisible
+        controls.controls = savedControls; controls.visible = savedVisible; controls.sizeScale = savedSize
         current = nil; activeEntry = nil; menu = false; sessionMessage = ""
         displayMode = .fit
         LogStore.shared.setDisplayActive(true)
@@ -1199,6 +1209,12 @@ struct LibraryDetail: View {
                     Toggle("Performance overlay", isOn: $entry.performance)
                     Toggle("Live logs", isOn: $entry.liveLogs)
                     Toggle("Touch controls", isOn: $entry.touchControls)
+                    LabeledContent("Control opacity") {
+                        Slider(value: Binding(get: { entry.controlOpacity ?? 0.7 }, set: { entry.controlOpacity = $0 }), in: 0.15...1)
+                    }
+                    LabeledContent("Control size") {
+                        Slider(value: Binding(get: { entry.controlSize ?? 1 }, set: { entry.controlSize = $0 }), in: 0.5...2)
+                    }
                     Text("Arrange buttons and choose XInput, mouse, or keyboard actions from the in-game menu.").font(.caption).foregroundStyle(.secondary)
                 }
                 if entry.desktop != true {
@@ -1457,6 +1473,8 @@ struct LibraryHUD: View {
                 HStack { Label("Session", systemImage: "gamecontroller.fill").font(.title2.bold()); Spacer(); Button("Done") { model.menu = false }.buttonStyle(.bordered) }
                 // The controls come first, the easiest to reach; the overlay settings last.
                 Toggle("Touch controls", isOn: $controls.visible)
+                LabeledContent("Opacity") { Slider(value: $model.opacity, in: 0.15...1) }
+                LabeledContent("Size") { Slider(value: $controls.sizeScale, in: 0.5...2) }
                 Button("Edit controls", systemImage: "slider.horizontal.3") { controls.visible = true; controls.editing = true; model.menu = false }
                 Button("Keyboard", systemImage: "keyboard") { model.menu = false; LibraryKeyboard.show() }
                 Divider()
