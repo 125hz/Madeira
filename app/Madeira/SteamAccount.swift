@@ -240,7 +240,11 @@ final class SteamAccountModel: ObservableObject {
     /// ml1830: stop native activity before giving the same login to Valve's
     /// guest client. The token is read from Keychain only after quiescing.
     func prepareDock(_ entry: LibraryEntry) async throws {
-        guard Self.enabled, phase == .signedIn, !inSession, let appID = entry.steamAppID else {
+        // ml2011: the standalone sign-in (SteamSignIn, Keychain-only) is preferred when it holds
+        // a token; otherwise the earlier native sign-in is used. MADEIRA_DOCK_SIGNIN_V2=0 keeps
+        // the earlier path only.
+        let signIn = LibraryFlags.enabled("MADEIRA_DOCK_SIGNIN_V2") ? SteamSignIn.credentialsForDock() : nil
+        guard Self.enabled, signIn != nil || phase == .signedIn, !inSession, let appID = entry.steamAppID else {
             throw LibraryError.message("Sign in to Steam in Madeira before starting Dock.")
         }
         try MadeiraDock.validate(entry)
@@ -250,11 +254,16 @@ final class SteamAccountModel: ObservableObject {
             await holdForSteamInstall()
             await session.disconnectGracefully()
             try Task.checkCancellation()
-            guard phase == .signedIn, let tokens = session.tokenStore.loadTokens() else {
-                throw LibraryError.message("Steam sign-in is no longer available. Sign in again.")
+            if let signIn {
+                try MadeiraDock.writeHandoff(account: signIn.accountName, token: signIn.refreshToken, appID: appID)
+                SteamLog.event("[madeira-dock] ml2011 one-use sign-in ready (standalone sign-in)")
+            } else {
+                guard phase == .signedIn, let tokens = session.tokenStore.loadTokens() else {
+                    throw LibraryError.message("Steam sign-in is no longer available. Sign in again.")
+                }
+                try MadeiraDock.writeHandoff(account: tokens.accountName, token: tokens.refreshToken, appID: appID)
+                SteamLog.event("[madeira-dock] ml1830 native connection closed; one-use sign-in ready")
             }
-            try MadeiraDock.writeHandoff(account: tokens.accountName, token: tokens.refreshToken, appID: appID)
-            SteamLog.event("[madeira-dock] ml1830 native connection closed; one-use sign-in ready")
         } catch {
             sessionChanged(active: false)
             throw error

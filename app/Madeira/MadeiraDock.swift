@@ -40,7 +40,10 @@ enum MadeiraDock {
         enabled && LibraryFlags.enabled("MADEIRA_DOCK_NATIVE_SETUP", fallback: true)
     }
     static let executable = "C:\\windows\\system32\\dockhost.exe"
-    static func routes(_ entry: LibraryEntry) -> Bool { enabled && entry.steamGameLaunch && entry.steamDesktopLaunch != true }
+    // ml2010: a stored "Steam (more usage)" choice starts with Dock while regular Steam is deferred.
+    static func routes(_ entry: LibraryEntry) -> Bool {
+        enabled && entry.steamGameLaunch && (entry.steamDesktopLaunch != true || !LibraryFlags.enabled("MADEIRA_STEAM_CLIENT_OPTIONS", fallback: false))
+    }
     /// ml1970: a batch of the game's pending one-time installs (DockInstallScripts), run in the
     /// Dock session before the host. Set on the main actor before launch, read by the launch worker.
     nonisolated(unsafe) static var installerScript: String?

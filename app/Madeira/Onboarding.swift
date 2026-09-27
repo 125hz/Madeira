@@ -739,10 +739,17 @@ struct OnboardingFinishButton: View {
 /// Valve's client components are present; regular Steam needs the desktop client.
 enum SteamStartMode: Hashable { case dock, game, steam }
 
+/// ml2010: the regular Windows Steam client (Settings entry and "Steam (more usage)") is
+/// deferred to a later release; Madeira Dock starts Steam games. Greyed out by default;
+/// MADEIRA_STEAM_CLIENT_OPTIONS=1 enables both again.
+enum SteamClientOptions {
+    static var enabled: Bool { LibraryFlags.enabled("MADEIRA_STEAM_CLIENT_OPTIONS", fallback: false) }
+}
+
 extension LibraryEntry {
     @MainActor var steamStartMode: SteamStartMode {
         guard startsWithClient else { return .game }
-        return MadeiraDock.enabled && steamDesktopLaunch != true ? .dock : .steam
+        return MadeiraDock.enabled && (steamDesktopLaunch != true || !LibraryFlags.enabled("MADEIRA_STEAM_CLIENT_OPTIONS", fallback: false)) ? .dock : .steam
     }
     mutating func setSteamStartMode(_ mode: SteamStartMode) {
         switch mode {

@@ -416,3 +416,15 @@ Total: about **1.5–3 weeks** of preparation plus review latency. Upstream has 
 - **Device baseline:** ml1620 (pre-merge) installed and signed in to the Steam client on the A16 iPad as well as the iPhone. Any regression in Steam setup on ml1630 is therefore the merge.
 - **Host tests:** all 42 `build/host-tests/check-*.py` suites pass on the merged tree.
 - **Open:** `libmetalirconverter.dylib` signing under xtool (only the D3D12 path dlopens it); `madeira_d3d12.dll` is upstream's prebuilt copy until `build/madeira-d3d12/build-pe.sh` is pointed at `.xtool/toolchains/llvm-mingw`; device checkpoints (Steam client setup on iPhone and iPad, a D3D9/D3D11 title, a 32-bit title, then an upstream D3D12 title).
+
+### Status 2026-09-26: PRs 1-3 opened
+
+Opened by the owner's go: willfaust/Madeira#26 (PR 1 core + 32-bit), #27 (PR 2 D3D9), #28 (optional binaries), #29 (PR 3 controllers); companions willfaust/rpmalloc#1, willfaust/FEX#1, willfaust/wine#2 (PR 1) and #3 (PR 3 dinput), willfaust/dxmt#1 (PR 1) and #2 (PR 2). Heads are the 125hz `pr/*` branches; worktrees in `../pr-work/`. Merge order: rpmalloc before FEX (FEX pins rpmalloc 2aa52c0). Fork integration branch with upstream 8c050d0: `integration/upstream-0926` (Madeira, wine).
+
+### Status 2026-09-26 (second batch): series complete
+
+Opened: willfaust/Madeira#32 (PR 8 D3D12, on main), #33 (PR 7 media, on #26) + willfaust/wine#4, #34 (PR 4 front end, on #26), #35 (PR 5 Steam, on #34) + willfaust/wine#5, #36 (PR 6 Madeira Dock adapter + separately licensed dockhost.exe, on #35). PRs 9-12 of the plan were folded into #26/FEX#1/wine#2/dxmt#1 (PR 1 carried the whole core). Open questions for Will: FEX AI policy, LGPL D3D9 import, dxmt copyright lines, madsync default, Jfishin licence for SwiftSteam, proprietary Dock EXE (or download on first use).
+
+### Status 2026-09-26 (audit fixes)
+
+After a user found missing options: #34 restored per-game Resolution/Aspect & scaling/touch mode/control opacity+size/D3D9 anisotropy; #26 gained ~20 host tests, the madeira-env.txt merge fix and the fork JIT-pool sizing; #27 the D3D9 notice + BCn test; #28 all 68 NLS code pages; #35/#36 the Steam/Dock pool rules. New: #37 hardware keyboard/mouse (pointer lock, sensitivity, right-stick mouse, nav-key E0 fix), #38 optional extra binaries (276 DLLs). Audit: scratchpad audit/pr-omissions.md; no runtime code was missing.

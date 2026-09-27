@@ -181,7 +181,7 @@ with tempfile.TemporaryDirectory(prefix='madeira-ml1970-') as td:
 lib = (app / 'Library.swift').read_text()
 cv = (app / 'ContentView.swift').read_text()
 dock = (app / 'MadeiraDock.swift').read_text()
-assert 'entry.steamGameLaunch && entry.steamDesktopLaunch != true' in dock, 'regular Steam choice bypasses Dock'
+assert 'entry.steamGameLaunch && (entry.steamDesktopLaunch != true || !LibraryFlags.enabled("MADEIRA_STEAM_CLIENT_OPTIONS", fallback: false))' in dock, 'regular Steam choice bypasses Dock'  # ml2010: deferred regular Steam routes through Dock
 assert 'cmd.exe /c call \\(script) & \\"\\(MadeiraDock.executable)\\"' in lib, 'installers run before the host, same session'
 assert 'LibraryModel.prepareDockInstallers(entry)' in cv and 'MADEIRA_DOCK_INSTALLERS' in cv
 assert '"ml1970"' in dock and '"launch-update-wait"' in dock, 'Dock content-wait report fields accepted'

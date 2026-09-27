@@ -187,12 +187,11 @@ used for local research. Both are gitignored, untracked, and no part of them is
 linked into or shipped with the app. They form no part of the combined work.
 # Madeira Dock executable
 
-The optional `arm64ec-windows/dockhost.exe` is a separately built proprietary
-Madeira Dock release, copyright (c) 2026 125hz. Its license permits distribution
-of unmodified executable releases with Madeira. Its source is maintained in a
-private repository and is not part of this source distribution.
+The optional `arm64ec-windows/dockhost.exe` is built from Madeira Dock,
+copyright (c) 2026 125hz, licensed GPL-3.0-or-later with the Madeira Converter
+Exception. Its source is published at https://github.com/125hz/madeira-dock.
 
 `arm64ec-windows/dock-notices.txt` accompanies the executable and contains its
-binary license plus the LLVM and MinGW-w64 runtime notices. Dock includes no
+license (GPL-3.0-or-later, the exception) plus the LLVM and MinGW-w64 runtime notices. Dock includes no
 Valve client files, game content or developer login. Users install official
 Steam files and authenticate their own account at runtime.

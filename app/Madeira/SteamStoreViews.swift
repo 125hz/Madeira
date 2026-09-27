@@ -447,6 +447,7 @@ struct SteamSettingsSection: View {
     var signIn: () -> Void
     var openClient: () -> Void
     @State private var confirmSignOut = false
+    @State private var showDockSignIn = false   // ml2011
     var body: some View {
         Section {
             if steam.phase == .signedIn {
@@ -467,12 +468,25 @@ struct SteamSettingsSection: View {
             } else {
                 Button(action: signIn) { Label("Sign in to Steam", systemImage: "person.crop.circle.badge.plus") }
             }
+            // ml2010: the regular Windows Steam client is deferred to a later release; Madeira
+            // Dock starts Steam games. MADEIRA_STEAM_CLIENT_OPTIONS=1 enables the entry again.
+            // ml2011: the standalone Steam sign-in Madeira Dock uses (MADEIRA_DOCK_SIGNIN_V2=0 hides it).
+            if LibraryFlags.enabled("MADEIRA_DOCK_SIGNIN_V2") {
+                Button { showDockSignIn = true } label: {
+                    Label(SteamSignIn.isSignedIn ? "Madeira Dock sign-in: \(SteamSignIn.accountName ?? "signed in")" : "Sign in for Madeira Dock (new)…",
+                          systemImage: "key")
+                }
+            }
             Button(action: openClient) { Label("Windows Steam client…", systemImage: "desktopcomputer") }
+                .disabled(!SteamClientOptions.enabled)
         } header: {
             Text("Steam")
         } footer: {
-            Text("Madeira keeps a Steam sign-in token in this device's Keychain. Signing out removes it; installed games stay on this device. The Windows Steam client is optional and only needed for games that require Steam to be running.")
+            Text(SteamClientOptions.enabled
+                 ? "Madeira keeps a Steam sign-in token in this device's Keychain. Signing out removes it; installed games stay on this device. The Windows Steam client is optional and only needed for games that require Steam to be running."
+                 : "Madeira keeps a Steam sign-in token in this device's Keychain. Signing out removes it; installed games stay on this device. Steam games start with Madeira Dock; the regular Windows Steam client comes in a later release.")
         }
+        .sheet(isPresented: $showDockSignIn) { SteamSignInView() }
         .confirmationDialog("Sign out of Steam? Installed games stay on this device.", isPresented: $confirmSignOut, titleVisibility: .visible) {
             Button("Sign out", role: .destructive) { steam.signOut() }
         }
@@ -496,7 +510,9 @@ struct SteamEntrySection: View {
             // ml1970: Madeira Dock (the default), the game alone, or regular Steam, which is only
             // selectable while the regular desktop client is installed.
             let dock = MadeiraDock.enabled
-            let steamReady = dock ? client.snapshot.desktopClient : client.snapshot.client != nil
+            // ml2010: regular Steam is deferred to a later release (MADEIRA_STEAM_CLIENT_OPTIONS=1).
+            let steamReady = SteamClientOptions.enabled
+                && (dock ? client.snapshot.desktopClient : client.snapshot.client != nil)
             Picker("Start with", selection: Binding(get: { entry.steamStartMode }, set: { mode in
                 guard mode != .steam || steamReady else { return }
                 entry.setSteamStartMode(mode)
@@ -511,11 +527,15 @@ struct SteamEntrySection: View {
                 Text("Madeira Dock needs Steam's client components. Run setup again from Settings to prepare them.")
                     .font(.caption).foregroundStyle(.orange)
             case .steam where !steamReady:
-                Text("Install regular Steam from Settings › Windows Steam client first, then sign in to it with the same account.")
+                Text(SteamClientOptions.enabled
+                     ? "Install regular Steam from Settings › Windows Steam client first, then sign in to it with the same account."
+                     : "Starting through regular Steam comes in a later release. Choose Madeira Dock or The game.")
                     .font(.caption).foregroundStyle(.orange)
             default:
                 if dock && !steamReady {
-                    Text("Steam (more usage) needs regular Steam, installed from Settings › Windows Steam client.")
+                    Text(SteamClientOptions.enabled
+                         ? "Steam (more usage) needs regular Steam, installed from Settings › Windows Steam client."
+                         : "Steam (more usage) comes in a later release.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }

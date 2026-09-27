@@ -57,9 +57,10 @@ entries added/removed. Dock's hash is unchanged. Existing compiler warnings
 remain. Reports: .xtool/logs/ml1900-verified.json and ml1900-build.log;
 verifier: .xtool/verify-ml1900.py. No commit/push or private source changes.
 
-Dock is a separately built, proprietary executable hosted in the private
-`125hz/madeira-dock` repository. Its source must never enter this public app's
-working tree or Git history. The public integration consists of
+Dock is a separately built executable whose source is in the
+`125hz/madeira-dock` repository. On 2026-09-27 the owner decided to open-source
+it (GPL-3.0-or-later with the Madeira Converter Exception); it may now move into
+this repository. The public integration consists of
 `MadeiraDock.swift`, onboarding/session routing and the stripped `dockhost.exe`.
 The bundled `dock-notices.txt` contains its binary redistribution license and
 runtime notices. No developer account or cached Steam login is bundled.
@@ -340,11 +341,10 @@ app start. The first trial remains off by default pending device results.
 
 ## Source separation
 
-The app's Git hooks reject private host paths and private source markers,
-including source present in earlier commits of a push. They are a guard
-against mistakes, not a substitute for reviewing staged files. Only a verified
-private destination may receive Dock source. Repository privacy restricts
-source access; executable distribution does not prevent reverse engineering.
+Historical (before 2026-09-27): the app's Git hooks rejected private host paths
+and private source markers. With Dock open-sourced, those hook checks (and the
+`MADEIRA_DOCK_PRIVATE_SOURCE` marker they look for) must be removed or relaxed
+before Dock source is committed here.
 
 ## Previous verified build (ml1830; superseded)
 

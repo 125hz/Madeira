@@ -8,10 +8,11 @@ Madeira combines [Wine](https://www.winehq.org/) (ARM64EC),
 Mach process on iOS with wineserver as a thread rather than a separate process.
 
 This fork also has an opt-in [Madeira Dock trial](docs/MADEIRA_DOCK.md): a
-separately built, closed-source headless host for Valve's genuine Steam client.
+separately built, open-source (GPL-3.0-or-later) headless host for Valve's genuine Steam client
+([125hz/madeira-dock](https://github.com/125hz/madeira-dock)).
 It preserves real authentication, ownership checks and original game DRM.
-Dock source stays private; only its executable, notices and public app adapter
-are included here. Windows startup has been tested; the new iOS path awaits
+Madeira Dock is being open-sourced (owner decision 2026-09-27: GPL-3.0-or-later with the Madeira Converter Exception);
+its source is in `125hz/madeira-dock` until it moves into this repository. Windows startup has been tested; the new iOS path awaits
 device validation.
 
 ## Status

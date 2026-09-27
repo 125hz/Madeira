@@ -409,6 +409,9 @@ func appVDF(_ body: String) -> Data { Data(("\"appinfo\" { \"appid\" \"10\" " + 
         native.steamClientLaunch = true
         // ml1970: "Steam (more usage)": the regular client even while Madeira Dock is on.
         native.steamDesktopLaunch = true
+        // ml2010: regular Steam is deferred; the stored choice goes through Dock by default.
+        require(MadeiraDock.routes(native), "deferred regular Steam choice routes through Madeira Dock")
+        setenv("MADEIRA_STEAM_CLIENT_OPTIONS", "1", 1)
         require(!MadeiraDock.routes(native), "the regular Steam choice bypasses Madeira Dock")
         do { try native.validate(); require(false, "client route needs an installed client") }
         catch { require(true, "client route needs an installed client") }

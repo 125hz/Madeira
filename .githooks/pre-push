@@ -1,28 +1,82 @@
 #!/bin/sh
-# Refuse to push to a non-local remote while the converter exception is still a
-# draft. Distribution starts with the push, not with a tag. Enable with:
+# 1. Refuse to push secrets or personal data: every pushed non-merge commit's
+#    added lines and added file names are scanned with the same rules as
+#    pre-commit (and Madeira Dock's tools/check-privacy.py), so data added and
+#    removed again before HEAD is still caught.
+# 2. Refuse to push to a non-local remote while the converter exception is
+#    still a draft. Distribution starts with the push, not with a tag.
+# Enable with:
 #   git config core.hooksPath .githooks
+remote="$1"
 url="$2"
-# Check every pushed commit, including source added and removed before HEAD.
+
+# --- secret/personal-data scan (shared with pre-commit) ----------------------
+# Personal user paths: C:\Users\<name>, /home/<name>, /Users/<name>.
+scan_user='(^|[^A-Za-z0-9_])([A-Za-z]:)?[\\/]+(Users|users|home|Documents and Settings)[\\/]+[A-Za-z0-9][A-Za-z0-9._-]*'
+scan_user_ok='[\\/](public|default|default user|all users|shared|guest|user|username|name|you|me|someone|example|runner|steamuser|wineuser|madeira|mobile|build_user|crossover)$'
+scan_email='[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}'
+scan_email_ok='^noreply@(anthropic|github)\.com$|@users\.noreply\.github\.com$|^git@github\.com$|@example\.(com|org|net)$|\.(invalid|test|example|localhost)$|@[0-9]+x\.[a-z]+$'
+# Third-party licence texts legitimately carry their authors' addresses.
+scan_licence='^((.*/)?(LICENSES|notices)/[^	]*|(.*/)?(COPYING|LICENSE[^/	]*|NOTICE[^/	]*|THIRD[-_]PARTY[^/	]*))	'
+# JWT-like tokens (Steam refresh/access tokens), keys, common API tokens.
+scan_secret='ey[A-Za-z0-9_-]{10,}\.ey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|-----BEGIN ([A-Z]+ )*PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,}|AKIA[0-9A-Z]{16}|sk-ant-[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}'
+# Real-looking SteamID64; the two synthetic test IDs (accounts 0 and 1) are allowed.
+scan_steamid='(^|[^0-9])7656119[0-9]{10}([^0-9]|$)'
+scan_steamid_ok='^(76561197960265728|76561197960265729)$'
+# Steam login cache (loginusers.vdf / config.vdf) keys and files.
+scan_vdf='"(AccountName|PersonaName|RememberPassword|AllowAutoLogin|WantsOfflineMode|SkipOfflineModeWarning|ConnectCache)"[[:space:]]+"'
+scan_names='(^|/)((loginusers|config|localconfig)\.vdf|ssfn[^/]*)$'
+
+# Turn a unified diff on stdin into "path<TAB>added line" records.
+scan_added_lines() {
+    awk '/^diff --git /{hdr=1; next}
+         hdr && /^\+\+\+ /{p=substr($0,5); sub(/^b\//,"",p); next}
+         /^@@/{hdr=0; next}
+         !hdr && /^\+/{print p "\t" substr($0,2)}'
+}
+
+# $1: file of "path<TAB>line" records, $2: file of added paths. Prints findings.
+scan_report() {
+    {
+        grep -oE "$scan_user" "$1" | grep -viE "$scan_user_ok" | sed 's/^[^A-Za-z\\/]//;s/^/user-path: /'
+        grep -vE "$scan_licence" "$1" | grep -oE "$scan_email" | grep -viE "$scan_email_ok" | sed 's/^/email: /'
+        grep -oE "$scan_secret" "$1" | sed 's/^/token-or-key: /'
+        grep -oE "$scan_steamid" "$1" | grep -oE '7656119[0-9]{10}' | grep -vE "$scan_steamid_ok" | sed 's/^/steamid: /'
+        grep -oE "$scan_vdf" "$1" | sed 's/^/steam-login-cache: /'
+        grep -iE "$scan_names" "$2" | sed 's/^/steam-login-cache-file: /'
+    } | sort -u
+}
+# -----------------------------------------------------------------------------
+
+zero=0000000000000000000000000000000000000000
+tmp=$(mktemp -d) || exit 1
+trap 'rm -rf "$tmp"' EXIT
 while read local_ref local_sha remote_ref remote_sha; do
-    case "$local_sha" in 0000000000000000000000000000000000000000) continue ;; esac
-    case "$remote_sha" in
-        0000000000000000000000000000000000000000) range="$local_sha" ;;
-        *) range="$remote_sha..$local_sha" ;;
-    esac
-    if git log --format= --name-only "$range" -- build/steam-host madeira-dock private docs/STEAM_HOST_PLAN.md | grep -q .; then
-        echo "pre-push: private Madeira Dock source is present in pushed history; refusing upload" >&2
+    [ "$local_sha" = "$zero" ] && continue   # branch deletion
+    # Commits the remote does not have yet. A new branch (or an unknown remote
+    # tip after a force push) is compared against everything already on it.
+    if [ "$remote_sha" != "$zero" ] && git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+        git rev-list "$remote_sha..$local_sha" > "$tmp/commits"
+    else
+        git rev-list "$local_sha" --not --remotes="$remote" > "$tmp/commits"
+    fi
+    [ -s "$tmp/commits" ] || continue
+    git log --stdin --no-walk --no-merges -p -U0 --format= --no-color --no-ext-diff \
+        --diff-filter=ACMR < "$tmp/commits" | scan_added_lines > "$tmp/lines"
+    git log --stdin --no-walk --no-merges --format= --name-only --diff-filter=ACR \
+        < "$tmp/commits" > "$tmp/names"
+    found=$(scan_report "$tmp/lines" "$tmp/names")
+    if [ -n "$found" ]; then
+        echo "pre-push: possible secret or personal data in commits pushed to $local_ref:" >&2
+        printf '%s\n' "$found" | sed 's/^/  /' >&2
+        echo "Rewrite the offending commits before pushing; refusing upload." >&2
         exit 1
     fi
-    for commit in $(git rev-list "$range"); do
-        if git grep -I -l 'MADEIRA_DOCK_PRIVATE_SOURCE' "$commit" -- . ':!.githooks/*' >/dev/null 2>&1; then
-            echo "pre-push: private Madeira Dock source marker found in pushed history" >&2
-            exit 1
-        fi
-    done
 done
+
 case "$url" in /*|file:*) exit 0 ;; esac
 if grep -q "^Adopted on: *$" LICENSE-EXCEPTION.md 2>/dev/null || grep -q "DRAFT" LICENSE-EXCEPTION.md 2>/dev/null; then
     echo "pre-push: LICENSE-EXCEPTION.md is still a draft (adoption line not completed); refusing to publish to $url" >&2
     exit 1
 fi
+exit 0
