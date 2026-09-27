@@ -62,6 +62,50 @@ extern void winios_pWindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_h
 
 static struct user_driver_funcs winios_user_driver;
 
+/* Direct mode (no virtual desktop) has no compositor to draw the Windows
+ * cursor, so the app draws the program's own cursor over the game view while a
+ * hardware mouse is in use (app/Madeira/Winios/WiniosCursor.c and
+ * HardwareInput.swift). The driver reports the cursor image, whether the
+ * program hides it, and where Wine's cursor is after clipping; it changes
+ * nothing the program sees, and does nothing until the app has asked for the
+ * reports (MADEIRA_DIRECT_CURSOR=0 or MADEIRA_HWINPUT=0 in the app: never). */
+extern int winios_direct_cursor_wanted( void ) __attribute__((weak));
+extern void winios_direct_cursor_set( unsigned int id, int w, int h, int hot_x, int hot_y,
+                                      const void *bgra ) __attribute__((weak));
+extern void winios_direct_cursor_show( int show ) __attribute__((weak));
+extern void winios_direct_cursor_pos( int x, int y ) __attribute__((weak));
+
+static int winios_desktop_mode(void);
+
+static int winios_direct_cursor_on(void)
+{
+    return !winios_desktop_mode() && winios_direct_cursor_wanted && winios_direct_cursor_wanted();
+}
+
+/* Wine's cursor position, read the way NtUserGetCursorPos does but without the
+ * DPI mapping: the app posts and draws in the server's screen pixels. */
+static void winios_report_cursor_pos(void)
+{
+    struct object_lock lock = OBJECT_LOCK_INIT;
+    const desktop_shm_t *desktop_shm;
+    NTSTATUS status;
+    int x = 0, y = 0;
+
+    while ((status = get_shared_desktop( &lock, &desktop_shm )) == STATUS_PENDING)
+    {
+        x = desktop_shm->cursor.x;
+        y = desktop_shm->cursor.y;
+    }
+    if (!status) winios_direct_cursor_pos( x, y );
+}
+
+/* A program moved its cursor itself (SetCursorPos). Direct mode only. */
+static BOOL winios_drv_set_cursor_pos( INT x, INT y )
+{
+    if (winios_direct_cursor_on()) winios_direct_cursor_pos( x, y );
+    return TRUE;
+}
+
 /* C bridge for Winios.m to inject mouse input without pulling in Wine
  * headers into Obj-C (where INPUT/HWND/etc. would conflict with UIKit
  * types). Call this from pProcessEvents drain or directly from a
@@ -92,6 +136,8 @@ void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_
             dprintf(2, "[winios] drv_post_mouse hwnd=%p flags=0x%x x=%d y=%d -> status=0x%x\n",
                     hwnd, flags, x, y, (unsigned)st);
     }
+    /* The server has already moved (and clipped) its cursor for a MOVE. */
+    if ((flags & MOUSEEVENTF_MOVE) && winios_direct_cursor_on()) winios_report_cursor_pos();
 }
 
 /* The dedicated navigation keys (arrows, Insert/Delete, Home/End, Page
@@ -293,7 +339,9 @@ static int winios_desktop_mode(void);
 /* pSetCursor: extract the cursor image as straight-alpha BGRA and forward
  * to the app-side compositor cursor layer. win32u calls this on every
  * cursor CHANGE (WM_SETCURSOR → NtUserSetCursor), so resize arrows,
- * I-beam and app cursors all arrive here. */
+ * I-beam and app cursors all arrive here. In direct mode the same image and
+ * visibility go to the app's direct-mode cursor instead (see
+ * winios_direct_cursor_on). */
 static void winios_drv_set_cursor( HWND hwnd, HCURSOR cursor )
 {
     static HCURSOR last_cursor;
@@ -304,14 +352,22 @@ static void winios_drv_set_cursor( HWND hwnd, HCURSOR cursor )
     int w, h, i, has_alpha = 0;
     char bmibuf[sizeof(BITMAPINFOHEADER) + 256 * sizeof(RGBQUAD)];
     BITMAPINFO *bmi = (BITMAPINFO *)bmibuf;
+    void (*cursor_set)( unsigned int, int, int, int, int, const void * ) = winios_cursor_set;
+    void (*cursor_show)( int ) = winios_cursor_show;
 
-    if (!winios_desktop_mode() || !winios_cursor_set) return;
+    if (!winios_desktop_mode())
+    {
+        if (!winios_direct_cursor_on()) return;
+        cursor_set = winios_direct_cursor_set;
+        cursor_show = winios_direct_cursor_show;
+    }
+    if (!cursor_set) return;
     if (!cursor)
     {
-        if (winios_cursor_show) winios_cursor_show( 0 );
+        if (cursor_show) cursor_show( 0 );
         return;
     }
-    if (winios_cursor_show) winios_cursor_show( 1 );
+    if (cursor_show) cursor_show( 1 );
     if (cursor == last_cursor) return;
 
     if (!NtUserGetIconInfo( cursor, &info, NULL, NULL, NULL, 0 )) return;
@@ -369,8 +425,8 @@ static void winios_drv_set_cursor( HWND hwnd, HCURSOR cursor )
     }
 #undef WINIOS_BMI_INIT
 
-    winios_cursor_set( (unsigned int)(UINT_PTR)cursor, w, h,
-                       (int)info.xHotspot, (int)info.yHotspot, color );
+    cursor_set( (unsigned int)(UINT_PTR)cursor, w, h,
+                (int)info.xHotspot, (int)info.yHotspot, color );
     last_cursor = cursor;
     dprintf( 2, "[winios] cursor set hcursor=%p %dx%d hot=(%u,%u)\n",
              cursor, w, h, (unsigned)info.xHotspot, (unsigned)info.yHotspot );
@@ -1624,7 +1680,11 @@ static void load_display_driver(void)
         if (winios_pDestroyWindow)       winios_user_driver.pDestroyWindow       = winios_pDestroyWindow;
         if (winios_pProcessEvents)       winios_user_driver.pProcessEvents       = winios_pProcessEvents;
         if (winios_desktop_mode())       winios_user_driver.pSetCursor           = winios_drv_set_cursor;
+        /* direct mode: inert (like winios_pSetCursor) until the app enables it */
+        else if (winios_direct_cursor_set) winios_user_driver.pSetCursor         = winios_drv_set_cursor;
         else if (winios_pSetCursor)      winios_user_driver.pSetCursor           = winios_pSetCursor;
+        if (!winios_desktop_mode() && winios_direct_cursor_pos)
+            winios_user_driver.pSetCursorPos = winios_drv_set_cursor_pos;
         if (winios_pDestroyCursorIcon)   winios_user_driver.pDestroyCursorIcon   = winios_pDestroyCursorIcon;
         if (winios_pShowWindow)          winios_user_driver.pShowWindow          = winios_pShowWindow;
         /* window-pos wrapper dereferences window_rects on this side and
