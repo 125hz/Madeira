@@ -106,10 +106,15 @@ final class MetalBackedView: UIView {
         self.isMultipleTouchEnabled = true
         self.isUserInteractionEnabled = true
         self.backgroundColor = .clear
+        // Hardware mouse/trackpad: hide the system pointer over the surface and
+        // carry indirect-pointer motion (HardwareInput.swift). No-op with
+        // MADEIRA_HWINPUT=0.
+        PointerFallback.install(on: self)
     }
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         GamepadEventClaim.install(on: self)
+        PointerFallback.install(on: self)
     }
 
     // Visibility-stall postmortem (2026-07-03): the intermittent "presents
@@ -200,7 +205,9 @@ final class MetalBackedView: UIView {
     // Cursor position lives here (desktop px); wine + the rendered arrow
     // follow via winios_pointer / winios_cursor_move.
     // ==================================================================
-    private static var cursor = CGPoint(x: 480, y: 270)
+    // Internal, not private: a hardware mouse moves the same desktop cursor
+    // (HardwareInput.followDesktopCursor).
+    static var cursor = CGPoint(x: 480, y: 270)
     private var lastPanPoint = CGPoint.zero
     private var touchStartPoint = CGPoint.zero
     private var touchStartTime: TimeInterval = 0
@@ -246,6 +253,7 @@ final class MetalBackedView: UIView {
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if HardwareInput.shared.interceptTouches(touches, event, .began) { return }
         guard desktopMode else {
             guard let t = touches.first else { return }
             let (x, y) = mapTouch(t)
@@ -290,6 +298,7 @@ final class MetalBackedView: UIView {
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if HardwareInput.shared.interceptTouches(touches, event, .moved) { return }
         guard desktopMode else {
             guard let t = touches.first else { return }
             let (x, y) = mapTouch(t)
@@ -366,6 +375,7 @@ final class MetalBackedView: UIView {
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if HardwareInput.shared.interceptTouches(touches, event, .ended) { return }
         guard desktopMode else {
             guard let t = touches.first else { return }
             let (x, y) = mapTouch(t)
@@ -407,6 +417,7 @@ final class MetalBackedView: UIView {
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if HardwareInput.shared.interceptTouches(touches, event, .cancelled) { return }
         guard desktopMode else {
             guard let t = touches.first else { return }
             let (x, y) = mapTouch(t)
@@ -764,6 +775,9 @@ extension MetalBackedView: UIKeyInput {
     }
 
     func insertText(_ text: String) {
+        // A hardware keyboard's presses reach Wine raw (HardwareInput); UIKit
+        // also delivers them here as text, which would type every key twice.
+        if HardwareInput.shared.handlesTyping { return }
         for ch in text {
             guard let (vk, shift) = MetalBackedView.vkForChar(ch) else { continue }
             if shift { winios_post_key(0x10, 1) }   // VK_SHIFT down
@@ -774,6 +788,7 @@ extension MetalBackedView: UIKeyInput {
     }
 
     func deleteBackward() {
+        if HardwareInput.shared.handlesTyping { return }
         winios_post_key(0x08, 1)   // VK_BACK down
         winios_post_key(0x08, 0)
     }
@@ -810,6 +825,16 @@ final class InputSettings: ObservableObject {
     /// ml649: heavy diagnostics. Default OFF so the shipped default is the fast
     /// path; flip it on only when a run needs to be explainable.
     @Published var diagnostics = false { didSet { madeira_set_diag_enabled(diagnostics ? 1 : 0); save() } }
+    /// Hardware mouse gain (HardwareInput): counts per reported unit. 1.0 passes
+    /// the device's deltas through unchanged.
+    @Published var sensMouse: Double = 1.0 { didSet { save() } }
+    /// Drop AssistiveTouch's synthesised clicks while a hardware mouse is live
+    /// (HardwareInput.shouldIgnore). `"ignoreTouchesWithMouse": false` in
+    /// madeira-input.json turns the filter off.
+    @Published var ignoreTouchesWithMouse = true { didSet { save() } }
+    /// "Right stick controls mouse" (HardwareInput.swift, PadStickMouse). Off by
+    /// default: a program that reads the controller already gets the stick.
+    @Published var padRightStickMouse = false { didSet { save() } }
 
     /// didSet fires for assignments made in init() because the properties are
     /// already initialised by then; without this the first launch would write
@@ -829,6 +854,9 @@ final class InputSettings: ObservableObject {
             sensAbs  = j["sensAbs"]  as? Double ?? 2.0
             sensRel  = j["sensRel"]  as? Double ?? 2.0
             diagnostics = j["diagnostics"] as? Bool ?? false
+            sensMouse = j["sensMouse"] as? Double ?? 1.0
+            ignoreTouchesWithMouse = j["ignoreTouchesWithMouse"] as? Bool ?? true
+            padRightStickMouse = j["padRightStickMouse"] as? Bool ?? false
         }
         loading = false
         madeira_set_diag_enabled(diagnostics ? 1 : 0)   // push the restored value down
@@ -836,7 +864,9 @@ final class InputSettings: ObservableObject {
 
     private func save() {
         guard !loading else { return }
-        let j: [String: Any] = ["relative": relative, "sensAbs": sensAbs, "sensRel": sensRel, "diagnostics": diagnostics]
+        let j: [String: Any] = ["relative": relative, "sensAbs": sensAbs, "sensRel": sensRel, "diagnostics": diagnostics,
+                                "sensMouse": sensMouse, "ignoreTouchesWithMouse": ignoreTouchesWithMouse,
+                                "padRightStickMouse": padRightStickMouse]
         guard let d = try? JSONSerialization.data(withJSONObject: j) else { return }
         try? d.write(to: Self.url, options: .atomic)
     }
@@ -960,6 +990,10 @@ struct ContentView: View {
             // The expanded pad overflows this row; without a raised zIndex the
             // later VStack siblings (action buttons, log) would draw over it.
             .zIndex(10)
+            // Mouse gain, pointer lock and "Right stick controls mouse" while the
+            // pointer panel is open and such a device is attached, plus the
+            // iPhone AssistiveTouch hint (HardwareInput.swift).
+            HardwareInputSettings(open: pointerPanel)
             Divider()
             actionButtons
             Divider()
