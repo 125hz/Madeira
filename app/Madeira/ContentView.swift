@@ -283,6 +283,161 @@ final class MetalBackedView: UIView {
     }
 
     // ==================================================================
+    // Touch pointer mode (InputSettings.touchMode), in direct and desktop
+    // sessions alike:
+    //   one-finger tap        — left click where the finger is
+    //   hold (0.25 s) or move — left button down at the touch point, drag, lift
+    //   two / three-finger tap — right / middle click at the fingers' midpoint
+    //   two-finger drag       — scroll wheel
+    // The drawn cursor jumps to the finger at once; nothing is posted until
+    // the gesture resolves, so a multi-finger tap never leaves a stray click.
+    // ==================================================================
+    private var tmDownPoints: [ObjectIdentifier: CGPoint] = [:]
+    private var tmGestureDownPoint = CGPoint.zero
+    private var tmPeak = 0
+    private var tmResolved = false
+    private var tmDragTouch: UITouch?
+    private var tmSlopBroken = false
+    private var tmGeneration = 0
+    private var tmTwoFingerLastY: CGFloat = 0
+    private var tmScrollAccum: CGFloat = 0
+    private static let tmHoldDelay: TimeInterval = 0.25
+    private static let tmSlop: CGFloat = 10
+    private let F_MDOWN: UInt32 = 0x20, F_MUP: UInt32 = 0x40
+
+    private var touchPointerMode: Bool { InputSettings.shared.touchMode }
+
+    private func tmResetGesture() {
+        tmDownPoints.removeAll()
+        tmGestureDownPoint = .zero
+        tmPeak = 0
+        tmResolved = false
+        tmDragTouch = nil
+        tmSlopBroken = false
+        tmGeneration += 1
+        tmTwoFingerLastY = 0
+        tmScrollAccum = 0
+    }
+
+    /// Midpoint of every finger's down point this gesture.
+    private func tmMidpoint() -> CGPoint {
+        guard !tmDownPoints.isEmpty else { return tmGestureDownPoint }
+        let pts = Array(tmDownPoints.values)
+        let n = CGFloat(pts.count)
+        return CGPoint(x: pts.reduce(0) { $0 + $1.x } / n, y: pts.reduce(0) { $0 + $1.y } / n)
+    }
+
+    private func tmCommitDrag(_ t: UITouch) {
+        guard !tmResolved else { return }
+        tmResolved = true
+        tmDragTouch = t
+        let (x, y) = mapPoint(tmGestureDownPoint)
+        winios_post_touch_down(x, y)
+    }
+
+    /// Right/middle click at a guest position: winios_post_touch_* are
+    /// left-button only, so these go through winios_pointer with ABSOLUTE.
+    private func tmAbsoluteClick(down: UInt32, up: UInt32, at p: CGPoint) {
+        let (x, y) = mapPoint(p)
+        winios_pointer(x, y, down | F_ABS, 0)
+        winios_pointer(x, y, up | F_ABS, 0)
+    }
+
+    private func touchModeBegan(_ touches: Set<UITouch>) {
+        guard !tmResolved else { return }   // a finger joining mid-drag changes nothing
+        for t in touches where tmDownPoints[ObjectIdentifier(t)] == nil {
+            tmDownPoints[ObjectIdentifier(t)] = t.location(in: self)
+        }
+        tmPeak = max(tmPeak, tmDownPoints.count)
+        if tmDownPoints.count == 1, let t = touches.first {
+            tmGestureDownPoint = t.location(in: self)
+            let (x, y) = mapPoint(tmGestureDownPoint)
+            winios_cursor_move(x, y)
+            tmGeneration += 1
+            let gen = tmGeneration
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.tmHoldDelay) { [weak self, weak t] in
+                guard let self, let t, self.tmGeneration == gen, !self.tmResolved,
+                      self.tmDownPoints.count == 1 else { return }
+                self.tmCommitDrag(t)
+            }
+        } else {
+            // A second or third finger: only a multi-finger tap is possible now.
+            tmGeneration += 1
+        }
+    }
+
+    private func touchModeMoved(_ touches: Set<UITouch>, _ event: UIEvent?) {
+        let active = activeTouches(event)
+        if !tmResolved, tmDownPoints.count == 2, active.count == 2 {
+            let avg = avgPoint(active)
+            if tmTwoFingerLastY == 0 { tmTwoFingerLastY = avg.y }
+            let dy = avg.y - tmTwoFingerLastY
+            if abs(dy) > 2 { tmSlopBroken = true }
+            tmTwoFingerLastY = avg.y
+            tmScrollAccum += dy
+            let (mx, my) = mapPoint(avg)
+            while tmScrollAccum <= -14 { tmScrollAccum += 14
+                winios_pointer(mx, my, F_WHEEL, UInt32(bitPattern: Int32(-120))) }
+            while tmScrollAccum >= 14 { tmScrollAccum -= 14
+                winios_pointer(mx, my, F_WHEEL, UInt32(bitPattern: Int32(120))) }
+            return
+        }
+        for t in touches {
+            guard let down = tmDownPoints[ObjectIdentifier(t)] else { continue }
+            let p = t.location(in: self)
+            if tmResolved {
+                guard t === tmDragTouch else { continue }
+                let (x, y) = mapPoint(p)
+                winios_post_touch_move(x, y)
+                continue
+            }
+            guard tmDownPoints.count == 1 else {
+                if hypot(p.x - down.x, p.y - down.y) > Self.tmSlop { tmSlopBroken = true }
+                continue
+            }
+            if hypot(p.x - down.x, p.y - down.y) > Self.tmSlop {
+                tmSlopBroken = true
+                tmCommitDrag(t)                  // button down at the ORIGINAL point
+                let (x, y) = mapPoint(p)
+                winios_post_touch_move(x, y)
+            }
+        }
+    }
+
+    private func touchModeEnded(_ touches: Set<UITouch>, _ event: UIEvent?) {
+        if tmResolved, let d = tmDragTouch, touches.contains(d) {
+            let (x, y) = mapPoint(d.location(in: self))
+            winios_post_touch_up(x, y)
+            tmResetGesture()
+            return
+        }
+        guard !tmResolved else { return }
+        guard activeTouches(event).isEmpty else { return }   // wait for every finger
+        let peak = tmPeak, mid = tmMidpoint(), brokeSlop = tmSlopBroken
+        tmResetGesture()
+        guard !brokeSlop else { return }
+        switch peak {
+        case 1:
+            let (x, y) = mapPoint(mid)
+            winios_post_touch_down(x, y)
+            winios_post_touch_up(x, y)
+        case 2: tmAbsoluteClick(down: F_RDOWN, up: F_RUP, at: mid)
+        case 3: tmAbsoluteClick(down: F_MDOWN, up: F_MUP, at: mid)
+        default: break
+        }
+    }
+
+    private func touchModeCancelled(_ touches: Set<UITouch>) {
+        if tmResolved, let d = tmDragTouch, touches.contains(d) {
+            let (x, y) = mapPoint(d.location(in: self))
+            winios_post_touch_up(x, y)   // never leave the button held
+            tmResetGesture()
+            return
+        }
+        if !tmResolved { tmResetGesture() }
+    }
+
+    // ==================================================================
     // S2 desktop mode: trackpad-style pointer.
     //   one finger move       — cursor moves relative (like a laptop pad)
     //   single tap            — left click
@@ -339,6 +494,7 @@ final class MetalBackedView: UIView {
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if touchPointerMode { touchModeBegan(touches); return }
         guard desktopMode else {
             guard let t = touches.first else { return }
             let (x, y) = mapTouch(t)
@@ -383,6 +539,7 @@ final class MetalBackedView: UIView {
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if touchPointerMode { touchModeMoved(touches, event); return }
         guard desktopMode else {
             guard let t = touches.first else { return }
             let (x, y) = mapTouch(t)
@@ -459,6 +616,7 @@ final class MetalBackedView: UIView {
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if touchPointerMode { touchModeEnded(touches, event); return }
         guard desktopMode else {
             guard let t = touches.first else { return }
             let (x, y) = mapTouch(t)
@@ -500,6 +658,7 @@ final class MetalBackedView: UIView {
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if touchPointerMode { touchModeCancelled(touches); return }
         guard desktopMode else {
             guard let t = touches.first else { return }
             let (x, y) = mapTouch(t)
@@ -900,6 +1059,10 @@ final class InputSettings: ObservableObject {
     @Published var relative: Bool  = false { didSet { save() } }
     @Published var sensAbs:  Double = 2.0  { didSet { save() } }
     @Published var sensRel:  Double = 2.0  { didSet { save() } }
+    /// Touch pointer mode (MetalBackedView.touchModeBegan): tap to click where
+    /// the finger is, hold or move to drag. Checked before `relative`; the
+    /// library's pointer picker keeps the two mutually exclusive.
+    @Published var touchMode = false { didSet { save() } }
     /// ml649: heavy diagnostics. Default OFF so the shipped default is the fast
     /// path; flip it on only when a run needs to be explainable.
     @Published var diagnostics = false { didSet { madeira_set_diag_enabled(diagnostics ? 1 : 0); save() } }
@@ -921,6 +1084,7 @@ final class InputSettings: ObservableObject {
             relative = j["relative"] as? Bool   ?? false
             sensAbs  = j["sensAbs"]  as? Double ?? 2.0
             sensRel  = j["sensRel"]  as? Double ?? 2.0
+            touchMode = j["touchMode"] as? Bool ?? false
             diagnostics = j["diagnostics"] as? Bool ?? false
         }
         loading = false
@@ -929,7 +1093,8 @@ final class InputSettings: ObservableObject {
 
     private func save() {
         guard !loading else { return }
-        let j: [String: Any] = ["relative": relative, "sensAbs": sensAbs, "sensRel": sensRel, "diagnostics": diagnostics]
+        let j: [String: Any] = ["relative": relative, "sensAbs": sensAbs, "sensRel": sensRel, "diagnostics": diagnostics,
+                                "touchMode": touchMode]
         guard let d = try? JSONSerialization.data(withJSONObject: j) else { return }
         try? d.write(to: Self.url, options: .atomic)
     }
@@ -1178,10 +1343,12 @@ struct ContentView: View {
 
     private var pointerModeToggle: some View {
         Button {
-            input.relative.toggle()
+            // Touch mode is chosen in the library; this button leaves it for Absolute.
+            if input.touchMode { input.touchMode = false; input.relative = false }
+            else { input.relative.toggle() }
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
         } label: {
-            Text(input.relative ? "Relative" : "Absolute")
+            Text(input.touchMode ? "Touch" : input.relative ? "Relative" : "Absolute")
                 .font(.system(size: 13, weight: .semibold))
                 .frame(minWidth: 82, minHeight: 32)
                 .background((input.relative ? Color.accentColor : Color.secondary).opacity(0.28))

@@ -1254,11 +1254,19 @@ struct FPSChoice: View {
 
 struct LibraryPointerSettings: View {
     @ObservedObject private var input = InputSettings.shared
+    /// Absolute, Relative or Touch; `touchMode` and `relative` stay mutually exclusive.
+    private var mode: Binding<String> {
+        Binding(get: { input.touchMode ? "touch" : (input.relative ? "relative" : "absolute") }, set: { value in
+            input.touchMode = value == "touch"; input.relative = value == "relative"
+            fputs("[frontend-pointer] mode=\(value)\n", stderr)
+        })
+    }
     var body: some View {
-        Picker("Pointer mode", selection: $input.relative) {
-            Text("Absolute").tag(false); Text("Relative").tag(true)
+        Picker("Pointer mode", selection: mode) {
+            Text("Absolute").tag("absolute"); Text("Relative").tag("relative"); Text("Touch").tag("touch")
         }.pickerStyle(.segmented)
-        Text(input.relative ? "Drag to send relative mouse movement for mouse-look. Tap to click." : "Drag the pointer like a trackpad. Tap to click.")
+        Text(input.touchMode ? "Tap the screen to position and click. Hold and move to drag. Two fingers: right click or scroll."
+             : (input.relative ? "Drag to send relative mouse movement for mouse-look. Tap to click." : "Drag the pointer like a trackpad. Tap to click."))
             .font(.caption).foregroundStyle(.secondary)
         LabeledContent("Touch sensitivity") {
             Slider(value: input.relative ? $input.sensRel : $input.sensAbs, in: 0.1...8)
@@ -1547,6 +1555,8 @@ enum LibraryKeyboard {
     static weak var previous: UIWindow?
     static var input: LibraryKeyInput?
     static func show() {
+        // MADEIRA_FRONTEND_KEYBOARD=0: the game view's own keyboard instead.
+        if !MadeiraConfig.flag("MADEIRA_FRONTEND_KEYBOARD") { MetalBackedView.toggleKeyboard(); return }
         guard window == nil, let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first(where: { $0.activationState == .foregroundActive }) else { return }
         previous = scene.windows.first(where: { $0.isKeyWindow })
         let w = LibraryKeyboardWindow(windowScene: scene)
