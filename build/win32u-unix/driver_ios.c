@@ -94,6 +94,30 @@ void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_
     }
 }
 
+/* The dedicated navigation keys (arrows, Insert/Delete, Home/End, Page
+ * Up/Down) share their scan codes with the numpad, and Wine's US table lists
+ * the numpad position first, so MAPVK_VK_TO_VSC_EX answers 0x48 for VK_UP,
+ * not 0xe048. A raw-input or DirectInput reader then sees numpad 8. The app
+ * never posts these virtual keys for a numpad key (a numpad key is
+ * VK_NUMPAD0-9 or VK_DECIMAL), so one of them here always means the dedicated
+ * key: mark it extended, as the physical key's E0 prefix is.
+ * MADEIRA_NAV_KEYS_E0=0 restores the previous flags.
+ * build/host-tests/check-nav-keys.py compiles this function on its own. */
+static UINT winios_key_extended_flag( UINT vk, UINT scan, int nav_e0 )
+{
+    if (scan & 0xe000) return KEYEVENTF_EXTENDEDKEY;
+    if (!nav_e0) return 0;
+    switch (vk)
+    {
+    case VK_PRIOR: case VK_NEXT: case VK_END: case VK_HOME:
+    case VK_LEFT: case VK_UP: case VK_RIGHT: case VK_DOWN:
+    case VK_INSERT: case VK_DELETE:
+        return KEYEVENTF_EXTENDEDKEY;
+    }
+    return 0;
+}
+/* end winios_key_extended_flag */
+
 /* Keyboard sibling of winios_drv_post_key: packages an INPUT_KEYBOARD
  * event. vk is a Windows virtual-key code (VK_RETURN=0x0D, VK_SPACE=0x20,
  * VK_ESCAPE=0x1B, ...); flags is 0 for key-down, KEYEVENTF_KEYUP (0x2)
@@ -104,6 +128,7 @@ void winios_drv_post_key(unsigned short vk, unsigned int flags)
     INPUT input = {0};
     NTSTATUS st;
     UINT scan;
+    static int nav_e0 = -1;
 
     /* ml647: DERIVE THE SCAN CODE. This used to hardcode wScan = 0 while the
      * comment above claimed it was "derived via the default layout" — the
@@ -127,7 +152,12 @@ void winios_drv_post_key(unsigned short vk, unsigned int flags)
      * KEYEVENTF_EXTENDEDKEY, or a scan-code reader sees the numpad twin
      * instead: without E0, "up arrow" is numpad 8. */
     scan = NtUserMapVirtualKeyEx( vk, MAPVK_VK_TO_VSC_EX, NtUserGetKeyboardLayout(0) );
-    if (scan & 0xe000) flags |= KEYEVENTF_EXTENDEDKEY;
+    if (nav_e0 < 0)
+    {
+        const char *e = getenv( "MADEIRA_NAV_KEYS_E0" );
+        nav_e0 = !(e && e[0] == '0');
+    }
+    flags |= winios_key_extended_flag( vk, scan, nav_e0 );
 
     input.type           = INPUT_KEYBOARD;
     input.ki.wVk         = vk;
