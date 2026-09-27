@@ -5116,20 +5116,22 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
         o->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_2;   /* heaps here are descriptions; any mix is fine */
         o->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation = TRUE;
         /* ml1970: FORMAT_SUPPORT below already reports UAV_TYPED_LOAD for every
-         * uncompressed colour format (Metal read-write textures), so the device
-         * option must agree. Leaving it FALSE made an engine that requires it
-         * reject the device before creating anything, then exhaust its other
-         * renderers. MADEIRA_D3D12_TYPED_UAV_LOAD=0 reports FALSE again. */
+         * uncompressed colour format (Metal read-write textures), but this
+         * option stays FALSE by default: reporting it can move an engine that
+         * already runs onto different rendering paths. An engine that requires
+         * it rejects the device before creating anything, so it is available
+         * OPT-IN: madeira.cfg d3d12-typed-uav-load = 1, or
+         * MADEIRA_D3D12_TYPED_UAV_LOAD=1 in the environment. */
         {
             static int typed = -1;
             if (typed < 0) {
                 char v[4] = {0};
                 DWORD n = GetEnvironmentVariableA("MADEIRA_D3D12_TYPED_UAV_LOAD", v, sizeof v);
-                typed = !(n == 1 && v[0] == '0');
-                OutputDebugStringA(typed ? "[d3d12-caps] ml1970 typed-uav-load-additional=1\n"
-                                         : "[d3d12-caps] ml1970 typed-uav-load-additional=0 (rollback)\n");
+                typed = ((n == 1 && v[0] == '1') || mad_cfg_int_pe("d3d12-typed-uav-load", 0)) ? 1 : 0;
+                d3d12_log("[d3d12-caps] ml1970 typed-uav-load-additional=%d%s\n", typed,
+                          typed ? " (opt-in)" : " (default)");
             }
-            o->TypedUAVLoadAdditionalFormats = typed ? TRUE : FALSE;
+            if (typed) o->TypedUAVLoadAdditionalFormats = TRUE;
         }
         return S_OK;
     }
