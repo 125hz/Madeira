@@ -115,6 +115,7 @@ extern kern_return_t vm_protect(mach_port_t target_task, vm_address_t address,
 #include "wine/list.h"
 #include "wine/rbtree.h"
 #include "unix_private.h"
+#include "ios_wow.h"
 #include "wine/debug.h"
 
 /* ml648: the Mono-bridge alias table is defined further down, but the anon-alias
@@ -1379,6 +1380,9 @@ static unsigned ios_soft_n;
 #define IOS_CAGE_BASE      0x7200000000ULL
 #define IOS_CAGE_REAL_SIZE 0x1ffff0000ULL   /* 8GB - 64KB */
 static int ios_cage_holdback_live;
+/* Set only after the lower window is carved. The unregistered PROT_NONE
+ * remainder stays ours; the original whole-cage grant is then disabled. */
+static int ios_cage_window_tail_live;
 
 static int ios_soft_find( uint64_t addr )
 {
@@ -5382,9 +5386,23 @@ static void ios_furniture_census( void )
                  k + 1, top[k].base, top[k].size, top[k].size >> 20, top[k].prot );
 }
 
-static void ios_va_describe( void *addr, char *buf, size_t buflen )
+/* Describe what the kernel has at `addr` — or, when `len` is non-zero, across
+ * the whole range [addr, addr+len).
+ *
+ * RANGE AWARENESS (device evidence, desktop run after the furniture-bias fix):
+ * the single-address form printed "iOS REFUSED A FREE ADDRESS" whenever
+ * mach_vm_region returned a region ABOVE addr — which is also true of a RANGE
+ * whose first page is free and whose tail is occupied.  That is exactly the
+ * 4 GB guest-window candidate on device (free from 0x7100000000, occupied from
+ * 0x71fc120000), so the log accused iOS of refusing free VA when the real
+ * verdict was "part of your range is taken".  A caller that knows the length of
+ * the mapping it tried therefore passes it, and the refusal wording is reserved
+ * for a range that really was free end to end. */
+static void ios_va_describe_range( void *addr, ULONG_PTR len, char *buf, size_t buflen )
 {
-    mach_vm_address_t a = (mach_vm_address_t)(uintptr_t)addr;
+    mach_vm_address_t start = (mach_vm_address_t)(uintptr_t)addr;
+    mach_vm_address_t end = start + (len ? (mach_vm_address_t)len : 1);
+    mach_vm_address_t a = start;
     mach_vm_size_t size = 0;
     vm_region_basic_info_data_64_t info;
     mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
@@ -5396,14 +5414,37 @@ static void ios_va_describe( void *addr, char *buf, size_t buflen )
         snprintf( buf, buflen, "no-region-above (free to end of VA)" );
         return;
     }
-    if (a > (mach_vm_address_t)(uintptr_t)addr)
-        snprintf( buf, buflen, "FREE hole, next region 0x%llx (+0x%llx away) <-- iOS REFUSED A FREE ADDRESS",
-                  (unsigned long long)a,
-                  (unsigned long long)(a - (mach_vm_address_t)(uintptr_t)addr) );
-    else
-        snprintf( buf, buflen, "OCCUPIED 0x%llx+0x%llx prot=%x/%x shared=%d",
+    if (a >= end)       /* nothing mapped anywhere in the requested range */
+    {
+        if (len)
+            snprintf( buf, buflen, "FREE: all 0x%llx bytes from 0x%llx are free, next region 0x%llx "
+                                   "(+0x%llx past the end) <-- iOS REFUSED A FREE RANGE",
+                      (unsigned long long)len, (unsigned long long)start,
+                      (unsigned long long)a, (unsigned long long)(a - end) );
+        else
+            snprintf( buf, buflen, "FREE hole, next region 0x%llx (+0x%llx away) <-- iOS REFUSED A FREE ADDRESS",
+                      (unsigned long long)a, (unsigned long long)(a - start) );
+        return;
+    }
+    if (a > start)      /* head free, tail taken: name the occupied sub-range */
+    {
+        snprintf( buf, buflen, "PARTIALLY OCCUPIED: free 0x%llx..0x%llx, then OCCUPIED 0x%llx+0x%llx "
+                               "prot=%x/%x shared=%d (0x%llx of the range is not free)",
+                  (unsigned long long)start, (unsigned long long)a,
                   (unsigned long long)a, (unsigned long long)size,
-                  info.protection, info.max_protection, info.shared );
+                  info.protection, info.max_protection, info.shared,
+                  (unsigned long long)(end - a) );
+        return;
+    }
+    snprintf( buf, buflen, "OCCUPIED 0x%llx+0x%llx prot=%x/%x shared=%d%s",
+              (unsigned long long)a, (unsigned long long)size,
+              info.protection, info.max_protection, info.shared,
+              (len && a + size < end) ? " (and the range continues past this region)" : "" );
+}
+
+static void ios_va_describe( void *addr, char *buf, size_t buflen )
+{
+    ios_va_describe_range( addr, 0, buf, buflen );
 }
 
 static const char *ios_scan_stop_name( int stop )
@@ -6785,6 +6826,1150 @@ static ULONG_PTR get_wow_user_space_limit(void)
 #endif
     return (ULONG_PTR)user_space_limit;
 }
+
+
+#ifdef WINE_IOS
+/* ==== WoW64 guest windows: registry and placement ==== */
+/***********************************************************************
+ *           WoW64 guest window (docs/WOW64.md)
+ *
+ * One reserved [B, B+4G) host range per 32-bit pseudo-process.  Reserved as
+ * a Wine "reserved area" (PROT_NONE + mmap_add_reserved_area) so the whole
+ * existing placement machinery works inside it: map_reserved_area places
+ * window-constrained requests, map_fixed_area can honour a fixed address in
+ * it, and unmap_area/delete_view restore PROT_NONE on free.
+ *
+ * LAZY.  Nothing here runs for a session that never starts a 32-bit program:
+ * no window, no placeholder and no placement bias exist until the session is
+ * ARMED (ios_wow_session_arm), which happens only when a 32-bit main image is
+ * published by the app (ios_main_image_i386) or a 32-bit process asks for a
+ * window.  A 64-bit-only session therefore places memory exactly as before.
+ *
+ * Placement rules: 4 GB-aligned, inside the furniture band
+ * [ios_usable_va_floor, ios_furniture_ceiling) (or the low band on a small
+ * address map, see ios_wow_band), below the CEF pools [0x7400000000,
+ * 0x7c00000000) and the FEX band [0x7c00000000, 0x8000000000).
+ */
+#define IOS_WOW_MAX_WINDOWS 8
+#define IOS_WOW_CEF_POOLS_START ((ULONG_PTR)0x7400000000)
+#define IOS_WOW_FEX_BAND_END    ((ULONG_PTR)0x8000000000)
+
+struct ios_wow_window
+{
+    void      *peb;             /* owning pseudo-process; NULL = unbound/free */
+    ULONG_PTR  base;            /* B, 0 = free slot */
+    unsigned   leaked;          /* window intentionally not torn down, see
+                                   ios_wow_window_retire(); never reused and
+                                   never matched by a lookup again */
+    unsigned   dead;            /* the owning pseudo-process has EXITED and the
+                                   window waits to be torn down by the next
+                                   32-bit pseudo-process that wants a slot
+                                   (release-on-next-adopt).  A dead slot still
+                                   owns its VA and is still excluded from
+                                   furniture placement, but no lookup resolves
+                                   to it any more.  2 = teardown in progress. */
+    void      *dead_peb;        /* the exited owner's PEB, kept for the deferred
+                                   teardown (JIT ledger, fd cache) */
+    time_t     released_at;     /* when the owner exited, see IOS_WOW_SETTLE_SEC */
+    unsigned   guard_owned;     /* 1: the overrun guard page at B+4G is part of
+                                   OUR reservation.  0: it is a pre-existing
+                                   inaccessible neighbour we verified and
+                                   borrowed (see ios_wow_window_try). */
+    pthread_t  owner;           /* thread that reserved it while peb == NULL */
+    /* per-process TEB block: a WoW process's TEB64/TEB32 pair must live in
+     * its own window, so it cannot share the session-wide teb_block. */
+    void      *teb_block;
+    void     **next_free_teb;   /* same type as the session-wide next_free_teb */
+    int        teb_block_pos;
+};
+static struct ios_wow_window ios_wow_windows[IOS_WOW_MAX_WINDOWS];
+static unsigned ios_wow_window_count;
+static pthread_mutex_t ios_wow_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Set once the session can have a 32-bit process; see the LAZY note above. */
+static int ios_wow_armed;
+
+int ios_wow_session_armed(void)
+{
+    return __atomic_load_n( &ios_wow_armed, __ATOMIC_ACQUIRE );
+}
+
+void ios_wow_session_arm(void)
+{
+    if (!__atomic_exchange_n( &ios_wow_armed, 1, __ATOMIC_ACQ_REL ))
+        dprintf( 2, "[wow-window] session armed: a 32-bit process is expected\n" );
+}
+
+/* PLACEHOLDERS.  A placeholder is a 4 GB-aligned slot reserved PROT_NONE ahead
+ * of the 32-bit process that will use it, registered as a Wine reserved area
+ * exactly as a real window is.  The process then ADOPTS it (ios_wow_window_try)
+ * instead of mapping a fresh range.  The reason is device evidence: iOS places
+ * anonymous memory for the system frameworks (Metal, libdispatch, malloc zone
+ * growth) at the HIGHEST free hole, which is the slot directly below the [cage]
+ * holdback, and Wine cannot bias those allocations.  A slot that is reserved
+ * before the frameworks start keeps its hole.
+ *
+ * Placeholders are taken only when they are known to be needed: one slot at
+ * session start when the app published a 32-bit main image (it is known before
+ * virtual_init returns), or every slot of the band when MADEIRA_WOW_PLACEHOLDERS=1
+ * (for 64-bit launchers that start 32-bit children on a crowded map).  A
+ * placeholder is never unmapped: a release makes it unadopted again after the
+ * teardown, so the next 32-bit process adopts exactly the same reservation. */
+struct ios_wow_placeholder
+{
+    ULONG_PTR base;          /* 4 GB-aligned slot base, 0 = unused entry */
+    unsigned  guard_owned;   /* same meaning as ios_wow_window.guard_owned */
+    unsigned  adopted;       /* a pseudo-process has taken this slot over */
+};
+static struct ios_wow_placeholder ios_wow_placeholders[IOS_WOW_MAX_WINDOWS];
+static unsigned ios_wow_placeholder_count;
+
+static struct ios_wow_placeholder *ios_wow_placeholder_find( ULONG_PTR base )
+{
+    unsigned i;
+
+    for (i = 0; i < ios_wow_placeholder_count; i++)
+        if (ios_wow_placeholders[i].base == base) return &ios_wow_placeholders[i];
+    return NULL;
+}
+
+/* Published by the app before __wine_main: nonzero when this session's MAIN
+ * image is 32-bit.  The main image's machine is not known unix-side until
+ * unix_init_startup_info, which runs after the first TEB is placed, so the app
+ * (which already probes the target PE) says so up front.  0 = 64-bit/unknown. */
+int ios_main_image_i386 = 0;
+
+/* The session's own PEB (the first pseudo-process), captured in
+ * virtual_alloc_first_teb().  The child path leaves the session global `peb`
+ * pointing at the last child it booted, so a released guest window has to put
+ * it back to something that still exists — see ios_wow_window_teardown(). */
+static PEB *ios_session_peb;
+
+/* OVERRUN GUARD PAGE.
+ *
+ * FEX adds a raw immediate offset AFTER the base for ldp/stp and the
+ * non-temporal forms, so a guest access within ~1 KB of 0xffffffff computes
+ * B + 4G + n instead of wrapping round to B + n.  The first byte past the
+ * window must therefore never belong to anything else: reserve one extra host
+ * page beyond [B, B+4G) and keep it PROT_NONE, so such an access faults
+ * instead of silently corrupting the next window or a piece of furniture.  The
+ * guard page is part of the RESERVATION but never part of the guest window:
+ * ios_wow_in_window() and every ±B conversion use exactly IOS_WOW_WINDOW_SIZE.
+ *
+ * BORROWED GUARD.  When the only 4 GB-aligned candidate is an exactly-4 GB gap,
+ * asking for 4 GB + one page fails.  ios_wow_window_try() then verifies that
+ * the page at B+4G is ALREADY an existing region with protection VM_PROT_NONE
+ * and, only then, reserves exactly 4 GB and records guard_owned = 0. */
+static ULONG_PTR ios_wow_guard_size(void)
+{
+    return host_page_size ? (ULONG_PTR)host_page_size : (ULONG_PTR)0x4000;
+}
+
+/* How much VA a reserved slot owns: 4 GB plus the guard page when it is ours. */
+static ULONG_PTR ios_wow_slot_reservation( const struct ios_wow_window *slot )
+{
+    return IOS_WOW_WINDOW_SIZE + (slot->guard_owned ? ios_wow_guard_size() : 0);
+}
+
+static struct ios_wow_window *ios_wow_slot_for_peb( void *peb_id )
+{
+    unsigned i, n = ios_wow_window_count;
+
+    if (!peb_id) return NULL;
+    for (i = 0; i < n; i++)
+        if (ios_wow_windows[i].base && !ios_wow_windows[i].leaked &&
+            !ios_wow_windows[i].dead &&
+            ios_wow_windows[i].peb == peb_id) return &ios_wow_windows[i];
+    return NULL;
+}
+
+/* The registry entry that owns `base`, whatever its state (live, dead or
+ * leaked).  The adopt path must never hand a slot to a second process while
+ * the first one's window is still standing. */
+static struct ios_wow_window *ios_wow_slot_at_base( ULONG_PTR base )
+{
+    unsigned i, n = ios_wow_window_count;
+
+    for (i = 0; i < n; i++)
+        if (ios_wow_windows[i].base == base && base) return &ios_wow_windows[i];
+    return NULL;
+}
+
+/* The calling thread's window: its pseudo-process's, or one this thread
+ * reserved.  The owner fallback covers the boot gap in which the window is
+ * already bound but the new process's TEB is not published yet, so
+ * ios_jit_current_peb() cannot resolve the PEB.  `owner` is the owning
+ * process's own boot thread, so the fallback can only resolve to that
+ * process's window. */
+static struct ios_wow_window *ios_wow_slot_current(void)
+{
+    struct ios_wow_window *slot;
+    unsigned i, n = ios_wow_window_count;
+
+    if (!n) return NULL;   /* no window in this session: nothing to resolve */
+    if ((slot = ios_wow_slot_for_peb( ios_jit_current_peb() ))) return slot;
+    for (i = 0; i < n; i++)
+        if (ios_wow_windows[i].base && !ios_wow_windows[i].leaked &&
+            !ios_wow_windows[i].dead &&
+            pthread_equal( ios_wow_windows[i].owner, pthread_self() ))
+            return &ios_wow_windows[i];
+    return NULL;
+}
+
+/* Live windows (bound or reserved, not dead or leaked). */
+static unsigned ios_wow_live_window_count(void)
+{
+    unsigned i, live = 0;
+
+    for (i = 0; i < ios_wow_window_count; i++)
+        if (ios_wow_windows[i].base && !ios_wow_windows[i].dead && !ios_wow_windows[i].leaked)
+            live++;
+    return live;
+}
+
+ULONG_PTR ios_wow_base_for_peb( void *peb_id )
+{
+    struct ios_wow_window *slot = ios_wow_slot_for_peb( peb_id );
+    return slot ? slot->base : 0;
+}
+
+ULONG_PTR ios_wow_base(void)
+{
+    struct ios_wow_window *slot = ios_wow_slot_current();
+    return slot ? slot->base : 0;
+}
+
+int ios_wow_in_window( const void *addr )
+{
+    ULONG_PTR base = ios_wow_base();
+    return base && (ULONG_PTR)addr >= base && (ULONG_PTR)addr < base + IOS_WOW_WINDOW_SIZE;
+}
+
+ULONG ios_wow_guest_addr( const void *host )
+{
+    ULONG_PTR base = ios_wow_base();
+
+    if (!host) return 0;
+    if (base && (ULONG_PTR)host >= base && (ULONG_PTR)host < base + IOS_WOW_WINDOW_SIZE)
+        return (ULONG)((ULONG_PTR)host - base);
+    return PtrToUlong( host );   /* no window: unchanged (and truncating, as before) */
+}
+
+/* Guest addresses below this are never handed out, mirroring upstream Wine's
+ * address_space_start = 0x110000 ("keep DOS area clear").  A bottom-up pick
+ * inside a window returns the LOWEST free address of the range — host B, i.e.
+ * GUEST 0 — which every ±B conversion and every guest NULL test would read as
+ * NULL.  Upstream gets this for free because guest == host there. */
+#define IOS_WOW_GUEST_FLOOR ((ULONG_PTR)0x110000)
+
+void ios_wow_translate_limits( ULONG_PTR *limit_low, ULONG_PTR *limit_high )
+{
+    ULONG_PTR base = ios_wow_base(), low, high;
+
+    if (!base) return;
+    /* Only a ceiling below 4 GB is a guest-namespace number; 0 means
+     * "unconstrained" (the 64-bit half of the process, which must keep
+     * getting host addresses outside the window) and anything >= 4 GB is
+     * already a host address. */
+    if (!*limit_high || *limit_high >= IOS_WOW_WINDOW_SIZE) return;
+    high = *limit_high;
+    low  = (*limit_low < IOS_WOW_WINDOW_SIZE) ? *limit_low : 0;
+    /* raise the floor, but never invert the caller's range */
+    if (low < IOS_WOW_GUEST_FLOOR && high > IOS_WOW_GUEST_FLOOR) low = IOS_WOW_GUEST_FLOOR;
+    *limit_low  = base + low;
+    *limit_high = base + high;
+}
+
+/* A host placement ceiling may itself lie inside the current window (a third
+ * slot below the furniture ceiling).  Testing only limit_high would then admit
+ * native ARM64 images into the guest reservation.  A translated guest request
+ * has BOTH bounds inside its own window; a host request spanning from
+ * address_space_start to that ceiling does not.  MADEIRA_WOW_STRICT_LIMITS=0
+ * restores the limit_high-only test. */
+static int ios_wow_limits_in_window( ULONG_PTR low, ULONG_PTR high )
+{
+    ULONG_PTR base = ios_wow_base();
+    int old_match = high && ios_wow_in_window( (void *)high );
+    int match = old_match && low >= base && low <= high;
+    static int enabled = -1;
+    int policy = __atomic_load_n( &enabled, __ATOMIC_ACQUIRE );
+
+    if (policy < 0)
+    {
+        const char *s = getenv( "MADEIRA_WOW_STRICT_LIMITS" );
+        policy = !(s && !strcmp( s, "0" ));
+        __atomic_store_n( &enabled, policy, __ATOMIC_RELEASE );
+    }
+    return policy ? match : old_match;
+}
+
+/* Clamp [*start, *end) off the reserved slot [wb, we).  Keep the side BELOW
+ * the slot whenever there is one: the side above the lowest slots is the
+ * [cage] holdback, which no furniture can use.  Advisory: map_view drops the
+ * clamp when it leaves no room. */
+static void ios_wow_exclude_range( void **start, void **end, ULONG_PTR wb, ULONG_PTR we )
+{
+    if ((ULONG_PTR)*end <= wb || (ULONG_PTR)*start >= we) return;   /* no overlap */
+    if ((ULONG_PTR)*start < wb) *end = (void *)wb;                  /* keep the low side */
+    else if ((ULONG_PTR)*end > we) *start = (void *)we;             /* nothing below: keep the high side */
+    /* else the request lies entirely inside the slot: leave it alone and let
+       the caller's own fallback decide */
+}
+
+/* Keep an UNCONSTRAINED kernel-pick placement out of every guest window and
+ * placeholder.  A window is a Wine reserved area, so without this the ordinary
+ * furniture search would hand out addresses inside a 32-bit process's window. */
+static void ios_wow_exclude_windows( void **start, void **end )
+{
+    unsigned i, n = ios_wow_window_count;
+
+    for (i = 0; i < n; i++)
+    {
+        ULONG_PTR wb = ios_wow_windows[i].base;
+
+        if (!wb) continue;
+        ios_wow_exclude_range( start, end, wb,
+                               wb + ios_wow_slot_reservation( &ios_wow_windows[i] ) );
+    }
+    for (i = 0; i < ios_wow_placeholder_count; i++)
+    {
+        ULONG_PTR pb = ios_wow_placeholders[i].base;
+
+        if (!pb || ios_wow_placeholders[i].adopted) continue;
+        ios_wow_exclude_range( start, end, pb, pb + IOS_WOW_WINDOW_SIZE +
+                               (ios_wow_placeholders[i].guard_owned ? ios_wow_guard_size() : 0) );
+    }
+}
+
+/* ---- lazy-window policy (build/host-tests/check-lazy-windows.py compiles this) ---- */
+
+/* The kernel's end of the user address map (TASK_VM_INFO.max_address), or 0
+ * when the kernel does not say. */
+static ULONG_PTR ios_wow_map_end(void)
+{
+    static ULONG_PTR kern_max;      /* 0 = not asked yet, 1 = unavailable */
+
+    if (!kern_max)
+    {
+        task_vm_info_data_t vmi;
+        mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+
+        kern_max = 1;
+        if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt ) == KERN_SUCCESS &&
+            vmi.max_address >= 0x100000000ULL)
+            kern_max = (ULONG_PTR)vmi.max_address;
+    }
+    return kern_max > 1 ? kern_max : 0;
+}
+
+static unsigned long ios_wow_env_ulong( const char *name, unsigned long dflt )
+{
+    const char *e = getenv( name );
+    return (e && *e) ? strtoul( e, NULL, 10 ) : dflt;
+}
+
+/***********************************************************************
+ *           ios_wow_band
+ *
+ * The range guest-window candidates are drawn from.
+ *
+ * With a 512 GB user map this is the furniture band [ios_usable_va_floor,
+ * ios_furniture_ceiling) capped below the CEF pools.  A device without that
+ * much address space (TASK_VM_INFO.max_address = 0xfc0000000, 63 GB, on a
+ * tablet without the extended-virtual-addressing entitlement) has no such band
+ * at all.  Nothing about a guest window needs a HIGH address: FEX forms host
+ * addresses as B + zext32(EA), so B only has to be 4 GB-aligned.  On such a
+ * map candidates come from the low band [16 GB, 44 GB): above the image, the
+ * malloc zones, the shared cache and the JIT pool's RW alias (all below
+ * 16 GB), below the FEX host arena at 48 GB, and clear of the top-down
+ * furniture that packs down from the end of the map.
+ *
+ * ios_wow_small_va_slots is then the MAXIMUM number of windows alive at once
+ * (MADEIRA_WOW_SMALL_VA_SLOTS, default 2): windows are reserved one at a time,
+ * when a 32-bit process starts, never ahead of time.  0 on a large map.
+ */
+static unsigned ios_wow_small_va_slots;
+static void ios_wow_band( ULONG_PTR *floor, ULONG_PTR *ceil )
+{
+    static int announced;
+    ULONG_PTR kern_max = ios_wow_map_end();
+
+    *floor = ios_usable_va_floor;
+    *ceil  = ios_furniture_ceiling ? ios_furniture_ceiling : (ULONG_PTR)user_space_limit;
+    if (*ceil > IOS_WOW_CEF_POOLS_START) *ceil = IOS_WOW_CEF_POOLS_START;
+
+    if (kern_max && kern_max < *floor + IOS_WOW_WINDOW_SIZE)
+    {
+        ULONG_PTR top = kern_max & ~(IOS_WOW_WINDOW_SIZE - 1);
+        ULONG_PTR lo  = (ULONG_PTR)0x400000000ULL;                      /* 16 GB */
+        ULONG_PTR hi  = top > 2 * IOS_WOW_WINDOW_SIZE ? top - 2 * IOS_WOW_WINDOW_SIZE : 0;
+        unsigned long want = ios_wow_env_ulong( "MADEIRA_WOW_SMALL_VA_SLOTS", 2 );
+
+        if (want < 1) want = 1;
+        if (want > IOS_WOW_MAX_WINDOWS) want = IOS_WOW_MAX_WINDOWS;
+        ios_wow_small_va_slots = (unsigned)want;
+        if (hi > (ULONG_PTR)0xb00000000ULL) hi = (ULONG_PTR)0xb00000000ULL;   /* 44 GB */
+        if (hi > lo + IOS_WOW_WINDOW_SIZE)
+        {
+            *floor = lo;
+            *ceil  = hi;
+        }
+        if (!announced)
+        {
+            announced = 1;
+            dprintf( 2, "[wow-window] small address map: it ends at %p, below the normal "
+                        "guest-window band -- candidates come from [%p,%p), at most %u window(s) "
+                        "at once\n", (void *)kern_max, (void *)*floor, (void *)*ceil,
+                     ios_wow_small_va_slots );
+        }
+    }
+}
+
+/* Free VA in [4 GB, map_end): the sum of the holes between regions. */
+static ULONG_PTR ios_wow_free_va( ULONG_PTR map_end )
+{
+    mach_vm_address_t addr = (mach_vm_address_t)0x100000000ULL;
+    ULONG_PTR free_bytes = 0;
+    unsigned regions = 0;
+
+    while (addr < map_end && regions++ < 1000000)
+    {
+        mach_vm_address_t a = addr;
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+
+        if (mach_vm_region( mach_task_self(), &a, &size, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&info, &cnt, &obj ) != KERN_SUCCESS || a >= map_end)
+        {
+            free_bytes += map_end - addr;              /* free to the end of the map */
+            break;
+        }
+        if (a > addr) free_bytes += a - addr;
+        addr = a + size;
+    }
+    return free_bytes;
+}
+
+/* SMALL-MAP RULE: may this session take (another) 4 GB window?
+ *
+ * A window is refused, cleanly and once-logged, when the map is smaller than
+ * MADEIRA_WOW_MIN_MAP_GB (default 48), or when taking it would leave less than
+ * MADEIRA_WOW_MIN_FREE_GB (default 8) of free VA outside it.  The 32-bit
+ * process then fails to start with STATUS_NO_MEMORY instead of squeezing the
+ * 64-bit side of the session.  An unknown map size is not a reason to refuse:
+ * the reservation itself then decides. */
+static int ios_wow_map_allows_window(void)
+{
+    ULONG_PTR map_end = ios_wow_map_end();
+    ULONG_PTR min_map, min_free, free_va;
+
+    if (!map_end) return 1;
+    min_map  = (ULONG_PTR)ios_wow_env_ulong( "MADEIRA_WOW_MIN_MAP_GB", 48 ) << 30;
+    min_free = (ULONG_PTR)ios_wow_env_ulong( "MADEIRA_WOW_MIN_FREE_GB", 8 ) << 30;
+    if (map_end < min_map)
+    {
+        dprintf( 2, "[wow-window] refused: map too small (ends at %p, MADEIRA_WOW_MIN_MAP_GB=%lu)\n",
+                 (void *)map_end, (unsigned long)(min_map >> 30) );
+        return 0;
+    }
+    free_va = ios_wow_free_va( map_end );
+    if (free_va < IOS_WOW_WINDOW_SIZE + min_free)
+    {
+        dprintf( 2, "[wow-window] refused: map too small (%lu MB free VA; a window needs 4096 MB "
+                    "plus MADEIRA_WOW_MIN_FREE_GB=%lu left over)\n",
+                 (unsigned long)(free_va >> 20), (unsigned long)(min_free >> 30) );
+        return 0;
+    }
+    return 1;
+}
+
+/* One slot below the FEX band's start: the top of the spill range. */
+static int ios_wow_spill_walk;
+#define IOS_WOW_SPILL_TOP ((ULONG_PTR)0x7b00000000)
+
+static int ios_wow_band_ok( ULONG_PTR base, ULONG_PTR total )
+{
+    if (ios_wow_spill_walk)
+        return base >= IOS_WOW_CEF_POOLS_START && base + total <= IOS_WOW_SPILL_TOP;
+    if (base < IOS_WOW_CEF_POOLS_START && base + total > IOS_WOW_CEF_POOLS_START)
+        return 0;   /* would cross into the CEF pools / FEX band */
+    if (base >= IOS_WOW_CEF_POOLS_START && base < IOS_WOW_FEX_BAND_END) return 0;
+    return 1;
+}
+
+/* Is [addr, addr+len) ALREADY covered by an existing region that no access can
+ * touch?  A failed fixed mapping is not evidence (it says the VA is taken, not
+ * that it is inaccessible), so query the region and require it to exist, to
+ * contain addr and to carry protection VM_PROT_NONE. */
+static int ios_wow_guard_neighbour_blocked( ULONG_PTR addr, ULONG_PTR len )
+{
+    mach_vm_address_t a = (mach_vm_address_t)addr;
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+
+    if (mach_vm_region( mach_task_self(), &a, &size, VM_REGION_BASIC_INFO_64,
+                        (vm_region_info_t)&info, &cnt, &obj ) != KERN_SUCCESS)
+        return 0;                                   /* free to the end of the VA */
+    if (a > (mach_vm_address_t)addr) return 0;      /* free hole at addr */
+    if (info.protection != VM_PROT_NONE) return 0;  /* accessible neighbour */
+    return a + size >= (mach_vm_address_t)addr + len;
+}
+
+static int ios_wow_window_try( ULONG_PTR base, unsigned *guard_owned )
+{
+    ULONG_PTR guard = ios_wow_guard_size();
+    struct ios_wow_placeholder *ph;
+    struct ios_wow_window *slot;
+    char what[256];
+
+    *guard_owned = 0;
+    if (!ios_wow_band_ok( base, IOS_WOW_WINDOW_SIZE )) return 0;
+
+    /* A slot still owned by a registry entry (live, dead-awaiting-teardown or
+     * leaked) may not be handed to a second process. */
+    if ((slot = ios_wow_slot_at_base( base )))
+    {
+        dprintf( 2, "[wow-window] B=%p REJECTED: the slot is %s\n", (void *)base,
+                 slot->dead ? "still held by an exited process whose teardown did not complete" :
+                 slot->leaked ? "abandoned by a process that is still alive inside it" :
+                 "in use by a running 32-bit process" );
+        return 0;
+    }
+
+    /* ADOPT the placeholder for this slot, if there is one.  Taking ownership
+     * is all that happens: unmapping to remap would open the hole the
+     * placeholder exists to keep. */
+    if ((ph = ios_wow_placeholder_find( base )))
+    {
+        if (ph->adopted)
+        {
+            dprintf( 2, "[wow-window] B=%p REJECTED: its placeholder is already adopted\n",
+                     (void *)base );
+            return 0;
+        }
+        ph->adopted = 1;
+        *guard_owned = ph->guard_owned;
+        dprintf( 2, "[wow-window] adopted placeholder B=%p..%p guard=%s\n",
+                 (void *)base, (void *)(base + IOS_WOW_WINDOW_SIZE),
+                 ph->guard_owned ? "owned" : "borrowed" );
+        return 1;
+    }
+
+    /* preferred: the 4 GB window plus our own guard page */
+    if (ios_wow_band_ok( base, IOS_WOW_WINDOW_SIZE + guard ) &&
+        anon_mmap_tryfixed( (void *)base, IOS_WOW_WINDOW_SIZE + guard,
+                            PROT_NONE, MAP_NORESERVE ) != MAP_FAILED)
+    {
+        mmap_add_reserved_area( (void *)base, IOS_WOW_WINDOW_SIZE + guard );
+        *guard_owned = 1;
+        dprintf( 2, "[wow-window] B=%p: reserved 4GB + own guard page (+0x%llx)\n",
+                 (void *)base, (unsigned long long)guard );
+        return 1;
+    }
+
+    /* an exactly-4GB gap: borrow the guard from the neighbour if — and only
+     * if — the neighbour is already inaccessible */
+    if (!ios_wow_guard_neighbour_blocked( base + IOS_WOW_WINDOW_SIZE, guard ))
+    {
+        ios_va_describe_range( (void *)(base + IOS_WOW_WINDOW_SIZE), guard, what, sizeof(what) );
+        dprintf( 2, "[wow-window] B=%p REJECTED: 4GB+guard unavailable and the page at "
+                    "%p is not an inaccessible neighbour (%s)\n",
+                 (void *)base, (void *)(base + IOS_WOW_WINDOW_SIZE), what );
+        return 0;
+    }
+    if (anon_mmap_tryfixed( (void *)base, IOS_WOW_WINDOW_SIZE,
+                            PROT_NONE, MAP_NORESERVE ) == MAP_FAILED)
+    {
+        ios_va_describe_range( (void *)base, IOS_WOW_WINDOW_SIZE, what, sizeof(what) );
+        dprintf( 2, "[wow-window] B=%p REJECTED: the 4GB range is not free (%s)\n",
+                 (void *)base, what );
+        return 0;
+    }
+    mmap_add_reserved_area( (void *)base, IOS_WOW_WINDOW_SIZE );
+    dprintf( 2, "[wow-window] B=%p: reserved exactly 4GB; guard BORROWED from the "
+                "pre-existing PROT_NONE region at %p\n",
+             (void *)base, (void *)(base + IOS_WOW_WINDOW_SIZE) );
+    return 1;
+}
+
+/* The lowest 4 GB-aligned slot a future 32-bit pseudo-process could still take,
+ * or 0.  Same candidate rule as ios_wow_window_pick().
+ *
+ * Device evidence: the [cage] holdback leaves exactly ONE 4 GB-aligned
+ * candidate in the furniture band, and MEM_TOP_DOWN placements (the session TEB
+ * block first of all) go to the very top of what is left, i.e. into that
+ * candidate; about 60 MB of furniture then made every later 32-bit child
+ * unstartable.  So once the session is ARMED, map_view keeps top-down furniture
+ * below the candidate (ios_wow_bias_end).  Never consulted before that. */
+static ULONG_PTR ios_wow_candidate_slot(void)
+{
+    ULONG_PTR floor, ceil;
+    ULONG_PTR cand;
+    unsigned i, n;
+
+    ios_wow_band( &floor, &ceil );
+    if (ceil <= floor || ceil - floor < IOS_WOW_WINDOW_SIZE) return 0;
+
+    n = ios_wow_window_count;
+    for (cand = (floor + IOS_WOW_WINDOW_SIZE - 1) & ~(IOS_WOW_WINDOW_SIZE - 1);
+         cand >= floor && cand + IOS_WOW_WINDOW_SIZE <= ceil;
+         cand += IOS_WOW_WINDOW_SIZE)
+    {
+        int taken = 0;
+        unsigned p;
+
+        /* windows and placeholders are real reservations, excluded by
+         * ios_wow_exclude_windows(); nothing left for the bias to protect */
+        for (i = 0; i < n; i++)
+            if (ios_wow_windows[i].base == cand) { taken = 1; break; }
+        for (p = 0; p < ios_wow_placeholder_count && !taken; p++)
+            if (ios_wow_placeholders[p].base == cand) taken = 1;
+        if (!taken) return cand;
+    }
+    return 0;
+}
+
+/* map_view's top-down bias: the end of a top-down kernel pick, lowered below
+ * the free candidate slot.  Only while the session is armed: a 64-bit-only
+ * session gets `end` back unchanged and the band is never looked at. */
+static void *ios_wow_bias_end( void *start, void *end )
+{
+    ULONG_PTR cand;
+
+    if (!ios_wow_session_armed()) return end;
+    cand = ios_wow_candidate_slot();
+    if (cand && (void *)cand > start && (void *)cand < end) return (void *)cand;
+    return end;
+}
+
+/***********************************************************************
+ *           ios_wow_carve_holdback_slots
+ *
+ * A SECOND CONCURRENT 32-bit process: take a slot out of the [cage] holdback.
+ *
+ * The furniture band [0x7038000000, 0x73ffff0000) holds two 4 GB-aligned slots
+ * that fit whole, 0x7100000000 and 0x7200000000, and the [cage] holdback
+ * (8 GB - 64 KB from 0x7200000000, reserved in virtual_init for a V8/cppgc
+ * reservation) covers the second.  A launcher that starts a 32-bit program
+ * needs two windows at once.  This runs from ios_wow_window_pick() only after
+ * every ordinary candidate has been refused, only while another 32-bit process
+ * is alive, and only while nobody has asked for the holdback: a session that
+ * never runs two concurrent 32-bit processes never reaches it, and the holdback
+ * is never shrunk when no 32-bit process exists.
+ *
+ * WHAT IS CARVED.  One MAP_FIXED PROT_NONE replacement over VA the holdback
+ * already owns (no munmap, so the kernel never sees a hole) plus a Wine
+ * reserved area, recorded as an unadopted placeholder that the normal path
+ * then adopts.  The guard page at B+4 GB is borrowed from the holdback
+ * remainder, which stays PROT_NONE.  ios_cage_holdback_live is cleared: the
+ * holdback is no longer contiguous and the grant path munmaps the whole range,
+ * which would now remove a live guest window.
+ *
+ * Returns the lowest slot carved, or 0.  Called with ios_wow_mutex held. */
+static ULONG_PTR ios_wow_carve_holdback_slots(void)
+{
+    ULONG_PTR floor  = ios_usable_va_floor;
+    ULONG_PTR ceil   = ios_furniture_ceiling ? ios_furniture_ceiling : (ULONG_PTR)user_space_limit;
+    ULONG_PTR guard  = ios_wow_guard_size();
+    ULONG_PTR hb_end = IOS_CAGE_BASE + IOS_CAGE_REAL_SIZE;
+    ULONG_PTR first  = 0;
+    ULONG_PTR cand;
+    unsigned made = 0;
+
+    if (!ios_cage_holdback_live || !ios_wow_live_window_count()) return 0;
+    if (ceil > IOS_WOW_CEF_POOLS_START) ceil = IOS_WOW_CEF_POOLS_START;
+
+    for (cand = IOS_CAGE_BASE; cand + IOS_WOW_WINDOW_SIZE + guard <= hb_end;
+         cand += IOS_WOW_WINDOW_SIZE)
+    {
+        if (cand < floor || cand + IOS_WOW_WINDOW_SIZE > ceil) continue;
+        if (!ios_wow_band_ok( cand, IOS_WOW_WINDOW_SIZE )) continue;
+        if (ios_wow_slot_at_base( cand ) || ios_wow_placeholder_find( cand )) continue;
+        if (ios_wow_placeholder_count >= IOS_WOW_MAX_WINDOWS) break;
+
+        /* replace, never unmap: this VA is ours already and must stay ours */
+        if (anon_mmap_fixed( (void *)cand, IOS_WOW_WINDOW_SIZE, PROT_NONE, MAP_NORESERVE ) == MAP_FAILED)
+        {
+            ERR( "[cage] carve of B=%p out of the holdback FAILED (%s)\n",
+                 (void *)cand, strerror(errno) );
+            continue;
+        }
+        mmap_add_reserved_area( (void *)cand, IOS_WOW_WINDOW_SIZE );
+        ios_wow_placeholders[ios_wow_placeholder_count].base        = cand;
+        ios_wow_placeholders[ios_wow_placeholder_count].guard_owned = 0;
+        ios_wow_placeholders[ios_wow_placeholder_count].adopted     = 0;
+        ios_wow_placeholder_count++;
+        if (!first) first = cand;
+        made++;
+        dprintf( 2, "[cage] carved guest-window slot B=%p..%p out of the holdback; its guard "
+                    "page is borrowed from the holdback remainder [%p,%p)\n",
+                 (void *)cand, (void *)(cand + IOS_WOW_WINDOW_SIZE),
+                 (void *)(cand + IOS_WOW_WINDOW_SIZE), (void *)hb_end );
+    }
+
+    if (made)
+    {
+        ios_cage_holdback_live = 0;
+        ios_cage_window_tail_live = 1;
+        ERR( "[cage] holdback traded for %u guest-window slot(s): the 8GB V8/cppgc reservation "
+             "can no longer be granted from 0x%llx this session\n",
+             made, (unsigned long long)IOS_CAGE_BASE );
+    }
+    return first;
+}
+
+/* A launcher -> helper -> program chain needs a THIRD window.  After the carve,
+ * finish the held upper half of the cage, [0x7300000000, 0x73ffff0000), on
+ * demand.  The missing 64 KB and the guard are acquired together with
+ * tryfixed, which refuses existing mappings (including a granted PA pool).
+ * The guard stays a raw host reservation, not allocatable Wine space.
+ * MADEIRA_WOW_EXTRA_WINDOW=0 disables it.  Called with ios_wow_mutex held. */
+static ULONG_PTR ios_wow_extend_holdback_tail( unsigned *guard_owned )
+{
+    const ULONG_PTR held_end = IOS_CAGE_BASE + IOS_CAGE_REAL_SIZE;
+    const ULONG_PTR base = held_end & ~(IOS_WOW_WINDOW_SIZE - 1);
+    const ULONG_PTR end = base + IOS_WOW_WINDOW_SIZE;
+    ULONG_PTR guard = ios_wow_guard_size();
+    const char *policy = getenv( "MADEIRA_WOW_EXTRA_WINDOW" );
+    struct ios_wow_placeholder *ph;
+
+    if (policy && !strcmp( policy, "0" )) return 0;
+    if (ios_wow_slot_at_base( base )) return 0;
+    /* a released extra window keeps its placeholder: adopt it again */
+    if ((ph = ios_wow_placeholder_find( base )))
+        return !ph->adopted && ios_wow_window_try( base, guard_owned ) ? base : 0;
+    if (!ios_cage_window_tail_live || ios_cage_holdback_live ||
+        ios_wow_placeholder_count >= IOS_WOW_MAX_WINDOWS) return 0;
+    if (anon_mmap_tryfixed( (void *)held_end, end - held_end + guard,
+                            PROT_NONE, MAP_NORESERVE ) == MAP_FAILED)
+    {
+        dprintf( 2, "[wow-window] extra window unavailable: tail=%p size=0x%llx errno=%d\n",
+                 (void *)held_end, (unsigned long long)(end - held_end + guard), errno );
+        return 0;
+    }
+    mmap_add_reserved_area( (void *)base, IOS_WOW_WINDOW_SIZE );
+    ph = &ios_wow_placeholders[ios_wow_placeholder_count++];
+    ph->base = base;
+    ph->guard_owned = 1;
+    ph->adopted = 0;
+    ios_cage_window_tail_live = 0;
+    dprintf( 2, "[wow-window] extended the held cage tail: B=%p end=%p guard=0x%llx\n",
+             (void *)base, (void *)end, (unsigned long long)guard );
+    return ios_wow_window_try( base, guard_owned ) ? base : 0;
+}
+
+static ULONG_PTR ios_wow_window_pick( unsigned *guard_owned )
+{
+    ULONG_PTR floor, ceil;
+    ULONG_PTR cand;
+
+    ios_wow_band( &floor, &ceil );
+    if (ceil <= floor || ceil - floor < IOS_WOW_WINDOW_SIZE) return 0;
+
+    /* 4 GB-aligned only, lowest first.  B must be 4 GB-aligned: FEX forms host
+     * addresses as [Xbase, Wea, UXTW], i.e. B + zext32(EA), which is only safe
+     * against a 32-bit wrap at the top of the window when the low 32 bits of B
+     * are zero. */
+    for (cand = (floor + IOS_WOW_WINDOW_SIZE - 1) & ~(IOS_WOW_WINDOW_SIZE - 1);
+         cand >= floor && cand + IOS_WOW_WINDOW_SIZE <= ceil;
+         cand += IOS_WOW_WINDOW_SIZE)
+        if (ios_wow_window_try( cand, guard_owned )) return cand;
+
+    /* the band is out of slots: a concurrent 32-bit process may trade the
+     * [cage] holdback for one (see ios_wow_carve_holdback_slots) */
+    if ((cand = ios_wow_carve_holdback_slots()) && ios_wow_window_try( cand, guard_owned ))
+        return cand;
+    if ((cand = ios_wow_extend_holdback_tail( guard_owned ))) return cand;
+
+    /* Still nothing: a 32-bit client with several 32-bit helpers can need more
+     * windows than the band holds.  [0x7400000000, 0x7c00000000) is kept for a
+     * 64-bit Chromium's PartitionAlloc pools, which a 32-bit client does not
+     * use.  Spill into it top-down from 0x7a when the band is full; each slot
+     * is checked free before it is taken, so pools already there are kept.
+     * MADEIRA_WOW_SPILL_CEF=0 disables this. */
+    {
+        const char *e = getenv( "MADEIRA_WOW_SPILL_CEF" );
+        if (!(e && e[0] == '0') && ceil <= IOS_WOW_CEF_POOLS_START && floor >= (ULONG_PTR)0x7000000000ULL)
+        {
+            ios_wow_spill_walk = 1;
+            for (cand = IOS_WOW_SPILL_TOP - IOS_WOW_WINDOW_SIZE; cand >= IOS_WOW_CEF_POOLS_START;
+                 cand -= IOS_WOW_WINDOW_SIZE)
+            {
+                if (ios_wow_window_try( cand, guard_owned ))
+                {
+                    ios_wow_spill_walk = 0;
+                    dprintf( 2, "[wow-window] band full: spilled into the Chromium pool range "
+                                "B=%p..%p (MADEIRA_WOW_SPILL_CEF=0 disables)\n",
+                             (void *)cand, (void *)(cand + IOS_WOW_WINDOW_SIZE) );
+                    return cand;
+                }
+            }
+            ios_wow_spill_walk = 0;
+        }
+    }
+
+    ERR( "[wow-window] no free 4GB-aligned slot in [%p,%p): a 32-bit process cannot start; "
+         "the REJECTED lines above say what is in each candidate\n", (void *)floor, (void *)ceil );
+    return 0;
+}
+
+/* Reserve up to `max` placeholders from the band, lowest first.  Called from
+ * virtual_init (ios_wow_session_start) only, before any furniture exists. */
+static void ios_wow_reserve_placeholders( unsigned max )
+{
+    ULONG_PTR floor, ceil;
+    ULONG_PTR cand;
+
+    ios_wow_band( &floor, &ceil );
+    if (ceil <= floor || ceil - floor < IOS_WOW_WINDOW_SIZE) return;
+    if (ios_wow_small_va_slots && max > ios_wow_small_va_slots) max = ios_wow_small_va_slots;
+
+    pthread_mutex_lock( &ios_wow_mutex );
+    for (cand = (floor + IOS_WOW_WINDOW_SIZE - 1) & ~(IOS_WOW_WINDOW_SIZE - 1);
+         cand >= floor && cand + IOS_WOW_WINDOW_SIZE <= ceil;
+         cand += IOS_WOW_WINDOW_SIZE)
+    {
+        unsigned guard_owned = 0;
+
+        if (ios_wow_placeholder_count >= max || ios_wow_placeholder_count >= IOS_WOW_MAX_WINDOWS)
+            break;
+        if (!ios_wow_window_try( cand, &guard_owned )) continue;
+        ios_wow_placeholders[ios_wow_placeholder_count].base        = cand;
+        ios_wow_placeholders[ios_wow_placeholder_count].guard_owned = guard_owned;
+        ios_wow_placeholders[ios_wow_placeholder_count].adopted     = 0;
+        ios_wow_placeholder_count++;
+        dprintf( 2, "[wow-window] placeholder reserved B=%p..%p (guard %s)\n",
+                 (void *)cand, (void *)(cand + IOS_WOW_WINDOW_SIZE),
+                 guard_owned ? "owned" : "borrowed" );
+    }
+    pthread_mutex_unlock( &ios_wow_mutex );
+}
+
+/***********************************************************************
+ *           ios_wow_session_start
+ *
+ * virtual_init's hook, the last thing it does (after the [cage] holdback,
+ * which the first slot borrows its guard page from).
+ *
+ *  - default, 64-bit main image: NOTHING.  No window and no placeholder is
+ *    reserved and the session is not armed, so a 64-bit-only session keeps
+ *    every byte of its address map (a small map loses nothing to 32-bit
+ *    support that will never run).
+ *  - 32-bit main image (ios_main_image_i386, published by the app): arm and
+ *    reserve ONE placeholder for it, now, before the system frameworks can
+ *    take the slot.  start_main_thread then adopts it.
+ *  - MADEIRA_WOW_PLACEHOLDERS=1: arm and reserve a placeholder for every slot
+ *    of the band (on a small map at most MADEIRA_WOW_SMALL_VA_SLOTS), for
+ *    64-bit launchers that start 32-bit children on a crowded map.
+ */
+static void ios_wow_session_start(void)
+{
+    unsigned want;
+
+    if (ios_wow_env_ulong( "MADEIRA_WOW_PLACEHOLDERS", 0 ) == 1) want = IOS_WOW_MAX_WINDOWS;
+    else if (ios_main_image_i386) want = 1;
+    else return;
+
+    ios_wow_session_arm();
+    if (!ios_wow_map_allows_window()) return;
+    ios_wow_reserve_placeholders( want );
+}
+/* ---- end of lazy-window policy ---- */
+
+/* Tear a dead window down.  Defined next to delete_view(), which it needs. */
+static int ios_wow_window_teardown( ULONG_PTR base, void *dead_peb, unsigned guard_owned );
+
+/* How long after a pseudo-process's exit the teardown waits before replacing
+ * its window.  Nothing joins a pseudo-process's threads on iOS, so a laggard
+ * thread can still be unwinding through the window for a moment after the
+ * exit.  The teardown runs from the NEXT 32-bit process's boot, so in practice
+ * the interval has long passed and nothing sleeps. */
+#define IOS_WOW_SETTLE_SEC 3
+
+/* RELEASE-ON-NEXT-ADOPT, step 2: tear down every window whose owner has exited.
+ *
+ * Runs at the top of ios_wow_window_reserve(), on the booting thread of the
+ * next 32-bit pseudo-process, with no lock held.  At exit the dying thread is
+ * still standing on its own TEB inside the window it would be unmapping. */
+static void ios_wow_reclaim_dead_windows(void)
+{
+    unsigned i;
+
+    for (i = 0; i < IOS_WOW_MAX_WINDOWS; i++)
+    {
+        ULONG_PTR base;
+        void *dead_peb;
+        unsigned guard_owned;
+        time_t released_at, now;
+
+        pthread_mutex_lock( &ios_wow_mutex );
+        if (!ios_wow_windows[i].base || ios_wow_windows[i].dead != 1)
+        {
+            pthread_mutex_unlock( &ios_wow_mutex );
+            continue;
+        }
+        base        = ios_wow_windows[i].base;
+        dead_peb    = ios_wow_windows[i].dead_peb;
+        guard_owned = ios_wow_windows[i].guard_owned;
+        released_at = ios_wow_windows[i].released_at;
+        ios_wow_windows[i].dead = 2;
+        pthread_mutex_unlock( &ios_wow_mutex );
+
+        now = time( NULL );
+        if (released_at && now >= released_at && now - released_at < IOS_WOW_SETTLE_SEC)
+        {
+            struct timespec ts;
+
+            ts.tv_sec  = IOS_WOW_SETTLE_SEC - (now - released_at);
+            ts.tv_nsec = 0;
+            nanosleep( &ts, NULL );
+        }
+
+        if (!ios_wow_window_teardown( base, dead_peb, guard_owned ))
+        {
+            pthread_mutex_lock( &ios_wow_mutex );
+            ios_wow_windows[i].dead = 1;   /* still dead, still not reclaimable */
+            pthread_mutex_unlock( &ios_wow_mutex );
+            continue;
+        }
+
+        pthread_mutex_lock( &ios_wow_mutex );
+        /* free the registry entry and hand the reservation back to its
+         * placeholder, unadopted, or drop it from the registry */
+        memset( &ios_wow_windows[i], 0, sizeof(ios_wow_windows[i]) );
+        {
+            struct ios_wow_placeholder *ph = ios_wow_placeholder_find( base );
+            if (ph) ph->adopted = 0;
+            else
+            {
+                /* no placeholder: keep the PROT_NONE reservation as one, so the
+                 * slot is not handed back to the kernel (the teardown replaced
+                 * it in place and it is still a Wine reserved area) */
+                if (ios_wow_placeholder_count < IOS_WOW_MAX_WINDOWS)
+                {
+                    ph = &ios_wow_placeholders[ios_wow_placeholder_count++];
+                    ph->base = base;
+                    ph->guard_owned = guard_owned;
+                    ph->adopted = 0;
+                }
+            }
+        }
+        pthread_mutex_unlock( &ios_wow_mutex );
+    }
+}
+
+/***********************************************************************
+ *           ios_wow_window_reserve
+ *
+ * Reserve a guest window for the calling thread (the boot thread of a 32-bit
+ * pseudo-process).  Idempotent per thread: one window per process, never more.
+ * Refused with STATUS_NO_MEMORY when the address map cannot afford one (see
+ * ios_wow_map_allows_window) or, on a small map, when the maximum number of
+ * concurrent windows is already alive.
+ */
+NTSTATUS ios_wow_window_reserve(void)
+{
+    struct ios_wow_window *slot = NULL;
+    unsigned guard_owned = 0, held = 0;
+    ULONG_PTR base, floor, ceil;
+    unsigned i;
+
+    ios_wow_session_arm();
+
+    /* give back what a previous 32-bit pseudo-process left behind first —
+     * this is what makes launcher -> program work */
+    ios_wow_reclaim_dead_windows();
+
+    pthread_mutex_lock( &ios_wow_mutex );
+    if (ios_wow_slot_current())
+    {
+        pthread_mutex_unlock( &ios_wow_mutex );
+        return STATUS_SUCCESS;   /* already have one */
+    }
+    for (i = 0; i < IOS_WOW_MAX_WINDOWS; i++)
+    {
+        if (ios_wow_windows[i].base) held++;
+        else if (!slot) slot = &ios_wow_windows[i];
+    }
+    if (!slot)
+    {
+        pthread_mutex_unlock( &ios_wow_mutex );
+        ERR( "[wow-window] registry full, cannot reserve a guest window\n" );
+        return STATUS_NO_MEMORY;
+    }
+    ios_wow_band( &floor, &ceil );
+    if (ios_wow_small_va_slots && held >= ios_wow_small_va_slots)
+    {
+        pthread_mutex_unlock( &ios_wow_mutex );
+        dprintf( 2, "[wow-window] refused: map too small for another window (%u of at most %u "
+                    "held; MADEIRA_WOW_SMALL_VA_SLOTS)\n", held, ios_wow_small_va_slots );
+        return STATUS_NO_MEMORY;
+    }
+    /* a free placeholder is already reserved VA: adopting it costs nothing, so
+     * only a fresh reservation has to pass the map rule */
+    for (i = 0; i < ios_wow_placeholder_count; i++)
+        if (!ios_wow_placeholders[i].adopted) break;
+    if (i == ios_wow_placeholder_count && !ios_wow_map_allows_window())
+    {
+        pthread_mutex_unlock( &ios_wow_mutex );
+        return STATUS_NO_MEMORY;
+    }
+    if (!(base = ios_wow_window_pick( &guard_owned )))
+    {
+        pthread_mutex_unlock( &ios_wow_mutex );
+        return STATUS_NO_MEMORY;
+    }
+    slot->peb           = NULL;
+    slot->owner         = pthread_self();
+    slot->teb_block     = NULL;
+    slot->next_free_teb = NULL;
+    slot->teb_block_pos = 0;
+    slot->leaked        = 0;
+    slot->dead          = 0;
+    slot->dead_peb      = NULL;
+    slot->released_at   = 0;
+    slot->guard_owned   = guard_owned;
+    slot->base          = base;
+    __sync_synchronize();
+    if (slot - ios_wow_windows >= (ptrdiff_t)ios_wow_window_count)
+        ios_wow_window_count = (unsigned)(slot - ios_wow_windows) + 1;
+    pthread_mutex_unlock( &ios_wow_mutex );
+    dprintf( 2, "[wow-window] reserved B=%p..%p (slot %d) guard=%s\n", (void *)base,
+             (void *)(base + IOS_WOW_WINDOW_SIZE), (int)(slot - ios_wow_windows),
+             guard_owned ? "owned" : "borrowed" );
+    return STATUS_SUCCESS;
+}
+
+void ios_wow_window_bind( void *peb_id )
+{
+    struct ios_wow_window *slot;
+
+    pthread_mutex_lock( &ios_wow_mutex );
+    if ((slot = ios_wow_slot_current()) && !slot->peb)
+    {
+        slot->peb = peb_id;
+        dprintf( 2, "[wow-window] slot %d B=%p bound to peb=%p\n",
+                 (int)(slot - ios_wow_windows), (void *)slot->base, peb_id );
+    }
+    pthread_mutex_unlock( &ios_wow_mutex );
+}
+
+/* ABANDON a window without ever giving the slot back.
+ *
+ * Not the exit path (that is ios_wow_window_mark_released).  This is the case
+ * where a pseudo-process stops being a WoW process while STAYING ALIVE inside
+ * its window (the loader's start.exe fallback for a main image that turned out
+ * not to be a mappable 32-bit PE).  Its first TEB/PEB pair is already inside
+ * the window and none of its threads is ever joined, so the VA can never be
+ * reclaimed: unbind the slot, mark it leaked so it is never handed out again,
+ * and keep the reservation so the range stays excluded from placement. */
+static void ios_wow_window_retire( struct ios_wow_window *slot )
+{
+    ULONG_PTR base;
+    void *peb_id;
+
+    pthread_mutex_lock( &ios_wow_mutex );
+    base = slot->base;
+    peb_id = slot->peb;
+    if (base && !slot->leaked && !slot->dead)
+    {
+        slot->leaked = 1;      /* keep base: the VA is still ours, just dead */
+        slot->peb = NULL;
+        slot->teb_block = NULL;
+        slot->next_free_teb = NULL;
+        slot->teb_block_pos = 0;
+    }
+    else base = 0;
+    pthread_mutex_unlock( &ios_wow_mutex );
+    if (base)
+        ERR( "[wow-window] B=%p (peb=%p) abandoned but not unmapped: the process is still alive "
+             "inside the window, so this slot serves no further 32-bit process this session\n",
+             (void *)base, peb_id );
+}
+
+/* RELEASE-ON-NEXT-ADOPT, step 1: the owning pseudo-process has EXITED.
+ *
+ * The slot stops resolving for anybody and the owner's identity is recorded,
+ * but the teardown itself waits for the next 32-bit process (see
+ * ios_wow_reclaim_dead_windows): this runs on the dead process's own last
+ * thread, which is still standing inside the range. */
+static void ios_wow_window_mark_released( struct ios_wow_window *slot )
+{
+    ULONG_PTR base;
+    void *peb_id;
+
+    pthread_mutex_lock( &ios_wow_mutex );
+    base   = slot->base;
+    peb_id = slot->peb;
+    if (base && !slot->leaked && !slot->dead)
+    {
+        slot->dead          = 1;
+        slot->dead_peb      = peb_id;
+        slot->released_at   = time( NULL );
+        slot->peb           = NULL;
+        slot->teb_block     = NULL;
+        slot->next_free_teb = NULL;
+        slot->teb_block_pos = 0;
+    }
+    else base = 0;
+    pthread_mutex_unlock( &ios_wow_mutex );
+    if (base)
+        dprintf( 2, "[wow-window] slot %d B=%p released (owner peb=%p exited); torn down when the "
+                    "next 32-bit process starts\n", (int)(slot - ios_wow_windows), (void *)base, peb_id );
+}
+
+/* Release the window owned by the calling thread's pseudo-process, from that
+ * process's own exit path. */
+void ios_wow_window_release_current(void)
+{
+    struct ios_wow_window *slot;
+
+    pthread_mutex_lock( &ios_wow_mutex );
+    slot = ios_wow_slot_current();
+    pthread_mutex_unlock( &ios_wow_mutex );
+    if (slot) ios_wow_window_mark_released( slot );
+}
+
+/* Abandon the calling thread's window for good — see ios_wow_window_retire(). */
+void ios_wow_window_retire_current(void)
+{
+    struct ios_wow_window *slot;
+
+    pthread_mutex_lock( &ios_wow_mutex );
+    slot = ios_wow_slot_current();
+    pthread_mutex_unlock( &ios_wow_mutex );
+    if (slot) ios_wow_window_retire( slot );
+}
+
+void ios_wow_window_release( void *peb_id )
+{
+    struct ios_wow_window *slot;
+
+    pthread_mutex_lock( &ios_wow_mutex );
+    slot = ios_wow_slot_for_peb( peb_id );
+    pthread_mutex_unlock( &ios_wow_mutex );
+    if (slot) ios_wow_window_mark_released( slot );
+}
+/* ==== end of WoW64 guest windows ==== */
+#else
+int ios_main_image_i386 = 0;
+int ios_wow_session_armed(void) { return 0; }
+void ios_wow_session_arm(void) { }
+ULONG_PTR ios_wow_base_for_peb( void *peb_id ) { return 0; }
+ULONG_PTR ios_wow_base(void) { return 0; }
+int ios_wow_in_window( const void *addr ) { return 0; }
+ULONG ios_wow_guest_addr( const void *host ) { return PtrToUlong( host ); }
+void ios_wow_translate_limits( ULONG_PTR *l, ULONG_PTR *h ) { }
+NTSTATUS ios_wow_window_reserve(void) { return STATUS_NOT_SUPPORTED; }
+void ios_wow_window_bind( void *peb_id ) { }
+void ios_wow_window_release( void *peb_id ) { }
+void ios_wow_window_release_current(void) { }
+void ios_wow_window_retire_current(void) { }
+#endif  /* WINE_IOS */
 
 
 /***********************************************************************
@@ -8553,6 +9738,282 @@ static NTSTATUS create_view( struct file_view **view_ret, void *base, size_t siz
     *view_ret = view;
     return STATUS_SUCCESS;
 }
+
+#ifdef WINE_IOS
+/***********************************************************************
+ *           ios_jit_purge_window
+ *
+ * Drop every JIT-pool record that describes PE memory inside a guest window
+ * that is being released.
+ *
+ * ios_jit_reclaim_process() already frees the pool ranges the dead PEB
+ * allocated, and ios_jit_add_mapping()'s stale-containment logic would purge an
+ * overlapping entry the next time an image is mapped at the same address.  But
+ * relying on that means the table keeps entries whose pe_base is about to be
+ * replaced by a DIFFERENT process's image at exactly the same guest address —
+ * the window is handed back at the same B, so the next 32-bit process's ntdll,
+ * kernel32 and exe land on the very same VAs — and until the purge-on-add
+ * happens every translate/sync_write for an address in the overlap resolves to
+ * the dead copy.  Make it explicit: at release, anything in [base, base+size)
+ * is by definition gone.
+ *
+ * Entries are tombstoned in the order the lock-free readers require: size = 0
+ * first (a zero-size entry matches no query), barrier, then pe_base = NULL. */
+static void ios_jit_purge_window( ULONG_PTR base, ULONG_PTR size )
+{
+    int i, maps = 0, aliases = 0;
+
+    pthread_mutex_lock( &ios_pool_lock );
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        ULONG_PTR eb = (ULONG_PTR)ios_jit_mappings[i].pe_base;
+
+        if (!ios_jit_mappings[i].pe_base) continue;
+        if (eb >= base + size || eb + ios_jit_mappings[i].size <= base) continue;
+        dprintf( 2, "[jit-pool] image %p+0x%lx jit=%p owner_peb=%p purged: its guest window "
+                    "%p+0x%llx is being released\n",
+                 (void *)eb, (unsigned long)ios_jit_mappings[i].size,
+                 ios_jit_mappings[i].jit_base, ios_jit_mappings[i].owner_peb,
+                 (void *)base, (unsigned long long)size );
+        ios_jit_mappings[i].size = 0;
+        __sync_synchronize();
+        ios_jit_mappings[i].pe_base = NULL;
+        maps++;
+    }
+    for (i = 0; i < ios_jit_anon_alias_count; i++)
+    {
+        uintptr_t uv = ios_jit_anon_aliases[i].user_va;
+
+        if (!uv) continue;
+        if (uv >= base + size || ios_jit_anon_aliases[i].user_va_end <= base) continue;
+        dprintf( 2, "[iOS-xrem] anon RWX alias %p..%p purged: its guest window %p is being "
+                    "released\n", (void *)uv, (void *)ios_jit_anon_aliases[i].user_va_end,
+                 (void *)base );
+        ios_jit_anon_aliases[i].user_va_end = 0;
+        __sync_synchronize();
+        ios_mono_alias_retire( uv );
+        ios_jit_anon_aliases[i].user_va = 0;
+        aliases++;
+    }
+    pthread_mutex_unlock( &ios_pool_lock );
+    dprintf( 2, "[jit-pool] window purge B=%p: %d image mapping(s), %d anon alias(es)\n",
+             (void *)base, maps, aliases );
+}
+
+
+/***********************************************************************
+ *           ios_wow_window_teardown
+ *
+ * RELEASE-ON-NEXT-ADOPT, step 2 (docs/WOW64.md).  Give a dead 32-bit
+ * pseudo-process's guest window back to the slot, WITHOUT ever leaving a hole
+ * the kernel could fill.
+ *
+ * The order is what matters:
+ *
+ *   1. Wine's bookkeeping for everything inside [B, B+4G) goes first — every
+ *      file_view (the i386 images, the anon views, the USD second view at
+ *      B+0x7ffe0000, the apiset view, the wow64 parameters block, the TEB/PEB
+ *      pages, every thread stack, the BOP/unix-call page at guest 0x250000),
+ *      then the pages_vprot bytes for the whole range.  Deleting a view inside
+ *      a reserved area already replaces its pages with PROT_NONE rather than
+ *      unmapping them, and it is what keeps free_ranges and views_tree
+ *      consistent; doing it after the big mmap would leave the tree pointing at
+ *      memory that is no longer what it says.
+ *
+ *   2. ONE mmap(MAP_FIXED, PROT_NONE, MAP_ANON|MAP_NORESERVE) over the whole
+ *      4 GB.  A fixed mapping atomically discards whatever is under it, so
+ *      there is never an instant in which the range is free — which is the
+ *      reason a placeholder is never unmapped.  NO munmap, and the
+ *      reserved-area entry and the FB3 guard page are deliberately untouched:
+ *      an overrun past B+4G must keep faulting, and the next adopter needs the
+ *      reservation to be exactly what it was.
+ *
+ *   3. The per-pseudo-process registries that are keyed by PEB and would
+ *      otherwise answer for the NEXT process: a child's PEB is allocated inside
+ *      the window, so the next 32-bit child's PEB very probably has the same
+ *      host address as this dead one, and a surviving [proc-ident] entry would
+ *      hand it the dead process's image info and private ntdll.
+ *
+ *   4. The session globals that point into the window.
+ *
+ * LIVE THREADS.  The precondition everybody wants — "no thread of the owner is
+ * still running" — cannot be proved on iOS: pseudo-processes are threads of one
+ * Mach task, NtTerminateProcess longjmps out of the CALLING thread only
+ * (process_ios.c), nothing joins the others, and a pseudo-process's own boot TEB
+ * is never freed, so counting teb_list entries with teb->Peb == dead_peb always
+ * finds at least one and proves nothing.  What this function does instead:
+ * unlink those TEBs from teb_list and report how many there were, wait out a
+ * settle interval after the exit (see
+ * IOS_WOW_SETTLE_SEC, and note that the teardown only runs when the NEXT 32-bit
+ * process boots, which is at least one process creation later), and leave the
+ * range PROT_NONE — so a laggard thread of the dead process FAULTS on its first
+ * access instead of quietly writing into the next process's memory.  That is
+ * strictly better than the previous behaviour, which was to leak the slot and
+ * make every later 32-bit process fail to start.
+ */
+static int ios_wow_window_teardown( ULONG_PTR base, void *dead_peb, unsigned guard_owned )
+{
+    struct ntdll_thread_data *thread_data, *next_thread_data;
+    struct file_view *batch[256];
+    unsigned stale_tebs = 0;
+    unsigned deleted = 0, straddlers = 0;
+    sigset_t sigset;
+    unsigned n, i;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+
+    /* teb_list is threaded THROUGH THE TEBs themselves (the entry is a field of
+     * the ntdll_thread_data inside each TEB), and this process's TEBs are inside
+     * the window.  Unlink them before the memory goes: nothing removes them
+     * otherwise — virtual_free_teb() is the only remover and a pseudo-process's
+     * boot TEB is never freed — so the very next walker of teb_list
+     * (virtual_clear_tls_index, for one) would step into PROT_NONE.
+     * The criterion is the TEB's ADDRESS, not its PEB: what makes an entry
+     * unusable is that its storage is about to be replaced. */
+    LIST_FOR_EACH_ENTRY_SAFE( thread_data, next_thread_data, &teb_list,
+                              struct ntdll_thread_data, entry )
+    {
+        TEB *t = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+
+        if ((ULONG_PTR)t < base || (ULONG_PTR)t >= base + IOS_WOW_WINDOW_SIZE) continue;
+        list_remove( &thread_data->entry );
+        stale_tebs++;
+    }
+
+    /* 1. views, in batches so the rb tree is never walked while it is edited */
+    do
+    {
+        struct file_view *view;
+
+        n = 0;
+        WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+        {
+            ULONG_PTR vb = (ULONG_PTR)view->base;
+
+            if (vb + view->size <= base) continue;
+            if (vb >= base + IOS_WOW_WINDOW_SIZE) break;   /* tree is address-ordered */
+            if (vb < base || vb + view->size > base + IOS_WOW_WINDOW_SIZE)
+            {
+                /* a view cannot legally straddle the window: everything in here
+                 * was placed inside the reserved area.  Say so and leave it. */
+                straddlers++;
+                continue;
+            }
+            batch[n++] = view;
+            if (n == ARRAY_SIZE(batch)) break;
+        }
+        for (i = 0; i < n; i++) delete_view( batch[i] );
+        deleted += n;
+    } while (n == ARRAY_SIZE(batch));
+
+    /* 2. pages_vprot for the whole range (delete_view cleared the covered
+     *    pages; this catches anything that was never a view) */
+    if (alloc_pages_vprot( (void *)base, IOS_WOW_WINDOW_SIZE ))
+        set_page_vprot( (void *)base, IOS_WOW_WINDOW_SIZE, 0 );
+
+    /* 3. ONE fixed mapping over the whole window.  Deliberately not munmap +
+     *    mmap: that would open the hole this whole mechanism exists to close. */
+    if (anon_mmap_fixed( (void *)base, IOS_WOW_WINDOW_SIZE, PROT_NONE, MAP_NORESERVE ) == MAP_FAILED)
+    {
+        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+        ERR( "[wow-window] teardown of B=%p FAILED: the single PROT_NONE replacement of the 4GB "
+             "range returned %s. The slot stays dead and no 32-bit process will get it; nothing "
+             "was handed back to the kernel.\n", (void *)base, strerror(errno) );
+        return 0;
+    }
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+
+    dprintf( 2, "[wow-window] teardown B=%p (owner peb=%p): %u view(s) deleted, %u straddling "
+                "view(s) left alone, %u TEB(s) unlinked from teb_list (nothing frees a "
+                "pseudo-process's boot TEB on iOS), 4GB replaced by ONE PROT_NONE mapping, "
+                "guard=%s kept\n",
+             (void *)base, dead_peb, deleted, straddlers, stale_tebs,
+             guard_owned ? "owned" : "borrowed" );
+    if (straddlers)
+        ERR( "[wow-window] teardown B=%p: %u view(s) straddle the window boundary and were NOT "
+             "deleted — their pages were replaced anyway, so Wine's bookkeeping for them is now "
+             "wrong. Nothing should ever place a view across a guest window.\n",
+             (void *)base, straddlers );
+
+    /* 4. JIT-pool records: the dead process's pool ranges and copies, then
+     *    anything at all that describes memory inside the window. */
+    if (dead_peb)
+    {
+        extern void ios_jit_reclaim_process( void *peb );
+        ios_jit_reclaim_process( dead_peb );
+    }
+    ios_jit_purge_window( base, IOS_WOW_WINDOW_SIZE );
+
+    /* 5. registries keyed by the dead PEB: the next child's PEB is allocated
+     *    at the same place inside the same window, so a survivor would answer
+     *    for it. */
+    if (dead_peb)
+    {
+        extern void ios_fd_cache_release( void *peb );
+        ios_fd_cache_release( dead_peb );
+    }
+
+    /* 6. session globals that pointed into the window.  user_space_wow_limit is
+     *    republished from the next 32-bit main image's large-address-aware bit
+     *    (virtual_set_large_address_space); wow_peb is
+     *    re-derived by that process's init_peb.
+     *
+     *    `peb` is the dangerous one: the child path deliberately leaves the
+     *    session global pointing at the last child it booted (loader_ios.c,
+     *    "peb stays as child_peb on this thread"), so after a 32-bit child dies
+     *    the global names a PEB inside the window we have just made PROT_NONE,
+     *    and the next unix-side `peb->...` on any thread would fault. */
+    if ((ULONG_PTR)peb >= base && (ULONG_PTR)peb < base + IOS_WOW_WINDOW_SIZE)
+    {
+        if (ios_session_peb &&
+            !((ULONG_PTR)ios_session_peb >= base &&
+              (ULONG_PTR)ios_session_peb < base + IOS_WOW_WINDOW_SIZE))
+        {
+            dprintf( 2, "[wow-window] session global peb=%p was the released window's — put back "
+                        "to the session PEB %p\n", peb, ios_session_peb );
+            peb = ios_session_peb;
+        }
+        else
+            ERR( "[wow-window] session global peb=%p is inside the released window %p and there is "
+                 "no session PEB outside it — every later unix-side peb dereference will fault\n",
+                 peb, (void *)base );
+    }
+    if (wow_peb && (ULONG_PTR)wow_peb >= base && (ULONG_PTR)wow_peb < base + IOS_WOW_WINDOW_SIZE)
+    {
+        dprintf( 2, "[wow-peb] session wow_peb=%p belonged to the released window — cleared\n",
+                 wow_peb );
+        wow_peb = NULL;
+    }
+    /*    user_space_wow_limit is a GUEST-namespace ceiling and a session global,
+     *    so it belongs to every live 32-bit pseudo-process at once.  With more
+     *    than one window slot in use (the [cage] carve) clearing it on one
+     *    process's exit would strip the survivor's 32-bit ceiling mid-run:
+     *    get_wow_user_space_limit() would read 0 and every later placement —
+     *    TEB blocks, 32-bit stacks, images, every zero_bits translation — would
+     *    lose its bound.  Only clear it when no live window is left. */
+    if (user_space_wow_limit)
+    {
+        unsigned i, survivors = 0;
+
+        pthread_mutex_lock( &ios_wow_mutex );
+        for (i = 0; i < ios_wow_window_count; i++)
+            if (ios_wow_windows[i].base && ios_wow_windows[i].base != base &&
+                !ios_wow_windows[i].dead && !ios_wow_windows[i].leaked) survivors++;
+        pthread_mutex_unlock( &ios_wow_mutex );
+
+        if (survivors)
+            dprintf( 2, "[wow-limit] KEPT (%p): %u other guest window(s) are still live and share "
+                        "this guest ceiling\n", (void *)user_space_wow_limit, survivors );
+        else
+        {
+            dprintf( 2, "[wow-limit] cleared (was %p): the next 32-bit main image publishes its own\n",
+                     (void *)user_space_wow_limit );
+            user_space_wow_limit = 0;
+        }
+    }
+    return 1;
+}
+#endif  /* WINE_IOS */
 
 
 /***********************************************************************
@@ -11335,6 +12796,31 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
         if (limit_high && (void *)limit_high < end) end = (char *)limit_high + 1;
 
+#ifdef WINE_IOS
+        /* WoW64 guest windows: a window is a Wine reserved area, so without
+         * this the ordinary furniture search would place 64-bit views inside
+         * a 32-bit pseudo-process's [B, B+4G) and starve it.  Requests that
+         * ARE window-constrained (translated by ios_wow_translate_limits) keep
+         * the window.  Advisory: if excluding the windows leaves no room, keep
+         * the original range (the rule the furniture ceiling follows).  With no
+         * window and no placeholder in the session this is skipped entirely. */
+        if ((ios_wow_window_count || ios_wow_placeholder_count) &&
+            !ios_wow_limits_in_window( limit_low, limit_high ))
+        {
+            void *excl_start = start, *excl_end = end;
+
+            ios_wow_exclude_windows( &excl_start, &excl_end );
+            if (excl_start < excl_end) { start = excl_start; end = excl_end; }
+        }
+
+        /* Once the session is armed, keep the free 4 GB-aligned candidate slot
+         * for the next 32-bit pseudo-process (see ios_wow_candidate_slot).  Only
+         * for top-down picks, and only when ceiling_relaxable, i.e. when the
+         * only constraints in force are ours and can be withdrawn again at the
+         * "THE CEILING IS ADVISORY, NEVER FATAL" retry below. */
+        if (top_down && ceiling_relaxable) end = ios_wow_bias_end( start, end );
+#endif
+
         /* task #35 (ml116): raise the scan floor to match the ceiling — see
          * ios_usable_va_floor. Gated on end already being at/below the ceiling,
          * which is exactly the set of requests the ceiling put on the scan path
@@ -13751,6 +15237,12 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
     LARGE_INTEGER offset;
     sigset_t sigset;
 
+#ifdef WINE_IOS
+    /* WoW64 guest window: same rule as allocate_virtual_memory — a ceiling
+     * below 4 GB reaching NtMapViewOfSection[Ex] is a GUEST ceiling. */
+    ios_wow_translate_limits( &limit_low, &limit_high );
+#endif
+
     switch(protect)
     {
     case PAGE_NOACCESS:
@@ -14067,6 +15559,12 @@ void virtual_init(void)
                  (unsigned long long)IOS_CAGE_BASE, (unsigned long long)IOS_CAGE_REAL_SIZE );
     }
     else dprintf( 2, "[cage] holdback reserve FAILED (errno %d) rev=ml433\n", errno );
+
+    /* Guest windows are reserved lazily; this reserves nothing unless a
+     * 32-bit main image was published or MADEIRA_WOW_PLACEHOLDERS=1 (see
+     * ios_wow_session_start).  Last, after the holdback, whose first page
+     * the lowest slot borrows as its guard. */
+    ios_wow_session_start();
 }
 
 
@@ -14633,6 +16131,9 @@ TEB *virtual_alloc_first_teb(void)
     data_size = 2 * block_size;
     NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&ptr, 0, &data_size, MEM_COMMIT, PAGE_READWRITE );
     peb = (PEB *)((char *)teb_block + 31 * block_size + (is_win64 ? 0 : page_size));
+#ifdef WINE_IOS
+    ios_session_peb = peb;   /* see ios_wow_window_teardown */
+#endif
     teb = init_teb( ptr, FALSE );
     pthread_key_create( &teb_key, NULL );
     pthread_setspecific( teb_key, teb );
@@ -16003,6 +17504,15 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     sigset_t sigset;
     SIZE_T size = *size_ptr;
     NTSTATUS status = STATUS_SUCCESS;
+
+#ifdef WINE_IOS
+    /* WoW64 guest window: every ceiling that reaches here below 4 GB is a
+     * GUEST-namespace number (a zero_bits limit from NtAllocateVirtualMemory or
+     * a MEM_ADDRESS_REQUIREMENTS limit from NtAllocateVirtualMemoryEx); nothing
+     * below 4 GB is mappable on iOS, so it can never be a host constraint.
+     * A no-op for a process without a window. */
+    ios_wow_translate_limits( &limit_low, &limit_high );
+#endif
 
     /* Round parameters to a page boundary */
 
@@ -17797,6 +19307,19 @@ static NTSTATUS get_extended_params( const MEM_EXTENDED_PARAMETER *parameters, U
             MEM_ADDRESS_REQUIREMENTS *r = parameters[i].Pointer;
             ULONG_PTR limit;
 
+#ifdef WINE_IOS
+            /* In a process with a guest window the requirement is a GUEST
+             * constraint only when its ceiling is below 4 GB (32-bit code
+             * cannot name anything higher).  The CPU module's own allocators
+             * in the same process pass explicit HIGH host bands and must be
+             * validated against the host ceiling.  Without a window this is
+             * the upstream rule. */
+            if (ios_wow_base())
+                limit = ((ULONG_PTR)r->HighestEndingAddress &&
+                         (ULONG_PTR)r->HighestEndingAddress < IOS_WOW_WINDOW_SIZE)
+                        ? get_wow_user_space_limit() : (ULONG_PTR)user_space_limit;
+            else
+#endif
             if (is_wow64()) limit = get_wow_user_space_limit();
             else limit = (ULONG_PTR)user_space_limit;
 
