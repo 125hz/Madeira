@@ -10,8 +10,9 @@ import Combine
 //
 // A game library in front of the existing launch path: entries are Windows
 // executables inside the prefix's drive_c, each with its own launch profile
-// (arguments, frame limit, x87 precision, on-screen controls). Play starts the same runWineFullSequence the developer
-// interface uses; the session runs full screen with a small in-game menu.
+// (arguments, resolution and scaling, frame limit, x87 precision, on-screen
+// controls). Play starts the same runWineFullSequence the developer interface
+// uses; the session runs full screen with a small in-game menu.
 //
 // The developer interface stays available: Settings › Interface switches back
 // to it (FrontendChoice), and it has a "Use New Interface" button to return.
@@ -157,8 +158,12 @@ struct LibraryEntry: Codable, Identifiable {
     /// A user-chosen cover in Documents/madeira-art/.
     var coverFile: String?
     var arguments = ""
-    /// Desktop size for the Desktop entry ("WxH").
+    /// The virtual monitor's size ("WxH"): the session default a game renders
+    /// for (GuestDisplay.configureSessionDefault), and the Desktop entry's
+    /// desktop size. New entries use main's session default.
     var resolution = "1024x768"
+    /// How the monitor is scaled to the screen (DisplayMode raw value; nil = Fit).
+    var display: String?
     /// FPS limit: 1 = 60, 3 = 30, 0 = display maximum, 2 = uncapped (madeira_set_vsync_locked).
     var fpsMode = 1
     /// FEX's X87ReducedPrecision for this game. Off by default, as in FEX; only
@@ -176,6 +181,8 @@ struct LibraryEntry: Codable, Identifiable {
     var overlayFields: [String]?
     /// The Wine desktop (explorer and services in a virtual desktop).
     var desktop: Bool?
+
+    var displayMode: DisplayMode { display.flatMap(DisplayMode.init(rawValue:)) ?? .fit }
 
     var launchArguments: String {
         if desktop == true { return "/desktop=shell,\(resolution) C:\\windows\\system32\\services.exe" }
@@ -219,24 +226,18 @@ struct LibraryEntry: Codable, Identifiable {
         if reducedX87 { setenv("FEX_X87REDUCEDPRECISION", "1", 1) } else { unsetenv("FEX_X87REDUCEDPRECISION") }
         madeira_set_vsync_locked(effectiveFPSMode)
         fputs("[frontend] launch profile applied\n", stderr)
+        LogStore.shared.log("[display-shape] resolution=\(resolution) mode=\(displayMode.rawValue)")
     }
 
     /// What the bridge starts. Set on the main thread before the session begins.
     func configureLaunch() {
         setenv("MADEIRA_EXE", desktop == true ? "explorer.exe" : windowsPath, 1)
         setenv("MADEIRA_ARGS", launchArguments, 1)
-        if desktop == true {
-            setenv("MADEIRA_DESKTOP", "1", 1)
-            let size = resolution.split(separator: "x")
-            if size.count == 2 {
-                setenv("MADEIRA_SCREEN_W", String(size[0]), 1)
-                setenv("MADEIRA_SCREEN_H", String(size[1]), 1)
-            }
-        } else {
-            unsetenv("MADEIRA_DESKTOP")
-            unsetenv("MADEIRA_SCREEN_W")
-            unsetenv("MADEIRA_SCREEN_H")
-        }
+        if desktop == true { setenv("MADEIRA_DESKTOP", "1", 1) } else { unsetenv("MADEIRA_DESKTOP") }
+        // Every session's virtual monitor takes this entry's Resolution
+        // (MADEIRA_SCREEN_W/H, source "knob"); for the Desktop entry it is the
+        // same size as its /desktop= argument.
+        GuestDisplay.configureSessionDefault(view: CGSize(width: 1280, height: 720), knob: resolution)
     }
 }
 
@@ -252,6 +253,10 @@ final class LibraryModel: ObservableObject {
     @Published var performance = false
     @Published var liveLogs = false
     @Published var fpsMode = 1
+    /// The session's Aspect & scaling; MetalBackedView lays the game out with it.
+    @Published var displayMode = DisplayMode.fit {
+        didSet { if displayMode != oldValue { MetalBackedView.refreshDisplayMode(reason: "mode-toggle") } }
+    }
     @Published var error: String?
     @Published var sessionMessage = ""
     @Published var launching = false
@@ -286,6 +291,8 @@ final class LibraryModel: ObservableObject {
     private var metadataInFlight = Set<UUID>()
     private var savedControls: [TouchControl] = []
     private var savedVisible = true
+    /// The session's first frame makes the drawable's shape known (Aspect).
+    private var laidOutAfterFirstPresent = false
     private struct Document: Codable { var version: Int; var entries: [LibraryEntry] }
     private var file: URL { Self.documents.appendingPathComponent("madeira-library.json") }
 
@@ -473,7 +480,9 @@ final class LibraryModel: ObservableObject {
         Self.sessionsThisRun += 1
         launchPresent = madeira_get_present_count(); launchStarted = Date(); launchSlow = false; launchLogs = entry.liveLogs
         launchSurface = winios_surface_present_count()
+        MetalBackedView.presentCountAtLaunch = launchPresent; laidOutAfterFirstPresent = false
         launching = true; overlayFields = entry.overlayFields ?? ["FPS", "Frame time", "RAM", "Battery"]
+        displayMode = entry.displayMode
         activeEntry = entry; current = entry.id; menu = false; performance = entry.performance; liveLogs = entry.liveLogs
         LogStore.shared.setDisplayActive(entry.liveLogs)
         fpsMode = entry.fpsMode; sessionMessage = "Starting…"
@@ -502,6 +511,11 @@ final class LibraryModel: ObservableObject {
             sawProcess = true
             if sessionMessage == "Starting…" { sessionMessage = "" }
         } else if sawProcess && wineserver_is_running() == 0 { finish() }
+        // The first frame gives Aspect and Fill height the drawable's shape.
+        if current != nil, !laidOutAfterFirstPresent, madeira_get_present_count() != MetalBackedView.presentCountAtLaunch {
+            laidOutAfterFirstPresent = true
+            MetalBackedView.refreshDisplayMode(reason: "first-present")
+        }
     }
     func launchFailed() { if current != nil && !sawProcess { finish(); error = "The session could not start. Check the diagnostic log and JIT status." } }
     /// Both flags change in one transaction without animation: the animated
@@ -553,7 +567,11 @@ final class LibraryModel: ObservableObject {
             entry.controls = controls.controls
             entry.touchControls = controls.visible
             entry.fpsMode = fpsMode; entry.performance = performance
-            entry.overlayFields = overlayFields; save(entry)
+            entry.overlayFields = overlayFields
+            // The in-game Aspect & scaling choice sticks to the game. MADEIRA_SESSION_TOOLS=0
+            // hides that picker and leaves the stored choice alone.
+            if MadeiraConfig.flag("MADEIRA_SESSION_TOOLS") { entry.display = displayMode.rawValue }
+            save(entry)
         }
     }
     private func finish() {
@@ -564,6 +582,7 @@ final class LibraryModel: ObservableObject {
         controls.editing = false; controls.selected = nil
         controls.controls = savedControls; controls.visible = savedVisible
         current = nil; activeEntry = nil; menu = false; sessionMessage = ""
+        displayMode = .fit
         LogStore.shared.setDisplayActive(true)
         launching = false; launchLogs = false; LibraryKeyboard.hide()
         LibraryController.shared.configure(enabled: enabled, ownsInput: enabled)
@@ -879,7 +898,7 @@ struct LibraryView: View {
             } header: { Text("Diagnostics") }
             Section("Pointer") { LibraryPointerSettings() }
             Section("Library") {
-                Text("Add complete application folders to Madeira/wine/drive_c using Files. Frame limit and compatibility options are saved per game.")
+                Text("Add complete application folders to Madeira/wine/drive_c using Files. Display, frame limit, and compatibility options are saved per game.")
             }
             Section {
                 Toggle("Use developer interface", isOn: Binding(get: { developerUI }, set: { on in
@@ -1097,6 +1116,24 @@ struct LibraryDetail: View {
     @State private var remove = false
     @State private var leaving = false
     @State private var error: String?
+    static let presetResolutions = ["640x480", "800x600", "960x540", "1024x768", "1280x720", "1280x960", "1920x1080", "2560x1440"]
+    /// The presets, plus a stored size that is none of them (a screen shape
+    /// chosen on another device), so the picker never shows a blank choice.
+    static func resolutions(keeping current: String) -> [String] {
+        presetResolutions.contains(current) || current == screenShapeResolution ? presetResolutions : presetResolutions + [current]
+    }
+    /// "WxH" matching this screen's landscape aspect at 720 lines (width
+    /// rounded to a multiple of 8), or nil when it equals a preset or
+    /// MADEIRA_SCREEN_SHAPE_RESOLUTION=0.
+    static var screenShapeResolution: String? {
+        guard MadeiraConfig.flag("MADEIRA_SCREEN_SHAPE_RESOLUTION") else { return nil }
+        let bounds = UIScreen.main.bounds
+        let long = max(bounds.width, bounds.height), short = min(bounds.width, bounds.height)
+        guard short > 0 else { return nil }
+        let width = Int((720 * long / short / 8).rounded()) * 8
+        guard (640...4096).contains(width), width != 1280, width != 960 else { return nil }
+        return "\(width)x720"
+    }
     private func start() {
         guard !leaving else { return }
         leaving = true
@@ -1136,10 +1173,17 @@ struct LibraryDetail: View {
                     if entry.coverFile != nil { Button("Remove cover image") { entry.coverFile = nil } }
                 } }
                 Section("Display") {
-                    if entry.desktop == true {
-                        Picker("Desktop size", selection: $entry.resolution) {
-                            ForEach(["800x600", "1024x768", "1280x720", "1280x960", "1920x1080"], id: \.self) { Text($0.replacingOccurrences(of: "x", with: "×")).tag($0) }
+                    // The Windows screen the game renders for (and the Desktop's size).
+                    Picker("Resolution", selection: $entry.resolution) {
+                        ForEach(Self.resolutions(keeping: entry.resolution), id: \.self) { Text($0.replacingOccurrences(of: "x", with: "×")).tag($0) }
+                        // This device's own aspect ratio at 720 lines, so the game
+                        // fills the screen without bars or stretching.
+                        if let shape = Self.screenShapeResolution {
+                            Text("Screen shape (\(shape.replacingOccurrences(of: "x", with: "×")))").tag(shape)
                         }
+                    }
+                    Picker("Aspect & scaling", selection: Binding(get: { entry.displayMode.rawValue }, set: { entry.display = $0 })) {
+                        ForEach(DisplayMode.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
                     }
                     FPSChoice(mode: $entry.fpsMode)
                 }
@@ -1312,6 +1356,7 @@ struct LibraryHUD: View {
     }
     @ObservedObject private var model = LibraryModel.shared
     @ObservedObject private var controls = TouchControlsModel.shared
+    private let sessionTools = MadeiraConfig.flag("MADEIRA_SESSION_TOOLS")
     @State private var launchVisible = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
@@ -1408,6 +1453,15 @@ struct LibraryHUD: View {
                 Button("Keyboard", systemImage: "keyboard") { model.menu = false; LibraryKeyboard.show() }
                 Divider()
                 FPSChoice(mode: Binding(get: { model.fpsMode }, set: { model.setFPS($0) }))
+                // Saved to the game with the rest of the session's profile.
+                // MADEIRA_SESSION_TOOLS=0 hides it.
+                if sessionTools {
+                    LabeledContent("Aspect & scaling") {
+                        Picker("Aspect & scaling", selection: $model.displayMode) {
+                            ForEach(DisplayMode.allCases, id: \.self) { mode in Label(mode.label, systemImage: mode.symbol).tag(mode) }
+                        }.pickerStyle(.menu).labelsHidden()
+                    }
+                }
                 Divider()
                 Text("Mouse & pointer").font(.headline)
                 LibraryPointerSettings()

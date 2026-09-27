@@ -122,18 +122,93 @@ final class MetalBackedView: UIView {
     // ~1 FPS content mostly doesn't. Resolution path: raise game FPS (perf
     // work), with a steady-rate re-present in DXMT as fallback insurance.
 
-    /// Largest 4:3 rect (the 1024×768 logical surface's aspect) that fits
-    /// centered in our bounds. The window-level host view gets THIS frame,
-    /// not our full bounds — otherwise landscape stretches the game to the
-    /// display edges (2026-07-05). Touch mapping uses the same rect so
-    /// letterboxing never skews input.
-    private func gameRect() -> CGRect {
-        let gw: CGFloat = 1024, gh: CGFloat = 768
-        let scale = min(bounds.width / gw, bounds.height / gh)
-        let w = gw * scale, h = gh * scale
-        return CGRect(x: (bounds.width - w) / 2, y: (bounds.height - h) / 2,
-                      width: max(w, 1), height: max(h, 1))
+    /// The guest surface's size in guest pixels: the virtual monitor win32u
+    /// reports right now (GuestDisplay.swift). A game's ChangeDisplaySettings
+    /// really resizes it, so it is read back on every use rather than taken
+    /// from MADEIRA_SCREEN_W/H once; a mode change re-lays-out through
+    /// `observeModeChanges`. It is 1024x768 unless a session chose otherwise.
+    private func guestSize() -> CGSize {
+        Self.observeModeChanges()
+        var w: Int32 = 0, h: Int32 = 0
+        winios_screen_size(&w, &h)
+        guard w > 0, h > 0 else { return CGSize(width: 1024, height: 768) }
+        return CGSize(width: CGFloat(w), height: CGFloat(h))
     }
+
+    /// The layout used for the presented layer and for touch mapping: a
+    /// library session's Aspect & scaling choice (LibraryModel.displayMode);
+    /// Fit everywhere else, which is what the developer interface always did.
+    private func effectiveDisplayMode() -> DisplayMode {
+        let library = LibraryModel.shared
+        return library.current != nil ? library.displayMode : .fit
+    }
+
+    /// The presented drawable's size, or `.zero` until this session has
+    /// presented into it (before that it is the 800x600 seed or the last
+    /// session's size, and Aspect would letterbox against the wrong shape).
+    private func drawableAspect() -> CGSize {
+        guard madeira_get_present_count() != Self.presentCountAtLaunch else { return .zero }
+        let d = MetalHostView.shared.metalLayer.drawableSize
+        return (d.width > 0 && d.height > 0) ? d : .zero
+    }
+
+    /// The present counter when the current library session started (see
+    /// drawableAspect); LibraryModel.begin sets it.
+    static var presentCountAtLaunch: UInt64 = 0
+
+    /// The rect (view-local points) the guest surface occupies. The
+    /// window-level host view gets THIS frame, not our full bounds, and touch
+    /// mapping uses the same rect, so letterboxing, cropping and stretching
+    /// never skew input.
+    private func gameRect() -> CGRect {
+        let r = GameSurfaceLayout.rect(guest: guestSize(), aspect: drawableAspect(),
+                                       bounds: bounds, mode: effectiveDisplayMode())
+        return CGRect(x: r.minX, y: r.minY, width: max(r.width, 1), height: max(r.height, 1))
+    }
+
+    private static var drawableObservation: NSKeyValueObservation?
+    private static var pendingSettle: DispatchWorkItem?
+    private static var lastApplied = ""
+
+    /// Sizes the presented layer's host view to gameRect(). `[display] apply`
+    /// is logged when the result changes.
+    private func applyDisplayMode(reason: String) {
+        guard let w = window else { return }
+        let r = gameRect()
+        MetalHostView.shared.frame = convert(r, to: w)
+        let guest = guestSize(), mode = effectiveDisplayMode()
+        let line = String(format: "mode=%@ guest=%.0fx%.0f bounds=%.0fx%.0f -> rect=(%.0f,%.0f %.0fx%.0f)",
+                          mode.rawValue, guest.width, guest.height, bounds.width, bounds.height,
+                          r.minX, r.minY, r.width, r.height)
+        if line != Self.lastApplied {
+            Self.lastApplied = line
+            fputs("[display] apply reason=\(reason) \(line)\n", stderr)
+        }
+    }
+
+    /// Re-applies the layout to the live view now and once more ~0.3 s later:
+    /// UIKit reports pre-rotation bounds while a rotation is still animating,
+    /// and DXMT may not have published the new drawable size yet. A burst of
+    /// triggers collapses into one trailing re-apply.
+    static func refreshDisplayMode(reason: String = "refresh") {
+        keyboardTarget?.applyDisplayMode(reason: reason)
+        pendingSettle?.cancel()
+        let item = DispatchWorkItem { keyboardTarget?.applyDisplayMode(reason: "settle:\(reason)") }
+        pendingSettle = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: item)
+    }
+
+    /// Guest mode changes (IOSDisplayShim posts them on the main queue) and
+    /// device rotation re-lay-out the surface. Idempotent, app lifetime.
+    private static let observers: [NSObjectProtocol] = [
+        NotificationCenter.default.addObserver(forName: .MadeiraDisplayModeChanged, object: nil, queue: .main) { _ in
+            MetalBackedView.refreshDisplayMode(reason: "mode-changed")
+        },
+        NotificationCenter.default.addObserver(forName: UIDevice.orientationDidChangeNotification, object: nil, queue: .main) { _ in
+            MetalBackedView.refreshDisplayMode(reason: "orientation")
+        },
+    ]
+    static func observeModeChanges() { _ = observers }
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
@@ -156,7 +231,7 @@ final class MetalBackedView: UIView {
             host.removeFromSuperview()
             w.addSubview(host)
         }
-        host.frame = convert(gameRect(), to: w)
+        applyDisplayMode(reason: "attach")
         // S2 desktop mode: the winios compositor renders the wine virtual
         // desktop aspect-fit inside THIS placeholder's area, exactly like
         // the games' Metal layer — never over the whole phone screen.
@@ -165,6 +240,11 @@ final class MetalBackedView: UIView {
         if !Self.layerRegistered {
             Self.layerRegistered = true
             madeira_display_set_layer(host.metalLayer)
+            // DXMT writes drawableSize off the main thread; Aspect and Fill
+            // height follow it, so a change re-lays-out on the main queue.
+            Self.drawableObservation = host.metalLayer.observe(\.drawableSize, options: [.new]) { _, _ in
+                DispatchQueue.main.async { MetalBackedView.refreshDisplayMode(reason: "drawable") }
+            }
             LogStore.shared.log("MetalLayer registered with DXMT shim (window-hosted singleton)", level: .success)
         }
     }
@@ -172,21 +252,34 @@ final class MetalBackedView: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         if let w = window {
-            MetalHostView.shared.frame = convert(gameRect(), to: w)
+            applyDisplayMode(reason: "layout")
             let full = convert(bounds, to: w)
             winios_set_compositor_frame(full.minX, full.minY, full.width, full.height)
         }
     }
 
-    // Map touch point in view-local UI points to the 1024×768 logical
-    // surface DXMT swapchains use, then post to winios.drv. Coordinates
-    // are relative to the aspect-fit gameRect (letterbox borders clamp).
+    // Map a touch in view-local points to guest pixels through the same
+    // GameSurfaceLayout math that sizes the presented layer, then post to
+    // winios.drv. Off-surface touches (letterbox, Fill's cropped margin)
+    // clamp to the nearest edge.
     private func mapTouch(_ touch: UITouch) -> (Int32, Int32) {
-        let p = touch.location(in: self)
-        let r = gameRect()
-        let x = Int32(min(max((p.x - r.minX) * 1024 / r.width, 0), 1023))
-        let y = Int32(min(max((p.y - r.minY) * 768 / r.height, 0), 767))
-        return (x, y)
+        mapPoint(touch.location(in: self))
+    }
+
+    /// Same mapping for any point (a multi-finger midpoint, a touch's down
+    /// point). In a desktop session the compositor letterboxes the desktop in
+    /// its own frame, so it does the mapping.
+    private func mapPoint(_ p: CGPoint) -> (Int32, Int32) {
+        if desktopMode {
+            let w = convert(p, to: nil)
+            var px: Int32 = 0, py: Int32 = 0
+            _ = winios_desktop_point_from_window(Double(w.x), Double(w.y), &px, &py)
+            Self.cursor = CGPoint(x: CGFloat(px), y: CGFloat(py))   // keep the trackpad cursor in step
+            return (px, py)
+        }
+        let g = GameSurfaceLayout.map(point: p, guest: guestSize(), aspect: drawableAspect(),
+                                      bounds: bounds, mode: effectiveDisplayMode())
+        return (Int32(g.x), Int32(g.y))
     }
 
     // ==================================================================
