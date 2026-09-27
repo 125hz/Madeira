@@ -23,9 +23,9 @@ Statically linked into the application binary:
   repository, build/gnutls-ios/src, built by build/gnutls-ios/build.sh.
 - FFmpeg 7.1.1 (libavformat, libavcodec, libavutil, libswresample):
   LGPL-2.1-or-later (LGPL-2.1.txt), configured without any GPL, version3 or
-  non-free component. Unmodified upstream release from ffmpeg.org, SHA-256
-  733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1, built by
-  build/ffmpeg/build.sh in the Madeira repository.
+  non-free component. Source tarball (the unmodified upstream release from
+  ffmpeg.org) and its SHA-256: the Madeira repository, build/ffmpeg/src,
+  built by build/ffmpeg/build.sh.
 
 Dynamically loaded at runtime:
 - Apple Metal Shader Converter dynamic library: Apple proprietary, under the

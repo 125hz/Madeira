@@ -36,8 +36,8 @@ git-ignored and consumed by the app project.
    from a clean checkout.
    `build/ffmpeg/build.sh`: FFmpeg 7.1.1 in an LGPL-only configuration (WMA,
    MPEG audio and PCM decoders; mp3/wav/mov demuxers; no H.264/HEVC/AAC),
-   fetched from ffmpeg.org into `build/ffmpeg/src` and verified against the
-   SHA-256 pinned in the script -> headers in `toolchains/ffmpeg-ios/include`
+   built from the tracked, unmodified release tarball in `build/ffmpeg/src`
+   after verifying it against `build/ffmpeg/src/SHA256SUMS` -> headers in `toolchains/ffmpeg-ios/include`
    (read by `build/ntdll-unix/build.sh` for winegstreamer's unix side) and
    `app/Madeira/lib{avformat,avcodec,swresample,avutil}.a` (ignored; the app
    target links them together with VideoToolbox, CoreMedia, CoreVideo,
@@ -60,9 +60,8 @@ git-ignored and consumed by the app project.
 ## Status of the LGPL relink question
 
 A recipient of a built package can obtain the complete corresponding
-source of every LGPL library (Wine fork, GnuTLS, Nettle, GMP) from the
-repository (FFmpeg: the unmodified ffmpeg.org release that
-`build/ffmpeg/build.sh` pins by version and SHA-256), and the application source and build scripts above. Whether
+source of every LGPL library (Wine fork, GnuTLS, Nettle, GMP, FFmpeg) from the
+repository, and the application source and build scripts above. Whether
 they can actually relink depends on assembling the "not in the repository"
 inputs and re-executing the UNVERIFIED steps; that end-to-end clean-machine
 rebuild, signing and installation has NOT been performed. Until it is,

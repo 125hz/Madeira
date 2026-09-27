@@ -32,13 +32,16 @@
 # --disable-asm: the C paths are enough for these decoders, and it keeps the
 # archive identical in behaviour to the one the port was tested with.
 #
-# The tarball is the unmodified upstream release, fetched from ffmpeg.org into
-# build/ffmpeg/src/ (ignored) and checked against the SHA-256 below before
-# anything is extracted; a mismatch aborts. No patches are applied.
+# The source is the unmodified upstream release tarball, TRACKED in
+# build/ffmpeg/src/ (as build/gnutls-ios/src/ tracks GnuTLS, GMP and nettle):
+# it is the corresponding source of the archives the app links, and the build
+# needs no network. It is checked against build/ffmpeg/src/SHA256SUMS before
+# anything is extracted; a mismatch aborts. No patches are applied. The
+# checksum is the one pinned when the tarball was downloaded from
+# https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz.
 #
-# Re-runnable: the tarball is cached, and configure runs again only when the
-# configure arguments change (they are stamped into the build tree) or when
-# --reconfigure is passed.
+# Re-runnable: configure runs again only when the configure arguments change
+# (they are stamped into the build tree) or when --reconfigure is passed.
 set -euo pipefail
 
 BUILD_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -49,8 +52,6 @@ PREFIX="$REPO_ROOT/toolchains/ffmpeg-ios"
 APP_DIR="$REPO_ROOT/app/Madeira"
 
 FFMPEG_VERSION=7.1.1
-FFMPEG_SHA256=733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1
-FFMPEG_URL="https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
 TARBALL="$SRC_DIR/ffmpeg-${FFMPEG_VERSION}.tar.xz"
 SRC="$OBJ_DIR/ffmpeg-${FFMPEG_VERSION}"
 BUILD="$OBJ_DIR/build"
@@ -66,18 +67,18 @@ done
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 JOBS=$(sysctl -n hw.ncpu)
 
-# ------------------------------------------------------------------ fetch
-mkdir -p "$SRC_DIR" "$OBJ_DIR"
+# ------------------------------------------------------------------ verify
+mkdir -p "$OBJ_DIR"
 if [ ! -f "$TARBALL" ]; then
-    echo "=== fetching $FFMPEG_URL ==="
-    curl -fSL --connect-timeout 20 --retry 2 -o "$TARBALL.part" "$FFMPEG_URL"
-    mv "$TARBALL.part" "$TARBALL"
+    echo "missing $TARBALL (it is tracked; is the checkout complete?)" >&2
+    exit 1
 fi
 echo "=== verifying sha256 ==="
+WANT=$(awk -v f="ffmpeg-${FFMPEG_VERSION}.tar.xz" '{ sub(/\r$/, "") } $2 == f { print $1 }' "$SRC_DIR/SHA256SUMS")
 GOT=$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)
-if [ "$GOT" != "$FFMPEG_SHA256" ]; then
+if [ -z "$WANT" ] || [ "$GOT" != "$WANT" ]; then
     echo "sha256 mismatch for $TARBALL" >&2
-    echo "  expected $FFMPEG_SHA256" >&2
+    echo "  expected ${WANT:-(no entry in $SRC_DIR/SHA256SUMS)}" >&2
     echo "  got      $GOT" >&2
     exit 1
 fi

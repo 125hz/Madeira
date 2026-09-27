@@ -131,20 +131,17 @@ All three are unmodified upstream releases; no patches are applied. A reference
 to an upstream project would not have been enough on its own, which is why the
 tarballs themselves are here.
 
-FFmpeg is handled differently on purpose: its archives are **not** tracked as
-compiled binaries in this repository (they are git-ignored outputs of the build
-script, like `libntdll_unix.a`), so there is nothing here that a source tarball
-would have to correspond to. The build script fetches the unmodified upstream
-release itself and refuses to build anything else:
+FFmpeg's archives are git-ignored outputs of its build script (like
+`libntdll_unix.a`), but the app links them, so a built package contains them
+and the exact source they are built from is tracked here in the same way:
 
-- `build/ffmpeg/build.sh` -- the exact build machinery and configure flags,
-  including the release (`7.1.1`), its download URL on `ffmpeg.org`, and the
-  SHA-256 (`733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1`)
-  that every run verifies before extracting. No patches are applied.
-
-Anyone distributing a built `.ipa` that contains these archives owes the same
-corresponding source as for the crypto stack above; the pinned version and
-checksum identify it exactly.
+- `build/ffmpeg/src/ffmpeg-7.1.1.tar.xz` -- the unmodified upstream release
+  from `ffmpeg.org`
+- `build/ffmpeg/src/SHA256SUMS` -- its checksum
+  (`733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1`), which
+  every run of the build script verifies before extracting
+- `build/ffmpeg/build.sh` -- the exact build machinery and configure flags. No
+  patches are applied, and the script needs no network.
 
 ## Relinking and static linking
 

@@ -16,7 +16,7 @@ Statically linked into the main executable (`Madeira` / `Madeira.debug.dylib`):
 | DXMT unix side + airconv (`libdxmt_combined.a`) | MIT | GPL-3.0-or-later + additional permission | statically linked |
 | LLVM (inside `libdxmt_combined.a`) | Apache-2.0 with LLVM exception | none | statically linked |
 | gnutls 3.8.9, nettle 3.10.1, hogweed 3.10.1, gmp 6.3.0 | LGPL-2.1+ / dual LGPL-3+ or GPL-2+ / dual LGPL-3+ or GPL-2+ | none; Madeira elects LGPL-3.0-or-later for the dual-licensed three | statically linked; LGPL obligations apply; sources tracked in build/gnutls-ios/src |
-| FFmpeg 7.1.1 (libavformat, libavcodec, libavutil, libswresample) | LGPL-2.1-or-later (built `--disable-gpl --disable-nonfree --disable-version3`) | none | statically linked, winegstreamer's unix side only; LGPL obligations apply; the unmodified release is pinned by version and SHA-256 in `build/ffmpeg/build.sh`, not tracked |
+| FFmpeg 7.1.1 (libavformat, libavcodec, libavutil, libswresample) | LGPL-2.1-or-later (built `--disable-gpl --disable-nonfree --disable-version3`) | none | statically linked, winegstreamer's unix side only; LGPL obligations apply; the unmodified release tarball is tracked in `build/ffmpeg/src` with its SHA-256 and built by `build/ffmpeg/build.sh` |
 | Madeira app (Swift/ObjC), native D3D12 runtime (`madeira_d3d12.dll`, PE) | GPL-3.0-or-later + additional permission | author-owned | |
 
 Dynamically loaded at runtime (dlopen; this is NOT a GPL-compatibility

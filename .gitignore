@@ -35,12 +35,12 @@ app/libwineserver.a
 app/Madeira/libdxmt_combined.a
 app/Madeira/libwin32u_unix.a
 app/libwin32u_unix.a
-# FFmpeg (build/ffmpeg/build.sh): fetched upstream release + static archives
+# FFmpeg (build/ffmpeg/build.sh): static archives and build tree (the source
+# tarball in build/ffmpeg/src/ is tracked, like build/gnutls-ios/src/)
 app/Madeira/libavformat.a
 app/Madeira/libavcodec.a
 app/Madeira/libswresample.a
 app/Madeira/libavutil.a
-build/ffmpeg/src/
 build/ffmpeg/obj/
 
 # win32u-unix build artifacts

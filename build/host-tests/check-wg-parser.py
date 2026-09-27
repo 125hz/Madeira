@@ -24,8 +24,8 @@
    MADEIRA_WG_VIDEO=0 path, unsupported video / audio codecs, compressed-output refusal, a backend
    that refuses to open, and the deduplicated, bounded log.
 
-Environment: MADEIRA_FFMPEG_TARBALL (default: build/ffmpeg/src/ffmpeg-7.1.1.tar.xz, which
-build/ffmpeg/build.sh fetches and verifies),
+Environment: MADEIRA_FFMPEG_TARBALL (default: build/ffmpeg/src/ffmpeg-7.1.1.tar.xz, the tracked
+source tarball),
 MADEIRA_HOST_FFMPEG (prefix of an existing host build), MADEIRA_TEST_MP3 (an .mp3 to decode;
 default: a Windows system MP3 under /mnt/c when present, otherwise the real-MP3 case is skipped).
 """
@@ -123,7 +123,7 @@ if not prefix:
     key = hashlib.sha256(" ".join(FLAGS).encode()).hexdigest()[:12]
     prefix = str(Path.home() / ".cache/madeira-host-ffmpeg" / ("7.1.1-" + key))
     if not (Path(prefix) / "lib/libavformat.a").exists():
-        assert tarball and Path(tarball).exists(), "no FFmpeg tarball; run build/ffmpeg/build.sh once or set MADEIRA_FFMPEG_TARBALL"
+        assert tarball and Path(tarball).exists(), "no FFmpeg tarball at build/ffmpeg/src (tracked) and no MADEIRA_FFMPEG_TARBALL"
         src = Path(prefix + "-src")
         src.mkdir(parents=True, exist_ok=True)
         if not (src / "ffmpeg-7.1.1/configure").exists():
