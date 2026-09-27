@@ -81,7 +81,7 @@ static inline void mad_dxc_hstr(struct mad_dxc_hasher *s, const char *str, size_
 
 /* Everything outside the arguments that shapes the output. */
 struct mad_dxc_env {
-    uint64_t converter_ident;   /* the loaded converter dylib (size) + header version */
+    uint64_t converter_ident;   /* the loaded converter dylib (LC_UUID + size) + header version */
     const char *build_stamp;    /* this service's build: its parameter mapping is code */
     uint32_t ags_rewrite;       /* ml1149 rewrite enabled */
     uint32_t compat_flags;      /* compatibility flags handed to the compiler */

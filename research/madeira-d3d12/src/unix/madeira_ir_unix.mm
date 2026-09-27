@@ -16,6 +16,7 @@
  * dereference; what must follow the rendering backend is the TARGET, and that
  * arrives in the arguments rather than being read from the local device. */
 #include <dlfcn.h>
+#include <mach-o/loader.h>   /* ml1990: LC_UUID of the converter dylib */
 #include "../../../../build/madeira_cfg.h"   /* ml1095: one config file */
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -77,6 +78,7 @@ struct IRFns {
     int   ready;
     int   status;          /* madeira_ir_status when not ready */
     uint64_t ident;        /* ml1990: the loaded converter's identity, for the DXIL cache key */
+    int      ident_ok;     /* ml1990: ident includes the dylib's LC_UUID */
 #define IR_DECL(n) decltype(&::n) n;
     IR_FUNC_LIST(IR_DECL)
 #undef IR_DECL
@@ -133,17 +135,37 @@ bind:
 
     /* ml1990: a different converter is a different compiler, and every DXIL
      * cache entry it did not produce must miss. The header version says which
-     * API we compiled against; the dylib's size tells two builds of it apart
-     * (its path is the bundle's, which moves on every install, so not that). */
+     * API we compiled against; the loaded image's LC_UUID (the linker's unique
+     * id for that build of the dylib) and its file size tell two builds apart.
+     * The path is not used: it is the bundle's, which moves on every install.
+     * Without a UUID the build cannot be identified, and the persistent cache
+     * stays off (ident_ok = 0); the in-process retry slots are unaffected. */
     {
         Dl_info info;
         struct stat st;
         uint64_t h = 1469598103934665603ull;
         uint32_t v[3] = { IR_VERSION_MAJOR, IR_VERSION_MINOR, IR_VERSION_PATCH };
         for (size_t i = 0; i < sizeof v; i++) { h ^= ((const unsigned char *)v)[i]; h *= 1099511628211ull; }
-        if (dladdr((const void *)g_ir.IRCompilerCreate, &info) && info.dli_fname && stat(info.dli_fname, &st) == 0) {
-            uint64_t sz = (uint64_t)st.st_size;
-            for (size_t i = 0; i < sizeof sz; i++) { h ^= ((const unsigned char *)&sz)[i]; h *= 1099511628211ull; }
+        if (dladdr((const void *)g_ir.IRCompilerCreate, &info) && info.dli_fbase) {
+            const struct mach_header_64 *mh = (const struct mach_header_64 *)info.dli_fbase;
+            if (mh->magic == MH_MAGIC_64) {
+                const unsigned char *lc = (const unsigned char *)(mh + 1);
+                for (uint32_t i = 0; i < mh->ncmds; i++) {
+                    const struct load_command *c = (const struct load_command *)lc;
+                    if (c->cmdsize < sizeof *c) break;
+                    if (c->cmd == LC_UUID && c->cmdsize >= sizeof(struct uuid_command)) {
+                        const struct uuid_command *u = (const struct uuid_command *)lc;
+                        for (size_t k = 0; k < sizeof u->uuid; k++) { h ^= u->uuid[k]; h *= 1099511628211ull; }
+                        g_ir.ident_ok = 1;
+                        break;
+                    }
+                    lc += c->cmdsize;
+                }
+            }
+            if (info.dli_fname && stat(info.dli_fname, &st) == 0) {
+                uint64_t sz = (uint64_t)st.st_size;
+                for (size_t i = 0; i < sizeof sz; i++) { h ^= ((const unsigned char *)&sz)[i]; h *= 1099511628211ull; }
+            }
         }
         g_ir.ident = h;
     }
@@ -1154,6 +1176,11 @@ static void mad_dxc_init_once(void)
     if (!g_dxc_disk_on) {
         dprintf(2, "[d3d12-dxil-cache] ml1990 disabled (MADEIRA_D3D12_DXIL_CACHE=0); retry slots %s\n",
                 g_dxc_slot_on ? "on" : "off");
+        return;
+    }
+    if (!g_ir.ident_ok) {
+        g_dxc_disk_on = 0;
+        dprintf(2, "[d3d12-dxil-cache] ml1990 converter build not identifiable (no LC_UUID); persistent cache off\n");
         return;
     }
     if (!mad_dxc_dir(dir, sizeof dir)) {
