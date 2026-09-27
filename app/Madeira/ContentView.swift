@@ -2735,7 +2735,7 @@ final class TouchControlsModel: ObservableObject {
     }
 
     /// ml1990: touch controls will feed player 1 this session (visible
-    /// controller mappings, or the controller layout a new user is about to get).
+    /// controller mappings, or the built-in a user without controls is about to get with MADEIRA_CONTROLS_XBOX_DEFAULT=1).
     var offersControllerInput: Bool {
         visible && (controls.contains { $0.action.padName.map(TouchPadAction.supported) ?? false }
                     || ControlPresetsModel.shared.defaultPending)
@@ -2869,8 +2869,8 @@ struct TouchControlsOverlay: View {
         GamepadInput.shared.configureTouch(controls: Set(ids))
     }
 
-    /// ml1970: a new user's first landscape overlay gets the built-in controller
-    /// layout, laid out for this screen (never over an existing controls file).
+    /// ml1970: with MADEIRA_CONTROLS_XBOX_DEFAULT=1, a user with no controls file gets the built-in controller
+    /// layout on the first landscape overlay, laid out for this screen (never over an existing controls file).
     private func applyDefaultLayout(_ geo: GeometryProxy) {
         guard m.needsDefaultLayout, geo.size.width > geo.size.height else { return }
         let i = geo.safeAreaInsets

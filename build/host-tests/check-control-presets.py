@@ -168,10 +168,15 @@ def function(source, start):
     return source[i:k]
 
 gamepad = (app / 'GamepadInput.swift').read_text()
-for flag, where in (('MADEIRA_CONTROL_PRESETS', presets), ('MADEIRA_CONTROLS_XBOX_DEFAULT', presets),
-                    ('MADEIRA_CONTROLS_EDITOR_DONE', content), ('MADEIRA_PAD_EARLY_SLOT', gamepad)):
+for flag, where in (('MADEIRA_CONTROL_PRESETS', presets), ('MADEIRA_CONTROLS_EDITOR_DONE', content)):
     assert f'.flag("{flag}")' in where, flag + ' is a kill switch'
+# Defaults an existing user would notice are opt-in: the built-in is never applied
+# automatically and player 1 is not reserved unless the switch is set to 1.
+for flag, where in (('MADEIRA_CONTROLS_XBOX_DEFAULT', presets), ('MADEIRA_PAD_EARLY_SLOT', gamepad)):
+    assert f'.optIn("{flag}")' in where and f'.flag("{flag}")' not in where, flag + ' is opt-in'
 assert '!= "0"' in function(gamepad, 'static func flag('), 'only "0" disables'
+assert '== "1"' in function(gamepad, 'static func optIn('), 'only "1" enables'
+assert 'Self.xboxDefault' in function(presets, 'var defaultPending: Bool {'), 'the automatic built-in needs the opt-in'
 
 model = content[content.index('final class TouchControlsModel'):content.index('/// Click-through EXCEPT')]
 assert 'if oldValue && !editing { ControlPresetsModel.shared.editingEnded(baseline: editBaseline) }' in model
@@ -190,7 +195,7 @@ window = function(content, 'final class ControlsWindow: UIWindow {')
 assert window.index('if m.editing {') < window.index('!hit.isDescendant(of: root)') \
     < window.index('guard m.hitsInteractive('), 'menu and dialog presentations take their touches in play mode'
 reserve = function(gamepad, '@MainActor func reserveSessionSlot(touchControls: Bool) {')
-assert reserve.index('guard Self.enabled, Self.flag("MADEIRA_PAD_EARLY_SLOT")') < reserve.index('touchState.reserved = true')
+assert reserve.index('guard Self.enabled, Self.optIn("MADEIRA_PAD_EARLY_SLOT")') < reserve.index('touchState.reserved = true')
 run = function(content, 'private func runWineFullSequence() {')
 assert run.index('GamepadInput.shared.reserveSessionSlot(') < run.index('DispatchQueue.global'), 'reserved before Wine starts'
-print('PASS: switches, edit write-back, new-user default, layout menu and session slot wiring')
+print('PASS: switches (opt-in built-in default and session slot), edit write-back, layout menu and session slot wiring')

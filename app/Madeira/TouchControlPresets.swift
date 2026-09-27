@@ -15,9 +15,11 @@ import UIKit
 // which layout it was loaded from (`TouchControlsModel.layoutID`) so edits made
 // in the editor are written back to that custom layout when editing ends.
 //
-// Switches (Documents/madeira.cfg `env.NAME = 0`, or the environment):
-//   MADEIRA_CONTROL_PRESETS=0        no layout menu, no default, no write-back
-//   MADEIRA_CONTROLS_XBOX_DEFAULT=0  a new user starts with no controls, as before
+// Switches (Documents/madeira.cfg `env.NAME = value`, or the environment):
+//   MADEIRA_CONTROL_PRESETS=0        no layout menu, no write-back (default on)
+//   MADEIRA_CONTROLS_XBOX_DEFAULT=1  a user with no controls file gets the
+//                                    built-in once (default OFF: otherwise the
+//                                    built-in is only applied from the menu)
 // ============================================================================
 
 // MARK: - Pure preset state (also compiled by the host regression test)
@@ -278,7 +280,12 @@ struct ControlPresetStore: Equatable {
 final class ControlPresetsModel: ObservableObject {
     static let shared = ControlPresetsModel()
     static let enabled = GamepadInput.flag("MADEIRA_CONTROL_PRESETS")
-    static let xboxDefault = GamepadInput.flag("MADEIRA_CONTROLS_XBOX_DEFAULT")
+    /// Opt-in. "No madeira-controls.json" is not a fresh install: the file is
+    /// only written once the controls or their visibility change, so an
+    /// existing user who never touched them has none either and would get an
+    /// 18-button overlay they did not ask for. Nothing on disk tells the two
+    /// apart reliably, so the built-in is applied automatically only on request.
+    static let xboxDefault = GamepadInput.optIn("MADEIRA_CONTROLS_XBOX_DEFAULT")
 
     @Published private(set) var store = ControlPresetStore()
     /// A file that exists and cannot be read is left untouched: saving is
@@ -317,7 +324,7 @@ final class ControlPresetsModel: ObservableObject {
         return m.layoutID == nil && !m.controls.isEmpty
     }
 
-    /// A new user (no madeira-controls.json yet) gets the controller layout the
+    /// With MADEIRA_CONTROLS_XBOX_DEFAULT=1, a user with no madeira-controls.json gets the controller layout the
     /// first time the landscape overlay appears.
     var defaultPending: Bool {
         TouchControlsModel.shared.needsDefaultLayout && Self.enabled && Self.xboxDefault && Self.touchPad
