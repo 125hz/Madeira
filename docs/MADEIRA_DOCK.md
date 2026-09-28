@@ -104,7 +104,10 @@ arguments are not supported.
 3. The host's inputs go in its environment: `MADEIRA_STEAM_HOST_*` gates,
    App ID, client folder, the expected install folder (Valve's client must
    resolve the game to exactly that folder) and the report path. The
-   cached-account variables are always cleared.
+   cached-account variables are always cleared. The launch also sets the
+   engine's opt-in image-retire switch, `MADEIRA_JIT_IMAGE_RETIRE=1`, for
+   this session only and logs `[dock-launch] image-retire=1` (see Known
+   risks). Other sessions keep the engine default (off).
 4. The session is the normal Wine session: `explorer.exe
    /desktop=madeira,<W>x<H> C:\windows\system32\dockhost.exe`. The size comes
    from `desktop-size` in madeira.cfg, else 1280x720.
@@ -128,6 +131,7 @@ never asks. The preparation is Valve's; Dock does not touch the files.
 | `MADEIRA_DOCK` | on | `0` hides the Dock button |
 | `MADEIRA_DOCK_COMPACT_POOL` | **off** | `1` starts the sheet's "Smaller JIT pool" toggle on |
 | `MADEIRA_DOCK_CEG` | on | `0`: never ask the client to prepare per-user executables |
+| `MADEIRA_DOCK_IMAGE_RETIRE` | on | `0`: a Dock launch does not turn on the engine's `MADEIRA_JIT_IMAGE_RETIRE` (an explicit `env.MADEIRA_JIT_IMAGE_RETIRE` still wins) |
 | `MADEIRA_DOCK_CLIENT_202601` | on | read by the host: `0` disables its January 2026 client adapter |
 | `MADEIRA_DOCK_HANDOFF_DIAGNOSTICS` | on | read by the host: `0` drops its numeric transfer diagnostics |
 
@@ -137,7 +141,9 @@ With no Dock launch, nothing changes. The JIT pool stays 896 MB (or
 madeira.cfg `pool`); no engine, Wine, FEX or DXMT file is touched. The compact
 pool applies only to a Dock launch whose toggle is on, only for that launch,
 and an explicit madeira.cfg `pool` still wins. Dock's host is itself an x64
-program; Dock sessions run under the same unchanged engine as any other.
+program. A Dock launch also sets `MADEIRA_JIT_IMAGE_RETIRE=1`, the engine's
+opt-in image-retire switch (its own engine PR), for that session only; no
+other session sets it, and an engine without the switch ignores it.
 
 ## Not included (compared with the fork)
 
@@ -164,12 +170,14 @@ program; Dock sessions run under the same unchanged engine as any other.
   licences. Clean-prefix component setup and broad title compatibility are
   less proven.
 - **This extraction has not been run on a device.**
-- The fork's device runs depended on an engine fix that is not in `main`:
-  retiring an unloaded image's translations before its address is reused
-  (fork ml1850). Without it, one device run crashed while Valve's client
-  loaded its DLLs, before any sign-in. That fix changes the shared image
-  lifetime, affects 64-bit sessions, and belongs in its own opt-in engine PR.
-  Until then, Dock on `main` may hit that crash.
+- The fork's device runs depended on an engine fix: retiring an unloaded
+  image's translations before its address is reused (fork ml1850). Without
+  it, one device run crashed while Valve's client loaded its DLLs, before any
+  sign-in: a DLL mapped at the address of a DLL unloaded moments before ran
+  the unloaded DLL's translated code. The fix is its own engine PR, off by
+  default, behind `MADEIRA_JIT_IMAGE_RETIRE=1`. Dock launches set that switch
+  for their session only. This app side builds and runs without the engine
+  PR; the variable is then ignored and Dock may hit that crash.
 - Valve can change the client at any time. A new client build needs a newly
   verified adapter in the Dock repository and new pins in `SteamRuntime.swift`.
   Until then, Dock refuses the new build.
@@ -181,11 +189,13 @@ credentials:
 
 - `check-dock-contract.py`:
   - static rules: no program-name lists, no credential in a log line, compact
-    pool off by default and Dock-only, madeira.cfg `pool` wins, no built
+    pool off by default and Dock-only, madeira.cfg `pool` wins, the
+    image-retire switch set only in the Dock launch environment, no built
     binary tracked, submodule pin;
   - compiled production Swift: pool policy, manifest and library discovery,
-    validation, the transfer envelope and subject, the host environment, and
-    the one-launch request.
+    validation, the transfer envelope and subject, the host environment
+    (image retire on, and off with `MADEIRA_DOCK_IMAGE_RETIRE=0`), and the
+    one-launch request.
 - `check-dock-report.py`: the report parser, its messages, rejection of
   private and malformed fields, and that every report round the pinned host
   writes is accepted.

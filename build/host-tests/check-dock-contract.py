@@ -7,7 +7,8 @@
 Synthetic data only: no Steam, Wine or credentials. Covers the JIT pool policy
 (opt-in, Dock-only), installed-game discovery from Steam's own app manifests and
 library list, launch validation, the one-use transfer envelope, the host's
-environment and launch arguments, the one-launch request, and static rules:
+environment (including the Dock-only image-retire switch) and launch arguments,
+the one-launch request, and static rules:
 no program-name lists, no credential in a log line, the compact pool off by
 default, madeira.cfg `pool` still winning, and no built Dock binary tracked.
 """
@@ -47,6 +48,14 @@ require('DockPerformancePolicy.sessionPoolMB(standard: 896, dock: dockLaunch.doc
         'the standard 896 MB pool is unchanged outside a compact Dock launch')
 require(content.count('MadeiraDock.requestLaunch(') == 1, 'only the Dock launch requests the Dock pool policy')
 require('SteamSignIn.credentialsForDock()' in content, 'the launch uses the sign-in API')
+# Image retire is a Dock-session switch: only MadeiraDock.configure sets it, and
+# only the Dock launch calls configure.
+for name, text in [('ContentView.swift', content), ('MadeiraDockView.swift', view), ('SteamRuntime.swift', runtime)]:
+    require('MADEIRA_JIT_IMAGE_RETIRE' not in text, f'{name}: does not set the image-retire switch')
+require(dock.count('setenv("MADEIRA_JIT_IMAGE_RETIRE"') == 1 and
+        dock.index('setenv("MADEIRA_JIT_IMAGE_RETIRE"') > dock.index('static func configure('),
+        'the image-retire switch is set only in the Dock launch environment')
+require(content.count('MadeiraDock.configure(') == 1, 'only the Dock launch configures the host environment')
 git = subprocess.run(['git', '-C', str(root), 'rev-parse', '--git-dir'], capture_output=True, text=True)
 if git.returncode == 0:
     tracked = subprocess.run(['git', '-C', str(root), 'ls-files', 'app/Madeira/arm64ec-windows/dockhost.exe',
@@ -182,6 +191,10 @@ func jwt(_ claims: String) -> String {
         require(env("MADEIRA_STEAM_HOST_CEG") == nil, "MADEIRA_DOCK_CEG=0 never asks")
         unsetenv("MADEIRA_DOCK_CEG"); MadeiraDock.configure(alpha)
         require(env("MADEIRA_STEAM_HOST_CEG") == nil, "no custom executables: not asked")
+        require(env("MADEIRA_JIT_IMAGE_RETIRE") == "1", "a Dock launch turns the engine's image-retire switch on")
+        unsetenv("MADEIRA_JIT_IMAGE_RETIRE"); setenv("MADEIRA_DOCK_IMAGE_RETIRE", "0", 1); MadeiraDock.configure(alpha)
+        require(env("MADEIRA_JIT_IMAGE_RETIRE") == nil, "MADEIRA_DOCK_IMAGE_RETIRE=0 leaves image retire off")
+        unsetenv("MADEIRA_DOCK_IMAGE_RETIRE")
         require(MadeiraDock.launchArguments(width: 1280, height: 720) == "/desktop=madeira,1280x720 \"C:\\windows\\system32\\dockhost.exe\"", "explorer desktop runs the host")
         require(MadeiraDock.handoffGuestPath(URL(fileURLWithPath: "/var/x/launch.auth")) == "\\\\?\\unix\\var\\x\\launch.auth", "transfer path through Wine's Unix namespace")
 

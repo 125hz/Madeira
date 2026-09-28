@@ -373,6 +373,15 @@ enum MadeiraDock {
         }
         // Never let a stale environment choose the PC cached-account test path.
         unsetenv("MADEIRA_STEAM_HOST_ACCOUNT"); unsetenv("MADEIRA_STEAM_HOST_STEAMID")
+        // Valve's client unloads DLLs while it starts and the loader can map a different
+        // DLL of the same size at the same address. The engine's opt-in image-retire
+        // switch (MADEIRA_JIT_IMAGE_RETIRE, off for every other session) gives that DLL
+        // fresh code instead of the unloaded one's translation. Dock sessions turn it on;
+        // an engine without the switch ignores the variable. env.MADEIRA_DOCK_IMAGE_RETIRE = 0
+        // leaves it off, and an explicit env.MADEIRA_JIT_IMAGE_RETIRE in madeira.cfg still wins.
+        let retire = SteamSignIn.flag("MADEIRA_DOCK_IMAGE_RETIRE", default: true)
+        if retire { setenv("MADEIRA_JIT_IMAGE_RETIRE", "1", 1) }
+        SteamLog.event("[dock-launch] image-retire=\(retire ? 1 : 0)")
     }
 
     /// Wine's explorer opens a virtual desktop and starts the host in it.
