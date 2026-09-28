@@ -43,6 +43,69 @@ stick. Otherwise a deflected touch stick takes priority; resting touch preserves
 the physical value. Touch updates are event-driven and require no polling timer.
 Keyboard/mouse mappings and the existing layout format are retained.
 
+## Layouts
+
+While touch controls are shown, the landscape top bar has a layout button
+(stacked squares) next to the show/hide controller glyph. It lists:
+
+- **Xbox controller**, a built-in full XInput layout: LT/LB and RB/RT rows in the
+  top corners, a D-pad cross above the left stick, the A/B/X/Y diamond above the
+  right stick, View/Menu at the bottom centre and L3/R3 beside the sticks. It is
+  laid out in points from the safe-area edges each time it is loaded, so it fits
+  phones and tablets, and it keeps clear of the top bar. It is offered only while
+  touch XInput is enabled, since its buttons are controller mappings.
+- The user's own layouts, **Custom Layout 1**, **Custom Layout 2**, ...
+- **Create new layout**, which adds the next free "Custom Layout N" with no
+  controls and opens the editor on it.
+- **Delete** for the active custom layout (confirmed first). The deleted
+  layout's controls are replaced by the built-in, when it is available.
+
+Built-ins cannot be changed. Custom layouts live in
+Documents/madeira-control-presets.json; madeira-controls.json stays the working
+copy the overlay draws and records which layout it came from (an optional
+`layout` field, so older files still load). When an edit ends, the controls are
+written back to the active custom layout. Editing the built-in leaves it as
+shipped: the edited controls become unsaved controls. Choosing another layout
+while unsaved controls are on screen asks first and offers to keep them as the
+next custom layout, so an existing hand-made layout is never lost.
+
+The built-in is never applied automatically by default: it is only loaded
+when chosen from the menu. A missing madeira-controls.json does not identify a
+new user (the file is only written once the controls or their visibility
+change, so an existing user who never touched them has none either), and
+nothing else on disk tells the two apart reliably. With
+`env.MADEIRA_CONTROLS_XBOX_DEFAULT = 1`, a user with no madeira-controls.json
+at launch gets the built-in the first time the landscape overlay appears; it is
+never applied over an existing controls file, even an empty one.
+
+The editor shows **Done** in place of the checkmark and hides the show/hide
+glyph while editing; **+** still adds a control. Menus and confirmation dialogs
+raised from the overlay window take the touches they cover.
+
+## Player 1 at session start
+
+Some input layers enumerate XInput once when a game starts and only look again
+on a device-arrival broadcast, which this port cannot deliver. Touch player 1
+connects only once the landscape overlay shows its controller mappings, and a
+paired controller may not have reported an extended profile yet, so such a game
+would never see a pad.
+
+This is **opt-in** (`env.MADEIRA_PAD_EARLY_SLOT = 1`), because the reserved
+player 1 stays connected for the whole session. With the switch, when a Wine
+session starts with visible touch controller mappings (or the built-in about
+to be applied by `MADEIRA_CONTROLS_XBOX_DEFAULT = 1`) or with a paired
+controller, slot 0 is published as connected with neutral input. Live touch or
+physical input takes it over. Hiding the controls or disconnecting the pad then
+leaves player 1 connected at rest until the app exits. Without the switch,
+slot 0 connects only when a real source appears, as before.
+
+## Audio route with wired controllers
+
+Some controllers enumerate as a USB audio output when wired. iOS then routes all
+app audio to the controller and the device sounds silent while the audio engine
+reports healthy signal levels. This is system routing, not a Madeira audio fault:
+unplug the cable or pair the controller over Bluetooth.
+
 ## Rollback and scope
 
 Set `env.MADEIRA_XINPUT = 0` in Documents/madeira.cfg and restart to disable the
@@ -50,14 +113,38 @@ whole producer and controller event claims. Set `env.MADEIRA_TOUCH_XINPUT = 0`
 to disable only touch gamepad input. `[xinput] ml1920` logs physical enablement
 and connections; `[touch-xinput] ml1930` logs touch enablement once.
 
-Vibration, battery telemetry, DirectInput, controller-driven library navigation
-and the fork's larger editor/remapping redesign are outside this contribution.
+Each follow-up behaviour has its own switch (`env.NAME = value` in
+madeira.cfg, or the process environment). The two that change what an existing
+user sees are opt-in (only `1` enables); the others are on unless set to `0`:
+
+| Switch | Default | Effect |
+| --- | --- | --- |
+| `MADEIRA_CONTROL_PRESETS` | on | `0`: no layout menu, no write-back |
+| `MADEIRA_CONTROLS_EDITOR_DONE` | on | `0`: the checkmark and show/hide glyph while editing |
+| `MADEIRA_CONTROLS_XBOX_DEFAULT` | **off** | `1`: a user with no controls file gets the built-in once |
+| `MADEIRA_PAD_EARLY_SLOT` | **off** | `1`: player 1 is reserved at session start (see above) |
+
+`[controls-layout] ml1970` logs layout loads, saves, creation and deletion
+(never layout names); `[xinput] ml1990` logs the session slot reservation.
+
+DirectInput has a separate, opt-in device in the companion Wine change: one
+joystick with the standard XInput controller object set (X/Y and Rx/Ry sticks,
+Z as the combined triggers, an 8-way POV, ten buttons), read from the same host
+query. It is hidden unless `env.MADEIRA_DINPUT_PAD = 1` is in madeira.cfg
+(exported to the Wine environment), because a game that reads both APIs would
+otherwise see two controllers. `MADEIRA_DINPUT_TRACE=1` adds a rate-limited
+state trace.
+
+Vibration, battery telemetry, controller-driven navigation of the app itself,
+binding physical buttons to keyboard/mouse controls, shaped (non-round) controls,
+a layout-wide size slider and a movable top bar remain outside this contribution.
 
 ## Integration prerequisite
 
-Pair this with [the Wine change](https://github.com/willfaust/wine/pull/1), then
-update Madeira's Wine pin. This source-review PR retains upstream's submodule
-pins and prebuilt DLLs until the dependency and combined build are validated.
+The XInput path needs [the Wine change](https://github.com/willfaust/wine/pull/1),
+which is merged and pinned. The opt-in DirectInput device needs its companion
+Wine change and rebuilt dinput.dll/dinput8.dll; the app side needs nothing more.
+Source PRs keep upstream's submodule pins and prebuilt DLLs.
 
 Rebuild the native win32u library and affected PE win32u/XInput modules using
 the paired Wine source. Rebuild wow64win for a WOW64 configuration. XInput
@@ -72,14 +159,21 @@ Run on a POSIX host with a C compiler and Swift installed:
 ```sh
 python3 build/host-tests/check-gamepad.py
 python3 build/host-tests/check-touch-gamepad.py
+python3 build/host-tests/check-control-presets.py
 ```
 
 The first compiles production snapshot/query code and checks packets, ranges,
 slots, invalid queries, disconnect/reconnect and concurrent readers/writers.
 The second compiles production touch state and checks independent button holds,
 layout/lifecycle clearing, analogue ranges, duplicate sticks and physical/touch
-arbitration. Set `SWIFTC` if Swift is not on PATH. These are logic tests, not
-UIKit gesture or device integration tests.
+arbitration, and the session slot reservation. The third compiles the
+production layout store with the controller actions: the built-in layout on
+phone, tablet and portrait-reported screens (complete, supported mappings,
+inside the safe area and clamps, no overlaps, top bar clear), built-ins
+read-only, "Custom Layout N" naming, JSON round trips and what loading a layout
+puts on screen; it also checks the switch and write-back wiring in the source.
+Set `SWIFTC` if Swift is not on PATH. These are logic tests, not UIKit gesture
+or device integration tests.
 
 The Swift bridge, touch view and changed touch-editor section type-check against
 the arm64 iOS 17 SDK with the production config reader and stubs for unrelated
@@ -96,5 +190,14 @@ merge, rebuild the paired components and test:
 - Hold then hide, edit, remap, remove, rotate, background or interrupt the app;
   no input should remain stuck, and fresh touches should work afterward.
 - Both rollback flags, saved layouts, and existing keyboard/mouse controls.
+- Layouts: by default nothing is applied to a user with or without a controls
+  file; the built-in loads from the menu; switching away from unsaved controls
+  asks first; create, edit with Done, relaunch and reload a custom layout;
+  delete it; the layout menu and its dialogs respond anywhere on screen; each
+  kill switch at `0`. With `MADEIRA_CONTROLS_XBOX_DEFAULT = 1`: a user without
+  a controls file gets the built-in once and an existing file is kept.
+- By default player 1 is not connected until a real source appears. With
+  `MADEIRA_PAD_EARLY_SLOT = 1`, a game that enumerates XInput only at startup
+  sees player 1 with touch controls shown or a controller paired before launch.
 
 The fork's existing device history does not prove this isolated extraction.
