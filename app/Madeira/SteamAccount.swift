@@ -240,10 +240,11 @@ final class SteamAccountModel: ObservableObject {
     /// ml1830: stop native activity before giving the same login to Valve's
     /// guest client. The token is read from Keychain only after quiescing.
     func prepareDock(_ entry: LibraryEntry) async throws {
-        // ml2011: the standalone sign-in (SteamSignIn, Keychain-only) is preferred when it holds
+        // ml2013: off by default in the fork (it duplicates the existing sign-in); MADEIRA_DOCK_SIGNIN_V2=1
+        // opts in for testing. ml2011: the standalone sign-in (SteamSignIn, Keychain-only) is preferred when it holds
         // a token; otherwise the earlier native sign-in is used. MADEIRA_DOCK_SIGNIN_V2=0 keeps
         // the earlier path only.
-        let signIn = LibraryFlags.enabled("MADEIRA_DOCK_SIGNIN_V2") ? SteamSignIn.credentialsForDock() : nil
+        let signIn = LibraryFlags.enabled("MADEIRA_DOCK_SIGNIN_V2", fallback: false) ? SteamSignIn.credentialsForDock() : nil
         guard Self.enabled, signIn != nil || phase == .signedIn, !inSession, let appID = entry.steamAppID else {
             throw LibraryError.message("Sign in to Steam in Madeira before starting Dock.")
         }
@@ -651,6 +652,8 @@ final class SteamAccountModel: ObservableObject {
         guard entry.steamNative == true, let appID = entry.steamAppID else { return }
         pause(appID); downloads[appID] = nil
         let folderName = entry.steamInstallPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? game(appID)?.folderName ?? ""
+        // ml2013: a reinstall evaluates the game's one-time installs again (MADEIRA_DOCK_INSTALL_RESET=0: not).
+        LibraryModel.requestDockInstallerReset(appID: appID, runAll: entry.steamRunInstallers == true)
         LibraryModel.shared.removeSteamInstall(entry.id)
         Task.detached(priority: .utility) {
             Self.deleteInstallFiles(appID: appID, folderName: folderName)

@@ -998,59 +998,170 @@ final class LibraryModel: ObservableObject {
     /// the other programs not yet recorded done go into a batch the session runs before the host.
     /// "Run Steam's one-time installs" (steamRunInstallers) also queues the provided ones.
     /// Only while no session runs. MADEIRA_DOCK_INSTALLERS=0 restores ml1780's marking.
+    /// ml2013 (device logs 97-100: 1 of a script's 3 programs found, none run, nothing said why):
+    /// entries without a "HasRunKey" use Steam's per-app key (MADEIRA_INSTALL_DEFAULT_KEY=0: skipped
+    /// again); every program's fate is logged and shown on the start screen, and the batch reports
+    /// each exit status (MADEIRA_DOCK_INSTALL_REPORT=0: the ml1970 batch, one summary line); after an
+    /// uninstall the installs are evaluated again, runs Madeira only marked done run when "run all"
+    /// is on, and that choice survives the reinstall (MADEIRA_DOCK_INSTALL_RESET=0: none of this).
     static func prepareDockInstallers(_ entry: LibraryEntry) {
         MadeiraDock.installerScript = nil
+        MadeiraDock.installerNote = nil
+        MadeiraDock.resetInstallerProgress()
         let app = entry.steamAppID ?? 0
+        let defaultKey = LibraryFlags.enabled("MADEIRA_INSTALL_DEFAULT_KEY")
+        let report = LibraryFlags.enabled("MADEIRA_DOCK_INSTALL_REPORT")
+        let resetOn = LibraryFlags.enabled("MADEIRA_DOCK_INSTALL_RESET")
+        let prefix = drive.deletingLastPathComponent()
         let batchURL = drive.appendingPathComponent(MadeiraDock.installerScriptName)
         try? FileManager.default.removeItem(at: batchURL)
+        if report { absorbDockInstallerResults(reason: "next-start") }
+        try? FileManager.default.removeItem(at: drive.appendingPathComponent(MadeiraDock.installerResultName))
         guard let folder = steamInstallFolder(entry), let gameRelative = SteamPaths.relative(folder, drive: drive) else {
             LogStore.shared.log("[dock-installers] ml1970 app=\(app) no install folder"); return
         }
         func windows(_ relative: String) -> String { "C:\\" + relative.replacingOccurrences(of: "/", with: "\\") }
         let shared = folder.deletingLastPathComponent().appendingPathComponent("Steamworks Shared", isDirectory: true)
         var found: [SteamInstallProcess] = []
-        var roots: [(URL, Int, String)] = [(folder, 1, windows(gameRelative))]
+        var roots: [(URL, Int, String, Int?)] = [(folder, 1, windows(gameRelative), defaultKey && app > 0 ? app : nil)]
         if let sharedRelative = SteamPaths.relative(shared, drive: drive) {
-            roots.append((shared.appendingPathComponent("_CommonRedist", isDirectory: true), 3, windows(sharedRelative)))
+            roots.append((shared.appendingPathComponent("_CommonRedist", isDirectory: true), 3, windows(sharedRelative), nil))
         }
-        for (root, depth, installDir) in roots {
+        var scripts = 0
+        for (root, depth, installDir, owner) in roots {
             for file in SteamInstallScripts.scripts(folder: root, depth: depth) {
                 guard let data = try? Data(contentsOf: file) else { continue }
-                for process in DockInstallScripts.processes(script: data, installDir: installDir) where !found.contains(process) {
+                scripts += 1
+                for process in DockInstallScripts.processes(script: data, installDir: installDir, appID: owner) where !found.contains(process) {
                     found.append(process)
                 }
             }
         }
-        let runAll = entry.steamRunInstallers == true
-        let prefix = drive.deletingLastPathComponent()
+        var runAll = entry.steamRunInstallers == true
+        var ledger = resetOn || report ? SteamInstallLedger.load(prefix: prefix) : SteamInstallLedger()
+        // ml2013: the first start after an uninstall: Steam's per-app records and the marks Madeira
+        // wrote itself are cleared, so the new install's programs are evaluated again.
+        if resetOn, let carried = ledger.reset[String(app)] {
+            let appKey = SteamInstallScripts.defaultRunKey(appID: app).lowercased()
+            var clear = found.map(\.run).filter { $0.hive == .machine && $0.key.lowercased() == appKey }
+            for run in ledger.marked[String(app)] ?? [] where !clear.contains(run) { clear.append(run) }
+            var removed = 0
+            do { removed = try SteamInstallScripts.unmark(clear, prefix: prefix) }
+            catch { LogStore.shared.log("[dock-installers] ml2013 app=\(app) reset failed: \(error.localizedDescription)", level: .error) }
+            ledger.marked[String(app)] = nil
+            ledger.reset[String(app)] = nil
+            if carried && !runAll {
+                runAll = true
+                if var stored = LibraryModel.shared.entries.first(where: { $0.id == entry.id }) { stored.steamRunInstallers = true; LibraryModel.shared.save(stored) }
+            }
+            LogStore.shared.log("[dock-installers] ml2013 app=\(app) reinstall-reset values-removed=\(removed) run-all-restored=\(carried ? 1 : 0)")
+        }
         let registry = [SteamInstallRun.Hive.machine: "system.reg", .user: "user.reg"].mapValues {
             (try? String(contentsOf: prefix.appendingPathComponent($0), encoding: .utf8)) ?? ""
         }
-        func done(_ run: SteamInstallRun) -> Bool { DockInstallScripts.marked(run, in: registry[run.hive] ?? "") }
+        // With "run all", a runtime Madeira only recorded done (never ran) counts as not done.
+        func done(_ run: SteamInstallRun) -> Bool {
+            DockInstallScripts.marked(run, in: registry[run.hive] ?? "") && !(resetOn && runAll && ledger.madeiraMarked(run, app: app))
+        }
         func exists(_ windowsPath: String) -> Bool {
             let relative = windowsPath.dropFirst(3).replacingOccurrences(of: "\\", with: "/")
             guard let url = SteamPaths.safeRelative(relative, under: drive) else { return false }
             return SteamPaths.existing(url, drive: drive) != nil
         }
         // A run is marked done up front only when every program in it is provided by Madeira.
+        let items = DockInstallScripts.plan(found, runAll: runAll, done: done, exists: exists)
         var provided: [SteamInstallRun] = []
-        for process in found where !runAll && !provided.contains(process.run) {
-            if found.filter({ $0.run == process.run }).allSatisfy(DockInstallScripts.providedByMadeira) { provided.append(process.run) }
-        }
+        for item in items where item.status == .provided && !provided.contains(item.process.run) { provided.append(item.process.run) }
+        let newlyProvided = provided.filter { !DockInstallScripts.marked($0, in: registry[$0.hive] ?? "") }
         var written = 0
         do { written = try SteamInstallScripts.mark(provided, prefix: prefix) }
         catch { LogStore.shared.log("[dock-installers] ml1970 app=\(app) mark failed: \(error.localizedDescription)", level: .error) }
-        let pending = found.filter { !provided.contains($0.run) && !done($0.run) && exists($0.executable) }.prefix(8)
+        if resetOn { ledger.record(newlyProvided, app: app) }
+        let pending = items.filter { $0.status == .pending }.map(\.process)
         if !pending.isEmpty {
             do {
-                try Data(DockInstallScripts.batch(Array(pending)).utf8).write(to: batchURL, options: .atomic)
+                let text = report ? DockInstallScripts.batch(pending, resultFile: "C:\\" + MadeiraDock.installerResultName)
+                                  : DockInstallScripts.batch(pending)
+                try Data(text.utf8).write(to: batchURL, options: .atomic)
                 MadeiraDock.installerScript = "C:\\" + MadeiraDock.installerScriptName
             } catch {
                 LogStore.shared.log("[dock-installers] ml1970 app=\(app) batch write failed: \(error.localizedDescription)", level: .error)
             }
         }
+        if resetOn || report {
+            ledger.session = report && MadeiraDock.installerScript != nil ? pending.map(\.run) : []
+            ledger.sessionApp = ledger.session.isEmpty ? 0 : app
+            do { try ledger.save(prefix: prefix) }
+            catch { LogStore.shared.log("[dock-installers] ml2013 app=\(app) ledger write failed: \(error.localizedDescription)", level: .error) }
+        }
+        if report {
+            for item in items {
+                let run = item.process.run
+                let recorded = DockInstallScripts.recorded(run, in: registry[run.hive] ?? "").map { String($0) } ?? "-"
+                let file = item.process.executable.split(separator: "\\").last.map(String.init) ?? ""
+                let hive = run.hive == .machine ? "HKLM" : "HKCU"
+                let label = DockInstallScripts.label(run)
+                LogStore.shared.log("[dock-installers] ml2013 app=\(app) program=\(label) file=\(file) status=\(item.status.rawValue) " +
+                                    "key=\(hive)\\\(run.key) recorded=\(recorded) minimum=\(run.value)")
+            }
+            // Shown when something runs or is missing, or when Madeira first records runtimes as
+            // provided (a first start, a reinstall); a start where all is done stays quiet (ml1990).
+            MadeiraDock.installerNote = DockInstallScripts.note(items, runAll: runAll, announceProvided: !newlyProvided.isEmpty)
+        }
+        var detail = ""
+        if report {
+            let doneCount = items.filter { $0.status == .done }.count
+            let missingCount = items.filter { $0.status == .missing }.count
+            detail = " scripts=\(scripts) done=\(doneCount) missing=\(missingCount) default-key=\(defaultKey ? 1 : 0)"
+        }
+        let names = pending.map(\.run.name).joined(separator: ",")
         LogStore.shared.log("[dock-installers] ml1970 app=\(app) programs=\(found.count) provided=\(provided.count) marked=\(written) " +
-                            "pending=\(pending.count) run-all=\(runAll ? 1 : 0) names=\(pending.map(\.run.name).joined(separator: ","))")
+                            "pending=\(pending.count) run-all=\(runAll ? 1 : 0) names=\(names)" + detail)
+    }
+
+    /// ml2013: the batch's exit statuses, read back after the session (or at the next start):
+    /// one summary line; runs that succeeded are no longer counted as only marked by Madeira.
+    static func absorbDockInstallerResults(reason: String) {
+        let prefix = drive.deletingLastPathComponent()
+        let url = drive.appendingPathComponent(MadeiraDock.installerResultName)
+        var ledger = SteamInstallLedger.load(prefix: prefix)
+        guard !ledger.session.isEmpty else { return }
+        let app = ledger.sessionApp
+        if let data = try? Data(contentsOf: url), data.count <= 16384 {
+            let results = DockInstallScripts.results(String(decoding: data, as: UTF8.self))
+            var succeeded: [SteamInstallRun] = []
+            var statuses: [String] = []
+            for (offset, run) in ledger.session.enumerated() {
+                let index = offset + 1, name = DockInstallScripts.label(run)
+                if let status = results.exits[index] {
+                    statuses.append("\(name)=\(status)")
+                    if DockInstallScripts.Results.succeeded(status) { succeeded.append(run) }
+                } else {
+                    statuses.append("\(name)=\(results.started[index] != nil ? "unfinished" : "not-started")")
+                }
+            }
+            ledger.forget(succeeded, app: app)
+            let failed = ledger.session.count - succeeded.count
+            LogStore.shared.log("[dock-installers] ml2013 app=\(app) results reason=\(reason) succeeded=\(succeeded.count) failed=\(failed) " +
+                                "ended=\(results.ended ? 1 : 0) statuses=\(statuses.joined(separator: ","))", level: failed > 0 ? .error : .info)
+        } else {
+            LogStore.shared.log("[dock-installers] ml2013 app=\(app) results reason=\(reason) none: the batch did not start", level: .error)
+        }
+        try? FileManager.default.removeItem(at: url)
+        ledger.session = []; ledger.sessionApp = 0
+        try? ledger.save(prefix: prefix)
+    }
+
+    /// ml2013: called when Madeira removes a Steam install; the next start evaluates the game's
+    /// one-time installs again and keeps the removed entry's "run all" choice.
+    static func requestDockInstallerReset(appID: Int, runAll: Bool) {
+        guard LibraryFlags.enabled("MADEIRA_DOCK_INSTALL_RESET"), appID > 0 else { return }
+        let prefix = drive.deletingLastPathComponent()
+        var ledger = SteamInstallLedger.load(prefix: prefix)
+        ledger.reset[String(appID)] = runAll || ledger.reset[String(appID)] == true
+        do { try ledger.save(prefix: prefix) }
+        catch { LogStore.shared.log("[dock-installers] ml2013 app=\(appID) reset request failed: \(error.localizedDescription)", level: .error); return }
+        LogStore.shared.log("[dock-installers] ml2013 app=\(appID) reset requested run-all=\(runAll ? 1 : 0)")
     }
 
     /// Set by "Skip one-time installs": the library marks the installs once the session has ended.
@@ -1137,6 +1248,11 @@ final class LibraryModel: ObservableObject {
         let dockError = MainActor.assumeIsolated {
             let message = dockLaunching ? MadeiraDock.finishReport() : nil
             MadeiraDock.cleanup()
+            // ml2013: the one-time installs' exit statuses, logged as the Dock session ends.
+            if dockLaunching && MadeiraDock.installerScript != nil && LibraryFlags.enabled("MADEIRA_DOCK_INSTALL_REPORT") {
+                _ = MadeiraDock.pollInstallers()
+                Self.absorbDockInstallerResults(reason: "session-end")
+            }
             return message
         }
         if let dockError { error = dockError } else if sawProcess, let report = exitReport() { error = report }
@@ -2124,13 +2240,25 @@ struct RuntimeMemorySyncSettings: View {
         }
     }
     static let swapChoices = [0, 1024, 2048, 4096]
+    /// ml2013: which guest allocations the swap tier may move (env.MADEIRA_SWAP_COVERAGE).
+    /// "" = large blocks (the ml2013 default), "wide" adds heaps and spilled views,
+    /// "classic" restores the original 8 MB-and-up rule.
+    struct SwapCoverage: Identifiable { let tag: String; let label: String; var id: String { tag } }
+    static let coverageChoices = [SwapCoverage(tag: "", label: "Large blocks (default)"),
+                                  SwapCoverage(tag: "wide", label: "Wide (heaps too)"),
+                                  SwapCoverage(tag: "classic", label: "Original (8 MB+)")]
     @State private var swapMB = RuntimeMemorySyncSettings.currentSwap()
+    @State private var coverage = RuntimeMemorySyncSettings.currentCoverage()
     @State private var engine = RuntimeMemorySyncSettings.currentEngine()
     @State private var changed = false
 
     static func currentSwap() -> Int {
         let v = Int(MadeiraConfig.get("swap-mb") ?? "") ?? 0
         return swapChoices.contains(v) ? v : (v > 0 ? swapChoices.last { $0 <= v } ?? 1024 : 0)
+    }
+    static func currentCoverage() -> String {
+        let v = (MadeiraConfig.get("env.MADEIRA_SWAP_COVERAGE") ?? "").lowercased()
+        return coverageChoices.contains { $0.tag == v } ? v : ""
     }
     static func currentEngine() -> SyncEngine {
         if MadeiraConfig.bool("inproc-sync") { return .madsync }
@@ -2156,6 +2284,15 @@ struct RuntimeMemorySyncSettings: View {
                     Text(mb == 0 ? "Off" : "\(mb / 1024) GB").tag(mb)
                 }
             }
+            if swapMB > 0 {
+                Picker("Swap coverage", selection: Binding(get: { coverage }, set: { tag in
+                    coverage = tag; changed = true
+                    MadeiraConfig.set("env.MADEIRA_SWAP_COVERAGE", tag.isEmpty ? nil : tag)
+                    LogStore.shared.log("[runtime-settings] ml2013 swap-coverage=\(tag.isEmpty ? "blocks" : tag)")
+                })) {
+                    ForEach(Self.coverageChoices) { Text($0.label).tag($0.tag) }
+                }
+            }
             Picker("Sync engine", selection: Binding(get: { engine }, set: { choice in
                 engine = choice; changed = true
                 Self.apply(choice)
@@ -2166,6 +2303,7 @@ struct RuntimeMemorySyncSettings: View {
         } header: { Text("Memory & sync") } footer: {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Swap tier moves game data to a file on this device's storage when memory runs short, using up to the chosen size. It can help games that are closed for using too much memory, at some speed cost.")
+                if swapMB > 0 { Text("Swap coverage: Large blocks moves allocations of 1 MB and up. Wide also moves game heaps and memory placed outside the usual range; try it if a game is still closed for memory. Original uses the first release's 8 MB rule.") }
                 Text("Sync engine: Fastsync is this build's default; Madsync is the upstream engine. Only one runs at a time.")
                 if changed { Text("Restart Madeira (close it from the app switcher) for these changes to apply.").foregroundStyle(.orange) }
             }
@@ -2402,6 +2540,10 @@ struct LibraryHUD: View {
                     TimelineView(.periodic(from: .now, by: 1)) { context in
                         VStack(spacing: 8) {
                             Text(dockStatus).foregroundStyle(.white.opacity(0.8)).multilineTextAlignment(.center)
+                            // ml2013: what this start does with the game's one-time installs.
+                            if let note = MadeiraDock.installerNote {
+                                Text(note).font(.caption).foregroundStyle(.white.opacity(0.6)).multilineTextAlignment(.center).frame(maxWidth: 360)
+                            }
                             Text("\(Int(context.date.timeIntervalSince(model.launchStartedAt)))s")
                                 .font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.4))
                         }
@@ -2483,6 +2625,8 @@ struct LibraryHUD: View {
             return "Steam is installing content this game needs. The game starts when it finishes…"
         }
         if MadeiraDock.installerScript != nil && report.fields["probe-start-bits"] == nil {
+            // ml2013: which program runs now, and any that failed (MADEIRA_DOCK_INSTALL_REPORT=0: fixed text).
+            if LibraryFlags.enabled("MADEIRA_DOCK_INSTALL_REPORT"), let progress = MadeiraDock.pollInstallers() { return progress }
             return "Running this game's one-time installs…"
         }
         return model.launchSlow ? "Waiting for Madeira Dock…" : "Starting Madeira Dock…"

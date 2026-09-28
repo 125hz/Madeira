@@ -734,6 +734,40 @@ static void madeira_publish_steam_identity(void) {
             dir, id[0] ? id : "-", source);
 }
 
+/* ml2013: export MADEIRA_DOCS_DIR before main(), while HOME is still the app
+ * container. The in-app wineserver thread sets HOME to the Wine prefix before it
+ * creates its first object, and madsync reads madeira.cfg inproc-sync right there
+ * (then keeps the answer for the whole app run); with MADEIRA_DOCS_DIR exported only
+ * when the guest starts, that read looked in Documents/wine/Documents and missed the
+ * Settings choice. Kill switch: MADEIRA_CFG_EARLY_DOCS=0 in the process environment
+ * or env.MADEIRA_CFG_EARLY_DOCS = 0 in madeira.cfg. Pure C, host-tested
+ * (build/host-tests/check-sync-engine-cfg.py). */
+static const char *g_madeira_docs_early = "not-run";
+static int madeira_cfg_off_word(const char *v)
+{
+    return v && (!strcmp(v, "0") || !strcmp(v, "off") || !strcmp(v, "no"));
+}
+static const char *madeira_docs_dir_early(void)
+{
+    char docs[1024], v[16];
+    const char *home = getenv("HOME"), *have = getenv("MADEIRA_DOCS_DIR");
+    if (madeira_cfg_off_word(getenv("MADEIRA_CFG_EARLY_DOCS"))) return "off-env";
+    if (have && *have) return "already-set";
+    if (!home || !*home || strlen(home) + 11 >= sizeof(docs)) return "no-home";
+    snprintf(docs, sizeof(docs), "%s/Documents", home);
+    setenv("MADEIRA_DOCS_DIR", docs, 0);
+    if (madeira_cfg_get("env.MADEIRA_CFG_EARLY_DOCS", v, sizeof(v)) && madeira_cfg_off_word(v)) {
+        unsetenv("MADEIRA_DOCS_DIR");
+        setenv("MADEIRA_CFG_EARLY_DOCS", "0", 1);   /* also turns off madeira_cfg.h's container fallback */
+        return "off-cfg";
+    }
+    return "set";
+}
+__attribute__((constructor)) static void madeira_docs_dir_ctor(void)
+{
+    g_madeira_docs_early = madeira_docs_dir_early();
+}
+
 static void wine_process_finished(void *arg) {
     /* Also runs when SIGQUIT makes the main guest thread call pthread_exit. */
     wineserver_finish_session();
@@ -946,6 +980,9 @@ static void *wine_process_thread(void *arg) {
             LOG("Wine log file: %{public}s", logPath.UTF8String);
             /* Expose the app Documents dir to Wine code (e.g. for fex-jit-dump.bin) */
             setenv("MADEIRA_DOCS_DIR", docs.UTF8String, 1);
+            dprintf(STDERR_FILENO, "[config-dir] ml2013 early MADEIRA_DOCS_DIR=%s; native madeira.cfg readers that run "
+                    "before this point (wineserver start: madsync inproc-sync) use it (MADEIRA_CFG_EARLY_DOCS=0 disables)\n",
+                    g_madeira_docs_early);
 
             /* ml1076: file-backed memory canary (Astra's memory-backing-canary.c,
              * run in-app on the phone, gated by Documents/madeira-swap-canary.txt).

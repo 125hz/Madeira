@@ -474,7 +474,7 @@ struct SteamSettingsSection: View {
             // ml2010: the regular Windows Steam client is deferred to a later release; Madeira
             // Dock starts Steam games. MADEIRA_STEAM_CLIENT_OPTIONS=1 enables the entry again.
             // ml2011: the standalone Steam sign-in Madeira Dock uses (MADEIRA_DOCK_SIGNIN_V2=0 hides it).
-            if LibraryFlags.enabled("MADEIRA_DOCK_SIGNIN_V2") {
+            if LibraryFlags.enabled("MADEIRA_DOCK_SIGNIN_V2", fallback: false) {
                 Button { showDockSignIn = true } label: {
                     Label(SteamSignIn.isSignedIn ? "Madeira Dock sign-in: \(SteamSignIn.accountName ?? "signed in")" : "Sign in for Madeira Dock (new)…",
                           systemImage: "key")

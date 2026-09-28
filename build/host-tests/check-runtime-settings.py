@@ -8,6 +8,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SWIFTC = os.environ.get("SWIFTC") or shutil.which("swiftc") or os.path.expanduser("~/.local/share/swiftly/bin/swiftc")
 config = (ROOT / "app/Madeira/MadeiraConfig.swift").read_text(encoding="utf-8")
+# ml2013: Linux Foundation resolves .documentDirectory from the passwd home, not $HOME,
+# so the unpatched copy wrote the developer's real ~/Documents/madeira.cfg. Point the
+# test copy at $HOME/Documents (what iOS returns inside the app container).
+DOCS_EXPR = "FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first"
+assert DOCS_EXPR in config
+config = config.replace(DOCS_EXPR, 'URL(fileURLWithPath: ProcessInfo.processInfo.environment["HOME"]! + "/Documents")')
 library = (ROOT / "app/Madeira/Library.swift").read_text(encoding="utf-8")
 
 # Source checks on the Settings section (SwiftUI is not available on the host).

@@ -48,6 +48,38 @@ enum MadeiraDock {
     /// Dock session before the host. Set on the main actor before launch, read by the launch worker.
     nonisolated(unsafe) static var installerScript: String?
     static let installerScriptName = "madeira-dock-installers.cmd"
+    /// ml2013: the batch appends each program's start and exit status here (drive C root).
+    static let installerResultName = "madeira-dock-installers.result"
+    /// ml2013: the start screen's line about this start's one-time installs (what runs, what
+    /// Madeira provides instead, what is already done). MADEIRA_DOCK_INSTALL_REPORT=0 leaves it nil.
+    nonisolated(unsafe) static var installerNote: String?
+    nonisolated(unsafe) private static var installerLogged: Set<String> = []
+    static func resetInstallerProgress() { installerLogged = [] }
+
+    /// ml2013: the batch's progress from its result file. New start and exit lines are logged once;
+    /// the returned text names the program running now and any that failed.
+    @MainActor static func pollInstallers() -> String? {
+        guard installerScript != nil else { return nil }
+        let url = LibraryModel.drive.appendingPathComponent(installerResultName)
+        guard let data = try? Data(contentsOf: url), data.count <= 16384 else { return "Starting this game's one-time installs…" }
+        let results = DockInstallScripts.results(String(decoding: data, as: UTF8.self))
+        for (index, name) in results.started.sorted(by: { $0.key < $1.key }) where installerLogged.insert("s\(index)").inserted {
+            LogStore.shared.log("[dock-installers] ml2013 start \(index)/\(results.total) program=\(name)")
+        }
+        var failed: [String] = []
+        for (index, status) in results.exits.sorted(by: { $0.key < $1.key }) {
+            let ok = DockInstallScripts.Results.succeeded(status)
+            if !ok { failed.append("\(results.started[index] ?? "#\(index)") (exit \(status))") }
+            guard installerLogged.insert("e\(index)").inserted else { continue }
+            LogStore.shared.log("[dock-installers] ml2013 exit \(index)/\(results.total) program=\(results.started[index] ?? "") status=\(status) " +
+                                (ok ? "recorded-done" : "failed; not recorded, runs again at the next start"))
+        }
+        let failures = failed.isEmpty ? "" : "\nFailed: " + failed.joined(separator: ", ")
+        if let running = results.running {
+            return "Running one-time install \(running) of \(max(results.total, running)): \(results.started[running] ?? "")…" + failures
+        }
+        return (results.ended ? "One-time installs finished." : "Running this game's one-time installs…") + failures
+    }
 
     static func supportsArguments(_ entry: LibraryEntry) -> Bool {
         entry.arguments.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||

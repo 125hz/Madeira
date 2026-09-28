@@ -50,11 +50,46 @@ static void madeira_cfg__trim(char *s)
     if (i) memmove(s, s + i, n - i + 1);
 }
 
-/* Directory that holds the configuration: $MADEIRA_DOCS_DIR, else $HOME/Documents. */
+/* Directory that holds the configuration: $MADEIRA_DOCS_DIR, else (ml2013) the
+ * app container's Documents from $CFFIXED_USER_HOME, else $HOME/Documents.
+ *
+ * ml2013: the in-app wineserver thread sets HOME to the Wine prefix
+ * (Documents/wine) BEFORE its first object is created, and MADEIRA_DOCS_DIR
+ * used to be exported only later, when the guest process started. A reader
+ * running inside the server during that window (madsync's inproc-sync switch
+ * is read there and cached for the whole app run) therefore looked for
+ * Documents/wine/Documents/madeira.cfg, found nothing and returned the default.
+ * The app now exports MADEIRA_DOCS_DIR before main() (WineProcessBridge.m);
+ * CFFIXED_USER_HOME is the sandbox home the system sets and nothing in the app
+ * rewrites it, so it is a second, independent anchor.
+ * MADEIRA_CFG_EARLY_DOCS=0 restores the pre-ml2013 lookup. */
+static int madeira_cfg__early_docs_enabled(void)
+{
+    const char *k = getenv("MADEIRA_CFG_EARLY_DOCS");
+    return !(k && (!strcmp(k, "0") || !strcmp(k, "off") || !strcmp(k, "no")));
+}
+
+/* Which rule chose the directory, for logging: "env", "container", "home" or "none". */
+static const char *madeira_cfg_dir_source(void)
+{
+    const char *v = getenv("MADEIRA_DOCS_DIR");
+    if (v && *v) return "env";
+    v = getenv("CFFIXED_USER_HOME");
+    if (v && *v && madeira_cfg__early_docs_enabled()) return "container";
+    v = getenv("HOME");
+    return (v && *v) ? "home" : "none";
+}
+
 static int madeira_cfg__dir(char *out, size_t cap)
 {
     const char *docs = getenv("MADEIRA_DOCS_DIR");
     if (docs && *docs) { if (strlen(docs) >= cap) return 0; strcpy(out, docs); return 1; }
+    docs = getenv("CFFIXED_USER_HOME");
+    if (docs && *docs && madeira_cfg__early_docs_enabled() && strlen(docs) + 11 < cap)
+    {
+        strcpy(out, docs); strcat(out, "/Documents");
+        return 1;
+    }
     docs = getenv("HOME");
     if (!docs || !*docs || strlen(docs) + 11 >= cap) return 0;
     strcpy(out, docs); strcat(out, "/Documents");
@@ -88,6 +123,9 @@ static int madeira_cfg_get(const char *key, char *out, size_t cap)
     if (madeira_cfg__read_file(path, buf, MADEIRA_CFG_MAX) >= 0)
     {
         char *line = buf, *next;
+        /* ml2013: a UTF-8 byte-order mark (added by some editors) is not part of
+         * the first key; Foundation drops it on the Swift side, so drop it here. */
+        if ((unsigned char)line[0] == 0xef && (unsigned char)line[1] == 0xbb && (unsigned char)line[2] == 0xbf) line += 3;
         for (; line && *line; line = next)
         {
             char *eq;

@@ -125,10 +125,20 @@ int madsync_enabled(void)
     static int state = -1;
     if (state < 0)
     {
-        int on = madeira_cfg_bool( "inproc-sync", 0 );   /* off by default: the fastsync cells own the in-process wait path; madeira.cfg inproc-sync = 1 opts in */
+        /* off by default: the fastsync cells own the in-process wait path;
+         * madeira.cfg inproc-sync = 1 (Settings > Memory & sync > Madsync) opts in.
+         * ml2013: this runs inside the wineserver thread on its first object, and
+         * the answer is kept for the whole app run, so the log says what was read
+         * and from where (see madeira_cfg__dir for the directory rules). */
+        char v[32];
+        int set = madeira_cfg_get( "inproc-sync", v, sizeof v );
+        int on = madeira_cfg_bool( "inproc-sync", 0 );
         state = on;
         dprintf( 2, "[madsync] ml1058 in-process synchronisation %s (madeira.cfg inproc-sync = 1 enables; fastsync is the default)\n",
                  on ? "ENABLED" : "disabled" );
+        dprintf( 2, "[madsync] ml2013 decision=%s inproc-sync=%s cfg=%s dir=%s (MADEIRA_CFG_EARLY_DOCS=0 restores the pre-ml2013 lookup)\n",
+                 on ? "madsync" : "off", set ? (v[0] ? v : "(empty)") : "unset",
+                 madeira_cfg_present() ? "present" : "absent", madeira_cfg_dir_source() );
     }
     return state;
 }

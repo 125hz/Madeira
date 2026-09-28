@@ -674,8 +674,8 @@ enum LibraryRendererBadge {
 /// program (DirectX, Visual C++, PhysX and similar redistributables) before a start
 /// unless the registry value `name` under `key` is at least `value`, and writes 1
 /// there after the program exits with 0 (Steamworks "Creating and using InstallScripts").
-struct SteamInstallRun: Equatable, Sendable {
-    enum Hive: String, Sendable { case machine, user }
+struct SteamInstallRun: Equatable, Sendable, Codable {
+    enum Hive: String, Sendable, Codable { case machine, user }
     var name: String
     var hive: Hive
     var key: String      // under the hive, e.g. Software\Valve\Steam\Apps\7000
@@ -756,22 +756,38 @@ enum SteamInstallScripts {
     }
 
     /// The entries of every install script of a game installed in `installFolder`, and of
-    /// the shared redistributables the client keeps next to it.
-    static func runs(installFolder: URL) -> [SteamInstallRun] {
+    /// the shared redistributables the client keeps next to it. `appID` (ml2013) gives the
+    /// game's own entries without a "HasRunKey" Steam's per-app key (defaultRunKey).
+    static func runs(installFolder: URL, appID: Int? = nil) -> [SteamInstallRun] {
         let shared = installFolder.deletingLastPathComponent()
             .appendingPathComponent("Steamworks Shared", isDirectory: true).appendingPathComponent("_CommonRedist", isDirectory: true)
         var result: [SteamInstallRun] = []
-        for file in scripts(folder: installFolder, depth: 1) + scripts(folder: shared, depth: 3) {
+        for (file, owner) in scripts(folder: installFolder, depth: 1).map({ ($0, appID) }) + scripts(folder: shared, depth: 3).map({ ($0, nil as Int?) }) {
             guard let data = try? Data(contentsOf: file) else { continue }
-            for run in runs(script: data) where !result.contains(run) { result.append(run) }
+            for run in runs(script: data, appID: owner) where !result.contains(run) { result.append(run) }
         }
         return result
+    }
+
+    /// ml2013: where Valve's client records an entry that names no "HasRunKey": a DWORD named
+    /// after the entry (lowercase, as its script parser keys it) under the app's own key, e.g.
+    /// "directx"=1 under HKLM\Software\[Wow6432Node\]Valve\Steam\Apps\<appid> in a Windows
+    /// registry after the client ran that entry. ml1780/ml1970 skipped such entries entirely,
+    /// so a script whose DirectX and Visual C++ entries name no key found only its third entry.
+    static func defaultRunKey(appID: Int) -> String { "Software\\Valve\\Steam\\Apps\\\(appID)" }
+
+    /// The "HasRunKey" of an entry's fields, else (ml2013, with a valid `appID` and a program to
+    /// run) the per-app default key in full-path form.
+    static func runKey(_ fields: [String: String], appID: Int?) -> String? {
+        if let key = fields["hasrunkey"] { return key }
+        guard let appID, appID > 0, appID < 1 << 31, fields.keys.contains(where: { $0.hasPrefix("process ") }) else { return nil }
+        return "HKEY_LOCAL_MACHINE\\" + defaultRunKey(appID: appID)
     }
 
     /// ml1790: the entries of one install script read straight from its text. Scripts repeat
     /// the "Run Process" key, one section per installer; SteamKeyValues keeps the last copy of
     /// a repeated key, so device log 52 found 1 of the 3 entries its client then ran.
-    static func runs(script data: Data) -> [SteamInstallRun] {
+    static func runs(script data: Data, appID: Int? = nil) -> [SteamInstallRun] {
         var bytes = Array(data.prefix(maxScriptBytes))
         if bytes.starts(with: [0xef, 0xbb, 0xbf]) { bytes.removeFirst(3) }
         var position = 0
@@ -816,7 +832,7 @@ enum SteamInstallScripts {
             } else if !quoted && text == "}" {
                 // An entry section closes: path is [..., "run process", <entry>].
                 if path.count >= 2, path[path.count - 2] == "run process", let name = path.last,
-                   let key = fields["hasrunkey"], let (hive, sub) = hive(key), !sub.isEmpty {
+                   let key = runKey(fields, appID: appID), let (hive, sub) = hive(key), !sub.isEmpty {
                     let minimum = fields["minimumhasrunvalue"].flatMap { UInt32($0.trimmingCharacters(in: .whitespaces)) } ?? 1
                     let run = SteamInstallRun(name: name, hive: hive, key: sub, value: max(1, minimum))
                     if !result.contains(run) { result.append(run) }
@@ -884,6 +900,42 @@ enum SteamInstallScripts {
         return total
     }
 
+    /// ml2013: the .reg text without the runs' values (both views), and how many were removed.
+    /// Used when a game is reinstalled, so its one-time installs are evaluated again.
+    static func unmark(_ runs: [SteamInstallRun], in text: String) -> (text: String, changed: Int) {
+        var lines = text.components(separatedBy: "\n")
+        var changed = 0
+        for run in runs {
+            let valueName = ("\"" + escape(run.name) + "\"=").lowercased()
+            for key in keys(run) {
+                let header = ("[" + escape(key) + "]").lowercased()
+                guard let start = lines.firstIndex(where: { $0.lowercased().hasPrefix(header) }) else { continue }
+                var index = start + 1
+                while index < lines.count, !lines[index].hasPrefix("[") {
+                    if lines[index].lowercased().hasPrefix(valueName) { lines.remove(at: index); changed += 1 } else { index += 1 }
+                }
+            }
+        }
+        return (lines.joined(separator: "\n"), changed)
+    }
+
+    /// ml2013: unmark in the prefix's system.reg and user.reg. Only while no session runs.
+    @discardableResult
+    static func unmark(_ runs: [SteamInstallRun], prefix: URL) throws -> Int {
+        var total = 0
+        for (hive, file) in [(SteamInstallRun.Hive.machine, "system.reg"), (.user, "user.reg")] {
+            let selected = runs.filter { $0.hive == hive }
+            guard !selected.isEmpty else { continue }
+            let url = prefix.appendingPathComponent(file)
+            guard let data = try? Data(contentsOf: url), !data.isEmpty else { continue }
+            let (updated, changed) = unmark(selected, in: String(decoding: data, as: UTF8.self))
+            guard changed > 0 else { continue }
+            try Data(updated.utf8).write(to: url, options: .atomic)
+            total += changed
+        }
+        return total
+    }
+
     static func escape(_ s: String) -> String { s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") }
     private static func dword(_ line: String) -> UInt32? {
         guard let range = line.range(of: "=dword:", options: .caseInsensitive) else { return nil }
@@ -908,6 +960,8 @@ struct SteamInstallProcess: Equatable, Sendable {
 /// Wine DLLs, and their installers failed under emulation (see ml1780), so they stay marked done.
 /// Any other program runs once in the Dock session before the host starts, and is recorded done
 /// only when it exits successfully. Callers apply MADEIRA_DOCK_INSTALLERS.
+/// ml2013: entries without a "HasRunKey" count too (Steam's per-app key), every program's fate is
+/// logged, the batch reports each exit status, and a reinstall evaluates the installs again.
 enum DockInstallScripts {
     /// Programs Madeira's own Wine components replace.
     static func providedByMadeira(_ process: SteamInstallProcess) -> Bool {
@@ -918,9 +972,10 @@ enum DockInstallScripts {
     }
 
     /// The programs of one install script. `installDir` replaces %INSTALLDIR% (a Windows path).
-    static func processes(script data: Data, installDir: String) -> [SteamInstallProcess] {
+    /// `appID` (ml2013) records entries without a "HasRunKey" under Steam's per-app key.
+    static func processes(script data: Data, installDir: String, appID: Int? = nil) -> [SteamInstallProcess] {
         var result: [SteamInstallProcess] = []
-        for (run, fields) in SteamInstallScripts.entries(script: data) {
+        for (run, fields) in SteamInstallScripts.entries(script: data, appID: appID) {
             let numbers = fields.keys.compactMap { key -> Int? in
                 guard key.hasPrefix("process ") else { return nil }
                 return Int(key.dropFirst("process ".count).trimmingCharacters(in: .whitespaces))
@@ -995,7 +1050,7 @@ enum DockInstallScripts {
 extension SteamInstallScripts {
     /// ml1970: every "Run Process" entry with its fields (lowercased keys), read from the text
     /// so repeated sections all count (see runs(script:)).
-    static func entries(script data: Data) -> [(SteamInstallRun, [String: String])] {
+    static func entries(script data: Data, appID: Int? = nil) -> [(SteamInstallRun, [String: String])] {
         var bytes = Array(data.prefix(maxScriptBytes))
         if bytes.starts(with: [0xef, 0xbb, 0xbf]) { bytes.removeFirst(3) }
         var position = 0
@@ -1039,7 +1094,7 @@ extension SteamInstallScripts {
                 if path.count >= 2, path[path.count - 2] == "run process" { fields = [:] }
             } else if !quoted && text == "}" {
                 if path.count >= 2, path[path.count - 2] == "run process", let name = path.last,
-                   let key = fields["hasrunkey"], let (hive, sub) = hive(key), !sub.isEmpty {
+                   let key = runKey(fields, appID: appID), let (hive, sub) = hive(key), !sub.isEmpty {
                     let minimum = fields["minimumhasrunvalue"].flatMap { UInt32($0.trimmingCharacters(in: .whitespaces)) } ?? 1
                     let run = SteamInstallRun(name: name, hive: hive, key: sub, value: max(1, minimum))
                     if !result.contains(where: { $0.0 == run }) { result.append((run, fields)) }
@@ -1054,5 +1109,198 @@ extension SteamInstallScripts {
             }
         }
         return result
+    }
+}
+
+// MARK: - ml2013: one-time installs, visible and reset on reinstall
+
+/// ml2013: what a Dock start does with one install-script program.
+enum DockInstallStatus: String, Sendable {
+    case provided   // a runtime Madeira's Wine provides: recorded done, not run
+    case done       // already recorded done in the prefix's registry
+    case missing    // the program is not on disk (the log names it)
+    case pending    // runs in the session before the host
+    case limit      // over the per-start program limit; runs at a later start
+}
+
+struct DockInstallPlanItem: Equatable, Sendable {
+    var process: SteamInstallProcess
+    var status: DockInstallStatus
+}
+
+/// ml2013: runs Madeira itself recorded done (a provided runtime, ml1970) per app, and apps whose
+/// install was removed, so their one-time installs are evaluated again at the next start. Kept
+/// next to the prefix's registry files; one small JSON file.
+struct SteamInstallLedger: Codable, Equatable, Sendable {
+    static let fileName = "madeira-install-marks.json"
+    /// App ID -> runs Madeira marked done without running their program.
+    var marked: [String: [SteamInstallRun]] = [:]
+    /// App ID -> the removed entry's "run all" choice, applied once after a reinstall.
+    var reset: [String: Bool] = [:]
+    /// The programs the last generated batch runs, in its order (result lines refer to them by index).
+    var session: [SteamInstallRun] = []
+    var sessionApp: Int = 0
+
+    static func load(prefix: URL) -> SteamInstallLedger {
+        let url = prefix.appendingPathComponent(fileName)
+        guard let data = try? Data(contentsOf: url), data.count <= 1 << 20,
+              let ledger = try? JSONDecoder().decode(SteamInstallLedger.self, from: data) else { return SteamInstallLedger() }
+        return ledger
+    }
+    func save(prefix: URL) throws {
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        try encoder.encode(self).write(to: prefix.appendingPathComponent(Self.fileName), options: .atomic)
+    }
+    func madeiraMarked(_ run: SteamInstallRun, app: Int) -> Bool { marked[String(app)]?.contains(run) == true }
+    mutating func record(_ runs: [SteamInstallRun], app: Int) {
+        var list = marked[String(app)] ?? []
+        for run in runs where !list.contains(run) { list.append(run) }
+        marked[String(app)] = list.isEmpty ? nil : list
+    }
+    mutating func forget(_ runs: [SteamInstallRun], app: Int) {
+        let list = (marked[String(app)] ?? []).filter { !runs.contains($0) }
+        marked[String(app)] = list.isEmpty ? nil : list
+    }
+}
+
+extension DockInstallScripts {
+    /// The value a run has in a Wine .reg text (highest of both views), nil when absent.
+    static func recorded(_ run: SteamInstallRun, in text: String) -> UInt32? {
+        let lines = text.components(separatedBy: "\n")
+        let valueName = ("\"" + SteamInstallScripts.escape(run.name) + "\"=").lowercased()
+        var best: UInt32?
+        for key in SteamInstallScripts.keys(run) {
+            let header = ("[" + SteamInstallScripts.escape(key) + "]").lowercased()
+            guard let start = lines.firstIndex(where: { $0.lowercased().hasPrefix(header) }) else { continue }
+            var index = start + 1
+            while index < lines.count, !lines[index].hasPrefix("[") {
+                let line = lines[index].lowercased()
+                if line.hasPrefix(valueName), let range = line.range(of: "=dword:"),
+                   let value = UInt32(line[range.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines), radix: 16) {
+                    best = max(best ?? 0, value)
+                }
+                index += 1
+            }
+        }
+        return best
+    }
+
+    /// ml2013: every program's fate at this start. A run is provided (recorded done up front) only
+    /// when every program in it is provided and `runAll` is off; `done` decides the rest first,
+    /// then whether the program exists; at most `limit` programs run per start.
+    static func plan(_ found: [SteamInstallProcess], runAll: Bool, limit: Int = 8,
+                     done: (SteamInstallRun) -> Bool, exists: (String) -> Bool) -> [DockInstallPlanItem] {
+        var result: [DockInstallPlanItem] = []
+        var queued = 0
+        for process in found {
+            let status: DockInstallStatus
+            if !runAll && found.filter({ $0.run == process.run }).allSatisfy(providedByMadeira) { status = .provided }
+            else if done(process.run) { status = .done }
+            else if !exists(process.executable) { status = .missing }
+            else if queued < limit { status = .pending; queued += 1 }
+            else { status = .limit }
+            result.append(DockInstallPlanItem(process: process, status: status))
+        }
+        return result
+    }
+
+    /// ml2013: the start screen's line about the plan, or nil when there is nothing to say: nothing
+    /// runs, nothing is missing and no provided runtime is newly recorded (`announceProvided`).
+    static func note(_ items: [DockInstallPlanItem], runAll: Bool, announceProvided: Bool) -> String? {
+        func names(_ status: DockInstallStatus) -> String {
+            var seen: [String] = []
+            for item in items where item.status == status {
+                let name = label(item.process.run)
+                if !seen.contains(name) { seen.append(name) }
+            }
+            return seen.joined(separator: ", ")
+        }
+        let active = items.contains { $0.status == .pending || $0.status == .missing || $0.status == .limit }
+        guard active || (announceProvided && items.contains { $0.status == .provided }) else { return nil }
+        var parts: [String] = []
+        if !names(.pending).isEmpty { parts.append("Runs first: " + names(.pending)) }
+        if !names(.provided).isEmpty {
+            parts.append("Provided by Madeira, not run: " + names(.provided) +
+                         (runAll ? "" : " (turn on \"Also run DirectX and Visual C++ installers\" to run them)"))
+        }
+        if !names(.done).isEmpty { parts.append("Already done: " + names(.done)) }
+        if !names(.missing).isEmpty { parts.append("Installer file missing: " + names(.missing)) }
+        if !names(.limit).isEmpty { parts.append("Next start: " + names(.limit)) }
+        return "One-time installs. " + parts.joined(separator: ". ") + "."
+    }
+
+    /// A program's label for logs, the batch and the UI: the entry name, reduced to safe characters.
+    static func label(_ run: SteamInstallRun) -> String {
+        String(run.name.filter { $0.isLetter || $0.isNumber || $0 == " " || $0 == "." || $0 == "-" || $0 == "_" }.prefix(64))
+    }
+
+    /// ml2013: the batch with a result file. Each program's start and exit status are appended to
+    /// `resultFile` ("start <i> <label>", "exit <i> <status>"; each redirection follows a space, so
+    /// a status digit is never read as a handle number); a run is recorded done only on status 0,
+    /// 3010 or 1641 (installed, restart requested). ml1970's "if not errorlevel 1" also accepted
+    /// negative statuses (an installer's -9 read as success).
+    static func batch(_ processes: [SteamInstallProcess], resultFile: String) -> String {
+        let result = " >>\"" + resultFile.replacingOccurrences(of: "\"", with: "") + "\""
+        var lines = ["@echo off", "rem Madeira ml2013: one-time installs before Madeira Dock starts the game",
+                     "echo begin \(processes.count)" + result.replacingOccurrences(of: " >>", with: " >")]
+        for (offset, process) in processes.enumerated() {
+            let index = offset + 1
+            let quoted = "\"" + process.executable + "\""
+            let command = process.executable.lowercased().hasSuffix(".msi")
+                ? "C:\\windows\\system32\\msiexec.exe /i " + quoted + (process.arguments.isEmpty ? "" : " " + process.arguments)
+                : "call " + quoted + (process.arguments.isEmpty ? "" : " " + process.arguments)
+            let name = label(process.run)
+            lines.append("echo [dock-installers] ml2013 running \(index)/\(processes.count) " + name)
+            lines.append("echo start \(index) " + name + result)
+            lines.append(command)
+            for ok in ["0", "3010", "1641"] { lines.append("if \"%ERRORLEVEL%\"==\"\(ok)\" goto madeira_ok_\(index)") }
+            lines.append("echo exit \(index) %ERRORLEVEL%" + result)
+            lines.append("goto madeira_next_\(index)")
+            lines.append(":madeira_ok_\(index)")
+            lines.append("echo exit \(index) %ERRORLEVEL%" + result)
+            let hive = process.run.hive == .machine ? "HKLM" : "HKCU"
+            let value = process.run.name.replacingOccurrences(of: "\"", with: "")
+            for key in SteamInstallScripts.keys(process.run) {
+                lines.append("C:\\windows\\system32\\reg.exe add \"\(hive)\\\(key.replacingOccurrences(of: "\"", with: ""))\" /v \"\(value)\" /t REG_DWORD /d \(process.run.value) /f >nul")
+            }
+            lines.append(":madeira_next_\(index)")
+        }
+        lines.append("echo end" + result)
+        return lines.joined(separator: "\r\n") + "\r\n"
+    }
+
+    /// ml2013: a result file read back: programs in the batch, which started (index -> label),
+    /// which exited (index -> status) and whether the batch finished.
+    struct Results: Equatable, Sendable {
+        var total = 0
+        var started: [Int: String] = [:]
+        var exits: [Int: Int] = [:]
+        var ended = false
+        var running: Int? { started.keys.filter { exits[$0] == nil }.max() }
+        static func succeeded(_ status: Int) -> Bool { status == 0 || status == 3010 || status == 1641 }
+    }
+    static func results(_ text: String) -> Results {
+        var results = Results()
+        // cmd.exe writes CRLF; "\r\n" is one Character, so split on any newline Character.
+        for raw in text.split(whereSeparator: { $0.isNewline }).prefix(200) {
+            let parts = raw.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ", maxSplits: 2).map(String.init)
+            guard let verb = parts.first else { continue }
+            switch verb {
+            case "begin":
+                results.total = parts.count > 1 ? min(Int(parts[1]) ?? 0, 64) : 0
+            case "start":
+                if parts.count > 1, let index = Int(parts[1]), (1...64).contains(index) {
+                    results.started[index] = parts.count > 2 ? String(parts[2].prefix(64)) : ""
+                }
+            case "exit":
+                if parts.count > 2, let index = Int(parts[1]), (1...64).contains(index),
+                   let status = Int(parts[2].trimmingCharacters(in: .whitespaces)) { results.exits[index] = status }
+            case "end":
+                results.ended = true
+            default:
+                continue
+            }
+        }
+        return results
     }
 }
