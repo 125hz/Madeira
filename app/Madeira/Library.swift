@@ -1505,7 +1505,7 @@ struct LibraryView: View {
             }.padding(.bottom, 5).padding(.top, 8)
         }
         .sheet(isPresented: $steamManager) { SteamLibraryView(play: { profile in steamManager = false; play(profile) }, enableJIT: enableJIT) }
-        .sheet(isPresented: $steamSignIn) { SteamSignInView() }
+        .sheet(isPresented: $steamSignIn) { SteamAccountSignInView() }
         .sheet(item: $steamGame) { ref in
             SteamGameSheet(appID: ref.id) { entry in
                 // Let the download sheet finish dismissing before presenting details.

@@ -6,7 +6,10 @@ import UIKit
 
 // MARK: - Sign in
 
-struct SteamSignInView: View {
+/// ml2011: renamed from SteamSignInView, which is now the standalone sign-in
+/// (SteamSignIn/SteamSignInView.swift, the upstream PR's type). This is the library's
+/// native account sign-in (SteamAccountModel).
+struct SteamAccountSignInView: View {
     @ObservedObject private var steam = SteamAccountModel.shared
     @Environment(\.dismiss) private var dismiss
     @State private var method: SteamAccountModel.SignInMethod = UIDevice.current.userInterfaceIdiom == .pad ? .qr : .password

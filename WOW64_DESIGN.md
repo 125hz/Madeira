@@ -3144,7 +3144,7 @@ validator moved verbatim from `d3d9.cpp:44-316`), `d3d9shim_object.c/.h`,
 `meson.build` (`cpu_family=='x86'`). Under `research/dxmt/src/d3d9/unix/`:
 generated `d3d9_unix.c` (entries, `_32` variants, tables, init),
 `d3d9_native_glue.cpp` (handle table, per-PEB registry, arena
-sub-allocator, `guest_alloc`, `d3d9_native_process_teardown`). Under
+sub-allocator, `guest_alloc`, `d3d9_native_window_teardown`). Under
 `src/util/`: `wsi_platform_madeira.cpp`, `wsi_window_madeira.cpp`,
 `util_madeira_compat.h`. Files to modify: `research/dxmt/meson.build`
 (option `dxmt_madeira_native`, `-DDXMT_NATIVE=1 -DDXMT_MADEIRA=1`, keep
@@ -3156,7 +3156,7 @@ multithread compat), `src/dxmt/dxmt_buffer.cpp:148-193` (`__i386__ &&
 `seal_latest()` `:69-85`), `build/dxmt-ios/build.sh` (add TUs; need
 `-fexceptions -frtti`), `build/dxmt-ios/build-pe.sh:60` (install shim AS
 `d3d9.dll`), `.xtool/build-wine-i386.sh:36-41` (A/B name), `virtual_ios.c`
-(binding branch; call `d3d9_native_process_teardown` from
+(binding branch; call `d3d9_native_window_teardown` from
 `ios_wow_reclaim_dead_windows()` — §8.9-5), `ContentView.swift` launch
 table (state test). A/B knob: ship both i386 modules — emulated frontend
 as `d3d9-emulated.dll`, shim as `d3d9.dll`; `Documents/madeira-d3d9.txt`
@@ -3250,8 +3250,8 @@ Residual: a validly mapped but wrong pointer still faults hard.
 Metal handles outlive the guest pseudo-process and hold host pointers INTO
 the arena, i.e. into the 4 GB range `ios_wow_reclaim_dead_windows()`
 replaces with PROT_NONE. Required: per-guest-process root keyed by the
-same PEB the window registry uses; export `d3d9_native_process_teardown
-(peb)`; call it BEFORE the PROT_NONE replace and before
+same PEB the window registry uses; export `d3d9_native_window_teardown
+(window_base)` (ml2011: keyed by the window base; a dead PEB no longer resolves); call it BEFORE the PROT_NONE replace and before
 `ios_jit_purge_window()`; assert the order: arena pointers dropped, then
 Metal objects, then the remap.
 6. Guest-window memory: net positive (staging rings, CpuPlaced backings,
@@ -3340,7 +3340,7 @@ window teardown), `src/winemetal/unix/winemetal_unix.c` (`_Foo32` pattern
   `d3d9_native_gen.inc` + 6 hand-written; identity by find-before-create;
   arena root pinned per PEB; `D3D9_GUEST_PTR32` window assertion; binding
   branch in `load_builtin_unixlib` matches `d3d9shim` in match OR modname;
-  `d3d9_native_process_teardown` before the PROT_NONE replace; shim ships
+  `d3d9_native_window_teardown` before the PROT_NONE replace; shim ships
   as `d3d9.dll`, unset knob = forward to `d3d9-emulated.dll`, only
   `Documents/madeira-d3d9.txt` = `native` runs native; `TestCooperativeLevel`
   lock-free; `[d3d9-native-census]`; api hash `0xf49329770a2bc97b`).
@@ -3975,7 +3975,7 @@ window teardown), `src/winemetal/unix/winemetal_unix.c` (`_Foo32` pattern
   `ios_wow_translate_limits()` all resolve through `ios_wow_slot_current()`,
   i.e. per CALLER (`:6040`); `ios_wow_live_slot_for_addr()` (`:6088`) keys TEB
   pooling on the block ADDRESS; `ios_wow_slot_for_peb()`, `ios_jit_purge_window(
-  base, size)`, `d3d9_native_process_teardown(peb)`, `ios_wow_window_teardown(
+  base, size)`, `d3d9_native_window_teardown(base)`, `ios_wow_window_teardown(
   base, …)`, `ios_wow_reclaim_dead_windows()` (already loops all
   `IOS_WOW_MAX_WINDOWS`), `ios_wow_exclude_windows()`,
   `ios_wow_candidate_slot()` and `win32u_zero_bits()`

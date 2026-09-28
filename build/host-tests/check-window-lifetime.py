@@ -58,7 +58,9 @@ static unsigned teardown_count, graphics_count;
 static int teardown_ok = 1;
 static int ios_wow_window_teardown(ULONG_PTR base, void *peb, unsigned guard)
 { teardown_count++; return teardown_ok; }
-static void d3d9_native_process_teardown(void *peb) { graphics_count++; }
+static unsigned long graphics_base;
+static void d3d9_native_window_teardown(unsigned long window_base)
+{ graphics_count++; graphics_base = window_base; }
 static void *ios_jit_rx_base_global = (void *)0x100000000;
 static unsigned pool_reclaims;
 typedef void *HANDLE;
@@ -133,6 +135,9 @@ int main(void)
     teardown_ok = 1;
     ios_wow_reclaim_dead_windows();
     assert(!ios_wow_windows[0].base && !placeholders[0].adopted);
+    /* ml2011: graphics teardown is keyed by the window base, not the dead PEB,
+     * and runs before every (possibly retried) window teardown. */
+    assert(graphics_count == 2 && graphics_base == base);
     query_status[1] = MACH_SEND_INVALID_DEST;
     assert(!ios_thread_registry_range_busy(base, IOS_WOW_WINDOW_SIZE));
     query_status[1] = KERN_TERMINATED;
@@ -148,6 +153,12 @@ int main(void)
     assert(pool_reclaims == 3);
     ios_wow_reclaim_dead_windows();
     assert(!ios_wow_windows[0].base); /* Rollback reproduces live-memory retirement. */
+    assert(graphics_count == 3);
+    dead_window();
+    setenv("MADEIRA_D3D9_WINDOW_TEARDOWN", "0", 1);
+    ios_wow_reclaim_dead_windows();
+    assert(!ios_wow_windows[0].base && graphics_count == 3); /* ml2011 rollback */
+    unsetenv("MADEIRA_D3D9_WINDOW_TEARDOWN");
     puts("PASS: live/unknown/dead threads, window boundaries, deferred executable retirement, retry and rollback");
 
     ULONG count = 99;

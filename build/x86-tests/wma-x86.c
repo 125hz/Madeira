@@ -33,20 +33,22 @@
  * parameter-block layouts from the 64-bit half (WOW64_DESIGN.md section 3,
  * invariant 2).  Running it 64-bit would test the other table.
  *
- * THREE STAGES, because the first device run (log u87) decoded one stream and
- * failed every packet of a second one:
+ * THREE STAGES:
  *
  *   A  44100 Hz stereo, honest parameters.  The baseline.
- *   B  22050 Hz stereo at a low bit rate -- the geometry of the stream that
+ *   B  22050 Hz stereo at a low bit rate -- the geometry of a stream that
  *      failed on device (that one was 22050 Hz stereo, block_align 1487).
- *   C  the SAME bytes as B, declared with a deliberately WRONG
- *      MF_MT_AUDIO_AVG_BYTES_PER_SECOND (the 48 kbit/s figure the Microsoft
- *      xWMA encoder stamps on streams that are really something else; see
- *      libavformat/xwma.c's normalisation table, mirrored in the unix side).
- *      libavcodec derives its coefficient VLC tables, high band start and --
- *      for a bit-reservoir stream -- the superframe header's byte_offset_bits
- *      from the bit rate, so a lying rate is fatal.  Stage C is the regression
- *      guard for the unix side's bit-rate retry: it must still decode.
+ *   D  B's bytes, pushed in chunks and after a misaligned buffer.
+ *
+ * There is no stage C any more.  It declared B's bytes with a WRONG average
+ * byte rate (the 48 kbit/s figure libavformat/xwma.c lists as an xWMA lie) and
+ * expected the unix side's bit-rate retry to rescue it.  That retry can only
+ * work for a bit-reservoir (superframe) stream, whose packets say how many
+ * frames they hold; FFmpeg's encoder writes single-frame packets (flags2 = 1),
+ * and a single-frame packet decoded at the wrong rate is wrong audio, not a
+ * detectable failure.  xWMA streams are always superframe streams, so the
+ * stage tested a case that does not occur.  build/host-tests/
+ * check-wma-decoder.py covers WMA v1 and v2 at many more geometries.
  *
  * THE TEST VECTORS are 0.5 s of a 440 Hz sine at half full scale, encoded by a
  * host FFmpeg 7.1.1 wmav2 encoder, with the codec-private bytes that encoder
@@ -62,7 +64,7 @@
  * 64-bit division, no int-to-double conversion.
  *
  * Exit status (the runtime reports it as "MADEIRA-EXIT: ... status=<n>"):
- *   62  PASS -- all three stages created the MFT, negotiated both types, and
+ *   62  PASS -- every stage created the MFT, negotiated both types, and
  *       returned PCM that is non-silent and has a ~440 Hz fundamental
  *   63  the MFT was created but a stage failed: a type was rejected, no
  *       output came back, or the output was silence / the wrong frequency
@@ -1354,16 +1356,6 @@ static int run( void )
             wma_test_b_data, sizeof(wma_test_b_data),
             wma_test_b_extradata, sizeof(wma_test_b_extradata),
             WMA_TEST_B_RATE, WMA_TEST_B_CHANNELS, WMA_TEST_B_BLOCK_ALIGN, WMA_TEST_B_AVG_BYTES, 0, 0
-        },
-        {
-            /* 48000 bit/s = 6000 B/s is one of the figures libavformat/xwma.c
-             * lists as a lie for 22050 Hz stereo.  The unix side must still
-             * decode this: it opens at the declared rate, and on a first-packet
-             * failure reopens once at xwma.c's normalised rate. */
-            "C 22050 Hz stereo, xWMA fake byte rate",
-            wma_test_b_data, sizeof(wma_test_b_data),
-            wma_test_b_extradata, sizeof(wma_test_b_extradata),
-            WMA_TEST_B_RATE, WMA_TEST_B_CHANNELS, WMA_TEST_B_BLOCK_ALIGN, 6000, 0, 0
         },
         {
             /* PHASE. The unix side stages pushed bytes in a FIFO and cuts

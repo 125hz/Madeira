@@ -147,6 +147,11 @@ enum MadeiraDock {
                 default: return "Steam could not prepare this game's executable for your account (code \(fields["ceg-result"] ?? "?")). Export the diagnostic log."
                 }
             }
+            // ml2011: a configuration refusal the host already waited out gets its own words.
+            if result == 45 || result == 48, let error = fields["launch-client-error"].flatMap(Int.init),
+               (22...23).contains(error), fields["launch-config-wait"] != nil {
+                return "Steam did not finish loading this game's configuration after signing in. Wait a minute and start the game again; if it keeps happening, refresh the library."
+            }
             if result == 45 || result == 48, let error = fields["launch-client-error"].flatMap(Int.init),
                let reason = Self.launchRefusal(error, waited: result == 48) {
                 return reason
@@ -185,6 +190,7 @@ enum MadeiraDock {
             "session-native-token-submitted", "session-logon-start-result", "session-connection-result",
             "session-authenticated-online", "session-requested-app-listed", "session-auth-test-result",
             "launch-client-error", "launch-update-wait", "launch-update-retry", "launch-update-ready",
+            "launch-config-wait", "launch-config-gave-up",
             "ceg-request", "ceg-request-result", "ceg-request-busy", "ceg-server-result", "ceg-job-result",
             "ceg-finished-jobs", "ceg-result", "ceg-disabled", "ceg-unsupported-client",
             "ceg-scm", "ceg-scm-started", "ceg-scm-error", "ceg-service-registered", "ceg-service-install", "ceg-service-stop", "ceg-scm-stopped",
@@ -195,7 +201,7 @@ enum MadeiraDock {
             .split(separator: "\n", omittingEmptySubsequences: false).dropLast() {
             let parts = line.split(separator: " ", omittingEmptySubsequences: false)
             guard parts.count == 3, parts[0] == "[steam-host]",
-                  ["ml1830", "ml1820", "ml1860", "ml1870", "ml1970", "ml1990", "ml2000"].contains(parts[1]) else { continue }
+                  ["ml1830", "ml1820", "ml1860", "ml1870", "ml1970", "ml1990", "ml2000", "ml2011"].contains(parts[1]) else { continue }
             let field = parts[2].trimmingCharacters(in: .newlines).split(separator: "=", maxSplits: 1)
             guard field.count == 2 else { continue }
             let key = String(field[0]), value = String(field[1])

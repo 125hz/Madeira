@@ -116,7 +116,7 @@ echo "  [wma] decoder created fmt=wmav2 tag=0x161 44100Hz 2ch block=743 avg=1600
 echo "  MADEIRA-WMA: --- stage A 44100 Hz stereo, honest rate ---"
 echo "  MADEIRA-WMA: fundamental 44x Hz (expected ~440)"
 echo "  MADEIRA-WMA: --- stage B 22050 Hz stereo low bit rate, honest rate ---"
-echo "  MADEIRA-WMA: --- stage C 22050 Hz stereo, xWMA fake byte rate ---"
+echo "  MADEIRA-WMA: --- stage D 22050 Hz stereo, chunked and misaligned pushes ---"
 echo "  MADEIRA-WMA: PASS -- every stage decoded WMA V2 to PCM at ~440 Hz"
 echo "  MADEIRA-EXIT: wma-x86.exe status=62"
 echo "63 means the MFT was created but the decode failed; 64 means the class is"

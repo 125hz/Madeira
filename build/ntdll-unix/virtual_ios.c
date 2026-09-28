@@ -9891,7 +9891,13 @@ static int ios_wow_window_teardown( ULONG_PTR base, void *dead_peb, unsigned gua
  * and hold HOST POINTERS INTO THE ARENA — i.e. into the very 4 GB range the
  * teardown below is about to replace with PROT_NONE.  Dropping them has to
  * happen first, and the call site below is what asserts that order. */
-extern void d3d9_native_process_teardown( void *peb );
+/* ml2011: keyed by the dead window's base B, not its PEB.  The PEB-keyed
+ * d3d9_native_process_teardown() looked B up through ios_wow_base_for_peb(),
+ * which skips released (dead) slots by design, so it always found nothing and
+ * every native D3D9 object of an exited 32-bit process leaked, still pointing
+ * into the range remapped PROT_NONE below.  MADEIRA_D3D9_WINDOW_TEARDOWN=0
+ * skips the call (the previous, effectively no-op behaviour). */
+extern void d3d9_native_window_teardown( unsigned long window_base );
 extern int ios_thread_registry_range_busy( uintptr_t base, uintptr_t size );
 
 static void ios_wow_reclaim_dead_windows(void)
@@ -9956,9 +9962,17 @@ static void ios_wow_reclaim_dead_windows(void)
         /* BEFORE the PROT_NONE replace and before ios_jit_purge_window(),
          * both of which happen inside ios_wow_window_teardown(): the order is
          * arena pointers dropped, then Metal objects, then the remap (§8.9-5).
-         * Keyed by the same PEB the window registry is, so a second live
-         * 32-bit process keeps its own objects. */
-        d3d9_native_process_teardown( dead_peb );
+         * Keyed by the window base B (ml2011), so a second live 32-bit
+         * process keeps its own objects. */
+        {
+            const char *td = getenv( "MADEIRA_D3D9_WINDOW_TEARDOWN" );
+            static unsigned td_reports;
+            const int td_on = !td || strcmp( td, "0" );
+            if (__atomic_fetch_add( &td_reports, 1, __ATOMIC_RELAXED ) < 4)
+                dprintf( 2, "[wow-window] ml2011 d3d9 teardown B=%p %s\n", (void *)base,
+                         td_on ? "by window base" : "skipped (MADEIRA_D3D9_WINDOW_TEARDOWN=0)" );
+            if (td_on) d3d9_native_window_teardown( (unsigned long)base );
+        }
 
         if (!ios_wow_window_teardown( base, dead_peb, guard_owned ))
         {

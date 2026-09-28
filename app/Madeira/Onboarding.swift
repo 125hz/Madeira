@@ -491,7 +491,7 @@ struct OnboardingView: View {
             }
         }
         .interactiveDismissDisabled()
-        .sheet(isPresented: $signIn) { SteamSignInView() }
+        .sheet(isPresented: $signIn) { SteamAccountSignInView() }
         .onAppear { steam.start(); jitReady = StikJITHelper.readyToLaunch }
         .onReceive(ticks) { _ in jitReady = StikJITHelper.readyToLaunch }
         .task(id: model.step) { if model.step == .steamClient { await model.checkClient() } }
