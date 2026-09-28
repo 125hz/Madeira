@@ -850,6 +850,7 @@ struct MadeiraMetalView: UIViewRepresentable {
 }
 
 struct ContentView: View {
+    @State private var showSteamSignIn = false
     @StateObject private var logStore = LogStore.shared
     @State private var jitStatus: JITStatus = .unknown
     @State private var entitlements: EntitlementStatus?
@@ -1135,6 +1136,11 @@ struct ContentView: View {
     private var actionButtons: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 12) {
+                if SteamSignIn.isEnabled {
+                    Button("Steam sign-in") { showSteamSignIn = true }
+                        .buttonStyle(.bordered)
+                        .sheet(isPresented: $showSteamSignIn) { SteamSignInView() }
+                }
                 Button("Enable JIT") {
                     enableJITViaStikDebug()
                 }
