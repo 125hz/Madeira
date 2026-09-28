@@ -713,10 +713,9 @@ final class HardwareInput: ObservableObject {
             self?.appActive = true
             self?.refreshFocus("app active")
         }
-        nc.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification, object: nil,
-                       queue: .main) { [weak self] _ in
-            self?.releaseAll("memory warning")
-        }
+        // Not on memory warnings: games here run close to the memory limit and
+        // get them mid-play, and a key released while still physically held
+        // stays up until it is pressed again.
         // Another text input taking or giving back the keyboard, or a window
         // changing key status, changes focus at once rather than at the next poll.
         for name in [UITextField.textDidBeginEditingNotification, UITextField.textDidEndEditingNotification,
