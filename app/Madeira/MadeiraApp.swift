@@ -6,7 +6,10 @@ struct MadeiraApp: App {
         WindowGroup {
             ContentView()
                 .modifier(ClaimGamepadEvents())
-                .onAppear { GamepadInput.shared.start() }
+                .onAppear {
+                    GamepadInput.shared.start()
+                    HardwareInput.shared.start()
+                }
         }
     }
 }
