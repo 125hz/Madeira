@@ -19,6 +19,10 @@ int wine_process_is_running(void);
 // detached the JIT debugger and switched VPNs. Returns 0 on success.
 int madeira_write_continue_flag(void);
 
+// Extract the bundled prefix template if the prefix is new (idempotent).
+// Madeira Dock's component setup calls it before writing Steam's registry keys.
+void madeira_seed_prefix_if_needed(const char *prefix_path);
+
 #ifdef __cplusplus
 }
 #endif

@@ -851,6 +851,7 @@ struct MadeiraMetalView: UIViewRepresentable {
 
 struct ContentView: View {
     @State private var showSteamSignIn = false
+    @State private var showDock = false
     @StateObject private var logStore = LogStore.shared
     @State private var jitStatus: JITStatus = .unknown
     @State private var entitlements: EntitlementStatus?
@@ -896,6 +897,11 @@ struct ContentView: View {
                 jit_install_trap_handler()
                 entitlements = EntitlementStatus.check()
                 logEntitlementStatus()
+                // Madeira Dock: an unconsumed sign-in transfer from an earlier run goes.
+                if wine_process_is_running() == 0 { MadeiraDock.cleanup() }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: SteamSignIn.didChange)) { _ in
+                if !SteamSignIn.isSignedIn { MadeiraDock.cleanup() }
             }
         }
     }
@@ -1140,6 +1146,11 @@ struct ContentView: View {
                     Button("Steam sign-in") { showSteamSignIn = true }
                         .buttonStyle(.bordered)
                         .sheet(isPresented: $showSteamSignIn) { SteamSignInView() }
+                }
+                if MadeiraDock.enabled {
+                    Button("Madeira Dock") { showDock = true }
+                        .buttonStyle(.bordered)
+                        .sheet(isPresented: $showDock) { MadeiraDockView { startDock($0, compactPool: $1) } }
                 }
                 Button("Enable JIT") {
                     enableJITViaStikDebug()
@@ -1939,7 +1950,11 @@ struct ContentView: View {
             // so it can be swapped between runs without a rebuild, and deleting
             // the file reverts to the proven default. Clamped to sane values --
             // a typo here would otherwise move the VA floor with it.
-            var poolSizeMB = 896
+            // Madeira Dock: a Dock launch may opt in to a compact pool (only that
+            // launch; off by default). madeira.cfg pool below still wins.
+            let dockLaunch = MadeiraDock.takeLaunchRequest()
+            var poolSizeMB = DockPerformancePolicy.sessionPoolMB(standard: 896, dock: dockLaunch.dock, compact: dockLaunch.compact)
+            if poolSizeMB != 896 { logStore.log("[dock-pool] compact JIT pool \(poolSizeMB)MB for this Dock launch") }
             if let txt = MadeiraConfig.get("pool"),
                let mb = Int(txt.trimmingCharacters(in: .whitespacesAndNewlines)),
                mb >= 256, mb <= 1152 {
@@ -2385,6 +2400,47 @@ struct ContentView: View {
 
             DispatchQueue.main.async { heartbeat.invalidate() }
         }
+    }
+
+    /// Madeira Dock: hand the stored sign-in to the host once, point it at the game and
+    /// start the normal session with explorer's virtual desktop running dockhost.exe.
+    /// Nothing is handed over unless JIT is ready and no session runs.
+    private func startDock(_ game: DockGame, compactPool: Bool) {
+        guard jit_check_debugged() else {
+            logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
+            return
+        }
+        guard wine_process_is_running() == 0, wineserver_is_running() == 0 else {
+            logStore.log("[madeira-dock] a session already ran in this app run; restart Madeira first", level: .error)
+            return
+        }
+        do {
+            try MadeiraDock.validate(game, drive: MadeiraDock.drive)
+            guard let signIn = SteamSignIn.credentialsForDock() else {
+                throw DockError.message("Sign in to Steam in Madeira before starting Dock.")
+            }
+            try MadeiraDock.writeHandoff(account: signIn.accountName, token: signIn.refreshToken, appID: game.id)
+        } catch {
+            MadeiraDock.cleanup()
+            MadeiraDockModel.shared.status = error.localizedDescription
+            logStore.log("[madeira-dock] not started: \(error.localizedDescription)", level: .error)
+            return
+        }
+        MadeiraDock.configure(game)
+        var width = 1280, height = 720
+        if let txt = MadeiraConfig.get("desktop-size") {
+            let p = txt.lowercased().split(separator: "x").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+            if p.count == 2, p[0] >= 640, p[1] >= 360, p[0] <= 3840, p[1] <= 2160 { width = p[0]; height = p[1] }
+        }
+        setenv("MADEIRA_EXE", "explorer.exe", 1)
+        setenv("MADEIRA_ARGS", MadeiraDock.launchArguments(width: width, height: height), 1)
+        setenv("MADEIRA_DESKTOP", "1", 1)
+        setenv("MADEIRA_SCREEN_W", String(width), 1)
+        setenv("MADEIRA_SCREEN_H", String(height), 1)
+        MadeiraDock.requestLaunch(compactPool: compactPool)
+        logStore.log("[madeira-dock] starting the host for app \(game.id); Valve's client authenticates and authorizes the launch")
+        MadeiraDockModel.shared.watchReport()
+        runWineFullSequence()
     }
 
     /// ml589: locate an installed Steam inside the prefix and (re)generate
