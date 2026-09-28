@@ -63,6 +63,14 @@ enum MadeiraConfig {
         return ["1", "on", "true", "yes"].contains(v)
     }
 
+    /// An app-side switch spelled like the native ones: `env.NAME = value` in
+    /// madeira.cfg, else the process environment, else `fallback`. Any value
+    /// other than "0" means on.
+    static func flag(_ name: String, fallback: Bool = true) -> Bool {
+        if present, let v = all()["env." + name] { return v != "0" }
+        return getenv(name).map { String(cString: $0) != "0" } ?? fallback
+    }
+
     /// One-time migration: with no madeira.cfg and at least one legacy file,
     /// write madeira.cfg from them. Legacy files are left in place (ignored from
     /// now on) so nothing is destroyed; the log names them so they can be deleted.

@@ -53,6 +53,48 @@ void madeira_display_set_layer(CAMetalLayer *layer) {
     pthread_mutex_unlock(&g_lock);
 }
 
+// --- The guest's virtual monitor ---------------------------------------
+//
+// The front end lays out the presented layer and maps touches in guest
+// pixels, so it needs the monitor size win32u uses. win32u reads
+// MADEIRA_SCREEN_W/H once per session (sysparams_ios.c, ios_screen_size), so
+// that is the seed; winios_display_mode_changed() is the entry point for a
+// win32u that publishes mode changes (nothing calls it on main yet).
+
+static int g_screen_w, g_screen_h;   // 0 until something publishes a size
+static pthread_mutex_t g_screen_lock = PTHREAD_MUTEX_INITIALIZER;
+
+NSString * const MadeiraDisplayModeChangedNotification = @"MadeiraDisplayModeChanged";
+
+void winios_screen_size(int *w, int *h) {
+    pthread_mutex_lock(&g_screen_lock);
+    int sw = g_screen_w, sh = g_screen_h;
+    pthread_mutex_unlock(&g_screen_lock);
+    if (sw <= 0 || sh <= 0) {
+        // Nothing published: the session default, read each time because the
+        // app sets it per launch.
+        const char *we = getenv("MADEIRA_SCREEN_W"), *he = getenv("MADEIRA_SCREEN_H");
+        sw = (we && atoi(we) > 0) ? atoi(we) : 1024;
+        sh = (he && atoi(he) > 0) ? atoi(he) : 768;
+    }
+    if (w) *w = sw;
+    if (h) *h = sh;
+}
+
+void winios_display_mode_changed(int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    pthread_mutex_lock(&g_screen_lock);
+    int changed = (g_screen_w != w || g_screen_h != h);
+    g_screen_w = w;
+    g_screen_h = h;
+    pthread_mutex_unlock(&g_screen_lock);
+    if (!changed) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter]
+            postNotificationName:MadeiraDisplayModeChangedNotification object:nil];
+    });
+}
+
 // --- macdrv_* implementations ---
 
 // DXMT only dereferences client_cocoa_view (passing it straight back to
