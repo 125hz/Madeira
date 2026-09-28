@@ -10,3 +10,7 @@
 	path = research/dxmt
 	url = https://github.com/willfaust/dxmt.git
 	branch = ios-port
+[submodule "research/madeira-dock"]
+	path = research/madeira-dock
+	url = https://github.com/125hz/madeira-dock.git
+	branch = main

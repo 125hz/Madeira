@@ -103,6 +103,7 @@ build/gnutls-ios/obj/
 research/*
 !research/madeira-d3d12/
 !research/remote-metal/
+!research/madeira-dock
 *.bak
 photorec.se2
 .DS_Store
@@ -142,3 +143,7 @@ research/remote-metal/host/rmetald.*
 app/Madeira/licenses/LICENSE-MADEIRA-GPL-3.0.txt
 app/Madeira/licenses/LICENSE-MADEIRA-EXCEPTION.txt
 research/madeira-d3d12/tests/offline/sm51/
+
+# Madeira Dock: built from research/madeira-dock by build/madeira-dock/build.sh
+app/Madeira/arm64ec-windows/dockhost.exe
+app/Madeira/arm64ec-windows/dock-notices.txt

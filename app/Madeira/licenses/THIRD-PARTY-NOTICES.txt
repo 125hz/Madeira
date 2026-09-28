@@ -8,6 +8,11 @@ Steam sign-in (SwiftSteam): derived from Jfishin's Madeira Steam client and
 used with his permission; GPL-3.0-or-later with the exception, (C) 2026
 Jfishin, 125hz.
 
+Madeira Dock (arm64ec-windows/dockhost.exe, when built): GPL-3.0-or-later
+with the exception, (C) 2026 125hz. Source: https://github.com/125hz/madeira-dock
+(the research/madeira-dock submodule). Its licence and the notices of its
+statically linked LLVM/MinGW-w64 runtime are in arm64ec-windows/dock-notices.txt.
+
 Statically linked into the application binary:
 - Wine (fork branch madeira-lgpl, from upstream wine-11.4): LGPL-2.1-or-later
   (LGPL-2.1.txt). Madeira's modifications: LGPL-2.1-or-later, (C) 2026 Will
