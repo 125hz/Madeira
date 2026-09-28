@@ -23,8 +23,8 @@
 # DXMT owns d3d11/dxgi/d3d10core/winemetal on i386 as on 64-bit: Wine's own
 # d3d11/dxgi/d3d10core are wined3d frontends and wined3d has no backend in this
 # port (no OpenGL, --without-vulkan), so those are never installed from Wine.
-# d3d9 is left to the D3D9 series (DXMT's frontend + shim); Wine's copy is not
-# installed either.
+# d3d9 is DXMT's too: its thin shim ships as d3d9.dll and forwards to the
+# emulated frontend (d3d9-emulated.dll) unless madeira.cfg says d3d9 = native.
 set -euo pipefail
 
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -66,7 +66,7 @@ SKIP_REASON=(
   "aero.msstyles=7.4 MiB of theme data nothing in the prefix selects"
   "winedbg.exe=4.5 MiB debugger only the (unshown) crash dialog spawns; dbghelp.dll ships"
   "d3d11.dll|dxgi.dll|d3d10core.dll|winemetal.dll=DXMT-owned (installed below); Wine's are wined3d frontends with no backend here"
-  "d3d9.dll=DXMT-owned, installed by the D3D9 series"
+  "d3d9.dll=DXMT-owned: the shim and the emulated frontend are installed below"
 )
 SKIP=()
 for e in "${SKIP_REASON[@]}"; do IFS='|' read -r -a n <<< "${e%%=*}"; SKIP+=("${n[@]}"); done
@@ -112,9 +112,11 @@ done
 echo "== installed ${#TARGETS[@]} Wine modules into app/Madeira/i386-windows =="
 
 # --------------------------------------------------------------------- DXMT
-# The i386 build of research/dxmt (d3d11/dxgi/d3d10core/winemetal), linked
-# against this tree's import libraries. winemetal's wow64 thunk table on the
-# unix side is what lets these 32-bit DLLs reach the Metal renderer.
+# The i386 build of research/dxmt (d3d11/dxgi/d3d10core/winemetal and the
+# D3D9 frontend + shim), linked against this tree's import libraries.
+# winemetal's wow64 thunk table on the unix side is what lets these 32-bit
+# DLLs reach the Metal renderer; the shim reaches the native D3D9 frontend
+# through its own table (virtual_ios.c, the d3d9shim branch).
 if [ -z "${SKIP_DXMT:-}" ] && [ $# -eq 0 ]; then
     D="$R/research/dxmt"
     X="$B/dxmt-cross-i386.txt"
@@ -146,7 +148,12 @@ EOF
     for m in d3d11/d3d11.dll dxgi/dxgi.dll d3d10/d3d10core.dll winemetal/winemetal.dll; do
         "$STRIP" -o "$DEST/$(basename "$m")" "build-pe-i386/src/$m"
     done
-    echo "== installed DXMT i386 d3d11/dxgi/d3d10core/winemetal =="
+    # The shim is what programs load as d3d9.dll; the emulated frontend (the
+    # meson target also called d3d9.dll) ships beside it as d3d9-emulated.dll.
+    "$STRIP" -o "$DEST/d3d9.dll" build-pe-i386/src/d3d9shim/d3d9shim.dll
+    "$STRIP" -o "$DEST/d3d9shim.dll" build-pe-i386/src/d3d9shim/d3d9shim.dll
+    "$STRIP" -o "$DEST/d3d9-emulated.dll" build-pe-i386/src/d3d9/d3d9.dll
+    echo "== installed DXMT i386 d3d11/dxgi/d3d10core/winemetal and d3d9 (shim + emulated) =="
 fi
 
 # ----------------------------------------------------------- import closure

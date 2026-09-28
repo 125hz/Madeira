@@ -119,6 +119,32 @@ renderer; the 32-bit table lives in DXMT's `winemetal_unix.c`), ws2_32,
 bcrypt, secur32, crypt32, dwrite, nsi (TCP table) and the audio driver (on
 the existing engine). win32u goes through `wow64win.dll`.
 
+### Direct3D 9
+
+The i386 `d3d9.dll` in the farm is DXMT's thin shim (`research/dxmt/src/d3d9shim`,
+exported as `d3d9shim.dll` whatever file name it is installed under):
+
+- By default its `DllMain` forwards every export to `d3d9-emulated.dll`, DXMT's
+  D3D9 frontend built for i386 and translated by FEX like the program itself.
+  That frontend reaches Metal through winemetal's 32-bit table.
+- With `d3d9 = native` in `madeira.cfg` (the app exports it as `MADEIRA_D3D9`),
+  the shim binds its own unix side instead and the frontend runs as native
+  ARM64 code in `libdxmt_combined.a` (`build/dxmt-ios/build.sh`, the
+  `dxmt_madeira_native` objects). `load_builtin_unixlib()` binds
+  `dxmt_d3d9_unix_call_wow64_funcs` to a 32-bit module whose export name is
+  `d3d9shim`, never to the emulated frontend.
+- Native D3D9 objects hold host pointers into the guest window, so the window
+  reclaim calls `d3d9_native_window_teardown(B)` before a dead process's
+  window is replaced with `PROT_NONE`. The hook is weak in `virtual_ios.c`;
+  DXMT's definition replaces the default, which only reports that it is
+  missing.
+
+`build/wine-i386/build.sh` installs the shim as `d3d9.dll` and `d3d9shim.dll`
+and the emulated frontend as `d3d9-emulated.dll`.
+`build/x86-tests/build-d3d9-cube.sh` builds the acceptance test, a spinning
+cube through a real device with a dynamic vertex buffer the guest locks every
+frame.
+
 ## 5. Thread contexts
 
 On iOS `SuspendThread` does not stop the target, so for **32-bit processes
@@ -197,6 +223,7 @@ the switch is only consulted for a WoW64 process, window or thread.
 | `MADEIRA_CPU_COUNT` | unset | per launch | Overrides the `cpu-count` key for one program (unset: unchanged) |
 | `MADEIRA_STRICT_SPLITLOCK` | on | FEX WOW64 | `StrictInProcessSplitLocks` default for 32-bit guests (an explicit FEX setting wins) |
 | `MADEIRA_WOW_SYSCALL_SWEEP` | on | FEX WOW64 | Let the code-buffer sweeper move threads parked in a system call |
+| `MADEIRA_D3D9` | unset (emulated) | i386 `d3d9.dll` | `native`: the D3D9 shim uses the native ARM64 frontend. Also set by the `d3d9` key of `madeira.cfg` |
 
 `inproc-sync` (madsync) is a `madeira.cfg` key, not part of this series, and
 keeps its default of 1.
@@ -243,7 +270,8 @@ Madeira PRs that pin them:
 2. willfaust/wine#6, #7, #8, #9, #10, #11, #12.
 3. willfaust/FEX#2, #3, #4 (FEX#3 pins rpmalloc#1).
 4. willfaust/Madeira#40, then #41 (pins the Wine series), then #42, #43 and
-   #44, then the launch PR (pins FEX#4), then the winemetal PR (pins DXMT).
+   #44, then the launch PR (pins FEX#4), then the winemetal PR (pins DXMT),
+   then the D3D9 PR (pins willfaust/dxmt#2, which merges after dxmt#1).
 
 A pin that points at a 125hz merge branch moves to the corresponding upstream
 merge commit once the submodule PRs are merged.

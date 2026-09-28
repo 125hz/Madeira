@@ -1995,6 +1995,20 @@ struct ContentView: View {
                 }
             }
 
+            // D3D9 frontend for 32-bit programs. The i386 d3d9.dll is DXMT's thin
+            // shim; unset (the default) or "emulated", it forwards every export to
+            // d3d9-emulated.dll, DXMT's D3D9 frontend built for i386 and translated
+            // by FEX like the program. "native" makes the shim bind its unix side
+            // and run the frontend as native ARM64 code in libdxmt_combined.a.
+            // Only the i386 shim reads MADEIRA_D3D9; 64-bit programs are unaffected.
+            if let txt = MadeiraConfig.get("d3d9") {
+                let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !v.isEmpty {
+                    setenv("MADEIRA_D3D9", v, 1)
+                    logStore.log("D3D9 frontend: MADEIRA_D3D9=\(v) via madeira.cfg d3d9")
+                }
+            }
+
             // ml734: Theorafile call tracer. Documents/madeira-tf-trace.txt == "1"
             // redirects libtheorafile's tf_* exports through wrappers in
             // tftrace-x64.dll that call the original and report the RETURN

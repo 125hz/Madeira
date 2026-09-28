@@ -50,6 +50,16 @@ wow64 = {
 }
 assert "extern const void *dxmt_winemetal_unix_call_wow64_funcs[];" in src
 branches = re.split(r"\n        \} else ", chain[chain.index('if (match && strstr(match, "winemetal"))'):])
+# The i386 D3D9 shim's branch is not upstream's: it is entered by 32-bit callers only
+# (so a 64-bit module keeps the upstream chain), offers only its wow64 table and no 64-bit one.
+d3d9 = [b for b in branches if '"d3d9shim"' in b.split("{")[0]]
+if d3d9:
+    assert len(d3d9) == 1
+    head = d3d9[0].split("{")[0]
+    assert head.startswith("if (wow && ("), head
+    assert "funcs_wow64 = (const void *)dxmt_d3d9_unix_call_wow64_funcs;" in d3d9[0]
+    assert "funcs64" not in d3d9[0], "the d3d9shim branch must not offer a 64-bit table"
+    branches.remove(d3d9[0])
 assert len(branches) == len(upstream) + 1, len(branches)
 for (test, table), body in zip(upstream, branches):
     assert test in body.split("\n")[0], (test, body.split("\n")[0])
