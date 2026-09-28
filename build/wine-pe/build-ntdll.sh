@@ -5,13 +5,17 @@
 # Other PE modules: `make -C dlls/<name>` in the same build tree, then copy the
 # .dll from dlls/<name>/arm64ec-windows/ to app/Madeira/arm64ec-windows/ (no
 # strip/pad for those). Requires the llvm-mingw toolchain (docs/BUILDING.md).
+# --enable-winegstreamer keeps winegstreamer's PE rules although GStreamer is
+# absent (its unix side is build/ntdll-unix/winegstreamer_unixlib_ios.c); build
+# it as `make dlls/winegstreamer/arm64ec-windows/winegstreamer.dll`, never as
+# `make -C dlls/winegstreamer`, which would also try the GStreamer-based .so.
 set -eu
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TC="$R/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin"
 export PATH="$TC:$PATH"
 B="$R/wine/build-arm64ec"
 if [ ! -f "$B/config.status" ]; then
-    mkdir -p "$B" && cd "$B" && ../configure --enable-archs=arm64ec --without-x --disable-tests
+    mkdir -p "$B" && cd "$B" && ../configure --enable-archs=arm64ec --without-x --disable-tests --enable-winegstreamer
 fi
 cd "$B" && make -C dlls/ntdll
 SRC="$B/dlls/ntdll/arm64ec-windows/ntdll.dll"; OUT="$R/app/Madeira/arm64ec-windows/ntdll.dll"

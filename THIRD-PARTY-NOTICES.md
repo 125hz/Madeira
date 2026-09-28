@@ -20,6 +20,7 @@ dependency license texts are in `LICENSES/`. See "Why GPL-3.0-or-later" below.
 | **GMP** 6.3.0 | **LGPL-3.0-or-later** or GPL-2.0-or-later | Static (`libgmp.a`). |
 | **Nettle / Hogweed** 3.10.1 | **LGPL-3.0-or-later** or GPL-2.0-or-later | Static (`libnettle.a`, `libhogweed.a`). |
 | **GnuTLS** 3.8.9 | LGPL-2.1-or-later | Static (`libgnutls.a`). Used by Wine's bcrypt/secur32/crypt32. |
+| **FFmpeg** 7.1.1 — libavformat, libavcodec, libavutil, libswresample | **LGPL-2.1-or-later** | Static (`libavformat.a`, `libavcodec.a`, `libavutil.a`, `libswresample.a`). Configured `--disable-gpl --disable-nonfree --disable-version3 --disable-everything`, then only: the WMA-family decoders (`wmav1,wmav2,wmapro,wmalossless,xma1,xma2`), the `mp1,mp2,mp3` and `pcm_u8,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_f64le` decoders, the `mp3`, `wav` and `mov` (MP4/MOV/M4A) demuxers and the `mpegaudio` parser. No H.264, HEVC or AAC decoder or parser (those streams are decoded by Apple's VideoToolbox/AudioToolbox), no protocols, no muxers, no zlib. No GPL, version3 or non-free component is enabled, so the result is LGPL-2.1-or-later. Used only by `build/ntdll-unix/winegstreamer_unixlib_ios.c` and `build/ntdll-unix/wg_parser_av_ios.c`, winegstreamer's unix side on this port (the Windows WMA decoder MFT/DMO, and the wg_parser behind quartz's MP3/WAV splitters and Media Foundation's MP4 source); upstream Wine implements both with GStreamer, which does not exist on iOS. |
 | **{fmt}** | MIT | Static (`libfmt.a`), via FEX. |
 | **xxHash** | BSD-2-Clause | Static (`libxxhash.a`). |
 | **Cephes** | permissive (Moshier) | Static (`libcephes_128bit.a`), via FEX. |
@@ -32,7 +33,7 @@ proprietary applications to link against the covered work, which does not serve
 that intent; GPL requires distributed derivative and combined works to remain
 GPL-compatible and to offer source.
 
-The dependencies permit this. Wine and GnuTLS are LGPL-2.1-**or-later** and GMP
+The dependencies permit this. Wine, GnuTLS and FFmpeg are LGPL-2.1-**or-later** and GMP
 and Nettle are LGPL-3.0-or-later; LGPL explicitly allows a combined work to be
 distributed under GPL terms, and the MIT and BSD components impose no obstacle.
 
@@ -133,9 +134,21 @@ All three are unmodified upstream releases; no patches are applied. A reference
 to an upstream project would not have been enough on its own, which is why the
 tarballs themselves are here.
 
+FFmpeg's archives are git-ignored outputs of its build script (like
+`libntdll_unix.a`), but the app links them, so a built package contains them
+and the exact source they are built from is tracked here in the same way:
+
+- `build/ffmpeg/src/ffmpeg-7.1.1.tar.xz` -- the unmodified upstream release
+  from `ffmpeg.org`
+- `build/ffmpeg/src/SHA256SUMS` -- its checksum
+  (`733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1`), which
+  every run of the build script verifies before extracting
+- `build/ffmpeg/build.sh` -- the exact build machinery and configure flags. No
+  patches are applied, and the script needs no network.
+
 ## Relinking and static linking
 
-The Wine-derived unix libraries and the crypto stack are linked **statically**
+The Wine-derived unix libraries, the crypto stack and FFmpeg are linked **statically**
 into the app binary.
 
 LGPL section 6 (v2.1) / section 4 (v3) contemplates a recipient being able to
