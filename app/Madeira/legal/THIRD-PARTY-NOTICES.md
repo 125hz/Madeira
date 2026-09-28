@@ -23,6 +23,7 @@ dependency license texts are in `LICENSES/`. See "Why GPL-3.0-or-later" below.
 | **xxHash** | BSD-2-Clause | Static (`libxxhash.a`). |
 | **Cephes** | permissive (Moshier) | Static (`libcephes_128bit.a`), via FEX. |
 | **Berkeley SoftFloat 3e** | BSD-3-Clause | Static (`libsoftfloat_3e.a`), via FEX. |
+| **Steam sign-in (`app/Madeira/SwiftSteam/`)** | Derived from Jfishin's Madeira Steam client, used with the author's permission (see below) | GPL-3.0-or-later + Converter Exception, Copyright 2026 Jfishin, 125hz | Sign-in to Steam's public `IAuthenticationService` over HTTPS and a Keychain token store only. File-by-file provenance: `docs/STEAM_SIGNIN.md`. No Valve or third-party Steam code or binaries. |
 
 ## Why GPL-3.0-or-later
 
@@ -89,6 +90,10 @@ Do **not** assume that everything outside the submodules is original. It is not.
   fetched separately (see the open issue below).
 - `app/`, `tools/`, `scripts/` and `patches/` are largely original, but contain
   vendored and derived files too.
+- `app/Madeira/SwiftSteam/` is derived from Jfishin's Madeira Steam client. Jfishin
+  gave permission to use it ("do whatever you want with it") in the Madeira
+  Discord server on 2026-09-22; Will Faust is a member of that server and saw
+  the message. Details and a per-file audit: `docs/STEAM_SIGNIN.md`.
 
 Rather than claim authorship of whole directories: **original Madeira-authored
 files that do not carry another license notice are licensed under
