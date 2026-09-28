@@ -133,6 +133,14 @@ int madsync_enabled(void)
         char v[32];
         int set = madeira_cfg_get( "inproc-sync", v, sizeof v );
         int on = madeira_cfg_bool( "inproc-sync", 0 );
+        /* ml2015: the app turns madsync off for a session that runs one-time installs
+         * (services.exe's RPC server never answered under it; device log 111). */
+        const char *session = getenv( "MADEIRA_MADSYNC_SESSION" );
+        if (on && session && session[0] == '0')
+        {
+            on = 0;
+            dprintf( 2, "[madsync] ml2015 off for this session (MADEIRA_MADSYNC_SESSION=0: one-time installs)\n" );
+        }
         state = on;
         dprintf( 2, "[madsync] ml1058 in-process synchronisation %s (madeira.cfg inproc-sync = 1 enables; fastsync is the default)\n",
                  on ? "ENABLED" : "disabled" );

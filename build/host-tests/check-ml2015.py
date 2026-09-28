@@ -106,3 +106,28 @@ for label in ['"Close session", "stop.circle"', '"Hide live log" : "Show live lo
     assert label in row, label
 assert 'Button("Close session"' not in lib and '.accessibilityLabel(label)' in lib
 print('PASS: close / live log / desktop are one row of glyph buttons with VoiceOver labels')
+
+# 6. Logs 111/112 follow-ups.
+views = (app / 'SteamStoreViews.swift').read_text(encoding='utf-8')
+content = (app / 'ContentView.swift').read_text(encoding='utf-8')
+madsync = (root / 'build/madsync/madsync.c').read_text(encoding='utf-8')
+driver = (root / 'build/win32u-unix/driver_ios.c').read_text(encoding='utf-8')
+dock_main = (root.parent / 'madeira-dock/src/main.c').read_text(encoding='utf-8')
+assert 'var steamInstallersNext: Bool?' in lib and 'Picker("One-time installs"' in views
+assert 'Text("Run at next start").tag(true)' in views and 'Text("Skip").tag(false)' in views
+assert 'entry.steamInstallersNext == false && !pending.isEmpty' in lib and 'stored.steamInstallersNext = false' in lib
+assert 'func skipDockInstallers()' in lib and 'model.skipDockInstallers()' in lib
+print('PASS: game details › One-time installs (fresh install runs once, then Skip) and a Dock skip button')
+assert 'let forceFast = madsync && !pending.isEmpty' in lib and 'MadeiraDock.installerSessionFastsync = forceFast' in lib
+assert 'setenv("MADEIRA_MADSYNC_SESSION", "0", 1)' in content and 'unsetenv("MADEIRA_MADSYNC_SESSION")' in content
+assert 'getenv( "MADEIRA_MADSYNC_SESSION" )' in madsync
+assert 'SH_INSTALL_SCM_STEP_MS' in dock_main and 'printf("services timeout\\n")' in dock_main
+print('PASS: a start with one-time installs runs on fastsync; the service step is bounded (20 s)')
+assert 'int winios_drv_foreground_if_owner( HWND hwnd )' in driver and 'GetCurrentThreadId()' in driver
+assert 'atomic_store(&g_restore_foreground, (uintptr_t)hwnd);' in winios and 'winios_drv_foreground_if_owner((HWND)fg)' in winios
+print('PASS: a restored born-minimized window is brought to the front by its own thread')
+assert 'Add complete application folders' not in lib
+for who in ['name: "Will Faust", handle: "willfaust"', 'name: "Nick", handle: "125hz"', 'name: "Jfishin", handle: "Jfishin"']:
+    assert who in lib, who
+assert lib.index('header: { Text("Credits") }') > lib.index('header: { Text("Interface") }'), 'credits last'
+print('PASS: Settings: the drive_c note is gone and Credits is the last section')

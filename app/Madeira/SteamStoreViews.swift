@@ -546,9 +546,24 @@ struct SteamEntrySection: View {
             // ml1970: under Madeira Dock, installs Madeira's Wine does not provide run once anyway;
             // this also runs the DirectX / Visual C++ installers.
             if entry.startsWithClient {
-                Toggle(entry.steamStartMode == .dock ? "Also run DirectX and Visual C++ installers" : "Run Steam's one-time installs",
-                       isOn: Binding(get: { entry.steamRunInstallers == true },
-                                     set: { entry.steamRunInstallers = $0 ? true : nil }))
+                // ml2015 (owner request): under Madeira Dock, whether the next start runs the game's
+                // one-time installs. A fresh install runs them once; afterwards this shows Skip.
+                if entry.steamStartMode == .dock && LibraryFlags.enabled("MADEIRA_DOCK_INSTALL_CHOICE") {
+                    Picker("One-time installs", selection: Binding(get: { entry.steamInstallersNext != false },
+                                                                   set: { entry.steamInstallersNext = $0 })) {
+                        Text("Run at next start").tag(true)
+                        Text("Skip").tag(false)
+                    }.pickerStyle(.menu)
+                    if entry.steamInstallersNext != false {
+                        Toggle("Also run DirectX and Visual C++ installers",
+                               isOn: Binding(get: { entry.steamRunInstallers == true },
+                                             set: { entry.steamRunInstallers = $0 ? true : nil }))
+                    }
+                } else {
+                    Toggle(entry.steamStartMode == .dock ? "Also run DirectX and Visual C++ installers" : "Run Steam's one-time installs",
+                           isOn: Binding(get: { entry.steamRunInstallers == true },
+                                         set: { entry.steamRunInstallers = $0 ? true : nil }))
+                }
             }
             if candidates.count > 1 {
                 Picker("Program", selection: Binding(get: { entry.relativePath }, set: { select($0) })) {

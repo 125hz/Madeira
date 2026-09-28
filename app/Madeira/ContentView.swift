@@ -5964,6 +5964,15 @@ struct ContentView: View {
             // Steam after a Dock handoff has been prepared.
             profile?.applyEnvironment(dock: dock)
             if profile != nil { logStore.log("[launch-route] ml1840 selected=\(dock ? "dock" : "profile") applied-after-config=1") }
+            // ml2015: a Dock start that runs one-time installs uses fastsync for this session even
+            // when madsync is chosen (installers hung under madsync; see prepareDockInstallers).
+            if dock && MadeiraDock.installerScript != nil && MadeiraDock.installerSessionFastsync {
+                setenv("MADEIRA_MADSYNC_SESSION", "0", 1)
+                unsetenv("MADEIRA_FASTSYNC")
+                logStore.log("[sync-engine] ml2015 one-time installs: this session uses fastsync; the next start uses madsync again")
+            } else {
+                unsetenv("MADEIRA_MADSYNC_SESSION")
+            }
 
             // ml734: Theorafile call tracer. Documents/madeira-tf-trace.txt == "1"
             // redirects libtheorafile's tf_* exports through wrappers in

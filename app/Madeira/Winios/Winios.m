@@ -454,6 +454,11 @@ extern int NtUserPostMessage(HWND hwnd, unsigned int msg, uintptr_t wparam, intp
  * alone. MADEIRA_RESTORE_BORN_MINIMIZED=0 turns this off. */
 #define WINIOS_WM_SYSCOMMAND 0x0112u
 #define WINIOS_SC_RESTORE    0xF120u
+/* Device log 112: restored, the window was shown but the game stayed idle and never
+ * made its D3D device (a fullscreen game pauses without focus). A taskbar click also
+ * brings the window to the front: its own thread does that from its event pump. */
+extern int winios_drv_foreground_if_owner(HWND hwnd);
+static _Atomic(uintptr_t) g_restore_foreground;
 static int winios_restore_born_minimized_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) { const char *e = getenv("MADEIRA_RESTORE_BORN_MINIMIZED"); enabled = !(e && e[0] == '0'); }
@@ -569,6 +574,7 @@ static void winios_census_note_frame(HWND hwnd, int x, int y, int w, int h, int 
     if (born_minimized) {
         /* Posted, not sent: this runs inside the window's WindowPosChanged. */
         int ok = NtUserPostMessage(hwnd, WINIOS_WM_SYSCOMMAND, WINIOS_SC_RESTORE, 0);
+        atomic_store(&g_restore_foreground, (uintptr_t)hwnd);
         fprintf(stderr, "[born-minimized] ml2015 hwnd=%p pid=%04x image=%s restore-posted=%d "
                         "(MADEIRA_RESTORE_BORN_MINIMIZED=0 leaves it minimized)\n", hwnd, pid, image, ok ? 1 : 0);
         fflush(stderr);
@@ -627,6 +633,8 @@ int winios_window_census(struct winios_census_window *out, int max) {
 
 void winios_pDestroyWindow(HWND hwnd) {
     WLOG("pDestroyWindow hwnd=%p", hwnd);
+    uintptr_t pending = (uintptr_t)hwnd;
+    atomic_compare_exchange_strong(&g_restore_foreground, &pending, 0);   /* ml2015 */
     winios_census_forget(hwnd);
     winios_remove_layer(hwnd);
 }
@@ -1044,6 +1052,16 @@ void winios_post_key_ex(int vk, int down, unsigned int extra) {
 void winios_post_key(int vk, int down) { winios_post_key_ex(vk, down, 0); }
 
 BOOL winios_pProcessEvents(DWORD mask) {
+    /* ml2015: the restored window's own thread brings it to the front (see
+     * g_restore_foreground); other threads leave the request in place. */
+    uintptr_t fg = atomic_load_explicit(&g_restore_foreground, memory_order_relaxed);
+    if (fg) {
+        int r = winios_drv_foreground_if_owner((HWND)fg);
+        if (r && atomic_compare_exchange_strong(&g_restore_foreground, &fg, 0)) {
+            fprintf(stderr, "[born-minimized] ml2015 hwnd=%p foreground=%d\n", (HWND)fg, r);
+            fflush(stderr);
+        }
+    }
     static unsigned int cnt;
     static int quiet = -1;
     if (quiet < 0) quiet = getenv("MADEIRA_QUIET") != NULL;

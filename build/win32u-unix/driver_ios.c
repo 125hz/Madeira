@@ -156,6 +156,16 @@ void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_
  * VK_ESCAPE=0x1B, ...); flags is 0 for key-down, KEYEVENTF_KEYUP (0x2)
  * for key-up. Scan code derived via the default layout so games reading
  * scan codes (DirectInput-style) see something plausible. */
+int winios_drv_foreground_if_owner( HWND hwnd )
+{
+    /* ml2015: Winios.m restores a window whose first show was minimized, as a taskbar
+     * click does; a taskbar click also brings it to the front. Only the window's own
+     * thread does that, from its event pump (not inside SetWindowPos). Returns 0 on
+     * another thread, 1 when the window is now foreground, -1 on failure. */
+    if (!hwnd || get_window_thread( hwnd, NULL ) != GetCurrentThreadId()) return 0;
+    return NtUserSetForegroundWindow( hwnd ) ? 1 : -1;
+}
+
 void winios_drv_post_key(unsigned short vk, unsigned int flags)
 {
     INPUT input = {0};

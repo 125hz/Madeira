@@ -50,6 +50,8 @@ enum MadeiraDock {
     /// ml2015: the batch starts with `dockhost.exe --start-services`, whose normal exit is not
     /// the Dock's (device log 108: that exit ended the start and deleted the sign-in transfer).
     nonisolated(unsafe) static var installerServicesStep = false
+    /// ml2015: this start runs one-time installs while madsync is chosen; the session uses fastsync.
+    nonisolated(unsafe) static var installerSessionFastsync = false
     static let installerScriptName = "madeira-dock-installers.cmd"
     /// ml2013: the batch appends each program's start and exit status here (drive C root).
     static let installerResultName = "madeira-dock-installers.result"

@@ -187,6 +187,9 @@ struct LibraryEntry: Codable, Identifiable {
     // ml1780: true lets the client run the game's one-time installs (DirectX, Visual C++,
     // PhysX...); otherwise Madeira marks them done before a client start.
     var steamRunInstallers: Bool?
+    // ml2015: game details › One-time installs under Madeira Dock. nil (a fresh install) or
+    // true runs the pending installs at the next start, which then sets it to false (Skip).
+    var steamInstallersNext: Bool?
     // ml1970: true starts this game through the regular desktop Steam client even while
     // Madeira Dock is on ("Steam (more usage)" under Start with); nil keeps Madeira Dock.
     var steamDesktopLaunch: Bool?
@@ -1013,6 +1016,7 @@ final class LibraryModel: ObservableObject {
     static func prepareDockInstallers(_ entry: LibraryEntry) {
         MadeiraDock.installerScript = nil
         MadeiraDock.installerServicesStep = false
+        MadeiraDock.installerSessionFastsync = false
         MadeiraDock.installerNote = nil
         MadeiraDock.resetInstallerProgress()
         let app = entry.steamAppID ?? 0
@@ -1084,13 +1088,38 @@ final class LibraryModel: ObservableObject {
         do { written = try SteamInstallScripts.mark(provided, prefix: prefix) }
         catch { LogStore.shared.log("[dock-installers] ml1970 app=\(app) mark failed: \(error.localizedDescription)", level: .error) }
         if resetOn { ledger.record(newlyProvided, app: app) }
-        let pending = items.filter { $0.status == .pending }.map(\.process)
+        var pending = items.filter { $0.status == .pending }.map(\.process)
+        // ml2015 (owner request): game details › One-time installs. A fresh install (nil) or
+        // "Run at next start" (true) runs them at this start, after which the choice becomes
+        // Skip (false); Skip starts the game without them. MADEIRA_DOCK_INSTALL_CHOICE=0 ignores it.
+        let choiceOn = LibraryFlags.enabled("MADEIRA_DOCK_INSTALL_CHOICE")
+        let skipped = choiceOn && entry.steamInstallersNext == false && !pending.isEmpty
+        if skipped {
+            LogStore.shared.log("[dock-installers] ml2015 app=\(app) choice=skip pending=\(pending.count) (game details › One-time installs)")
+            pending = []
+        } else if choiceOn && !pending.isEmpty,
+                  var stored = LibraryModel.shared.entries.first(where: { $0.id == entry.id }) {
+            stored.steamInstallersNext = false
+            LibraryModel.shared.save(stored)
+            LogStore.shared.log("[dock-installers] ml2015 app=\(app) choice=run pending=\(pending.count); next start skips them")
+        }
         // ml2014 (device log 103: an installer found no service manager in the Dock session, and
         // a provided runtime's failed setup was retried at every start): the batch first makes
         // Wine's service manager reachable (MADEIRA_DOCK_INSTALL_SCM=0: "services off"), and a
         // provided runtime queued by "run all" that fails is recorded done
         // (MADEIRA_DOCK_INSTALL_PROVIDED_FALLBACK=0: retried as in ml2013). Both need the report batch.
-        let services: DockInstallServices = LibraryFlags.enabled("MADEIRA_DOCK_INSTALL_SCM") ? .start(MadeiraDock.executable) : .off
+        // ml2015 (device log 111): with the madsync engine, services.exe's RPC server never
+        // answered, and the service step (then every installer) waited forever; msiexec's custom
+        // actions use the same RPC server. A start that runs one-time installs therefore uses
+        // fastsync for its whole session; later starts use the chosen engine.
+        // MADEIRA_DOCK_INSTALL_FASTSYNC=0 keeps madsync and leaves the service step out instead.
+        let madsync = MadeiraConfig.bool("inproc-sync") && MadeiraConfig.get("env.MADEIRA_FASTSYNC") == "0"
+        let forceFast = madsync && !pending.isEmpty && LibraryFlags.enabled("MADEIRA_DOCK_INSTALL_FASTSYNC")
+        let scmOK = !madsync || forceFast
+        let services: DockInstallServices = LibraryFlags.enabled("MADEIRA_DOCK_INSTALL_SCM") && scmOK ? .start(MadeiraDock.executable) : .off
+        if madsync && !pending.isEmpty {
+            LogStore.shared.log("[dock-installers] ml2015 app=\(app) engine=madsync session-engine=\(forceFast ? "fastsync" : "madsync") services-step=\(scmOK ? "start" : "off")")
+        }
         let fallback = LibraryFlags.enabled("MADEIRA_DOCK_INSTALL_PROVIDED_FALLBACK") ? DockInstallScripts.providedRuns(found) : []
         if !pending.isEmpty {
             do {
@@ -1100,6 +1129,7 @@ final class LibraryModel: ObservableObject {
                 try Data(text.utf8).write(to: batchURL, options: .atomic)
                 MadeiraDock.installerScript = "C:\\" + MadeiraDock.installerScriptName
                 MadeiraDock.installerServicesStep = report && services != .off
+                MadeiraDock.installerSessionFastsync = forceFast
             } catch {
                 LogStore.shared.log("[dock-installers] ml1970 app=\(app) batch write failed: \(error.localizedDescription)", level: .error)
             }
@@ -1123,6 +1153,12 @@ final class LibraryModel: ObservableObject {
             // Shown when something runs or is missing, or when Madeira first records runtimes as
             // provided (a first start, a reinstall); a start where all is done stays quiet (ml1990).
             MadeiraDock.installerNote = DockInstallScripts.note(items, runAll: runAll, announceProvided: !newlyProvided.isEmpty)
+            if skipped {
+                MadeiraDock.installerNote = "One-time installs skipped. To run them, choose Run at next start under One-time installs in the game's details."
+            } else if forceFast {
+                MadeiraDock.installerNote = (MadeiraDock.installerNote.map { $0 + " " } ?? "") +
+                    "This start uses Fastsync for the installers; your Madsync setting applies again from the next start."
+            }
         }
         var detail = ""
         if report {
@@ -1249,6 +1285,18 @@ final class LibraryModel: ObservableObject {
         sessionMessage = "Closing Steam to skip the one-time installs…"
     }
     private var pendingRelaunch: LibraryEntry?
+
+    /// ml2015 (owner request): "Skip one-time installs" while a Madeira Dock start runs them.
+    /// The game's One-time installs choice becomes Skip and the session ends; one session per
+    /// run, so Madeira then asks for a restart, after which Play starts without them.
+    func skipDockInstallers() {
+        guard let entry = activeEntry, dockLaunching, !skippingInstallers else { return }
+        if var stored = entries.first(where: { $0.id == entry.id }) { stored.steamInstallersNext = false; save(stored) }
+        skippingInstallers = true
+        LogStore.shared.log("[dock-installers] ml2015 skip tapped app=\(entry.steamAppID ?? 0) t=\(Int(Date().timeIntervalSince(launchStarted)))s; ending the session")
+        requestQuit()
+        restartNotice = "The one-time installs are skipped for this game. " + Self.restartMessage + " Then tap Play."
+    }
 
     func setFPS(_ mode: Int) {
         fpsMode = mode; madeira_set_vsync_locked(Int32(mode))
@@ -1733,9 +1781,6 @@ struct LibraryView: View {
             if nativeSteam {
                 SteamSettingsSection(signIn: { steamSignIn = true }, openClient: { steamManager = true })
             }
-            Section("Library") {
-                Text("Add complete application folders to Madeira/wine/drive_c using Files. Display, frame limit, and compatibility options are saved per game.")
-            }
             // ml1530: reopens the first-run setup (MADEIRA_ONBOARDING=0 hides it).
             if OnboardingModel.enabled {
                 Section {
@@ -1750,6 +1795,14 @@ struct LibraryView: View {
                 }))
             } header: { Text("Interface") } footer: {
                 Text("The developer interface is Madeira's original diagnostic screen. The change applies after Madeira restarts.")
+            }
+            // ml2015 (owner request): credits, last on the Settings page.
+            Section {
+                MadeiraCredit(name: "Will Faust", handle: "willfaust", role: "Created Madeira")
+                MadeiraCredit(name: "Nick", handle: "125hz", role: "32-bit game support, the game library and Madeira Dock")
+                MadeiraCredit(name: "Jfishin", handle: "Jfishin", role: "The original native Steam sign-in, library and downloads")
+            } header: { Text("Credits") } footer: {
+                Text("Madeira is built on Wine, FEX-Emu, DXMT by Feifan He (3Shain) with the Direct3D 9 frontend by David Acevedo (dacevedo12), rpmalloc by Mattias Jansson, and StikDebug for enabling JIT. Thank you to everyone who contributes to these projects.")
             }
         }
         .alert("Restart Madeira", isPresented: $restartNotice) {
@@ -2277,6 +2330,26 @@ struct FPSChoice: View {
 /// in-process sync engine: the fork's fastsync (env.MADEIRA_FASTSYNC) or Will's madsync
 /// (madeira.cfg inproc-sync). Exactly one engine is active, never both. Both are read when
 /// Madeira starts, so changes apply after a restart. MADEIRA_RUNTIME_SETTINGS=0 hides this.
+/// ml2015: one row of Settings › Credits: a person, their GitHub account and what they did.
+struct MadeiraCredit: View {
+    let name: String
+    let handle: String
+    let role: String
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Text(name).font(.body.weight(.semibold))
+                if let url = URL(string: "https://github.com/\(handle)") {
+                    Link("@\(handle)", destination: url).font(.subheadline)
+                }
+            }
+            Text(role).font(.subheadline).foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
+    }
+}
+
 struct RuntimeMemorySyncSettings: View {
     enum SyncEngine: String, CaseIterable, Identifiable {
         case fastsync, madsync, off
@@ -2639,6 +2712,15 @@ struct LibraryHUD: View {
                                 }
                                 .disabled(model.skippingInstallers)
                                 .accessibilityHint("Closes Steam and marks DirectX, Visual C++ and similar installers as done")
+                            }
+                            // ml2015: the same under Madeira Dock while its one-time installs run.
+                            if model.dockLaunching, model.dockLaunchFailure == nil, MadeiraDock.installerScript != nil,
+                               MadeiraDock.pollReport().fields["probe-start-bits"] == nil {
+                                launchGlyph(model.skippingInstallers ? "Skipping one-time installs…" : "Skip one-time installs", "forward.end") {
+                                    model.skipDockInstallers()
+                                }
+                                .disabled(model.skippingInstallers)
+                                .accessibilityHint("Ends this start; the game then starts without its one-time installs")
                             }
                         }
                     }
