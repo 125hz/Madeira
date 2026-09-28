@@ -242,8 +242,10 @@ none are committed with the code.
    modules; `SKIP_DXMT=1` leaves DXMT out. The unix side needs
    `libdxmt_combined.a` rebuilt from the pinned DXMT (`build/dxmt-ios/build.sh`),
    which carries winemetal's 32-bit table.
-   It is the macOS form of the WSL script the 32-bit work was built with and
-   has not been run on macOS.
+   It is the macOS form of the WSL script the 32-bit work was built with; it
+   was first run on macOS on 2026-09-29 (717 Wine modules plus DXMT, no
+   missing imports). Wine's configure needs bison 3.0 or newer; macOS ships
+   2.3, so put Homebrew's first on PATH (`/opt/homebrew/opt/bison/bin`).
 2. **aarch64 side:** `app/Madeira/aarch64-windows/` needs `wow64.dll` and
    `wow64win.dll`, and `ntdll.dll` rebuilt, from the pinned Wine's aarch64 PE
    build (`make -C dlls/wow64 dlls/wow64win dlls/ntdll` in a tree configured

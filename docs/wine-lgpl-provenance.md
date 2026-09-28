@@ -88,3 +88,6 @@ signed off under the DCO (the fork's `CONTRIBUTING.md`):
 - feb96ad2be4 2026-09-25 xinput: read Madeira host controller snapshots
   through win32u. Author: 125hz. willfaust/wine pull request #1, merged as
   815cf1f92e2.
+- 2026-09-29 the iOS WoW64 series, author 125hz, willfaust/wine pull
+  requests #6-#12, merged as cea4dfc9a14: 970dac54a4e, 2ebe9374b26,
+  db62a711998, e9289051644, 1a73c698b8c, f9074408fd9, 059cb1923c0.
