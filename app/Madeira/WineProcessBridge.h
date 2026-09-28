@@ -1,4 +1,5 @@
 #pragma once
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -12,6 +13,16 @@ int wine_process_start(const char *prefix_path);
 
 // Check if Wine process is running
 int wine_process_is_running(void);
+
+// Session exit report (the library front end). ntdll calls
+// wine_launched_process_did_exit() when the program the app launched (the
+// session's initial process) exits; other processes are not reported.
+// Returns 1 and fills *status when that program ended with an NTSTATUS error
+// (0xC...) since the last reset.
+void wine_launched_process_did_exit(int status);
+int wine_crash_exit_status(uint32_t *status);
+// Forget the recorded status; called when a session begins.
+void wine_exit_status_reset(void);
 
 // Steam S0 net-test VPN gate: write C:\madeira-continue.flag into the
 // prefix's drive_c so the paused winhttp-test.exe resumes to the Steam

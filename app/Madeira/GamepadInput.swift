@@ -196,6 +196,17 @@ final class GamepadInput: @unchecked Sendable {
                 state.ly = Self.axis(pad.leftThumbstick.yAxis.value)
                 state.rx = Self.axis(pad.rightThumbstick.xAxis.value)
                 state.ry = Self.axis(pad.rightThumbstick.yAxis.value)
+                // The library front end navigates with player 1's pad (Library.swift).
+                // While it owns input (no session, or its menu is open) the game
+                // sees a connected pad at rest.
+                if i == 0 {
+                    let library = LibraryController.shared
+                    library.sample(buttons: state.buttons, lx: state.lx, ly: state.ly)
+                    if library.ownsInput {
+                        state = winios_gamepad()
+                        state.connected = 1
+                    }
+                }
             }
             if active && touchConnected {
                 let physical = GamepadSample(buttons: state.buttons,

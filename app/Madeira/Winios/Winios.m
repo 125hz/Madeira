@@ -25,6 +25,7 @@
 #import <os/log.h>
 #include <stdarg.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <sys/time.h>
@@ -595,6 +596,15 @@ static void winios_apply_contents_rect(NSNumber *key, CALayer *l) {
                                 MIN(px.size.width / surf.width, 1.0),
                                 MIN(px.size.height / surf.height, 1.0));
 }
+
+/* GDI window images the compositor has shown (desktop sessions). The library
+ * front end reads it to notice a desktop session's first frame, the way it
+ * reads DXMT's present counter for a direct launch. */
+static _Atomic unsigned long long g_surface_present_count;
+unsigned long long winios_surface_present_count(void) {
+    return atomic_load_explicit(&g_surface_present_count, memory_order_relaxed);
+}
+
 static UIView *g_compositor_view;
 static CALayer *g_desk_bg;               /* teal desktop-area backdrop */
 static CGFloat g_px_to_pt = 1.0 / 3.0;   /* desktop px → screen pt */
@@ -651,6 +661,45 @@ void winios_set_compositor_frame(double x, double y, double w, double h) {
         g_comp_frame_set = YES;
         winios_layout_compositor();
     });
+}
+
+/* Library front end (Library.swift): a desktop session's compositor view sits
+ * on the app window above the library and keeps showing the last frame after
+ * the session ended, so the library hides it then and shows it again for the
+ * next session. Returns 1 when there was a view to change. */
+int winios_compositor_set_hidden(int hidden) {
+    if (!g_compositor_view) return 0;
+    BOOL h = hidden ? YES : NO;
+    if (NSThread.isMainThread) {
+        if (g_compositor_view.hidden == h) return 0;
+        g_compositor_view.hidden = h;
+    } else {
+        dispatch_async(dispatch_get_main_queue(), ^{ g_compositor_view.hidden = h; });
+    }
+    return 1;
+}
+
+/* Main thread only. A window point (points) to desktop pixels through the same
+ * mapping winios_layout_compositor placed the desktop with, for the front end's
+ * Touch pointer mode in desktop sessions. Returns 0 when there is no desktop. */
+int winios_desktop_point_from_window(double wx, double wy, int *px, int *py) {
+    const char *dw = getenv("MADEIRA_SCREEN_W"), *dh = getenv("MADEIRA_SCREEN_H");
+    int desk_w = dw ? atoi(dw) : 1024, desk_h = dh ? atoi(dh) : 768;
+    if (desk_w <= 0) desk_w = 1024;
+    if (desk_h <= 0) desk_h = 768;
+    if (px) *px = 0;
+    if (py) *py = 0;
+    if (!g_compositor_view || g_px_to_pt <= 0) return 0;
+    CGRect f = g_compositor_view.frame;
+    double x = (wx - f.origin.x - g_desk_origin.x) / g_px_to_pt;
+    double y = (wy - f.origin.y - g_desk_origin.y) / g_px_to_pt;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x > desk_w - 1) x = desk_w - 1;
+    if (y > desk_h - 1) y = desk_h - 1;
+    if (px) *px = (int)x;
+    if (py) *py = (int)y;
+    return 1;
 }
 
 /* main thread only */
@@ -1216,6 +1265,7 @@ int winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
         if (img) {
             NSNumber *key = @((uintptr_t)hwnd);
             l.contents = (__bridge id)img;
+            atomic_fetch_add_explicit(&g_surface_present_count, 1, memory_order_relaxed);
             g_surf_sizes[key] = [NSValue valueWithCGSize:CGSizeMake(sw, sh)];
             if (CGRectIsEmpty(l.frame)) {
                 /* frame not delivered yet — place at surface size */

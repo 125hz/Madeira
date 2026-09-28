@@ -5,6 +5,7 @@
 #import <Foundation/Foundation.h>
 #import <os/log.h>
 #import <pthread.h>
+#import "WineProcessBridge.h"
 /* AVFoundation: AVAudioSession activation for the Tier-2 audio driver
  * (audio_null_ios.c RemoteIO backend). AudioToolbox: pulls the framework
  * in via autolink — the static-lib driver code can't autolink itself. */
@@ -288,6 +289,28 @@ extern void wine_log_set_file(const char *path);
 
 static pthread_t g_wine_thread;
 static volatile int g_wine_running = 0;
+
+/* Session exit report for the library front end. The app marks one process as
+ * its own: the program it hands to __wine_main below, which is the session's
+ * initial process. ntdll's common exit wrapper (build/ntdll-unix/server_ios.c)
+ * calls wine_launched_process_did_exit() for that process only, on whichever
+ * thread ends it. Only the status is kept: no names, no allocation, no
+ * logging. g_launch_exit holds (1 << 32) | status when the program ended with
+ * an NTSTATUS error (0xC...), else 0. */
+static uint64_t g_launch_exit = 0;
+void wine_launched_process_did_exit(int status) {
+    if ((uint32_t)status >= 0xC0000000u)
+        __atomic_store_n(&g_launch_exit, (UINT64_C(1) << 32) | (uint32_t)status, __ATOMIC_RELEASE);
+}
+void wine_exit_status_reset(void) {
+    __atomic_store_n(&g_launch_exit, 0, __ATOMIC_RELEASE);
+}
+int wine_crash_exit_status(uint32_t *status) {
+    uint64_t value = __atomic_load_n(&g_launch_exit, __ATOMIC_ACQUIRE);
+    if (!(value >> 32)) return 0;
+    if (status) *status = (uint32_t)value;
+    return 1;
+}
 static char *g_prefix_path = NULL;
 
 /***********************************************************************
