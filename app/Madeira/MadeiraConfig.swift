@@ -63,6 +63,28 @@ enum MadeiraConfig {
         return ["1", "on", "true", "yes"].contains(v)
     }
 
+    /// Set or remove one key in madeira.cfg (Settings). Comments and every
+    /// other line are kept; earlier lines for the key are dropped and the new
+    /// value is appended; a nil value removes the key. Without madeira.cfg the
+    /// legacy files are migrated first, so writing one key never hides the
+    /// switches that still live in madeira-*.txt files.
+    @discardableResult
+    static func set(_ key: String, _ value: String?) -> Bool {
+        guard let u = url else { return false }
+        if !present { migrateLegacy(log: { _ in }) }
+        let text = (try? String(contentsOf: u, encoding: .utf8)) ?? ""
+        var lines = text.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" || $0 == "\r\n" }).map(String.init)
+        if lines.last == "" { lines.removeLast() }
+        lines.removeAll { line in
+            let t = line.trimmingCharacters(in: .whitespaces)
+            guard !t.hasPrefix("#"), let eq = t.firstIndex(of: "=") else { return false }
+            return t[..<eq].trimmingCharacters(in: .whitespaces) == key
+        }
+        if let value { lines.append("\(key) = \(value)") }
+        let out = lines.joined(separator: "\n") + (lines.isEmpty ? "" : "\n")
+        do { try out.write(to: u, atomically: true, encoding: .utf8); return true } catch { return false }
+    }
+
     /// An app-side switch spelled like the native ones: `env.NAME = value` in
     /// madeira.cfg, else the process environment, else `fallback`. Any value
     /// other than "0" means on.

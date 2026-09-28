@@ -907,6 +907,10 @@ struct LibraryView: View {
                 Toggle("Extended logging", isOn: $input.diagnostics)
             } header: { Text("Diagnostics") }
             Section("Pointer") { LibraryPointerSettings() }
+            if MadeiraConfig.flag("MADEIRA_RUNTIME_SETTINGS") {
+                DisplayRateSettings()
+                RuntimeMemorySyncSettings()
+            }
             Section("Library") {
                 Text("Add complete application folders to Madeira/wine/drive_c using Files. Display, frame limit, and compatibility options are saved per game.")
             }
@@ -1265,6 +1269,66 @@ struct FPSChoice: View {
             if ProMotionIntent.has30Cap || mode == 3 { Text("30 FPS").tag(3) }
             Text("60 FPS").tag(1); Text("Display maximum").tag(0); Text("Uncapped").tag(2)
         }.labelsHidden().pickerStyle(.menu) }
+    }
+}
+
+/// Holding the display at its maximum refresh rate in the 60 FPS limit
+/// (madeira.cfg env.MADEIRA_PROMOTE = 1, off by default; see ProMotionIntent).
+/// Applies from the next session start or FPS limit change.
+struct DisplayRateSettings: View {
+    @State private var hold = ProMotionIntent.holdMaximum
+
+    var body: some View {
+        Section {
+            Toggle("Hold the display at its maximum rate", isOn: Binding(get: { hold }, set: { on in
+                hold = on
+                MadeiraConfig.set("env.MADEIRA_PROMOTE", on ? "1" : nil)
+                LogStore.shared.log("[runtime-settings] promote=\(on ? 1 : 0)")
+            }))
+        } header: { Text("Display") } footer: {
+            Text("Off by default. On a 120 Hz display, keeps the panel at 120 Hz during a game's 60 FPS limit so a frame that misses one refresh waits 8 ms instead of 17 ms. Uses more power.")
+        }
+    }
+}
+
+/// Settings for the file-backed swap tier (madeira.cfg swap-mb, off by default) and
+/// the in-process sync engine madsync (madeira.cfg inproc-sync, on by default). Both are
+/// read when Madeira starts, so changes apply after a restart.
+/// MADEIRA_RUNTIME_SETTINGS=0 hides this section.
+struct RuntimeMemorySyncSettings: View {
+    static let swapChoices = [0, 1024, 2048, 4096]
+    @State private var swapMB = RuntimeMemorySyncSettings.currentSwap()
+    @State private var madsync = MadeiraConfig.bool("inproc-sync", default: true)
+    @State private var changed = false
+
+    static func currentSwap() -> Int {
+        let v = Int(MadeiraConfig.get("swap-mb") ?? "") ?? 0
+        return swapChoices.contains(v) ? v : (v > 0 ? swapChoices.last { $0 <= v } ?? 1024 : 0)
+    }
+
+    var body: some View {
+        Section {
+            Picker("Swap tier", selection: Binding(get: { swapMB }, set: { mb in
+                swapMB = mb; changed = true
+                MadeiraConfig.set("swap-mb", mb > 0 ? String(mb) : nil)
+                LogStore.shared.log("[runtime-settings] swap-mb=\(mb)")
+            })) {
+                ForEach(Self.swapChoices, id: \.self) { mb in
+                    Text(mb == 0 ? "Off" : "\(mb / 1024) GB").tag(mb)
+                }
+            }
+            Toggle("Madsync", isOn: Binding(get: { madsync }, set: { on in
+                madsync = on; changed = true
+                MadeiraConfig.set("inproc-sync", on ? nil : "0")
+                LogStore.shared.log("[runtime-settings] inproc-sync=\(on ? 1 : 0)")
+            }))
+        } header: { Text("Memory & sync") } footer: {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Swap tier moves game data to a file on this device's storage when memory runs short, using up to the chosen size. It can help games that are closed for using too much memory, at some speed cost.")
+                Text("Madsync is the in-process synchronisation engine (on by default).")
+                if changed { Text("Restart Madeira (close it from the app switcher) for these changes to apply.").foregroundStyle(.orange) }
+            }
+        }
     }
 }
 
