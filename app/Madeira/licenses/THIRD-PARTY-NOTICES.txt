@@ -4,6 +4,10 @@ Madeira itself: GPL-3.0-or-later (LICENSE-MADEIRA-GPL-3.0.txt) with the
 Madeira Converter Exception, version 1 (LICENSE-MADEIRA-EXCEPTION.txt),
 which is a DRAFT and not in effect until adopted in a tagged release.
 
+Steam sign-in (SwiftSteam): derived from Jfishin's Madeira Steam client and
+used with his permission; GPL-3.0-or-later with the exception, (C) 2026
+Jfishin, 125hz.
+
 Statically linked into the application binary:
 - Wine (fork branch madeira-lgpl, from upstream wine-11.4): LGPL-2.1-or-later
   (LGPL-2.1.txt). Madeira's modifications: LGPL-2.1-or-later, (C) 2026 Will
