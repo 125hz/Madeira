@@ -76,6 +76,10 @@ is built; `env.MADEIRA_DOCK = 0` hides it). The sheet has:
    when Dock starts it, and Dock waits for that.
 4. **Smaller JIT pool (512 MB) for this launch.** Opt-in. The toggle starts
    from `env.MADEIRA_DOCK_COMPACT_POOL` and is off unless that is `1`.
+5. **One-time installs.** Listed for each installed game whose Steam install
+   script has programs to run (see below): "Run at next start" or "Skip".
+   A game starts at "Run at next start"; a start that runs its programs
+   turns it to "Skip".
 
 Tap a game. Dock is started with Steam's default launch option only; custom
 arguments are not supported.
@@ -110,7 +114,10 @@ arguments are not supported.
    risks). Other sessions keep the engine default (off).
 4. The session is the normal Wine session: `explorer.exe
    /desktop=madeira,<W>x<H> C:\windows\system32\dockhost.exe`. The size comes
-   from `desktop-size` in madeira.cfg, else 1280x720.
+   from `desktop-size` in madeira.cfg, else 1280x720. When the game has
+   one-time installs to run, it is `... C:\windows\system32\cmd.exe /c call
+   C:\madeira-dock-installers.cmd & C:\windows\system32\dockhost.exe`: the
+   installers first, then the host, in the same session.
 5. **The report.** Dock writes numeric stages to `C:\madeira-dock.txt`.
    Madeira reads only whitelisted numeric fields and the 64-hex client
    fingerprint (never other guest text), logs changes as `[dock-report]`,
@@ -124,6 +131,63 @@ arguments are not supported.
    (`launch-session-wait`, `launch-session-gave-up`). The sheet shows the wait;
    only Valve's own later success starts the game, and a session that is
    really playing elsewhere still fails with its own message.
+
+## One-time installs
+
+A game's Steam install script (`installscript.vdf`) lists programs Steam's
+desktop client runs before a first start, typically runtime setups, each
+recorded in the registry once it has run ("Run Process", `HasRunKey`,
+`MinimumHasRunValue`). Valve's client runs them as part of its own launch
+tasks, before the step Dock asks it for, so on the Dock route nothing ran them.
+`DockInstallers.swift` does, right before a Dock start, while no session runs:
+
+1. **Find.** Scripts in the game's folder (one level down) and in
+   `common/Steamworks Shared/_CommonRedist` (three levels down). Repeated
+   "Run Process" sections all count. An entry without a `HasRunKey` is
+   recorded where Valve's client records it, a DWORD named after the entry
+   under `HKLM\Software\Valve\Steam\Apps\<appid>`. HKLM keys are read and
+   written in both registry views.
+2. **Plan.** Each program is `done` (recorded at least at its minimum),
+   `missing` (not on disk; paths resolve case-insensitively inside drive_c),
+   `unsupported` or `pending`; at most 8 run per start (`limit`: the next
+   start). `unsupported` depends only on what the program is and what the
+   bundle has: a Windows Installer package needs `msiexec.exe` in the bundle,
+   a 32-bit executable (PE machine 0x14c) needs `i386-windows`. There is no
+   list of program names; every runtime setup is treated alike.
+3. **Choice.** With "Skip", nothing runs. Otherwise the pending programs go
+   into `C:\madeira-dock-installers.cmd` and the choice turns to "Skip"
+   (unless some programs wait for a later start).
+4. **Batch.** It first runs `dockhost.exe --start-services`: installers
+   expect a service manager, and a Dock session starts none before the host.
+   That mode loads no Steam client, starts Wine's `services.exe` only if no
+   manager answers, gives up after 20 s and writes no report file. Then each
+   program runs once (`.msi` through `msiexec.exe /i`). Each start and exit
+   status goes to `C:\madeira-dock-installers.result`; the batch writes
+   nothing to the registry.
+5. **Record.** At the next Dock start, when no session runs, Madeira reads
+   the result file and records the programs that exited with 0, 3010 or 1641
+   in `system.reg`/`user.reg` (a `.madeira-bak` copy is kept once). Failed
+   programs are not recorded; with the choice at "Skip" they do not run
+   again at every start.
+6. **Sync engine for that session.** With madsync, Wine's `services.exe`
+   never answered its RPC clients in the fork's device runs, so the service
+   step and then every installer waited; msiexec's custom actions use the same
+   RPC server. A start that runs installers therefore sets
+   `MADEIRA_MADSYNC_SESSION=0` before its session starts, and
+   `build/madsync/madsync.c` turns madsync off for that session (the app runs
+   one session per run). Every other session keeps the configured engine.
+7. **fusion.dll.** An installer with a managed step (DirectX setup's is one)
+   loads `fusion.dll` from `C:\windows\Microsoft.NET\Framework\v2.0.50727`.
+   Wine gets that file from its Mono package, which Madeira does not ship;
+   in the fork's device runs such a setup ended with -9. Before a start that
+   runs installers, Wine's own builtin 32-bit `fusion.dll`
+   (`i386-windows/fusion.dll`) is copied there if the file is missing. A
+   bundle without 32-bit Windows DLLs has nothing to copy (`no-source`).
+
+The plan, each program's fate and the results are logged as
+`[dock-installers]`; the Dock sheet's status shows the plan and the running
+program. `madeira-dock-installs.json` next to the registry files holds the
+batch's program list and each game's choice.
 
 If the install record lists per-user custom executables (`CheckGuid`), Dock
 asks Valve's client to prepare them before launching. `env.MADEIRA_DOCK_CEG = 0`
@@ -142,6 +206,12 @@ never asks. The preparation is Valve's; Dock does not touch the files.
 | `MADEIRA_DOCK_CLIENT_202601` | on | read by the host: `0` disables its January 2026 client adapter |
 | `MADEIRA_DOCK_HANDOFF_DIAGNOSTICS` | on | read by the host: `0` drops its numeric transfer diagnostics |
 | `MADEIRA_DOCK_SESSION_WAIT` | on | read by the host: `0` fails a launch refused with 35 (another session playing) at once instead of asking again for up to three minutes |
+| `MADEIRA_DOCK_INSTALLERS` | on | `0`: no one-time installs (nothing read, run or shown) |
+| `MADEIRA_INSTALL_DEFAULT_KEY` | on | `0`: install-script entries without a `HasRunKey` are ignored |
+| `MADEIRA_DOCK_INSTALL_CHOICE` | on | `0`: no per-game choice; every start runs whatever is pending |
+| `MADEIRA_DOCK_INSTALL_SCM` | on | `0`: the batch records "services off" instead of starting the service manager (also read by the host's `--start-services`) |
+| `MADEIRA_DOCK_INSTALL_SERVER_SYNC` | on | `0`: a start that runs installers keeps madsync and leaves the service step out |
+| `MADEIRA_DOTNET_FUSION` | on | `0`: never place `fusion.dll` in the .NET 2.0 folder |
 
 ## 64-bit and runtime impact
 
@@ -153,17 +223,27 @@ program. A Dock launch also sets `MADEIRA_JIT_IMAGE_RETIRE=1`, the engine's
 opt-in image-retire switch (its own engine PR), for that session only; no
 other session sets it, and an engine without the switch ignores it.
 
+One-time installs change the engine for one session only: a Dock start that
+runs a game's installers sets `MADEIRA_MADSYNC_SESSION=0`, and madsync is off
+for that session, including the game Valve's client then starts in it. The
+madsync default is unchanged (`inproc-sync` still defaults to 1, and with the
+variable unset `madsync_enabled()` returns what it returned before); no other
+code sets the variable. The next start, with the choice at "Skip", uses the
+configured engine again.
+
 ## Not included (compared with the fork)
 
 - **Game installation and library integration.** The fork's Steam library and
   depot downloads were rejected with #35 and are not coming back here. When
   the new front end lands, Dock can be offered from it.
-- **One-time installers.** Valve's client does not run a game's install
-  scripts on this route. The fork ran them from a batch before the host, and
-  by default skipped installers it recognised by file name. That name list is
-  gone (no program-name rules). The batch also needs `reg.exe`, which this
-  bundle does not ship. A later change can offer it as an explicit per-launch
-  choice.
+- **One-time installs, fork extras.** The fork also marked runtimes it
+  recognised by file name as done without running them, and recorded such a
+  runtime as done after a failed run. Those name rules are gone here (every
+  program is treated alike; the per-game choice keeps failures from running
+  at every start). The fork's reset on uninstall is gone too: Dock neither
+  installs nor removes games. The fork's "skip" button on its starting screen
+  needs a session stop this branch does not have; choose "Skip" in the sheet
+  before the start instead.
 - **Automatic session end and the exit-status hook.** These need the ntdll
   program start/exit hooks from the front-end PR. Here, the result comes from
   the report file, and the session ends as other developer-interface
@@ -213,6 +293,12 @@ credentials:
 - `check-dock-components.py`: the component ZIP reader and registry writer on
   synthetic archives, and the pins (one HTTPS host, well-formed sums, a
   client hash the pinned host supports).
+- `check-dock-installers.py`: install-script parsing, the plan and its note,
+  the batch and result parser, the whole start in a synthetic prefix
+  (choice, recording at the next start, madsync request, fusion.dll, every
+  switch), `madsync_enabled()` with the production `madeira_cfg.h`, and,
+  where Windows `cmd.exe` is reachable, the batch run for real with stand-in
+  installers and the staged `dockhost.exe --start-services`.
 - `build/madeira-dock/build.sh --check`: Dock's own ASan/UBSan unit tests
   (transfer parsing, 2,000 malformed inputs, client selection, launch-result
   and callback bounds).

@@ -2849,13 +2849,24 @@ struct ContentView: View {
             return
         }
         MadeiraDock.configure(game)
+        // The game's one-time installs (its Steam install script) run first, in the same
+        // session. No session runs yet, so the registry files can be read and written.
+        DockInstallers.prepare(game, drive: MadeiraDock.drive, prefix: MadeiraDock.prefix)
+        // Only a start that runs installers turns madsync off, for its own session
+        // (build/madsync/madsync.c reads MADEIRA_MADSYNC_SESSION once, when the server starts).
+        if DockInstallers.serverSync {
+            setenv("MADEIRA_MADSYNC_SESSION", "0", 1)
+            logStore.log("[dock-installers] this session runs one-time installs: madsync off for this session only (MADEIRA_MADSYNC_SESSION=0)")
+        } else {
+            unsetenv("MADEIRA_MADSYNC_SESSION")
+        }
         var width = 1280, height = 720
         if let txt = MadeiraConfig.get("desktop-size") {
             let p = txt.lowercased().split(separator: "x").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
             if p.count == 2, p[0] >= 640, p[1] >= 360, p[0] <= 3840, p[1] <= 2160 { width = p[0]; height = p[1] }
         }
         setenv("MADEIRA_EXE", "explorer.exe", 1)
-        setenv("MADEIRA_ARGS", MadeiraDock.launchArguments(width: width, height: height), 1)
+        setenv("MADEIRA_ARGS", MadeiraDock.launchArguments(width: width, height: height, installers: DockInstallers.script), 1)
         setenv("MADEIRA_DESKTOP", "1", 1)
         setenv("MADEIRA_SCREEN_W", String(width), 1)
         setenv("MADEIRA_SCREEN_H", String(height), 1)

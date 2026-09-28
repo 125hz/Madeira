@@ -31,12 +31,16 @@ dock = (app / 'MadeiraDock.swift').read_text()
 view = (app / 'MadeiraDockView.swift').read_text()
 runtime = (app / 'SteamRuntime.swift').read_text()
 content = (app / 'ContentView.swift').read_text()
+installers = (app / 'DockInstallers.swift').read_text()
 
 # ------------------------------------------------------------------ static
-for name, text in [('MadeiraDock.swift', dock), ('MadeiraDockView.swift', view), ('SteamRuntime.swift', runtime)]:
+for name, text in [('MadeiraDock.swift', dock), ('MadeiraDockView.swift', view), ('SteamRuntime.swift', runtime),
+                   ('DockInstallers.swift', installers)]:
     literals = set(re.findall(r'"([^"\n]*?\.exe)\\?"', text)) | set(re.findall(r'\\"([^"\n]*?\.exe)\\"', text))
-    names = {l.split('\\')[-1].lower() for l in literals}
-    require(names <= {'dockhost.exe', 'explorer.exe', 'steam.exe'}, f'{name}: no program-name list ({sorted(names)})')
+    names = {l.replace('/', '\\').split('\\')[-1].lower() for l in literals}
+    # DockInstallers.swift checks the ".exe" suffix of install-script programs and whether the
+    # bundle has Windows Installer (msiexec.exe); it keys nothing on a program's name.
+    require(names <= {'dockhost.exe', 'explorer.exe', 'steam.exe', '.exe', 'msiexec.exe'}, f'{name}: no program-name list ({sorted(names)})')
     for line in text.splitlines():
         if re.search(r'SteamLog\.(event|trace)|LogStore|print\(|NSLog', line):
             require(re.search(r'\\\((account|token|signIn|secret|data|url|name)\b', line) is None,
@@ -198,6 +202,9 @@ func jwt(_ claims: String) -> String {
         require(MadeiraDock.launchArguments(width: 1280, height: 720) == "/desktop=madeira,1280x720 C:\\windows\\system32\\dockhost.exe", "explorer desktop runs the host")
         require(!MadeiraDock.launchArguments(width: 1280, height: 720).contains("\""), "no quotes: MADEIRA_ARGS is split at spaces and passed on as is")
         require(!MadeiraDock.executable.contains(" "), "the host path has no spaces")
+        require(MadeiraDock.launchArguments(width: 1280, height: 720, installers: "C:\\i.cmd") ==
+                "/desktop=madeira,1280x720 C:\\windows\\system32\\cmd.exe /c call C:\\i.cmd & C:\\windows\\system32\\dockhost.exe",
+                "with one-time installs: cmd.exe runs them, then the host, in the same session")
         require(MadeiraDock.handoffGuestPath(URL(fileURLWithPath: "/var/x/launch.auth")) == "\\\\?\\unix\\var\\x\\launch.auth", "transfer path through Wine's Unix namespace")
 
         if failures > 0 { print("FAILURES: \(failures)"); exit(1) }

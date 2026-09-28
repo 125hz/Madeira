@@ -390,11 +390,14 @@ enum MadeiraDock {
         SteamLog.event("[dock-launch] image-retire=\(retire ? 1 : 0)")
     }
 
-    /// Wine's explorer opens a virtual desktop and starts the host in it. The path is not
-    /// quoted: MADEIRA_ARGS is split at spaces and passed on as is, so quote characters
-    /// would reach Wine literally; `executable` has no spaces.
-    static func launchArguments(width: Int, height: Int) -> String {
-        "/desktop=madeira,\(width)x\(height) \(executable)"
+    /// Wine's explorer opens a virtual desktop and starts the host in it. With
+    /// `installers` (DockInstallers.script), cmd.exe first runs the game's one-time
+    /// installs in the same session, then the host. No token is quoted: MADEIRA_ARGS is
+    /// split at spaces and passed on as is, so quote characters would reach Wine
+    /// literally, and none of these paths contains a space.
+    static func launchArguments(width: Int, height: Int, installers: String? = nil) -> String {
+        guard let installers else { return "/desktop=madeira,\(width)x\(height) \(executable)" }
+        return "/desktop=madeira,\(width)x\(height) C:\\windows\\system32\\cmd.exe /c call \(installers) & \(executable)"
     }
 
     /// Set on the main actor right before a Dock launch; read (and cleared) once by the
