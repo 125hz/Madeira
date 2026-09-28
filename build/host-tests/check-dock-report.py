@@ -62,11 +62,13 @@ if host.exists():
         written |= set(re.findall(r'"(ml\d{4})"', path.read_text()))
     accepted = set(re.findall(r'"(ml\d{4})"', text[text.index('static let reportRounds'):text.index('static func parseReport')]))
     # ml2014 tags only install-scm, emitted by the host's `--start-services` CLI mode before any
-    # report file is opened (stderr only). Madeira never runs that mode, so it never reaches the report.
+    # report file is opened (stderr only). Madeira runs that mode only as its own process in the
+    # one-time-install batch (DockInstallers.swift), before the host run, so it never reaches the report.
     main_c = host.read_text()
     assert re.search(r'!strncmp\(stage, "install-scm", 11\) \? "ml2014"', main_c) and main_c.count('"ml2014"') == 1
     assert main_c.index('"--start-services"') < main_c.index('report = _wfopen(')
-    assert not any('--start-services' in p.read_text() for p in (root / 'app/Madeira').glob('*.swift'))
+    uses = sorted(p.name for p in (root / 'app/Madeira').glob('*.swift') if '--start-services' in p.read_text())
+    assert uses in ([], ['DockInstallers.swift']), uses
     written -= {'ml2014'}
     assert written <= accepted, f'host rounds not accepted: {sorted(written - accepted)}'
     print(f'PASS: every report round the pinned host writes is accepted ({len(written)})')
