@@ -19,16 +19,35 @@ final class MadeiraDockModel: ObservableObject {
     @Published var status: String?
     /// Opt-in per launch: a 512 MB JIT pool instead of the standard one.
     @Published var compactPool = SteamSignIn.flag("MADEIRA_DOCK_COMPACT_POOL", default: false)
+    /// App ID -> number of one-time install programs in the game's Steam install scripts.
+    @Published private(set) var installPrograms: [Int: Int] = [:]
+    /// App ID -> the game's One-time installs choice (true: Run at next start).
+    @Published private(set) var installRunNext: [Int: Bool] = [:]
 
     private var watch: Task<Void, Never>?
 
     func refresh() {
         clientInstalled = MadeiraDock.clientInstalled
-        let drive = MadeiraDock.drive
+        let drive = MadeiraDock.drive, prefix = MadeiraDock.prefix
         Task.detached(priority: .userInitiated) {
             let found = MadeiraDock.games(drive: drive)
-            await MainActor.run { self.games = found }
+            var programs: [Int: Int] = [:], runNext: [Int: Bool] = [:]
+            if DockInstallers.choiceEnabled {
+                let ledger = DockInstallLedger.load(prefix: prefix)
+                for game in found where game.installed {
+                    let count = DockInstallers.programCount(game, drive: drive)
+                    if count > 0 { programs[game.id] = count; runNext[game.id] = ledger.runsNext(game.id) }
+                }
+            }
+            let counts = programs, choices = runNext
+            await MainActor.run { self.games = found; self.installPrograms = counts; self.installRunNext = choices }
         }
+    }
+
+    /// The game's One-time installs choice, saved next to the prefix's registry files.
+    func setRunsInstallers(_ appID: Int, _ run: Bool) {
+        DockInstallers.setRunsNext(appID, run, prefix: MadeiraDock.prefix)
+        installRunNext[appID] = run
     }
 
     /// Downloads and unpacks Valve's client components (no Wine session).
@@ -54,12 +73,20 @@ final class MadeiraDockModel: ObservableObject {
     /// without one, then removes any unconsumed sign-in transfer.
     func watchReport() {
         watch?.cancel()
-        status = "Madeira Dock is starting. Valve's client signs in and checks the license."
+        let starting = "Madeira Dock is starting. Valve's client signs in and checks the license."
+        let plan = DockInstallers.note
+        status = plan.map { $0 + "\n" + starting } ?? starting
+        if let plan { LogStore.shared.log("[dock-installers] " + plan) }
         watch = Task { @MainActor in
             var idle = 0, started = false
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 let report = MadeiraDock.pollReport()
+                // The game's one-time installs run before the host writes its first field.
+                if DockInstallers.script != nil {
+                    let progress = DockInstallers.poll(drive: MadeiraDock.drive)
+                    if report.fields["probe-start-bits"] == nil, report.result == nil, let progress { status = progress }
+                }
                 if report.result != nil {
                     if let failure = report.failure {
                         status = failure
@@ -144,8 +171,22 @@ struct MadeiraDockView: View {
                 } header: { Text("Installed games") } footer: {
                     Text("Games Steam's client has installed in this prefix. Only Steam's default launch option is used.")
                 }
+                if !dock.installPrograms.isEmpty {
+                    Section {
+                        ForEach(dock.games.filter { dock.installPrograms[$0.id] != nil }) { game in
+                            Picker(game.name, selection: Binding(get: { dock.installRunNext[game.id] ?? true },
+                                                                 set: { dock.setRunsInstallers(game.id, $0) })) {
+                                Text("Run at next start").tag(true)
+                                Text("Skip").tag(false)
+                            }
+                            .pickerStyle(.menu)
+                        }
+                    } header: { Text("One-time installs") } footer: {
+                        Text("Programs from a game's Steam install script, such as runtime setups, that Steam's desktop client runs before a first start. A Dock start runs the ones not yet recorded as done before Valve's client starts; the choice then changes to Skip.")
+                    }
+                }
                 if let status = dock.status {
-                    Section("Last Dock result") { Text(status) }
+                    Section("Dock status") { Text(status) }
                 }
                 if let error = dock.error {
                     Section { Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red) }
