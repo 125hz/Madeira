@@ -58,6 +58,26 @@ enum MadeiraConfig {
         return txt.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// ml2012: set or remove one key in madeira.cfg (Settings writes swap-mb, inproc-sync
+    /// and env.MADEIRA_FASTSYNC). Comments and every other line are kept; earlier lines for
+    /// the key are dropped and the new value is appended (the last line wins either way).
+    /// A nil value removes the key. Creates madeira.cfg when needed.
+    @discardableResult
+    static func set(_ key: String, _ value: String?) -> Bool {
+        guard let u = url else { return false }
+        let text = (try? String(contentsOf: u, encoding: .utf8)) ?? ""
+        var lines = text.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" || $0 == "\r\n" }).map(String.init)
+        if lines.last == "" { lines.removeLast() }
+        lines.removeAll { line in
+            let t = line.trimmingCharacters(in: .whitespaces)
+            guard !t.hasPrefix("#"), let eq = t.firstIndex(of: "=") else { return false }
+            return t[..<eq].trimmingCharacters(in: .whitespaces) == key
+        }
+        if let value { lines.append("\(key) = \(value)") }
+        let out = lines.joined(separator: "\n") + (lines.isEmpty ? "" : "\n")
+        do { try out.write(to: u, atomically: true, encoding: .utf8); return true } catch { return false }
+    }
+
     static func bool(_ key: String, default dflt: Bool = false) -> Bool {
         guard let v = get(key) else { return dflt }
         return ["1", "on", "true", "yes"].contains(v)

@@ -1560,6 +1560,7 @@ struct LibraryView: View {
                 Toggle("Extended logging", isOn: $input.diagnostics)
             } header: { Text("Diagnostics") }
             Section("Pointer") { LibraryPointerSettings() }
+            if LibraryFlags.enabled("MADEIRA_RUNTIME_SETTINGS") { RuntimeMemorySyncSettings() }
             Section("Controller") {
                 Toggle("Right stick controls mouse", isOn: $input.padRightStickMouse)
             }
@@ -2103,6 +2104,72 @@ struct FPSChoice: View {
     @Binding var mode: Int
     var body: some View {
         HStack { Text("FPS limit"); Spacer(); Picker("FPS limit", selection: $mode) { Text("30 FPS").tag(3); Text("60 FPS").tag(1); Text("Display maximum").tag(0); Text("Uncapped").tag(2) }.labelsHidden().pickerStyle(.menu) }
+    }
+}
+
+/// ml2012: Settings for Will's file-backed swap tier (madeira.cfg swap-mb) and the
+/// in-process sync engine: the fork's fastsync (env.MADEIRA_FASTSYNC) or Will's madsync
+/// (madeira.cfg inproc-sync). Exactly one engine is active, never both. Both are read when
+/// Madeira starts, so changes apply after a restart. MADEIRA_RUNTIME_SETTINGS=0 hides this.
+struct RuntimeMemorySyncSettings: View {
+    enum SyncEngine: String, CaseIterable, Identifiable {
+        case fastsync, madsync, off
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .fastsync: return "Fastsync (default)"
+            case .madsync: return "Madsync"
+            case .off: return "Off (plain Wine)"
+            }
+        }
+    }
+    static let swapChoices = [0, 1024, 2048, 4096]
+    @State private var swapMB = RuntimeMemorySyncSettings.currentSwap()
+    @State private var engine = RuntimeMemorySyncSettings.currentEngine()
+    @State private var changed = false
+
+    static func currentSwap() -> Int {
+        let v = Int(MadeiraConfig.get("swap-mb") ?? "") ?? 0
+        return swapChoices.contains(v) ? v : (v > 0 ? swapChoices.last { $0 <= v } ?? 1024 : 0)
+    }
+    static func currentEngine() -> SyncEngine {
+        if MadeiraConfig.bool("inproc-sync") { return .madsync }
+        let fs = (MadeiraConfig.get("env.MADEIRA_FASTSYNC") ?? "").lowercased()
+        return ["0", "off", "no"].contains(fs) ? .off : .fastsync
+    }
+    static func apply(_ engine: SyncEngine) {
+        switch engine {
+        case .fastsync: MadeiraConfig.set("inproc-sync", nil); MadeiraConfig.set("env.MADEIRA_FASTSYNC", nil)
+        case .madsync: MadeiraConfig.set("inproc-sync", "1"); MadeiraConfig.set("env.MADEIRA_FASTSYNC", "0")
+        case .off: MadeiraConfig.set("inproc-sync", "0"); MadeiraConfig.set("env.MADEIRA_FASTSYNC", "0")
+        }
+    }
+
+    var body: some View {
+        Section {
+            Picker("Swap tier", selection: Binding(get: { swapMB }, set: { mb in
+                swapMB = mb; changed = true
+                MadeiraConfig.set("swap-mb", mb > 0 ? String(mb) : nil)
+                LogStore.shared.log("[runtime-settings] ml2012 swap-mb=\(mb)")
+            })) {
+                ForEach(Self.swapChoices, id: \.self) { mb in
+                    Text(mb == 0 ? "Off" : "\(mb / 1024) GB").tag(mb)
+                }
+            }
+            Picker("Sync engine", selection: Binding(get: { engine }, set: { choice in
+                engine = choice; changed = true
+                Self.apply(choice)
+                LogStore.shared.log("[runtime-settings] ml2012 sync=\(choice.rawValue)")
+            })) {
+                ForEach(SyncEngine.allCases) { Text($0.label).tag($0) }
+            }
+        } header: { Text("Memory & sync") } footer: {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Swap tier moves game data to a file on this device's storage when memory runs short, using up to the chosen size. It can help games that are closed for using too much memory, at some speed cost.")
+                Text("Sync engine: Fastsync is this build's default; Madsync is the upstream engine. Only one runs at a time.")
+                if changed { Text("Restart Madeira (close it from the app switcher) for these changes to apply.").foregroundStyle(.orange) }
+            }
+        }
     }
 }
 
