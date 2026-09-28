@@ -8368,6 +8368,21 @@ static void ios_init_stub_tables(void)
  * winemetal_unix.c to avoid collision with our own ntdll table). */
 extern const void *dxmt_winemetal_unix_call_funcs[];
 
+/* DXMT's winemetal_unix.c, linked into the same image, reports per-frame
+ * statistics into a "[frame]" instrument through the symbols below.  That
+ * instrument is a diagnostic and is not part of this port, so this is its off
+ * state: ios_frame_stats_on stays 0, which winemetal checks before any
+ * per-frame hook, and the entry points it calls unconditionally do nothing.
+ * Nothing here allocates, logs or takes a lock. */
+int ios_frame_stats_on = 0;
+void ios_frame_game_tick(void) { }
+void ios_frame_encode_present( int skipped ) { }
+void ios_frame_drawable_wait( unsigned long long ns ) { }
+void ios_frame_gpu( unsigned long long gpu_ns, unsigned long long inflight ) { }
+void ios_frame_note_display( int panel_hz, int intent_hz, int mode ) { }
+void ios_frame_limiter( unsigned long long ns ) { }
+void ios_frame_pass( unsigned kind, unsigned loads, unsigned stores, unsigned clears ) { }
+
 /* iOS-Madeira 2026-05-13: null audio driver unix table. Implements the 37
  * mmdevapi audio funcs to provide a fake "iOS Null" render endpoint with
  * a real-time IAudioClock — enough for FMOD's rhythm-game timing engine
@@ -8410,9 +8425,11 @@ extern NTSTATUS win32u_unix_lib_init(void);
  * pointers inside it (+B, see ios_wow_host_ptr()), so a 32-bit caller must
  * never be handed a 64-bit table.  build.sh's compile_unixlib() renames each
  * compiled library's __wine_unix_call_wow64_funcs to <prefix>_unix_call_
- * wow64_funcs; the audio driver and NSI name theirs in the source.  A library
- * without one (winemetal until its table is bound) is refused for a 32-bit
- * caller. */
+ * wow64_funcs; the audio driver and NSI name theirs in the source, and
+ * DXMT's winemetal_unix.c renames its own to
+ * dxmt_winemetal_unix_call_wow64_funcs.  A library without one is refused for
+ * a 32-bit caller. */
+extern const void *dxmt_winemetal_unix_call_wow64_funcs[];
 extern const void *ws2_32_unix_call_wow64_funcs[];
 extern const void *bcrypt_unix_call_wow64_funcs[];
 extern const void *secur32_unix_call_wow64_funcs[];
@@ -8615,7 +8632,7 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
         if (match && strstr(match, "winemetal")) {
             libname = "winemetal";
             funcs64 = (const void *)dxmt_winemetal_unix_call_funcs;
-            funcs_wow64 = NULL;   /* no 32-bit table yet */
+            funcs_wow64 = (const void *)dxmt_winemetal_unix_call_wow64_funcs;
         } else if (match && (strstr(match, "wineios.drv") || strstr(match, "winecoreaudio") || strstr(match, "winealsa") || strstr(match, "winepulse"))) {
             /* NOTE: mmdevapi does NOT reach the driver through this by-module
              * path — __wine_load_unix_lib() asks for "wine<name>.drv" BY NAME

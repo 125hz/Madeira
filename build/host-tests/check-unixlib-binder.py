@@ -35,6 +35,20 @@ upstream = [  # (match test, 64-bit table) in upstream order
     ('strstr(match, "win32u")', "ios_stub_unix_call_table"),
     ('strstr(match, "opengl32")', "ios_gl_stub_unix_call_table"),
 ]
+# the 32-bit table each branch offers (upstream had none)
+wow64 = {
+    "dxmt_winemetal_unix_call_funcs": "dxmt_winemetal_unix_call_wow64_funcs",
+    "audio_null_ios_unix_call_funcs": "audio_null_ios_unix_call_wow64_funcs",
+    "ws2_32_unix_call_funcs": "ws2_32_unix_call_wow64_funcs",
+    "bcrypt_unix_call_funcs": "bcrypt_unix_call_wow64_funcs",
+    "secur32_unix_call_funcs": "secur32_unix_call_wow64_funcs",
+    "crypt32_unix_call_funcs": "crypt32_unix_call_wow64_funcs",
+    "dwrite_unix_call_funcs": "dwrite_unix_call_wow64_funcs",
+    "nsi_unix_call_funcs": "nsi_unix_call_wow64_funcs",
+    "ios_stub_unix_call_table": "ios_stub_unix_call_table",
+    "ios_gl_stub_unix_call_table": "ios_gl_stub_unix_call_table",
+}
+assert "extern const void *dxmt_winemetal_unix_call_wow64_funcs[];" in src
 branches = re.split(r"\n        \} else ", chain[chain.index('if (match && strstr(match, "winemetal"))'):])
 assert len(branches) == len(upstream) + 1, len(branches)
 for (test, table), body in zip(upstream, branches):
@@ -44,11 +58,12 @@ for (test, table), body in zip(upstream, branches):
     w = re.search(r"funcs_wow64 = ([^;]+);", body) or re.search(r"funcs64 = funcs_wow64 = \(const void \*\)(\w+);", body)
     assert w, test
     assert "_unix_call_funcs" not in w.group(1), ("64-bit table offered to a 32-bit caller", test)
+    assert w.group(1).replace("(const void *)", "") == wow64[table], (test, w.group(1))
 last = branches[-1]
 assert "funcs64 = (const void *)ios_stub_unix_call_table;" in last and "funcs_wow64 = NULL;" in last
 assert "status = ios_bind_unixlib_table( module, libname, wow, funcs64, funcs_wow64, funcs );" in chain
 assert "if (!match && wow && ios_module_mapped_file_name( module, secname, sizeof(secname) ))" in chain
-print("PASS: every branch keeps upstream's 64-bit table; no 64-bit table reaches a 32-bit caller; the mapped-file fallback is 32-bit only")
+print("PASS: every branch keeps upstream's 64-bit table and offers its own 32-bit table (winemetal included); no 64-bit table reaches a 32-bit caller; the mapped-file fallback is 32-bit only")
 
 # ---- Part B: behaviour of the helpers
 names = function(src, "static const char *ios_module_export_name( const void *module )")
