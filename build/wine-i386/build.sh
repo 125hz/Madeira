@@ -44,8 +44,11 @@ LOG="$B/madeira-i386-build.log"
 # arch would regenerate every module Makefile the ntdll-unix build relies on.
 if [ ! -f "$B/config.status" ]; then
     mkdir -p "$B"
+    # --enable-winegstreamer: the PE half never touches GStreamer, but configure
+    # drops the module without GStreamer's development files (docs/MEDIA.md).
     (cd "$B" && ../configure --enable-archs=i386 --without-x --without-vulkan \
-                             --without-freetype --without-gnutls --disable-tests)
+                             --without-freetype --without-gnutls --disable-tests \
+                             --enable-winegstreamer)
 fi
 
 # ------------------------------------------------------------------ targets
@@ -62,7 +65,7 @@ SKIP_REASON=(
   "wow32.dll|winevdm.exe|vga.dll|hal.dll|w32skrnl.dll=16-bit layer; no 16-bit modules in a WoW64 tree"
   "winemenubuilder.exe=writes host desktop menu entries; there is no host desktop"
   "wineconsole.exe=host console; conhost is the WoW64-side console"
-  "winegstreamer.dll|ir50_32.dll=media has its own series (the unix side is not in this tree)"
+  "ir50_32.dll=needs GStreamer's codec; the winegstreamer unix side here is FFmpeg-based (docs/MEDIA.md)"
   "aero.msstyles=7.4 MiB of theme data nothing in the prefix selects"
   "winedbg.exe=4.5 MiB debugger only the (unshown) crash dialog spawns; dbghelp.dll ships"
   "d3d11.dll|dxgi.dll|d3d10core.dll|winemetal.dll=DXMT-owned (installed below); Wine's are wined3d frontends with no backend here"
