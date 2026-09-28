@@ -445,9 +445,16 @@ static uint64_t g_dock_exit = 0;
 // Numeric status only. Launcher/helper images are not programs the user ran.
 // MADEIRA_EXIT_REPORT=0 turns the record off.
 static uint64_t g_crash_exit = 0;
+// ml2015: dockhost.exe exits to skip before the host's own (the install batch's
+// --start-services step runs the same image and exits normally first).
+static int g_dock_exit_skip = 0;
 void wine_dock_exit_reset(void) {
     __atomic_store_n(&g_dock_exit, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_crash_exit, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_dock_exit_skip, 0, __ATOMIC_RELEASE);
+}
+void wine_dock_exit_skip_next(void) {
+    __atomic_store_n(&g_dock_exit_skip, 1, __ATOMIC_RELEASE);
 }
 static int madeira_exit_is_helper(const char *image) {
     static const char *const helpers[] = { "dockhost.exe", "steam.exe", "steamwebhelper.exe",
@@ -491,6 +498,11 @@ void wine_process_did_exit(const char *image, int status) {
             __atomic_store_n(&g_crash_exit, (UINT64_C(1) << 32) | (uint32_t)status, __ATOMIC_RELEASE);
     }
     if (!image || strcasecmp(image, "dockhost.exe")) return;
+    int skip = 1;
+    if (__atomic_compare_exchange_n(&g_dock_exit_skip, &skip, 0, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        fprintf(stderr, "[dock-status] ml2015 skipped the install batch's service-manager step exit status=%d\n", status);
+        return;
+    }
     uint64_t expected = 0;
     __atomic_compare_exchange_n(&g_dock_exit, &expected,
         (UINT64_C(1) << 32) | (uint32_t)status, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);

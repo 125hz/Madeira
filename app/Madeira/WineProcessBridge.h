@@ -19,6 +19,8 @@ void madeira_seed_prefix_if_needed(const char *prefix_path);
 // ml1850: one session's Dock exit, including a zero exit code. Nonzero = known.
 int wine_dock_exit_status(int *status);
 void wine_dock_exit_reset(void);
+// ml2015: ignore the next dockhost.exe exit (the install batch's --start-services step).
+void wine_dock_exit_skip_next(void);
 int wine_crash_exit_status(uint32_t *status);
 // ml2000: programs (not launcher/helper images) started / still running this session.
 int wine_programs_started(void);

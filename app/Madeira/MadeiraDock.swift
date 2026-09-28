@@ -47,6 +47,9 @@ enum MadeiraDock {
     /// ml1970: a batch of the game's pending one-time installs (DockInstallScripts), run in the
     /// Dock session before the host. Set on the main actor before launch, read by the launch worker.
     nonisolated(unsafe) static var installerScript: String?
+    /// ml2015: the batch starts with `dockhost.exe --start-services`, whose normal exit is not
+    /// the Dock's (device log 108: that exit ended the start and deleted the sign-in transfer).
+    nonisolated(unsafe) static var installerServicesStep = false
     static let installerScriptName = "madeira-dock-installers.cmd"
     /// ml2013: the batch appends each program's start and exit status here (drive C root).
     static let installerResultName = "madeira-dock-installers.result"
@@ -197,6 +200,10 @@ enum MadeiraDock {
                (22...23).contains(error), fields["launch-config-wait"] != nil {
                 return "Steam did not finish loading this game's configuration after signing in. Wait a minute and start the game again; if it keeps happening, refresh the library."
             }
+            // ml2015: the host waited for Steam to end the other session; it did not.
+            if result == 45 || result == 48, fields["launch-client-error"] == "35", fields["launch-session-wait"] != nil {
+                return "Steam still says this account is playing in another session. Close the game on your other device (or wait a few minutes after a closed session) and start it again."
+            }
             if result == 45 || result == 48, let error = fields["launch-client-error"].flatMap(Int.init),
                let reason = Self.launchRefusal(error, waited: result == 48) {
                 return reason
@@ -220,6 +227,7 @@ enum MadeiraDock {
             case 22, 23, 24: return "Steam could not read this game's configuration. Refresh the library and try again."
             case 25: return "Steam says this game is not released yet."
             case 26: return "Steam says this game is not available in your region."
+            case 35: return "Steam says this account is playing in another session. Close the game on your other device and start it again."
             default: return nil
             }
         }
@@ -235,7 +243,7 @@ enum MadeiraDock {
             "session-native-token-submitted", "session-logon-start-result", "session-connection-result",
             "session-authenticated-online", "session-requested-app-listed", "session-auth-test-result",
             "launch-client-error", "launch-update-wait", "launch-update-retry", "launch-update-ready",
-            "launch-config-wait", "launch-config-gave-up",
+            "launch-config-wait", "launch-config-gave-up", "launch-session-wait", "launch-session-gave-up",
             "ceg-request", "ceg-request-result", "ceg-request-busy", "ceg-server-result", "ceg-job-result",
             "ceg-finished-jobs", "ceg-result", "ceg-disabled", "ceg-unsupported-client",
             "ceg-scm", "ceg-scm-started", "ceg-scm-error", "ceg-service-registered", "ceg-service-install", "ceg-service-stop", "ceg-scm-stopped",
@@ -246,7 +254,7 @@ enum MadeiraDock {
             .split(separator: "\n", omittingEmptySubsequences: false).dropLast() {
             let parts = line.split(separator: " ", omittingEmptySubsequences: false)
             guard parts.count == 3, parts[0] == "[steam-host]",
-                  ["ml1830", "ml1820", "ml1860", "ml1870", "ml1970", "ml1990", "ml2000", "ml2011"].contains(parts[1]) else { continue }
+                  ["ml1830", "ml1820", "ml1860", "ml1870", "ml1970", "ml1990", "ml2000", "ml2011", "ml2015"].contains(parts[1]) else { continue }
             let field = parts[2].trimmingCharacters(in: .newlines).split(separator: "=", maxSplits: 1)
             guard field.count == 2 else { continue }
             let key = String(field[0]), value = String(field[1])

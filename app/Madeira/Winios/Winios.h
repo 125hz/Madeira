@@ -49,7 +49,8 @@ struct winios_census_window {
     unsigned int presents;        /* GDI frames this window put on screen */
     unsigned char visible;        /* WS_VISIBLE, not minimized, non-empty rect */
     unsigned char metal;          /* a D3D swapchain presents into it (DXMT) */
-    unsigned char reserved[2];
+    unsigned char shown_once;     /* ml2015: has been shown at least once */
+    unsigned char restore_sent;   /* ml2015: born minimized; SC_RESTORE posted */
     char image[48];
 };
 

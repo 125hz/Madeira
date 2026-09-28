@@ -442,6 +442,23 @@ extern HWND NtUserGetAncestor(HWND hwnd, unsigned int type);
 extern unsigned int get_window_thread(HWND hwnd, unsigned int *process);
 extern int get_window_long(HWND hwnd, int offset);
 extern int NtQuerySystemInformation(int info_class, void *info, unsigned int size, unsigned int *ret_size);
+extern int NtUserPostMessage(HWND hwnd, unsigned int msg, uintptr_t wparam, intptr_t lparam);
+
+/* ml2015 (device log 109): a game started by the Steam client showed its main
+ * window minimized the first time it was shown (ShowWindow cmd 2, the window
+ * parked at -32000,-32000). On Windows the taskbar brings it back; Madeira has
+ * no taskbar, so the starting screen waited for a window that never appeared.
+ * While the census runs, a top-level window whose first show is minimized is
+ * sent what a taskbar click sends: WM_SYSCOMMAND/SC_RESTORE, once. A window
+ * that was shown and later minimized itself (e.g. on losing focus) is left
+ * alone. MADEIRA_RESTORE_BORN_MINIMIZED=0 turns this off. */
+#define WINIOS_WM_SYSCOMMAND 0x0112u
+#define WINIOS_SC_RESTORE    0xF120u
+static int winios_restore_born_minimized_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) { const char *e = getenv("MADEIRA_RESTORE_BORN_MINIMIZED"); enabled = !(e && e[0] == '0'); }
+    return enabled;
+}
 
 /* SYSTEM_PROCESS_ID_INFORMATION: a process id and a UNICODE_STRING the caller
  * points at its own buffer (Length must be 0 on input). */
@@ -525,6 +542,7 @@ static void winios_census_note_frame(HWND hwnd, int x, int y, int w, int h, int 
     char image[48];
     winios_census_image(pid, image);
     int shown = visible && (style & WINIOS_WS_VISIBLE) && !(style & WINIOS_WS_MINIMIZE) && w > 0 && h > 0;
+    int born_minimized = 0;
 
     pthread_mutex_lock(&g_census_lock);
     struct winios_census_window *e = winios_census_find(hwnd);
@@ -540,8 +558,21 @@ static void winios_census_note_frame(HWND hwnd, int x, int y, int w, int h, int 
         e->pid = pid;
         e->visible = (unsigned char)shown;
         memcpy(e->image, image, sizeof(e->image));
+        if (shown) e->shown_once = 1;
+        else if ((style & WINIOS_WS_VISIBLE) && (style & WINIOS_WS_MINIMIZE) && !e->shown_once && !e->restore_sent &&
+                 winios_restore_born_minimized_enabled()) {
+            e->restore_sent = 1;
+            born_minimized = 1;
+        }
     }
     pthread_mutex_unlock(&g_census_lock);
+    if (born_minimized) {
+        /* Posted, not sent: this runs inside the window's WindowPosChanged. */
+        int ok = NtUserPostMessage(hwnd, WINIOS_WM_SYSCOMMAND, WINIOS_SC_RESTORE, 0);
+        fprintf(stderr, "[born-minimized] ml2015 hwnd=%p pid=%04x image=%s restore-posted=%d "
+                        "(MADEIRA_RESTORE_BORN_MINIMIZED=0 leaves it minimized)\n", hwnd, pid, image, ok ? 1 : 0);
+        fflush(stderr);
+    }
 }
 
 /* Wine thread, from the GDI flush: count frames of listed windows only. */

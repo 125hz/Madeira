@@ -743,6 +743,12 @@ final class LibraryModel: ObservableObject {
         dockLaunching = dock
         dockLaunchFailure = nil; dockExitObserved = false
         wine_dock_exit_reset()
+        // ml2015: the one-time-install batch's `dockhost.exe --start-services` exits first;
+        // only the host's own exit counts. MADEIRA_DOCK_SERVICES_EXIT_SKIP=0 counts it again.
+        if dock && MadeiraDock.installerScript != nil && MadeiraDock.installerServicesStep &&
+            LibraryFlags.enabled("MADEIRA_DOCK_SERVICES_EXIT_SKIP") {
+            wine_dock_exit_skip_next()
+        }
         quitRequested = false; pressureAtStart = StikJITHelper.poolPressureRecorded   // ml2000
         programsGoneSince = nil; dockSessionEnding = false; wine_programs_reset()
         LibraryController.shared.configure(enabled: enabled, ownsInput: false)
@@ -1006,6 +1012,7 @@ final class LibraryModel: ObservableObject {
     /// is on, and that choice survives the reinstall (MADEIRA_DOCK_INSTALL_RESET=0: none of this).
     static func prepareDockInstallers(_ entry: LibraryEntry) {
         MadeiraDock.installerScript = nil
+        MadeiraDock.installerServicesStep = false
         MadeiraDock.installerNote = nil
         MadeiraDock.resetInstallerProgress()
         let app = entry.steamAppID ?? 0
@@ -1092,6 +1099,7 @@ final class LibraryModel: ObservableObject {
                                   : DockInstallScripts.batch(pending)
                 try Data(text.utf8).write(to: batchURL, options: .atomic)
                 MadeiraDock.installerScript = "C:\\" + MadeiraDock.installerScriptName
+                MadeiraDock.installerServicesStep = report && services != .off
             } catch {
                 LogStore.shared.log("[dock-installers] ml1970 app=\(app) batch write failed: \(error.localizedDescription)", level: .error)
             }
@@ -2576,8 +2584,6 @@ struct LibraryHUD: View {
                 } else if let failure = model.dockLaunchFailure {
                     Text("Madeira Dock stopped").font(.headline)
                     Text(failure).font(.caption).multilineTextAlignment(.center).frame(maxWidth: 360)
-                    Button("Close session", systemImage: "stop.circle") { model.requestQuit() }
-                        .buttonStyle(.bordered).frame(minHeight: 44)
                 } else if model.dockLaunching {
                     TimelineView(.periodic(from: .now, by: 1)) { context in
                         VStack(spacing: 8) {
@@ -2610,23 +2616,34 @@ struct LibraryHUD: View {
                 // ml1490: Steam's own windows stay behind this screen until the game opens.
                 // ml1850: colocated with the known visible desktop control,
                 // independent of session tools and the top session-message overlay.
-                if alwaysLog {
-                    Button(showLogs ? "Hide live log" : "Show live log", systemImage: "text.alignleft") {
-                        model.toggleLaunchLogs()
-                    }.buttonStyle(.bordered).tint(.white).frame(minHeight: 44)
+                // ml2015 (owner request): one row of glyph-only buttons (close, live log, desktop),
+                // so a short screen no longer pushes them below the fold. The words stay as
+                // VoiceOver labels.
+                if model.dockLaunchFailure != nil || alwaysLog || model.steamHolding {
+                    HStack(spacing: 14) {
+                        if model.dockLaunchFailure != nil {
+                            launchGlyph("Close session", "stop.circle") { model.requestQuit() }
+                        }
+                        if alwaysLog {
+                            launchGlyph(showLogs ? "Hide live log" : "Show live log", "text.alignleft", on: showLogs) {
+                                model.toggleLaunchLogs()
+                            }
+                        }
+                        if model.steamHolding {
+                            launchGlyph(model.dockLaunching ? "Show desktop" : "Show Steam", "macwindow") { model.showSteam() }
+                                .accessibilityHint(model.dockLaunching ? "Shows the Windows desktop" : "Shows the Windows Steam client, for example to sign in")
+                            // ml1780: the client is running the game's one-time installs; restart without them.
+                            if !model.dockLaunching, steamProgress.progress?.stage == .installers, model.activeEntry?.steamGameLaunch == true {
+                                launchGlyph(model.skippingInstallers ? "Closing Steam…" : "Skip one-time installs", "forward.end") {
+                                    model.skipSteamInstallers()
+                                }
+                                .disabled(model.skippingInstallers)
+                                .accessibilityHint("Closes Steam and marks DirectX, Visual C++ and similar installers as done")
+                            }
+                        }
+                    }
                 }
                 if model.steamHolding {
-                    Button(model.dockLaunching ? "Show desktop" : "Show Steam", systemImage: "macwindow") { model.showSteam() }
-                        .buttonStyle(.bordered).tint(.white).frame(minHeight: 44)
-                        .accessibilityHint(model.dockLaunching ? "Shows the Windows desktop" : "Shows the Windows Steam client, for example to sign in")
-                    // ml1780: the client is running the game's one-time installs; restart without them.
-                    if !model.dockLaunching, steamProgress.progress?.stage == .installers, model.activeEntry?.steamGameLaunch == true {
-                        Button(model.skippingInstallers ? "Closing Steam…" : "Skip one-time installs", systemImage: "forward.end") {
-                            model.skipSteamInstallers()
-                        }
-                        .buttonStyle(.bordered).tint(.white).frame(minHeight: 44).disabled(model.skippingInstallers)
-                        .accessibilityHint("Closes Steam and marks DirectX, Visual C++ and similar installers as done")
-                    }
                     // ml1990: no explanatory line under a Madeira Dock start (owner request);
                     // MADEIRA_DOCK_START_NOTE=1 shows it again.
                     if !model.dockLaunching || LibraryFlags.enabled("MADEIRA_DOCK_START_NOTE", fallback: false) {
@@ -2660,11 +2677,28 @@ struct LibraryHUD: View {
             LogStore.shared.log("[launch-log] ml1850 inline=\(alwaysLog ? 1 : 0) tools=\(sessionTools ? 1 : 0) dock=\(model.dockLaunching ? 1 : 0)")
         }
     }
+    /// ml2015: a round glyph button for the starting screen's control row.
+    private func launchGlyph(_ label: String, _ symbol: String, on: Bool = false,
+                             action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol).font(.system(size: 19, weight: .semibold))
+                .frame(width: 46, height: 46)
+                .background(Circle().fill(Color.white.opacity(on ? 0.32 : 0.16)))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain).foregroundStyle(.white)
+        .accessibilityLabel(label)
+    }
+
     /// ml1970: what the Dock start is waiting for, from the host's numeric report.
     private var dockStatus: String {
         let report = MadeiraDock.pollReport()
         if report.fields["launch-update-wait"] != nil && report.fields["launch-update-ready"] == nil {
             return "Steam is installing content this game needs. The game starts when it finishes…"
+        }
+        // ml2015: Steam still counts an earlier session as playing (error 35); the Dock asks again.
+        if report.fields["launch-session-wait"] != nil && report.fields["launch-client-error"] == "35" {
+            return "Steam says this account is still playing in another session. Waiting for Steam to end it (up to 3 minutes)…"
         }
         if MadeiraDock.installerScript != nil && report.fields["probe-start-bits"] == nil {
             // ml2013: which program runs now, and any that failed (MADEIRA_DOCK_INSTALL_REPORT=0: fixed text).
