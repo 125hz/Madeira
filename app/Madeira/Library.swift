@@ -1078,9 +1078,17 @@ final class LibraryModel: ObservableObject {
         catch { LogStore.shared.log("[dock-installers] ml1970 app=\(app) mark failed: \(error.localizedDescription)", level: .error) }
         if resetOn { ledger.record(newlyProvided, app: app) }
         let pending = items.filter { $0.status == .pending }.map(\.process)
+        // ml2014 (device log 103: an installer found no service manager in the Dock session, and
+        // a provided runtime's failed setup was retried at every start): the batch first makes
+        // Wine's service manager reachable (MADEIRA_DOCK_INSTALL_SCM=0: "services off"), and a
+        // provided runtime queued by "run all" that fails is recorded done
+        // (MADEIRA_DOCK_INSTALL_PROVIDED_FALLBACK=0: retried as in ml2013). Both need the report batch.
+        let services: DockInstallServices = LibraryFlags.enabled("MADEIRA_DOCK_INSTALL_SCM") ? .start(MadeiraDock.executable) : .off
+        let fallback = LibraryFlags.enabled("MADEIRA_DOCK_INSTALL_PROVIDED_FALLBACK") ? DockInstallScripts.providedRuns(found) : []
         if !pending.isEmpty {
             do {
-                let text = report ? DockInstallScripts.batch(pending, resultFile: "C:\\" + MadeiraDock.installerResultName)
+                let text = report ? DockInstallScripts.batch(pending, resultFile: "C:\\" + MadeiraDock.installerResultName,
+                                                             services: services, providedFallback: fallback)
                                   : DockInstallScripts.batch(pending)
                 try Data(text.utf8).write(to: batchURL, options: .atomic)
                 MadeiraDock.installerScript = "C:\\" + MadeiraDock.installerScriptName
@@ -1114,9 +1122,38 @@ final class LibraryModel: ObservableObject {
             let missingCount = items.filter { $0.status == .missing }.count
             detail = " scripts=\(scripts) done=\(doneCount) missing=\(missingCount) default-key=\(defaultKey ? 1 : 0)"
         }
+        if report && MadeiraDock.installerScript != nil {
+            let eligible = pending.filter { fallback.contains($0.run) }.count
+            LogStore.shared.log("[dock-installers] ml2014 app=\(app) services-step=\(services == .off ? "off" : "start") provided-fallback=\(eligible)")
+            // ml2014: DirectX setup's Managed DirectX step loads fusion.dll from the .NET 2.0
+            // framework folder through mscoree's LoadLibraryShim. Wine normally gets that file
+            // from its Mono package, which Madeira does not ship, so setup ended with -9. Place
+            // Wine's own builtin fusion.dll there (only when missing) before a DirectX run.
+            // MADEIRA_DOTNET_FUSION=0 leaves the folder alone.
+            if pending.contains(where: { DockInstallScripts.providedRuntime($0) == "DirectX" }),
+               LibraryFlags.enabled("MADEIRA_DOTNET_FUSION") {
+                LogStore.shared.log("[dock-installers] ml2014 app=\(app) dotnet-fusion=\(placeDotNetFusion())")
+            }
+        }
         let names = pending.map(\.run.name).joined(separator: ",")
         LogStore.shared.log("[dock-installers] ml1970 app=\(app) programs=\(found.count) provided=\(provided.count) marked=\(written) " +
                             "pending=\(pending.count) run-all=\(runAll ? 1 : 0) names=\(names)" + detail)
+    }
+
+    /// ml2014: copies the bundled 32-bit Wine fusion.dll into the prefix's .NET 2.0 framework
+    /// folder when it is missing. Returns "placed", "present", "no-source" or "failed".
+    static func placeDotNetFusion() -> String {
+        let fm = FileManager.default
+        let folder = drive.appendingPathComponent("windows/Microsoft.NET/Framework/v2.0.50727", isDirectory: true)
+        let target = folder.appendingPathComponent("fusion.dll")
+        if fm.fileExists(atPath: target.path) { return "present" }
+        guard let source = Bundle.main.resourceURL?.appendingPathComponent("i386-windows/fusion.dll"),
+              fm.fileExists(atPath: source.path) else { return "no-source" }
+        do {
+            try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            try fm.copyItem(at: source, to: target)
+            return "placed"
+        } catch { return "failed" }
     }
 
     /// ml2013: the batch's exit statuses, read back after the session (or at the next start):
@@ -1130,19 +1167,24 @@ final class LibraryModel: ObservableObject {
         if let data = try? Data(contentsOf: url), data.count <= 16384 {
             let results = DockInstallScripts.results(String(decoding: data, as: UTF8.self))
             var succeeded: [SteamInstallRun] = []
+            var providedAfterFailure: [SteamInstallRun] = []
             var statuses: [String] = []
             for (offset, run) in ledger.session.enumerated() {
                 let index = offset + 1, name = DockInstallScripts.label(run)
                 if let status = results.exits[index] {
-                    statuses.append("\(name)=\(status)")
-                    if DockInstallScripts.Results.succeeded(status) { succeeded.append(run) }
+                    if DockInstallScripts.Results.succeeded(status) { succeeded.append(run); statuses.append("\(name)=\(status)") }
+                    else if results.providedAfterFailure(index) {
+                        // ml2014: recorded done by the batch; no longer counted as only marked.
+                        providedAfterFailure.append(run); statuses.append("\(name)=\(status)/provided-after-failure")
+                    } else { statuses.append("\(name)=\(status)") }
                 } else {
                     statuses.append("\(name)=\(results.started[index] != nil ? "unfinished" : "not-started")")
                 }
             }
-            ledger.forget(succeeded, app: app)
-            let failed = ledger.session.count - succeeded.count
+            ledger.forget(succeeded + providedAfterFailure, app: app)
+            let failed = ledger.session.count - succeeded.count - providedAfterFailure.count
             LogStore.shared.log("[dock-installers] ml2013 app=\(app) results reason=\(reason) succeeded=\(succeeded.count) failed=\(failed) " +
+                                "provided-after-failure=\(providedAfterFailure.count) services=\(results.services ?? "-") " +
                                 "ended=\(results.ended ? 1 : 0) statuses=\(statuses.joined(separator: ","))", level: failed > 0 ? .error : .info)
         } else {
             LogStore.shared.log("[dock-installers] ml2013 app=\(app) results reason=\(reason) none: the batch did not start", level: .error)

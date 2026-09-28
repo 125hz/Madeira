@@ -965,10 +965,27 @@ struct SteamInstallProcess: Equatable, Sendable {
 enum DockInstallScripts {
     /// Programs Madeira's own Wine components replace.
     static func providedByMadeira(_ process: SteamInstallProcess) -> Bool {
+        providedRuntime(process) != nil
+    }
+
+    /// ml2014: the name of the Microsoft runtime a provided program installs (start screen text),
+    /// nil for any other program.
+    static func providedRuntime(_ process: SteamInstallProcess) -> String? {
         let file = process.executable.split(separator: "\\").last.map { $0.lowercased() } ?? ""
-        return file == "dxsetup.exe" || file.hasPrefix("vcredist") || file.hasPrefix("vc_redist") ||
-            file.hasPrefix("vcruntime") || file.hasPrefix("dotnetfx") || file.hasPrefix("ndp4") ||
-            file.hasPrefix("netfx") || file.hasPrefix("dxwebsetup")
+        if file == "dxsetup.exe" || file.hasPrefix("dxwebsetup") { return "DirectX" }
+        if file.hasPrefix("vcredist") || file.hasPrefix("vc_redist") || file.hasPrefix("vcruntime") { return "Visual C++" }
+        if file.hasPrefix("dotnetfx") || file.hasPrefix("ndp4") || file.hasPrefix("netfx") { return ".NET" }
+        return nil
+    }
+
+    /// ml2014: runs the plan classifies provided (every program in the run is provided by
+    /// Madeira), whether or not "run all" queues them. Such a run that exits non-zero is recorded
+    /// done ("provided-after-failure") instead of running again at every start.
+    static func providedRuns(_ found: [SteamInstallProcess]) -> [SteamInstallRun] {
+        var runs: [SteamInstallRun] = []
+        for process in found where !runs.contains(process.run) &&
+            found.filter({ $0.run == process.run }).allSatisfy(providedByMadeira) { runs.append(process.run) }
+        return runs
     }
 
     /// The programs of one install script. `installDir` replaces %INSTALLDIR% (a Windows path).
@@ -1123,6 +1140,22 @@ enum DockInstallStatus: String, Sendable {
     case limit      // over the per-start program limit; runs at a later start
 }
 
+/// ml2014: the install batch's service-manager step. `.none` keeps the ml2013 batch; `.off`
+/// only records "services off" (MADEIRA_DOCK_INSTALL_SCM=0); `.start` runs the Dock executable
+/// with --start-services before the first installer.
+enum DockInstallServices: Equatable, Sendable {
+    case none
+    case off
+    case start(String)
+}
+
+extension DockInstallScripts {
+    /// ml2014: the start screen's line for a provided runtime whose installer failed.
+    static func providedFailureNote(runtime: String, status: Int) -> String {
+        "\(runtime) setup failed (code \(status)); Madeira provides \(runtime), so it won't run again."
+    }
+}
+
 struct DockInstallPlanItem: Equatable, Sendable {
     var process: SteamInstallProcess
     var status: DockInstallStatus
@@ -1239,10 +1272,24 @@ extension DockInstallScripts {
     /// a status digit is never read as a handle number); a run is recorded done only on status 0,
     /// 3010 or 1641 (installed, restart requested). ml1970's "if not errorlevel 1" also accepted
     /// negative statuses (an installer's -9 read as success).
-    static func batch(_ processes: [SteamInstallProcess], resultFile: String) -> String {
+    ///
+    /// ml2014: `services` first makes Wine's service manager reachable (`dockhost.exe
+    /// --start-services` prints "services <outcome>" into the result file; "services failed" if
+    /// it could not run) or records "services off". A program whose run is in `providedFallback`
+    /// and exits with any other status appends "provided <i> <runtime>" before its exit line and is
+    /// recorded done too: Madeira provides that runtime, so it is not run again at every start.
+    static func batch(_ processes: [SteamInstallProcess], resultFile: String,
+                      services: DockInstallServices = .none, providedFallback: [SteamInstallRun] = []) -> String {
         let result = " >>\"" + resultFile.replacingOccurrences(of: "\"", with: "") + "\""
         var lines = ["@echo off", "rem Madeira ml2013: one-time installs before Madeira Dock starts the game",
                      "echo begin \(processes.count)" + result.replacingOccurrences(of: " >>", with: " >")]
+        switch services {
+        case .none: break
+        case .off: lines.append("echo services off" + result)
+        case .start(let executable):
+            lines.append("\"" + executable.replacingOccurrences(of: "\"", with: "") + "\" --start-services" + result)
+            lines.append("if not \"%ERRORLEVEL%\"==\"0\" echo services failed" + result)
+        }
         for (offset, process) in processes.enumerated() {
             let index = offset + 1
             let quoted = "\"" + process.executable + "\""
@@ -1254,10 +1301,21 @@ extension DockInstallScripts {
             lines.append("echo start \(index) " + name + result)
             lines.append(command)
             for ok in ["0", "3010", "1641"] { lines.append("if \"%ERRORLEVEL%\"==\"\(ok)\" goto madeira_ok_\(index)") }
-            lines.append("echo exit \(index) %ERRORLEVEL%" + result)
-            lines.append("goto madeira_next_\(index)")
+            let fallback = providedFallback.contains(process.run) ? providedRuntime(process) : nil
+            if let fallback {
+                // ml2014: the "provided" line precedes the exit line, so a reader that sees the
+                // exit also sees why it is recorded done.
+                lines.append("set madeira_status=%ERRORLEVEL%")
+                lines.append("echo provided \(index) " + fallback + result)
+                lines.append("echo exit \(index) %madeira_status%" + result)
+                lines.append("goto madeira_mark_\(index)")
+            } else {
+                lines.append("echo exit \(index) %ERRORLEVEL%" + result)
+                lines.append("goto madeira_next_\(index)")
+            }
             lines.append(":madeira_ok_\(index)")
             lines.append("echo exit \(index) %ERRORLEVEL%" + result)
+            if fallback != nil { lines.append(":madeira_mark_\(index)") }
             let hive = process.run.hive == .machine ? "HKLM" : "HKCU"
             let value = process.run.name.replacingOccurrences(of: "\"", with: "")
             for key in SteamInstallScripts.keys(process.run) {
@@ -1276,8 +1334,17 @@ extension DockInstallScripts {
         var started: [Int: String] = [:]
         var exits: [Int: Int] = [:]
         var ended = false
+        /// ml2014: the service-manager step's outcome ("started", "already", "failed", "off").
+        var services: String?
+        /// ml2014: programs recorded done after a failed exit (index -> provided runtime).
+        var provided: [Int: String] = [:]
         var running: Int? { started.keys.filter { exits[$0] == nil }.max() }
         static func succeeded(_ status: Int) -> Bool { status == 0 || status == 3010 || status == 1641 }
+        /// ml2014: a provided runtime whose installer failed; recorded done, not run again.
+        func providedAfterFailure(_ index: Int) -> Bool {
+            guard let status = exits[index] else { return false }
+            return !Self.succeeded(status) && provided[index] != nil
+        }
     }
     static func results(_ text: String) -> Results {
         var results = Results()
@@ -1295,6 +1362,15 @@ extension DockInstallScripts {
             case "exit":
                 if parts.count > 2, let index = Int(parts[1]), (1...64).contains(index),
                    let status = Int(parts[2].trimmingCharacters(in: .whitespaces)) { results.exits[index] = status }
+            case "services":
+                let word = parts.count > 1 ? String(parts[1].filter { $0.isLetter }.prefix(16)) : ""
+                if !word.isEmpty { results.services = word }
+            case "provided":
+                if parts.count > 2, let index = Int(parts[1]), (1...64).contains(index) {
+                    let name = String(parts[2].filter { $0.isLetter || $0.isNumber || $0 == " " || $0 == "." || $0 == "+" }.prefix(32))
+                        .trimmingCharacters(in: .whitespaces)
+                    if !name.isEmpty { results.provided[index] = name }
+                }
             case "end":
                 results.ended = true
             default:

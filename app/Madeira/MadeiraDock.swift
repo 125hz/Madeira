@@ -66,9 +66,22 @@ enum MadeiraDock {
         for (index, name) in results.started.sorted(by: { $0.key < $1.key }) where installerLogged.insert("s\(index)").inserted {
             LogStore.shared.log("[dock-installers] ml2013 start \(index)/\(results.total) program=\(name)")
         }
+        // ml2014: the service-manager step before the first installer.
+        if let services = results.services, installerLogged.insert("services").inserted {
+            LogStore.shared.log("[dock-installers] ml2014 services=\(services)", level: services == "failed" ? .error : .info)
+        }
         var failed: [String] = []
         for (index, status) in results.exits.sorted(by: { $0.key < $1.key }) {
             let ok = DockInstallScripts.Results.succeeded(status)
+            // ml2014: a provided runtime whose setup failed is recorded done, not a failure.
+            if !ok, results.providedAfterFailure(index), let runtime = results.provided[index] {
+                guard installerLogged.insert("e\(index)").inserted else { continue }
+                LogStore.shared.log("[dock-installers] ml2014 exit \(index)/\(results.total) program=\(results.started[index] ?? "") status=\(status) " +
+                                    "provided-after-failure; recorded done, not run again (Madeira provides \(runtime))")
+                let line = DockInstallScripts.providedFailureNote(runtime: runtime, status: status)
+                installerNote = installerNote.map { $0 + "\n" + line } ?? line
+                continue
+            }
             if !ok { failed.append("\(results.started[index] ?? "#\(index)") (exit \(status))") }
             guard installerLogged.insert("e\(index)").inserted else { continue }
             LogStore.shared.log("[dock-installers] ml2013 exit \(index)/\(results.total) program=\(results.started[index] ?? "") status=\(status) " +
