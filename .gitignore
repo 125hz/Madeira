@@ -110,6 +110,7 @@ build/gnutls-ios/obj/
 research/*
 !research/madeira-d3d12/
 !research/remote-metal/
+!research/madeira-dock
 *.bak
 photorec.se2
 .DS_Store
@@ -154,3 +155,7 @@ research/madeira-d3d12/tests/offline/sm51/
 # build/wine-i386/build.sh (docs/WOW64.md section 9); it is not committed.
 app/Madeira/i386-windows/*
 !app/Madeira/i386-windows/.gitkeep
+
+# Madeira Dock: built from research/madeira-dock by build/madeira-dock/build.sh
+app/Madeira/arm64ec-windows/dockhost.exe
+app/Madeira/arm64ec-windows/dock-notices.txt
