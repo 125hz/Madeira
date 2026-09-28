@@ -8,8 +8,9 @@
 # has NOT been run on macOS yet: the logic is the WSL script's, the paths and
 # tool invocations are translated. See docs/WOW64.md, "Building".
 #
-#   build/wine-i386/build.sh                 the whole farm
+#   build/wine-i386/build.sh                 whole farm + DXMT's i386 DLLs
 #   build/wine-i386/build.sh kernel32 user32 only those Wine modules
+#   SKIP_DXMT=1 build/wine-i386/build.sh     Wine modules only
 #
 # What goes in, and why it is not a hand-written list: a 32-bit program that
 # imports one missing DLL never reaches its first instruction
@@ -22,7 +23,6 @@
 # DXMT owns d3d11/dxgi/d3d10core/winemetal on i386 as on 64-bit: Wine's own
 # d3d11/dxgi/d3d10core are wined3d frontends and wined3d has no backend in this
 # port (no OpenGL, --without-vulkan), so those are never installed from Wine.
-# DXMT's i386 build is not part of this script.
 # d3d9 is left to the D3D9 series (DXMT's frontend + shim); Wine's copy is not
 # installed either.
 set -euo pipefail
@@ -65,7 +65,7 @@ SKIP_REASON=(
   "winegstreamer.dll|ir50_32.dll=media has its own series (the unix side is not in this tree)"
   "aero.msstyles=7.4 MiB of theme data nothing in the prefix selects"
   "winedbg.exe=4.5 MiB debugger only the (unshown) crash dialog spawns; dbghelp.dll ships"
-  "d3d11.dll|dxgi.dll|d3d10core.dll|winemetal.dll=DXMT-owned; Wine's are wined3d frontends with no backend here"
+  "d3d11.dll|dxgi.dll|d3d10core.dll|winemetal.dll=DXMT-owned (installed below); Wine's are wined3d frontends with no backend here"
   "d3d9.dll=DXMT-owned, installed by the D3D9 series"
 )
 SKIP=()
@@ -110,6 +110,44 @@ for t in "${TARGETS[@]}"; do
     mv -f "$DEST/$b.tmp" "$DEST/$b"
 done
 echo "== installed ${#TARGETS[@]} Wine modules into app/Madeira/i386-windows =="
+
+# --------------------------------------------------------------------- DXMT
+# The i386 build of research/dxmt (d3d11/dxgi/d3d10core/winemetal), linked
+# against this tree's import libraries. winemetal's wow64 thunk table on the
+# unix side is what lets these 32-bit DLLs reach the Metal renderer.
+if [ -z "${SKIP_DXMT:-}" ] && [ $# -eq 0 ]; then
+    D="$R/research/dxmt"
+    X="$B/dxmt-cross-i386.txt"
+    cat > "$X" <<EOF
+[binaries]
+c = '$TC/i686-w64-mingw32-clang'
+cpp = '$TC/i686-w64-mingw32-clang++'
+ar = '$TC/i686-w64-mingw32-ar'
+strip = '$TC/i686-w64-mingw32-strip'
+windres = '$TC/i686-w64-mingw32-windres'
+dlltool = '$TC/i686-w64-mingw32-dlltool'
+
+[properties]
+needs_exe_wrapper = true
+
+[host_machine]
+system = 'windows'
+cpu_family = 'x86'
+cpu = 'i686'
+endian = 'little'
+EOF
+    cd "$D"
+    if [ ! -f build-pe-i386/build.ninja ]; then
+        SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+        meson setup --cross-file "$X" --native-file build-osx.txt --buildtype release \
+            -Dwine_build_path="$B" -Dwine_builtin_dll=true build-pe-i386
+    fi
+    SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" meson compile -C build-pe-i386
+    for m in d3d11/d3d11.dll dxgi/dxgi.dll d3d10/d3d10core.dll winemetal/winemetal.dll; do
+        "$STRIP" -o "$DEST/$(basename "$m")" "build-pe-i386/src/$m"
+    done
+    echo "== installed DXMT i386 d3d11/dxgi/d3d10core/winemetal =="
+fi
 
 # ----------------------------------------------------------- import closure
 # Every DLL an installed module imports must be in the farm (api-ms-win-* is

@@ -114,9 +114,10 @@ blocks and converts the guest pointers inside them. `load_builtin_unixlib()`
 (`virtual_ios.c`) binds by the module's export name (PE32 or PE32+) and by the
 caller's bitness; a library without a 32-bit table refuses a 32-bit caller
 instead of handing it the 64-bit table. 64-bit callers get the same tables
-from the same branches as before. Tables provided: ws2_32, bcrypt, secur32,
-crypt32, dwrite, nsi (TCP table) and the audio driver (on the existing engine).
-win32u goes through `wow64win.dll`.
+from the same branches as before. Tables provided: winemetal (DXMT's Metal
+renderer; the 32-bit table lives in DXMT's `winemetal_unix.c`), ws2_32,
+bcrypt, secur32, crypt32, dwrite, nsi (TCP table) and the audio driver (on
+the existing engine). win32u goes through `wow64win.dll`.
 
 ## 5. Thread contexts
 
@@ -208,8 +209,12 @@ none are committed with the code.
 1. **i386 farm:** `build/wine-i386/build.sh` configures `wine/build-i386`
    (`--enable-archs=i386`), builds every i386 module the tree has a rule for
    minus a documented skip list, strips and installs into
-   `app/Madeira/i386-windows/`, and reports the farm's import closure.
-   `build/wine-i386/build.sh kernel32 user32` rebuilds only those modules.
+   `app/Madeira/i386-windows/`, builds DXMT's i386 `d3d11`/`dxgi`/`d3d10core`/
+   `winemetal` against that tree with meson, and reports the farm's import
+   closure. `build/wine-i386/build.sh kernel32 user32` rebuilds only those
+   modules; `SKIP_DXMT=1` leaves DXMT out. The unix side needs
+   `libdxmt_combined.a` rebuilt from the pinned DXMT (`build/dxmt-ios/build.sh`),
+   which carries winemetal's 32-bit table.
    It is the macOS form of the WSL script the 32-bit work was built with and
    has not been run on macOS.
 2. **aarch64 side:** `app/Madeira/aarch64-windows/` needs `wow64.dll` and
