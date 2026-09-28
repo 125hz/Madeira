@@ -12034,13 +12034,27 @@ static void ios_swap_back( void *base, size_t size, unsigned int vprot )
 }
 /* Drop file backing for whatever part of [base, base+size) has it. copy_back:
  * preserve contents in fresh anonymous memory (for an EXEC request); else the
- * caller is about to replace the mapping anyway and the data is discarded. */
+ * caller is about to replace the mapping anyway and the data is discarded.
+ *
+ * A copy-back works on WHOLE host pages. The request is guest-page (4 KB)
+ * granular, the extents are host-page (16 KB) aligned, and one host page can
+ * only be mapped from one object: an edge inside a backed host page moves that
+ * whole host page to anonymous memory, contents of its other guest pages
+ * included, and the pages' own protections are re-applied afterwards (the
+ * caller has already set them; a guard request leaves them PROT_NONE, so the
+ * source is made readable for the copy). Without a copy buffer or a fresh
+ * anonymous mapping the range stays file-backed instead of losing its data. */
 static void ios_swap_release_range( void *base, size_t size, int copy_back )
 {
     char *lo = (char *)base, *hi = (char *)base + size;
     unsigned i = 0;
     unsigned long long releases_before = ios_swap_releases;
     if (ios_swap_fd < 0 || !ios_swap_n) return;
+    if (copy_back)
+    {
+        lo = (char *)((uintptr_t)lo & ~(uintptr_t)host_page_mask);
+        hi = (char *)(((uintptr_t)hi + host_page_mask) & ~(uintptr_t)host_page_mask);
+    }
     while (i < ios_swap_n)
     {
         char *a = ios_swap_ext[i].va, *b = a + ios_swap_ext[i].len;
@@ -12052,9 +12066,29 @@ static void ios_swap_release_range( void *base, size_t size, int copy_back )
             if (copy_back)
             {
                 void *tmp = malloc( olen );
-                if (tmp) memcpy( tmp, oa, olen );
-                anon_mmap_fixed( oa, olen, PROT_READ | PROT_WRITE, 0 );
-                if (tmp) { memcpy( oa, tmp, olen ); free( tmp ); }
+                char *pg;
+                if (!tmp)
+                {
+                    static int said;
+                    if (said++ < 8) dprintf( 2, "[swap] copy-back of %p+0x%zx: no buffer, range stays file-backed\n", oa, olen );
+                    i++;
+                    continue;
+                }
+                for (pg = oa; pg < ob; pg += host_page_mask + 1)
+                    if (!(get_unix_prot( get_host_page_vprot( pg ) ) & PROT_READ)) { mprotect( oa, olen, PROT_READ ); break; }
+                memcpy( tmp, oa, olen );
+                if (anon_mmap_fixed( oa, olen, PROT_READ | PROT_WRITE, 0 ) == MAP_FAILED)
+                {
+                    static int said;
+                    if (said++ < 8) dprintf( 2, "[swap] copy-back of %p+0x%zx: anonymous map failed errno=%d, range stays file-backed\n", oa, olen, errno );
+                    free( tmp );
+                    mprotect_range( oa, olen, 0, 0 );
+                    i++;
+                    continue;
+                }
+                memcpy( oa, tmp, olen );
+                free( tmp );
+                mprotect_range( oa, olen, 0, 0 );
                 ios_swap_unbacks++;
             }
             ios_swap_give( ooff, olen );
