@@ -75,7 +75,7 @@ compile_objcxx_arc() {
     fi
 }
 if [[ -f "$BUILD_DIR/../madeira-d3d12/deps.sh" ]] && \
-   source "$BUILD_DIR/../madeira-d3d12/deps.sh" 2>/dev/null; then
+   source "$BUILD_DIR/../madeira-d3d12/deps.sh"; then
     echo "=== madeira-d3d12 canary (Objective-C++, Metal Shader Converter) ==="
     compile_objcxx_arc "$REPO_ROOT/research/madeira-d3d12/tests/native/msc_canary.mm" \
                        msc_canary "-DIR_PRIVATE_IMPLEMENTATION -I$MSC_INCLUDE"
@@ -97,7 +97,14 @@ if [[ -f "$BUILD_DIR/../madeira-d3d12/deps.sh" ]] && \
     # the LLVM 15 that airconv already links (bitcode reader + writer).
     compile_cxx "$REPO_ROOT/research/madeira-d3d12/src/unix/madeira_ags.cpp" madeira_ags
 else
-    echo "=== madeira-d3d12 canary SKIPPED (converter package not resolvable) ==="
+    # Without madeira_ir_unix every D3D12 shader fails to convert (DXIL and DXBC
+    # alike), so an app built past this point cannot run a D3D12 game. deps.sh
+    # printed why; stop unless the caller explicitly accepts that.
+    echo "=== madeira-d3d12 conversion service NOT BUILT: D3D12 games will not work ===" >&2
+    if [ "${MADEIRA_ALLOW_NO_D3D12:-0}" != "1" ]; then
+        echo "    Fix the error above, or set MADEIRA_ALLOW_NO_D3D12=1 to build without D3D12." >&2
+        exit 1
+    fi
 fi
 
 echo "=== winemetal unix (Objective-C) ==="

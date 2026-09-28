@@ -8,6 +8,7 @@ set -eu
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$DIR/../.." && pwd)"
 source "$DIR/deps.sh"
+[[ "$MSC_HAVE_PKG" == 1 ]] || { echo "$(basename "$0"): needs the macOS converter library from Apple's installer package (see deps.sh)" >&2; exit 1; }
 
 OUT="${OUT:-$REPO_ROOT/build/madeira-d3d12/out}"
 mkdir -p "$OUT"
