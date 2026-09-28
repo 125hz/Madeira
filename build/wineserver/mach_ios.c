@@ -444,6 +444,8 @@ int send_thread_signal( struct thread *thread, int sig )
 #define IOS_SCF_PC    0x100
 #define IOS_SCF_CPSR  0x108
 #define IOS_SCF_SIZE  0x330
+#define IOS_SCF_RESTORE_FLAGS 0x10c           /* syscall_frame.restore_flags */
+#define IOS_CTX_ARM64_CONTROL 0x00400001u     /* CONTEXT_ARM64 | CONTEXT_ARM64_CONTROL */
 #define IOS_CPUAREA_CTX64_OFF      0x18     /* CHPE_V2_CPU_AREA_INFO.ContextAmd64 */
 #define IOS_A64_SEGCS   0x38
 #define IOS_A64_SEGDS   0x3a
@@ -609,6 +611,263 @@ int ios_thread_mach_release( struct thread *thread )
     return 1;
 }
 
+/* ================= WoW64 (i386) thread contexts =================
+ *
+ * The server side of "Thread contexts of WoW64 processes" in wine's
+ * server/thread.c.  Only ever used for threads of i386 processes
+ * (ios_process_is_wow64); 64-bit processes keep the capture above unchanged
+ * and never reach ios_apply_resume_context().
+ *
+ * GET: the 32-bit register state of a WoW64 thread that is inside a system
+ * call lives in its WoW64 CPU area (TEB64->TlsSlots[WOW64_TLS_CPURESERVED]:
+ * a WOW64_CPURESERVED header followed by an I386_CONTEXT), exactly where
+ * wine's own get_cpu_area() finds it.  ios_wow_capture() reads it into the WOW
+ * side and records, in thread->ios_ctx_frame / ios_ctx_seq, which syscall
+ * frame the capture came from and a fingerprint of that frame (the return
+ * point: pc, sp, fp, lr).
+ *
+ * SET: a SetThreadContext on a suspended thread is applied by resume_thread()
+ * through ios_apply_resume_context().  The thread is halted for the write and
+ * the write happens only while it is still inside the SAME syscall frame with
+ * the SAME return point it had at capture; the native registers go into the
+ * syscall frame (as NtSetContextThread's own in-syscall path does, x18
+ * excluded) and the 32-bit registers into the CPU area, with
+ * WOW64_CPURESERVED_FLAG_RESET_STATE set so the CPU module reloads them on the
+ * way back to 32-bit code (wine's set_thread_wow64_context does the same).
+ * Anything else -- the thread left the call, or is running JIT code -- is
+ * dropped and reported by the caller: writing registers captured in one
+ * syscall into another is the corruption this design exists to avoid. */
+#define IOS_TEB_TLS_SLOTS_OFF   0x1480   /* TEB.TlsSlots (64-bit TEB) */
+#define IOS_WOW_CPURESERVED_SZ  4        /* WOW64_CPURESERVED: USHORT Flags, USHORT Machine */
+#define IOS_WOW_RESET_STATE     1        /* WOW64_CPURESERVED_FLAG_RESET_STATE */
+/* I386_CONTEXT field offsets (winnt.h) */
+#define IOS_X86_FLAGS   0x00
+#define IOS_X86_DR0     0x04
+#define IOS_X86_FLOAT   0x1c
+#define IOS_X86_CR0NPX  0x88
+#define IOS_X86_SEGGS   0x8c
+#define IOS_X86_SEGFS   0x90
+#define IOS_X86_SEGES   0x94
+#define IOS_X86_SEGDS   0x98
+#define IOS_X86_EDI     0x9c
+#define IOS_X86_ESI     0xa0
+#define IOS_X86_EBX     0xa4
+#define IOS_X86_EDX     0xa8
+#define IOS_X86_ECX     0xac
+#define IOS_X86_EAX     0xb0
+#define IOS_X86_EBP     0xb4
+#define IOS_X86_EIP     0xb8
+#define IOS_X86_SEGCS   0xbc
+#define IOS_X86_EFLAGS  0xc0
+#define IOS_X86_ESP     0xc4
+#define IOS_X86_SEGSS   0xc8
+#define IOS_X86_EXT     0xcc
+#define IOS_X86_CTXLEN  0x2cc
+#define IOS_X86_CONTROL   0x00010001
+#define IOS_X86_INTEGER   0x00010002
+#define IOS_X86_SEGMENTS  0x00010004
+#define IOS_X86_FLOATING  0x00010008
+#define IOS_X86_DEBUG     0x00010010
+#define IOS_X86_EXTENDED  0x00010020
+
+#define IOS_X86_U32(c, off) (*(unsigned int *)((c) + (off)))
+
+/* The syscall frame the thread is inside, or 0 (kernel_stack <= sp <= frame,
+ * the same selector as is_inside_syscall()). */
+static uint64_t ios_wow_syscall_frame( struct thread *thread, uint64_t sp )
+{
+    uint64_t frame = 0, kstack = 0;
+
+    if (!thread->teb) return 0;
+    if (!ios_safe_read( (uint64_t)thread->teb + IOS_TEB_SYSCALL_FRAME_OFF, &frame, 8 ) ||
+        !ios_safe_read( (uint64_t)thread->teb + IOS_TEB_KERNEL_STACK_OFF, &kstack, 8 ))
+        return 0;
+    if (!frame || !kstack || (frame & 7) || kstack >= frame || sp < kstack || sp > frame) return 0;
+    return frame;
+}
+
+/* Fingerprint of a syscall frame's return point. */
+static unsigned int ios_wow_frame_seq( uint64_t frame )
+{
+    unsigned char f[IOS_SCF_SIZE];
+    uint64_t h = 0xcbf29ce484222325ull, v[4];
+    unsigned int i;
+
+    if (!frame || !ios_safe_read( frame, f, sizeof(f) )) return 0;
+    v[0] = *(uint64_t *)(f + IOS_SCF_PC);
+    v[1] = *(uint64_t *)(f + IOS_SCF_SP);
+    v[2] = *(uint64_t *)(f + IOS_SCF_FP);
+    v[3] = *(uint64_t *)(f + IOS_SCF_LR);
+    for (i = 0; i < 4; i++) h = (h ^ v[i]) * 0x100000001b3ull;
+    return (unsigned int)(h ^ (h >> 32)) | 1;   /* never 0: 0 means "no capture" */
+}
+
+/* Address of the thread's WoW64 I386_CONTEXT, or 0. */
+static uint64_t ios_wow_cpu_context( struct thread *thread, uint64_t *cpu_out )
+{
+    uint64_t cpu = 0;
+    unsigned short hdr[2];
+
+    if (!thread->teb) return 0;
+    if (!ios_safe_read( (uint64_t)thread->teb + IOS_TEB_TLS_SLOTS_OFF + 8, &cpu, 8 ) || !cpu) return 0;
+    if (!ios_safe_read( cpu, hdr, sizeof(hdr) ) || hdr[1] != IMAGE_FILE_MACHINE_I386) return 0;
+    if (cpu_out) *cpu_out = cpu;
+    return (cpu + IOS_WOW_CPURESERVED_SZ + 3) & ~(uint64_t)3;   /* TYPE_ALIGNMENT(I386_CONTEXT) */
+}
+
+/* Called with the target halted, from ios_fill_thread_context(). */
+static void ios_wow_capture( struct thread *thread, uint64_t sp, struct context_data *wow )
+{
+    unsigned char c[IOS_X86_CTXLEN];
+    uint64_t frame = ios_wow_syscall_frame( thread, sp ), ctx;
+
+    thread->ios_ctx_frame = frame;
+    thread->ios_ctx_seq   = ios_wow_frame_seq( frame );
+    if (!wow) return;
+    wow->machine = IMAGE_FILE_MACHINE_I386;
+    if (!frame || !(ctx = ios_wow_cpu_context( thread, NULL )) || !ios_safe_read( ctx, c, sizeof(c) ))
+        return;   /* running 32-bit code: the CPU area is not current, report nothing */
+
+    wow->flags |= SERVER_CTX_CONTROL | SERVER_CTX_INTEGER | SERVER_CTX_SEGMENTS |
+                  SERVER_CTX_FLOATING_POINT | SERVER_CTX_DEBUG_REGISTERS | SERVER_CTX_EXTENDED_REGISTERS;
+    wow->ctl.i386_regs.ebp    = IOS_X86_U32( c, IOS_X86_EBP );
+    wow->ctl.i386_regs.esp    = IOS_X86_U32( c, IOS_X86_ESP );
+    wow->ctl.i386_regs.eip    = IOS_X86_U32( c, IOS_X86_EIP );
+    wow->ctl.i386_regs.cs     = IOS_X86_U32( c, IOS_X86_SEGCS );
+    wow->ctl.i386_regs.ss     = IOS_X86_U32( c, IOS_X86_SEGSS );
+    wow->ctl.i386_regs.eflags = IOS_X86_U32( c, IOS_X86_EFLAGS );
+    wow->integer.i386_regs.eax = IOS_X86_U32( c, IOS_X86_EAX );
+    wow->integer.i386_regs.ebx = IOS_X86_U32( c, IOS_X86_EBX );
+    wow->integer.i386_regs.ecx = IOS_X86_U32( c, IOS_X86_ECX );
+    wow->integer.i386_regs.edx = IOS_X86_U32( c, IOS_X86_EDX );
+    wow->integer.i386_regs.esi = IOS_X86_U32( c, IOS_X86_ESI );
+    wow->integer.i386_regs.edi = IOS_X86_U32( c, IOS_X86_EDI );
+    wow->seg.i386_regs.ds = IOS_X86_U32( c, IOS_X86_SEGDS );
+    wow->seg.i386_regs.es = IOS_X86_U32( c, IOS_X86_SEGES );
+    wow->seg.i386_regs.fs = IOS_X86_U32( c, IOS_X86_SEGFS );
+    wow->seg.i386_regs.gs = IOS_X86_U32( c, IOS_X86_SEGGS );
+    memcpy( &wow->fp.i386_regs, c + IOS_X86_FLOAT, 7 * 4 );                 /* ctrl .. data_sel */
+    memcpy( wow->fp.i386_regs.regs, c + IOS_X86_FLOAT + 7 * 4, sizeof(wow->fp.i386_regs.regs) );
+    wow->fp.i386_regs.cr0npx = IOS_X86_U32( c, IOS_X86_CR0NPX );
+    memcpy( &wow->debug.i386_regs, c + IOS_X86_DR0, sizeof(wow->debug.i386_regs) );
+    memcpy( wow->ext.i386_regs, c + IOS_X86_EXT, sizeof(wow->ext.i386_regs) );
+}
+
+/* Apply a SetThreadContext made while the thread was suspended (resume_thread()
+ * in wine's server/thread.c).  Returns 1 when applied, 0 when dropped. */
+int ios_apply_resume_context( struct thread *thread, const struct context_data *native,
+                              const struct context_data *wow )
+{
+    mach_msg_type_name_t type;
+    mach_port_t port;
+    arm_thread_state64_t arm;
+    mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+    uint64_t frame, ctx, cpu = 0;
+    int applied = 0;
+
+    if (!ios_process_is_wow64( thread->process )) return 0;
+    if (!thread->ios_ctx_frame || !thread->ios_ctx_seq) return 0;
+    if (thread->unix_pid == -1 || thread->unix_tid == (unsigned int)-1) return 0;
+    if (mach_port_extract_right( mach_task_self(), thread->unix_tid,
+                                 MACH_MSG_TYPE_COPY_SEND, &port, &type ))
+        return 0;
+    if (thread_suspend( port )) { mach_port_deallocate( mach_task_self(), port ); return 0; }
+
+    if (thread_get_state( port, ARM_THREAD_STATE64, (thread_state_t)&arm, &count )) goto done;
+    frame = ios_wow_syscall_frame( thread, arm.__sp );
+    if (!frame || frame != thread->ios_ctx_frame || ios_wow_frame_seq( frame ) != thread->ios_ctx_seq)
+        goto done;   /* the thread left the syscall the capture came from */
+
+    /* native side: into the syscall frame, x18 (the TEB) never overwritten */
+    if (native && (native->flags & SERVER_CTX_CONTROL) && native->machine == native_machine)
+    {
+        unsigned char f[IOS_SCF_SIZE];
+        unsigned int i;
+
+        if (!ios_safe_read( frame, f, sizeof(f) )) goto done;
+        if (native->flags & SERVER_CTX_INTEGER)
+        {
+            for (i = 0; i < 29; i++)
+                if (i != 18) *(uint64_t *)(f + i * 8) = native->integer.arm64_regs.x[i];
+            *(uint64_t *)(f + IOS_SCF_FP) = native->integer.arm64_regs.x[29];
+            *(uint64_t *)(f + IOS_SCF_LR) = native->integer.arm64_regs.x[30];
+        }
+        *(uint64_t *)(f + IOS_SCF_SP)   = native->ctl.arm64_regs.sp;
+        *(uint64_t *)(f + IOS_SCF_PC)   = native->ctl.arm64_regs.pc;
+        *(uint32_t *)(f + IOS_SCF_CPSR) = native->ctl.arm64_regs.pstate;
+        *(uint32_t *)(f + IOS_SCF_RESTORE_FLAGS) |= IOS_CTX_ARM64_CONTROL;
+        if (mach_vm_write( mach_task_self(), (mach_vm_address_t)frame, (vm_offset_t)f,
+                           (mach_msg_type_number_t)sizeof(f) ))
+            goto done;
+    }
+
+    /* 32-bit side: into the CPU area, and tell the CPU module to reload it */
+    if (wow && wow->machine == IMAGE_FILE_MACHINE_I386 && wow->flags &&
+        (ctx = ios_wow_cpu_context( thread, &cpu )))
+    {
+        unsigned char c[IOS_X86_CTXLEN];
+        unsigned short cpu_flags;
+
+        if (!ios_safe_read( ctx, c, sizeof(c) ) || !ios_safe_read( cpu, &cpu_flags, 2 )) goto done;
+        if (wow->flags & SERVER_CTX_CONTROL)
+        {
+            IOS_X86_U32( c, IOS_X86_EBP )    = wow->ctl.i386_regs.ebp;
+            IOS_X86_U32( c, IOS_X86_ESP )    = wow->ctl.i386_regs.esp;
+            IOS_X86_U32( c, IOS_X86_EIP )    = wow->ctl.i386_regs.eip;
+            IOS_X86_U32( c, IOS_X86_SEGCS )  = wow->ctl.i386_regs.cs;
+            IOS_X86_U32( c, IOS_X86_SEGSS )  = wow->ctl.i386_regs.ss;
+            IOS_X86_U32( c, IOS_X86_EFLAGS ) = wow->ctl.i386_regs.eflags;
+            IOS_X86_U32( c, IOS_X86_FLAGS ) |= IOS_X86_CONTROL;
+        }
+        if (wow->flags & SERVER_CTX_INTEGER)
+        {
+            IOS_X86_U32( c, IOS_X86_EAX ) = wow->integer.i386_regs.eax;
+            IOS_X86_U32( c, IOS_X86_EBX ) = wow->integer.i386_regs.ebx;
+            IOS_X86_U32( c, IOS_X86_ECX ) = wow->integer.i386_regs.ecx;
+            IOS_X86_U32( c, IOS_X86_EDX ) = wow->integer.i386_regs.edx;
+            IOS_X86_U32( c, IOS_X86_ESI ) = wow->integer.i386_regs.esi;
+            IOS_X86_U32( c, IOS_X86_EDI ) = wow->integer.i386_regs.edi;
+            IOS_X86_U32( c, IOS_X86_FLAGS ) |= IOS_X86_INTEGER;
+        }
+        if (wow->flags & SERVER_CTX_SEGMENTS)
+        {
+            IOS_X86_U32( c, IOS_X86_SEGDS ) = wow->seg.i386_regs.ds;
+            IOS_X86_U32( c, IOS_X86_SEGES ) = wow->seg.i386_regs.es;
+            IOS_X86_U32( c, IOS_X86_SEGFS ) = wow->seg.i386_regs.fs;
+            IOS_X86_U32( c, IOS_X86_SEGGS ) = wow->seg.i386_regs.gs;
+            IOS_X86_U32( c, IOS_X86_FLAGS ) |= IOS_X86_SEGMENTS;
+        }
+        if (wow->flags & SERVER_CTX_FLOATING_POINT)
+        {
+            memcpy( c + IOS_X86_FLOAT, &wow->fp.i386_regs, 7 * 4 );
+            memcpy( c + IOS_X86_FLOAT + 7 * 4, wow->fp.i386_regs.regs, sizeof(wow->fp.i386_regs.regs) );
+            IOS_X86_U32( c, IOS_X86_CR0NPX ) = wow->fp.i386_regs.cr0npx;
+            IOS_X86_U32( c, IOS_X86_FLAGS ) |= IOS_X86_FLOATING;
+        }
+        if (wow->flags & SERVER_CTX_DEBUG_REGISTERS)
+        {
+            memcpy( c + IOS_X86_DR0, &wow->debug.i386_regs, sizeof(wow->debug.i386_regs) );
+            IOS_X86_U32( c, IOS_X86_FLAGS ) |= IOS_X86_DEBUG;
+        }
+        if (wow->flags & SERVER_CTX_EXTENDED_REGISTERS)
+        {
+            memcpy( c + IOS_X86_EXT, wow->ext.i386_regs, sizeof(wow->ext.i386_regs) );
+            IOS_X86_U32( c, IOS_X86_FLAGS ) |= IOS_X86_EXTENDED;
+        }
+        cpu_flags |= IOS_WOW_RESET_STATE;
+        if (mach_vm_write( mach_task_self(), (mach_vm_address_t)ctx, (vm_offset_t)c,
+                           (mach_msg_type_number_t)sizeof(c) ) ||
+            mach_vm_write( mach_task_self(), (mach_vm_address_t)cpu, (vm_offset_t)&cpu_flags, 2 ))
+            goto done;
+    }
+    applied = 1;
+
+done:
+    thread_resume( port );
+    mach_port_deallocate( mach_task_self(), port );
+    return applied;
+}
+
 /* Set by suspend_thread() around its stop_thread() call so the capture below
  * can convert its momentary halt into the persistent hold without ever
  * resuming in between. Snapshot-only callers leave it NULL. */
@@ -717,8 +976,11 @@ int ios_fill_thread_context( struct thread *thread,
         }
     }
 
+    /* --- WoW64 (i386) process: 32-bit context from its CPU area --- */
+    if (have_native && ios_process_is_wow64( thread->process ))
+        ios_wow_capture( thread, arm.__sp, wow );
     /* --- guest x86-64 context from TEB->ChpeV2CpuAreaInfo->ContextAmd64 --- */
-    if (wow)
+    else if (wow)
     {
         uint64_t cpuarea = 0, ctx64 = 0;
         unsigned char ctx[IOS_A64_CTXLEN];

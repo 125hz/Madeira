@@ -975,7 +975,14 @@ static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_s
      * mapping -- fixups that were applied resolve high, the rest resolve through
      * the window, and both reach the same bytes. Without ml938 this branch
      * would be producing a half-relocated image; with it, the image is whole. */
-    else if (reloc_dir && mapping->image.base && mapping->image.base < PE_LOW_BASE_FLOOR)
+    /* A 32-bit (WoW64) process maps a PE32 image at its preferred base inside
+     * its own 4 GB guest window, so a base below the floor is mappable there and
+     * must not be forced through the session-wide sub-floor relocation, which
+     * would let two 32-bit processes re-point each other's images.  Sections
+     * created by 64-bit processes keep the upstream rule. */
+    else if (reloc_dir && mapping->image.base && mapping->image.base < PE_LOW_BASE_FLOOR &&
+             !(nt.opt.hdr32.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC &&
+               current && ios_process_is_wow64( current->process )))
     {
         fprintf( stderr, "ml936: image base %#llx below the %#llx floor, unmappable here; "
                  "relocating anyway (dynamic_base=%d relocs_stripped=%d) -- ml938 will "
