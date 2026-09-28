@@ -139,6 +139,7 @@ static void wine_log_write(const char *fmt, ...)
 #include "wine/server.h"
 #include "wine/debug.h"
 #include "unix_private.h"
+#include "ios_wow.h"
 #include "ddk/wdm.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(server);
@@ -1911,6 +1912,13 @@ static void invoke_system_apc( const union apc_call *call, union apc_result *res
         else result->async_io.status = STATUS_PENDING; /* restart it */
         break;
     }
+    /* in every APC below, `addr` is a
+     * client_ptr_t and therefore a HOST address (one namespace per process),
+     * while zero_bits / limit_low / limit_high are GUEST-namespace ceilings.
+     * Nothing is converted here: these calls execute inside the TARGET
+     * process, so NtAllocateVirtualMemory / NtMapViewOfSection / the
+     * MEM_ADDRESS_REQUIREMENTS path translate the ceiling into that
+     * process's own window.  Do not "fix" this by adding B here. */
     case APC_VIRTUAL_ALLOC:
         result->type = call->type;
         addr = wine_server_get_ptr( call->virtual_alloc.addr );
@@ -3504,6 +3512,14 @@ void process_exit_wrapper( int status )
          * the session (else-branch) lives as long as the app. Reuse is
          * grace-delayed inside the allocator for laggard exit threads. */
         ios_jit_reclaim_process( dead_peb );
+        /* and its guest window, if it had one.  Here rather
+         * than only in ios_child_thread_entry because THIS is the chokepoint
+         * every pseudo-process exit reaches, on whichever thread called
+         * ExitProcess — a guest worker thread that ends the process does not
+         * return to the boot thread's setjmp at all.  Keyed by the dying PEB,
+         * not by the calling thread.  Nothing is unmapped here; see
+         * ios_wow_window_mark_released(). */
+        ios_wow_window_release( dead_peb );
         /* ml988 phase 2: only now may the retired fixed base be handed on. Until
          * this point the old generation's pool mappings and FEX translations are
          * still live, so a new claimant taking the same VA would race them. */
@@ -4518,16 +4534,26 @@ NTSTATUS wow64_wine_server_call( void *args )
     NTSTATUS status;
     struct __server_request_info req;
 
+    /* the WoW64 module converted the OUTER args pointer
+     * only, so req32 is a host pointer but every pointer INSIDE it is still a
+     * guest address — the request's own iov data blocks and the reply buffer
+     * live in the 32-bit caller's window.  ios_wow_host_ptr() is +B and
+     * NULL-preserving (a NULL iov entry stays NULL). */
     req.u.req = req32->u.req;
     req.data_count = req32->data_count;
     for (i = 0; i < req.data_count; i++)
     {
-        req.data[i].ptr = ULongToPtr( req32->data[i].ptr );
+        req.data[i].ptr = ios_wow_host_ptr( req32->data[i].ptr );
         req.data[i].size = req32->data[i].size;
     }
-    req.reply_data = ULongToPtr( req32->reply_data );
+    req.reply_data = ios_wow_host_ptr( req32->reply_data );
     status = wine_server_call( &req );
     req32->u.reply = req.u.reply;
+    /* NOTE: req.u.req is copied verbatim.  client_ptr_t members inside the
+     * request union that a 32-bit caller filled in are guest addresses and are
+     * NOT converted here.  No request made through this entry point by the
+     * 32-bit ntdll (debug output, file I/O, handle/console requests) carries
+     * one. */
     return status;
 }
 
@@ -4544,7 +4570,8 @@ NTSTATUS wow64_wine_server_fd_to_handle( void *args )
         ULONG        handle;
     } const *params32 = args;
 
-    ULONG *handle32 = ULongToPtr( params32->handle );
+    /* embedded guest pointer: the caller's output slot */
+    ULONG *handle32 = ios_wow_host_ptr( params32->handle );
     HANDLE handle;
     NTSTATUS ret;
 
@@ -4566,8 +4593,11 @@ NTSTATUS wow64_wine_server_handle_to_fd( void *args )
         ULONG        options;
     } const *params32 = args;
 
+    /* handle stays a handle; unix_fd and options are embedded guest pointers
+     * to the caller's output slots */
     return wine_server_handle_to_fd( ULongToHandle( params32->handle ), params32->access,
-                                     ULongToPtr( params32->unix_fd ), ULongToPtr( params32->options ));
+                                     ios_wow_host_ptr( params32->unix_fd ),
+                                     ios_wow_host_ptr( params32->options ));
 }
 
 #endif /* _WIN64 */

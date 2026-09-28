@@ -97,6 +97,7 @@
 #include "winternl.h"
 #include "wine/asm.h"
 #include "unix_private.h"
+#include "ios_wow.h"
 #include "wine/debug.h"
 
 /* defined at the bottom of this file with the [thread-stacks] dumper */
@@ -598,6 +599,52 @@ static int ios_teb_is_registered(uintptr_t teb)
     if (count > IOS_MAX_WINE_THREADS) count = IOS_MAX_WINE_THREADS;
     for (int i = 0; i < count; i++)
         if (ios_thread_registry[i].teb == teb) return 1;
+    return 0;
+}
+
+/* A released guest window is about to become PROT_NONE, and every TEB inside
+ * it with it.  Entries naming those TEBs must go first: the registry is keyed
+ * by Mach port, ports are recycled, and the exception path's port lookup would
+ * otherwise hand the fault handler a pointer into the replaced range.  Only
+ * called from the guest-window teardown (virtual_ios.c). */
+int ios_thread_registry_purge_range( uintptr_t base, uintptr_t size )
+{
+    int count = ios_thread_registry_count(), purged = 0, i;
+
+    for (i = 0; i < count; i++)
+    {
+        uintptr_t teb = ios_thread_registry[i].teb;
+
+        if (!teb || teb < base || teb - base >= size) continue;
+        ios_thread_registry[i].mach_thread = 0;
+        __sync_synchronize();
+        ios_thread_registry[i].teb = 0;
+        ios_thread_registry[i].trampoline = NULL;
+        purged++;
+    }
+    return purged;
+}
+
+/* Is a thread whose TEB lies in [base, base+size) still alive?  An exited
+ * process's workers can stay asleep long after its main thread is gone.  Only
+ * the Mach thread's existence is asked, its TEB is never dereferenced; an
+ * unexpected query failure counts as alive (keep the memory). */
+int ios_thread_registry_range_busy( uintptr_t base, uintptr_t size )
+{
+    int count = ios_thread_registry_count(), i;
+
+    for (i = 0; i < count; i++)
+    {
+        uintptr_t teb = ios_thread_registry[i].teb;
+        thread_t port = ios_thread_registry[i].mach_thread;
+        struct thread_basic_info info;
+        mach_msg_type_number_t length = THREAD_BASIC_INFO_COUNT;
+        kern_return_t kr;
+
+        if (!port || !teb || teb < base || teb - base >= size) continue;
+        kr = thread_info( port, THREAD_BASIC_INFO, (thread_info_t)&info, &length );
+        if (kr != KERN_INVALID_ARGUMENT && kr != MACH_SEND_INVALID_DEST && kr != KERN_TERMINATED) return 1;
+    }
     return 0;
 }
 
@@ -12740,6 +12787,12 @@ void syscall_dispatcher_return_slowpath(void)
 /***********************************************************************
  *           init_syscall_frame
  */
+/* host -> guest for a known window base, NULL-preserving */
+static inline ULONG ios_wow_guest_in( const void *host, ULONG_PTR wow_base )
+{
+    return host ? (ULONG)((ULONG_PTR)host - wow_base) : 0;
+}
+
 void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, TEB *teb )
 {
     struct syscall_frame *frame = ((struct ntdll_thread_data *)&teb->GdiTebBatch)->syscall_frame;
@@ -12753,12 +12806,19 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
     context.Sp  = (DWORD64)teb->Tib.StackBase;
     context.Pc  = (DWORD64)IOS_PFUNC(RtlUserThreadStart);
 
+    /* Every register of the initial 32-bit context is a GUEST value.  `entry`
+     * and `arg` arrive as host pointers, wow_peb is the host PEB32, and
+     * pLdrSystemDllInitBlock->pRtlUserThreadStart is already published guest.
+     * Without a guest window wow_base is 0 and this is the upstream code. */
+    ULONG_PTR wow_base = ios_wow_base_for_peb( teb->Peb );
+#define IOS_WOW_GUEST_IN(ptr) ios_wow_guest_in( (ptr), wow_base )
+
     if ((i386_context = get_cpu_area( IMAGE_FILE_MACHINE_I386 )))
     {
         XMM_SAVE_AREA32 *fpu = (XMM_SAVE_AREA32 *)i386_context->ExtendedRegisters;
         i386_context->ContextFlags = CONTEXT_I386_ALL;
-        i386_context->Eax = (ULONG_PTR)entry;
-        i386_context->Ebx = (arg == peb ? (ULONG_PTR)wow_peb : (ULONG_PTR)arg);
+        i386_context->Eax = IOS_WOW_GUEST_IN( entry );
+        i386_context->Ebx = IOS_WOW_GUEST_IN( arg == peb ? (void *)wow_peb : arg );
         i386_context->Esp = get_wow_teb( teb )->Tib.StackBase - 16;
         i386_context->Eip = pLdrSystemDllInitBlock->pRtlUserThreadStart;
         i386_context->SegCs = 0x23;
@@ -12775,12 +12835,13 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
     else if ((arm_context = get_cpu_area( IMAGE_FILE_MACHINE_ARMNT )))
     {
         arm_context->ContextFlags = CONTEXT_ARM_ALL;
-        arm_context->R0 = (ULONG_PTR)entry;
-        arm_context->R1 = (arg == peb ? (ULONG_PTR)wow_peb : (ULONG_PTR)arg);
+        arm_context->R0 = IOS_WOW_GUEST_IN( entry );
+        arm_context->R1 = IOS_WOW_GUEST_IN( arg == peb ? (void *)wow_peb : arg );
         arm_context->Sp = get_wow_teb( teb )->Tib.StackBase;
         arm_context->Pc = pLdrSystemDllInitBlock->pRtlUserThreadStart;
         if (arm_context->Pc & 1) arm_context->Cpsr |= 0x20; /* thumb mode */
     }
+#undef IOS_WOW_GUEST_IN
 
     if (suspend)
     {
@@ -13448,9 +13509,40 @@ static const char *ios_pe_module_name( uint64_t base )
                                (mach_vm_address_t)&pe_sig, &got) != KERN_SUCCESS || got != 4)
         return "?";
     if (pe_sig != 0x00004550) return "?";
-    if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(base + e_lfanew + 0x88), 4,
-                               (mach_vm_address_t)&exp_rva, &got) != KERN_SUCCESS || got != 4)
-        return "?";
+    /* ml998: THE EXPORT DIRECTORY IS NOT AT THE SAME OFFSET IN PE32 AND PE32+.
+     *
+     * This read was hardcoded to e_lfanew+0x88, which is IMAGE_NT_HEADERS64's
+     * DataDirectory[0] (OptionalHeader at +0x18, DataDirectory at +0x70).  In a
+     * 32-bit image OptionalHeader32 puts DataDirectory at +0x60, so the export
+     * directory is at e_lfanew+0x78 and +0x88 is DataDirectory[2] -- RESOURCE.
+     * `exp_rva' was therefore the resource RVA, `name_rva' was read from offset
+     * 0x0c of IMAGE_RESOURCE_DIRECTORY (NumberOfNamedEntries | NumberOfIdEntries
+     * << 16, a small plausible-looking number that passes the range check), and
+     * the "name" was 63 arbitrary bytes from that address.
+     *
+     * That is where the profiler's `Zx' and `PnQ' modules came from: r76 line
+     * 6858 reports `jit by module: Zx=42.4% ... Zx=0.2%' -- the same two-letter
+     * garbage twice, for two different images, at 21-44 % of all CPU.  Both are
+     * 32-bit guest DLLs that the MZ probe had to name because they loaded after
+     * the one-shot loader walk (see ios_gmod32_build).  SizeOfImage happens to
+     * sit at +0x50 in BOTH layouts, which is why ios_gmod32_probe's own reads
+     * were right and only the name was wrong.
+     *
+     * Pick the layout from OptionalHeader.Magic, the field that exists to say
+     * which one it is. */
+    {
+        unsigned short magic = 0;
+        uint32_t ddir_off;
+        if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(base + e_lfanew + 0x18), 2,
+                                   (mach_vm_address_t)&magic, &got) != KERN_SUCCESS || got != 2)
+            return "?";
+        if (magic == 0x010b) ddir_off = 0x78;        /* PE32  */
+        else if (magic == 0x020b) ddir_off = 0x88;   /* PE32+ */
+        else return "?";
+        if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(base + e_lfanew + ddir_off), 4,
+                                   (mach_vm_address_t)&exp_rva, &got) != KERN_SUCCESS || got != 4)
+            return "?";
+    }
     if (!exp_rva || exp_rva > 0x10000000) return "(exe)";
     if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(base + exp_rva + 0x0c), 4,
                                (mach_vm_address_t)&name_rva, &got) != KERN_SUCCESS || got != 4)

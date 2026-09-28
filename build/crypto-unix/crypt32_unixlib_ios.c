@@ -850,26 +850,109 @@ static void load_root_certs(void)
         import_certs_from_path( CRYPT_knownLocations[i], TRUE );
 }
 
+/* On iOS this one unix side serves every pseudo-process of the session.  A
+ * 32-bit process's root store import must not consume the list another
+ * process is still importing from, so a WoW64 caller enumerates with a
+ * per-thread position instead (ios_enum_root_certs_wow).  The lock serialises
+ * the one-time load and every walk or removal of the list. */
+#include <pthread.h>
+#include <stdint.h>
+#include <time.h>
+static pthread_mutex_t ios_root_lock = PTHREAD_MUTEX_INITIALIZER;
+static BOOL ios_roots_loaded;
+
+static void ios_load_roots_locked(void)
+{
+    if (!ios_roots_loaded) load_root_certs();
+    ios_roots_loaded = TRUE;
+}
+
 static NTSTATUS enum_root_certs( void *args )
 {
     struct enum_root_certs_params *params = args;
-    static BOOL loaded;
     struct list *ptr;
     struct root_cert *cert;
+    NTSTATUS status = STATUS_SUCCESS;
 
-    if (!loaded) load_root_certs();
-    loaded = TRUE;
+    pthread_mutex_lock( &ios_root_lock );
+    ios_load_roots_locked();
 
-    if (!(ptr = list_head( &root_cert_list ))) return STATUS_NO_MORE_ENTRIES;
-    cert = LIST_ENTRY( ptr, struct root_cert, entry );
-    *params->needed = cert->size;
-    if (cert->size <= params->size)
+    if (!(ptr = list_head( &root_cert_list ))) status = STATUS_NO_MORE_ENTRIES;
+    else
     {
-        memcpy( params->buffer, cert->data, cert->size );
-        list_remove( &cert->entry );
-        free( cert );
+        cert = LIST_ENTRY( ptr, struct root_cert, entry );
+        *params->needed = cert->size;
+        if (cert->size <= params->size)
+        {
+            memcpy( params->buffer, cert->data, cert->size );
+            list_remove( &cert->entry );
+            free( cert );
+        }
     }
-    return STATUS_SUCCESS;
+    pthread_mutex_unlock( &ios_root_lock );
+    return status;
+}
+
+/* The WoW64 enumeration: each thread keeps its own position; the rootstore
+ * loop runs on one thread and asks again for the same certificate after
+ * growing its buffer, so the position advances only when one was copied.  The
+ * position is dropped at the end of the list and restarted after 10 s idle. */
+#define IOS_ROOT_CURSORS 32
+static struct { uintptr_t thread; unsigned int index; unsigned long long stamp; } ios_root_cursor[IOS_ROOT_CURSORS];
+
+static unsigned long long ios_root_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (unsigned long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static NTSTATUS ios_enum_root_certs_wow( struct enum_root_certs_params *params )
+{
+    uintptr_t self = (uintptr_t)pthread_self();
+    unsigned long long now = ios_root_now_ms();
+    unsigned int i, slot = IOS_ROOT_CURSORS, oldest = 0, n = 0;
+    struct list *ptr;
+    NTSTATUS status;
+
+    pthread_mutex_lock( &ios_root_lock );
+    ios_load_roots_locked();
+    for (i = 0; i < IOS_ROOT_CURSORS; i++)
+    {
+        if (ios_root_cursor[i].thread == self) { slot = i; break; }
+        if (ios_root_cursor[i].stamp < ios_root_cursor[oldest].stamp) oldest = i;
+    }
+    if (slot == IOS_ROOT_CURSORS)
+    {
+        slot = oldest;
+        ios_root_cursor[slot].thread = self;
+        ios_root_cursor[slot].index = 0;
+    }
+    else if (now - ios_root_cursor[slot].stamp > 10000) ios_root_cursor[slot].index = 0;
+    ios_root_cursor[slot].stamp = now;
+
+    LIST_FOR_EACH( ptr, &root_cert_list )
+        if (n++ == ios_root_cursor[slot].index) break;
+    if (ptr == &root_cert_list)
+    {
+        ios_root_cursor[slot].thread = 0;
+        ios_root_cursor[slot].index = 0;
+        ios_root_cursor[slot].stamp = 0;
+        status = STATUS_NO_MORE_ENTRIES;
+    }
+    else
+    {
+        struct root_cert *cert = LIST_ENTRY( ptr, struct root_cert, entry );
+        *params->needed = cert->size;
+        if (cert->size <= params->size)
+        {
+            memcpy( params->buffer, cert->data, cert->size );
+            ios_root_cursor[slot].index++;
+        }
+        status = STATUS_SUCCESS;
+    }
+    pthread_mutex_unlock( &ios_root_lock );
+    return status;
 }
 
 const unixlib_entry_t __wine_unix_call_funcs[] =
@@ -886,6 +969,10 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
 C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
 
 #ifdef _WIN64
+/* In every thunk below `args` is already a HOST pointer (the WoW64 module
+ * converts that one outer pointer) but every pointer EMBEDDED in the 32-bit
+ * block is still a GUEST address: ios_wow_host_ptr() is the +B conversion
+ * (NULL-preserving), and plain ULongToPtr off the iOS port. */
 
 typedef ULONG PTR32;
 
@@ -905,14 +992,14 @@ static NTSTATUS wow64_open_cert_store( void *args )
         PTR32 key_count_ret;
     } const *params32 = args;
 
-    const CRYPT_DATA_BLOB32 *pfx32 = ULongToPtr( params32->pfx );
-    CRYPT_DATA_BLOB pfx = { pfx32->cbData, ULongToPtr( pfx32->pbData ) };
+    const CRYPT_DATA_BLOB32 *pfx32 = ios_wow_host_ptr( params32->pfx );
+    CRYPT_DATA_BLOB pfx = { pfx32->cbData, ios_wow_host_ptr( pfx32->pbData ) };
     struct open_cert_store_params params =
     {
         &pfx,
-        ULongToPtr( params32->password ),
-        ULongToPtr( params32->data_ret ),
-        ULongToPtr( params32->key_count_ret )
+        ios_wow_host_ptr( params32->password ),
+        ios_wow_host_ptr( params32->data_ret ),
+        ios_wow_host_ptr( params32->key_count_ret )
     };
 
     return open_cert_store( &params );
@@ -930,8 +1017,8 @@ static NTSTATUS wow64_import_store_key( void *args )
     struct import_store_key_params params =
     {
         params32->data,
-        ULongToPtr( params32->buf ),
-        ULongToPtr( params32->buf_size )
+        ios_wow_host_ptr( params32->buf ),
+        ios_wow_host_ptr( params32->buf_size )
     };
 
     return import_store_key( &params );
@@ -951,8 +1038,8 @@ static NTSTATUS wow64_import_store_cert( void *args )
     {
         params32->data,
         params32->index,
-        ULongToPtr( params32->buf ),
-        ULongToPtr( params32->buf_size )
+        ios_wow_host_ptr( params32->buf ),
+        ios_wow_host_ptr( params32->buf_size )
     };
 
     return import_store_cert( &params );
@@ -969,12 +1056,12 @@ static NTSTATUS wow64_enum_root_certs( void *args )
 
     struct enum_root_certs_params params =
     {
-        ULongToPtr( params32->buffer ),
+        ios_wow_host_ptr( params32->buffer ),
         params32->size,
-        ULongToPtr( params32->needed )
+        ios_wow_host_ptr( params32->needed )
     };
 
-    return enum_root_certs( &params );
+    return ios_enum_root_certs_wow( &params );
 }
 
 const unixlib_entry_t __wine_unix_call_wow64_funcs[] =

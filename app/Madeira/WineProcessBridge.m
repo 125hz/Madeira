@@ -21,6 +21,9 @@
 #include <sys/stat.h>
 #include <limits.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <sys/sysctl.h>
 
 #include "WineProcessBridge.h"
 #include "WineServerBridge.h"
@@ -342,6 +345,332 @@ void madeira_seed_prefix_if_needed(const char *prefix_path) {
         /* ml581: see madeira_undo_appdata_skeleton() above. */
         madeira_undo_appdata_skeleton( prefix );
     }
+}
+
+/* ===========================================================================
+ * WoW64: 32-bit (i386) targets. See docs/WOW64.md.
+ *
+ * Everything below is used only when the bundle carries the i386 Wine set
+ * (app/Madeira/i386-windows, built by build/wine-i386/build.sh) or when the
+ * target exe is an i386 PE. A bundle without i386-windows and a 64-bit
+ * target take exactly the code path they took before.
+ * ========================================================================= */
+#define MADEIRA_IMAGE_FILE_MACHINE_I386 0x014c
+
+/* build/ntdll-unix/virtual_ios.c: nonzero when this session's MAIN image is
+ * 32-bit. The unix side reserves the process's guest window before its first
+ * TEB when it is set; the image's machine is not known there until later. */
+extern int ios_main_image_i386;
+
+/* IMAGE_FILE_HEADER.Machine, read off disk (MZ -> e_lfanew -> "PE\0\0").
+ * 0 on any read or format failure. */
+static uint16_t madeira_pe_machine(const char *unix_path)
+{
+    unsigned char dos[64], pe[6];
+    uint16_t machine = 0;
+    FILE *f;
+
+    if (!unix_path || !*unix_path || !(f = fopen(unix_path, "rb"))) return 0;
+    if (fread(dos, 1, sizeof(dos), f) == sizeof(dos) && dos[0] == 'M' && dos[1] == 'Z')
+    {
+        uint32_t lfanew = (uint32_t)dos[0x3c] | ((uint32_t)dos[0x3d] << 8) |
+                          ((uint32_t)dos[0x3e] << 16) | ((uint32_t)dos[0x3f] << 24);
+        if (lfanew <= (16u << 20) && fseek(f, (long)lfanew, SEEK_SET) == 0 &&
+            fread(pe, 1, sizeof(pe), f) == sizeof(pe) &&
+            pe[0] == 'P' && pe[1] == 'E' && !pe[2] && !pe[3])
+            machine = (uint16_t)(pe[4] | (pe[5] << 8));
+    }
+    fclose(f);
+    return machine;
+}
+
+/* The machine of the file the launch below will run, or 0 when it is not
+ * known (the caller then treats the target as 64-bit, as before).
+ *  - "C:\...\app.exe": the file under the prefix's drive_c.
+ *  - a bare name: the launch resolves it as C:\windows\system32\<name>, which
+ *    links the 64-bit farms, so a name present in a 64-bit farm is not probed
+ *    any further. Otherwise it is looked up in the bundle's i386-windows. To
+ *    launch the 32-bit build of a name both sets carry (explorer.exe, cmd.exe),
+ *    give its full path, C:\windows\syswow64\<name>.
+ *  - any other form (another drive, a relative Win32 path) is not probed. */
+static uint16_t madeira_target_machine(const char *exe, const char *prefix, NSString *bundle)
+{
+    static const char * const farms64[] = { "aarch64-windows", "arm64ec-windows" };
+    char probe[PATH_MAX];
+    size_t skip;
+
+    if ((exe[0] == 'C' || exe[0] == 'c') && exe[1] == ':' && exe[2] == '\\')
+    {
+        skip = strlen(prefix) + strlen("/drive_c/");
+        if (snprintf(probe, sizeof(probe), "%s/drive_c/%s", prefix, exe + 3) >= (int)sizeof(probe))
+            return 0;
+        for (char *p = probe + skip; *p; p++) if (*p == '\\') *p = '/';
+    }
+    else if (strchr(exe, '\\') || (exe[0] && exe[1] == ':'))
+        return 0;
+    else
+    {
+        for (size_t i = 0; i < sizeof(farms64) / sizeof(farms64[0]); i++)
+        {
+            snprintf(probe, sizeof(probe), "%s/%s/%s", bundle.fileSystemRepresentation, farms64[i], exe);
+            if (access(probe, R_OK) == 0) return 0;
+        }
+        if (snprintf(probe, sizeof(probe), "%s/i386-windows/%s", bundle.fileSystemRepresentation, exe)
+                >= (int)sizeof(probe))
+            return 0;
+    }
+    return madeira_pe_machine(probe);
+}
+
+/* The bundle carries the i386 Wine set. */
+static BOOL madeira_bundle_has_i386(NSString *bundle)
+{
+    NSString *ntdll = [bundle stringByAppendingPathComponent:@"i386-windows/ntdll.dll"];
+    return access(ntdll.fileSystemRepresentation, R_OK) == 0;
+}
+
+/* C:\windows\syswow64: the i386 farm, the Windows name for this pattern. A
+ * 32-bit process's system32 is redirected here, and the unix loader's
+ * machine -> directory mapping looks here for the 32-bit ntdll, kernel32 and
+ * the rest. Linked for every session once the bundle has the i386 set, so a
+ * 64-bit launcher can start a 32-bit child. */
+static void madeira_link_syswow64(NSFileManager *fm, NSString *prefix, NSString *bundle)
+{
+    NSString *farmDir = [prefix stringByAppendingPathComponent:@"drive_c/windows/syswow64"];
+    NSString *source = [bundle stringByAppendingPathComponent:@"i386-windows"];
+    int linked = 0;
+
+    [fm createDirectoryAtPath:farmDir withIntermediateDirectories:YES attributes:nil error:nil];
+    for (NSString *f in [fm contentsOfDirectoryAtPath:source error:nil])
+    {
+        if ([f hasPrefix:@"."]) continue;
+        NSString *dst = [farmDir stringByAppendingPathComponent:f];
+        [fm removeItemAtPath:dst error:nil];  /* self-heal stale links on reinstall */
+        if ([fm createSymbolicLinkAtPath:dst
+                     withDestinationPath:[source stringByAppendingPathComponent:f] error:nil])
+            linked++;
+    }
+    dprintf(STDERR_FILENO, "[WineProc] Farm syswow64: %d links -> i386-windows\n", linked);
+}
+
+/* syswow64\wbem, for 32-bit targets. The farms are flat, but WMI's registered
+ * InprocServer32 paths are C:\windows\system32\wbem\<name> (wine.inf installs
+ * these modules there), so a 32-bit CoCreateInstance(CLSID_WbemLocator) -- for
+ * example dxdiagn asking WMI about the display adapter -- fails with
+ * c0000135 when the subdirectory is empty. The list is wine.inf's. */
+static void madeira_link_syswow64_wbem(NSFileManager *fm, NSString *prefix, NSString *bundle)
+{
+    static const char * const wbem[] = { "wbemprox.dll", "wbemdisp.dll", "wmiutils.dll",
+                                         "wmic.exe", "mofcomp.exe" };
+    NSString *dir = [prefix stringByAppendingPathComponent:@"drive_c/windows/syswow64/wbem"];
+    NSString *source = [bundle stringByAppendingPathComponent:@"i386-windows"];
+    int linked = 0;
+
+    [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    for (size_t i = 0; i < sizeof(wbem) / sizeof(wbem[0]); i++)
+    {
+        NSString *n = [NSString stringWithUTF8String:wbem[i]];
+        NSString *src = [source stringByAppendingPathComponent:n];
+        NSString *dst = [dir stringByAppendingPathComponent:n];
+        [fm removeItemAtPath:dst error:nil];
+        if (![fm fileExistsAtPath:src]) continue;
+        if ([fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil]) linked++;
+    }
+    dprintf(STDERR_FILENO, "[WineProc] syswow64\\wbem: %d/%zu links\n",
+            linked, sizeof(wbem) / sizeof(wbem[0]));
+}
+
+/* C:\windows\winsxs for 32-bit targets: the x86 side-by-side assemblies Wine
+ * ships.
+ *
+ * The prefix has no winsxs directory: the template does not carry one and
+ * this port never runs wineboot's fake-DLL install, which is what builds it on
+ * a normal Wine prefix. Without it no 32-bit program gets a Common-Controls
+ * 6.0 activation context (comdlg32 gives up in DllMain with 14001), and a
+ * program built with Visual Studio 2005/2008, which carries its CRT as a
+ * side-by-side dependency ("Microsoft.VC80.CRT"), fails the activation
+ * context for every DLL with the same dependency.
+ *
+ * This writes what dlls/setupapi/fakedll.c writes for each WINE_MANIFEST
+ * assembly in the tree:
+ *   windows\winsxs\manifests\<DIR>.manifest
+ *   windows\winsxs\<DIR>\<file>          (linked from the i386 farm)
+ *   <DIR> = x86_<lower-case name>_<publicKeyToken>_<version>_none_deadbeef
+ * with the architecture filled into processorArchitecture, because actctx.c
+ * checks the identity in the file against the one in its name. actctx.c pins
+ * only major.minor, and accepts any build/revision >= the one requested, so
+ * one assembly per major.minor serves every service pack of it.
+ *
+ * Only the x86 architecture is written: ntdll looks for "x86_" assemblies in
+ * a 32-bit process and for "arm64_"/"amd64_" ones in 64-bit processes, so
+ * 64-bit processes in the same prefix see no difference. An assembly whose
+ * first file is missing from the i386 farm is skipped: a manifest without its
+ * DLL would redirect that DLL's loads into an empty directory. */
+static void madeira_seed_winsxs_x86(NSFileManager *fm, NSString *prefix, NSString *bundle)
+{
+    struct sxs_file { const char *in_assembly; const char *in_farm; };
+    struct sxs_assembly { const char *name, *lname, *key, *version; struct sxs_file files[4]; };
+    static const char *comctl32_body =
+        "    <windowClass>Button</windowClass>\n"
+        "    <windowClass>ButtonListBox</windowClass>\n"
+        "    <windowClass>ComboBoxEx32</windowClass>\n"
+        "    <windowClass>ComboLBox</windowClass>\n"
+        "    <windowClass>ComboBox</windowClass>\n"
+        "    <windowClass>Edit</windowClass>\n"
+        "    <windowClass>ListBox</windowClass>\n"
+        "    <windowClass>NativeFontCtl</windowClass>\n"
+        "    <windowClass>ReBarWindow32</windowClass>\n"
+        "    <windowClass>ScrollBar</windowClass>\n"
+        "    <windowClass>Static</windowClass>\n"
+        "    <windowClass>SysAnimate32</windowClass>\n"
+        "    <windowClass>SysDateTimePick32</windowClass>\n"
+        "    <windowClass>SysHeader32</windowClass>\n"
+        "    <windowClass>SysIPAddress32</windowClass>\n"
+        "    <windowClass>SysLink</windowClass>\n"
+        "    <windowClass>SysListView32</windowClass>\n"
+        "    <windowClass>SysMonthCal32</windowClass>\n"
+        "    <windowClass>SysPager</windowClass>\n"
+        "    <windowClass>SysTabControl32</windowClass>\n"
+        "    <windowClass>SysTreeView32</windowClass>\n"
+        "    <windowClass>ToolbarWindow32</windowClass>\n"
+        "    <windowClass>msctls_hotkey32</windowClass>\n"
+        "    <windowClass>msctls_progress32</windowClass>\n"
+        "    <windowClass>msctls_statusbar32</windowClass>\n"
+        "    <windowClass>msctls_trackbar32</windowClass>\n"
+        "    <windowClass>msctls_updown32</windowClass>\n"
+        "    <windowClass>tooltips_class32</windowClass>\n";
+    /* One entry per WINE_MANIFEST resource in the Wine tree (the file the
+     * values come from is named on each entry). */
+    static const struct sxs_assembly asms[] = {
+        /* dlls/comctl32_v6/comctl32.manifest (index 0: gets comctl32_body) */
+        { "Microsoft.Windows.Common-Controls", "microsoft.windows.common-controls",
+          "6595b64144ccf1df", "6.0.2600.2982", { { "comctl32.dll", "comctl32_v6.dll" } } },
+        /* dlls/msvcr80/msvcr80.manifest */
+        { "Microsoft.VC80.CRT", "microsoft.vc80.crt", "1fc8b3b9a1e18e3b", "8.0.50727.9672",
+          { { "msvcr80.dll", "msvcr80.dll" }, { "msvcp80.dll", "msvcp80.dll" },
+            { "msvcm80.dll", "msvcm80.dll" } } },
+        /* dlls/msvcr90/msvcr90.manifest */
+        { "Microsoft.VC90.CRT", "microsoft.vc90.crt", "1fc8b3b9a1e18e3b", "9.0.30729.6161",
+          { { "msvcr90.dll", "msvcr90.dll" }, { "msvcp90.dll", "msvcp90.dll" },
+            { "msvcm90.dll", "msvcm90.dll" } } },
+        /* dlls/atl80/atl80.manifest */
+        { "Microsoft.VC80.ATL", "microsoft.vc80.atl", "1fc8b3b9a1e18e3b", "8.0.50727.4053",
+          { { "atl80.dll", "atl80.dll" } } },
+        /* dlls/atl90/atl90.manifest */
+        { "Microsoft.VC90.ATL", "microsoft.vc90.atl", "1fc8b3b9a1e18e3b", "9.0.30729.6161",
+          { { "atl90.dll", "atl90.dll" } } },
+        /* dlls/gdiplus/gdiplus.manifest and gdiplus11.manifest: one DLL */
+        { "Microsoft.Windows.GdiPlus", "microsoft.windows.gdiplus", "6595b64144ccf1df",
+          "1.0.6000.16386", { { "gdiplus.dll", "gdiplus.dll" } } },
+        { "Microsoft.Windows.GdiPlus", "microsoft.windows.gdiplus", "6595b64144ccf1df",
+          "1.1.7601.23038", { { "gdiplus.dll", "gdiplus.dll" } } },
+        /* dlls/msxml3, msxml4 and msxml6 manifests */
+        { "Microsoft-Windows-MSXML30", "microsoft-windows-msxml30", "31bf3856ad364e35",
+          "6.0.6000.16386", { { "msxml3.dll", "msxml3.dll" } } },
+        { "Microsoft.MSXML2", "microsoft.msxml2", "6bd6b9abf345378f", "4.1.0.0",
+          { { "msxml4.dll", "msxml4.dll" } } },
+        { "Microsoft-Windows-MSXML60", "microsoft-windows-msxml60", "31bf3856ad364e35",
+          "6.0.6000.16386", { { "msxml6.dll", "msxml6.dll" } } },
+    };
+    NSString *winsxs = [prefix stringByAppendingPathComponent:@"drive_c/windows/winsxs"];
+    NSString *manifests = [winsxs stringByAppendingPathComponent:@"manifests"];
+    NSString *source = [bundle stringByAppendingPathComponent:@"i386-windows"];
+    const size_t count = sizeof(asms) / sizeof(asms[0]);
+    int seeded = 0, skipped = 0;
+
+    [fm createDirectoryAtPath:manifests withIntermediateDirectories:YES attributes:nil error:nil];
+    for (size_t a = 0; a < count; a++)
+    {
+        const struct sxs_assembly *def = &asms[a];
+        const char *body = a == 0 ? comctl32_body : NULL;
+        NSString *first = [source stringByAppendingPathComponent:
+                           [NSString stringWithUTF8String:def->files[0].in_farm]];
+        if (![fm fileExistsAtPath:first])
+        {
+            dprintf(STDERR_FILENO, "[WineProc] winsxs: x86 %s skipped, i386-windows has no %s\n",
+                    def->name, def->files[0].in_farm);
+            skipped++;
+            continue;
+        }
+        NSString *dirName = [NSString stringWithFormat:@"x86_%s_%s_%s_none_deadbeef",
+                             def->lname, def->key, def->version];
+        NSString *asmDir = [winsxs stringByAppendingPathComponent:dirName];
+        NSString *manifest = [manifests stringByAppendingPathComponent:
+                              [dirName stringByAppendingString:@".manifest"]];
+        [fm createDirectoryAtPath:asmDir withIntermediateDirectories:YES attributes:nil error:nil];
+
+        /* Build the manifest and the directory together so the <file> list
+         * and the directory cannot disagree: a file missing from the farm is
+         * left out of both. UTF-8, LF, no BOM. */
+        NSMutableString *text = [NSMutableString stringWithString:
+            @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+            @"<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\n"];
+        [text appendFormat:@"  <assemblyIdentity type=\"win32\" name=\"%s\" version=\"%s\" "
+                           @"processorArchitecture=\"x86\" publicKeyToken=\"%s\"/>\n",
+                           def->name, def->version, def->key];
+        BOOL ok = YES;
+        for (size_t f = 0; f < sizeof(def->files) / sizeof(def->files[0]) && def->files[f].in_assembly; f++)
+        {
+            NSString *src = [source stringByAppendingPathComponent:
+                             [NSString stringWithUTF8String:def->files[f].in_farm]];
+            NSString *link = [asmDir stringByAppendingPathComponent:
+                              [NSString stringWithUTF8String:def->files[f].in_assembly]];
+            [fm removeItemAtPath:link error:nil];  /* the bundle path changes on reinstall */
+            if (![fm fileExistsAtPath:src]) continue;
+            if (![fm createSymbolicLinkAtPath:link withDestinationPath:src error:nil]) { ok = NO; break; }
+            if (body)
+                [text appendFormat:@"  <file name=\"%s\">\n%s  </file>\n", def->files[f].in_assembly, body];
+            else
+                [text appendFormat:@"  <file name=\"%s\"/>\n", def->files[f].in_assembly];
+        }
+        [text appendString:@"</assembly>\n"];
+        if (!ok || ![[text dataUsingEncoding:NSUTF8StringEncoding] writeToFile:manifest atomically:YES])
+        {
+            dprintf(STDERR_FILENO, "[WineProc] winsxs: x86 %s FAILED\n", def->name);
+            skipped++;
+            continue;
+        }
+        seeded++;
+    }
+    dprintf(STDERR_FILENO, "[WineProc] winsxs: %d/%zu x86 assemblies seeded, %d skipped\n",
+            seeded, count, skipped);
+}
+
+/* FEX's WOW64 module cannot call sysctl, and without an answer it assumes the
+ * newest cores' feature set. A wrong "present" is silent corruption, not a
+ * crash (FEAT_AFP claimed on a core without it leaves FPCR.NEP RES0, so every
+ * scalar SSE operation zeroes the upper lanes of its destination), so the app
+ * asks and passes the answers in FEX_MADEIRA_HOSTPROBE. Only the WOW64 module
+ * reads it (FEX Source/Windows/Common/CPUFeatures.cpp, !ARCHITECTURE_arm64ec);
+ * "?" means the sysctl does not exist and keeps FEX's assumption. */
+static void madeira_publish_host_probe(void)
+{
+    static const struct { const char *key, *sysctl; } probes[] = {
+        { "AFP",     "hw.optional.arm.FEAT_AFP" },
+        { "FLAGM",   "hw.optional.arm.FEAT_FlagM" },
+        { "FLAGM2",  "hw.optional.arm.FEAT_FlagM2" },
+        { "FCMA",    "hw.optional.arm.FEAT_FCMA" },
+        { "RCPC",    "hw.optional.arm.FEAT_LRCPC" },
+        { "AES",     "hw.optional.arm.FEAT_AES" },
+        { "PMULL",   "hw.optional.arm.FEAT_PMULL" },
+        { "SHA",     "hw.optional.arm.FEAT_SHA256" },
+        { "CRC",     "hw.optional.armv8_crc32" },
+        { "ATOMICS", "hw.optional.arm.FEAT_LSE" },
+    };
+    char buf[256];
+    size_t len = 0;
+
+    buf[0] = 0;
+    for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++)
+    {
+        int32_t v = 0;
+        size_t sz = sizeof(v);
+        const char *val = sysctlbyname(probes[i].sysctl, &v, &sz, NULL, 0) == 0 ? (v ? "1" : "0") : "?";
+        len += snprintf(buf + len, sizeof(buf) - len, "%s%s=%s", i ? "," : "", probes[i].key, val);
+        if (len >= sizeof(buf)) return;
+    }
+    setenv("FEX_MADEIRA_HOSTPROBE", buf, 1);
+    dprintf(STDERR_FILENO, "[WineProc] FEX host feature probe: %s\n", buf);
 }
 
 static void *wine_process_thread(void *arg) {
@@ -680,6 +1009,20 @@ static void *wine_process_thread(void *arg) {
         BOOL use_arm64ec = (force_ec && *force_ec == '1') ||
                            (strstr(madeira_exe, "x64") != NULL) ||
                            (strchr(madeira_exe, '\\') != NULL);
+
+        /* WoW64: a 32-bit (i386) target, from the PE header on disk rather
+         * than the name. Its 64-bit half runs on the plain aarch64 core (the
+         * unix loader resolves aarch64-windows for a process whose main image
+         * is i386), whatever the heuristic above chose. Any other target
+         * keeps the heuristic's answer unchanged. */
+        NSString *bundleForProbe = [[NSBundle mainBundle] bundlePath];
+        const BOOL has_i386_set = madeira_bundle_has_i386(bundleForProbe);
+        const uint16_t target_machine = madeira_target_machine(madeira_exe, g_prefix_path, bundleForProbe);
+        const BOOL is_i386_target = has_i386_set && target_machine == MADEIRA_IMAGE_FILE_MACHINE_I386;
+        dprintf(STDERR_FILENO, "[WineProc] PE probe: machine=0x%x%s\n", target_machine,
+                is_i386_target ? " (i386: WoW64)" :
+                target_machine == MADEIRA_IMAGE_FILE_MACHINE_I386 ? " (i386, but the bundle has no i386-windows)" : "");
+        if (is_i386_target) use_arm64ec = NO;
         const char *bundle_subdir = use_arm64ec ? "arm64ec-windows" : "aarch64-windows";
         LOG("Target exe: %{public}s (bundle=%{public}s)", madeira_exe, bundle_subdir);
         dprintf(STDERR_FILENO, "[WineProc] Target exe: %s (bundle=%s)\n", madeira_exe, bundle_subdir);
@@ -768,6 +1111,17 @@ static void *wine_process_thread(void *arg) {
                     }
                     dprintf(STDERR_FILENO, "[WineProc] Farm %s: %d links -> %s\n",
                             farms[i].farm, farmLinked, farms[i].arch);
+                }
+            }
+
+            /* WoW64: the i386 farm for every session once the bundle has it;
+             * the x86 side-by-side store and syswow64\wbem for a 32-bit
+             * target (docs/WOW64.md). */
+            if (has_i386_set) {
+                madeira_link_syswow64(fm, prefix, bundlePath);
+                if (is_i386_target) {
+                    madeira_link_syswow64_wbem(fm, prefix, bundlePath);
+                    madeira_seed_winsxs_x86(fm, prefix, bundlePath);
                 }
             }
 
@@ -894,6 +1248,9 @@ static void *wine_process_thread(void *arg) {
         char exe_path[512];
         if (strchr(madeira_exe, '\\') || (madeira_exe[0] && madeira_exe[1] == ':')) {
             snprintf(exe_path, sizeof(exe_path), "%s", madeira_exe);
+        } else if (is_i386_target) {
+            /* WoW64: a bare i386 name lives in the syswow64 farm */
+            snprintf(exe_path, sizeof(exe_path), "C:\\windows\\syswow64\\%s", madeira_exe);
         } else {
             snprintf(exe_path, sizeof(exe_path), "C:\\windows\\system32\\%s", madeira_exe);
         }
@@ -976,6 +1333,12 @@ static void *wine_process_thread(void *arg) {
         wine_ios_exit_initialized = 1;
 
         LOG("Calling __wine_main...");
+
+        /* WoW64: publish the main image's machine so the unix side reserves
+         * this process's guest window before its first TEB, and hand FEX's
+         * WOW64 module the host features it cannot query itself. */
+        ios_main_image_i386 = is_i386_target ? 1 : 0;
+        if (has_i386_set) madeira_publish_host_probe();
 
         if (setjmp(wine_ios_exit_jmpbuf) == 0) {
             __wine_main(argc, argv);

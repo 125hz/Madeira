@@ -1939,7 +1939,8 @@ void pack_user_message( void *buffer, size_t size, UINT message,
                 memcpy( tmp_cds, cds, sizeof(*cds) );
 
                 extra_buffer_size = cds->cbData;
-                status = NtAllocateVirtualMemory( GetCurrentProcess(), ret_extra_buffer, zero_bits,
+                /* the CALLING pseudo-process's ceiling (win32u is shared by the session) */
+    status = NtAllocateVirtualMemory( GetCurrentProcess(), ret_extra_buffer, caller_zero_bits(),
                                                   &extra_buffer_size, MEM_RESERVE | MEM_COMMIT,
                                                   PAGE_READWRITE );
                 if (!status)

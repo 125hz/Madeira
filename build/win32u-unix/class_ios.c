@@ -26,6 +26,9 @@
 
 #include <pthread.h>
 #include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include "ntstatus.h"
 #include "win32u_private.h"
 #include "ntuser_private.h"
@@ -164,11 +167,46 @@ static WINDOWPROC *find_winproc( WNDPROC func, BOOL ansi )
     return NULL;
 }
 
+/* A 32-bit program's winproc handle (0xffffNNNN) can reach win32u with its
+ * guest window base added.  The WoW64 thunks for
+ * CallWindowProc (win_proc_params.func) and RegisterClass (lpfnWndProc)
+ * convert those fields as guest addresses, so 0xffff0036 arrives as
+ * B + 0xffff0036.  get_winproc_ptr() then does not recognise it as a handle,
+ * win32u hands it back as a plain procedure, the conversion back to 32 bits
+ * yields 0xffff0036 again, and user32 calls it as code: the CPU module then
+ * reports a no-exec entry block at FFFF0036 and every message to that window
+ * is dropped.  The top 64 KB of
+ * a 32-bit address space never holds code, so a value of that form inside
+ * the caller's window is the handle.  MADEIRA_WINPROC_HANDLE=0 disables. */
+extern ULONG_PTR ios_wow_base(void);
+static WNDPROC ios_winproc_handle_arg( WNDPROC proc )
+{
+    static int enabled = -1;
+    static unsigned int reported;
+    ULONG_PTR value = (ULONG_PTR)proc, base;
+
+    if (!(value >> 32)) return proc;
+    base = ios_wow_base();
+    if (!base || value - base > 0xffffffffu || (value - base) >> 16 != WINPROC_HANDLE) return proc;
+    if (enabled < 0)
+    {
+        const char *env = getenv( "MADEIRA_WINPROC_HANDLE" );
+        enabled = !env || strcmp( env, "0" );
+    }
+    if (__atomic_load_n( &reported, __ATOMIC_RELAXED ) < 8 &&
+        __atomic_fetch_add( &reported, 1, __ATOMIC_RELAXED ) < 8)
+        fprintf( stderr, "[winproc-handle] ml1360 guest=%#lx handle=%#lx enabled=%d\n",
+                 (unsigned long)value, (unsigned long)(value - base), enabled );
+    return enabled ? (WNDPROC)(value - base) : proc;
+}
+
 /* return the window proc for a given handle, or NULL for an invalid handle,
  * or WINPROC_PROC16 for a handle to a 16-bit proc. */
 static WINDOWPROC *get_winproc_ptr( WNDPROC handle )
 {
-    UINT index = LOWORD(handle);
+    UINT index;
+    handle = ios_winproc_handle_arg( handle );
+    index = LOWORD(handle);
     if ((ULONG_PTR)handle >> 16 != WINPROC_HANDLE) return NULL;
     if (index >= MAX_WINPROCS) return WINPROC_PROC16;
     if (index >= winproc_used) return NULL;
@@ -308,6 +346,16 @@ DLGPROC get_dialog_proc( DLGPROC ret, BOOL ansi )
 
 static void init_user(void)
 {
+    /* gdi_init() -> font_init()
+     * dereferences Peb->AnsiCodePageData / OemCodePageData /
+     * UnicodeCaseTableData.  In a 32-bit process those three PEB64 fields were
+     * written by the guest's own ntdll with the WoW64 identity conversion, so
+     * they hold GUEST addresses; repair them before the first native read.
+     * Defined in build/ntdll-unix/env_ios.c (same image); no-op for a 64-bit
+     * process.  RtlInitCodePageTable() also guards itself. */
+    extern void ios_wow_fixup_peb64_ptrs(void);
+    ios_wow_fixup_peb64_ptrs();
+
     NtQuerySystemInformation( SystemBasicInformation, &system_info, sizeof(system_info), NULL );
 
     init_startup_info();
