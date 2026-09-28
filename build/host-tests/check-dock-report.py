@@ -34,12 +34,19 @@ assert(parse("[steam-host] ml1830 session-native-handoff-app-mismatch=1\n[steam-
 assert(parse("[steam-host] ml1990 ceg-result=10\n[steam-host] ml1830 probe-result=49\n").failure!.contains("busy"))
 assert(parse("[steam-host] ml1970 launch-client-error=18\n[steam-host] ml1830 probe-result=45\n").failure!.contains("installed"))
 assert(parse("[steam-host] ml2011 launch-config-wait=1\n[steam-host] ml1970 launch-client-error=22\n[steam-host] ml1830 probe-result=48\n").failure!.contains("configuration"))
+let session = parse("[steam-host] ml1970 launch-client-error=35\n[steam-host] ml2015 launch-session-wait=35\n[steam-host] ml2015 launch-session-gave-up=12\n[steam-host] ml1830 probe-result=45\n")
+assert(session.fields["launch-session-wait"] == "35" && session.fields["launch-session-gave-up"] == "12")
+assert(session.failure!.contains("still says") && session.failure!.contains("another session"))
+assert(parse("[steam-host] ml1970 launch-client-error=35\n[steam-host] ml2015 launch-session-wait=35\n[steam-host] ml1830 probe-result=48\n").failure!.contains("still says"))
+let sessionNoWait = parse("[steam-host] ml1970 launch-client-error=35\n[steam-host] ml1830 probe-result=45\n").failure!
+assert(sessionNoWait.contains("another session") && !sessionNoWait.contains("still says"))
+assert(parse("[steam-host] ml2015 launch-session-wait=35\n[steam-host] ml1970 launch-client-error=22\n[steam-host] ml1830 probe-result=45\n").failure!.contains("configuration"))
 assert(parse("[steam-host] ml1970 launch-client-error=99\n[steam-host] ml1830 probe-result=45\n").failure!.contains("code 45"))
 let rejected = "[steam-host] ml1830 account=synthetic\n[steam-host] ml1830 token=synthetic\n[steam-host] ml1830 probe-result=2147483648\n[steam-host] ml1830 probe-result=secret\n[steam-host] ml1830 client-sha256=invalid\n[steam-host] unknown probe-result=0\n[steam-host] ml1830 probe-result=0 secret\n"
 assert(parse(rejected).fields.isEmpty)
 assert(parse(String(repeating: "x", count: 32769)).fields.isEmpty)
 assert(MadeiraDock.parseReport(Data([0xff])).fields.isEmpty)
-print("PASS: Dock report completion, CRLF, fingerprints, adapter version, failure reasons and private/malformed field rejection")
+print("PASS: Dock report completion, CRLF, fingerprints, adapter version, failure reasons (including the session wait) and private/malformed field rejection")
 '''
 with tempfile.TemporaryDirectory(prefix='madeira-dock-report-') as directory:
     source = Path(directory) / 'main.swift'; binary = Path(directory) / 'check'
@@ -54,7 +61,20 @@ if host.exists():
     for path in (root / 'research/madeira-dock/src').glob('*.c'):
         written |= set(re.findall(r'"(ml\d{4})"', path.read_text()))
     accepted = set(re.findall(r'"(ml\d{4})"', text[text.index('static let reportRounds'):text.index('static func parseReport')]))
+    # ml2014 tags only install-scm, emitted by the host's `--start-services` CLI mode before any
+    # report file is opened (stderr only). Madeira never runs that mode, so it never reaches the report.
+    main_c = host.read_text()
+    assert re.search(r'!strncmp\(stage, "install-scm", 11\) \? "ml2014"', main_c) and main_c.count('"ml2014"') == 1
+    assert main_c.index('"--start-services"') < main_c.index('report = _wfopen(')
+    assert not any('--start-services' in p.read_text() for p in (root / 'app/Madeira').glob('*.swift'))
+    written -= {'ml2014'}
     assert written <= accepted, f'host rounds not accepted: {sorted(written - accepted)}'
     print(f'PASS: every report round the pinned host writes is accepted ({len(written)})')
 else:
     print('SKIP: research/madeira-dock not checked out; round cross-check not run')
+
+# The live Dock status names the session wait only while the host reports it for refusal 35.
+view = (root / 'app/Madeira/MadeiraDockView.swift').read_text()
+assert 'report.fields["launch-session-wait"] != nil, report.fields["launch-client-error"] == "35"' in view
+assert 'Waiting for Steam to end it (up to 3 minutes)' in view
+print('PASS: live Dock status shows the session wait')

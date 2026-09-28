@@ -70,6 +70,11 @@ final class MadeiraDockModel: ObservableObject {
                     }
                     break
                 }
+                // Steam still counts another session of this account as playing
+                // (launch refusal 35); the host asks again for up to three minutes.
+                if report.fields["launch-session-wait"] != nil, report.fields["launch-client-error"] == "35" {
+                    status = "Steam says this account is still playing in another session. Waiting for Steam to end it (up to 3 minutes)…"
+                }
                 // The session starts after the JIT pool is set up; count only once it ran.
                 let running = wine_process_is_running() != 0 || wineserver_is_running() != 0
                 if running { started = true; idle = 0 } else { idle += 1 }

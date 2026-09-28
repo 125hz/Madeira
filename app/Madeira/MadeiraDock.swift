@@ -228,6 +228,11 @@ enum MadeiraDock {
                (22...23).contains(error), fields["launch-config-wait"] != nil {
                 return "Steam did not finish loading this game's configuration after signing in. Wait a minute and start the game again."
             }
+            // The host asked again for up to three minutes while Steam still counted
+            // another session of this account as playing (refusal 35); it still did.
+            if result == 45 || result == 48, fields["launch-client-error"] == "35", fields["launch-session-wait"] != nil {
+                return "Steam still says this account is playing in another session. Close the game on your other device (or wait a few minutes after a closed session) and start it again."
+            }
             if result == 45 || result == 48, let error = fields["launch-client-error"].flatMap(Int.init),
                let reason = Self.launchRefusal(error, waited: result == 48) {
                 return reason
@@ -251,6 +256,7 @@ enum MadeiraDock {
             case 22, 23, 24: return "Steam could not read this game's configuration. Try again."
             case 25: return "Steam says this game is not released yet."
             case 26: return "Steam says this game is not available in your region."
+            case 35: return "Steam says this account is playing in another session. Close the game on your other device and start it again."
             default: return nil
             }
         }
@@ -265,13 +271,13 @@ enum MadeiraDock {
         "session-native-token-submitted", "session-logon-start-result", "session-connection-result",
         "session-authenticated-online", "session-requested-app-listed", "session-auth-test-result",
         "launch-client-error", "launch-update-wait", "launch-update-retry", "launch-update-ready",
-        "launch-config-wait", "launch-config-gave-up",
+        "launch-config-wait", "launch-config-gave-up", "launch-session-wait", "launch-session-gave-up",
         "ceg-request", "ceg-request-result", "ceg-request-busy", "ceg-server-result", "ceg-job-result",
         "ceg-finished-jobs", "ceg-result", "ceg-disabled", "ceg-unsupported-client",
         "ceg-scm", "ceg-scm-started", "ceg-scm-error", "ceg-service-registered", "ceg-service-install", "ceg-service-stop", "ceg-scm-stopped",
         "shutdown-begin", "shutdown-complete", "probe-result"]
     /// The host's report rounds (research/madeira-dock src/main.c).
-    static let reportRounds: Set<String> = ["ml1820", "ml1830", "ml1860", "ml1870", "ml1970", "ml1990", "ml2000", "ml2011"]
+    static let reportRounds: Set<String> = ["ml1820", "ml1830", "ml1860", "ml1870", "ml1970", "ml1990", "ml2000", "ml2011", "ml2015"]
 
     static func parseReport(_ data: Data) -> Report {
         guard data.count <= 32768, let text = String(data: data, encoding: .utf8) else { return Report() }

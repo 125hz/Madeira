@@ -29,7 +29,7 @@ them.
 ## Source and licence
 
 - Source: the `research/madeira-dock` submodule
-  (`https://github.com/125hz/madeira-dock`, pinned at `412063f`), about 1,700 lines of
+  (`https://github.com/125hz/madeira-dock`, pinned at `0c5bbd1`), about 1,850 lines of
   C. Copyright 2026 125hz, **GPL-3.0-or-later with the Madeira
   Converter Exception** (the owner open-sourced it on 2026-09-27; it used to
   be a closed executable).
@@ -117,6 +117,13 @@ arguments are not supported.
    and turns the final `probe-result` into a message. Covered: unsupported
    client build, no licence, a bad transfer, Valve's own launch refusal codes,
    and per-user executable preparation errors.
+6. **Another session.** If Valve's client refuses the launch with 35 (Steam
+   still counts the account as playing in another session, which also
+   happens for a session that ended without telling Steam until its old
+   connection times out), Dock asks again every 15 s for up to three minutes
+   (`launch-session-wait`, `launch-session-gave-up`). The sheet shows the wait;
+   only Valve's own later success starts the game, and a session that is
+   really playing elsewhere still fails with its own message.
 
 If the install record lists per-user custom executables (`CheckGuid`), Dock
 asks Valve's client to prepare them before launching. `env.MADEIRA_DOCK_CEG = 0`
@@ -134,6 +141,7 @@ never asks. The preparation is Valve's; Dock does not touch the files.
 | `MADEIRA_DOCK_IMAGE_RETIRE` | on | `0`: a Dock launch does not turn on the engine's `MADEIRA_JIT_IMAGE_RETIRE` (an explicit `env.MADEIRA_JIT_IMAGE_RETIRE` still wins) |
 | `MADEIRA_DOCK_CLIENT_202601` | on | read by the host: `0` disables its January 2026 client adapter |
 | `MADEIRA_DOCK_HANDOFF_DIAGNOSTICS` | on | read by the host: `0` drops its numeric transfer diagnostics |
+| `MADEIRA_DOCK_SESSION_WAIT` | on | read by the host: `0` fails a launch refused with 35 (another session playing) at once instead of asking again for up to three minutes |
 
 ## 64-bit and runtime impact
 
