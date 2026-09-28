@@ -195,7 +195,9 @@ func jwt(_ claims: String) -> String {
         unsetenv("MADEIRA_JIT_IMAGE_RETIRE"); setenv("MADEIRA_DOCK_IMAGE_RETIRE", "0", 1); MadeiraDock.configure(alpha)
         require(env("MADEIRA_JIT_IMAGE_RETIRE") == nil, "MADEIRA_DOCK_IMAGE_RETIRE=0 leaves image retire off")
         unsetenv("MADEIRA_DOCK_IMAGE_RETIRE")
-        require(MadeiraDock.launchArguments(width: 1280, height: 720) == "/desktop=madeira,1280x720 \"C:\\windows\\system32\\dockhost.exe\"", "explorer desktop runs the host")
+        require(MadeiraDock.launchArguments(width: 1280, height: 720) == "/desktop=madeira,1280x720 C:\\windows\\system32\\dockhost.exe", "explorer desktop runs the host")
+        require(!MadeiraDock.launchArguments(width: 1280, height: 720).contains("\""), "no quotes: MADEIRA_ARGS is split at spaces and passed on as is")
+        require(!MadeiraDock.executable.contains(" "), "the host path has no spaces")
         require(MadeiraDock.handoffGuestPath(URL(fileURLWithPath: "/var/x/launch.auth")) == "\\\\?\\unix\\var\\x\\launch.auth", "transfer path through Wine's Unix namespace")
 
         if failures > 0 { print("FAILURES: \(failures)"); exit(1) }
