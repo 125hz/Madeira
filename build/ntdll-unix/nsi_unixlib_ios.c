@@ -47,6 +47,7 @@
 #include "tcpmib.h"
 #include "wine/nsi.h"
 #include "wine/server.h"
+#include "wine/unixlib.h"   /* ios_wow_host_ptr() for the wow64 table below */
 
 /* NPI_MS_TCP_MODULEID (netiodef.h declares it extern; the defining
  * translation unit lives in nsiproxy.sys which we don't build) */
@@ -222,4 +223,65 @@ static NTSTATUS ios_nsi_enumerate_all_ex( void *args )
 const void *nsi_unix_call_funcs[] =
 {
     (const void *)ios_nsi_enumerate_all_ex,
+};
+
+/* The 32-bit counterpart.  A 32-bit nsi.dll passes a struct
+ * nsi_enumerate_all_ex whose pointer members are 4 bytes wide.  `args` itself
+ * is already a HOST pointer (the WoW64 module converts that one outer
+ * pointer); every pointer EMBEDDED in the block is a GUEST address and needs
+ * + B (ios_wow_host_ptr, NULL-preserving).  The row buffers are the caller's
+ * own, allocated inside its guest window.  count is in/out. */
+typedef ULONG PTR32;
+
+struct nsi_enumerate_all_ex32
+{
+    PTR32 unknown[2];
+    PTR32 module;
+    ULONG table;
+    UINT  first_arg;
+    UINT  second_arg;
+    PTR32 key_data;
+    UINT  key_size;
+    PTR32 rw_data;
+    UINT  rw_size;
+    PTR32 dynamic_data;
+    UINT  dynamic_size;
+    PTR32 static_data;
+    UINT  static_size;
+    ULONG count;
+};
+
+static NTSTATUS ios_wow64_nsi_enumerate_all_ex( void *args )
+{
+    struct nsi_enumerate_all_ex32 *params32 = args;
+    struct nsi_enumerate_all_ex params;
+    NTSTATUS status;
+
+    if (!params32) return STATUS_INVALID_PARAMETER;
+
+    params.unknown[0]   = ios_wow_host_ptr( params32->unknown[0] );
+    params.unknown[1]   = ios_wow_host_ptr( params32->unknown[1] );
+    params.module       = ios_wow_host_ptr( params32->module );
+    params.table        = params32->table;
+    params.first_arg    = params32->first_arg;
+    params.second_arg   = params32->second_arg;
+    params.key_data     = ios_wow_host_ptr( params32->key_data );
+    params.key_size     = params32->key_size;
+    params.rw_data      = ios_wow_host_ptr( params32->rw_data );
+    params.rw_size      = params32->rw_size;
+    params.dynamic_data = ios_wow_host_ptr( params32->dynamic_data );
+    params.dynamic_size = params32->dynamic_size;
+    params.static_data  = ios_wow_host_ptr( params32->static_data );
+    params.static_size  = params32->static_size;
+    params.count        = params32->count;
+
+    status = ios_nsi_enumerate_all_ex( &params );
+
+    params32->count = (ULONG)params.count;
+    return status;
+}
+
+const void *nsi_unix_call_wow64_funcs[] =
+{
+    (const void *)ios_wow64_nsi_enumerate_all_ex,
 };
