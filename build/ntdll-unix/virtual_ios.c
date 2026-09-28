@@ -10224,6 +10224,62 @@ static void unregister_view( struct file_view *view )
 
 
 /***********************************************************************
+ *           ios_jit_retire_image
+ *
+ * Opt-in (MADEIRA_JIT_IMAGE_RETIRE=1, or env.MADEIRA_JIT_IMAGE_RETIRE = 1 in
+ * madeira.cfg; off by default). FreeLibrary can release an image and the
+ * loader can then map a DIFFERENT image of the same size at the same base.
+ * mprotect_exec's already-copied check matches on the PE range and the MZ
+ * header's SizeOfImage, so it accepts the unloaded module's pool copy and the
+ * new module runs the old module's translated code. Tombstone every pool
+ * mapping that overlaps the unmapped range before the VA can be reused, so
+ * the next image mapped there gets a fresh copy. The pool bytes themselves
+ * stay in the process ledger (recycling executable bytes here would race
+ * laggard readers); the tombstone write order is the one ios_jit_add_mapping
+ * and ios_jit_reclaim_process use. Called with virtual_mutex held; takes
+ * ios_pool_lock, which never waits for virtual_mutex.
+ * Not to be confused with MADEIRA_NO_IMAGE_RETIRE (ml988 generation handoff).
+ */
+static int ios_jit_image_retire_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        const char *env = getenv( "MADEIRA_JIT_IMAGE_RETIRE" );
+        enabled = env && env[0] == '1' && !env[1];
+        if (enabled) dprintf( 2, "[jit-image-retire] enabled\n" );
+    }
+    return enabled;
+}
+
+static void ios_jit_retire_image( void *base, size_t size )
+{
+    uintptr_t start = (uintptr_t)base;
+    int i, retired = 0;
+    static unsigned int reports;
+
+    if (!size) return;
+    pthread_mutex_lock( &ios_pool_lock );
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uintptr_t mapped = (uintptr_t)ios_jit_mappings[i].pe_base;
+        size_t length = ios_jit_mappings[i].size;
+        if (!mapped || !length) continue;
+        /* Subtraction avoids overflowing either end of an address interval. */
+        if (mapped >= start ? mapped - start >= size : start - mapped >= length) continue;
+        ios_jit_mappings[i].size = 0;
+        __sync_synchronize();
+        ios_jit_mappings[i].pe_base = NULL;
+        retired++;
+    }
+    pthread_mutex_unlock( &ios_pool_lock );
+    if (retired && __atomic_fetch_add( &reports, 1, __ATOMIC_RELAXED ) < 32)
+        dprintf( 2, "[jit-image-retire] unmapped=%p size=%#lx translations=%d\n",
+                 base, (unsigned long)size, retired );
+}
+
+
+/***********************************************************************
  *           delete_view
  *
  * Deletes a view. virtual_mutex must be held by caller.
@@ -10233,6 +10289,8 @@ static void delete_view( struct file_view *view ) /* [in] View */
     /* ml989: entered BEFORE any field of `view` is read, so "call never
      * entered" is distinguishable from "died reading the view". */
     if (ios_retire_trace_armed) ios_retire_mark( "D0>\n" );
+    if ((view->protect & SEC_IMAGE) && ios_jit_image_retire_enabled())
+        ios_jit_retire_image( view->base, view->size );
     ios_swap_release_range( view->base, view->size, 0 );   /* ml1077 */
     if (!(view->protect & VPROT_SYSTEM)) unmap_area( view->base, view->size );
     if (ios_retire_trace_armed) ios_retire_mark( "D1u\n" );   /* unmap_area done */
