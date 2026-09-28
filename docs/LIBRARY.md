@@ -43,8 +43,8 @@ Removing an entry never removes the game's files or saves.
 - **Settings**: JIT and memory status, Enable JIT, extended logging, pointer
   mode (Absolute, Relative or Touch) and touch sensitivity, **Display** (hold
   the display at its maximum rate, off by default), **Memory & sync** (swap tier
-  Off/1/2/4 GB, off by default; Madsync, on by default) and the interface
-  switch. Display applies from the next session or FPS limit change; Memory &
+  Off/1/2/4 GB, off by default; Madsync, on by default), the interface
+  switch and **Credits** (the last section). Display applies from the next session or FPS limit change; Memory &
   sync after a restart. They write `env.MADEIRA_PROMOTE`, `swap-mb` and
   `inproc-sync` in `Documents/madeira.cfg`, keeping every other line.
 
@@ -86,7 +86,8 @@ Play applies the profile and runs the same `runWineFullSequence` as the
 developer interface's buttons. The game is shown full screen in either
 orientation. A starting screen with the game's cover stays until the first
 frames arrive (Metal presents or a desktop surface); after 30 seconds it offers
-**Show game view**, and **Show live log** shows the most recent log lines.
+**Show game view**. A row of round glyph-only buttons (their words are
+VoiceOver labels) holds **Show live log**, which shows the most recent log lines.
 
 The small menu button (drag to move; it fades after three seconds) opens the
 in-game menu:

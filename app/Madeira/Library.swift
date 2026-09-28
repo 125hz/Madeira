@@ -911,15 +911,20 @@ struct LibraryView: View {
                 DisplayRateSettings()
                 RuntimeMemorySyncSettings()
             }
-            Section("Library") {
-                Text("Add complete application folders to Madeira/wine/drive_c using Files. Display, frame limit, and compatibility options are saved per game.")
-            }
             Section {
                 Toggle("Use developer interface", isOn: Binding(get: { developerUI }, set: { on in
                     developerUI = on; FrontendChoice.choose(new: !on); restartNotice = true
                 }))
             } header: { Text("Interface") } footer: {
                 Text("The developer interface is Madeira's original diagnostic screen. The change applies after Madeira restarts.")
+            }
+            // Credits, last on the Settings page.
+            Section {
+                MadeiraCredit(name: "Will Faust", handle: "willfaust", role: "Created Madeira")
+                MadeiraCredit(name: "Nick", handle: "125hz", role: "32-bit game support, the game library and Madeira Dock")
+                MadeiraCredit(name: "Jfishin", handle: "Jfishin", role: "The original native Steam sign-in, library and downloads")
+            } header: { Text("Credits") } footer: {
+                Text("Madeira is built on Wine, FEX-Emu, DXMT by Feifan He (3Shain) with the Direct3D 9 frontend by David Acevedo (dacevedo12), rpmalloc by Mattias Jansson, and StikDebug for enabling JIT. Thank you to everyone who contributes to these projects.")
             }
         }
         .alert("Restart Madeira", isPresented: $restartNotice) {
@@ -1291,6 +1296,26 @@ struct DisplayRateSettings: View {
     }
 }
 
+/// One row of Settings › Credits: a person, their GitHub account and what they did.
+struct MadeiraCredit: View {
+    let name: String
+    let handle: String
+    let role: String
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Text(name).font(.body.weight(.semibold))
+                if let url = URL(string: "https://github.com/\(handle)") {
+                    Link("@\(handle)", destination: url).font(.subheadline)
+                }
+            }
+            Text(role).font(.subheadline).foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
+    }
+}
+
 /// Settings for the file-backed swap tier (madeira.cfg swap-mb, off by default) and
 /// the in-process sync engine madsync (madeira.cfg inproc-sync, on by default). Both are
 /// read when Madeira starts, so changes apply after a restart.
@@ -1510,9 +1535,14 @@ struct LibraryHUD: View {
                             .font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.4))
                     }
                 }
-                Button(showLogs ? "Hide live log" : "Show live log", systemImage: "text.alignleft") {
-                    model.toggleLaunchLogs()
-                }.buttonStyle(.bordered).tint(.white).frame(minHeight: 44)
+                // The starting screen's controls are one row of glyph-only buttons, so a
+                // short screen does not push them below the fold. The words stay as
+                // VoiceOver labels.
+                HStack(spacing: 14) {
+                    launchGlyph(showLogs ? "Hide live log" : "Show live log", "text.alignleft", on: showLogs) {
+                        model.toggleLaunchLogs()
+                    }
+                }
                 if model.launchSlow {
                     Button("Show game view") { model.showGameView(reason: "button") }.frame(minHeight: 44)
                 }
@@ -1529,6 +1559,18 @@ struct LibraryHUD: View {
         }
         .frame(width: geo.size.width, height: available)
         .padding(.top, geo.safeAreaInsets.top).foregroundStyle(.white).transition(.opacity)
+    }
+    /// A round glyph button for the starting screen's control row.
+    private func launchGlyph(_ label: String, _ symbol: String, on: Bool = false,
+                             action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol).font(.system(size: 19, weight: .semibold))
+                .frame(width: 46, height: 46)
+                .background(Circle().fill(Color.white.opacity(on ? 0.32 : 0.16)))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain).foregroundStyle(.white)
+        .accessibilityLabel(label)
     }
 
     private var menu: some View {

@@ -19,8 +19,10 @@ exit report.
    cap is detected; the app wires the library into ContentView and
    GamepadInput; game details offer Resolution (with Screen shape) for every
    entry, Aspect & scaling and control opacity/size; the in-game menu offers
-   Aspect & scaling, opacity, size and the Touch pointer mode; and a session
-   saves those choices to the game.
+   Aspect & scaling, opacity, size and the Touch pointer mode; a session
+   saves those choices to the game; the starting screen's controls are one row
+   of glyph-only buttons with VoiceOver labels; and Settings ends with Credits
+   and no longer carries the drive_c note.
 
 Run from anywhere; needs `swift` and `cc` on PATH.
 """
@@ -327,5 +329,28 @@ check('GameSurfaceLayout.rect(' in content and 'GameSurfaceLayout.map(' in conte
 check('if touchPointerMode { touchModeBegan(touches); return }' in content, 'the game view handles the Touch pointer mode')
 check('TouchControlsModel.diameter(control)' in content and 'library.opacity' in content,
       "touch controls follow the session's size and opacity")
+
+# Owner requests: the starting screen's glyph row, Settings credits last, no drive_c note.
+launch = block(hud, 'private func launchView(')
+glyph = block(hud, 'private func launchGlyph(')
+row = block(launch, 'HStack(spacing: 14)')
+check('launchGlyph(showLogs ? "Hide live log" : "Show live log", "text.alignleft", on: showLogs)' in row
+      and 'Button(showLogs ?' not in launch,
+      'starting screen: the live-log control is a glyph in one row')
+check('Image(systemName: symbol)' in glyph and '.accessibilityLabel(label)' in glyph and 'Text(' not in glyph
+      and 'Circle()' in glyph, 'starting screen: glyph buttons show no text and keep their words as VoiceOver labels')
+settings = block(lib, 'private var settings: some View')
+form = block(settings, 'Form {')
+last = form[[m.start() for m in re.finditer(r'\bSection\b', form)][-1]:]
+check('header: { Text("Credits") }' in last and form.count('Text("Credits")') == 1,
+      'Settings: Credits is the last section')
+for who in ('name: "Will Faust", handle: "willfaust"', 'name: "Nick", handle: "125hz"',
+            'name: "Jfishin", handle: "Jfishin"'):
+    check('MadeiraCredit(' + who in last, 'Settings credits: ' + who)
+check('https://github.com/\\(handle)' in block(lib, 'struct MadeiraCredit: View'),
+      'a credit links the GitHub account')
+check('complete application folders' not in lib and 'Section("Library")' not in settings,
+      'Settings: the drive_c note is removed')
+
 print('check-frontend:', 'FAIL' if failures else 'PASS')
 sys.exit(1 if failures else 0)
