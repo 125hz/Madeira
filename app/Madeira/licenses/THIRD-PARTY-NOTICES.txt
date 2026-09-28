@@ -14,6 +14,12 @@ Statically linked into the application binary:
 - DXMT (fork): MIT (DXMT-MIT.txt); Madeira's modifications GPL-3.0-or-later
   with the exception. Bundled LLVM: Apache-2.0 with LLVM exception
   (LLVM-Apache-2.0-with-exception.txt).
+  DXMT's Direct3D 9 frontend and DXSO shader translator, written by David
+  Acevedo and imported from dacevedo12/dxmt tag v0.4-d3d9 (that tree's
+  licence notice: Copyright (c) 2023-2026 Feifan He for CodeWeavers):
+  LGPL-2.1-or-later (LGPL-2.1.txt), kept under
+  LGPL-2.1-or-later as received. Source: the research/dxmt submodule of the
+  Madeira repository; its LICENSE-MADEIRA.md lists the imported files.
 - GnuTLS 3.8.9: LGPL-2.1-or-later (LGPL-2.1.txt).
 - Nettle 3.10.1 and Hogweed 3.10.1: dual-licensed LGPL-3.0-or-later /
   GPL-2.0-or-later; Madeira elects LGPL-3.0-or-later (LGPL-3.0.txt).
