@@ -963,6 +963,8 @@ struct LibraryView: View {
                         .id(LibraryEntry.desktopID)
                         .overlay(RoundedRectangle(cornerRadius: 22).stroke(focused == LibraryEntry.desktopID && controller.connected ? Color.cyan : .clear, lineWidth: 3))
                 }
+                // Installed Steam games, started through Madeira Dock (SteamGames.swift).
+                SteamGamesSection(search: search, startDock: startDock)
                 if model.entries.filter({ $0.desktop != true }).isEmpty {
                     ContentUnavailableView("Make yourself at home", systemImage: "gamecontroller", description: Text("Copy a game's folder into Madeira › wine › drive_c with the Files app, then tap + and choose its .exe."))
                 } else {

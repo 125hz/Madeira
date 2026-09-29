@@ -154,8 +154,22 @@ here runs as a library session: full-screen view, starting screen, in-game
 menu, and the one-session-per-run rule. That session is not added to the
 library.
 
-Log tag: `[onboarding]` (`shown reason=… steps=…`, `step=…`, `done`,
-`skipped`). No account name, token or path is logged.
+**Steam games in the library** (`app/Madeira/SteamGames.swift`). When Madeira
+Dock is available, the library shows a **Steam** section above the games you
+added: the games Steam's client has installed in the prefix, exactly as Dock's
+own discovery finds them (`appmanifest_<appid>.acf` in `C:\Program Files
+(x86)\Steam\steamapps` and the other C: libraries its `libraryfolders.vdf`
+lists). The section follows the library's search and collapses like the games
+section. Artwork comes from Steam's public store CDN by App ID. A game opens a
+sheet with **Play**, which goes through Dock's launch path with Dock's
+per-launch pool toggle, as a library session. Play is offered only for a game
+Steam marks fully installed, with Valve's client components present and a
+Steam sign-in. The section reads install records only; it never writes Steam
+files. Controller focus does not reach it yet.
+
+Log tags: `[onboarding]` (`shown reason=… steps=…`, `step=…`, `done`,
+`skipped`) and `[steam-games]` (counts and App IDs). No account name, token or
+path is logged.
 
 ## Controllers
 
@@ -209,3 +223,6 @@ in-game menu options), `build/host-tests/check-runtime-settings.py`
 without Dock, the done key, the `MADEIRA_ONBOARDING` switch, and the wiring
 (no Wine session, no pool or engine switch, sign-in and Dock only through
 their public pieces).
+`build/host-tests/check-steam-games.py` covers the library's Steam section: Dock's
+discovery on a synthetic drive_c laid out as Steam writes it, the section,
+search, Play and artwork rules, and that Play uses only Dock's launch path.
