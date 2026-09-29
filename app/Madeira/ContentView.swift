@@ -2894,7 +2894,7 @@ struct ContentView: View {
         MadeiraDock.requestLaunch(compactPool: compactPool)
         logStore.log("[madeira-dock] starting the host for app \(game.id); Valve's client authenticates and authorizes the launch")
         MadeiraDockModel.shared.watchReport()
-        if inLibrary { library.begin(.dockSession(title: game.name, width: width, height: height), remember: false) }
+        if inLibrary { library.begin(.dockSession(title: game.name, width: width, height: height), remember: false, dock: game) }
         runWineFullSequence()
     }
 

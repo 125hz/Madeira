@@ -123,12 +123,12 @@ require('LibraryView(play: launchLibraryEntry, enableJIT: enableJITViaStikDebug,
         "ContentView hands Dock's start to the library")
 held = start.index('LibraryModel.sessionsThisRun > 0, MadeiraConfig.flag("MADEIRA_ONE_SESSION_PER_RUN")')
 require(held < start.index('MadeiraDock.writeHandoff('), 'a held Dock start writes no sign-in transfer')
-require('if inLibrary { library.begin(.dockSession(title: game.name, width: width, height: height), remember: false) }' in start
+require('if inLibrary { library.begin(.dockSession(title: game.name, width: width, height: height), remember: false, dock: game) }' in start
         and start.index('library.begin(') < start.index('runWineFullSequence()'),
         'a Dock start from the library is an unsaved library session')
 require(start.count('runWineFullSequence(') == 1 and 'runWineFullSequence()' in start,
         "Dock's launch path is unchanged (no library profile applied over its environment)")
-begin = block(library, 'func begin(_ entry: LibraryEntry, remember: Bool = true)')
+begin = block(library, 'func begin(_ entry: LibraryEntry, remember: Bool = true, dock: DockGame? = nil)')
 require('if remember { var played = entry; played.lastPlayed = Date(); save(played) }' in begin,
         'begin(remember: false) neither adds nor stamps an entry')
 dock_entry = block(onboarding, 'static func dockSession(')
