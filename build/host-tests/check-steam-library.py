@@ -9,7 +9,8 @@ or the openssl command, and libssl/liblzma/zlib development files.
 
 Part A is static: licence headers, the Xcode project, no program names, the
 only token path (SteamSignIn's Keychain item), no account data in a log line, no
-engine, pool or Info.plist change, and that the sources do not say they are
+engine or pool change, Info.plist permitting only the background download task,
+and that the sources do not say they are
 ports of another project.
 
 Part B builds the production Swift (protocol messages, message codec, app-info
@@ -131,6 +132,9 @@ for path in library_swift:
     for word in ['helperNames', 'steamwebhelper', 'steam.exe', 'setenv(', 'unsetenv(', 'runWineFullSequence', 'MADEIRA_EXE',
                  'MADEIRA_ARGS', 'jit_', 'JITPool', 'poolSize', 'FEX_', 'DXMT', 'BGTaskScheduler', 'BGContinuedProcessing',
                  'UNUserNotificationCenter', 'SteamKit2', 'JavaSteam', 'DepotDownloader\'s', 'port of the DepotDownloader']:
+        # Background downloads and their notifications live in one file (SteamDownloadBackground.swift).
+        if path == 'SteamDownloadBackground.swift' and word in ('BGTaskScheduler', 'BGContinuedProcessing', 'UNUserNotificationCenter'):
+            continue
         require(word not in text, f'{path}: no {word}')
     require(not re.search(r'\bml\d{3,4}\b', text), f'{path}: no build-round labels')
     for line in text.splitlines():
@@ -140,7 +144,21 @@ for path in library_swift:
 require('MadeiraConfig' not in sources['SteamOwnedLibrary.swift'] and 'SteamSignIn.flag("MADEIRA_STEAM_LIBRARY", default: true)' in sources['SteamOwnedLibrary.swift'],
         'one switch, MADEIRA_STEAM_LIBRARY, on by default')
 info = (app / 'Info.plist').read_text()
-require('BGTaskSchedulerPermittedIdentifiers' not in info and 'UIBackgroundModes' not in info, 'Info.plist has no background mode or task identifier')
+permitted = re.findall(r'<key>BGTaskSchedulerPermittedIdentifiers</key>\s*<array>(.*?)</array>', info, re.S)
+require(len(permitted) == 1 and re.findall(r'<string>([^<]*)</string>', permitted[0]) == ['$(PRODUCT_BUNDLE_IDENTIFIER).download.*'],
+        "Info.plist permits one task identifier family, the bundle's own .download.* (background downloads)")
+require('UIBackgroundModes' not in info, 'Info.plist asks for no background mode')
+background = sources['SteamDownloadBackground.swift']
+require('hasSuffix(".download.*")' in background and '+ "queue"' in background and 'BGContinuedProcessingTaskRequest(identifier: identifier' in background,
+        'the continued-processing task uses the permitted identifier, made concrete')
+require('SteamSignIn.flag("MADEIRA_BACKGROUND_DOWNLOADS", default: true)' in background and
+        'SteamSignIn.flag("MADEIRA_DOWNLOAD_NOTIFICATIONS", default: true)' in background,
+        'background downloads and notifications each have a switch, on by default')
+require('if #available(iOS 26.0, *), Self.continuedEnabled { submitContinued() }' in background and 'beginBackgroundTask(' in background
+        and 'pauseForBackground()' in background, 'iOS 26 continues in the background; otherwise the grace period ends in a clean pause')
+owned_text = sources['SteamOwnedLibrary.swift']
+require('SteamDownloadBackground.shared.downloadStarted(appID: appID' in owned_text and 'SteamDownloadBackground.shared.progress(progress)' in owned_text
+        and 'outcome: outcome, queueEmpty: queue.isEmpty)' in owned_text, 'every download reports its start, progress and outcome')
 content_view = (app / 'ContentView.swift').read_text()
 require(content_view.count('SteamOwnedLibrary.shared.sessionChanged(active: true)') == 1,
         'a session start pauses downloads and closes the Steam connection (one call, in runWineFullSequence)')

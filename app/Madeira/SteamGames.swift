@@ -497,7 +497,7 @@ struct SteamGameSheet: View {
         }
     }
 
-    static let downloadNote = "Games download directly from Steam with your account into C:\\Program Files (x86)\\Steam\\steamapps\\common. Keep Madeira open while it downloads: it pauses shortly after you leave, and while a game is running, and continues when you return."
+    static let downloadNote = "Games download directly from Steam with your account into C:\\Program Files (x86)\\Steam\\steamapps\\common. You can leave Madeira while it downloads: on iOS 26 and later iOS shows the download's progress and keeps it going; on earlier versions it pauses after a short while and continues when you return. A download pauses while a game is running and continues afterwards."
 
     @ViewBuilder private func primaryAction(_ item: SteamGamesRules.Item) -> some View {
         if let installed = item.installed {

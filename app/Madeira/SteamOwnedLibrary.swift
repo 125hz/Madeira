@@ -442,7 +442,7 @@ final class SteamOwnedLibrary: ObservableObject {
         guard active == nil, !inSession, !queue.isEmpty else { return }
         let appID = queue.removeFirst()
         downloads[appID]?.state = .active
-        SteamDownloadBackground.shared.downloadStarted()
+        SteamDownloadBackground.shared.downloadStarted(appID: appID, name: game(appID)?.name ?? "Steam game")
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             await self.run(appID)
@@ -451,6 +451,7 @@ final class SteamOwnedLibrary: ObservableObject {
     }
 
     private func run(_ appID: Int) async {
+        var outcome = SteamDownloadBackground.Outcome.paused
         do {
             guard let info = try await fetcher.fetchInstallInfo(appID: UInt32(appID)) else {
                 throw SteamError.appInfoNotFound(UInt32(appID))
@@ -459,6 +460,7 @@ final class SteamOwnedLibrary: ObservableObject {
             let folder = try await downloader.install(info, steamApps: Self.steamApps,
                                                       ownedDepots: { [weak self] in try? await self?.fetcher.ownedDepotIDs() }) { [weak self] progress in
                 self?.downloads[appID]?.progress = progress
+                SteamDownloadBackground.shared.progress(progress)
             }
             downloads[appID] = nil
             // The install record is written last: the game is now "installed" for Dock, and it
@@ -468,6 +470,7 @@ final class SteamOwnedLibrary: ObservableObject {
                                                      customExecutables: false), title: info.name)
             SteamLog.event("[steam-depot] library entry app=\(appID)")
             SteamGamesModel.shared.refresh()
+            outcome = .completed
         } catch {
             if Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
                 if downloads[appID] != nil { downloads[appID]?.state = .paused }
@@ -475,13 +478,16 @@ final class SteamOwnedLibrary: ObservableObject {
             } else if case SteamError.logonDenied = error {
                 downloads[appID]?.state = .failed(SteamSignIn.message(error))
                 handleSessionError(error, context: "depot")
+                outcome = .failed(SteamSignIn.message(error))
             } else {
                 downloads[appID]?.state = .failed(SteamSignIn.message(error))
                 SteamLog.event("[steam-depot] failed app=\(appID) reason=\(Self.reason(error))")
+                outcome = .failed(SteamSignIn.message(error))
             }
         }
         active = nil
-        SteamDownloadBackground.shared.downloadEnded(queueEmpty: queue.isEmpty)
+        SteamDownloadBackground.shared.downloadEnded(appID: appID, name: game(appID)?.name ?? "Steam game",
+                                                     outcome: outcome, queueEmpty: queue.isEmpty)
         pump()
     }
 
