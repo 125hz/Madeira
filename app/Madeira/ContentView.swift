@@ -1162,6 +1162,11 @@ struct MadeiraMetalView: UIViewRepresentable {
 }
 
 struct ContentView: View {
+    /// iOS 26 and later blur content under the navigation bar themselves.
+    private static var systemScrollEdge: Bool {
+        if #available(iOS 26.0, *) { return true }
+        return false
+    }
     @State private var devSheet: SettingsSheet?
     @StateObject private var logStore = LogStore.shared
     @State private var jitStatus: JITStatus = .unknown
@@ -1215,7 +1220,11 @@ struct ContentView: View {
             .navigationTitle("Madeira")
             .navigationBarTitleDisplayMode(.inline)
             .toolbarBackground(.regularMaterial, for: .navigationBar)
-            .toolbarBackground(library.enabled ? .visible : .automatic, for: .navigationBar)
+            // The library keeps a material bar only before iOS 26. From iOS 26 the
+            // system draws its soft scroll edge effect instead: content scrolls
+            // under the title, the buttons and the search field behind a
+            // progressive blur (as in the App Store), with no hard edge.
+            .toolbarBackground(library.enabled && !Self.systemScrollEdge ? .visible : .automatic, for: .navigationBar)
             .navigationBarHidden(library.enabled ? library.current != nil : vSizeClass == .compact)
             // A second session cannot start in this process; offer to close Madeira.
             .alert("Restart Madeira", isPresented: Binding(get: { library.restartNotice != nil },

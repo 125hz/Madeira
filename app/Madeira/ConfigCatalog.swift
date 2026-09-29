@@ -182,3 +182,49 @@ struct ConfigOptionRow: View {
         }
     }
 }
+
+/// Settings search: the All settings options that match, editable in place.
+/// The options with a row of their own in Settings › Memory & sync are left out.
+struct SettingsSearchResults: View {
+    let query: String
+    /// Bumped when a Settings sheet closes, so the rows re-read madeira.cfg.
+    var refresh = 0
+    @State private var values: [String: String] = MadeiraConfig.all()
+    private static let limit = 60
+
+    private var hits: [ConfigOption] {
+        ConfigCatalog.generated.filter { o in
+            !RuntimeMemorySyncSettings.featuredKeys.contains(o.key)
+                && [o.key, o.title, o.note, o.category].contains { $0.localizedCaseInsensitiveContains(query) }
+        }
+    }
+    private func binding(_ key: String) -> Binding<String?> {
+        Binding(get: { values[key] }, set: { new in
+            let v = new?.trimmingCharacters(in: .whitespaces)
+            let stored = (v?.isEmpty ?? true) ? nil : v
+            guard stored != values[key] else { return }
+            MadeiraConfig.set(key, stored)
+            values = MadeiraConfig.all()
+            LogStore.shared.log("[settings-search] \(key) = \(stored ?? "(default)")")
+        })
+    }
+
+    var body: some View {
+        let hits = self.hits
+        Section {
+            if hits.isEmpty {
+                Text("No other options match \u{201C}\(query)\u{201D}.").foregroundStyle(.secondary)
+            }
+            ForEach(hits.prefix(Self.limit)) { ConfigOptionRow(option: $0, value: binding($0.key)) }
+        } header: {
+            Text(hits.isEmpty ? "Options" : "Options (\(hits.count))")
+        } footer: {
+            if hits.count > Self.limit {
+                Text("Showing \(Self.limit) of \(hits.count). Refine the search, or open All settings.")
+            } else if !hits.isEmpty {
+                Text("Most options are read when Madeira starts: close it from the app switcher after a change.")
+            }
+        }
+        .onChange(of: refresh) { _, _ in values = MadeiraConfig.all() }
+    }
+}

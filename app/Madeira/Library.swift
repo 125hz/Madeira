@@ -728,41 +728,284 @@ enum LibraryRendererBadge {
     }
 }
 
-// UIKit owns the entire hit region and tracking sequence. No SwiftUI button
-// gaps: hold and slide across the native segments to change tabs.
-private struct LibraryTabControl: UIViewRepresentable {
-    @Binding var selection: Int
+/// "Madeira" as a large title at the leading edge of the navigation bar, on the
+/// row of the toolbar buttons (the system large title would sit on a row of its
+/// own below them), in the large title font, with no Liquid Glass capsule
+/// behind it on iOS 26. LibraryHeaderAlignment lines its first letter up with
+/// the search field below.
+struct LibraryLargeTitle: ToolbarContent {
+    var body: some ToolbarContent {
+        if #available(iOS 26.0, *) {
+            ToolbarItem(placement: .topBarLeading) { LibraryTitleText() }.sharedBackgroundVisibility(.hidden)
+        } else {
+            ToolbarItem(placement: .topBarLeading) { LibraryTitleText() }
+        }
+    }
+}
+
+/// The title, then a bolt for JIT: a thin outline in the title's colour until
+/// the debugger is attached, then filled in the accent colour (LibraryJITState;
+/// the SF Symbols replace effect animates the change).
+/// The bolt is as tall as the title's capitals and centred on them: an SF
+/// Symbol at the title's own size is nearly twice the height of its M.
+struct LibraryTitleText: View {
+    @ObservedObject private var alignment = LibraryHeaderAlignment.shared
+    @ObservedObject private var jitState = LibraryJITState.shared
+    var body: some View {
+        let jit = jitState.enabled
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(LibraryHeaderAlignment.title).accessibilityAddTraits(.isHeader)
+            Image(systemName: jit ? "bolt.fill" : "bolt")
+                .font(.system(size: LibraryHeaderAlignment.titleFont().pointSize * 0.53, weight: .thin))
+                .foregroundStyle(jit ? Color.accentColor : Color.primary)
+                .contentTransition(.symbolEffect(.replace))
+                .alignmentGuide(.firstTextBaseline) { d in d.height / 2 + LibraryHeaderAlignment.titleFont().capHeight / 2 }
+                .accessibilityLabel(jit ? "JIT enabled" : "JIT not enabled")
+        }
+        .font(.largeTitle.bold())
+        .fixedSize()
+        .offset(x: alignment.shift)
+        .background(LibraryTitleAnchor())   // after the offset: marks where the text is laid out
+    }
+}
+
+/// Whether JIT is available (the debugger is attached), checked every 2 s like
+/// LibraryStatus. Shared by the title's bolt and the Enable JIT buttons, which
+/// are disabled once it is.
+final class LibraryJITState: ObservableObject {
+    static let shared = LibraryJITState()
+    @Published private(set) var enabled = jit_check_debugged()
+    private var timer: Timer?
+    private init() {
+        let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
+        RunLoop.main.add(timer, forMode: .common)   // keeps ticking while a list scrolls
+        self.timer = timer
+    }
+    func refresh() {
+        let now = jit_check_debugged()
+        guard now != enabled else { return }
+        withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .default) { enabled = now }
+    }
+}
+
+/// Lines the large title's first letter up with the search field below it. The
+/// navigation bar's leading inset differs between iOS versions (the title sat
+/// 4 pt inside the field on iOS 26.2 and level with its edge on iOS 27, before
+/// the glyph's own side bearing), so the offset is measured: the field's leading
+/// edge and the title's frame, both in window coordinates, less the side
+/// bearing of the title's first glyph. Checked in the iOS 26.2 and iOS 27
+/// simulators: the M starts on the field's edge to the pixel on both.
+final class LibraryHeaderAlignment: ObservableObject {
+    static let shared = LibraryHeaderAlignment()
+    static let title = "Madeira"
+    @Published private(set) var shift: CGFloat = 0
+    weak var field: UIView?
+    weak var anchor: UIView?
+    private var pending = false
+
+    /// Called from layout passes; measures once they have finished, when the
+    /// search field and the title are both at their final positions.
+    func update() {
+        guard !pending else { return }
+        pending = true
+        DispatchQueue.main.async { self.pending = false; self.measure(retries: 0) }
+    }
+    private func measure(retries: Int) {
+        guard let field, let anchor, let window = field.window, anchor.window === window else { return }
+        guard field.bounds.width > 0, anchor.bounds.width > 0 else {   // not laid out yet
+            if retries < 20 { DispatchQueue.main.async { self.measure(retries: retries + 1) } }
+            return
+        }
+        let fieldX = field.convert(field.bounds, to: nil).minX
+        let titleX = anchor.convert(anchor.bounds, to: nil).minX
+        let scale = window.screen.scale
+        let target = ((fieldX - titleX - Self.inkInset()) * scale).rounded() / scale
+        if abs(target - shift) > 0.01 { shift = target }
+    }
+
+    /// The title's font: the large title style, bold, at the current text size.
+    static func titleFont() -> UIFont {
+        let base = UIFontDescriptor.preferredFontDescriptor(withTextStyle: .largeTitle)
+        return UIFont(descriptor: base.withSymbolicTraits(.traitBold) ?? base, size: 0)
+    }
+
+    /// How far the first glyph's ink starts right of the text's origin, in the
+    /// title's font.
+    static func inkInset() -> CGFloat {
+        let font = titleFont() as CTFont
+        guard var unit = title.utf16.first else { return 0 }
+        var glyph: CGGlyph = 0
+        guard CTFontGetGlyphsForCharacters(font, &unit, &glyph, 1) else { return 0 }
+        var rect = CGRect.zero
+        CTFontGetBoundingRectsForGlyphs(font, .horizontal, &glyph, &rect, 1)
+        return rect.minX
+    }
+}
+
+/// Marks where the title's text is laid out (before its alignment offset).
+struct LibraryTitleAnchor: UIViewRepresentable {
+    func makeUIView(context: Context) -> Anchor { Anchor() }
+    func updateUIView(_ view: Anchor, context: Context) {}
+    final class Anchor: UIView {
+        override init(frame: CGRect) { super.init(frame: frame); isUserInteractionEnabled = false }
+        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+        override func didMoveToWindow() { super.didMoveToWindow(); report() }
+        override func layoutSubviews() { super.layoutSubviews(); report() }
+        private func report() {
+            guard window != nil else { return }
+            LibraryHeaderAlignment.shared.anchor = self
+            LibraryHeaderAlignment.shared.update()
+        }
+    }
+}
+
+/// A search controller whose bar reports its layout to LibraryHeaderAlignment.
+final class ReportingSearchController: UISearchController {
+    private lazy var reportingBar = ReportingSearchBar()
+    override var searchBar: UISearchBar { reportingBar }
+}
+final class ReportingSearchBar: UISearchBar {
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        LibraryHeaderAlignment.shared.field = searchTextField
+        LibraryHeaderAlignment.shared.update()
+    }
+}
+
+/// The library's search field: the system search bar (Liquid Glass on iOS 26),
+/// stacked under the navigation bar at full width, with the Madeira title and
+/// the toolbar buttons on the row above it. A UISearchController on the
+/// NavigationStack's own navigation item: `.searchable` shows nothing here (the
+/// TabView sits inside the NavigationStack). Removed again when the library
+/// goes away, so the developer screen has no search bar. Checked in the iOS
+/// simulator: the title and the toolbar buttons share a centre line, and the
+/// field spans the screen on both tabs.
+struct LibraryNavSearch: UIViewControllerRepresentable {
+    @Binding var text: String
+    let placeholder: String
+
     func makeCoordinator() -> Coordinator { Coordinator(self) }
-    func makeUIView(context: Context) -> UISegmentedControl {
-        let control = UISegmentedControl(items: [UIImage(systemName: "square.grid.2x2.fill")!, UIImage(systemName: "gearshape.fill")!])
-        control.accessibilityLabel = "Library and Settings"
-        control.setWidth(80, forSegmentAt: 0); control.setWidth(80, forSegmentAt: 1)
-        control.addTarget(context.coordinator, action: #selector(Coordinator.changed(_:)), for: .valueChanged)
-        // The surrounding glass capsule supplies the only background, including
-        // during a held selection. A full-height transparent canvas keeps the
-        // symbol from being clipped (the image height takes part in layout).
-        let clear = UIGraphicsImageRenderer(size: CGSize(width: 1, height: 52)).image { _ in }
-        for state: UIControl.State in [.normal, .selected, .highlighted, [.selected, .highlighted]] {
-            control.setBackgroundImage(clear, for: state, barMetrics: .default)
-        }
-        control.setDividerImage(clear, forLeftSegmentState: .normal, rightSegmentState: .normal, barMetrics: .default)
-        control.backgroundColor = .clear
-        control.selectedSegmentTintColor = .clear
-        control.selectedSegmentIndex = selection
-        return control
+    func makeUIViewController(context: Context) -> Host {
+        let host = Host()
+        host.coordinator = context.coordinator
+        return host
     }
-    func updateUIView(_ control: UISegmentedControl, context: Context) {
+    func updateUIViewController(_ host: Host, context: Context) {
         context.coordinator.parent = self
-        control.selectedSegmentIndex = selection
-        control.accessibilityValue = selection == 0 ? "Library" : "Settings"
-        for (index, symbol) in ["square.grid.2x2.fill", "gearshape.fill"].enumerated() {
-            control.setImage(UIImage(systemName: symbol)?.withTintColor(index == selection ? .systemBlue : .secondaryLabel, renderingMode: .alwaysOriginal), forSegmentAt: index)
-        }
+        host.apply()
+        // SwiftUI rebuilds the navigation item when the toolbar changes (the
+        // library's buttons leave with the Settings tab) and can drop the search
+        // controller on the way; put it back once that update has landed.
+        DispatchQueue.main.async { host.apply() }
     }
-    final class Coordinator: NSObject {
-        var parent: LibraryTabControl
-        init(_ parent: LibraryTabControl) { self.parent = parent }
-        @objc func changed(_ control: UISegmentedControl) { parent.selection = control.selectedSegmentIndex }
+    static func dismantleUIViewController(_ host: Host, coordinator: Coordinator) { host.remove() }
+
+    final class Coordinator: NSObject, UISearchResultsUpdating, UISearchBarDelegate, UIGestureRecognizerDelegate {
+        var parent: LibraryNavSearch
+        let controller = ReportingSearchController(searchResultsController: nil)
+        private var outsideTap: UITapGestureRecognizer?
+        var bar: UISearchBar { controller.searchBar }
+
+        init(_ parent: LibraryNavSearch) {
+            self.parent = parent
+            super.init()
+            controller.obscuresBackgroundDuringPresentation = false
+            controller.hidesNavigationBarDuringPresentation = false
+            controller.searchResultsUpdater = self
+            bar.delegate = self
+            bar.autocapitalizationType = .none
+            bar.autocorrectionType = .no
+            bar.returnKeyType = .search
+        }
+        func updateSearchResults(for searchController: UISearchController) {
+            let t = searchController.searchBar.text ?? ""
+            if t != parent.text { parent.text = t }
+        }
+        func searchBarSearchButtonClicked(_ searchBar: UISearchBar) { searchBar.resignFirstResponder() }
+
+        // While the field is being edited, any tap outside it closes the keyboard.
+        // The tap still reaches whatever was tapped (cancelsTouchesInView = false).
+        func searchBarTextDidBeginEditing(_ searchBar: UISearchBar) {
+            guard outsideTap == nil, let window = searchBar.window else { return }
+            let tap = UITapGestureRecognizer(target: self, action: #selector(tappedOutside))
+            tap.cancelsTouchesInView = false
+            tap.delegate = self
+            window.addGestureRecognizer(tap)
+            outsideTap = tap
+        }
+        func searchBarTextDidEndEditing(_ searchBar: UISearchBar) {
+            if let tap = outsideTap { tap.view?.removeGestureRecognizer(tap) }
+            outsideTap = nil
+        }
+        @objc private func tappedOutside() { bar.resignFirstResponder() }
+
+        /// A tab switch squeezes the field a little and lets it spring back, like
+        /// a Liquid Glass control answering a touch (there is no public call that
+        /// plays the glass's own touch response). The system spring, on the bar's
+        /// layer only, so the navigation bar's layout never sees a transform.
+        /// Checked in the iOS 27 simulator (at 4%; now 1.5%): in, a slight overshoot,
+        /// settled in about half a second, running alongside the toolbar's glass morph.
+        func squeeze() {
+            guard !UIAccessibility.isReduceMotionEnabled else { return }
+            let layer = bar.layer
+            let now = layer.convertTime(CACurrentMediaTime(), from: nil)
+            let squeezed = 0.985, inTime = 0.12
+            let back = CASpringAnimation(perceptualDuration: 0.5, bounce: 0.5)
+            back.keyPath = "transform.scale"
+            back.fromValue = squeezed
+            back.toValue = 1
+            back.beginTime = now + inTime
+            back.duration = back.settlingDuration
+            back.fillMode = .backwards   // holds the squeezed size until it starts
+            let inward = CABasicAnimation(keyPath: "transform.scale")
+            inward.fromValue = 1
+            inward.toValue = squeezed
+            inward.beginTime = now
+            inward.duration = inTime
+            inward.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            layer.add(back, forKey: "madeira.search.squeeze.back")
+            layer.add(inward, forKey: "madeira.search.squeeze.in")   // added last: shown over the held spring
+        }
+        func gestureRecognizer(_ g: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+            !(touch.view?.isDescendant(of: bar) ?? false)
+        }
+        func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
+    }
+
+    final class Host: UIViewController {
+        weak var coordinator: Coordinator?
+        private weak var owner: UIViewController?
+        override func viewDidAppear(_ animated: Bool) { super.viewDidAppear(animated); apply() }
+
+        func apply() {
+            guard let c = coordinator else { return }
+            if c.bar.text != c.parent.text { c.bar.text = c.parent.text }
+            if c.bar.placeholder != c.parent.placeholder {
+                if c.bar.placeholder != nil {   // a tab switch: crossfade instead of jumping
+                    let fade = CATransition(); fade.type = .fade; fade.duration = 0.25
+                    c.bar.searchTextField.layer.add(fade, forKey: "madeira.search.fade")
+                    c.squeeze()
+                }
+                c.bar.placeholder = c.parent.placeholder
+            }
+            // The NavigationStack's own view controller owns the navigation item.
+            var vc: UIViewController? = self
+            while let v = vc, !(v.parent is UINavigationController) { vc = v.parent }
+            guard let target = vc else { return }
+            owner = target
+            let item = target.navigationItem
+            if item.searchController !== c.controller { item.searchController = c.controller }
+            if item.preferredSearchBarPlacement != .stacked { item.preferredSearchBarPlacement = .stacked }
+            if item.hidesSearchBarWhenScrolling { item.hidesSearchBarWhenScrolling = false }
+            // iOS 26 otherwise moves it to the bottom of an iPhone screen, beside the tab bar.
+            if #available(iOS 26.0, *), item.searchBarPlacementAllowsToolbarIntegration {
+                item.searchBarPlacementAllowsToolbarIntegration = false
+            }
+        }
+        func remove() {
+            coordinator?.bar.resignFirstResponder()
+            if let owner, owner.navigationItem.searchController === coordinator?.controller { owner.navigationItem.searchController = nil }
+        }
     }
 }
 
@@ -811,12 +1054,15 @@ struct LibraryBadges: View {
 }
 
 struct LibraryStatus: View {
+    /// The library page leaves JIT to the bolt beside its title.
+    var showsJIT = true
     @State private var jit = false
     @State private var memory = false
     let ticks = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
     var body: some View {
         HStack(spacing: 14) {
-            status("JIT", jit); status("Memory+", memory)
+            if showsJIT { status("JIT", jit) }
+            status("Memory+", memory)
             if BuildStamp.visible {
                 Text(BuildStamp.text).font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(Color(.systemGray2)).lineLimit(1).minimumScaleFactor(0.7)
@@ -873,6 +1119,7 @@ struct LibraryView: View {
     @Environment(\.scenePhase) private var scenePhase
     var play: (LibraryEntry) -> Void
     var enableJIT: () -> Void
+    @ObservedObject private var jitState = LibraryJITState.shared
     /// Madeira Dock's start, for Settings › Steam (Onboarding.swift).
     var startDock: (DockGame, Bool) -> Void = { _, _ in }
     /// First-run setup (Onboarding.swift).
@@ -880,6 +1127,8 @@ struct LibraryView: View {
     @State private var browser = false
     @State private var selected: LibraryEntry?
     @State private var search = ""
+    /// The Settings tab's own search text, kept apart from the library's.
+    @State private var settingsSearch = ""
     @State private var focused: UUID?
     @ObservedObject private var controller = LibraryController.shared
     @ObservedObject private var input = InputSettings.shared
@@ -903,14 +1152,32 @@ struct LibraryView: View {
         }
     }
     var body: some View {
-        Group {
-            if tab == 0 { library } else { settings }
+        // The system tab bar: on iOS 26 it is the floating Liquid Glass bar whose
+        // glass selection slides between the tabs and follows a drag.
+        TabView(selection: Binding(get: { tab }, set: { switchTab(to: $0) })) {
+            library
+                .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
+                .tabItem { Label("Library", systemImage: "square.grid.2x2.fill") }
+                .tag(0)
+            settings
+                .tabItem { Label("Settings", systemImage: "gearshape.fill") }
+                .tag(1)
         }
-        .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            LibraryTabControl(selection: $tab).frame(width: 160, height: 52)
-                .modifier(LibraryPillGlass())
-                .padding(.bottom, 5).padding(.top, 8)
+        // The system search field (Liquid Glass on iOS 26) in the title's place, left
+        // of the library's buttons, on both tabs; each tab keeps its own text.
+        .background(LibraryNavSearch(text: tab == 0 ? $search : $settingsSearch,
+                                     placeholder: tab == 0 ? "Search your library" : "Search settings")
+            .frame(width: 0, height: 0))
+        // Each tab is hosted by the tab bar controller, so a toolbar set inside a tab
+        // would not reach the navigation bar: the library's lives here.
+        // The title is a large leading toolbar item, level with the library's
+        // buttons like an App Store tab title; the bar's centred one is cleared.
+        // The trailing glass group changes with the tab (switchTab animates it),
+        // which iOS 26 draws as a Liquid Glass morph between the two.
+        .navigationTitle("")
+        .toolbar {
+            LibraryLargeTitle()
+            if tab == 0 { libraryToolbar } else { settingsToolbar }
         }
         .fullScreenCover(isPresented: $onboarding.presented) { OnboardingView() }
         .onAppear {
@@ -920,38 +1187,96 @@ struct LibraryView: View {
             onboarding.presentIfNeeded()
         }
         .onReceive(controller.commands) { command in
-            if selected == nil, !browser, !onboarding.presented, command == "tab" { tab = 1 - tab }
+            if selected == nil, !browser, !onboarding.presented, command == "tab" { switchTab(to: 1 - tab) }
         }
+    }
+    @ToolbarContentBuilder private var libraryToolbar: some ToolbarContent {
+        ToolbarItem(placement: .topBarTrailing) {
+            Menu {
+                Picker("Library layout", selection: $layout) {
+                    Label("Cards", systemImage: "square.grid.2x2").tag("cards")
+                    Label("Compact cards", systemImage: "square.grid.3x3").tag("compact")
+                    Label("List", systemImage: "list.bullet").tag("list")
+                    Label("Compact list", systemImage: "list.dash").tag("compactList")
+                }
+                Picker("Sort by", selection: $sort) {
+                    Label("Last played", systemImage: "clock").tag("played")
+                    Label("Name", systemImage: "textformat.abc").tag("name")
+                    Label("Recently added", systemImage: "plus").tag("added")
+                    Label("Folder size", systemImage: "internaldrive").tag("size")
+                }
+            } label: { Label("Library options", systemImage: "line.3.horizontal.decrease") }
+        }
+        ToolbarItem(placement: .topBarTrailing) { Button { browser = true } label: { Label("Add executable", systemImage: "plus") } }
+    }
+    @ToolbarContentBuilder private var settingsToolbar: some ToolbarContent {
+        ToolbarItem(placement: .topBarTrailing) {
+            Button(action: enableJIT) {
+                HStack(spacing: 6) {
+                    Text("Enable JIT")
+                    Image(systemName: "bolt.fill").accessibilityHidden(true)
+                }
+            }
+            .disabled(jitState.enabled)
+        }
+    }
+    private func switchTab(to newTab: Int) {
+        guard newTab != tab else { return }
+        withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .default) { tab = newTab }
+    }
+    /// Settings search: a section shows when the search is empty or matches one of its words.
+    private func settingsShow(_ words: String...) -> Bool {
+        let q = settingsSearch.trimmingCharacters(in: .whitespaces)
+        return q.isEmpty || words.contains { $0.localizedCaseInsensitiveContains(q) || q.localizedCaseInsensitiveContains($0) }
     }
     private var settings: some View {
         Form {
-            Section("Ready to play") {
-                LibraryStatus()
-                Button(action: enableJIT) { Label("Enable JIT", systemImage: "bolt.fill") }
+            if settingsShow("ready to play", "enable JIT", "JIT", "StikDebug", "status") {
+                Section("Ready to play") {
+                    LibraryStatus()
+                    Button(action: enableJIT) { Label("Enable JIT", systemImage: "bolt.fill") }
+                        .disabled(jitState.enabled)
+                }
             }
-            Section {
-                Toggle("Extended logging", isOn: $input.diagnostics)
-            } header: { Text("Diagnostics") }
-            Section("Pointer") { LibraryPointerSettings() }
+            if settingsShow("diagnostics", "extended logging", "logging", "log") {
+                Section {
+                    Toggle("Extended logging", isOn: $input.diagnostics)
+                } header: { Text("Diagnostics") }
+            }
+            if settingsShow("pointer", "mouse", "cursor", "touch", "trackpad", "sensitivity") {
+                Section("Pointer") { LibraryPointerSettings() }
+            }
             if MadeiraConfig.flag("MADEIRA_RUNTIME_SETTINGS") {
-                DisplayRateSettings()
-                RuntimeMemorySyncSettings(open: { settingsSheet = $0 }, refresh: settingsRefresh)
+                if settingsShow("display", "refresh", "rate", "ProMotion", "120 Hz") { DisplayRateSettings() }
+                if settingsShow("memory", "JIT pool", "pool", "video memory", "VRAM", "swap", "coverage", "madsync", "sync", "eco", "all settings") {
+                    RuntimeMemorySyncSettings(open: { settingsSheet = $0 }, refresh: settingsRefresh)
+                }
             }
-            if SteamSettingsSection.shown { SteamSettingsSection(open: { settingsSheet = $0 }) }
-            Section {
-                Toggle("Use developer interface", isOn: Binding(get: { developerUI }, set: { on in
-                    developerUI = on; FrontendChoice.choose(new: !on); restartNotice = true
-                }))
-            } header: { Text("Interface") } footer: {
-                Text("The developer interface is Madeira's original diagnostic screen. The change applies after Madeira restarts.")
+            if SteamSettingsSection.shown, settingsShow("Steam", "Dock", "sign in", "account", "setup") {
+                SteamSettingsSection(open: { settingsSheet = $0 })
+            }
+            if settingsShow("interface", "developer") {
+                Section {
+                    Toggle("Use developer interface", isOn: Binding(get: { developerUI }, set: { on in
+                        developerUI = on; FrontendChoice.choose(new: !on); restartNotice = true
+                    }))
+                } header: { Text("Interface") } footer: {
+                    Text("The developer interface is Madeira's original diagnostic screen. The change applies after Madeira restarts.")
+                }
+            }
+            // Search: the matching options of All settings, editable here.
+            if !settingsSearch.trimmingCharacters(in: .whitespaces).isEmpty {
+                SettingsSearchResults(query: settingsSearch.trimmingCharacters(in: .whitespaces), refresh: settingsRefresh)
             }
             // Credits, last on the Settings page.
-            Section {
-                MadeiraCredit(name: "Will Faust", handle: "willfaust", role: "Created Madeira")
-                MadeiraCredit(name: "Nick", handle: "125hz", role: "32-bit game support, the game library and Madeira Dock")
-                MadeiraCredit(name: "Jfishin", handle: "Jfishin", role: "The original native Steam sign-in, library and downloads")
-            } header: { Text("Credits") } footer: {
-                Text("Madeira is built on Wine, FEX-Emu, DXMT by Feifan He (3Shain) with the Direct3D 9 frontend by David Acevedo (dacevedo12), rpmalloc by Mattias Jansson, and StikDebug for enabling JIT. Thank you to everyone who contributes to these projects.")
+            if settingsShow("credits", "thanks", "Will Faust", "Nick", "125hz", "Jfishin") {
+                Section {
+                    MadeiraCredit(name: "Will Faust", handle: "willfaust", role: "Created Madeira")
+                    MadeiraCredit(name: "Nick", handle: "125hz", role: "32-bit game support, the game library and Madeira Dock")
+                    MadeiraCredit(name: "Jfishin", handle: "Jfishin", role: "The original native Steam sign-in, library and downloads")
+                } header: { Text("Credits") } footer: {
+                    Text("Madeira is built on Wine, FEX-Emu, DXMT by Feifan He (3Shain) with the Direct3D 9 frontend by David Acevedo (dacevedo12), rpmalloc by Mattias Jansson, and StikDebug for enabling JIT. Thank you to everyone who contributes to these projects.")
+                }
             }
         }
         .alert("Restart Madeira", isPresented: $restartNotice) {
@@ -978,7 +1303,7 @@ struct LibraryView: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 5) {
                         Text("Your library").font(.largeTitle.bold())
-                        LibraryStatus().foregroundStyle(.secondary)
+                        LibraryStatus(showsJIT: false).foregroundStyle(.secondary)
                     }
                     Spacer()
                 }
@@ -997,9 +1322,8 @@ struct LibraryView: View {
                     ContentUnavailableView("Make yourself at home", systemImage: "gamecontroller", description: Text("Copy a game's folder into Madeira › wine › drive_c with the Files app, then tap + and choose its .exe."))
                 } else {
                     VStack(alignment: .leading, spacing: 14) {
-                        LibrarySectionHeader(title: "Games", count: entries.count, collapsed: $hideGames) {
-                            Button { browser = true } label: { Label("Add a game", systemImage: "plus.circle") }.font(.subheadline)
-                        }
+                        // Games are added with the + in the navigation bar.
+                        LibrarySectionHeader(title: "Games", count: entries.count, collapsed: $hideGames) { EmptyView() }
                         if hideGames {
                             EmptyView()
                         } else if entries.isEmpty {
@@ -1025,26 +1349,6 @@ struct LibraryView: View {
                 let delta = command == "left" || command == "up" ? -1 : 1
                 withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .easeOut(duration: 0.18)) { focused = ids[(index + delta + ids.count) % ids.count] }
             }
-        }
-        .searchable(text: $search, prompt: "Search your library")
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    Picker("Library layout", selection: $layout) {
-                        Label("Cards", systemImage: "square.grid.2x2").tag("cards")
-                        Label("Compact cards", systemImage: "square.grid.3x3").tag("compact")
-                        Label("List", systemImage: "list.bullet").tag("list")
-                        Label("Compact list", systemImage: "list.dash").tag("compactList")
-                    }
-                    Picker("Sort by", selection: $sort) {
-                        Label("Last played", systemImage: "clock").tag("played")
-                        Label("Name", systemImage: "textformat.abc").tag("name")
-                        Label("Recently added", systemImage: "plus").tag("added")
-                        Label("Folder size", systemImage: "internaldrive").tag("size")
-                    }
-                } label: { Label("Library options", systemImage: "line.3.horizontal.decrease") }
-            }
-            ToolbarItem(placement: .topBarTrailing) { Button { browser = true } label: { Label("Add executable", systemImage: "plus") } }
         }
         .sheet(isPresented: $browser) {
             NavigationStack { ExecutableBrowser(folder: LibraryModel.drive) { entry in
