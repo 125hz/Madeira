@@ -721,9 +721,11 @@ static void winios_ensure_compositor(void) {
     g_compositor_view = [[UIView alloc] initWithFrame:win.bounds];
     g_compositor_view.userInteractionEnabled = NO;  /* touches fall through */
     g_compositor_view.clipsToBounds = YES;
-    /* letterbox area: near-black; desktop area: classic teal (until
-     * explorer's own background paint works) */
-    g_compositor_view.backgroundColor = [UIColor colorWithWhite:0.08 alpha:1.0];
+    /* letterbox area: black, like the rest of a session's screen (the game
+     * view's host and the library's session view are black); an 8 % grey
+     * showed as grey bands around a fitted desktop. desktop area: classic
+     * teal (until explorer's own background paint works) */
+    g_compositor_view.backgroundColor = UIColor.blackColor;
     g_desk_bg = [CALayer layer];
     g_desk_bg.backgroundColor = [UIColor colorWithRed:0.0 green:0.502 blue:0.502 alpha:1.0].CGColor;
     [g_compositor_view.layer addSublayer:g_desk_bg];
