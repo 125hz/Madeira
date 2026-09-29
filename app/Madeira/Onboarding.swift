@@ -275,13 +275,13 @@ struct OnboardingView: View {
 /// (SteamSignIn; the token stays in its Keychain store), Madeira Dock's sheet
 /// and "Run setup again".
 struct SteamSettingsSection: View {
-    /// Madeira Dock's start (ContentView.startDock).
-    let startDock: (DockGame, Bool) -> Void
+    /// Opens Steam sign-in or Madeira Dock. LibraryView presents the sheet from the
+    /// Settings Form: a sheet attached to this section closed again as soon as it
+    /// slid up whenever the Form rebuilt its rows.
+    let open: (SettingsSheet) -> Void
     @ObservedObject private var signIn = SteamSignInModel.shared
     @ObservedObject private var dock = MadeiraDockModel.shared
     @ObservedObject private var onboarding = OnboardingModel.shared
-    @State private var showSignIn = false
-    @State private var showDock = false
     @State private var confirmSignOut = false
 
     /// Shown when Steam sign-in or Madeira Dock is available.
@@ -293,10 +293,10 @@ struct SteamSettingsSection: View {
                 LabeledContent("Signed in as", value: name)
                 Button("Sign out of Steam", role: .destructive) { confirmSignOut = true }
             } else {
-                Button { showSignIn = true } label: { Label("Sign in to Steam", systemImage: "person.crop.circle.badge.plus") }
+                Button { open(.steamSignIn) } label: { Label("Sign in to Steam", systemImage: "person.crop.circle.badge.plus") }
             }
             if MadeiraDock.enabled {
-                Button { showDock = true } label: { Label("Madeira Dock", systemImage: "shippingbox") }
+                Button { open(.dock) } label: { Label("Madeira Dock", systemImage: "shippingbox") }
                 if let status = dock.status {
                     Text(status).font(.caption).foregroundStyle(.secondary)
                 }
@@ -309,8 +309,6 @@ struct SteamSettingsSection: View {
         } footer: {
             Text("Madeira keeps a Steam sign-in token in this device's Keychain, for this device only. Signing out removes it.")
         }
-        .sheet(isPresented: $showSignIn) { SteamSignInView() }
-        .sheet(isPresented: $showDock) { MadeiraDockView(start: startDock) }
         .confirmationDialog("Sign out of Steam?", isPresented: $confirmSignOut, titleVisibility: .visible) {
             Button("Sign out", role: .destructive) { signIn.signOut() }
         }

@@ -1138,8 +1138,7 @@ struct MadeiraMetalView: UIViewRepresentable {
 }
 
 struct ContentView: View {
-    @State private var showSteamSignIn = false
-    @State private var showDock = false
+    @State private var devSheet: SettingsSheet?
     @StateObject private var logStore = LogStore.shared
     @State private var jitStatus: JITStatus = .unknown
     @State private var entitlements: EntitlementStatus?
@@ -1492,15 +1491,15 @@ struct ContentView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 12) {
                 if SteamSignIn.isEnabled {
-                    Button("Steam sign-in") { showSteamSignIn = true }
+                    Button("Steam sign-in") { devSheet = .steamSignIn }
                         .buttonStyle(.bordered)
-                        .sheet(isPresented: $showSteamSignIn) { SteamSignInView() }
                 }
                 if MadeiraDock.enabled {
-                    Button("Madeira Dock") { showDock = true }
+                    Button("Madeira Dock") { devSheet = .dock }
                         .buttonStyle(.bordered)
-                        .sheet(isPresented: $showDock) { MadeiraDockView { startDock($0, compactPool: $1) } }
                 }
+                Button("All settings") { devSheet = .allSettings }
+                    .buttonStyle(.bordered)
                 Button("Enable JIT") {
                     enableJITViaStikDebug()
                 }
@@ -1969,6 +1968,15 @@ struct ContentView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text("Close Madeira from the app switcher and open it again to use the new interface.")
+        }
+        // One sheet for the strip, not one per button: a sheet attached to a
+        // button closed again whenever this often-redrawn screen rebuilt it.
+        .sheet(item: $devSheet) { sheet in
+            switch sheet {
+            case .steamSignIn: SteamSignInView()
+            case .dock: MadeiraDockView { startDock($0, compactPool: $1) }
+            case .allSettings: AllSettingsView()
+            }
         }
     }
 

@@ -160,8 +160,9 @@ struct LibraryEntry: Codable, Identifiable {
     var arguments = ""
     /// The virtual monitor's size ("WxH"): the session default a game renders
     /// for (GuestDisplay.configureSessionDefault), and the Desktop entry's
-    /// desktop size. New entries use main's session default.
-    var resolution = "1024x768"
+    /// desktop size. New entries default to 1408x648, a wide shape near the
+    /// phone's landscape aspect that most games render quickly.
+    var resolution = "1408x648"
     /// How the monitor is scaled to the screen (DisplayMode raw value; nil = Fit).
     var display: String?
     /// FPS limit: 1 = 60, 3 = 30, 0 = display maximum, 2 = uncapped (madeira_set_vsync_locked).
@@ -871,6 +872,8 @@ struct LibraryView: View {
     // The interface the next start uses (FrontendChoice).
     @State private var developerUI = !FrontendChoice.preferNew
     @State private var restartNotice = false
+    @State private var settingsSheet: SettingsSheet?
+    @State private var settingsRefresh = 0
     @AppStorage("madeiraLibraryLayout") private var layout = "cards"
     @AppStorage("madeiraLibrarySort") private var sort = "played"
     // Collapsed state of the games section.
@@ -917,9 +920,9 @@ struct LibraryView: View {
             Section("Pointer") { LibraryPointerSettings() }
             if MadeiraConfig.flag("MADEIRA_RUNTIME_SETTINGS") {
                 DisplayRateSettings()
-                RuntimeMemorySyncSettings()
+                RuntimeMemorySyncSettings(open: { settingsSheet = $0 }, refresh: settingsRefresh)
             }
-            if SteamSettingsSection.shown { SteamSettingsSection(startDock: startDock) }
+            if SteamSettingsSection.shown { SteamSettingsSection(open: { settingsSheet = $0 }) }
             Section {
                 Toggle("Use developer interface", isOn: Binding(get: { developerUI }, set: { on in
                     developerUI = on; FrontendChoice.choose(new: !on); restartNotice = true
@@ -940,6 +943,16 @@ struct LibraryView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text("Close Madeira from the app switcher and open it again to switch interfaces.")
+        }
+        // The Settings sheets hang off the Form, never off one of its rows: a Form
+        // may rebuild its rows while a sheet slides up over it, and a sheet whose
+        // owning row is rebuilt closes again at once.
+        .sheet(item: $settingsSheet, onDismiss: { settingsRefresh += 1 }) { sheet in
+            switch sheet {
+            case .allSettings: AllSettingsView()
+            case .steamSignIn: SteamSignInView()
+            case .dock: MadeiraDockView(start: startDock)
+            }
         }
     }
     private var library: some View {
@@ -1146,7 +1159,7 @@ struct LibraryDetail: View {
     @State private var remove = false
     @State private var leaving = false
     @State private var error: String?
-    static let presetResolutions = ["640x480", "800x600", "960x540", "1024x768", "1280x720", "1280x960", "1920x1080", "2560x1440"]
+    static let presetResolutions = ["640x480", "800x600", "960x540", "1024x768", "1280x720", "1280x960", "1408x648", "1920x1080", "2560x1440"]
     /// The presets, plus a stored size that is none of them (a screen shape
     /// chosen on another device), so the picker never shows a blank choice.
     static func resolutions(keeping current: String) -> [String] {
@@ -1327,43 +1340,106 @@ struct MadeiraCredit: View {
     }
 }
 
-/// Settings for the file-backed swap tier (madeira.cfg swap-mb, off by default) and
-/// the in-process sync engine madsync (madeira.cfg inproc-sync, on by default). Both are
-/// read when Madeira starts, so changes apply after a restart.
+/// Settings › Memory & sync: the JIT pool (madeira.cfg pool), the video memory
+/// budget (vram-mb), the file-backed swap tier (swap-mb, off by default, and
+/// env.MADEIRA_SWAP_COVERAGE, which allocations it backs) and the in-process sync
+/// engine madsync (inproc-sync, on by default). All are read when Madeira starts,
+/// so changes apply after a restart. "All settings" opens every other option.
 /// MADEIRA_RUNTIME_SETTINGS=0 hides this section.
+/// A sheet opened from Settings; LibraryView presents it from the Form itself.
+enum SettingsSheet: String, Identifiable {
+    case allSettings, steamSignIn, dock
+    var id: String { rawValue }
+}
+
 struct RuntimeMemorySyncSettings: View {
-    static let swapChoices = [0, 1024, 2048, 4096]
-    @State private var swapMB = RuntimeMemorySyncSettings.currentSwap()
+    /// Opens a Settings sheet (LibraryView owns the presentation).
+    var open: (SettingsSheet) -> Void = { _ in }
+    /// Bumped when a Settings sheet closes, so the rows re-read madeira.cfg.
+    var refresh = 0
+    /// The keys this section owns; All settings leaves them out.
+    static let featuredKeys: Set<String> = ["pool", "vram-mb", "swap-mb", "env.MADEIRA_SWAP_COVERAGE", "inproc-sync", "eco"]
+    static let poolChoices = [0, 512, 640, 768, 1024, 1152]          // 0 = the standard 896 MB
+    static let vramChoices = [0, 1536, 2048, 3072, 4096, 4352, 4608, 5120, 6144]   // 0 = automatic
+    static let swapChoices = [0, 1024, 2048, 3072, 4096]
+    /// The stored value "" (no key) and "classic" are the same rules.
+    static let coverageChoices: [(String, String)] = [
+        ("", "Large allocations (8 MB+)"), ("blocks", "All allocations of 1 MB+"), ("wide", "1 MB+ and overflow"),
+    ]
+    @State private var poolMB = Self.intKey("pool")
+    @State private var vramMB = Self.intKey("vram-mb")
+    @State private var swapMB = Self.intKey("swap-mb")
+    @State private var coverage = Self.currentCoverage()
     @State private var madsync = MadeiraConfig.bool("inproc-sync", default: true)
+    @State private var eco = MadeiraConfig.bool("eco", default: false)
     @State private var changed = false
 
-    static func currentSwap() -> Int {
-        let v = Int(MadeiraConfig.get("swap-mb") ?? "") ?? 0
-        return swapChoices.contains(v) ? v : (v > 0 ? swapChoices.last { $0 <= v } ?? 1024 : 0)
+    /// The configured value in MB, shown as itself even when it is not one of the choices.
+    static func intKey(_ key: String) -> Int { Int(MadeiraConfig.get(key) ?? "") ?? 0 }
+    static func currentCoverage() -> String {
+        let v = (MadeiraConfig.get("env.MADEIRA_SWAP_COVERAGE") ?? "").lowercased()
+        return v == "classic" ? "" : v
+    }
+    static func gb(_ mb: Int) -> String {
+        String(format: "%g GB", Double(mb) / 1024)   // 1.5, 4, 4.25 ...
+    }
+
+    private func mbPicker(_ title: String, key: String, value: Binding<Int>, choices: [Int],
+                          zero: String, label: @escaping (Int) -> String) -> some View {
+        Picker(title, selection: Binding(get: { value.wrappedValue }, set: { mb in
+            value.wrappedValue = mb; changed = true
+            MadeiraConfig.set(key, mb > 0 ? String(mb) : nil)
+            LogStore.shared.log("[runtime-settings] \(key)=\(mb)")
+        })) {
+            ForEach(choices, id: \.self) { mb in Text(mb == 0 ? zero : label(mb)).tag(mb) }
+            if !choices.contains(value.wrappedValue) { Text("\(value.wrappedValue) MB").tag(value.wrappedValue) }
+        }
     }
 
     var body: some View {
         Section {
-            Picker("Swap tier", selection: Binding(get: { swapMB }, set: { mb in
-                swapMB = mb; changed = true
-                MadeiraConfig.set("swap-mb", mb > 0 ? String(mb) : nil)
-                LogStore.shared.log("[runtime-settings] swap-mb=\(mb)")
+            mbPicker("JIT pool", key: "pool", value: $poolMB, choices: Self.poolChoices,
+                     zero: "Default (896 MB)", label: { "\($0) MB" })
+            mbPicker("Video memory", key: "vram-mb", value: $vramMB, choices: Self.vramChoices,
+                     zero: "Automatic", label: Self.gb)
+            mbPicker("Swap tier", key: "swap-mb", value: $swapMB, choices: Self.swapChoices,
+                     zero: "Off", label: Self.gb)
+            Picker("Swap coverage", selection: Binding(get: { coverage }, set: { mode in
+                coverage = mode; changed = true
+                MadeiraConfig.set("env.MADEIRA_SWAP_COVERAGE", mode.isEmpty ? nil : mode)
+                LogStore.shared.log("[runtime-settings] swap-coverage=\(mode.isEmpty ? "classic" : mode)")
             })) {
-                ForEach(Self.swapChoices, id: \.self) { mb in
-                    Text(mb == 0 ? "Off" : "\(mb / 1024) GB").tag(mb)
-                }
+                ForEach(Self.coverageChoices, id: \.0) { Text($0.1).tag($0.0) }
+                if !Self.coverageChoices.contains(where: { $0.0 == coverage }) { Text(coverage).tag(coverage) }
             }
+            .disabled(swapMB == 0)
             Toggle("Madsync", isOn: Binding(get: { madsync }, set: { on in
                 madsync = on; changed = true
                 MadeiraConfig.set("inproc-sync", on ? nil : "0")
                 LogStore.shared.log("[runtime-settings] inproc-sync=\(on ? 1 : 0)")
             }))
+            Toggle("Eco mode", isOn: Binding(get: { eco }, set: { on in
+                eco = on; changed = true
+                MadeiraConfig.set("eco", on ? "1" : nil)
+                LogStore.shared.log("[runtime-settings] eco=\(on ? 1 : 0)")
+            }))
+            Button { open(.allSettings) } label: {
+                Label("All settings (\(ConfigCatalog.generated.count - Self.featuredKeys.count) more)", systemImage: "slider.horizontal.3")
+            }
         } header: { Text("Memory & sync") } footer: {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Swap tier moves game data to a file on this device's storage when memory runs short, using up to the chosen size. It can help games that are closed for using too much memory, at some speed cost.")
+                Text("JIT pool is the memory reserved at launch for translated x86 code (256 to 1152 MB).")
+                Text("Video memory is how much graphics memory games are told they have. Automatic sizes it from the memory free at launch. Too high can get Madeira closed for using too much memory; too low makes games keep reloading textures.")
+                Text("Swap tier moves game data to a file on this device's storage when memory runs short, up to the chosen size, at some speed cost. Coverage decides which allocations it moves: large ones only (8 MB and up, the default), every allocation of 1 MB and up, or those plus allocations that overflow the game's address range. Wider coverage saves more memory but can slow a game down.")
                 Text("Madsync is the in-process synchronisation engine (on by default).")
+                Text("Eco mode starts every game with its threads at a low priority, which saves power but makes games run slower. Off by default. It is meant for loading screens: the ECO pill in the performance overlay turns it on and off while a game runs.")
                 if changed { Text("Restart Madeira (close it from the app switcher) for these changes to apply.").foregroundStyle(.orange) }
             }
+        }
+        .onChange(of: refresh) { _, _ in
+            poolMB = Self.intKey("pool"); vramMB = Self.intKey("vram-mb"); swapMB = Self.intKey("swap-mb")
+            coverage = Self.currentCoverage(); madsync = MadeiraConfig.bool("inproc-sync", default: true)
+            eco = MadeiraConfig.bool("eco", default: false)
         }
     }
 }
