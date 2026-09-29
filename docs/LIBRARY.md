@@ -84,7 +84,9 @@ starting screen takes over (or an error is shown). A profile holds:
 
 A game you added starts directly. A Steam game's page (`docs/STEAM_LIBRARY.md`)
 adds a **Steam** section under the library details: **Start with** Madeira
-Dock, Dock's per-launch pool choice, **One-time installs**, updates, **Repair
+Dock (the default) or **The game** (its own program without Steam, from Steam's
+launch configuration or chosen under **Program**), Dock's per-launch pool
+choice, **One-time installs**, updates, **Repair
 installed files**, App ID, free space and **Uninstall**; its **Executable**
 section shows the install folder, and it has no **Remove from library** (the
 entry goes with **Uninstall**).

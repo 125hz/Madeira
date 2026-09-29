@@ -33,10 +33,11 @@ The page has, in this order:
 - the header: artwork (Steam's, or a chosen cover), title, install size,
   Steam's playtime, and **Play**;
 - **Library details**: title, **Choose cover image**, **Use Steam artwork**;
-- **Steam**: **Start with** Madeira Dock; **Smaller JIT pool (512 MB) for this
-  launch** (Dock's per-launch choice); **One-time installs**, **Run at next
-  start** or **Skip** (Dock's choice for the game's Steam install scripts, when
-  it has any); an update's progress with **Pause update** / **Resume update**,
+- **Steam**: **Start with** Madeira Dock (the default) or **The game** (below);
+  under Madeira Dock, **Smaller JIT pool (512 MB) for this launch** (Dock's
+  per-launch choice) and **One-time installs**, **Run at next start** or
+  **Skip** (Dock's choice for the game's Steam install scripts, when it has
+  any); under The game, **Program**; an update's progress with **Pause update** / **Resume update**,
   or **Update available — download**; **Repair installed files**; App ID; free
   space; the last Dock result; **Uninstall** (with a confirmation);
 - **Display**, **Compatibility & performance** (reduced-precision x87,
@@ -51,6 +52,25 @@ entry). The profile never replaces what Dock starts. Play is refused, with the
 reason, while an update runs, before Steam marks the game fully installed,
 without Valve's client components or without a sign-in. Launch arguments are
 not offered: Dock starts Steam's own launch option.
+
+**Start with: The game** starts the game's own program in Wine, without Steam
+or Madeira Dock, like a game added to the library. It suits games that run
+without Steam (DRM-free ones); a game that needs Steam or its licence check
+does not start this way, and Madeira Dock stays the default. Which program is
+Steam's own launch configuration for the app (`config.launch` in its product
+info, read with the owned library, or asked of Steam once when an older cache
+lacks it): the Windows entries outside beta branches that are the game itself
+(not a server, editor or VR entry), Steam's default first, a 64-bit entry
+before a 32-bit one, and the first whose program exists in the install folder
+(names are matched without case, as on Windows, and never leave the folder).
+That entry's arguments and working folder apply. When Steam's configuration
+names nothing that runs here, **Program** lists the install folder's `.exe`
+files to choose from (the only one is taken by itself); a program picked there
+is kept. No list of program names is involved. The launch publishes the game's
+own Steam identity (`SteamAppId`, `SteamGameId`, and `SteamAppPath` = its
+install folder) instead of the fixed one other launches get. Play needs the
+game installed, no update running, and a program; no client components or
+sign-in.
 
 **Repair installed files** runs the download again for the current build: the
 downloader checks every chunk already on disk against its SHA-1 and fetches
@@ -191,7 +211,9 @@ result codes, never payloads or credentials).
 
 `[steam-library]`, `[steam-depot]`, `[steam-repair]`, `[steam-cdn]`,
 `[steam-shared]`, `[steam-shared-record]`, `[steam-record]`, `[steam-playtime]`,
-`[steam-account]`, `[steam-games]` and `[bg-download]`. They carry App IDs,
+`[steam-account]`, `[steam-games]`, `[steam-start]` (Start with: the mode,
+where the program came from, how many launch entries and programs) and
+`[bg-download]`. They carry App IDs,
 depot IDs, counts and short reason codes. No account name, Steam ID, token,
 game name or path is logged (the host test checks this on a full install).
 
@@ -203,8 +225,13 @@ default. Existing code paths it touches: `ContentView.runWineFullSequence` (one
 call that tells the library a session starts), `ContentView.startDock` (the
 sign-in transfer is written after the app's own logoff; a Steam game's library
 entry is its launch profile), `ContentView.launchLibraryEntry` (a Steam entry
-starts through Dock), `LibraryEntry.configureLaunch` (returns before
-`MADEIRA_EXE` for a Steam game) and `LibraryEntry.applyEnvironment`, which
+starts through Dock, or with **The game** as a library game),
+`LibraryEntry.configureLaunch` (returns before `MADEIRA_EXE` for a Steam game
+started through Dock; clears the direct start's `MADEIRA_STEAM_APPID`,
+`MADEIRA_STEAM_APPPATH` and `MADEIRA_WORKDIR` for every other launch),
+`WineProcessBridge.m` (a launch carrying those publishes that game's Steam
+identity and working folder instead of the fixed identity and the program's
+own folder; every other launch is unchanged) and `LibraryEntry.applyEnvironment`, which
 exports `MADEIRA_CPU_COUNT` and `DXMT_D9_ANISO_LIMIT` only when a game's
 **CPU cores reported** or **D3D9 anisotropic filtering** is chosen (both
 engine variables are already in the pinned wine and DXMT; unset keeps their
@@ -283,16 +310,16 @@ as in Jfishin's tree; the name is generic.
 | `Content/ContentDecryptor.swift` | 232 | 153 | Jfishin; comments rewritten, zip container added, corrupt-zstd guard fixed |
 | `Content/DepotDownloader.swift` | 732 | 209 | Jfishin's original (334 non-blank lines), substantially rewritten by 125hz: journal, resume, host rotation, records |
 | `Content/DepotManifest.swift` | 175 | 163 | Jfishin; unused diff code removed |
-| `Library/SteamAppInfo.swift` | 289 | 157 | Jfishin, extended (shared depots, artwork names); launch, Cloud and licence-agreement parts removed |
+| `Library/SteamAppInfo.swift` | 333 | 157 | Jfishin, extended (shared depots, artwork names); his launch, Cloud and licence-agreement parts removed; `SteamLaunchOption` (the launch configuration for Start with: The game) is 125hz's |
 | `Library/SteamLibraryFetcher.swift` | 351 | 251 | Jfishin, extended (licensed depots, shared metadata); the hidden-app report removed |
 | `Install/AppManifestWriter.swift` | 184 | 101 | Jfishin's record writer (176 lines, in a folder named DRM in his tree; it writes Steam's own `appmanifest` format and nothing else), extended by 125hz: installed depots, shared depots, `CheckGuid` |
 | `lzma_shim.c/.h` | 85 | n/a | Jfishin |
 | `zstd_edu.c/.h` | 2056 | n/a | Meta Platforms (BSD-3-Clause selected), with Jfishin's error-safe wrapper; 1,986 lines identical to his copy |
 | `chunk_zip.c/.h` | 73 | n/a | 125hz |
-| `SteamOwnedLibrary.swift` | 533 | n/a | 125hz; the model is adapted from the fork's account model around Jfishin's flows; `SteamConnectionGate` |
+| `SteamOwnedLibrary.swift` | 559 | n/a | 125hz; the model is adapted from the fork's account model around Jfishin's flows; `SteamConnectionGate` |
 | `SteamInstall.swift` | 101 | n/a | 125hz |
 | `SteamDownloadBackground.swift` | 188 | n/a | 125hz (the fork's background downloads) |
-| `SteamGames.swift` | 577 | n/a | 125hz (#53's section, extended; the download sheet and the Game details page's Steam section follow the fork's) |
+| `SteamGames.swift` | 777 | n/a | 125hz (#53's section, extended; the download sheet and the Game details page's Steam section follow the fork's; `SteamDirectStart` is new) |
 
 The limit of this audit: it cannot prove how a file was originally written. It
 rests on Jfishin's statement, on his tree carrying no third-party notice for
@@ -344,7 +371,17 @@ page with the Steam section and every section and control listed above, a
 finished download's sheet offers **Open**, a finished download (and only that)
 gets its entry and **Uninstall** removes it, Play on a Steam entry goes through
 Dock with the entry's profile, the profile never sets what Dock starts, and the
-CPU-count and anisotropy variables are exported only when chosen.
+CPU-count and anisotropy variables are exported only when chosen. For **Start
+with: The game** it reads a product info's launch configuration (order, types,
+platforms, beta branches, bounds, the owned-library cache and an older cache
+without it) and, on a synthetic install folder, checks which entry is taken
+(64-bit default first, names without case, missing programs and working folders
+passed over, nothing outside the folder), the Program picker's list and the Play
+rule; the launch wiring (no program, no start; the program checked inside
+drive_c) and the bridge's one-launch identity and working folder are checked in
+the sources. `check-frontend.py` runs `LibraryEntry.configureLaunch` for a Dock
+start (nothing set) and a direct start (program, Steam's arguments, identity,
+working folder) and checks that any other launch clears them.
 `check-onboarding.py` and `check-dock-installers.py` cover the rest of Dock's
 start from the library; `check-steam-signin-native.py` covers the module
 boundary (sign-in files hold no library code).
@@ -352,7 +389,8 @@ boundary (sign-in files hold no library code).
 Not covered: a live logon to Steam and a download from Valve's content servers
 from this branch (the protocol code is the fork's, which ran on the owner's
 devices; see the pull request for what was and was not device-tested), the SwiftUI
-views, iOS background-task behaviour, and running a downloaded game.
+views, iOS background-task behaviour, and running a downloaded game (through
+Madeira Dock or as The game).
 
 ## Not included, and limits
 
