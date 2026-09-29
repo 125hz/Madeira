@@ -37,6 +37,13 @@ enum SteamInstallFiles {
         return state["buildid"]?.string.flatMap { Int($0) }
     }
 
+    /// The install size the record states (`SizeOnDisk`, bytes), or nil.
+    static func sizeOnDisk(appID: Int, steamApps: URL) -> Int64? {
+        guard let state = record(appID: appID, steamApps: steamApps),
+              let size = state["SizeOnDisk"]?.string.flatMap({ Int64($0) }), size > 0 else { return nil }
+        return size
+    }
+
     /// Removes an app's install: its folder under `common`, its record, its
     /// resume journal and the records of the apps that own its shared depots
     /// (those describe the same folder). Only paths strictly inside

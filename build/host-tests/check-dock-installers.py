@@ -64,7 +64,7 @@ for name, text in [('MadeiraDock.swift', dock), ('MadeiraDockView.swift', view)]
     require('MADEIRA_MADSYNC_SESSION' not in text, f'{name}: does not touch the madsync session switch')
 start = content.index('private func startDock(')
 body = content[start:content.index('\n    }\n', start)]
-require(body.index('try MadeiraDock.writeHandoff(') < body.index('DockInstallers.prepare(') < body.index('runWineFullSequence()'),
+require(body.index('try MadeiraDock.writeHandoff(') < body.index('DockInstallers.prepare(') < body.index('runWineFullSequence('),
         'installers are planned after the launch checks, before the session starts')
 require('installers: DockInstallers.script' in body, 'the planned batch goes into the launch arguments')
 require('DockInstallers.poll(drive: MadeiraDock.drive)' in view and 'Picker(game.name' in view and

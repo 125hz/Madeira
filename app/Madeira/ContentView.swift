@@ -2199,6 +2199,15 @@ struct ContentView: View {
     /// applies the entry's launch profile and runs the same full sequence as the
     /// developer interface's buttons.
     private func launchLibraryEntry(_ entry: LibraryEntry) {
+        // A Steam game starts through Madeira Dock with its own launch profile (SteamGames.swift).
+        if let appID = entry.steamAppID {
+            guard let game = MadeiraDock.games(drive: MadeiraDock.drive).first(where: { $0.id == appID }) else {
+                library.error = "Steam no longer lists this game as installed. Refresh the library and try again."; return
+            }
+            LogStore.shared.log("[steam-games] play app=\(appID)")
+            startDock(game, compactPool: MadeiraDockModel.shared.compactPool, profile: entry)
+            return
+        }
         guard wine_process_is_running() == 0, wineserver_is_running() == 0, library.current == nil else {
             library.error = "A session is already running."; return
         }
@@ -2842,7 +2851,9 @@ struct ContentView: View {
     /// From the library (Settings › Steam › Madeira Dock) the start is a library
     /// session: the library's one-session-per-run rule applies first, failures
     /// show in the library, and the session gets the full-screen game view.
-    private func startDock(_ game: DockGame, compactPool: Bool) {
+    /// `profile` is a Steam game's library entry (its Game details page): the
+    /// session then takes that entry's display, performance and on-screen settings.
+    private func startDock(_ game: DockGame, compactPool: Bool, profile: LibraryEntry? = nil) {
         let inLibrary = library.enabled
         guard jit_check_debugged() else {
             logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
@@ -2861,6 +2872,7 @@ struct ContentView: View {
         }
         do {
             try MadeiraDock.validate(game, drive: MadeiraDock.drive)
+            try profile?.validate()
             guard let signIn = SteamSignIn.credentialsForDock() else {
                 throw DockError.message("Sign in to Steam in Madeira before starting Dock.")
             }
@@ -2889,6 +2901,10 @@ struct ContentView: View {
             let p = txt.lowercased().split(separator: "x").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
             if p.count == 2, p[0] >= 640, p[1] >= 360, p[0] <= 3840, p[1] <= 2160 { width = p[0]; height = p[1] }
         }
+        // A Steam game's own Resolution (validated above) sizes its Dock desktop.
+        if let size = profile?.resolution.split(separator: "x").compactMap({ Int($0) }), size.count == 2 {
+            width = size[0]; height = size[1]
+        }
         setenv("MADEIRA_EXE", "explorer.exe", 1)
         setenv("MADEIRA_ARGS", MadeiraDock.launchArguments(width: width, height: height, installers: DockInstallers.script), 1)
         setenv("MADEIRA_DESKTOP", "1", 1)
@@ -2897,8 +2913,11 @@ struct ContentView: View {
         MadeiraDock.requestLaunch(compactPool: compactPool)
         logStore.log("[madeira-dock] starting the host for app \(game.id); Valve's client authenticates and authorizes the launch")
         MadeiraDockModel.shared.watchReport()
-        if inLibrary { library.begin(.dockSession(title: game.name, width: width, height: height), remember: false) }
-        runWineFullSequence()
+        if inLibrary {
+            if let profile { library.begin(profile) }
+            else { library.begin(.dockSession(title: game.name, width: width, height: height), remember: false) }
+        }
+        runWineFullSequence(profile: profile)
     }
 
     /// ml589: locate an installed Steam inside the prefix and (re)generate

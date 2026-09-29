@@ -48,11 +48,51 @@ require(games.startswith('// SPDX-License-Identifier: GPL-3.0-or-later\n// Copyr
         'SteamGames.swift: GPL-3.0-or-later, Copyright 2026 125hz, Converter Exception')
 require('/* SteamGames.swift in Sources */,' in project and 'path = "SteamGames.swift"' in project,
         'SteamGames.swift is built by the Xcode project')
-require('SteamGamesSection(search: search, startDock: startDock)' in library, 'Library: the Steam section is in the library')
+content_view = (app / 'ContentView.swift').read_text()
+require('SteamGamesSection(search: search, open: { selected = $0 })' in library,
+        "Library: the Steam section is in the library and opens the library's Game details page")
 require('MadeiraDock.games(drive: drive)' in games and 'let drive = MadeiraDock.drive' in games,
         "the section lists exactly what Dock's own discovery finds")
-require('startDock(installed, dock.compactPool)' in games and games.count('startDock(') == 1,
-        "Play goes through Dock's launch path, with Dock's per-launch pool toggle")
+# Game details: a Steam game is a library entry (its per-game settings) with a Steam section.
+require('open(LibraryModel.shared.steamEntry(installed, title: item.name))' in games,
+        'an installed Steam game opens its Game details page (its library entry)')
+require(games.count('startDock(') == 0, 'the section never starts Dock itself: Play is on the Game details page')
+detail = library[library.index('struct LibraryDetail: View {'):library.index('struct FPSChoice: View {')]
+steam_section = games[games.index('struct SteamEntrySection'):]
+require('SteamEntrySection(entry: $entry)' in detail and 'if entry.steamAppID != nil {' in detail,
+        'Game details: the Steam section for a Steam game')
+for label in ['"Start with"', '"Madeira Dock"', '"Smaller JIT pool (512 MB) for this launch"', '"One-time installs"',
+              '"Run at next start"', '"Skip"', '"Repair installed files"', '"Uninstall"', '"App ID"',
+              '"Free space on this device"', '"Pause update"', '"Resume update"']:
+    require(label in steam_section, f'Steam section: {label}')
+for label in ['"Library details"', '"Choose cover image"', '"Use Steam artwork"', '"Display"', '"Resolution"',
+              '"Aspect & scaling"', '"Compatibility & performance"', '"Reduced-precision x87"', '"CPU cores reported"',
+              '"D3D9 anisotropic filtering"', '"On screen"', '"Performance overlay"', '"Live logs"', '"Touch controls"',
+              '"Control opacity"', '"Control size"', '"Executable"', '"Game details"']:
+    require(label in detail, f'Game details: {label}')
+require('if entry.desktop != true && entry.steamAppID == nil {' in detail,
+        "no Launch arguments for a Steam game: Dock starts Steam's own launch option")
+entries_start = library.index('private var entries: [LibraryEntry] {')
+require('$0.steamAppID == nil' in library[entries_start:library.index('var body: some View {', entries_start)],
+        'Steam games are listed in the Steam section only, not also under Games')
+launch = content_view[content_view.index('private func launchLibraryEntry('):content_view.index('private func runWineFullSequence(')]
+require('if let appID = entry.steamAppID {' in launch and
+        'startDock(game, compactPool: MadeiraDockModel.shared.compactPool, profile: entry)' in launch,
+        "Play on a Steam game's Game details page starts it through Madeira Dock with its own profile")
+dock_start = content_view[content_view.index('private func startDock('):]
+dock_start = dock_start[:dock_start.index('\n    }\n') + 6]
+require('if let profile { library.begin(profile) }' in dock_start and 'runWineFullSequence(profile: profile)' in dock_start,
+        "a Steam game's session takes its display, overlay and control settings")
+configure = library[library.index('    func configureLaunch() {'):]
+configure = configure[:configure.index('\n    }\n')]
+require(configure.index('if steamAppID != nil {') < configure.index('setenv("MADEIRA_EXE"'),
+        "a Steam game's profile never replaces what Madeira Dock starts")
+apply = library[library.index('    func applyEnvironment() {'):]
+apply = apply[:apply.index('\n    }\n')]
+require('if let cpuCount, (1..<64).contains(cpuCount) { setenv("MADEIRA_CPU_COUNT"' in apply and
+        'if let anisotropyLimit, [1, 2, 4, 8].contains(anisotropyLimit) { setenv("DXMT_D9_ANISO_LIMIT"' in apply and
+        'unsetenv("MADEIRA_CPU_COUNT")' not in apply and 'unsetenv("DXMT_D9_ANISO_LIMIT")' not in apply,
+        'CPU cores and anisotropic filtering are exported only when chosen (default behaviour unchanged)')
 for forbidden in ['setenv(', 'unsetenv(', 'runWineFullSequence', 'writeHandoff', 'credentialsForDock', 'SteamTokenStore',
                   'refreshToken', 'SecItem', 'MADEIRA_EXE', 'MADEIRA_ARGS', 'jit_', 'JITPool', 'poolSize',
                   'steamwebhelper', 'steam.exe', 'SteamSetup', 'FEX_', 'DXMT']:
@@ -119,6 +159,12 @@ func record(_ appID: Int, _ name: String, _ folder: String, flags: Int) -> Strin
                 "a fully installed game (StateFlags 4) in Madeira's Steam library")
         require(found.first { $0.id == 4343 }?.installed == false, "an update in progress is not offered for Play")
         require(first?.windowsInstallPath == "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Fixture Game", "Windows install path")
+        // The size a Game details page shows comes from the install record.
+        try write(apps.appendingPathComponent("appmanifest_4545.acf"),
+                  record(4545, "Sized", "Sized", flags: 4).replacingOccurrences(of: "\n}\n", with: "\n\t\"SizeOnDisk\"\t\t\"12345\"\n}\n"))
+        require(SteamInstallFiles.sizeOnDisk(appID: 4545, steamApps: apps) == 12345 &&
+                SteamInstallFiles.sizeOnDisk(appID: 4242, steamApps: apps) == nil, "install size from the record's SizeOnDisk")
+        try fm.removeItem(at: apps.appendingPathComponent("appmanifest_4545.acf"))
 
         require(R.showsSection(dock: true, signedIn: false, count: 2), "section shown with Dock and games")
         require(!R.showsSection(dock: false, signedIn: true, count: 2), "no section without Dock (MADEIRA_DOCK=0 or no host)")

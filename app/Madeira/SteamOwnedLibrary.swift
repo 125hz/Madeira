@@ -414,11 +414,20 @@ final class SteamOwnedLibrary: ObservableObject {
         }
     }
 
+    /// Checks an installed game's files against the current Steam build and
+    /// downloads what is missing or changed: the downloader compares every chunk
+    /// already on disk by its SHA-1 before fetching it.
+    func repair(_ appID: Int) {
+        SteamLog.event("[steam-repair] app=\(appID) requested=1")
+        install(appID)
+    }
+
     /// Removes an install that Madeira's downloads own (its library folder is
-    /// Madeira Dock's own).
+    /// Madeira Dock's own), with its library entry (its per-game settings).
     func uninstall(_ game: DockGame) {
         guard SteamInstallPaths.isManaged(library: game.library), !inSession else { return }
         pause(game.id); downloads[game.id] = nil
+        LibraryModel.shared.removeSteam(appID: game.id)
         // A reinstall evaluates the game's one-time installs again.
         DockInstallers.setRunsNext(game.id, true, prefix: MadeiraDock.prefix)
         let apps = Self.steamApps, id = game.id, folder = game.installDir

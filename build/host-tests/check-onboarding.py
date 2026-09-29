@@ -118,16 +118,23 @@ require(exes <= {'explorer.exe'}, f'Onboarding.swift: no program-name list ({sor
 require('.exe' not in rules, 'rules key nothing on program names')
 
 # ------------------------------------------------------------------ static: Dock from the library
-start = block(content, 'private func startDock(_ game: DockGame, compactPool: Bool)')
+start = block(content, 'private func startDock(_ game: DockGame, compactPool: Bool')
 require('LibraryView(play: launchLibraryEntry, enableJIT: enableJITViaStikDebug,\n                                startDock: { startDock($0, compactPool: $1) })' in content,
         "ContentView hands Dock's start to the library")
 held = start.index('LibraryModel.sessionsThisRun > 0, MadeiraConfig.flag("MADEIRA_ONE_SESSION_PER_RUN")')
 require(held < start.index('MadeiraDock.writeHandoff('), 'a held Dock start writes no sign-in transfer')
-require('if inLibrary { library.begin(.dockSession(title: game.name, width: width, height: height), remember: false) }' in start
-        and start.index('library.begin(') < start.index('runWineFullSequence()'),
-        'a Dock start from the library is an unsaved library session')
-require(start.count('runWineFullSequence(') == 1 and 'runWineFullSequence()' in start,
-        "Dock's launch path is unchanged (no library profile applied over its environment)")
+require('else { library.begin(.dockSession(title: game.name, width: width, height: height), remember: false) }' in start
+        and start.index('library.begin(') < start.index('runWineFullSequence('),
+        'a Dock start from Settings is an unsaved library session')
+# A Steam game started from its Game details page (SteamGames.swift) is its own library entry: its
+# display, overlay and control settings apply, and its profile never replaces Dock's environment
+# (LibraryEntry.configureLaunch returns before MADEIRA_EXE for a Steam game; check-steam-games.py).
+require('if let profile { library.begin(profile) }' in start and start.count('runWineFullSequence(') == 1
+        and 'runWineFullSequence(profile: profile)' in start,
+        "Dock's launch path takes a Steam game's own profile, and only that")
+configure = block(library, 'func configureLaunch()')
+require(configure.index('if steamAppID != nil {') < configure.index('setenv("MADEIRA_EXE"'),
+        "a Steam game's profile leaves Dock's program, arguments and desktop in place")
 begin = block(library, 'func begin(_ entry: LibraryEntry, remember: Bool = true)')
 require('if remember { var played = entry; played.lastPlayed = Date(); save(played) }' in begin,
         'begin(remember: false) neither adds nor stamps an entry')
