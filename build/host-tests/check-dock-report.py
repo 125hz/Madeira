@@ -42,11 +42,18 @@ let sessionNoWait = parse("[steam-host] ml1970 launch-client-error=35\n[steam-ho
 assert(sessionNoWait.contains("another session") && !sessionNoWait.contains("still says"))
 assert(parse("[steam-host] ml2015 launch-session-wait=35\n[steam-host] ml1970 launch-client-error=22\n[steam-host] ml1830 probe-result=45\n").failure!.contains("configuration"))
 assert(parse("[steam-host] ml1970 launch-client-error=99\n[steam-host] ml1830 probe-result=45\n").failure!.contains("code 45"))
+let callbacks = parse((1...20).map { "[steam-host] ml1830 session-callback-id=\(100 + $0)\n" }.joined() + "[steam-host] ml1830 session-callback-id=x\n")
+assert(callbacks.fields["session-callback-ids"] == (1...16).map { String(100 + $0) }.joined(separator: ","))
+assert(callbacks.fields["session-callback-id"] == nil)
+let entitled = parse("[steam-host] ml1830 session-requested-app-entitled=1\n[steam-host] ml1830 session-subscription-count=12\n")
+assert(entitled.fields["session-requested-app-entitled"] == "1" && entitled.fields["session-subscription-count"] == "12")
+assert(parse("[steam-host] ml1830 session-authenticated-online=1\n[steam-host] ml1830 probe-result=34\n").failure!.contains("did not confirm this game's license in time"))
+assert(parse("[steam-host] ml1830 probe-result=34\n").failure!.contains("did not finish signing in"))
 let rejected = "[steam-host] ml1830 account=synthetic\n[steam-host] ml1830 token=synthetic\n[steam-host] ml1830 probe-result=2147483648\n[steam-host] ml1830 probe-result=secret\n[steam-host] ml1830 client-sha256=invalid\n[steam-host] unknown probe-result=0\n[steam-host] ml1830 probe-result=0 secret\n"
 assert(parse(rejected).fields.isEmpty)
 assert(parse(String(repeating: "x", count: 32769)).fields.isEmpty)
 assert(MadeiraDock.parseReport(Data([0xff])).fields.isEmpty)
-print("PASS: Dock report completion, CRLF, fingerprints, adapter version, failure reasons (including the session wait) and private/malformed field rejection")
+print("PASS: Dock report completion, CRLF, fingerprints, adapter version, callback IDs, failure reasons (including the session wait and the license wait) and private/malformed field rejection")
 '''
 with tempfile.TemporaryDirectory(prefix='madeira-dock-report-') as directory:
     source = Path(directory) / 'main.swift'; binary = Path(directory) / 'check'

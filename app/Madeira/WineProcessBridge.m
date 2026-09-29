@@ -907,10 +907,26 @@ static void *wine_process_thread(void *arg) {
          * steam_appid.txt, set SteamAppPath to that game's directory, and give each child
          * its own environment rather than mutating one process-global set shared by every
          * pseudo-process. This path usually launches explorer.exe and cannot know which
-         * title the desktop will start later, so a conditional here cannot work. */
-        setenv("SteamAppPath", "C:\\Program Files\\Thumper", 1);
-        setenv("SteamGameId", "356400", 1);
-        setenv("SteamAppId",  "356400", 1);
+         * title the desktop will start later, so a conditional here cannot work.
+         *
+         * A Madeira Dock session is the one launch that can know: it runs Valve's
+         * client inside the host process, and the client gives every game it
+         * starts that game's own identity. The fixed identity above reached the
+         * client and the game (both inherit this environment), so a Dock launch
+         * publishes none of the three. ContentView sets MADEIRA_DOCK_SESSION=1 for
+         * a Dock launch only and clears it for every other launch, which keeps
+         * the fixed identity exactly as before. */
+        const char *dock_session = getenv("MADEIRA_DOCK_SESSION");
+        if (dock_session && dock_session[0] == '1') {
+            unsetenv("SteamAppPath");
+            unsetenv("SteamGameId");
+            unsetenv("SteamAppId");
+            dprintf(STDERR_FILENO, "[steam-env] Madeira Dock session: no fixed Steam game identity published\n");
+        } else {
+            setenv("SteamAppPath", "C:\\Program Files\\Thumper", 1);
+            setenv("SteamGameId", "356400", 1);
+            setenv("SteamAppId",  "356400", 1);
+        }
 
         /* iOS-Madeira 2026-07-02: publish the TRUE JIT-pool RX->RW offset to
          * xtajit64.dll (its own FEXCore copy reads this via getenv in

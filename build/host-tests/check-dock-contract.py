@@ -60,7 +60,16 @@ require(dock.count('setenv("MADEIRA_JIT_IMAGE_RETIRE"') == 1 and
         dock.index('setenv("MADEIRA_JIT_IMAGE_RETIRE"') > dock.index('static func configure('),
         'the image-retire switch is set only in the Dock launch environment')
 require(content.count('MadeiraDock.configure(') == 1, 'only the Dock launch configures the host environment')
-git = subprocess.run(['git', '-C', str(root), 'rev-parse', '--git-dir'], capture_output=True, text=True)
+# A Dock session publishes no fixed Steam game identity; every other launch keeps it.
+bridge = (app / 'WineProcessBridge.m').read_text()
+flag = bridge.index('const char *dock_session = getenv("MADEIRA_DOCK_SESSION");')
+require(bridge.index('unsetenv("SteamAppId");', flag) < bridge.index('} else {', flag) < bridge.index('setenv("SteamAppId",', flag),
+        'the bridge clears the fixed Steam identity only for a Dock session')
+require(content.count('setenv("MADEIRA_DOCK_SESSION", "1", 1)') == 1 and
+        'if dockLaunch.dock && SteamSignIn.flag("MADEIRA_DOCK_CLEAR_STEAM_ID", default: true) {' in content and
+        'unsetenv("MADEIRA_DOCK_SESSION")' in content,
+        'only a Dock launch sets MADEIRA_DOCK_SESSION; every other launch clears it')
+git =subprocess.run(['git', '-C', str(root), 'rev-parse', '--git-dir'], capture_output=True, text=True)
 if git.returncode == 0:
     tracked = subprocess.run(['git', '-C', str(root), 'ls-files', 'app/Madeira/arm64ec-windows/dockhost.exe',
                               'app/Madeira/arm64ec-windows/dock-notices.txt'], capture_output=True, text=True).stdout.strip()

@@ -2377,6 +2377,15 @@ struct ContentView: View {
             // Madeira Dock: a Dock launch may opt in to a compact pool (only that
             // launch; off by default). madeira.cfg pool below still wins.
             let dockLaunch = MadeiraDock.takeLaunchRequest()
+            // A Dock session publishes no fixed Steam game identity to its guests
+            // (WineProcessBridge.m): Valve's client runs in the host and gives each
+            // game its own. Every other launch clears the flag and is unchanged.
+            // env.MADEIRA_DOCK_CLEAR_STEAM_ID = 0 keeps the fixed identity (A/B).
+            if dockLaunch.dock && SteamSignIn.flag("MADEIRA_DOCK_CLEAR_STEAM_ID", default: true) {
+                setenv("MADEIRA_DOCK_SESSION", "1", 1)
+            } else {
+                unsetenv("MADEIRA_DOCK_SESSION")
+            }
             var poolSizeMB = DockPerformancePolicy.sessionPoolMB(standard: 896, dock: dockLaunch.dock, compact: dockLaunch.compact)
             if poolSizeMB != 896 { logStore.log("[dock-pool] compact JIT pool \(poolSizeMB)MB for this Dock launch") }
             if let txt = MadeiraConfig.get("pool"),

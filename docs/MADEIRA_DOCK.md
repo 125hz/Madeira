@@ -125,12 +125,25 @@ arguments are not supported.
    one-time installs to run, it is `... C:\windows\system32\cmd.exe /c call
    C:\madeira-dock-installers.cmd & C:\windows\system32\dockhost.exe`: the
    installers first, then the host, in the same session.
+
+   The session publishes no fixed Steam game identity. Every other launch
+   gives its guests one title's `SteamAppId`, `SteamGameId` and `SteamAppPath`
+   (a known compromise in `WineProcessBridge.m`); in a Dock session they
+   reached Valve's client, which runs inside the host, and the game it starts.
+   A Dock launch sets `MADEIRA_DOCK_SESSION=1` and the bridge leaves the three
+   unset (`[steam-env] Madeira Dock session: ...`); Valve's client gives the
+   game its own. `env.MADEIRA_DOCK_CLEAR_STEAM_ID = 0` keeps the fixed identity.
 5. **The report.** Dock writes numeric stages to `C:\madeira-dock.txt`.
    Madeira reads only whitelisted numeric fields and the 64-hex client
    fingerprint (never other guest text), logs changes as `[dock-report]`,
    and turns the final `probe-result` into a message. Covered: unsupported
-   client build, no licence, a bad transfer, Valve's own launch refusal codes,
-   and per-user executable preparation errors.
+   client build, no licence, a licence Valve's client did not confirm within
+   the host's 90 s after sign-in (34), a bad transfer, Valve's own launch
+   refusal codes, and per-user executable preparation errors. The first 16
+   callback IDs Valve's client posts after sign-in are logged in order as
+   `session-callback-ids` (numbers only), with `session-requested-app-entitled`
+   and `session-subscription-count`, so a sign-in that never reaches the
+   licence check can be told apart from one whose licences never arrive.
 6. **Another session.** If Valve's client refuses the launch with 35 (Steam
    still counts the account as playing in another session, which also
    happens for a session that ended without telling Steam until its old
@@ -267,6 +280,7 @@ never asks. The preparation is Valve's; Dock does not touch the files.
 |---|---|---|
 | `MADEIRA_DOCK` | on | `0` hides the Dock button |
 | `MADEIRA_DOCK_COMPACT_POOL` | **off** | `1` starts the sheet's "Smaller JIT pool" toggle on |
+| `MADEIRA_DOCK_CLEAR_STEAM_ID` | on | `0`: a Dock session keeps the fixed Steam game identity every other launch publishes |
 | `MADEIRA_DOCK_CEG` | on | `0`: never ask the client to prepare per-user executables |
 | `MADEIRA_DOCK_IMAGE_RETIRE` | on | `0`: a Dock launch does not turn on the engine's `MADEIRA_JIT_IMAGE_RETIRE` (an explicit `env.MADEIRA_JIT_IMAGE_RETIRE` still wins) |
 | `MADEIRA_DOCK_CLIENT_202601` | on | read by the host: `0` disables its January 2026 client adapter |
@@ -358,8 +372,8 @@ credentials:
     validation, the transfer envelope and subject, the host environment
     (image retire on, and off with `MADEIRA_DOCK_IMAGE_RETIRE=0`), and the
     one-launch request.
-- `check-dock-report.py`: the report parser, its messages, rejection of
-  private and malformed fields, and that every report round the pinned host
+- `check-dock-report.py`: the report parser, its messages (including 34),
+  the ordered callback IDs, rejection of private and malformed fields, and that every report round the pinned host
   writes is accepted.
 - `check-dock-path.py`: the transfer path through Wine's own path resolver
   (`WINE_FILE_C` can point at `dlls/ntdll/unix/file.c` when the wine
