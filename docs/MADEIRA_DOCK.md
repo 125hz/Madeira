@@ -280,7 +280,6 @@ never asks. The preparation is Valve's; Dock does not touch the files.
 |---|---|---|
 | `MADEIRA_DOCK` | on | `0` hides the Dock button |
 | `MADEIRA_DOCK_COMPACT_POOL` | **off** | `1` starts the sheet's "Smaller JIT pool" toggle on |
-| `MADEIRA_DOCK_EARLY_POOL` | on | `0`: when Dock is the route, the pool is still allocated at Play instead of before it (see 64-bit and runtime impact) |
 | `MADEIRA_DOCK_CLEAR_STEAM_ID` | on | `0`: a Dock session keeps the fixed Steam game identity every other launch publishes |
 | `MADEIRA_DOCK_CEG` | on | `0`: never ask the client to prepare per-user executables |
 | `MADEIRA_DOCK_IMAGE_RETIRE` | on | `0`: a Dock launch does not turn on the engine's `MADEIRA_JIT_IMAGE_RETIRE` (an explicit `env.MADEIRA_JIT_IMAGE_RETIRE` still wins) |
@@ -308,23 +307,6 @@ and an explicit madeira.cfg `pool` still wins. Dock's host is itself an x64
 program. A Dock launch also sets `MADEIRA_JIT_IMAGE_RETIRE=1`, the engine's
 opt-in image-retire switch (its own engine PR), for that session only; no
 other session sets it, and an engine without the switch ignores it.
-
-**The pool before Play.** Allocating the JIT pool through the debugger suspends
-the app for about 2 s (`BRK suspension lasted 1.7-2.8s` in Dock starts; the
-fork, which reserves it at app start, logs 0.03 s). When Dock is the route,
-the pool is allocated before Play instead, once the library's Steam scan has
-run: the library front end is shown, Dock can start (client present, a
-sign-in), a Steam game is installed, every library game is a Steam game (so
-it starts through Dock), the compact option is off and nothing has started in
-this app run (`DockPerformancePolicy.earlyPool`,
-`[dock-pool] allocating the 896MB pool before Play`). It is the same
-allocation with the same size a start without the compact option asks for
-(896 MB, or madeira.cfg `pool`), and the debugger stays attached until the
-start detaches it as before; the start then logs `[dock-pool] the start uses
-the pool allocated before Play`. In any other library, or with
-`env.MADEIRA_DOCK_EARLY_POOL = 0`, the pool is allocated at the start as
-before. A start that does not go through Dock (the developer interface) after
-an early pool gets the size it would have asked for itself.
 
 One-time installs change the engine for one session only: a Dock start that
 runs a game's installers sets `MADEIRA_MADSYNC_SESSION=0`, and madsync is off
@@ -386,8 +368,7 @@ credentials:
     pool off by default and Dock-only, madeira.cfg `pool` wins, the
     image-retire switch set only in the Dock launch environment, no built
     binary tracked, submodule pin;
-  - compiled production Swift: pool policy (including when the pool is
-    allocated before Play), manifest and library discovery,
+  - compiled production Swift: pool policy, manifest and library discovery,
     validation, the transfer envelope and subject, the host environment
     (image retire on, and off with `MADEIRA_DOCK_IMAGE_RETIRE=0`), and the
     one-launch request.

@@ -154,23 +154,6 @@ enum SteamGamesRules {
     private var rescan = false
     private var lastCount = -1
 
-    /// When Madeira Dock is the route (DockPerformancePolicy.earlyPool), the pool the
-    /// start takes is allocated now, before Play (StikJITHelper.prepareEarlyPool; once
-    /// per app run). Its size is what a start without the compact option asks for.
-    private func prepareEarlyPoolIfDockRoute(_ found: [DockGame]) {
-        let library = LibraryModel.shared
-        guard library.enabled,
-              DockPerformancePolicy.earlyPool(enabled: SteamSignIn.flag("MADEIRA_DOCK_EARLY_POOL", default: true),
-                                              dockReady: MadeiraDock.clientInstalled && SteamSignIn.isSignedIn,
-                                              installedGames: found.filter(\.installed).count,
-                                              otherLibraryGames: library.entries.filter { $0.steamAppID == nil }.count,
-                                              compact: MadeiraDockModel.shared.compactPool,
-                                              sessionStarted: LibraryModel.sessionsThisRun > 0 || library.current != nil)
-        else { return }
-        let standard = DockPerformancePolicy.sessionPoolMB(standard: 896, dock: true, compact: false)
-        StikJITHelper.prepareEarlyPool(sizeMB: StikJITHelper.configuredPoolMB ?? standard, reason: "Madeira Dock is the route")
-    }
-
     /// Reads the install records again, off the main thread.
     func refresh() {
         guard MadeiraDock.enabled else { return }
@@ -196,7 +179,6 @@ enum SteamGamesRules {
                     self.lastCount = found.count
                     LogStore.shared.log("[steam-games] installed=\(found.count) ready=\(found.filter(\.installed).count)")
                 }
-                self.prepareEarlyPoolIfDockRoute(found)
                 if again { self.refresh() }
             }
         }

@@ -2534,12 +2534,9 @@ struct ContentView: View {
             }
 
             winios_phase("pool-alloc-begin")
+            logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
             let t0 = CFAbsoluteTimeGetCurrent()
-            // A pool allocated before Play when Madeira Dock is the route
-            // (StikJITHelper.prepareEarlyPool); otherwise allocated here, as before.
-            let early = StikJITHelper.takeEarlyPool(sizeMB: poolSizeMB)
-            if early == nil { logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...") }
-            let pool = early ?? StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)
+            let pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)
             let elapsed = CFAbsoluteTimeGetCurrent() - t0
             winios_phase("pool-ready")
             logStore.log("BRK suspension lasted \(String(format: "%.2f", elapsed))s")

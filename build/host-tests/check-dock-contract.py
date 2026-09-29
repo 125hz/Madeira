@@ -60,22 +60,6 @@ require(dock.count('setenv("MADEIRA_JIT_IMAGE_RETIRE"') == 1 and
         dock.index('setenv("MADEIRA_JIT_IMAGE_RETIRE"') > dock.index('static func configure('),
         'the image-retire switch is set only in the Dock launch environment')
 require(content.count('MadeiraDock.configure(') == 1, 'only the Dock launch configures the host environment')
-# The pool before Play: prepared in one place, behind the route policy, and taken by the
-# start before it would allocate its own; the size is a start's own without the compact option.
-games = (app / 'SteamGames.swift').read_text()
-helper = (app / 'StikJITHelper.swift').read_text()
-all_swift = ''.join(p.read_text() for p in app.glob('*.swift'))
-require(all_swift.count('StikJITHelper.prepareEarlyPool(') == 1 and 'DockPerformancePolicy.earlyPool(' in games and
-        games.index('DockPerformancePolicy.earlyPool(') < games.index('StikJITHelper.prepareEarlyPool('),
-        'the pool before Play is prepared only behind the Dock-route policy')
-require('SteamSignIn.flag("MADEIRA_DOCK_EARLY_POOL", default: true)' in games and
-        'DockPerformancePolicy.sessionPoolMB(standard: 896, dock: true, compact: false)' in games and
-        'StikJITHelper.configuredPoolMB ?? standard' in games,
-        'the pool before Play has the size of a start without the compact option (or madeira.cfg pool)')
-require(content.index('StikJITHelper.takeEarlyPool(sizeMB: poolSizeMB)') < content.index('early ?? StikJITHelper.allocatePool('),
-        'the start takes a pool allocated before Play and otherwise allocates its own')
-require('jit_check_debugged()' in helper[helper.index('static func prepareEarlyPool('):helper.index('static func takeEarlyPool(')],
-        'the pool before Play needs the debugger that started the app')
 # A Dock session publishes no fixed Steam game identity; every other launch keeps it.
 bridge = (app / 'WineProcessBridge.m').read_text()
 flag = bridge.index('const char *dock_session = getenv("MADEIRA_DOCK_SESSION");')
@@ -136,18 +120,6 @@ func jwt(_ claims: String) -> String {
         require(DockPerformancePolicy.sessionPoolMB(standard: 896, dock: true, compact: false) == 896, "Dock without the option: standard pool")
         require(DockPerformancePolicy.sessionPoolMB(standard: 896, dock: true, compact: true) == 512, "Dock with the option: 512 MB")
         require(DockPerformancePolicy.sessionPoolMB(standard: 384, dock: true, compact: true) == 384, "never larger than the standard pool")
-        // The pool before Play: only when Madeira Dock is the route.
-        func early(_ enabled: Bool = true, ready: Bool = true, installed: Int = 1, other: Int = 0, compact: Bool = false, started: Bool = false) -> Bool {
-            DockPerformancePolicy.earlyPool(enabled: enabled, dockReady: ready, installedGames: installed, otherLibraryGames: other,
-                                            compact: compact, sessionStarted: started)
-        }
-        require(early(), "Dock is the route: the pool is allocated before Play")
-        require(!early(false), "env.MADEIRA_DOCK_EARLY_POOL = 0: at Play, as before")
-        require(!early(ready: false), "Dock cannot start: at Play")
-        require(!early(installed: 0), "no installed Steam game: at Play")
-        require(!early(other: 1), "a library game that does not start through Dock: at Play")
-        require(!early(compact: true), "compact option (another size than a start without Dock): at Play")
-        require(!early(started: true), "a session already ran in this app run: at Play")
         require(MadeiraDock.takeLaunchRequest() == (false, false), "no request by default")
         MadeiraDock.requestLaunch(compactPool: true)
         require(MadeiraDock.takeLaunchRequest() == (true, true), "a Dock launch request is read once")
