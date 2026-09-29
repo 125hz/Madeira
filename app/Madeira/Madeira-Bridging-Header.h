@@ -5,6 +5,8 @@
 #import "IOSDisplayShim.h"
 #import "Winios/Winios.h"
 #import "Winios/WiniosCursor.h"
+// Steam content decoders (liblzma shim, zstd decoder, zip chunks), used by the owned library's downloads.
+#import "SwiftSteam/lzma_shim.h"
 
 // Wine file-based logging (server_ios.c)
 void wine_log_set_file(const char *path);
