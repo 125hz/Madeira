@@ -2870,54 +2870,70 @@ struct ContentView: View {
             library.restartNotice = LibraryModel.restartMessage
             return
         }
-        do {
-            try MadeiraDock.validate(game, drive: MadeiraDock.drive)
-            try profile?.validate()
-            guard let signIn = SteamSignIn.credentialsForDock() else {
-                throw DockError.message("Sign in to Steam in Madeira before starting Dock.")
-            }
-            try MadeiraDock.writeHandoff(account: signIn.accountName, token: signIn.refreshToken, appID: game.id)
-        } catch {
+        func fail(_ error: Error) {
             MadeiraDock.cleanup()
+            SteamOwnedLibrary.shared.dockEnded()
             MadeiraDockModel.shared.status = error.localizedDescription
             logStore.log("[madeira-dock] not started: \(error.localizedDescription)", level: .error)
             if inLibrary { library.error = error.localizedDescription }
-            return
         }
-        MadeiraDock.configure(game)
-        // The game's one-time installs (its Steam install script) run first, in the same
-        // session. No session runs yet, so the registry files can be read and written.
-        DockInstallers.prepare(game, drive: MadeiraDock.drive, prefix: MadeiraDock.prefix)
-        // Only a start that runs installers turns madsync off, for its own session
-        // (build/madsync/madsync.c reads MADEIRA_MADSYNC_SESSION once, when the server starts).
-        if DockInstallers.serverSync {
-            setenv("MADEIRA_MADSYNC_SESSION", "0", 1)
-            logStore.log("[dock-installers] this session runs one-time installs: madsync off for this session only (MADEIRA_MADSYNC_SESSION=0)")
-        } else {
-            unsetenv("MADEIRA_MADSYNC_SESSION")
+        do {
+            try MadeiraDock.validate(game, drive: MadeiraDock.drive)
+            try profile?.validate()
+            guard SteamSignIn.isSignedIn else { throw DockError.message("Sign in to Steam in Madeira before starting Dock.") }
+        } catch { fail(error); return }
+        // Only one sign-in of the account may be online: the app's own Steam connection
+        // (library, playtime, downloads) logs off and its socket closes before the sign-in
+        // is handed to Valve's client, and it stays off until the Dock session has ended
+        // (SteamOwnedLibrary.prepareDock / dockEnded, SteamConnectionGate).
+        Task { @MainActor in
+            await SteamOwnedLibrary.shared.prepareDock()
+            do {
+                // The launch state may have changed while the connection closed.
+                guard jit_check_debugged(), wine_process_is_running() == 0, wineserver_is_running() == 0,
+                      !inLibrary || library.current == nil else {
+                    throw DockError.message("The launch state changed. Enable JIT and try again.")
+                }
+                guard let signIn = SteamSignIn.credentialsForDock() else {
+                    throw DockError.message("Sign in to Steam in Madeira before starting Dock.")
+                }
+                try MadeiraDock.writeHandoff(account: signIn.accountName, token: signIn.refreshToken, appID: game.id)
+            } catch { fail(error); return }
+            MadeiraDock.configure(game)
+            // The game's one-time installs (its Steam install script) run first, in the same
+            // session. No session runs yet, so the registry files can be read and written.
+            DockInstallers.prepare(game, drive: MadeiraDock.drive, prefix: MadeiraDock.prefix)
+            // Only a start that runs installers turns madsync off, for its own session
+            // (build/madsync/madsync.c reads MADEIRA_MADSYNC_SESSION once, when the server starts).
+            if DockInstallers.serverSync {
+                setenv("MADEIRA_MADSYNC_SESSION", "0", 1)
+                logStore.log("[dock-installers] this session runs one-time installs: madsync off for this session only (MADEIRA_MADSYNC_SESSION=0)")
+            } else {
+                unsetenv("MADEIRA_MADSYNC_SESSION")
+            }
+            var width = 1280, height = 720
+            if let txt = MadeiraConfig.get("desktop-size") {
+                let p = txt.lowercased().split(separator: "x").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+                if p.count == 2, p[0] >= 640, p[1] >= 360, p[0] <= 3840, p[1] <= 2160 { width = p[0]; height = p[1] }
+            }
+            // A Steam game's own Resolution (validated above) sizes its Dock desktop.
+            if let size = profile?.resolution.split(separator: "x").compactMap({ Int($0) }), size.count == 2 {
+                width = size[0]; height = size[1]
+            }
+            setenv("MADEIRA_EXE", "explorer.exe", 1)
+            setenv("MADEIRA_ARGS", MadeiraDock.launchArguments(width: width, height: height, installers: DockInstallers.script), 1)
+            setenv("MADEIRA_DESKTOP", "1", 1)
+            setenv("MADEIRA_SCREEN_W", String(width), 1)
+            setenv("MADEIRA_SCREEN_H", String(height), 1)
+            MadeiraDock.requestLaunch(compactPool: compactPool)
+            logStore.log("[madeira-dock] starting the host for app \(game.id); Valve's client authenticates and authorizes the launch")
+            MadeiraDockModel.shared.watchReport()
+            if inLibrary {
+                if let profile { library.begin(profile) }
+                else { library.begin(.dockSession(title: game.name, width: width, height: height), remember: false) }
+            }
+            runWineFullSequence(profile: profile)
         }
-        var width = 1280, height = 720
-        if let txt = MadeiraConfig.get("desktop-size") {
-            let p = txt.lowercased().split(separator: "x").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-            if p.count == 2, p[0] >= 640, p[1] >= 360, p[0] <= 3840, p[1] <= 2160 { width = p[0]; height = p[1] }
-        }
-        // A Steam game's own Resolution (validated above) sizes its Dock desktop.
-        if let size = profile?.resolution.split(separator: "x").compactMap({ Int($0) }), size.count == 2 {
-            width = size[0]; height = size[1]
-        }
-        setenv("MADEIRA_EXE", "explorer.exe", 1)
-        setenv("MADEIRA_ARGS", MadeiraDock.launchArguments(width: width, height: height, installers: DockInstallers.script), 1)
-        setenv("MADEIRA_DESKTOP", "1", 1)
-        setenv("MADEIRA_SCREEN_W", String(width), 1)
-        setenv("MADEIRA_SCREEN_H", String(height), 1)
-        MadeiraDock.requestLaunch(compactPool: compactPool)
-        logStore.log("[madeira-dock] starting the host for app \(game.id); Valve's client authenticates and authorizes the launch")
-        MadeiraDockModel.shared.watchReport()
-        if inLibrary {
-            if let profile { library.begin(profile) }
-            else { library.begin(.dockSession(title: game.name, width: width, height: height), remember: false) }
-        }
-        runWineFullSequence(profile: profile)
     }
 
     /// ml589: locate an installed Steam inside the prefix and (re)generate

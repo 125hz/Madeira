@@ -105,6 +105,63 @@ struct SteamPlaytime: Codable, Equatable, Sendable {
     }
 }
 
+// MARK: - The account between the app and a game session
+
+/// One Steam account, two possible users: the app's own connection (library,
+/// playtime, downloads) and Valve's client in a game session, to which Madeira
+/// Dock hands the same sign-in. A second logon with the same account replaces
+/// the first one's session, so only one may be logged on: the app's connection
+/// logs off, and its socket is closed, before Dock writes the one-use sign-in
+/// transfer, and it comes back only after the game session ended.
+/// Foundation only (check-steam-library.py compiles and runs it).
+@MainActor final class SteamConnectionGate {
+    private let closeConnection: @MainActor () async -> Void
+    private let reopenConnection: @MainActor () -> Void
+    /// The app's connection may be used (no game session holds the account).
+    private(set) var open = true
+    /// Madeira Dock holds the account: from before its sign-in transfer is
+    /// written until its session ended (or its start failed).
+    private(set) var heldForDock = false
+    private var closing: Task<Void, Never>?
+
+    /// `close` logs the app's connection off and returns once its socket is
+    /// closed; `reopen` lets it connect again.
+    init(close: @escaping @MainActor () async -> Void, reopen: @escaping @MainActor () -> Void) {
+        closeConnection = close
+        reopenConnection = reopen
+    }
+
+    /// A game session starts. Idempotent: the task finishes when the socket is closed.
+    @discardableResult func close() -> Task<Void, Never> {
+        if let closing { return closing }
+        open = false
+        let task = Task { await closeConnection() }
+        closing = task
+        return task
+    }
+
+    /// Madeira Dock is about to hand the sign-in to Valve's client: returns only
+    /// once the app's connection is logged off and closed. Until `releaseDock()`
+    /// the connection stays closed whatever else happens.
+    func holdForDock() async {
+        heldForDock = true
+        await close().value
+    }
+
+    /// Madeira Dock's session ended, or its start failed.
+    func releaseDock() { heldForDock = false }
+
+    /// Lets the app's connection back when no game session runs and Dock does
+    /// not hold the account. Returns whether it reopened.
+    @discardableResult func reopen(sessionRunning: Bool) -> Bool {
+        guard !open, !sessionRunning, !heldForDock else { return false }
+        open = true
+        closing = nil
+        reopenConnection()
+        return true
+    }
+}
+
 // MARK: - Model
 
 @MainActor
@@ -138,6 +195,9 @@ final class SteamOwnedLibrary: ObservableObject {
     private var resumeAfterBackgroundIDs = Set<Int>()
 
     private let session = SteamSession()
+    /// The app's connection is closed while a game session (or Madeira Dock) holds the account.
+    private lazy var gate = SteamConnectionGate(close: { [session] in await session.suspend() },
+                                                reopen: { [session] in session.resume() })
     private lazy var fetcher = SteamLibraryFetcher(session: session)
     private lazy var downloader = DepotDownloader(session: session)
     private var started = false
@@ -293,22 +353,24 @@ final class SteamOwnedLibrary: ObservableObject {
 
     /// A game session is starting (ContentView starts the Wine session) or ended.
     /// Downloads pause for a session (memory and I/O belong to the game) and
-    /// continue afterwards, and the Steam connection closes before Valve's own
-    /// client signs in with the same account. Idempotent.
+    /// continue afterwards; the app's Steam connection is closed for the whole
+    /// session (SteamConnectionGate). Idempotent.
     func sessionChanged(active running: Bool) {
         guard Self.enabled, running != inSession else { return }
-        inSession = running
         if running {
+            inSession = true
             if let current = active {
                 resumeAfterSession.insert(current.id)
                 current.task.cancel()
             }
             for id in queue { resumeAfterSession.insert(id); downloads[id]?.state = .paused }
             queue.removeAll()
-            Task { await session.suspend() }
+            gate.close()
             SteamLog.event("[steam-depot] paused for a game session count=\(resumeAfterSession.count)")
         } else {
-            session.resume()
+            // Madeira Dock may still hold the account (dockEnded() releases it).
+            guard gate.reopen(sessionRunning: false) else { return }
+            inSession = false
             let resume = resumeAfterSession.sorted()
             resumeAfterSession.removeAll()
             for id in resume { install(id) }
@@ -316,6 +378,27 @@ final class SteamOwnedLibrary: ObservableObject {
             // Steam records the session's playtime when the game ends.
             Task { try? await Task.sleep(nanoseconds: 5_000_000_000); await self.refreshPlaytime() }
         }
+    }
+
+    /// Before Madeira Dock writes the one-use sign-in transfer for Valve's
+    /// client (ContentView.startDock): downloads stop (the running one is
+    /// awaited), and the app's own connection logs off and its socket closes.
+    /// Returns when the account is free; the connection stays closed until
+    /// `dockEnded()` and the end of the session.
+    func prepareDock() async {
+        let running = active?.task
+        sessionChanged(active: true)
+        await running?.value
+        await gate.holdForDock()
+        SteamLog.event("[steam-library] connection closed for Madeira Dock")
+    }
+
+    /// Madeira Dock's session ended, or its start failed (MadeiraDockModel,
+    /// ContentView.startDock): the connection comes back once no session runs.
+    func dockEnded() {
+        guard gate.heldForDock else { return }
+        gate.releaseDock()
+        reconcileSession()
     }
 
     /// Whether a Wine session runs in this app run (any interface).

@@ -58,7 +58,7 @@ for switch in ('MADEIRA_DOCK_INSTALLERS', 'MADEIRA_INSTALL_DEFAULT_KEY', 'MADEIR
     require(f'flag("{switch}")' in installers, f'switch {switch} is read')
 require('reg.exe' not in installers, 'the batch never writes the registry (no reg.exe in the bundle)')
 require(content.count('setenv("MADEIRA_MADSYNC_SESSION", "0", 1)') == 1 and
-        'if DockInstallers.serverSync {\n            setenv("MADEIRA_MADSYNC_SESSION", "0", 1)' in content and
+        re.search(r'if DockInstallers\.serverSync \{\n\s*setenv\("MADEIRA_MADSYNC_SESSION", "0", 1\)', content) and
         'unsetenv("MADEIRA_MADSYNC_SESSION")' in content, 'madsync is turned off only for a Dock start that runs installers')
 for name, text in [('MadeiraDock.swift', dock), ('MadeiraDockView.swift', view)]:
     require('MADEIRA_MADSYNC_SESSION' not in text, f'{name}: does not touch the madsync session switch')

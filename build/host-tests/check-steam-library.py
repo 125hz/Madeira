@@ -162,6 +162,35 @@ require('SteamDownloadBackground.shared.downloadStarted(appID: appID' in owned_t
 content_view = (app / 'ContentView.swift').read_text()
 require(content_view.count('SteamOwnedLibrary.shared.sessionChanged(active: true)') == 1,
         'a session start pauses downloads and closes the Steam connection (one call, in runWineFullSequence)')
+# Madeira Dock: the app's own connection is logged off (socket closed) before the one-use sign-in
+# is written, and stays off until the Dock session ended (the ordering the gate test above runs).
+dock_start = block(content_view, 'private func startDock(')
+order = [dock_start.find(s) for s in ('await SteamOwnedLibrary.shared.prepareDock()', 'SteamSignIn.credentialsForDock()',
+                                      'try MadeiraDock.writeHandoff(', 'runWineFullSequence(profile: profile)')]
+require(-1 not in order and order == sorted(order),
+        'Dock start: the app connection closes, then the sign-in is read and handed over, then the session starts')
+require(dock_start.count('SteamSignIn.credentialsForDock()') == 1 and dock_start.count('MadeiraDock.writeHandoff(') == 1,
+        'the sign-in is read and written once, after the connection closed')
+require('SteamOwnedLibrary.shared.dockEnded()' in dock_start[:dock_start.index('Task { @MainActor in')],
+        'a failed Dock start gives the connection back')
+dock_view = (app / 'MadeiraDockView.swift').read_text()
+watch = block(dock_view, 'func watchReport()')
+require(watch.index('MadeiraDock.cleanup()') < watch.index('SteamOwnedLibrary.shared.dockEnded()'),
+        "the connection may come back only when the Dock host's report or session is over")
+owned_model = sources['SteamOwnedLibrary.swift']
+prepare = block(owned_model, 'func prepareDock() async')
+require(prepare.index('sessionChanged(active: true)') < prepare.index('await running?.value') < prepare.index('await gate.holdForDock()'),
+        'prepareDock pauses downloads, waits for the running one, then waits for the connection to close')
+changed = block(owned_model, 'func sessionChanged(active running: Bool)')
+require('guard gate.reopen(sessionRunning: false) else { return }' in changed and 'gate.close()' in changed
+        and 'session.resume()' not in changed and 'session.suspend()' not in changed,
+        'a session ending reopens the connection only through the gate (never while Dock holds the account)')
+session_source = sources['SwiftSteam/Core/SteamSession.swift']
+suspend = block(session_source, 'func suspend() async')
+require(suspend.index('isSuspended = true') < suspend.index('await disconnectGracefully()') < suspend.index('await connection.disconnect()'),
+        'suspend: no reconnect from here on, log off, then wait for the socket to close')
+require('if self.isSuspended {' in session_source and 'eMsg: .clientLogOff' in session_source[session_source.index('if self.isSuspended {'):],
+        'a logon that completes after suspend() logs straight off again')
 runtime = (app / 'SteamRuntime.swift').read_text()
 relative_root = re.search(r'static let relativeRoot = "([^"]+)"', runtime).group(1)
 require(sources['SteamInstall.swift'].count(f'"{relative_root}/steamapps"') == 1,
@@ -705,6 +734,40 @@ func packageBuffer(apps: [UInt32], depots: [UInt32]) -> Data {
     require(playtime[5001]?.played == nil && playtime[5001]?.lastPlayedText() != nil, "a game only last played has no playtime text")
     do { _ = try SteamPlaytime.parse(Data([0x12, 0x7f, 0x01])); require(false, "a truncated playtime record is rejected") }
     catch { require(error is SteamError, "a truncated playtime record is rejected") }
+
+    // ---- the account between the app's connection and a game session (SteamConnectionGate)
+    var events: [String] = []
+    let gate = SteamConnectionGate(close: {
+        events.append("logoff-sent")
+        try? await Task.sleep(nanoseconds: 60_000_000)       // the socket takes a while to close
+        events.append("socket-closed")
+    }, reopen: { events.append("reopened") })
+    require(gate.open && !gate.heldForDock, "the app's connection is open without a session")
+    // Madeira Dock: the sign-in transfer is written only after holdForDock() returns.
+    await gate.holdForDock()
+    events.append("sign-in-transfer-written")
+    require(events == ["logoff-sent", "socket-closed", "sign-in-transfer-written"],
+            "Dock: the app's connection logs off and its socket closes before the sign-in is handed over: \(events)")
+    // runWineFullSequence's own sessionChanged(true) after that closes nothing again.
+    gate.close()
+    await Task.yield()
+    require(events.filter { $0 == "logoff-sent" }.count == 1, "closing again is a no-op")
+    // Nothing reopens the connection while Dock holds the account, even with no session detected yet.
+    require(!gate.reopen(sessionRunning: false) && !events.contains("reopened"),
+            "while Dock holds the account the connection stays closed (no session seen yet)")
+    gate.releaseDock()
+    require(!gate.reopen(sessionRunning: true) && !events.contains("reopened"), "the Dock session still runs: still closed")
+    require(gate.reopen(sessionRunning: false) && events.last == "reopened" && gate.open, "the session ended: the connection may come back")
+    require(!gate.reopen(sessionRunning: false) && events.filter { $0 == "reopened" }.count == 1, "reopening is idempotent")
+    // A session that starts while a close is under way: Dock waits for that same close.
+    events.removeAll()
+    let first = gate.close()
+    await gate.holdForDock()
+    events.append("sign-in-transfer-written")
+    await first.value
+    require(events == ["logoff-sent", "socket-closed", "sign-in-transfer-written"],
+            "a Dock start during a session's close waits for that close: \(events)")
+    gate.releaseDock(); gate.reopen(sessionRunning: false)
 
     // ---- app info: depot selection
     let full = appVDF(#"""

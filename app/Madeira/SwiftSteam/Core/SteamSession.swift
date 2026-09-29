@@ -332,6 +332,22 @@ class SteamSession {
                     return
                 }
 
+                // A game session took the account while this logon was on its way
+                // (suspend() ran): log straight off again instead of staying online
+                // next to Valve's client.
+                if self.isSuspended {
+                    let logoff = SteamMessageCodec.encodeClientMessage(eMsg: .clientLogOff, body: Data(),
+                                                                      steamID: message.header.steamid,
+                                                                      sessionID: message.header.clientSessionid)
+                    Task { [connection = self.connection] in
+                        try? await connection.send(logoff)
+                        await connection.disconnect()
+                    }
+                    SteamLog.trace("Logon completed during a game session: logged off again")
+                    resumeThrowing(SteamError.disconnected)
+                    return
+                }
+
                 self.steamID = message.header.steamid
                 self.sessionID = message.header.clientSessionid
                 self.heartbeatInterval = heartbeatSecs
