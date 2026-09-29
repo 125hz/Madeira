@@ -6,7 +6,8 @@ exit report.
    (app/Madeira/Library.swift) and the display layout (app/Madeira/
    GuestDisplay.swift) with small stubs and checks the launch environment a
    profile exports (executable, arguments, virtual monitor size for every
-   entry, x87 precision only when chosen, nothing else for the engine), the
+   entry, x87 precision only when chosen, fastsync's switches only when
+   Settings chose Fastsync, nothing else for the engine), the
    30 FPS fallback without DXMT's 30 FPS cap, profile validation, decoding of
    library files that carry unknown or fork-written keys (display mode,
    control opacity and size), the layout and touch-mapping math of every
@@ -78,7 +79,13 @@ final class PassthroughSubject<Output, Failure: Error> {
     func sink(receiveValue: @escaping (Output) -> Void) -> AnyCancellable { receivers.append(receiveValue); return AnyCancellable() }
 }
 #endif
-enum MadeiraConfig { static func flag(_ name: String, fallback: Bool = true) -> Bool { fallback } }
+enum MadeiraConfig {
+    static var values: [String: String] = [:]   // stands in for madeira.cfg
+    static func flag(_ name: String, fallback: Bool = true) -> Bool { fallback }
+    static func get(_ key: String) -> String? { values[key] }
+    static func bool(_ key: String, default dflt: Bool = false) -> Bool { values[key].map { ["1", "on", "true", "yes"].contains($0) } ?? dflt }
+    @discardableResult static func set(_ key: String, _ value: String?) -> Bool { values[key] = value; return true }
+}
 final class LogStore { static let shared = LogStore(); var lines: [String] = []; func log(_ s: String) { lines.append(s) } }
 var published: (Int32, Int32) = (0, 0)
 func winios_display_mode_changed(_ w: Int32, _ h: Int32) { published = (w, h) }
@@ -90,6 +97,7 @@ enum LibraryError: LocalizedError { case message(String) }
 func env(_ name: String) -> String? { getenv(name).map { String(cString: $0) } }
 '''
 swift += block(lib, 'struct LibraryEntry: Codable, Identifiable') + '\n'
+swift += block(lib, 'enum SyncEngine: String, CaseIterable, Identifiable') + '\n'
 swift += '\n'.join(l for l in display.splitlines() if not l.startswith('import ')) + '\n'
 swift += block(lib, 'final class LibraryController: ObservableObject, @unchecked Sendable') + '\n'
 swift += r'''
@@ -130,6 +138,20 @@ expect(env("FEX_X87REDUCEDPRECISION") == nil, "x87: nothing exported unless chos
 expect(env("MADEIRA_CPU_COUNT") == nil && env("MADEIRA_FASTSYNC") == nil && env("MADEIRA_FASTSYNC_SEM") == nil
        && env("DXMT_D9_ANISO_LIMIT") == nil, "no other engine switches are exported")
 expect(LogStore.shared.lines.last == "[display-shape] resolution=1280x720 mode=fit", "the profile's display shape is logged")
+// Fastsync's per-game switches: exported only when Settings chose Fastsync.
+MadeiraConfig.values = ["inproc-sync": "0"]
+game.applyEnvironment()
+expect(env("MADEIRA_FASTSYNC") == nil && env("MADEIRA_FASTSYNC_SEM") == nil, "Wine standard sync: no fastsync switches")
+MadeiraConfig.values = ["inproc-sync": "0", "env.MADEIRA_FASTSYNC": "auto"]
+game.applyEnvironment()
+expect(env("MADEIRA_FASTSYNC") == "auto" && env("MADEIRA_FASTSYNC_SEM") == "0",
+       "Fastsync: fast synchronization on by default (the chosen mode), semaphore waits off")
+game.fastSync = false; game.semaphoreFastPath = true; game.applyEnvironment()
+expect(env("MADEIRA_FASTSYNC") == "0" && env("MADEIRA_FASTSYNC_SEM") == "1", "Fastsync: the game's own switches are exported")
+MadeiraConfig.values = ["env.MADEIRA_FASTSYNC": "auto"]
+unsetenv("MADEIRA_FASTSYNC"); unsetenv("MADEIRA_FASTSYNC_SEM"); game.applyEnvironment()
+expect(env("MADEIRA_FASTSYNC") == nil && env("MADEIRA_FASTSYNC_SEM") == nil, "Madsync on: the game's fastsync switches are not exported")
+MadeiraConfig.values = [:]; game.fastSync = nil; game.semaphoreFastPath = nil
 game.reducedX87 = true; game.applyEnvironment()
 expect(env("FEX_X87REDUCEDPRECISION") == "1", "reduced x87 exported when chosen")
 game.reducedX87 = false
