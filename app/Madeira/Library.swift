@@ -196,12 +196,41 @@ struct LibraryEntry: Codable, Identifiable {
     /// through Valve's client, with Steam's default launch option.
     /// `relativePath` is then its install folder, relative to drive_c.
     var steamAppID: Int?
+    /// How a Steam game starts (Game details › Steam › Start with): nil is Madeira
+    /// Dock, the default; "game" is the game's own program in Wine, without Steam
+    /// (SteamDirectStart).
+    var steamStart: String?
+    /// "The game": the program, relative to the install folder ("bin/game.exe"), its
+    /// arguments, and its working folder (relative to the install folder; nil: the
+    /// program's own folder, "": the install folder), from Steam's launch configuration
+    /// for the app ("steam"), the Program picker ("choice") or the folder's only
+    /// program ("only").
+    var steamProgram: String?
+    var steamProgramArguments: String?
+    var steamProgramFolder: String?
+    var steamProgramSource: String?
 
     var displayMode: DisplayMode { display.flatMap(DisplayMode.init(rawValue:)) ?? .fit }
 
     var launchArguments: String {
         if desktop == true { return "/desktop=shell,\(resolution) C:\\windows\\system32\\services.exe" }
+        if startsSteamGameDirectly { return steamProgramArguments ?? "" }
         return arguments
+    }
+
+    /// A Steam game that starts as its own program ("Start with: The game").
+    var startsSteamGameDirectly: Bool { steamAppID != nil && steamStart == "game" }
+    /// What a launch starts, relative to drive_c: "The game"'s program inside the
+    /// install folder, else `relativePath`.
+    var launchRelativePath: String {
+        guard startsSteamGameDirectly, let program = steamProgram, !program.isEmpty else { return relativePath }
+        return relativePath + "/" + program
+    }
+    var launchWindowsPath: String { "C:\\" + launchRelativePath.replacingOccurrences(of: "/", with: "\\") }
+    /// "The game"'s working folder as a Windows path, or nil for the program's own folder.
+    var steamWorkingWindowsPath: String? {
+        guard startsSteamGameDirectly, let folder = steamProgramFolder else { return nil }
+        return "C:\\" + (folder.isEmpty ? relativePath : relativePath + "/" + folder).replacingOccurrences(of: "/", with: "\\")
     }
 
     static let desktopID = UUID(uuidString: "AF046C35-C32A-497B-92BC-0BBD14F8CB61")!
@@ -220,7 +249,9 @@ struct LibraryEntry: Codable, Identifiable {
     func validate() throws {
         let size = resolution.split(separator: "x").compactMap { Int($0) }
         guard size.count == 2, (320...4096).contains(size[0]), (240...4096).contains(size[1]),
-              (0...3).contains(fpsMode), !arguments.contains("\0"), !windowsPath.contains("\0") else {
+              (0...3).contains(fpsMode), !arguments.contains("\0"), !windowsPath.contains("\0"),
+              !launchArguments.contains("\0"), !launchWindowsPath.contains("\0"),
+              launchWindowsPath.utf8.count < 1024, (steamWorkingWindowsPath?.utf8.count ?? 0) < 512 else {
             throw LibraryError.message("The saved launch profile contains invalid display or argument values.")
         }
         var quoted = false, inToken = false, tokens = 0
@@ -250,15 +281,28 @@ struct LibraryEntry: Codable, Identifiable {
 
     /// What the bridge starts. Set on the main thread before the session begins.
     func configureLaunch() {
-        // A Steam game: Madeira Dock has set what starts (ContentView.startDock);
-        // the virtual monitor follows this entry's Resolution, as below.
+        // "The game"'s identity and working folder for this launch only (the bridge
+        // reads and clears them); every other launch starts without them.
+        unsetenv("MADEIRA_STEAM_APPID"); unsetenv("MADEIRA_STEAM_APPPATH"); unsetenv("MADEIRA_WORKDIR")
         if steamAppID != nil {
-            GuestDisplay.configureSessionDefault(view: CGSize(width: 1280, height: 720), knob: resolution)
-            return
+            // A Steam game through Madeira Dock: Dock has set what starts (ContentView.startDock);
+            // the virtual monitor follows this entry's Resolution, as below. "The game" starts
+            // its own program below, like any library game.
+            if !startsSteamGameDirectly {
+                GuestDisplay.configureSessionDefault(view: CGSize(width: 1280, height: 720), knob: resolution)
+                return
+            }
         }
-        setenv("MADEIRA_EXE", desktop == true ? "explorer.exe" : windowsPath, 1)
+        setenv("MADEIRA_EXE", desktop == true ? "explorer.exe" : launchWindowsPath, 1)
         setenv("MADEIRA_ARGS", launchArguments, 1)
         if desktop == true { setenv("MADEIRA_DESKTOP", "1", 1) } else { unsetenv("MADEIRA_DESKTOP") }
+        if startsSteamGameDirectly, let steamAppID {
+            // The game's own Steam identity (SteamAppId, SteamGameId, SteamAppPath = its install
+            // folder) instead of the bridge's fixed one, and Steam's working folder when it names one.
+            setenv("MADEIRA_STEAM_APPID", String(steamAppID), 1)
+            setenv("MADEIRA_STEAM_APPPATH", windowsPath, 1)
+            if let folder = steamWorkingWindowsPath { setenv("MADEIRA_WORKDIR", folder, 1) }
+        }
         // Every session's virtual monitor takes this entry's Resolution
         // (MADEIRA_SCREEN_W/H, source "knob"); for the Desktop entry it is the
         // same size as its /desktop= argument.
@@ -1241,13 +1285,16 @@ struct LibraryDetail: View {
     private func start() {
         guard !leaving else { return }
         // A Steam game starts through Madeira Dock (ContentView.launchLibraryEntry)
-        // once its files are complete and Dock can sign in.
+        // once its files are complete and Dock can sign in; "The game" once its
+        // program is chosen (no client or sign-in involved).
         if let appID = entry.steamAppID {
             if SteamOwnedLibrary.shared.downloads[appID] != nil {
                 error = "This game's update has not finished. Resume it and wait for it to complete before playing."; return
             }
             let installed = SteamGamesModel.shared.games.first { $0.id == appID }?.installed ?? false
-            if let blocker = SteamGamesRules.blocker(installed: installed, client: MadeiraDock.clientInstalled, signedIn: SteamSignIn.isSignedIn) {
+            if entry.startsSteamGameDirectly {
+                if let blocker = SteamDirectStart.blocker(installed: installed, program: entry.steamProgram) { error = blocker; return }
+            } else if let blocker = SteamGamesRules.blocker(installed: installed, client: MadeiraDock.clientInstalled, signedIn: SteamSignIn.isSignedIn) {
                 error = blocker; return
             }
         }
@@ -1348,9 +1395,14 @@ struct LibraryDetail: View {
                 }
                 if entry.steamAppID != nil {
                     Section {
-                        Text(entry.windowsPath).font(.caption.monospaced()).textSelection(.enabled)
+                        Text(entry.launchWindowsPath).font(.caption.monospaced()).textSelection(.enabled)
+                        if entry.startsSteamGameDirectly, !entry.launchArguments.isEmpty {
+                            Text(entry.launchArguments).font(.caption.monospaced()).textSelection(.enabled)
+                        }
                     } header: { Text("Executable") } footer: {
-                        Text("Valve's client starts the game's default Steam launch option from this folder.")
+                        Text(entry.startsSteamGameDirectly
+                             ? "The game starts this program directly, without Steam."
+                             : "Valve's client starts the game's default Steam launch option from this folder.")
                     }
                 } else if entry.desktop != true {
                     Section("Executable") { Text(entry.windowsPath).font(.caption.monospaced()).textSelection(.enabled) }

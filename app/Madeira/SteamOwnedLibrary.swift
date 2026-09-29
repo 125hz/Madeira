@@ -36,6 +36,9 @@ struct SteamOwnedGame: Codable, Identifiable, Hashable, Sendable {
     var libraryHero: String?
     var headerImage: String?
     var parentID: Int?
+    /// Steam's launch configuration, for "Start with: The game" (SteamDirectStart);
+    /// nil in older caches, which then ask Steam once (SteamOwnedLibrary.launchOptions).
+    var launches: [SteamLaunchOption]?
 
     init(_ info: SteamAppInfo) {
         id = Int(info.appID)
@@ -44,6 +47,7 @@ struct SteamOwnedGame: Codable, Identifiable, Hashable, Sendable {
         buildID = Int(info.buildID)
         libraryCapsule = info.libraryCapsule; libraryHero = info.libraryHero; headerImage = info.headerImage
         parentID = info.parentID.map(Int.init)
+        launches = info.launches
     }
 
     var folderName: String { SteamInstallFiles.safeFolderName(installDir.isEmpty ? "app_\(id)" : installDir) }
@@ -301,15 +305,39 @@ final class SteamOwnedLibrary: ObservableObject {
             owned = games
             libraryUpdated = Date()
             cachedAccount = Self.accountKey(SteamSignIn.accountName)
-            if let account = cachedAccount {
-                try? FileManager.default.createDirectory(at: Self.supportFolder, withIntermediateDirectories: true)
-                try? JSONEncoder().encode(Cache(version: 2, updated: libraryUpdated!, account: account, games: games))
-                    .write(to: Self.cacheURL, options: .atomic)
-            }
+            writeCache()
             SteamLog.event("[steam-library] owned apps=\(apps.count) windows-installable=\(games.count)")
             await refreshPlaytime()
         } catch {
             handleSessionError(error, context: "library", report: interactive)
+        }
+    }
+
+    private func writeCache() {
+        guard let account = cachedAccount, let updated = libraryUpdated else { return }
+        try? FileManager.default.createDirectory(at: Self.supportFolder, withIntermediateDirectories: true)
+        try? JSONEncoder().encode(Cache(version: 2, updated: updated, account: account, games: owned))
+            .write(to: Self.cacheURL, options: .atomic)
+    }
+
+    /// Steam's launch configuration for an owned app, for "Start with: The game"
+    /// (SteamDirectStart): from the cached library, else asked of Steam once over the
+    /// app's own connection (signed in, no session running) and kept in the cache.
+    /// nil when it cannot be had; the Program picker then decides.
+    func launchOptions(appID: Int) async -> [SteamLaunchOption]? {
+        if let cached = game(appID)?.launches { return cached }
+        guard Self.enabled, signedIn, !inSession, appID > 0, appID <= Int(UInt32.max) else { return nil }
+        do {
+            guard let info = try await fetcher.fetchAppInfo(appID: UInt32(appID)) else { return nil }
+            if let index = owned.firstIndex(where: { $0.id == appID }) {
+                owned[index].launches = info.launches
+                writeCache()
+            }
+            SteamLog.event("[steam-start] launch configuration app=\(appID) entries=\(info.launches.count)")
+            return info.launches
+        } catch {
+            handleSessionError(error, context: "start", report: false)
+            return nil
         }
     }
 

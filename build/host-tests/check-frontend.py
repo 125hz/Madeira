@@ -122,6 +122,36 @@ expect(env("MADEIRA_SCREEN_W") == "1560" && env("MADEIRA_SCREEN_H") == "720" && 
 expect((try? game.validate()) != nil, "a screen-shape resolution validates")
 game.resolution = "1280x720"; game.configureLaunch()
 
+// A Steam game: Madeira Dock sets what starts, so its profile leaves MADEIRA_EXE alone...
+var steamGame = LibraryEntry(title: "Steam game", relativePath: "Program Files (x86)/Steam/steamapps/common/Some Game", bits: 0)
+steamGame.steamAppID = 4242
+setenv("MADEIRA_EXE", "set-by-dock", 1); setenv("MADEIRA_STEAM_APPID", "1", 1)
+steamGame.configureLaunch()
+expect(env("MADEIRA_EXE") == "set-by-dock" && env("MADEIRA_STEAM_APPID") == nil, "Madeira Dock (the default): the profile sets nothing that starts")
+// ...and "Start with: The game" starts the game's own program, with the game's own Steam identity.
+steamGame.steamStart = "game"; steamGame.steamProgram = "bin/game.exe"; steamGame.steamProgramArguments = "-dx11 \"-name=a b\""
+steamGame.steamProgramFolder = "data"
+expect((try? steamGame.validate()) != nil, "a direct Steam start validates")
+steamGame.configureLaunch()
+let steamFolder = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Some Game"
+expect(env("MADEIRA_EXE") == steamFolder + "\\bin\\game.exe", "The game: its program")
+expect(env("MADEIRA_ARGS") == "-dx11 \"-name=a b\"", "The game: Steam's arguments verbatim")
+expect(env("MADEIRA_STEAM_APPID") == "4242" && env("MADEIRA_STEAM_APPPATH") == steamFolder,
+       "The game: its own App ID and install folder for the bridge")
+expect(env("MADEIRA_WORKDIR") == steamFolder + "\\data", "The game: Steam's working folder")
+steamGame.steamProgramFolder = ""; steamGame.configureLaunch()
+expect(env("MADEIRA_WORKDIR") == steamFolder, "working folder \"\": the install folder")
+steamGame.steamProgramFolder = nil; steamGame.configureLaunch()
+expect(env("MADEIRA_WORKDIR") == nil, "no working folder: the program's own (the bridge's default)")
+expect(steamGame.windowsPath == steamFolder &&
+       steamGame.launchRelativePath == "Program Files (x86)/Steam/steamapps/common/Some Game/bin/game.exe",
+       "the entry keeps its install folder; only the launch path names the program")
+steamGame.steamProgram = nil; steamGame.configureLaunch()
+expect(env("MADEIRA_EXE") == steamFolder, "no program: the folder (ContentView refuses it first)")
+game.configureLaunch()
+expect(env("MADEIRA_STEAM_APPID") == nil && env("MADEIRA_STEAM_APPPATH") == nil && env("MADEIRA_WORKDIR") == nil,
+       "any other launch clears the direct start's identity and folder")
+
 // Engine switches: only x87 precision, and only when chosen (FEX's default otherwise).
 expect(!game.reducedX87, "reduced-precision x87 is off for new entries")
 setenv("FEX_X87REDUCEDPRECISION", "1", 1)

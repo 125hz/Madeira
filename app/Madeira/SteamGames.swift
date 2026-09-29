@@ -139,6 +139,142 @@ enum SteamGamesRules {
     }
 }
 
+/// "Start with: The game" on a Steam game's Game details page: the game's own
+/// program runs in Wine without Steam, which suits games that do not need Steam
+/// (DRM-free ones). Which program is Steam's own launch configuration for the app
+/// (its product info's `config.launch`), never a list of program names; when that
+/// names nothing that can run here, the user picks one of the install folder's
+/// programs. Madeira Dock stays the default.
+enum SteamDirectStart {
+    /// LibraryEntry.steamStart for this start; nil there is Madeira Dock.
+    static let mode = "game"
+
+    /// What "The game" starts: the program, relative to the install folder and
+    /// spelt as on disk, its arguments, and its working folder (nil: the program's
+    /// own folder; "": the install folder).
+    struct Choice: Equatable {
+        var program: String
+        var arguments: String
+        var folder: String?
+    }
+
+    /// Launch types Steam gives entries that are not the game itself.
+    static let otherKinds: Set<String> = ["server", "editor", "vr", "othervr", "openvroverlay", "osvr", "manual"]
+
+    /// A path from Steam's launch configuration in slash form (bin/game.exe), or nil
+    /// for anything that could leave the install folder or is not a plain name: an
+    /// absolute path, a drive, "..", a control or reserved character. "." parts go.
+    static func relativePath(_ raw: String) -> String? {
+        let text = raw.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\\", with: "/")
+        guard !text.hasPrefix("/"), text.utf8.count <= 512,
+              !text.unicodeScalars.contains(where: { $0.value < 0x20 || "<>:\"|?*".unicodeScalars.contains($0) }) else { return nil }
+        var parts: [Substring] = []
+        for part in text.split(separator: "/") where part != "." {
+            if part == ".." { return nil }
+            parts.append(part)
+        }
+        return parts.joined(separator: "/")
+    }
+
+    /// `relative` found under `root` one name at a time, exactly or else without case
+    /// (as Windows finds it): its spelling on disk, or nil when a name is missing, the
+    /// last one is not of the kind asked for, or the result leaves `root`.
+    static func onDisk(_ relative: String, in root: URL, directory: Bool) -> String? {
+        let fm = FileManager.default
+        var url = root
+        var spelled: [String] = []
+        for part in relative.split(separator: "/").map(String.init) {
+            guard let names = try? fm.contentsOfDirectory(atPath: url.path),
+                  let name = names.first(where: { $0 == part }) ?? names.first(where: { $0.caseInsensitiveCompare(part) == .orderedSame })
+            else { return nil }
+            url.appendPathComponent(name)
+            spelled.append(name)
+        }
+        var isDirectory: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue == directory else { return nil }
+        let base = root.resolvingSymlinksInPath().path
+        let target = url.resolvingSymlinksInPath().path
+        guard target == base ? directory : target.hasPrefix(base + "/") else { return nil }
+        return spelled.joined(separator: "/")
+    }
+
+    /// The launch entry "The game" starts. Candidates are the Windows entries (no
+    /// platform list, or one naming Windows) outside beta branches and of a kind that is
+    /// the game itself; Steam's default comes first ("default", then no type or "none",
+    /// then the other options), each in Steam's order with a 64-bit entry before one
+    /// for any architecture before a 32-bit one. The first candidate whose program is a
+    /// Windows program (.exe) inside the install folder, and whose working folder (when
+    /// it names one) exists there, is taken.
+    static func choose(_ options: [SteamLaunchOption], installFolder root: URL) -> Choice? {
+        func rank(_ option: SteamLaunchOption) -> Int? {
+            let type = option.type.lowercased()
+            guard option.betaKey.isEmpty, !otherKinds.contains(type),
+                  option.oslist.isEmpty || option.oslist.lowercased().contains("windows") else { return nil }
+            let kind: Int
+            if type == "default" { kind = 0 } else if type.isEmpty || type == "none" { kind = 1 } else { kind = 2 }
+            let arch: Int
+            if option.osarch == "64" { arch = 0 } else if option.osarch.isEmpty { arch = 1 } else { arch = 2 }
+            return kind * 3 + arch
+        }
+        var ranked: [(rank: Int, index: Int, option: SteamLaunchOption)] = []
+        for (index, option) in options.enumerated() {
+            if let value = rank(option) { ranked.append((rank: value, index: index, option: option)) }
+        }
+        ranked.sort { a, b in a.rank != b.rank ? a.rank < b.rank : a.index < b.index }
+        let spaces = CharacterSet.whitespaces
+        for entry in ranked {
+            let option = entry.option
+            guard let path = relativePath(option.executable), !path.isEmpty,
+                  URL(fileURLWithPath: path).pathExtension.lowercased() == "exe",
+                  let program = onDisk(path, in: root, directory: false) else { continue }
+            var folder: String? = nil
+            if !option.workingDir.trimmingCharacters(in: spaces).isEmpty {
+                guard let relative = relativePath(option.workingDir) else { continue }
+                if relative.isEmpty {
+                    folder = ""
+                } else {
+                    guard let found = onDisk(relative, in: root, directory: true) else { continue }
+                    folder = found
+                }
+            }
+            return Choice(program: program, arguments: option.arguments.trimmingCharacters(in: spaces), folder: folder)
+        }
+        return nil
+    }
+
+    /// The install folder's Windows programs for the Program picker: every .exe up to
+    /// six folders deep (linked folders are not followed), at most 400, sorted.
+    static func programs(in root: URL) -> [String] {
+        let fm = FileManager.default
+        var found: [String] = []
+        func walk(_ url: URL, _ prefix: String, _ depth: Int) {
+            guard depth <= 6, let names = try? fm.contentsOfDirectory(atPath: url.path) else { return }
+            for name in names.sorted() where !name.hasPrefix(".") && found.count < 400 {
+                let child = url.appendingPathComponent(name)
+                let relative = prefix.isEmpty ? name : prefix + "/" + name
+                var isDirectory: ObjCBool = false
+                guard fm.fileExists(atPath: child.path, isDirectory: &isDirectory) else { continue }
+                if isDirectory.boolValue {
+                    if (try? fm.destinationOfSymbolicLink(atPath: child.path)) == nil { walk(child, relative, depth + 1) }
+                } else if child.pathExtension.lowercased() == "exe" {
+                    found.append(relative)
+                }
+            }
+        }
+        walk(root, "", 0)
+        return found.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+
+    /// Why Play is not offered for "The game" yet, or nil. No Steam client or sign-in
+    /// is involved; the game's own program must be chosen.
+    static func blocker(installed: Bool, program: String?, updating: Bool = false) -> String? {
+        if !installed { return "Steam does not list this game as fully installed yet." }
+        if updating { return "This game is being downloaded. Play is available when it is done." }
+        if (program ?? "").isEmpty { return "Choose the program to start in Game details › Steam › Program." }
+        return nil
+    }
+}
+
 // MARK: - Model
 
 /// The games Steam has installed in the prefix (Dock's discovery, off the main
@@ -540,8 +676,9 @@ func steamActionLabel(_ title: String, symbol: String) -> some View {
 // MARK: - Game details: the Steam section
 
 /// The Steam section of a Steam game's Game details page (LibraryDetail): how
-/// the game starts (Madeira Dock, with its per-launch pool choice), its
-/// one-time installs, its update, a repair of its files and Uninstall.
+/// the game starts (Madeira Dock, the default, with its per-launch pool choice and
+/// one-time installs; or The game, its own program without Steam, SteamDirectStart),
+/// its update, a repair of its files and Uninstall.
 struct SteamEntrySection: View {
     @Binding var entry: LibraryEntry
     /// The game was uninstalled: the page closes without saving.
@@ -551,6 +688,10 @@ struct SteamEntrySection: View {
     @ObservedObject private var games = SteamGamesModel.shared
     @State private var confirmUninstall = false
     @State private var freeSpace: Int64?
+    /// "The game": the install folder's programs (the Program picker) and whether
+    /// Steam's launch configuration is being read.
+    @State private var programs: [String] = []
+    @State private var resolving = false
 
     var body: some View {
         let appID = entry.steamAppID ?? 0
@@ -559,20 +700,46 @@ struct SteamEntrySection: View {
         // Madeira manages (updates, repairs, removes) only what it downloaded into Dock's own library folder.
         let managed = installed.map { SteamInstallPaths.isManaged(library: $0.library) } ?? false
         let downloads = SteamOwnedLibrary.enabled && managed
+        let direct = entry.startsSteamGameDirectly
         Section {
-            LabeledContent("Start with", value: "Madeira Dock")
-            if !dock.clientInstalled {
-                Text("Madeira Dock needs Valve's client components. Download them in Settings › Steam › Madeira Dock.")
-                    .font(.caption).foregroundStyle(.orange)
+            Picker("Start with", selection: Binding(get: { direct ? SteamDirectStart.mode : "dock" }, set: { choose($0) })) {
+                Text("Madeira Dock").tag("dock")
+                Text("The game").tag(SteamDirectStart.mode)
             }
-            Toggle("Smaller JIT pool (512 MB) for this launch", isOn: $dock.compactPool)
-            // The game's One-time installs choice (Madeira Dock, DockInstallers).
-            if DockInstallers.choiceEnabled, dock.installPrograms[appID] != nil {
-                Picker("One-time installs", selection: Binding(get: { dock.installRunNext[appID] ?? true },
-                                                               set: { dock.setRunsInstallers(appID, $0) })) {
-                    Text("Run at next start").tag(true)
-                    Text("Skip").tag(false)
-                }.pickerStyle(.menu)
+            if direct {
+                // The game's own program, from Steam's launch configuration or chosen here.
+                if resolving && entry.steamProgram == nil {
+                    LabeledContent("Program") { ProgressView() }
+                } else if programs.isEmpty && entry.steamProgram == nil {
+                    Text("No Windows program was found in this game's install folder.")
+                        .font(.caption).foregroundStyle(.orange)
+                } else {
+                    Picker("Program", selection: Binding(get: { entry.steamProgram ?? "" }, set: { pick($0) })) {
+                        if entry.steamProgram == nil { Text("Choose…").tag("") }
+                        ForEach(pickerPrograms, id: \.self) { Text($0).tag($0) }
+                    }.pickerStyle(.navigationLink)
+                    if entry.steamProgramSource == "steam" {
+                        if (entry.steamProgramArguments ?? "").isEmpty {
+                            Text("From Steam's launch configuration for this game.").font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            Text("From Steam's launch configuration for this game, with its arguments.").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            } else {
+                if !dock.clientInstalled {
+                    Text("Madeira Dock needs Valve's client components. Download them in Settings › Steam › Madeira Dock.")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+                Toggle("Smaller JIT pool (512 MB) for this launch", isOn: $dock.compactPool)
+                // The game's One-time installs choice (Madeira Dock, DockInstallers).
+                if DockInstallers.choiceEnabled, dock.installPrograms[appID] != nil {
+                    Picker("One-time installs", selection: Binding(get: { dock.installRunNext[appID] ?? true },
+                                                                   set: { dock.setRunsInstallers(appID, $0) })) {
+                        Text("Run at next start").tag(true)
+                        Text("Skip").tag(false)
+                    }.pickerStyle(.menu)
+                }
             }
             if let download {
                 SteamDownloadStatus(download: download)
@@ -604,13 +771,18 @@ struct SteamEntrySection: View {
         } header: {
             Text("Steam")
         } footer: {
-            Text("Madeira Dock starts the game through Valve's own Steam client, without the Steam desktop window. Valve's client signs in with your account and decides whether the game may run.")
+            if direct {
+                Text("The game starts its own program in Wine, without Steam. This suits games that run without Steam (DRM-free); a game that needs Steam or its licence check does not start this way, so choose Madeira Dock for it.")
+            } else {
+                Text("Madeira Dock starts the game through Valve's own Steam client, without the Steam desktop window. Valve's client signs in with your account and decides whether the game may run.")
+            }
         }
         .onAppear { dock.refresh(); games.refresh() }
         .task(id: download?.state) {
             let values = try? URL.documentsDirectory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
             freeSpace = values?.volumeAvailableCapacityForImportantUsage
         }
+        .task(id: "\(entry.steamStart ?? "dock") \(installed?.installed == true) \(download == nil)") { await resolveProgram() }
         .confirmationDialog("Uninstall \(entry.title)? Its downloaded files are deleted from this device. Saves stored elsewhere are kept.",
                             isPresented: $confirmUninstall, titleVisibility: .visible) {
             Button("Uninstall", role: .destructive) {
@@ -618,5 +790,62 @@ struct SteamEntrySection: View {
                 uninstalled()
             }
         }
+    }
+
+    /// The Program picker's rows: the folder's programs, and a kept choice that is not among them.
+    private var pickerPrograms: [String] {
+        guard let chosen = entry.steamProgram, !programs.contains(chosen) else { return programs }
+        return [chosen] + programs
+    }
+
+    /// Start with: Madeira Dock (stored as no choice, the default) or The game.
+    private func choose(_ mode: String) {
+        let next: String? = mode == SteamDirectStart.mode ? mode : nil
+        guard next != entry.steamStart else { return }
+        entry.steamStart = next
+        LogStore.shared.log("[steam-start] app=\(entry.steamAppID ?? 0) mode=\(next == nil ? "dock" : "game")")
+    }
+
+    /// The Program picker's choice; it is kept over Steam's launch configuration.
+    private func pick(_ program: String) {
+        guard !program.isEmpty, program != entry.steamProgram else { return }
+        entry.steamProgram = program
+        entry.steamProgramArguments = nil
+        entry.steamProgramFolder = nil
+        entry.steamProgramSource = "choice"
+        LogStore.shared.log("[steam-start] app=\(entry.steamAppID ?? 0) program=choice")
+    }
+
+    /// "The game": lists the install folder's programs and, unless the user picked one that
+    /// is still there, takes Steam's launch configuration for the app (SteamDirectStart.choose);
+    /// failing that, the only program when there is exactly one.
+    private func resolveProgram() async {
+        guard entry.startsSteamGameDirectly, let appID = entry.steamAppID else { return }
+        let folder = LibraryModel.drive.appendingPathComponent(entry.relativePath, isDirectory: true)
+        let found = await Task.detached(priority: .userInitiated) { SteamDirectStart.programs(in: folder) }.value
+        programs = found
+        if entry.steamProgramSource == "choice", let program = entry.steamProgram, found.contains(program) { return }
+        resolving = true
+        let options = await steam.launchOptions(appID: appID) ?? []
+        resolving = false
+        guard entry.startsSteamGameDirectly, entry.steamAppID == appID else { return }
+        let choice = await Task.detached(priority: .userInitiated) { SteamDirectStart.choose(options, installFolder: folder) }.value
+        if let choice {
+            entry.steamProgram = choice.program
+            entry.steamProgramArguments = choice.arguments.isEmpty ? nil : choice.arguments
+            entry.steamProgramFolder = choice.folder
+            entry.steamProgramSource = "steam"
+        } else if let program = entry.steamProgram, found.contains(program) {
+            // Kept: an earlier choice that is still installed.
+        } else if found.count == 1 {
+            entry.steamProgram = found[0]
+            entry.steamProgramArguments = nil; entry.steamProgramFolder = nil
+            entry.steamProgramSource = "only"
+        } else {
+            entry.steamProgram = nil
+            entry.steamProgramArguments = nil; entry.steamProgramFolder = nil
+            entry.steamProgramSource = nil
+        }
+        LogStore.shared.log("[steam-start] app=\(appID) launch-entries=\(options.count) programs=\(found.count) source=\(entry.steamProgramSource ?? "none")")
     }
 }

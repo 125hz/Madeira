@@ -75,7 +75,7 @@ require('SteamEntrySection(entry: $entry)' in detail and 'if entry.steamAppID !=
         'Game details: the Steam section for a Steam game')
 for label in ['"Start with"', '"Madeira Dock"', '"Smaller JIT pool (512 MB) for this launch"', '"One-time installs"',
               '"Run at next start"', '"Skip"', '"Repair installed files"', '"Uninstall"', '"App ID"',
-              '"Free space on this device"', '"Pause update"', '"Resume update"']:
+              '"Free space on this device"', '"Pause update"', '"Resume update"', '"The game"', '"Program"', '"Choose…"']:
     require(label in steam_section, f'Steam section: {label}')
 for label in ['"Library details"', '"Choose cover image"', '"Use Steam artwork"', '"Display"', '"Resolution"',
               '"Aspect & scaling"', '"Compatibility & performance"', '"Reduced-precision x87"', '"CPU cores reported"',
@@ -88,17 +88,42 @@ entries_start = library.index('private var entries: [LibraryEntry] {')
 require('$0.steamAppID == nil' in library[entries_start:library.index('var body: some View {', entries_start)],
         'Steam games are listed in the Steam section only, not also under Games')
 launch = content_view[content_view.index('private func launchLibraryEntry('):content_view.index('private func runWineFullSequence(')]
-require('if let appID = entry.steamAppID {' in launch and
+require('if let appID = entry.steamAppID, !entry.startsSteamGameDirectly {' in launch and
         'startDock(game, compactPool: MadeiraDockModel.shared.compactPool, profile: entry)' in launch,
         "Play on a Steam game's Game details page starts it through Madeira Dock with its own profile")
+# "Start with: The game" (SteamDirectStart): the program from Steam's launch configuration or the
+# Program picker starts like any library game, without Dock, a sign-in transfer or a client.
+direct = launch[launch.index('if let appID = entry.steamAppID, !entry.startsSteamGameDirectly {'):]
+require(direct.index('startDock(') < direct.index('guard entry.steamProgram?.isEmpty == false else {') <
+        direct.index('LibraryModel.executable(entry.launchRelativePath)') < direct.index('entry.configureLaunch()') <
+        direct.index('runWineFullSequence(profile: entry)'),
+        '"The game": no program chosen, no start; otherwise the program is checked inside drive_c and started as a library game')
+require('writeHandoff' not in direct[direct.index('guard entry.steamProgram'):] and 'credentialsForDock' not in launch,
+        '"The game" hands no sign-in to anything')
 dock_start = content_view[content_view.index('private func startDock('):]
 dock_start = dock_start[:dock_start.index('\n    }\n') + 6]
 require('if let profile { library.begin(profile, dock: game) }' in dock_start and 'runWineFullSequence(profile: profile)' in dock_start,
         "a Steam game's session takes its display, overlay and control settings")
 configure = library[library.index('    func configureLaunch() {'):]
 configure = configure[:configure.index('\n    }\n')]
-require(configure.index('if steamAppID != nil {') < configure.index('setenv("MADEIRA_EXE"'),
-        "a Steam game's profile never replaces what Madeira Dock starts")
+require(configure.index('if steamAppID != nil {') < configure.index('if !startsSteamGameDirectly {') <
+        configure.index('return') < configure.index('setenv("MADEIRA_EXE"'),
+        "a Steam game's profile never replaces what Madeira Dock starts (only \"The game\" sets what starts)")
+require(configure.index('unsetenv("MADEIRA_STEAM_APPID"); unsetenv("MADEIRA_STEAM_APPPATH"); unsetenv("MADEIRA_WORKDIR")') <
+        configure.index('if steamAppID != nil {') and
+        configure.index('if startsSteamGameDirectly, let steamAppID {') < configure.index(' setenv("MADEIRA_STEAM_APPID"') and
+        configure.count(' setenv("MADEIRA_STEAM_APPID"') == 1,
+        "the game's own Steam identity and working folder are exported for \"The game\" only, and cleared for every other launch")
+bridge = (app / 'WineProcessBridge.m').read_text()
+identity = bridge[bridge.index('const char *direct_app = getenv("MADEIRA_STEAM_APPID");'):]
+identity = identity[:identity.index('unsetenv("MADEIRA_STEAM_APPPATH");')]
+require('setenv("SteamAppId",  direct_app, 1);' in identity and 'strspn(direct_app, "0123456789") == strlen(direct_app)' in identity
+        and '} else {' in identity and 'unsetenv("MADEIRA_STEAM_APPID");' in identity,
+        "bridge: a direct start publishes its game's own identity once (digits only, a C: folder); every other launch keeps the previous identity")
+workdir = bridge[bridge.index('const char *launch_workdir = getenv("MADEIRA_WORKDIR");'):]
+workdir = workdir[:workdir.index('} else if (strchr(madeira_exe')]
+require('unsetenv("MADEIRA_WORKDIR");' in workdir and '!strstr(launch_workdir, "..")' in workdir and 'chdir(unix_dir)' in workdir,
+        "bridge: Steam's working folder applies to one launch, only as a C: folder of the prefix")
 apply = library[library.index('    func applyEnvironment() {'):]
 apply = apply[:apply.index('\n    }\n')]
 require('if let cpuCount, (1..<64).contains(cpuCount) { setenv("MADEIRA_CPU_COUNT"' in apply and
@@ -249,6 +274,76 @@ func record(_ appID: Int, _ name: String, _ folder: String, flags: Int) -> Strin
         require(R.safeAssetName("a1/b2.jpg") && !R.safeAssetName("../x") && !R.safeAssetName("/x") && !R.safeAssetName("a b") &&
                 !R.safeAssetName("a?b=c") && !R.safeAssetName("a#b") && !R.safeAssetName("") && !R.safeAssetName("caf\u{e9}.jpg"),
                 "artwork names are plain relative paths")
+        // "Start with: The game": Steam's launch configuration names the program (SteamDirectStart).
+        typealias D = SteamDirectStart
+        let launchVDF = "\"appinfo\" { \"common\" { \"name\" \"Direct\" \"type\" \"Game\" \"oslist\" \"windows\" } " +
+            "\"config\" { \"installdir\" \"Direct\" \"launch\" { " +
+            "\"3\" { \"executable\" \"Bin64\\\\Game.exe\" \"arguments\" \" -dx11 -skipintro \" \"type\" \"default\" \"config\" { \"oslist\" \"windows\" \"osarch\" \"64\" } } " +
+            "\"0\" { \"executable\" \"bin32\\game.exe\" \"type\" \"default\" \"config\" { \"oslist\" \"windows\" \"osarch\" \"32\" } } " +
+            "\"1\" { \"executable\" \"server/srv.exe\" \"type\" \"server\" } " +
+            "\"2\" { \"executable\" \"Direct.app\" \"config\" { \"oslist\" \"macos\" } } " +
+            "\"4\" { \"executable\" \"beta/game.exe\" \"config\" { \"betakey\" \"public-beta\" } } " +
+            "\"5\" { \"executable\" \"..\\escape.exe\" \"type\" \"default\" } " +
+            "\"6\" { \"executable\" \"tools/launcher.exe\" \"workingdir\" \"Missing\" \"type\" \"option1\" \"config\" { \"osarch\" \"64\" } } " +
+            "\"7\" { \"executable\" \"tools/launcher.exe\" \"workingdir\" \"DATA\" \"type\" \"option2\" } " +
+            "\"x\" { \"executable\" \"not-numbered.exe\" } \"8\" { \"arguments\" \"-no-program\" } " +
+            "} } \"depots\" { \"77\" { \"manifests\" { \"public\" { \"gid\" \"1\" } } } } }"
+        let directInfo = SteamAppInfo.parse(appID: 7000, from: Data(launchVDF.utf8))!
+        require(directInfo.launches.map(\.executable) == ["bin32\\game.exe", "server/srv.exe", "Direct.app", "Bin64\\\\Game.exe",
+                                                          "beta/game.exe", "..\\escape.exe", "tools/launcher.exe", "tools/launcher.exe"],
+                "config.launch is read in Steam's numeric order, without entries that name no program: \(directInfo.launches.map(\.executable))")
+        require(directInfo.launches[1].type == "server" && directInfo.launches[4].betaKey == "public-beta" &&
+                directInfo.launches[2].oslist == "macos" && directInfo.launches[3].osarch == "64",
+                "each entry keeps its type, platform, architecture and beta branch")
+        require(SteamOwnedGame(directInfo).launches == directInfo.launches, "the owned library caches the launch configuration")
+        let oldCache = #"{"id":1,"name":"Old","installDir":"Old","buildID":1}"#
+        require((try? JSONDecoder().decode(SteamOwnedGame.self, from: Data(oldCache.utf8)))?.launches == nil,
+                "an older cache without it still loads (the configuration is then asked of Steam once)")
+        var many = [String: Any]()
+        for i in 0..<40 { many[String(i)] = ["executable": "g\(i).exe"] }
+        many["41"] = ["executable": String(repeating: "a", count: 600)]
+        require(SteamLaunchOption.parse(many).count == 32, "at most 32 entries are read")
+        require(SteamLaunchOption.parse(["0": ["executable": "g.exe", "arguments": String(repeating: "a", count: 3000)]]).isEmpty,
+                "oversized text drops the entry")
+
+        require(D.relativePath("Bin64\\\\Game.exe") == "Bin64/Game.exe" && D.relativePath(".\\bin\\game.exe") == "bin/game.exe" &&
+                D.relativePath("") == "" && D.relativePath(".") == "", "Steam's paths in slash form")
+        for bad in ["C:\\game.exe", "/abs/game.exe", "\\abs\\game.exe", "a/../b.exe", "..", "a\u{1}b.exe", "a|b.exe", "a:b"] {
+            require(D.relativePath(bad) == nil, "not a path inside the install folder: \(bad.debugDescription)")
+        }
+
+        let install = drive.appendingPathComponent("Program Files (x86)/Steam/steamapps/common/Direct")
+        for file in ["bin64/game.exe", "bin32/game.exe", "server/srv.exe", "beta/game.exe", "tools/launcher.exe", "data/readme.txt",
+                     "Direct.app", "notes.txt", "deep/1/2/3/4/5/6/7/too-deep.exe"] {
+            try write(install.appendingPathComponent(file), "x")
+        }
+        try write(drive.appendingPathComponent("Program Files (x86)/Steam/steamapps/common/escape.exe"), "x")
+        try fm.createSymbolicLink(at: install.appendingPathComponent("loop"), withDestinationURL: install)
+        let options = directInfo.launches
+        require(D.choose(options, installFolder: install) == D.Choice(program: "bin64/game.exe", arguments: "-dx11 -skipintro", folder: nil),
+                "Steam's 64-bit default entry, found without case, with its arguments: \(String(describing: D.choose(options, installFolder: install)))")
+        try fm.removeItem(at: install.appendingPathComponent("bin64"))
+        require(D.choose(options, installFolder: install) == D.Choice(program: "bin32/game.exe", arguments: "", folder: nil),
+                "its program missing: the next default entry (32-bit); never the server, macOS, beta or escaping entries")
+        try fm.removeItem(at: install.appendingPathComponent("bin32"))
+        require(D.choose(options, installFolder: install) == D.Choice(program: "tools/launcher.exe", arguments: "", folder: "data"),
+                "then the other options in Steam's order; one whose working folder is missing is passed over")
+        require(D.choose(Array(options.prefix(6)), installFolder: install) == nil, "nothing that runs here: no choice (the Program picker decides)")
+        require(D.choose([SteamLaunchOption(executable: "tools/launcher.exe", workingDir: ".")], installFolder: install)?.folder == "",
+                "working folder \".\" is the install folder")
+        require(D.choose([SteamLaunchOption(executable: "Direct.app")], installFolder: install) == nil, "only Windows programs")
+        require(D.choose([SteamLaunchOption(executable: "loop/tools/launcher.exe")], installFolder: install)?.program == "loop/tools/launcher.exe",
+                "a program is found through a link that stays inside the install folder")
+        require(D.onDisk("..", in: install, directory: true) == nil && D.onDisk("x/../../escape.exe", in: install, directory: false) == nil,
+                "never outside the install folder")
+        let programs = D.programs(in: install)
+        require(programs == ["beta/game.exe", "server/srv.exe", "tools/launcher.exe"],
+                "the Program picker lists the folder's .exe files, sorted, not through linked folders or deeper than six: \(programs)")
+        require(D.blocker(installed: false, program: "a.exe")?.contains("fully installed") == true &&
+                D.blocker(installed: true, program: "a.exe", updating: true)?.contains("downloaded") == true &&
+                D.blocker(installed: true, program: nil)?.contains("Program") == true &&
+                D.blocker(installed: true, program: "") != nil && D.blocker(installed: true, program: "a.exe") == nil,
+                "Play for \"The game\": installed, not updating, a program chosen; no client or sign-in needed")
         if failures > 0 { print("FAILURES: \(failures)"); exit(1) }
         print("PASS: all Steam games Swift checks")
     }

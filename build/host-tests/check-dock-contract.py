@@ -69,8 +69,10 @@ require(dock.count('setenv("MADEIRA_IMAGE_MAP_GUARD"') == 1 and
 # A Dock session publishes no fixed Steam game identity; every other launch keeps it.
 bridge = (app / 'WineProcessBridge.m').read_text()
 flag = bridge.index('const char *dock_session = getenv("MADEIRA_DOCK_SESSION");')
-require(bridge.index('unsetenv("SteamAppId");', flag) < bridge.index('} else {', flag) < bridge.index('setenv("SteamAppId",', flag),
-        'the bridge clears the fixed Steam identity only for a Dock session')
+require(bridge.index('unsetenv("SteamAppId");', flag) < bridge.index('} else if (direct_app', flag) <
+        bridge.index('setenv("SteamAppId",  direct_app, 1);', flag) < bridge.index('} else {', flag) <
+        bridge.index('setenv("SteamAppId",  "356400", 1);', flag),
+        "the bridge clears the fixed Steam identity only for a Dock session (a direct start publishes its game's own)")
 require(content.count('setenv("MADEIRA_DOCK_SESSION", "1", 1)') == 1 and
         'if dockLaunch.dock && SteamSignIn.flag("MADEIRA_DOCK_CLEAR_STEAM_ID", default: true) {' in content and
         'unsetenv("MADEIRA_DOCK_SESSION")' in content,

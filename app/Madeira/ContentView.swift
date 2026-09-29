@@ -2199,14 +2199,23 @@ struct ContentView: View {
     /// applies the entry's launch profile and runs the same full sequence as the
     /// developer interface's buttons.
     private func launchLibraryEntry(_ entry: LibraryEntry) {
-        // A Steam game starts through Madeira Dock with its own launch profile (SteamGames.swift).
-        if let appID = entry.steamAppID {
+        // A Steam game starts through Madeira Dock with its own launch profile (SteamGames.swift),
+        // unless its Game details page chose "The game": then its own program starts below, like
+        // any library game (SteamDirectStart).
+        if let appID = entry.steamAppID, !entry.startsSteamGameDirectly {
             guard let game = MadeiraDock.games(drive: MadeiraDock.drive).first(where: { $0.id == appID }) else {
                 library.error = "Steam no longer lists this game as installed. Refresh the library and try again."; return
             }
             LogStore.shared.log("[steam-games] play app=\(appID)")
             startDock(game, compactPool: MadeiraDockModel.shared.compactPool, profile: entry)
             return
+        }
+        if let appID = entry.steamAppID {
+            guard entry.steamProgram?.isEmpty == false else {
+                library.error = "Choose the program to start in Game details › Steam › Program."; return
+            }
+            LogStore.shared.log("[steam-start] app=\(appID) direct source=\(entry.steamProgramSource ?? "-") " +
+                                "args=\(entry.launchArguments.isEmpty ? 0 : 1) folder=\(entry.steamWorkingWindowsPath == nil ? "program" : "steam")")
         }
         guard wine_process_is_running() == 0, wineserver_is_running() == 0, library.current == nil else {
             library.error = "A session is already running."; return
@@ -2221,13 +2230,13 @@ struct ContentView: View {
         guard jit_check_debugged() else {
             library.error = "Enable JIT before playing."; return
         }
-        do { if entry.desktop != true { _ = try LibraryModel.executable(entry.relativePath) }; try entry.validate() }
+        do { if entry.desktop != true { _ = try LibraryModel.executable(entry.launchRelativePath) }; try entry.validate() }
         catch {
             library.error = error.localizedDescription
             logStore.log("[launch-preflight] profile validation failed: \(error.localizedDescription)", level: .error)
             return
         }
-        guard entry.windowsPath.utf8.count < 1024, entry.arguments.utf8.count < 1024 else {
+        guard entry.launchWindowsPath.utf8.count < 1024, entry.launchArguments.utf8.count < 1024 else {
             library.error = "The executable path or launch arguments are too long."; return
         }
         entry.configureLaunch()

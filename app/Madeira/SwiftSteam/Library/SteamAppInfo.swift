@@ -28,6 +28,10 @@ struct SteamAppInfo {
     var libraryHero: String?
     var headerImage: String?
     var parentID: UInt32?
+    /// Steam's launch configuration (`config.launch`), in Steam's order. Only
+    /// "Start with: The game" reads it (SteamDirectStart); Madeira Dock leaves
+    /// the choice to Valve's client.
+    var launches: [SteamLaunchOption] = []
 
     struct SharedOwner: Equatable {
         var name: String
@@ -240,6 +244,9 @@ struct SteamAppInfo {
         // Config section
         if let config = appInfo["config"] as? [String: Any] {
             info.installDir = config["installdir"] as? String ?? ""
+            if let launch = config["launch"] as? [String: Any] {
+                info.launches = SteamLaunchOption.parse(launch)
+            }
         }
 
         // Depots section
@@ -313,5 +320,44 @@ struct SteamAppInfo {
         guard !info.name.isEmpty else { return nil }
 
         return info
+    }
+}
+
+/// One entry of an app's launch configuration (`config.launch.<n>` in its
+/// product info): the program Valve's client would start, relative to the
+/// install folder as Steam spells it, its arguments and working folder, the
+/// entry's type and the platform, architecture and beta branch it is for.
+/// Untrusted text: bounded here, and validated as a path by SteamDirectStart.
+struct SteamLaunchOption: Codable, Hashable, Sendable {
+    var executable: String
+    var arguments = ""
+    var workingDir = ""
+    /// "default", "none", "option1", "server", "editor", "vr", ... ("" when absent).
+    var type = ""
+    var oslist = ""
+    var osarch = ""
+    var betaKey = ""
+
+    /// Entries in Steam's order (numeric keys), without those that name no
+    /// program or carry oversized text; at most 32.
+    static func parse(_ launch: [String: Any]) -> [SteamLaunchOption] {
+        let keys = launch.keys.compactMap { key in Int(key).map { ($0, key) } }.sorted { $0.0 < $1.0 }
+        var options: [SteamLaunchOption] = []
+        for (_, key) in keys.prefix(32) {
+            guard let entry = launch[key] as? [String: Any], let executable = entry["executable"] as? String,
+                  !executable.isEmpty, executable.utf8.count <= 512 else { continue }
+            func text(_ value: Any?, limit: Int = 256) -> String? {
+                guard let value else { return "" }
+                guard let string = value as? String, string.utf8.count <= limit else { return nil }
+                return string
+            }
+            let config = entry["config"] as? [String: Any] ?? [:]
+            guard let arguments = text(entry["arguments"], limit: 2048), let workingDir = text(entry["workingdir"], limit: 512),
+                  let type = text(entry["type"]), let oslist = text(config["oslist"]), let osarch = text(config["osarch"]),
+                  let betaKey = text(config["betakey"]) else { continue }
+            options.append(SteamLaunchOption(executable: executable, arguments: arguments, workingDir: workingDir,
+                                             type: type, oslist: oslist, osarch: osarch, betaKey: betaKey))
+        }
+        return options
     }
 }
