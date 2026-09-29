@@ -243,6 +243,7 @@ without Dock, the done key, the `MADEIRA_ONBOARDING` switch, and the wiring
 their public pieces).
 `build/host-tests/check-steam-games.py` covers the library's Steam section: Dock's
 discovery on a synthetic drive_c laid out as Steam writes it, the merge of
-installed and owned games, the section, status, search, Play and artwork rules,
-and that Play uses only Dock's launch path. `build/host-tests/check-steam-library.py`
+installed and owned games, the section, status, card pill, search, Play and
+artwork rules, the program an installed game's pills describe, and that Play
+uses only Dock's launch path. `build/host-tests/check-steam-library.py`
 covers the owned library and downloads (`docs/STEAM_LIBRARY.md`).

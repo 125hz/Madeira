@@ -209,6 +209,10 @@ struct LibraryEntry: Codable, Identifiable {
     var steamProgramArguments: String?
     var steamProgramFolder: String?
     var steamProgramSource: String?
+    /// The install folder, build and picked program a Steam game's `bits` and
+    /// `graphicsAPI` were read for, and whether Steam's launch configuration was
+    /// cached (LibraryModel.refreshSteamMetadata); any change reads them again.
+    var steamMetadataInstall: String?
 
     var displayMode: DisplayMode { display.flatMap(DisplayMode.init(rawValue:)) ?? .fit }
 
@@ -360,6 +364,7 @@ final class LibraryModel: ObservableObject {
     }
     private var readOnly = false
     private var metadataInFlight = Set<UUID>()
+    private var steamMetadataInFlight = Set<Int>()
     private var savedControls: [TouchControl] = []
     private var savedVisible = true
     private var savedSize = 1.0
@@ -394,10 +399,14 @@ final class LibraryModel: ObservableObject {
         guard !readOnly else { error = "The library file could not be read. Preserve or repair it before making changes."; return }
         var next = entries
         var entry = entry
-        if let i = next.firstIndex(where: { $0.id == entry.id }) {
+        // A Steam game has one entry: a details page opened before its card first saved
+        // one (refreshSteamMetadata) updates that entry.
+        if let i = next.firstIndex(where: { $0.id == entry.id }) ??
+            next.firstIndex(where: { entry.steamAppID != nil && $0.steamAppID == entry.steamAppID }) {
             // A details sheet may predate an asynchronous metadata refresh.
             if (next[i].metadataChecked ?? .distantPast) > (entry.metadataChecked ?? .distantPast) {
                 entry.folderBytes = next[i].folderBytes; entry.graphicsAPI = next[i].graphicsAPI
+                entry.bits = next[i].bits; entry.steamMetadataInstall = next[i].steamMetadataInstall
                 entry.metadataChecked = next[i].metadataChecked
                 entry.metadataRevision = next[i].metadataRevision
             }
@@ -460,6 +469,55 @@ final class LibraryModel: ObservableObject {
         if let api = result.api { updated.graphicsAPI = api }
         updated.metadataChecked = Date(); updated.metadataRevision = revision; save(updated)
         fputs("[library-metadata] install scan api=\(updated.graphicsAPI ?? "unknown") bytes=\(result.bytes ?? -1)\n", stderr)
+    }
+
+    /// An installed Steam game's library pills (SteamGames.swift): 32-bit or 64-bit and
+    /// the graphics API of the program "Start with: The game" would start
+    /// (SteamDirectStart.program), and the install size from Steam's install record.
+    /// Read off the main thread once per install folder, build and picked program
+    /// (again when Steam's launch configuration arrives, or after a day while no
+    /// program is known) and kept on the game's entry.
+    @MainActor
+    func refreshSteamMetadata(_ game: DockGame, title: String) async {
+        let revision = 1
+        guard !readOnly, game.installed, !steamMetadataInFlight.contains(game.id) else { return }
+        steamMetadataInFlight.insert(game.id)
+        defer { steamMetadataInFlight.remove(game.id) }
+        let drive = Self.drive
+        let folder = game.library + "/common/" + game.installDir
+        let root = drive.appendingPathComponent(folder, isDirectory: true)
+        let steamApps = drive.appendingPathComponent(game.library, isDirectory: true)
+        let record = await Task.detached(priority: .utility) {
+            (build: SteamInstallFiles.buildID(appID: game.id, steamApps: steamApps),
+             size: SteamInstallFiles.sizeOnDisk(appID: game.id, steamApps: steamApps))
+        }.value
+        let stored = entries.first { $0.steamAppID == game.id }
+        let picked = stored?.steamProgramSource == "choice" ? stored?.steamProgram : nil
+        let known = SteamOwnedLibrary.shared.game(game.id)?.launches != nil
+        let install = "\(folder)#\(record.build ?? 0)#\(picked ?? "")#\(known ? 1 : 0)"
+        if let stored, stored.steamMetadataInstall == install, stored.metadataRevision == revision,
+           stored.bits != 0 || Date().timeIntervalSince(stored.metadataChecked ?? .distantPast) < 86400 { return }
+        // Steam's launch configuration is asked for only when no picked program is installed.
+        let kept = await Task.detached(priority: .utility) { picked.flatMap { SteamDirectStart.onDisk($0, in: root, directory: false) } }.value
+        let options = kept == nil ? await SteamOwnedLibrary.shared.launchOptions(appID: game.id) : nil
+        let program = await Task.detached(priority: .utility) { () -> (url: URL, bits: Int, api: String?)? in
+            guard let path = SteamDirectStart.program(picked: kept, options: options, installFolder: root),
+                  let inspected = try? LibraryModel.inspect(root.appendingPathComponent(path)) else { return nil }
+            return (root.appendingPathComponent(path), inspected.bits, inspected.graphicsAPI)
+        }.value
+        var api = program?.api
+        if let program, let scanned = await LibraryMetadataScanner.shared.scan(program.url, drive: drive, countBytes: false).api { api = scanned }
+        guard !Task.isCancelled else { return }
+        var updated = entries.first { $0.steamAppID == game.id } ?? LibraryEntry(title: title, relativePath: folder, bits: 0)
+        updated.steamAppID = game.id
+        updated.relativePath = folder
+        updated.bits = program?.bits ?? 0
+        updated.graphicsAPI = api
+        updated.folderBytes = record.size ?? updated.folderBytes
+        updated.steamMetadataInstall = install
+        updated.metadataChecked = Date(); updated.metadataRevision = revision
+        save(updated)
+        LogStore.shared.log("[steam-games] metadata app=\(game.id) bits=\(updated.bits) api=\(api ?? "unknown")")
     }
 
     static func executable(_ relative: String) throws -> URL {
@@ -733,7 +791,8 @@ private actor LibraryMetadataScanner {
         }
         return result
     }
-    func scan(_ executable: URL, drive: URL) -> (bytes: Int64?, api: String?) {
+    /// `countBytes: false` skips the size walk (a Steam game's size is its install record's).
+    func scan(_ executable: URL, drive: URL, countBytes: Bool = true) -> (bytes: Int64?, api: String?) {
         let folder = executable.deletingLastPathComponent()
         guard folder.path.hasPrefix(drive.path + "/"), !Task.isCancelled else { return (nil, nil) }
         let manager = FileManager.default
@@ -750,7 +809,7 @@ private actor LibraryMetadataScanner {
         }
         var complete = true
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
-        let walker = manager.enumerator(at: installation, includingPropertiesForKeys: Array(keys), options: [], errorHandler: { _, _ in complete = false; return true })
+        let walker = countBytes ? manager.enumerator(at: installation, includingPropertiesForKeys: Array(keys), options: [], errorHandler: { _, _ in complete = false; return true }) : nil
         var bytes: Int64 = 0
         var files = 0
         while let file = walker?.nextObject() as? URL {
@@ -865,6 +924,8 @@ struct LibraryArtwork: View {
 
 struct LibraryBadges: View {
     let entry: LibraryEntry
+    /// A state pill after the format pills (a Steam game's "Update").
+    var note: String? = nil
     var body: some View {
         ViewThatFits(in: .horizontal) {
             HStack(spacing: 4) { format; size }
@@ -875,6 +936,7 @@ struct LibraryBadges: View {
         HStack(spacing: 4) {
             if entry.bits == 32 || entry.bits == 64 { badge("\(entry.bits)-bit") }
             if let api = LibraryRendererBadge.compact(entry.graphicsAPI) { badge(api) }
+            if let note { badge(note) }
         }
     }
     @ViewBuilder private var size: some View {

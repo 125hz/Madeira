@@ -8,13 +8,15 @@
    discovery (MadeiraDock.games / game(manifest:), sliced as in
    check-dock-contract.py, and SteamKeyValues.swift) and checks, on a synthetic
    drive_c laid out as Steam's client writes it, that installed and partly
-   installed games are found, plus the section, search, Play-blocker and
-   artwork rules, and the merge of installed and owned games (owned games come
-   from the production SteamOwnedGame and SteamAppInfo).
+   installed games are found, plus the section, search, Play-blocker, card
+   pill and artwork rules, the merge of installed and owned games (owned games
+   come from the production SteamOwnedGame and SteamAppInfo), and the program
+   an installed game's pills describe.
 2. Source checks: the section uses Dock's discovery and Dock's launch path
    only (no environment, sign-in transfer, token or Wine call of its own), no
    program-name list, no account data in a log line, wired into the library,
-   built by the Xcode project.
+   built by the Xcode project; an installed game's card shows the library
+   pills, read once per install and kept on its library entry.
 
 Synthetic data only: no Steam, Wine or credentials.
 """
@@ -87,6 +89,43 @@ require('if entry.desktop != true && entry.steamAppID == nil {' in detail,
 entries_start = library.index('private var entries: [LibraryEntry] {')
 require('$0.steamAppID == nil' in library[entries_start:library.index('var body: some View {', entries_start)],
         'Steam games are listed in the Steam section only, not also under Games')
+# A card's pills: an installed game shows a library game's (32-bit or 64-bit, graphics API, size), no
+# "Madeira Dock" or "Steam" pill; "Update" joins them; any other state keeps its own pill.
+cell = games[games.index('private struct SteamGameCell: View {'):games.index('/// Progress, speed and the state of one download.')]
+require('if status.showsFormat, let entry {\n                LibraryBadges(entry: entry, note: status.badge)' in cell and
+        '} else if let badge = status.badge {\n                Text(badge)' in cell and '.label' not in cell and
+        '"Madeira Dock"' not in rules and '"Steam"' not in rules,
+        "an installed game's card shows the library pills (and Update), any other state its own pill; no Dock or Steam pill")
+badges = library[library.index('struct LibraryBadges: View {'):library.index('struct LibraryStatus: View {')]
+require(badges.index('badge("\\(entry.bits)-bit")') < badges.index('LibraryRendererBadge.compact(entry.graphicsAPI)') <
+        badges.index('if let note { badge(note) }') < badges.index('private var size'),
+        'the pills in order: bits, graphics API, Update, then the size')
+require('await library.refreshSteamMetadata(game, title: item.name)' in cell and 'if status.showsFormat, let game = item.installed' in cell,
+        "an installed game's card reads its format through its library entry")
+steam_meta = library[library.index('    func refreshSteamMetadata('):]
+steam_meta = steam_meta[:steam_meta.index('\n    }\n')]
+require(steam_meta.index('SteamInstallFiles.buildID(') <
+        steam_meta.index('let install = "\\(folder)#\\(record.build ?? 0)#\\(picked ?? "")#\\(known ? 1 : 0)"') <
+        steam_meta.index('stored.steamMetadataInstall == install') < steam_meta.index('launchOptions(appID: game.id)'),
+        "the format is read again only for another install folder, build or picked program, once Steam's launch "
+        "configuration is cached, or a day later while no program is known")
+require('\\(steam.game(item.id)?.launches != nil)' in cell,
+        "the card reads again when Steam's launch configuration arrives")
+require('stored?.steamProgramSource == "choice" ? stored?.steamProgram : nil' in steam_meta and
+        'let options = kept == nil ? await SteamOwnedLibrary.shared.launchOptions(appID: game.id) : nil' in steam_meta and
+        'SteamDirectStart.program(picked: kept, options: options, installFolder: root)' in steam_meta and
+        'LibraryModel.inspect(root.appendingPathComponent(path))' in steam_meta and
+        'LibraryMetadataScanner.shared.scan(program.url, drive: drive, countBytes: false)' in steam_meta,
+        'the program is the one "The game" starts; bits from its PE header, the API as for any library game')
+require(steam_meta.count('Task.detached(priority: .utility)') == 3 and 'updated.folderBytes = record.size ?? updated.folderBytes' in steam_meta
+        and 'guard !Task.isCancelled else { return }' in steam_meta and 'save(updated)' in steam_meta,
+        "file reads off the main thread; the size is the install record's; the result is kept on the game's entry")
+require('LogStore.shared.log("[steam-games] metadata app=\\(game.id) bits=\\(updated.bits) api=\\(api ?? "unknown")")' in steam_meta
+        and steam_meta.count('LogStore') == 1, '[steam-games] metadata logs the App ID, bits and API only')
+save_body = library[library.index('    func save(_ entry: LibraryEntry) {'):library.index('    func remove(_ id: UUID) {')]
+require('next.firstIndex(where: { entry.steamAppID != nil && $0.steamAppID == entry.steamAppID })' in save_body and
+        'entry.bits = next[i].bits; entry.steamMetadataInstall = next[i].steamMetadataInstall' in save_body,
+        "a Steam game keeps one entry, and a details page saved later keeps the card's newer format")
 launch = content_view[content_view.index('private func launchLibraryEntry('):content_view.index('private func runWineFullSequence(')]
 require('if let appID = entry.steamAppID, !entry.startsSteamGameDirectly {' in launch and
         'startDock(game, compactPool: MadeiraDockModel.shared.compactPool, profile: entry)' in launch,
@@ -239,10 +278,16 @@ func record(_ appID: Int, _ name: String, _ folder: String, flags: Int) -> Strin
         require(R.status(installed: ready, transfer: nil, updateAvailable: false) == .installed, "installed")
         require(R.status(installed: ready, transfer: nil, updateAvailable: true) == .updateAvailable, "installed with a newer build")
         require(R.status(installed: ready, transfer: .active(percent: 250), updateAvailable: true) == .downloading(100), "a download wins over the record; percent is clamped")
-        require(R.status(installed: nil, transfer: .paused, updateAvailable: false).label == "Paused", "paused label")
-        require(R.status(installed: nil, transfer: .queued, updateAvailable: false).label == "Waiting", "queued label")
+        require(R.status(installed: nil, transfer: .paused, updateAvailable: false).badge == "Paused", "paused pill")
+        require(R.status(installed: nil, transfer: .queued, updateAvailable: false).badge == "Waiting", "queued pill")
         require(R.status(installed: nil, transfer: .failed, updateAvailable: false) == .failed, "failed")
-        require(R.status(installed: nil, transfer: .active(percent: 42), updateAvailable: false).label == "Downloading 42%", "progress label")
+        require(R.status(installed: nil, transfer: .active(percent: 42), updateAvailable: false).badge == "Downloading 42%", "progress pill")
+        // A card's pills: an installed game shows a library game's (bits, graphics API, size), no state pill.
+        let states: [R.Status] = [.notInstalled, .partlyInstalled, .installed, .updateAvailable, .queued, .downloading(42), .paused, .failed]
+        require(states.map(\.badge) == ["Not installed", "Not fully installed", nil, "Update", "Waiting", "Downloading 42%", "Paused", "Download failed"],
+                "card pills: none for an installed game (no \"Madeira Dock\" or \"Steam\"), \"Update\" for a newer build, the other states unchanged")
+        require(states.filter(\.showsFormat) == [.installed, .updateAvailable],
+                "only an installed game (with or without a newer build) shows the library pills")
 
         // The build an update compares with comes from the game's owned build.
         require(owned[0].buildID == 100 && owned[0].installDir == "Fixture Game" && owned[0].folderName == "Fixture Game",
@@ -339,6 +384,22 @@ func record(_ appID: Int, _ name: String, _ folder: String, flags: Int) -> Strin
         let programs = D.programs(in: install)
         require(programs == ["beta/game.exe", "server/srv.exe", "tools/launcher.exe"],
                 "the Program picker lists the folder's .exe files, sorted, not through linked folders or deeper than six: \(programs)")
+        // The card's bits and graphics API describe the program "The game" would start.
+        require(D.program(picked: "SERVER/srv.EXE", options: options, installFolder: install) == "server/srv.exe",
+                "pills: the user's picked program first, spelt as on disk")
+        require(D.program(picked: "gone.exe", options: options, installFolder: install) == "tools/launcher.exe" &&
+                D.program(picked: nil, options: options, installFolder: install) == "tools/launcher.exe",
+                "pills: else the program of Steam's launch configuration")
+        require(D.program(picked: nil, options: nil, installFolder: install) == nil &&
+                D.program(picked: nil, options: [], installFolder: install) == nil &&
+                D.program(picked: nil, options: Array(options.prefix(6)), installFolder: install) == nil,
+                "pills: several programs and no usable launch configuration: unknown (only the size), never guessed from names")
+        let single = drive.appendingPathComponent("Program Files (x86)/Steam/steamapps/common/Single")
+        try write(single.appendingPathComponent("bin/only.exe"), "x")
+        try write(single.appendingPathComponent("readme.txt"), "x")
+        require(D.program(picked: nil, options: nil, installFolder: single) == "bin/only.exe", "pills: else the install folder's only program")
+        require(D.program(picked: "../Direct/tools/launcher.exe", options: nil, installFolder: single) == "bin/only.exe",
+                "pills: a picked program never leaves the install folder")
         require(D.blocker(installed: false, program: "a.exe")?.contains("fully installed") == true &&
                 D.blocker(installed: true, program: "a.exe", updating: true)?.contains("downloaded") == true &&
                 D.blocker(installed: true, program: nil)?.contains("Program") == true &&

@@ -26,23 +26,29 @@ enum SteamGamesRules {
         var owned: SteamOwnedGame?
     }
 
-    /// What a game's card and sheet say about it.
+    /// What a game's card says about it.
     enum Status: Equatable {
         case notInstalled, partlyInstalled, installed, updateAvailable
         case queued, downloading(Int), paused, failed
 
-        var label: String {
+        /// The card's state pill, or nil for an installed game: its card shows only
+        /// the pills of any library game (32-bit or 64-bit, graphics API, install
+        /// size), and a newer build adds "Update" to them.
+        var badge: String? {
             switch self {
             case .notInstalled: return "Not installed"
             case .partlyInstalled: return "Not fully installed"
-            case .installed: return "Madeira Dock"
-            case .updateAvailable: return "Update available"
+            case .installed: return nil
+            case .updateAvailable: return "Update"
             case .queued: return "Waiting"
             case .downloading(let percent): return "Downloading \(percent)%"
             case .paused: return "Paused"
             case .failed: return "Download failed"
             }
         }
+
+        /// Whether the card shows the installed game's library pills.
+        var showsFormat: Bool { self == .installed || self == .updateAvailable }
     }
 
     /// A download's state, as far as the status needs it.
@@ -265,6 +271,17 @@ enum SteamDirectStart {
         return found.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
     }
 
+    /// The program a Steam game's library pills describe (32-bit or 64-bit, graphics
+    /// API), found as "The game" finds it: the user's pick while it is installed, else
+    /// Steam's launch configuration, else the install folder's only program; nil when
+    /// none is known (the card then shows only the install size).
+    static func program(picked: String?, options: [SteamLaunchOption]?, installFolder root: URL) -> String? {
+        if let picked, !picked.isEmpty, let found = onDisk(picked, in: root, directory: false) { return found }
+        if let options, let choice = choose(options, installFolder: root) { return choice.program }
+        let found = programs(in: root)
+        return found.count == 1 ? found[0] : nil
+    }
+
     /// Why Play is not offered for "The game" yet, or nil. No Steam client or sign-in
     /// is involved; the game's own program must be chosen.
     static func blocker(installed: Bool, program: String?, updating: Bool = false) -> String? {
@@ -480,28 +497,41 @@ private struct SteamGameCell: View {
     let item: SteamGamesRules.Item
     @ObservedObject private var steam = SteamOwnedLibrary.shared
     @ObservedObject private var games = SteamGamesModel.shared
+    @ObservedObject private var library = LibraryModel.shared
 
     var body: some View {
         let download = steam.downloads[item.id]
         let status = SteamGamesRules.status(installed: item.installed, transfer: download?.transfer,
                                             updateAvailable: steam.updateAvailable(appID: item.id, installedBuild: games.builds[item.id]))
+        // An installed game's format (bits, graphics API, size) is kept on its library entry.
+        let entry = library.entries.first { $0.steamAppID == item.id }
         VStack(alignment: .leading, spacing: 6) {
             SteamGameArtwork(appID: item.id).aspectRatio(2.0 / 3.0, contentMode: .fit)
                 .overlay { overlay(download) }
                 .clipShape(RoundedRectangle(cornerRadius: 12))
                 .opacity(item.installed?.installed == true || download != nil ? 1 : 0.6)
             Text(item.name).font(.subheadline.weight(.semibold)).lineLimit(2)
-            Text(status.label)
-                .font(.caption2.weight(.medium)).lineLimit(1)
-                .padding(.horizontal, 5).padding(.vertical, 4)
-                .background(.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
-                .foregroundStyle(.secondary)
+            if status.showsFormat, let entry {
+                LibraryBadges(entry: entry, note: status.badge).foregroundStyle(.secondary)
+            } else if let badge = status.badge {
+                Text(badge)
+                    .font(.caption2.weight(.medium)).lineLimit(1)
+                    .padding(.horizontal, 5).padding(.vertical, 4)
+                    .background(.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+                    .foregroundStyle(.secondary)
+            }
             if let played = steam.playtime[item.id]?.played {
                 Text(played).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
             }
         }
         .padding(4).foregroundStyle(.primary)
         .accessibilityElement(children: .combine)
+        // Read once per install folder, build and picked program, and again when Steam's
+        // launch configuration arrives (LibraryModel.refreshSteamMetadata).
+        .task(id: "\(status.showsFormat) \(item.installed?.windowsInstallPath ?? "") \(games.builds[item.id] ?? 0) " +
+                  "\(entry?.steamProgram ?? "") \(steam.game(item.id)?.launches != nil)", priority: .utility) {
+            if status.showsFormat, let game = item.installed { await library.refreshSteamMetadata(game, title: item.name) }
+        }
     }
 
     @ViewBuilder private func overlay(_ download: SteamOwnedLibrary.Download?) -> some View {
