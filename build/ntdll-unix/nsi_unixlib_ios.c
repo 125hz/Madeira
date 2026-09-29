@@ -17,8 +17,11 @@
  * PE nsi.dll falls back to this unixlib (WINE_UNIX_CALL code 0, same
  * struct nsi_enumerate_all_ex the nsiproxy ioctl path uses) when the
  * device is absent; registration is by module name in virtual_ios.c
- * load_builtin_unixlib. Non-TCP modules keep failing exactly as before
- * (STATUS_NOT_SUPPORTED instead of the old device-open error).
+ * load_builtin_unixlib. Other modules (network interfaces, IPv4/IPv6
+ * addresses, routes and neighbours) go to Wine's BSD providers through
+ * nsi_network_ios.c, which also serves the row and field reads (codes 1
+ * and 2); a table nobody serves still answers STATUS_NOT_SUPPORTED, which
+ * nsi.dll turns back into the old device-open error.
  *
  * The enumerator is wine/dlls/nsiproxy.sys/tcp.c tcp_conns_enumerate_all
  * copied faithfully, except IPv6 scope ids come straight from the server
@@ -48,6 +51,11 @@
 #include "wine/nsi.h"
 #include "wine/server.h"
 #include "wine/unixlib.h"   /* ios_wow_host_ptr() for the wow64 table below */
+
+/* nsi_network_ios.c: the interface, address and route tables. */
+NTSTATUS nsi_enumerate_all_ex( struct nsi_enumerate_all_ex *params );
+NTSTATUS nsi_get_all_parameters_ex( struct nsi_get_all_parameters_ex *params );
+NTSTATUS nsi_get_parameter_ex( struct nsi_get_parameter_ex *params );
 
 /* NPI_MS_TCP_MODULEID (netiodef.h declares it extern; the defining
  * translation unit lives in nsiproxy.sys which we don't build) */
@@ -177,16 +185,18 @@ static NTSTATUS ios_nsi_enumerate_all_ex( void *args )
     if (!params || !params->module) return STATUS_INVALID_PARAMETER;
     if (!NmrIsEqualNpiModuleId( params->module, &ios_tcp_moduleid ))
     {
+        /* iOS-Madeira: interfaces, addresses and routes (nsi_network_ios.c) */
+        status = nsi_enumerate_all_ex( params );
         /* ml472 (#80 attribution): a hot caller retrying an unserviced table
          * would otherwise be invisible here. */
         static int non_tcp_logged;
-        if (non_tcp_logged < 16)
+        if (status == STATUS_NOT_SUPPORTED && non_tcp_logged < 16)
         {
             non_tcp_logged++;
             dprintf( 2, "[nsi-ios] non-tcp module %08x table=%u -> NOT_SUPPORTED rev=ml472\n",
                      (UINT)params->module->Guid.Data1, (UINT)params->table );
         }
-        return STATUS_NOT_SUPPORTED;
+        return status;
     }
 
     switch ((UINT)params->table)
@@ -223,6 +233,8 @@ static NTSTATUS ios_nsi_enumerate_all_ex( void *args )
 const void *nsi_unix_call_funcs[] =
 {
     (const void *)ios_nsi_enumerate_all_ex,
+    (const void *)nsi_get_all_parameters_ex,   /* 1: NsiGetAllParametersEx */
+    (const void *)nsi_get_parameter_ex,        /* 2: NsiGetParameterEx */
 };
 
 /* The 32-bit counterpart.  A 32-bit nsi.dll passes a struct
@@ -281,7 +293,93 @@ static NTSTATUS ios_wow64_nsi_enumerate_all_ex( void *args )
     return status;
 }
 
+/* The row and field reads, converted the same way: every embedded pointer is
+ * a guest address (the key and the caller's output buffers included), the
+ * sizes, table and param_type are plain numbers. Nothing is written back
+ * into the argument block; the data goes to the converted buffers. */
+struct nsi_get_all_parameters_ex32
+{
+    PTR32 unknown[2];
+    PTR32 module;
+    ULONG table;
+    UINT  first_arg;
+    UINT  unknown2;
+    PTR32 key;
+    UINT  key_size;
+    PTR32 rw_data;
+    UINT  rw_size;
+    PTR32 dynamic_data;
+    UINT  dynamic_size;
+    PTR32 static_data;
+    UINT  static_size;
+};
+
+struct nsi_get_parameter_ex32
+{
+    PTR32 unknown[2];
+    PTR32 module;
+    ULONG table;
+    UINT  first_arg;
+    UINT  unknown2;
+    PTR32 key;
+    UINT  key_size;
+    ULONG param_type;
+    PTR32 data;
+    UINT  data_size;
+    UINT  data_offset;
+};
+
+static NTSTATUS ios_wow64_nsi_get_all_parameters_ex( void *args )
+{
+    struct nsi_get_all_parameters_ex32 *params32 = args;
+    struct nsi_get_all_parameters_ex params;
+
+    if (!params32) return STATUS_INVALID_PARAMETER;
+
+    params.unknown[0]   = ios_wow_host_ptr( params32->unknown[0] );
+    params.unknown[1]   = ios_wow_host_ptr( params32->unknown[1] );
+    params.module       = ios_wow_host_ptr( params32->module );
+    params.table        = params32->table;
+    params.first_arg    = params32->first_arg;
+    params.unknown2     = params32->unknown2;
+    params.key          = ios_wow_host_ptr( params32->key );
+    params.key_size     = params32->key_size;
+    params.rw_data      = ios_wow_host_ptr( params32->rw_data );
+    params.rw_size      = params32->rw_size;
+    params.dynamic_data = ios_wow_host_ptr( params32->dynamic_data );
+    params.dynamic_size = params32->dynamic_size;
+    params.static_data  = ios_wow_host_ptr( params32->static_data );
+    params.static_size  = params32->static_size;
+
+    return nsi_get_all_parameters_ex( &params );
+}
+
+static NTSTATUS ios_wow64_nsi_get_parameter_ex( void *args )
+{
+    struct nsi_get_parameter_ex32 *params32 = args;
+    struct nsi_get_parameter_ex params;
+
+    if (!params32) return STATUS_INVALID_PARAMETER;
+
+    params.unknown[0]  = ios_wow_host_ptr( params32->unknown[0] );
+    params.unknown[1]  = ios_wow_host_ptr( params32->unknown[1] );
+    params.module      = ios_wow_host_ptr( params32->module );
+    params.table       = params32->table;
+    params.first_arg   = params32->first_arg;
+    params.unknown2    = params32->unknown2;
+    params.key         = ios_wow_host_ptr( params32->key );
+    params.key_size    = params32->key_size;
+    params.param_type  = params32->param_type;
+    params.data        = ios_wow_host_ptr( params32->data );
+    params.data_size   = params32->data_size;
+    params.data_offset = params32->data_offset;
+
+    return nsi_get_parameter_ex( &params );
+}
+
 const void *nsi_unix_call_wow64_funcs[] =
 {
     (const void *)ios_wow64_nsi_enumerate_all_ex,
+    (const void *)ios_wow64_nsi_get_all_parameters_ex,
+    (const void *)ios_wow64_nsi_get_parameter_ex,
 };

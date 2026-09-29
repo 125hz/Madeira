@@ -116,8 +116,9 @@ caller's bitness; a library without a 32-bit table refuses a 32-bit caller
 instead of handing it the 64-bit table. 64-bit callers get the same tables
 from the same branches as before. Tables provided: winemetal (DXMT's Metal
 renderer; the 32-bit table lives in DXMT's `winemetal_unix.c`), ws2_32,
-bcrypt, secur32, crypt32, dwrite, nsi (TCP table) and the audio driver (on
-the existing engine). win32u goes through `wow64win.dll`.
+bcrypt, secur32, crypt32, dwrite, nsi (TCP connections, network interfaces,
+addresses and routes, and the row/field reads) and the audio driver (on the
+existing engine). win32u goes through `wow64win.dll`.
 
 ### Direct3D 9
 
