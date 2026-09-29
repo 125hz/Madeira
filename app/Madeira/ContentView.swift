@@ -1177,7 +1177,8 @@ struct ContentView: View {
                 if library.enabled && library.current != nil {
                     sessionBody
                 } else if library.enabled {
-                    LibraryView(play: launchLibraryEntry, enableJIT: enableJITViaStikDebug)
+                    LibraryView(play: launchLibraryEntry, enableJIT: enableJITViaStikDebug,
+                                startDock: { startDock($0, compactPool: $1) })
                 } else if vSizeClass == .compact {
                     landscapeBody
                 } else {
@@ -2827,13 +2828,24 @@ struct ContentView: View {
     /// Madeira Dock: hand the stored sign-in to the host once, point it at the game and
     /// start the normal session with explorer's virtual desktop running dockhost.exe.
     /// Nothing is handed over unless JIT is ready and no session runs.
+    /// From the library (Settings › Steam › Madeira Dock) the start is a library
+    /// session: the library's one-session-per-run rule applies first, failures
+    /// show in the library, and the session gets the full-screen game view.
     private func startDock(_ game: DockGame, compactPool: Bool) {
+        let inLibrary = library.enabled
         guard jit_check_debugged() else {
             logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
+            if inLibrary { library.error = "Enable JIT before playing." }
             return
         }
-        guard wine_process_is_running() == 0, wineserver_is_running() == 0 else {
+        guard wine_process_is_running() == 0, wineserver_is_running() == 0, !inLibrary || library.current == nil else {
             logStore.log("[madeira-dock] a session already ran in this app run; restart Madeira first", level: .error)
+            if inLibrary { library.error = "A session is already running." }
+            return
+        }
+        if inLibrary, LibraryModel.sessionsThisRun > 0, MadeiraConfig.flag("MADEIRA_ONE_SESSION_PER_RUN") {
+            LogStore.shared.log("[session-once] Dock launch held: \(LibraryModel.sessionsThisRun) session(s) already ran in this app run")
+            library.restartNotice = LibraryModel.restartMessage
             return
         }
         do {
@@ -2846,6 +2858,7 @@ struct ContentView: View {
             MadeiraDock.cleanup()
             MadeiraDockModel.shared.status = error.localizedDescription
             logStore.log("[madeira-dock] not started: \(error.localizedDescription)", level: .error)
+            if inLibrary { library.error = error.localizedDescription }
             return
         }
         MadeiraDock.configure(game)
@@ -2873,6 +2886,7 @@ struct ContentView: View {
         MadeiraDock.requestLaunch(compactPool: compactPool)
         logStore.log("[madeira-dock] starting the host for app \(game.id); Valve's client authenticates and authorizes the launch")
         MadeiraDockModel.shared.watchReport()
+        if inLibrary { library.begin(.dockSession(title: game.name, width: width, height: height), remember: false) }
         runWineFullSequence()
     }
 
