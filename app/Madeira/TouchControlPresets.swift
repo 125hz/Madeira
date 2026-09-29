@@ -15,6 +15,13 @@ import UIKit
 // which layout it was loaded from (`TouchControlsModel.layoutID`) so edits made
 // in the editor are written back to that custom layout when editing ends.
 //
+// The layout menu is offered in two places: the landscape overlay's top bar
+// (`ControlLayoutMenu`) and, in a library session, where LibraryHUD replaces
+// that bar, as a "Controller layout" row of the in-game Session menu (the same
+// view, `.row` style). A library game remembers its layout (`LibraryEntry.
+// controlLayout`); other games and the overlay outside the library keep the
+// one shared working copy.
+//
 // Switches (Documents/madeira.cfg `env.NAME = value`, or the environment):
 //   MADEIRA_CONTROL_PRESETS=0        no layout menu, no write-back (default on)
 //   MADEIRA_CONTROLS_XBOX_DEFAULT=1  a user with no controls file gets the
@@ -177,6 +184,10 @@ struct ControlPresetStore: Equatable {
     static func isBuiltIn(_ id: String) -> Bool { builtIns.contains { $0.id == id } }
 
     func preset(_ id: String) -> ControlPreset? { all.first { $0.id == id } }
+
+    /// The id if a layout still has it, else nil: a game's remembered layout may
+    /// have been deleted since, and controls that no layout holds are unsaved.
+    func resolvedID(_ id: String?) -> String? { id.flatMap { preset($0)?.id } }
 
     static func clean(_ name: String) -> String {
         String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(maxNameLength))
@@ -449,47 +460,41 @@ final class ControlPresetsModel: ObservableObject {
     }
 }
 
-// MARK: - Layout menu (landscape overlay)
+// MARK: - Layout menu (landscape overlay, library session menu)
 
-/// The overlay's layout button: the controller built-in, the user's custom
-/// layouts, "Create new layout" (opens the editor on an empty layout) and
-/// deleting the active custom layout. Shown only while touch controls are on.
+/// The layout menu: the controller built-in, the user's custom layouts,
+/// "Create new layout" (opens the editor on an empty layout) and deleting the
+/// active custom layout. Shown only while touch controls are on. `.glass` is
+/// the overlay's round top-bar button; `.row` is a labelled row of the library
+/// session's Session menu.
 struct ControlLayoutMenu: View {
+    enum Style { case glass, row }
+
     @ObservedObject private var presets = ControlPresetsModel.shared
     @ObservedObject private var m = TouchControlsModel.shared
+    private let style: Style
+    /// Called after a layout was loaded, created or deleted, with true when the
+    /// editor was opened (a library session saves the game's profile, and closes
+    /// its menu to show the editor).
+    private let didChoose: ((_ openedEditor: Bool) -> Void)?
+
+    init(style: Style = .glass, didChoose: ((_ openedEditor: Bool) -> Void)? = nil) {
+        self.style = style
+        self.didChoose = didChoose
+    }
 
     private enum Choice: Equatable { case load(String), create }
     @State private var pending: Choice?
     @State private var confirmDelete: ControlPreset?
 
     var body: some View {
-        Menu {
-            Section("Controller layout") {
-                ForEach(presets.available) { p in
-                    Button { request(.load(p.id)) } label: {
-                        if m.layoutID == p.id { Label(p.name, systemImage: "checkmark") }
-                        else if ControlPresetStore.isBuiltIn(p.id) { Label(p.name, systemImage: "gamecontroller") }
-                        else { Text(p.name) }
-                    }
-                }
+        Group {
+            if style == .row {
+                LabeledContent("Controller layout") { menu }
+            } else {
+                menu
             }
-            if !presets.readOnly {
-                Button("Create new layout", systemImage: "plus") { request(.create) }
-            }
-            if let a = presets.active, !ControlPresetStore.isBuiltIn(a.id), !presets.readOnly {
-                Button("Delete \u{201C}\(a.name)\u{201D}", systemImage: "trash", role: .destructive) {
-                    confirmDelete = a
-                }
-            }
-        } label: {
-            // Same look as the overlay's glass buttons; stroke glyph only.
-            Image(systemName: "square.stack.3d.up")
-                .font(.system(size: 18, weight: .regular))
-                .foregroundStyle(.white)
-                .frame(width: 44, height: 44)
-                .background(GlassShape(circle: true))
         }
-        .accessibilityLabel("Controller layout")
         .alert("Keep the current controls?", isPresented: shown($pending)) {
             if !presets.readOnly {
                 Button("Keep as \u{201C}\(presets.store.nextCustomName())\u{201D}") {
@@ -510,11 +515,49 @@ struct ControlLayoutMenu: View {
         }
         .alert("Delete \u{201C}\(confirmDelete?.name ?? "")\u{201D}?", isPresented: shown($confirmDelete)) {
             Button("Delete", role: .destructive) {
-                if let p = confirmDelete { presets.delete(p.id) }
+                if let p = confirmDelete, presets.delete(p.id) { didChoose?(false) }
                 confirmDelete = nil
             }
             Button("Cancel", role: .cancel) { confirmDelete = nil }
         }
+    }
+
+    private var menu: some View {
+        Menu {
+            Section("Controller layout") {
+                ForEach(presets.available) { p in
+                    Button { request(.load(p.id)) } label: {
+                        if m.layoutID == p.id { Label(p.name, systemImage: "checkmark") }
+                        else if ControlPresetStore.isBuiltIn(p.id) { Label(p.name, systemImage: "gamecontroller") }
+                        else { Text(p.name) }
+                    }
+                }
+            }
+            if !presets.readOnly {
+                Button("Create new layout", systemImage: "plus") { request(.create) }
+            }
+            if let a = presets.active, !ControlPresetStore.isBuiltIn(a.id), !presets.readOnly {
+                Button("Delete \u{201C}\(a.name)\u{201D}", systemImage: "trash", role: .destructive) {
+                    confirmDelete = a
+                }
+            }
+        } label: {
+            switch style {
+            case .glass:
+                // Same look as the overlay's glass buttons; stroke glyph only.
+                Image(systemName: "square.stack.3d.up")
+                    .font(.system(size: 18, weight: .regular))
+                    .foregroundStyle(.white)
+                    .frame(width: 44, height: 44)
+                    .background(GlassShape(circle: true))
+            case .row:
+                HStack(spacing: 4) {
+                    Text(presets.active?.name ?? "Custom")
+                    Image(systemName: "chevron.up.chevron.down").font(.caption)
+                }
+            }
+        }
+        .accessibilityLabel("Controller layout")
     }
 
     private func shown<T>(_ b: Binding<T?>) -> Binding<Bool> {
@@ -528,8 +571,11 @@ struct ControlLayoutMenu: View {
 
     private func perform(_ choice: Choice?) {
         switch choice {
-        case .load(let id): presets.load(id, screen: ControlPresetsModel.currentScreen())
-        case .create: presets.createLayout()
+        case .load(let id):
+            presets.load(id, screen: ControlPresetsModel.currentScreen())
+            didChoose?(false)
+        case .create:
+            if presets.createLayout() { didChoose?(true) }
         case nil: break
         }
     }

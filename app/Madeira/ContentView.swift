@@ -827,6 +827,12 @@ struct JoystickFace: View {
     /// than faked by passing held:true (which would also kill the knob travel
     /// and the press styling).
     var alwaysExpanded = false
+    /// SF Symbol naming what this stick drives (ControlAction.stickGlyph), so a
+    /// WASD stick and an arrow-key stick differ at a glance. At rest it is drawn
+    /// on the knob in the middle of the ring and travels with it; a ring at idle
+    /// size shows the glyph alone, where a knob plus a symbol would be a smudge.
+    /// nil (the portrait pad) draws the face exactly as before.
+    var glyph: String?
     private var expanded: Bool { held || alwaysExpanded }
 
     static let idleDiameter: CGFloat = 22
@@ -855,6 +861,12 @@ struct JoystickFace: View {
         return ZStack {
             interior
             Circle().strokeBorder(Color.white.opacity(0.55), lineWidth: expanded ? 2 : 1.5)
+            if let g = glyph, !expanded {
+                Image(systemName: g)
+                    .font(.system(size: d * 0.62, weight: .medium))
+                    .foregroundColor(.white)
+                    .opacity(0.95)
+            }
             Circle()
                 .fill(Color.white)
                 .frame(width: d * 0.42, height: d * 0.42)
@@ -869,7 +881,19 @@ struct JoystickFace: View {
                         .padding(d * 0.075)
                         .opacity(expanded ? 0 : 1)
                 )
+                .overlay {
+                    // Dark on the white knob, inside its rim: it reads at rest and
+                    // follows the knob when the stick is deflected.
+                    if let g = glyph, expanded {
+                        Image(systemName: g)
+                            .font(.system(size: d * 0.22, weight: .semibold))
+                            .foregroundColor(.black)
+                            .opacity(0.62)
+                    }
+                }
                 .offset(knobOffset(d))
+                // A glyph-bearing ring at idle size shows the glyph instead of the knob.
+                .opacity(glyph == nil || expanded ? 1 : 0)
         }
         .frame(width: d, height: d)
     }
@@ -3146,6 +3170,17 @@ enum ControlAction: Codable, Equatable, Hashable {
         default: return nil
         }
     }
+    /// SF Symbol drawn in the middle of a key stick's face. WASD and the arrow
+    /// keys share one control (`.dirStick`) and would draw the same ring, so a
+    /// user could not tell them apart without pressing one. nil for every other
+    /// control, including the controller sticks, which carry their own label.
+    var stickGlyph: String? {
+        switch self {
+        case .joystickWASD:   return "keyboard"
+        case .joystickArrows: return "arrow.up.and.down.and.arrow.left.and.right"
+        default:              return nil
+        }
+    }
     var isPad: Bool { if case .pad = self { return true }; return false }
     var padName: String? { if case .pad(let name) = self { return name }; return nil }
     var isPadStick: Bool { padName == "LS" || padName == "RS" }
@@ -3551,7 +3586,8 @@ struct TouchControlButton: View {
             } else if control.action.stickKeys != nil {
                 // Reuse the portrait pad's face so both look and animate the
                 // same; scale it to whatever size this control was pinched to.
-                JoystickFace(held: isDown, dir: stickDir, alwaysExpanded: true)
+                JoystickFace(held: isDown, dir: stickDir, alwaysExpanded: true,
+                              glyph: control.action.stickGlyph)
                     .frame(width: JoystickFace.padRadius * 2,
                            height: JoystickFace.padRadius * 2)
                     .scaleEffect(diameter / (JoystickFace.padRadius * 2))

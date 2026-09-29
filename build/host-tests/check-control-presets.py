@@ -7,6 +7,9 @@ preset state from TouchControlPresets.swift) on the host: the built-in
 controller layout on phone and tablet screens, built-ins read-only, "Custom
 Layout N" naming, encode/decode and what loading a layout puts on screen.
 
+The preset is checked as data: its name, id and its 18 bindings, each an XInput
+mapping that produces a non-neutral pad sample; and the key sticks' glyphs.
+
 Part B checks the UI wiring in the same files: kill switches, the write-back
 on the end of an edit, the default for new users only, and the session slot.
 Set SWIFTC if Swift is not on PATH.
@@ -94,6 +97,34 @@ for (label, screen) in screens {
 }
 let ids = Set(ControlPresetLayout.xbox(for: .referencePhone).map { $0.id })
 require(ids.count == expected.count, "built-in controls have distinct ids")
+
+// --- The Xbox controller preset as data: what a user is offered and what each button does.
+let builtIn = ControlPresetStore.builtIns
+require(builtIn.count == 1 && builtIn[0].id == ControlPresetLayout.xboxID && builtIn[0].name == "Xbox controller",
+        "one built-in, listed as \"Xbox controller\"")
+require(builtIn[0].controls.count == 18 && Set(builtIn[0].controls.compactMap { $0.action.padName }) == Set(expected),
+        "the built-in binds the 18 controller inputs, none twice")
+require(builtIn[0].controls.allSatisfy { c in
+            guard let n = c.action.padName else { return false }
+            return TouchPadAction.sample(n, x: 1, y: 1) != GamepadSample()
+        }, "every built-in binding produces a non-neutral XInput sample when pressed or deflected")
+require(ControlPresetStore().preset(ControlPresetLayout.xboxID)?.name == "Xbox controller"
+        && ControlPresetStore(user: []).all.first?.id == ControlPresetLayout.xboxID,
+        "a store with no user layouts still offers the built-in first")
+let one = ControlPresetStore(user: [ControlPreset(id: "u", name: "Mine", controls: [])])
+require(one.resolvedID(ControlPresetLayout.xboxID) == ControlPresetLayout.xboxID && one.resolvedID("u") == "u",
+        "a game's remembered built-in or custom layout resolves")
+require(one.resolvedID("gone") == nil && one.resolvedID(nil) == nil, "a deleted or absent layout resolves to none")
+
+// --- The key sticks carry a glyph that tells them apart; nothing else does.
+require(ControlAction.joystickWASD.stickGlyph == "keyboard", "the WASD stick's glyph is the keyboard")
+require(ControlAction.joystickArrows.stickGlyph == "arrow.up.and.down.and.arrow.left.and.right",
+        "the arrow-key stick's glyph is the arrows")
+require(ControlAction.joystickWASD.stickGlyph != ControlAction.joystickArrows.stickGlyph, "WASD and Arrows differ")
+let plain: [ControlAction] = [.none, .mouseLeft, .mouseRight, .keyboardToggle, .key(0x20), .pad("LS"), .pad("RS"), .pad("A")]
+require(plain.allSatisfy { $0.stickGlyph == nil }, "no other control (nor the controller sticks) has a stick glyph")
+require(ControlAction.joystickWASD.stickKeys == [0x57, 0x44, 0x53, 0x41]
+        && ControlAction.joystickArrows.stickKeys == [0x26, 0x27, 0x28, 0x25], "the glyph does not change the keys a stick posts")
 
 // --- Encode / decode round trip.
 var store = ControlPresetStore()
@@ -196,6 +227,38 @@ assert window.index('if m.editing {') < window.index('!hit.isDescendant(of: root
     < window.index('guard m.hitsInteractive('), 'menu and dialog presentations take their touches in play mode'
 reserve = function(gamepad, '@MainActor func reserveSessionSlot(touchControls: Bool) {')
 assert reserve.index('guard Self.enabled, Self.optIn("MADEIRA_PAD_EARLY_SLOT")') < reserve.index('touchState.reserved = true')
-run = function(content, 'private func runWineFullSequence() {')
+run = function(content, 'private func runWineFullSequence(profile: LibraryEntry? = nil) {')
 assert run.index('GamepadInput.shared.reserveSessionSlot(') < run.index('DispatchQueue.global'), 'reserved before Wine starts'
-print('PASS: switches (opt-in built-in default and session slot), edit write-back, layout menu and session slot wiring')
+
+# The built-in reaches a library session: LibraryHUD replaces the overlay's top bar there, so the
+# Session menu carries the same menu, and a game remembers the layout it was loaded from.
+lib = (app / 'Library.swift').read_text()
+hud = function(lib, 'struct LibraryHUD: View {')
+menu = function(hud, 'private var menu: some View {')
+row = menu.index('ControlLayoutMenu(style: .row)')
+assert 'if session && !m.editing { LibraryHUD() } else { topBar }' in overlay, 'a session shows the HUD instead of the top bar'
+assert menu.index('Toggle("Touch controls"') < row < menu.index('LabeledContent("Opacity")'), \
+    'the Session menu offers the layout menu with the touch-control settings'
+assert 'controls.visible && ControlPresetsModel.enabled' in menu[row - 80:row], \
+    'only while touch controls are on and MADEIRA_CONTROL_PRESETS is not 0'
+assert 'model.saveCurrentProfile()' in menu[row:menu.index('LabeledContent("Opacity")')], 'a chosen layout is saved to the game'
+layout_menu = function(presets, 'struct ControlLayoutMenu: View {')
+assert 'enum Style { case glass, row }' in layout_menu and 'LabeledContent("Controller layout")' in layout_menu
+assert 'ControlLayoutMenu()' in overlay, 'the overlay keeps its top-bar button, unchanged'
+entry = function(lib, 'struct LibraryEntry: Codable, Identifiable {')
+assert 'var controlLayout: String?' in entry, 'optional, so older library files decode'
+model_lib = function(lib, 'final class LibraryModel: ObservableObject {')
+begin = function(model_lib, 'func begin(_ entry: LibraryEntry')
+assert 'store.resolvedID(entry.controlLayout)' in begin and 'savedLayout = controls.layoutID' in begin
+assert begin.index('if let profile = entry.controls') < begin.index('resolvedID'), "the layout follows the game's own controls only"
+assert 'entry.controlLayout = controls.layoutID' in function(model_lib, 'func saveCurrentProfile()')
+fin = function(model_lib, 'private func finish()')
+assert fin.index('saveCurrentProfile()') < fin.index('controls.layoutID = savedLayout'), 'the session restores the shared layout after saving'
+
+# The WASD stick's centre glyph: drawn by the stick face, fed by the action.
+face = function(content, 'struct JoystickFace: View {')
+assert 'var glyph: String?' in face and 'Image(systemName: g)' in face, 'the stick face draws a glyph'
+assert 'glyph: control.action.stickGlyph' in function(content, 'struct TouchControlButton: View {'), 'the overlay stick passes its glyph'
+assert 'JoystickFace(held: s.held, dir: s.dir)' in content and 'JoystickFace(held: false, dir: -1)' in content, 'the portrait pad passes none, drawn as before'
+assert '.opacity(glyph == nil || expanded ? 1 : 0)' in face, 'no glyph: the knob is always drawn'
+print('PASS: switches (opt-in built-in default and session slot), edit write-back, layout menu, session-menu layout choice and stick glyph wiring')
