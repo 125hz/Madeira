@@ -472,6 +472,9 @@ enum DockInstallers {
     private(set) static var serverSync = false
     /// This start's plan in words (the Dock sheet's status), nil when there is nothing to say.
     private(set) static var note: String?
+    /// When poll first read the batch's end: the host starts next. nil before, and
+    /// for a start without installs.
+    private(set) static var finishedAt: Date?
     private static var logged: Set<String> = []
 
     nonisolated static func flag(_ name: String) -> Bool { SteamSignIn.flag(name, default: true) }
@@ -592,7 +595,7 @@ enum DockInstallers {
     static func prepare(_ game: DockGame, drive: URL, prefix: URL,
                         has32Bit: Bool = DockInstallers.bundleHas32Bit, hasMsiexec: Bool = DockInstallers.bundleHasMsiexec,
                         fusionSource: URL? = Bundle.main.resourceURL?.appendingPathComponent("i386-windows/fusion.dll")) {
-        script = nil; serverSync = false; note = nil; logged = []
+        script = nil; serverSync = false; note = nil; finishedAt = nil; logged = []
         let app = game.id
         let batchFile = drive.appendingPathComponent(scriptName)
         try? FileManager.default.removeItem(at: batchFile)
@@ -730,8 +733,9 @@ enum DockInstallers {
         try? ledger.save(prefix: prefix)
     }
 
-    /// The batch's progress from its result file, for the Dock sheet. New start and exit
-    /// lines are logged once; the text names the program running now and any that failed.
+    /// The batch's progress from its result file, for the Dock sheet and the starting
+    /// screen. New start and exit lines, and the end, are logged once; the text names the
+    /// program running now and any that failed, and at the end how many succeeded.
     static func poll(drive: URL) -> String? {
         guard script != nil else { return nil }
         let file = drive.appendingPathComponent(resultName)
@@ -755,6 +759,12 @@ enum DockInstallers {
         if let running = results.running {
             return "Running one-time install \(running) of \(max(results.total, running)): \(results.started[running] ?? "")…" + failures
         }
-        return (results.ended ? "One-time installs finished." : "Running this game's one-time installs…") + failures
+        guard results.ended else { return "Running this game's one-time installs…" + failures }
+        let total = max(results.total, results.exits.count), succeeded = results.exits.count - failed.count
+        if logged.insert("end").inserted {
+            finishedAt = Date()
+            LogStore.shared.log("[dock-installers] end succeeded=\(succeeded) failed=\(failed.count) of=\(total); the host starts next")
+        }
+        return "One-time installs finished: \(succeeded) of \(total) succeeded." + failures
     }
 }

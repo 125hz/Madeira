@@ -79,6 +79,11 @@ require('if dockStart.failure != nil {' in row and 'if dockStart.holding {' in r
         'close session only once the Dock stopped; show desktop only while the desktop is held back')
 require('Text("Madeira Dock stopped")' in library and 'DockInstallers.note' in library and 'DockStartStatus.text(' in library,
         'the starting screen shows the Dock status, the one-time-install note, and a stop with its words')
+status = library[library.index('    private var dockStatus: String {'):]
+status = status[:status.index('\n    }\n')]
+require(status.index('DockInstallers.poll(drive: MadeiraDock.drive)') < status.index('DockInstallers.finishedAt ?? model.launchStartedAt')
+        and 'installsFinished: DockInstallers.finishedAt != nil' in status and 'waited: Date().timeIntervalSince(hostDue)' in status,
+        "the status line reads the installs' end after polling them, and times the host from it (or from the start)")
 require('SteamGameArtwork(appID: appID)' in library and 'SteamLaunchBackdrop(appID: appID)' in library,
         "a Dock start shows the game's cover and backdrop by App ID")
 require('winios_window_census_enable(1)' in screen and screen.count('winios_window_census_enable(0)') == 1,
@@ -218,23 +223,75 @@ func window(_ image: String, _ w: Int, _ h: Int, visible: Bool = true, drawn: Bo
         require(reveals == SteamLaunchHold.maxAutoReveals && covers == SteamLaunchHold.maxAutoReveals - 1 && flapping.revealed,
                 "a flapping dialog stops toggling and stays shown (reveals=\(reveals) covers=\(covers))")
 
-        // --- The status line.
+        // --- The status line: the furthest stage the host reported.
         typealias D = DockStartStatus
-        require(D.text([:], installers: false, installerProgress: nil, slow: false) == "Starting Madeira Dock…", "starting")
-        require(D.text([:], installers: false, installerProgress: nil, slow: true) == "Waiting for Madeira Dock…", "slow")
-        require(D.text([:], installers: true, installerProgress: nil, slow: false) == "Running this game's one-time installs…", "installs")
-        require(D.text([:], installers: true, installerProgress: "Running one-time install 1 of 2: a…", slow: true) == "Running one-time install 1 of 2: a…",
-                "installs with their progress")
-        require(D.text(["probe-start-bits": "64"], installers: true, installerProgress: "x", slow: false) == "Starting Madeira Dock…",
-                "the host's first field ends the installs")
-        require(D.text(["launch-update-wait": "17"], installers: false, installerProgress: nil, slow: false).hasPrefix("Steam is installing content"),
-                "content wait")
-        require(D.text(["launch-update-wait": "17", "launch-update-ready": "3"], installers: false, installerProgress: nil, slow: false) == "Starting Madeira Dock…",
+        func text(_ fields: [String: String], installers: Bool = false, progress: String? = nil, finished: Bool = false,
+                  waited: Double = 5) -> String {
+            D.text(fields, installers: installers, installerProgress: progress, installsFinished: finished, waited: waited)
+        }
+        // Report fields in the order a device log's [dock-report] lines show them.
+        let started: [String: String] = ["probe-start-bits": "64", "client-machine": "34404", "load-client-begin": "0",
+                                      "session-client-adapter": "202601"]
+        let loaded = started.merging(["public-client021-present": "1", "engine005-present": "1", "engine-factory-result": "0"]) { $1 }
+        let submitted = loaded.merging(["session-private-abi-verified": "1", "session-native-token-submitted": "1",
+                                        "session-logon-start-result": "1"]) { $1 }
+        let online = submitted.merging(["session-authenticated-online": "1"]) { $1 }
+        let listed = online.merging(["session-requested-app-entitled": "1", "session-subscription-count": "12",
+                                     "session-requested-app-listed": "1"]) { $1 }
+        let launched = listed.merging(["launch-client-error": "0"]) { $1 }
+        require(text([:]) == "Starting Madeira Dock…", "no field yet: the host is starting")
+        require(text([:], waited: 29) == "Starting Madeira Dock…" && text([:], waited: 30) == "Still starting Madeira Dock…",
+                "after 30 s without its first field the host is late")
+        require(text(started) == "Loading Steam…" && text(loaded) == "Loading Steam…", "host started: Valve's client loads")
+        require(text(started, waited: 300) == "Loading Steam…", "late only matters before the host's first field")
+        require(text(submitted) == "Signing in to Steam…" && text(["probe-start-bits": "64", "session-logon-start-result": "1"]) == "Signing in to Steam…",
+                "the sign-in was submitted")
+        require(text(online) == "Signed in. Waiting for Steam to confirm this game's license…", "signed in, the license check waits")
+        require(text(online.merging(["session-authenticated-online": "0"]) { $1 }) == "Signing in to Steam…", "signed out again: signing in")
+        require(text(online.merging(["session-requested-app-entitled": "1", "session-requested-app-listed": "0"]) { $1 }) ==
+                "Signed in. Waiting for Steam to confirm this game's license…", "a license not listed is not confirmed")
+        require(text(listed) == "License confirmed. Steam is starting the game…", "license confirmed")
+        let preparing = listed.merging(["ceg-scm": "1", "ceg-request-result": "1", "ceg-request": "1"]) { $1 }
+        require(text(preparing) == "Steam is preparing this game's executable…" &&
+                text(listed.merging(["ceg-request-busy": "10"]) { $1 }) == "Steam is preparing this game's executable…",
+                "a game whose executable Steam prepares per user")
+        require(text(preparing.merging(["ceg-result": "1"]) { $1 }) == "License confirmed. Steam is starting the game…", "executable prepared")
+        require(text(listed.merging(["ceg-disabled": "1"]) { $1 }) == "License confirmed. Steam is starting the game…", "no preparation")
+        require(text(launched) == "The game is starting. Waiting for its window…" &&
+                text(preparing.merging(["ceg-result": "1", "launch-client-error": "0"]) { $1 }) == "The game is starting. Waiting for its window…",
+                "Steam accepted the launch: waiting for the game's window")
+        require(text(listed.merging(["launch-client-error": "17"]) { $1 }) == "License confirmed. Steam is starting the game…",
+                "a refusal without a wait keeps the last stage until the host's result")
+
+        // Steam's own waits come first.
+        let update = listed.merging(["launch-client-error": "17", "launch-update-wait": "17"]) { $1 }
+        require(text(update).hasPrefix("Steam is installing content"), "content wait")
+        require(text(update.merging(["launch-update-ready": "3", "launch-client-error": "0"]) { $1 }) == "The game is starting. Waiting for its window…",
                 "content ready")
-        require(D.text(["launch-session-wait": "1", "launch-client-error": "35"], installers: false, installerProgress: nil, slow: false)
-                    .hasPrefix("Steam says this account is still playing in another session"), "session wait (35)")
-        require(D.text(["launch-session-wait": "1", "launch-client-error": "22"], installers: false, installerProgress: nil, slow: false) == "Starting Madeira Dock…",
+        let session = listed.merging(["launch-session-wait": "35", "launch-client-error": "35"]) { $1 }
+        require(text(session).hasPrefix("Steam says this account is still playing in another session"), "session wait (35)")
+        require(text(listed.merging(["launch-session-wait": "35", "launch-client-error": "22"]) { $1 }) == "License confirmed. Steam is starting the game…",
                 "another error is not the session wait")
+        require(text(session.merging(["launch-client-error": "0"]) { $1 }) == "The game is starting. Waiting for its window…", "session wait over")
+        let config = listed.merging(["launch-config-wait": "22", "launch-client-error": "22"]) { $1 }
+        require(text(config) == "Steam is still loading this game's configuration. Waiting for it…" &&
+                text(config.merging(["launch-client-error": "23"]) { $1 }) == "Steam is still loading this game's configuration. Waiting for it…",
+                "configuration wait (22, 23)")
+        require(text(config.merging(["launch-client-error": "0"]) { $1 }) == "The game is starting. Waiting for its window…", "configuration loaded")
+
+        // The one-time installs run before the host's first field.
+        require(text([:], installers: true) == "Running this game's one-time installs…", "installs")
+        require(text([:], installers: true, progress: "Running one-time install 1 of 2: a…", waited: 90) == "Running one-time install 1 of 2: a…",
+                "installs with their progress, never late")
+        let finishedWords = "One-time installs finished: 1 of 3 succeeded.\nFailed: b (exit 5), c (exit 7)"
+        require(text([:], installers: true, progress: finishedWords, finished: true) == finishedWords + "\nStarting Madeira Dock…",
+                "installs finished: how many succeeded, and the host starts next")
+        require(text([:], installers: true, progress: finishedWords, finished: true, waited: 31) == finishedWords + "\nStill starting Madeira Dock…",
+                "late counts from the installs' end")
+        require(text([:], installers: true, progress: nil, finished: true) == "One-time installs finished.\nStarting Madeira Dock…",
+                "installs finished without progress words")
+        require(text(started, installers: true, progress: finishedWords, finished: true) == "Loading Steam…" &&
+                text(started, installers: true, progress: "x") == "Loading Steam…", "the host's first field ends the installs")
         require(D.hostStarted(["probe-start-bits": "64"]) && !D.hostStarted([:]), "host start")
         require(D.failure(result: nil, words: nil, launching: true) == nil, "no result: the start goes on")
         require(D.failure(result: 0, words: nil, launching: false) == nil, "a normal end after the game's window is not a failure")

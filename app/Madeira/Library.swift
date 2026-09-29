@@ -1851,11 +1851,15 @@ struct LibraryHUD: View {
         if let appID = dockStart.appID { SteamLaunchBackdrop(appID: appID) } else { LibraryArtwork(entry: entry, backdrop: true) }
     }
 
-    /// What the Dock start is waiting for (DockStartStatus), read once a second.
+    /// What the Dock start is doing (DockStartStatus), read once a second.
     private var dockStatus: String {
         MainActor.assumeIsolated {
-            DockStartStatus.text(MadeiraDock.pollReport().fields, installers: DockInstallers.script != nil,
-                                 installerProgress: DockInstallers.poll(drive: MadeiraDock.drive), slow: model.launchSlow)
+            let progress = DockInstallers.poll(drive: MadeiraDock.drive)
+            // The host starts at once, or after this start's one-time installs finished.
+            let hostDue = DockInstallers.finishedAt ?? model.launchStartedAt
+            return DockStartStatus.text(MadeiraDock.pollReport().fields, installers: DockInstallers.script != nil,
+                                        installerProgress: progress, installsFinished: DockInstallers.finishedAt != nil,
+                                        waited: Date().timeIntervalSince(hostDue))
         }
     }
 

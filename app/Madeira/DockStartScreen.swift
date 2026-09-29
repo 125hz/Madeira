@@ -185,10 +185,23 @@ struct SteamLaunchHold {
 }
 
 /// The starting screen's text for a Dock start, from the host's numeric report.
+/// The host writes its fields as it goes (research/madeira-dock src/main.c,
+/// session.c, launch.c), and the text follows the furthest stage reported: the
+/// host started (probe-start-bits), the sign-in submitted, signed in, the game's
+/// license confirmed, the game's executable prepared (only for a game that needs
+/// it) and Steam's launch accepted (launch-client-error=0). Steam's own waits
+/// (content, configuration, another session) come first.
 enum DockStartStatus {
-    /// What the start is waiting for. `installers`: this start runs the game's
-    /// one-time installs first; `installerProgress`: their progress in words.
-    static func text(_ fields: [String: String], installers: Bool, installerProgress: String?, slow: Bool) -> String {
+    /// Seconds without the host's first field before the text says it is late.
+    static let slowAfter = 30.0
+
+    /// What the start is doing. `installers`: this start runs the game's one-time
+    /// installs first; `installerProgress`: their progress in words;
+    /// `installsFinished`: they ended, and the host starts next. `waited`: seconds
+    /// since the host could start (the start began, or the installs finished); it
+    /// only matters before the host's first field.
+    static func text(_ fields: [String: String], installers: Bool, installerProgress: String?,
+                     installsFinished: Bool, waited: Double) -> String {
         if fields["launch-update-wait"] != nil && fields["launch-update-ready"] == nil {
             return "Steam is installing content this game needs. The game starts when it finishes…"
         }
@@ -196,11 +209,25 @@ enum DockStartStatus {
         if fields["launch-session-wait"] != nil && fields["launch-client-error"] == "35" {
             return "Steam says this account is still playing in another session. Waiting for Steam to end it (up to 3 minutes)…"
         }
-        // The one-time installs run before the host writes its first field.
-        if installers && fields["probe-start-bits"] == nil {
-            return installerProgress ?? "Running this game's one-time installs…"
+        // Right after sign-in Steam may not have the game's configuration yet (22, 23); the Dock asks again.
+        if fields["launch-config-wait"] != nil && (fields["launch-client-error"] == "22" || fields["launch-client-error"] == "23") {
+            return "Steam is still loading this game's configuration. Waiting for it…"
         }
-        return slow ? "Waiting for Madeira Dock…" : "Starting Madeira Dock…"
+        if fields["launch-client-error"] == "0" { return "The game is starting. Waiting for its window…" }
+        if ["ceg-scm", "ceg-request-busy", "ceg-request"].contains(where: { fields[$0] != nil }) && fields["ceg-result"] == nil {
+            return "Steam is preparing this game's executable…"
+        }
+        if fields["session-requested-app-listed"] == "1" { return "License confirmed. Steam is starting the game…" }
+        if fields["session-authenticated-online"] == "1" { return "Signed in. Waiting for Steam to confirm this game's license…" }
+        if fields["session-native-token-submitted"] != nil || fields["session-logon-start-result"] != nil {
+            return "Signing in to Steam…"
+        }
+        if hostStarted(fields) { return "Loading Steam…" }
+        // Before the host's first field: the one-time installs run first, then the host starts.
+        let starting = waited >= slowAfter ? "Still starting Madeira Dock…" : "Starting Madeira Dock…"
+        guard installers else { return starting }
+        guard installsFinished else { return installerProgress ?? "Running this game's one-time installs…" }
+        return (installerProgress ?? "One-time installs finished.") + "\n" + starting
     }
 
     /// The host has started (its first report field): the one-time installs are over.

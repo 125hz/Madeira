@@ -175,13 +175,28 @@ VoiceOver labels): **Close session** once Dock has stopped, **Show live log**,
 and **Show desktop** while the desktop is held back. It stays until the
 game's own window is shown.
 
-The status line comes from the host's report: "Starting Madeira Dock…" (after
-30 s "Waiting for Madeira Dock…"), the one-time installs with the program
-running now, Steam installing content the game needs, and Steam's other
-session still counted as playing (35). When the host reports a result while
-the starting screen is up, the screen says "Madeira Dock stopped" with the
-report's words (the host waits for the game it started, so a result before
-any game window means the game did not start).
+The status line follows the furthest stage in the host's report
+(`DockStartStatus`, read once a second):
+
+| Report | Status line |
+|---|---|
+| nothing yet | "Starting Madeira Dock…" ("Still starting Madeira Dock…" after 30 s) |
+| one-time installs running | the program running now, and any that failed |
+| one-time installs ended (`[dock-installers] end`) | "One-time installs finished: N of M succeeded." and the failed ones, then "Starting Madeira Dock…" (late 30 s after the installs' end) |
+| `probe-start-bits` | "Loading Steam…" |
+| `session-native-token-submitted` or `session-logon-start-result` | "Signing in to Steam…" |
+| `session-authenticated-online=1` | "Signed in. Waiting for Steam to confirm this game's license…" |
+| `session-requested-app-listed=1` | "License confirmed. Steam is starting the game…" |
+| `ceg-scm`, `ceg-request-busy` or `ceg-request` without `ceg-result` | "Steam is preparing this game's executable…" |
+| `launch-client-error=0` | "The game is starting. Waiting for its window…" |
+
+Steam's own waits come first: content the game needs (`launch-update-wait`),
+the game's configuration right after sign-in (`launch-config-wait` with 22 or
+23), and Steam's other session still counted as playing (35). The host
+reports only numbers; the words are the app's. When the host reports a
+result while the starting screen is up, the screen says "Madeira Dock
+stopped" with the report's words (the host waits for the game it started, so
+a result before any game window means the game did not start).
 
 **Which window is the game's.** Winios keeps a census of the desktop's
 top-level windows while a Dock start's starting screen is up: per window,
@@ -273,8 +288,9 @@ tasks, before the step Dock asks it for, so on the Dock route nothing ran them.
    bundle without 32-bit Windows DLLs has nothing to copy (`no-source`).
 
 The plan, each program's fate and the results are logged as
-`[dock-installers]`; the Dock sheet's status shows the plan and the running
-program. `madeira-dock-installs.json` next to the registry files holds the
+`[dock-installers]`; the Dock sheet's status and the starting screen show the
+plan, the running program and, once the batch ended, how many succeeded.
+`madeira-dock-installs.json` next to the registry files holds the
 batch's program list and each game's choice.
 
 If the install record lists per-user custom executables (`CheckGuid`), Dock
