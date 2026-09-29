@@ -118,7 +118,16 @@ arguments are not supported.
    cached-account variables are always cleared. The launch also sets the
    engine's opt-in image-retire switch, `MADEIRA_JIT_IMAGE_RETIRE=1`, for
    this session only and logs `[dock-launch] image-retire=1` (see Known
-   risks). Other sessions keep the engine default (off).
+   risks). Other sessions keep the engine default (off). It also sets
+   Wine's opt-in image-map guard, `MADEIRA_IMAGE_MAP_GUARD=1`, and logs
+   `[dock-launch] image-map-guard=1`: while the loader loads Valve's client
+   and its imports, the emulator's image-map handler can commit a page of
+   its own heap under its interval lock, and that commit's notification
+   waits for the same lock. The host then parks for good with no report
+   line after `load-client-begin`. With the guard, the emulator's own memory
+   calls during that notification are not notified again, as on the syscall
+   path; ntdll logs `[ldr-image] image-map guard on`. Other sessions keep
+   Wine's default (off).
 4. The session is the normal Wine session: `explorer.exe
    /desktop=madeira,<W>x<H> C:\windows\system32\dockhost.exe`. The size comes
    from `desktop-size` in madeira.cfg, else 1280x720. When the game has
@@ -283,6 +292,7 @@ never asks. The preparation is Valve's; Dock does not touch the files.
 | `MADEIRA_DOCK_CLEAR_STEAM_ID` | on | `0`: a Dock session keeps the fixed Steam game identity every other launch publishes |
 | `MADEIRA_DOCK_CEG` | on | `0`: never ask the client to prepare per-user executables |
 | `MADEIRA_DOCK_IMAGE_RETIRE` | on | `0`: a Dock launch does not turn on the engine's `MADEIRA_JIT_IMAGE_RETIRE` (an explicit `env.MADEIRA_JIT_IMAGE_RETIRE` still wins) |
+| `MADEIRA_DOCK_IMAGE_MAP_GUARD` | on | `0`: a Dock launch does not turn on Wine's `MADEIRA_IMAGE_MAP_GUARD` |
 | `MADEIRA_DOCK_CLIENT_202601` | on | read by the host: `0` disables its January 2026 client adapter |
 | `MADEIRA_DOCK_HANDOFF_DIAGNOSTICS` | on | read by the host: `0` drops its numeric transfer diagnostics |
 | `MADEIRA_DOCK_SESSION_WAIT` | on | read by the host: `0` fails a launch refused with 35 (another session playing) at once instead of asking again for up to three minutes |
@@ -370,7 +380,8 @@ credentials:
     binary tracked, submodule pin;
   - compiled production Swift: pool policy, manifest and library discovery,
     validation, the transfer envelope and subject, the host environment
-    (image retire on, and off with `MADEIRA_DOCK_IMAGE_RETIRE=0`), and the
+    (image retire on, and off with `MADEIRA_DOCK_IMAGE_RETIRE=0`; the
+    image-map guard on, and off with `MADEIRA_DOCK_IMAGE_MAP_GUARD=0`), and the
     one-launch request.
 - `check-dock-report.py`: the report parser, its messages (including 34),
   the ordered callback IDs, rejection of private and malformed fields, and that every report round the pinned host

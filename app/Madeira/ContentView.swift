@@ -2388,6 +2388,7 @@ struct ContentView: View {
             }
             var poolSizeMB = DockPerformancePolicy.sessionPoolMB(standard: 896, dock: dockLaunch.dock, compact: dockLaunch.compact)
             if poolSizeMB != 896 { logStore.log("[dock-pool] compact JIT pool \(poolSizeMB)MB for this Dock launch") }
+            // madeira.cfg pool: the JIT pool size in MB (256 to 1152) for every launch; wins over the size above.
             if let txt = MadeiraConfig.get("pool"),
                let mb = Int(txt.trimmingCharacters(in: .whitespacesAndNewlines)),
                mb >= 256, mb <= 1152 {

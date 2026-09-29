@@ -60,6 +60,12 @@ require(dock.count('setenv("MADEIRA_JIT_IMAGE_RETIRE"') == 1 and
         dock.index('setenv("MADEIRA_JIT_IMAGE_RETIRE"') > dock.index('static func configure('),
         'the image-retire switch is set only in the Dock launch environment')
 require(content.count('MadeiraDock.configure(') == 1, 'only the Dock launch configures the host environment')
+# The image-map guard is also a Dock-session switch, set only by MadeiraDock.configure.
+for name, text in [('ContentView.swift', content), ('MadeiraDockView.swift', view), ('SteamRuntime.swift', runtime)]:
+    require('MADEIRA_IMAGE_MAP_GUARD' not in text, f'{name}: does not set the image-map guard')
+require(dock.count('setenv("MADEIRA_IMAGE_MAP_GUARD"') == 1 and
+        dock.index('setenv("MADEIRA_IMAGE_MAP_GUARD"') > dock.index('static func configure('),
+        'the image-map guard is set only in the Dock launch environment')
 # A Dock session publishes no fixed Steam game identity; every other launch keeps it.
 bridge = (app / 'WineProcessBridge.m').read_text()
 flag = bridge.index('const char *dock_session = getenv("MADEIRA_DOCK_SESSION");')
@@ -208,6 +214,10 @@ func jwt(_ claims: String) -> String {
         unsetenv("MADEIRA_JIT_IMAGE_RETIRE"); setenv("MADEIRA_DOCK_IMAGE_RETIRE", "0", 1); MadeiraDock.configure(alpha)
         require(env("MADEIRA_JIT_IMAGE_RETIRE") == nil, "MADEIRA_DOCK_IMAGE_RETIRE=0 leaves image retire off")
         unsetenv("MADEIRA_DOCK_IMAGE_RETIRE")
+        require(env("MADEIRA_IMAGE_MAP_GUARD") == "1", "a Dock launch turns Wine's image-map guard on")
+        unsetenv("MADEIRA_IMAGE_MAP_GUARD"); setenv("MADEIRA_DOCK_IMAGE_MAP_GUARD", "0", 1); MadeiraDock.configure(alpha)
+        require(env("MADEIRA_IMAGE_MAP_GUARD") == nil, "MADEIRA_DOCK_IMAGE_MAP_GUARD=0 leaves the image-map guard off")
+        unsetenv("MADEIRA_DOCK_IMAGE_MAP_GUARD")
         require(MadeiraDock.launchArguments(width: 1280, height: 720) == "/desktop=madeira,1280x720 C:\\windows\\system32\\dockhost.exe", "explorer desktop runs the host")
         require(!MadeiraDock.launchArguments(width: 1280, height: 720).contains("\""), "no quotes: MADEIRA_ARGS is split at spaces and passed on as is")
         require(!MadeiraDock.executable.contains(" "), "the host path has no spaces")
