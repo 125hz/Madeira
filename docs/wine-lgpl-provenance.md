@@ -91,3 +91,6 @@ signed off under the DCO (the fork's `CONTRIBUTING.md`):
 - 2026-09-29 the iOS WoW64 series, author 125hz, willfaust/wine pull
   requests #6-#12, merged as cea4dfc9a14: 970dac54a4e, 2ebe9374b26,
   db62a711998, e9289051644, 1a73c698b8c, f9074408fd9, 059cb1923c0.
+- 2026-09-29 dinput: opt-in joystick backed by the Madeira host gamepad slot
+  (56f69bc7528, pull request #3) and server iOS: queue a process-wide system
+  APC on a live thread (3ba35adcbdd, pull request #13). Author: 125hz.
