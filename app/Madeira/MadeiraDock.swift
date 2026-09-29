@@ -17,6 +17,19 @@ enum DockPerformancePolicy {
     static func sessionPoolMB(standard: Int, dock: Bool, compact: Bool) -> Int {
         dock && compact ? min(standard, compactPoolMB) : standard
     }
+
+    /// Whether the JIT pool is allocated before Play (StikJITHelper.prepareEarlyPool),
+    /// so a Dock start does not suspend the app for the debugger's allocation. Only
+    /// when Dock is the route: Dock can start (bundled, Valve's client present, a
+    /// sign-in), a Steam game is installed, and every library game is a Steam game,
+    /// which starts through Dock. Not with the compact option: the early pool has the
+    /// standard size, so a start that does not go through Dock (the developer
+    /// interface) gets the pool it would have allocated itself. Nothing may have
+    /// started in this app run. env.MADEIRA_DOCK_EARLY_POOL = 0 turns it off.
+    static func earlyPool(enabled: Bool, dockReady: Bool, installedGames: Int, otherLibraryGames: Int,
+                          compact: Bool, sessionStarted: Bool) -> Bool {
+        enabled && dockReady && installedGames > 0 && otherLibraryGames == 0 && !compact && !sessionStarted
+    }
 }
 
 enum DockError: LocalizedError {
