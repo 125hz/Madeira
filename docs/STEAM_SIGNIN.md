@@ -8,7 +8,8 @@ Steam library, download, install or launch code here.
 ## Using it
 
 The developer interface has a **Steam sign-in** button next to **Enable JIT**.
-It opens a sheet with two methods:
+In the library, **Settings › Steam** and first-run setup open the same sheet
+(`docs/LIBRARY.md`, "Steam setup"). The sheet has two methods:
 
 - **Password** (default on iPhone): the Steam *account name* (not the email
   address) and password. When Steam asks for Steam Guard, the sheet offers a

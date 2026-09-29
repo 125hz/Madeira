@@ -49,7 +49,10 @@ them.
 ## Using it
 
 The developer interface has a **Madeira Dock** button (when `dockhost.exe`
-is built; `env.MADEIRA_DOCK = 0` hides it). The sheet has:
+is built; `env.MADEIRA_DOCK = 0` hides it). In the library the same sheet is
+**Settings › Steam › Madeira Dock**, and first-run setup offers step 2 below
+(`docs/LIBRARY.md`, "Steam setup"). A start from the library runs as a
+library session. The sheet has:
 
 1. **Steam account.** Sign in with Madeira's Steam sign-in
    (`docs/STEAM_SIGNIN.md`).
@@ -156,8 +159,8 @@ other session sets it, and an engine without the switch ignores it.
 ## Not included (compared with the fork)
 
 - **Game installation and library integration.** The fork's Steam library and
-  depot downloads were rejected with #35 and are not coming back here. When
-  the new front end lands, Dock can be offered from it.
+  depot downloads were rejected with #35 and are not coming back here. The
+  library offers Dock's sheet from Settings › Steam (`docs/LIBRARY.md`).
 - **One-time installers.** Valve's client does not run a game's install
   scripts on this route. The fork ran them from a batch before the host, and
   by default skipped installers it recognised by file name. That name list is

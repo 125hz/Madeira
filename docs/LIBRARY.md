@@ -126,6 +126,37 @@ process (the wineserver's permanent objects from the first session remain and
 the registry initialisation aborts). The library asks to restart Madeira
 instead.
 
+## Steam setup
+
+The code is `app/Madeira/Onboarding.swift`. It uses Steam sign-in
+(`docs/STEAM_SIGNIN.md`) and Madeira Dock (`docs/MADEIRA_DOCK.md`) through
+their public pieces only: `SteamSignInModel`/`SteamSignInView` for signing in
+and out (the token stays in sign-in's Keychain store), and
+`MadeiraDockModel.prepareClient()`/`MadeiraDockView` for Dock.
+
+**First-run setup.** On a new install the library opens a full-screen setup
+once: welcome, **Sign in to Steam**, **Prepare Madeira Dock** (Valve's client
+components, about 73 MB, only when Dock is available), done. Every step has
+**Set up later**, and the welcome page has **Skip setup**. Finishing or
+skipping stores `madeiraOnboardingDone` in the app's UserDefaults, which iOS
+removes with the app. Setup opens only when there is something to set up: the
+sign-in page needs Steam sign-in or Dock, and without either setup never
+opens. It never opens over a running session.
+
+Setup is app UI only. It starts no Wine session, and the component download
+runs Dock's own verified download without Wine. It changes no JIT pool, engine
+switch or configuration default.
+
+**Settings › Steam** shows the signed-in account with **Sign out of Steam**
+(or **Sign in to Steam**), **Madeira Dock** (Dock's sheet, with the last Dock
+result under it) and **Run setup again**. A game started from the Dock sheet
+here runs as a library session: full-screen view, starting screen, in-game
+menu, and the one-session-per-run rule. That session is not added to the
+library.
+
+Log tag: `[onboarding]` (`shown reason=… steps=…`, `step=…`, `done`,
+`skipped`). No account name, token or path is logged.
+
 ## Controllers
 
 Player 1's controller navigates the library through `GamepadInput`: D-pad or
@@ -153,6 +184,7 @@ menu owns input, the game sees a connected pad at rest.
 | `MADEIRA_SESSION_TOOLS` | on | no Aspect & scaling in the in-game menu, and a session does not save it |
 | `MADEIRA_SCREEN_SHAPE_RESOLUTION` | on | no Screen shape resolution choice |
 | `MADEIRA_FRONTEND_KEYBOARD` | on | Keyboard opens the game view's own keyboard instead of the key window |
+| `MADEIRA_ONBOARDING` | on | first-run setup never opens, and Settings › Steam has no **Run setup again** |
 
 Opt-in (`env.NAME = 1`), off by default:
 
@@ -162,7 +194,7 @@ Opt-in (`env.NAME = 1`), off by default:
 | `MADEIRA_DEVICE_STATS` | a `[device-load]` line (thermal state, low power, screen capture) every 10 s while Wine runs |
 
 Log tags: `[frontend]`, `[display]`, `[display-shape]`, `[frontend-pointer]`, `[launch-view]`, `[startup-log]`, `[exit-report]`,
-`[session-once]`, `[library-surface]`, `[library-metadata]`,
+`[session-once]`, `[library-surface]`, `[library-metadata]`, `[onboarding]`,
 `[frontend-controller]`, `[frontend-keyboard]`, `[device-load]`, `[promote]`.
 
 ## Tests
@@ -173,3 +205,7 @@ math, controller commands, the exit hook, and the presence of the details and
 in-game menu options), `build/host-tests/check-runtime-settings.py`
 (`MadeiraConfig.set` and the Settings defaults) and
 `build/host-tests/check-library-api.py` (renderer detection and the badge).
+`build/host-tests/check-onboarding.py` covers Steam setup: the pages with and
+without Dock, the done key, the `MADEIRA_ONBOARDING` switch, and the wiring
+(no Wine session, no pool or engine switch, sign-in and Dock only through
+their public pieces).
