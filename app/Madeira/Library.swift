@@ -480,7 +480,9 @@ final class LibraryModel: ObservableObject {
     static let restartMessage = "Restart Madeira to start another game: swipe Madeira away in the app switcher, then open it again."
     @Published var restartNotice: String?
 
-    func begin(_ entry: LibraryEntry) {
+    /// `remember: false` runs a session that is not a library entry (a Madeira
+    /// Dock start): it is neither added to the library nor stamped as played.
+    func begin(_ entry: LibraryEntry, remember: Bool = true) {
         wine_exit_status_reset()
         quitRequested = false
         LibraryController.shared.configure(enabled: enabled, ownsInput: false)
@@ -501,8 +503,7 @@ final class LibraryModel: ObservableObject {
         controls.sizeScale = min(max(entry.controlSize ?? 1, 0.5), 2)
         MetalHostView.shared.isHidden = false
         ProMotionIntent.apply(mode: entry.effectiveFPSMode)
-        var played = entry; played.lastPlayed = Date()
-        save(played)
+        if remember { var played = entry; played.lastPlayed = Date(); save(played) }
         launchDismissLogged = false
         sawProcess = false
         timer?.invalidate()
@@ -856,6 +857,10 @@ struct LibraryView: View {
     @Environment(\.scenePhase) private var scenePhase
     var play: (LibraryEntry) -> Void
     var enableJIT: () -> Void
+    /// Madeira Dock's start, for Settings › Steam (Onboarding.swift).
+    var startDock: (DockGame, Bool) -> Void = { _, _ in }
+    /// First-run setup (Onboarding.swift).
+    @ObservedObject private var onboarding = OnboardingModel.shared
     @State private var browser = false
     @State private var selected: LibraryEntry?
     @State private var search = ""
@@ -889,12 +894,15 @@ struct LibraryView: View {
                 .modifier(LibraryPillGlass())
                 .padding(.bottom, 5).padding(.top, 8)
         }
+        .fullScreenCover(isPresented: $onboarding.presented) { OnboardingView() }
         .onAppear {
             // An ended desktop session's surface never stays over the library.
             EndedSessionSurface.install(); EndedSessionSurface.hide(reason: "library-appeared")
+            // First-run setup opens once on a new install.
+            onboarding.presentIfNeeded()
         }
         .onReceive(controller.commands) { command in
-            if selected == nil, !browser, command == "tab" { tab = 1 - tab }
+            if selected == nil, !browser, !onboarding.presented, command == "tab" { tab = 1 - tab }
         }
     }
     private var settings: some View {
@@ -911,6 +919,7 @@ struct LibraryView: View {
                 DisplayRateSettings()
                 RuntimeMemorySyncSettings()
             }
+            if SteamSettingsSection.shown { SteamSettingsSection(startDock: startDock) }
             Section {
                 Toggle("Use developer interface", isOn: Binding(get: { developerUI }, set: { on in
                     developerUI = on; FrontendChoice.choose(new: !on); restartNotice = true
@@ -973,7 +982,7 @@ struct LibraryView: View {
             }.padding(16).frame(maxWidth: 1100).frame(maxWidth: .infinity)
         }
         .onReceive(controller.commands) { command in
-            guard tab == 0, selected == nil, !browser else { return }
+            guard tab == 0, selected == nil, !browser, !onboarding.presented else { return }
             let items = entries
             let ids = [LibraryEntry.desktopID] + items.map(\.id)
             let index = ids.firstIndex(where: { $0 == focused }) ?? 0
