@@ -17,12 +17,13 @@ record writer).
 ## What you see
 
 In the library, the **Steam** section (`docs/LIBRARY.md`, "Steam setup") lists
-two kinds of game together: the games Steam has installed in the prefix, and
-the account's owned games that are not installed yet. Installed games come
-first. Each card shows the game's artwork, its state (**Madeira Dock**,
+the games Steam has installed in the prefix under its title, with the games
+being downloaded first, and the account's owned games that are not installed
+yet under **Not installed**; the games you added follow under **Other games**.
+Each card shows the game's artwork, its state (**Madeira Dock**,
 **Not installed**, **Update available**, **Downloading 42%**, **Paused**,
-**Download failed**) and, when Steam knows it, the playtime. **Refresh** reads
-the install records again and fetches the library again.
+**Download failed**) and, when Steam knows it, the playtime. Pull down on the
+library to read the install records again and fetch the library again.
 
 **An installed game** opens its **Game details** page, the library's own page
 (`docs/LIBRARY.md`, "Game details"), as in the fork. The game is a library

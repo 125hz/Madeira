@@ -35,7 +35,16 @@ Removing an entry never removes the game's files or saves.
 
 - Layouts: cards, compact cards, list and compact list (one short row per
   game). Sort by last played, name, date added or folder size. Search by title.
-- The games section collapses by tapping its title.
+- Sections, as in the fork's library: when Madeira Dock is available,
+  **Steam** (the Steam games being downloaded and the games Steam has
+  installed, with their count; a **Sign in to Steam** card when signed out),
+  its **Not installed** group (the account's other games, with their count),
+  then **Other games** (the games you added, with **Add a game**). Tapping
+  **Steam** or **Other games** collapses it; **Not installed** folds on its
+  own, open by default; each state is remembered. Search, the layout and, for
+  installed games, Sort by apply to every section. Pull down to read the
+  Steam install records and the account's library again. Without Madeira
+  Dock the games you added are one grid.
 - **Desktop** opens the Wine desktop (explorer and services in a virtual
   desktop) with its own profile; its Resolution is the desktop's size.
 - The build label (`MadeiraBuild` in Info.plist, else the bundle version) is
@@ -168,14 +177,16 @@ menu, and the one-session-per-run rule. That session is not added to the
 library.
 
 **Steam games in the library** (`app/Madeira/SteamGames.swift`). When Madeira
-Dock is available, the library shows a **Steam** section above the games you
-added. It lists the games Steam has installed in the prefix, exactly as Dock's
-own discovery finds them (`appmanifest_<appid>.acf` in `C:\Program Files
-(x86)\Steam\steamapps` and the other C: libraries its `libraryfolders.vdf`
-lists), and, once you are signed in, the account's owned games that are not
-installed yet, which are installed from their download sheet
-(`docs/STEAM_LIBRARY.md`). The section follows the library's search and
-collapses like the games section. Artwork comes from Steam's public store CDN.
+Dock is available, the library shows a **Steam** section above **Other
+games**, the games you added. It lists the games Steam has installed in the
+prefix, exactly as Dock's own discovery finds them (`appmanifest_<appid>.acf`
+in `C:\Program Files (x86)\Steam\steamapps` and the other C: libraries its
+`libraryfolders.vdf` lists), and, once you are signed in, under **Not
+installed**, the account's owned games that are not installed yet, which are
+installed from their download sheet (`docs/STEAM_LIBRARY.md`); a game being
+downloaded moves up to the installed games. The section follows the library's
+search and layout and collapses like Other games. Artwork comes from Steam's
+public store CDN.
 An installed game opens its **Game details** page (above): the game is a
 library entry with its own settings, listed only in the Steam section, and its
 **Play** goes through Dock's launch path with the entry as its launch profile,
@@ -188,7 +199,8 @@ do, and only in Madeira Dock's own library folder. Controller focus does not
 reach the section yet.
 
 Log tags: `[onboarding]` (`shown reason=… steps=…`, `step=…`, `done`,
-`skipped`), `[steam-games]` (counts and App IDs) and the library and download
+`skipped`), `[steam-games]` (counts and App IDs), `[library-sections]`
+(`native-steam=… sections=… collapse=…`, flags only) and the library and download
 tags of `docs/STEAM_LIBRARY.md`. No account name, token or path is logged.
 
 ## Controllers
@@ -219,6 +231,7 @@ menu owns input, the game sees a connected pad at rest.
 | `MADEIRA_SCREEN_SHAPE_RESOLUTION` | on | no Screen shape resolution choice |
 | `MADEIRA_FRONTEND_KEYBOARD` | on | Keyboard opens the game view's own keyboard instead of the key window |
 | `MADEIRA_ONBOARDING` | on | first-run setup never opens, and Settings › Steam has no **Run setup again** |
+| `MADEIRA_LIBRARY_COLLAPSE` | on | the **Steam** and **Other games** titles do not collapse (**Not installed** still folds) |
 
 Opt-in (`env.NAME = 1`), off by default:
 
@@ -246,5 +259,8 @@ their public pieces).
 `build/host-tests/check-steam-games.py` covers the library's Steam section: Dock's
 discovery on a synthetic drive_c laid out as Steam writes it, the merge of
 installed and owned games, the section, status, search, Play and artwork rules,
-and that Play uses only Dock's launch path. `build/host-tests/check-steam-library.py`
+the groups of the library's sections and their Sort by order, and that Play uses
+only Dock's launch path. `build/host-tests/check-library-sections.py` covers the
+library page's sections (order, texts, collapsing, search, layout, pull to
+refresh). `build/host-tests/check-steam-library.py`
 covers the owned library and downloads (`docs/STEAM_LIBRARY.md`).

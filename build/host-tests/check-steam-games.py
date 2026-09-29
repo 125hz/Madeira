@@ -49,7 +49,8 @@ require(games.startswith('// SPDX-License-Identifier: GPL-3.0-or-later\n// Copyr
 require('/* SteamGames.swift in Sources */,' in project and 'path = "SteamGames.swift"' in project,
         'SteamGames.swift is built by the Xcode project')
 content_view = (app / 'ContentView.swift').read_text()
-require('SteamGamesSection(search: search, open: { selected = $0 })' in library,
+require('SteamGamesSection(search: search, layout: layout, sort: sort, width: viewport.size.width,\n'
+        '                                      open: { selected = $0 })' in library,
         "Library: the Steam section is in the library and opens the library's Game details page")
 require('MadeiraDock.games(drive: drive)' in games and 'let drive = MadeiraDock.drive' in games,
         "the section lists exactly what Dock's own discovery finds")
@@ -243,6 +244,28 @@ func record(_ appID: Int, _ name: String, _ folder: String, flags: Int) -> Strin
         require(R.status(installed: nil, transfer: .queued, updateAvailable: false).label == "Waiting", "queued label")
         require(R.status(installed: nil, transfer: .failed, updateAvailable: false) == .failed, "failed")
         require(R.status(installed: nil, transfer: .active(percent: 42), updateAvailable: false).label == "Downloading 42%", "progress label")
+
+        // The library's sections (check-library-sections.py): downloading and installed games under
+        // the Steam title, the account's other games under Not installed, each in the items' order.
+        let groups = R.groups(merged, downloading: [5001, 4242])
+        require(groups.downloading.map(\.id) == [5001] && groups.installed.map(\.id) == [4242, 4343]
+                && groups.notInstalled.map(\.id) == [5000, 5002],
+                "groups: a download without an install record, installed games (updating too), not installed: \([groups.downloading, groups.installed, groups.notInstalled].map { $0.map(\.id) })")
+        require(R.groups([], downloading: [1]) == R.Groups(), "no items: empty groups")
+        // Installed games follow the library's Sort by, from their library entries.
+        let a = R.Item(id: 1, name: "Bravo", installed: ready, owned: nil)
+        let b = R.Item(id: 2, name: "alpha", installed: ready, owned: nil)
+        let c = R.Item(id: 3, name: "Charlie", installed: ready, owned: nil)
+        let now = Date()
+        let recorded: [Int: R.Recorded] = [
+            1: .init(lastPlayed: now.addingTimeInterval(-60), bytes: 10, position: 0),
+            3: .init(lastPlayed: now, bytes: 30, position: 4)]
+        func order(_ sort: String) -> [Int] { R.sorted([a, b, c], by: sort, recorded: recorded).map(\.id) }
+        require(order("name") == [2, 1, 3], "sort by name, without case: \(order("name"))")
+        require(order("played") == [3, 1, 2], "sort by last played; never played last, by name: \(order("played"))")
+        require(order("size") == [3, 1, 2], "sort by size; unknown size last: \(order("size"))")
+        require(order("added") == [3, 1, 2], "sort by recently added; no library entry last: \(order("added"))")
+        require(R.sorted([c, a, b], by: "played", recorded: [:]).map(\.id) == [2, 1, 3], "no entries: by name")
 
         // The build an update compares with comes from the game's owned build.
         require(owned[0].buildID == 100 && owned[0].installDir == "Fixture Game" && owned[0].folderName == "Fixture Game",
