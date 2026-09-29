@@ -18,6 +18,10 @@ providers, under AddressSanitizer and UBSan, and checks:
     and an offset/size that overflows are refused before any provider runs;
     zero sizes pass NULL buffers;
   * MADEIRA_NSI_NETWORK_TABLES=0 serves nothing; any other value serves;
+  * an identical enumerate within MADEIRA_NSI_CACHE_MS reuses the last rows
+    and count (a short buffer still gets STATUS_BUFFER_OVERFLOW, count-only
+    and row reads, other arguments and failed reads are kept apart or not
+    kept), a change shows after the window, and 0 turns the copy off;
   * [nsi-network] prints 16 lines at most, with module/table/status/count only;
   * unix calls 1 and 2 exist in both tables, in order, and the 32-bit thunks
     convert every embedded pointer (and nothing else) for the reads.
@@ -152,6 +156,8 @@ harness_main = r'''
 static const NPI_MODULEID ndis_id = MOD(0xeb004a11), ipv4_id = MOD(0xeb004a00), ipv6_id = MOD(0xeb004a01),
                           tcp_id = MOD(0xeb004a03), udp_id = MOD(0xeb004a02);
 static int provider_calls, rows = 3;
+static NTSTATUS fail_status;
+static UINT test_first_arg;
 static struct { const void *key; UINT key_size; void *p[4]; UINT s[4]; UINT param_type, data_size, data_offset; } seen;
 
 static NTSTATUS fake_enumerate( void *k, UINT ks, void *rw, UINT rws, void *dyn, UINT ds, void *st, UINT ss, UINT_PTR *count )
@@ -159,6 +165,7 @@ static NTSTATUS fake_enumerate( void *k, UINT ks, void *rw, UINT rws, void *dyn,
     UINT i, want = ks || rws || ds || ss;
     provider_calls++;
     seen.p[0] = k; seen.p[1] = rw; seen.p[2] = dyn; seen.p[3] = st;
+    if (fail_status) return fail_status;
     for (i = 0; want && i < (UINT)rows && i < *count; i++)
     {
         if (k) memset( (BYTE *)k + i * ks, 0x10 + i, ks );
@@ -210,7 +217,7 @@ static NTSTATUS enumerate( const NPI_MODULEID *m, UINT table, UINT sizes[4], voi
     struct nsi_enumerate_all_ex p;
     NTSTATUS status;
     memset( &p, 0, sizeof(p) );
-    p.module = m; p.table = table; p.count = *count;
+    p.module = m; p.table = table; p.count = *count; p.first_arg = test_first_arg;
     p.key_data = bufs[0]; p.key_size = sizes[0]; p.rw_data = bufs[1]; p.rw_size = sizes[1];
     p.dynamic_data = bufs[2]; p.dynamic_size = sizes[2]; p.static_data = bufs[3]; p.static_size = sizes[3];
     status = nsi_enumerate_all_ex( &p );
@@ -226,9 +233,9 @@ int main( int argc, char **argv )
     void *bufs[4] = { a, b, c, d };
     UINT_PTR count;
     NTSTATUS st;
-    int before;
+    int before, nocache = argc > 1 && !strcmp( argv[1], "nocache" );
 
-    if (argc > 1)   /* MADEIRA_NSI_NETWORK_TABLES=0 run */
+    if (argc > 1 && !strcmp( argv[1], "off" ))   /* MADEIRA_NSI_NETWORK_TABLES=0 run */
     {
         struct nsi_get_all_parameters_ex ga = { { 0 }, &ndis_id, 0, 0, 0, key, 8, b, 16, NULL, 0, NULL, 0 };
         struct nsi_get_parameter_ex gp = { { 0 }, &ndis_id, 0, 0, 0, key, 8, 0, out, 4, 0 };
@@ -360,6 +367,51 @@ int main( int argc, char **argv )
                         "32-bit field read: converted, numbers unchanged" );
     }
 
+    /* the short-lived table copy (MADEIRA_NSI_CACHE_MS, 500 ms by default) */
+    if (nocache)
+    {
+        test_first_arg = 7; before = provider_calls;
+        count = 4; enumerate( &ndis_id, 0, sizes, bufs, &count );
+        count = 4; enumerate( &ndis_id, 0, sizes, bufs, &count );
+        fails += check( provider_calls == before + 2, "MADEIRA_NSI_CACHE_MS=0: every read goes to the provider" );
+    }
+    else
+    {
+        BYTE kept[4 * 64];
+        UINT zero[4] = { 0, 0, 0, 0 };
+        NTSTATUS st2;
+
+        test_first_arg = 7; before = provider_calls;
+        count = 4; st = enumerate( &ndis_id, 0, sizes, bufs, &count );
+        memcpy( kept, d, sizeof(kept) ); memset( a, 0, sizeof(a) ); memset( d, 0, sizeof(d) );
+        count = 4; st2 = enumerate( &ndis_id, 0, sizes, bufs, &count );
+        fails += check( st == STATUS_SUCCESS && st2 == STATUS_SUCCESS && provider_calls == before + 1 && count == 3
+                        && !memcmp( kept, d, 3 * 64 ) && a[8] == 0x11,
+                        "an identical read within the window: the same rows and count, one provider read" );
+        count = 2;
+        fails += check( enumerate( &ndis_id, 0, sizes, bufs, &count ) == STATUS_BUFFER_OVERFLOW && count == 2
+                        && provider_calls == before + 1, "a short buffer on a kept table: STATUS_BUFFER_OVERFLOW, count untouched" );
+        count = 0; enumerate( &ndis_id, 0, zero, bufs, &count );
+        count = 0; st = enumerate( &ndis_id, 0, zero, bufs, &count );
+        fails += check( st == STATUS_SUCCESS && count == 3 && provider_calls == before + 2,
+                        "a count-only read is kept apart from a read of rows" );
+        test_first_arg = 8;
+        count = 4; enumerate( &ndis_id, 0, sizes, bufs, &count );
+        fails += check( provider_calls == before + 3, "a different argument is a different request" );
+        test_first_arg = 9; fail_status = (NTSTATUS)0xc0000001;
+        count = 4; st = enumerate( &ndis_id, 0, sizes, bufs, &count );
+        count = 4; st2 = enumerate( &ndis_id, 0, sizes, bufs, &count );
+        fails += check( st == (NTSTATUS)0xc0000001 && st2 == st && provider_calls == before + 5, "a failed read is not kept" );
+        fail_status = 0;
+        test_first_arg = 7; rows = 4;
+        count = 4; enumerate( &ndis_id, 0, sizes, bufs, &count );
+        fails += check( count == 3 && provider_calls == before + 5, "within the window a change is not seen yet" );
+        usleep( 700 * 1000 );
+        count = 4; st = enumerate( &ndis_id, 0, sizes, bufs, &count );
+        fails += check( st == STATUS_SUCCESS && count == 4 && provider_calls == before + 6, "after the window the provider is read again" );
+        rows = 3; test_first_arg = 0;
+    }
+
     /* the log stops after 16 enumerates */
     for (i = 0; i < 20; i++) { count = 4; enumerate( &ndis_id, 0, sizes, bufs, &count ); }
     return fails;
@@ -395,6 +447,9 @@ with tempfile.TemporaryDirectory(prefix='madeira-nsi-network-') as tmp:
         run = subprocess.run([str(exe), 'off'], env=dict(env, MADEIRA_NSI_NETWORK_TABLES='0'), capture_output=True, text=True)
         sys.stdout.write(run.stdout)
         require(run.returncode == 0 and '[nsi-network]' not in run.stderr, 'MADEIRA_NSI_NETWORK_TABLES=0: nothing served')
+        run = subprocess.run([str(exe), 'nocache'], env=dict(env, MADEIRA_NSI_CACHE_MS='0'), capture_output=True, text=True)
+        sys.stdout.write(''.join(l + '\n' for l in run.stdout.splitlines() if 'MADEIRA_NSI_CACHE_MS' in l or l.startswith('FAIL')))
+        require(run.returncode == 0, 'MADEIRA_NSI_CACHE_MS=0: routing, validation and the 32-bit reads hold without the copy')
 
     # shims/net/route.h compiles on its own; its asserts pin the 92-byte message header
     hdr = tmp / 'route_check.c'

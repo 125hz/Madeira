@@ -40,12 +40,16 @@
  *     offset and size overflow, are refused instead of trusted;
  *   - MADEIRA_NSI_NETWORK_TABLES=0 serves nothing (every table answers
  *     STATUS_NOT_SUPPORTED again, as before this file existed);
+ *   - an identical enumerate within MADEIRA_NSI_CACHE_MS reuses the last
+ *     result (see ios_nsi_cached_enumerate);
  *   - [nsi-network] logs the first 16 enumerates per process: module,
  *     table, status and row count only. */
 #include "config.h"
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "ntstatus.h"
 #include "windef.h"
 #include "winbase.h"
@@ -96,6 +100,145 @@ static const struct module_table *get_module_table( const NPI_MODULEID *id, UINT
     return NULL;
 }
 
+/* A short-lived copy of the interface, address and route tables.
+ *
+ * Each enumerate rebuilds a whole table from the host (if_nameindex, the
+ * interface ioctls, getifaddrs, the routing sysctls), for data that changes a
+ * few times a minute at most, and some programs poll: in a device log one
+ * program's network-watch thread read these tables about 1,700 times a
+ * second. An identical request (module, table, both arguments, the four row
+ * sizes, rows or only the count) within MADEIRA_NSI_CACHE_MS of the last
+ * successful one is answered from that result with the provider's own
+ * semantics: every row and the count, or STATUS_BUFFER_OVERFLOW with the
+ * count untouched when the caller's buffer is too small. Eight tables of at
+ * most 1 MB each; a failed read is never kept. Row and field reads (unix
+ * calls 1 and 2) always go to the provider. */
+#define IOS_NSI_CACHE_SLOTS 8
+#define IOS_NSI_CACHE_MAX_BYTES (1u << 20)
+
+struct ios_nsi_cache_slot
+{
+    NPI_MODULEID module;
+    UINT table, first_arg, second_arg, sizes[4];
+    UINT_PTR count;
+    BOOL want_data, used;
+    unsigned char *rows[4];
+    unsigned long long when_ms;
+};
+
+static pthread_mutex_t ios_nsi_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct ios_nsi_cache_slot ios_nsi_cache[IOS_NSI_CACHE_SLOTS];
+
+static unsigned long long ios_nsi_now_ms( void )
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (unsigned long long)ts.tv_sec * 1000ull + ts.tv_nsec / 1000000;
+}
+
+static unsigned int ios_nsi_cache_ms( void )
+{
+    static int value = -1;
+
+    if (value < 0)
+    {
+        /* On by default (500 ms): an identical interface, address or route
+         * table read within this many milliseconds reuses the last result.
+         * 0 reads the host every time; at most 5000. */
+        const char *e = getenv( "MADEIRA_NSI_CACHE_MS" );
+        int ms = e && *e ? atoi( e ) : 500;
+        if (ms < 0) ms = 0;
+        if (ms > 5000) ms = 5000;
+        __atomic_store_n( &value, ms, __ATOMIC_RELAXED );
+    }
+    return value;
+}
+
+/* ios_nsi_cache_lock held. */
+static BOOL ios_nsi_cache_match( const struct ios_nsi_cache_slot *slot, const struct nsi_enumerate_all_ex *params,
+                                 const UINT sizes[4], BOOL want_data )
+{
+    return slot->used && slot->want_data == want_data && slot->table == (UINT)params->table
+        && slot->first_arg == params->first_arg && slot->second_arg == params->second_arg
+        && !memcmp( slot->sizes, sizes, sizeof(slot->sizes) )
+        && NmrIsEqualNpiModuleId( &slot->module, params->module );
+}
+
+static NTSTATUS ios_nsi_cached_enumerate( struct nsi_enumerate_all_ex *params, const struct module_table *entry,
+                                          void *data[4], const UINT sizes[4] )
+{
+    unsigned int ttl = ios_nsi_cache_ms(), i, j;
+    BOOL want_data = data[0] || data[1] || data[2] || data[3];
+    struct ios_nsi_cache_slot *slot, *victim = NULL;
+    UINT_PTR capacity = params->count;
+    unsigned long long now;
+    size_t bytes = 0;
+    NTSTATUS status;
+
+    if (!ttl)
+        return entry->enumerate_all( data[0], sizes[0], data[1], sizes[1], data[2], sizes[2], data[3], sizes[3],
+                                     &params->count );
+
+    now = ios_nsi_now_ms();
+    pthread_mutex_lock( &ios_nsi_cache_lock );
+    for (i = 0; i < IOS_NSI_CACHE_SLOTS; i++)
+    {
+        slot = &ios_nsi_cache[i];
+        if (!ios_nsi_cache_match( slot, params, sizes, want_data )) continue;
+        if (now - slot->when_ms > ttl) break;   /* too old (or newer than `now`): read again */
+        if (want_data && slot->count > capacity)
+            status = STATUS_BUFFER_OVERFLOW;
+        else
+        {
+            for (j = 0; j < 4; j++)
+                if (data[j] && slot->count) memcpy( data[j], slot->rows[j], (size_t)slot->count * sizes[j] );
+            params->count = slot->count;
+            status = STATUS_SUCCESS;
+        }
+        pthread_mutex_unlock( &ios_nsi_cache_lock );
+        return status;
+    }
+    pthread_mutex_unlock( &ios_nsi_cache_lock );
+
+    status = entry->enumerate_all( data[0], sizes[0], data[1], sizes[1], data[2], sizes[2], data[3], sizes[3],
+                                   &params->count );
+    if (status != STATUS_SUCCESS) return status;
+    for (i = 0; i < 4; i++) bytes += (size_t)params->count * sizes[i];
+    if (bytes > IOS_NSI_CACHE_MAX_BYTES) return status;
+
+    pthread_mutex_lock( &ios_nsi_cache_lock );
+    /* The same request's slot, else an unused one, else the oldest. */
+    for (i = 0; i < IOS_NSI_CACHE_SLOTS && !victim; i++)
+        if (ios_nsi_cache_match( &ios_nsi_cache[i], params, sizes, want_data )) victim = &ios_nsi_cache[i];
+    for (i = 0; i < IOS_NSI_CACHE_SLOTS && !victim; i++)
+        if (!ios_nsi_cache[i].used) victim = &ios_nsi_cache[i];
+    if (!victim)
+    {
+        victim = &ios_nsi_cache[0];
+        for (i = 1; i < IOS_NSI_CACHE_SLOTS; i++)
+            if (ios_nsi_cache[i].when_ms < victim->when_ms) victim = &ios_nsi_cache[i];
+    }
+    victim->used = TRUE;
+    for (i = 0; i < 4; i++)
+    {
+        free( victim->rows[i] );
+        victim->rows[i] = NULL;
+        if (!data[i] || !params->count) continue;
+        if (!(victim->rows[i] = malloc( (size_t)params->count * sizes[i] ))) victim->used = FALSE;
+        else memcpy( victim->rows[i], data[i], (size_t)params->count * sizes[i] );
+    }
+    victim->module = *params->module;
+    victim->table = params->table;
+    victim->first_arg = params->first_arg;
+    victim->second_arg = params->second_arg;
+    memcpy( victim->sizes, sizes, sizeof(victim->sizes) );
+    victim->count = params->count;
+    victim->want_data = want_data;
+    victim->when_ms = ios_nsi_now_ms();
+    pthread_mutex_unlock( &ios_nsi_cache_lock );
+    return status;
+}
+
 NTSTATUS nsi_enumerate_all_ex( struct nsi_enumerate_all_ex *params )
 {
     const struct module_table *entry = get_module_table( params->module, params->table );
@@ -117,8 +260,7 @@ NTSTATUS nsi_enumerate_all_ex( struct nsi_enumerate_all_ex *params )
         else if (!data[i] || sizes[i] != entry->sizes[i]) return STATUS_INVALID_PARAMETER;
     }
 
-    status = entry->enumerate_all( data[0], sizes[0], data[1], sizes[1], data[2], sizes[2], data[3], sizes[3],
-                                   &params->count );
+    status = ios_nsi_cached_enumerate( params, entry, data, sizes );
     if (__atomic_fetch_add( &reports, 1, __ATOMIC_RELAXED ) < 16)
         dprintf( 2, "[nsi-network] module=%08x table=%u status=%08x count=%u\n",
                  (UINT)params->module->Guid.Data1, (UINT)params->table, (UINT)status, (UINT)params->count );
