@@ -91,7 +91,11 @@ arguments are not supported.
 
 1. Madeira checks: JIT is enabled, no session has run in this app run,
    `dockhost.exe` is bundled, the client DLL exists, the game is fully
-   installed and its folder exists, and a sign-in is stored.
+   installed and its folder exists, and a sign-in is stored. Then the app's
+   own Steam connection (the owned library, `docs/STEAM_LIBRARY.md`) logs off
+   and closes its socket, and Madeira waits for that before going on: a second
+   online sign-in of the same account would replace the client's session. It
+   stays off until Dock's report or session is over. The checks run again.
 2. **One-use sign-in transfer.** `SteamSignIn.credentialsForDock()` supplies
    the account name and refresh token from the Keychain. Madeira writes them,
    with the account's SteamID (taken from the token's subject claim to select
@@ -238,8 +242,9 @@ configured engine again.
 
 - **Game installation and library integration.** Dock itself neither installs
   nor removes games. The owned library and downloads are a separate part
-  (`docs/STEAM_LIBRARY.md`) that writes the install records Dock reads. The
-  library offers Dock's sheet from Settings › Steam (`docs/LIBRARY.md`).
+  (`docs/STEAM_LIBRARY.md`) that writes the install records Dock reads; a
+  Steam game's Game details page starts it through Dock. The library also
+  offers Dock's sheet from Settings › Steam (`docs/LIBRARY.md`).
 - **One-time installs, fork extras.** The fork also marked runtimes it
   recognised by file name as done without running them, and recorded such a
   runtime as done after a failed run. Those name rules are gone here (every

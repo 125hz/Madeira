@@ -5,11 +5,14 @@ Steam's content servers, and removes them again. An installed game starts
 through Madeira Dock like any other Steam game in the prefix.
 
 The code is `app/Madeira/SteamOwnedLibrary.swift` (the model),
-`app/Madeira/SteamGames.swift` (the library's Steam section and the game
-sheet), `app/Madeira/SteamInstall.swift` (where a download lives and how one is
-removed), `app/Madeira/SteamDownloadBackground.swift`, and
-`app/Madeira/SwiftSteam/` (the Steam connection, product info, depot
-downloader, content decoders and install record writer).
+`app/Madeira/SteamGames.swift` (the library's Steam section, the download
+sheet and the Steam section of a game's Game details page),
+`app/Madeira/SteamInstall.swift` (where a download lives and how one is
+removed), `app/Madeira/SteamDownloadBackground.swift` (downloads in the
+background), the Steam parts of `app/Madeira/Library.swift` (a Steam game's
+library entry and Game details page), and `app/Madeira/SwiftSteam/` (the
+Steam connection, product info, depot downloader, content decoders and install
+record writer).
 
 ## What you see
 
@@ -21,21 +24,48 @@ first. Each card shows the game's artwork, its state (**Madeira Dock**,
 **Download failed**) and, when Steam knows it, the playtime. **Refresh** reads
 the install records again and fetches the library again.
 
-A card opens the game's sheet:
+**An installed game** opens its **Game details** page, the library's own page
+(`docs/LIBRARY.md`, "Game details"), as in the fork. The game is a library
+entry (`LibraryEntry.steamAppID`), made from Steam's install record the first
+time it is opened or when its download finishes, so it keeps its own settings.
+The page has, in this order:
 
-- **Install**, or **Play** (through Madeira Dock, with its per-launch pool
-  toggle) for an installed game. A game that is being downloaded cannot be
-  played.
-- **Update** when Steam lists a newer build than the install record, for games
-  in Madeira's own library folder.
-- **Pause**, **Resume**, **Try again** and **Cancel download** while a download
-  exists. Cancelling a first-time install deletes its partial files; cancelling
-  an update only stops it.
-- **Uninstall** (with a confirmation) for games in Madeira's own library folder.
-  Games Steam's client installed in another library folder are shown and
-  played, but Madeira does not modify them.
-- Progress, speed and time left, the free space on the device, and a link to
-  the game's Steam Store page.
+- the header: artwork (Steam's, or a chosen cover), title, install size,
+  Steam's playtime, and **Play**;
+- **Library details**: title, **Choose cover image**, **Use Steam artwork**;
+- **Steam**: **Start with** Madeira Dock; **Smaller JIT pool (512 MB) for this
+  launch** (Dock's per-launch choice); **One-time installs**, **Run at next
+  start** or **Skip** (Dock's choice for the game's Steam install scripts, when
+  it has any); an update's progress with **Pause update** / **Resume update**,
+  or **Update available — download**; **Repair installed files**; App ID; free
+  space; the last Dock result; **Uninstall** (with a confirmation);
+- **Display**, **Compatibility & performance** (reduced-precision x87,
+  **CPU cores reported**, **D3D9 anisotropic filtering**), **On screen** and
+  **Executable** (the install folder), as for any game.
+
+**Play** starts the game through Madeira Dock with the entry as its launch
+profile: its **Resolution** sizes the Dock desktop, and its display, frame
+limit, x87, CPU-count, anisotropy, overlay, live-log and touch-control
+settings apply to the session (the in-game menu saves changes back to the
+entry). The profile never replaces what Dock starts. Play is refused, with the
+reason, while an update runs, before Steam marks the game fully installed,
+without Valve's client components or without a sign-in. Launch arguments are
+not offered: Dock starts Steam's own launch option.
+
+**Repair installed files** runs the download again for the current build: the
+downloader checks every chunk already on disk against its SHA-1 and fetches
+only what is missing or differs. **Update**, **Repair** and **Uninstall** are
+offered for games in Madeira's own library folder; games Steam's client
+installed in another library folder are shown and played, but Madeira does not
+modify them. **Uninstall** also removes the game's library entry.
+
+**A game that is not installed** opens its download sheet: artwork, playtime,
+**Install** (or **Resume download**), **Pause**, **Resume**, **Try again**,
+progress, speed and time left, **Cancel download** (a first-time install's
+partial files are deleted; an update is only stopped), the free space on the
+device and a link to the game's Steam Store page. When the download finishes,
+the game becomes a library entry and the sheet's button reads **Open**, which
+opens its Game details page.
 
 Sign-in is not new: Settings › Steam and first-run setup (`docs/STEAM_SIGNIN.md`,
 `docs/LIBRARY.md`) sign in and out. Signing in fetches the library; signing out
@@ -101,43 +131,85 @@ layout Madeira Dock's discovery reads (`MadeiraDock.games`) and Valve's client
 understands; `build/host-tests/check-steam-library.py` writes an install with
 the production downloader and has Dock's own scanner find it.
 
-**Sessions.** A game session pauses downloads (memory and I/O belong to the
-game) and closes the Steam connection before Valve's client signs in with the
-same account, which would otherwise log one of the two out. Downloads continue
-when the session has ended and the library is back. Madeira does not start more
-than one session per app run (`docs/LIBRARY.md`).
+**Sessions and the account.** Only one sign-in of an account may be online:
+a second logon with the same account replaces the first one's session. So the
+app's own connection (library, playtime, downloads) and Valve's client in a
+game session never overlap (`SteamConnectionGate`):
 
-**Leaving Madeira.** A running download asks iOS for the usual short background
-grace period. When that ends, or is refused, the download pauses and continues
-when Madeira is opened again. This uses no background mode, no background task
-identifier and no notification permission; `Info.plist` is unchanged. Keep
-Madeira open while a large game downloads.
+1. A Madeira Dock start (`ContentView.startDock`) first awaits
+   `SteamOwnedLibrary.prepareDock()`: downloads pause, the running one is
+   awaited, and the app's connection sends `ClientLogOff` and closes its
+   socket.
+2. Only then are the launch preconditions checked again, the sign-in read from
+   `SteamSignIn`, the one-use sign-in transfer written and the session started.
+3. The connection stays closed until Dock's report or session is over (or the
+   start failed) and no session runs; then downloads continue. A logon that
+   was already on its way when the session took the account logs straight off
+   again.
+
+Any other session also pauses downloads and closes the connection
+(`runWineFullSequence`). Madeira does not start more than one session per app
+run (`docs/LIBRARY.md`).
+
+## Downloads in the background
+
+On iOS 26 and later, a download submits a `BGContinuedProcessingTask` when it
+starts: iOS keeps Madeira running in the background for the whole queue and
+shows its own progress UI (title, game, percentage, a cancel control), fed from
+the downloader's byte counts. When the queue is empty the task completes; when
+iOS ends it early the downloads pause cleanly (every finished chunk is
+journaled) and continue when Madeira is active again. On earlier iOS, or when
+iOS refuses the request, a running download gets the usual short background
+grace period, then pauses the same way. Local notifications report a download
+that finished, failed or paused while Madeira was in the background; the
+permission is asked for when the first download starts.
+
+This needs one `Info.plist` entry: `BGTaskSchedulerPermittedIdentifiers` with
+`$(PRODUCT_BUNDLE_IDENTIFIER).download.*`. The task identifier is
+`<bundle id>.download.queue`, read back from that entry at run time, so a
+re-signed bundle keeps working or falls back to the grace period. There is no
+`UIBackgroundModes` entry. (`app/Madeira/SteamDownloadBackground.swift`,
+ported from the fork, where it ran on the owner's devices.)
 
 ## Switches
 
-`env.MADEIRA_STEAM_LIBRARY = 0` in `Documents/madeira.cfg` turns the owned
-library and downloads off (the Steam section then lists installed games only, as
-before). The library also stays off without Madeira Dock, because a downloaded
-game starts through it. `env.MADEIRA_STEAM_TRACE = 1` adds protocol trace lines
-(message names and result codes, never payloads or credentials). There are no
-other switches.
+In `Documents/madeira.cfg`, all on by default:
+
+- `env.MADEIRA_STEAM_LIBRARY = 0` turns the owned library and downloads off
+  (the Steam section then lists installed games only, as before). The library
+  also stays off without Madeira Dock, because a downloaded game starts
+  through it.
+- `env.MADEIRA_BACKGROUND_DOWNLOADS = 0`: no continued-processing task; the
+  grace period and the clean pause remain.
+- `env.MADEIRA_DOWNLOAD_NOTIFICATIONS = 0`: no notifications and no
+  permission request.
+
+`env.MADEIRA_STEAM_TRACE = 1` adds protocol trace lines (message names and
+result codes, never payloads or credentials).
 
 ## Logs
 
-`[steam-library]`, `[steam-depot]`, `[steam-cdn]`, `[steam-shared]`,
-`[steam-shared-record]`, `[steam-record]`, `[steam-playtime]`, `[steam-account]`
-and `[steam-games]`. They carry App IDs, depot IDs, counts and short reason
-codes. No account name, Steam ID, token, game name or path is logged (the
-host test checks this on a full install).
+`[steam-library]`, `[steam-depot]`, `[steam-repair]`, `[steam-cdn]`,
+`[steam-shared]`, `[steam-shared-record]`, `[steam-record]`, `[steam-playtime]`,
+`[steam-account]`, `[steam-games]` and `[bg-download]`. They carry App IDs,
+depot IDs, counts and short reason codes. No account name, Steam ID, token,
+game name or path is logged (the host test checks this on a full install).
 
 ## 64-bit impact
 
-None. This is app-side Swift and C that runs when the Steam section is used. It
-starts no Wine session, sets no environment variable, and changes no JIT pool,
-engine switch, Wine, FEX or DXMT code, and no `madeira.cfg` default. The one
-line added to an existing code path is the call in `ContentView` that tells the
-library a session starts (it pauses downloads and closes the connection; the
-session itself is untouched).
+**64-bit default behaviour unchanged.** This is app-side Swift and C. It
+changes no JIT pool, engine switch, Wine, FEX or DXMT code, and no `madeira.cfg`
+default. Existing code paths it touches: `ContentView.runWineFullSequence` (one
+call that tells the library a session starts), `ContentView.startDock` (the
+sign-in transfer is written after the app's own logoff; a Steam game's library
+entry is its launch profile), `ContentView.launchLibraryEntry` (a Steam entry
+starts through Dock), `LibraryEntry.configureLaunch` (returns before
+`MADEIRA_EXE` for a Steam game) and `LibraryEntry.applyEnvironment`, which
+exports `MADEIRA_CPU_COUNT` and `DXMT_D9_ANISO_LIMIT` only when a game's
+**CPU cores reported** or **D3D9 anisotropic filtering** is chosen (both
+engine variables are already in the pinned wine and DXMT; unset keeps their
+default). A Dock start from Settings › Steam › Madeira Dock runs as before,
+except that its sign-in transfer is written after the app's own logoff.
 
 ## Provenance and licence audit
 
@@ -203,7 +275,7 @@ as in Jfishin's tree; the name is generic.
 | `Core/LicenseListBox.swift` | 49 | 42 | Jfishin; header |
 | `Core/SteamConnection.swift` | 171 | 154 | Jfishin; header |
 | `Core/SteamMessageCodec.swift` | 218 | 205 | Jfishin; header |
-| `Core/SteamSession.swift` | 736 | 639 | Jfishin; logon with SteamSignIn's sign-in, `suspend()`/`resume()`, no token clearing, no channel encryption |
+| `Core/SteamSession.swift` | 751 | 639 | Jfishin; logon with SteamSignIn's sign-in, `suspend()`/`resume()` (a logon completing after `suspend()` logs off again), no token clearing, no channel encryption |
 | `Core/SteamError.swift` | 108 | 60 | Jfishin (reduced in the sign-in PR, extended again with his connection, library and content errors) |
 | `Core/SteamProtocol.swift` | 55 | n/a | Jfishin's message-type, result-code and service-method constants, reduced to what is used |
 | `Core/SteamCMSession.swift` | 25 | n/a | 125hz (the protocol that lets tests script the connection) |
@@ -217,10 +289,10 @@ as in Jfishin's tree; the name is generic.
 | `lzma_shim.c/.h` | 85 | n/a | Jfishin |
 | `zstd_edu.c/.h` | 2056 | n/a | Meta Platforms (BSD-3-Clause selected), with Jfishin's error-safe wrapper; 1,986 lines identical to his copy |
 | `chunk_zip.c/.h` | 73 | n/a | 125hz |
-| `SteamOwnedLibrary.swift` | 434 | n/a | 125hz; the model is adapted from the fork's account model around Jfishin's flows |
-| `SteamInstall.swift` | 95 | n/a | 125hz |
-| `SteamDownloadBackground.swift` | 54 | n/a | 125hz |
-| `SteamGames.swift` | 510 | n/a | 125hz (#53's section, extended) |
+| `SteamOwnedLibrary.swift` | 533 | n/a | 125hz; the model is adapted from the fork's account model around Jfishin's flows; `SteamConnectionGate` |
+| `SteamInstall.swift` | 101 | n/a | 125hz |
+| `SteamDownloadBackground.swift` | 188 | n/a | 125hz (the fork's background downloads) |
+| `SteamGames.swift` | 577 | n/a | 125hz (#53's section, extended; the download sheet and the Game details page's Steam section follow the fork's) |
 
 The limit of this audit: it cannot prove how a file was originally written. It
 rests on Jfishin's statement, on his tree carrying no third-party notice for
@@ -238,8 +310,12 @@ nothing else), and the Windows desktop client's installer and launch code.
 `python3` with `cryptography` or the `openssl` command, and libssl, liblzma and
 zlib development files; it never contacts Steam):
 
-- static: licence headers, the Xcode project, no program names, no engine, pool
-  or `Info.plist` change, no second token path, no account data in a log line;
+- static: licence headers, the Xcode project, no program names, no engine or
+  pool change, `Info.plist` permitting only the `.download.*` task family and no
+  background mode, the background-download switches, no second token path, no
+  account data in a log line; the order of a Dock start (the app's connection
+  closes, then the sign-in is read and written, then the session starts), the
+  release after Dock and the logon guard in `SteamSession`;
 - one AddressSanitizer executable built from the production Swift and C, with
   stand-ins for CommonCrypto (on OpenSSL), Compression and zlib and a scripted
   `SteamCMSession`:
@@ -248,7 +324,10 @@ zlib development files; it never contacts Steam):
     (language, architecture, DLC, redistributables, shared depots), the library
     fetcher against scripted product-info replies, the AES and container decoders
     on known vectors with wrong keys, checksums, truncation and hostile sizes,
-    manifest path and folder rules;
+    manifest path and folder rules; `SteamConnectionGate` with a connection
+    that takes a while to close (the sign-in transfer comes only after the
+    logoff and the socket close; nothing reopens while Dock holds the account
+    or a session runs; a Dock start during a session's close waits for it);
   - installs, against a local HTTP content server with three hosts (one dead, one
     that corrupts the first answer per chunk, one healthy) and content
     authorization: every chunk container and an encrypted manifest; a shared
@@ -259,8 +338,16 @@ zlib development files; it never contacts Steam):
     fetches one changed chunk and shrinks a file; uninstall.
 
 `check-steam-games.py` covers the merge of installed and owned games, the
-status text, artwork candidates and the Play rules; `check-steam-signin-native.py`
-covers the module boundary (sign-in files hold no library code).
+status text, artwork candidates and the Play rules, the install size from the
+record, and the Game details wiring: an installed game opens its library entry's
+page with the Steam section and every section and control listed above, a
+finished download's sheet offers **Open**, a finished download (and only that)
+gets its entry and **Uninstall** removes it, Play on a Steam entry goes through
+Dock with the entry's profile, the profile never sets what Dock starts, and the
+CPU-count and anisotropy variables are exported only when chosen.
+`check-onboarding.py` and `check-dock-installers.py` cover the rest of Dock's
+start from the library; `check-steam-signin-native.py` covers the module
+boundary (sign-in files hold no library code).
 
 Not covered: a live logon to Steam and a download from Valve's content servers
 from this branch (the protocol code is the fork's, which ran on the owner's

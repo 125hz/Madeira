@@ -70,15 +70,24 @@ starting screen takes over (or an error is shown). A profile holds:
   has its 30 FPS cap (willfaust/dxmt#1; DXMT without it would present mode 3
   uncapped, so the choice is hidden and a saved 30 runs as 60);
 - reduced-precision x87: off by default, as in FEX; only an explicit choice
-  exports `FEX_X87REDUCEDPRECISION=1`. The library exports no other engine
-  switch;
-- launch arguments (double-quoted tokens, at most 64 and 4 KB in total);
+  exports `FEX_X87REDUCEDPRECISION=1`;
+- **CPU cores reported** (Automatic, 1, 2, 4 or 6) and **D3D9 anisotropic
+  filtering** (Application default, up to 1×, 2×, 4× or 8×): only a choice
+  other than the default exports `MADEIRA_CPU_COUNT` (wine) or
+  `DXMT_D9_ANISO_LIMIT` (DXMT); the defaults export nothing. The library
+  exports no other engine switch;
+- launch arguments (double-quoted tokens, at most 64 and 4 KB in total; not
+  for Steam games, which Madeira Dock starts with Steam's own launch option);
 - performance overlay, live logs and touch controls for the session, with the
   controls' **opacity** and overall **size**. The touch layout itself is saved
   per game from the in-game editor.
 
-A game always starts directly. (The Steam integration adds a "Start with"
-choice for Steam games.)
+A game you added starts directly. A Steam game's page (`docs/STEAM_LIBRARY.md`)
+adds a **Steam** section under the library details: **Start with** Madeira
+Dock, Dock's per-launch pool choice, **One-time installs**, updates, **Repair
+installed files**, App ID, free space and **Uninstall**; its **Executable**
+section shows the install folder, and it has no **Remove from library** (the
+entry goes with **Uninstall**).
 
 ## Sessions
 
@@ -160,13 +169,16 @@ added. It lists the games Steam has installed in the prefix, exactly as Dock's
 own discovery finds them (`appmanifest_<appid>.acf` in `C:\Program Files
 (x86)\Steam\steamapps` and the other C: libraries its `libraryfolders.vdf`
 lists), and, once you are signed in, the account's owned games that are not
-installed yet, which can be installed, updated and uninstalled from the game's
-sheet (`docs/STEAM_LIBRARY.md`). The section follows the library's search and
+installed yet, which are installed from their download sheet
+(`docs/STEAM_LIBRARY.md`). The section follows the library's search and
 collapses like the games section. Artwork comes from Steam's public store CDN.
-An installed game's sheet has **Play**, which goes through Dock's launch path
-with Dock's per-launch pool toggle, as a library session. Play is offered only
-for a game Steam marks fully installed (and not being downloaded), with Valve's
-client components present and a Steam sign-in. Reading install records never
+An installed game opens its **Game details** page (above): the game is a
+library entry with its own settings, listed only in the Steam section, and its
+**Play** goes through Dock's launch path with the entry as its launch profile,
+as a library session. When a download finishes, the sheet's button reads
+**Open** and opens that page. Play starts only a game Steam marks fully
+installed (and not being downloaded), with Valve's client components present
+and a Steam sign-in. Reading install records never
 writes Steam files; only the downloads and **Uninstall** of `docs/STEAM_LIBRARY.md`
 do, and only in Madeira Dock's own library folder. Controller focus does not
 reach the section yet.
