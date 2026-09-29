@@ -11224,8 +11224,34 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
          * never executed from its own pages (it is translated into the JIT
          * pool), so apply the protection the caller asked for instead of
          * failing every PAGE_READONLY request with STATUS_ACCESS_DENIED.
-         * Outside a window this is the upstream rule. */
-        if (!(unix_prot & PROT_WRITE) && !ios_wow_in_window( base )) return -1;
+         *
+         * The same holds OUTSIDE the windows, where this used to keep the
+         * upstream rule. A 32-bit process also runs 64-bit host images there
+         * (wow64.dll, the emulator DLL, ntdll), and force_exec_prot is one flag
+         * for the whole host process: once a 32-bit process has turned it on,
+         * every later process sees it, 64-bit ones included. The loader makes
+         * an import table writable, fills it, and puts PAGE_READONLY back; that
+         * last request failed, and NtProtectVirtualMemory syncs an image's
+         * JIT-pool copy only when the protection change succeeds, so the copy
+         * that runs kept the unresolved table. wow64.dll then called its first
+         * import through an entry that still held a name offset and every
+         * 32-bit program died with an access violation at start; a 64-bit
+         * program started after it died the same way. Nothing is gained by the
+         * refusal: no page outside the JIT pool can be executable here.
+         *
+         * Only a 32-bit (WoW64) process can switch force_exec_prot on
+         * (NtSetInformationProcess(ProcessExecuteFlags) refuses a 64-bit
+         * process), so a run that never starts a 32-bit program never reaches
+         * this line. */
+        if (!(unix_prot & PROT_WRITE))
+        {
+            static unsigned int unforced_n;
+
+            if (++unforced_n <= 4 && !ios_in_mach_exc)
+                dprintf( 2, "[force-exec] PROT_EXEC unavailable; applying the requested protection "
+                            "unforced at %p+0x%lx (%s a guest window)\n", base, (unsigned long)size,
+                         ios_wow_in_window( base ) ? "inside" : "outside" );
+        }
 #else
         if (!(unix_prot & PROT_WRITE)) return -1;
 #endif
