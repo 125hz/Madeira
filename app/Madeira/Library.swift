@@ -173,6 +173,10 @@ struct LibraryEntry: Codable, Identifiable {
     var performance = false
     var touchControls = false
     var controls: [TouchControl]?
+    /// The named layout (TouchControlPresets.swift) `controls` came from, so the
+    /// Session menu shows it and an edit is written back to it; nil for controls
+    /// no layout holds. Older files have none.
+    var controlLayout: String?
     var lastPlayed: Date?
     var graphicsAPI: String?
     var folderBytes: Int64?
@@ -296,6 +300,7 @@ final class LibraryModel: ObservableObject {
     private var readOnly = false
     private var metadataInFlight = Set<UUID>()
     private var savedControls: [TouchControl] = []
+    private var savedLayout: String?
     private var savedVisible = true
     private var savedSize = 1.0
     /// The session's first frame makes the drawable's shape known (Aspect).
@@ -498,7 +503,15 @@ final class LibraryModel: ObservableObject {
         opacity = min(max(entry.controlOpacity ?? 0.7, 0.15), 1)
         let controls = TouchControlsModel.shared
         savedControls = controls.controls; savedVisible = controls.visible; savedSize = controls.sizeScale
-        if let profile = entry.controls { controls.controls = profile }
+        savedLayout = controls.layoutID
+        if let profile = entry.controls {
+            controls.controls = profile
+            // The game's controls come with the layout they were loaded from (if that
+            // layout still exists), so a later edit is not written to another game's.
+            if ControlPresetsModel.enabled {
+                controls.layoutID = ControlPresetsModel.shared.store.resolvedID(entry.controlLayout)
+            }
+        }
         controls.visible = entry.touchControls
         controls.sizeScale = min(max(entry.controlSize ?? 1, 0.5), 2)
         MetalHostView.shared.isHidden = false
@@ -575,6 +588,7 @@ final class LibraryModel: ObservableObject {
         let controls = TouchControlsModel.shared
         if let id = current, var entry = entries.first(where: { $0.id == id }) {
             entry.controls = controls.controls
+            if ControlPresetsModel.enabled { entry.controlLayout = controls.layoutID }
             entry.touchControls = controls.visible
             entry.fpsMode = fpsMode; entry.performance = performance
             entry.overlayFields = overlayFields
@@ -592,6 +606,7 @@ final class LibraryModel: ObservableObject {
         let controls = TouchControlsModel.shared
         controls.editing = false; controls.selected = nil
         controls.controls = savedControls; controls.visible = savedVisible; controls.sizeScale = savedSize
+        if ControlPresetsModel.enabled { controls.layoutID = savedLayout }
         current = nil; activeEntry = nil; menu = false; sessionMessage = ""
         displayMode = .fit
         LogStore.shared.setDisplayActive(true)
@@ -1590,6 +1605,14 @@ struct LibraryHUD: View {
                 HStack { Label("Session", systemImage: "gamecontroller.fill").font(.title2.bold()); Spacer(); Button("Done") { model.menu = false }.buttonStyle(.bordered) }
                 // The controls come first, the easiest to reach; the overlay settings last.
                 Toggle("Touch controls", isOn: $controls.visible)
+                // The named layouts (Xbox controller, custom ones) live here in a session: this
+                // menu replaces the overlay's top bar, where the same menu sits outside the library.
+                if controls.visible && ControlPresetsModel.enabled {
+                    ControlLayoutMenu(style: .row) { openedEditor in
+                        model.saveCurrentProfile()
+                        if openedEditor { model.menu = false }
+                    }
+                }
                 LabeledContent("Opacity") { Slider(value: $model.opacity, in: 0.15...1) }
                 LabeledContent("Size") { Slider(value: $controls.sizeScale, in: 0.5...2) }
                 Button("Edit controls", systemImage: "slider.horizontal.3") { controls.visible = true; controls.editing = true; model.menu = false }

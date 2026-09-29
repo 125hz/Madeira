@@ -92,7 +92,9 @@ VoiceOver labels) holds **Show live log**, which shows the most recent log lines
 The small menu button (drag to move; it fades after three seconds) opens the
 in-game menu:
 
-1. touch controls on/off, their **Opacity** and **Size**, **Edit controls**
+1. touch controls on/off, their **Controller layout** (the built-in Xbox
+   controller, the user's custom layouts, **Create new layout**; remembered per
+   game), their **Opacity** and **Size**, **Edit controls**
    (the existing editor) and the **Keyboard** (its own key window, with an
    Esc/Ctrl/Shift/Alt/Tab/Enter/arrow row; modifiers latch);
 2. the FPS limit, **Aspect & scaling**, and the mouse and pointer settings;

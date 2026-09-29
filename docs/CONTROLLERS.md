@@ -46,7 +46,10 @@ Keyboard/mouse mappings and the existing layout format are retained.
 ## Layouts
 
 While touch controls are shown, the landscape top bar has a layout button
-(stacked squares) next to the show/hide controller glyph. It lists:
+(stacked squares) next to the show/hide controller glyph. In a library session
+that top bar is replaced by the library's menu button, and the same menu is the
+**Controller layout** row of the in-game **Session** menu, below **Touch
+controls** (`docs/LIBRARY.md`). Either one lists:
 
 - **Xbox controller**, a built-in full XInput layout: LT/LB and RB/RT rows in the
   top corners, a D-pad cross above the left stick, the A/B/X/Y diamond above the
@@ -59,6 +62,16 @@ While touch controls are shown, the landscape top bar has a layout button
   controls and opens the editor on it.
 - **Delete** for the active custom layout (confirmed first). The deleted
   layout's controls are replaced by the built-in, when it is available.
+
+A library game remembers the layout its controls were loaded from (an optional
+`controlLayout` field of its library entry, so older files still load; a layout
+deleted since is treated as none), and the session restores the shared layout
+when it ends. A game with no saved controls of its own draws the shared working
+copy, as before.
+
+The two key sticks, WASD and Arrows, draw a small symbol on the knob in the
+middle of the stick (a keyboard, and four arrows) so they can be told apart; the
+controller sticks keep their LS/RS label.
 
 Built-ins cannot be changed. Custom layouts live in
 Documents/madeira-control-presets.json; madeira-controls.json stays the working
@@ -191,7 +204,8 @@ merge, rebuild the paired components and test:
   no input should remain stuck, and fresh touches should work afterward.
 - Both rollback flags, saved layouts, and existing keyboard/mouse controls.
 - Layouts: by default nothing is applied to a user with or without a controls
-  file; the built-in loads from the menu; switching away from unsaved controls
+  file; the built-in loads from the menu (the overlay's button, and in a library
+  session the Session menu's Controller layout row); switching away from unsaved controls
   asks first; create, edit with Done, relaunch and reload a custom layout;
   delete it; the layout menu and its dialogs respond anywhere on screen; each
   kill switch at `0`. With `MADEIRA_CONTROLS_XBOX_DEFAULT = 1`: a user without
