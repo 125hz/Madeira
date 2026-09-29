@@ -124,6 +124,10 @@ func record(_ appID: Int, _ name: String, _ folder: String, flags: Int) -> Strin
         require(!R.showsSection(dock: false, signedIn: true, count: 2), "no section without Dock (MADEIRA_DOCK=0 or no host)")
         require(!R.showsSection(dock: true, signedIn: false, count: 0), "no empty section without a sign-in")
         require(R.showsSection(dock: true, signedIn: true, count: 0), "signed in: the section shows while the library loads")
+        require(R.showsSection(dock: true, library: true, signedIn: false, count: 0), "owned library on, signed out: the section shows to invite a sign-in")
+        require(!R.showsSection(dock: false, library: true, signedIn: false, count: 0), "no section without Dock even with the library on")
+        require(R.showsSignIn(library: true, signedIn: false) && !R.showsSignIn(library: true, signedIn: true)
+                && !R.showsSignIn(library: false, signedIn: false), "the sign-in card shows only when the owned library is on and signed out")
         require(R.items(installed: found, owned: [], search: "").count == 2 && R.items(installed: found, owned: [], search: "  ").count == 2,
                 "empty search shows all")
         require(R.items(installed: found, owned: [], search: "second").map(\.id) == [4343], "search is case-insensitive on the name")

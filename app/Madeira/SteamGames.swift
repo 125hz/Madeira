@@ -83,9 +83,15 @@ enum SteamGamesRules {
         }
     }
 
-    /// Whether the library shows the Steam section: Dock is available, and
-    /// there is a game to show or a sign-in whose library is on its way.
-    static func showsSection(dock: Bool, signedIn: Bool, count: Int) -> Bool { dock && (count > 0 || signedIn) }
+    /// Whether the library shows the Steam section: Dock is available, and there is
+    /// a game to show, a sign-in whose library is on its way, or (with the owned
+    /// library on) a signed-out account the section invites to sign in.
+    static func showsSection(dock: Bool, library: Bool = false, signedIn: Bool, count: Int) -> Bool {
+        dock && (count > 0 || signedIn || library)
+    }
+
+    /// Whether the section shows its "Sign in to Steam" card instead of the account's games.
+    static func showsSignIn(library: Bool, signedIn: Bool) -> Bool { library && !signedIn }
 
     /// Why Play is not offered yet, or nil when Dock can be asked to start the game.
     /// Valve's client still decides at launch.
@@ -194,6 +200,7 @@ struct SteamGamesSection: View {
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("madeiraLibraryHideSteam") private var hidden = false
     @State private var selected: SteamGameSelection?
+    @State private var showSignIn = false
 
     private var libraryEnabled: Bool { SteamOwnedLibrary.enabled }
 
@@ -202,7 +209,8 @@ struct SteamGamesSection: View {
         let items = SteamGamesRules.items(installed: model.games, owned: owned, search: search)
         let total = SteamGamesRules.items(installed: model.games, owned: owned, search: "").count
         Group {
-            if SteamGamesRules.showsSection(dock: MadeiraDock.enabled, signedIn: libraryEnabled && steam.signedIn, count: total) {
+            if SteamGamesRules.showsSection(dock: MadeiraDock.enabled, library: libraryEnabled,
+                                            signedIn: libraryEnabled && steam.signedIn, count: total) {
                 VStack(alignment: .leading, spacing: 14) {
                     LibrarySectionHeader(title: "Steam", count: total, collapsed: $hidden) {
                         Button { refreshAll() } label: { Label("Refresh", systemImage: "arrow.clockwise") }.font(.subheadline)
@@ -211,6 +219,17 @@ struct SteamGamesSection: View {
                     if hidden {
                         EmptyView()
                     } else {
+                        // Signed out: the account's games need a sign-in; say so here rather
+                        // than hiding the section until someone finds Settings › Steam.
+                        if SteamGamesRules.showsSignIn(library: libraryEnabled, signedIn: steam.signedIn) {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("Sign in to Steam to see your games and install them.")
+                                    .foregroundStyle(.secondary)
+                                Button { showSignIn = true } label: {
+                                    Label("Sign in to Steam", systemImage: "person.crop.circle")
+                                }.buttonStyle(.borderedProminent)
+                            }
+                        }
                         if libraryEnabled, steam.signedIn, steam.refreshing, owned.isEmpty {
                             HStack(spacing: 10) {
                                 ProgressView()
@@ -241,6 +260,7 @@ struct SteamGamesSection: View {
             if phase == .active { model.refresh(); if libraryEnabled { steam.reconcileSession() } }
         }
         .sheet(item: $selected) { selection in SteamGameDetail(appID: selection.id, startDock: startDock) }
+        .sheet(isPresented: $showSignIn) { SteamSignInView() }
         .alert("Steam", isPresented: Binding(get: { steam.error != nil }, set: { if !$0 { steam.error = nil } })) {
             Button("OK", role: .cancel) { steam.error = nil }
         } message: { Text(steam.error ?? "") }
