@@ -156,20 +156,24 @@ library.
 
 **Steam games in the library** (`app/Madeira/SteamGames.swift`). When Madeira
 Dock is available, the library shows a **Steam** section above the games you
-added: the games Steam's client has installed in the prefix, exactly as Dock's
+added. It lists the games Steam has installed in the prefix, exactly as Dock's
 own discovery finds them (`appmanifest_<appid>.acf` in `C:\Program Files
 (x86)\Steam\steamapps` and the other C: libraries its `libraryfolders.vdf`
-lists). The section follows the library's search and collapses like the games
-section. Artwork comes from Steam's public store CDN by App ID. A game opens a
-sheet with **Play**, which goes through Dock's launch path with Dock's
-per-launch pool toggle, as a library session. Play is offered only for a game
-Steam marks fully installed, with Valve's client components present and a
-Steam sign-in. The section reads install records only; it never writes Steam
-files. Controller focus does not reach it yet.
+lists), and, once you are signed in, the account's owned games that are not
+installed yet, which can be installed, updated and uninstalled from the game's
+sheet (`docs/STEAM_LIBRARY.md`). The section follows the library's search and
+collapses like the games section. Artwork comes from Steam's public store CDN.
+An installed game's sheet has **Play**, which goes through Dock's launch path
+with Dock's per-launch pool toggle, as a library session. Play is offered only
+for a game Steam marks fully installed (and not being downloaded), with Valve's
+client components present and a Steam sign-in. Reading install records never
+writes Steam files; only the downloads and **Uninstall** of `docs/STEAM_LIBRARY.md`
+do, and only in Madeira Dock's own library folder. Controller focus does not
+reach the section yet.
 
 Log tags: `[onboarding]` (`shown reason=… steps=…`, `step=…`, `done`,
-`skipped`) and `[steam-games]` (counts and App IDs). No account name, token or
-path is logged.
+`skipped`), `[steam-games]` (counts and App IDs) and the library and download
+tags of `docs/STEAM_LIBRARY.md`. No account name, token or path is logged.
 
 ## Controllers
 
@@ -224,5 +228,7 @@ without Dock, the done key, the `MADEIRA_ONBOARDING` switch, and the wiring
 (no Wine session, no pool or engine switch, sign-in and Dock only through
 their public pieces).
 `build/host-tests/check-steam-games.py` covers the library's Steam section: Dock's
-discovery on a synthetic drive_c laid out as Steam writes it, the section,
-search, Play and artwork rules, and that Play uses only Dock's launch path.
+discovery on a synthetic drive_c laid out as Steam writes it, the merge of
+installed and owned games, the section, status, search, Play and artwork rules,
+and that Play uses only Dock's launch path. `build/host-tests/check-steam-library.py`
+covers the owned library and downloads (`docs/STEAM_LIBRARY.md`).

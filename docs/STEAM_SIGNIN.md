@@ -1,9 +1,10 @@
 # Steam sign-in
 
 Madeira can sign in to a Steam account and keep the resulting sign-in token in
-the iOS Keychain. Nothing in the app uses the token yet except the public API
-below; Madeira Dock (a separate pull request) is the first user. There is no
-Steam library, download, install or launch code here.
+the iOS Keychain. Madeira Dock uses the token to sign Valve's client in, and
+the owned library and downloads (`docs/STEAM_LIBRARY.md`) use it for their Steam
+connection. This document covers sign-in only; the library and downloads have
+their own.
 
 ## Using it
 
@@ -95,11 +96,12 @@ this permission that does not resolve; that reference is withdrawn. The
 permission is a chat message, not a written licence; a public confirmation by
 Jfishin on the pull request would make it verifiable by anyone.
 
-Only the sign-in part of that client is here. Its CM connection, channel
-encryption, library, app info, depot download, content decoding, Steam Cloud,
-launch and DRM-related parts are **not** included (sign-in does not need a CM
-connection). 125hz's changes are GPL-3.0-or-later with the Madeira Converter
-Exception; the derived files say `Copyright 2026 Jfishin, 125hz`.
+The sign-in files listed below are the sign-in part of that client. The
+owned library and downloads (`docs/STEAM_LIBRARY.md`) are a second part, with
+their own audit; Steam Cloud, launch and DRM-related parts of his client, and
+the channel encryption that cites a third-party key dictionary, are **not**
+included anywhere. 125hz's changes are GPL-3.0-or-later with the Madeira
+Converter Exception; the derived files say `Copyright 2026 Jfishin, 125hz`.
 
 Audit method: the files below were compared line by line with Jfishin's
 original tree (a local copy of his fork, last commit 2026-09-19 "Prepare
@@ -129,10 +131,10 @@ library, as far as this audit can tell; nothing here needs a licence other
 than GPL-3.0-or-later with the Madeira Converter Exception. What the audit
 cannot establish is how Jfishin himself wrote his originals: it rests on his
 statement, his tree carrying no third-party notice for these files, and the
-absence of any reference or recognisable foreign code. The parts of his client
-that *do* name third-party sources (its channel encryption, which cites the
-SteamKit2/JavaSteam key dictionary, and its depot downloader) are exactly the
-parts left out.
+absence of any reference or recognisable foreign code. The channel encryption
+of his client cites the SteamKit2/JavaSteam key dictionary; it is left out
+(the connection is a WebSocket over TLS). His depot downloader is in
+`docs/STEAM_LIBRARY.md`, which records its own audit.
 
 ## Tests
 
