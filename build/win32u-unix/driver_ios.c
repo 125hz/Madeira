@@ -314,6 +314,77 @@ void winios_dump_window_tree(void)
     }
 }
 
+/* Window census helpers for app/Madeira/Winios/Winios.m, which keeps the
+ * library's starting screen up over a Madeira Dock start until the game's own
+ * window is shown (see winios_window_census_enable in Winios.h). Winios.m
+ * cannot include the Wine headers, so the win32u and ntdll calls live here.
+ * All of them run on a Wine thread, only while the app has the census on. */
+
+/* A top-level window's owning process id and style bits. Returns 0 for a
+ * child window, the desktop window itself, or a window that is gone. */
+int winios_drv_census_owner( HWND hwnd, unsigned int *pid, unsigned int *style )
+{
+    DWORD process = 0, bits;
+
+    *pid = 0;
+    *style = 0;
+    bits = get_window_long( hwnd, GWL_STYLE );
+    if (bits & WS_CHILD) return 0;
+    if (!NtUserGetAncestor( hwnd, GA_PARENT )) return 0;   /* the desktop window */
+    if (!get_window_thread( hwnd, &process )) return 0;
+    *pid = process;
+    *style = bits;
+    return 1;
+}
+
+/* The executable path of process `pid`, as the server recorded it when the
+ * process started (no handle is opened): lower-case, with the NT "\??\"
+ * prefix removed, so "\??\C:\Windows\explorer.exe" reads
+ * "c:\windows\explorer.exe". Characters outside printable ASCII become '?';
+ * a path longer than the buffer is cut. Returns 1 when the path was read. */
+int winios_drv_process_image( unsigned int pid, char *out, unsigned int size )
+{
+    WCHAR path[MAX_PATH + 8];
+    SYSTEM_PROCESS_ID_INFORMATION info;
+    unsigned int i, j = 0, n;
+
+    if (!out || !size) return 0;
+    out[0] = 0;
+    if (!pid) return 0;
+    memset( &info, 0, sizeof(info) );
+    info.ProcessId = pid;
+    info.ImageName.Buffer = path;
+    info.ImageName.MaximumLength = sizeof(path);
+    if (NtQuerySystemInformation( SystemProcessIdInformation, &info, sizeof(info), NULL )) return 0;
+    n = info.ImageName.Length / sizeof(WCHAR);
+    if (n > ARRAY_SIZE(path)) n = ARRAY_SIZE(path);
+    i = (n >= 4 && path[0] == '\\' && (path[1] == '?' || path[1] == '\\') && path[2] == '?' && path[3] == '\\') ? 4 : 0;
+    for (; i < n && j + 1 < size; i++)
+    {
+        WCHAR c = path[i];
+        if (c == '/') c = '\\';
+        out[j++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : (c >= 32 && c < 127) ? (char)c : '?';
+    }
+    out[j] = 0;
+    return j > 0;
+}
+
+/* What a taskbar click sends to a minimized window. Posted, never sent: the
+ * caller runs inside the window's WindowPosChanged. */
+int winios_drv_post_restore( HWND hwnd )
+{
+    return NtUserPostMessage( hwnd, WM_SYSCOMMAND, SC_RESTORE, 0 ) ? 1 : 0;
+}
+
+/* A taskbar click also brings the window to the front. Only the window's own
+ * thread does that, from its event pump (not inside SetWindowPos). Returns 0
+ * on another thread, 1 when the window is now foreground, -1 on failure. */
+int winios_drv_foreground_if_owner( HWND hwnd )
+{
+    if (!hwnd || get_window_thread( hwnd, NULL ) != GetCurrentThreadId()) return 0;
+    return NtUserSetForegroundWindow( hwnd ) ? 1 : -1;
+}
+
 /* ============================================================ *
  * winios window surfaces (S2): GDI window content → app compositor.
  * Modeled on win32u's offscreen surface (dce.c): the generic
