@@ -14248,15 +14248,16 @@ static unsigned long long ios_swap_bytes, ios_swap_peak, ios_swap_backs, ios_swa
  * blocks (every Wine heap block above ~508 KB is its own reserve+commit) and
  * as heaps committing 64 KB at a time. MADEIRA_SWAP_COVERAGE (madeira.cfg
  * env.MADEIRA_SWAP_COVERAGE) picks the rules:
- *  - blocks (default): a commit request of at least 1 MB is enough.
+ *  - classic (default): the ml1077 rules, see below.
+ *  - blocks: a commit request of at least 1 MB is enough.
  *    MADEIRA_SWAP_MIN_KB=N sets that floor (64 KB .. 4 GB).
  *  - wide: blocks, plus any writable Wine private view outside the band
  *    (allocations that spill past it once it is full), plus fresh writable
  *    reservations up to MADEIRA_SWAP_RESERVE_MAX_MB (default 256) mapped from
  *    the file PROT_NONE at reserve time, so that a heap committing 64 KB at a
  *    time commits file pages (a hole reads as zero).
- *  - classic: the rules above exactly, including the plain free list and no
- *    census.
+ *  - classic (the default, spelled out): a single commit of at least 8 MB in the
+ *    guest band, exactly as ml1077, including the plain free list and no census.
  * blocks and wide never back the FEX arena, the JIT pool, placeholders or
  * ARM64EC views, return freed file ranges merged with their free neighbours
  * (a range ending at the bump pointer lowers it), and print a [swap] census
@@ -14292,7 +14293,10 @@ static void ios_swap_config( void )
 {
     const char *cov = getenv( "MADEIRA_SWAP_COVERAGE" );
     ios_swap_v2 = 0; ios_swap_wide = 0; ios_swap_min = 8u << 20; ios_swap_mode = "classic";
-    if (cov && (cov[0] | 0x20) == 'c') return;
+    /* classic is the default: blocks and wide back far more of a game's memory with
+     * the file, and a game can run slower for it, so they are opt-in. Any other
+     * value also means classic. */
+    if (!cov || ((cov[0] | 0x20) != 'b' && (cov[0] | 0x20) != 'w')) return;
     ios_swap_v2 = 1;
     ios_swap_wide = cov && (cov[0] | 0x20) == 'w';
     ios_swap_mode = ios_swap_wide ? "wide" : "blocks";
@@ -14316,7 +14320,7 @@ static void ios_swap_init( void )
     dprintf( 2, "[swap] ml1077 file-backed guest data tier ON: %s, cap %llu MB\n", f, (unsigned long long)(ios_swap_cap >> 20) );
     ios_swap_config();
     if (ios_swap_v2)
-        dprintf( 2, "[swap] coverage=%s min=%zuKB reserve-max=%zuMB (MADEIRA_SWAP_COVERAGE=blocks|wide|classic, "
+        dprintf( 2, "[swap] coverage=%s min=%zuKB reserve-max=%zuMB (MADEIRA_SWAP_COVERAGE=classic|blocks|wide, "
                     "MADEIRA_SWAP_MIN_KB, MADEIRA_SWAP_RESERVE_MAX_MB)\n",
                  ios_swap_mode, ios_swap_min >> 10, ios_swap_resv_max >> 20 );
     else
