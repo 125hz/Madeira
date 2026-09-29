@@ -262,7 +262,12 @@ struct SteamGamesSection: View {
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { model.refresh(); if libraryEnabled { steam.reconcileSession() } }
         }
-        .sheet(item: $selected) { selection in SteamGameDetail(appID: selection.id) }
+        .sheet(item: $selected) { selection in
+            SteamGameSheet(appID: selection.id) { entry in
+                // Let the download sheet finish dismissing before presenting the details page.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { open(entry) }
+            }
+        }
         .sheet(isPresented: $showSignIn) { SteamSignInView() }
         .alert("Steam", isPresented: Binding(get: { steam.error != nil }, set: { if !$0 { steam.error = nil } })) {
             Button("OK", role: .cancel) { steam.error = nil }
@@ -414,9 +419,12 @@ struct SteamDownloadStatus: View {
 // MARK: - Download sheet
 
 /// A game the account owns that is not installed: Install, Pause, Resume and
-/// Cancel of its download. An installed game opens its Game details page instead.
-struct SteamGameDetail: View {
+/// Cancel of its download. When the download finishes the sheet's button reads
+/// Open, which opens the game's Game details page, where Play starts it.
+struct SteamGameSheet: View {
     let appID: Int
+    /// Opens the installed game's Game details page (after this sheet closes).
+    var open: (LibraryEntry) -> Void
     @ObservedObject private var steam = SteamOwnedLibrary.shared
     @ObservedObject private var games = SteamGamesModel.shared
     @Environment(\.dismiss) private var dismiss
@@ -427,7 +435,6 @@ struct SteamGameDetail: View {
     var body: some View {
         let owned = SteamOwnedLibrary.enabled ? steam.owned : []
         let item = SteamGamesRules.items(installed: games.games, owned: owned, search: "").first { $0.id == appID }
-        let download = steam.downloads[appID]
         NavigationStack {
             Form {
                 if let item {
@@ -440,11 +447,16 @@ struct SteamGameDetail: View {
                                 if let summary = steam.playtime[appID]?.summary {
                                     Text(summary).font(.subheadline).foregroundStyle(.secondary)
                                 }
-                                primaryAction(installed: item.installed != nil, download: download, canInstall: item.owned != nil)
+                                primaryAction(item)
                             }
-                        }.padding(.vertical, 12)
+                        }.padding(.vertical, 24)
+                            .listRowBackground(
+                                SteamGameArtwork(appID: appID).blur(radius: 4)
+                                    .overlay(Color(uiColor: .secondarySystemGroupedBackground).opacity(0.55))
+                                    .clipped()
+                            )
                     }
-                    if let download {
+                    if let download = steam.downloads[appID] {
                         Section("Download") {
                             SteamDownloadStatus(download: download)
                             Button("Cancel download", role: .destructive) { confirmCancel = true }
@@ -455,10 +467,9 @@ struct SteamGameDetail: View {
                         }
                     }
                     Section {
-                        LabeledContent("App ID", value: String(appID))
                         if let freeSpace { LabeledContent("Free space on this device", value: formatBytes(freeSpace)) }
-                    } footer: {
-                        Text("Games download directly from Steam with your account into C:\\Program Files (x86)\\Steam\\steamapps\\common. Keep Madeira open while it downloads: it pauses shortly after you leave, and while a game is running, and continues when you return.")
+                        Text(SteamGameSheet.downloadNote)
+                            .font(.footnote).foregroundStyle(.secondary)
                     }
                     Section {
                         Link(destination: URL(string: "https://store.steampowered.com/app/\(appID)/")!) {
@@ -472,20 +483,32 @@ struct SteamGameDetail: View {
             }
             .navigationTitle("Steam").navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
-            .task(id: download?.state) {
+            .task(id: steam.downloads[appID]?.state) {
                 partial = steam.hasPartialDownload(appID)
                 let values = try? URL.documentsDirectory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
                 freeSpace = values?.volumeAvailableCapacityForImportantUsage
             }
-            .confirmationDialog("Cancel this download?", isPresented: $confirmCancel, titleVisibility: .visible) {
-                Button("Cancel and delete downloaded files", role: .destructive) { steam.cancelInstall(appID, installed: false) }
+            .confirmationDialog("Cancel this download? Downloaded files are deleted.", isPresented: $confirmCancel, titleVisibility: .visible) {
+                Button("Cancel download", role: .destructive) {
+                    steam.cancelInstall(appID, installed: games.games.contains { $0.id == appID })
+                }
                 Button("Keep downloading", role: .cancel) {}
             }
         }
     }
 
-    @ViewBuilder private func primaryAction(installed: Bool, download: SteamOwnedLibrary.Download?, canInstall: Bool) -> some View {
-        if let download {
+    static let downloadNote = "Games download directly from Steam with your account into C:\\Program Files (x86)\\Steam\\steamapps\\common. Keep Madeira open while it downloads: it pauses shortly after you leave, and while a game is running, and continues when you return."
+
+    @ViewBuilder private func primaryAction(_ item: SteamGamesRules.Item) -> some View {
+        if let installed = item.installed {
+            // The download finished (or Steam's client installed the game): its Game details page.
+            Button {
+                let entry = LibraryModel.shared.steamEntry(installed, title: item.name)
+                dismiss(); open(entry)
+            } label: {
+                HStack(spacing: 10) { Image(systemName: "play.fill"); Text("Open").fontWeight(.semibold) }.frame(minWidth: 100, minHeight: 30)
+            }.buttonStyle(.borderedProminent)
+        } else if let download = steam.downloads[appID] {
             switch download.state {
             case .active, .queued:
                 Button { steam.pause(appID) } label: { steamActionLabel("Pause", symbol: "pause.fill") }
@@ -497,9 +520,7 @@ struct SteamGameDetail: View {
                 Button { steam.install(appID) } label: { steamActionLabel("Try again", symbol: "arrow.clockwise") }
                     .buttonStyle(.borderedProminent)
             }
-        } else if installed {
-            Text("Installed. Open it from your library.").font(.subheadline).foregroundStyle(.secondary)
-        } else if canInstall {
+        } else if item.owned != nil {
             Button { steam.install(appID) } label: {
                 steamActionLabel(partial ? "Resume download" : "Install", symbol: "arrow.down.circle.fill")
             }.buttonStyle(.borderedProminent).disabled(!steam.signedIn)

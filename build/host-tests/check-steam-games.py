@@ -57,6 +57,18 @@ require('MadeiraDock.games(drive: drive)' in games and 'let drive = MadeiraDock.
 require('open(LibraryModel.shared.steamEntry(installed, title: item.name))' in games,
         'an installed Steam game opens its Game details page (its library entry)')
 require(games.count('startDock(') == 0, 'the section never starts Dock itself: Play is on the Game details page')
+# A finished download: the game becomes a library entry, and its sheet's button reads Open (Game details).
+sheet = games[games.index('struct SteamGameSheet: View {'):games.index('struct SteamEntrySection')]
+require('Text("Open")' in sheet and 'if let installed = item.installed {' in sheet and 'dismiss(); open(entry)' in sheet,
+        "a finished download's sheet offers Open, which opens the Game details page")
+require('SteamGameSheet(appID: selection.id) { entry in' in games and 'open(entry) }' in games,
+        'Open presents the Game details page after the download sheet closes')
+run_body = owned_source[owned_source.index('    private func run(_ appID: Int) async {'):]
+run_body = run_body[:run_body.index('\n    }\n')]
+require(run_body.index('try await downloader.install(') < run_body.index('LibraryModel.shared.upsertSteam(') < run_body.index('} catch {'),
+        'a finished download (record written) gets its library entry; a failed or paused one does not')
+require('LibraryModel.shared.removeSteam(appID: game.id)' in owned_source[owned_source.index('func uninstall(_ game: DockGame)'):],
+        "Uninstall removes the game's library entry with its files")
 detail = library[library.index('struct LibraryDetail: View {'):library.index('struct FPSChoice: View {')]
 steam_section = games[games.index('struct SteamEntrySection'):]
 require('SteamEntrySection(entry: $entry)' in detail and 'if entry.steamAppID != nil {' in detail,

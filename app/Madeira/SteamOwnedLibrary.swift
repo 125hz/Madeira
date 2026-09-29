@@ -456,12 +456,17 @@ final class SteamOwnedLibrary: ObservableObject {
                 throw SteamError.appInfoNotFound(UInt32(appID))
             }
             try FileManager.default.createDirectory(at: SteamInstallPaths.common(drive: Self.drive), withIntermediateDirectories: true)
-            _ = try await downloader.install(info, steamApps: Self.steamApps,
-                                             ownedDepots: { [weak self] in try? await self?.fetcher.ownedDepotIDs() }) { [weak self] progress in
+            let folder = try await downloader.install(info, steamApps: Self.steamApps,
+                                                      ownedDepots: { [weak self] in try? await self?.fetcher.ownedDepotIDs() }) { [weak self] progress in
                 self?.downloads[appID]?.progress = progress
             }
             downloads[appID] = nil
-            // The install record is written last: the game is now "installed" for Dock.
+            // The install record is written last: the game is now "installed" for Dock, and it
+            // gets its library entry (its Game details page and settings; an existing one is kept).
+            LibraryModel.shared.upsertSteam(DockGame(id: appID, name: info.name, installDir: folder.lastPathComponent,
+                                                     library: SteamInstallPaths.libraryRelative, installed: true,
+                                                     customExecutables: false), title: info.name)
+            SteamLog.event("[steam-depot] library entry app=\(appID)")
             SteamGamesModel.shared.refresh()
         } catch {
             if Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
