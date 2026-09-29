@@ -187,7 +187,10 @@ print("PASS: built-in controller layout, layout store, naming and loading")
 
 with tempfile.TemporaryDirectory(prefix='madeira-presets-') as tmp:
     src, exe = Path(tmp) / 'main.swift', Path(tmp) / 'check'
-    src.write_text('import Foundation\n' + actions + pure_touch + pure + tests)
+    # CoreGraphics where it exists: on macOS, Foundation alone no longer gives CGRect
+    # its members (midX, width, ...); Linux's Foundation still does.
+    header = 'import Foundation\n#if canImport(CoreGraphics)\nimport CoreGraphics\n#endif\n'
+    src.write_text(header + actions + pure_touch + pure + tests)
     subprocess.run([os.environ.get('SWIFTC', 'swiftc'), str(src), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)
 
