@@ -62,6 +62,15 @@ void winios_pointer(int x, int y, unsigned int flags, unsigned int data);
  * by winios_pointer(MOVE); exposed for initial placement. */
 void winios_cursor_move(int x, int y);
 
+/* Library front end hooks. How many GDI window images the desktop
+ * compositor has shown (a desktop session's first frame); hide or show the
+ * compositor view (1 when there was one to change); and a window point
+ * (points, main thread) to desktop pixels through the compositor's own
+ * mapping (0 when there is no desktop). */
+unsigned long long winios_surface_present_count(void);
+int winios_compositor_set_hidden(int hidden);
+int winios_desktop_point_from_window(double wx, double wy, int *px, int *py);
+
 #ifdef __cplusplus
 }
 #endif

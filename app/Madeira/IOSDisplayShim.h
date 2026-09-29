@@ -15,6 +15,16 @@
 // Register the CAMetalLayer that DXMT-rendered content should go into.
 // Must be called before the first D3D11 swapchain is created.
 void madeira_display_set_layer(CAMetalLayer *layer);
+
+// Posted (on the main queue) when the guest's virtual monitor changes size.
+extern NSString * const MadeiraDisplayModeChangedNotification;
 #endif
+
+// The guest's virtual-monitor size in guest pixels, for the front end's
+// layout and touch mapping. Seeded from MADEIRA_SCREEN_W/H (the session
+// default win32u uses, 1024x768 when unset); winios_display_mode_changed()
+// lets a win32u that supports mode changes publish a new size.
+void winios_screen_size(int *w, int *h);
+void winios_display_mode_changed(int w, int h);
 
 #endif
