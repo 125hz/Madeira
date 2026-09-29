@@ -83,6 +83,61 @@ enum SteamGamesRules {
         }
     }
 
+    /// The Steam section's groups, as in the fork's sectioned library: games
+    /// being downloaded that Steam has no install record for yet, the games
+    /// Steam has installed (both listed under the section's title), and the
+    /// account's other games (its "Not installed" group). Each keeps `items`'
+    /// order.
+    struct Groups: Equatable {
+        var downloading: [Item] = []
+        var installed: [Item] = []
+        var notInstalled: [Item] = []
+    }
+
+    static func groups(_ items: [Item], downloading: Set<Int>) -> Groups {
+        var groups = Groups()
+        for item in items {
+            if item.installed != nil { groups.installed.append(item) }
+            else if downloading.contains(item.id) { groups.downloading.append(item) }
+            else { groups.notInstalled.append(item) }
+        }
+        return groups
+    }
+
+    /// What a game's library entry records, for the library's Sort by menu:
+    /// when Madeira last started it, its size, and its place in the library.
+    struct Recorded: Equatable {
+        var lastPlayed: Date?
+        var bytes: Int64?
+        var position: Int
+    }
+
+    /// Installed games in the library's Sort by order ("played", "name",
+    /// "added" or "size"), compared as the library compares the games you
+    /// added. A game without a library entry yet (never opened, or installed
+    /// by Steam's client) sorts as never played, of unknown size and, for
+    /// "added", after the games that have one; ties go by name.
+    static func sorted(_ items: [Item], by sort: String, recorded: [Int: Recorded]) -> [Item] {
+        func byName(_ a: Item, _ b: Item) -> Bool {
+            let order = a.name.localizedStandardCompare(b.name)
+            return order == .orderedSame ? a.id < b.id : order == .orderedAscending
+        }
+        return items.sorted { a, b in
+            let ra = recorded[a.id], rb = recorded[b.id]
+            switch sort {
+            case "added":
+                if ra?.position != rb?.position { return (ra?.position ?? -1) > (rb?.position ?? -1) }
+            case "played":
+                if ra?.lastPlayed != rb?.lastPlayed { return (ra?.lastPlayed ?? .distantPast) > (rb?.lastPlayed ?? .distantPast) }
+            case "size":
+                if ra?.bytes != rb?.bytes { return (ra?.bytes ?? -1) > (rb?.bytes ?? -1) }
+            default:
+                break
+            }
+            return byName(a, b)
+        }
+    }
+
     /// Whether the library shows the Steam section: Dock is available, and there is
     /// a game to show, a sign-in whose library is on its way, or (with the owned
     /// library on) a signed-out account the section invites to sign in.
@@ -325,69 +380,120 @@ enum SteamDirectStart {
 
 private struct SteamGameSelection: Identifiable { let id: Int }
 
-/// The library's Steam section: the account's games and the games Steam has
-/// installed in the prefix. An installed game opens its Game details page (the
-/// library's own, LibraryDetail, with the Steam section below), where Play
-/// starts it through Madeira Dock; a game that is not installed opens its
-/// download sheet.
+/// The library's Steam section, laid out as the fork's sectioned library: under
+/// the **Steam** title the games being downloaded and the games Steam has
+/// installed in the prefix (the title collapses them), then the account's
+/// other games under **Not installed**, which folds on its own. The library's
+/// **Other games** section (LibraryView) follows. An installed game opens its
+/// Game details page (the library's own, LibraryDetail, with the Steam section
+/// below), where Play starts it through Madeira Dock; a game that is not
+/// installed opens its download sheet. Cards follow the library's layout, and
+/// installed games its Sort by choice. Pull down on the library to read the
+/// install records and the account's library again.
 struct SteamGamesSection: View {
     let search: String
+    /// The library's layout and Sort by choices and its width (LibraryView).
+    var layout = "cards"
+    var sort = "played"
+    var width: CGFloat = 390
     /// Opens a game's Game details page (LibraryView's details sheet).
     let open: (LibraryEntry) -> Void
     @ObservedObject private var model = SteamGamesModel.shared
     @ObservedObject private var steam = SteamOwnedLibrary.shared
+    @ObservedObject private var library = LibraryModel.shared
     @Environment(\.scenePhase) private var scenePhase
-    @AppStorage("madeiraLibraryHideSteam") private var hidden = false
+    // Collapsed state of the installed games (the Steam title) and of Not installed.
+    @AppStorage("madeiraLibraryHideInstalled") private var hideInstalled = false
+    @AppStorage("madeiraSteamShowUninstalled") private var showUninstalled = true
     @State private var selected: SteamGameSelection?
     @State private var showSignIn = false
 
+    /// MADEIRA_LIBRARY_COLLAPSE=0: the section titles do not collapse.
+    static var collapsible: Bool { MadeiraConfig.flag("MADEIRA_LIBRARY_COLLAPSE") }
     private var libraryEnabled: Bool { SteamOwnedLibrary.enabled }
+
+    /// Whether the library shows this section, and with it the sectioned
+    /// layout (the games you added then sit under Other games).
+    @MainActor static var shown: Bool {
+        let library = SteamOwnedLibrary.enabled, account = SteamOwnedLibrary.shared
+        let owned = library ? account.owned : []
+        let total = SteamGamesRules.items(installed: SteamGamesModel.shared.games, owned: owned, search: "").count
+        return SteamGamesRules.showsSection(dock: MadeiraDock.enabled, library: library,
+                                            signedIn: library && account.signedIn, count: total)
+    }
+
+    /// Pull to refresh on the library: the install records again and, when
+    /// signed in, the account's library.
+    @MainActor static func refresh() async {
+        SteamGamesModel.shared.refresh()
+        if SteamOwnedLibrary.enabled && SteamOwnedLibrary.shared.signedIn {
+            await SteamOwnedLibrary.shared.refreshLibrary(interactive: true)
+        }
+    }
+
+    /// Sort by data from the Steam games' library entries.
+    private var recorded: [Int: SteamGamesRules.Recorded] {
+        var result: [Int: SteamGamesRules.Recorded] = [:]
+        for (position, entry) in library.entries.enumerated() {
+            if let appID = entry.steamAppID {
+                result[appID] = SteamGamesRules.Recorded(lastPlayed: entry.lastPlayed, bytes: entry.folderBytes, position: position)
+            }
+        }
+        return result
+    }
 
     var body: some View {
         let owned = libraryEnabled ? steam.owned : []
+        let signedIn = libraryEnabled && steam.signedIn
         let items = SteamGamesRules.items(installed: model.games, owned: owned, search: search)
-        let total = SteamGamesRules.items(installed: model.games, owned: owned, search: "").count
+        let groups = SteamGamesRules.groups(items, downloading: Set(steam.downloads.keys))
+        let installed = SteamGamesRules.sorted(groups.installed, by: sort, recorded: recorded)
+        let collapsible = Self.collapsible
         Group {
-            if SteamGamesRules.showsSection(dock: MadeiraDock.enabled, library: libraryEnabled,
-                                            signedIn: libraryEnabled && steam.signedIn, count: total) {
+            if Self.shown {
                 VStack(alignment: .leading, spacing: 14) {
-                    LibrarySectionHeader(title: "Steam", count: total, collapsed: $hidden) {
-                        Button { refreshAll() } label: { Label("Refresh", systemImage: "arrow.clockwise") }.font(.subheadline)
-                            .disabled(steam.refreshing)
+                    LibrarySectionHeader(title: "Steam", count: installed.count,
+                                         collapsed: collapsible ? $hideInstalled : nil) {
+                        if steam.refreshing { ProgressView().accessibilityLabel("Refreshing Steam library") }
                     }
-                    if hidden {
+                    // Signed out: the account's games need a sign-in; say so here rather
+                    // than hiding the section until someone finds Settings › Steam.
+                    if SteamGamesRules.showsSignIn(library: libraryEnabled, signedIn: steam.signedIn) {
+                        SteamSignInCard { showSignIn = true }
+                    }
+                    if hideInstalled && collapsible {
                         EmptyView()
-                    } else {
-                        // Signed out: the account's games need a sign-in; say so here rather
-                        // than hiding the section until someone finds Settings › Steam.
-                        if SteamGamesRules.showsSignIn(library: libraryEnabled, signedIn: steam.signedIn) {
-                            VStack(alignment: .leading, spacing: 10) {
-                                Text("Sign in to Steam to see your games and install them.")
-                                    .foregroundStyle(.secondary)
-                                Button { showSignIn = true } label: {
-                                    Label("Sign in to Steam", systemImage: "person.crop.circle")
-                                }.buttonStyle(.borderedProminent)
-                            }
+                    } else if !groups.downloading.isEmpty || !installed.isEmpty {
+                        LibraryCells(items: groups.downloading + installed, layout: layout, width: width) { item, list, dense in
+                            cell(item, list: list, dense: dense)
                         }
-                        if libraryEnabled, steam.signedIn, steam.refreshing, owned.isEmpty {
-                            HStack(spacing: 10) {
-                                ProgressView()
-                                Text("Loading your Steam library…").foregroundStyle(.secondary)
-                            }.accessibilityElement(children: .combine)
-                        }
-                        if items.isEmpty {
-                            if total > 0 { Text("No Steam games match your search.").foregroundStyle(.secondary) }
-                        } else {
-                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 110, maximum: 164), spacing: 12, alignment: .top)],
-                                      alignment: .leading, spacing: 18) {
-                                ForEach(items) { item in
-                                    Button { select(item) } label: { SteamGameCell(item: item) }
-                                        .buttonStyle(.plain)
-                                }
+                    } else if signedIn && !steam.refreshing && groups.notInstalled.isEmpty && search.isEmpty {
+                        Text(steam.libraryUpdated == nil ? "Pull down to load your Steam library."
+                             : "No Windows games were found in this Steam library.").foregroundStyle(.secondary)
+                    }
+                    if signedIn && !groups.notInstalled.isEmpty {
+                        Button {
+                            withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .easeInOut(duration: 0.2)) { showUninstalled.toggle() }
+                        } label: {
+                            HStack {
+                                Text("Not installed").font(.headline)
+                                Text("\(groups.notInstalled.count)").font(.subheadline).foregroundStyle(.secondary)
+                                Spacer()
+                                Image(systemName: "chevron.right").font(.caption.weight(.semibold))
+                                    .rotationEffect(.degrees(showUninstalled ? 90 : 0)).foregroundStyle(.secondary)
+                            }.contentShape(Rectangle()).frame(minHeight: 44)
+                        }.buttonStyle(.plain)
+                            .accessibilityValue(showUninstalled ? "Shown" : "Hidden")
+                        if showUninstalled {
+                            LibraryCells(items: groups.notInstalled, layout: layout, width: width) { item, list, dense in
+                                cell(item, list: list, dense: dense)
                             }
                         }
                     }
                 }
+            } else {
+                // Nothing to show yet: an empty placeholder keeps the scan below running.
+                Color.clear.frame(height: 0).accessibilityHidden(true)
             }
         }
         // The library reappears after every session, so this also rereads after a game.
@@ -410,6 +516,11 @@ struct SteamGamesSection: View {
         } message: { Text(steam.error ?? "") }
     }
 
+    private func cell(_ item: SteamGamesRules.Item, list: Bool, dense: Bool) -> some View {
+        Button { select(item) } label: { SteamGameCell(item: item, list: list, dense: dense) }
+            .buttonStyle(.plain)
+    }
+
     /// An installed game (by Madeira's download or by Steam's client) opens its
     /// Game details page; any other game opens its download sheet.
     private func select(_ item: SteamGamesRules.Item) {
@@ -419,10 +530,25 @@ struct SteamGamesSection: View {
             selected = SteamGameSelection(id: item.id)
         }
     }
+}
 
-    private func refreshAll() {
-        model.refresh()
-        if libraryEnabled && steam.signedIn { Task { await steam.refreshLibrary(interactive: true) } }
+/// The signed-out Steam section's invitation to sign in.
+struct SteamSignInCard: View {
+    var signIn: () -> Void
+    var body: some View {
+        Button(action: signIn) {
+            HStack(spacing: 14) {
+                Image(systemName: "person.crop.circle.badge.plus").font(.system(size: 30)).foregroundStyle(.tint)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Sign in to Steam").font(.headline)
+                    Text("See your Steam games here and install them without leaving Madeira.")
+                        .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.leading)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+            }.padding(14)
+                .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
+        }.buttonStyle(.plain)
     }
 }
 
@@ -476,8 +602,12 @@ private extension SteamOwnedLibrary.Download {
     }
 }
 
+/// A game's card, or its row in the library's list layouts (as the fork's
+/// library rows: artwork, name, state and playtime, or the download's progress).
 private struct SteamGameCell: View {
     let item: SteamGamesRules.Item
+    var list = false
+    var dense = false
     @ObservedObject private var steam = SteamOwnedLibrary.shared
     @ObservedObject private var games = SteamGamesModel.shared
 
@@ -485,23 +615,62 @@ private struct SteamGameCell: View {
         let download = steam.downloads[item.id]
         let status = SteamGamesRules.status(installed: item.installed, transfer: download?.transfer,
                                             updateAvailable: steam.updateAvailable(appID: item.id, installedBuild: games.builds[item.id]))
-        VStack(alignment: .leading, spacing: 6) {
-            SteamGameArtwork(appID: item.id).aspectRatio(2.0 / 3.0, contentMode: .fit)
-                .overlay { overlay(download) }
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-                .opacity(item.installed?.installed == true || download != nil ? 1 : 0.6)
-            Text(item.name).font(.subheadline.weight(.semibold)).lineLimit(2)
-            Text(status.label)
-                .font(.caption2.weight(.medium)).lineLimit(1)
-                .padding(.horizontal, 5).padding(.vertical, 4)
-                .background(.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
-                .foregroundStyle(.secondary)
-            if let played = steam.playtime[item.id]?.played {
-                Text(played).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+        let opacity = item.installed?.installed == true || download != nil ? 1 : 0.6
+        Group {
+            if list && dense {
+                // One short row per game.
+                HStack(spacing: 10) {
+                    SteamGameArtwork(appID: item.id).frame(width: 28, height: 42)
+                        .clipShape(RoundedRectangle(cornerRadius: 5)).opacity(opacity)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(item.name).font(.subheadline.weight(.semibold)).lineLimit(1)
+                        if let download { SteamDownloadStatus(download: download) }
+                        else if let summary = steam.playtime[item.id]?.summary {
+                            Text(summary).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                    }
+                    Spacer(minLength: 6)
+                    badge(status.label).fixedSize()
+                }.padding(.horizontal, 8).padding(.vertical, 5)
+                    .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 10))
+            } else if list {
+                HStack(spacing: 14) {
+                    SteamGameArtwork(appID: item.id).frame(width: 48, height: 72)
+                        .overlay { overlay(download) }.clipShape(RoundedRectangle(cornerRadius: 8)).opacity(opacity)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(item.name).font(.headline).lineLimit(2)
+                        if let download { SteamDownloadStatus(download: download) } else { badge(status.label) }
+                        if download == nil, let summary = steam.playtime[item.id]?.summary {
+                            Text(summary).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                    Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+                }.padding(10).background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    SteamGameArtwork(appID: item.id).aspectRatio(2.0 / 3.0, contentMode: .fit)
+                        .overlay { overlay(download) }
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .opacity(opacity)
+                    Text(item.name).font(.subheadline.weight(.semibold)).lineLimit(2)
+                    badge(status.label)
+                    if let played = steam.playtime[item.id]?.played {
+                        Text(played).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                }.padding(4)
             }
         }
-        .padding(4).foregroundStyle(.primary)
+        .foregroundStyle(.primary)
         .accessibilityElement(children: .combine)
+    }
+
+    private func badge(_ text: String) -> some View {
+        Text(text)
+            .font(.caption2.weight(.medium)).lineLimit(1)
+            .padding(.horizontal, 5).padding(.vertical, 4)
+            .background(.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+            .foregroundStyle(.secondary)
     }
 
     @ViewBuilder private func overlay(_ download: SteamOwnedLibrary.Download?) -> some View {
