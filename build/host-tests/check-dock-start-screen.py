@@ -60,8 +60,9 @@ for text in (screen, winios[winios.index('Top-level window census'):winios.index
     require(not re.findall(r'"[^"\n]*\.exe"', text), 'no program names in the rules or the census')
 require('clientImages' not in screen and 'helperImages' not in screen and 'helperPrefixes' not in screen,
         'no program-name lists: owners are classed by folder')
-require('library.begin(.dockSession(title: game.name, width: width, height: height), remember: false, dock: game)' in content,
-        'a Dock start tells the library which game it starts')
+require('library.begin(.dockSession(title: game.name, width: width, height: height), remember: false, dock: game)' in content
+        and 'library.begin(profile, dock: game)' in content,
+        "a Dock start (from Settings or a Steam game's Game details page) tells the library which game it starts")
 require('DockStartScreen.shared.begin(dock, at: launchStarted)' in library and 'DockStartScreen.shared.finish()' in library,
         'the library begins and ends the Dock starting screen with the session')
 poll = library[library.index('    private func poll() {'):]

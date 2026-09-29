@@ -186,6 +186,16 @@ struct LibraryEntry: Codable, Identifiable {
     /// nil = 1) in this game's sessions.
     var controlOpacity: Double?
     var controlSize: Double?
+    /// Processors reported to Windows code in this game's sessions
+    /// (MADEIRA_CPU_COUNT, ntdll); nil = automatic.
+    var cpuCount: Int?
+    /// D3D9 anisotropic filtering limit (DXMT_D9_ANISO_LIMIT: 1, 2, 4 or 8);
+    /// nil = the application's own choice.
+    var anisotropyLimit: Int?
+    /// A Steam game (SteamGames.swift): Madeira Dock starts it by this App ID
+    /// through Valve's client, with Steam's default launch option.
+    /// `relativePath` is then its install folder, relative to drive_c.
+    var steamAppID: Int?
 
     var displayMode: DisplayMode { display.flatMap(DisplayMode.init(rawValue:)) ?? .fit }
 
@@ -229,6 +239,10 @@ struct LibraryEntry: Codable, Identifiable {
         configureLaunch()
         // Unset unless chosen: FEX's own default then applies, as for any other launch.
         if reducedX87 { setenv("FEX_X87REDUCEDPRECISION", "1", 1) } else { unsetenv("FEX_X87REDUCEDPRECISION") }
+        // Exported only when chosen: unset keeps the engine's own default (and any
+        // madeira.cfg setting), as before these choices existed.
+        if let cpuCount, (1..<64).contains(cpuCount) { setenv("MADEIRA_CPU_COUNT", String(cpuCount), 1) }
+        if let anisotropyLimit, [1, 2, 4, 8].contains(anisotropyLimit) { setenv("DXMT_D9_ANISO_LIMIT", String(anisotropyLimit), 1) }
         madeira_set_vsync_locked(effectiveFPSMode)
         fputs("[frontend] launch profile applied\n", stderr)
         LogStore.shared.log("[display-shape] resolution=\(resolution) mode=\(displayMode.rawValue)")
@@ -236,6 +250,12 @@ struct LibraryEntry: Codable, Identifiable {
 
     /// What the bridge starts. Set on the main thread before the session begins.
     func configureLaunch() {
+        // A Steam game: Madeira Dock has set what starts (ContentView.startDock);
+        // the virtual monitor follows this entry's Resolution, as below.
+        if steamAppID != nil {
+            GuestDisplay.configureSessionDefault(view: CGSize(width: 1280, height: 720), knob: resolution)
+            return
+        }
         setenv("MADEIRA_EXE", desktop == true ? "explorer.exe" : windowsPath, 1)
         setenv("MADEIRA_ARGS", launchArguments, 1)
         if desktop == true { setenv("MADEIRA_DESKTOP", "1", 1) } else { unsetenv("MADEIRA_DESKTOP") }
@@ -343,6 +363,34 @@ final class LibraryModel: ObservableObject {
     }
     func remove(_ id: UUID) {
         persist(entries.filter { $0.id != id })
+    }
+    /// A Steam game's library entry, which holds its per-game settings
+    /// (SteamGames.swift). A game without one gets a new entry made from what
+    /// Steam installed; it is saved when its details page closes or it is
+    /// played. An existing entry follows the install folder Steam records.
+    func steamEntry(_ game: DockGame, title: String? = nil) -> LibraryEntry {
+        let folder = game.library + "/common/" + game.installDir
+        if var entry = entries.first(where: { $0.steamAppID == game.id }) {
+            entry.relativePath = folder
+            return entry
+        }
+        var entry = LibraryEntry(title: title ?? game.name, relativePath: folder, bits: 0)
+        entry.steamAppID = game.id
+        entry.folderBytes = SteamInstallFiles.sizeOnDisk(appID: game.id, steamApps: Self.drive.appendingPathComponent(game.library, isDirectory: true))
+        return entry
+    }
+    /// A Steam download finished (SteamOwnedLibrary): the game gets its library
+    /// entry, or an existing one keeps its title, artwork and settings.
+    func upsertSteam(_ game: DockGame, title: String) {
+        guard !readOnly else { return }
+        var entry = steamEntry(game, title: title)
+        entry.folderBytes = SteamInstallFiles.sizeOnDisk(appID: game.id, steamApps: Self.drive.appendingPathComponent(game.library, isDirectory: true)) ?? entry.folderBytes
+        save(entry)
+    }
+    /// A Steam game was uninstalled: its entry goes with its files.
+    func removeSteam(appID: Int) {
+        guard entries.contains(where: { $0.steamAppID == appID }) else { return }
+        persist(entries.filter { $0.steamAppID != appID })
     }
     private func persist(_ next: [LibraryEntry]) {
         guard !readOnly else { return }
@@ -890,7 +938,8 @@ struct LibraryView: View {
     // Collapsed state of the games section.
     @AppStorage("madeiraLibraryHideOthers") private var hideGames = false
     private var entries: [LibraryEntry] {
-        let visible = model.entries.filter { $0.desktop != true && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)) }
+        // Steam games are listed in their own section (SteamGames.swift).
+        let visible = model.entries.filter { $0.desktop != true && $0.steamAppID == nil && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)) }
         if sort == "added" { return visible.reversed() }
         return visible.sorted {
             if sort == "played", $0.lastPlayed != $1.lastPlayed { return ($0.lastPlayed ?? .distantPast) > ($1.lastPlayed ?? .distantPast) }
@@ -987,9 +1036,10 @@ struct LibraryView: View {
                         .id(LibraryEntry.desktopID)
                         .overlay(RoundedRectangle(cornerRadius: 22).stroke(focused == LibraryEntry.desktopID && controller.connected ? Color.cyan : .clear, lineWidth: 3))
                 }
-                // Installed Steam games, started through Madeira Dock (SteamGames.swift).
-                SteamGamesSection(search: search, startDock: startDock)
-                if model.entries.filter({ $0.desktop != true }).isEmpty {
+                // Steam games, started through Madeira Dock (SteamGames.swift); an installed
+                // one opens its Game details page like any library game.
+                SteamGamesSection(search: search, open: { selected = $0 })
+                if model.entries.filter({ $0.desktop != true && $0.steamAppID == nil }).isEmpty {
                     ContentUnavailableView("Make yourself at home", systemImage: "gamecontroller", description: Text("Copy a game's folder into Madeira › wine › drive_c with the Files app, then tap + and choose its .exe."))
                 } else {
                     VStack(alignment: .leading, spacing: 14) {
@@ -1190,6 +1240,17 @@ struct LibraryDetail: View {
     }
     private func start() {
         guard !leaving else { return }
+        // A Steam game starts through Madeira Dock (ContentView.launchLibraryEntry)
+        // once its files are complete and Dock can sign in.
+        if let appID = entry.steamAppID {
+            if SteamOwnedLibrary.shared.downloads[appID] != nil {
+                error = "This game's update has not finished. Resume it and wait for it to complete before playing."; return
+            }
+            let installed = SteamGamesModel.shared.games.first { $0.id == appID }?.installed ?? false
+            if let blocker = SteamGamesRules.blocker(installed: installed, client: MadeiraDock.clientInstalled, signedIn: SteamSignIn.isSignedIn) {
+                error = blocker; return
+            }
+        }
         leaving = true
         let profile = entry
         // Give the pressed state a display turn before saving and handing off.
@@ -1197,16 +1258,26 @@ struct LibraryDetail: View {
             model.save(profile); play(profile)
         }
     }
+    /// A Steam game without a chosen cover shows Steam's store artwork.
+    @ViewBuilder private func artwork(backdrop: Bool) -> some View {
+        if let appID = entry.steamAppID, entry.coverFile == nil {
+            SteamGameArtwork(appID: appID)
+        } else {
+            LibraryArtwork(entry: entry, backdrop: backdrop)
+        }
+    }
     var body: some View {
         NavigationStack {
             Form {
                 Section {
                     HStack(spacing: 20) {
-                        LibraryArtwork(entry: entry).frame(width: 120, height: 180).clipShape(RoundedRectangle(cornerRadius: 14))
+                        artwork(backdrop: false).frame(width: 120, height: 180).clipShape(RoundedRectangle(cornerRadius: 14))
                         VStack(alignment: .leading, spacing: 12) {
                             Text(entry.title).font(.title2.bold())
                             LibraryBadges(entry: entry)
-                            if let played = entry.lastPlayed {
+                            if let appID = entry.steamAppID, let summary = SteamOwnedLibrary.shared.playtime[appID]?.summary {
+                                Text(summary).font(.subheadline).foregroundStyle(.secondary)
+                            } else if let played = entry.lastPlayed {
                                 Text("Last played \(played.formatted(.relative(presentation: .named)))").font(.subheadline).foregroundStyle(.secondary)
                             }
                             Button(action: start) { HStack(spacing: 10) { Image(systemName: "play.fill"); Text("Play").fontWeight(.semibold) }.frame(minWidth: 100, minHeight: 30) }
@@ -1214,7 +1285,7 @@ struct LibraryDetail: View {
                         }
                     }.padding(.vertical, 24)
                         .listRowBackground(
-                            LibraryArtwork(entry: entry, backdrop: true).blur(radius: 4)
+                            artwork(backdrop: true).blur(radius: 4)
                                 .overlay(Color(uiColor: .secondarySystemGroupedBackground).opacity(0.48))
                                 .overlay(alignment: .bottom) {
                                     LinearGradient(colors: [.clear, Color(uiColor: .secondarySystemGroupedBackground)], startPoint: .top, endPoint: .bottom).frame(height: 70)
@@ -1224,8 +1295,12 @@ struct LibraryDetail: View {
                 if entry.desktop != true { Section("Library details") {
                     TextField("Title", text: $entry.title)
                     Button("Choose cover image", systemImage: "photo") { importCover = true }
-                    if entry.coverFile != nil { Button("Remove cover image") { entry.coverFile = nil } }
+                    if entry.coverFile != nil { Button(entry.steamAppID != nil ? "Use Steam artwork" : "Remove cover image") { entry.coverFile = nil } }
                 } }
+                // How a Steam game starts sits under its library details (SteamGames.swift).
+                if entry.steamAppID != nil {
+                    SteamEntrySection(entry: $entry) { leaving = true; dismiss() }
+                }
                 Section("Display") {
                     // The Windows screen the game renders for (and the Desktop's size).
                     Picker("Resolution", selection: $entry.resolution) {
@@ -1243,7 +1318,17 @@ struct LibraryDetail: View {
                 }
                 Section {
                     Toggle("Reduced-precision x87", isOn: $entry.reducedX87)
-                    if entry.desktop != true {
+                    // Exported for this game only when chosen (applyEnvironment).
+                    Picker("CPU cores reported", selection: Binding(get: { entry.cpuCount ?? 0 }, set: { entry.cpuCount = $0 == 0 ? nil : $0 })) {
+                        Text("Automatic").tag(0)
+                        ForEach([1, 2, 4, 6], id: \.self) { Text("\($0)").tag($0) }
+                    }
+                    Picker("D3D9 anisotropic filtering", selection: Binding(get: { entry.anisotropyLimit ?? 0 }, set: { entry.anisotropyLimit = $0 == 0 ? nil : $0 })) {
+                        Text("Application default").tag(0)
+                        ForEach([1, 2, 4, 8], id: \.self) { Text("Up to \($0)×").tag($0) }
+                    }
+                    // A Steam game starts with Steam's own launch option through Madeira Dock.
+                    if entry.desktop != true && entry.steamAppID == nil {
                         TextField("Launch arguments", text: $entry.arguments, axis: .vertical).autocorrectionDisabled().textInputAutocapitalization(.never)
                     }
                 } header: { Text("Compatibility & performance") } footer: {
@@ -1261,7 +1346,13 @@ struct LibraryDetail: View {
                     }
                     Text("Arrange buttons and choose XInput, mouse, or keyboard actions from the in-game menu.").font(.caption).foregroundStyle(.secondary)
                 }
-                if entry.desktop != true {
+                if entry.steamAppID != nil {
+                    Section {
+                        Text(entry.windowsPath).font(.caption.monospaced()).textSelection(.enabled)
+                    } header: { Text("Executable") } footer: {
+                        Text("Valve's client starts the game's default Steam launch option from this folder.")
+                    }
+                } else if entry.desktop != true {
                     Section("Executable") { Text(entry.windowsPath).font(.caption.monospaced()).textSelection(.enabled) }
                     Section { Button("Remove from library", role: .destructive) { remove = true } }
                 }

@@ -4,9 +4,9 @@ Madeira itself: GPL-3.0-or-later (LICENSE-MADEIRA-GPL-3.0.txt) with the
 Madeira Converter Exception, version 1 (LICENSE-MADEIRA-EXCEPTION.txt),
 which is a DRAFT and not in effect until adopted in a tagged release.
 
-Steam sign-in (SwiftSteam): derived from Jfishin's Madeira Steam client and
-used with his permission; GPL-3.0-or-later with the exception, (C) 2026
-Jfishin, 125hz.
+Steam sign-in, owned library and downloads (SwiftSteam): derived from
+Jfishin's Madeira Steam client and used with his permission; GPL-3.0-or-later
+with the exception, (C) 2026 Jfishin, 125hz.
 
 Madeira Dock (arm64ec-windows/dockhost.exe, when built): GPL-3.0-or-later
 with the exception, (C) 2026 125hz. Source: https://github.com/125hz/madeira-dock
@@ -36,6 +36,11 @@ Statically linked into the application binary:
   elects LGPL-3.0-or-later (LGPL-3.0.txt).
   Source tarballs and SHA-256 sums for GnuTLS, Nettle and GMP: the Madeira
   repository, build/gnutls-ios/src, built by build/gnutls-ios/build.sh.
+- Zstandard educational decoder (app/Madeira/SwiftSteam/zstd_edu.c, for
+  Steam's zstd content chunks): (C) Meta Platforms, Inc. and affiliates;
+  BSD-3-Clause selected from its BSD / GPL-2.0 dual licence (ZSTD-BSD.txt).
+- liblzma: public domain / 0BSD, the iOS SDK's system library, linked
+  dynamically; nothing is bundled.
 - FFmpeg 7.1.1 (libavformat, libavcodec, libavutil, libswresample):
   LGPL-2.1-or-later (LGPL-2.1.txt), configured without any GPL, version3 or
   non-free component. Source tarball (the unmodified upstream release from

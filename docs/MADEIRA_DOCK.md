@@ -91,7 +91,11 @@ arguments are not supported.
 
 1. Madeira checks: JIT is enabled, no session has run in this app run,
    `dockhost.exe` is bundled, the client DLL exists, the game is fully
-   installed and its folder exists, and a sign-in is stored.
+   installed and its folder exists, and a sign-in is stored. Then the app's
+   own Steam connection (the owned library, `docs/STEAM_LIBRARY.md`) logs off
+   and closes its socket, and Madeira waits for that before going on: a second
+   online sign-in of the same account would replace the client's session. It
+   stays off until Dock's report or session is over. The checks run again.
 2. **One-use sign-in transfer.** `SteamSignIn.credentialsForDock()` supplies
    the account name and refresh token from the Keychain. Madeira writes them,
    with the account's SteamID (taken from the token's subject claim to select
@@ -137,7 +141,8 @@ arguments are not supported.
 
 ## Starting screen
 
-A Dock start from the library is a desktop session, and the library's
+A Dock start from the library (Settings › Steam › Madeira Dock, or Play on a
+Steam game's Game details page) is a desktop session, and the library's
 starting screen used to end on the desktop's first GDI frame: explorer's
 windows and the host's console window, seconds before the game. The user saw
 the Wine desktop instead of the game. Now (`DockStartScreen.swift`) the
@@ -299,15 +304,18 @@ configured engine again.
 
 ## Not included (compared with the fork)
 
-- **Game installation and library integration.** The fork's Steam library and
-  depot downloads were rejected with #35 and are not coming back here. The
-  library offers Dock's sheet from Settings › Steam (`docs/LIBRARY.md`).
+- **Game installation and library integration.** Dock itself neither installs
+  nor removes games. The owned library and downloads are a separate part
+  (`docs/STEAM_LIBRARY.md`) that writes the install records Dock reads; a
+  Steam game's Game details page starts it through Dock. The library also
+  offers Dock's sheet from Settings › Steam (`docs/LIBRARY.md`).
 - **One-time installs, fork extras.** The fork also marked runtimes it
   recognised by file name as done without running them, and recorded such a
   runtime as done after a failed run. Those name rules are gone here (every
   program is treated alike; the per-game choice keeps failures from running
-  at every start). The fork's reset on uninstall is gone too: Dock neither
-  installs nor removes games. The fork's "skip" button on its starting screen
+  at every start). The fork's reset on uninstall exists only in Madeira's own uninstall
+  (`docs/STEAM_LIBRARY.md`), which sets the game's choice back to "Run at next
+  start"; Dock neither installs nor removes games. The fork's "skip" button on its starting screen
   needs a session stop this branch does not have; choose "Skip" in the sheet
   before the start instead.
 - **Automatic session end and the exit-status hook.** These need the ntdll
