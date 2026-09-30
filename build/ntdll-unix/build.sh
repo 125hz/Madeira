@@ -116,6 +116,14 @@ compile_unixlib "$CRYPTO_DIR/crypt32_unixlib_ios.c" "crypt32_unixlib" "crypt32" 
 # iOS-Madeira 2026-08-03 (#79 transport): in-process NSI TCP connection
 # tables (nsiproxy.sys is not shipped; PE nsi.dll falls back to this).
 compile_one "$BUILD_DIR/nsi_unixlib_ios.c" "nsi_unixlib_ios"
+# iOS-Madeira: the other NSI tables (network interfaces, IP addresses,
+# routes) from Wine's own BSD providers, wine/dlls/nsiproxy.sys/ndis.c and
+# ip.c, behind nsiproxy.sys's table dispatcher (nsi_network_ios.c).
+# shims/net/route.h declares the routing-message ABI they read, which the
+# iPhoneOS SDK does not ship.
+compile_one "$BUILD_DIR/nsi_network_ios.c" "nsi_network_ios"
+compile_one "$BUILD_DIR/nsi_ndis_ios.c" "nsi_ndis"
+compile_one "$BUILD_DIR/nsi_ip_ios.c" "nsi_ip"
 # MADEIRA 2026-09-19: winegstreamer's unix side is GStreamer, which does not
 # exist on iOS -- so the Windows WMA decoder MFT (CLSID_CWMADecMediaObject ->
 # wmadmod.dll -> CLSID_wg_wma_decoder in winegstreamer.dll) was absent and
@@ -194,6 +202,7 @@ echo ""
 echo "=== Building libntdll_unix.a ==="
 ar rcs "$OBJ_DIR/libntdll_unix.a" \
     "$OBJ_DIR/audio_null_ios.o" "$OBJ_DIR/madsync.o" "$OBJ_DIR/nsi_unixlib_ios.o" \
+    "$OBJ_DIR/nsi_network_ios.o" "$OBJ_DIR/nsi_ndis.o" "$OBJ_DIR/nsi_ip.o" \
     "$OBJ_DIR/gnutls_symtab_ios.o" "$OBJ_DIR/ws2_32_unixlib.o" \
     "$OBJ_DIR/bcrypt_unixlib.o" "$OBJ_DIR/secur32_unixlib.o" "$OBJ_DIR/crypt32_unixlib.o" \
     "$OBJ_DIR/dwrite_unixlib.o" \
