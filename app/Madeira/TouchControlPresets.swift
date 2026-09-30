@@ -77,11 +77,13 @@ enum ControlPresetLayout {
         CGRect(x: s.width / 2 - 100, y: 0, width: 200, height: 76)
     }
 
-    /// The drawn circle's bounding box, in points: every control is round,
-    /// `baseDiameter` × its scale across, centred on its normalised position.
+    /// The drawn bounding box, in points: `baseDiameter` × the control's scale
+    /// for a round button, the pad button's own shape otherwise (a wide
+    /// shoulder, a Start/Select pill), centred on its normalised position.
     static func box(_ c: TouchControl, screen s: ControlPresetScreen) -> CGRect {
-        let d = baseDiameter * c.scale
-        return CGRect(x: c.nx * s.width - d / 2, y: c.ny * s.height - d / 2, width: d, height: d)
+        let z = c.action.controlSize(diameter: CGFloat(baseDiameter * c.scale))
+        return CGRect(x: c.nx * s.width - Double(z.width) / 2, y: c.ny * s.height - Double(z.height) / 2,
+                      width: Double(z.width), height: Double(z.height))
     }
 
     /// The built-in controller layout, using the editor's controller mappings:
@@ -120,10 +122,11 @@ enum ControlPresetLayout {
         add("RS", stickScale, rStickX, stickY)
         let stickTop = stickY - stick / 2
 
-        // Shoulders: one row in each top corner, trigger outermost.
-        let sh = d(shoulderScale)
+        // Shoulders: one row in each top corner, trigger outermost. They are
+        // drawn 1.5× as wide as they are tall (ControlAction.controlSize).
+        let sh = d(shoulderScale), shW = sh * 1.5
         let shoulderY = T + 6 * k + sh / 2
-        let outer = sh / 2 + 6 * k, inner = outer + sh + 10 * k
+        let outer = shW / 2 + 6 * k, inner = outer + shW + 10 * k
         add("LT", shoulderScale, L + outer, shoulderY)
         add("LB", shoulderScale, L + inner, shoulderY)
         add("RB", shoulderScale, W - R - inner, shoulderY)

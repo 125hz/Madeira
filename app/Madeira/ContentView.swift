@@ -3185,6 +3185,54 @@ enum ControlAction: Codable, Equatable, Hashable {
     var padName: String? { if case .pad(let name) = self { return name }; return nil }
     var isPadStick: Bool { padName == "LS" || padName == "RS" }
 
+    // ------------------------------------------------------------------
+    // HOW A VIRTUAL CONTROLLER BUTTON IS DRAWN. The shape is part of the
+    // button's identity: a wide rounded rectangle says "shoulder", a capsule
+    // says "system", a coloured circle says "face", so a layout reads without
+    // its labels. Saved layouts keep their names ("Menu", "View", "D↑"); only
+    // the drawing changes.
+    // ------------------------------------------------------------------
+    enum PadFace { case round, wide, capsule, small }
+
+    var padFace: PadFace? {
+        guard let n = padName else { return nil }
+        switch n {
+        case "LB", "RB", "LT", "RT": return .wide
+        case "Menu", "View":         return .capsule
+        case "L3", "R3":             return .small
+        default:                     return .round
+        }
+    }
+    /// SF Symbol drawn instead of a label: the four D-pad directions.
+    var padGlyph: String? {
+        switch padName {
+        case "D↑": return "arrowtriangle.up.fill"
+        case "D↓": return "arrowtriangle.down.fill"
+        case "D←": return "arrowtriangle.left.fill"
+        case "D→": return "arrowtriangle.right.fill"
+        default:   return nil
+        }
+    }
+    /// The text drawn on the control. Menu/View are the XInput names the
+    /// layout stores; the buttons themselves read START/SELECT.
+    var padFaceLabel: String {
+        switch padName {
+        case "Menu": return "START"
+        case "View": return "SELECT"
+        default:     return label
+        }
+    }
+    /// Drawn size, given the layout's diameter for a round button. Shoulders
+    /// are wide, Start/Select are small pills, stick clicks are small circles.
+    func controlSize(diameter d: CGFloat) -> CGSize {
+        switch padFace {
+        case .wide:    return CGSize(width: d * 1.5, height: d * 0.66)
+        case .capsule: return CGSize(width: d * 1.2, height: d * 0.5)
+        case .small:   return CGSize(width: d * 0.8, height: d * 0.8)
+        default:       return CGSize(width: d, height: d)
+        }
+    }
+
     var label: String {
         switch self {
         case .none:            return "—"
@@ -3266,6 +3314,9 @@ final class TouchControlsModel: ObservableObject {
     static func diameter(_ c: TouchControl) -> CGFloat {
         baseDiameter * CGFloat(c.scale) * CGFloat(shared.sizeScale)
     }
+    /// The drawn frame: the diameter for round controls, the pad button's own
+    /// shape otherwise (ControlAction.controlSize).
+    static func size(_ c: TouchControl) -> CGSize { c.action.controlSize(diameter: diameter(c)) }
 
     private var loading = false
     private static var url: URL {
@@ -3419,11 +3470,7 @@ struct TouchControlsOverlay: View {
             ZStack(alignment: .top) {
                 if landscape {
                     if (m.visible || m.editing) && !library.blocksGameplayTouch {
-                        ForEach(m.controls) { c in
-                            TouchControlButton(control: c, screen: geo.size)
-                                // A library session's Control opacity; full while editing.
-                                .opacity(session && !m.editing ? library.opacity : 1)
-                        }
+                        controls(geo.size, session: session)
                     }
                     if session && !m.editing { LibraryHUD() } else { topBar }
                     if m.editing, let i = m.index(of: m.selected) {
@@ -3443,6 +3490,27 @@ struct TouchControlsOverlay: View {
             .onDisappear { GamepadInput.shared.configureTouch(controls: []) }
         }
         .ignoresSafeArea()
+    }
+
+    /// Every control in ONE GlassEffectContainer: on iOS 26 the system merges
+    /// glass shapes that come within `spacing` of each other, so a D-pad cross
+    /// or a face diamond pinched tight reads as one piece of glass and a button
+    /// dragged next to another flows into it. Before 26 the same views stack
+    /// as plain material.
+    @ViewBuilder private func controls(_ screen: CGSize, session: Bool) -> some View {
+        let buttons = ForEach(m.controls) { c in
+            TouchControlButton(control: c, screen: screen)
+                // A library session's Control opacity; full while editing.
+                .opacity(session && !m.editing ? library.opacity : 1)
+        }
+        if #available(iOS 26.0, *) {
+            GlassEffectContainer(spacing: 28) {
+                ZStack { buttons }
+                    .frame(width: screen.width, height: screen.height, alignment: .topLeading)
+            }
+        } else {
+            buttons
+        }
     }
 
     private func configureGamepad(landscape: Bool) {
@@ -3548,16 +3616,44 @@ struct TouchControlsOverlay: View {
 }
 
 /// Shared glass backing, with the pre-26 fallback the codebase already uses.
+/// A circle, a capsule or a rounded rectangle; `tint` colours the glass itself
+/// (the four face buttons), so the colour is a hue on the material rather than
+/// an opaque disc. Inside a GlassEffectContainer these merge when they come
+/// close, which is what makes a tight D-pad or face diamond read as one piece.
 struct GlassShape: View {
     var circle = false
+    var capsule = false
+    var cornerRadius: CGFloat = 18
+    var tint: Color? = nil
+    private var shape: AnyShape {
+        if circle { return AnyShape(Circle()) }
+        if capsule { return AnyShape(Capsule()) }
+        return AnyShape(RoundedRectangle(cornerRadius: cornerRadius))
+    }
     var body: some View {
         if #available(iOS 26.0, *) {
-            if circle { Circle().fill(.clear).glassEffect(.regular, in: Circle()) }
-            else { RoundedRectangle(cornerRadius: 18).fill(.clear)
-                     .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18)) }
+            if let tint {
+                shape.fill(.clear).glassEffect(.regular.tint(tint.opacity(0.55)), in: shape)
+            } else {
+                shape.fill(.clear).glassEffect(.regular, in: shape)
+            }
         } else {
-            if circle { Circle().fill(.ultraThinMaterial) }
-            else { RoundedRectangle(cornerRadius: 18).fill(.ultraThinMaterial) }
+            shape.fill(.ultraThinMaterial)
+            if let tint { shape.fill(tint.opacity(0.35)) }
+        }
+    }
+}
+
+extension ControlAction {
+    /// Xbox face colours. Everything else is uncoloured: a wash of tint on every
+    /// button would make the four that mean something unreadable.
+    var padTint: Color? {
+        switch padName {
+        case "A": return Color(red: 0.36, green: 0.76, blue: 0.30)
+        case "B": return Color(red: 0.88, green: 0.28, blue: 0.24)
+        case "X": return Color(red: 0.24, green: 0.53, blue: 0.92)
+        case "Y": return Color(red: 0.96, green: 0.76, blue: 0.16)
+        default:  return nil
         }
     }
 }
@@ -3572,8 +3668,57 @@ struct TouchControlButton: View {
     @State private var padVector = CGSize.zero
 
     private var diameter: CGFloat { TouchControlsModel.diameter(control) }
+    private var size: CGSize { TouchControlsModel.size(control) }
     private var isStick: Bool { control.action.stickKeys != nil || control.action.isPadStick }
     private var isSelected: Bool { m.editing && m.selected == control.id }
+
+    /// The resting outline and the edit-mode selection ring, in the shape the
+    /// control actually has.
+    private var outline: AnyShape {
+        switch control.action.padFace {
+        case .some(.wide):    return AnyShape(RoundedRectangle(cornerRadius: size.height * 0.30))
+        case .some(.capsule): return AnyShape(Capsule())
+        default:              return AnyShape(Circle())
+        }
+    }
+
+    /// A controller button: coloured circle (A/B/X/Y), arrow (D-pad), wide
+    /// shoulder (LB/RB/LT/RT), START/SELECT pill, small L3/R3.
+    @ViewBuilder private var padFace: some View {
+        let a = control.action
+        switch a.padFace ?? .round {
+        case .round:
+            GlassShape(circle: true, tint: a.padTint)
+            if let g = a.padGlyph {
+                Image(systemName: g)
+                    .font(.system(size: size.height * 0.40, weight: .semibold))
+                    .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.88))
+            } else {
+                Text(a.padFaceLabel)
+                    .font(.system(size: size.height * (a.padFaceLabel.count > 2 ? 0.24 : 0.40), weight: .semibold))
+                    .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.92))
+            }
+        case .small:
+            GlassShape(circle: true)
+            Text(a.padFaceLabel)
+                .font(.system(size: size.height * 0.36, weight: .semibold))
+                .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.85))
+        case .wide:
+            GlassShape(cornerRadius: size.height * 0.30)
+            Text(a.padFaceLabel)
+                .font(.system(size: size.height * 0.42, weight: .semibold))
+                .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.88))
+        case .capsule:
+            GlassShape(capsule: true)
+            Text(a.padFaceLabel)
+                .font(.system(size: size.height * 0.40, weight: .semibold))
+                .kerning(0.6)
+                .minimumScaleFactor(0.5)
+                .lineLimit(1)
+                .padding(.horizontal, 6)
+                .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.85))
+        }
+    }
 
     var body: some View {
         ZStack {
@@ -3591,6 +3736,8 @@ struct TouchControlButton: View {
                     .frame(width: JoystickFace.padRadius * 2,
                            height: JoystickFace.padRadius * 2)
                     .scaleEffect(diameter / (JoystickFace.padRadius * 2))
+            } else if control.action.isPad {
+                padFace
             } else {
                 GlassShape(circle: true)
                 Text(control.action.label)
@@ -3599,10 +3746,10 @@ struct TouchControlButton: View {
                     .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.85))
             }
         }
-        .frame(width: diameter, height: diameter)
-        .overlay(Circle().stroke(.white.opacity(isSelected ? 0.95
-                                                : (isStick ? 0 : 0.28)),
-                                 lineWidth: isSelected ? 2 : 1))
+        .frame(width: size.width, height: size.height)
+        .overlay(outline.stroke(.white.opacity(isSelected ? 0.95
+                                               : (isStick ? 0 : 0.28)),
+                                lineWidth: isSelected ? 2 : 1))
         // A stick must not shrink under the thumb; only round buttons do that.
         .scaleEffect(!isStick && isDown ? 0.92 : 1.0)
         // ml890: no press animation. Pressing the on-screen Enter key killed the
@@ -3876,7 +4023,9 @@ struct MappingPanel: View {
                                            ("LT", .pad("LT")), ("RT", .pad("RT"))])
             section("Sticks", [("LS", .pad("LS")), ("RS", .pad("RS")),
                                ("L3", .pad("L3")), ("R3", .pad("R3"))])
-            section("System", [("Menu", .pad("Menu")), ("View", .pad("View")),
+            // Start and Select are XInput's Menu and View; the layout keeps the
+            // XInput names, the chips and the buttons read Start/Select.
+            section("System", [("Start", .pad("Menu")), ("Select", .pad("View")),
                                ("Guide", .pad("Guide"))])
         }
     }
