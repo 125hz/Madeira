@@ -112,7 +112,7 @@ enum ControlPresetLayout {
         }
         func d(_ scale: Double) -> Double { baseDiameter * scale }
         let stickScale = 1.45 * k, faceScale = 0.78 * k, dpadScale = 0.7 * k
-        let shoulderScale = 0.8 * k, systemScale = 0.75 * k, clickScale = 0.62 * k
+        let shoulderScale = 0.88 * k, systemScale = 0.75 * k, clickScale = 0.62 * k
 
         // Sticks: bottom corners, clear of the home indicator.
         let stick = d(stickScale)
@@ -122,23 +122,28 @@ enum ControlPresetLayout {
         add("RS", stickScale, rStickX, stickY)
         let stickTop = stickY - stick / 2
 
-        // Shoulders: one row in each top corner, trigger outermost. They are
-        // drawn 1.5× as wide as they are tall (ControlAction.controlSize).
-        let sh = d(shoulderScale), shW = sh * 1.5
-        let shoulderY = T + 6 * k + sh / 2
-        let outer = shW / 2 + 6 * k, inner = outer + shW + 10 * k
-        add("LT", shoulderScale, L + outer, shoulderY)
-        add("LB", shoulderScale, L + inner, shoulderY)
-        add("RB", shoulderScale, W - R - inner, shoulderY)
-        add("RT", shoulderScale, W - R - outer, shoulderY)
-        let rowBottom = shoulderY + sh / 2
+        // Shoulders: a column in each top corner, trigger above bumper as on
+        // the controller. Drawn 1.6× as wide as they are tall and 0.74 d high
+        // (ControlAction.controlSize), so the column is two of those plus a gap.
+        let sh = d(shoulderScale), shW = sh * 1.6, shH = sh * 0.74
+        let shoulderX = shW / 2 + 6 * k
+        let triggerY = T + 6 * k + shH / 2
+        let bumperY = triggerY + shH + 8 * k
+        add("LT", shoulderScale, L + shoulderX, triggerY)
+        add("LB", shoulderScale, L + shoulderX, bumperY)
+        add("RB", shoulderScale, W - R - shoulderX, bumperY)
+        add("RT", shoulderScale, W - R - shoulderX, triggerY)
+        // The columns' inner edge: the D-pad cross and the face diamond sit
+        // inboard of it, so they can rise above the bumper row.
+        let columnInner = shoulderX + shW / 2 + 10 * k
 
         // D-pad: a cross of four buttons just above the left stick (not
         // mid-screen on a tall tablet), kept below the shoulder row.
         // The cross sits a little inboard of the stick so its left arm stays
         // inside the safe area with the wider spacing.
-        let dp = d(dpadScale), arm = dp + 12 * k, dpadX = lStickX + 8 * k
-        let dpadY = max(stickTop - 22 * k - arm - dp / 2, rowBottom + 12 * k + arm + dp / 2)
+        let dp = d(dpadScale), arm = dp + 12 * k
+        let dpadX = max(lStickX + 8 * k, L + columnInner + arm + dp / 2)
+        let dpadY = max(stickTop - 22 * k - arm - dp / 2, T + 6 * k + arm + dp / 2)
         add("D↑", dpadScale, dpadX, dpadY - arm)
         add("D←", dpadScale, dpadX - arm, dpadY)
         add("D→", dpadScale, dpadX + arm, dpadY)
@@ -148,8 +153,8 @@ enum ControlPresetLayout {
         // sit o·√2 apart, which clears one face button's diameter.
         let face = d(faceScale)
         let o = face / 2 + 24 * k
-        let cx = rStickX - 8 * k
-        let cy = max(stickTop - 22 * k - o - face / 2, rowBottom + 12 * k + o + face / 2)
+        let cx = min(rStickX - 8 * k, W - R - columnInner - o - face / 2)
+        let cy = max(stickTop - 22 * k - o - face / 2, T + 6 * k + o + face / 2)
         add("Y", faceScale, cx, cy - o)
         add("X", faceScale, cx - o, cy)
         add("B", faceScale, cx + o, cy)

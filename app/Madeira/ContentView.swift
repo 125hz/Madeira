@@ -3226,7 +3226,7 @@ enum ControlAction: Codable, Equatable, Hashable {
     /// are wide, Start/Select are small pills, stick clicks are small circles.
     func controlSize(diameter d: CGFloat) -> CGSize {
         switch padFace {
-        case .wide:    return CGSize(width: d * 1.5, height: d * 0.66)
+        case .wide:    return CGSize(width: d * 1.6, height: d * 0.74)
         case .capsule: return CGSize(width: d * 1.2, height: d * 0.5)
         case .small:   return CGSize(width: d * 0.8, height: d * 0.8)
         default:       return CGSize(width: d, height: d)
@@ -3743,11 +3743,14 @@ struct TouchControlButton: View {
     var body: some View {
         ZStack {
             if control.action.isPadStick {
-                GlassShape(circle: true)
-                Circle().fill(.white.opacity(isDown ? 0.55 : 0.25))
-                    .frame(width: diameter * 0.42, height: diameter * 0.42)
-                    .offset(x: padVector.width * diameter * 0.29, y: padVector.height * diameter * 0.29)
-                Text(control.action.label).font(.caption).foregroundStyle(.white.opacity(0.8))
+                ZStack {
+                    Circle().fill(.white.opacity(isDown ? 0.55 : 0.25))
+                        .frame(width: diameter * 0.42, height: diameter * 0.42)
+                        .offset(x: padVector.width * diameter * 0.29, y: padVector.height * diameter * 0.29)
+                    Text(control.action.label).font(.caption).foregroundStyle(.white.opacity(0.8))
+                }
+                .frame(width: diameter, height: diameter)
+                .glassFace(GlassShape(circle: true))
             } else if control.action.stickKeys != nil {
                 // Reuse the portrait pad's face so both look and animate the
                 // same; scale it to whatever size this control was pinched to.
