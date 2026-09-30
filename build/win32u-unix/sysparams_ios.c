@@ -180,21 +180,53 @@ static struct monitor virtual_monitor =
 };
 
 #ifdef WINE_IOS
-/* S2 virtual desktop: screen size for the virtual monitor. The app sets
- * MADEIRA_SCREEN_W/H (device pixels, e.g. 1170x2532) in desktop mode so
- * the wine desktop covers the whole display; default stays 1024x768 for
- * the games path. */
+/* The size of the virtual monitor -- the single monitor this port reports
+ * (lock_display_devices always takes the virtual-monitor branch here).
+ *
+ * Two values, not one:
+ *
+ *  - the SESSION DEFAULT, which the app publishes in MADEIRA_SCREEN_W/H
+ *    before the first guest thread runs (MADEIRA_SCREEN_SRC names where it
+ *    came from). ChangeDisplaySettings(NULL,0) and CDS_RESET restore it,
+ *    exactly as they restore the registry mode on Windows.
+ *
+ *  - the CURRENT mode, which is whatever a guest last selected through
+ *    ChangeDisplaySettings(Ex). A mode request used to be accepted and
+ *    ignored, so a game that asked for 800x600 on a 1280x720 monitor drew
+ *    an 800x600 window into the corner of a 1280x720 desktop. It is a real
+ *    monitor now: ios_virtual_change_display_settings() is the only writer
+ *    and ios_publish_screen_size() pushes a change out to everything that
+ *    mirrors the size, including the app's presented surface.
+ *
+ * ios_screen_size() is called with display_lock held (monitor_get_rect,
+ * lock_display_devices), so it must never take a lock of its own; the two
+ * ints are written once by a mode change and read as single words.
+ */
+static int ios_screen_cur_w, ios_screen_cur_h;
+static int ios_screen_def_w, ios_screen_def_h;
+
 static void ios_screen_size( int *w, int *h )
 {
-    static int sw, sh;
-    if (!sw)
+    if (!ios_screen_cur_w)
     {
+        /* MADEIRA_SCREEN_W/H: the virtual monitor's session default size,
+         * exported by the app before Wine starts (1024x768 when unset); a
+         * program's ChangeDisplaySettings changes the current size from there.
+         * MADEIRA_SCREEN_SRC names where the default came from, for the log. */
         const char *we = getenv( "MADEIRA_SCREEN_W" ), *he = getenv( "MADEIRA_SCREEN_H" );
-        sw = (we && atoi( we ) > 0) ? atoi( we ) : 1024;
-        sh = (he && atoi( he ) > 0) ? atoi( he ) : 768;
+        const char *src = getenv( "MADEIRA_SCREEN_SRC" );
+        int sw = (we && atoi( we ) > 0) ? atoi( we ) : 1024;
+        int sh = (he && atoi( he ) > 0) ? atoi( he ) : 768;
+
+        ios_screen_def_w = sw;
+        ios_screen_def_h = sh;
+        ios_screen_cur_w = sw;
+        ios_screen_cur_h = sh;
+        dprintf( STDERR_FILENO, "[display] virtual monitor %dx%d (source=%s)\n", sw, sh,
+                 (src && *src) ? src : ((we && he) ? "env" : "default") );
     }
-    *w = sw;
-    *h = sh;
+    *w = ios_screen_cur_w;
+    *h = ios_screen_cur_h;
 }
 #endif
 
@@ -3855,10 +3887,70 @@ static BOOL ios_virtual_monitor_active(void)
     return ret;
 }
 
+/* The mode table the virtual monitor advertises: the standard PC display
+ * modes a game's resolution list is built from. A monitor that offers only
+ * "640x480, 800x600 and whatever you are already running" leaves a game no
+ * way to ask for its own shape (960x540, 1024x576, ...), so it picks a 4:3
+ * mode and renders 16:9 content into it. Every entry is 32 bpp / 60 Hz. */
+static const struct { short w, h; } ios_standard_modes[] =
+{
+    {  640,  360 }, {  640,  400 }, {  640,  480 }, {  720,  480 },
+    {  720,  576 }, {  800,  480 }, {  800,  600 }, {  848,  480 },
+    {  854,  480 }, {  960,  540 }, {  960,  600 }, {  960,  720 },
+    { 1024,  576 }, { 1024,  600 }, { 1024,  640 }, { 1024,  768 },
+    { 1120,  832 }, { 1152,  648 }, { 1152,  864 }, { 1176,  664 },
+    { 1280,  720 }, { 1280,  768 }, { 1280,  800 }, { 1280,  960 },
+    { 1280, 1024 }, { 1360,  768 }, { 1366,  768 }, { 1400, 1050 },
+    { 1440,  900 }, { 1600,  900 }, { 1600, 1024 }, { 1600, 1200 },
+    { 1680, 1050 }, { 1920, 1080 }, { 1920, 1200 }, { 2048, 1536 },
+    { 2560, 1440 },
+};
+
+/* Index 0 is always the CURRENT mode: EnumDisplaySettings callers compare the
+ * list against ENUM_CURRENT_SETTINGS/ENUM_REGISTRY_SETTINGS and a current mode
+ * missing from the list reads as "this monitor cannot do what it is doing".
+ *
+ * The rest is capped against the SESSION DEFAULT (this port's stand-in for
+ * the panel's native size, and the one value a mode change never moves), so
+ * the list does not shrink under a program that selects a small mode.
+ * Programs commonly choose the largest advertised mode on first launch, so
+ * the default cap is the session default's pixel count;
+ * MADEIRA_EXTENDED_MODES=1 offers modes up to four times it. */
+static BOOL ios_mode_at_index( UINT index, int *w, int *h )
+{
+    int sw, sh, cw, ch;
+    const char *extended = getenv( "MADEIRA_EXTENDED_MODES" );  /* 1: list modes up to 4x the session default's pixels */
+    BOOL high_modes = extended && !strcmp( extended, "1" );
+    UINT i, n = 0;
+
+    ios_screen_size( &sw, &sh );
+    if (!index)
+    {
+        *w = sw;
+        *h = sh;
+        return TRUE;
+    }
+
+    cw = ios_screen_def_w ? ios_screen_def_w : sw;
+    ch = ios_screen_def_h ? ios_screen_def_h : sh;
+
+    for (i = 0; i < ARRAY_SIZE(ios_standard_modes); i++)
+    {
+        int mw = ios_standard_modes[i].w, mh = ios_standard_modes[i].h;
+
+        if (mw == sw && mh == sh) continue;                     /* already index 0 */
+        if ((INT64)mw * mh > (high_modes ? 4 : 1) * (INT64)cw * ch) continue;
+        if (++n != index) continue;
+        *w = mw;
+        *h = mh;
+        return TRUE;
+    }
+    return FALSE;
+}
+
 static BOOL ios_virtual_enum_display_settings( DWORD index, DEVMODEW *devmode, DWORD flags )
 {
     int sw, sh;
-    UINT idx = index;
 
     ios_screen_size( &sw, &sh );
 
@@ -3886,25 +3978,210 @@ static BOOL ios_virtual_enum_display_settings( DWORD index, DEVMODEW *devmode, D
     if (index == WINE_ENUM_PHYSICAL_SETTINGS) return FALSE;
 
     {
-        /* Classic small modes + the desktop resolution (deduped). Nothing
-         * LARGER than the desktop — bigger modes crop on the virtual
-         * desktop surface. */
-        UINT widths[3]  = {640, 800, 0};
-        UINT heights[3] = {480, 600, 0};
-        UINT count = 2;
-        if (!((sw == 640 && sh == 480) || (sw == 800 && sh == 600)))
-        {
-            widths[2] = sw; heights[2] = sh; count = 3;
-        }
-        if (idx >= count)
+        int mw, mh;
+
+        if (!ios_mode_at_index( index, &mw, &mh ))
         {
             RtlSetLastWin32Error( ERROR_NO_MORE_FILES );
             return FALSE;
         }
-        devmode->dmPelsWidth = widths[idx];
-        devmode->dmPelsHeight = heights[idx];
+        devmode->dmPelsWidth = mw;
+        devmode->dmPelsHeight = mh;
     }
     return TRUE;
+}
+
+/* iOS-Madeira: does this device name refer to the single adapter that
+ * NtUserEnumDisplayDevices synthesizes in the virtual-monitor regime?
+ * That call hands out "\\.\DISPLAY1" for the adapter and
+ * "\\.\DISPLAY1\Monitor0" for its monitor, so both must be accepted here:
+ * an application that follows the documented
+ * EnumDisplayDevices -> EnumDisplaySettings -> ChangeDisplaySettingsEx
+ * sequence feeds exactly those strings back to us. */
+static BOOL ios_virtual_device_name( const UNICODE_STRING *name )
+{
+    static const WCHAR display1W[] = {'\\','\\','.','\\','D','I','S','P','L','A','Y','1'};
+    UINT len;
+
+    if (!name || !name->Length) return TRUE;                 /* NULL/empty = primary */
+    if (get_display_index( name ) == 1) return TRUE;         /* "\\.\DISPLAY1" */
+
+    /* "\\.\DISPLAY1\MonitorN" */
+    len = name->Length / sizeof(WCHAR);
+    if (len <= ARRAY_SIZE(display1W)) return FALSE;
+    if (wcsnicmp( name->Buffer, display1W, ARRAY_SIZE(display1W) )) return FALSE;
+    return name->Buffer[ARRAY_SIZE(display1W)] == '\\';
+}
+
+/* Implemented by the app (app/Madeira/IOSDisplayShim.m); weak so win32u still
+ * links in a process that does not host the UI. It tells the host view what
+ * the guest is rendering into NOW, which is the only way the presented
+ * surface can follow a mode change instead of a launch-time constant. */
+extern void winios_display_mode_changed( int w, int h ) __attribute__((weak));
+
+/* Make the current virtual-monitor size real everywhere it is mirrored.
+ *
+ *  - update_display_cache( TRUE ) re-runs the virtual-monitor branch of
+ *    lock_display_devices, which refreshes virtual_monitor.rc_work and pushes
+ *    the new monitor rectangle to the server (set_winstation_monitors). That
+ *    one push is what moves NtUserGetSystemMetrics(SM_C{X,Y}SCREEN),
+ *    EnumDisplayMonitors/GetMonitorInfo (monitor_get_rect reads
+ *    ios_screen_size directly) and the desktop window itself -- win32u
+ *    answers WND_DESKTOP rects from get_primary_monitor_rect(), so the
+ *    desktop window needs no SetWindowPos of its own.
+ *  - the cached SPI_GETWORKAREA rectangle is derived from the monitor, so it
+ *    is dropped and recomputed on the next query, as Windows does.
+ *  - the server clips absolute pointer input to the desktop cursor clip,
+ *    which is seeded with a fixed size before any monitor exists, so a
+ *    monitor of a different shape is unusable until the clip is reset.
+ *  - the app then resizes the presented surface, and WM_DISPLAYCHANGE tells
+ *    the guest.
+ *
+ * Must not be called with display_lock held. */
+static void ios_invalidate_work_area(void);   /* below, beside the spi_loaded cache */
+
+static void ios_publish_screen_size( BOOL broadcast )
+{
+    int w, h;
+
+    ios_screen_size( &w, &h );
+    update_display_cache( TRUE );
+    ios_invalidate_work_area();
+    NtUserClipCursor( NULL );
+
+    if (winios_display_mode_changed) winios_display_mode_changed( w, h );
+
+    if (!broadcast) return;
+
+    send_notify_message( get_desktop_window(), WM_DISPLAYCHANGE, 32, MAKELPARAM( w, h ), FALSE );
+    send_message_timeout( HWND_BROADCAST, WM_DISPLAYCHANGE, 32, MAKELPARAM( w, h ),
+                          SMTO_ABORTIFHUNG, 2000, FALSE );
+    NtUserPostMessage( NtUserGetForegroundWindow(), WM_WINE_CLIPCURSOR, SET_CURSOR_FSCLIP, 0 );
+}
+
+/* The session default has to be published too, once, for the same cursor-clip
+ * reason -- the server's seed predates any monitor. It cannot happen at
+ * ios_screen_size() time (that runs under display_lock, and long before the
+ * desktop window exists), so it is driven from the first screen-size query
+ * made with no lock held: NtUserGetSystemMetrics( SM_CXSCREEN ), which every
+ * process asks early and which is by definition about this value. */
+static void ios_publish_screen_size_once(void)
+{
+    static int done;
+
+    if (done) return;
+    /* the cached handle, not get_desktop_window(): this runs on a path hot
+     * enough that a server round trip per query would be its own problem.
+     * Non-zero means this thread has already resolved the desktop window,
+     * which is exactly when there is something to publish to. */
+    if (!NtUserGetThreadInfo()->top_window) return;   /* too early; the next query retries */
+    done = 1;
+    ios_publish_screen_size( FALSE );
+}
+
+/* MADEIRA_VIRTUAL_MODE_SET=0: accept a listed mode without programming it --
+ * the monitor keeps the session default size, as before this change. */
+static int ios_virtual_mode_set_enabled(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_VIRTUAL_MODE_SET" );
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+/* iOS-Madeira: NtUserChangeDisplaySettings for the virtual-monitor regime.
+ *
+ * The sources list is EMPTY here, so find_source() fails for every name --
+ * including the one this same driver advertises from
+ * NtUserEnumDisplayDevices and happily answers in
+ * NtUserEnumDisplaySettings. The result was DISP_CHANGE_BADPARAM for a mode
+ * the driver had just reported as CURRENT, which explorer logs as
+ * "Failed to initialize registry display settings" and which applications
+ * treat as a fatal video-init error, while an empty device name was
+ * accepted and ignored, so the game's mode never reached the monitor.
+ *
+ * Accept any mode the synthesized enumeration lists and PROGRAM it: the
+ * virtual monitor really becomes that size, the way a monitor does on
+ * Windows, and the app scales the new desktop to the view. Reject a mode
+ * that is not in the list with BADMODE and an unknown device with BADPARAM --
+ * never BADPARAM for our own device name. A NULL devmode, and a request
+ * that names no size, restore the session default, which is this port's
+ * equivalent of the registry mode. */
+static LONG ios_virtual_change_display_settings( UNICODE_STRING *devname, const DEVMODEW *devmode,
+                                                 DWORD flags )
+{
+    static const DWORD size_fields = DM_PELSWIDTH | DM_PELSHEIGHT;
+    LONG ret = DISP_CHANGE_SUCCESSFUL;
+    const char *why = "no mode requested";
+    int sw, sh, want_w = 0, want_h = 0;
+    BOOL apply = FALSE;
+
+    ios_screen_size( &sw, &sh );
+
+    if (!ios_virtual_device_name( devname )) ret = DISP_CHANGE_BADPARAM, why = "unknown device name";
+    else if (!devmode || !(devmode->dmFields & size_fields))
+    {
+        /* ChangeDisplaySettings(NULL, 0) -- and any call that names no size --
+         * means "go back to the registry mode", which here is the size the
+         * session started at. */
+        want_w = ios_screen_def_w;
+        want_h = ios_screen_def_h;
+        apply = !(flags & (CDS_TEST | CDS_NORESET));
+        why = "restoring the session default";
+    }
+    else if ((devmode->dmFields & size_fields) == size_fields)
+    {
+        BOOL found = FALSE;
+        int mw, mh;
+        UINT i;
+
+        want_w = (int)devmode->dmPelsWidth;
+        want_h = (int)devmode->dmPelsHeight;
+
+        /* the session default is always acceptable */
+        if (want_w == ios_screen_def_w && want_h == ios_screen_def_h) found = TRUE;
+        /* A saved explicit request may exceed the conservative advertised
+         * ladder (see ios_mode_at_index). Accept the whole standard table up
+         * to four times the session default; enumeration is a first-launch
+         * preference, not a ban on user-selected resolutions. */
+        for (i = 0; !found && i < ARRAY_SIZE(ios_standard_modes); i++)
+        {
+            mw = ios_standard_modes[i].w;
+            mh = ios_standard_modes[i].h;
+            if ((INT64)mw * mh <= 4 * (INT64)ios_screen_def_w * ios_screen_def_h)
+                found = (mw == want_w && mh == want_h);
+        }
+
+        if (!found) ret = DISP_CHANGE_BADMODE, why = "mode is not in the virtual mode list";
+        else
+        {
+            apply = !(flags & (CDS_TEST | CDS_NORESET));
+            why = apply ? "mode accepted" : "mode supported (test/noreset)";
+        }
+    }
+
+    if (apply && (want_w != sw || want_h != sh))
+    {
+        if (!ios_virtual_mode_set_enabled()) why = "mode accepted, not programmed (MADEIRA_VIRTUAL_MODE_SET=0)";
+        else
+        {
+            ios_screen_cur_w = want_w;
+            ios_screen_cur_h = want_h;
+            ios_publish_screen_size( TRUE );
+            why = "mode programmed";
+        }
+    }
+
+    dprintf( STDERR_FILENO,
+             "[iOS ChangeDisplaySettings] virtual display %dx%d: req=%lux%lu flags=%#x -> %d (%s)\n",
+             sw, sh,
+             devmode ? (unsigned long)devmode->dmPelsWidth : 0ul,
+             devmode ? (unsigned long)devmode->dmPelsHeight : 0ul,
+             (unsigned)flags, (int)ret, why );
+    return ret;
 }
 
 static void monitor_get_interface_name( struct monitor *monitor, WCHAR *interface_name )
@@ -4720,6 +4997,16 @@ LONG WINAPI NtUserChangeDisplaySettings( UNICODE_STRING *devname, DEVMODEW *devm
                 (unsigned long)devmode->dmBitsPerPel,
                 (unsigned)devmode->dmFields);
     }
+
+#ifdef WINE_IOS
+    /* iOS-Madeira: answer for the synthesized virtual display BEFORE the
+     * source lookup. In this regime the sources list is empty, so
+     * find_source() cannot succeed for ANY name -- not even "\\.\DISPLAY1",
+     * which NtUserEnumDisplayDevices hands out and NtUserEnumDisplaySettings
+     * answers -- and the empty-name shortcut below ignored the mode. */
+    if (ios_virtual_monitor_active())
+        return ios_virtual_change_display_settings( devname, devmode, flags );
+#endif
 
     if ((!devname || !devname->Length) && !devmode) return apply_display_settings( NULL, NULL, hwnd, flags, lparam );
 
@@ -6036,6 +6323,16 @@ enum spi_index
 /* indicators whether system parameter value is loaded */
 static char spi_loaded[SPI_INDEX_COUNT];
 
+#ifdef WINE_IOS
+/* See ios_publish_screen_size: the work area is cached from the monitor, so
+ * a monitor that changed size drops it. A plain word store; SPI_GETWORKAREA
+ * then recomputes under display_lock on the next query. */
+static void ios_invalidate_work_area(void)
+{
+    spi_loaded[SPI_SETWORKAREA_IDX] = FALSE;
+}
+#endif
+
 static struct sysparam_rgb_entry system_colors[] =
 {
 #define RGB_ENTRY(name,val,reg) { { get_rgb_entry, set_rgb_entry, init_rgb_entry, COLORS_KEY, reg }, (val) }
@@ -7282,6 +7579,7 @@ int get_system_metrics( int index )
     case SM_CYMAXIMIZED:
     {
         int sw, sh;
+        ios_publish_screen_size_once();
         ios_screen_size( &sw, &sh );
         switch (index)
         {

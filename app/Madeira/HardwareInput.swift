@@ -531,9 +531,12 @@ final class HardwareInput: ObservableObject {
         return v.pointee == 49  // '1'
     }
 
-    private static func envInt(_ name: String, _ def: Int) -> Int {
-        guard let v = getenv(name), let i = Int(String(cString: v)) else { return def }
-        return i
+    /// The desktop's live size in guest pixels (IOSDisplayShim): the session
+    /// default until a program changes the display mode, which resizes it.
+    private static func desktopSize() -> (w: Int, h: Int) {
+        var w: Int32 = 0, h: Int32 = 0
+        winios_screen_size(&w, &h)
+        return (w > 0 ? Int(w) : 1024, h > 0 ? Int(h) : 768)
     }
 
     /// A program on the game view, with its cursor drawn by this file.
@@ -1101,9 +1104,9 @@ final class HardwareInput: ObservableObject {
     private func followDesktopCursor(_ dx: Int32, _ dy: Int32, sync: Bool) {
         DispatchQueue.main.async {
             let cur = MetalBackedView.cursor
+            let desk = Self.desktopSize()
             let p = DesktopCursor.advance(x: Double(cur.x), y: Double(cur.y), dx: dx, dy: dy,
-                                          width: Self.envInt("MADEIRA_SCREEN_W", 1024),
-                                          height: Self.envInt("MADEIRA_SCREEN_H", 768))
+                                          width: desk.w, height: desk.h)
             MetalBackedView.cursor = CGPoint(x: p.x, y: p.y)
             if sync {
                 // Also draws the arrow (winios_pointer draws absolute moves).
@@ -1118,8 +1121,9 @@ final class HardwareInput: ObservableObject {
     /// the game view. Main thread.
     private func postAbsolute(_ p: CGPoint, in view: UIView) {
         let desktop = Self.desktopMode
-        let sw = desktop ? Self.envInt("MADEIRA_SCREEN_W", 1024) : DirectCursorOverlay.screenW
-        let sh = desktop ? Self.envInt("MADEIRA_SCREEN_H", 768) : DirectCursorOverlay.screenH
+        let desk = Self.desktopSize()
+        let sw = desktop ? desk.w : DirectCursorOverlay.screenW
+        let sh = desktop ? desk.h : DirectCursorOverlay.screenH
         let s = ScreenMap.toScreen(x: Double(p.x), y: Double(p.y), viewW: Double(view.bounds.width),
                                    viewH: Double(view.bounds.height), screenW: sw, screenH: sh)
         setMouseInUse(true)

@@ -3,11 +3,10 @@ import Foundation
 // The guest's virtual monitor and how it is laid out on the device's screen.
 //
 // A game renders for the virtual monitor win32u reports (build/win32u-unix/
-// sysparams_ios.c): its size is the session default from MADEIRA_SCREEN_W/H,
-// which win32u reads once per session. A win32u that lets a game change it
-// can publish the new size through winios_display_mode_changed()
-// (IOSDisplayShim.m); main's does not, so the size stays the session default.
-// MetalBackedView reads the current size back (winios_screen_size) and places
+// sysparams_ios.c): it starts at the session default from MADEIRA_SCREEN_W/H,
+// and a game's ChangeDisplaySettings programs a new mode, which win32u
+// publishes through winios_display_mode_changed() (IOSDisplayShim.m;
+// MADEIRA_VIRTUAL_MODE_SET=0 keeps the session default). MetalBackedView reads the current size back (winios_screen_size) and places
 // the presented layer with GameSurfaceLayout, so the layer's frame and the
 // touch mapping always agree. A library entry chooses the monitor size
 // (Resolution) and how it is scaled (Aspect & scaling); the developer
@@ -15,7 +14,19 @@ import Foundation
 
 /// How the guest surface is mapped into the view's bounds.
 enum DisplayMode: String, CaseIterable {
-    case fit, fill, stretch, aspect, fitHeight
+    case fit, fill, stretch, aspect
+
+    /// Older settings stored "fitHeight" (Fill height); it behaved as Fit in
+    /// landscape and is gone from the picker, so it decodes to Fit.
+    init?(rawValue: String) {
+        switch rawValue {
+        case "fit", "fitHeight": self = .fit
+        case "fill": self = .fill
+        case "stretch": self = .stretch
+        case "aspect": self = .aspect
+        default: return nil
+        }
+    }
 
     var label: String {
         switch self {
@@ -23,7 +34,6 @@ enum DisplayMode: String, CaseIterable {
         case .fill:      return "Fill"
         case .stretch:   return "Stretch"
         case .aspect:    return "Aspect"
-        case .fitHeight: return "Fill height"
         }
     }
     var symbol: String {
@@ -32,7 +42,6 @@ enum DisplayMode: String, CaseIterable {
         case .fill:      return "arrow.up.left.and.arrow.down.right"
         case .stretch:   return "rectangle.expand.vertical"
         case .aspect:    return "rectangle.ratio.16.to.9"
-        case .fitHeight: return "arrow.up.and.down.square"
         }
     }
 }
@@ -53,16 +62,14 @@ enum GameSurfaceLayout {
     ///   game whose back buffer is 4:3 on a 16:9 monitor is stretched by the
     ///   layer in every other mode; here it is scaled uniformly. Falls back to
     ///   the guest shape until a drawable size is known (`aspect == .zero`).
-    /// - Fill height: the presented shape at the view's full height; a result
-    ///   wider than the view is centred and cropped at the sides.
     static func rect(guest: CGSize, aspect: CGSize = .zero, bounds: CGRect, mode: DisplayMode) -> CGRect {
         guard guest.width > 0, guest.height > 0,
               bounds.width > 0, bounds.height > 0 else { return bounds }
         if mode == .stretch { return bounds }
-        let useDrawable = (mode == .aspect || mode == .fitHeight) && aspect.width > 0 && aspect.height > 0
+        let useDrawable = mode == .aspect && aspect.width > 0 && aspect.height > 0
         let shape = useDrawable ? aspect : guest
         let sx = bounds.width / shape.width, sy = bounds.height / shape.height
-        let scale = mode == .fill ? max(sx, sy) : (mode == .fitHeight ? sy : min(sx, sy))
+        let scale = mode == .fill ? max(sx, sy) : min(sx, sy)
         let w = shape.width * scale, h = shape.height * scale
         return CGRect(x: bounds.minX + (bounds.width - w) / 2,
                       y: bounds.minY + (bounds.height - h) / 2,

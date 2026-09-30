@@ -789,6 +789,10 @@ static NSMutableDictionary<NSNumber *, NSValue *> *g_px_rects;  /* hwnd → last
 static NSMutableDictionary<NSNumber *, NSValue *> *g_surf_sizes; /* hwnd → surface px size */
 static NSMutableDictionary<NSNumber *, CAMetalLayer *> *g_metal_layers; /* hwnd → DXMT layer */
 static NSMutableDictionary<NSNumber *, NSValue *> *g_client_rects;      /* hwnd → client px rect */
+/* Desktop fit state (winios_desktop_fit below), main thread only. */
+static NSNumber *g_fit_key;
+static CGRect g_fit_client_px;   /* the window's client rect, desktop px */
+static CGRect g_fit_view_pt;     /* where it is shown, compositor-view points */
 static void winios_place_metal_layer(NSNumber *key);
 
 /* Surfaces are 128px-aligned (win32u), usually LARGER than the window.
@@ -813,16 +817,29 @@ unsigned long long winios_surface_present_count(void) {
     return atomic_load_explicit(&g_surface_present_count, memory_order_relaxed);
 }
 
+/* IOSDisplayShim.m: the guest's virtual monitor as win32u last published it
+ * (the session default until a program changes the display mode). */
+extern void winios_screen_size(int *w, int *h);
+extern NSString * const MadeiraDisplayModeChangedNotification;
+
 static UIView *g_compositor_view;
 static CALayer *g_desk_bg;               /* teal desktop-area backdrop */
-static CGFloat g_px_to_pt = 1.0 / 3.0;   /* desktop px → screen pt */
+static CGFloat g_px_to_pt = 1.0 / 3.0;   /* desktop px → screen pt (x, and y unless stretched) */
+static CGFloat g_px_to_pt_y;             /* y scale when the display mode stretches; 0 = same as x */
 static CGPoint g_desk_origin;            /* desktop (0,0) in view pt (letterbox offset) */
+/* The rect the front end laid the guest display out in (its Aspect / Fill /
+ * Stretch / Fit choice, GameSurfaceLayout), in compositor-view points. When
+ * set, the desktop is placed there instead of being aspect-fit into the
+ * whole frame, so the display-mode setting applies to desktop sessions too. */
+static CGRect g_desk_rect;
+static BOOL g_desk_rect_set;
+#define WINIOS_PX_TO_PT_Y (g_px_to_pt_y > 0 ? g_px_to_pt_y : g_px_to_pt)
 static CGRect g_comp_frame;              /* presentation area (window coords), from Swift */
 static BOOL g_comp_frame_set;
 
 static CGRect winios_layer_rect(int x, int y, int w, int h) {
-    CGFloat s = g_px_to_pt;
-    return CGRectMake(g_desk_origin.x + x * s, g_desk_origin.y + y * s, w * s, h * s);
+    CGFloat s = g_px_to_pt, sy = WINIOS_PX_TO_PT_Y;
+    return CGRectMake(g_desk_origin.x + x * s, g_desk_origin.y + y * sy, w * s, h * sy);
 }
 
 /* main thread only. Sizes the compositor to the presentation frame and
@@ -833,15 +850,32 @@ static void winios_layout_compositor(void) {
     CGRect frame = g_comp_frame_set ? g_comp_frame : (win ? win.bounds : g_compositor_view.frame);
     g_compositor_view.frame = frame;
 
-    const char *dw = getenv("MADEIRA_SCREEN_W"), *dh = getenv("MADEIRA_SCREEN_H");
-    int desk_w = dw ? atoi(dw) : 1024, desk_h = dh ? atoi(dh) : 768;
+    /* The LIVE guest size, not MADEIRA_SCREEN_W/H. That environment pair is
+     * the session's launch-time seed; win32u owns the value afterwards and
+     * publishes every change through winios_display_mode_changed
+     * (IOSDisplayShim.m). Reading the seed kept letterboxing against the old
+     * size after a program programmed a different mode, so an 800x600 game
+     * stayed a small window inside a 1280x720 frame. */
+    int desk_w = 0, desk_h = 0;
+    winios_screen_size(&desk_w, &desk_h);
     if (desk_w <= 0) desk_w = 1024;
     if (desk_h <= 0) desk_h = 768;
     CGFloat s = MIN(frame.size.width / desk_w, frame.size.height / desk_h);
     CGSize fit = CGSizeMake(desk_w * s, desk_h * s);
     g_px_to_pt = s;
+    g_px_to_pt_y = 0;
     g_desk_origin = CGPointMake((frame.size.width - fit.width) / 2,
                                 (frame.size.height - fit.height) / 2);
+    if (g_desk_rect_set && g_desk_rect.size.width >= 1 && g_desk_rect.size.height >= 1) {
+        /* The front end's display mode: Fit and Aspect keep the guest shape
+         * (uniform), Fill overflows the frame (clipped by the view), Stretch
+         * is the one anisotropic case. */
+        g_px_to_pt = g_desk_rect.size.width / desk_w;
+        CGFloat sy = g_desk_rect.size.height / desk_h;
+        if (fabs(sy - g_px_to_pt) > 0.0005) g_px_to_pt_y = sy;
+        g_desk_origin = g_desk_rect.origin;
+        fit = g_desk_rect.size;
+    }
     g_desk_bg.frame = CGRectMake(g_desk_origin.x, g_desk_origin.y, fit.width, fit.height);
 
     /* re-place existing window layers under the new mapping */
@@ -860,6 +894,20 @@ static void winios_layout_compositor(void) {
 
 /* Called from Swift (MetalBackedView) with the presentation area in
  * window coordinates — same geometry contract as the Metal host view. */
+/* Called from Swift (MetalBackedView.applyDisplayMode) with the rect its
+ * display mode laid the guest display out in, in the compositor view's own
+ * points (the compositor frame is that view's bounds). `set` 0 clears it and
+ * the desktop goes back to an aspect fit of the whole frame. */
+void winios_set_desktop_rect(double x, double y, double w, double h, int set) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CGRect r = CGRectMake(x, y, w, h);
+        if (g_desk_rect_set == (set != 0) && (!set || CGRectEqualToRect(g_desk_rect, r))) return;
+        g_desk_rect = r;
+        g_desk_rect_set = set != 0;
+        winios_layout_compositor();
+    });
+}
+
 void winios_set_compositor_frame(double x, double y, double w, double h) {
     dispatch_async(dispatch_get_main_queue(), ^{
         CGRect f = CGRectMake(x, y, w, h);
@@ -891,16 +939,26 @@ int winios_compositor_set_hidden(int hidden) {
  * mapping winios_layout_compositor placed the desktop with, for the front end's
  * Touch pointer mode in desktop sessions. Returns 0 when there is no desktop. */
 int winios_desktop_point_from_window(double wx, double wy, int *px, int *py) {
-    const char *dw = getenv("MADEIRA_SCREEN_W"), *dh = getenv("MADEIRA_SCREEN_H");
-    int desk_w = dw ? atoi(dw) : 1024, desk_h = dh ? atoi(dh) : 768;
+    /* the live guest size, as winios_layout_compositor uses: the two must
+     * agree or a touch lands somewhere the desktop is not */
+    int desk_w = 0, desk_h = 0;
+    winios_screen_size(&desk_w, &desk_h);
     if (desk_w <= 0) desk_w = 1024;
     if (desk_h <= 0) desk_h = 768;
     if (px) *px = 0;
     if (py) *py = 0;
     if (!g_compositor_view || g_px_to_pt <= 0) return 0;
     CGRect f = g_compositor_view.frame;
+    /* a tap on a fitted window (winios_desktop_fit) lands in that window's
+     * own client pixels */
+    if (g_fit_key && CGRectContainsPoint(g_fit_view_pt, CGPointMake(wx - f.origin.x, wy - f.origin.y))) {
+        CGFloat k = g_fit_client_px.size.width / g_fit_view_pt.size.width;
+        if (px) *px = (int)(g_fit_client_px.origin.x + (wx - f.origin.x - g_fit_view_pt.origin.x) * k);
+        if (py) *py = (int)(g_fit_client_px.origin.y + (wy - f.origin.y - g_fit_view_pt.origin.y) * k);
+        return 1;
+    }
     double x = (wx - f.origin.x - g_desk_origin.x) / g_px_to_pt;
-    double y = (wy - f.origin.y - g_desk_origin.y) / g_px_to_pt;
+    double y = (wy - f.origin.y - g_desk_origin.y) / WINIOS_PX_TO_PT_Y;
     if (x < 0) x = 0;
     if (y < 0) y = 0;
     if (x > desk_w - 1) x = desk_w - 1;
@@ -941,6 +999,17 @@ static void winios_ensure_compositor(void) {
     winios_layout_compositor();
     fprintf(stderr, "[winios] compositor attached inside presentation frame\n");
     fflush(stderr);
+    /* A guest display-mode change moves the desktop's size without moving
+     * the presentation frame, so winios_set_compositor_frame (which skips a
+     * no-op frame) never notices it: re-fit the desktop when win32u
+     * publishes one (IOSDisplayShim posts this on the main queue). */
+    static id mode_observer;
+    if (!mode_observer) {
+        mode_observer = [[NSNotificationCenter defaultCenter]
+            addObserverForName:MadeiraDisplayModeChangedNotification object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) { winios_layout_compositor(); }];
+    }
     /* Wedged-thread triage: sample every thread's stack every 20s from
      * an app-side timer — keeps firing even when all wine threads are
      * stuck (unlike the tree dump, which rides wine's event drain). */
@@ -988,6 +1057,7 @@ static void winios_remove_layer(HWND hwnd) {
             [ml removeFromSuperlayer];
             [g_metal_layers removeObjectForKey:key];
             [g_client_rects removeObjectForKey:key];
+            if (g_fit_key && [g_fit_key isEqual:key]) g_fit_key = nil;
             fprintf(stderr, "[winios] metal layer removed for hwnd=%p\n", hwnd);
             fflush(stderr);
         }
@@ -1006,6 +1076,55 @@ static void winios_remove_layer(HWND hwnd) {
  * Game (non-desktop) mode keeps the fullscreen singleton layer via
  * IOSDisplayShim — none of this runs. */
 
+/* DESKTOP FIT. A presenting window whose client area does not fit the wine
+ * desktop (a 1920x1080 window on a 1280x720 desktop) was cropped: only its
+ * top-left showed, under a title bar, which looked like a frozen,
+ * non-fullscreen game. Its Metal layer is instead aspect-fitted to the whole
+ * desktop, and taps and the arrow are mapped through the same rectangle so
+ * the program still gets its own client coordinates. Main thread only.
+ * MADEIRA_DESKTOP_FIT=0 crops. */
+static int winios_desktop_fit_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) { const char *e = getenv("MADEIRA_DESKTOP_FIT"); enabled = !(e && e[0] == '0'); }
+    return enabled;
+}
+static BOOL winios_desktop_fit(NSNumber *key, CAMetalLayer *ml, CGRect c) {
+    int desk_w = 0, desk_h = 0;
+    winios_screen_size(&desk_w, &desk_h);
+    CGRect desk = CGRectMake(0, 0, desk_w, desk_h);
+    BOOL outside = desk_w > 0 && desk_h > 0 && c.size.width >= 64 && c.size.height >= 64
+        && !CGRectContainsRect(CGRectInset(desk, -8, -8), c);
+    if (!winios_desktop_fit_enabled() || !outside || !ml.superlayer || !g_compositor_view) {
+        if (g_fit_key && [g_fit_key isEqual:key]) g_fit_key = nil;
+        return NO;
+    }
+    CGFloat k = MIN(desk_w / c.size.width, desk_h / c.size.height) * g_px_to_pt;
+    CGSize sz = CGSizeMake(c.size.width * k, c.size.height * k);
+    CGRect view = CGRectMake(g_desk_origin.x + (desk_w * g_px_to_pt - sz.width) / 2,
+                             g_desk_origin.y + (desk_h * g_px_to_pt - sz.height) / 2, sz.width, sz.height);
+    ml.frame = [ml.superlayer convertRect:view fromLayer:g_compositor_view.layer];
+    BOOL changed = !g_fit_key || ![g_fit_key isEqual:key] || !CGRectEqualToRect(g_fit_client_px, c);
+    g_fit_key = key; g_fit_client_px = c; g_fit_view_pt = view;
+    static unsigned logged;
+    if (changed && logged < 16) {
+        logged++;
+        fprintf(stderr, "[desktop-fit] hwnd=0x%llx client-px={%.0f,%.0f %.0fx%.0f} desk=%dx%d -> view=(%.1f,%.1f %.1fx%.1f)\n",
+                key.unsignedLongLongValue, c.origin.x, c.origin.y, c.size.width, c.size.height, desk_w, desk_h,
+                view.origin.x, view.origin.y, view.size.width, view.size.height);
+    }
+    return YES;
+}
+/* Desktop px -> compositor-view points through the fitted window, if any. */
+static BOOL winios_desktop_fit_map(CGFloat x, CGFloat y, CGPoint *pt, CGFloat *scale) {
+    if (!g_fit_key || g_fit_client_px.size.width <= 0 || !CGRectContainsPoint(g_fit_client_px, CGPointMake(x, y)))
+        return NO;
+    CGFloat k = g_fit_view_pt.size.width / g_fit_client_px.size.width;
+    if (pt) *pt = CGPointMake(g_fit_view_pt.origin.x + (x - g_fit_client_px.origin.x) * k,
+                              g_fit_view_pt.origin.y + (y - g_fit_client_px.origin.y) * k);
+    if (scale) *scale = k;
+    return YES;
+}
+
 /* main thread only — frame the metal sublayer to the client rect in the
  * parent (window) layer's coordinate space. Parent bounds are the window
  * rect in points, so client offset = (client_px - window_px) * scale. */
@@ -1017,8 +1136,9 @@ static void winios_place_metal_layer(NSNumber *key) {
     CGRect w = wv.CGRectValue, c = cv.CGRectValue;
     CGFloat s = g_px_to_pt;
     ml.frame = CGRectMake((c.origin.x - w.origin.x) * s,
-                          (c.origin.y - w.origin.y) * s,
-                          c.size.width * s, c.size.height * s);
+                          (c.origin.y - w.origin.y) * WINIOS_PX_TO_PT_Y,
+                          c.size.width * s, c.size.height * WINIOS_PX_TO_PT_Y);
+    winios_desktop_fit(key, ml, c);
 }
 
 /* Called by IOSDisplayShim on a wine thread when DXMT creates a swapchain
@@ -1551,13 +1671,23 @@ static void winios_ensure_cursor_layer(void) {
 static void winios_cursor_place(void) {
     if (!g_cursor_layer) return;
     CGFloat x = g_cursor_pos_px.x, y = g_cursor_pos_px.y;
+    CGPoint fitted; CGFloat k = 0;
+    if (winios_desktop_fit_map(x, y, &fitted, &k)) {   /* over a fitted window */
+        if (g_cur_w > 0) {
+            g_cursor_layer.bounds = CGRectMake(0, 0, g_cur_w * k, g_cur_h * k);
+            g_cursor_layer.position = CGPointMake(fitted.x - g_cur_hx * k, fitted.y - g_cur_hy * k);
+        } else {
+            g_cursor_layer.position = fitted;
+        }
+        return;
+    }
     if (g_cur_w > 0) {
         g_cursor_layer.bounds = CGRectMake(0, 0, g_cur_w * g_px_to_pt, g_cur_h * g_px_to_pt);
         g_cursor_layer.position = CGPointMake(g_desk_origin.x + (x - g_cur_hx) * g_px_to_pt,
-                                              g_desk_origin.y + (y - g_cur_hy) * g_px_to_pt);
+                                              g_desk_origin.y + (y - g_cur_hy) * WINIOS_PX_TO_PT_Y);
     } else {
         g_cursor_layer.position = CGPointMake(g_desk_origin.x + x * g_px_to_pt,
-                                              g_desk_origin.y + y * g_px_to_pt);
+                                              g_desk_origin.y + y * WINIOS_PX_TO_PT_Y);
     }
 }
 
