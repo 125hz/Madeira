@@ -124,6 +124,12 @@ compile_one "$BUILD_DIR/nsi_unixlib_ios.c" "nsi_unixlib_ios"
 compile_one "$BUILD_DIR/nsi_network_ios.c" "nsi_network_ios"
 compile_one "$BUILD_DIR/nsi_ndis_ios.c" "nsi_ndis"
 compile_one "$BUILD_DIR/nsi_ip_ios.c" "nsi_ip"
+# dnsapi had no unix side (the generic stub table: every call STATUS_NOT_SUPPORTED,
+# including the DNS server list GetAdaptersAddresses asks for). dnsapi_unixlib_ios.c
+# is upstream dlls/dnsapi/libresolv.c with res_init/res_query/_res/h_errno rebound to
+# /usr/lib/libresolv.9.dylib through dlopen, so nothing is added to the app's link.
+compile_unixlib "$BUILD_DIR/dnsapi_unixlib_ios.c" "dnsapi_unixlib" "dnsapi" \
+    -I"$WINE_SRC/dlls/dnsapi"
 # MADEIRA 2026-09-19: winegstreamer's unix side is GStreamer, which does not
 # exist on iOS -- so the Windows WMA decoder MFT (CLSID_CWMADecMediaObject ->
 # wmadmod.dll -> CLSID_wg_wma_decoder in winegstreamer.dll) was absent and
@@ -205,7 +211,7 @@ ar rcs "$OBJ_DIR/libntdll_unix.a" \
     "$OBJ_DIR/nsi_network_ios.o" "$OBJ_DIR/nsi_ndis.o" "$OBJ_DIR/nsi_ip.o" \
     "$OBJ_DIR/gnutls_symtab_ios.o" "$OBJ_DIR/ws2_32_unixlib.o" \
     "$OBJ_DIR/bcrypt_unixlib.o" "$OBJ_DIR/secur32_unixlib.o" "$OBJ_DIR/crypt32_unixlib.o" \
-    "$OBJ_DIR/dwrite_unixlib.o" \
+    "$OBJ_DIR/dwrite_unixlib.o" "$OBJ_DIR/dnsapi_unixlib.o" \
     "$OBJ_DIR/winegstreamer_unixlib.o" "$OBJ_DIR/wg_parser_apple_ios.o" \
     "$OBJ_DIR/cdrom.o" "$OBJ_DIR/debug.o" "$OBJ_DIR/env.o" "$OBJ_DIR/file.o" \
     "$OBJ_DIR/loader.o" "$OBJ_DIR/loadorder.o" "$OBJ_DIR/process.o" "$OBJ_DIR/registry.o" \
