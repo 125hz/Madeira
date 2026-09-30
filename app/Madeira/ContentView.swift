@@ -3495,8 +3495,9 @@ struct TouchControlsOverlay: View {
     /// Every control in ONE GlassEffectContainer: on iOS 26 the system merges
     /// glass shapes that come within `spacing` of each other, so a D-pad cross
     /// or a face diamond pinched tight reads as one piece of glass and a button
-    /// dragged next to another flows into it. Before 26 the same views stack
-    /// as plain material.
+    /// dragged next to another flows into it. 12 pt: the built-in layout's
+    /// neighbours sit further apart than that, so nothing merges until it is
+    /// moved almost touching. Before 26 the same views stack as plain material.
     @ViewBuilder private func controls(_ screen: CGSize, session: Bool) -> some View {
         let buttons = ForEach(m.controls) { c in
             TouchControlButton(control: c, screen: screen)
@@ -3504,7 +3505,7 @@ struct TouchControlsOverlay: View {
                 .opacity(session && !m.editing ? library.opacity : 1)
         }
         if #available(iOS 26.0, *) {
-            GlassEffectContainer(spacing: 28) {
+            GlassEffectContainer(spacing: 12) {
                 ZStack { buttons }
                     .frame(width: screen.width, height: screen.height, alignment: .topLeading)
             }
@@ -3625,21 +3626,34 @@ struct GlassShape: View {
     var capsule = false
     var cornerRadius: CGFloat = 18
     var tint: Color? = nil
-    private var shape: AnyShape {
+    fileprivate var shape: AnyShape {
         if circle { return AnyShape(Circle()) }
         if capsule { return AnyShape(Capsule()) }
         return AnyShape(RoundedRectangle(cornerRadius: cornerRadius))
     }
     var body: some View {
+        Color.clear.glassFace(self)
+    }
+}
+
+extension View {
+    /// Glass BEHIND this view, with the view as the glass's content. Inside a
+    /// GlassEffectContainer every glass effect is composited together as one
+    /// layer over the container's other children, so a label that is merely a
+    /// sibling of its glass ends up blurred underneath it; a label that is the
+    /// glass view's own content is drawn on top, as the system's buttons are.
+    @ViewBuilder func glassFace(_ g: GlassShape) -> some View {
         if #available(iOS 26.0, *) {
-            if let tint {
-                shape.fill(.clear).glassEffect(.regular.tint(tint.opacity(0.55)), in: shape)
+            if let tint = g.tint {
+                self.glassEffect(.regular.tint(tint.opacity(0.55)), in: g.shape)
             } else {
-                shape.fill(.clear).glassEffect(.regular, in: shape)
+                self.glassEffect(.regular, in: g.shape)
             }
         } else {
-            shape.fill(.ultraThinMaterial)
-            if let tint { shape.fill(tint.opacity(0.35)) }
+            self.background {
+                g.shape.fill(.ultraThinMaterial)
+                if let tint = g.tint { g.shape.fill(tint.opacity(0.35)) }
+            }
         }
     }
 }
@@ -3688,28 +3702,32 @@ struct TouchControlButton: View {
         let a = control.action
         switch a.padFace ?? .round {
         case .round:
-            GlassShape(circle: true, tint: a.padTint)
-            if let g = a.padGlyph {
-                Image(systemName: g)
-                    .font(.system(size: size.height * 0.40, weight: .semibold))
-                    .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.88))
-            } else {
-                Text(a.padFaceLabel)
-                    .font(.system(size: size.height * (a.padFaceLabel.count > 2 ? 0.24 : 0.40), weight: .semibold))
-                    .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.92))
+            Group {
+                if let g = a.padGlyph {
+                    Image(systemName: g)
+                        .font(.system(size: size.height * 0.40, weight: .semibold))
+                        .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.88))
+                } else {
+                    Text(a.padFaceLabel)
+                        .font(.system(size: size.height * (a.padFaceLabel.count > 2 ? 0.24 : 0.40), weight: .semibold))
+                        .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.92))
+                }
             }
+            .frame(width: size.width, height: size.height)
+            .glassFace(GlassShape(circle: true, tint: a.padTint))
         case .small:
-            GlassShape(circle: true)
             Text(a.padFaceLabel)
                 .font(.system(size: size.height * 0.36, weight: .semibold))
                 .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.85))
+                .frame(width: size.width, height: size.height)
+                .glassFace(GlassShape(circle: true))
         case .wide:
-            GlassShape(cornerRadius: size.height * 0.30)
             Text(a.padFaceLabel)
                 .font(.system(size: size.height * 0.42, weight: .semibold))
                 .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.88))
+                .frame(width: size.width, height: size.height)
+                .glassFace(GlassShape(cornerRadius: size.height * 0.30))
         case .capsule:
-            GlassShape(capsule: true)
             Text(a.padFaceLabel)
                 .font(.system(size: size.height * 0.40, weight: .semibold))
                 .kerning(0.6)
@@ -3717,6 +3735,8 @@ struct TouchControlButton: View {
                 .lineLimit(1)
                 .padding(.horizontal, 6)
                 .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.85))
+                .frame(width: size.width, height: size.height)
+                .glassFace(GlassShape(capsule: true))
         }
     }
 

@@ -135,19 +135,21 @@ enum ControlPresetLayout {
 
         // D-pad: a cross of four buttons just above the left stick (not
         // mid-screen on a tall tablet), kept below the shoulder row.
-        let dp = d(dpadScale), arm = dp + 6 * k
-        let dpadY = max(stickTop - 16 * k - arm - dp / 2, rowBottom + 12 * k + arm + dp / 2)
-        add("D↑", dpadScale, lStickX, dpadY - arm)
-        add("D←", dpadScale, lStickX - arm, dpadY)
-        add("D→", dpadScale, lStickX + arm, dpadY)
-        add("D↓", dpadScale, lStickX, dpadY + arm)
+        // The cross sits a little inboard of the stick so its left arm stays
+        // inside the safe area with the wider spacing.
+        let dp = d(dpadScale), arm = dp + 12 * k, dpadX = lStickX + 8 * k
+        let dpadY = max(stickTop - 22 * k - arm - dp / 2, rowBottom + 12 * k + arm + dp / 2)
+        add("D↑", dpadScale, dpadX, dpadY - arm)
+        add("D←", dpadScale, dpadX - arm, dpadY)
+        add("D→", dpadScale, dpadX + arm, dpadY)
+        add("D↓", dpadScale, dpadX, dpadY + arm)
 
         // A/B/X/Y: a diamond just above the right stick. Diagonal neighbours
         // sit o·√2 apart, which clears one face button's diameter.
         let face = d(faceScale)
-        let o = face / 2 + 17 * k
+        let o = face / 2 + 24 * k
         let cx = rStickX - 8 * k
-        let cy = max(stickTop - 16 * k - o - face / 2, rowBottom + 12 * k + o + face / 2)
+        let cy = max(stickTop - 22 * k - o - face / 2, rowBottom + 12 * k + o + face / 2)
         add("Y", faceScale, cx, cy - o)
         add("X", faceScale, cx - o, cy)
         add("B", faceScale, cx + o, cy)
@@ -156,15 +158,15 @@ enum ControlPresetLayout {
         // View / Menu: bottom centre, between the sticks.
         let sys = d(systemScale)
         let sysY = H - B - 20 * k - sys / 2
-        add("View", systemScale, W / 2 - 40 * k, sysY)
-        add("Menu", systemScale, W / 2 + 40 * k, sysY)
+        add("View", systemScale, W / 2 - 46 * k, sysY)
+        add("Menu", systemScale, W / 2 + 46 * k, sysY)
 
         // L3 / R3: small buttons on the inner side of each stick, level with
         // its bottom edge.
         let click = d(clickScale)
         let clickY = stickY + stick / 2 - click / 2
-        add("L3", clickScale, lStickX + stick / 2 + 14 * k + click / 2, clickY)
-        add("R3", clickScale, rStickX - stick / 2 - 14 * k - click / 2, clickY)
+        add("L3", clickScale, lStickX + stick / 2 + 20 * k + click / 2, clickY)
+        add("R3", clickScale, rStickX - stick / 2 - 20 * k - click / 2, clickY)
         return out
     }
 }
