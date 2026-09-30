@@ -181,6 +181,9 @@ final class MetalBackedView: UIView {
         guard let w = window else { return }
         let r = gameRect()
         MetalHostView.shared.frame = convert(r, to: w)
+        // The desktop compositor lays the guest display out in the same rect,
+        // so Aspect / Fill / Stretch / Fit apply to desktop sessions as well.
+        winios_set_desktop_rect(r.minX - bounds.minX, r.minY - bounds.minY, r.width, r.height, 1)
         let guest = guestSize(), mode = effectiveDisplayMode()
         let line = String(format: "mode=%@ guest=%.0fx%.0f bounds=%.0fx%.0f -> rect=(%.0f,%.0f %.0fx%.0f)",
                           mode.rawValue, guest.width, guest.height, bounds.width, bounds.height,
