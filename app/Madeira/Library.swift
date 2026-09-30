@@ -1279,6 +1279,29 @@ struct LibrarySectionHeader<Trailing: View>: View {
     }
 }
 
+/// A section's cards or rows in the library's layout ("cards", "compact",
+/// "list" or "compactList"): every section of the library page uses it.
+struct LibraryCells<Item: Identifiable, Cell: View>: View {
+    let items: [Item]
+    let layout: String
+    let width: CGFloat
+    @ViewBuilder let cell: (_ item: Item, _ list: Bool, _ dense: Bool) -> Cell
+    var body: some View {
+        if layout == "list" || layout == "compactList" {
+            let dense = layout == "compactList"
+            LazyVStack(spacing: dense ? 4 : 8) { ForEach(items) { item in cell(item, true, dense) } }
+        } else {
+            let compact = layout == "compact"
+            let width = max(1, min(self.width, 1100) - 32)
+            let count = max(1, Int((width + 12) / (compact ? 110 : 154)))
+            let cardWidth = min(compact ? 115.0 : 164.0, (width - CGFloat(count - 1) * 12) / CGFloat(count))
+            LazyVGrid(columns: Array(repeating: GridItem(.fixed(cardWidth), spacing: 12, alignment: .top), count: count), alignment: .center, spacing: 18) {
+                ForEach(items) { item in cell(item, false, false) }
+            }.frame(maxWidth: .infinity, alignment: .center)
+        }
+    }
+}
+
 struct LibraryView: View {
     @ObservedObject private var model = LibraryModel.shared
     @Environment(\.scenePhase) private var scenePhase
@@ -1305,8 +1328,11 @@ struct LibraryView: View {
     @State private var settingsRefresh = 0
     @AppStorage("madeiraLibraryLayout") private var layout = "cards"
     @AppStorage("madeiraLibrarySort") private var sort = "played"
-    // Collapsed state of the games section.
-    @AppStorage("madeiraLibraryHideOthers") private var hideGames = false
+    // Collapsed state of the Other games section (MADEIRA_LIBRARY_COLLAPSE=0: no collapsing).
+    @AppStorage("madeiraLibraryHideOthers") private var hideOthers = false
+    // The sections follow the Steam section's games and sign-in (SteamGames.swift).
+    @ObservedObject private var steamGames = SteamGamesModel.shared
+    @ObservedObject private var steamLibrary = SteamOwnedLibrary.shared
     private var entries: [LibraryEntry] {
         // Steam games are listed in their own section (SteamGames.swift).
         let visible = model.entries.filter { $0.desktop != true && $0.steamAppID == nil && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)) }
@@ -1351,6 +1377,9 @@ struct LibraryView: View {
             EndedSessionSurface.install(); EndedSessionSurface.hide(reason: "library-appeared")
             // First-run setup opens once on a new install.
             onboarding.presentIfNeeded()
+        }
+        .onAppear {
+            LogStore.shared.log("[library-sections] native-steam=\(SteamOwnedLibrary.enabled ? 1 : 0) sections=\(SteamGamesSection.shown ? 1 : 0) collapse=\(SteamGamesSection.collapsible ? 1 : 0)")
         }
         .onReceive(controller.commands) { command in
             if selected == nil, !browser, !onboarding.presented, command == "tab" { switchTab(to: 1 - tab) }
@@ -1482,26 +1511,39 @@ struct LibraryView: View {
                         .id(LibraryEntry.desktopID)
                         .overlay(RoundedRectangle(cornerRadius: 22).stroke(focused == LibraryEntry.desktopID && controller.connected ? Color.cyan : .clear, lineWidth: 3))
                 }
-                // Steam games, started through Madeira Dock (SteamGames.swift); an installed
-                // one opens its Game details page like any library game.
-                SteamGamesSection(search: search, open: { selected = $0 })
-                if model.entries.filter({ $0.desktop != true && $0.steamAppID == nil }).isEmpty {
-                    ContentUnavailableView("Make yourself at home", systemImage: "gamecontroller", description: Text("Copy a game's folder into Madeira › wine › drive_c with the Files app, then tap + and choose its .exe."))
-                } else {
+                // The library's sections, as in the fork: Steam (installed and downloading
+                // Steam games, then Not installed), then Other games, the games you added.
+                // Steam games start through Madeira Dock (SteamGames.swift); an installed one
+                // opens its Game details page like any library game. Without the Steam
+                // section the games you added are one grid.
+                if MadeiraDock.enabled {
+                    SteamGamesSection(search: search, layout: layout, sort: sort, width: viewport.size.width,
+                                      open: { selected = $0 })
+                }
+                if SteamGamesSection.shown {
                     VStack(alignment: .leading, spacing: 14) {
                         // Games are added with the + in the navigation bar.
-                        LibrarySectionHeader(title: "Games", count: entries.count, collapsed: $hideGames) { EmptyView() }
-                        if hideGames {
+                        LibrarySectionHeader(title: "Other games", count: entries.count,
+                                             collapsed: SteamGamesSection.collapsible ? $hideOthers : nil) { EmptyView() }
+                        if hideOthers && SteamGamesSection.collapsible {
                             EmptyView()
                         } else if entries.isEmpty {
-                            Text("No games match your search.").foregroundStyle(.secondary)
+                            Text(search.isEmpty
+                                 ? "Copy a game's folder into Madeira › wine › drive_c with the Files app, then tap + and choose its .exe."
+                                 : "No other games match your search.")
+                                .foregroundStyle(.secondary)
                         } else {
                             cells(entries, width: viewport.size.width)
                         }
                     }
+                } else if model.entries.filter({ $0.desktop != true && $0.steamAppID == nil }).isEmpty {
+                    ContentUnavailableView("Make yourself at home", systemImage: "gamecontroller", description: Text("Copy a game's folder into Madeira › wine › drive_c with the Files app, then tap + and choose its .exe."))
+                } else {
+                    cells(entries, width: viewport.size.width)
                 }
             }.padding(16).frame(maxWidth: 1100).frame(maxWidth: .infinity)
         }
+        .refreshable { await SteamGamesSection.refresh() }
         .onReceive(controller.commands) { command in
             guard tab == 0, selected == nil, !browser, !onboarding.presented else { return }
             let items = entries
@@ -1545,18 +1587,9 @@ struct LibraryView: View {
         }
         }
     }
-    @ViewBuilder private func cells(_ items: [LibraryEntry], width viewportWidth: CGFloat) -> some View {
-        if layout == "list" || layout == "compactList" {
-            let dense = layout == "compactList"
-            LazyVStack(spacing: dense ? 4 : 8) { ForEach(items) { entry in libraryItem(entry, list: true, dense: dense) } }
-        } else {
-            let compact = layout == "compact"
-            let width = max(1, min(viewportWidth, 1100) - 32)
-            let count = max(1, Int((width + 12) / (compact ? 110 : 154)))
-            let cardWidth = min(compact ? 115.0 : 164.0, (width - CGFloat(count - 1) * 12) / CGFloat(count))
-            LazyVGrid(columns: Array(repeating: GridItem(.fixed(cardWidth), spacing: 12, alignment: .top), count: count), alignment: .center, spacing: 18) {
-                ForEach(items) { entry in libraryItem(entry, list: false) }
-            }.frame(maxWidth: .infinity, alignment: .center)
+    private func cells(_ items: [LibraryEntry], width viewportWidth: CGFloat) -> some View {
+        LibraryCells(items: items, layout: layout, width: viewportWidth) { entry, list, dense in
+            libraryItem(entry, list: list, dense: dense)
         }
     }
     private func libraryItem(_ entry: LibraryEntry, list: Bool, dense: Bool = false) -> some View {

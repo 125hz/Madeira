@@ -17,15 +17,16 @@ record writer).
 ## What you see
 
 In the library, the **Steam** section (`docs/LIBRARY.md`, "Steam setup") lists
-two kinds of game together: the games Steam has installed in the prefix, and
-the account's owned games that are not installed yet. Installed games come
-first. Each card shows the game's artwork, its pills and, when Steam knows it,
-the playtime. An installed game has the pills of any library game: **32-bit**
-or **64-bit**, its graphics API (**OpenGL**, **D3D9**, **D3D11**, ...; named
-only when exactly one is found) and its install size, plus **Update** when
-Steam has a newer build. Any other game shows its state: **Not installed**,
-**Not fully installed**, **Waiting**, **Downloading 42%**, **Paused** or
-**Download failed**. **Refresh** reads the install records again and fetches
+the games Steam has installed in the prefix under its title, with the games
+being downloaded first, and the account's owned games that are not installed
+yet under **Not installed**; the games you added follow under **Other games**.
+Each card shows the game's artwork, its pills and, when Steam knows it, the
+playtime. An installed game has the pills of any library game: **32-bit** or
+**64-bit**, its graphics API (**OpenGL**, **D3D9**, **D3D11**, ...; named only
+when exactly one is found) and its install size, plus **Update** when Steam has
+a newer build. Any other game shows its state: **Not installed**, **Not fully
+installed**, **Waiting**, **Downloading 42%**, **Paused** or **Download
+failed**. Pull down on the library to read the install records again and fetch
 the library again.
 
 The bits and graphics API are those of the program **Start with: The game**
