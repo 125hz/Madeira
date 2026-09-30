@@ -1114,9 +1114,14 @@ struct LibraryView: View {
                 // Steam games start through Madeira Dock (SteamGames.swift); an installed one
                 // opens its Game details page like any library game. Without the Steam
                 // section the games you added are one grid.
-                if MadeiraDock.enabled {
+                // Installed Steam games first, then the games you added, then the
+                // account's Not installed games. With nothing installed (or
+                // downloading) the games you added are the top section and the
+                // whole Steam section, sign-in included, follows them.
+                let steamFirst = MadeiraDock.enabled && SteamGamesSection.hasInstalled
+                if steamFirst {
                     SteamGamesSection(search: search, layout: layout, sort: sort, width: viewport.size.width,
-                                      open: { selected = $0 })
+                                      part: .installed, open: { selected = $0 })
                 }
                 if SteamGamesSection.shown {
                     VStack(alignment: .leading, spacing: 14) {
@@ -1134,6 +1139,10 @@ struct LibraryView: View {
                         } else {
                             cells(entries, width: viewport.size.width)
                         }
+                    }
+                    if MadeiraDock.enabled {
+                        SteamGamesSection(search: search, layout: layout, sort: sort, width: viewport.size.width,
+                                          part: steamFirst ? .notInstalled : .all, open: { selected = $0 })
                     }
                 } else if model.entries.filter({ $0.desktop != true && $0.steamAppID == nil }).isEmpty {
                     ContentUnavailableView("Make yourself at home", systemImage: "gamecontroller", description: Text("Copy a game's folder into Madeira › wine › drive_c with the Files app, then tap + and choose its .exe."))

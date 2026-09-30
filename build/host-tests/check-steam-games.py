@@ -50,7 +50,7 @@ require('/* SteamGames.swift in Sources */,' in project and 'path = "SteamGames.
         'SteamGames.swift is built by the Xcode project')
 content_view = (app / 'ContentView.swift').read_text()
 require('SteamGamesSection(search: search, layout: layout, sort: sort, width: viewport.size.width,\n'
-        '                                      open: { selected = $0 })' in library,
+        '                                      part: .installed, open: { selected = $0 })' in library,
         "Library: the Steam section is in the library and opens the library's Game details page")
 require('MadeiraDock.games(drive: drive)' in games and 'let drive = MadeiraDock.drive' in games,
         "the section lists exactly what Dock's own discovery finds")

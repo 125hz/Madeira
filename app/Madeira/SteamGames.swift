@@ -391,11 +391,15 @@ private struct SteamGameSelection: Identifiable { let id: Int }
 /// installed games its Sort by choice. Pull down on the library to read the
 /// install records and the account's library again.
 struct SteamGamesSection: View {
+    /// Which half the library asks for: the installed games under the Steam
+    /// title, the Not installed group, or both together (the old layout).
+    enum Part { case all, installed, notInstalled }
     let search: String
     /// The library's layout and Sort by choices and its width (LibraryView).
     var layout = "cards"
     var sort = "played"
     var width: CGFloat = 390
+    var part: Part = .all
     /// Opens a game's Game details page (LibraryView's details sheet).
     let open: (LibraryEntry) -> Void
     @ObservedObject private var model = SteamGamesModel.shared
@@ -414,6 +418,17 @@ struct SteamGamesSection: View {
 
     /// Whether the library shows this section, and with it the sectioned
     /// layout (the games you added then sit under Other games).
+    /// True when the account has installed or downloading games: the library
+    /// then shows them first and its own games after; otherwise its own games
+    /// come first and the Steam section (sign-in, Not installed) follows.
+    @MainActor static var hasInstalled: Bool {
+        let library = SteamOwnedLibrary.enabled, account = SteamOwnedLibrary.shared
+        let owned = library ? account.owned : []
+        let items = SteamGamesRules.items(installed: SteamGamesModel.shared.games, owned: owned, search: "")
+        let groups = SteamGamesRules.groups(items, downloading: Set(account.downloads.keys))
+        return !groups.installed.isEmpty || !groups.downloading.isEmpty
+    }
+
     @MainActor static var shown: Bool {
         let library = SteamOwnedLibrary.enabled, account = SteamOwnedLibrary.shared
         let owned = library ? account.owned : []
@@ -452,6 +467,7 @@ struct SteamGamesSection: View {
         Group {
             if Self.shown {
                 VStack(alignment: .leading, spacing: 14) {
+                    if part != .notInstalled {
                     LibrarySectionHeader(title: "Steam", count: installed.count,
                                          collapsed: collapsible ? $hideInstalled : nil) {
                         if steam.refreshing { ProgressView().accessibilityLabel("Refreshing Steam library") }
@@ -471,7 +487,8 @@ struct SteamGamesSection: View {
                         Text(steam.libraryUpdated == nil ? "Pull down to load your Steam library."
                              : "No Windows games were found in this Steam library.").foregroundStyle(.secondary)
                     }
-                    if signedIn && !groups.notInstalled.isEmpty {
+                    }
+                    if part != .installed && signedIn && !groups.notInstalled.isEmpty {
                         Button {
                             withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .easeInOut(duration: 0.2)) { showUninstalled.toggle() }
                         } label: {

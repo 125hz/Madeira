@@ -48,8 +48,13 @@ steam_at = page.index('SteamGamesSection(search: search, layout: layout, sort: s
 others_at = page.index('LibrarySectionHeader(title: "Other games"')
 require(page.index('Label("Desktop", systemImage: "desktopcomputer")') < steam_at < others_at,
         'page order: Desktop, then Steam, then Other games')
-require('if MadeiraDock.enabled {' in page[:steam_at] and 'if SteamGamesSection.shown {' in page[steam_at:others_at],
-        'Other games is a section exactly when the Steam section is shown')
+require('let steamFirst = MadeiraDock.enabled && SteamGamesSection.hasInstalled' in page[:steam_at]
+        and 'part: .installed, open: { selected = $0 })' in page[steam_at:others_at]
+        and 'if SteamGamesSection.shown {' in page[steam_at:others_at],
+        'Other games is a section exactly when the Steam section is shown; installed Steam games come first')
+require('part: steamFirst ? .notInstalled : .all, open: { selected = $0 })' in page[others_at:]
+        and 'if MadeiraDock.enabled {' in page[others_at:],
+        'Not installed follows Other games; with nothing installed the whole Steam section does')
 single = page[others_at:]
 require('ContentUnavailableView("Make yourself at home"' in single and single.count('cells(entries, width: viewport.size.width)') == 2,
         'without the Steam section: one grid of the games you added, or the empty-library message')
@@ -90,7 +95,7 @@ require(order == sorted(order), 'Steam order: title, sign-in, downloading + inst
 require('"No Windows games were found in this Steam library."' in body, 'Steam: empty-library text')
 require('} else if signedIn && !steam.refreshing && groups.notInstalled.isEmpty && search.isEmpty {' in body,
         'Steam: the empty text only when signed in, loaded, nothing owned to install and no search')
-require('if signedIn && !groups.notInstalled.isEmpty {' in body and 'if showUninstalled {' in body
+require('if part != .installed && signedIn && !groups.notInstalled.isEmpty {' in body and 'if showUninstalled {' in body
         and '.accessibilityValue(showUninstalled ? "Shown" : "Hidden")' in body,
         'Not installed: signed in, folds on its own, not with the Steam title')
 require('let items = SteamGamesRules.items(installed: model.games, owned: owned, search: search)' in body and
