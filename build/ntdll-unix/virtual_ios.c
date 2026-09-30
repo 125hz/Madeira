@@ -13163,7 +13163,66 @@ static void ios_verify_commit_zero( const void *base, SIZE_T size, ULONG protect
     seq = hi ? ++ck_hi : ++ck_lo;
     {
         size_t chk = size < 64 ? (size_t)size : 64;
-        long nz = ios_first_nonzero( base, chk );
+        unsigned char snap[64];
+        mach_vm_size_t got = 0;
+        long nz;
+
+        /* ml981: THIS PROBE RUNS UNDER virtual_mutex, SO IT MAY NEVER FAULT.
+         *
+         * The ml293 comment above claims the probe "can never itself fault"
+         * because it checks the protection first — but it checks the protection
+         * the CALLER ASKED FOR, not the one the page ended up with. When a
+         * commit reports success while the host page stays PROT_NONE (device
+         * logs t85:1195 / t86:5280, addr = the just-committed base, mach region
+         * prot=0 max=7), the load below took EXC_BAD_ACCESS, and that is not a
+         * recoverable fault here:
+         *
+         *   NtAllocateVirtualMemory holds virtual_mutex across this call
+         *   -> the Mach message goes to wine-x18-exc
+         *   -> the delivery path locks virtual_mutex (virtual_handle_fault,
+         *      virtual_setup_exception, the [fault-rgn] dumper)
+         *   -> that lock is held by the very thread whose fault it is servicing.
+         *
+         * Both threads stop forever (t86:6711 "Core_5 - Thread 0" parked at
+         * ios_verify_commit_zero+0x80 run=3 cpu=0, t86:6607 wine-x18-exc in
+         * __psynch_mutexwait on 0x1061a7078 = virtual_mutex), and every later
+         * VirtualAlloc/VirtualProtect/VirtualFree/page-fault fixup in the whole
+         * process queues behind them: the process sits at ~0 % CPU with nothing
+         * in a server wait, which is why [srv-stuck] and [waiters] stayed silent.
+         * A DIAGNOSTIC MUST NOT BE ABLE TO DO THAT.
+         *
+         * mach_vm_read_overwrite reads the same bytes without a load on this
+         * thread: an inaccessible page comes back as a failed kern_return
+         * instead of a fault. And a refused read is itself the signal we most
+         * want — it means a MEM_COMMIT that returned STATUS_SUCCESS left memory
+         * the guest cannot touch — so report it instead of swallowing it. */
+        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(uintptr_t)base,
+                                    (mach_vm_size_t)chk, (mach_vm_address_t)(uintptr_t)snap,
+                                    &got ) != KERN_SUCCESS || got != (mach_vm_size_t)chk)
+        {
+            BYTE hv = get_host_page_vprot( base );
+            mach_vm_address_t ra = (mach_vm_address_t)(uintptr_t)base;
+            mach_vm_size_t rs = 0;
+            vm_region_basic_info_data_64_t ri;
+            mach_msg_type_number_t rc = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t ro = MACH_PORT_NULL;
+            int have_region = (mach_vm_region( mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                                               (vm_region_info_t)&ri, &rc, &ro ) == KERN_SUCCESS);
+
+            if (hi) stale_hi++; else stale_lo++;
+            dprintf( 2, "[commit-noaccess] #%lu %s *** COMMIT SUCCEEDED BUT PAGE IS UNREADABLE *** "
+                     "base=%p size=0x%lx protect=0x%x host_page_vprot=0x%02x unix_prot=0x%x "
+                     "region=0x%llx+0x%llx prot=%d max=%d checked=%lu/%lu stale=%lu/%lu "
+                     "recommit=%lu rev=ml981\n",
+                     seq, hi ? "arena/pool" : "GUEST", base, (unsigned long)size,
+                     (unsigned)protect, hv, (unsigned)get_unix_prot( hv ),
+                     have_region ? (unsigned long long)ra : 0ull,
+                     have_region ? (unsigned long long)rs : 0ull,
+                     have_region ? ri.protection : -1, have_region ? ri.max_protection : -1,
+                     ck_lo, ck_hi, stale_lo, stale_hi, recommit_n );
+            return;
+        }
+        nz = ios_first_nonzero( snap, chk );
         if (nz < 0)
         {
             /* boring: first few, then sparse -- but the totals ride along */
@@ -13179,7 +13238,7 @@ static void ios_verify_commit_zero( const void *base, SIZE_T size, ULONG protect
             /* ml546 defect #2: ml545 printed bytes[0..7] from BASE while reporting
              * first_nonzero=+0x8 -- so it printed eight zeros and told us nothing
              * about the actual stale content. Print from the offending offset. */
-            const unsigned char *b = (const unsigned char *)base + nz;
+            const unsigned char *b = snap + nz;      /* ml981: the Mach snapshot, same bytes */
             if (hi) stale_hi++; else stale_lo++;      /* ALWAYS logged: this is the signal */
             dprintf( 2, "[commit-zero] #%lu %s *** STALE ON COMMIT *** base=%p size=0x%lx "
                      "protect=0x%x first_nonzero=+0x%lx checked=%lu/%lu stale=%lu/%lu recommit=%lu "
