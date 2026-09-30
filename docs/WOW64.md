@@ -87,7 +87,7 @@ unix side. The page past `B + 4 GB` is an overrun guard.
 |---|---|---|
 | Machine | `IMAGE_FILE_HEADER.Machine` read off disk: a `C:\...` path under the prefix's `drive_c`, or a bare name found in the bundle's `i386-windows` and in neither 64-bit farm | not probed further; the existing name heuristic decides, unchanged |
 | Session core | plain `aarch64-windows` (a WoW64 process's 64-bit half is aarch64) | unchanged |
-| Farms | `C:\windows\syswow64` -> `i386-windows`, plus `syswow64\wbem` and the x86 side-by-side store in `C:\windows\winsxs` | `syswow64` is linked when the bundle has the i386 set, so a 64-bit launcher can start a 32-bit child; nothing else |
+| Farms | `C:\windows\syswow64` -> `i386-windows`, plus `syswow64\wbem` and the x86 side-by-side store in `C:\windows\winsxs` | the same three, whenever the bundle has the i386 set: a 64-bit launcher (or the Dock host) starts 32-bit children, and the store's links name the bundle path, which changes on reinstall |
 | Bare name | `C:\windows\syswow64\<name>` | `C:\windows\system32\<name>` |
 | Before `__wine_main` | `ios_main_image_i386 = 1`; `FEX_MADEIRA_HOSTPROBE` published | `ios_main_image_i386 = 0`; `FEX_MADEIRA_HOSTPROBE` published only if the bundle has the i386 set |
 
