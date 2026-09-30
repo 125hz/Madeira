@@ -157,6 +157,10 @@ struct LibraryEntry: Codable, Identifiable {
     var bits: Int
     /// A user-chosen cover in Documents/madeira-art/.
     var coverFile: String?
+    /// The Steam store app this game was matched to (Game details › Find on
+    /// Steam). Only its public artwork is used: the library cover and the
+    /// starting screen's background, when no cover file is chosen.
+    var steamID: Int?
     var arguments = ""
     /// The virtual monitor's size ("WxH"): the session default a game renders
     /// for (GuestDisplay.configureSessionDefault), and the Desktop entry's
@@ -1009,6 +1013,30 @@ struct LibraryNavSearch: UIViewControllerRepresentable {
     }
 }
 
+struct SteamMatch: Decodable, Identifiable {
+    let id: Int
+    let name: String
+    let tiny_image: String?
+}
+
+/// The public Steam store: title search and store artwork for an app ID. No
+/// account, credentials, or private library access.
+enum SteamCatalog {
+    static func search(_ text: String) async throws -> [SteamMatch] {
+        var url = URLComponents(string: "https://store.steampowered.com/api/storesearch/")!
+        url.queryItems = [URLQueryItem(name: "term", value: text), URLQueryItem(name: "l", value: "english"), URLQueryItem(name: "cc", value: "US")]
+        var request = URLRequest(url: url.url!); request.timeoutInterval = 15
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200, data.count < 2_000_000 else {
+            throw LibraryError.message("Steam search is unavailable. You can still edit the title and artwork manually.")
+        }
+        struct Results: Decodable { var items: [SteamMatch] }
+        return Array(try JSONDecoder().decode(Results.self, from: data).items.prefix(30))
+    }
+    static func cover(_ id: Int) -> URL? { URL(string: "https://cdn.cloudflare.steamstatic.com/steam/apps/\(id)/library_600x900.jpg") }
+    static func hero(_ id: Int) -> URL? { URL(string: "https://cdn.cloudflare.steamstatic.com/steam/apps/\(id)/library_hero.jpg") }
+}
+
 struct LibraryArtwork: View {
     let entry: LibraryEntry
     var backdrop = false
@@ -1021,6 +1049,11 @@ struct LibraryArtwork: View {
                let image = UIImage(contentsOfFile: LibraryModel.documents.appendingPathComponent("madeira-art/" + URL(fileURLWithPath: name).lastPathComponent).path) {
                 Image(uiImage: image).resizable().scaledToFill()
                     .frame(width: geometry.size.width, height: geometry.size.height, alignment: .center).clipped()
+            } else if let id = entry.steamID {
+                AsyncImage(url: backdrop ? SteamCatalog.hero(id) : SteamCatalog.cover(id)) { image in
+                    image.resizable().scaledToFill()
+                        .frame(width: geometry.size.width, height: geometry.size.height, alignment: .center).clipped()
+                } placeholder: { Color.clear }
             }
         }
         .frame(width: geometry.size.width, height: geometry.size.height)
@@ -1475,6 +1508,7 @@ struct LibraryDetail: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var model = LibraryModel.shared
     @State private var importCover = false
+    @State private var findCover = false
     @State private var remove = false
     @State private var leaving = false
     @State private var error: String?
@@ -1531,8 +1565,9 @@ struct LibraryDetail: View {
                 }
                 if entry.desktop != true { Section("Library details") {
                     TextField("Title", text: $entry.title)
+                    Button("Find on Steam", systemImage: "magnifyingglass") { findCover = true }
                     Button("Choose cover image", systemImage: "photo") { importCover = true }
-                    if entry.coverFile != nil { Button("Remove cover image") { entry.coverFile = nil } }
+                    if entry.coverFile != nil { Button(entry.steamID != nil ? "Use Steam artwork" : "Remove cover image") { entry.coverFile = nil } }
                 } }
                 Section("Display") {
                     // The Windows screen the game renders for (and the Desktop's size).
@@ -1579,6 +1614,7 @@ struct LibraryDetail: View {
             .toolbarBackground(.regularMaterial, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { model.save(entry); dismiss() } } }
+            .sheet(isPresented: $findCover) { SteamSearchView(query: entry.title) { match in entry.steamID = match.id; entry.title = match.name; entry.coverFile = nil } }
             .fileImporter(isPresented: $importCover, allowedContentTypes: [.image]) { result in
                 do {
                     let url = try result.get(); let access = url.startAccessingSecurityScopedResource(); defer { if access { url.stopAccessingSecurityScopedResource() } }
@@ -1601,9 +1637,48 @@ struct LibraryDetail: View {
             }
             .onDisappear { if !leaving { model.save(entry) } }
             .onReceive(LibraryController.shared.commands) { command in
-                guard !leaving, !importCover, !remove else { return }
+                guard !leaving, !findCover, !importCover, !remove else { return }
                 if command == "back" { model.save(entry); dismiss() }
                 if command == "accept" { start() }
+            }
+        }
+    }
+}
+
+/// Game details › Find on Steam: searches the public store by title; choosing
+/// a result gives the entry that app's name and store artwork.
+struct SteamSearchView: View {
+    @State var query: String
+    var select: (SteamMatch) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var results: [SteamMatch] = []
+    @State private var error: String?
+    @State private var loading = false
+    @State private var submitted = ""
+    var body: some View {
+        NavigationStack {
+            List {
+                if loading { ProgressView("Searching Steam…") }
+                if let error { Text(error).foregroundStyle(.secondary) }
+                ForEach(results) { match in
+                    Button { select(match); dismiss() } label: {
+                        HStack {
+                            AsyncImage(url: URL(string: match.tiny_image ?? "")) { $0.resizable().scaledToFit() } placeholder: { Image(systemName: "gamecontroller") }.frame(width: 70, height: 40)
+                            Text(match.name).foregroundStyle(.primary)
+                        }
+                    }
+                }
+            }.navigationTitle("Find on Steam")
+            .searchable(text: $query, prompt: "Title").onSubmit(of: .search) { submitted = query }
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .onAppear { submitted = query }
+            .task(id: submitted) {
+                guard !submitted.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+                loading = true; error = nil
+                do { let found = try await SteamCatalog.search(submitted); try Task.checkCancellation(); results = found; if found.isEmpty { error = "No matches. Try a different title." } }
+                catch is CancellationError { return }
+                catch { self.error = error.localizedDescription }
+                loading = false
             }
         }
     }
