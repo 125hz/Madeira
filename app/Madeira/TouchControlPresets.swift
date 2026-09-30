@@ -133,28 +133,33 @@ enum ControlPresetLayout {
         add("LB", shoulderScale, L + shoulderX, bumperY)
         add("RB", shoulderScale, W - R - shoulderX, bumperY)
         add("RT", shoulderScale, W - R - shoulderX, triggerY)
-        // The columns' inner edge: the D-pad cross and the face diamond sit
-        // inboard of it, so they can rise above the bumper row.
+        // The columns' bottom and inner edge, for placing the D-pad cross and
+        // the face diamond below them (or, on a short screen, inboard of them).
+        let rowBottom = bumperY + shH / 2
         let columnInner = shoulderX + shW / 2 + 10 * k
 
-        // D-pad: a cross of four buttons just above the left stick (not
-        // mid-screen on a tall tablet), kept below the shoulder row.
-        // The cross sits a little inboard of the stick so its left arm stays
-        // inside the safe area with the wider spacing.
-        let dp = d(dpadScale), arm = dp + 12 * k
-        let dpadX = max(lStickX + 8 * k, L + columnInner + arm + dp / 2)
-        let dpadY = max(stickTop - 22 * k - arm - dp / 2, T + 6 * k + arm + dp / 2)
+        // D-pad: a tight cross at the left edge, between the shoulder column
+        // and the stick, so the middle of the screen stays clear. When the
+        // screen is too short for that stack (a phone with a tall column), the
+        // cross moves inboard of the column instead and rises beside it.
+        let dp = d(dpadScale), arm = dp + 6 * k
+        let stacked = rowBottom + 8 * k + 2 * arm + dp <= stickTop - 8 * k
+        let dpadX = stacked ? L + 6 * k + arm + dp / 2 : L + columnInner + arm + dp / 2
+        let dpadY = stacked ? rowBottom + 8 * k + arm + dp / 2
+                            : max(stickTop - 22 * k - arm - dp / 2, T + 6 * k + arm + dp / 2)
         add("D↑", dpadScale, dpadX, dpadY - arm)
         add("D←", dpadScale, dpadX - arm, dpadY)
         add("D→", dpadScale, dpadX + arm, dpadY)
         add("D↓", dpadScale, dpadX, dpadY + arm)
 
-        // A/B/X/Y: a diamond just above the right stick. Diagonal neighbours
-        // sit o·√2 apart, which clears one face button's diameter.
+        // A/B/X/Y: a tight diamond at the right edge, mirroring the D-pad.
+        // Diagonal neighbours sit o·√2 apart, which clears one face button's
+        // diameter.
         let face = d(faceScale)
-        let o = face / 2 + 24 * k
-        let cx = min(rStickX - 8 * k, W - R - columnInner - o - face / 2)
-        let cy = max(stickTop - 22 * k - o - face / 2, T + 6 * k + o + face / 2)
+        let o = face / 2 + 12 * k
+        let cx = stacked ? W - R - 6 * k - o - face / 2 : W - R - columnInner - o - face / 2
+        let cy = stacked ? rowBottom + 8 * k + o + face / 2
+                         : max(stickTop - 22 * k - o - face / 2, T + 6 * k + o + face / 2)
         add("Y", faceScale, cx, cy - o)
         add("X", faceScale, cx - o, cy)
         add("B", faceScale, cx + o, cy)
