@@ -73,8 +73,13 @@ for (label, screen) in screens {
     var overlaps: [String] = []
     for i in cs.indices { for j in cs.indices where j > i {
         let a = boxes[i], b = boxes[j]
+        // Round controls (a square box) are compared as circles, so the face
+        // diamond's diagonal neighbours may share box corners; anything else
+        // (wide shoulders, Start/Select pills) as its drawn box. 2 pt gap.
         let dx = a.midX - b.midX, dy = a.midY - b.midY
-        if (dx * dx + dy * dy).squareRoot() < a.width / 2 + b.width / 2 + 2 {
+        let round = abs(a.width - a.height) < 1e-9 && abs(b.width - b.height) < 1e-9
+        if round ? (dx * dx + dy * dy).squareRoot() < a.width / 2 + b.width / 2 + 2
+                 : a.insetBy(dx: -1, dy: -1).intersects(b) {
             overlaps.append("\(cs[i].action.label)/\(cs[j].action.label)")
         }
     } }
@@ -91,8 +96,9 @@ for (label, screen) in screens {
             "\(label): D-pad cross above the left stick")
     require(y.ny < x.ny && x.ny == b.ny && b.ny < a.ny && x.nx < y.nx && y.nx < b.nx && abs(y.nx - a.nx) < 1e-9
             && a.ny < r.ny && a.nx > 0.5, "\(label): Y top, X left, B right, A bottom, above the right stick")
-    require(lt.ny < 0.2 && lt.ny == lb.ny && lt.nx < lb.nx && lb.nx < 0.5 && rb.nx < rt.nx && rb.nx > 0.5,
-            "\(label): shoulder rows in the top corners, triggers outermost")
+    require(lt.ny < 0.2 && abs(lt.nx - lb.nx) < 1e-9 && lt.ny < lb.ny && lb.nx < 0.5
+            && abs(rt.nx - rb.nx) < 1e-9 && rt.ny < rb.ny && rb.nx > 0.5,
+            "\(label): shoulder columns in the top corners, triggers above bumpers")
     require(view.nx < 0.5 && menu.nx > 0.5 && abs(view.ny - menu.ny) < 1e-9, "\(label): View left of Menu, centre")
 }
 let ids = Set(ControlPresetLayout.xbox(for: .referencePhone).map { $0.id })

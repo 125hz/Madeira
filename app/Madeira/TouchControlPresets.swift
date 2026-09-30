@@ -77,11 +77,13 @@ enum ControlPresetLayout {
         CGRect(x: s.width / 2 - 100, y: 0, width: 200, height: 76)
     }
 
-    /// The drawn circle's bounding box, in points: every control is round,
-    /// `baseDiameter` × its scale across, centred on its normalised position.
+    /// The drawn bounding box, in points: `baseDiameter` × the control's scale
+    /// for a round button, the pad button's own shape otherwise (a wide
+    /// shoulder, a Start/Select pill), centred on its normalised position.
     static func box(_ c: TouchControl, screen s: ControlPresetScreen) -> CGRect {
-        let d = baseDiameter * c.scale
-        return CGRect(x: c.nx * s.width - d / 2, y: c.ny * s.height - d / 2, width: d, height: d)
+        let z = c.action.controlSize(diameter: CGFloat(baseDiameter * c.scale))
+        return CGRect(x: c.nx * s.width - Double(z.width) / 2, y: c.ny * s.height - Double(z.height) / 2,
+                      width: Double(z.width), height: Double(z.height))
     }
 
     /// The built-in controller layout, using the editor's controller mappings:
@@ -110,7 +112,7 @@ enum ControlPresetLayout {
         }
         func d(_ scale: Double) -> Double { baseDiameter * scale }
         let stickScale = 1.45 * k, faceScale = 0.78 * k, dpadScale = 0.7 * k
-        let shoulderScale = 0.8 * k, systemScale = 0.75 * k, clickScale = 0.62 * k
+        let shoulderScale = 0.88 * k, systemScale = 0.75 * k, clickScale = 0.62 * k
 
         // Sticks: bottom corners, clear of the home indicator.
         let stick = d(stickScale)
@@ -120,31 +122,44 @@ enum ControlPresetLayout {
         add("RS", stickScale, rStickX, stickY)
         let stickTop = stickY - stick / 2
 
-        // Shoulders: one row in each top corner, trigger outermost.
-        let sh = d(shoulderScale)
-        let shoulderY = T + 6 * k + sh / 2
-        let outer = sh / 2 + 6 * k, inner = outer + sh + 10 * k
-        add("LT", shoulderScale, L + outer, shoulderY)
-        add("LB", shoulderScale, L + inner, shoulderY)
-        add("RB", shoulderScale, W - R - inner, shoulderY)
-        add("RT", shoulderScale, W - R - outer, shoulderY)
-        let rowBottom = shoulderY + sh / 2
+        // Shoulders: a column in each top corner, trigger above bumper as on
+        // the controller. Drawn 1.6× as wide as they are tall and 0.74 d high
+        // (ControlAction.controlSize), so the column is two of those plus a gap.
+        let sh = d(shoulderScale), shW = sh * 1.6, shH = sh * 0.74
+        let shoulderX = shW / 2 + 6 * k
+        let triggerY = T + 6 * k + shH / 2
+        let bumperY = triggerY + shH + 8 * k
+        add("LT", shoulderScale, L + shoulderX, triggerY)
+        add("LB", shoulderScale, L + shoulderX, bumperY)
+        add("RB", shoulderScale, W - R - shoulderX, bumperY)
+        add("RT", shoulderScale, W - R - shoulderX, triggerY)
+        // The columns' bottom and inner edge, for placing the D-pad cross and
+        // the face diamond below them (or, on a short screen, inboard of them).
+        let rowBottom = bumperY + shH / 2
+        let columnInner = shoulderX + shW / 2 + 10 * k
 
-        // D-pad: a cross of four buttons just above the left stick (not
-        // mid-screen on a tall tablet), kept below the shoulder row.
+        // D-pad: a tight cross at the left edge, between the shoulder column
+        // and the stick, so the middle of the screen stays clear. When the
+        // screen is too short for that stack (a phone with a tall column), the
+        // cross moves inboard of the column instead and rises beside it.
         let dp = d(dpadScale), arm = dp + 6 * k
-        let dpadY = max(stickTop - 16 * k - arm - dp / 2, rowBottom + 12 * k + arm + dp / 2)
-        add("D↑", dpadScale, lStickX, dpadY - arm)
-        add("D←", dpadScale, lStickX - arm, dpadY)
-        add("D→", dpadScale, lStickX + arm, dpadY)
-        add("D↓", dpadScale, lStickX, dpadY + arm)
+        let stacked = rowBottom + 8 * k + 2 * arm + dp <= stickTop - 8 * k
+        let dpadX = stacked ? L + 6 * k + arm + dp / 2 : L + columnInner + arm + dp / 2
+        let dpadY = stacked ? rowBottom + 8 * k + arm + dp / 2
+                            : max(stickTop - 22 * k - arm - dp / 2, T + 6 * k + arm + dp / 2)
+        add("D↑", dpadScale, dpadX, dpadY - arm)
+        add("D←", dpadScale, dpadX - arm, dpadY)
+        add("D→", dpadScale, dpadX + arm, dpadY)
+        add("D↓", dpadScale, dpadX, dpadY + arm)
 
-        // A/B/X/Y: a diamond just above the right stick. Diagonal neighbours
-        // sit o·√2 apart, which clears one face button's diameter.
+        // A/B/X/Y: a tight diamond at the right edge, mirroring the D-pad.
+        // Diagonal neighbours sit o·√2 apart, which clears one face button's
+        // diameter.
         let face = d(faceScale)
-        let o = face / 2 + 17 * k
-        let cx = rStickX - 8 * k
-        let cy = max(stickTop - 16 * k - o - face / 2, rowBottom + 12 * k + o + face / 2)
+        let o = face / 2 + 22 * k
+        let cx = stacked ? W - R - 6 * k - o - face / 2 : W - R - columnInner - o - face / 2
+        let cy = stacked ? rowBottom + 8 * k + o + face / 2
+                         : max(stickTop - 22 * k - o - face / 2, T + 6 * k + o + face / 2)
         add("Y", faceScale, cx, cy - o)
         add("X", faceScale, cx - o, cy)
         add("B", faceScale, cx + o, cy)
@@ -153,15 +168,15 @@ enum ControlPresetLayout {
         // View / Menu: bottom centre, between the sticks.
         let sys = d(systemScale)
         let sysY = H - B - 20 * k - sys / 2
-        add("View", systemScale, W / 2 - 40 * k, sysY)
-        add("Menu", systemScale, W / 2 + 40 * k, sysY)
+        add("View", systemScale, W / 2 - 46 * k, sysY)
+        add("Menu", systemScale, W / 2 + 46 * k, sysY)
 
         // L3 / R3: small buttons on the inner side of each stick, level with
         // its bottom edge.
         let click = d(clickScale)
         let clickY = stickY + stick / 2 - click / 2
-        add("L3", clickScale, lStickX + stick / 2 + 14 * k + click / 2, clickY)
-        add("R3", clickScale, rStickX - stick / 2 - 14 * k - click / 2, clickY)
+        add("L3", clickScale, lStickX + stick / 2 + 20 * k + click / 2, clickY)
+        add("R3", clickScale, rStickX - stick / 2 - 20 * k - click / 2, clickY)
         return out
     }
 }
