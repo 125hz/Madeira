@@ -839,6 +839,10 @@ struct JoystickFace: View {
     /// size shows the glyph alone, where a knob plus a symbol would be a smudge.
     /// nil (the portrait pad) draws the face exactly as before.
     var glyph: String?
+    /// false: the caller puts the glass behind this face itself. The overlay
+    /// stick draws the face at pad size and scales it to the control; glass
+    /// under that scaleEffect is drawn off-centre from the ring and knob.
+    var glass = true
     private var expanded: Bool { held || alwaysExpanded }
 
     static let idleDiameter: CGFloat = 22
@@ -846,14 +850,6 @@ struct JoystickFace: View {
     private var idleDiameter: CGFloat { Self.idleDiameter }
     private var padRadius: CGFloat { Self.padRadius }
     private let knobTravelRatio: CGFloat = 0.30
-
-    @ViewBuilder private var interior: some View {
-        if #available(iOS 26.0, *) {
-            Circle().fill(.clear).glassEffect(.regular, in: Circle())
-        } else {
-            Circle().fill(.ultraThinMaterial)
-        }
-    }
 
     private func knobOffset(_ d: CGFloat) -> CGSize {
         guard dir >= 0, expanded else { return .zero }
@@ -864,8 +860,7 @@ struct JoystickFace: View {
 
     var body: some View {
         let d = expanded ? padRadius * 2 : idleDiameter
-        return ZStack {
-            interior
+        let face = ZStack {
             Circle().strokeBorder(Color.white.opacity(0.55), lineWidth: expanded ? 2 : 1.5)
             if let g = glyph, !expanded {
                 Image(systemName: g)
@@ -902,6 +897,14 @@ struct JoystickFace: View {
                 .opacity(glyph == nil || expanded ? 1 : 0)
         }
         .frame(width: d, height: d)
+        // The ring, glyph and knob are the glass's content, not siblings of it:
+        // an overlay stick sits in the controls' GlassEffectContainer, which
+        // composites every glass over its siblings and blurred the knob.
+        if glass {
+            face.glassFace(GlassShape(circle: true))
+        } else {
+            face
+        }
     }
 }
 
@@ -3842,19 +3845,26 @@ struct TouchControlButton: View {
             } else if control.action.stickKeys != nil {
                 // Reuse the portrait pad's face so both look and animate the
                 // same; scale it to whatever size this control was pinched to.
+                // The glass goes on at the control's real size, outside the
+                // scaleEffect, so it stays centred on the ring and knob.
                 JoystickFace(held: isDown, dir: stickDir, alwaysExpanded: true,
-                              glyph: control.action.stickGlyph)
+                              glyph: control.action.stickGlyph, glass: false)
                     .frame(width: JoystickFace.padRadius * 2,
                            height: JoystickFace.padRadius * 2)
                     .scaleEffect(diameter / (JoystickFace.padRadius * 2))
+                    .frame(width: diameter, height: diameter)
+                    .glassFace(GlassShape(circle: true))
             } else if control.action.isPad {
                 padFace
             } else {
-                GlassShape(circle: true)
+                // The label is the glass's content (see glassFace), so it is drawn
+                // on top of the glass rather than blurred underneath it.
                 Text(control.action.label)
                     .font(.system(size: diameter * (control.action.label.count > 2 ? 0.22 : 0.34),
                                   weight: .medium))
                     .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.85))
+                    .frame(width: size.width, height: size.height)
+                    .glassFace(GlassShape(circle: true))
             }
         }
         .frame(width: size.width, height: size.height)
