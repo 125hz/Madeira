@@ -16629,9 +16629,18 @@ static void *alloc_virtual_heap( SIZE_T size )
 }
 
 /* is_wow64() also asks the calling thread's TEB (wine unix_private.h), so a
- * 64-bit thread in a session that has a 32-bit process keeps its 64-bit
- * answer.  MADEIRA_WOW64_BY_TEB=0 restores the session-global answer. */
+ * thread that carries a 32-bit TEB is WoW64 whatever the global says.  A
+ * 64-bit thread has no 32-bit TEB and still gets the session-global
+ * !!wow_peb, which is TRUE in every process once any 32-bit pseudo-process
+ * has booted.  MADEIRA_WOW64_BY_TEB=0 restores the session-global answer. */
 int ios_wow64_by_teb = 1;
+
+/* get_extended_params(): a MEM_ADDRESS_REQUIREMENTS ceiling is a guest (WoW)
+ * ceiling only in a process that owns a guest window.  Every other process
+ * validates against the host ceiling, even after a 32-bit pseudo-process has
+ * set the session-wide wow_peb.  MADEIRA_WOW_LIMIT_BY_WINDOW=0 restores the
+ * session-wide is_wow64() fallback. */
+static int ios_wow_limit_by_window = 1;
 
 /***********************************************************************
  *           virtual_init
@@ -16786,6 +16795,8 @@ void virtual_init(void)
     {
         const char *e = getenv( "MADEIRA_WOW64_BY_TEB" );
         if (e && e[0] == '0') ios_wow64_by_teb = 0;
+        e = getenv( "MADEIRA_WOW_LIMIT_BY_WINDOW" );
+        if (e && e[0] == '0') ios_wow_limit_by_window = 0;
     }
 }
 
@@ -20960,12 +20971,35 @@ static NTSTATUS get_extended_params( const MEM_EXTENDED_PARAMETER *parameters, U
              * constraint only when its ceiling is below 4 GB (32-bit code
              * cannot name anything higher).  The CPU module's own allocators
              * in the same process pass explicit HIGH host bands and must be
-             * validated against the host ceiling.  Without a window this is
-             * the upstream rule. */
+             * validated against the host ceiling.
+             *
+             * A process WITHOUT a window of its own is a 64-bit process, and
+             * must not fall back to is_wow64(): for a 64-bit thread that reads
+             * the session-wide wow_peb, which every pseudo-process sees set
+             * once any 32-bit program has booted.  The 64-bit process then had
+             * its host band requests (the CPU module's per-thread lookup
+             * cache at 0x7c00000000+) rejected with STATUS_INVALID_PARAMETER
+             * against the 2/4 GB guest ceiling, before any placement ran. */
             if (ios_wow_base())
                 limit = ((ULONG_PTR)r->HighestEndingAddress &&
                          (ULONG_PTR)r->HighestEndingAddress < IOS_WOW_WINDOW_SIZE)
                         ? get_wow_user_space_limit() : (ULONG_PTR)user_space_limit;
+            else if (ios_wow_limit_by_window)
+            {
+                limit = (ULONG_PTR)user_space_limit;
+                if (is_wow64())
+                {
+                    static int no_window_n;
+
+                    if (no_window_n++ < 4)
+                        dprintf( 2, "[wow-hostreq] range [%p,%p] from a process without a guest "
+                                    "window while the session has a 32-bit process: validated "
+                                    "against the host ceiling %p, not the guest ceiling %p "
+                                    "(MADEIRA_WOW_LIMIT_BY_WINDOW=0 reverts)\n",
+                                 r->LowestStartingAddress, r->HighestEndingAddress,
+                                 (void *)limit, (void *)get_wow_user_space_limit() );
+                }
+            }
             else
 #endif
             if (is_wow64()) limit = get_wow_user_space_limit();
