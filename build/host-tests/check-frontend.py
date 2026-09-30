@@ -165,12 +165,13 @@ expect(!game.reducedX87, "reduced-precision x87 is off for new entries")
 setenv("FEX_X87REDUCEDPRECISION", "1", 1)
 game.applyEnvironment()
 expect(env("FEX_X87REDUCEDPRECISION") == nil, "x87: nothing exported unless chosen")
-expect(env("MADEIRA_CPU_COUNT") == nil && env("MADEIRA_FASTSYNC") == nil && env("MADEIRA_FASTSYNC_SEM") == nil
-       && env("DXMT_D9_ANISO_LIMIT") == nil, "no other engine switches are exported")
+expect(env("MADEIRA_CPU_COUNT") == nil && env("DXMT_D9_ANISO_LIMIT") == nil, "no other engine switches are exported")
+expect(env("MADEIRA_FASTSYNC") == "auto" && env("MADEIRA_FASTSYNC_SEM") == "0",
+       "no sync keys (Fastsync, the default): the game's fastsync switches are exported")
 expect(LogStore.shared.lines.last == "[display-shape] resolution=1280x720 mode=fit", "the profile's display shape is logged")
 // Fastsync's per-game switches: exported only when Settings chose Fastsync.
 MadeiraConfig.values = ["inproc-sync": "0"]
-game.applyEnvironment()
+unsetenv("MADEIRA_FASTSYNC"); unsetenv("MADEIRA_FASTSYNC_SEM"); game.applyEnvironment()
 expect(env("MADEIRA_FASTSYNC") == nil && env("MADEIRA_FASTSYNC_SEM") == nil, "Wine standard sync: no fastsync switches")
 MadeiraConfig.values = ["inproc-sync": "0", "env.MADEIRA_FASTSYNC": "auto"]
 game.applyEnvironment()
@@ -178,7 +179,7 @@ expect(env("MADEIRA_FASTSYNC") == "auto" && env("MADEIRA_FASTSYNC_SEM") == "0",
        "Fastsync: fast synchronization on by default (the chosen mode), semaphore waits off")
 game.fastSync = false; game.semaphoreFastPath = true; game.applyEnvironment()
 expect(env("MADEIRA_FASTSYNC") == "0" && env("MADEIRA_FASTSYNC_SEM") == "1", "Fastsync: the game's own switches are exported")
-MadeiraConfig.values = ["env.MADEIRA_FASTSYNC": "auto"]
+MadeiraConfig.values = ["inproc-sync": "1", "env.MADEIRA_FASTSYNC": "auto"]
 unsetenv("MADEIRA_FASTSYNC"); unsetenv("MADEIRA_FASTSYNC_SEM"); game.applyEnvironment()
 expect(env("MADEIRA_FASTSYNC") == nil && env("MADEIRA_FASTSYNC_SEM") == nil, "Madsync on: the game's fastsync switches are not exported")
 MadeiraConfig.values = [:]; game.fastSync = nil; game.semaphoreFastPath = nil

@@ -266,6 +266,7 @@ func pe(_ url: URL, machine: UInt16) throws {
         require(DockInstallers.programCount(game, drive: drive) == 5, "the sheet's program count")
 
         // ---- prepare(): a first start on a bundle without 32-bit support or msiexec
+        MadeiraConfig.values["inproc-sync"] = "1"   // madsync chosen: the per-session request applies
         try? FileManager.default.removeItem(at: prefix.appendingPathComponent(DockInstallLedger.fileName))
         try write(prefix.appendingPathComponent("system.reg"), "WINE REGISTRY Version 2\n\n[Software\\\\Wow6432Node\\\\Fixture Shared] 1700000000\n\"Shared Runtime\"=dword:00000001\n")
         try write(prefix.appendingPathComponent("user.reg"), "WINE REGISTRY Version 2\n")
@@ -350,6 +351,11 @@ func pe(_ url: URL, machine: UInt16) throws {
         require(!DockInstallers.serverSync && ((try? String(contentsOf: drive.appendingPathComponent("madeira-dock-installers.cmd"), encoding: .utf8)) ?? "").contains("--start-services"),
                 "madsync already off in madeira.cfg: the service step runs without a session request")
         MadeiraConfig.values = [:]
+        DockInstallers.setRunsNext(7000, true, prefix: prefix)
+        DockInstallers.prepare(game, drive: drive, prefix: prefix, has32Bit: true, hasMsiexec: false, fusionSource: nil)
+        require(!DockInstallers.serverSync && ((try? String(contentsOf: drive.appendingPathComponent("madeira-dock-installers.cmd"), encoding: .utf8)) ?? "").contains("--start-services")
+                && !(DockInstallers.note ?? "").contains("standard synchronization"),
+                "no inproc-sync (fastsync, the default engine): the service step runs, no madsync note")
         unsetenv("MADEIRA_DOCK_INSTALL_SERVER_SYNC")
         setenv("MADEIRA_DOCK_INSTALL_SCM", "0", 1)
         DockInstallers.setRunsNext(7000, true, prefix: prefix)
@@ -437,12 +443,12 @@ with tempfile.TemporaryDirectory(prefix='madeira-dock-installers-') as tmp:
             return int(re.search(r'madsync=(\d)', out.stdout).group(1)), out.stderr
 
         on, log = madsync_run()
-        require(on == 1 and 'ENABLED' in log and 'off for this session' not in log, 'no madeira.cfg, no session switch: madsync on (default unchanged)')
-        require(madsync_run('inproc-sync = 1\n')[0] == 1 and madsync_run('other = 1\n')[0] == 1, 'madeira.cfg with or without the key: on')
+        require(on == 0 and 'disabled' in log and 'off for this session' not in log, 'no madeira.cfg, no session switch: madsync off (fastsync is the default)')
+        require(madsync_run('inproc-sync = 1\n')[0] == 1 and madsync_run('other = 1\n')[0] == 0, 'madsync only with inproc-sync = 1')
         require(madsync_run('inproc-sync = 0\n')[0] == 0, 'inproc-sync = 0 still turns it off')
-        on, log = madsync_run(session='0')
+        on, log = madsync_run('inproc-sync = 1\n', session='0')
         require(on == 0 and '[madsync] off for this session (MADEIRA_MADSYNC_SESSION=0' in log, 'MADEIRA_MADSYNC_SESSION=0: off for this session, logged')
-        require(all(madsync_run(session=v)[0] == 1 for v in ('1', '', '00', 'off', '0 ')), 'any other session value leaves madsync on')
+        require(all(madsync_run('inproc-sync = 1\n', session=v)[0] == 1 for v in ('1', '', '00', 'off', '0 ')), 'any other session value leaves madsync on')
         require(madsync_run('inproc-sync = 0\n', session='1')[0] == 0, 'the session switch never turns madsync on')
 
 # ---- optional: run the generated batch with Windows cmd.exe (WSL interop)

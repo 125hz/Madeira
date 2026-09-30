@@ -336,9 +336,9 @@ other session sets it, and an engine without the switch ignores it.
 
 One-time installs change the engine for one session only: a Dock start that
 runs a game's installers sets `MADEIRA_MADSYNC_SESSION=0`, and madsync is off
-for that session, including the game Valve's client then starts in it. The
-madsync default is unchanged (`inproc-sync` still defaults to 1, and with the
-variable unset `madsync_enabled()` returns what it returned before); no other
+for that session, including the game Valve's client then starts in it. With
+the variable unset, `madsync_enabled()` returns what `madeira.cfg` selects
+(madsync only with `inproc-sync = 1`; fastsync is the default engine); no other
 code sets the variable. The next start, with the choice at "Skip", uses the
 configured engine again.
 

@@ -481,10 +481,11 @@ enum DockInstallers {
     nonisolated static var enabled: Bool { flag("MADEIRA_DOCK_INSTALLERS") }
     nonisolated static var choiceEnabled: Bool { enabled && flag("MADEIRA_DOCK_INSTALL_CHOICE") }
 
-    /// madeira.cfg `inproc-sync` as the engine reads it: on unless set to something else
-    /// than 1/on/true/yes (build/madeira_cfg.h).
+    /// Whether madeira.cfg selects madsync, as the engine reads it (madeira_cfg_sync_engine
+    /// in build/madeira_cfg.h): only inproc-sync set to 1/on/true/yes; unset is fastsync,
+    /// the default engine.
     static var madsyncConfigured: Bool {
-        guard let value = MadeiraConfig.get("inproc-sync") else { return true }
+        guard let value = MadeiraConfig.get("inproc-sync") else { return false }
         return ["1", "on", "true", "yes"].contains(value)
     }
 

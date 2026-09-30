@@ -52,10 +52,13 @@ Removing an entry never removes the game's files or saves.
 - **Settings**: JIT and memory status, Enable JIT, extended logging, pointer
   mode (Absolute, Relative or Touch) and touch sensitivity, **Display** (hold
   the display at its maximum rate, off by default), **Memory & sync** (swap tier
-  Off/1/2/4 GB, off by default; Madsync, on by default), the interface
+  Off/1/2/4 GB, off by default; sync engine, Fastsync by default), the interface
   switch and **Credits** (the last section). Display applies from the next session or FPS limit change; Memory &
-  sync after a restart. They write `env.MADEIRA_PROMOTE`, `swap-mb` and
-  `inproc-sync` in `Documents/madeira.cfg`, keeping every other line.
+  sync after a restart. They write `env.MADEIRA_PROMOTE`, `swap-mb`,
+  `inproc-sync` and `env.MADEIRA_FASTSYNC` in `Documents/madeira.cfg`, keeping
+  every other line. With neither sync key set the engine is fastsync
+  (`madeira_cfg_sync_engine` in `build/madeira_cfg.h`); `inproc-sync = 1` selects
+  madsync.
 
 ## Game details
 

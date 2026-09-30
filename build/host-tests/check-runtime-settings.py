@@ -6,13 +6,13 @@
    it keeps comments and other keys, replaces earlier lines for the key,
    removes a key for nil, migrates legacy madeira-*.txt files before creating
    madeira.cfg, and MadeiraConfig.flag() reads env.NAME lines. With the
-   production SyncEngine (Library.swift): no key is Madsync (the default);
-   Fastsync writes inproc-sync = 0 and env.MADEIRA_FASTSYNC = auto; Wine
-   standard sync writes inproc-sync = 0 and removes env.MADEIRA_FASTSYNC;
-   Madsync removes both; a hand-edited madeira.cfg reads back as the engine
+   production SyncEngine (Library.swift): no key is Fastsync (the default);
+   Fastsync removes both keys; Madsync writes inproc-sync = 1 and removes
+   env.MADEIRA_FASTSYNC; Wine standard sync writes inproc-sync = 0 and removes
+   env.MADEIRA_FASTSYNC; a hand-edited madeira.cfg reads back as the engine
    Wine will run (madsync wins over any MADEIRA_FASTSYNC value).
 2. Source checks on app/Madeira/Library.swift and FPSOverlay.swift: the
-   defaults are main's (swap tier off, madsync on, display-rate hold off), the
+   defaults are swap tier off, Fastsync and display-rate hold off, the
    Sync engine picker writes through SyncEngine.apply, game details offer the
    Fastsync-only switches greyed out unless Fastsync is chosen, launches export
    them only with Fastsync, and MADEIRA_RUNTIME_SETTINGS=0 hides both sections.
@@ -77,19 +77,20 @@ expect(MadeiraConfig.flag("MADEIRA_SOMETHING_ELSE"), "unset flags use their fall
 MadeiraConfig.set("inproc-sync", "0")
 expect(!MadeiraConfig.bool("inproc-sync", default: true), "madsync off is inproc-sync = 0")
 MadeiraConfig.set("inproc-sync", nil)
-expect(MadeiraConfig.bool("inproc-sync", default: true), "madsync on removes the key (main's default)")
+expect(MadeiraConfig.bool("inproc-sync", default: true), "a removed key reads as the default")
 
 // Sync engine: exactly one engine, and the keys Wine reads for it.
-expect(SyncEngine.current == .madsync, "no sync keys: Madsync (the default)")
+expect(SyncEngine.current == .fastsync, "no sync keys: Fastsync (the default)")
+SyncEngine.apply(.madsync)
 SyncEngine.apply(.fastsync)
-expect(MadeiraConfig.get("inproc-sync") == "0" && MadeiraConfig.get("env.MADEIRA_FASTSYNC") == "auto"
-       && SyncEngine.current == .fastsync, "Fastsync: inproc-sync = 0, env.MADEIRA_FASTSYNC = auto")
+expect(MadeiraConfig.get("inproc-sync") == nil && MadeiraConfig.get("env.MADEIRA_FASTSYNC") == nil
+       && SyncEngine.current == .fastsync, "Fastsync: both keys removed (the default)")
 SyncEngine.apply(.wine)
 expect(MadeiraConfig.get("inproc-sync") == "0" && MadeiraConfig.get("env.MADEIRA_FASTSYNC") == nil
        && SyncEngine.current == .wine, "Wine standard sync: inproc-sync = 0, no MADEIRA_FASTSYNC")
 SyncEngine.apply(.madsync)
-expect(MadeiraConfig.get("inproc-sync") == nil && MadeiraConfig.get("env.MADEIRA_FASTSYNC") == nil
-       && SyncEngine.current == .madsync, "Madsync: both keys removed")
+expect(MadeiraConfig.get("inproc-sync") == "1" && MadeiraConfig.get("env.MADEIRA_FASTSYNC") == nil
+       && SyncEngine.current == .madsync, "Madsync: inproc-sync = 1, no MADEIRA_FASTSYNC")
 let kept = try! String(contentsOf: cfg, encoding: .utf8)
 expect(kept.contains("# my notes") && kept.contains("wx = 1"), "engine changes keep comments and other keys")
 MadeiraConfig.set("env.MADEIRA_FASTSYNC", "1")
@@ -98,6 +99,10 @@ MadeiraConfig.set("inproc-sync", "0")
 expect(SyncEngine.current == .fastsync, "hand-edited: inproc-sync = 0 with MADEIRA_FASTSYNC = 1 is Fastsync")
 MadeiraConfig.set("env.MADEIRA_FASTSYNC", "0")
 expect(SyncEngine.current == .wine, "hand-edited: MADEIRA_FASTSYNC = 0 without madsync is Wine standard sync")
+MadeiraConfig.set("env.MADEIRA_FASTSYNC", nil)
+expect(SyncEngine.current == .wine, "inproc-sync = 0 without MADEIRA_FASTSYNC stays Wine standard sync (as written before)")
+MadeiraConfig.set("inproc-sync", nil)
+expect(SyncEngine.current == .fastsync, "neither key: Fastsync")
 exit(failed == 0 ? 0 : 1)
 '''
 
@@ -119,12 +124,12 @@ engine = block(lib, 'enum SyncEngine: String, CaseIterable, Identifiable')
 detail = lib[lib.index('struct LibraryDetail: View'):lib.index('struct RuntimeMemorySyncSettings: View')]
 apply_env = block(lib, 'func applyEnvironment()')
 entry = block(lib, 'struct LibraryEntry: Codable, Identifiable')
-check('MadeiraConfig.bool("inproc-sync", default: true)' in engine, 'madsync is the engine unless madeira.cfg says otherwise')
+check('return inproc == nil ? .fastsync : .wine' in engine, 'fastsync is the engine unless madeira.cfg says otherwise')
 check('@State private var engine = SyncEngine.current' in settings and 'Picker("Sync engine"' in settings
       and 'SyncEngine.apply(choice)' in settings and 'ForEach(SyncEngine.allCases)' in settings,
       'Settings: the Sync engine picker writes through SyncEngine.apply')
-check(['Madsync (default)', 'Fastsync', 'Wine standard sync'] == re.findall(r'case \.\w+: return "([^"]+)"', engine),
-      'the picker offers Madsync (default), Fastsync and Wine standard sync, in that order')
+check(['Madsync', 'Fastsync (default)', 'Wine standard sync'] == re.findall(r'case \.\w+: return "([^"]+)"', engine),
+      'the picker offers Madsync, Fastsync (default) and Wine standard sync, in that order')
 check('"env.MADEIRA_FASTSYNC"' in settings.split('static let featuredKeys')[1].split(']')[0],
       'All settings leaves env.MADEIRA_FASTSYNC to the picker')
 check('var fastSync: Bool?' in entry and 'var semaphoreFastPath: Bool?' in entry,

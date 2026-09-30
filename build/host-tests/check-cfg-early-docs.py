@@ -36,7 +36,7 @@ madsync = read("build/madsync/madsync.c")
 bridge = read("app/Madeira/WineProcessBridge.m")
 f_enabled = between(madsync, "int madsync_enabled(void)", "\n}\n", include_end=True)
 f_early = between(bridge, "static const char *g_madeira_docs_early", "__attribute__((constructor))")
-assert "madeira_cfg_bool( \"inproc-sync\", 1 )" in f_enabled, "inproc-sync default must stay 1"
+assert "madeira_cfg_sync_engine() == MADEIRA_SYNC_MADSYNC" in f_enabled, "madsync only when madeira.cfg selects it"
 assert "[madsync] config inproc-sync=" in f_enabled
 assert "__attribute__((constructor)) static void madeira_docs_dir_ctor" in bridge
 assert "[config-dir] early MADEIRA_DOCS_DIR=" in bridge
@@ -100,15 +100,15 @@ with tempfile.TemporaryDirectory(prefix="madeira-cfg-early-") as tmp:
         if not ok: raise SystemExit("FAIL: " + what + ("\n" + repr(r) if r else ""))
         print("ok:", what)
 
-    # -- default: madsync stays on when nothing is configured --
+    # -- default: fastsync, so madsync is off when nothing is configured --
     home = container("absent")
     r = launch(home)
-    check(r["early"] == "set" and r["dir"] == "env" and r["madsync"] == 1,
-          "no madeira.cfg: constructor exports MADEIRA_DOCS_DIR, madsync on (default)", r)
+    check(r["early"] == "set" and r["dir"] == "env" and r["madsync"] == 0,
+          "no madeira.cfg: constructor exports MADEIRA_DOCS_DIR, madsync off (fastsync is the default)", r)
     check("inproc-sync=unset cfg=absent dir=env" in r["log"], "log names value, file and directory", r)
     home = container("nokey", cfg=b"# user file\npool = 896\n")
     r = launch(home)
-    check(r["madsync"] == 1 and "cfg=present" in r["log"], "madeira.cfg without inproc-sync: madsync on (default)", r)
+    check(r["madsync"] == 0 and "cfg=present" in r["log"], "madeira.cfg without inproc-sync: madsync off (fastsync is the default)", r)
 
     # -- explicit choices are honoured although HOME is the prefix when they are read --
     home = container("off", cfg=b"# user file\ninproc-sync = 0\n")
@@ -117,38 +117,38 @@ with tempfile.TemporaryDirectory(prefix="madeira-cfg-early-") as tmp:
     home = container("on", cfg=b"inproc-sync = 1\n")
     r = launch(home)
     check(r["madsync"] == 1, "inproc-sync = 1 honoured", r)
-    home = container("legacy", legacy="0\n")
+    home = container("legacy", legacy="1\n")
     r = launch(home)
-    check(r["madsync"] == 0, "no madeira.cfg: legacy madeira-inproc-sync.txt still honoured", r)
+    check(r["madsync"] == 1, "no madeira.cfg: legacy madeira-inproc-sync.txt still honoured", r)
 
     # -- the bug: the old order (HOME = prefix, no MADEIRA_DOCS_DIR) misses the file --
-    home = container("old-order", cfg=b"inproc-sync = 0\n")
+    home = container("old-order", cfg=b"inproc-sync = 1\n")
     r = launch(home, ctor=False, cffixed=False)
-    check(r["madsync"] == 1 and r["dir"] == "home", "old order ignores inproc-sync = 0 (bug reproduced)", r)
+    check(r["madsync"] == 0 and r["dir"] == "home", "old order ignores inproc-sync = 1 (bug reproduced)", r)
     # the container home alone (no constructor) is enough
     r = launch(home, ctor=False, cffixed=True)
-    check(r["madsync"] == 0 and r["dir"] == "container", "CFFIXED_USER_HOME anchor alone finds the file", r)
+    check(r["madsync"] == 1 and r["dir"] == "container", "CFFIXED_USER_HOME anchor alone finds the file", r)
 
     # -- byte-order mark and CRLF --
-    home = container("bom", cfg=b"\xef\xbb\xbfinproc-sync = 0\r\npool = 896\r\n")
+    home = container("bom", cfg=b"\xef\xbb\xbfinproc-sync = 1\r\npool = 896\r\n")
     r = launch(home)
-    check(r["madsync"] == 0, "BOM + CRLF: first key still found", r)
+    check(r["madsync"] == 1, "BOM + CRLF: first key still found", r)
 
     # -- kill switches restore the old lookup --
-    home = container("kill-env", cfg=b"inproc-sync = 0\n")
+    home = container("kill-env", cfg=b"inproc-sync = 1\n")
     r = launch(home, extra={"MADEIRA_CFG_EARLY_DOCS": "0"})
-    check(r["early"] == "off-env" and r["madsync"] == 1 and r["dir"] == "home",
+    check(r["early"] == "off-env" and r["madsync"] == 0 and r["dir"] == "home",
           "MADEIRA_CFG_EARLY_DOCS=0 restores the old lookup", r)
-    home = container("kill-cfg", cfg=b"env.MADEIRA_CFG_EARLY_DOCS = 0\ninproc-sync = 0\n")
+    home = container("kill-cfg", cfg=b"env.MADEIRA_CFG_EARLY_DOCS = 0\ninproc-sync = 1\n")
     r = launch(home)
-    check(r["early"] == "off-cfg" and r["madsync"] == 1 and r["dir"] == "home",
+    check(r["early"] == "off-cfg" and r["madsync"] == 0 and r["dir"] == "home",
           "env.MADEIRA_CFG_EARLY_DOCS = 0 in madeira.cfg also restores it", r)
 
     # -- an existing MADEIRA_DOCS_DIR is kept --
-    other = container("other", cfg=b"inproc-sync = 0\n")
+    other = container("other", cfg=b"inproc-sync = 1\n")
     home = container("preset")
     r = launch(home, extra={"MADEIRA_DOCS_DIR": str(other / "Documents")})
-    check(r["early"] == "already-set" and r["madsync"] == 0, "an exported MADEIRA_DOCS_DIR is left alone", r)
+    check(r["early"] == "already-set" and r["madsync"] == 1, "an exported MADEIRA_DOCS_DIR is left alone", r)
 
     # -- Swift and C agree on a BOM file (optional) --
     if SWIFTC:
@@ -166,7 +166,7 @@ with tempfile.TemporaryDirectory(prefix="madeira-cfg-early-") as tmp:
         home = tmp / "bom"
         out = subprocess.run([str(tmp / "s")], check=True, capture_output=True, text=True,
                              env=base_env(home)).stdout
-        check("SWIFT inproc-sync=0" in out, "Swift reader agrees on the BOM + CRLF file", out)
+        check("SWIFT inproc-sync=1" in out, "Swift reader agrees on the BOM + CRLF file", out)
     else:
         print("skip: swiftc not found, Swift/C BOM agreement not checked")
 

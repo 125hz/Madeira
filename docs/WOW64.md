@@ -178,8 +178,10 @@ behaviour.
 
 The series does not change the 64-bit engine's defaults. In particular:
 
-- madsync stays on (`inproc-sync` defaults to 1 in `build/madsync/madsync.c`);
-  the series adds no other in-process sync engine.
+- madsync stays on (`inproc-sync` defaulted to 1 in `build/madsync/madsync.c`);
+  the series adds no other in-process sync engine. (Fastsync, added later, has
+  been the default engine since 2026-09-30; `inproc-sync = 1` still selects
+  madsync.)
 - The FEX code-buffer cap and ladder (128 MB, ml1052), the owner-aware
   code-buffer guard (ml1035), the bounded sweep retry (ml1106) and the
   ARM64EC alias cache (ml1116) are untouched; the ARM64EC FEX DLL builds to
