@@ -552,7 +552,7 @@ struct SteamGamesSection: View {
 
     private func cell(_ item: SteamGamesRules.Item, list: Bool, dense: Bool) -> some View {
         Button { select(item) } label: { SteamGameCell(item: item, list: list, dense: dense) }
-            .buttonStyle(.plain)
+            .libraryCardButtonStyle(grid: !list)
     }
 
     /// An installed game (by Madeira's download or by Steam's client) opens its
@@ -591,6 +591,10 @@ struct SteamSignInCard: View {
 /// A game's artwork: its candidates in turn until one loads.
 struct SteamGameArtwork: View {
     let appID: Int
+    /// A game that is not downloaded: no controller glyph while the artwork loads (the
+    /// card draws its download glyph instead), and a soft circle of blur in the middle
+    /// of the art for that glyph to sit on.
+    var notDownloaded = false
     @ObservedObject private var steam = SteamOwnedLibrary.shared
     @State private var index = 0
 
@@ -599,12 +603,15 @@ struct SteamGameArtwork: View {
         GeometryReader { geometry in
             ZStack {
                 Color(uiColor: .secondarySystemFill)
-                Image(systemName: "gamecontroller.fill").font(.largeTitle).foregroundStyle(.secondary)
+                if !notDownloaded {
+                    Image(systemName: "gamecontroller.fill").font(.largeTitle).foregroundStyle(.secondary)
+                }
                 AsyncImage(url: index < urls.count ? urls[index] : nil) { phase in
                     switch phase {
                     case .success(let image):
                         image.resizable().scaledToFill()
                             .frame(width: geometry.size.width, height: geometry.size.height).clipped()
+                            .overlay { if notDownloaded { SteamArtworkBlurSpot(image: image, size: geometry.size) } }
                     case .failure:
                         Color.clear.onAppear { if index + 1 < urls.count { index += 1 } }
                     default:
@@ -616,6 +623,36 @@ struct SteamGameArtwork: View {
         }
         .accessibilityHidden(true)
         .task(id: appID) { index = 0 }
+    }
+}
+
+/// A soft circle of progressive blur in the middle of a game's artwork, under a
+/// not-downloaded game's download glyph. There is no variable blur for views, so
+/// it stacks copies of the same loaded image, each blurred more and masked to a
+/// smaller radial fade: the blur ramps from the centre out to the sharp artwork
+/// with no edge. Sizes follow the artwork's shorter side, so a list thumbnail gets
+/// the same look as a grid card.
+private struct SteamArtworkBlurSpot: View {
+    let image: Image
+    let size: CGSize
+    /// (blur radius, fade radius) as fractions of the shorter side, outermost first.
+    private static let steps: [(blur: CGFloat, radius: CGFloat)] = [(0.008, 0.55), (0.015, 0.42), (0.025, 0.30)]
+
+    var body: some View {
+        let side = min(size.width, size.height)
+        ZStack {
+            ForEach(Self.steps.indices, id: \.self) { i in
+                image.resizable().scaledToFill()
+                    .frame(width: size.width, height: size.height).clipped()
+                    .blur(radius: side * Self.steps[i].blur, opaque: true)
+                    .mask {
+                        RadialGradient(stops: [.init(color: .black, location: 0), .init(color: .black.opacity(0.85), location: 0.35),
+                                               .init(color: .black.opacity(0.35), location: 0.7), .init(color: .clear, location: 1)],
+                                       center: .center, startRadius: 0, endRadius: side * Self.steps[i].radius)
+                    }
+            }
+        }
+        .allowsHitTesting(false)
     }
 }
 
@@ -652,13 +689,14 @@ private struct SteamGameCell: View {
                                             updateAvailable: steam.updateAvailable(appID: item.id, installedBuild: games.builds[item.id]))
         // An installed game's format (bits, graphics API, size) is kept on its library entry.
         let entry = library.entries.first { $0.steamAppID == item.id }
-        let opacity = item.installed?.installed == true || download != nil ? 1 : 0.6
+        let notDownloaded = item.installed?.installed != true && download == nil
         Group {
             if list && dense {
                 // One short row per game.
                 HStack(spacing: 10) {
-                    SteamGameArtwork(appID: item.id).frame(width: 28, height: 42)
-                        .clipShape(RoundedRectangle(cornerRadius: 5)).opacity(opacity)
+                    SteamGameArtwork(appID: item.id, notDownloaded: notDownloaded).frame(width: 28, height: 42)
+                        .overlay { if notDownloaded { notDownloadedFace(.caption) } }
+                        .clipShape(RoundedRectangle(cornerRadius: 5))
                     VStack(alignment: .leading, spacing: 2) {
                         Text(item.name).font(.subheadline.weight(.semibold)).lineLimit(1)
                         if let download { SteamDownloadStatus(download: download) }
@@ -672,8 +710,10 @@ private struct SteamGameCell: View {
                     .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 10))
             } else if list {
                 HStack(spacing: 14) {
-                    SteamGameArtwork(appID: item.id).frame(width: 48, height: 72)
-                        .overlay { overlay(download) }.clipShape(RoundedRectangle(cornerRadius: 8)).opacity(opacity)
+                    SteamGameArtwork(appID: item.id, notDownloaded: notDownloaded).frame(width: 48, height: 72)
+                        .overlay { overlay(download) }
+                        .overlay { if notDownloaded { notDownloadedFace(.title3) } }
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
                     VStack(alignment: .leading, spacing: 8) {
                         Text(item.name).font(.headline).lineLimit(2)
                         if let download { SteamDownloadStatus(download: download) } else { pills(status, entry) }
@@ -686,10 +726,14 @@ private struct SteamGameCell: View {
                 }.padding(10).background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
             } else {
                 VStack(alignment: .leading, spacing: 6) {
-                    SteamGameArtwork(appID: item.id).aspectRatio(2.0 / 3.0, contentMode: .fit)
+                    SteamGameArtwork(appID: item.id, notDownloaded: notDownloaded).aspectRatio(2.0 / 3.0, contentMode: .fit)
                         .overlay { overlay(download) }
+                        .overlay { if notDownloaded { notDownloadedFace(.largeTitle) } }
                         .clipShape(RoundedRectangle(cornerRadius: 12))
-                        .opacity(opacity)
+                        .modifier(LibraryCardArtworkPress { pressed, bounds in
+                            AmbientGlowItem(id: "steam-\(item.id)", seed: item.id, art: .steam(item.id), dimmed: notDownloaded,
+                                            pressed: pressed, bounds: bounds)
+                        })
                     Text(item.name).font(.subheadline.weight(.semibold)).lineLimit(2)
                     pills(status, entry)
                     if let played = steam.playtime[item.id]?.played {
@@ -724,6 +768,19 @@ private struct SteamGameCell: View {
             .padding(.horizontal, 5).padding(.vertical, 4)
             .background(.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
             .foregroundStyle(.secondary)
+    }
+
+    /// A game that is not downloaded: its artwork dimmed with black, which darkens it
+    /// in light and dark mode alike (fading it instead lightened it in light mode and
+    /// let the placeholder controller show through the art), under an iCloud-style
+    /// download glyph at half opacity. The artwork blurs softly under the glyph
+    /// (SteamArtworkBlurSpot).
+    private func notDownloadedFace(_ font: Font) -> some View {
+        ZStack {
+            Color.black.opacity(0.4)
+            Image(systemName: "icloud.and.arrow.down").font(font.weight(.medium))
+                .foregroundStyle(.white.opacity(0.5))
+        }
     }
 
     @ViewBuilder private func overlay(_ download: SteamOwnedLibrary.Download?) -> some View {
