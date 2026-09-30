@@ -4036,6 +4036,12 @@ void server_init_process_done(void)
         ios_srv_game_teb = (uintptr_t)NtCurrentTeb();
     }
 
+    /* Opt-in fastsync (wine/dlls/ntdll/unix/sync.c): the handle -> cell cache is
+     * shared by every process of this task and keyed by process id, and the server
+     * reissues the ids of dead processes, so drop what a dead process with this id
+     * left behind. This process owns no handles yet. A no-op while fastsync is off. */
+    madeira_fast_flush_pid();
+
     if (!get_device_info( initial_cwd, &info ) && (info.Characteristics & FILE_REMOVABLE_MEDIA))
         chdir( "/" );
     close( initial_cwd );

@@ -74,6 +74,10 @@ PATCHED_FILES=(
     # listed here -- they are otherwise linked from a prebuilt object and the
     # source edits would be dead code, the same trap as the unix/*.c forks.
     "event:$WINE_SRC/server/event.c:event.o"
+    # Fastsync's semaphore half (madeira_semaphore_cell_index and friends in
+    # server/semaphore.c) is referenced by inproc_sync.c and thread.c, so it is
+    # compiled from the submodule and swapped in as well.
+    "semaphore:$WINE_SRC/server/semaphore.c:semaphore.o"
     "handle:$WINE_SRC/server/handle.c:handle.o"
     # ml575: async.c carries the free_async_queue UAF fix.
     "async:$WINE_SRC/server/async.c:async.o"
@@ -174,6 +178,7 @@ REPLACEMENTS=(
     # compiles cleanly, ships the OLD object, and fails at link with an undefined
     # symbol -- which is exactly what happened first try.
     "event.o:event.o"
+    "semaphore.o:semaphore.o"
     "handle.o:handle.o"
     "inproc_sync.o:inproc_sync.o"   # ml1058
 )

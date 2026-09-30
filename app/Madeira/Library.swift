@@ -217,6 +217,12 @@ struct LibraryEntry: Codable, Identifiable {
     /// `graphicsAPI` were read for, and whether Steam's launch configuration was
     /// cached (LibraryModel.refreshSteamMetadata); any change reads them again.
     var steamMetadataInstall: String?
+    /// Fastsync's per-game switches, used only while Settings › Sync engine is
+    /// Fastsync: "Fast synchronization" (nil = on; off gives this game Wine's
+    /// standard sync) and "Fast semaphore waits" (nil = off). Optional, so older
+    /// library files decode; the fork's files carry the same keys.
+    var fastSync: Bool?
+    var semaphoreFastPath: Bool?
 
     var displayMode: DisplayMode { display.flatMap(DisplayMode.init(rawValue:)) ?? .fit }
 
@@ -282,6 +288,13 @@ struct LibraryEntry: Codable, Identifiable {
         // madeira.cfg setting), as before these choices existed.
         if let cpuCount, (1..<64).contains(cpuCount) { setenv("MADEIRA_CPU_COUNT", String(cpuCount), 1) }
         if let anisotropyLimit, [1, 2, 4, 8].contains(anisotropyLimit) { setenv("DXMT_D9_ANISO_LIMIT", String(anisotropyLimit), 1) }
+        // Fastsync's per-game switches, only when Settings chose Fastsync; with Madsync
+        // (the default) or Wine's standard sync nothing is exported here.
+        if SyncEngine.current == .fastsync {
+            let mode = MadeiraConfig.get("env.MADEIRA_FASTSYNC") ?? "auto"
+            setenv("MADEIRA_FASTSYNC", fastSync == false ? "0" : mode, 1)
+            setenv("MADEIRA_FASTSYNC_SEM", semaphoreFastPath == true ? "1" : "0", 1)
+        }
         madeira_set_vsync_locked(effectiveFPSMode)
         fputs("[frontend] launch profile applied\n", stderr)
         LogStore.shared.log("[display-shape] resolution=\(resolution) mode=\(displayMode.rawValue)")
@@ -1687,6 +1700,9 @@ struct LibraryDetail: View {
     @State private var remove = false
     @State private var leaving = false
     @State private var error: String?
+    /// Settings › Sync engine, read when the details open: the fastsync switches
+    /// below only apply while it is Fastsync.
+    @State private var syncEngine = SyncEngine.current
     static let presetResolutions = ["640x480", "800x600", "960x540", "1024x768", "1280x720", "1280x960", "1408x648", "1920x1080", "2560x1440"]
     /// The presets, plus a stored size that is none of them (a screen shape
     /// chosen on another device), so the picker never shows a blank choice.
@@ -1797,12 +1813,24 @@ struct LibraryDetail: View {
                         Text("Application default").tag(0)
                         ForEach([1, 2, 4, 8], id: \.self) { Text("Up to \($0)×").tag($0) }
                     }
+                    // Fastsync-only switches: shown for every game, usable only while
+                    // Settings › Sync engine is Fastsync.
+                    Group {
+                        Toggle("Fast synchronization", isOn: Binding(get: { entry.fastSync ?? true }, set: { entry.fastSync = $0 }))
+                        Toggle("Fast semaphore waits (experimental)",
+                               isOn: Binding(get: { entry.semaphoreFastPath ?? false }, set: { entry.semaphoreFastPath = $0 }))
+                    }
+                    .disabled(syncEngine != .fastsync)
+                    if syncEngine != .fastsync {
+                        Text("Fast synchronization and fast semaphore waits are Fastsync options. Choose Fastsync in Settings › Memory & sync to use them.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // A Steam game starts with Steam's own launch option through Madeira Dock.
                     if entry.desktop != true && entry.steamAppID == nil {
                         TextField("Launch arguments", text: $entry.arguments, axis: .vertical).autocorrectionDisabled().textInputAutocapitalization(.never)
                     }
                 } header: { Text("Compatibility & performance") } footer: {
-                    Text("Reduced-precision x87 can make older games faster at some cost in accuracy; it is off by default. Settings apply to the next launch; a precision change may still require restarting Madeira.")
+                    Text("Reduced-precision x87 can make older games faster at some cost in accuracy; it is off by default. With Fastsync, fast synchronization (on by default) handles events without a server round trip, and fast semaphore waits (off by default) does the same for semaphores. Settings apply to the next launch; a precision change may still require restarting Madeira.")
                 }
                 Section("On screen") {
                     Toggle("Performance overlay", isOn: $entry.performance)
@@ -1920,7 +1948,7 @@ struct MadeiraCredit: View {
 /// Settings › Memory & sync: the JIT pool (madeira.cfg pool), the video memory
 /// budget (vram-mb), the file-backed swap tier (swap-mb, off by default, and
 /// env.MADEIRA_SWAP_COVERAGE, which allocations it backs) and the in-process sync
-/// engine madsync (inproc-sync, on by default). All are read when Madeira starts,
+/// engine (SyncEngine: madsync by default, fastsync or Wine's own). All are read when Madeira starts,
 /// so changes apply after a restart. "All settings" opens every other option.
 /// MADEIRA_RUNTIME_SETTINGS=0 hides this section.
 /// A sheet opened from Settings; LibraryView presents it from the Form itself.
@@ -1929,13 +1957,43 @@ enum SettingsSheet: String, Identifiable {
     var id: String { rawValue }
 }
 
+/// The in-process synchronisation engine, one per session. Madsync is the default
+/// (madeira.cfg inproc-sync unset or 1). Fastsync turns madsync off (inproc-sync = 0)
+/// and sets env.MADEIRA_FASTSYNC = auto; Wine standard sync turns both off. Wine
+/// reads both once per app run, and never runs fastsync while madsync is on.
+enum SyncEngine: String, CaseIterable, Identifiable {
+    case madsync, fastsync, wine
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .madsync: return "Madsync (default)"
+        case .fastsync: return "Fastsync"
+        case .wine: return "Wine standard sync"
+        }
+    }
+    /// The MADEIRA_FASTSYNC values Wine treats as "fastsync on" (sync.c, event.c).
+    static let fastsyncValues: Set<String> = ["1", "on", "yes", "auto", "cells"]
+    static var current: SyncEngine {
+        if MadeiraConfig.bool("inproc-sync", default: true) { return .madsync }
+        return fastsyncValues.contains(MadeiraConfig.get("env.MADEIRA_FASTSYNC") ?? "") ? .fastsync : .wine
+    }
+    static func apply(_ engine: SyncEngine) {
+        switch engine {
+        case .madsync: MadeiraConfig.set("inproc-sync", nil); MadeiraConfig.set("env.MADEIRA_FASTSYNC", nil)
+        case .fastsync: MadeiraConfig.set("inproc-sync", "0"); MadeiraConfig.set("env.MADEIRA_FASTSYNC", "auto")
+        case .wine: MadeiraConfig.set("inproc-sync", "0"); MadeiraConfig.set("env.MADEIRA_FASTSYNC", nil)
+        }
+    }
+}
+
 struct RuntimeMemorySyncSettings: View {
     /// Opens a Settings sheet (LibraryView owns the presentation).
     var open: (SettingsSheet) -> Void = { _ in }
     /// Bumped when a Settings sheet closes, so the rows re-read madeira.cfg.
     var refresh = 0
     /// The keys this section owns; All settings leaves them out.
-    static let featuredKeys: Set<String> = ["pool", "vram-mb", "swap-mb", "env.MADEIRA_SWAP_COVERAGE", "inproc-sync", "eco"]
+    static let featuredKeys: Set<String> = ["pool", "vram-mb", "swap-mb", "env.MADEIRA_SWAP_COVERAGE", "inproc-sync",
+                                            "env.MADEIRA_FASTSYNC", "eco"]
     static let poolChoices = [0, 512, 640, 768, 1024, 1152]          // 0 = the standard 896 MB
     static let vramChoices = [0, 1536, 2048, 3072, 4096, 4352, 4608, 5120, 6144]   // 0 = automatic
     static let swapChoices = [0, 1024, 2048, 3072, 4096]
@@ -1947,7 +2005,7 @@ struct RuntimeMemorySyncSettings: View {
     @State private var vramMB = Self.intKey("vram-mb")
     @State private var swapMB = Self.intKey("swap-mb")
     @State private var coverage = Self.currentCoverage()
-    @State private var madsync = MadeiraConfig.bool("inproc-sync", default: true)
+    @State private var engine = SyncEngine.current
     @State private var eco = MadeiraConfig.bool("eco", default: false)
     @State private var changed = false
 
@@ -1990,11 +2048,13 @@ struct RuntimeMemorySyncSettings: View {
                 if !Self.coverageChoices.contains(where: { $0.0 == coverage }) { Text(coverage).tag(coverage) }
             }
             .disabled(swapMB == 0)
-            Toggle("Madsync", isOn: Binding(get: { madsync }, set: { on in
-                madsync = on; changed = true
-                MadeiraConfig.set("inproc-sync", on ? nil : "0")
-                LogStore.shared.log("[runtime-settings] inproc-sync=\(on ? 1 : 0)")
-            }))
+            Picker("Sync engine", selection: Binding(get: { engine }, set: { choice in
+                engine = choice; changed = true
+                SyncEngine.apply(choice)
+                LogStore.shared.log("[runtime-settings] sync-engine=\(choice.rawValue)")
+            })) {
+                ForEach(SyncEngine.allCases) { Text($0.label).tag($0) }
+            }
             Toggle("Eco mode", isOn: Binding(get: { eco }, set: { on in
                 eco = on; changed = true
                 MadeiraConfig.set("eco", on ? "1" : nil)
@@ -2008,14 +2068,14 @@ struct RuntimeMemorySyncSettings: View {
                 Text("JIT pool is the memory reserved at launch for translated x86 code (256 to 1152 MB).")
                 Text("Video memory is how much graphics memory games are told they have. Automatic sizes it from the memory free at launch. Too high can get Madeira closed for using too much memory; too low makes games keep reloading textures.")
                 Text("Swap tier moves game data to a file on this device's storage when memory runs short, up to the chosen size, at some speed cost. Coverage decides which allocations it moves: large ones only (8 MB and up, the default), every allocation of 1 MB and up, or those plus allocations that overflow the game's address range. Wider coverage saves more memory but can slow a game down.")
-                Text("Madsync is the in-process synchronisation engine (on by default).")
+                Text("Sync engine: Madsync is the in-process synchronisation engine (the default). Fastsync is an alternative engine for events and semaphores; its per-game options are in each game's details. Wine standard sync uses neither. Only one engine runs at a time.")
                 Text("Eco mode starts every game with its threads at a low priority, which saves power but makes games run slower. Off by default. It is meant for loading screens: the ECO pill in the performance overlay turns it on and off while a game runs.")
                 if changed { Text("Restart Madeira (close it from the app switcher) for these changes to apply.").foregroundStyle(.orange) }
             }
         }
         .onChange(of: refresh) { _, _ in
             poolMB = Self.intKey("pool"); vramMB = Self.intKey("vram-mb"); swapMB = Self.intKey("swap-mb")
-            coverage = Self.currentCoverage(); madsync = MadeiraConfig.bool("inproc-sync", default: true)
+            coverage = Self.currentCoverage(); engine = SyncEngine.current
             eco = MadeiraConfig.bool("eco", default: false)
         }
     }
