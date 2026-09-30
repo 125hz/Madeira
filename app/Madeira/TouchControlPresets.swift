@@ -156,7 +156,7 @@ enum ControlPresetLayout {
         // Diagonal neighbours sit o·√2 apart, which clears one face button's
         // diameter.
         let face = d(faceScale)
-        let o = face / 2 + 12 * k
+        let o = face / 2 + 22 * k
         let cx = stacked ? W - R - 6 * k - o - face / 2 : W - R - columnInner - o - face / 2
         let cy = stacked ? rowBottom + 8 * k + o + face / 2
                          : max(stickTop - 22 * k - o - face / 2, T + 6 * k + o + face / 2)
