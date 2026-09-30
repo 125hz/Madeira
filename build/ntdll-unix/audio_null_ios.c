@@ -347,6 +347,11 @@ struct ios_stream {
     int is_float;                /* ring holds float32 (else signed integer) */
     int sample_bits;             /* bits per channel in the ring */
     int mixable;                 /* format understood by the mixer */
+    UINT32 channel_mask;         /* dwChannelMask, 0 = "use the default layout" */
+    /* Per-client-channel gain into the endpoint's stereo bus. Built once from
+     * the channel mask at create_stream; this is the 5.1 (and 7.1, quad and
+     * mono) downmix. Read-only once the stream is published to the mixer. */
+    float mix_gain[8][2];
     BYTE *ring;
     _Atomic uint64_t write_pos;  /* frames produced by the game (monotonic) */
     _Atomic uint64_t play_pos;   /* frames consumed by the RT callback */
@@ -509,6 +514,131 @@ static uint64_t elapsed_frames(const struct ios_stream *s) {
     return s->accumulated_frames + (ns * s->sample_rate / 1000000000ull);
 }
 
+/* ------------------- Channel downmix into the stereo bus ------------------- */
+
+/* SPEAKER_* bits from ksmedia.h, in the order WAVEFORMATEXTENSIBLE requires
+ * the channels to appear in the buffer (low bit first). */
+#define IOS_SPK_FRONT_LEFT            0x00001
+#define IOS_SPK_FRONT_RIGHT           0x00002
+#define IOS_SPK_FRONT_CENTER          0x00004
+#define IOS_SPK_LOW_FREQUENCY         0x00008
+#define IOS_SPK_BACK_LEFT             0x00010
+#define IOS_SPK_BACK_RIGHT            0x00020
+#define IOS_SPK_FRONT_LEFT_OF_CENTER  0x00040
+#define IOS_SPK_FRONT_RIGHT_OF_CENTER 0x00080
+#define IOS_SPK_BACK_CENTER           0x00100
+#define IOS_SPK_SIDE_LEFT             0x00200
+#define IOS_SPK_SIDE_RIGHT            0x00400
+
+#define IOS_GAIN_M3DB  0.70710678f
+#define IOS_GAIN_M10DB 0.316f
+
+/* dwChannelMask of a WAVEFORMATEXTENSIBLE, 0 for a plain WAVEFORMATEX. */
+static UINT32 ios_fmt_channel_mask(const struct WAVEFORMATEX_stub *fmt)
+{
+    uint32_t mask;
+    if (!fmt || fmt->wFormatTag != 0xFFFE || fmt->cbSize < 22) return 0;
+    memcpy(&mask, (const uint8_t *)fmt + 20, sizeof(mask));
+    return mask;
+}
+
+/* MADEIRA_AUDIO_DOWNMIX=0 restores the old mapping (channel 0 to the left,
+ * channel 1 to the right, everything else dropped). Read on the create_stream
+ * thread, never from the render callback. */
+static int ios_downmix_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("MADEIRA_AUDIO_DOWNMIX");
+        cached = !(e && e[0] == '0' && !e[1]);
+    }
+    return cached;
+}
+
+/* Build the per-channel downmix into the stereo bus.
+ *
+ * The mixer used to take channels 0 and 1 of every client frame and drop the
+ * rest. For a 5.1 client that keeps front left/right and loses the centre,
+ * LFE and surrounds -- and the centre is where a 5.1 mix puts dialogue, so a
+ * 5.1 client played music and effects with its dialogue silent. This folds
+ * every channel in with the standard ITU coefficients: centre and the
+ * surrounds at -3 dB, LFE at -10 dB (dropping it entirely loses the bass a
+ * title puts ONLY there); the render callback already clamps the sum.
+ *
+ * The layout comes from dwChannelMask when there is one. When there is not
+ * -- a plain WAVEFORMATEX -- the channel count implies the standard layout,
+ * which is what every other WASAPI implementation assumes too. */
+static void ios_build_mix_gains(struct ios_stream *s, UINT32 mask)
+{
+    static const UINT32 default_mask[9] = {
+        0,
+        IOS_SPK_FRONT_CENTER,                                            /* 1: mono */
+        IOS_SPK_FRONT_LEFT | IOS_SPK_FRONT_RIGHT,                        /* 2 */
+        IOS_SPK_FRONT_LEFT | IOS_SPK_FRONT_RIGHT | IOS_SPK_FRONT_CENTER, /* 3 */
+        IOS_SPK_FRONT_LEFT | IOS_SPK_FRONT_RIGHT | IOS_SPK_BACK_LEFT | IOS_SPK_BACK_RIGHT,
+        IOS_SPK_FRONT_LEFT | IOS_SPK_FRONT_RIGHT | IOS_SPK_FRONT_CENTER |
+            IOS_SPK_BACK_LEFT | IOS_SPK_BACK_RIGHT,                      /* 5 */
+        IOS_SPK_FRONT_LEFT | IOS_SPK_FRONT_RIGHT | IOS_SPK_FRONT_CENTER |
+            IOS_SPK_LOW_FREQUENCY | IOS_SPK_BACK_LEFT | IOS_SPK_BACK_RIGHT, /* 6: 5.1 */
+        IOS_SPK_FRONT_LEFT | IOS_SPK_FRONT_RIGHT | IOS_SPK_FRONT_CENTER |
+            IOS_SPK_LOW_FREQUENCY | IOS_SPK_BACK_CENTER |
+            IOS_SPK_SIDE_LEFT | IOS_SPK_SIDE_RIGHT,                      /* 7: 6.1 */
+        IOS_SPK_FRONT_LEFT | IOS_SPK_FRONT_RIGHT | IOS_SPK_FRONT_CENTER |
+            IOS_SPK_LOW_FREQUENCY | IOS_SPK_BACK_LEFT | IOS_SPK_BACK_RIGHT |
+            IOS_SPK_SIDE_LEFT | IOS_SPK_SIDE_RIGHT                       /* 8: 7.1 */
+    };
+    UINT32 ch = s->channels > 8 ? 8 : s->channels, c, bit, i;
+
+    memset(s->mix_gain, 0, sizeof(s->mix_gain));
+    if (!ch) return;
+
+    /* One channel is mono however it is labelled: it goes to both sides at
+     * unity, not at -3 dB, or a mono client is half as loud as a stereo one.
+     * This is also what the mixer always did with a mono client. */
+    if (ch == 1) {
+        s->mix_gain[0][0] = s->mix_gain[0][1] = 1.0f;
+        return;
+    }
+
+    if (!ios_downmix_enabled()) {
+        s->mix_gain[0][0] = 1.0f;
+        s->mix_gain[1][1] = 1.0f;
+        return;
+    }
+
+    if (!mask || s->channels > 8) mask = default_mask[ch];
+
+    /* Walk the mask low bit first; the Nth set bit is the Nth channel in the
+     * interleaved frame. */
+    c = 0;
+    for (i = 0; i < 11 && c < ch; i++) {
+        bit = 1u << i;
+        if (!(mask & bit)) continue;
+        switch (bit) {
+        case IOS_SPK_FRONT_LEFT:            s->mix_gain[c][0] = 1.0f; break;
+        case IOS_SPK_FRONT_RIGHT:           s->mix_gain[c][1] = 1.0f; break;
+        case IOS_SPK_FRONT_CENTER:
+        case IOS_SPK_BACK_CENTER:
+            s->mix_gain[c][0] = s->mix_gain[c][1] = IOS_GAIN_M3DB; break;
+        case IOS_SPK_LOW_FREQUENCY:
+            s->mix_gain[c][0] = s->mix_gain[c][1] = IOS_GAIN_M10DB; break;
+        case IOS_SPK_BACK_LEFT:
+        case IOS_SPK_SIDE_LEFT:
+        case IOS_SPK_FRONT_LEFT_OF_CENTER:  s->mix_gain[c][0] = IOS_GAIN_M3DB; break;
+        case IOS_SPK_BACK_RIGHT:
+        case IOS_SPK_SIDE_RIGHT:
+        case IOS_SPK_FRONT_RIGHT_OF_CENTER: s->mix_gain[c][1] = IOS_GAIN_M3DB; break;
+        default: break;
+        }
+        c++;
+    }
+    /* A mask that names fewer speakers than the stream has channels (or only
+     * speakers we do not place, such as the top ones) would silence the rest;
+     * fold anything left over into both sides quietly rather than dropping it. */
+    for (; c < ch; c++)
+        s->mix_gain[c][0] = s->mix_gain[c][1] = 0.5f;
+}
+
 /* ------------------- Tier-2: RemoteIO real output ------------------- */
 
 /* Core Audio real-time thread. Ring + atomics ONLY — no Wine calls, no
@@ -522,6 +652,7 @@ static void ios_mix_stream(struct ios_stream *s, float *out, UInt32 nframes,
                            UINT32 dev_ch, UINT32 dev_rate)
 {
     UINT32 cap = s->buffer_frames, sch = s->channels, fb = s->frame_bytes;
+    UINT32 mch = sch > 8 ? 8 : sch;   /* channels with a gain; the rest are dropped */
     uint64_t play, wr, avail, need;
     UInt32 f;
 
@@ -542,22 +673,29 @@ static void ios_mix_stream(struct ios_stream *s, float *out, UInt32 nframes,
                         ? (uint64_t)f
                         : ((uint64_t)f * s->sample_rate) / dev_rate;
         const BYTE *fr;
-        float l, r;
+        float l = 0.0f, r = 0.0f;
+        UINT32 c;
 
         if (sidx >= need) break;
         fr = s->ring + (size_t)((play + sidx) % cap) * fb;
 
-        if (s->is_float) {
-            const float *v = (const float *)fr;
-            l = v[0]; r = sch > 1 ? v[1] : v[0];
-        } else if (s->sample_bits == 16) {
-            const int16_t *v = (const int16_t *)fr;
-            l = (float)v[0] * (1.0f / 32768.0f);
-            r = sch > 1 ? (float)v[1] * (1.0f / 32768.0f) : l;
-        } else {   /* 32-bit signed integer */
-            const int32_t *v = (const int32_t *)fr;
-            l = (float)v[0] * (1.0f / 2147483648.0f);
-            r = sch > 1 ? (float)v[1] * (1.0f / 2147483648.0f) : l;
+        /* Fold every client channel into the stereo bus with the gains
+         * ios_build_mix_gains chose at create_stream. */
+        for (c = 0; c < mch; c++) {
+            float v;
+            if (s->is_float) {
+                memcpy(&v, fr + (size_t)c * 4, 4);
+            } else if (s->sample_bits == 16) {
+                int16_t i16;
+                memcpy(&i16, fr + (size_t)c * 2, 2);
+                v = (float)i16 * (1.0f / 32768.0f);
+            } else {   /* 32-bit signed integer */
+                int32_t i32;
+                memcpy(&i32, fr + (size_t)c * 4, 4);
+                v = (float)i32 * (1.0f / 2147483648.0f);
+            }
+            l += v * s->mix_gain[c][0];
+            r += v * s->mix_gain[c][1];
         }
 
         out[(size_t)f * dev_ch + 0] += l;
@@ -717,10 +855,23 @@ static int ios_dev_attach(struct ios_stream *s, const struct WAVEFORMATEX_stub *
         fprintf(stderr, "[ios_audio] ml1026 mixer full -- client stays silent\n");
         return -1;
     }
-    fprintf(stderr, "[ios_audio] ml1026 MIX slot=%d rate=%u ch=%u fb=%u float=%d "
-                    "(endpoint %u Hz %u ch)\n",
-            slot, s->sample_rate, s->channels, s->frame_bytes, s->is_float,
-            g_dev.rate, g_dev.channels);
+    {   /* the downmix this client gets, one L/R gain pair per channel */
+        char gains[160];
+        size_t n = 0;
+        UINT32 c, mch = s->channels > 8 ? 8 : s->channels;
+        gains[0] = 0;
+        for (c = 0; c < mch && n < sizeof(gains); c++) {
+            int w = snprintf(gains + n, sizeof(gains) - n, "%s%.2f/%.2f", c ? " " : "",
+                             s->mix_gain[c][0], s->mix_gain[c][1]);
+            if (w < 0) break;
+            n += (size_t)w;
+        }
+        fprintf(stderr, "[ios_audio] ml1026 MIX slot=%d rate=%u ch=%u fb=%u float=%d "
+                        "(endpoint %u Hz %u ch) mask=0x%x downmix%s L/R=[%s]\n",
+                slot, s->sample_rate, s->channels, s->frame_bytes, s->is_float,
+                g_dev.rate, g_dev.channels, s->channel_mask,
+                ios_downmix_enabled() ? "" : "(off)", gains);
+    }
     return 0;
 }
 
@@ -955,6 +1106,8 @@ static NTSTATUS ios_create_stream(void *args) {
     s->channels = p->fmt && p->fmt->nChannels ? p->fmt->nChannels : IOS_AUDIO_CHANNELS;
     s->frame_bytes = p->fmt && p->fmt->nBlockAlign ? p->fmt->nBlockAlign
                           : (s->channels * IOS_AUDIO_BITS) / 8;
+    s->channel_mask = ios_fmt_channel_mask(p->fmt);
+    ios_build_mix_gains(s, s->channel_mask);
     /* Ring capacity: the requested buffer duration (100ns units), floor
      * 100ms so a slow FEX-translated mixer has slack. */
     dur_frames = (uint64_t)(p->duration > 0 ? p->duration : 0) * s->sample_rate / 10000000ull;
@@ -1150,7 +1303,9 @@ static NTSTATUS ios_release_render_buffer(void *args) {
                 UINT32 f2, c2, step = n > 4096 ? n / 4096 : 1;
                 for (f2 = 0; f2 < n; f2 += step) {
                     const BYTE *fr = s->render_scratch + (size_t)f2 * fb;
-                    for (c2 = 0; c2 < s->channels && c2 < 2; c2++) {
+                    /* every channel the mixer reads, not just the first two:
+                     * a 5.1 client can carry signal only in its centre */
+                    for (c2 = 0; c2 < s->channels && c2 < 8; c2++) {
                         float v = s->is_float ? ((const float *)fr)[c2]
                                 : s->sample_bits == 16 ? ((const int16_t *)fr)[c2] * (1.0f / 32768.0f)
                                 : ((const int32_t *)fr)[c2] * (1.0f / 2147483648.0f);
