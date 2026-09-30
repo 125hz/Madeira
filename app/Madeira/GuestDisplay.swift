@@ -62,8 +62,6 @@ enum GameSurfaceLayout {
     ///   game whose back buffer is 4:3 on a 16:9 monitor is stretched by the
     ///   layer in every other mode; here it is scaled uniformly. Falls back to
     ///   the guest shape until a drawable size is known (`aspect == .zero`).
-    /// - Fill height: the presented shape at the view's full height; a result
-    ///   wider than the view is centred and cropped at the sides.
     static func rect(guest: CGSize, aspect: CGSize = .zero, bounds: CGRect, mode: DisplayMode) -> CGRect {
         guard guest.width > 0, guest.height > 0,
               bounds.width > 0, bounds.height > 0 else { return bounds }
