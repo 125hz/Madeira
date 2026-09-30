@@ -71,6 +71,42 @@ unsigned long long winios_surface_present_count(void);
 int winios_compositor_set_hidden(int hidden);
 int winios_desktop_point_from_window(double wx, double wy, int *px, int *py);
 
+/* Top-level window census, for the starting screen of a Madeira Dock start
+ * (DockStartScreen.swift). A Dock start is a desktop session, and the
+ * starting screen used to go away on the desktop's first GDI frame, so the
+ * user watched the Dock host's console window instead of the game. The app
+ * keeps the starting screen until a window of the started game is up, and
+ * needs to know, per top-level window: is it shown, how big, has it put a
+ * frame on screen, and which program owns it.
+ *
+ * Fed from the driver hooks on the window's own Wine thread (WindowPosChanged,
+ * the GDI flush, DestroyWindow, the desktop-mode swapchain), so nothing polls
+ * win32u. Costs one atomic load per hook while off; the app turns it on only
+ * for a Dock start's starting screen. `image` is the owning process's
+ * executable path as the server recorded it, lower case, without the NT
+ * "\??\" prefix ("" when it could not be read). Only top-level windows are
+ * listed. */
+#define WINIOS_CENSUS_MAX 64
+#define WINIOS_CENSUS_IMAGE 264
+struct winios_census_window {
+    unsigned long long hwnd;
+    int x, y, w, h;               /* visible rect, desktop pixels */
+    unsigned int pid;             /* owning Windows process id, 0 = unknown */
+    unsigned int presents;        /* GDI frames this window put on screen */
+    unsigned char visible;        /* WS_VISIBLE, not minimized, non-empty rect */
+    unsigned char metal;          /* a D3D swapchain presents into it (DXMT) */
+    unsigned char shown_once;     /* has been shown at least once */
+    unsigned char restore_sent;   /* born minimized; SC_RESTORE posted */
+    char image[WINIOS_CENSUS_IMAGE];
+};
+
+/* Main thread. on=1 starts an empty census (and forgets cached process paths,
+ * whose ids a new session may reuse); on=0 stops and empties it. */
+void winios_window_census_enable(int on);
+
+/* Main thread. Copies up to `max` entries; returns how many were copied. */
+int winios_window_census(struct winios_census_window *out, int max);
+
 #ifdef __cplusplus
 }
 #endif

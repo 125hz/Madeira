@@ -286,8 +286,21 @@ func pe(_ url: URL, machine: UInt16) throws {
         require(DockInstallers.poll(drive: drive) == "Starting this game's one-time installs…", "progress before the batch starts")
         try write(drive.appendingPathComponent("madeira-dock-installers.result"), "begin 1 \r\nservices started\r\nstart 1 tool \r\n")
         require(DockInstallers.poll(drive: drive) == "Running one-time install 1 of 1: tool…" && logged("services=started") && logged("start 1/1 program=tool"), "progress while running")
-        try write(drive.appendingPathComponent("madeira-dock-installers.result"), "begin 1 \r\nservices started\r\nstart 1 tool \r\nexit 1 0 \r\nend \r\n")
-        require(DockInstallers.poll(drive: drive) == "One-time installs finished." && logged("exit 1/1 program=tool status=0 succeeded"), "progress when finished")
+        require(DockInstallers.finishedAt == nil, "not finished while a program runs")
+        let finished = "begin 1 \r\nservices started\r\nstart 1 tool \r\nexit 1 0 \r\nend \r\n"
+        try write(drive.appendingPathComponent("madeira-dock-installers.result"), finished)
+        require(DockInstallers.poll(drive: drive) == "One-time installs finished: 1 of 1 succeeded." && logged("exit 1/1 program=tool status=0 succeeded"), "progress when finished")
+        let ended = DockInstallers.finishedAt
+        _ = DockInstallers.poll(drive: drive)
+        require(ended != nil && DockInstallers.finishedAt == ended &&
+                LogStore.shared.lines.filter({ $0.contains("[dock-installers] end succeeded=1 failed=0 of=1; the host starts next") }).count == 1,
+                "the end is logged once and its time kept (the starting screen times the host from it)")
+        // The words count what succeeded and name what failed (the text reads only the result file).
+        try write(drive.appendingPathComponent("madeira-dock-installers.result"),
+                  "begin 3 \r\nservices started\r\nstart 1 tool \r\nexit 1 0 \r\nstart 2 b \r\nexit 2 5 \r\nstart 3 c \r\nexit 3 -1073741819 \r\nend \r\n")
+        require(DockInstallers.poll(drive: drive) == "One-time installs finished: 1 of 3 succeeded.\nFailed: b (exit 5), c (exit -1073741819)",
+                "finished with failures: how many succeeded, which failed")
+        try write(drive.appendingPathComponent("madeira-dock-installers.result"), finished)
 
         // ---- the next start records the result and plans again: nothing is left to run
         DockInstallers.prepare(game, drive: drive, prefix: prefix, has32Bit: false, hasMsiexec: false, fusionSource: nil)
@@ -296,7 +309,8 @@ func pe(_ url: URL, machine: UInt16) throws {
                 system.contains("[SOFTWARE\\\\Fixture Tool]"), "a program that exited 0 is recorded in both views at the next start")
         require(FileManager.default.fileExists(atPath: prefix.appendingPathComponent("system.reg.madeira-bak").path), "a backup of system.reg is kept once")
         require(logged("results reason=next-start succeeded=1 failed=0 recorded-values=2 services=started ended=1 statuses=tool=0"), "one summary line")
-        require(DockInstallers.script == nil && !DockInstallers.serverSync, "nothing pending: no batch, madsync untouched")
+        require(DockInstallers.script == nil && !DockInstallers.serverSync && DockInstallers.finishedAt == nil,
+                "nothing pending: no batch, madsync untouched, no installs' end")
         require(!FileManager.default.fileExists(atPath: drive.appendingPathComponent("madeira-dock-installers.result").path) &&
                 DockInstallLedger.load(prefix: prefix).session.isEmpty, "result file and session list cleared")
 

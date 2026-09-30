@@ -638,7 +638,8 @@ final class LibraryModel: ObservableObject {
 
     /// `remember: false` runs a session that is not a library entry (a Madeira
     /// Dock start): it is neither added to the library nor stamped as played.
-    func begin(_ entry: LibraryEntry, remember: Bool = true) {
+    /// `dock`: the game a Madeira Dock start launches (DockStartScreen).
+    func begin(_ entry: LibraryEntry, remember: Bool = true, dock: DockGame? = nil) {
         wine_exit_status_reset()
         quitRequested = false
         LibraryController.shared.configure(enabled: enabled, ownsInput: false)
@@ -669,12 +670,21 @@ final class LibraryModel: ObservableObject {
         ProMotionIntent.apply(mode: entry.effectiveFPSMode)
         if remember { var played = entry; played.lastPlayed = Date(); save(played) }
         launchDismissLogged = false
+        DockStartScreen.shared.begin(dock, at: launchStarted)
         sawProcess = false
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.poll() }
     }
     private func poll() {
-        if launching {
+        let dockStart = DockStartScreen.shared
+        if dockStart.active {
+            // A Dock start: the desktop's own frames (explorer, the host's console window)
+            // do not end this starting screen; the game's window does (DockStartScreen).
+            dockStart.poll(self, rendered: madeira_get_present_count() >= launchPresent + 3)
+        }
+        if dockStart.holding {
+            if launching && !launchSlow && Date().timeIntervalSince(launchStarted) > 30 { launchSlow = true }
+        } else if launching {
             if madeira_get_present_count() >= launchPresent + 3 {
                 showGameView(reason: "present")
             } else if winios_surface_present_count() > launchSurface {
@@ -762,6 +772,7 @@ final class LibraryModel: ObservableObject {
         displayMode = .fit
         LogStore.shared.setDisplayActive(true)
         launching = false; launchLogs = false; LibraryKeyboard.hide()
+        DockStartScreen.shared.finish()
         LibraryController.shared.configure(enabled: enabled, ownsInput: enabled)
         MetalHostView.shared.isHidden = true
         ProMotionIntent.shared.setActive(false)
@@ -2080,6 +2091,8 @@ struct LibraryHUD: View {
     }
     @ObservedObject private var model = LibraryModel.shared
     @ObservedObject private var controls = TouchControlsModel.shared
+    /// A Madeira Dock start: its status, failure and Show desktop (DockStartScreen).
+    @ObservedObject private var dockStart = DockStartScreen.shared
     private let sessionTools = MadeiraConfig.flag("MADEIRA_SESSION_TOOLS")
     @State private var launchVisible = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -2087,7 +2100,7 @@ struct LibraryHUD: View {
         GeometryReader { geo in
             ZStack(alignment: .topLeading) {
                 if model.launching, let entry = model.activeEntry {
-                    LibraryArtwork(entry: entry, backdrop: true).overlay(.black.opacity(0.65)).ignoresSafeArea()
+                    launchBackdrop(entry).overlay(.black.opacity(0.65)).ignoresSafeArea()
                         .opacity(launchVisible ? 1 : 0)
                     launchView(entry, geometry: geo)
                         .opacity(launchVisible ? 1 : 0)
@@ -2135,26 +2148,52 @@ struct LibraryHUD: View {
         VStack(spacing: 0) {
         ScrollView {
             VStack(spacing: compact ? 10 : 18) {
-                LibraryArtwork(entry: entry).frame(width: compact ? 90 : 120, height: compact ? 135 : 180)
+                launchCover(entry).frame(width: compact ? 90 : 120, height: compact ? 135 : 180)
                     .clipShape(RoundedRectangle(cornerRadius: 14)).shadow(radius: 20)
                 Text(entry.title).font(.title2.bold()).multilineTextAlignment(.center)
-                ProgressView().tint(.white)
-                TimelineView(.periodic(from: .now, by: 1)) { context in
-                    VStack(spacing: 8) {
-                        Text(model.launchSlow ? "Still starting…" : "Starting your game…").foregroundStyle(.white.opacity(0.7))
-                        Text("\(Int(context.date.timeIntervalSince(model.launchStartedAt)))s")
-                            .font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.4))
+                if dockStart.failure == nil { ProgressView().tint(.white) }
+                if let failure = dockStart.failure {
+                    Text("Madeira Dock stopped").font(.headline)
+                    Text(failure).font(.caption).multilineTextAlignment(.center).frame(maxWidth: 360)
+                } else if dockStart.active {
+                    // What the Dock start is waiting for, from the host's report, and what it
+                    // does with the game's one-time installs.
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        VStack(spacing: 8) {
+                            Text(dockStatus).foregroundStyle(.white.opacity(0.8)).multilineTextAlignment(.center)
+                            if let note = DockInstallers.note {
+                                Text(note).font(.caption).foregroundStyle(.white.opacity(0.6)).multilineTextAlignment(.center).frame(maxWidth: 360)
+                            }
+                            Text("\(Int(context.date.timeIntervalSince(model.launchStartedAt)))s")
+                                .font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.4))
+                        }
+                    }
+                } else {
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        VStack(spacing: 8) {
+                            Text(model.launchSlow ? "Still starting…" : "Starting your game…").foregroundStyle(.white.opacity(0.7))
+                            Text("\(Int(context.date.timeIntervalSince(model.launchStartedAt)))s")
+                                .font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.4))
+                        }
                     }
                 }
                 // The starting screen's controls are one row of glyph-only buttons, so a
                 // short screen does not push them below the fold. The words stay as
-                // VoiceOver labels.
+                // VoiceOver labels. A stopped Dock start can be closed; while a Dock start
+                // holds the desktop back, Show desktop reveals it.
                 HStack(spacing: 14) {
+                    if dockStart.failure != nil {
+                        launchGlyph("Close session", "stop.circle") { model.requestQuit() }
+                    }
                     launchGlyph(showLogs ? "Hide live log" : "Show live log", "text.alignleft", on: showLogs) {
                         model.toggleLaunchLogs()
                     }
+                    if dockStart.holding {
+                        launchGlyph("Show desktop", "macwindow") { dockStart.showDesktop(model) }
+                            .accessibilityHint("Shows the Windows desktop")
+                    }
                 }
-                if model.launchSlow {
+                if model.launchSlow && !dockStart.holding {
                     Button("Show game view") { model.showGameView(reason: "button") }.frame(minHeight: 44)
                 }
                 if showLogs && !sideLogs {
@@ -2182,6 +2221,27 @@ struct LibraryHUD: View {
         }
         .buttonStyle(.plain).foregroundStyle(.white)
         .accessibilityLabel(label)
+    }
+
+    /// The starting screen's cover and backdrop: a Dock start shows the game's
+    /// Steam artwork by App ID, any other session its library artwork.
+    @ViewBuilder private func launchCover(_ entry: LibraryEntry) -> some View {
+        if let appID = dockStart.appID { SteamGameArtwork(appID: appID) } else { LibraryArtwork(entry: entry) }
+    }
+    @ViewBuilder private func launchBackdrop(_ entry: LibraryEntry) -> some View {
+        if let appID = dockStart.appID { SteamLaunchBackdrop(appID: appID) } else { LibraryArtwork(entry: entry, backdrop: true) }
+    }
+
+    /// What the Dock start is doing (DockStartStatus), read once a second.
+    private var dockStatus: String {
+        MainActor.assumeIsolated {
+            let progress = DockInstallers.poll(drive: MadeiraDock.drive)
+            // The host starts at once, or after this start's one-time installs finished.
+            let hostDue = DockInstallers.finishedAt ?? model.launchStartedAt
+            return DockStartStatus.text(MadeiraDock.pollReport().fields, installers: DockInstallers.script != nil,
+                                        installerProgress: progress, installsFinished: DockInstallers.finishedAt != nil,
+                                        waited: Date().timeIntervalSince(hostDue))
+        }
     }
 
     private var menu: some View {

@@ -60,7 +60,24 @@ require(dock.count('setenv("MADEIRA_JIT_IMAGE_RETIRE"') == 1 and
         dock.index('setenv("MADEIRA_JIT_IMAGE_RETIRE"') > dock.index('static func configure('),
         'the image-retire switch is set only in the Dock launch environment')
 require(content.count('MadeiraDock.configure(') == 1, 'only the Dock launch configures the host environment')
-git = subprocess.run(['git', '-C', str(root), 'rev-parse', '--git-dir'], capture_output=True, text=True)
+# The image-map guard is also a Dock-session switch, set only by MadeiraDock.configure.
+for name, text in [('ContentView.swift', content), ('MadeiraDockView.swift', view), ('SteamRuntime.swift', runtime)]:
+    require('MADEIRA_IMAGE_MAP_GUARD' not in text, f'{name}: does not set the image-map guard')
+require(dock.count('setenv("MADEIRA_IMAGE_MAP_GUARD"') == 1 and
+        dock.index('setenv("MADEIRA_IMAGE_MAP_GUARD"') > dock.index('static func configure('),
+        'the image-map guard is set only in the Dock launch environment')
+# A Dock session publishes no fixed Steam game identity; every other launch keeps it.
+bridge = (app / 'WineProcessBridge.m').read_text()
+flag = bridge.index('const char *dock_session = getenv("MADEIRA_DOCK_SESSION");')
+require(bridge.index('unsetenv("SteamAppId");', flag) < bridge.index('} else if (direct_app', flag) <
+        bridge.index('setenv("SteamAppId",  direct_app, 1);', flag) < bridge.index('} else {', flag) <
+        bridge.index('setenv("SteamAppId",  "356400", 1);', flag),
+        "the bridge clears the fixed Steam identity only for a Dock session (a direct start publishes its game's own)")
+require(content.count('setenv("MADEIRA_DOCK_SESSION", "1", 1)') == 1 and
+        'if dockLaunch.dock && SteamSignIn.flag("MADEIRA_DOCK_CLEAR_STEAM_ID", default: true) {' in content and
+        'unsetenv("MADEIRA_DOCK_SESSION")' in content,
+        'only a Dock launch sets MADEIRA_DOCK_SESSION; every other launch clears it')
+git =subprocess.run(['git', '-C', str(root), 'rev-parse', '--git-dir'], capture_output=True, text=True)
 if git.returncode == 0:
     tracked = subprocess.run(['git', '-C', str(root), 'ls-files', 'app/Madeira/arm64ec-windows/dockhost.exe',
                               'app/Madeira/arm64ec-windows/dock-notices.txt'], capture_output=True, text=True).stdout.strip()
@@ -199,6 +216,10 @@ func jwt(_ claims: String) -> String {
         unsetenv("MADEIRA_JIT_IMAGE_RETIRE"); setenv("MADEIRA_DOCK_IMAGE_RETIRE", "0", 1); MadeiraDock.configure(alpha)
         require(env("MADEIRA_JIT_IMAGE_RETIRE") == nil, "MADEIRA_DOCK_IMAGE_RETIRE=0 leaves image retire off")
         unsetenv("MADEIRA_DOCK_IMAGE_RETIRE")
+        require(env("MADEIRA_IMAGE_MAP_GUARD") == "1", "a Dock launch turns Wine's image-map guard on")
+        unsetenv("MADEIRA_IMAGE_MAP_GUARD"); setenv("MADEIRA_DOCK_IMAGE_MAP_GUARD", "0", 1); MadeiraDock.configure(alpha)
+        require(env("MADEIRA_IMAGE_MAP_GUARD") == nil, "MADEIRA_DOCK_IMAGE_MAP_GUARD=0 leaves the image-map guard off")
+        unsetenv("MADEIRA_DOCK_IMAGE_MAP_GUARD")
         require(MadeiraDock.launchArguments(width: 1280, height: 720) == "/desktop=madeira,1280x720 C:\\windows\\system32\\dockhost.exe", "explorer desktop runs the host")
         require(!MadeiraDock.launchArguments(width: 1280, height: 720).contains("\""), "no quotes: MADEIRA_ARGS is split at spaces and passed on as is")
         require(!MadeiraDock.executable.contains(" "), "the host path has no spaces")

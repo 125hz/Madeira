@@ -141,7 +141,7 @@ require('writeHandoff' not in direct[direct.index('guard entry.steamProgram'):] 
         '"The game" hands no sign-in to anything')
 dock_start = content_view[content_view.index('private func startDock('):]
 dock_start = dock_start[:dock_start.index('\n    }\n') + 6]
-require('if let profile { library.begin(profile) }' in dock_start and 'runWineFullSequence(profile: profile)' in dock_start,
+require('if let profile { library.begin(profile, dock: game) }' in dock_start and 'runWineFullSequence(profile: profile)' in dock_start,
         "a Steam game's session takes its display, overlay and control settings")
 configure = library[library.index('    func configureLaunch() {'):]
 configure = configure[:configure.index('\n    }\n')]

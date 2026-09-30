@@ -123,19 +123,20 @@ require('LibraryView(play: launchLibraryEntry, enableJIT: enableJITViaStikDebug,
         "ContentView hands Dock's start to the library")
 held = start.index('LibraryModel.sessionsThisRun > 0, MadeiraConfig.flag("MADEIRA_ONE_SESSION_PER_RUN")')
 require(held < start.index('MadeiraDock.writeHandoff('), 'a held Dock start writes no sign-in transfer')
-require('else { library.begin(.dockSession(title: game.name, width: width, height: height), remember: false) }' in start
+require('else { library.begin(.dockSession(title: game.name, width: width, height: height), remember: false, dock: game) }' in start
         and start.index('library.begin(') < start.index('runWineFullSequence('),
         'a Dock start from Settings is an unsaved library session')
 # A Steam game started from its Game details page (SteamGames.swift) is its own library entry: its
 # display, overlay and control settings apply, and its profile never replaces Dock's environment
 # (LibraryEntry.configureLaunch returns before MADEIRA_EXE for a Steam game; check-steam-games.py).
-require('if let profile { library.begin(profile) }' in start and start.count('runWineFullSequence(') == 1
+# Either way the library is told which game Dock starts (its starting screen, DockStartScreen.swift).
+require('if let profile { library.begin(profile, dock: game) }' in start and start.count('runWineFullSequence(') == 1
         and 'runWineFullSequence(profile: profile)' in start,
         "Dock's launch path takes a Steam game's own profile, and only that")
 configure = block(library, 'func configureLaunch()')
 require(configure.index('if steamAppID != nil {') < configure.index('setenv("MADEIRA_EXE"'),
         "a Steam game's profile leaves Dock's program, arguments and desktop in place")
-begin = block(library, 'func begin(_ entry: LibraryEntry, remember: Bool = true)')
+begin = block(library, 'func begin(_ entry: LibraryEntry, remember: Bool = true, dock: DockGame? = nil)')
 require('if remember { var played = entry; played.lastPlayed = Date(); save(played) }' in begin,
         'begin(remember: false) neither adds nor stamps an entry')
 dock_entry = block(onboarding, 'static func dockSession(')

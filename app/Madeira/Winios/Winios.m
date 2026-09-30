@@ -32,6 +32,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+/* The window census struct is shared with Swift through this header;
+ * including it here keeps both sides' definitions the same. */
+#include "Winios.h"
+
 /* csops syscall — CS_DEBUGGED is the flag StikDebug JIT rides on. Declared by
  * hand for the same reason JITAllocator.c does: <sys/codesign.h> is not in the
  * iOS SDK's public headers. */
@@ -366,8 +370,202 @@ BOOL winios_pCreateWindow(HWND hwnd) {
 
 static void winios_remove_layer(HWND hwnd);   /* compositor, below */
 
+/* ============================================================ *
+ * Top-level window census (see Winios.h)
+ * ============================================================
+ *
+ * A game started through Madeira Dock runs in a desktop session: explorer,
+ * the Dock host's console window, Valve's client inside the host, and the
+ * game's one-time installers can all put windows up before the game does,
+ * each from a different thread. Nothing on the app side could tell those
+ * apart, so the starting screen went away on the desktop's first GDI frame.
+ *
+ * The one fact that separates them generically is WHICH PROGRAM owns the
+ * window, and where that program lives on drive C. win32u knows the owning
+ * process id and the server knows every process's image path
+ * (SystemProcessIdInformation asks it by id without opening a handle). Both
+ * are read on the Wine thread inside the WindowPosChanged hook
+ * (winios_drv_census_owner / winios_drv_process_image in driver_ios.c); each
+ * process's path is looked up once. The app decides what the paths mean.
+ *
+ * Only while the app has switched it on (winios_window_census_enable), so a
+ * normal session never pays a lookup. */
+#define WINIOS_WS_VISIBLE    0x10000000u
+#define WINIOS_WS_MINIMIZE   0x20000000u
+
+extern int winios_drv_census_owner(HWND hwnd, unsigned int *pid, unsigned int *style);
+extern int winios_drv_process_image(unsigned int pid, char *out, unsigned int size);
+extern int winios_drv_post_restore(HWND hwnd);
+extern int winios_drv_foreground_if_owner(HWND hwnd);
+
+/* A game's main window can be shown minimized the first time it is shown
+ * (ShowWindow cmd 2, parked at -32000,-32000). On Windows the taskbar brings
+ * it back; Madeira has no taskbar, so the starting screen waited for a window
+ * that never appeared. While the census runs, a top-level window whose first
+ * show is minimized is sent what a taskbar click sends: WM_SYSCOMMAND/
+ * SC_RESTORE, once. A window that was shown and later minimized itself (e.g.
+ * on losing focus) is left alone. MADEIRA_RESTORE_BORN_MINIMIZED=0 turns this
+ * off. Restored, such a window was shown but its game stayed idle (a
+ * fullscreen game pauses without focus): a taskbar click also brings the
+ * window to the front, which its own thread does from its event pump
+ * (g_restore_foreground, winios_pProcessEvents). */
+static _Atomic(uintptr_t) g_restore_foreground;
+static int winios_restore_born_minimized_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) { const char *e = getenv("MADEIRA_RESTORE_BORN_MINIMIZED"); enabled = !(e && e[0] == '0'); }   /* 0: while a Dock start's census runs, a window first shown minimized stays minimized */
+    return enabled;
+}
+
+static pthread_mutex_t g_census_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int g_census_on;
+static struct winios_census_window g_census[WINIOS_CENSUS_MAX];
+static int g_census_n;
+#define WINIOS_CENSUS_IMAGES 48
+static struct { unsigned int pid; int known; char image[WINIOS_CENSUS_IMAGE]; } g_census_images[WINIOS_CENSUS_IMAGES];
+static int g_census_images_n;
+static _Atomic unsigned g_census_failures;
+
+/* The owning program's executable path (see Winios.h), "" when the server
+ * could not name it. Cached per process id for the census's lifetime.
+ * Wine thread only (the lookup is a server call). */
+static int winios_census_image(unsigned int pid, char out[WINIOS_CENSUS_IMAGE]) {
+    out[0] = 0;
+    if (!pid) return 0;
+    pthread_mutex_lock(&g_census_lock);
+    for (int i = 0; i < g_census_images_n; i++) {
+        if (g_census_images[i].pid != pid) continue;
+        memcpy(out, g_census_images[i].image, WINIOS_CENSUS_IMAGE);
+        int known = g_census_images[i].known;
+        pthread_mutex_unlock(&g_census_lock);
+        return known;
+    }
+    pthread_mutex_unlock(&g_census_lock);
+
+    int known = winios_drv_process_image(pid, out, WINIOS_CENSUS_IMAGE);
+    if (!known) {
+        out[0] = 0;
+        if (atomic_fetch_add(&g_census_failures, 1) < 4) {
+            fprintf(stderr, "[window-census] no image path for pid %04x\n", pid);
+            fflush(stderr);
+        }
+    }
+    pthread_mutex_lock(&g_census_lock);
+    if (g_census_images_n < WINIOS_CENSUS_IMAGES) {
+        g_census_images[g_census_images_n].pid = pid;
+        g_census_images[g_census_images_n].known = known;
+        memcpy(g_census_images[g_census_images_n].image, out, WINIOS_CENSUS_IMAGE);
+        g_census_images_n++;
+    }
+    pthread_mutex_unlock(&g_census_lock);
+    return known;
+}
+
+/* Caller holds g_census_lock. */
+static struct winios_census_window *winios_census_find(HWND hwnd) {
+    for (int i = 0; i < g_census_n; i++)
+        if (g_census[i].hwnd == (unsigned long long)(uintptr_t)hwnd) return &g_census[i];
+    return NULL;
+}
+
+/* Wine thread, from winios_window_frame (the WindowPosChanged hook, which runs
+ * on the window's own thread). Records top-level windows only. */
+static void winios_census_note_frame(HWND hwnd, int x, int y, int w, int h, int visible) {
+    if (!atomic_load_explicit(&g_census_on, memory_order_relaxed) || !hwnd) return;
+    /* win32u calls stay outside the census lock: they take win32u's own. */
+    unsigned int pid = 0, style = 0;
+    if (!winios_drv_census_owner(hwnd, &pid, &style)) return;
+    char image[WINIOS_CENSUS_IMAGE];
+    winios_census_image(pid, image);
+    int shown = visible && (style & WINIOS_WS_VISIBLE) && !(style & WINIOS_WS_MINIMIZE) && w > 0 && h > 0;
+    int born_minimized = 0;
+
+    pthread_mutex_lock(&g_census_lock);
+    struct winios_census_window *e = winios_census_find(hwnd);
+    if (!e && g_census_n < WINIOS_CENSUS_MAX) e = &g_census[g_census_n++];
+    if (!e && shown) {
+        /* Full: reuse a hidden window's slot rather than lose a shown one. */
+        for (int i = 0; i < g_census_n && !e; i++) if (!g_census[i].visible) e = &g_census[i];
+    }
+    if (e) {
+        if (e->hwnd != (unsigned long long)(uintptr_t)hwnd) memset(e, 0, sizeof(*e));
+        e->hwnd = (unsigned long long)(uintptr_t)hwnd;
+        e->x = x; e->y = y; e->w = w; e->h = h;
+        e->pid = pid;
+        e->visible = (unsigned char)shown;
+        memcpy(e->image, image, sizeof(e->image));
+        if (shown) e->shown_once = 1;
+        else if ((style & WINIOS_WS_VISIBLE) && (style & WINIOS_WS_MINIMIZE) && !e->shown_once && !e->restore_sent &&
+                 winios_restore_born_minimized_enabled()) {
+            e->restore_sent = 1;
+            born_minimized = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_census_lock);
+    if (born_minimized) {
+        /* Posted, not sent: this runs inside the window's WindowPosChanged. */
+        int ok = winios_drv_post_restore(hwnd);
+        atomic_store(&g_restore_foreground, (uintptr_t)hwnd);
+        fprintf(stderr, "[born-minimized] hwnd=%p pid=%04x restore-posted=%d "
+                        "(MADEIRA_RESTORE_BORN_MINIMIZED=0 leaves it minimized)\n", hwnd, pid, ok ? 1 : 0);
+        fflush(stderr);
+    }
+}
+
+/* Wine thread, from the GDI flush: count frames of listed windows only. */
+static void winios_census_note_present(HWND hwnd) {
+    if (!atomic_load_explicit(&g_census_on, memory_order_relaxed)) return;
+    pthread_mutex_lock(&g_census_lock);
+    struct winios_census_window *e = winios_census_find(hwnd);
+    if (e && e->presents < 0xffffffffu) e->presents++;
+    pthread_mutex_unlock(&g_census_lock);
+}
+
+/* A desktop-mode swapchain was made for this window (any thread). A swapchain
+ * on a child window is not listed; the app also watches DXMT's present count. */
+static void winios_census_note_metal(HWND hwnd) {
+    if (!atomic_load_explicit(&g_census_on, memory_order_relaxed)) return;
+    pthread_mutex_lock(&g_census_lock);
+    struct winios_census_window *e = winios_census_find(hwnd);
+    if (e) e->metal = 1;
+    pthread_mutex_unlock(&g_census_lock);
+}
+
+static void winios_census_forget(HWND hwnd) {
+    if (!atomic_load_explicit(&g_census_on, memory_order_relaxed)) return;
+    pthread_mutex_lock(&g_census_lock);
+    struct winios_census_window *e = winios_census_find(hwnd);
+    if (e) { *e = g_census[--g_census_n]; memset(&g_census[g_census_n], 0, sizeof(g_census[0])); }
+    pthread_mutex_unlock(&g_census_lock);
+}
+
+void winios_window_census_enable(int on) {
+    pthread_mutex_lock(&g_census_lock);
+    int was = atomic_load(&g_census_on);
+    g_census_n = 0;
+    g_census_images_n = 0;
+    memset(g_census, 0, sizeof(g_census));
+    atomic_store(&g_census_on, on ? 1 : 0);
+    pthread_mutex_unlock(&g_census_lock);
+    if (!was != !on) {
+        fprintf(stderr, "[window-census] %s\n", on ? "on" : "off");
+        fflush(stderr);
+    }
+}
+
+int winios_window_census(struct winios_census_window *out, int max) {
+    if (!out || max <= 0) return 0;
+    pthread_mutex_lock(&g_census_lock);
+    int n = g_census_n < max ? g_census_n : max;
+    memcpy(out, g_census, (size_t)n * sizeof(*out));
+    pthread_mutex_unlock(&g_census_lock);
+    return n;
+}
+
 void winios_pDestroyWindow(HWND hwnd) {
     WLOG("pDestroyWindow hwnd=%p", hwnd);
+    uintptr_t pending = (uintptr_t)hwnd;
+    atomic_compare_exchange_strong(&g_restore_foreground, &pending, 0);
+    winios_census_forget(hwnd);
     winios_remove_layer(hwnd);
 }
 
@@ -522,6 +720,16 @@ void winios_post_key(int vk, int down) {
 }
 
 BOOL winios_pProcessEvents(DWORD mask) {
+    /* The restored born-minimized window's own thread brings it to the front
+     * (see g_restore_foreground); other threads leave the request in place. */
+    uintptr_t fg = atomic_load_explicit(&g_restore_foreground, memory_order_relaxed);
+    if (fg) {
+        int r = winios_drv_foreground_if_owner((HWND)fg);
+        if (r && atomic_compare_exchange_strong(&g_restore_foreground, &fg, 0)) {
+            fprintf(stderr, "[born-minimized] hwnd=%p foreground=%d\n", (HWND)fg, r);
+            fflush(stderr);
+        }
+    }
     static unsigned int cnt;
     static int quiet = -1;
     if (quiet < 0) quiet = getenv("MADEIRA_QUIET") != NULL;
@@ -838,6 +1046,7 @@ CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
                     hwnd, ml.frame.origin.x, ml.frame.origin.y,
                     ml.frame.size.width, ml.frame.size.height);
             fflush(stderr);
+            winios_census_note_metal((HWND)hwnd);
         }
         result = ml;
     };
@@ -850,6 +1059,9 @@ CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
  * x/y/w/h = visible rect, cx/cy/cw/ch = client rect, desktop pixels. */
 void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
                          int cx, int cy, int cw, int ch) {
+    /* Here, not in the block below: the census asks win32u about the window,
+     * which needs this Wine thread. No-op unless the app turned it on. */
+    winios_census_note_frame(hwnd, x, y, w, h, visible);
     dispatch_async(dispatch_get_main_queue(), ^{
         winios_ensure_compositor();
         if (!g_compositor_view) return;
@@ -1035,6 +1247,7 @@ void winios_dump_srcbits(const void *bits, int w, int h, int stride) {
 int winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
                            int sw, int sh, int stride, const void *bits) {
     if (sw <= 0 || sh <= 0 || !bits) return 1;   /* nothing to paint */
+    winios_census_note_present(hwnd);   /* no-op unless the census is on */
     size_t snap_len = (size_t)stride * (size_t)sh;
     void *snap = malloc(snap_len);
     if (!snap) {

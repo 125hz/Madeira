@@ -97,7 +97,9 @@ Play applies the profile and runs the same `runWineFullSequence` as the
 developer interface's buttons. The game is shown full screen in either
 orientation. A starting screen with the game's cover stays until the first
 frames arrive (Metal presents or a desktop surface); after 30 seconds it offers
-**Show game view**. A row of round glyph-only buttons (their words are
+**Show game view**. A Madeira Dock start keeps it, with the Dock's status,
+until the game's own window is shown, and adds **Show desktop**
+(`docs/MADEIRA_DOCK.md`, "Starting screen"). A row of round glyph-only buttons (their words are
 VoiceOver labels) holds **Show live log**, which shows the most recent log lines.
 
 The small menu button (drag to move; it fades after three seconds) opens the

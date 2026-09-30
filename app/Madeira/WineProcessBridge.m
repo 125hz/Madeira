@@ -909,14 +909,28 @@ static void *wine_process_thread(void *arg) {
          * pseudo-process. This path usually launches explorer.exe and cannot know which
          * title the desktop will start later, so a conditional here cannot work.
          *
-         * One launch does know its title: a Steam game the library starts as its own
-         * program ("Start with: The game", LibraryEntry.configureLaunch). It passes that
+         * A Madeira Dock session is the one launch that can know: it runs Valve's
+         * client inside the host process, and the client gives every game it
+         * starts that game's own identity. The fixed identity above reached the
+         * client and the game (both inherit this environment), so a Dock launch
+         * publishes none of the three. ContentView sets MADEIRA_DOCK_SESSION=1 for
+         * a Dock launch only and clears it for every other launch, which keeps
+         * the fixed identity exactly as before.
+         *
+         * A Steam game the library starts as its own program ("Start with: The
+         * game", LibraryEntry.configureLaunch) knows its title too. It passes that
          * game's App ID and install folder in MADEIRA_STEAM_APPID / MADEIRA_STEAM_APPPATH,
          * and this launch publishes the game's own identity instead of the fixed one. Both
          * are cleared here, so no later launch inherits them. */
+        const char *dock_session = getenv("MADEIRA_DOCK_SESSION");
         const char *direct_app = getenv("MADEIRA_STEAM_APPID");    /* set by the library for one direct Steam start (Start with: The game); not a setting */
         const char *direct_path = getenv("MADEIRA_STEAM_APPPATH"); /* that game's install folder, with MADEIRA_STEAM_APPID; not a setting */
-        if (direct_app && direct_app[0] && strlen(direct_app) <= 10 &&
+        if (dock_session && dock_session[0] == '1') {
+            unsetenv("SteamAppPath");
+            unsetenv("SteamGameId");
+            unsetenv("SteamAppId");
+            dprintf(STDERR_FILENO, "[steam-env] Madeira Dock session: no fixed Steam game identity published\n");
+        } else if (direct_app && direct_app[0] && strlen(direct_app) <= 10 &&
             strspn(direct_app, "0123456789") == strlen(direct_app) &&
             direct_path && (direct_path[0] == 'C' || direct_path[0] == 'c') && direct_path[1] == ':' &&
             direct_path[2] == '\\' && strlen(direct_path) < 1024 && !strstr(direct_path, "..")) {

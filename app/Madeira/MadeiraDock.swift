@@ -206,6 +206,13 @@ enum MadeiraDock {
                 }
                 return "Madeira Dock could not initialize the Steam session (code 30). Export the log to identify the failed check."
             }
+            // The host waits 90 s after sign-in for Valve's client to count the game
+            // among the account's subscriptions (research/madeira-dock src/session.c).
+            if result == 34 {
+                return fields["session-authenticated-online"] == "1"
+                    ? "Steam signed in but did not confirm this game's license in time. Export the log before trying again."
+                    : "Steam did not finish signing in. Check the connection and try again."
+            }
             if result == 35 { return "Steam did not confirm a license for this game on the signed-in account." }
             if result == 37 {
                 if fields["session-native-handoff-app-mismatch"] == "1" {
@@ -269,7 +276,8 @@ enum MadeiraDock {
         "session-native-handoff-app-mismatch", "session-handoff-stage", "session-handoff-error",
         "session-account-input-invalid", "session-app-input-invalid",
         "session-native-token-submitted", "session-logon-start-result", "session-connection-result",
-        "session-authenticated-online", "session-requested-app-listed", "session-auth-test-result",
+        "session-authenticated-online", "session-requested-app-entitled", "session-subscription-count",
+        "session-requested-app-listed", "session-auth-test-result",
         "launch-client-error", "launch-update-wait", "launch-update-retry", "launch-update-ready",
         "launch-config-wait", "launch-config-gave-up", "launch-session-wait", "launch-session-gave-up",
         "ceg-request", "ceg-request-result", "ceg-request-busy", "ceg-server-result", "ceg-job-result",
@@ -293,6 +301,13 @@ enum MadeiraDock {
             if key == "client-sha256", value.utf8.count == 64,
                value.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) {
                 report.fields[key] = value
+            } else if key == "session-callback-id", let number = Int32(value) {
+                // Valve's callback IDs after sign-in (the host reports the first 16), in
+                // order, as one field: the poll logs a field only when it changes.
+                let ids = report.fields["session-callback-ids"]
+                if (ids?.split(separator: ",").count ?? 0) < 16 {
+                    report.fields["session-callback-ids"] = (ids.map { $0 + "," } ?? "") + String(number)
+                }
             } else if reportAllowed.contains(key), let number = Int32(value) {
                 report.fields[key] = String(number)
             }
@@ -388,6 +403,16 @@ enum MadeiraDock {
         let retire = SteamSignIn.flag("MADEIRA_DOCK_IMAGE_RETIRE", default: true)
         if retire { setenv("MADEIRA_JIT_IMAGE_RETIRE", "1", 1) }
         SteamLog.event("[dock-launch] image-retire=\(retire ? 1 : 0)")
+        // While the loader loads Valve's client and its many imports, the emulator's
+        // image-map handler can commit a page of its own heap under its interval lock; the
+        // commit's notification then waits for that same lock and the host parks for good
+        // (no report after load-client-begin). Wine's opt-in MADEIRA_IMAGE_MAP_GUARD (off for
+        // every other session) keeps the emulator's own memory calls un-notified there, as
+        // on the syscall path. Dock sessions turn it on; ntdll without the switch ignores it.
+        // env.MADEIRA_DOCK_IMAGE_MAP_GUARD = 0 leaves it off.
+        let guardMap = SteamSignIn.flag("MADEIRA_DOCK_IMAGE_MAP_GUARD", default: true)
+        if guardMap { setenv("MADEIRA_IMAGE_MAP_GUARD", "1", 1) }
+        SteamLog.event("[dock-launch] image-map-guard=\(guardMap ? 1 : 0)")
     }
 
     /// Wine's explorer opens a virtual desktop and starts the host in it. With

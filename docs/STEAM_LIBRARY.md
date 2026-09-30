@@ -66,7 +66,9 @@ settings apply to the session (the in-game menu saves changes back to the
 entry). The profile never replaces what Dock starts. Play is refused, with the
 reason, while an update runs, before Steam marks the game fully installed,
 without Valve's client components or without a sign-in. Launch arguments are
-not offered: Dock starts Steam's own launch option.
+not offered: Dock starts Steam's own launch option. The session keeps Dock's
+starting screen until the game's own window is shown (`docs/MADEIRA_DOCK.md`,
+"Starting screen").
 
 **Start with: The game** starts the game's own program in Wine, without Steam
 or Madeira Dock, like a game added to the library. It suits games that run
