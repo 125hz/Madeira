@@ -2963,6 +2963,16 @@ struct ContentView: View {
             } else {
                 unsetenv("MADEIRA_MADSYNC_SESSION")
             }
+            // A Dock session starts 64-bit (explorer, then the host), but the programs it starts
+            // later are often 32-bit: one-time installers and the 32-bit games Valve's client
+            // launches. win32u decides once, when the session's first program initialises it,
+            // whether the GDI handle table is a section that every 32-bit program can map inside
+            // its own guest window (wine dlls/win32u/gdiobj.c, gdi_shared_use_section). Left to
+            // that default, a Dock session's table is private host memory, and 32-bit gdi32
+            // truncates its address and faults on its first GDI handle. The regular launch path
+            // is unchanged; env.MADEIRA_GDI_SHARED_SECTION = 0 in madeira.cfg, exported after
+            // this, keeps the default for Dock sessions too.
+            setenv("MADEIRA_GDI_SHARED_SECTION", "1", 1)
             var width = 1280, height = 720
             if let txt = MadeiraConfig.get("desktop-size") {
                 let p = txt.lowercased().split(separator: "x").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
