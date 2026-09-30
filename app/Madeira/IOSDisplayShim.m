@@ -58,8 +58,9 @@ void madeira_display_set_layer(CAMetalLayer *layer) {
 // The front end lays out the presented layer and maps touches in guest
 // pixels, so it needs the monitor size win32u uses. win32u reads
 // MADEIRA_SCREEN_W/H once per session (sysparams_ios.c, ios_screen_size), so
-// that is the seed; winios_display_mode_changed() is the entry point for a
-// win32u that publishes mode changes (nothing calls it on main yet).
+// that is the seed; sysparams_ios.c calls winios_display_mode_changed() when
+// a program changes the display mode (ios_publish_screen_size), and the
+// front end calls it when it chooses a session's size.
 
 static int g_screen_w, g_screen_h;   // 0 until something publishes a size
 static pthread_mutex_t g_screen_lock = PTHREAD_MUTEX_INITIALIZER;

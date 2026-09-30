@@ -605,6 +605,11 @@ unsigned long long winios_surface_present_count(void) {
     return atomic_load_explicit(&g_surface_present_count, memory_order_relaxed);
 }
 
+/* IOSDisplayShim.m: the guest's virtual monitor as win32u last published it
+ * (the session default until a program changes the display mode). */
+extern void winios_screen_size(int *w, int *h);
+extern NSString * const MadeiraDisplayModeChangedNotification;
+
 static UIView *g_compositor_view;
 static CALayer *g_desk_bg;               /* teal desktop-area backdrop */
 static CGFloat g_px_to_pt = 1.0 / 3.0;   /* desktop px → screen pt */
@@ -625,8 +630,14 @@ static void winios_layout_compositor(void) {
     CGRect frame = g_comp_frame_set ? g_comp_frame : (win ? win.bounds : g_compositor_view.frame);
     g_compositor_view.frame = frame;
 
-    const char *dw = getenv("MADEIRA_SCREEN_W"), *dh = getenv("MADEIRA_SCREEN_H");
-    int desk_w = dw ? atoi(dw) : 1024, desk_h = dh ? atoi(dh) : 768;
+    /* The LIVE guest size, not MADEIRA_SCREEN_W/H. That environment pair is
+     * the session's launch-time seed; win32u owns the value afterwards and
+     * publishes every change through winios_display_mode_changed
+     * (IOSDisplayShim.m). Reading the seed kept letterboxing against the old
+     * size after a program programmed a different mode, so an 800x600 game
+     * stayed a small window inside a 1280x720 frame. */
+    int desk_w = 0, desk_h = 0;
+    winios_screen_size(&desk_w, &desk_h);
     if (desk_w <= 0) desk_w = 1024;
     if (desk_h <= 0) desk_h = 768;
     CGFloat s = MIN(frame.size.width / desk_w, frame.size.height / desk_h);
@@ -683,8 +694,10 @@ int winios_compositor_set_hidden(int hidden) {
  * mapping winios_layout_compositor placed the desktop with, for the front end's
  * Touch pointer mode in desktop sessions. Returns 0 when there is no desktop. */
 int winios_desktop_point_from_window(double wx, double wy, int *px, int *py) {
-    const char *dw = getenv("MADEIRA_SCREEN_W"), *dh = getenv("MADEIRA_SCREEN_H");
-    int desk_w = dw ? atoi(dw) : 1024, desk_h = dh ? atoi(dh) : 768;
+    /* the live guest size, as winios_layout_compositor uses: the two must
+     * agree or a touch lands somewhere the desktop is not */
+    int desk_w = 0, desk_h = 0;
+    winios_screen_size(&desk_w, &desk_h);
     if (desk_w <= 0) desk_w = 1024;
     if (desk_h <= 0) desk_h = 768;
     if (px) *px = 0;
@@ -731,6 +744,17 @@ static void winios_ensure_compositor(void) {
     winios_layout_compositor();
     fprintf(stderr, "[winios] compositor attached inside presentation frame\n");
     fflush(stderr);
+    /* A guest display-mode change moves the desktop's size without moving
+     * the presentation frame, so winios_set_compositor_frame (which skips a
+     * no-op frame) never notices it: re-fit the desktop when win32u
+     * publishes one (IOSDisplayShim posts this on the main queue). */
+    static id mode_observer;
+    if (!mode_observer) {
+        mode_observer = [[NSNotificationCenter defaultCenter]
+            addObserverForName:MadeiraDisplayModeChangedNotification object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) { winios_layout_compositor(); }];
+    }
     /* Wedged-thread triage: sample every thread's stack every 20s from
      * an app-side timer — keeps firing even when all wine threads are
      * stuck (unlike the tree dump, which rides wine's event drain). */

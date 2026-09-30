@@ -3,11 +3,10 @@ import Foundation
 // The guest's virtual monitor and how it is laid out on the device's screen.
 //
 // A game renders for the virtual monitor win32u reports (build/win32u-unix/
-// sysparams_ios.c): its size is the session default from MADEIRA_SCREEN_W/H,
-// which win32u reads once per session. A win32u that lets a game change it
-// can publish the new size through winios_display_mode_changed()
-// (IOSDisplayShim.m); main's does not, so the size stays the session default.
-// MetalBackedView reads the current size back (winios_screen_size) and places
+// sysparams_ios.c): it starts at the session default from MADEIRA_SCREEN_W/H,
+// and a game's ChangeDisplaySettings programs a new mode, which win32u
+// publishes through winios_display_mode_changed() (IOSDisplayShim.m;
+// MADEIRA_VIRTUAL_MODE_SET=0 keeps the session default). MetalBackedView reads the current size back (winios_screen_size) and places
 // the presented layer with GameSurfaceLayout, so the layer's frame and the
 // touch mapping always agree. A library entry chooses the monitor size
 // (Resolution) and how it is scaled (Aspect & scaling); the developer

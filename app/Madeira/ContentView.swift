@@ -617,8 +617,11 @@ final class MetalBackedView: UIView {
         }
 
         let sens = CGFloat(InputSettings.shared.sensAbs)   // desktop px per view pt
-        let maxX = CGFloat(envInt("MADEIRA_SCREEN_W", 1024) - 1)
-        let maxY = CGFloat(envInt("MADEIRA_SCREEN_H", 768) - 1)
+        // The live desktop size: a program's display-mode change resizes it.
+        var deskW: Int32 = 0, deskH: Int32 = 0
+        winios_screen_size(&deskW, &deskH)
+        let maxX = CGFloat(max(Int(deskW), 1) - 1)
+        let maxY = CGFloat(max(Int(deskH), 1) - 1)
         Self.cursor.x = min(max(Self.cursor.x + dx * sens, 0), maxX)
         Self.cursor.y = min(max(Self.cursor.y + dy * sens, 0), maxY)
         postPointer(F_MOVE | F_ABS)
@@ -1667,6 +1670,7 @@ struct ContentView: View {
                     setenv("MADEIRA_DESKTOP", "1", 1)
                     setenv("MADEIRA_SCREEN_W", String(deskW), 1)
                     setenv("MADEIRA_SCREEN_H", String(deskH), 1)
+                    winios_display_mode_changed(Int32(deskW), Int32(deskH))
                     // ml371: surfdump ground truth — the "frozen desktop"
                     // question (fresh pixels never presented vs nothing
                     // painting upstream) is undecidable from the log alone
@@ -1828,6 +1832,7 @@ struct ContentView: View {
                     setenv("MADEIRA_DESKTOP", "1", 1)
                     setenv("MADEIRA_SCREEN_W", String(deskW), 1)
                     setenv("MADEIRA_SCREEN_H", String(deskH), 1)
+                    winios_display_mode_changed(Int32(deskW), Int32(deskH))
                     runWineFullSequence()
                 }
                 .buttonStyle(.borderedProminent)
@@ -2915,6 +2920,10 @@ struct ContentView: View {
         setenv("MADEIRA_DESKTOP", "1", 1)
         setenv("MADEIRA_SCREEN_W", String(width), 1)
         setenv("MADEIRA_SCREEN_H", String(height), 1)
+        // The compositor and touch mapping read the published size
+        // (winios_screen_size), which a program's display-mode change moves;
+        // start this session from its own desktop size, not a previous one.
+        winios_display_mode_changed(Int32(width), Int32(height))
         MadeiraDock.requestLaunch(compactPool: compactPool)
         logStore.log("[madeira-dock] starting the host for app \(game.id); Valve's client authenticates and authorizes the launch")
         MadeiraDockModel.shared.watchReport()
