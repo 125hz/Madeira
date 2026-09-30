@@ -4,9 +4,10 @@
 # Madeira Converter Exception: see LICENSE-EXCEPTION.md
 """Host checks for Steam sign-in (app/Madeira/SwiftSteam); never contacts Steam.
 
-Part A is static: every sign-in file carries its licence header, the module
-holds only sign-in code, the Keychain item stays on this device, and no log
-line interpolates a credential.
+Part A is static: every file carries its licence header, the sign-in files hold
+no library, download or launch code (the owned library and downloads have their
+own files and their own test, check-steam-library.py), the Keychain item stays
+on this device, and no log line interpolates a credential.
 
 Part B compiles the production Swift on the host (protobuf helpers, the
 IAuthenticationService messages, SteamError, SteamAuthAPI and the pure part of
@@ -53,11 +54,19 @@ def block(source, start_marker):
 
 # ---------------------------------------------------------------- Part A
 files = sorted(steam.rglob('*.swift'))
-expected = {'SteamSignIn.swift', 'SteamSignInView.swift', 'SteamAuthAPI.swift', 'SteamCredentialAuth.swift',
-            'SteamQRAuth.swift', 'SteamTokenStore.swift', 'SteamError.swift', 'SteamProtoMessages.swift',
-            'SteamDevice.swift', 'SteamLog.swift'}
-require({f.name for f in files} == expected, 'SwiftSteam holds exactly the sign-in files')
-require(not [f for f in steam.rglob('*') if f.is_file() and f.suffix != '.swift'], 'no C sources or binaries in SwiftSteam')
+signin_files = {'SteamSignIn.swift', 'SteamSignInView.swift', 'SteamAuthAPI.swift', 'SteamCredentialAuth.swift',
+                'SteamQRAuth.swift', 'SteamTokenStore.swift', 'SteamError.swift', 'SteamProtoMessages.swift',
+                'SteamDevice.swift', 'SteamLog.swift'}
+# The owned library and downloads (docs/STEAM_LIBRARY.md). SteamError and SteamProtoMessages are shared.
+library_files = {'CMServerList.swift', 'LicenseListBox.swift', 'SteamCMSession.swift', 'SteamConnection.swift', 'SteamMessageCodec.swift',
+                 'SteamProtocol.swift', 'SteamSession.swift', 'ContentDecryptor.swift', 'DepotDownloader.swift',
+                 'DepotManifest.swift', 'SteamAppInfo.swift', 'SteamLibraryFetcher.swift', 'AppManifestWriter.swift'}
+shared_files = {'SteamError.swift', 'SteamProtoMessages.swift'}
+require(signin_files <= {f.name for f in files} <= signin_files | library_files,
+        'SwiftSteam holds the sign-in files and, besides them, only the library files (check-steam-library.py lists those)')
+require({f.name for f in steam.rglob('*') if f.is_file() and f.suffix != '.swift'} <=
+        {'chunk_zip.c', 'chunk_zip.h', 'lzma_shim.c', 'lzma_shim.h', 'zstd_edu.c', 'zstd_edu.h'},
+        'the only C sources in SwiftSteam are the content decoders')
 project = (root / 'app/Madeira.xcodeproj/project.pbxproj').read_text()
 for f in files:
     rel = f.relative_to(app).as_posix()
@@ -68,10 +77,11 @@ for f in files:
             and head[2] == '// Madeira Converter Exception: see LICENSE-EXCEPTION.md', f'{rel} licence header')
     if 'Jfishin' in head[1]:
         require("Derived from Jfishin's Madeira Steam client" in text or "Jfishin's" in text, f'{rel} credits Jfishin')
-    # No depot, library, CM connection or launch code belongs in the sign-in module.
-    for word in ['DepotDownloader', 'SteamSession', 'SteamConnection', 'CMsgClientLogon', 'ChannelEncrypt',
-                 'PICS', 'appmanifest', 'steamclient64', 'steamclient.dll', 'LaunchApp', 'emulat']:
-        require(word not in text, f'{rel} has no {word}')
+    # No depot, library, CM connection or launch code belongs in the sign-in files.
+    if f.name in signin_files and f.name not in shared_files:
+        for word in ['DepotDownloader', 'SteamSession', 'SteamConnection', 'CMsgClientLogon', 'ChannelEncrypt',
+                     'PICS', 'appmanifest', 'steamclient64', 'steamclient.dll', 'LaunchApp', 'emulat']:
+            require(word not in text, f'{rel} has no {word}')
     # Credentials never reach a log line.
     for line in text.splitlines():
         if re.search(r'SteamLog\.(event|trace)|LogStore|print\(|NSLog|os_log', line):

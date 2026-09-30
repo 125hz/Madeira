@@ -116,6 +116,9 @@ final class MadeiraDockModel: ObservableObject {
                 }
             }
             MadeiraDock.cleanup()
+            // The host is done with the sign-in: the app's own Steam connection may come
+            // back once no session runs (SteamOwnedLibrary).
+            SteamOwnedLibrary.shared.dockEnded()
         }
     }
 }

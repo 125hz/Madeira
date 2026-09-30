@@ -13,6 +13,25 @@
 		A1000540 /* ConfigCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000540 /* ConfigCatalog.swift */; };
 		A1000541 /* ConfigCatalog.generated.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000541 /* ConfigCatalog.generated.swift */; };
 		A1000531 /* SteamGames.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000531 /* SteamGames.swift */; };
+		A1000601 /* SteamOwnedLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000601 /* SteamOwnedLibrary.swift */; };
+		A1000602 /* SteamDownloadBackground.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000602 /* SteamDownloadBackground.swift */; };
+		A1000600 /* SteamInstall.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000600 /* SteamInstall.swift */; };
+		A1000609 /* SwiftSteam/Content/ContentDecryptor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000609 /* ContentDecryptor.swift */; };
+		A100060A /* SwiftSteam/Content/DepotDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200060A /* DepotDownloader.swift */; };
+		A100060B /* SwiftSteam/Content/DepotManifest.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200060B /* DepotManifest.swift */; };
+		A100060E /* SwiftSteam/Install/AppManifestWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200060E /* AppManifestWriter.swift */; };
+		A100060F /* SwiftSteam/chunk_zip.c in Sources */ = {isa = PBXBuildFile; fileRef = A200060F /* chunk_zip.c */; };
+		A1000610 /* SwiftSteam/lzma_shim.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000610 /* lzma_shim.c */; };
+		A1000611 /* SwiftSteam/zstd_edu.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000611 /* zstd_edu.c */; };
+		A1000603 /* SwiftSteam/Core/CMServerList.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000603 /* CMServerList.swift */; };
+		A1000604 /* SwiftSteam/Core/LicenseListBox.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000604 /* LicenseListBox.swift */; };
+		A1000605 /* SwiftSteam/Core/SteamConnection.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000605 /* SteamConnection.swift */; };
+		A1000606 /* SwiftSteam/Core/SteamMessageCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000606 /* SteamMessageCodec.swift */; };
+		A1000607 /* SwiftSteam/Core/SteamProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000607 /* SteamProtocol.swift */; };
+		A1000608 /* SwiftSteam/Core/SteamSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000608 /* SteamSession.swift */; };
+		A1000616 /* SwiftSteam/Core/SteamCMSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000616 /* SteamCMSession.swift */; };
+		A100060C /* SwiftSteam/Library/SteamAppInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200060C /* SteamAppInfo.swift */; };
+		A100060D /* SwiftSteam/Library/SteamLibraryFetcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200060D /* SteamLibraryFetcher.swift */; };
 		A1000522 /* SteamKeyValues.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000522 /* SteamKeyValues.swift */; };
 		A1000523 /* SteamRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000523 /* SteamRuntime.swift */; };
 		A1000524 /* DockInstallers.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000524 /* DockInstallers.swift */; };
@@ -59,6 +78,7 @@
 		A1000053 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000053 /* QuartzCore.framework */; };
 		A1000054 /* MetalFX.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000054 /* MetalFX.framework */; };
 		A1000055 /* libsqlite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000055 /* libsqlite3.tbd */; };
+		A1000615 /* liblzma.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000615 /* liblzma.tbd */; };
 		A1000060 /* libwin32u_unix.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000060 /* libwin32u_unix.a */; };
 		A1000070 /* Winios/Winios.m in Sources */ = {isa = PBXBuildFile; fileRef = A2000070 /* Winios/Winios.m */; };
 		A1000080 /* arm64ec-windows in Resources */ = {isa = PBXBuildFile; fileRef = A2000080 /* arm64ec-windows */; };
@@ -101,6 +121,28 @@
 		A2000540 /* ConfigCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ConfigCatalog.swift"; sourceTree = "<group>"; };
 		A2000541 /* ConfigCatalog.generated.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ConfigCatalog.generated.swift"; sourceTree = "<group>"; };
 		A2000531 /* SteamGames.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamGames.swift"; sourceTree = "<group>"; };
+		A2000601 /* SteamOwnedLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamOwnedLibrary.swift"; sourceTree = "<group>"; };
+		A2000602 /* SteamDownloadBackground.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamDownloadBackground.swift"; sourceTree = "<group>"; };
+		A2000600 /* SteamInstall.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamInstall.swift"; sourceTree = "<group>"; };
+		A2000609 /* ContentDecryptor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/ContentDecryptor.swift"; sourceTree = "<group>"; };
+		A200060A /* DepotDownloader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/DepotDownloader.swift"; sourceTree = "<group>"; };
+		A200060B /* DepotManifest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/DepotManifest.swift"; sourceTree = "<group>"; };
+		A200060E /* AppManifestWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Install/AppManifestWriter.swift"; sourceTree = "<group>"; };
+		A200060F /* chunk_zip.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "SwiftSteam/chunk_zip.c"; sourceTree = "<group>"; };
+		A2000610 /* lzma_shim.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "SwiftSteam/lzma_shim.c"; sourceTree = "<group>"; };
+		A2000611 /* zstd_edu.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "SwiftSteam/zstd_edu.c"; sourceTree = "<group>"; };
+		A2000612 /* chunk_zip.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "SwiftSteam/chunk_zip.h"; sourceTree = "<group>"; };
+		A2000613 /* lzma_shim.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "SwiftSteam/lzma_shim.h"; sourceTree = "<group>"; };
+		A2000614 /* zstd_edu.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "SwiftSteam/zstd_edu.h"; sourceTree = "<group>"; };
+		A2000603 /* CMServerList.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Core/CMServerList.swift"; sourceTree = "<group>"; };
+		A2000604 /* LicenseListBox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Core/LicenseListBox.swift"; sourceTree = "<group>"; };
+		A2000605 /* SteamConnection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Core/SteamConnection.swift"; sourceTree = "<group>"; };
+		A2000606 /* SteamMessageCodec.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Core/SteamMessageCodec.swift"; sourceTree = "<group>"; };
+		A2000607 /* SteamProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Core/SteamProtocol.swift"; sourceTree = "<group>"; };
+		A2000608 /* SteamSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Core/SteamSession.swift"; sourceTree = "<group>"; };
+		A2000616 /* SteamCMSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Core/SteamCMSession.swift"; sourceTree = "<group>"; };
+		A200060C /* SteamAppInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Library/SteamAppInfo.swift"; sourceTree = "<group>"; };
+		A200060D /* SteamLibraryFetcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Library/SteamLibraryFetcher.swift"; sourceTree = "<group>"; };
 		A2000522 /* SteamKeyValues.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamKeyValues.swift"; sourceTree = "<group>"; };
 		A2000523 /* SteamRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamRuntime.swift"; sourceTree = "<group>"; };
 		A2000524 /* DockInstallers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DockInstallers.swift"; sourceTree = "<group>"; };
@@ -156,6 +198,7 @@
 		A2000053 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		A2000054 /* MetalFX.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalFX.framework; path = System/Library/Frameworks/MetalFX.framework; sourceTree = SDKROOT; };
 		A2000055 /* libsqlite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libsqlite3.tbd; path = usr/lib/libsqlite3.tbd; sourceTree = SDKROOT; };
+		A2000615 /* liblzma.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = liblzma.tbd; path = usr/lib/liblzma.tbd; sourceTree = SDKROOT; };
 		A2000056 /* IOSDisplayShim.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = IOSDisplayShim.h; sourceTree = "<group>"; };
 		A2000060 /* libwin32u_unix.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libwin32u_unix.a; sourceTree = "<group>"; };
 		A2000070 /* Winios/Winios.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = Winios/Winios.m; sourceTree = "<group>"; };
@@ -215,6 +258,7 @@
 				A1000053 /* QuartzCore.framework in Frameworks */,
 				A1000054 /* MetalFX.framework in Frameworks */,
 				A1000055 /* libsqlite3.tbd in Frameworks */,
+				A1000615 /* liblzma.tbd in Frameworks */,
 				A1000060 /* libwin32u_unix.a in Frameworks */,
 				A1000090 /* libgnutls.a in Frameworks */,
 				A1000091 /* libhogweed.a in Frameworks */,
@@ -253,6 +297,28 @@
 				A2000540 /* ConfigCatalog.swift */,
 				A2000541 /* ConfigCatalog.generated.swift */,
 				A2000531 /* SteamGames.swift */,
+				A2000601 /* SteamOwnedLibrary.swift */,
+				A2000602 /* SteamDownloadBackground.swift */,
+				A2000600 /* SteamInstall.swift */,
+				A2000609 /* ContentDecryptor.swift */,
+				A200060A /* DepotDownloader.swift */,
+				A200060B /* DepotManifest.swift */,
+				A200060E /* AppManifestWriter.swift */,
+				A200060F /* chunk_zip.c */,
+				A2000610 /* lzma_shim.c */,
+				A2000611 /* zstd_edu.c */,
+				A2000612 /* chunk_zip.h */,
+				A2000613 /* lzma_shim.h */,
+				A2000614 /* zstd_edu.h */,
+				A2000603 /* CMServerList.swift */,
+				A2000604 /* LicenseListBox.swift */,
+				A2000605 /* SteamConnection.swift */,
+				A2000606 /* SteamMessageCodec.swift */,
+				A2000607 /* SteamProtocol.swift */,
+				A2000608 /* SteamSession.swift */,
+				A2000616 /* SteamCMSession.swift */,
+				A200060C /* SteamAppInfo.swift */,
+				A200060D /* SteamLibraryFetcher.swift */,
 				A2000522 /* SteamKeyValues.swift */,
 				A2000523 /* SteamRuntime.swift */,
 				A2000524 /* DockInstallers.swift */,
@@ -343,6 +409,7 @@
 				A2000053 /* QuartzCore.framework */,
 				A2000054 /* MetalFX.framework */,
 				A2000055 /* libsqlite3.tbd */,
+				A2000615 /* liblzma.tbd */,
 				A2000060 /* libwin32u_unix.a */,
 				A2000090 /* libgnutls.a */,
 				A2000091 /* libhogweed.a */,
@@ -464,6 +531,25 @@
 				A1000540 /* ConfigCatalog.swift in Sources */,
 				A1000541 /* ConfigCatalog.generated.swift in Sources */,
 				A1000531 /* SteamGames.swift in Sources */,
+				A1000601 /* SteamOwnedLibrary.swift in Sources */,
+				A1000602 /* SteamDownloadBackground.swift in Sources */,
+				A1000600 /* SteamInstall.swift in Sources */,
+				A1000609 /* SwiftSteam/Content/ContentDecryptor.swift in Sources */,
+				A100060A /* SwiftSteam/Content/DepotDownloader.swift in Sources */,
+				A100060B /* SwiftSteam/Content/DepotManifest.swift in Sources */,
+				A100060E /* SwiftSteam/Install/AppManifestWriter.swift in Sources */,
+				A100060F /* SwiftSteam/chunk_zip.c in Sources */,
+				A1000610 /* SwiftSteam/lzma_shim.c in Sources */,
+				A1000611 /* SwiftSteam/zstd_edu.c in Sources */,
+				A1000603 /* SwiftSteam/Core/CMServerList.swift in Sources */,
+				A1000604 /* SwiftSteam/Core/LicenseListBox.swift in Sources */,
+				A1000605 /* SwiftSteam/Core/SteamConnection.swift in Sources */,
+				A1000606 /* SwiftSteam/Core/SteamMessageCodec.swift in Sources */,
+				A1000607 /* SwiftSteam/Core/SteamProtocol.swift in Sources */,
+				A1000608 /* SwiftSteam/Core/SteamSession.swift in Sources */,
+				A1000616 /* SwiftSteam/Core/SteamCMSession.swift in Sources */,
+				A100060C /* SwiftSteam/Library/SteamAppInfo.swift in Sources */,
+				A100060D /* SwiftSteam/Library/SteamLibraryFetcher.swift in Sources */,
 				A1000522 /* SteamKeyValues.swift in Sources */,
 				A1000523 /* SteamRuntime.swift in Sources */,
 				A1000524 /* DockInstallers.swift in Sources */,
