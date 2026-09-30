@@ -93,7 +93,7 @@ require('$0.steamAppID == nil' in library[entries_start:library.index('var body:
 # A card's pills: an installed game shows a library game's (32-bit or 64-bit, graphics API, size), no
 # "Madeira Dock" or "Steam" pill; "Update" joins them; any other state keeps its own pill.
 cell = games[games.index('private struct SteamGameCell: View {'):games.index('/// Progress, speed and the state of one download.')]
-require('@ViewBuilder private func pills(_ status: Status, _ entry: LibraryEntry?) -> some View {' in cell and
+require('@ViewBuilder private func pills(_ status: SteamGamesRules.Status, _ entry: LibraryEntry?) -> some View {' in cell and
         'if status.showsFormat, let entry {\n            LibraryBadges(entry: entry, note: status.badge)' in cell and
         '} else if let text = status.badge {\n            badge(text)' in cell and
         cell.count('pills(status, entry)') == 3 and '.label' not in cell and

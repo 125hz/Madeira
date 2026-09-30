@@ -710,7 +710,7 @@ private struct SteamGameCell: View {
 
     /// An installed game shows the pills of any library game (bits, graphics API,
     /// size, and "Update" when a newer build exists); any other state its badge.
-    @ViewBuilder private func pills(_ status: Status, _ entry: LibraryEntry?) -> some View {
+    @ViewBuilder private func pills(_ status: SteamGamesRules.Status, _ entry: LibraryEntry?) -> some View {
         if status.showsFormat, let entry {
             LibraryBadges(entry: entry, note: status.badge).foregroundStyle(.secondary)
         } else if let text = status.badge {

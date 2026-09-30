@@ -33,8 +33,10 @@ assert "const BOOL is_i386_target = has_i386_set && target_machine == MADEIRA_IM
 farm = thread[thread.index("if (has_i386_set) {"):]
 farm = farm[:farm.index("/* ml719: REPAIR THE SHELL FOLDERS.")]
 assert "madeira_link_syswow64(fm, prefix, bundlePath);" in farm
-inner = farm[farm.index("if (is_i386_target) {"):]
-assert "madeira_link_syswow64_wbem(" in inner and "madeira_seed_winsxs_x86(" in inner, "wbem/winsxs for i386 targets only"
+# #84: syswow64\\wbem and the x86 side-by-side store are seeded for every session that
+# has the i386 farm (a 64-bit target starts 32-bit children too), not for i386 targets only.
+assert "madeira_link_syswow64_wbem(" in farm and "madeira_seed_winsxs_x86(" in farm, "wbem/winsxs with the i386 farm"
+assert "is_i386_target" not in farm, "wbem/winsxs no longer depend on the target's machine"
 for call in ["madeira_link_syswow64(", "madeira_link_syswow64_wbem(", "madeira_seed_winsxs_x86(",
              "madeira_publish_host_probe()"]:
     assert thread.count(call) == 1, call
@@ -48,7 +50,7 @@ assert 'snprintf(exe_path, sizeof(exe_path), "C:\\\\windows\\\\system32\\\\%s", 
 sxs = function(src, "static void madeira_seed_winsxs_x86(")
 assert "x86_%s_%s_%s_none_deadbeef" in sxs and 'processorArchitecture=\\"x86\\"' in sxs
 assert "arm64" not in sxs and "amd64" not in sxs, "only x86 assemblies are written"
-print("PASS: non-i386 targets keep the upstream core choice, farms and exe path; WoW64 steps are gated")
+print("PASS: non-i386 targets keep the upstream core choice and exe path; the i386 farm, wbem and winsxs come with the farm")
 
 # ---- Part B: the machine probe
 pe_machine = function(src, "static uint16_t madeira_pe_machine(")

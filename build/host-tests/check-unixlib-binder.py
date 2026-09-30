@@ -67,6 +67,12 @@ wg = [b for b in branches if 'strstr(match, "winegstreamer")' in b.split("\n")[0
 assert len(wg) == 1, len(wg)
 assert "funcs_wow64 = (const void *)winegstreamer_unix_call_wow64_funcs;" in wg[0], wg[0]
 branches = [b for b in branches if b is not wg[0]]
+# dnsapi's branch is new too (#70: upstream dnsapi has no unix side on iOS); same rule.
+dns = [b for b in branches if 'strstr(match, "dnsapi")' in b.split("\n")[0]]
+assert len(dns) == 1, len(dns)
+assert "funcs64 = (const void *)dnsapi_unix_call_funcs;" in dns[0], dns[0]
+assert "funcs_wow64 = (const void *)dnsapi_unix_call_wow64_funcs;" in dns[0], dns[0]
+branches = [b for b in branches if b is not dns[0]]
 assert len(branches) == len(upstream) + 1, len(branches)
 for (test, table), body in zip(upstream, branches):
     assert test in body.split("\n")[0], (test, body.split("\n")[0])
