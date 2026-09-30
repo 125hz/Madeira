@@ -19351,9 +19351,24 @@ static void ios_vm_note_alloc( void *base, SIZE_T size, ULONG type, ULONG protec
      * which printed only the RESULT. Always log a violating or low-limited
      * request, regardless of the census budget. */
     int viol = (lim && b > lim);
+    /* Bounded. A WoW64 process lives in its own 4 GB window, so every one of its
+     * allocations carries zero_bits and lands "above" its 32-bit limit by design;
+     * the uncapped branch below logged each of them: 127,000 lines (22 MB of a
+     * 25 MB device log) in one 32-bit session, 3.5 million lines (562 MB) in a
+     * longer one. WoW64 is skipped except for the watch address, and the
+     * always-log branch is capped at 200. MADEIRA_VALLOC_LOG_ALL=1 restores the
+     * old reach. */
+    static int log_all = -1;
+    static unsigned long special_logged;
+    int special = viol || zbits;
+    if (log_all < 0) { const char *e = getenv( "MADEIRA_VALLOC_LOG_ALL" ); log_all = e && e[0] == '1'; }
+    if (!log_all && !covers && is_wow64()) return;
     if (b < 0x100000000ull && !viol && !zbits) return;
-    if (covers || viol || zbits || ios_vm_alloc_logged < 3000)
+    if (covers || (special && (log_all || special_logged < 200)) || (!special && ios_vm_alloc_logged < 3000))
     {
+        if (special && !covers && ++special_logged == 200)
+            dprintf( 2, "[valloc] limited/violating allocations: first 200 logged, the rest are not "
+                        "(MADEIRA_VALLOC_LOG_ALL=1 logs all)\n" );
         ios_vm_alloc_logged++;
         dprintf( 2, "[valloc] ml959 %s base=0x%llx size=0x%llx type=0x%x prot=0x%x tid=%04x"
                  " | req_hint=0x%llx zero_bits=0x%llx limit=0x%llx%s\n",
