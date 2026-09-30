@@ -14,7 +14,19 @@ import Foundation
 
 /// How the guest surface is mapped into the view's bounds.
 enum DisplayMode: String, CaseIterable {
-    case fit, fill, stretch, aspect, fitHeight
+    case fit, fill, stretch, aspect
+
+    /// Older settings stored "fitHeight" (Fill height); it behaved as Fit in
+    /// landscape and is gone from the picker, so it decodes to Fit.
+    init?(rawValue: String) {
+        switch rawValue {
+        case "fit", "fitHeight": self = .fit
+        case "fill": self = .fill
+        case "stretch": self = .stretch
+        case "aspect": self = .aspect
+        default: return nil
+        }
+    }
 
     var label: String {
         switch self {
@@ -22,7 +34,6 @@ enum DisplayMode: String, CaseIterable {
         case .fill:      return "Fill"
         case .stretch:   return "Stretch"
         case .aspect:    return "Aspect"
-        case .fitHeight: return "Fill height"
         }
     }
     var symbol: String {
@@ -31,7 +42,6 @@ enum DisplayMode: String, CaseIterable {
         case .fill:      return "arrow.up.left.and.arrow.down.right"
         case .stretch:   return "rectangle.expand.vertical"
         case .aspect:    return "rectangle.ratio.16.to.9"
-        case .fitHeight: return "arrow.up.and.down.square"
         }
     }
 }
@@ -58,10 +68,10 @@ enum GameSurfaceLayout {
         guard guest.width > 0, guest.height > 0,
               bounds.width > 0, bounds.height > 0 else { return bounds }
         if mode == .stretch { return bounds }
-        let useDrawable = (mode == .aspect || mode == .fitHeight) && aspect.width > 0 && aspect.height > 0
+        let useDrawable = mode == .aspect && aspect.width > 0 && aspect.height > 0
         let shape = useDrawable ? aspect : guest
         let sx = bounds.width / shape.width, sy = bounds.height / shape.height
-        let scale = mode == .fill ? max(sx, sy) : (mode == .fitHeight ? sy : min(sx, sy))
+        let scale = mode == .fill ? max(sx, sy) : min(sx, sy)
         let w = shape.width * scale, h = shape.height * scale
         return CGRect(x: bounds.minX + (bounds.width - w) / 2,
                       y: bounds.minY + (bounds.height - h) / 2,

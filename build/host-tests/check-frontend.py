@@ -193,8 +193,6 @@ let drawn = CGSize(width: 1024, height: 768)
 let aspect = GameSurfaceLayout.rect(guest: guest, aspect: drawn, bounds: view, mode: .aspect)
 expect(near(aspect.width / aspect.height * 3, 4) && near(aspect.height, 390), "Aspect follows the drawn shape")
 expect(GameSurfaceLayout.rect(guest: guest, bounds: view, mode: .aspect) == fit, "Aspect is Fit until a frame is drawn")
-let tall = GameSurfaceLayout.rect(guest: guest, aspect: CGSize(width: 2560, height: 720), bounds: view, mode: .fitHeight)
-expect(near(tall.height, 390) && tall.width > view.width, "Fill height keeps the full height")
 let centre = GameSurfaceLayout.map(point: CGPoint(x: 422, y: 195), guest: guest, bounds: view, mode: .fit)
 expect(near(centre.x, 640) && near(centre.y, 360), "the centre maps to the guest's centre")
 let bar = GameSurfaceLayout.map(point: CGPoint(x: 10, y: 10), guest: guest, bounds: view, mode: .fit)
@@ -205,7 +203,7 @@ let phone = GuestDisplay.defaultMode(forLandscapeView: CGSize(width: 844, height
 let tablet = GuestDisplay.defaultMode(forLandscapeView: CGSize(width: 1024, height: 768))
 expect(phone.w == 1280 && phone.h == 720, "phone default mode is 1280x720")
 expect(tablet.w == 1152 && tablet.h == 864, "4:3 default mode is 1152x864 (cheapest 4:3 of at least 0.9 MP)")
-expect(DisplayMode.allCases.map { $0.label } == ["Fit", "Fill", "Stretch", "Aspect", "Fill height"], "the five Aspect & scaling choices")
+expect(DisplayMode.allCases.map { $0.label } == ["Fit", "Fill", "Stretch", "Aspect"], "the four Aspect & scaling choices")
 
 // Controller navigation.
 let c = LibraryController.shared

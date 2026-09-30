@@ -927,7 +927,7 @@ static void winios_place_metal_layer(NSNumber *key) {
     CGFloat s = g_px_to_pt;
     ml.frame = CGRectMake((c.origin.x - w.origin.x) * s,
                           (c.origin.y - w.origin.y) * WINIOS_PX_TO_PT_Y,
-                          c.size.width * s, c.size.height * s);
+                          c.size.width * s, c.size.height * WINIOS_PX_TO_PT_Y);
     winios_desktop_fit(key, ml, c);
 }
 
