@@ -17921,6 +17921,26 @@ void virtual_map_user_shared_data(void)
     }
     if (needs_close) close( fd );
     NtClose( section );
+
+    /* ml1001: SAY WHAT THE GUEST CLOCK READS, ONCE, AT THE MOMENT IT BECOMES
+     * READABLE.  GetTickCount()/GetTickCount64() in kernelbase are three loads
+     * from this page and nothing else, so this line IS what every guest program
+     * will be told the time is.  It read 0 for the entire life of this port
+     * (the server's publication was opt-in behind MADEIRA_USD_TIME), which is
+     * indistinguishable in a log from "nobody asked" -- so print it rather than
+     * infer it.  A zero here means the clock is frozen and any guest that keys
+     * a data structure on the tick will collide every entry against every
+     * other one.  Two reads, once per process. */
+    {
+        unsigned long long ms = ((unsigned long long)user_shared_data->TickCount.High1Time << 32)
+                                | user_shared_data->TickCount.LowPart;
+        dprintf( 2, "[usd-clock] ml1001 guest KUSER_SHARED_DATA at %p: GetTickCount64()=%llu ms "
+                    "(TickCountMultiplier=0x%x) — %s\n",
+                 (void *)user_shared_data, ms,
+                 (unsigned)user_shared_data->TickCountMultiplier,
+                 ms ? "ticking" : "*** FROZEN AT ZERO: every guest tick-keyed timer will collide "
+                                  "(MADEIRA_USD_TIME=0 set?) ***" );
+    }
 }
 
 
