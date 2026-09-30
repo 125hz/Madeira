@@ -278,6 +278,9 @@ enum MadeiraDock {
         "session-native-token-submitted", "session-logon-start-result", "session-connection-result",
         "session-authenticated-online", "session-requested-app-entitled", "session-subscription-count",
         "session-requested-app-listed", "session-auth-test-result",
+        "session-online-subscription-count", "session-online-app-zero-query", "session-online-callback-id",
+        "session-timeout-subscription-count", "session-timeout-app-listed", "session-timeout-still-online",
+        "session-online-blip", "session-online-blips", "session-online-lost", "session-entitlement-source",
         "launch-client-error", "launch-update-wait", "launch-update-retry", "launch-update-ready",
         "launch-config-wait", "launch-config-gave-up", "launch-session-wait", "launch-session-gave-up",
         "ceg-request", "ceg-request-result", "ceg-request-busy", "ceg-server-result", "ceg-job-result",
@@ -326,6 +329,14 @@ enum MadeiraDock {
         let report = parseReport(data)
         for key in report.fields.keys.sorted() where report.fields[key] != lastReport.fields[key] {
             SteamLog.event("[dock-report] \(key)=\(report.fields[key]!)")
+        }
+        // The host ended: its whole report, in order, so the sequence and repeats of
+        // its numeric fields are in the diagnostic log (each line is `[steam-host]
+        // <round> <field>=<number>`; nothing else is in the file).
+        if report.fields["probe-result"] != nil, lastReport.fields["probe-result"] == nil {
+            let lines = String(decoding: data, as: UTF8.self).split(separator: "\n").filter { $0.hasPrefix("[steam-host] ") }
+            SteamLog.event("[dock-report-file] lines=\(lines.count)")
+            for line in lines.prefix(400) { SteamLog.event("[dock-report-file] " + line.trimmingCharacters(in: .whitespacesAndNewlines)) }
         }
         lastReport = report
         return report
