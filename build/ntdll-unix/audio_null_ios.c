@@ -1371,8 +1371,114 @@ static NTSTATUS ios_get_prop_value(void *args) {
     return STATUS_SUCCESS;
 }
 
+/* ---------------------------- MIDI and aux ----------------------------
+ *
+ * There is no MIDI backend on this port.  Saying so was NOT what this file
+ * used to do: every one of the seven MIDI/aux slots pointed at one stub that
+ * returned STATUS_SUCCESS and wrote nothing at all, which is not "no MIDI",
+ * it is "success, and the answer is whatever was already on the caller's
+ * stack".  That cost a whole core.
+ *
+ * mmdevapi's DriverProc (wine/dlls/mmdevapi/main.c, DRV_LOAD) starts a
+ * notify_thread whenever midi_init leaves its *err at DRV_SUCCESS, and that
+ * thread is `while (1) { midi_notify_wait; if (quit) break; ... }`.
+ * midi_notify_wait is defined to BLOCK until a notification arrives or the
+ * driver is released -- winecoreaudio.drv and winealsa.drv both sit on a
+ * condition variable in it.  A stub that returns instantly without setting
+ * *quit turns that loop into a spin on an uninitialised `quit` and an
+ * uninitialised `notify.send_notify`: on the device the thread named
+ * "mmdevapi_midi_notify" held a whole core inside the dispatcher with a
+ * garbage guest RIP, and the program it belonged to never left "starting".
+ *
+ * So each entry point now answers for itself:
+ *   midi_init        -> DRV_FAILURE, so DRV_LOAD fails and the thread is
+ *                       never created (winmm then reports no MIDI devices,
+ *                       which is the truth; waveOut does not come through
+ *                       here -- mmdevapi exports no wodMessage).
+ *   midi_notify_wait -> quit = TRUE, so even a thread that does exist leaves
+ *                       its loop on the first turn instead of spinning.
+ *   mid/mod/aux msg  -> MMSYSERR_NOTSUPPORTED and send_notify = FALSE.
+ */
+#define IOS_DRV_FAILURE           0   /* mmsystem.h DRV_FAILURE */
+#define IOS_MMSYSERR_NOTSUPPORTED 8   /* mmsystem.h MMSYSERR_NOTSUPPORTED */
+
+struct ios_midi_init_params { UINT *err; };
+struct ios_midi_notify_wait_params { BOOL *quit; void *notify; };
+struct ios_midi_message_params {
+    UINT dev_id;
+    UINT msg;
+    UINT_PTR user;
+    UINT_PTR param_1;
+    UINT_PTR param_2;
+    UINT *err;
+    void *notify;
+};
+struct ios_aux_message_params {
+    UINT dev_id;
+    UINT msg;
+    UINT_PTR user;
+    UINT_PTR param_1;
+    UINT_PTR param_2;
+    UINT *err;
+};
+
+/* notify_context's first field is `BOOL send_notify` at offset 0 in both the
+ * 64-bit and the 32-bit layout, so clearing it needs no other knowledge of
+ * the struct and the same helper serves both tables. */
+static void ios_midi_clear_notify(void *notify)
+{
+    if (notify) *(BOOL *)notify = 0;
+}
+
 static NTSTATUS ios_midi_stub(void *args) {
+    /* midi_get_driver and midi_release: nothing to report, nothing to free. */
     (void)args;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ios_midi_init(void *args) {
+    struct ios_midi_init_params *p = args;
+    static int said;
+    if (p && p->err) *p->err = IOS_DRV_FAILURE;
+    if (!said++)
+        fprintf(stderr, "[audio] midi_init -> DRV_FAILURE (no MIDI backend on this "
+                        "port; mmdevapi will not start its notify thread)\n");
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ios_midi_notify_wait(void *args) {
+    struct ios_midi_notify_wait_params *p = args;
+    static int said;
+    if (p) {
+        if (p->quit) *p->quit = 1;
+        ios_midi_clear_notify(p->notify);
+    }
+    if (!said++)
+        fprintf(stderr, "[audio] midi_notify_wait -> quit=TRUE (there is nothing to "
+                        "wait for; returning without this is a busy loop)\n");
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ios_midi_message(void *args) {
+    struct ios_midi_message_params *p = args;
+    static unsigned said;
+    if (p) {
+        if (p->err) *p->err = IOS_MMSYSERR_NOTSUPPORTED;
+        ios_midi_clear_notify(p->notify);
+    }
+    if (said++ < 8)
+        fprintf(stderr, "[audio] midi message msg=%u -> MMSYSERR_NOTSUPPORTED\n",
+                p ? p->msg : 0);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ios_aux_message(void *args) {
+    struct ios_aux_message_params *p = args;
+    static unsigned said;
+    if (p && p->err) *p->err = IOS_MMSYSERR_NOTSUPPORTED;
+    if (said++ < 8)
+        fprintf(stderr, "[audio] aux message msg=%u -> MMSYSERR_NOTSUPPORTED\n",
+                p ? p->msg : 0);
     return STATUS_SUCCESS;
 }
 
@@ -1410,13 +1516,80 @@ const void *audio_null_ios_unix_call_funcs[] = {
     ios_is_started,                    /* is_started */
     ios_get_prop_value,                /* get_prop_value */
     ios_midi_stub,                     /* midi_get_driver */
-    ios_midi_stub,                     /* midi_init */
-    ios_midi_stub,                     /* midi_release */
-    ios_midi_stub,                     /* midi_out_message */
-    ios_midi_stub,                     /* midi_in_message */
-    ios_midi_stub,                     /* midi_notify_wait */
-    ios_midi_stub,                     /* aux_message */
+    ios_midi_init,                     /* midi_init */
+    ios_midi_stub,                     /* midi_release   (args == NULL) */
+    ios_midi_message,                  /* midi_out_message */
+    ios_midi_message,                  /* midi_in_message */
+    ios_midi_notify_wait,              /* midi_notify_wait */
+    ios_aux_message,                   /* aux_message */
 };
+
+/* The MIDI/aux blocks carry pointers too, and a 32-bit mmdevapi builds them
+ * with 4-byte UINT_PTRs, so the 64-bit entries above would write *err and
+ * *quit at the wrong offsets -- and *quit not landing where notify_thread
+ * reads it is precisely the spin this file is fixing. */
+static NTSTATUS ios_wow64_midi_init(void *args)
+{
+    struct { PTR32 err; } *params32 = args;
+    struct ios_midi_init_params params = {
+        .err = ios_wow_host_ptr(params32->err),
+    };
+    return ios_midi_init(&params);
+}
+
+static NTSTATUS ios_wow64_midi_notify_wait(void *args)
+{
+    struct { PTR32 quit; PTR32 notify; } *params32 = args;
+    struct ios_midi_notify_wait_params params = {
+        .quit = ios_wow_host_ptr(params32->quit),
+        .notify = ios_wow_host_ptr(params32->notify),
+    };
+    return ios_midi_notify_wait(&params);
+}
+
+static NTSTATUS ios_wow64_midi_message(void *args)
+{
+    struct {
+        UINT dev_id;
+        UINT msg;
+        PTR32 user;
+        PTR32 param_1;
+        PTR32 param_2;
+        PTR32 err;
+        PTR32 notify;
+    } *params32 = args;
+    struct ios_midi_message_params params = {
+        .dev_id = params32->dev_id,
+        .msg = params32->msg,
+        .user = params32->user,
+        .param_1 = params32->param_1,
+        .param_2 = params32->param_2,
+        .err = ios_wow_host_ptr(params32->err),
+        .notify = ios_wow_host_ptr(params32->notify),
+    };
+    return ios_midi_message(&params);
+}
+
+static NTSTATUS ios_wow64_aux_message(void *args)
+{
+    struct {
+        UINT dev_id;
+        UINT msg;
+        PTR32 user;
+        PTR32 param_1;
+        PTR32 param_2;
+        PTR32 err;
+    } *params32 = args;
+    struct ios_aux_message_params params = {
+        .dev_id = params32->dev_id,
+        .msg = params32->msg,
+        .user = params32->user,
+        .param_1 = params32->param_1,
+        .param_2 = params32->param_2,
+        .err = ios_wow_host_ptr(params32->err),
+    };
+    return ios_aux_message(&params);
+}
 
 /* ================= the 32-bit (WoW64) table =================
  *
@@ -1886,10 +2059,10 @@ const void *audio_null_ios_unix_call_wow64_funcs[] = {
     ios_is_started,                    /* is_started      { stream, result } */
     ios_wow64_get_prop_value,          /* get_prop_value */
     ios_midi_stub,                     /* midi_get_driver (ignores args) */
-    ios_midi_stub,                     /* midi_init (ignores args) */
+    ios_wow64_midi_init,               /* midi_init */
     ios_midi_stub,                     /* midi_release    (args == NULL) */
-    ios_midi_stub,                     /* midi_out_message (ignores args) */
-    ios_midi_stub,                     /* midi_in_message (ignores args) */
-    ios_midi_stub,                     /* midi_notify_wait (ignores args) */
-    ios_midi_stub,                     /* aux_message (ignores args) */
+    ios_wow64_midi_message,            /* midi_out_message */
+    ios_wow64_midi_message,            /* midi_in_message */
+    ios_wow64_midi_notify_wait,        /* midi_notify_wait */
+    ios_wow64_aux_message,             /* aux_message */
 };
