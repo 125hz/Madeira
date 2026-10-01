@@ -40,8 +40,8 @@ Wine's server runs as a thread instead of a separate program.
 
 ## Requirements
 
-- An iPhone on **iOS 17 or later**. The interface is designed for iOS 26, and
-  development happens on recent Pro iPhones.
+- An iPhone on **iOS 26 or later**, the only version Madeira currently runs
+  on reliably. Development happens on recent Pro iPhones.
 - **JIT**, which iOS only allows while a debugger is attached. Madeira uses
   [StikDebug](https://github.com/StikDebug/StikDebug) for this.
 - An **Apple ID** to sideload the app. A free account works; its signing
