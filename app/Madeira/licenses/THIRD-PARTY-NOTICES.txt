@@ -10,7 +10,7 @@ with the exception, (C) 2026 Jfishin, 125hz.
 
 Madeira Dock (arm64ec-windows/dockhost.exe, when built): GPL-3.0-or-later
 with the exception, (C) 2026 125hz. Source: https://github.com/125hz/madeira-dock
-(the research/madeira-dock submodule). Its licence and the notices of its
+(the madeira-dock submodule). Its licence and the notices of its
 statically linked LLVM/MinGW-w64 runtime are in arm64ec-windows/dock-notices.txt.
 
 Statically linked into the application binary:
@@ -27,7 +27,7 @@ Statically linked into the application binary:
   Acevedo and imported from dacevedo12/dxmt tag v0.4-d3d9 (that tree's
   licence notice: Copyright (c) 2023-2026 Feifan He for CodeWeavers):
   LGPL-2.1-or-later (LGPL-2.1.txt), kept under
-  LGPL-2.1-or-later as received. Source: the research/dxmt submodule of the
+  LGPL-2.1-or-later as received. Source: the dxmt submodule of the
   Madeira repository; its LICENSE-MADEIRA.md lists the imported files.
 - GnuTLS 3.8.9: LGPL-2.1-or-later (LGPL-2.1.txt).
 - Nettle 3.10.1 and Hogweed 3.10.1: dual-licensed LGPL-3.0-or-later /

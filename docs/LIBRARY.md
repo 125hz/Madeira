@@ -262,22 +262,22 @@ Log tags: `[frontend]`, `[display]`, `[display-shape]`, `[frontend-pointer]`, `[
 
 ## Tests
 
-`build/host-tests/check-frontend.py` (profiles incl. resolution and scaling,
+`tests/host/check-frontend.py` (profiles incl. resolution and scaling,
 the engine switches a profile exports, the 30 FPS fallback, the display layout
 math, controller commands, the exit hook, and the presence of the details and
-in-game menu options), `build/host-tests/check-runtime-settings.py`
+in-game menu options), `tests/host/check-runtime-settings.py`
 (`MadeiraConfig.set` and the Settings defaults) and
-`build/host-tests/check-library-api.py` (renderer detection and the badge).
-`build/host-tests/check-onboarding.py` covers Steam setup: the pages with and
+`tests/host/check-library-api.py` (renderer detection and the badge).
+`tests/host/check-onboarding.py` covers Steam setup: the pages with and
 without Dock, the done key, the `MADEIRA_ONBOARDING` switch, and the wiring
 (no Wine session, no pool or engine switch, sign-in and Dock only through
 their public pieces).
-`build/host-tests/check-steam-games.py` covers the library's Steam section: Dock's
+`tests/host/check-steam-games.py` covers the library's Steam section: Dock's
 discovery on a synthetic drive_c laid out as Steam writes it, the merge of
 installed and owned games, the section, status, card pill, search, Play and
 artwork rules, the program an installed game's pills describe, the groups of the
 library's sections and their Sort by order, and that Play uses only Dock's launch
-path. `build/host-tests/check-library-sections.py` covers the library page's
+path. `tests/host/check-library-sections.py` covers the library page's
 sections (order, texts, collapsing, search, layout, pull to refresh).
-`build/host-tests/check-steam-library.py`
+`tests/host/check-steam-library.py`
 covers the owned library and downloads (`docs/STEAM_LIBRARY.md`).

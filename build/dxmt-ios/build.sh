@@ -7,8 +7,8 @@ set -eu
 
 BUILD_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$BUILD_DIR/../.." && pwd)"
-DXMT_SRC="$REPO_ROOT/research/dxmt/src"
-DXMT_ROOT="$REPO_ROOT/research/dxmt"
+DXMT_SRC="$REPO_ROOT/dxmt/src"
+DXMT_ROOT="$REPO_ROOT/dxmt"
 LLVM_SRC="$REPO_ROOT/toolchains/llvm-project/llvm"
 LLVM_BUILD="$REPO_ROOT/toolchains/llvm-ios-build"
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -45,7 +45,7 @@ MADEIRA_INCLUDES="-I$DXMT_SRC/nativemetal -I$DXMT_ROOT/include -I$DXMT_ROOT/libs
 # The frontend throws (MTLD3DError) and the imported code uses dynamic_cast,
 # so it needs the two flags the rest of this archive is built without.
 MADEIRA_CXX_FLAGS="-std=c++20 -fexceptions -frtti"
-# The same suppressions research/dxmt/meson.build:48-62 applies to every DXMT
+# The same suppressions dxmt/meson.build:48-62 applies to every DXMT
 # target; -Wno-extern-c-compat is the one that matters here (the imported
 # d3d11.h declares `struct CD3D11_DEFAULT {}`, which is size 0 in C and 1 in
 # C++).
@@ -130,7 +130,7 @@ compile_objcxx_arc() {
 if [[ -f "$BUILD_DIR/../madeira-d3d12/deps.sh" ]] && \
    source "$BUILD_DIR/../madeira-d3d12/deps.sh"; then
     echo "=== madeira-d3d12 canary (Objective-C++, Metal Shader Converter) ==="
-    compile_objcxx_arc "$REPO_ROOT/research/madeira-d3d12/tests/native/msc_canary.mm" \
+    compile_objcxx_arc "$REPO_ROOT/madeira-d3d12/tests/native/msc_canary.mm" \
                        msc_canary "-DIR_PRIVATE_IMPLEMENTATION -I$MSC_INCLUDE"
     # The runtime conversion service reached from the D3D12 runtime through
     # winemetal's unix call. Deliberately NOT defining IR_PRIVATE_IMPLEMENTATION
@@ -140,15 +140,15 @@ if [[ -f "$BUILD_DIR/../madeira-d3d12/deps.sh" ]] && \
     # ml1008: also needs airconv_public.h -- shader-model-5.x DXBC goes to the
     # in-tree AIR compiler, which is linked into this same archive, so the shim
     # includes the compiler's real header rather than restating its structs.
-    compile_objcxx_arc "$REPO_ROOT/research/madeira-d3d12/src/unix/madeira_ir_unix.mm" \
-                       madeira_ir_unix "-I$MSC_INCLUDE -I$REPO_ROOT/research/madeira-d3d12/src $INCLUDES $INCLUDES_DIRECTX"
+    compile_objcxx_arc "$REPO_ROOT/madeira-d3d12/src/unix/madeira_ir_unix.mm" \
+                       madeira_ir_unix "-I$MSC_INCLUDE -I$REPO_ROOT/madeira-d3d12/src $INCLUDES $INCLUDES_DIRECTX"
     # ml1011: the input-layout resolver, plain C++ because DXBCParser's signature
     # reader includes a Windows shim whose BOOL clashes with Objective-C's.
-    compile_cxx "$REPO_ROOT/research/madeira-d3d12/src/unix/madeira_sm5_ia.cpp" \
-                madeira_sm5_ia "-I$REPO_ROOT/research/madeira-d3d12/src"
+    compile_cxx "$REPO_ROOT/madeira-d3d12/src/unix/madeira_sm5_ia.cpp" \
+                madeira_sm5_ia "-I$REPO_ROOT/madeira-d3d12/src"
     # ml1149: AMD AGS 64-bit atomics -> native SM6.6 atomics, a DXIL rewrite on
     # the LLVM 15 that airconv already links (bitcode reader + writer).
-    compile_cxx "$REPO_ROOT/research/madeira-d3d12/src/unix/madeira_ags.cpp" madeira_ags
+    compile_cxx "$REPO_ROOT/madeira-d3d12/src/unix/madeira_ags.cpp" madeira_ags
 else
     # Without madeira_ir_unix every D3D12 shader fails to convert (DXIL and DXBC
     # alike), so an app built past this point cannot run a D3D12 game. deps.sh

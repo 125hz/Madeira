@@ -40,7 +40,7 @@ struct DockGame: Identifiable, Equatable, Sendable {
     }
 }
 
-/// Madeira Dock: a small headless host (research/madeira-dock, built by
+/// Madeira Dock: a small headless host (madeira-dock, built by
 /// build/madeira-dock/build.sh into arm64ec-windows/dockhost.exe) that loads
 /// Valve's genuine Windows Steam client inside the Wine session, signs in
 /// with the user's own refresh token and asks the client to start an
@@ -207,7 +207,7 @@ enum MadeiraDock {
                 return "Madeira Dock could not initialize the Steam session (code 30). Export the log to identify the failed check."
             }
             // The host waits 90 s after sign-in for Valve's client to count the game
-            // among the account's subscriptions (research/madeira-dock src/session.c).
+            // among the account's subscriptions (madeira-dock src/session.c).
             if result == 34 {
                 return fields["session-authenticated-online"] == "1"
                     ? "Steam signed in but did not confirm this game's license in time. Export the log before trying again."
@@ -287,7 +287,7 @@ enum MadeiraDock {
         "ceg-finished-jobs", "ceg-result", "ceg-disabled", "ceg-unsupported-client",
         "ceg-scm", "ceg-scm-started", "ceg-scm-error", "ceg-service-registered", "ceg-service-install", "ceg-service-stop", "ceg-scm-stopped",
         "shutdown-begin", "shutdown-complete", "probe-result"]
-    /// The host's report rounds (research/madeira-dock src/main.c).
+    /// The host's report rounds (madeira-dock src/main.c).
     static let reportRounds: Set<String> = ["ml1820", "ml1830", "ml1860", "ml1870", "ml1970", "ml1990", "ml2000", "ml2011", "ml2015"]
 
     static func parseReport(_ data: Data) -> Report {

@@ -6,11 +6,11 @@
 	path = wine
 	url = https://github.com/willfaust/wine.git
 	branch = madeira-lgpl
-[submodule "research/dxmt"]
-	path = research/dxmt
+[submodule "dxmt"]
+	path = dxmt
 	url = https://github.com/willfaust/dxmt.git
 	branch = ios-port
-[submodule "research/madeira-dock"]
-	path = research/madeira-dock
+[submodule "madeira-dock"]
+	path = madeira-dock
 	url = https://github.com/willfaust/madeira-dock.git
 	branch = main

@@ -5,7 +5,7 @@
 import Foundation
 
 // Where Madeira's own Steam downloads live, and how one is read and removed
-// (docs/STEAM_LIBRARY.md). Foundation only, so build/host-tests/check-steam-library.py
+// (docs/STEAM_LIBRARY.md). Foundation only, so tests/host/check-steam-library.py
 // compiles this file as it is.
 //
 // A download goes into Madeira Dock's own Steam library folder,

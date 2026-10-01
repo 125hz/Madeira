@@ -15,7 +15,7 @@ import SwiftUI
 // and starts it. No program names are involved: a game is its App ID.
 // Log tag: [steam-games] (App IDs and counts only).
 
-// MARK: - Rules (Foundation only; build/host-tests/check-onboarding.py compiles this part)
+// MARK: - Rules (Foundation only; tests/host/check-onboarding.py compiles this part)
 
 enum SteamGamesRules {
     /// One game of the section: installed by Steam, owned by the account, or both.

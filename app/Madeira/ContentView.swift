@@ -1911,8 +1911,7 @@ struct ContentView: View {
 
                 Button("Thumper (standalone)") {
                     // Game lives at Documents/wine/drive_c/Program Files/Thumper/
-                    // (push via scripts/deploy-thumper.sh during development;
-                    // bundled as resource for distribution later).
+                    // (copied into the prefix by hand during development).
                     setenv("MADEIRA_EXE",
                            "C:\\Program Files\\Thumper\\THUMPER_win10.exe", 1)
                     unsetenv("MADEIRA_ARGS")

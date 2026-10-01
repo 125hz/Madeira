@@ -18,7 +18,7 @@ import UIKit
 // session and changes no JIT pool, engine switch or configuration default.
 // Log tag: [onboarding] (no account names, tokens or paths).
 
-// MARK: - Rules (Foundation and MadeiraConfig only; build/host-tests/check-onboarding.py compiles this part)
+// MARK: - Rules (Foundation and MadeiraConfig only; tests/host/check-onboarding.py compiles this part)
 
 enum OnboardingRules {
     static let doneKey = "madeiraOnboardingDone"

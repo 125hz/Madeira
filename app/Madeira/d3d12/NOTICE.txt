@@ -15,7 +15,7 @@ This folder holds what the app needs from Apple's Metal Shader Converter.
 - Metal Shader Converter headers (metal_irconverter*, compiled into the
   runtime): Apache License 2.0, Copyright Apple Inc.
   See LICENSE-metal-shader-converter-headers.txt. The source tree carries
-  them unchanged in research/madeira-d3d12/third_party/metal-shader-converter.
+  them unchanged in madeira-d3d12/third_party/metal-shader-converter.
 - canary_*.dxil: Madeira's own test shaders (GPL-3.0-or-later with the
   draft additional permission in the repository's LICENSE-EXCEPTION.md).
 - Madeira's own licence, the draft exception and every third-party notice

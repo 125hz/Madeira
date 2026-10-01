@@ -170,9 +170,9 @@ No binaries from the larger fork are included here.
 Run on a POSIX host with a C compiler and Swift installed:
 
 ```sh
-python3 build/host-tests/check-gamepad.py
-python3 build/host-tests/check-touch-gamepad.py
-python3 build/host-tests/check-control-presets.py
+python3 tests/host/check-gamepad.py
+python3 tests/host/check-touch-gamepad.py
+python3 tests/host/check-control-presets.py
 ```
 
 The first compiles production snapshot/query code and checks packets, ranges,

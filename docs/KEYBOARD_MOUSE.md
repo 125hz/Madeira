@@ -211,8 +211,8 @@ new cursor image (`[winios] cursor set`), as in the desktop session.
 ## Validation
 
 ```sh
-python3 build/host-tests/check-hardware-input.py      # needs swiftc, cc and the wine submodule (or WINE_SRC)
-python3 build/host-tests/check-nav-keys.py
+python3 tests/host/check-hardware-input.py      # needs swiftc, cc and the wine submodule (or WINE_SRC)
+python3 tests/host/check-nav-keys.py
 ```
 
 `check-hardware-input.py` compiles the pure part of `HardwareInput.swift` (key

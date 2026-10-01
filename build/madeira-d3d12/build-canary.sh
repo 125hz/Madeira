@@ -22,7 +22,7 @@ clang++ -O1 -g -fobjc-arc -Wall \
       -I"$MSC_INCLUDE" \
       -framework Foundation -framework Metal \
       -o "$OUT/msc_canary" \
-      "$REPO_ROOT/research/madeira-d3d12/tests/native/msc_canary.mm" \
+      "$REPO_ROOT/madeira-d3d12/tests/native/msc_canary.mm" \
       \
       -Wl,-rpath,"$(dirname "$MSC_LIB_MACOS")"
 

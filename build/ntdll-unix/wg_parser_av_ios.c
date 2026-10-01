@@ -85,7 +85,7 @@
  *
  * This file does not include any Wine header.  winegstreamer_unixlib_ios.c
  * includes it and maps the Wine structures onto the small API below, and
- * build/host-tests/check-wg-parser.py compiles it on its own against a host
+ * tests/host/check-wg-parser.py compiles it on its own against a host
  * FFmpeg, with stub backends, to exercise it under ASan.
  *
  * LOGGING: "[wg-parser] ml1990 ..." on stderr.  At most MAV_MAX_LOGS distinct

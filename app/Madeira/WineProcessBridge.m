@@ -321,7 +321,7 @@ static char *g_prefix_path = NULL;
  * Documents/wine/Documents and missed the user's madeira.cfg. Kill switch:
  * MADEIRA_CFG_EARLY_DOCS=0 in the process environment or
  * env.MADEIRA_CFG_EARLY_DOCS = 0 in madeira.cfg. Pure C, host-tested
- * (build/host-tests/check-cfg-early-docs.py). */
+ * (tests/host/check-cfg-early-docs.py). */
 static const char *g_madeira_docs_early = "not-run";
 static int madeira_cfg_off_word(const char *v)
 {

@@ -62,12 +62,12 @@ rate-limited per process (`MADEIRA_DIAG=1` lifts the `[wma]` cap).
 
 ## Tests
 
-- `build/host-tests/check-wg-parser.py` (Linux): source checks on the call
+- `tests/host/check-wg-parser.py` (Linux): source checks on the call
   tables, wow64 thunks, kill switches, FFmpeg configuration and app link; then
   builds a host FFmpeg from the same tarball and runs the parser core under
   ASan/UBSan against MP3, MPEG layer II, WAV and synthetic MP4 (stub video and
   AAC backends).
-- `build/host-tests/check-wma-decoder.py` (Linux or macOS, needs a configured
+- `tests/host/check-wma-decoder.py` (Linux or macOS, needs a configured
   Wine tree for the generated headers): compiles the production
   `winegstreamer_unixlib_ios.c` under ASan/UBSan against a host FFmpeg built
   from the tracked tarball, encodes WMA v1 and v2 streams (a 440 Hz tone) with
@@ -77,7 +77,7 @@ rate-limited per process (`MADEIRA_DIAG=1` lifts the `[wma]` cap).
   right level and fundamental back. Also checks that 64-bit callers keep the
   stub table by default. Bit-reservoir (superframe) streams are not covered:
   FFmpeg cannot encode them.
-- `build/x86-tests/wma-x86.c` (`build-wma-test.sh`): a 32-bit program that
+- `tests/x86/wma-x86.c` (`build-wma-test.sh`): a 32-bit program that
   reaches the WMA decoder exactly as FAudio does and checks that the decoded
   PCM has the 440 Hz fundamental it was encoded from. Exit 62 pass, 63 decode
   failed, 64 class not registered, 65 watchdog.

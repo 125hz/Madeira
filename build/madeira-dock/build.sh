@@ -3,7 +3,7 @@
 # Copyright 2026 125hz
 # Madeira Converter Exception: see LICENSE-EXCEPTION.md
 #
-# Build Madeira Dock (research/madeira-dock) as a stripped x86-64 PE and stage
+# Build Madeira Dock (madeira-dock) as a stripped x86-64 PE and stage
 # it in the app bundle with its notices:
 #   app/Madeira/arm64ec-windows/dockhost.exe
 #   app/Madeira/arm64ec-windows/dock-notices.txt
@@ -12,18 +12,18 @@
 #
 # Usage: build/madeira-dock/build.sh [--check]
 #   --check  also build and run Dock's own unit tests with the host compiler
-#            (research/madeira-dock/tools/check.sh; needs cc with ASan/UBSan).
+#            (madeira-dock/tools/check.sh; needs cc with ASan/UBSan).
 # LLVM_MINGW=<dir with x86_64-w64-mingw32-clang> overrides the toolchain.
 set -eu
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$DIR/../.." && pwd)"
-SRC="$REPO_ROOT/research/madeira-dock"
+SRC="$REPO_ROOT/madeira-dock"
 MINGW="${LLVM_MINGW:-$REPO_ROOT/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin}"
 CC="$MINGW/x86_64-w64-mingw32-clang"
 OUT="$REPO_ROOT/app/Madeira/arm64ec-windows"
 
-[ -f "$SRC/src/main.c" ] || { echo "research/madeira-dock is missing: git submodule update --init research/madeira-dock" >&2; exit 1; }
+[ -f "$SRC/src/main.c" ] || { echo "madeira-dock is missing: git submodule update --init madeira-dock" >&2; exit 1; }
 [ -x "$CC" ] || { echo "missing cross compiler: $CC (set LLVM_MINGW)" >&2; exit 1; }
 
 if [ "${1:-}" = "--check" ]; then

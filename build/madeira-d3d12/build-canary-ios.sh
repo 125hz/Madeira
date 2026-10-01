@@ -20,13 +20,13 @@ xcrun --sdk iphoneos clang++ -O1 -g -fobjc-arc -Wall \
       -I"$MSC_INCLUDE" \
       -framework Foundation -framework Metal \
       -o "$OUT/msc_canary" \
-      "$REPO_ROOT/research/madeira-d3d12/tests/native/msc_canary.mm" \
+      "$REPO_ROOT/madeira-d3d12/tests/native/msc_canary.mm" \
       \
       -Wl,-rpath,@executable_path
 
 # The dylib travels beside the binary; its install name is @rpath-relative.
 cp "$MSC_LIB_IOS" "$OUT/libmetalirconverter.dylib"
-cp "$REPO_ROOT/research/madeira-d3d12/shaders/"*.dxil "$OUT/"
+cp "$REPO_ROOT/madeira-d3d12/shaders/"*.dxil "$OUT/"
 
 echo "built: $OUT/msc_canary"
 lipo -archs "$OUT/msc_canary" | sed 's/^/  arch: /'

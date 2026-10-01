@@ -3,7 +3,7 @@
 # hash-verified installer package, after a converter update: the iOS dynamic
 # library into the app bundle source folder (verified against its pinned hash;
 # distributed under Apple's agreement, see app/Madeira/d3d12/NOTICE.txt) and the
-# Apache-2.0 public headers into research/madeira-d3d12/third_party/
+# Apache-2.0 public headers into madeira-d3d12/third_party/
 # metal-shader-converter, whose SHA256SUMS is rewritten, so the library and the
 # headers the runtime is compiled against always come from the same package.
 # Nothing from an earlier /tmp extraction or an environment-selected directory
@@ -28,7 +28,7 @@ got="$(shasum -a 256 "$SRC" | cut -d' ' -f1)"
 DEST_DIR="$REPO_ROOT/app/Madeira/d3d12"
 cp "$SRC" "$DEST_DIR/libmetalirconverter.dylib"
 HDR_SRC="$tmp/expanded/MetalShaderConverter.pkg/Payload/usr/local/include"
-HDR_DEST="$REPO_ROOT/research/madeira-d3d12/third_party/metal-shader-converter"
+HDR_DEST="$REPO_ROOT/madeira-d3d12/third_party/metal-shader-converter"
 [[ -f "$HDR_SRC/metal_irconverter/metal_irconverter.h" ]] || { echo "fetch-converter: headers not in the package payload" >&2; exit 1; }
 rm -rf "$HDR_DEST/include"
 mkdir -p "$HDR_DEST"

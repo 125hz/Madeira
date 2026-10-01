@@ -31,7 +31,7 @@ import ObjectiveC
 // keys extended, and the wineserver synthesises the generic VK_SHIFT/
 // VK_CONTROL/VK_MENU from the left/right ones. Posting VK_LSHIFT is therefore
 // both more precise than VK_SHIFT and fully compatible.
-// build/host-tests/check-hardware-input.py checks the combined HID -> VK ->
+// tests/host/check-hardware-input.py checks the combined HID -> VK ->
 // scan code result against Wine's US layout.
 //
 // FOCUS: GCKeyboard and GCMouse report to the app whatever the user is doing

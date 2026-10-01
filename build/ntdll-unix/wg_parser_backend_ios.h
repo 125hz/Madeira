@@ -9,7 +9,7 @@
  *
  *   - the Apple backend is its own translation unit and never sees Wine's
  *     headers (CoreFoundation and winnt.h disagree about several names);
- *   - build/host-tests/check-wg-parser.py can drive the core's demux, packet
+ *   - tests/host/check-wg-parser.py can drive the core's demux, packet
  *     queue, reorder, seek and pixel-conversion logic on Linux through a stub
  *     backend of the same shape.
  *

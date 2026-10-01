@@ -115,13 +115,13 @@ done
 echo "== installed ${#TARGETS[@]} Wine modules into app/Madeira/i386-windows =="
 
 # --------------------------------------------------------------------- DXMT
-# The i386 build of research/dxmt (d3d11/dxgi/d3d10core/winemetal and the
+# The i386 build of dxmt (d3d11/dxgi/d3d10core/winemetal and the
 # D3D9 frontend + shim), linked against this tree's import libraries.
 # winemetal's wow64 thunk table on the unix side is what lets these 32-bit
 # DLLs reach the Metal renderer; the shim reaches the native D3D9 frontend
 # through its own table (virtual_ios.c, the d3d9shim branch).
 if [ -z "${SKIP_DXMT:-}" ] && [ $# -eq 0 ]; then
-    D="$R/research/dxmt"
+    D="$R/dxmt"
     X="$B/dxmt-cross-i386.txt"
     cat > "$X" <<EOF
 [binaries]

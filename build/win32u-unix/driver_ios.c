@@ -148,7 +148,7 @@ void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_
  * VK_NUMPAD0-9 or VK_DECIMAL), so one of them here always means the dedicated
  * key: mark it extended, as the physical key's E0 prefix is.
  * MADEIRA_NAV_KEYS_E0=0 restores the previous flags.
- * build/host-tests/check-nav-keys.py compiles this function on its own. */
+ * tests/host/check-nav-keys.py compiles this function on its own. */
 static UINT winios_key_extended_flag( UINT vk, UINT scan, int nav_e0 )
 {
     if (scan & 0xe000) return KEYEVENTF_EXTENDEDKEY;

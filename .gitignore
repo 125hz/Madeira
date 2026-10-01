@@ -2,8 +2,8 @@
 box64/
 LiveContainer/
 MeloNX/
-# research/ holds upstream clones for study, except research/dxmt which is
-# an active fork submodule — list siblings explicitly.
+# research/ holds upstream clones kept for study; they are not part of the
+# project (Madeira's own components live at the top level).
 research/angle/
 research/attesor/
 research/box64/
@@ -61,7 +61,7 @@ build/d3d11-triangle/hlsl_compile.exe
 build/d3d11-triangle/triangle.exe
 
 # DXMT test-suite per-test build output
-build/dxmt-tests/out/
+tests/dxmt/out/
 
 # Wineboot subprocesses — dormant while Phase 3+ uses a pre-seeded prefix
 # and skips wineboot. Rebuilt from the wine submodule if needed (requires
@@ -108,9 +108,8 @@ build/gnutls-ios/obj/
 # re-included; git will not descend into a directory ignored with a trailing
 # slash, which makes any negation inside it silently ineffective.
 research/*
-!research/madeira-d3d12/
 !research/remote-metal/
-!research/madeira-dock
+!research/metal-blend-test/
 *.bak
 photorec.se2
 .DS_Store
@@ -118,8 +117,8 @@ photorec.se2
 # Build/deploy artifacts (regenerable; keep them out of history)
 *.ipa
 clean-prefix/
-build/x64-tests/asmconf_gen/
-build/x64-tests/asmconf_obj/
+tests/x64/asmconf_gen/
+tests/x64/asmconf_obj/
 
 # Microsoft Visual C++ runtime redistributables.
 # Microsoft-authored binaries, redistributable only under the Visual Studio
@@ -149,13 +148,13 @@ research/remote-metal/host/rmetald.*
 # Licence copies generated into the bundle by build/stage-licenses.sh (from COPYING and LICENSE-EXCEPTION.md)
 app/Madeira/licenses/LICENSE-MADEIRA-GPL-3.0.txt
 app/Madeira/licenses/LICENSE-MADEIRA-EXCEPTION.txt
-research/madeira-d3d12/tests/offline/sm51/
+madeira-d3d12/tests/offline/sm51/
 
 # The i386 farm (32-bit Wine + DXMT DLLs) is built from the pinned submodules by
 # build/wine-i386/build.sh (docs/WOW64.md section 9); it is not committed.
 app/Madeira/i386-windows/*
 !app/Madeira/i386-windows/.gitkeep
 
-# Madeira Dock: built from research/madeira-dock by build/madeira-dock/build.sh
+# Madeira Dock: built from madeira-dock by build/madeira-dock/build.sh
 app/Madeira/arm64ec-windows/dockhost.exe
 app/Madeira/arm64ec-windows/dock-notices.txt

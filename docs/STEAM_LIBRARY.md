@@ -166,7 +166,7 @@ which signs in and checks the license (`docs/MADEIRA_DOCK.md`).
 `C:\Program Files (x86)\Steam\steamapps` in the prefix, as
 `common/<installdir>` and the install record beside it. That is exactly the
 layout Madeira Dock's discovery reads (`MadeiraDock.games`) and Valve's client
-understands; `build/host-tests/check-steam-library.py` writes an install with
+understands; `tests/host/check-steam-library.py` writes an install with
 the production downloader and has Dock's own scanner find it.
 
 **Sessions and the account.** Only one sign-in of an account may be online:
@@ -351,7 +351,7 @@ nothing else), and the Windows desktop client's installer and launch code.
 
 ## Tests
 
-`build/host-tests/check-steam-library.py` (needs `swiftc` on Linux, `cc`,
+`tests/host/check-steam-library.py` (needs `swiftc` on Linux, `cc`,
 `python3` with `cryptography` or the `openssl` command, and libssl, liblzma and
 zlib development files; it never contacts Steam):
 

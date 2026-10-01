@@ -15,7 +15,7 @@ dependency license texts are in `LICENSES/`. See "Why GPL-3.0-or-later" below.
 | **Wine** | LGPL-2.1-or-later | **GPL-3.0-or-later** | Fork relicensed under LGPL-2.1 §3, which expressly permits applying the ordinary GPL to a copy. `ntdll`, `wineserver`, `win32u`, ARM64EC loader modified for iOS. |
 | **FEX-Emu** | MIT | upstream MIT + **modifications GPL-3.0-or-later** | Forked. x86-64 → ARM64 translation. |
 | **DXMT** | MIT | upstream MIT + **modifications GPL-3.0-or-later** | Forked. D3D11 → Metal. |
-| **DXMT — Direct3D 9 / DXSO frontend** | **LGPL-2.1-or-later** | **LGPL-2.1-or-later**, kept as received | Written by **David Acevedo** (his commit `fe69cd3`, "feat(d3d9): add a Direct3D 9 frontend") and imported into `research/dxmt` from his fork of the same upstream: `https://github.com/dacevedo12/dxmt.git`, tag `v0.4-d3d9`, commit `e8dd4c656dcb74a6d970a30a397d1558b0e3fb2b`. That tree's licence is the DXMT project notice ("Copyright (c) 2023-2026 Feifan He for CodeWeavers", LGPL-2.1-or-later), which postdates upstream's MIT→LGPL relicense, so the import is **not** MIT. It is kept under LGPL-2.1-or-later as received: the LGPL-2.1 §3 option to distribute a copy under the ordinary GPL is not exercised, and that choice is left to the maintainer. 125hz's additions to the D3D9 path are licensed like the DXMT row. Licence text in `research/dxmt/COPYING.LIB` and `LICENSES/LGPL-2.1.txt`; the file-by-file list is in `research/dxmt/LICENSE-MADEIRA.md`. |
+| **DXMT — Direct3D 9 / DXSO frontend** | **LGPL-2.1-or-later** | **LGPL-2.1-or-later**, kept as received | Written by **David Acevedo** (his commit `fe69cd3`, "feat(d3d9): add a Direct3D 9 frontend") and imported into `dxmt` from his fork of the same upstream: `https://github.com/dacevedo12/dxmt.git`, tag `v0.4-d3d9`, commit `e8dd4c656dcb74a6d970a30a397d1558b0e3fb2b`. That tree's licence is the DXMT project notice ("Copyright (c) 2023-2026 Feifan He for CodeWeavers", LGPL-2.1-or-later), which postdates upstream's MIT→LGPL relicense, so the import is **not** MIT. It is kept under LGPL-2.1-or-later as received: the LGPL-2.1 §3 option to distribute a copy under the ordinary GPL is not exercised, and that choice is left to the maintainer. 125hz's additions to the D3D9 path are licensed like the DXMT row. Licence text in `dxmt/COPYING.LIB` and `LICENSES/LGPL-2.1.txt`; the file-by-file list is in `dxmt/LICENSE-MADEIRA.md`. |
 | **rpmalloc** | 0BSD | 0BSD + **Will Faust's modifications GPL-3.0-or-later** | Nested submodule of FEX, forked to `willfaust/rpmalloc`. Commits by Ryan Houdek are **not** relicensed. |
 | **GMP** 6.3.0 | **LGPL-3.0-or-later** or GPL-2.0-or-later | Static (`libgmp.a`). |
 | **Nettle / Hogweed** 3.10.1 | **LGPL-3.0-or-later** or GPL-2.0-or-later | Static (`libnettle.a`, `libhogweed.a`). |
@@ -28,7 +28,7 @@ dependency license texts are in `LICENSES/`. See "Why GPL-3.0-or-later" below.
 | **Steam sign-in, owned library and downloads (`app/Madeira/SwiftSteam/`)** | Derived from Jfishin's Madeira Steam client, used with the author's permission (see below); Jfishin confirmed that he wrote the depot downloader himself | GPL-3.0-or-later + Converter Exception, Copyright 2026 Jfishin, 125hz | Sign-in to Steam's public `IAuthenticationService` over HTTPS and a Keychain token store; a Steam connection (WebSocket over TLS) that lists the account's owned games; downloads from Steam's content servers into Madeira Dock's Steam library folder. File-by-file provenance and the licence audit of the downloader: `docs/STEAM_SIGNIN.md`, `docs/STEAM_LIBRARY.md`. No Valve or third-party Steam code or binaries, and no Steam Cloud, launch-emulator or DRM code. |
 | **Zstandard educational decoder** | BSD-3-Clause or GPL-2.0 | BSD-3-Clause selected | `app/Madeira/SwiftSteam/zstd_edu.c/.h` (Meta Platforms). Decodes Steam's zstd content chunks. Madeira's error-recovery wrapper (Jfishin's, kept) is serialized across threads. Licence text in `LICENSES/ZSTD-BSD.txt`. |
 | **liblzma** | Public domain / 0BSD | System library | Linked dynamically from the iOS SDK (`liblzma.tbd`) for Steam's LZMA content chunks; nothing is bundled. |
-| **Madeira Dock (`research/madeira-dock`, built into `arm64ec-windows/dockhost.exe`)** | original work, Copyright 2026 125hz | GPL-3.0-or-later + Converter Exception | Headless host for Valve's Steam client, a separate Windows program started in the Wine session. Built from the submodule by `build/madeira-dock/build.sh`; not committed as a binary. Its statically linked LLVM/MinGW-w64 runtime notices ship in `dock-notices.txt`. Valve's client files are downloaded by the user from Valve and are not covered by Madeira's licence. See `docs/MADEIRA_DOCK.md`. |
+| **Madeira Dock (`madeira-dock`, built into `arm64ec-windows/dockhost.exe`)** | original work, Copyright 2026 125hz | GPL-3.0-or-later + Converter Exception | Headless host for Valve's Steam client, a separate Windows program started in the Wine session. Built from the submodule by `build/madeira-dock/build.sh`; not committed as a binary. Its statically linked LLVM/MinGW-w64 runtime notices ship in `dock-notices.txt`. Valve's client files are downloaded by the user from Valve and are not covered by Madeira's licence. See `docs/MADEIRA_DOCK.md`. |
 
 ## Why GPL-3.0-or-later
 
@@ -63,8 +63,8 @@ lives in a separate submodule. Each fork therefore carries its own
 
 - `wine/LICENSE-MADEIRA.md` — the LGPL-2.1 §3 conversion, exactly what changed
   and the two deliberate exceptions.
-- `FEX/LICENSE-MADEIRA.md`, `research/dxmt/LICENSE-MADEIRA.md` — upstream MIT
-  preserved; Madeira's modifications GPL-3.0-or-later. `research/dxmt`'s notice
+- `FEX/LICENSE-MADEIRA.md`, `dxmt/LICENSE-MADEIRA.md` — upstream MIT
+  preserved; Madeira's modifications GPL-3.0-or-later. `dxmt`'s notice
   also records the Direct3D 9 / DXSO import, file by file, which is kept under
   LGPL-2.1-or-later as received.
 - `FEX/External/rpmalloc/LICENSE-MADEIRA.md` — 0BSD preserved; only Will
@@ -95,8 +95,8 @@ Do **not** assume that everything outside the submodules is original. It is not.
   `build/` carry an upstream copyright notice of some kind.
 - `build/gnutls-ios/` contains build scripting only; the library sources are
   fetched separately (see the open issue below).
-- `app/`, `tools/`, `scripts/` and `patches/` are largely original, but contain
-  vendored and derived files too.
+- `app/`, `tools/` and `tests/` are largely original, but contain vendored and
+  derived files too.
 - `app/Madeira/SwiftSteam/` is derived from Jfishin's Madeira Steam client. Jfishin
   gave permission to use it ("do whatever you want with it") in the Madeira
   Discord server on 2026-09-22; Will Faust is a member of that server and saw

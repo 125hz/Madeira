@@ -138,7 +138,7 @@ of his client cites the SteamKit2/JavaSteam key dictionary; it is left out
 
 ## Tests
 
-`build/host-tests/check-steam-signin-native.py` (needs `swiftc` and
+`tests/host/check-steam-signin-native.py` (needs `swiftc` and
 `python3`; never contacts Steam):
 
 - static: licence headers, the module holds only sign-in code, every file is

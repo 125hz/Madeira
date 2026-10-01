@@ -6,7 +6,7 @@ import Foundation
 
 /// What the library fetcher and the depot downloader need from a logged-on
 /// Steam connection. `SteamSession` is the one implementation; the host tests
-/// (build/host-tests/check-steam-library.py) use a scripted one, so the
+/// (tests/host/check-steam-library.py) use a scripted one, so the
 /// download pipeline runs without a network connection to Steam.
 @MainActor
 protocol SteamCMSession: AnyObject {

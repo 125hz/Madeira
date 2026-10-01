@@ -8,8 +8,8 @@ set -eu
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$DIR/../.." && pwd)"
 MINGW="$REPO_ROOT/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin"
-SRC="$REPO_ROOT/research/madeira-d3d12/src/pe"
-TESTS="$REPO_ROOT/research/madeira-d3d12/tests/windows"
+SRC="$REPO_ROOT/madeira-d3d12/src/pe"
+TESTS="$REPO_ROOT/madeira-d3d12/tests/windows"
 OUT="${OUT:-$REPO_ROOT/build/madeira-d3d12/out-pe}"
 mkdir -p "$OUT"
 
@@ -22,8 +22,8 @@ python3 "$SRC/gen_vtables.py" \
 echo "=== madeira_d3d12.dll (arm64ec) ==="
 "$MINGW/arm64ec-w64-mingw32-clang" -shared -O2 -Wall \
     -o "$OUT/madeira_d3d12.dll" "$SRC/madeira_d3d12.c" "$SRC/d3d12.def" \
-    -I"$SRC" -I"$REPO_ROOT/research/madeira-d3d12/src" -I"$REPO_ROOT/research/dxmt/src/winemetal" \
-    -L"$REPO_ROOT/research/dxmt/build-arm64ec/src/winemetal" -lwinemetal \
+    -I"$SRC" -I"$REPO_ROOT/madeira-d3d12/src" -I"$REPO_ROOT/dxmt/src/winemetal" \
+    -L"$REPO_ROOT/dxmt/build-arm64ec/src/winemetal" -lwinemetal \
     -luuid -lole32
 echo "  built $(ls -l "$OUT/madeira_d3d12.dll" | awk '{print $5}') bytes"
 # The same binary also ships as d3d12.dll (ml849): the engine reaches it through

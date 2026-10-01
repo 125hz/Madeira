@@ -25,7 +25,7 @@ are, unmodified, inside a single iOS app.
 | **[FEX-Emu](https://github.com/FEX-Emu/FEX)** | Translates the game's x86 and x86-64 code to ARM64 as it runs. |
 | **[Wine](https://www.winehq.org/)** 11.4 | Provides Windows. It is built for ARM64EC, so Wine itself runs natively and only the game's own code is translated. 32-bit games run through WoW64. |
 | **[DXMT](https://github.com/3Shain/DXMT)** | Draws Direct3D 9, 10 and 11 with Metal. |
-| **[madeira-d3d12](research/madeira-d3d12)** | Madeira's own Direct3D 12 implementation on Metal, converting DXIL shaders at run time with Apple's Metal Shader Converter. |
+| **[madeira-d3d12](madeira-d3d12)** | Madeira's own Direct3D 12 implementation on Metal, converting DXIL shaders at run time with Apple's Metal Shader Converter. |
 
 iOS apps cannot start other programs, so everything runs in one process: even
 Wine's server runs as a thread instead of a separate program.
@@ -70,11 +70,24 @@ Some 64-bit games need Microsoft's Visual C++ runtime, which is not included
 git clone --recurse-submodules https://github.com/willfaust/Madeira.git
 ```
 
-`FEX`, `wine`, `research/dxmt` and `research/madeira-dock` are submodules that
-point at Madeira's own forks; upstream checkouts will not build here. The
-build has several parts (the Wine unix libraries, the ARM64EC Windows modules,
-FEX, DXMT and the app) and some inputs that are not in the repository, such as
-the toolchains. [`docs/BUILDING.md`](docs/BUILDING.md) walks through all of it.
+`FEX`, `wine`, `dxmt` and `madeira-dock` are submodules that point at Madeira's
+own forks; upstream checkouts will not build here. The build has several parts
+(the Wine unix libraries, the ARM64EC Windows modules, FEX, DXMT and the app)
+and some inputs that are not in the repository, such as the toolchains.
+[`docs/BUILDING.md`](docs/BUILDING.md) walks through all of it.
+
+### Repository layout
+
+| Path | Contents |
+|---|---|
+| [`app/`](app) | The iOS app: SwiftUI front end, Wine bridge and bundled resources |
+| [`wine/`](https://github.com/willfaust/wine), [`FEX/`](https://github.com/willfaust/FEX), [`dxmt/`](https://github.com/willfaust/dxmt), [`madeira-dock/`](https://github.com/willfaust/madeira-dock) | Madeira's forks and the Steam client launcher (submodules) |
+| [`madeira-d3d12/`](madeira-d3d12) | The native Direct3D 12 runtime |
+| [`build/`](build) | Build scripts and iOS-side sources, one folder per component |
+| [`tests/`](tests) | Host checks and x86, x86-64 and DXMT test programs |
+| [`tools/`](tools) | Helper scripts |
+| [`docs/`](docs) | Documentation |
+| [`research/`](research) | Experiments that are not part of the app |
 
 ## Documentation
 

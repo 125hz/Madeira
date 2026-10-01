@@ -25,7 +25,7 @@ import SwiftUI
 //     theirs may need the user.
 // Log tag: [steam-launch-view] (scene names, window sizes and owner classes only).
 
-// MARK: - Rules (Foundation only; build/host-tests/check-dock-start-screen.py compiles this part)
+// MARK: - Rules (Foundation only; tests/host/check-dock-start-screen.py compiles this part)
 
 /// One top-level window of a Dock start's Wine desktop, as Winios.m's census reports it.
 /// `image`: the owning program's executable path, "" when it could not be read.
@@ -185,7 +185,7 @@ struct SteamLaunchHold {
 }
 
 /// The starting screen's text for a Dock start, from the host's numeric report.
-/// The host writes its fields as it goes (research/madeira-dock src/main.c,
+/// The host writes its fields as it goes (madeira-dock src/main.c,
 /// session.c, launch.c), and the text follows the furthest stage reported: the
 /// host started (probe-start-bits), the sign-in submitted, signed in, the game's
 /// license confirmed, the game's executable prepared (only for a game that needs

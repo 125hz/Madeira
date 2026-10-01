@@ -4,7 +4,7 @@ Builds the iOS side of DXMT — the D3D11→Metal translation layer — as a
 static library that links into Madeira.app, plus the aarch64-windows PE
 DLLs the game loads via Wine.
 
-The upstream DXMT source lives at `research/dxmt/` as a git submodule
+The upstream DXMT source lives at `dxmt/` as a git submodule
 pointing at our fork [willfaust/dxmt](https://github.com/willfaust/dxmt),
 `ios-port` branch. The iOS patches are committed there, not here.
 
@@ -59,13 +59,13 @@ The meson cross file uses `@GLOBAL_SOURCE_ROOT@/toolchains/...` paths, so
 symlink our toolchains dir into the DXMT submodule once:
 
 ```
-ln -s ../../toolchains research/dxmt/toolchains
+ln -s ../toolchains dxmt/toolchains
 ```
 
 Then:
 
 ```
-cd research/dxmt
+cd dxmt
 SDKROOT=$(xcrun --sdk macosx --show-sdk-path) \
     PATH="$(pwd)/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin:/usr/bin:/opt/homebrew/bin:$PATH" \
     meson setup --cross-file build-aarch64-win.txt --native-file build-osx.txt \

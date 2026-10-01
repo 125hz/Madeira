@@ -6,7 +6,7 @@ set -eu
 DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$DIR/../.." && pwd)"
 MINGW="$REPO_ROOT/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin"
-DXMT_DIRECTX="$REPO_ROOT/research/dxmt/include/native/directx"
+DXMT_DIRECTX="$REPO_ROOT/dxmt/include/native/directx"
 
 CC_AARCH64="$MINGW/aarch64-w64-mingw32-clang"
 CC_X86_64="$MINGW/x86_64-w64-mingw32-clang"

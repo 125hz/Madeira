@@ -122,7 +122,7 @@ existing engine). win32u goes through `wow64win.dll`.
 
 ### Direct3D 9
 
-The i386 `d3d9.dll` in the farm is DXMT's thin shim (`research/dxmt/src/d3d9shim`,
+The i386 `d3d9.dll` in the farm is DXMT's thin shim (`dxmt/src/d3d9shim`,
 exported as `d3d9shim.dll` whatever file name it is installed under):
 
 - By default its `DllMain` forwards every export to `d3d9-emulated.dll`, DXMT's
@@ -142,7 +142,7 @@ exported as `d3d9shim.dll` whatever file name it is installed under):
 
 `build/wine-i386/build.sh` installs the shim as `d3d9.dll` and `d3d9shim.dll`
 and the emulated frontend as `d3d9-emulated.dll`.
-`build/x86-tests/build-d3d9-cube.sh` builds the acceptance test, a spinning
+`tests/x86/build-d3d9-cube.sh` builds the acceptance test, a spinning
 cube through a real device with a dynamic vertex buffer the guest locks every
 frame.
 
@@ -257,7 +257,7 @@ none are committed with the code.
    for `aarch64-w64-mingw32` with the iOS host options, builds target
    `wow64fex` and installs `Bin/libwow64fex.dll` as
    `app/Madeira/aarch64-windows/xtajit.dll`.
-4. **Smoke test:** `build/x86-tests/build.sh hello-x86` builds a kernel32-only
+4. **Smoke test:** `tests/x86/build.sh hello-x86` builds a kernel32-only
    i386 PE into `app/Madeira/i386-windows/`. Put `env.MADEIRA_EXE = hello-x86.exe`
    in `madeira.cfg` and launch: the log shows
    `PE probe: machine=0x14c (i386: WoW64)`, the program's

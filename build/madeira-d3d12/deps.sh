@@ -3,7 +3,7 @@
 #
 # What the app build needs is in the repository, each file hash-checked here:
 #   - the converter's public headers (Apache-2.0), vendored unchanged in
-#     research/madeira-d3d12/third_party/metal-shader-converter;
+#     madeira-d3d12/third_party/metal-shader-converter;
 #   - the iOS library, app/Madeira/d3d12/libmetalirconverter.dylib
 #     (distributed under Apple's agreement, see app/Madeira/d3d12/NOTICE.txt).
 # Apple's installer package is only needed for the macOS host tools (the
@@ -30,7 +30,7 @@ _msc_fail() {
 }
 
 _msc_resolve() {
-    local vend="$REPO_ROOT/research/madeira-d3d12/third_party/metal-shader-converter"
+    local vend="$REPO_ROOT/madeira-d3d12/third_party/metal-shader-converter"
     local ios_lib="$REPO_ROOT/app/Madeira/d3d12/libmetalirconverter.dylib"
     # Pinned in MADEIRA_NATIVE_D3D12_EXECUTION_DESIGN.md section 2. A different
     # converter is a different compiler and invalidates every cached shader.

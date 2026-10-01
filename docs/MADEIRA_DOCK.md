@@ -22,13 +22,13 @@ them.
   (SHA-256) and checks the exact method addresses it calls. Any other build
   **fails closed** before sign-in, with report code 30 and the client's
   fingerprint in the log. Two client builds are supported at the pinned
-  commit; see `research/madeira-dock/docs/CLIENT_LAYOUTS.md`.
+  commit; see `madeira-dock/docs/CLIENT_LAYOUTS.md`.
 - No Valve binaries, game content, cached login or token is bundled or
   committed.
 
 ## Source and licence
 
-- Source: the `research/madeira-dock` submodule
+- Source: the `madeira-dock` submodule
   (`https://github.com/125hz/madeira-dock`, pinned at `0c5bbd1`), about 1,850 lines of
   C. Copyright 2026 125hz, **GPL-3.0-or-later with the Madeira
   Converter Exception** (the owner open-sourced it on 2026-09-27; it used to
