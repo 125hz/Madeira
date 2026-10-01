@@ -1384,6 +1384,32 @@ static int ios_cage_holdback_live;
  * remainder stays ours; the original whole-cage grant is then disabled. */
 static int ios_cage_window_tail_live;
 
+/* Give the unclaimed [cage] holdback back to the band when it is exhausted.
+ *
+ * The holdback is 8 GB of a ~15 GB furniture window. A session with no
+ * Chromium never claims it, and a guest that reserves address space freely can
+ * fill the rest, so that even a 1 MB request fails. Releasing the holdback then
+ * costs nothing the session was going to use.
+ *
+ * Off unless MADEIRA_CAGE_RELEASE=1, which the app sets for a Madeira Dock
+ * session (headless Steam client, no CEF). Called with virtual_mutex held.
+ * Returns 1 if the range was released. */
+static int ios_cage_release_on_exhaustion( size_t want )
+{
+    /* 1: when the guest band is exhausted, release the unclaimed 8 GB V8 cage
+     * holdback to it. Set by the app for a Madeira Dock session; off otherwise. */
+    const char *e = getenv( "MADEIRA_CAGE_RELEASE" );
+
+    if (!ios_cage_holdback_live || !e || *e != '1') return 0;
+    if (munmap( (void *)(uintptr_t)IOS_CAGE_BASE, IOS_CAGE_REAL_SIZE )) return 0;
+    ios_cage_holdback_live = 0;
+    dprintf( 2, "[cage] holdback released 0x%llx+0x%llx: the band is exhausted (request 0x%lx) and "
+                "no V8 cage was asked for\n",
+             (unsigned long long)IOS_CAGE_BASE, (unsigned long long)IOS_CAGE_REAL_SIZE,
+             (unsigned long)want );
+    return 1;
+}
+
 static int ios_soft_find( uint64_t addr )
 {
     /* ml434: smallest matching range wins — the 4GB soft cages sit INSIDE the
@@ -13815,6 +13841,8 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
             unsigned int skips0 = ios_va_scan_skips;
 
             ptr = map_free_area( start, end, host_size, top_down, unix_prot, align_mask );
+            if (!ptr && ios_cage_release_on_exhaustion( host_size ))
+                ptr = map_free_area( start, end, host_size, top_down, unix_prot, align_mask );
             /* [va-scan] the ml116/ml117 probe: a healthy scan costs a handful of
              * tryfixed calls. Hundreds means we are grinding unmappable VA;
              * ptr==NULL is the silent STATUS_NO_MEMORY that handed rpmalloc a
