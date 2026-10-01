@@ -25,7 +25,7 @@ are, unmodified, inside a single iOS app.
 | **[FEX-Emu](https://github.com/FEX-Emu/FEX)** | Translates the game's x86 and x86-64 code to ARM64 as it runs. |
 | **[Wine](https://www.winehq.org/)** 11.4 | Provides Windows. It is built for ARM64EC, so Wine itself runs natively and only the game's own code is translated. 32-bit games run through WoW64. |
 | **[DXMT](https://github.com/3Shain/DXMT)** | Draws Direct3D 9, 10 and 11 with Metal. |
-| **Native Direct3D 12** | Madeira's own Direct3D 12 runtime, converting DXIL shaders to Metal at run time with Apple's Metal Shader Converter. |
+| **[madeira-d3d12](research/madeira-d3d12)** | Madeira's own Direct3D 12 implementation on Metal, converting DXIL shaders at run time with Apple's Metal Shader Converter. |
 
 iOS apps cannot start other programs, so everything runs in one process: even
 Wine's server runs as a thread instead of a separate program.
