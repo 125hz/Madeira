@@ -158,9 +158,9 @@ fragment half4 liquidMetalSkinFragment(liquidmetalskin::VertexOut in [[stage_in]
     rgb = navy + (1.0 - navy) * clamp(rgb, 0.0, 1.0);
     rgb += float3(-0.03, 0.0, 0.07) * (lum * (1.0 - lum) * 4.0);
     rgb = clamp(rgb, 0.0, 1.0);
-    // In dark mode the highlights roll off to 0.9 (the darks are left alone); in light
+    // In dark mode the highlights roll off to 0.8 (the darks are left alone); in light
     // mode they stay full white, like the page around them.
-    if (u.light < 0.5) { rgb -= 0.1 * rgb * rgb; }
+    if (u.light < 0.5) { rgb -= 0.2 * rgb * rgb; }
 
     // The lens: full metal at the edge, gone a rim's width in. The boundary flows with
     // its own finer, faster folds, so the metal seems to melt into the glass. It grows in

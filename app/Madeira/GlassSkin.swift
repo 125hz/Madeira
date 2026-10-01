@@ -34,11 +34,13 @@ import UIKit
 /// like a pill, and the lens that lifts out of the selected tab under a finger keeps its
 /// glass with metal only around its edge, dissolving into the glass toward the middle
 /// (`rim`). The navigation bar's search field gets the same rim. Everything is found by class name and key-value coding; if any of it is
-/// missing the glass stays as it is. MADEIRA_GLASS_SKIN=0 turns it off.
+/// missing the glass stays as it is. Settings › Appearance › Liquid metal (LiquidMetalSetting,
+/// env.MADEIRA_LIQUID_METAL in madeira.cfg) turns it on and off at once, with the Desktop
+/// button's liquid metal: off, the app shows plain Liquid Glass.
 @MainActor
 final class GlassSkin: NSObject {
     static let shared = GlassSkin()
-    static let enabled = MadeiraConfig.flag("MADEIRA_GLASS_SKIN")
+    static var enabled: Bool { LiquidMetalSetting.shared.on }
     private static let groupName = "madeira.glass-skin"
 
     private var observer: CFRunLoopObserver?
@@ -65,8 +67,11 @@ final class GlassSkin: NSObject {
         let veils: Bool
     }
 
-    func start() {
+    /// `fadeIn`: liquid metal was just turned on in Settings, so the pills it finds in the
+    /// next moment fade from their glass into metal instead of switching.
+    func start(fadeIn: Bool = false) {
         guard Self.enabled, observer == nil, Self.privateClassesPresent, preparePipeline() else { return }
+        fadeInUntil = fadeIn ? CACurrentMediaTime() + 0.5 : 0
         // Core Animation commits in an observer of order 2,000,000; run just before it.
         observer = CFRunLoopObserverCreateWithHandler(nil, CFRunLoopActivity.beforeWaiting.rawValue | CFRunLoopActivity.exit.rawValue,
                                                       true, 1_999_999) { _, _ in
@@ -80,6 +85,32 @@ final class GlassSkin: NSObject {
         link?.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
         link?.add(to: .main, forMode: .common)
         LogStore.shared.log("[glass-skin] started")
+    }
+
+    /// Takes the skin off every pill (liquid metal turned off in Settings): the metal fades
+    /// out over the system's glass, and nothing more is drawn or attached.
+    func stop() {
+        guard let observer else { return }
+        CFRunLoopRemoveObserver(CFRunLoopGetMain(), observer, .commonModes)
+        self.observer = nil
+        link?.invalidate()
+        link = nil
+        let fading = skins
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(UIAccessibility.isReduceMotionEnabled ? 0.15 : 0.35)
+        CATransaction.setCompletionBlock { MainActor.assumeIsolated { for skin in fading { skin.group.removeFromSuperlayer() } } }
+        for skin in fading {
+            skin.group.opacity = 0
+            if !skin.rim, let backdrop = skin.container?.sublayers?.first(where: { Self.isClass($0, "CABackdropLayer") }) {
+                backdrop.opacity = 1
+            }
+        }
+        CATransaction.commit()
+        skins.removeAll()
+        steadyRects.removeAll()
+        bars.removeAll()
+        veiled = false
+        LogStore.shared.log("[glass-skin] stopped")
     }
 
     /// SwiftUI updates a pill's layers during Core Animation's commit itself (its hosting
@@ -96,9 +127,10 @@ final class GlassSkin: NSObject {
         return unsafeBitCast(method_getImplementation(method), to: AddCommitHandler.self)
     }()
     private var commitHandlerPending = false
+    private var fadeInUntil: CFTimeInterval = 0
 
     private func attachAgainAfterLayout() {
-        guard !commitHandlerPending, let add = Self.addCommitHandler else { return }
+        guard observer != nil, !commitHandlerPending, let add = Self.addCommitHandler else { return }
         commitHandlerPending = true
         add(CATransaction.self, Self.addCommitHandlerSelector, {
             MainActor.assumeIsolated {
@@ -113,6 +145,7 @@ final class GlassSkin: NSObject {
     }
 
     private func preparePipeline() -> Bool {
+        if pipeline != nil { return true }
         guard let device = MTLCreateSystemDefaultDevice(), let library = device.makeDefaultLibrary(),
               let vertex = library.makeFunction(name: "liquidMetalSkinVertex"),
               let fragment = library.makeFunction(name: "liquidMetalSkinFragment") else { return false }
@@ -130,6 +163,7 @@ final class GlassSkin: NSObject {
     // MARK: Attaching
 
     private func attach() {
+        guard observer != nil else { return }   // stopped (a commit handler may still fire)
         // The bars persist; a navigation bar's platter containers do not (opening and
         // closing a bar button's menu builds a new one), so the glass is looked up under the
         // bars on every pass (a walk of a few dozen layers) and only the bars are cached.
@@ -181,8 +215,13 @@ final class GlassSkin: NSObject {
         skin.group.opacity = on ? 0 : 1
         backdrop.opacity = on ? 1 : 0
         CATransaction.commit()
-        guard !on else { return }
-        for (layer, from, to) in [(skin.group, Float(0), Float(1)), (backdrop, Float(1), Float(0))] {
+        if !on { fadeIn(skin, over: backdrop) }
+    }
+
+    /// The metal fades in over the system's glass (whose backdrop fades out under it).
+    private func fadeIn(_ skin: Skin, over backdrop: CALayer?) {
+        let pairs: [(CALayer, Float, Float)] = [(skin.group, 0, 1)] + (backdrop.map { [($0, Float(1), Float(0))] } ?? [])
+        for (layer, from, to) in pairs {
             let fade = CABasicAnimation(keyPath: "opacity")
             fade.fromValue = from
             fade.toValue = to
@@ -358,6 +397,9 @@ final class GlassSkin: NSObject {
             backdrop.opacity = 0
         }
         skins.append(Skin(container: container, source: source, group: group, metal: metal, rim: rim, lens: lens, veils: veils))
+        if CACurrentMediaTime() < fadeInUntil, !(veils && veiled) {
+            fadeIn(skins[skins.count - 1], over: rim ? nil : backdrop)
+        }
         render(skins[skins.count - 1], light: container.delegate.flatMap { ($0 as? UIView)?.traitCollection.userInterfaceStyle == .light }
                ?? (bars.lazy.compactMap(\.view).first?.traitCollection.userInterfaceStyle == .light))
     }

@@ -157,8 +157,8 @@ constant float3 spectrumSum = float3(3.40, 2.75, 2.55);
     rgb = mix(rgb, float3(1.0), line * 0.75);
 
     rgb = clamp(rgb, 0.0, 1.0);
-    // In dark mode the highlights roll off to 0.9 (the darks are left alone); in light
+    // In dark mode the highlights roll off to 0.8 (the darks are left alone); in light
     // mode they stay full white, like the page around them.
-    if (light < 0.5) { rgb -= 0.1 * rgb * rgb; }
+    if (light < 0.5) { rgb -= 0.2 * rgb * rgb; }
     return half4(half3(rgb * alpha), half(alpha));
 }
