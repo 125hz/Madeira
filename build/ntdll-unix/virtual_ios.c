@@ -15758,6 +15758,33 @@ static IMAGE_BASE_RELOCATION *process_relocation_block( char *page, IMAGE_BASE_R
 }
 
 
+/* A shared writable image section that is not aligned to the host page is mapped private.
+ *
+ * A section marked IMAGE_SCN_MEM_SHARED | IMAGE_SCN_MEM_WRITE is file-mapped
+ * MAP_SHARED from the server's shared-section file, so every process that maps
+ * the image sees the same bytes.  mmap works in host pages (16 KB here) and PE
+ * sections are aligned to 4 KB: a shared section that does not start and end on
+ * a host page cannot be file-mapped without replacing its neighbours' bytes, so
+ * map_file_into_view refuses it ("unaligned shared mapping"), the image load
+ * failed with STATUS_INVALID_IMAGE_FORMAT and the program never started.  Such
+ * a section is now loaded like any other writable section, from the image file:
+ * its contents are right, but writes are not seen by other processes that map
+ * the same image.  One log line names each section this happens to.
+ */
+static int ios_shared_section_private(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0)
+    {
+        /* 0 fails the load of an image whose shared writable section is not aligned to the
+         * host page, as before; otherwise that section is mapped private. */
+        const char *e = getenv( "MADEIRA_SHARED_SECTION_PRIVATE" );
+        enabled = !(e && e[0] == '0');
+    }
+    return enabled;
+}
+
 /***********************************************************************
  *           map_image_into_view
  *
@@ -15916,10 +15943,27 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
                             debugstr_us(nt_name), sec[i].Name, ptr + sec[i].VirtualAddress,
                             sec[i].PointerToRawData, (int)pos, file_size, map_size,
                             sec[i].Characteristics );
-            if (map_file_into_view( view, shared_fd, sec[i].VirtualAddress, map_size, pos,
-                                    VPROT_COMMITTED | VPROT_READ | VPROT_WRITE, FALSE ) != STATUS_SUCCESS)
+            NTSTATUS shared_status = map_file_into_view( view, shared_fd, sec[i].VirtualAddress, map_size, pos,
+                                                         VPROT_COMMITTED | VPROT_READ | VPROT_WRITE, FALSE );
+
+            if (shared_status == STATUS_INVALID_PARAMETER && ios_shared_section_private())
+            {
+                /* not host-page aligned: see ios_shared_section_private */
+                dprintf( 2, "[shared-section] %s section %.8s rva=0x%x size=0x%lx is not aligned to the "
+                            "0x%lx-byte host page: mapped private, its writes are not shared between "
+                            "processes (MADEIRA_SHARED_SECTION_PRIVATE=0 fails the load instead)\n",
+                         debugstr_us(nt_name), sec[i].Name, (unsigned)sec[i].VirtualAddress,
+                         (unsigned long)map_size, (unsigned long)host_page_size );
+                pos += map_size;
+                goto private_section;
+            }
+            if (shared_status != STATUS_SUCCESS)
             {
                 ERR_(module)( "Could not map %s shared section %.8s\n", debugstr_us(nt_name), sec[i].Name );
+                dprintf( 2, "[shared-section] %s section %.8s rva=0x%x size=0x%lx: shared mapping failed, "
+                            "status=0x%x shared_fd=%d\n", debugstr_us(nt_name), sec[i].Name,
+                         (unsigned)sec[i].VirtualAddress, (unsigned long)map_size,
+                         (unsigned)shared_status, shared_fd );
                 do { IOS_IMG_FAIL(8); goto done; } while (0);
             }
 
@@ -15939,6 +15983,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
             continue;
         }
 
+    private_section:
         TRACE_(module)( "mapping %s section %.8s at %p off %x size %x virt %x flags %x\n",
                         debugstr_us(nt_name), sec[i].Name, ptr + sec[i].VirtualAddress,
                         sec[i].PointerToRawData, sec[i].SizeOfRawData,
