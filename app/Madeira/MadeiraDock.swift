@@ -260,6 +260,8 @@ enum MadeiraDock {
                     : "Steam needs to install or update content this game depends on before it can start. Start the game again to let Madeira Dock wait for Steam."
             case 18: return "Steam does not see this game as installed."
             case 28: return "Steam could not find the game's executable."
+            // Steam's CreateProcess for the game failed: Madeira could not load the program.
+            case 29: return "Steam started this game's program, but Madeira could not load it (Steam reports an invalid platform). Export the log: it names the reason."
             case 22, 23, 24: return "Steam could not read this game's configuration. Try again."
             case 25: return "Steam says this game is not released yet."
             case 26: return "Steam says this game is not available in your region."
