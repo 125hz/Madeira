@@ -544,6 +544,7 @@ struct mad_resource {
     UINT samples;
     struct mad_device *owner;
     int borrowed;              /* texture belongs to a drawable; do not release */
+    obj_handle_t resolve_tmp;  /* exec_resolve: render-target stand-in when this is a resolve destination without that usage */
     D3D12_RESOURCE_DESC desc;  /* as created; answered by GetDesc */
     /* ml905: typed-buffer views (Buffer<T> / RWBuffer<T>). The converter reads
      * a typed buffer as a texture buffer, so each distinct (format, offset,
@@ -1057,6 +1058,7 @@ enum mad_ck {
     MC_DRAW_INDIRECT, MC_DRAW_INDEXED_INDIRECT, MC_DISPATCH_INDIRECT,   /* ml889: ExecuteIndirect */
     MC_FILL_BB, MC_BLEND_FACTOR,   /* ml892: UAV buffer clears, blend factor */
     MC_COPY_BB, MC_COPY_B2T, MC_COPY_T2B, MC_COPY_T2T, MC_DISPATCH,
+    MC_RESOLVE,   /* ResolveSubresource: uses u.tt */
     MC_ROOTSIG, MC_ROOT_CONST, MC_STENCIL_REF,
     MC_CROOTSIG, MC_CROOT, MC_CROOT_CONST,
     MC_QUERY_BEGIN, MC_QUERY_END, MC_QUERY_RESOLVE,   /* ml1088: occlusion queries */
@@ -1703,7 +1705,7 @@ static void f7_store_census(struct mad_exec *e, const struct mad_resource *r, UI
             for (k = 0; k < c->u.barrier.n; k++)
                 if (c->u.barrier.res[k] == r) { cls = rebound ? &g_ac_st_rebound : c->u.barrier.cls[k] == BC_ALL ? &g_ac_st_write : &g_ac_st_read; goto done; }
             break;
-        case MC_COPY_T2T:
+        case MC_COPY_T2T: case MC_RESOLVE:
             if (c->u.tt.src == r) { cls = &g_ac_st_read; goto done; }
             if (c->u.tt.dst == r) { cls = &g_ac_st_write; goto done; }
             break;
@@ -4069,6 +4071,67 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     }
 }
 
+static int mad_texinfo_from_desc(const D3D12_RESOURCE_DESC *desc, struct WMTTextureInfo *ti, enum WMTPixelFormat *pf, int *is_depth);
+
+/* ResolveSubresource. Metal resolves as the store action of a render pass, so
+ * this is a pass of its own with nothing drawn: load the multisampled source,
+ * keep it, and resolve into the destination. A clear still pending on either
+ * texture has to land first or the pass would load stale contents.
+ *
+ * Metal only resolves into a texture with render-target usage, which a D3D12
+ * resolve destination need not have. Such a destination gets a stand-in of
+ * the subresource's size that is resolved into and then copied from. */
+static void exec_resolve(struct mad_exec *e, const struct mad_cmd *c) {
+    struct mad_resource *src = c->u.tt.src, *dst = c->u.tt.dst;
+    struct WMTRenderPassInfo rpi;
+    obj_handle_t enc, target = dst->texture;
+    UINT w = src->width >> c->u.tt.slevel, h = src->height >> c->u.tt.slevel;
+    int direct = dst->borrowed || (dst->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    if (!w) w = 1;
+    if (!h) h = 1;
+    if (!src->texture || !dst->texture || src->is_depth || dst->is_depth) { MAD_SKIP(e); return; }
+    if (!direct) {
+        if (!dst->resolve_tmp) {
+            D3D12_RESOURCE_DESC td = dst->desc;
+            struct WMTTextureInfo ti; enum WMTPixelFormat pf; int is_depth = 0;
+            td.Width = w; td.Height = h; td.DepthOrArraySize = 1; td.MipLevels = 1;
+            td.SampleDesc.Count = 1; td.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            if (mad_texinfo_from_desc(&td, &ti, &pf, &is_depth))
+                dst->resolve_tmp = MTLDevice_newTexture(e->q->device->mtl_device, &ti);
+        }
+        if (!dst->resolve_tmp) { MAD_SKIP(e); return; }
+        target = dst->resolve_tmp;
+    }
+    exec_end(e);
+    while (e->npend) exec_flush_clear(e, 0);
+    e->wr_all = 1;
+    memset(&rpi, 0, sizeof rpi);
+    rpi.colors[0].texture = src->texture;
+    rpi.colors[0].level = c->u.tt.slevel; rpi.colors[0].slice = c->u.tt.sslice;
+    rpi.colors[0].load_action = WMTLoadActionLoad;
+    rpi.colors[0].store_action = WMTStoreActionStoreAndMultisampleResolve;
+    rpi.colors[0].resolve_texture = target;
+    if (direct) { rpi.colors[0].resolve_level = c->u.tt.dlevel; rpi.colors[0].resolve_slice = c->u.tt.dslice; }
+    rpi.render_target_width = w; rpi.render_target_height = h;
+    rpi.default_raster_sample_count = src->samples;
+    enc = MTLCommandBuffer_renderCommandEncoder(e->cb, &rpi); if (enc) g_enc_seq++;
+    e->f6_att[0] = src; e->f6_att[1] = dst; e->f6_natt = 2;
+    if (enc) { exec_fence_render(e, enc, 0); exec_fence_render(e, enc, 1); }
+    e->f6_natt = 0;
+    if (!enc) { MAD_SKIP(e); return; }
+    MTLCommandEncoder_endEncoding(enc);
+    if (!direct) {
+        struct wmtcmd_blit_copy_from_texture_to_texture k;
+        if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
+        memset(&k, 0, sizeof k);
+        k.type = WMTBlitCommandCopyFromTextureToTexture;
+        k.src = target;
+        k.src_size.width = w; k.src_size.height = h; k.src_size.depth = 1;
+        k.dst = dst->texture; k.dst_slice = c->u.tt.dslice; k.dst_level = c->u.tt.dlevel;
+        MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
+    }
+}
+
 static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     struct wmtcmd_compute_setpso c_pso;
     e->wr_all = 1;   /* ml1116: a dispatch writes through UAVs we do not enumerate here */
@@ -4300,6 +4363,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_FILL_BB: exec_copy(&e, c); break;
         case MC_BLEND_FACTOR: memcpy(e.blend, c->u.blend.rgba, sizeof e.blend); e.has_blend = 1; break;
         case MC_DISPATCH: exec_dispatch(&e, c); break;
+        case MC_RESOLVE: exec_resolve(&e, c); break;
         }
     }
     if (e.renc) InterlockedIncrement(&g_pass_end_list);
@@ -6532,6 +6596,7 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
         { unsigned k; for (k = 0; k < r->nview_old; k++) free(r->view_old[k]); free(r->tview); free(r->xview); }
         if (r->buffer) NSObject_release(r->buffer);
         if (r->texture && !r->borrowed) NSObject_release(r->texture);
+        if (r->resolve_tmp) NSObject_release(r->resolve_tmp);
         if (r->placed_heap) ID3D12Heap_Release((ID3D12Heap *)r->placed_heap);   /* ml1145 */
         if (r->own_mem) {   /* ml1154: the GPU may still read it; free after its serial (reclaimed with the ml1148 list) */
             struct mad_device *md = r->owner; int queued = 0;
@@ -10046,6 +10111,36 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(ID3D12GraphicsCommandList *
     }
     list_CopyBufferRegion(This, dst->pResource, 0, src->pResource, 0, s->size < d->size ? s->size : d->size);
 }
+/* A multisampled source resolves through a render pass (exec_resolve); a
+ * single-sampled one is a plain copy, which is what D3D12 does with it too.
+ * The format argument only matters for typeless resources, which are created
+ * here with a concrete Metal format already. */
+static void STDMETHODCALLTYPE list_ResolveSubresource(ID3D12GraphicsCommandList *This, ID3D12Resource *dst, UINT dst_sub,
+        ID3D12Resource *src, UINT src_sub, DXGI_FORMAT format) {
+    struct mad_list *l = (struct mad_list *)This;
+    struct mad_resource *d = (struct mad_resource *)dst, *s = (struct mad_resource *)src;
+    struct mad_cmd *c;
+    static unsigned said;
+    if (!d || !s || !d->texture || !s->texture) return;
+    if (said++ < 4)
+        d3d12_log("[madeira-d3d12] ResolveSubresource: %ux%u x%u samples, format %u -> %ux%u x%u, format %u (as %u)\n",
+                  (unsigned)s->width, (unsigned)s->height, (unsigned)s->samples, (unsigned)s->desc.Format,
+                  (unsigned)d->width, (unsigned)d->height, (unsigned)d->samples, (unsigned)d->desc.Format, (unsigned)format);
+    if (s->samples <= 1) {
+        D3D12_TEXTURE_COPY_LOCATION a, b;
+        memset(&a, 0, sizeof a); memset(&b, 0, sizeof b);
+        a.pResource = dst; a.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; a.SubresourceIndex = dst_sub;
+        b.pResource = src; b.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; b.SubresourceIndex = src_sub;
+        list_CopyTextureRegion(This, &a, 0, 0, 0, &b, NULL);
+        return;
+    }
+    c = mad_list_push(l, MC_RESOLVE);
+    if (!c) return;
+    mad_subresource(d, dst_sub, &c->u.tt.dlevel, &c->u.tt.dslice);
+    mad_subresource(s, src_sub, &c->u.tt.slevel, &c->u.tt.sslice);
+    c->u.tt.dst = d; c->u.tt.src = s;
+}
+
 static void STDMETHODCALLTYPE list_CopyResource(ID3D12GraphicsCommandList *This, ID3D12Resource *dst, ID3D12Resource *src) {
     struct mad_resource *d = (struct mad_resource *)dst, *s = (struct mad_resource *)src;
     if (!d || !s) return;
@@ -10585,6 +10680,7 @@ static void build_vtables(void) {
     g_list_vtbl.IASetPrimitiveTopology  = (void *)list_IASetPrimitiveTopology;
     g_list_vtbl.DrawInstanced           = (void *)list_DrawInstanced;
     g_list_vtbl.CopyTextureRegion       = (void *)list_CopyTextureRegion;
+    g_list_vtbl.ResolveSubresource      = (void *)list_ResolveSubresource;
     g_list_vtbl.IASetIndexBuffer        = (void *)list_IASetIndexBuffer;
     g_list_vtbl.DrawIndexedInstanced    = (void *)list_DrawIndexedInstanced;
     g_list_vtbl.ClearDepthStencilView   = (void *)list_ClearDepthStencilView;
