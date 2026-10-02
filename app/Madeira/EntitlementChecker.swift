@@ -159,6 +159,11 @@ enum DeviceDiagnostics {
             log.log("[device] this copy is signed without get-task-allow: no debugger can attach to it, so JIT cannot be "
                 + "enabled. Reinstall Madeira with a development certificate.", level: .error)
         }
+        if StikJITHelper.flaggedWithoutDebugger {
+            log.log("[jit-debugger] CS_DEBUGGED is set but no debugger is attached at start-up: JIT was enabled "
+                + "outside Madeira (StikDebug's app list attaches and leaves). Enable JIT in Madeira before playing.",
+                level: .error)
+        }
         let screen = UIScreen.main
         let offset = TimeZone.current.secondsFromGMT()
         let free = (try? URL(fileURLWithPath: NSHomeDirectory())

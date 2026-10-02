@@ -80,9 +80,29 @@ enum StikJITHelper {
     /// Why the last allocatePool() returned nil, in words for the person playing
     /// (the library shows it); nil after a success.
     private(set) static var poolFailure: String?
-    static let noDebuggerMessage = "JIT is switched on, but no debugger is attached to Madeira any more, so the JIT memory "
-        + "could not be set up. Close Madeira (swipe it away in the app switcher), open it again and tap Enable JIT in "
-        + "Madeira, so that StikDebug attaches with Madeira's script."
+    static let noDebuggerMessage = "JIT is switched on, but StikDebug is not attached to Madeira, so the JIT memory cannot "
+        + "be set up. This happens when JIT is enabled from StikDebug's own app list. Tap Enable JIT: StikDebug then "
+        + "reopens Madeira with Madeira's script, ready to play."
+
+    /// This app run's pool exists. The debugger detaches right after the pool is
+    /// made, by design, so from then on "no debugger attached" is the normal state.
+    private(set) static var poolTaken = false
+
+    // 0 treats JIT as ready whenever CS_DEBUGGED is set, as before, without asking whether a debugger is attached.
+    private static let attachCheck = MadeiraConfig.flag("MADEIRA_JIT_ATTACH_CHECK")
+
+    /// JIT can serve a launch: CS_DEBUGGED is set, and either a debugger is
+    /// attached to answer the pool request or this run's pool exists already.
+    /// CS_DEBUGGED alone is not enough: it stays set after a debugger leaves, which
+    /// is the state StikDebug's own app list (attach, then detach) leaves behind.
+    static var ready: Bool {
+        guard jit_check_debugged() else { return false }
+        return !attachCheck || poolTaken || isDebuggerAttached()
+    }
+
+    /// CS_DEBUGGED is set but nothing can answer a pool request: JIT has to be
+    /// enabled again, through Madeira, before a game can start.
+    static var flaggedWithoutDebugger: Bool { jit_check_debugged() && !ready }
 
     /// Allocate a JIT memory pool via BRK #0xf00d WITHOUT detaching the debugger.
     /// The debugger stays attached so Wine can use BRK to prepare PE code pages.
@@ -404,8 +424,8 @@ enum StikJITHelper {
                 // re-roll, so the app stays up and says what to do.
                 poolFailure = noDebuggerMessage
                 LogStore.shared.log("[jit-debugger] the pool request was not answered: no debugger is attached. "
-                    + "Restart Madeira and enable JIT with Madeira's Enable JIT button, so that StikDebug "
-                    + "attaches with Madeira's script and stays attached until the game starts.", level: .error)
+                    + "Enable JIT with Madeira's Enable JIT button, so that StikDebug attaches with Madeira's "
+                    + "script and stays attached until the game starts.", level: .error)
                 return nil
             }
             poolFailure = requestUnanswered
@@ -624,6 +644,7 @@ enum StikJITHelper {
         LogStore.shared.log("[no-footprint] pool applied=\(exempt)", level: exempt ? .success : .error)
 
         LogStore.shared.log("JIT pool ready (debugger still attached).", level: .success)
+        poolTaken = true
 
         return (rx: rxPtr, rw: rwPtr, size: poolSize)
     }

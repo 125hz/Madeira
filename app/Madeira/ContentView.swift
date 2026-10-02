@@ -1244,6 +1244,12 @@ struct ContentView: View {
                 }
                 Button("Later", role: .cancel) { library.restartNotice = nil }
             } message: { Text(library.restartNotice ?? "") }
+            // CS_DEBUGGED without a debugger (JIT enabled outside Madeira): offer Madeira's own request.
+            .alert("Enable JIT", isPresented: Binding(get: { library.jitNotice != nil },
+                                                      set: { if !$0 { library.jitNotice = nil } })) {
+                Button("Enable JIT") { library.jitNotice = nil; enableJITViaStikDebug() }
+                Button("Later", role: .cancel) { library.jitNotice = nil }
+            } message: { Text(library.jitNotice ?? "") }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
                 library.refreshFlag()
                 if library.enabled && library.current == nil { MetalHostView.shared.isHidden = true }
@@ -2254,6 +2260,23 @@ struct ContentView: View {
         }
     }
 
+    /// Whether a launch may ask for the JIT pool. With CS_DEBUGGED set but no debugger
+    /// attached (JIT enabled from StikDebug's own list, which attaches and leaves) the
+    /// library offers Madeira's Enable JIT instead of starting a launch that cannot
+    /// get its pool.
+    private func jitReadyForLaunch(inLibrary: Bool) -> Bool {
+        if StikJITHelper.ready { return true }
+        if StikJITHelper.flaggedWithoutDebugger {
+            logStore.log("[jit-debugger] launch held: CS_DEBUGGED is set but no debugger is attached; "
+                         + "JIT has to be enabled again from Madeira", level: .error)
+            if inLibrary { library.jitNotice = StikJITHelper.noDebuggerMessage }
+        } else {
+            logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
+            if inLibrary { library.error = "Enable JIT before playing." }
+        }
+        return false
+    }
+
     /// Play in the library (Library.swift): checks that a session can start,
     /// applies the entry's launch profile and runs the same full sequence as the
     /// developer interface's buttons.
@@ -2286,9 +2309,7 @@ struct ContentView: View {
         }
         // The same precondition runWineFullSequence checks: the JIT pool is
         // taken at launch, through the debugger.
-        guard jit_check_debugged() else {
-            library.error = "Enable JIT before playing."; return
-        }
+        guard jitReadyForLaunch(inLibrary: true) else { return }
         do { if entry.desktop != true { _ = try LibraryModel.executable(entry.launchRelativePath) }; try entry.validate() }
         catch {
             library.error = error.localizedDescription
@@ -2785,7 +2806,8 @@ struct ContentView: View {
                 logStore.log("  " + (reason ?? "No reason was recorded; see the pool lines above."), level: .info)
                 logStore.uiPaused = false
                 // A library session that never started returns to the library.
-                DispatchQueue.main.async { LibraryModel.shared.launchFailed(reason) }
+                let offerJIT = reason == StikJITHelper.noDebuggerMessage
+                DispatchQueue.main.async { LibraryModel.shared.launchFailed(reason, offerJIT: offerJIT) }
                 return
             }
 
@@ -2934,11 +2956,7 @@ struct ContentView: View {
     /// session then takes that entry's display, performance and on-screen settings.
     private func startDock(_ game: DockGame, compactPool: Bool, profile: LibraryEntry? = nil) {
         let inLibrary = library.enabled
-        guard jit_check_debugged() else {
-            logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
-            if inLibrary { library.error = "Enable JIT before playing." }
-            return
-        }
+        guard jitReadyForLaunch(inLibrary: inLibrary) else { return }
         guard wine_process_is_running() == 0, wineserver_is_running() == 0, !inLibrary || library.current == nil else {
             logStore.log("[madeira-dock] a session already ran in this app run; restart Madeira first", level: .error)
             if inLibrary { library.error = "A session is already running." }
@@ -2969,7 +2987,7 @@ struct ContentView: View {
             await SteamOwnedLibrary.shared.prepareDock()
             do {
                 // The launch state may have changed while the connection closed.
-                guard jit_check_debugged(), wine_process_is_running() == 0, wineserver_is_running() == 0,
+                guard StikJITHelper.ready, wine_process_is_running() == 0, wineserver_is_running() == 0,
                       !inLibrary || library.current == nil else {
                     throw DockError.message("The launch state changed. Enable JIT and try again.")
                 }
