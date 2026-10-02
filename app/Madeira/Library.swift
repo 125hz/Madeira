@@ -719,7 +719,10 @@ final class LibraryModel: ObservableObject {
             MetalBackedView.refreshDisplayMode(reason: "first-present")
         }
     }
-    func launchFailed() { if current != nil && !sawProcess { finish(); error = "The session could not start. Check the diagnostic log and JIT status." } }
+    /// `reason`: what stopped the launch, when the caller knows (the JIT pool's failure).
+    func launchFailed(_ reason: String? = nil) {
+        if current != nil && !sawProcess { finish(); error = reason ?? "The session could not start. Check the diagnostic log and JIT status." }
+    }
     /// Both flags change in one transaction without animation: the animated
     /// removal of a scrolling view with live content could leave the starting
     /// screen up (and unresponsive) while the game was already presenting.

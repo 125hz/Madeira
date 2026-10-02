@@ -1253,6 +1253,7 @@ struct ContentView: View {
                 entitlements = EntitlementStatus.check()
                 logEntitlementStatus()
                 logStore.log("[build] \(BuildStamp.text)")
+                DeviceDiagnostics.logStartup()
                 FrontendChoice.logStartup()
                 DeviceLoadDiagnostics.start()
                 // Madeira Dock: an unconsumed sign-in transfer from an earlier run goes.
@@ -1524,8 +1525,10 @@ struct ContentView: View {
         logStore.log("  allow-jit: \(ents.jitAllowed)", level: ents.jitAllowed ? .success : .error)
         logStore.log("  increased-memory-limit: \(ents.increasedMemory)", level: ents.increasedMemory ? .success : .debug)
         logStore.log("  extended-virtual-addressing: \(ents.extendedVA)", level: ents.extendedVA ? .success : .debug)
-        if !ents.extendedVA {
-            logStore.log("  Tip: Use GetMoreRam to inject extended-virtual-addressing", level: .info)
+        // The memory limit is the entitlement a session needs; the address map may
+        // be the standard 63 GB one.
+        if !ents.increasedMemory {
+            logStore.log("  Tip: Use GetMoreRam to add increased-memory-limit", level: .info)
         }
     }
 
@@ -2224,6 +2227,19 @@ struct ContentView: View {
     }
 
     private func enableJITViaStikDebug() {
+        // Explains why JIT cannot be enabled on a copy signed without get-task-allow; 0 opens StikDebug regardless.
+        // A debugger can attach only to a process whose signature carries
+        // get-task-allow (a development signature). A copy signed with a
+        // distribution or enterprise certificate lacks it, StikDebug can never
+        // attach, and CS_DEBUGGED never appears however often this is tapped.
+        if !SigningStatus.current.debuggable, MadeiraConfig.flag("MADEIRA_JIT_SIGNING_CHECK") {
+            jitStatus = .unavailable
+            logStore.log(String(format: "[jit-signing] get-task-allow is missing (cs-flags=0x%x): no debugger can attach to this copy, "
+                                + "so JIT cannot be enabled. Reinstall Madeira with a development certificate.",
+                                SigningStatus.current.flags), level: .error)
+            if library.enabled { library.error = SigningStatus.notDebuggableMessage }
+            return
+        }
         jitStatus = .testing
         logStore.log("Requesting JIT via StikDebug URL scheme...")
 
@@ -2313,6 +2329,7 @@ struct ContentView: View {
         }
 
         logStore.log("Running full Wine sequence...")
+        DeviceDiagnostics.logLaunch()
 
         // Start a main thread heartbeat to diagnose hang
         var heartbeatCount = 0
@@ -2762,13 +2779,13 @@ struct ContentView: View {
                 // wrong conclusion I wrote into the source. A run without the pool can
                 // only manufacture misleading secondary crashes, so refuse to start one.
                 logStore.log("JIT pool allocation FAILED — not starting Wine.", level: .error)
-                logStore.log("  All placements landed in the forbidden guest 64G window.", level: .info)
-                logStore.log("  Force-quit and relaunch: placement is chosen by the kernel", level: .info)
-                logStore.log("  and depends on current memory layout, so a fresh process", level: .info)
-                logStore.log("  usually lands somewhere valid.", level: .info)
+                // The reason allocatePool recorded (no debugger, placement, alias);
+                // the lines above this one in the log carry the detail.
+                let reason = StikJITHelper.poolFailure
+                logStore.log("  " + (reason ?? "No reason was recorded; see the pool lines above."), level: .info)
                 logStore.uiPaused = false
                 // A library session that never started returns to the library.
-                DispatchQueue.main.async { LibraryModel.shared.launchFailed() }
+                DispatchQueue.main.async { LibraryModel.shared.launchFailed(reason) }
                 return
             }
 
