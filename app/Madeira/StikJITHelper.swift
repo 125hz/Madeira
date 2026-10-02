@@ -77,11 +77,55 @@ enum StikJITHelper {
         return result
     }
 
+    /// Why the last allocatePool() returned nil, in words for the person playing
+    /// (the library shows it); nil after a success.
+    private(set) static var poolFailure: String?
+    static let noDebuggerMessage = "JIT is switched on, but StikDebug is not attached to Madeira, so the JIT memory cannot "
+        + "be set up. This happens when JIT is enabled from StikDebug's own app list. Tap Enable JIT: StikDebug then "
+        + "reopens Madeira with Madeira's script, ready to play."
+
+    /// This app run's pool exists. The debugger detaches right after the pool is
+    /// made, by design, so from then on "no debugger attached" is the normal state.
+    private(set) static var poolTaken = false
+
+    // 0 treats JIT as ready whenever CS_DEBUGGED is set, as before, without asking whether a debugger is attached.
+    private static let attachCheck = MadeiraConfig.flag("MADEIRA_JIT_ATTACH_CHECK")
+
+    /// JIT can serve a launch: CS_DEBUGGED is set, and either a debugger is
+    /// attached to answer the pool request or this run's pool exists already.
+    /// CS_DEBUGGED alone is not enough: it stays set after a debugger leaves, which
+    /// is the state StikDebug's own app list (attach, then detach) leaves behind.
+    static var ready: Bool {
+        guard jit_check_debugged() else { return false }
+        return !attachCheck || poolTaken || isDebuggerAttached()
+    }
+
+    /// CS_DEBUGGED is set but nothing can answer a pool request: JIT has to be
+    /// enabled again, through Madeira, before a game can start.
+    static var flaggedWithoutDebugger: Bool { jit_check_debugged() && !ready }
+
     /// Allocate a JIT memory pool via BRK #0xf00d WITHOUT detaching the debugger.
     /// The debugger stays attached so Wine can use BRK to prepare PE code pages.
     static func allocatePool(poolSize requestedPoolSize: Int = 128 * 1024 * 1024) -> (rx: UnsafeMutableRawPointer, rw: UnsafeMutableRawPointer, size: Int)? {
         var poolSize = requestedPoolSize      // ml1036: may shrink to fit, see the hole census below
+        poolFailure = nil
         LogStore.shared.log("Allocating \(poolSize / 1024 / 1024)MB JIT pool via debugger...")
+
+        let debuggerAttached = isDebuggerAttached()
+        LogStore.shared.log("[jit-debugger] attached=\(debuggerAttached ? 1 : 0) at the pool request")
+        // With no debugger attached, a JIT request fails the launch with a message; 0 lets it crash the app as before.
+        // CS_DEBUGGED stays set after a debugger detaches (JIT enabled by a tool
+        // that attaches and leaves, or without Madeira's script), and the pool
+        // request below is a BRK only a debugger can answer: with nobody attached
+        // it killed the app (EXC_BREAKPOINT in jit26_prepare_region). P_TRACED says
+        // whether a debugger is attached now. The handler cannot take a BRK away
+        // from an attached debugger, which sees the exception first, so a wrong
+        // reading costs nothing.
+        if !debuggerAttached && MadeiraConfig.flag("MADEIRA_JIT_TRAP_FALLBACK") {
+            jit_arm_trap_fallback()
+            LogStore.shared.log("[jit-debugger] no debugger is attached although CS_DEBUGGED is set: "
+                + "an unanswered pool request now fails the launch instead of crashing the app", level: .error)
+        }
 
         // iOS-Madeira: FEX's dispatcher emit has a position-dependent encoding
         // bug — only works when the JIT pool lands at a high enough address
@@ -345,9 +389,11 @@ enum StikJITHelper {
         }
 
         var rxPtrOpt: UnsafeMutableRawPointer? = nil
+        var requestUnanswered = false
         for attempt in 0..<3 {
             guard let p = jit26_prepare_region(nil, poolSize), p != UnsafeMutableRawPointer(bitPattern: 0) else {
                 LogStore.shared.log("Debugger failed to allocate RX memory (attempt \(attempt))", level: .error)
+                requestUnanswered = true
                 break
             }
             let a = Int(bitPattern: p)
@@ -373,6 +419,18 @@ enum StikJITHelper {
         // ml1040: the plugs existed only to steer first-fit; give the VA back.
         for (a, sz) in plugs { vm_deallocate(mach_task_self_, a, sz) }
         guard let rxPtr = rxPtrOpt else {
+            if requestUnanswered && !debuggerAttached {
+                // Nothing answered the BRK: there is no pool and no placement to
+                // re-roll, so the app stays up and says what to do.
+                poolFailure = noDebuggerMessage
+                LogStore.shared.log("[jit-debugger] the pool request was not answered: no debugger is attached. "
+                    + "Enable JIT with Madeira's Enable JIT button, so that StikDebug attaches with Madeira's "
+                    + "script and stays attached until the game starts.", level: .error)
+                return nil
+            }
+            poolFailure = requestUnanswered
+                ? "The debugger could not allocate the JIT memory. Restart Madeira, enable JIT and try again."
+                : "The JIT memory landed at an address Madeira cannot use. Restart Madeira, enable JIT and try again."
             LogStore.shared.log("BAD POOL: no valid placement after retries. Killing in 10s — please relaunch.", level: .error)
             DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 10) {
                 LogStore.shared.log("BAD POOL — exiting now. Relaunch the app.", level: .error)
@@ -507,7 +565,7 @@ enum StikJITHelper {
         // derives WriteOffset from the real distance), so send it high, where it
         // lived in every run before ml977, and keep the scarce low gap for RX.
         rwAddr = 0x7000000000
-        let kr1 = vm_remap(
+        var kr1 = vm_remap(
             mach_task_self_,
             &rwAddr,
             vm_size_t(poolSize),
@@ -521,8 +579,27 @@ enum StikJITHelper {
             VM_INHERIT_NONE
         )
 
+        // Lets the kernel place the JIT pool's RW alias when the 0x7000000000 hint is
+        // past the end of the address map (63 GB maps); 0 fails at the hint as before.
+        // A process without the extended-virtual-addressing entitlement has a map
+        // that ends at 0xfc0000000, and an ANYWHERE search that starts past the end
+        // of the map does not wrap: every alias failed with KERN_NO_SPACE although
+        // ~50 GB was free, no pool was made and no session could start. On such a
+        // map the kernel's choice is directly above the RX pool, below the 16 GB
+        // floor of the small-map guest-window band.
+        if kr1 == KERN_NO_SPACE && MadeiraConfig.flag("MADEIRA_RW_ALIAS_RETRY") {
+            rwAddr = 0
+            kr1 = vm_remap(mach_task_self_, &rwAddr, vm_size_t(poolSize), 0, VM_FLAGS_ANYWHERE,
+                           mach_task_self_, vm_address_t(bitPattern: rxPtr), 0,
+                           &curProt, &maxProt, VM_INHERIT_NONE)
+            LogStore.shared.log(String(format: "[rw-alias] high hint out of reach; kernel placement kr=%d RW=0x%lx",
+                                       kr1, Int(rwAddr)), level: kr1 == KERN_SUCCESS ? .info : .error)
+        }
+
         guard kr1 == KERN_SUCCESS else {
             LogStore.shared.log("vm_remap failed: \(kr1)", level: .error)
+            poolFailure = "Madeira could not map its JIT memory (vm_remap error \(kr1)). Restart Madeira and try again; "
+                + "if it keeps happening, send the diagnostic log."
             return nil
         }
 
@@ -540,6 +617,8 @@ enum StikJITHelper {
         guard kr2 == KERN_SUCCESS else {
             LogStore.shared.log("vm_protect(RW) failed: \(kr2)", level: .error)
             vm_deallocate(mach_task_self_, rwAddr, vm_size_t(poolSize))
+            poolFailure = "Madeira could not make its JIT memory writable (vm_protect error \(kr2)). Restart Madeira and try again; "
+                + "if it keeps happening, send the diagnostic log."
             return nil
         }
 
@@ -565,6 +644,7 @@ enum StikJITHelper {
         LogStore.shared.log("[no-footprint] pool applied=\(exempt)", level: exempt ? .success : .error)
 
         LogStore.shared.log("JIT pool ready (debugger still attached).", level: .success)
+        poolTaken = true
 
         return (rx: rxPtr, rw: rwPtr, size: poolSize)
     }

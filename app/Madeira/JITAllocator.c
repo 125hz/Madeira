@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <mach-o/dyld.h>
 #include <os/log.h>
+#include <os/proc.h>
 
 // csops syscall - used to check CS_DEBUGGED flag
 #ifndef CS_DEBUGGED
@@ -391,6 +392,36 @@ void jit_install_trap_handler(void) {
     sa.sa_sigaction = sigtrap_handler;
     sigaction(SIGTRAP, &sa, NULL);
     jit_log("SIGTRAP handler installed (no debugger)");
+}
+
+void jit_arm_trap_fallback(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_flags = SA_SIGINFO;
+    sa.sa_sigaction = sigtrap_handler;
+    sigaction(SIGTRAP, &sa, NULL);
+    jit_log("SIGTRAP handler installed (CS_DEBUGGED set, no debugger attached)");
+}
+
+bool jit_cs_status(uint32_t *flags) {
+    uint32_t value = 0;
+    if (csops(getpid(), CS_OPS_STATUS, &value, sizeof(value)) != 0) return false;
+    *flags = value;
+    return true;
+}
+
+bool jit_task_map_range(uint64_t *min_address, uint64_t *max_address) {
+    task_vm_info_data_t vmi;
+    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt) != KERN_SUCCESS ||
+        !vmi.max_address) return false;
+    *min_address = vmi.min_address;
+    *max_address = vmi.max_address;
+    return true;
+}
+
+uint64_t jit_available_memory(void) {
+    return (uint64_t)os_proc_available_memory();
 }
 
 // iOS 26 BRK-based JIT syscalls.

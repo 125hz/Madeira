@@ -653,6 +653,9 @@ final class LibraryModel: ObservableObject {
     static var sessionsThisRun = 0
     static let restartMessage = "Restart Madeira to start another game: swipe Madeira away in the app switcher, then open it again."
     @Published var restartNotice: String?
+    /// CS_DEBUGGED is set but no debugger is attached (JIT was enabled outside
+    /// Madeira): the text of the alert that offers Madeira's own Enable JIT.
+    @Published var jitNotice: String?
 
     /// `remember: false` runs a session that is not a library entry (a Madeira
     /// Dock start): it is neither added to the library nor stamped as played.
@@ -719,7 +722,15 @@ final class LibraryModel: ObservableObject {
             MetalBackedView.refreshDisplayMode(reason: "first-present")
         }
     }
-    func launchFailed() { if current != nil && !sawProcess { finish(); error = "The session could not start. Check the diagnostic log and JIT status." } }
+    /// `reason`: what stopped the launch, when the caller knows (the JIT pool's failure).
+    /// `offerJIT`: the launch failed because no debugger is attached, so the alert
+    /// offers Enable JIT instead of only reporting.
+    func launchFailed(_ reason: String? = nil, offerJIT: Bool = false) {
+        guard current != nil && !sawProcess else { return }
+        finish()
+        if offerJIT, let reason { jitNotice = reason }
+        else { error = reason ?? "The session could not start. Check the diagnostic log and JIT status." }
+    }
     /// Both flags change in one transaction without animation: the animated
     /// removal of a scrolling view with live content could leave the starting
     /// screen up (and unresponsive) while the game was already presenting.
@@ -954,7 +965,7 @@ struct LibraryTitleText: View {
 /// are disabled once it is.
 final class LibraryJITState: ObservableObject {
     static let shared = LibraryJITState()
-    @Published private(set) var enabled = jit_check_debugged()
+    @Published private(set) var enabled = StikJITHelper.ready
     private var timer: Timer?
     private init() {
         let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
@@ -962,7 +973,7 @@ final class LibraryJITState: ObservableObject {
         self.timer = timer
     }
     func refresh() {
-        let now = jit_check_debugged()
+        let now = StikJITHelper.ready
         guard now != enabled else { return }
         withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .default) { enabled = now }
     }
@@ -1712,7 +1723,7 @@ struct LibraryStatus: View {
         .background((enabled ? Color.green : Color.red).opacity(0.1), in: RoundedRectangle(cornerRadius: 6))
         .accessibilityElement(children: .ignore).accessibilityLabel("\(label): \(enabled ? "enabled" : "unavailable")")
     }
-    private func update() { jit = jit_check_debugged(); memory = EntitlementStatus.check().increasedMemory }
+    private func update() { jit = StikJITHelper.ready; memory = EntitlementStatus.check().increasedMemory }
 }
 
 /// A section title with a count; with `collapsed` set, tapping the title
@@ -2076,6 +2087,7 @@ struct LibraryView: View {
         .onChange(of: model.current) { _, current in if current != nil { selected = nil } }
         .onChange(of: model.error) { _, error in if error != nil { selected = nil } }
         .onChange(of: model.restartNotice) { _, notice in if notice != nil { selected = nil } }
+        .onChange(of: model.jitNotice) { _, notice in if notice != nil { selected = nil } }
         .alert("Library", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
             Button("OK", role: .cancel) { model.error = nil }
         } message: { Text(model.error ?? "") }

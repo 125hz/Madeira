@@ -53,6 +53,24 @@ bool jit_check_debugged(void);
 // when no debugger is attached. Must be called before any jit26_* functions.
 void jit_install_trap_handler(void);
 
+// Install the same SIGTRAP handler although CS_DEBUGGED is set. The flag stays
+// set after a debugger detaches, so it does not say that anything will answer a
+// BRK; with the handler armed an unanswered jit26_* request returns 0 instead of
+// killing the app. A debugger that is attached still receives the BRK first.
+void jit_arm_trap_fallback(void);
+
+// The process's code-signing status flags (csops CS_OPS_STATUS), without logging.
+// Returns false when the kernel does not report them.
+bool jit_cs_status(uint32_t *flags);
+
+// The user address map [min, max) from TASK_VM_INFO: max is 0xfc0000000 (63 GB)
+// on a standard map and 0x8000000000 (512 GB) on an extended one. Returns false
+// when the kernel does not report it.
+bool jit_task_map_range(uint64_t *min_address, uint64_t *max_address);
+
+// Memory this process may still allocate before the system's limit.
+uint64_t jit_available_memory(void);
+
 // iOS 26 BRK-based protocol: Ask attached debugger (StikDebug) to
 // prepare a memory region for JIT execution.
 // Returns the prepared address (may differ from input on allocation).
