@@ -32,6 +32,7 @@
 	<string>public.app-category.games</string>
 	<key>LSApplicationQueriesSchemes</key>
 	<array>
+		<string>stikdebug</string>
 		<string>stikjit</string>
 	</array>
 	<key>LSRequiresIPhoneOS</key>

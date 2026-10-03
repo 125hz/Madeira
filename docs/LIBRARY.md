@@ -59,7 +59,8 @@ Removing an entry never removes the game's files or saves.
   desktop) with its own profile; its Resolution is the desktop's size.
 - The build label (`MadeiraBuild` in Info.plist, else the bundle version) is
   shown in Settings (Ready to play) and in the developer interface's status row.
-- **Settings**: JIT and memory status, Enable JIT, extended logging, pointer
+- **Settings**: JIT and memory status, Enable JIT, JIT method and setup
+  (StikDebug or the built-in helper), extended logging, pointer
   mode (Absolute, Relative or Touch) and touch sensitivity, **Display** (hold
   the display at its maximum rate, off by default), **Memory & sync** (swap tier
   Off/1/2/4 GB, off by default; sync engine, Fastsync by default), the interface
@@ -163,33 +164,38 @@ process (the wineserver's permanent objects from the first session remain and
 the registry initialisation aborts). The library asks to restart Madeira
 instead.
 
-## Steam setup
+## First-run setup
 
-The code is `app/Madeira/Onboarding.swift`. It uses Steam sign-in
-(`docs/STEAM_SIGNIN.md`) and Madeira Dock (`docs/MADEIRA_DOCK.md`) through
-their public pieces only: `SteamSignInModel`/`SteamSignInView` for signing in
-and out (the token stays in sign-in's Keychain store), and
-`MadeiraDockModel.prepareClient()`/`MadeiraDockView` for Dock.
+The code is `app/Madeira/Onboarding.swift`. It uses `JITCoordinator` for the
+JIT method and validated pairing-file import, Steam sign-in
+(`docs/STEAM_SIGNIN.md`) through `SteamSignInModel`/`SteamSignInView` (the
+token stays in sign-in's Keychain store), and Madeira Dock
+(`docs/MADEIRA_DOCK.md`) through
+`MadeiraDockModel.prepareClient()`/`MadeiraDockView`.
 
 **First-run setup.** On a new install the library opens a full-screen setup
-once: welcome, **Sign in to Steam**, **Prepare Madeira Dock** (Valve's client
-components, about 73 MB, only when Dock is available), done. Every step has
-**Set up later**, and the welcome page has **Skip setup**. Finishing or
-skipping stores `madeiraOnboardingDone` in the app's UserDefaults, which iOS
-removes with the app. Setup opens only when there is something to set up: the
-sign-in page needs Steam sign-in or Dock, and without either setup never
-opens. It never opens over a running session.
+once: welcome, **Set up JIT**, **Sign in to Steam**, **Prepare Madeira Dock**
+(Valve's client components, about 73 MB, only when Dock is available), done.
+The JIT page offers **Upload Pairing File**, **Use StikDebug**, or **I'll do
+this later**. A valid pairing-file import selects Built-in StikJIT; it does not
+enable JIT yet. Steam and Dock steps have **Set up later**, and the welcome
+page has **Skip setup**. Finishing or skipping stores
+`madeiraOnboardingDone` in the app's UserDefaults, which iOS removes with the
+app. The JIT page is always available; Steam pages follow their feature
+switches. Setup never opens over a running session.
 
-Setup is app UI only. It starts no Wine session, and the component download
-runs Dock's own verified download without Wine. It changes no JIT pool, engine
-switch or configuration default.
+Setup starts no Wine session and allocates no JIT pool. It stores the selected
+JIT method and may copy a validated pairing file to
+`Documents/StikJIT/pairingFile.plist`; the component download runs Dock's own
+verified download without Wine. It changes no engine switch or launch
+configuration.
 
-**Settings › Steam** shows the signed-in account with **Sign out of Steam**
+**Settings › JIT** and **Settings › Steam** both show **Run setup again**.
+Settings › Steam also shows the signed-in account with **Sign out of Steam**
 (or **Sign in to Steam**), **Madeira Dock** (Dock's sheet, with the last Dock
-result under it) and **Run setup again**. A game started from the Dock sheet
-here runs as a library session: full-screen view, starting screen, in-game
-menu, and the one-session-per-run rule. That session is not added to the
-library.
+result under it). A game started from the Dock sheet here runs as a library
+session: full-screen view, starting screen, in-game menu, and the
+one-session-per-run rule. That session is not added to the library.
 
 **Steam games in the library** (`app/Madeira/SteamGames.swift`). When Madeira
 Dock is available, the library shows a **Steam** section above **Other
@@ -245,7 +251,7 @@ menu owns input, the game sees a connected pad at rest.
 | `MADEIRA_SESSION_TOOLS` | on | no Aspect & scaling in the in-game menu, and a session does not save it |
 | `MADEIRA_SCREEN_SHAPE_RESOLUTION` | on | no Screen shape resolution choice |
 | `MADEIRA_FRONTEND_KEYBOARD` | on | Keyboard opens the game view's own keyboard instead of the key window |
-| `MADEIRA_ONBOARDING` | on | first-run setup never opens, and Settings › Steam has no **Run setup again** |
+| `MADEIRA_ONBOARDING` | on | first-run setup never opens, and Settings › JIT/Steam have no **Run setup again** |
 | `MADEIRA_LIBRARY_COLLAPSE` | on | the **Steam** and **Other games** titles do not collapse (**Not installed** still folds) |
 | `MADEIRA_LIBRARY_AMBIENT` | on | no ambient light around the library's grid cards |
 
@@ -268,10 +274,10 @@ math, controller commands, the exit hook, and the presence of the details and
 in-game menu options), `tests/host/check-runtime-settings.py`
 (`MadeiraConfig.set` and the Settings defaults) and
 `tests/host/check-library-api.py` (renderer detection and the badge).
-`tests/host/check-onboarding.py` covers Steam setup: the pages with and
-without Dock, the done key, the `MADEIRA_ONBOARDING` switch, and the wiring
-(no Wine session, no pool or engine switch, sign-in and Dock only through
-their public pieces).
+`tests/host/check-onboarding.py` covers first-run setup: the JIT choices,
+pairing import, pages with and without Dock, the done key, the
+`MADEIRA_ONBOARDING` switch, and the wiring (no Wine session, no pool or
+engine switch; JIT, sign-in and Dock through their public pieces).
 `tests/host/check-steam-games.py` covers the library's Steam section: Dock's
 discovery on a synthetic drive_c laid out as Steam writes it, the merge of
 installed and owned games, the section, status, card pill, search, Play and

@@ -75,6 +75,15 @@
 		A1000033 /* wine_stubs.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000034 /* wine_stubs.c */; };
 		A1000034 /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000035 /* IOKit.framework */; };
 		A1000035 /* StikJITHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000036 /* StikJITHelper.swift */; };
+		B1000001 /* JITSetup.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000001 /* JITSetup.swift */; };
+		B1000002 /* JITBuiltInHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000002 /* JITBuiltInHost.swift */; };
+		B1000003 /* JITBuiltInMessages.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000003 /* JITBuiltInMessages.swift */; };
+		B1000004 /* madeira-jit.js in Resources */ = {isa = PBXBuildFile; fileRef = B2000004 /* madeira-jit.js */; };
+		B1000005 /* ExtensionFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B2000010 /* ExtensionFoundation.framework */; settings = {ATTRIBUTES = (Weak, ); }; };
+		B1000010 /* MadeiraJITHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000020 /* MadeiraJITHelper.swift */; };
+		B1000011 /* JITBuiltInMessages.swift in Helper Sources */ = {isa = PBXBuildFile; fileRef = B2000003 /* JITBuiltInMessages.swift */; };
+		B1000014 /* ExtensionFoundation.framework in Helper Frameworks */ = {isa = PBXBuildFile; fileRef = B2000010 /* ExtensionFoundation.framework */; };
+		B1000016 /* MadeiraJITHelper.appex in Embed JIT Helper */ = {isa = PBXBuildFile; fileRef = B2000022 /* MadeiraJITHelper.appex */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		A1000040 /* prefix-template.tar.gz in Resources */ = {isa = PBXBuildFile; fileRef = A2000040 /* prefix-template.tar.gz */; };
 		A1000041 /* PrefixExtractor.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000041 /* PrefixExtractor.c */; };
 		A1000042 /* libz.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000042 /* libz.tbd */; };
@@ -119,6 +128,40 @@
 		A1000245 /* TouchGamepad.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000245 /* TouchGamepad.swift */; };
 		A1000246 /* TouchControlPresets.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000246 /* TouchControlPresets.swift */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		B3000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A6000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = B5000001;
+			remoteInfo = MadeiraJITHelper;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		B3000002 /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B3000003 /* Embed JIT Helper */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = Extensions;
+			dstSubfolderSpec = 1;
+			files = (
+				B1000016 /* MadeiraJITHelper.appex in Embed JIT Helper */,
+			);
+			name = "Embed JIT Helper";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		A2000520 /* MadeiraDock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MadeiraDock.swift"; sourceTree = "<group>"; };
@@ -200,6 +243,15 @@
 		A2000034 /* wine_stubs.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wine_stubs.c; sourceTree = "<group>"; };
 		A2000035 /* IOKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOKit.framework; path = System/Library/Frameworks/IOKit.framework; sourceTree = SDKROOT; };
 		A2000036 /* StikJITHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StikJITHelper.swift; sourceTree = "<group>"; };
+		B2000001 /* JITSetup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JITSetup.swift; sourceTree = "<group>"; };
+		B2000002 /* JITBuiltInHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JITBuiltInHost.swift; sourceTree = "<group>"; };
+		B2000003 /* JITBuiltInMessages.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JITBuiltInMessages.swift; sourceTree = "<group>"; };
+		B2000004 /* madeira-jit.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = "madeira-jit.js"; sourceTree = "<group>"; };
+		B2000010 /* ExtensionFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ExtensionFoundation.framework; path = System/Library/Frameworks/ExtensionFoundation.framework; sourceTree = SDKROOT; };
+		B2000020 /* MadeiraJITHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MadeiraJITHelper.swift; sourceTree = "<group>"; };
+		B2000021 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		B2000022 /* MadeiraJITHelper.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.extensionkit-extension"; includeInIndex = 0; path = MadeiraJITHelper.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		B2000030 /* StikJIT.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = Frameworks/StikJIT.xcframework; sourceTree = SOURCE_ROOT; };
 		A2000040 /* prefix-template.tar.gz */ = {isa = PBXFileReference; lastKnownFileType = archive.gzip; path = "prefix-template.tar.gz"; sourceTree = "<group>"; };
 		A2000041 /* PrefixExtractor.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = PrefixExtractor.c; sourceTree = "<group>"; };
 		A2000042 /* libz.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libz.tbd; path = usr/lib/libz.tbd; sourceTree = SDKROOT; };
@@ -285,6 +337,15 @@
 				A1000306 /* libavcodec.a in Frameworks */,
 				A1000307 /* libswresample.a in Frameworks */,
 				A1000308 /* libavutil.a in Frameworks */,
+				B1000005 /* ExtensionFoundation.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B3000004 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B1000014 /* ExtensionFoundation.framework in Helper Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -295,6 +356,7 @@
 			isa = PBXGroup;
 			children = (
 				A4000002 /* Madeira */,
+				B4000001 /* MadeiraJITHelper */,
 				A4000004 /* Libraries */,
 				A4000003 /* Products */,
 			);
@@ -375,6 +437,10 @@
 				A2000031 /* WineProcessBridge.h */,
 				A200000A /* EntitlementChecker.swift */,
 				A2000036 /* StikJITHelper.swift */,
+				B2000001 /* JITSetup.swift */,
+				B2000002 /* JITBuiltInHost.swift */,
+				B2000003 /* JITBuiltInMessages.swift */,
+				B2000004 /* madeira-jit.js */,
 				A2000021 /* nls */,
 				A2000033 /* aarch64-windows */,
 				A20000F1 /* legal */,
@@ -403,6 +469,7 @@
 			isa = PBXGroup;
 			children = (
 				A2000009 /* Madeira.app */,
+				B2000022 /* MadeiraJITHelper.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -442,8 +509,19 @@
 				A2000306 /* libavcodec.a */,
 				A2000307 /* libswresample.a */,
 				A2000308 /* libavutil.a */,
+				B2000010 /* ExtensionFoundation.framework */,
+				B2000030 /* StikJIT.xcframework */,
 			);
 			name = Libraries;
+			sourceTree = "<group>";
+		};
+		B4000001 /* MadeiraJITHelper */ = {
+			isa = PBXGroup;
+			children = (
+				B2000020 /* MadeiraJITHelper.swift */,
+				B2000021 /* Info.plist */,
+			);
+			path = MadeiraJITHelper;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -456,16 +534,36 @@
 				A3000002 /* Sources */,
 				A3000001 /* Frameworks */,
 				A3000003 /* Resources */,
+				B3000003 /* Embed JIT Helper */,
 				A30000D1 /* Sign bundled dylibs */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				B3000006 /* PBXTargetDependency */,
 			);
 			name = Madeira;
 			productName = Madeira;
 			productReference = A2000009 /* Madeira.app */;
 			productType = "com.apple.product-type.application";
+		};
+		B5000001 /* MadeiraJITHelper */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B7000001 /* Build configuration list for PBXNativeTarget "MadeiraJITHelper" */;
+			buildPhases = (
+				B3000005 /* Sources */,
+				B3000004 /* Frameworks */,
+				B3000002 /* Embed Frameworks */,
+				B3000007 /* Embed StikJIT */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = MadeiraJITHelper;
+			productName = MadeiraJITHelper;
+			productReference = B2000022 /* MadeiraJITHelper.appex */;
+			productType = "com.apple.product-type.extensionkit-extension";
 		};
 /* End PBXNativeTarget section */
 
@@ -479,6 +577,11 @@
 				TargetAttributes = {
 					A5000001 = {
 						CreatedOnToolsVersion = 16.0;
+					};
+					B5000001 = {
+						CreatedOnToolsVersion = 27.0;
+						DevelopmentTeam = V8NU3FX3TL;
+						ProvisioningStyle = Automatic;
 					};
 				};
 			};
@@ -496,6 +599,7 @@
 			projectRoot = "";
 			targets = (
 				A5000001 /* Madeira */,
+				B5000001 /* MadeiraJITHelper */,
 			);
 		};
 /* End PBXProject section */
@@ -516,6 +620,7 @@
 				A1000040 /* prefix-template.tar.gz in Resources */,
 				A1000094 /* cacert.pem in Resources */,
 				A1000910 /* Assets.xcassets in Resources */,
+				B1000004 /* madeira-jit.js in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -536,6 +641,21 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "# Licence texts bundled with the converter must match their sources (staged by\n# build/madeira-d3d12/fetch-converter.sh); stale copies fail the build.\nfor pair in COPYING:LICENSE-MADEIRA-GPL-3.0.txt LICENSE-EXCEPTION.md:LICENSE-MADEIRA-EXCEPTION.txt; do\n  src=\"$SRCROOT/../${pair%%:*}\"; dst=\"$CODESIGNING_FOLDER_PATH/licenses/${pair##*:}\"\n  if [ ! -f \"$dst\" ] || ! cmp -s \"$src\" \"$dst\"; then echo \"error: bundled ${pair##*:} is missing or stale; run build/stage-licenses.sh\"; exit 1; fi\ndone\n# A loose dylib copied as a resource is sealed by the bundle\n# signature but is not itself re-signed, and dyld will not load code\n# whose own signature does not match. Sign it with whatever identity\n# this configuration resolved to, rather than hardcoding one.\nDYLIB=\"$CODESIGNING_FOLDER_PATH/d3d12/libmetalirconverter.dylib\"\n[ -f \"$DYLIB\" ] || exit 0\nif [ -n \"$EXPANDED_CODE_SIGN_IDENTITY\" ] && [ \"$CODE_SIGNING_ALLOWED\" != \"NO\" ]; then\n  codesign --force --sign \"$EXPANDED_CODE_SIGN_IDENTITY\" --timestamp=none \"$DYLIB\"\nelse\n  codesign --force --sign - \"$DYLIB\"\nfi\n";
+		};
+		B3000007 /* Embed StikJIT */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+			);
+			name = "Embed StikJIT";
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -e\n[ \"$PLATFORM_NAME\" = iphoneos ] || exit 0\nSRC=\"$SRCROOT/Frameworks/StikJIT.xcframework/ios-arm64/StikJIT.framework\"\nDST=\"$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH/StikJIT.framework\"\nrm -rf \"$DST\"\nmkdir -p \"$(dirname \"$DST\")\"\nditto \"$SRC\" \"$DST\"\nif [ -n \"$EXPANDED_CODE_SIGN_IDENTITY\" ] && [ \"$CODE_SIGNING_ALLOWED\" != \"NO\" ]; then\n  codesign --force --sign \"$EXPANDED_CODE_SIGN_IDENTITY\" --timestamp=none \"$DST\"\nfi\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -612,10 +732,30 @@
 				A1000050 /* IOSDisplayShim.m in Sources */,
 				A1000070 /* Winios/Winios.m in Sources */,
 				A1000035 /* StikJITHelper.swift in Sources */,
+				B1000001 /* JITSetup.swift in Sources */,
+				B1000002 /* JITBuiltInHost.swift in Sources */,
+				B1000003 /* JITBuiltInMessages.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B3000005 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B1000010 /* MadeiraJITHelper.swift in Sources */,
+				B1000011 /* JITBuiltInMessages.swift in Helper Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		B3000006 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = B5000001 /* MadeiraJITHelper */;
+			targetProxy = B3000001 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		A8000001 /* Debug */ = {
@@ -688,6 +828,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = V8NU3FX3TL;
+				EX_ENABLE_EXTENSION_POINT_GENERATION = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
@@ -739,6 +880,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = V8NU3FX3TL;
+				EX_ENABLE_EXTENSION_POINT_GENERATION = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
@@ -781,6 +923,71 @@
 			};
 			name = Release;
 		};
+		B8000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 2;
+				DEVELOPMENT_TEAM = V8NU3FX3TL;
+				EX_ENABLE_EXTENSION_POINT_GENERATION = YES;
+				"FRAMEWORK_SEARCH_PATHS[sdk=iphoneos*]" = "$(SRCROOT)/Frameworks/StikJIT.xcframework/ios-arm64";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = MadeiraJITHelper/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.1;
+				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"-framework",
+					StikJIT,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.willfaust.madeora.JITHelper;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = NO;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		B8000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 2;
+				DEVELOPMENT_TEAM = V8NU3FX3TL;
+				EX_ENABLE_EXTENSION_POINT_GENERATION = YES;
+				"FRAMEWORK_SEARCH_PATHS[sdk=iphoneos*]" = "$(SRCROOT)/Frameworks/StikJIT.xcframework/ios-arm64";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = MadeiraJITHelper/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.1;
+				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"-framework",
+					StikJIT,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.willfaust.madeora.JITHelper;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = NO;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -798,6 +1005,15 @@
 			buildConfigurations = (
 				A8000003 /* Debug */,
 				A8000004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		B7000001 /* Build configuration list for PBXNativeTarget "MadeiraJITHelper" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B8000001 /* Debug */,
+				B8000002 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

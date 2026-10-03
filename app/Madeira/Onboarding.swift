@@ -4,18 +4,21 @@
 
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
-// First-run setup and Settings › Steam for the library (docs/LIBRARY.md,
-// "Steam setup"). On a new install (no `madeiraOnboardingDone` in UserDefaults,
-// which iOS removes with the app) the library opens a full-screen setup:
-// welcome, Steam sign-in, Valve's client components for Madeira Dock (only when
-// Dock is available), done. Every step can be skipped. Settings › Steam ›
-// "Run setup again" reopens it. env.MADEIRA_ONBOARDING = 0 never opens it.
+// First-run setup for JIT, Steam sign-in and Madeira Dock (docs/LIBRARY.md).
+// On a new install (no `madeiraOnboardingDone` in UserDefaults, which iOS
+// removes with the app) the library opens a full-screen setup: welcome, JIT,
+// Steam sign-in, Valve's client components for Madeira Dock (only when Dock is
+// available), done. Every step can be skipped. Settings › JIT or Settings ›
+// Steam can reopen it. env.MADEIRA_ONBOARDING = 0 never opens it.
 //
-// Setup is app UI only: sign-in goes through SteamSignIn (the token stays in its
-// Keychain store) and the components through MadeiraDockModel.prepareClient(),
-// which downloads and verifies files without starting Wine. Setup starts no Wine
-// session and changes no JIT pool, engine switch or configuration default.
+// JIT setup stores only the chosen method and, when selected, imports the
+// pairing file through JITCoordinator. Sign-in goes through SteamSignIn (the
+// token stays in its Keychain store) and the components through
+// MadeiraDockModel.prepareClient(), which downloads and verifies files without
+// starting Wine. Setup starts no Wine session and changes no JIT pool, engine
+// switch or launch configuration.
 // Log tag: [onboarding] (no account names, tokens or paths).
 
 // MARK: - Rules (Foundation and MadeiraConfig only; tests/host/check-onboarding.py compiles this part)
@@ -27,20 +30,24 @@ enum OnboardingRules {
     /// setup and hides "Run setup again". On by default.
     static var enabled: Bool { MadeiraConfig.flag("MADEIRA_ONBOARDING") }
 
-    enum Step: String, CaseIterable { case welcome, signIn = "sign-in", dockClient = "dock-client", done }
+    enum Step: String, CaseIterable {
+        case welcome, jit, signIn = "sign-in", dockClient = "dock-client", done
+    }
 
-    /// The setup's pages. Sign-in is offered when Steam sign-in is enabled, or
-    /// when Madeira Dock is available (Dock needs a sign-in). Valve's client
+    /// JIT is always offered. Sign-in is offered when Steam sign-in is enabled,
+    /// or when Madeira Dock is available (Dock needs a sign-in). Valve's client
     /// components are offered only when Dock is available.
     static func steps(signIn: Bool, dock: Bool) -> [Step] {
-        var list: [Step] = [.welcome]
+        var list: [Step] = [.welcome, .jit]
         if signIn || dock { list.append(.signIn) }
         if dock { list.append(.dockClient) }
         return list + [.done]
     }
 
     /// Whether there is anything to set up between the welcome and done pages.
-    static func hasSetup(_ steps: [Step]) -> Bool { steps.contains(.signIn) || steps.contains(.dockClient) }
+    static func hasSetup(_ steps: [Step]) -> Bool {
+        steps.contains(.jit) || steps.contains(.signIn) || steps.contains(.dockClient)
+    }
 
     /// Whether setup opens by itself when the library appears.
     static func shouldShow(done: Bool, enabled: Bool, steps: [Step]) -> Bool {
@@ -133,9 +140,12 @@ enum OnboardingRules {
 
 struct OnboardingView: View {
     @ObservedObject private var model = OnboardingModel.shared
+    @ObservedObject private var jit = JITCoordinator.shared
     @ObservedObject private var signIn = SteamSignInModel.shared
     @ObservedObject private var dock = MadeiraDockModel.shared
     @State private var showSignIn = false
+    @State private var importingPairingFile = false
+    @State private var pairingImportError: String?
 
     var body: some View {
         NavigationStack {
@@ -147,6 +157,7 @@ struct OnboardingView: View {
                     }
                     switch model.step {
                     case .welcome: welcome
+                    case .jit: jitPage
                     case .signIn: signInPage
                     case .dockClient: dockClientPage
                     case .done: donePage
@@ -158,7 +169,26 @@ struct OnboardingView: View {
         }
         .interactiveDismissDisabled()
         .sheet(isPresented: $showSignIn) { SteamSignInView() }
-        .onAppear { signIn.refresh(); dock.refresh() }
+        .fileImporter(isPresented: $importingPairingFile,
+                      allowedContentTypes: [.propertyList, .data]) { result in
+            switch result {
+            case .success(let url):
+                jit.importPairingFile(url)
+                if jit.pairingImported {
+                    jit.method = .builtIn
+                    pairingImportError = nil
+                    LogStore.shared.log("[onboarding] JIT method=built-in pairing=imported")
+                }
+            case .failure(let failure):
+                pairingImportError = failure.localizedDescription
+                LogStore.shared.log("[onboarding] pairing import failed")
+            }
+        }
+        .onAppear {
+            jit.refreshPairingStatus()
+            signIn.refresh()
+            dock.refresh()
+        }
     }
 
     private func header(_ title: String, symbol: String) -> some View {
@@ -196,12 +226,53 @@ struct OnboardingView: View {
                 .font(.title3)
             Text("A few optional steps get you ready:").foregroundStyle(.secondary)
             let pages = model.steps
-            if pages.contains(.signIn) { point(1, "Sign in to Steam in Madeira.") }
+            point(1, "Choose how Madeira enables JIT.")
+            if pages.contains(.signIn) { point(2, "Sign in to Steam in Madeira.") }
             if pages.contains(.dockClient) {
-                point(2, "Download Valve's Steam client components for Madeira Dock.")
+                point(3, "Download Valve's Steam client components for Madeira Dock.")
             }
             primary("Get started", symbol: "arrow.right") { model.next() }.padding(.top, 8)
             secondary("Skip setup") { model.skip() }
+        }
+    }
+
+    private var jitPage: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            header("Set up JIT", symbol: "bolt.fill")
+            Text("JIT lets Madeira create executable memory for Windows games. Built-in StikJIT keeps the setup inside Madeira and needs this iPhone's pairing file.")
+            VStack(alignment: .leading, spacing: 10) {
+                Label("The pairing file stays in Madeira's Documents folder.", systemImage: "lock.fill")
+                Label("LocalDevVPN must be connected when you enable JIT.", systemImage: "network")
+            }.font(.subheadline).foregroundStyle(.secondary)
+
+            if jit.pairingImported {
+                Label("Pairing file imported", systemImage: "checkmark.circle.fill")
+                    .font(.headline).foregroundStyle(.green)
+                primary("Continue with Built-in JIT", symbol: "arrow.right") {
+                    jit.method = .builtIn
+                    LogStore.shared.log("[onboarding] JIT method=built-in")
+                    model.next()
+                }
+                secondary("Choose another pairing file") {
+                    pairingImportError = nil
+                    importingPairingFile = true
+                }
+            } else {
+                primary("Upload Pairing File", symbol: "square.and.arrow.up") {
+                    pairingImportError = nil
+                    importingPairingFile = true
+                }
+            }
+
+            if let error = pairingImportError ?? jit.error {
+                Label(error, systemImage: "exclamationmark.circle.fill").foregroundStyle(.red)
+            }
+            secondary("Use StikDebug") {
+                jit.method = .stikDebug
+                LogStore.shared.log("[onboarding] JIT method=StikDebug")
+                model.next()
+            }
+            secondary("I'll do this later") { model.next() }
         }
     }
 
@@ -260,10 +331,11 @@ struct OnboardingView: View {
     private var donePage: some View {
         VStack(alignment: .leading, spacing: 18) {
             header("You're all set", symbol: "checkmark.seal.fill")
+            Text("You can change the JIT method or import a pairing file from Settings › JIT.")
             if model.steps.contains(.dockClient) {
                 Text("Settings › Steam › Madeira Dock lists the Steam games installed in Madeira's drive_c and starts them.")
             }
-            Text("You can run this setup again from Settings › Steam.").foregroundStyle(.secondary)
+            Text("You can run this setup again from Settings › JIT or Settings › Steam.").foregroundStyle(.secondary)
             primary("Go to your library", symbol: "square.grid.2x2.fill") { model.finish() }
         }
     }

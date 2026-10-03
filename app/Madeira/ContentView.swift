@@ -1178,6 +1178,7 @@ struct ContentView: View {
     }
     @State private var devSheet: SettingsSheet?
     @StateObject private var logStore = LogStore.shared
+    @StateObject private var jitCoordinator = JITCoordinator.shared
     @State private var jitStatus: JITStatus = .unknown
     @State private var entitlements: EntitlementStatus?
     @State private var debuggerAttached = isDebuggerAttached()
@@ -1214,7 +1215,7 @@ struct ContentView: View {
                 if library.enabled && library.current != nil {
                     sessionBody
                 } else if library.enabled {
-                    LibraryView(play: launchLibraryEntry, enableJIT: enableJITViaStikDebug,
+                    LibraryView(play: launchLibraryEntry, enableJIT: enableJIT,
                                 startDock: { startDock($0, compactPool: $1) })
                 } else if vSizeClass == .compact {
                     landscapeBody
@@ -1247,9 +1248,10 @@ struct ContentView: View {
             // CS_DEBUGGED without a debugger (JIT enabled outside Madeira): offer Madeira's own request.
             .alert("Enable JIT", isPresented: Binding(get: { library.jitNotice != nil },
                                                       set: { if !$0 { library.jitNotice = nil } })) {
-                Button("Enable JIT") { library.jitNotice = nil; enableJITViaStikDebug() }
+                Button("Enable JIT") { library.jitNotice = nil; enableJIT() }
                 Button("Later", role: .cancel) { library.jitNotice = nil }
             } message: { Text(library.jitNotice ?? "") }
+            .sheet(isPresented: $jitCoordinator.showSetup) { JITSetupView() }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
                 library.refreshFlag()
                 if library.enabled && library.current == nil { MetalHostView.shared.isHidden = true }
@@ -1552,7 +1554,7 @@ struct ContentView: View {
                 Button("All settings") { devSheet = .allSettings }
                     .buttonStyle(.bordered)
                 Button("Enable JIT") {
-                    enableJITViaStikDebug()
+                    enableJIT()
                 }
                 .buttonStyle(.borderedProminent)
 
@@ -2232,7 +2234,7 @@ struct ContentView: View {
         }
     }
 
-    private func enableJITViaStikDebug() {
+    private func enableJIT() {
         // Explains why JIT cannot be enabled on a copy signed without get-task-allow; 0 opens StikDebug regardless.
         // A debugger can attach only to a process whose signature carries
         // get-task-allow (a development signature). A copy signed with a
@@ -2247,15 +2249,22 @@ struct ContentView: View {
             return
         }
         jitStatus = .testing
-        logStore.log("Requesting JIT via StikDebug URL scheme...")
+        logStore.log("Requesting JIT with \(jitCoordinator.resolvedMethod.title)...")
 
-        StikJITHelper.enableJIT { success in
-            if success {
+        jitCoordinator.enable { result in
+            switch result {
+            case .success:
                 jitStatus = .available
                 logStore.log("JIT enabled! Debugger attached.", level: .success)
-            } else {
+            case .failure(let failure):
+                if let coordinatorError = failure as? JITCoordinator.CoordinatorError,
+                   case .setupRequired = coordinatorError {
+                    jitStatus = .unknown
+                    return
+                }
                 jitStatus = .unavailable
-                logStore.log("Failed to enable JIT via StikDebug", level: .error)
+                logStore.log("Failed to enable JIT: \(failure.localizedDescription)", level: .error)
+                if library.enabled { library.error = failure.localizedDescription }
             }
         }
     }
