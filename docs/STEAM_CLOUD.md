@@ -6,9 +6,9 @@ library and downloads use, `docs/STEAM_LIBRARY.md`), which is closed
 while a game session holds the account: saves sync before and after a
 session, and during one only on the game menu's upload button.
 
-It is off until turned on in **Settings › Steam Cloud saves**, which keeps
-`env.MADEIRA_STEAM_CLOUD = 1` in `madeira.cfg`; turning it on syncs the
-installed games at once.
+It is on by default. **Settings › Steam Cloud saves** turns it off, which
+keeps `env.MADEIRA_STEAM_CLOUD = 0` in `madeira.cfg`; turning it back on
+syncs the installed games at once.
 `env.MADEIRA_STEAM_CLOUD_AUTO = 0` keeps the comparison and the game page
 but copies nothing in either direction unless the user asks there.
 
@@ -40,11 +40,13 @@ Play checks the game's cloud state first (`env.MADEIRA_STEAM_CLOUD_PLAY_CHECK = 
 turns this off):
 
 - In sync, checked in the last 10 minutes: the game starts.
-- Checked longer ago: the saves are synced again, then the game starts.
+- Not checked yet in this app run (Play pressed before the start-up sync got
+  to the game), or checked longer ago: the saves are synced first, then the
+  game starts.
 - A check or transfer is running: an alert offers **Wait and sync** (the game
   starts when it finishes) or **Launch anyway**.
-- The check failed or has not run (no network, for example): **Try again**
-  or **Launch anyway**.
+- The check failed (no network, for example): **Try again** or **Launch
+  anyway**.
 - Saves wait for a choice: **Choose** opens the game's page, or **Launch
   anyway**.
 

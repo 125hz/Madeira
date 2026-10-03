@@ -2303,10 +2303,11 @@ struct LibraryDetail: View {
                     Button("Choose cover image", systemImage: "photo") { importCover = true }
                     if entry.coverFile != nil { Button((entry.steamAppID ?? entry.steamID) != nil ? "Use Steam artwork" : "Remove cover image") { entry.coverFile = nil } }
                 } }
-                // How a Steam game starts sits under its library details (SteamGames.swift).
-                if entry.steamAppID != nil {
+                // A Steam game's cloud saves, then how it starts, under its library
+                // details (SteamGames.swift).
+                if let appID = entry.steamAppID {
+                    SteamCloudSection(appID: appID)
                     SteamEntrySection(entry: $entry) { leaving = true; dismiss() }
-                    if let appID = entry.steamAppID { SteamCloudSection(appID: appID) }
                 }
                 Section("Display") {
                     // The Windows screen the game renders for (and the Desktop's size).

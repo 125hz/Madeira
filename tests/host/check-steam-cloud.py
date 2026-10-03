@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Steam Cloud sync decisions (app/Madeira/SteamCloud.swift SteamCloudPlan); no Steam runs.
-Compiles the production SteamCloudEntry and SteamCloudPlan and checks what each comparison
-leads to against the record of the last sync: one-sided changes are copied, two-sided ones
-wait for a choice, and a save synced before that is now missing on this device is a choice
-whose mark keeps a new save of that name from going up over the cloud's copy unasked (the
-reset-prefix case), and runs the production comparison (SteamCloudPaths, SteamCloudAudit) over a
-synthetic prefix: a save folder named with {64BitSteamID} gets a cloud name with the ID filled in,
-the name the cloud lists for that file. Source checks: Steam Cloud is off unless turned on, every upload that
-replaces a cloud file backs up the cloud's copy first, and backups are in Documents.
+"""Steam Cloud sync decisions (app/Madeira/SteamCloud.swift SteamCloudPlan); no Steam runs. Compiles
+the production SteamCloudEntry and SteamCloudPlan and checks what each comparison leads to against
+the record of the last sync: one-sided changes are copied, two-sided ones wait for a choice, and a
+save synced before that is now missing on this device is a choice whose mark keeps a new save of
+that name from going up over the cloud's copy unasked (the reset-prefix case), and runs the
+production comparison (SteamCloudPaths, SteamCloudAudit) over a synthetic prefix: a save folder
+named with {64BitSteamID} gets a cloud name with the ID filled in, the name the cloud lists for
+that file. Source checks: Steam Cloud is on unless turned off, a game not checked yet syncs before
+Play, every upload that replaces a cloud file backs up the cloud's copy first, and backups are in
+Documents.
 """
 from pathlib import Path
 import os, shutil, subprocess, sys, tempfile
@@ -31,8 +32,10 @@ compare = cloud[cloud.index('// MARK: - Where a cloud path lives in the Wine pre
 plan = cloud[cloud.index('// MARK: - What to do with a comparison'):cloud.index('// MARK: - Upload')]
 
 # ------------------------------------------------------------------ static
-require('SteamSignIn.flag("MADEIRA_STEAM_CLOUD", default: false)' in owned,
-        'Steam Cloud is off unless turned on (env.MADEIRA_STEAM_CLOUD = 1)')
+require('SteamSignIn.flag("MADEIRA_STEAM_CLOUD", default: true)' in owned,
+        'Steam Cloud is on unless turned off (env.MADEIRA_STEAM_CLOUD = 0)')
+require('guard let state = cloud[appID] else { return .stale }' in owned,
+        'Play on a game not checked yet in this app run syncs it first, without asking')
 upload = owned[owned.index('private func upload(_ appID: Int'):owned.index('// MARK: Before Play')]
 require(upload.index('cloudFile(appID, entry)') < upload.index('.cloudBeginAppUploadBatch'),
         "an upload fetches the cloud's copy of every file it replaces before the batch opens")

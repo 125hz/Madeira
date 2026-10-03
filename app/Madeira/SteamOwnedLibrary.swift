@@ -390,9 +390,9 @@ final class SteamOwnedLibrary: ObservableObject {
 
     // MARK: Steam Cloud (docs/STEAM_CLOUD.md)
 
-    /// Steam Cloud is opt-in: Settings › Steam › Steam Cloud saves, kept in madeira.cfg
-    /// as `env.MADEIRA_STEAM_CLOUD = 1` (SteamCloudSetting). Off: no checks, no section.
-    static var cloudEnabled: Bool { enabled && SteamSignIn.flag("MADEIRA_STEAM_CLOUD", default: false) }
+    /// Steam Cloud is on unless Settings › Steam Cloud saves turns it off, kept in
+    /// madeira.cfg as `env.MADEIRA_STEAM_CLOUD = 0` (SteamCloudSetting). Off: no checks, no section.
+    static var cloudEnabled: Bool { enabled && SteamSignIn.flag("MADEIRA_STEAM_CLOUD", default: true) }
     /// `env.MADEIRA_STEAM_CLOUD_AUTO = 0`: compare only; nothing is copied
     /// either way without the user asking on the game's page.
     static var cloudAutomatic: Bool { SteamSignIn.flag("MADEIRA_STEAM_CLOUD_AUTO", default: true) }
@@ -737,9 +737,11 @@ final class SteamOwnedLibrary: ObservableObject {
     enum CloudHold: Equatable {
         /// A check or a transfer is running.
         case syncing
-        /// The last check is older than `cloudFresh`: checked again before the start, without asking.
+        /// Not checked in this app run yet (Play pressed before the start-up sync got
+        /// to it), or the last check is older than `cloudFresh`: checked before the
+        /// start, without asking.
         case stale
-        /// Never checked in this app run, or the check or a transfer failed (why).
+        /// The check or a transfer failed (why).
         case unchecked(String?)
         /// Saves that need the user's choice (count).
         case conflict(Int)
@@ -752,7 +754,7 @@ final class SteamOwnedLibrary: ObservableObject {
     func cloudHold(_ appID: Int) -> CloudHold? {
         guard Self.cloudPlayCheck, signedIn, !inSession else { return nil }
         if cloudBusy.contains(appID) { return .syncing }
-        guard let state = cloud[appID] else { return .unchecked(nil) }
+        guard let state = cloud[appID] else { return .stale }
         switch state.phase {
         case .checking, .downloading, .uploading: return .syncing
         // No prefix yet (first start): there is nothing to compare with.

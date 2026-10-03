@@ -1022,14 +1022,14 @@ struct SteamCloudQuitRow: View {
 }
 
 /// Whether Steam Cloud saves sync: Settings › Steam Cloud saves, kept in madeira.cfg as
-/// env.MADEIRA_STEAM_CLOUD (off unless it is 1; docs/STEAM_CLOUD.md). Turning it on
+/// env.MADEIRA_STEAM_CLOUD (on unless it is 0; docs/STEAM_CLOUD.md). Turning it back on
 /// syncs the installed games at once.
 @MainActor final class SteamCloudSetting: ObservableObject {
     static let shared = SteamCloudSetting()
-    @Published var on = SteamSignIn.flag("MADEIRA_STEAM_CLOUD", default: false) {
+    @Published var on = SteamSignIn.flag("MADEIRA_STEAM_CLOUD", default: true) {
         didSet {
             guard on != oldValue else { return }
-            MadeiraConfig.set("env.MADEIRA_STEAM_CLOUD", on ? "1" : nil)
+            MadeiraConfig.set("env.MADEIRA_STEAM_CLOUD", on ? nil : "0")
             SteamLog.event("[steam-cloud] setting on=\(on ? 1 : 0)")
             if on { SteamOwnedLibrary.shared.cloudTurnedOn() } else { SteamOwnedLibrary.shared.objectWillChange.send() }
         }
