@@ -52,7 +52,10 @@ OVERLAY = {
     "env.MADEIRA_FASTSYNC": {"category": "Synchronisation", "title": "Fastsync (in-process sync, default)", "kind": "choice",
                 "note": "Fastsync is the default engine: with neither this nor inproc-sync set, the app exports auto. Settings > Sync engine > Fastsync removes both keys. Never runs while madsync is on. auto arms the fast wake path on heavy event traffic, 1 from the start, cells only answers polls, 0 is off.",
                 "choices": [("", "Default (auto)"), ("auto", "Auto"), ("1", "On"), ("cells", "Poll answers only"), ("0", "Off")]},
-    "vram-mb": {"title": "Video memory budget (MB)"},
+    # Read by winemetal (the DXGI budget) and, for the opt-in D3DKMT adapter, by
+    # build/win32u-unix/d3dkmt_ios.c; keep the DXMT category and note.
+    "vram-mb": {"title": "Video memory budget (MB)", "category": "Direct3D 9/10/11 (DXMT)",
+                "note": "ml1095: madeira.cfg vram-mb = N"},
     "pool": { "category": "Memory & JIT pool","title": "JIT pool size (MB)"},
     "totalphys": { "category": "Memory & JIT pool","title": "Reported physical memory (MB)"},
     "eco": { "note": 'Runs guest threads at a lower iOS QoS class so the system favours efficiency and saves power; can cost speed. Class chosen by eco-qos.',"title": "Eco scheduling"},
@@ -99,6 +102,13 @@ OVERLAY = {
                         "that reads both APIs does not see the same pad twice.",
                 "sources": ["app/Madeira/GamepadInput.swift"]},
     "env.MADEIRA_PROMOTE": {"title": "Hold the display at its maximum rate"},
+    # The D3D12/DXGI GPU as a D3DKMT adapter (build/win32u-unix/d3dkmt_ios.c).
+    "env.MADEIRA_KMT_ADAPTER": {"category": "Windows, display & input", "title": "D3DKMT adapter for the GPU (WDDM 3.1)",
+                "kind": "bool", "default": "0",
+                "note": "1: D3DKMTEnumAdapters2 lists the GPU DXGI and D3D12 report (same LUID) and "
+                        "D3DKMTQueryAdapterInfo answers like a WDDM 3.1 driver (driver version, caps, device ids, "
+                        "memory, performance data). Off (default): no adapter is listed, as before. Read at "
+                        "session start."},
     "dxmt": {"title": "DXMT options (a=b;c=d)"},
 }
 
