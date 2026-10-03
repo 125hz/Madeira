@@ -121,9 +121,11 @@ but not while cellular data is in use.
 closed the connection instead):
 
 1. The route: which interface traffic to `10.7.0.1` would leave by, asked of the
-   kernel without sending anything. Through Wi-Fi or cellular, LocalDevVPN is not
-   routing it, and the check fails at once. A network that accepts any
-   connection (a proxy) is never asked.
+   kernel without sending anything. It must be LocalDevVPN's tunnel, whose
+   address is in `10.7.0.0/16`. Through Wi-Fi or cellular, or through another
+   VPN that carries all traffic (it accepts the connection, and the JIT helper
+   then reads "early eof"), the check fails at once, so a network or VPN that
+   accepts any connection is never asked.
 2. Through a VPN interface: a TCP connection, at most 0.4 s. Through a working
    loopback it opens in milliseconds, and JIT is enabled with nothing else
    opening; over cellular data, where the tunnel does not work, it fails.

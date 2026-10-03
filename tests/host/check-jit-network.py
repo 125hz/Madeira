@@ -91,7 +91,7 @@ LoopbackProbe.address = args[1]
 LoopbackProbe.port = UInt16(args[2])!
 let r = LoopbackProbe.check(timeout: 0.4, requireVPN: args[3] == "1")
 let route = LoopbackProbe.route()
-print("{\"reachable\": \(r.reachable), \"ms\": \(r.milliseconds), \"detail\": \"\(r.detail)\", \"interface\": \"\(route?.interface ?? "-")\", \"vpn\": \(route?.isVPN ?? false)}")
+print("{\"reachable\": \(r.reachable), \"ms\": \(r.milliseconds), \"detail\": \"\(r.detail)\", \"interface\": \"\(route?.interface ?? "-")\", \"vpn\": \(route?.isVPN ?? false), \"ldv\": [\(LoopbackProbe.Route(interface: "utun5", address: "10.7.1.1").isLocalDevVPN), \(LoopbackProbe.Route(interface: "utun5", address: "172.19.0.1").isLocalDevVPN), \(LoopbackProbe.Route(interface: "en0", address: "10.7.1.1").isLocalDevVPN)]}")
 '''
 
 
@@ -133,6 +133,9 @@ with tempfile.TemporaryDirectory() as tmp:
         refused = run('127.0.0.1', free_port(), False)
         require(not refused['reachable'] and refused['ms'] < 100,
                 'a closed port fails at once (%.1f ms, %s)' % (refused['ms'], refused['detail']))
+        require(up['ldv'] == [True, False, False],
+                "LocalDevVPN is told from another VPN by its tunnel address: utun5 10.7.1.1 is LocalDevVPN; "
+                "utun5 172.19.0.1 (a VPN carrying all traffic) and en0 are not")
         srv.close()
 
 print('\n%s' % ('ALL PASS' if failures == 0 else '%d FAILURE(S)' % failures))

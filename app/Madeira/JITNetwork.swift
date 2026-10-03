@@ -24,7 +24,10 @@ import UIKit
 ///    with an unsent UDP connect (no packets, microseconds). Not a VPN interface means
 ///    LocalDevVPN is not routing it, so a network that accepts any connection (a proxy;
 ///    the 18 Pro's Wi-Fi has one) is never asked.
-/// 2. Through a VPN interface: a TCP connection, at most `timeout`. Through a working
+///    It must also be LocalDevVPN's interface, whose address is in 10.7.0.0/16 (10.7.1.1
+///    on the 18 Pro): another VPN carrying all traffic (172.19.0.1 there) also routes
+///    10.7.0.1 and accepts the connection, but the JIT helper then reads "early eof".
+/// 2. Through LocalDevVPN: a TCP connection, at most `timeout`. Through a working
 ///    tunnel it opens in milliseconds; over cellular data, where the tunnel does not
 ///    work, it fails. Nothing is sent, and it is closed at once.
 enum LoopbackProbe {
@@ -42,6 +45,8 @@ enum LoopbackProbe {
         let address: String
         /// utun (packet tunnels such as LocalDevVPN), ipsec or ppp.
         var isVPN: Bool { ["utun", "ipsec", "ppp"].contains { interface.hasPrefix($0) } }
+        /// LocalDevVPN's own tunnel: a VPN interface whose address is in its 10.7.0.0/16.
+        var isLocalDevVPN: Bool { isVPN && address.hasPrefix("10.7.") }
     }
 
     private static func target() -> sockaddr_in? {
@@ -103,6 +108,9 @@ enum LoopbackProbe {
         }
         guard let route = route() else { return done(false, "no route") }
         if requireVPN, !route.isVPN { return done(false, "routed via \(route.interface), not a VPN") }
+        if requireVPN, !route.isLocalDevVPN {
+            return done(false, "routed via \(route.interface) \(route.address): another VPN, not LocalDevVPN")
+        }
         guard var addr = target() else { return done(false, "bad address") }
         let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
         guard fd >= 0 else { return done(false, "socket: \(String(cString: strerror(errno)))") }
@@ -145,9 +153,9 @@ enum LoopbackProbe {
         }
     }
 
-    /// LocalDevVPN (or another VPN) is connected: traffic to 10.7.0.1 leaves by a VPN
-    /// interface. Instant: no network traffic.
-    static var vpnInterfaceUp: Bool { route()?.isVPN ?? false }
+    /// LocalDevVPN is connected: traffic to 10.7.0.1 leaves by its tunnel. Instant: no
+    /// network traffic.
+    static var vpnInterfaceUp: Bool { route()?.isLocalDevVPN ?? false }
 }
 
 /// The user's "Madeira JIT" shortcut (docs/JIT.md has its steps). Input "start",
