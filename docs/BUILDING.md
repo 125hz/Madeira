@@ -55,7 +55,7 @@ git-ignored and consumed by the app project.
 4. DXMT (submodule, branch ios-port):
    - unix side: `build/dxmt-ios/build.sh` (needs `toolchains/llvm-ios-build`) -> `app/Madeira/libdxmt_combined.a` (ignored; the app links it). Verified this session.
    - PE side: `meson setup dxmt/build-arm64ec dxmt -Dbuildtype=release -Dwine_build_path=../../wine/build-arm64ec --cross-file=dxmt/build-arm64ec-win.txt` then `ninja -C dxmt/build-arm64ec src/winemetal/winemetal.dll` (and d3d11.dll) -> copied to `app/Madeira/arm64ec-windows/`. Verified this session (winemetal.dll).
-4b. On-device pairing (Built-in StikJIT on iOS 27): `build/rppairing-ios/build.sh`
+4b. In-app pairing (Built-in StikJIT on iOS 27): `build/rppairing-ios/build.sh`
    (Rust with the `aarch64-apple-ios` target; crates from crates.io at the
    versions in `build/rppairing-ios/Cargo.lock`) -> `app/Madeira/libmadeira_rppairing.a`
    (ignored; the app links it) and the bundled crate notices

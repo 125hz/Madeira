@@ -14,7 +14,7 @@ import UniformTypeIdentifiers
 // available), done. Every step can be skipped. Settings › JIT or Settings ›
 // Steam can reopen it. env.MADEIRA_ONBOARDING = 0 never opens it.
 //
-// The JIT page offers three ways in (on-device pairing on iOS 27, a pairing
+// The JIT page offers three ways in (in-app pairing on iOS 27, a pairing
 // file from a computer, StikDebug), each with its own numbered steps. It stores
 // only the chosen method and, when selected, pairs on this device through
 // OnDevicePairing or imports the pairing file through JITCoordinator.
@@ -174,7 +174,7 @@ struct OnboardingView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     enum JITSetupPath: String {
-        case onDevice = "on-device", pairingFile = "pairing-file", stikDebug = "stikdebug"
+        case onDevice = "in-app", pairingFile = "pairing-file", stikDebug = "stikdebug"
         /// After a way in is set up (iOS 27): the Madeira JIT shortcut, on its own page.
         case shortcut
     }
@@ -330,12 +330,12 @@ struct OnboardingView: View {
             header("Set up JIT", symbol: "bolt.fill")
             Text("JIT lets Madeira run Windows code. Choose how your \(device) gets it.")
             VStack(spacing: 12) {
-                jitChoice("On-device", symbol: "iphone.radiowaves.left.and.right",
+                jitChoice("In-app", symbol: "iphone.radiowaves.left.and.right",
                           detail: !OnDevicePairing.isSupported ? "Needs iOS 27 or later."
                               : pairedOnDevice ? "Paired on this \(device)."
                               : "Pair this \(device) with Madeira in Settings. No computer needed.",
                           done: pairedOnDevice, enabled: OnDevicePairing.isSupported) { choose(.onDevice) }
-                jitChoice("On-device with pairing file", symbol: "doc.badge.plus",
+                jitChoice("In-app with pairing file", symbol: "doc.badge.plus",
                           detail: fileImported ? "Pairing file imported." : "Use a pairing file made on a computer.",
                           done: fileImported) { choose(.pairingFile) }
                 jitChoice("StikDebug", symbol: "ant",
@@ -469,7 +469,7 @@ struct OnboardingView: View {
 
     private func startPairing() {
         pairingImportError = nil
-        LogStore.shared.log("[onboarding] JIT on-device pairing started")
+        LogStore.shared.log("[onboarding] JIT in-app pairing started")
         pairing.start()
     }
 

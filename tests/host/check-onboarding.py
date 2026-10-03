@@ -105,9 +105,9 @@ choices = block(view, 'private var jitChoices')
 require(all(f'case .{path}: {guide}' in jit_page for path, guide in
             [('onDevice', 'onDeviceGuide'), ('pairingFile', 'pairingFileGuide'), ('stikDebug', 'stikDebugGuide')]),
         'JIT: each of the three ways in has its own guide')
-require(all(f'jitChoice("{title}"' in choices for title in ['On-device', 'On-device with pairing file', 'StikDebug'])
+require(all(f'jitChoice("{title}"' in choices for title in ['In-app', 'In-app with pairing file', 'StikDebug'])
         and 'enabled: OnDevicePairing.isSupported' in choices,
-        'JIT: On-device (iOS 27), On-device with pairing file, StikDebug')
+        'JIT: In-app (iOS 27), In-app with pairing file, StikDebug')
 on_device = block(view, 'private var onDeviceGuide')
 require('startPairing()' in on_device and 'OnDevicePairingPanel()' in on_device
         and 'pairing.start()' in block(view, 'private func startPairing'),

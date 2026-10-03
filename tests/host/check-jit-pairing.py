@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""On-device pairing for Built-in StikJIT (iOS 27), on the host.
+"""In-app pairing for Built-in StikJIT (iOS 27), on the host.
 
 1. The C header the app imports declares exactly the functions the Rust
    library exports, and the library's own tests pass (`cargo test`, when cargo
@@ -119,9 +119,9 @@ require('$(PRODUCT_BUNDLE_IDENTIFIER).pairing.*' in plist.get('BGTaskSchedulerPe
 
 # ------------------------------------------------------------------ the three choices
 choices = block(onboarding, 'private var jitChoices')
-require(all(f'jitChoice("{title}"' in choices for title in ['On-device', 'On-device with pairing file', 'StikDebug'])
+require(all(f'jitChoice("{title}"' in choices for title in ['In-app', 'In-app with pairing file', 'StikDebug'])
         and 'enabled: OnDevicePairing.isSupported' in choices,
-        'setup: On-device (iOS 27), On-device with pairing file, StikDebug')
+        'setup: In-app (iOS 27), In-app with pairing file, StikDebug')
 require('OnDevicePairingPanel()' in block(onboarding, 'private var onDeviceGuide')
         and 'pairing.start()' in block(onboarding, 'private func startPairing'),
         'setup: the on-device guide pairs and shows its progress')

@@ -356,7 +356,7 @@ final class JITCoordinator: ObservableObject {
         try JITPairingFileStore.store(data, source: .onDevice)
         refreshPairingStatus()
         method = .builtIn
-        status = "Paired on this device."
+        status = "Paired in Madeira."
         error = nil
     }
 
@@ -587,7 +587,7 @@ struct JITSetupView: View {
 
     private var pairingLabel: String {
         switch coordinator.pairingSource {
-        case .onDevice: return "Paired on this device"
+        case .onDevice: return "Paired in Madeira"
         case .imported: return "File imported"
         case nil: return "Not set up"
         }
@@ -620,7 +620,7 @@ struct JITSetupView: View {
                     Section {
                         LabeledContent("Pairing", value: pairingLabel)
                         if OnDevicePairing.isSupported {
-                            Button(coordinator.pairingSource == .onDevice ? "Pair on this device again" : "Pair on this device") {
+                            Button(coordinator.pairingSource == .onDevice ? "Pair in Madeira again" : "Pair in Madeira") {
                                 pairing.start()
                             }
                             .disabled(pairing.active)
@@ -634,8 +634,8 @@ struct JITSetupView: View {
                         Text("Built-in StikJIT")
                     } footer: {
                         Text(OnDevicePairing.isSupported
-                             ? "Pair on this device or import a pairing file made on a computer, connect LocalDevVPN, then check setup. The pairing file stays in Madeira's Documents folder."
-                             : "Import this device's pairing file, connect LocalDevVPN, then check setup. The pairing file stays in Madeira's Documents folder. Pairing on the device itself needs iOS 27 or later.")
+                             ? "Pair in Madeira or import a pairing file made on a computer, connect LocalDevVPN, then check setup. The pairing file is kept in this device's Keychain."
+                             : "Import this device's pairing file, connect LocalDevVPN, then check setup. The pairing file is kept in this device's Keychain. Pairing in Madeira needs iOS 27 or later.")
                     }
 
                     Section {

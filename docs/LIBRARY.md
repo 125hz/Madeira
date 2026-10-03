@@ -167,7 +167,7 @@ instead.
 ## First-run setup
 
 The code is `app/Madeira/Onboarding.swift`. It uses `JITCoordinator` for the
-JIT method and validated pairing-file import, `OnDevicePairing` for on-device
+JIT method and validated pairing-file import, `OnDevicePairing` for in-app
 pairing (iOS 27, `docs/JIT.md`), Steam sign-in
 (`docs/STEAM_SIGNIN.md`) through `SteamSignInModel`/`SteamSignInView` (the
 token stays in sign-in's Keychain store), and Madeira Dock
@@ -180,8 +180,8 @@ reaches the device through it; **Get LocalDevVPN** opens the App Store, and
 Madeira checks again with `canOpenURL` whenever it comes back to the front),
 **Set up JIT**, **Sign in to Steam**, **Prepare Madeira Dock**
 (Valve's client components, about 73 MB, only when Dock is available), done.
-The JIT page offers three ways in, **On-device** (iOS 27 and later),
-**On-device with pairing file** and **StikDebug**, or **I'll do this later**.
+The JIT page offers three ways in, **In-app** (iOS 27 and later),
+**In-app with pairing file** and **StikDebug**, or **I'll do this later**.
 Each way opens numbered steps that tick off as they are done, with **Back to
 options**. A completed pairing or a valid pairing-file import selects Built-in
 StikJIT; it does not enable JIT yet. Steam and Dock steps have **Set up later**, and the welcome
@@ -190,7 +190,7 @@ page has **Skip setup**. Finishing or skipping stores the setup revision
 the app. Setup opens on a new install, and once after an update whose
 `OnboardingRules.revision` is higher than the stored one; raise it in a release
 whose setup every existing install should see. Revision 2 (Install LocalDevVPN,
-on-device pairing, the Madeira JIT shortcut) also reopens setup for installs
+in-app pairing, the Madeira JIT shortcut) also reopens setup for installs
 that finished it before revisions (`madeiraOnboardingDone`). The JIT page is always available; Steam pages follow their feature
 switches. Setup never opens over a running session.
 
