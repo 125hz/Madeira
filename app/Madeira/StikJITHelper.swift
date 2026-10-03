@@ -76,6 +76,10 @@ enum StikJITHelper {
         }
     }
 
+    /// ml1235 (local, 2026-10-02) is folded in here: upstream's waitForDebugger
+    /// waits for `ready` (CS_DEBUGGED and a live debugger), which is what ml1235's
+    /// pollForJIT did; the flag-only poll reported success at once in the
+    /// flagged-without-debugger state. `ready` reads the flag silently (below).
     /// Opening a URL only proves iOS accepted it. Readiness requires both the
     /// sticky CS_DEBUGGED flag and a live debugger that can answer Madeira's BRK.
     @discardableResult
@@ -125,14 +129,22 @@ enum StikJITHelper {
     /// attached to answer the pool request or this run's pool exists already.
     /// CS_DEBUGGED alone is not enough: it stays set after a debugger leaves, which
     /// is the state StikDebug's own app list (attach, then detach) leaves behind.
+    /// ml1235: the flag is read without jit_check_debugged's log line; the library
+    /// polls this every 2 s for the whole app run (and waitForDebugger every 0.5 s).
     static var ready: Bool {
-        guard jit_check_debugged() else { return false }
+        guard SigningStatus.current.debugged else { return false }
         return !attachCheck || poolTaken || isDebuggerAttached()
     }
 
     /// CS_DEBUGGED is set but nothing can answer a pool request: JIT has to be
     /// enabled again, through Madeira, before a game can start.
-    static var flaggedWithoutDebugger: Bool { jit_check_debugged() && !ready }
+    static var flaggedWithoutDebugger: Bool { SigningStatus.current.debugged && !ready }
+
+    /// ml1234: the early pool placeholder is unmapped once per app run. A launch that
+    /// fails without a debugger now leaves the app up, and a second pool request
+    /// unmapped the placeholder's range again, under whatever had been mapped there
+    /// since (malloc, Metal, IOSurface).
+    private static var earlyPoolReleased = false
 
     /// Allocate a JIT memory pool via BRK #0xf00d WITHOUT detaching the debugger.
     /// The debugger stays attached so Wine can use BRK to prepare PE code pages.
@@ -341,8 +353,12 @@ enum StikJITHelper {
         var plugs: [(vm_address_t, vm_size_t)] = []
         let earlyPoolBase = vm_address_t(madeira_early_pool_base)
         let earlyPoolSize = vm_address_t(madeira_early_pool_size)
-        if earlyPoolBase != 0 {
+        if earlyPoolBase != 0 && earlyPoolReleased {
+            LogStore.shared.log(String(format: "ml1234: the early pool placeholder 0x%lx+%luMB was released by an earlier pool request in this run; not unmapped again",
+                                       Int(earlyPoolBase), Int(earlyPoolSize >> 20)))
+        } else if earlyPoolBase != 0 {
             vm_deallocate(mach_task_self_, earlyPoolBase, vm_size_t(earlyPoolSize))
+            earlyPoolReleased = true
             LogStore.shared.log(String(format: "ml1040: released the early pool placeholder 0x%lx+%luMB for the debugger",
                                        Int(earlyPoolBase), Int(earlyPoolSize >> 20)))
         } else {
