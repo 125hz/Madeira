@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Madeira Converter Exception: see LICENSE-EXCEPTION.md
 
-import ExtensionFoundation
+// Madeira's JIT helper: a classic app extension that Madeira starts by its bundle ID
+// (app/Madeira/JITBuiltInHost.swift), so a sideloader's renamed install still finds it.
+// One MadeiraJITRequest per extension request, answered when the request completes.
+
 import Foundation
 #if !targetEnvironment(simulator)
 import StikJIT
 #endif
-import XPC
 
 #if targetEnvironment(simulator)
 private struct DDIPaths {
@@ -40,14 +42,11 @@ private enum StikJIT {
 }
 #endif
 
-private struct MadeiraJITMessageHandler: XPCPeerHandler {
-    private static let queue = DispatchQueue(label: "com.willfaust.madeora.jit-helper")
+private enum MadeiraJITWork {
+    /// One request at a time, as the XPC handler ran them before.
+    static let queue = DispatchQueue(label: "com.willfaust.madeora.jit-helper")
 
-    func handleIncomingRequest(_ request: MadeiraJITRequest) -> (any Encodable)? {
-        Self.queue.sync { handle(request) }
-    }
-
-    private func handle(_ request: MadeiraJITRequest) -> MadeiraJITRequest.Response {
+    static func handle(_ request: MadeiraJITRequest) -> MadeiraJITRequest.Response {
         let manager = FileManager.default
         let root = manager.urls(for: .libraryDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("StikJIT", isDirectory: true)
@@ -119,11 +118,26 @@ private struct MadeiraJITMessageHandler: XPCPeerHandler {
     }
 }
 
-@main
-struct MadeiraJITHelperExtension: AppExtension {
-    var configuration: some AppExtensionConfiguration {
-        ConnectionHandler(onSessionRequest: { request in
-            request.accept { _ in MadeiraJITMessageHandler() }
-        })
+/// NSExtensionPrincipalClass (Info.plist). The request arrives as JSON in the first input
+/// item; the response goes back as JSON in the item the request completes with. Enable
+/// completes only when Madeira's script has detached, so the request, and this process,
+/// last as long as the debugger does.
+@objc(MadeiraJITHelperHandler)
+final class MadeiraJITHelperHandler: NSObject, NSExtensionRequestHandling {
+    func beginRequest(with context: NSExtensionContext) {
+        let info = (context.inputItems.first as? NSExtensionItem)?.userInfo
+        let data = info?[MadeiraJITRequest.itemKey] as? Data
+        MadeiraJITWork.queue.async {
+            let response: MadeiraJITRequest.Response
+            if let data, let request = try? JSONDecoder().decode(MadeiraJITRequest.self, from: data) {
+                response = MadeiraJITWork.handle(request)
+            } else {
+                response = .init(success: false, message: "Madeira's JIT helper received no request.",
+                                 txmPresent: nil)
+            }
+            let item = NSExtensionItem()
+            item.userInfo = [MadeiraJITRequest.Response.itemKey: (try? JSONEncoder().encode(response)) ?? Data()]
+            context.completeRequest(returningItems: [item], completionHandler: nil)
+        }
     }
 }

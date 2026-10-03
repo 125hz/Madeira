@@ -3,8 +3,11 @@
 
 import Foundation
 
-/// Codable messages shared by Madeira and its iOS 26 JIT helper extension.
+/// Codable messages shared by Madeira and its JIT helper extension. Each travels as JSON
+/// in an extension request's item (userInfo[itemKey]), to the helper and back.
 struct MadeiraJITRequest: Codable, Sendable {
+    static let itemKey = "madeira-jit-request"
+
     enum Operation: String, Codable, Sendable {
         case prepare
         case enable
@@ -33,6 +36,7 @@ struct MadeiraJITRequest: Codable, Sendable {
     }
 
     struct Response: Codable, Sendable {
+        static let itemKey = "madeira-jit-response"
         let success: Bool
         let message: String
         let txmPresent: Bool?

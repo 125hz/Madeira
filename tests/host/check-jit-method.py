@@ -75,15 +75,24 @@ require('dictionary["public_key"]' in setup
 
 # The debugger must run in a separate extension process. The request includes
 # the target app PID and helper always forces Madeira's custom script.
-require("AppExtensionProcess(configuration:" in host
-        and "process.makeXPCSession()" in host
-        and "session.send(request)" in host,
-        "the app invokes a separate ExtensionFoundation helper over XPC")
-require(project.count("EX_ENABLE_EXTENSION_POINT_GENERATION = YES;") == 4,
-        "both app and helper configurations generate ExtensionFoundation metadata")
+# The helper is a classic app extension started by the bundle ID it has in this
+# installation (LiveContainer's way), so a sideloader that renames Madeira's bundle ID
+# (and the helper's with it) does not lose it; an ExtensionKit extension point did.
+require("extensionWithIdentifier:error:" in host and "beginExtensionRequestWithInputItems:completion:" in host
+        and "setRequestCompletionBlock:" in host and "setRequestInterruptionBlock:" in host
+        and 'Bundle.main.builtInPlugInsURL?.appendingPathComponent(helperFile)' in host
+        and "Bundle(url: url)?.bundleIdentifier" in host,
+        "the app starts the helper extension by the helper's own bundle ID in this installation")
+require("ExtensionFoundation" not in helper.replace("ExtensionFoundation.framework", "")
+        and "AppExtensionPoint" not in host and "EX_ENABLE_EXTENSION_POINT_GENERATION" not in project
+        and "extensionkit" not in project,
+        "no ExtensionKit extension point is declared or looked up (iOS registers none for a renamed install)")
 require("let targetPID: Int32?" in messages and "let pairingData: Data?" in messages
-        and "let scriptBase64: String?" in messages,
-        "the XPC request carries PID, pairing data, and script")
+        and "let scriptBase64: String?" in messages
+        and "item.userInfo = [MadeiraJITRequest.itemKey: data]" in host
+        and "context.completeRequest(returningItems: [item], completionHandler: nil)" in helper
+        and "@objc(MadeiraJITHelperHandler)" in helper,
+        "the request (PID, pairing data, script) goes in the extension request, the answer in the item it completes with")
 helper_enable = helper[helper.index("try StikJIT.enableJIT("):]
 require("targetPID: targetPID" in helper_enable
         and "script: .customBase64(scriptBase64)" in helper_enable
@@ -112,17 +121,21 @@ require("stikdebug" in app_plist["LSApplicationQueriesSchemes"],
         "the app may detect the canonical StikDebug URL scheme")
 with (root / "app/MadeiraJITHelper/Info.plist").open("rb") as f:
     helper_plist = plistlib.load(f)
-require(helper_plist["CFBundlePackageType"] == "XPC!"
-        and helper_plist["EXAppExtensionAttributes"]["EXExtensionPointIdentifier"]
-        == "$(MADEIRA_BUNDLE_IDENTIFIER).MadeiraJITHelper",
-        "the helper is packaged as an ExtensionKit extension of the app's own bundle identifier")
+extension_info = helper_plist.get("NSExtension", {})
+require(helper_plist["CFBundlePackageType"] == "XPC!" and "EXAppExtensionAttributes" not in helper_plist
+        and extension_info.get("NSExtensionPointIdentifier") == "com.apple.ar.viewer"
+        and extension_info.get("NSExtensionPrincipalClass") == "MadeiraJITHelperHandler"
+        and helper_plist["XPCService"]["_ProcessType"] == "App"
+        and 'productType = "com.apple.product-type.app-extension";' in project
+        and "dstSubfolderSpec = 13;" in project[project.index("/* Embed JIT Helper */ = {"):],
+        "the helper is a classic app extension in PlugIns, as LiveContainer's LiveProcess")
 project = (root / "app/Madeira.xcodeproj/project.pbxproj").read_text()
 helper_source = (root / "app/MadeiraJITHelper/MadeiraJITHelper.swift").read_text()
 require(project.count('PRODUCT_BUNDLE_IDENTIFIER = "$(MADEIRA_BUNDLE_IDENTIFIER)";') == 2
         and project.count('PRODUCT_BUNDLE_IDENTIFIER = "$(MADEIRA_BUNDLE_IDENTIFIER).JITHelper";') == 2
         and project.count("MADEIRA_BUNDLE_IDENTIFIER = com.willfaust.madeora;") == 2
-        and "AppExtensionPoint.Identifier(" not in helper_source,
-        "one setting, MADEIRA_BUNDLE_IDENTIFIER, names the app, the helper and its extension point")
+        and "AppExtensionPoint" not in helper_source,
+        "one setting, MADEIRA_BUNDLE_IDENTIFIER, names the app and the helper")
 
 problem = setup[setup.index("enum ConnectionProblem"):setup.index("var message: String")]
 require(problem.index('"connectionreset"') < problem.index("self = .pairing") < problem.index('"connectionrefused"')
