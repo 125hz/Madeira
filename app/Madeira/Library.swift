@@ -1879,6 +1879,11 @@ struct LibraryView: View {
     var startDock: (DockGame, Bool) -> Void = { _, _ in }
     /// First-run setup (Onboarding.swift).
     @ObservedObject private var onboarding = OnboardingModel.shared
+    @ObservedObject private var jit = JITCoordinator.shared
+    /// The library's error is a JIT connection problem with a fix to offer.
+    private var jitProblem: JITCoordinator.ConnectionProblem? {
+        jit.connectionProblem.flatMap { model.error == $0.message ? $0 : nil }
+    }
     @State private var browser = false
     @State private var selected: LibraryEntry?
     @State private var search = ""
@@ -2177,7 +2182,9 @@ struct LibraryView: View {
             model.showDetail = nil
             selected = model.entries.first { $0.id == id }
         }
-        .alert("Library", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
+        .alert(jitProblem == nil ? "Library" : "Couldn't Enable JIT",
+               isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
+            if let jitProblem { jitConnectionActions(jitProblem) { model.error = nil } }
             Button("OK", role: .cancel) { model.error = nil }
         } message: { Text(model.error ?? "") }
         .onChange(of: scenePhase) { _, phase in if phase == .active { model.refreshFlag() } }

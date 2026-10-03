@@ -142,9 +142,41 @@ final class JITCoordinator: ObservableObject {
         }
     }
 
+    /// Why the built-in helper could not reach this device, read from its error.
+    enum ConnectionProblem: Equatable {
+        /// Nothing answered at LocalDevVPN's address: the VPN is off or not routing.
+        case vpn
+        /// The device closed the connection, usually because it no longer accepts this
+        /// pairing (every new pairing replaces the last).
+        case pairing
+
+        init?(helperMessage: String) {
+            let text = helperMessage.lowercased()
+            let has = { (needles: [String]) in needles.contains(where: text.contains) }
+            if has(["connectionreset", "connection reset", "device refused connection"]) {
+                self = .pairing
+            } else if has(["connectionrefused", "connection refused", "timedout", "timed out",
+                           "networkunreachable", "network unreachable", "hostunreachable", "host unreachable", "no route"]) {
+                self = .vpn
+            } else {
+                return nil
+            }
+        }
+
+        var message: String {
+            switch self {
+            case .vpn:
+                return "Madeira couldn't reach this device. Connect LocalDevVPN, then try again."
+            case .pairing:
+                return "This device closed the connection, which usually means it no longer accepts Madeira's pairing. Pair again, and check that LocalDevVPN is connected."
+            }
+        }
+    }
+
     @Published var method: JITMethod {
         didSet { UserDefaults.standard.set(method.rawValue, forKey: "madeiraJITMethod") }
     }
+    @Published private(set) var connectionProblem: ConnectionProblem?
     @Published var showSetup = false
     @Published private(set) var busy = false
     @Published private(set) var status: String?
@@ -187,6 +219,7 @@ final class JITCoordinator: ObservableObject {
         }
         error = nil
         status = nil
+        connectionProblem = nil
 
         switch resolvedMethod {
         case .automatic:
@@ -257,16 +290,18 @@ final class JITCoordinator: ObservableObject {
         }
         busy = true
         error = nil
+        connectionProblem = nil
         status = "Checking LocalDevVPN and the Developer Disk Image…"
         MadeiraBuiltInJIT.send(.prepare(pairingData: pairing)) { [weak self] result in
-            self?.busy = false
+            guard let self else { return }
+            busy = false
             switch result {
             case .success(let response):
-                self?.txmPresent = response.txmPresent
-                self?.status = response.success ? response.message : nil
-                self?.error = response.success ? nil : response.message
+                txmPresent = response.txmPresent
+                status = response.success ? response.message : nil
+                error = response.success ? nil : helperFailure(response.message)
             case .failure(let failure):
-                self?.error = failure.localizedDescription
+                error = failure.localizedDescription
             }
         }
     }
@@ -322,14 +357,15 @@ final class JITCoordinator: ObservableObject {
                     self?.txmPresent = response.txmPresent
                     LogStore.shared.log("[jit-built-in] \(response.message)",
                                         level: response.success ? .success : .error)
-                    if !response.success && !readinessFinished {
+                    if !response.success && !readinessFinished, let self {
                         readinessFinished = true
                         readinessTimer?.invalidate()
-                        self?.busy = false
-                        self?.error = response.message
+                        busy = false
+                        let message = helperFailure(response.message)
+                        error = message
                         completion(.failure(NSError(
                             domain: "MadeiraJIT", code: 13,
-                            userInfo: [NSLocalizedDescriptionKey: response.message])))
+                            userInfo: [NSLocalizedDescriptionKey: message])))
                     }
                 case .failure(let failure):
                     if !readinessFinished {
@@ -341,6 +377,13 @@ final class JITCoordinator: ObservableObject {
                     }
                 }
             })
+    }
+
+    /// The helper's failure as shown: a connection problem gets its plain explanation
+    /// (the helper's own message is already in the log).
+    private func helperFailure(_ message: String) -> String {
+        connectionProblem = ConnectionProblem(helperMessage: message)
+        return connectionProblem?.message ?? message
     }
 
     func resetDDI() {
@@ -357,6 +400,38 @@ final class JITCoordinator: ObservableObject {
                 self?.error = failure.localizedDescription
             }
         }
+    }
+}
+
+/// LocalDevVPN, which built-in JIT and StikDebug reach the device through: open it to
+/// connect when it is installed, otherwise its App Store page.
+enum LocalDevVPN {
+    static let appStore = URL(string: "https://apps.apple.com/us/app/localdevvpn/id6755608044")!
+    /// `enable` connects the VPN; `scheme` has LocalDevVPN return to Madeira a second later.
+    static let connect = URL(string: "localdevvpn://enable?scheme=madeira")!
+
+    static var isInstalled: Bool { UIApplication.shared.canOpenURL(URL(string: "localdevvpn://")!) }
+    static var actionTitle: String { isInstalled ? "Connect LocalDevVPN" : "Get LocalDevVPN" }
+
+    static func open() {
+        let installed = isInstalled
+        LogStore.shared.log("[jit] LocalDevVPN \(installed ? "connect" : "app-store")")
+        UIApplication.shared.open(installed ? connect : appStore)
+    }
+}
+
+/// The fix a JIT connection problem offers: pair again (rejected pairing) and LocalDevVPN.
+@MainActor func jitConnectionActions(_ problem: JITCoordinator.ConnectionProblem,
+                                     then dismiss: @escaping () -> Void = {}) -> some View {
+    Group {
+        if problem == .pairing {
+            Button(OnDevicePairing.isSupported ? "Pair Again" : "Open JIT Setup") {
+                dismiss()
+                if OnDevicePairing.isSupported { OnDevicePairing.shared.start() }
+                JITCoordinator.shared.showSetup = true
+            }
+        }
+        Button(LocalDevVPN.actionTitle) { dismiss(); LocalDevVPN.open() }
     }
 }
 
@@ -443,8 +518,7 @@ struct JITSetupView: View {
                         Button("Import pairing file") { importing = true }
                         Link("How to create a pairing file",
                              destination: URL(string: "https://github.com/StikDebug/StikDebug-Guide/blob/main/pairing_file.md")!)
-                        Link("Download LocalDevVPN",
-                             destination: URL(string: "https://apps.apple.com/us/app/localdevvpn/id6755608044")!)
+                        Button(LocalDevVPN.actionTitle) { LocalDevVPN.open() }
                     } header: {
                         Text("Built-in StikJIT")
                     } footer: {
@@ -478,7 +552,10 @@ struct JITSetupView: View {
                 if coordinator.busy {
                     Section { HStack { ProgressView(); Text(coordinator.status ?? "Working…") } }
                 } else if let error = coordinator.error {
-                    Section { Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red) }
+                    Section {
+                        Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                        if let problem = coordinator.connectionProblem { jitConnectionActions(problem) }
+                    }
                 } else if let status = coordinator.status {
                     Section { Label(status, systemImage: "checkmark.circle.fill").foregroundStyle(.green) }
                 }
