@@ -2478,7 +2478,7 @@ struct ContentView: View {
             }
             // A Dock session runs Valve's client headless, with no Chromium, so
             // nothing claims the 8 GB V8 cage holdback (virtual_ios.c). Let ntdll
-            // release it when the guest band runs out. madeira.cfg
+            // hand it to the allocator when the guest band runs out. madeira.cfg
             // env.MADEIRA_CAGE_RELEASE, exported later, wins.
             if dockLaunch.dock {
                 setenv("MADEIRA_CAGE_RELEASE", "1", 1)
