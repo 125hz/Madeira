@@ -491,29 +491,50 @@ struct SteamCloudPlan: Equatable, Sendable {
     /// Differ, and either both sides changed since the last sync or there is
     /// no record of one.
     var conflicts: [SteamCloudEntry] = []
-    /// Identical on both sides now: the new baseline for these files.
+    /// New record entries: SHA-1 of the files identical on both sides now, and
+    /// the marks below.
     var settled: [String: String] = [:]
 
     static func hex(_ data: Data) -> String { data.map { String(format: "%02x", $0) }.joined() }
 
+    /// Record marks besides a SHA-1. `missing:<sha>`: a save synced here at
+    /// <sha> is gone from this device while the cloud still has it, and no
+    /// choice was made yet. `deleted:<sha>`: the user chose to leave it gone
+    /// while the cloud held <sha>.
+    static let missingMark = "missing:", deletedMark = "deleted:"
+
     /// `baseline`: SHA-1 (hex) of each file when it was last the same on both
-    /// sides, by `SteamCloudEntry.key`.
+    /// sides, or a mark, by `SteamCloudEntry.key`.
     static func make(audit: SteamCloudAudit, baseline: [String: String]) -> SteamCloudPlan {
         var plan = SteamCloudPlan()
         for entry in audit.entries {
             let known = baseline[entry.key]
+            let marked = known.map { $0.hasPrefix(missingMark) || $0.hasPrefix(deletedMark) } ?? false
             switch entry.kind {
             case .same:
                 plan.settled[entry.key] = hex(entry.cloudSHA)
             case .differ:
+                // A save that was missing here and is back is a new file, not a
+                // change of the synced one: never copied over the cloud's unasked.
                 let cloud = hex(entry.cloudSHA), local = hex(entry.localSHA)
-                if let known, known == cloud, known != local { plan.upload.append(entry) }
-                else if let known, known == local, known != cloud { plan.download.append(entry) }
+                if let known, !marked, known == cloud, known != local { plan.upload.append(entry) }
+                else if let known, !marked, known == local, known != cloud { plan.download.append(entry) }
                 else { plan.conflicts.append(entry) }
             case .cloudOnly:
-                // New in the cloud. A file this device once had and no longer has was
-                // deleted here: it is not brought back, and not deleted in the cloud.
-                if known == nil { plan.download.append(entry) }
+                let cloud = hex(entry.cloudSHA)
+                if known == nil {
+                    plan.download.append(entry)          // new in the cloud
+                } else if known == deletedMark + cloud {
+                    break                                // left gone, by the user's choice
+                } else if known?.hasPrefix(deletedMark) == true {
+                    plan.download.append(entry)          // changed in the cloud since: nothing here to lose
+                } else {
+                    // Synced here once and gone now: lost with the prefix or deleted
+                    // by the game. The user chooses; until then the mark keeps a new
+                    // save of that name from going up over the cloud's copy.
+                    plan.conflicts.append(entry)
+                    if !marked { plan.settled[entry.key] = missingMark + (known ?? "") }
+                }
             case .localOnly:
                 // New on this device. A file the cloud once had and no longer has was
                 // deleted elsewhere: it is not sent back.

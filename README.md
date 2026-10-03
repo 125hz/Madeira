@@ -35,10 +35,11 @@ Wine's server runs as a thread instead of a separate program.
 - **Game library** with artwork, search and a Windows desktop session.
 - **Steam**: sign in, browse the games you own, install and update them, and
   start them through Valve's own Windows Steam client (Madeira Dock).
-- **Steam Cloud saves**: saves sync with Steam Cloud when Madeira starts and
-  before a game starts, and **Upload saves and close Madeira** in the game
-  menu sends them when you stop playing. Saves that changed on both sides
-  are never overwritten without asking.
+- **Steam Cloud saves** (turn on in Settings): saves sync with Steam Cloud
+  when Madeira starts and before a game starts, and **Upload saves and close
+  Madeira** in the game menu sends them when you stop playing. Saves that
+  changed on both sides are never overwritten without asking, and anything a
+  sync replaces is backed up.
 - **Controllers**: Bluetooth controllers through XInput, plus customisable
   on-screen touch controls.
 - **Keyboard, mouse and trackpad** passed through to games as real input.

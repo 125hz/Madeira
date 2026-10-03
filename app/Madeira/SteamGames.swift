@@ -1010,13 +1010,28 @@ struct SteamCloudQuitRow: View {
                         .confirmationDialog("Replace the Steam Cloud saves with this device's?", isPresented: $confirmReplace, titleVisibility: .visible) {
                             Button("Replace the cloud saves", role: .destructive) { run(replaceCloud: true) }
                             Button("Cancel", role: .cancel) { }
-                        } message: { Text("The saves in Steam Cloud are overwritten for every device. This cannot be undone from Madeira.") }
+                        } message: { Text("The saves in Steam Cloud are overwritten for every device. Their current copies are saved first, in Files › Madeira › Steam Cloud Backups.") }
                 case nil:
                     EmptyView()
                 }
                 Text("Save in the game first. Uploads this game's saves to Steam Cloud, then closes Madeira; Steam in this session is signed out when the upload starts.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+        }
+    }
+}
+
+/// Whether Steam Cloud saves sync: Settings › Steam Cloud saves, kept in madeira.cfg as
+/// env.MADEIRA_STEAM_CLOUD (off unless it is 1; docs/STEAM_CLOUD.md). Turning it on
+/// syncs the installed games at once.
+@MainActor final class SteamCloudSetting: ObservableObject {
+    static let shared = SteamCloudSetting()
+    @Published var on = SteamSignIn.flag("MADEIRA_STEAM_CLOUD", default: false) {
+        didSet {
+            guard on != oldValue else { return }
+            MadeiraConfig.set("env.MADEIRA_STEAM_CLOUD", on ? "1" : nil)
+            SteamLog.event("[steam-cloud] setting on=\(on ? 1 : 0)")
+            if on { SteamOwnedLibrary.shared.cloudTurnedOn() } else { SteamOwnedLibrary.shared.objectWillChange.send() }
         }
     }
 }
@@ -1042,7 +1057,7 @@ struct SteamCloudSection: View {
             } header: {
                 Text("Steam Cloud")
             } footer: {
-                Text("Saves sync with Steam Cloud when Madeira starts and when this page opens, not while you play: use Upload saves and close Madeira in the game menu when you stop, or what you played is uploaded the next time Madeira starts. A save that differs on both sides is never replaced without asking.")
+                Text("Saves sync with Steam Cloud when Madeira starts and when this page opens, not while you play: use Upload saves and close Madeira in the game menu when you stop, or what you played is uploaded the next time Madeira starts. A save that differs on both sides, or that is missing on this device, is never replaced without asking, and a save a sync replaces is kept in Files › Madeira › Steam Cloud Backups.")
             }
         }
     }
@@ -1080,29 +1095,32 @@ struct SteamCloudSection: View {
             Text("No saves in Steam Cloud or on this device for this game.").foregroundStyle(.secondary)
         }
         if !conflicts.isEmpty {
-            Label("\(Self.saves(conflicts.count)) differ between Steam Cloud and this device", systemImage: "exclamationmark.triangle.fill")
+            let missing = conflicts.filter { $0.kind == .cloudOnly }.count
+            Label(missing == conflicts.count ? "\(Self.saves(missing)) synced here before \(missing == 1 ? "is" : "are") missing on this device"
+                  : "\(Self.saves(conflicts.count)) differ between Steam Cloud and this device", systemImage: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
             ForEach(conflicts) { entry in
                 VStack(alignment: .leading, spacing: 3) {
                     Text(entry.name).font(.subheadline.weight(.medium))
-                    Text("Steam Cloud: \(Self.when(entry.cloudTime)) · \(Self.size(entry.cloudSize))\(entry.cloudTime > entry.localTime ? " · newer" : "")")
+                    Text("Steam Cloud: \(Self.when(entry.cloudTime)) · \(Self.size(entry.cloudSize))\(entry.kind != .cloudOnly && entry.cloudTime > entry.localTime ? " · newer" : "")")
                         .font(.caption).foregroundStyle(.secondary)
-                    Text("This device: \(Self.when(entry.localTime)) · \(Self.size(entry.localSize))\(entry.localTime > entry.cloudTime ? " · newer" : "")")
+                    Text(entry.kind == .cloudOnly ? "This device: missing (it was synced here before)"
+                         : "This device: \(Self.when(entry.localTime)) · \(Self.size(entry.localSize))\(entry.localTime > entry.cloudTime ? " · newer" : "")")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
             Text("Nothing is changed until you choose which to keep.")
                 .font(.caption).foregroundStyle(.secondary)
             Button("Keep the Steam Cloud saves…") { confirmCloud = true }
-                .confirmationDialog("Replace \(Self.saves(conflicts.count)) on this device with the Steam Cloud version? This device's copies are backed up first.",
+                .confirmationDialog("Use the Steam Cloud version of \(Self.saves(conflicts.count)) on this device? This device's copies are saved first, in Files › Madeira › Steam Cloud Backups.",
                                     isPresented: $confirmCloud, titleVisibility: .visible) {
-                    Button("Replace this device's saves", role: .destructive) { Task { await steam.resolveCloud(appID, useCloud: true) } }
+                    Button("Use the Steam Cloud saves", role: .destructive) { Task { await steam.resolveCloud(appID, useCloud: true) } }
                     Button("Cancel", role: .cancel) {}
                 }
             Button("Keep this device's saves…") { confirmDevice = true }
-                .confirmationDialog("Replace \(Self.saves(conflicts.count)) in Steam Cloud with this device's version? Steam keeps no copy of the saves it replaces.",
+                .confirmationDialog("Keep this device's version of \(Self.saves(conflicts.count))? Saves that differ replace Steam Cloud's for every device; the cloud's copies are saved first, in Files › Madeira › Steam Cloud Backups. Saves missing on this device stay missing, and Steam Cloud keeps them.",
                                     isPresented: $confirmDevice, titleVisibility: .visible) {
-                    Button("Replace the Steam Cloud saves", role: .destructive) { Task { await steam.resolveCloud(appID, useCloud: false) } }
+                    Button("Keep this device's saves", role: .destructive) { Task { await steam.resolveCloud(appID, useCloud: false) } }
                     Button("Cancel", role: .cancel) {}
                 }
         } else if !audit.entries.isEmpty {

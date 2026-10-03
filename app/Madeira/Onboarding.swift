@@ -282,12 +282,25 @@ struct SteamSettingsSection: View {
     @ObservedObject private var signIn = SteamSignInModel.shared
     @ObservedObject private var dock = MadeiraDockModel.shared
     @ObservedObject private var onboarding = OnboardingModel.shared
+    @ObservedObject private var cloud = SteamCloudSetting.shared
     @State private var confirmSignOut = false
 
     /// Shown when Steam sign-in or Madeira Dock is available.
     static var shown: Bool { SteamSignIn.isEnabled || MadeiraDock.enabled }
 
     var body: some View {
+        account
+        // Opt-in two-way sync of installed games' saves (docs/STEAM_CLOUD.md).
+        if SteamOwnedLibrary.enabled, signIn.accountName != nil {
+            Section {
+                Toggle("Steam Cloud saves", isOn: $cloud.on)
+            } footer: {
+                Text("Syncs installed Steam games' saves with Steam Cloud before and after you play. A save that changed on both sides, or that is missing on this device, is never replaced without asking, and a save a sync replaces is kept in Files › Madeira › Steam Cloud Backups.")
+            }
+        }
+    }
+
+    private var account: some View {
         Section {
             if let name = signIn.accountName {
                 LabeledContent("Signed in as", value: name)
