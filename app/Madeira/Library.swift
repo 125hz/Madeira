@@ -1999,6 +1999,9 @@ struct LibraryView: View {
             if settingsShow("ready to play", "JIT", "Memory+", "StikDebug", "status") {
                 Section { LibraryStatus().listRowBackground(Color.clear) }
             }
+            if settingsShow("JIT", "StikDebug", "built-in", "pairing", "LocalDevVPN") {
+                JITSettingsSection()
+            }
             if settingsShow("diagnostics", "extended logging", "logging", "log") {
                 Section {
                     Toggle("Extended logging", isOn: $input.diagnostics)
@@ -2044,7 +2047,7 @@ struct LibraryView: View {
                     MadeiraCredit(name: "Jfishin", handle: "Jfishin", role: "The original native Steam sign-in, library and downloads")
                     MadeiraCredit(name: "Jesse", handle: "JesseLovelace", role: "Steam Cloud saves, faster game launches, and fixes that let more games run")
                 } header: { Text("Credits") } footer: {
-                    Text("Madeira is built on Wine, FEX-Emu, DXMT by Feifan He (3Shain) with the Direct3D 9 frontend by David Acevedo (dacevedo12), rpmalloc by Mattias Jansson, and StikDebug for enabling JIT. Thank you to everyone who contributes to these projects.")
+                    Text("Madeira is built on Wine, FEX-Emu, DXMT by Feifan He (3Shain) with the Direct3D 9 frontend by David Acevedo (dacevedo12), rpmalloc by Mattias Jansson, StikDebug and StikJIT. Thank you to everyone who contributes to these projects.")
                 }
             }
         }

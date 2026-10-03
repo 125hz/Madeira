@@ -49,8 +49,10 @@ Wine's server runs as a thread instead of a separate program.
 
 - An iPhone on **iOS 26 or later**, the only version Madeira currently runs
   on reliably. Development happens on recent Pro iPhones.
-- **JIT**, which iOS only allows while a debugger is attached. Madeira uses
-  [StikDebug](https://github.com/StikDebug/StikDebug) for this.
+- **JIT**, which iOS only allows while a debugger is attached. Madeira can use
+  [StikDebug](https://github.com/StikDebug/StikDebug) or its built-in StikJIT
+  helper. On iOS 27 the built-in helper can pair the iPhone itself, without a
+  computer.
 - An **Apple ID** to sideload the app. A free account works; its signing
   expires after 7 days, so the app needs refreshing weekly. Your games and
   saves are kept across reinstalls.
@@ -62,7 +64,9 @@ Because JIT needs a debugger, Madeira cannot be offered on the App Store.
 1. Download the IPA from the [latest release](https://github.com/willfaust/Madeira/releases).
 2. Sideload it with your own Apple ID using SideStore, AltStore, Sideloadly,
    Plume or a similar tool.
-3. Open Madeira and enable JIT with StikDebug.
+3. Open Madeira and enable JIT. Automatic mode uses StikDebug when installed,
+   otherwise it guides you through the built-in setup; see
+   [JIT setup](docs/JIT.md).
 4. In **Settings**, check that **JIT** and **Memory+** both show a green check:
    Madeira then says **Ready to play**.
 
@@ -99,6 +103,7 @@ and some inputs that are not in the repository, such as the toolchains.
 | Topic | Document |
 |---|---|
 | Building from a clean checkout | [`docs/BUILDING.md`](docs/BUILDING.md) |
+| StikDebug and built-in JIT setup | [`docs/JIT.md`](docs/JIT.md) |
 | The game library | [`docs/LIBRARY.md`](docs/LIBRARY.md) |
 | Steam sign-in, library and downloads | [`docs/STEAM_SIGNIN.md`](docs/STEAM_SIGNIN.md), [`docs/STEAM_LIBRARY.md`](docs/STEAM_LIBRARY.md) |
 | Steam Cloud saves | [`docs/STEAM_CLOUD.md`](docs/STEAM_CLOUD.md) |
@@ -155,7 +160,8 @@ proposing anything to it.
 Madeira is built on [Wine](https://www.winehq.org/), [FEX-Emu](https://github.com/FEX-Emu/FEX),
 [DXMT](https://github.com/3Shain/DXMT) by Feifan He (3Shain) with the Direct3D 9
 frontend by David Acevedo (dacevedo12), [rpmalloc](https://github.com/mjansson/rpmalloc)
-by Mattias Jansson, and [StikDebug](https://github.com/StikDebug/StikDebug)
+by Mattias Jansson, [StikDebug](https://github.com/StikDebug/StikDebug), and
+[StikJIT](https://github.com/StikDebug/StikJIT)
 for enabling JIT. Thank you to everyone who contributes to them.
 
 <p align="center">
