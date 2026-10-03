@@ -144,4 +144,25 @@ require('URL(string: "localdevvpn://enable?scheme=madeira")' in setup
         and any("madeira" in t.get("CFBundleURLSchemes", []) for t in app_plist.get("CFBundleURLTypes", [])),
         "LocalDevVPN opens to connect and returns to Madeira's own URL scheme")
 
+# Play without JIT runs Enable JIT, then starts the game, once: only with the debugger
+# attached (so the start cannot ask again), and never after a failure.
+gate = function(content, "private func jitReadyForLaunch(")
+require(gate.index("if StikJITHelper.ready { return true }") < gate.index("if inLibrary, let launch {")
+        < gate.index("if StikJITHelper.flaggedWithoutDebugger {")
+        and "launchAfterJIT = launch" in gate and "if jitStatus != .testing { enableJIT() }" in gate,
+        "Play without JIT enables it (a second Play while it runs only replaces the game)")
+ended = function(content, "private func launchAfterJITEnded(")
+require("launchAfterJIT = nil" in ended
+        and "guard started, StikJITHelper.ready, library.current == nil, wine_process_is_running() == 0 else {" in ended
+        and ended.index("launchAfterJIT = nil") < ended.index("launch()"),
+        "the waiting game starts once, only when JIT came on and nothing else started")
+enable_jit = function(content, "private func enableJIT()")
+require(enable_jit.count("launchAfterJITEnded(started: false)") == 2 and enable_jit.count("launchAfterJITEnded(started: true)") == 1,
+        "every way Enable JIT ends settles the waiting game")
+play = function(content, "private func launchLibraryEntry(")
+require("guard jitReadyForLaunch(inLibrary: true, then: { startLibraryEntry(entry) }) else { return }" in play
+        and play.index("cloudClear(") < play.index("jitReadyForLaunch(")
+        and "guard jitReadyForLaunch(inLibrary: inLibrary, then: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }" in content,
+        "Play and Dock starts continue after JIT without repeating the checks already passed")
+
 print("check-jit-method: PASS")

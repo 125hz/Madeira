@@ -19,6 +19,13 @@ later) and **On-device with pairing file** both select Built-in StikJIT,
 **StikDebug** selects StikDebug, and setting it up later leaves the current
 method unchanged.
 
+**Play** enables JIT itself when it is off: it runs the same flow as **Enable
+JIT** (the loopback check and the Madeira JIT shortcut included), then starts
+the game once the debugger is attached. If JIT does not come on, the usual
+error is shown and the game is not started; enabling JIT later starts nothing.
+This also covers JIT enabled from StikDebug's own list, which sets CS_DEBUGGED
+and leaves, so no debugger is attached.
+
 ## StikDebug
 
 1. Install [StikDebug](https://github.com/StikDebug/StikDebug/releases/latest).
@@ -167,6 +174,18 @@ An app can only run a shortcut by opening the Shortcuts app, so each run leaves
 Madeira for a moment and returns through `madeira://jit-network/…`
 (x-callback-url). Between **Enable JIT** and the game starting, cellular data
 stays off.
+
+**Known gap: no network at all.** With Wi-Fi and Cellular Data both off and
+LocalDevVPN not connected, the shortcut cannot help: LocalDevVPN does not
+connect without any network, so after the 15 s wait the JIT attempt times out
+(`[jit-loopback] … no route`) and Madeira reports it cannot reach the device.
+LocalDevVPN that was already connected keeps working with no network. Untested
+fixes: the shortcut turning Wi-Fi on first (the radio alone, without joining a
+network, may be enough; Control Center's Wi-Fi button only disconnects and
+leaves the radio on, while Settings turns it off), or turning Cellular Data on
+just long enough to connect LocalDevVPN, then off again. Madeira can tell this
+case apart (its network path has no interface) and could pass the shortcut a
+word for it.
 
 ### Getting the shortcut
 
