@@ -196,7 +196,9 @@ struct LibraryEntry: Codable, Identifiable {
     var controlOpacity: Double?
     var controlSize: Double?
     /// How a physical controller reaches this game: nil, the game's own support
-    /// (XInput, as before); "keys", keyboard and mouse (PadKeyboardMouse: the pad
+    /// (XInput, as before); "dinput", XInput and a DirectInput joystick of the same
+    /// pad (for games older than XInput; a game reading both APIs sees two
+    /// controllers); "keys", keyboard and mouse (PadKeyboardMouse: the pad
     /// presses keys and moves the mouse, the game sees no controller). For games
     /// without controller support. Optional, so older files decode.
     var controllerMode: String?
@@ -302,6 +304,11 @@ struct LibraryEntry: Codable, Identifiable {
         // Exported only when chosen: unset keeps the engine's own default (and any
         // madeira.cfg setting), as before these choices existed.
         if let cpuCount, (1..<64).contains(cpuCount) { setenv("MADEIRA_CPU_COUNT", String(cpuCount), 1) }
+        // "dinput": the host pad also as a DirectInput joystick (wine/dlls/dinput/joystick_ios.c,
+        // off by default because a game reading both APIs would see two controllers).
+        // Exported only for that choice; madeira.cfg's own MADEIRA_DINPUT_PAD still applies otherwise.
+        if GamepadInput.keyboardMouseAvailable, controllerMode == "dinput" { setenv("MADEIRA_DINPUT_PAD", "1", 1) }
+        else if MadeiraConfig.get("env.MADEIRA_DINPUT_PAD") == nil { unsetenv("MADEIRA_DINPUT_PAD") }
         if let anisotropyLimit, [1, 2, 4, 8].contains(anisotropyLimit) { setenv("DXMT_D9_ANISO_LIMIT", String(anisotropyLimit), 1) }
         // Fastsync's per-game switches, only when Settings chose Fastsync; with Madsync
         // (the default) or Wine's standard sync nothing is exported here.
@@ -2397,6 +2404,7 @@ struct LibraryDetail: View {
                     }
                     Text("Arrange buttons and choose XInput, mouse, or keyboard actions from the in-game menu.").font(.caption).foregroundStyle(.secondary)
                     if GamepadInput.keyboardMouseAvailable {
+                        Text("XInput and DirectInput: for games older than XInput, which read the pad through DirectInput. The same pad is offered through both APIs, so a game that reads both may list two controllers. Applies to the next launch.").font(.caption).foregroundStyle(.secondary)
                         Text("Keyboard and mouse: for games without controller support. The controller presses keys and moves the mouse (left stick WASD, right stick mouse, triggers click, D-pad arrows, Start Esc, Select Tab) and the game sees no controller. Change what each button does under Controller binds, here or in the in-game menu.").font(.caption).foregroundStyle(.secondary)
                     }
                 }
@@ -2634,6 +2642,7 @@ struct ControllerModeChoice: View {
         LabeledContent("Controller") {
             Picker("Controller", selection: Binding(get: { mode ?? "" }, set: { mode = $0.isEmpty ? nil : $0 })) {
                 Text("Game's own support").tag("")
+                Text("XInput and DirectInput").tag("dinput")
                 Text("Keyboard and mouse").tag("keys")
             }.pickerStyle(.menu).labelsHidden()
         }
