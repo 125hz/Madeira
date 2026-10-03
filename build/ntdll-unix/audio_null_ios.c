@@ -33,6 +33,8 @@
 #include <string.h>
 #include <pthread.h>
 #include <mach/mach_time.h>
+#include <mach/mach.h>
+#include <mach/thread_policy.h>
 #include <unistd.h>
 #include <time.h>
 #include <AudioToolbox/AudioToolbox.h>
@@ -355,6 +357,12 @@ struct ios_stream {
     BYTE *ring;
     _Atomic uint64_t write_pos;  /* frames produced by the game (monotonic) */
     _Atomic uint64_t play_pos;   /* frames consumed by the RT callback */
+    /* ml1230: what the RT callback asked of this stream and could not get.
+     * Written by the RT callback only (relaxed), read by the timer loop. */
+    _Atomic uint64_t st_short;     /* stream frames the device asked for and the ring did not have */
+    _Atomic uint32_t st_cbs;       /* render passes that mixed this stream */
+    _Atomic uint32_t st_short_cbs; /* passes that ran short */
+    _Atomic uint32_t st_cb_max;    /* largest render pass, device frames */
 };
 
 /* ml739: one stream object per client, mirroring Wine's CoreAudio driver.
@@ -411,6 +419,7 @@ struct ios_audio_device {
     UINT32 rate;                  /* canonical output rate */
     UINT32 channels;              /* canonical output channel count */
     _Atomic uint64_t cb_epoch;    /* ++ at the end of every render pass */
+    _Atomic uint64_t clamped;     /* ml1230: output samples clamped to +-1 */
 };
 static struct ios_audio_device g_dev;
 static pthread_mutex_t g_dev_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -670,7 +679,7 @@ static void ios_mix_stream(struct ios_stream *s, float *out, UInt32 nframes,
 {
     UINT32 cap = s->buffer_frames, sch = s->channels, fb = s->frame_bytes;
     UINT32 mch = sch > 12 ? 12 : sch;   /* channels with a gain; the rest are dropped (ml1227: 12) */
-    uint64_t play, wr, avail, need;
+    uint64_t play, wr, avail, need, want;
     UInt32 f;
 
     if (!s->started || !s->mixable || !s->ring || !cap || !sch || !fb) return;
@@ -682,6 +691,7 @@ static void ios_mix_stream(struct ios_stream *s, float *out, UInt32 nframes,
     /* frames of THIS stream that cover nframes of device time */
     if (s->sample_rate == dev_rate) need = nframes;
     else need = ((uint64_t)nframes * s->sample_rate + dev_rate - 1) / dev_rate;
+    want = need;
     if (avail < need) need = avail;
 
     for (f = 0; f < nframes; f++)
@@ -720,6 +730,15 @@ static void ios_mix_stream(struct ios_stream *s, float *out, UInt32 nframes,
     }
 
     atomic_store_explicit(&s->play_pos, play + need, memory_order_release);
+
+    /* ml1230: an underrun is heard as a click; count them */
+    atomic_fetch_add_explicit(&s->st_cbs, 1, memory_order_relaxed);
+    if (need < want) {
+        atomic_fetch_add_explicit(&s->st_short, want - need, memory_order_relaxed);
+        atomic_fetch_add_explicit(&s->st_short_cbs, 1, memory_order_relaxed);
+    }
+    if (nframes > atomic_load_explicit(&s->st_cb_max, memory_order_relaxed))
+        atomic_store_explicit(&s->st_cb_max, nframes, memory_order_relaxed);
 }
 
 /* Core Audio real-time thread. See ios_mix_stream for the constraints. */
@@ -730,7 +749,7 @@ static OSStatus ios_audio_render_cb(void *refcon, AudioUnitRenderActionFlags *fl
     UINT32 dev_ch = g_dev.channels ? g_dev.channels : 2;
     UINT32 dev_rate = g_dev.rate ? g_dev.rate : 48000;
     size_t total = (size_t)nframes * dev_ch;
-    size_t k, cap_floats;
+    size_t k, cap_floats, clamped = 0;
     int i;
     (void)refcon; (void)flags; (void)ts; (void)bus;
 
@@ -754,9 +773,10 @@ static OSStatus ios_audio_render_cb(void *refcon, AudioUnitRenderActionFlags *fl
     /* Summing independent clients can exceed full scale; clamp rather than
      * letting it wrap into noise. */
     for (k = 0; k < total; k++) {
-        if (out[k] > 1.0f) out[k] = 1.0f;
-        else if (out[k] < -1.0f) out[k] = -1.0f;
+        if (out[k] > 1.0f) { out[k] = 1.0f; clamped++; }
+        else if (out[k] < -1.0f) { out[k] = -1.0f; clamped++; }
     }
+    if (clamped) atomic_fetch_add_explicit(&g_dev.clamped, clamped, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_dev.cb_epoch, 1, memory_order_release);
     return noErr;
 }
@@ -1231,18 +1251,147 @@ static NTSTATUS ios_reset(void *args) {
     return STATUS_SUCCESS;
 }
 
+/* ml1230: event pacing by ring fill, not by the clock.
+ *
+ * The timer loop used to signal the client every usleep(10000). A client that
+ * renders exactly one period per wake-up then delivers exactly as much audio as
+ * the loop managed wake-ups, and every late wake-up is audio lost for good: the
+ * ring underruns and the device plays a gap. Wine's ISpatialAudioObjectRender-
+ * Stream is such a client (BeginUpdatingAudioObjects always asks for one
+ * period), and so is anything that writes a fixed period per event. Ori and the Will of the Wisps' Wwise
+ * renders through it: in gameplay it delivered 212 s of audio in ~230 s, a
+ * 10 ms hole every ~120 ms, heard as crackle.
+ *
+ * Now the loop keeps a lead of audio in the ring (60 ms, env
+ * MADEIRA_AUDIO_LEAD_MS = 10..500): while the ring holds less, it wakes the
+ * client again as soon as the client has answered the previous wake-up (wrote
+ * something), or a period later if it has not. Once the lead is there it sleeps
+ * until the lead is used up. A late wake-up now eats into the lead instead of
+ * the sound, and the client catches up on the next ones.
+ *
+ * The thread also runs under the time-constraint policy, as Core Audio's own
+ * I/O thread does; it only sleeps and sets an event. */
+#define IOS_AUDIO_LEAD_MS_DEFAULT 60
+static UINT32 ios_audio_lead_ms(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("MADEIRA_AUDIO_LEAD_MS");
+        int v = e ? atoi(e) : 0;
+        cached = (v >= 10 && v <= 500) ? v : IOS_AUDIO_LEAD_MS_DEFAULT;
+    }
+    return (UINT32)cached;
+}
+
+static uint64_t ns_to_mach(uint64_t ns) {
+    if (!g_timebase.denom) mach_timebase_info(&g_timebase);
+    return ns * g_timebase.denom / g_timebase.numer;
+}
+
+static void ios_audio_timer_thread_rt(void)
+{
+    thread_time_constraint_policy_data_t pol;
+    mach_port_t th = mach_thread_self();
+    kern_return_t kr;
+
+    pol.period      = (uint32_t)ns_to_mach(10000000);   /* 10 ms */
+    pol.computation = (uint32_t)ns_to_mach(500000);     /* 0.5 ms */
+    pol.constraint  = (uint32_t)ns_to_mach(5000000);    /* 5 ms */
+    pol.preemptible = 1;
+    kr = thread_policy_set(th, THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&pol,
+                           THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    mach_port_deallocate(mach_task_self(), th);
+    fprintf(stderr, "[ios_audio] ml1230 timer thread: time-constraint policy kr=%d, lead %u ms\n",
+            (int)kr, ios_audio_lead_ms());
+}
+
 static NTSTATUS ios_timer_loop(void *args) {
     /* Runs on a dedicated Wine thread mmdevapi spawns for event-driven
-     * clients. Wake the client every device period so it refills the
-     * ring; exit when the stream dies. */
+     * clients. Wake the client whenever the ring needs more (ml1230); exit
+     * when the stream dies. */
     struct timer_loop_params *p = args;
     struct ios_stream *s = stream_from_handle(p->stream);
+    uint64_t sig_wr = 0, sig_ns = 0;
+    /* ml1230 report, one line per ~10 s per live stream */
+    uint64_t rep_ns = 0, rep_wr = 0, rep_short = 0, rep_clamped = 0;
+    uint32_t rep_cbs = 0, rep_short_cbs = 0, wakes = 0;
+    uint64_t pad_min = UINT64_MAX, pad_max = 0, late_max_ns = 0;
+
     if (!s) return STATUS_SUCCESS;
     LOG_FN_CALL(9, "timer_loop");
+    ios_audio_timer_thread_rt();
     while (s->valid) {
-        usleep(10000); /* device period, 10 ms */
-        if (s->event && s->started)
-            NtSetEvent(s->event, NULL);
+        UINT32 rate = s->sample_rate ? s->sample_rate : IOS_AUDIO_SAMPLE_RATE;
+        uint64_t period = rate / 100, lead, play, wr, pad, now, sleep_ns, deadline, t;
+
+        if (!s->event || !s->started || !ios_stream_is_live(s)) {
+            /* null-mode, or nothing to drive yet: the plain 10 ms beat */
+            usleep(10000); /* device period, 10 ms */
+            if (s->event && s->started)
+                NtSetEvent(s->event, NULL);
+            continue;
+        }
+
+        lead = (uint64_t)rate * ios_audio_lead_ms() / 1000;
+        if (lead + period > s->buffer_frames)   /* leave room for one more period */
+            lead = s->buffer_frames > 2 * period ? s->buffer_frames - period : period;
+        if (lead < period) lead = period;
+
+        now = mach_to_ns(mach_absolute_time());
+        /* play_pos first: the RT callback only consumes what it saw written, so
+         * a write_pos loaded after it is never behind it. Loaded the other way
+         * round, a pass that ran in between made wr - play wrap to ~2^64 and the
+         * loop slept 10 ms with the ring nearly empty. A reset can still store
+         * the two out of order, hence the clamp. */
+        play = atomic_load_explicit(&s->play_pos, memory_order_acquire);
+        wr   = atomic_load_explicit(&s->write_pos, memory_order_acquire);
+        pad  = wr > play ? wr - play : 0;
+        if (pad < pad_min) pad_min = pad;
+        if (pad > pad_max) pad_max = pad;
+
+        if (pad < lead) {
+            if (wr != sig_wr || now - sig_ns >= 10000000) {
+                NtSetEvent(s->event, NULL);
+                sig_wr = wr;
+                sig_ns = now;
+                wakes++;
+            }
+            sleep_ns = 1000000;   /* look again for the client's answer */
+        } else {
+            sleep_ns = (pad - lead) * 1000000000ull / rate;   /* until the lead is used up */
+            if (sleep_ns < 1000000) sleep_ns = 1000000;
+            if (sleep_ns > 10000000) sleep_ns = 10000000;
+        }
+
+        if (!rep_ns) {
+            rep_ns = now; rep_wr = wr;
+            rep_short = atomic_load_explicit(&s->st_short, memory_order_relaxed);
+            rep_cbs = atomic_load_explicit(&s->st_cbs, memory_order_relaxed);
+            rep_short_cbs = atomic_load_explicit(&s->st_short_cbs, memory_order_relaxed);
+            rep_clamped = atomic_load_explicit(&g_dev.clamped, memory_order_relaxed);
+        } else if (now - rep_ns >= 10000000000ull) {
+            uint64_t shrt = atomic_load_explicit(&s->st_short, memory_order_relaxed);
+            uint32_t cbs = atomic_load_explicit(&s->st_cbs, memory_order_relaxed);
+            uint32_t scbs = atomic_load_explicit(&s->st_short_cbs, memory_order_relaxed);
+            uint64_t clamped = atomic_load_explicit(&g_dev.clamped, memory_order_relaxed);
+            double secs = (double)(now - rep_ns) / 1e9;
+            double wrote = (double)(wr - rep_wr) / rate;
+            fprintf(stderr, "[ios_audio] ml1230 pacing stream=%p lead %u ms: client wrote %.2f s of audio in %.2f s "
+                    "(%.1f%%) over %u wakes; device short %.1f ms in %u of %u passes (largest pass %u frames); "
+                    "ring %llu..%llu frames; worst late wake %.1f ms; clamped %llu samples\n",
+                    (void *)s, ios_audio_lead_ms(), wrote, secs, secs > 0 ? 100.0 * wrote / secs : 0.0, wakes,
+                    (double)(shrt - rep_short) * 1000.0 / rate, scbs - rep_short_cbs, cbs - rep_cbs,
+                    atomic_load_explicit(&s->st_cb_max, memory_order_relaxed),
+                    (unsigned long long)pad_min, (unsigned long long)pad_max, late_max_ns / 1e6,
+                    (unsigned long long)(clamped - rep_clamped));
+            rep_ns = now; rep_wr = wr; rep_short = shrt; rep_cbs = cbs; rep_short_cbs = scbs;
+            rep_clamped = clamped; wakes = 0; pad_min = UINT64_MAX; pad_max = 0; late_max_ns = 0;
+        }
+
+        deadline = mach_absolute_time() + ns_to_mach(sleep_ns);
+        mach_wait_until(deadline);
+        t = mach_absolute_time();
+        if (t > deadline && mach_to_ns(t - deadline) > late_max_ns) late_max_ns = mach_to_ns(t - deadline);
     }
     return STATUS_SUCCESS;
 }
