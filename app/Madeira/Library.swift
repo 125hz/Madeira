@@ -656,6 +656,22 @@ final class LibraryModel: ObservableObject {
     /// CS_DEBUGGED is set but no debugger is attached (JIT was enabled outside
     /// Madeira): the text of the alert that offers Madeira's own Enable JIT.
     @Published var jitNotice: String?
+    /// A Steam game's saves may not be the latest (SteamOwnedLibrary.cloudHold):
+    /// the alert Play shows before starting it.
+    struct CloudNotice: Equatable {
+        enum Kind { case syncing, unchecked, conflict }
+        var appID: Int
+        var kind: Kind
+        var title: String
+        var message: String
+    }
+    @Published var cloudNotice: CloudNotice?
+    /// Starts the game the notice is about again.
+    var cloudRetry: (() -> Void)?
+    /// The game (App ID) allowed to start once without the check ("Launch anyway").
+    var cloudBypass: Int?
+    /// The entry whose details page the library should open (the notice's "Choose").
+    @Published var showDetail: UUID?
 
     /// `remember: false` runs a session that is not a library entry (a Madeira
     /// Dock start): it is neither added to the library nor stamped as played.
@@ -2088,6 +2104,12 @@ struct LibraryView: View {
         .onChange(of: model.error) { _, error in if error != nil { selected = nil } }
         .onChange(of: model.restartNotice) { _, notice in if notice != nil { selected = nil } }
         .onChange(of: model.jitNotice) { _, notice in if notice != nil { selected = nil } }
+        .onChange(of: model.cloudNotice) { _, notice in if notice != nil { selected = nil } }
+        .onChange(of: model.showDetail) { _, id in
+            guard let id else { return }
+            model.showDetail = nil
+            selected = model.entries.first { $0.id == id }
+        }
         .alert("Library", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
             Button("OK", role: .cancel) { model.error = nil }
         } message: { Text(model.error ?? "") }
@@ -2284,6 +2306,7 @@ struct LibraryDetail: View {
                 // How a Steam game starts sits under its library details (SteamGames.swift).
                 if entry.steamAppID != nil {
                     SteamEntrySection(entry: $entry) { leaving = true; dismiss() }
+                    if let appID = entry.steamAppID { SteamCloudSection(appID: appID) }
                 }
                 Section("Display") {
                     // The Windows screen the game renders for (and the Desktop's size).
@@ -2928,6 +2951,10 @@ struct LibraryHUD: View {
                             model.overlayFields.removeAll { $0 == field }; if on { model.overlayFields.append(field) }
                         })).font(.subheadline)
                     }
+                }
+                if let appID = model.activeEntry?.steamAppID, SteamOwnedLibrary.cloudQuitEnabled {
+                    Divider()
+                    SteamCloudQuitRow(appID: appID)
                 }
                 Divider()
                 // Red label and symbol; the menu's .primary style would otherwise win.

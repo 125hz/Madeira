@@ -1250,6 +1250,27 @@ struct ContentView: View {
                 Button("Enable JIT") { library.jitNotice = nil; enableJITViaStikDebug() }
                 Button("Later", role: .cancel) { library.jitNotice = nil }
             } message: { Text(library.jitNotice ?? "") }
+            // A Steam game's saves may not be the latest (cloudClear).
+            .alert(library.cloudNotice?.title ?? "Steam Cloud", isPresented: Binding(get: { library.cloudNotice != nil },
+                                                                                     set: { if !$0 { library.cloudNotice = nil } })) {
+                if let notice = library.cloudNotice {
+                    switch notice.kind {
+                    case .syncing: Button("Wait and sync") { library.cloudNotice = nil; cloudWait(notice.appID) }
+                    case .unchecked: Button("Try again") { library.cloudNotice = nil; cloudWait(notice.appID) }
+                    case .conflict:
+                        Button("Choose") {
+                            library.cloudNotice = nil; library.cloudRetry = nil
+                            library.showDetail = library.entries.first { $0.steamAppID == notice.appID }?.id
+                        }
+                    }
+                    Button("Launch anyway") {
+                        LogStore.shared.log("[steam-cloud] app=\(notice.appID) before-play: launched anyway")
+                        library.cloudNotice = nil; library.cloudBypass = notice.appID
+                        let retry = library.cloudRetry; library.cloudRetry = nil; retry?()
+                    }
+                    Button("Cancel", role: .cancel) { library.cloudNotice = nil; library.cloudRetry = nil }
+                }
+            } message: { Text(library.cloudNotice?.message ?? "") }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
                 library.refreshFlag()
                 if library.enabled && library.current == nil { MetalHostView.shared.isHidden = true }
@@ -2277,6 +2298,50 @@ struct ContentView: View {
         return false
     }
 
+    /// Whether a Steam game may start as far as its Steam Cloud saves go. If a sync
+    /// is running, the last check failed or never ran, or saves wait for a choice,
+    /// an alert asks first; `retry` starts the game again from there. A check that
+    /// is only old is repeated first, without asking.
+    private func cloudClear(_ appID: Int, name: String, retry: @escaping () -> Void) -> Bool {
+        guard library.enabled else { return true }
+        if library.cloudBypass == appID { library.cloudBypass = nil; return true }
+        guard let hold = SteamOwnedLibrary.shared.cloudHold(appID) else { return true }
+        library.cloudRetry = retry
+        if hold == .stale { cloudWait(appID); return false }
+        LogStore.shared.log("[steam-cloud] app=\(appID) before-play: held \(hold)")
+        library.cloudNotice = cloudNotice(appID, name: name, hold: hold)
+        return false
+    }
+
+    private func cloudNotice(_ appID: Int, name: String, hold: SteamOwnedLibrary.CloudHold) -> LibraryModel.CloudNotice {
+        switch hold {
+        case .syncing, .stale:
+            return .init(appID: appID, kind: .syncing, title: "Steam Cloud is still syncing",
+                         message: "\(name)'s saves are still being checked or downloaded. Starting now may leave you on older saves.")
+        case .unchecked(let why):
+            return .init(appID: appID, kind: .unchecked, title: "Steam Cloud could not be checked",
+                         message: "Madeira does not know whether \(name)'s saves on this device are the latest."
+                            + (why.map { " (\($0))" } ?? "") + " If another device has newer saves, starting now means choosing between them later.")
+        case .conflict(let count):
+            return .init(appID: appID, kind: .conflict, title: "Saves differ from Steam Cloud",
+                         message: "\(count) of \(name)'s save\(count == 1 ? "" : "s") differ\(count == 1 ? "s" : "") between this device and Steam Cloud. Choose which to keep on the game's page, or start with this device's saves.")
+        }
+    }
+
+    /// Syncs the game's saves, then starts it; if the saves are still not settled, asks again.
+    private func cloudWait(_ appID: Int) {
+        guard SteamOwnedLibrary.shared.cloudWaitingFor == nil else { return }
+        let name = MadeiraDock.games(drive: MadeiraDock.drive).first { $0.id == appID }?.name ?? "This game"
+        Task { @MainActor in
+            let hold = await SteamOwnedLibrary.shared.settleCloud(appID)
+            if let hold {
+                library.cloudNotice = cloudNotice(appID, name: name, hold: hold)
+            } else {
+                let retry = library.cloudRetry; library.cloudRetry = nil; retry?()
+            }
+        }
+    }
+
     /// Play in the library (Library.swift): checks that a session can start,
     /// applies the entry's launch profile and runs the same full sequence as the
     /// developer interface's buttons.
@@ -2293,6 +2358,7 @@ struct ContentView: View {
             return
         }
         if let appID = entry.steamAppID {
+            guard cloudClear(appID, name: entry.title, retry: { launchLibraryEntry(entry) }) else { return }
             guard entry.steamProgram?.isEmpty == false else {
                 library.error = "Choose the program to start in Game details › Steam › Program."; return
             }
@@ -2957,6 +3023,7 @@ struct ContentView: View {
     private func startDock(_ game: DockGame, compactPool: Bool, profile: LibraryEntry? = nil) {
         let inLibrary = library.enabled
         guard jitReadyForLaunch(inLibrary: inLibrary) else { return }
+        guard cloudClear(game.id, name: game.name, retry: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }
         guard wine_process_is_running() == 0, wineserver_is_running() == 0, !inLibrary || library.current == nil else {
             logStore.log("[madeira-dock] a session already ran in this app run; restart Madeira first", level: .error)
             if inLibrary { library.error = "A session is already running." }
