@@ -175,7 +175,10 @@ token stays in sign-in's Keychain store), and Madeira Dock
 `MadeiraDockModel.prepareClient()`/`MadeiraDockView`.
 
 **First-run setup.** On a new install the library opens a full-screen setup
-once: welcome, **Set up JIT**, **Sign in to Steam**, **Prepare Madeira Dock**
+once: welcome, **Install LocalDevVPN** (only when it is missing: every JIT way
+reaches the device through it; **Get LocalDevVPN** opens the App Store, and
+Madeira checks again with `canOpenURL` whenever it comes back to the front),
+**Set up JIT**, **Sign in to Steam**, **Prepare Madeira Dock**
 (Valve's client components, about 73 MB, only when Dock is available), done.
 The JIT page offers three ways in, **On-device** (iOS 27 and later),
 **On-device with pairing file** and **StikDebug**, or **I'll do this later**.
