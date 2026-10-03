@@ -7900,6 +7900,50 @@ static ULONG_PTR ios_wow_extend_holdback_tail( unsigned *guard_owned )
     return ios_wow_window_try( base, guard_owned ) ? base : 0;
 }
 
+/* Give the unclaimed [cage] holdback to Wine's allocator when the band is
+ * exhausted.
+ *
+ * The holdback is 8 GB of a ~15 GB furniture window. A session with no
+ * Chromium never claims it, and a guest that reserves address space freely can
+ * fill the rest, so that even a 1 MB request fails. Handing the holdback over
+ * then costs nothing the session was going to use.
+ *
+ * Only for a failed request whose search range [start, end) could be served
+ * from the holdback: anything else gains nothing from it, and the holdback
+ * stays whole for the cage grant and the guest-window carve.
+ *
+ * WHAT IS HANDED OVER. The holdback becomes a Wine reserved area, as a guest
+ * window is: the VA stays mapped PROT_NONE and ours, and map_reserved_area
+ * places views in it. No munmap, so the kernel never sees a hole another
+ * mapping could take. Its first host page is kept out: a guest window at
+ * 0x7100000000 that found only an exact 4 GB gap borrowed its overrun guard
+ * from it (ios_wow_window_try), and that page must stay inaccessible.
+ * ios_cage_holdback_live is cleared, which disables the cage grant (it munmaps
+ * the whole range) and the carve.
+ *
+ * Off unless MADEIRA_CAGE_RELEASE=1, which the app sets for a Madeira Dock
+ * session (headless Steam client, no CEF). Called with virtual_mutex held.
+ * Returns 1 if the holdback was handed over. */
+static int ios_cage_release_on_exhaustion( void *start, void *end, size_t want )
+{
+    /* 1: when the guest band is exhausted, hand the unclaimed 8 GB V8 cage
+     * holdback to it. Set by the app for a Madeira Dock session; off otherwise. */
+    const char *e = getenv( "MADEIRA_CAGE_RELEASE" );
+    const ULONG_PTR lo = IOS_CAGE_BASE + ios_wow_guard_size();
+    const ULONG_PTR hi = IOS_CAGE_BASE + IOS_CAGE_REAL_SIZE;
+    ULONG_PTR s = (ULONG_PTR)start > lo ? (ULONG_PTR)start : lo;
+    ULONG_PTR t = (ULONG_PTR)end < hi ? (ULONG_PTR)end : hi;
+
+    if (!ios_cage_holdback_live || !e || *e != '1') return 0;
+    if (t <= s || t - s < want) return 0;
+    mmap_add_reserved_area( (void *)lo, hi - lo );
+    ios_cage_holdback_live = 0;
+    dprintf( 2, "[cage] holdback handed to the allocator [%p,%p): the band is exhausted "
+                "(request 0x%lx) and no V8 cage was asked for; its first page stays a guard\n",
+             (void *)lo, (void *)hi, (unsigned long)want );
+    return 1;
+}
+
 static ULONG_PTR ios_wow_window_pick( unsigned *guard_owned )
 {
     ULONG_PTR floor, ceil;
@@ -11187,10 +11231,11 @@ volatile int ios_in_mach_exc;
  * host meaning, while VPROT_WRITE is load-bearing -- it is what makes an inline
  * hook, a runtime relocation fixup, or the emulator's own SMC untrap land.
  *
- * Deliberately NOT "anything in the window": a guest that allocates anonymous
- * RWX memory (a managed runtime's code buffers) still needs the pool alias and
- * the store emulator, and those views are not SEC_IMAGE.  The test is the view,
- * not the address range.
+ * Deliberately NOT "anything in the window": a guest's anonymous executable
+ * memory is decided by its own rule (ios_guest_anon_rwx_is_host_data, below):
+ * a managed runtime's code buffers keep the pool alias and the store emulator,
+ * and those views are not SEC_IMAGE.  The test is the view, not the address
+ * range.
  *
  * virtual_mutex is held by every caller that can reach here (mprotect_range from
  * set_vprot, and the map_image section loop), so find_view() is safe. */
@@ -11216,6 +11261,93 @@ static int ios_guest_image_is_host_data( const void *base, size_t size )
     if (!ios_wow_in_window( base )) return 0;
     if (!(view = find_view( base, size ))) return 0;
     return (view->protect & SEC_IMAGE) != 0;
+#else
+    return 0;
+#endif
+}
+
+
+/* A guest's anonymous RWX data heap is plain read/write memory to the host.
+ *
+ * Some runtimes allocate their data heap PAGE_EXECUTE_READWRITE (Mono's Boehm
+ * GC does). mprotect_exec cannot grant host exec, so it would back the heap
+ * with a JIT-pool R+X slot and route every store through the store emulator.
+ * Host exec is not needed: x86 bytes are decoded by FEX, never fetched by the
+ * host, and FEX tracks SMC on RWX ranges itself through NtProtectVirtualMemory
+ * (see ml1030). So PROT_EXEC is dropped for such a heap.
+ *
+ * Excluded, because they need (or already have) the pool path: EC_CODE requests
+ * (ios_alloc_ec_code while the request is in flight, VPROT_ARM64EC afterwards),
+ * the JIT pool, alias-backed ranges, images, file mappings, and views under
+ * 64 KB (possible native thunk pages).
+ *
+ * Guest JIT code chunks are excluded too: guests patch them with unaligned
+ * atomics, which must not land on a plain page FEX has armed for SMC. Two tests
+ * keep them out. Only a view ALLOCATED read-write-execute qualifies (its
+ * allocation protection, view->protect, has both VPROT_WRITE and VPROT_EXEC),
+ * as a GC heap is: a JIT that allocates read-write and makes its code
+ * executable later keeps the pool path. And code and data are told apart by
+ * size, a heuristic: Boehm's heap chunks are an expansion plus one 4 KB page
+ * (0x41000, ...), never a multiple of 64 KB, while Mono's code chunks, also
+ * allocated RWX, are (0x100000). A data heap sized in 64 KB multiples just
+ * keeps the pool path.
+ *
+ * The decision is per allocation and permanent. A page must not move to the
+ * pool later: that copies and remaps a live page, and a store landing between
+ * the two is lost.
+ *
+ * MADEIRA_GUEST_RWX_DATA=0 restores the previous behaviour. */
+static int ios_alloc_ec_code;   /* set by allocate_virtual_memory under virtual_mutex */
+
+static int ios_guest_rwx_data_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        /* On by default: a guest's anonymous RWX data heap (Mono's Boehm GC) is
+         * plain read/write memory. 0 maps it through the JIT pool again, with
+         * every store emulated, as before. */
+        const char *s = getenv( "MADEIRA_GUEST_RWX_DATA" );
+        cached = (s && (*s == '0' || *s == 'n' || *s == 'N')) ? 0 : 1;
+    }
+    return cached;
+}
+
+static int ios_guest_anon_rwx_view_ok( const struct file_view *view )
+{
+    if (!is_view_valloc( view )) return 0;
+    if (view->protect & (SEC_IMAGE | VPROT_ARM64EC | VPROT_SYSTEM)) return 0;
+    /* allocated RWX, not made executable after the fact: see above */
+    if ((view->protect & (VPROT_WRITE | VPROT_EXEC)) != (VPROT_WRITE | VPROT_EXEC)) return 0;
+    if (view->size < 0x10000) return 0;
+    return (view->size & 0xffff) != 0;   /* data, not a code chunk: see above */
+}
+
+/* The range is host-page rounded (16 KB) and can run past the end of a guest
+ * allocation (0x41000 -> 0x44000), so every view it touches must qualify. */
+static int ios_guest_anon_rwx_is_host_data( const void *base, size_t size )
+{
+#ifdef WINE_IOS
+    extern int ios_jit_anon_alias_find_cover(void *, size_t, void **, void **);
+    extern void *ios_jit_rx_base_global;
+    extern size_t ios_jit_pool_size_global;
+    void *cov_rw = NULL, *cov_rx = NULL;
+    uintptr_t b = (uintptr_t)base, e = b + size, a, rx = (uintptr_t)ios_jit_rx_base_global;
+    int any = 0;
+
+    if (!ios_guest_rwx_data_enabled() || ios_alloc_ec_code || !arm64ec_view) return 0;
+    if (e <= b) return 0;
+    if (rx && e > rx && b < rx + ios_jit_pool_size_global) return 0;
+    if (ios_jit_anon_alias_find_cover( (void *)base, size, &cov_rw, &cov_rx )) return 0;
+    for (a = b; a < e; )
+    {
+        struct file_view *view = find_view( (const void *)a, 1 );
+        if (!view) { a = (a + 0x1000) & ~(uintptr_t)0xfff; continue; }   /* rounding gap */
+        if (!ios_guest_anon_rwx_view_ok( view )) return 0;
+        any = 1;
+        a = (uintptr_t)view->base + view->size;
+    }
+    return any;
 #else
     return 0;
 #endif
@@ -11274,6 +11406,21 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                      (unix_prot & PROT_WRITE) ? 'w' : '-' );
         unix_prot &= ~PROT_EXEC;
         if (!unix_prot) unix_prot = PROT_READ;   /* PAGE_EXECUTE alone: readable is the honest answer */
+    }
+    else if ((unix_prot & PROT_EXEC) && ios_guest_anon_rwx_is_host_data( base, size ))
+    {
+        static unsigned long grd_n;
+        if (++grd_n <= 24 && !ios_in_mach_exc)
+            dprintf( 2, "[guest-rwx] #%lu %p+0x%lx prot=%c%c%c — anonymous guest memory, "
+                        "EXEC is FEX bookkeeping; applying %c%c- instead\n",
+                     grd_n, base, (unsigned long)size,
+                     (unix_prot & PROT_READ)  ? 'r' : '-',
+                     (unix_prot & PROT_WRITE) ? 'w' : '-',
+                     (unix_prot & PROT_EXEC)  ? 'x' : '-',
+                     (unix_prot & PROT_READ)  ? 'r' : '-',
+                     (unix_prot & PROT_WRITE) ? 'w' : '-' );
+        unix_prot &= ~PROT_EXEC;
+        if (!unix_prot) unix_prot = PROT_READ;
     }
 
 #endif
@@ -13851,6 +13998,11 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
             unsigned int skips0 = ios_va_scan_skips;
 
             ptr = map_free_area( start, end, host_size, top_down, unix_prot, align_mask );
+#ifdef WINE_IOS
+            /* the holdback is now a reserved area: place the view there */
+            if (!ptr && ios_cage_release_on_exhaustion( start, end, view_size ))
+                ptr = map_reserved_area( start, end, host_size, top_down, unix_prot, align_mask );
+#endif
             /* [va-scan] the ml116/ml117 probe: a healthy scan costs a handful of
              * tryfixed calls. Hundreds means we are grinding unmappable VA;
              * ptr==NULL is the silent STATUS_NO_MEMORY that handed rpmalloc a
@@ -19402,6 +19554,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     /* Reserve the memory */
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    ios_alloc_ec_code = (attributes & MEM_EXTENDED_PARAMETER_EC_CODE) != 0;   /* see ios_guest_anon_rwx_is_host_data */
 
     if ((type & MEM_RESERVE) || !base)
     {
@@ -19547,6 +19700,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
 
     if (!status) VIRTUAL_DEBUG_DUMP_VIEW( view );
 
+    ios_alloc_ec_code = 0;
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
 
     if (status == STATUS_SUCCESS)

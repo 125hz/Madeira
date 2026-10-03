@@ -656,6 +656,22 @@ final class LibraryModel: ObservableObject {
     /// CS_DEBUGGED is set but no debugger is attached (JIT was enabled outside
     /// Madeira): the text of the alert that offers Madeira's own Enable JIT.
     @Published var jitNotice: String?
+    /// A Steam game's saves may not be the latest (SteamOwnedLibrary.cloudHold):
+    /// the alert Play shows before starting it.
+    struct CloudNotice: Equatable {
+        enum Kind { case syncing, unchecked, conflict }
+        var appID: Int
+        var kind: Kind
+        var title: String
+        var message: String
+    }
+    @Published var cloudNotice: CloudNotice?
+    /// Starts the game the notice is about again.
+    var cloudRetry: (() -> Void)?
+    /// The game (App ID) allowed to start once without the check ("Launch anyway").
+    var cloudBypass: Int?
+    /// The entry whose details page the library should open (the notice's "Choose").
+    @Published var showDetail: UUID?
 
     /// `remember: false` runs a session that is not a library entry (a Madeira
     /// Dock start): it is neither added to the library nor stamped as played.
@@ -1961,11 +1977,12 @@ struct LibraryView: View {
                 SettingsSearchResults(query: settingsSearch.trimmingCharacters(in: .whitespaces), refresh: settingsRefresh)
             }
             // Credits, last on the Settings page.
-            if settingsShow("credits", "thanks", "Will Faust", "Nick", "125hz", "Jfishin") {
+            if settingsShow("credits", "thanks", "Will Faust", "Nick", "125hz", "Jfishin", "Jesse", "JesseLovelace") {
                 Section {
                     MadeiraCredit(name: "Will Faust", handle: "willfaust", role: "Created Madeira")
                     MadeiraCredit(name: "Nick", handle: "125hz", role: "32-bit game support, the game library and Madeira Dock")
                     MadeiraCredit(name: "Jfishin", handle: "Jfishin", role: "The original native Steam sign-in, library and downloads")
+                    MadeiraCredit(name: "Jesse", handle: "JesseLovelace", role: "Steam Cloud saves, faster game launches, and fixes that let more games run")
                 } header: { Text("Credits") } footer: {
                     Text("Madeira is built on Wine, FEX-Emu, DXMT by Feifan He (3Shain) with the Direct3D 9 frontend by David Acevedo (dacevedo12), rpmalloc by Mattias Jansson, StikDebug and StikJIT. Thank you to everyone who contributes to these projects.")
                 }
@@ -2091,6 +2108,12 @@ struct LibraryView: View {
         .onChange(of: model.error) { _, error in if error != nil { selected = nil } }
         .onChange(of: model.restartNotice) { _, notice in if notice != nil { selected = nil } }
         .onChange(of: model.jitNotice) { _, notice in if notice != nil { selected = nil } }
+        .onChange(of: model.cloudNotice) { _, notice in if notice != nil { selected = nil } }
+        .onChange(of: model.showDetail) { _, id in
+            guard let id else { return }
+            model.showDetail = nil
+            selected = model.entries.first { $0.id == id }
+        }
         .alert("Library", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
             Button("OK", role: .cancel) { model.error = nil }
         } message: { Text(model.error ?? "") }
@@ -2284,8 +2307,10 @@ struct LibraryDetail: View {
                     Button("Choose cover image", systemImage: "photo") { importCover = true }
                     if entry.coverFile != nil { Button((entry.steamAppID ?? entry.steamID) != nil ? "Use Steam artwork" : "Remove cover image") { entry.coverFile = nil } }
                 } }
-                // How a Steam game starts sits under its library details (SteamGames.swift).
-                if entry.steamAppID != nil {
+                // A Steam game's cloud saves, then how it starts, under its library
+                // details (SteamGames.swift).
+                if let appID = entry.steamAppID {
+                    SteamCloudSection(appID: appID)
                     SteamEntrySection(entry: $entry) { leaving = true; dismiss() }
                 }
                 Section("Display") {
@@ -2931,6 +2956,10 @@ struct LibraryHUD: View {
                             model.overlayFields.removeAll { $0 == field }; if on { model.overlayFields.append(field) }
                         })).font(.subheadline)
                     }
+                }
+                if let appID = model.activeEntry?.steamAppID, SteamOwnedLibrary.cloudQuitEnabled {
+                    Divider()
+                    SteamCloudQuitRow(appID: appID)
                 }
                 Divider()
                 // Red label and symbol; the menu's .primary style would otherwise win.
