@@ -59,10 +59,11 @@ typedef int NTSTATUS;
 #define ERR(...) do { } while (0)
 static void *cur_peb;
 void *ios_jit_current_peb(void) { return cur_peb; }
-int ios_subfloor_enum( int idx, unsigned long long *low, unsigned long long *real, unsigned long long *size )
-{ (void)idx; (void)low; (void)real; (void)size; return 0; }
-void ios_push_subfloor_window( unsigned long long a, unsigned long long b, unsigned long long c )
-{ (void)a; (void)b; (void)c; }
+int ios_subfloor_enum( int idx, unsigned long long *low, unsigned long long *real, unsigned long long *size,
+                       void **owner )
+{ (void)idx; (void)low; (void)real; (void)size; (void)owner; return 0; }
+void ios_push_subfloor_window( unsigned long long a, unsigned long long b, unsigned long long c, void *owner )
+{ (void)a; (void)b; (void)c; (void)owner; }
 static void ios_resolve_fex_exports( void ) { }
 '''
 code += between(native, '#define IOS_JIT_MAX_MAPPINGS', '\n};')
