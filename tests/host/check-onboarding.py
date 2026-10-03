@@ -71,7 +71,7 @@ require(not re.search(r'\b(SwiftUI|UIKit|View|UIDevice)\b', rules.replace('// MA
 
 # ------------------------------------------------------------------ static: when setup opens
 present = block(model, 'func presentIfNeeded()')
-require('guard !considered' in present and 'OnboardingRules.shouldShow(done: Self.done, enabled: Self.enabled, steps: steps)' in present,
+require('guard !considered' in present and 'OnboardingRules.shouldShow(seen: Self.seen, enabled: Self.enabled, steps: steps)' in present,
         'setup is considered once per run and opens only by the rules')
 opener = block(model, 'private func open(reason: String)')
 require('LibraryModel.shared.current == nil' in opener and 'wine_process_is_running() == 0' in opener and 'guard available' in opener,
@@ -80,11 +80,10 @@ require('OnboardingRules.steps(signIn: SteamSignIn.isEnabled, dock: MadeiraDock.
         'the pages follow the sign-in and Dock switches, and whether LocalDevVPN is installed')
 require(opener.index('offerLocalDevVPN = !LocalDevVPN.isInstalled') < opener.index('[onboarding] shown'),
         "LocalDevVPN's page is decided once, when setup opens, so installing it on the way does not renumber the steps")
-require(model.count('UserDefaults.standard.set(true, forKey: OnboardingRules.doneKey)') == 2
-        and 'UserDefaults.standard.set(true, forKey: OnboardingRules.doneKey)' in block(model, 'func finish()')
-        and 'UserDefaults.standard.set(true, forKey: OnboardingRules.doneKey)' in block(model, 'func skip()')
-        and 'removeObject' not in onboarding and 'set(false' not in onboarding,
-        'only finishing or skipping stores the done key; nothing clears it')
+stamp = 'UserDefaults.standard.set(OnboardingRules.revision, forKey: OnboardingRules.revisionKey)'
+require(model.count(stamp) == 2 and stamp in block(model, 'func finish()') and stamp in block(model, 'func skip()')
+        and 'removeObject' not in onboarding and 'set(false' not in onboarding and 'set(0' not in onboarding,
+        'only finishing or skipping stores the setup revision; nothing clears it')
 require('static var enabled: Bool { OnboardingRules.enabled }' in model, 'the model uses the rules switch')
 require('.fullScreenCover(isPresented: $onboarding.presented) { OnboardingView() }' in library,
         'Library: setup is presented over the library')
@@ -195,7 +194,7 @@ import Foundation
     static func main() {
         typealias R = OnboardingRules
         let full: [R.Step] = [.welcome, .jit, .signIn, .dockClient, .done]
-        expect(R.doneKey == "madeiraOnboardingDone", "done key")
+        expect(R.revisionKey == "madeiraOnboardingRevision" && R.revision >= 2, "revision key; revision 2 or later")
         expect(R.Step.jit.rawValue == "jit" && R.Step.signIn.rawValue == "sign-in"
                && R.Step.dockClient.rawValue == "dock-client", "log step names")
 
@@ -215,19 +214,26 @@ import Foundation
                && !R.hasSetup([.welcome, .done]), "hasSetup")
 
         // First-run decision.
-        expect(R.shouldShow(done: false, enabled: true, steps: full), "new install shows setup")
-        expect(!R.shouldShow(done: true, enabled: true, steps: full), "finished or skipped setup stays closed")
-        expect(!R.shouldShow(done: false, enabled: false, steps: full), "MADEIRA_ONBOARDING=0 never shows it")
-        expect(!R.shouldShow(done: false, enabled: true, steps: [.welcome, .done]),
+        expect(R.shouldShow(seen: 0, enabled: true, steps: full), "new install shows setup")
+        expect(R.shouldShow(seen: R.revision - 1, enabled: true, steps: full),
+               "an update that raised the revision shows setup once more")
+        expect(!R.shouldShow(seen: R.revision, enabled: true, steps: full)
+               && !R.shouldShow(seen: R.revision + 1, enabled: true, steps: full),
+               "setup finished or skipped at this revision (or a later one, after a downgrade) stays closed")
+        expect(!R.shouldShow(seen: 0, enabled: false, steps: full), "MADEIRA_ONBOARDING=0 never shows it")
+        expect(!R.shouldShow(seen: 0, enabled: true, steps: [.welcome, .done]),
                "synthetic setup with no middle page never shows")
 
-        // The done key in UserDefaults.
+        // The revision in UserDefaults.
         let suite = "madeira-onboarding-check"
         let defaults = UserDefaults(suiteName: suite)!
         defaults.removePersistentDomain(forName: suite)
-        expect(R.shouldShow(done: defaults.bool(forKey: R.doneKey), enabled: true, steps: full), "missing key (fresh install) shows setup")
-        defaults.set(true, forKey: R.doneKey)
-        expect(!R.shouldShow(done: defaults.bool(forKey: R.doneKey), enabled: true, steps: full), "stored key hides setup")
+        expect(R.shouldShow(seen: defaults.integer(forKey: R.revisionKey), enabled: true, steps: full), "missing key (fresh install) shows setup")
+        defaults.set(true, forKey: "madeiraOnboardingDone")
+        expect(R.shouldShow(seen: defaults.integer(forKey: R.revisionKey), enabled: true, steps: full),
+               "setup finished before revisions (only madeiraOnboardingDone) shows once more")
+        defaults.set(R.revision, forKey: R.revisionKey)
+        expect(!R.shouldShow(seen: defaults.integer(forKey: R.revisionKey), enabled: true, steps: full), "stored revision hides setup")
         defaults.removePersistentDomain(forName: suite)
 
         // Navigation and the step counter.

@@ -7,8 +7,9 @@ import UIKit
 import UniformTypeIdentifiers
 
 // First-run setup for JIT, Steam sign-in and Madeira Dock (docs/LIBRARY.md).
-// On a new install (no `madeiraOnboardingDone` in UserDefaults, which iOS
-// removes with the app) the library opens a full-screen setup: welcome, JIT,
+// On a new install, and once after an update that raises the setup revision
+// (`madeiraOnboardingRevision` in UserDefaults, which iOS removes with the app,
+// is below OnboardingRules.revision), the library opens a full-screen setup: welcome, JIT,
 // Steam sign-in, Valve's client components for Madeira Dock (only when Dock is
 // available), done. Every step can be skipped. Settings › JIT or Settings ›
 // Steam can reopen it. env.MADEIRA_ONBOARDING = 0 never opens it.
@@ -27,7 +28,12 @@ import UniformTypeIdentifiers
 // MARK: - Rules (Foundation and MadeiraConfig only; tests/host/check-onboarding.py compiles this part)
 
 enum OnboardingRules {
-    static let doneKey = "madeiraOnboardingDone"
+    /// The setup revision this device last finished or skipped. Raise `revision` in a
+    /// release whose setup every existing install should see once.
+    static let revisionKey = "madeiraOnboardingRevision"
+    /// 1 was the first setup, stored as `madeiraOnboardingDone` (no longer read); 2 adds
+    /// Install LocalDevVPN, on-device pairing and the Madeira JIT shortcut.
+    static let revision = 2
 
     /// `env.MADEIRA_ONBOARDING = 0` (madeira.cfg or the environment) never opens
     /// setup and hides "Run setup again". On by default.
@@ -56,8 +62,8 @@ enum OnboardingRules {
     }
 
     /// Whether setup opens by itself when the library appears.
-    static func shouldShow(done: Bool, enabled: Bool, steps: [Step]) -> Bool {
-        enabled && !done && hasSetup(steps)
+    static func shouldShow(seen: Int, enabled: Bool, steps: [Step]) -> Bool {
+        enabled && seen < revision && hasSetup(steps)
     }
 
     /// The page after `step`, or nil when setup is finished.
@@ -86,7 +92,8 @@ enum OnboardingRules {
     private var considered = false
 
     static var enabled: Bool { OnboardingRules.enabled }
-    static var done: Bool { UserDefaults.standard.bool(forKey: OnboardingRules.doneKey) }
+    /// 0 on a new install, and on one that finished setup before revisions (revision 1).
+    static var seen: Int { UserDefaults.standard.integer(forKey: OnboardingRules.revisionKey) }
 
     /// LocalDevVPN was missing when setup opened, so its page is offered. Fixed for that
     /// run of setup: installing it on the way does not renumber the steps.
@@ -99,12 +106,13 @@ enum OnboardingRules {
 
     private init() {}
 
-    /// The library appeared: open setup once on a new install.
+    /// The library appeared: open setup once on a new install, and once after an update
+    /// that raised the setup revision.
     func presentIfNeeded() {
         guard !considered else { return }
         considered = true
-        guard OnboardingRules.shouldShow(done: Self.done, enabled: Self.enabled, steps: steps) else { return }
-        open(reason: "first-run")
+        guard OnboardingRules.shouldShow(seen: Self.seen, enabled: Self.enabled, steps: steps) else { return }
+        open(reason: "revision \(Self.seen)->\(OnboardingRules.revision)")
     }
 
     /// Settings › Steam › Run setup again.
@@ -131,13 +139,13 @@ enum OnboardingRules {
 
     /// "Skip setup" on the welcome page: done, and not shown again.
     func skip() {
-        UserDefaults.standard.set(true, forKey: OnboardingRules.doneKey)
+        UserDefaults.standard.set(OnboardingRules.revision, forKey: OnboardingRules.revisionKey)
         LogStore.shared.log("[onboarding] skipped")
         close()
     }
 
     func finish() {
-        UserDefaults.standard.set(true, forKey: OnboardingRules.doneKey)
+        UserDefaults.standard.set(OnboardingRules.revision, forKey: OnboardingRules.revisionKey)
         LogStore.shared.log("[onboarding] done")
         close()
     }

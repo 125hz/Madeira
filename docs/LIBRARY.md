@@ -174,8 +174,8 @@ token stays in sign-in's Keychain store), and Madeira Dock
 (`docs/MADEIRA_DOCK.md`) through
 `MadeiraDockModel.prepareClient()`/`MadeiraDockView`.
 
-**First-run setup.** On a new install the library opens a full-screen setup
-once: welcome, **Install LocalDevVPN** (only when it is missing: every JIT way
+**First-run setup.** On a new install (and once after an update that raises
+the setup revision, below) the library opens a full-screen setup: welcome, **Install LocalDevVPN** (only when it is missing: every JIT way
 reaches the device through it; **Get LocalDevVPN** opens the App Store, and
 Madeira checks again with `canOpenURL` whenever it comes back to the front),
 **Set up JIT**, **Sign in to Steam**, **Prepare Madeira Dock**
@@ -185,9 +185,13 @@ The JIT page offers three ways in, **On-device** (iOS 27 and later),
 Each way opens numbered steps that tick off as they are done, with **Back to
 options**. A completed pairing or a valid pairing-file import selects Built-in
 StikJIT; it does not enable JIT yet. Steam and Dock steps have **Set up later**, and the welcome
-page has **Skip setup**. Finishing or skipping stores
-`madeiraOnboardingDone` in the app's UserDefaults, which iOS removes with the
-app. The JIT page is always available; Steam pages follow their feature
+page has **Skip setup**. Finishing or skipping stores the setup revision
+(`madeiraOnboardingRevision`) in the app's UserDefaults, which iOS removes with
+the app. Setup opens on a new install, and once after an update whose
+`OnboardingRules.revision` is higher than the stored one; raise it in a release
+whose setup every existing install should see. Revision 2 (Install LocalDevVPN,
+on-device pairing, the Madeira JIT shortcut) also reopens setup for installs
+that finished it before revisions (`madeiraOnboardingDone`). The JIT page is always available; Steam pages follow their feature
 switches. Setup never opens over a running session.
 
 Setup starts no Wine session and allocates no JIT pool. It stores the selected
