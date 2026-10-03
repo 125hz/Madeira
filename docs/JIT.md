@@ -100,6 +100,12 @@ requests.
 If setup reports stale Developer Disk Image data after an iOS update, use
 **Reset Developer Disk Image**, then **Check setup** again.
 
+If the device resets the connection, it no longer accepts the pairing (each
+on-device pairing replaces the last), so Madeira offers **Pair Again**. If the
+device can't be reached, it offers **Connect LocalDevVPN**, or **Get
+LocalDevVPN** when the app isn't installed; LocalDevVPN returns to Madeira
+through its `madeira://` URL scheme once connected.
+
 ## Signing and installation
 
 The app and `MadeiraJITHelper` extension must be signed together. Sideloaders

@@ -122,4 +122,18 @@ require(project.count('PRODUCT_BUNDLE_IDENTIFIER = "$(MADEIRA_BUNDLE_IDENTIFIER)
         and "AppExtensionPoint.Identifier(" not in helper_source,
         "one setting, MADEIRA_BUNDLE_IDENTIFIER, names the app, the helper and its extension point")
 
+problem = setup[setup.index("enum ConnectionProblem"):setup.index("var message: String")]
+require(problem.index('"connectionreset"') < problem.index("self = .pairing") < problem.index('"connectionrefused"')
+        < problem.index('"timedout"') < problem.index("self = .vpn"),
+        "a reset connection reads as a rejected pairing; refused, timed out or unreachable as LocalDevVPN")
+require(setup.count("helperFailure(response.message)") == 2,
+        "Check setup and Enable JIT both explain connection problems")
+library_source = (app / "Library.swift").read_text()
+require("if let jitProblem { jitConnectionActions(jitProblem) { model.error = nil } }" in library_source,
+        "the library's JIT error offers Pair Again and LocalDevVPN")
+require('URL(string: "localdevvpn://enable?scheme=madeira")' in setup
+        and "localdevvpn" in app_plist["LSApplicationQueriesSchemes"]
+        and any("madeira" in t.get("CFBundleURLSchemes", []) for t in app_plist.get("CFBundleURLTypes", [])),
+        "LocalDevVPN opens to connect and returns to Madeira's own URL scheme")
+
 print("check-jit-method: PASS")
