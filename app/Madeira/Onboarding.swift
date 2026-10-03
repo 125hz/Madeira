@@ -153,7 +153,11 @@ struct OnboardingView: View {
     @State private var pairingImportError: String?
     @State private var jitPath: JITSetupPath?
 
-    enum JITSetupPath: String { case onDevice = "on-device", pairingFile = "pairing-file", stikDebug = "stikdebug" }
+    enum JITSetupPath: String {
+        case onDevice = "on-device", pairingFile = "pairing-file", stikDebug = "stikdebug"
+        /// After a way in is set up (iOS 27): the Madeira JIT shortcut, on its own page.
+        case shortcut
+    }
 
     private var device: String { UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone" }
 
@@ -269,6 +273,7 @@ struct OnboardingView: View {
         case .onDevice: onDeviceGuide
         case .pairingFile: pairingFileGuide
         case .stikDebug: stikDebugGuide
+        case .shortcut: shortcutPage
         }
     }
 
@@ -308,7 +313,6 @@ struct OnboardingView: View {
                 Label("Paired on this \(device)", systemImage: "checkmark.circle.fill")
                     .font(.headline).foregroundStyle(.green)
                 vpnNote
-                JITShortcutOffer()
                 primary("Continue", symbol: "arrow.right") { useBuiltIn() }
                 secondary("Pair again") { startPairing() }
             } else {
@@ -335,7 +339,6 @@ struct OnboardingView: View {
                 Label("Pairing file imported", systemImage: "checkmark.circle.fill")
                     .font(.headline).foregroundStyle(.green)
                 vpnNote
-                JITShortcutOffer()
                 primary("Continue", symbol: "arrow.right") { useBuiltIn() }
                 secondary("Choose another pairing file") { importPairingFile() }
             } else {
@@ -356,11 +359,10 @@ struct OnboardingView: View {
                 point(2, "Install and connect [LocalDevVPN](https://apps.apple.com/us/app/localdevvpn/id6755608044).")
                 point(3, "When you play, Madeira opens StikDebug to enable JIT, then comes back.")
             }
-            JITShortcutOffer()
             primary("Use StikDebug", symbol: "arrow.right") {
                 jit.method = .stikDebug
                 LogStore.shared.log("[onboarding] JIT method=StikDebug")
-                model.next()
+                finishJIT()
             }
             secondary("Back to options") { leaveGuide() }
         }
@@ -430,7 +432,56 @@ struct OnboardingView: View {
     private func useBuiltIn() {
         jit.method = .builtIn
         LogStore.shared.log("[onboarding] JIT method=built-in")
-        model.next()
+        finishJIT()
+    }
+
+    /// A way in is set up: the Madeira JIT shortcut's page on iOS 27, else the next step.
+    private func finishJIT() {
+        if JITShortcutFile.supported, JITShortcutFile.url != nil {
+            jitPath = .shortcut
+        } else {
+            model.next()
+        }
+    }
+
+    /// The Madeira JIT shortcut (iOS 27; JITShortcutFile), on its own page so the JIT
+    /// guides fit on one screen. Add it from its iCloud link (straight to Add Shortcut)
+    /// or, with no connection, Madeira's copy through the share sheet; then turn it on.
+    /// It drives LocalDevVPN with LocalDevVPN's own Shortcuts action.
+    private var shortcutPage: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            header("Connect automatically", symbol: "bolt.horizontal.circle")
+            Text("With the \(JITNetworkShortcut.name) shortcut, Enable JIT connects LocalDevVPN for you, turns Cellular Data off while there's no Wi-Fi, and puts both back, along with any VPN you were using, once the game starts.")
+                .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 14) {
+                point(1, "Install [LocalDevVPN](https://apps.apple.com/us/app/localdevvpn/id6755608044).",
+                      done: LocalDevVPN.isInstalled)
+                point(2, "Tap **Add the shortcut**, then **Add Shortcut** in Shortcuts.")
+                point(3, "Turn on **Use it for JIT**.", done: shortcut.enabled)
+            }
+            Button {
+                LogStore.shared.log("[jit-shortcut] add: iCloud link")
+                UIApplication.shared.open(JITShortcutFile.iCloudLink)
+            } label: {
+                Label("Add the shortcut", systemImage: "plus.square.on.square")
+                    .fontWeight(.semibold).frame(maxWidth: .infinity, minHeight: 36)
+            }
+            .buttonStyle(.bordered).controlSize(.large)
+            if let url = JITShortcutFile.url {
+                ShareLink(item: url) {
+                    Text("No connection? Add Madeira's copy, then choose Shortcuts.")
+                        .font(.footnote).frame(maxWidth: .infinity)
+                }
+            }
+            Toggle("Use it for JIT", isOn: $shortcut.enabled)
+                .padding(.horizontal, 14).padding(.vertical, 10)
+                .background(Color(uiColor: .secondarySystemGroupedBackground),
+                            in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            primary("Continue", symbol: "arrow.right") {
+                LogStore.shared.log("[onboarding] JIT shortcut on=\(shortcut.enabled ? 1 : 0)")
+                model.next()
+            }
+        }
     }
 
     private var signInPage: some View {

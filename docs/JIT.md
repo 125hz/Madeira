@@ -170,9 +170,9 @@ stays off.
 
 ### Getting the shortcut
 
-On iOS 27 and later, setup's JIT guides offer **Connect automatically** →
-**Add the shortcut**, and **Settings → JIT** has **Add the Madeira JIT
-shortcut**. Both open its iCloud link, which takes Shortcuts straight to **Add
+On iOS 27 and later, setup shows **Connect automatically** on its own page
+after any JIT guide, with **Add the shortcut** and the **Use it for JIT**
+switch, and **Settings → JIT** has **Add the Madeira JIT shortcut**. Both open its iCloud link, which takes Shortcuts straight to **Add
 Shortcut**, but needs a connection: iOS opens a shortcut directly only from an
 iCloud link. Without one, **No connection? Add Madeira's copy** shares the
 bundled `app/Madeira/Madeira JIT.shortcut` (a signed export): choose

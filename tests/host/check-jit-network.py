@@ -78,9 +78,13 @@ require('Bundle.main.url(forResource: "Madeira JIT", withExtension: "shortcut")'
 require('OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0)' in net
         and 'if JITShortcutFile.supported, let url = JITShortcutFile.url {' in setup,
         'the shortcut is offered on iOS 27 or later only (it uses Store Content)')
-require(onboarding.count('JITShortcutOffer()') == 3 and setup.count('UIApplication.shared.open(JITShortcutFile.iCloudLink)') == 2
-        and setup.count('ShareLink(item: url)') == 2,
-        "setup offers it in all three JIT guides and in Settings › JIT: its iCloud link (straight to Add Shortcut), "
+shortcut_page = onboarding[onboarding.index('private var shortcutPage'):onboarding.index('private var signInPage')]
+require('case .shortcut: shortcutPage' in onboarding and 'JITShortcutOffer' not in onboarding
+        and onboarding.count('finishJIT()') == 3 and 'jitPath = .shortcut' in onboarding,
+        "setup offers it on its own page after any of the three JIT guides, so the guides fit on one screen")
+require('UIApplication.shared.open(JITShortcutFile.iCloudLink)' in shortcut_page and 'ShareLink(item: url)' in shortcut_page
+        and 'UIApplication.shared.open(JITShortcutFile.iCloudLink)' in setup and 'ShareLink(item: url)' in setup,
+        "setup's page and Settings › JIT add it from its iCloud link (straight to Add Shortcut), "
         "and Madeira's copy through the share sheet with no connection")
 require('static let iCloudLink = URL(string: "https://www.icloud.com/shortcuts/' in net
         and 'THE TWO MUST BE THE SAME SHORTCUT' in net,

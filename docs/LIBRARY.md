@@ -189,8 +189,9 @@ switches. Setup never opens over a running session.
 
 Setup starts no Wine session and allocates no JIT pool. It stores the selected
 JIT method and may store a validated pairing file (paired on the device or
-imported) in the Keychain (docs/JIT.md). On iOS 27 its JIT guides also offer
-the bundled Madeira JIT shortcut and its switch; the component download runs Dock's own
+imported) in the Keychain (docs/JIT.md). On iOS 27, a Connect automatically
+page after the JIT guide offers the Madeira JIT shortcut and its switch; the
+component download runs Dock's own
 verified download without Wine. It changes no engine switch or launch
 configuration.
 
