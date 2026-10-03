@@ -443,7 +443,12 @@ static void *ios_child_thread_entry( void *arg )
 {
     struct ios_child_args *args = arg;
 
-    ios_child_main_machine = args->pe_info.machine;
+    /* An IL-only .NET image without 32BITREQUIRED runs as a native process: the
+     * server and exec_wineloader both promote it, so it must not get a guest
+     * window either.  With one, the process is 64-bit to everyone but lives in
+     * 32-bit furniture, and wow64.dll faults on the PEB32 nobody built. */
+    ios_child_main_machine = (args->pe_info.image_flags & IMAGE_FLAGS_ComPlusNativeReady)
+                             ? native_machine : args->pe_info.machine;
 
     /* Use dprintf for early logging — ERR requires TEB which isn't set up yet */
     dprintf(STDERR_FILENO, "[Wine child thread] ENTRY: fd=%d, argc=%d, exe=%s\n",
@@ -1382,7 +1387,8 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     }
 #ifdef WINE_IOS
     /* a 32-bit child is about to need a guest window (see ios_wow_session_arm) */
-    if (machine == IMAGE_FILE_MACHINE_I386) ios_wow_session_arm();
+    if (machine == IMAGE_FILE_MACHINE_I386 && !(pe_info.image_flags & IMAGE_FLAGS_ComPlusNativeReady))
+        ios_wow_session_arm();
 #endif
     if (!(startup_info = create_startup_info( attr.ObjectName, process_flags, params, &pe_info, &startup_info_size )))
         goto done;
