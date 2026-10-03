@@ -211,7 +211,9 @@ echo "=== MADEIRA: dxmt_madeira_native -- internal command library ==="
 # toolchain). The library then does not exist, no Direct3D device can be
 # created, and every game that needs one fails to start. dxmt_command.metal
 # needs nothing past Metal 3.1 (iOS 17), the same version the Windows Metal
-# tools used for the committed header. The script's own timestamp is part of
+# tools used for the committed header. The AIR target is pinned with it, as in
+# DXMT's meson build (the container format must also be one the OS reads). The
+# script's own timestamp is part of
 # the cache check so that a flag change here regenerates the header.
 DXMT_METAL_STD="${DXMT_METAL_STD:-metal3.1}"
 if [ ! -f "$BUILD_DIR/shader-headers/dxmt_command.h" ] \
@@ -219,7 +221,8 @@ if [ ! -f "$BUILD_DIR/shader-headers/dxmt_command.h" ] \
    || [ "$0" -nt "$BUILD_DIR/shader-headers/dxmt_command.h" ]; then
     mkdir -p "$BUILD_DIR/shader-headers"
     (cd "$BUILD_DIR/shader-headers" \
-     && xcrun -sdk macosx metal -std="$DXMT_METAL_STD" -o dxmt_command.air -c "$DXMT_SRC/dxmt/dxmt_command.metal" \
+     && xcrun -sdk macosx metal -std="$DXMT_METAL_STD" --target=air64-apple-macos14.0 \
+          -o dxmt_command.air -c "$DXMT_SRC/dxmt/dxmt_command.metal" \
      && xcrun -sdk macosx metallib -o dxmt_command.metallib dxmt_command.air \
      && xxd -n dxmt_command -i dxmt_command.metallib dxmt_command.h)
     echo "  dxmt_command.h                           OK (-std=$DXMT_METAL_STD)"
