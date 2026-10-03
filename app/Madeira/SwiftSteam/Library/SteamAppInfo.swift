@@ -32,6 +32,31 @@ struct SteamAppInfo {
     /// "Start with: The game" reads it (SteamDirectStart); Madeira Dock leaves
     /// the choice to Valve's client.
     var launches: [SteamLaunchOption] = []
+    /// Steam Auto-Cloud configuration (`ufs`): which files of the game are its
+    /// saves, and where another platform keeps them. Empty for a game that
+    /// only uses the Steam Cloud API (its files live in the user's `remote` folder).
+    var saveFiles: [SaveFile] = []
+    var rootOverrides: [RootOverride] = []
+
+    /// One `ufs.savefiles` entry: `root` names a folder ("WinAppDataLocalLow",
+    /// "GameInstall", ...), `path` a subfolder of it, `pattern` a wildcard.
+    struct SaveFile: Equatable {
+        var root: String
+        var path: String
+        var pattern: String
+        var recursive: Bool
+        /// Lower-cased platform names the entry is limited to; empty = all.
+        var platforms: [String]
+    }
+
+    /// One `ufs.rootoverrides` entry: on `os`, files the cloud lists under
+    /// `root` are kept under `useInstead` + `addPath`.
+    struct RootOverride: Equatable {
+        var root: String
+        var os: String
+        var useInstead: String
+        var addPath: String
+    }
 
     struct SharedOwner: Equatable {
         var name: String
@@ -314,6 +339,31 @@ struct SteamAppInfo {
                 } else if let buildID = publicBranch["buildid"] as? UInt32 {
                     info.buildID = buildID
                 }
+            }
+        }
+
+        // Auto-Cloud section. Untrusted text: bounded, and only ever used to
+        // form paths below known folders (SteamCloud validates each one).
+        if let ufs = appInfo["ufs"] as? [String: Any] {
+            func text(_ value: Any?) -> String {
+                guard let string = value as? String, string.utf8.count <= 512 else { return "" }
+                return string
+            }
+            func entries(_ node: Any?) -> [[String: Any]] {
+                guard let dict = node as? [String: Any] else { return [] }
+                return dict.keys.compactMap { key in Int(key).map { ($0, key) } }.sorted { $0.0 < $1.0 }
+                    .prefix(64).compactMap { dict[$0.1] as? [String: Any] }
+            }
+            for entry in entries(ufs["savefiles"]) {
+                let platforms = (entry["platforms"] as? [String: Any])?.values.compactMap { ($0 as? String)?.lowercased() } ?? []
+                info.saveFiles.append(SaveFile(root: text(entry["root"]), path: text(entry["path"]),
+                                               pattern: text(entry["pattern"]),
+                                               recursive: (entry["recursive"] as? String) == "1",
+                                               platforms: platforms.sorted()))
+            }
+            for entry in entries(ufs["rootoverrides"]) {
+                info.rootOverrides.append(RootOverride(root: text(entry["root"]), os: text(entry["os"]),
+                                                       useInstead: text(entry["useinstead"]), addPath: text(entry["addpath"])))
             }
         }
 
