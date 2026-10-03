@@ -168,9 +168,18 @@ Madeira for a moment and returns through `madeira://jit-network/…`
 (x-callback-url). Between **Enable JIT** and the game starting, cellular data
 stays off.
 
-### Making the shortcut
+### Getting the shortcut
 
-Name it exactly **Madeira JIT** and add:
+Madeira ships it (`app/Madeira/Madeira JIT.shortcut`, a signed export, so it
+installs with no network). On iOS 27 and later, setup's JIT guides offer
+**Connect automatically** → **Add the shortcut**, and **Settings → JIT** has
+**Add the Madeira JIT shortcut**: both open the share sheet, where choosing
+**Shortcuts** and then **Add Shortcut** adds it, named after the file. Then
+turn it on. The file's signing certificate expires on 26 Oct 2027; export it
+again before then (in Shortcuts: **Share** → **Options** → **Anyone** → **Save
+to Files**) and replace the file, keeping its name.
+
+Its steps, to make it by hand (name it exactly **Madeira JIT**):
 
 1. **Text**, with the *Shortcut Input* variable inside it. (*Shortcut Input* on
    its own is untyped, so **If** offers only "has any value"; its text offers

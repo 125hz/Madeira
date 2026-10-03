@@ -147,6 +147,7 @@ struct OnboardingView: View {
     @ObservedObject private var pairing = OnDevicePairing.shared
     @ObservedObject private var signIn = SteamSignInModel.shared
     @ObservedObject private var dock = MadeiraDockModel.shared
+    @ObservedObject private var shortcut = JITNetworkShortcut.shared
     @State private var showSignIn = false
     @State private var importingPairingFile = false
     @State private var pairingImportError: String?
@@ -307,6 +308,7 @@ struct OnboardingView: View {
                 Label("Paired on this \(device)", systemImage: "checkmark.circle.fill")
                     .font(.headline).foregroundStyle(.green)
                 vpnNote
+                JITShortcutOffer()
                 primary("Continue", symbol: "arrow.right") { useBuiltIn() }
                 secondary("Pair again") { startPairing() }
             } else {
@@ -327,12 +329,13 @@ struct OnboardingView: View {
                 point(2, "Save it to Files or AirDrop it to this \(device).", done: fileImported)
                 point(3, "Tap **Choose pairing file** and pick it.", done: fileImported)
             }
-            Label("The pairing file stays in Madeira's Documents folder.", systemImage: "lock.fill")
+            Label("The pairing file is kept in this \(device)'s Keychain.", systemImage: "lock.fill")
                 .font(.subheadline).foregroundStyle(.secondary)
             if fileImported {
                 Label("Pairing file imported", systemImage: "checkmark.circle.fill")
                     .font(.headline).foregroundStyle(.green)
                 vpnNote
+                JITShortcutOffer()
                 primary("Continue", symbol: "arrow.right") { useBuiltIn() }
                 secondary("Choose another pairing file") { importPairingFile() }
             } else {
@@ -353,6 +356,7 @@ struct OnboardingView: View {
                 point(2, "Install and connect [LocalDevVPN](https://apps.apple.com/us/app/localdevvpn/id6755608044).")
                 point(3, "When you play, Madeira opens StikDebug to enable JIT, then comes back.")
             }
+            JITShortcutOffer()
             primary("Use StikDebug", symbol: "arrow.right") {
                 jit.method = .stikDebug
                 LogStore.shared.log("[onboarding] JIT method=StikDebug")
@@ -362,7 +366,12 @@ struct OnboardingView: View {
         }
     }
 
-    private var vpnNote: some View {
+    /// Hidden once the Madeira JIT shortcut connects LocalDevVPN by itself.
+    @ViewBuilder private var vpnNote: some View {
+        if !(JITShortcutFile.supported && shortcut.enabled) { vpnNoteLabel }
+    }
+
+    private var vpnNoteLabel: some View {
         Label {
             Text("Before you play, connect [LocalDevVPN](https://apps.apple.com/us/app/localdevvpn/id6755608044). Madeira enables JIT through it.")
         } icon: {

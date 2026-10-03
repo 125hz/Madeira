@@ -531,6 +531,34 @@ enum LocalDevVPN {
     }
 }
 
+/// Setup's offer of the bundled Madeira JIT shortcut (iOS 27; JITShortcutFile): add it
+/// through the share sheet, then turn it on. It drives LocalDevVPN with LocalDevVPN's
+/// own Shortcuts action, so LocalDevVPN has to be installed.
+struct JITShortcutOffer: View {
+    @ObservedObject private var shortcut = JITNetworkShortcut.shared
+
+    var body: some View {
+        if JITShortcutFile.supported, let url = JITShortcutFile.url {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Connect automatically", systemImage: "bolt.horizontal.circle").font(.headline)
+                Text("With the \(JITNetworkShortcut.name) shortcut, Enable JIT connects LocalDevVPN for you when it isn't connected, turns Cellular Data off while there's no Wi-Fi, and puts both back, along with any VPN you were using, once the game starts. It needs LocalDevVPN installed.")
+                    .font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                ShareLink(item: url) {
+                    Label("Add the shortcut", systemImage: "plus.square.on.square")
+                        .fontWeight(.semibold).frame(maxWidth: .infinity, minHeight: 32)
+                }
+                .buttonStyle(.bordered)
+                Text("Choose Shortcuts in the share sheet, then Add Shortcut. Turn this on once it's added:")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Toggle("Use it for JIT", isOn: $shortcut.enabled)
+            }
+            .padding(14)
+            .background(Color(uiColor: .secondarySystemGroupedBackground),
+                        in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+    }
+}
+
 struct JITSettingsSection: View {
     @ObservedObject private var coordinator = JITCoordinator.shared
     @ObservedObject private var onboarding = OnboardingModel.shared
@@ -558,6 +586,11 @@ struct JITSettingsSection: View {
             if coordinator.method == .automatic {
                 Text(coordinator.automaticDescription)
                     .font(.caption).foregroundStyle(.secondary)
+            }
+            if JITShortcutFile.supported, let url = JITShortcutFile.url {
+                ShareLink(item: url) {
+                    Label("Add the \(JITNetworkShortcut.name) shortcut", systemImage: "plus.square.on.square")
+                }
             }
             Toggle("\(JITNetworkShortcut.name) shortcut", isOn: $shortcut.enabled)
         } header: {

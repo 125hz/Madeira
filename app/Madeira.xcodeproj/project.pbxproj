@@ -83,6 +83,7 @@
 		B1000040 /* JITPairing.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000040 /* JITPairing.swift */; };
 		B1000041 /* libmadeira_rppairing.a in Frameworks */ = {isa = PBXBuildFile; fileRef = B2000041 /* libmadeira_rppairing.a */; };
 		B1000004 /* madeira-jit.js in Resources */ = {isa = PBXBuildFile; fileRef = B2000004 /* madeira-jit.js */; };
+		B1000051 /* Madeira JIT.shortcut in Resources */ = {isa = PBXBuildFile; fileRef = B2000051 /* Madeira JIT.shortcut */; };
 		B1000005 /* ExtensionFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B2000010 /* ExtensionFoundation.framework */; settings = {ATTRIBUTES = (Weak, ); }; };
 		B1000010 /* MadeiraJITHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000020 /* MadeiraJITHelper.swift */; };
 		B1000011 /* JITBuiltInMessages.swift in Helper Sources */ = {isa = PBXBuildFile; fileRef = B2000003 /* JITBuiltInMessages.swift */; };
@@ -257,6 +258,7 @@
 		B2000041 /* libmadeira_rppairing.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libmadeira_rppairing.a; sourceTree = "<group>"; };
 		B2000042 /* MadeiraRPPairing.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MadeiraRPPairing.h; sourceTree = "<group>"; };
 		B2000004 /* madeira-jit.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = "madeira-jit.js"; sourceTree = "<group>"; };
+		B2000051 /* Madeira JIT.shortcut */ = {isa = PBXFileReference; lastKnownFileType = file; path = "Madeira JIT.shortcut"; sourceTree = "<group>"; };
 		B2000010 /* ExtensionFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ExtensionFoundation.framework; path = System/Library/Frameworks/ExtensionFoundation.framework; sourceTree = SDKROOT; };
 		B2000020 /* MadeiraJITHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MadeiraJITHelper.swift; sourceTree = "<group>"; };
 		B2000021 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
@@ -458,6 +460,7 @@
 				B2000040 /* JITPairing.swift */,
 				B2000042 /* MadeiraRPPairing.h */,
 				B2000004 /* madeira-jit.js */,
+				B2000051 /* Madeira JIT.shortcut */,
 				A2000021 /* nls */,
 				A2000033 /* aarch64-windows */,
 				A20000F1 /* legal */,
@@ -639,6 +642,7 @@
 				A1000094 /* cacert.pem in Resources */,
 				A1000910 /* Assets.xcassets in Resources */,
 				B1000004 /* madeira-jit.js in Resources */,
+				B1000051 /* Madeira JIT.shortcut in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

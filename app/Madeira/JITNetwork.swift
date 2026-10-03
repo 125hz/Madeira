@@ -158,6 +158,18 @@ enum LoopbackProbe {
     static var vpnInterfaceUp: Bool { route()?.isLocalDevVPN ?? false }
 }
 
+/// The Madeira JIT shortcut, bundled (app/Madeira/Madeira JIT.shortcut): a signed
+/// export, so it installs with no network. The share sheet hands it to Shortcuts, which
+/// asks to add it and names it after the file, "Madeira JIT". iOS 27 and later only: it
+/// keeps the previous VPN with Store Content, which iOS 26 lacks. Its signing
+/// certificate expires on 26 Oct 2027; export it again (Share › Options › Anyone) before then.
+enum JITShortcutFile {
+    static var url: URL? { Bundle.main.url(forResource: "Madeira JIT", withExtension: "shortcut") }
+    static var supported: Bool {
+        ProcessInfo.processInfo.isOperatingSystemAtLeast(OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0))
+    }
+}
+
 /// The user's "Madeira JIT" shortcut (docs/JIT.md has its steps). Input "start",
 /// with "cellular" when Madeira sees cellular data and no Wi-Fi: keep the VPN that is
 /// connected (Get Current VPN into Store Content; iOS connects one VPN at a time, so

@@ -63,6 +63,26 @@ require('Save File' not in net and 'Get File' not in net,
 require('returned output=\\(result.isEmpty ? "none" : "a VPN name")' in net and 'vpn-restore\\n' not in net,
         "Madeira neither logs nor keeps the VPN's name (the shortcut keeps the VPN itself)")
 
+# The bundled shortcut: a signed export (iOS imports only signed files), in the app's
+# resources, named after the shortcut Madeira runs, offered on iOS 27 or later.
+onboarding = (app / 'Onboarding.swift').read_text()
+bundled = app / 'Madeira JIT.shortcut'
+blob = bundled.read_bytes() if bundled.exists() else b''
+require(blob[:4] == b'AEA1' and b'SigningCertificateChain' in blob[:64],
+        'Madeira JIT.shortcut is a signed export (AEA1 with a signing certificate chain)')
+require('/* Madeira JIT.shortcut in Resources */,' in project,
+        'Madeira JIT.shortcut is copied into the app')
+require('Bundle.main.url(forResource: "Madeira JIT", withExtension: "shortcut")' in net
+        and 'static let name = "Madeira JIT"' in net,
+        "the file's name is the shortcut's name Madeira runs (Shortcuts names an import after its file)")
+require('OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0)' in net
+        and 'if JITShortcutFile.supported, let url = JITShortcutFile.url {' in setup,
+        'the shortcut is offered on iOS 27 or later only (it uses Store Content)')
+require(onboarding.count('JITShortcutOffer()') == 3 and 'ShareLink(item: url)' in setup,
+        "setup offers it in all three JIT guides, and Settings › JIT has it too")
+require("Keychain" in onboarding and "stays in Madeira's Documents folder" not in onboarding,
+        "setup no longer says the pairing file is in Documents")
+
 # ------------------------------------------------------------------ Swift
 probe = net[net.index('enum LoopbackProbe {'):net.index('/// The user\'s "Madeira JIT" shortcut')]
 probe = probe.replace('static let address = "10.7.0.1"', 'static var address = "10.7.0.1"') \
