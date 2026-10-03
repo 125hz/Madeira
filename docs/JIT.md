@@ -182,9 +182,11 @@ Name it exactly **Madeira JIT** and add:
    1. **If** *Text* contains `cellular`: **Set Cellular Data** *On*. End If.
    2. **If** *Text* contains `vpn-off`: LocalDevVPN's **Disconnect** action (or
       **Set VPN** → *Disconnect*). End If.
-   3. **If** *Text* contains `vpn-restore`: **Split Text** *Text* by *New Lines*,
-      **Get Item from List** (*Last Item*), then **Set VPN** → *Connect* → that
-      item. End If.
+   3. **If** *Text* contains `vpn-restore`: **Set VPN** → *Connect* → your VPN,
+      picked from its list. End If. (**Set VPN** takes only a VPN picked there,
+      not a name: "couldn't convert from Text to VPN". With several VPNs, use one
+      **If** per VPN: **Split Text** *Text* by *New Lines*, **Get Item from List**
+      (*Last Item*) is that VPN's name → **Set VPN** → *Connect* → that VPN.)
 4. End If.
 
 Then turn on **Settings → JIT → Madeira JIT shortcut**. Without the shortcut,
