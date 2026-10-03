@@ -126,6 +126,13 @@ starting screen takes over (or an error is shown). A profile holds:
   app logs an error past that, ml1255).
   Settings the app reads itself at launch (such as `pool`) stay global.
 
+A switch the game's page exports for a launch (the x87, AVX, CPU core,
+anisotropy and frame generation choices, the fastsync switches, the
+DirectInput controller choice) wins over the same `env.` key in madeira.cfg:
+that cfg line is skipped and logged as `[madeira-env] ml1184 KEY=... kept`.
+These keys are unset when the session ends (ml1184). The game's own config
+lines come after both and win.
+
 A game you added starts directly. A Steam game's page (`docs/STEAM_LIBRARY.md`)
 adds a **Steam** section under the library details: **Start with** Madeira
 Dock (the default) or **The game** (its own program without Steam, from Steam's
