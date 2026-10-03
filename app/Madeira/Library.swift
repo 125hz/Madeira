@@ -195,6 +195,11 @@ struct LibraryEntry: Codable, Identifiable {
     /// nil = 1) in this game's sessions.
     var controlOpacity: Double?
     var controlSize: Double?
+    /// How a physical controller reaches this game: nil, the game's own support
+    /// (XInput, as before); "keys", keyboard and mouse (PadKeyboardMouse: the pad
+    /// presses keys and moves the mouse, the game sees no controller). For games
+    /// without controller support. Optional, so older files decode.
+    var controllerMode: String?
     /// Processors reported to Windows code in this game's sessions
     /// (MADEIRA_CPU_COUNT, ntdll); nil = automatic.
     var cpuCount: Int?
@@ -348,6 +353,10 @@ final class LibraryModel: ObservableObject {
     @Published var performance = false
     @Published var liveLogs = false
     @Published var fpsMode = 1
+    /// The session's controller mode (LibraryEntry.controllerMode): "keys" or nil.
+    @Published var controllerMode: String? {
+        didSet { if oldValue != controllerMode { applyControllerMode() } }
+    }
     /// The session's touch-control opacity (the entry's Control opacity).
     @Published var opacity = 0.7
     /// The session's Aspect & scaling; MetalBackedView lays the game out with it.
@@ -687,6 +696,8 @@ final class LibraryModel: ObservableObject {
         }
         controls.visible = entry.touchControls
         controls.sizeScale = min(max(entry.controlSize ?? 1, 0.5), 2)
+        controllerMode = GamepadInput.keyboardMouseAvailable ? entry.controllerMode : nil
+        applyControllerMode()
         MetalHostView.shared.isHidden = false
         ProMotionIntent.apply(mode: entry.effectiveFPSMode)
         if remember { var played = entry; played.lastPlayed = Date(); save(played) }
@@ -749,6 +760,26 @@ final class LibraryModel: ObservableObject {
         fputs("[startup-log] visible=\(launchLogs ? 1 : 0)\n", stderr)
     }
 
+    /// Hand the session's mode to the pad sampler. In keyboard-and-mouse mode the
+    /// bindings follow the touch layout on screen, so they are rebuilt when the
+    /// controls change (TouchControlsModel.controls, observed below).
+    func applyControllerMode() {
+        guard GamepadInput.keyboardMouseAvailable else { return }
+        if current != nil, controllerMode == "keys" {
+            GamepadInput.shared.setKeyboardMouse(PadBindings.build(controls: TouchControlsModel.shared.controls))
+            if controlsSink == nil {
+                controlsSink = TouchControlsModel.shared.$controls.sink { [weak self] controls in
+                    guard let self, self.controllerMode == "keys", self.current != nil else { return }
+                    GamepadInput.shared.setKeyboardMouse(PadBindings.build(controls: controls))
+                }
+            }
+        } else {
+            controlsSink = nil
+            GamepadInput.shared.setKeyboardMouse(nil)
+        }
+    }
+    private var controlsSink: AnyCancellable?
+
     func setFPS(_ mode: Int) {
         fpsMode = mode
         let applied: Int32 = mode == 3 && !ProMotionIntent.has30Cap ? 1 : Int32(mode)
@@ -783,6 +814,7 @@ final class LibraryModel: ObservableObject {
             entry.fpsMode = fpsMode; entry.performance = performance
             entry.overlayFields = overlayFields
             entry.controlOpacity = opacity; entry.controlSize = controls.sizeScale
+            if GamepadInput.keyboardMouseAvailable { entry.controllerMode = controllerMode }
             // The in-game Aspect & scaling choice sticks to the game. MADEIRA_SESSION_TOOLS=0
             // hides that picker and leaves the stored choice alone.
             if MadeiraConfig.flag("MADEIRA_SESSION_TOOLS") { entry.display = displayMode.rawValue }
@@ -793,6 +825,7 @@ final class LibraryModel: ObservableObject {
         if sawProcess, let report = exitReport() { error = report }
         timer?.invalidate(); timer = nil
         saveCurrentProfile()
+        controllerMode = nil
         let controls = TouchControlsModel.shared
         controls.editing = false; controls.selected = nil
         controls.controls = savedControls; controls.visible = savedVisible; controls.sizeScale = savedSize
@@ -2334,6 +2367,9 @@ struct LibraryDetail: View {
                     Toggle("Performance overlay", isOn: $entry.performance)
                     Toggle("Live logs", isOn: $entry.liveLogs)
                     Toggle("Touch controls", isOn: $entry.touchControls)
+                    if GamepadInput.keyboardMouseAvailable {
+                        ControllerModeChoice(mode: $entry.controllerMode)
+                    }
                     LabeledContent("Control opacity") {
                         Slider(value: Binding(get: { entry.controlOpacity ?? 0.7 }, set: { entry.controlOpacity = $0 }), in: 0.15...1)
                     }
@@ -2341,6 +2377,9 @@ struct LibraryDetail: View {
                         Slider(value: Binding(get: { entry.controlSize ?? 1 }, set: { entry.controlSize = $0 }), in: 0.5...2)
                     }
                     Text("Arrange buttons and choose XInput, mouse, or keyboard actions from the in-game menu.").font(.caption).foregroundStyle(.secondary)
+                    if GamepadInput.keyboardMouseAvailable {
+                        Text("Keyboard and mouse: for games without controller support. The controller presses keys and moves the mouse (left stick WASD, right stick mouse, triggers click, D-pad arrows, Start Esc, Select Tab) and the game sees no controller. Each touch control can name the controller button that performs its action, in the control editor.").font(.caption).foregroundStyle(.secondary)
+                    }
                 }
                 if entry.steamAppID != nil {
                     Section {
@@ -2429,6 +2468,19 @@ struct SteamSearchView: View {
                 catch { self.error = error.localizedDescription }
                 loading = false
             }
+        }
+    }
+}
+
+/// Game details and the Session menu: how a physical controller reaches the game.
+struct ControllerModeChoice: View {
+    @Binding var mode: String?
+    var body: some View {
+        LabeledContent("Controller") {
+            Picker("Controller", selection: Binding(get: { mode ?? "" }, set: { mode = $0.isEmpty ? nil : $0 })) {
+                Text("Game's own support").tag("")
+                Text("Keyboard and mouse").tag("keys")
+            }.pickerStyle(.menu).labelsHidden()
         }
     }
 }
@@ -2905,6 +2957,9 @@ struct LibraryHUD: View {
                 LabeledContent("Opacity") { Slider(value: $model.opacity, in: 0.15...1) }
                 LabeledContent("Size") { Slider(value: $controls.sizeScale, in: 0.5...2) }
                 Button("Edit controls", systemImage: "slider.horizontal.3") { controls.visible = true; controls.editing = true; model.menu = false }
+                if GamepadInput.keyboardMouseAvailable {
+                    ControllerModeChoice(mode: Binding(get: { model.controllerMode }, set: { model.controllerMode = $0; model.saveCurrentProfile() }))
+                }
                 Button("Keyboard", systemImage: "keyboard") { model.menu = false; LibraryKeyboard.show() }
                 Divider()
                 FPSChoice(mode: Binding(get: { model.fpsMode }, set: { model.setFPS($0) }))

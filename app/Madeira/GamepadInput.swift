@@ -68,6 +68,29 @@ final class GamepadInput: @unchecked Sendable {
         }
     }
 
+    /// Keyboard-and-mouse mode (PadKeyboardMouse): nil keeps XInput. Set on the
+    /// main actor by the library for its session; read on `queue`.
+    private var keyboardMouse: PadBindings?
+
+    /// Availability of the mode. 0 removes the per-game choice; the physical pad then always feeds XInput.
+    static let keyboardMouseAvailable: Bool = flag("MADEIRA_XINPUT") && flag("MADEIRA_PAD_KBM")
+
+    /// Translate player 1's physical pad into keys and mouse (`bindings`) instead
+    /// of publishing it to XInput; nil restores XInput. Touch controls keep
+    /// feeding XInput either way.
+    func setKeyboardMouse(_ bindings: PadBindings?) {
+        guard Self.keyboardMouseAvailable else { return }
+        queue.async { [self] in
+            let was = keyboardMouse != nil
+            if keyboardMouse != nil && bindings == nil { PadKeyboardMouse.shared.releaseAll("mode off") }
+            keyboardMouse = bindings
+            if was != (bindings != nil) {
+                LogStore.shared.log("[pad-kbm] physical controller as keyboard and mouse: \(bindings != nil ? "on" : "off")")
+            }
+            sample()
+        }
+    }
+
     private let queue = DispatchQueue(label: "madeira.gamepad", qos: .userInteractive)
     private var controllers = [GCController?](repeating: nil, count: 4)
     private var profiles = [GCExtendedGamepad?](repeating: nil, count: 4)
@@ -139,7 +162,10 @@ final class GamepadInput: @unchecked Sendable {
     private func setActive(_ value: Bool) {
         queue.async { [self] in
             active = value
-            if !value { touchState.clear() }
+            if !value {
+                touchState.clear()
+                if keyboardMouse != nil { PadKeyboardMouse.shared.releaseAll("inactive") }
+            }
             updateTimer()
             sample()
         }
@@ -203,6 +229,20 @@ final class GamepadInput: @unchecked Sendable {
                     let library = LibraryController.shared
                     library.sample(buttons: state.buttons, lx: state.lx, ly: state.ly)
                     if library.ownsInput {
+                        state = winios_gamepad()
+                        state.connected = 1
+                        if keyboardMouse != nil { PadKeyboardMouse.shared.releaseAll("library menu") }
+                    } else if let kbm = keyboardMouse {
+                        // Keyboard-and-mouse mode: the pad becomes keys and mouse
+                        // motion; XInput sees no physical player 1 (touch may still
+                        // connect it below).
+                        PadKeyboardMouse.shared.feed(buttons: state.buttons, lt: state.left_trigger, rt: state.right_trigger,
+                                                     lx: state.lx, ly: state.ly, rx: state.rx, ry: state.ry,
+                                                     bindings: kbm, focused: HardwareInput.shared.baseFocused)
+                        guard touchConnected else {
+                            winios_gamepad_set_state(Int32(i), nil)
+                            continue
+                        }
                         state = winios_gamepad()
                         state.connected = 1
                     }
