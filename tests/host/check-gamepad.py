@@ -27,6 +27,8 @@ typedef uintptr_t ULONG_PTR;
 '''
 tests = r'''
 static atomic_int finished;
+static int notified;
+static void count_notify(void) { notified++; }
 static struct winios_gamepad patterns[2];
 static void *writer(void *arg) {
     uintptr_t which = (uintptr_t)arg;
@@ -61,7 +63,35 @@ int main(void) {
     assert(ios_gamepad_query(0, 1, &caps));
     assert(caps.type == 1 && caps.sub_type == 1 && caps.flags == 0);
     assert(caps.left_motor_speed == 0 && caps.right_motor_speed == 0);
-    assert(!ios_gamepad_query(0, 2, &caps) && !ios_gamepad_query(4, 0, &output));
+    /* ml2106: motors are advertised only while the app plays them. */
+    winios_gamepad_set_rumble_caps(1);
+    assert(ios_gamepad_query(0, 1, &caps) && caps.flags == 0);
+    assert(caps.left_motor_speed == 0xff && caps.right_motor_speed == 0xff);
+    winios_gamepad_set_rumble_caps(0);
+    /* ml2106: op 2 (NtUserGamepadOp_SetVibration) takes XINPUT_VIBRATION in; each change notifies once. */
+    {
+        WORD motors[2] = { 0xffff, 0x1234 };
+        struct winios_gamepad_vibration v;
+        notified = 0;
+        winios_pad_output_set_notify(count_notify);
+        assert(!winios_gamepad_get_vibration(0, &v) && !v.left && !v.right);
+        assert(ios_gamepad_query(0, 2, motors));
+        assert(winios_gamepad_get_vibration(0, &v) == 1 && v.left == 0xffff && v.right == 0x1234);
+        assert(notified == 1);
+        assert(ios_gamepad_query(0, 2, motors));          /* same values: no new serial, no notify */
+        assert(winios_gamepad_get_vibration(0, &v) == 1 && notified == 1);
+        motors[0] = 0; motors[1] = 0;
+        assert(ios_gamepad_query(0, 2, motors));
+        assert(winios_gamepad_get_vibration(0, &v) == 2 && !v.left && !v.right && notified == 2);
+        assert(!ios_gamepad_query(1, 2, motors));         /* no pad in slot 1: nothing stored */
+        assert(!winios_gamepad_get_vibration(1, &v));
+        assert(!winios_gamepad_get_vibration(4, &v) && !winios_gamepad_get_vibration(-1, &v));
+        winios_gamepad_set_vibration(9, 1, 1);             /* out of range: ignored */
+        winios_pad_output_set_notify(NULL);
+        winios_gamepad_set_vibration(0, 5, 5);
+        assert(notified == 2 && winios_gamepad_get_vibration(0, &v) == 3);
+    }
+    assert(!ios_gamepad_query(0, 3, &caps) && !ios_gamepad_query(4, 0, &output));
     assert(!ios_gamepad_query(0, 0, NULL));
     for (int i = 1; i < 4; ++i) {
         state.buttons = (uint16_t)(1 << i);
@@ -99,4 +129,5 @@ with tempfile.TemporaryDirectory(prefix='madeira-gamepad-') as tmp:
                     '-O2', '-pthread', '-I', str(root / 'build/win32u-unix'), str(source),
                     str(root / 'app/Madeira/Winios/WiniosGamepad.c'), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
-print('PASS: packet changes, ranges, four slots, disconnect/reconnect, query ABI, concurrent snapshots')
+print('PASS: packet changes, ranges, four slots, disconnect/reconnect, query ABI, concurrent snapshots, '
+      'rumble caps, XInput vibration op (ml2106)')

@@ -68,6 +68,7 @@
 
 #include "../hidpad/hidpad_reports.h"
 #include "../hidpad/hidparse_ios.h"
+#include "../../app/Madeira/Winios/WiniosPadEffects.h"
 
 /* wine/include/wine/hid.h; not included for one constant, it pulls the DDK. */
 #ifndef IOCTL_HID_GET_WINE_RAWINPUT_HANDLE
@@ -88,8 +89,11 @@ struct hidpad_device
     unsigned int                  preparsed_size;
     unsigned short                input_len[256], output_len[256], feature_len[256];
     struct hidpad_report_state    state;
+    struct winios_hidpad_output   output;
     char                          product[64];
     unsigned int                  opens, reads, outputs, features, refused;
+    /* ml2106: what the game's output reports asked for, for the log. */
+    unsigned int                  out_rumble, out_audio, out_triggers, out_lightbar, out_leds, out_next;
 };
 
 struct hidpad_file
@@ -249,6 +253,28 @@ static void hidpad_file_destroy( struct object *obj )
     free_async_queue( &file->read_q );
     if (file->fd) release_object( file->fd );
     list_remove( &file->entry );
+    /* ml2106: the last handle is gone (the game quit or crashed): stop the
+     * motors and release the triggers, which a real pad would keep, so the
+     * controller is not left rumbling or stiff for the rest of the session.
+     * Lightbar and player LEDs stay as the game left them. */
+    if (list_empty( &device->files ) && device->outputs &&
+        (device->output.rumble_left || device->output.rumble_right ||
+         device->output.trigger_valid[0] || device->output.trigger_valid[1]))
+    {
+        static unsigned int resets;
+        unsigned int t;
+
+        device->output.rumble_left = device->output.rumble_right = 0;
+        for (t = 0; t < 2; t++)
+            if (device->output.trigger_valid[t])
+            {
+                memset( device->output.trigger[t], 0, sizeof(device->output.trigger[t]) );
+                device->output.trigger[t][0] = 0x05;   /* off */
+            }
+        winios_hidpad_set_output( &device->output );
+        if (resets++ < HIDPAD_LOG_LIMIT)
+            fprintf( stderr, "[hidpad-out] ml2106 last handle closed: rumble stopped, triggers off\n" );
+    }
     release_object( device );
 }
 
@@ -333,10 +359,59 @@ static void hidpad_file_read( struct fd *fd, struct async *async, file_pos_t pos
     set_error( STATUS_PENDING );
 }
 
+/* ml2106: [hidpad-out] lines. The first HIDPAD_OUT_LOG effects reports in
+ * full (flags, motors, both trigger blocks with their mode names, lightbar,
+ * LEDs), then one tally at 100, 1000, 10000 ... reports: how many asked for
+ * rumble, how many set no rumble bit at all (a game driving the DualSense's
+ * audio haptics sends those: it streams the haptics to the pad's USB audio
+ * interface, which this device does not have), trigger, lightbar and LED
+ * changes. The app logs what it applied (PadOutput.m). */
+#define HIDPAD_OUT_LOG 12
+
+static int hidpad_output_rumbles( unsigned int f0, unsigned int f2 )
+{
+    return (f0 & (HIDPAD_DS_F0_RUMBLE | HIDPAD_DS_F0_HAPTICS_SEL)) || (f2 & HIDPAD_DS_F2_RUMBLE2);
+}
+
+static void hidpad_output_log( struct hidpad_device *device, const unsigned char *data, data_size_t size,
+                               const char *how )
+{
+    const struct winios_hidpad_output *o = &device->output;
+    const unsigned char *l = o->trigger[0], *r = o->trigger[1];
+    uint32_t flags = hidpad_dualsense_output_flags( data, size );
+    unsigned int f0 = flags & 0xff, f1 = (flags >> 8) & 0xff, f2 = flags >> 16;
+    unsigned int n = device->outputs + 1;
+
+    if (hidpad_output_rumbles( f0, f2 )) device->out_rumble++;
+    else device->out_audio++;
+    if (f0 & (HIDPAD_DS_F0_LEFT_TRIGGER | HIDPAD_DS_F0_RIGHT_TRIGGER)) device->out_triggers++;
+    if (f1 & HIDPAD_DS_F1_LIGHTBAR) device->out_lightbar++;
+    if (f1 & (HIDPAD_DS_F1_PLAYER_LEDS | HIDPAD_DS_F1_MIC_LED)) device->out_leds++;
+
+    if (n <= HIDPAD_OUT_LOG)
+        fprintf( stderr, "[hidpad-out] ml2106 #%u via %s report %#x: flags %02x/%02x/%02x%s%s "
+                 "rumble L%u R%u power %02x | L2 %s %02x:%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
+                 "| R2 %s %02x:%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x | lightbar %02x%02x%02x "
+                 "players %02x mic %u\n", n, how, data[0], f0, f1, f2,
+                 hidpad_output_rumbles( f0, f2 ) ? "" : " (no rumble bit)",
+                 (f1 & HIDPAD_DS_F1_LOW_PASS) ? " (haptics low-pass)" : "",
+                 o->rumble_left, o->rumble_right, o->power_reduction,
+                 winios_trigger_mode_name( l[0] ), l[0], l[1], l[2], l[3], l[4], l[5], l[6], l[7], l[8], l[9], l[10],
+                 winios_trigger_mode_name( r[0] ), r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10],
+                 o->red, o->green, o->blue, o->player_leds, o->mute_led );
+    if (!device->out_next) device->out_next = 100;
+    if (n == device->out_next)
+    {
+        fprintf( stderr, "[hidpad-out] ml2106 %u effects reports: rumble %u, no rumble bit %u, triggers %u, "
+                 "lightbar %u, player/mic LEDs %u\n", n, device->out_rumble, device->out_audio,
+                 device->out_triggers, device->out_lightbar, device->out_leds );
+        device->out_next = n < 100000000 ? n * 10 : ~0u;
+    }
+}
+
 /* An output report from WriteFile or IOCTL_HID_SET_OUTPUT_REPORT; the same
- * checks as hidclass's hid_device_xfer_report. Accepted and counted: the
- * reports (rumble, adaptive triggers, lightbar) are not applied to the
- * physical pad here. */
+ * checks as hidclass's hid_device_xfer_report. A DualSense effects report is
+ * decoded into the snapshot the app applies to the physical pad (PadOutput.m). */
 static unsigned int hidpad_output( struct hidpad_device *device, const unsigned char *data, data_size_t size,
                                    const char *how )
 {
@@ -347,9 +422,16 @@ static unsigned int hidpad_output( struct hidpad_device *device, const unsigned 
                      size ? data[0] : 0, size );
         return STATUS_INVALID_PARAMETER;
     }
-    if (!device->outputs++)
+    if (device->id->kind == HIDPAD_KIND_DUALSENSE &&
+        hidpad_dualsense_output( data, size, &device->output ))
+    {
+        winios_hidpad_set_output( &device->output );
+        hidpad_output_log( device, data, size, how );
+    }
+    else if (!device->outputs)
         fprintf( stderr, "[hid-pad] ml2101 first output report via %s: report %#x, %u bytes\n", how,
                  data[0], size );
+    device->outputs++;
     return STATUS_SUCCESS;
 }
 
@@ -598,7 +680,10 @@ void madeira_hidpad_init( void )
     memcpy( device->output_len, output, sizeof(output) );
     memcpy( device->feature_len, feature, sizeof(feature) );
     memset( &device->state, 0, sizeof(device->state) );
+    memset( &device->output, 0, sizeof(device->output) );
     device->opens = device->reads = device->outputs = device->features = device->refused = 0;
+    device->out_rumble = device->out_audio = device->out_triggers = device->out_lightbar = 0;
+    device->out_leds = device->out_next = 0;
     hidpad_product_name( device );
 
     hidpad_interface_link( id, link, sizeof(link) );
