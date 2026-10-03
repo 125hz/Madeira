@@ -408,9 +408,10 @@ struct OnboardingView: View {
         }
     }
 
-    /// Hidden once the Madeira JIT shortcut connects LocalDevVPN by itself.
+    /// Only on iOS 26: from iOS 27 the Connect automatically page that follows the guide
+    /// covers LocalDevVPN.
     @ViewBuilder private var vpnNote: some View {
-        if !(JITShortcutFile.supported && shortcut.enabled) { vpnNoteLabel }
+        if !JITShortcutFile.supported { vpnNoteLabel }
     }
 
     private var vpnNoteLabel: some View {
@@ -486,7 +487,8 @@ struct OnboardingView: View {
 
     /// The Madeira JIT shortcut (iOS 27; JITShortcutFile), on its own page so the JIT
     /// guides fit on one screen. Add it from its iCloud link (straight to Add Shortcut)
-    /// or, with no connection, Madeira's copy through the share sheet; then turn it on.
+    /// or, with no internet connection, the local copy through the share sheet; then turn
+    /// it on.
     /// It drives LocalDevVPN with LocalDevVPN's own Shortcuts action.
     private var shortcutPage: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -509,7 +511,7 @@ struct OnboardingView: View {
             .buttonStyle(.bordered).controlSize(.large)
             if let url = JITShortcutFile.url {
                 ShareLink(item: url) {
-                    Text("No connection? Add Madeira's copy, then choose Shortcuts.")
+                    Text("No internet connection? Add local copy, then choose the Shortcuts app in the share sheet that pops up.")
                         .font(.footnote).frame(maxWidth: .infinity)
                 }
             }

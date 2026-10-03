@@ -567,7 +567,7 @@ struct JITSettingsSection: View {
                     Label("Add the \(JITNetworkShortcut.name) shortcut", systemImage: "plus.square.on.square")
                 }
                 ShareLink(item: url) {
-                    Label("Add Madeira's copy (no connection)", systemImage: "square.and.arrow.up")
+                    Label("No internet connection? Add local copy", systemImage: "square.and.arrow.up")
                 }
             }
             Toggle("\(JITNetworkShortcut.name) shortcut", isOn: $shortcut.enabled)

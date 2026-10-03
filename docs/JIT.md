@@ -174,9 +174,9 @@ On iOS 27 and later, setup shows **Connect automatically** on its own page
 after any JIT guide, with **Add the shortcut** and the **Use it for JIT**
 switch, and **Settings → JIT** has **Add the Madeira JIT shortcut**. Both open its iCloud link, which takes Shortcuts straight to **Add
 Shortcut**, but needs a connection: iOS opens a shortcut directly only from an
-iCloud link. Without one, **No connection? Add Madeira's copy** shares the
-bundled `app/Madeira/Madeira JIT.shortcut` (a signed export): choose
-**Shortcuts** in the share sheet, then **Add Shortcut**. Only the share sheet
+iCloud link. Without one, **No internet connection? Add local copy** shares
+the bundled `app/Madeira/Madeira JIT.shortcut` (a signed export): choose the
+**Shortcuts** app in the share sheet, then **Add Shortcut**. Only the share sheet
 can hand a file to Shortcuts: iOS gives Shortcuts the file only when the user
 picks it there. Either way it is named **Madeira JIT**; then turn it on.
 
