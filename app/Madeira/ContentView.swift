@@ -1245,8 +1245,6 @@ struct ContentView: View {
     @ObservedObject private var input = InputSettings.shared
     @State private var pointerPanel = false
     @Namespace private var pointerNS
-    /// .compact = iPhone landscape: game surface expands, arrow keys appear.
-    @Environment(\.verticalSizeClass) private var vSizeClass
     /// The library front end (Library.swift). When it is the chosen interface it
     /// replaces both bodies below, and a running library session gets the
     /// full-screen `sessionBody`.
@@ -1274,19 +1272,14 @@ struct ContentView: View {
             Group {
                 if library.enabled && library.current != nil {
                     sessionBody
+                        .navigationBarHidden(true)
                 } else if library.enabled {
                     LibraryView(play: launchLibraryEntry, enableJIT: enableJIT,
                                 startDock: { startDock($0, compactPool: $1) })
-                } else if vSizeClass == .compact {
-                    landscapeBody
                 } else {
-                    portraitBody
+                    developerBody
                 }
             }
-            // Rotation destroys/recreates the UIViewRepresentable across
-            // this if/else (two SwiftUI identities) — HARMLESS since
-            // 2026-07-05: MetalHostView is a process-lifetime singleton;
-            // a fresh placeholder only re-parents the same CAMetalLayer.
             .navigationTitle("Madeira")
             .navigationBarTitleDisplayMode(.inline)
             .toolbarBackground(.regularMaterial, for: .navigationBar)
@@ -1295,7 +1288,6 @@ struct ContentView: View {
             // under the title, the buttons and the search field behind a
             // progressive blur (as in the App Store), with no hard edge.
             .toolbarBackground(library.enabled && !Self.systemScrollEdge ? .visible : .automatic, for: .navigationBar)
-            .navigationBarHidden(library.enabled ? library.current != nil : vSizeClass == .compact)
             // A second session cannot start in this process; offer to close Madeira.
             .alert("Restart Madeira", isPresented: Binding(get: { library.restartNotice != nil },
                                                             set: { if !$0 { library.restartNotice = nil } })) {
@@ -1356,6 +1348,37 @@ struct ContentView: View {
             .onReceive(ShortcutRouter.shared.$pendingExe) { _ in launchPendingShortcut() }
             .onChange(of: library.enabled) { _, _ in launchPendingShortcut() }
         }
+    }
+
+    /// The developer interface. Orientation comes from the view's own shape, not
+    /// verticalSizeClass: iPad is .regular in BOTH orientations, so the size-class
+    /// test kept the portrait tooling (badges, buttons, log) on screen after
+    /// rotating. The keyboard is excluded from the measurement, otherwise raising
+    /// it on a portrait iPad would make the view wider than tall.
+    private var developerBody: some View {
+        GeometryReader { geo in
+            let landscape = geo.size.width > geo.size.height
+            Group {
+                if landscape {
+                    landscapeBody
+                } else {
+                    portraitBody
+                }
+            }
+            .frame(width: geo.size.width, height: geo.size.height)
+            // Rotation destroys/recreates the UIViewRepresentable across
+            // this if/else (two SwiftUI identities) — HARMLESS since
+            // 2026-07-05: MetalHostView is a process-lifetime singleton;
+            // a fresh placeholder only re-parents the same CAMetalLayer.
+            .navigationBarHidden(landscape)
+            // ml1157: landscape is the desktop, edge to edge -- no status bar
+            // over its top rows, and the home indicator fades out.
+            .statusBarHidden(landscape)
+            .persistentSystemOverlays(landscape ? .hidden : .automatic)
+            // The landscape controls window re-frames to the rotated scene.
+            .onChange(of: landscape) { _, _ in TouchControlsHost.attach() }
+        }
+        .ignoresSafeArea(.keyboard)
     }
 
     /// A library session: the game full screen in either orientation, with the
@@ -1459,6 +1482,10 @@ struct ContentView: View {
             ZStack {
                 Color.black
                 MadeiraMetalView()
+                    // A launch straight into landscape never shows the portrait
+                    // layout, which is otherwise what creates the controls window
+                    // (its top bar carries the keyboard button here).
+                    .onAppear { TouchControlsHost.attach() }
                 // Controls removed for now (ml586): game-only landscape.
                 // The FPS readout stays, pinned in the right pillarbox bar —
                 // the window-level surface covers anything drawn over the
@@ -3768,10 +3795,11 @@ final class TouchControlsModel: ObservableObject {
     /// `topBar: false` in a library session, where LibraryHUD replaces the bar.
     func hitsInteractive(_ p: CGPoint, in bounds: CGRect, topBar: Bool = true) -> Bool {
         // Top bar: two 44pt buttons 10pt apart in play mode, centred, 10pt down,
-        // plus the layout menu while touch controls are on (ml1970).
+        // plus the layout menu while touch controls are on (ml1970), plus the
+        // keyboard button.
         // Padded generously; a few points of slop costs nothing and a missed tap
         // costs a build.
-        let buttons: CGFloat = TouchControlsOverlay.showsLayoutMenu(self) ? 3 : 2
+        let buttons: CGFloat = (TouchControlsOverlay.showsLayoutMenu(self) ? 3 : 2) + 1
         let barW: CGFloat = buttons * 44 + (buttons - 1) * 10
         if topBar, CGRect(x: bounds.midX - barW / 2 - 10, y: 0,
                           width: barW + 20, height: 68).contains(p) { return true }
@@ -3960,6 +3988,8 @@ struct TouchControlsOverlay: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel("Done editing controls")
             } else {
+                // The iOS keyboard for the game, as ⌨ in the portrait key row.
+                glassButton("keyboard") { MetalBackedView.toggleKeyboard() }
                 glassButton("gamecontroller", dim: !m.visible) { m.visible.toggle() }
                 if Self.showsLayoutMenu(m) {
                     ControlLayoutMenu()
