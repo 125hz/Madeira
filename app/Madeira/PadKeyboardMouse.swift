@@ -11,11 +11,14 @@ import UIKit
 /// into what the touch controls already produce, through the same posting
 /// paths (winios_post_key, winios_pointer, HardwareInput.postRelative).
 ///
-/// Bindings come from two places, the layout first:
+/// Bindings come from three places, the most specific winning:
+/// - The game's own binds table (`LibraryEntry.controllerBinds`, edited in the
+///   Session menu's Controller binds page and in Game details): one action per
+///   controller input, stored with the game.
 /// - A touch control of the active layout can name a controller input
 ///   (`TouchControl.padBinding`: "A", "LB", "RT", "D↑", ...; "LS" or "RS" for a
 ///   stick control). That input then does what the touch control does.
-/// - Inputs the layout leaves unbound take the built-in template below: WASD on
+/// - Inputs neither of those bind take the built-in template below: WASD on
 ///   the left stick, mouse on the right stick, the triggers as the mouse
 ///   buttons, the D-pad as the arrow keys, Start as Escape, Select as Tab.
 ///
@@ -53,10 +56,12 @@ struct PadBindings: Equatable {
         leftStick: .joystickWASD,
         rightStick: .none)                    // .none on the right stick means: the mouse
 
-    /// The template with the layout's own bindings on top. A control's binding
-    /// replaces the template's entry for that input; a key stick bound to RS
-    /// takes the right stick away from the mouse.
-    static func build(controls: [TouchControl]) -> PadBindings {
+    /// The template with the layout's own bindings on top, then the game's binds
+    /// table on top of that. A binding replaces the template's entry for that
+    /// input; a key stick bound to RS takes the right stick away from the mouse.
+    /// In the table, `.none` on a button means "does nothing", on RS "the mouse",
+    /// on LS "unused".
+    static func build(controls: [TouchControl], binds: [String: ControlAction]? = nil) -> PadBindings {
         var b = template
         for c in controls {
             guard let name = c.padBinding else { continue }
@@ -67,7 +72,26 @@ struct PadBindings: Equatable {
                 b.buttons[name] = c.action
             }
         }
+        for (name, action) in binds ?? [:] where !action.isPad {
+            if name == "LS" { b.leftStick = action.stickKeys != nil ? action : .none }
+            else if name == "RS" { b.rightStick = action.stickKeys != nil ? action : .none }
+            else if buttonNames.contains(name), action.stickKeys == nil { b.buttons[name] = action }
+        }
         return b
+    }
+
+    /// What the template gives an input, for the binds page's "Default" rows.
+    static func templateAction(_ name: String) -> ControlAction {
+        switch name {
+        case "LS": return template.leftStick
+        case "RS": return template.rightStick
+        default:   return template.buttons[name] ?? .none
+        }
+    }
+
+    /// The binds page's row labels: XInput names in the table, Start/Select on screen.
+    static func displayName(_ name: String) -> String {
+        name == "Menu" ? "Start" : name == "View" ? "Select" : name
     }
 
     var usesMouseStick: Bool { rightStick.stickKeys == nil }

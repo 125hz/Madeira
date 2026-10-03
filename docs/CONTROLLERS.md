@@ -135,7 +135,15 @@ the same posting paths:
 | LB, RB, L3, R3 | Q, F, Shift, C |
 | Start, Select | Escape, Tab |
 
-A layout can replace any of these: in the control editor, a touch control with
+The game's **Controller binds** page (the Session menu while the mode is on, and
+Game details) lists every input with a menu of what it does: a mouse button, a
+key, Show keyboard or Nothing; the sticks choose between WASD, the arrow keys
+and (right stick) the mouse. Rows the player has not changed show the layout's
+or the template's action and are not stored; "Default" in a row's menu and
+"Reset all to defaults" clear them. The table is saved with the game
+(`LibraryEntry.controllerBinds`) and the driver takes each change at once.
+
+A layout can also bind an input: in the control editor, a touch control with
 a key or mouse action has a **Controller button for this action** row, and a
 key stick (WASD or Arrows) can name LS or RS. The named input then does what
 that control does (`TouchControl.padBinding`, an optional field, so older

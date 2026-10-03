@@ -200,6 +200,11 @@ struct LibraryEntry: Codable, Identifiable {
     /// presses keys and moves the mouse, the game sees no controller). For games
     /// without controller support. Optional, so older files decode.
     var controllerMode: String?
+    /// Keyboard-and-mouse mode: what each controller input does in this game
+    /// (PadBindings.buttonNames plus "LS"/"RS" → key, mouse button, key stick or
+    /// .none), on top of the layout's bindings and the built-in template. Only
+    /// inputs the player changed are stored. Optional, so older files decode.
+    var controllerBinds: [String: ControlAction]?
     /// Processors reported to Windows code in this game's sessions
     /// (MADEIRA_CPU_COUNT, ntdll); nil = automatic.
     var cpuCount: Int?
@@ -356,6 +361,11 @@ final class LibraryModel: ObservableObject {
     /// The session's controller mode (LibraryEntry.controllerMode): "keys" or nil.
     @Published var controllerMode: String? {
         didSet { if oldValue != controllerMode { applyControllerMode() } }
+    }
+    /// The session's binds table (LibraryEntry.controllerBinds); a change rebuilds
+    /// the driver's bindings at once, so the binds page is live.
+    @Published var controllerBinds: [String: ControlAction] = [:] {
+        didSet { if oldValue != controllerBinds { applyControllerMode() } }
     }
     /// The session's touch-control opacity (the entry's Control opacity).
     @Published var opacity = 0.7
@@ -696,6 +706,7 @@ final class LibraryModel: ObservableObject {
         }
         controls.visible = entry.touchControls
         controls.sizeScale = min(max(entry.controlSize ?? 1, 0.5), 2)
+        controllerBinds = GamepadInput.keyboardMouseAvailable ? (entry.controllerBinds ?? [:]) : [:]
         controllerMode = GamepadInput.keyboardMouseAvailable ? entry.controllerMode : nil
         applyControllerMode()
         MetalHostView.shared.isHidden = false
@@ -766,11 +777,11 @@ final class LibraryModel: ObservableObject {
     func applyControllerMode() {
         guard GamepadInput.keyboardMouseAvailable else { return }
         if current != nil, controllerMode == "keys" {
-            GamepadInput.shared.setKeyboardMouse(PadBindings.build(controls: TouchControlsModel.shared.controls))
+            GamepadInput.shared.setKeyboardMouse(PadBindings.build(controls: TouchControlsModel.shared.controls, binds: controllerBinds))
             if controlsSink == nil {
                 controlsSink = TouchControlsModel.shared.$controls.sink { [weak self] controls in
                     guard let self, self.controllerMode == "keys", self.current != nil else { return }
-                    GamepadInput.shared.setKeyboardMouse(PadBindings.build(controls: controls))
+                    GamepadInput.shared.setKeyboardMouse(PadBindings.build(controls: controls, binds: self.controllerBinds))
                 }
             }
         } else {
@@ -815,6 +826,7 @@ final class LibraryModel: ObservableObject {
             entry.overlayFields = overlayFields
             entry.controlOpacity = opacity; entry.controlSize = controls.sizeScale
             if GamepadInput.keyboardMouseAvailable { entry.controllerMode = controllerMode }
+            if GamepadInput.keyboardMouseAvailable { entry.controllerBinds = controllerBinds.isEmpty ? nil : controllerBinds }
             // The in-game Aspect & scaling choice sticks to the game. MADEIRA_SESSION_TOOLS=0
             // hides that picker and leaves the stored choice alone.
             if MadeiraConfig.flag("MADEIRA_SESSION_TOOLS") { entry.display = displayMode.rawValue }
@@ -826,6 +838,7 @@ final class LibraryModel: ObservableObject {
         timer?.invalidate(); timer = nil
         saveCurrentProfile()
         controllerMode = nil
+        controllerBinds = [:]
         let controls = TouchControlsModel.shared
         controls.editing = false; controls.selected = nil
         controls.controls = savedControls; controls.visible = savedVisible; controls.sizeScale = savedSize
@@ -2369,6 +2382,12 @@ struct LibraryDetail: View {
                     Toggle("Touch controls", isOn: $entry.touchControls)
                     if GamepadInput.keyboardMouseAvailable {
                         ControllerModeChoice(mode: $entry.controllerMode)
+                        if entry.controllerMode == "keys" {
+                            NavigationLink("Controller binds") {
+                                Form { ControllerBindsPage(binds: $entry.controllerBinds) }
+                                    .navigationTitle("Controller binds")
+                            }
+                        }
                     }
                     LabeledContent("Control opacity") {
                         Slider(value: Binding(get: { entry.controlOpacity ?? 0.7 }, set: { entry.controlOpacity = $0 }), in: 0.15...1)
@@ -2378,7 +2397,7 @@ struct LibraryDetail: View {
                     }
                     Text("Arrange buttons and choose XInput, mouse, or keyboard actions from the in-game menu.").font(.caption).foregroundStyle(.secondary)
                     if GamepadInput.keyboardMouseAvailable {
-                        Text("Keyboard and mouse: for games without controller support. The controller presses keys and moves the mouse (left stick WASD, right stick mouse, triggers click, D-pad arrows, Start Esc, Select Tab) and the game sees no controller. Each touch control can name the controller button that performs its action, in the control editor.").font(.caption).foregroundStyle(.secondary)
+                        Text("Keyboard and mouse: for games without controller support. The controller presses keys and moves the mouse (left stick WASD, right stick mouse, triggers click, D-pad arrows, Start Esc, Select Tab) and the game sees no controller. Change what each button does under Controller binds, here or in the in-game menu.").font(.caption).foregroundStyle(.secondary)
                     }
                 }
                 if entry.steamAppID != nil {
@@ -2468,6 +2487,142 @@ struct SteamSearchView: View {
                 catch { self.error = error.localizedDescription }
                 loading = false
             }
+        }
+    }
+}
+
+/// Keyboard-and-mouse mode: one row per controller input with a menu of what it
+/// does, saved to the game. Used as a page of the Session menu (live: the driver
+/// takes each change at once) and as a sheet from Game details. Rows the player
+/// has not changed show the layout's or the template's action and are not stored.
+struct ControllerBindsPage: View {
+    @Binding var binds: [String: ControlAction]?
+    /// The active layout's own bindings, so an unchanged row shows what really
+    /// happens in this session; Game details passes none.
+    var controls: [TouchControl] = []
+
+    private static let groups: [(String, [String])] = [
+        ("Sticks", ["LS", "RS"]),
+        ("Face", ["A", "B", "X", "Y"]),
+        ("Bumpers & triggers", ["LB", "RB", "LT", "RT"]),
+        ("D-pad", ["D↑", "D↓", "D←", "D→"]),
+        ("System", ["Menu", "View", "L3", "R3"]),
+    ]
+
+    var body: some View {
+        ForEach(Self.groups, id: \.0) { group in
+            Section(group.0) {
+                ForEach(group.1, id: \.self) { name in row(name) }
+            }
+        }
+        Section {
+            Button("Reset all to defaults", role: .destructive) { binds = nil }
+                .disabled((binds ?? [:]).isEmpty)
+            Text("Defaults: left stick WASD, right stick mouse, RT and LT click, D-pad arrows, A Space, B Ctrl, X E, Y R, LB Q, RB F, L3 Shift, R3 C, Start Esc, Select Tab. A touch control's own controller binding (control editor) applies when a row is at its default.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private func row(_ name: String) -> some View {
+        let fromLayout = PadBindings.build(controls: controls)
+        let effective: ControlAction = binds?[name] ?? (name == "LS" ? fromLayout.leftStick : name == "RS" ? fromLayout.rightStick : fromLayout.buttons[name] ?? .none)
+        let changed = binds?[name] != nil
+        return LabeledContent(PadBindings.displayName(name)) {
+            Menu {
+                if name == "LS" || name == "RS" {
+                    pick(name, name == "RS" ? "Mouse" : "Nothing", .none)
+                    pick(name, "WASD", .joystickWASD)
+                    pick(name, "Arrow keys", .joystickArrows)
+                } else {
+                    pick(name, "Left click", .mouseLeft)
+                    pick(name, "Right click", .mouseRight)
+                    Menu("Letters") { ForEach(0x41...0x5A, id: \.self) { vk in pick(name, String(UnicodeScalar(UInt8(vk))), .key(Int32(vk))) } }
+                    Menu("Numbers") { ForEach(0x30...0x39, id: \.self) { vk in pick(name, String(UnicodeScalar(UInt8(vk))), .key(Int32(vk))) } }
+                    Menu("Function keys") { ForEach(0...11, id: \.self) { i in pick(name, "F\(i + 1)", .key(Int32(0x70 + i))) } }
+                    Menu("Modifiers & editing") {
+                        pick(name, "Escape", .key(0x1B)); pick(name, "Tab", .key(0x09)); pick(name, "Shift", .key(0x10))
+                        pick(name, "Ctrl", .key(0x11)); pick(name, "Alt", .key(0x12)); pick(name, "Space", .key(0x20))
+                        pick(name, "Enter", .key(0x0D)); pick(name, "Backspace", .key(0x08)); pick(name, "Caps Lock", .key(0x14))
+                    }
+                    Menu("Navigation") {
+                        pick(name, "↑", .key(0x26)); pick(name, "↓", .key(0x28)); pick(name, "←", .key(0x25)); pick(name, "→", .key(0x27))
+                        pick(name, "Insert", .key(0x2D)); pick(name, "Delete", .key(0x2E)); pick(name, "Home", .key(0x24))
+                        pick(name, "End", .key(0x23)); pick(name, "Page Up", .key(0x21)); pick(name, "Page Down", .key(0x22))
+                    }
+                    Menu("Symbols") {
+                        pick(name, "-", .key(0xBD)); pick(name, "=", .key(0xBB)); pick(name, "[", .key(0xDB)); pick(name, "]", .key(0xDD))
+                        pick(name, "\\", .key(0xDC)); pick(name, ";", .key(0xBA)); pick(name, "'", .key(0xDE)); pick(name, ",", .key(0xBC))
+                        pick(name, ".", .key(0xBE)); pick(name, "/", .key(0xBF)); pick(name, "`", .key(0xC0))
+                    }
+                    Menu("Numpad") {
+                        ForEach(0...9, id: \.self) { i in pick(name, "Numpad \(i)", .key(Int32(0x60 + i))) }
+                        pick(name, "Numpad *", .key(0x6A)); pick(name, "Numpad +", .key(0x6B)); pick(name, "Numpad −", .key(0x6D))
+                        pick(name, "Numpad .", .key(0x6E)); pick(name, "Numpad /", .key(0x6F))
+                    }
+                    pick(name, "Show keyboard", .keyboardToggle)
+                    pick(name, "Nothing", .none)
+                }
+                if changed {
+                    Divider()
+                    Button("Default") { binds?[name] = nil; if binds?.isEmpty == true { binds = nil } }
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Text(Self.describe(effective, input: name))
+                        .foregroundStyle(changed ? .primary : .secondary)
+                    Image(systemName: "chevron.up.chevron.down").font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func pick(_ name: String, _ title: String, _ action: ControlAction) -> some View {
+        Button(title) {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            var table = binds ?? [:]
+            table[name] = action
+            binds = table
+        }
+    }
+
+    /// Row text for an action, in the words the menu uses.
+    static func describe(_ action: ControlAction, input: String) -> String {
+        switch action {
+        case .none:            return input == "RS" ? "Mouse" : "Nothing"
+        case .mouseLeft:       return "Left click"
+        case .mouseRight:      return "Right click"
+        case .joystickWASD:    return "WASD"
+        case .joystickArrows:  return "Arrow keys"
+        case .keyboardToggle:  return "Show keyboard"
+        case .pad(let n):      return n
+        case .key(let vk):     return keyName(vk)
+        }
+    }
+    static func keyName(_ vk: Int32) -> String {
+        switch vk {
+        case 0x20: return "Space"
+        case 0x0D: return "Enter"
+        case 0x09: return "Tab"
+        case 0x1B: return "Escape"
+        case 0x10: return "Shift"
+        case 0x11: return "Ctrl"
+        case 0x12: return "Alt"
+        case 0x08: return "Backspace"
+        case 0x14: return "Caps Lock"
+        case 0x2D: return "Insert"
+        case 0x2E: return "Delete"
+        case 0x24: return "Home"
+        case 0x23: return "End"
+        case 0x21: return "Page Up"
+        case 0x22: return "Page Down"
+        case 0x70...0x7B: return "F\(vk - 0x6F)"
+        case 0x60...0x69: return "Numpad \(vk - 0x60)"
+        case 0x6A: return "Numpad *"
+        case 0x6B: return "Numpad +"
+        case 0x6D: return "Numpad −"
+        case 0x6E: return "Numpad ."
+        case 0x6F: return "Numpad /"
+        default:   return ControlAction.keyLabel(vk)
         }
     }
 }
@@ -2791,6 +2946,8 @@ struct LibraryHUD: View {
     @ObservedObject private var dockStart = DockStartScreen.shared
     private let sessionTools = MadeiraConfig.flag("MADEIRA_SESSION_TOOLS")
     @State private var launchVisible = false
+    /// The Session menu's Controller binds page (keyboard-and-mouse mode).
+    @State private var bindsPage = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         GeometryReader { geo in
@@ -2808,7 +2965,8 @@ struct LibraryHUD: View {
                 if !model.launching { LibraryFloatingItem(isMenu: true, viewport: geo.size, insets: geo.safeAreaInsets) }
                 if model.menu {
                     Color.black.opacity(0.5).ignoresSafeArea().onTapGesture { model.menu = false }.transition(.opacity)
-                    menu.frame(width: min(460, geo.size.width - 32), height: min(650, geo.size.height - geo.safeAreaInsets.top - geo.safeAreaInsets.bottom - 24))
+                    (bindsPage ? AnyView(bindsMenu) : AnyView(menu))
+                        .frame(width: min(460, geo.size.width - 32), height: min(650, geo.size.height - geo.safeAreaInsets.top - geo.safeAreaInsets.bottom - 24))
                         .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 28))
                         .clipShape(RoundedRectangle(cornerRadius: 28))
                         .overlay(RoundedRectangle(cornerRadius: 28).stroke(.white.opacity(0.15)))
@@ -2826,6 +2984,7 @@ struct LibraryHUD: View {
         .onAppear { model.saveCurrentProfile() }
         .onChange(of: model.menu) { _, open in
             LibraryController.shared.configure(enabled: model.enabled, ownsInput: open)
+            if !open { bindsPage = false }
             if !open { model.saveCurrentProfile() }
         }
         .onReceive(LibraryController.shared.commands) { command in
@@ -2940,6 +3099,25 @@ struct LibraryHUD: View {
         }
     }
 
+    /// Controller binds, as a page of the Session menu: a Form, so the rows read
+    /// like Game details; the driver takes each change at once (model.controllerBinds).
+    private var bindsMenu: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Button("Session", systemImage: "chevron.left") { bindsPage = false }.buttonStyle(.borderless)
+                Spacer()
+                Text("Controller binds").font(.headline)
+                Spacer()
+                Button("Done") { model.menu = false }.buttonStyle(.bordered)
+            }.padding(.horizontal, 22).padding(.top, 22).padding(.bottom, 8)
+            Form {
+                ControllerBindsPage(binds: Binding(get: { model.controllerBinds.isEmpty ? nil : model.controllerBinds },
+                                                   set: { model.controllerBinds = $0 ?? [:]; model.saveCurrentProfile() }),
+                                    controls: controls.controls)
+            }.scrollContentBackground(.hidden)
+        }
+    }
+
     private var menu: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
@@ -2959,6 +3137,9 @@ struct LibraryHUD: View {
                 Button("Edit controls", systemImage: "slider.horizontal.3") { controls.visible = true; controls.editing = true; model.menu = false }
                 if GamepadInput.keyboardMouseAvailable {
                     ControllerModeChoice(mode: Binding(get: { model.controllerMode }, set: { model.controllerMode = $0; model.saveCurrentProfile() }))
+                    if model.controllerMode == "keys" {
+                        Button("Controller binds", systemImage: "gamecontroller") { bindsPage = true }
+                    }
                 }
                 Button("Keyboard", systemImage: "keyboard") { model.menu = false; LibraryKeyboard.show() }
                 Divider()
