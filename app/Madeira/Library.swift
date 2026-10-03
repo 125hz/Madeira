@@ -1944,6 +1944,14 @@ struct LibraryView: View {
             LibraryLargeTitle()
             if tab == 0 { libraryToolbar } else { settingsToolbar }
         }
+        // On the tab view, not inside one tab's page: an alert attached to the Library
+        // page cannot present while Settings is showing, so an error raised there (its
+        // Enable JIT, for one) waited until the Library tab came back.
+        .alert(jitProblem == nil ? "Library" : "Couldn't Enable JIT",
+               isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
+            if let jitProblem { jitConnectionActions(jitProblem) { model.error = nil } }
+            Button("OK", role: .cancel) { model.error = nil }
+        } message: { Text(model.error ?? "") }
         .fullScreenCover(isPresented: $onboarding.presented) { OnboardingView() }
         .onAppear {
             // An ended desktop session's surface never stays over the library.
@@ -2182,11 +2190,6 @@ struct LibraryView: View {
             model.showDetail = nil
             selected = model.entries.first { $0.id == id }
         }
-        .alert(jitProblem == nil ? "Library" : "Couldn't Enable JIT",
-               isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
-            if let jitProblem { jitConnectionActions(jitProblem) { model.error = nil } }
-            Button("OK", role: .cancel) { model.error = nil }
-        } message: { Text(model.error ?? "") }
         .onChange(of: scenePhase) { _, phase in if phase == .active { model.refreshFlag() } }
         .onAppear {
             if focused == nil { focused = LibraryEntry.desktopID }

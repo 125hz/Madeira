@@ -131,6 +131,12 @@ require(setup.count("helperFailure(response.message)") == 2,
 library_source = (app / "Library.swift").read_text()
 require("if let jitProblem { jitConnectionActions(jitProblem) { model.error = nil } }" in library_source,
         "the library's JIT error offers Pair Again and LocalDevVPN")
+# The error alert hangs off LibraryView's tab view, so it presents from Settings too
+# (an alert inside the Library page waited until that tab came back).
+body = library_source[library_source.index('struct LibraryView: View {'):]
+body = body[body.index('    var body: some View {'):body.index('    @ToolbarContentBuilder private var libraryToolbar')]
+require('.alert(jitProblem == nil ? "Library" : "Couldn\'t Enable JIT"' in body,
+        "the library's error alert is on the tab view, shown on the Settings tab as well")
 require('URL(string: "localdevvpn://enable?scheme=madeira")' in setup
         and "localdevvpn" in app_plist["LSApplicationQueriesSchemes"]
         and any("madeira" in t.get("CFBundleURLSchemes", []) for t in app_plist.get("CFBundleURLTypes", [])),
