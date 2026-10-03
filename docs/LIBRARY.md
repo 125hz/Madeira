@@ -94,11 +94,30 @@ and check-frontend fails if a setting is hidden from it. A profile holds:
 
 - title and cover image;
 - **Resolution**: the size of the Windows screen (the virtual monitor) the game
-  renders for: 640×480 to 2560×1440, plus **Screen shape**, this device's own
-  aspect ratio at 720 lines (for example 1560×720 on a 19.5:9 phone), so a game
-  fills the screen without bars. It is exported as the session default
-  (`MADEIRA_SCREEN_W/H`, `MADEIRA_SCREEN_SRC=knob`), which win32u reports for
-  the session. New entries use 1024×768, the size main uses for every launch;
+  renders for, chosen from this device's list (ml1172, `ResolutionChoices` in
+  `GuestDisplay.swift`; the developer interface's Resolution menu shows the
+  same list):
+  - **This screen's shape**, which fills the screen without bars: the screen's
+    aspect ratio at 944×656's pixel count (**default**), at 1280×720's (≈720p)
+    and at 1920×1080's (≈1080p), sides rounded to multiples of 8, then the
+    screen's **native** pixels; a size past native is left out. On an 11-inch
+    iPad (1180×820 points): 944×656, 1152×800, 1728×1200, 2360×1640; on an
+    iPhone 16 Pro Max: 1168×536, 1408×648, 2120×976, 2868×1320;
+  - **16:9 widescreen**: 960×540, 1280×720, 1600×900, 1920×1080, 2560×1440;
+  - **4:3 classic**: 640×480, 800×600, 1024×768, 1280×960.
+
+  Each PC group's title says whether it fills this screen or leaves bars
+  above and below or at the sides (in Fit). A saved size the list lacks (chosen
+  on another device) is shown as "saved". The choice is exported as the session
+  default (`MADEIRA_SCREEN_W/H`, `MADEIRA_SCREEN_SRC=knob`), which win32u
+  reports for the session. A program's own display-mode change
+  (ChangeDisplaySettings to a size win32u lists) resizes that monitor for the
+  rest of the session and the picture follows it;
+  `env.MADEIRA_VIRTUAL_MODE_SET = 0` keeps the chosen size. New entries, and
+  the Desktop entry, take the default. Upstream's fixed default, 1408×648, is
+  a 19.5:9 phone's shape; on a screen of another shape, entries saved with it
+  are reset once to the default (UserDefaults
+  `madeira.ml1172.resolution-reset`);
 - **Aspect & scaling**: how that screen is shown. **Fit** letterboxes it,
   **Fill** covers the screen and crops, **Stretch** fills it exactly, **Aspect**
   letterboxes the shape the game actually draws (its back buffer) and **Fill
@@ -360,7 +379,6 @@ menu owns input, the game sees a connected pad at rest.
 | `MADEIRA_RUNTIME_SETTINGS` | on | no Display and Memory & sync sections in Settings |
 | `MADEIRA_SESSION_TOOLS` | on | no Aspect & scaling (a session does not save it) and no Diagnostics in the in-game menu |
 | `MADEIRA_SESSION_DIAGNOSTICS` | off | `1` shows the in-game menu's Diagnostics: frame capture (render-target pixels to `Documents/capture`) and GPU sync, for Direct3D 12 games |
-| `MADEIRA_SCREEN_SHAPE_RESOLUTION` | on | no Screen shape resolution choice |
 | `MADEIRA_FRONTEND_KEYBOARD` | on | Keyboard opens the game view's own keyboard instead of the key window |
 | `MADEIRA_ONBOARDING` | on | first-run setup never opens, and Settings › JIT/Steam have no **Run setup again** |
 | `MADEIRA_LIBRARY_COLLAPSE` | on | the **Steam** and **Other games** titles do not collapse (**Not installed** still folds) |

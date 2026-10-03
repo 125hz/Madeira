@@ -167,9 +167,10 @@ struct LibraryEntry: Codable, Identifiable {
     var arguments = ""
     /// The virtual monitor's size ("WxH"): the session default a game renders
     /// for (GuestDisplay.configureSessionDefault), and the Desktop entry's
-    /// desktop size. New entries default to 1408x648, a wide shape near the
-    /// phone's landscape aspect that most games render quickly.
-    var resolution = "1408x648"
+    /// desktop size. ml1172: new entries default to this screen's shape at
+    /// 944x656's pixel count (ResolutionChoices; 944x656 on an 11-inch iPad);
+    /// upstream's fixed 1408x648 is a phone's shape.
+    var resolution = ResolutionChoices.defaultValue
     /// How the monitor is scaled to the screen (DisplayMode raw value; nil = Fit).
     var display: String?
     /// FPS limit: 1 = 60, 3 = 30, 4 = 40, 0 = display maximum, 2 = uncapped (madeira_set_vsync_locked).
@@ -664,15 +665,35 @@ final class LibraryModel: ObservableObject {
 
     private init() {
         refreshFlag()
-        guard FileManager.default.fileExists(atPath: file.path) else { return }
-        do {
-            let doc = try JSONDecoder().decode(Document.self, from: Data(contentsOf: file))
-            guard doc.version == 1 else { throw LibraryError.message("This library uses a newer format.") }
-            entries = doc.entries
-        } catch {
-            readOnly = true
-            self.error = "Library could not be opened. The original file was preserved. " + error.localizedDescription
+        if FileManager.default.fileExists(atPath: file.path) {
+            do {
+                let doc = try JSONDecoder().decode(Document.self, from: Data(contentsOf: file))
+                guard doc.version == 1 else { throw LibraryError.message("This library uses a newer format.") }
+                entries = doc.entries
+            } catch {
+                readOnly = true
+                self.error = "Library could not be opened. The original file was preserved. " + error.localizedDescription
+            }
         }
+        resetPhoneResolution()
+    }
+
+    /// ml1172: upstream gave every new entry 1408x648, a 19.5:9 phone's shape.
+    /// On a screen of another shape (an iPad: a third of it black in Fit)
+    /// those entries are reset once to this device's default; nothing tells a
+    /// deliberate 1408x648 from the old default, and the owner chose the reset.
+    private func resetPhoneResolution() {
+        let key = "madeira.ml1172.resolution-reset"
+        guard !readOnly, !UserDefaults.standard.bool(forKey: key) else { return }
+        let phone = "1408x648"
+        let reset = ResolutionChoices.fills(1408, 648) ? 0 : entries.filter { $0.resolution == phone }.count
+        if reset > 0 {
+            var next = entries
+            for i in next.indices where next[i].resolution == phone { next[i].resolution = ResolutionChoices.defaultValue }
+            guard persist(next) else { return }   // try again at the next start
+        }
+        UserDefaults.standard.set(true, forKey: key)
+        LogStore.shared.log("[library] ml1172 resolution default \(ResolutionChoices.defaultValue); \(reset) entries reset from \(phone)")
     }
 
     func refreshFlag() {
@@ -734,13 +755,15 @@ final class LibraryModel: ObservableObject {
         guard entries.contains(where: { $0.steamAppID == appID }) else { return }
         persist(entries.filter { $0.steamAppID != appID })
     }
-    private func persist(_ next: [LibraryEntry]) {
-        guard !readOnly else { return }
+    @discardableResult
+    private func persist(_ next: [LibraryEntry]) -> Bool {
+        guard !readOnly else { return false }
         do {
             let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             try encoder.encode(Document(version: 1, entries: next)).write(to: file, options: .atomic)
             entries = next
-        } catch { self.error = "Could not save the library: " + error.localizedDescription }
+            return true
+        } catch { self.error = "Could not save the library: " + error.localizedDescription; return false }
     }
 
     /// Install size and graphics API, at most once a day per entry.
@@ -2568,36 +2591,6 @@ struct LibraryDetail: View {
     /// Settings › Sync engine, read when the details open: the fastsync switches
     /// below only apply while it is Fastsync.
     @State private var syncEngine = SyncEngine.current
-    static let presetResolutions = ["640x480", "800x600", "960x540", "1024x768", "1280x720", "1280x960", "1408x648", "1920x1080", "2560x1440"]
-    /// The presets, plus a stored size that is none of them (a screen shape
-    /// chosen on another device), so the picker never shows a blank choice.
-    static func resolutions(keeping current: String) -> [String] {
-        presetResolutions.contains(current) || current == screenShapeResolution || current == metalFXShapeResolution
-            ? presetResolutions : presetResolutions + [current]
-    }
-    /// "WxH" matching this screen's landscape aspect at 720 lines (width
-    /// rounded to a multiple of 8), or nil when it equals a preset or
-    /// MADEIRA_SCREEN_SHAPE_RESOLUTION=0.
-    static var screenShapeResolution: String? {
-        guard MadeiraConfig.flag("MADEIRA_SCREEN_SHAPE_RESOLUTION") else { return nil }
-        let bounds = UIScreen.main.bounds
-        let long = max(bounds.width, bounds.height), short = min(bounds.width, bounds.height)
-        guard short > 0 else { return nil }
-        let width = Int((720 * long / short / 8).rounded()) * 8
-        guard (640...4096).contains(width), width != 1280, width != 960 else { return nil }
-        return "\(width)x720"
-    }
-    /// The same shape at 480 lines, the size MetalFX 1.5× brings to 720; nil
-    /// when it equals a preset or MADEIRA_SCREEN_SHAPE_RESOLUTION=0.
-    static var metalFXShapeResolution: String? {
-        guard MadeiraConfig.flag("MADEIRA_SCREEN_SHAPE_RESOLUTION") else { return nil }
-        let bounds = UIScreen.main.bounds
-        let long = max(bounds.width, bounds.height), short = min(bounds.width, bounds.height)
-        guard short > 0 else { return nil }
-        let width = Int((480 * long / short / 8).rounded()) * 8
-        guard (640...4096).contains(width), !presetResolutions.contains("\(width)x480") else { return nil }
-        return "\(width)x480"
-    }
     /// "None", or how many keys this game's own config sets.
     static func configSummary(_ config: String?) -> String {
         let count = MadeiraConfig.parse(config ?? "").count
@@ -2684,16 +2677,22 @@ struct LibraryDetail: View {
                 }
                 Section {
                     // The Windows screen the game renders for (and the Desktop's size).
+                    // ml1172: this device's choices (ResolutionChoices), grouped.
+                    let groups = ResolutionChoices.groups()
+                    let metalFX = ResolutionChoices.metalFX(in: groups)
                     Picker("Resolution", selection: $entry.resolution) {
-                        ForEach(Self.resolutions(keeping: entry.resolution), id: \.self) { Text($0.replacingOccurrences(of: "x", with: "×")).tag($0) }
-                        // This device's own aspect ratio at 720 lines, so the game
-                        // fills the screen without bars or stretching.
-                        if let shape = Self.screenShapeResolution {
-                            Text("Screen shape (\(shape.replacingOccurrences(of: "x", with: "×")))").tag(shape)
+                        ForEach(groups, id: \.title) { group in
+                            Section(group.title) {
+                                ForEach(group.choices, id: \.value) { Text($0.label).tag($0.value) }
+                            }
                         }
-                        // The same shape at 480 lines, which MetalFX 1.5× brings to 720.
-                        if let shape = Self.metalFXShapeResolution, entry.metalFXUpscale == 1.5 || entry.resolution == shape {
-                            Text("Screen shape for MetalFX 1.5× (\(shape.replacingOccurrences(of: "x", with: "×")))").tag(shape)
+                        // The screen's shape at 480 lines, which MetalFX 1.5× brings to 720.
+                        if let shape = metalFX, entry.metalFXUpscale == 1.5 || entry.resolution == shape.value {
+                            Text(shape.label).tag(shape.value)
+                        }
+                        // A size none of them has, so the picker never shows a blank choice.
+                        if entry.resolution != metalFX?.value, let saved = ResolutionChoices.extra(entry.resolution, in: groups, note: "saved") {
+                            Text(saved.label).tag(entry.resolution)
                         }
                     }
                     Picker("Aspect & scaling", selection: Binding(get: { entry.displayMode.rawValue }, set: { entry.display = $0 })) {
