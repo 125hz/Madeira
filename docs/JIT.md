@@ -144,16 +144,17 @@ stays off.
 
 Name it exactly **Madeira JIT** and add:
 
-1. **If** *Shortcut Input* contains `start`
-   1. **If** *Shortcut Input* contains `cellular`: **Set Cellular Data** *Off*.
-      End If.
+1. **Text**, with the *Shortcut Input* variable inside it. (*Shortcut Input* on
+   its own is untyped, so **If** offers only "has any value"; its text offers
+   "contains".)
+2. **If** *Text* contains `start`
+   1. **If** *Text* contains `cellular`: **Set Cellular Data** *Off*. End If.
    2. LocalDevVPN's **Connect** action (or **Set VPN** → *Connect* → LocalDevVPN).
-2. **Otherwise**
-   1. **If** *Shortcut Input* contains `vpn`: LocalDevVPN's **Disconnect**
-      action (or **Set VPN** → *Disconnect*). End If.
-   2. **If** *Shortcut Input* contains `cellular`: **Set Cellular Data** *On*.
-      End If.
-3. End If.
+3. **Otherwise**
+   1. **If** *Text* contains `vpn`: LocalDevVPN's **Disconnect** action (or
+      **Set VPN** → *Disconnect*). End If.
+   2. **If** *Text* contains `cellular`: **Set Cellular Data** *On*. End If.
+4. End If.
 
 Then turn on **Settings → JIT → Madeira JIT shortcut**. Without the shortcut,
 leave it off: Shortcuts would only report that the shortcut is missing.
