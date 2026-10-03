@@ -370,10 +370,24 @@ void *jit_region_write(JITRegion *region, size_t offset, const void *code, size_
 
 // SIGTRAP handler: skips BRK instruction (PC += 4) and zeros x0.
 // This prevents crashes when BRK is executed without a debugger attached.
+// ml1233: only the JIT protocol's BRK #0xf00d (as Wine's handler does). Any other
+// trap is not ours -- a Swift runtime trap (precondition, force unwrap, overflow)
+// is BRK #1 -- and was skipped too, running on past it with x0 = 0. The handler
+// stays installed for the rest of the app run (from start-up without CS_DEBUGGED,
+// or from jit_arm_trap_fallback before a launch that then fails and keeps the app
+// up), so put the default action back and return: the instruction traps again and
+// the app crashes with a report.
 static void sigtrap_handler(int sig, siginfo_t *info, void *context) {
-    (void)sig;
     (void)info;
     ucontext_t *uc = (ucontext_t *)context;
+    uint64_t pc = uc->uc_mcontext->__ss.__pc;
+    if ((pc & 3) || *(const uint32_t *)(uintptr_t)pc != 0xd43e01a0u /* brk #0xf00d */) {
+        struct sigaction dfl;
+        memset(&dfl, 0, sizeof(dfl));
+        dfl.sa_handler = SIG_DFL;
+        sigaction(sig, &dfl, NULL);
+        return;
+    }
     uc->uc_mcontext->__ss.__pc += 4;
     uc->uc_mcontext->__ss.__x[0] = 0;
 }
