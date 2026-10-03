@@ -180,7 +180,9 @@ bundled `app/Madeira/Madeira JIT.shortcut` (a signed export): choose
 can hand a file to Shortcuts: iOS gives Shortcuts the file only when the user
 picks it there. Either way it is named **Madeira JIT**; then turn it on.
 
-The iCloud link and the bundled file must be the same shortcut. After changing
+The iCloud link lives only while the shared shortcut stays in its owner's
+library: deleting it there breaks the link. The iCloud link and the bundled
+file must be the same shortcut. After changing
 it, share a new iCloud link and export a new file (**Share** → **Options** →
 **Anyone** → **Save to Files**), and replace both (`JITShortcutFile` in
 `JITNetwork.swift`, and the file, keeping its name). The file's signing

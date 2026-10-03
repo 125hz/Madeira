@@ -165,12 +165,15 @@ enum LoopbackProbe {
 /// share sheet can hand a file to Shortcuts: iOS gives Shortcuts that file only when the
 /// user picks it there. Shortcuts names an import after the file, "Madeira JIT".
 ///
+/// The link lives only while the shared shortcut stays in its owner's library: deleting
+/// it there breaks the link ("Shortcut Not Found"), as happened to the first one.
+///
 /// THE TWO MUST BE THE SAME SHORTCUT: change it, then share a new iCloud link and export
 /// a new file (Share › Options › Anyone › Save to Files), and replace both here. The
 /// file's signing certificate expires on 26 Oct 2027. iOS 27 and later only: it keeps the
 /// previous VPN with Store Content, which iOS 26 lacks.
 enum JITShortcutFile {
-    static let iCloudLink = URL(string: "https://www.icloud.com/shortcuts/1fea5b44c4884c589bd9559274a53ddb")!
+    static let iCloudLink = URL(string: "https://www.icloud.com/shortcuts/0cd955d14dd240e3aa3fed5fa9248a37")!
     static var url: URL? { Bundle.main.url(forResource: "Madeira JIT", withExtension: "shortcut") }
     static var supported: Bool {
         ProcessInfo.processInfo.isOperatingSystemAtLeast(OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0))
