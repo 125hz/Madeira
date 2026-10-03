@@ -151,7 +151,12 @@ final class PadKeyboardMouse {
         if let keys = bindings.rightStick.stickKeys {
             rightDir = Self.applyStick(from: rightDir, to: Self.sector(r.x, r.y), keys: keys, heldKeys: &rightKeys)
         } else if focused {
-            let f = StickVelocity.frame(x: r.x, y: r.y, gain: InputSettings.shared.sensRel, dt: dt)
+            // Motion by the time since the last sample, unfloored: samples come from
+            // the 4 ms timer and from every controller change, so StickVelocity.frame's
+            // 1/240 s floor would make the cursor faster the more often the pad reports.
+            let v = StickVelocity.deflect(r.x, r.y)
+            let k = InputSettings.shared.sensRel * StickVelocity.fullRate * min(dt, 1.0 / 15.0)
+            let f = (dx: v.x * k, dy: -v.y * k)
             if f.dx != 0 || f.dy != 0 {
                 let d = carry.add(f.dx, f.dy * bindings.mouseVertical, gain: 1)
                 if d.dx != 0 || d.dy != 0 {
@@ -168,8 +173,12 @@ final class PadKeyboardMouse {
         }
     }
 
+    /// Whether a key or mouse button is down, or the mouse is moving.
+    var holding: Bool { !pressedWith.isEmpty || !leftKeys.isEmpty || !rightKeys.isEmpty || mouseMoving }
+
     /// Release everything this driver holds: the mode went off, the app
-    /// resigned active, the session ended, or the library took the pad.
+    /// resigned active, the session ended, the library took the pad, or the
+    /// controller disconnected.
     func releaseAll(_ why: String) {
         for (_, a) in pressedWith { act(a, down: false) }
         pressedWith.removeAll()
