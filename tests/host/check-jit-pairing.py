@@ -87,6 +87,18 @@ require('try JITCoordinator.shared.storeOnDevicePairing(data)' in finished, 'a p
 store = block(setup, 'func storeOnDevicePairing(')
 require('JITPairingFileStore.store(data, source: .onDevice)' in store and 'method = .builtIn' in store,
         'the stored pairing selects Built-in StikJIT')
+# The pairing file is a credential for the device: Keychain, this device only, never Documents.
+pstore = setup[setup.index('enum JITPairingFileStore {'):setup.index('final class JITCoordinator')]
+require('SecItemAdd(add as CFDictionary, nil)' in pstore
+        and 'kSecAttrAccessibleWhenUnlockedThisDeviceOnly' in pstore
+        and 'SecItemCopyMatching(' in pstore,
+        'the pairing file is kept in the Keychain, this device only, readable while unlocked')
+require('data.write(' not in pstore and pstore.count('.documentDirectory') == 1
+        and 'private static var legacyFolder' in pstore,
+        'the pairing file is never written to Documents (only the old copy is read there)')
+legacy = block(setup, 'private static func moveLegacyFile(')
+require(legacy.index('try? store(data, source: kept)') < legacy.index('removeItem(at: file)'),
+        'an old Documents copy is deleted only after the Keychain holds it')
 require('try store(try Data(contentsOf: source), source: .imported)' in setup
         and 'dictionary["public_key"]' in block(setup, 'static func store('),
         'imports and on-device pairings share one validation')

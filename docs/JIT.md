@@ -86,10 +86,13 @@ only the Local Network permission is needed.
    and verifies the matching Developer Disk Image when needed.
 3. Tap **Enable JIT**.
 
-Either way, the pairing file is stored at
-`Documents/StikJIT/pairingFile.plist`, which is visible through Finder/iTunes
-file sharing. Treat it as device-sensitive data and do not share it. Madeira
-sends its bytes only to its bundled helper process for the current request.
+Either way, the pairing file is kept in the Keychain, for this device only and
+readable while it is unlocked, as the Steam sign-in token is. It is a credential
+for the iPhone itself, so it is never stored in `Documents`, where the Files app
+and every Windows program in Madeira could read it. Madeira sends its bytes only
+to its bundled helper process for the current request. A copy an earlier build
+left at `Documents/StikJIT/pairingFile.plist` is moved into the Keychain and
+deleted the first time Madeira reads it.
 
 The helper is an iOS 26 ExtensionFoundation process. A separate process is
 required because a process cannot synchronously debug itself. The app sends its

@@ -188,9 +188,8 @@ app. The JIT page is always available; Steam pages follow their feature
 switches. Setup never opens over a running session.
 
 Setup starts no Wine session and allocates no JIT pool. It stores the selected
-JIT method and may write a validated pairing file (paired on the device or
-imported) to
-`Documents/StikJIT/pairingFile.plist`; the component download runs Dock's own
+JIT method and may store a validated pairing file (paired on the device or
+imported) in the Keychain (docs/JIT.md); the component download runs Dock's own
 verified download without Wine. It changes no engine switch or launch
 configuration.
 

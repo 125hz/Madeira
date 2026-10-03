@@ -2,6 +2,7 @@
 // Madeira Converter Exception: see LICENSE-EXCEPTION.md
 
 import Foundation
+import Security
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -28,14 +29,19 @@ enum JITPairingSource: String {
     case imported
 }
 
+/// This iPhone's remote pairing file for Built-in StikJIT. It is a credential
+/// for the device itself, so it lives in the Keychain (this device only, while
+/// unlocked), as the Steam sign-in token does, and never in Documents, where
+/// the Files app and every Windows program in Madeira could read it. Its bytes
+/// go only to the bundled helper, over XPC, for one request. A copy an earlier
+/// build left at Documents/StikJIT/pairingFile.plist moves into the Keychain
+/// and is deleted.
 enum JITPairingFileStore {
-    static var directory: URL {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("StikJIT", isDirectory: true)
-    }
-    static var url: URL { directory.appendingPathComponent("pairingFile.plist") }
-    static var isImported: Bool { FileManager.default.fileExists(atPath: url.path) }
+    private static let service = "MadeiraJITPairing"
+    private static let account = "rppairing"
     private static let sourceKey = "madeiraJITPairingSource"
+
+    static var isImported: Bool { (try? data()) != nil }
 
     /// Files stored before on-device pairing existed were all imported.
     static var source: JITPairingSource? {
@@ -44,7 +50,20 @@ enum JITPairingFileStore {
     }
 
     static func data() throws -> Data {
-        try Data(contentsOf: url)
+        moveLegacyFile()
+        var result: AnyObject?
+        let status = SecItemCopyMatching([
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ] as CFDictionary, &result)
+        guard status == errSecSuccess, let data = result as? Data, !data.isEmpty else {
+            throw NSError(domain: "MadeiraJIT", code: 11,
+                          userInfo: [NSLocalizedDescriptionKey: "No pairing file is stored for this device."])
+        }
+        return data
     }
 
     static func importFile(from source: URL) throws {
@@ -65,9 +84,43 @@ enum JITPairingFileStore {
                           userInfo: [NSLocalizedDescriptionKey:
                             "That is not a StikDebug remote pairing file. Create one with iloader and try again."])
         }
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try data.write(to: url, options: .atomic)
+        let item: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        SecItemDelete(item as CFDictionary)
+        var add = item
+        add[kSecValueData as String] = data
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        let status = SecItemAdd(add as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw NSError(domain: "MadeiraJIT", code: 12,
+                          userInfo: [NSLocalizedDescriptionKey:
+                            "The pairing file could not be saved in the Keychain (\(status)). Unlock this device and try again."])
+        }
         UserDefaults.standard.set(source.rawValue, forKey: sourceKey)
+    }
+
+    /// Documents/StikJIT/pairingFile.plist, where builds before the Keychain kept it.
+    private static var legacyFolder: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("StikJIT", isDirectory: true)
+    }
+
+    private static func moveLegacyFile() {
+        let manager = FileManager.default
+        let file = legacyFolder.appendingPathComponent("pairingFile.plist")
+        guard manager.fileExists(atPath: file.path), let data = try? Data(contentsOf: file) else { return }
+        let kept = UserDefaults.standard.string(forKey: sourceKey).flatMap(JITPairingSource.init(rawValue:)) ?? .imported
+        // Deleted only once the Keychain holds it (a locked device keeps it for later).
+        if (try? store(data, source: kept)) != nil {
+            try? manager.removeItem(at: file)
+            if (try? manager.contentsOfDirectory(atPath: legacyFolder.path))?.isEmpty == true {
+                try? manager.removeItem(at: legacyFolder)
+            }
+            LogStore.shared.log("[jit] pairing file moved from Documents into the Keychain")
+        }
     }
 }
 
