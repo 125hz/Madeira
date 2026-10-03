@@ -49,10 +49,14 @@ require('guard let self, !probe.reachable, JITNetworkShortcut.shared.enabled els
         'the shortcut runs only when the loopback does not answer and the shortcut is turned on')
 require('JITNetworkShortcut.shared.restoreIfNeeded' in enable,
         'a JIT attempt that fails after the shortcut ran puts back what it changed')
-start = net[net.index('    func start(vpnWasUp:'):net.index('    /// Runs "done"')]
-require('let cellular = cellularOnly' in start and 'run(cellular ? "start cellular" : "start")' in start
-        and 'self?.restore = (cellular, !vpnWasUp)' in start,
-        '"start" asks for the cellular step only without Wi-Fi; "done" undoes only what "start" changed')
+start = net[net.index('    func start(completion:'):net.index('    /// From the launch thread')]
+require('let cellular = cellularOnly' in start
+        and start.index('pending = cellular ? "done cellular" : "done"') < start.index('run(cellular ? "start cellular" : "start"')
+        and 'guard let input = pending else { completion(); return }' in start and 'run(input)' in start,
+        '"start" asks for the cellular step only without Wi-Fi, and records the "done" it owes before it runs')
+require('UserDefaults.standard.string(forKey: Self.pendingKey)' in net
+        and 'JITNetworkShortcut.shared.restoreLeftover()' in main_app,
+        'the owed "done" is kept on disk and run at the next launch if a run ended between them')
 require('path.usesInterfaceType(.cellular) && !path.usesInterfaceType(.wifi)' in net,
         'cellular-only comes from the system network path')
 detach = content.index('winios_phase("detach-done")')

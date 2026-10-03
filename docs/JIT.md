@@ -137,15 +137,19 @@ shortcut** is on (`env.MADEIRA_JIT_SHORTCUT = 1`), Madeira runs your
 **Madeira JIT** shortcut:
 
 - **"start"** (with "cellular" when Madeira sees cellular data and no Wi-Fi):
-  turn Cellular Data off, only when asked, and connect LocalDevVPN. LocalDevVPN's
-  Connect returns before its tunnel routes (about 5 s on an iPhone 18 Pro), so
-  Madeira checks the loopback again for up to 15 s, going on the moment `lockdownd`
-  answers, and enables JIT.
-- **"done"** (with "cellular" and/or "vpn"): turn Cellular Data back on and/or
-  disconnect LocalDevVPN. Madeira runs it once a game's JIT pool is mapped and
-  the debugger has detached, before Wine starts, and asks only to undo what
-  "start" changed: a VPN that was already connected stays connected. If enabling
-  JIT fails, "done" runs at once.
+  save the name of the VPN that is connected now, if any, to a file (iOS
+  connects one VPN at a time, so LocalDevVPN replaces it); turn Cellular Data
+  off, only when asked; and connect LocalDevVPN. LocalDevVPN's Connect returns
+  before its tunnel routes (about 5 s on an iPhone 18 Pro), so Madeira checks
+  the loopback again for up to 15 s, going on the moment it works, and enables
+  JIT.
+- **"done"** (with "cellular" when "start" had it): turn Cellular Data back on,
+  and put the VPN back from the file: none (disconnect LocalDevVPN), LocalDevVPN
+  (leave it connected), or another VPN (connect it, which replaces LocalDevVPN).
+  Madeira runs it once a game's JIT pool is mapped and the debugger has
+  detached, before Wine starts, or at once if enabling JIT fails. The "done" it
+  owes is kept on disk, so if Madeira is closed or crashes in between, the next
+  launch runs it.
 
 With the shortcut on, Madeira never opens LocalDevVPN's own link: when JIT still
 cannot connect, the alert offers **Connect with Madeira JIT**, which enables JIT
@@ -165,12 +169,20 @@ Name it exactly **Madeira JIT** and add:
    its own is untyped, so **If** offers only "has any value"; its text offers
    "contains".)
 2. **If** *Text* contains `start`
-   1. **If** *Text* contains `cellular`: **Set Cellular Data** *Off*. End If.
-   2. LocalDevVPN's **Connect** action (or **Set VPN** → *Connect* → LocalDevVPN).
+   1. **Get Current VPN**.
+   2. **If** *Current VPN* has any value: **Save File** *Current VPN*;
+      **Otherwise**: **Save File** a **Text** `none`. Both to the Shortcuts
+      folder as `Madeira JIT VPN.txt`, with *Ask Where to Save* off and
+      *Overwrite If File Exists* on. End If.
+   3. **If** *Text* contains `cellular`: **Set Cellular Data** *Off*. End If.
+   4. LocalDevVPN's **Connect** action (or **Set VPN** → *Connect* → LocalDevVPN).
 3. **Otherwise**
-   1. **If** *Text* contains `vpn`: LocalDevVPN's **Disconnect** action (or
-      **Set VPN** → *Disconnect*). End If.
-   2. **If** *Text* contains `cellular`: **Set Cellular Data** *On*. End If.
+   1. **If** *Text* contains `cellular`: **Set Cellular Data** *On*. End If.
+   2. **Get File** `Madeira JIT VPN.txt` from the Shortcuts folder (*Error If Not
+      Found* off), then **Get Text from Input** of it.
+   3. **If** that text is `none`: LocalDevVPN's **Disconnect** action.
+      **Otherwise**: **If** it is not `LocalDevVPN` (the name **Get Current VPN**
+      gives LocalDevVPN): **Set VPN** → *Connect* → that text. End If. End If.
 4. End If.
 
 Then turn on **Settings → JIT → Madeira JIT shortcut**. Without the shortcut,

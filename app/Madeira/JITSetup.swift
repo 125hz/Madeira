@@ -249,7 +249,7 @@ final class JITCoordinator: ObservableObject {
             self?.loopbackAnswered = probe.reachable
             guard let self, !probe.reachable, JITNetworkShortcut.shared.enabled else { proceed(false); return }
             status = "Running the \(JITNetworkShortcut.name) shortcut…"
-            JITNetworkShortcut.shared.start(vpnWasUp: vpnWasUp) { [weak self] outcome in
+            JITNetworkShortcut.shared.start { [weak self] outcome in
                 if case .failed = outcome { proceed(true); return }
                 // LocalDevVPN's Connect returns before its tunnel routes (about 5 s
                 // on the 18 Pro): go on the moment lockdownd answers.
@@ -270,11 +270,10 @@ final class JITCoordinator: ObservableObject {
     /// JIT setup's connect action with the Madeira JIT shortcut on: the shortcut connects
     /// LocalDevVPN (turning Cellular Data off without Wi-Fi); then the loopback is checked.
     func connectWithShortcut() {
-        let vpnWasUp = LoopbackProbe.vpnInterfaceUp
         busy = true
         error = nil
         status = "Running the \(JITNetworkShortcut.name) shortcut…"
-        JITNetworkShortcut.shared.start(vpnWasUp: vpnWasUp) { [weak self] outcome in
+        JITNetworkShortcut.shared.start { [weak self] outcome in
             if case .failed(let why) = outcome {
                 self?.busy = false
                 self?.status = nil

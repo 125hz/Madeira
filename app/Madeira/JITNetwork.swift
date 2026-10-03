@@ -151,10 +151,12 @@ enum LoopbackProbe {
 }
 
 /// The user's "Madeira JIT" shortcut (docs/JIT.md has its steps). Input "start",
-/// with "cellular" when Madeira sees cellular data and no Wi-Fi: turn Cellular Data
-/// off (only then) and connect LocalDevVPN. Input "done", with "cellular" and/or
-/// "vpn": turn Cellular Data back on and/or disconnect LocalDevVPN. Madeira decides
-/// both from what it saw before "start", so "done" only undoes what "start" changed.
+/// with "cellular" when Madeira sees cellular data and no Wi-Fi: save the current VPN's
+/// name to a file (iOS connects one VPN at a time, so LocalDevVPN replaces it), turn
+/// Cellular Data off (only when asked) and connect LocalDevVPN. Input "done", with
+/// "cellular" when "start" had it: turn Cellular Data back on, and put the VPN back from
+/// the file: none (disconnect LocalDevVPN), LocalDevVPN (leave it), or another VPN
+/// (connect it). Madeira runs "done" after any "start".
 ///
 /// An app can only run a shortcut by opening the Shortcuts app, so each run leaves
 /// Madeira for a moment and comes back through x-callback-url
@@ -189,26 +191,38 @@ enum LoopbackProbe {
         monitor.start(queue: DispatchQueue(label: "madeira.jit-network.path"))
     }
 
-    /// What "done" has to undo; nil when the shortcut changed nothing. Read and
-    /// cleared only on the main thread.
-    private var restore: (cellular: Bool, vpn: Bool)?
+    /// The "done" input owed since a "start" ("done" or "done cellular"); nil when none.
+    /// Kept on disk, so a run that ends between them (Madeira closed or crashed) is put
+    /// back at the next launch. Main thread.
+    private static let pendingKey = "madeiraJITShortcutPendingDone"
+    private var pending: String? {
+        get { UserDefaults.standard.string(forKey: Self.pendingKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.pendingKey) }
+    }
     private var waiting: ((Outcome) -> Void)?
     private var timeout: Timer?
 
-    /// Runs "start". `vpnWasUp`: LocalDevVPN was already connected, so "done" leaves it.
-    func start(vpnWasUp: Bool, completion: @escaping (Outcome) -> Void) {
+    /// Runs "start". Pending from before it runs: even a "start" that fails part-way may
+    /// have changed something.
+    func start(completion: @escaping (Outcome) -> Void) {
         let cellular = cellularOnly
-        run(cellular ? "start cellular" : "start") { [weak self] outcome in
-            if case .done = outcome, cellular || !vpnWasUp { self?.restore = (cellular, !vpnWasUp) }
-            completion(outcome)
-        }
+        pending = cellular ? "done cellular" : "done"
+        run(cellular ? "start cellular" : "start", completion: completion)
     }
 
-    /// Runs "done" when "start" changed anything, then calls `completion`.
+    /// Runs "done" when "start" ran since the last "done", then calls `completion`.
     func restoreIfNeeded(completion: @escaping () -> Void) {
-        guard let restore else { completion(); return }
-        self.restore = nil
-        run("done" + (restore.cellular ? " cellular" : "") + (restore.vpn ? " vpn" : "")) { _ in completion() }
+        guard let input = pending else { completion(); return }
+        pending = nil
+        run(input) { _ in completion() }
+    }
+
+    /// At launch: a run that ended between "start" and "done" left the device without
+    /// cellular data or its VPN; put them back.
+    func restoreLeftover() {
+        guard pending != nil, enabled else { return }
+        LogStore.shared.log("[jit-shortcut] an earlier run ended before done: restoring now")
+        restoreIfNeeded {}
     }
 
     /// From the launch thread, right after the debugger detached: runs "done" if
