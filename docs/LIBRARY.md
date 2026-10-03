@@ -91,7 +91,10 @@ starting screen takes over (or an error is shown). A profile holds:
 - FPS limit: 60, the display maximum or uncapped (the same presentation
   pacing modes as the FPS pill in the developer interface), and 30 when DXMT
   has its 30 FPS cap (willfaust/dxmt#1; DXMT without it would present mode 3
-  uncapped, so the choice is hidden and a saved 30 runs as 60);
+  uncapped, so the choice is hidden and a saved 30 runs as 60), and 40 (mode 4)
+  when DXMT has its 40 FPS cap (`madeira_dxmt_has_40_cap`) and the panel reaches
+  120 Hz, which is held while it runs (25 ms is three 120 Hz refreshes but
+  rounds to 33 ms at 60 Hz); a saved 40 runs as 60 otherwise;
 - reduced-precision x87: off by default, as in FEX; only an explicit choice
   exports `FEX_X87REDUCEDPRECISION=1`;
 - **AVX and AVX2**: off by default, as in FEX's iOS build; only an explicit
