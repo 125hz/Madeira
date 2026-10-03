@@ -2698,7 +2698,15 @@ struct ContentView: View {
                     logStore.log("DXMT config: \(parts.joined(separator: ";")) via \(source)")
                 }
             }
-            if !dxmtOptions.isEmpty { setenv("DXMT_CONFIG", dxmtOptions.joined(separator: ";"), 1) }
+            // A library entry's "Report an NVIDIA GPU" (LibraryEntry.applyEnvironment):
+            // DXGI's device id is the GeForce RTX 3060 win32u registers as the
+            // display adapter (sysparams_ios.c), so every API names one GPU.
+            if profile?.reportNVIDIA == true {
+                dxmtOptions.append("dxgi.customDeviceId=2544")
+                logStore.log("DXMT config: dxgi.customDeviceId=2544 via Report an NVIDIA GPU")
+            }
+            // Unset otherwise, so an earlier session's options never carry over.
+            if dxmtOptions.isEmpty { unsetenv("DXMT_CONFIG") } else { setenv("DXMT_CONFIG", dxmtOptions.joined(separator: ";"), 1) }
 
             // D3D9 frontend for 32-bit programs. The i386 d3d9.dll is DXMT's thin
             // shim; unset (the default) or "emulated", it forwards every export to

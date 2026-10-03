@@ -68,6 +68,12 @@ OVERLAY = {
     "async-submit": {"title": "D3D12 asynchronous submission"},
     "upload-swap": {"title": "D3D12 upload buffers on file-backed memory"},
     "d3d12-typed-uav-load": {"title": "D3D12 typed UAV loads (report support)"},
+    # Read by DXMT's DXGI and by win32u's display adapter (sysparams_ios.c); a
+    # library entry's "Report an NVIDIA GPU" sets it.
+    "env.DXMT_ENABLE_NVEXT": {"category": "Direct3D 9/10/11 (DXMT)", "title": "Report an NVIDIA GPU (all games)",
+                "note": "1: DXGI names NVIDIA as the vendor, DXMT's NVAPI answers and win32u registers the display "
+                        "adapter as a GeForce RTX 3060 (driver 581.57). Per game: Game details > Report an NVIDIA GPU, "
+                        "which also sets the matching DXGI device id."},
     "ags-rewrite": {"title": "D3D12 AMD AGS 64-bit atomics rewrite"},
     "env.MADEIRA_EXE": {"title": "Program to start at launch (Windows path or name)"},
     "env.MADEIRA_ONBOARDING": {"title": "First-run Steam setup"},
