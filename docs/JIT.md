@@ -170,14 +170,21 @@ stays off.
 
 ### Getting the shortcut
 
-Madeira ships it (`app/Madeira/Madeira JIT.shortcut`, a signed export, so it
-installs with no network). On iOS 27 and later, setup's JIT guides offer
-**Connect automatically** → **Add the shortcut**, and **Settings → JIT** has
-**Add the Madeira JIT shortcut**: both open the share sheet, where choosing
-**Shortcuts** and then **Add Shortcut** adds it, named after the file. Then
-turn it on. The file's signing certificate expires on 26 Oct 2027; export it
-again before then (in Shortcuts: **Share** → **Options** → **Anyone** → **Save
-to Files**) and replace the file, keeping its name.
+On iOS 27 and later, setup's JIT guides offer **Connect automatically** →
+**Add the shortcut**, and **Settings → JIT** has **Add the Madeira JIT
+shortcut**. Both open its iCloud link, which takes Shortcuts straight to **Add
+Shortcut**, but needs a connection: iOS opens a shortcut directly only from an
+iCloud link. Without one, **No connection? Add Madeira's copy** shares the
+bundled `app/Madeira/Madeira JIT.shortcut` (a signed export): choose
+**Shortcuts** in the share sheet, then **Add Shortcut**. Only the share sheet
+can hand a file to Shortcuts: iOS gives Shortcuts the file only when the user
+picks it there. Either way it is named **Madeira JIT**; then turn it on.
+
+The iCloud link and the bundled file must be the same shortcut. After changing
+it, share a new iCloud link and export a new file (**Share** → **Options** →
+**Anyone** → **Save to Files**), and replace both (`JITShortcutFile` in
+`JITNetwork.swift`, and the file, keeping its name). The file's signing
+certificate expires on 26 Oct 2027.
 
 Its steps, to make it by hand (name it exactly **Madeira JIT**):
 

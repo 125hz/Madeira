@@ -531,9 +531,10 @@ enum LocalDevVPN {
     }
 }
 
-/// Setup's offer of the bundled Madeira JIT shortcut (iOS 27; JITShortcutFile): add it
-/// through the share sheet, then turn it on. It drives LocalDevVPN with LocalDevVPN's
-/// own Shortcuts action, so LocalDevVPN has to be installed.
+/// Setup's offer of the Madeira JIT shortcut (iOS 27; JITShortcutFile): add it from its
+/// iCloud link, or Madeira's copy through the share sheet with no connection, then turn
+/// it on. It drives LocalDevVPN with LocalDevVPN's own Shortcuts action, so LocalDevVPN
+/// has to be installed.
 struct JITShortcutOffer: View {
     @ObservedObject private var shortcut = JITNetworkShortcut.shared
 
@@ -543,12 +544,18 @@ struct JITShortcutOffer: View {
                 Label("Connect automatically", systemImage: "bolt.horizontal.circle").font(.headline)
                 Text("With the \(JITNetworkShortcut.name) shortcut, Enable JIT connects LocalDevVPN for you when it isn't connected, turns Cellular Data off while there's no Wi-Fi, and puts both back, along with any VPN you were using, once the game starts. It needs LocalDevVPN installed.")
                     .font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                ShareLink(item: url) {
+                Button {
+                    LogStore.shared.log("[jit-shortcut] add: iCloud link")
+                    UIApplication.shared.open(JITShortcutFile.iCloudLink)
+                } label: {
                     Label("Add the shortcut", systemImage: "plus.square.on.square")
                         .fontWeight(.semibold).frame(maxWidth: .infinity, minHeight: 32)
                 }
                 .buttonStyle(.bordered)
-                Text("Choose Shortcuts in the share sheet, then Add Shortcut. Turn this on once it's added:")
+                ShareLink(item: url) {
+                    Text("No connection? Add Madeira's copy").font(.footnote).frame(maxWidth: .infinity)
+                }
+                Text("Tap Add Shortcut in Shortcuts (from Madeira's copy, choose Shortcuts in the share sheet first). Turn this on once it's added:")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 Toggle("Use it for JIT", isOn: $shortcut.enabled)
             }
@@ -588,8 +595,14 @@ struct JITSettingsSection: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             if JITShortcutFile.supported, let url = JITShortcutFile.url {
-                ShareLink(item: url) {
+                Button {
+                    LogStore.shared.log("[jit-shortcut] add: iCloud link")
+                    UIApplication.shared.open(JITShortcutFile.iCloudLink)
+                } label: {
                     Label("Add the \(JITNetworkShortcut.name) shortcut", systemImage: "plus.square.on.square")
+                }
+                ShareLink(item: url) {
+                    Label("Add Madeira's copy (no connection)", systemImage: "square.and.arrow.up")
                 }
             }
             Toggle("\(JITNetworkShortcut.name) shortcut", isOn: $shortcut.enabled)

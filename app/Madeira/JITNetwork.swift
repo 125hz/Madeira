@@ -158,12 +158,19 @@ enum LoopbackProbe {
     static var vpnInterfaceUp: Bool { route()?.isLocalDevVPN ?? false }
 }
 
-/// The Madeira JIT shortcut, bundled (app/Madeira/Madeira JIT.shortcut): a signed
-/// export, so it installs with no network. The share sheet hands it to Shortcuts, which
-/// asks to add it and names it after the file, "Madeira JIT". iOS 27 and later only: it
-/// keeps the previous VPN with Store Content, which iOS 26 lacks. Its signing
-/// certificate expires on 26 Oct 2027; export it again (Share › Options › Anyone) before then.
+/// The Madeira JIT shortcut, two ways to add it. `iCloudLink` opens Shortcuts straight at
+/// Add Shortcut, but needs a connection: iOS opens a shortcut directly only from an iCloud
+/// link (its import-shortcut URL refuses any other). The bundled copy
+/// (app/Madeira/Madeira JIT.shortcut, a signed export) installs with none, but only the
+/// share sheet can hand a file to Shortcuts: iOS gives Shortcuts that file only when the
+/// user picks it there. Shortcuts names an import after the file, "Madeira JIT".
+///
+/// THE TWO MUST BE THE SAME SHORTCUT: change it, then share a new iCloud link and export
+/// a new file (Share › Options › Anyone › Save to Files), and replace both here. The
+/// file's signing certificate expires on 26 Oct 2027. iOS 27 and later only: it keeps the
+/// previous VPN with Store Content, which iOS 26 lacks.
 enum JITShortcutFile {
+    static let iCloudLink = URL(string: "https://www.icloud.com/shortcuts/1fea5b44c4884c589bd9559274a53ddb")!
     static var url: URL? { Bundle.main.url(forResource: "Madeira JIT", withExtension: "shortcut") }
     static var supported: Bool {
         ProcessInfo.processInfo.isOperatingSystemAtLeast(OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0))

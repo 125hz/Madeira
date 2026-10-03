@@ -78,8 +78,13 @@ require('Bundle.main.url(forResource: "Madeira JIT", withExtension: "shortcut")'
 require('OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0)' in net
         and 'if JITShortcutFile.supported, let url = JITShortcutFile.url {' in setup,
         'the shortcut is offered on iOS 27 or later only (it uses Store Content)')
-require(onboarding.count('JITShortcutOffer()') == 3 and 'ShareLink(item: url)' in setup,
-        "setup offers it in all three JIT guides, and Settings › JIT has it too")
+require(onboarding.count('JITShortcutOffer()') == 3 and setup.count('UIApplication.shared.open(JITShortcutFile.iCloudLink)') == 2
+        and setup.count('ShareLink(item: url)') == 2,
+        "setup offers it in all three JIT guides and in Settings › JIT: its iCloud link (straight to Add Shortcut), "
+        "and Madeira's copy through the share sheet with no connection")
+require('static let iCloudLink = URL(string: "https://www.icloud.com/shortcuts/' in net
+        and 'THE TWO MUST BE THE SAME SHORTCUT' in net,
+        'the iCloud link and the bundled file are kept as one shortcut')
 require("Keychain" in onboarding and "stays in Madeira's Documents folder" not in onboarding,
         "setup no longer says the pairing file is in Documents")
 
