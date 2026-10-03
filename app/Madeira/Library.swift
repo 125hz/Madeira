@@ -1949,7 +1949,7 @@ struct LibraryView: View {
         // Enable JIT, for one) waited until the Library tab came back.
         .alert(jitProblem == nil ? "Library" : "Couldn't Enable JIT",
                isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
-            if let jitProblem { jitConnectionActions(jitProblem) { model.error = nil } }
+            if let jitProblem { jitConnectionActions(jitProblem, retry: enableJIT) { model.error = nil } }
             Button("OK", role: .cancel) { model.error = nil }
         } message: { Text(model.error ?? "") }
         .fullScreenCover(isPresented: $onboarding.presented) { OnboardingView() }

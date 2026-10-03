@@ -135,6 +135,11 @@ shortcut** is on (`env.MADEIRA_JIT_SHORTCUT = 1`), Madeira runs your
   "start" changed: a VPN that was already connected stays connected. If enabling
   JIT fails, "done" runs at once.
 
+With the shortcut on, Madeira never opens LocalDevVPN's own link: when JIT still
+cannot connect, the alert offers **Connect with Madeira JIT**, which enables JIT
+again through the shortcut (on the JIT setup page it runs the shortcut, then
+checks the loopback). Without it, the alert offers **Connect LocalDevVPN**.
+
 An app can only run a shortcut by opening the Shortcuts app, so each run leaves
 Madeira for a moment and returns through `madeira://jit-network/…`
 (x-callback-url). Between **Enable JIT** and the game starting, cellular data

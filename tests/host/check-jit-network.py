@@ -61,6 +61,12 @@ require('.onOpenURL { url in JITNetworkShortcut.shared.handle(url) }' in main_ap
 require('URLQueryItem(name: "x-success", value: "madeira://jit-network/success")' in net
         and 'URLQueryItem(name: "name", value: Self.name)' in net and 'static let name = "Madeira JIT"' in net,
         'the shortcut runs through x-callback-url and returns to madeira://jit-network/')
+actions = setup[setup.index('@MainActor func jitConnectionActions('):setup.index('struct JITSettingsSection')]
+require(actions.index('if JITNetworkShortcut.shared.enabled {') < actions.index('LocalDevVPN.open()')
+        and 'if let retry { retry() } else { JITCoordinator.shared.connectWithShortcut() }' in actions,
+        "with the shortcut on, the connect action runs the shortcut, never LocalDevVPN's link")
+require('jitConnectionActions(jitProblem, retry: enableJIT)' in (app / 'Library.swift').read_text(),
+        "the library's alert retries Enable JIT, which runs the shortcut")
 require('Toggle("\\(JITNetworkShortcut.name) shortcut", isOn: $shortcut.enabled)' in setup
         and 'MadeiraConfig.flag("MADEIRA_JIT_SHORTCUT", fallback: false)' in net,
         'Settings › JIT has the switch, off by default (madeira.cfg env.MADEIRA_JIT_SHORTCUT)')

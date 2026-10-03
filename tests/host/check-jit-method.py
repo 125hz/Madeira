@@ -131,8 +131,8 @@ require(problem.index('"connectionreset"') < problem.index("self = .pairing") < 
 require(setup.count("helperFailure(response.message)") == 2,
         "Check setup and Enable JIT both explain connection problems")
 library_source = (app / "Library.swift").read_text()
-require("if let jitProblem { jitConnectionActions(jitProblem) { model.error = nil } }" in library_source,
-        "the library's JIT error offers Pair Again and LocalDevVPN")
+require("if let jitProblem { jitConnectionActions(jitProblem, retry: enableJIT) { model.error = nil } }" in library_source,
+        "the library's JIT error offers Pair Again and LocalDevVPN (or the shortcut)")
 # The error alert hangs off LibraryView's tab view, so it presents from Settings too
 # (an alert inside the Library page waited until that tab came back).
 body = library_source[library_source.index('struct LibraryView: View {'):]

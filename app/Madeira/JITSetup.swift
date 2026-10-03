@@ -256,6 +256,33 @@ final class JITCoordinator: ObservableObject {
         }
     }
 
+    /// JIT setup's connect action with the Madeira JIT shortcut on: the shortcut connects
+    /// LocalDevVPN (turning Cellular Data off without Wi-Fi); then the loopback is checked.
+    func connectWithShortcut() {
+        let vpnWasUp = LoopbackProbe.vpnInterfaceUp
+        busy = true
+        error = nil
+        status = "Running the \(JITNetworkShortcut.name) shortcut…"
+        JITNetworkShortcut.shared.start(vpnWasUp: vpnWasUp) { [weak self] outcome in
+            if case .failed(let why) = outcome {
+                self?.busy = false
+                self?.status = nil
+                self?.error = "The \(JITNetworkShortcut.name) shortcut did not run: \(why)."
+                return
+            }
+            LoopbackProbe.waitUntilReachable(within: 5) { [weak self] probe in
+                self?.busy = false
+                if probe.reachable {
+                    self?.connectionProblem = nil
+                    self?.status = "LocalDevVPN reaches this device."
+                } else {
+                    self?.status = nil
+                    self?.error = ConnectionProblem.vpn.message
+                }
+            }
+        }
+    }
+
     private func enableResolved(_ completion: @escaping (Result<Void, Error>) -> Void) {
         switch resolvedMethod {
         case .automatic:
@@ -457,7 +484,11 @@ enum LocalDevVPN {
 }
 
 /// The fix a JIT connection problem offers: pair again (rejected pairing) and LocalDevVPN.
+/// With the Madeira JIT shortcut on, LocalDevVPN is connected by the shortcut, never by
+/// its link: `retry` enables JIT again (which runs the shortcut when the loopback does not
+/// answer); without it the shortcut runs on its own.
 @MainActor func jitConnectionActions(_ problem: JITCoordinator.ConnectionProblem,
+                                     retry: (() -> Void)? = nil,
                                      then dismiss: @escaping () -> Void = {}) -> some View {
     Group {
         if problem == .pairing {
@@ -467,7 +498,14 @@ enum LocalDevVPN {
                 JITCoordinator.shared.showSetup = true
             }
         }
-        Button(LocalDevVPN.actionTitle) { dismiss(); LocalDevVPN.open() }
+        if JITNetworkShortcut.shared.enabled {
+            Button("Connect with \(JITNetworkShortcut.name)") {
+                dismiss()
+                if let retry { retry() } else { JITCoordinator.shared.connectWithShortcut() }
+            }
+        } else {
+            Button(LocalDevVPN.actionTitle) { dismiss(); LocalDevVPN.open() }
+        }
     }
 }
 
