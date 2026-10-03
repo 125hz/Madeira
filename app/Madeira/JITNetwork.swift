@@ -17,13 +17,16 @@ import Foundation
 import Network
 import UIKit
 
-/// Whether LocalDevVPN's loopback reaches this device's lockdownd, at
-/// 10.7.0.1:62078 (the address StikDebug uses). A connection alone proves
-/// nothing (a proxy or another VPN can accept any connection), so it sends
-/// lockdownd's QueryType request, which needs no pairing, and counts only a
-/// reply naming com.apple.mobile.lockdown. Through a working tunnel that takes
-/// milliseconds; with the VPN off, or over cellular data, it is refused or times
-/// out. The connection is closed at once.
+/// Whether LocalDevVPN's loopback reaches this device's lockdownd at 10.7.0.1:62078
+/// (the address StikDebug uses). Two steps, neither depending on what lockdownd says
+/// (over USB it answers a plain QueryType; through the tunnel it closed the connection):
+/// 1. The route: the interface traffic to 10.7.0.1 would leave by, asked of the kernel
+///    with an unsent UDP connect (no packets, microseconds). Not a VPN interface means
+///    LocalDevVPN is not routing it, so a network that accepts any connection (a proxy;
+///    the 18 Pro's Wi-Fi has one) is never asked.
+/// 2. Through a VPN interface: a TCP connection, at most `timeout`. Through a working
+///    tunnel it opens in milliseconds; over cellular data, where the tunnel does not
+///    work, it fails. Nothing is sent, and it is closed at once.
 enum LoopbackProbe {
     static let address = "10.7.0.1"
     static let port: UInt16 = 62078
@@ -34,62 +37,90 @@ enum LoopbackProbe {
         let detail: String
     }
 
-    private static let queryType = Array(("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-        + "<plist version=\"1.0\"><dict><key>Label</key><string>Madeira</string>"
-        + "<key>Request</key><string>QueryType</string></dict></plist>\n").utf8)
+    struct Route {
+        let interface: String
+        let address: String
+        /// utun (packet tunnels such as LocalDevVPN), ipsec or ppp.
+        var isVPN: Bool { ["utun", "ipsec", "ppp"].contains { interface.hasPrefix($0) } }
+    }
 
-    /// Blocks for at most `timeout`; use `check(timeout:completion:)` from the main thread.
-    static func check(timeout: TimeInterval = 0.4) -> Result {
-        let start = CFAbsoluteTimeGetCurrent()
-        func done(_ ok: Bool, _ detail: String) -> Result {
-            Result(reachable: ok, milliseconds: (CFAbsoluteTimeGetCurrent() - start) * 1000, detail: detail)
-        }
-        func remainingMs() -> Int32 { max(1, Int32((start + timeout - CFAbsoluteTimeGetCurrent()) * 1000)) }
+    private static func target() -> sockaddr_in? {
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = port.bigEndian
-        guard inet_pton(AF_INET, address, &addr.sin_addr) == 1 else { return done(false, "bad address") }
+        return inet_pton(AF_INET, address, &addr.sin_addr) == 1 ? addr : nil
+    }
+
+    private static func connect(_ fd: Int32, _ addr: inout sockaddr_in) -> Int32 {
+        withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+    }
+
+    /// The interface and local address traffic to 10.7.0.1 would leave by; nil without a route.
+    static func route() -> Route? {
+        guard var addr = target() else { return nil }
+        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        guard connect(fd, &addr) == 0 else { return nil }
+        var local = sockaddr_in()
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let got = withUnsafeMutablePointer(to: &local) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) }
+        }
+        guard got == 0 else { return nil }
+        var text = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        var sin = local.sin_addr
+        inet_ntop(AF_INET, &sin, &text, socklen_t(INET_ADDRSTRLEN))
+        return Route(interface: interfaceName(holding: local.sin_addr.s_addr) ?? "?", address: String(cString: text))
+    }
+
+    private static func interfaceName(holding ip: in_addr_t) -> String? {
+        var list: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&list) == 0, let first = list else { return nil }
+        defer { freeifaddrs(list) }
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let entry = cursor {
+            if let sa = entry.pointee.ifa_addr, sa.pointee.sa_family == sa_family_t(AF_INET),
+               sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1, { $0.pointee.sin_addr.s_addr }) == ip {
+                return String(cString: entry.pointee.ifa_name)
+            }
+            cursor = entry.pointee.ifa_next
+        }
+        return nil
+    }
+
+    /// Blocks for at most `timeout`; use `check(timeout:completion:)` from the main thread.
+    /// `requireVPN` is false only for host tests, whose listeners are on lo0.
+    static func check(timeout: TimeInterval = 0.4, requireVPN: Bool = true) -> Result {
+        let start = CFAbsoluteTimeGetCurrent()
+        func done(_ ok: Bool, _ detail: String) -> Result {
+            Result(reachable: ok, milliseconds: (CFAbsoluteTimeGetCurrent() - start) * 1000, detail: detail)
+        }
+        guard let route = route() else { return done(false, "no route") }
+        if requireVPN, !route.isVPN { return done(false, "routed via \(route.interface), not a VPN") }
+        guard var addr = target() else { return done(false, "bad address") }
         let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
         guard fd >= 0 else { return done(false, "socket: \(String(cString: strerror(errno)))") }
         defer { close(fd) }
         var one: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
         _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK)
-        let rc = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        if rc != 0 {
+        if connect(fd, &addr) != 0 {
             guard errno == EINPROGRESS else { return done(false, String(cString: strerror(errno))) }
             var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
-            let ready = poll(&pfd, 1, remainingMs())
-            guard ready > 0 else { return done(false, ready == 0 ? "timed out" : String(cString: strerror(errno))) }
+            let ready = poll(&pfd, 1, Int32(max(1, (start + timeout - CFAbsoluteTimeGetCurrent()) * 1000)))
+            guard ready > 0 else { return done(false, ready == 0 ? "timed out via \(route.interface)" : String(cString: strerror(errno))) }
             var err: Int32 = 0
             var len = socklen_t(MemoryLayout<Int32>.size)
             getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len)
-            guard err == 0 else { return done(false, String(cString: strerror(err))) }
+            guard err == 0 else { return done(false, "\(String(cString: strerror(err))) via \(route.interface)") }
         }
-        // lockdownd's framing: a big-endian length, then the plist.
-        let message = withUnsafeBytes(of: UInt32(queryType.count).bigEndian, Array.init) + queryType
-        guard message.withUnsafeBytes({ send(fd, $0.baseAddress, $0.count, 0) }) == message.count else {
-            return done(false, "send: \(String(cString: strerror(errno)))")
-        }
-        var reply: [UInt8] = []
-        var chunk = [UInt8](repeating: 0, count: 2048)
-        while reply.count < 16384 {
-            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
-            let ready = poll(&pfd, 1, remainingMs())
-            guard ready > 0 else { return done(false, ready == 0 ? "connected, no lockdownd reply" : String(cString: strerror(errno))) }
-            let n = chunk.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, 0) }
-            guard n > 0 else { return done(false, "connected, closed without a lockdownd reply") }
-            reply += chunk[0..<n]
-            if String(decoding: reply, as: UTF8.self).contains("com.apple.mobile.lockdown") {
-                return done(true, "lockdownd answered")
-            }
-        }
-        return done(false, "connected, not lockdownd")
+        return done(true, "connected via \(route.interface) \(route.address)")
     }
 
     static func check(timeout: TimeInterval = 0.4, completion: @escaping @MainActor (Result) -> Void) {
@@ -114,22 +145,9 @@ enum LoopbackProbe {
         }
     }
 
-    /// Whether an interface holds an address in LocalDevVPN's 10.7.0.0/24, i.e. its
-    /// VPN is connected (whether or not it routes). Instant: no network traffic.
-    static var vpnInterfaceUp: Bool {
-        var list: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&list) == 0, let first = list else { return false }
-        defer { freeifaddrs(list) }
-        var cursor: UnsafeMutablePointer<ifaddrs>? = first
-        while let entry = cursor {
-            if let sa = entry.pointee.ifa_addr, sa.pointee.sa_family == sa_family_t(AF_INET) {
-                let ip = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { UInt32(bigEndian: $0.pointee.sin_addr.s_addr) }
-                if ip >> 8 == 0x0A0700 { return true }       // 10.7.0.x
-            }
-            cursor = entry.pointee.ifa_next
-        }
-        return false
-    }
+    /// LocalDevVPN (or another VPN) is connected: traffic to 10.7.0.1 leaves by a VPN
+    /// interface. Instant: no network traffic.
+    static var vpnInterfaceUp: Bool { route()?.isVPN ?? false }
 }
 
 /// The user's "Madeira JIT" shortcut (docs/JIT.md has its steps). Input "start",

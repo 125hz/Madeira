@@ -116,13 +116,21 @@ Both methods reach this iPhone's `lockdownd` through LocalDevVPN's loopback
 but not while cellular data is in use.
 
 **Enable JIT** first checks the loopback directly
-(`app/Madeira/JITNetwork.swift`): it sends `lockdownd`'s `QueryType` request
-and waits at most 0.4 s for its reply. Through a working loopback that takes a
-few milliseconds, and JIT is enabled with nothing else opening. A proxy or
-another VPN that accepts the connection does not count; only `lockdownd`'s own
-reply does. On a network that accepts any connection, the helper's own error
-reads "early eof"; after a check that found no `lockdownd`, Madeira explains any
-JIT failure as LocalDevVPN not routing.
+(`app/Madeira/JITNetwork.swift`), in two steps that do not depend on what
+`lockdownd` says (over USB it answers a plain `QueryType`; through the tunnel it
+closed the connection instead):
+
+1. The route: which interface traffic to `10.7.0.1` would leave by, asked of the
+   kernel without sending anything. Through Wi-Fi or cellular, LocalDevVPN is not
+   routing it, and the check fails at once. A network that accepts any
+   connection (a proxy) is never asked.
+2. Through a VPN interface: a TCP connection, at most 0.4 s. Through a working
+   loopback it opens in milliseconds, and JIT is enabled with nothing else
+   opening; over cellular data, where the tunnel does not work, it fails.
+
+On a network that accepts any connection, the helper's own error reads "early
+eof"; after a check that found no loopback, Madeira explains any JIT failure as
+LocalDevVPN not routing.
 
 When the loopback does not answer and **Settings → JIT → Madeira JIT
 shortcut** is on (`env.MADEIRA_JIT_SHORTCUT = 1`), Madeira runs your

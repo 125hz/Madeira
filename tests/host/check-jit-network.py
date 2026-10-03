@@ -3,9 +3,11 @@
 no device runs.
 
 1. Swift: compiles the production LoopbackProbe on the host, pointed at local test
-   listeners, and checks that a fake lockdownd answering QueryType counts within
-   milliseconds, while a listener that accepts but stays silent (a proxy), one that
-   answers something else, and a closed port do not, each within the timeout.
+   listeners, and checks the route step (it names the interface traffic leaves by, and
+   a listener reached other than through a VPN does not count and is never connected
+   to, which is how a network that accepts any connection is ruled out) and the
+   connection step (a listening port connects in milliseconds, a closed port fails at
+   once).
 2. Source checks: Enable JIT checks the loopback before any JIT method and runs the
    shortcut only when it does not answer and the shortcut is turned on; "start" asks for
    the cellular step only when Madeira sees cellular data without Wi-Fi, and "done" undoes
@@ -83,8 +85,9 @@ main = r'''
 let args = CommandLine.arguments
 LoopbackProbe.address = args[1]
 LoopbackProbe.port = UInt16(args[2])!
-let r = LoopbackProbe.check(timeout: 0.4)
-print("{\"reachable\": \(r.reachable), \"ms\": \(r.milliseconds), \"detail\": \"\(r.detail)\", \"vpn\": \(LoopbackProbe.vpnInterfaceUp)}")
+let r = LoopbackProbe.check(timeout: 0.4, requireVPN: args[3] == "1")
+let route = LoopbackProbe.route()
+print("{\"reachable\": \(r.reachable), \"ms\": \(r.milliseconds), \"detail\": \"\(r.detail)\", \"interface\": \"\(route?.interface ?? "-")\", \"vpn\": \(route?.isVPN ?? false)}")
 '''
 
 
@@ -105,49 +108,28 @@ with tempfile.TemporaryDirectory() as tmp:
         print(build.stderr[-3000:])
         require(False, 'the production LoopbackProbe compiles on the host')
     else:
-        def run(addr, port):
-            out = subprocess.run([str(exe), addr, str(port)], capture_output=True, text=True, timeout=10).stdout
+        def run(addr, port, require_vpn):
+            out = subprocess.run([str(exe), addr, str(port), '1' if require_vpn else '0'],
+                                 capture_output=True, text=True, timeout=10).stdout
             return json.loads(out)
 
-        def serve(reply):
-            """A listener that answers the first request with `reply` (None: stays silent)."""
-            srv = socket.socket()
-            srv.bind(('127.0.0.1', 0))
-            srv.listen(4)
-
-            def loop():
-                while True:
-                    try:
-                        conn, _ = srv.accept()
-                    except OSError:
-                        return
-                    conn.recv(4096)
-                    if reply is not None:
-                        body = reply.encode()
-                        conn.sendall(len(body).to_bytes(4, 'big') + body)
-                    else:
-                        threading.Event().wait(1.0)
-                    conn.close()
-            threading.Thread(target=loop, daemon=True).start()
-            return srv
-
-        lockdownd = serve('<?xml version="1.0"?><plist version="1.0"><dict><key>Request</key><string>QueryType</string>'
-                          '<key>Type</key><string>com.apple.mobile.lockdown</string></dict></plist>')
-        up = run('127.0.0.1', lockdownd.getsockname()[1])
-        require(up['reachable'] and up['ms'] < 100, 'lockdownd answering QueryType counts, in %.1f ms (%s)' % (up['ms'], up['detail']))
-        silent = serve(None)
-        proxy = run('127.0.0.1', silent.getsockname()[1])
-        require(not proxy['reachable'] and proxy['ms'] < 700,
-                'a listener that accepts but is not lockdownd (a proxy) does not count (%.0f ms, %s)' % (proxy['ms'], proxy['detail']))
-        other = serve('<plist><dict><key>Type</key><string>something.else</string></dict></plist>')
-        wrong = run('127.0.0.1', other.getsockname()[1])
-        require(not wrong['reachable'], 'a reply that is not lockdownd does not count (%s)' % wrong['detail'])
-        refused = run('127.0.0.1', free_port())
+        srv = socket.socket()
+        srv.bind(('127.0.0.1', 0))
+        srv.listen(8)
+        threading.Thread(target=lambda: [srv.accept()[0].close() for _ in range(8)], daemon=True).start()
+        port = srv.getsockname()[1]
+        up = run('127.0.0.1', port, False)
+        require(up['reachable'] and up['ms'] < 100, 'a listening port connects in %.1f ms (%s)' % (up['ms'], up['detail']))
+        require(up['interface'].startswith('lo') and up['vpn'] is False,
+                'the route check names the interface traffic leaves by (%s), and lo0 is not a VPN' % up['interface'])
+        held = run('127.0.0.1', port, True)
+        require(not held['reachable'] and held['ms'] < 50 and 'not a VPN' in held['detail'],
+                'a listener that accepts, reached other than through a VPN, does not count, and is never connected to (%.1f ms, %s)'
+                % (held['ms'], held['detail']))
+        refused = run('127.0.0.1', free_port(), False)
         require(not refused['reachable'] and refused['ms'] < 100,
                 'a closed port fails at once (%.1f ms, %s)' % (refused['ms'], refused['detail']))
-        require(up['vpn'] is False or up['vpn'] is True, 'the VPN interface check runs')
-        for srv in (lockdownd, silent, other):
-            srv.close()
+        srv.close()
 
 print('\n%s' % ('ALL PASS' if failures == 0 else '%d FAILURE(S)' % failures))
 sys.exit(0 if failures == 0 else 1)
