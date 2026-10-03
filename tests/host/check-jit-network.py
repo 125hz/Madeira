@@ -61,6 +61,10 @@ require('.onOpenURL { url in JITNetworkShortcut.shared.handle(url) }' in main_ap
 require('URLQueryItem(name: "x-success", value: "madeira://jit-network/success")' in net
         and 'URLQueryItem(name: "name", value: Self.name)' in net and 'static let name = "Madeira JIT"' in net,
         'the shortcut runs through x-callback-url and returns to madeira://jit-network/')
+require('ConnectionProblem(helperMessage: message) ?? (loopbackAnswered == false ? .vpn : nil)' in setup,
+        "a JIT failure after a check that found no lockdownd is explained as LocalDevVPN (a network that accepts any connection gives 'early eof')")
+require(ensure[:ensure.index('func connectWithShortcut(')].count('LoopbackProbe.waitUntilReachable(within: 15)') == 1,
+        "after the shortcut, the loopback is awaited up to 15 s (LocalDevVPN's Connect returns before its tunnel routes)")
 actions = setup[setup.index('@MainActor func jitConnectionActions('):setup.index('struct JITSettingsSection')]
 require(actions.index('if JITNetworkShortcut.shared.enabled {') < actions.index('LocalDevVPN.open()')
         and 'if let retry { retry() } else { JITCoordinator.shared.connectWithShortcut() }' in actions,

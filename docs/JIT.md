@@ -120,15 +120,19 @@ but not while cellular data is in use.
 and waits at most 0.4 s for its reply. Through a working loopback that takes a
 few milliseconds, and JIT is enabled with nothing else opening. A proxy or
 another VPN that accepts the connection does not count; only `lockdownd`'s own
-reply does.
+reply does. On a network that accepts any connection, the helper's own error
+reads "early eof"; after a check that found no `lockdownd`, Madeira explains any
+JIT failure as LocalDevVPN not routing.
 
 When the loopback does not answer and **Settings → JIT → Madeira JIT
 shortcut** is on (`env.MADEIRA_JIT_SHORTCUT = 1`), Madeira runs your
 **Madeira JIT** shortcut:
 
 - **"start"** (with "cellular" when Madeira sees cellular data and no Wi-Fi):
-  turn Cellular Data off, only when asked, and connect LocalDevVPN. Madeira then
-  checks the loopback again for up to 5 s while the VPN settles, and enables JIT.
+  turn Cellular Data off, only when asked, and connect LocalDevVPN. LocalDevVPN's
+  Connect returns before its tunnel routes (about 5 s on an iPhone 18 Pro), so
+  Madeira checks the loopback again for up to 15 s, going on the moment `lockdownd`
+  answers, and enables JIT.
 - **"done"** (with "cellular" and/or "vpn"): turn Cellular Data back on and/or
   disconnect LocalDevVPN. Madeira runs it once a game's JIT pool is mapped and
   the debugger has detached, before Wine starts, and asks only to undo what

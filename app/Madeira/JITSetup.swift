@@ -177,6 +177,10 @@ final class JITCoordinator: ObservableObject {
         didSet { UserDefaults.standard.set(method.rawValue, forKey: "madeiraJITMethod") }
     }
     @Published private(set) var connectionProblem: ConnectionProblem?
+    /// What the last loopback check found (nil: none ran). A JIT failure after it found no
+    /// lockdownd is a LocalDevVPN problem whatever the helper's message says: a network
+    /// that accepts any connection makes the helper's read end early ("early eof").
+    private var loopbackAnswered: Bool?
     @Published var showSetup = false
     @Published private(set) var busy = false
     @Published private(set) var status: String?
@@ -242,14 +246,21 @@ final class JITCoordinator: ObservableObject {
             LogStore.shared.log(String(format: "[jit-loopback] %@ in %.0f ms (vpn-interface=%d, %@)",
                                        probe.reachable ? "reachable" : "unreachable", probe.milliseconds,
                                        vpnWasUp ? 1 : 0, probe.detail))
+            self?.loopbackAnswered = probe.reachable
             guard let self, !probe.reachable, JITNetworkShortcut.shared.enabled else { proceed(false); return }
             status = "Running the \(JITNetworkShortcut.name) shortcut…"
             JITNetworkShortcut.shared.start(vpnWasUp: vpnWasUp) { [weak self] outcome in
                 if case .failed = outcome { proceed(true); return }
+                // LocalDevVPN's Connect returns before its tunnel routes (about 5 s
+                // on the 18 Pro): go on the moment lockdownd answers.
                 self?.status = "Waiting for LocalDevVPN…"
-                LoopbackProbe.waitUntilReachable(within: 5) { probe in
-                    LogStore.shared.log(String(format: "[jit-loopback] after the shortcut: %@ in %.0f ms (%@)",
-                                               probe.reachable ? "reachable" : "unreachable", probe.milliseconds, probe.detail))
+                let waitStart = CFAbsoluteTimeGetCurrent()
+                LoopbackProbe.waitUntilReachable(within: 15) { [weak self] probe in
+                    LogStore.shared.log(String(format: "[jit-loopback] after the shortcut: %@ after %.1f s (vpn-interface=%d, %@)",
+                                               probe.reachable ? "reachable" : "unreachable",
+                                               CFAbsoluteTimeGetCurrent() - waitStart,
+                                               LoopbackProbe.vpnInterfaceUp ? 1 : 0, probe.detail))
+                    self?.loopbackAnswered = probe.reachable
                     proceed(true)
                 }
             }
@@ -270,7 +281,7 @@ final class JITCoordinator: ObservableObject {
                 self?.error = "The \(JITNetworkShortcut.name) shortcut did not run: \(why)."
                 return
             }
-            LoopbackProbe.waitUntilReachable(within: 5) { [weak self] probe in
+            LoopbackProbe.waitUntilReachable(within: 15) { [weak self] probe in
                 self?.busy = false
                 if probe.reachable {
                     self?.connectionProblem = nil
@@ -445,7 +456,7 @@ final class JITCoordinator: ObservableObject {
     /// The helper's failure as shown: a connection problem gets its plain explanation
     /// (the helper's own message is already in the log).
     private func helperFailure(_ message: String) -> String {
-        connectionProblem = ConnectionProblem(helperMessage: message)
+        connectionProblem = ConnectionProblem(helperMessage: message) ?? (loopbackAnswered == false ? .vpn : nil)
         return connectionProblem?.message ?? message
     }
 
