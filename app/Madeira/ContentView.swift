@@ -2476,6 +2476,15 @@ struct ContentView: View {
             } else {
                 unsetenv("MADEIRA_DOCK_SESSION")
             }
+            // A Dock session runs Valve's client headless, with no Chromium, so
+            // nothing claims the 8 GB V8 cage holdback (virtual_ios.c). Let ntdll
+            // release it when the guest band runs out. madeira.cfg
+            // env.MADEIRA_CAGE_RELEASE, exported later, wins.
+            if dockLaunch.dock {
+                setenv("MADEIRA_CAGE_RELEASE", "1", 1)
+            } else {
+                unsetenv("MADEIRA_CAGE_RELEASE")
+            }
             var poolSizeMB = DockPerformancePolicy.sessionPoolMB(standard: 896, dock: dockLaunch.dock, compact: dockLaunch.compact)
             if poolSizeMB != 896 { logStore.log("[dock-pool] compact JIT pool \(poolSizeMB)MB for this Dock launch") }
             // madeira.cfg pool: the JIT pool size in MB (256 to 1152) for every launch; wins over the size above.
