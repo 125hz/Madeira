@@ -94,6 +94,9 @@ OVERLAY = {
                 "sources": ["app/Madeira/GamepadInput.swift"]},
     "env.MADEIRA_PROMOTE": {"title": "Hold the display at its maximum rate"},
     "dxmt": {"title": "DXMT options (a=b;c=d)"},
+    "metalfx-upscale": {"title": "MetalFX upscaling factor", "kind": "choice",
+             "note": "Scales the presented picture with Apple's MetalFX spatial scaler (Direct3D 11 and 12). Usually set per game in Game details > Display.",
+             "choices": [("", "Off"), ("1.5", "1.5x"), ("2", "2x")]},
 }
 
 
