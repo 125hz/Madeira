@@ -21,7 +21,8 @@ method unchanged.
 
 **Play** enables JIT itself when it is off: it runs the same flow as **Enable
 JIT** (the loopback check and the Madeira JIT shortcut included), then starts
-the game once the debugger is attached. If JIT does not come on, the usual
+the game once the debugger is attached. Meanwhile the button reads **Starting
+JIT**, with a spinner, and the game's page stays open. If JIT does not come on, the usual
 error is shown and the game is not started; enabling JIT later starts nothing.
 This also covers JIT enabled from StikDebug's own list, which sets CS_DEBUGGED
 and leaves, so no debugger is attached.

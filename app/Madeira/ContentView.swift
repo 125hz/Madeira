@@ -2301,8 +2301,11 @@ struct ContentView: View {
     private func launchAfterJITEnded(started: Bool) {
         guard let launch = launchAfterJIT else { return }
         launchAfterJIT = nil
+        library.startingJIT = nil
         guard started, StikJITHelper.ready, library.current == nil, wine_process_is_running() == 0 else {
             logStore.log("[jit-on-play] JIT did not come on: the game was not started")
+            // A failure has its own error; this one closes the details page as well.
+            if started, library.current == nil { library.error = "JIT is on, but the game could not start. Tap Play again." }
             return
         }
         logStore.log("[jit-on-play] JIT is on: starting the game")
@@ -2315,11 +2318,12 @@ struct ContentView: View {
     /// covers CS_DEBUGGED set with no debugger attached (JIT enabled from StikDebug's
     /// own list, which attaches and leaves). Without `then`, the library offers
     /// Madeira's Enable JIT instead of starting a launch that cannot get its pool.
-    private func jitReadyForLaunch(inLibrary: Bool, then launch: (() -> Void)? = nil) -> Bool {
+    private func jitReadyForLaunch(inLibrary: Bool, entry: UUID? = nil, then launch: (() -> Void)? = nil) -> Bool {
         if StikJITHelper.ready { return true }
         if inLibrary, let launch {
             logStore.log("[jit-on-play] JIT is not on: enabling it, then starting the game")
             launchAfterJIT = launch
+            library.startingJIT = entry
             if jitStatus != .testing { enableJIT() }   // a second Play while it runs only replaces the game
             return false
         }
@@ -2412,7 +2416,7 @@ struct ContentView: View {
         // The same precondition runWineFullSequence checks: the JIT pool is
         // taken at launch, through the debugger. Without it, Play enables JIT and
         // continues from here once it is on.
-        guard jitReadyForLaunch(inLibrary: true, then: { startLibraryEntry(entry) }) else { return }
+        guard jitReadyForLaunch(inLibrary: true, entry: entry.id, then: { startLibraryEntry(entry) }) else { return }
         startLibraryEntry(entry)
     }
 
@@ -3091,7 +3095,8 @@ struct ContentView: View {
     /// session then takes that entry's display, performance and on-screen settings.
     private func startDock(_ game: DockGame, compactPool: Bool, profile: LibraryEntry? = nil) {
         let inLibrary = library.enabled
-        guard jitReadyForLaunch(inLibrary: inLibrary, then: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }
+        guard jitReadyForLaunch(inLibrary: inLibrary, entry: profile?.id,
+                                then: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }
         guard cloudClear(game.id, name: game.name, retry: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }
         guard wine_process_is_running() == 0, wineserver_is_running() == 0, !inLibrary || library.current == nil else {
             logStore.log("[madeira-dock] a session already ran in this app run; restart Madeira first", level: .error)

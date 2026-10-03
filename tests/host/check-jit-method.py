@@ -149,20 +149,26 @@ require('URL(string: "localdevvpn://enable?scheme=madeira")' in setup
 gate = function(content, "private func jitReadyForLaunch(")
 require(gate.index("if StikJITHelper.ready { return true }") < gate.index("if inLibrary, let launch {")
         < gate.index("if StikJITHelper.flaggedWithoutDebugger {")
-        and "launchAfterJIT = launch" in gate and "if jitStatus != .testing { enableJIT() }" in gate,
+        and "launchAfterJIT = launch" in gate and "library.startingJIT = entry" in gate
+        and "if jitStatus != .testing { enableJIT() }" in gate,
         "Play without JIT enables it (a second Play while it runs only replaces the game)")
 ended = function(content, "private func launchAfterJITEnded(")
 require("launchAfterJIT = nil" in ended
         and "guard started, StikJITHelper.ready, library.current == nil, wine_process_is_running() == 0 else {" in ended
-        and ended.index("launchAfterJIT = nil") < ended.index("launch()"),
+        and ended.index("launchAfterJIT = nil") < ended.index("library.startingJIT = nil") < ended.index("launch()"),
         "the waiting game starts once, only when JIT came on and nothing else started")
+require('if model.startingJIT == entry.id {' in library and 'Text("Starting JIT")' in library and 'ProgressView()' in library
+        and "if selected?.id == entry.id, model.startingJIT != entry.id { selected = nil }" in library
+        and ".onChange(of: jit.showSetup) { _, show in if show { selected = nil } }" in library,
+        "the Play button reads Starting JIT with a spinner meanwhile; the details page stays up for it, "
+        "and closes for JIT setup")
 enable_jit = function(content, "private func enableJIT()")
 require(enable_jit.count("launchAfterJITEnded(started: false)") == 2 and enable_jit.count("launchAfterJITEnded(started: true)") == 1,
         "every way Enable JIT ends settles the waiting game")
 play = function(content, "private func launchLibraryEntry(")
-require("guard jitReadyForLaunch(inLibrary: true, then: { startLibraryEntry(entry) }) else { return }" in play
+require("guard jitReadyForLaunch(inLibrary: true, entry: entry.id, then: { startLibraryEntry(entry) }) else { return }" in play
         and play.index("cloudClear(") < play.index("jitReadyForLaunch(")
-        and "guard jitReadyForLaunch(inLibrary: inLibrary, then: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }" in content,
+        and "then: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }" in content,
         "Play and Dock starts continue after JIT without repeating the checks already passed")
 
 print("check-jit-method: PASS")
