@@ -2855,8 +2855,18 @@ struct ContentView: View {
             self.startWineserver()
             winios_phase("wineserver-up")
 
-            // Step 3: Start Wine (debugger still attached for PE loading BRK calls)
-            Thread.sleep(forTimeInterval: 2.0)
+            // Step 3: Start Wine once the server accepts connections. This used to be a
+            // fixed 2 s pause; the server is normally listening within milliseconds.
+            // env.MADEIRA_FAST_SERVER_START = 0 restores the fixed pause.
+            if SteamSignIn.flag("MADEIRA_FAST_SERVER_START", default: true) {
+                let waitStart = CFAbsoluteTimeGetCurrent()
+                while wineserver_is_listening() == 0, CFAbsoluteTimeGetCurrent() - waitStart < 2.0 {
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
+                logStore.log(String(format: "[launch] wineserver listening after %.0f ms", (CFAbsoluteTimeGetCurrent() - waitStart) * 1000))
+            } else {
+                Thread.sleep(forTimeInterval: 2.0)
+            }
             winios_phase("wine-start")
             self.startWineProcess()
 
