@@ -139,22 +139,24 @@ shortcut** is on (`env.MADEIRA_JIT_SHORTCUT = 1`), Madeira runs your
 **Madeira JIT** shortcut:
 
 - **"start"** (with "cellular" when Madeira sees cellular data and no Wi-Fi):
-  turn Cellular Data off, only when asked; connect LocalDevVPN; and output the
-  name of the VPN that was connected before, if any (iOS connects one VPN at a
-  time, so LocalDevVPN replaces it). LocalDevVPN's Connect can return before
-  its tunnel routes, so Madeira checks the loopback again for up to 15 s, going
-  on the moment it works, and enables JIT.
+  keep the VPN that is connected now, if any (iOS connects one VPN at a time,
+  so LocalDevVPN replaces it); turn Cellular Data off, only when asked; connect
+  LocalDevVPN; and output the kept VPN, which tells Madeira whether one was on.
+  LocalDevVPN's Connect can return before its tunnel routes, so Madeira checks
+  the loopback again for up to 15 s, going on the moment it works, and enables
+  JIT.
 - **"done"**: with "cellular", turn Cellular Data back on; with "vpn-off" (no
-  VPN was on), disconnect LocalDevVPN; with "vpn-restore" and the name on its
-  last line, connect that VPN again (it replaces LocalDevVPN). Neither VPN word
-  when LocalDevVPN was already connected. Madeira runs it once a game's JIT pool
-  is mapped and the debugger has detached, before Wine starts, or at once if
-  enabling JIT fails.
+  VPN was on), disconnect LocalDevVPN; with "vpn-restore", connect the kept VPN
+  again (it replaces LocalDevVPN). Neither VPN word when LocalDevVPN was already
+  connected. Madeira runs it once a game's JIT pool is mapped and the debugger
+  has detached, before Wine starts, or at once if enabling JIT fails.
 
-Madeira keeps the VPN's name with the "done" it owes, on disk, so if Madeira is
-closed or crashes in between, the next launch runs it. The shortcut needs no
-file: a file needs a folder that exists, and the Shortcuts folder is in iCloud
-Drive. The log never shows the VPN's name.
+The shortcut keeps the VPN with **Store Content** (iOS 27): only that keeps a
+VPN that **Set VPN** accepts. Saved as text (to a file, or as a name Madeira
+passes back) it is only its name, and Set VPN cannot convert it ("couldn't
+convert from Text to VPN"). Madeira keeps the "done" it owes on disk, so if it
+is closed or crashes in between, the next launch runs it. On iOS 26, which has
+no Store Content, use the LocalDevVPN prompt instead.
 
 With the shortcut on, Madeira never opens LocalDevVPN's own link: when JIT still
 cannot connect, the alert offers **Connect with Madeira JIT**, which enables JIT
@@ -175,18 +177,17 @@ Name it exactly **Madeira JIT** and add:
    "contains".)
 2. **If** *Text* contains `start`
    1. **Get Current VPN** (before LocalDevVPN replaces it).
-   2. **If** *Text* contains `cellular`: **Set Cellular Data** *Off*. End If.
-   3. LocalDevVPN's **Connect** action (or **Set VPN** → *Connect* → LocalDevVPN).
-   4. **Stop and Output** *Current VPN*.
+   2. **Store Content**: *Current VPN*, named `previous VPN`.
+   3. **If** *Text* contains `cellular`: **Set Cellular Data** *Off*. End If.
+   4. LocalDevVPN's **Connect** action (or **Set VPN** → *Connect* → LocalDevVPN).
+   5. **Stop and Output** *Current VPN*.
 3. **Otherwise**
    1. **If** *Text* contains `cellular`: **Set Cellular Data** *On*. End If.
    2. **If** *Text* contains `vpn-off`: LocalDevVPN's **Disconnect** action (or
       **Set VPN** → *Disconnect*). End If.
-   3. **If** *Text* contains `vpn-restore`: **Set VPN** → *Connect* → your VPN,
-      picked from its list. End If. (**Set VPN** takes only a VPN picked there,
-      not a name: "couldn't convert from Text to VPN". With several VPNs, use one
-      **If** per VPN: **Split Text** *Text* by *New Lines*, **Get Item from List**
-      (*Last Item*) is that VPN's name → **Set VPN** → *Connect* → that VPN.)
+   3. **If** *Text* contains `vpn-restore`: **Get Stored Content** `previous
+      VPN`, then **Set VPN** → *Connect* → that stored content, wired straight in
+      (no Text in between). End If.
 4. End If.
 
 Then turn on **Settings → JIT → Madeira JIT shortcut**. Without the shortcut,

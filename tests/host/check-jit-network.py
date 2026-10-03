@@ -54,44 +54,14 @@ require('let cellular = cellularOnly' in start
         and start.index('pending = base') < start.index('run(cellular ? "start cellular" : "start")')
         and 'guard let input = pending else { completion(); return }' in start and 'run(input)' in start,
         '"start" asks for the cellular step only without Wi-Fi, and records the "done" it owes before it runs')
-require('self?.pending = vpn.isEmpty ? base + " vpn-off" : base + " vpn-restore\\n" + vpn' in start
+require('self?.pending = base + (vpnWasOn ? " vpn-restore" : " vpn-off")' in start
         and 'if case .done(let output) = outcome, !localDevVPNWasUp' in start,
-        '"done" disconnects LocalDevVPN when no VPN was on, reconnects the VPN "start" reported, '
+        '"done" disconnects LocalDevVPN when no VPN was on, restores the one the shortcut kept, '
         'and leaves VPNs alone when LocalDevVPN was already on or "start" did not report')
 require('Save File' not in net and 'Get File' not in net,
         'the shortcut needs no file (no iCloud Drive or folder to set up)')
-require('returned output=\\(result.isEmpty ? "none" : "a VPN name")' in net
-        and 'run input=\\(shown)' in net,
-        "the log never shows the VPN's name")
-require('UserDefaults.standard.string(forKey: Self.pendingKey)' in net
-        and 'JITNetworkShortcut.shared.restoreLeftover()' in main_app,
-        'the owed "done" is kept on disk and run at the next launch if a run ended between them')
-require('path.usesInterfaceType(.cellular) && !path.usesInterfaceType(.wifi)' in net,
-        'cellular-only comes from the system network path')
-detach = content.index('winios_phase("detach-done")')
-require(detach < content.index('JITNetworkShortcut.restoreBlocking()', detach) < content.index('self.startWineserver()', detach),
-        'the restore runs after the debugger detached and before Wine starts')
-require('.onOpenURL { url in JITNetworkShortcut.shared.handle(url) }' in main_app,
-        "the app hands madeira:// URLs to the shortcut's handler")
-require('URLQueryItem(name: "x-success", value: "madeira://jit-network/success")' in net
-        and 'URLQueryItem(name: "name", value: Self.name)' in net and 'static let name = "Madeira JIT"' in net,
-        'the shortcut runs through x-callback-url and returns to madeira://jit-network/')
-require('ConnectionProblem(helperMessage: message) ?? (loopbackAnswered == false ? .vpn : nil)' in setup,
-        "a JIT failure after a check that found no lockdownd is explained as LocalDevVPN (a network that accepts any connection gives 'early eof')")
-require(ensure[:ensure.index('func connectWithShortcut(')].count('LoopbackProbe.waitUntilReachable(within: 15)') == 1,
-        "after the shortcut, the loopback is awaited up to 15 s (LocalDevVPN's Connect returns before its tunnel routes)")
-require('stopped("Your \\(JITNetworkShortcut.name) shortcut stopped: \\(why)' in ensure
-        and 'JITNetworkShortcut.shared.restoreIfNeeded {}' in enable[enable.index('stopped: {'):],
-        "a shortcut that fails is reported with its own error, without a JIT attempt, and what it changed is put back")
-actions = setup[setup.index('@MainActor func jitConnectionActions('):setup.index('struct JITSettingsSection')]
-require(actions.index('if JITNetworkShortcut.shared.enabled {') < actions.index('LocalDevVPN.open()')
-        and 'if let retry { retry() } else { JITCoordinator.shared.connectWithShortcut() }' in actions,
-        "with the shortcut on, the connect action runs the shortcut, never LocalDevVPN's link")
-require('jitConnectionActions(jitProblem, retry: enableJIT)' in (app / 'Library.swift').read_text(),
-        "the library's alert retries Enable JIT, which runs the shortcut")
-require('Toggle("\\(JITNetworkShortcut.name) shortcut", isOn: $shortcut.enabled)' in setup
-        and 'MadeiraConfig.flag("MADEIRA_JIT_SHORTCUT", fallback: false)' in net,
-        'Settings › JIT has the switch, off by default (madeira.cfg env.MADEIRA_JIT_SHORTCUT)')
+require('returned output=\\(result.isEmpty ? "none" : "a VPN name")' in net and 'vpn-restore\\n' not in net,
+        "Madeira neither logs nor keeps the VPN's name (the shortcut keeps the VPN itself)")
 
 # ------------------------------------------------------------------ Swift
 probe = net[net.index('enum LoopbackProbe {'):net.index('/// The user\'s "Madeira JIT" shortcut')]

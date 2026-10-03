@@ -159,14 +159,15 @@ enum LoopbackProbe {
 }
 
 /// The user's "Madeira JIT" shortcut (docs/JIT.md has its steps). Input "start",
-/// with "cellular" when Madeira sees cellular data and no Wi-Fi: turn Cellular Data off
-/// (only when asked), connect LocalDevVPN, and output the name of the VPN that was
-/// connected before (Get Current VPN; iOS connects one VPN at a time, so LocalDevVPN
-/// replaces it). Input "done", with "cellular" when "start" had it: turn Cellular Data
-/// back on; "vpn-off": disconnect LocalDevVPN (no VPN was on); "vpn-restore" and the
-/// name on its last line: connect that VPN again. Madeira keeps the name with the "done"
-/// it owes, so the shortcut needs no file (a file needs a folder that exists, and the
-/// Shortcuts folder is in iCloud Drive). Madeira runs "done" after any "start".
+/// with "cellular" when Madeira sees cellular data and no Wi-Fi: keep the VPN that is
+/// connected (Get Current VPN into Store Content; iOS connects one VPN at a time, so
+/// LocalDevVPN replaces it), turn Cellular Data off (only when asked), connect
+/// LocalDevVPN, and output that VPN, which tells Madeira whether one was on. Input
+/// "done", with "cellular" when "start" had it: turn Cellular Data back on; "vpn-off":
+/// disconnect LocalDevVPN (no VPN was on); "vpn-restore": connect the kept VPN again.
+/// Only Store Content keeps a VPN that Set VPN accepts: as text (a file, or a name
+/// Madeira passed back) it is only a name, which Set VPN cannot convert ("couldn't
+/// convert from Text to VPN"). Madeira runs "done" after any "start".
 ///
 /// An app can only run a shortcut by opening the Shortcuts app, so each run leaves
 /// Madeira for a moment and comes back through x-callback-url
@@ -223,8 +224,8 @@ enum LoopbackProbe {
         pending = base
         run(cellular ? "start cellular" : "start") { [weak self] outcome in
             if case .done(let output) = outcome, !localDevVPNWasUp {
-                let vpn = output.trimmingCharacters(in: .whitespacesAndNewlines)
-                self?.pending = vpn.isEmpty ? base + " vpn-off" : base + " vpn-restore\n" + vpn
+                let vpnWasOn = !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                self?.pending = base + (vpnWasOn ? " vpn-restore" : " vpn-off")
             }
             completion(outcome)
         }
@@ -260,7 +261,6 @@ enum LoopbackProbe {
 
     private func run(_ input: String, completion: @escaping (Outcome) -> Void) {
         finish(.failed("superseded"))
-        let shown = input.split(separator: "\n").first.map(String.init) ?? input   // not the VPN's name
         var c = URLComponents()
         c.scheme = "shortcuts"
         c.host = "x-callback-url"
@@ -274,7 +274,7 @@ enum LoopbackProbe {
             URLQueryItem(name: "x-cancel", value: "madeira://jit-network/cancel")
         ]
         guard let url = c.url else { completion(.failed("bad shortcut URL")); return }
-        LogStore.shared.log("[jit-shortcut] run input=\(shown)")
+        LogStore.shared.log("[jit-shortcut] run input=\(input)")
         waiting = completion
         timeout = Timer.scheduledTimer(withTimeInterval: 60, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated { self?.finish(.failed("the shortcut did not return within 60 s")) }
