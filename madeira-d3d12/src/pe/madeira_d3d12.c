@@ -545,6 +545,7 @@ struct mad_resource {
     struct mad_device *owner;
     int borrowed;              /* texture belongs to a drawable; do not release */
     obj_handle_t resolve_tmp;  /* exec_resolve: render-target stand-in when this is a resolve destination without that usage */
+    UINT resolve_tmp_w, resolve_tmp_h, resolve_tmp_pf;   /* the stand-in's size and pixel format, to replace it when they change */
     D3D12_RESOURCE_DESC desc;  /* as created; answered by GetDesc */
     /* ml905: typed-buffer views (Buffer<T> / RWBuffer<T>). The converter reads
      * a typed buffer as a texture buffer, so each distinct (format, offset,
@@ -4080,26 +4081,60 @@ static int mad_texinfo_from_desc(const D3D12_RESOURCE_DESC *desc, struct WMTText
  *
  * Metal only resolves into a texture with render-target usage, which a D3D12
  * resolve destination need not have. Such a destination gets a stand-in of
- * the subresource's size that is resolved into and then copied from. */
+ * the subresource's size that is resolved into and then copied from.
+ *
+ * Metal also wants the resolve texture in the source attachment's pixel
+ * format, while D3D12 resolves between sRGB/linear and typeless pairs (an
+ * sRGB multisampled target into a UNORM back buffer is common). When the
+ * formats differ, the destination subresource is resolved (or copied) through
+ * a view of it in the source's format; every texture here has PixelFormatView
+ * usage. Formats of different sizes cannot be viewed as each other: skipped. */
+static obj_handle_t mad_resolve_view(struct mad_resource *r, enum WMTPixelFormat pf, UINT level, UINT slice) {
+    struct WMTTextureSwizzleChannels sw;
+    uint64_t id = 0;
+    sw.r = (enum WMTTextureSwizzle)2; sw.g = (enum WMTTextureSwizzle)3;   /* identity, as MAD_SWZ_IDENTITY */
+    sw.b = (enum WMTTextureSwizzle)4; sw.a = (enum WMTTextureSwizzle)5;
+    return MTLTexture_newTextureView(r->texture, pf, WMTTextureType2D, (uint16_t)level, 1, (uint16_t)slice, 1, sw, &id);
+}
+
 static void exec_resolve(struct mad_exec *e, const struct mad_cmd *c) {
     struct mad_resource *src = c->u.tt.src, *dst = c->u.tt.dst;
     struct WMTRenderPassInfo rpi;
-    obj_handle_t enc, target = dst->texture;
+    obj_handle_t enc, target = dst->texture, dview = 0;
+    enum WMTPixelFormat spf = src->tex_pf;
     UINT w = src->width >> c->u.tt.slevel, h = src->height >> c->u.tt.slevel;
+    UINT dlevel = c->u.tt.dlevel, dslice = c->u.tt.dslice;
     int direct = dst->borrowed || (dst->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    static unsigned said_pf;
     if (!w) w = 1;
     if (!h) h = 1;
     if (!src->texture || !dst->texture || src->is_depth || dst->is_depth) { MAD_SKIP(e); return; }
+    if (dst->tex_pf != spf) {
+        if (mad_pf_bytes((UINT)dst->tex_pf) != mad_pf_bytes((UINT)spf) || !(dview = mad_resolve_view(dst, spf, dlevel, dslice))) {
+            if (said_pf++ < 4)
+                d3d12_log("[madeira-d3d12] ResolveSubresource skipped: Metal format %u cannot be resolved into %u\n",
+                          (unsigned)spf, (unsigned)dst->tex_pf);
+            MAD_SKIP(e); return;
+        }
+        target = dview; dlevel = 0; dslice = 0;
+    }
     if (!direct) {
+        if (dst->resolve_tmp && (dst->resolve_tmp_w != w || dst->resolve_tmp_h != h || dst->resolve_tmp_pf != (UINT)spf)) {
+            NSObject_release(dst->resolve_tmp);
+            dst->resolve_tmp = 0;
+        }
         if (!dst->resolve_tmp) {
             D3D12_RESOURCE_DESC td = dst->desc;
             struct WMTTextureInfo ti; enum WMTPixelFormat pf; int is_depth = 0;
             td.Width = w; td.Height = h; td.DepthOrArraySize = 1; td.MipLevels = 1;
             td.SampleDesc.Count = 1; td.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-            if (mad_texinfo_from_desc(&td, &ti, &pf, &is_depth))
+            if (mad_texinfo_from_desc(&td, &ti, &pf, &is_depth)) {
+                ti.pixel_format = spf;   /* resolved in the source's format, copied as it */
                 dst->resolve_tmp = MTLDevice_newTexture(e->q->device->mtl_device, &ti);
+                dst->resolve_tmp_w = w; dst->resolve_tmp_h = h; dst->resolve_tmp_pf = (UINT)spf;
+            }
         }
-        if (!dst->resolve_tmp) { MAD_SKIP(e); return; }
+        if (!dst->resolve_tmp) { if (dview) NSObject_release(dview); MAD_SKIP(e); return; }
         target = dst->resolve_tmp;
     }
     exec_end(e);
@@ -4111,25 +4146,27 @@ static void exec_resolve(struct mad_exec *e, const struct mad_cmd *c) {
     rpi.colors[0].load_action = WMTLoadActionLoad;
     rpi.colors[0].store_action = WMTStoreActionStoreAndMultisampleResolve;
     rpi.colors[0].resolve_texture = target;
-    if (direct) { rpi.colors[0].resolve_level = c->u.tt.dlevel; rpi.colors[0].resolve_slice = c->u.tt.dslice; }
+    if (direct) { rpi.colors[0].resolve_level = dlevel; rpi.colors[0].resolve_slice = dslice; }
     rpi.render_target_width = w; rpi.render_target_height = h;
     rpi.default_raster_sample_count = src->samples;
     enc = MTLCommandBuffer_renderCommandEncoder(e->cb, &rpi); if (enc) g_enc_seq++;
     e->f6_att[0] = src; e->f6_att[1] = dst; e->f6_natt = 2;
     if (enc) { exec_fence_render(e, enc, 0); exec_fence_render(e, enc, 1); }
     e->f6_natt = 0;
-    if (!enc) { MAD_SKIP(e); return; }
+    if (!enc) { if (dview) NSObject_release(dview); MAD_SKIP(e); return; }
     MTLCommandEncoder_endEncoding(enc);
     if (!direct) {
         struct wmtcmd_blit_copy_from_texture_to_texture k;
-        if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
+        if (!exec_begin_blit(e)) { if (dview) NSObject_release(dview); MAD_SKIP(e); return; }
         memset(&k, 0, sizeof k);
         k.type = WMTBlitCommandCopyFromTextureToTexture;
         k.src = target;
         k.src_size.width = w; k.src_size.height = h; k.src_size.depth = 1;
-        k.dst = dst->texture; k.dst_slice = c->u.tt.dslice; k.dst_level = c->u.tt.dlevel;
+        k.dst = dview ? dview : dst->texture; k.dst_slice = dslice; k.dst_level = dlevel;
         MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
     }
+    /* The command buffer keeps the view alive until it has run. */
+    if (dview) NSObject_release(dview);
 }
 
 static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
