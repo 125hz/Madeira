@@ -145,8 +145,9 @@ require('MadeiraConfig' not in sources['SteamOwnedLibrary.swift'] and 'SteamSign
         'one switch, MADEIRA_STEAM_LIBRARY, on by default')
 info = (app / 'Info.plist').read_text()
 permitted = re.findall(r'<key>BGTaskSchedulerPermittedIdentifiers</key>\s*<array>(.*?)</array>', info, re.S)
-require(len(permitted) == 1 and re.findall(r'<string>([^<]*)</string>', permitted[0]) == ['$(PRODUCT_BUNDLE_IDENTIFIER).download.*'],
-        "Info.plist permits one task identifier family, the bundle's own .download.* (background downloads)")
+require(len(permitted) == 1 and re.findall(r'<string>([^<]*)</string>', permitted[0])
+        == ['$(PRODUCT_BUNDLE_IDENTIFIER).download.*', '$(PRODUCT_BUNDLE_IDENTIFIER).pairing.*'],
+        "Info.plist permits only the bundle's own .download.* (background downloads) and .pairing.* (JIT pairing) tasks")
 require('UIBackgroundModes' not in info, 'Info.plist asks for no background mode')
 background = sources['SteamDownloadBackground.swift']
 require('hasSuffix(".download.*")' in background and '+ "queue"' in background and 'BGContinuedProcessingTaskRequest(identifier: identifier' in background,

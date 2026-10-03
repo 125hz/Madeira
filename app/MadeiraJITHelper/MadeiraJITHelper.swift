@@ -121,13 +121,6 @@ private struct MadeiraJITMessageHandler: XPCPeerHandler {
 
 @main
 struct MadeiraJITHelperExtension: AppExtension {
-    @AppExtensionPoint.Bind
-    var extensionPoint: AppExtensionPoint {
-        AppExtensionPoint.Identifier(
-            host: "com.willfaust.madeora",
-            name: "MadeiraJITHelper")
-    }
-
     var configuration: some AppExtensionConfiguration {
         ConnectionHandler(onSessionRequest: { request in
             request.accept { _ in MadeiraJITMessageHandler() }

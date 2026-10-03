@@ -13,9 +13,11 @@ Madeira does not silently switch methods after a failed attempt; the error is
 shown so the pairing, VPN, or Developer Disk Image problem can be fixed.
 
 Choose a method under **Settings → JIT**, or open **JIT setup** for its guided
-setup and status. First-run setup offers the same choice: **Upload Pairing
-File** selects Built-in StikJIT, **Use StikDebug** selects StikDebug, and
-**I'll do this later** leaves the current method unchanged.
+setup and status. First-run setup offers three ways in, each with its own
+numbered steps: **On-device** (pair this iPhone with Madeira, iOS 27 and
+later) and **On-device with pairing file** both select Built-in StikJIT,
+**StikDebug** selects StikDebug, and setting it up later leaves the current
+method unchanged.
 
 ## StikDebug
 
@@ -34,18 +36,57 @@ detach before Madeira creates its JIT pool.
 ## Built-in StikJIT
 
 Built-in JIT requires iOS 26 or later and a normal sideloaded installation. It
-is unavailable in the simulator and inside LiveContainer.
+is unavailable in the simulator and inside LiveContainer. It needs this
+iPhone's remote pairing file, which Madeira can make itself on iOS 27, or
+import.
+
+### On-device pairing (iOS 27 and later)
+
+iOS 27 can pair with a computer it finds on the local network, started from
+the iPhone. Madeira plays that computer for its own iPhone, so no computer is
+needed.
+
+1. Turn on Wi-Fi. Tap **On-device**, then **Start pairing**, during first-run setup, or
+   **Pair on this device** in **Settings → JIT → JIT setup**, and allow Local
+   Network access when iOS asks.
+2. Open **Settings → Privacy & Security → Developer Mode**, scroll down and
+   tap **Pair with Madeira**.
+3. Enter the code Madeira shows. It appears in iOS's background-task banner
+   and as a notification, and in Madeira when you return.
+4. Back in Madeira, continue with LocalDevVPN, **Check setup** and
+   **Enable JIT** as below.
+
+Madeira keeps running in the background while you are in Settings through an
+iOS continued-processing task (`<bundle id>.pairing.session`). If iOS refuses
+it, typically because the sideloader changed the bundle identifier, Madeira
+only gets the usual ~30 seconds in the background and says so; go to Settings
+straight away. A pairing that has not finished after five minutes is stopped.
+
+Every pairing makes a new host key. The identifier stays the same, so the
+iPhone replaces its earlier record for Madeira, and only the newest pairing
+file works.
+
+The pairing runs in `libmadeira_rppairing.a` (`build/rppairing-ios`), a small
+wrapper around [idevice](https://github.com/jkcoxson/idevice)'s pairable-host
+implementation. `app/Madeira/JITPairing.swift` advertises it as a
+`_remotepairing-pairable-host._tcp` Bonjour service through mDNSResponder, so
+only the Local Network permission is needed.
+
+### Pairing file from a computer
 
 1. Create a pairing file for this iPhone by following the
    [StikDebug pairing-file guide](https://github.com/StikDebug/StikDebug-Guide/blob/main/pairing_file.md).
-2. Tap **Upload Pairing File** during first-run setup, or open
+2. Tap **On-device with pairing file**, then **Choose pairing file**, during first-run setup, or open
    **Settings → JIT → JIT setup** and tap **Import pairing file**.
-3. Install and connect LocalDevVPN.
-4. Tap **Check setup**. Madeira checks VPN reachability and downloads, mounts,
-   and verifies the matching Developer Disk Image when needed.
-5. Tap **Enable JIT**.
 
-The pairing file is copied to
+### Enabling JIT
+
+1. Install and connect LocalDevVPN.
+2. Tap **Check setup**. Madeira checks VPN reachability and downloads, mounts,
+   and verifies the matching Developer Disk Image when needed.
+3. Tap **Enable JIT**.
+
+Either way, the pairing file is stored at
 `Documents/StikJIT/pairingFile.plist`, which is visible through Finder/iTunes
 file sharing. Treat it as device-sensitive data and do not share it. Madeira
 sends its bytes only to its bundled helper process for the current request.
@@ -65,6 +106,12 @@ The app and `MadeiraJITHelper` extension must be signed together. Sideloaders
 must preserve and provision the embedded ExtensionKit extension. If an
 installer cannot do that, select StikDebug instead.
 
+To build Madeira under another bundle identifier, set the
+`MADEIRA_BUNDLE_IDENTIFIER` build setting (for example in an `.xcconfig`
+passed with `-xcconfig`). The app, the helper (`<id>.JITHelper`) and the
+helper's extension point (`<id>.MadeiraJITHelper`) all follow it; changing only
+`PRODUCT_BUNDLE_IDENTIFIER` leaves the helper unfindable.
+
 JIT also requires Madeira's executable to be signed as debuggable. Madeira
 reports a signing error before attempting either method when that entitlement
 is missing.
@@ -79,3 +126,8 @@ and is licensed under MPL-2.0. It includes the
 [idevice](https://github.com/jkcoxson/idevice) library, licensed under MIT.
 Corresponding source and license links are recorded in
 [`THIRD-PARTY-NOTICES.md`](../THIRD-PARTY-NOTICES.md).
+
+On-device pairing links idevice 0.1.68 and its Rust dependencies (MIT,
+Apache-2.0, BSD-3-Clause or ISC) into the app from crates.io, pinned by
+`build/rppairing-ios/Cargo.lock`; their notices are bundled as
+`legal/LICENSES-rppairing-crates.txt`.

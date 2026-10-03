@@ -20,6 +20,14 @@ enum JITMethod: String, CaseIterable, Identifiable {
     }
 }
 
+/// Where Built-in StikJIT's pairing file came from.
+enum JITPairingSource: String {
+    /// Made by Madeira on this device (iOS 27, OnDevicePairing).
+    case onDevice
+    /// Imported from a file made on a computer.
+    case imported
+}
+
 enum JITPairingFileStore {
     static var directory: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -27,6 +35,13 @@ enum JITPairingFileStore {
     }
     static var url: URL { directory.appendingPathComponent("pairingFile.plist") }
     static var isImported: Bool { FileManager.default.fileExists(atPath: url.path) }
+    private static let sourceKey = "madeiraJITPairingSource"
+
+    /// Files stored before on-device pairing existed were all imported.
+    static var source: JITPairingSource? {
+        guard isImported else { return nil }
+        return UserDefaults.standard.string(forKey: sourceKey).flatMap(JITPairingSource.init(rawValue:)) ?? .imported
+    }
 
     static func data() throws -> Data {
         try Data(contentsOf: url)
@@ -35,7 +50,11 @@ enum JITPairingFileStore {
     static func importFile(from source: URL) throws {
         let scoped = source.startAccessingSecurityScopedResource()
         defer { if scoped { source.stopAccessingSecurityScopedResource() } }
-        let data = try Data(contentsOf: source)
+        try store(try Data(contentsOf: source), source: .imported)
+    }
+
+    /// Validates an RPPairing plist and makes it the pairing file.
+    static func store(_ data: Data, source: JITPairingSource) throws {
         guard !data.isEmpty,
               let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
               let dictionary = plist as? [String: Any],
@@ -48,6 +67,7 @@ enum JITPairingFileStore {
         }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try data.write(to: url, options: .atomic)
+        UserDefaults.standard.set(source.rawValue, forKey: sourceKey)
     }
 }
 
@@ -63,7 +83,7 @@ final class JITCoordinator: ObservableObject {
         var errorDescription: String? {
             switch self {
             case .setupRequired(let message): return message
-            case .pairingMissing: return "Import this device's pairing file first."
+            case .pairingMissing: return "Pair this device or import its pairing file first."
             case .scriptMissing: return "Madeira's JIT script is missing from this installation. Reinstall Madeira."
             }
         }
@@ -78,6 +98,7 @@ final class JITCoordinator: ObservableObject {
     @Published private(set) var error: String?
     @Published private(set) var txmPresent: Bool?
     @Published private(set) var pairingImported = JITPairingFileStore.isImported
+    @Published private(set) var pairingSource = JITPairingFileStore.source
 
     private init() {
         method = UserDefaults.standard.string(forKey: "madeiraJITMethod")
@@ -97,6 +118,7 @@ final class JITCoordinator: ObservableObject {
 
     func refreshPairingStatus() {
         pairingImported = JITPairingFileStore.isImported
+        pairingSource = JITPairingFileStore.source
     }
 
     func enable(completion: @escaping (Result<Void, Error>) -> Void) {
@@ -136,7 +158,7 @@ final class JITCoordinator: ObservableObject {
             }
         case .builtIn:
             guard JITPairingFileStore.isImported else {
-                let message = "Import this device's pairing file to finish Built-in StikJIT setup."
+                let message = "Pair this device or import its pairing file to finish Built-in StikJIT setup."
                 error = message
                 showSetup = true
                 completion(.failure(CoordinatorError.setupRequired(message)))
@@ -149,12 +171,22 @@ final class JITCoordinator: ObservableObject {
     func importPairingFile(_ source: URL) {
         do {
             try JITPairingFileStore.importFile(from: source)
-            pairingImported = true
+            OnDevicePairing.shared.cancel()
+            refreshPairingStatus()
             status = "Pairing file imported."
             error = nil
         } catch {
             self.error = error.localizedDescription
         }
+    }
+
+    /// OnDevicePairing finished: its file becomes the pairing file and Built-in StikJIT the method.
+    func storeOnDevicePairing(_ data: Data) throws {
+        try JITPairingFileStore.store(data, source: .onDevice)
+        refreshPairingStatus()
+        method = .builtIn
+        status = "Paired on this device."
+        error = nil
     }
 
     func prepareBuiltIn() {
@@ -310,8 +342,17 @@ struct JITSettingsSection: View {
 
 struct JITSetupView: View {
     @ObservedObject private var coordinator = JITCoordinator.shared
+    @ObservedObject private var pairing = OnDevicePairing.shared
     @State private var importing = false
     @Environment(\.dismiss) private var dismiss
+
+    private var pairingLabel: String {
+        switch coordinator.pairingSource {
+        case .onDevice: return "Paired on this device"
+        case .imported: return "File imported"
+        case nil: return "Not set up"
+        }
+    }
 
     var body: some View {
         NavigationStack {
@@ -338,8 +379,14 @@ struct JITSetupView: View {
 
                 if coordinator.method != .stikDebug {
                     Section {
-                        LabeledContent("Pairing file",
-                                       value: coordinator.pairingImported ? "Imported" : "Not imported")
+                        LabeledContent("Pairing", value: pairingLabel)
+                        if OnDevicePairing.isSupported {
+                            Button(coordinator.pairingSource == .onDevice ? "Pair on this device again" : "Pair on this device") {
+                                pairing.start()
+                            }
+                            .disabled(pairing.active)
+                            OnDevicePairingPanel()
+                        }
                         Button("Import pairing file") { importing = true }
                         Link("How to create a pairing file",
                              destination: URL(string: "https://github.com/StikDebug/StikDebug-Guide/blob/main/pairing_file.md")!)
@@ -348,7 +395,9 @@ struct JITSetupView: View {
                     } header: {
                         Text("Built-in StikJIT")
                     } footer: {
-                        Text("Import this device's pairing file, connect LocalDevVPN, then check setup. The pairing file stays in Madeira's Documents folder.")
+                        Text(OnDevicePairing.isSupported
+                             ? "Pair on this device or import a pairing file made on a computer, connect LocalDevVPN, then check setup. The pairing file stays in Madeira's Documents folder."
+                             : "Import this device's pairing file, connect LocalDevVPN, then check setup. The pairing file stays in Madeira's Documents folder. Pairing on the device itself needs iOS 27 or later.")
                     }
 
                     Section {

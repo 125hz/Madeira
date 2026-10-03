@@ -21,7 +21,7 @@
 	<key>EXAppExtensionAttributes</key>
 	<dict>
 		<key>EXExtensionPointIdentifier</key>
-		<string>com.willfaust.madeora.MadeiraJITHelper</string>
+		<string>$(MADEIRA_BUNDLE_IDENTIFIER).MadeiraJITHelper</string>
 	</dict>
 </dict>
 </plist>

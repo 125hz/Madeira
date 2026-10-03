@@ -111,8 +111,15 @@ require("stikdebug" in app_plist["LSApplicationQueriesSchemes"],
 with (root / "app/MadeiraJITHelper/Info.plist").open("rb") as f:
     helper_plist = plistlib.load(f)
 require(helper_plist["CFBundlePackageType"] == "XPC!"
-        and helper_plist["EXAppExtensionAttributes"]["EXExtensionPointIdentifier"].endswith(
-            ".MadeiraJITHelper"),
-        "the helper is packaged as an ExtensionKit extension")
+        and helper_plist["EXAppExtensionAttributes"]["EXExtensionPointIdentifier"]
+        == "$(MADEIRA_BUNDLE_IDENTIFIER).MadeiraJITHelper",
+        "the helper is packaged as an ExtensionKit extension of the app's own bundle identifier")
+project = (root / "app/Madeira.xcodeproj/project.pbxproj").read_text()
+helper_source = (root / "app/MadeiraJITHelper/MadeiraJITHelper.swift").read_text()
+require(project.count('PRODUCT_BUNDLE_IDENTIFIER = "$(MADEIRA_BUNDLE_IDENTIFIER)";') == 2
+        and project.count('PRODUCT_BUNDLE_IDENTIFIER = "$(MADEIRA_BUNDLE_IDENTIFIER).JITHelper";') == 2
+        and project.count("MADEIRA_BUNDLE_IDENTIFIER = com.willfaust.madeora;") == 2
+        and "AppExtensionPoint.Identifier(" not in helper_source,
+        "one setting, MADEIRA_BUNDLE_IDENTIFIER, names the app, the helper and its extension point")
 
 print("check-jit-method: PASS")

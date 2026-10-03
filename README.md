@@ -51,7 +51,8 @@ Wine's server runs as a thread instead of a separate program.
   on reliably. Development happens on recent Pro iPhones.
 - **JIT**, which iOS only allows while a debugger is attached. Madeira can use
   [StikDebug](https://github.com/StikDebug/StikDebug) or its built-in StikJIT
-  helper.
+  helper. On iOS 27 the built-in helper can pair the iPhone itself, without a
+  computer.
 - An **Apple ID** to sideload the app. A free account works; its signing
   expires after 7 days, so the app needs refreshing weekly. Your games and
   saves are kept across reinstalls.

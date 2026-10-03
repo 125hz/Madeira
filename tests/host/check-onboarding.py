@@ -100,11 +100,25 @@ for page in ['private var signInPage', 'private var dockClientPage']:
     require('secondary("Set up later") { model.next() }' in block(view, page), f'{page.split()[-1]}: Set up later')
 require('secondary("Skip setup") { model.skip() }' in block(view, 'private var welcome'), 'welcome: visible Skip setup')
 jit_page = block(view, 'private var jitPage')
-require('primary("Upload Pairing File"' in jit_page and 'importingPairingFile = true' in jit_page,
-        'JIT: primary pairing-file upload')
-require('secondary("Use StikDebug")' in jit_page and 'jit.method = .stikDebug' in jit_page,
-        'JIT: secondary StikDebug choice')
-require("secondary(\"I'll do this later\") { model.next() }" in jit_page, 'JIT: visible defer choice')
+choices = block(view, 'private var jitChoices')
+require(all(f'case .{path}: {guide}' in jit_page for path, guide in
+            [('onDevice', 'onDeviceGuide'), ('pairingFile', 'pairingFileGuide'), ('stikDebug', 'stikDebugGuide')]),
+        'JIT: each of the three ways in has its own guide')
+require(all(f'jitChoice("{title}"' in choices for title in ['On-device', 'On-device with pairing file', 'StikDebug'])
+        and 'enabled: OnDevicePairing.isSupported' in choices,
+        'JIT: On-device (iOS 27), On-device with pairing file, StikDebug')
+on_device = block(view, 'private var onDeviceGuide')
+require('startPairing()' in on_device and 'OnDevicePairingPanel()' in on_device
+        and 'pairing.start()' in block(view, 'private func startPairing'),
+        'JIT: the on-device guide pairs and shows its progress')
+require('importPairingFile()' in block(view, 'private var pairingFileGuide')
+        and 'importingPairingFile = true' in block(view, 'private func importPairingFile'),
+        'JIT: the pairing-file guide imports')
+require('jit.method = .stikDebug' in block(view, 'private var stikDebugGuide'), 'JIT: the StikDebug guide selects StikDebug')
+for guide in ['onDeviceGuide', 'pairingFileGuide', 'stikDebugGuide']:
+    require('secondary("Back to options") { leaveGuide() }' in block(view, f'private var {guide}'), f'JIT: {guide} goes back')
+require('pairing.cancel()' in block(view, 'private func leaveGuide'), 'JIT: leaving the guide stops a waiting pairing')
+require("secondary(\"I'll do this later\") { model.next() }" in choices, 'JIT: visible defer choice')
 require('jit.importPairingFile(url)' in view and 'jit.method = .builtIn' in view,
         'JIT: validated import selects Built-in StikJIT through the coordinator')
 require('onTapGesture' not in onboarding, 'no hidden gestures')

@@ -7,6 +7,8 @@
 #import "Winios/WiniosCursor.h"
 // Steam content decoders (liblzma shim, zstd decoder, zip chunks), used by the owned library's downloads.
 #import "SwiftSteam/lzma_shim.h"
+// On-device remote pairing for Built-in StikJIT (build/rppairing-ios, JITPairing.swift).
+#import "MadeiraRPPairing.h"
 
 // Wine file-based logging (server_ios.c)
 void wine_log_set_file(const char *path);

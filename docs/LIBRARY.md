@@ -167,7 +167,8 @@ instead.
 ## First-run setup
 
 The code is `app/Madeira/Onboarding.swift`. It uses `JITCoordinator` for the
-JIT method and validated pairing-file import, Steam sign-in
+JIT method and validated pairing-file import, `OnDevicePairing` for on-device
+pairing (iOS 27, `docs/JIT.md`), Steam sign-in
 (`docs/STEAM_SIGNIN.md`) through `SteamSignInModel`/`SteamSignInView` (the
 token stays in sign-in's Keychain store), and Madeira Dock
 (`docs/MADEIRA_DOCK.md`) through
@@ -176,16 +177,19 @@ token stays in sign-in's Keychain store), and Madeira Dock
 **First-run setup.** On a new install the library opens a full-screen setup
 once: welcome, **Set up JIT**, **Sign in to Steam**, **Prepare Madeira Dock**
 (Valve's client components, about 73 MB, only when Dock is available), done.
-The JIT page offers **Upload Pairing File**, **Use StikDebug**, or **I'll do
-this later**. A valid pairing-file import selects Built-in StikJIT; it does not
-enable JIT yet. Steam and Dock steps have **Set up later**, and the welcome
+The JIT page offers three ways in, **On-device** (iOS 27 and later),
+**On-device with pairing file** and **StikDebug**, or **I'll do this later**.
+Each way opens numbered steps that tick off as they are done, with **Back to
+options**. A completed pairing or a valid pairing-file import selects Built-in
+StikJIT; it does not enable JIT yet. Steam and Dock steps have **Set up later**, and the welcome
 page has **Skip setup**. Finishing or skipping stores
 `madeiraOnboardingDone` in the app's UserDefaults, which iOS removes with the
 app. The JIT page is always available; Steam pages follow their feature
 switches. Setup never opens over a running session.
 
 Setup starts no Wine session and allocates no JIT pool. It stores the selected
-JIT method and may copy a validated pairing file to
+JIT method and may write a validated pairing file (paired on the device or
+imported) to
 `Documents/StikJIT/pairingFile.plist`; the component download runs Dock's own
 verified download without Wine. It changes no engine switch or launch
 configuration.
