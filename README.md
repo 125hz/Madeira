@@ -156,13 +156,14 @@ proposing anything to it.
 - **Nick** ([@125hz](https://github.com/125hz)): 32-bit game support, the game library and Madeira Dock
 - **Jfishin** ([@Jfishin](https://github.com/Jfishin)): the original native Steam sign-in, library and downloads
 - **Jesse** ([@JesseLovelace](https://github.com/JesseLovelace)): Steam Cloud saves, faster game launches, and fixes that let more games run
+- **Dan Perks** ([@danperks](https://github.com/danperks)): built-in JIT without StikDebug, and pairing on the device itself
 
 Madeira is built on [Wine](https://www.winehq.org/), [FEX-Emu](https://github.com/FEX-Emu/FEX),
 [DXMT](https://github.com/3Shain/DXMT) by Feifan He (3Shain) with the Direct3D 9
 frontend by David Acevedo (dacevedo12), [rpmalloc](https://github.com/mjansson/rpmalloc)
-by Mattias Jansson, [StikDebug](https://github.com/StikDebug/StikDebug), and
-[StikJIT](https://github.com/StikDebug/StikJIT)
-for enabling JIT. Thank you to everyone who contributes to them.
+by Mattias Jansson, [StikDebug](https://github.com/StikDebug/StikDebug),
+[StikJIT](https://github.com/StikDebug/StikJIT) and
+[idevice](https://github.com/jkcoxson/idevice) for enabling JIT. Thank you to everyone who contributes to them.
 
 <p align="center">
   <a href="https://discord.gg/4t5mNjwCn7"><b>Join the community on Discord</b></a>

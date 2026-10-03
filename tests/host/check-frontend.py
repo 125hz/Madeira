@@ -405,7 +405,8 @@ last = form[[m.start() for m in re.finditer(r'\bSection\b', form)][-1]:]
 check('header: { Text("Credits") }' in last and form.count('Text("Credits")') == 1,
       'Settings: Credits is the last section')
 for who in ('name: "Will Faust", handle: "willfaust"', 'name: "Nick", handle: "125hz"',
-            'name: "Jfishin", handle: "Jfishin"'):
+            'name: "Jfishin", handle: "Jfishin"', 'name: "Jesse", handle: "JesseLovelace"',
+            'name: "Dan Perks", handle: "danperks"'):
     check('MadeiraCredit(' + who in last, 'Settings credits: ' + who)
 check('https://github.com/\\(handle)' in block(lib, 'struct MadeiraCredit: View'),
       'a credit links the GitHub account')
