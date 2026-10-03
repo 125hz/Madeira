@@ -4,7 +4,9 @@ Compiles the production SteamCloudEntry and SteamCloudPlan and checks what each 
 leads to against the record of the last sync: one-sided changes are copied, two-sided ones
 wait for a choice, and a save synced before that is now missing on this device is a choice
 whose mark keeps a new save of that name from going up over the cloud's copy unasked (the
-reset-prefix case). Source checks: Steam Cloud is off unless turned on, every upload that
+reset-prefix case), and runs the production comparison (SteamCloudPaths, SteamCloudAudit) over a
+synthetic prefix: a save folder named with {64BitSteamID} gets a cloud name with the ID filled in,
+the name the cloud lists for that file. Source checks: Steam Cloud is off unless turned on, every upload that
 replaces a cloud file backs up the cloud's copy first, and backups are in Documents.
 """
 from pathlib import Path
@@ -25,7 +27,7 @@ def require(condition, label):
 
 cloud = (app / 'SteamCloud.swift').read_text()
 owned = (app / 'SteamOwnedLibrary.swift').read_text()
-entry = cloud[cloud.index('/// One save file, on either side or both.'):cloud.index('/// How one app\'s cloud and local save files compare.')]
+compare = cloud[cloud.index('// MARK: - Where a cloud path lives in the Wine prefix'):cloud.index('// MARK: - Download')]
 plan = cloud[cloud.index('// MARK: - What to do with a comparison'):cloud.index('// MARK: - Upload')]
 
 # ------------------------------------------------------------------ static
@@ -44,7 +46,13 @@ require('$0.kind == .cloudOnly' in owned[owned.index('func resolveCloud'):owned.
 # ------------------------------------------------------------------ Swift
 main = r'''
 import Foundation
-struct SteamCloudAudit { var entries: [SteamCloudEntry] = [] }
+enum SteamAppInfo {
+    struct SaveFile: Equatable { var root: String; var path: String; var pattern: String; var recursive: Bool; var platforms: [String] }
+    struct RootOverride: Equatable { var root: String; var os: String; var useInstead: String; var addPath: String }
+}
+struct SteamCloudFile { var prefix: String; var name: String; var sha: Data; var timestamp: UInt64; var size: UInt64; var persistState: UInt32
+    var path: String { prefix + name } }
+struct SteamCloudListing { var changeNumber: UInt64 = 0; var files: [SteamCloudFile] = [] }
 
 var failed = 0
 func check(_ ok: Bool, _ label: String) { print((ok ? "PASS: " : "FAIL: ") + label); if !ok { failed += 1 } }
@@ -101,17 +109,43 @@ check(only(plan(e(.cloudOnly, cloud: 1), deleted)) == "nothing", "left missing b
 check(only(plan(e(.cloudOnly, cloud: 2), deleted)) == "download", "  the cloud's copy changed since: downloaded (nothing here to lose)")
 check(only(plan(e(.differ, cloud: 1, local: 9), deleted)) == "ask", "  a new save of that name later: a choice")
 
+// The production comparison over a prefix laid out like a game that keeps its saves in
+// <install>/savedata/<64-bit Steam ID>/ (ufs path "savedata/{64BitSteamID}").
+let steamID: UInt64 = 76561198000000001
+let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("cloud-\(getpid())", isDirectory: true)
+let drive = tmp.appendingPathComponent("drive_c", isDirectory: true)
+let install = drive.appendingPathComponent("steamapps/common/Game", isDirectory: true)
+let saves = install.appendingPathComponent("savedata/\(steamID)", isDirectory: true)
+try! FileManager.default.createDirectory(at: saves, withIntermediateDirectories: true)
+try! FileManager.default.createDirectory(at: drive.appendingPathComponent("users/player/AppData", isDirectory: true), withIntermediateDirectories: true)
+let bytes = Data("progress".utf8)
+try! bytes.write(to: saves.appendingPathComponent("data_0.sav"))
+let paths = SteamCloudPaths(drive: drive, userFolder: drive.appendingPathComponent("users/player", isDirectory: true),
+                            installFolder: install, remoteFolder: tmp.appendingPathComponent("remote", isDirectory: true),
+                            steamID: steamID, overrides: [])
+let ufs = [SteamAppInfo.SaveFile(root: "gameinstall", path: "savedata/{64BitSteamID}", pattern: "*", recursive: false, platforms: [])]
+let name = "%GameInstall%savedata/\(steamID)/data_0.sav"
+let local = SteamCloudAudit.run(listing: SteamCloudListing(), saveFiles: ufs, paths: paths)
+check(local.entries.count == 1 && local.entries[0].kind == .localOnly, "a device-only save in a {64BitSteamID} folder is found")
+check(local.entries.first?.path == name, "  its cloud name has the ID filled in (\(local.entries.first?.path ?? "-"))")
+let listed = SteamCloudFile(prefix: "%GameInstall%savedata/\(steamID)/", name: "data_0.sav",
+                            sha: SteamCloudAudit.sha1(of: saves.appendingPathComponent("data_0.sav"))!,
+                            timestamp: 1, size: UInt64(bytes.count), persistState: 0)
+let both = SteamCloudAudit.run(listing: SteamCloudListing(files: [listed]), saveFiles: ufs, paths: paths)
+check(both.entries.count == 1 && both.entries[0].kind == .same, "  and once the cloud lists it under that name, the two are the same file")
+try? FileManager.default.removeItem(at: tmp)
+
 exit(failed == 0 ? 0 : 1)
 '''
 
 with tempfile.TemporaryDirectory() as tmp:
     src = Path(tmp) / 'main.swift'
-    src.write_text('import Foundation\n' + entry + '\n' + plan + '\n' + main.replace('import Foundation\n', '', 1))
+    src.write_text('import Foundation\nimport CryptoKit\n' + compare + '\n' + plan + '\n' + main.replace('import Foundation\n', '', 1))
     out = Path(tmp) / 'cloud'
     build = subprocess.run([SWIFTC, '-O', str(src), '-o', str(out)], capture_output=True, text=True)
     if build.returncode != 0:
         print(build.stderr[-3000:])
-        require(False, 'the production SteamCloudPlan compiles on the host')
+        require(False, 'the production comparison and SteamCloudPlan compile on the host')
     else:
         run = subprocess.run([str(out)], capture_output=True, text=True)
         print(run.stdout, end='')

@@ -697,7 +697,8 @@ final class SteamOwnedLibrary: ObservableObject {
                     try await session.callServiceMethod(method: .cloudClientBeginFileUpload, body: request.data, timeout: 30))
                 guard !answer.encrypt else { throw SteamFileError.invalid("Steam asked for an encrypted upload, which is not supported.") }
                 var sent = true
-                do { try await SteamCloudTransfer.send(file, blocks: answer.blocks) } catch {
+                var statuses: [Int] = []
+                do { statuses = try await SteamCloudTransfer.send(file, blocks: answer.blocks) } catch {
                     sent = false
                     SteamLog.event("[steam-cloud] app=\(appID) upload part failed reason=\(Self.reason(error))")
                 }
@@ -711,6 +712,7 @@ final class SteamOwnedLibrary: ObservableObject {
                 while let tag = try reply.readTag() {
                     if tag.fieldNumber == 1, tag.wireType == .varint { committed = try reply.readVarint() != 0 } else { try reply.skip(wireType: tag.wireType) }
                 }
+                SteamLog.event("[steam-cloud] app=\(appID) upload file=\(done + 1)/\(wanted.count) bytes=\(file.count) parts=\(answer.blocks.count) http=\(statuses.map(String.init).joined(separator: ",")) committed=\(committed ? 1 : 0)")
                 guard sent, committed else { throw SteamFileError.invalid("Steam did not accept a save file.") }
                 done += 1
                 state.phase = .uploading(done: done, of: wanted.count); cloud[appID] = state

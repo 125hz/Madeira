@@ -278,7 +278,11 @@ struct SteamCloudAudit: Equatable, Sendable {
             // files found there are not offered for upload.
             if paths.overrides.contains(where: { $0.root.caseInsensitiveCompare(save.root) == .orderedSame
                                                  && $0.os.caseInsensitiveCompare("Windows") == .orderedSame }) { continue }
-            let label = "%\(SteamCloudPaths.canonical(root: save.root))%" + (save.path.isEmpty ? "" : save.path + "/")
+            // The cloud name has the account IDs filled in ({64BitSteamID} and
+            // {Steam3AccountID}), as the device folder does: Steam does not commit
+            // an upload named with the placeholder itself.
+            let folderPath = save.path.isEmpty ? "" : (paths.components(save.path)?.joined(separator: "/") ?? save.path) + "/"
+            let label = "%\(SteamCloudPaths.canonical(root: save.root))%" + folderPath
             folders.append((label, folder, save.pattern.isEmpty ? "*" : save.pattern, save.recursive))
         }
         folders.append(("", paths.remoteFolder, "*", true))
@@ -611,8 +615,10 @@ struct SteamCloudUploadBlock: Sendable {
 
 extension SteamCloudTransfer {
     /// Sends the parts of one file where Steam asked for them. k_EHTTPMethodPOST
-    /// is 3; Steam's storage otherwise takes PUT.
-    static func send(_ file: Data, blocks: [SteamCloudUploadBlock]) async throws {
+    /// is 3; Steam's storage otherwise takes PUT. Returns each part's HTTP status.
+    @discardableResult
+    static func send(_ file: Data, blocks: [SteamCloudUploadBlock]) async throws -> [Int] {
+        var statuses: [Int] = []
         for block in blocks {
             guard let url = block.url else { throw SteamFileError.invalid("Steam gave no usable address for an upload.") }
             var body = block.explicitBody
@@ -627,8 +633,10 @@ extension SteamCloudTransfer {
             for header in block.headers { request.setValue(header.value, forHTTPHeaderField: header.name) }
             let (_, response) = try await uploadSession.upload(for: request, from: body)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            statuses.append(status)
             guard (200..<300).contains(status) else { throw SteamFileError.invalid("Steam Cloud upload failed (HTTP \(status)).") }
         }
+        return statuses
     }
 
     private static let uploadSession: URLSession = {
