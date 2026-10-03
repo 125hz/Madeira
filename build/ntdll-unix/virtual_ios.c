@@ -11187,10 +11187,11 @@ volatile int ios_in_mach_exc;
  * host meaning, while VPROT_WRITE is load-bearing -- it is what makes an inline
  * hook, a runtime relocation fixup, or the emulator's own SMC untrap land.
  *
- * Deliberately NOT "anything in the window": a guest that allocates anonymous
- * RWX memory (a managed runtime's code buffers) still needs the pool alias and
- * the store emulator, and those views are not SEC_IMAGE.  The test is the view,
- * not the address range.
+ * Deliberately NOT "anything in the window": a guest's anonymous executable
+ * memory is decided by its own rule (ios_guest_anon_rwx_is_host_data, below):
+ * a managed runtime's code buffers keep the pool alias and the store emulator,
+ * and those views are not SEC_IMAGE.  The test is the view, not the address
+ * range.
  *
  * virtual_mutex is held by every caller that can reach here (mprotect_range from
  * set_vprot, and the map_image section loop), so find_view() is safe. */
@@ -11237,10 +11238,14 @@ static int ios_guest_image_is_host_data( const void *base, size_t size )
  * 64 KB (possible native thunk pages).
  *
  * Guest JIT code chunks are excluded too: guests patch them with unaligned
- * atomics, which must not land on a plain page FEX has armed for SMC. Code and
- * data are told apart by size, a heuristic: Boehm's heap chunks are an
- * expansion plus one 4 KB page (0x41000, ...), never a multiple of 64 KB, while
- * Mono's code chunks are (0x100000). A data heap sized in 64 KB multiples just
+ * atomics, which must not land on a plain page FEX has armed for SMC. Two tests
+ * keep them out. Only a view ALLOCATED read-write-execute qualifies (its
+ * allocation protection, view->protect, has both VPROT_WRITE and VPROT_EXEC),
+ * as a GC heap is: a JIT that allocates read-write and makes its code
+ * executable later keeps the pool path. And code and data are told apart by
+ * size, a heuristic: Boehm's heap chunks are an expansion plus one 4 KB page
+ * (0x41000, ...), never a multiple of 64 KB, while Mono's code chunks, also
+ * allocated RWX, are (0x100000). A data heap sized in 64 KB multiples just
  * keeps the pool path.
  *
  * The decision is per allocation and permanent. A page must not move to the
@@ -11268,6 +11273,8 @@ static int ios_guest_anon_rwx_view_ok( const struct file_view *view )
 {
     if (!is_view_valloc( view )) return 0;
     if (view->protect & (SEC_IMAGE | VPROT_ARM64EC | VPROT_SYSTEM)) return 0;
+    /* allocated RWX, not made executable after the fact: see above */
+    if ((view->protect & (VPROT_WRITE | VPROT_EXEC)) != (VPROT_WRITE | VPROT_EXEC)) return 0;
     if (view->size < 0x10000) return 0;
     return (view->size & 0xffff) != 0;   /* data, not a code chunk: see above */
 }
