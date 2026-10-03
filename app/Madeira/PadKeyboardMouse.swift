@@ -37,6 +37,10 @@ struct PadBindings: Equatable {
     var leftStick: ControlAction
     /// The right stick moves the mouse (default) or drives a key stick.
     var rightStick: ControlAction
+    /// Vertical speed of the right-stick mouse relative to its horizontal speed
+    /// (1 = the same). Games scale pitch and yaw differently from a mouse, and a
+    /// stick cannot be compensated by hand the way a wrist does.
+    var mouseVertical: Double = 1.0
 
     /// The built-in template: the keyboard-and-mouse layout most PC games use.
     static let template = PadBindings(
@@ -61,8 +65,9 @@ struct PadBindings: Equatable {
     /// input; a key stick bound to RS takes the right stick away from the mouse.
     /// In the table, `.none` on a button means "does nothing", on RS "the mouse",
     /// on LS "unused".
-    static func build(controls: [TouchControl], binds: [String: ControlAction]? = nil) -> PadBindings {
+    static func build(controls: [TouchControl], binds: [String: ControlAction]? = nil, mouseVertical: Double? = nil) -> PadBindings {
         var b = template
+        if let v = mouseVertical, v.isFinite { b.mouseVertical = min(max(v, 0.25), 2.0) }
         for c in controls {
             guard let name = c.padBinding else { continue }
             if c.action.stickKeys != nil {
@@ -148,7 +153,7 @@ final class PadKeyboardMouse {
         } else if focused {
             let f = StickVelocity.frame(x: r.x, y: r.y, gain: InputSettings.shared.sensRel, dt: dt)
             if f.dx != 0 || f.dy != 0 {
-                let d = carry.add(f.dx, f.dy, gain: 1)
+                let d = carry.add(f.dx, f.dy * bindings.mouseVertical, gain: 1)
                 if d.dx != 0 || d.dy != 0 {
                     if !mouseMoving {
                         mouseMoving = true

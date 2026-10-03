@@ -207,6 +207,9 @@ struct LibraryEntry: Codable, Identifiable {
     /// .none), on top of the layout's bindings and the built-in template. Only
     /// inputs the player changed are stored. Optional, so older files decode.
     var controllerBinds: [String: ControlAction]?
+    /// Keyboard-and-mouse mode: vertical speed of the right-stick mouse relative
+    /// to horizontal (PadBindings.mouseVertical); nil = 1.
+    var padMouseVertical: Double?
     /// Processors reported to Windows code in this game's sessions
     /// (MADEIRA_CPU_COUNT, ntdll); nil = automatic.
     var cpuCount: Int?
@@ -373,6 +376,10 @@ final class LibraryModel: ObservableObject {
     /// the driver's bindings at once, so the binds page is live.
     @Published var controllerBinds: [String: ControlAction] = [:] {
         didSet { if oldValue != controllerBinds { applyControllerMode() } }
+    }
+    /// The session's right-stick mouse vertical speed (LibraryEntry.padMouseVertical).
+    @Published var padMouseVertical: Double = 1 {
+        didSet { if oldValue != padMouseVertical { applyControllerMode() } }
     }
     /// The session's touch-control opacity (the entry's Control opacity).
     @Published var opacity = 0.7
@@ -714,6 +721,7 @@ final class LibraryModel: ObservableObject {
         controls.visible = entry.touchControls
         controls.sizeScale = min(max(entry.controlSize ?? 1, 0.5), 2)
         controllerBinds = GamepadInput.keyboardMouseAvailable ? (entry.controllerBinds ?? [:]) : [:]
+        padMouseVertical = GamepadInput.keyboardMouseAvailable ? (entry.padMouseVertical ?? 1) : 1
         controllerMode = GamepadInput.keyboardMouseAvailable ? entry.controllerMode : nil
         applyControllerMode()
         MetalHostView.shared.isHidden = false
@@ -784,11 +792,11 @@ final class LibraryModel: ObservableObject {
     func applyControllerMode() {
         guard GamepadInput.keyboardMouseAvailable else { return }
         if current != nil, controllerMode == "keys" {
-            GamepadInput.shared.setKeyboardMouse(PadBindings.build(controls: TouchControlsModel.shared.controls, binds: controllerBinds))
+            GamepadInput.shared.setKeyboardMouse(PadBindings.build(controls: TouchControlsModel.shared.controls, binds: controllerBinds, mouseVertical: padMouseVertical))
             if controlsSink == nil {
                 controlsSink = TouchControlsModel.shared.$controls.sink { [weak self] controls in
                     guard let self, self.controllerMode == "keys", self.current != nil else { return }
-                    GamepadInput.shared.setKeyboardMouse(PadBindings.build(controls: controls, binds: self.controllerBinds))
+                    GamepadInput.shared.setKeyboardMouse(PadBindings.build(controls: controls, binds: self.controllerBinds, mouseVertical: self.padMouseVertical))
                 }
             }
         } else {
@@ -834,6 +842,7 @@ final class LibraryModel: ObservableObject {
             entry.controlOpacity = opacity; entry.controlSize = controls.sizeScale
             if GamepadInput.keyboardMouseAvailable { entry.controllerMode = controllerMode }
             if GamepadInput.keyboardMouseAvailable { entry.controllerBinds = controllerBinds.isEmpty ? nil : controllerBinds }
+            if GamepadInput.keyboardMouseAvailable { entry.padMouseVertical = padMouseVertical == 1 ? nil : padMouseVertical }
             // The in-game Aspect & scaling choice sticks to the game. MADEIRA_SESSION_TOOLS=0
             // hides that picker and leaves the stored choice alone.
             if MadeiraConfig.flag("MADEIRA_SESSION_TOOLS") { entry.display = displayMode.rawValue }
@@ -846,6 +855,7 @@ final class LibraryModel: ObservableObject {
         saveCurrentProfile()
         controllerMode = nil
         controllerBinds = [:]
+        padMouseVertical = 1
         let controls = TouchControlsModel.shared
         controls.editing = false; controls.selected = nil
         controls.controls = savedControls; controls.visible = savedVisible; controls.sizeScale = savedSize
@@ -2391,8 +2401,12 @@ struct LibraryDetail: View {
                         ControllerModeChoice(mode: $entry.controllerMode)
                         if entry.controllerMode == "keys" {
                             NavigationLink("Controller binds") {
-                                Form { ControllerBindsPage(binds: $entry.controllerBinds) }
+                                Form { ControllerBindsPage(binds: $entry.controllerBinds, mouseVertical: $entry.padMouseVertical) }
                                     .navigationTitle("Controller binds")
+                                    .toolbar {
+                                        Button("Reset") { entry.controllerBinds = nil; entry.padMouseVertical = nil }
+                                            .disabled(entry.controllerBinds == nil && entry.padMouseVertical == nil)
+                                    }
                             }
                         }
                     }
@@ -2505,6 +2519,8 @@ struct SteamSearchView: View {
 /// has not changed show the layout's or the template's action and are not stored.
 struct ControllerBindsPage: View {
     @Binding var binds: [String: ControlAction]?
+    /// Vertical speed of the right-stick mouse, 1 = as horizontal; nil = 1.
+    @Binding var mouseVertical: Double?
     /// The active layout's own bindings, so an unchanged row shows what really
     /// happens in this session; Game details passes none.
     var controls: [TouchControl] = []
@@ -2523,17 +2539,38 @@ struct ControllerBindsPage: View {
                 ForEach(group.1, id: \.self) { name in row(name) }
             }
         }
+        if effective("RS").stickKeys == nil {
+            Section("Right stick as mouse") {
+                LabeledContent("Vertical speed") {
+                    HStack {
+                        Slider(value: Binding(get: { mouseVertical ?? 1 }, set: { mouseVertical = abs($0 - 1) < 0.01 ? nil : $0 }), in: 0.25...1.5, step: 0.05)
+                        Text("\(Int(((mouseVertical ?? 1) * 100).rounded()))%").font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(width: 44, alignment: .trailing)
+                    }
+                }
+                Text("Relative to horizontal. Games scale the camera's pitch and yaw differently from a mouse; lower this if the view climbs faster than it turns.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
         Section {
-            Button("Reset all to defaults", role: .destructive) { binds = nil }
-                .disabled((binds ?? [:]).isEmpty)
+            Button("Reset all to defaults", role: .destructive) { reset() }
+                .disabled(!changed)
             Text("Defaults: left stick WASD, right stick mouse, RT and LT click, D-pad arrows, A Space, B Ctrl, X E, Y R, LB Q, RB F, L3 Shift, R3 C, Start Esc, Select Tab. A touch control's own controller binding (control editor) applies when a row is at its default.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
 
-    private func row(_ name: String) -> some View {
+    /// Anything to reset: a bound row or a vertical speed other than 1.
+    var changed: Bool { !(binds ?? [:]).isEmpty || mouseVertical != nil }
+    func reset() { binds = nil; mouseVertical = nil }
+
+    /// What the input does in this session: the table's entry, else the layout's, else the template's.
+    private func effective(_ name: String) -> ControlAction {
         let fromLayout = PadBindings.build(controls: controls)
-        let effective: ControlAction = binds?[name] ?? (name == "LS" ? fromLayout.leftStick : name == "RS" ? fromLayout.rightStick : fromLayout.buttons[name] ?? .none)
+        return binds?[name] ?? (name == "LS" ? fromLayout.leftStick : name == "RS" ? fromLayout.rightStick : fromLayout.buttons[name] ?? .none)
+    }
+
+    private func row(_ name: String) -> some View {
+        let effective = effective(name)
         let changed = binds?[name] != nil
         return LabeledContent(PadBindings.displayName(name)) {
             Menu {
@@ -3117,11 +3154,15 @@ struct LibraryHUD: View {
                 Spacer()
                 Text("Controller binds").font(.headline)
                 Spacer()
+                Button("Reset") { model.controllerBinds = [:]; model.padMouseVertical = 1; model.saveCurrentProfile() }
+                    .buttonStyle(.borderless).disabled(model.controllerBinds.isEmpty && model.padMouseVertical == 1)
                 Button("Done") { model.menu = false }.buttonStyle(.bordered)
             }.padding(.horizontal, 22).padding(.top, 22).padding(.bottom, 8)
             Form {
                 ControllerBindsPage(binds: Binding(get: { model.controllerBinds.isEmpty ? nil : model.controllerBinds },
                                                    set: { model.controllerBinds = $0 ?? [:]; model.saveCurrentProfile() }),
+                                    mouseVertical: Binding(get: { model.padMouseVertical == 1 ? nil : model.padMouseVertical },
+                                                           set: { model.padMouseVertical = $0 ?? 1; model.saveCurrentProfile() }),
                                     controls: controls.controls)
             }.scrollContentBackground(.hidden)
         }

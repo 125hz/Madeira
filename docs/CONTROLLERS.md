@@ -140,8 +140,17 @@ Game details) lists every input with a menu of what it does: a mouse button, a
 key, Show keyboard or Nothing; the sticks choose between WASD, the arrow keys
 and (right stick) the mouse. Rows the player has not changed show the layout's
 or the template's action and are not stored; "Default" in a row's menu and
-"Reset all to defaults" clear them. The table is saved with the game
+the page's Reset clear them. The table is saved with the game
 (`LibraryEntry.controllerBinds`) and the driver takes each change at once.
+While the right stick is the mouse, the page also has its **Vertical speed**
+(`LibraryEntry.padMouseVertical`, 25–150 % of the horizontal speed): games
+scale the camera's pitch and yaw differently from a mouse, and a stick cannot
+be compensated by hand the way a wrist does.
+
+The Controller picker's third choice, **XInput and DirectInput**, is for games
+older than XInput: it exports `MADEIRA_DINPUT_PAD=1` for that launch only (the
+DirectInput device below), since a game reading both APIs may list two
+controllers.
 
 A layout can also bind an input: in the control editor, a touch control with
 a key or mouse action has a **Controller button for this action** row, and a
