@@ -51,9 +51,18 @@ require('JITNetworkShortcut.shared.restoreIfNeeded' in enable,
         'a JIT attempt that fails after the shortcut ran puts back what it changed')
 start = net[net.index('    func start(completion:'):net.index('    /// From the launch thread')]
 require('let cellular = cellularOnly' in start
-        and start.index('pending = cellular ? "done cellular" : "done"') < start.index('run(cellular ? "start cellular" : "start"')
+        and start.index('pending = base') < start.index('run(cellular ? "start cellular" : "start")')
         and 'guard let input = pending else { completion(); return }' in start and 'run(input)' in start,
         '"start" asks for the cellular step only without Wi-Fi, and records the "done" it owes before it runs')
+require('self?.pending = vpn.isEmpty ? base + " vpn-off" : base + " vpn-restore\\n" + vpn' in start
+        and 'if case .done(let output) = outcome, !localDevVPNWasUp' in start,
+        '"done" disconnects LocalDevVPN when no VPN was on, reconnects the VPN "start" reported, '
+        'and leaves VPNs alone when LocalDevVPN was already on or "start" did not report')
+require('Save File' not in net and 'Get File' not in net,
+        'the shortcut needs no file (no iCloud Drive or folder to set up)')
+require('returned output=\\(result.isEmpty ? "none" : "a VPN name")' in net
+        and 'run input=\\(shown)' in net,
+        "the log never shows the VPN's name")
 require('UserDefaults.standard.string(forKey: Self.pendingKey)' in net
         and 'JITNetworkShortcut.shared.restoreLeftover()' in main_app,
         'the owed "done" is kept on disk and run at the next launch if a run ended between them')

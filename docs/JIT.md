@@ -139,19 +139,22 @@ shortcut** is on (`env.MADEIRA_JIT_SHORTCUT = 1`), Madeira runs your
 **Madeira JIT** shortcut:
 
 - **"start"** (with "cellular" when Madeira sees cellular data and no Wi-Fi):
-  save the name of the VPN that is connected now, if any, to a file (iOS
-  connects one VPN at a time, so LocalDevVPN replaces it); turn Cellular Data
-  off, only when asked; and connect LocalDevVPN. LocalDevVPN's Connect returns
-  before its tunnel routes (about 5 s on an iPhone 18 Pro), so Madeira checks
-  the loopback again for up to 15 s, going on the moment it works, and enables
-  JIT.
-- **"done"** (with "cellular" when "start" had it): turn Cellular Data back on,
-  and put the VPN back from the file: none (disconnect LocalDevVPN), LocalDevVPN
-  (leave it connected), or another VPN (connect it, which replaces LocalDevVPN).
-  Madeira runs it once a game's JIT pool is mapped and the debugger has
-  detached, before Wine starts, or at once if enabling JIT fails. The "done" it
-  owes is kept on disk, so if Madeira is closed or crashes in between, the next
-  launch runs it.
+  turn Cellular Data off, only when asked; connect LocalDevVPN; and output the
+  name of the VPN that was connected before, if any (iOS connects one VPN at a
+  time, so LocalDevVPN replaces it). LocalDevVPN's Connect can return before
+  its tunnel routes, so Madeira checks the loopback again for up to 15 s, going
+  on the moment it works, and enables JIT.
+- **"done"**: with "cellular", turn Cellular Data back on; with "vpn-off" (no
+  VPN was on), disconnect LocalDevVPN; with "vpn-restore" and the name on its
+  last line, connect that VPN again (it replaces LocalDevVPN). Neither VPN word
+  when LocalDevVPN was already connected. Madeira runs it once a game's JIT pool
+  is mapped and the debugger has detached, before Wine starts, or at once if
+  enabling JIT fails.
+
+Madeira keeps the VPN's name with the "done" it owes, on disk, so if Madeira is
+closed or crashes in between, the next launch runs it. The shortcut needs no
+file: a file needs a folder that exists, and the Shortcuts folder is in iCloud
+Drive. The log never shows the VPN's name.
 
 With the shortcut on, Madeira never opens LocalDevVPN's own link: when JIT still
 cannot connect, the alert offers **Connect with Madeira JIT**, which enables JIT
@@ -171,20 +174,17 @@ Name it exactly **Madeira JIT** and add:
    its own is untyped, so **If** offers only "has any value"; its text offers
    "contains".)
 2. **If** *Text* contains `start`
-   1. **Get Current VPN**.
-   2. **If** *Current VPN* has any value: **Save File** *Current VPN*;
-      **Otherwise**: **Save File** a **Text** `none`. Both to the Shortcuts
-      folder as `Madeira JIT VPN.txt`, with *Ask Where to Save* off and
-      *Overwrite If File Exists* on. End If.
-   3. **If** *Text* contains `cellular`: **Set Cellular Data** *Off*. End If.
-   4. LocalDevVPN's **Connect** action (or **Set VPN** → *Connect* → LocalDevVPN).
+   1. **Get Current VPN** (before LocalDevVPN replaces it).
+   2. **If** *Text* contains `cellular`: **Set Cellular Data** *Off*. End If.
+   3. LocalDevVPN's **Connect** action (or **Set VPN** → *Connect* → LocalDevVPN).
+   4. **Stop and Output** *Current VPN*.
 3. **Otherwise**
    1. **If** *Text* contains `cellular`: **Set Cellular Data** *On*. End If.
-   2. **Get File** `Madeira JIT VPN.txt` from the Shortcuts folder (*Error If Not
-      Found* off), then **Get Text from Input** of it.
-   3. **If** that text is `none`: LocalDevVPN's **Disconnect** action.
-      **Otherwise**: **If** it is not `LocalDevVPN` (the name **Get Current VPN**
-      gives LocalDevVPN): **Set VPN** → *Connect* → that text. End If. End If.
+   2. **If** *Text* contains `vpn-off`: LocalDevVPN's **Disconnect** action (or
+      **Set VPN** → *Disconnect*). End If.
+   3. **If** *Text* contains `vpn-restore`: **Split Text** *Text* by *New Lines*,
+      **Get Item from List** (*Last Item*), then **Set VPN** → *Connect* → that
+      item. End If.
 4. End If.
 
 Then turn on **Settings → JIT → Madeira JIT shortcut**. Without the shortcut,
