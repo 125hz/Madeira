@@ -34,14 +34,17 @@ enum OnboardingRules {
     static var enabled: Bool { MadeiraConfig.flag("MADEIRA_ONBOARDING") }
 
     enum Step: String, CaseIterable {
-        case welcome, jit, signIn = "sign-in", dockClient = "dock-client", done
+        case welcome, localDevVPN = "localdevvpn", jit, signIn = "sign-in", dockClient = "dock-client", done
     }
 
-    /// JIT is always offered. Sign-in is offered when Steam sign-in is enabled,
-    /// or when Madeira Dock is available (Dock needs a sign-in). Valve's client
-    /// components are offered only when Dock is available.
-    static func steps(signIn: Bool, dock: Bool) -> [Step] {
-        var list: [Step] = [.welcome, .jit]
+    /// LocalDevVPN comes first when it is not installed (`localDevVPN`): every JIT way
+    /// reaches this device through it. JIT is always offered. Sign-in is offered when
+    /// Steam sign-in is enabled, or when Madeira Dock is available (Dock needs a
+    /// sign-in). Valve's client components are offered only when Dock is available.
+    static func steps(signIn: Bool, dock: Bool, localDevVPN: Bool = false) -> [Step] {
+        var list: [Step] = [.welcome]
+        if localDevVPN { list.append(.localDevVPN) }
+        list.append(.jit)
         if signIn || dock { list.append(.signIn) }
         if dock { list.append(.dockClient) }
         return list + [.done]
@@ -85,7 +88,12 @@ enum OnboardingRules {
     static var enabled: Bool { OnboardingRules.enabled }
     static var done: Bool { UserDefaults.standard.bool(forKey: OnboardingRules.doneKey) }
 
-    var steps: [Step] { OnboardingRules.steps(signIn: SteamSignIn.isEnabled, dock: MadeiraDock.enabled) }
+    /// LocalDevVPN was missing when setup opened, so its page is offered. Fixed for that
+    /// run of setup: installing it on the way does not renumber the steps.
+    private var offerLocalDevVPN = false
+    var steps: [Step] {
+        OnboardingRules.steps(signIn: SteamSignIn.isEnabled, dock: MadeiraDock.enabled, localDevVPN: offerLocalDevVPN)
+    }
     /// Setup can be opened: enabled, and something to set up.
     var available: Bool { Self.enabled && OnboardingRules.hasSetup(steps) }
 
@@ -105,6 +113,7 @@ enum OnboardingRules {
     private func open(reason: String) {
         // Never over a running session.
         guard available, LibraryModel.shared.current == nil, wine_process_is_running() == 0 else { return }
+        offerLocalDevVPN = !LocalDevVPN.isInstalled
         LogStore.shared.log("[onboarding] shown reason=\(reason) steps=\(steps.map(\.rawValue).joined(separator: ","))")
         go(.welcome)
         presented = true
@@ -152,6 +161,9 @@ struct OnboardingView: View {
     @State private var importingPairingFile = false
     @State private var pairingImportError: String?
     @State private var jitPath: JITSetupPath?
+    /// Asked again whenever Madeira comes back to the front (from the App Store, say).
+    @State private var localDevVPNInstalled = LocalDevVPN.isInstalled
+    @Environment(\.scenePhase) private var scenePhase
 
     enum JITSetupPath: String {
         case onDevice = "on-device", pairingFile = "pairing-file", stikDebug = "stikdebug"
@@ -171,6 +183,7 @@ struct OnboardingView: View {
                     }
                     switch model.step {
                     case .welcome: welcome
+                    case .localDevVPN: localDevVPNPage
                     case .jit: jitPage
                     case .signIn: signInPage
                     case .dockClient: dockClientPage
@@ -204,6 +217,10 @@ struct OnboardingView: View {
             jit.refreshPairingStatus()
             signIn.refresh()
             dock.refresh()
+            localDevVPNInstalled = LocalDevVPN.isInstalled
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { localDevVPNInstalled = LocalDevVPN.isInstalled }
         }
     }
 
@@ -252,13 +269,36 @@ struct OnboardingView: View {
                 .font(.title3)
             Text("A few optional steps get you ready:").foregroundStyle(.secondary)
             let pages = model.steps
-            point(1, "Choose how Madeira enables JIT.")
-            if pages.contains(.signIn) { point(2, "Sign in to Steam in Madeira.") }
-            if pages.contains(.dockClient) {
-                point(3, "Download Valve's Steam client components for Madeira Dock.")
-            }
+            let offered: [LocalizedStringKey] =
+                (pages.contains(.localDevVPN) ? ["Install LocalDevVPN, which Madeira enables JIT through."] : [])
+                + ["Choose how Madeira enables JIT."]
+                + (pages.contains(.signIn) ? ["Sign in to Steam in Madeira."] : [])
+                + (pages.contains(.dockClient) ? ["Download Valve's Steam client components for Madeira Dock."] : [])
+            ForEach(offered.indices, id: \.self) { index in point(index + 1, offered[index]) }
             primary("Get started", symbol: "arrow.right") { model.next() }.padding(.top, 8)
             secondary("Skip setup") { model.skip() }
+        }
+    }
+
+    /// LocalDevVPN first, offered only when it was missing: every JIT way reaches this
+    /// device through it. LocalDevVPN.isInstalled asks iOS whether an app handles
+    /// localdevvpn:// (canOpenURL; the scheme is declared in Info.plist), so nothing opens.
+    private var localDevVPNPage: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            header("Install LocalDevVPN", symbol: "network")
+            Text("Madeira enables JIT through LocalDevVPN, a free app that gives Madeira a network path to this \(device). Install it from the App Store, then come back.")
+                .fixedSize(horizontal: false, vertical: true)
+            if localDevVPNInstalled {
+                Label("LocalDevVPN is installed", systemImage: "checkmark.circle.fill")
+                    .font(.headline).foregroundStyle(.green)
+                primary("Continue", symbol: "arrow.right") { model.next() }
+            } else {
+                primary("Get LocalDevVPN", symbol: "arrow.down.app") {
+                    LogStore.shared.log("[onboarding] LocalDevVPN app-store")
+                    UIApplication.shared.open(LocalDevVPN.appStore)
+                }
+                secondary("I'll do this later") { model.next() }
+            }
         }
     }
 

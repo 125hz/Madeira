@@ -76,8 +76,10 @@ require('guard !considered' in present and 'OnboardingRules.shouldShow(done: Sel
 opener = block(model, 'private func open(reason: String)')
 require('LibraryModel.shared.current == nil' in opener and 'wine_process_is_running() == 0' in opener and 'guard available' in opener,
         'setup never opens over a running session, or with nothing to set up')
-require('OnboardingRules.steps(signIn: SteamSignIn.isEnabled, dock: MadeiraDock.enabled)' in model,
-        'the pages follow the sign-in and Dock switches')
+require('OnboardingRules.steps(signIn: SteamSignIn.isEnabled, dock: MadeiraDock.enabled, localDevVPN: offerLocalDevVPN)' in model,
+        'the pages follow the sign-in and Dock switches, and whether LocalDevVPN is installed')
+require(opener.index('offerLocalDevVPN = !LocalDevVPN.isInstalled') < opener.index('[onboarding] shown'),
+        "LocalDevVPN's page is decided once, when setup opens, so installing it on the way does not renumber the steps")
 require(model.count('UserDefaults.standard.set(true, forKey: OnboardingRules.doneKey)') == 2
         and 'UserDefaults.standard.set(true, forKey: OnboardingRules.doneKey)' in block(model, 'func finish()')
         and 'UserDefaults.standard.set(true, forKey: OnboardingRules.doneKey)' in block(model, 'func skip()')
@@ -121,6 +123,13 @@ require('pairing.cancel()' in block(view, 'private func leaveGuide'), 'JIT: leav
 require("secondary(\"I'll do this later\") { model.next() }" in choices, 'JIT: visible defer choice')
 require('jit.importPairingFile(url)' in view and 'jit.method = .builtIn' in view,
         'JIT: validated import selects Built-in StikJIT through the coordinator')
+ldv_page = block(view, 'private var localDevVPNPage')
+require('UIApplication.shared.open(LocalDevVPN.appStore)' in ldv_page and "secondary(\"I'll do this later\") { model.next() }" in ldv_page
+        and 'if localDevVPNInstalled' in ldv_page and 'case .localDevVPN: localDevVPNPage' in view,
+        "LocalDevVPN's page sends a missing LocalDevVPN to the App Store, and can be skipped")
+require('if phase == .active { localDevVPNInstalled = LocalDevVPN.isInstalled }' in view
+        and 'UIApplication.shared.canOpenURL(URL(string: "localdevvpn://")!)' in (app / 'JITSetup.swift').read_text(),
+        'LocalDevVPN is checked with canOpenURL (nothing opens), again whenever Madeira comes back to the front')
 require('onTapGesture' not in onboarding, 'no hidden gestures')
 require('dock.prepareClient()' in block(view, 'private var dockClientPage'), "components through Dock's verified download")
 
@@ -195,6 +204,11 @@ import Foundation
         expect(R.steps(signIn: true, dock: false) == [.welcome, .jit, .signIn, .done],
                "without Dock: JIT and sign-in, no components page")
         expect(R.steps(signIn: false, dock: true) == full, "Dock keeps the sign-in page after JIT (it needs a sign-in)")
+        expect(R.steps(signIn: true, dock: true, localDevVPN: true) == [.welcome, .localDevVPN, .jit, .signIn, .dockClient, .done]
+               && R.steps(signIn: false, dock: false, localDevVPN: true) == [.welcome, .localDevVPN, .jit, .done],
+               "LocalDevVPN missing: its page comes first, before JIT")
+        expect(R.position(of: .localDevVPN, in: [.welcome, .localDevVPN, .jit, .done])! == (1, 2)
+               && R.Step.localDevVPN.rawValue == "localdevvpn", "LocalDevVPN's page counts as step 1")
         expect(R.steps(signIn: false, dock: false) == [.welcome, .jit, .done],
                "JIT remains when Steam setup is unavailable")
         expect(R.hasSetup(full) && R.hasSetup([.welcome, .jit, .done])
