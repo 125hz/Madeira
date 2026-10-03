@@ -220,7 +220,43 @@ final class JITCoordinator: ObservableObject {
         error = nil
         status = nil
         connectionProblem = nil
+        ensureLoopback { [weak self] restoreOnFailure in
+            self?.enableResolved { result in
+                // Nothing will hold the network open now: put back what the shortcut changed.
+                if restoreOnFailure, case .failure = result {
+                    JITNetworkShortcut.shared.restoreIfNeeded {}
+                }
+                completion(result)
+            }
+        }
+    }
 
+    /// LocalDevVPN's loopback first (milliseconds when it already works). When it does
+    /// not answer and the Madeira JIT shortcut is on, the shortcut turns Cellular Data
+    /// off without Wi-Fi and connects LocalDevVPN, and the loopback is checked again
+    /// while the VPN settles. Either way JIT is then attempted, so a failure still gets
+    /// the usual explanation. `proceed`'s argument: the shortcut ran.
+    private func ensureLoopback(then proceed: @escaping (Bool) -> Void) {
+        let vpnWasUp = LoopbackProbe.vpnInterfaceUp
+        LoopbackProbe.check { [weak self] probe in
+            LogStore.shared.log(String(format: "[jit-loopback] %@ in %.0f ms (vpn-interface=%d, %@)",
+                                       probe.reachable ? "reachable" : "unreachable", probe.milliseconds,
+                                       vpnWasUp ? 1 : 0, probe.detail))
+            guard let self, !probe.reachable, JITNetworkShortcut.shared.enabled else { proceed(false); return }
+            status = "Running the \(JITNetworkShortcut.name) shortcut…"
+            JITNetworkShortcut.shared.start(vpnWasUp: vpnWasUp) { [weak self] outcome in
+                if case .failed = outcome { proceed(true); return }
+                self?.status = "Waiting for LocalDevVPN…"
+                LoopbackProbe.waitUntilReachable(within: 5) { probe in
+                    LogStore.shared.log(String(format: "[jit-loopback] after the shortcut: %@ in %.0f ms (%@)",
+                                               probe.reachable ? "reachable" : "unreachable", probe.milliseconds, probe.detail))
+                    proceed(true)
+                }
+            }
+        }
+    }
+
+    private func enableResolved(_ completion: @escaping (Result<Void, Error>) -> Void) {
         switch resolvedMethod {
         case .automatic:
             assertionFailure("Automatic must resolve to a concrete JIT method")
@@ -438,6 +474,7 @@ enum LocalDevVPN {
 struct JITSettingsSection: View {
     @ObservedObject private var coordinator = JITCoordinator.shared
     @ObservedObject private var onboarding = OnboardingModel.shared
+    @ObservedObject private var shortcut = JITNetworkShortcut.shared
 
     var body: some View {
         Section {
@@ -462,8 +499,11 @@ struct JITSettingsSection: View {
                 Text(coordinator.automaticDescription)
                     .font(.caption).foregroundStyle(.secondary)
             }
+            Toggle("\(JITNetworkShortcut.name) shortcut", isOn: $shortcut.enabled)
         } header: {
             Text("JIT")
+        } footer: {
+            Text("When LocalDevVPN can't reach this device, Enable JIT runs your \(JITNetworkShortcut.name) shortcut: it turns Cellular Data off when there's no Wi-Fi and connects LocalDevVPN, then puts both back once the game has started. Each run opens Shortcuts for a moment.")
         }
     }
 }

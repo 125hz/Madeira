@@ -60,10 +60,12 @@ resolved = function(setup, "var resolvedMethod: JITMethod")
 require("StikJITHelper.isAvailable ? .stikDebug : .builtIn" in resolved,
         "Automatic prefers installed StikDebug, then Built-in StikJIT")
 coordinator_enable = function(setup, "func enable(completion:")
-require("switch resolvedMethod" in coordinator_enable
-        and "enableBuiltIn(completion: completion)" in coordinator_enable
-        and coordinator_enable.count("StikJITHelper.enableJIT") == 1,
-        "the coordinator routes each selected JIT method once")
+coordinator_route = function(setup, "private func enableResolved(")
+require("ensureLoopback" in coordinator_enable and "self?.enableResolved" in coordinator_enable
+        and "switch resolvedMethod" in coordinator_route
+        and "enableBuiltIn(completion: completion)" in coordinator_route
+        and setup.count("StikJITHelper.enableJIT") == 1,
+        "the coordinator routes each selected JIT method once, after the loopback check")
 require("JITSetupView()" in content and "JITSettingsSection()" in library,
         "JIT setup is reachable from the main flow and Settings")
 require('dictionary["public_key"]' in setup

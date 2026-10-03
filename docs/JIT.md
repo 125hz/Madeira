@@ -109,6 +109,55 @@ device can't be reached, it offers **Connect LocalDevVPN**, or **Get
 LocalDevVPN** when the app isn't installed; LocalDevVPN returns to Madeira
 through its `madeira://` URL scheme once connected.
 
+## LocalDevVPN, cellular data and the Madeira JIT shortcut
+
+Both methods reach this iPhone's `lockdownd` through LocalDevVPN's loopback
+(`10.7.0.1:62078`). The loopback works on Wi-Fi, or with no network at all,
+but not while cellular data is in use.
+
+**Enable JIT** first checks the loopback directly
+(`app/Madeira/JITNetwork.swift`): it sends `lockdownd`'s `QueryType` request
+and waits at most 0.4 s for its reply. Through a working loopback that takes a
+few milliseconds, and JIT is enabled with nothing else opening. A proxy or
+another VPN that accepts the connection does not count; only `lockdownd`'s own
+reply does.
+
+When the loopback does not answer and **Settings → JIT → Madeira JIT
+shortcut** is on (`env.MADEIRA_JIT_SHORTCUT = 1`), Madeira runs your
+**Madeira JIT** shortcut:
+
+- **"start"** (with "cellular" when Madeira sees cellular data and no Wi-Fi):
+  turn Cellular Data off, only when asked, and connect LocalDevVPN. Madeira then
+  checks the loopback again for up to 5 s while the VPN settles, and enables JIT.
+- **"done"** (with "cellular" and/or "vpn"): turn Cellular Data back on and/or
+  disconnect LocalDevVPN. Madeira runs it once a game's JIT pool is mapped and
+  the debugger has detached, before Wine starts, and asks only to undo what
+  "start" changed: a VPN that was already connected stays connected. If enabling
+  JIT fails, "done" runs at once.
+
+An app can only run a shortcut by opening the Shortcuts app, so each run leaves
+Madeira for a moment and returns through `madeira://jit-network/…`
+(x-callback-url). Between **Enable JIT** and the game starting, cellular data
+stays off.
+
+### Making the shortcut
+
+Name it exactly **Madeira JIT** and add:
+
+1. **If** *Shortcut Input* contains `start`
+   1. **If** *Shortcut Input* contains `cellular`: **Set Cellular Data** *Off*.
+      End If.
+   2. LocalDevVPN's **Connect** action (or **Set VPN** → *Connect* → LocalDevVPN).
+2. **Otherwise**
+   1. **If** *Shortcut Input* contains `vpn`: LocalDevVPN's **Disconnect**
+      action (or **Set VPN** → *Disconnect*). End If.
+   2. **If** *Shortcut Input* contains `cellular`: **Set Cellular Data** *On*.
+      End If.
+3. End If.
+
+Then turn on **Settings → JIT → Madeira JIT shortcut**. Without the shortcut,
+leave it off: Shortcuts would only report that the shortcut is missing.
+
 ## Signing and installation
 
 The app and `MadeiraJITHelper` extension must be signed together. Sideloaders

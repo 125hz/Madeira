@@ -9,7 +9,10 @@ struct MadeiraApp: App {
                 .onAppear {
                     GamepadInput.shared.start()
                     HardwareInput.shared.start()
+                    _ = JITNetworkShortcut.shared     // starts its network path monitor
                 }
+                // madeira://jit-network/...: the Madeira JIT shortcut returning (JITNetwork.swift).
+                .onOpenURL { url in JITNetworkShortcut.shared.handle(url) }
         }
     }
 }

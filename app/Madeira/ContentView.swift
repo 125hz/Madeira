@@ -2935,6 +2935,12 @@ struct ContentView: View {
 
             winios_phase("detach-done")
 
+            // The Madeira JIT shortcut turned Cellular Data off or connected LocalDevVPN
+            // for this JIT (JITNetwork.swift). The pool is mapped and the debugger is
+            // gone, so put them back now: running the shortcut leaves Madeira for a
+            // moment, which is safe only before Wine starts drawing.
+            JITNetworkShortcut.restoreBlocking()
+
             // Step 2: Start wineserver
             self.startWineserver()
             winios_phase("wineserver-up")
