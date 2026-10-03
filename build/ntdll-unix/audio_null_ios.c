@@ -351,7 +351,7 @@ struct ios_stream {
     /* Per-client-channel gain into the endpoint's stereo bus. Built once from
      * the channel mask at create_stream; this is the 5.1 (and 7.1, quad and
      * mono) downmix. Read-only once the stream is published to the mixer. */
-    float mix_gain[8][2];
+    float mix_gain[12][2];   /* ml1227: up to 7.1.4 */
     BYTE *ring;
     _Atomic uint64_t write_pos;  /* frames produced by the game (monotonic) */
     _Atomic uint64_t play_pos;   /* frames consumed by the RT callback */
@@ -529,6 +529,13 @@ static uint64_t elapsed_frames(const struct ios_stream *s) {
 #define IOS_SPK_BACK_CENTER           0x00100
 #define IOS_SPK_SIDE_LEFT             0x00200
 #define IOS_SPK_SIDE_RIGHT            0x00400
+#define IOS_SPK_TOP_CENTER            0x00800   /* ml1227: the height speakers of 7.1.4 */
+#define IOS_SPK_TOP_FRONT_LEFT        0x01000
+#define IOS_SPK_TOP_FRONT_CENTER      0x02000
+#define IOS_SPK_TOP_FRONT_RIGHT       0x04000
+#define IOS_SPK_TOP_BACK_LEFT         0x08000
+#define IOS_SPK_TOP_BACK_CENTER       0x10000
+#define IOS_SPK_TOP_BACK_RIGHT        0x20000
 
 #define IOS_GAIN_M3DB  0.70710678f
 #define IOS_GAIN_M10DB 0.316f
@@ -587,7 +594,7 @@ static void ios_build_mix_gains(struct ios_stream *s, UINT32 mask)
             IOS_SPK_LOW_FREQUENCY | IOS_SPK_BACK_LEFT | IOS_SPK_BACK_RIGHT |
             IOS_SPK_SIDE_LEFT | IOS_SPK_SIDE_RIGHT                       /* 8: 7.1 */
     };
-    UINT32 ch = s->channels > 8 ? 8 : s->channels, c, bit, i;
+    UINT32 ch = s->channels > 12 ? 12 : s->channels, c, bit, i;
 
     memset(s->mix_gain, 0, sizeof(s->mix_gain));
     if (!ch) return;
@@ -606,12 +613,14 @@ static void ios_build_mix_gains(struct ios_stream *s, UINT32 mask)
         return;
     }
 
-    if (!mask || s->channels > 8) mask = default_mask[ch];
+    /* ml1227: a mask is honoured up to 12 channels (7.1.4: Wine's spatial
+     * audio bed); without one, more than 8 channels only get the leftovers */
+    if (!mask) mask = ch <= 8 ? default_mask[ch] : default_mask[8];
 
     /* Walk the mask low bit first; the Nth set bit is the Nth channel in the
      * interleaved frame. */
     c = 0;
-    for (i = 0; i < 11 && c < ch; i++) {
+    for (i = 0; i < 18 && c < ch; i++) {
         bit = 1u << i;
         if (!(mask & bit)) continue;
         switch (bit) {
@@ -628,13 +637,21 @@ static void ios_build_mix_gains(struct ios_stream *s, UINT32 mask)
         case IOS_SPK_BACK_RIGHT:
         case IOS_SPK_SIDE_RIGHT:
         case IOS_SPK_FRONT_RIGHT_OF_CENTER: s->mix_gain[c][1] = IOS_GAIN_M3DB; break;
+        case IOS_SPK_TOP_FRONT_LEFT:
+        case IOS_SPK_TOP_BACK_LEFT:         s->mix_gain[c][0] = IOS_GAIN_M3DB; break;
+        case IOS_SPK_TOP_FRONT_RIGHT:
+        case IOS_SPK_TOP_BACK_RIGHT:        s->mix_gain[c][1] = IOS_GAIN_M3DB; break;
+        case IOS_SPK_TOP_CENTER:
+        case IOS_SPK_TOP_FRONT_CENTER:
+        case IOS_SPK_TOP_BACK_CENTER:
+            s->mix_gain[c][0] = s->mix_gain[c][1] = IOS_GAIN_M3DB; break;
         default: break;
         }
         c++;
     }
-    /* A mask that names fewer speakers than the stream has channels (or only
-     * speakers we do not place, such as the top ones) would silence the rest;
-     * fold anything left over into both sides quietly rather than dropping it. */
+    /* A mask that names fewer speakers than the stream has channels would
+     * silence the rest; fold anything left over into both sides quietly rather
+     * than dropping it. */
     for (; c < ch; c++)
         s->mix_gain[c][0] = s->mix_gain[c][1] = 0.5f;
 }
@@ -652,7 +669,7 @@ static void ios_mix_stream(struct ios_stream *s, float *out, UInt32 nframes,
                            UINT32 dev_ch, UINT32 dev_rate)
 {
     UINT32 cap = s->buffer_frames, sch = s->channels, fb = s->frame_bytes;
-    UINT32 mch = sch > 8 ? 8 : sch;   /* channels with a gain; the rest are dropped */
+    UINT32 mch = sch > 12 ? 12 : sch;   /* channels with a gain; the rest are dropped (ml1227: 12) */
     uint64_t play, wr, avail, need;
     UInt32 f;
 
@@ -858,7 +875,7 @@ static int ios_dev_attach(struct ios_stream *s, const struct WAVEFORMATEX_stub *
     {   /* the downmix this client gets, one L/R gain pair per channel */
         char gains[160];
         size_t n = 0;
-        UINT32 c, mch = s->channels > 8 ? 8 : s->channels;
+        UINT32 c, mch = s->channels > 12 ? 12 : s->channels;
         gains[0] = 0;
         for (c = 0; c < mch && n < sizeof(gains); c++) {
             int w = snprintf(gains + n, sizeof(gains) - n, "%s%.2f/%.2f", c ? " " : "",
@@ -1265,6 +1282,15 @@ static NTSTATUS ios_get_render_buffer(void *args) {
         s->scratch_frames = p->frames;
     }
     s->pending_frames = p->frames;
+    /* ml1227: hand out SILENCE, not the previous period. WASAPI leaves the
+     * contents undefined, but Wine's ISpatialAudioObjectRenderStream
+     * (mmdevapi/spatialaudio.c) mixes its static objects into this buffer with
+     * `*out += *in` and never clears it. Ori and the Will of the Wisps' Wwise renders through that
+     * path (a 7.1.4 bed, 12 ch), so every period was added onto the last one:
+     * the source level climbed from mean|x| 0.01 to 5 (peaks 36) and the game
+     * played only crackle. */
+    if (p->frames && s->render_scratch)
+        memset(s->render_scratch, 0, (size_t)p->frames * s->frame_bytes);
     if (p->data) *p->data = s->render_scratch;
     p->result = S_OK;
     return STATUS_SUCCESS;
@@ -1305,7 +1331,7 @@ static NTSTATUS ios_release_render_buffer(void *args) {
                     const BYTE *fr = s->render_scratch + (size_t)f2 * fb;
                     /* every channel the mixer reads, not just the first two:
                      * a 5.1 client can carry signal only in its centre */
-                    for (c2 = 0; c2 < s->channels && c2 < 8; c2++) {
+                    for (c2 = 0; c2 < s->channels && c2 < 12; c2++) {
                         float v = s->is_float ? ((const float *)fr)[c2]
                                 : s->sample_bits == 16 ? ((const int16_t *)fr)[c2] * (1.0f / 32768.0f)
                                 : ((const int32_t *)fr)[c2] * (1.0f / 2147483648.0f);
