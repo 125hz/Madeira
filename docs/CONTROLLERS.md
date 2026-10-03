@@ -112,6 +112,58 @@ physical input takes it over. Hiding the controls or disconnecting the pad then
 leaves player 1 connected at rest until the app exits. Without the switch,
 slot 0 connects only when a real source appears, as before.
 
+## A controller as keyboard and mouse
+
+For a game without controller support (or with it switched off), Game details
+and the in-game Session menu offer **Controller: Keyboard and mouse**. Steam
+Input does this for desktop players; Madeira Dock runs Valve's client headless,
+so Madeira does it itself (`PadKeyboardMouse.swift`). The default, **Game's own
+support**, is XInput as before.
+
+In keyboard-and-mouse mode the physical pad is not published to XInput at all
+(the game sees no controller; touch controller mappings still connect player 1),
+and every pad input becomes what the touch controls already produce, through
+the same posting paths:
+
+| Pad input | Default |
+| --- | --- |
+| Left stick | WASD (the same eight sectors as a touch key stick) |
+| Right stick | Mouse motion (the pointer settings' relative sensitivity) |
+| RT / LT | Left / right mouse button (half press) |
+| D-pad | Arrow keys |
+| A, B, X, Y | Space, Ctrl, E, R |
+| LB, RB, L3, R3 | Q, F, Shift, C |
+| Start, Select | Escape, Tab |
+
+The game's **Controller binds** page (the Session menu while the mode is on, and
+Game details) lists every input with a menu of what it does: a mouse button, a
+key, Show keyboard or Nothing; the sticks choose between WASD, the arrow keys
+and (right stick) the mouse. Rows the player has not changed show the layout's
+or the template's action and are not stored; "Default" in a row's menu and
+the page's Reset clear them. The table is saved with the game
+(`LibraryEntry.controllerBinds`) and the driver takes each change at once.
+While the right stick is the mouse, the page also has its **Vertical speed**
+(`LibraryEntry.padMouseVertical`, 25–150 % of the horizontal speed): games
+scale the camera's pitch and yaw differently from a mouse, and a stick cannot
+be compensated by hand the way a wrist does.
+
+The Controller picker's third choice, **XInput and DirectInput**, is for games
+older than XInput: it exports `MADEIRA_DINPUT_PAD=1` for that launch only (the
+DirectInput device below), since a game reading both APIs may list two
+controllers.
+
+A layout can also bind an input: in the control editor, a touch control with
+a key or mouse action has a **Controller button for this action** row, and a
+key stick (WASD or Arrows) can name LS or RS. The named input then does what
+that control does (`TouchControl.padBinding`, an optional field, so older
+layouts load unchanged); a key stick bound to RS takes the right stick away from
+the mouse. The bindings follow the layout on screen and are rebuilt when it
+changes. The choice is saved with the game. While the Session menu is open, or
+when the app resigns active, everything the mode holds is released.
+
+`MADEIRA_PAD_KBM=0` removes the choice; `[pad-kbm]` logs the mode switching on
+and off and its releases.
+
 ## Audio route with wired controllers
 
 Some controllers enumerate as a USB audio output when wired. iOS then routes all
@@ -149,8 +201,9 @@ otherwise see two controllers. `MADEIRA_DINPUT_TRACE=1` adds a rate-limited
 state trace.
 
 Vibration, battery telemetry, controller-driven navigation of the app itself,
-binding physical buttons to keyboard/mouse controls, shaped (non-round) controls,
-a layout-wide size slider and a movable top bar remain outside this contribution.
+shaped (non-round) controls, a layout-wide size slider and a movable top bar
+remain outside this contribution. Binding physical buttons to keyboard/mouse
+controls is the keyboard-and-mouse mode above.
 
 ## Integration prerequisite
 

@@ -3493,6 +3493,11 @@ struct TouchControl: Codable, Identifiable, Equatable {
     var ny: Double = 0.5
     var scale: Double = 1.0
     var action: ControlAction = .mouseLeft   // usable the moment it is created
+    /// A physical controller input that also performs this control's key or
+    /// mouse action when the game runs in keyboard-and-mouse controller mode
+    /// (PadKeyboardMouse): "A", "RT", "D↑", ...; "LS"/"RS" for a key stick.
+    /// Optional, so layouts saved before it existed still decode.
+    var padBinding: String?
 }
 
 final class TouchControlsModel: ObservableObject {
@@ -4224,6 +4229,9 @@ struct MappingPanel: View {
 
     private var keyboardTab: some View {
         VStack(alignment: .leading, spacing: 12) {
+            if GamepadInput.keyboardMouseAvailable, !control.action.isPad, control.action != .none, control.action != .keyboardToggle {
+                bindingSection
+            }
             section("Pointer, sticks & special", [
                 ("L click", .mouseLeft), ("R click", .mouseRight),
                 ("WASD", .joystickWASD), ("Arrows", .joystickArrows),
@@ -4270,6 +4278,34 @@ struct MappingPanel: View {
             // XInput names, the chips and the buttons read Start/Select.
             section("System", [("Start", .pad("Menu")), ("Select", .pad("View")),
                                ("Guide", .pad("Guide"))])
+        }
+    }
+
+    /// Keyboard-and-mouse controller mode: which physical input performs this
+    /// control's action. A key stick binds to a stick; everything else to a
+    /// button or trigger. The chosen chip is highlighted; tapping it again clears.
+    private var bindingSection: some View {
+        let names = control.action.stickKeys != nil ? PadBindings.stickNames : PadBindings.buttonNames
+        return VStack(alignment: .leading, spacing: 6) {
+            Text("Controller button for this action (keyboard & mouse mode)")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.45))
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 48), spacing: 6)], spacing: 6) {
+                ForEach(names, id: \.self) { name in
+                    let on = control.padBinding == name
+                    Button {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        if let i = m.index(of: control.id) { m.controls[i].padBinding = on ? nil : name }
+                    } label: {
+                        Text(name == "Menu" ? "Start" : name == "View" ? "Select" : name)
+                            .font(.system(size: 12, weight: .medium)).lineLimit(1).minimumScaleFactor(0.55)
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity, minHeight: 30)
+                            .background(RoundedRectangle(cornerRadius: 7).fill(on ? Color.accentColor.opacity(0.6) : .white.opacity(0.12)))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
         }
     }
 
