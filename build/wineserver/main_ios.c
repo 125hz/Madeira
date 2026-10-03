@@ -46,6 +46,17 @@ int wineserver_main(int argc, char *argv[])
     init_threading();
     ws_log("[wineserver] init_registry...");
     init_registry();
+    /* The app starts Wine on this, not after a fixed pause. Not earlier:
+     * init_registry fchdir()s the whole process to the config dir to load
+     * system.reg, userdef.reg and user.reg by relative path, and the thread
+     * that starts Wine chdir()s to the game's folder, so a Wine start during
+     * the registry load could read an empty registry (later saved over the
+     * prefix) or leave the game in the server's directory. A client's first
+     * request waits for main_loop anyway. */
+    {
+        extern int wineserver_ready;
+        __atomic_store_n( &wineserver_ready, 1, __ATOMIC_RELEASE );
+    }
     ws_log("[wineserver] entering main_loop!");
     main_loop();
     ws_log("[wineserver] main_loop returned");

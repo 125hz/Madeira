@@ -125,7 +125,7 @@ struct thread *current = NULL;  /* thread handling the current request */
 unsigned int global_error = 0;  /* global error code for when no thread is current */
 timeout_t server_start_time = 0;  /* server startup time */
 char *server_dir = NULL;   /* server directory */
-int wineserver_listening;  /* set once the master socket accepts connections */
+int wineserver_ready;  /* set by main() once start-up is complete, just before the main loop */
 int server_dir_fd = -1;    /* file descriptor for the server dir */
 int config_dir_fd = -1;    /* file descriptor for the config dir */
 
@@ -1033,10 +1033,6 @@ void open_master_socket(void)
     /* init the process tracing mechanism */
     init_tracing_mechanism();
     close( fd );
-    /* The socket exists and is locked: a client can connect from here on
-     * (its request waits for the main loop).  The app starts Wine on this
-     * instead of after a fixed pause. */
-    __atomic_store_n( &wineserver_listening, 1, __ATOMIC_RELEASE );
 }
 
 /* master socket timer expiration handler */

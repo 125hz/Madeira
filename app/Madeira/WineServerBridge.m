@@ -152,8 +152,8 @@ int wineserver_start(const char *prefix_path) {
     }
 
     {
-        extern int wineserver_listening;
-        __atomic_store_n(&wineserver_listening, 0, __ATOMIC_RELEASE);
+        extern int wineserver_ready;
+        __atomic_store_n(&wineserver_ready, 0, __ATOMIC_RELEASE);
     }
     g_wineserver_running = 1;
 
@@ -187,9 +187,9 @@ int wineserver_is_running(void) {
     return g_wineserver_running;
 }
 
-int wineserver_is_listening(void) {
-    extern int wineserver_listening;
-    return __atomic_load_n(&wineserver_listening, __ATOMIC_ACQUIRE);
+int wineserver_is_ready(void) {
+    extern int wineserver_ready;
+    return __atomic_load_n(&wineserver_ready, __ATOMIC_ACQUIRE);
 }
 
 void wineserver_stop(void) {
