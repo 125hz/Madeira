@@ -1529,17 +1529,22 @@ static void *wine_process_thread(void *arg) {
          * started in the last 60 s and still runs, the session goes on until
          * no such child is left (process_ios.c, madeira_live_game_children).
          * A game that exits normally long after starting its helpers is not
-         * affected. MADEIRA_WAIT_CHILDREN=0 ends the session with the main
-         * process, as before. */
+         * affected. Opt-in, MADEIRA_WAIT_CHILDREN=1 (madeira.cfg, or a game's
+         * own config): a child that ends from a worker thread never releases its
+         * slot (process_ios.c), and the session would then wait forever. */
         {
             extern int madeira_live_game_children(char *buf, int len, double max_age);
             const char *wc = getenv("MADEIRA_WAIT_CHILDREN");
             char names[256];
             int n = madeira_live_game_children(names, sizeof names, 60.0);
-            if (n > 0 && !(wc && wc[0] == '0')) {
+            if (n > 0 && !(wc && wc[0] == '1')) {
+                dprintf(STDERR_FILENO, "[WineProc] the main process exited while %d child process(es) it started "
+                        "still run (%s); the session ends with it (MADEIRA_WAIT_CHILDREN=1 keeps it while they run)\n",
+                        n, names);
+            } else if (n > 0) {
                 dprintf(STDERR_FILENO, "[WineProc] the main process exited but %d child process(es) "
                         "it started still run (%s) -- a launcher started the game; the session goes on until "
-                        "they exit (MADEIRA_WAIT_CHILDREN=0 ends it with the main process)\n", n, names);
+                        "they exit (MADEIRA_WAIT_CHILDREN=1)\n", n, names);
                 unsigned ticks = 0;
                 while ((n = madeira_live_game_children(names, sizeof names, -1.0)) > 0) {
                     usleep(200 * 1000);

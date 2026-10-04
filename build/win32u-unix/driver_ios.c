@@ -673,6 +673,18 @@ static BOOL winios_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *sur
     BITMAPINFO *info = (BITMAPINFO *)buffer;
     struct window_surface *previous;
 
+    /* Game mode: a window as large as the guest desktop is the game's own. It
+     * presents through Metal and Winios.m never draws it, so it keeps win32u's
+     * offscreen surface, as before game-mode windows, instead of having its whole
+     * surface copied to the app at every flush (about 8 MB at 1080p). */
+    if (!winios_desktop_mode())
+    {
+        RECT screen = get_virtual_screen_rect( 0, MDT_DEFAULT );
+        if (surface_rect->right - surface_rect->left >= screen.right - screen.left &&
+            surface_rect->bottom - surface_rect->top >= screen.bottom - screen.top)
+            return FALSE;
+    }
+
     if ((previous = *window_surface) && previous->funcs == &winios_surface_funcs
         && EqualRect( &previous->rect, surface_rect )) return TRUE;
 
