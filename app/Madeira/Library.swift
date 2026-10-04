@@ -3164,6 +3164,10 @@ struct LibraryHUD: View {
     /// A Madeira Dock start: its status, failure and Show desktop (DockStartScreen).
     @ObservedObject private var dockStart = DockStartScreen.shared
     private let sessionTools = MadeiraConfig.flag("MADEIRA_SESSION_TOOLS")
+    /// The in-game menu's Diagnostics (frame capture, GPU sync), for testing: off
+    /// unless madeira.cfg sets env.MADEIRA_SESSION_DIAGNOSTICS = 1. A capture
+    /// writes render-target pixels to Documents/capture, which Files shows.
+    private let sessionDiagnostics = MadeiraConfig.flag("MADEIRA_SESSION_DIAGNOSTICS", fallback: false)
     /// The developer overlay's ECO and F pills, which a library session does not
     /// show; read again each time the menu opens.
     @State private var eco = madeira_get_eco() != 0
@@ -3400,8 +3404,9 @@ struct LibraryHUD: View {
                     }
                 }
                 // The developer overlay's CAP and F pills (FPSOverlay), for library
-                // sessions. MADEIRA_SESSION_TOOLS=0 hides them.
-                if sessionTools {
+                // sessions: only with MADEIRA_SESSION_DIAGNOSTICS=1 (and not with
+                // MADEIRA_SESSION_TOOLS=0).
+                if sessionTools && sessionDiagnostics {
                     Divider()
                     Text("Diagnostics").font(.headline)
                     Button("Capture the next frame", systemImage: "camera.viewfinder") {
@@ -3420,7 +3425,7 @@ struct LibraryHUD: View {
                             Text("F1").tag(1); Text("F6").tag(6); Text("F5").tag(5); Text("F0").tag(0)
                         }.pickerStyle(.segmented).frame(maxWidth: 220)
                     }
-                    Text("Capture writes the render passes of the next frame to Documents/capture and its draw list to the log. GPU sync applies to Direct3D 12 games: F1 makes every pass wait for the one before (the default), F6 waits only where the game's barriers ask, F5 makes render passes wait at the fragment stage, F0 has no sync at all (expect flicker; for tests).")
+                    Text("Both apply to Direct3D 12 games only. Capture writes the render passes of the next frame to Documents/capture and its draw list to the log. GPU sync: F1 makes every pass wait for the one before (the default), F6 waits only where the game's barriers ask, F5 makes render passes wait at the fragment stage, F0 has no sync at all (expect flicker; for tests).")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if let appID = model.activeEntry?.steamAppID, SteamOwnedLibrary.cloudQuitEnabled {

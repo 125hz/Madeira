@@ -150,7 +150,8 @@ in-game menu:
    footprint, battery, and the thermal state: Cool, Warm, Hot or Critical; a
    change is logged as `[thermal]` while the overlay is shown), then
    **Diagnostics**: **Capture the next frame** and **GPU sync** F1/F6/F5/F0,
-   the developer overlay's CAP and F pills (hidden with `MADEIRA_SESSION_TOOLS=0`);
+   the developer overlay's CAP and F pills, for Direct3D 12 games (shown only with
+   `MADEIRA_SESSION_DIAGNOSTICS=1`);
 4. **Quit game** in red. Quit asks the program to close with Alt+F4 through
    the normal input queue, so it can save; the session ends when it exits.
 
@@ -276,6 +277,7 @@ menu owns input, the game sees a connected pad at rest.
 | `MADEIRA_LOG_VIA_STDERR` | on | Swift log lines use their own file handle |
 | `MADEIRA_RUNTIME_SETTINGS` | on | no Display and Memory & sync sections in Settings |
 | `MADEIRA_SESSION_TOOLS` | on | no Aspect & scaling (a session does not save it) and no Diagnostics in the in-game menu |
+| `MADEIRA_SESSION_DIAGNOSTICS` | off | `1` shows the in-game menu's Diagnostics: frame capture (render-target pixels to `Documents/capture`) and GPU sync, for Direct3D 12 games |
 | `MADEIRA_SCREEN_SHAPE_RESOLUTION` | on | no Screen shape resolution choice |
 | `MADEIRA_FRONTEND_KEYBOARD` | on | Keyboard opens the game view's own keyboard instead of the key window |
 | `MADEIRA_ONBOARDING` | on | first-run setup never opens, and Settings › JIT/Steam have no **Run setup again** |
