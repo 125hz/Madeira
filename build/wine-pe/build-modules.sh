@@ -47,6 +47,9 @@ targets=()
 for m in "$@"; do
     case "$m" in
         ntdll) echo "ntdll: use build/wine-pe/build-ntdll.sh (it also pads the image)" >&2; exit 1 ;;
+        # Farm names that are not Wine's here: wine/dlls has these directories too, and
+        # building one would replace DXMT's, madeira-d3d12's or FEX's DLL with Wine's.
+        d3d10core|d3d11|dxgi|d3d12|d3d12core|xtajit64) echo "$m: not a Wine module in the farm (DXMT / madeira-d3d12 / FEX)" >&2; exit 1 ;;
         */*|.*|"") echo "$m: name a module directory under wine/dlls" >&2; exit 1 ;;
     esac
     [ -f "$R/wine/dlls/$m/Makefile.in" ] || { echo "$m: no wine/dlls/$m/Makefile.in" >&2; exit 1; }
