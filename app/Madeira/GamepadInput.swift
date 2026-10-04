@@ -71,6 +71,8 @@ final class GamepadInput: @unchecked Sendable {
     @MainActor func beginPadSession() {
         let mode = Self.configuredPadMode()
         unsetenv("MADEIRA_HIDPAD"); unsetenv("MADEIRA_HIDPAD_NAME")
+        // An earlier session in this app run may have taken player 1 off XInput.
+        queue.async { [self] in hidActive = false; hidKeepsXInput = false }
         guard ["hid", "dualsense", "generic"].contains(mode.value) else {
             LogStore.shared.log("[hid-pad] ml2100 session mode=xinput source=\(mode.source)")
             return
