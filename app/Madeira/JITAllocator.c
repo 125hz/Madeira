@@ -1,4 +1,5 @@
 #include "JITAllocator.h"
+#include "../../build/madeira_cfg.h"   /* metal-validation (ml1249) */
 
 #include <mach/mach.h>
 #include <mach/vm_map.h>
@@ -955,28 +956,8 @@ __attribute__((constructor(101), used)) static void madeira_early_va_claim(void)
  * constructor. Expensive: diagnostic runs only. */
 __attribute__((constructor(102), used)) static void madeira_metal_validation_opt_in(void)
 {
-    const char *home = getenv("HOME");
-    char path[1024], line[256];
-    FILE *f;
-    int on = 0;
-
-    if (!home) return;
-    snprintf(path, sizeof(path), "%s/Documents/madeira.cfg", home);
-    if (!(f = fopen(path, "r"))) return;
-    while (fgets(line, sizeof(line), f)) {
-        char *p = line, *k, *v;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '#') continue;
-        if (strncmp(p, "metal-validation", 16) != 0) continue;
-        k = p + 16;
-        while (*k == ' ' || *k == '\t') k++;
-        if (*k != '=') continue;
-        v = k + 1;
-        while (*v == ' ' || *v == '\t') v++;
-        on = (*v == '1');          /* last line wins, like the rest of the file */
-    }
-    fclose(f);
-    if (!on) return;
+    /* Metal API validation for this launch (debug layer, reports instead of aborts). */
+    if (!madeira_cfg_bool("metal-validation", 0)) return;
     setenv("MTL_DEBUG_LAYER", "1", 1);
     setenv("MTL_DEBUG_LAYER_ERROR_MODE", "nslog", 1);
     setenv("MTL_DEBUG_LAYER_WARNING_MODE", "nslog", 1);

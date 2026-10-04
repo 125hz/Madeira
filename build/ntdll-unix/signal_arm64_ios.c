@@ -1398,7 +1398,7 @@ static int ios_x18_derived_base( uint64_t fault_pc, int rn )
     return 0;
 }
 
-/* ml1242: the JIT-pool dump is OPT-IN (MADEIRA_JIT_DUMP set) and sparse.
+/* ml1242: the JIT-pool dump is sparse, and MADEIRA_JIT_DUMP=0 turns it off.
  *
  * Both one-shot dumps used to write the whole 896MB RW alias. The production
  * pool is not NO_FOOTPRINT (see jit_make_region_no_footprint), and a read fault
@@ -1417,7 +1417,10 @@ static void ios_dump_jit_pool( const char *why )
     char path[512], vec[256];   /* one byte per page of a 1MB chunk, down to 4KB pages */
     int fd;
 
-    if (!getenv( "MADEIRA_JIT_DUMP" ) || !ios_jit_rw_base_global || !total) return;   /* set: write the JIT pool (sparse) to Documents/fex-jit-dump.bin on the first mach UNHANDLED / SIGILL (ml1242) */
+    const char *jd = getenv( "MADEIRA_JIT_DUMP" );
+    /* 0: no Documents/fex-jit-dump.bin; by default the JIT pool is written (sparse) on the
+     * first mach UNHANDLED / SIGILL, and pulled with the log (ml1242) */
+    if ((jd && jd[0] == '0') || !ios_jit_rw_base_global || !total) return;
     docs = getenv( "MADEIRA_DOCS_DIR" );
     snprintf( path, sizeof(path), "%s/fex-jit-dump.bin", docs ? docs : "/tmp" );
     if ((fd = open( path, O_WRONLY | O_CREAT | O_TRUNC, 0644 )) < 0)

@@ -1263,7 +1263,8 @@ static NTSTATUS ios_reset(void *args) {
  * 10 ms hole every ~120 ms, heard as crackle.
  *
  * Now the loop keeps a lead of audio in the ring (60 ms, env
- * MADEIRA_AUDIO_LEAD_MS = 10..500): while the ring holds less, it wakes the
+ * MADEIRA_AUDIO_LEAD_MS = 10..500; 0 restores the plain 10 ms beat and no
+ * time-constraint policy, as before): while the ring holds less, it wakes the
  * client again as soon as the client has answered the previous wake-up (wrote
  * something), or a period later if it has not. Once the lead is there it sleeps
  * until the lead is used up. A late wake-up now eats into the lead instead of
@@ -1276,9 +1277,10 @@ static UINT32 ios_audio_lead_ms(void)
 {
     static int cached = -1;
     if (cached < 0) {
+        /* ms of audio kept in the ring (10..500, default 60); 0: the old 10 ms beat */
         const char *e = getenv("MADEIRA_AUDIO_LEAD_MS");
-        int v = e ? atoi(e) : 0;
-        cached = (v >= 10 && v <= 500) ? v : IOS_AUDIO_LEAD_MS_DEFAULT;
+        int v = e ? atoi(e) : -1;
+        cached = (e && e[0] == '0') ? 0 : (v >= 10 && v <= 500) ? v : IOS_AUDIO_LEAD_MS_DEFAULT;
     }
     return (UINT32)cached;
 }
@@ -1314,18 +1316,18 @@ static NTSTATUS ios_timer_loop(void *args) {
     uint64_t sig_wr = 0, sig_ns = 0;
     /* ml1230 report, one line per ~10 s per live stream */
     uint64_t rep_ns = 0, rep_wr = 0, rep_short = 0, rep_clamped = 0;
-    uint32_t rep_cbs = 0, rep_short_cbs = 0, wakes = 0;
+    uint32_t rep_cbs = 0, rep_short_cbs = 0, wakes = 0, unanswered = 0;
     uint64_t pad_min = UINT64_MAX, pad_max = 0, late_max_ns = 0;
 
     if (!s) return STATUS_SUCCESS;
     LOG_FN_CALL(9, "timer_loop");
-    ios_audio_timer_thread_rt();
+    if (ios_audio_lead_ms()) ios_audio_timer_thread_rt();
     while (s->valid) {
         UINT32 rate = s->sample_rate ? s->sample_rate : IOS_AUDIO_SAMPLE_RATE;
         uint64_t period = rate / 100, lead, play, wr, pad, now, sleep_ns, deadline, t;
 
-        if (!s->event || !s->started || !ios_stream_is_live(s)) {
-            /* null-mode, or nothing to drive yet: the plain 10 ms beat */
+        if (!s->event || !s->started || !ios_stream_is_live(s) || !ios_audio_lead_ms()) {
+            /* null-mode, nothing to drive yet, or MADEIRA_AUDIO_LEAD_MS=0: the plain 10 ms beat */
             usleep(10000); /* device period, 10 ms */
             if (s->event && s->started)
                 NtSetEvent(s->event, NULL);
@@ -1350,13 +1352,18 @@ static NTSTATUS ios_timer_loop(void *args) {
         if (pad > pad_max) pad_max = pad;
 
         if (pad < lead) {
+            if (wr != sig_wr) unanswered = 0;
             if (wr != sig_wr || now - sig_ns >= 10000000) {
+                if (wr == sig_wr) unanswered++;
                 NtSetEvent(s->event, NULL);
                 sig_wr = wr;
                 sig_ns = now;
                 wakes++;
             }
-            sleep_ns = 1000000;   /* look again for the client's answer */
+            /* Look again for the client's answer in 1 ms; a client that left two
+             * wake-ups unanswered (paused, starved) is looked at on the 10 ms beat
+             * until it writes again, not 1000 times a second. */
+            sleep_ns = unanswered >= 2 ? 10000000 : 1000000;
         } else {
             sleep_ns = (pad - lead) * 1000000000ull / rate;   /* until the lead is used up */
             if (sleep_ns < 1000000) sleep_ns = 1000000;
