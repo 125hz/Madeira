@@ -178,9 +178,9 @@ int main( void )
         check("FEX iOS FetchHostFeatures: one MIDR, 0, and SupportsCRC set",
               ios.count("HostFeatures.CPUMIDRs.push_back(") == 1 and "HostFeatures.CPUMIDRs.push_back(0u);" in ios
               and "HostFeatures.SupportsCRC = true;" in ios)
-        check("FEX: the host-probe override (CRC=0 etc.) is WOW64-only",
-              "#if defined(FEX_IOS_HOST) && !defined(ARCHITECTURE_arm64ec)" in ios
-              and ios.index("#if defined(FEX_IOS_HOST) && !defined(ARCHITECTURE_arm64ec)") < ios.index('Absent("CRC")'))
+        probe_if = "#if defined(FEX_IOS_HOST)\n  /* The list above assumes the newest cores."
+        check("FEX: the host-probe override (CRC=0 etc.) applies to both modules",
+              probe_if in ios and ios.index(probe_if) < ios.index('Absent("CRC")'))
         table = re.findall(r"\{(0x[0-9a-fA-F]+), (0x?[0-9a-fA-F]*|0), ([01]), ProductNames::(\w+)\}", cpp)
         first0 = next((t for t in table if int(t[0], 16) == 0 and int(t[1], 0) == 0), None)
         unk = re.search(r'static const char ARM_UNKNOWN\[\] = "([^"]*)";', cpp)
