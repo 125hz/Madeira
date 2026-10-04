@@ -197,6 +197,21 @@ struct LibraryEntry: Codable, Identifiable {
     /// nil = 1) in this game's sessions.
     var controlOpacity: Double?
     var controlSize: Double?
+    // ml1163: how a game starts. All optional, so older library files decode and
+    // entries that never set them start as before.
+    /// "desktop": the program runs inside the Wine desktop, as explorer.exe's
+    /// first child (explorer.exe /desktop=shell,<resolution> "<exe>" args), so
+    /// every window shows. nil or "direct": the program is Wine's first process,
+    /// with no desktop; only its small windows (launchers, message boxes) are
+    /// drawn over the game.
+    var launchMode: String?
+    /// The working directory, a C:\ path (exported as MADEIRA_WORKDIR); nil or
+    /// empty = the program's own folder (Steam's for "The game").
+    var workingDirectory: String?
+    /// Start services.exe (the SCM, and through it rpcss: out-of-process COM,
+    /// which Steam-style launchers need) before the program, from a generated
+    /// C:\madeira-games\<id>.bat (servicesScript).
+    var startServices: Bool?
     /// How a physical controller reaches this game: nil, the game's own support
     /// (XInput, as before); "dinput", XInput and a DirectInput joystick of the same
     /// pad (for games older than XInput; a game reading both APIs sees two
@@ -261,8 +276,119 @@ struct LibraryEntry: Codable, Identifiable {
 
     var launchArguments: String {
         if desktop == true { return "/desktop=shell,\(resolution) C:\\windows\\system32\\services.exe" }
-        if startsSteamGameDirectly { return steamProgramArguments ?? "" }
-        return arguments
+        return launchCommand.args
+    }
+
+    /// ml1163: a .bat or .cmd target runs through cmd.exe. For "The game" (a Steam
+    /// game started as its own program) the target is that program.
+    var isBatch: Bool {
+        let path = launchRelativePath.lowercased()
+        return path.hasSuffix(".bat") || path.hasSuffix(".cmd")
+    }
+    /// ml1163's launch options apply to what the library starts itself: a game you
+    /// added, or a Steam game's "The game". A Steam game started through Madeira
+    /// Dock has Dock's own desktop and command (ContentView.startDock).
+    var usesLaunchOptions: Bool { desktop != true && (steamAppID == nil || startsSteamGameDirectly) }
+    /// ml1163: a game (not the Desktop entry) started inside the Wine desktop.
+    var runsInDesktop: Bool { usesLaunchOptions && launchMode == "desktop" }
+    /// The program's own arguments: Steam's launch configuration for "The game",
+    /// else the entry's Launch arguments.
+    var programArguments: String { startsSteamGameDirectly ? (steamProgramArguments ?? "") : arguments }
+    /// ml1163: the directory the program starts in (MADEIRA_WORKDIR): the chosen
+    /// working folder, else Steam's for "The game", else the program's own folder.
+    /// A desktop-mode game inherits explorer's directory and a .bat runs as
+    /// cmd.exe, whose own folder is system32, so configureLaunch exports it
+    /// whenever what starts lives elsewhere.
+    var launchDirectory: String {
+        let chosen = (workingDirectory ?? "").trimmingCharacters(in: .whitespaces)
+        if !chosen.isEmpty { return chosen }
+        return steamWorkingWindowsPath ?? Self.folder(of: launchWindowsPath)
+    }
+    /// C:\a\b\x.exe -> C:\a\b (C:\ for a file in the root).
+    static func folder(of windowsPath: String) -> String {
+        guard let i = windowsPath.lastIndex(of: "\\") else { return "C:\\" }
+        let dir = String(windowsPath[..<i])
+        return dir.count <= 2 ? dir + "\\" : dir
+    }
+    /// drive_c on the host. LibraryModel.drive is the same folder; this struct
+    /// stands alone so the host tests can compile it.
+    static var hostDrive: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("wine/drive_c", isDirectory: true)
+    }
+    /// C:\a\b -> <prefix>/drive_c/a/b; nil for another drive or a ".." element.
+    static func hostURL(ofWindowsPath path: String) -> URL? {
+        let p = path.trimmingCharacters(in: .whitespaces)
+        guard p.count >= 3, p.prefix(3).uppercased() == "C:\\" else { return nil }
+        let parts = p.dropFirst(3).split(separator: "\\").map(String.init)
+        guard !parts.contains("..") else { return nil }
+        return parts.reduce(hostDrive) { $0.appendingPathComponent($1) }
+    }
+    /// ml1163: where startServices writes its batch file, one per entry.
+    var servicesScriptPath: String { "C:\\madeira-games\\\(id.uuidString).bat" }
+    /// ml1163: the services batch, CRLF. services.exe is STARTed; then a .bat is
+    /// CALLed so it runs in this console, and an exe is STARTed so cmd exits and
+    /// its console closes straight away (the pattern of Steam's batch). nil
+    /// unless startServices.
+    var servicesScript: String? {
+        guard usesLaunchOptions, startServices == true else { return nil }
+        func quoted(_ s: String) -> String { "\"\(s)\"" }
+        // Text put into the batch keeps one line each (a line break in the arguments
+        // or the title would start another command), and its '%' is doubled once per
+        // expansion: cmd expands '%' in a batch file, so C:\Games\100% Juice became
+        // C:\Games\100 Juice and "%~" in a title was a syntax error that stopped the
+        // whole batch; CALL expands its line a second time.
+        func batchText(_ s: String, expansions: Int = 1) -> String {
+            var text = s.replacingOccurrences(of: "\r", with: " ").replacingOccurrences(of: "\n", with: " ")
+            for _ in 0..<expansions { text = text.replacingOccurrences(of: "%", with: "%%") }
+            return text
+        }
+        let expansions = isBatch ? 2 : 1   // the program's line: CALL for a .bat
+        let extra = batchText(programArguments.trimmingCharacters(in: .whitespaces), expansions: expansions)
+        let target = quoted(batchText(launchWindowsPath, expansions: expansions))
+        let run = isBatch ? "call \(target)" : "start \"\" \(target)"
+        return [
+            "@echo off",
+            "rem Generated by Madeira (ml1163) for \(batchText(title)); rewritten at every launch.",
+            "start \"\" \"C:\\windows\\system32\\services.exe\"",
+            "cd /d \(quoted(batchText(launchDirectory)))",
+            extra.isEmpty ? run : run + " " + extra,
+        ].joined(separator: "\r\n") + "\r\n"
+    }
+
+    /// ml1163: what a game starts (the Desktop entry keeps its own command
+    /// above). MADEIRA_ARGS goes through
+    /// WineProcessBridge's quote-aware tokenizer; Wine re-quotes an argument
+    /// with spaces.
+    ///   Wine desktop: explorer.exe /desktop=shell,WxH "<exe>" args, or cmd /c "x.bat" args
+    ///   direct:       the exe with its arguments, or cmd.exe /c "x.bat" args
+    /// With startServices the target is the services batch, which carries the
+    /// arguments itself. The exe is launchWindowsPath: "The game"'s program for
+    /// a Steam game started as its own program.
+    private var launchCommand: (exe: String, args: String) {
+        func quoted(_ s: String) -> String { "\"\(s)\"" }
+        var path = launchWindowsPath
+        var extra = programArguments.trimmingCharacters(in: .whitespaces)
+        var batch = isBatch
+        if servicesScript != nil { path = servicesScriptPath; extra = ""; batch = true }
+        func withExtra(_ s: String) -> String { extra.isEmpty ? s : s + " " + extra }
+        if runsInDesktop {
+            return ("explorer.exe", "/desktop=shell,\(resolution) " + withExtra(batch ? "cmd /c \(quoted(path))" : quoted(path)))
+        }
+        if batch { return ("C:\\windows\\system32\\cmd.exe", withExtra("/c \(quoted(path))")) }
+        return (path, programArguments)   // upstream's direct launch, arguments verbatim
+    }
+    /// The details page's "command that runs" line: the program's file name and
+    /// its arguments, as upstream shows a direct start; ml1163: what starts it
+    /// otherwise (explorer.exe or cmd.exe with its whole command), and with the
+    /// services batch also what that batch starts.
+    var commandPreview: String {
+        func name(_ path: String) -> String { path.split(separator: "\\").last.map(String.init) ?? path }
+        let command = launchCommand
+        let program = ([name(launchWindowsPath)] + (programArguments.isEmpty ? [] : [programArguments])).joined(separator: " ")
+        if command.exe == launchWindowsPath { return program }
+        let line = name(command.exe) + " " + command.args
+        return servicesScript == nil ? line : line + "\n(the batch starts services.exe, then " + program + ")"
     }
 
     /// A Steam game that starts as its own program ("Start with: The game").
@@ -314,6 +440,33 @@ struct LibraryEntry: Codable, Identifiable {
         guard (config?.utf8.count ?? 0) < 60_000, config?.contains("\0") != true else {
             throw LibraryError.message("This game's config is too long.")
         }
+        // ml1163: the launch options.
+        guard launchMode == nil || launchMode == "desktop" || launchMode == "direct" else {
+            throw LibraryError.message("The saved launch profile contains an invalid launch mode.")
+        }
+        if usesLaunchOptions, let chosen = workingDirectory?.trimmingCharacters(in: .whitespaces), !chosen.isEmpty {
+            // WineProcessBridge maps MADEIRA_WORKDIR onto drive_c (C:\ only), and the
+            // services batch quotes it, so only an existing C:\ folder without
+            // quotes is accepted.
+            var isFolder: ObjCBool = false
+            guard !chosen.contains("\""), !chosen.contains("\0"), chosen.utf8.count < 500,
+                  let url = Self.hostURL(ofWindowsPath: chosen),
+                  FileManager.default.fileExists(atPath: url.path, isDirectory: &isFolder), isFolder.boolValue else {
+                throw LibraryError.message("The working folder must be an existing folder on drive C:, such as C:\\Games\\Some Game.")
+            }
+        }
+        // validate() is the last step of a launch that can refuse it
+        // (ContentView.launchLibraryEntry), so the services batch is written
+        // here: a batch that cannot be written stops the launch with a message.
+        if let script = servicesScript {
+            guard let url = Self.hostURL(ofWindowsPath: servicesScriptPath) else { return }
+            do {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try script.write(to: url, atomically: true, encoding: .utf8)
+            } catch {
+                throw LibraryError.message("Could not write \(servicesScriptPath): \(error.localizedDescription)")
+            }
+        }
     }
 
     /// Runs on the launch worker, before the JIT pool is taken.
@@ -326,7 +479,9 @@ struct LibraryEntry: Codable, Identifiable {
         if let cpuCount, (1..<64).contains(cpuCount) { setenv("MADEIRA_CPU_COUNT", String(cpuCount), 1) }
         // "dinput": the host pad also as a DirectInput joystick (wine/dlls/dinput/joystick_ios.c,
         // off by default because a game reading both APIs would see two controllers).
-        // Exported only for that choice; madeira.cfg's own MADEIRA_DINPUT_PAD still applies otherwise.
+        // Exported only for that choice, and it wins over madeira.cfg's MADEIRA_DINPUT_PAD
+        // (ml1240: in ml1184's per-launch list, unset when the session ends); the cfg's
+        // own value still applies to the other choices.
         if GamepadInput.keyboardMouseAvailable, controllerMode == "dinput" { setenv("MADEIRA_DINPUT_PAD", "1", 1) }
         else if MadeiraConfig.get("env.MADEIRA_DINPUT_PAD") == nil { unsetenv("MADEIRA_DINPUT_PAD") }
         if let anisotropyLimit, [1, 2, 4, 8].contains(anisotropyLimit) { setenv("DXMT_D9_ANISO_LIMIT", String(anisotropyLimit), 1) }
@@ -351,13 +506,16 @@ struct LibraryEntry: Codable, Identifiable {
             LogStore.shared.log("[game-cfg] this game's config could not be written: \(error.localizedDescription)")
         }
         fputs("[frontend] launch profile applied\n", stderr)
+        if usesLaunchOptions {
+            fputs("[library] ml1163 start=\(runsInDesktop ? "desktop" : "direct") batch=\(isBatch ? 1 : 0) services=\(servicesScript != nil ? 1 : 0) cwd=\(launchDirectory)\n", stderr)
+        }
         LogStore.shared.log("[display-shape] resolution=\(resolution) mode=\(displayMode.rawValue)")
     }
 
     /// What the bridge starts. Set on the main thread before the session begins.
     func configureLaunch() {
-        // "The game"'s identity and working folder for this launch only (the bridge
-        // reads and clears them); every other launch starts without them.
+        // "The game"'s identity and the launch's working folder, for this launch only
+        // (the bridge reads and clears them); every other launch starts without them.
         unsetenv("MADEIRA_STEAM_APPID"); unsetenv("MADEIRA_STEAM_APPPATH"); unsetenv("MADEIRA_WORKDIR")
         if steamAppID != nil {
             // A Steam game through Madeira Dock: Dock has set what starts (ContentView.startDock);
@@ -368,15 +526,22 @@ struct LibraryEntry: Codable, Identifiable {
                 return
             }
         }
-        setenv("MADEIRA_EXE", desktop == true ? "explorer.exe" : launchWindowsPath, 1)
-        setenv("MADEIRA_ARGS", launchArguments, 1)
-        if desktop == true { setenv("MADEIRA_DESKTOP", "1", 1) } else { unsetenv("MADEIRA_DESKTOP") }
+        let command = desktop == true ? (exe: "explorer.exe", args: launchArguments) : launchCommand
+        setenv("MADEIRA_EXE", command.exe, 1)
+        setenv("MADEIRA_ARGS", command.args, 1)
+        if desktop == true || runsInDesktop { setenv("MADEIRA_DESKTOP", "1", 1) } else { unsetenv("MADEIRA_DESKTOP") }
         if startsSteamGameDirectly, let steamAppID {
             // The game's own Steam identity (SteamAppId, SteamGameId, SteamAppPath = its install
-            // folder) instead of the bridge's fixed one, and Steam's working folder when it names one.
+            // folder) instead of the bridge's fixed one.
             setenv("MADEIRA_STEAM_APPID", String(steamAppID), 1)
             setenv("MADEIRA_STEAM_APPPATH", windowsPath, 1)
-            if let folder = steamWorkingWindowsPath { setenv("MADEIRA_WORKDIR", folder, 1) }
+        }
+        // ml1163: a game starts in launchDirectory (a chosen folder, Steam's for "The game",
+        // else the program's own). It is exported when the bridge's default, the folder of
+        // what it starts, differs: explorer.exe (desktop mode) and cmd.exe (a .bat, the
+        // services batch) live elsewhere. The Desktop entry keeps explorer's default.
+        if desktop != true, launchDirectory != Self.folder(of: command.exe) {
+            setenv("MADEIRA_WORKDIR", launchDirectory, 1)
         }
         // Every session's virtual monitor takes this entry's Resolution
         // (MADEIRA_SCREEN_W/H, source "knob"); for the Desktop entry it is the
@@ -605,17 +770,27 @@ final class LibraryModel: ObservableObject {
         LogStore.shared.log("[steam-games] metadata app=\(game.id) bits=\(updated.bits) api=\(api ?? "unknown")")
     }
 
+    /// What an entry can start: an executable, or (ml1163) a batch file run through cmd.exe.
+    static let programExtensions: Set<String> = ["exe", "bat", "cmd"]
     static func executable(_ relative: String) throws -> URL {
         let url = drive.appendingPathComponent(relative).resolvingSymlinksInPath().standardizedFileURL
-        guard url.path.hasPrefix(drive.path + "/"), url.pathExtension.lowercased() == "exe",
+        guard url.path.hasPrefix(drive.path + "/"), programExtensions.contains(url.pathExtension.lowercased()),
               FileManager.default.fileExists(atPath: url.path) else {
-            throw LibraryError.message("Choose an executable inside drive_c.")
+            throw LibraryError.message("Choose an executable (.exe, .bat or .cmd) inside drive_c.")
         }
         return url
     }
     static func inspect(_ url: URL) throws -> LibraryEntry {
         guard url.resolvingSymlinksInPath().path.hasPrefix(drive.path + "/") else {
             throw LibraryError.message("The executable must be inside drive_c.")
+        }
+        if ["bat", "cmd"].contains(url.pathExtension.lowercased()) {
+            // ml1163: a batch file has no PE header. Like every entry it starts
+            // directly by default, as upstream starts every game; the details page
+            // warns that Wine then stops when cmd.exe, its first process, exits.
+            let relative = String(url.resolvingSymlinksInPath().path.dropFirst(drive.path.count + 1))
+            return LibraryEntry(title: url.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "_", with: " "),
+                                relativePath: relative, bits: 0)
         }
         let h = try FileHandle(forReadingFrom: url); defer { try? h.close() }
         let dos = try h.read(upToCount: 64) ?? Data()
@@ -1792,6 +1967,7 @@ struct LibraryBadges: View {
     private var format: some View {
         HStack(spacing: 4) {
             if entry.bits == 32 || entry.bits == 64 { badge("\(entry.bits)-bit") }
+            if entry.isBatch { badge("Batch") }   // ml1163
             if let api = LibraryRendererBadge.compact(entry.graphicsAPI) { badge(api) }
             if let note { badge(note) }
         }
@@ -2309,7 +2485,7 @@ struct ExecutableBrowser: View {
                     NavigationLink { ExecutableBrowser(folder: file, select: select) } label: { Label(file.lastPathComponent, systemImage: "folder") }
                 } else {
                     Button { do { select(try LibraryModel.inspect(file)) } catch { self.error = error.localizedDescription } } label: {
-                        Label(file.lastPathComponent, systemImage: "app.dashed")
+                        Label(file.lastPathComponent, systemImage: file.pathExtension.lowercased() == "exe" ? "app.dashed" : "terminal")
                     }
                 }
             }
@@ -2318,8 +2494,9 @@ struct ExecutableBrowser: View {
         .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
         .task {
             do {
+                // ml1163: .bat and .cmd files are listed too (they run through cmd.exe).
                 files = try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isDirectoryKey], options: .skipsHiddenFiles)
-                    .filter { ($0.hasDirectoryPath || $0.pathExtension.lowercased() == "exe") && $0.resolvingSymlinksInPath().path.hasPrefix(LibraryModel.drive.path + "/") }
+                    .filter { ($0.hasDirectoryPath || LibraryModel.programExtensions.contains($0.pathExtension.lowercased())) && $0.resolvingSymlinksInPath().path.hasPrefix(LibraryModel.drive.path + "/") }
                     .sorted { if $0.hasDirectoryPath != $1.hasDirectoryPath { return $0.hasDirectoryPath }; return $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
             } catch { self.error = error.localizedDescription }
         }
@@ -2474,6 +2651,35 @@ struct LibraryDetail: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
+                // ml1163: how the program starts. Not for the Desktop entry, nor for a Steam
+                // game started through Madeira Dock, whose desktop and command are Dock's:
+                // there these choices would do nothing.
+                if entry.usesLaunchOptions {
+                    Section {
+                        Picker("Start", selection: Binding(get: { entry.runsInDesktop ? "desktop" : "direct" }, set: {
+                            entry.launchMode = $0 == "desktop" ? "desktop" : nil
+                        })) {
+                            Text("Directly").tag("direct")
+                            Text("In the Wine desktop").tag("desktop")
+                        }
+                        TextField("Working folder (default: the program's folder)", text: Binding(get: { entry.workingDirectory ?? "" }, set: {
+                            entry.workingDirectory = $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0
+                        })).autocorrectionDisabled().textInputAutocapitalization(.never).font(.body.monospaced())
+                        Toggle("Start Windows services first", isOn: Binding(get: { entry.startServices == true }, set: {
+                            entry.startServices = $0 ? true : nil
+                        }))
+                    } header: { Text("Launch") } footer: {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Directly: the game is Wine's first program, with no desktop; small windows such as launchers and message boxes are drawn over the game, a window drawn without DirectX that fills the screen is not. In the Wine desktop: the game starts inside the Wine desktop at the Resolution above, where every window shows.")
+                            Text("The working folder is a C:\\ path, for example C:\\Games\\Some Game. Start Windows services first is for launchers that need them (Steam-style COM); Madeira writes a batch file for it in C:\\madeira-games.")
+                            if !entry.runsInDesktop && (entry.isBatch || entry.startServices == true) {
+                                // Wine stops with its first process (the ml1163 open risk).
+                                Text("Started directly, Wine stops when its first program exits, so a batch file that starts the game and exits closes the game too. Start it in the Wine desktop instead.")
+                                    .foregroundStyle(.orange)
+                            }
+                        }
+                    }
+                }
                 // A Steam game starts with Steam's own launch option through Madeira Dock.
                 if entry.desktop != true && entry.steamAppID == nil {
                     Section {
@@ -2481,8 +2687,9 @@ struct LibraryDetail: View {
                             .font(.body.monospaced()).lineLimit(1...4)
                             .autocorrectionDisabled().textInputAutocapitalization(.never)
                         LaunchFlagChips(arguments: $entry.arguments)
-                        // What the next start runs.
-                        Text(([(entry.relativePath as NSString).lastPathComponent] + (entry.arguments.isEmpty ? [] : [entry.arguments])).joined(separator: " "))
+                        // What the next start runs (ml1163: in the Wine desktop, a batch file or
+                        // the services batch, what starts the program).
+                        Text(entry.commandPreview)
                             .font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
                     } header: { Text("Launch arguments") } footer: {
                         Text("Passed to the program on every start; the line above is the command that runs. The flags add or remove themselves; the renderer flags exclude each other, as do -windowed and -fullscreen.")
@@ -3416,6 +3623,10 @@ struct LibraryHUD: View {
                     ControllerModeChoice(mode: Binding(get: { model.controllerMode }, set: { model.controllerMode = $0; model.saveCurrentProfile() }))
                     if model.controllerMode == "keys" {
                         Button("Controller binds", systemImage: "gamecontroller") { bindsPage = true }
+                    } else if model.controllerMode == "dinput" {
+                        // ml1240: the DirectInput device exists only from the launch on.
+                        Text("XInput and DirectInput applies to the next launch.")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                 }
                 Button("Keyboard", systemImage: "keyboard") { model.menu = false; LibraryKeyboard.show() }
