@@ -589,6 +589,9 @@ static void mad_view_list_add(struct mad_device *d, int uav, struct mad_resource
     unsigned *n = uav ? &d->nuav : &d->nsrv, *cap = uav ? &d->nuav_cap : &d->nsrv_cap;
     unsigned *slot = uav ? &r->uav_slot : &r->srv_slot;
     if (*slot) return;   /* unlocked peek: the common case, already listed */
+    if (r->owner) d = r->owner;   /* the list res_Release removes it from */
+    arr = uav ? &d->uav_res : &d->srv_res;
+    n = uav ? &d->nuav : &d->nsrv; cap = uav ? &d->nuav_cap : &d->nsrv_cap;
     AcquireSRWLockExclusive(&d->list_lock);
     if (!*slot && mad_grow((void **)arr, cap, *n + 1, sizeof **arr)) {
         (*arr)[*n] = r; *slot = ++*n;
@@ -8986,8 +8989,18 @@ static struct mad_libshare *mad_libshare_slot(UINT64 k0, UINT64 k1) {
     for (i = (SIZE_T)(k0 & (g_libshare_cap - 1));; i = (i + 1) & (g_libshare_cap - 1))
         if (!g_libshare[i].lib || (g_libshare[i].k0 == k0 && g_libshare[i].k1 == k1)) return &g_libshare[i];
 }
+/* madeira.cfg pso-share-libs (default 1): identical converted libraries share one
+ * MTLLibrary. 0 keeps one per pipeline (the table is never trimmed, so this is the
+ * switch to compare memory with). */
+static int mad_libshare_on(void) {
+    static int on = -1;
+    if (on < 0) { on = mad_cfg_int_pe("pso-share-libs", 1) ? 1 : 0;
+                  d3d12_log("[madeira-d3d12] identical shader libraries are %s (madeira.cfg pso-share-libs)\n", on ? "shared" : "kept per pipeline"); }
+    return on;
+}
 static int mad_libshare_find(UINT64 k0, UINT64 k1, obj_handle_t *lib, obj_handle_t *fn) {
     struct mad_libshare *e; int ok = 0;
+    if (!mad_libshare_on()) return 0;
     AcquireSRWLockShared(&g_libshare_lock);
     e = mad_libshare_slot(k0, k1);
     if (e && e->lib) { NSObject_retain(e->lib); NSObject_retain(e->fn); *lib = e->lib; *fn = e->fn; ok = 1; }
@@ -9001,6 +9014,7 @@ static int mad_libshare_find(UINT64 k0, UINT64 k1, obj_handle_t *lib, obj_handle
 }
 static void mad_libshare_add(UINT64 k0, UINT64 k1, obj_handle_t lib, obj_handle_t fn) {
     struct mad_libshare *e;
+    if (!mad_libshare_on()) return;
     AcquireSRWLockExclusive(&g_libshare_lock);
     if ((g_libshare_n + 1) * 10 >= g_libshare_cap * 7) {   /* grow at 70 % load; the capacity stays a power of two */
         SIZE_T ncap = g_libshare_cap ? g_libshare_cap * 2 : 4096, i, oldcap = g_libshare_cap;
@@ -9243,7 +9257,9 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
     obj_handle_t fn = 0, err = 0, lib = 0;
     UINT64 share_k0, share_k1;
     mad_libshare_key(buf, (SIZE_T)a.ret_len, name, &share_k0, &share_k1);
-    if (mad_libshare_find(share_k0, share_k1, &lib, &fn)) {   /* an identical library already exists */
+    /* Not for a DXIL tessellation conversion (lib_only): its result is the library
+     * itself, and a shared entry would hand back the function instead. */
+    if (!(o && o->lib_only) && mad_libshare_find(share_k0, share_k1, &lib, &fn)) {   /* an identical library already exists */
         snprintf(g_last_entry, sizeof g_last_entry, "%s", name);
         if (o && o->name_out && o->name_cap) snprintf(o->name_out, o->name_cap, "%s", name);   /* ml927b */
         *lib_out = lib;
