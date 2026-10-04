@@ -101,8 +101,9 @@ starting screen takes over (or an error is shown). A profile holds:
 - **CPU cores reported** (Automatic, 1, 2, 4 or 6) and **D3D9 anisotropic
   filtering** (Application default, up to 1×, 2×, 4× or 8×): only a choice
   other than the default exports `MADEIRA_CPU_COUNT` (wine) or
-  `DXMT_D9_ANISO_LIMIT` (DXMT); the defaults export nothing. Frame generation
-  below is the only other engine switch the library exports;
+  `DXMT_D9_ANISO_LIMIT` (DXMT); the defaults export nothing. AVX above, frame
+  generation below and the game's own config lines are the library's other
+  engine switches;
 - **Frame generation (experimental)**, off by default: exports
   `MADEIRA_FRAMEGEN=1`, and DXMT's present path (D3D11 and D3D12 alike) shows a
   MetalFX-interpolated frame between every two game frames; FPS limits do not
