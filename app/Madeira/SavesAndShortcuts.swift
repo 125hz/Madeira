@@ -1,18 +1,16 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Madeira Converter Exception: see LICENSE-EXCEPTION.md
 //
-//  SavesAndShortcuts.swift
-//  Madeira
+// Two things players of other Windows game launchers expect:
 //
-//  Two things players of other Windows game launchers expect:
-//
-//  * Save backups. A game's progress lives in the Wine prefix (C:\users\...),
-//    which a prefix reset, an experiment or a reinstall under another bundle
-//    id takes with it. Settings › Saves writes every Windows user's Documents,
-//    Saved Games and AppData (caches left out) into one zip to keep in Files
-//    or iCloud Drive, and puts one back.
-//  * Home Screen shortcuts. madeira://play?exe=<Windows path> starts that game
-//    from the library (after JIT, like Play on its details page). Game details
-//    copies the link; the Shortcuts app turns it into a Home Screen icon.
-//
+// * Save backups. A game's progress lives in the Wine prefix (C:\users\...),
+//   which a prefix reset, an experiment or a reinstall under another bundle
+//   id takes with it. Settings › Saves writes every Windows user's Documents,
+//   Saved Games and AppData (caches, and Valve's client and web caches, left
+//   out) into one zip to keep in Files or iCloud Drive, and puts one back.
+// * Home Screen shortcuts. madeira://play?exe=<Windows path> starts that game
+//   if it is in the library (after JIT, like Play on its details page). Game
+//   details copies the link; the Shortcuts app turns it into a Home Screen icon.
 
 import Foundation
 import SwiftUI
@@ -216,8 +214,10 @@ enum SaveBackup {
     /// Folders under each C:\users\<name> that hold saves and settings.
     static let roots = ["Documents", "Saved Games", "AppData/Roaming", "AppData/LocalLow", "AppData/Local"]
     /// Folder names that are caches or Windows' own files, never saves.
+    /// "steam" and "htmlcache": the Steam client Madeira Dock runs keeps its sign-in
+    /// state (local.vdf) and web cookies under AppData\Local\Steam; never in a backup.
     static let skipped: Set<String> = ["madeira", "temp", "shadercache", "d3dscache", "nvidia", "microsoft",
-                                       "cache", "caches", "crashdumps", "logs", "webcache"]
+                                       "cache", "caches", "crashdumps", "logs", "webcache", "steam", "htmlcache"]
     static let maxFile = 256 << 20
     static let maxTotal: UInt64 = 3_500 << 20
 
@@ -343,7 +343,13 @@ struct SavesSection: View {
                  + "to keep in Files or iCloud Drive. Restoring puts those files back and overwrites saves with "
                  + "the same names.")
         }
-        .sheet(item: Binding(get: { shareURL.map { SharedFile(url: $0) } }, set: { if $0 == nil { shareURL = nil } })) { f in
+        // The zip is a copy made for sharing: removed once the share sheet closes.
+        .sheet(item: Binding(get: { shareURL.map { SharedFile(url: $0) } }, set: {
+            if $0 == nil {
+                if let url = shareURL { try? FileManager.default.removeItem(at: url) }
+                shareURL = nil
+            }
+        })) { f in
             ActivitySheet(items: [f.url])
         }
         .fileImporter(isPresented: $importing, allowedContentTypes: [.zip]) { r in
