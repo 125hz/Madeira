@@ -6415,45 +6415,60 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
  * section the main thread waited on.
  *
  * The target's last x64 state is in its CPU area (ChpeV2CpuAreaInfo->
- * ContextAmd64, saved whenever it left emulated code). It is returned in the
- * ARM64EC register mapping, which the wrapper's context_arm_to_x64() turns
- * back into x64 registers; X23/X28 are cleared so the wrapper does not
- * replace Pc/Sp with an emulator frame's. Threads of this process only: the
- * TEB pointer is read in this address space. */
+ * ContextAmd64, saved whenever it left emulated code). Its control registers
+ * (Pc, Sp, Fp, Lr) are returned in the ARM64EC register mapping, which the
+ * wrapper's context_arm_to_x64() turns back into x64 registers; X23/X28 are
+ * cleared so the wrapper does not replace Pc/Sp with an emulator frame's. The
+ * integer registers stay the server's. Threads of this process only: the TEB
+ * pointer is read in this address space, through mach_vm_read_overwrite, so a
+ * target that exits meanwhile cannot fault this thread.
+ *
+ * Opt-in, MADEIRA_CTX_CPU_AREA=1 (madeira.cfg env., or a game's own config):
+ * the snapshot is the thread's last exit from emulated code, not where it is
+ * now, so a caller that writes the context back (SetThreadContext, as a .NET
+ * runtime redirecting a thread does) would move the thread back there. */
+static int ctx_peek( void *dst, const void *src, size_t size )
+{
+    mach_vm_size_t got = 0;
+    return src && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(uintptr_t)src, size,
+                                          (mach_vm_address_t)(uintptr_t)dst, &got ) == KERN_SUCCESS && got == size;
+}
+
 static int get_context_from_amd64_area( HANDLE handle, CONTEXT *context, DWORD needed )
 {
+    static int on = -1;
     THREAD_BASIC_INFORMATION tbi;
     const TEB *teb;
-    const CHPE_V2_CPU_AREA_INFO *cpu;
-    const ARM64EC_NT_CONTEXT *ec;
+    const CHPE_V2_CPU_AREA_INFO *cpu = NULL;
+    const ARM64EC_NT_CONTEXT *ecp = NULL;
+    ARM64EC_NT_CONTEXT ec;
     static LONG said;
 
+    if (on < 0)
+    {
+        /* 1: a cross-thread GetThreadContext without control registers gets the target's
+         * saved x64 Pc/Sp/Fp/Lr (default off; a context written back would rewind it). */
+        const char *env = getenv( "MADEIRA_CTX_CPU_AREA" );
+        on = env && env[0] == '1';
+    }
+    if (!on) return 0;
     if (NtQueryInformationThread( handle, ThreadBasicInformation, &tbi, sizeof(tbi), NULL )) return 0;
     if (tbi.ClientId.UniqueProcess != NtCurrentTeb()->ClientId.UniqueProcess) return 0;
-    if (!(teb = tbi.TebBaseAddress) || !(cpu = teb->ChpeV2CpuAreaInfo) || !(ec = cpu->ContextAmd64)) return 0;
-    if (!ec->Pc || !ec->Sp) return 0;
-    if (needed & CONTEXT_INTEGER & ~CONTEXT_ARM64)
-    {
-        memset( context->X, 0, sizeof(context->X[0]) * 29 );
-        context->X[0] = ec->X0;   context->X[1] = ec->X1;   context->X[2] = ec->X2;   context->X[3] = ec->X3;
-        context->X[4] = ec->X4;   context->X[5] = ec->X5;   context->X[6] = ec->X6;   context->X[7] = ec->X7;
-        context->X[8] = ec->X8;   context->X[9] = ec->X9;   context->X[10] = ec->X10; context->X[11] = ec->X11;
-        context->X[12] = ec->X12; context->X[15] = ec->X15;
-        context->X[19] = ec->X19; context->X[20] = ec->X20; context->X[21] = ec->X21; context->X[22] = ec->X22;
-        context->X[25] = ec->X25; context->X[26] = ec->X26; context->X[27] = ec->X27;
-        context->ContextFlags |= CONTEXT_INTEGER;
-    }
+    if (!(teb = tbi.TebBaseAddress)) return 0;
+    if (!ctx_peek( &cpu, &teb->ChpeV2CpuAreaInfo, sizeof(cpu) ) || !cpu) return 0;
+    if (!ctx_peek( &ecp, &cpu->ContextAmd64, sizeof(ecp) ) || !ecp) return 0;
+    if (!ctx_peek( &ec, ecp, sizeof(ec) )) return 0;
+    if (!ec.Pc || !ec.Sp) return 0;
     context->X[23] = context->X[28] = 0;
-    context->Fp = ec->Fp;
-    context->Lr = ec->Lr;
-    context->Sp = ec->Sp;
-    context->Pc = ec->Pc;
-    context->Cpsr = 0;
+    context->Fp = ec.Fp;
+    context->Lr = ec.Lr;
+    context->Sp = ec.Sp;
+    context->Pc = ec.Pc;
     context->ContextFlags |= CONTEXT_CONTROL;
     if (InterlockedIncrement( &said ) <= 8)
         ERR( "[ctx] get handle=%p: no control registers from the server; "
-             "returning the target's saved x64 state rip=%p rsp=%p\n",
-             handle, (void *)ec->Pc, (void *)ec->Sp );
+             "returning the target's saved x64 Pc/Sp/Fp/Lr rip=%p rsp=%p (MADEIRA_CTX_CPU_AREA)\n",
+             handle, (void *)ec.Pc, (void *)ec.Sp );
     return 1;
 }
 
