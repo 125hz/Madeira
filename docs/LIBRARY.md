@@ -155,7 +155,8 @@ in-game menu:
 2. the FPS limit, **Aspect & scaling**, **Eco mode** (the developer overlay's
    ECO pill: guest threads at a low priority while it is on), and the mouse and
    pointer settings;
-3. the performance overlay and its fields (FPS, average frame time, memory
+3. the performance overlay and its fields (FPS, average frame time, CPU load
+   with the busiest thread, GPU load with GPU time per frame, memory
    footprint, battery, and the thermal state: Cool, Warm, Hot or Critical; a
    change is logged as `[thermal]` while the overlay is shown), then
    **Diagnostics**: **Capture the next frame** and **GPU sync** F1/F6/F5/F0,
