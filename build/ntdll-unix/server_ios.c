@@ -3989,6 +3989,146 @@ void ios_hw_registry_publish(void)
                     smbios_len ? "SMBIOS" : "no SMBIOS table", bios.defaults );
 }
 /* hw-registry-test:end */
+
+#include "../hidpad/hidpad_ids.h"
+
+/* ml2105: the HID pad's registry keys are made level by level, every new level
+ * volatile, by the same helper as the hardware description keys above. */
+#define ios_hidpad_key ios_hw_key
+
+static void ios_hidpad_value( HANDLE key, const char *value, ULONG type, const char *const *strings,
+                              unsigned int count, DWORD number )
+{
+    WCHAR nameW[32], data[512];
+    UNICODE_STRING name;
+    ULONG size = 0;
+    unsigned int i;
+
+    ascii_to_unicode( nameW, value, strlen( value ) + 1 );
+    init_unicode_string( &name, nameW );
+    if (type == REG_DWORD)
+    {
+        NtSetValueKey( key, &name, 0, type, &number, sizeof(number) );
+        return;
+    }
+    for (i = 0; i < count; i++)
+    {
+        size_t len = strlen( strings[i] ) + 1;
+        if (size + len + 1 > ARRAY_SIZE(data)) break;
+        ascii_to_unicode( data + size, strings[i], len );
+        size += len;
+    }
+    if (type == REG_MULTI_SZ) data[size++] = 0;
+    NtSetValueKey( key, &name, 0, type, data, size * sizeof(WCHAR) );
+}
+
+/* ml2105: the identity whose \??\HID#... link the wineserver created
+ * (hidpad_ios.c), or NULL; `link` gets its interface name. The registry must
+ * name exactly the device that exists: the wineserver reads MADEIRA_HIDPAD
+ * when it starts, but madeira.cfg's env.NAME lines are exported later, just
+ * before this process, and could name another identity. */
+static const struct hidpad_identity *ios_hidpad_live_identity( char *link, unsigned int size )
+{
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(hidpad_identities); i++)
+    {
+        WCHAR pathW[256];
+        char path[256];
+        UNICODE_STRING name;
+        OBJECT_ATTRIBUTES attr;
+        HANDLE handle;
+
+        hidpad_interface_link( &hidpad_identities[i], link, size );
+        snprintf( path, sizeof(path), "\\??\\%s", link );
+        ascii_to_unicode( pathW, path, strlen( path ) + 1 );
+        init_unicode_string( &name, pathW );
+        InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, 0, NULL );
+        if (!NtOpenSymbolicLinkObject( &handle, SYMBOLIC_LINK_QUERY, &attr ))
+        {
+            NtClose( handle );
+            return &hidpad_identities[i];
+        }
+    }
+    return NULL;
+}
+
+/***********************************************************************
+ *           ios_hidpad_publish
+ *
+ * ml2102: the registry half of the opt-in HID controller (MADEIRA_HIDPAD,
+ * build/hidpad/hidpad_ids.h). setupapi lists GUID_DEVINTERFACE_HID from
+ * DeviceClasses\{4d1e55b2-...}: an interface key with DeviceInstance, its "#"
+ * subkey with SymbolicLink and Control\Linked = 1 (what DIGCF_PRESENT checks,
+ * setupapi devinst.c is_linked), and the Enum key that DeviceInstance names,
+ * whose ClassGUID setupapi needs before it lists the device at all. hidclass
+ * and setupapi write the same keys for a real device on desktop Wine (the
+ * prefix template still holds Wine's virtual HID mouse and keyboard in this
+ * shape, minus the volatile Control\Linked); win32u's raw input list reads
+ * them too. The \??\HID#... link they point at is the wineserver's
+ * (hidpad_ios.c). First process only, like the drive links above, so it is in
+ * place before any game enumerates. In XInput mode the app unsets
+ * MADEIRA_HIDPAD (GamepadInput.beginPadSession) and this does nothing.
+ */
+static void ios_hidpad_publish(void)
+{
+    static const char enumkey[] = "\\Registry\\Machine\\System\\CurrentControlSet\\Enum";
+    static const char classes[] = "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\DeviceClasses";
+    const struct hidpad_identity *id;
+    char link[200], path[400], instance[128], symlink[210];
+    const char *class_name = "HIDClass", *class_guid = HIDPAD_HIDCLASS_GUID;
+    const char *desc = "HID-compliant game controller";
+    unsigned int written = 0;
+    HANDLE key;
+
+    if (!getenv( "MADEIRA_HIDPAD" )) return;
+    if (!(id = ios_hidpad_live_identity( link, sizeof(link) )))
+    {
+        wine_log_write( "[hid-pad] ml2105 MADEIRA_HIDPAD=%s but the wineserver made no pad; "
+                        "nothing registered rev=ml2105", getenv( "MADEIRA_HIDPAD" ) );
+        return;
+    }
+    snprintf( instance, sizeof(instance), "%s\\%s", id->device_id, id->instance );
+    snprintf( symlink, sizeof(symlink), "\\\\?\\%s", link );
+
+    if ((key = ios_hidpad_key( enumkey, instance )))
+    {
+        ios_hidpad_value( key, "ClassGUID", REG_SZ, &class_guid, 1, 0 );
+        ios_hidpad_value( key, "Class", REG_SZ, &class_name, 1, 0 );
+        ios_hidpad_value( key, "DeviceDesc", REG_SZ, &desc, 1, 0 );
+        ios_hidpad_value( key, "Mfg", REG_SZ, &id->manufacturer, 1, 0 );
+        ios_hidpad_value( key, "HardwareID", REG_MULTI_SZ, id->hardware_ids, ARRAY_SIZE(id->hardware_ids), 0 );
+        ios_hidpad_value( key, "ContainerID", REG_SZ, &id->container_id, 1, 0 );
+        ios_hidpad_value( key, "ConfigFlags", REG_DWORD, NULL, 0, 0 );
+        NtClose( key );
+        written++;
+    }
+    snprintf( path, sizeof(path), "%s\\##?#%s", HIDPAD_HID_INTERFACE_GUID, link );
+    if ((key = ios_hidpad_key( classes, path )))
+    {
+        const char *value = instance;
+        ios_hidpad_value( key, "DeviceInstance", REG_SZ, &value, 1, 0 );
+        NtClose( key );
+        written++;
+    }
+    snprintf( path, sizeof(path), "%s\\##?#%s\\#", HIDPAD_HID_INTERFACE_GUID, link );
+    if ((key = ios_hidpad_key( classes, path )))
+    {
+        const char *value = symlink;
+        ios_hidpad_value( key, "SymbolicLink", REG_SZ, &value, 1, 0 );
+        NtClose( key );
+        written++;
+    }
+    snprintf( path, sizeof(path), "%s\\##?#%s\\#\\Control", HIDPAD_HID_INTERFACE_GUID, link );
+    if ((key = ios_hidpad_key( classes, path )))
+    {
+        ios_hidpad_value( key, "Linked", REG_DWORD, NULL, 0, 1 );
+        NtClose( key );
+        written++;
+    }
+    wine_log_write( "[hid-pad] ml2102 %s %04X:%04X registered (%u/4 keys) as %s rev=ml2105",
+                    id->env, id->vid, id->pid, written, symlink );
+}
 #endif
 
 
@@ -4165,6 +4305,8 @@ size_t server_init_process(void)
     /* First process only (children use server_init_process_child), so the DOS
      * drive objects are published exactly once, before the shell enumerates. */
     ios_create_drive_symlinks();
+    /* ml2102: the opt-in HID controller's registry entries; nothing in XInput mode. */
+    ios_hidpad_publish();
 #endif
 
     for (i = 0; i < supported_machines_count; i++)
