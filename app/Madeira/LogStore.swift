@@ -154,6 +154,8 @@ final class LogStore: ObservableObject {
         for old in runs.dropFirst(keep) { try? fm.removeItem(at: old) }
     }
 
+    /// Once Wine points stderr at madeira-log.txt, the app's own log lines are
+    /// written through stderr too (appendToFile); 0 keeps a per-call file handle.
     private static let viaStderr = MadeiraConfig.flag("MADEIRA_LOG_VIA_STDERR")
 
     /// Is fd 2 the log file itself (same device and inode)?
