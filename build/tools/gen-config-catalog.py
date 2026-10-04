@@ -93,7 +93,10 @@ OVERLAY = {
                         "that reads both APIs does not see the same pad twice.",
                 "sources": ["app/Madeira/GamepadInput.swift"]},
     "env.MADEIRA_PROMOTE": {"title": "Hold the display at its maximum rate"},
-    "dxmt": {"title": "DXMT options (a=b;c=d)"},
+    "dxmt": {"title": "DXMT options (a=b;c=d)",
+             "note": "Exported as DXMT_CONFIG with the options joined by ';', a library game's own dxmt options after these: "
+                     "e.g. d3d11.mipClampBC=1;d3d11.preferredMaxFrameRate=30. DXMT reads at most 259 characters of it, "
+                     "and nothing at all from a longer value (ml1255)."},
 }
 
 

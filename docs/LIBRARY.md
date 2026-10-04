@@ -121,7 +121,9 @@ starting screen takes over (or an error is shown). A profile holds:
   and exports `MADEIRA_CFG_GAME` (unset when there are none): a key set there
   wins over madeira.cfg wherever the runtime reads it (`build/madeira_cfg.h`),
   `env.NAME` lines are exported after madeira.cfg's, and `dxmt` options are
-  added to madeira.cfg's (all joined with `;`, as `DXMT_CONFIG` requires).
+  added to madeira.cfg's (all joined with `;`, as `DXMT_CONFIG` requires; DXMT
+  reads at most 259 characters of it and nothing from a longer value, so the
+  app logs an error past that, ml1255).
   Settings the app reads itself at launch (such as `pool`) stay global.
 
 A game you added starts directly. A Steam game's page (`docs/STEAM_LIBRARY.md`)
