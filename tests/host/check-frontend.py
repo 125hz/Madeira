@@ -534,7 +534,8 @@ check('header: { Text("Credits") }' in last and form.count('Text("Credits")') ==
 for who in ('name: "Will Faust", handle: "willfaust"', 'name: "Nick", handle: "125hz"',
             'name: "Jfishin", handle: "Jfishin"', 'name: "Jesse", handle: "JesseLovelace"',
             'name: "Dan Perks", handle: "danperks"',
-            'name: "bahacan16", handle: "bahacan16"'):
+            'name: "bahacan16", handle: "bahacan16"',
+            'name: "spitefulowl", handle: "spitefulowl"'):
     check('MadeiraCredit(' + who in last, 'Settings credits: ' + who)
 check('https://github.com/\\(handle)' in block(lib, 'struct MadeiraCredit: View'),
       'a credit links the GitHub account')
