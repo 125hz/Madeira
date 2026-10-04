@@ -171,19 +171,24 @@ about ownership.
 
 - **Online starts are unchanged.** Once Valve's client has confirmed the game's
   license, the host asks it whether the account can log on offline and reports the
-  answer (`session-offline-ready`). When it is 1, the app notes the game as saved
-  for offline play (`DockOffline`, a date per App ID in the app's preferences;
-  removed with the sign-in).
+  answer (`session-offline-ready`). When it is 1, the app notes that the ACCOUNT can
+  sign in offline (`DockOffline`: one date for the account and the games started
+  online since, in the app's preferences; removed with the sign-in). Steam's offline
+  sign-in is per account: with it, Valve's client answers the license question for
+  any installed game from its cached list, started online before or not.
 - **A start with no network path** (`NWPathMonitor`) sets `MADEIRA_DOCK_OFFLINE=1`
   for the host, which hands over the sign-in as usual, asks Valve's client whether
   it can log on offline, and only then asks it to. The client answers the license
   question from what it cached and starts the game through the same launch call.
   A network that fails after the start falls back the same way 20 s in.
 - **Game details** shows a small line under the title for games the Dock starts:
-  "Saved for offline play" (green check) or "Start once online to play offline".
-  Tapping it explains. The mark is a note of the last online start; whether an
-  offline start goes ahead is always Steam's decision at that moment, and Steam's
-  offline sign-in expires on Steam's own schedule.
+  "Can be played offline" (green check) once the account is saved; "Start a game
+  online to play offline" before that; and "Start once online to play offline" for
+  a game with per-user executables that has not started online yet (Steam prepares
+  those over the network on the first start). Tapping it explains. The mark is a
+  note of the last online start; whether an offline start goes ahead is always
+  Steam's decision at that moment, and Steam's offline sign-in expires on Steam's
+  own schedule.
 - A refusal ends the start with its own message: nothing saved to sign in offline
   (50), offline sign-in refused (51), game not in what Steam saved (52).
 
