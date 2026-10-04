@@ -2750,9 +2750,14 @@ struct DockOfflineMark: View {
         let mark = DockOffline.mark(appID, preparedOnline: preparedOnline)
         let ready: Bool = { if case .ready = mark { return true } else { return false } }()
         Button { explain = true } label: {
-            Label(Self.line(mark), systemImage: ready ? "checkmark.circle.fill" : "wifi.exclamationmark")
-                .font(.caption.weight(.medium))
-                .foregroundStyle(ready ? Color.green : Color.secondary)
+            // Not a Label: inside a Form row a Label takes the list's wide icon column,
+            // which leaves the text far from its symbol.
+            HStack(spacing: 5) {
+                Image(systemName: ready ? "checkmark.circle.fill" : "wifi.exclamationmark")
+                Text(Self.line(mark))
+            }
+            .font(.caption.weight(.medium))
+            .foregroundStyle(ready ? Color.green : Color.secondary)
         }
         .buttonStyle(.plain)
         .task { preparedOnline = MadeiraDock.games(drive: MadeiraDock.drive).first { $0.id == appID }?.customExecutables ?? false }
