@@ -2064,6 +2064,7 @@ struct LibraryView: View {
             if SteamSettingsSection.shown, settingsShow("Steam", "Dock", "sign in", "account", "setup") {
                 SteamSettingsSection(open: { settingsSheet = $0 })
             }
+            if settingsShow("saves", "backup", "restore", "save games") { SavesSection() }
             if settingsShow("appearance", "liquid metal", "metal", "glass") {
                 Section {
                     Toggle("Liquid metal", isOn: $liquidMetal.on)
@@ -2334,6 +2335,7 @@ struct LibraryDetail: View {
     @State private var remove = false
     @State private var leaving = false
     @State private var error: String?
+    @State private var copiedLink = false
     /// Settings › Sync engine, read when the details open: the fastsync switches
     /// below only apply while it is Fastsync.
     @State private var syncEngine = SyncEngine.current
@@ -2540,6 +2542,20 @@ struct LibraryDetail: View {
                     }
                 } header: { Text("Advanced") } footer: {
                     Text("Lines in madeira.cfg's format for this game only. A key set here wins over madeira.cfg wherever the runtime reads it, env.NAME lines are exported after madeira.cfg's, and dxmt options are added to madeira.cfg's. Applies from the next start.")
+                }
+                // A link that starts this game from a Home Screen icon (SavesAndShortcuts.swift).
+                if entry.desktop != true {
+                    Section {
+                        Button {
+                            UIPasteboard.general.string = ShortcutRouter.link(for: entry.windowsPath)
+                            copiedLink = true
+                        } label: {
+                            Label(copiedLink ? "Link copied" : "Copy Home Screen shortcut link",
+                                  systemImage: copiedLink ? "checkmark" : "link")
+                        }
+                    } header: { Text("Home Screen") } footer: {
+                        Text("In the Shortcuts app: new shortcut, Open URLs, paste the link, then Share › Add to Home Screen.")
+                    }
                 }
                 if entry.steamAppID != nil {
                     Section {
