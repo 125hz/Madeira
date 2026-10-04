@@ -103,3 +103,9 @@ signed off under the DCO (the fork's `CONTRIBUTING.md`):
   (e200a5e19a9, f6848ad4e98, pull request #16, merged as e33e56e4db8); ntdll
   ARM64EC: opt-in guard against a self-deadlock in the loader's image-map
   notification (d770df01ae7, pull request #17, merged as f7df74abb76).
+- 2026-10-04 author spitefulowl: ntdll ARM64EC: leave the syscall callback on
+  the execute-request early return (38aa753f98b, pull request #22, merged as
+  bcb9938b136); kernelbase iOS: GetTickCount and QueryInterruptTime from the
+  performance counter (f2f3e4b42e4, pull request #23, merged as 84b25d3847c);
+  ntdll ARM64EC: unwind data for x64 code running at a fixed base below 4 GB
+  (f4bbccf9499, pull request #24, merged as 0bfd4a09b47).
