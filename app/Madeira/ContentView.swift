@@ -2428,7 +2428,9 @@ struct ContentView: View {
             logStore.log("[launch-preflight] profile validation failed: \(error.localizedDescription)", level: .error)
             return
         }
-        guard entry.launchWindowsPath.utf8.count < 1024, entry.launchArguments.utf8.count < 1024 else {
+        // launchArguments carries the whole ml1163 command (explorer's /desktop=, the quoted
+        // program, its arguments); validate() and the bridge's tokenizer take 4 KB.
+        guard entry.launchWindowsPath.utf8.count < 1024, entry.launchArguments.utf8.count < 4096 else {
             library.error = "The executable path or launch arguments are too long."; return
         }
         entry.configureLaunch()
