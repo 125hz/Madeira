@@ -284,6 +284,9 @@ int main( void )
 #ifndef min
 #define min(a,b) (((a) < (b)) ? (a) : (b))
 #endif
+#ifndef FIXME
+#define FIXME(...) do { } while (0)
+#endif
 static ULONGLONG cpu_id = 0x0000000a000661ull;
 ''' + sys_structs + sys_append + r'''
 /* kind: 0 generic (no host data), 1 Apple with manufacturer/model, 2 Apple with
@@ -339,6 +342,7 @@ unsigned char *gen_table( int kind, unsigned int *len )
 #include "winbase.h"
 #include "winnls.h"
 #define WARN(...) do { } while (0)
+#define FIXME(...) do { } while (0)
 static char rec[4096];
 static void narrow( const WCHAR *w, char *out ) { while ((*out++ = (char)*w++)) ; }
 static DWORD set_reg_value( HKEY hkey, const WCHAR *name, const WCHAR *value )
@@ -432,7 +436,7 @@ int main( void )
     return 0;
 }
 '''
-    flags = ["-fshort-wchar", "-D__WINESRC__", "-DWINE_UNIX_LIB", "-I", str(wine / "include"),
+    flags = ["-Wno-deprecated-declarations", "-fshort-wchar", "-D__WINESRC__", "-DWINE_UNIX_LIB", "-I", str(wine / "include"),
              "-Wno-unused-variable", "-Wno-pointer-sign", "-Wno-unknown-pragmas"]
     out = run_c({"gen.c": generator, "wb.c": wineboot, "ours.c": ours, "cmp.c": compare}, tmp / "cmp", flags)
     check("wineboot's parser, ntdll's generator and hw_registry_ios.h compile together and run", out is not None)
