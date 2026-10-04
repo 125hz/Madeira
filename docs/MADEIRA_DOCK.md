@@ -190,7 +190,9 @@ about ownership.
 `[dock-offline]` logs the request and the save; `[dock-report] session-offline-*`
 carries the host's numbers. Steam Cloud cannot be checked without a connection, so
 the existing "could not be checked" question still appears before an offline start.
-Not run on a device yet.
+Device-run once (2026-10-04, iPhone 18,3 / iOS 27.0, no network path): the offline
+request, Steam's offline sign-in, the license from its cache and the game's window
+8 s after the host started; the refusals and the fallback have not been exercised.
 
 ## Starting screen
 
