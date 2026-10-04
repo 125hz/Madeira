@@ -1804,6 +1804,244 @@ struct LibraryCells<Item: Identifiable, Cell: View>: View {
     }
 }
 
+// MARK: - Group by rules (Foundation only; tests/host/check-library-groups.py compiles this part)
+
+/// The library's Group by choice: "platform" is the sections (LibraryView);
+/// "played" groups by when a game was last played, "installed" into Installed
+/// and Not installed, and "none" is one grid. Those three list the games you
+/// added and Steam's games together, each group in the library's Sort by order.
+enum LibraryGrouping {
+    enum Source: Hashable {
+        case entry(UUID), steam(Int)
+        var key: String {
+            switch self {
+            case .entry(let id): return "entry:" + id.uuidString
+            case .steam(let appID): return "steam:\(appID)"
+            }
+        }
+    }
+
+    /// One game of any source, as far as the groups and the sort need it.
+    struct Game: Identifiable, Equatable {
+        let source: Source
+        var title: String
+        /// On disk; a Steam game being downloaded counts, as under the Steam title.
+        var installed: Bool
+        var lastPlayed: Date?
+        var bytes: Int64?
+        /// Its library entry's place in the library file (later is newer); nil without one.
+        var position: Int?
+        var id: Source { source }
+    }
+
+    struct Group: Identifiable, Equatable {
+        let id: String
+        /// nil: no header (Group by None).
+        let title: String?
+        var games: [Game]
+    }
+
+    /// Sort by ("played", "name", "added" or "size") as the library sorts the games
+    /// you added: a game without a library entry sorts as never played, of unknown
+    /// size and, for "added", after the games that have one; ties go by name.
+    static func sorted(_ games: [Game], by sort: String) -> [Game] {
+        games.sorted { a, b in
+            switch sort {
+            case "played":
+                if a.lastPlayed != b.lastPlayed { return (a.lastPlayed ?? .distantPast) > (b.lastPlayed ?? .distantPast) }
+            case "added":
+                if a.position != b.position { return (a.position ?? -1) > (b.position ?? -1) }
+            case "size":
+                if a.bytes != b.bytes { return (a.bytes ?? -1) > (b.bytes ?? -1) }
+            default:
+                break
+            }
+            let order = a.title.localizedStandardCompare(b.title)
+            return order == .orderedSame ? a.source.key < b.source.key : order == .orderedAscending
+        }
+    }
+
+    /// The groups of a Group by choice other than "platform", in page order,
+    /// without empty ones. Last played: today, the past 7 and 30 days (counted
+    /// from the start of today), earlier, then never played.
+    static func groups(_ games: [Game], by grouping: String, sort: String,
+                       now: Date = Date(), calendar: Calendar = .current) -> [Group] {
+        let games = sorted(games, by: sort)
+        var groups: [Group]
+        switch grouping {
+        case "played":
+            let today = calendar.startOfDay(for: now)
+            let week = calendar.date(byAdding: .day, value: -6, to: today) ?? today
+            let month = calendar.date(byAdding: .day, value: -29, to: today) ?? today
+            groups = [Group(id: "today", title: "Today", games: []), Group(id: "week", title: "Past 7 days", games: []),
+                      Group(id: "month", title: "Past 30 days", games: []), Group(id: "earlier", title: "Earlier", games: []),
+                      Group(id: "never", title: "Never played", games: [])]
+            for game in games {
+                let index: Int
+                if let played = game.lastPlayed {
+                    index = played >= today ? 0 : played >= week ? 1 : played >= month ? 2 : 3
+                } else {
+                    index = 4
+                }
+                groups[index].games.append(game)
+            }
+        case "installed":
+            groups = [Group(id: "installed", title: "Installed", games: games.filter(\.installed)),
+                      Group(id: "notInstalled", title: "Not installed", games: games.filter { !$0.installed })]
+        default:
+            groups = [Group(id: "all", title: nil, games: games)]
+        }
+        return groups.filter { !$0.games.isEmpty }
+    }
+
+    /// The collapsed groups' ids, stored comma-separated ("played.today,installed.notInstalled").
+    static func collapsed(_ stored: String) -> Set<String> {
+        Set(stored.split(separator: ",").map(String.init))
+    }
+
+    static func storing(_ collapsed: Set<String>) -> String { collapsed.sorted().joined(separator: ",") }
+}
+
+// MARK: - Group by view
+
+extension LibraryGrouping.Game {
+    /// A game you added; `position` is its index in LibraryModel.entries.
+    init(entry: LibraryEntry, position: Int) {
+        self.init(source: .entry(entry.id), title: entry.title, installed: true,
+                  lastPlayed: entry.lastPlayed, bytes: entry.folderBytes, position: position)
+    }
+}
+
+/// The library page under a Group by other than Platform: the games you added
+/// and Steam's games in one set of groups (LibraryGrouping). A card opens as in
+/// its own section: a game you added or an installed Steam game its Game details
+/// page, any other Steam game its download sheet. Not installed Steam games are
+/// listed only while signed in.
+struct LibraryGroupedGames<LocalCell: View>: View {
+    let grouping: String
+    let search: String
+    var layout = "cards"
+    var sort = "played"
+    var width: CGFloat = 390
+    /// Opens a game's Game details page (LibraryView's details sheet).
+    let open: (LibraryEntry) -> Void
+    /// A game you added: LibraryView's own card, with its controller focus.
+    @ViewBuilder let localCell: (_ entry: LibraryEntry, _ list: Bool, _ dense: Bool) -> LocalCell
+    @ObservedObject private var library = LibraryModel.shared
+    @ObservedObject private var steamGames = SteamGamesModel.shared
+    @ObservedObject private var steam = SteamOwnedLibrary.shared
+    @Environment(\.scenePhase) private var scenePhase
+    @AppStorage("madeiraLibraryCollapsedGroups") private var collapsedGroups = ""
+    @State private var steamSheet: SteamSelection?
+
+    private struct SteamSelection: Identifiable { let id: Int }
+
+    private struct Sources {
+        var games: [LibraryGrouping.Game] = []
+        var entries: [UUID: LibraryEntry] = [:]
+        var steam: [Int: SteamGamesRules.Item] = [:]
+    }
+
+    private var sources: Sources {
+        var result = Sources()
+        let query = search.trimmingCharacters(in: .whitespaces)
+        var steamEntries: [Int: (position: Int, entry: LibraryEntry)] = [:]
+        for (position, entry) in library.entries.enumerated() where entry.desktop != true {
+            if let appID = entry.steamAppID { steamEntries[appID] = (position, entry) }
+            else if query.isEmpty || entry.title.localizedCaseInsensitiveContains(query) {
+                result.entries[entry.id] = entry
+                result.games.append(LibraryGrouping.Game(entry: entry, position: position))
+            }
+        }
+        if SteamGamesSection.shown {
+            let enabled = SteamOwnedLibrary.enabled
+            let downloading = Set(steam.downloads.keys)
+            for item in SteamGamesRules.items(installed: steamGames.games, owned: enabled ? steam.owned : [], search: query) {
+                let installed = item.installed != nil || downloading.contains(item.id)
+                guard installed || (enabled && steam.signedIn) else { continue }
+                let recorded = steamEntries[item.id]
+                let steamPlayed = steam.playtime[item.id].flatMap {
+                    $0.lastPlayed > 0 ? Date(timeIntervalSince1970: TimeInterval($0.lastPlayed)) : nil
+                }
+                result.steam[item.id] = item
+                result.games.append(LibraryGrouping.Game(source: .steam(item.id), title: item.name, installed: installed,
+                                                         lastPlayed: [recorded?.entry.lastPlayed, steamPlayed].compactMap { $0 }.max(),
+                                                         bytes: recorded?.entry.folderBytes, position: recorded?.position))
+            }
+        }
+        return result
+    }
+
+    var body: some View {
+        let sources = self.sources
+        let groups = LibraryGrouping.groups(sources.games, by: grouping, sort: sort)
+        let collapsed = LibraryGrouping.collapsed(collapsedGroups)
+        VStack(alignment: .leading, spacing: 24) {
+            if groups.isEmpty {
+                if search.isEmpty {
+                    ContentUnavailableView("Make yourself at home", systemImage: "gamecontroller", description: Text("Copy a game's folder into Madeira › wine › drive_c with the Files app, then tap + and choose its .exe."))
+                } else {
+                    Text("No games match your search.").foregroundStyle(.secondary)
+                }
+            }
+            ForEach(groups) { group in
+                let key = grouping + "." + group.id
+                VStack(alignment: .leading, spacing: 14) {
+                    if let title = group.title {
+                        LibrarySectionHeader(title: title, count: group.games.count,
+                                             collapsed: SteamGamesSection.collapsible ? collapsedBinding(key) : nil) { EmptyView() }
+                    }
+                    if !(collapsed.contains(key) && SteamGamesSection.collapsible) {
+                        LibraryCells(items: group.games, layout: layout, width: width) { game, list, dense in
+                            cell(game, sources, list: list, dense: dense)
+                        }
+                    }
+                }
+            }
+        }
+        // As the Steam section does: the library reappears after every session.
+        .onAppear {
+            steamGames.refresh()
+            if SteamOwnedLibrary.enabled { steam.start(); steam.reconcileSession() }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { steamGames.refresh(); if SteamOwnedLibrary.enabled { steam.reconcileSession() } }
+        }
+        .sheet(item: $steamSheet) { selection in
+            SteamGameSheet(appID: selection.id) { entry in
+                // Let the download sheet finish dismissing before presenting the details page.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { open(entry) }
+            }
+        }
+        .alert("Steam", isPresented: Binding(get: { steam.error != nil }, set: { if !$0 { steam.error = nil } })) {
+            Button("OK", role: .cancel) { steam.error = nil }
+        } message: { Text(steam.error ?? "") }
+    }
+
+    private func collapsedBinding(_ key: String) -> Binding<Bool> {
+        Binding(get: { LibraryGrouping.collapsed(collapsedGroups).contains(key) }, set: { on in
+            var set = LibraryGrouping.collapsed(collapsedGroups)
+            if on { set.insert(key) } else { set.remove(key) }
+            collapsedGroups = LibraryGrouping.storing(set)
+        })
+    }
+
+    @ViewBuilder private func cell(_ game: LibraryGrouping.Game, _ sources: Sources, list: Bool, dense: Bool) -> some View {
+        switch game.source {
+        case .entry(let id):
+            if let entry = sources.entries[id] { localCell(entry, list, dense) }
+        case .steam(let appID):
+            if let item = sources.steam[appID] {
+                Button {
+                    if let installed = item.installed { open(library.steamEntry(installed, title: item.name)) }
+                    else { steamSheet = SteamSelection(id: appID) }
+                } label: { SteamGameCell(item: item, list: list, dense: dense) }
+                    .libraryCardButtonStyle(grid: !list)
+            }
+        }
+    }
+}
+
 struct LibraryView: View {
     @ObservedObject private var model = LibraryModel.shared
     @Environment(\.scenePhase) private var scenePhase
@@ -1832,6 +2070,8 @@ struct LibraryView: View {
     @State private var settingsRefresh = 0
     @AppStorage("madeiraLibraryLayout") private var layout = "cards"
     @AppStorage("madeiraLibrarySort") private var sort = "played"
+    @AppStorage("madeiraLibraryGroup") private var group = "platform"
+    @AppStorage("madeiraLibraryCollapsedGroups") private var collapsedGroups = ""
     // Collapsed state of the Other games section (MADEIRA_LIBRARY_COLLAPSE=0: no collapsing).
     @AppStorage("madeiraLibraryHideOthers") private var hideOthers = false
     // The sections follow the Steam section's games and sign-in (SteamGames.swift).
@@ -1846,6 +2086,22 @@ struct LibraryView: View {
             if sort == "size", $0.folderBytes != $1.folderBytes { return ($0.folderBytes ?? -1) > ($1.folderBytes ?? -1) }
             return $0.title.localizedStandardCompare($1.title) == .orderedAscending
         }
+    }
+    /// The games you added in the page's order, for the controller's focus. Grouping
+    /// and sorting go game by game, so their order among the Steam games is the
+    /// order without them.
+    private var focusOrder: [LibraryEntry] {
+        guard group != "platform" else { return entries }
+        let positions = Dictionary(uniqueKeysWithValues: model.entries.enumerated().map { ($1.id, $0) })
+        let byID = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) })
+        let games = entries.map { LibraryGrouping.Game(entry: $0, position: positions[$0.id] ?? 0) }
+        let collapsed = SteamGamesSection.collapsible ? LibraryGrouping.collapsed(collapsedGroups) : []
+        return LibraryGrouping.groups(games, by: group, sort: sort)
+            .filter { !collapsed.contains(group + "." + $0.id) }
+            .flatMap(\.games).compactMap { game in
+                if case .entry(let id) = game.source { return byID[id] }
+                return nil
+            }
     }
     var body: some View {
         // The system tab bar: on iOS 26 it is the floating Liquid Glass bar whose
@@ -1899,6 +2155,12 @@ struct LibraryView: View {
                     Label("List", systemImage: "list.bullet").tag("list")
                     Label("Compact list", systemImage: "list.dash").tag("compactList")
                 }
+                Picker("Group by", selection: $group) {
+                    Label("Last played", systemImage: "clock.arrow.circlepath").tag("played")
+                    Label("Installed", systemImage: "arrow.down.circle").tag("installed")
+                    Label("Platform", systemImage: "square.stack").tag("platform")
+                    Label("None", systemImage: "square.grid.2x2").tag("none")
+                }.pickerStyle(.menu)
                 Picker("Sort by", selection: $sort) {
                     Label("Last played", systemImage: "clock").tag("played")
                     Label("Name", systemImage: "textformat.abc").tag("name")
@@ -2036,6 +2298,13 @@ struct LibraryView: View {
                 // account's Not installed games. With nothing installed (or
                 // downloading) the games you added are the top section and the
                 // whole Steam section, sign-in included, follows them.
+                // Any other Group by choice lists every game in one set of groups.
+                if group != "platform" {
+                    LibraryGroupedGames(grouping: group, search: search, layout: layout, sort: sort, width: viewport.size.width,
+                                        open: { selected = $0 }) { entry, list, dense in
+                        libraryItem(entry, list: list, dense: dense)
+                    }
+                } else {
                 let steamFirst = MadeiraDock.enabled && SteamGamesSection.hasInstalled
                 if steamFirst {
                     SteamGamesSection(search: search, layout: layout, sort: sort, width: viewport.size.width,
@@ -2066,6 +2335,7 @@ struct LibraryView: View {
                 } else {
                     cells(entries, width: viewport.size.width)
                 }
+                }
             }
             // Ambient light behind the grid cards, in the content's own space so it scrolls with them.
             .backgroundPreferenceValue(AmbientGlowKey.self) { AmbientGlowLayer(items: $0) }
@@ -2074,7 +2344,7 @@ struct LibraryView: View {
         .refreshable { await SteamGamesSection.refresh() }
         .onReceive(controller.commands) { command in
             guard tab == 0, selected == nil, !browser, !onboarding.presented else { return }
-            let items = entries
+            let items = focusOrder
             let ids = [LibraryEntry.desktopID] + items.map(\.id)
             let index = ids.firstIndex(where: { $0 == focused }) ?? 0
             if command == "add" { browser = true }

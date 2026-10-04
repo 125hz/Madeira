@@ -35,6 +35,14 @@ Removing an entry never removes the game's files or saves.
 
 - Layouts: cards, compact cards, list and compact list (one short row per
   game). Sort by last played, name, date added or folder size. Search by title.
+- Group by: **Platform** (the default) is the sections below. **Last played**
+  (Today, Past 7 days, Past 30 days, Earlier, Never played), **Installed**
+  (Installed, then Not installed) and **None** (one grid) list the games you
+  added and Steam's games together, each group in the Sort by order. A Steam
+  game counts as played when Madeira or Steam last started it, and as
+  installed while it downloads. Not installed Steam games are listed only while
+  signed in. Group titles collapse like the section titles, and each one's
+  state is remembered.
 - Sections, as in the fork's library: when Madeira Dock is available,
   **Steam** (the Steam games being downloaded and the games Steam has
   installed, with their count; a **Sign in to Steam** card when signed out),
