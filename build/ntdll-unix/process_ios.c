@@ -925,7 +925,8 @@ static void madeira_steam_session_log( const UNICODE_STRING *image )
     }
     pthread_mutex_lock( &done_lock );
     for (i = 0; i < ndone && !seen; i++) if (!strcmp( done[i], name )) seen = 1;
-    if (!seen && ndone < sizeof(done) / sizeof(done[0])) strcpy( done[ndone++], name );
+    /* A full table counts as seen: otherwise every later spawn would link again. */
+    if (!seen) { if (ndone < sizeof(done) / sizeof(done[0])) strcpy( done[ndone++], name ); else seen = 1; }
     pthread_mutex_unlock( &done_lock );
     if (seen) return;
 
