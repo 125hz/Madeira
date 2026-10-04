@@ -103,8 +103,10 @@ because this port never runs wineboot's fake-DLL install. Only `x86_`
 assemblies are written, which 64-bit processes never look up.
 
 `FEX_MADEIRA_HOSTPROBE` carries the answers of the `hw.optional.*` sysctls
-FEX's WOW64 module cannot query itself (a wrong "present", e.g. FEAT_AFP,
-corrupts SSE results silently). Only the WOW64 module reads it.
+FEX's modules cannot query themselves (a wrong "present" either corrupts SSE
+results silently, e.g. FEAT_AFP, or is an illegal instruction, e.g. FlagM2 on
+A13). The app publishes it for every session, and both the WOW64 and the
+ARM64EC module read it; the ARM64EC module also takes LRCPC2 and AFP from it.
 
 ## 4. Unix calls from 32-bit DLLs
 

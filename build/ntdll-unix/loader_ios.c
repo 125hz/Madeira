@@ -3472,14 +3472,35 @@ void ios_child_boot_unlock( void )
 
 static void ios_child_boot_lock( const char *who )
 {
+    static int on = -1;
+    int ms;
+
     if (ios_child_boot_held) return;
+    if (on < 0)
+    {
+        /* 0: child processes boot at once, side by side, as before ml1213 */
+        const char *env = getenv( "MADEIRA_CHILD_BOOT_SERIAL" );
+        on = !(env && env[0] == '0');
+    }
+    if (!on) return;
     pthread_once( &ios_child_boot_once, ios_child_boot_key_init );
     if (pthread_mutex_trylock( &ios_child_boot_mutex ))
     {
         static int waits;
         if (waits++ < 16)
             dprintf( STDERR_FILENO, "[Wine child] ml1213 %s: another child is booting, waiting\n", who );
-        pthread_mutex_lock( &ios_child_boot_mutex );
+        /* At most 10 s: a child whose boot hangs without exiting must not stop every
+         * later CreateProcess of the session. Past that this one boots alongside. */
+        for (ms = 0; pthread_mutex_trylock( &ios_child_boot_mutex ); ms += 10)
+        {
+            if (ms >= 10000)
+            {
+                dprintf( STDERR_FILENO, "[Wine child] ml1213 %s: another child's boot has not finished "
+                         "in 10 s; booting alongside it\n", who );
+                return;
+            }
+            usleep( 10000 );
+        }
     }
     ios_child_boot_held = 1;
     if (ios_child_boot_key_ok) pthread_setspecific( ios_child_boot_key, (void *)1 );
