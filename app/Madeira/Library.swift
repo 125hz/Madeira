@@ -2371,6 +2371,10 @@ struct LibraryDetail: View {
                             } else if let played = entry.lastPlayed {
                                 Text("Last played \(played.formatted(.relative(presentation: .named)))").font(.subheadline).foregroundStyle(.secondary)
                             }
+                            // A game Valve's client starts (Madeira Dock): can it start without a connection?
+                            if DockOffline.enabled, let appID = entry.steamAppID, !entry.startsSteamGameDirectly {
+                                DockOfflineMark(appID: appID)
+                            }
                             Button(action: start) {
                                 HStack(spacing: 10) {
                                     // Enabling JIT can take seconds with nothing else on screen.
@@ -2725,6 +2729,35 @@ struct ControllerBindsPage: View {
         case 0x6E: return "Numpad ."
         case 0x6F: return "Numpad /"
         default:   return ControlAction.keyLabel(vk)
+        }
+    }
+}
+
+/// Game details: whether a Steam game that Valve's client starts (Madeira Dock)
+/// can start without a connection. "Saved" means its last online start ended with
+/// Valve's client confirming the license and reporting that it can sign the
+/// account in offline (DockOffline). Tapping the line explains it; an offline
+/// start is always Steam's decision at that moment.
+struct DockOfflineMark: View {
+    let appID: Int
+    @State private var explain = false
+    var body: some View {
+        let saved = DockOffline.verified(appID)
+        Button { explain = true } label: {
+            Label(saved != nil ? "Saved for offline play" : "Start once online to play offline",
+                  systemImage: saved != nil ? "checkmark.circle.fill" : "wifi.exclamationmark")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(saved != nil ? Color.green : Color.secondary)
+        }
+        .buttonStyle(.plain)
+        .alert(saved != nil ? "Saved for offline play" : "Not saved for offline play yet", isPresented: $explain) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            if let saved {
+                Text("Steam confirmed this game's license online on \(saved.formatted(date: .abbreviated, time: .omitted)) and can sign this account in without a connection. With no internet, Madeira asks Steam to start the game offline. Steam decides each time, and its offline sign-in expires after a while, so start a game online now and then.")
+            } else {
+                Text("Start this game once while you are online. Steam then keeps what it needs to sign in and start it without a connection.")
+            }
         }
     }
 }
