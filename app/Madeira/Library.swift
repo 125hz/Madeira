@@ -2453,12 +2453,12 @@ struct LibraryDetail: View {
                         ForEach(DisplayMode.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
                     }
                     FPSChoice(mode: $entry.fpsMode)
-                    if entry.desktop != true {
-                        Toggle("Frame generation (experimental)", isOn: Binding(get: { entry.frameGeneration ?? false }, set: { entry.frameGeneration = $0 ? true : nil }))
-                        if entry.frameGeneration == true {
-                            Text("Shows a MetalFX-generated frame between every two game frames: twice the frames on screen, at the cost of GPU time, some latency and artifacts at edges and on the HUD. FPS limits do not apply while it is on.")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
+                    // The Desktop too: its programs present through the same path, and its
+                    // launch exports the switch like a game's (applyEnvironment).
+                    Toggle("Frame generation (experimental)", isOn: Binding(get: { entry.frameGeneration ?? false }, set: { entry.frameGeneration = $0 ? true : nil }))
+                    if entry.frameGeneration == true {
+                        Text("Shows a MetalFX-generated frame between every two rendered frames: twice the frames on screen, at the cost of GPU time, some latency and artifacts at edges and on the HUD. FPS limits do not apply while it is on.")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                 }
                 // A Steam game starts with Steam's own launch option through Madeira Dock.

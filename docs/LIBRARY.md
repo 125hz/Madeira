@@ -107,7 +107,7 @@ starting screen takes over (or an error is shown). A profile holds:
 - **Frame generation (experimental)**, off by default: exports
   `MADEIRA_FRAMEGEN=1`, and DXMT's present path (D3D11 and D3D12 alike) shows a
   MetalFX-interpolated frame between every two game frames; FPS limits do not
-  apply while it is on;
+  apply while it is on. The Desktop's page has it too;
 - launch arguments (double-quoted tokens, at most 64 and 4 KB in total; not
   for Steam games, which Madeira Dock starts with Steam's own launch option),
   in their own section with chips for common flags (`-dx11`, `-dx12`, `-dx10`,
