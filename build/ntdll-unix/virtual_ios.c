@@ -3035,10 +3035,14 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
      * (via the unix_ios_push_jit_aliases unix-call), forward this new
      * mapping to it too. Early mappings (added before xtajit64 loads) are
      * picked up by the iteration in unix_ios_push_jit_aliases. */
-    if (ios_jit_alias_pushback_cb)
-        ios_jit_alias_pushback_cb((unsigned long long)(uintptr_t)pe_base,
-                                  (unsigned long long)(uintptr_t)jit_base,
-                                  (unsigned long long)size);
+    {
+        /* Loaded once: a child's exit can clear it between a test and a call. */
+        void (*cb)(unsigned long long, unsigned long long, unsigned long long) =
+            __atomic_load_n(&ios_jit_alias_pushback_cb, __ATOMIC_ACQUIRE);
+        if (cb)
+            cb((unsigned long long)(uintptr_t)pe_base, (unsigned long long)(uintptr_t)jit_base,
+               (unsigned long long)size);
+    }
 }
 
 /* ml951: hand a sub-floor image window to FEX so QueryGuestExecutableRange can
@@ -3065,10 +3069,12 @@ void ios_push_subfloor_window( unsigned long long low_base, unsigned long long r
                  low_base );
         return;
     }
-    if (!ios_jit_alias_pushback_cb) return;   /* pushed later by the catch-up loop */
+    void (*cb)(unsigned long long, unsigned long long, unsigned long long) =
+        __atomic_load_n(&ios_jit_alias_pushback_cb, __ATOMIC_ACQUIRE);   /* loaded once, as above */
+    if (!cb) return;   /* pushed later by the catch-up loop */
     fprintf( stderr, "ml951: pushing sub-floor window guest %#llx+%#llx -> real %#llx to FEX\n",
              low_base, size, real_base );
-    ios_jit_alias_pushback_cb( low_base, real_base, size );
+    cb( low_base, real_base, size );
 }
 
 /* unix_ios_push_jit_aliases handler. Called from PE-side ntdll's
@@ -3344,8 +3350,8 @@ NTSTATUS unixcall_ios_push_jit_aliases(void *args)
     void *self = ios_jit_current_peb();
     int i, own_pushed = 0;
     if (!params || !params->callback) return STATUS_INVALID_PARAMETER;
-    ios_jit_alias_pushback_cb = params->callback;
     ios_jit_alias_pushback_peb = self;
+    __atomic_store_n(&ios_jit_alias_pushback_cb, params->callback, __ATOMIC_RELEASE);
 
     /* ml951: any sub-floor window registered before xtajit64 loaded has not been
      * pushed yet — the per-registration push above needs this callback. Catch up. */
@@ -9770,8 +9776,7 @@ void ios_jit_reclaim_process( void *peb )
     {
         dprintf(2, "[alias-push] peb=%p exits while its emulator receives the alias pushes: "
                 "callback dropped before its pool copy is reclaimed\n", peb);
-        ios_jit_alias_pushback_cb = NULL;
-        __sync_synchronize();
+        __atomic_store_n(&ios_jit_alias_pushback_cb, NULL, __ATOMIC_RELEASE);
         ios_jit_alias_pushback_peb = NULL;
     }
 

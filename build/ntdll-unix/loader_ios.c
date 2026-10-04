@@ -3792,7 +3792,10 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
                 }
                 /* The copy is fresh from the PE image: give it the same
                  * RtlPcToFileHeader pool-alias patch as the session's copy
-                 * (virtual_ios.c, logs a [pc2fh] line). */
+                 * (virtual_ios.c, logs a [pc2fh] line). ARM64EC only: the patch is
+                 * for the arm64ec ntdll, and an aarch64/WoW64 child only logged
+                 * "not patched". */
+                if (is_arm64ec())
                 {
                     extern int ios_patch_rtl_pc_to_file_header_current( const void *pe_addr );
                     ios_patch_rtl_pc_to_file_header_current( pLdrInitializeThunk );
