@@ -8,7 +8,7 @@ against stubs for the view tree, the clock and NtFreeVirtualMemory, and checks:
     STATUS_MEMORY_NOT_ALLOCATED's case, anything else is not held;
   - held views are really released once the delay has run out, or at once
     while more than 128 MB are held, through the bypass (never re-held);
-  - MADEIRA_FREE_DELAY_MS=0 holds nothing;
+  - unset (the default) or MADEIRA_FREE_DELAY_MS=0 holds nothing;
   - the NtFreeVirtualMemory call site drains first and only takes size-0,
     page-aligned MEM_RELEASE calls.
 Needs python3 and a C compiler (AddressSanitizer/UBSan when available).
@@ -154,7 +154,7 @@ with tempfile.TemporaryDirectory(prefix='madeira-free-delay-') as directory:
         r = subprocess.run(flags, capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
         print('built without sanitizers')
-    for value, mode in [(None, 'on'), ('2000', 'on'), ('0', 'off')]:
+    for value, mode in [(None, 'off'), ('2000', 'on'), ('0', 'off')]:   # off unless set (opt-in)
         env = dict(os.environ)
         env.pop('MADEIRA_FREE_DELAY_MS', None)
         if value is not None:

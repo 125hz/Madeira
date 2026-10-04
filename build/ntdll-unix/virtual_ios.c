@@ -22948,8 +22948,10 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
  * Metal's command-buffer completion handler releasing a corrupted object).
  * A whole-view MEM_RELEASE of a private 1-16 MB allocation now succeeds
  * immediately but the mapping stays committed for MADEIRA_FREE_DELAY_MS
- * (default 2000; 0 turns it off), capped at 128 MB in flight, and is
- * released later. The race itself is not fixed; its victims survive. */
+ * (opt-in: off by default, 2000 is the tested value), capped at 128 MB in
+ * flight, and is released later. The race itself is not fixed; its victims
+ * survive. Off by default because it holds up to 128 MB more for every game,
+ * and a block cannot be reallocated at its own address while it is held. */
 #define IOS_FD_N 256
 static struct { char *base; size_t size; unsigned int ms; } ios_fd_ring[IOS_FD_N];
 static unsigned int ios_fd_n;
@@ -22962,9 +22964,9 @@ static int ios_fd_ms( void )
     if (v < 0)
     {
         /* How long a released 1-16 MB guest allocation stays mapped before it is
-         * really freed (default 2000 ms; 0 frees at once, as before). */
+         * really freed (default 0: freed at once; 2000 ms is the tested hold). */
         const char *e = getenv( "MADEIRA_FREE_DELAY_MS" );
-        v = e ? atoi( e ) : 2000;
+        v = e ? atoi( e ) : 0;
         if (v < 0) v = 0;
     }
     return v;
@@ -23028,6 +23030,15 @@ static int ios_fd_take( char *base, SIZE_T *out_size )
     if (!ok) return 0;
     if (ios_fd_n >= IOS_FD_N) ios_fd_drain( 1 );
     pthread_mutex_lock( &ios_fd_lock );
+    /* Checked again under the lock: two threads releasing the same base can both
+     * pass the check above, and holding it twice made the drain free it twice
+     * (the second time, possibly someone's new allocation at that address). */
+    for (i = 0; i < ios_fd_n; i++) if (ios_fd_ring[i].base == base) break;
+    if (i < ios_fd_n)
+    {
+        pthread_mutex_unlock( &ios_fd_lock );
+        return 2;
+    }
     if (ios_fd_n < IOS_FD_N)
     {
         ios_fd_ring[ios_fd_n].base = base; ios_fd_ring[ios_fd_n].size = vsize; ios_fd_ring[ios_fd_n].ms = ios_fd_now();
