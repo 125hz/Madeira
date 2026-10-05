@@ -49,7 +49,8 @@ Statically linked into the application binary:
 
 Bundled as files when the build includes it (wine-mono/):
 - Wine Mono 11.0.0, the .NET Framework runtime Wine's mscoree loads,
-  unmodified: Mono (LGPL or MIT X11 per part), FNA (Ms-PL and MIT), FAudio,
+  unmodified except mscorlib.dll (GC.Collect with GCCollectionMode.Optimized
+  returns; Madeira's build/wine-mono/bundle.sh): Mono (LGPL or MIT X11 per part), FNA (Ms-PL and MIT), FAudio,
   FNA3D, MojoShader and SDL3 (zlib), winforms, wpf, monoDX, System.Speech and
   Wine Mono's own code (MIT); details in wine-mono/COPYING. Source:
   wine-mono-11.0.0-src.tar.xz from https://dl.winehq.org/wine/wine-mono/11.0.0/

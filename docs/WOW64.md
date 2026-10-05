@@ -102,6 +102,12 @@ by themselves when that runtime loads, and only then:
   the backpatcher, turns SMC detection off for the process (ml1280): Mono
   rewrites live code only through the backpatcher, which the bridge handles.
 
+The bundled `mscorlib.dll` is patched at build time (`build/wine-mono/bundle.sh`,
+ml1281, a dirty hack, see the TODO there): `GC.Collect(gen,
+GCCollectionMode.Optimized, ...)` returns without collecting, as .NET allows.
+Mono ran a full blocking collection for every such call, and Terraria makes
+one per frame (85-150 ms each, ~8 FPS).
+
 Unity games load their own `mono-2.0-bdwgc.dll`, not through mscoree, and are
 not matched. The switches are in section 8.
 

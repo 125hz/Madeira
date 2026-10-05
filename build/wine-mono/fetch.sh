@@ -36,4 +36,5 @@ fi
 
 rm -rf "$D/wine-mono-$VER"
 tar -xJf "$D/wine-mono-$VER-x86.tar.xz" -C "$D"
+echo "$WINE_MONO_MSCORLIB_SHA256  $D/wine-mono-$VER/lib/mono/4.5/mscorlib.dll" | shasum -a 256 -c -
 echo "Wine Mono $VER ready in build/wine-mono/wine-mono-$VER"
