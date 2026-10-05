@@ -3580,7 +3580,65 @@ static void *ios_mach_exception_thread( void *arg )
                         *(uint16_t *)rw_addr = (uint16_t)IOS_STORE_SRC(rt);
                         emulated = 1;
                     }
-                    
+                    /* ml1276: SIMD&FP STR (register offset), B/H/S/D/Q:
+                     *   size 111 1 00 opc(1)0 1 Rm option S 10 Rn Rt
+                     *   mask 0x3f600c00, value 0x3c200800; opc<1> picks Q (size 00 only).
+                     * FEX addresses 32-bit guest memory as [x19, wN, uxtw] (x19 = the
+                     * guest window), so a guest SSE store becomes STR qN, [x19, wM, uxtw].
+                     * Terraria's Mono x86 JIT copied into its RWX code buffer with one
+                     * (0x3cab4a70) and, undecoded, looped through FEX's SMC handler 2000
+                     * times: FEX re-granted RWX, the alias page stays physically RX.
+                     * The address is taken from the registers rather than fault_addr,
+                     * which need not be the start of an access that crosses into the
+                     * faulting page; each 16 KB page of the destination takes its own
+                     * alias, and the store is refused unless all of it has one. */
+                    else if ((insn & 0x3f600c00) == 0x3c200800)
+                    {
+                        const unsigned size = insn >> 30;
+                        const unsigned bytes = ((insn >> 23) & 1) ? (size == 0 ? 16u : 0u) : (1u << size);
+                        const unsigned option = (insn >> 13) & 7;
+                        const int rt = insn & 0x1f, rn = (insn >> 5) & 0x1f, rm = (insn >> 16) & 0x1f;
+
+                        if (have_neon && bytes && (option & 2))  /* option<1> = 0 is unallocated */
+                        {
+                            uint64_t off = IOS_STORE_SRC(rm), ea, a;
+                            uintptr_t part_rw[2];
+                            unsigned part_len[2], parts = 0, done = 0, i;
+
+                            if (option == 2) off = (uint32_t)off;                        /* UXTW */
+                            else if (option == 6) off = (uint64_t)(int64_t)(int32_t)off; /* SXTW */
+                            if (insn & 0x1000) off <<= __builtin_ctz(bytes);
+                            ea = (rn == 31 ? state.__sp : state.__x[rn]) + off;
+                            while (done < bytes && parts < 2)
+                            {
+                                unsigned len = bytes - done;
+                                a = ea + done;
+                                if (len > 0x4000 - (a & 0x3fff)) len = 0x4000 - (unsigned)(a & 0x3fff);
+                                part_rw[parts] = (rx && rw && sz && a >= rx && a - rx <= sz - len)
+                                                 ? rw + (a - rx) : ios_jit_anon_alias_lookup( (uintptr_t)a );
+                                if (!part_rw[parts]) break;
+                                part_len[parts++] = len;
+                                done += len;
+                            }
+                            if (done == bytes)
+                            {
+                                const uint8_t *src = (const uint8_t *)&neon_state.__v[rt];
+                                for (i = 0, done = 0; i < parts; done += part_len[i], i++)
+                                    memcpy( (void *)part_rw[i], src + done, part_len[i] );
+                                emulated = 1;
+                            }
+                            {
+                                static int simd_reg_n;
+                                if (simd_reg_n < 4)
+                                    dprintf(STDERR_FILENO,
+                                        "[simd-str-reg] ml1276 #%d insn=0x%08x bytes=%u ea=0x%llx fault=0x%llx parts=%u %s\n",
+                                        ++simd_reg_n, insn, bytes, (unsigned long long)ea,
+                                        (unsigned long long)fault_addr, parts,
+                                        emulated ? "emulated" : "REFUSED: a page of the store has no alias");
+                            }
+                        }
+                    }
+
 
                     /* iOS-Madeira ml626: SWP{A}{L}{B,H} — ATOMIC SWAP.
                      *
