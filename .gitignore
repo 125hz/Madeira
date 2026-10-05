@@ -123,6 +123,10 @@ clean-prefix/
 tests/x64/asmconf_gen/
 tests/x64/asmconf_obj/
 
+# Wine Mono, fetched (hash-checked) by build/wine-mono/fetch.sh and bundled by
+# build/wine-mono/bundle.sh; the scripts are tracked, the payload is not.
+build/wine-mono/wine-mono-*
+
 # Microsoft Visual C++ runtime redistributables.
 # Microsoft-authored binaries, redistributable only under the Visual Studio
 # redistributable terms and only unmodified. Not ours to ship -- obtain them
