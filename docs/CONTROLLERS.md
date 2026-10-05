@@ -37,6 +37,14 @@ connected identity. UIKit handles independent fingers and cancellation, so
 releasing one of two controls mapped to the same button leaves the other held.
 The pinch recognizer is enabled only during editing.
 
+Once the touch pad has connected, the Session menu (including opening the
+software keyboard) and control editor keep that identity connected with neutral
+input. Late touches are ignored while gameplay controls are suppressed; closing
+the menu accepts fresh input without an XInput disconnect/reconnect. This does
+not connect a pad early while the game is loading. Actually hiding or removing
+all controller mappings still disconnects it, unless the session reservation
+described below is enabled.
+
 Touch and physical buttons combine; triggers use the larger value. A physical
 stick outside its standard XInput dead zone takes priority over touch on that
 stick. Otherwise a deflected touch stick takes priority; resting touch preserves

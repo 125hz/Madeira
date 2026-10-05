@@ -3835,9 +3835,10 @@ struct TouchControlsOverlay: View {
     }
 
     private func configureGamepad(landscape: Bool) {
-        let ids = landscape && m.visible && !m.editing && !library.blocksGameplayTouch
+        let ids = landscape && m.visible
             ? m.controls.filter { $0.action.padName.map(TouchPadAction.supported) ?? false }.map(\.id) : []
-        GamepadInput.shared.configureTouch(controls: Set(ids))
+        GamepadInput.shared.configureTouch(controls: Set(ids),
+            acceptingInput: !m.editing && !library.blocksGameplayTouch)
     }
 
     /// ml1970: with MADEIRA_CONTROLS_XBOX_DEFAULT=1, a user with no controls file gets the built-in controller

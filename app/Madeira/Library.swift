@@ -3895,6 +3895,7 @@ enum LibraryKeyboard {
         fputs("[frontend-keyboard] key-window input activated\n", stderr)
     }
     static func hide() {
+        if window != nil { fputs("[frontend-keyboard] key-window input deactivated\n", stderr) }
         input?.releaseModifiers(); input?.resignFirstResponder(); window?.isHidden = true
         window = nil; input = nil; previous?.makeKey(); previous = nil
     }
