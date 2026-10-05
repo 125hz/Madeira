@@ -7441,6 +7441,8 @@ struct ios_wow_window
     void      *teb_block;
     void     **next_free_teb;   /* same type as the session-wide next_free_teb */
     int        teb_block_pos;
+    unsigned   wine_mono;       /* ml1279: libmono-2.0-x86.dll was mapped in this window, so its
+                                   RWX memory is plain read/write from then on */
 };
 static struct ios_wow_window ios_wow_windows[IOS_WOW_MAX_WINDOWS];
 static unsigned ios_wow_window_count;
@@ -8737,6 +8739,7 @@ NTSTATUS ios_wow_window_reserve(void)
     slot->teb_block     = NULL;
     slot->next_free_teb = NULL;
     slot->teb_block_pos = 0;
+    slot->wine_mono     = 0;
     slot->leaked        = 0;
     slot->dead          = 0;
     slot->dead_peb      = NULL;
@@ -11959,6 +11962,87 @@ static int ios_guest_anon_rwx_view_ok( const struct file_view *view )
     return (view->size & 0xffff) != 0;   /* data, not a code chunk: see above */
 }
 
+/* ml1279: anonymous RWX memory in a 32-bit guest window, code chunks included.
+ *
+ * Nothing there is ever executed by the host: FEX decodes the x86 bytes and runs its own
+ * translation from its code buffer, so the window rule of ml1030 (image pages) holds for a
+ * managed runtime's JIT chunks too. Through the JIT pool every store to such a chunk was a
+ * Mach fault: Terraria's wine-mono emitted 25.2 M emulated stores into ~8 MB of 64 KB code
+ * chunks in 7 minutes (~100 s of handler time, the main thread down to 30-40% busy), and
+ * MADEIRA_WX's 256-page table was full after 20 s. As plain memory a chunk is written
+ * freely until FEX arms it (PAGE_EXECUTE_READ -> PROT_READ); the next store faults once,
+ * FEX invalidates and disarms (PAGE_EXECUTE_READWRITE -> read/write), as on Windows.
+ * Same exclusions as below (EC_CODE requests, the pool, existing aliases, images, file
+ * mappings), but no size heuristic and no ARM64EC view requirement.
+ *
+ * ml1282: automatic per window. It turns on in a window when Wine Mono's runtime
+ * (libmono-2.0-x86.dll, loaded by mscoree) is mapped there -- verified on Terraria; a
+ * Unity game loads its own mono-2.0-bdwgc.dll and is not matched. MADEIRA_WOW_RWX_PLAIN=0
+ * never turns it on, =1 turns it on for every 32-bit window. */
+static int ios_wow_rwx_plain_mode(void)
+{
+    static int cached = -2;
+    if (cached == -2)
+    {
+        const char *s = getenv( "MADEIRA_WOW_RWX_PLAIN" );
+        cached = !s || !*s ? -1 : (*s == '1') ? 1 : 0;
+        dprintf( 2, "[wow-rwx] ml1279 MADEIRA_WOW_RWX_PLAIN=%s -> 32-bit guest RWX memory is %s\n",
+                 s ? s : "(unset)",
+                 cached == 1 ? "plain read/write in every 32-bit window" :
+                 cached == 0 ? "pool-aliased (stores emulated)" :
+                               "plain read/write in a window once Wine Mono is mapped there" );
+    }
+    return cached;
+}
+
+/* The window whose RWX memory is plain, or NULL. Lock-free reads of slot fields, like the
+ * other window lookups on this path. */
+static struct ios_wow_window *ios_wow_rwx_plain_window( const void *addr )
+{
+    int mode = ios_wow_rwx_plain_mode();
+    struct ios_wow_window *w;
+
+    if (!mode) return NULL;
+    if (!(w = ios_wow_live_slot_for_addr( addr ))) return NULL;
+    if (mode == 1 || __atomic_load_n( &w->wine_mono, __ATOMIC_ACQUIRE )) return w;
+    return NULL;
+}
+
+/* Called for every image mapping: notice Wine Mono's 32-bit runtime. */
+static void ios_wow_note_image( const void *base, const UNICODE_STRING *nt_name )
+{
+    static const WCHAR libmono[] = {'l','i','b','m','o','n','o','-','2','.','0','-','x','8','6','.','d','l','l'};
+    const size_t n = ARRAY_SIZE( libmono );
+    struct ios_wow_window *w;
+    const WCHAR *name;
+    size_t len, i;
+
+    if (!nt_name || !nt_name->Buffer) return;
+    len = nt_name->Length / sizeof(WCHAR);
+    if (len < n) return;
+    name = nt_name->Buffer + len - n;
+    if (len > n && name[-1] != '\\' && name[-1] != '/') return;
+    for (i = 0; i < n; i++)
+    {
+        WCHAR c = name[i];
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        if (c != libmono[i]) return;
+    }
+    if (!(w = ios_wow_live_slot_for_addr( base ))) return;
+    if (__atomic_exchange_n( &w->wine_mono, 1, __ATOMIC_ACQ_REL )) return;
+    dprintf( 2, "[wow-rwx] ml1282 Wine Mono mapped at %p in window B=%p: its RWX memory is %s\n",
+             base, (void *)w->base,
+             ios_wow_rwx_plain_mode() ? "plain read/write from now on"
+                                      : "still pool-aliased (MADEIRA_WOW_RWX_PLAIN=0)" );
+}
+
+static int ios_wow_rwx_view_ok( const struct file_view *view )
+{
+    if (!is_view_valloc( view )) return 0;
+    if (view->protect & (SEC_IMAGE | VPROT_ARM64EC | VPROT_SYSTEM)) return 0;
+    return 1;
+}
+
 /* The range is host-page rounded (16 KB) and can run past the end of a guest
  * allocation (0x41000 -> 0x44000), so every view it touches must qualify. */
 static int ios_guest_anon_rwx_is_host_data( const void *base, size_t size )
@@ -11970,6 +12054,24 @@ static int ios_guest_anon_rwx_is_host_data( const void *base, size_t size )
     void *cov_rw = NULL, *cov_rx = NULL;
     uintptr_t b = (uintptr_t)base, e = b + size, a, rx = (uintptr_t)ios_jit_rx_base_global;
     int any = 0;
+
+    struct ios_wow_window *plain_w = (!ios_alloc_ec_code && e > b) ? ios_wow_rwx_plain_window( base ) : NULL;
+
+    if (plain_w && e - 1 < plain_w->base + IOS_WOW_WINDOW_SIZE &&
+        !(rx && e > rx && b < rx + ios_jit_pool_size_global) &&
+        !ios_jit_anon_alias_find_cover( (void *)base, size, &cov_rw, &cov_rx ))
+    {
+        for (a = b; a < e; )
+        {
+            struct file_view *view = find_view( (const void *)a, 1 );
+            if (!view) { a = (a + 0x1000) & ~(uintptr_t)0xfff; continue; }   /* rounding gap */
+            if (!ios_wow_rwx_view_ok( view )) { any = -1; break; }
+            any = 1;
+            a = (uintptr_t)view->base + view->size;
+        }
+        if (any == 1) return 1;
+        any = 0;
+    }
 
     if (!ios_guest_rwx_data_enabled() || ios_alloc_ec_code || !arm64ec_view) return 0;
     if (e <= b) return 0;
@@ -17036,6 +17138,10 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     SIZE_T header_size, header_map_size, total_size = view->size;
     SIZE_T align_mask = max( image_info->alignment - 1, page_mask );
     INT_PTR delta;
+
+#ifdef WINE_IOS
+    ios_wow_note_image( view->base, nt_name );   /* ml1282 */
+#endif
 
     TRACE_(module)( "mapping PE file %s at %p-%p\n", debugstr_us(nt_name), ptr, ptr + total_size );
 
