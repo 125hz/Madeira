@@ -1718,7 +1718,9 @@ static inline void ios_note_guest_delivery( uint64_t thread )
  * takes the alignment-fault path instead.
  *
  * Returns 1 (written), -1 (refused: a page of the store has no alias) or 0
- * (not a crossing store this helper decodes; the per-encoding cases run). */
+ * (not a crossing store this helper decodes; the per-encoding cases run).
+ * ml1292: also called by the thread sampler (server_ios.c) to complete a store
+ * the kernel keeps faulting on, with the thread suspended. */
 int ios_store_split_crossing( uint32_t insn, arm_thread_state64_t *st,
                                      const arm_neon_state64_t *neon,
                                      uintptr_t rx, uintptr_t rw, size_t sz )
