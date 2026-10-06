@@ -252,7 +252,11 @@ func jwt(_ claims: String) -> String {
 with tempfile.TemporaryDirectory(prefix='madeira-dock-contract-') as tmp:
     tmp = Path(tmp)
     (tmp / 'stubs.swift').write_text(stubs + head)
-    (tmp / 'dock.swift').write_text('import Foundation\n#if canImport(Glibc)\nimport Glibc\n#else\nimport Darwin\n#endif\n' + body)
+    (tmp / 'dock.swift').write_text(('import Foundation\n#if canImport(Glibc)\nimport Glibc\n#else\nimport Darwin\n#endif\n'
+        '#if canImport(Network)\nimport Network\n#else\n'
+        '/* Linux: no Network framework; DockOffline only needs these names. */\n'
+        'final class NWPathMonitor { struct Path { enum Status { case satisfied, unsatisfied, requiresConnection }; '
+        'var status = Status.satisfied }; var currentPath = Path(); func start(queue: DispatchQueue) {} }\n#endif\n') + body)
     (tmp / 'checks.swift').write_text(checks)
     exe = tmp / 'check'
     build = subprocess.run([SWIFTC, '-parse-as-library', '-swift-version', '5', '-sanitize=address', '-o', str(exe),

@@ -459,7 +459,11 @@ func record(_ appID: Int, _ name: String, _ folder: String, flags: Int) -> Strin
 with tempfile.TemporaryDirectory(prefix='madeira-steam-games-') as tmp:
     tmp = Path(tmp)
     (tmp / 'stubs.swift').write_text(stubs + head)
-    (tmp / 'dock.swift').write_text('import Foundation\n#if canImport(Glibc)\nimport Glibc\n#else\nimport Darwin\n#endif\n' + body)
+    (tmp / 'dock.swift').write_text(('import Foundation\n#if canImport(Glibc)\nimport Glibc\n#else\nimport Darwin\n#endif\n'
+        '#if canImport(Network)\nimport Network\n#else\n'
+        '/* Linux: no Network framework; DockOffline only needs these names. */\n'
+        'final class NWPathMonitor { struct Path { enum Status { case satisfied, unsatisfied, requiresConnection }; '
+        'var status = Status.satisfied }; var currentPath = Path(); func start(queue: DispatchQueue) {} }\n#endif\n') + body)
     (tmp / 'rules.swift').write_text('import Foundation\n' + rules)
     (tmp / 'owned.swift').write_text('import Foundation\n' + owned_game + '\n' + vdf)
     (tmp / 'checks.swift').write_text(checks)

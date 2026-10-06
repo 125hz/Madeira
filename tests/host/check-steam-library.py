@@ -1041,7 +1041,11 @@ try:
 
     (work / 'stubs.swift').write_text(STUBS.replace('RELATIVE_ROOT', relative_root).replace('REASON', reason))
     (work / 'checks.swift').write_text(CHECKS)
-    (work / 'dock.swift').write_text('import Foundation\n#if canImport(Glibc)\nimport Glibc\n#else\nimport Darwin\n#endif\n' + dock_head + dock_body)
+    (work / 'dock.swift').write_text(('import Foundation\n#if canImport(Glibc)\nimport Glibc\n#else\nimport Darwin\n#endif\n'
+        '#if canImport(Network)\nimport Network\n#else\n'
+        '/* Linux: no Network framework; DockOffline only needs these names. */\n'
+        'final class NWPathMonitor { struct Path { enum Status { case satisfied, unsatisfied, requiresConnection }; '
+        'var status = Status.satisfied }; var currentPath = Path(); func start(queue: DispatchQueue) {} }\n#endif\n') + dock_head + dock_body)
     (work / 'owned.swift').write_text('import Foundation\n' + owned_game + playtime_source)
     (work / 'downloader.swift').write_text(downloader_host)
     production = [steam / 'Proto/SteamProtoMessages.swift', steam / 'Core/SteamError.swift', steam / 'Core/SteamProtocol.swift',
