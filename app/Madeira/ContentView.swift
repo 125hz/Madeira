@@ -1358,8 +1358,9 @@ struct ContentView: View {
     /// The developer interface. Orientation comes from the view's own shape, not
     /// verticalSizeClass: iPad is .regular in BOTH orientations, so the size-class
     /// test kept the portrait tooling (badges, buttons, log) on screen after
-    /// rotating. The keyboard is excluded from the measurement, otherwise raising
-    /// it on a portrait iPad would make the view wider than tall.
+    /// rotating. On iPad the keyboard is excluded from the measurement, otherwise
+    /// raising it in portrait would make the view wider than tall; an iPhone's
+    /// keyboard never does, so there the portrait layout still makes room for it.
     private var developerBody: some View {
         GeometryReader { geo in
             let landscape = geo.size.width > geo.size.height
@@ -1383,7 +1384,7 @@ struct ContentView: View {
             // The landscape controls window re-frames to the rotated scene.
             .onChange(of: landscape) { _, _ in TouchControlsHost.attach() }
         }
-        .ignoresSafeArea(.keyboard)
+        .ignoresSafeArea(UIDevice.current.userInterfaceIdiom == .pad ? .keyboard : [])
     }
 
     /// A library session: the game full screen in either orientation, with the
@@ -3320,8 +3321,9 @@ struct ContentView: View {
             // this, keeps the default for Dock sessions too.
             setenv("MADEIRA_GDI_SHARED_SECTION", "1", 1)
             // ml1185: without desktop-size or a game's Resolution, this screen's shape
-            // (ml1172's default, 944x656 on an 11-inch iPad), as every library entry
-            // defaults to; upstream's 1280x720 left bars above and below on an iPad.
+            // (ml1172's default: 1408x648 on a 19.5:9 iPhone, 1152x800 on an 11-inch
+            // iPad), as every library entry defaults to; a fixed 1280x720 left bars
+            // above and below on an iPad.
             var (width, height) = ResolutionChoices.defaultSize()
             if let txt = MadeiraConfig.get("desktop-size") {
                 let p = txt.lowercased().split(separator: "x").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }

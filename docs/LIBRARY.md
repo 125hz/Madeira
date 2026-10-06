@@ -106,11 +106,13 @@ and check-frontend fails if a setting is hidden from it. A profile holds:
   `GuestDisplay.swift`; the developer interface's Resolution menu shows the
   same list):
   - **This screen's shape**, which fills the screen without bars: the screen's
-    aspect ratio at 944×656's pixel count (**default**), at 1280×720's (≈720p)
-    and at 1920×1080's (≈1080p), sides rounded to multiples of 8, then the
-    screen's **native** pixels; a size past native is left out. On an 11-inch
-    iPad (1180×820 points): 944×656, 1152×800, 1728×1200, 2360×1640; on an
-    iPhone 16 Pro Max: 1168×536, 1408×648, 2120×976, 2868×1320;
+    aspect ratio at 944×656's pixel count (light), at 1280×720's (≈720p, the
+    **default**, so a 19.5:9 iPhone keeps the 1408×648 it always had and a
+    game's mode list is unchanged) and at 1920×1080's (≈1080p), sides rounded
+    to multiples of 8, then the screen's **native** pixels; a size past native
+    is left out. On an 11-inch iPad (1180×820 points): 944×656, 1152×800,
+    1728×1200, 2360×1640; on an iPhone 16 Pro Max: 1168×536, 1408×648,
+    2120×976, 2868×1320;
   - **16:9 widescreen**: 960×540, 1280×720, 1600×900, 1920×1080, 2560×1440;
   - **4:3 classic**: 640×480, 800×600, 1024×768, 1280×960.
 

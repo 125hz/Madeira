@@ -131,7 +131,8 @@ arguments are not supported.
 4. The session is the normal Wine session: `explorer.exe
    /desktop=madeira,<W>x<H> C:\windows\system32\dockhost.exe`. The size comes
    from `desktop-size` in madeira.cfg, else the device's own default size
-   (the library's default Resolution, 944x656 on an 11-inch iPad). When the game has
+   (the library's default Resolution: 1408x648 on a 19.5:9 iPhone, 1152x800 on
+   an 11-inch iPad). When the game has
    one-time installs to run, it is `... C:\windows\system32\cmd.exe /c call
    C:\madeira-dock-installers.cmd & C:\windows\system32\dockhost.exe`: the
    installers first, then the host, in the same session.

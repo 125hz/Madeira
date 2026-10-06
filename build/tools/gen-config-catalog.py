@@ -69,7 +69,7 @@ OVERLAY = {
                 "note": "0 limits the media parser to MP3/WAV; by default MP4 with H.264/HEVC video decodes through VideoToolbox."},
     "cpu-count": {"title": "Reported CPU count (0 = device)"},
     "desktop-size": {"title": "Virtual desktop size (WxH)",
-                     "note": "The developer interface's Wine desktop size (ml1127); its Resolution menu writes it (ml1157). Unset: this screen's shape at 944x656's pixel count (ml1172, 944x656 on an 11-inch iPad). Applies at the next app start."},
+                     "note": "The developer interface's Wine desktop size (ml1127); its Resolution menu writes it (ml1157). Madeira Dock sessions without a game's Resolution use it too. Unset: this screen's shape at 1280x720's pixel count (ml1172: 1408x648 on a 19.5:9 iPhone, 1152x800 on an 11-inch iPad). Applies at the next app start."},
     "d3d9": {"title": "Direct3D 9 frontend (32-bit)", "kind": "choice",
              "choices": [("", "Default (emulated)"), ("native", "Native ARM64 frontend")]},
     "fence-chain": {"title": "D3D12 fence chain mode"},

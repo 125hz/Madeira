@@ -191,12 +191,14 @@ enum ResolutionChoices {
         #endif
     }()
 
-    /// Pixel counts of the screen-shaped choices. The default is 944x656's:
-    /// the fork's default on an 11-inch iPad (0.8x its points), the owner's
-    /// pick for render cost; then 1280x720's and 1920x1080's.
+    /// Pixel counts of the screen-shaped choices: a light one (944x656's, 0.8x
+    /// an 11-inch iPad's points), the default (1280x720's: 1408x648 on a 19.5:9
+    /// iPhone, the size every entry had before these choices, so a game's mode
+    /// list is unchanged), then 1920x1080's.
     static let budgets: [(pixels: Int, name: String)] = [
-        (944 * 656, "default"), (1280 * 720, "≈720p"), (1920 * 1080, "≈1080p"),
+        (944 * 656, "light"), (1280 * 720, "≈720p, default"), (1920 * 1080, "≈1080p"),
     ]
+    static let defaultBudget = 1
     static let widescreen = [(960, 540), (1280, 720), (1600, 900), (1920, 1080), (2560, 1440)]
     static let classic = [(640, 480), (800, 600), (1024, 768), (1280, 960)]
 
@@ -217,7 +219,7 @@ enum ResolutionChoices {
         h > 0 && abs(Double(w) / Double(h) / aspect(s) - 1) < 0.015
     }
 
-    static func defaultSize(for s: Screen = screen) -> (w: Int, h: Int) { shape(s, pixels: budgets[0].pixels) }
+    static func defaultSize(for s: Screen = screen) -> (w: Int, h: Int) { shape(s, pixels: budgets[defaultBudget].pixels) }
     static var defaultValue: String { let d = defaultSize(); return "\(d.w)x\(d.h)" }
 
     static func groups(for s: Screen = screen) -> [Group] {
@@ -225,8 +227,8 @@ enum ResolutionChoices {
         var own: [Choice] = []
         for (i, b) in budgets.enumerated() {
             let (w, h) = shape(s, pixels: b.pixels)
-            // More pixels than the screen has only cost more.
-            if i > 0 && w * h >= native.w * native.h { break }
+            // More pixels than the screen has only cost more (never the light or default size).
+            if i > defaultBudget && w * h >= native.w * native.h { break }
             own.append(Choice(w: w, h: h, label: "\(w)×\(h) · \(b.name)"))
         }
         if native.w <= 3840, native.h <= 2160, !own.contains(where: { $0.w == native.w && $0.h == native.h }) {

@@ -138,8 +138,8 @@ expect(env("MADEIRA_EXE") == "C:\\Games\\Some Game\\bin\\game.exe", "direct exec
 expect(env("MADEIRA_ARGS") == "-windowed \"-name=a b\"", "direct arguments verbatim")
 expect(env("MADEIRA_DESKTOP") == nil, "desktop state cleared")
 // Every entry's Resolution becomes the session's virtual monitor.
-expect(game.resolution == "944x656", "ml1172: new entries default to the screen's shape (944x656 on an 11-inch iPad)")
-expect(env("MADEIRA_SCREEN_W") == "944" && env("MADEIRA_SCREEN_H") == "656" && env("MADEIRA_SCREEN_SRC") == "knob",
+expect(game.resolution == "1152x800", "ml1172: new entries default to the screen's shape at 720p's pixels (1152x800 on an 11-inch iPad)")
+expect(env("MADEIRA_SCREEN_W") == "1152" && env("MADEIRA_SCREEN_H") == "800" && env("MADEIRA_SCREEN_SRC") == "knob",
        "a direct game's resolution is exported as the session default")
 game.resolution = "1560x720"; game.configureLaunch()
 expect(env("MADEIRA_SCREEN_W") == "1560" && env("MADEIRA_SCREEN_H") == "720" && published == (1560, 720),
@@ -387,21 +387,21 @@ func screenOf(_ pw: CGFloat, _ ph: CGFloat, _ nw: CGFloat, _ nh: CGFloat) -> RC.
     RC.Screen(points: CGSize(width: pw, height: ph), pixels: CGSize(width: nw, height: nh))
 }
 func sizes(_ g: RC.Group) -> [String] { g.choices.map(\.value) }
-let ipad = screenOf(1180, 820, 2360, 1640)          // 11-inch iPad (the owner's)
+let ipad = screenOf(1180, 820, 2360, 1640)          // 11-inch iPad
 let ipad13 = screenOf(1376, 1032, 2752, 2064)       // 13-inch iPad, 4:3
 let phone16 = screenOf(956, 440, 2868, 1320)        // iPhone 16 Pro Max, 19.5:9
 let ig = RC.groups(for: ipad)
-expect(RC.defaultSize(for: ipad) == (944, 656), "iPad 11: default 944x656")
+expect(RC.defaultSize(for: ipad) == (1152, 800), "iPad 11: default 1152x800 (720p's pixels)")
 expect(sizes(ig[0]) == ["944x656", "1152x800", "1728x1200", "2360x1640"], "iPad 11: screen-shaped choices, then native")
-expect(ig[0].choices.map(\.label) == ["944×656 · default", "1152×800 · ≈720p", "1728×1200 · ≈1080p", "2360×1640 · native"],
+expect(ig[0].choices.map(\.label) == ["944×656 · light", "1152×800 · ≈720p, default", "1728×1200 · ≈1080p", "2360×1640 · native"],
        "iPad 11: labels name each level")
 expect(ig.map(\.title) == ["This screen's shape", "16:9 widescreen · bars above and below", "4:3 classic · bars at the sides"],
        "iPad 11: group titles say how the PC shapes fit")
 expect(sizes(ig[1]) == ["960x540", "1280x720", "1600x900", "1920x1080", "2560x1440"] && sizes(ig[2]) == ["640x480", "800x600", "1024x768", "1280x960"],
        "iPad 11: the 16:9 and 4:3 sizes")
 expect(!RC.fills(1408, 648, screen: ipad) && RC.fills(1408, 648, screen: phone16), "1408x648 is a phone's shape, not an iPad's")
-expect(RC.defaultSize(for: phone16) == (1168, 536) && sizes(RC.groups(for: phone16)[0]) == ["1168x536", "1408x648", "2120x976", "2868x1320"],
-       "iPhone 16 Pro Max: its own shape; upstream's 1408x648 is its ≈720p")
+expect(RC.defaultSize(for: phone16) == (1408, 648) && sizes(RC.groups(for: phone16)[0]) == ["1168x536", "1408x648", "2120x976", "2868x1320"],
+       "iPhone 16 Pro Max: its own shape; the default stays 1408x648, its ≈720p")
 let g13 = RC.groups(for: ipad13)
 expect(g13[2].title == "4:3 classic · fills this screen" && RC.defaultSize(for: ipad13).h > 0, "iPad 13: 4:3 fills the screen")
 let seG = RC.groups(for: screenOf(667, 375, 1334, 750))

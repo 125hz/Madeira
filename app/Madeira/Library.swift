@@ -168,8 +168,8 @@ struct LibraryEntry: Codable, Identifiable {
     /// The virtual monitor's size ("WxH"): the session default a game renders
     /// for (GuestDisplay.configureSessionDefault), and the Desktop entry's
     /// desktop size. ml1172: new entries default to this screen's shape at
-    /// 944x656's pixel count (ResolutionChoices; 944x656 on an 11-inch iPad);
-    /// upstream's fixed 1408x648 is a phone's shape.
+    /// 1280x720's pixel count (ResolutionChoices: 1408x648 on a 19.5:9 iPhone,
+    /// as before, and 1152x800 on an 11-inch iPad, where a fixed 1408x648 left bars).
     var resolution = ResolutionChoices.defaultValue
     /// How the monitor is scaled to the screen (DisplayMode raw value; nil = Fit).
     var display: String?
@@ -678,10 +678,11 @@ final class LibraryModel: ObservableObject {
         resetPhoneResolution()
     }
 
-    /// ml1172: upstream gave every new entry 1408x648, a 19.5:9 phone's shape.
+    /// ml1172: every new entry used to get 1408x648, a 19.5:9 phone's shape.
     /// On a screen of another shape (an iPad: a third of it black in Fit)
-    /// those entries are reset once to this device's default; nothing tells a
-    /// deliberate 1408x648 from the old default, and the owner chose the reset.
+    /// those entries are reset once to this device's default. Nothing tells a
+    /// deliberate 1408x648 from the old default, so a game set to it on purpose
+    /// is reset too; on a 19.5:9 iPhone nothing changes.
     private func resetPhoneResolution() {
         let key = "madeira.ml1172.resolution-reset"
         guard !readOnly, !UserDefaults.standard.bool(forKey: key) else { return }
