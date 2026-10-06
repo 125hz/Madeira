@@ -3731,6 +3731,76 @@ static void *ios_mach_exception_thread( void *arg )
                             }
                         }
                     }
+                    /* ml1284: STXR / STLXR Ws, Wt|Xt, [Xn] into an aliased page.
+                     *   size 001000 0 0 0 Rs o0 11111 Rn Rt, mask 0x3fe07c00 val 0x08007c00
+                     * The paired LDXR/LDAXR read the RX view and succeeded; only the store
+                     * faults, so the exclusive monitor never sees it and replaying it as a
+                     * plain store would lose a racing update. ntdll's RtlEnterCriticalSection
+                     * (LDAXR W9, [X8]; ADD W10, W9, #1; STLXR W11, W10, [X8]) reached this on
+                     * a critical section a 64-bit .NET runtime keeps in its RWX memory.
+                     * The LL/SC pair becomes a compare-and-swap on the RW alias: the expected
+                     * value is the register the matching load filled, found by scanning back
+                     * at most 8 instructions for an LDXR/LDAXR of the same Rn and size; any
+                     * instruction between that may write that register (anything but a
+                     * branch on it) refuses the emulation. Ws = 0 when the swap succeeds and
+                     * 1 when the value changed, so the guest's loop retries as on hardware.
+                     * Every write to such a page traps and is handled on the one Mach
+                     * exception thread, and the CAS is a real atomic on the shared pages. */
+                    else if ((insn & 0x3fe07c00) == 0x08007c00)
+                    {
+                        const unsigned size = insn >> 30;
+                        const int rs = (insn >> 16) & 0x1f, rn = (insn >> 5) & 0x1f, rt = insn & 0x1f;
+                        const uint64_t mask = size == 3 ? ~0ull : ((1ull << (8u << size)) - 1);
+                        const uint64_t ea = rn == 31 ? state.__sp : state.__x[rn];
+                        int ld_rt = -1, k, clobbered = 0;
+                        uint32_t prev;
+
+                        for (k = 1; k <= 8 && ld_rt < 0 && !clobbered; k++)
+                        {
+                            if (!ios_fault_read_insn( (uint64_t)(uintptr_t)fault_pc - 4u * k, &prev )) break;
+                            if ((prev & 0x3fff7c00) == 0x085f7c00 && (prev >> 30) == size
+                                && (int)((prev >> 5) & 0x1f) == rn)
+                                ld_rt = prev & 0x1f;                       /* LDXR / LDAXR */
+                        }
+                        if (ld_rt >= 0 && ld_rt != 31)
+                        {
+                            for (k = k - 2; k >= 1 && !clobbered; k--)  /* the instructions between */
+                            {
+                                if (!ios_fault_read_insn( (uint64_t)(uintptr_t)fault_pc - 4u * k, &prev )) { clobbered = 1; break; }
+                                if ((int)(prev & 0x1f) != ld_rt) continue;
+                                if ((prev & 0x7e000000) == 0x34000000          /* CBZ / CBNZ */
+                                    || (prev & 0x7e000000) == 0x36000000       /* TBZ / TBNZ */
+                                    || (prev & 0xff000010) == 0x54000000)      /* B.cond */
+                                    continue;
+                                clobbered = 1;
+                            }
+                        }
+                        if (ld_rt >= 0 && ld_rt != 31 && !clobbered && rw_addr && !(ea & ((1u << size) - 1))
+                            && (uint64_t)fault_addr == ea)
+                        {
+                            const uint64_t expect = state.__x[ld_rt] & mask, val = IOS_STORE_SRC(rt) & mask;
+                            int ok = 0;
+                            switch (size)
+                            {
+                            case 0: { uint8_t  e = (uint8_t)expect;  ok = __atomic_compare_exchange_n( (uint8_t  *)rw_addr, &e, (uint8_t)val,  0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ); break; }
+                            case 1: { uint16_t e = (uint16_t)expect; ok = __atomic_compare_exchange_n( (uint16_t *)rw_addr, &e, (uint16_t)val, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ); break; }
+                            case 2: { uint32_t e = (uint32_t)expect; ok = __atomic_compare_exchange_n( (uint32_t *)rw_addr, &e, (uint32_t)val, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ); break; }
+                            default:{ uint64_t e = expect;           ok = __atomic_compare_exchange_n( (uint64_t *)rw_addr, &e, val,           0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ); break; }
+                            }
+                            if (rs != 31) state.__x[rs] = ok ? 0 : 1;
+                            emulated = 1;
+                        }
+                        {
+                            static int excl_n;
+                            if (excl_n < 8)
+                                dprintf(STDERR_FILENO,
+                                    "[excl-store] ml1284 #%d insn=0x%08x size=%u ea=0x%llx load-reg=%d%s %s\n",
+                                    ++excl_n, insn, 1u << size, (unsigned long long)ea, ld_rt,
+                                    clobbered ? " (overwritten)" : "",
+                                    emulated ? (rs != 31 && state.__x[rs] ? "emulated: value changed, retry" : "emulated")
+                                             : "REFUSED: no matching LDXR/LDAXR");
+                        }
+                    }
 
 
                     /* iOS-Madeira ml626: SWP{A}{L}{B,H} — ATOMIC SWAP.
