@@ -3740,9 +3740,12 @@ static void *ios_mach_exception_thread( void *arg )
                      * a critical section a 64-bit .NET runtime keeps in its RWX memory.
                      * The LL/SC pair becomes a compare-and-swap on the RW alias: the expected
                      * value is the register the matching load filled, found by scanning back
-                     * at most 8 instructions for an LDXR/LDAXR of the same Rn and size; any
-                     * instruction between that may write that register (anything but a
-                     * branch on it) refuses the emulation. Ws = 0 when the swap succeeds and
+                     * at most 8 instructions for an LDXR/LDAXR of the same Rn and size. An
+                     * ADD/SUB(S) immediate between that updates that register in place (the
+                     * InterlockedDecrement shape LDAXR W9; SUBS W9, W9, #1; STLXR W10, W9 of
+                     * RtlLeaveCriticalSection) is undone to recover the loaded value; any
+                     * other instruction that may write it (anything but a branch on it)
+                     * refuses the emulation. Ws = 0 when the swap succeeds and
                      * 1 when the value changed, so the guest's loop retries as on hardware.
                      * Every write to such a page traps and is handled on the one Mach
                      * exception thread, and the CAS is a real atomic on the shared pages. */
@@ -3753,6 +3756,7 @@ static void *ios_mach_exception_thread( void *arg )
                         const uint64_t mask = size == 3 ? ~0ull : ((1ull << (8u << size)) - 1);
                         const uint64_t ea = rn == 31 ? state.__sp : state.__x[rn];
                         int ld_rt = -1, k, clobbered = 0;
+                        uint64_t delta = 0;   /* what in-place ADD/SUB immediates added to it */
                         uint32_t prev;
 
                         for (k = 1; k <= 8 && ld_rt < 0 && !clobbered; k++)
@@ -3772,13 +3776,23 @@ static void *ios_mach_exception_thread( void *arg )
                                     || (prev & 0x7e000000) == 0x36000000       /* TBZ / TBNZ */
                                     || (prev & 0xff000010) == 0x54000000)      /* B.cond */
                                     continue;
+                                /* ADD/SUB(S) immediate, Rd == Rn == the loaded register, at the
+                                 * load's width: sf op S 100010 sh imm12 Rn Rd */
+                                if ((prev & 0x1f800000) == 0x11000000 && (int)((prev >> 5) & 0x1f) == ld_rt
+                                    && (prev >> 31) == (size == 3))
+                                {
+                                    uint64_t imm = (prev >> 10) & 0xfff;
+                                    if (prev & 0x400000) imm <<= 12;
+                                    delta += (prev & 0x40000000) ? (uint64_t)0 - imm : imm;
+                                    continue;
+                                }
                                 clobbered = 1;
                             }
                         }
                         if (ld_rt >= 0 && ld_rt != 31 && !clobbered && rw_addr && !(ea & ((1u << size) - 1))
                             && (uint64_t)fault_addr == ea)
                         {
-                            const uint64_t expect = state.__x[ld_rt] & mask, val = IOS_STORE_SRC(rt) & mask;
+                            const uint64_t expect = (state.__x[ld_rt] - delta) & mask, val = IOS_STORE_SRC(rt) & mask;
                             int ok = 0;
                             switch (size)
                             {
@@ -3794,9 +3808,9 @@ static void *ios_mach_exception_thread( void *arg )
                             static int excl_n;
                             if (excl_n < 8)
                                 dprintf(STDERR_FILENO,
-                                    "[excl-store] ml1284 #%d insn=0x%08x size=%u ea=0x%llx load-reg=%d%s %s\n",
+                                    "[excl-store] ml1284 #%d insn=0x%08x size=%u ea=0x%llx load-reg=%d delta=%lld%s %s\n",
                                     ++excl_n, insn, 1u << size, (unsigned long long)ea, ld_rt,
-                                    clobbered ? " (overwritten)" : "",
+                                    (long long)delta, clobbered ? " (overwritten)" : "",
                                     emulated ? (rs != 31 && state.__x[rs] ? "emulated: value changed, retry" : "emulated")
                                              : "REFUSED: no matching LDXR/LDAXR");
                         }
