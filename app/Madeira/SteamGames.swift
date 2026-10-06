@@ -689,7 +689,7 @@ private extension SteamOwnedLibrary.Download {
 
 /// A game's card, or its row in the library's list layouts (as the fork's
 /// library rows: artwork, name, state and playtime, or the download's progress).
-private struct SteamGameCell: View {
+struct SteamGameCell: View {
     let item: SteamGamesRules.Item
     var list = false
     var dense = false
