@@ -621,7 +621,8 @@ for who in ('name: "Will Faust", handle: "willfaust"', 'name: "Nick", handle: "1
             'name: "Dan Perks", handle: "danperks"',
             'name: "bahacan16", handle: "bahacan16"',
             'name: "spitefulowl", handle: "spitefulowl"',
-            'name: "meshoklv", handle: "meshoklv"'):
+            'name: "meshoklv", handle: "meshoklv"',
+            'name: "TheHadesc", handle: "TheHadesc"'):
     check('MadeiraCredit(' + who in last, 'Settings credits: ' + who)
 check('https://github.com/\\(handle)' in block(lib, 'struct MadeiraCredit: View'),
       'a credit links the GitHub account')
