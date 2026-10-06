@@ -3638,6 +3638,99 @@ static void *ios_mach_exception_thread( void *arg )
                             }
                         }
                     }
+                    /* ml1283: the immediate-offset pair and SIMD&FP stores the cases above
+                     * miss, with the base writeback the indexed forms need:
+                     *   STP/STNP Wt|Xt, post-index, pre-index, non-temporal:
+                     *     sf 0 101 0 0 mode(2) 0 imm7 Rt2 Rn Rt, mask 0x7e400000 val 0x28000000
+                     *     (mode 10, signed offset, is matched earlier);
+                     *   SIMD&FP STUR and STR post-/pre-index, B/H/S/D/Q:
+                     *     size 111 1 00 opc(1)0 0 imm9 mode(2) Rn Rt, mask 0x3f600000 val 0x3c000000
+                     *     (mode 00 unscaled, 01 post, 11 pre; 10 is unallocated).
+                     * A 64-bit .NET program reached both, each an access violation while
+                     * undecoded: ntdll's own STP X9, X8, [X10, #0x80]! (0xa9882149)
+                     * initialising a critical section mscoree had placed in RWX memory,
+                     * and Mono's x86 JIT writing a float into its code buffer, translated
+                     * as STUR S0, [X19, #41] (0xbc029260). As ml1276: the address comes from
+                     * the registers, each 16 KB page takes its own alias, the store is
+                     * refused unless all of it has one, and Rn is written back only after
+                     * the whole store. Rn == 31 is SP. */
+                    else if (((insn & 0x7e400000) == 0x28000000 && ((insn >> 23) & 3) != 2)
+                             || ((insn & 0x3f600000) == 0x3c000000 && ((insn >> 10) & 3) != 2))
+                    {
+                        const int pair = (insn & 0x3c000000) == 0x28000000;
+                        const int rt = insn & 0x1f, rn = (insn >> 5) & 0x1f;
+                        uint8_t src[16];
+                        unsigned bytes = 0;
+                        int64_t imm = 0;
+                        int post = 0, wb = 0;
+
+                        if (pair)
+                        {
+                            const unsigned mode = (insn >> 23) & 3;   /* 0 stnp, 1 post, 3 pre */
+                            const unsigned elem = (insn >> 31) ? 8u : 4u;
+                            int64_t imm7 = (int64_t)((insn >> 15) & 0x7f);
+                            uint64_t a = IOS_STORE_SRC(rt), b = IOS_STORE_SRC((insn >> 10) & 0x1f);
+                            if (imm7 & 0x40) imm7 -= 0x80;
+                            imm = imm7 * (int64_t)elem;
+                            post = mode == 1;
+                            wb = mode == 1 || mode == 3;
+                            bytes = 2 * elem;
+                            memcpy( src, &a, elem );
+                            memcpy( src + elem, &b, elem );
+                        }
+                        else if (have_neon)
+                        {
+                            const unsigned size = insn >> 30, mode = (insn >> 10) & 3;
+                            int64_t imm9 = (int64_t)((insn >> 12) & 0x1ff);
+                            if (imm9 & 0x100) imm9 -= 0x200;
+                            imm = imm9;
+                            post = mode == 1;
+                            wb = mode != 0;
+                            bytes = ((insn >> 23) & 1) ? (size == 0 ? 16u : 0u) : (1u << size);
+                            memcpy( src, &neon_state.__v[rt], 16 );
+                        }
+                        if (bytes)
+                        {
+                            const uint64_t base = rn == 31 ? state.__sp : state.__x[rn];
+                            const uint64_t ea = post ? base : base + (uint64_t)imm;
+                            uint64_t a;
+                            uintptr_t part_rw[2];
+                            unsigned part_len[2], parts = 0, done = 0, i;
+
+                            while (done < bytes && parts < 2)
+                            {
+                                unsigned len = bytes - done;
+                                a = ea + done;
+                                if (len > 0x4000 - (a & 0x3fff)) len = 0x4000 - (unsigned)(a & 0x3fff);
+                                part_rw[parts] = (rx && rw && sz && a >= rx && a - rx <= sz - len)
+                                                 ? rw + (a - rx) : ios_jit_anon_alias_lookup( (uintptr_t)a );
+                                if (!part_rw[parts]) break;
+                                part_len[parts++] = len;
+                                done += len;
+                            }
+                            if (done == bytes)
+                            {
+                                for (i = 0, done = 0; i < parts; done += part_len[i], i++)
+                                    memcpy( (void *)part_rw[i], src + done, part_len[i] );
+                                if (wb)
+                                {
+                                    if (rn == 31) state.__sp = base + (uint64_t)imm;
+                                    else          state.__x[rn] = base + (uint64_t)imm;
+                                }
+                                emulated = 1;
+                            }
+                            {
+                                static int imm_store_n;
+                                if (imm_store_n < 4)
+                                    dprintf(STDERR_FILENO,
+                                        "[imm-store] ml1283 #%d insn=0x%08x %s bytes=%u ea=0x%llx fault=0x%llx%s %s\n",
+                                        ++imm_store_n, insn, pair ? "stp" : "simd", bytes,
+                                        (unsigned long long)ea, (unsigned long long)fault_addr,
+                                        wb ? " (writeback)" : "",
+                                        emulated ? "emulated" : "REFUSED: a page of the store has no alias");
+                            }
+                        }
+                    }
 
 
                     /* iOS-Madeira ml626: SWP{A}{L}{B,H} — ATOMIC SWAP.
