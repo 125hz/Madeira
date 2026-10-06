@@ -196,7 +196,7 @@ enum ResolutionChoices {
     /// iPhone, the size every entry had before these choices, so a game's mode
     /// list is unchanged), then 1920x1080's.
     static let budgets: [(pixels: Int, name: String)] = [
-        (944 * 656, "light"), (1280 * 720, "≈720p, default"), (1920 * 1080, "≈1080p"),
+        (944 * 656, "light"), (1280 * 720, "default"), (1920 * 1080, "≈1080p"),
     ]
     static let defaultBudget = 1
     static let widescreen = [(960, 540), (1280, 720), (1600, 900), (1920, 1080), (2560, 1440)]

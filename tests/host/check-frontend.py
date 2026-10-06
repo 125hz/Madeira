@@ -393,7 +393,7 @@ let phone16 = screenOf(956, 440, 2868, 1320)        // iPhone 16 Pro Max, 19.5:9
 let ig = RC.groups(for: ipad)
 expect(RC.defaultSize(for: ipad) == (1152, 800), "iPad 11: default 1152x800 (720p's pixels)")
 expect(sizes(ig[0]) == ["944x656", "1152x800", "1728x1200", "2360x1640"], "iPad 11: screen-shaped choices, then native")
-expect(ig[0].choices.map(\.label) == ["944×656 · light", "1152×800 · ≈720p, default", "1728×1200 · ≈1080p", "2360×1640 · native"],
+expect(ig[0].choices.map(\.label) == ["944×656 · light", "1152×800 · default", "1728×1200 · ≈1080p", "2360×1640 · native"],
        "iPad 11: labels name each level")
 expect(ig.map(\.title) == ["This screen's shape", "16:9 widescreen · bars above and below", "4:3 classic · bars at the sides"],
        "iPad 11: group titles say how the PC shapes fit")
