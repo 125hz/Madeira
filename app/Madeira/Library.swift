@@ -2408,8 +2408,9 @@ struct LibraryView: View {
     /// order without them.
     private var focusOrder: [LibraryEntry] {
         guard group != "platform" else { return entries }
-        let positions = Dictionary(uniqueKeysWithValues: model.entries.enumerated().map { ($1.id, $0) })
-        let byID = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) })
+        // A library file edited by hand (or written by a fork) may repeat an id: keep the first.
+        let positions = Dictionary(model.entries.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let byID = Dictionary(entries.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let games = entries.map { LibraryGrouping.Game(entry: $0, position: positions[$0.id] ?? 0) }
         let collapsed = SteamGamesSection.collapsible ? LibraryGrouping.collapsed(collapsedGroups) : []
         return LibraryGrouping.groups(games, by: group, sort: sort)
