@@ -2772,7 +2772,8 @@ struct ContentView: View {
             } else {
                 unsetenv("DXMT_METALFX_SPATIAL_SWAPCHAIN")
             }
-            if !dxmtOptions.isEmpty { setenv("DXMT_CONFIG", dxmtOptions.joined(separator: ";"), 1) }
+            // Unset otherwise, so a previous session's options in this app process do not apply.
+            if !dxmtOptions.isEmpty { setenv("DXMT_CONFIG", dxmtOptions.joined(separator: ";"), 1) } else { unsetenv("DXMT_CONFIG") }
             // ml1255: DXMT reads the variable into a MAX_PATH buffer (util_env.cpp
             // getEnvVar); from a longer value it gets nothing, and every option is lost.
             let dxmtLength = dxmtOptions.joined(separator: ";").utf16.count

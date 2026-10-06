@@ -10,7 +10,8 @@ import QuartzCore
 /// The tick itself does nothing.
 ///
 /// Default (as on main): armed only outside the 60 and 30 caps, i.e. for
-/// MAX and RAW, where the game is meant to run above 60.
+/// MAX and RAW, where the game is meant to run above 60, and for the 40 cap,
+/// whose 25ms spacing needs the 120Hz grid (at 60Hz it would land on 33.3ms).
 ///
 /// Opt-in `env.MADEIRA_PROMOTE = 1` (Settings > Display > Hold the display
 /// at its maximum rate) also arms it in the 60 cap. The panel rate is the
@@ -121,7 +122,8 @@ struct FPSOverlay: View {
     /// 1 = locked 60, 0 = display max (120 ProMotion), 2 = raw (frame-skip
     /// mailbox — game unthrottled, panel shows ≤ display rate), 3 = locked 30
     /// (added 2026-09-15, same afterMinimumDuration mechanism as 60 — see
-    /// winemetal_unix.c's _MTLCommandBuffer_presentDrawable).
+    /// winemetal_unix.c's _MTLCommandBuffer_presentDrawable), 4 = locked 40
+    /// (willfaust/dxmt#14; offered on 120Hz panels only).
     @State private var vsyncMode: Int32 = 1
     /// Ring buffer of (timestamp, count) pairs, 100ms cadence, 5s window.
     @State private var samples: [(t: CFAbsoluteTime, c: UInt64)] = []
