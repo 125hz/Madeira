@@ -784,6 +784,12 @@ OVERLAY = {
                         "Launcher 132 MB, Social Club 68 MB through a whole RDR2 session). Larger uploads still get a "
                         "block of their own; each named program logs one [small-rings] line. Unset or 0 (default): "
                         "32 MB, as before. Set it in the game's own file; read when the program starts."},
+    # Mesa's opengl32 on D3D12 over Wine's stub (WineProcessBridge.m, build/mesa-d3d12).
+    "env.MADEIRA_OPENGL": {"category": "Windows, display & input", "title": "OpenGL through Mesa on D3D12",
+                "kind": "bool", "default": "1",
+                "note": "On (default): x64 games get Mesa's opengl32.dll (OpenGL 3.3 on D3D12, then Metal) "
+                        "when build/mesa-d3d12/build.sh has put it in the app. 0: Wine's builtin opengl32, "
+                        "whose calls all fail. A game folder's own opengl32.dll still wins. Read at session start."},
     # The D3D12/DXGI GPU as a D3DKMT adapter (build/win32u-unix/d3dkmt_ios.c).
     "env.MADEIRA_KMT_ADAPTER": {"category": "Windows, display & input", "title": "D3DKMT adapter for the GPU (WDDM 3.1)",
                 "kind": "bool", "default": "0",

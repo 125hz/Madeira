@@ -23,6 +23,7 @@ remediation; steps marked UNVERIFIED have not yet been re-run from scratch.
 | `research/GPTK/Metal Shader Converter 4.0 beta 2.pkg` | Apple installer, 30 MB, licence-bound | Apple developer downloads; SHA-256 `1acc33c87ea663933df89721a998d066106685473020bcbe007cee7a16155734` (pinned in `build/madeira-d3d12/deps.sh`). Only needed to REBUILD the converter fetch; the library itself is tracked | n/a |
 | `app/Madeira/x86_64-vcruntime/` | Microsoft Visual C++ 2015-2022 x64 runtime DLLs (concrt140, msvcp140*, vcamp140, vccorlib140, vcruntime140*), redistributable under Microsoft's terms, not under this repository's licence | extract from Microsoft's `vc_redist.x64.exe` (or copy from `C:\Windows\System32` of a licensed Windows install) into that folder | UNVERIFIED |
 | `build/wine-mono/wine-mono-11.0.0/` (optional) | Wine Mono, the .NET Framework runtime Wine's mscoree loads (not Microsoft code; licences in `build/wine-mono/COPYING` and `THIRD-PARTY-NOTICES.md`), 41.6 MB download, 228 MB unpacked | `bash build/wine-mono/fetch.sh` downloads `wine-mono-11.0.0-x86.tar.xz` from https://dl.winehq.org/wine/wine-mono/11.0.0/ and checks its SHA-256; `--source` also fetches the matching source tarball. Version and hashes are pinned in `build/wine-mono/pin.sh`, which does not follow `WINE_MONO_VERSION` in `wine/dlls/mscoree/mscoree_private.h`. The Xcode phase "Bundle Wine Mono" runs `build/wine-mono/bundle.sh`, which copies it into `Madeira.app/wine-mono` without the `lib/mono/*-api` reference assemblies and patches the bundled `mscorlib.dll`: **a dirty hack** (4 IL bytes: `GC.Collect` with `GCCollectionMode.Optimized` returns, for Terraria), pinned to the exact file by SHA-256 so the build stops on any other mscorlib; TODO: replace it with a Wine Mono built from source or an upstream fix (see the TODO in `bundle.sh`). Without the folder the app builds without Mono, and .NET Framework programs fail with "Wine Mono is not installed". **Release builds leave Wine Mono out** (2026-10-06): the packaging step deletes `Madeira.app/wine-mono`, and the app downloads it from WineHQ on first use (setup or Settings › .NET Framework, `app/Madeira/WineMono.swift`) | fetch + bundle run on the development machine 2026-10-05; not from a clean checkout |
+| `toolchains/mesa-d3d12/` (OpenGL, optional) | Mesa 26.2.4 source, the DirectXShaderCompiler release for `dxil.dll`, and zlib for Meson | downloaded by `build/mesa-d3d12/build.sh` and checked against the SHA-256 values in it: `mesa-26.2.4.tar.xz` `bce5f7fb…832e9` from archive.mesa3d.org, `dxc_2026_09_29.zip` `ad31b1fc…7e7f1` (DirectXShaderCompiler v1.9.2609), zlib 1.3.1 and its wrap patch; DirectX-Headers at commit `9e393d6d` (v1.619.1) | Verified 2026-10-06 |
 | A free Apple ID; StikDebug or a pairing file plus LocalDevVPN | signing and JIT runtime requirements | see `docs/JIT.md` | n/a |
 
 ## Native build chains (all in the repository)
@@ -71,6 +72,17 @@ git-ignored and consumed by the app project.
    in that folder runs its host tests. Verified on the development machine.
 5. Native D3D12 runtime: `build/madeira-d3d12/build-pe.sh` -> `d3d12.dll`, `madeira_d3d12.dll` and the test executables in `app/Madeira/arm64ec-windows/` (tracked). Verified this session. `build/madeira-d3d12/fetch-converter.sh` re-verifies the converter library; `build/stage-licenses.sh` refreshes the bundled licence copies (the Xcode build fails if they are stale).
    `faultrep.dll` (Windows Error Reporting stubs; Wine's faultrep lacks `WerReportHang`, and Ghost of Tsushima imports it): `build/faultrep/build.sh` -> `app/Madeira/arm64ec-windows/faultrep.dll` (tracked like the other builtins).
+5b. OpenGL (optional): `build/mesa-d3d12/build.sh` builds Mesa's Windows x64
+   D3D12 driver from the pinned tarball with `build/mesa-d3d12/patches/` and
+   writes `opengl32.dll`, `libgallium_wgl.dll` and the fetched `dxil.dll`
+   (with `LICENSE-dxil.txt`) to `app/Madeira/x86_64-opengl/` (ignored). Needs
+   bison 3, ninja, and uv or `python3 -m venv` for Meson and Mako. Meson cannot
+   download (`--wrap-mode=nodownload`), and two clean builds give the same
+   bytes. `tests/host/check-mesa-fence-fallback.py` checks the fence patch
+   against the built tree. At session start WineProcessBridge.m links these
+   DLLs over Wine's opengl32 stub for x64 games (`env.MADEIRA_OPENGL = 0`
+   keeps the stub); without them nothing changes. Verified on the development
+   machine 2026-10-06.
 6. App: `xcodebuild -project app/Madeira.xcodeproj -scheme Madeira -destination 'generic/platform=iOS' -allowProvisioningUpdates build` (Debug is the configuration that runs the games; Release builds have crashed the guest), then zip `Payload/Madeira.app` into an IPA and sideload. Verified this session on the development machine.
 7. WoW64 (32-bit programs, optional): `build/wine-i386/build.sh` (i386 Wine farm
    -> `app/Madeira/i386-windows/`), `build/fex-wow64/build.sh` (FEX WOW64 module

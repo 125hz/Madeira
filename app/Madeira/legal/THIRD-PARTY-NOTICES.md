@@ -34,6 +34,7 @@ dependency license texts are in `LICENSES/`. See "Why GPL-3.0-or-later" below.
 | **libxml2** 2.12.10 and **libxslt** 1.1.45 | MIT (Daniel Veillard and contributors) | Unmodified, statically linked into Wine's `msxml3.dll` (`arm64ec-windows`) | Wine's bundled copies (`wine/libs/xml2`, `wine/libs/xslt`), built with the module by `build/wine-pe/build-modules.sh`. Licence texts in `LICENSES/MIT-libxml2.txt` and `LICENSES/MIT-libxslt.txt`. |
 | **NVAPI SDK headers** | MIT (NVIDIA Corporation & affiliates) | Unmodified headers, compiled into DXMT's `nvapi64.dll` (`arm64ec-windows`) | `dxmt/external/nvapi`. DXMT's own NVAPI implementation answers only with Madeira's opt-in "Report an NVIDIA GPU" switch; no NVIDIA binary is shipped. Licence text in `LICENSES/MIT-NVAPI.txt`. |
 | **Wine Mono** 11.0.0 | Mono: LGPL or MIT X11 per part; FNA: Ms-PL and MIT; FAudio, FNA3D, MojoShader, SDL3: zlib; winforms, wpf, monoDX, System.Speech and Wine Mono's own code: MIT (`build/wine-mono/COPYING`) | Prebuilt runtime, unmodified except `lib/mono/4.5/mscorlib.dll` (4 IL bytes in `GC.Collect`, `build/wine-mono/bundle.sh`), bundled as `wine-mono/` with that COPYING only in a development build made after `build/wine-mono/fetch.sh`; **release builds do not include it** (the packaging step removes `wine-mono/`). Instead the app downloads it from WineHQ when the user asks (setup or Settings › .NET Framework, `app/Madeira/WineMono.swift`), checks it against the same SHA-256, unpacks it without `lib/mono/*-api` and applies the same mscorlib patch on the device | Runs .NET Framework programs; Wine's mscoree loads it. The x86 tarball from `dl.winehq.org`, SHA-256 pinned in `build/wine-mono/pin.sh`. The compile-time reference assemblies (`lib/mono/*-api`, which include the GPL-licensed ICSharpCode.SharpZipLib) are not bundled. Exact corresponding source: `wine-mono-11.0.0-src.tar.xz` from the same folder; see "Corresponding source" below. |
+| **Mesa** 26.2.4 — `opengl32.dll`, `libgallium_wgl.dll` (`x86_64-opengl`, when built) | MIT (most files; each file's SPDX identifier governs), with BSL-1.0 (`src/c11/impl/threads_win32.c`), BLAKE3 (Apache-2.0 selected of CC0-1.0 / Apache-2.0), Berkeley SoftFloat 3e (BSD-3-Clause), zlib 1.3.1 (Zlib) and DirectX-Headers v1.619.1 (MIT) | upstream licences + **Madeira's two patches GPL-3.0-or-later** (`build/mesa-d3d12/patches/`) | Windows x64 OpenGL driver on D3D12 (OpenGL → D3D12 → `madeira_d3d12` → Metal). Built from the pinned release tarball by `build/mesa-d3d12/build.sh`; not committed as a binary. Licence texts in `LICENSES/MIT-Mesa.txt`, `BSL-1.0-Mesa.txt`, `Apache-2.0-BLAKE3.txt`, `BSD-3-SoftFloat-3e.txt`, `Zlib-zlib.txt`, `MIT-DirectX-Headers.txt`. |
 
 ## Why GPL-3.0-or-later
 
@@ -131,6 +132,18 @@ signature the file no longer contained.
 Those blobs have been removed from this repository's history entirely. Anyone
 holding a clone or fork taken before the rewrite may still have them, and should
 not redistribute those copies.
+
+## Microsoft DXIL validator (`dxil.dll`) — NOT TRACKED
+
+Mesa's D3D12 driver signs the DXIL shaders it compiles with Microsoft's
+validator, `dxil.dll`. It is a Microsoft-authored binary under Microsoft's own
+licence terms (`LICENSE-MS.txt` in the DirectXShaderCompiler release), not under
+this project's licence. It is **not tracked in this repository**:
+`build/mesa-d3d12/build.sh` downloads the official release
+(DirectXShaderCompiler v1.9.2609, `dxc_2026_09_29.zip`), checks its SHA-256,
+and copies `bin/x64/dxil.dll` unmodified into `app/Madeira/x86_64-opengl/`
+with that licence beside it as `LICENSE-dxil.txt`. Whether a published build
+includes it is the maintainer's decision.
 
 ## Corresponding source for the statically linked libraries
 
