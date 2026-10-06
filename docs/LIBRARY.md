@@ -87,7 +87,10 @@ Removing an entry never removes the game's files or saves.
 ## Game details
 
 Tapping a game opens its details page; it stays up until the session's
-starting screen takes over (or an error is shown). A profile holds:
+starting screen takes over (or an error is shown). The Desktop's page has every
+setting below as well; it leaves out only what names or starts one program (title
+and cover, Launch, launch arguments, the Home Screen link and the executable),
+and check-frontend fails if a setting is hidden from it. A profile holds:
 
 - title and cover image;
 - **Resolution**: the size of the Windows screen (the virtual monitor) the game
@@ -101,7 +104,7 @@ starting screen takes over (or an error is shown). A profile holds:
   letterboxes the shape the game actually draws (its back buffer) and **Fill
   height** keeps that shape at full height. Touches are mapped through the same
   rectangle, so input lines up in every mode;
-- **MetalFX upscaling** (Off, 1.5× or 2×; not for the Desktop): the picture is
+- **MetalFX upscaling** (Off, 1.5× or 2×): the picture is
   scaled up with MetalFX's spatial scaler before it reaches the screen, by the
   D3D12 runtime's swapchain or DXMT's MetalFX swapchain for D3D11. It becomes
   the game's `metalfx-upscale` line (see This game's config). With 1.5×,
@@ -129,7 +132,7 @@ starting screen takes over (or an error is shown). A profile holds:
 - **Frame generation (experimental)**, off by default: exports
   `MADEIRA_FRAMEGEN=1`, and DXMT's present path (D3D11 and D3D12 alike) shows a
   MetalFX-interpolated frame between every two game frames; FPS limits do not
-  apply while it is on. The Desktop's page has it too;
+  apply while it is on;
 - launch arguments (double-quoted tokens, at most 64 and 4 KB in total, the
   whole command included; not for Steam games, which start with Steam's own
   launch option, through Madeira Dock or as **The game**), in their own section

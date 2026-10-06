@@ -24,7 +24,9 @@ exit report.
    status, with no image names; the display-rate hold is opt-in and the 30 FPS
    cap is detected; the app wires the library into ContentView and
    GamepadInput; game details offer Resolution (with Screen shape) for every
-   entry, Aspect & scaling and control opacity/size; the in-game menu offers
+   entry, Aspect & scaling and control opacity/size, and the Desktop's page
+   every setting a game's has (only program-specific sections left out); the
+   in-game menu offers
    Aspect & scaling, opacity, size and the Touch pointer mode; a session
    saves those choices to the game; the starting screen's controls are one row
    of glyph-only buttons with VoiceOver labels; and Settings ends with Credits
@@ -504,6 +506,27 @@ check('Picker("Resolution", selection: $entry.resolution)' in detail and 'Deskto
 check('screenShapeResolution' in detail and 'Text("Screen shape (' in detail and 'MADEIRA_SCREEN_SHAPE_RESOLUTION' in detail,
       'game details: Screen shape resolution choice')
 check('Picker("Aspect & scaling"' in detail and 'entry.display = $0' in detail, 'game details: Aspect & scaling')
+# The Desktop's details page carries every setting a game's page does. What the Desktop
+# entry leaves out names or starts one particular program: its title and cover, how it
+# starts, its launch arguments, a Home Screen link, its executable. A block gated off
+# for the Desktop must be one of those and hold no other control.
+form_body = detail[:detail.index('.navigationTitle("Game details")')]
+desktop_out = ('Section("Library details")', 'Picker("Start"', 'TextField("Launch arguments"',
+               'Text("Home Screen")', 'Section("Executable")')
+desktop_controls = {'Picker("Start"', 'Toggle("Start Windows services first"'}
+hidden = []
+for gate in re.finditer(r'\bif\b[^{\n]*(?:entry\.desktop != true|entry\.usesLaunchOptions)[^{\n]*\{', form_body):
+    depth, end = 1, gate.end()
+    while depth:
+        depth += (form_body[end] == '{') - (form_body[end] == '}')
+        end += 1
+    gated = form_body[gate.end():end]
+    controls = set(re.findall(r'\b(?:Toggle|Picker|Slider|FPSChoice|ControllerModeChoice)\("?[^",)]*"?', gated))
+    controls = {c if c.endswith('"') or '"' not in c else c.rstrip('"') for c in controls}
+    if not any(marker in gated for marker in desktop_out) or {c for c in controls if not any(c.startswith(a) for a in desktop_controls)}:
+        hidden.append(gated.strip().splitlines()[0][:80])
+check(not hidden and 'Picker("MetalFX upscaling"' in form_body,
+      'Desktop details: every setting a game has, only program-specific sections left out (gated: %s)' % hidden)
 check('LabeledContent("Control opacity")' in detail and 'LabeledContent("Control size")' in detail,
       'game details: control opacity and size sliders')
 check('Picker("Aspect & scaling", selection: $model.displayMode)' in hud and 'MADEIRA_SESSION_TOOLS' in hud,

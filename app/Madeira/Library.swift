@@ -2699,25 +2699,22 @@ struct LibraryDetail: View {
                     Picker("Aspect & scaling", selection: Binding(get: { entry.displayMode.rawValue }, set: { entry.display = $0 })) {
                         ForEach(DisplayMode.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
                     }
-                    if entry.desktop != true {
-                        Picker("MetalFX upscaling", selection: $entry.metalFXUpscale) {
-                            Text("Off").tag(Double?.none)
-                            Text("1.5×").tag(Double?.some(1.5))
-                            Text("2×").tag(Double?.some(2))
-                        }
+                    // Every setting here is the Desktop's too: its programs present through
+                    // the same path, and its launch applies them like a game's
+                    // (applyEnvironment, gameConfigText). check-frontend holds the parity.
+                    Picker("MetalFX upscaling", selection: $entry.metalFXUpscale) {
+                        Text("Off").tag(Double?.none)
+                        Text("1.5×").tag(Double?.some(1.5))
+                        Text("2×").tag(Double?.some(2))
                     }
                     FPSChoice(mode: $entry.fpsMode)
-                    // The Desktop too: its programs present through the same path, and its
-                    // launch exports the switch like a game's (applyEnvironment).
                     Toggle("Frame generation (experimental)", isOn: Binding(get: { entry.frameGeneration ?? false }, set: { entry.frameGeneration = $0 ? true : nil }))
                     if entry.frameGeneration == true {
                         Text("Shows a MetalFX-generated frame between every two rendered frames: twice the frames on screen, at the cost of GPU time, some latency and artifacts at edges and on the HUD. FPS limits do not apply while it is on.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 } header: { Text("Display") } footer: {
-                    if entry.desktop != true {
-                        Text("MetalFX upscaling renders at the resolution above and scales the picture up with Apple's MetalFX spatial scaler before it reaches the screen (Direct3D 11 and 12 games). Use it with a small resolution for frame rate.")
-                    }
+                    Text("MetalFX upscaling renders at the resolution above and scales the picture up with Apple's MetalFX spatial scaler before it reaches the screen (Direct3D 11 and 12 programs). Use it with a small resolution for frame rate.")
                 }
                 // ml1163: how the program starts. Not for the Desktop entry, nor for a Steam
                 // game started through Madeira Dock, whose desktop and command are Dock's:
