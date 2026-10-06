@@ -609,6 +609,9 @@ static void madeira_link_wine_mono(NSFileManager *fm, NSString *prefix, NSString
 
     if (access([source stringByAppendingPathComponent:@"bin/libmono-2.0-x86.dll"].fileSystemRepresentation, R_OK) != 0)
     {
+        /* A link an earlier build with Mono made points into a bundle that is gone. */
+        if (lstat(dst.fileSystemRepresentation, &st) == 0 && S_ISLNK(st.st_mode))
+            [fm removeItemAtPath:dst error:nil];
         dprintf(STDERR_FILENO, "[wine-mono] ml1275 this build carries no Wine Mono\n");
         return;
     }
