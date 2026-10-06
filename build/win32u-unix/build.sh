@@ -105,6 +105,12 @@ for src in $WINE_SRC/dlls/win32u/*.c $WINE_SRC/dlls/win32u/dibdrv/*.c; do
             compile_one "$BUILD_DIR/message_ios.c" "message"
             continue
             ;;
+        d3dkmt)
+            # Wraps upstream d3dkmt.c: the opt-in MADEIRA_KMT_ADAPTER adapter
+            # (see the header comment in d3dkmt_ios.c).
+            compile_one "$BUILD_DIR/d3dkmt_ios.c" "d3dkmt"
+            continue
+            ;;
         syscall)
             # Wraps upstream syscall.c and adds win32u_zero_bits(), the
             # allocation ceiling of the calling pseudo-process (see the

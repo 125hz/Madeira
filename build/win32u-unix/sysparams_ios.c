@@ -37,6 +37,9 @@
 #include "d3dkmdt.h"
 #include "wine/wingdi16.h"
 #include "wine/server.h"
+#ifdef WINE_IOS
+#include "madeira_kmt.h"   /* iOS-Madeira: opt-in D3DKMT adapter (d3dkmt_ios.c) */
+#endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(system);
 
@@ -2965,6 +2968,7 @@ static void ios_register_virtual_gpu(void)
     WCHAR bufferW[128];
     DWORD len;
     HKEY hkey;
+    int kmt;
 
     if (done) return;
     done = 1;
@@ -2980,13 +2984,31 @@ static void ios_register_virtual_gpu(void)
     gpu.refcount = 1;
     gpu.index = 0;
     memcpy( gpu.guid, ios_video_guidA, sizeof(gpu.guid) );
-    NtAllocateLocallyUniqueId( &gpu.luid );
+    /* MADEIRA_KMT_ADAPTER=1: the registry GPU carries the LUID DXGI /
+     * madeira_d3d12 / NVAPI report and EnumAdapters2 lists, and the dedicated
+     * size of the D3DKMT adapter; off: a fresh LUID and 4096 MB. */
+    kmt = madeira_kmt_adapter_enabled() && madeira_kmt_adapter_luid( &gpu.luid );
+    if (!kmt) NtAllocateLocallyUniqueId( &gpu.luid );
     snprintf( gpu.path, sizeof(gpu.path), "PCI\\VEN_%04X&DEV_%04X&SUBSYS_00000000&REV_00\\%08X",
               pci.vendor, pci.device, gpu.index );
-    if (!write_gpu_to_registry( &gpu, &pci, (ULONGLONG)4096 * 1024 * 1024 ))
+    if (!write_gpu_to_registry( &gpu, &pci, kmt ? madeira_kmt_dedicated_bytes() : (ULONGLONG)4096 * 1024 * 1024 ))
     {
         dprintf( 2, "[vgpu] could not write the virtual GPU to the registry\n" );
         return;
+    }
+    if (kmt)
+    {
+        /* write_gpu_to_registry's DirectX\{guid} DriverVersion is "some
+         * version in the future"; make it the QWORD of the DriverVersion
+         * string, which is also the D3DKMT UMD version. */
+        UINT64 ver = madeira_kmt_driver_version_qword( driver_vendor_to_version( pci.vendor ) );
+        snprintf( buffer, sizeof(buffer), "%s\\%s", directx_keyA, gpu.guid );
+        if ((hkey = reg_create_ascii_key( NULL, buffer, REG_OPTION_VOLATILE, NULL )))
+        {
+            asciiz_to_unicode( bufferW, "DriverVersion" );
+            set_reg_value( hkey, bufferW, REG_QWORD, &ver, sizeof(ver) );
+            NtClose( hkey );
+        }
     }
 
     /* The DeviceKey EnumDisplayDevices returns for the adapter. On Windows it
@@ -3002,8 +3024,25 @@ static void ios_register_virtual_gpu(void)
         set_reg_value( hkey, bufferW, REG_SZ, gpu.name, (wcslen( gpu.name ) + 1) * sizeof(WCHAR) );
         NtClose( hkey );
     }
-    dprintf( 2, "[vgpu] registered %s (%04x:%04x) driver %s\n", gpu.path, pci.vendor, pci.device,
-             driver_vendor_to_version( pci.vendor ) );
+    dprintf( 2, "[vgpu] registered %s (%04x:%04x) driver %s%s\n", gpu.path, pci.vendor, pci.device,
+             driver_vendor_to_version( pci.vendor ), kmt ? " (MADEIRA_KMT_ADAPTER: the D3DKMT adapter's LUID)" : "" );
+}
+
+/* What the D3DKMT adapter (d3dkmt_ios.c, MADEIRA_KMT_ADAPTER=1) reports: the
+ * registry GPU ios_register_virtual_gpu writes. */
+void madeira_kmt_identity( struct madeira_kmt_identity *id )
+{
+    struct pci_id pci = {0};
+
+    memset( id, 0, sizeof(*id) );
+    ios_virtual_gpu_ids( &pci.vendor, &pci.device );
+    id->vendor = pci.vendor;
+    id->device = pci.device;
+    snprintf( id->name, sizeof(id->name), "%s", gpu_device_name( pci.vendor, pci.device, "Madeira Display" ) );
+    snprintf( id->driver_version, sizeof(id->driver_version), "%s", driver_vendor_to_version( pci.vendor ) );
+    snprintf( id->path, sizeof(id->path), "PCI\\VEN_%04X&DEV_%04X&SUBSYS_00000000&REV_00\\%08X",
+              pci.vendor, pci.device, 0 );
+    id->dedicated = madeira_kmt_dedicated_bytes();
 }
 #endif
 
@@ -4385,7 +4424,11 @@ static NTSTATUS d3dkmt_open_adapter_from_gdi_display_name( D3DKMT_OPENADAPTERFRO
         if (!virtual_luid_ready)
         {
             struct gpu *first = LIST_ENTRY( list_head( &gpus ), struct gpu, entry );
-            if (!list_empty( &gpus ) && first)
+            if (madeira_kmt_adapter_enabled() && madeira_kmt_adapter_luid( &virtual_luid ))
+                dprintf( 2, "[vmode] ml1006 virtual adapter uses the MADEIRA_KMT_ADAPTER luid %08x%08x "
+                         "(the DXGI / D3D12 adapter)\n", (unsigned)virtual_luid.HighPart,
+                         (unsigned)virtual_luid.LowPart );
+            else if (!list_empty( &gpus ) && first)
             {
                 virtual_luid = first->luid;
                 dprintf( 2, "[vmode] ml1006 virtual adapter adopts the registered GPU luid "
@@ -8747,6 +8790,25 @@ NTSTATUS WINAPI NtGdiDdDDIEnumAdapters2( D3DKMT_ENUMADAPTERS2 *desc )
     }
     unlock_display_devices();
 
+#ifdef WINE_IOS
+    /* iOS-Madeira, MADEIRA_KMT_ADAPTER=1: the virtual-monitor regime has no GPU
+     * in `gpus`; list the one DXGI / madeira_d3d12 / NVAPI report, by their
+     * LUID, driving the virtual monitor's one source. */
+    if (!count && madeira_kmt_adapter_enabled() && madeira_kmt_adapter_luid( &open_adapter_from_luid.AdapterLuid ))
+    {
+        if (!desc->NumAdapters) return STATUS_BUFFER_TOO_SMALL;
+        if (!(status = NtGdiDdDDIOpenAdapterFromLuid( &open_adapter_from_luid )))
+        {
+            desc->pAdapters[0].hAdapter = open_adapter_from_luid.hAdapter;
+            desc->pAdapters[0].AdapterLuid = open_adapter_from_luid.AdapterLuid;
+            desc->pAdapters[0].NumOfSources = 1;
+            desc->pAdapters[0].bPrecisePresentRegionsPreferred = FALSE;
+            desc->NumAdapters = 1;
+        }
+        return status;
+    }
+#endif
+
     if (count > desc->NumAdapters)
     {
         status = STATUS_BUFFER_TOO_SMALL;
@@ -8865,6 +8927,16 @@ NTSTATUS WINAPI NtGdiDdDDIOpenAdapterFromDeviceName( D3DKMT_OPENADAPTERFROMDEVIC
         break;
     }
     unlock_display_devices();
+#ifdef WINE_IOS
+    /* iOS-Madeira, MADEIRA_KMT_ADAPTER=1: the registry GPU's display-device
+     * interface (SetupAPI lists it) opens the DXGI / D3D12 adapter. */
+    if (!found && madeira_kmt_adapter_enabled())
+    {
+        struct madeira_kmt_identity kmt_id;
+        madeira_kmt_identity( &kmt_id );
+        if (!strcmp( name + 4, kmt_id.path ) && madeira_kmt_adapter_luid( &desc_luid.AdapterLuid )) found = TRUE;
+    }
+#endif
 
     if (found && !(status = NtGdiDdDDIOpenAdapterFromLuid( &desc_luid )))
     {
