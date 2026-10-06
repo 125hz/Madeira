@@ -114,3 +114,10 @@ signed off under the DCO (the fork's `CONTRIBUTING.md`):
   4dbaf6bd7d6). Pull request #18 (b7996f867cb) is the same fix as pull
   request #22 and was submitted first; recorded as merged (cdd29c7dee3) with
   no change of its own, since #22's identical line was already in.
+- 2026-10-06 author bahacan16: xinput1_3 iOS: send XInputSetState motors to the
+  host pad (67b8c8bed51, pull request #20, squashed; recorded as merged by
+  4d30258eb82).
+- 2026-10-06 author spitefulowl: mscoree iOS: cooperative thread suspend and
+  keep-delegates for Wine Mono (000cac48452, pull request #26, merged as
+  2790f7c2a5d); Madeira's follow-up bfa3a472397 builds it for i386 only and
+  puts the variables back once Mono has read them.
