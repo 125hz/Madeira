@@ -3288,12 +3288,14 @@ struct ContentView: View {
         Task { @MainActor in
             // Resolve the original config.launch key before closing the native connection.
             // A filtered launch array can start at 1 (or have gaps); its offset is not the key.
+            // Without a choice (no configuration to be had, or no entry whose .exe is on disk:
+            // a launcher started through a .bat, say) it is key 0, which every Dock start
+            // used before; Dock stops at once if Steam names that entry missing.
             let options = await SteamOwnedLibrary.shared.launchOptions(appID: game.id)
             let installFolder = MadeiraDock.drive.appendingPathComponent(game.library + "/common/" + game.installDir)
-            guard let options, let launchOption = SteamDirectStart.choose(options, installFolder: installFolder)?.launchIndex else {
-                fail(DockError.message("Steam's launch configuration is unavailable or has no installed Windows game entry. Refresh the Steam library and try again."))
-                return
-            }
+            let chosen = options.flatMap { SteamDirectStart.choose($0, installFolder: installFolder)?.launchIndex }
+            let launchOption = chosen ?? 0
+            LogStore.shared.log("[madeira-dock] launch option \(launchOption)\(chosen == nil ? " (none chosen: the default)" : "")")
             await SteamOwnedLibrary.shared.prepareDock()
             do {
                 // The launch state may have changed while the connection closed.

@@ -51,8 +51,10 @@ them.
 Dock reads Steam's launch configuration before handing its sign-in to Valve's
 client. It selects the installed Windows game entry (default first, excluding
 DLC-only and tool entries) and preserves its original `config.launch` key, which
-need not be 0. Old caches without keys are fetched again. Missing metadata or no
-eligible installed entry stops before sign-in transfer. The host receives that
+need not be 0. Old caches without keys are fetched again. With missing metadata or
+no eligible installed entry (a launcher started through a `.bat`, say) it uses key
+0, as every Dock start did before; the host then stops at once if Steam names that
+entry missing, instead of waiting for configuration. The host receives that
 key in `MADEIRA_STEAM_HOST_LAUNCH_OPTION` and uses it for every LaunchApp retry.
 Its report exposes only numeric `launch-option-index`, `launch-option-invalid`
 and `launch-option-missing` fields; a confirmed missing entry ends the config
