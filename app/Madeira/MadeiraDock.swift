@@ -231,6 +231,9 @@ enum MadeiraDock {
                 default: return "Steam could not prepare this game's executable for your account (code \(fields["ceg-result"] ?? "?"))."
                 }
             }
+            if result == 45 || result == 48, fields["launch-option-missing"] != nil || fields["launch-option-invalid"] != nil {
+                return "Steam rejected this game's launch option. Refresh the Steam library and try again."
+            }
             if result == 45 || result == 48, let error = fields["launch-client-error"].flatMap(Int.init),
                (22...23).contains(error), fields["launch-config-wait"] != nil {
                 return "Steam did not finish loading this game's configuration after signing in. Wait a minute and start the game again."
@@ -283,7 +286,8 @@ enum MadeiraDock {
         "session-online-subscription-count", "session-online-app-zero-query", "session-online-callback-id",
         "session-timeout-subscription-count", "session-timeout-app-listed", "session-timeout-still-online",
         "session-online-blip", "session-online-blips", "session-online-lost", "session-entitlement-source",
-        "launch-client-error", "launch-update-wait", "launch-update-retry", "launch-update-ready",
+        "launch-client-error", "launch-option-index", "launch-option-invalid", "launch-option-missing",
+        "launch-update-wait", "launch-update-retry", "launch-update-ready",
         "launch-config-wait", "launch-config-gave-up", "launch-session-wait", "launch-session-gave-up",
         "ceg-request", "ceg-request-result", "ceg-request-busy", "ceg-server-result", "ceg-job-result",
         "ceg-finished-jobs", "ceg-result", "ceg-disabled", "ceg-unsupported-client",
@@ -390,11 +394,12 @@ enum MadeiraDock {
     }
 
     /// The host's environment for one launch.
-    static func configure(_ game: DockGame) {
+    static func configure(_ game: DockGame, launchOption: UInt32 = 0) {
         for key in ["MADEIRA_STEAM_HOST_PROBE", "MADEIRA_STEAM_HOST_SESSION", "MADEIRA_STEAM_HOST_LOGIN", "MADEIRA_STEAM_HOST_LAUNCH"] {
             setenv(key, "1", 1)
         }
         setenv("MADEIRA_STEAM_HOST_APPID", String(game.id), 1)
+        setenv("MADEIRA_STEAM_HOST_LAUNCH_OPTION", String(launchOption), 1)
         setenv("MADEIRA_STEAM_HOST_CLIENT_DIR", SteamRuntimeFiles.windowsRoot, 1)
         setenv("MADEIRA_STEAM_HOST_EXPECTED_INSTALL", game.windowsInstallPath, 1)
         setenv("MADEIRA_STEAM_HOST_LOG", "C:\\madeira-dock.txt", 1)

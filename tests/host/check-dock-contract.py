@@ -83,7 +83,11 @@ if git.returncode == 0:
                               'app/Madeira/arm64ec-windows/dock-notices.txt'], capture_output=True, text=True).stdout.strip()
     require(tracked == '', 'no built Dock executable or notices are tracked')
     gitlink = subprocess.run(['git', '-C', str(root), 'ls-files', '-s', 'madeira-dock'], capture_output=True, text=True).stdout
-    require(gitlink.startswith('160000 0c5bbd1a854c4c63c47e074b72954aba5b36919d'), 'madeira-dock is pinned at 0c5bbd1')
+    fields = gitlink.split()
+    dock_head = subprocess.run(['git', '-C', str(root / 'madeira-dock'), 'rev-parse', 'HEAD'],
+                               capture_output=True, text=True)
+    require(len(fields) >= 2 and fields[0] == '160000' and dock_head.returncode == 0 and
+            fields[1] == dock_head.stdout.strip(), 'madeira-dock matches the revision pinned by Madeira')
 else:
     print('SKIP: not a usable git checkout here; tracked-binary and submodule-pin checks not run')
 
@@ -201,6 +205,10 @@ func jwt(_ claims: String) -> String {
         require((try? MadeiraDock.subject("opaque")) == nil && (try? MadeiraDock.subject(jwt(#"{"sub":"x"}"#))) == nil, "no usable subject: refused")
 
         // Host environment and launch.
+        MadeiraDock.configure(alpha, launchOption: 7)
+        require(env("MADEIRA_STEAM_HOST_LAUNCH_OPTION") == "7", "the original launch entry key reaches the host")
+        MadeiraDock.configure(alpha, launchOption: 0)
+        require(env("MADEIRA_STEAM_HOST_LAUNCH_OPTION") == "0", "a later launch replaces the previous option")
         setenv("MADEIRA_STEAM_HOST_ACCOUNT", "stale", 1); setenv("MADEIRA_STEAM_HOST_STEAMID", "1", 1)
         MadeiraDock.configure(game)
         require(["MADEIRA_STEAM_HOST_PROBE", "MADEIRA_STEAM_HOST_SESSION", "MADEIRA_STEAM_HOST_LOGIN", "MADEIRA_STEAM_HOST_LAUNCH"].allSatisfy { env($0) == "1" }, "host gates on")

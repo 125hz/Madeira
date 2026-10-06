@@ -29,7 +29,7 @@ them.
 ## Source and licence
 
 - Source: the `madeira-dock` submodule
-  (`https://github.com/125hz/madeira-dock`, pinned at `0c5bbd1`), about 1,850 lines of
+  (`https://github.com/125hz/madeira-dock`, pinned at `e1bf62f`), about 1,850 lines of
   C. Copyright 2026 125hz, **GPL-3.0-or-later with the Madeira
   Converter Exception** (the owner open-sourced it on 2026-09-27; it used to
   be a closed executable).
@@ -47,6 +47,20 @@ them.
   unit tests. Without a built `dockhost.exe`, Madeira shows no Dock button.
 
 ## Using it
+
+Dock reads Steam's launch configuration before handing its sign-in to Valve's
+client. It selects the installed Windows game entry (default first, excluding
+DLC-only and tool entries) and preserves its original `config.launch` key, which
+need not be 0. Old caches without keys are fetched again. Missing metadata or no
+eligible installed entry stops before sign-in transfer. The host receives that
+key in `MADEIRA_STEAM_HOST_LAUNCH_OPTION` and uses it for every LaunchApp retry.
+Its report exposes only numeric `launch-option-index`, `launch-option-invalid`
+and `launch-option-missing` fields; a confirmed missing entry ends the config
+wait. Rebuild the Dock host together with the app for this change.
+
+The Steam/Dock Swift and C sanitizer regressions passed, and a tester confirmed
+startup of a previously failing game on an M2 iPad using a rebuilt Debug IPA.
+This verifies startup for that device test, not extended gameplay coverage.
 
 The developer interface has a **Madeira Dock** button (when `dockhost.exe`
 is built; `env.MADEIRA_DOCK = 0` hides it). In the library the same sheet is

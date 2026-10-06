@@ -202,6 +202,9 @@ enum DockStartStatus {
     /// only matters before the host's first field.
     static func text(_ fields: [String: String], installers: Bool, installerProgress: String?,
                      installsFinished: Bool, waited: Double) -> String {
+        if fields["launch-option-missing"] != nil || fields["launch-option-invalid"] != nil {
+            return "Steam rejected this game's launch option."
+        }
         if fields["launch-update-wait"] != nil && fields["launch-update-ready"] == nil {
             return "Steam is installing content this game needs. The game starts when it finishes…"
         }
