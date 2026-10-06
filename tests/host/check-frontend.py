@@ -11,22 +11,24 @@ exit report.
    30 FPS fallback without DXMT's 30 FPS cap, profile validation, decoding of
    library files that carry unknown or fork-written keys (display mode,
    control opacity and size), the layout and touch-mapping math of every
-   Aspect & scaling mode, the pad-to-command mapping, and (ml1163) a game in
+   Aspect & scaling mode, the pad-to-command mapping, (ml1163) a game in
    the Wine desktop or direct, .bat/.cmd targets through cmd, the working
    folder (MADEIRA_WORKDIR, exported when it differs from the folder of what
    starts; the same variable as a Steam game's "The game"), the services batch,
    the command line the details page shows, and which of them a Steam game
-   takes.
+   takes, and (ml1172) the Resolution choices and default built from an iPad's
+   and a phone's screen and the one-time reset of 1408x648 entries.
 2. C: compiles the session exit hook from app/Madeira/WineProcessBridge.m and
    checks that only an NTSTATUS error of the launched program is recorded and
    that a reset clears it.
 3. Source checks: ntdll reports only the launched (initial) process's exit
    status, with no image names; the display-rate hold is opt-in and the 30 FPS
    cap is detected; the app wires the library into ContentView and
-   GamepadInput; game details offer Resolution (with Screen shape) for every
-   entry, Aspect & scaling and control opacity/size, and the Desktop's page
-   every setting a game's has (only program-specific sections left out); the
-   in-game menu offers
+   GamepadInput; game details offer Resolution (ml1172: this device's
+   choices, grouped, plus a saved size none of them has, and the screen shape
+   for MetalFX 1.5× while a game uses it) for every entry, Aspect & scaling
+   and control opacity/size, and the Desktop's page every setting a game's
+   has (only program-specific sections left out); the in-game menu offers
    Aspect & scaling, opacity, size and the Touch pointer mode; a session
    saves those choices to the game; the starting screen's controls are one row
    of glyph-only buttons with VoiceOver labels; and Settings ends with Credits
@@ -136,8 +138,8 @@ expect(env("MADEIRA_EXE") == "C:\\Games\\Some Game\\bin\\game.exe", "direct exec
 expect(env("MADEIRA_ARGS") == "-windowed \"-name=a b\"", "direct arguments verbatim")
 expect(env("MADEIRA_DESKTOP") == nil, "desktop state cleared")
 // Every entry's Resolution becomes the session's virtual monitor.
-expect(game.resolution == "1408x648", "new entries default to 1408x648")
-expect(env("MADEIRA_SCREEN_W") == "1408" && env("MADEIRA_SCREEN_H") == "648" && env("MADEIRA_SCREEN_SRC") == "knob",
+expect(game.resolution == "944x656", "ml1172: new entries default to the screen's shape (944x656 on an 11-inch iPad)")
+expect(env("MADEIRA_SCREEN_W") == "944" && env("MADEIRA_SCREEN_H") == "656" && env("MADEIRA_SCREEN_SRC") == "knob",
        "a direct game's resolution is exported as the session default")
 game.resolution = "1560x720"; game.configureLaunch()
 expect(env("MADEIRA_SCREEN_W") == "1560" && env("MADEIRA_SCREEN_H") == "720" && published == (1560, 720),
@@ -379,6 +381,39 @@ expect(phone.w == 1280 && phone.h == 720, "phone default mode is 1280x720")
 expect(tablet.w == 1152 && tablet.h == 864, "4:3 default mode is 1152x864 (cheapest 4:3 of at least 0.9 MP)")
 expect(DisplayMode.allCases.map { $0.label } == ["Fit", "Fill", "Stretch", "Aspect"], "the four Aspect & scaling choices")
 
+// ml1172: Resolution choices from the device's screen (points: shape; pixels: native).
+typealias RC = ResolutionChoices
+func screenOf(_ pw: CGFloat, _ ph: CGFloat, _ nw: CGFloat, _ nh: CGFloat) -> RC.Screen {
+    RC.Screen(points: CGSize(width: pw, height: ph), pixels: CGSize(width: nw, height: nh))
+}
+func sizes(_ g: RC.Group) -> [String] { g.choices.map(\.value) }
+let ipad = screenOf(1180, 820, 2360, 1640)          // 11-inch iPad (the owner's)
+let ipad13 = screenOf(1376, 1032, 2752, 2064)       // 13-inch iPad, 4:3
+let phone16 = screenOf(956, 440, 2868, 1320)        // iPhone 16 Pro Max, 19.5:9
+let ig = RC.groups(for: ipad)
+expect(RC.defaultSize(for: ipad) == (944, 656), "iPad 11: default 944x656")
+expect(sizes(ig[0]) == ["944x656", "1152x800", "1728x1200", "2360x1640"], "iPad 11: screen-shaped choices, then native")
+expect(ig[0].choices.map(\.label) == ["944×656 · default", "1152×800 · ≈720p", "1728×1200 · ≈1080p", "2360×1640 · native"],
+       "iPad 11: labels name each level")
+expect(ig.map(\.title) == ["This screen's shape", "16:9 widescreen · bars above and below", "4:3 classic · bars at the sides"],
+       "iPad 11: group titles say how the PC shapes fit")
+expect(sizes(ig[1]) == ["960x540", "1280x720", "1600x900", "1920x1080", "2560x1440"] && sizes(ig[2]) == ["640x480", "800x600", "1024x768", "1280x960"],
+       "iPad 11: the 16:9 and 4:3 sizes")
+expect(!RC.fills(1408, 648, screen: ipad) && RC.fills(1408, 648, screen: phone16), "1408x648 is a phone's shape, not an iPad's")
+expect(RC.defaultSize(for: phone16) == (1168, 536) && sizes(RC.groups(for: phone16)[0]) == ["1168x536", "1408x648", "2120x976", "2868x1320"],
+       "iPhone 16 Pro Max: its own shape; upstream's 1408x648 is its ≈720p")
+let g13 = RC.groups(for: ipad13)
+expect(g13[2].title == "4:3 classic · fills this screen" && RC.defaultSize(for: ipad13).h > 0, "iPad 13: 4:3 fills the screen")
+let seG = RC.groups(for: screenOf(667, 375, 1334, 750))
+expect(sizes(seG[0]).contains("1280x720") && !sizes(seG[1]).contains("1280x720") && seG[1].title.hasSuffix("fills this screen"),
+       "iPhone SE: 1280x720 listed once, in its own shape")
+expect(sizes(seG[0]).last == "1334x750" && !sizes(seG[0]).contains("1920x1080"), "iPhone SE: nothing past native")
+expect(RC.extra("1408x648", in: ig, note: "saved")?.label == "1408×648 · saved" && RC.extra("944x656", in: ig, note: "saved") == nil
+       && RC.extra("junk", in: ig, note: "saved") == nil, "a saved size none of the choices has is listed once")
+expect(RC.metalFX(for: ipad, in: ig)?.label == "688×480 · for MetalFX 1.5×" && RC.metalFX(for: ipad13, in: g13) == nil
+       && RC.metalFX(for: phone16, in: RC.groups(for: phone16))?.value == "1040x480",
+       "MetalFX 1.5×: the screen's shape at 480 lines, not repeated where 4:3 already has 640x480")
+
 // Controller navigation.
 let c = LibraryController.shared
 var got: [String] = []
@@ -503,8 +538,18 @@ hud = block(lib, 'struct LibraryHUD: View')
 model = block(lib, 'final class LibraryModel: ObservableObject')
 check('Picker("Resolution", selection: $entry.resolution)' in detail and 'Desktop size' not in lib,
       'game details: one Resolution picker for every entry (not only the Desktop)')
-check('screenShapeResolution' in detail and 'Text("Screen shape (' in detail and 'MADEIRA_SCREEN_SHAPE_RESOLUTION' in detail,
-      'game details: Screen shape resolution choice')
+check('ResolutionChoices.groups()' in detail and 'Section(group.title)' in detail and 'ResolutionChoices.extra(entry.resolution' in detail
+      and 'presetResolutions' not in lib and 'MADEIRA_SCREEN_SHAPE_RESOLUTION' not in lib,
+      'ml1172: game details list this device\'s Resolution choices, grouped')
+check('ResolutionChoices.metalFX(in: groups)' in detail and 'entry.metalFXUpscale == 1.5 || entry.resolution == shape.value' in detail
+      and 'entry.resolution != metalFX?.value' in detail,
+      'game details: the MetalFX 1.5× screen shape while MetalFX 1.5× is chosen (or saved), not also as "saved"')
+reset = block(model, 'private func resetPhoneResolution(')
+check('resetPhoneResolution()' in block(model, 'private init()') and 'ResolutionChoices.fills(1408, 648)' in reset
+      and 'madeira.ml1172.resolution-reset' in reset and 'guard persist(next) else { return }' in reset,
+      'ml1172: 1408x648 entries are reset once on a screen of another shape')
+check('ResolutionChoices.groups()' in block(content, 'private var resolutionPicker') and 'DesktopResolution' not in content,
+      'ml1172: the developer Resolution menu shows the same choices')
 check('Picker("Aspect & scaling"' in detail and 'entry.display = $0' in detail, 'game details: Aspect & scaling')
 # The Desktop's details page carries every setting a game's page does. What the Desktop
 # entry leaves out names or starts one particular program: its title and cover, how it

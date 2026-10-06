@@ -31,7 +31,10 @@ env.FEX_EXTENDEDVOLATILEMETADATA = oo2core_5_win64.dll:bink2w64.dll
 # without AFP (no FPCR write per x64->native call). For an A/B, one or both of:
 # env.FEX_HOSTFEATURES = enableafp,disablelrcpc2
 
-# ml1127: virtual desktop size for the "Wine Virtual Desktop" button (WxH, default 960x540)
+# ml1127: virtual desktop size for the "Wine Virtual Desktop" button (WxH). ml1157: the
+# developer interface's Resolution menu writes this line; unset, the desktop takes this
+# screen's shape at 944x656's pixel count (ml1172, the library's default Resolution:
+# 944x656 on an 11" iPad, 1168x536 on an iPhone 16 Pro Max) and fills it.
 # desktop-size = 1280x720
 
 # ml1230: audio kept queued ahead of the speaker, in ms (10-500). A client that writes one

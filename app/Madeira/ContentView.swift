@@ -487,8 +487,12 @@ final class MetalBackedView: UIView {
     // follow via winios_pointer / winios_cursor_move.
     // ==================================================================
     // Internal, not private: a hardware mouse moves the same desktop cursor
-    // (HardwareInput.followDesktopCursor).
-    static var cursor = CGPoint(x: 480, y: 270)
+    // (HardwareInput.followDesktopCursor). ml1157: it starts at the centre of
+    // whatever desktop size was launched (static, so it is first read at the
+    // first use -- after MADEIRA_SCREEN_* are set).
+    static var cursor = CGPoint(
+        x: CGFloat(getenv("MADEIRA_SCREEN_W").flatMap { Int(String(cString: $0)) } ?? 960) / 2,
+        y: CGFloat(getenv("MADEIRA_SCREEN_H").flatMap { Int(String(cString: $0)) } ?? 540) / 2)
     private var lastPanPoint = CGPoint.zero
     private var touchStartPoint = CGPoint.zero
     private var touchStartTime: TimeInterval = 0
@@ -1244,9 +1248,8 @@ struct ContentView: View {
     @State private var debuggerAttached = isDebuggerAttached()
     @ObservedObject private var input = InputSettings.shared
     @State private var pointerPanel = false
+    @State private var desktopSizeTick = 0   // ml1157: bumps after a Resolution pick
     @Namespace private var pointerNS
-    /// .compact = iPhone landscape: game surface expands, arrow keys appear.
-    @Environment(\.verticalSizeClass) private var vSizeClass
     /// The library front end (Library.swift). When it is the chosen interface it
     /// replaces both bodies below, and a running library session gets the
     /// full-screen `sessionBody`.
@@ -1274,19 +1277,14 @@ struct ContentView: View {
             Group {
                 if library.enabled && library.current != nil {
                     sessionBody
+                        .navigationBarHidden(true)
                 } else if library.enabled {
                     LibraryView(play: launchLibraryEntry, enableJIT: enableJIT,
                                 startDock: { startDock($0, compactPool: $1) })
-                } else if vSizeClass == .compact {
-                    landscapeBody
                 } else {
-                    portraitBody
+                    developerBody
                 }
             }
-            // Rotation destroys/recreates the UIViewRepresentable across
-            // this if/else (two SwiftUI identities) — HARMLESS since
-            // 2026-07-05: MetalHostView is a process-lifetime singleton;
-            // a fresh placeholder only re-parents the same CAMetalLayer.
             .navigationTitle("Madeira")
             .navigationBarTitleDisplayMode(.inline)
             .toolbarBackground(.regularMaterial, for: .navigationBar)
@@ -1295,7 +1293,6 @@ struct ContentView: View {
             // under the title, the buttons and the search field behind a
             // progressive blur (as in the App Store), with no hard edge.
             .toolbarBackground(library.enabled && !Self.systemScrollEdge ? .visible : .automatic, for: .navigationBar)
-            .navigationBarHidden(library.enabled ? library.current != nil : vSizeClass == .compact)
             // A second session cannot start in this process; offer to close Madeira.
             .alert("Restart Madeira", isPresented: Binding(get: { library.restartNotice != nil },
                                                             set: { if !$0 { library.restartNotice = nil } })) {
@@ -1356,6 +1353,37 @@ struct ContentView: View {
             .onReceive(ShortcutRouter.shared.$pendingExe) { _ in launchPendingShortcut() }
             .onChange(of: library.enabled) { _, _ in launchPendingShortcut() }
         }
+    }
+
+    /// The developer interface. Orientation comes from the view's own shape, not
+    /// verticalSizeClass: iPad is .regular in BOTH orientations, so the size-class
+    /// test kept the portrait tooling (badges, buttons, log) on screen after
+    /// rotating. The keyboard is excluded from the measurement, otherwise raising
+    /// it on a portrait iPad would make the view wider than tall.
+    private var developerBody: some View {
+        GeometryReader { geo in
+            let landscape = geo.size.width > geo.size.height
+            Group {
+                if landscape {
+                    landscapeBody
+                } else {
+                    portraitBody
+                }
+            }
+            .frame(width: geo.size.width, height: geo.size.height)
+            // Rotation destroys/recreates the UIViewRepresentable across
+            // this if/else (two SwiftUI identities) — HARMLESS since
+            // 2026-07-05: MetalHostView is a process-lifetime singleton;
+            // a fresh placeholder only re-parents the same CAMetalLayer.
+            .navigationBarHidden(landscape)
+            // ml1157: landscape is the desktop, edge to edge -- no status bar
+            // over its top rows, and the home indicator fades out.
+            .statusBarHidden(landscape)
+            .persistentSystemOverlays(landscape ? .hidden : .automatic)
+            // The landscape controls window re-frames to the rotated scene.
+            .onChange(of: landscape) { _, _ in TouchControlsHost.attach() }
+        }
+        .ignoresSafeArea(.keyboard)
     }
 
     /// A library session: the game full screen in either orientation, with the
@@ -1459,6 +1487,10 @@ struct ContentView: View {
             ZStack {
                 Color.black
                 MadeiraMetalView()
+                    // A launch straight into landscape never shows the portrait
+                    // layout, which is otherwise what creates the controls window
+                    // (its top bar carries the keyboard button here).
+                    .onAppear { TouchControlsHost.attach() }
                 // Controls removed for now (ml586): game-only landscape.
                 // The FPS readout stays, pinned in the right pillarbox bar —
                 // the window-level surface covers anything drawn over the
@@ -1912,6 +1944,8 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.green)
 
+                resolutionPicker
+
                 Button("Wine Virtual Desktop") {
                     // S3-pre R2v2: raw rpcss.exe CANNOT run standalone —
                     // its wmain unconditionally StartServiceCtrlDispatcherW's
@@ -1931,12 +1965,11 @@ struct ContentView: View {
                     // Known risk: if shellwindows_init beats services.exe's
                     // RPC_Init, OpenSCManager fails → watch whether that
                     // fails fast or hits the RaiseException→CS wedge again.
-                    // ml1127: `desktop-size = WxH` in madeira.cfg; 960x540 otherwise.
-                    var deskW = 960, deskH = 540
-                    if let txt = MadeiraConfig.get("desktop-size") {
-                        let p = txt.lowercased().split(separator: "x").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-                        if p.count == 2, p[0] >= 640, p[1] >= 360, p[0] <= 3840, p[1] <= 2160 { deskW = p[0]; deskH = p[1] }
-                    }
+                    // ml1127: `desktop-size = WxH` in madeira.cfg (the Resolution
+                    // menu writes it). ml1157/ml1172: otherwise the screen's own
+                    // shape (ResolutionChoices), so the desktop fills a landscape
+                    // screen with no bars.
+                    let (deskW, deskH) = configuredDesktopSize(default: ResolutionChoices.defaultSize())
                     setenv("MADEIRA_EXE", "explorer.exe", 1)
                     setenv("MADEIRA_ARGS",
                            "/desktop=shell,\(deskW)x\(deskH) C:\\windows\\system32\\services.exe", 1)
@@ -3286,7 +3319,10 @@ struct ContentView: View {
             // is unchanged; env.MADEIRA_GDI_SHARED_SECTION = 0 in madeira.cfg, exported after
             // this, keeps the default for Dock sessions too.
             setenv("MADEIRA_GDI_SHARED_SECTION", "1", 1)
-            var width = 1280, height = 720
+            // ml1185: without desktop-size or a game's Resolution, this screen's shape
+            // (ml1172's default, 944x656 on an 11-inch iPad), as every library entry
+            // defaults to; upstream's 1280x720 left bars above and below on an iPad.
+            var (width, height) = ResolutionChoices.defaultSize()
             if let txt = MadeiraConfig.get("desktop-size") {
                 let p = txt.lowercased().split(separator: "x").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
                 if p.count == 2, p[0] >= 640, p[1] >= 360, p[0] <= 3840, p[1] <= 2160 { width = p[0]; height = p[1] }
@@ -3369,6 +3405,44 @@ struct ContentView: View {
         }
         logStore.log("Steam found at \(winDir)", level: .success)
         return true
+    }
+
+    /// ml1127: `desktop-size = WxH` from madeira.cfg, or `def` when absent or out of range.
+    /// ml1157: the desktop resolution menu. Saves `desktop-size` to madeira.cfg;
+    /// Wine reads it once per app launch, so while it runs the choice waits for
+    /// the next launch (the label says so).
+    /// ml1172: the choices are the library's (ResolutionChoices), grouped.
+    private var resolutionPicker: some View {
+        let _ = desktopSizeTick   // re-read the file after a pick
+        let (cw, ch) = configuredDesktopSize(default: ResolutionChoices.defaultSize())
+        let groups = ResolutionChoices.groups()
+        let custom = ResolutionChoices.extra("\(cw)x\(ch)", in: groups, note: "madeira.cfg")
+        let pending = wine_process_is_running() != 0
+        let pick = { (p: ResolutionChoices.Choice) in
+            Button {
+                MadeiraConfig.set("desktop-size", p.value)
+                desktopSizeTick += 1
+            } label: {
+                if p.w == cw && p.h == ch { Label(p.label, systemImage: "checkmark") } else { Text(p.label) }
+            }
+        }
+        return Menu {
+            ForEach(groups, id: \.title) { group in
+                Section(group.title) { ForEach(group.choices, id: \.value) { pick($0) } }
+            }
+            if let custom { pick(custom) }
+        } label: {
+            Label("\(cw)×\(ch)" + (pending ? " · next launch" : ""), systemImage: "rectangle.dashed")
+        }
+        .buttonStyle(.bordered)
+    }
+
+    private func configuredDesktopSize(default def: (Int, Int)) -> (Int, Int) {
+        if let txt = MadeiraConfig.get("desktop-size") {
+            let p = txt.lowercased().split(separator: "x").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+            if p.count == 2, p[0] >= 640, p[1] >= 360, p[0] <= 3840, p[1] <= 2160 { return (p[0], p[1]) }
+        }
+        return def
     }
 
     private func startWineserver() {
@@ -3768,10 +3842,11 @@ final class TouchControlsModel: ObservableObject {
     /// `topBar: false` in a library session, where LibraryHUD replaces the bar.
     func hitsInteractive(_ p: CGPoint, in bounds: CGRect, topBar: Bool = true) -> Bool {
         // Top bar: two 44pt buttons 10pt apart in play mode, centred, 10pt down,
-        // plus the layout menu while touch controls are on (ml1970).
+        // plus the layout menu while touch controls are on (ml1970), plus the
+        // keyboard button.
         // Padded generously; a few points of slop costs nothing and a missed tap
         // costs a build.
-        let buttons: CGFloat = TouchControlsOverlay.showsLayoutMenu(self) ? 3 : 2
+        let buttons: CGFloat = (TouchControlsOverlay.showsLayoutMenu(self) ? 3 : 2) + 1
         let barW: CGFloat = buttons * 44 + (buttons - 1) * 10
         if topBar, CGRect(x: bounds.midX - barW / 2 - 10, y: 0,
                           width: barW + 20, height: 68).contains(p) { return true }
@@ -3960,6 +4035,8 @@ struct TouchControlsOverlay: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel("Done editing controls")
             } else {
+                // The iOS keyboard for the game, as ⌨ in the portrait key row.
+                glassButton("keyboard") { MetalBackedView.toggleKeyboard() }
                 glassButton("gamecontroller", dim: !m.visible) { m.visible.toggle() }
                 if Self.showsLayoutMenu(m) {
                     ControlLayoutMenu()

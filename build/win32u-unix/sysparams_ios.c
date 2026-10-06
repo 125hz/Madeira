@@ -7754,8 +7754,18 @@ int get_system_metrics( int index )
     case SM_CYMIN:        return 38;
     case SM_CXMINTRACK:   return 132;
     case SM_CYMINTRACK:   return 38;
-    case SM_CXMAXTRACK:   return 1920;
-    case SM_CYMAXTRACK:   return 1080;
+    /* ml1157: CreateWindowEx clamps an overlapped window to the max track
+     * size. A virtual screen taller than 1080 (the Resolution list's ~1080p
+     * and native sizes on an iPad, 1728x1200 and 2360x1640 on an 11-inch one)
+     * would clip a windowed game there, so follow the screen plus a frame's
+     * worth, as Windows does, never below the old values. */
+    case SM_CXMAXTRACK:
+    case SM_CYMAXTRACK:
+    {
+        int sw, sh;
+        ios_screen_size( &sw, &sh );
+        return index == SM_CXMAXTRACK ? max( 1920, sw + 16 ) : max( 1080, sh + 16 );
+    }
     /* screen-size metrics follow MADEIRA_SCREEN_W/H (defaults keep the
      * legacy 1024x768 for the games path where the env is unset).
      * Explorer's taskbar positions itself from SM_C{X,Y}SCREEN — the
