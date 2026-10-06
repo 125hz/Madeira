@@ -268,8 +268,11 @@ fall back to the rumble pair -- the speaker, headset and microphone, the
 microphone LED, arbitrary player-LED patterns, light bar brightness/fade
 settings. CoreHaptics on a game controller only takes plain pattern players
 (the advanced player breaks the engine's connection to gamecontrollerd), so
-each handle plays one continuous event whose intensity follows the motor,
-restarted every 25 s; a failed engine set-up backs off and retries.
+each handle plays one continuous event (30 s long) whose intensity follows the
+motor. The event is restarted on the first change of level after 25 s, so a
+level held unchanged for over 30 s goes quiet until the game changes it; there
+is no timer that re-arms it, which after a crash would keep the pad buzzing. A
+failed engine set-up backs off and retries.
 
 Why the wineserver serves it: on desktop Wine a pad reaches hid.dll through
 plugplay/winedevice loading winebus.sys, winehid, hidclass and hidparse. A

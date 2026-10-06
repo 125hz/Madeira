@@ -231,6 +231,9 @@ final class GamepadInput: @unchecked Sendable {
                 profiles[i]?.valueChangedHandler = nil
                 controllers[i] = nil
                 profiles[i] = nil
+                // ml2106: a game's "motors off" for a pad that left is dropped (the
+                // slot reads disconnected), so the slot's motors end here.
+                winios_gamepad_set_vibration(Int32(i), 0, 0)
                 fputs("[xinput] ml1920 slot=\(i) disconnected\n", stderr)
             }
             for (controller, profile) in live {
@@ -238,6 +241,9 @@ final class GamepadInput: @unchecked Sendable {
                       let i = controllers.firstIndex(where: { $0 == nil }) else { continue }
                 controllers[i] = controller
                 profiles[i] = profile
+                // A pad joining a slot starts still, before sample() publishes it,
+                // rather than replaying the level the slot had before.
+                winios_gamepad_set_vibration(Int32(i), 0, 0)
                 profile.valueChangedHandler = { [weak self] _, _ in
                     // Explicit queue hop also serializes callbacks already in flight
                     // when a controller is disconnected or the app resigns active.

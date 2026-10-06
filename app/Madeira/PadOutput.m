@@ -79,7 +79,7 @@ static void on_main(dispatch_block_t block)
     float _want[2];             // per engine: 0 left/low (or the only one), 1 right/high
     float _sent[2];
     unsigned int _failures;     // failed engine/player set-ups in a row; 0 again once one works
-    unsigned int _logged, _losses;
+    unsigned int _logged, _losses, _strikes;
     CFAbsoluteTime _retryAt;    // no new set-up before this (back-off after a failure)
 }
 
@@ -153,7 +153,11 @@ static void on_main(dispatch_block_t block)
     _player[i] = nil;
     _playing[i] = NO;
     _sent[i] = -1;
-    if (_losses > 20) _failures = RUMBLE_GIVE_UP;   // a pad that keeps dropping its engine: leave it alone
+    /* A pad that keeps dropping its engine: leave it alone. iOS stops the engines
+     * when the app goes to the background or audio is interrupted; those do not count. */
+    if (reason != CHHapticEngineStoppedReasonApplicationSuspended
+        && reason != CHHapticEngineStoppedReasonAudioSessionInterrupt && ++_strikes > 20)
+        _failures = RUMBLE_GIVE_UP;
     if (g_active) [self push];
 }
 

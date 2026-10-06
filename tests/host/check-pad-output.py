@@ -35,7 +35,8 @@ test = r'''
 
 static int near(float a, float b) { return fabsf(a - b) < 1e-4f; }
 
-/* Nielk1's TriggerEffectGenerator, transcribed (gist 6d54cc2c...). */
+/* Nielk1's TriggerEffectGenerator, transcribed (gist 6d54cc2c...; MIT License,
+ * John "Nielk1" Klein). Test-only: none of it ships in the app. */
 static void gen_off(uint8_t *d) { memset(d, 0, 11); d[0] = 0x05; }
 static void gen_zones(uint8_t *d, uint8_t mode, const uint8_t *level /* 10 x 0-8 */)
 {
