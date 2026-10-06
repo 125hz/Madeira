@@ -514,7 +514,8 @@ struct LibraryEntry: Codable, Identifiable {
         // the game finds its monitor on the adapter. The device id goes into
         // DXMT_CONFIG (ContentView); win32u reads DXMT_ENABLE_NVEXT for the
         // registry adapter. Set or unset, so one game's choice never leaks into
-        // the next session; madeira.cfg env lines are exported later and win.
+        // the next session; when set, it wins over madeira.cfg's lines for the
+        // same keys (ml1184's per-launch list in WineProcessBridge.m).
         if reportNVIDIA == true {
             setenv("DXMT_ENABLE_NVEXT", "1", 1)
             setenv("DXMT_WSI_MONITOR_IDENTITY", "1", 1)
