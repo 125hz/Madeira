@@ -29,8 +29,9 @@ extents, whole-host-page copy-back and the [swap] census.
      punching synchronously as before).
 2. Source-checks the call sites in allocate_virtual_memory(), that every new
    entry point returns first when the tier is off, that the census neither
-   allocates nor uses stdio, and that the punch thread punches without
-   virtual_mutex and returns the range under it.
+   allocates nor uses stdio, that the punch thread punches without
+   virtual_mutex and returns the range under it, and (ml1293) that a dead
+   range drops its dirty pages (MS_KILLPAGES) before it is punched.
 Device runs are still required: this proves the bookkeeping, not iOS paging.
 """
 from pathlib import Path
@@ -170,6 +171,10 @@ static int test_fcntl( int fd, int cmd, struct fpunchhole *ph )
 static pthread_mutex_t virtual_mutex = PTHREAD_MUTEX_INITIALIZER;
 #ifdef __linux__
 #define pthread_setname_np( name ) pthread_setname_np( pthread_self(), name )   /* glibc names a given thread */
+#endif
+/* ml1293: Darwin's msync flag (drop the pages without writing them back); a plain msync here */
+#ifndef MS_KILLPAGES
+#define MS_KILLPAGES 0
 #endif
 '''
 
@@ -591,6 +596,12 @@ check(give.index('if (ios_swap_punch_defer( off, len )) return;') < give.index('
 punch = body_of(virt, 'static void *ios_swap_punch_thread( void *arg )\n{')
 check(punch.index('ios_swap_punch_timed(') < punch.index('pthread_mutex_lock( &virtual_mutex );') < punch.index('ios_swap_free_add('),
       'ml1291: the punch runs without virtual_mutex, the free list is updated under it')
+rel = body_of(virt, 'static void ios_swap_release_range( void *base, size_t size, int copy_back )\n{')
+check('if (!copy_back) msync( oa, olen, MS_KILLPAGES );\n            ios_swap_give( ooff, olen );' in rel,
+      'ml1293: a released range drops its dirty pages before it is given back')
+resv = body_of(virt, 'static int ios_swap_punch_resv( char *lo, size_t len )\n{')
+check('msync( lo, len, MS_KILLPAGES );' in resv and resv.index('msync( lo, len, MS_KILLPAGES );') < resv.index('ios_swap_punch_timed('),
+      'ml1293: a decommit drops its dirty pages before the punch')
 setprot = body_of(virt, 'static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size, ULONG protect )')
 check('ios_swap_release_range( base, size, 1 )' in setprot, 'set_protection still leaves the tier for EXEC/WRITECOPY/GUARD')
 
