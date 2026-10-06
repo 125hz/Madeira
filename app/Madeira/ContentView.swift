@@ -1340,6 +1340,7 @@ struct ContentView: View {
                 logEntitlementStatus()
                 logStore.log("[build] \(BuildStamp.text)")
                 DeviceDiagnostics.logStartup()
+                DockOffline.begin()
                 FrontendChoice.logStartup()
                 DeviceLoadDiagnostics.start()
                 // Madeira Dock: an unconsumed sign-in transfer from an earlier run goes.
