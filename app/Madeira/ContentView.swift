@@ -2772,6 +2772,13 @@ struct ContentView: View {
             } else {
                 unsetenv("DXMT_METALFX_SPATIAL_SWAPCHAIN")
             }
+            // A library entry's "Report an NVIDIA GPU" (LibraryEntry.applyEnvironment):
+            // DXGI's device id is the GeForce RTX 3060 win32u registers as the
+            // display adapter (sysparams_ios.c), so every API names one GPU.
+            if profile?.reportNVIDIA == true {
+                dxmtOptions.append("dxgi.customDeviceId=2544")
+                logStore.log("DXMT config: dxgi.customDeviceId=2544 via Report an NVIDIA GPU")
+            }
             // Unset otherwise, so a previous session's options in this app process do not apply.
             if !dxmtOptions.isEmpty { setenv("DXMT_CONFIG", dxmtOptions.joined(separator: ";"), 1) } else { unsetenv("DXMT_CONFIG") }
             // ml1255: DXMT reads the variable into a MAX_PATH buffer (util_env.cpp

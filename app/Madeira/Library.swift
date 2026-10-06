@@ -233,6 +233,11 @@ struct LibraryEntry: Codable, Identifiable {
     /// D3D9 anisotropic filtering limit (DXMT_D9_ANISO_LIMIT: 1, 2, 4 or 8);
     /// nil = the application's own choice.
     var anisotropyLimit: Int?
+    /// "Report an NVIDIA GPU": DXGI names NVIDIA as the vendor (GeForce RTX
+    /// 3060, 10DE:2544), DXMT's NVAPI answers, and win32u registers the same
+    /// display adapter, for games that refuse a GPU without a known vendor's
+    /// driver. nil = off.
+    var reportNVIDIA: Bool?
     /// A Steam game (SteamGames.swift): Madeira Dock starts it by this App ID
     /// through Valve's client, with Steam's default launch option.
     /// `relativePath` is then its install folder, relative to drive_c.
@@ -504,6 +509,21 @@ struct LibraryEntry: Codable, Identifiable {
         // Set or unset, so a previous session's choice never stays.
         if avx == true { setenv("MADEIRA_FEX_AVX", "1", 1) } else { unsetenv("MADEIRA_FEX_AVX") }
         if frameGeneration == true { setenv("MADEIRA_FRAMEGEN", "1", 1) } else { unsetenv("MADEIRA_FRAMEGEN") }
+        // "Report an NVIDIA GPU": DXMT's vendor extension (DXGI vendor 10DE,
+        // NVAPI), with DXGI's output carrying user32's monitor and mode list so
+        // the game finds its monitor on the adapter. The device id goes into
+        // DXMT_CONFIG (ContentView); win32u reads DXMT_ENABLE_NVEXT for the
+        // registry adapter. Set or unset, so one game's choice never leaks into
+        // the next session; madeira.cfg env lines are exported later and win.
+        if reportNVIDIA == true {
+            setenv("DXMT_ENABLE_NVEXT", "1", 1)
+            setenv("DXMT_WSI_MONITOR_IDENTITY", "1", 1)
+            setenv("DXMT_WSI_MODE_TABLE", "1", 1)
+        } else {
+            unsetenv("DXMT_ENABLE_NVEXT")
+            unsetenv("DXMT_WSI_MONITOR_IDENTITY")
+            unsetenv("DXMT_WSI_MODE_TABLE")
+        }
         // Fastsync's per-game switches, only when Settings chose Fastsync; with Madsync
         // (the default) or Wine's standard sync nothing is exported here.
         if SyncEngine.current == .fastsync {
@@ -2755,6 +2775,7 @@ struct LibraryDetail: View {
                         Text("Application default").tag(0)
                         ForEach([1, 2, 4, 8], id: \.self) { Text("Up to \($0)×").tag($0) }
                     }
+                    Toggle("Report an NVIDIA GPU", isOn: Binding(get: { entry.reportNVIDIA ?? false }, set: { entry.reportNVIDIA = $0 ? true : nil }))
                     // Fastsync-only switches: shown for every game, usable only while
                     // Settings › Sync engine is Fastsync.
                     Group {
@@ -2768,7 +2789,7 @@ struct LibraryDetail: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 } header: { Text("Compatibility & performance") } footer: {
-                    Text("Reduced-precision x87 can make older games faster at some cost in accuracy; it is off by default. Turn on AVX and AVX2 (off by default, 64-bit games) when a game built for AVX processors quits at start with an illegal instruction (c000001d); FEX then emulates AVX, which is slower. With Fastsync, fast synchronization (on by default) handles events without a server round trip, and fast semaphore waits (off by default) does the same for semaphores. Settings apply to the next launch; a precision change may still require restarting Madeira.")
+                    Text("Reduced-precision x87 can make older games faster at some cost in accuracy; it is off by default. Turn on AVX and AVX2 (off by default, 64-bit games) when a game built for AVX processors quits at start with an illegal instruction (c000001d); FEX then emulates AVX, which is slower. Report an NVIDIA GPU is for games that stop with \"no graphics card\" or \"failed to get GPU driver info\". With Fastsync, fast synchronization (on by default) handles events without a server round trip, and fast semaphore waits (off by default) does the same for semaphores. Settings apply to the next launch; a precision change may still require restarting Madeira.")
                 }
                 Section("On screen") {
                     Toggle("Performance overlay", isOn: $entry.performance)
