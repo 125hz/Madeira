@@ -22,9 +22,16 @@ final class GamepadInput: @unchecked Sendable {
         return enabled && value != "0"
     }()
 
-    @MainActor func configureTouch(controls: Set<UUID>) {
+    @MainActor func configureTouch(controls: Set<UUID>, acceptingInput: Bool = true) {
         let allowed = Self.touchEnabled ? controls : []
-        queue.async { [self] in touchState.configure(allowed); sample() }
+        queue.async { [self] in
+            let wasConnected = touchState.connected, wasAccepting = touchState.acceptingInput
+            touchState.configure(allowed, acceptingInput: acceptingInput)
+            if wasConnected != touchState.connected || wasAccepting != touchState.acceptingInput {
+                LogStore.shared.log("[touch-xinput] connected=\(touchState.connected ? 1 : 0) accepting=\(acceptingInput ? 1 : 0) controls=\(allowed.count)")
+            }
+            sample()
+        }
     }
 
     /// Publish player 1 before the game looks (MADEIRA_PAD_EARLY_SLOT=1; default OFF).

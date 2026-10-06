@@ -4000,10 +4000,13 @@ struct TouchControlsOverlay: View {
     }
 
     private func configureGamepad(landscape: Bool) {
-        let ids = landscape && m.visible && !m.editing && !library.blocksGameplayTouch
+        let ids = landscape && m.visible
             ? m.controls.filter { $0.action.padName.map(TouchPadAction.supported) ?? false }.map(\.id) : []
-        GamepadInput.shared.configureTouch(controls: Set(ids))
-        TouchMouseGate.padOverlay = !ids.isEmpty
+        // Menus and the control editor keep the pad connected but take no input (#204);
+        // a touch that misses the controls is no mouse only while they do (#150).
+        let accepting = !m.editing && !library.blocksGameplayTouch
+        GamepadInput.shared.configureTouch(controls: Set(ids), acceptingInput: accepting)
+        TouchMouseGate.padOverlay = accepting && !ids.isEmpty
     }
 
     /// ml1970: with MADEIRA_CONTROLS_XBOX_DEFAULT=1, a user with no controls file gets the built-in controller
