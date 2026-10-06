@@ -204,6 +204,9 @@ game.config = "fence-chain = 6"; game.applyEnvironment()
 expect(MadeiraConfig.game == "fence-chain = 6", "the game's own config is applied at launch")
 game.config = nil; game.applyEnvironment()
 expect(MadeiraConfig.game == nil, "a game without its own config clears the previous one")
+game.metalFXUpscale = 1.5; game.config = "metalfx-upscale = 2"; game.applyEnvironment()
+expect(MadeiraConfig.game == "metalfx-upscale = 1.5\nmetalfx-upscale = 2", "MetalFX upscaling comes first, so the game's own line wins")
+game.metalFXUpscale = nil; game.config = nil
 // FPS limit: 30 needs DXMT's 30 FPS cap; without it a saved 30 runs as 60.
 game.fpsMode = 3; game.applyEnvironment()
 expect(vsync == 3, "30 FPS applied when DXMT has the cap")

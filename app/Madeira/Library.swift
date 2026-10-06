@@ -271,6 +271,18 @@ struct LibraryEntry: Codable, Identifiable {
     /// Experimental MetalFX frame interpolation between the game's frames
     /// (DXMT's present path, MADEIRA_FRAMEGEN); nil = off.
     var frameGeneration: Bool?
+    /// MetalFX spatial upscaling factor (Display › MetalFX upscaling: 1.5 or 2;
+    /// nil = off), passed on as this game's `metalfx-upscale` line.
+    var metalFXUpscale: Double?
+
+    /// What MadeiraConfig.applyGame writes for this game: the lines its pickers
+    /// stand for, then its own config, which wins where both set a key.
+    var gameConfigText: String? {
+        var lines: [String] = []
+        if let metalFXUpscale { lines.append("metalfx-upscale = \(metalFXUpscale)") }
+        if let config, !config.isEmpty { lines.append(config) }
+        return lines.isEmpty ? nil : lines.joined(separator: "\n")
+    }
 
     var displayMode: DisplayMode { display.flatMap(DisplayMode.init(rawValue:)) ?? .fit }
 
@@ -504,7 +516,7 @@ struct LibraryEntry: Codable, Identifiable {
         madeira_set_vsync_locked(effectiveFPSMode)
         // This game's own lines; a launch without any unsets the previous game's.
         do {
-            let pairs = try MadeiraConfig.applyGame(config)
+            let pairs = try MadeiraConfig.applyGame(gameConfigText)
             if !pairs.isEmpty {
                 LogStore.shared.log("[game-cfg] " + pairs.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))
             }
@@ -2539,7 +2551,8 @@ struct LibraryDetail: View {
     /// The presets, plus a stored size that is none of them (a screen shape
     /// chosen on another device), so the picker never shows a blank choice.
     static func resolutions(keeping current: String) -> [String] {
-        presetResolutions.contains(current) || current == screenShapeResolution ? presetResolutions : presetResolutions + [current]
+        presetResolutions.contains(current) || current == screenShapeResolution || current == metalFXShapeResolution
+            ? presetResolutions : presetResolutions + [current]
     }
     /// "WxH" matching this screen's landscape aspect at 720 lines (width
     /// rounded to a multiple of 8), or nil when it equals a preset or
@@ -2552,6 +2565,17 @@ struct LibraryDetail: View {
         let width = Int((720 * long / short / 8).rounded()) * 8
         guard (640...4096).contains(width), width != 1280, width != 960 else { return nil }
         return "\(width)x720"
+    }
+    /// The same shape at 480 lines, the size MetalFX 1.5× brings to 720; nil
+    /// when it equals a preset or MADEIRA_SCREEN_SHAPE_RESOLUTION=0.
+    static var metalFXShapeResolution: String? {
+        guard MadeiraConfig.flag("MADEIRA_SCREEN_SHAPE_RESOLUTION") else { return nil }
+        let bounds = UIScreen.main.bounds
+        let long = max(bounds.width, bounds.height), short = min(bounds.width, bounds.height)
+        guard short > 0 else { return nil }
+        let width = Int((480 * long / short / 8).rounded()) * 8
+        guard (640...4096).contains(width), !presetResolutions.contains("\(width)x480") else { return nil }
+        return "\(width)x480"
     }
     /// "None", or how many keys this game's own config sets.
     static func configSummary(_ config: String?) -> String {
@@ -2637,7 +2661,7 @@ struct LibraryDetail: View {
                     SteamCloudSection(appID: appID)
                     SteamEntrySection(entry: $entry) { leaving = true; dismiss() }
                 }
-                Section("Display") {
+                Section {
                     // The Windows screen the game renders for (and the Desktop's size).
                     Picker("Resolution", selection: $entry.resolution) {
                         ForEach(Self.resolutions(keeping: entry.resolution), id: \.self) { Text($0.replacingOccurrences(of: "x", with: "×")).tag($0) }
@@ -2646,9 +2670,20 @@ struct LibraryDetail: View {
                         if let shape = Self.screenShapeResolution {
                             Text("Screen shape (\(shape.replacingOccurrences(of: "x", with: "×")))").tag(shape)
                         }
+                        // The same shape at 480 lines, which MetalFX 1.5× brings to 720.
+                        if let shape = Self.metalFXShapeResolution, entry.metalFXUpscale == 1.5 || entry.resolution == shape {
+                            Text("Screen shape for MetalFX 1.5× (\(shape.replacingOccurrences(of: "x", with: "×")))").tag(shape)
+                        }
                     }
                     Picker("Aspect & scaling", selection: Binding(get: { entry.displayMode.rawValue }, set: { entry.display = $0 })) {
                         ForEach(DisplayMode.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
+                    }
+                    if entry.desktop != true {
+                        Picker("MetalFX upscaling", selection: $entry.metalFXUpscale) {
+                            Text("Off").tag(Double?.none)
+                            Text("1.5×").tag(Double?.some(1.5))
+                            Text("2×").tag(Double?.some(2))
+                        }
                     }
                     FPSChoice(mode: $entry.fpsMode)
                     // The Desktop too: its programs present through the same path, and its
@@ -2657,6 +2692,10 @@ struct LibraryDetail: View {
                     if entry.frameGeneration == true {
                         Text("Shows a MetalFX-generated frame between every two rendered frames: twice the frames on screen, at the cost of GPU time, some latency and artifacts at edges and on the HUD. FPS limits do not apply while it is on.")
                             .font(.caption).foregroundStyle(.secondary)
+                    }
+                } header: { Text("Display") } footer: {
+                    if entry.desktop != true {
+                        Text("MetalFX upscaling renders at the resolution above and scales the picture up with Apple's MetalFX spatial scaler before it reaches the screen (Direct3D 11 and 12 games). Use it with a small resolution for frame rate.")
                     }
                 }
                 // ml1163: how the program starts. Not for the Desktop entry, nor for a Steam

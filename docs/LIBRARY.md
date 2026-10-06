@@ -101,6 +101,12 @@ starting screen takes over (or an error is shown). A profile holds:
   letterboxes the shape the game actually draws (its back buffer) and **Fill
   height** keeps that shape at full height. Touches are mapped through the same
   rectangle, so input lines up in every mode;
+- **MetalFX upscaling** (Off, 1.5× or 2×; not for the Desktop): the picture is
+  scaled up with MetalFX's spatial scaler before it reaches the screen, by the
+  D3D12 runtime's swapchain or DXMT's MetalFX swapchain for D3D11. It becomes
+  the game's `metalfx-upscale` line (see This game's config). With 1.5×,
+  Resolution also offers the screen's shape at 480 lines, which 1.5× brings to
+  720;
 - FPS limit: 60, the display maximum or uncapped (the same presentation
   pacing modes as the FPS pill in the developer interface), and 30 when DXMT
   has its 30 FPS cap (willfaust/dxmt#1; DXMT without it would present mode 3

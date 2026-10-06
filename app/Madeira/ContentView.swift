@@ -2760,6 +2760,18 @@ struct ContentView: View {
                     logStore.log("DXMT config: \(parts.joined(separator: ";")) via \(source) (\(parts.count) option\(parts.count == 1 ? "" : "s"))")
                 }
             }
+            // MetalFX spatial upscaling (metalfx-upscale; Game details › MetalFX
+            // upscaling writes it to the game's own lines). The D3D12 runtime reads
+            // the key itself; D3D11 games get DXMT's MetalFX swapchain at the same
+            // factor (DXMT takes 1 to 2).
+            if let txt = MadeiraConfig.gameValue("metalfx-upscale") ?? MadeiraConfig.get("metalfx-upscale"),
+               let factor = Double(txt), factor >= 1.1 {
+                setenv("DXMT_METALFX_SPATIAL_SWAPCHAIN", "1", 1)
+                dxmtOptions.append("d3d11.metalSpatialUpscaleFactor=\(min(factor, 2))")
+                logStore.log("MetalFX upscaling: \(txt)x via metalfx-upscale")
+            } else {
+                unsetenv("DXMT_METALFX_SPATIAL_SWAPCHAIN")
+            }
             if !dxmtOptions.isEmpty { setenv("DXMT_CONFIG", dxmtOptions.joined(separator: ";"), 1) }
             // ml1255: DXMT reads the variable into a MAX_PATH buffer (util_env.cpp
             // getEnvVar); from a longer value it gets nothing, and every option is lost.
