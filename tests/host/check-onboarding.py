@@ -71,15 +71,20 @@ require(not re.search(r'\b(SwiftUI|UIKit|View|UIDevice)\b', rules.replace('// MA
 
 # ------------------------------------------------------------------ static: when setup opens
 present = block(model, 'func presentIfNeeded()')
-require('guard !considered' in present and 'OnboardingRules.shouldShow(seen: Self.seen, enabled: Self.enabled, steps: steps)' in present,
-        'setup is considered once per run and opens only by the rules')
-opener = block(model, 'private func open(reason: String)')
+require('guard !considered' in present and 'OnboardingRules.shouldShow(seen: Self.seen, enabled: Self.enabled, steps: steps(since: Self.seen))' in present
+        and 'open(reason: "revision \\(Self.seen)->\\(OnboardingRules.revision)", since: Self.seen)' in present,
+        'setup is considered once per run, opens only by the rules, and after an update shows only the new pages')
+require('func rerun() { open(reason: "settings", since: 0) }' in model,
+        'Run setup again shows every page')
+opener = block(model, 'private func open(reason: String, since: Int)')
 require('LibraryModel.shared.current == nil' in opener and 'wine_process_is_running() == 0' in opener and 'guard available' in opener,
         'setup never opens over a running session, or with nothing to set up')
-require('OnboardingRules.steps(signIn: SteamSignIn.isEnabled, dock: MadeiraDock.enabled, localDevVPN: offerLocalDevVPN)' in model,
-        'the pages follow the sign-in and Dock switches, and whether LocalDevVPN is installed')
-require(opener.index('offerLocalDevVPN = !LocalDevVPN.isInstalled') < opener.index('[onboarding] shown'),
-        "LocalDevVPN's page is decided once, when setup opens, so installing it on the way does not renumber the steps")
+require('OnboardingRules.steps(signIn: SteamSignIn.isEnabled, dock: MadeiraDock.enabled, localDevVPN: offerLocalDevVPN,\n'
+        '                              wineMono: offerWineMono, since: since)' in model,
+        'the pages follow the sign-in and Dock switches, whether LocalDevVPN and Wine Mono are here, and the revision seen')
+require(opener.index('offerLocalDevVPN = !LocalDevVPN.isInstalled') < opener.index('[onboarding] shown')
+        and opener.index('offerWineMono = !WineMonoModel.available') < opener.index('[onboarding] shown'),
+        "LocalDevVPN's and Wine Mono's pages are decided once, when setup opens, so installing on the way does not renumber the steps")
 stamp = 'UserDefaults.standard.set(OnboardingRules.revision, forKey: OnboardingRules.revisionKey)'
 require(model.count(stamp) == 2 and stamp in block(model, 'func finish()') and stamp in block(model, 'func skip()')
         and 'removeObject' not in onboarding and 'set(false' not in onboarding and 'set(0' not in onboarding,
@@ -210,6 +215,19 @@ import Foundation
                && R.Step.localDevVPN.rawValue == "localdevvpn", "LocalDevVPN's page counts as step 1")
         expect(R.steps(signIn: false, dock: false) == [.welcome, .jit, .done],
                "JIT remains when Steam setup is unavailable")
+        // Wine Mono (revision 3): offered when this device has none, before done; after an
+        // update from revision 2 only it is shown.
+        expect(R.revision == 3 && R.Step.wineMono.rawValue == "wine-mono" && R.Step.wineMono.introduced == 3
+               && R.Step.localDevVPN.introduced == 2 && R.Step.jit.introduced == 1, "revision 3 adds Wine Mono")
+        expect(R.steps(signIn: true, dock: true, wineMono: true) == [.welcome, .jit, .signIn, .dockClient, .wineMono, .done],
+               "Wine Mono's page comes last, before done")
+        expect(R.steps(signIn: true, dock: true, localDevVPN: true, wineMono: true, since: 2) == [.welcome, .wineMono, .done]
+               && R.steps(signIn: true, dock: true, localDevVPN: true, wineMono: true, since: 1) == [.welcome, .localDevVPN, .wineMono, .done],
+               "after an update only the pages added since the revision seen")
+        expect(!R.shouldShow(seen: 2, enabled: true, steps: R.steps(signIn: true, dock: true, wineMono: false, since: 2))
+               && R.shouldShow(seen: 2, enabled: true, steps: R.steps(signIn: true, dock: true, wineMono: true, since: 2))
+               && R.hasSetup([.welcome, .wineMono, .done]),
+               "an update shows setup only when a new page applies (Wine Mono missing)")
         expect(R.hasSetup(full) && R.hasSetup([.welcome, .jit, .done])
                && !R.hasSetup([.welcome, .done]), "hasSetup")
 

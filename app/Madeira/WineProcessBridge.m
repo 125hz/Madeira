@@ -593,7 +593,9 @@ static void madeira_link_syswow64_wbem(NSFileManager *fm, NSString *prefix, NSSt
 }
 
 /* ml1275: C:\windows\mono\mono-2.0 -> the bundle's Wine Mono, when the build
- * carries one (the "Bundle Wine Mono" build phase). mscoree looks there first
+ * carries one (the "Bundle Wine Mono" build phase); otherwise the copy Madeira
+ * downloaded from WineHQ (WineMono.swift, Library/Application Support/WineMono/
+ * wine-mono), as release builds carry none. mscoree looks there first
  * (wine/dlls/mscoree/metahost.c get_mono_path_local) for bin\libmono-2.0-x86.dll
  * in a 32-bit process and bin\libmono-2.0-x86_64.dll in a 64-bit one; without
  * it every .NET Framework program dies with "Wine Mono is not installed".
@@ -604,6 +606,13 @@ static void madeira_link_wine_mono(NSFileManager *fm, NSString *prefix, NSString
 {
     NSString *source = [bundle stringByAppendingPathComponent:@"wine-mono"];
     NSString *monoDir = [prefix stringByAppendingPathComponent:@"drive_c/windows/mono"];
+    if (access([source stringByAppendingPathComponent:@"bin/libmono-2.0-x86.dll"].fileSystemRepresentation, R_OK) != 0)
+    {
+        NSString *support = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
+        NSString *downloaded = [support stringByAppendingPathComponent:@"WineMono/wine-mono"];
+        if (access([downloaded stringByAppendingPathComponent:@"bin/libmono-2.0-x86.dll"].fileSystemRepresentation, R_OK) == 0)
+            source = downloaded;
+    }
     NSString *dst = [monoDir stringByAppendingPathComponent:@"mono-2.0"];
     struct stat st;
 
@@ -612,7 +621,7 @@ static void madeira_link_wine_mono(NSFileManager *fm, NSString *prefix, NSString
         /* A link an earlier build with Mono made points into a bundle that is gone. */
         if (lstat(dst.fileSystemRepresentation, &st) == 0 && S_ISLNK(st.st_mode))
             [fm removeItemAtPath:dst error:nil];
-        dprintf(STDERR_FILENO, "[wine-mono] ml1275 this build carries no Wine Mono\n");
+        dprintf(STDERR_FILENO, "[wine-mono] ml1275 neither this build nor a download has Wine Mono\n");
         return;
     }
     if (lstat(dst.fileSystemRepresentation, &st) == 0 && !S_ISLNK(st.st_mode))
@@ -623,7 +632,8 @@ static void madeira_link_wine_mono(NSFileManager *fm, NSString *prefix, NSString
     [fm createDirectoryAtPath:monoDir withIntermediateDirectories:YES attributes:nil error:nil];
     [fm removeItemAtPath:dst error:nil];  /* self-heal a stale link on reinstall */
     if ([fm createSymbolicLinkAtPath:dst withDestinationPath:source error:nil])
-        dprintf(STDERR_FILENO, "[wine-mono] ml1275 C:\\windows\\mono\\mono-2.0 -> bundle wine-mono\n");
+        dprintf(STDERR_FILENO, "[wine-mono] ml1275 C:\\windows\\mono\\mono-2.0 -> %s wine-mono\n",
+                [source hasPrefix:bundle] ? "bundle" : "downloaded");
     else
         dprintf(STDERR_FILENO, "[wine-mono] ml1275 FAILED to link C:\\windows\\mono\\mono-2.0 errno=%d\n", errno);
 }

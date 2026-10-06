@@ -299,14 +299,16 @@ pairing (iOS 27, `docs/JIT.md`), Steam sign-in
 (`docs/STEAM_SIGNIN.md`) through `SteamSignInModel`/`SteamSignInView` (the
 token stays in sign-in's Keychain store), and Madeira Dock
 (`docs/MADEIRA_DOCK.md`) through
-`MadeiraDockModel.prepareClient()`/`MadeiraDockView`.
+`MadeiraDockModel.prepareClient()`/`MadeiraDockView`, and Wine Mono through
+`WineMonoModel` (`app/Madeira/WineMono.swift`, below).
 
 **First-run setup.** On a new install (and once after an update that raises
 the setup revision, below) the library opens a full-screen setup: welcome, **Install LocalDevVPN** (only when it is missing: every JIT way
 reaches the device through it; **Get LocalDevVPN** opens the App Store, and
 Madeira checks again with `canOpenURL` whenever it comes back to the front),
 **Set up JIT**, **Sign in to Steam**, **Prepare Madeira Dock**
-(Valve's client components, about 73 MB, only when Dock is available), done.
+(Valve's client components, about 73 MB, only when Dock is available),
+**Add .NET Framework support** (Wine Mono, only when the device has none), done.
 The JIT page offers three ways in, **In-app** (iOS 27 and later),
 **In-app with pairing file** and **StikDebug**, or **I'll do this later**.
 Each way opens numbered steps that tick off as they are done, with **Back to
@@ -318,8 +320,27 @@ the app. Setup opens on a new install, and once after an update whose
 `OnboardingRules.revision` is higher than the stored one; raise it in a release
 whose setup every existing install should see. Revision 2 (Install LocalDevVPN,
 in-app pairing, the Madeira JIT shortcut) also reopens setup for installs
-that finished it before revisions (`madeiraOnboardingDone`). The JIT page is always available; Steam pages follow their feature
+that finished it before revisions (`madeiraOnboardingDone`). After an update,
+setup shows only the pages added since the revision the device last saw
+(`Step.introduced`), under **New in Madeira**: revision 3 adds Wine Mono, so an
+install that finished revision 2 sees just that page, and nothing at all when
+it already has Wine Mono. A new install and **Run setup again** show every page.
+The JIT page is always available; Steam pages follow their feature
 switches. Setup never opens over a running session.
+
+**Wine Mono** (`app/Madeira/WineMono.swift`). Games built on .NET Framework
+start through Wine's mscoree, which needs Wine Mono at `C:\windows\mono\mono-2.0`.
+Release builds do not carry it; setup's Wine Mono page and **Settings › .NET
+Framework** download it from WineHQ (`wine-mono-<ver>-x86.tar.xz`, about 42 MB,
+pinned by SHA-256 in `build/wine-mono/pin.sh`), unpack it on the device with
+Apple's LZMA decoder and a small tar reader, without the compile-time
+`lib/mono/*-api` assemblies (about 135 MB installed), apply bundle.sh's ml1281
+mscorlib patch (both hashes checked), and install it in one rename to
+`Library/Application Support/WineMono/wine-mono`, excluded from backups. Each
+session links `C:\windows\mono\mono-2.0` to the bundled copy (a development
+build made after `build/wine-mono/fetch.sh`) or, failing that, to the download.
+Settings can remove it again. `tests/host/check-wine-mono.py` runs the installer
+code on the real tarball. Log tag: `[wine-mono]`.
 
 Setup starts no Wine session and allocates no JIT pool. It stores the selected
 JIT method and may store a validated pairing file (paired on the device or
@@ -330,6 +351,8 @@ verified download without Wine. It changes no engine switch or launch
 configuration.
 
 **Settings › JIT** and **Settings › Steam** both show **Run setup again**.
+**Settings › .NET Framework** shows Wine Mono's state, with **Download Wine
+Mono** or **Remove Wine Mono** (hidden in a build that carries it).
 Settings › Steam also shows the signed-in account with **Sign out of Steam**
 (or **Sign in to Steam**), **Madeira Dock** (Dock's sheet, with the last Dock
 result under it). A game started from the Dock sheet here runs as a library

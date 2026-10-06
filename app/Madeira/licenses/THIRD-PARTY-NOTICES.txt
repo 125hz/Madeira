@@ -48,7 +48,8 @@ Statically linked into the application binary:
   built by build/ffmpeg/build.sh.
 
 Bundled as files only in a development build that includes it (wine-mono/;
-release builds do not):
+release builds download it from WineHQ when the user asks, into
+Library/Application Support/WineMono, with the same mscorlib patch):
 - Wine Mono 11.0.0, the .NET Framework runtime Wine's mscoree loads,
   unmodified except mscorlib.dll (GC.Collect with GCCollectionMode.Optimized
   returns; Madeira's build/wine-mono/bundle.sh): Mono (LGPL or MIT X11 per part), FNA (Ms-PL and MIT), FAudio,
