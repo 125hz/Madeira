@@ -190,7 +190,11 @@ body = (dock[dock.index('enum MadeiraDock {'):dock.index('    @MainActor private
         dock[dock.index("    /// The host's environment for one launch."):])
 stubs = r'''
 import Foundation
+#if canImport(Glibc)
 import Glibc
+#else
+import Darwin
+#endif
 enum SteamSignIn {
     static func flag(_ name: String, default fallback: Bool) -> Bool { getenv(name).map { String(cString: $0) != "0" } ?? fallback }
 }
@@ -204,7 +208,11 @@ owned_game = owned_source[owned_source.index('struct SteamOwnedGame:'):owned_sou
 vdf = fetcher[fetcher.index('// MARK: - Simple VDF Binary Parser'):]
 checks = r'''
 import Foundation
+#if canImport(Glibc)
 import Glibc
+#else
+import Darwin
+#endif
 var failures = 0
 func require(_ condition: @autoclosure () -> Bool, _ label: String) {
     if condition() { print("PASS: " + label) } else { print("FAIL: " + label); failures += 1 }
@@ -451,7 +459,7 @@ func record(_ appID: Int, _ name: String, _ folder: String, flags: Int) -> Strin
 with tempfile.TemporaryDirectory(prefix='madeira-steam-games-') as tmp:
     tmp = Path(tmp)
     (tmp / 'stubs.swift').write_text(stubs + head)
-    (tmp / 'dock.swift').write_text('import Foundation\nimport Glibc\n' + body)
+    (tmp / 'dock.swift').write_text('import Foundation\n#if canImport(Glibc)\nimport Glibc\n#else\nimport Darwin\n#endif\n' + body)
     (tmp / 'rules.swift').write_text('import Foundation\n' + rules)
     (tmp / 'owned.swift').write_text('import Foundation\n' + owned_game + '\n' + vdf)
     (tmp / 'checks.swift').write_text(checks)

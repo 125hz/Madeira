@@ -97,7 +97,11 @@ body = (dock[dock.index('enum MadeiraDock {'):dock.index('    @MainActor private
         dock[dock.index("    /// The host's environment for one launch."):])
 stubs = r'''
 import Foundation
+#if canImport(Glibc)
 import Glibc
+#else
+import Darwin
+#endif
 enum SteamSignIn {
     static func flag(_ name: String, default fallback: Bool) -> Bool { getenv(name).map { String(cString: $0) != "0" } ?? fallback }
 }
@@ -109,7 +113,11 @@ enum SteamRuntimeFiles {
 '''
 checks = r'''
 import Foundation
+#if canImport(Glibc)
 import Glibc
+#else
+import Darwin
+#endif
 var failures = 0
 func require(_ condition: @autoclosure () -> Bool, _ label: String) {
     if condition() { print("PASS: " + label) } else { print("FAIL: " + label); failures += 1 }
@@ -244,7 +252,7 @@ func jwt(_ claims: String) -> String {
 with tempfile.TemporaryDirectory(prefix='madeira-dock-contract-') as tmp:
     tmp = Path(tmp)
     (tmp / 'stubs.swift').write_text(stubs + head)
-    (tmp / 'dock.swift').write_text('import Foundation\nimport Glibc\n' + body)
+    (tmp / 'dock.swift').write_text('import Foundation\n#if canImport(Glibc)\nimport Glibc\n#else\nimport Darwin\n#endif\n' + body)
     (tmp / 'checks.swift').write_text(checks)
     exe = tmp / 'check'
     build = subprocess.run([SWIFTC, '-parse-as-library', '-swift-version', '5', '-sanitize=address', '-o', str(exe),
