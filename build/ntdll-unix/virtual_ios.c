@@ -24044,6 +24044,24 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
         *addr_ptr = base;
         *size_ptr = size;
     }
+#ifdef WINE_IOS
+    else
+    {
+        /* ml1285: a refused free was silent, and a runtime that asserts on VirtualFree
+         * (Wine Mono's mono_vfree) died without saying which block or why. */
+        static int refused_n;
+        if (refused_n < 16)
+        {
+            struct file_view *rv = base ? find_view( base, 0 ) : NULL;
+            refused_n++;
+            dprintf( 2, "[free-refused] ml1285 #%d addr=%p size=%#lx type=%#x status=%#x view=%p+%#lx "
+                     "protect=%#x valloc=%d tid=%04x\n", refused_n, addr, (unsigned long)size, (unsigned)type,
+                     status, rv ? rv->base : NULL, rv ? (unsigned long)rv->size : 0UL,
+                     rv ? (unsigned)rv->protect : 0u, rv ? is_view_valloc( rv ) : -1,
+                     (unsigned)GetCurrentThreadId() );
+        }
+    }
+#endif
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
     return status;
 }
