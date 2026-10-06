@@ -253,6 +253,30 @@ static void check_dualsense( void )
     hidpad_dualsense_feature( 0x20, f, p.feat[0x20] );
     assert( (f[44] | f[45] << 8) == 0x0224 && !memcmp( f + 1, "Jun 19 2023", 11 ) );
 
+    /* Output report 0x02: rumble, triggers, LEDs, lightbar; parts the report
+     * does not flag are kept. */
+    {
+        struct winios_hidpad_output out = {0};
+        unsigned char o[48] = {0x02};
+        o[1] = 0x03 | 0x04 | 0x08; o[2] = 0x01 | 0x04 | 0x10;
+        o[3] = 0x40; o[4] = 0xf0;
+        for (i = 0; i < 11; i++) { o[11 + i] = 0x21 + i; o[22 + i] = 0x61 + i; }
+        o[9] = 1; o[44] = 0x04; o[45] = 10; o[46] = 20; o[47] = 30;
+        assert( hidpad_dualsense_output( o, sizeof(o), &out ) );
+        assert( out.rumble_valid && out.rumble_right == 0x40 && out.rumble_left == 0xf0 );
+        assert( out.trigger_valid[1] && out.trigger[1][0] == 0x21 && out.trigger[1][10] == 0x2b );
+        assert( out.trigger_valid[0] && out.trigger[0][0] == 0x61 );
+        assert( out.mute_led_valid && out.mute_led == 1 && out.player_leds_valid && out.player_leds == 4 );
+        assert( out.lightbar_valid && out.red == 10 && out.green == 20 && out.blue == 30 );
+        memset( o + 1, 0, sizeof(o) - 1 );
+        o[1] = 0x01; o[3] = 0; o[4] = 0;
+        assert( hidpad_dualsense_output( o, sizeof(o), &out ) );
+        assert( out.rumble_left == 0 && out.red == 10 && out.trigger[0][0] == 0x61 );
+        o[0] = 0x31;
+        assert( !hidpad_dualsense_output( o, sizeof(o), &out ) );
+        o[0] = 0x02;
+        assert( !hidpad_dualsense_output( o, 2, &out ) );
+    }
     free( p.pre );
 }
 
@@ -319,9 +343,10 @@ static void check_generic( void )
 static void check_transport( void )
 {
     struct winios_hidpad pad = {0}, got;
+    struct winios_hidpad_output out = {0}, seen;
     struct winios_gamepad xi;
 
-    assert( sizeof(struct winios_hidpad) == 48 );
+    assert( sizeof(struct winios_hidpad) == 48 && sizeof(struct winios_hidpad_output) == 44 );
     assert( sizeof(struct winios_gamepad) == 20 );
     assert( !winios_hidpad_get_state( &got ) && got.packet == 0 );
     pad.connected = 1; pad.lx = 5; pad.packet = 77; pad.reserved2 = 9;
@@ -334,6 +359,14 @@ static void check_transport( void )
     assert( !winios_hidpad_get_state( &got ) && got.packet == 2 && !got.lx && !got.connected );
     /* The XInput slots are a separate snapshot. */
     assert( !winios_gamepad_get_state( 0, &xi ) );
+
+    assert( !winios_hidpad_get_output( 0, &seen ) );
+    out.rumble_valid = 1; out.rumble_left = 9;
+    winios_hidpad_set_output( &out );
+    assert( winios_hidpad_get_output( 0, &seen ) && seen.serial == 1 && seen.rumble_left == 9 );
+    assert( !winios_hidpad_get_output( 1, &seen ) );
+    winios_hidpad_set_output( &out );
+    assert( !winios_hidpad_get_output( 1, &seen ) );
 }
 
 int main( void )
@@ -625,5 +658,5 @@ with tempfile.TemporaryDirectory(prefix='madeira-hidpad-') as tmp:
     subprocess.run([cc, *objs, '-pthread', '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
 print('PASS: DualSense and generic descriptors through Wine hidparse + hid.dll, '
-      'sticks/triggers/buttons/hat/touch/motion/battery, feature reports, transport, '
+      'sticks/triggers/buttons/hat/touch/motion/battery, feature and output reports, transport, '
       'registry entries (level by level, volatile, only for the device that exists)')

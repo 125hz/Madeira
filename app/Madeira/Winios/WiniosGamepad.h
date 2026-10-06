@@ -54,9 +54,52 @@ struct winios_hidpad {
     uint16_t reserved2;           /* 48 bytes, no padding: the transport memcmp()s it */
 };
 
+/* What the game wrote to the pad (output report 0x02), newest state, for the
+ * app to apply. `serial` advances on every change; *_valid say which parts the
+ * game has set at least once. Rumble is the "compatible vibration" pair. */
+struct winios_hidpad_output {
+    uint32_t serial;
+    uint8_t rumble_valid, rumble_left, rumble_right;
+    uint8_t lightbar_valid, red, green, blue;
+    uint8_t player_leds_valid, player_leds;
+    uint8_t mute_led_valid, mute_led;
+    uint8_t trigger_valid[2];     /* [0] left (L2), [1] right (R2) */
+    uint8_t trigger[2][11];       /* the effect block as written: mode, then parameters */
+    uint8_t power_valid;          /* the game set the motor power reduction */
+    uint8_t power_reduction;      /* low nibble triggers, high nibble rumble, 0-7 = 0-87.5 % less */
+    uint8_t reserved[3];          /* 44 bytes, no padding */
+};
+
 /* NULL disconnects (the device stays, at rest). Same locking rules as above. */
 void winios_hidpad_set_state(const struct winios_hidpad *state);
 int winios_hidpad_get_state(struct winios_hidpad *out);
+void winios_hidpad_set_output(const struct winios_hidpad_output *output);
+/* Copies the latest output into *out and returns 1 when its serial differs
+ * from `seen`, else 0. */
+int winios_hidpad_get_output(uint32_t seen, struct winios_hidpad_output *out);
+
+/* ml2106: the other direction for XInput. XInputSetState on a host pad reaches
+ * win32u's ios_gamepad_query (op 2, NtUserGamepadOp_SetVibration, in
+ * build/win32u-unix/driver_ios.c), which stores the two motor speeds here;
+ * `serial` advances on every change. Slots 0-3, as above. */
+struct winios_gamepad_vibration {
+    uint32_t serial;
+    uint16_t left;                /* XINPUT_VIBRATION.wLeftMotorSpeed: the large, low-frequency motor */
+    uint16_t right;               /* wRightMotorSpeed: the small, high-frequency motor */
+};
+void winios_gamepad_set_vibration(int index, uint16_t left, uint16_t right);
+/* Copies slot `index`'s motors into *out; returns its serial (0: never set). */
+uint32_t winios_gamepad_get_vibration(int index, struct winios_gamepad_vibration *out);
+/* 1: the app applies XInput rumble, so XInputGetCapabilities reports motors. */
+void winios_gamepad_set_rumble_caps(int on);
+int winios_gamepad_rumble_caps(void);
+
+/* ml2106: called after winios_hidpad_set_output or winios_gamepad_set_vibration
+ * changed something, outside every lock, on the writer's thread (the
+ * wineserver's, or a game thread in win32u). The app's handler only schedules
+ * work on its main thread. NULL unregisters. */
+typedef void (*winios_pad_output_notify_fn)(void);
+void winios_pad_output_set_notify(winios_pad_output_notify_fn fn);
 #ifdef __cplusplus
 }
 #endif

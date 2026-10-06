@@ -2443,8 +2443,10 @@ static void ios_foreground_check(void)
  *
  * The body of NtUserCallTwoParam_GetGamepadState. `index` is the XInput user
  * index (0-3) and `op` selects the payload; see NtUserGamepadOp_* in
- * wine/include/ntuser.h. Returns 1 when a pad is connected in that slot and
- * `buffer` was filled, 0 otherwise — which is also what an upstream,
+ * wine/include/ntuser.h. Op 2 (ml2106, NtUserGamepadOp_SetVibration) passes
+ * the game's XINPUT_VIBRATION in from XInputSetState; an xinput that predates
+ * it never sends it. Returns 1 when a pad is connected in that slot and
+ * `buffer` was filled (or read), 0 otherwise — which is also what an upstream,
  * non-Madeira win32u returns for a code it does not know, so xinput1_3's
  * runtime probe falls back to the existing HID path.
  */
@@ -2484,14 +2486,22 @@ ULONG_PTR ios_gamepad_query( UINT index, UINT op, void *buffer )
          * (low bits clear, as real XInput reports them) and the triggers 8. */
         caps->type     = 1;
         caps->sub_type = 1;
-        /* Controller rumble is not implemented by this transport. */
         caps->flags    = 0;
         caps->gamepad.buttons       = 0xf3ff;
         caps->gamepad.left_trigger  = 0xff;
         caps->gamepad.right_trigger = 0xff;
         caps->gamepad.thumb_lx = caps->gamepad.thumb_ly = (SHORT)0xffc0;
         caps->gamepad.thumb_rx = caps->gamepad.thumb_ry = (SHORT)0xffc0;
-        caps->left_motor_speed = caps->right_motor_speed = 0;
+        /* ml2106: motors only while the app applies XInput rumble
+         * (env.MADEIRA_PAD_OUTPUT); 0xff is what a wired Xbox pad reports. */
+        caps->left_motor_speed = caps->right_motor_speed = winios_gamepad_rumble_caps() ? 0xff : 0;
+        return 1;
+    }
+    case 2:   /* ml2106 NtUserGamepadOp_SetVibration: XINPUT_VIBRATION (4 bytes, in) */
+    {
+        const WORD *motors = buffer;
+
+        winios_gamepad_set_vibration( index, motors[0], motors[1] );
         return 1;
     }
     default:

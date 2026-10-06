@@ -455,4 +455,147 @@ static inline int hidpad_dualsense_feature( unsigned char report_id, unsigned ch
     return 1;
 }
 
+/* ml2106: the DualSense output report, as Sony's libScePad, SDL and Linux
+ * write it. Sources: Linux drivers/hid/hid-playstation.c (struct
+ * dualsense_output_report_common, DS_OUTPUT_VALID_FLAG*), SDL
+ * src/joystick/hidapi/SDL_hidapi_ps5.c (DS5EffectsState_t,
+ * HIDAPI_DriverPS5_UpdateEffects), both master 2026-10-01, and the community
+ * SetStateData layout (Nielk1, controllers wiki) for the bytes neither driver
+ * writes. Offsets into the common block, which starts at report[1] over USB
+ * (report 0x02, 48 bytes) and at report[3] over Bluetooth (report 0x31, 78
+ * bytes: [1] sequence << 4, [2] 0x10, CRC-32 of 0xA2 + report[0..73] at [74]):
+ *
+ *   [0]  valid_flag0: 0x01 compatible vibration (rumble emulation), 0x02
+ *        haptics select (motors instead of audio haptics), 0x04 right trigger
+ *        effect, 0x08 left trigger effect, 0x10/0x20/0x40/0x80 headphone /
+ *        speaker / microphone volume / audio control
+ *   [1]  valid_flag1: 0x01 mic LED, 0x02 power save / mute control, 0x04
+ *        lightbar colour, 0x08 release LEDs, 0x10 player LEDs, 0x20 haptics
+ *        low-pass filter, 0x40 motor power level, 0x80 audio control 2
+ *   [2]  motor_right (small, high frequency)   [3] motor_left (large, low)
+ *   [4..7] headphone/speaker/mic volume, audio control   [8] mic LED
+ *   [9]  power save / mute bits   [10..20] R2 effect   [21..31] L2 effect
+ *   [32..35] host timestamp   [36] power reduction: low nibble triggers,
+ *        high nibble rumble, 0-7 = 12.5 % steps   [37] audio control 2
+ *   [38] valid_flag2: 0x01 LED brightness, 0x02 lightbar setup, 0x04
+ *        improved rumble emulation ("vibration v2", firmware 2.24+)
+ *   [41] lightbar setup   [42] LED brightness   [43] player LEDs (bits 0-4,
+ *        0x20 instant)   [44..46] lightbar red, green, blue
+ *
+ * Trigger effect blocks: byte 0 is the mode, 10 parameter bytes follow
+ * (WiniosPadEffects.h decodes them for the app). */
+#define HIDPAD_DS_OUT_USB      0x02
+#define HIDPAD_DS_OUT_USB_LEN  48
+#define HIDPAD_DS_OUT_BT       0x31
+#define HIDPAD_DS_OUT_BT_LEN   78
+
+#define HIDPAD_DS_F0_RUMBLE        0x01
+#define HIDPAD_DS_F0_HAPTICS_SEL   0x02
+#define HIDPAD_DS_F0_RIGHT_TRIGGER 0x04
+#define HIDPAD_DS_F0_LEFT_TRIGGER  0x08
+#define HIDPAD_DS_F1_MIC_LED       0x01
+#define HIDPAD_DS_F1_LIGHTBAR      0x04
+#define HIDPAD_DS_F1_PLAYER_LEDS   0x10
+#define HIDPAD_DS_F1_LOW_PASS      0x20
+#define HIDPAD_DS_F1_POWER         0x40
+#define HIDPAD_DS_F2_RUMBLE2       0x04
+
+/* CRC-32 (IEEE, reflected, as zlib's crc32 and SDL_crc32). */
+static inline uint32_t hidpad_crc32( uint32_t crc, const unsigned char *p, unsigned int len )
+{
+    unsigned int i, k;
+
+    crc = ~crc;
+    for (i = 0; i < len; i++)
+    {
+        crc ^= p[i];
+        for (k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1)));
+    }
+    return ~crc;
+}
+
+/* The CRC a Bluetooth DualSense output report carries at [len - 4]. */
+static inline uint32_t hidpad_dualsense_bt_crc( const unsigned char *r, unsigned int len )
+{
+    static const unsigned char seed = 0xa2;     /* HID transaction header: DATA | OUTPUT */
+    return hidpad_crc32( hidpad_crc32( 0, &seed, 1 ), r, len - 4 );
+}
+
+/* Where an output report's common block starts, or NULL when the report is
+ * not a DualSense effects report (or a Bluetooth one fails its CRC). */
+static inline const unsigned char *hidpad_dualsense_common( const unsigned char *r, unsigned int len )
+{
+    if (len >= HIDPAD_DS_OUT_USB_LEN && r[0] == HIDPAD_DS_OUT_USB) return r + 1;
+    if (len >= HIDPAD_DS_OUT_BT_LEN && r[0] == HIDPAD_DS_OUT_BT)
+    {
+        const unsigned char *c = r + HIDPAD_DS_OUT_BT_LEN - 4;
+        uint32_t crc = c[0] | c[1] << 8 | c[2] << 16 | (uint32_t)c[3] << 24;
+        if (crc == hidpad_dualsense_bt_crc( r, HIDPAD_DS_OUT_BT_LEN )) return r + 3;
+    }
+    return NULL;
+}
+
+/* Fold what the game asked for into `out`, keeping whatever this report does
+ * not flag. Returns 1 when the report was a DualSense effects report. Rumble
+ * counts when any of the three rumble bits is set: libScePad and SDL use the
+ * "improved" one (valid_flag2) on firmware 2.24+, which feature report 0x20
+ * claims, Linux sets haptics select with either. */
+static inline int hidpad_dualsense_output( const unsigned char *r, unsigned int len,
+                                           struct winios_hidpad_output *out )
+{
+    const unsigned char *c = hidpad_dualsense_common( r, len );
+    unsigned char f0, f1, f2;
+
+    if (!c) return 0;
+    f0 = c[0];
+    f1 = c[1];
+    f2 = c[38];
+    if ((f0 & (HIDPAD_DS_F0_RUMBLE | HIDPAD_DS_F0_HAPTICS_SEL)) || (f2 & HIDPAD_DS_F2_RUMBLE2))
+    {
+        out->rumble_valid = 1;
+        out->rumble_right = c[2];               /* small, high-frequency motor */
+        out->rumble_left = c[3];                /* large, low-frequency motor */
+    }
+    if (f0 & HIDPAD_DS_F0_RIGHT_TRIGGER)
+    {
+        out->trigger_valid[1] = 1;
+        memcpy( out->trigger[1], c + 10, 11 );
+    }
+    if (f0 & HIDPAD_DS_F0_LEFT_TRIGGER)
+    {
+        out->trigger_valid[0] = 1;
+        memcpy( out->trigger[0], c + 21, 11 );
+    }
+    if (f1 & HIDPAD_DS_F1_MIC_LED)
+    {
+        out->mute_led_valid = 1;
+        out->mute_led = c[8];
+    }
+    if (f1 & HIDPAD_DS_F1_POWER)
+    {
+        out->power_valid = 1;
+        out->power_reduction = c[36] & 0x77;
+    }
+    if (f1 & HIDPAD_DS_F1_PLAYER_LEDS)
+    {
+        out->player_leds_valid = 1;
+        out->player_leds = c[43];
+    }
+    if (f1 & HIDPAD_DS_F1_LIGHTBAR)
+    {
+        out->lightbar_valid = 1;
+        out->red = c[44];
+        out->green = c[45];
+        out->blue = c[46];
+    }
+    return 1;
+}
+
+/* The three valid-flag bytes of an effects report (for the log), 0 if none. */
+static inline uint32_t hidpad_dualsense_output_flags( const unsigned char *r, unsigned int len )
+{
+    const unsigned char *c = hidpad_dualsense_common( r, len );
+    return c ? (uint32_t)c[0] | (uint32_t)c[1] << 8 | (uint32_t)c[38] << 16 : 0;
+}
+
 #endif

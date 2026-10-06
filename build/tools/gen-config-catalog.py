@@ -96,6 +96,16 @@ OVERLAY = {
                 "note": "1: with the HID controller on, player 1 also stays an XInput pad. Off by default, so a game "
                         "that reads both APIs does not see the same pad twice.",
                 "sources": ["app/Madeira/GamepadInput.swift"]},
+    # ml2106: game output to the physical pad (app/Madeira/PadOutput.m).
+    "env.MADEIRA_PAD_OUTPUT": {"category": "Controllers", "title": "Rumble, adaptive triggers and lightbar to the pad",
+                "kind": "choice",
+                "note": "On (default): XInput rumble plays on the controller (CoreHaptics), and in DualSense HID mode the "
+                        "game's output reports drive rumble, adaptive triggers (closest GameController mode), lightbar "
+                        "and player LEDs. hid: only the DualSense's; xinput: only XInput rumble; 0: none. Read at "
+                        "session start.",
+                "choices": [("", "On (default)"), ("hid", "DualSense output only"), ("xinput", "XInput rumble only"),
+                            ("0", "Off")],
+                "sources": ["app/Madeira/GamepadInput.swift", "app/Madeira/PadOutput.m"]},
     "env.MADEIRA_PROMOTE": {"title": "Hold the display at its maximum rate"},
     "dxmt": {"title": "DXMT options (a=b;c=d)",
              "note": "Exported as DXMT_CONFIG with the options joined by ';', a library game's own dxmt options after these: "

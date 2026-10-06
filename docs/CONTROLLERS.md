@@ -240,9 +240,36 @@ microphone (mute) button, so that bit never sets. Battery level and charging
 come from GCDeviceBattery once a second. Sensors report the pad lying flat,
 the touchpad reports no finger.
 
-Output reports (0x02 over WriteFile or IOCTL_HID_SET_OUTPUT_REPORT) are
-accepted with hidclass's length checks; rumble, adaptive triggers and the
-light bar are not applied to the physical pad by this change.
+Output (ml2106/ml2107): the game's output reports (0x02 over WriteFile or
+IOCTL_HID_SET_OUTPUT_REPORT) are decoded in the wineserver and applied to
+player 1's pad by `app/Madeira/PadOutput.m`: the rumble pair through
+CoreHaptics on the left and right handle, each trigger effect as the closest
+`GCDualSenseAdaptiveTrigger` mode (`Winios/WiniosPadEffects.h`), the light bar
+through `GCDeviceLight`, the player LEDs through `playerIndex`. All three
+rumble flags count (Linux's compatible vibration and haptics select, and the
+firmware-2.24 "improved rumble" flag libScePad and SDL use), as does the motor
+power reduction byte. When the game closes its last handle the motors stop
+and the triggers are released; while the app is inactive the motors stop and
+the triggers go off. `env.MADEIRA_PAD_OUTPUT = 0` keeps the pad as it is.
+
+What iOS allows at all: an app never sees the DualSense's HID reports, its
+USB interfaces or its audio channels; it gets GameController's view only --
+GCDualSenseGamepad state, GCDualSenseAdaptiveTrigger modes (off, feedback,
+weapon, vibration, and the positional variants), GCDeviceLight (light bar
+colour), GCController.playerIndex (four fixed player-LED patterns), GCMotion,
+and CoreHaptics engines from GCDeviceHaptics. So the output side is mapped
+best effort: the classic rumble pair to CoreHaptics intensities, a game's
+trigger effect to the closest Apple trigger mode (bow becomes weapon,
+galloping and machine become vibration), the light bar colour to
+GCDeviceLight. Not reproducible on iOS: the DualSense's audio-driven
+("advanced") haptics -- PC games send those as a sound stream to the pad's
+USB audio interface, which this virtual device does not have, so such games
+fall back to the rumble pair -- the speaker, headset and microphone, the
+microphone LED, arbitrary player-LED patterns, light bar brightness/fade
+settings. CoreHaptics on a game controller only takes plain pattern players
+(the advanced player breaks the engine's connection to gamecontrollerd), so
+each handle plays one continuous event whose intensity follows the motor,
+restarted every 25 s; a failed engine set-up backs off and retries.
 
 Why the wineserver serves it: on desktop Wine a pad reaches hid.dll through
 plugplay/winedevice loading winebus.sys, winehid, hidclass and hidparse. A
@@ -264,13 +291,20 @@ shipped builtins, unchanged.
 Logs: `[hid-pad] ml2100 session mode=... kind=...` (app), `[hid-pad] ml2101
 device dualsense 054c:0ce6 ...` (wineserver), `[hid-pad] ml2102 ... registered
 (4/4 keys)` (first Wine process), then `ml2101 open #n`, `first input report`,
-`feature report 0x.. read`, `first output report`, `ml2104 ... refused` and
-`unsupported ioctl` (each limited to a few lines).
+`feature report 0x.. read`, `[hidpad-out] ml2106 #n via write|ioctl ...`
+(the decoded output report; then a tally at 100, 1000, ... reports), `ml2104
+... refused` and `unsupported ioctl` (each limited to a few lines); the app
+logs what it applied as `[hidpad-out] ml2107 ...` (`haptics ready on ...`,
+`slot n rumble`, `L2:`/`R2:` trigger modes, `lightbar`).
 
 `tests/host/check-hidpad.py` (needs the wine submodule or `WINE_SRC`)
 runs both descriptors through Wine's hidparse.sys and hid.dll and checks every
-report field, the feature reports, the snapshot transport, and the registry
-entries against a fake registry with Wine 11's rules.
+report field, the feature and output reports, the snapshot transport, and the
+registry entries against a fake registry with Wine 11's rules.
+`tests/host/check-pad-output.py` runs the output decoder (USB and Bluetooth
+reports, CRC), the trigger-effect mapping against a transcription of Nielk1's
+TriggerEffectGenerator, the rumble levels and player LEDs, and checks the
+PadOutput/Xcode/GamepadInput/win32u wiring.
 
 ## Audio route with wired controllers
 
@@ -298,6 +332,7 @@ user sees are opt-in (only `1` enables); the others are on unless set to `0`:
 | `MADEIRA_PAD_EARLY_SLOT` | **off** | `1`: player 1 is reserved at session start (see above) |
 | `MADEIRA_PAD_MODE` | XInput | `hid` / `dualsense` / `generic`: player 1 as a HID controller (see above) |
 | `MADEIRA_HIDPAD_XINPUT` | **off** | `1`: in HID mode, player 1 stays an XInput pad as well |
+| `MADEIRA_PAD_OUTPUT` | on | `0`: no rumble/trigger/lightbar output to the pad; `hid` / `xinput`: only that half |
 
 `[controls-layout] ml1970` logs layout loads, saves, creation and deletion
 (never layout names); `[xinput] ml1990` logs the session slot reservation.
@@ -310,7 +345,14 @@ query. It is hidden unless `env.MADEIRA_DINPUT_PAD = 1` is in madeira.cfg
 otherwise see two controllers. `MADEIRA_DINPUT_TRACE=1` adds a rate-limited
 state trace.
 
-Vibration, battery telemetry, controller-driven navigation of the app itself,
+XInput vibration (ml2106): XInputSetState's two motors play on the pad in
+that slot through CoreHaptics, and XInputGetCapabilities reports motors, when
+`MADEIRA_PAD_OUTPUT` allows it. It needs the companion Wine xinput change
+(XInputSetState, XInputEnable and process detach forward the motors through
+`NtUserGamepadOp_SetVibration`) and rebuilt xinput1_1-1_4 DLLs; with the
+current prebuilt xinput the motors are not forwarded.
+
+Battery telemetry, controller-driven navigation of the app itself,
 shaped (non-round) controls, a layout-wide size slider and a movable top bar
 remain outside this contribution. Binding physical buttons to keyboard/mouse
 controls is the keyboard-and-mouse mode above.
@@ -348,6 +390,7 @@ python3 tests/host/check-gamepad.py
 python3 tests/host/check-touch-gamepad.py
 python3 tests/host/check-control-presets.py
 python3 tests/host/check-hidpad.py      # needs the wine submodule or WINE_SRC
+python3 tests/host/check-pad-output.py
 ```
 
 The first compiles production snapshot/query code and checks packets, ranges,
