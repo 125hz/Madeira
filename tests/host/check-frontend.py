@@ -98,7 +98,11 @@ var published: (Int32, Int32) = (0, 0)
 func winios_display_mode_changed(_ w: Int32, _ h: Int32) { published = (w, h) }
 var vsync: Int32 = -1
 func madeira_set_vsync_locked(_ mode: Int32) { vsync = mode }
-enum ProMotionIntent { static var has30Cap = true }
+enum ProMotionIntent {
+    static var has30Cap = true
+    static var has40Cap = true
+''' + block(fps, '    static func supportedMode(_ mode: Int) -> Int32 {') + r'''
+}
 struct TouchControl: Codable, Equatable { var nx = 0.5 }
 enum ControlAction: Codable, Equatable, Hashable { case none }   // LibraryEntry.controllerBinds
 enum GamepadInput { static let keyboardMouseAvailable = true }   // LibraryEntry's per-game DirectInput choice
@@ -205,7 +209,14 @@ game.fpsMode = 3; game.applyEnvironment()
 expect(vsync == 3, "30 FPS applied when DXMT has the cap")
 ProMotionIntent.has30Cap = false; game.applyEnvironment()
 expect(vsync == 1, "a saved 30 FPS runs as 60 without DXMT's 30 FPS cap")
-ProMotionIntent.has30Cap = true; game.fpsMode = 1; game.applyEnvironment()
+ProMotionIntent.has30Cap = true
+// 40 needs DXMT's 40 FPS cap and a 120 Hz panel; without them a saved 40 runs as 60.
+game.fpsMode = 4; game.applyEnvironment()
+expect(vsync == 4, "40 FPS applied when it is offered")
+expect((try? game.validate()) != nil, "a 40 FPS profile validates")
+ProMotionIntent.has40Cap = false; game.applyEnvironment()
+expect(vsync == 1, "a saved 40 FPS runs as 60 without the 40 FPS cap")
+ProMotionIntent.has40Cap = true; game.fpsMode = 1; game.applyEnvironment()
 expect(vsync == 1, "60 FPS applied")
 // "XInput and DirectInput": MADEIRA_DINPUT_PAD for that game's launch only; the
 // next launch without the choice clears it unless madeira.cfg sets it.
@@ -456,6 +467,9 @@ check('MadeiraConfig.flag("MADEIRA_PROMOTE", fallback: false)' in fps,
 check('if mode == 1 { return holdMaximum ? panelMaxFPS : 0 }' in fps, 'no display link in the 60 cap by default')
 check('__attribute__((weak)) void madeira_set_display_max_fps' in shim and 'ProMotionIntent.has30Cap' in fps
       and 'ProMotionIntent.has30Cap || mode == 3' in lib, 'the 30 FPS cap is offered only with DXMT support')
+check('__attribute__((weak)) int madeira_dxmt_has_40_cap(void) {\n    return 0;' in shim
+      and 'madeira_dxmt_has_40_cap() != 0 && panelMaxFPS >= 120' in fps
+      and 'ProMotionIntent.has40Cap || mode == 4' in lib, 'the 40 FPS cap is offered only with DXMT support and a 120 Hz panel')
 check('LibraryView(play: launchLibraryEntry' in content, 'ContentView shows the library when it is the chosen interface')
 check('runWineFullSequence(profile: entry)' in content and 'profile.applyEnvironment()' in content,
       'library launches use the shared launch path with the profile applied')

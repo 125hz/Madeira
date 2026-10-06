@@ -117,6 +117,13 @@ int madeira_dxmt_has_display_pacing(void) {
     return !g_dxmt_display_pacing_missing;
 }
 
+// DXMT with the 40 FPS cap (vsync mode 4) defines madeira_dxmt_has_40_cap()
+// returning 1. A DXMT without it would present mode 4 uncapped, so this weak
+// fallback says no and the front end does not offer 40.
+__attribute__((weak)) int madeira_dxmt_has_40_cap(void) {
+    return 0;
+}
+
 // --- macdrv_* implementations ---
 
 // DXMT only dereferences client_cocoa_view (passing it straight back to
