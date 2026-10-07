@@ -26,7 +26,9 @@ extents, whole-host-page copy-back and the [swap] census.
    - ml1291: a given-back range queued to the punch thread is not free before
      its punch, reads as zero in the file afterwards and only then returns
      to the free list (the other cases run with MADEIRA_SWAP_PUNCH_DEFER=0,
-     punching synchronously as before).
+     punching synchronously as before);
+   - ml1297: a range whose punch failed (synchronous or on the punch thread)
+     is never returned to the free list.
 2. Source-checks the call sites in allocate_virtual_memory(), that every new
    entry point returns first when the tier is off, that the census neither
    allocates nor uses stdio, that the punch thread punches without
@@ -498,6 +500,39 @@ static void test_deferred_punch( void )
     reset_tier();
 }
 
+/* ml1297: a range whose punch failed is never reused */
+static void test_punch_failure( void )
+{
+    int fd = ios_swap_fd, nullfd = open( "/dev/null", O_RDONLY ), waited;
+    unsigned long long leaks0 = ios_swap_punch_leaks, done0;
+    uint64_t a;
+    env( "blocks", NULL, NULL );
+    reset_tier();
+    a = ios_swap_take( 0x8000 );
+    ios_swap_take( 0x4000 );   /* keeps a below the bump */
+    ios_swap_pq_state = -1;   /* synchronous */
+    ios_swap_fd = nullfd;
+    ios_swap_give( a, 0x8000 );
+    ios_swap_fd = fd;
+    CHECK( ios_swap_punch_leaks == leaks0 + 1 && ios_swap_nfree == 0, "punch failure (synchronous): range not reused" );
+    reset_tier();
+    a = ios_swap_take( 0x8000 );
+    ios_swap_take( 0x4000 );
+    ios_swap_pq_state = 1;    /* the punch thread started in test_deferred_punch */
+    done0 = ios_swap_pq_done;
+    ios_swap_fd = nullfd;
+    pthread_mutex_lock( &virtual_mutex );
+    ios_swap_give( a, 0x8000 );
+    pthread_mutex_unlock( &virtual_mutex );
+    for (waited = 0; ios_swap_pq_done == done0 && waited < 5000; waited++) usleep( 1000 );
+    ios_swap_fd = fd;
+    pthread_mutex_lock( &virtual_mutex );
+    CHECK( ios_swap_pq_done == done0 + 1 && ios_swap_punch_leaks == leaks0 + 2 && ios_swap_nfree == 0, "punch failure (punch thread): range not reused" );
+    pthread_mutex_unlock( &virtual_mutex );
+    close( nullfd );
+    reset_tier();
+}
+
 static void test_off( void )
 {
     struct file_view v = { 0, 0, 0 };
@@ -534,6 +569,7 @@ int main( int argc, char **argv )
     test_classic_commit();
     test_reserve();
     test_deferred_punch();
+    test_punch_failure();
     env( "blocks", NULL, NULL );
     ios_swap_tick( 1 );
     printf( "%d failures\n", bad );
@@ -560,6 +596,7 @@ with tempfile.TemporaryDirectory() as tmp:
         check(re.search(r'file=\d+/256MB', census[-1]) is not None, 'census carries file use and cap')
     check('[swap] ml1291 deferred F_PUNCHHOLE off (MADEIRA_SWAP_PUNCH_DEFER=0)' in err, 'MADEIRA_SWAP_PUNCH_DEFER=0 keeps the punches synchronous')
     check('[swap] ml1291 deferred F_PUNCHHOLE on' in err, 'the punch thread starts by default')
+    check('range not reused, ml1297' in err, 'ml1297: a failed synchronous punch is logged')
 
 # ------------------------------------------------------------ source checks
 avm = body_of(virt, 'static NTSTATUS allocate_virtual_memory(')
