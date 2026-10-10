@@ -2931,8 +2931,287 @@ struct LibraryDetail: View {
             LibraryArtwork(entry: entry, backdrop: backdrop)
         }
     }
+    /// The pages the details page links to (iOS Settings style), each with its own Form.
+    enum Page: Hashable {
+        case display, controls, launch, compatibility, steam, cloud, library, advanced
+        var title: String {
+            switch self {
+            case .display: return "Display"
+            case .controls: return "Controls"
+            case .launch: return "Launch"
+            case .compatibility: return "Compatibility"
+            case .steam: return "Steam"
+            case .cloud: return "Steam Cloud"
+            case .library: return "Library details"
+            case .advanced: return "Advanced"
+            }
+        }
+        var symbol: String {
+            switch self {
+            case .display: return "display"
+            case .controls: return "gamecontroller"
+            case .launch: return "terminal"
+            case .compatibility: return "cpu"
+            case .steam: return "shippingbox"
+            case .cloud: return "icloud"
+            case .library: return "info.circle"
+            case .advanced: return "wrench.and.screwdriver"
+            }
+        }
+    }
+    @State private var path: [Page] = []
+    /// The rows of the details page, in groups. The Desktop entry has no launch options
+    /// or library details; a Steam game has its Steam pages.
+    private var pageGroups: [[Page]] {
+        let launch = entry.usesLaunchOptions || (entry.desktop != true && entry.steamAppID == nil)
+        let steam: [Page] = entry.steamAppID == nil ? [] : (SteamOwnedLibrary.cloudEnabled ? [.steam, .cloud] : [.steam])
+        let tuning: [Page] = launch ? [.display, .controls, .launch, .compatibility] : [.display, .controls, .compatibility]
+        let more: [Page] = entry.desktop == true ? [.advanced] : [.library, .advanced]
+        return [tuning, steam, more].filter { !$0.isEmpty }
+    }
+    /// The value a page's row shows, when one setting sums it up.
+    private func summary(_ page: Page) -> String? {
+        switch page {
+        case .display: return entry.metalFXUpscale.map { "\(entry.resolution) · MetalFX \($0 == 2 ? "2" : "1.5")×" } ?? entry.resolution
+        case .controls: return entry.controllerMode == "keys" ? "Keyboard and mouse" : entry.controllerMode == "dinput" ? "XInput and DirectInput" : nil
+        case .launch: return entry.usesLaunchOptions ? (entry.runsInDesktop ? "Wine desktop" : "Directly") : nil
+        case .steam: return entry.startsSteamGameDirectly ? "The game" : "Madeira Dock"
+        case .advanced: return Self.configSummary(entry.config)
+        default: return nil
+        }
+    }
+
+    @ViewBuilder private func page(_ page: Page) -> some View {
+        Form {
+            switch page {
+            case .display: displayPage
+            case .controls: controlsPage
+            case .launch: launchPage
+            case .compatibility: compatibilityPage
+            case .steam: steamPage
+            case .cloud: if let appID = entry.steamAppID { SteamCloudSection(appID: appID) }
+            case .library: libraryPage
+            case .advanced: advancedPage
+            }
+        }
+        .navigationTitle(page.title).navigationBarTitleDisplayMode(.inline)
+    }
+
+    @ViewBuilder private var displayPage: some View {
+        Section {
+            // The Windows screen the game renders for (and the Desktop's size).
+            // ml1172: this device's choices (ResolutionChoices), grouped.
+            let groups = ResolutionChoices.groups()
+            let metalFX = ResolutionChoices.metalFX(in: groups)
+            Picker("Resolution", selection: $entry.resolution) {
+                ForEach(groups, id: \.title) { group in
+                    Section(group.title) {
+                        ForEach(group.choices, id: \.value) { Text($0.label).tag($0.value) }
+                    }
+                }
+                // The screen's shape at 480 lines, which MetalFX 1.5× brings to 720.
+                if let shape = metalFX, entry.metalFXUpscale == 1.5 || entry.resolution == shape.value {
+                    Text(shape.label).tag(shape.value)
+                }
+                // A size none of them has, so the picker never shows a blank choice.
+                if entry.resolution != metalFX?.value, let saved = ResolutionChoices.extra(entry.resolution, in: groups, note: "saved") {
+                    Text(saved.label).tag(entry.resolution)
+                }
+            }
+            Picker("Aspect & scaling", selection: Binding(get: { entry.displayMode.rawValue }, set: { entry.display = $0 })) {
+                ForEach(DisplayMode.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
+            }
+            // Every setting here is the Desktop's too: its programs present through
+            // the same path, and its launch applies them like a game's
+            // (applyEnvironment, gameConfigText). check-frontend holds the parity.
+            Picker("MetalFX upscaling", selection: $entry.metalFXUpscale) {
+                Text("Off").tag(Double?.none)
+                Text("1.5×").tag(Double?.some(1.5))
+                Text("2×").tag(Double?.some(2))
+            }
+            Toggle("Frame generation (experimental)", isOn: Binding(get: { entry.frameGeneration ?? false }, set: { entry.frameGeneration = $0 ? true : nil }))
+            if entry.frameGeneration == true {
+                Text("Adds a generated frame between real ones. More latency; the FPS limit is ignored.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        } header: { Text("Display") } footer: {
+            Text("MetalFX renders at the resolution above and upscales it (Direct3D 11 and 12).")
+        }
+    }
+
+    @ViewBuilder private var controlsPage: some View {
+        Section("On screen") {
+            if GamepadInput.keyboardMouseAvailable {
+                ControllerModeChoice(mode: $entry.controllerMode)
+                if entry.controllerMode == "dinput" {
+                    Text("For older games that read the pad through DirectInput.").font(.caption).foregroundStyle(.secondary)
+                }
+                if entry.controllerMode == "keys" {
+                    Text("The pad acts as keyboard and mouse. Change keys in Controller binds.").font(.caption).foregroundStyle(.secondary)
+                    NavigationLink("Controller binds") {
+                        Form { ControllerBindsPage(binds: $entry.controllerBinds, mouseVertical: $entry.padMouseVertical) }
+                            .navigationTitle("Controller binds")
+                            .toolbar {
+                                Button("Reset") { entry.controllerBinds = nil; entry.padMouseVertical = nil }
+                                    .disabled(entry.controllerBinds == nil && entry.padMouseVertical == nil)
+                            }
+                    }
+                }
+            }
+            LabeledContent("Control opacity") {
+                Slider(value: Binding(get: { entry.controlOpacity ?? 0.7 }, set: { entry.controlOpacity = $0 }), in: 0.15...1)
+            }
+            LabeledContent("Control size") {
+                Slider(value: Binding(get: { entry.controlSize ?? 1 }, set: { entry.controlSize = $0 }), in: 0.5...2)
+            }
+            Text("Edit buttons from the in-game menu.").font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private var launchPage: some View {
+        // ml1163: how the program starts. Not for the Desktop entry, nor for a Steam
+        // game started through Madeira Dock, whose desktop and command are Dock's:
+        // there these choices would do nothing.
+        if entry.usesLaunchOptions {
+            Section {
+                Picker("Start", selection: Binding(get: { entry.runsInDesktop ? "desktop" : "direct" }, set: {
+                    entry.launchMode = $0 == "desktop" ? "desktop" : nil
+                })) {
+                    Text("Directly").tag("direct")
+                    Text("In the Wine desktop").tag("desktop")
+                }
+                TextField("Working folder (default: the program's folder)", text: Binding(get: { entry.workingDirectory ?? "" }, set: {
+                    entry.workingDirectory = $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0
+                })).autocorrectionDisabled().textInputAutocapitalization(.never).font(.body.monospaced())
+                Toggle("Start Windows services first", isOn: Binding(get: { entry.startServices == true }, set: {
+                    entry.startServices = $0 ? true : nil
+                }))
+            } header: { Text("Launch") } footer: {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("The working folder is a C:\\ path. Services are for launchers that need them.")
+                    if !entry.runsInDesktop && (entry.isBatch || entry.startServices == true) {
+                        // Wine stops with its first process (the ml1163 open risk).
+                        Text("A batch file that exits closes the game. Start it in the Wine desktop.")
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
+        }
+        // A Steam game starts with Steam's own launch option through Madeira Dock.
+        if entry.desktop != true && entry.steamAppID == nil {
+            Section {
+                TextField("Launch arguments", text: $entry.arguments, axis: .vertical)
+                    .font(.body.monospaced()).lineLimit(1...4)
+                    .autocorrectionDisabled().textInputAutocapitalization(.never)
+                LaunchFlagChips(arguments: $entry.arguments)
+                // What the next start runs (ml1163: in the Wine desktop, a batch file or
+                // the services batch, what starts the program).
+                Text(entry.commandPreview)
+                    .font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+            } header: { Text("Launch arguments") } footer: {
+                Text("Passed on every start. Above: the full command.")
+            }
+        }
+    }
+
+    @ViewBuilder private var compatibilityPage: some View {
+        Section {
+            Toggle(isOn: $entry.reducedX87) { compatLabel("Reduced-precision x87", "Faster, less accurate") }
+            // Exported for this game only when chosen (applyEnvironment).
+            Toggle(isOn: Binding(get: { entry.avx ?? false }, set: { entry.avx = $0 ? true : nil })) {
+                compatLabel("AVX and AVX2", "For games that quit with c000001d")
+            }
+            // Exported for this game only when chosen (applyEnvironment).
+            Picker("CPU cores reported", selection: Binding(get: { entry.cpuCount ?? 0 }, set: { entry.cpuCount = $0 == 0 ? nil : $0 })) {
+                Text("Automatic").tag(0)
+                ForEach([1, 2, 4, 6], id: \.self) { Text("\($0)").tag($0) }
+            }
+            Picker("D3D9 anisotropic filtering", selection: Binding(get: { entry.anisotropyLimit ?? 0 }, set: { entry.anisotropyLimit = $0 == 0 ? nil : $0 })) {
+                Text("Application default").tag(0)
+                ForEach([1, 2, 4, 8], id: \.self) { Text("Up to \($0)×").tag($0) }
+            }
+            Toggle(isOn: Binding(get: { entry.reportNVIDIA ?? false }, set: { entry.reportNVIDIA = $0 ? true : nil })) {
+                compatLabel("Report an NVIDIA GPU", "For \"no graphics card\" errors")
+            }
+            // Fastsync-only switches: shown for every game, usable only while
+            // Settings › Sync engine is Fastsync.
+            Group {
+                Toggle("Fast synchronization", isOn: Binding(get: { entry.fastSync ?? true }, set: { entry.fastSync = $0 }))
+                Toggle("Fast semaphore waits (experimental)",
+                       isOn: Binding(get: { entry.semaphoreFastPath ?? false }, set: { entry.semaphoreFastPath = $0 }))
+            }
+            .disabled(syncEngine != .fastsync)
+            if syncEngine != .fastsync {
+                Text("Choose Fastsync in Settings › Memory & sync to use these.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        } header: { Text("Compatibility & performance") } footer: {
+            Text("Applies at the next launch.")
+        }
+    }
+    private func compatLabel(_ title: String, _ note: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+            Text(note).font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private var steamPage: some View {
+        // A Steam game's start, update, repair and Uninstall (SteamGames.swift).
+        if entry.steamAppID != nil {
+            SteamEntrySection(entry: $entry) { leaving = true; dismiss() }
+            Section {
+                Text(entry.launchWindowsPath).font(.caption.monospaced()).textSelection(.enabled)
+                if entry.startsSteamGameDirectly, !entry.launchArguments.isEmpty {
+                    Text(entry.launchArguments).font(.caption.monospaced()).textSelection(.enabled)
+                }
+            } header: { Text("Executable") }
+        }
+    }
+
+    @ViewBuilder private var libraryPage: some View {
+        if entry.desktop != true { Section("Library details") {
+            TextField("Title", text: $entry.title)
+            Button("Find on Steam", systemImage: "magnifyingglass") { findCover = true }
+            Button("Choose cover image", systemImage: "photo") { importCover = true }
+            if entry.coverFile != nil { Button((entry.steamAppID ?? entry.steamID) != nil ? "Use Steam artwork" : "Remove cover image") { entry.coverFile = nil } }
+        } }
+        // A link that starts this game from a Home Screen icon (SavesAndShortcuts.swift).
+        if entry.desktop != true {
+            Section {
+                Button {
+                    UIPasteboard.general.string = ShortcutRouter.link(for: entry.windowsPath)
+                    copiedLink = true
+                } label: {
+                    Label(copiedLink ? "Link copied" : "Copy Home Screen shortcut link",
+                          systemImage: copiedLink ? "checkmark" : "link")
+                }
+            } header: { Text("Home Screen") } footer: {
+                Text("Shortcuts › Open URLs › paste › Add to Home Screen.")
+            }
+        }
+        if entry.steamAppID == nil && entry.desktop != true {
+            Section("Executable") { Text(entry.windowsPath).font(.caption.monospaced()).textSelection(.enabled) }
+            Section { Button("Remove from library", role: .destructive) { remove = true } }
+        }
+        if let error { Section { Text(error).foregroundStyle(.red) } }
+    }
+
+    @ViewBuilder private var advancedPage: some View {
+        Section {
+            Toggle("Live logs", isOn: $entry.liveLogs)
+            NavigationLink {
+                LibraryGameConfigEditor(text: Binding(get: { entry.config ?? "" }, set: { entry.config = $0.isEmpty ? nil : $0 }))
+            } label: {
+                LabeledContent("This game's config", value: Self.configSummary(entry.config))
+            }
+        } header: { Text("Advanced") } footer: {
+            Text("Per-game madeira.cfg lines; they override the global file.")
+        }
+    }
+
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             Form {
                 Section {
                     HStack(spacing: 20) {
@@ -2972,231 +3251,68 @@ struct LibraryDetail: View {
                                 }.clipped()
                         )
                 }
-                if entry.desktop != true { Section("Library details") {
-                    TextField("Title", text: $entry.title)
-                    Button("Find on Steam", systemImage: "magnifyingglass") { findCover = true }
-                    Button("Choose cover image", systemImage: "photo") { importCover = true }
-                    if entry.coverFile != nil { Button((entry.steamAppID ?? entry.steamID) != nil ? "Use Steam artwork" : "Remove cover image") { entry.coverFile = nil } }
-                } }
-                // A Steam game's cloud saves, then how it starts, under its library
-                // details (SteamGames.swift).
-                if let appID = entry.steamAppID {
-                    SteamCloudSection(appID: appID)
-                    SteamEntrySection(entry: $entry) { leaving = true; dismiss() }
-                }
-                Section {
-                    // The Windows screen the game renders for (and the Desktop's size).
-                    // ml1172: this device's choices (ResolutionChoices), grouped.
-                    let groups = ResolutionChoices.groups()
-                    let metalFX = ResolutionChoices.metalFX(in: groups)
-                    Picker("Resolution", selection: $entry.resolution) {
-                        ForEach(groups, id: \.title) { group in
-                            Section(group.title) {
-                                ForEach(group.choices, id: \.value) { Text($0.label).tag($0.value) }
-                            }
-                        }
-                        // The screen's shape at 480 lines, which MetalFX 1.5× brings to 720.
-                        if let shape = metalFX, entry.metalFXUpscale == 1.5 || entry.resolution == shape.value {
-                            Text(shape.label).tag(shape.value)
-                        }
-                        // A size none of them has, so the picker never shows a blank choice.
-                        if entry.resolution != metalFX?.value, let saved = ResolutionChoices.extra(entry.resolution, in: groups, note: "saved") {
-                            Text(saved.label).tag(entry.resolution)
-                        }
-                    }
-                    Picker("Aspect & scaling", selection: Binding(get: { entry.displayMode.rawValue }, set: { entry.display = $0 })) {
-                        ForEach(DisplayMode.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
-                    }
-                    // Every setting here is the Desktop's too: its programs present through
-                    // the same path, and its launch applies them like a game's
-                    // (applyEnvironment, gameConfigText). check-frontend holds the parity.
-                    Picker("MetalFX upscaling", selection: $entry.metalFXUpscale) {
-                        Text("Off").tag(Double?.none)
-                        Text("1.5×").tag(Double?.some(1.5))
-                        Text("2×").tag(Double?.some(2))
-                    }
-                    FPSChoice(mode: $entry.fpsMode)
-                    Toggle("Frame generation (experimental)", isOn: Binding(get: { entry.frameGeneration ?? false }, set: { entry.frameGeneration = $0 ? true : nil }))
-                    if entry.frameGeneration == true {
-                        Text("Shows a MetalFX-generated frame between every two rendered frames: twice the frames on screen, at the cost of GPU time, some latency and artifacts at edges and on the HUD. FPS limits do not apply while it is on.")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                } header: { Text("Display") } footer: {
-                    Text("MetalFX upscaling renders at the resolution above and scales the picture up with Apple's MetalFX spatial scaler before it reaches the screen (Direct3D 11 and 12 programs). Use it with a small resolution for frame rate.")
-                }
-                // ml1163: how the program starts. Not for the Desktop entry, nor for a Steam
-                // game started through Madeira Dock, whose desktop and command are Dock's:
-                // there these choices would do nothing.
-                if entry.usesLaunchOptions {
-                    Section {
-                        Picker("Start", selection: Binding(get: { entry.runsInDesktop ? "desktop" : "direct" }, set: {
-                            entry.launchMode = $0 == "desktop" ? "desktop" : nil
-                        })) {
-                            Text("Directly").tag("direct")
-                            Text("In the Wine desktop").tag("desktop")
-                        }
-                        TextField("Working folder (default: the program's folder)", text: Binding(get: { entry.workingDirectory ?? "" }, set: {
-                            entry.workingDirectory = $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0
-                        })).autocorrectionDisabled().textInputAutocapitalization(.never).font(.body.monospaced())
-                        Toggle("Start Windows services first", isOn: Binding(get: { entry.startServices == true }, set: {
-                            entry.startServices = $0 ? true : nil
-                        }))
-                    } header: { Text("Launch") } footer: {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Directly: the game is Wine's first program, with no desktop; small windows such as launchers and message boxes are drawn over the game, a window drawn without DirectX that fills the screen is not. In the Wine desktop: the game starts inside the Wine desktop at the Resolution above, where every window shows.")
-                            Text("The working folder is a C:\\ path, for example C:\\Games\\Some Game. Start Windows services first is for launchers that need them (Steam-style COM); Madeira writes a batch file for it in C:\\madeira-games.")
-                            if !entry.runsInDesktop && (entry.isBatch || entry.startServices == true) {
-                                // Wine stops with its first process (the ml1163 open risk).
-                                Text("Started directly, Wine stops when its first program exits, so a batch file that starts the game and exits closes the game too. Start it in the Wine desktop instead.")
-                                    .foregroundStyle(.orange)
-                            }
-                        }
-                    }
-                }
-                // A Steam game starts with Steam's own launch option through Madeira Dock.
-                if entry.desktop != true && entry.steamAppID == nil {
-                    Section {
-                        TextField("Launch arguments", text: $entry.arguments, axis: .vertical)
-                            .font(.body.monospaced()).lineLimit(1...4)
-                            .autocorrectionDisabled().textInputAutocapitalization(.never)
-                        LaunchFlagChips(arguments: $entry.arguments)
-                        // What the next start runs (ml1163: in the Wine desktop, a batch file or
-                        // the services batch, what starts the program).
-                        Text(entry.commandPreview)
-                            .font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
-                    } header: { Text("Launch arguments") } footer: {
-                        Text("Passed to the program on every start; the line above is the command that runs. The flags add or remove themselves; the renderer flags exclude each other, as do -windowed and -fullscreen.")
-                    }
-                }
-                Section {
-                    Toggle("Reduced-precision x87", isOn: $entry.reducedX87)
-                    // Exported for this game only when chosen (applyEnvironment).
-                    Toggle("AVX and AVX2", isOn: Binding(get: { entry.avx ?? false }, set: { entry.avx = $0 ? true : nil }))
-                    // Exported for this game only when chosen (applyEnvironment).
-                    Picker("CPU cores reported", selection: Binding(get: { entry.cpuCount ?? 0 }, set: { entry.cpuCount = $0 == 0 ? nil : $0 })) {
-                        Text("Automatic").tag(0)
-                        ForEach([1, 2, 4, 6], id: \.self) { Text("\($0)").tag($0) }
-                    }
-                    Picker("D3D9 anisotropic filtering", selection: Binding(get: { entry.anisotropyLimit ?? 0 }, set: { entry.anisotropyLimit = $0 == 0 ? nil : $0 })) {
-                        Text("Application default").tag(0)
-                        ForEach([1, 2, 4, 8], id: \.self) { Text("Up to \($0)×").tag($0) }
-                    }
-                    Toggle("Report an NVIDIA GPU", isOn: Binding(get: { entry.reportNVIDIA ?? false }, set: { entry.reportNVIDIA = $0 ? true : nil }))
-                    // Fastsync-only switches: shown for every game, usable only while
-                    // Settings › Sync engine is Fastsync.
-                    Group {
-                        Toggle("Fast synchronization", isOn: Binding(get: { entry.fastSync ?? true }, set: { entry.fastSync = $0 }))
-                        Toggle("Fast semaphore waits (experimental)",
-                               isOn: Binding(get: { entry.semaphoreFastPath ?? false }, set: { entry.semaphoreFastPath = $0 }))
-                    }
-                    .disabled(syncEngine != .fastsync)
-                    if syncEngine != .fastsync {
-                        Text("Fast synchronization and fast semaphore waits are Fastsync options. Choose Fastsync in Settings › Memory & sync to use them.")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                } header: { Text("Compatibility & performance") } footer: {
-                    Text("Reduced-precision x87 can make older games faster at some cost in accuracy; it is off by default. Turn on AVX and AVX2 (off by default, 64-bit games) when a game built for AVX processors quits at start with an illegal instruction (c000001d); FEX then emulates AVX, which is slower. Report an NVIDIA GPU is for games that stop with \"no graphics card\" or \"failed to get GPU driver info\". With Fastsync, fast synchronization (on by default) handles events without a server round trip, and fast semaphore waits (off by default) does the same for semaphores. Settings apply to the next launch; a precision change may still require restarting Madeira.")
-                }
-                Section("On screen") {
-                    Toggle("Performance overlay", isOn: $entry.performance)
-                    Toggle("Live logs", isOn: $entry.liveLogs)
-                    Toggle("Touch controls", isOn: $entry.touchControls)
-                    if GamepadInput.keyboardMouseAvailable {
-                        ControllerModeChoice(mode: $entry.controllerMode)
-                        if entry.controllerMode == "keys" {
-                            NavigationLink("Controller binds") {
-                                Form { ControllerBindsPage(binds: $entry.controllerBinds, mouseVertical: $entry.padMouseVertical) }
-                                    .navigationTitle("Controller binds")
-                                    .toolbar {
-                                        Button("Reset") { entry.controllerBinds = nil; entry.padMouseVertical = nil }
-                                            .disabled(entry.controllerBinds == nil && entry.padMouseVertical == nil)
-                                    }
-                            }
-                        }
-                    }
-                    LabeledContent("Control opacity") {
-                        Slider(value: Binding(get: { entry.controlOpacity ?? 0.7 }, set: { entry.controlOpacity = $0 }), in: 0.15...1)
-                    }
-                    LabeledContent("Control size") {
-                        Slider(value: Binding(get: { entry.controlSize ?? 1 }, set: { entry.controlSize = $0 }), in: 0.5...2)
-                    }
-                    Text("Arrange buttons and choose XInput, mouse, or keyboard actions from the in-game menu.").font(.caption).foregroundStyle(.secondary)
-                    if GamepadInput.keyboardMouseAvailable {
-                        Text("XInput and DirectInput: for games older than XInput, which read the pad through DirectInput. The same pad is offered through both APIs, so a game that reads both may list two controllers. Applies to the next launch.").font(.caption).foregroundStyle(.secondary)
-                        Text("Keyboard and mouse: for games without controller support. The controller presses keys and moves the mouse (left stick WASD, right stick mouse, triggers click, D-pad arrows, Start Esc, Select Tab) and the game sees no controller. Change what each button does under Controller binds, here or in the in-game menu.").font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-                Section {
-                    NavigationLink {
-                        LibraryGameConfigEditor(text: Binding(get: { entry.config ?? "" }, set: { entry.config = $0.isEmpty ? nil : $0 }))
-                    } label: {
-                        LabeledContent("This game's config", value: Self.configSummary(entry.config))
-                    }
-                } header: { Text("Advanced") } footer: {
-                    Text("Lines in madeira.cfg's format for this game only. A key set here wins over madeira.cfg wherever the runtime reads it, env.NAME lines are exported after madeira.cfg's, and dxmt options are added to madeira.cfg's. Applies from the next start.")
-                }
-                // A link that starts this game from a Home Screen icon (SavesAndShortcuts.swift).
-                if entry.desktop != true {
-                    Section {
-                        Button {
-                            UIPasteboard.general.string = ShortcutRouter.link(for: entry.windowsPath)
-                            copiedLink = true
-                        } label: {
-                            Label(copiedLink ? "Link copied" : "Copy Home Screen shortcut link",
-                                  systemImage: copiedLink ? "checkmark" : "link")
-                        }
-                    } header: { Text("Home Screen") } footer: {
-                        Text("In the Shortcuts app: new shortcut, Open URLs, paste the link, then Share › Add to Home Screen.")
-                    }
-                }
-                if entry.steamAppID != nil {
-                    Section {
-                        Text(entry.launchWindowsPath).font(.caption.monospaced()).textSelection(.enabled)
-                        if entry.startsSteamGameDirectly, !entry.launchArguments.isEmpty {
-                            Text(entry.launchArguments).font(.caption.monospaced()).textSelection(.enabled)
-                        }
-                    } header: { Text("Executable") } footer: {
-                        Text(entry.startsSteamGameDirectly
-                             ? "The game starts this program directly, without Steam."
-                             : "Valve's client starts the game's default Steam launch option from this folder.")
-                    }
-                } else if entry.desktop != true {
-                    Section("Executable") { Text(entry.windowsPath).font(.caption.monospaced()).textSelection(.enabled) }
-                    Section { Button("Remove from library", role: .destructive) { remove = true } }
-                }
+                // A Play error sits under Play.
                 if let error { Section { Text(error).foregroundStyle(.red) } }
+                // A running update blocks Play: its progress shows here too.
+                if let appID = entry.steamAppID, let download = SteamOwnedLibrary.shared.downloads[appID] {
+                    Section { SteamDownloadStatus(download: download) }
+                }
+                Section {
+                    FPSChoice(mode: $entry.fpsMode)
+                    Toggle("Performance overlay", isOn: $entry.performance)
+                    Toggle("Touch controls", isOn: $entry.touchControls)
+                }
+                ForEach(Array(pageGroups.enumerated()), id: \.offset) { _, group in
+                    Section {
+                        ForEach(group, id: \.self) { item in
+                            NavigationLink(value: item) {
+                                if let value = summary(item) {
+                                    LabeledContent { Text(value).lineLimit(1) } label: { Label(item.title, systemImage: item.symbol) }
+                                } else {
+                                    Label(item.title, systemImage: item.symbol)
+                                }
+                            }
+                        }
+                    }
+                }
             }
             .navigationTitle("Game details").navigationBarTitleDisplayMode(.inline)
+            .navigationDestination(for: Page.self) { item in page(item) }
             .toolbarBackground(.regularMaterial, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { model.save(entry); dismiss() } } }
-            .sheet(isPresented: $findCover) { SteamSearchView(query: entry.title) { match in entry.steamID = match.id; entry.title = match.name; entry.coverFile = nil } }
-            .fileImporter(isPresented: $importCover, allowedContentTypes: [.image]) { result in
-                do {
-                    let url = try result.get(); let access = url.startAccessingSecurityScopedResource(); defer { if access { url.stopAccessingSecurityScopedResource() } }
-                    let attrs = try url.resourceValues(forKeys: [.fileSizeKey])
-                    guard (attrs.fileSize ?? Int.max) <= 20_000_000 else { throw LibraryError.message("Choose an image smaller than 20 MB.") }
-                    let data = try Data(contentsOf: url)
-                    guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-                          let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: 1200, kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary),
-                          let jpeg = UIImage(cgImage: thumbnail).jpegData(compressionQuality: 0.85) else { throw LibraryError.message("This image could not be opened.") }
-                    let dir = LibraryModel.documents.appendingPathComponent("madeira-art", isDirectory: true)
-                    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-                    let name = entry.id.uuidString + ".jpg"; try jpeg.write(to: dir.appendingPathComponent(name), options: .atomic); entry.coverFile = name
-                } catch { self.error = error.localizedDescription }
-            }
-            .confirmationDialog("Remove this library entry? Your executable and saves stay in drive_c.", isPresented: $remove, titleVisibility: .visible) {
-                Button("Remove", role: .destructive) { leaving = true; model.remove(entry.id); dismiss() }
-            }
             .task {
                 if entry.graphicsAPI == nil, entry.desktop != true, let url = try? LibraryModel.executable(entry.relativePath) { entry.graphicsAPI = LibraryModel.graphicsImports(url) }
             }
-            .onDisappear { if !leaving { model.save(entry) } }
-            .onReceive(LibraryController.shared.commands) { command in
-                guard !leaving, !findCover, !importCover, !remove else { return }
-                if command == "back" { model.save(entry); dismiss() }
-                if command == "accept" { start() }
+            // Play's checks read the installed games and Dock's client state, which the
+            // Steam page refreshed when it was on this page.
+            .onAppear { if entry.steamAppID != nil { MadeiraDockModel.shared.refresh(); SteamGamesModel.shared.refresh() } }
+        }
+        .sheet(isPresented: $findCover) { SteamSearchView(query: entry.title) { match in entry.steamID = match.id; entry.title = match.name; entry.coverFile = nil } }
+        .fileImporter(isPresented: $importCover, allowedContentTypes: [.image]) { result in
+            do {
+                let url = try result.get(); let access = url.startAccessingSecurityScopedResource(); defer { if access { url.stopAccessingSecurityScopedResource() } }
+                let attrs = try url.resourceValues(forKeys: [.fileSizeKey])
+                guard (attrs.fileSize ?? Int.max) <= 20_000_000 else { throw LibraryError.message("Choose an image smaller than 20 MB.") }
+                let data = try Data(contentsOf: url)
+                guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+                      let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: 1200, kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary),
+                      let jpeg = UIImage(cgImage: thumbnail).jpegData(compressionQuality: 0.85) else { throw LibraryError.message("This image could not be opened.") }
+                let dir = LibraryModel.documents.appendingPathComponent("madeira-art", isDirectory: true)
+                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                let name = entry.id.uuidString + ".jpg"; try jpeg.write(to: dir.appendingPathComponent(name), options: .atomic); entry.coverFile = name
+            } catch { self.error = error.localizedDescription }
+        }
+        .confirmationDialog("Remove this library entry? Your executable and saves stay in drive_c.", isPresented: $remove, titleVisibility: .visible) {
+            Button("Remove", role: .destructive) { leaving = true; model.remove(entry.id); dismiss() }
+        }
+        .onDisappear { if !leaving { model.save(entry) } }
+        .onReceive(LibraryController.shared.commands) { command in
+            guard !leaving, !findCover, !importCover, !remove else { return }
+            if command == "back" {
+                if path.isEmpty { model.save(entry); dismiss() } else { path.removeLast() }
             }
+            if command == "accept", path.isEmpty { start() }
         }
     }
 }
