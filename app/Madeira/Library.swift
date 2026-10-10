@@ -2851,6 +2851,8 @@ private struct LibraryPlayStyle: ButtonStyle {
             .foregroundStyle(.white)
             .background(pending || configuration.isPressed ? Color(uiColor: .darkGray) : .accentColor,
                         in: RoundedRectangle(cornerRadius: 14))
+            .scaleEffect(configuration.isPressed ? 0.955 : 1)
+            .animation(.spring(response: 0.3, dampingFraction: 0.5), value: configuration.isPressed)
     }
 }
 
@@ -2865,6 +2867,8 @@ struct LibraryDetail: View {
     @State private var leaving = false
     @State private var error: String?
     @State private var copiedLink = false
+    /// Where Play is on screen, for the starting screen's flood (LaunchOrigin).
+    @State private var playFrame: CGRect = .zero
     /// Settings › Sync engine, read when the details open: the fastsync switches
     /// below only apply while it is Fastsync.
     @State private var syncEngine = SyncEngine.current
@@ -2890,6 +2894,7 @@ struct LibraryDetail: View {
             }
         }
         leaving = true
+        LaunchOrigin.note(playFrame)
         let profile = entry
         // Give the pressed state a display turn before saving and handing off.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
@@ -2934,6 +2939,7 @@ struct LibraryDetail: View {
                                 }.frame(minWidth: 100, minHeight: 30)
                             }
                             .buttonStyle(LibraryPlayStyle(pending: leaving)).disabled(leaving)
+                            .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { playFrame = $0 }
                         }
                     }.padding(.vertical, 24)
                         .listRowBackground(
@@ -3833,6 +3839,12 @@ struct LibraryHUD: View {
     @State private var eco = madeira_get_eco() != 0
     @State private var fenceMode = FPSOverlayFenceMode.current
     @State private var launchVisible = false
+    /// The Play button's frame while the starting screen floods out of it (LaunchFlood),
+    /// the cover's frame it gathers into, and whether it has landed there.
+    @State private var floodOrigin: CGRect?
+    @State private var coverFrame: CGRect = .zero
+    @State private var coverLanded = true
+    private let launchFloodEnabled = MadeiraConfig.flag("MADEIRA_LAUNCH_FLOOD")   // 0: the starting screen fades in without growing out of the Play button
     /// The Session menu's Controller binds page (keyboard-and-mouse mode).
     @State private var bindsPage = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -3840,11 +3852,23 @@ struct LibraryHUD: View {
         GeometryReader { geo in
             ZStack(alignment: .topLeading) {
                 if model.launching, let entry = model.activeEntry {
-                    launchBackdrop(entry).overlay(.black.opacity(0.65)).ignoresSafeArea()
+                    // The backdrop fades in while it settles from a slight zoom; the screen's
+                    // parts then arrive one after another (LaunchEntrance).
+                    launchBackdrop(entry).scaleEffect(launchVisible || reduceMotion ? 1 : 1.12)
+                        .overlay(.black.opacity(0.65)).ignoresSafeArea()
                         .opacity(launchVisible ? 1 : 0)
+                        .animation(reduceMotion ? .easeOut(duration: 0.15) : .easeOut(duration: 1.1), value: launchVisible)
                     launchView(entry, geometry: geo)
-                        .opacity(launchVisible ? 1 : 0)
-                        .scaleEffect(launchVisible || reduceMotion ? 1 : 0.96)
+                    if let origin = floodOrigin {
+                        let local = geo.frame(in: .global).origin
+                        LaunchFlood(origin: origin.offsetBy(dx: -local.x, dy: -local.y),
+                                    screen: CGRect(origin: .zero, size: geo.size),
+                                    target: coverFrame.offsetBy(dx: -local.x, dy: -local.y),
+                                    gathering: { launchVisible = true },
+                                    landed: { coverLanded = true },
+                                    done: { floodOrigin = nil })
+                            .ignoresSafeArea().allowsHitTesting(false)
+                    }
                 }
                 if !model.launching && model.performance { LibraryFloatingItem(isMenu: false, viewport: geo.size, insets: geo.safeAreaInsets) }
                 if model.liveLogs && !model.launching { LibraryLiveLogs().frame(maxWidth: 550, maxHeight: 140).padding(.top, Self.topInset(geo) + 60).padding(.horizontal, 12).allowsHitTesting(false) }
@@ -3864,7 +3888,13 @@ struct LibraryHUD: View {
             }
             .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.85), value: model.menu)
             .onAppear {
-                withAnimation(.easeOut(duration: reduceMotion ? 0.15 : 0.35)) { launchVisible = true }
+                // Started from a Play button just now: grow out of it, then gather into the
+                // cover (LaunchFlood). Otherwise the parts arrive in turn (LaunchEntrance).
+                if model.launching, launchFloodEnabled, !reduceMotion, let origin = LaunchOrigin.take() {
+                    coverLanded = false; floodOrigin = origin
+                } else {
+                    withAnimation(.easeOut(duration: reduceMotion ? 0.15 : 0.35)) { launchVisible = true }
+                }
             }
             .preferredColorScheme(.dark)
         }.ignoresSafeArea()
@@ -3880,7 +3910,17 @@ struct LibraryHUD: View {
             else if command == "back", model.menu { model.menu = false }
         }
     }
-    private func launchView(_ entry: LibraryEntry, geometry geo: GeometryProxy) -> some View {
+    /// Landscape: the cover large on the left, the title, status and controls beside it
+    /// (launchWideView). MADEIRA_LAUNCH_WIDE=0 keeps the centred column in landscape too.
+    private let launchWideEnabled = MadeiraConfig.flag("MADEIRA_LAUNCH_WIDE")   // 0: the starting screen is one centred column in landscape too
+    @ViewBuilder private func launchView(_ entry: LibraryEntry, geometry geo: GeometryProxy) -> some View {
+        if launchWideEnabled && geo.size.width > geo.size.height {
+            launchWideView(entry, geometry: geo)
+        } else {
+            launchColumnView(entry, geometry: geo)
+        }
+    }
+    private func launchColumnView(_ entry: LibraryEntry, geometry geo: GeometryProxy) -> some View {
         let compact = geo.size.height < 500
         let available = max(0, geo.size.height - geo.safeAreaInsets.top - geo.safeAreaInsets.bottom)
         // A landscape phone would have the live log below the fold; it goes
@@ -3893,8 +3933,14 @@ struct LibraryHUD: View {
             VStack(spacing: compact ? 10 : 18) {
                 launchCover(entry).frame(width: compact ? 90 : 120, height: compact ? 135 : 180)
                     .clipShape(RoundedRectangle(cornerRadius: 14)).shadow(radius: 20)
+                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { coverFrame = $0 }
+                    .opacity(coverLanded ? 1 : 0)
+                    .modifier(LaunchEntrance(visible: launchVisible || floodOrigin != nil, step: 0, rise: CGSize(width: 0, height: 26), scale: 0.84))
                 Text(entry.title).font(.title2.bold()).multilineTextAlignment(.center)
-                if dockStart.failure == nil { ProgressView().tint(.white) }
+                    .modifier(LaunchEntrance(visible: launchVisible, step: 1, rise: CGSize(width: 0, height: 14)))
+                if dockStart.failure == nil {
+                    ProgressView().tint(.white).modifier(LaunchEntrance(visible: launchVisible, step: 2))
+                }
                 if let failure = dockStart.failure {
                     Text("Madeira Dock stopped").font(.headline)
                     Text(failure).font(.caption).multilineTextAlignment(.center).frame(maxWidth: 360)
@@ -3910,7 +3956,7 @@ struct LibraryHUD: View {
                             Text("\(Int(context.date.timeIntervalSince(model.launchStartedAt)))s")
                                 .font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.4))
                         }
-                    }
+                    }.modifier(LaunchEntrance(visible: launchVisible, step: 2))
                 } else {
                     TimelineView(.periodic(from: .now, by: 1)) { context in
                         VStack(spacing: 8) {
@@ -3918,7 +3964,7 @@ struct LibraryHUD: View {
                             Text("\(Int(context.date.timeIntervalSince(model.launchStartedAt)))s")
                                 .font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.4))
                         }
-                    }
+                    }.modifier(LaunchEntrance(visible: launchVisible, step: 2))
                 }
                 // The starting screen's controls are one row of glyph-only buttons, so a
                 // short screen does not push them below the fold. The words stay as
@@ -3935,7 +3981,7 @@ struct LibraryHUD: View {
                         launchGlyph("Show desktop", "macwindow") { dockStart.showDesktop(model) }
                             .accessibilityHint("Shows the Windows desktop")
                     }
-                }
+                }.modifier(LaunchEntrance(visible: launchVisible, step: 3))
                 if model.launchSlow && !dockStart.holding {
                     Button("Show game view") { model.showGameView(reason: "button") }.frame(minHeight: 44)
                 }
@@ -3952,6 +3998,87 @@ struct LibraryHUD: View {
         }
         .frame(width: geo.size.width, height: available)
         .padding(.top, geo.safeAreaInsets.top).foregroundStyle(.white).transition(.opacity)
+    }
+    /// The landscape starting screen: a large cover left of centre, and beside it the
+    /// title, what the start is doing in smaller type, and the same glyph row as the
+    /// column (close session, live log, show desktop). The live log opens under the row.
+    private func launchWideView(_ entry: LibraryEntry, geometry geo: GeometryProxy) -> some View {
+        let available = max(0, geo.size.height - geo.safeAreaInsets.top - geo.safeAreaInsets.bottom)
+        let showLogs = model.launchLogs
+        let short = available < 440
+        let coverHeight = min(max(available * (showLogs ? 0.6 : 0.68), 150), 470)
+        let leading = max(geo.safeAreaInsets.leading + 28, geo.size.width * 0.09)
+        return HStack(alignment: .center, spacing: max(28, geo.size.width * 0.045)) {
+            launchCover(entry).frame(width: coverHeight * 2 / 3, height: coverHeight)
+                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).strokeBorder(.white.opacity(0.14), lineWidth: 0.5))
+                .shadow(color: .black.opacity(0.55), radius: 30, y: 14)
+                .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { coverFrame = $0 }
+                .opacity(coverLanded ? 1 : 0)
+                .modifier(LaunchEntrance(visible: launchVisible || floodOrigin != nil, step: 0, rise: CGSize(width: -36, height: 0), scale: 0.86))
+            VStack(alignment: .leading, spacing: short ? 10 : 14) {
+                Text(entry.title).font(.system(size: short ? 28 : 38, weight: .bold))
+                    .lineLimit(2).minimumScaleFactor(0.6)
+                    .modifier(LaunchEntrance(visible: launchVisible, step: 1, rise: CGSize(width: 22, height: 0)))
+                launchWideStatus.modifier(LaunchEntrance(visible: launchVisible, step: 2, rise: CGSize(width: 22, height: 0)))
+                HStack(spacing: 12) {
+                    if dockStart.failure != nil {
+                        launchGlyph("Close session", "stop.circle") { model.requestQuit() }
+                    }
+                    launchGlyph(showLogs ? "Hide live log" : "Show live log", "text.alignleft", on: showLogs) {
+                        model.toggleLaunchLogs()
+                    }
+                    if dockStart.holding {
+                        launchGlyph("Show desktop", "macwindow") { dockStart.showDesktop(model) }
+                            .accessibilityHint("Shows the Windows desktop")
+                    }
+                    if model.launchSlow && !dockStart.holding {
+                        Button("Show game view") { model.showGameView(reason: "button") }
+                            .font(.subheadline.weight(.semibold)).buttonStyle(.bordered).tint(.white)
+                            .buttonBorderShape(.capsule).frame(minHeight: 44)
+                    }
+                }
+                .padding(.top, short ? 2 : 6)
+                .modifier(LaunchEntrance(visible: launchVisible, step: 3, rise: CGSize(width: 22, height: 0)))
+                if showLogs {
+                    LibraryLiveLogs().frame(height: min(170, available * 0.3)).frame(maxWidth: 520)
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
+            }
+            .frame(maxWidth: 520, alignment: .leading)
+            .animation(reduceMotion ? nil : .spring(response: 0.4, dampingFraction: 0.86), value: showLogs)
+            Spacer(minLength: 0)
+        }
+        .padding(.leading, leading).padding(.trailing, geo.safeAreaInsets.trailing + 24)
+        .frame(width: geo.size.width, height: available)
+        .padding(.top, geo.safeAreaInsets.top).foregroundStyle(.white)
+    }
+    /// The landscape status: a small spinner and one line of what the start is doing,
+    /// the one-time-install note and the elapsed time under it; or why the Dock stopped.
+    @ViewBuilder private var launchWideStatus: some View {
+        if let failure = dockStart.failure {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Madeira Dock stopped").font(.headline)
+                Text(failure).font(.subheadline).foregroundStyle(.white.opacity(0.75)).frame(maxWidth: 440, alignment: .leading)
+            }
+        } else {
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                let status = dockStart.active ? dockStatus : (model.launchSlow ? "Still starting…" : "Starting your game…")
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 10) {
+                        ProgressView().controlSize(.small).tint(.white)
+                        Text(status).font(.subheadline).foregroundStyle(.white.opacity(0.78))
+                            .contentTransition(.opacity).animation(.easeInOut(duration: 0.3), value: status)
+                    }
+                    if dockStart.active, let note = DockInstallers.note {
+                        Text(note).font(.caption).foregroundStyle(.white.opacity(0.6)).frame(maxWidth: 440, alignment: .leading)
+                    }
+                    Text("\(Int(context.date.timeIntervalSince(model.launchStartedAt)))s")
+                        .font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.4))
+                }
+            }
+        }
     }
     /// A round glyph button for the starting screen's control row.
     private func launchGlyph(_ label: String, _ symbol: String, on: Bool = false,
@@ -4369,5 +4496,112 @@ enum EndedSessionSurface {
         hiddenByUs = false
         _ = winios_compositor_set_hidden(0)
         LogStore.shared.log("[library-surface] desktop shown for the new session")
+    }
+}
+
+// MARK: - Starting screen motion
+
+/// Where Play was pressed, in global coordinates: the starting screen grows out of
+/// it (LaunchFlood). Taken once, and only within two seconds of the press, so a
+/// session started any other way fades in instead.
+enum LaunchOrigin {
+    private static var rect: CGRect?
+    private static var at = Date.distantPast
+    static func note(_ frame: CGRect) { rect = frame.isEmpty ? nil : frame; at = Date() }
+    static func take() -> CGRect? {
+        defer { rect = nil }
+        guard let rect, Date().timeIntervalSince(at) < 2 else { return nil }
+        return rect
+    }
+}
+
+/// The starting screen's staged entrance: each part fades in from a small offset
+/// and scale, 70 ms after the one before it. Reduce Motion only fades.
+struct LaunchEntrance: ViewModifier {
+    var visible: Bool
+    var step: Int
+    var rise = CGSize(width: 0, height: 12)
+    var scale: CGFloat = 1
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    func body(content: Content) -> some View {
+        let settled = visible || reduceMotion
+        content.opacity(visible ? 1 : 0)
+            .scaleEffect(settled ? 1 : scale)
+            .offset(settled ? .zero : rise)
+            .animation(reduceMotion ? .easeOut(duration: 0.2)
+                                    : .spring(response: 0.62, dampingFraction: 0.84).delay(0.08 + Double(step) * 0.07),
+                       value: visible)
+    }
+}
+
+/// A rounded rectangle moving from one frame to another as `progress` goes 0 → 1
+/// (a spring may carry it past 1). `blob` rounds it towards a pill mid-flight.
+private struct LaunchFloodShape: Shape {
+    var from: CGRect
+    var to: CGRect
+    var fromCorner: CGFloat
+    var toCorner: CGFloat
+    var blob: Bool
+    var progress: CGFloat
+    var animatableData: CGFloat {
+        get { progress }
+        set { progress = newValue }
+    }
+    func path(in _: CGRect) -> Path {
+        func mix(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * progress }
+        let r = CGRect(x: mix(from.minX, to.minX), y: mix(from.minY, to.minY),
+                       width: max(1, mix(from.width, to.width)), height: max(1, mix(from.height, to.height)))
+        var corner = fromCorner + (toCorner - fromCorner) * min(max(progress, 0), 1)
+        if blob {
+            let swell = max(0, sin(.pi * min(max(progress, 0), 1)))
+            corner += (min(r.width, r.height) * 0.42 - corner) * swell
+        }
+        return Path(roundedRect: r, cornerRadius: min(corner, min(r.width, r.height) / 2), style: .continuous)
+    }
+}
+
+/// Play → starting screen, after DroidDeck's launch flood: the button's colour grows
+/// out of it and fills the screen on an underdamped spring, darkening as it goes;
+/// after a beat it gathers into the cover's frame while the starting screen arrives
+/// around it, and fades into the cover once it lands there.
+struct LaunchFlood: View {
+    let origin: CGRect
+    let screen: CGRect
+    let target: CGRect
+    var gathering: () -> Void
+    var landed: () -> Void
+    var done: () -> Void
+    @State private var flood: CGFloat = 0
+    @State private var accent = true
+    @State private var gather: CGFloat?
+    @State private var fade = false
+    private static let ink = Color(white: 0.07)
+    var body: some View {
+        ZStack {
+            if let gather {
+                LaunchFloodShape(from: screen, to: target.isEmpty ? screen : target, fromCorner: 0, toCorner: 20,
+                                 blob: false, progress: gather).fill(Self.ink)
+            } else {
+                let shape = LaunchFloodShape(from: origin, to: screen.insetBy(dx: -2, dy: -2), fromCorner: 14,
+                                             toCorner: 0, blob: true, progress: flood)
+                shape.fill(Self.ink)
+                shape.fill(Color.accentColor).opacity(accent ? 1 : 0)
+            }
+        }
+        .opacity(fade ? 0 : 1)
+        .task {
+            withAnimation(.spring(response: 0.52, dampingFraction: 0.62)) { flood = 1 }
+            withAnimation(.easeIn(duration: 0.32)) { accent = false }
+            try? await Task.sleep(for: .milliseconds(470))
+            gather = 0
+            try? await Task.sleep(for: .milliseconds(90))
+            gathering()
+            withAnimation(.timingCurve(0.6, 0, 0.15, 1, duration: 0.64)) { gather = 1 }
+            try? await Task.sleep(for: .milliseconds(640))
+            landed()
+            withAnimation(.easeOut(duration: 0.22)) { fade = true }
+            try? await Task.sleep(for: .milliseconds(240))
+            done()
+        }
     }
 }
