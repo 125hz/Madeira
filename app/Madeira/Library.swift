@@ -2867,7 +2867,7 @@ struct LibraryDetail: View {
     @State private var leaving = false
     @State private var error: String?
     @State private var copiedLink = false
-    /// Where Play is on screen, for the starting screen's flood (LaunchOrigin).
+    /// Where Play is on screen: the starting screen grows out of it (LaunchCurtain).
     @State private var playFrame: CGRect = .zero
     /// Settings › Sync engine, read when the details open: the fastsync switches
     /// below only apply while it is Fastsync.
@@ -2894,7 +2894,9 @@ struct LibraryDetail: View {
             }
         }
         leaving = true
-        LaunchOrigin.note(playFrame)
+        LaunchCurtain.shared.begin(from: playFrame, artwork: entry.steamAppID.flatMap { id in
+            SteamGamesRules.artwork(appID: id) { SteamOwnedLibrary.shared.game($0) }.first
+        })
         let profile = entry
         // Give the pressed state a display turn before saving and handing off.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
@@ -3839,12 +3841,11 @@ struct LibraryHUD: View {
     @State private var eco = madeira_get_eco() != 0
     @State private var fenceMode = FPSOverlayFenceMode.current
     @State private var launchVisible = false
-    /// The Play button's frame while the starting screen floods out of it (LaunchFlood),
-    /// the cover's frame it gathers into, and whether it has landed there.
-    @State private var floodOrigin: CGRect?
+    /// The starting screen came up under the Play button's flood (LaunchCurtain): the
+    /// cover's frame it gathers into, and whether it has landed there.
+    @State private var curtained = false
     @State private var coverFrame: CGRect = .zero
     @State private var coverLanded = true
-    private let launchFloodEnabled = MadeiraConfig.flag("MADEIRA_LAUNCH_FLOOD")   // 0: the starting screen fades in without growing out of the Play button
     /// The Session menu's Controller binds page (keyboard-and-mouse mode).
     @State private var bindsPage = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -3852,27 +3853,20 @@ struct LibraryHUD: View {
         GeometryReader { geo in
             ZStack(alignment: .topLeading) {
                 if model.launching, let entry = model.activeEntry {
-                    // The backdrop fades in while it settles from a slight zoom; the screen's
-                    // parts then arrive one after another (LaunchEntrance).
+                    // An opaque base first, so the desktop never shows through while the
+                    // backdrop fades in; the backdrop settles from a slight zoom and the
+                    // screen's parts arrive one after another (LaunchEntrance).
+                    Color.black.ignoresSafeArea().opacity(curtained || launchVisible ? 1 : 0)
+                        .animation(.easeOut(duration: 0.12), value: launchVisible)
                     launchBackdrop(entry).scaleEffect(launchVisible || reduceMotion ? 1 : 1.12)
                         .overlay(.black.opacity(0.65)).ignoresSafeArea()
                         .opacity(launchVisible ? 1 : 0)
                         .animation(reduceMotion ? .easeOut(duration: 0.15) : .easeOut(duration: 1.1), value: launchVisible)
                     launchView(entry, geometry: geo)
-                    if let origin = floodOrigin {
-                        let local = geo.frame(in: .global).origin
-                        LaunchFlood(origin: origin.offsetBy(dx: -local.x, dy: -local.y),
-                                    screen: CGRect(origin: .zero, size: geo.size),
-                                    target: coverFrame.offsetBy(dx: -local.x, dy: -local.y),
-                                    gathering: { launchVisible = true },
-                                    landed: { coverLanded = true },
-                                    done: { floodOrigin = nil })
-                            .ignoresSafeArea().allowsHitTesting(false)
-                    }
                 }
                 if !model.launching && model.performance { LibraryFloatingItem(isMenu: false, viewport: geo.size, insets: geo.safeAreaInsets) }
                 if model.liveLogs && !model.launching { LibraryLiveLogs().frame(maxWidth: 550, maxHeight: 140).padding(.top, Self.topInset(geo) + 60).padding(.horizontal, 12).allowsHitTesting(false) }
-                if !model.sessionMessage.isEmpty { Text(model.sessionMessage).font(.caption).padding(10).background(.regularMaterial, in: Capsule()).frame(maxWidth: .infinity).padding(.top, Self.topInset(geo) + 12).allowsHitTesting(false) }
+                if !model.sessionMessage.isEmpty && !model.launching { Text(model.sessionMessage).font(.caption).padding(10).background(.regularMaterial, in: Capsule()).frame(maxWidth: .infinity).padding(.top, Self.topInset(geo) + 12).allowsHitTesting(false) }
                 if !model.launching { LibraryFloatingItem(isMenu: true, viewport: geo.size, insets: geo.safeAreaInsets) }
                 if model.menu {
                     Color.black.opacity(0.5).ignoresSafeArea().onTapGesture { model.menu = false }.transition(.opacity)
@@ -3888,10 +3882,18 @@ struct LibraryHUD: View {
             }
             .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.85), value: model.menu)
             .onAppear {
-                // Started from a Play button just now: grow out of it, then gather into the
-                // cover (LaunchFlood). Otherwise the parts arrive in turn (LaunchEntrance).
-                if model.launching, launchFloodEnabled, !reduceMotion, let origin = LaunchOrigin.take() {
-                    coverLanded = false; floodOrigin = origin
+                // Under the Play button's flood (LaunchCurtain): once laid out, hand the
+                // cover's frame over and let the flood gather into it. Otherwise the
+                // parts arrive in turn (LaunchEntrance).
+                if model.launching, LaunchCurtain.shared.covering {
+                    curtained = true; coverLanded = false
+                    let corner: CGFloat = launchWideEnabled && geo.size.width > geo.size.height ? 20 : 14
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .milliseconds(160))
+                        LaunchCurtain.shared.handOff(to: coverFrame, corner: corner,
+                                                     gathering: { launchVisible = true },
+                                                     landed: { coverLanded = true })
+                    }
                 } else {
                     withAnimation(.easeOut(duration: reduceMotion ? 0.15 : 0.35)) { launchVisible = true }
                 }
@@ -3935,7 +3937,7 @@ struct LibraryHUD: View {
                     .clipShape(RoundedRectangle(cornerRadius: 14)).shadow(radius: 20)
                     .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { coverFrame = $0 }
                     .opacity(coverLanded ? 1 : 0)
-                    .modifier(LaunchEntrance(visible: launchVisible || floodOrigin != nil, step: 0, rise: CGSize(width: 0, height: 26), scale: 0.84))
+                    .modifier(LaunchEntrance(visible: launchVisible || curtained, step: 0, rise: CGSize(width: 0, height: 26), scale: 0.84))
                 Text(entry.title).font(.title2.bold()).multilineTextAlignment(.center)
                     .modifier(LaunchEntrance(visible: launchVisible, step: 1, rise: CGSize(width: 0, height: 14)))
                 if dockStart.failure == nil {
@@ -4015,7 +4017,7 @@ struct LibraryHUD: View {
                 .shadow(color: .black.opacity(0.55), radius: 30, y: 14)
                 .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { coverFrame = $0 }
                 .opacity(coverLanded ? 1 : 0)
-                .modifier(LaunchEntrance(visible: launchVisible || floodOrigin != nil, step: 0, rise: CGSize(width: -36, height: 0), scale: 0.86))
+                .modifier(LaunchEntrance(visible: launchVisible || curtained, step: 0, rise: CGSize(width: -36, height: 0), scale: 0.86))
             VStack(alignment: .leading, spacing: short ? 10 : 14) {
                 Text(entry.title).font(.system(size: short ? 28 : 38, weight: .bold))
                     .lineLimit(2).minimumScaleFactor(0.6)
@@ -4501,20 +4503,6 @@ enum EndedSessionSurface {
 
 // MARK: - Starting screen motion
 
-/// Where Play was pressed, in global coordinates: the starting screen grows out of
-/// it (LaunchFlood). Taken once, and only within two seconds of the press, so a
-/// session started any other way fades in instead.
-enum LaunchOrigin {
-    private static var rect: CGRect?
-    private static var at = Date.distantPast
-    static func note(_ frame: CGRect) { rect = frame.isEmpty ? nil : frame; at = Date() }
-    static func take() -> CGRect? {
-        defer { rect = nil }
-        guard let rect, Date().timeIntervalSince(at) < 2 else { return nil }
-        return rect
-    }
-}
-
 /// The starting screen's staged entrance: each part fades in from a small offset
 /// and scale, 70 ms after the one before it. Reduce Motion only fades.
 struct LaunchEntrance: ViewModifier {
@@ -4560,48 +4548,172 @@ private struct LaunchFloodShape: Shape {
     }
 }
 
-/// Play → starting screen, after DroidDeck's launch flood: the button's colour grows
-/// out of it and fills the screen on an underdamped spring, darkening as it goes;
-/// after a beat it gathers into the cover's frame while the starting screen arrives
-/// around it, and fades into the cover once it lands there.
-struct LaunchFlood: View {
-    let origin: CGRect
-    let screen: CGRect
-    let target: CGRect
-    var gathering: () -> Void
-    var landed: () -> Void
-    var done: () -> Void
-    @State private var flood: CGFloat = 0
-    @State private var accent = true
-    @State private var gather: CGFloat?
-    @State private var fade = false
-    private static let ink = Color(white: 0.07)
-    var body: some View {
-        ZStack {
-            if let gather {
-                LaunchFloodShape(from: screen, to: target.isEmpty ? screen : target, fromCorner: 0, toCorner: 20,
-                                 blob: false, progress: gather).fill(Self.ink)
-            } else {
-                let shape = LaunchFloodShape(from: origin, to: screen.insetBy(dx: -2, dy: -2), fromCorner: 14,
-                                             toCorner: 0, blob: true, progress: flood)
-                shape.fill(Self.ink)
-                shape.fill(Color.accentColor).opacity(accent ? 1 : 0)
+/// Play → starting screen, after DroidDeck's launch flood, in a window of its own above
+/// every other one (the Game details sheet leaving and the game view arriving happen
+/// underneath it): the button's colour grows out of it and fills the screen on an
+/// underdamped spring, darkening at once; it holds until the starting screen is laid out
+/// (handOff), then gathers into the cover's frame with the cover art fading in inside
+/// it, and fades out over the real cover. When no session follows the press (JIT failed,
+/// a cloud-save notice), it shrinks back into the button. MADEIRA_LAUNCH_FLOOD=0 turns it
+/// off; Reduce Motion skips it.
+@MainActor final class LaunchCurtain: ObservableObject {
+    static let shared = LaunchCurtain()
+    enum Phase { case flood, gather, retract }
+    static let ink = Color(white: 0.06)
+    @Published private(set) var phase: Phase = .flood
+    @Published private(set) var image: UIImage?
+    private(set) var origin: CGRect = .zero
+    private(set) var target: CGRect = .zero
+    private(set) var corner: CGFloat = 14
+    private var window: UIWindow?
+    private var started = Date()
+    private var gathering: (() -> Void)?
+    private var landed: (() -> Void)?
+    private var watch: Task<Void, Never>?
+    private let enabled = MadeiraConfig.flag("MADEIRA_LAUNCH_FLOOD")   // 0: the starting screen fades in without growing out of the Play button
+
+    /// The flood is up and waiting for the starting screen.
+    var covering: Bool { window != nil && phase == .flood }
+
+    func begin(from frame: CGRect, artwork: URL?) {
+        guard enabled, !UIAccessibility.isReduceMotionEnabled, window == nil, !frame.isEmpty,
+              let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
+                .first(where: { $0.activationState == .foregroundActive }) else { return }
+        origin = frame; target = .zero; image = nil; phase = .flood; started = Date()
+        let w = UIWindow(windowScene: scene)
+        w.frame = scene.coordinateSpace.bounds
+        w.windowLevel = .normal + 150; w.backgroundColor = .clear
+        let host = UIHostingController(rootView: LaunchCurtainView(curtain: self))
+        host.view.backgroundColor = .clear
+        w.rootViewController = host; w.isHidden = false   // never made key
+        window = w
+        if let artwork {
+            Task { [weak self] in
+                if let fetched = try? await URLSession.shared.data(from: artwork), let img = UIImage(data: fetched.0) {
+                    self?.image = img
+                }
             }
         }
-        .opacity(fade ? 0 : 1)
-        .task {
-            withAnimation(.spring(response: 0.52, dampingFraction: 0.62)) { flood = 1 }
-            withAnimation(.easeIn(duration: 0.32)) { accent = false }
-            try? await Task.sleep(for: .milliseconds(470))
-            gather = 0
-            try? await Task.sleep(for: .milliseconds(90))
-            gathering()
-            withAnimation(.timingCurve(0.6, 0, 0.15, 1, duration: 0.64)) { gather = 1 }
-            try? await Task.sleep(for: .milliseconds(640))
-            landed()
-            withAnimation(.easeOut(duration: 0.22)) { fade = true }
-            try? await Task.sleep(for: .milliseconds(240))
-            done()
+        watch = Task { [weak self] in await self?.watchStart() }
+        fputs("[launch-curtain] flood from \(Int(frame.midX)),\(Int(frame.midY))\n", stderr)
+    }
+
+    /// The starting screen is laid out: gather into its cover once the flood has filled
+    /// the screen.
+    func handOff(to cover: CGRect, corner: CGFloat, gathering: @escaping () -> Void, landed: @escaping () -> Void) {
+        guard covering else { gathering(); landed(); return }
+        target = cover; self.corner = corner; self.gathering = gathering; self.landed = landed
+        let wait = max(0, 0.5 - Date().timeIntervalSince(started))
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(wait))
+            guard let self, self.covering else { return }
+            self.phase = .gather
         }
+    }
+
+    func gatherBegan() { gathering?(); gathering = nil }
+    func gatherLanded() { landed?(); landed = nil }
+
+    func close() {
+        watch?.cancel(); watch = nil
+        window?.isHidden = true; window = nil
+        if let gathering { self.gathering = nil; gathering() }
+        if let landed { self.landed = nil; landed() }
+    }
+
+    /// No session after the press: retract. A session whose starting screen never hands
+    /// over (it was already up, or skipped): gather to the middle and fade.
+    private func watchStart() async {
+        let model = LibraryModel.shared
+        var sessionAt: Date?
+        while !Task.isCancelled, covering {
+            try? await Task.sleep(for: .milliseconds(200))
+            guard covering else { return }
+            let t = Date().timeIntervalSince(started)
+            if model.cloudNotice != nil { phase = .retract; return }
+            if model.current == nil {
+                if model.startingJIT == nil && t > 2.5 { phase = .retract; return }
+            } else if sessionAt == nil {
+                sessionAt = Date()
+            } else if let at = sessionAt, Date().timeIntervalSince(at) > 3 {
+                phase = .gather; return
+            }
+            if t > 30 { phase = .gather; return }
+        }
+    }
+}
+
+private struct LaunchCurtainView: View {
+    @ObservedObject var curtain: LaunchCurtain
+    @State private var flood: CGFloat = 0
+    @State private var accent = true
+    @State private var gather: CGFloat = 0
+    @State private var art = false
+    @State private var fade = false
+    @State private var spinner = false
+    var body: some View {
+        GeometryReader { geo in
+            let screen = CGRect(origin: .zero, size: geo.size)
+            ZStack {
+                if curtain.phase == .gather {
+                    let target = curtain.target.isEmpty
+                        ? CGRect(x: screen.midX - 60, y: screen.midY - 90, width: 120, height: 180) : curtain.target
+                    let shape = LaunchFloodShape(from: screen, to: target, fromCorner: 0, toCorner: curtain.corner,
+                                                 blob: false, progress: gather)
+                    shape.fill(LaunchCurtain.ink)
+                    if let image = curtain.image {
+                        Image(uiImage: image).resizable().scaledToFill()
+                            .frame(width: target.width, height: target.height).clipped()
+                            .position(x: target.midX, y: target.midY)
+                            .opacity(art ? 1 : 0)
+                            .mask(shape)
+                    }
+                } else {
+                    let shape = LaunchFloodShape(from: curtain.origin, to: screen.insetBy(dx: -2, dy: -2), fromCorner: 14,
+                                                 toCorner: 0, blob: true, progress: flood)
+                    shape.fill(LaunchCurtain.ink)
+                    shape.fill(Color.accentColor).opacity(accent ? 1 : 0)
+                    if spinner {
+                        ProgressView().tint(.white).position(x: screen.midX, y: screen.midY).transition(.opacity)
+                    }
+                }
+            }
+            .opacity(fade ? 0 : 1)
+        }
+        .ignoresSafeArea()
+        .task {
+            withAnimation(.spring(response: 0.5, dampingFraction: 0.62)) { flood = 1 }
+            withAnimation(.easeOut(duration: 0.18)) { accent = false }
+            try? await Task.sleep(for: .milliseconds(900))
+            if curtain.phase == .flood { withAnimation(.easeIn(duration: 0.3)) { spinner = true } }
+        }
+        .onChange(of: curtain.phase) { _, phase in
+            switch phase {
+            case .gather: Task { await gatherIn() }
+            case .retract: Task { await retract() }
+            case .flood: break
+            }
+        }
+    }
+    private func gatherIn() async {
+        try? await Task.sleep(for: .milliseconds(60))
+        curtain.gatherBegan()
+        withAnimation(.timingCurve(0.6, 0, 0.15, 1, duration: 0.62)) { gather = 1 }
+        withAnimation(.easeIn(duration: 0.28).delay(0.3)) { art = true }
+        try? await Task.sleep(for: .milliseconds(620))
+        curtain.gatherLanded()
+        try? await Task.sleep(for: .milliseconds(280))
+        withAnimation(.easeOut(duration: 0.24)) { fade = true }
+        try? await Task.sleep(for: .milliseconds(260))
+        curtain.close()
+    }
+    private func retract() async {
+        withAnimation(.easeOut(duration: 0.15)) { spinner = false }
+        withAnimation(.spring(response: 0.42, dampingFraction: 1)) { flood = 0 }
+        withAnimation(.easeIn(duration: 0.3)) { accent = true }
+        try? await Task.sleep(for: .milliseconds(380))
+        withAnimation(.easeOut(duration: 0.15)) { fade = true }
+        try? await Task.sleep(for: .milliseconds(170))
+        curtain.close()
     }
 }
