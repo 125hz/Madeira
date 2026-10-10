@@ -3933,6 +3933,8 @@ final class ControlsWindow: UIWindow {
         // menu and starting screen take every touch; otherwise only its menu
         // button, its performance overlay and the touch controls do.
         let library = LibraryModel.shared
+        // A Play getting ready: its starting screen takes every touch.
+        if library.preparing != nil { return super.hitTest(point, with: event) }
         if library.current != nil {
             if library.menu || library.launching || library.menuButtonRect.contains(point) ||
                 (library.performance && library.performanceRect.contains(point)) {
@@ -3989,7 +3991,7 @@ struct TouchControlsOverlay: View {
             // A library session is full screen in either orientation, and its
             // HUD (menu button, starting screen, in-game menu) replaces the top
             // bar; the controls hide while its menu or starting screen is up.
-            let session = library.current != nil
+            let session = library.current != nil || library.preparing != nil
             let landscape = geo.size.width > geo.size.height || session
             ZStack(alignment: .top) {
                 if landscape {

@@ -621,7 +621,7 @@ final class LibraryModel: ObservableObject {
     @Published var displayMode = DisplayMode.fit {
         didSet { if displayMode != oldValue { MetalBackedView.refreshDisplayMode(reason: "mode-toggle") } }
     }
-    @Published var error: String?
+    @Published var error: String? { didSet { if error != nil { preparing = nil } } }
     @Published var sessionMessage = ""
     @Published var launching = false
     @Published var overlayFields = ["FPS", "Frame time", "RAM", "Battery"]
@@ -636,7 +636,7 @@ final class LibraryModel: ObservableObject {
     var menuButtonRect = CGRect.zero
     var performanceRect = CGRect.zero
     /// The in-game menu and the starting screen take every touch.
-    var blocksGameplayTouch: Bool { current != nil && (menu || launching) }
+    var blocksGameplayTouch: Bool { preparing != nil || (current != nil && (menu || launching)) }
     private var timer: Timer?
     private var sawProcess = false
     // Why a session ended by itself (not Quit): the program the app launched
@@ -952,13 +952,31 @@ final class LibraryModel: ObservableObject {
     /// a restart instead. MADEIRA_ONE_SESSION_PER_RUN=0 lets the launch go ahead.
     static var sessionsThisRun = 0
     static let restartMessage = "Restart Madeira to start another game: swipe Madeira away in the app switcher, then open it again."
-    @Published var restartNotice: String?
+    @Published var restartNotice: String? { didSet { if restartNotice != nil { preparing = nil } } }
     /// CS_DEBUGGED is set but no debugger is attached (JIT was enabled outside
     /// Madeira): the text of the alert that offers Madeira's own Enable JIT.
-    @Published var jitNotice: String?
+    @Published var jitNotice: String? { didSet { if jitNotice != nil { preparing = nil } } }
     /// Play is enabling JIT before starting this entry (ContentView.jitReadyForLaunch):
     /// its Play button reads Starting JIT, with a spinner, until JIT is on or fails.
     @Published var startingJIT: UUID?
+    /// A Play still enabling JIT or getting its start ready: the starting screen is up
+    /// for it before the session begins (LibraryHUD), so the press goes straight to it.
+    @Published var preparing: LibraryEntry?
+    private var preparingSince = Date()
+    /// The starting screen is up: a session starting, or a Play getting ready.
+    var startingScreen: Bool { launching || preparing != nil }
+    var startingEntry: LibraryEntry? { launching ? activeEntry : preparing }
+    /// When the starting screen went up, for its elapsed-time line.
+    var startingSince: Date { launching ? launchStarted : preparingSince }
+    func prepare(_ entry: LibraryEntry) {
+        guard MadeiraConfig.flag("MADEIRA_LAUNCH_EARLY"), current == nil else { return }   // 0: Play keeps the Game details page up until the session begins
+        preparingSince = Date(); preparing = entry
+        let id = entry.id
+        // A start that neither begins nor reports an error lets the screen go.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 45) { [weak self] in
+            if let self, self.preparing?.id == id, self.current == nil { self.preparing = nil }
+        }
+    }
     /// A Steam game's saves may not be the latest (SteamOwnedLibrary.cloudHold):
     /// the alert Play shows before starting it.
     struct CloudNotice: Equatable {
@@ -968,7 +986,7 @@ final class LibraryModel: ObservableObject {
         var title: String
         var message: String
     }
-    @Published var cloudNotice: CloudNotice?
+    @Published var cloudNotice: CloudNotice? { didSet { if cloudNotice != nil { preparing = nil } } }
     /// Starts the game the notice is about again.
     var cloudRetry: (() -> Void)?
     /// The game (App ID) allowed to start once without the check ("Launch anyway").
@@ -987,7 +1005,7 @@ final class LibraryModel: ObservableObject {
         launchPresent = madeira_get_present_count(); launchStarted = Date(); launchSlow = false; launchLogs = entry.liveLogs
         launchSurface = winios_surface_present_count()
         MetalBackedView.presentCountAtLaunch = launchPresent; laidOutAfterFirstPresent = false
-        launching = true; overlayFields = entry.overlayFields ?? ["FPS", "Frame time", "RAM", "Battery"]
+        preparing = nil; launching = true; overlayFields = entry.overlayFields ?? ["FPS", "Frame time", "RAM", "Battery"]
         displayMode = entry.displayMode
         activeEntry = entry; current = entry.id; menu = false; performance = entry.performance; liveLogs = entry.liveLogs
         LogStore.shared.setDisplayActive(entry.liveLogs)
@@ -2894,9 +2912,11 @@ struct LibraryDetail: View {
             }
         }
         leaving = true
-        LaunchCurtain.shared.begin(from: playFrame, artwork: entry.steamAppID.flatMap { id in
+        let steamCover = entry.coverFile == nil ? entry.steamAppID : nil
+        LaunchCurtain.shared.begin(from: playFrame, appID: steamCover, artwork: steamCover.flatMap { id in
             SteamGamesRules.artwork(appID: id) { SteamOwnedLibrary.shared.game($0) }.first
         })
+        model.prepare(entry)
         let profile = entry
         // Give the pressed state a display turn before saving and handing off.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
@@ -3852,7 +3872,7 @@ struct LibraryHUD: View {
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .topLeading) {
-                if model.launching, let entry = model.activeEntry {
+                if model.startingScreen, let entry = model.startingEntry {
                     // An opaque base first, so the desktop never shows through while the
                     // backdrop fades in; the backdrop settles from a slight zoom and the
                     // screen's parts arrive one after another (LaunchEntrance).
@@ -3864,10 +3884,10 @@ struct LibraryHUD: View {
                         .animation(reduceMotion ? .easeOut(duration: 0.15) : .easeOut(duration: 1.1), value: launchVisible)
                     launchView(entry, geometry: geo)
                 }
-                if !model.launching && model.performance { LibraryFloatingItem(isMenu: false, viewport: geo.size, insets: geo.safeAreaInsets) }
-                if model.liveLogs && !model.launching { LibraryLiveLogs().frame(maxWidth: 550, maxHeight: 140).padding(.top, Self.topInset(geo) + 60).padding(.horizontal, 12).allowsHitTesting(false) }
-                if !model.sessionMessage.isEmpty && !model.launching { Text(model.sessionMessage).font(.caption).padding(10).background(.regularMaterial, in: Capsule()).frame(maxWidth: .infinity).padding(.top, Self.topInset(geo) + 12).allowsHitTesting(false) }
-                if !model.launching { LibraryFloatingItem(isMenu: true, viewport: geo.size, insets: geo.safeAreaInsets) }
+                if !model.startingScreen && model.performance { LibraryFloatingItem(isMenu: false, viewport: geo.size, insets: geo.safeAreaInsets) }
+                if model.liveLogs && !model.startingScreen { LibraryLiveLogs().frame(maxWidth: 550, maxHeight: 140).padding(.top, Self.topInset(geo) + 60).padding(.horizontal, 12).allowsHitTesting(false) }
+                if !model.sessionMessage.isEmpty && !model.startingScreen { Text(model.sessionMessage).font(.caption).padding(10).background(.regularMaterial, in: Capsule()).frame(maxWidth: .infinity).padding(.top, Self.topInset(geo) + 12).allowsHitTesting(false) }
+                if !model.startingScreen { LibraryFloatingItem(isMenu: true, viewport: geo.size, insets: geo.safeAreaInsets) }
                 if model.menu {
                     Color.black.opacity(0.5).ignoresSafeArea().onTapGesture { model.menu = false }.transition(.opacity)
                     (bindsPage ? AnyView(bindsMenu) : AnyView(menu))
@@ -3885,7 +3905,7 @@ struct LibraryHUD: View {
                 // Under the Play button's flood (LaunchCurtain): once laid out, hand the
                 // cover's frame over and let the flood gather into it. Otherwise the
                 // parts arrive in turn (LaunchEntrance).
-                if model.launching, LaunchCurtain.shared.covering {
+                if model.startingScreen, LaunchCurtain.shared.covering {
                     curtained = true; coverLanded = false
                     let corner: CGFloat = launchWideEnabled && geo.size.width > geo.size.height ? 20 : 14
                     Task { @MainActor in
@@ -3955,15 +3975,15 @@ struct LibraryHUD: View {
                             if let note = DockInstallers.note {
                                 Text(note).font(.caption).foregroundStyle(.white.opacity(0.6)).multilineTextAlignment(.center).frame(maxWidth: 360)
                             }
-                            Text("\(Int(context.date.timeIntervalSince(model.launchStartedAt)))s")
+                            Text("\(Int(context.date.timeIntervalSince(model.startingSince)))s")
                                 .font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.4))
                         }
                     }.modifier(LaunchEntrance(visible: launchVisible, step: 2))
                 } else {
                     TimelineView(.periodic(from: .now, by: 1)) { context in
                         VStack(spacing: 8) {
-                            Text(model.launchSlow ? "Still starting…" : "Starting your game…").foregroundStyle(.white.opacity(0.7))
-                            Text("\(Int(context.date.timeIntervalSince(model.launchStartedAt)))s")
+                            Text(launchIdleStatus).foregroundStyle(.white.opacity(0.7))
+                            Text("\(Int(context.date.timeIntervalSince(model.startingSince)))s")
                                 .font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.4))
                         }
                     }.modifier(LaunchEntrance(visible: launchVisible, step: 2))
@@ -4066,7 +4086,7 @@ struct LibraryHUD: View {
             }
         } else {
             TimelineView(.periodic(from: .now, by: 1)) { context in
-                let status = dockStart.active ? dockStatus : (model.launchSlow ? "Still starting…" : "Starting your game…")
+                let status = dockStart.active ? dockStatus : launchIdleStatus
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 10) {
                         ProgressView().controlSize(.small).tint(.white)
@@ -4076,7 +4096,7 @@ struct LibraryHUD: View {
                     if dockStart.active, let note = DockInstallers.note {
                         Text(note).font(.caption).foregroundStyle(.white.opacity(0.6)).frame(maxWidth: 440, alignment: .leading)
                     }
-                    Text("\(Int(context.date.timeIntervalSince(model.launchStartedAt)))s")
+                    Text("\(Int(context.date.timeIntervalSince(model.startingSince)))s")
                         .font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.4))
                 }
             }
@@ -4096,12 +4116,24 @@ struct LibraryHUD: View {
     }
 
     /// The starting screen's cover and backdrop: a Dock start shows the game's
-    /// Steam artwork by App ID, any other session its library artwork.
+    /// Steam artwork by App ID, any other session its library artwork. A Steam game
+    /// without its own cover shows Steam's while it gets ready too, and the cover the
+    /// launch flood carried when there is one (the same pixels it lands on).
+    private func launchSteamID(_ entry: LibraryEntry) -> Int? {
+        dockStart.appID ?? (entry.coverFile == nil ? entry.steamAppID : nil)
+    }
     @ViewBuilder private func launchCover(_ entry: LibraryEntry) -> some View {
-        if let appID = dockStart.appID { SteamGameArtwork(appID: appID) } else { LibraryArtwork(entry: entry) }
+        if let image = LaunchCurtain.shared.cover(for: launchSteamID(entry)) {
+            Image(uiImage: image).resizable().scaledToFill()
+        } else if let appID = launchSteamID(entry) { SteamGameArtwork(appID: appID) } else { LibraryArtwork(entry: entry) }
     }
     @ViewBuilder private func launchBackdrop(_ entry: LibraryEntry) -> some View {
-        if let appID = dockStart.appID { SteamLaunchBackdrop(appID: appID) } else { LibraryArtwork(entry: entry, backdrop: true) }
+        if let appID = launchSteamID(entry) { SteamLaunchBackdrop(appID: appID) } else { LibraryArtwork(entry: entry, backdrop: true) }
+    }
+    /// What the start is doing before the Dock reports (or for a game without Dock).
+    private var launchIdleStatus: String {
+        if let entry = model.preparing { return model.startingJIT == entry.id ? "Enabling JIT…" : "Getting ready…" }
+        return model.launchSlow ? "Still starting…" : "Starting your game…"
     }
 
     /// What the Dock start is doing (DockStartStatus), read once a second.
@@ -4549,171 +4581,135 @@ private struct LaunchFloodShape: Shape {
 }
 
 /// Play → starting screen, after DroidDeck's launch flood, in a window of its own above
-/// every other one (the Game details sheet leaving and the game view arriving happen
-/// underneath it): the button's colour grows out of it and fills the screen on an
-/// underdamped spring, darkening at once; it holds until the starting screen is laid out
-/// (handOff), then gathers into the cover's frame with the cover art fading in inside
-/// it, and fades out over the real cover. When no session follows the press (JIT failed,
-/// a cloud-save notice), it shrinks back into the button. MADEIRA_LAUNCH_FLOOD=0 turns it
+/// every other one. The press puts the starting screen up at once (LibraryModel.prepare)
+/// underneath it; the button's colour grows out of the button and fills the screen,
+/// darkening at once, then gathers into the starting screen's cover frame with the
+/// cover art inside it and fades out over the real cover, which shows the same image.
+/// Core Animation runs it, so a busy main thread does not stall it. When no start
+/// follows the press it shrinks back into the button. MADEIRA_LAUNCH_FLOOD=0 turns it
 /// off; Reduce Motion skips it.
-@MainActor final class LaunchCurtain: ObservableObject {
+@MainActor final class LaunchCurtain {
     static let shared = LaunchCurtain()
-    enum Phase { case flood, gather, retract }
-    static let ink = Color(white: 0.06)
-    @Published private(set) var phase: Phase = .flood
-    @Published private(set) var image: UIImage?
-    private(set) var origin: CGRect = .zero
-    private(set) var target: CGRect = .zero
-    private(set) var corner: CGFloat = 14
+    private static let ink = UIColor(white: 0.06, alpha: 1)
     private var window: UIWindow?
+    private var flood: UIView?
+    private var spinner: UIActivityIndicatorView?
+    private var origin: CGRect = .zero
     private var started = Date()
-    private var gathering: (() -> Void)?
-    private var landed: (() -> Void)?
+    private var image: UIImage?
+    private var imageAppID: Int?
     private var watch: Task<Void, Never>?
     private let enabled = MadeiraConfig.flag("MADEIRA_LAUNCH_FLOOD")   // 0: the starting screen fades in without growing out of the Play button
 
-    /// The flood is up and waiting for the starting screen.
-    var covering: Bool { window != nil && phase == .flood }
+    /// The flood is up and has not been handed a cover yet.
+    private(set) var covering = false
 
-    func begin(from frame: CGRect, artwork: URL?) {
+    /// The cover art the flood carries, for the starting screen's own cover (the same
+    /// pixels, so the hand-over does not change the picture or wait for a download).
+    func cover(for appID: Int?) -> UIImage? { appID != nil && appID == imageAppID ? image : nil }
+
+    func begin(from frame: CGRect, appID: Int?, artwork: URL?) {
         guard enabled, !UIAccessibility.isReduceMotionEnabled, window == nil, !frame.isEmpty,
               let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
                 .first(where: { $0.activationState == .foregroundActive }) else { return }
-        origin = frame; target = .zero; image = nil; phase = .flood; started = Date()
         let w = UIWindow(windowScene: scene)
         w.frame = scene.coordinateSpace.bounds
         w.windowLevel = .normal + 150; w.backgroundColor = .clear
-        let host = UIHostingController(rootView: LaunchCurtainView(curtain: self))
-        host.view.backgroundColor = .clear
-        w.rootViewController = host; w.isHidden = false   // never made key
-        window = w
-        if let artwork {
+        let root = UIViewController(); root.view.backgroundColor = .clear
+        w.rootViewController = root; w.isHidden = false   // never made key
+        let v = UIView(frame: frame)
+        v.backgroundColor = .tintColor
+        v.layer.cornerCurve = .continuous; v.clipsToBounds = true
+        root.view.addSubview(v)
+        window = w; flood = v; origin = frame; started = Date(); covering = true
+        if appID != imageAppID { image = nil; imageAppID = appID }
+        if image == nil, let artwork {
             Task { [weak self] in
                 if let fetched = try? await URLSession.shared.data(from: artwork), let img = UIImage(data: fetched.0) {
-                    self?.image = img
+                    if self?.imageAppID == appID { self?.image = img }
                 }
             }
+        }
+        let full = w.bounds.insetBy(dx: -2, dy: -2)
+        let blob = CAKeyframeAnimation(keyPath: "cornerRadius")
+        blob.values = [14, 56, 0]; blob.keyTimes = [0, 0.4, 1]; blob.duration = 0.5
+        blob.timingFunctions = [CAMediaTimingFunction(name: .easeOut), CAMediaTimingFunction(name: .easeInEaseOut)]
+        v.layer.cornerRadius = 0
+        v.layer.add(blob, forKey: "blob")
+        UIViewPropertyAnimator(duration: 0.55, dampingRatio: 0.8) { v.frame = full }.startAnimation()
+        UIViewPropertyAnimator(duration: 0.2, curve: .easeOut) { v.backgroundColor = Self.ink }.startAnimation()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self, self.covering, let root = self.window?.rootViewController?.view else { return }
+            let s = UIActivityIndicatorView(style: .medium); s.color = .white
+            s.center = CGPoint(x: root.bounds.midX, y: root.bounds.midY); s.alpha = 0
+            root.addSubview(s); s.startAnimating(); self.spinner = s
+            UIView.animate(withDuration: 0.3) { s.alpha = 1 }
         }
         watch = Task { [weak self] in await self?.watchStart() }
         fputs("[launch-curtain] flood from \(Int(frame.midX)),\(Int(frame.midY))\n", stderr)
     }
 
-    /// The starting screen is laid out: gather into its cover once the flood has filled
-    /// the screen.
+    /// The starting screen is laid out: once the flood has filled the screen, gather into
+    /// its cover. `gathering` runs as the gather starts, `landed` when it reaches the cover.
     func handOff(to cover: CGRect, corner: CGFloat, gathering: @escaping () -> Void, landed: @escaping () -> Void) {
-        guard covering else { gathering(); landed(); return }
-        target = cover; self.corner = corner; self.gathering = gathering; self.landed = landed
-        let wait = max(0, 0.5 - Date().timeIntervalSince(started))
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(wait))
-            guard let self, self.covering else { return }
-            self.phase = .gather
+        guard covering, let v = flood else { gathering(); landed(); return }
+        covering = false
+        let wait = max(0, 0.55 - Date().timeIntervalSince(started))
+        DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
+            guard let self else { return }
+            if let s = self.spinner { UIView.animate(withDuration: 0.15) { s.alpha = 0 } }
+            gathering()
+            let screen = self.window?.bounds ?? v.frame
+            let target = cover.isEmpty ? CGRect(x: screen.midX - 60, y: screen.midY - 90, width: 120, height: 180) : cover
+            var art: UIImageView?
+            if let image = self.image {
+                let iv = UIImageView(image: image)
+                iv.contentMode = .scaleAspectFill; iv.frame = v.bounds; iv.alpha = 0
+                iv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+                v.addSubview(iv); art = iv
+            }
+            let gather = UIViewPropertyAnimator(duration: 0.62, controlPoint1: CGPoint(x: 0.6, y: 0), controlPoint2: CGPoint(x: 0.15, y: 1)) {
+                v.frame = target; v.layer.cornerRadius = corner
+            }
+            gather.addCompletion { [weak self] _ in
+                landed()
+                UIView.animate(withDuration: 0.25, delay: 0.2, options: [.curveEaseOut]) { self?.window?.alpha = 0 }
+                    completion: { _ in self?.close() }
+            }
+            gather.startAnimation()
+            if let art { UIView.animate(withDuration: 0.36, delay: 0.1, options: [.curveEaseOut]) { art.alpha = 1 } }
         }
     }
 
-    func gatherBegan() { gathering?(); gathering = nil }
-    func gatherLanded() { landed?(); landed = nil }
-
-    func close() {
-        watch?.cancel(); watch = nil
-        window?.isHidden = true; window = nil
-        if let gathering { self.gathering = nil; gathering() }
-        if let landed { self.landed = nil; landed() }
+    private func retract() {
+        guard covering, let v = flood else { return }
+        covering = false
+        if let s = spinner { UIView.animate(withDuration: 0.15) { s.alpha = 0 } }
+        let back = UIViewPropertyAnimator(duration: 0.45, dampingRatio: 1) { [origin] in
+            v.frame = origin; v.layer.cornerRadius = 14; v.backgroundColor = .tintColor
+        }
+        back.addCompletion { [weak self] _ in
+            UIView.animate(withDuration: 0.15) { self?.window?.alpha = 0 } completion: { _ in self?.close() }
+        }
+        back.startAnimation()
     }
 
-    /// No session after the press: retract. A session whose starting screen never hands
-    /// over (it was already up, or skipped): gather to the middle and fade.
+    private func close() {
+        watch?.cancel(); watch = nil
+        window?.isHidden = true; window = nil; flood = nil; spinner = nil; covering = false
+    }
+
+    /// No start after the press: retract. A start whose starting screen never hands over:
+    /// gather to the middle and fade.
     private func watchStart() async {
         let model = LibraryModel.shared
-        var sessionAt: Date?
         while !Task.isCancelled, covering {
             try? await Task.sleep(for: .milliseconds(200))
             guard covering else { return }
             let t = Date().timeIntervalSince(started)
-            if model.cloudNotice != nil { phase = .retract; return }
-            if model.current == nil {
-                if model.startingJIT == nil && t > 2.5 { phase = .retract; return }
-            } else if sessionAt == nil {
-                sessionAt = Date()
-            } else if let at = sessionAt, Date().timeIntervalSince(at) > 3 {
-                phase = .gather; return
-            }
-            if t > 30 { phase = .gather; return }
+            if model.cloudNotice != nil || model.error != nil { retract(); return }
+            if !model.startingScreen && model.current == nil && model.startingJIT == nil && t > 2.5 { retract(); return }
+            if t > 4 { handOff(to: .zero, corner: 14, gathering: {}, landed: {}); return }
         }
-    }
-}
-
-private struct LaunchCurtainView: View {
-    @ObservedObject var curtain: LaunchCurtain
-    @State private var flood: CGFloat = 0
-    @State private var accent = true
-    @State private var gather: CGFloat = 0
-    @State private var art = false
-    @State private var fade = false
-    @State private var spinner = false
-    var body: some View {
-        GeometryReader { geo in
-            let screen = CGRect(origin: .zero, size: geo.size)
-            ZStack {
-                if curtain.phase == .gather {
-                    let target = curtain.target.isEmpty
-                        ? CGRect(x: screen.midX - 60, y: screen.midY - 90, width: 120, height: 180) : curtain.target
-                    let shape = LaunchFloodShape(from: screen, to: target, fromCorner: 0, toCorner: curtain.corner,
-                                                 blob: false, progress: gather)
-                    shape.fill(LaunchCurtain.ink)
-                    if let image = curtain.image {
-                        Image(uiImage: image).resizable().scaledToFill()
-                            .frame(width: target.width, height: target.height).clipped()
-                            .position(x: target.midX, y: target.midY)
-                            .opacity(art ? 1 : 0)
-                            .mask(shape)
-                    }
-                } else {
-                    let shape = LaunchFloodShape(from: curtain.origin, to: screen.insetBy(dx: -2, dy: -2), fromCorner: 14,
-                                                 toCorner: 0, blob: true, progress: flood)
-                    shape.fill(LaunchCurtain.ink)
-                    shape.fill(Color.accentColor).opacity(accent ? 1 : 0)
-                    if spinner {
-                        ProgressView().tint(.white).position(x: screen.midX, y: screen.midY).transition(.opacity)
-                    }
-                }
-            }
-            .opacity(fade ? 0 : 1)
-        }
-        .ignoresSafeArea()
-        .task {
-            withAnimation(.spring(response: 0.5, dampingFraction: 0.62)) { flood = 1 }
-            withAnimation(.easeOut(duration: 0.18)) { accent = false }
-            try? await Task.sleep(for: .milliseconds(900))
-            if curtain.phase == .flood { withAnimation(.easeIn(duration: 0.3)) { spinner = true } }
-        }
-        .onChange(of: curtain.phase) { _, phase in
-            switch phase {
-            case .gather: Task { await gatherIn() }
-            case .retract: Task { await retract() }
-            case .flood: break
-            }
-        }
-    }
-    private func gatherIn() async {
-        try? await Task.sleep(for: .milliseconds(60))
-        curtain.gatherBegan()
-        withAnimation(.timingCurve(0.6, 0, 0.15, 1, duration: 0.62)) { gather = 1 }
-        withAnimation(.easeIn(duration: 0.28).delay(0.3)) { art = true }
-        try? await Task.sleep(for: .milliseconds(620))
-        curtain.gatherLanded()
-        try? await Task.sleep(for: .milliseconds(280))
-        withAnimation(.easeOut(duration: 0.24)) { fade = true }
-        try? await Task.sleep(for: .milliseconds(260))
-        curtain.close()
-    }
-    private func retract() async {
-        withAnimation(.easeOut(duration: 0.15)) { spinner = false }
-        withAnimation(.spring(response: 0.42, dampingFraction: 1)) { flood = 0 }
-        withAnimation(.easeIn(duration: 0.3)) { accent = true }
-        try? await Task.sleep(for: .milliseconds(380))
-        withAnimation(.easeOut(duration: 0.15)) { fade = true }
-        try? await Task.sleep(for: .milliseconds(170))
-        curtain.close()
     }
 }
