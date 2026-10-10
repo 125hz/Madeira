@@ -3935,6 +3935,8 @@ final class ControlsWindow: UIWindow {
         let library = LibraryModel.shared
         // A Play getting ready: its starting screen takes every touch.
         if library.preparing != nil { return super.hitTest(point, with: event) }
+        // The library itself, between sessions (a start that did not happen): nothing here.
+        if library.enabled && library.current == nil { return nil }
         if library.current != nil {
             if library.menu || library.launching || library.menuButtonRect.contains(point) ||
                 (library.performance && library.performanceRect.contains(point)) {
@@ -3994,7 +3996,9 @@ struct TouchControlsOverlay: View {
             let session = library.current != nil || library.preparing != nil
             let landscape = geo.size.width > geo.size.height || session
             ZStack(alignment: .top) {
-                if landscape {
+                // The library between sessions (the window came up for a start that did not
+                // happen) draws nothing over the library's own screens.
+                if landscape && !(library.enabled && !session && !m.editing) {
                     if (m.visible || m.editing) && !library.blocksGameplayTouch {
                         controls(geo.size, session: session)
                     }

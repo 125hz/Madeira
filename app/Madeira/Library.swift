@@ -971,6 +971,9 @@ final class LibraryModel: ObservableObject {
     func prepare(_ entry: LibraryEntry) {
         guard MadeiraConfig.flag("MADEIRA_LAUNCH_EARLY"), current == nil else { return }   // 0: Play keeps the Game details page up until the session begins
         preparingSince = Date(); preparing = entry
+        // The starting screen draws in the controls window (LibraryHUD), which otherwise
+        // only comes up with the session's game view.
+        TouchControlsHost.attach()
         let id = entry.id
         // A start that neither begins nor reports an error lets the screen go.
         DispatchQueue.main.asyncAfter(deadline: .now() + 45) { [weak self] in
@@ -4071,7 +4074,7 @@ struct LibraryHUD: View {
             VStack(spacing: compact ? 10 : 18) {
                 launchCover(entry).frame(width: compact ? 90 : 120, height: compact ? 135 : 180)
                     .clipShape(RoundedRectangle(cornerRadius: 14)).shadow(radius: 20)
-                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { coverFrame = $0 }
+                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { coverFrame = $0; LaunchCurtain.shared.track($0) }
                     .opacity(coverLanded ? 1 : 0)
                     .modifier(LaunchEntrance(visible: launchVisible || curtained, step: 0, rise: CGSize(width: 0, height: 26), scale: 0.84))
                 Text(entry.title).font(.title2.bold()).multilineTextAlignment(.center)
@@ -4151,7 +4154,7 @@ struct LibraryHUD: View {
                 .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).strokeBorder(.white.opacity(0.14), lineWidth: 0.5))
                 .shadow(color: .black.opacity(0.55), radius: 30, y: 14)
-                .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { coverFrame = $0 }
+                .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { coverFrame = $0; LaunchCurtain.shared.track($0) }
                 .opacity(coverLanded ? 1 : 0)
                 .modifier(LaunchEntrance(visible: launchVisible || curtained, step: 0, rise: CGSize(width: -36, height: 0), scale: 0.86))
             VStack(alignment: .leading, spacing: short ? 10 : 14) {
@@ -4719,6 +4722,10 @@ private struct LaunchFloodShape: Shape {
 
     /// The flood is up and has not been handed a cover yet.
     private(set) var covering = false
+    /// Where the starting screen's cover is now: its layout can still move while the
+    /// flood gathers (status lines arriving), and the flood lands where it ends up.
+    private var latestTarget: CGRect = .zero
+    func track(_ frame: CGRect) { if window != nil { latestTarget = frame } }
 
     /// The cover art the flood carries, for the starting screen's own cover (the same
     /// pixels, so the hand-over does not change the picture or wait for a download).
@@ -4737,7 +4744,7 @@ private struct LaunchFloodShape: Shape {
         v.backgroundColor = .tintColor
         v.layer.cornerCurve = .continuous; v.clipsToBounds = true
         root.view.addSubview(v)
-        window = w; flood = v; origin = frame; started = Date(); covering = true
+        window = w; flood = v; origin = frame; started = Date(); covering = true; latestTarget = .zero
         if appID != imageAppID { image = nil; imageAppID = appID }
         if image == nil, let artwork {
             Task { [weak self] in
@@ -4787,13 +4794,31 @@ private struct LaunchFloodShape: Shape {
             let gather = UIViewPropertyAnimator(duration: 0.62, controlPoint1: CGPoint(x: 0.6, y: 0), controlPoint2: CGPoint(x: 0.15, y: 1)) {
                 v.frame = target; v.layer.cornerRadius = corner
             }
-            gather.addCompletion { [weak self] _ in
-                landed()
-                UIView.animate(withDuration: 0.25, delay: 0.2, options: [.curveEaseOut]) { self?.window?.alpha = 0 }
-                    completion: { _ in self?.close() }
-            }
+            gather.addCompletion { [weak self] _ in self?.settle(on: target, corner: corner, landed: landed) }
             gather.startAnimation()
-            if let art { UIView.animate(withDuration: 0.36, delay: 0.1, options: [.curveEaseOut]) { art.alpha = 1 } }
+            // The art comes in over the second half, once the flood is near the cover's size.
+            if let art { UIView.animate(withDuration: 0.22, delay: 0.3, options: [.curveEaseOut]) { art.alpha = 1 } }
+        }
+    }
+
+    /// The gather reached `target`. If the cover moved meanwhile, follow it; then hand
+    /// over to the starting screen's cover (the same image at the same frame) and go.
+    private func settle(on target: CGRect, corner: CGFloat, landed: @escaping () -> Void) {
+        guard let v = flood else { landed(); close(); return }
+        let now = latestTarget
+        let moved = !now.isEmpty && (abs(now.midX - target.midX) > 1 || abs(now.midY - target.midY) > 1
+                                     || abs(now.width - target.width) > 1 || abs(now.height - target.height) > 1)
+        if moved {
+            let follow = UIViewPropertyAnimator(duration: 0.24, dampingRatio: 1) { v.frame = now }
+            follow.addCompletion { [weak self] _ in self?.settle(on: now, corner: corner, landed: landed) }
+            follow.startAnimation()
+            return
+        }
+        landed()
+        // One frame for the starting screen to draw its cover, then a quick dissolve.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            UIView.animate(withDuration: 0.12, delay: 0, options: [.curveEaseOut]) { self?.window?.alpha = 0 }
+                completion: { _ in self?.close() }
         }
     }
 
