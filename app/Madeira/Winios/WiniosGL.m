@@ -305,6 +305,22 @@ static MadeiraGLPresenter *presenter_get(void **state, void *hwnd) {
     return p;
 }
 
+// The FPS limit's frame time for a GL present: 1 = 60, 3 = 30, 4 = 40 FPS (the same
+// modes DXMT's present honours); 0 (display maximum) and 2 (uncapped) present at once.
+// MADEIRA_GL_FPS_CAP=0 presents every GL frame at once, as before.
+extern int madeira_get_vsync_locked(void);
+static double gl_cap_frame_time(void) {
+    static int enabled = -1;
+    if (enabled < 0) { const char *e = getenv("MADEIRA_GL_FPS_CAP"); enabled = !(e && e[0] == '0'); }   // 0: OpenGL games ignore the session's FPS limit, as before
+    if (!enabled) return 0;
+    switch (madeira_get_vsync_locked()) {
+    case 1: return 1.0 / 60.0;
+    case 3: return 1.0 / 30.0;
+    case 4: return 1.0 / 40.0;
+    default: return 0;
+    }
+}
+
 // Draw slot `s` (its IOSurface, rows bottom-up) onto the presenter's layer.
 static BOOL present_slot(MadeiraGLPresenter *p, GLSlot *s, void *hwnd) {
     CAMetalLayer *layer = p->layer;
@@ -326,7 +342,12 @@ static BOOL present_slot(MadeiraGLPresenter *p, GLSlot *s, void *hwnd) {
     [enc setFragmentSamplerState:p->sampler atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [enc endEncoding];
-    [cb presentDrawable:drawable];
+    // The session's FPS limit (madeira_set_vsync_locked, DXMT's vsync mode), applied
+    // the way DXMT applies it: the drawable is held for the frame time, and the
+    // layer's drawable pool then holds the game to the cap.
+    double minimum = gl_cap_frame_time();
+    if (minimum > 0) [cb presentDrawable:drawable afterMinimumDuration:minimum];
+    else [cb presentDrawable:drawable];
     [cb commit];
     s->last = cb;
     atomic_fetch_add_explicit(&gl_present_count, 1, memory_order_relaxed);
