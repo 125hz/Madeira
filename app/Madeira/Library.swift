@@ -3999,11 +3999,15 @@ struct LibraryHUD: View {
                     // screen's parts arrive one after another (LaunchEntrance).
                     Color.black.ignoresSafeArea().opacity(curtained || launchVisible ? 1 : 0)
                         .animation(.easeOut(duration: 0.12), value: launchVisible)
+                        .opacity(curtain.hidesStartingScreen ? 0 : 1)
                     launchBackdrop(entry).scaleEffect(launchVisible || reduceMotion ? 1 : 1.12)
                         .overlay(.black.opacity(0.65)).ignoresSafeArea()
                         .opacity(launchVisible ? 1 : 0)
                         .animation(reduceMotion ? .easeOut(duration: 0.15) : .easeOut(duration: 1.1), value: launchVisible)
-                    launchView(entry, geometry: geo)
+                        .opacity(curtain.hidesStartingScreen ? 0 : 1)
+                    // Hidden while the flood is still growing over the details page; drawn
+                    // (and measured) all the same.
+                    launchView(entry, geometry: geo).opacity(curtain.hidesStartingScreen ? 0 : 1)
                 }
                 if !model.startingScreen && model.performance { LibraryFloatingItem(isMenu: false, viewport: geo.size, insets: geo.safeAreaInsets) }
                 if model.liveLogs && !model.startingScreen { LibraryLiveLogs().frame(maxWidth: 550, maxHeight: 140).padding(.top, Self.topInset(geo) + 60).padding(.horizontal, 12).allowsHitTesting(false) }
@@ -4082,11 +4086,11 @@ struct LibraryHUD: View {
                     .clipShape(RoundedRectangle(cornerRadius: 14)).shadow(radius: 20)
                     .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { coverFrame = $0; LaunchCurtain.shared.track($0) }
                     .opacity(coverLanded ? 1 : 0)
-                    .modifier(LaunchEntrance(visible: launchVisible || curtained, step: 0, rise: CGSize(width: 0, height: 26), scale: 0.84))
+                    .modifier(LaunchEntrance(visible: launchVisible, step: 0, rise: CGSize(width: 0, height: 26), scale: 0.84, still: curtained))
                 Text(entry.title).font(.title2.bold()).multilineTextAlignment(.center)
-                    .modifier(LaunchEntrance(visible: launchVisible, step: 1, rise: CGSize(width: 0, height: 14)))
+                    .modifier(LaunchEntrance(visible: launchVisible, step: 1, rise: CGSize(width: 0, height: 14), still: curtained))
                 if dockStart.failure == nil {
-                    ProgressView().tint(.white).modifier(LaunchEntrance(visible: launchVisible, step: 2))
+                    ProgressView().tint(.white).modifier(LaunchEntrance(visible: launchVisible, step: 2, still: curtained))
                 }
                 if let failure = dockStart.failure {
                     Text("Madeira Dock stopped").font(.headline)
@@ -4103,7 +4107,9 @@ struct LibraryHUD: View {
                             Text("\(Int(context.date.timeIntervalSince(model.startingSince)))s")
                                 .font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.4))
                         }
-                    }.modifier(LaunchEntrance(visible: launchVisible, step: 2))
+                    }
+                    .frame(minHeight: 96, alignment: .top)
+                    .modifier(LaunchEntrance(visible: launchVisible, step: 2, still: curtained))
                 } else {
                     TimelineView(.periodic(from: .now, by: 1)) { context in
                         VStack(spacing: 8) {
@@ -4111,7 +4117,7 @@ struct LibraryHUD: View {
                             Text("\(Int(context.date.timeIntervalSince(model.startingSince)))s")
                                 .font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.4))
                         }
-                    }.modifier(LaunchEntrance(visible: launchVisible, step: 2))
+                    }.modifier(LaunchEntrance(visible: launchVisible, step: 2, still: curtained))
                 }
                 // The starting screen's controls are one row of glyph-only buttons, so a
                 // short screen does not push them below the fold. The words stay as
@@ -4128,7 +4134,7 @@ struct LibraryHUD: View {
                         launchGlyph("Show desktop", "macwindow") { dockStart.showDesktop(model) }
                             .accessibilityHint("Shows the Windows desktop")
                     }
-                }.modifier(LaunchEntrance(visible: launchVisible, step: 3))
+                }.modifier(LaunchEntrance(visible: launchVisible, step: 3, still: curtained))
                 if model.launchSlow && !dockStart.holding {
                     Button("Show game view") { model.showGameView(reason: "button") }.frame(minHeight: 44)
                 }
@@ -4162,12 +4168,12 @@ struct LibraryHUD: View {
                 .shadow(color: .black.opacity(0.55), radius: 30, y: 14)
                 .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { coverFrame = $0; LaunchCurtain.shared.track($0) }
                 .opacity(coverLanded ? 1 : 0)
-                .modifier(LaunchEntrance(visible: launchVisible || curtained, step: 0, rise: CGSize(width: -36, height: 0), scale: 0.86))
+                .modifier(LaunchEntrance(visible: launchVisible, step: 0, rise: CGSize(width: -36, height: 0), scale: 0.86, still: curtained))
             VStack(alignment: .leading, spacing: short ? 10 : 14) {
                 Text(entry.title).font(.system(size: short ? 28 : 38, weight: .bold))
                     .lineLimit(2).minimumScaleFactor(0.6)
-                    .modifier(LaunchEntrance(visible: launchVisible, step: 1, rise: CGSize(width: 22, height: 0)))
-                launchWideStatus.modifier(LaunchEntrance(visible: launchVisible, step: 2, rise: CGSize(width: 22, height: 0)))
+                    .modifier(LaunchEntrance(visible: launchVisible, step: 1, rise: CGSize(width: 22, height: 0), still: curtained))
+                launchWideStatus.modifier(LaunchEntrance(visible: launchVisible, step: 2, rise: CGSize(width: 22, height: 0), still: curtained))
                 HStack(spacing: 12) {
                     if dockStart.failure != nil {
                         launchGlyph("Close session", "stop.circle") { model.requestQuit() }
@@ -4186,7 +4192,7 @@ struct LibraryHUD: View {
                     }
                 }
                 .padding(.top, short ? 2 : 6)
-                .modifier(LaunchEntrance(visible: launchVisible, step: 3, rise: CGSize(width: 22, height: 0)))
+                .modifier(LaunchEntrance(visible: launchVisible, step: 3, rise: CGSize(width: 22, height: 0), still: curtained))
                 if showLogs {
                     LibraryLiveLogs().frame(height: min(170, available * 0.3)).frame(maxWidth: 520)
                         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -4671,13 +4677,16 @@ struct LaunchEntrance: ViewModifier {
     var step: Int
     var rise = CGSize(width: 0, height: 12)
     var scale: CGFloat = 1
+    /// Under the launch flood: in place at once, never moving (the flood measures the
+    /// cover's frame and lands on it).
+    var still = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     func body(content: Content) -> some View {
-        let settled = visible || reduceMotion
-        content.opacity(visible ? 1 : 0)
+        let settled = visible || reduceMotion || still
+        content.opacity(visible || still ? 1 : 0)
             .scaleEffect(settled ? 1 : scale)
             .offset(settled ? .zero : rise)
-            .animation(reduceMotion ? .easeOut(duration: 0.2)
+            .animation(still ? nil : reduceMotion ? .easeOut(duration: 0.2)
                                     : .spring(response: 0.62, dampingFraction: 0.84).delay(0.08 + Double(step) * 0.07),
                        value: visible)
     }
@@ -4743,10 +4752,23 @@ private struct LaunchFloodShape: Shape {
 
     /// The flood is up and has not been handed a cover yet.
     private(set) var covering = false
+    /// The flood has not filled the screen yet: the starting screen under it stays hidden.
+    @Published private(set) var hidesStartingScreen = false
+    private var gather: UIViewPropertyAnimator?
     /// Where the starting screen's cover is now: its layout can still move while the
     /// flood gathers (status lines arriving), and the flood lands where it ends up.
     private var latestTarget: CGRect = .zero
-    func track(_ frame: CGRect) { if window != nil { latestTarget = frame } }
+    func track(_ frame: CGRect) {
+        guard window != nil else { return }
+        latestTarget = frame
+        // Mid-gather, a move blends into the running animation (UIKit animations of the
+        // same property are additive), so the flood bends to the new frame instead of
+        // landing and then correcting.
+        if let gather, gather.isRunning, let h = holder {
+            let left = max(0.15, Double(1 - gather.fractionComplete) * gather.duration)
+            UIViewPropertyAnimator(duration: left, dampingRatio: 1) { h.frame = frame }.startAnimation()
+        }
+    }
 
     func cover(for appID: Int?) -> UIImage? { appID != nil && appID == imageAppID ? coverImage : nil }
     func hero(for appID: Int?) -> UIImage? { appID != nil && appID == imageAppID ? heroImage : nil }
@@ -4778,6 +4800,8 @@ private struct LaunchFloodShape: Shape {
         v.layer.cornerCurve = .continuous; v.clipsToBounds = true
         h.addSubview(v); root.view.addSubview(h)
         window = w; holder = h; flood = v; origin = frame; started = Date(); covering = true; latestTarget = .zero
+        hidesStartingScreen = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.hidesStartingScreen = false }
         if let appID, appID != imageAppID {
             imageAppID = appID; coverImage = nil; heroImage = nil
             fetch(artwork, into: \.coverImage, appID: appID)
@@ -4855,7 +4879,8 @@ private struct LaunchFloodShape: Shape {
             let gather = UIViewPropertyAnimator(duration: 0.62, controlPoint1: CGPoint(x: 0.6, y: 0), controlPoint2: CGPoint(x: 0.15, y: 1)) {
                 h.frame = target; v.layer.cornerRadius = style.corner
             }
-            gather.addCompletion { [weak self] _ in self?.settle(on: target, landed: landed) }
+            gather.addCompletion { [weak self] _ in guard let self else { return }; self.gather = nil; self.settle(on: self.latestTarget.isEmpty ? target : self.latestTarget, landed: landed) }
+            self.gather = gather
             gather.startAnimation()
             // The art comes in over the second half, once the flood is near the cover's size.
             if let art { UIView.animate(withDuration: 0.22, delay: 0.3, options: [.curveEaseOut]) { art.alpha = 1 } }
@@ -4867,10 +4892,11 @@ private struct LaunchFloodShape: Shape {
     private func settle(on target: CGRect, landed: @escaping () -> Void) {
         guard let h = holder else { landed(); close(); return }
         let now = latestTarget
-        let moved = !now.isEmpty && (abs(now.midX - target.midX) > 1 || abs(now.midY - target.midY) > 1
-                                     || abs(now.width - target.width) > 1 || abs(now.height - target.height) > 1)
+        let at = h.layer.presentation()?.frame ?? h.frame
+        let moved = !now.isEmpty && (abs(now.midX - at.midX) > 1 || abs(now.midY - at.midY) > 1
+                                     || abs(now.width - at.width) > 1 || abs(now.height - at.height) > 1)
         if moved {
-            let follow = UIViewPropertyAnimator(duration: 0.24, dampingRatio: 1) { h.frame = now }
+            let follow = UIViewPropertyAnimator(duration: 0.3, curve: .easeOut) { h.frame = now }
             follow.addCompletion { [weak self] _ in self?.settle(on: now, landed: landed) }
             follow.startAnimation()
             return
@@ -4899,6 +4925,7 @@ private struct LaunchFloodShape: Shape {
     private func close() {
         watch?.cancel(); watch = nil
         window?.isHidden = true; window = nil; holder = nil; flood = nil; spinner = nil; heroView = nil; covering = false
+        gather = nil; hidesStartingScreen = false
     }
 
     /// No start after the press: retract. A start whose starting screen never hands over:
