@@ -31,6 +31,10 @@
 #   winegstreamer, wmadmod          XAudio2's xWMA voices decode through the WMA
 #                                   decoder DMO (wmadmod -> winegstreamer's
 #                                   FFmpeg-based unix side, docs/MEDIA.md)
+#   build/wine-pe/farm-modules.txt  every other stock module the farm ships for
+#                                   programs that import it: C runtimes, d2d1,
+#                                   d3d8/ddraw, XACT, DirectMusic, DirectPlay,
+#                                   faultrep/wer, msi, scripting, WinRT ...
 # Pass the tracked modules a change touches (kernelbase, shell32, xinput1_1 ...
 # xinput1_4, ...) to rebuild them. ntdll is padded as well: build-ntdll.sh.
 #
@@ -55,7 +59,8 @@ case "${1:-}" in
 esac
 [ $# -gt 0 ] || set -- cryptsp d3d10 d3d10_1 d3dx11_43 msvcp110 msvcr110 tbs winegstreamer wintypes wmadmod \
     $(cd "$R/wine/dlls" && ls -d d3dx9_[0-9]* d3dx10_[0-9]* d3dcompiler_[0-9]* xaudio2_[0-9]* \
-                                  x3daudio1_[0-9]* xapofx1_[0-9]*)
+                                  x3daudio1_[0-9]* xapofx1_[0-9]*) \
+    $(grep -v '^#' "$R/build/wine-pe/farm-modules.txt")
 [ -x "$STRIP" ] || { echo "llvm-mingw not found at $TC (docs/BUILDING.md)" >&2; exit 1; }
 
 targets=()
@@ -68,7 +73,7 @@ for m in "$@"; do
         */*|.*|"") echo "$m: name a module directory under wine/dlls" >&2; exit 1 ;;
     esac
     [ -f "$R/wine/dlls/$m/Makefile.in" ] || { echo "$m: no wine/dlls/$m/Makefile.in" >&2; exit 1; }
-    case "$m" in *.*) f="$m" ;; *) f="$m.dll" ;; esac
+    case "$m" in *.acm|*.drv|*.ocx|*.cpl|*.ax|*.tlb|*.exe) f="$m" ;; *) f="$m.dll" ;; esac
     targets+=("dlls/$m/arm64ec-windows/$f")
 done
 
