@@ -47,6 +47,13 @@ Statically linked into the application binary:
   ffmpeg.org) and its SHA-256: the Madeira repository, build/ffmpeg/src,
   built by build/ffmpeg/build.sh.
 
+Separate file in the bundle:
+- LuaJIT 2.1 (compat/love/lua51.dll, x86-64 Windows DLL, unmodified source
+  built by build/luajit-x64/build.sh; commit in compat/love/lua51.dll.version):
+  MIT (LuaJIT-MIT.txt, copied by that script). Loaded in place of a game's
+  lua51.dll when that is an x64 LuaJIT needing memory below 2 GB; game files
+  are not modified.
+
 Bundled as files only in a development build that includes it (wine-mono/;
 release builds download it from WineHQ when the user asks, into
 Library/Application Support/WineMono, with the same mscorlib patch):
