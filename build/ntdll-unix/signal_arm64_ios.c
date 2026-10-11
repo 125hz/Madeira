@@ -12139,9 +12139,22 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             vrec.ExceptionAddress = (void *)PC_sig(bus_ctx);
             {
                 uint32_t f_insn = *(uint32_t *)(uintptr_t)PC_sig(bus_ctx);
+                /* The data abort's ESR says whether the access wrote (WnR, bit 6).
+                 * The encoding guess below calls the LSE atomics (LDADD, SWP, CAS...:
+                 * an x86 lock xadd / xchg) reads, because they have bit 22 set, so a
+                 * write was reported to the guest as a read. MADEIRA_FAULT_ESR_DIR=0
+                 * keeps the encoding guess alone. */
+                static int esr_dir = -1;
+                DWORD64 f_esr = get_fault_esr( bus_ctx );
+                unsigned f_ec = (unsigned)(f_esr >> 26) & 0x3f;
+                if (esr_dir < 0) { const char *e = getenv( "MADEIRA_FAULT_ESR_DIR" ); esr_dir = !(e && e[0] == '0'); }
+                if (esr_dir && (f_ec == 0x24 || f_ec == 0x25))
+                {
+                    if (f_esr & 0x40) vrec.ExceptionInformation[0] = EXCEPTION_WRITE_FAULT;
+                }
                 /* loads have bit22 set in the ld/st register/immediate classes;
                  * good enough to label the fault direction for wine's repair */
-                if ((f_insn & 0x0a000000) == 0x08000000 && !(f_insn & 0x00400000))
+                else if ((f_insn & 0x0a000000) == 0x08000000 && !(f_insn & 0x00400000))
                     vrec.ExceptionInformation[0] = EXCEPTION_WRITE_FAULT;
             }
 
