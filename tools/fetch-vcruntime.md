@@ -40,20 +40,13 @@ fourteen files above, **byte-for-byte as Microsoft shipped them**.
 ## Do not modify them
 
 Microsoft's redistribution permission covers the eligible files *unmodified*.
-In particular, do not strip Authenticode signatures. You can check that a file
-still carries its signature payload:
+In particular, do not strip Authenticode signatures. You can check that the files
+still carry their signature payload using the host test:
 
 ```sh
-python3 - app/Madeira/x86_64-vcruntime/*.dll <<'EOF'
-import struct, sys
-for path in sys.argv[1:]:
-    d = open(path, 'rb').read()
-    pe = struct.unpack_from('<I', d, 0x3c)[0]
-    off, size = struct.unpack_from('<II', d, pe + 24 + 112 + 4*8)
-    ok = size and off + size <= len(d)
-    print(('signed  ' if ok else 'UNSIGNED'), path)
-EOF
+python3 tests/host/check-vcruntime.py --strict
 ```
 
 A file whose certificate offset equals its own length has had the signature
 truncated off and is no longer an unmodified Microsoft binary.
+

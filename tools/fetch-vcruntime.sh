@@ -1,17 +1,23 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="$R/app/Madeira/x86_64-vcruntime"
 URL="https://aka.ms/vs/17/release/vc_redist.x64.exe"
-TMP="$(mktemp -d /tmp/madeira-vcrt.XXXXXX 2>/dev/null || mktemp -d)"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/madeira-vcrt.XXXXXX" 2>/dev/null || mktemp -d)"
 
 trap 'rm -rf "$TMP"' EXIT
 
 mkdir -p "$DEST"
+mkdir -p "$TMP/cab_out" "$TMP/stage"
 
 echo "fetching VC_redist.x64.exe..."
-curl -fL --retry 3 -o "$TMP/VC_redist.x64.exe" "$URL"
+curl --proto '=https' --tlsv1.2 -fL --retry 3 -o "$TMP/VC_redist.x64.exe" "$URL"
+
+if command -v shasum >/dev/null 2>&1; then
+    echo -n "downloaded sha256: "
+    shasum -a 256 "$TMP/VC_redist.x64.exe" | awk '{print $1}'
+fi
 
 SEVENZIP=""
 if command -v 7zz >/dev/null 2>&1; then
@@ -19,22 +25,26 @@ if command -v 7zz >/dev/null 2>&1; then
 elif command -v 7z >/dev/null 2>&1; then
     SEVENZIP="7z"
 else
-    echo "7zz or 7z not found, brew install sevenzip" >&2
+    echo "error: 7zz or 7z not found (brew install sevenzip)" >&2
     exit 1
 fi
 
 "$SEVENZIP" x "$TMP/VC_redist.x64.exe" -o"$TMP/ext" -y >/dev/null
 
-CABS=$(find "$TMP/ext" -type f -name "*.cab" 2>/dev/null || true)
-if [ -z "$CABS" ]; then
-    echo "failed to find cab files in installer" >&2
+i=0
+while IFS= read -r -d '' cab; do
+    i=$((i + 1))
+    out="$TMP/cab_out/$i"
+    mkdir -p "$out"
+    if ! "$SEVENZIP" x "$cab" -o"$out" -y >"$TMP/7z-$i.log" 2>&1; then
+        echo "warn: could not extract $cab (log: $TMP/7z-$i.log)" >&2
+    fi
+done < <(find "$TMP/ext" -type f -iname '*.cab' -print0)
+
+if [ "$i" -eq 0 ]; then
+    echo "error: no cab files found in installer" >&2
     exit 1
 fi
-
-mkdir -p "$TMP/cab_out"
-for cab in $CABS; do
-    "$SEVENZIP" e "$cab" -o"$TMP/cab_out" -y >/dev/null 2>&1 || true
-done
 
 WANTED=(
     "concrt140.dll"
@@ -51,15 +61,32 @@ WANTED=(
     "vcruntime140_threads.dll"
 )
 
-FOUND=0
+missing=()
 for name in "${WANTED[@]}"; do
-    MATCH=$(find "$TMP/cab_out" -type f -iname "$name" | head -n 1 || true)
-    if [ -n "$MATCH" ] && [ -f "$MATCH" ]; then
-        cp "$MATCH" "$DEST/$name"
-        FOUND=$((FOUND + 1))
+    matches=()
+    while IFS= read -r -d '' match; do
+        matches+=("$match")
+    done < <(find "$TMP/cab_out" -type f -iname "$name" -print0)
+
+    if [ "${#matches[@]}" -eq 0 ]; then
+        missing+=("$name")
+    else
+        if [ "${#matches[@]}" -gt 1 ]; then
+            echo "note: multiple matches for $name, using first"
+        fi
+        cp "${matches[0]}" "$TMP/stage/$name"
     fi
 done
 
-echo "$FOUND/${#WANTED[@]} runtime files copied to $DEST"
+if [ "${#missing[@]}" -ne 0 ]; then
+    echo "error: ${#missing[@]} of ${#WANTED[@]} files not found in installer:" >&2
+    for m in "${missing[@]}"; do
+        echo "  - $m" >&2
+    done
+    exit 1
+fi
 
-python3 "$R/tests/host/check-vcruntime.py"
+cp "$TMP/stage/"*.dll "$DEST/"
+echo "${#WANTED[@]}/${#WANTED[@]} runtime files copied to $DEST"
+
+python3 "$R/tests/host/check-vcruntime.py" --strict
