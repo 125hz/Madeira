@@ -17091,6 +17091,22 @@ static void mad_dtess_convert(struct mad_device *d, struct mad_rootsig *rs, stru
         p->gs_emu = 2;
         p->dt.out_prim = r.hs_out_prim; p->dt.patches_per_tg = r.hs_patches_per_tg; p->dt.threads_per_patch = r.hs_threads_per_patch;
         p->dt.input_cps = r.hs_input_cps; p->dt.mesh_prims = r.ds_prims_per_mesh_tg; p->dt.max_factor = r.hs_max_factor;
+        {   /* madeira-bcd: TESSELLATION FACTOR CAP. Ghost of Tsushima lights its
+             * particles through tessellated quads (ls_SetColor, max factor 9):
+             * 5,000-7,700 of them, drawn three times a frame, once the fires
+             * are going ([probe] log 2026-09-28 14:04) -- up to 162 triangles
+             * each through the emulation, and the GPU time climbed from 17 to
+             * 44 ms as they spawned. The hull's factors are clamped to this
+             * maximum for pipelines that declare at most 16 (the water declares
+             * 64 and is left alone). madeira.cfg dxil-tess-max-factor: 0 keeps
+             * the game's, default 3. */
+            static long long cap = -1;
+            if (cap < 0) {
+                cap = mad_cfg_int_pe("dxil-tess-max-factor", 3);
+                d3d12_log("[madeira-d3d12] DXIL tessellation factor cap: %lld for pipelines declaring <= 16 (madeira.cfg dxil-tess-max-factor, 0 = off)\n", cap);
+            }
+            if (cap >= 1 && cap <= 64 && r.hs_max_factor <= 16.0f && (float)cap < r.hs_max_factor) p->dt.max_factor = (float)cap;
+        }
         snprintf(p->gs_name, sizeof p->gs_name, "%s", r.hs_out_prim == 1 ? "irconverter_domain_shader_point_passthrough"
                  : r.hs_out_prim == 2 ? "irconverter_domain_shader_line_passthrough" : "irconverter_domain_shader_triangle_passthrough");
         if (said_ok++ < 8)
