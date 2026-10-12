@@ -2560,6 +2560,31 @@ void set_fd_user( struct fd *fd, const struct fd_ops *user_ops, struct object *u
     fd->user   = user;
 }
 
+/* madeira-bcd: MADEIRA_SRV_FGETPATH=1 names a file the server has just opened
+ * from its descriptor (fcntl F_GETPATH) instead of realpath() on its path.
+ * realpath walks the path one component at a time (getattrlist and lstat for
+ * each, every call checked by the sandbox): about 0.5 ms a file on the device,
+ * and Horizon Zero Dawn's menu opens ~1000 shader-cache files a second, which
+ * kept this thread busy on a performance core (493, 2026-10-11). F_GETPATH is
+ * one call and gives the resolved path realpath gives (open() here follows
+ * symlinks; /var comes back as /private/var); realpath stays the fallback.
+ * The server is running before a game's env lines are set, so
+ * WineProcessBridge.m passes the switch for each launch in this global. */
+extern volatile int g_madeira_srv_fgetpath;
+
+static char *srv_open_fd_name( int unix_fd, const char *path )
+{
+#ifdef F_GETPATH
+    if (g_madeira_srv_fgetpath == 1 && unix_fd != -1)
+    {
+        char buf[PATH_MAX > 1024 ? PATH_MAX : 1024];   /* F_GETPATH wants MAXPATHLEN (1024) */
+
+        if (fcntl( unix_fd, F_GETPATH, buf ) != -1 && buf[0] == '/') return strdup( buf );
+    }
+#endif
+    return realpath( path, NULL );
+}
+
 char *dup_fd_name( struct fd *root, const char *name )
 {
     char *ret;
@@ -2784,7 +2809,7 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
 
         if ((path = dup_fd_name( root, name )))
         {
-            fd->unix_name = realpath( path, NULL );
+            fd->unix_name = srv_open_fd_name( fd->unix_fd, path );
             free( path );
         }
 
