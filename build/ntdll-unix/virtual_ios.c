@@ -1433,6 +1433,7 @@ static void ios_soft_report( const char *why )
 
 static void ios_bigres_note( void *base, size_t size );   /* defined below */
 
+static int ios_safe_read64( uint64_t addr, uint64_t *out );
 static void ios_jumbo_census( void *hint, size_t size, void *result, unsigned st )
 {
     /* ml131: report the 512MB-reservation census alongside every jumbo call —
@@ -1493,6 +1494,29 @@ static void ios_jumbo_census( void *hint, size_t size, void *result, unsigned st
             (unsigned long long)ios_guest_ctx_rip(),
             (unsigned long)size, (unsigned long)(size >> 20), hint, result, st,
             (unsigned long)(ios_jumbo_granted >> 20), ios_jumbo_ok, ios_jumbo_fail);
+    /* madeira-bcd [jumbo-tls]: the main image's allocator stack at this point
+     * (God of War keeps it in its TLS[0] block: index at +0xc, table at +0xf0).
+     * GoW pushes its first heap before it reserves the arena this call makes;
+     * the build 237 fault found the index at 0 and table[0] empty. Also reads
+     * where that push would land if the index were zero-extended instead of
+     * sign-extended (block + 0x8000000f0). */
+    if (ios_jumbo_seq <= 4 && NtCurrentTeb())
+    {
+        uint64_t arr = 0, blk = 0, w8 = 0, t0 = 0, t1 = 0, zx = 0;
+        void **blocks = NtCurrentTeb()->ThreadLocalStoragePointer;
+        if (blocks && !ios_safe_read64( (uint64_t)(uintptr_t)blocks, &arr ) && arr)
+        {
+            blk = arr;
+            int ok8 = !ios_safe_read64( blk + 0x8, &w8 );
+            int ok0 = !ios_safe_read64( blk + 0xf0, &t0 );
+            int ok1 = !ios_safe_read64( blk + 0xf8, &t1 );
+            int okz = !ios_safe_read64( blk + 0x8000000f0ULL, &zx );
+            dprintf( 2, "[jumbo-tls] #%u tls0=%p +0x8=%s0x%llx (index %d) table[0]=%s0x%llx table[1]=%s0x%llx | zext-target %p=%s0x%llx\n",
+                     ios_jumbo_seq, (void *)(uintptr_t)blk, ok8 ? "" : "?", (unsigned long long)w8, (int)(w8 >> 32),
+                     ok0 ? "" : "?", (unsigned long long)t0, ok1 ? "" : "?", (unsigned long long)t1,
+                     (void *)(uintptr_t)(blk + 0x8000000f0ULL), okz ? "" : "unmapped ", (unsigned long long)zx );
+        }
+    }
 }
 
 
