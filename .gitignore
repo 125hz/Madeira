@@ -165,3 +165,6 @@ app/Madeira/i386-windows/*
 # Madeira Dock: built from madeira-dock by build/madeira-dock/build.sh
 app/Madeira/arm64ec-windows/dockhost.exe
 app/Madeira/arm64ec-windows/dock-notices.txt
+
+# faultrep.dll: build/faultrep/build.sh (its install goes into the tracked farm)
+build/faultrep/out/
