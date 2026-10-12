@@ -14009,7 +14009,10 @@ void signal_init_process(void)
 
  error:
     perror("sigaction");
-    exit(1);
+    {   /* ml1310: this pseudo-process only, through its normal exit path (server_ios.c) */
+        extern void ios_unix_fatal_exit( int status, const char *why ) __attribute__((noreturn));
+        ios_unix_fatal_exit( 1, "signal handler set-up" );
+    }
 }
 
 
