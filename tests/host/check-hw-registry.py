@@ -6,11 +6,12 @@
    server_ios.c reads MADEIRA_HW_REGISTRY once and creates every key through
    the volatile level-by-level helper.
 2. The values (build/ntdll-unix/hw_registry_ios.h) compiled and run on the
-   host: identifier, vendor, brand, feature set, ~MHz from the counter
-   frequency, switch and count parsing.
+   host: identifier, vendor, brand, feature set with and without AVX, ~MHz
+   from the counter frequency, switch and count parsing.
 3. FEX ($FEX_SRC, default ./FEX): every mirrored number read back out of
    CPUID.cpp/CPUID.h, Source/Windows/Common/CPUFeatures.cpp, the FEX winternl.h,
-   Core.cpp, Context.h and Config.json.in.
+   Core.cpp, Context.h and Config.json.in, and the MADEIRA_FEX_AVX switch FEX
+   reads (mirrored, not read for itself).
 4. wineboot ($WINE_SRC, default ./wine): the value names and constants, and
    the SMBIOS rules -- wineboot's own find_smbios_entry / get_smbios_string /
    create_bios_*_values and ntdll's own append_smbios_* generator, extracted and
@@ -20,8 +21,8 @@
 5. The publish code (server_ios.c between the hw-registry-test marks)
    compiled against a fake registry with Wine 11's parent rule and a fake
    NtQuerySystemInformation serving the generated tables: keys, volatility,
-   values, MADEIRA_HW_REGISTRY=0, no SMBIOS, zero counter frequency, repeated
-   runs, Session Manager\\Environment untouched.
+   values, MADEIRA_HW_REGISTRY=0, AVX, no SMBIOS, zero counter frequency,
+   repeated runs, Session Manager\\Environment untouched.
 """
 from pathlib import Path
 import os, re, shutil, subprocess, sys, tempfile
@@ -93,6 +94,11 @@ region = server[server.index("/* hw-registry-test:begin"):server.index("/* hw-re
 pub = func(server, "void ios_hw_registry_publish(void)")
 check("MADEIRA_HW_REGISTRY read once, through hwreg_enabled",
       server.count('getenv( "MADEIRA_HW_REGISTRY" )') == 1 and 'if (!hwreg_enabled( getenv( "MADEIRA_HW_REGISTRY" ) ))' in pub)
+check("MADEIRA_FEX_AVX mirrored without a catalog site of its own (FEX owns the switch)",
+      'getenv( fex_avx )' in pub and 'static const char fex_avx[] = "MADEIRA_FEX_AVX";' in pub
+      and 'getenv( "MADEIRA_FEX_AVX" )' not in server and 'getenv("MADEIRA_FEX_AVX")' not in server)
+check("AVX only for a 64-bit main image (FEX's WOW64 module has none)",
+      "hwreg_fex_cpu( &cpu, avx && avx[0] == '1' && !ios_main_image_i386, ios_hw_cntfrq() );" in pub)
 check("every HARDWARE key is made by the volatile level-by-level helper",
       len(re.findall(r"ios_hw_key\( machine, ", pub)) == 4 and "NtCreateKey" not in pub)
 check("Session Manager\\Environment is not touched", "Environment" not in pub and "NtOpenKey" not in pub)
@@ -110,19 +116,20 @@ with tempfile.TemporaryDirectory(prefix="madeira-hwreg-") as tmpd:
     # ------------------------------------------------------------ 2. values
     out = run_c({"values.c": r'''
 #include "hw_registry_ios.h"
-static void show( const char *tag, unsigned long long cntfrq )
+static void show( const char *tag, int avx, unsigned long long cntfrq )
 {
     struct hwreg_cpu c;
-    hwreg_fex_cpu( &c, cntfrq );
+    hwreg_fex_cpu( &c, avx, cntfrq );
     printf( "%s|%s|%s|%s|%u|%04x|%08x|%u\n", tag, c.identifier, c.vendor, c.brand, c.level, c.revision,
             (unsigned)c.feature_set, (unsigned)c.mhz );
 }
 int main( void )
 {
-    show( "plain", 24000000 );
-    show( "1ghz", 1000000000 );
-    show( "19.2", 19200000 );
-    show( "zero", 0 );
+    show( "plain", 0, 24000000 );
+    show( "avx", 1, 24000000 );
+    show( "1ghz", 0, 1000000000 );
+    show( "19.2", 0, 19200000 );
+    show( "zero", 0, 0 );
     printf( "enabled %d %d %d %d %d\n", hwreg_enabled( NULL ), hwreg_enabled( "" ), hwreg_enabled( "0" ),
             hwreg_enabled( "1" ), hwreg_enabled( "yes" ) );
     printf( "count %u %u %u %u\n", hwreg_cpu_count( 0 ), hwreg_cpu_count( 6 ), hwreg_cpu_count( 64 ),
@@ -136,8 +143,9 @@ int main( void )
     check("Identifier/vendor/brand/level/revision: Intel64 Family 6 Model 166 Stepping 1, GenuineIntel, "
           "'Unknown ARM CPU', 6, a601",
           "plain|Intel64 Family 6 Model 166 Stepping 1|GenuineIntel|Unknown ARM CPU|6|a601|" in out)
-    check("FeatureSet 0x2379ffff (FEX baseline + SSE4.2)",
-          "plain|Intel64 Family 6 Model 166 Stepping 1|GenuineIntel|Unknown ARM CPU|6|a601|2379ffff|1536\n" in out)
+    check("FeatureSet 0x2379ffff (FEX baseline + SSE4.2), 0xe3f9ffff with AVX (+XSAVE, AVX, AVX2)",
+          "plain|Intel64 Family 6 Model 166 Stepping 1|GenuineIntel|Unknown ARM CPU|6|a601|2379ffff|1536\n" in out
+          and "|e3f9ffff|1536\n" in out.split("avx|", 1)[-1])
     check("~MHz = FEX's scaled TSC: 24 MHz -> 1536, 1 GHz -> 1000, 19.2 MHz -> 1228, 0 -> 0",
           out.split("1ghz|")[-1].split("\n")[0].endswith("|1000") and out.split("19.2|")[-1].split("\n")[0].endswith("|1228")
           and out.split("zero|")[-1].split("\n")[0].endswith("|0"))
@@ -200,9 +208,20 @@ int main( void )
         check("FEX: baseline ProcessorFeatureBits = %#x = ours (%#x), same %d flags" % (fexbase, base, len(names)),
               fexbase == base and names == ours and all(int(hdef["HWREG_" + k], 16) == vals[k] for k in vals
                                                        if "HWREG_" + k in hdef))
-        check("FEX: SSE4.2 <- leaf1 ECX[20] <- SupportsCRC",
+        check("FEX: SSE4.2 <- leaf1 ECX[20] <- SupportsCRC; XSAVE/AVX <- ECX[27]/[28], AVX2 <- leaf7 EBX[5] <- SupportsAVX",
               "if (CPUIDResult01.ecx & (1 << 20)) {\n    CpuInfo.ProcessorFeatureBits |= CPU_FEATURE_SSE42;" in cf
-              and "(CTX->HostFeatures.SupportsCRC << 20) |         // SSE4.2" in cpp)
+              and "if (CPUIDResult01.ecx & (1 << 27)) {\n    CpuInfo.ProcessorFeatureBits |= CPU_FEATURE_XSAVE;" in cf
+              and "if (CPUIDResult01.ecx & (1 << 28)) {\n    CpuInfo.ProcessorFeatureBits |= CPU_FEATURE_AVX;" in cf
+              and "if (CPUIDResult07.ebx & (1 << 5)) {\n    CpuInfo.ProcessorFeatureBits |= CPU_FEATURE_AVX2;" in cf
+              and "(CTX->HostFeatures.SupportsCRC << 20) |         // SSE4.2" in cpp
+              and "(SupportsAVX() << 27) |                         // OSXSAVE" in cpp
+              and "(SupportsAVX() << 28) |                         // AVX" in cpp
+              and "(SupportsAVX() << 5) |                   // AVX2 support" in cpp
+              and "if (CTX->HostFeatures.SupportsAVX) {\n    XCR0 |= XCR0_AVX;" in cpp)
+        check("FEX: MADEIRA_FEX_AVX starting with '1' sets SupportsAVX, ARM64EC module only (what server_ios.c mirrors)",
+              'getenv("MADEIRA_FEX_AVX")' in ios
+              and "Avx && Avx[0] == '1' && HostType != FEXCore::HostFeatures::HostTypeEnum::Wow64" in ios
+              and "HostFeatures.SupportsAVX = true;" in ios)
         check("FEX: level/revision formulas and AMD64 for the ARM64EC module",
               "CpuInfo.ProcessorLevel = ((FamilyIdentifier >> 8) & 0xf) + ((FamilyIdentifier >> 20) & 0xff);" in cf
               and "CpuInfo.ProcessorRevision = (FamilyIdentifier & 0xf0000) >> 4;" in cf
@@ -569,6 +588,7 @@ static inline void init_unicode_string( UNICODE_STRING *str, const WCHAR *data )
 
 static PEB fake_peb;
 PEB *peb = &fake_peb;
+int ios_main_image_i386;   /* ios_wow.h: the app publishes it for a 32-bit main image */
 
 struct value { char name[64]; ULONG type; ULONG size; unsigned char data[600]; };
 struct node { char name[160]; struct node *parent; int is_volatile; unsigned int nvalues; struct value values[24]; };
@@ -804,7 +824,9 @@ static void reset( unsigned int cpus )
     fake_peb.NumberOfProcessors = cpus;
     fake_cntfrq = 24000000;
     table_kind = 1;
+    ios_main_image_i386 = 0;
     unsetenv( "MADEIRA_HW_REGISTRY" );
+    unsetenv( "MADEIRA_FEX_AVX" );
 }
 #define SYS "\\Registry\\Machine\\HARDWARE\\DESCRIPTION\\System"
 #define CPU0 "FeatureSet=dword:0x2379ffff;Identifier=sz:Intel64 Family 6 Model 166 Stepping 1;" \
@@ -865,20 +887,34 @@ int main( void )
     assert( !creates && !sets && !fw_queries && log_lines == 1 && strstr( last_log, "MADEIRA_HW_REGISTRY=0, no" ) );
     assert( !find( "\\Registry\\Machine\\HARDWARE" ) );
 
-    /* no SMBIOS table, no counter frequency, one processor */
+    /* AVX, no SMBIOS table, no counter frequency, one processor */
     reset( 1 );
     table_kind = -1;
     fake_cntfrq = 0;
+    setenv( "MADEIRA_FEX_AVX", "1", 1 );
     ios_hw_registry_publish();
     assert( !strcmp( vals( SYS "\\CentralProcessor\\0" ),
-        "FeatureSet=dword:0x2379ffff;Identifier=sz:Intel64 Family 6 Model 166 Stepping 1;VendorIdentifier=sz:GenuineIntel;"
+        "FeatureSet=dword:0xe3f9ffff;Identifier=sz:Intel64 Family 6 Model 166 Stepping 1;VendorIdentifier=sz:GenuineIntel;"
         "ProcessorNameString=sz:Unknown ARM CPU;~MHz=dword:0x000003e8;" ) );
     assert( !find( SYS "\\CentralProcessor\\1" ) && fw_queries == 1 );
     assert( strstr( vals( SYS "\\BIOS" ), "BIOSVendor=sz:The Wine project;BIOSVersion=sz:11.4;BIOSReleaseDate=sz:01/01/2021;" ) );
     assert( strstr( vals( SYS "\\BIOS" ), "SystemManufacturer=sz:The Wine project;SystemProductName=sz:Wine;SystemVersion=sz:11.4;" ) );
-    assert( strstr( last_log, "1/1 CentralProcessor" ) && strstr( last_log, "FeatureSet 0x2379ffff" )
+    assert( strstr( last_log, "1/1 CentralProcessor" ) && strstr( last_log, "FeatureSet 0xe3f9ffff" )
             && strstr( last_log, "~MHz 1000" ) && strstr( last_log, "(no SMBIOS table, 9 Wine default(s))" ) );
     printf( "fallbacks: %s\n", last_log );
+
+    /* MADEIRA_FEX_AVX other than 1: no AVX */
+    reset( 2 );
+    setenv( "MADEIRA_FEX_AVX", "0", 1 );
+    ios_hw_registry_publish();
+    assert( strstr( vals( SYS "\\CentralProcessor\\1" ), "FeatureSet=dword:0x2379ffff;" ) );
+
+    /* a 32-bit main image runs FEX's WOW64 module, which has no AVX: none even with the switch */
+    reset( 6 );
+    setenv( "MADEIRA_FEX_AVX", "1", 1 );
+    ios_main_image_i386 = 1;
+    ios_hw_registry_publish();
+    assert( !strcmp( vals( SYS "\\CentralProcessor\\0" ), CPU0 ) && strstr( last_log, "FeatureSet 0x2379ffff" ) );
 
     /* a processor count of 0 still gives one key; HARDWARE already there (win32u's DEVICEMAP) */
     reset( 0 );
@@ -902,7 +938,7 @@ int main( void )
                 flags + ["-Werror", "-Wno-unused-but-set-variable"] + use)
     check("publish region compiles warning-free (-Werror) against Wine's headers", out is not None)
     print("     " + (out or "").replace("\n", "\n     ").rstrip())
-    check("fake registry: keys volatile, values, idempotent rerun, off, no SMBIOS, zero counter, "
+    check("fake registry: keys volatile, values, idempotent rerun, off, AVX, no SMBIOS, zero counter, "
           "count 0, existing HARDWARE, Environment untouched, generic table",
           out is not None and "registry: all scenarios passed" in out)
 
