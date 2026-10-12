@@ -700,6 +700,123 @@ static void madeira_link_d3d9_wined3d(NSFileManager *fm, NSString *prefix, NSStr
                 "folder); with OpenGL ES wined3d finds no usable context and Direct3DCreate9 returns NULL\n");
 }
 
+/* Vulkan, and vkd3d-proton as a second Direct3D 12 route (docs/BUILDING.md,
+ * "winevulkan and vkd3d-proton"). madeira.cfg, or the game's own lines:
+ *
+ *   vulkan = moltenvk | kosmickrisp | off | <path>.dylib
+ *            the Vulkan library winevulkan loads: gl/libMoltenVK.dylib (the one
+ *            Zink uses), gl/libvulkan_kosmickrisp.dylib, or a file named by path
+ *            (absolute, or relative to the app bundle). Unset: MoltenVK whenever
+ *            Vulkan is on.
+ *   d3d12  = vkd3d
+ *            this session's d3d12.dll and d3d12core.dll are vkd3d-proton's
+ *            (vulkan/arm64ec-windows in the bundle) instead of madeira-d3d12's.
+ *
+ * Vulkan is on for a session when `vulkan` names a library or d3d12 = vkd3d.
+ * Off (the default) changes nothing: the prefix gets no vulkan-1.dll or
+ * winevulkan.dll (no farm holds them, so a program that probes for Vulkan
+ * finds none, as before), MADEIRA_VULKAN_LIBRARY stays unset, and win32u lists
+ * no Vulkan GPU (build/win32u-unix/vulkan_ios.c). On: MADEIRA_VULKAN_LIBRARY
+ * names the library and system32 (in an x64 session) and sysx64 get links to
+ * the ARM64EC vulkan-1.dll and winevulkan.dll; with d3d12 = vkd3d also to
+ * vkd3d-proton's d3d12.dll and d3d12core.dll, replacing the farm's links. Every
+ * session relinks the farms first, so the next session without the setting
+ * gets madeira-d3d12 again; the two Vulkan DLLs, which no farm relinks, are
+ * removed here when they name the bundle's vulkan folder. x64 programs only:
+ * the unix side binds no 32-bit table yet (build/ntdll-unix/virtual_ios.c). */
+static BOOL madeira_d3d12_vkd3d_wanted(void)
+{
+    char v[32] = "";
+
+    return madeira_cfg_get("d3d12", v, sizeof v) && !strcasecmp(v, "vkd3d");
+}
+
+/* The Vulkan library for this session, or nil when Vulkan stays off. */
+static NSString *madeira_vulkan_library(NSString *bundle)
+{
+    char v[512] = "";
+    BOOL set = madeira_cfg_get("vulkan", v, sizeof v) && v[0];
+
+    if (set && (!strcasecmp(v, "off") || !strcmp(v, "0"))) return nil;
+    if (!set && !madeira_d3d12_vkd3d_wanted()) return nil;
+    if (!set || !strcasecmp(v, "moltenvk"))
+        return [bundle stringByAppendingPathComponent:@"gl/libMoltenVK.dylib"];
+    if (!strcasecmp(v, "kosmickrisp"))
+        return [bundle stringByAppendingPathComponent:@"gl/libvulkan_kosmickrisp.dylib"];
+    if (strchr(v, '/'))
+        return v[0] == '/' ? [NSString stringWithUTF8String:v]
+                           : [bundle stringByAppendingPathComponent:[NSString stringWithUTF8String:v]];
+    dprintf(STDERR_FILENO, "[vulkan] unknown madeira.cfg vulkan = %s (moltenvk, kosmickrisp, off or a .dylib path); "
+            "using MoltenVK\n", v);
+    return [bundle stringByAppendingPathComponent:@"gl/libMoltenVK.dylib"];
+}
+
+/* <dir>\<name> -> <src>. 1 linked, 0 failed. */
+static int madeira_link_vulkan_file(NSFileManager *fm, NSString *dir, NSString *name, NSString *src)
+{
+    NSString *dst = [dir stringByAppendingPathComponent:name];
+
+    [fm removeItemAtPath:dst error:nil];
+    return [fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil] ? 1 : 0;
+}
+
+static void madeira_setup_vulkan(NSFileManager *fm, NSString *prefix, NSString *bundle, BOOL use_arm64ec)
+{
+    NSString *win = [prefix stringByAppendingPathComponent:@"drive_c/windows"];
+    NSString *stack = [bundle stringByAppendingPathComponent:@"vulkan/arm64ec-windows"];
+    NSArray<NSString *> *vulkan_dlls = @[@"winevulkan.dll", @"vulkan-1.dll"];
+    NSArray<NSString *> *vkd3d_dlls = @[@"d3d12.dll", @"d3d12core.dll"];
+    NSArray<NSString *> *dirs = use_arm64ec ? @[@"system32", @"sysx64"] : @[@"sysx64"];
+    NSString *lib = madeira_vulkan_library(bundle);
+    BOOL vkd3d = madeira_d3d12_vkd3d_wanted();
+    int linked = 0, vkd3d_linked = 0;
+
+    /* A previous session's Vulkan links (no farm pass replaces these two). */
+    for (NSString *dir in @[@"system32", @"sysx64"])
+        for (NSString *dll in vulkan_dlls) {
+            NSString *path = [[win stringByAppendingPathComponent:dir] stringByAppendingPathComponent:dll];
+            NSString *dest = [fm destinationOfSymbolicLinkAtPath:path error:nil];
+            if (dest && [dest rangeOfString:@"/vulkan/arm64ec-windows/"].location != NSNotFound)
+                [fm removeItemAtPath:path error:nil];
+        }
+
+    if (!lib) {
+        unsetenv("MADEIRA_VULKAN_LIBRARY");
+        if (vkd3d)
+            dprintf(STDERR_FILENO, "[vulkan] d3d12 = vkd3d with vulkan = off: madeira-d3d12 stays this session's D3D12\n");
+        return;
+    }
+    if (access(lib.fileSystemRepresentation, R_OK) != 0 ||
+        access([stack stringByAppendingPathComponent:@"winevulkan.dll"].fileSystemRepresentation, R_OK) != 0 ||
+        access([stack stringByAppendingPathComponent:@"vulkan-1.dll"].fileSystemRepresentation, R_OK) != 0) {
+        unsetenv("MADEIRA_VULKAN_LIBRARY");
+        dprintf(STDERR_FILENO, "[vulkan] Vulkan stays off: %s or the bundle's vulkan/arm64ec-windows/{winevulkan,vulkan-1}.dll "
+                "is missing%s\n", lib.UTF8String, vkd3d ? " (d3d12 = vkd3d ignored: madeira-d3d12 stays)" : "");
+        return;
+    }
+    setenv("MADEIRA_VULKAN_LIBRARY", lib.UTF8String, 1);   /* read by build/win32u-unix/vulkan_ios.c */
+
+    for (NSString *dir in dirs)
+        for (NSString *dll in vulkan_dlls)
+            linked += madeira_link_vulkan_file(fm, [win stringByAppendingPathComponent:dir], dll,
+                                               [stack stringByAppendingPathComponent:dll]);
+    if (vkd3d) {
+        if (access([stack stringByAppendingPathComponent:@"d3d12.dll"].fileSystemRepresentation, R_OK) == 0 &&
+            access([stack stringByAppendingPathComponent:@"d3d12core.dll"].fileSystemRepresentation, R_OK) == 0) {
+            for (NSString *dir in dirs)
+                for (NSString *dll in vkd3d_dlls)
+                    vkd3d_linked += madeira_link_vulkan_file(fm, [win stringByAppendingPathComponent:dir], dll,
+                                                             [stack stringByAppendingPathComponent:dll]);
+        } else {
+            dprintf(STDERR_FILENO, "[vulkan] d3d12 = vkd3d, but the bundle has no vulkan/arm64ec-windows/d3d12.dll and "
+                    "d3d12core.dll (build/vkd3d-proton/build.sh): madeira-d3d12 stays\n");
+        }
+    }
+    dprintf(STDERR_FILENO, "[vulkan] on: MADEIRA_VULKAN_LIBRARY=%s; %d Vulkan DLL links in %s; D3D12 = %s (%d links)\n",
+            lib.UTF8String, linked, use_arm64ec ? "system32 + sysx64" : "sysx64",
+            vkd3d_linked ? "vkd3d-proton" : "madeira-d3d12", vkd3d_linked);
+}
+
 /* ml1275: C:\windows\mono\mono-2.0 -> the bundle's Wine Mono, when the build
  * carries one (the "Bundle Wine Mono" build phase); otherwise the copy Madeira
  * downloaded from WineHQ (WineMono.swift, Library/Application Support/WineMono/
@@ -1576,6 +1693,7 @@ static void *wine_process_thread(void *arg) {
             madeira_link_wine_mono(fm, prefix, bundlePath);
             if (madeira_d3d9_wined3d_wanted())
                 madeira_link_d3d9_wined3d(fm, prefix, bundlePath, has_i386_set);
+            madeira_setup_vulkan(fm, prefix, bundlePath, use_arm64ec);
 
             /* ml719: REPAIR THE SHELL FOLDERS. They ship as symlinks to the BUILD
              * MACHINE's home directory.

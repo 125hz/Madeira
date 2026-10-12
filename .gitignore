@@ -63,6 +63,13 @@ app/Madeira/licenses/MoltenVK-Apache-2.0.txt
 app/Madeira/licenses/SPIRV-Cross-Apache-2.0.txt
 app/Madeira/licenses/SPIRV-Tools-Apache-2.0.txt
 app/Madeira/licenses/cereal-BSD-3-Clause.txt
+#   build/vkd3d-proton/build.sh -> vulkan/arm64ec-windows/{d3d12,d3d12core}.dll
+#                                  and the vkd3d-proton, dxil-spirv, dxbc-spirv texts
+app/Madeira/vulkan/arm64ec-windows/d3d12.dll
+app/Madeira/vulkan/arm64ec-windows/d3d12core.dll
+app/Madeira/licenses/vkd3d-proton-LGPL-2.1.txt
+app/Madeira/licenses/dxil-spirv-MIT.txt
+app/Madeira/licenses/dxbc-spirv-MIT.txt
 
 # DXMT build artifacts
 build/dxmt-ios/obj/

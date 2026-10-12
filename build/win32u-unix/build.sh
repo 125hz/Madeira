@@ -111,6 +111,13 @@ for src in $WINE_SRC/dlls/win32u/*.c $WINE_SRC/dlls/win32u/dibdrv/*.c; do
             compile_one "$BUILD_DIR/d3dkmt_ios.c" "d3dkmt"
             continue
             ;;
+        vulkan)
+            # Wraps upstream vulkan.c: loads $MADEIRA_VULKAN_LIBRARY (set by the
+            # app only when the session asks for Vulkan) and adds the winios
+            # Vulkan surface driver (see the header comment in vulkan_ios.c).
+            compile_one "$BUILD_DIR/vulkan_ios.c" "vulkan"
+            continue
+            ;;
         syscall)
             # Wraps upstream syscall.c and adds win32u_zero_bits(), the
             # allocation ceiling of the calling pseudo-process (see the

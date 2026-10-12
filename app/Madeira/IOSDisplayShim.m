@@ -205,6 +205,17 @@ CAMetalLayer *madeira_display_layer_for_hwnd(void *hwnd) {
     return layer;
 }
 
+// winevulkan's window surfaces (build/win32u-unix/vulkan_ios.c): the CAMetalLayer
+// an HWND's Vulkan swapchain presents to (VK_EXT_metal_surface retains it), the
+// same layer a D3D swapchain on that window gets, and the window is marked as a
+// Metal-presenting one like a DXMT swapchain's. NULL when there is no layer.
+void *madeira_vulkan_layer_for_hwnd(void *hwnd) {
+    CAMetalLayer *layer = madeira_display_layer_for_hwnd(hwnd);
+    if (!layer) return NULL;
+    winios_note_game_metal_hwnd(hwnd);
+    return (__bridge void *)layer;
+}
+
 // The critical two: return a "view" handle that maps to the CAMetalLayer.
 // We pack the layer pointer directly. `v` carries the swapchain's HWND
 // (see my_get_win_data).

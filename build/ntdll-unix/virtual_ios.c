@@ -11518,6 +11518,14 @@ extern const void *winegstreamer_unix_call_funcs[];
 extern const void *opengl32_unix_call_funcs[];
 extern const void *opengl32_unix_call_wow64_funcs[];
 
+/* winevulkan's unix side, compiled from wine/dlls/winevulkan/{vulkan,vulkan_thunks}.c
+ * into libntdll_unix.a (build/ntdll-unix/build.sh). It reaches the session's
+ * Vulkan library through win32u (build/win32u-unix/vulkan_ios.c); without
+ * MADEIRA_VULKAN_LIBRARY its init call fails and vulkan-1.dll reports no ICD.
+ * 64-bit callers only: its wow64 thunks do not add a 32-bit window's base to
+ * guest pointers (see the build.sh comment). */
+extern const void *winevulkan_unix_call_funcs[];
+
 /* win32u's unix init, statically linked via libwin32u_unix.a. Renamed
  * from __wine_unix_lib_init in build/win32u-unix/build.sh so future
  * statically-linked unix libs can keep their own init without colliding.
@@ -11865,6 +11873,12 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             }
             libname = "win32u (stub table)";
             funcs64 = funcs_wow64 = (const void *)ios_stub_unix_call_table;
+        } else if (match && strstr(match, "winevulkan")) {
+            /* "winevulkan" matches the export name winevulkan.dll and a unix_path
+             * of winevulkan.so. No wow64 table: a 32-bit caller is refused. */
+            libname = "winevulkan (Vulkan through win32u, MADEIRA_VULKAN_LIBRARY)";
+            funcs64 = (const void *)winevulkan_unix_call_funcs;
+            funcs_wow64 = NULL;
         } else if (match && strstr(match, "opengl32")) {
             /* Real opengl32 unix side (OpenGL ES / desktop GL through the winios
              * WGL driver). MADEIRA_NO_GL=1 keeps the old GL-absent stub table.
