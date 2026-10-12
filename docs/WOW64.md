@@ -171,9 +171,15 @@ exported as `d3d9shim.dll` whatever file name it is installed under):
   window is replaced with `PROT_NONE`. The hook is weak in `virtual_ios.c`;
   DXMT's definition replaces the default, which only reports that it is
   missing.
+- With `d3d9 = wined3d` the shim is not loaded at all: the session links
+  `syswow64\d3d9.dll` (and the x64 `system32`/`sysx64` one) to
+  `d3d9-wined3d.dll`, Wine's own frontend on wined3d's OpenGL renderer
+  (`WineProcessBridge.m`, `madeira_link_d3d9_wined3d`). See
+  docs/BUILDING.md, "wined3d (Direct3D 8/9 and DirectDraw on OpenGL)".
 
-`build/wine-i386/build.sh` installs the shim as `d3d9.dll` and `d3d9shim.dll`
-and the emulated frontend as `d3d9-emulated.dll`.
+`build/wine-i386/build.sh` installs the shim as `d3d9.dll` and `d3d9shim.dll`,
+the emulated frontend as `d3d9-emulated.dll` and Wine's d3d9 as
+`d3d9-wined3d.dll`.
 
 The ARM64EC `d3d9.dll` that x64 programs load is DXMT's frontend too, built for
 ARM64EC from the same source (`ninja -C build-pe-arm64ec src/d3d9/d3d9.dll` in the
@@ -266,7 +272,7 @@ the switch is only consulted for a WoW64 process, window or thread.
 | `MADEIRA_CPU_COUNT` | unset | per launch | Overrides the `cpu-count` key for one program (unset: unchanged) |
 | `MADEIRA_STRICT_SPLITLOCK` | on | FEX WOW64 | `StrictInProcessSplitLocks` default for 32-bit guests (an explicit FEX setting wins) |
 | `MADEIRA_WOW_SYSCALL_SWEEP` | on | FEX WOW64 | Let the code-buffer sweeper move threads parked in a system call |
-| `MADEIRA_D3D9` | unset (emulated) | i386 `d3d9.dll` | `native`: the D3D9 shim uses the native ARM64 frontend. Also set by the `d3d9` key of `madeira.cfg` |
+| `MADEIRA_D3D9` | unset (emulated) | i386 `d3d9.dll` | `native`: the D3D9 shim uses the native ARM64 frontend; `wined3d`: Wine's d3d9 on wined3d/OpenGL replaces DXMT's for 32- and 64-bit programs. Also set by the `d3d9` key of `madeira.cfg` |
 | `MADEIRA_D3D9_X64` | on | x64 `d3d9.dll` | `0`: Direct3D 9 creation fails for x64 programs, as it did with Wine's wined3d frontend |
 | `MADEIRA_WOW_RWX_PLAIN` | unset (automatic) | 32-bit | Anonymous RWX memory in a window is plain read/write to the host once Wine Mono's `libmono-2.0-x86.dll` is mapped there; 1: in every window, 0: never (stores go through the JIT pool's alias, as before; also keeps FEX's Mono bridge off) |
 | `MADEIRA_WINEMONO_BRIDGE` | automatic for `libmono-2.0-x86.dll` | FEX WOW64 | FEX's Mono backpatcher bridge (ml712) and, once it finds the backpatcher, SMC detection off for the process (ml1280); 0 keeps both off. The 64-bit runtime still needs 1 |
