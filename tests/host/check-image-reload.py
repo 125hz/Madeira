@@ -67,7 +67,7 @@ assert re.search(r'if \(choice == 1\)\s*\{\s*reload_jit = ios_jit_mappings\[i\]\
                  r'\s*if \(choice == 2\) continue;', early), 'in-place: leave the loop; new copy: skip the entry'
 
 alloc = native[native.index('size_t alloc_size = image_alloc + tramp_prealloc'):]
-alloc = alloc[:alloc.index('if (offset == (size_t)-1)')]
+alloc = alloc[:alloc.index('\n            if (offset == (size_t)-1)\n            {')]
 assert re.search(r'if \(reload_jit && reload_pe == image_base && reload_size == image_size &&\s*'
                  r'ios_pool_ledger_holds\( \(size_t\)\(\(char \*\)reload_jit - \(char \*\)jit_rx_base\),\s*'
                  r'image_alloc \+ tramp_prealloc, ios_jit_current_peb\(\) \)\)', alloc), \
