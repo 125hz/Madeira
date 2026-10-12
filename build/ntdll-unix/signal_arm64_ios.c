@@ -102,6 +102,8 @@
 
 /* defined at the bottom of this file with the [thread-stacks] dumper */
 static const char *ios_pe_module_name( uint64_t base );
+/* madeira-bcd: for the watchdog's guest-stack dump (server_ios.c). */
+const char *ios_pe_module_name_ext( uint64_t base ) { return ios_pe_module_name( base ); }
 
 WINE_DEFAULT_DEBUG_CHANNEL(seh);
 

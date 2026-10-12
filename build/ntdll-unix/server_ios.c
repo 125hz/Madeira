@@ -4545,6 +4545,56 @@ void server_init_process_done(void)
                             }
                         }
                     }
+                    /* madeira-bcd: WHERE IN THE GUEST it waits. A thread parked in a
+                     * syscall (NtWaitForAlertByThreadId under a lock, build 229: God of
+                     * War inside LdrLoadDll) has its PE caller in the syscall frame
+                     * (TEB+0x378; x29 at +0xe8, lr +0xf0, sp +0xf8, pc +0x100). Walk
+                     * that frame chain and scan the guest stack for return addresses,
+                     * each mapped from the JIT pool copy back to module+offset. */
+                    {
+                        extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+                        extern const char *ios_pe_module_name_ext( uint64_t base );
+                        uint64_t frame_ptr = 0, regs[4] = { 0, 0, 0, 0 };
+                        vm_size_t got = 0;
+                        if (vm_read_overwrite(mach_task_self(), watchdog_teb_addr + 0x378, sizeof(frame_ptr),
+                                              (vm_address_t)&frame_ptr, &got) == KERN_SUCCESS && frame_ptr &&
+                            vm_read_overwrite(mach_task_self(), frame_ptr + 0xe8, sizeof(regs),
+                                              (vm_address_t)regs, &got) == KERN_SUCCESS)
+                        {
+                            uint64_t fp = regs[0], sp = regs[2];
+                            int n;
+                            const uint64_t pcs[2] = { regs[3], regs[1] };
+                            for (n = 0; n < 2; n++)
+                            {
+                                uint64_t mod = 0, va = ios_jit_reverse_translate( pcs[n], &mod );
+                                wine_log_write("[guest-stk] %s 0x%llx = %s+0x%llx", n ? "lr" : "pc",
+                                    (unsigned long long)pcs[n], va && mod ? ios_pe_module_name_ext( mod ) : "?",
+                                    (unsigned long long)(va && mod ? va - mod : 0));
+                            }
+                            for (n = 0; n < 24 && fp > 0x10000; n++)
+                            {
+                                uint64_t rec[2] = { 0, 0 }, mod = 0, va;
+                                if (vm_read_overwrite(mach_task_self(), fp, sizeof(rec), (vm_address_t)rec, &got) != KERN_SUCCESS)
+                                    break;
+                                va = ios_jit_reverse_translate( rec[1], &mod );
+                                wine_log_write("[guest-stk] fp#%d 0x%llx = %s+0x%llx", n, (unsigned long long)rec[1],
+                                    va && mod ? ios_pe_module_name_ext( mod ) : "?",
+                                    (unsigned long long)(va && mod ? va - mod : 0));
+                                if (rec[0] <= fp) break;
+                                fp = rec[0];
+                            }
+                            for (n = 0; n < 1024 && sp; n++)
+                            {
+                                static int hits;
+                                uint64_t slot = 0, mod = 0, va;
+                                if (vm_read_overwrite(mach_task_self(), sp + 8ull * n, 8, (vm_address_t)&slot, &got) != KERN_SUCCESS)
+                                    break;
+                                if ((va = ios_jit_reverse_translate( slot, &mod )) && mod && va != slot && hits++ < 48)
+                                    wine_log_write("[guest-stk] sp+0x%x 0x%llx = %s+0x%llx", n * 8, (unsigned long long)slot,
+                                        ios_pe_module_name_ext( mod ), (unsigned long long)(va - mod));
+                            }
+                        }
+                    }
                 } else {
                     wine_log_write("[Wine WATCHDOG %ds] thread_get_state failed: %d", secs, kr);
                 }
