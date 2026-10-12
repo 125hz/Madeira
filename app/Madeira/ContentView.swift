@@ -3076,6 +3076,30 @@ struct ContentView: View {
                 setenv("WINE_IOS_JIT_RX", String(format: "%lx", Int(bitPattern: pool.rx)), 1)
                 setenv("WINE_IOS_JIT_RW", String(format: "%lx", Int(bitPattern: pool.rw)), 1)
                 setenv("WINE_IOS_JIT_SIZE", String(format: "%lx", pool.size), 1)
+                // madeira-bcd split pool (pool-split = 1): the pool offsets between its two
+                // debugger regions, which ntdll never hands out (StikJITHelper.poolHole).
+                if let hole = StikJITHelper.poolHole {
+                    setenv("WINE_IOS_JIT_HOLE", String(format: "%lx:%lx", hole.off, hole.end), 1)
+                } else {
+                    unsetenv("WINE_IOS_JIT_HOLE")
+                }
+                // madeira-bcd pool-mid (pool-mid = 1): the second hole, when a free run
+                // between the split regions became a third region (StikJITHelper.poolHole2).
+                if let hole2 = StikJITHelper.poolHole2 {
+                    setenv("WINE_IOS_JIT_HOLE2", String(format: "%lx:%lx", hole2.off, hole2.end), 1)
+                } else {
+                    unsetenv("WINE_IOS_JIT_HOLE2")
+                }
+                // madeira-bcd pool-low (pool-low = 1): region C below the executable window,
+                // RW alias at the pool's distance; ntdll carves FEX's code buffers from it
+                // first (StikJITHelper.poolLow).
+                if let low = StikJITHelper.poolLow {
+                    setenv("WINE_IOS_JIT_TAIL_REGION", String(format: "%lx:%lx", low.rx, low.size), 1)
+                    logStore.log(String(format: "[pool-low] WINE_IOS_JIT_TAIL_REGION=%lx:%lx (%ldMB for FEX code buffers)",
+                                        low.rx, low.size, low.size >> 20), level: .success)
+                } else {
+                    unsetenv("WINE_IOS_JIT_TAIL_REGION")
+                }
             } else {
                 // ml596: ABORT. "Continuing without it" produced ml595 — a run that
                 // looked like an ARM64EC/optimizer regression but was only Wine
