@@ -21413,6 +21413,136 @@ void virtual_init(void)
 }
 
 
+/* madeira-bcd: 1 when the calling pseudo-process is a Chromium browser that
+ * judges memory pressure by GlobalMemoryStatusEx: SocialClubHelper.exe or
+ * steamwebhelper.exe (the last component of its PEB's image path, any case).
+ * Used by ios_avail_phys for avail-phys-cef-mb. */
+static int ios_avail_phys_chromium( void )
+{
+    static const char *const names[] = { "socialclubhelper.exe", "steamwebhelper.exe" };
+    PEB *peb = ios_jit_current_peb();
+    RTL_USER_PROCESS_PARAMETERS *pp = peb ? peb->ProcessParameters : NULL;
+    const WCHAR *path;
+    size_t len, base = 0, k, n;
+    unsigned i;
+
+    if (!pp || !(path = pp->ImagePathName.Buffer)) return 0;
+    len = pp->ImagePathName.Length / sizeof(WCHAR);
+    for (k = 0; k < len; k++) if (path[k] == '\\' || path[k] == '/') base = k + 1;
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+    {
+        n = strlen( names[i] );
+        if (len - base != n) continue;
+        for (k = 0; k < n; k++)
+        {
+            WCHAR c = path[base + k];
+            if (c >= 'A' && c <= 'Z') c += 32;
+            if (c != (WCHAR)names[i][k]) break;
+        }
+        if (k == n) return 1;
+    }
+    return 0;
+}
+
+
+/***********************************************************************
+ *           ios_avail_phys
+ *
+ * madeira-bcd: madeira.cfg or the game's own file `avail-phys = 1`, opt-in
+ * (owner's Red Dead Redemption 2 run of 2026-10-09 11:02). Wine's
+ * get_performance_info (system.c) reports the whole phone's free + inactive
+ * pages as SystemPerformanceInformation.AvailablePages, which is
+ * GlobalMemoryStatusEx's ullAvailPhys, while this app dies at its own memory
+ * limit (the total virtual_get_system_info reports, ml992). Windows programs
+ * saw gigabytes available until iOS killed the app at 8184 MB, so Chromium's
+ * memory pressure evaluator (SocialClubHelper.exe, steamwebhelper.exe), which
+ * purges caches and collects garbage below 1000 MB (moderate) and 400 MB
+ * (critical) available, never fired. With the switch the value is lowered to
+ * what remains before the limit (os_proc_available_memory) when that is
+ * smaller. Called by the patched get_performance_info
+ * (Wine's avail-phys change); off, host_free comes back unchanged.
+ *
+ * madeira-bcd: avail-phys-cef-mb = N (madeira.cfg or the game's own file, MB,
+ * 0 = off, independent of avail-phys) caps what Chromium browsers see -- Social
+ * Club's SocialClubHelper.exe and Steam's steamwebhelper.exe, nothing else (see
+ * ios_avail_phys_chromium) -- at N MB. The 467 run (2026-10-09 13:09) reached
+ * Chromium's moderate level only at 7.3 GB, a minute into play, long after the
+ * helper had grown: at RDR2.exe's start its V8 cage held 167 MB dirty, its
+ * PartitionAlloc 88 MB, and its ANGLE device two 32 MB staging blocks. Below
+ * 400 MB (e.g. 300) Chromium's Windows evaluator reports CRITICAL pressure on
+ * every 5 s check from the helper's start (full V8 GC, PartitionAlloc and
+ * discardable purges, Skia/tile caches dropped); 400-999 MB (e.g. 900)
+ * reports MODERATE every 10 s. The game and the launcher keep the real figure.
+ */
+unsigned long long ios_avail_phys( unsigned long long host_free )
+{
+    extern size_t os_proc_available_memory( void );
+    static int on = -1, band = -1, said;
+    static unsigned long long memsize;
+    unsigned long long left;
+    static int on = -1, band = -1, said, capped;
+    static unsigned long long memsize, cef;
+    unsigned long long left, value = host_free;
+    int now;
+
+    if (on < 0)
+    {
+        size_t len = sizeof(memsize);
+        long long mb;
+        if (sysctlbyname( "hw.memsize", &memsize, &len, NULL, 0 )) memsize = 0;
+        on = madeira_cfg_bool( "avail-phys", 0 );   /* madeira.cfg avail-phys = 1 */
+        if (on) dprintf( 2, "[avail-phys] on: available physical memory is what remains before this "
+                         "app's memory limit (madeira.cfg avail-phys = 1)\n" );
+        /* MB of available memory SocialClubHelper.exe / steamwebhelper.exe see at most (0 = off; 300 = Chromium's critical level). */
+        mb = madeira_cfg_int( "avail-phys-cef-mb", 0 );
+        cef = mb > 0 && mb <= 65536 ? (unsigned long long)mb << 20 : 0;
+        if (cef) dprintf( 2, "[avail-phys] Chromium browsers (SocialClubHelper.exe, steamwebhelper.exe) see at most "
+                          "%llu MB available: %s (madeira.cfg avail-phys-cef-mb = %lld)\n", cef >> 20,
+                          mb < 400 ? "Chromium's critical level, purges every 5 s" :
+                          mb < 1000 ? "Chromium's moderate level, purges every 10 s" : "no pressure level", mb );
+    }
+    if (on && (left = (unsigned long long)os_proc_available_memory()) &&
+        !(memsize && left > memsize))   /* rdr61: a "no limit" sentinel larger than the machine is not a measurement */
+    {
+        now = left < (400ull << 20) ? 2 : left < (1000ull << 20) ? 1 : 0;
+        if (now != band && said < 64)
+        {
+            said++;
+            dprintf( 2, "[avail-phys] %llu MB left before the limit (host free %llu MB): %s\n",
+                     left >> 20, host_free >> 20,
+                     now == 2 ? "below 400 MB, Chromium's critical level" :
+                     now == 1 ? "below 1000 MB, Chromium's moderate level" : "1000 MB or more" );
+        }
+        band = now;
+        if (left < host_free) value = left;
+    }
+    /* madeira-bcd: avail-phys-cef-mb, the Chromium browsers only (see above) */
+    if (cef && value > cef && ios_avail_phys_chromium())
+    {
+        if (capped++ < 4)
+            dprintf( 2, "[avail-phys] a Chromium browser asked: %llu MB reported instead of %llu MB "
+                     "(madeira.cfg avail-phys-cef-mb)\n", cef >> 20, value >> 20 );
+        value = cef;
+    }
+    if (!on) return host_free;
+    left = (unsigned long long)os_proc_available_memory();
+    /* rdr61: a "no limit" sentinel larger than the machine is not a measurement */
+    if (!left || (memsize && left > memsize)) return host_free;
+    now = left < (400ull << 20) ? 2 : left < (1000ull << 20) ? 1 : 0;
+    if (now != band && said < 64)
+    {
+        said++;
+        dprintf( 2, "[avail-phys] %llu MB left before the limit (host free %llu MB): %s\n",
+                 left >> 20, host_free >> 20,
+                 now == 2 ? "below 400 MB, Chromium's critical level" :
+                 now == 1 ? "below 1000 MB, Chromium's moderate level" : "1000 MB or more" );
+    }
+    band = now;
+    return left < host_free ? left : host_free;
+    return value;
+}
+
+
 /***********************************************************************
  *           get_system_affinity_mask
  */
