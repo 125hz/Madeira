@@ -4077,6 +4077,67 @@ static int ios_iat_sync_pick_mapping( uintptr_t rgn_start, uintptr_t rgn_end, vo
     return fallback >= 0 ? fallback : first;
 }
 
+/* image-patch-test:begin (tests/host/check-image-patch-trace.py) */
+/* Read-only diagnostics for short protect/write/restore sequences on DLL code.
+ * Capture the requested byte range, not NtProtect's rounded page. The existing
+ * owner-aware sync remains the authority; this does not repair a hook, change
+ * permissions, copy code, or redirect native calls to an x64 stub. */
+static void ios_trace_image_patch( void *requested, size_t length, unsigned int prot,
+                                   unsigned int status )
+{
+    static unsigned int emitted;
+    const char *enabled;
+    uintptr_t start = (uintptr_t)requested, pe, pool;
+    void *owner, *caller;
+    unsigned int serial, i, n;
+    unsigned char a[16], b[16];
+    char parent[33], copy[33];
+    mach_vm_size_t actual;
+    int idx, got_parent, got_copy, saved_errno = errno;
+    unsigned int read_bits = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                             PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    unsigned int exec_bits = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                             PAGE_EXECUTE_WRITECOPY;
+
+    enabled = getenv( "MADEIRA_IMAGE_PATCH_TRACE" );
+    if (!enabled || strcmp( enabled, "1" ) || status || !length || length > 16 ||
+        start > UINTPTR_MAX - length || !(prot & read_bits) || !(prot & exec_bits) || (prot & PAGE_GUARD) ||
+        __atomic_load_n( &emitted, __ATOMIC_RELAXED ) >= 64) goto out;
+    if (!NtCurrentTeb()) goto out;
+    caller = ios_jit_current_peb();
+    idx = ios_iat_sync_pick_mapping( start, start + length, caller );
+    if (idx < 0) goto out;
+    pe = (uintptr_t)ios_jit_mappings[idx].pe_base;
+    pool = (uintptr_t)ios_jit_mappings[idx].jit_base;
+    owner = ios_jit_mappings[idx].owner_peb;
+    if (start < pe || start - pe >= ios_jit_mappings[idx].size ||
+        ios_jit_mappings[idx].size - (start - pe) < length ||
+        !pool || pool > UINTPTR_MAX - (start - pe)) goto out;
+    n = length;
+    pool += start - pe;
+    if (pool > UINTPTR_MAX - n) goto out;
+    serial = __atomic_fetch_add( &emitted, 1, __ATOMIC_RELAXED );
+    if (serial >= 64) goto out;
+    actual = 0;
+    got_parent = mach_vm_read_overwrite( mach_task_self(), start, n,
+                                         (mach_vm_address_t)(uintptr_t)a, &actual ) == KERN_SUCCESS && actual == n;
+    actual = 0;
+    got_copy = mach_vm_read_overwrite( mach_task_self(), pool, n,
+                                       (mach_vm_address_t)(uintptr_t)b, &actual ) == KERN_SUCCESS && actual == n;
+    strcpy( parent, "unreadable" );
+    strcpy( copy, "unreadable" );
+    for (i = 0; got_parent && i < n; i++) snprintf( parent + 2 * i, 3, "%02x", a[i] );
+    for (i = 0; got_copy && i < n; i++) snprintf( copy + 2 * i, 3, "%02x", b[i] );
+    dprintf( 2, "[image-patch] #%u tid=%04x image=%p rva=%#lx len=%lu prot=%#x "
+                 "owner=%p caller=%p pe=%s pool=%s %s\n",
+             serial + 1, (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
+             (void *)pe, (unsigned long)(start - pe), (unsigned long)length, prot, owner, caller,
+             parent, copy, got_parent && got_copy ? (memcmp( a, b, n ) ? "DIFFERENT" : "MATCH") : "UNREADABLE" );
+out:
+    errno = saved_errno;
+}
+/* image-patch-test:end */
+
 /* Translate a PE address to JIT pool address. Returns original if not mapped.
  * Owner-aware: resolves against the calling thread's process. */
 void *ios_jit_translate_addr(void *addr)
@@ -24607,6 +24668,8 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
     DWORD old;
 
 #ifdef WINE_IOS
+    LPVOID ios_patch_requested = addr;
+    SIZE_T ios_patch_length = size;
     /* ml966: a protection change on a low guest allocation applies to the
      * backing. The whole span is bounds-checked, so a request that runs off
      * the end of the allocation is left alone rather than silently clipped. */
@@ -25232,6 +25295,10 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
 #endif
     }
     else *old_prot = PAGE_NOACCESS;
+    /* After the existing IAT sync, observe both copies without touching them. */
+#ifdef WINE_IOS
+    ios_trace_image_patch( ios_patch_requested, ios_patch_length, new_prot, status );
+#endif
     return status;
 }
 
