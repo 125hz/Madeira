@@ -11180,6 +11180,133 @@ static int ios_pool_ledger_holds( size_t off, size_t need, void *peb )
     return ok;
 }
 
+/* madeira-bcd: VIEW HISTORY. Ghost of Tsushima's workers faulted copying 2 MB
+ * out of 0x70eedd0040 -- a range with no Wine view by then, inside the native
+ * stack of a thread that had exited, freed while the copies ran. Who created
+ * and who removed the views there could not be read from any log. Every guest-
+ * band view of 1 MB or more is recorded here when it is created and when it is
+ * deleted (thread, time, why), and a fault on an address Wine does not own
+ * prints the records that covered it (ios_dump_fault_region). Passive. */
+/* A release site is captured at NtFreeVirtualMemory, before free_pages enters
+ * delete_view.  A native return address alone usually names an ARM64EC thunk,
+ * so also retain FEX's saved x64 context and return-address candidates from
+ * its stack.  Nothing is unwound or printed on the hot free path. */
+struct ios_vh_site
+{
+    void *native_return;
+    uint64_t state_rip, ctx_rip, ctx_rsp, image_base;
+    uint64_t image_returns[8];
+    unsigned int nr_returns, valid;
+    char *base;
+};
+struct ios_vh_rec
+{
+    char *base;
+    size_t size;
+    unsigned int protect, tid, ms;
+    char kind;
+    const char *why;
+    struct ios_vh_site site;
+};
+#define IOS_VH_N 4096
+static struct ios_vh_rec ios_vh_ring[IOS_VH_N];
+static unsigned long ios_vh_pos;
+static __thread const char *ios_vh_why;
+static __thread struct ios_vh_site ios_vh_free_site;
+static unsigned int ios_vh_ms( void )
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (unsigned int)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+static void ios_vh_capture_free_site( const struct file_view *view, void *native_return )
+{
+    TEB *teb = NtCurrentTeb();
+    struct ios_vh_site *site = &ios_vh_free_site;
+    void *area;
+    uintptr_t rsp, low, high, image_lo = 0, image_hi = 0;
+    unsigned int i;
+
+    site->valid = 0;
+    if (view->size < (1u << 20) || (uintptr_t)view->base < 0x7000000000ULL ||
+        (uintptr_t)view->base >= 0x7c00000000ULL || !teb) return;
+    site->base = view->base;
+    site->native_return = native_return;
+    site->state_rip = ios_guest_rip_now();
+    site->ctx_rip = ios_guest_ctx_rip();
+    site->ctx_rsp = site->image_base = 0;
+    site->nr_returns = 0;
+    area = teb->ChpeV2CpuAreaInfo;
+    if (area) site->ctx_rsp = *(uint64_t *)((char *)area + 0x50 + 0x98);
+
+    /* Bound the scan to this thread's stack and 128 slots from saved RSP.
+     * These are candidates, not a real unwind; saved EC context can be stale. */
+    rsp = (uintptr_t)site->ctx_rsp;
+    low = (uintptr_t)teb->Tib.StackLimit;
+    high = (uintptr_t)teb->Tib.StackBase;
+    if (teb->Peb && teb->Peb->ImageBaseAddress)
+    {
+        struct file_view *image = find_view( teb->Peb->ImageBaseAddress, 0 );
+        if (image && (image->protect & SEC_IMAGE))
+        {
+            image_lo = (uintptr_t)image->base;
+            image_hi = image_lo + image->size;
+            site->image_base = image_lo;
+        }
+    }
+    if (image_lo && rsp >= low && rsp < high && !(rsp & 7))
+    {
+        for (i = 0; i < 128 && high - rsp >= (i + 1) * sizeof(uint64_t) &&
+                    site->nr_returns < ARRAY_SIZE(site->image_returns); i++)
+        {
+            uint64_t candidate = ((const uint64_t *)rsp)[i];
+            if (candidate >= image_lo && candidate < image_hi)
+                site->image_returns[site->nr_returns++] = candidate;
+        }
+    }
+    site->valid = 1;
+}
+static void ios_vh_note( char kind, const struct file_view *view )
+{
+    struct ios_vh_rec *r;
+    if (view->size < (1u << 20) || (uintptr_t)view->base < 0x7000000000ULL || (uintptr_t)view->base >= 0x7c00000000ULL) return;
+    r = &ios_vh_ring[__atomic_fetch_add( &ios_vh_pos, 1, __ATOMIC_RELAXED ) % IOS_VH_N];
+    r->base = view->base; r->size = view->size; r->protect = view->protect; r->kind = kind;
+    r->tid = NtCurrentTeb() ? (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0;
+    r->ms = ios_vh_ms();
+    r->why = ios_vh_why;
+    r->site = kind == 'd' && ios_vh_free_site.valid &&
+              ios_vh_free_site.base == view->base ? ios_vh_free_site : (struct ios_vh_site){0};
+}
+static void ios_vh_dump( const void *addr )
+{
+    unsigned long end = __atomic_load_n( &ios_vh_pos, __ATOMIC_RELAXED ), i, n = 0;
+    unsigned int now = ios_vh_ms();
+    for (i = end; i-- > 0 && end - i <= IOS_VH_N && n < 12; )
+    {
+        const struct ios_vh_rec *r = &ios_vh_ring[i % IOS_VH_N];
+        if ((const char *)addr < r->base || (const char *)addr >= r->base + r->size) continue;
+        dprintf( 2, "[fault-rgn]   history: view %p+0x%lx protect=0x%x %s by tid %04x %u ms ago%s%s\n",
+                 r->base, (unsigned long)r->size, r->protect, r->kind == 'c' ? "CREATED" : "DELETED",
+                 r->tid, now - r->ms, r->why ? " -- " : "", r->why ? r->why : "" );
+        if (r->site.valid)
+        {
+            unsigned int j;
+            dprintf( 2, "[free-origin] view=%p native-return=%p state-rip=%#llx ec-ctx-rip=%#llx "
+                     "ec-ctx-rsp=%#llx main-image=%#llx candidates=%u (stack scan, not unwind)\n",
+                     r->base, r->site.native_return, (unsigned long long)r->site.state_rip,
+                     (unsigned long long)r->site.ctx_rip, (unsigned long long)r->site.ctx_rsp,
+                     (unsigned long long)r->site.image_base, r->site.nr_returns );
+            for (j = 0; j < r->site.nr_returns; j++)
+                dprintf( 2, "[free-origin]   candidate[%u]=%#llx exe+rva=%#llx\n", j,
+                         (unsigned long long)r->site.image_returns[j],
+                         (unsigned long long)(r->site.image_returns[j] - r->site.image_base) );
+        }
+        n++;
+    }
+    if (!n) dprintf( 2, "[fault-rgn]   history: no view of 1 MB+ covered this address in the last %u records\n", IOS_VH_N );
+}
+
 
 /***********************************************************************
  *           delete_view
@@ -11188,6 +11315,7 @@ static int ios_pool_ledger_holds( size_t off, size_t need, void *peb )
  */
 static void delete_view( struct file_view *view ) /* [in] View */
 {
+    ios_vh_note( 'd', view );   /* madeira-bcd: view history */
     /* ml989: entered BEFORE any field of `view` is read, so "call never
      * entered" is distinguishable from "died reading the view". */
     if (ios_retire_trace_armed) ios_retire_mark( "D0>\n" );
@@ -11268,6 +11396,7 @@ static NTSTATUS create_view( struct file_view **view_ret, void *base, size_t siz
 
     register_view( view );
     kernel_writewatch_register_range( view, view->base, view->size );
+    ios_vh_note( 'c', view );   /* madeira-bcd: view history */
 
     *view_ret = view;
     return STATUS_SUCCESS;
@@ -19218,6 +19347,68 @@ NTSTATUS virtual_alloc_teb( TEB **ret_teb )
 /***********************************************************************
  *           virtual_free_teb
  */
+/* madeira-bcd: STACK QUARANTINE. An exited thread's native stack is decommitted
+ * but stays reserved for the next IOS_STACKQ_N thread stack frees before its
+ * address range is released. Ghost of Tsushima's worker threads faulted
+ * copying from a range that had been that stack and then held a fresh 2 MB
+ * allocation, removed while the copies ran; if something still acts on a dead
+ * thread's stack, it now meets the reservation instead of whatever the
+ * program allocated there next, and the release below says so. */
+#define IOS_STACKQ_N 8
+static struct { void *base; size_t size; } ios_stackq[IOS_STACKQ_N];
+static unsigned int ios_stackq_pos;
+static void ios_stack_release( void *base )
+{
+    struct file_view *view;
+    sigset_t sigset;
+    size_t vsize = 0, oldsize = 0;
+    void *old = NULL;
+    SIZE_T size;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    view = find_view( base, 0 );
+    if (view && view->base == base)
+    {
+        vsize = view->size;
+        old = ios_stackq[ios_stackq_pos].base; oldsize = ios_stackq[ios_stackq_pos].size;
+        ios_stackq[ios_stackq_pos].base = base; ios_stackq[ios_stackq_pos].size = vsize;
+        ios_stackq_pos = (ios_stackq_pos + 1) % IOS_STACKQ_N;
+    }
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+
+    if (!vsize)
+    {
+        static int said;
+        if (said++ < 16)
+            dprintf( 2, "[stack-quarantine] %p is not the base of a view any more; released directly\n", base );
+        size = 0;
+        NtFreeVirtualMemory( GetCurrentProcess(), &base, &size, MEM_RELEASE );
+        return;
+    }
+    size = vsize;
+    NtFreeVirtualMemory( GetCurrentProcess(), &base, &size, MEM_DECOMMIT );
+    if (old)
+    {
+        int ok;
+        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+        view = find_view( old, 0 );
+        ok = view && view->base == old && view->size == oldsize;
+        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+        if (ok)
+        {
+            size = 0;
+            NtFreeVirtualMemory( GetCurrentProcess(), &old, &size, MEM_RELEASE );
+        }
+        else
+        {
+            static int said;
+            if (said++ < 32)
+                dprintf( 2, "[stack-quarantine] dead thread stack %p+0x%lx was FREED OR REPLACED by someone else while quarantined -- not released again\n",
+                         old, (unsigned long)oldsize );
+        }
+    }
+}
+
 void virtual_free_teb( TEB *teb )
 {
     struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
@@ -19226,11 +19417,8 @@ void virtual_free_teb( TEB *teb )
     sigset_t sigset;
     WOW_TEB *wow_teb = get_wow_teb( teb );
 
-    if (teb->DeallocationStack)
-    {
-        size = 0;
-        NtFreeVirtualMemory( GetCurrentProcess(), &teb->DeallocationStack, &size, MEM_RELEASE );
-    }
+    ios_vh_why = "TEB free (thread stacks)";   /* madeira-bcd: view history */
+    if (teb->DeallocationStack) ios_stack_release( teb->DeallocationStack );   /* madeira-bcd: quarantined */
 #ifdef __aarch64__
     if (teb->ChpeV2CpuAreaInfo)
     {
@@ -19254,6 +19442,7 @@ void virtual_free_teb( TEB *teb )
 #endif
         NtFreeVirtualMemory( GetCurrentProcess(), &ptr, &size, MEM_RELEASE );
     }
+    ios_vh_why = NULL;
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
     signal_free_thread( teb );
@@ -20105,7 +20294,10 @@ void ios_dump_fault_region( void *addr )
                  (unsigned long)((char *)addr - (char *)view->base),
                  (char *)view->base + view->size );
     else
+    {
         dprintf( 2, "[fault-rgn]   NO wine view — Wine doesn't own this addr (FEX/foreign mmap)\n" );
+        ios_vh_dump( addr );   /* madeira-bcd */
+    }
     mutex_unlock( &virtual_mutex );
 }
 
@@ -24141,7 +24333,10 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
         break;
     case MEM_RELEASE:
         if (!size) size = view->size;
+        if (base == view->base && size == view->size)
+            ios_vh_capture_free_site( view, __builtin_return_address(0) );
         status = free_pages( view, base, size );
+        ios_vh_free_site.valid = 0;
         break;
     case MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER:
         status = free_pages_preserve_placeholder( view, base, size );
