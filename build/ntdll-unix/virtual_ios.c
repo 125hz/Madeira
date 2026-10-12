@@ -144,12 +144,15 @@ WINE_DECLARE_DEBUG_CHANNEL(virtual_ranges);
  * the 65th image (Thumper under desktop, 2026-07-06): concrt140 copied but
  * never registered → raw-VA DllMain call → unfixable exec-fault loop. */
 #define IOS_JIT_MAX_MAPPINGS 512
+#define IOS_JIT_MAX_CODE_RANGES 96
 struct ios_jit_mapping {
     void *pe_base;      /* Original PE image base address (unix mapping) */
     void *jit_base;     /* JIT pool RX address */
     size_t size;        /* Size of the mapping */
     size_t text_offset; /* Offset of .text section within image */
     size_t text_size;   /* Size of .text section (0 if unknown) */
+    unsigned code_range_count;
+    struct { size_t offset, size; } code_ranges[IOS_JIT_MAX_CODE_RANGES];
     uint64_t pe_image_base; /* PE optional header ImageBase */
     intptr_t reloc_delta;   /* JIT dest - PE ImageBase */
     unsigned int reloc_rva; /* RVA of .reloc section */
@@ -3021,6 +3024,7 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
         ios_jit_mappings[slot].size = size;
         ios_jit_mappings[slot].text_offset = 0;
         ios_jit_mappings[slot].text_size = 0;
+        ios_jit_mappings[slot].code_range_count = 0;
         ios_jit_mappings[slot].pe_image_base = 0;
         ios_jit_mappings[slot].reloc_delta = 0;
         ios_jit_mappings[slot].reloc_rva = 0;
@@ -3167,6 +3171,25 @@ static void *ios_pe_find_export( const unsigned char *base, const char *want )
     return NULL;
 }
 
+/* Versioned DATA from the rebuilt module. Offsets are compiler-produced;
+ * neither a guessed CpuStateFrame tail nor an EC function call is safe. */
+static unsigned ios_fex_branch_history_offset_unix;
+
+static unsigned ios_fex_branch_layout_offset( const uint64_t layout[3] )
+{
+    unsigned offset = (uint32_t)layout[1], frame_size = layout[1] >> 32;
+    if (layout[0] != UINT64_C(0x314744454742444d) ||
+        (uint32_t)layout[2] != 272 || layout[2] >> 32 != 8 ||
+        offset < 0x5c0 || (offset & 7) || frame_size > 32760 ||
+        frame_size < 272 || offset > frame_size - 272) return 0;
+    return offset;
+}
+
+unsigned ios_fex_branch_history_offset( void )
+{
+    return __atomic_load_n( &ios_fex_branch_history_offset_unix, __ATOMIC_ACQUIRE );
+}
+
 /* iOS-Madeira ml613: resolve BOTH FEX exports by walking the already-mapped
  * emulator module. Called at the END of unixcall_ios_push_jit_aliases — the
  * guaranteed initialization path — and RETRYABLE until it succeeds.
@@ -3203,6 +3226,25 @@ void ios_resolve_fex_exports( void )
 
         rip_cb = ios_pe_find_export( ios_jit_mappings[i].pe_base, "BTCpu64IosRipFromHostPC" );
         rel_cb = ios_pe_find_export( ios_jit_mappings[i].pe_base, "BTCpu64IosReleaseThreadHolds" );
+
+        {
+            const void *data = ios_pe_find_export( ios_jit_mappings[i].pe_base, "IosGuestBranchTraceLayout" );
+            uintptr_t base = (uintptr_t)ios_jit_mappings[i].pe_base, address = (uintptr_t)data;
+            size_t image_size = ios_jit_mappings[i].size;
+            uint64_t layout[3] = {0};
+            mach_vm_size_t got = 0;
+            unsigned offset;
+            if (data && image_size >= sizeof(layout) && address >= base &&
+                address - base <= image_size - sizeof(layout) &&
+                mach_vm_read_overwrite( mach_task_self(), address, sizeof(layout),
+                    (mach_vm_address_t)layout, &got ) == KERN_SUCCESS && got == sizeof(layout) &&
+                (offset = ios_fex_branch_layout_offset( layout )))
+            {
+                __atomic_store_n( &ios_fex_branch_history_offset_unix, offset, __ATOMIC_RELEASE );
+                dprintf( 2, "[fex-edges] DATA layout v1 frame-offset=%u frame-size=%u history=272 capacity=8\n",
+                         offset, (unsigned)(layout[1] >> 32) );
+            }
+        }
 
         /* Record the addresses for diagnostics. */
         if (rip_cb) ios_fex_rip_from_hostpc_cb = (void *)rip_cb;
@@ -3845,6 +3887,20 @@ void ios_jit_set_text_section(void *pe_base, size_t text_offset, size_t text_siz
     {
         if (ios_jit_mappings[i].pe_base == pe_base)
         {
+            unsigned r, count = __atomic_load_n( &ios_jit_mappings[i].code_range_count, __ATOMIC_RELAXED );
+            if (text_offset <= ios_jit_mappings[i].size && text_size &&
+                text_size <= ios_jit_mappings[i].size - text_offset)
+            {
+                for (r = 0; r < count && r < IOS_JIT_MAX_CODE_RANGES; r++)
+                    if (ios_jit_mappings[i].code_ranges[r].offset == text_offset &&
+                        ios_jit_mappings[i].code_ranges[r].size == text_size) break;
+                if (r == count && count < IOS_JIT_MAX_CODE_RANGES)
+                {
+                    ios_jit_mappings[i].code_ranges[count].offset = text_offset;
+                    ios_jit_mappings[i].code_ranges[count].size = text_size;
+                    __atomic_store_n( &ios_jit_mappings[i].code_range_count, count + 1, __ATOMIC_RELEASE );
+                }
+            }
             /* Keep the LARGEST executable section. ARM64EC PEs have both
              * .text (large, ARM64 native) and .hexpthk (small, x86_64
              * fast-forward thunks). The x18 patcher needs to walk .text. */
@@ -3856,6 +3912,27 @@ void ios_jit_set_text_section(void *pe_base, size_t text_offset, size_t text_siz
             return;
         }
     }
+}
+
+/* Pointer classification needs every executable section. The largest-section
+ * fields above remain the native x18 patcher's input. No PE-header walk on
+ * each IAT slot; ranges are collected by the existing mapping section walk. */
+static int ios_jit_code_bounds( const struct ios_jit_mapping *m, size_t off,
+                                size_t *low, size_t *high )
+{
+    unsigned r, count = __atomic_load_n( &m->code_range_count, __ATOMIC_ACQUIRE );
+    if (count > IOS_JIT_MAX_CODE_RANGES) return 0;
+    for (r = 0; r <= count; r++)
+    {
+        size_t start = r < count ? m->code_ranges[r].offset : m->text_offset;
+        size_t size = r < count ? m->code_ranges[r].size : m->text_size;
+        if (start > m->size || !size || size > m->size - start ||
+            off < start || off - start >= size) continue;
+        *low = start;
+        *high = start + size;
+        return 1;
+    }
+    return 0;
 }
 
 /* Check if a JIT pool address is within a .text (executable code) section */
@@ -4350,14 +4427,42 @@ static int ios_va_is_x86_code( uint64_t va )
 
         if (!b || sz < 0x40 || va < b || va >= b + sz) continue;
 
-        t_off = ios_jit_mappings[i].text_offset;
-        t_sz  = ios_jit_mappings[i].text_size;
         off   = va - b;
-        if (!t_sz || off < t_off || off >= t_off + t_sz) return 0;   /* data, not code */
+        if (!ios_jit_code_bounds( &ios_jit_mappings[i], off, &t_off, &t_sz )) return 0;
 
         /* Unreadable header → 0 → non-x86: translation stays on, which is the
          * correct behavior for EC/data and harmless for a dead copy. */
         return ios_jit_mapping_machine( i ) == 0x8664;  /* IMAGE_FILE_MACHINE_AMD64 */
+    }
+    return 0;
+}
+
+/* Bound a fatal-instruction snapshot to the registered x64 text section.
+ * This only supplies addresses; the caller must read through Mach safely. */
+int ios_jit_guest_code_window( uint64_t rip, uint64_t *image, uint64_t *start, size_t *length )
+{
+    int i;
+
+    if (!ios_va_is_x86_code( rip )) return 0;
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uint64_t b = (uint64_t)(uintptr_t)ios_jit_mappings[i].pe_base;
+        size_t sz = ios_jit_mappings[i].size;
+        size_t off, end;
+        uint64_t low, high, before, after;
+
+        if (!b || ios_jit_mappings[i].unmapped || b > UINT64_MAX - sz ||
+            rip < b || rip - b >= sz ||
+            !ios_jit_code_bounds( &ios_jit_mappings[i], rip - b, &off, &end )) continue;
+        low = b + off;
+        high = b + end;
+        if (rip < low || rip >= high) continue;
+        before = rip - low < 16 ? rip - low : 16;
+        after = high - rip < 32 ? high - rip : 32;
+        *image = b;
+        *start = rip - before;
+        *length = before + after;
+        return 1;
     }
     return 0;
 }
@@ -14418,6 +14523,8 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
         ios_jit_mappings[slot].size = m->size;
         ios_jit_mappings[slot].text_offset = m->text_offset;
         ios_jit_mappings[slot].text_size = m->text_size;
+        ios_jit_mappings[slot].code_range_count = m->code_range_count;
+        memcpy( ios_jit_mappings[slot].code_ranges, m->code_ranges, sizeof m->code_ranges );
         ios_jit_mappings[slot].pe_image_base = pe_image_base;
         ios_jit_mappings[slot].reloc_delta = child_delta;
         ios_jit_mappings[slot].reloc_rva = m->reloc_rva;

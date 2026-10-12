@@ -101,6 +101,7 @@ static kern_return_t mach_vm_read_overwrite(int task, mach_vm_address_t a, mach_
 }
 #define IOS_JIT_MAX_MAPPINGS 8
 '''
+code += re.search(r'^#define IOS_JIT_MAX_CODE_RANGES .*$', native, re.MULTILINE).group(0) + '\n'
 code += struct(native, 'ios_jit_mapping')
 code += r'''
 static struct ios_jit_mapping ios_jit_mappings[IOS_JIT_MAX_MAPPINGS];
