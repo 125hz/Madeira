@@ -547,6 +547,181 @@ static void *ios_stale_va_scanner( void *arg )
 
 /* Per-thread trampoline for signal handlers (runs on faulting thread) */
 static __thread void *ios_my_trampoline = NULL;
+
+/***********************************************************************
+ *           write watch  (ml1201)
+ *
+ * MADEIRA_WATCH_WRITES=<hex address>[:<hex length>] names a guest range
+ * whose writers must be caught. Log 58 (upstream-1011-4) showed a
+ * bytecode-VM pointer slot in the main image's .rdata (zero on disk) that
+ * held a table address plus one at the time of the crash; .rdata is
+ * mapped write-copy, so the write was an ordinary host store and nothing
+ * saw it. The watch strips PROT_WRITE from the host page that holds the
+ * range whenever Wine grants it (mprotect_range in virtual_ios.c, plus a
+ * sweep from the pump), and the Mach handler then emulates every store to
+ * that page through the usual store emulator, reporting the ones that
+ * touch the range: host pc and instruction, the value, the guest RIP and
+ * its x86 bytes, the EC registers, and the bytes in the range afterwards.
+ * A store the emulator cannot decode disarms the watch (the page is left
+ * writable) rather than stopping the program. Diagnostic only; unset = off.
+ */
+enum { IOS_WATCH_PAGE = 0x4000 };
+static uintptr_t ios_watch_lo, ios_watch_hi, ios_watch_page;
+static int ios_watch_state;            /* 0 unconfigured, 1 active, -1 off, -2 disarmed */
+static unsigned long ios_watch_hits, ios_watch_other;
+
+static void ios_watch_init( void )
+{
+    const char *e;
+    char *end;
+    uintptr_t a, len = 8;
+
+    if (ios_watch_state) return;
+    e = getenv( "MADEIRA_WATCH_WRITES" );
+    if (!e || !*e) { ios_watch_state = -1; return; }
+    a = (uintptr_t)strtoull( e, &end, 16 );
+    if (*end == ':' || *end == ',') len = (uintptr_t)strtoull( end + 1, NULL, 16 );
+    if (!a || !len) { ios_watch_state = -1; return; }
+    ios_watch_lo = a;
+    ios_watch_hi = a + len;
+    ios_watch_page = a & ~(uintptr_t)(IOS_WATCH_PAGE - 1);
+    ios_watch_state = 1;
+    dprintf( 2, "[watch] ml1201 writes to [%p,%p) are watched through host page %p\n",
+             (void *)ios_watch_lo, (void *)ios_watch_hi, (void *)ios_watch_page );
+}
+
+static int ios_watch_covers( uintptr_t addr )
+{
+    ios_watch_init();
+    return ios_watch_state == 1 && (addr & ~(uintptr_t)(IOS_WATCH_PAGE - 1)) == ios_watch_page;
+}
+
+/* Called after Wine changes host protections (virtual_ios.c mprotect_range) and from the
+ * pump sweep: while the watch is active the host page must not be writable. */
+void ios_watch_after_protect( const void *base, size_t size, const char *why )
+{
+    mach_vm_address_t ra;
+    mach_vm_size_t rs = 0;
+    vm_region_basic_info_data_64_t ri;
+    mach_msg_type_number_t rc = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t ro = MACH_PORT_NULL;
+    int prot;
+
+    ios_watch_init();
+    if (ios_watch_state != 1) return;
+    if ((uintptr_t)base >= ios_watch_page + IOS_WATCH_PAGE || (uintptr_t)base + size <= ios_watch_page) return;
+    ra = ios_watch_page;
+    if (mach_vm_region( mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                        (vm_region_info_t)&ri, &rc, &ro ) != KERN_SUCCESS || ra > ios_watch_page)
+        return;                                   /* not mapped yet */
+    if (!(ri.protection & VM_PROT_WRITE)) return;
+    prot = (ri.protection & VM_PROT_READ ? PROT_READ : 0) | (ri.protection & VM_PROT_EXECUTE ? PROT_EXEC : 0);
+    if (mprotect( (void *)ios_watch_page, IOS_WATCH_PAGE, prot ) == 0)
+    {
+        static unsigned long armed;
+        if (++armed <= 16 || !(armed & 1023))
+            dprintf( 2, "[watch] ml1201 armed #%lu (%s): host page %p write stripped (was %d)\n",
+                     armed, why, (void *)ios_watch_page, ri.protection );
+    }
+    else
+        dprintf( 2, "[watch] ml1201 mprotect(%p) failed errno=%d (%s); the watch has a hole\n",
+                 (void *)ios_watch_page, errno, why );
+}
+
+/* A store to the watched page was emulated (or could not be): report it. */
+static void ios_watch_report( const arm_thread_state64_t *st, uint64_t pc, uint32_t insn, uintptr_t addr,
+                              int emulated, int watch_prot )
+{
+    static const char * const ec_name[32] = {
+        "rcx","rdx","r8 ","r9 ","r10","r11","tmp","tmp","rax","PF ",
+        "T1 ","T2 ","T3 ","T4 ","tmp","tmp","tmp","crs","x18","r12",
+        "r13","r14","r15","rsp","AF ","rsi","rdi","rbx","ST ","rbp","lr ","sp " };
+    const int touches = addr < ios_watch_hi && addr + 32 > ios_watch_lo;
+    const unsigned rt = insn & 31, rt2 = (insn >> 10) & 31;
+    const int pair = (insn & 0x3A000000u) == 0x28000000u;
+
+    if (!emulated)
+    {
+        ios_watch_state = -2;
+        dprintf( 2, "[watch] ml1201 DISARMED: store %08x at pc=%p to %p is not in the emulator; "
+                 "the page stays writable from here on (hits so far: %lu in range, %lu elsewhere)\n",
+                 insn, (void *)pc, (void *)addr, ios_watch_hits, ios_watch_other );
+        return;
+    }
+    if (!touches)
+    {
+        if (!(++ios_watch_other & 4095))
+            dprintf( 2, "[watch] ml1201 %lu stores to the page outside the range so far (latest pc=%p insn=%08x addr=%p)\n",
+                     ios_watch_other, (void *)pc, insn, (void *)addr );
+        return;
+    }
+    if (++ios_watch_hits > 24)
+    {
+        if (!(ios_watch_hits & 1023))
+            dprintf( 2, "[watch] ml1201 %lu stores in range so far (latest pc=%p insn=%08x addr=%p x%u=%llx)\n",
+                     ios_watch_hits, (void *)pc, insn, (void *)addr, rt, (unsigned long long)st->__x[rt & 31] );
+        return;
+    }
+    {
+        unsigned char now[16];
+        mach_vm_size_t got = 0;
+        char hex[16 * 3 + 1] = "?";
+        int b;
+        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)ios_watch_lo, sizeof(now),
+                                    (mach_vm_address_t)now, &got ) == KERN_SUCCESS && got == sizeof(now))
+            for (b = 0; b < 16; b++) snprintf( hex + b * 3, 4, "%02x ", now[b] );
+        dprintf( 2, "[watch] ml1201 HIT #%lu pc=%p insn=%08x addr=%p (range%+lld) x%u=%016llx%s%s%016llx"
+                 " | wine prot %d | [range] now: %s\n",
+                 ios_watch_hits, (void *)pc, insn, (void *)addr, (long long)(addr - ios_watch_lo),
+                 rt, (unsigned long long)(rt == 31 ? 0 : st->__x[rt]),
+                 pair ? " x" : "", pair ? "" : "", (unsigned long long)(pair && rt2 != 31 ? st->__x[rt2] : 0),
+                 watch_prot, hex );
+    }
+    {   /* guest RIP and its x86 bytes, when the store came from emitted code */
+        extern void *ios_jit_rx_base_global;
+        extern size_t ios_jit_pool_size_global;
+        extern uint64_t ios_native_rip_from_hostpc( uint64_t, uint64_t, const char ** );
+        uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+        if (rx && pc >= rx && pc < rx + ios_jit_pool_size_global && st->__x[28])
+        {
+            uint64_t bb = 0, xrip = 0;
+            const char *why = "";
+            mach_vm_size_t g = 0;
+            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)st->__x[28], 8,
+                                        (mach_vm_address_t)&bb, &g ) == KERN_SUCCESS && g == 8 && bb)
+                xrip = ios_native_rip_from_hostpc( bb, pc, &why );
+            if (xrip)
+            {
+                unsigned char xb[48];
+                char hx[48 * 3 + 1] = "?";
+                int b;
+                g = 0;
+                if (xrip >= 16 &&
+                    mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(xrip - 16), sizeof(xb),
+                                            (mach_vm_address_t)xb, &g ) == KERN_SUCCESS && g == sizeof(xb))
+                    for (b = 0; b < 48; b++) snprintf( hx + b * 3, 4, "%02x ", xb[b] );
+                dprintf( 2, "[watch] ml1201   guest rip=%p block=%p x86[rip-16..rip+31]: %s\n",
+                         (void *)xrip, (void *)bb, hx );
+            }
+            else
+                dprintf( 2, "[watch] ml1201   guest rip unresolved (block=%p): %s\n", (void *)bb, why );
+        }
+        else
+            dprintf( 2, "[watch] ml1201   pc outside the JIT pool (native code) lr=%p\n", (void *)st->__lr );
+    }
+    {
+        int i;
+        for (i = 0; i < 28; i += 7)
+            dprintf( 2, "[watch] ml1201   x%-2d(%s)=%llx x%-2d(%s)=%llx x%-2d(%s)=%llx x%-2d(%s)=%llx x%-2d(%s)=%llx x%-2d(%s)=%llx x%-2d(%s)=%llx\n",
+                     i, ec_name[i], (unsigned long long)st->__x[i], i+1, ec_name[i+1], (unsigned long long)st->__x[i+1],
+                     i+2, ec_name[i+2], (unsigned long long)st->__x[i+2], i+3, ec_name[i+3], (unsigned long long)st->__x[i+3],
+                     i+4, ec_name[i+4], (unsigned long long)st->__x[i+4], i+5, ec_name[i+5], (unsigned long long)st->__x[i+5],
+                     i+6, ec_name[i+6], (unsigned long long)st->__x[i+6] );
+        dprintf( 2, "[watch] ml1201   x28(ST )=%llx fp=%llx lr=%llx sp=%llx\n",
+                 (unsigned long long)st->__x[28], (unsigned long long)st->__fp,
+                 (unsigned long long)st->__lr, (unsigned long long)st->__sp );
+    }
+}
 static __thread int ios_my_slot = -1;
 
 /* Thread registry: maps Mach thread port → TEB + trampoline.
@@ -1030,6 +1205,7 @@ void ios_pump_sample(void)
         ios_orphan_check( stamps, ns );
     }
     ios_lock_census();
+    ios_watch_after_protect( (const void *)ios_watch_page, IOS_WATCH_PAGE, "sweep" );   /* ml1201 */
     if (samples >= 120) return;
     /* discover beacon TEBs (ml399: server thread and pump can differ) */
     if (nbeacons < IOS_PUMP_MAX)
@@ -3294,12 +3470,29 @@ static void *ios_mach_exception_thread( void *arg )
                  * routed the same way -- its alias is at the pool's distance. in_low
                  * keeps the bounds checks below to C's own extent. */
                 int in_low = rx && rw && sz && ios_jit_low_contains( (uintptr_t)fault_addr );
+                int watch_hit = 0, watch_prot = 0;   /* ml1201 */
                 int in_jit = (rx && rw && sz &&
                               fault_addr >= rx && fault_addr < rx + sz) || in_low;
                 if (in_jit) {
                     rw_addr = rw + (fault_addr - rx);
                 } else {
                     rw_addr = ios_jit_anon_alias_lookup(fault_addr);
+                }
+                /* ml1201: a store to the watched page has no alias; make the page writable for
+                 * the emulator below and strip the write again once the store has landed. */
+                if (!rw_addr && ios_watch_covers( fault_addr ))
+                {
+                    extern int ios_page_expected_prot( const void *addr );
+                    watch_prot = ios_page_expected_prot( (const void *)fault_addr );
+                    if (watch_prot < 0) watch_prot = PROT_READ | PROT_WRITE;
+                    if (mprotect( (void *)ios_watch_page, IOS_WATCH_PAGE, watch_prot | PROT_READ | PROT_WRITE ) == 0)
+                    {
+                        rw_addr = fault_addr;
+                        watch_hit = 1;
+                    }
+                    else
+                        dprintf( STDERR_FILENO, "[watch] ml1201 cannot unprotect %p for the store at pc=%p errno=%d\n",
+                                 (void *)ios_watch_page, (void *)(uintptr_t)fault_pc, errno );
                 }
                 /* ml348 DISCRIMINATOR: a write fault with NO alias is a
                  * different bug from a write fault whose instruction we can't
@@ -4128,6 +4321,11 @@ static void *ios_mach_exception_thread( void *arg )
                      * the next gap is a one-line diagnosis. Capped. */
                     if (!emulated)
                     {
+                        if (watch_hit)
+                        {   /* ml1201: leave the page writable, re-execute the store natively */
+                            ios_watch_report( &state, (uint64_t)fault_pc, insn, fault_addr, 0, watch_prot );
+                            handled = 1;
+                        }
                         static int undecoded_n;
                         if (undecoded_n < 8)
                             dprintf(STDERR_FILENO,
@@ -4138,6 +4336,12 @@ static void *ios_mach_exception_thread( void *arg )
                     }
                     if (emulated)
                     {
+                        if (watch_hit)
+                        {   /* ml1201: the store landed; report it and re-arm the page */
+                            ios_watch_report( &state, (uint64_t)fault_pc, insn, fault_addr, 1, watch_prot );
+                            if (ios_watch_state == 1)
+                                mprotect( (void *)ios_watch_page, IOS_WATCH_PAGE, (watch_prot | PROT_READ) & ~PROT_WRITE );
+                        }
                         /* ml635: record that this alias page was written. FEX's cached
                          * translation is NOT invalidated here (the ARM64EC path would call
                          * HandleRWXAccessViolation); this counter is what proves whether a
@@ -4193,7 +4397,7 @@ static void *ios_mach_exception_thread( void *arg )
                                 extern int ios_wx_enabled( void );
                                 int wi, victim = -1;
 
-                                if (ios_wx_enabled())
+                                if (ios_wx_enabled() && !watch_hit)   /* ml1201: a watched page keeps its trap */
                                 {
                                     for (wi = 0; wi < WX_SLOTS; wi++)
                                     {
