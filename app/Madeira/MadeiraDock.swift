@@ -453,8 +453,11 @@ enum MadeiraDock {
     /// installs in the same session, then the host. No token is quoted: MADEIRA_ARGS is
     /// split at spaces and passed on as is, so quote characters would reach Wine
     /// literally, and none of these paths contains a space.
-    static func launchArguments(width: Int, height: Int, installers: String? = nil) -> String {
+    /// madeira-bcd: `host` false runs only the installers; the session ends after them
+    /// (DockInstallers.installsOnly).
+    static func launchArguments(width: Int, height: Int, installers: String? = nil, host: Bool = true) -> String {
         guard let installers else { return "/desktop=madeira,\(width)x\(height) \(executable)" }
+        guard host else { return "/desktop=madeira,\(width)x\(height) C:\\windows\\system32\\cmd.exe /c call \(installers)" }
         return "/desktop=madeira,\(width)x\(height) C:\\windows\\system32\\cmd.exe /c call \(installers) & \(executable)"
     }
 

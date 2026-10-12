@@ -23,6 +23,8 @@ final class MadeiraDockModel: ObservableObject {
     @Published private(set) var installPrograms: [Int: Int] = [:]
     /// App ID -> the game's One-time installs choice (true: Run at next start).
     @Published private(set) var installRunNext: [Int: Bool] = [:]
+    /// App ID -> the Record as done / Reset request its next Dock start applies.
+    @Published private(set) var installRequest: [Int: DockInstallRequest] = [:]
 
     private var watch: Task<Void, Never>?
 
@@ -31,16 +33,20 @@ final class MadeiraDockModel: ObservableObject {
         let drive = MadeiraDock.drive, prefix = MadeiraDock.prefix
         Task.detached(priority: .userInitiated) {
             let found = MadeiraDock.games(drive: drive)
-            var programs: [Int: Int] = [:], runNext: [Int: Bool] = [:]
+            var programs: [Int: Int] = [:], runNext: [Int: Bool] = [:], requests: [Int: DockInstallRequest] = [:]
             if DockInstallers.choiceEnabled {
                 let ledger = DockInstallLedger.load(prefix: prefix)
                 for game in found where game.installed {
                     let count = DockInstallers.programCount(game, drive: drive)
                     if count > 0 { programs[game.id] = count; runNext[game.id] = ledger.runsNext(game.id) }
+                    if count > 0, let request = ledger.request(game.id) { requests[game.id] = request }
                 }
             }
-            let counts = programs, choices = runNext
-            await MainActor.run { self.games = found; self.installPrograms = counts; self.installRunNext = choices }
+            let counts = programs, choices = runNext, pendingRequests = requests
+            await MainActor.run {
+                self.games = found; self.installPrograms = counts; self.installRunNext = choices
+                self.installRequest = pendingRequests
+            }
         }
     }
 
@@ -48,6 +54,13 @@ final class MadeiraDockModel: ObservableObject {
     func setRunsInstallers(_ appID: Int, _ run: Bool) {
         DockInstallers.setRunsNext(appID, run, prefix: MadeiraDock.prefix)
         installRunNext[appID] = run
+    }
+
+    /// Saves (nil: cancels) the game's Record as done / Reset request; its next Dock start
+    /// applies it while no session runs.
+    func setInstallRequest(_ appID: Int, _ request: DockInstallRequest?) {
+        DockInstallers.setRequest(appID, request, prefix: MadeiraDock.prefix)
+        installRequest[appID] = request
     }
 
     /// Downloads and unpacks Valve's client components (no Wine session).
@@ -73,12 +86,13 @@ final class MadeiraDockModel: ObservableObject {
     /// without one, then removes any unconsumed sign-in transfer.
     func watchReport() {
         watch?.cancel()
-        let starting = "Madeira Dock is starting. Valve's client signs in and checks the license."
+        let starting = DockInstallers.installsOnly ? "Running this game's one-time installs…"
+                                                   : "Madeira Dock is starting. Valve's client signs in and checks the license."
         let plan = DockInstallers.note
         status = plan.map { $0 + "\n" + starting } ?? starting
         if let plan { LogStore.shared.log("[dock-installers] " + plan) }
         watch = Task { @MainActor in
-            var idle = 0, started = false
+            var idle = 0, started = false, offered = false
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 let report = MadeiraDock.pollReport()
@@ -110,9 +124,30 @@ final class MadeiraDockModel: ObservableObject {
                     status = "The Dock session did not start. See the log."
                     break
                 }
+                // madeira-bcd: a program an installer started (a launcher, a helper) can keep a
+                // session of one-time installs open after its batch ended. The wineserver writes
+                // the registry to disk every 30 s, so 45 s after the batch a restart loses nothing.
+                if DockInstallers.installsOnly, running, !offered, let finished = DockInstallers.finishedAt,
+                   Date().timeIntervalSince(finished) >= 45 {
+                    offered = true
+                    let ended = DockInstallers.poll(drive: MadeiraDock.drive) ?? "One-time installs finished."
+                    status = ended + "\n" + DockInstallers.restartWords
+                    LogStore.shared.log("[dock-installers] the session still runs 45 s after the installs ended (a program they started); the restart is offered now")
+                    LibraryModel.shared.restartNotice = DockInstallers.restartNotice(ended)
+                }
                 if started && idle >= 5 {
-                    status = "Madeira Dock stopped before reporting a result. Export the log."
-                    LogStore.shared.log("[madeira-dock] session ended without a host result", level: .error)
+                    if DockInstallers.installsOnly {
+                        // madeira-bcd: a session of one-time installs ends after its batch, and the
+                        // game starts in the next app run (DockInstallers.installsOnly). The
+                        // wineserver has stopped by now, so the registry is on disk.
+                        let ended = DockInstallers.poll(drive: MadeiraDock.drive) ?? "One-time installs ended."
+                        status = ended + "\n" + DockInstallers.restartWords
+                        LogStore.shared.log("[dock-installers] the installs-only session ended; the game starts after Madeira is restarted")
+                        LibraryModel.shared.restartNotice = DockInstallers.restartNotice(DockInstallers.poll(drive: MadeiraDock.drive))
+                    } else {
+                        status = "Madeira Dock stopped before reporting a result. Export the log."
+                        LogStore.shared.log("[madeira-dock] session ended without a host result", level: .error)
+                    }
                     break
                 }
             }
@@ -184,9 +219,10 @@ struct MadeiraDockView: View {
                                 Text("Skip").tag(false)
                             }
                             .pickerStyle(.menu)
+                            DockInstallRequestRows(dock: dock, appID: game.id, name: game.name)
                         }
                     } header: { Text("One-time installs") } footer: {
-                        Text("Programs from a game's Steam install script, such as runtime setups, that Steam's desktop client runs before a first start. A Dock start runs the ones not yet recorded as done before Valve's client starts; the choice then changes to Skip.")
+                        Text("Programs from a game's Steam install script, such as runtime setups, that Steam's desktop client runs before a first start. A Dock start runs the ones not yet recorded as done before Valve's client starts; the choice then changes to Skip. Record as done and Reset take effect at the game's next Dock start.")
                     }
                 }
                 if let status = dock.status {
@@ -200,6 +236,52 @@ struct MadeiraDockView: View {
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
             .onAppear { dock.refresh(); signIn.refresh() }
             .sheet(isPresented: $showSignIn) { SteamSignInView() }
+        }
+    }
+}
+
+/// A game's One-time installs requests, under its Run at next start / Skip choice: Record as
+/// done (an installer that did its work but never closed, so it was never recorded) and
+/// Reset (remove what they installed and forget the records, so the installers run again;
+/// madeira-bcd: DockReset.swift). Each is saved now and applied at
+/// the game's next Dock start, while no session runs (DockInstallers.applyRequest); until
+/// then it can be cancelled.
+struct DockInstallRequestRows: View {
+    @ObservedObject var dock: MadeiraDockModel
+    let appID: Int
+    let name: String
+    @State private var confirmRecord = false
+    @State private var confirmReset = false
+
+    var body: some View {
+        Group {
+            if let request = dock.installRequest[appID] {
+                HStack {
+                    Text(request == .record ? "Next start: one-time installs recorded as done."
+                         : request == .resetSignOut ? "Next start: one-time installs and Rockstar sign-in removed, then installed again."
+                         : "Next start: one-time installs removed, then installed again.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Cancel") { dock.setInstallRequest(appID, nil) }.font(.caption)
+                }
+            } else {
+                Button("Record as done…") { confirmRecord = true }
+                Button("Reset one-time installs…", role: .destructive) { confirmReset = true }
+            }
+        }
+        .confirmationDialog("Record \(name)'s one-time installs as done?", isPresented: $confirmRecord, titleVisibility: .visible) {
+            Button("Record as done") { dock.setInstallRequest(appID, .record) }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("For an installer that finished its work but never closed, so Madeira never saw it end. At the next start the game's own install-script programs are recorded as done, as a finished run would be, and are not run again. Nothing is installed or removed.")
+        }
+        // madeira-bcd: a reset removes what the installers put in (DockReset.swift), into a backup.
+        .confirmationDialog("Reset \(name)'s one-time installs?", isPresented: $confirmReset, titleVisibility: .visible) {
+            Button("Reset at next start", role: .destructive) { dock.setInstallRequest(appID, .reset) }
+            Button("Reset and sign out of Rockstar", role: .destructive) { dock.setInstallRequest(appID, .resetSignOut) }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("At the next start Madeira removes what the one-time installs put into Wine: the Rockstar Games Launcher, Social Club, the Visual C++ 2015-2022 runtimes (x86 and x64) and the Vulkan runtime. That start then runs only the installers again, as on a new device; after it, restart Madeira and start the game. Games sharing these installs (GTA V, Red Dead Redemption 2) install them again at their next start too. The game files and saves stay. Everything removed is kept in the madeira-reset-backup folder in Madeira's Documents. Sign out also removes the Rockstar sign-in.")
         }
     }
 }
