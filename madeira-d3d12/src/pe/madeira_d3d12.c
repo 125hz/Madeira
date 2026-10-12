@@ -13713,6 +13713,10 @@ static char g_sc_stamp[96] = "madeira_d3d12 bc1 converter " MAD_SC_CONVERTER_ID;
 static char g_sc_stamp[96] = "madeira_d3d12 bc1 " __DATE__ " " __TIME__;
 #endif
 static char g_sc_rt[96];
+/* madeira-bcd shader-cache-native (see mad_scn_init): winemetal's handle for the
+ * build directory (MadeiraCtl op 20); 0 = Wine's file API. */
+static UINT32 g_scn;
+static int mad_scn_has(const UINT64 key[2]);
 
 struct mad_sc_hash { UINT64 a, b; };
 static void mad_sc_feed(struct mad_sc_hash *h, const void *p, SIZE_T n) {
@@ -13798,6 +13802,49 @@ static DWORD WINAPI mad_sc_prune(void *arg) {   /* other builds' caches */
     if (n) d3d12_log("[madeira-d3d12] shader cache: removed %u older build cache(s)\n", n);
     return 0;
 }
+/* madeira-bcd shader-cache-native (madeira.cfg or the game's own file; on by
+ * default, = 0 turns it off): the cache's files are read and written by
+ * winemetal, natively, relative to an open descriptor of the build directory
+ * (winemetal in DXMT, MadeiraCtl ops 20-22) -- the same names,
+ * contents and layout as through Wine's file API, and the same temporary file
+ * renamed over the entry. Wine's file API cost a create_file, get_handle_fd and
+ * close_handle request and a realpath() in the wineserver per entry: Horizon
+ * Zero Dawn's menu (build 493, 2026-10-11) read ~1,000 entries a second at
+ * ~3.5 ms each and kept the server thread at 0.5 of a performance core. With
+ * it, a stage's entry that was just read or written is known to be there
+ * (pso-lazy-libs asked the file system again) and its key is not computed a
+ * second time. An entry winemetal cannot reach goes through Wine's file API
+ * as before, and so does everything when winemetal has no op 20 or kernel32
+ * no wine_get_unix_file_name. */
+struct mad_scn_io { UINT64 key[2]; UINT64 data, cap, len; UINT32 handle, flags; };   /* winemetal's struct madeira_scn_io */
+#define MAD_SCN_FIRST (64u << 10)   /* the first read's buffer; a longer entry is read again into its own length */
+static void mad_scn_init(void) {
+    typedef char *(CDECL *unix_name_fn)(LPCWSTR);
+    unix_name_fn unix_name = NULL;
+    HMODULE k32;
+    char *dir = NULL;
+    const char *why = NULL;
+    if (!mad_cfg_int_pe("shader-cache-native", 1)) {
+        d3d12_log("[madeira-d3d12] shader-cache-native = 0: the shader cache goes through Wine's file calls\n");
+        return;
+    }
+    if ((k32 = GetModuleHandleW(L"kernel32.dll")))
+        unix_name = (unix_name_fn)(void *)GetProcAddress(k32, "wine_get_unix_file_name");
+    if (!unix_name) why = "kernel32 has no wine_get_unix_file_name";
+    else if (!(dir = unix_name(g_sc_dir))) why = "the directory has no unix name";
+    else {
+        struct madeira_ctl_args a;
+        memset(&a, 0, sizeof a);
+        a.op = 20; a.ptr = (UINT64)(ULONG_PTR)dir;
+        MadeiraCtl(&a);
+        g_scn = a.ret;
+        if (!g_scn) why = "winemetal did not open it (no op 20)";
+        HeapFree(GetProcessHeap(), 0, dir);
+    }
+    if (g_scn) d3d12_log("[madeira-d3d12] shader cache files are read and written natively (madeira.cfg shader-cache-native = 0 "
+                         "keeps Wine's file calls)\n");
+    else d3d12_log("[madeira-d3d12] shader cache: native file access unavailable (%s); Wine's file calls stay in use\n", why);
+}
 static int mad_sc_init(void) {
     static SRWLOCK lk = SRWLOCK_INIT;
     if (g_sc_on >= 0) return g_sc_on;
@@ -13845,6 +13892,7 @@ static int mad_sc_init(void) {
         }
         if (on) d3d12_log("[madeira-d3d12] shader cache ON: %ls, identity '%s' (%s; madeira.cfg shader-cache = 0 turns it off)\n", g_sc_dir, g_sc_stamp, g_sc_rt);
         else d3d12_log("[madeira-d3d12] shader cache off\n");
+        if (on) { mad_scn_init(); MemoryBarrier(); }   /* madeira-bcd shader-cache-native: g_scn before g_sc_on */
         g_sc_on = on;
     }
     ReleaseSRWLockExclusive(&lk);
@@ -13866,6 +13914,7 @@ static void mad_sc_path(const UINT64 key[2], WCHAR *out, int mkdir) {
 }
 static int mad_sc_exists(const UINT64 key[2]) {   /* madeira-bcd pso-lazy-libs: the entry can be read again */
     WCHAR path[MAX_PATH];
+    if (g_scn) { int r = mad_scn_has(key); if (r >= 0) return r; }   /* madeira-bcd shader-cache-native */
     mad_sc_path(key, path, 0);
     return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
 }
@@ -13881,8 +13930,19 @@ static void mad_sc_stats(void) {
  * on a miss the DXIL converter COMPILED twice (the sizing call compiled and
  * threw the result away). The last entry a sizing call loaded or produced is
  * kept per thread and handed to the fill call that follows it. */
-struct mad_sc_memo { UINT64 key[2]; unsigned char *blob; SIZE_T size; int fresh; };
-struct mad_sc_memo { UINT64 key[2]; unsigned char *blob; SIZE_T size; int fresh; };
+/* madeira-bcd shader-cache-native: the inputs mad_sc_key reads, by value (a
+ * pointer stands for the bytes behind it, which do not change while one stage
+ * is converted). */
+struct mad_sc_in {
+    UINT64 dxil, dxil_len, entry_point, params, num_params, ranges, num_ranges, samplers, root_flags, os_version, layout,
+           vs_bytecode, vs_bytecode_len, hs_bytecode, hs_bytecode_len, ds_bytecode, ds_bytecode_len, gs_bytecode, gs_bytecode_len;
+    UINT32 num_samplers, target_os, gpu_family, gs_emulation, input_topology, ps_valid, ps_sample_mask, ps_flags,
+           ps_unorm_output_mask, tess_stage, tess_index_format, gs_stage, gs_strip, air, air2, pad;
+};
+struct mad_sc_memo { UINT64 key[2]; unsigned char *blob; SIZE_T size; int fresh;
+                     /* madeira-bcd shader-cache-native: the key whose entry this thread last read or wrote, and the
+                      * last key it computed, with the arguments and inputs it was computed from */
+                     int there_set, last_set; UINT64 there[2], last_key[2]; const void *last_args; struct mad_sc_in last_in; };
 static LONG g_sc_tls = -1;   /* a TLS index; -1 until allocated */
 static struct mad_sc_memo *mad_sc_memo_get(void) {
     struct mad_sc_memo *m;
@@ -13901,8 +13961,100 @@ static void mad_sc_memo_set(struct mad_sc_memo *m, const UINT64 key[2], unsigned
     if (m->blob && m->blob != blob) free(m->blob);
     m->key[0] = key[0]; m->key[1] = key[1]; m->blob = blob; m->size = size; m->fresh = fresh;
 }
+/* madeira-bcd shader-cache-native: winemetal reads and writes the entry files
+ * (see mad_scn_init). */
+static void mad_scn_there(const UINT64 key[2]) {   /* this thread just read or wrote key's entry */
+    struct mad_sc_memo *m = mad_sc_memo_get();
+    if (m) { m->there[0] = key[0]; m->there[1] = key[1]; m->there_set = 1; }
+}
+/* 1 with the entry in a new buffer, 0 when there is none, -1 when winemetal
+ * could not read it (the caller then reads it through Wine). */
+static int mad_scn_get(const UINT64 key[2], unsigned char **blob_out, SIZE_T *size_out) {
+    struct madeira_ctl_args a; struct mad_scn_io io;
+    SIZE_T cap = MAD_SCN_FIRST;
+    int tries;
+    for (tries = 0; tries < 2; tries++) {
+        unsigned char *b = malloc(cap);
+        if (!b) return -1;
+        memset(&io, 0, sizeof io);
+        io.key[0] = key[0]; io.key[1] = key[1]; io.data = (UINT64)(ULONG_PTR)b; io.cap = cap; io.handle = g_scn;
+        memset(&a, 0, sizeof a); a.op = 21; a.ptr = (UINT64)(ULONG_PTR)&io;
+        MadeiraCtl(&a);
+        if (a.ret == 1 && io.len <= cap) {
+            if (io.len < sizeof(struct mad_sc_hdr)) { free(b); return 0; }   /* as GetFileSizeEx's check below */
+            *blob_out = b; *size_out = (SIZE_T)io.len;
+            return 1;
+        }
+        free(b);
+        if (a.ret == 0) return 0;
+        if (a.ret != 2 || io.len <= cap) return -1;
+        if (io.len < sizeof(struct mad_sc_hdr) || io.len > (256ull << 20)) return 0;
+        cap = (SIZE_T)io.len;
+    }
+    return -1;
+}
+static int mad_scn_put(const UINT64 key[2], const unsigned char *blob, SIZE_T total) {
+    struct madeira_ctl_args a; struct mad_scn_io io;
+    memset(&io, 0, sizeof io);
+    io.key[0] = key[0]; io.key[1] = key[1]; io.data = (UINT64)(ULONG_PTR)blob; io.len = total; io.handle = g_scn;
+    memset(&a, 0, sizeof a); a.op = 22; a.ptr = (UINT64)(ULONG_PTR)&io;
+    MadeiraCtl(&a);
+    return a.ret == 1;
+}
+/* mad_sc_exists: 1 or 0, -1 when winemetal could not tell. An entry this
+ * thread read or wrote a moment ago is there without asking. */
+static int mad_scn_has(const UINT64 key[2]) {
+    struct mad_sc_memo *m = mad_sc_memo_get();
+    struct madeira_ctl_args a; struct mad_scn_io io;
+    if (m && m->there_set && m->there[0] == key[0] && m->there[1] == key[1]) return 1;
+    memset(&io, 0, sizeof io);
+    io.key[0] = key[0]; io.key[1] = key[1]; io.handle = g_scn;   /* cap 0: is it there? */
+    memset(&a, 0, sizeof a); a.op = 21; a.ptr = (UINT64)(ULONG_PTR)&io;
+    MadeiraCtl(&a);
+    return a.ret == 2 ? 1 : a.ret == 0 ? 0 : -1;
+}
+static void mad_sc_in_fill(const struct madeira_ir_convert_args *a, struct mad_sc_in *s) {
+    memset(s, 0, sizeof *s);
+    s->dxil = a->dxil; s->dxil_len = a->dxil_len; s->entry_point = a->entry_point;
+    s->params = a->params; s->num_params = a->num_params; s->ranges = a->ranges; s->num_ranges = a->num_ranges;
+    s->samplers = a->samplers; s->num_samplers = a->num_samplers; s->root_flags = a->root_flags;
+    s->target_os = a->target_os; s->gpu_family = a->gpu_family; s->os_version = a->os_version;
+    s->gs_emulation = a->gs_emulation; s->input_topology = a->input_topology; s->layout = a->layout;
+    s->ps_valid = a->ps_valid; s->ps_sample_mask = a->ps_sample_mask; s->ps_flags = a->ps_flags;
+    s->ps_unorm_output_mask = a->ps_unorm_output_mask;
+    s->vs_bytecode = a->vs_bytecode; s->vs_bytecode_len = a->vs_bytecode_len;
+    s->tess_stage = a->tess_stage; s->tess_index_format = a->tess_index_format;
+    s->hs_bytecode = a->hs_bytecode; s->hs_bytecode_len = a->hs_bytecode_len;
+    s->ds_bytecode = a->ds_bytecode; s->ds_bytecode_len = a->ds_bytecode_len;
+    s->gs_stage = a->gs_stage; s->gs_strip = a->gs_strip; s->gs_bytecode = a->gs_bytecode; s->gs_bytecode_len = a->gs_bytecode_len;
+    s->air = a->out_air_ranges != 0; s->air2 = a->out_air_ranges2 != 0;
+}
+static void mad_scn_key_note(const struct madeira_ir_convert_args *a, const UINT64 key[2]) {
+    struct mad_sc_memo *m = mad_sc_memo_get();
+    if (!m) return;
+    m->last_key[0] = key[0]; m->last_key[1] = key[1]; m->last_args = a;
+    mad_sc_in_fill(a, &m->last_in);
+    m->last_set = 1;
+}
+/* 1 with the key mad_sc_key gives a, when this thread computed it for the same
+ * arguments with the same inputs last (pso-lazy-libs asks right after the
+ * conversion). */
+static int mad_scn_key_again(const struct madeira_ir_convert_args *a, UINT64 key[2]) {
+    struct mad_sc_memo *m = mad_sc_memo_get();
+    struct mad_sc_in now;
+    if (!g_scn || !m || !m->last_set || m->last_args != a) return 0;
+    mad_sc_in_fill(a, &now);
+    if (memcmp(&now, &m->last_in, sizeof now)) return 0;
+    key[0] = m->last_key[0]; key[1] = m->last_key[1];
+    return 1;
+}
 static int mad_sc_read_file(const UINT64 key[2], unsigned char **blob_out, SIZE_T *size_out) {
     WCHAR path[MAX_PATH]; HANDLE f; LARGE_INTEGER sz; unsigned char *blob; DWORD got; int ok = 0;
+    if (g_scn) {   /* madeira-bcd shader-cache-native */
+        int r = mad_scn_get(key, blob_out, size_out);
+        if (r > 0) mad_scn_there(key);
+        if (r >= 0) return r;
+    }
     mad_sc_path(key, path, 0);
     f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
     if (f == INVALID_HANDLE_VALUE) return 0;
@@ -14039,6 +14191,11 @@ static unsigned char *mad_sc_build_blob(const struct madeira_ir_convert_args *a,
 }
 static void mad_sc_write_file(const UINT64 key[2], const unsigned char *blob, SIZE_T total) {
     WCHAR path[MAX_PATH], tmp[MAX_PATH]; HANDLE f; DWORD put;
+    if (g_scn && mad_scn_put(key, blob, total)) {   /* madeira-bcd shader-cache-native; not written: through Wine below */
+        InterlockedIncrement(&g_sc_store);
+        mad_scn_there(key);
+        return;
+    }
     mad_sc_path(key, path, 1);
     _snwprintf(tmp, MAX_PATH, L"%ls.%lx.tmp", path, GetCurrentThreadId());
     f = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
@@ -14202,6 +14359,7 @@ static void mad_ir_convert_cached_impl(struct madeira_ir_convert_args *a) {
     UINT64 key[2]; int fresh = 0;
     if (!mad_sc_init()) { MadeiraIRConvert(a); return; }
     mad_sc_key(a, key);
+    if (g_scn) mad_scn_key_note(a, key);   /* madeira-bcd shader-cache-native: pso-lazy-libs asks for it again */
     if (mad_sc_load(a, key, &fresh)) {
         if (a->out_buf && !fresh) { InterlockedIncrement(&g_sc_hit); mad_sc_stats(); }
         return;
@@ -14689,7 +14847,7 @@ again:
     if (switched) mad_unb_note(rs, tag, sized, 1);   /* madeira-bcd msc-unbounded-retry */
     if (o && o->lz) {   /* madeira-bcd pso-lazy-libs: the key the first draw reads this stage back under */
         o->lz->ok = 0;
-        if (mad_sc_init()) { mad_sc_key(&a, o->lz->key); o->lz->ok = mad_sc_exists(o->lz->key); }
+        if (mad_sc_init()) { if (!mad_scn_key_again(&a, o->lz->key)) mad_sc_key(&a, o->lz->key); o->lz->ok = mad_sc_exists(o->lz->key); }
     }
     free(sized_ranges);   /* the conversion is done; nothing below reads a.ranges */
     mad_convert_note_time(t0, retried);
