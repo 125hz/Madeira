@@ -2070,6 +2070,40 @@ volatile int ios_srv_wait_timeouts = 0;   /* ... of which returned STATUS_TIMEOU
 volatile int ios_srv_req_count = 0;       /* ALL threads: wineserver requests */
 uintptr_t ios_srv_game_teb = 0;           /* set once by server_init_process_done */
 
+#ifdef WINE_IOS
+/* madeira-bcd: direct requests (env.MADEIRA_SRV_DIRECT, off by default; the server side is
+ * build/wineserver/request_ios.c ios_srv_direct_call, set per launch by WineProcessBridge.m).
+ * A request the server lists runs on this thread under the server's lock and its reply
+ * comes back in req as wait_reply would leave it; anything the server does not take goes
+ * through the pipe below as before. A request that ended this thread is not taken either:
+ * the server has closed the thread's pipes by then, so the write below fails with EPIPE
+ * and that path reports it exactly as it does today. */
+extern volatile int g_madeira_srv_direct;
+extern int ios_srv_direct_call( unsigned int tid, client_ptr_t teb, const union generic_request *request,
+                                const struct iovec *vec, unsigned int count,
+                                union generic_reply *reply, void *reply_data );
+
+static BOOL ios_srv_try_direct( struct __server_request_info *req, unsigned int *status )
+{
+    struct iovec vec[__SERVER_MAX_DATA];
+    unsigned int i;
+    int ret, err = errno;   /* the handler's own system calls must not change this thread's errno */
+
+    for (i = 0; i < req->data_count; i++)
+    {
+        vec[i].iov_base = (void *)req->data[i].ptr;
+        vec[i].iov_len = req->data[i].size;
+    }
+    ret = ios_srv_direct_call( HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ),
+                               (client_ptr_t)(ULONG_PTR)NtCurrentTeb(), &req->u.req, vec, req->data_count,
+                               &req->u.reply, req->reply_data );
+    errno = err;
+    if (ret <= 0) return FALSE;
+    *status = req->u.reply.reply_header.error;
+    return TRUE;
+}
+#endif
+
 /***********************************************************************
  *           server_call_unlocked
  */
@@ -2082,14 +2116,18 @@ unsigned int server_call_unlocked( void *req_ptr )
 #ifdef WINE_IOS
     /* killed inside a section (ios_defer_section_abort): no more requests */
     if (ios_section_state() & IOS_SECTION_ABORT) return STATUS_THREAD_IS_TERMINATING;
+    if (__atomic_load_n( &g_madeira_srv_direct, __ATOMIC_RELAXED ) > 0 && ios_srv_try_direct( req, &ret ))
+        return ret;   /* madeira-bcd: MADEIRA_SRV_DIRECT */
 #endif
     if ((ret = send_request( req ))) return ret;
     /* iOS-Madeira 2026-07-05: kick the in-process server loop out of its
      * tick sleep so the request is picked up in ~50us instead of waiting
      * for the next 1ms iteration (fd_ios.c ios_srv_wake_sem). */
     {
-        extern void ios_wineserver_wake(void);
-        ios_wineserver_wake();
+        /* madeira-bcd doorbell: name the thread, so the loop reads only its
+         * request fd (fd_ios.c ios_srv_bell); a ring also wakes the loop */
+        extern void ios_wineserver_ring( unsigned int tid );
+        ios_wineserver_ring( HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ) );
     }
     return wait_reply( req );
 }
@@ -3332,6 +3370,26 @@ static int remove_fd_from_cache( HANDLE handle )
 }
 
 
+#ifdef WINE_IOS
+/* madeira-bcd: get_handle_fd hands the descriptor over in its reply (build/wineserver/
+ * fd_ios.c). The server is a thread of this process and shares its descriptor table, so
+ * the copy it makes with F_DUPFD_CLOEXEC is what SCM_RIGHTS through the process socket
+ * delivered (a new descriptor for the same open file, close-on-exec), without the server's
+ * sendmsg and its two log lines and this side's recvmsg and fcntl; it also cannot pick up
+ * another thread's descriptor from the shared socket. -1 means the descriptor table is
+ * full, reported as before. env.MADEIRA_SRV_FD_SOCKET = 1 (read once) uses the socket. */
+static int ios_fd_in_reply(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_SRV_FD_SOCKET" );
+        on = !(e && e[0] == '1');
+    }
+    return on;
+}
+#endif
+
 /***********************************************************************
  *           server_get_unix_fd
  *
@@ -3356,15 +3414,30 @@ int server_get_unix_fd( HANDLE handle, unsigned int wanted_access, int *unix_fd,
     ret = get_cached_fd( handle, &fd, type, &access, options );
     if (ret == STATUS_INVALID_HANDLE)
     {
+#ifdef WINE_IOS
+        int in_reply = ios_fd_in_reply(), reply_fd = -1;
+#endif
         SERVER_START_REQ( get_handle_fd )
         {
             req->handle = wine_server_obj_handle( handle );
+#ifdef WINE_IOS
+            if (in_reply) wine_server_set_reply( req, &reply_fd, sizeof(reply_fd) );
+#endif
             if (!(ret = wine_server_call( req )))
             {
                 if (type) *type = reply->type;
                 if (options) *options = reply->options;
                 access = reply->access;
-                if ((fd = wine_server_receive_fd( &fd_handle )) != -1)
+#ifdef WINE_IOS
+                if (in_reply)   /* the descriptor came in the reply (fd_ios.c get_handle_fd) */
+                {
+                    fd = wine_server_reply_size( reply ) == sizeof(reply_fd) ? reply_fd : -1;
+                    fd_handle = wine_server_obj_handle( handle );
+                }
+                else
+#endif
+                fd = wine_server_receive_fd( &fd_handle );
+                if (fd != -1)
                 {
                     /* task #24: the settings-freeze loop showed a handle
                      * whose fd never reaches the requester. If the received

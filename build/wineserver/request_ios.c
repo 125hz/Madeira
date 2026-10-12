@@ -49,6 +49,7 @@
 #endif
 
 #include <os/log.h>
+#include <os/lock.h>   /* madeira-bcd: ios_srv_lock (MADEIRA_SRV_DIRECT) */
 #include "wine_log_ios.h"
 #include <pthread.h>
 
@@ -296,6 +297,138 @@ static void send_reply( union generic_reply *reply )
         fatal_protocol_error( current, "reply write: %s\n", strerror( errno ));
 }
 
+/* madeira-bcd: the ml1055 request census, moved out of call_req_handler unchanged so a
+ * direct request (ios_srv_direct_call) is counted the same way. current is thread. */
+static void ios_req_census( struct thread *thread, enum request req )
+{
+    /* ml1055: which requests. With the JIT no longer thrashing, ~16% of running
+     * CPU samples sit in the client/server pipe read; the mix decides whether an
+     * in-process fast path for waits is worth building. Request numbers map to
+     * names through wine/server/request_trace.h req_names[]. */
+    static unsigned long counts[REQ_NB_REQUESTS], total;
+    static struct timespec t0;
+    /* madeira-bcd: and from whom. Four heavy-hitter slots per request
+     * (space-saving: a newcomer replaces the smallest and inherits its
+     * count), so a storm (set_cursor 2,400/s in build 437) names its
+     * thread and process; a slot's count can overstate by at most the
+     * count it inherited. */
+    static struct { unsigned int tid, pid; unsigned long n; } hh[REQ_NB_REQUESTS][4];
+    static unsigned long cursor_flags[6];   /* set_cursor by flag: handle count pos clip noclip fsclip */
+    /* madeira-bcd: the shape of each wait. Fastsync answers a single,
+     * non-alertable wait on an event (or, with MADEIRA_FASTSYNC_SEM=1, on a
+     * semaphore) in the client; every other shape stays a server round
+     * trip. GTA V sent ~15,000 selects a second in build 442 (sem=off), and
+     * these counts say how many of them the switch could take away.
+     * Shapes: single, single alertable, any of many, all of many,
+     * signal-and-wait, keyed event, other; objects by the first handle. */
+    static unsigned long sel_shape[7], sel_obj[8], sel_multi_sem;
+    if (req == REQ_select &&
+        get_req_data_size() >= sizeof(union apc_result) + sizeof(enum select_opcode))
+    {
+        const union apc_result *res = get_req_data();
+        data_size_t size = min( thread->req.select_request.size, get_req_data_size() - sizeof(*res) );
+        union select_op op;
+        unsigned int nh = 0, i, shape;
+        int has_sem = 0;
+
+        memset( &op, 0, sizeof(op) );
+        memcpy( &op, res + 1, min( size, sizeof(op) ) );
+        if ((op.op == SELECT_WAIT || op.op == SELECT_WAIT_ALL) && size > offsetof( union select_op, wait.handles ))
+            nh = min( (size - offsetof( union select_op, wait.handles )) / sizeof(obj_handle_t),
+                      MAXIMUM_WAIT_OBJECTS );
+        if (op.op == SELECT_WAIT && nh == 1)
+            shape = (thread->req.select_request.flags & SELECT_ALERTABLE) ? 1 : 0;
+        else if (op.op == SELECT_WAIT) shape = 2;
+        else if (op.op == SELECT_WAIT_ALL) shape = 3;
+        else if (op.op == SELECT_SIGNAL_AND_WAIT) shape = 4;
+        else if (op.op == SELECT_KEYED_EVENT_WAIT || op.op == SELECT_KEYED_EVENT_RELEASE) shape = 5;
+        else shape = 6;
+        sel_shape[shape]++;
+        for (i = 0; i < nh; i++)
+        {
+            struct object *obj = get_handle_obj( thread->process, op.wait.handles[i], 0, NULL );
+            const struct type_descr *type;
+            int k = 7;
+
+            if (!obj) clear_error();   /* the handler reports a bad handle itself */
+            else
+            {
+                type = obj->ops->type;
+                k = type == &semaphore_type ? 0 : type == &event_type ? 1 : type == &mutex_type ? 2 :
+                    type == &thread_type ? 3 : type == &process_type ? 4 : type == &timer_type ? 5 :
+                    type == &completion_type ? 6 : 7;
+                release_object( obj );
+            }
+            if (!i) sel_obj[k]++;
+            if (!k) has_sem = 1;
+        }
+        if (nh > 1 && has_sem) sel_multi_sem++;
+    }
+    if (req == REQ_set_cursor)
+    {
+        unsigned int f = thread->req.set_cursor_request.flags, b;
+        for (b = 0; b < 6; b++) if (f & (1u << b)) cursor_flags[b]++;
+    }
+    if (req < REQ_NB_REQUESTS)
+    {
+        unsigned int tid = thread->id, pid = thread->process ? thread->process->id : 0;
+        int s, low = 0;
+        counts[req]++;
+        for (s = 0; s < 4; s++)
+        {
+            if (hh[req][s].n && hh[req][s].tid == tid) { hh[req][s].n++; break; }
+            if (hh[req][s].n < hh[req][low].n) low = s;
+        }
+        if (s == 4)
+        {
+            hh[req][low].tid = tid; hh[req][low].pid = pid; hh[req][low].n++;
+        }
+    }
+    if (!total) clock_gettime( CLOCK_MONOTONIC, &t0 );
+    if (++total % 200000 == 0)
+    {
+        struct timespec t1; char line[1400]; int n = 0, k, s; unsigned r;
+        clock_gettime( CLOCK_MONOTONIC, &t1 );
+        for (k = 0; k < 10; k++)
+        {
+            unsigned best = 0, top = 0; unsigned long bn = 0;
+            for (r = 0; r < REQ_NB_REQUESTS; r++) if (counts[r] > bn) { bn = counts[r]; best = r; }
+            if (!bn) break;
+            for (s = 1; s < 4; s++) if (hh[best][s].n > hh[best][top].n) top = s;
+            n += snprintf( line + n, sizeof(line) - n, " req%u=%lu(tid %04x pid %04x ~%lu)", best, bn,
+                           hh[best][top].tid, hh[best][top].pid, hh[best][top].n );
+            counts[best] = 0;
+        }
+        for (r = 0; r < REQ_NB_REQUESTS; r++) counts[r] = 0;
+        memset( hh, 0, sizeof(hh) );
+        fprintf( stderr, "[srv-req] ml1055 last 200000 requests in %.1f s:%s\n",
+                 (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9, line );
+        if (cursor_flags[0] + cursor_flags[1] + cursor_flags[2] + cursor_flags[3] + cursor_flags[4])
+        {
+            extern unsigned long ios_clip_repeats_skipped;
+            fprintf( stderr, "[srv-req] set_cursor by flag: handle=%lu count=%lu pos=%lu clip=%lu noclip=%lu "
+                     "fsclip=%lu; unchanged ClipCursor notifications skipped so far: %lu\n",
+                     cursor_flags[0], cursor_flags[1], cursor_flags[2], cursor_flags[3], cursor_flags[4],
+                     cursor_flags[5], ios_clip_repeats_skipped );
+            memset( cursor_flags, 0, sizeof(cursor_flags) );
+        }
+        if (sel_shape[0] + sel_shape[1] + sel_shape[2] + sel_shape[3] + sel_shape[4] + sel_shape[5] + sel_shape[6])
+        {
+            fprintf( stderr, "[srv-req] select by shape: single %lu, single alertable %lu, any of many %lu "
+                     "(%lu with a semaphore), all of many %lu, signal-and-wait %lu, keyed event %lu, other %lu; "
+                     "first object: semaphore %lu, event %lu, mutex %lu, thread %lu, process %lu, timer %lu, "
+                     "completion %lu, other %lu\n",
+                     sel_shape[0], sel_shape[1], sel_shape[2], sel_multi_sem, sel_shape[3], sel_shape[4],
+                     sel_shape[5], sel_shape[6], sel_obj[0], sel_obj[1], sel_obj[2], sel_obj[3], sel_obj[4],
+                     sel_obj[5], sel_obj[6], sel_obj[7] );
+            memset( sel_shape, 0, sizeof(sel_shape) );
+            memset( sel_obj, 0, sizeof(sel_obj) );
+            sel_multi_sem = 0;
+        }
+        t0 = t1;
+    }
+}
+
 /* call a request handler */
 static void call_req_handler( struct thread *thread )
 {
@@ -309,33 +442,7 @@ static void call_req_handler( struct thread *thread )
 
     if (debug_level) trace_request();
 
-    /* ml1055: which requests. With the JIT no longer thrashing, ~16% of running
-     * CPU samples sit in the client/server pipe read; the mix decides whether an
-     * in-process fast path for waits is worth building. Request numbers map to
-     * names through wine/server/request_trace.h req_names[]. */
-    {
-        static unsigned long counts[REQ_NB_REQUESTS], total;
-        static struct timespec t0;
-        if (req < REQ_NB_REQUESTS) counts[req]++;
-        if (!total) clock_gettime( CLOCK_MONOTONIC, &t0 );
-        if (++total % 200000 == 0)
-        {
-            struct timespec t1; char line[600]; int n = 0, k; unsigned r;
-            clock_gettime( CLOCK_MONOTONIC, &t1 );
-            for (k = 0; k < 10; k++)
-            {
-                unsigned best = 0; unsigned long bn = 0;
-                for (r = 0; r < REQ_NB_REQUESTS; r++) if (counts[r] > bn) { bn = counts[r]; best = r; }
-                if (!bn) break;
-                n += snprintf( line + n, sizeof(line) - n, " req%u=%lu", best, bn );
-                counts[best] = 0;
-            }
-            for (r = 0; r < REQ_NB_REQUESTS; r++) counts[r] = 0;
-            fprintf( stderr, "[srv-req] ml1055 last 200000 requests in %.1f s:%s\n",
-                     (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9, line );
-            t0 = t1;
-        }
-    }
+    ios_req_census( thread, req );
     if (req < REQ_NB_REQUESTS)
         req_handlers[req]( &current->req, &reply );
     else
@@ -357,6 +464,222 @@ static void call_req_handler( struct thread *thread )
         }
     }
     current = NULL;
+}
+
+#ifdef WINE_IOS
+/* madeira-bcd: direct requests (env.MADEIRA_SRV_DIRECT = 1 or 2; off by default).
+ *
+ * A request normally costs two thread switches and five or more system calls: the client
+ * writes it to its request pipe and rings (fd_ios.c ios_srv_bell), the server thread wakes,
+ * reads it, runs the handler and writes the reply, and the client wakes from its read.
+ * Here the server is a thread of the same process, so with the switch a listed request runs
+ * on the calling thread itself: under ios_srv_lock, which the server loop holds for
+ * everything it does except its sleep (fd_ios.c ios_srv_loop_enter), the request is copied
+ * into the thread's server state exactly as read_request leaves it, the same handler runs
+ * (call_req_handler's steps, census included), and the reply is copied back instead of
+ * written. No pipe, ring or wake-up, and the handler's work runs on the caller's core (an
+ * efficiency core under ECO) instead of the server's performance core. Horizon Zero Dawn's
+ * menu sent ~6,900 requests a second (493, 2026-10-11), GTA V Enhanced up to ~35,000.
+ *
+ * Listed are requests that finish inside their handler. Level 1: handles, files and their
+ * descriptors, mappings looked up, registry keys and values, events, semaphores, mutexes and
+ * completion ports. Level 2 adds select (a wait that cannot finish at once returns
+ * STATUS_PENDING as before, and its wake-up still arrives on the thread's wait pipe from
+ * whoever satisfies it), the timer requests and set_cursor (GTA V Enhanced sent up to
+ * ~10,000 a second); a timer due before the sleeping loop wakes has the request wake it
+ * (fd_ios.c add_timeout_user). Thread and process lifetime,
+ * suspension, contexts, APC queuing, asynchronous I/O and window messages keep the pipe.
+ * A request that cannot run here (the switch went off, the loop is not running, the thread
+ * is not fully connected or is not the caller) goes through the pipe as before; one that
+ * ends its own thread is sent through the pipe as well, which the server has closed by
+ * then, so the client's EPIPE path reports it exactly as it does today. */
+os_unfair_lock ios_srv_lock = OS_UNFAIR_LOCK_INIT;
+volatile int ios_srv_direct_live;          /* fd_ios.c: set and cleared by the loop under the lock */
+volatile int ios_srv_timer_added;          /* fd_ios.c add_timeout_user: the sleeping loop must wake */
+unsigned long long ios_srv_loop_wake_at;   /* fd_ios.c: monotonic tick the sleeping loop wakes at */
+unsigned long long ios_srv_direct_n, ios_srv_direct_fallback, ios_srv_direct_timer_wakes;   /* [srv-direct] */
+extern volatile int g_madeira_srv_direct;  /* WineProcessBridge.m */
+
+/* 0: never direct; 1: with MADEIRA_SRV_DIRECT = 1 or 2; 2: only with MADEIRA_SRV_DIRECT = 2 */
+static int ios_srv_direct_level( enum request req )
+{
+    switch (req)
+    {
+    case REQ_close_handle:
+    case REQ_create_file:
+    case REQ_open_file_object:
+    case REQ_get_handle_fd:
+    case REQ_open_mapping:
+    case REQ_get_mapping_info:
+    case REQ_create_key:
+    case REQ_open_key:
+    case REQ_get_key_value:
+    case REQ_set_key_value:
+    case REQ_enum_key:
+    case REQ_enum_key_value:
+    case REQ_create_event:
+    case REQ_open_event:
+    case REQ_event_op:
+    case REQ_query_event:
+    case REQ_create_semaphore:
+    case REQ_open_semaphore:
+    case REQ_release_semaphore:
+    case REQ_query_semaphore:
+    case REQ_create_mutex:
+    case REQ_open_mutex:
+    case REQ_release_mutex:
+    case REQ_query_mutex:
+    case REQ_create_completion:
+    case REQ_open_completion:
+    case REQ_add_completion:
+    case REQ_remove_completion:
+    case REQ_query_completion:
+    case REQ_get_thread_completion:
+        return 1;
+    case REQ_select:
+    case REQ_create_timer:
+    case REQ_open_timer:
+    case REQ_set_timer:
+    case REQ_cancel_timer:
+    case REQ_get_timer_info:
+    case REQ_set_cursor:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
+/* call_req_handler's steps with the reply copied out: 1 done, -1 the request ended the thread */
+static int ios_srv_run_direct( struct thread *thread, union generic_reply *reply, void *reply_data )
+{
+    enum request req = thread->req.request_header.req;
+    int ret = -1;
+
+    current = thread;
+    current->reply_size = 0;
+    clear_error();
+    memset( reply, 0, sizeof(*reply) );
+
+    if (debug_level) trace_request();
+
+    ios_req_census( thread, req );
+    req_handlers[req]( &current->req, reply );
+
+    if (current)
+    {
+        if (current->reply_fd)
+        {
+            reply->reply_header.error = current->error;
+            reply->reply_header.reply_size = current->reply_size;
+            if (debug_level) trace_reply( req, reply );
+            if (current->reply_size) memcpy( reply_data, current->reply_data, current->reply_size );
+            free( current->reply_data );
+            current->reply_data = NULL;
+            ret = 1;
+        }
+        else
+        {
+            current->exit_code = 1;
+            kill_thread( current, 1 );  /* no way to continue without reply fd */
+        }
+    }
+    current = NULL;
+    return ret;
+}
+
+/* Run a request of thread `tid' (TEB `teb') on the calling thread. 1: it ran, the reply and
+ * its data are in reply_out and reply_data; 0: not taken; -1: it ended the thread. */
+int ios_srv_direct_call( unsigned int tid, client_ptr_t teb, const union generic_request *request,
+                         const struct iovec *vec, unsigned int count,
+                         union generic_reply *reply_out, void *reply_data )
+{
+    extern void ios_wineserver_wake(void);
+    enum request req = request->request_header.req;
+    data_size_t size = request->request_header.request_size, done = 0;
+    int level = __atomic_load_n( &g_madeira_srv_direct, __ATOMIC_ACQUIRE ), need, ret, wake = 0;
+    union generic_reply reply;
+    struct thread *thread;
+    void *data = NULL;
+    unsigned int i;
+
+    if (level <= 0 || (unsigned int)req >= REQ_NB_REQUESTS) return 0;
+    if (!(need = ios_srv_direct_level( req )) || need > level) return 0;
+    if (size)   /* contiguous and malloc'd, as read_request leaves it (cleanup_thread frees it) */
+    {
+        if (!(data = malloc( size ))) return 0;
+        for (i = 0; i < count; i++)
+        {
+            if (vec[i].iov_len > size - done) break;
+            if (vec[i].iov_len) memcpy( (char *)data + done, vec[i].iov_base, vec[i].iov_len );
+            done += vec[i].iov_len;
+        }
+        if (i < count || done != size)
+        {
+            free( data );
+            return 0;
+        }
+    }
+
+    os_unfair_lock_lock( &ios_srv_lock );
+    if (!__atomic_load_n( &ios_srv_direct_live, __ATOMIC_ACQUIRE )) goto pipe;
+    if (!(thread = get_thread_from_id( tid )))
+    {
+        clear_error();
+        goto pipe;
+    }
+    if (thread->teb != teb || thread->state == TERMINATED || !thread->request_fd || !thread->reply_fd ||
+        thread->req_toread || thread->req_data || thread->reply_data || thread->reply_towrite)
+    {
+        release_object( thread );
+        goto pipe;
+    }
+    set_current_time();
+    memcpy( &thread->req, request, sizeof(thread->req) );
+    thread->req_data = data;
+    ret = ios_srv_run_direct( thread, &reply, reply_data );
+    free( thread->req_data );   /* NULL when kill_thread has freed it */
+    thread->req_data = NULL;
+    release_object( thread );
+    __atomic_fetch_add( &ios_srv_direct_n, 1, __ATOMIC_RELAXED );
+    if (ios_srv_timer_added)
+    {
+        ios_srv_timer_added = 0;
+        wake = 1;
+        __atomic_fetch_add( &ios_srv_direct_timer_wakes, 1, __ATOMIC_RELAXED );
+    }
+    os_unfair_lock_unlock( &ios_srv_lock );
+    if (wake) ios_wineserver_wake();
+    if (ret > 0) memcpy( reply_out, &reply, sizeof(reply) );
+    return ret;
+
+pipe:
+    __atomic_fetch_add( &ios_srv_direct_fallback, 1, __ATOMIC_RELAXED );
+    os_unfair_lock_unlock( &ios_srv_lock );
+    free( data );
+    return 0;
+}
+#endif
+
+/* madeira-bcd doorbell (fd_ios.c ios_srv_bell): read the request fd of thread
+ * `tid` the way a POLLIN on it would; 1 when a request is still partly unread */
+int ios_doorbell_poll_thread( unsigned int tid )
+{
+    extern void ios_fd_poll_in( struct fd *fd );
+    struct thread *thread = get_thread_from_id( tid );
+    int again = 0;
+
+    if (!thread)
+    {
+        clear_error();
+        return 0;
+    }
+    if (thread->request_fd)
+    {
+        ios_fd_poll_in( thread->request_fd );
+        again = thread->request_fd && thread->req_toread;
+    }
+    release_object( thread );
+    return again;
 }
 
 /* read a request from a thread */
@@ -516,12 +839,17 @@ int send_client_fd( struct process *process, int fd, obj_handle_t handle )
     struct cmsghdr *cmsg;
     int ret;
 
+    static unsigned long logged;   /* madeira-bcd: fd_ios.c ios_srv_log_sample */
+    extern int ios_srv_log_sample( unsigned long *count );
+    int log_this = ios_srv_log_sample( &logged );
+
     /* task #24: include requester identity — the settings-freeze loop
      * resends the same handle forever; tid names the retrying thread and
      * process id disambiguates which pseudo-process's msg socket this is. */
-    ws_log("[wineserver] send_client_fd: fd=%d handle=0x%x msg_fd_unix=%d proc=%04x tid=%04x",
-           fd, handle, get_unix_fd( process->msg_fd ), process->id,
-           current ? current->id : 0);
+    if (log_this)
+        ws_log("[wineserver] send_client_fd: fd=%d handle=0x%x msg_fd_unix=%d proc=%04x tid=%04x",
+               fd, handle, get_unix_fd( process->msg_fd ), process->id,
+               current ? current->id : 0);
 
     msghdr.msg_name    = NULL;
     msghdr.msg_namelen = 0;
@@ -546,8 +874,9 @@ int send_client_fd( struct process *process, int fd, obj_handle_t handle )
 
     ret = sendmsg( get_unix_fd( process->msg_fd ), &msghdr, 0 );
 
-    ws_log("[wineserver] send_client_fd: sendmsg returned %d (expected %lu) errno=%d",
-           ret, (unsigned long)sizeof(handle), errno);
+    if (log_this || ret != sizeof(handle))
+        ws_log("[wineserver] send_client_fd: sendmsg returned %d (expected %lu) errno=%d",
+               ret, (unsigned long)sizeof(handle), errno);
 
     if (ret == sizeof(handle)) return 0;
 
