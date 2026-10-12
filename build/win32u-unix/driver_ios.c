@@ -106,6 +106,8 @@ static BOOL winios_drv_set_cursor_pos( INT x, INT y )
     return TRUE;
 }
 
+static void ios_foreground_if_none( const char *why );   /* madeira-bcd, MADEIRA_INPUT_FOREGROUND, below */
+
 /* C bridge for Winios.m to inject mouse input without pulling in Wine
  * headers into Obj-C (where INPUT/HWND/etc. would conflict with UIKit
  * types). Call this from pProcessEvents drain or directly from a
@@ -129,6 +131,7 @@ void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_
      * Call win32u's send_hardware_message directly (same library) instead
      * of the NtUserCallHwndParam inline — we get the raw NTSTATUS and skip
      * a dispatch layer that can fail for its own reasons. */
+    ios_foreground_if_none( "an injected mouse event" );
     NTSTATUS st = send_hardware_message( NULL, 0, &input, 0 );
     {
         static unsigned cnt;
@@ -212,6 +215,7 @@ void winios_drv_post_key(unsigned short vk, unsigned int flags)
     input.ki.time        = 0;
     input.ki.dwExtraInfo = 0;
 
+    ios_foreground_if_none( "an injected key" );
     st = send_hardware_message( NULL, 0, &input, 0 );
     {
         /* ml647: COUNT EVENTS, and never let a cap masquerade as absence. The
@@ -246,6 +250,12 @@ void winios_dump_window_tree(void)
         return;
     }
     dprintf( 2, "[winios-tree] ---- %u top-level windows ----\n", (unsigned)(size ? size - 1 : 0) );
+    /* who takes the keyboard and, for a game that pauses without focus, the pad */
+    {
+        HWND fg = NtUserGetForegroundWindow();
+        DWORD fg_pid = 0, fg_tid = fg ? get_window_thread( fg, &fg_pid ) : 0;
+        dprintf( 2, "[winios-tree] foreground=%p pid=%04x tid=%04x\n", fg, (unsigned)fg_pid, (unsigned)fg_tid );
+    }
     for (i = 0; i + 1 < size && i < ARRAY_SIZE(list); i++)
     {
         HWND hwnd = list[i];
@@ -589,6 +599,85 @@ static void winios_note_dialog_thread( HWND hwnd, const RECT *visible )
                  (int)visible->left, (int)visible->top, (int)visible->right, (int)visible->bottom );
 }
 
+/* Activation of a full-screen window when it is shown. iOS has no window
+ * manager, and the wineserver keeps Windows' foreground lock (queue_ios.c,
+ * set_foreground_window): a process that has had neither input nor the
+ * foreground may not take it from another process unless its parent holds
+ * it. A game started by a launcher whose windows belong to other processes
+ * is refused: Grand Theft Auto V Enhanced, started by Launcher.exe in a Dock
+ * session (log 2026-10-07 19:27, build 433), asked four times to activate
+ * its 1920x1080 window after the launcher's windows (SocialClubHelper.exe's
+ * UI, the console conhost.exe opened for it) had held the foreground, and
+ * sat at its first screen with no keyboard, mouse or pad; a copy of the game
+ * started on its own plays with a pad on the same build. A window manager
+ * gives a newly shown full-screen window the activation it asks for, so: a
+ * visible top-level window covering the whole virtual screen that is shown
+ * without SWP_NOACTIVATE is made foreground by its own thread at its next
+ * message poll, unless a window of its process already is (the internal path
+ * ios_foreground_check uses). Once per show; smaller windows (launchers,
+ * dialogs) are left to the lock. MADEIRA_FULLSCREEN_FOREGROUND=0 turns this
+ * off. Logs [fg-show] (16 lines at most). */
+static __thread HWND ios_show_foreground;
+
+static int ios_fullscreen_foreground_enabled(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+    {
+        const char *env = getenv( "MADEIRA_FULLSCREEN_FOREGROUND" );  /* 0: a full-screen window shown with activation is left to the foreground lock */
+        on = !(env && env[0] == '0' && !env[1]);
+    }
+    return on;
+}
+
+/* From winios_drv_window_pos_changed, on the window's own thread. */
+static void ios_note_fullscreen_show( HWND hwnd, UINT swp_flags, const RECT *visible )
+{
+    DWORD style;
+    RECT screen;
+
+    if (!(swp_flags & SWP_SHOWWINDOW) || (swp_flags & (SWP_NOACTIVATE | SWP_HIDEWINDOW))) return;
+    if (!ios_fullscreen_foreground_enabled()) return;
+    style = get_window_long( hwnd, GWL_STYLE );
+    if ((style & (WS_CHILD | WS_MINIMIZE | WS_DISABLED)) || !(style & WS_VISIBLE)) return;
+    if (get_window_long( hwnd, GWL_EXSTYLE ) & WS_EX_NOACTIVATE) return;
+    if (NtUserGetAncestor( hwnd, GA_PARENT ) != get_desktop_window()) return;
+    if (get_window_thread( hwnd, NULL ) != GetCurrentThreadId()) return;
+    screen = get_virtual_screen_rect( 0, MDT_DEFAULT );
+    if (visible->left > screen.left || visible->top > screen.top ||
+        visible->right < screen.right || visible->bottom < screen.bottom) return;
+    ios_show_foreground = hwnd;
+}
+
+static void ios_apply_fullscreen_foreground(void)
+{
+    static unsigned int said;
+    HWND hwnd = ios_show_foreground, fg;
+    DWORD pid = GetCurrentProcessId(), fg_pid = 0;
+    BOOL ok;
+
+    ios_show_foreground = 0;
+    if (!is_window( hwnd ) || !is_window_visible( hwnd )) return;
+    if ((fg = NtUserGetForegroundWindow()) && get_window_thread( fg, &fg_pid ) && fg_pid == pid) return;
+    ok = set_foreground_window( hwnd, FALSE, TRUE );
+    if (__atomic_fetch_add( &said, 1, __ATOMIC_RELAXED ) < 16)
+        dprintf( 2, "[fg-show] full-screen window %p of pid %04x was shown with activation while %p "
+                 "(pid %04x) held the foreground: made it foreground ok=%d "
+                 "(MADEIRA_FULLSCREEN_FOREGROUND=0 disables)\n",
+                 hwnd, (unsigned)pid, fg, (unsigned)fg_pid, ok );
+}
+
+/* pProcessEvents: runs on every message poll of a wine thread (message_ios.c
+ * process_driver_events), so a window's own thread gets here right after it
+ * was shown. */
+static BOOL winios_drv_process_events( DWORD mask )
+{
+    if (ios_show_foreground) ios_apply_fullscreen_foreground();
+    ios_foreground_if_none( "a message poll" );
+    return winios_pProcessEvents ? winios_pProcessEvents( mask ) : FALSE;
+}
+
 /* ml505 probe. This hook was a pure stub: wine hands the driver the
  * surface's VISIBLE REGION here — the rects left after sibling and child
  * occlusion — and we discarded all of it.
@@ -906,6 +995,8 @@ static void winios_drv_refresh_children( HWND hwnd, BOOL geometry )
 static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                                            const struct window_rects *new_rects, struct window_surface *surface )
 {
+    ios_note_fullscreen_show( hwnd, swp_flags, &new_rects->visible );
+
     /* desktop mode, or a top-level window in game mode (Winios.m draws it
      * in its transparent game-mode overlay, never the desktop backdrop that
      * would cover the DXMT Metal layer) */
@@ -2058,7 +2149,7 @@ static void load_display_driver(void)
          * in app/Madeira/Winios/Winios.m and link in via Madeira.app. */
         if (winios_pCreateWindow)        winios_user_driver.pCreateWindow        = winios_pCreateWindow;
         if (winios_pDestroyWindow)       winios_user_driver.pDestroyWindow       = winios_pDestroyWindow;
-        if (winios_pProcessEvents)       winios_user_driver.pProcessEvents       = winios_pProcessEvents;
+        if (winios_pProcessEvents)       winios_user_driver.pProcessEvents       = winios_drv_process_events;
         if (winios_desktop_mode())       winios_user_driver.pSetCursor           = winios_drv_set_cursor;
         /* direct mode: inert (like winios_pSetCursor) until the app enables it */
         else if (winios_direct_cursor_set) winios_user_driver.pSetCursor         = winios_drv_set_cursor;
@@ -2614,6 +2705,10 @@ static HWND ios_main_window( DWORD pid )
         if (!get_window_thread( list[i], &wpid ) || wpid != pid) continue;
         style = get_window_long( list[i], GWL_STYLE );
         if ((style & (WS_POPUP | WS_CHILD)) == WS_CHILD) continue;
+        /* madeira-bcd: never a hidden window -- its keys would go nowhere, and
+         * a launcher that polls XInput with only hidden windows left (behind
+         * the game it started) must not take the game's foreground. */
+        if (!(style & WS_VISIBLE)) continue;
         if (!get_window_rect( list[i], &r, dpi )) continue;
         if (r.right - r.left < 320 || r.bottom - r.top < 200) continue;
         area = (LONGLONG)(r.right - r.left) * (r.bottom - r.top);
@@ -2621,6 +2716,53 @@ static HWND ios_main_window( DWORD pid )
     }
     free( list );
     return best;
+}
+
+/* madeira-bcd: NOBODY IN FRONT (opt-in, MADEIRA_INPUT_FOREGROUND=1). Horizon
+ * Zero Dawn on build 471 (2026-10-09 15:01) showed its window "DX12" through
+ * style changes and SetWindowPos with SWP_NOACTIVATE only, and it reads no
+ * XInput (it uses Windows.Gaming.Input), so neither the show rule above nor
+ * ios_foreground_check made it foreground: GetForegroundWindow() stayed NULL
+ * ([swap-win] ... fg=0x0). The wineserver queues WM_INPUT only for the
+ * foreground process (queue_ios.c get_foreground_thread) and sends keys to the
+ * foreground thread's focus, so its language menu got none of the Enter
+ * presses (drv_post_key status 0) and none of the taps. With the switch, while
+ * no window at all is foreground, a wine thread polling its messages or posting
+ * injected input makes its process's main window (ios_main_window: the largest
+ * visible top-level window of 320x200 or more) foreground. Never while some
+ * window is foreground, so it cannot take the foreground from another process.
+ * At most every 250 ms. Logs [fg-none] (16 lines). */
+static void ios_foreground_if_none( const char *why )
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static long long next_ns;
+    static int enabled = -1;
+    static unsigned int said;
+    DWORD pid = GetCurrentProcessId();
+    HWND main_hwnd;
+    struct timespec ts;
+    long long now;
+    BOOL ok;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_INPUT_FOREGROUND" );  /* 1: while no window is foreground, a process polling messages or posting input makes its main window foreground */
+        enabled = e && e[0] == '1' && !e[1];
+    }
+    if (!enabled || NtUserGetForegroundWindow()) return;
+
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    now = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    if (pthread_mutex_trylock( &lock )) return;
+    if (now < next_ns) { pthread_mutex_unlock( &lock ); return; }
+    next_ns = now + 250000000LL;
+    pthread_mutex_unlock( &lock );
+
+    if (!(main_hwnd = ios_main_window( pid ))) return;
+    ok = set_foreground_window( main_hwnd, FALSE, TRUE );
+    if (__atomic_fetch_add( &said, 1, __ATOMIC_RELAXED ) < 16)
+        dprintf( 2, "[fg-none] no window was foreground: made the main window %p of pid %04x foreground "
+                 "on %s, ok=%d (MADEIRA_INPUT_FOREGROUND=1)\n", main_hwnd, (unsigned)pid, why, ok );
 }
 
 static void ios_foreground_check(void)
