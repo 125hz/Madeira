@@ -186,8 +186,13 @@ static struct ios_proc_socket
     BOOL exiting;   /* per-process process_exiting flag */
 } ios_proc_sockets[IOS_MAX_PROC_SOCKETS];
 static int ios_proc_socket_count = 0;
+/* madeira-bcd: PEBs of exited child pseudo-processes (ios_peb_is_dead). */
+#define IOS_DEAD_PEB_MAX 64
+static void * volatile ios_dead_pebs[IOS_DEAD_PEB_MAX];
+static unsigned int ios_dead_peb_next;
 
 extern void *ios_jit_current_peb(void);
+extern ULONG_PTR ios_highest_user_address( BOOL wow64 );
 
 static int ios_proc_socket_index(void)
 {
@@ -320,8 +325,23 @@ static void ios_register_proc_socket(void *peb_id, int fd)
     ios_fdt_reg( fd, FDT_MASTER, peb_id );
     ios_proc_sockets[idx].fd = fd;
     ios_proc_sockets[idx].exiting = FALSE;
+    { int d; for (d = 0; d < IOS_DEAD_PEB_MAX; d++) if (ios_dead_pebs[d] == peb_id) ios_dead_pebs[d] = NULL; }
     __sync_synchronize();
     ios_proc_sockets[idx].peb = peb_id;
+}
+
+/* madeira-bcd: is this the PEB of a child pseudo-process that has exited? A
+ * thread whose TEB->Peb is listed is a zombie: the server's kill cannot signal
+ * it on iOS, and its JIT copies are reclaimed. Lock-free (read from the Mach
+ * exception thread); a live or re-registered PEB never counts as dead. */
+int ios_peb_is_dead( const void *peb )
+{
+    int i, n = ios_proc_socket_count;
+    if (!peb) return 0;
+    if (n > IOS_MAX_PROC_SOCKETS) n = IOS_MAX_PROC_SOCKETS;
+    for (i = 0; i < n; i++) if (ios_proc_sockets[i].peb == peb) return 0;
+    for (i = 0; i < IOS_DEAD_PEB_MAX; i++) if (ios_dead_pebs[i] == peb) return 1;
+    return 0;
 }
 #endif
 static _Thread_local int initial_cwd = -1;
@@ -1029,6 +1049,7 @@ static void ios_guest_rip_profile( int gen )
      * 2 = native (Madeira dylib = Wine unix + madsync + bridge, system libs). */
     extern void *ios_jit_rx_base_global; extern size_t ios_jit_pool_size_global;
     extern int ios_jit_pool_image_pc(uintptr_t pc, uintptr_t *pe_addr_out);
+    extern int ios_jit_low_contains( uintptr_t a );   /* madeira-bcd pool-low: region C, FEX code only */
     unsigned cls[3] = {0, 0, 0};
     struct { uint64_t key; unsigned n; } ib[48], xnb[48], jb[64]; int nib = 0, nnb = 0, njb = 0;   /* ml1124: jb = JIT host pc /64 */
     memset( rb, 0, sizeof(rb) ); memset( hb, 0, sizeof(hb) );
@@ -1072,6 +1093,7 @@ static void ios_guest_rip_profile( int gen )
                     uintptr_t rx0 = (uintptr_t)ios_jit_rx_base_global, pe_at = 0; int c;
                     if (st.__pc >= rx0 && st.__pc < rx0 + ios_jit_pool_size_global)
                         c = ios_jit_pool_image_pc( st.__pc, &pe_at ) ? 1 : 0;
+                    else if (ios_jit_low_contains( st.__pc )) c = 0;
                     else c = 2;
                     cls[c]++;
                     if (c == 0) {   /* ml1124 */
@@ -1878,9 +1900,12 @@ static int ios_wp_desc( uint64_t a, struct ios_ts_map *mp, char *out, size_t cap
 {
     extern void *ios_jit_rx_base_global; extern size_t ios_jit_pool_size_global;
     extern int ios_jit_pool_image_pc(uintptr_t pc, uintptr_t *pe_addr_out);
+    extern int ios_jit_low_contains( uintptr_t a );
     uintptr_t rx0 = (uintptr_t)ios_jit_rx_base_global, pe = 0; uint64_t rva = 0; const char *mod;
     Dl_info di;
     *kind = 0;
+    /* madeira-bcd pool-low: region C holds FEX code buffers only */
+    if (ios_jit_low_contains( (uintptr_t)a )) { snprintf( out, cap, "x64-JIT" ); *kind = 3; return 1; }
     if (a >= rx0 && a < rx0 + ios_jit_pool_size_global)
     {
         if (!ios_jit_pool_image_pc( a, &pe )) { snprintf( out, cap, "x64-JIT" ); *kind = 3; return 1; }
@@ -2265,12 +2290,11 @@ static void invoke_system_apc( const union apc_call *call, union apc_result *res
         }
         if (call->virtual_alloc_ex.limit_low || call->virtual_alloc_ex.limit_high || call->virtual_alloc_ex.align)
         {
-            SYSTEM_BASIC_INFORMATION sbi;
             SIZE_T limit_low, limit_high, align;
 
-            virtual_get_system_info( &sbi, is_wow64() );
+            /* madeira-bcd: the real limit, not the reported one (see ios_highest_user_address) */
             limit_low = call->virtual_alloc_ex.limit_low;
-            limit_high = min( (ULONG_PTR)sbi.HighestUserAddress, call->virtual_alloc_ex.limit_high );
+            limit_high = min( ios_highest_user_address( is_wow64() ), call->virtual_alloc_ex.limit_high );
             align = call->virtual_alloc_ex.align;
             if (limit_low != call->virtual_alloc_ex.limit_low || align != call->virtual_alloc_ex.align)
             {
@@ -2428,10 +2452,8 @@ static void invoke_system_apc( const union apc_call *call, union apc_result *res
         }
         if (call->map_view_ex.limit_low || call->map_view_ex.limit_high)
         {
-            SYSTEM_BASIC_INFORMATION sbi;
-
-            virtual_get_system_info( &sbi, is_wow64() );
-            limit_high = min( (ULONG_PTR)sbi.HighestUserAddress, call->map_view_ex.limit_high );
+            /* madeira-bcd: the real limit, not the reported one (see ios_highest_user_address) */
+            limit_high = min( ios_highest_user_address( is_wow64() ), call->map_view_ex.limit_high );
             addr_req.LowestStartingAddress = (void *)limit_low;
             addr_req.HighestEndingAddress = (void *)limit_high;
             addr_req.Alignment = 0;
@@ -3823,6 +3845,7 @@ void process_exit_wrapper( int status )
         ios_fdt_note_close( ios_proc_sockets[i].fd, "exit-master", dead_peb );
         close( ios_proc_sockets[i].fd );
         ios_proc_sockets[i].peb = NULL;
+        ios_dead_pebs[__sync_fetch_and_add( &ios_dead_peb_next, 1 ) % IOS_DEAD_PEB_MAX] = dead_peb;
         /* ml571: drop this pseudo-process's fd cache and close what it held.
          * Must happen on the SAME identity used to key it, and before the JIT
          * reclaim below reuses anything. */

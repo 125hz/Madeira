@@ -1646,6 +1646,29 @@ struct object *create_user_data_mapping( struct object *root, const struct unico
 }
 
 /* create a file mapping */
+/* madeira-bcd: Social Club's overlay hands its UI frames from SocialClubHelper.exe
+ * to the game as a BGRA bitmap in named shared memory
+ * ("rgsc_window_%u_mem_%x_inst_%u", width*height*4 + 0x8000 bytes, created with
+ * CreateFileMappingW by socialclub.dll). Log the first creates/opens of such
+ * names so a GTA log shows whether that transport is up. Returns 1 and the
+ * ASCII name in `out` when `name` contains "rgsc_". */
+static int ws_rgsc_name( const struct unicode_str *name, char *out, size_t cap )
+{
+    static const char tag[] = "rgsc_";
+    size_t n = name->len / sizeof(WCHAR), i, k;
+
+    for (i = 0; i + 5 <= n; i++)
+    {
+        for (k = 0; k < 5 && name->str[i + k] == (WCHAR)tag[k]; k++);
+        if (k < 5) continue;
+        for (k = 0; k < n && k + 1 < cap; k++)
+            out[k] = (name->str[k] >= 0x20 && name->str[k] < 0x7f) ? (char)name->str[k] : '?';
+        out[k] = 0;
+        return 1;
+    }
+    return 0;
+}
+
 DECL_HANDLER(create_mapping)
 {
     struct object *root;
@@ -1668,6 +1691,17 @@ DECL_HANDLER(create_mapping)
     }
     else ws_log("[srv-map] create_mapping FAILED err=%08x flags=%08x size=%llu pid=%04x\n",
                 get_error(), req->flags, (unsigned long long)req->size, current->process->id);
+    {
+        static int rgsc_n;
+        char nm[160];
+        if (rgsc_n < 32 && ws_rgsc_name( &name, nm, sizeof(nm) ))
+        {
+            rgsc_n++;
+            ws_log("[sc-shm] create_mapping \"%s\" size=%llu flags=%08x pid=%04x -> handle=%04x err=%08x\n",
+                   nm, (unsigned long long)req->size, req->flags, current->process->id,
+                   reply->handle, get_error());
+        }
+    }
 
     if (root) release_object( root );
 }
@@ -1679,6 +1713,16 @@ DECL_HANDLER(open_mapping)
 
     reply->handle = open_object( current->process, req->rootdir, req->access,
                                  &mapping_ops, &name, req->attributes );
+    {
+        static int rgsc_n;
+        char nm[160];
+        if (rgsc_n < 32 && ws_rgsc_name( &name, nm, sizeof(nm) ))
+        {
+            rgsc_n++;
+            ws_log("[sc-shm] open_mapping \"%s\" pid=%04x -> handle=%04x err=%08x\n",
+                   nm, current->process->id, reply->handle, get_error());
+        }
+    }
 }
 
 /* get a mapping information */

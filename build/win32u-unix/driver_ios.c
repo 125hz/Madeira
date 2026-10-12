@@ -398,9 +398,13 @@ int winios_drv_foreground_if_owner( HWND hwnd )
  * driver hooks below). Called on wine threads — the app side copies the
  * bits before returning and uploads on the main thread. */
 extern int winios_surface_present( HWND hwnd, int dirty_x, int dirty_y, int dirty_w, int dirty_h,
-                                    int surf_w, int surf_h, int stride, const void *bits ) __attribute__((weak));
+                                    int surf_w, int surf_h, int stride, const void *bits,
+                                    unsigned int alpha_mask ) __attribute__((weak));
 extern void winios_window_frame( HWND hwnd, int x, int y, int w, int h, int visible,
                                  int cx, int cy, int cw, int ch ) __attribute__((weak));
+extern void winios_window_visibility( HWND hwnd, int visible ) __attribute__((weak));
+extern void winios_window_geometry( HWND hwnd, int x, int y, int w, int h,
+                                    int cx, int cy, int cw, int ch ) __attribute__((weak));
 extern void winios_cursor_set( unsigned int id, int w, int h, int hot_x, int hot_y,
                                const void *bgra ) __attribute__((weak));
 extern void winios_cursor_show( int show ) __attribute__((weak));
@@ -647,7 +651,7 @@ static BOOL winios_surface_flush( struct window_surface *surface, const RECT *re
         if (!winios_surface_present( surface->hwnd,
                                      dirty->left, dirty->top,
                                      dirty->right - dirty->left, dirty->bottom - dirty->top,
-                                     surf_w, surf_h, surf_w * 4, color_bits ))
+                                     surf_w, surf_h, surf_w * 4, color_bits, surface->alpha_mask ))
             return FALSE;
     }
     return TRUE;
@@ -821,6 +825,81 @@ static BOOL winios_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *sur
     return TRUE;
 }
 
+/* WindowPosChanged gives children parent-relative raw-pixel rectangles, but
+ * the app's independent HWND layers need screen coordinates. Query on this
+ * Wine thread, after apply_window_pos updated the rectangles. Translate the
+ * supplied frame rather than replacing it: retain its visible bounds, client
+ * offset and pixel dimensions, including a server-side rectangle fallback.
+ * Roots keep the driver's supplied frame (notably exclusive fullscreen). */
+static BOOL winios_drv_screen_rects( HWND hwnd, const struct window_rects *new_rects,
+                                    struct window_rects *rects )
+{
+    struct window_rects screen, parent;
+    HWND ancestor = NtUserGetAncestor( hwnd, GA_PARENT );
+    UINT raw_dpi = 0;
+    int x, y;
+
+    if (new_rects && (!ancestor || ancestor == get_desktop_window()))
+    {
+        *rects = *new_rects;
+        return TRUE;
+    }
+    if (!get_win_monitor_dpi( hwnd, &raw_dpi ) || !raw_dpi ||
+        !get_window_rects( hwnd, COORDS_SCREEN, &screen, raw_dpi )) return FALSE;
+    if (!new_rects)
+    {
+        *rects = screen;
+        return TRUE;
+    }
+    if (!get_window_rects( hwnd, COORDS_PARENT, &parent, raw_dpi )) return FALSE;
+    x = screen.window.left - parent.window.left;
+    y = screen.window.top - parent.window.top;
+    *rects = *new_rects;
+    OffsetRect( &rects->window, x, y );
+    /* An RTL parent can mirror asymmetric client/visible insets. Use each
+     * rectangle's own translation, while keeping the supplied dimensions. */
+    OffsetRect( &rects->client, screen.client.left - parent.client.left,
+                screen.client.top - parent.client.top );
+    OffsetRect( &rects->visible, screen.visible.left - parent.visible.left,
+                screen.visible.top - parent.visible.top );
+    return TRUE;
+}
+
+/* A parent move/show/hide does not send WindowPosChanged to every child.
+ * Refresh existing independent layers without recreating their surfaces or
+ * Metal layers. Query screen coordinates through Wine for nested children. */
+static void winios_drv_refresh_children( HWND hwnd, BOOL geometry )
+{
+    HWND *children;
+    ULONG capacity = 128, count, i;
+    NTSTATUS status;
+
+    if (!winios_window_visibility && !(geometry && winios_window_geometry)) return;
+    for (;;)
+    {
+        if (!(children = malloc( capacity * sizeof(*children) ))) return;
+        status = NtUserBuildHwndList( 0, hwnd, TRUE, TRUE, 0, capacity, children, &count );
+        if (!status) break;
+        free( children );
+        if (status != STATUS_BUFFER_TOO_SMALL || count <= capacity) return;
+        capacity = count;
+    }
+    /* NtUserBuildHwndList includes a final HWND_BOTTOM sentinel. */
+    for (i = 0; i + 1 < count; i++)
+    {
+        struct window_rects rects;
+        if (geometry && winios_window_geometry && winios_drv_screen_rects( children[i], NULL, &rects ))
+        {
+            const RECT *v = &rects.visible, *c = &rects.client;
+            winios_window_geometry( children[i], v->left, v->top, v->right - v->left, v->bottom - v->top,
+                                    c->left, c->top, c->right - c->left, c->bottom - c->top );
+        }
+        if (winios_window_visibility)
+            winios_window_visibility( children[i], is_window_visible( children[i] ) );
+    }
+    free( children );
+}
+
 /* pWindowPosChanged wrapper: dereference window_rects HERE (Winios.m
  * cannot include wine headers) and forward plain ints for the layer
  * frame; chain to the Winios.m hook afterwards. */
@@ -834,11 +913,36 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
         || (winios_game_windows() && !(get_window_long( hwnd, GWL_STYLE ) & WS_CHILD)
             && NtUserGetAncestor( hwnd, GA_PARENT ) == get_desktop_window())))
     {
-        const RECT *v = &new_rects->visible;
-        const RECT *c = &new_rects->client;
-        int visible = !IsRectEmpty( v ) && !(swp_flags & SWP_HIDEWINDOW);
-        winios_window_frame( hwnd, v->left, v->top, v->right - v->left, v->bottom - v->top, visible,
-                             c->left, c->top, c->right - c->left, c->bottom - c->top );
+        struct window_rects rects = *new_rects;
+        const RECT *v = &rects.visible;
+        const RECT *c = &rects.client;
+        BOOL desktop = winios_desktop_mode();
+        BOOL frame_valid = !desktop || winios_drv_screen_rects( hwnd, new_rects, &rects );
+        /* The visible rect describes geometry even for a hidden window.
+         * Wine has already updated WS_VISIBLE before this callback; include
+         * its parent chain so a hidden browser's child Metal layer stays hidden. */
+        int visible = is_window_visible( hwnd ) && !IsRectEmpty( v ) && !(swp_flags & SWP_HIDEWINDOW);
+        if (frame_valid)
+            winios_window_frame( hwnd, v->left, v->top, v->right - v->left, v->bottom - v->top, visible,
+                                 c->left, c->top, c->right - c->left, c->bottom - c->top );
+        if (desktop)
+        {
+            BOOL geometry = !(swp_flags & SWP_NOMOVE) || !(swp_flags & SWP_NOSIZE) ||
+                            (swp_flags & SWP_FRAMECHANGED);
+            if (geometry || (swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW)))
+                winios_drv_refresh_children( hwnd, geometry );
+            if (!frame_valid || v->left != new_rects->visible.left || v->top != new_rects->visible.top)
+            {
+                static unsigned frame_n;
+                unsigned n = ++frame_n;
+                if (n <= 64 || (n % 128) == 0)
+                    dprintf( 2, "[win-frame] #%u hwnd=%p valid=%u local={%d,%d,%d,%d} "
+                             "screen={%d,%d,%d,%d} rev=sc-screen\n", n, (void *)hwnd, (unsigned)frame_valid,
+                             (int)new_rects->visible.left, (int)new_rects->visible.top,
+                             (int)new_rects->visible.right, (int)new_rects->visible.bottom,
+                             (int)v->left, (int)v->top, (int)v->right, (int)v->bottom );
+            }
+        }
         if (visible && surface && winios_game_windows()) winios_note_dialog_thread( hwnd, v );
     }
     /* ml505: z-order and geometry churn. If the three same-rect siblings are
@@ -858,8 +962,11 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
         {
             const RECT *v = &new_rects->visible;
             dprintf( 2, "[win-pos] #%u hwnd=%p after=%p flags=%08x vis={%d,%d,%d,%d} "
-                     "surface=%p rev=ml505\n", n, hwnd, insert_after, (unsigned)swp_flags,
-                     (int)v->left, (int)v->top, (int)v->right, (int)v->bottom, surface );
+                     "surface=%p rev=ml505 style=%08x visible=%u parent=%p\n",
+                     n, hwnd, insert_after, (unsigned)swp_flags,
+                     (int)v->left, (int)v->top, (int)v->right, (int)v->bottom, surface,
+                     (unsigned)get_window_long( hwnd, GWL_STYLE ), (unsigned)is_window_visible( hwnd ),
+                     NtUserGetAncestor( hwnd, GA_PARENT ) );
             /* ml853: name the window. A dialog nobody can see (nothing is
              * presenting) is otherwise just a rectangle; the class and the
              * text of every window, children included, make it readable
