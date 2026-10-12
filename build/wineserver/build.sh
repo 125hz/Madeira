@@ -111,6 +111,7 @@ PATCHED_FILES=(
     # replacements: both lists, as for every entry here.
     "hidpad_ios:hidpad_ios.c:hidpad_ios.o"
     "hidparse_ios:$REPO_ROOT/build/hidpad/hidparse_ios.c:hidparse_ios.o"
+    "storage_device_ios:storage_device_ios.c:storage_device_ios.o"
 )
 
 echo "=== Building kill wrapper (without kill macro) ==="
@@ -188,6 +189,7 @@ REPLACEMENTS=(
     "inproc_sync.o:inproc_sync.o"   # ml1058
     "hidpad_ios.o:hidpad_ios.o"     # ml2101
     "hidparse_ios.o:hidparse_ios.o" # ml2101
+    "storage_device_ios.o:storage_device_ios.o"
 )
 
 for entry in "${REPLACEMENTS[@]}"; do
