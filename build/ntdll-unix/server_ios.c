@@ -798,6 +798,130 @@ static void ios_thread_sampler_pass(int burst)
     vm_deallocate(mach_task_self(), (vm_address_t)tlist, tcount * sizeof(*tlist));
 }
 
+/* madeira-bcd ml1112b: NAME what a hot IAT call calls.
+ *
+ * ml1112 printed `call [slot] -> target` as two numbers, and the God of War
+ * 1080p log (2026-10-01 15:06:44, build 279) needed the game binary and the
+ * shipped kernel32.dll by hand to learn that 0x71fe7074f0 is kernel32!Sleep
+ * and 0x71fe7109a0 kernel32!GetCurrentThreadId (an x64 fast-forward thunk in
+ * .hexpthk). These two helpers do that on the device:
+ *   - ios_rp_export_name: the nearest export at or below an RVA of a PE image
+ *     ("kernel32.dll!Sleep", "+0x.." when not exact);
+ *   - ios_rp_import_name: which import an IAT slot of the CALLING image holds
+ *     ("KERNEL32.dll!Sleep"), from its import directory.
+ * Read-only and bounded: every read is ios_ts_read (vm_read_overwrite, which
+ * fails instead of faulting on an unmapped page), into fixed buffers on the
+ * stack -- no allocation, no lock -- and every loop has a cap. They run on the
+ * thread sampler's own thread (ios_thread_sampler_main), never in a signal or
+ * exception context, and only for the <= 6 hottest buckets of a profile. */
+static int ios_rp_read_str( uint64_t a, char *out, size_t cap )
+{
+    size_t n;
+    if (!cap) return 0;
+    out[0] = 0;
+    /* a name can end right before an unmapped page: try shorter windows */
+    for (n = cap - 1; n >= 8; n /= 2)
+        if (ios_ts_read( a, out, n )) { out[n] = 0; return out[0] != 0; }
+    return 0;
+}
+
+static int ios_rp_pe_dir( uint64_t base, int index, uint32_t dir[2] )
+{
+    uint32_t lfanew = 0, sig = 0; uint16_t magic = 0;
+    dir[0] = dir[1] = 0;
+    if (!ios_ts_read( base + 0x3c, &lfanew, 4 ) || lfanew < 0x40 || lfanew > 0x1000) return 0;
+    if (!ios_ts_read( base + lfanew, &sig, 4 ) || sig != 0x00004550) return 0;          /* "PE\0\0" */
+    if (!ios_ts_read( base + lfanew + 24, &magic, 2 ) || magic != 0x20b) return 0;       /* PE32+ */
+    return ios_ts_read( base + lfanew + 24 + 112 + 8 * index, dir, 8 ) && dir[0] && dir[1];
+}
+
+static int ios_rp_export_name( uint64_t base, const char *mod, uint32_t rva, char *out, size_t cap )
+{
+    uint32_t dir[2], ed[10], nfunc, nname, i, j, best = ~0u, bestrva = 0, chunk32[256];
+    uint16_t chunk16[256];
+    char nm[64];
+    if (!ios_rp_pe_dir( base, 0, dir ) || dir[1] < 40) return 0;
+    if (!ios_ts_read( base + dir[0], ed, sizeof(ed) )) return 0;
+    nfunc = ed[5] > 16384 ? 16384 : ed[5];
+    nname = ed[6] > 16384 ? 16384 : ed[6];
+    for (i = 0; i < nfunc; i += 256)
+    {
+        uint32_t n = nfunc - i < 256 ? nfunc - i : 256, k;
+        if (!ios_ts_read( base + ed[7] + (uint64_t)i * 4, chunk32, n * 4 )) return 0;
+        for (k = 0; k < n; k++)
+        {
+            uint32_t f = chunk32[k];
+            if (!f || f > rva || (f >= dir[0] && f < dir[0] + dir[1])) continue;   /* empty, above, forwarder string */
+            if (best == ~0u || f > bestrva) { best = i + k; bestrva = f; }
+        }
+    }
+    if (best == ~0u) return 0;
+    for (j = 0; j < nname; j += 256)
+    {
+        uint32_t n = nname - j < 256 ? nname - j : 256, k, name_rva = 0;
+        if (!ios_ts_read( base + ed[9] + (uint64_t)j * 2, chunk16, n * 2 )) break;
+        for (k = 0; k < n; k++)
+        {
+            if (chunk16[k] != best) continue;
+            if (!ios_ts_read( base + ed[8] + (uint64_t)(j + k) * 4, &name_rva, 4 ) ||
+                !ios_rp_read_str( base + name_rva, nm, sizeof(nm) )) break;
+            if (rva == bestrva) snprintf( out, cap, "%s!%s", mod, nm );
+            else snprintf( out, cap, "%s!%s+0x%x", mod, nm, rva - bestrva );
+            return 1;
+        }
+    }
+    snprintf( out, cap, "%s!#%u+0x%x", mod, ed[4] + best, rva - bestrva );   /* exported by ordinal only */
+    return 1;
+}
+
+static int ios_rp_import_name( uint64_t base, uint64_t slot, char *out, size_t cap )
+{
+    uint32_t dir[2], desc[5], srva, best_ft = 0, best_oft = 0, best_name = 0, idx, k;
+    uint64_t ents[64], ent;
+    char dll[48], fn[64];
+    int d;
+    if (slot < base || slot - base >= 0x80000000ull || !ios_rp_pe_dir( base, 1, dir )) return 0;
+    srva = (uint32_t)(slot - base);
+    for (d = 0; d < 512; d++)   /* the descriptor whose IAT starts closest below the slot */
+    {
+        if (!ios_ts_read( base + dir[0] + (uint64_t)d * 20, desc, sizeof(desc) )) return 0;
+        if (!desc[3] && !desc[4]) break;
+        if (desc[4] <= srva && desc[4] > best_ft) { best_ft = desc[4]; best_oft = desc[0]; best_name = desc[3]; }
+    }
+    if (!best_ft || !best_oft || (srva - best_ft) % 8) return 0;
+    idx = (srva - best_ft) / 8;
+    if (idx > 8192) return 0;
+    for (k = 0; k <= idx; k += 64)   /* inside this descriptor's array: no terminator before the slot */
+    {
+        uint32_t n = idx + 1 - k < 64 ? idx + 1 - k : 64, q;
+        if (!ios_ts_read( base + best_oft + (uint64_t)k * 8, ents, n * 8 )) return 0;
+        for (q = 0; q < n; q++) if (!ents[q]) return 0;
+    }
+    ent = ents[(idx % 64)];
+    if (!ios_rp_read_str( base + best_name, dll, sizeof(dll) )) strcpy( dll, "?" );
+    if (ent >> 63) snprintf( out, cap, "%s!#%u", dll, (unsigned)(ent & 0xffff) );
+    else if (ios_rp_read_str( base + (ent & 0x7fffffff) + 2, fn, sizeof(fn) )) snprintf( out, cap, "%s!%s", dll, fn );
+    else return 0;
+    return 1;
+}
+
+/* "kernel32.dll!Sleep" for a call target: a pool-copy address goes back to its
+ * PE address first (ARM64EC code runs from the JIT pool), then the module comes
+ * from the sampled process's own loader list (ios_ts_map_for_teb). */
+static void ios_rp_name_target( uint64_t teb, uint64_t target, char *out, size_t cap )
+{
+    extern int ios_jit_pool_image_pc( uintptr_t pc, uintptr_t *pe_addr_out );
+    struct ios_ts_map *mp = ios_ts_map_for_teb( teb );
+    uintptr_t pe = 0;
+    uint64_t rva = 0;
+    const char *mn;
+    out[0] = 0;
+    if (ios_jit_pool_image_pc( (uintptr_t)target, &pe ) && pe) target = pe;
+    if (!(mn = ios_ts_mod_for( mp, target, &rva ))) return;
+    if (!ios_rp_export_name( target - rva, mn, (uint32_t)rva, out, cap ))
+        snprintf( out, cap, "%s+0x%llx", mn, (unsigned long long)rva );
+}
+
 /* ml979: is the guest looping tightly, or grinding forward slowly?
  *
  * rdr48/rdr49 plateau with four guest threads at ~35% CPU each, all with RIPs
@@ -832,6 +956,7 @@ static void ios_guest_rip_profile( int gen )
     int nb = 0, pass, i;
     thread_act_t tg[ML979_MAXTHREADS];
     int ntg = 0;
+    uint64_t rp_teb = 0;   /* ml1112b: a sampled guest thread's TEB, for the module list */
 
     /* ml980 FIX: the state read MUST be bracketed by thread_suspend/resume.
      *
@@ -857,11 +982,13 @@ static void ios_guest_rip_profile( int gen )
             /* ml981: a guest thread is one whose frame yields a plausible RIP at
              * x28+0x18 -- the same test the sampling loop uses, so a thread can
              * never be selected here and then fail to resolve below. */
+            uint64_t teb_k = 0;
             if (thread_get_state( tl[k], ARM_THREAD_STATE64, (thread_state_t)&st, &cnt ) == KERN_SUCCESS
                 && ios_ts_read( st.__x[28] + 0x18, &bb, 8 )
                 && bb > 0x10000 && bb < 0x8000000000ull
-                && ios_ts_teb( pthread_from_mach_thread_np( tl[k] ) ))   /* ml1116: a Wine thread (has a TEB); native threads passed the x28 test by accident */
+                && (teb_k = ios_ts_teb( pthread_from_mach_thread_np( tl[k] ) )))   /* ml1116: a Wine thread (has a TEB); native threads passed the x28 test by accident */
             {
+                if (!rp_teb) rp_teb = teb_k;
                 tg[ntg] = tl[k];
                 mach_port_mod_refs( mach_task_self(), tl[k], MACH_PORT_RIGHT_SEND, 1 ); /* keep it */
                 ntg++;
@@ -1063,18 +1190,39 @@ static void ios_guest_rip_profile( int gen )
          * (ff 15) in the bucket: the IAT slot and the pointer in it name the import
          * the game is inside (the RIP of a thread in an ARM64EC callee stays at the
          * call site). */
+        /* ml1112b: once per run, how to read the RUNNING histogram -- the 2026-10-01
+         * God of War log was first read as "43 % of the CPU inside Sleep and
+         * GetCurrentThreadId"; [cpu-split] of the same profiles put only 1-6 % of
+         * the host pcs in ARM64EC images and most of the rest in sched_yield. */
+        {
+            static int said;
+            if (!said++)
+                wine_log_write( "[rip-profile] ml1112b note: RUNNING = Mach TH_STATE_RUNNING, i.e. on a core OR queued for one; "
+                                "the guest RIP is FEX's last synchronised RIP (it moves at calls into ARM64EC code and dispatcher "
+                                "exits, not per x64 instruction), so a bucket at an IAT call means 'last left the JIT there'. "
+                                "[cpu-split] gives where the host pc really was." );
+        }
         for (i = 0; i < nrb && i < 6; i++) {
             unsigned char code[80]; int k;
+            uint64_t img_rva = 0, img_base = 0;
             if (rb[i].base < 0x140000000ull || rb[i].base >= 0x148000000ull) continue;
             if (!ios_ts_read( rb[i].base, code, sizeof(code) )) continue;
+            if (ios_ts_mod_for( ios_ts_map_for_teb( rp_teb ), rb[i].base, &img_rva )) img_base = rb[i].base - img_rva;
             for (k = 0; k + 6 <= 64; k++) {
                 if (code[k] == 0xff && code[k + 1] == 0x15) {
                     int32_t disp; uint64_t slot, target = 0;
+                    char callee[160] = "", imp[120] = "";
                     memcpy( &disp, code + k + 2, 4 );
                     slot = rb[i].base + k + 6 + (int64_t)disp;
                     ios_ts_read( slot, &target, 8 );
-                    wine_log_write( "[rip-profile] ml1112 bucket %#llx: call [%#llx] -> %#llx (%u%% of running)",
-                                    (unsigned long long)rb[i].base, (unsigned long long)slot, (unsigned long long)target, rtotal ? (rb[i].n * 100) / rtotal : 0 );
+                    /* ml1112b: what the slot imports (the caller's import table) and
+                     * what the pointer in it is (the callee's export table) */
+                    if (target) ios_rp_name_target( rp_teb, target, callee, sizeof(callee) );
+                    if (img_base) ios_rp_import_name( img_base, slot, imp, sizeof(imp) );
+                    wine_log_write( "[rip-profile] ml1112 bucket %#llx: call [%#llx] -> %#llx%s%s%s%s%s (%u%% of running)",
+                                    (unsigned long long)rb[i].base, (unsigned long long)slot, (unsigned long long)target,
+                                    callee[0] ? " = " : "", callee, imp[0] ? " (import " : "", imp, imp[0] ? ")" : "",
+                                    rtotal ? (rb[i].n * 100) / rtotal : 0 );
                 }
             }
         }
@@ -1158,6 +1306,52 @@ static struct ios_xp_mod ios_xp_mods[160];
 static int ios_xp_nmods;
 static uint64_t ios_xp_peb, ios_xp_heap, ios_xp_fex_addr, ios_xp_nt_addr;
 static volatile uint64_t ios_xp_game_teb;   /* set by the xprobe loop from a P/E role thread */
+
+/* madeira-bcd ml1131c: the game process for a title with no D3D12 roles.
+ *
+ * ios_xp_game_teb came only from a thread madeira_d3d12 registered as P or E,
+ * so for a D3D11 game (God of War through DXMT) the module map was never built
+ * and [xp-api] printed "x64->EC 0/s" with no [xp-api-top] / -qpc / -cs lines:
+ * FEX's x64->EC counters and ntdll's QPC / critical-section / WaitOnAddress
+ * counters existed but were never found. Without roles, every ~10 s the Wine
+ * process (PEB) whose threads used the most CPU in that window supplies the
+ * TEB; when that process changes (boot helpers first, then the game), the
+ * counter blocks are looked up again in the new one. Measurement only: this
+ * runs on the xprobe thread, which is also the only reader of these globals. */
+static struct { uint64_t peb, teb; double ms; } ios_xp_fb[8];
+static int ios_xp_nfb;
+static uint64_t ios_xp_fb_peb;        /* the process the fallback currently follows */
+static volatile unsigned ios_xp_rebind;   /* bumped on a switch; the reporter restarts its deltas */
+static void ios_xp_fallback_add( uint64_t teb, double ms )
+{
+    uint64_t peb = 0; int i;
+    if (!ios_ts_read( teb + 0x60, &peb, 8 ) || !peb) return;
+    for (i = 0; i < ios_xp_nfb; i++) if (ios_xp_fb[i].peb == peb) break;
+    if (i == ios_xp_nfb)
+    {
+        if (ios_xp_nfb >= 8) return;
+        ios_xp_fb[i].peb = peb; ios_xp_fb[i].ms = 0; ios_xp_fb[i].teb = teb; ios_xp_nfb++;
+    }
+    ios_xp_fb[i].ms += ms;
+    ios_xp_fb[i].teb = teb;   /* any live thread of that process will do */
+}
+static void ios_xp_fallback_pick( void )
+{
+    int i, best = -1;
+    for (i = 0; i < ios_xp_nfb; i++) if (best < 0 || ios_xp_fb[i].ms > ios_xp_fb[best].ms) best = i;
+    if (best >= 0 && !ios_xp_nroles && ios_xp_fb[best].peb != ios_xp_fb_peb)
+    {
+        ios_xp_fb_peb = ios_xp_fb[best].peb;
+        ios_xp_game_teb = ios_xp_fb[best].teb;
+        ios_xp_fex_addr = ios_xp_nt_addr = 0;
+        ios_xp_rebind++;
+        wine_log_write( "[xp-api] ml1131c no D3D12 role threads: counters follow the busiest Wine process "
+                        "(peb 0x%llx via teb 0x%llx, %.0f ms CPU in the last 10 s)",
+                        (unsigned long long)ios_xp_fb_peb, (unsigned long long)ios_xp_game_teb, ios_xp_fb[best].ms );
+    }
+    else if (best >= 0 && !ios_xp_nroles) ios_xp_game_teb = ios_xp_fb[best].teb;   /* same process, a thread that is alive now */
+    ios_xp_nfb = 0;
+}
 
 struct ios_xp_expc { uint64_t base; uint32_t exp_rva, exp_size, nfunc, nname; uint32_t *funcs, *names; uint16_t *ords; };
 static struct ios_xp_expc ios_xp_expcache[32];
@@ -1286,6 +1480,10 @@ static void ios_xp_api_report( const char *wall, double wall_s )
 
     if (!fex) { fex = calloc( IOS_XP_FEX_WORDS, 8 ); fex_prev = calloc( IOS_XP_FEX_WORDS, 8 ); nt = calloc( 1, sizeof(*nt) ); nt_prev = calloc( 1, sizeof(*nt) ); }
     if (!fex || !fex_prev || !nt || !nt_prev) return;
+    {   /* ml1131c: the fallback moved to another process: its counters start a new series */
+        static unsigned seen_rebind;
+        if (seen_rebind != ios_xp_rebind) { seen_rebind = ios_xp_rebind; have_fex = have_nt = 0; map_age = 1000; }
+    }
     if (++map_age > 10 || !ios_xp_fex_addr || !ios_xp_nt_addr)   /* every ~10 s, or until both are found */
     {
         struct ios_xp_mod *m;
@@ -1553,6 +1751,7 @@ static void ios_xprobe_main( void )
                                 r->role = NULL;
                                 for (i = 0; i < ios_xp_nroles; i++) if (ios_xp_roles[i].tid == idi.thread_id) { r->role = ios_xp_roles[i].role; break; }
                                 if (r->role && teb && (strchr( r->role, 'P' ) || strchr( r->role, 'E' ))) ios_xp_game_teb = teb;   /* ml1131 */
+                                if (teb && !ios_xp_nroles) ios_xp_fallback_add( teb, pt + et );   /* ml1131c */
                                 sum_thr_ms += pt + et; nrows++;
                             }
                         }
@@ -1563,6 +1762,7 @@ static void ios_xprobe_main( void )
             }
             vm_deallocate( mach_task_self(), (vm_address_t)th, nth * sizeof(*th) );
         }
+        if (!(gen % 40)) ios_xp_fallback_pick();   /* ml1131c: every ~10 s */
 
         /* process counters + PE counters */
         memset( &ru, 0, sizeof(ru) );
