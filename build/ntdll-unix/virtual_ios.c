@@ -10240,6 +10240,121 @@ static int get_unix_prot( BYTE vprot )
 /***********************************************************************
  *           dump_view
  */
+#ifdef WINE_IOS
+/* Called with virtual_mutex held, only after a constrained FEX allocation
+ * fails. Count live views, rather than ALLOC/COMMIT events (which count the
+ * same span repeatedly). Read only Wine's native protection bookkeeping;
+ * never read guest/FEX payloads or reclaim a live or dead thread's memory. */
+static void ios_fex_arena_census( void *start, void *end, size_t request, size_t align_mask )
+{
+    struct fex_va_bucket { size_t size, bytes, committed; unsigned flags, views; } buckets[32] = {{0}};
+    struct file_view *view;
+    ULONG_PTR lo = ios_fex_arena_base_unix, hi = ios_fex_arena_end_unix, cursor;
+    size_t covered = 0, committed = 0, overlap = 0, biggest = 0, aligned_biggest = 0;
+    size_t other_bytes = 0, other_committed = 0;
+    unsigned nviews = 0, holes = 0, used = 0, other_views = 0, i, j;
+    static unsigned printed;
+
+    if (printed || !lo || hi <= lo || (ULONG_PTR)start < lo || (ULONG_PTR)end > hi ||
+        (ULONG_PTR)start >= (ULONG_PTR)end || !page_size) return;
+    printed = 1;
+    cursor = lo;
+    WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+    {
+        ULONG_PTR b = (ULONG_PTR)view->base, e, first, fresh, p;
+        size_t vc = 0;
+
+        if (b >= hi) break;
+        e = view->size > ~(ULONG_PTR)0 - b ? ~(ULONG_PTR)0 : b + view->size;
+        if (e <= lo || e <= b) continue;
+        if (b < lo) b = lo;
+        if (e > hi) e = hi;
+        nviews++;
+        if (b > cursor)
+        {
+            size_t gap = b - cursor;
+            ULONG_PTR aligned;
+            holes++;
+            if (gap > biggest) biggest = gap;
+            if (cursor <= ~(ULONG_PTR)0 - align_mask)
+            {
+                aligned = (cursor + align_mask) & ~(ULONG_PTR)align_mask;
+                if (aligned < b && b - aligned > aligned_biggest) aligned_biggest = b - aligned;
+            }
+        }
+        first = b;
+        fresh = b > cursor ? b : cursor;
+        if (b < cursor) overlap += (e < cursor ? e : cursor) - b;
+        if (e > fresh) covered += e - fresh;
+        if (e > cursor) cursor = e;
+        for (p = first; p < e; )
+        {
+            size_t bytes = e - p < page_size ? e - p : page_size;
+            if (get_page_vprot( (void *)p ) & VPROT_COMMITTED)
+            {
+                vc += bytes;
+                if (p >= fresh) committed += bytes;
+                else if (p + bytes > fresh) committed += p + bytes - fresh;
+            }
+            p += bytes;
+        }
+        for (i = 0; i < used; i++)
+            if (buckets[i].size == view->size && buckets[i].flags == view->protect) break;
+        if (i == used && used < ARRAY_SIZE(buckets))
+        {
+            buckets[i].size = view->size;
+            buckets[i].flags = view->protect;
+            used++;
+        }
+        if (i < used)
+        {
+            buckets[i].views++;
+            buckets[i].bytes += e - b;
+            buckets[i].committed += vc;
+        }
+        else
+        {
+            other_views++;
+            other_bytes += e - b;
+            other_committed += vc;
+        }
+    }
+    if (cursor < hi)
+    {
+        size_t gap = hi - cursor;
+        ULONG_PTR aligned;
+        holes++;
+        if (gap > biggest) biggest = gap;
+        if (cursor <= ~(ULONG_PTR)0 - align_mask)
+        {
+            aligned = (cursor + align_mask) & ~(ULONG_PTR)align_mask;
+            if (aligned < hi && hi - aligned > aligned_biggest) aligned_biggest = hi - aligned;
+        }
+    }
+    dprintf( 2, "[fex-va] live arena=%p..%p failed_range=%p..%p request=0x%llx align_mask=0x%llx "
+                "views=%u covered=0x%llx free=0x%llx committed=0x%llx overlap=0x%llx "
+                "holes=%u maxgap=0x%llx max_aligned_gap=0x%llx (virtual bytes, not residency)\n",
+             (void *)lo, (void *)hi, start, end, (unsigned long long)request, (unsigned long long)align_mask,
+             nviews, (unsigned long long)covered, (unsigned long long)(hi - lo - covered),
+             (unsigned long long)committed, (unsigned long long)overlap, holes,
+             (unsigned long long)biggest, (unsigned long long)aligned_biggest );
+    /* Largest consumers first, at most 32 buckets plus one overflow line. */
+    for (i = 0; i < used; i++)
+    {
+        unsigned largest = i;
+        struct fex_va_bucket tmp;
+        for (j = i + 1; j < used; j++) if (buckets[j].bytes > buckets[largest].bytes) largest = j;
+        tmp = buckets[i]; buckets[i] = buckets[largest]; buckets[largest] = tmp;
+        dprintf( 2, "[fex-va] size=0x%llx view_flags=0x%x views=%u reserved=0x%llx committed=0x%llx\n",
+                 (unsigned long long)buckets[i].size, buckets[i].flags, buckets[i].views,
+                 (unsigned long long)buckets[i].bytes, (unsigned long long)buckets[i].committed );
+    }
+    if (other_views)
+        dprintf( 2, "[fex-va] other_sizes views=%u reserved=0x%llx committed=0x%llx\n",
+                 other_views, (unsigned long long)other_bytes, (unsigned long long)other_committed );
+}
+#endif
+
 static void dump_view( struct file_view *view )
 {
     UINT i, count;
@@ -14872,6 +14987,9 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                                                        : "  <-- STATUS_NO_MEMORY (callers see a NULL alloc)") );
                 }
             }
+#ifdef WINE_IOS
+            if (!ptr) ios_fex_arena_census( start, end, size, align_mask );
+#endif
             if (ptr)
             {
                 TRACE( "got mem with map_free_area %p-%p\n", ptr, (char *)ptr + size );
