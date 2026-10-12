@@ -9865,6 +9865,187 @@ static int ios_tlswatch_fault( const void *addr, const void *pc, const char *whi
 static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *via, void *peb );
 #endif
 
+/***********************************************************************
+ *           ios_fault_operand_trace  (ml1200)
+ *
+ * A fatal fault in FEX-emitted code reports the ARM registers x0-x3,
+ * x8-x10 and x16-x20 and the guest GPRs from the CpuStateFrame. In the
+ * ARM64EC build the guest registers LIVE in ARM registers (x0=rcx x1=rdx
+ * x2=r8 x3=r9 x4=r10 x5=r11 x8=rax x19-x22=r12-r15 x23=rsp x25=rsi
+ * x26=rdi x27=rbx x29=rbp) and the frame copy is only refreshed at block
+ * boundaries, so the printed guest state is stale by up to a whole block
+ * and the registers that matter (x4-x7, x21-x27) were not printed at all.
+ * Log 57 (upstream-1011-3) faulted on `ldurh w8,[x2,#8]` with x2 holding
+ * a pointer rotated by one byte; x2 had been loaded by `ldur x2,[x4]` two
+ * instructions earlier and nothing showed x4 or the bytes at [x4].
+ *
+ * This prints every ARM register from the signal context, then decodes
+ * the faulting load/store's base register and walks back up to eight
+ * instructions for the load that produced that register (same Rt), and
+ * dumps the memory around both addresses with a checked read. The
+ * alignment and the eight bytes at the producer's address tell apart
+ * "memory already holds the bad value" (trace the writer) from "the load
+ * returned something other than memory" (our load emulation), and whether
+ * the producer's address was unaligned (our backpatch path).
+ * Diagnostic only. MADEIRA_FAULT_OPERANDS=0 disables it.
+ */
+static void ios_fault_operand_trace( ucontext_t *context, const void *fault_addr )
+{
+    static int enabled = -1;
+    static const char * const ec_name[32] = {
+        "rcx","rdx","r8 ","r9 ","r10","r11","tmp","tmp","rax","PF ",
+        "T1 ","T2 ","T3 ","T4 ","tmp","tmp","tmp","crs","x18","r12",
+        "r13","r14","r15","rsp","AF ","rsi","rdi","rbx","ST ","rbp","lr ","sp " };
+    uint64_t r[32];
+    uint32_t ins[9];
+    mach_vm_size_t got = 0;
+    uintptr_t pc = (uintptr_t)PC_sig(context);
+    int i;
+
+    if (enabled < 0) { const char *e = getenv( "MADEIRA_FAULT_OPERANDS" ); enabled = !(e && e[0] == '0'); }
+    if (!enabled) return;
+
+    for (i = 0; i < 29; i++) r[i] = (uint64_t)REGn_sig(i, context);
+    r[29] = (uint64_t)FP_sig(context);
+    r[30] = (uint64_t)REGn_sig(30, context);
+    r[31] = (uint64_t)SP_sig(context);
+
+    for (i = 0; i < 32; i += 4)
+        ERR("  [regs] ml1200 x%-2d(%s)=%016llx x%-2d(%s)=%016llx x%-2d(%s)=%016llx x%-2d(%s)=%016llx\n",
+            i,   ec_name[i],   (unsigned long long)r[i],   i+1, ec_name[i+1], (unsigned long long)r[i+1],
+            i+2, ec_name[i+2], (unsigned long long)r[i+2], i+3, ec_name[i+3], (unsigned long long)r[i+3]);
+
+    if (pc < 0x100000000ULL + 32) return;
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(pc - 32), sizeof(ins),
+                                (mach_vm_address_t)ins, &got ) != KERN_SUCCESS || got != sizeof(ins))
+    {
+        ERR("  [operand] ml1200 instruction stream at pc=%p unreadable\n", (void *)pc);
+        return;
+    }
+
+    {
+        const uint32_t insn = ins[8];
+        unsigned rn;
+        uint64_t base;
+        long long off;
+        unsigned char mem[48];
+        int k, redefined = 0;
+
+        /* Loads and stores: bit 27 set, bit 25 clear. */
+        if ((insn & 0x0A000000u) != 0x08000000u)
+        {
+            ERR("  [operand] ml1200 faulting insn %08x is not a load/store; no operand trace\n", insn);
+            return;
+        }
+        rn = (insn >> 5) & 31;
+        base = r[rn];
+        off = (long long)((uint64_t)(uintptr_t)fault_addr - base);
+
+        ERR("  [operand] ml1200 fault insn %08x base x%u=%p fault=%p (base%+lld, base mod 8 = %u)\n",
+            insn, rn, (void *)base, fault_addr, off, (unsigned)(base & 7));
+
+        /* The producer: the nearest earlier load whose destination is the base register.
+         * A data-processing instruction with that destination in between is reported. */
+        for (k = 7; k >= 0; k--)
+        {
+            const uint32_t w = ins[k];
+            const int ldst = (w & 0x0A000000u) == 0x08000000u;
+            const unsigned rt = w & 31;
+
+            if (ldst)
+            {
+                const unsigned opc = (w >> 22) & 3;
+                if (rt == rn && opc != 0)
+                {
+                    const unsigned prn = (w >> 5) & 31;
+                    const unsigned size = (w >> 30) & 3;
+                    const uint64_t pbase = r[prn];
+                    uint64_t addr = pbase;
+                    const char *form = "other";
+                    uint64_t now8 = 0;
+
+                    if ((w & 0x3B000000u) == 0x39000000u)
+                    {   /* LDR (unsigned immediate), scaled by the access size */
+                        addr += (uint64_t)((w >> 10) & 0xfff) << size;
+                        form = "ldr-imm";
+                    }
+                    else if ((w & 0x3B200C00u) == 0x38000000u)
+                    {   /* LDUR: simm9 at bits 12-20 */
+                        int64_t imm9 = (int64_t)(int32_t)(((w >> 12) & 0x1ff) << 23) >> 23;
+                        addr += (uint64_t)imm9;
+                        form = "ldur";
+                    }
+                    else if ((w & 0x3B200C00u) == 0x38200800u)
+                    {   /* register offset: Rm with extend and optional shift */
+                        const unsigned rm = (w >> 16) & 31;
+                        const unsigned option = (w >> 13) & 7;
+                        const unsigned s = (w >> 12) & 1;
+                        uint64_t idx = r[rm];
+                        if (option == 2) idx = (uint32_t)idx;
+                        else if (option == 6) idx = (uint64_t)(int64_t)(int32_t)idx;
+                        addr += s ? (idx << size) : idx;
+                        form = "ldr-reg";
+                    }
+                    else if ((w & 0x3F200C00u) == 0x19000000u)
+                    {   /* LDAPUR (RCPC2): simm9 at bits 12-20 */
+                        int64_t imm9 = (int64_t)(int32_t)(((w >> 12) & 0x1ff) << 23) >> 23;
+                        addr += (uint64_t)imm9;
+                        form = "ldapur";
+                    }
+                    else if ((w & 0x3A000000u) == 0x28000000u)
+                    {   /* LDP/STP family: the address of the first register only */
+                        form = "ldp";
+                    }
+
+                    ERR("  [operand] ml1200 producer at pc-%u: %08x %s x%u <- [x%u=%p] addr=%p (mod 8 = %u, width %u)%s\n",
+                        (unsigned)(8 - k) * 4, w, form, rt, prn, (void *)pbase, (void *)addr,
+                        (unsigned)(addr & 7), 1u << size,
+                        redefined ? "  NOTE: base register redefined between producer and fault" : "");
+
+                    got = 0;
+                    if (addr >= 16 &&
+                        mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(addr - 16), sizeof(mem),
+                                                (mach_vm_address_t)mem, &got ) == KERN_SUCCESS && got == sizeof(mem))
+                    {
+                        char hex[sizeof(mem) * 3 + 1];
+                        int b;
+                        for (b = 0; b < (int)sizeof(mem); b++) snprintf( hex + b * 3, 4, "%02x ", mem[b] );
+                        memcpy( &now8, mem + 16, 8 );
+                        ERR("  [operand] ml1200 [addr-16 .. addr+31]: %s\n", hex);
+                        ERR("  [operand] ml1200 memory now holds %016llx at addr; register x%u holds %016llx -> %s\n",
+                            (unsigned long long)now8, rt, (unsigned long long)base,
+                            now8 == base ? "SAME: the bad value is in memory, trace its writer"
+                                         : "DIFFERENT: memory changed since the load, or the load did not return memory");
+                    }
+                    else
+                        ERR("  [operand] ml1200 producer address %p unreadable now\n", (void *)addr);
+                    break;
+                }
+                /* a store does not redefine its Rt; keep walking */
+            }
+            else if (rt == rn && (w >> 26) != 0x05 && (w & 0x7C000000u) != 0x14000000u)
+            {
+                /* data-processing with Rd == base (branches excluded) */
+                redefined = 1;
+            }
+        }
+        if (k < 0)
+            ERR("  [operand] ml1200 no load into x%u within the previous 8 instructions%s\n", rn,
+                redefined ? " (register redefined by data processing)" : "");
+
+        got = 0;
+        if (base >= 16 &&
+            mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(base - 16), sizeof(mem),
+                                    (mach_vm_address_t)mem, &got ) == KERN_SUCCESS && got == sizeof(mem))
+        {
+            char hex[sizeof(mem) * 3 + 1];
+            int b;
+            for (b = 0; b < (int)sizeof(mem); b++) snprintf( hex + b * 3, 4, "%02x ", mem[b] );
+            ERR("  [operand] ml1200 [base-16 .. base+31]: %s\n", hex);
+        }
+    }
+}
+
 static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     EXCEPTION_RECORD rec = { 0 };
@@ -10809,6 +10990,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                 }
                 ERR("  insn_stream PC-12..PC+8: %08x %08x %08x [%08x] %08x %08x %08x\n",
                     p[-3], p[-2], p[-1], p[0], p[1], p[2], p[3]);
+                ios_fault_operand_trace( context, siginfo->si_addr );
             }
             else
                 ERR("  insn=<unmappable PC, skipping read>\n");
