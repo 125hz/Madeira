@@ -71,6 +71,12 @@ void winios_cursor_move(int x, int y);
 unsigned long long winios_surface_present_count(void);
 int winios_compositor_set_hidden(int hidden);
 
+/* ml1300 windowed mode (WiniosWindowed.m, docs/WINDOWED.md): 1 while this
+ * session is a desktop session with madeira.cfg `windowed = 1` (or
+ * env.MADEIRA_WINDOWED = 1), drawing every top-level window in its own frame
+ * with a title bar and a taskbar. Any thread; read once per session. */
+int winios_windowed_active(void);
+
 /* Game-mode windows (Winios.m). The window a game session's swapchain
  * presents from (IOSDisplayShim) is never drawn as a GDI window; a Wine
  * session start clears the overlay. */

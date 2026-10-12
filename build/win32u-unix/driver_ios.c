@@ -77,6 +77,8 @@ static struct user_driver_funcs winios_user_driver;
  * nothing the program sees, and does nothing until the app has asked for the
  * reports (MADEIRA_DIRECT_CURSOR=0 or MADEIRA_HWINPUT=0 in the app: never). */
 extern int winios_direct_cursor_wanted( void ) __attribute__((weak));
+/* WiniosWindowed.m: ml1300 windowed mode is on for this session. */
+extern int winios_windowed_active( void ) __attribute__((weak));
 extern void winios_direct_cursor_set( unsigned int id, int w, int h, int hot_x, int hot_y,
                                       const void *bgra ) __attribute__((weak));
 extern void winios_direct_cursor_show( int show ) __attribute__((weak));
@@ -135,8 +137,16 @@ void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_
      * the detached desktop window and returns NULL, dropping the message.
      * Call win32u's send_hardware_message directly (same library) instead
      * of the NtUserCallHwndParam inline — we get the raw NTSTATUS and skip
-     * a dispatch layer that can fail for its own reasons. */
-    NTSTATUS st = send_hardware_message( NULL, 0, &input, 0 );
+     * a dispatch layer that can fail for its own reasons.
+     *
+     * ml1300 windowed mode (WiniosWindowed.m): the app draws every top-level
+     * window in its own frame, wherever the user put it, so two windows that
+     * overlap on the guest desktop can sit apart on screen. It then names the
+     * top-level window the touch landed on, and the server routes the mouse
+     * message to that window (find_hardware_message_window: msg->win when it
+     * is visible, capture first) instead of hit-testing the guest desktop.
+     * Only windowed mode passes a window; everything else still passes NULL. */
+    NTSTATUS st = send_hardware_message( hwnd, 0, &input, 0 );
     {
         static unsigned cnt;
         if (cnt++ < 40)
@@ -390,6 +400,155 @@ int winios_drv_foreground_if_owner( HWND hwnd )
 {
     if (!hwnd || get_window_thread( hwnd, NULL ) != GetCurrentThreadId()) return 0;
     return NtUserSetForegroundWindow( hwnd ) ? 1 : -1;
+}
+
+/* ml1300 windowed mode helpers for app/Madeira/Winios/WiniosWindowed.m, which
+ * draws each top-level window in its own frame with a title bar and lists the
+ * program windows in a taskbar. Winios.m cannot include the Wine headers, so
+ * the win32u calls live here. All run on a Wine thread, only while windowed
+ * mode is on (madeira.cfg windowed = 1 / env.MADEIRA_WINDOWED = 1 in a desktop
+ * session). The struct is mirrored in WiniosWindowed.h. */
+struct winios_windowed_info
+{
+    unsigned int kind;              /* 0 child / gone, 1 the desktop window, 2 top-level */
+    unsigned int style, exstyle;
+    unsigned int pid;
+    unsigned long long owner;       /* GW_OWNER */
+    unsigned long long root_owner;  /* GA_ROOTOWNER */
+    char cls[64];                   /* class name, printable ASCII */
+    char title[192];                /* window text, UTF-8 */
+};
+
+static void winios_wide_to_utf8( const WCHAR *src, int n, char *out, int size )
+{
+    int i, j = 0;
+
+    for (i = 0; i < n && src[i]; i++)
+    {
+        unsigned int c = src[i];
+        if (c >= 0xd800 && c < 0xdc00 && i + 1 < n && src[i + 1] >= 0xdc00 && src[i + 1] < 0xe000)
+            c = 0x10000 + ((c - 0xd800) << 10) + (src[++i] - 0xdc00);
+        else if (c >= 0xd800 && c < 0xe000) c = 0xfffd;
+        if (c < 0x20) c = ' ';
+        if (c < 0x80) { if (j + 1 >= size) break; out[j++] = (char)c; }
+        else if (c < 0x800) { if (j + 2 >= size) break; out[j++] = 0xc0 | (c >> 6); out[j++] = 0x80 | (c & 0x3f); }
+        else if (c < 0x10000)
+        {
+            if (j + 3 >= size) break;
+            out[j++] = 0xe0 | (c >> 12); out[j++] = 0x80 | ((c >> 6) & 0x3f); out[j++] = 0x80 | (c & 0x3f);
+        }
+        else
+        {
+            if (j + 4 >= size) break;
+            out[j++] = 0xf0 | (c >> 18); out[j++] = 0x80 | ((c >> 12) & 0x3f);
+            out[j++] = 0x80 | ((c >> 6) & 0x3f); out[j++] = 0x80 | (c & 0x3f);
+        }
+    }
+    out[j] = 0;
+}
+
+/* Kind, styles, owners, class and text of a window. Returns 0 for a window
+ * that is gone. Works for windows of any Wine process (server calls). */
+int winios_drv_window_info( HWND hwnd, struct winios_windowed_info *out )
+{
+    WCHAR clsW[64], txtW[192];
+    UNICODE_STRING us = { 0, sizeof(clsW), clsW };
+    DWORD pid = 0, style;
+    HWND parent;
+    int j, n;
+
+    memset( out, 0, sizeof(*out) );
+    if (!hwnd || !get_window_thread( hwnd, &pid )) return 0;
+    style = get_window_long( hwnd, GWL_STYLE );
+    parent = NtUserGetAncestor( hwnd, GA_PARENT );
+    out->kind = !parent ? 1 : (style & WS_CHILD) || parent != get_desktop_window() ? 0 : 2;
+    out->style = style;
+    out->pid = pid;
+    if (!out->kind) return 1;   /* a child window: nothing more is needed */
+    out->exstyle = get_window_long( hwnd, GWL_EXSTYLE );
+    out->owner = (unsigned long long)(UINT_PTR)get_window_relative( hwnd, GW_OWNER );
+    out->root_owner = (unsigned long long)(UINT_PTR)NtUserGetAncestor( hwnd, GA_ROOTOWNER );
+    if (NtUserGetClassName( hwnd, FALSE, &us ) > 0)
+    {
+        for (j = 0; j < us.Length / (int)sizeof(WCHAR) && j < 63; j++)
+            out->cls[j] = (clsW[j] >= 32 && clsW[j] < 127) ? (char)clsW[j] : '?';
+        out->cls[j] = 0;
+    }
+    n = NtUserInternalGetWindowText( hwnd, txtW, ARRAY_SIZE(txtW) );
+    if (n > 0) winios_wide_to_utf8( txtW, n, out->title, sizeof(out->title) );
+    return 1;
+}
+
+/* The window's class icon (large, else small) as straight-alpha BGRA, at most
+ * max_side pixels square. Only for a window of the calling process: icon
+ * handles belong to the process that made them. Returns 1 when out is filled. */
+int winios_drv_window_icon( HWND hwnd, unsigned int *out, int max_side, int *pw, int *ph )
+{
+    char bmibuf[sizeof(BITMAPINFOHEADER) + 256 * sizeof(RGBQUAD)];
+    BITMAPINFO *bmi = (BITMAPINFO *)bmibuf;
+    ICONINFO info = {0};
+    unsigned int *mask = NULL;
+    HICON icon;
+    DWORD pid = 0;
+    BITMAP bm;
+    HDC hdc;
+    int w, h, i, has_alpha = 0, ok = 0;
+
+    if (!hwnd || !out || !get_window_thread( hwnd, &pid ) || pid != GetCurrentProcessId()) return 0;
+    if (!(icon = (HICON)get_class_long_ptr( hwnd, GCLP_HICON, FALSE )) &&
+        !(icon = (HICON)get_class_long_ptr( hwnd, GCLP_HICONSM, FALSE ))) return 0;
+    if (!NtUserGetIconInfo( icon, &info, NULL, NULL, NULL, 0 )) return 0;
+    hdc = NtGdiCreateCompatibleDC( 0 );
+    if (!info.hbmColor || !NtGdiExtGetObjectW( info.hbmColor, sizeof(bm), &bm )) goto done;
+    w = bm.bmWidth; h = bm.bmHeight;
+    if (w <= 0 || h <= 0 || w > max_side || h > max_side) goto done;
+    memset( bmibuf, 0, sizeof(bmibuf) );
+    bmi->bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi->bmiHeader.biWidth = w;
+    bmi->bmiHeader.biHeight = -h;
+    bmi->bmiHeader.biPlanes = 1;
+    bmi->bmiHeader.biBitCount = 32;
+    bmi->bmiHeader.biCompression = BI_RGB;
+    if (!NtGdiGetDIBitsInternal( hdc, info.hbmColor, 0, h, out, bmi, DIB_RGB_COLORS, w * h * 4, sizeof(bmibuf) ))
+        goto done;
+    for (i = 0; i < w * h; i++) if (out[i] & 0xff000000) { has_alpha = 1; break; }
+    if (!has_alpha)
+    {
+        if (!(mask = malloc( (size_t)w * h * 4 ))) goto done;
+        memset( bmibuf, 0, sizeof(bmibuf) );
+        bmi->bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi->bmiHeader.biWidth = w;
+        bmi->bmiHeader.biHeight = -h;
+        bmi->bmiHeader.biPlanes = 1;
+        bmi->bmiHeader.biBitCount = 32;
+        bmi->bmiHeader.biCompression = BI_RGB;
+        NtGdiGetDIBitsInternal( hdc, info.hbmMask, 0, h, mask, bmi, DIB_RGB_COLORS, w * h * 4, sizeof(bmibuf) );
+        for (i = 0; i < w * h; i++)
+            out[i] = (out[i] & 0xffffff) | ((mask[i] & 0xffffff) ? 0 : 0xff000000);
+    }
+    *pw = w; *ph = h;
+    ok = 1;
+done:
+    free( mask );
+    if (info.hbmColor) NtGdiDeleteObjectApp( info.hbmColor );
+    if (info.hbmMask) NtGdiDeleteObjectApp( info.hbmMask );
+    NtGdiDeleteObjectApp( hdc );
+    return ok;
+}
+
+/* What a title bar button sends: SC_MINIMIZE / SC_RESTORE / SC_CLOSE (which
+ * DefWindowProc turns into WM_CLOSE). Posted, so it never waits on the
+ * window's thread. */
+int winios_drv_post_syscommand( HWND hwnd, unsigned int cmd )
+{
+    return NtUserPostMessage( hwnd, WM_SYSCOMMAND, cmd, 0 ) ? 1 : 0;
+}
+
+/* The guest's foreground window, so a frame the program activated itself
+ * comes to the front on screen too. */
+HWND winios_drv_foreground_window(void)
+{
+    return NtUserGetForegroundWindow();
 }
 
 /* ============================================================ *
@@ -2431,6 +2590,10 @@ static void ios_foreground_check(void)
         enabled = !(e && e[0] == '0' && !e[1]);
     }
     if (!enabled) return;
+    /* ml1300 windowed mode: the user picks the active window by tapping its
+     * frame (a click activates it), so a game polling XInput must not pull
+     * itself back to the front every second over the window the user chose. */
+    if (winios_windowed_active && winios_windowed_active()) return;
 
     clock_gettime( CLOCK_MONOTONIC, &ts );
     now = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
