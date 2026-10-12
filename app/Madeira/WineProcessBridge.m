@@ -831,6 +831,17 @@ static void madeira_publish_host_probe(void)
         { "SHA",     "hw.optional.arm.FEAT_SHA256" },
         { "CRC",     "hw.optional.armv8_crc32" },
         { "ATOMICS", "hw.optional.arm.FEAT_LSE" },
+        /* madeira-bcd: reported, not yet used by either module: which of FEX's other
+         * host features this device has (FRINTTS, CSSC, RPRES, MOPS, ECV, WFXT), and
+         * LSE2/LRCPC3 for its TSO code (which unaligned atomics trap; vector imm9). */
+        { "LSE2",    "hw.optional.arm.FEAT_LSE2" },
+        { "LRCPC3",  "hw.optional.arm.FEAT_LRCPC3" },
+        { "FRINTTS", "hw.optional.arm.FEAT_FRINTTS" },
+        { "RPRES",   "hw.optional.arm.FEAT_RPRES" },
+        { "CSSC",    "hw.optional.arm.FEAT_CSSC" },
+        { "MOPS",    "hw.optional.arm.FEAT_MOPS" },
+        { "ECV",     "hw.optional.arm.FEAT_ECV" },
+        { "WFXT",    "hw.optional.arm.FEAT_WFxT" },
     };
     char buf[256];
     size_t len = 0;
