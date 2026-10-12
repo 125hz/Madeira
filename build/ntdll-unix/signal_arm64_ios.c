@@ -610,6 +610,58 @@ void ios_watch_after_protect( const void *base, size_t size, const char *why )
                  (void *)ios_watch_page, errno, why );
 }
 
+/* ml1205: dump a thread's block-entry ring (FEX writes it when MADEIRA_BLOCK_RING is set and
+ * publishes the pointer at TEB+0x1710). Oldest first, newest last, 16 x86 bytes per entry so a
+ * one-instruction fragment decodes from the line. Checked reads throughout. */
+static void ios_block_ring_dump( uintptr_t teb, unsigned max_entries, const char *why )
+{
+    enum { RING_N = 4096 };
+    uint64_t ring = 0, idx = 0, *ents = NULL;
+    mach_vm_size_t got = 0;
+    unsigned n, i, start;
+
+    if (!teb) { dprintf( 2, "[block-ring] ml1205 (%s): no TEB for this thread\n", why ); return; }
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(teb + 0x1710), 8, (mach_vm_address_t)&ring, &got ) != KERN_SUCCESS
+        || got != 8 || !ring)
+    {
+        dprintf( 2, "[block-ring] ml1205 (%s): no ring on this thread (MADEIRA_BLOCK_RING unset, or the thread predates it)\n", why );
+        return;
+    }
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)ring, 8, (mach_vm_address_t)&idx, &got ) != KERN_SUCCESS || got != 8)
+        return;
+    ents = malloc( RING_N * sizeof(uint64_t) );
+    if (!ents) return;
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(ring + 8), RING_N * sizeof(uint64_t),
+                                (mach_vm_address_t)ents, &got ) != KERN_SUCCESS || got != RING_N * sizeof(uint64_t))
+    {
+        free( ents );
+        return;
+    }
+    idx &= RING_N - 1;
+    /* count the filled entries: a zero entry is an unused slot */
+    n = RING_N;
+    while (n && !ents[(idx + RING_N - n) & (RING_N - 1)]) n--;
+    if (n > max_entries) n = max_entries;
+    start = (idx + RING_N - n) & (RING_N - 1);
+    dprintf( 2, "[block-ring] ml1205 (%s): ring %p next=%llu, last %u block entries, oldest first:\n",
+             why, (void *)ring, (unsigned long long)idx, n );
+    for (i = 0; i < n; i++)
+    {
+        uint64_t rip = ents[(start + i) & (RING_N - 1)];
+        unsigned char xb[16];
+        char hx[16 * 3 + 1] = "?";
+        got = 0;
+        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)rip, sizeof(xb), (mach_vm_address_t)xb, &got ) == KERN_SUCCESS
+            && got == sizeof(xb))
+        {
+            int b;
+            for (b = 0; b < 16; b++) snprintf( hx + b * 3, 4, "%02x ", xb[b] );
+        }
+        dprintf( 2, "[block-ring] -%-4u %llx: %s\n", n - i, (unsigned long long)rip, hx );
+    }
+    free( ents );
+}
+
 /* ml1203: WALK THE JUMP CHAIN BACK FROM THE WRITER.
  *
  * The writer the watch caught sits in jump-threaded code: one instruction, then
@@ -773,7 +825,7 @@ static void ios_watch_chase( uint64_t rip )
 }
 
 /* A store to the watched page was emulated (or could not be): report it. */
-static void ios_watch_report( const arm_thread_state64_t *st, uint64_t pc, uint32_t insn, uintptr_t addr,
+static void ios_watch_report( const arm_thread_state64_t *st, uint64_t pc, uint32_t insn, uintptr_t addr, uintptr_t teb,
                               int emulated, int watch_prot )
 {
     static const char * const ec_name[32] = {
@@ -847,6 +899,7 @@ static void ios_watch_report( const arm_thread_state64_t *st, uint64_t pc, uint3
                 dprintf( 2, "[watch] ml1201   guest rip=%p block=%p x86[rip-16..rip+31]: %s\n",
                          (void *)xrip, (void *)bb, hx );
                 if (ios_watch_hits <= 2) ios_watch_chase( xrip );   /* ml1203 */
+                if (ios_watch_hits <= 2) ios_block_ring_dump( teb, 1536, "watch hit" );   /* ml1205 */
             }
             else
                 dprintf( 2, "[watch] ml1201   guest rip unresolved (block=%p): %s\n", (void *)bb, why );
@@ -4295,7 +4348,7 @@ static void *ios_mach_exception_thread( void *arg )
                     {
                         if (watch_hit)
                         {   /* ml1201: leave the page writable, re-execute the store natively */
-                            ios_watch_report( &state, (uint64_t)fault_pc, insn, fault_addr, 0, watch_prot );
+                            ios_watch_report( &state, (uint64_t)fault_pc, insn, fault_addr, thread_teb, 0, watch_prot );
                             handled = 1;
                         }
                         static int undecoded_n;
@@ -4310,7 +4363,7 @@ static void *ios_mach_exception_thread( void *arg )
                     {
                         if (watch_hit)
                         {   /* ml1201: the store landed; report it and re-arm the page */
-                            ios_watch_report( &state, (uint64_t)fault_pc, insn, fault_addr, 1, watch_prot );
+                            ios_watch_report( &state, (uint64_t)fault_pc, insn, fault_addr, thread_teb, 1, watch_prot );
                             if (ios_watch_state == 1)
                                 mprotect( (void *)ios_watch_page, IOS_WATCH_PAGE, PROT_READ );   /* ml1202: read only; EXEC would be refused */
                         }
@@ -10544,6 +10597,11 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                 ERR("  insn_stream PC-12..PC+8: %08x %08x %08x [%08x] %08x %08x %08x\n",
                     p[-3], p[-2], p[-1], p[0], p[1], p[2], p[3]);
                 ios_fault_operand_trace( context, siginfo->si_addr );
+                {   /* ml1205: the crashing thread's block ring */
+                    uintptr_t tsd_b; extern int ios_teb_tls_slot_offset;
+                    __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_b)); tsd_b &= ~7ULL;
+                    ios_block_ring_dump( ios_teb_tls_slot_offset ? *(uintptr_t *)(tsd_b + ios_teb_tls_slot_offset) : 0, 1536, "fatal" );
+                }
             }
             else
                 ERR("  insn=<unmappable PC, skipping read>\n");
