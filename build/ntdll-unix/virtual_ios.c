@@ -4833,20 +4833,55 @@ static int ios_insn_x18_role(uint32_t insn)
         if (rm == 18) return X18_ROLE_RM;
     }
 
-    /* ADD/SUB (immediate) — [31:24]=x00 10001 or x10 10001 */
-    if ((top8 & 0x5F) == 0x11)
+    /* ADD/SUB (immediate) — [31:24]=sf op S 10001. madeira-bcd: the mask was
+     * 0x5F, which kept op (bit 30) and so matched ADD only: every SUB off x18
+     * went unpatched and read the raw (zeroed) x18. 0x1F takes ADD, ADDS, SUB
+     * and SUBS, as the comment always said. */
+    if ((top8 & 0x1F) == 0x11)
     {
         if (rn == 18) return X18_ROLE_RN;
     }
 
-    /* ADD/SUB (register) — [31:24]=x00 01011 or x10 01011 */
-    if ((top8 & 0x5F) == 0x0B)
+    /* ADD/SUB (register) — [31:24]=sf op S 01011 (same mask fix as above) */
+    if ((top8 & 0x1F) == 0x0B)
     {
         if (rn == 18) return X18_ROLE_RN;
         if (rm == 18) return X18_ROLE_RM;
     }
 
     return X18_ROLE_NONE;
+}
+
+/* madeira-bcd: the destination of an ADD/SUB (immediate or register) that reads
+ * x18 once, when that destination can carry the TEB instead of x18: not x18,
+ * not 31 (SP or XZR), and not the instruction's other source. -1 otherwise.
+ *
+ * Such an instruction used to take the "via x18" trampoline (load x18 from
+ * TPIDRRO_EL0, run the instruction unchanged). If iOS preempts the thread
+ * between the load and the instruction it zeroes x18, and unlike a load or a
+ * store the ADD does not fault: it computes a small address that faults later,
+ * somewhere the handler cannot repair ([x18-decline]). Wine's debug channel
+ * buffer is get_info() = NtCurrentTeb() + 0x2000 + sizeof(TEB32), so with the
+ * TEB read as 0 its output lands at 0x3404: RockstarService.exe died that way
+ * in ntdll's printf padding loop (GTA V Enhanced build 375, 2026-10-04 09:52,
+ * `pc ntdll+0x63458 ... writing to 0x3404`, x18=0), the self-restarted
+ * Rockstar Games Launcher on 2026-10-03 23:21, and God of War's 0x3404 SEGVs.
+ * With the destination as scratch x18 is never touched. */
+static int ios_x18_arith_dest(uint32_t insn, int role)
+{
+    uint32_t top8 = insn >> 24;
+    int rd = insn & 0x1f, rn = (insn >> 5) & 0x1f, rm = (insn >> 16) & 0x1f;
+
+    if (rd == 18 || rd == 31) return -1;
+    if ((top8 & 0x1F) == 0x11)                       /* ADD/SUB (immediate) */
+        return (role == X18_ROLE_RN && rn == 18) ? rd : -1;
+    if ((top8 & 0x1F) == 0x0B)                       /* ADD/SUB (register) */
+    {
+        if (rn == 18 && rm == 18) return -1;
+        if (role == X18_ROLE_RN && rn == 18 && rm != rd) return rd;
+        if (role == X18_ROLE_RM && rm == 18 && rn != rd) return rd;
+    }
+    return -1;
 }
 
 /* Replace x18 in an instruction with a different register */
@@ -4932,6 +4967,8 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
     int count = 0;
     int skipped = 0;
     int lit_skipped = 0;
+    int ldr_scratch = 0;   /* ml7xx: patched via the destination register */
+    int x18_scratch = 0;   /* ml7xx: patched via x18 itself */
     unsigned char *data_map = NULL;
     extern int ios_teb_tls_slot_offset;
 
@@ -5088,19 +5125,26 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
         role = ios_insn_x18_role(insn);
         if (role == X18_ROLE_NONE) continue;
 
-        /* Determine scratch register — use x17 normally.
-         * Avoid conflicts with instruction's other register operands. */
-        int scratch = 17;
+        /* ml7xx SP-ALIGN: no trampoline form below touches the stack, so the
+         * old x16/x17 scratch selection (and its "both in use, give up" skip)
+         * is gone. It was never a register-pressure problem -- it was that
+         * saving the scratch meant `str xN, [sp, #-16]!`, and AArch64 faults
+         * that store outright when SP is not 16-byte aligned:
+         *
+         *   kr=259 == EXC_ARM_SP_ALIGN   sp=0x703881f4d8   sp % 16 == 8
+         *
+         * An 8-mod-16 SP is not corruption. It is what x86-64 hands us: `call`
+         * pushes the return address, so guest RSP is 8 (mod 16) for the whole
+         * body of a called function, and ARM64EC carries that straight into
+         * SP. Native ARM64 keeps SP aligned, which is why the arm64 cube never
+         * hit this and only the x64 path died -- every single time, at the
+         * first instruction of a trampoline.
+         *
+         * So: never use the stack. Three forms, safest first. */
         int rt = insn & 0x1f;
         int rn = (insn >> 5) & 0x1f;
         int rm = (insn >> 16) & 0x1f;
-        if (rt == 17 || rn == 17 || rm == 17) scratch = 16;
-        /* Double-check: if both x16 and x17 are used, skip (extremely rare) */
-        if (scratch == 16 && (rt == 16 || rn == 16 || rm == 16))
-        {
-            skipped++;
-            continue;
-        }
+        (void)rn; (void)rm;
 
         /* Check trampoline space (max 6 instructions = 24 bytes per trampoline) */
         if (tramp_off + 24 > tramp_size)
@@ -5125,6 +5169,17 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
         int is_mov_from_x18 = (role == X18_ROLE_RM) &&
             ((insn & 0xFFE0FFE0) == 0xAA0003E0) && rm == 18;
 
+        /* LDR (unsigned immediate), integer, 32- or 64-bit, x18 as the base.
+         * 41 of xtajit64.dll's 115 x18 references are this shape. */
+        int is_int_ldr_imm = (role == X18_ROLE_RN) &&
+            (((insn & 0xFFC00000) == 0xF9400000) ||      /* ldr xT, [x18,#imm] */
+             ((insn & 0xFFC00000) == 0xB9400000)) &&     /* ldr wT, [x18,#imm] */
+            rt != 31 && rt != 18;
+
+        /* madeira-bcd: ADD/SUB off x18 with a usable destination (see
+         * ios_x18_arith_dest): same form as the LDR below. */
+        int arith_rd = (!is_mov_from_x18 && !is_int_ldr_imm) ? ios_x18_arith_dest(insn, role) : -1;
+
         if (is_mov_from_x18)
         {
             int rd = insn & 0x1f;
@@ -5138,32 +5193,87 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
             *(uint32_t *)(tramp_rw + tramp_off) = 0xF9400000 | ((slot_off / 8) << 10) | (rd << 5) | rd;
             tramp_off += 4;
         }
-        else
+        else if (is_int_ldr_imm)
         {
-            /* Check trampoline space (7 instructions = 28 bytes) */
-            if (tramp_off + 32 > tramp_size)
+            /* LDR (unsigned immediate) off x18. The destination register is
+             * about to be overwritten by this very instruction, so it can be
+             * the scratch: nothing to save, nothing to restore.
+             *   mrs xRt, TPIDRRO_EL0
+             *   and xRt, xRt, #~7
+             *   ldr xRt, [xRt, #slot_off]
+             *   ldr xRt, [xRt, #orig_imm]     (x18 -> xRt)
+             * A 32-bit form (ldr wT) still writes the full 64-bit register in
+             * the three setup instructions and narrows only on the last, which
+             * is the semantics the original had. */
+            if (tramp_off + 24 > tramp_size)
             {
                 ERR("x18 patcher: out of trampoline space at %d patches\n", count);
                 break;
             }
-            /* str xSCRATCH, [sp, #-16]! */
-            *(uint32_t *)(tramp_rw + tramp_off) = (scratch == 17) ? 0xF81F0FF1 : 0xF81F0FF0;
+            *(uint32_t *)(tramp_rw + tramp_off) = 0xD53BD060 | rt;
             tramp_off += 4;
-            /* mrs xSCRATCH, TPIDRRO_EL0 */
-            *(uint32_t *)(tramp_rw + tramp_off) = 0xD53BD060 | scratch;
+            *(uint32_t *)(tramp_rw + tramp_off) = 0x927DF000 | (rt << 5) | rt;
             tramp_off += 4;
-            /* and xSCRATCH, xSCRATCH, #~7 */
-            *(uint32_t *)(tramp_rw + tramp_off) = 0x927DF000 | (scratch << 5) | scratch;
+            *(uint32_t *)(tramp_rw + tramp_off) = 0xF9400000 | ((slot_off / 8) << 10) | (rt << 5) | rt;
             tramp_off += 4;
-            /* ldr xSCRATCH, [xSCRATCH, #slot_off] */
-            *(uint32_t *)(tramp_rw + tramp_off) = 0xF9400000 | ((slot_off / 8) << 10) | (scratch << 5) | scratch;
+            *(uint32_t *)(tramp_rw + tramp_off) = ios_insn_replace_x18(insn, role, rt);
             tramp_off += 4;
-            /* Modified instruction with x18 replaced by scratch */
-            *(uint32_t *)(tramp_rw + tramp_off) = ios_insn_replace_x18(insn, role, scratch);
+            ldr_scratch++;
+        }
+        else if (arith_rd >= 0)
+        {
+            /*   mrs xRd, TPIDRRO_EL0
+             *   and xRd, xRd, #~7
+             *   ldr xRd, [xRd, #slot_off]
+             *   add/sub xRd, xRd, <the other operand>   (x18 -> xRd)
+             * Counted with the destination-register forms. */
+            if (tramp_off + 20 > tramp_size)
+            {
+                ERR("x18 patcher: out of trampoline space at %d patches\n", count);
+                break;
+            }
+            *(uint32_t *)(tramp_rw + tramp_off) = 0xD53BD060 | arith_rd;
             tramp_off += 4;
-            /* ldr xSCRATCH, [sp], #16 */
-            *(uint32_t *)(tramp_rw + tramp_off) = (scratch == 17) ? 0xF84107F1 : 0xF84107F0;
+            *(uint32_t *)(tramp_rw + tramp_off) = 0x927DF000 | (arith_rd << 5) | arith_rd;
             tramp_off += 4;
+            *(uint32_t *)(tramp_rw + tramp_off) = 0xF9400000 | ((slot_off / 8) << 10) | (arith_rd << 5) | arith_rd;
+            tramp_off += 4;
+            *(uint32_t *)(tramp_rw + tramp_off) = ios_insn_replace_x18(insn, role, arith_rd);
+            tramp_off += 4;
+            ldr_scratch++;
+        }
+        else
+        {
+            /* Stores, LDP, and arithmetic: the operands must all survive, so
+             * there is no free destination register to borrow. Use x18 itself.
+             *   mrs x18, TPIDRRO_EL0
+             *   and x18, x18, #~7
+             *   ldr x18, [x18, #slot_off]
+             *   <original instruction, byte for byte>
+             *
+             * The header above says patched code must never touch x18, because
+             * iOS zeroes it and a stale x18 read silently returns page zero.
+             * That reasoning holds for code that READS x18 expecting the TEB.
+             * Here x18 is written from TPIDRRO_EL0 and consumed one
+             * instruction later, so the value is never stale -- and if the
+             * thread is preempted in that window, x18 comes back zero and the
+             * original instruction faults on the zero page, which the handler
+             * already recovers. A rare recoverable fault beats the certain
+             * SP-align kill this replaces. */
+            if (tramp_off + 20 > tramp_size)
+            {
+                ERR("x18 patcher: out of trampoline space at %d patches\n", count);
+                break;
+            }
+            *(uint32_t *)(tramp_rw + tramp_off) = 0xD53BD060 | 18;
+            tramp_off += 4;
+            *(uint32_t *)(tramp_rw + tramp_off) = 0x927DF000 | (18 << 5) | 18;
+            tramp_off += 4;
+            *(uint32_t *)(tramp_rw + tramp_off) = 0xF9400000 | ((slot_off / 8) << 10) | (18 << 5) | 18;
+            tramp_off += 4;
+            *(uint32_t *)(tramp_rw + tramp_off) = insn;
+            tramp_off += 4;
+            x18_scratch++;
         }
 
         /* Branch back to return address */
@@ -5207,6 +5317,14 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
                 "tramp=%p+%#lx used=%lu\n",
                 text_rx, (unsigned long)text_size, text_rw, count, skipped,
                 tramp_rx, (unsigned long)tramp_size, (unsigned long)tramp_off);
+    /* dprintf, not ERR: err-virtual is muted, and after the SP-align fix the
+     * split is the thing to check on-device -- no trampoline may touch SP. */
+    if (count > 0)
+        dprintf(2, "[x18-tramp] .text %p: %d patched -- %d via dest reg, %d via x18, "
+                   "%d MOV-direct; 0 use the stack (was: all of them, and x86 hands "
+                   "us an 8-mod-16 SP)\n",
+                text_rx, count, ldr_scratch, x18_scratch,
+                count - ldr_scratch - x18_scratch);
     /* dprintf, not ERR (err-virtual muted): literal words the x18 matcher
      * WOULD have clobbered — nonzero = a dodged conhost-class boot death. */
     if (lit_skipped)

@@ -1381,19 +1381,39 @@ static int ios_fault_read_insn( uint64_t fault_pc, uint32_t *out )
  * that wrote exactly this base register from x18, the base holds
  * (0 + offset) and fault_addr is the TEB offset, so the same TEB-relative
  * emulation is correct. Only ADD (extended/shifted register or immediate) and
- * MOV Xd,X18; the other operand must not be the destination (it still holds
- * the value the ADD used). */
+ * MOV Xd,X18.
+ * madeira-bcd: the other operand may be the destination itself, as in
+ * `add x8, x18, x8, lsl #3`: the emulation reads only fault_addr. That form is
+ * the one the x18 patcher runs "via x18" (its destination cannot carry the TEB),
+ * and declining it killed Horizon Zero Dawn on build 500 (2026-10-11 19:17,
+ * madeira_d3d12.dll+0x15ed4 reading 0x1508 = TEB 0 + TLS slot 17). */
 static int ios_x18_derived_base( uint64_t fault_pc, int rn )
 {
     uint32_t p;
     int rd, pn, pm;
 
     if (rn == 18 || rn >= 29 || !ios_fault_read_insn( fault_pc - 4, &p )) return 0;
+    /* The x18 patcher (virtual_ios.c, "via x18" form) moves such an ADD into a
+     * trampoline -- `mrs x18, TPIDRRO_EL0; and x18, x18, #~7; ldr x18, [x18,
+     * #slot]; <ADD>; b back` -- and leaves `b tramp` at pc-4. TlsGetValue is
+     * hot enough that a preemption between that ldr and the ADD (iOS zeroes
+     * x18) does happen: build 264 died exactly there again. Follow the branch
+     * when the trampoline has that shape and branches back to the fault. */
+    if ((p & 0xfc000000u) == 0x14000000u)
+    {
+        int64_t imm = (int64_t)(int32_t)((p & 0x03ffffffu) << 6) >> 4;   /* sign-extended imm26 * 4 */
+        uint64_t t = fault_pc - 4 + imm;
+        uint32_t t0, t4;
+        if (!ios_fault_read_insn( t, &t0 ) || t0 != (0xd53bd060u | 18)) return 0;
+        if (!ios_fault_read_insn( t + 16, &t4 ) || (t4 & 0xfc000000u) != 0x14000000u) return 0;
+        if (t + 16 + ((int64_t)(int32_t)((t4 & 0x03ffffffu) << 6) >> 4) != fault_pc) return 0;
+        if (!ios_fault_read_insn( t + 12, &p )) return 0;
+    }
     rd = p & 31; pn = (p >> 5) & 31; pm = (p >> 16) & 31;
     if (rd != rn) return 0;
-    if ((p & 0xffe00000u) == 0x8b200000u) return pn == 18 && pm != rd;           /* ADD Xd, X18, Wm/Xm, ext */
-    if ((p & 0xff200000u) == 0x8b000000u) return (pn == 18 && pm != rd) ||       /* ADD Xd, X18, Xm, shift */
-                                                 (pm == 18 && pn != rd && !((p >> 10) & 0x3f));
+    if ((p & 0xffe00000u) == 0x8b200000u) return pn == 18;                       /* ADD Xd, X18, Wm/Xm, ext */
+    if ((p & 0xff200000u) == 0x8b000000u) return pn == 18 ||                     /* ADD Xd, X18, Xm, shift */
+                                                 (pm == 18 && !((p >> 10) & 0x3f));
     if ((p & 0xff800000u) == 0x91000000u) return pn == 18;                       /* ADD Xd, X18, #imm */
     if ((p & 0xffffffe0u) == (0xaa0003e0u | (18u << 16))) return 1;              /* MOV Xd, X18 */
     return 0;
