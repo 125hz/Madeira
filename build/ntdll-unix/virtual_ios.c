@@ -6213,6 +6213,11 @@ struct file_view
 #define VPROT_SYSTEM           0x0200  /* system view (underlying mmap not under our control) */
 #define VPROT_PLACEHOLDER      0x0400
 #define VPROT_FREE_PLACEHOLDER 0x0800
+/* madeira-bcd [x64-image]: a pure-x64 image view in an x64 process that gets no
+ * JIT-pool copy; its code is host DATA that the emulator runs at the PE VA.
+ * Set once by map_image_into_view (MADEIRA_X64_IMAGE_NOCOPY), read by
+ * mprotect_exec. Follows the view through splits like VPROT_ARM64EC. */
+#define VPROT_X64DATA          0x1000
 
 /* Conversion from VPROT_* to Win32 flags */
 static const BYTE VIRTUAL_Win32Flags[16] =
@@ -14036,6 +14041,91 @@ static int ios_guest_image_is_host_data( const void *base, size_t size )
 #endif
 }
 
+/* madeira-bcd [x64-image] (env MADEIRA_X64_IMAGE_NOCOPY = 1; default off, set
+ * in the game's own file): A PURE-X64 IMAGE IS HOST DATA IN AN X64 PROCESS TOO.
+ *
+ * Every image an x64 pseudo-process loads is copied into the JIT pool, pure
+ * x64 ones included: GTA V Enhanced build 422 (2026-10-07 07:59) carried
+ * 454 MiB of such copies in the 889 MiB span (libcef.dll 239.7, the game exe
+ * 91.3, steamclient64.dll x2 49.5, Launcher.exe 32.1, libGLESv2, socialclub,
+ * tier0, chrome_elf, nvapi64 ...) next to ~450 MiB of hybrid Wine DLL copies,
+ * and the game died at its third steamclient64.dll copy with the span full.
+ *
+ * The emulator never runs x64 code from a pool copy. FEX Core.cpp (ml315,
+ * [pool-rip-fix]) rewrites any guest RIP that lands in a module's pool copy
+ * back to the PE VA and re-enters the dispatcher ("No block is ever created
+ * for the alias address"); the SMC intervals it tracks are PE-space (2341
+ * `Add SMC interval` lines in that log, all at PE VAs); the EC bitmap is
+ * PE-space; the alias table exists for ARM64EC native code, which really
+ * executes from its copy. So a pure-x64 copy is dead weight: the i386
+ * precedent is ml1030 above, where a 32-bit image page keeps VPROT_EXEC in
+ * Wine's tables while the host page is R/W only, and 32-bit programs run.
+ *
+ * Marking: map_image_into_view sets VPROT_X64DATA on the view before the
+ * section protections when the image is machine AMD64, carries no CHPE
+ * metadata (update_arm64ec_ranges did not set VPROT_ARM64EC, and the server
+ * did not call it hybrid), is not a Wine builtin, is not a resource-only map,
+ * and the process is not WoW64. mprotect_exec then drops PROT_EXEC for such a
+ * view exactly as ml1030 does: the eager copy loop makes no copy, set_vprot
+ * still records VPROT_EXEC, and every later PAGE_EXECUTE_* request (the
+ * emulator's SMC trap/untrap through NtProtectVirtualMemory) lands on plain
+ * R or R/W. No alias entry is pushed for the image (IosAliasEntries has 256
+ * slots). Hybrid images, builtins and everything else keep their copy.
+ *
+ * History: upstream's ml457 (2026-08-03) skipped the copy for pure x64 and
+ * steam.exe died within seconds ("garbage target out of vstdlib's .fptable");
+ * ml458 wrote "do not try a third time" without a root cause. That predates
+ * ml710 (loader-safe interval registration), ml1030 and the child-process
+ * alias work, so it is tested again behind this switch, off by default. The
+ * failure to watch for is an exec AV / [iOS-noexec] at the first call into a
+ * module logged by [x64-image]; 0 restores the copies. */
+static int ios_x64_image_nocopy_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *s = getenv( "MADEIRA_X64_IMAGE_NOCOPY" );
+        cached = (s && s[0] == '1' && !s[1]) ? 1 : 0;
+    }
+    return cached;
+}
+
+/* The request is host-page rounded (16 KB) while SizeOfImage is only 4 KB
+ * aligned, so a last section's request ends up to 12 KB past the view: GTA V
+ * Enhanced build 423 (2026-10-07 09:18), GTA5_Enhanced.exe 0x72d4840000+
+ * 0x5b46000, last section request 0x72d9964000+0xa24000 ends 0x72da388000, 8 KB
+ * past the view. find_view( base, size ) refused it, the ml348 "OUTSIDE nearest
+ * image" path gave the 10 MB section an anonymous-RWX pool alias, its PE VA was
+ * remapped onto blessed pool pages, and the game's TLS callback, which decrypts
+ * that section byte by byte, took one emulated store fault per byte
+ * ([fault-class] stride=1, 2 million hits, 2 MB done in a minute). So look the
+ * view up by its start and accept a tail that stays inside the view's last host
+ * page; views start on 64 KB boundaries, so no other view shares that page. */
+#define IOS_X64_IMAGE_HOST_PAGE 0x4000u
+static int ios_x64_image_view_covers( uintptr_t view_base, size_t view_size, uintptr_t base, size_t size )
+{
+    uintptr_t view_end = view_base + view_size;
+    uintptr_t host_end = (view_end + IOS_X64_IMAGE_HOST_PAGE - 1) & ~(uintptr_t)(IOS_X64_IMAGE_HOST_PAGE - 1);
+
+    if (base < view_base || base >= view_end) return 0;
+    if (base + size < base) return 0;
+    return base + size <= host_end;
+}
+
+static int ios_x64_image_is_host_data( const void *base, size_t size )
+{
+#ifdef WINE_IOS
+    struct file_view *view;
+
+    if (!ios_x64_image_nocopy_enabled()) return 0;
+    if (!(view = find_view( base, 0 ))) return 0;
+    if (!(view->protect & VPROT_X64DATA)) return 0;
+    return ios_x64_image_view_covers( (uintptr_t)view->base, view->size, (uintptr_t)base, size );
+#else
+    return 0;
+#endif
+}
+
 
 /* A guest's anonymous RWX data heap is plain read/write memory to the host.
  *
@@ -14283,6 +14373,25 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
             dprintf( 2, "[guest-rwx] #%lu %p+0x%lx prot=%c%c%c — anonymous guest memory, "
                         "EXEC is FEX bookkeeping; applying %c%c- instead\n",
                      grd_n, base, (unsigned long)size,
+                     (unix_prot & PROT_READ)  ? 'r' : '-',
+                     (unix_prot & PROT_WRITE) ? 'w' : '-',
+                     (unix_prot & PROT_EXEC)  ? 'x' : '-',
+                     (unix_prot & PROT_READ)  ? 'r' : '-',
+                     (unix_prot & PROT_WRITE) ? 'w' : '-' );
+        unix_prot &= ~PROT_EXEC;
+        if (!unix_prot) unix_prot = PROT_READ;
+    }
+
+    /* madeira-bcd [x64-image]: see ios_x64_image_is_host_data. Same contract as
+     * ml1030, for a pure-x64 image view in an x64 process: the bit has no host
+     * meaning, the page keeps VPROT_EXEC in Wine's tables, no pool copy. */
+    if ((unix_prot & PROT_EXEC) && ios_x64_image_is_host_data( base, size ))
+    {
+        static unsigned long x64_n;
+        if (++x64_n <= 24 && !ios_in_mach_exc)
+            dprintf( 2, "[x64-image] #%lu %p+0x%lx prot=%c%c%c -- pure-x64 image page, EXEC has no host "
+                        "meaning here (the emulator runs it at the PE VA); applying %c%c- (MADEIRA_X64_IMAGE_NOCOPY)\n",
+                     x64_n, base, (unsigned long)size,
                      (unix_prot & PROT_READ)  ? 'r' : '-',
                      (unix_prot & PROT_WRITE) ? 'w' : '-',
                      (unix_prot & PROT_EXEC)  ? 'x' : '-',
@@ -19869,6 +19978,23 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     }
     /* madeira-bcd: [sc-rph], before the protections and the JIT-pool copy. */
     ios_sc_render_handler_patch( ptr, total_size, nt, sec, nt_name );
+
+    /* madeira-bcd [x64-image]: decided before any protection is set, so both
+     * the section pass and the eager copy loop below see the mark (see
+     * ios_x64_image_is_host_data). update_arm64ec_ranges has run: a hybrid
+     * image carries VPROT_ARM64EC by now. */
+    if (ios_x64_image_nocopy_enabled() && !ios_map_resource_view && !ios_wow_base() &&
+        nt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64 &&
+        nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+        !(view->protect & VPROT_ARM64EC) && !image_info->is_hybrid && !image_info->wine_builtin)
+    {
+        static int x64_images;
+        view->protect |= VPROT_X64DATA;
+        if (x64_images++ < 64)
+            dprintf( 2, "[x64-image] %s %p+0x%lx mapped without a pool copy (pure x64: the emulator runs "
+                        "it at the PE VA; MADEIRA_X64_IMAGE_NOCOPY)\n",
+                     debugstr_us(nt_name), ptr, (unsigned long)total_size );
+    }
 #endif
 
     /* set the image protections */
