@@ -1154,6 +1154,20 @@ static void *wine_process_thread(void *arg) {
                     if ([[NSFileManager defaultManager] createFileAtPath:swapPath contents:nil attributes:@{NSFileProtectionKey: NSFileProtectionNone}]) {
                         setenv("MADEIRA_SWAP_FILE", swapPath.UTF8String, 1);
                         setenv("MADEIRA_SWAP_MB", [NSString stringWithFormat:@"%ld", capMB].UTF8String, 1);
+                        /* madeira-bcd: swap-min-kb (madeira.cfg or the game's config) lowers
+                         * the tier's 8 MB eligibility floor. Upstream's virtual_ios.c reads
+                         * MADEIRA_SWAP_MIN_KB only in its "blocks" coverage, so swap-min-kb
+                         * selects that; an env.MADEIRA_SWAP_COVERAGE line, exported below,
+                         * still wins. */
+                        long minKB = (long)madeira_cfg_int("swap-min-kb", 0);
+                        if (minKB > 0) {
+                            setenv("MADEIRA_SWAP_MIN_KB", [NSString stringWithFormat:@"%ld", minKB].UTF8String, 1);
+                            setenv("MADEIRA_SWAP_COVERAGE", "blocks", 1);
+                            fprintf(stderr, "[swap] app: commits from %ld KB are eligible (swap-min-kb, coverage=blocks)\n", minKB);
+                        } else {
+                            unsetenv("MADEIRA_SWAP_MIN_KB");
+                            unsetenv("MADEIRA_SWAP_COVERAGE");
+                        }
                         LOG("ml1077 swap tier armed: %{public}s, %ld MB", swapPath.UTF8String, capMB);
                         fprintf(stderr, "[swap] ml1077 app: backing file %s, cap %ld MB\n", swapPath.UTF8String, capMB);
                     }
