@@ -285,7 +285,7 @@ struct mad_device {
      * ~2000 draws a frame that walk was the hottest code on the render thread
      * (ml981 profile: the entries of the two IA setters held 8-11 % of all
      * guest samples in the city). */
-    struct mad_addr_entry { UINT64 lo, hi; struct mad_resource *r; unsigned seq; } *aidx;
+    struct mad_addr_entry { UINT64 lo, hi; struct mad_resource *r; unsigned seq; UINT64 pmax; } *aidx;   /* madeira-bcd addr-scan: pmax = highest hi of this and every earlier entry */
     unsigned naidx, aidx_cap; int aidx_dirty; UINT64 aidx_maxsize; unsigned aidx_seq;   /* ml1113: maintained incrementally */
     CRITICAL_SECTION live_lock;
     volatile LONG64 aidx_ver;   /* ml1132: odd while a writer changes aidx; lets mad_resolve_address read it lock-free */
@@ -596,33 +596,335 @@ static UINT64 mad_tick_freq(void) {
     }
     return g_es_freq;
 }
+/* madeira-bcd ENCODE-BATCH (madeira.cfg encode-batch, default 1; = 0 turns it
+ * off). Every draw handed its command chain to Metal in an encodeCommands call
+ * of its own, and every encoder its fence wait and its fence update in two
+ * more: ~1700-1950 PE -> unix transitions a frame for ~1000 draws in Horizon
+ * Zero Dawn (build 493, [perf] encode split), each paying the unix call's way
+ * in and out, the winemetal thunk and the timers around it. While a replay
+ * runs on a thread (mad_es_begin .. mad_es_finish), the chains it hands to one
+ * encoder are copied into the thread's arena, linked in the order they came,
+ * and sent as ONE chain: when that encoder ends, before any other encoder is
+ * made or used, before any object is released or an encoder labelled, when the
+ * arena is full, and when the replay ends. Metal therefore gets exactly the
+ * calls it got before, in the same order, on the same thread; only the
+ * transitions between them are gone. Commands that point at memory (setBytes,
+ * the viewport and scissor arrays) are copied with that memory, as Metal
+ * copies setBytes at encode time, so a later change of the caller's copy
+ * cannot reach the queued command. A command type this file does not know is
+ * never queued: what is queued is sent, then that chain as it is. The same
+ * per-thread state carries draw-dedup's view of the render encoder (struct
+ * mad_dd, see exec_draw). */
+#define MAD_EB_BYTES (64u * 1024u)
+#define MAD_EB_ALIGN(n) (((size_t)(n) + 15) & ~(size_t)15)
+enum { MAD_EB_RENDER, MAD_EB_COMPUTE, MAD_EB_BLIT };
+enum { EBF_END, EBF_ENCODER, EBF_RELEASE, EBF_FULL, EBF_VARIANT, EBF_OTHER, EBF_N };   /* why a batch was sent */
+struct mad_dd {   /* madeira-bcd draw-dedup: what render encoder `enc` holds, as the draws left it */
+    obj_handle_t enc;   /* 0: nothing is known (another encoder, or a chain from elsewhere reached it) */
+    obj_handle_t pso, dss;
+    struct WMTViewport vp; struct WMTScissorRect sc;
+    float blend[4];
+    UINT8 has_vp, has_sc, has_dss, has_blend, has_ras, has_ref, ref;
+    UINT8 ras[4]; float ras_f[3];   /* fill, cull, depth clip, winding; depth bias, slope scale, clamp */
+    struct { obj_handle_t buf; UINT64 off; } b[4][31];   /* buffer bindings: vertex, fragment, object, mesh */
+    LONG sets, elided, offsets;   /* statistics (kept across resets), published by mad_es_finish */
+};
+struct mad_eb {
+    int active;                     /* replays running on this thread (mad_es_begin .. mad_es_finish) */
+    obj_handle_t enc; int kind;     /* the encoder the queued chain is for */
+    struct wmtcmd_base *head, *tail;
+    unsigned used;                  /* arena bytes in use, a multiple of 16 */
+    LONG chains, calls, alone, why[EBF_N];   /* statistics, published by mad_es_finish */
+    struct mad_dd dd;
+    UINT64 arena[MAD_EB_BYTES / 8] __attribute__((aligned(16)));
+};
+static int g_eb_on = -1, g_dd_on = -1;   /* encode-batch, draw-dedup: read once (mad_es_begin) */
+static LONG g_eb_tls = -1;               /* TLS index of the thread's struct mad_eb, -1 until made */
+static volatile LONG g_eb_chains, g_eb_calls, g_eb_alone, g_eb_why[EBF_N], g_dd_sets, g_dd_elided, g_dd_offsets;
+#ifndef MAD_EB_SLOT   /* TEB TlsSlots[i]: what TlsGetValue reads, without its SetLastError */
+#ifdef __arm64ec__
+/* The TEB through one load whose base register is x18 (NT_TIB.Self at +0x30).
+ * NtCurrentTeb() + 0x1480 + 8 * i compiled to `add x8, x18, x8, lsl #3`, which
+ * the x18 patcher (build/ntdll-unix/virtual_ios.c) can only run "via x18": iOS
+ * preempted the thread between the trampoline's reload of x18 and the add, x8
+ * became 8 * i, and the load faulted where the Mach handler would not repair it
+ * (HZD on build 500: madeira_d3d12.dll+0x15ed4 read 0x1508 = TEB 0 + slot 17).
+ * The patcher runs `ldr xT, [x18, #imm]` through xT itself, without x18. */
+static inline void *mad_teb_self(void) {
+    void *teb;
+    __asm__ volatile("ldr %0, [x18, #0x30]" : "=r"(teb));
+    return teb;
+}
+#define MAD_EB_SLOT(i) (((void *const *)((const char *)mad_teb_self() + 0x1480))[(i)])
+#else
+#define MAD_EB_SLOT(i) (((void *const *)((const char *)NtCurrentTeb() + 0x1480))[(i)])
+#endif
+#endif
+static struct mad_eb *mad_eb_cur(void) {   /* this thread's state while a replay runs on it */
+    LONG i = g_eb_tls;
+    struct mad_eb *b;
+    if (i < 0) return NULL;
+    b = (struct mad_eb *)MAD_EB_SLOT(i);
+    return b && b->active ? b : NULL;
+}
+/* One command's size, and the memory it points at (*pay, *plen). 0: not queued. */
+static size_t mad_eb_size(int kind, const struct wmtcmd_base *c, const void **pay, size_t *plen) {
+    *pay = NULL; *plen = 0;
+    if (kind == MAD_EB_RENDER) switch (c->type) {
+    case WMTRenderCommandNop: return sizeof(struct wmtcmd_render_nop);
+    case WMTRenderCommandUseResource: return sizeof(struct wmtcmd_render_useresource);
+    case WMTRenderCommandSetVertexBuffer: case WMTRenderCommandSetFragmentBuffer:
+    case WMTRenderCommandSetMeshBuffer: case WMTRenderCommandSetObjectBuffer: return sizeof(struct wmtcmd_render_setbuffer);
+    case WMTRenderCommandSetVertexBufferOffset: case WMTRenderCommandSetFragmentBufferOffset:
+    case WMTRenderCommandSetMeshBufferOffset: case WMTRenderCommandSetObjectBufferOffset: return sizeof(struct wmtcmd_render_setbufferoffset);
+    case WMTRenderCommandSetFragmentTexture: case WMTRenderCommandSetVertexTexture: return sizeof(struct wmtcmd_render_settexture);
+    case WMTRenderCommandSetFragmentSamplerState: case WMTRenderCommandSetVertexSamplerState: return sizeof(struct wmtcmd_render_setsamplerstate);
+    case WMTRenderCommandSetFragmentBytes: {
+        const struct wmtcmd_render_setbytes *s = (const void *)c;
+        *pay = s->bytes.ptr; *plen = (size_t)s->length; return sizeof *s;
+    }
+    case WMTRenderCommandSetRasterizerState: return sizeof(struct wmtcmd_render_setrasterizerstate);
+    case WMTRenderCommandSetViewports: {
+        const struct wmtcmd_render_setviewports *s = (const void *)c;
+        *pay = s->viewports.ptr; *plen = (size_t)s->viewport_count * sizeof(struct WMTViewport); return sizeof *s;
+    }
+    case WMTRenderCommandSetScissorRects: {
+        const struct wmtcmd_render_setscissorrects *s = (const void *)c;
+        *pay = s->scissor_rects.ptr; *plen = (size_t)s->rect_count * sizeof(struct WMTScissorRect); return sizeof *s;
+    }
+    case WMTRenderCommandSetPSO: return sizeof(struct wmtcmd_render_setpso);
+    case WMTRenderCommandSetDSSO: return sizeof(struct wmtcmd_render_setdsso);
+    case WMTRenderCommandSetBlendFactorAndStencilRef: case WMTRenderCommandSetBlendFactor: return sizeof(struct wmtcmd_render_setblendcolor);
+    case WMTRenderCommandSetVisibilityMode: return sizeof(struct wmtcmd_render_setvisibilitymode);
+    case WMTRenderCommandDraw: return sizeof(struct wmtcmd_render_draw);
+    case WMTRenderCommandDrawIndexed: return sizeof(struct wmtcmd_render_draw_indexed);
+    case WMTRenderCommandDrawIndirect: return sizeof(struct wmtcmd_render_draw_indirect);
+    case WMTRenderCommandDrawIndexedIndirect: return sizeof(struct wmtcmd_render_draw_indexed_indirect);
+    case WMTRenderCommandDrawMeshThreadgroups: return sizeof(struct wmtcmd_render_draw_meshthreadgroups);
+    case WMTRenderCommandDrawMeshThreadgroupsIndirect: return sizeof(struct wmtcmd_render_draw_meshthreadgroups_indirect);
+    case WMTRenderCommandMemoryBarrier: return sizeof(struct wmtcmd_render_memory_barrier);
+    case WMTRenderCommandDXMTGeometryDraw: return sizeof(struct wmtcmd_render_dxmt_geometry_draw);
+    case WMTRenderCommandDXMTGeometryDrawIndexed: return sizeof(struct wmtcmd_render_dxmt_geometry_draw_indexed);
+    case WMTRenderCommandDXMTGeometryDrawIndirect: return sizeof(struct wmtcmd_render_dxmt_geometry_draw_indirect);
+    case WMTRenderCommandDXMTGeometryDrawIndexedIndirect: return sizeof(struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect);
+    case WMTRenderCommandWaitForFence: case WMTRenderCommandUpdateFence: return sizeof(struct wmtcmd_render_fence_op);
+    case WMTRenderCommandSetViewport: return sizeof(struct wmtcmd_render_setviewport);
+    case WMTRenderCommandSetScissorRect: return sizeof(struct wmtcmd_render_setscissorrect);
+    case WMTRenderCommandDXMTTessellationMeshDraw: return sizeof(struct wmtcmd_render_dxmt_tessellation_mesh_draw);
+    case WMTRenderCommandDXMTTessellationMeshDrawIndexed: return sizeof(struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed);
+    case WMTRenderCommandDXMTTessellationMeshDrawIndirect: return sizeof(struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect);
+    case WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect: return sizeof(struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect);
+    default: return 0;
+    }
+    if (kind == MAD_EB_COMPUTE) switch (c->type) {
+    case WMTComputeCommandNop: return sizeof(struct wmtcmd_compute_nop);
+    case WMTComputeCommandDispatch: case WMTComputeCommandDispatchThreads: return sizeof(struct wmtcmd_compute_dispatch);
+    case WMTComputeCommandDispatchIndirect: return sizeof(struct wmtcmd_compute_dispatch_indirect);
+    case WMTComputeCommandSetPSO: return sizeof(struct wmtcmd_compute_setpso);
+    case WMTComputeCommandSetBuffer: return sizeof(struct wmtcmd_compute_setbuffer);
+    case WMTComputeCommandSetBufferOffset: return sizeof(struct wmtcmd_compute_setbufferoffset);
+    case WMTComputeCommandUseResource: return sizeof(struct wmtcmd_compute_useresource);
+    case WMTComputeCommandSetBytes: {
+        const struct wmtcmd_compute_setbytes *s = (const void *)c;
+        *pay = s->bytes.ptr; *plen = (size_t)s->length; return sizeof *s;
+    }
+    case WMTComputeCommandSetTexture: return sizeof(struct wmtcmd_compute_settexture);
+    case WMTComputeCommandWaitForFence: case WMTComputeCommandUpdateFence: return sizeof(struct wmtcmd_compute_fence_op);
+    default: return 0;
+    }
+    switch (c->type) {
+    case WMTBlitCommandNop: return sizeof(struct wmtcmd_blit_nop);
+    case WMTBlitCommandCopyFromBufferToBuffer: return sizeof(struct wmtcmd_blit_copy_from_buffer_to_buffer);
+    case WMTBlitCommandCopyFromBufferToTexture: return sizeof(struct wmtcmd_blit_copy_from_buffer_to_texture);
+    case WMTBlitCommandCopyFromTextureToBuffer: return sizeof(struct wmtcmd_blit_copy_from_texture_to_buffer);
+    case WMTBlitCommandCopyFromTextureToTexture: return sizeof(struct wmtcmd_blit_copy_from_texture_to_texture);
+    case WMTBlitCommandGenerateMipmaps: return sizeof(struct wmtcmd_blit_generate_mipmaps);
+    case WMTBlitCommandWaitForFence: case WMTBlitCommandUpdateFence: return sizeof(struct wmtcmd_blit_fence_op);
+    case WMTBlitCommandFillBuffer: return sizeof(struct wmtcmd_blit_fillbuffer);
+    case WMTBlitCommandOptimizeContentsForGPUAccess: return sizeof(struct wmtcmd_blit_optimize_contents);
+    default: return 0;
+    }
+}
+/* Point a queued command at its copy of the memory it carries. */
+static void mad_eb_repoint(int kind, struct wmtcmd_base *d, void *q) {
+    if (kind == MAD_EB_COMPUTE) { ((struct wmtcmd_compute_setbytes *)d)->bytes.ptr = q; return; }
+    switch (d->type) {
+    case WMTRenderCommandSetFragmentBytes: ((struct wmtcmd_render_setbytes *)d)->bytes.ptr = q; break;
+    case WMTRenderCommandSetViewports: ((struct wmtcmd_render_setviewports *)d)->viewports.ptr = q; break;
+    case WMTRenderCommandSetScissorRects: ((struct wmtcmd_render_setscissorrects *)d)->scissor_rects.ptr = q; break;
+    }
+}
+/* Send what is queued: one encodeCommands call for the whole chain. */
+static void mad_eb_flush(struct mad_eb *b, int why) {
+    UINT64 t;
+    if (!b->head) return;
+    t = mad_tick();
+    if (b->kind == MAD_EB_RENDER) (MTLRenderCommandEncoder_encodeCommands)(b->enc, b->head);
+    else if (b->kind == MAD_EB_COMPUTE) (MTLComputeCommandEncoder_encodeCommands)(b->enc, b->head);
+    else (MTLBlitCommandEncoder_encodeCommands)(b->enc, b->head);
+    InterlockedExchangeAdd64(&g_es_enc_t, (LONG64)(mad_tick() - t)); InterlockedIncrement(&g_es_enc_n);
+    b->head = b->tail = NULL; b->used = 0; b->enc = 0;
+    b->calls++; b->why[why]++;
+}
+/* Before anything that must not overtake what this thread has queued. */
+static void mad_eb_flush_cur(int why) {
+    struct mad_eb *b;
+    if (g_eb_tls >= 0 && (b = mad_eb_cur()) && b->head) mad_eb_flush(b, why);
+}
+/* Queue a chain for encoder `enc`; 0: not queued (the caller sends it, after
+ * everything queued before it went out). */
+static int mad_eb_push(struct mad_eb *b, obj_handle_t enc, int kind, const struct wmtcmd_base *c) {
+    const struct wmtcmd_base *p;
+    const void *pay; size_t sz, plen, need = 0;
+    unsigned char *base = (unsigned char *)b->arena;
+    if (!enc || !c) return 0;
+    for (p = c; p; p = (const struct wmtcmd_base *)p->next.ptr) {
+        sz = mad_eb_size(kind, p, &pay, &plen);
+        if (!sz || (plen && !pay)) { mad_eb_flush(b, EBF_OTHER); b->alone++; return 0; }
+        need += MAD_EB_ALIGN(sz) + MAD_EB_ALIGN(plen);
+    }
+    if (need > MAD_EB_BYTES) { mad_eb_flush(b, EBF_FULL); b->alone++; return 0; }
+    if (b->head && (b->enc != enc || b->kind != kind)) mad_eb_flush(b, EBF_ENCODER);
+    if (b->used + need > MAD_EB_BYTES) mad_eb_flush(b, EBF_FULL);
+    for (p = c; p; p = (const struct wmtcmd_base *)p->next.ptr) {
+        struct wmtcmd_base *d = (struct wmtcmd_base *)(base + b->used);
+        sz = mad_eb_size(kind, p, &pay, &plen);
+        memcpy(d, p, sz);
+        b->used += (unsigned)MAD_EB_ALIGN(sz);
+        if (plen) {
+            void *q = base + b->used;
+            memcpy(q, pay, plen);
+            mad_eb_repoint(kind, d, q);
+            b->used += (unsigned)MAD_EB_ALIGN(plen);
+        }
+        d->next.ptr = NULL;
+        if (b->tail) b->tail->next.ptr = d; else b->head = d;
+        b->tail = d;
+    }
+    b->enc = enc; b->kind = kind; b->chains++;
+    return 1;
+}
 static void mad_es_rce(obj_handle_t e, const struct wmtcmd_base *c) {
-    UINT64 t = mad_tick(); (MTLRenderCommandEncoder_encodeCommands)(e, c);
+    UINT64 t;
+    if (g_eb_tls >= 0) {
+        struct mad_eb *b = mad_eb_cur();
+        if (b) {
+            if (b->dd.enc == e) b->dd.enc = 0;   /* draw-dedup: a chain from elsewhere; what the encoder holds is unknown now */
+            if (g_eb_on > 0 && mad_eb_push(b, e, MAD_EB_RENDER, c)) return;
+        }
+    }
+    t = mad_tick(); (MTLRenderCommandEncoder_encodeCommands)(e, c);
     InterlockedExchangeAdd64(&g_es_enc_t, (LONG64)(mad_tick() - t)); InterlockedIncrement(&g_es_enc_n);
 }
 static void mad_es_cce(obj_handle_t e, const struct wmtcmd_base *c) {
-    UINT64 t = mad_tick(); (MTLComputeCommandEncoder_encodeCommands)(e, c);
+    UINT64 t;
+    struct mad_eb *b;
+    if (g_eb_on > 0 && g_eb_tls >= 0 && (b = mad_eb_cur()) && mad_eb_push(b, e, MAD_EB_COMPUTE, c)) return;
+    t = mad_tick(); (MTLComputeCommandEncoder_encodeCommands)(e, c);
     InterlockedExchangeAdd64(&g_es_enc_t, (LONG64)(mad_tick() - t)); InterlockedIncrement(&g_es_enc_n);
 }
 static void mad_es_bce(obj_handle_t e, const struct wmtcmd_base *c) {
-    UINT64 t = mad_tick(); (MTLBlitCommandEncoder_encodeCommands)(e, c);
+    UINT64 t;
+    struct mad_eb *b;
+    if (g_eb_on > 0 && g_eb_tls >= 0 && (b = mad_eb_cur()) && mad_eb_push(b, e, MAD_EB_BLIT, c)) return;
+    t = mad_tick(); (MTLBlitCommandEncoder_encodeCommands)(e, c);
     InterlockedExchangeAdd64(&g_es_enc_t, (LONG64)(mad_tick() - t)); InterlockedIncrement(&g_es_enc_n);
 }
 static obj_handle_t mad_es_renc(obj_handle_t cb, struct WMTRenderPassInfo *i) {
-    UINT64 t = mad_tick(); obj_handle_t r = (MTLCommandBuffer_renderCommandEncoder)(cb, i);
+    UINT64 t; obj_handle_t r;
+    mad_eb_flush_cur(EBF_ENCODER);
+    t = mad_tick(); r = (MTLCommandBuffer_renderCommandEncoder)(cb, i);
     InterlockedExchangeAdd64(&g_es_open_t, (LONG64)(mad_tick() - t)); InterlockedIncrement(&g_es_open_n); return r;
 }
 static obj_handle_t mad_es_cenc(obj_handle_t cb, bool concurrent) {
-    UINT64 t = mad_tick(); obj_handle_t r = (MTLCommandBuffer_computeCommandEncoder)(cb, concurrent);
+    UINT64 t; obj_handle_t r;
+    mad_eb_flush_cur(EBF_ENCODER);
+    t = mad_tick(); r = (MTLCommandBuffer_computeCommandEncoder)(cb, concurrent);
     InterlockedExchangeAdd64(&g_es_open_t, (LONG64)(mad_tick() - t)); InterlockedIncrement(&g_es_open_n); return r;
 }
 static obj_handle_t mad_es_benc(obj_handle_t cb) {
-    UINT64 t = mad_tick(); obj_handle_t r = (MTLCommandBuffer_blitCommandEncoder)(cb);
+    UINT64 t; obj_handle_t r;
+    mad_eb_flush_cur(EBF_ENCODER);
+    t = mad_tick(); r = (MTLCommandBuffer_blitCommandEncoder)(cb);
     InterlockedExchangeAdd64(&g_es_open_t, (LONG64)(mad_tick() - t)); InterlockedIncrement(&g_es_open_n); return r;
 }
 static void mad_es_end(obj_handle_t e) {
-    UINT64 t = mad_tick(); (MTLCommandEncoder_endEncoding)(e);
+    UINT64 t;
+    if (g_eb_tls >= 0) {
+        struct mad_eb *b = mad_eb_cur();
+        if (b) {
+            if (b->head) mad_eb_flush(b, b->enc == e ? EBF_END : EBF_ENCODER);
+            if (b->dd.enc == e) b->dd.enc = 0;
+        }
+    }
+    t = mad_tick(); (MTLCommandEncoder_endEncoding)(e);
     InterlockedExchangeAdd64(&g_es_open_t, (LONG64)(mad_tick() - t));
+}
+static void mad_es_release(obj_handle_t o) {   /* a queued command may name it */
+    mad_eb_flush_cur(EBF_RELEASE);
+    (NSObject_release)(o);
+}
+static void mad_es_label(obj_handle_t e, obj_handle_t s) {
+    mad_eb_flush_cur(EBF_OTHER);
+    (MTLCommandEncoder_setLabel)(e, s);
+}
+static long long mad_cfg_int_pe(const char *key, long long dflt);
+/* A replay starts on this thread (mad_ecl_run): encode-batch and draw-dedup
+ * apply until mad_es_finish. NULL when both are off. */
+static struct mad_eb *mad_es_begin(void) {
+    struct mad_eb *b;
+    LONG i;
+    if (g_eb_on < 0 || g_dd_on < 0) {
+        g_eb_on = mad_cfg_int_pe("encode-batch", 1) ? 1 : 0;   /* one encodeCommands call per encoder instead of one per draw; 0 = one per draw, as before */
+        g_dd_on = mad_cfg_int_pe("draw-dedup", 1) ? 1 : 0;   /* draws leave out state the render encoder already holds; 0 = every draw sends all of it, as before */
+        d3d12_log("[madeira-d3d12] encode-batch = %d, draw-dedup = %d (madeira.cfg; 0 turns either off)\n", g_eb_on, g_dd_on);
+    }
+    if (g_eb_on <= 0 && g_dd_on <= 0) return NULL;
+    if ((i = g_eb_tls) < 0) {
+        DWORD n = TlsAlloc();
+        int in_place = 0;
+        if (n != TLS_OUT_OF_INDEXES && n < 64) {   /* only the TEB's first 64 slots are read in place */
+            TlsSetValue(n, (void *)&g_eb_tls);     /* the slot read in place must show what TlsSetValue stored */
+            in_place = MAD_EB_SLOT(n) == (void *)&g_eb_tls;
+            TlsSetValue(n, NULL);
+        }
+        if (!in_place) {
+            if (n != TLS_OUT_OF_INDEXES) TlsFree(n);
+            g_eb_on = g_dd_on = 0;
+            d3d12_log("[madeira-d3d12] encode-batch / draw-dedup off: no thread-local slot this runtime can read in place\n");
+            return NULL;
+        }
+        i = InterlockedCompareExchange(&g_eb_tls, (LONG)n, -1);
+        if (i >= 0) TlsFree(n); else i = (LONG)n;
+    }
+    b = (struct mad_eb *)MAD_EB_SLOT(i);
+    if (!b) {
+        if (!(b = calloc(1, sizeof *b))) return NULL;
+        TlsSetValue((DWORD)i, b);
+    }
+    if (!b->active++) b->dd.enc = 0;   /* encoder handles may be reused once the replay's pool drained */
+    return b;
+}
+static void mad_es_finish(struct mad_eb *b) {
+    unsigned k;
+    if (!b) return;
+    mad_eb_flush(b, EBF_OTHER);
+    if (--b->active > 0) return;
+    b->dd.enc = 0;
+    if (b->chains) { InterlockedExchangeAdd(&g_eb_chains, b->chains); b->chains = 0; }
+    if (b->calls) { InterlockedExchangeAdd(&g_eb_calls, b->calls); b->calls = 0; }
+    if (b->alone) { InterlockedExchangeAdd(&g_eb_alone, b->alone); b->alone = 0; }
+    for (k = 0; k < EBF_N; k++) if (b->why[k]) { InterlockedExchangeAdd(&g_eb_why[k], b->why[k]); b->why[k] = 0; }
+    if (b->dd.sets) { InterlockedExchangeAdd(&g_dd_sets, b->dd.sets); b->dd.sets = 0; }
+    if (b->dd.elided) { InterlockedExchangeAdd(&g_dd_elided, b->dd.elided); b->dd.elided = 0; }
+    if (b->dd.offsets) { InterlockedExchangeAdd(&g_dd_offsets, b->dd.offsets); b->dd.offsets = 0; }
+}
+static void mad_es_thread_exit(void) {   /* DLL_THREAD_DETACH: the thread's state goes with it */
+    LONG i = g_eb_tls;
+    struct mad_eb *b;
+    if (i < 0 || !(b = (struct mad_eb *)MAD_EB_SLOT(i)) || b->active) return;
+    TlsSetValue((DWORD)i, NULL);
+    free(b);
 }
 #define MTLRenderCommandEncoder_encodeCommands(e_, c_) mad_es_rce((e_), (c_))
 #define MTLComputeCommandEncoder_encodeCommands(e_, c_) mad_es_cce((e_), (c_))
@@ -631,6 +933,8 @@ static void mad_es_end(obj_handle_t e) {
 #define MTLCommandBuffer_computeCommandEncoder(cb_, c_) mad_es_cenc((cb_), (c_))
 #define MTLCommandBuffer_blitCommandEncoder(cb_) mad_es_benc((cb_))
 #define MTLCommandEncoder_endEncoding(e_) mad_es_end((e_))
+#define NSObject_release(o_) mad_es_release((o_))
+#define MTLCommandEncoder_setLabel(e_, s_) mad_es_label((e_), (s_))
 /* madeira-bcd: where pipeline creation time goes -- the "Compiling shaders"
  * screen and the stalls at first draw. QPC ticks, summed over all threads. */
 static volatile LONG64 g_pt_gfx, g_pt_cs, g_pt_conv, g_pt_lib, g_pt_rs, g_pt_realize;
@@ -2844,6 +3148,7 @@ static void exec_drop_pending(struct mad_exec *e, int i) {
     e->pend[i] = e->pend[--e->npend];
 }
 
+    mad_eb_flush_cur(EBF_OTHER);   /* encode-batch: the pass's queued draws reach Metal first, as before */
 /* A clear whose target is not part of the next pass still has to happen: it
  * gets a pass of its own with nothing drawn. */
 static void exec_flush_clear(struct mad_exec *e, int i) {
@@ -6921,6 +7226,100 @@ static int mad_skip_ps_match(const struct mad_pso *p) {
         }
     return 0;
 }
+/* madeira-bcd DRAW-DEDUP (madeira.cfg draw-dedup, default 1; = 0 turns it off).
+ * Every draw handed Metal its whole state again: pipeline, viewport, scissor,
+ * depth-stencil state and stencil reference, blend colour, the five rasterizer
+ * calls and every buffer binding (argument table, descriptor heaps, vertex
+ * buffers, draw parameters) -- ~20 Metal calls for a Horizon Zero Dawn draw,
+ * most of them repeating what the encoder already held. A Metal render encoder
+ * keeps its state from draw to draw, so setting a value it already holds
+ * changes nothing; such sets are left out. A binding of the buffer already
+ * bound at that index with only a new offset becomes set*BufferOffset, which
+ * Metal defines as exactly that. struct mad_dd (the replay thread's, see
+ * mad_eb) is what one render encoder holds, as the draws left it; it is
+ * forgotten when another encoder is drawn into, when the encoder ends, when a
+ * chain from anywhere else reaches it (mad_es_rce), and while a draw's chain is
+ * built (a draw that returns early leaves it forgotten). Draws through the
+ * geometry or tessellation emulation send everything and leave it forgotten. */
+static void mad_dd_reset(struct mad_dd *d) {
+    LONG s = d->sets, el = d->elided, o = d->offsets;
+    memset(d, 0, sizeof *d);
+    d->sets = s; d->elided = el; d->offsets = o;
+}
+/* The draw-dedup state for a draw into `renc`, unknown until mad_dd_end; NULL when off. */
+static struct mad_dd *mad_dd_begin(obj_handle_t renc) {
+    struct mad_eb *b;
+    if (g_dd_on <= 0 || !renc || !(b = mad_eb_cur())) return NULL;
+    if (b->dd.enc != renc) mad_dd_reset(&b->dd);
+    b->dd.enc = 0;
+    return &b->dd;
+}
+static void mad_dd_end(struct mad_dd *d, obj_handle_t renc) { d->enc = renc; }   /* the chain reached the encoder */
+/* Each returns 1 when the set must be sent (and records it), 0 when the encoder already holds it. */
+static int mad_dd_pso(struct mad_dd *d, obj_handle_t pso) {
+    d->sets++;
+    if (pso && d->pso == pso) { d->elided++; return 0; }
+    d->pso = pso;
+    return 1;
+}
+static int mad_dd_vp(struct mad_dd *d, const struct WMTViewport *v) {
+    d->sets++;
+    if (d->has_vp && !memcmp(&d->vp, v, sizeof *v)) { d->elided++; return 0; }
+    d->vp = *v; d->has_vp = 1;
+    return 1;
+}
+static int mad_dd_sc(struct mad_dd *d, const struct WMTScissorRect *s) {
+    d->sets++;
+    if (d->has_sc && !memcmp(&d->sc, s, sizeof *s)) { d->elided++; return 0; }
+    d->sc = *s; d->has_sc = 1;
+    return 1;
+}
+static int mad_dd_dss(struct mad_dd *d, obj_handle_t dss, UINT8 ref) {   /* the depth-stencil state and the stencil reference */
+    d->sets++;
+    if (d->has_dss && d->dss == dss && d->has_ref && d->ref == ref) { d->elided++; return 0; }
+    d->dss = dss; d->has_dss = 1; d->ref = ref; d->has_ref = 1;
+    return 1;
+}
+static int mad_dd_blend(struct mad_dd *d, const float rgba[4], UINT8 ref) {   /* the blend colour and the stencil reference */
+    d->sets++;
+    if (d->has_blend && !memcmp(d->blend, rgba, sizeof d->blend) && d->has_ref && d->ref == ref) { d->elided++; return 0; }
+    memcpy(d->blend, rgba, sizeof d->blend); d->has_blend = 1; d->ref = ref; d->has_ref = 1;
+    return 1;
+}
+static int mad_dd_ras(struct mad_dd *d, const struct wmtcmd_render_setrasterizerstate *r) {
+    const UINT8 m[4] = { (UINT8)r->fill_mode, (UINT8)r->cull_mode, (UINT8)r->depth_clip_mode, (UINT8)r->winding };
+    const float f[3] = { r->depth_bias, r->scole_scale, r->depth_bias_clamp };
+    d->sets++;
+    if (d->has_ras && !memcmp(d->ras, m, sizeof m) && !memcmp(d->ras_f, f, sizeof f)) { d->elided++; return 0; }
+    memcpy(d->ras, m, sizeof m); memcpy(d->ras_f, f, sizeof f); d->has_ras = 1;
+    return 1;
+}
+/* A buffer binding: NULL when the encoder holds it, `o` (an offset-only set) when
+ * only the offset differs, `s` otherwise. */
+static struct wmtcmd_base *mad_dd_buf(struct mad_dd *d, struct wmtcmd_render_setbuffer *s, struct wmtcmd_render_setbufferoffset *o) {
+    int st;
+    enum WMTRenderCommandType ot;
+    switch (s->type) {
+    case WMTRenderCommandSetVertexBuffer: st = 0; ot = WMTRenderCommandSetVertexBufferOffset; break;
+    case WMTRenderCommandSetFragmentBuffer: st = 1; ot = WMTRenderCommandSetFragmentBufferOffset; break;
+    case WMTRenderCommandSetObjectBuffer: st = 2; ot = WMTRenderCommandSetObjectBufferOffset; break;
+    case WMTRenderCommandSetMeshBuffer: st = 3; ot = WMTRenderCommandSetMeshBufferOffset; break;
+    default: return (struct wmtcmd_base *)s;
+    }
+    d->sets++;
+    if (s->index >= 31) return (struct wmtcmd_base *)s;
+    if (!s->buffer) { d->b[st][s->index].buf = 0; return (struct wmtcmd_base *)s; }
+    if (d->b[st][s->index].buf == s->buffer) {
+        if (d->b[st][s->index].off == s->offset) { d->elided++; return NULL; }
+        memset(o, 0, sizeof *o);
+        o->type = ot; o->offset = s->offset; o->index = s->index;
+        d->b[st][s->index].off = s->offset;
+        d->offsets++;
+        return (struct wmtcmd_base *)o;
+    }
+    d->b[st][s->index].buf = s->buffer; d->b[st][s->index].off = s->offset;
+    return (struct wmtcmd_base *)s;
+}
 static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
     struct wmtcmd_render_setpso c_pso;
     struct wmtcmd_render_draw_indirect c_di;
@@ -6929,6 +7328,8 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
     struct wmtcmd_render_setviewport c_vp;
     struct wmtcmd_render_setscissorrect c_sc;
     struct wmtcmd_render_setbuffer sb[6 + 16 + 2];
+    struct wmtcmd_render_setbufferoffset so[6 + 16 + 2];   /* madeira-bcd draw-dedup: sb[k] as an offset-only set */
+    struct mad_dd *dd = NULL;                              /* madeira-bcd draw-dedup: what the encoder holds; NULL = send everything */
     struct wmtcmd_render_useresource ur[256];
     struct wmtcmd_render_setdsso c_dss;
     struct wmtcmd_render_setrasterizerstate c_ras;
@@ -7018,6 +7419,8 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
         }
     }
 tess_go:
+    dd = mad_dd_begin(e->renc);            /* madeira-bcd draw-dedup */
+    if (dd && (tv || gsemu)) dd = NULL;    /* emulated stages send everything; what the encoder holds stays unknown */
     if (!exec_arg_slot(e, &argbuf, &argoff)) { MAD_SKIP(e); return; }
     arg_slot_used = e->l->ring_used - 1;   /* ml1084: the slot exec_arg_slot took, see the draw-params block */
     if (g_sd_state > 0 && g_upload_guard) mad_ug_note_draw(e, c);   /* madeira-bcd: sync diagnostics */
@@ -7032,6 +7435,7 @@ tess_go:
         for (i = 0; i < 16; i++) strides[i] = e->vb[i].res ? e->vb[i].stride : e->pso->vb_stride[i];
         c_pso.pso = mad_pso_for_strides(e->pso, strides);
     }
+    if (dd && !mad_dd_pso(dd, c_pso.pso)) c_pso.type = WMTRenderCommandNop;   /* madeira-bcd draw-dedup: the encoder has it */
     tail = (struct wmtcmd_base *)&c_pso;
 #define MAD_APPEND(node) do { tail->next.ptr = (node); tail = (struct wmtcmd_base *)(node); } while (0)
     if (e->has_vp) {
@@ -7039,7 +7443,7 @@ tess_go:
         c_vp.viewport.originX = e->vp.TopLeftX; c_vp.viewport.originY = e->vp.TopLeftY;
         c_vp.viewport.width = e->vp.Width; c_vp.viewport.height = e->vp.Height;
         c_vp.viewport.znear = e->vp.MinDepth; c_vp.viewport.zfar = e->vp.MaxDepth;
-        MAD_APPEND(&c_vp);
+        if (!dd || mad_dd_vp(dd, &c_vp.viewport)) MAD_APPEND(&c_vp);
     }
     if (e->has_sc) {
         /* Metal refuses a scissor outside the attachment; clamp to it. */
@@ -7053,12 +7457,13 @@ tess_go:
             memset(&c_sc, 0, sizeof c_sc); c_sc.type = WMTRenderCommandSetScissorRect;
             c_sc.scissor_rect.x = (UINT64)x0; c_sc.scissor_rect.y = (UINT64)y0;
             c_sc.scissor_rect.width = (UINT64)(x1 - x0); c_sc.scissor_rect.height = (UINT64)(y1 - y0);
-            MAD_APPEND(&c_sc);
+            if (!dd || mad_dd_sc(dd, &c_sc.scissor_rect)) MAD_APPEND(&c_sc);
         }
     }
     memset(sb, 0, sizeof sb);
-#define MAD_SETBUF(stage, buf_, off_, idx_) do { sb[nsb].type = (stage); sb[nsb].buffer = (buf_); \
-        sb[nsb].offset = (off_); sb[nsb].index = (idx_); MAD_APPEND(&sb[nsb]); nsb++; } while (0)
+#define MAD_SETBUF(stage, buf_, off_, idx_) do { struct wmtcmd_base *sbn_; sb[nsb].type = (stage); sb[nsb].buffer = (buf_); \
+        sb[nsb].offset = (off_); sb[nsb].index = (idx_); \
+        sbn_ = dd ? mad_dd_buf(dd, &sb[nsb], &so[nsb]) : (struct wmtcmd_base *)&sb[nsb]; if (sbn_) MAD_APPEND(sbn_); nsb++; } while (0)
     /* kIRArgumentBufferBindPoint 2, descriptor heap 0, sampler heap 1. */
     /* ml927: on a geometry-emulation pipeline the vertex stage is the OBJECT
      * stage and the geometry shader the MESH stage; both take the same
@@ -7263,17 +7668,17 @@ tess_go:
         memset(&c_dss, 0, sizeof c_dss); c_dss.type = WMTRenderCommandSetDSSO;
         c_dss.dsso = e->pso->dsso ? e->pso->dsso : dev->dsso;
         c_dss.stencil_ref = (uint8_t)e->stencil_ref;
-        MAD_APPEND(&c_dss);
+        if (!dd || mad_dd_dss(dd, c_dss.dsso, c_dss.stencil_ref)) MAD_APPEND(&c_dss);
     }
     if (e->has_blend) {
         memset(&c_bl, 0, sizeof c_bl); c_bl.type = WMTRenderCommandSetBlendFactorAndStencilRef;
         c_bl.red = e->blend[0]; c_bl.green = e->blend[1]; c_bl.blue = e->blend[2]; c_bl.alpha = e->blend[3];
         c_bl.stencil_ref = (uint8_t)e->stencil_ref;
-        MAD_APPEND(&c_bl);
+        if (!dd || mad_dd_blend(dd, e->blend, c_bl.stencil_ref)) MAD_APPEND(&c_bl);
     }
     c_ras = e->pso->raster;
     c_ras.next.ptr = NULL;
-    MAD_APPEND(&c_ras);
+    if (!dd || mad_dd_ras(dd, &c_ras)) MAD_APPEND(&c_ras);
     for (i = 0; i < 16; i++) {
         if (!(e->pso->vb_mask & (1u << i)) || !e->vb[i].res) continue;
         /* ml878: stride differences are handled by mad_pso_for_strides above */
@@ -7440,6 +7845,11 @@ tess_go:
         }
         if (want != ~(UINT64)0) v->dirty = 1;
     }
+    if (dd) mad_dd_end(dd, e->renc);   /* madeira-bcd draw-dedup: the encoder holds what dd says */
+    /* madeira-bcd encode-batch: a stride variant may be evicted from its pipeline's
+     * cache and released by any thread once the cache is full (mad_pso_for_strides);
+     * one is never left queued, so Metal holds it as soon as it was chosen. */
+    if (c_pso.type == WMTRenderCommandSetPSO && !tv && c_pso.pso != e->pso->rps) mad_eb_flush_cur(EBF_VARIANT);
     mad_use_commit(e);   /* this draw's useResource entries reached the encoder */
 #undef MAD_APPEND
     e->draws++; e->pass_draws++;   /* ml1098 */
@@ -8635,6 +9045,7 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
     obj_handle_t ml1049_pool = NSAutoreleasePool_alloc_init();
     const int rs = mad_rs_on();   /* madeira-bcd: replay split */
     UINT64 rs_t = rs ? mad_tick() : 0;
+    struct mad_eb *eb = mad_es_begin();   /* madeira-bcd encode-batch / draw-dedup: this replay's encode state */
     if (ml1021_q) EnterCriticalSection(&ml1021_q->submit_lock);
     if (rs) mad_rs_step(RS_LOCK, &rs_t);
 
@@ -8680,6 +9091,7 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
             if (rs) mad_rs_step(RS_FLUSH, &rs_t);
         }
     }
+    mad_es_finish(eb);   /* madeira-bcd encode-batch: anything still queued goes out under the queue's lock */
     if (ml1021_q) LeaveCriticalSection(&ml1021_q->submit_lock);   /* ml1021 */
     if (g_sd_state > 0 && g_gpu_sync && q) {   /* madeira-bcd: gpu-sync -- this submission runs to completion before the game goes on */
         mad_queue_flush(q);
@@ -8849,6 +9261,17 @@ static void mad_perf_present(void) {
                           "useResource entries %.0f (%.0f already declared, skipped; madeira.cfg use-dedup) -- the rest of ExecuteCommandLists is the replay itself\n",
                           1000.0 * (double)et / tf / np, en / np, en ? 1e6 * (double)et / tf / en : 0.0,
                           1000.0 * (double)ot / tf / np, on / np, un / np, us / np);
+                if (g_eb_on > 0 || g_dd_on > 0) {   /* madeira-bcd encode-batch / draw-dedup */
+                    LONG ch = InterlockedExchange(&g_eb_chains, 0), ca = InterlockedExchange(&g_eb_calls, 0), al = InterlockedExchange(&g_eb_alone, 0);
+                    LONG w[EBF_N], ds = InterlockedExchange(&g_dd_sets, 0), de = InterlockedExchange(&g_dd_elided, 0), dof = InterlockedExchange(&g_dd_offsets, 0);
+                    unsigned k;
+                    for (k = 0; k < EBF_N; k++) w[k] = InterlockedExchange(&g_eb_why[k], 0);
+                    d3d12_log("[perf] encode-batch per frame: %.0f chains sent in %.0f calls, %.0f sent alone; batches sent at encoder end %.0f, "
+                              "other encoder %.0f, release %.0f, arena full %.0f, pipeline variant %.0f, other %.0f | draw-dedup per frame: "
+                              "%.0f of %.0f state sets left out, %.0f buffer binds as offsets (madeira.cfg encode-batch = %d, draw-dedup = %d)\n",
+                              ch / np, ca / np, al / np, w[EBF_END] / np, w[EBF_ENCODER] / np, w[EBF_RELEASE] / np, w[EBF_FULL] / np,
+                              w[EBF_VARIANT] / np, w[EBF_OTHER] / np, de / np, ds / np, dof / np, g_eb_on > 0, g_dd_on > 0);
+                }
             }
             mad_rs_report((double)g_perf_presents);   /* madeira-bcd: replay-split = 1 */
             if (g_async_submit > 0)
@@ -11474,6 +11897,31 @@ static int mad_aidx_grow(struct mad_device *d, unsigned need) {
     d->aidx_cap = ncap;
     return 1;
 }
+/* madeira-bcd ADDR-SCAN (madeira.cfg addr-scan, default 1; = 0 turns it off).
+ * A lookup walked back from the last entry starting at or below the address
+ * over every entry that started less than the LARGEST resource size below it
+ * (ml1113), because placed resources may alias: with a 124 MB buffer among
+ * Horizon Zero Dawn's ~530, that is every buffer within 124 MB of address space
+ * on every IASetVertexBuffers / IASetIndexBuffer / root descriptor the game
+ * records. Each entry now also carries pmax, the highest end of itself and
+ * every entry before it, and the walk stops at the first entry whose pmax is
+ * at or below the address: nothing there or earlier can contain it. The entries
+ * that do are the same, so is the newest of them that is returned; without
+ * aliasing the walk is one or two entries. Updated with the entries, under
+ * live_lock and inside the aidx_ver bracket. */
+static void mad_aidx_pmax(struct mad_device *d, unsigned from) {
+    unsigned i;
+    UINT64 m = from ? d->aidx[from - 1].pmax : 0;
+    for (i = from; i < d->naidx; i++) {
+        if (d->aidx[i].hi > m) m = d->aidx[i].hi;
+        d->aidx[i].pmax = m;
+    }
+}
+static int g_addr_scan = -1;
+static int mad_addr_scan_on(void) {
+    if (g_addr_scan < 0) g_addr_scan = mad_cfg_int_pe("addr-scan", 1) ? 1 : 0;   /* address lookups stop at the first entry nothing earlier can reach past; 0 = walk back by the largest resource size, as before */
+    return g_addr_scan;
+}
 
 /* ml1113: keep the address index sorted incrementally (a buffer comes and goes
  * every frame; a full qsort per change was itself a hot spot: ml1111 profile
@@ -11488,6 +11936,7 @@ static void mad_addr_index_insert(struct mad_device *d, struct mad_resource *r) 
     d->aidx[lo].lo = r->gpu_address; d->aidx[lo].hi = r->gpu_address + r->size; d->aidx[lo].r = r; d->aidx[lo].seq = r->track_seq;   /* ml1157 */
     __atomic_store_n(&d->naidx, d->naidx + 1, __ATOMIC_RELEASE);
     if (r->size > d->aidx_maxsize) d->aidx_maxsize = r->size;
+    mad_aidx_pmax(d, lo);   /* madeira-bcd addr-scan */
     mad_aidx_end(d);
 }
 static void mad_addr_index_remove(struct mad_device *d, struct mad_resource *r) {
@@ -11498,6 +11947,7 @@ static void mad_addr_index_remove(struct mad_device *d, struct mad_resource *r) 
     mad_aidx_begin(d);
     memmove(&d->aidx[i], &d->aidx[i + 1], (d->naidx - i - 1) * sizeof *d->aidx);
     __atomic_store_n(&d->naidx, d->naidx - 1, __ATOMIC_RELEASE);
+    mad_aidx_pmax(d, i);   /* madeira-bcd addr-scan */
     mad_aidx_end(d);
 }
 static void mad_track(struct mad_device *d, struct mad_resource *r) {
@@ -11531,6 +11981,7 @@ static void mad_addr_index_rebuild(struct mad_device *d) {   /* live_lock held *
     }
     qsort(d->aidx, n, sizeof *d->aidx, mad_addr_cmp);
     __atomic_store_n(&d->naidx, n, __ATOMIC_RELEASE);
+    mad_aidx_pmax(d, 0);   /* madeira-bcd addr-scan */
     d->aidx_dirty = 0;
     mad_aidx_end(d);
 }
@@ -11548,7 +11999,9 @@ static struct mad_resource *mad_resolve_address_locked(struct mad_device *d, UIN
 #define MAD_LD(x) __atomic_load_n(&(x), __ATOMIC_RELAXED)
 static struct mad_resource *mad_resolve_address(struct mad_device *d, UINT64 addr, UINT64 *off) {
     LONG64 v1;
+    int pm;
     if (!d || !addr) return NULL;
+    pm = mad_addr_scan_on();   /* madeira-bcd addr-scan: read before any lock */
     v1 = __atomic_load_n(&d->aidx_ver, __ATOMIC_ACQUIRE);
     if (!(v1 & 1) && !MAD_LD(d->aidx_dirty)) {
         /* naidx first (acquire): a count is only ever stored after the block
@@ -11565,7 +12018,7 @@ static struct mad_resource *mad_resolve_address(struct mad_device *d, UINT64 add
              * a command recorded against it held a dead resource by the time it
              * ran (ph-valley16: a UAV clear's blit fill on a freed buffer, then
              * objc_release of it when the command buffer completed). */
-            for (i = (int)lo - 1; i >= 0 && MAD_LD(ax[i].lo) + maxsz > addr; i--)
+            for (i = (int)lo - 1; i >= 0 && (pm ? MAD_LD(ax[i].pmax) > addr : MAD_LD(ax[i].lo) + maxsz > addr); i--)   /* madeira-bcd addr-scan */
                 if (addr < MAD_LD(ax[i].hi) && (!found || MAD_LD(ax[i].seq) > best_seq)) { best_seq = MAD_LD(ax[i].seq); found = MAD_LD(ax[i].r); }
         }
         __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* the reads above complete before the re-check */
@@ -11587,7 +12040,7 @@ static struct mad_resource *mad_resolve_address_locked(struct mad_device *d, UIN
          * match, as the linear walk did. */
         unsigned lo = 0, hi = d->naidx, best_seq = 0; int i;
         while (lo < hi) { unsigned m = (lo + hi) / 2; if (d->aidx[m].lo <= addr) lo = m + 1; else hi = m; }
-        for (i = (int)lo - 1; i >= 0 && d->aidx[i].lo + d->aidx_maxsize > addr; i--)   /* ml1157: newest alias */
+        for (i = (int)lo - 1; i >= 0 && (g_addr_scan > 0 ? d->aidx[i].pmax > addr : d->aidx[i].lo + d->aidx_maxsize > addr); i--)   /* ml1157: newest alias; madeira-bcd addr-scan */
             if (addr < d->aidx[i].hi && (!found || d->aidx[i].seq > best_seq)) { best_seq = d->aidx[i].seq; found = d->aidx[i].r; }
     }
     if (!found) {   /* miss: the slow path keeps the old semantics exactly and re-syncs the index */
@@ -18960,6 +19413,7 @@ static void mad_load_d3d12core(void) {
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
     (void)inst; (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) { build_vtables(); mad_swap_fill_vtbl(); mad_load_d3d12core(); }
+    if (reason == DLL_THREAD_DETACH) mad_es_thread_exit();   /* madeira-bcd encode-batch: the thread's arena */
     return TRUE;
 }
 
