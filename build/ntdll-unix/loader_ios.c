@@ -55,6 +55,7 @@
 # include <sys/resource.h>
 #endif
 #include <limits.h>
+#include <time.h>
 #ifdef HAVE_SYS_SYSCTL_H
 # include <sys/sysctl.h>
 #endif
@@ -1401,7 +1402,87 @@ extern NTSTATUS unixcall_ios_get_fex_arena(void *args);          /* ml800, virtu
 
 static NTSTATUS ios_wrap_0(void *a) { return ios_wrap_unix_call(0, a, load_so_dll); }
 static NTSTATUS ios_wrap_1(void *a) { return ios_wrap_unix_call(1, a, unwind_builtin_dll); }
-static NTSTATUS ios_wrap_2(void *a) { return ios_wrap_unix_call(2, a, unixcall_wine_dbg_write); }
+/* [log-throttle]: every PE-side debug line (ERR/FIXME through __wine_dbg_output, and
+ * FEX's log) reaches madeira-log.txt through wine_dbg_write. A line repeated by the
+ * thousand -- an exception taken per frame, a fault storm -- made logs of 70-90 MB and
+ * cost the writing thread a system call each time. Lines are grouped by their first
+ * 96 characters with digits and hex letters folded (so addresses and counts do not
+ * split a group); past MADEIRA_LOG_THROTTLE lines of one group in 10 s (default 1000)
+ * the rest are dropped, and each window's drops are summed up in one line. 0 keeps
+ * every line. */
+#define IOS_LT_SLOTS 128
+static struct { uint64_t key; unsigned count, dropped; char example[120]; } ios_lt[IOS_LT_SLOTS];
+static pthread_mutex_t ios_lt_lock = PTHREAD_MUTEX_INITIALIZER;
+static time_t ios_lt_window;
+
+static int ios_log_throttle_drop( const char *str, unsigned len )
+{
+    static int limit = -1;
+    uint64_t key = 1469598103934665603ULL;
+    unsigned i, n = len < 96 ? len : 96, slot, flushed = 0;
+    char flush[IOS_LT_SLOTS > 8 ? 8 : IOS_LT_SLOTS][200];
+    time_t now;
+    int drop = 0;
+
+    if (limit < 0)
+    {
+        const char *e = getenv( "MADEIRA_LOG_THROTTLE" );
+        limit = e && *e ? atoi( e ) : 1000;
+        if (limit < 0) limit = 0;
+    }
+    if (!limit || !str) return 0;
+    for (i = 0; i < n; i++)
+    {
+        unsigned char c = str[i];
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) c = '#';
+        key = (key ^ c) * 1099511628211ULL;
+    }
+    now = time( NULL );
+    pthread_mutex_lock( &ios_lt_lock );
+    if (now - ios_lt_window >= 10)
+    {
+        for (i = 0; i < IOS_LT_SLOTS; i++)
+        {
+            if (ios_lt[i].dropped && flushed < 8)
+                snprintf( flush[flushed++], sizeof(flush[0]), "[log-throttle] %u more lines like this one in 10 s were dropped "
+                          "(MADEIRA_LOG_THROTTLE): %s\n", ios_lt[i].dropped, ios_lt[i].example );
+            ios_lt[i].key = 0; ios_lt[i].count = ios_lt[i].dropped = 0;
+        }
+        ios_lt_window = now;
+    }
+    slot = (unsigned)(key % IOS_LT_SLOTS);
+    if (ios_lt[slot].key != key && !ios_lt[slot].count) ios_lt[slot].key = key;
+    if (ios_lt[slot].key == key && ++ios_lt[slot].count > (unsigned)limit)
+    {
+        if (!ios_lt[slot].dropped++)
+        {
+            unsigned m = len < sizeof(ios_lt[slot].example) - 1 ? len : sizeof(ios_lt[slot].example) - 1;
+            memcpy( ios_lt[slot].example, str, m );
+            while (m && (ios_lt[slot].example[m - 1] == '\n' || ios_lt[slot].example[m - 1] == '\r')) m--;
+            ios_lt[slot].example[m] = 0;
+        }
+        drop = 1;
+    }
+    pthread_mutex_unlock( &ios_lt_lock );
+    for (i = 0; i < flushed; i++) write( 2, flush[i], strlen( flush[i] ) );
+    return drop;
+}
+
+static NTSTATUS ios_wrap_2(void *a)
+{
+    struct wine_dbg_write_params *p = a;
+    if (p && ios_log_throttle_drop( p->str, p->len )) return p->len;
+    return ios_wrap_unix_call(2, a, unixcall_wine_dbg_write);
+}
+
+#ifdef _WIN64
+static NTSTATUS ios_wow64_wine_dbg_write( void *args )
+{
+    const struct { ULONG str; unsigned int len; } *p32 = args;
+    if (p32 && ios_log_throttle_drop( (const char *)ios_wow_host_ptr( p32->str ), p32->len )) return p32->len;
+    return wow64_wine_dbg_write( args );
+}
+#endif
 static NTSTATUS ios_wrap_3(void *a) { return ios_wrap_unix_call(3, a, unixcall_wine_server_call); }
 static NTSTATUS ios_wrap_4(void *a) { return ios_wrap_unix_call(4, a, unixcall_wine_server_fd_to_handle); }
 static NTSTATUS ios_wrap_5(void *a) { return ios_wrap_unix_call(5, a, unixcall_wine_server_handle_to_fd); }
@@ -1458,7 +1539,7 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
 {
     wow64_load_so_dll,
     wow64_unwind_builtin_dll,
-    wow64_wine_dbg_write,
+    ios_wow64_wine_dbg_write,
     wow64_wine_server_call,
     wow64_wine_server_fd_to_handle,
     wow64_wine_server_handle_to_fd,
