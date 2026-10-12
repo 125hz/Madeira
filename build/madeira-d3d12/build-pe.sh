@@ -19,8 +19,39 @@ python3 "$SRC/gen_vtables.py" \
     "$REPO_ROOT/toolchains/llvm-mingw-20260421-ucrt-macos-universal/generic-w64-mingw32/include/d3d12.h" \
     "$SRC/madeira_d3d12_stubs.h" >/dev/null
 
+# Build-time inputs of madeira_d3d12.c, all optional: without them the runtime
+# falls back as noted below.
+EXTRA=()
+
+# The PE-side shader cache's converter identity (madeira_d3d12.c,
+# MAD_SC_CONVERTER_ID): a hash of everything that shapes a conversion -- the
+# conversion service and the IR ABI, build/dxmt-ios/build.sh, DXMT's DXBC
+# compiler and parser, LLVM's configuration, and the converter's headers and
+# iOS library (the inputs build/dxmt-ios/build.sh hashes for the unix side). A
+# build that changes none of them keeps the device's shader cache instead of
+# converting every shader again; without it every build gets a cache of its own.
+scid_inputs() {
+    local f x
+    for f in madeira-d3d12/src/unix madeira-d3d12/src/madeira_ir_abi.h \
+             build/dxmt-ios/build.sh dxmt/src/airconv dxmt/libs \
+             toolchains/llvm-ios-build/include/llvm/Config/llvm-config.h \
+             madeira-d3d12/third_party/metal-shader-converter/include \
+             app/Madeira/d3d12/libmetalirconverter.dylib; do
+        [ -e "$REPO_ROOT/$f" ] || { echo "absent $f"; continue; }
+        find "$REPO_ROOT/$f" -type f | LC_ALL=C sort | while read -r x; do
+            echo "$(shasum -a 256 < "$x" | cut -c1-64) ${x#"$REPO_ROOT"/}"
+        done
+    done
+}
+SCID=$(scid_inputs | shasum -a 256 | cut -c1-16)
+echo "=== shader cache converter identity $SCID ==="
+EXTRA+=(-DMAD_SC_CONVERTER_ID="\"$SCID\"")
+
+# MAD_BUILD_ID names the build in the device log ("madeira-d3d12 M2 <id>, <date>").
+if [ -n "${MAD_BUILD_ID:-}" ]; then EXTRA+=(-DMAD_BUILD_ID="\"$MAD_BUILD_ID\""); fi
+
 echo "=== madeira_d3d12.dll (arm64ec) ==="
-"$MINGW/arm64ec-w64-mingw32-clang" -shared -O2 -Wall \
+"$MINGW/arm64ec-w64-mingw32-clang" -shared -O2 -Wall ${EXTRA[@]+"${EXTRA[@]}"} \
     -o "$OUT/madeira_d3d12.dll" "$SRC/madeira_d3d12.c" "$SRC/d3d12.def" \
     -I"$SRC" -I"$REPO_ROOT/madeira-d3d12/src" -I"$REPO_ROOT/dxmt/src/winemetal" \
     -L"$REPO_ROOT/dxmt/build-arm64ec/src/winemetal" -lwinemetal \

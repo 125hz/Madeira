@@ -36,7 +36,13 @@
 #include "madeira_d3d12_stubs.h"
 #include "madeira_ir_abi.h"
 
+/* madeira-bcd: MAD_BUILD_ID (build-pe.sh passes it from the environment) names the build,
+ * so a log says which runtime ran. */
+#ifdef MAD_BUILD_ID
+#define MADEIRA_D3D12_BUILD "madeira-d3d12 M2 " MAD_BUILD_ID ", " __DATE__ " " __TIME__
+#else
 #define MADEIRA_D3D12_BUILD "madeira-d3d12 M2 " __DATE__ " " __TIME__
+#endif
 
 /* ---- diagnostics ---------------------------------------------------------
  * Routed through OutputDebugStringA so it lands in the same log as everything
@@ -471,10 +477,25 @@ static void mad_xp_role(char role) {   /* tell the probe which thread this is (u
     memset(&a, 0, sizeof a); a.op = 4; a.len = (UINT64)(unsigned char)role; a.ptr = me; MadeiraCtl(&a);
 }
 static LONG64 mad_qpc(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+/* madeira-bcd: where pipeline creation time goes -- the "Compiling shaders"
+ * screen and the stalls at first draw. QPC ticks, summed over all threads. */
+static volatile LONG64 g_pt_gfx, g_pt_cs, g_pt_conv, g_pt_lib, g_pt_rs, g_pt_realize;
+static volatile LONG g_pn_gfx, g_pn_cs, g_pn_lib, g_pn_rs, g_pn_realize;
+static void mad_pso_time_report(const char *why) {
+    LARGE_INTEGER f; double ms;
+    QueryPerformanceFrequency(&f);
+    ms = f.QuadPart ? 1000.0 / (double)f.QuadPart : 0.0;
+    d3d12_log("[madeira-d3d12] pso time (%s): %ld graphics pipelines %.0f ms, %ld compute %.0f ms; inside them shader conversion+cache "
+              "%.0f ms, %ld new Metal libraries %.0f ms; %ld root signatures %.0f ms; %ld lazy pipelines built at first draw %.0f ms\n",
+              why, g_pn_gfx, (double)g_pt_gfx * ms, g_pn_cs, (double)g_pt_cs * ms, (double)g_pt_conv * ms, g_pn_lib,
+              (double)g_pt_lib * ms, g_pn_rs, (double)g_pt_rs * ms, g_pn_realize, (double)g_pt_realize * ms);
+}
 static LONG g_perf_ecl, g_perf_signals, g_perf_waits, g_perf_polls, g_perf_qwait_sleeps; static LONGLONG g_perf_wait_ticks, g_perf_sig_lat_ticks; static LONG g_perf_sig_lat_n;
 #define MAD_SKIP(e_) (mad_skip_at(__LINE__), (e_)->skipped++)
+static void mad_pso_time_report(const char *why);
 static void mad_skip_report(void) {
     char buf[1400]; int n = 0; unsigned i;
+    mad_pso_time_report("periodic");   /* madeira-bcd */
     for (i = 0; i < 48 && g_skip_line[i].line; i++)
         n += snprintf(buf + n, sizeof buf - n, " L%ld=%ld", g_skip_line[i].line, g_skip_line[i].n);
     d3d12_log("[madeira-d3d12] ml1049 skips by site (cumulative):%s\n", n ? buf : " none");
@@ -2590,9 +2611,11 @@ static obj_handle_t mad_pso_realize(struct mad_pso *p) {
     AcquireSRWLockExclusive(&p->rlock);   /* per pipeline: builds of different pipelines run in parallel */
     if (!p->rps && p->lazy) {
         obj_handle_t err = 0;
+        LONG64 t0 = mad_qpc();   /* madeira-bcd */
         p->rps = p->has_vd ? MTLDevice_newRenderPipelineStateVD(p->device_handle, &p->rp, &p->vd, &err)
                            : MTLDevice_newRenderPipelineState(p->device_handle, &p->rp, &err);
         if (err) mad_log_nserror(p->vs_name, err);
+        InterlockedExchangeAdd64(&g_pt_realize, mad_qpc() - t0); InterlockedIncrement(&g_pn_realize);
         if (p->rps) {
             LONG n = InterlockedIncrement(&g_pso_lazy_built);
             if (n == 1 || (n % 500) == 0)
@@ -7898,7 +7921,17 @@ static const unsigned char *rs_find_chunk(const unsigned char *b, SIZE_T n,
 }
 /* rsdeser-test:end */
 
+static HRESULT device_CreateRootSignature_impl(ID3D12Device *This, UINT node,
+        const void *blob, SIZE_T blob_len, REFIID riid, void **out);
 static HRESULT STDMETHODCALLTYPE device_CreateRootSignature(ID3D12Device *This, UINT node,
+        const void *blob, SIZE_T blob_len, REFIID riid, void **out) {   /* madeira-bcd: timed */
+    LONG64 t0 = mad_qpc();
+    HRESULT hr = device_CreateRootSignature_impl(This, node, blob, blob_len, riid, out);
+    InterlockedExchangeAdd64(&g_pt_rs, mad_qpc() - t0);
+    InterlockedIncrement(&g_pn_rs);
+    return hr;
+}
+static HRESULT device_CreateRootSignature_impl(ID3D12Device *This, UINT node,
         const void *blob, SIZE_T blob_len, REFIID riid, void **out) {
     (void)This; (void)node;
     if (!out || !blob) return E_INVALIDARG;
@@ -9002,6 +9035,456 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
                                       struct madeira_ir_vs_input *vsin, unsigned vsin_cap, unsigned *vsin_n,
                                       UINT *tg_out, struct madeira_ir_loc *locs, unsigned *nlocs,
                                       const struct mad_convert_opts *o);
+/* madeira-bcd: PERSISTENT SHADER CACHE. Every DXIL/DXBC -> metallib
+ * conversion is keyed by a hash of ALL its inputs (bytecode, entry, root
+ * signature, static samplers, input layout, paired stages, pixel flags, target)
+ * and stored under %LOCALAPPDATA%\Madeira\ShaderCache\<build>\ with every
+ * output the converter returns. A game's second launch then skips the
+ * converter for every shader it saw before (Ghost of Tsushima converts ~29,000
+ * stages at New Game; a PC takes 2-3 minutes for its own shader cache there).
+ * The converter's identity (below) is part of the key and the path, so an
+ * entry is never read back by a converter that could have produced something
+ * else; other identities' directories are deleted in the background.
+ * madeira.cfg shader-cache = 0 turns it off. */
+#define MAD_SC_MAGIC 0x3143534du   /* "MSC1" */
+struct mad_sc_hdr {
+    UINT32 magic, hdr_size;
+    UINT64 key[2];
+    UINT64 ret_len, ret_len2;
+    UINT32 ret_stage, ret_status, ret_error_code, ret_vs_input_count;
+    UINT32 ret_tg_size[3], ret_loc_count;
+    UINT32 ret_vs_output_size, ret_gs_max_prims, ret_gs_payload, ret_gs_passthrough;
+    UINT32 ret_air_nranges, ret_backend, ret_cb_table_bind, ret_arg_table_bind, ret_arg_qwords, ret_air_slot_mask;
+    UINT32 ret_threads_per_patch, ret_tess_out_prim, ret_max_potential_factor, ret_air_nranges2;
+    UINT32 ret_cb_table_bind2, ret_arg_table_bind2, ret_arg_qwords2;
+    UINT32 n_vsin, n_loc, n_air, n_air2, entry_len;
+    char note[128];
+    UINT32 ret_hs[8], ret_ds[4];   /* madeira-bcd: DXIL tessellation reflection (ret_hs_* / ret_ds_*, ABI order) */
+};
+static int g_sc_on = -1;
+static WCHAR g_sc_root[MAX_PATH], g_sc_build[64], g_sc_dir[MAX_PATH];
+static volatile LONG g_sc_hit, g_sc_miss, g_sc_store;
+/* bc1: converted with IRCompatibilityFlagBoundsCheck. madeira-bcd: the
+ * build passes MAD_SC_CONVERTER_ID, a hash of everything that shapes a
+ * conversion (the service in madeira-d3d12/src/unix and the IR ABI,
+ * its build script, DXMT's DXBC compiler and parser as patched, LLVM's
+ * configuration, Apple's converter library and headers -- see
+ * build/madeira-d3d12/build-pe.sh), so a new Madeira build keeps the device's
+ * cache unless the converter itself changed; before, every build started from
+ * nothing and Ghost of Tsushima converted ~29,000 stages again. A local build
+ * without it still gets its own cache per build. The runtime switches that
+ * change the converter's output join it in g_sc_rt. */
+#ifdef MAD_SC_CONVERTER_ID
+static char g_sc_stamp[96] = "madeira_d3d12 bc1 converter " MAD_SC_CONVERTER_ID;
+#else
+static char g_sc_stamp[96] = "madeira_d3d12 bc1 " __DATE__ " " __TIME__;
+#endif
+static char g_sc_rt[96];
+
+struct mad_sc_hash { UINT64 a, b; };
+static void mad_sc_feed(struct mad_sc_hash *h, const void *p, SIZE_T n) {
+    const unsigned char *c = (const unsigned char *)p; SIZE_T i;
+    UINT64 a = h->a, b = h->b;
+    for (i = 0; i < n; i++) {
+        a = (a ^ c[i]) * 0x100000001b3ull;
+        b = (b + c[i] + 1) * 0x9e3779b97f4a7c15ull; b ^= b >> 31;
+    }
+    a ^= (UINT64)n; a *= 0xff51afd7ed558ccdull;
+    h->a = a; h->b = b;
+}
+static void mad_sc_feed_u64(struct mad_sc_hash *h, UINT64 v) { mad_sc_feed(h, &v, sizeof v); }
+static void mad_sc_feed_str(struct mad_sc_hash *h, UINT64 p) {
+    const char *s = (const char *)(uintptr_t)p;
+    if (s) mad_sc_feed(h, s, strlen(s) + 1); else mad_sc_feed_u64(h, 0);
+}
+static void mad_sc_feed_blob(struct mad_sc_hash *h, UINT64 p, UINT64 n) {
+    if (p && n) mad_sc_feed(h, (const void *)(uintptr_t)p, (SIZE_T)n); else mad_sc_feed_u64(h, 0);
+}
+
+/* The key: every input field. Output pointers and capacities are left out on
+ * purpose -- the sizing call and the real call carry different ones and must
+ * find the same entry. */
+static void mad_sc_key(const struct madeira_ir_convert_args *a, UINT64 key[2]) {
+    struct mad_sc_hash h = { 0xcbf29ce484222325ull, 0x84222325cbf29ce4ull };
+    const struct madeira_ir_input_layout *lay = (const struct madeira_ir_input_layout *)(uintptr_t)a->layout;
+    mad_sc_feed(&h, g_sc_stamp, strlen(g_sc_stamp) + 1);
+    mad_sc_feed(&h, g_sc_rt, sizeof g_sc_rt);
+    mad_sc_feed_blob(&h, a->dxil, a->dxil_len);
+    mad_sc_feed_str(&h, a->entry_point);
+    mad_sc_feed_blob(&h, a->params, a->num_params * sizeof(struct madeira_ir_root_param));
+    mad_sc_feed_blob(&h, a->ranges, a->num_ranges * sizeof(struct madeira_ir_root_range));
+    mad_sc_feed_blob(&h, a->samplers, (UINT64)a->num_samplers * sizeof(struct madeira_ir_static_sampler));
+    mad_sc_feed_u64(&h, a->root_flags);
+    mad_sc_feed_u64(&h, ((UINT64)a->target_os << 32) | a->gpu_family);
+    mad_sc_feed_str(&h, a->os_version);
+    mad_sc_feed_u64(&h, ((UINT64)a->gs_emulation << 32) | a->input_topology);
+    if (lay) {
+        UINT32 n = lay->n < 31 ? lay->n : 31;
+        mad_sc_feed(&h, &lay->n, sizeof lay->n);
+        mad_sc_feed(&h, lay->el, n * sizeof lay->el[0]);
+    } else mad_sc_feed_u64(&h, 0);
+    mad_sc_feed_u64(&h, ((UINT64)a->ps_valid << 32) | a->ps_sample_mask);
+    mad_sc_feed_u64(&h, ((UINT64)a->ps_flags << 32) | a->ps_unorm_output_mask);
+    mad_sc_feed_blob(&h, a->vs_bytecode, a->vs_bytecode_len);
+    mad_sc_feed_u64(&h, ((UINT64)a->tess_stage << 32) | a->tess_index_format);
+    mad_sc_feed_blob(&h, a->hs_bytecode, a->hs_bytecode_len);
+    mad_sc_feed_blob(&h, a->ds_bytecode, a->ds_bytecode_len);
+    mad_sc_feed_u64(&h, ((UINT64)a->gs_stage << 32) | a->gs_strip);
+    mad_sc_feed_blob(&h, a->gs_bytecode, a->gs_bytecode_len);
+    mad_sc_feed_u64(&h, ((UINT64)(a->out_air_ranges != 0) << 1) | (a->out_air_ranges2 != 0));
+    key[0] = h.a; key[1] = h.b;
+}
+
+static void mad_sc_rmtree(const WCHAR *dir) {
+    WCHAR pat[MAX_PATH], sub[MAX_PATH]; WIN32_FIND_DATAW fd; HANDLE f;
+    _snwprintf(pat, MAX_PATH, L"%ls\\*", dir);
+    f = FindFirstFileW(pat, &fd);
+    if (f != INVALID_HANDLE_VALUE) {
+        do {
+            if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+            _snwprintf(sub, MAX_PATH, L"%ls\\%ls", dir, fd.cFileName);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) mad_sc_rmtree(sub); else DeleteFileW(sub);
+        } while (FindNextFileW(f, &fd));
+        FindClose(f);
+    }
+    RemoveDirectoryW(dir);
+}
+static DWORD WINAPI mad_sc_prune(void *arg) {   /* other builds' caches */
+    WCHAR pat[MAX_PATH], sub[MAX_PATH]; WIN32_FIND_DATAW fd; HANDLE f; unsigned n = 0;
+    (void)arg;
+    _snwprintf(pat, MAX_PATH, L"%ls\\*", g_sc_root);
+    f = FindFirstFileW(pat, &fd);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..") || !wcscmp(fd.cFileName, g_sc_build)) continue;
+        _snwprintf(sub, MAX_PATH, L"%ls\\%ls", g_sc_root, fd.cFileName);
+        mad_sc_rmtree(sub); n++;
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+    if (n) d3d12_log("[madeira-d3d12] shader cache: removed %u older build cache(s)\n", n);
+    return 0;
+}
+static int mad_sc_init(void) {
+    static SRWLOCK lk = SRWLOCK_INIT;
+    if (g_sc_on >= 0) return g_sc_on;
+    AcquireSRWLockExclusive(&lk);
+    if (g_sc_on < 0) {
+        WCHAR base[MAX_PATH]; DWORD n; int on = mad_cfg_int_pe("shader-cache", 1) ? 1 : 0;
+        if (on) {
+            struct mad_sc_hash h = { 0xcbf29ce484222325ull, 0x84222325cbf29ce4ull };
+            char v[16]; int nobc, agsrt;
+            /* madeira-bcd: switches the converter service reads (madeira_ir_unix.mm,
+             * madeira_ags.cpp); set in madeira.cfg, as an env.NAME export there, or
+            n = GetEnvironmentVariableA("MADEIRA_IR_NO_BOUNDS_CHECK", v, sizeof v);
+            nobc = (n && n < sizeof v && v[0] == '1') ||
+                   (mad_cfg_str_pe("env.MADEIRA_IR_NO_BOUNDS_CHECK", v, sizeof v) && v[0] == '1') ||
+                   !mad_cfg_int_pe("msc-bounds-check", 1);   /* 0: shaders converted without D3D12's robust buffer access (bounds check), as env MADEIRA_IR_NO_BOUNDS_CHECK=1 */
+            agsrt = GetEnvironmentVariableA("MADEIRA_AGS_ROUNDTRIP_ONLY", v, sizeof v) != 0 ||
+                    mad_cfg_str_pe("env.MADEIRA_AGS_ROUNDTRIP_ONLY", v, sizeof v);
+            mad_sc_feed(&h, g_sc_rt, sizeof g_sc_rt);
+            n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+            if (!n || n >= MAX_PATH - 64) on = 0;
+            else {
+                _snwprintf(g_sc_root, MAX_PATH, L"%ls\\Madeira", base); CreateDirectoryW(g_sc_root, NULL);
+                _snwprintf(g_sc_root, MAX_PATH, L"%ls\\Madeira\\ShaderCache", base); CreateDirectoryW(g_sc_root, NULL);
+                _snwprintf(g_sc_build, 64, L"%016llx", (unsigned long long)h.a);
+                _snwprintf(g_sc_dir, MAX_PATH, L"%ls\\%ls", g_sc_root, g_sc_build);
+                CreateDirectoryW(g_sc_dir, NULL);
+                { HANDLE t = CreateThread(NULL, 0, mad_sc_prune, NULL, 0, NULL); if (t) CloseHandle(t); }
+            }
+        }
+        if (on) d3d12_log("[madeira-d3d12] shader cache ON: %ls, identity '%s' (%s; madeira.cfg shader-cache = 0 turns it off)\n", g_sc_dir, g_sc_stamp, g_sc_rt);
+        else d3d12_log("[madeira-d3d12] shader cache off\n");
+        g_sc_on = on;
+    }
+    ReleaseSRWLockExclusive(&lk);
+    return g_sc_on;
+}
+static volatile LONG g_sc_made[8];   /* madeira-bcd: the 256 subdirectories this process has created */
+static void mad_sc_path(const UINT64 key[2], WCHAR *out, int mkdir) {
+    WCHAR sub[MAX_PATH];
+    unsigned bucket = (unsigned)(key[0] >> 56);
+    _snwprintf(sub, MAX_PATH, L"%ls\\%02x", g_sc_dir, bucket);
+    /* madeira-bcd: once per bucket and process. Every store used to create it
+     * again; on an existing directory that is a failed NtCreateFile (a
+     * wineserver round trip, logged as [file-wfail] ... 0xc0000035) for each of
+     * a cold cache's ~29,000 entries. */
+    if (mkdir && !((ULONG)g_sc_made[bucket >> 5] & (1u << (bucket & 31))) &&
+        (CreateDirectoryW(sub, NULL) || GetLastError() == ERROR_ALREADY_EXISTS))
+        InterlockedOr(&g_sc_made[bucket >> 5], (LONG)(1u << (bucket & 31)));
+    _snwprintf(out, MAX_PATH, L"%ls\\%016llx%016llx.msc", sub, (unsigned long long)key[0], (unsigned long long)key[1]);
+}
+static void mad_sc_stats(void) {
+    LONG t = g_sc_hit + g_sc_miss;
+    if (t == 1 || (t % 1000) == 0)
+        d3d12_log("[madeira-d3d12] shader cache: %ld hits, %ld misses, %ld stored\n", g_sc_hit, g_sc_miss, g_sc_store);
+}
+#define MAD_SC_MIN(x, y) ((x) < (y) ? (x) : (y))
+
+/* madeira-bcd: the caller converts in two calls -- a sizing call (no out_buf)
+ * and a fill call -- so one conversion used to read its cache entry twice, and
+ * on a miss the DXIL converter COMPILED twice (the sizing call compiled and
+ * threw the result away). The last entry a sizing call loaded or produced is
+ * kept per thread and handed to the fill call that follows it. */
+struct mad_sc_memo { UINT64 key[2]; unsigned char *blob; SIZE_T size; int fresh; };
+struct mad_sc_memo { UINT64 key[2]; unsigned char *blob; SIZE_T size; int fresh; };
+static LONG g_sc_tls = -1;   /* a TLS index; -1 until allocated */
+static struct mad_sc_memo *mad_sc_memo_get(void) {
+    struct mad_sc_memo *m;
+    LONG idx = g_sc_tls;
+    if (idx < 0) {
+        DWORD n = TlsAlloc();
+        if (n == TLS_OUT_OF_INDEXES) return NULL;
+        idx = InterlockedCompareExchange(&g_sc_tls, (LONG)n, -1);
+        if (idx >= 0) TlsFree(n); else idx = (LONG)n;
+    }
+    m = TlsGetValue((DWORD)idx);
+    if (!m && (m = calloc(1, sizeof *m))) TlsSetValue((DWORD)idx, m);
+    return m;
+}
+static void mad_sc_memo_set(struct mad_sc_memo *m, const UINT64 key[2], unsigned char *blob, SIZE_T size, int fresh) {
+    if (m->blob && m->blob != blob) free(m->blob);
+    m->key[0] = key[0]; m->key[1] = key[1]; m->blob = blob; m->size = size; m->fresh = fresh;
+}
+static int mad_sc_read_file(const UINT64 key[2], unsigned char **blob_out, SIZE_T *size_out) {
+    WCHAR path[MAX_PATH]; HANDLE f; LARGE_INTEGER sz; unsigned char *blob; DWORD got; int ok = 0;
+    mad_sc_path(key, path, 0);
+    f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    if (GetFileSizeEx(f, &sz) && sz.QuadPart >= (LONGLONG)sizeof(struct mad_sc_hdr) && sz.QuadPart <= (256ll << 20) &&
+        (blob = malloc((SIZE_T)sz.QuadPart))) {
+        if (ReadFile(f, blob, (DWORD)sz.QuadPart, &got, NULL) && got == (DWORD)sz.QuadPart) {
+            *blob_out = blob; *size_out = (SIZE_T)sz.QuadPart; ok = 1;
+        } else free(blob);
+    }
+    CloseHandle(f);
+    return ok;
+}
+/* Fills every output as MadeiraIRConvert would from a stored entry; a sizing
+ * call (no out_buf) gets BUFFER_TOO_SMALL with the length. Returns 1 if the
+ * entry is valid for this call. */
+static int mad_sc_apply(struct madeira_ir_convert_args *a, const UINT64 key[2], const unsigned char *blob, SIZE_T size) {
+    struct mad_sc_hdr h; const unsigned char *q;
+    memcpy(&h, blob, sizeof h);
+    if (!(h.magic == MAD_SC_MAGIC && h.hdr_size == sizeof h && h.key[0] == key[0] && h.key[1] == key[1] &&
+          h.ret_status == MADEIRA_IR_OK && h.entry_len <= MADEIRA_IR_ENTRY_MAX &&
+          sizeof h + h.ret_len + h.ret_len2 + h.entry_len
+            + (UINT64)h.n_vsin * sizeof(struct madeira_ir_vs_input)
+            + (UINT64)h.n_loc * sizeof(struct madeira_ir_loc)
+            + (UINT64)(h.n_air + h.n_air2) * sizeof(struct madeira_ir_air_range) == (UINT64)size &&
+          (!a->out_vs_inputs || MAD_SC_MIN(h.ret_vs_input_count, a->vs_input_cap) <= h.n_vsin) &&
+          (!a->out_locs || MAD_SC_MIN(h.ret_loc_count, a->loc_cap) <= h.n_loc) &&
+          (!a->out_air_ranges || MAD_SC_MIN(h.ret_air_nranges, a->air_range_cap) <= h.n_air) &&
+          (!a->out_air_ranges2 || MAD_SC_MIN(h.ret_air_nranges2, a->air_range_cap2) <= h.n_air2) &&
+          (!a->out_buf2 || h.ret_len2 <= a->out_cap2)))
+        return 0;
+    q = blob + sizeof h;
+    a->ret_len = h.ret_len; a->ret_len2 = h.ret_len2;
+    a->ret_stage = h.ret_stage; a->ret_error_code = h.ret_error_code;
+    a->ret_vs_input_count = h.ret_vs_input_count; a->ret_loc_count = h.ret_loc_count;
+    memcpy(a->ret_tg_size, h.ret_tg_size, sizeof a->ret_tg_size);
+    a->ret_vs_output_size = h.ret_vs_output_size; a->ret_gs_max_prims = h.ret_gs_max_prims;
+    a->ret_gs_payload = h.ret_gs_payload; a->ret_gs_passthrough = h.ret_gs_passthrough;
+    a->ret_air_nranges = h.ret_air_nranges; a->ret_backend = h.ret_backend;
+    a->ret_cb_table_bind = h.ret_cb_table_bind; a->ret_arg_table_bind = h.ret_arg_table_bind;
+    a->ret_arg_qwords = h.ret_arg_qwords; a->ret_air_slot_mask = h.ret_air_slot_mask;
+    a->ret_threads_per_patch = h.ret_threads_per_patch; a->ret_tess_out_prim = h.ret_tess_out_prim;
+    a->ret_max_potential_factor = h.ret_max_potential_factor; a->ret_air_nranges2 = h.ret_air_nranges2;
+    a->ret_cb_table_bind2 = h.ret_cb_table_bind2; a->ret_arg_table_bind2 = h.ret_arg_table_bind2;
+    a->ret_arg_qwords2 = h.ret_arg_qwords2;
+    memcpy(a->ret_note, h.note, sizeof a->ret_note);
+    a->ret_hs_patches_per_tg = h.ret_hs[0]; a->ret_hs_threads_per_patch = h.ret_hs[1]; a->ret_hs_input_cps = h.ret_hs[2];
+    a->ret_hs_output_cps = h.ret_hs[3]; a->ret_hs_output_cp_size = h.ret_hs[4]; a->ret_hs_patch_const_size = h.ret_hs[5];
+    a->ret_hs_out_prim = h.ret_hs[6]; a->ret_hs_max_factor_bits = h.ret_hs[7];
+    a->ret_ds_prims_per_mesh_tg = h.ret_ds[0]; a->ret_ds_input_cps = h.ret_ds[1]; a->ret_ds_input_cp_size = h.ret_ds[2];
+    a->ret_ds_patch_const_size = h.ret_ds[3];
+    if (a->out_buf && a->out_cap >= h.ret_len) {
+        memcpy((void *)(uintptr_t)a->out_buf, q, (SIZE_T)h.ret_len);
+        a->ret_status = MADEIRA_IR_OK;
+    } else a->ret_status = MADEIRA_IR_BUFFER_TOO_SMALL;
+    q += h.ret_len;
+    if (a->out_buf2 && h.ret_len2) memcpy((void *)(uintptr_t)a->out_buf2, q, (SIZE_T)h.ret_len2);
+    q += h.ret_len2;
+    if (a->out_entry && h.entry_len) memcpy((void *)(uintptr_t)a->out_entry, q, h.entry_len);
+    q += h.entry_len;
+    if (a->out_vs_inputs)
+        memcpy((void *)(uintptr_t)a->out_vs_inputs, q, MAD_SC_MIN(h.n_vsin, a->vs_input_cap) * sizeof(struct madeira_ir_vs_input));
+    q += (SIZE_T)h.n_vsin * sizeof(struct madeira_ir_vs_input);
+    if (a->out_locs)
+        memcpy((void *)(uintptr_t)a->out_locs, q, MAD_SC_MIN(h.n_loc, a->loc_cap) * sizeof(struct madeira_ir_loc));
+    q += (SIZE_T)h.n_loc * sizeof(struct madeira_ir_loc);
+    if (a->out_air_ranges)
+        memcpy((void *)(uintptr_t)a->out_air_ranges, q, MAD_SC_MIN(h.n_air, a->air_range_cap) * sizeof(struct madeira_ir_air_range));
+    q += (SIZE_T)h.n_air * sizeof(struct madeira_ir_air_range);
+    if (a->out_air_ranges2)
+        memcpy((void *)(uintptr_t)a->out_air_ranges2, q, MAD_SC_MIN(h.n_air2, a->air_range_cap2) * sizeof(struct madeira_ir_air_range));
+    return 1;
+}
+/* Returns 1 on a hit; *fresh = the entry was produced by this thread's sizing
+ * call a moment ago (a miss, not a hit, for the statistics). */
+static int mad_sc_load(struct madeira_ir_convert_args *a, const UINT64 key[2], int *fresh) {
+    struct mad_sc_memo *m = mad_sc_memo_get();
+    unsigned char *blob = NULL; SIZE_T size = 0; int from_memo = 0, ok;
+    *fresh = 0;
+    if (m && m->blob && m->key[0] == key[0] && m->key[1] == key[1]) { blob = m->blob; size = m->size; from_memo = 1; *fresh = m->fresh; }
+    else if (!mad_sc_read_file(key, &blob, &size)) return 0;
+    ok = mad_sc_apply(a, key, blob, size);
+    if (ok && !a->out_buf && m) {   /* a sizing call: the fill call comes next on this thread */
+        if (!from_memo) mad_sc_memo_set(m, key, blob, size, 0);
+        return 1;
+    }
+    if (from_memo) { m->blob = NULL; m->size = 0; }
+    free(blob);
+    return ok;
+}
+/* Every output of a conversion, in the file layout. NULL on failure. */
+static unsigned char *mad_sc_build_blob(const struct madeira_ir_convert_args *a, const UINT64 key[2], SIZE_T *total_out) {
+    struct mad_sc_hdr h; UINT32 entry_len = 0; unsigned char *blob, *q; SIZE_T total;
+    if (a->out_entry) entry_len = (UINT32)strnlen((const char *)(uintptr_t)a->out_entry, MADEIRA_IR_ENTRY_MAX - 1) + 1;
+    memset(&h, 0, sizeof h);
+    h.magic = MAD_SC_MAGIC; h.hdr_size = sizeof h; h.key[0] = key[0]; h.key[1] = key[1];
+    h.ret_len = a->ret_len; h.ret_len2 = (a->out_buf2 && a->ret_len2 <= a->out_cap2) ? a->ret_len2 : 0;
+    h.ret_stage = a->ret_stage; h.ret_status = a->ret_status; h.ret_error_code = a->ret_error_code;
+    h.ret_vs_input_count = a->ret_vs_input_count; h.ret_loc_count = a->ret_loc_count;
+    memcpy(h.ret_tg_size, a->ret_tg_size, sizeof h.ret_tg_size);
+    h.ret_vs_output_size = a->ret_vs_output_size; h.ret_gs_max_prims = a->ret_gs_max_prims;
+    h.ret_gs_payload = a->ret_gs_payload; h.ret_gs_passthrough = a->ret_gs_passthrough;
+    h.ret_air_nranges = a->ret_air_nranges; h.ret_backend = a->ret_backend;
+    h.ret_cb_table_bind = a->ret_cb_table_bind; h.ret_arg_table_bind = a->ret_arg_table_bind;
+    h.ret_arg_qwords = a->ret_arg_qwords; h.ret_air_slot_mask = a->ret_air_slot_mask;
+    h.ret_threads_per_patch = a->ret_threads_per_patch; h.ret_tess_out_prim = a->ret_tess_out_prim;
+    h.ret_max_potential_factor = a->ret_max_potential_factor; h.ret_air_nranges2 = a->ret_air_nranges2;
+    h.ret_cb_table_bind2 = a->ret_cb_table_bind2; h.ret_arg_table_bind2 = a->ret_arg_table_bind2;
+    h.ret_arg_qwords2 = a->ret_arg_qwords2;
+    memcpy(h.note, a->ret_note, sizeof h.note);
+    h.ret_hs[0] = a->ret_hs_patches_per_tg; h.ret_hs[1] = a->ret_hs_threads_per_patch; h.ret_hs[2] = a->ret_hs_input_cps;
+    h.ret_hs[3] = a->ret_hs_output_cps; h.ret_hs[4] = a->ret_hs_output_cp_size; h.ret_hs[5] = a->ret_hs_patch_const_size;
+    h.ret_hs[6] = a->ret_hs_out_prim; h.ret_hs[7] = a->ret_hs_max_factor_bits;
+    h.ret_ds[0] = a->ret_ds_prims_per_mesh_tg; h.ret_ds[1] = a->ret_ds_input_cps; h.ret_ds[2] = a->ret_ds_input_cp_size;
+    h.ret_ds[3] = a->ret_ds_patch_const_size;
+    h.n_vsin = a->out_vs_inputs ? MAD_SC_MIN(a->ret_vs_input_count, a->vs_input_cap) : 0;
+    h.n_loc = a->out_locs ? MAD_SC_MIN(a->ret_loc_count, a->loc_cap) : 0;
+    h.n_air = a->out_air_ranges ? MAD_SC_MIN(a->ret_air_nranges, a->air_range_cap) : 0;
+    h.n_air2 = a->out_air_ranges2 ? MAD_SC_MIN(a->ret_air_nranges2, a->air_range_cap2) : 0;
+    h.entry_len = entry_len;
+    total = sizeof h + (SIZE_T)h.ret_len + (SIZE_T)h.ret_len2 + entry_len
+          + (SIZE_T)h.n_vsin * sizeof(struct madeira_ir_vs_input) + (SIZE_T)h.n_loc * sizeof(struct madeira_ir_loc)
+          + (SIZE_T)(h.n_air + h.n_air2) * sizeof(struct madeira_ir_air_range);
+    if (!(blob = malloc(total))) return NULL;
+    q = blob; memcpy(q, &h, sizeof h); q += sizeof h;
+    memcpy(q, (const void *)(uintptr_t)a->out_buf, (SIZE_T)h.ret_len); q += h.ret_len;
+    if (h.ret_len2) { memcpy(q, (const void *)(uintptr_t)a->out_buf2, (SIZE_T)h.ret_len2); q += h.ret_len2; }
+    if (entry_len) { memcpy(q, (const void *)(uintptr_t)a->out_entry, entry_len); q += entry_len; }
+    if (h.n_vsin) { memcpy(q, (const void *)(uintptr_t)a->out_vs_inputs, h.n_vsin * sizeof(struct madeira_ir_vs_input)); q += h.n_vsin * sizeof(struct madeira_ir_vs_input); }
+    if (h.n_loc) { memcpy(q, (const void *)(uintptr_t)a->out_locs, h.n_loc * sizeof(struct madeira_ir_loc)); q += h.n_loc * sizeof(struct madeira_ir_loc); }
+    if (h.n_air) { memcpy(q, (const void *)(uintptr_t)a->out_air_ranges, h.n_air * sizeof(struct madeira_ir_air_range)); q += h.n_air * sizeof(struct madeira_ir_air_range); }
+    if (h.n_air2) { memcpy(q, (const void *)(uintptr_t)a->out_air_ranges2, h.n_air2 * sizeof(struct madeira_ir_air_range)); }
+    *total_out = total;
+    return blob;
+}
+static void mad_sc_write_file(const UINT64 key[2], const unsigned char *blob, SIZE_T total) {
+    WCHAR path[MAX_PATH], tmp[MAX_PATH]; HANDLE f; DWORD put;
+    mad_sc_path(key, path, 1);
+    _snwprintf(tmp, MAX_PATH, L"%ls.%lx.tmp", path, GetCurrentThreadId());
+    f = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) {   /* the bucket may be gone: create it again next time */
+        unsigned bucket = (unsigned)(key[0] >> 56);
+        InterlockedAnd(&g_sc_made[bucket >> 5], (LONG)~(1u << (bucket & 31)));
+    }
+    if (f != INVALID_HANDLE_VALUE) {
+        BOOL w = WriteFile(f, blob, (DWORD)total, &put, NULL) && put == (DWORD)total;
+        CloseHandle(f);
+        if (w && MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING)) InterlockedIncrement(&g_sc_store);
+        else DeleteFileW(tmp);
+    }
+}
+static void mad_sc_save(const struct madeira_ir_convert_args *a, const UINT64 key[2]) {
+    SIZE_T total; unsigned char *blob = mad_sc_build_blob(a, key, &total);
+    if (!blob) return;
+    mad_sc_write_file(key, blob, total);
+    free(blob);
+}
+/* A sizing call that misses: convert ONCE, with room for every output the fill
+ * call will ask for (the caller's own range arrays and entry buffer, plus
+ * temporary ones for the metallib, vertex inputs, resource locations and the
+ * stage-in library), store it, and keep it for the fill call. Returns 1 when
+ * the entry is ready, -1 when the converter refused the shader (a then carries
+ * its answer, as the sizing call's own conversion would have), 0 to take the
+ * plain path. */
+#define MAD_SC_VSIN_CAP 64
+static int mad_sc_convert_full(struct madeira_ir_convert_args *a, const UINT64 key[2]) {
+    struct madeira_ir_convert_args b = *a;
+    SIZE_T cap = (SIZE_T)(4u << 20) + (SIZE_T)a->dxil_len * 4, total = 0;
+    unsigned char *buf = malloc(cap), *buf2 = a->layout ? malloc(256u << 10) : NULL, *blob = NULL;
+    struct madeira_ir_vs_input *vsin = calloc(MAD_SC_VSIN_CAP, sizeof *vsin);
+    struct madeira_ir_loc *locs = calloc(MAD_LOC_MAX, sizeof *locs);
+    char entry[MADEIRA_IR_ENTRY_MAX];
+    struct mad_sc_memo *m = mad_sc_memo_get();
+    int ok = 0;
+    if (!m || !buf || !vsin || !locs || (a->layout && !buf2)) goto done;
+    b.out_buf = (uint64_t)(uintptr_t)buf; b.out_cap = cap;
+    b.out_vs_inputs = (uint64_t)(uintptr_t)vsin; b.vs_input_cap = MAD_SC_VSIN_CAP;
+    b.out_locs = (uint64_t)(uintptr_t)locs; b.loc_cap = MAD_LOC_MAX;
+    if (!b.out_entry) b.out_entry = (uint64_t)(uintptr_t)entry;
+    *(char *)(uintptr_t)b.out_entry = 0;   /* the converter only writes a name it found */
+    if (buf2) { b.out_buf2 = (uint64_t)(uintptr_t)buf2; b.out_cap2 = 256u << 10; }
+    MadeiraIRConvert(&b);
+    if (b.ret_status == MADEIRA_IR_BUFFER_TOO_SMALL && b.ret_len > cap && b.ret_len <= (256u << 20)) {
+        free(buf);   /* bigger than the guess: once more into the exact size */
+        cap = (SIZE_T)b.ret_len;
+        if (!(buf = malloc(cap))) goto done;
+        b.out_buf = (uint64_t)(uintptr_t)buf; b.out_cap = cap;
+        MadeiraIRConvert(&b);
+    }
+    if (b.ret_status != MADEIRA_IR_OK) {
+        if (b.ret_status != MADEIRA_IR_BUFFER_TOO_SMALL) {
+            struct madeira_ir_convert_args keep = *a;
+            *a = b;
+            a->out_buf = keep.out_buf; a->out_cap = keep.out_cap;
+            a->out_vs_inputs = keep.out_vs_inputs; a->vs_input_cap = keep.vs_input_cap;
+            a->out_locs = keep.out_locs; a->loc_cap = keep.loc_cap;
+            a->out_entry = keep.out_entry; a->out_buf2 = keep.out_buf2; a->out_cap2 = keep.out_cap2;
+            ok = -1;
+        }
+        goto done;
+    }
+    if (!b.ret_len || b.ret_len > cap || !(blob = mad_sc_build_blob(&b, key, &total))) goto done;
+    mad_sc_write_file(key, blob, total);
+    mad_sc_memo_set(m, key, blob, total, 1);
+    InterlockedIncrement(&g_sc_miss);
+    mad_sc_stats();
+    ok = 1;
+done:
+    free(buf); free(buf2); free(vsin); free(locs);
+    return ok;
+}
+static void mad_ir_convert_cached_impl(struct madeira_ir_convert_args *a);
+static void mad_ir_convert_cached(struct madeira_ir_convert_args *a) {   /* madeira-bcd: timed */
+    LONG64 t0 = mad_qpc();
+    mad_ir_convert_cached_impl(a);
+    InterlockedExchangeAdd64(&g_pt_conv, mad_qpc() - t0);
+}
+static void mad_ir_convert_cached_impl(struct madeira_ir_convert_args *a) {
+    UINT64 key[2]; int fresh = 0;
+    if (!mad_sc_init()) { MadeiraIRConvert(a); return; }
+    mad_sc_key(a, key);
+    if (mad_sc_load(a, key, &fresh)) {
+        if (a->out_buf && !fresh) { InterlockedIncrement(&g_sc_hit); mad_sc_stats(); }
+        return;
+    }
+    if (!a->out_buf) {
+        int r = mad_sc_convert_full(a, key);
+        if (r < 0 || (r > 0 && mad_sc_load(a, key, &fresh))) return;
+    }
+    MadeiraIRConvert(a);
+    if (a->out_buf && a->ret_status == MADEIRA_IR_OK && a->ret_len <= a->out_cap) {
+        InterlockedIncrement(&g_sc_miss);
+        mad_sc_save(a, key);
+        mad_sc_stats();
+    }
+}
+
 /* SHARED METAL LIBRARIES. A game's pipelines repeat the same shader stage many
  * times: Ghost of Tsushima created 30,370 libraries at New Game from only
  * ~11,400 distinct converter outputs, and Metal allocates GPU-side storage per
@@ -9187,7 +9670,7 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
         a.out_locs = (uint64_t)(uintptr_t)locs; a.loc_cap = locs ? MAD_LOC_MAX : 0;
         if (buf2) { a.out_buf2 = (uint64_t)(uintptr_t)buf2; a.out_cap2 = cap2; }
     }
-    MadeiraIRConvert(&a);
+    mad_ir_convert_cached(&a);   /* madeira-bcd: persistent shader cache */
     if (a.ret_status != MADEIRA_IR_BUFFER_TOO_SMALL && a.ret_status != MADEIRA_IR_OK) {
         const unsigned char *b = (const unsigned char *)dxil;
         d3d12_log("[madeira-d3d12] %s conversion failed: %s (%s backend, code %u); %llu bytes, head "
@@ -9234,7 +9717,7 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
         a.loc_cap = locs ? MAD_LOC_MAX : 0;
         a.out_entry = (uint64_t)(uintptr_t)name;
         if (buf2) { a.out_buf2 = (uint64_t)(uintptr_t)buf2; a.out_cap2 = cap2; }
-        MadeiraIRConvert(&a);
+        mad_ir_convert_cached(&a);   /* madeira-bcd: persistent shader cache */
         if (a.ret_status != MADEIRA_IR_OK) {
             d3d12_log("[madeira-d3d12] %s conversion failed: %s (converter code %u)\n",
                       tag, mad_ir_status_name(a.ret_status), a.ret_error_code);
@@ -9309,6 +9792,7 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
         free(buf);
         return fn;
     }
+    LONG64 lib_t0 = mad_qpc();   /* madeira-bcd: timed, with the function lookup below */
     obj_handle_t dd = DispatchData_alloc_init((uint64_t)(uintptr_t)buf, (uint64_t)a.ret_len);
     if (dd) {
         lib = MTLDevice_newLibrary(d->mtl_device, dd, &err);
@@ -9333,6 +9817,7 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
     /* The converter RENAMES entry points, so the function is looked up by the
      * name reflection reported, never by the D3D-side name. */
     fn = MTLLibrary_newFunction(lib, name);
+    InterlockedExchangeAdd64(&g_pt_lib, mad_qpc() - lib_t0); InterlockedIncrement(&g_pn_lib);
     if (!fn) {
         d3d12_log("[madeira-d3d12] %s: converted library has no function '%s'\n", tag, name);
         NSObject_release(lib);
@@ -9901,7 +10386,19 @@ static void mad_dtess_convert(struct mad_device *d, struct mad_rootsig *rs, stru
     free(L);
 }
 
+static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
+        const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out);
 static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(ID3D12Device *This,
+        const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {   /* madeira-bcd: timed */
+    LONG64 t0 = mad_qpc();
+    HRESULT hr = device_CreateGraphicsPipelineState_impl(This, desc, riid, out);
+    LONG n;
+    InterlockedExchangeAdd64(&g_pt_gfx, mad_qpc() - t0);
+    n = InterlockedIncrement(&g_pn_gfx);
+    if ((n % 2000) == 0) mad_pso_time_report("every 2000 graphics pipelines");
+    return hr;
+}
+static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
         const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
     struct mad_device *d = (struct mad_device *)This;
     struct mad_rootsig *rs;
@@ -10369,7 +10866,17 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(ID3D12Device
 }
 
 
+static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,
+        const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **out);
 static HRESULT STDMETHODCALLTYPE device_CreateComputePipelineState(ID3D12Device *This,
+        const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {   /* madeira-bcd: timed */
+    LONG64 t0 = mad_qpc();
+    HRESULT hr = device_CreateComputePipelineState_impl(This, desc, riid, out);
+    InterlockedExchangeAdd64(&g_pt_cs, mad_qpc() - t0);
+    InterlockedIncrement(&g_pn_cs);
+    return hr;
+}
+static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,
         const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
     struct mad_device *d = (struct mad_device *)This;
     struct mad_pso *p;

@@ -1397,7 +1397,10 @@ static int mad_ags_enabled(void)
 static uint32_t mad_ir_compat_flags(void) {
     static int cached = -1;
     if (cached < 0) {
-        int bc = madeira_cfg_int("msc-bounds-check", 1) ? 1 : 0;
+        /* madeira-bcd: env MADEIRA_IR_NO_BOUNDS_CHECK=1 (the fork's switch, also
+         * read by the PE side for the cache key) turns the bounds check off too. */
+        const char *no_bc = getenv("MADEIRA_IR_NO_BOUNDS_CHECK");
+        int bc = (madeira_cfg_int("msc-bounds-check", 1) && !(no_bc && no_bc[0] == '1')) ? 1 : 0;
         int inv = madeira_cfg_int("msc-position-invariance", 1) ? 1 : 0;
         int nan = madeira_cfg_int("msc-strict-nan", 1) ? 1 : 0;
         int lod = madeira_cfg_int("msc-sampler-lod-bias", 1) ? 1 : 0;
@@ -1416,7 +1419,8 @@ static uint32_t mad_ir_compat_flags(void) {
 #endif
         fprintf(stderr, "[madeira-ir] MSC %d.%d.%d compatibility: bounds check %s, position invariance %s, strict NaN/Inf %s, "
                         "sampler LOD bias %s, sampled NaN -> 0 %s, Inf position -> NaN %s (madeira.cfg msc-bounds-check, "
-                        "msc-position-invariance, msc-strict-nan, msc-sampler-lod-bias, msc-sample-nan-zero, msc-position-inf-nan)\n",
+                        "msc-position-invariance, msc-strict-nan, msc-sampler-lod-bias, msc-sample-nan-zero, msc-position-inf-nan; "
+                        "env MADEIRA_IR_NO_BOUNDS_CHECK=1)\n",
                 IR_VERSION_MAJOR, IR_VERSION_MINOR, IR_VERSION_PATCH, bc ? "on" : "off", inv ? "on" : "off",
                 nan ? "on" : "off", lod ? "on" : "off", snz ? "on" : "off", pin ? "on" : "off");
         cached = f;   /* one store: another converting thread sees -1 or the whole value */
