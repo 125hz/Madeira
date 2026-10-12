@@ -10368,6 +10368,39 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(ID3D12Device
     return hr;
 }
 
+/* madeira-bcd: the ml931 compute-shader dumps (C:\madeira-cs\cs_<pipeline
+ * pointer>_<size>.dxil, the first 400 of every launch) are named by a pointer
+ * that changes from run to run, so each launch ADDED up to 400 files (~16 MB)
+ * and nothing removed them. A shader that faults the GPU is kept by hash
+ * through fault-shaders.txt instead, so the dumps are opt-in now
+ * (madeira.cfg cs-dump = 1), and the ones earlier builds left are deleted in
+ * the background once per launch while the switch is off. */
+static DWORD WINAPI mad_cs_dump_prune(void *arg) {
+    WIN32_FIND_DATAA fd; HANDLE f; unsigned n = 0; ULONGLONG bytes = 0; char path[MAX_PATH];
+    (void)arg;
+    f = FindFirstFileA("C:\\madeira-cs\\cs_*.dxil", &fd);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        snprintf(path, sizeof path, "C:\\madeira-cs\\%s", fd.cFileName);
+        if (DeleteFileA(path)) { n++; bytes += ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow; }
+    } while (FindNextFileA(f, &fd));
+    FindClose(f);
+    if (n) d3d12_log("[madeira-d3d12] removed %u old compute-shader dumps (%llu MB) from C:\\madeira-cs (madeira.cfg cs-dump = 1 keeps writing them)\n",
+                     n, (unsigned long long)(bytes >> 20));
+    return 0;
+}
+static int mad_cs_dump_on(void) {
+    static volatile LONG on = -1;
+    if (on < 0) {
+        LONG v = mad_cfg_int_pe("cs-dump", 0) ? 1 : 0;
+        if (InterlockedCompareExchange(&on, v, -1) == -1 && !v) {
+            HANDLE t = CreateThread(NULL, 0, mad_cs_dump_prune, NULL, 0, NULL);
+            if (t) CloseHandle(t);
+        }
+    }
+    return on > 0;
+}
 
 static HRESULT STDMETHODCALLTYPE device_CreateComputePipelineState(ID3D12Device *This,
         const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
@@ -10434,7 +10467,8 @@ static HRESULT STDMETHODCALLTYPE device_CreateComputePipelineState(ID3D12Device 
                 dump_on = n == 1 && v[0] == '1';
                 if (dump_on) d3d12_log("[madeira-d3d12] ml1990 compute bytecode dump to C:\\madeira-cs enabled (MADEIRA_D3D12_CS_DUMP=1)\n");
             }
-            if (dump_on && ndump++ < 400) { snprintf(fn, sizeof fn, "cs_%p_%u.dxil", (void *)p, (unsigned)desc->CS.BytecodeLength); mad_dump_blob(fn, desc->CS.pShaderBytecode, desc->CS.BytecodeLength); }
+            /* madeira-bcd: madeira.cfg cs-dump = 1 turns it on as well */
+            if ((dump_on || mad_cs_dump_on()) && ndump++ < 400) { snprintf(fn, sizeof fn, "cs_%p_%u.dxil", (void *)p, (unsigned)desc->CS.BytecodeLength); mad_dump_blob(fn, desc->CS.pShaderBytecode, desc->CS.BytecodeLength); }
         }
         snprintf(p->vs_name, sizeof p->vs_name, "%s", entry[0] ? entry : g_last_entry);   /* ml880 */
         /* ml1008: the reflected top-level layout is the DXIL converter's, and
