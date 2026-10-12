@@ -84,6 +84,36 @@ OVERLAY = {
     "async-submit": {"title": "D3D12 asynchronous submission"},
     "upload-swap": {"title": "D3D12 upload buffers on file-backed memory"},
     "d3d12-typed-uav-load": {"title": "D3D12 typed UAV loads (report support)"},
+    # The second Direct3D 12 route and the Vulkan library (WineProcessBridge.m,
+    # madeira_setup_vulkan; docs/BUILDING.md "winevulkan and vkd3d-proton").
+    "d3d12": {"category": "Direct3D 12", "title": "Direct3D 12 runtime (x64)", "kind": "choice",
+              "choices": [("", "madeira-d3d12 (default)"), ("vkd3d", "vkd3d-proton on Vulkan")],
+              "note": "Unset: madeira-d3d12, Direct3D 12 on Metal. \"vkd3d\": this session's d3d12.dll and d3d12core.dll "
+                      "are vkd3d-proton's (Direct3D 12 on Vulkan, the bundle's vulkan/ folder) and Vulkan is on (see "
+                      "vulkan). x64 programs only; read at session start; also from a game's own lines. Not "
+                      "device-tested. \"1\" (ml1095, developer) runs madeira-d3d12's shader converter canary at app start."},
+    "vulkan": {"category": "Direct3D 12", "title": "Vulkan library (x64)", "kind": "choice",
+               "choices": [("", "Off, MoltenVK with d3d12 = vkd3d"), ("moltenvk", "MoltenVK"),
+                           ("kosmickrisp", "KosmicKrisp"), ("off", "Off")],
+               "note": "The Vulkan driver Wine's winevulkan loads: moltenvk = gl/libMoltenVK.dylib (the one Zink uses), "
+                       "kosmickrisp = gl/libvulkan_kosmickrisp.dylib, or a .dylib path (absolute or bundle-relative). "
+                       "Setting it turns Vulkan on for x64 programs (vulkan-1.dll and winevulkan.dll in the prefix); "
+                       "unset, Vulkan is off unless d3d12 = vkd3d. Read at session start; also from a game's own lines."},
+    "env.VKD3D_DEBUG": {"category": "Direct3D 12", "title": "vkd3d-proton log level",
+               "note": "vkd3d-proton's log: none, err, warn, fixme (default), info, trace. Passed to the Windows "
+                       "environment like any env line; only with d3d12 = vkd3d."},
+    "env.VKD3D_SHADER_DEBUG": {"category": "Direct3D 12", "title": "vkd3d-proton shader log level",
+               "note": "The shader translators' log level (none, err, warn, fixme, info, trace); with d3d12 = vkd3d."},
+    "env.VKD3D_CONFIG": {"category": "Direct3D 12", "title": "vkd3d-proton options",
+               "note": "Comma-separated vkd3d-proton flags (e.g. no_upload_hvv, force_static_cbv, skip_driver_workarounds); "
+                       "with d3d12 = vkd3d. See vkd3d-proton's README."},
+    # Read by DXMT's DXGI (dxmt/src/dxgi/dxgi_swapchain_vk.cpp, ml1320).
+    "env.MADEIRA_DXGI_VK_SWAPCHAIN": {"category": "Direct3D 12", "title": "DXGI swapchains for vkd3d-proton",
+               "kind": "bool", "default": "1",
+               "note": "On (default): DXMT's DXGI presents for a Direct3D 12 device on Vulkan (d3d12 = vkd3d) by "
+                       "wrapping vkd3d-proton's swapchain (IDXGIVkSwapChainFactory); windowed only, a fullscreen "
+                       "request keeps the window. 0: CreateSwapChain fails with \"Unsupported device type\" for "
+                       "those devices, as before."},
     # Read by DXMT's DXGI and by win32u's display adapter (sysparams_ios.c); a
     # library entry's "Report an NVIDIA GPU" sets it.
     "env.DXMT_ENABLE_NVEXT": {"category": "Direct3D 9/10/11 (DXMT)", "title": "Report an NVIDIA GPU (all games)",
@@ -124,6 +154,28 @@ OVERLAY = {
                 "choices": [("", "On (default)"), ("hid", "DualSense output only"), ("xinput", "XInput rumble only"),
                             ("0", "Off")],
                 "sources": ["app/Madeira/GamepadInput.swift", "app/Madeira/PadOutput.m"]},
+    # ml2170/ml2171: XInput battery and Windows.Gaming.Input host pads (docs/CONTROLLERS.md).
+    "env.MADEIRA_XINPUT_BATTERY": {"category": "Controllers", "title": "Controller battery level to XInput",
+                "kind": "bool", "default": "1",
+                "note": "On (default): XInputGetBatteryInformation reports each pad's GameController battery (wired "
+                        "while charging, else a level) and XInputGetCapabilities flags a battery-powered pad as "
+                        "wireless. 0: an unknown battery, as before."},
+    "env.MADEIRA_XINPUT_WGI": {"category": "Controllers", "title": "Controllers in Windows.Gaming.Input",
+                "kind": "bool", "default": "1",
+                "note": "On (default): every XInput pad is also a Gamepad (and RawGameController) in "
+                        "Windows.Gaming.Input, with rumble, for games that only ask that API. 0: that API lists no "
+                        "controllers, as before."},
+    "env.MADEIRA_XINPUT_SLOT0_RECONNECT": {"category": "Controllers",
+                "title": "Reconnected controller back to player 1", "kind": "bool", "default": "1",
+                "note": "On (default): when player 1's controller reconnects and GameController reports it as a new "
+                        "controller before the old one leaves, it is moved from the slot it landed in back to slot 0. "
+                        "0: it stays where it landed, as before."},
+    "env.MADEIRA_XINPUT_ENABLE_FOREGROUND": {"category": "Controllers",
+                "title": "Ignore a stale XInput disable while the game is in front", "kind": "bool", "default": "1",
+                "note": "On (default): when a game has switched XInput off (XInputEnable(FALSE), usually on losing "
+                        "focus) but its window is in front, it still reads the pad; activation messages at startup can "
+                        "leave it off for good. 0: the pad reads at rest while disabled, as before. Read by win32u, so "
+                        "32- and 64-bit games alike."},
     "env.MADEIRA_PROMOTE": {"title": "Hold the display at its maximum rate"},
     # The D3D12/DXGI GPU as a D3DKMT adapter (build/win32u-unix/d3dkmt_ios.c).
     "env.MADEIRA_KMT_ADAPTER": {"category": "Windows, display & input", "title": "D3DKMT adapter for the GPU (WDDM 3.1)",
