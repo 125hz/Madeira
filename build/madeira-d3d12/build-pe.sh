@@ -51,13 +51,17 @@ EXTRA+=(-DMAD_SC_CONVERTER_ID="\"$SCID\"")
 if [ -n "${MAD_BUILD_ID:-}" ]; then EXTRA+=(-DMAD_BUILD_ID="\"$MAD_BUILD_ID\""); fi
 
 # The helper kernels (mad_kernels.metal) as an embedded metallib: the
-# indirect-argument probe runs on them. Without xcrun, or when the compile
-# fails, they are left out and the runtime skips what needs them.
+# indirect-argument probe and clear-rects run on them. Without xcrun, or when
+# the compile fails, they are left out and the runtime skips what needs them.
+# The file is compiled again without the clear functions when those do not
+# compile, so the probe kernel never depends on them.
 echo "=== helper kernels (metallib) ==="
 mad_kernels_metal() {
     xcrun -sdk iphoneos metal -std=metal3.0 "$@" -o "$OUT/mad_kernels.metallib" "$SRC/mad_kernels.metal" 2> "$OUT/mad_kernels.err"
 }
-if command -v xcrun > /dev/null 2>&1 && mad_kernels_metal; then
+if command -v xcrun > /dev/null 2>&1 &&
+   { mad_kernels_metal ||
+     mad_kernels_metal -DMAD_NO_CLEAR_RECTS; }; then
     (cd "$OUT" && xxd -i mad_kernels.metallib > mad_kernels_metallib.h)
     EXTRA+=(-DMAD_HAVE_KERNELS -I"$OUT")
     echo "  $(wc -c < "$OUT/mad_kernels.metallib" | tr -d ' ') bytes"
