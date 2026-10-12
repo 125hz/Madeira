@@ -3300,14 +3300,14 @@ static void *ios_mach_exception_thread( void *arg )
                     extern int ios_page_expected_prot( const void *addr );
                     watch_prot = ios_page_expected_prot( (const void *)fault_addr );
                     if (watch_prot < 0) watch_prot = PROT_READ | PROT_WRITE;
-                    if (mprotect( (void *)ios_watch_page, IOS_WATCH_PAGE, watch_prot | PROT_READ | PROT_WRITE ) == 0)
+                    if (mprotect( (void *)ios_watch_page, IOS_WATCH_PAGE, (watch_prot & ~PROT_EXEC) | PROT_READ | PROT_WRITE ) == 0)   /* ml1202: image data pages take no EXEC on the host */
                     {
                         rw_addr = fault_addr;
                         watch_hit = 1;
                     }
                     else
-                        dprintf( STDERR_FILENO, "[watch] ml1201 cannot unprotect %p for the store at pc=%p errno=%d\n",
-                                 (void *)ios_watch_page, (void *)(uintptr_t)fault_pc, errno );
+                        dprintf( STDERR_FILENO, "[watch] ml1201 cannot unprotect %p (wine prot %d) for the store at pc=%p errno=%d\n",
+                                 (void *)ios_watch_page, watch_prot, (void *)(uintptr_t)fault_pc, errno );
                 }
                 /* ml348 DISCRIMINATOR: a write fault with NO alias is a
                  * different bug from a write fault whose instruction we can't
@@ -4149,7 +4149,7 @@ static void *ios_mach_exception_thread( void *arg )
                         {   /* ml1201: the store landed; report it and re-arm the page */
                             ios_watch_report( &state, (uint64_t)fault_pc, insn, fault_addr, 1, watch_prot );
                             if (ios_watch_state == 1)
-                                mprotect( (void *)ios_watch_page, IOS_WATCH_PAGE, (watch_prot | PROT_READ) & ~PROT_WRITE );
+                                mprotect( (void *)ios_watch_page, IOS_WATCH_PAGE, PROT_READ );   /* ml1202: read only; EXEC would be refused */
                         }
                         /* ml635: record that this alias page was written. FEX's cached
                          * translation is NOT invalidated here (the ARM64EC path would call
