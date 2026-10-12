@@ -101,6 +101,76 @@ static void d3d12_log(const char *fmt, ...) {
     fflush(stderr);
 }
 
+/* madeira graphics pin begin */
+/* Opt-in loader lifetime for repeated hardware probes. Called from a public
+ * device entry point after DLL initialization, never from DllMain. The normal
+ * PIN API keeps live DLL state and still permits normal process teardown;
+ * no image/JIT range is force-freed or reused. Missing modules are not loaded. */
+static void mad_pin_graphics_dlls(void) {
+    static const struct { const WCHAR *name; const char *label; } modules[] = {
+        { L"d3d12.dll", "d3d12.dll" },
+        { L"madeira_d3d12.dll", "madeira_d3d12.dll" },
+        { L"d3d12core.dll", "d3d12core.dll" },
+        { L"dxgi.dll", "dxgi.dll" },
+        { L"winemetal.dll", "winemetal.dll" }
+    };
+    static volatile LONG logged_mask;
+    DWORD saved_error = GetLastError();
+    char value[2];
+    DWORD n = GetEnvironmentVariableA("MADEIRA_PIN_GRAPHICS_DLLS", value, sizeof value);
+    if (n == 1 && value[0] == '1') {
+        unsigned i;
+        for (i = 0; i < sizeof modules / sizeof modules[0]; i++) {
+            HMODULE module;
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, modules[i].name, &module)) {
+                LONG bit = 1L << i;
+                if (!(InterlockedOr(&logged_mask, bit) & bit))
+                    d3d12_log("[graphics-pin] retained %s at %p until process shutdown\n", modules[i].label, module);
+            }
+        }
+    }
+    SetLastError(saved_error);
+}
+/* madeira graphics pin end */
+
+/* madeira preload begin */
+/* madeira-bcd: MADEIRA_PRELOAD_DLLS = name;name (opt-in): those DLLs are loaded
+ * and pinned at a process's first D3D12CreateDevice call (probe or create),
+ * never from DllMain. RDR2 (build 476, 2026-10-09 16:51) loads xinput1_4.dll
+ * only at its first XInput call, minutes into the session, when the JIT pool
+ * had no room left for its copy: the load failed, and neither the controller
+ * nor the on-screen controls reached the game. When the device is created the
+ * pool still has room, and a pinned DLL is never unloaded and copied again. */
+static void mad_preload_dlls(void) {
+    static volatile LONG done;
+    char list[256], *name, *next;
+    DWORD saved_error, n;
+
+    if (InterlockedExchange(&done, 1)) return;
+    saved_error = GetLastError();
+    n = GetEnvironmentVariableA("MADEIRA_PRELOAD_DLLS", list, sizeof list);
+    if (n && n < sizeof list) {
+        for (name = list; name; name = next) {
+            HMODULE module, pinned;
+            size_t len;
+
+            if ((next = strchr(name, ';'))) *next++ = 0;
+            while (*name == ' ') name++;
+            len = strlen(name);
+            while (len && name[len - 1] == ' ') name[--len] = 0;
+            if (!*name) continue;
+            module = LoadLibraryA(name);
+            if (module && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                                             (LPCSTR)module, &pinned))
+                d3d12_log("[preload] %s loaded and pinned at %p (MADEIRA_PRELOAD_DLLS)\n", name, (void *)module);
+            else
+                d3d12_log("[preload] %s did not load (error %lu, MADEIRA_PRELOAD_DLLS)\n", name, GetLastError());
+        }
+    }
+    SetLastError(saved_error);
+}
+/* madeira preload end */
+
 void madeira_d3d12_note_unimplemented(const char *iface, const char *method) {
     /* Rate limiting is per call site rather than global: one chatty method must
      * not hide the first occurrence of every other one. */
@@ -12027,6 +12097,9 @@ __declspec(dllexport) void MadeiraD3D12GetQueueStats(ID3D12CommandQueue *queue,
 
 __declspec(dllexport) HRESULT WINAPI MadeiraD3D12CreateDevice(IUnknown *adapter,
         D3D_FEATURE_LEVEL min_feature_level, REFIID riid, void **device) {
+    (void)adapter;
+    mad_pin_graphics_dlls();
+    mad_preload_dlls();
     build_vtables();
 
     /* The design is explicit that accepting the controlled sample's requested
@@ -13109,7 +13182,11 @@ HRESULT WINAPI D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL min_level,
      * building a device, the way the real runtime does (S_FALSE on support). */
     d3d12_log("[madeira-d3d12] D3D12CreateDevice(adapter=%p, feature level %#x, %s)\n",
               adapter, (unsigned)min_level, device ? "create" : "probe");
-    if (!device) return (min_level <= D3D_FEATURE_LEVEL_12_0) ? S_FALSE : E_INVALIDARG;
+    if (!device) {
+        mad_pin_graphics_dlls();
+        mad_preload_dlls();
+        return (min_level <= D3D_FEATURE_LEVEL_12_0) ? S_FALSE : E_INVALIDARG;
+    }
     return MadeiraD3D12CreateDevice(adapter, min_level, riid, device);
 }
 
