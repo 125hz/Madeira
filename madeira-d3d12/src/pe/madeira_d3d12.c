@@ -139,6 +139,9 @@ static volatile LONG g_pass_begun, g_pass_end_rts, g_pass_end_clear, g_pass_end_
                      g_pass_end_attachless, g_pass_clear_only, g_pass_reused;
 static volatile LONG64 g_pass_attach_bytes;
 static int g_census_on;   /* ml899: one frame at presents 1500,1700,...,2800 */
+static int g_skin_check = -1;      /* madeira-bcd skin-check: frames per window, 0 = off (mad_skin_load) */
+static volatile LONG g_skin_now;   /* madeira-bcd skin-check: the frame being replayed is a check frame */
+static int g_view_census = -1;     /* madeira-bcd view-census (mad_vc_on) */
 /* ml1098: MANUAL FRAME CAPTURE. The UI asks (MadeiraCtl op 0); the next frame
  * has every render pass that drew something followed by a blit of each of its
  * attachments into a shared buffer, and at the following Present the buffers
@@ -204,7 +207,8 @@ static SRWLOCK g_skip_ps_lock = SRWLOCK_INIT;
  * and to C:\madeira-cs\dump_<stage>_<entry>_<hash>.dxil. Each bytecode once, at
  * most 48 blobs / 3 MB a run. Unset (the default): nothing is written. */
 static char g_dxil_dump[512]; static int g_dxil_dump_state = -1; static SRWLOCK g_dxil_dump_lock = SRWLOCK_INIT;
-static UINT64 g_dxil_dumped[48]; static unsigned g_dxil_ndumped; static SIZE_T g_dxil_dump_bytes;
+static UINT64 g_dxil_dumped[160]; static unsigned g_dxil_ndumped; static SIZE_T g_dxil_dump_bytes;
+static int g_dxil_dump_big;   /* madeira-bcd skin-check-trace: 160 blobs and 16 MB instead of 48 and 3 MB */
 /* madeira-bcd: SAMPLER STATES BY RESOURCE ID, so a targeted capture can say
  * what a sampler descriptor really does (filter, address modes, LOD clamps,
  * bias). Filled at CreateSampler and for root-signature static samplers; a
@@ -756,7 +760,7 @@ struct mad_resource {
      * resource; released with it. */
     /* ml1049: growable, never evicted. The 16-entry ring released a Metal view
      * that descriptors still named as soon as a 17th distinct view appeared. */
-    struct mad_tview { UINT fmt; UINT64 off, num; UINT8 uav; obj_handle_t tex; UINT64 id; } *tview;
+    struct mad_tview { UINT fmt; UINT64 off, num; UINT8 uav, eoff; obj_handle_t tex; UINT64 id, sh_gpu; struct mad_tvs *sh; } *tview;   /* eoff: elements before the view's first (madeira-bcd typed-view-align); sh_gpu / sh: its typed-view-shadow copy, 0 = none */
     unsigned ntview, tview_cap;
     void *view_old[24]; unsigned nview_old;   /* outgrown arrays, freed with the resource */
     unsigned srv_slot, uav_slot;              /* index + 1 in the device's srv_res / uav_res, 0 = absent (list_lock) */
@@ -857,6 +861,8 @@ struct mad_pso {
     int lazy;                                       /* plain render pipeline built at its first draw (mad_pso_realize) */
     int lazy_cs;                                    /* compute pipeline built at its first dispatch (mad_cpso_realize) */
     UINT64 cs_hash; UINT cs_len;   /* madeira-bcd: FNV-1a of the CS bytecode, for GPU fault reports */
+    UINT64 vs_hash;                /* madeira-bcd skin-check: FNV-1a of the VS bytecode (0 unless skin-check is on) */
+    char *il_tag; int il_int;      /* madeira-bcd skin-check-trace: the input layout in short; il_int: an integer element (blend indices) */
     LONG first_used; LONG64 born_present; DWORD born_tick;   /* madeira-bcd: pso-first-use */
     SRWLOCK rlock;                                  /* serialises this pipeline's lazy build (zero = SRWLOCK_INIT) */
     /* madeira-bcd pso-lazy-libs: lz = the stage libraries were dropped once the
@@ -1154,6 +1160,7 @@ struct mad_fence {
     UINT64 value;
     volatile LONG64 submitted;   /* ml1061: highest value a queue has been ASKED to signal */
     volatile LONG64 committed;   /* ml1120: highest value whose Signal batch has been COMMITTED to Metal (or signalled on the CPU) */
+    struct mad_queue *volatile sig_q; volatile LONG64 sig_value, sig_batch;   /* madeira-bcd vis-trace: the newest Signal, its queue and the batch it needs committed */
     struct { UINT64 value; HANDLE event; LONGLONG t_reg; } waiters[MAD_FENCE_WAITERS];   /* ml1109: t_reg = registration time */
     unsigned nwaiters;
 };
@@ -1650,6 +1657,7 @@ struct mad_exec {
     /* madeira-bcd: ind-count -- indirect commands of the open encoder whose
      * argument records are copied when it ends (mad_ic_encode) */
     struct { struct mad_resource *args; UINT64 off; UINT32 count, stride; UINT16 kind; const struct mad_pso *pso; } ic[64]; unsigned nic;
+    struct mad_skinx *sk;   /* madeira-bcd skin-check: this replay's state, check frames only (mad_skin_begin) */
 };
 static void mad_capture_pass(struct mad_exec *e, struct mad_resource **rt, unsigned nrt, const struct mad_rtvp *rtp,
                              struct mad_resource *depth, const struct mad_rtvp *dp, unsigned seq, unsigned draws);
@@ -2745,10 +2753,17 @@ static int mad_upload_swap_on(void) {   /* ml1154: madeira.cfg upload-swap (defa
                   d3d12_log("[madeira-d3d12] ml1154 upload-swap = %d (%s)\n", on, on ? "CPU-visible buffers >= 8 MB live on file-backed storage, off the jetsam footprint" : "Metal-owned storage"); }
     return on;
 }
-static int mad_pso_lazy_on(void) {   /* madeira.cfg pso-lazy (default 1): pipelines built at their first draw/dispatch */
+/* madeira-bcd readback-swap = 0 (opt-in): READBACK buffers stay on Metal-owned
+ * storage while upload-swap keeps UPLOAD buffers on the file tier. The GPU
+ * writes READBACK memory and the CPU reads it; with the file tier between them
+ * the CPU's view may not have the GPU's writes (vis-trace's readback check
+ * counts that). Horizon Zero Dawn has two 32 MB READBACK buffers. */
+static int mad_readback_swap_on(void) {
     static int on = -1;
-    if (on < 0) { on = mad_cfg_int_pe("pso-lazy", 1) ? 1 : 0;
-                  d3d12_log("[madeira-d3d12] pipelines are built %s (madeira.cfg pso-lazy)\n", on ? "at their first draw/dispatch" : "at creation"); }
+    if (on < 0) {
+        on = mad_cfg_int_pe("readback-swap", 1) ? 1 : 0;   /* fix attempt: 0 = READBACK buffers on Metal-owned storage, not the file tier (UPLOAD buffers stay there) */
+        if (!on) d3d12_log("[madeira-d3d12] madeira-bcd readback-swap = 0: READBACK buffers on Metal-owned storage, UPLOAD buffers as upload-swap says\n");
+    }
     return on;
 }
 
@@ -3060,9 +3075,11 @@ static void mad_dxil_dump_one(const char *stage, const char *entry, const void *
     safe[i] = 0;
     AcquireSRWLockExclusive(&g_dxil_dump_lock);
     for (i = 0; i < g_dxil_ndumped; i++) if (g_dxil_dumped[i] == hh) break;
-    if (i < g_dxil_ndumped || g_dxil_ndumped >= 48 || g_dxil_dump_bytes + len > (3u << 20)) {
-        if (i == g_dxil_ndumped && g_dxil_ndumped < 48) { g_dxil_dumped[g_dxil_ndumped++] = hh;
-            d3d12_log("[dxil-dump] %s of '%s' %016llx (%u bytes) NOT logged: the 3 MB budget is spent\n", stage, entry, (unsigned long long)hh, (unsigned)len); }
+    if (i < g_dxil_ndumped || g_dxil_ndumped >= (g_dxil_dump_big ? 160u : 48u) ||
+        g_dxil_dump_bytes + len > (g_dxil_dump_big ? (16u << 20) : (3u << 20))) {
+        if (i == g_dxil_ndumped && g_dxil_ndumped < (g_dxil_dump_big ? 160u : 48u)) { g_dxil_dumped[g_dxil_ndumped++] = hh;
+            d3d12_log("[dxil-dump] %s of '%s' %016llx (%u bytes) NOT logged: the %u MB budget is spent\n", stage, entry, (unsigned long long)hh,
+                      (unsigned)len, g_dxil_dump_big ? 16u : 3u); }
         ReleaseSRWLockExclusive(&g_dxil_dump_lock);
         return;
     }
@@ -5168,6 +5185,787 @@ static void mad_rs_report(double presents) {
     d3d12_log("%s\n", buf);
 }
 
+/* ---- madeira-bcd skin-check (diagnostic, opt-in) ------------------------------
+ * Horizon Zero Dawn (builds 480 and 481) skins its characters in compute: three
+ * dispatches, then one draw whose vertex streams 1 and 2 are a 16 MB and a 20 MB
+ * buffer created with ALLOW_UNORDERED_ACCESS, read at offset 0. Every few frames
+ * a face, a head of hair or a whole body is drawn collapsed to the origin, and
+ * gpu-sync = 1 (the CPU waits for the GPU after every submission) did not change
+ * it. madeira.cfg skin-check = N (1 = 8) checks windows of N frames, one every
+ * skin-check-every presents (default 300) once such a draw has been seen:
+ *  - a draw that reads a GPU-written stream (a buffer created with
+ *    ALLOW_UNORDERED_ACCESS) is logged with its streams, and up to 32 KB of each
+ *    such stream is copied GPU-ordered just before it and summarised after the
+ *    queue's next fence wait ([skin-cap]: vertices whose first three floats are
+ *    exactly 0, NaN/Inf ones, the largest magnitude, and a hash that repeats when
+ *    nothing rewrote the buffer);
+ *  - the dispatches since the previous draw are logged with every range their
+ *    DXBC stage declared and what it resolved to (resource r#, offset, typed view
+ *    count and first element, "!RAW" where a typed range got a plain buffer
+ *    descriptor and the shader sees no texture): every dispatch in the first two
+ *    frames of a window while the line budget lasts, otherwise only those that
+ *    fed such a draw; from then on those compute shaders also have the first 256
+ *    bytes of each input copied after they run;
+ *  - the draw's vertex-stage ranges are logged the same way, and the vertex and
+ *    compute shaders' bytecode once each ([dxil-dump]; kept from creation).
+ * Captures have their own 4 MB buffer and are printed by the queue that
+ * recorded them. Nothing here runs when skin-check is 0.
+ *
+ * Build 485 additions, each its own switch and off by default:
+ *  - every capture of CPU-written memory (an UPLOAD or CUSTOM heap) also keeps
+ *    the bytes the CPU had there when the list was replayed; once the GPU's
+ *    copy is complete the three are compared ([skin-cmp]: what the GPU read,
+ *    what the CPU had written at submission, what is there now);
+ *  - skin-check-trace = 1: the first frame of the first two windows logs
+ *    every draw in one line ([skin-trace]: shaders, counts, streams and the
+ *    pipeline's input layout); a pipeline with integer vertex inputs (blend
+ *    indices: a mesh skinned in its vertex shader) also gets its vertex-stage
+ *    bindings, copies of its CPU-written inputs and of its first vertices, and
+ *    its vertex shader's bytecode (kept at creation even once the shared 32 MB
+ *    store is full, up to 64 MB in all);
+ *  - skin-dump = 1: in the first window's first two frames (one per upload
+ *    heap of a double-buffered game) the compute shaders that feed such draws
+ *    have their inputs copied whole (up to 256 KB each) and the stream they
+ *    wrote too, and every copy marked for it is logged as base64 after the
+ *    queue's fence wait ([skin-dump] + [b64 ...] lines, at most 4 MB in all),
+ *    so the skinning can be recomputed on a PC and compared with what the GPU
+ *    wrote. The capture buffer is then 24 MB. */
+#define MAD_SKIN_WIN_LINES 1600      /* draw, dispatch and vertex-stage lines per window */
+#define MAD_SKIN_LINE_BUDGET 12000   /* ... and in all */
+#define MAD_SKIN_WIN_CAPS 1000       /* [skin-cap] lines per window */
+#define MAD_SKIN_CAP_BUDGET 8000     /* ... and in all */
+#define MAD_SK_BYTES (4u << 20)
+#define MAD_SK_N 512u                /* captures waiting for their queue's fence (256 before skin-check-trace) */
+#define MAD_SK_IN 12u                /* inputs one stage's tables resolve to that are remembered */
+#define MAD_SK_DUMP_MAX (256u << 10) /* skin-dump: largest single copy */
+#define MAD_SK_DUMP_BUDGET (4u << 20)
+struct mad_skinx {
+    unsigned list, ndisp, ndraw;          /* list number, dispatches and draws replayed so far */
+    UINT64 cs[4]; unsigned ncs;           /* compute shaders since the last draw, oldest first */
+    char dl[4][3200]; unsigned ndl;       /* their lines, held until a draw says whether they fed it */
+    char tok[3000]; unsigned ntok;        /* range tokens the bridge appends while tab_on */
+    int tab_on, tab_cs, draw_gpu;         /* tab_cs: the tables being built are a dispatch's */
+    struct { struct mad_resource *r; UINT64 off; UINT len; } in[MAD_SK_IN]; unsigned nin;   /* inputs the bridge resolved; len = the view's size, 256 when unknown */
+    unsigned ntrace;                      /* skin-check-trace: draws traced in this list */
+};
+static int g_skin_every = 300, g_skin_cap_on = 1, g_skin_trace, g_skin_dump;
+static volatile LONG g_skin_win_first;   /* the first frame of the current window */
+static volatile LONG g_skin_trace_n, g_skin_trace_full, g_skin_cmp_n, g_skin_dumps;
+static volatile LONG64 g_skin_dump_bytes;
+static UINT g_sk_bytes = MAD_SK_BYTES;   /* the capture buffer's size: 24 MB with skin-dump */
+static volatile LONG g_skin_seen, g_skin_frame, g_skin_window, g_skin_full, g_skin_lines, g_skin_dropped, g_skin_cap_lines;
+static volatile LONG g_skin_win_lines, g_skin_win_caps;   /* this window's, reset when one starts */
+static volatile LONG g_skin_draws_frame, g_skin_caps_frame, g_skin_draws, g_skin_caps, g_skin_caps_skipped;
+static UINT64 g_skin_prod[16]; static LONG g_skin_nprod;   /* compute shaders seen feeding such a draw (g_sk_lock) */
+/* UAV ranges dispatches bound in check frames, newest last (g_sk_lock): which
+ * compute shader last wrote the buffer a draw reads, even from another list. */
+static struct mad_skw { const struct mad_resource *r; UINT64 off, cs; LONG frame; unsigned list, disp; } g_skin_w[256];
+static unsigned g_skin_wn;
+static SRWLOCK g_sk_lock = SRWLOCK_INIT;
+static obj_handle_t g_sk_buf; static unsigned char *g_sk_cpu; static UINT g_sk_used;
+/* dump: log the copy as base64 (skin-dump); snap: the CPU's bytes at replay
+ * when the source is CPU-written memory, src (referenced) and src_off where */
+static struct mad_skcap { char label[120]; UINT off, len, kind, stride; const void *q;
+                          UINT dump; unsigned char *snap; struct mad_resource *src; UINT64 src_off; } g_sk_cap[MAD_SK_N];
+static volatile unsigned g_sk_n;
+/* The bytecode PSO creation saw, by FNV-1a hash (the cs_hash of fault reports). */
+#define MAD_BC_SLOTS 8192u
+static struct mad_bcrec { UINT64 hash; void *bc; UINT len; } *g_bc;
+static SRWLOCK g_bc_lock = SRWLOCK_INIT;
+static SIZE_T g_bc_bytes; static LONG g_bc_n, g_bc_refused;
+static void mad_vc_report(void);
+static void mad_tvs_refresh(void);   /* madeira-bcd typed-view-shadow */
+
+static void mad_skin_load(void) {
+    static volatile LONG once;
+    int n;
+    if (InterlockedExchange(&once, 1)) return;   /* another thread is reading it; until then it counts as off */
+    n = (int)mad_cfg_int_pe("skin-check", 0);   /* diagnostic: windows of N frames (1 = 8) logging draws that read GPU-written vertex buffers */
+    if (n < 0) n = 0;
+    if (n == 1) n = 8;
+    if (n > 64) n = 64;
+    if (n) {
+        int ev = (int)mad_cfg_int_pe("skin-check-every", 300);   /* presents between skin-check windows */
+        g_skin_every = ev < 30 ? 30 : ev;
+        g_skin_cap_on = mad_cfg_int_pe("skin-check-capture", 1) ? 1 : 0;   /* 0: log only, no GPU copies (they add a blit between the dispatches and the draw) */
+        g_skin_trace = mad_cfg_int_pe("skin-check-trace", 0) ? 1 : 0;   /* the first frame of the first two windows: every draw in one line, pipelines with integer vertex inputs in full */
+        g_skin_dump = mad_cfg_int_pe("skin-dump", 0) ? 1 : 0;           /* the first window's first two frames: what the compute skinning read and wrote, whole, as base64 */
+        if (g_skin_dump) g_sk_bytes = 24u << 20;
+        if (g_skin_trace) g_dxil_dump_big = 1;
+        d3d12_log("[skin-check] madeira-bcd DIAGNOSTIC: windows of %d frames, one every %d presents once a draw reads a "
+                  "GPU-written vertex buffer; those draws, the dispatches that fed them, %s and the shaders' bytecode are "
+                  "logged (madeira.cfg skin-check / skin-check-every / skin-check-capture; 0 = off)\n", n, g_skin_every,
+                  g_skin_cap_on ? "32 KB of each such stream" : "no stream copies (skin-check-capture = 0)");
+        if (g_skin_trace || g_skin_dump)
+            d3d12_log("[skin-check] skin-check-trace = %d (every draw of the first frame of windows 1-2, skinned-looking pipelines in full), "
+                      "skin-dump = %d (the first window's first two frames: compute skinning inputs and output as base64, a %u MB capture buffer)\n",
+                      g_skin_trace, g_skin_dump, g_sk_bytes >> 20);
+    }
+    g_skin_check = n;
+}
+static int mad_skin_on(void) { if (g_skin_check < 0) mad_skin_load(); return g_skin_check > 0; }
+
+/* pri (skin-check-trace: a vertex shader with integer inputs) may use 32 MB
+ * past the shared 32: the first shaders a game creates filled the store in
+ * Horizon Zero Dawn's 484 run (1773 kept, 12390 refused). */
+static void mad_bc_keep_ex(UINT64 hash, const void *bc, SIZE_T len, int pri) {
+    unsigned h, k;
+    if (!hash || !bc || !len || len > (1u << 20)) return;
+    AcquireSRWLockExclusive(&g_bc_lock);
+    if (!g_bc) g_bc = calloc(MAD_BC_SLOTS, sizeof *g_bc);
+    if (g_bc) {
+        h = (unsigned)((hash * 0x9E3779B97F4A7C15ull) >> 51);
+        for (k = 0; k < 64; k++) {
+            struct mad_bcrec *b = &g_bc[(h + k) & (MAD_BC_SLOTS - 1)];
+            if (b->hash == hash) break;
+            if (!b->hash) {
+                if (g_bc_bytes + len <= (pri ? (64u << 20) : (32u << 20)) && (b->bc = malloc(len))) {
+                    memcpy(b->bc, bc, len); b->len = (UINT)len; b->hash = hash;
+                    g_bc_bytes += len; g_bc_n++;
+                } else g_bc_refused++;
+                break;
+            }
+        }
+        if (k == 64) g_bc_refused++;
+    }
+    ReleaseSRWLockExclusive(&g_bc_lock);
+}
+static void mad_bc_keep(UINT64 hash, const void *bc, SIZE_T len) { mad_bc_keep_ex(hash, bc, len, 0); }
+static void mad_bc_dump(const char *stage, UINT64 hash) {
+    const void *bc = NULL; UINT len = 0; unsigned h, k;
+    static volatile LONG said_missing;
+    if (!hash) return;
+    AcquireSRWLockShared(&g_bc_lock);
+    if (g_bc) {
+        h = (unsigned)((hash * 0x9E3779B97F4A7C15ull) >> 51);
+        for (k = 0; k < 64; k++) {
+            const struct mad_bcrec *b = &g_bc[(h + k) & (MAD_BC_SLOTS - 1)];
+            if (!b->hash) break;
+            if (b->hash == hash) { bc = b->bc; len = b->len; break; }
+        }
+    }
+    ReleaseSRWLockShared(&g_bc_lock);
+    if (bc) mad_dxil_dump_one(stage, "skin", bc, len);   /* once per bytecode: it remembers the hash */
+    else if (InterlockedIncrement(&said_missing) <= 16)
+        d3d12_log("[skin-check] no %s bytecode kept for %016llx (created before skin-check was read, or the 32 MB store is full)\n",
+                  stage, (unsigned long long)hash);
+}
+
+/* Appends to o[*n..cap), never past it. */
+static void mad_sk_cat(char *o, size_t cap, int *n, const char *fmt, ...) {
+    va_list ap; int k;
+    if (*n < 0 || (size_t)*n + 1 >= cap) return;
+    va_start(ap, fmt); k = vsnprintf(o + *n, cap - (size_t)*n, fmt, ap); va_end(ap);
+    if (k > 0) *n += k;
+    if ((size_t)*n >= cap) *n = (int)cap - 1;
+}
+static void mad_skin_line(const char *line) {
+    if (InterlockedIncrement(&g_skin_win_lines) <= MAD_SKIN_WIN_LINES && InterlockedIncrement(&g_skin_lines) <= MAD_SKIN_LINE_BUDGET)
+        d3d12_log("%s\n", line);
+    else InterlockedIncrement(&g_skin_dropped);
+}
+/* A GPU-ordered copy of len bytes of r at off into the skin-check buffer.
+ * dump: log it as base64 when it is printed (skin-dump). CPU-written memory
+ * also keeps the CPU's bytes as this list is replayed (madeira-bcd 485). */
+static int mad_skin_capture(struct mad_exec *e, const char *label, struct mad_resource *r, UINT64 off, UINT len, UINT kind, UINT stride, UINT dump) {
+    struct mad_device *d = e->q->device;
+    struct wmtcmd_blit_copy_from_buffer_to_buffer k;
+    int ok = 0;
+    off &= ~(UINT64)3; len &= ~3u;
+    if (!r || !r->buffer || !len || off >= r->size) return 0;
+    if (off + len > r->size) len = (UINT)(r->size - off) & ~3u;
+    if (!len) return 0;
+    AcquireSRWLockExclusive(&g_sk_lock);
+    if (!g_sk_buf) {
+        struct WMTBufferInfo bi; memset(&bi, 0, sizeof bi);
+        bi.length = g_sk_bytes; bi.options = WMTResourceStorageModeShared;
+        g_sk_buf = MTLDevice_newBuffer(d->mtl_device, &bi);
+        if (g_sk_buf && bi.memory.ptr) g_sk_cpu = bi.memory.ptr;
+        else { if (g_sk_buf) NSObject_release(g_sk_buf); g_sk_buf = 0; }
+    }
+    if (g_sk_buf && g_sk_n < MAD_SK_N && g_sk_used + len <= g_sk_bytes && exec_begin_blit(e)) {
+        struct mad_skcap *c = &g_sk_cap[g_sk_n];
+        memset(&k, 0, sizeof k);
+        k.type = WMTBlitCommandCopyFromBufferToBuffer;
+        k.src = r->buffer; k.src_offset = off; k.dst = g_sk_buf; k.dst_offset = g_sk_used; k.copy_length = len;
+        MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
+        snprintf(c->label, sizeof c->label, "%s", label);
+        c->off = g_sk_used; c->len = len; c->kind = kind; c->stride = stride; c->q = e->q;
+        c->dump = dump; c->snap = NULL; c->src = NULL; c->src_off = off;
+        if (r->cpu && (r->heap == D3D12_HEAP_TYPE_UPLOAD || r->heap == D3D12_HEAP_TYPE_CUSTOM) && (c->snap = malloc(len))) {
+            memcpy(c->snap, (const unsigned char *)r->cpu + off, len);   /* what the CPU had written when this list was submitted */
+            c->src = r; ID3D12Resource_AddRef((ID3D12Resource *)r);
+        }
+        g_sk_used += (len + 15) & ~15u; g_sk_n++;
+        ok = 1;
+    }
+    ReleaseSRWLockExclusive(&g_sk_lock);
+    InterlockedIncrement(ok ? &g_skin_caps : &g_skin_caps_skipped);
+    return ok;
+}
+/* madeira-bcd 485: a copy of CPU-written memory against the bytes the CPU had
+ * there when the list was replayed (snap) and the bytes there now. The GPU
+ * reading the later bytes means they were rewritten while the work was in
+ * flight; reading bytes the CPU had at neither time means the GPU's view of
+ * that memory is not what the CPU wrote. */
+static void mad_skin_cmp(const struct mad_skcap *c, const unsigned char *gpu) {
+    const unsigned char *now = c->src && c->src->cpu ? (const unsigned char *)c->src->cpu + c->src_off : NULL;
+    UINT i, n = c->len / 4, dg = 0, dn = 0, dgn = 0, fg = 0, fn = 0;
+    for (i = 0; i < n; i++) {
+        const unsigned char *a = gpu + (size_t)i * 4, *b = c->snap + (size_t)i * 4;
+        if (memcmp(a, b, 4) && !dg++) fg = i * 4;
+        if (now && memcmp(now + (size_t)i * 4, b, 4) && !dn++) fn = i * 4;
+        if (now && memcmp(now + (size_t)i * 4, a, 4)) dgn++;
+    }
+    if (InterlockedIncrement(&g_skin_cmp_n) > 3000) return;
+    if (!dg && !dn)
+        d3d12_log("[skin-cmp] %s: %u bytes; the GPU read what the CPU had written at submission, unchanged since\n", c->label, c->len);
+    else
+        d3d12_log("[skin-cmp] %s: %u bytes; the GPU read %s (%u of %u words differ, the first at +%u); the CPU %s since (%u words, "
+                  "the first at +%u)%s\n", c->label, c->len,
+                  !dg ? "what the CPU had written at submission" : now && !dgn ? "the CPU's LATER bytes (rewritten after submission)"
+                                                                            : "BYTES THE CPU DID NOT HAVE THERE at submission or now",
+                  dg, n, fg, dn ? "rewrote them" : "left them", dn, fn, now ? "" : "; the source is gone");
+}
+/* madeira-bcd skin-dump: the copy as base64 ([skin-dump] header, [b64 <id>]
+ * lines, end), and the CPU's bytes at submission too when they differ. */
+static void mad_skin_dumpcap(const struct mad_skcap *c, const unsigned char *gpu) {
+    static volatile LONG said_full;
+    UINT64 id;
+    if ((UINT64)InterlockedExchangeAdd64(&g_skin_dump_bytes, (LONG64)c->len) + c->len > MAD_SK_DUMP_BUDGET) {
+        if (!InterlockedExchange(&said_full, 1))
+            d3d12_log("[skin-dump] the %u MB dump budget is spent; %s and later copies are not dumped\n", MAD_SK_DUMP_BUDGET >> 20, c->label);
+        return;
+    }
+    id = 0x5d00000000000000ull | (UINT64)InterlockedIncrement(&g_skin_dumps);
+    d3d12_log("[skin-dump] %016llx: %s, %u bytes as the GPU read them (kind %u, stride %u); base64 follows\n",
+              (unsigned long long)id, c->label, c->len, c->kind, c->stride);
+    mad_log_b64(id, gpu, c->len);
+    if (c->snap && memcmp(gpu, c->snap, c->len)) {
+        d3d12_log("[skin-dump] %016llx: %s, %u bytes as the CPU had written them at submission; base64 follows\n",
+                  (unsigned long long)(id | 0x0080000000000000ull), c->label, c->len);
+        mad_log_b64(id | 0x0080000000000000ull, c->snap, c->len);
+    }
+    d3d12_log("[skin-dump] %016llx: end\n", (unsigned long long)id);
+}
+static void mad_skin_print(const struct mad_skcap *c) {
+    const unsigned char *p = g_sk_cpu + c->off;
+    UINT32 hash = 0x811c9dc5u; UINT i;
+    if (c->snap) mad_skin_cmp(c, p);       /* madeira-bcd 485 */
+    if (c->dump) mad_skin_dumpcap(c, p);   /* madeira-bcd skin-dump */
+    if (InterlockedIncrement(&g_skin_win_caps) > MAD_SKIN_WIN_CAPS || InterlockedIncrement(&g_skin_cap_lines) > MAD_SKIN_CAP_BUDGET) return;
+    for (i = 0; i < c->len; i++) { hash ^= p[i]; hash *= 0x01000193u; }
+    if (c->kind == 20) {   /* a vertex stream */
+        UINT st = c->stride ? c->stride : 16, nb = st < 12 ? st & ~3u : 12, n = c->len / st, v, j, zero = 0, bad = 0, huge = 0;
+        float mx = 0.0f, f0[4] = { 0, 0, 0, 0 }, f1[4] = { 0, 0, 0, 0 };
+        for (v = 0; v < n; v++) {
+            float a[3] = { 0, 0, 0 }; UINT32 bits = 0; int b = 0, h = 0;
+            memcpy(a, p + (size_t)v * st, nb);
+            for (j = 0; j < nb / 4; j++) {
+                UINT32 u; memcpy(&u, &a[j], 4); bits |= u;
+                if (!isfinite(a[j])) b = 1;
+                else { float m = fabsf(a[j]); if (m > mx) mx = m; if (m > 1e5f) h = 1; }
+            }
+            if (!bits) zero++;
+            bad += b; huge += h;
+        }
+        memcpy(f0, p, st < 16 ? st & ~3u : 16);
+        if (n > 1) memcpy(f1, p + st, st < 16 ? st & ~3u : 16);
+        d3d12_log("[skin-cap] %s: %u vertices, position 0: %u, NaN/Inf: %u, over 1e5: %u, max |x| %.5g, hash %08x, "
+                  "v0 (%g %g %g %g) v1 (%g %g %g %g)\n", c->label, n, zero, bad, huge, mx, hash,
+                  f0[0], f0[1], f0[2], f0[3], f1[0], f1[1], f1[2], f1[3]);
+    } else if (c->kind == 22 || c->kind == 23) {   /* indices; 23: the first u16 is not the draw's; stride bit 4: nor the last */
+        UINT isz = (c->stride & 15) == 4 ? 4 : 2, skip = c->kind == 23 ? 1 : 0, n = c->len / isz, t, lo = ~0u, hi = 0, degen = 0, first[6] = { 0 };
+        if ((c->stride & 16) && n > skip) n--;
+        for (i = skip; i < n; i++) {
+            UINT32 x; UINT16 h;
+            if (isz == 4) memcpy(&x, p + (size_t)i * 4, 4); else { memcpy(&h, p + (size_t)i * 2, 2); x = h; }
+            if (x < lo) lo = x;
+            if (x > hi) hi = x;
+            if (i - skip < 6) first[i - skip] = x;
+        }
+        n = n > skip ? n - skip : 0;
+        for (t = 0; t + 3 <= n; t += 3) {
+            UINT32 a, b, cc; UINT16 h;
+            if (isz == 4) { memcpy(&a, p + (size_t)(skip + t) * 4, 4); memcpy(&b, p + (size_t)(skip + t + 1) * 4, 4); memcpy(&cc, p + (size_t)(skip + t + 2) * 4, 4); }
+            else { memcpy(&h, p + (size_t)(skip + t) * 2, 2); a = h; memcpy(&h, p + (size_t)(skip + t + 1) * 2, 2); b = h; memcpy(&h, p + (size_t)(skip + t + 2) * 2, 2); cc = h; }
+            if (a == b || b == cc || a == cc) degen++;
+        }
+        d3d12_log("[skin-cap] %s: %u indices captured, min %u max %u, %u of %u triangles degenerate, hash %08x: %u %u %u %u %u %u\n",
+                  c->label, n, n ? lo : 0, hi, degen, n / 3, hash, first[0], first[1], first[2], first[3], first[4], first[5]);
+    } else {   /* 21: the start of a shader input */
+        UINT n = c->len / 4, zero = 0, bad = 0; float f[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        for (i = 0; i < n; i++) {
+            UINT32 u; float x; memcpy(&u, p + (size_t)i * 4, 4); memcpy(&x, &u, 4);
+            if (!u) zero++; else if (!isfinite(x)) bad++;
+        }
+        memcpy(f, p, c->len < 32 ? c->len : 32);
+        d3d12_log("[skin-cap] %s: %u words, zero %u, NaN/Inf %u, hash %08x: %g %g %g %g %g %g %g %g\n", c->label, n, zero, bad, hash,
+                  f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+    }
+}
+/* After queue q's fence wait: its captures are complete. */
+static void mad_skin_flush(const void *q) {
+    unsigned i, keep = 0, nrel = 0; UINT top = 0;
+    struct mad_resource *rel[MAD_SK_N];
+    AcquireSRWLockExclusive(&g_sk_lock);
+    for (i = 0; i < g_sk_n; i++) {
+        if (q && g_sk_cap[i].q != q) {
+            if (g_sk_cap[i].off + g_sk_cap[i].len > top) top = g_sk_cap[i].off + g_sk_cap[i].len;
+            if (keep != i) g_sk_cap[keep] = g_sk_cap[i];
+            keep++;
+            continue;
+        }
+        if (q) mad_skin_print(&g_sk_cap[i]);
+        free(g_sk_cap[i].snap); g_sk_cap[i].snap = NULL;   /* madeira-bcd 485 */
+        if (g_sk_cap[i].src) { rel[nrel++] = g_sk_cap[i].src; g_sk_cap[i].src = NULL; }
+    }
+    if (!q && g_sk_n) d3d12_log("[skin-check] %u captures dropped: their queue never waited on a fence\n", g_sk_n);
+    g_sk_n = keep; g_sk_used = keep ? (top + 15) & ~15u : 0;
+    ReleaseSRWLockExclusive(&g_sk_lock);
+    for (i = 0; i < nrel; i++) ID3D12Resource_Release((ID3D12Resource *)rel[i]);   /* outside the lock: a last reference destroys it */
+}
+/* " r#<serial>+<offset>" for an address, "va:<hex>?" when no live resource holds it. */
+static void mad_skin_where(struct mad_device *d, UINT64 va, char *o, size_t cap, int *n, struct mad_resource **out, UINT64 *out_off) {
+    UINT64 off = 0; struct mad_resource *r = va ? mad_resolve_address(d, va, &off) : NULL;
+    if (out) *out = r;
+    if (out_off) *out_off = off;
+    if (!va) mad_sk_cat(o, cap, n, "0");
+    else if (!r) mad_sk_cat(o, cap, n, "va:%llx?", (unsigned long long)va);
+    else mad_sk_cat(o, cap, n, "r#%u+%llu", r->serial, (unsigned long long)off);
+}
+/* An input the stage's tables resolved to; size: the view's byte size when the
+ * descriptor carries one (0 = unknown, 256 is copied). */
+static void mad_skin_in(struct mad_skinx *s, struct mad_resource *r, UINT64 off, UINT64 size) {
+    if (!r || s->nin >= MAD_SK_IN) return;
+    s->in[s->nin].r = r; s->in[s->nin].off = off;
+    s->in[s->nin].len = size && size < 0x7fffffffu ? (UINT)size : 256;
+    s->nin++;
+}
+/* A UAV a dispatch binds in a check frame: remembered for mad_skin_draw. */
+static void mad_skin_note_write(struct mad_exec *e, const struct mad_resource *r, UINT64 off) {
+    struct mad_skw *w;
+    AcquireSRWLockExclusive(&g_sk_lock);
+    w = &g_skin_w[g_skin_wn++ & 255];
+    w->r = r; w->off = off; w->cs = e->cpso ? e->cpso->cs_hash : 0; w->frame = g_skin_frame; w->list = e->sk->list; w->disp = e->sk->ndisp + 1;
+    ReleaseSRWLockExclusive(&g_sk_lock);
+}
+/* One declared range of the stage whose tables are being built. */
+static void mad_skin_tok(struct mad_exec *e, const struct madeira_ir_air_range *rg, const struct mad_descriptor *de, UINT64 direct) {
+    static const char cls[4] = { 'b', 's', 't', 'u' };
+    struct mad_skinx *s = e->sk; struct mad_device *d = e->q->device;
+    struct mad_resource *r = NULL; UINT64 off = 0;
+    char t[200]; int n = 0;
+    if (rg->type == MADEIRA_IR_AIR_SAMPLER) return;
+    mad_sk_cat(t, sizeof t, &n, " %c%u", rg->type < 4 ? cls[rg->type] : '?', rg->lower_bound);
+    if (rg->space) mad_sk_cat(t, sizeof t, &n, "s%u", rg->space);
+    mad_sk_cat(t, sizeof t, &n, "=");
+    if (rg->type == MADEIRA_IR_AIR_CBV || (rg->flags & MADEIRA_IR_AIR_F_BUFFER)) {
+        mad_skin_where(d, direct ? direct : de->gpu_va, t, sizeof t, &n, &r, &off);
+        if (rg->type != MADEIRA_IR_AIR_CBV) mad_sk_cat(t, sizeof t, &n, "/%u", (unsigned)(de->metadata & 0xffffffffu));
+        else if (direct && !r) mad_sk_cat(t, sizeof t, &n, "(root)");
+    } else if (de->metadata & MAD_DESC_TYPEDBUF) {
+        UINT32 cnt = 0, first = 0; int hit = mad_air_texbuf(d, de->texture_view_id, &cnt, &first);
+        mad_sk_cat(t, sizeof t, &n, "T{");
+        mad_skin_where(d, de->gpu_va, t, sizeof t, &n, &r, &off);
+        mad_sk_cat(t, sizeof t, &n, " n%u+%u%s}", cnt, first, hit ? "" : " NOT-IN-VMAP");
+    } else if (!de->texture_view_id && de->gpu_va) {
+        mad_sk_cat(t, sizeof t, &n, "!RAW{");
+        mad_skin_where(d, de->gpu_va, t, sizeof t, &n, NULL, NULL);
+        mad_sk_cat(t, sizeof t, &n, "/%u}", (unsigned)(de->metadata & 0xffffffffu));
+    } else mad_sk_cat(t, sizeof t, &n, de->texture_view_id ? "tex" : "null");
+    if (r && rg->type != MADEIRA_IR_AIR_UAV)
+        mad_skin_in(s, r, off, direct ? 0 : (de->metadata & 0xffffffffu));
+    if (r && rg->type == MADEIRA_IR_AIR_UAV && s->tab_cs) mad_skin_note_write(e, r, off);
+    if (s->ntok + (unsigned)n + 1 < sizeof s->tok) { memcpy(s->tok + s->ntok, t, (size_t)n); s->ntok += (unsigned)n; s->tok[s->ntok] = 0; }
+    else if (s->ntok + 5 < sizeof s->tok && (!s->ntok || s->tok[s->ntok - 1] != '.')) { memcpy(s->tok + s->ntok, " ...", 5); s->ntok += 4; }
+}
+/* One descriptor of a table (the converter's layout: address, texture id,
+ * metadata with bit 63 for a typed buffer). */
+static void mad_skin_desc(struct mad_exec *e, const struct mad_descriptor *de, UINT range_type, char *t, size_t cap, int *n) {
+    struct mad_skinx *s = e->sk; struct mad_resource *r = NULL; UINT64 off = 0;
+    if (!de->gpu_va && !de->texture_view_id) { mad_sk_cat(t, cap, n, "0"); return; }
+    if (de->metadata & MAD_DESC_TYPEDBUF) {
+        mad_sk_cat(t, cap, n, "T{");
+        mad_skin_where(e->q->device, de->gpu_va, t, cap, n, &r, &off);
+        mad_sk_cat(t, cap, n, "/%u e%u%s}", (unsigned)(de->metadata & 0xffffffffu), (unsigned)((de->metadata >> 32) & 0xff),
+                   de->texture_view_id ? "" : " NO-TEXTURE");
+    } else if (de->texture_view_id) { mad_sk_cat(t, cap, n, "tex"); return; }
+    else {
+        mad_skin_where(e->q->device, de->gpu_va, t, cap, n, &r, &off);
+        mad_sk_cat(t, cap, n, "/%u", (unsigned)(de->metadata & 0xffffffffu));
+    }
+    if (!r) return;
+    if (range_type == MADEIRA_IR_RANGE_UAV) { if (s->tab_cs) mad_skin_note_write(e, r, off); }
+    else mad_skin_in(s, r, off, de->metadata & 0xffffffffu);   /* a buffer view's byte size (a CBV's too) */
+}
+/* The converter (DXIL) path binds the root signature as it is: tables point
+ * into the descriptor heap, which the shader indexes itself. Every parameter
+ * the stage can see, and the first descriptors of each table range. */
+static void mad_skin_rs_tok(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root, const UINT32 (*consts)[64], unsigned vis_mask) {
+    static const char cls[4] = { 't', 'u', 'b', 's' };
+    struct mad_skinx *s = e->sk; struct mad_heap *h = e->srv;
+    unsigned i, j, k;
+    if (!rs) { int n0 = (int)s->ntok; mad_sk_cat(s->tok, sizeof s->tok, &n0, " no root signature"); s->ntok = (unsigned)n0; return; }
+    for (i = 0; i < rs->nparams && i < MAD_ROOT_PARAM_MAX; i++) {
+        const struct madeira_ir_root_param *pp = &rs->params[i];
+        char t[1024]; int n = 0;
+        if (pp->visibility < 32 && !((1u << pp->visibility) & vis_mask)) continue;
+        if (pp->type == MADEIRA_IR_PARAM_CONSTANTS)
+            mad_sk_cat(t, sizeof t, &n, " p%u:b%u%s=%x,%x,%x,%x", i, pp->shader_register, pp->register_space ? "s" : "",
+                       consts[i][0], consts[i][1], consts[i][2], consts[i][3]);
+        else if (pp->type != MADEIRA_IR_PARAM_TABLE) {
+            struct mad_resource *r = NULL; UINT64 off = 0;
+            mad_sk_cat(t, sizeof t, &n, " p%u:root-%s%u=", i, pp->type == MADEIRA_IR_PARAM_CBV ? "b" : pp->type == MADEIRA_IR_PARAM_SRV ? "t" : "u",
+                       pp->shader_register);
+            mad_skin_where(e->q->device, root[i], t, sizeof t, &n, &r, &off);
+            if (r && pp->type == MADEIRA_IR_PARAM_UAV) { if (s->tab_cs) mad_skin_note_write(e, r, off); }
+            else if (r) mad_skin_in(s, r, off, 0);   /* a root descriptor carries no size */
+        } else {
+            UINT64 base = root[i]; unsigned running = 0, tidx;
+            mad_sk_cat(t, sizeof t, &n, " p%u:{", i);
+            if (!base) { mad_sk_cat(t, sizeof t, &n, "unset}"); goto add; }
+            if (!h || !h->cpu || base < h->gpu_address || (base - h->gpu_address) % sizeof(struct mad_descriptor) ||
+                (base - h->gpu_address) / sizeof(struct mad_descriptor) >= h->count) {
+                mad_sk_cat(t, sizeof t, &n, "not in the bound heap}"); goto add;
+            }
+            tidx = (unsigned)((base - h->gpu_address) / sizeof(struct mad_descriptor));
+            mad_sk_cat(t, sizeof t, &n, "@%u", tidx);
+            for (j = 0; j < pp->num_ranges; j++) {
+                unsigned ri = pp->first_range + j, roff, cnt;
+                const struct madeira_ir_root_range *rr;
+                if (ri >= rs->nranges) break;
+                rr = &rs->ranges[ri];
+                roff = rr->table_offset == 0xffffffffu ? running : rr->table_offset;
+                if (rr->num_descriptors != ~0u) running = roff + rr->num_descriptors;
+                if (rr->range_type == MADEIRA_IR_RANGE_SAMPLER) continue;
+                cnt = rr->num_descriptors == ~0u ? 2 : rr->num_descriptors < 6 ? rr->num_descriptors : 6;
+                mad_sk_cat(t, sizeof t, &n, " %c%u", rr->range_type < 4 ? cls[rr->range_type] : '?', rr->base_register);
+                if (rr->register_space) mad_sk_cat(t, sizeof t, &n, "s%u", rr->register_space);
+                if (rr->num_descriptors == ~0u) mad_sk_cat(t, sizeof t, &n, "x*");
+                else if (rr->num_descriptors != 1) mad_sk_cat(t, sizeof t, &n, "x%u", rr->num_descriptors);
+                mad_sk_cat(t, sizeof t, &n, "=");
+                for (k = 0; k < cnt; k++) {
+                    unsigned idx = tidx + roff + k;
+                    if (k) mad_sk_cat(t, sizeof t, &n, ",");
+                    if (idx >= h->count) { mad_sk_cat(t, sizeof t, &n, "past-heap"); break; }
+                    mad_skin_desc(e, &h->cpu[idx], rr->range_type, t, sizeof t, &n);
+                }
+            }
+            mad_sk_cat(t, sizeof t, &n, "}");
+        }
+    add:
+        if (s->ntok + (unsigned)n + 1 < sizeof s->tok) { memcpy(s->tok + s->ntok, t, (size_t)n); s->ntok += (unsigned)n; s->tok[s->ntok] = 0; }
+        else if (s->ntok + 5 < sizeof s->tok && (!s->ntok || s->tok[s->ntok - 1] != '.')) { memcpy(s->tok + s->ntok, " ...", 5); s->ntok += 4; }
+    }
+}
+static int mad_skin_is_prod(UINT64 h) {
+    LONG i; int hit = 0;
+    AcquireSRWLockShared(&g_sk_lock);
+    for (i = 0; i < g_skin_nprod; i++) if (g_skin_prod[i] == h) { hit = 1; break; }
+    ReleaseSRWLockShared(&g_sk_lock);
+    return hit;
+}
+/* skin-dump's frames: the first window's first two -- one per upload heap of a
+ * game that alternates two (Horizon Zero Dawn: r#8 and r#11). */
+static int mad_skin_dump_frame(void) {
+    return g_skin_dump && g_skin_window == 1 && g_skin_frame - g_skin_win_first < 2;
+}
+/* skin-check-trace's frames: the first of the first two windows. */
+static int mad_skin_trace_frame(void) {
+    return g_skin_trace && g_skin_window <= 2 && g_skin_frame == g_skin_win_first;
+}
+/* 1 the first time key (a shader hash, or a resource serial and offset) comes up in this frame. */
+static int mad_skin_dump_once(UINT64 key) {
+    static struct { LONG frame; UINT64 key; } seen[64]; static unsigned n;
+    unsigned i; int fresh = 1;
+    AcquireSRWLockExclusive(&g_sk_lock);
+    for (i = 0; i < n && i < 64; i++) if (seen[i].frame == g_skin_frame && seen[i].key == key) { fresh = 0; break; }
+    if (fresh) { seen[n % 64].frame = g_skin_frame; seen[n % 64].key = key; n++; }
+    ReleaseSRWLockExclusive(&g_sk_lock);
+    return fresh;
+}
+static void mad_skin_begin(struct mad_exec *e) {
+    struct mad_skinx *s = calloc(1, sizeof *s);
+    if (!s) return;
+    s->list = g_list_seq;
+    e->sk = s;
+}
+static void mad_skin_end(struct mad_exec *e) { free(e->sk); e->sk = NULL; }
+/* After a dispatch was encoded (its tables built with tab_on set). */
+static void mad_skin_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
+    struct mad_skinx *s = e->sk; const struct mad_pso *p = e->cpso; const struct mad_rootsig *rs = e->crs;
+    char line[sizeof s->dl[0]]; int n = 0; unsigned i;
+    UINT64 h = p->cs_hash;
+    s->ndisp++;
+    if (c->kind == MC_DISPATCH_INDIRECT)
+        mad_sk_cat(line, sizeof line, &n, "[skin-check] f%ld L%u C%u cs=%016llx indirect tg=%ux%ux%u |%s", (long)g_skin_frame, s->list, s->ndisp,
+                   (unsigned long long)h, p->tg[0], p->tg[1], p->tg[2], s->tok);
+    else
+        mad_sk_cat(line, sizeof line, &n, "[skin-check] f%ld L%u C%u cs=%016llx %ux%ux%u tg=%ux%ux%u |%s", (long)g_skin_frame, s->list, s->ndisp,
+                   (unsigned long long)h, c->u.dispatch.x, c->u.dispatch.y, c->u.dispatch.z, p->tg[0], p->tg[1], p->tg[2], s->tok);
+    for (i = 0; rs && i < rs->nparams && i < MAD_ROOT_PARAM_MAX; i++)
+        if (rs->params[i].type == MADEIRA_IR_PARAM_CONSTANTS)
+            mad_sk_cat(line, sizeof line, &n, " c%u=%x,%x,%x,%x", rs->params[i].shader_register,
+                       e->cconsts[i][0], e->cconsts[i][1], e->cconsts[i][2], e->cconsts[i][3]);
+    if (s->ncs == 4) { memmove(s->cs, s->cs + 1, 3 * sizeof s->cs[0]); s->ncs = 3; }
+    s->cs[s->ncs++] = h;
+    if (g_skin_full > 0) mad_skin_line(line);
+    else {
+        if (s->ndl == 4) { memmove(s->dl[0], s->dl[1], 3 * sizeof s->dl[0]); s->ndl = 3; }
+        memcpy(s->dl[s->ndl++], line, (size_t)n + 1);
+    }
+    if (g_skin_cap_on && s->nin && mad_skin_is_prod(h)) {   /* after it ran: these split its compute encoder */
+        UINT dump = mad_skin_dump_frame() && mad_skin_dump_once(h);   /* skin-dump: this shader's first dispatch of the frame, whole */
+        for (i = 0; i < s->nin && InterlockedIncrement(&g_skin_caps_frame) <= 96; i++) {
+            char lab[120];
+            UINT len = !dump ? 256 : s->in[i].len < MAD_SK_DUMP_MAX ? s->in[i].len : MAD_SK_DUMP_MAX;
+            snprintf(lab, sizeof lab, "f%ld L%u C%u cs=%016llx input %u r#%u+%llu", (long)g_skin_frame, s->list, s->ndisp,
+                     (unsigned long long)h, i, s->in[i].r->serial, (unsigned long long)s->in[i].off);
+            mad_skin_capture(e, lab, s->in[i].r, s->in[i].off, len, 21, 0, dump);
+        }
+    }
+}
+/* The vertex stage's ranges of the draw mad_skin_draw just logged. */
+static void mad_skin_vs_line(struct mad_exec *e) {
+    struct mad_skinx *s = e->sk; char line[3200]; int n = 0;
+    mad_sk_cat(line, sizeof line, &n, "[skin-check] f%ld L%u D%u vertex stage |%s", (long)g_skin_frame, s->list, s->ndraw, s->tok);
+    mad_skin_line(line);
+}
+/* madeira-bcd skin-check-trace: one line per draw of a trace frame. A pipeline
+ * with an integer vertex input (blend indices: skinned in its vertex shader)
+ * also gets its vertex stage's bindings, copies of its CPU-written inputs
+ * (whole and dumped with skin-dump, once a frame each) and of its first 64
+ * vertices, and its vertex shader's bytecode; 32 such draws per run. */
+static void mad_skin_trace(struct mad_exec *e, const struct mad_cmd *c) {
+    const struct mad_pso *p = e->pso; struct mad_skinx *s = e->sk;
+    char line[960]; int n = 0; unsigned sl, i;
+    if (InterlockedIncrement(&g_skin_trace_n) > 4000) return;
+    s->ntrace++;
+    mad_sk_cat(line, sizeof line, &n, "[skin-trace] f%ld L%u T%u vs=%016llx ", (long)g_skin_frame, s->list, s->ntrace, (unsigned long long)p->vs_hash);
+    if (c->kind == MC_DRAW_INDEXED)
+        mad_sk_cat(line, sizeof line, &n, "%u indices from %u base %d inst %u from %u", c->u.drawi.icount, c->u.drawi.start,
+                   c->u.drawi.base, c->u.drawi.inst, c->u.drawi.istart);
+    else if (c->kind == MC_DRAW)
+        mad_sk_cat(line, sizeof line, &n, "%u vertices from %u inst %u from %u", c->u.draw.vcount, c->u.draw.vstart,
+                   c->u.draw.icount, c->u.draw.istart);
+    else mad_sk_cat(line, sizeof line, &n, "indirect");
+    for (sl = 0; sl < 16; sl++) {
+        const struct mad_resource *r = e->vb[sl].res;
+        if (r && ((p->vb_mask >> sl) & 1))
+            mad_sk_cat(line, sizeof line, &n, " s%u=r#%u+%llu st%u", sl, r->serial, (unsigned long long)e->vb[sl].off, e->vb[sl].stride);
+    }
+    if (p->il_tag) mad_sk_cat(line, sizeof line, &n, " | %s", p->il_tag);
+    d3d12_log("%s\n", line);
+    if (!p->il_int || InterlockedIncrement(&g_skin_trace_full) > 32) return;
+    s->ntok = 0; s->tok[0] = 0; s->nin = 0;
+    if (p->backend != MADEIRA_IR_BACKEND_AIRCONV)
+        mad_skin_rs_tok(e, e->rs, e->root, (const UINT32 (*)[64])e->consts,
+                        (1u << MADEIRA_IR_VIS_ALL) | (1u << MADEIRA_IR_VIS_VERTEX) | (1u << MADEIRA_IR_VIS_GEOMETRY));
+    {   /* in parts of 880 characters: a log record stops at 998 */
+        unsigned np = s->ntok ? (s->ntok + 879) / 880 : 1, k;
+        for (k = 0; k < np; k++)
+            d3d12_log("[skin-trace] f%ld L%u T%u vertex stage %u/%u |%.880s\n", (long)g_skin_frame, s->list, s->ntrace, k + 1, np,
+                      s->tok + (size_t)k * 880);
+    }
+    for (i = 0; g_skin_cap_on && i < s->nin; i++) {   /* its CPU-written inputs */
+        struct mad_resource *r = s->in[i].r; char lab[120]; UINT len;
+        if (!r->cpu || (r->heap != D3D12_HEAP_TYPE_UPLOAD && r->heap != D3D12_HEAP_TYPE_CUSTOM)) continue;
+        if (!mad_skin_dump_once(((UINT64)r->serial << 40) ^ s->in[i].off)) continue;
+        len = !g_skin_dump ? 256 : s->in[i].len < MAD_SK_DUMP_MAX ? s->in[i].len : MAD_SK_DUMP_MAX;
+        snprintf(lab, sizeof lab, "f%ld L%u T%u vs input %u r#%u+%llu", (long)g_skin_frame, s->list, s->ntrace, i, r->serial,
+                 (unsigned long long)s->in[i].off);
+        mad_skin_capture(e, lab, r, s->in[i].off, len, 21, 0, g_skin_dump != 0);
+    }
+    for (sl = 0; g_skin_cap_on && sl < 16; sl++) {   /* its first 64 vertices */
+        struct mad_resource *r = e->vb[sl].res; UINT st = e->vb[sl].stride; UINT64 off; char lab[120];
+        if (!r || !((p->vb_mask >> sl) & 1) || !st) continue;
+        off = e->vb[sl].off + (UINT64)st * (c->kind == MC_DRAW_INDEXED ? (c->u.drawi.base > 0 ? (UINT64)c->u.drawi.base : 0) :
+                                            c->kind == MC_DRAW ? c->u.draw.vstart : 0);
+        snprintf(lab, sizeof lab, "f%ld L%u T%u s%u r#%u+%llu st%u", (long)g_skin_frame, s->list, s->ntrace, sl, r->serial,
+                 (unsigned long long)off, st);
+        mad_skin_capture(e, lab, r, off, 64 * st, 20, st, g_skin_dump != 0);
+    }
+    mad_bc_dump("vs", p->vs_hash);
+    s->ntok = 0; s->tok[0] = 0; s->nin = 0;
+}
+static int mad_format_is_int(DXGI_FORMAT f) {
+    switch (f) {
+    case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32A32_SINT: case DXGI_FORMAT_R32G32B32_UINT: case DXGI_FORMAT_R32G32B32_SINT:
+    case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R16G16B16A16_SINT: case DXGI_FORMAT_R32G32_UINT: case DXGI_FORMAT_R32G32_SINT:
+    case DXGI_FORMAT_R10G10B10A2_UINT: case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R8G8B8A8_SINT: case DXGI_FORMAT_R16G16_UINT:
+    case DXGI_FORMAT_R16G16_SINT: case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R32_SINT: case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R8G8_SINT:
+    case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SINT: case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_R8_SINT:
+        return 1;
+    default: return 0;
+    }
+}
+/* skin-check-trace: the input layout in short ("NAME<index>:<DXGI format>@<slot>+<offset>",
+ * offset 65535 = appended, "/i<rate>" per instance), and whether an element is an integer. */
+static void mad_skin_layout(struct mad_pso *p, const D3D12_INPUT_LAYOUT_DESC *il) {
+    char t[320]; int n = 0; UINT i;
+    if (g_skin_trace <= 0 || !il || !il->NumElements || !il->pInputElementDescs) return;
+    for (i = 0; i < il->NumElements && i < 16; i++) {
+        const D3D12_INPUT_ELEMENT_DESC *el = &il->pInputElementDescs[i];
+        if (mad_format_is_int(el->Format)) p->il_int = 1;
+        mad_sk_cat(t, sizeof t, &n, "%s%s%u:%u@%u+%u", i ? " " : "", el->SemanticName ? el->SemanticName : "?", el->SemanticIndex,
+                   (unsigned)el->Format, el->InputSlot, el->AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT ? 0xffffu : el->AlignedByteOffset);
+        if (el->InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA) mad_sk_cat(t, sizeof t, &n, "/i%u", el->InstanceDataStepRate);
+    }
+    if (n > 0 && (p->il_tag = malloc((size_t)n + 1))) memcpy(p->il_tag, t, (size_t)n + 1);
+}
+/* Before a draw begins its render pass. Outside check frames it only notices
+ * the first draw of this kind. */
+static void mad_skin_draw(struct mad_exec *e, const struct mad_cmd *c) {
+    const struct mad_pso *p = e->pso; struct mad_skinx *s = e->sk;
+    unsigned mask = p->air_slot_mask | p->vb_mask, gpu = 0, sl, i;
+    char line[1400]; int n = 0; LONG nd; UINT64 wcs[16]; unsigned nw = 0;
+    if (s && mad_skin_trace_frame()) mad_skin_trace(e, c);   /* madeira-bcd skin-check-trace: every draw of the frame */
+    if (!mask) mask = 0xffffu;
+    for (sl = 0; sl < 16; sl++) {
+        const struct mad_resource *r = e->vb[sl].res;
+        if (((mask >> sl) & 1) && r && r->buffer && (r->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) gpu |= 1u << sl;
+    }
+    if (s) s->draw_gpu = 0;
+    if (!gpu) { if (s) s->ncs = s->ndl = 0; return; }
+    if (!g_skin_seen && !InterlockedExchange(&g_skin_seen, 1))
+        d3d12_log("[skin-check] first draw reading a GPU-written vertex buffer at present #%lld (list#%u, vs '%s' ps '%s'); "
+                  "the first window starts 60 presents later\n", (long long)g_presents_now, g_list_seq, p->vs_name, p->ps_name);
+    if (!s) return;
+    s->ndraw++;
+    InterlockedIncrement(&g_skin_draws);
+    nd = InterlockedIncrement(&g_skin_draws_frame);
+    if (nd > 64) { s->ncs = s->ndl = 0; return; }
+    s->draw_gpu = (s->ncs || nd <= 16) ? 2 : 1;   /* 2: its vertex-stage ranges are logged too */
+    for (i = 0; i < s->ndl; i++) mad_skin_line(s->dl[i]);
+    if (s->ncs) {   /* these compute shaders fed it: from now on their inputs are captured */
+        AcquireSRWLockExclusive(&g_sk_lock);
+        for (i = 0; i < s->ncs; i++) {
+            LONG k;
+            for (k = 0; k < g_skin_nprod && g_skin_prod[k] != s->cs[i]; k++) ;
+            if (k == g_skin_nprod && g_skin_nprod < 16) g_skin_prod[g_skin_nprod++] = s->cs[i];
+        }
+        ReleaseSRWLockExclusive(&g_sk_lock);
+    }
+    mad_sk_cat(line, sizeof line, &n, "[skin-check] f%ld L%u D%u vs=%016llx '%s' ps '%s' ", (long)g_skin_frame, s->list, s->ndraw,
+               (unsigned long long)p->vs_hash, p->vs_name, p->ps_name);
+    if (c->kind == MC_DRAW_INDEXED)
+        mad_sk_cat(line, sizeof line, &n, "%u indices from %u base %d inst %u", c->u.drawi.icount, c->u.drawi.start, c->u.drawi.base, c->u.drawi.inst);
+    else if (c->kind == MC_DRAW)
+        mad_sk_cat(line, sizeof line, &n, "%u vertices from %u inst %u", c->u.draw.vcount, c->u.draw.vstart, c->u.draw.icount);
+    else mad_sk_cat(line, sizeof line, &n, "indirect");
+    mad_sk_cat(line, sizeof line, &n, ", after %u dispatch(es)", s->ncs);
+    for (i = 0; i < s->ncs; i++) mad_sk_cat(line, sizeof line, &n, " %016llx", (unsigned long long)s->cs[i]);
+    mad_sk_cat(line, sizeof line, &n, " |");
+    for (sl = 0; sl < 16; sl++) {
+        const struct mad_resource *r = e->vb[sl].res;
+        if (((mask >> sl) & 1) && r)
+            mad_sk_cat(line, sizeof line, &n, " s%u=r#%u+%llu/%llu st%u%s", sl, r->serial, (unsigned long long)e->vb[sl].off,
+                       (unsigned long long)r->size, e->vb[sl].stride, ((gpu >> sl) & 1) ? "*" : "");
+        if ((gpu >> sl) & 1) {   /* the newest check-frame dispatch whose UAV starts at or before this stream */
+            unsigned q; const struct mad_skw *hit = NULL;
+            AcquireSRWLockShared(&g_sk_lock);
+            for (q = 0; q < 256 && q < g_skin_wn; q++) {
+                const struct mad_skw *w = &g_skin_w[(g_skin_wn - 1 - q) & 255];
+                if (w->frame == g_skin_frame && w->r == r && w->off <= e->vb[sl].off) { hit = w; break; }
+            }
+            if (hit) { wcs[nw] = hit->cs; mad_sk_cat(line, sizeof line, &n, " <-cs=%016llx L%u C%u +%llu", (unsigned long long)hit->cs,
+                                                     hit->list, hit->disp, (unsigned long long)hit->off); nw++; }
+            else mad_sk_cat(line, sizeof line, &n, " <-no dispatch this frame");
+            ReleaseSRWLockShared(&g_sk_lock);
+        }
+    }
+    mad_skin_line(line);
+    if (nw) {   /* writers in other lists: producers too */
+        AcquireSRWLockExclusive(&g_sk_lock);
+        for (i = 0; i < nw; i++) {
+            LONG k;
+            for (k = 0; k < g_skin_nprod && g_skin_prod[k] != wcs[i]; k++) ;
+            if (k == g_skin_nprod && g_skin_nprod < 16) g_skin_prod[g_skin_nprod++] = wcs[i];
+        }
+        ReleaseSRWLockExclusive(&g_sk_lock);
+        for (i = 0; i < nw; i++) mad_bc_dump("cs", wcs[i]);
+    }
+    for (sl = 0; g_skin_cap_on && sl < 16; sl++) {
+        struct mad_resource *r = e->vb[sl].res;
+        UINT st = e->vb[sl].stride, dump; UINT64 off = e->vb[sl].off, first = 0, len;
+        char lab[120];
+        if (!((gpu >> sl) & 1)) continue;
+        if (c->kind == MC_DRAW_INDEXED) first = c->u.drawi.base > 0 ? (UINT64)c->u.drawi.base : 0;
+        else if (c->kind == MC_DRAW) first = c->u.draw.vstart;
+        off += first * st;
+        if (off >= r->size) continue;
+        len = r->size - off;
+        dump = mad_skin_dump_frame() && mad_skin_dump_once(((UINT64)r->serial << 40) ^ off);   /* skin-dump: the stream once a frame, up to 256 KB */
+        if (dump) { if (len > MAD_SK_DUMP_MAX) len = MAD_SK_DUMP_MAX; }
+        else if (len > 32768) len = 32768;
+        if (st) len -= len % st;
+        if (!len) continue;
+        if (InterlockedIncrement(&g_skin_caps_frame) > 96) break;
+        snprintf(lab, sizeof lab, "f%ld L%u D%u s%u r#%u+%llu st%u", (long)g_skin_frame, s->list, s->ndraw, sl, r->serial,
+                 (unsigned long long)off, st);
+        mad_skin_capture(e, lab, r, off, (UINT)len, 20, st, dump);
+    }
+    if (g_skin_cap_on && c->kind == MC_DRAW_INDEXED && e->ib && e->ib->buffer && c->u.drawi.icount &&
+        InterlockedIncrement(&g_skin_caps_frame) <= 96) {   /* the draw's indices: kind 22, or 23 when one u16 precedes them */
+        UINT isz = e->ib_type == WMTIndexTypeUInt32 ? 4 : 2, tail;
+        UINT64 off = e->ib_off + (UINT64)c->u.drawi.start * isz, len = (UINT64)c->u.drawi.icount * isz, lead = off & 3;
+        char lab[120];
+        off -= lead; len += lead;
+        tail = (UINT)((4 - (len & 3)) & 3);   /* a u16 after the draw's last index, read to keep the copy 4-byte sized */
+        len += tail;
+        if (len > 98304) { len = 98304; tail = 0; }
+        snprintf(lab, sizeof lab, "f%ld L%u D%u ib r#%u+%llu u%u x%u base %d", (long)g_skin_frame, s->list, s->ndraw, e->ib->serial,
+                 (unsigned long long)(off + lead), isz * 8, c->u.drawi.icount, c->u.drawi.base);
+        mad_skin_capture(e, lab, e->ib, off, (UINT)len, lead ? 23 : 22, isz | (tail ? 16u : 0u), 0);
+    }
+    if (s->draw_gpu == 2 && p->backend != MADEIRA_IR_BACKEND_AIRCONV) {   /* the DXBC path logs its ranges as it builds them */
+        s->ntok = 0; s->tok[0] = 0; s->nin = 0;
+        mad_skin_rs_tok(e, e->rs, e->root, (const UINT32 (*)[64])e->consts,
+                        (1u << MADEIRA_IR_VIS_ALL) | (1u << MADEIRA_IR_VIS_VERTEX) | (1u << MADEIRA_IR_VIS_GEOMETRY));
+        mad_skin_vs_line(e);
+    }
+    for (i = 0; i < s->ncs; i++) mad_bc_dump("cs", s->cs[i]);
+    if (s->ncs) mad_bc_dump("vs", p->vs_hash);   /* the dump budget is 48 blobs: compute skinning's draws only */
+    s->ncs = s->ndl = 0;
+}
+/* At every Present. */
+static void mad_skin_present(UINT64 presents) {
+    static LONG left; static LONG64 next_at = -1, drop_at = -1;
+    InterlockedExchange(&g_skin_draws_frame, 0); InterlockedExchange(&g_skin_caps_frame, 0);
+    if (g_skin_full > 0) InterlockedDecrement(&g_skin_full);
+    if (drop_at >= 0 && !left && (LONG64)presents >= drop_at) { drop_at = -1; if (g_sk_n) mad_skin_flush(NULL); }
+    if (left > 0) {
+        if (--left == 0) {
+            InterlockedExchange(&g_skin_now, 0);
+            if (g_skin_trace_n || g_skin_cmp_n || g_skin_dumps)
+                d3d12_log("[skin-check] window %ld: %ld draws traced (%ld in full), %ld comparisons with the CPU's bytes, %ld copies dumped "
+                          "(%lld KB)\n", (long)g_skin_window, (long)g_skin_trace_n, (long)g_skin_trace_full, (long)g_skin_cmp_n,
+                          (long)g_skin_dumps, (long long)(g_skin_dump_bytes >> 10));
+            drop_at = (LONG64)presents + 120;
+            d3d12_log("[skin-check] window %ld ends at present #%llu: %ld draws read GPU-written streams so far, %ld captures "
+                      "(%ld not made: buffer or budget full), %ld compute shaders seen feeding them, bytecode kept %ld (%lu KB, %ld refused), "
+                      "%ld lines (%ld over the budget), %ld capture lines\n", (long)g_skin_window, (unsigned long long)presents, (long)g_skin_draws,
+                      (long)g_skin_caps, (long)g_skin_caps_skipped, (long)g_skin_nprod, (long)g_bc_n, (unsigned long)(g_bc_bytes >> 10),
+                      (long)g_bc_refused, (long)g_skin_lines, (long)g_skin_dropped, (long)g_skin_cap_lines);
+            if (g_view_census > 0) mad_vc_report();
+        } else InterlockedIncrement(&g_skin_frame);
+        return;
+    }
+    if (!g_skin_seen) return;
+    if (next_at < 0) next_at = (LONG64)presents + 60;
+    if ((LONG64)presents < next_at) return;
+    next_at = (LONG64)presents + g_skin_every;
+    left = g_skin_check;
+    InterlockedIncrement(&g_skin_window); InterlockedExchange(&g_skin_win_first, InterlockedIncrement(&g_skin_frame));
+    InterlockedExchange(&g_skin_win_lines, 0); InterlockedExchange(&g_skin_win_caps, 0);
+    InterlockedExchange(&g_skin_full, g_skin_lines < MAD_SKIN_LINE_BUDGET / 2 ? 2 : 0);
+    InterlockedExchange(&g_skin_now, 1);
+    d3d12_log("[skin-check] window %ld starts at present #%llu: frames f%ld..f%ld, %s\n", (long)g_skin_window, (unsigned long long)presents,
+              (long)g_skin_frame, (long)g_skin_frame + g_skin_check - 1,
+              g_skin_full ? "every dispatch logged in the first two" : "only the dispatches that feed such draws are logged");
+}
+
 static int mad_air_build_tables_ex_body(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
                                    const UINT32 (*consts)[64], const struct mad_pso *pso,
                                    UINT cb_bind, UINT arg_bind, UINT arg_qwords, UINT nair,
@@ -5218,6 +6016,7 @@ static int mad_air_build_tables_ex_body(struct mad_exec *e, const struct mad_roo
             if (vis_mask == ~0u || !mad_air_resolve(e, rs, root, consts, rg, ~0u, &de, &direct, &why2)) goto bad;
             InterlockedIncrement(&g_vis_fallback);
         }
+        if (e->sk && e->sk->tab_on) mad_skin_tok(e, rg, &de, direct);   /* madeira-bcd skin-check */
 
         if (g_dump_tables)   /* ml1106 */
             d3d12_log("[capture-draw]   %s%u space%u -> %s word %u: va=0x%llx view=%llu meta=0x%llx direct=0x%llx flags=%#x\n",
@@ -5941,6 +6740,7 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
         MAD_SKIP(e); return;
     }
     if (g_census_on) { exec_capture_draw(e, c); exec_desc_check(e, e->rs, e->root, e->pso->vs_name); }   /* ml910/ml913 */
+    if (g_skin_check > 0) mad_skin_draw(e, c);   /* madeira-bcd skin-check: before the pass, its captures are blits */
     if (!exec_begin_render(e)) { MAD_SKIP(e); return; }
     if (g_skip_ps_state && mad_skip_ps_match(e->pso)) { MAD_SKIP(e); return; }   /* madeira-bcd: diagnostic, off unless skip-ps is set */
     g_dump_tables = 0;
@@ -6080,8 +6880,10 @@ tess_go:
          * argument tables at its own reported indices. */
         obj_handle_t vcb = 0, varg = 0, pcb = 0, parg = 0, vbt = 0;
         UINT64 vcboff = 0, vargoff = 0, pcboff = 0, pargoff = 0, vbtoff = 0;
+        if (e->sk) { e->sk->tab_on = e->sk->draw_gpu == 2; e->sk->ntok = 0; e->sk->tok[0] = 0; e->sk->nin = 0; }   /* madeira-bcd skin-check */
         if (!mad_air_build_tables(e, e->rs, e->root, (const UINT32 (*)[64])e->consts,
-                                  e->pso, 0, &vcb, &vcboff, &varg, &vargoff)) { MAD_SKIP(e); return; }
+                                  e->pso, 0, &vcb, &vcboff, &varg, &vargoff)) { if (e->sk) e->sk->tab_on = 0; MAD_SKIP(e); return; }
+        if (e->sk && e->sk->tab_on) { e->sk->tab_on = 0; mad_skin_vs_line(e); }
         if ((e->pso->ps_fn || e->pso->lz_has_ps) &&   /* madeira-bcd pso-lazy-libs: lz_has_ps is set at creation, ps_fn by another thread's first draw */
             !mad_air_build_tables(e, e->rs, e->root, (const UINT32 (*)[64])e->consts,
                                   e->pso, 1, &pcb, &pcboff, &parg, &pargoff)) { MAD_SKIP(e); return; }
@@ -6458,6 +7260,135 @@ static UINT mad_aspect_bpp(const struct mad_resource *r, UINT plane) {
     mad_format_info(r->desc.Format, &bytes, &block);
     return block == 1 ? bytes : 0;
 }
+/* madeira-bcd vis-trace (madeira.cfg vis-trace = 1, diagnostic) and
+ * readback-far (madeira.cfg readback-far = 1, an experiment).
+ *
+ * Horizon Zero Dawn culls on the CPU: every frame it copies mips 2-5 of a
+ * 176x81 R32_FLOAT depth pyramid (linear metres, far = 4096) to a READBACK
+ * buffer and later tests its objects against what it reads there. In the 486
+ * recordings whole walls, trees and plants are missing for one frame every few
+ * seconds, at the moments the [rb-tex] census saw near depths in that readback.
+ *
+ * vis-trace logs one line per present (the HUD's frame number is the present
+ * number, so a frame of a screen recording finds its line): draws (depth-only
+ * passes, passes with 3+ targets), indices x instances, dispatches, pyramid
+ * copies, new typed views with an element offset and shadowed ones, and
+ * Queue::Wait calls with how many passed before the batch they wait for was
+ * committed (the race fence-strict closes); and, once the GPU has finished
+ * them, every value of the 22x10, 11x5 and 5x2 mips of the pyramid as the GPU
+ * wrote them, with the present they belong to (each mip can be checked against
+ * the next). A vanishing frame with fewer draws was culled by the game; with
+ * the same draws, the GPU lost them.
+ *
+ * readback-far: those copies are not made; their destination rows are filled
+ * with 4096 on the CPU when the copy is replayed, so nothing in the pyramid
+ * hides anything and the game's occlusion culling culls nothing. If walls and
+ * plants stop vanishing, the culling input is what goes wrong. Costs GPU time
+ * (everything is drawn). */
+static int g_vt_on = -1, g_rbf_on = -1;
+static volatile LONG g_vt_draws, g_vt_depth, g_vt_mrt, g_vt_disp, g_vt_pyr, g_vt_rbf;
+static volatile LONG g_vt_qw, g_vt_qw_fast, g_vt_qw_early;   /* Queue::Wait calls; on the fast path; of those, before the signalling batch was committed */
+static volatile LONG g_vt_disp_q[4], g_vt_copy_q[4];   /* dispatches and copies by queue type (direct, bundle, compute, copy) */
+static volatile LONG64 g_vt_idx, g_vt_presents;
+struct mad_vt_rb { struct mad_queue *q; UINT64 batch; const unsigned char *cpu; UINT32 row, w, h, level; LONG64 frame; int mslot; };
+#define MAD_VT_RB 16u
+static struct mad_vt_rb g_vt_rb[MAD_VT_RB]; static unsigned g_vt_rb_n;
+static SRWLOCK g_vt_lock = SRWLOCK_INIT;
+/* The GPU also copies every recorded mip into a buffer of ours (Metal's own
+ * memory; the game's readback heap may sit on the file-backed swap tier), so
+ * the print can compare what the game's memory holds with what the GPU wrote.
+ * 64 slots of up to 256 values; a slot is reused after 64 recorded mips (about
+ * 21 presents of HZD's three), long after its batch was printed. */
+#define MAD_VT_MSLOTS 64u
+#define MAD_VT_MSLOT_BYTES 1024u
+static obj_handle_t g_vt_mbuf; static unsigned char *g_vt_mcpu; static unsigned g_vt_mnext;
+static struct { struct mad_queue *q; UINT64 batch; LONG64 frame; UINT32 level, w, h; } g_vt_mmeta[MAD_VT_MSLOTS];
+static volatile LONG g_vt_chk[4];   /* compared: equal, overwritten by a later readback, an earlier readback (stale), neither */
+/* Has the GPU finished batch `batch` of q? (done: the device's completed serial) */
+static int mad_vt_done(struct mad_queue *q, UINT64 batch, UINT64 done) {
+    UINT64 serial, nb;
+    if (!q) return 0;
+    nb = __atomic_load_n(&q->batches, __ATOMIC_ACQUIRE);
+    if (nb < batch) return 0;   /* still open */
+    serial = nb - batch < 64 ? q->batch_serial[batch & 63] : q->last_serial;
+    return !serial || serial <= done;
+}
+static void mad_vt_load(void) {
+    if (g_vt_on >= 0) return;
+    g_rbf_on = mad_cfg_int_pe("readback-far", 0) ? 1 : 0;   /* experiment: the CPU-culling depth readback (R32_FLOAT mip >= 1 of a 4+-mip texture, at most 64x64) is filled with 4096 instead of copied: the game culls nothing */
+    if (g_rbf_on)
+        d3d12_log("[vis-trace] madeira-bcd readback-far = 1 (EXPERIMENT): depth-pyramid readbacks are filled with 4096, so the game's "
+                  "occlusion culling culls nothing\n");
+    MemoryBarrier();
+    g_vt_on = mad_cfg_int_pe("vis-trace", 0) ? 1 : 0;   /* diagnostic: per present, draws / dispatches / indices, and the depth-pyramid readback the game culls with as the GPU wrote it */
+    if (g_vt_on)
+        d3d12_log("[vis-trace] madeira-bcd DIAGNOSTIC vis-trace = 1: one line per present (draws, dispatches, pyramid readbacks)\n");
+}
+static void mad_vt_draw(const struct mad_exec *e, const struct mad_cmd *c) {
+    UINT64 n;
+    InterlockedIncrement(&g_vt_draws);
+    if (e->renc && !e->enc_nrt && e->enc_depth) InterlockedIncrement(&g_vt_depth);
+    else if (e->renc && e->enc_nrt >= 3) InterlockedIncrement(&g_vt_mrt);
+    n = c->kind == MC_DRAW_INDEXED ? (UINT64)c->u.drawi.icount * (c->u.drawi.inst ? c->u.drawi.inst : 1)
+                                   : (UINT64)c->u.draw.vcount * (c->u.draw.icount ? c->u.draw.icount : 1);
+    InterlockedExchangeAdd64(&g_vt_idx, (LONG64)n);
+}
+/* A texture-to-buffer copy about to be replayed: a depth-pyramid readback?
+ * Returns 1 when readback-far handled it (no GPU copy). */
+static int mad_vt_copy(struct mad_exec *e, const struct mad_cmd *c) {
+    const struct mad_resource *t = c->u.bt.tex, *b = c->u.bt.buf;
+    unsigned char *cpu;
+    UINT x, y;
+    if (!t || !b || !b->cpu || t->tex_pf != WMTPixelFormatR32Float || c->u.bt.level < 1 || t->tex_mips < 4 ||
+        !c->u.bt.w || !c->u.bt.h || c->u.bt.w > 64 || c->u.bt.h > 64 || c->u.bt.d != 1 || c->u.bt.row < c->u.bt.w * 4u)
+        return 0;
+    if (c->u.bt.off + (UINT64)c->u.bt.row * (c->u.bt.h - 1) + (UINT64)c->u.bt.w * 4 > b->size) return 0;
+    cpu = (unsigned char *)b->cpu + c->u.bt.off;
+    InterlockedIncrement(&g_vt_pyr);
+    if (g_rbf_on > 0) {
+        for (y = 0; y < c->u.bt.h; y++)
+            for (x = 0; x < c->u.bt.w; x++) ((float *)(cpu + (size_t)y * c->u.bt.row))[x] = 4096.0f;
+        InterlockedIncrement(&g_vt_rbf);
+        return 1;
+    }
+    if (g_vt_on > 0 && c->u.bt.w * c->u.bt.h <= 256) {   /* the 22x10, 11x5 and 5x2 mips */
+        struct mad_vt_rb *r;
+        int ms = -1;
+        AcquireSRWLockExclusive(&g_vt_lock);
+        if (!g_vt_mbuf) {   /* once: 64 KB of Metal's own memory */
+            struct WMTBufferInfo bi;
+            obj_handle_t nb;
+            memset(&bi, 0, sizeof bi);
+            bi.length = MAD_VT_MSLOTS * MAD_VT_MSLOT_BYTES; bi.options = WMTResourceStorageModeShared; bi.memory.ptr = NULL;
+            nb = MTLDevice_newBuffer(e->q->device->mtl_device, &bi);
+            if (nb && bi.memory.ptr) { mad_resident(e->q->device, nb); g_vt_mcpu = (unsigned char *)bi.memory.ptr; g_vt_mbuf = nb; }
+            else if (nb) NSObject_release(nb);
+        }
+        if (g_vt_mbuf && t->texture) {
+            ms = (int)(g_vt_mnext++ % MAD_VT_MSLOTS);
+            g_vt_mmeta[ms].q = e->q; g_vt_mmeta[ms].batch = e->q->batches + 1; g_vt_mmeta[ms].frame = g_vt_presents + 1;
+            g_vt_mmeta[ms].level = c->u.bt.level; g_vt_mmeta[ms].w = c->u.bt.w; g_vt_mmeta[ms].h = c->u.bt.h;
+        }
+        if (g_vt_rb_n == MAD_VT_RB) { memmove(&g_vt_rb[0], &g_vt_rb[1], (MAD_VT_RB - 1) * sizeof g_vt_rb[0]); g_vt_rb_n--; }
+        r = &g_vt_rb[g_vt_rb_n++];
+        r->q = e->q; r->batch = e->q->batches + 1; r->cpu = cpu;   /* the open batch; submit_lock is held */
+        r->row = c->u.bt.row; r->w = c->u.bt.w; r->h = c->u.bt.h; r->level = c->u.bt.level; r->frame = g_vt_presents + 1; r->mslot = ms;
+        ReleaseSRWLockExclusive(&g_vt_lock);
+        if (ms >= 0) {   /* the GPU's own copy, in the same blit pass as the game's */
+            struct wmtcmd_blit_copy_from_texture_to_buffer k;
+            memset(&k, 0, sizeof k);
+            k.type = WMTBlitCommandCopyFromTextureToBuffer;
+            k.src = t->texture; k.slice = c->u.bt.slice; k.level = c->u.bt.level;
+            k.origin.x = c->u.bt.x; k.origin.y = c->u.bt.y; k.origin.z = c->u.bt.z;
+            k.size.width = c->u.bt.w; k.size.height = c->u.bt.h; k.size.depth = 1;
+            k.dst = g_vt_mbuf; k.offset = (UINT64)ms * MAD_VT_MSLOT_BYTES;
+            k.bytes_per_row = c->u.bt.w * 4u; k.bytes_per_image = c->u.bt.w * 4u * c->u.bt.h;
+            k.options = mad_aspect_opt(t, c->u.bt.plane);
+            MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
+        }
+    }
+    return 0;
+}
 static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
     const struct mad_resource *s = c->u.tt.src, *d = c->u.tt.dst;
     struct mad_device *dev = e->q->device;
@@ -6595,6 +7526,7 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     case MC_COPY_T2B: {
         struct wmtcmd_blit_copy_from_texture_to_buffer k;
         if (!c->u.bt.tex->texture || !c->u.bt.buf->buffer) { MAD_SKIP(e); return; }
+        if ((g_vt_on > 0 || g_rbf_on > 0) && mad_vt_copy(e, c)) return;   /* madeira-bcd vis-trace / readback-far */
         memset(&k, 0, sizeof k);
         k.type = WMTBlitCommandCopyFromTextureToBuffer;
         k.src = c->u.bt.tex->texture; k.slice = c->u.bt.slice; k.level = c->u.bt.level;
@@ -6965,12 +7897,16 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
      * its own at fixed Metal indices, not the converter's top-level layout.
      * Build those instead; a range that cannot be resolved fails the dispatch
      * with a named reason rather than running against a half-filled table. */
+    if (e->sk) { e->sk->tab_on = 0; e->sk->ntok = 0; e->sk->tok[0] = 0; e->sk->nin = 0; }   /* madeira-bcd skin-check */
     if (e->cpso->backend == MADEIRA_IR_BACKEND_AIRCONV) {
         static unsigned said_air_disp;
+        if (e->sk) e->sk->tab_on = e->sk->tab_cs = 1;
         if (!mad_air_build_tables(e, e->crs, e->croot, (const UINT32 (*)[64])e->cconsts,
                                   e->cpso, 0, &air_cb, &air_cboff, &air_arg, &air_argoff)) {
+            if (e->sk) e->sk->tab_on = e->sk->tab_cs = 0;
             MAD_SKIP(e); return;
         }
+        if (e->sk) e->sk->tab_on = e->sk->tab_cs = 0;
         if (said_air_disp++ < 8)
             d3d12_log("[madeira-d3d12] ml1008 dispatching '%s' through the sm5 tables "
                       "(cb@%u arg@%u, %u qwords, %u ranges)\n", e->cpso->vs_name,
@@ -6979,6 +7915,11 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
         if (!exec_arg_slot_for(e, e->crs, e->croot, (const UINT32 (*)[64])e->cconsts, &argbuf, &argoff,
                                e->cpso->has_root_off ? e->cpso->root_off : NULL, e->cpso)) { MAD_SKIP(e); return; }
         if (g_census_on) exec_desc_check(e, e->crs, e->croot, e->cpso->vs_name);   /* ml913 */
+        if (e->sk) {   /* madeira-bcd skin-check: the converter reads the root signature as bound */
+            e->sk->tab_cs = 1;
+            mad_skin_rs_tok(e, e->crs, e->croot, (const UINT32 (*)[64])e->cconsts, ~0u);
+            e->sk->tab_cs = 0;
+        }
     }
 
     if (((g_list_seq >= 12000 && g_list_seq < 12400) || g_census_on) && g_dump_draws < 40000) {   /* ml893 census + ml898 in-game window */
@@ -7056,6 +7997,7 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
         snprintf(lab, sizeof lab, "K9 OUT after '%s' %s at (100,100)", e->cpso->vs_name, r->name);
         exec_capture_region(e, lab, r, 0, 0, 100, 100, 4, 4, 0);
     }
+    if (e->sk) mad_skin_dispatch(e, c);   /* madeira-bcd skin-check */
 }
 
 /* madeira-bcd: indirect-fast (madeira.cfg indirect-fast = 1, opt-in). An
@@ -7256,6 +8198,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     e.vis_prev = ~(UINT64)0;   /* ml1088 */
     l->ring_q = q; l->ring_batch = q->batches + 1;   /* ml1061: the batch this replay belongs to */
     e.topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    if (g_skin_now) mad_skin_begin(&e);   /* madeira-bcd skin-check */
     for (i = 0; i < l->ncmds; i++) {
         const struct mad_cmd *c = &l->cmds[i];
         e.cur = i;   /* ml1137 */
@@ -7342,7 +8285,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         case MC_QUERY_BEGIN: exec_query_begin(&e, c); break;     /* ml1088 */
         case MC_QUERY_END: exec_query_end(&e, c); break;
         case MC_QUERY_RESOLVE: exec_query_resolve(&e, c); break;
-        case MC_DRAW: case MC_DRAW_INDEXED: exec_draw(&e, c); break;
+        case MC_DRAW: case MC_DRAW_INDEXED: exec_draw(&e, c); if (g_vt_on > 0) mad_vt_draw(&e, c); break;   /* madeira-bcd vis-trace */
         case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT: case MC_DISPATCH_INDIRECT: {
             struct mad_cmd t = *c; UINT k;
             if (!c->u.ind.args || !c->u.ind.args->buffer) { e.skipped++; break; }
@@ -7362,9 +8305,11 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             if (g_sd_state > 0 && g_ic_frames) mad_ic_note(&e, c);   /* madeira-bcd: ind-count */
             break;
         }
-        case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_FILL_BB: case MC_FILL_TEX: exec_copy(&e, c); break;
+        case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_FILL_BB: case MC_FILL_TEX: exec_copy(&e, c);
+            if (g_vt_on > 0) InterlockedIncrement(&g_vt_copy_q[q->type & 3]);   /* madeira-bcd vis-trace */
+            break;
         case MC_BLEND_FACTOR: memcpy(e.blend, c->u.blend.rgba, sizeof e.blend); e.has_blend = 1; break;
-        case MC_DISPATCH: exec_dispatch(&e, c); break;
+        case MC_DISPATCH: exec_dispatch(&e, c); if (g_vt_on > 0) { InterlockedIncrement(&g_vt_disp); InterlockedIncrement(&g_vt_disp_q[q->type & 3]); } break;   /* madeira-bcd vis-trace */
         case MC_RESOLVE: exec_resolve(&e, c); break;
         }
         if (rs) {   /* madeira-bcd: replay split, summed per list */
@@ -7445,6 +8390,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     }
     /* madeira-bcd ring-share: the chunks this replay wrote belong to the open batch now;
      * mad_queue_flush retires them with its serial, and the list keeps none. */
+    if (e.sk) mad_skin_end(&e);   /* madeira-bcd skin-check */
     if (l->nrings && q->device->gpu_event && mad_ring_share_on()) mad_ring_park(q, l);
 }
 
@@ -7544,6 +8490,8 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(ID3D12CommandQueue *This
     QueryPerformanceCounter(&t0);   /* ml1119: caller-thread time in here */
     InterlockedIncrement(&g_perf_ecl);   /* ml1109 */
     mad_xp_role('E'); InterlockedIncrement64(&g_xp.ecl_calls);   /* ml1128 */
+    mad_tvs_refresh();   /* madeira-bcd typed-view-shadow: the game wrote this submission's UPLOAD data by now */
+    if (g_vt_on < 0) mad_vt_load();   /* madeira-bcd vis-trace / readback-far */
     if (g_sd_state > 0 && g_qtrace) mad_qtrace("ExecuteCommandLists", q, NULL, 0, count);   /* madeira-bcd */
     if (q && q->sub_thread) {   /* ml1120: validate here, replay on the worker */
         struct mad_subjob *j = calloc(1, sizeof *j + (count ? count : 1) * sizeof(struct mad_list *));
@@ -7805,7 +8753,8 @@ static void mad_queue_flush(struct mad_queue *q) {
         if (q->nring_parked) mad_ring_unpark(q, serial);   /* madeira-bcd ring-share */
     }
     q->pending[q->npending++] = q->open_cb;      /* the reference taken at open moves here */
-    q->open_cb = 0; q->open_lists = 0; q->batches++;
+    q->open_cb = 0; q->open_lists = 0;
+    __atomic_store_n(&q->batches, q->batches + 1, __ATOMIC_RELEASE);   /* madeira-bcd: after batch_serial, for readers without submit_lock (ARM64 reorders stores) */
     if (q->batches <= 3 || (q->batches % 500) == 0)
         d3d12_log("[madeira-d3d12] batch #%llu committed (%llu lists so far)\n",
                   (unsigned long long)q->batches, (unsigned long long)q->executed);
@@ -7832,9 +8781,12 @@ static void mad_list_rings_rewind(struct mad_list *l) {
     struct mad_queue *q = l->ring_q;
     l->ring_used = 0;
     if (!q || !l->nrings || !q->device || !q->device->gpu_event) return;   /* never replayed, or no GPU timeline */
-    if (l->ring_batch > q->batches) mad_queue_flush(q);                     /* its batch is still open: commit it so it HAS a serial */
+    if (l->ring_batch > __atomic_load_n(&q->batches, __ATOMIC_ACQUIRE)) mad_queue_flush(q);   /* its batch is still open: commit it so it HAS a serial */
     {
-        UINT64 serial = (q->batches - l->ring_batch < 64) ? q->batch_serial[l->ring_batch & 63] : q->last_serial;
+        /* madeira-bcd: an acquire load, so batch_serial is read after the count it
+         * goes with (another thread's flush stores the serial, then the count). */
+        UINT64 nb = __atomic_load_n(&q->batches, __ATOMIC_ACQUIRE);
+        UINT64 serial = (nb - l->ring_batch < 64) ? q->batch_serial[l->ring_batch & 63] : q->last_serial;
         if (!serial) serial = q->last_serial;
         if (serial && mad_gpu_completed(q->device) < serial) mad_ring_retire(q->device, l, serial);
         else if (mad_ring_share_on()) mad_ring_pool_put(q->device, l);   /* madeira-bcd: ring-share */
@@ -7914,7 +8866,7 @@ static int mad_signal_async(struct mad_queue *q, ID3D12Fence *fence, UINT64 valu
     struct mad_device *d = q->device;
     struct mad_fence_job *job;
     int ok = 0;
-    if (!d->gpu_event || d->ncap) return 0;   /* no timeline, or a capture wants its readback synchronously */
+    if (!d->gpu_event || d->ncap || g_sk_n) return 0;   /* no timeline, or a capture wants its readback synchronously (madeira-bcd: skin-check's too) */
     if (g_fence_strict >= 2) return 0;        /* madeira-bcd: fence-strict 2, synchronous and draining */
     EnterCriticalSection(&q->submit_lock);   /* lock order everywhere: submit_lock, THEN fence_lock (as in flush) */
     EnterCriticalSection(&d->fence_lock);
@@ -7959,6 +8911,18 @@ static HRESULT STDMETHODCALLTYPE queue_Wait(ID3D12CommandQueue *This, ID3D12Fenc
      * signal that has not been submitted yet still needs the CPU-side wait. */
     if (g_sd_state < 0) mad_sync_diag_load();   /* madeira-bcd */
     if (g_sd_state > 0 && g_qtrace) mad_qtrace("Wait", (struct mad_queue *)This, f, value, 0);
+    if (g_vt_on > 0) {   /* madeira-bcd vis-trace: how often a wait passes before the work it waits for is committed */
+        InterlockedIncrement(&g_vt_qw);
+        if ((UINT64)__atomic_load_n(&f->submitted, __ATOMIC_ACQUIRE) >= value) {
+            struct mad_queue *sq = f->sig_q;
+            InterlockedIncrement(&g_vt_qw_fast);
+            /* early: the newest Signal is the awaited one, and its queue has not
+             * committed the batch it covers (the flush above commits any batch
+             * that was open, so this is another thread's work in flight) */
+            if (sq && (UINT64)f->sig_value == value && __atomic_load_n(&sq->batches, __ATOMIC_ACQUIRE) < (UINT64)f->sig_batch && f->value < value)
+                InterlockedIncrement(&g_vt_qw_early);
+        }
+    }
     if ((UINT64)f->submitted >= value) {
         /* madeira-bcd: fence-strict. "submitted" is set by queue_Signal BEFORE
          * its batch is committed (mad_signal_run flushes after), so a Wait on
@@ -7995,6 +8959,11 @@ static HRESULT STDMETHODCALLTYPE queue_Signal(ID3D12CommandQueue *This, ID3D12Fe
     struct mad_queue *q = (struct mad_queue *)This;
     if (!fence) return E_INVALIDARG;
     if (g_sd_state > 0 && g_qtrace) mad_qtrace("Signal", q, (const struct mad_fence *)fence, value, 0);   /* madeira-bcd */
+    if (g_vt_on > 0) {   /* madeira-bcd vis-trace: the batch a Queue::Wait for this value needs committed (published by the exchange below) */
+        struct mad_fence *sf = (struct mad_fence *)fence;
+        sf->sig_batch = (LONG64)(__atomic_load_n(&q->batches, __ATOMIC_ACQUIRE) + (q->open_cb ? 1 : 0));
+        sf->sig_q = q; sf->sig_value = (LONG64)value;
+    }
     {   /* ml1061 */
         struct mad_fence *sf = (struct mad_fence *)fence; LONG64 cur;
         do { cur = sf->submitted; } while ((UINT64)cur < value && InterlockedCompareExchange64(&sf->submitted, (LONG64)value, cur) != cur);
@@ -8035,6 +9004,7 @@ static HRESULT mad_signal_run(struct mad_queue *q, ID3D12Fence *fence, UINT64 va
         if (g_upload_guard) mad_ug_verify(q->device, mad_gpu_completed(q->device));
     }
     mad_capture_flush(q->device);   /* ml910 */
+    if (g_sk_n) mad_skin_flush(q);   /* madeira-bcd skin-check: this queue's captures are complete */
     return ID3D12Fence_Signal(fence, value);
 }
 
@@ -8368,6 +9338,32 @@ static BOOL mad_tile_based_answer(void) {
     return v ? TRUE : FALSE;
 }
 
+/* madeira-bcd: OPTIONS1.WaveOps; madeira.cfg d3d12-wave-ops = 0 reports FALSE,
+ * so an engine with a fallback picks shaders without wave intrinsics (an A/B
+ * for the converter's wave code). Horizon Zero Dawn reads OPTIONS1; when
+ * vkd3d-proton first reported wave ops, its skinned meshes broke until
+ * dxil-spirv's control-flow fix (vkd3d-proton 74a654e, 0749f46). */
+static BOOL mad_wave_ops_answer(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = mad_cfg_int_pe("d3d12-wave-ops", 1) ? 1 : 0;   /* 0: WaveOps FALSE */
+        if (!v) d3d12_log("[d3d12-caps] wave-ops=0 (d3d12-wave-ops): OPTIONS1 reports WaveOps FALSE\n");
+    }
+    return v ? TRUE : FALSE;
+}
+
+/* madeira-bcd: OPTIONS.ResourceBindingTier; madeira.cfg d3d12-binding-tier = 3
+ * reports tier 3, as Apple's D3DMetal and vkd3d-proton do (an A/B: an engine
+ * can take another binding path for it). Anything else keeps tier 2. */
+static D3D12_RESOURCE_BINDING_TIER mad_binding_tier_answer(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = mad_cfg_int_pe("d3d12-binding-tier", 2) == 3 ? 3 : 2;   /* 3: tier 3 */
+        if (v == 3) d3d12_log("[d3d12-caps] binding-tier=3 (d3d12-binding-tier): OPTIONS reports ResourceBindingTier 3\n");
+    }
+    return v == 3 ? D3D12_RESOURCE_BINDING_TIER_3 : D3D12_RESOURCE_BINDING_TIER_2;
+}
+
 static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
         D3D12_FEATURE feature, void *data, UINT size) {
     (void)This;
@@ -8377,7 +9373,7 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
         D3D12_FEATURE_DATA_D3D12_OPTIONS *o = data;
         if (size < sizeof *o) return E_INVALIDARG;
         memset(o, 0, sizeof *o);
-        o->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_2;
+        o->ResourceBindingTier = mad_binding_tier_answer();   /* madeira-bcd: tier 2 unless d3d12-binding-tier = 3 */
         o->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_2;   /* heaps here are descriptions; any mix is fine */
         o->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation = TRUE;
         /* ml1970: FORMAT_SUPPORT below already reports UAV_TYPED_LOAD for every
@@ -8475,7 +9471,7 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
         D3D12_FEATURE_DATA_D3D12_OPTIONS1 *o = data;
         if (size < sizeof *o) return E_INVALIDARG;
         memset(o, 0, sizeof *o);
-        o->WaveOps = TRUE;
+        o->WaveOps = mad_wave_ops_answer();   /* madeira-bcd: TRUE unless d3d12-wave-ops = 0 */
         o->WaveLaneCountMin = 32;
         o->WaveLaneCountMax = 32;
         o->TotalLaneCount = 4096;
@@ -9137,26 +10133,395 @@ static int mad_typed_uav_atomic(void) {
     }
     return on;
 }
+/* madeira-bcd typed-view-align (madeira.cfg typed-view-align = 16 or 256,
+ * opt-in; unset or anything else = 64, as before). A typed-buffer view is a
+ * Metal texture buffer over its buffer that starts at an aligned offset; the
+ * descriptor's metadata says how many elements lie between that start and the
+ * view's first element (bits 32-39, the 8 bits the converter reads), and the
+ * converted shader adds them to every access. This runtime has always aligned
+ * the start to 64 bytes. Apple's converter header describes texture buffer
+ * views aligned to 16 bytes, that offset being "the padding necessary to
+ * achieve this alignment": Horizon Zero Dawn's float4 bone palettes sit one
+ * element in here and at element 0 in Apple's runtime. With the switch the
+ * start is aligned to N bytes, never below what Metal reports for the pixel
+ * format (minimumLinearTextureAlignmentForPixelFormat, asked once per format
+ * and logged; view-census asks and logs it without changing anything), and a
+ * view Metal refuses at that alignment is made at 64 as before.
+ *
+ * Build 485 (Horizon Zero Dawn, 2026-10-10 09:35): 16 brought the characters
+ * back, so the converted shaders do not apply a float4 view's element offset.
+ * Views of 1-, 2- and 4-byte elements still get offsets of 1-3 elements at 16:
+ * a 1228-byte R32 view two compute passes read every frame started 4 bytes
+ * past a 16-byte boundary in some frames and on one in others, and plants and
+ * lighting flicker. typed-view-align = 4 starts every texture exactly at its
+ * view's first element (no element offset at all), below the 16 bytes Metal
+ * documents. Before the first view a probe (mad_texbuf_probe in
+ * mad_kernels.metal) reads texture buffers made at +4 and +20 (R32), +2 (R16)
+ * and +1 (R8) over the bytes 0, 1, 2, ...; element sizes whose reads come back
+ * right start exactly, the others at a 16-byte boundary as with 16. */
+static int g_tv_align = -1;
+static int g_tv_exact = -1;   /* typed-view-align = 4, the probe's result: -1 not run; bit 0: 4-byte and wider elements, bit 1: 2-byte, bit 2: 1-byte */
+static SRWLOCK g_tv_probe_lock = SRWLOCK_INIT;
+static UINT16 g_tv_floor[1024];   /* Metal's minimum per pixel format; 0 = not asked yet */
+static volatile LONG g_tv_said, g_tv_fallback, g_tv_eoff_views, g_tv_exact_views;
+static volatile LONG g_tv_eoff_pf[1024];   /* views made with a nonzero element offset, by pixel format (view-census) */
+/* madeira-bcd typed-view-shadow (see mad_tvs_view) */
+#define MAD_TVS_CHUNK (4u << 20)
+#define MAD_TVS_MAX_VIEW (64u << 10)
+#define MAD_TVS_MAX_BYTES (64u << 20)
+#define MAD_TVS_MAX_N 16384u
+#define MAD_TVS_ALL_BYTES (2u << 20)   /* up to this much in all, every copy is compared at every ExecuteCommandLists */
+struct mad_tvs { struct mad_resource *r; const unsigned char *src; unsigned char *dst; UINT32 len; volatile LONG64 seen; };   /* seen: the present its view was last made or looked up */
+static struct mad_tvs **g_tvs; static unsigned g_tvs_n, g_tvs_cap;
+static SRWLOCK g_tvs_lock = SRWLOCK_INIT;
+static obj_handle_t g_tvs_buf; static unsigned char *g_tvs_cpu; static UINT64 g_tvs_gpu; static UINT32 g_tvs_used;
+static volatile LONG64 g_tvs_bytes;
+static volatile LONG g_tvs_views, g_tvs_copies, g_tvs_other, g_tvs_full;
+static int g_tvs_on = -1;
+static int mad_tv_mode(void) {
+    if (g_tv_align < 0) {
+        long long v = mad_cfg_int_pe("typed-view-align", 0);   /* fix: texture-buffer views start at their first element (4, probed) or at a 16- or 256-byte boundary, instead of 64 */
+        int a = v == 4 || v == 16 || v == 256 ? (int)v : 64;
+        if (a == 4)
+            d3d12_log("[typed-view] madeira-bcd typed-view-align = 4: typed-buffer views start exactly at their first element where "
+                      "a probe shows Metal reads such textures right, else at a 16-byte boundary\n");
+        else if (a != 64)
+            d3d12_log("[typed-view] madeira-bcd typed-view-align = %d: typed-buffer views start at a %d-byte boundary, never below "
+                      "Metal's minimum for the format, instead of 64\n", a, a);
+        g_tv_align = a;
+    }
+    return g_tv_align;
+}
+/* typed-view-align = 4: four texture buffers off a 16-byte boundary, read on
+ * the GPU once; returns the g_tv_exact bits. A texture Metal refuses is made
+ * at offset 0 instead so the kernel still runs, and its element size fails. */
+static int mad_tv_probe(struct mad_device *d) {
+    static const struct { enum WMTPixelFormat pf; UINT off, bytes; } t[4] = {
+        { WMTPixelFormatR32Uint, 4, 4 }, { WMTPixelFormatR32Uint, 20, 4 }, { WMTPixelFormatR16Uint, 2, 2 }, { WMTPixelFormatR8Uint, 1, 1 } };
+    struct WMTComputePipelineInfo ci; struct WMTBufferInfo bs, bd; struct WMTTextureInfo ti;
+    struct wmtcmd_compute_setpso sp; struct wmtcmd_compute_settexture st[4]; struct wmtcmd_compute_setbuffer sb;
+    struct wmtcmd_compute_dispatch dsp;
+    obj_handle_t fn = 0, pso = 0, err = 0, src = 0, dst = 0, tex[4] = { 0 }, cb = 0, enc = 0, pool;
+    const UINT32 *o; int mask = 0, made = 0, ran = 0, i, n = 0;
+    char what[96];
+    d3d12_log("[typed-view] typed-view-align = 4: probing texture buffers that start off a 16-byte boundary\n");
+    if (!mad_kernels_ready(d) || !d->k_lib || !(fn = MTLLibrary_newFunction(d->k_lib, "mad_texbuf_probe"))) {
+        d3d12_log("[typed-view] probe: no helper kernel in this build; views start at a 16-byte boundary\n");
+        return 0;
+    }
+    pool = NSAutoreleasePool_alloc_init();
+    memset(&ci, 0, sizeof ci); ci.compute_function = fn;
+    pso = MTLDevice_newComputePipelineState(d->mtl_device, &ci, &err);
+    if (err) mad_log_nserror("mad_texbuf_probe", err);
+    NSObject_release(fn);
+    memset(&bs, 0, sizeof bs); bs.length = 256; bs.options = WMTResourceStorageModeShared;
+    memset(&bd, 0, sizeof bd); bd.length = 64; bd.options = WMTResourceStorageModeShared;
+    if (pso) src = MTLDevice_newBuffer(d->mtl_device, &bs);
+    if (src) dst = MTLDevice_newBuffer(d->mtl_device, &bd);
+    if (dst && bs.memory.ptr && bd.memory.ptr) {
+        for (i = 0; i < 256; i++) ((unsigned char *)bs.memory.ptr)[i] = (unsigned char)i;
+        memset(bd.memory.ptr, 0xff, 64);
+        for (i = 0; i < 4; i++) {
+            memset(&ti, 0, sizeof ti);
+            ti.pixel_format = t[i].pf; ti.width = 8; ti.height = 1; ti.depth = 1; ti.array_length = 1;
+            ti.type = WMTTextureTypeTextureBuffer; ti.mipmap_level_count = 1; ti.sample_count = 1;
+            ti.usage = WMTTextureUsageShaderRead; ti.options = WMTResourceStorageModeShared;
+            tex[i] = MTLBuffer_newTexture(src, &ti, t[i].off, 8 * t[i].bytes);
+            if (tex[i] && ti.gpu_resource_id) { made |= 1 << i; continue; }
+            if (tex[i]) NSObject_release(tex[i]);
+            ti.gpu_resource_id = 0;
+            tex[i] = MTLBuffer_newTexture(src, &ti, 0, 8 * t[i].bytes);   /* refused off the boundary: bound at 0 so the kernel runs */
+        }
+        if (tex[0] && tex[1] && tex[2] && tex[3]) cb = MTLCommandQueue_commandBuffer(d->mtl_queue);
+        if (cb) { NSObject_retain(cb); enc = MTLCommandBuffer_computeCommandEncoder(cb, false); }
+        if (enc) {
+            memset(&sp, 0, sizeof sp); memset(st, 0, sizeof st); memset(&sb, 0, sizeof sb); memset(&dsp, 0, sizeof dsp);
+            sp.type = WMTComputeCommandSetPSO; sp.pso = pso;
+            sp.threadgroup_size.width = 1; sp.threadgroup_size.height = 1; sp.threadgroup_size.depth = 1;
+            for (i = 0; i < 4; i++) { st[i].type = WMTComputeCommandSetTexture; st[i].texture = tex[i]; st[i].index = (uint8_t)i; }
+            sb.type = WMTComputeCommandSetBuffer; sb.buffer = dst; sb.offset = 0; sb.index = 0;
+            dsp.type = WMTComputeCommandDispatch; dsp.size.width = 1; dsp.size.height = 1; dsp.size.depth = 1;
+            sp.next.ptr = &st[0]; st[0].next.ptr = &st[1]; st[1].next.ptr = &st[2]; st[2].next.ptr = &st[3]; st[3].next.ptr = &sb;
+            sb.next.ptr = &dsp;
+            MTLComputeCommandEncoder_encodeCommands(enc, (const struct wmtcmd_base *)&sp);
+            MTLCommandEncoder_endEncoding(enc);
+            MTLCommandBuffer_commit(cb);
+            MTLCommandBuffer_waitUntilCompleted(cb);
+            ran = MTLCommandBuffer_status(cb) != WMTCommandBufferStatusError;
+        }
+        o = (const UINT32 *)bd.memory.ptr;
+        if (ran) {
+            if ((made & 3) == 3 && o[0] == 0x07060504u && o[1] == 0x0b0a0908u && o[2] == 0x17161514u) mask |= 1;
+            if ((made & 4) && o[3] == 0x0302u) mask |= 2;
+            if ((made & 8) && o[4] == 0x01u) mask |= 4;
+        }
+        what[0] = 0;
+        if (mask & 1) n += snprintf(what + n, sizeof what - (size_t)n, "4-byte and wider elements");
+        if (mask & 2) n += snprintf(what + n, sizeof what - (size_t)n, "%s2-byte", n ? ", " : "");
+        if (mask & 4) snprintf(what + n, sizeof what - (size_t)n, "%s1-byte", n ? ", " : "");
+        if (!mask) snprintf(what, sizeof what, "none (a 16-byte boundary, as with typed-view-align = 16)");
+        d3d12_log("[typed-view] probe %s: R32 at +4 read %08x %08x (right: 07060504 0b0a0908), at +20 %08x (17161514); R16 at +2 %04x "
+                  "(0302); R8 at +1 %02x (01); Metal made %d of the 4 textures off the boundary -> exact starts for %s\n",
+                  ran ? "ran" : "did NOT run", o[0], o[1], o[2], o[3], o[4], __builtin_popcount((unsigned)made & 15u), what);
+    } else d3d12_log("[typed-view] probe: could not make its pipeline or buffers; views start at a 16-byte boundary\n");
+    for (i = 0; i < 4; i++) if (tex[i]) NSObject_release(tex[i]);
+    if (cb) NSObject_release(cb);
+    if (dst) NSObject_release(dst);
+    if (src) NSObject_release(src);
+    if (pso) NSObject_release(pso);
+    if (pool) NSObject_release(pool);
+    return mask;
+}
+static void mad_tv_probe_once(struct mad_device *d) {
+    if (g_tv_exact >= 0) return;
+    AcquireSRWLockExclusive(&g_tv_probe_lock);
+    if (g_tv_exact < 0) g_tv_exact = mad_tv_probe(d);
+    ReleaseSRWLockExclusive(&g_tv_probe_lock);
+}
+static UINT mad_tv_align(struct mad_device *d, enum WMTPixelFormat pf, UINT bytes) {
+    UINT want, fl;
+    want = (UINT)mad_tv_mode();
+    if (want == 4) {   /* exact: the element size itself where the probe passed */
+        if (g_tv_exact > 0 && ((bytes >= 4 && (g_tv_exact & 1)) || (bytes == 2 && (g_tv_exact & 2)) || (bytes == 1 && (g_tv_exact & 4))))
+            return bytes >= 16 ? 16 : bytes;
+        want = 16;
+    }
+    if (want == 64 && g_view_census <= 0) return 64;   /* the default: as before, Metal is not asked */
+    if ((UINT)pf >= sizeof g_tv_floor / sizeof g_tv_floor[0]) return 64;
+    fl = g_tv_floor[pf];
+    if (!fl) {
+        UINT64 m = MTLDevice_minimumLinearTextureAlignmentForPixelFormat(d->mtl_device, pf);
+        fl = !m || m > 4096 || (m & (m - 1)) ? 64 : (UINT)m;
+        g_tv_floor[pf] = (UINT16)fl;
+        if (InterlockedIncrement(&g_tv_said) <= 24)
+            d3d12_log("[typed-view] pixel format %u: Metal's minimum linear texture alignment is %llu bytes%s; its views start at "
+                      "a %u-byte boundary\n", (unsigned)pf, (unsigned long long)m, m > 64 ? " (ABOVE the 64 this runtime uses)" : "",
+                      want == 64 ? 64 : fl > want ? fl : want);
+    }
+    if (want == 64) return 64;   /* view-census alone: logged, nothing changes */
+    if (fl > 256) fl = 256;      /* the element offset must fit the converter's 8 bits; Metal refusing it means 64, as before */
+    return fl > want ? fl : want;
+}
+/* madeira-bcd view-census (madeira.cfg view-census = 1, diagnostic): a typed
+ * buffer view that cannot become a texture buffer falls back to a plain buffer
+ * descriptor, and a typed shader access then sees no texture at all (reads 0,
+ * writes vanish) without a word in the log; one cut short at the end of its
+ * resource loses the elements past it the same way. Counts and names both,
+ * plus plain views and constant buffer views that run past their resource.
+ * Nothing changes how a view is made. */
+static volatile LONG g_vc_n[10], g_vc_past[2], g_vc_cbv_past, g_vc_cbv_nores;
+static const char *const g_vc_why[10] = {
+    "?", "the resource is not a buffer", "no Metal texture-buffer format for it", "a depth format",
+    "no element size (block-compressed or unknown)", "it starts at or past the end of its resource",
+    "wider than 2^28 elements", "Metal refused the texture", "the view list is full", "cut short at the end of its resource" };
+static int mad_vc_on(void) {
+    if (g_view_census < 0) {
+        g_view_census = mad_cfg_int_pe("view-census", 0) ? 1 : 0;   /* diagnostic: name typed-buffer views that fall back or are cut short, and views past their resource */
+        if (g_view_census)
+            d3d12_log("[view-census] madeira-bcd DIAGNOSTIC: typed-buffer views that fall back to plain descriptors or are cut short, "
+                      "and views past the end of their resource, are counted and named (madeira.cfg view-census)\n");
+    }
+    return g_view_census > 0;
+}
+static void mad_vc_res(const struct mad_resource *r, char *o, size_t cap) {
+    if (r->placed_heap)
+        snprintf(o, cap, "r#%u (%llu bytes, flags %#x, placed at +%llu)", r->serial, (unsigned long long)r->size,
+                 (unsigned)r->desc.Flags, (unsigned long long)r->placed_off);
+    else
+        snprintf(o, cap, "r#%u (%llu bytes, flags %#x, heap type %u)", r->serial, (unsigned long long)r->size,
+                 (unsigned)r->desc.Flags, (unsigned)r->heap);
+}
+static void mad_vc_typed(const struct mad_resource *r, DXGI_FORMAT fmt, UINT64 first, UINT64 num, int uav, int why) {
+    LONG k; char rs[128];
+    if (why <= 0 || why >= 10) return;
+    k = InterlockedIncrement(&g_vc_n[why]);
+    if (k > 12 && (k % 1000)) return;
+    mad_vc_res(r, rs, sizeof rs);
+    d3d12_log("[view-census] typed %s view fmt %u first %llu num %llu of %s: %s%s (%ld so far)\n", uav ? "UAV" : "SRV", (unsigned)fmt,
+              (unsigned long long)first, (unsigned long long)num, rs, g_vc_why[why],
+              why == 9 ? "; elements past it read 0 and their writes are lost"
+                       : "; the descriptor falls back to a plain buffer and a typed access sees no texture", (long)k);
+}
+static void mad_vc_past(const struct mad_resource *r, int uav, UINT64 first, UINT64 num, UINT64 stride) {
+    LONG k = InterlockedIncrement(&g_vc_past[uav ? 1 : 0]); char rs[128];
+    if (k > 12 && (k % 1000)) return;
+    mad_vc_res(r, rs, sizeof rs);
+    d3d12_log("[view-census] %s buffer view first %llu num %llu stride %llu ends at byte %llu, past the end of %s (%ld so far)\n",
+              uav ? "UAV" : "SRV", (unsigned long long)first, (unsigned long long)num, (unsigned long long)stride,
+              (unsigned long long)((first + num) * stride), rs, (long)k);
+}
+static void mad_vc_cbv(struct mad_device *d, UINT64 va, UINT size) {
+    UINT64 off = 0; struct mad_resource *r = mad_resolve_address(d, va, &off); LONG k; char rs[128];
+    if (r && off + size <= r->size) return;
+    k = InterlockedIncrement(r ? &g_vc_cbv_past : &g_vc_cbv_nores);
+    if (k > 12 && (k % 1000)) return;
+    if (!r) { d3d12_log("[view-census] constant buffer view at %llx (%u bytes) is in no live resource (%ld so far)\n", (unsigned long long)va, size, (long)k); return; }
+    mad_vc_res(r, rs, sizeof rs);
+    d3d12_log("[view-census] constant buffer view +%llu (%u bytes) runs past the end of %s (%ld so far)\n", (unsigned long long)off, size, rs, (long)k);
+}
+static void mad_vc_report(void) {
+    d3d12_log("[view-census] typed views made %ld; fell back: not a buffer %ld, no format %ld, depth %ld, no element size %ld, "
+              "past the end %ld, too wide %ld, Metal refused %ld, list full %ld; cut short %ld; plain views past their resource: "
+              "SRV %ld, UAV %ld; constant buffer views past their resource %ld, in no resource %ld\n",
+              (long)g_tview_made, (long)g_vc_n[1], (long)g_vc_n[2], (long)g_vc_n[3], (long)g_vc_n[4], (long)g_vc_n[5], (long)g_vc_n[6],
+              (long)g_vc_n[7], (long)g_vc_n[8], (long)g_vc_n[9], (long)g_vc_past[0], (long)g_vc_past[1], (long)g_vc_cbv_past,
+              (long)g_vc_cbv_nores);
+    {   /* madeira-bcd typed-view-align */
+        char by[400]; int n = 0; unsigned pf;
+        by[0] = 0;
+        for (pf = 0; pf < sizeof g_tv_eoff_pf / sizeof g_tv_eoff_pf[0] && n < (int)sizeof by - 32; pf++)
+            if (g_tv_eoff_pf[pf]) n += snprintf(by + n, sizeof by - (size_t)n, " %u:%ld", pf, (long)g_tv_eoff_pf[pf]);
+        d3d12_log("[view-census] typed views made with an element offset (texture started before the view): %ld%s%s; started exactly "
+                  "below a 16-byte boundary: %ld (typed-view-align %d)\n", (long)g_tv_eoff_views, n ? ", by pixel format:" : "", by,
+                  (long)g_tv_exact_views, mad_tv_mode());
+    }
+    if (g_tvs_on > 0)   /* madeira-bcd typed-view-shadow */
+        d3d12_log("[view-census] typed-view-shadow: %ld views read an aligned copy (%u refreshed, %lld KB), %ld copies made at "
+                  "ExecuteCommandLists; %ld offset views not copied (UAV or not UPLOAD memory), %ld refused (too big or full)\n",
+                  (long)g_tvs_views, g_tvs_n, (long long)(g_tvs_bytes >> 10), (long)g_tvs_copies, (long)g_tvs_other, (long)g_tvs_full);
+}
+/* madeira-bcd typed-view-shadow (madeira.cfg typed-view-shadow = 1, opt-in).
+ * Build 486's probe (Horizon Zero Dawn, 2026-10-10 11:52): Metal makes a
+ * texture buffer that starts off a 16-byte boundary but reads it from the start
+ * rounded down, and the converted shaders ignore a typed buffer's element
+ * offset (the float4 palettes of 484/485). So a typed view of a 1-, 2-, 4- or
+ * 8-byte format whose first element is not on a 16-byte boundary is read 1 to 15
+ * bytes early. Horizon Zero Dawn has one in its per-frame UPLOAD ring: a
+ * 307-element R32 array that dozens of compute dispatches read every frame,
+ * misaligned in some frames (137 such views in the 486 run).
+ *
+ * UPLOAD memory is written by the CPU only, before ExecuteCommandLists. Such a
+ * view gets a 16-byte-aligned copy of its bytes in a buffer of ours: its texture
+ * and its descriptor's address point at the copy, made when the view is made and
+ * brought up to date at every ExecuteCommandLists (compare, then copy). The game
+ * rewrites a ring range only once the GPU is done with it, so it never changes
+ * under a running command buffer. Views over GPU-written memory keep their
+ * offset and are counted (view-census). */
+static int mad_tvs_on(void) {
+    if (g_tvs_on < 0) {
+        g_tvs_on = mad_cfg_int_pe("typed-view-shadow", 0) ? 1 : 0;   /* fix: a typed SRV of UPLOAD memory that starts off a 16-byte boundary reads a 16-byte-aligned copy of its bytes, refreshed at every ExecuteCommandLists */
+        if (g_tvs_on)
+            d3d12_log("[typed-view] madeira-bcd typed-view-shadow = 1: typed SRVs of UPLOAD memory that start off a 16-byte boundary read an aligned "
+                      "copy of their bytes, refreshed at every ExecuteCommandLists\n");
+    }
+    return g_tvs_on;
+}
+/* The shadow for one view: its texture (or 0, and the caller makes the view as
+ * before), the copy's GPU address in *gpu. view_lock held. */
+static obj_handle_t mad_tvs_view(struct mad_device *d, struct mad_resource *r, struct WMTTextureInfo *ti,
+                                 UINT64 byte_off, UINT64 num, UINT bytes, UINT64 *gpu, struct mad_tvs **rec) {
+    UINT64 len = num * bytes, al;
+    uint32_t w0 = ti->width;
+    obj_handle_t tex = 0;
+    struct mad_tvs *t;
+    if (byte_off >= r->size || !bytes) return 0;
+    if (len > r->size - byte_off) len = r->size - byte_off;   /* past the end: what is there, as the plain view is cut short */
+    len -= len % bytes;
+    if (!len || len > MAD_TVS_MAX_VIEW) { InterlockedIncrement(&g_tvs_full); return 0; }
+    al = (len + 15) & ~(UINT64)15;
+    AcquireSRWLockExclusive(&g_tvs_lock);
+    if (g_tvs_n >= MAD_TVS_MAX_N || g_tvs_bytes + (LONG64)al > (LONG64)MAD_TVS_MAX_BYTES) goto full;
+    if (!g_tvs_buf || g_tvs_used + al > MAD_TVS_CHUNK) {   /* chunks are never freed: their views live as long as their resources */
+        struct WMTBufferInfo bi;
+        obj_handle_t nb;
+        memset(&bi, 0, sizeof bi);
+        bi.length = MAD_TVS_CHUNK; bi.options = WMTResourceStorageModeShared; bi.memory.ptr = NULL;
+        nb = MTLDevice_newBuffer(d->mtl_device, &bi);
+        if (!nb || !bi.memory.ptr) { if (nb) NSObject_release(nb); goto full; }
+        mad_resident(d, nb);
+        g_tvs_buf = nb; g_tvs_cpu = (unsigned char *)bi.memory.ptr; g_tvs_gpu = bi.gpu_address; g_tvs_used = 0;
+    }
+    if (!mad_grow((void **)&g_tvs, &g_tvs_cap, g_tvs_n + 1, sizeof *g_tvs) || !(t = malloc(sizeof *t))) goto full;
+    memcpy(g_tvs_cpu + g_tvs_used, (const unsigned char *)r->cpu + byte_off, (size_t)len);
+    ti->width = (uint32_t)(len / bytes);
+    tex = MTLBuffer_newTexture(g_tvs_buf, ti, g_tvs_used, len);
+    if (!tex || !ti->gpu_resource_id) {
+        if (tex) NSObject_release(tex);
+        free(t);
+        ti->gpu_resource_id = 0; ti->width = w0;
+        ReleaseSRWLockExclusive(&g_tvs_lock);
+        return 0;
+    }
+    t->r = r; t->src = (const unsigned char *)r->cpu + byte_off; t->dst = g_tvs_cpu + g_tvs_used; t->len = (UINT32)len;
+    t->seen = g_presents_now;
+    g_tvs[g_tvs_n++] = t;
+    *rec = t;
+    *gpu = g_tvs_gpu + g_tvs_used;
+    g_tvs_used += (UINT32)al; g_tvs_bytes += (LONG64)al;
+    ReleaseSRWLockExclusive(&g_tvs_lock);
+    InterlockedIncrement(&g_tvs_views);
+    return tex;
+full:
+    ReleaseSRWLockExclusive(&g_tvs_lock);
+    if (InterlockedIncrement(&g_tvs_full) <= 4)
+        d3d12_log("[typed-view] typed-view-shadow: no room for another copy (%u views, %lld KB); this view keeps its element offset\n",
+                  g_tvs_n, (long long)(g_tvs_bytes >> 10));
+    return 0;
+}
+/* At every ExecuteCommandLists, before its lists are replayed. While the copies
+ * add up to 2 MB or less (Horizon Zero Dawn made 137 such views in a 486 run,
+ * about 170 KB) every one is compared every time: a view made once and then
+ * only copied between descriptor heaps is never looked up again. Past that (a
+ * game that sub-allocates a ring makes one view per frame and range, so copies
+ * pile up) the ones whose view was made or looked up in the last 16 presents
+ * are compared every time and the rest at the first ExecuteCommandLists after
+ * each Present. */
+static void mad_tvs_refresh(void) {
+    static LONG64 last_sweep = -1;
+    LONG64 now = g_presents_now;
+    unsigned i; LONG n = 0; int sweep;
+    if (!g_tvs_n) return;
+    AcquireSRWLockExclusive(&g_tvs_lock);
+    sweep = g_tvs_bytes <= (LONG64)MAD_TVS_ALL_BYTES || now != last_sweep;
+    last_sweep = now;
+    for (i = 0; i < g_tvs_n; i++) {
+        struct mad_tvs *t = g_tvs[i];
+        if (!sweep && now - t->seen > 16) continue;
+        if (memcmp(t->dst, t->src, t->len)) { memcpy(t->dst, t->src, t->len); n++; }
+    }
+    ReleaseSRWLockExclusive(&g_tvs_lock);
+    if (n) InterlockedExchangeAdd(&g_tvs_copies, n);
+}
+/* A resource going away: its copies stop being refreshed (their bytes stay). */
+static void mad_tvs_forget(struct mad_resource *r) {
+    unsigned i, w = 0;
+    if (!g_tvs_n) return;
+    AcquireSRWLockExclusive(&g_tvs_lock);
+    for (i = 0; i < g_tvs_n; i++) { if (g_tvs[i]->r != r) g_tvs[w++] = g_tvs[i]; else free(g_tvs[i]); }
+    g_tvs_n = w;
+    ReleaseSRWLockExclusive(&g_tvs_lock);
+}
+/* why (may be NULL): 0, or the g_vc_why index of a refusal (1-8) or of a view
+ * cut short (9, still made). */
 static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, DXGI_FORMAT fmt,
-                                 UINT64 first, UINT64 num, int uav, struct mad_descriptor *e) {
+                                 UINT64 first, UINT64 num, int uav, struct mad_descriptor *e, int *why) {
     enum WMTPixelFormat pf; int is_depth = 0; UINT bytes, block; unsigned k;
-    UINT64 byte_off, aligned, elem_off, width, bpr;
+    UINT64 byte_off, aligned, elem_off, width, bpr, sh_gpu = 0;
+    struct mad_tvs *sh = NULL;
     struct WMTTextureInfo ti;
     obj_handle_t tex;
     static unsigned said_fail, said_ok;
-    if (!r->buffer || !mad_map_texture_format(fmt, 0, &pf, &is_depth) || is_depth) return 0;
+    if (!r->buffer) { if (why) *why = 1; return 0; }
+    if (!mad_map_texture_format(fmt, 0, &pf, &is_depth)) { if (why) *why = 2; return 0; }
+    if (is_depth) { if (why) *why = 3; return 0; }
     mad_format_info(fmt, &bytes, &block);
-    if (!bytes || block != 1) return 0;
+    if (!bytes || block != 1) { if (why) *why = 4; return 0; }
     byte_off = first * bytes;
+    if (mad_tv_mode() == 4) mad_tv_probe_once(d);   /* madeira-bcd typed-view-align = 4: before the first view, outside the lock */
     EnterCriticalSection(&d->view_lock);   /* ml1049: creation races creation on another thread */
     for (k = 0; k < r->ntview; k++)
         if (r->tview[k].fmt == (UINT)fmt && r->tview[k].off == byte_off && r->tview[k].num == num && r->tview[k].uav == (UINT8)uav) break;
     if (k == r->ntview) {
-        aligned = byte_off & ~(UINT64)63;                   /* linear texture alignment on Apple GPUs is <= 64 */
+        UINT al = mad_tv_align(d, pf, bytes);   /* madeira-bcd typed-view-align: 64 unless the switch says otherwise */
+        int cut;
+    again:
+        cut = 0;
+        aligned = byte_off & ~(UINT64)(al - 1);             /* linear texture alignment on Apple GPUs is <= 64 */
         elem_off = (byte_off - aligned) / bytes;
         width = num + elem_off;
-        if (aligned + width * bytes > r->size) width = (r->size - aligned) / bytes;
-        if (!width || width > (1u << 28)) { LeaveCriticalSection(&d->view_lock); return 0; }
+        if (aligned >= r->size) { LeaveCriticalSection(&d->view_lock); if (why) *why = 5; return 0; }   /* as before: no width */
+        if (aligned + width * bytes > r->size) { width = (r->size - aligned) / bytes; cut = 1; }
+        if (!width || width > (1u << 28)) { LeaveCriticalSection(&d->view_lock); if (why) *why = width ? 6 : 5; return 0; }
         bpr = width * bytes;
         memset(&ti, 0, sizeof ti);
         ti.pixel_format = pf; ti.width = (uint32_t)width; ti.height = 1; ti.depth = 1; ti.array_length = 1;
@@ -9165,7 +10530,13 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
         ti.options = r->cpu ? WMTResourceStorageModeShared : WMTResourceStorageModePrivate;
         if (uav && (pf == WMTPixelFormatR32Uint || pf == WMTPixelFormatR32Sint) && mad_typed_uav_atomic())   /* madeira-bcd, opt-in */
             ti.usage = (enum WMTTextureUsage)(ti.usage | WMTTextureUsageShaderAtomic);
-        tex = MTLBuffer_newTexture(r->buffer, &ti, aligned, bpr);
+        sh_gpu = 0; sh = NULL; tex = 0;
+        if (elem_off && mad_tvs_on()) {   /* madeira-bcd typed-view-shadow: an aligned copy instead of an element offset */
+            if (!uav && r->cpu && r->heap == D3D12_HEAP_TYPE_UPLOAD) tex = mad_tvs_view(d, r, &ti, byte_off, num, bytes, &sh_gpu, &sh);
+            if (!tex) InterlockedIncrement(&g_tvs_other);
+        }
+        if (tex) elem_off = 0;
+        else tex = MTLBuffer_newTexture(r->buffer, &ti, aligned, bpr);
         if ((ti.usage & WMTTextureUsageShaderAtomic) && (!tex || !ti.gpu_resource_id)) {   /* refused with it: as before */
             static unsigned said_atomic;
             if (said_atomic++ < 4) d3d12_log("[madeira-d3d12] typed-uav-atomic: Metal refused ShaderAtomic on an R32 texture buffer; created without it\n");
@@ -9173,15 +10544,27 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
             ti.usage = (enum WMTTextureUsage)(ti.usage & ~WMTTextureUsageShaderAtomic); ti.gpu_resource_id = 0;
             tex = MTLBuffer_newTexture(r->buffer, &ti, aligned, bpr);
         } else if (ti.usage & WMTTextureUsageShaderAtomic) InterlockedIncrement(&g_typed_atomic_views);
+        if ((!tex || !ti.gpu_resource_id) && al != 64) {   /* madeira-bcd typed-view-align: refused at that boundary -- at 16 (an exact start), else at 64 as before */
+            UINT next = al < 16 ? 16 : 64;
+            if (tex) NSObject_release(tex);
+            if (InterlockedIncrement(&g_tv_fallback) <= 8)
+                d3d12_log("[typed-view] Metal refused a view of pixel format %u at a %u-byte boundary (offset %llu); made at %u\n",
+                          (unsigned)pf, al, (unsigned long long)aligned, next);
+            al = next;
+            ti.gpu_resource_id = 0;
+            goto again;
+        }
+        if (cut && why) *why = 9;
         if (!tex || !ti.gpu_resource_id) {
             if (said_fail++ < 8)
                 d3d12_log("[madeira-d3d12] typed buffer view FAILED: fmt %u first %llu num %llu (buffer %llu bytes)\n",
                           (unsigned)fmt, (unsigned long long)first, (unsigned long long)num, (unsigned long long)r->size);
             LeaveCriticalSection(&d->view_lock);
+            if (why) *why = 7;
             return 0;
         }
         if (!mad_view_grow(r, (void **)&r->tview, &r->tview_cap, r->ntview + 1, sizeof *r->tview)) {
-            NSObject_release(tex); LeaveCriticalSection(&d->view_lock); return 0;
+            NSObject_release(tex); LeaveCriticalSection(&d->view_lock); if (why) *why = 8; return 0;
         }
         /* ml1126: NOT added to the residency set. A texture-buffer view aliases
          * its buffer's storage, and the buffer is already a member (as a placed
@@ -9195,8 +10578,14 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
         InterlockedIncrement(&g_tview_live); InterlockedIncrement(&g_tview_made);
         k = r->ntview;
         r->tview[k].fmt = (UINT)fmt; r->tview[k].off = byte_off; r->tview[k].num = num; r->tview[k].uav = (UINT8)uav;
+        r->tview[k].eoff = (UINT8)elem_off; r->tview[k].sh_gpu = sh_gpu; r->tview[k].sh = sh;
         r->tview[k].tex = tex; r->tview[k].id = ti.gpu_resource_id;
         r->ntview = k + 1;   /* published last: a reader never sees a half-written entry */
+        if (elem_off) {   /* madeira-bcd: what typed-view-align leaves to the converter (view-census reports it) */
+            InterlockedIncrement(&g_tv_eoff_views);
+            if ((UINT)pf < sizeof g_tv_eoff_pf / sizeof g_tv_eoff_pf[0]) InterlockedIncrement(&g_tv_eoff_pf[pf]);
+        }
+        if (al < 16 && (aligned & 15)) InterlockedIncrement(&g_tv_exact_views);   /* an exact start off a 16-byte boundary */
         mad_vmap_put_locked(d, ti.gpu_resource_id, (UINT32)num, (UINT32)elem_off);
         mad_view_census("typed-buffer", r, r->ntview);
         if (said_ok++ < 12)
@@ -9204,11 +10593,54 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
                       (unsigned)fmt, (unsigned long long)first, (unsigned long long)num, uav ? " (UAV)" : "",
                       (unsigned)width, (unsigned long long)elem_off);
     }
-    aligned = r->tview[k].off & ~(UINT64)63; elem_off = (r->tview[k].off - aligned) / bytes;
-    e->gpu_va = r->gpu_address + r->tview[k].off;
+    elem_off = r->tview[k].eoff;   /* as the view was made (madeira-bcd typed-view-align may have moved its start) */
+    if (r->tview[k].sh) r->tview[k].sh->seen = g_presents_now;   /* madeira-bcd typed-view-shadow: in use, refresh it every time */
+    e->gpu_va = r->tview[k].sh_gpu ? r->tview[k].sh_gpu : r->gpu_address + r->tview[k].off;   /* madeira-bcd typed-view-shadow: the copy */
     e->texture_view_id = r->tview[k].id;
     e->metadata = ((num * bytes) & 0xffffffffull) | ((elem_off & 0x7fffffffull) << 32) | (1ull << 63);
     LeaveCriticalSection(&d->view_lock);
+    return 1;
+}
+
+/* madeira-bcd raw-typed-views (madeira.cfg d3d12-raw-typed-views = 1, opt-in):
+ * a raw or structured buffer view also carries a texture-buffer view, as a
+ * typed view already carries the plain address. A shader that reads such a
+ * descriptor as Buffer<T> (undefined in D3D12, but native drivers return the
+ * data, and vkd3d-proton writes both kinds for every buffer view: 97e0d8e,
+ * 7201b27) otherwise reads texture id 0 here: zeros, which put vertices at the
+ * origin (ml905). The sibling's format follows native drivers: R32_UINT for
+ * raw views and every UAV, RGBA32/RG32_UINT for a structured SRV whose stride
+ * is a multiple of 16/8. Address and size stay the view's own, so raw and
+ * structured reads see what they saw before. Off: nothing changes. */
+static int g_raw_typed = -1;
+static volatile LONG g_raw_typed_made, g_raw_typed_failed;
+static int mad_raw_typed_on(void) {
+    if (g_raw_typed < 0) {
+        g_raw_typed = mad_cfg_int_pe("d3d12-raw-typed-views", 0) ? 1 : 0;
+        if (g_raw_typed)
+            d3d12_log("[raw-typed] madeira-bcd: raw and structured buffer views also carry a texture-buffer view "
+                      "(madeira.cfg d3d12-raw-typed-views)\n");
+    }
+    return g_raw_typed > 0;
+}
+static int mad_raw_typed_sibling(struct mad_device *d, struct mad_resource *r, UINT64 first, UINT64 num,
+                                 UINT64 stride, int uav, struct mad_descriptor *e) {
+    DXGI_FORMAT fmt = DXGI_FORMAT_R32_UINT; UINT64 f = 4; LONG k; int why = 0;
+    if (!stride || (stride & 3) || !num) return 0;
+    if (!uav && !(stride & 15)) { fmt = DXGI_FORMAT_R32G32B32A32_UINT; f = 16; }
+    else if (!uav && !(stride & 7)) { fmt = DXGI_FORMAT_R32G32_UINT; f = 8; }
+    if (!mad_typed_buffer_view(d, r, fmt, first * stride / f, num * stride / f, uav, e, &why)) {
+        k = InterlockedIncrement(&g_raw_typed_failed);
+        if (k <= 8 || !(k & (k - 1)))
+            d3d12_log("[raw-typed] no texture-buffer view for a %s view (stride %llu, first %llu, num %llu, buffer %llu bytes): "
+                      "reason %d; plain descriptor as before (%ld so far)\n", uav ? "UAV" : "SRV", (unsigned long long)stride,
+                      (unsigned long long)first, (unsigned long long)num, (unsigned long long)r->size, why, (long)k);
+        return 0;
+    }
+    k = InterlockedIncrement(&g_raw_typed_made);
+    if (k <= 4 || !(k & (k - 1)))
+        d3d12_log("[raw-typed] %s view stride %llu -> format %u texture-buffer view (%ld so far, %ld refused)\n",
+                  uav ? "UAV" : "SRV", (unsigned long long)stride, (unsigned)fmt, (long)k, (long)g_raw_typed_failed);
     return 1;
 }
 
@@ -9329,6 +10761,7 @@ static void STDMETHODCALLTYPE device_CreateConstantBufferView(ID3D12Device *This
         if (nd && nd->null_gpu) { e->gpu_va = nd->null_gpu; e->metadata = 65536; }
         return;
     }
+    if (g_view_census && mad_vc_on()) mad_vc_cbv((struct mad_device *)This, desc->BufferLocation, desc->SizeInBytes);   /* madeira-bcd view-census */
     mad_set_buffer_descriptor(e, desc->BufferLocation, desc->SizeInBytes);
 }
 
@@ -9385,11 +10818,18 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(ID3D12Device *Thi
             if (desc->Buffer.StructureByteStride) stride = desc->Buffer.StructureByteStride;
             else if (desc->Format != DXGI_FORMAT_UNKNOWN) {
                 mad_format_info(desc->Format, &bytes, &block); stride = bytes;
-                if (!(desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) &&
-                    mad_typed_buffer_view((struct mad_device *)This, r, desc->Format, first, num, 1, e)) return;   /* ml905 */
+                if (!(desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW)) {
+                    int vwhy = 0, ok = mad_typed_buffer_view((struct mad_device *)This, r, desc->Format, first, num, 1, e, &vwhy);   /* ml905 */
+                    if (vwhy && mad_vc_on()) mad_vc_typed(r, desc->Format, first, num, 1, vwhy);   /* madeira-bcd view-census */
+                    if (ok) return;
+                }
             }
         }
-        mad_set_buffer_descriptor(e, r->gpu_address + first * stride, num * stride);
+        if (g_view_census && (first + num) * stride > r->size && mad_vc_on()) mad_vc_past(r, 1, first, num, stride);   /* madeira-bcd view-census */
+        if (!counter && desc && desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER &&
+            (desc->Buffer.StructureByteStride || (desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW)) && mad_raw_typed_on() &&
+            mad_raw_typed_sibling((struct mad_device *)This, r, first, num, stride, 1, e)) ;   /* madeira-bcd raw-typed-views */
+        else mad_set_buffer_descriptor(e, r->gpu_address + first * stride, num * stride);
         {   /* remember this view's counter (or forget a stale one) */
             struct mad_resource *cr = (struct mad_resource *)counter;
             UINT64 cva = 0;
@@ -9405,8 +10845,10 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(ID3D12Device *Thi
             if (cva) {
                 struct mad_descriptor cd;
                 static unsigned said_ctr;
-                if (mad_typed_buffer_view((struct mad_device *)This, cr, DXGI_FORMAT_R32_UINT,
-                                          desc->Buffer.CounterOffsetInBytes / 4, 1, 1, &cd)) {
+                int cwhy = 0, cok = mad_typed_buffer_view((struct mad_device *)This, cr, DXGI_FORMAT_R32_UINT,
+                                                          desc->Buffer.CounterOffsetInBytes / 4, 1, 1, &cd, &cwhy);
+                if (cwhy && mad_vc_on()) mad_vc_typed(cr, DXGI_FORMAT_R32_UINT, desc->Buffer.CounterOffsetInBytes / 4, 1, 1, cwhy);   /* madeira-bcd view-census */
+                if (cok) {
                     UINT64 elem_off = (cd.metadata >> 32) & 0x7fffffffull;
                     e->texture_view_id = cd.texture_view_id;
                     e->metadata = (e->metadata & 0xffffffffull) | ((elem_off & 0xffull) << 32);
@@ -9975,6 +11417,7 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
             mad_uavtex_forget(r, r->gpu_resource_id);
             for (k = 0; k < r->nxview; k++) mad_uavtex_forget(r, r->xview[k].id);
         }
+        if (r->cpu) mad_tvs_forget(r);   /* madeira-bcd typed-view-shadow: before its memory goes */
         { unsigned k; for (k = 0; k < r->ntview; k++) if (r->tview[k].tex) { NSObject_release(r->tview[k].tex); InterlockedDecrement(&g_tview_live); } }   /* ml905; ml1126: never set members */
         { unsigned k; for (k = 0; k < r->nxview; k++) if (r->xview[k].tex) { mad_unresident(r->owner, r->xview[k].tex); NSObject_release(r->xview[k].tex); InterlockedDecrement(&g_xview_live); } }   /* ml913 */
         if (r->metal_bytes) {   /* madeira-bcd metal-gap */
@@ -10386,7 +11829,8 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
          * 0.4-0.9 GB of UPLOAD buffers live (ph-valley08-13), and its load-time
          * peak is what kills the Lumen runs. Metal-allocated shared storage is
          * charged in full. madeira.cfg upload-swap = 0 turns it off. */
-        if (!r->buffer && heap_type != D3D12_HEAP_TYPE_DEFAULT && info.length >= (8u << 20) && mad_upload_swap_on()) {
+        if (!r->buffer && heap_type != D3D12_HEAP_TYPE_DEFAULT && info.length >= (8u << 20) && mad_upload_swap_on() &&
+            (heap_type != D3D12_HEAP_TYPE_READBACK || mad_readback_swap_on())) {   /* madeira-bcd readback-swap */
             SIZE_T len = (SIZE_T)((info.length + 0xffff) & ~(UINT64)0xffff);
             void *mem = VirtualAlloc(NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (mem) {
@@ -10693,6 +12137,7 @@ static ULONG STDMETHODCALLTYPE pso_Release(ID3D12PipelineState *T) {
         if (p->cps) NSObject_release(p->cps);
         free(p->air);   /* ml1010 */
         free(p->ps_air);   /* ml1011 */
+        free(p->il_tag);   /* madeira-bcd skin-check-trace */
         mad_tess_free(p->tess);         /* ml1083 */
         mad_tess_free(p->tess_strip);   /* ml1147b */
         free(p);
@@ -11575,10 +13020,17 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceView(ID3D12Device *This
             if (desc->Buffer.StructureByteStride) stride = desc->Buffer.StructureByteStride;
             else if (desc->Format != DXGI_FORMAT_UNKNOWN) {
                 mad_format_info(desc->Format, &bytes, &block); stride = bytes;
-                if (!(desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) &&
-                    mad_typed_buffer_view((struct mad_device *)This, r, desc->Format, first, num, 0, e)) return;   /* ml905 */
+                if (!(desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW)) {
+                    int vwhy = 0, ok = mad_typed_buffer_view((struct mad_device *)This, r, desc->Format, first, num, 0, e, &vwhy);   /* ml905 */
+                    if (vwhy && mad_vc_on()) mad_vc_typed(r, desc->Format, first, num, 0, vwhy);   /* madeira-bcd view-census */
+                    if (ok) return;
+                }
             }
         }
+        if (g_view_census && (first + num) * stride > r->size && mad_vc_on()) mad_vc_past(r, 0, first, num, stride);   /* madeira-bcd view-census */
+        if (desc && desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER &&
+            (desc->Buffer.StructureByteStride || (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW)) && mad_raw_typed_on() &&
+            mad_raw_typed_sibling((struct mad_device *)This, r, first, num, stride, 0, e)) return;   /* madeira-bcd raw-typed-views */
         mad_set_buffer_descriptor(e, r->gpu_address + first * stride, num * stride);
         return;
     }
@@ -13706,6 +15158,11 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
     if (!p) return E_OUTOFMEMORY;
     p->vtbl = &g_pso_vtbl; p->refs = 1; p->iid = &IID_ID3D12PipelineState; p->name = "PipelineState";
     p->born_present = g_presents_now; p->born_tick = GetTickCount();   /* madeira-bcd: pso-first-use */
+    if (mad_skin_on()) {   /* madeira-bcd skin-check: the vertex shader's bytecode, by hash */
+        p->vs_hash = mad_fnv64(desc->VS.pShaderBytecode, desc->VS.BytecodeLength);
+        mad_skin_layout(p, &desc->InputLayout);   /* skin-check-trace: an integer input keeps the bytecode past the shared store */
+        mad_bc_keep_ex(p->vs_hash, desc->VS.pShaderBytecode, desc->VS.BytecodeLength, p->il_int);
+    }
     if (desc->HS.pShaderBytecode || desc->DS.pShaderBytecode) { p->has_tess = 1; InterlockedIncrement(&g_tess_psos); }   /* ml1050 */
 
     {
@@ -14211,6 +15668,7 @@ static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,
         for (q = 0; q < desc->CS.BytecodeLength; q++) { hh ^= b[q]; hh *= 0x100000001b3ull; }
         p->cs_hash = hh; p->cs_len = (UINT)desc->CS.BytecodeLength;
         if (mad_fault_info_on()) mad_fault_cs_check(b, p->cs_len, hh);
+        if (mad_skin_on()) mad_bc_keep(hh, b, p->cs_len);   /* madeira-bcd skin-check */
     }
     {
         struct madeira_ir_loc locs[MAD_LOC_MAX]; unsigned nl = 0;
@@ -16241,6 +17699,80 @@ static HRESULT STDMETHODCALLTYPE swap_GetDevice(IDXGISwapChain4 *T, REFIID riid,
  * It also stops leaking one command buffer per frame. */
 static HRESULT swap_Present_inner(IDXGISwapChain4 *T, UINT sync, UINT flags);
 static HRESULT swap_Present_pool(IDXGISwapChain4 *T, UINT sync, UINT flags);
+/* madeira-bcd vis-trace: at the end of present #presents. */
+static void mad_vt_present(struct mad_device *d, UINT64 presents) {
+    static LONG eoff_last, tvs_last;
+    static LONG strict_last;
+    char line[3200]; int n; unsigned i, w, x, y;
+    LONG eoff = g_tv_eoff_views, tvs = g_tvs_views, strict = g_sd_strict_waits;
+    UINT64 done;
+    d3d12_log("[vis-trace] present #%llu: draws %ld (depth-only %ld, 3+ targets %ld), indices %.2fM, dispatches %ld, pyramid copies %ld%s, "
+              "offset views +%ld, shadowed +%ld; Queue::Wait %ld (fast path %ld, before the awaited batch was committed %ld; fence-strict "
+              "waits +%ld); dispatches by queue: direct %ld, compute %ld; copies by queue: direct %ld, compute %ld, copy %ld\n",
+              (unsigned long long)presents, (long)InterlockedExchange(&g_vt_draws, 0),
+              (long)InterlockedExchange(&g_vt_depth, 0), (long)InterlockedExchange(&g_vt_mrt, 0), (double)InterlockedExchange64(&g_vt_idx, 0) / 1e6,
+              (long)InterlockedExchange(&g_vt_disp, 0), (long)InterlockedExchange(&g_vt_pyr, 0), g_rbf_on > 0 ? " (filled with 4096)" : "",
+              (long)(eoff - eoff_last), (long)(tvs - tvs_last), (long)InterlockedExchange(&g_vt_qw, 0), (long)InterlockedExchange(&g_vt_qw_fast, 0),
+              (long)InterlockedExchange(&g_vt_qw_early, 0), (long)(strict - strict_last), (long)InterlockedExchange(&g_vt_disp_q[0], 0),
+              (long)InterlockedExchange(&g_vt_disp_q[2], 0), (long)InterlockedExchange(&g_vt_copy_q[0], 0), (long)InterlockedExchange(&g_vt_copy_q[2], 0),
+              (long)InterlockedExchange(&g_vt_copy_q[3], 0));
+    eoff_last = eoff; tvs_last = tvs; strict_last = strict;
+    g_vt_presents = (LONG64)presents;
+    AcquireSRWLockExclusive(&g_vt_lock);
+    done = mad_gpu_completed(d);
+    for (i = w = 0; i < g_vt_rb_n; i++) {
+        struct mad_vt_rb *b = &g_vt_rb[i];
+        struct mad_queue *q = b->q;
+        int ready = mad_vt_done(q, b->batch, done);
+        if (!ready && (LONG64)presents - b->frame < 8) { if (w != i) g_vt_rb[w] = *b; w++; continue; }
+        n = snprintf(line, sizeof line, "[vis-trace] pyramid mip %u (%ux%u) of present #%lld, queue type %u%s:", b->level, b->w, b->h,
+                     (long long)b->frame, (unsigned)q->type, ready ? "" : " (GPU NOT DONE after 8 presents)");
+        for (y = 0; y < b->h && n < (int)sizeof line - 40; y++) {   /* every value, rows split by | (the mips can be checked against each other) */
+            const float *row = (const float *)(b->cpu + (size_t)y * b->row);
+            n += snprintf(line + n, sizeof line - (size_t)n, "%s", y ? " |" : "");
+            for (x = 0; x < b->w && n < (int)sizeof line - 16; x++) n += snprintf(line + n, sizeof line - (size_t)n, " %.4g", row[x]);
+        }
+        if (ready && b->mslot >= 0 && g_vt_mcpu) {   /* the game's memory against the GPU's own copy */
+            const unsigned char *m = g_vt_mcpu + (size_t)b->mslot * MAD_VT_MSLOT_BYTES;
+            unsigned diff = 0, k; int same = -1;
+            for (y = 0; y < b->h; y++)
+                for (x = 0; x < b->w; x++)
+                    diff += ((const UINT32 *)(b->cpu + (size_t)y * b->row))[x] != ((const UINT32 *)(m + (size_t)y * b->w * 4))[x];
+            if (!diff) InterlockedIncrement(&g_vt_chk[0]);
+            else {
+                for (k = 0; k < MAD_VT_MSLOTS && same < 0; k++) {   /* does it hold another present's readback of this mip? */
+                    const unsigned char *o = g_vt_mcpu + (size_t)k * MAD_VT_MSLOT_BYTES;
+                    int eq = 1;
+                    if ((int)k == b->mslot || g_vt_mmeta[k].level != b->level || g_vt_mmeta[k].w != b->w || g_vt_mmeta[k].h != b->h ||
+                        !mad_vt_done(g_vt_mmeta[k].q, g_vt_mmeta[k].batch, done)) continue;
+                    for (y = 0; y < b->h && eq; y++) eq = !memcmp(b->cpu + (size_t)y * b->row, o + (size_t)y * b->w * 4, (size_t)b->w * 4);
+                    if (eq) same = (int)k;
+                }
+                InterlockedIncrement(&g_vt_chk[same < 0 ? 3 : g_vt_mmeta[same].frame > b->frame ? 1 : 2]);
+                if (same < 0)
+                    n += snprintf(line + n, sizeof line - (size_t)n, " -- the game's memory differs from the GPU's own copy in %u of %u values "
+                                  "(not any recent readback)", diff, b->w * b->h);
+                else
+                    n += snprintf(line + n, sizeof line - (size_t)n, " -- the game's memory differs from the GPU's own copy in %u of %u values "
+                                  "(it holds the readback of present #%lld: %s)", diff, b->w * b->h, (long long)g_vt_mmeta[same].frame,
+                                  g_vt_mmeta[same].frame > b->frame ? "a later one, the slot was reused" : "STALE, the GPU's write did not reach it");
+                d3d12_log("%s\n", line);
+                n = snprintf(line, sizeof line, "[vis-trace]   the GPU's own copy:");
+                for (y = 0; y < b->h && n < (int)sizeof line - 40; y++) {
+                    const float *row = (const float *)(m + (size_t)y * b->w * 4);
+                    n += snprintf(line + n, sizeof line - (size_t)n, "%s", y ? " |" : "");
+                    for (x = 0; x < b->w && n < (int)sizeof line - 16; x++) n += snprintf(line + n, sizeof line - (size_t)n, " %.4g", row[x]);
+                }
+            }
+        }
+        d3d12_log("%s\n", line);
+    }
+    g_vt_rb_n = w;
+    ReleaseSRWLockExclusive(&g_vt_lock);
+    if (presents % 300 == 0 && g_vt_mcpu)
+        d3d12_log("[vis-trace] readback check so far: %ld mips equal to the GPU's own copy, %ld overwritten by a later readback, "
+                  "%ld STALE (an earlier readback), %ld different\n", (long)g_vt_chk[0], (long)g_vt_chk[1], (long)g_vt_chk[2], (long)g_vt_chk[3]);
+}
 static HRESULT STDMETHODCALLTYPE swap_Present(IDXGISwapChain4 *T, UINT sync, UINT flags) {   /* ml1119: timed wrapper */
     LARGE_INTEGER t0, t1; HRESULT hr;
     mad_xp_role('P'); InterlockedIncrement64(&g_xp.pres_enq);   /* ml1128 */
@@ -16451,8 +17983,11 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     /* ml1056: no release -- the drawable was never ours (see swap_Present). */
     s->presents++;
     mad_perf_present();   /* ml1108 */
+    if (g_vt_on > 0) mad_vt_present(s->queue->device, s->presents);   /* madeira-bcd vis-trace */
     g_census_on = (s->presents >= 1500 && s->presents < 3000 && (s->presents % 200) == 0);   /* ml899 */
     if (g_capture_on) g_census_on = 1;   /* ml1098 */
+    if (mad_skin_on()) mad_skin_present(s->presents);   /* madeira-bcd skin-check */
+    if (g_view_census > 0 && (s->presents % 1800) == 0) mad_vc_report();   /* madeira-bcd view-census */
     if ((g_list_seq >= 12000 && g_list_seq < 12400) || g_census_on)
         d3d12_log("[draw-dump] ===== Present #%llu (list#%u) =====\n", (unsigned long long)s->presents, g_list_seq);
     if (s->presents <= 3 || (s->presents % 600) == 0)
