@@ -4758,6 +4758,422 @@ int ios_patch_rtl_pc_to_file_header_current( const void *pe_addr )
     return -1;
 }
 
+/* madeira-bcd: NtProtectVirtualMemory's [exec-req] path must leave the syscall callback.
+ *
+ * The PE ntdll (app/Madeira/arm64ec-windows/ntdll.dll, a prebuilt binary of the
+ * wine fork's dlls/ntdll/signal_arm64ec.c) wraps NtProtectVirtualMemory for the
+ * emulator: enter_syscall_callback() sets CHPE_V2_CPU_AREA_INFO::InSyscallCallback,
+ * the protection is changed, FEX is told (NotifyMemoryProtect ->
+ * InvalidationTracker) and leave_syscall_callback() clears the flag again. The
+ * ml283 [exec-req] probe in that wrapper -- taken for the first 64 requests per
+ * ntdll copy that ask for an EXECUTE protection -- does its own syscall, log line
+ * and notification and then `return st;` WITHOUT leave_syscall_callback(). In the
+ * binary shipped until 7b56800 (function at VA 0x1800570f4) its three exits, 0x1800573bc
+ * (cross-process), 0x1800573c8 (no NotifyMemoryProtect) and 0x1800573f8 (after the
+ * notification), all branch to the epilogue at 0x180057514; only the non-exec
+ * path passes 0x1800574d8 `ldr x8,[x18,#0x1788]; cbz x8; strb wzr,[x8,#1]`.
+ *
+ * So after one executable protect InSyscallCallback stays 1 on that thread until
+ * FEX next compiles or links a block there (its dispatcher sets and clears the
+ * flag around those calls, FEXCore Dispatcher.cpp EmitSignalGuardedRegion) or a
+ * guest-visible exception passes ResetToConsistentState. Code that is already
+ * compiled and linked -- a loop calling VirtualProtect -- does neither. In
+ * between, every NtProtectVirtualMemory / NtAllocateVirtualMemory(Ex) /
+ * NtFreeVirtualMemory / NtMapViewOfSection(Ex) wrapper on that thread sees the
+ * flag, takes its raw path and tells FEX NOTHING -- no executable range added, no
+ * range removed, no translated code invalidated -- and prints none of its probes.
+ * Log PlayGTAV.exe 2026-10-02 10:51:28: [exec-req] #1 on tid 0024 (line 396), and
+ * the next four NtMapViewOfSection on that thread -- the emulator's own image and
+ * its imports -- report insc_before=1 entered=0 (lines 450-509), while the child
+ * maps the same four with no [exec-req] before them and reports insc_before=0
+ * entered=1 (1722-1755). A program that makes several ranges executable in a
+ * row from code that is already compiled (a protector's section pass, a hooking
+ * library) loses every request after the first.
+ *
+ * The PE ntdll cannot be rebuilt here, so the pool copy every ARM64EC caller runs
+ * is patched in place, like [pc2fh], by retargeting the three branches:
+ *   +0x04  b.eq -> +0x130 (exec cross-process block)  becomes  b.eq -> +0xf4, the
+ *          identical block of the non-exec path, which falls into the clear;
+ *   +0x10  cbz x11 -> +0x15c (epilogue)  becomes  cbz x11 -> +0x120 (the clear);
+ *   +0x40  b -> +0x15c                   becomes  b -> +0x120.
+ * (offsets from the probe's `tst w25, #0xff`, VA 0x1800573b8). Every instruction the
+ * patched paths run is checked first, in the image and in the pool copy; any
+ * mismatch leaves the copy alone. Idempotent. OPT-IN: MADEIRA_EXECREQ_LEAVE=1 (env,
+ * or `env.MADEIRA_EXECREQ_LEAVE = 1` in a game's settings), because it changes
+ * what the emulator is told after every executable protect in every game: it is
+ * the upstream behaviour, but notifications the leak used to drop will arrive
+ * (GTA V Enhanced).
+ *
+ * Wine 38aa753f98b (ml1259) added the missing leave_syscall_callback() in source,
+ * and every ntdll.dll shipped since 7b56800 (2026-10-04) has it, so build 442 said
+ * "not found" for every ntdll copy. That layout (ios_execreq_fixed_sig) is now
+ * recognised: MADEIRA_EXECREQ_LEAVE=1 says once that there is nothing to patch
+ * and writes nothing. */
+#define IOS_EXECREQ_WORDS 17u
+static const uint32_t ios_execreq_sig[IOS_EXECREQ_WORDS] = {
+    0x72001f3f, /* +0x00 tst  w25, #0xff                 is_current              */
+    0x54000960, /* +0x04 b.eq +0x130 -> exec cross-process notification   SITE A  */
+    0xf00003c8, /* +0x08 adrp x8, (pNotifyMemoryProtect)                          */
+    0xf947550b, /* +0x0c ldr  x11, [x8, #0xea8]                                   */
+    0xb4000a6b, /* +0x10 cbz  x11, +0x15c -> epilogue                     SITE B  */
+    0xb00003c8, /* +0x14 adrp x8, (icall checker)                                 */
+    0xf94002c1, /* +0x18 ldr  x1, [x22]                  *size_ptr                */
+    0xf94002a0, /* +0x1c ldr  x0, [x21]                  *addr_ptr                */
+    0xf945c508, /* +0x20 ldr  x8, [x8, #0xb88]                                    */
+    0xb000014a, /* +0x24 adrp x10, ...                                            */
+    0x9126514a, /* +0x28 add  x10, x10, #0x994                                    */
+    0xd63f0100, /* +0x2c blr  x8                                                  */
+    0x2a1303e2, /* +0x30 mov  w2, w19                    new_prot                 */
+    0x52800023, /* +0x34 mov  w3, #1                     After                    */
+    0x2a1a03e4, /* +0x38 mov  w4, w26                    status                   */
+    0xd63f0160, /* +0x3c blr  x11                        NotifyMemoryProtect      */
+    0x14000047, /* +0x40 b    +0x15c -> epilogue                          SITE C  */
+};
+#define IOS_EXECREQ_SITE_A   0x04u
+#define IOS_EXECREQ_SITE_B   0x10u
+#define IOS_EXECREQ_SITE_C   0x40u
+#define IOS_EXECREQ_XPROC_NX 0xf4u   /* cross-process post notification, non-exec path */
+#define IOS_EXECREQ_CLEAR    0x120u  /* ldr x8,[x18,#0x1788]; cbz x8,epi; strb wzr,[x8,#1]; b epi */
+#define IOS_EXECREQ_XPROC_X  0x130u  /* the same block on the exec path, no clear after it */
+#define IOS_EXECREQ_EPILOGUE 0x15cu  /* mov w0, w26; ldp ...; ret */
+
+static uint32_t ios_a64_b( uint32_t from, uint32_t to )
+{
+    return 0x14000000u | (((to - from) >> 2) & 0x03ffffffu);
+}
+
+static uint32_t ios_a64_bcond( uint32_t from, uint32_t to, uint32_t cond )
+{
+    return 0x54000000u | ((((to - from) >> 2) & 0x7ffffu) << 5) | cond;
+}
+
+static uint32_t ios_a64_cbz64( uint32_t from, uint32_t to, uint32_t rt )
+{
+    return 0xb4000000u | ((((to - from) >> 2) & 0x7ffffu) << 5) | rt;
+}
+
+static uint32_t ios_a64_bl_target( uint32_t pc, uint32_t insn )
+{
+    int32_t imm = (int32_t)(insn << 6) >> 6;   /* sign-extended imm26 */
+    return pc + (uint32_t)(imm * 4);
+}
+
+static uint32_t ios_a64_imm19_target( uint32_t pc, uint32_t insn )
+{
+    int32_t imm = (int32_t)(insn << 8) >> 13;   /* sign-extended imm19: b.cond, cbz, cbnz */
+    return pc + (uint32_t)(imm * 4);
+}
+
+static int ios_a64_is_branch( uint32_t insn )
+{
+    return (insn & 0x7c000000u) == 0x14000000u    /* b, bl */
+        || (insn & 0xff000010u) == 0x54000000u    /* b.cond */
+        || (insn & 0x7c000000u) == 0x34000000u    /* cbz, cbnz, tbz, tbnz */
+        || (insn & 0xfe000000u) == 0xd6000000u;   /* br, blr, ret */
+}
+
+static int ios_execreq_leave_wanted( void )
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        /* Default off. 1 makes NtProtectVirtualMemory's [exec-req] path clear
+         * InSyscallCallback again, so the emulator hears about the memory changes
+         * that follow an executable protect on the same thread (GTA V Enhanced,
+         * the NoExec crash). */
+        const char *e = getenv( "MADEIRA_EXECREQ_LEAVE" );
+        cached = (e && e[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+
+/* The words the three sites hold after the patch, computed from their offsets. */
+static void ios_execreq_patched_words( uint32_t out[3] )
+{
+    out[0] = ios_a64_bcond( IOS_EXECREQ_SITE_A, IOS_EXECREQ_XPROC_NX, 0 /* eq */ );
+    out[1] = ios_a64_cbz64( IOS_EXECREQ_SITE_B, IOS_EXECREQ_CLEAR, 11 );
+    out[2] = ios_a64_b( IOS_EXECREQ_SITE_C, IOS_EXECREQ_CLEAR );
+}
+
+/* Are the blocks the patched branches reach what the patch was written against?
+ * `w` is the function at the probe, in the image (check_x18 = 1) or in a pool copy
+ * (check_x18 = 0: the x18 patcher replaces `ldr x8,[x18,#0x1788]` there with a
+ * branch to its trampoline). */
+static int ios_execreq_layout_ok( const uint32_t *w, int check_x18 )
+{
+    const uint32_t nx = IOS_EXECREQ_XPROC_NX / 4, xx = IOS_EXECREQ_XPROC_X / 4;
+    const uint32_t clr = IOS_EXECREQ_CLEAR / 4, epi = IOS_EXECREQ_EPILOGUE / 4;
+    unsigned i;
+
+    /* the two cross-process blocks: ten identical instructions, then a BL to the
+     * same send_cross_process_notification */
+    for (i = 0; i < 10; i++) if (w[nx + i] != w[xx + i]) return 0;
+    if (w[nx] != 0xf94002c3 /* ldr x3,[x22] */ || w[nx + 7] != 0xb90013fa /* str w26,[sp,#0x10] */) return 0;
+    if ((w[nx + 10] & 0xfc000000u) != 0x94000000u || (w[xx + 10] & 0xfc000000u) != 0x94000000u) return 0;
+    if (ios_a64_bl_target( (nx + 10) * 4, w[nx + 10] ) != ios_a64_bl_target( (xx + 10) * 4, w[xx + 10] )) return 0;
+    /* the non-exec path's block falls straight into the clear */
+    if (nx + 11 != clr) return 0;
+    if (check_x18 && w[clr] != 0xf94bc648 /* ldr x8, [x18, #0x1788] */) return 0;
+    if (w[clr + 1] != ios_a64_cbz64( (clr + 1) * 4, IOS_EXECREQ_EPILOGUE, 8 )) return 0;
+    if (w[clr + 2] != 0x3900051f /* strb wzr, [x8, #1]: InSyscallCallback = 0 */) return 0;
+    if (w[clr + 3] != ios_a64_b( (clr + 3) * 4, IOS_EXECREQ_EPILOGUE )) return 0;
+    /* the epilogue returns the status every path keeps in w26 */
+    if (w[epi] != 0x2a1a03e0 /* mov w0, w26 */ || w[epi + 6] != 0xd65f03c0 /* ret */) return 0;
+    return 1;
+}
+
+/* The probe as wine 38aa753f98b builds it (VA 0x1800574d8 in 18c8f6d's ntdll.dll):
+ * every exit runs leave_syscall_callback() -- `ldr x8,[x18,#0x1788]; cbz/cbnz x8;
+ * strb wzr,[x8,#1]` -- before the epilogue. {word, mask}: what adrp and the
+ * add/ldr offsets address, and the branch offsets, move with every rebuild. */
+#define IOS_EXECREQ_FIXED_WORDS 19u
+static const uint32_t ios_execreq_fixed_sig[IOS_EXECREQ_FIXED_WORDS][2] = {
+    { 0x72001f3f, 0xffffffff }, /* +0x00 tst  w25, #0xff             is_current          */
+    { 0x54000000, 0xff00001f }, /* +0x04 b.eq -> cross-process block, then the clear     */
+    { 0x90000008, 0x9f00001f }, /* +0x08 adrp x8, (pNotifyMemoryProtect)                 */
+    { 0xf940010b, 0xffc003ff }, /* +0x0c ldr  x11, [x8, #...]                            */
+    { 0xb400000b, 0xff00001f }, /* +0x10 cbz  x11 -> the clear                           */
+    { 0xf94002c1, 0xffffffff }, /* +0x14 ldr  x1, [x22]               *size_ptr          */
+    { 0xf9400280, 0xffffffff }, /* +0x18 ldr  x0, [x20]               *addr_ptr          */
+    { 0x90000008, 0x9f00001f }, /* +0x1c adrp x8, (icall checker)                        */
+    { 0xf9400108, 0xffc003ff }, /* +0x20 ldr  x8, [x8, #...]                             */
+    { 0x9000000a, 0x9f00001f }, /* +0x24 adrp x10, ...                                   */
+    { 0x9100014a, 0xffc003ff }, /* +0x28 add  x10, x10, #...                             */
+    { 0xd63f0100, 0xffffffff }, /* +0x2c blr  x8                                         */
+    { 0x2a1303e2, 0xffffffff }, /* +0x30 mov  w2, w19                 new_prot           */
+    { 0x52800023, 0xffffffff }, /* +0x34 mov  w3, #1                  After              */
+    { 0x2a1a03e4, 0xffffffff }, /* +0x38 mov  w4, w26                 status             */
+    { 0xd63f0160, 0xffffffff }, /* +0x3c blr  x11                     NotifyMemoryProtect */
+    { 0xf94bc648, 0xffffffff }, /* +0x40 ldr  x8, [x18, #0x1788]      leave_syscall_callback() */
+    { 0xb5000008, 0xff00001f }, /* +0x44 cbnz x8 -> the clear's strb                     */
+    { 0x14000000, 0xfc000000 }, /* +0x48 b    -> epilogue                                */
+};
+
+/* Is `w` (the image at a `tst w25, #0xff`, `room` bytes before the section ends)
+ * the fixed probe? Checks that each exit reaches the clear: the cross-process
+ * block runs straight into it, the no-NotifyMemoryProtect exit branches to it,
+ * the notified exit has its own copy, and the clear falls into the epilogue. */
+static int ios_execreq_fixed_ok( const uint32_t *w, uint32_t room )
+{
+    uint32_t i, xp, clr, epi;
+
+    for (i = 0; i < IOS_EXECREQ_FIXED_WORDS; i++)
+        if ((w[i] & ios_execreq_fixed_sig[i][1]) != ios_execreq_fixed_sig[i][0]) return 0;
+    xp = ios_a64_imm19_target( 0x04, w[1] );
+    clr = ios_a64_imm19_target( 0x10, w[4] );
+    epi = clr + 12;
+    if (clr < (IOS_EXECREQ_FIXED_WORDS + 11) * 4 || clr >= room || room - clr < 12 + 7 * 4) return 0;
+    if (w[clr / 4] != 0xf94bc648 /* ldr x8, [x18, #0x1788] */ ||
+        w[clr / 4 + 1] != ios_a64_cbz64( clr + 4, epi, 8 ) ||
+        w[clr / 4 + 2] != 0x3900051f /* strb wzr, [x8, #1]: InSyscallCallback = 0 */) return 0;
+    if (w[epi / 4] != 0x2a1a03e0 /* mov w0, w26 */ || w[epi / 4 + 6] != 0xd65f03c0 /* ret */) return 0;
+    if (ios_a64_imm19_target( 0x44, w[17] ) != clr + 8 || w[18] != ios_a64_b( 0x48, epi )) return 0;
+    /* ten straight-line instructions and the BL to send_cross_process_notification */
+    if (xp + 11 * 4 != clr || w[xp / 4] != 0xf94002c3 /* ldr x3,[x22] */ ||
+        w[xp / 4 + 7] != 0xb90013fa /* str w26,[sp,#0x10] */) return 0;
+    for (i = 0; i < 10; i++) if (ios_a64_is_branch( w[xp / 4 + i] )) return 0;
+    return (w[xp / 4 + 10] & 0xfc000000u) == 0x94000000u;
+}
+
+/* The probe's RVA in the image's executable sections, or 0 unless found exactly
+ * once: with the layout the patch was written against, or (fixed) as wine
+ * 38aa753f98b builds it. */
+static uint32_t ios_execreq_find( const unsigned char *img, int fixed )
+{
+    const uint32_t need = fixed ? IOS_EXECREQ_FIXED_WORDS * 4 : IOS_EXECREQ_EPILOGUE + 7 * 4;
+    uint32_t e_lfanew, size_of_image, nsec, optsz, i, found = 0, hits = 0;
+    const unsigned char *sh;
+
+    if (img[0] != 'M' || img[1] != 'Z') return 0;
+    memcpy( &e_lfanew, img + 0x3c, 4 );
+    if (e_lfanew > 0x1000 || memcmp( img + e_lfanew, "PE\0\0", 4 )) return 0;
+    nsec = *(const uint16_t *)(img + e_lfanew + 6);
+    optsz = *(const uint16_t *)(img + e_lfanew + 20);
+    memcpy( &size_of_image, img + e_lfanew + 24 + 56, 4 );
+    sh = img + e_lfanew + 24 + optsz;
+    for (i = 0; i < nsec; i++)
+    {
+        uint32_t vs, va, ch, off;
+        memcpy( &vs, sh + 40 * i + 8, 4 ); memcpy( &va, sh + 40 * i + 12, 4 ); memcpy( &ch, sh + 40 * i + 36, 4 );
+        if (!(ch & 0x20000000u /* IMAGE_SCN_MEM_EXECUTE */) || va >= size_of_image) continue;
+        if (vs > size_of_image - va) vs = size_of_image - va;
+        for (off = (va + 3) & ~3u; off + need <= va + vs; off += 4)
+        {
+            const uint32_t *w = (const uint32_t *)(img + off);
+
+            if (w[0] != ios_execreq_sig[0]) continue;   /* tst w25, #0xff in both layouts */
+            if (fixed ? !ios_execreq_fixed_ok( w, va + vs - off )
+                      : (memcmp( w, ios_execreq_sig, sizeof(ios_execreq_sig) ) || !ios_execreq_layout_ok( w, 1 )))
+                continue;
+            found = off;
+            hits++;
+        }
+    }
+    return hits == 1 ? found : 0;
+}
+
+/* Patch the copy of `module` (the PE ntdll) that the CURRENT process runs:
+ * ios_jit_translate_addr is owner-aware, so on a pseudo-process child's boot
+ * thread this is the child's private copy. 1 patched, 0 already patched, not
+ * wanted or not needed (the fixed probe), -1 refused (logged). */
+int ios_patch_execreq_leave( void *module )
+{
+    static int said_off, said_fixed;
+    const unsigned char *img = module;
+    uintptr_t rx_lo = (uintptr_t)ios_jit_rx_base_global;
+    uint32_t rva, want[3], i;
+    char *base_rx, *fn_rx, *fn_rw;
+    const uint32_t *pw;
+
+    if (!ios_execreq_leave_wanted())
+    {
+        if (!said_off++)
+            dprintf( 2, "[execreq-leave] off (MADEIRA_EXECREQ_LEAVE=1 makes NtProtectVirtualMemory's "
+                        "[exec-req] path clear InSyscallCallback)\n" );
+        return 0;
+    }
+    if (!module || !rx_lo || !ios_jit_rw_base_global) return -1;
+    if (!(rva = ios_execreq_find( img, 0 )))
+    {
+        if ((rva = ios_execreq_find( img, 1 )))
+        {
+            if (!said_fixed++)
+                dprintf( 2, "[execreq-leave] ntdll %p: NtProtectVirtualMemory's [exec-req] path already leaves the "
+                            "syscall callback (rva %#x, wine 38aa753f98b) -- nothing to patch\n", module, rva );
+            return 0;
+        }
+        dprintf( 2, "[execreq-leave] ntdll %p: the [exec-req] probe was not found exactly once with the "
+                    "expected layout -- not patched (a different ntdll.dll build?)\n", module );
+        return -1;
+    }
+    base_rx = ios_jit_translate_addr( module );
+    if ((uintptr_t)base_rx == (uintptr_t)module || (uintptr_t)base_rx < rx_lo ||
+        (uintptr_t)base_rx - rx_lo >= ios_jit_pool_size_global)
+    {
+        dprintf( 2, "[execreq-leave] ntdll %p has no pool copy for this process -- not patched\n", module );
+        return -1;
+    }
+    fn_rx = base_rx + rva;
+    fn_rw = (char *)ios_jit_rw_base_global + ((uintptr_t)fn_rx - rx_lo);
+    pw = (const uint32_t *)fn_rx;
+    ios_execreq_patched_words( want );
+    if (pw[IOS_EXECREQ_SITE_A / 4] == want[0] && pw[IOS_EXECREQ_SITE_B / 4] == want[1] &&
+        pw[IOS_EXECREQ_SITE_C / 4] == want[2])
+        return 0;   /* this copy is already patched */
+    for (i = 0; i < IOS_EXECREQ_WORDS; i++)
+    {
+        if (pw[i] != ios_execreq_sig[i])
+        {
+            dprintf( 2, "[execreq-leave] pool copy %p differs from the image at +%#x (%08x, image %08x) "
+                        "-- not patched\n", fn_rx, i * 4, pw[i], ios_execreq_sig[i] );
+            return -1;
+        }
+    }
+    if (!ios_execreq_layout_ok( pw, 0 ))
+    {
+        dprintf( 2, "[execreq-leave] pool copy %p: the blocks the patch branches to differ from the image "
+                    "-- not patched\n", fn_rx );
+        return -1;
+    }
+    __atomic_store_n( (uint32_t *)(fn_rw + IOS_EXECREQ_SITE_B), want[1], __ATOMIC_RELEASE );
+    __atomic_store_n( (uint32_t *)(fn_rw + IOS_EXECREQ_SITE_C), want[2], __ATOMIC_RELEASE );
+    __atomic_store_n( (uint32_t *)(fn_rw + IOS_EXECREQ_SITE_A), want[0], __ATOMIC_RELEASE );
+    sys_icache_invalidate( fn_rx, IOS_EXECREQ_SITE_C + 4 );
+    dprintf( 2, "[execreq-leave] ntdll %p (pool %p): NtProtectVirtualMemory's [exec-req] path now clears "
+                "InSyscallCallback (rva %#x: %08x %08x %08x)\n",
+             module, fn_rx, rva, want[0], want[1], want[2] );
+    return 1;
+}
+
+/* The same for a pseudo-process child's private ntdll copy; `pe_addr` is any
+ * address inside the shared ntdll image (cf. ios_patch_rtl_pc_to_file_header_current). */
+int ios_patch_execreq_leave_current( const void *pe_addr )
+{
+    int i;
+
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        const unsigned char *b = ios_jit_mappings[i].pe_base;
+        size_t sz = ios_jit_mappings[i].size;
+
+        if (!b || !sz || ios_jit_mappings[i].owner_peb) continue;
+        if ((const unsigned char *)pe_addr < b || (const unsigned char *)pe_addr >= b + sz) continue;
+        return ios_patch_execreq_leave( (void *)b );
+    }
+    return -1;
+}
+
+/* madeira-bcd: which PE section of a pool-copied image holds `va` (a NoExec
+ * target, a protect request)? `va` may be a PE address or an address inside a
+ * module's pool copy; for a pool address the text names the copy, its owner
+ * and the process that mapped it (build 327: the child died in the PARENT's
+ * ntdll copy, which a PE-only lookup could not name). Lock-free like the other
+ * fault-path diagnostics: reads the mapping table and the image's own headers.
+ * Writes the description into buf and the image's PE base into *img_base;
+ * returns 0 when no pool-copied image covers va. */
+int ios_image_section_describe( unsigned long long va, char *buf, size_t len, unsigned long long *img_base )
+{
+    int i, pass;
+
+    for (pass = 0; pass < 2; pass++)
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        const unsigned char *pe = ios_jit_mappings[i].pe_base, *b = NULL;
+        const unsigned char *in = pass ? (const unsigned char *)ios_jit_mappings[i].jit_base : pe;
+        size_t sz = ios_jit_mappings[i].size;
+        uint32_t e_lfanew = 0, nsec, optsz, s, off;
+        const unsigned char *sh;
+        char where[112];
+        int k;
+
+        if (!pe || !in || sz < 0x1000 || va < (uintptr_t)in || va >= (uintptr_t)in + sz) continue;
+        if (img_base) *img_base = (uintptr_t)pe;
+        off = (uint32_t)(va - (uintptr_t)in);
+        if (pass)
+            snprintf( where, sizeof(where), "POOL copy %p (owner=%p mapper=%p) of %p, rva %#x, ",
+                      ios_jit_mappings[i].jit_base, ios_jit_mappings[i].owner_peb,
+                      ios_jit_mappings[i].map_peb, (const void *)pe, off );
+        else
+            snprintf( where, sizeof(where), "rva %#x, ", off );
+        /* The pool copy's headers first: they were copied when the image was
+         * mapped, before a protector could wipe the live ones. */
+        for (k = 0; k < 2; k++)
+        {
+            b = k ? pe : (const unsigned char *)ios_jit_mappings[i].jit_base;
+            if (!b) continue;
+            memcpy( &e_lfanew, b + 0x3c, 4 );
+            if (e_lfanew <= 0x1000 - 0x200 && !memcmp( b + e_lfanew, "PE\0\0", 4 )) break;
+        }
+        if (k == 2)
+        {
+            snprintf( buf, len, "%s(image headers unreadable, rva %#x)", where, off );
+            return 1;
+        }
+        nsec = *(const uint16_t *)(b + e_lfanew + 6);
+        optsz = *(const uint16_t *)(b + e_lfanew + 20);
+        sh = b + e_lfanew + 24 + optsz;
+        for (s = 0; s < nsec && s < 96; s++)
+        {
+            char name[9];
+            uint32_t vs, sva, raw, ch;
+
+            if ((size_t)(sh + 40 * (s + 1) - b) > 0x1000) break;
+            memcpy( name, sh + 40 * s, 8 ); name[8] = 0;
+            memcpy( &vs, sh + 40 * s + 8, 4 ); memcpy( &sva, sh + 40 * s + 12, 4 );
+            memcpy( &raw, sh + 40 * s + 16, 4 ); memcpy( &ch, sh + 40 * s + 36, 4 );
+            if (!vs) vs = raw;
+            if (off < sva || off - sva >= ((vs + 0xfffu) & ~0xfffu)) continue;
+            snprintf( buf, len, "%ssection #%u '%s' rva %#x+%#x chars %#x (%s%s%s%s)", where, s, name, sva, vs, ch,
+                      (ch & 0x40000000u) ? "R" : "-", (ch & 0x80000000u) ? "W" : "-",
+                      (ch & 0x20000000u) ? "X" : "-", (ch & 0x00000020u) ? " CODE" : "" );
+            return 1;
+        }
+        snprintf( buf, len, "%soutside every section (rva %#x, %u sections)", where, off, nsec );
+        return 1;
+    }
+    return 0;
+}
+
 /***********************************************************************
  *           ios_jit_patch_x18  (x18 → TPIDR_EL0 binary patcher)
  *
@@ -24208,6 +24624,39 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
     else status = STATUS_INVALID_PARAMETER;
 
     if (!status) VIRTUAL_DEBUG_DUMP_VIEW( view );
+
+#ifdef WINE_IOS
+    /* madeira-bcd: [prot-img] -- protection changes of 64 KB or more on the
+     * process's own main image, with the section they start in. GTA V Enhanced
+     * died executing GTA5_Enhanced.exe+0x509a144, in sections the emulator was
+     * never told were made executable. Whether the emulator WAS told cannot be
+     * read here: the PE wrapper enters this syscall with InSyscallCallback set
+     * on the notified path too (enter_syscall_callback() comes first), so the
+     * flag is 1 either way (build 327: every line said insc=1, which meant
+     * nothing, so it is gone). The answer is the PE side's [exec-req] line and
+     * FEX's "Add SMC interval" after it. First 48 per session.
+     * (GTA V Enhanced's NoExec crash.) */
+    {
+        static int prot_img_n;
+        PEB *cur_peb = NtCurrentTeb() ? NtCurrentTeb()->Peb : NULL;
+
+        if (view && (view->protect & SEC_IMAGE) && size >= 0x10000 && prot_img_n < 48 &&
+            cur_peb && cur_peb->ImageBaseAddress == view->base)
+        {
+            extern int ios_image_section_describe( unsigned long long va, char *buf, size_t len,
+                                                   unsigned long long *img_base );
+            char sec[160];
+
+            prot_img_n++;
+            if (!ios_image_section_describe( (uintptr_t)base, sec, sizeof(sec), NULL ))
+                snprintf( sec, sizeof(sec), "(no pool copy)" );
+            dprintf( 2, "[prot-img] #%d tid=%04x %p+%#lx (rva %#lx) new_prot=%#x old=%#x status=%#x | %s\n",
+                     prot_img_n, (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, base,
+                     (unsigned long)size, (unsigned long)((char *)base - (char *)view->base),
+                     (unsigned)new_prot, status ? 0u : (unsigned)old, status, sec );
+        }
+    }
+#endif
 
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
 
