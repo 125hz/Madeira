@@ -21,11 +21,13 @@
 
 #include "config.h"
 #include <os/log.h>
+#include <os/lock.h>
 #include <mach/mach_time.h>
 #include <mach/mach_init.h>
 #include <mach/semaphore.h>
 #include <mach/task.h>
 #include <pthread.h>
+#include <pthread/qos.h>
 #include <mach/mach_vm.h>
 #include <mach/vm_region.h>
 #include "wine_log_ios.h"
@@ -85,7 +87,137 @@ void ios_wineserver_ring( unsigned int tid )
     else
         __atomic_store_n( &ios_srv_bell_full, 1, __ATOMIC_SEQ_CST );
     ios_wineserver_wake();
+}
 
+/* madeira-bcd: the server's per-launch switches. The server thread is running before a
+ * game's env lines are applied, so WineProcessBridge.m sets these after them and clears
+ * them when the session ends (the way g_madeira_srv_fgetpath works). */
+extern volatile int g_madeira_srv_eco_follow;   /* env.MADEIRA_SRV_ECO_FOLLOW = 1 */
+extern volatile int g_madeira_srv_direct;       /* env.MADEIRA_SRV_DIRECT = 1 or 2 */
+extern volatile int g_madeira_srv_idle_us;      /* env.MADEIRA_SRV_IDLE_US = us, 0 = 1000 */
+extern volatile int g_madeira_srv_log_all;      /* env.MADEIRA_SRV_LOG_ALL = 1 */
+
+/* madeira-bcd: a ws_log line written for every fd object (add_poll_user) or every
+ * descriptor sent to a client (request_ios.c send_client_fd) costs the server thread a
+ * vsnprintf, a localtime_r and an fflush (a write) each: about 2,800 a second in Horizon
+ * Zero Dawn's menu (~940 opened shader-cache files a second; 493, 2026-10-11), on a
+ * performance core, and most of them never reach the session log. Each such line is now
+ * written for its first 64 occurrences and then every 1000th; the program does the same
+ * work either way. env.MADEIRA_SRV_LOG_ALL = 1 writes every line, as before. */
+int ios_srv_log_sample( unsigned long *count )
+{
+    unsigned long n = ++*count;
+    return n <= 64 || !(n % 1000) || __atomic_load_n( &g_madeira_srv_log_all, __ATOMIC_RELAXED ) == 1;
+}
+
+/* madeira-bcd: env.MADEIRA_SRV_ECO_FOLLOW = 1 (off by default). The server thread is
+ * created at user-interactive QoS (WineServerBridge.m), so it keeps a performance core at
+ * full clock while ECO holds every guest thread on the efficiency cores: Horizon Zero
+ * Dawn's menu with eco = 1 (2026-10-11 11:10) ran it at 0.54 cores, all of it on P at
+ * ~3.9 GHz, while every guest thread ran on E. With the switch the server thread runs at
+ * utility QoS (ECO's default class; never background, which could stall every request
+ * for seconds) while ECO is on, and user-interactive again when ECO goes off or the
+ * session ends. ECO changes come from ntdll's generation counter (sync.c ios_eco_gen: the
+ * ECO pill, the power governor), looked at once per loop pass. madeira_get_eco() reads
+ * madeira.cfg the first time it runs and keeps the answer, so it is called only once the
+ * bridge has set the switch, which is after the game's configuration is in place. */
+extern volatile int ios_eco_gen;      /* wine/dlls/ntdll/unix/sync.c */
+extern int madeira_get_eco( void );   /* same */
+static qos_class_t ios_srv_qos_set;   /* 0: the class the thread was created with */
+static int ios_srv_qos_follow_seen, ios_srv_qos_gen_seen;
+
+static void ios_srv_qos_follow(void)
+{
+    int follow = __atomic_load_n( &g_madeira_srv_eco_follow, __ATOMIC_ACQUIRE ) == 1;
+    int gen;
+    qos_class_t want = QOS_CLASS_USER_INTERACTIVE;
+
+    if (!follow && !ios_srv_qos_set) return;   /* switch off and nothing changed: nothing to do */
+    gen = __atomic_load_n( &ios_eco_gen, __ATOMIC_ACQUIRE );
+    if (follow == ios_srv_qos_follow_seen && gen == ios_srv_qos_gen_seen) return;
+    ios_srv_qos_follow_seen = follow;
+    ios_srv_qos_gen_seen = gen;
+    if (follow && madeira_get_eco()) want = QOS_CLASS_UTILITY;
+    if (want == (ios_srv_qos_set ? ios_srv_qos_set : QOS_CLASS_USER_INTERACTIVE)) return;
+    pthread_set_qos_class_self_np( want, 0 );
+    ios_srv_qos_set = want == QOS_CLASS_USER_INTERACTIVE ? 0 : want;
+    fprintf( stderr, "[srv-qos] server thread -> %s (ECO %s, MADEIRA_SRV_ECO_FOLLOW %s)\n",
+             want == QOS_CLASS_UTILITY ? "utility" : "user-interactive", want == QOS_CLASS_UTILITY ? "on" : "off",
+             follow ? "on" : "off" );
+}
+
+/* madeira-bcd: env.MADEIRA_SRV_IDLE_US (off by default: 1000 us, as before). The longest
+ * the loop sleeps when no timer is due sooner. A request wakes it at once (the wake
+ * semaphore) and a timer at its deadline; only the socket poll, the init-fd checks and the
+ * read of every client fd (MADEIRA_SRV_POLL_US, MADEIRA_SRV_FULLSCAN_MS) wait for this
+ * tick, so a longer sleep delays those and nothing else. It is the floor of the server
+ * thread's wake-ups: 1000 a second while idle, and with direct requests
+ * (MADEIRA_SRV_DIRECT) most requests no longer wake it at all. 100 us to 50 ms. */
+static unsigned long long ios_srv_idle_ns(void)
+{
+    int us = __atomic_load_n( &g_madeira_srv_idle_us, __ATOMIC_RELAXED );
+    if (us <= 0) return 1000000ull;
+    if (us < 100) us = 100;
+    if (us > 50000) us = 50000;
+    return (unsigned long long)us * 1000ull;
+}
+
+/* madeira-bcd: direct requests (env.MADEIRA_SRV_DIRECT, off by default; request_ios.c
+ * ios_srv_direct_call). While they are on, everything this loop does runs under
+ * ios_srv_lock, which the loop lets go only while it sleeps, and a client thread runs a
+ * listed request under the same lock. ios_srv_direct_live is set and cleared only by the
+ * loop, with the lock held, so a client that finds it set under the lock knows the loop is
+ * not running without the lock. Turning the switch off waits for a direct request still
+ * running, then the loop goes on without the lock, exactly as before. */
+extern os_unfair_lock ios_srv_lock;               /* request_ios.c */
+extern volatile int ios_srv_direct_live;          /* request_ios.c */
+extern volatile int ios_srv_timer_added;          /* request_ios.c */
+extern unsigned long long ios_srv_loop_wake_at;   /* request_ios.c: monotonic tick the loop sleeps until */
+static int ios_srv_loop_locked;
+
+static void ios_srv_loop_enter(void)
+{
+    int level = __atomic_load_n( &g_madeira_srv_direct, __ATOMIC_ACQUIRE );
+
+    if (level > 0)
+    {
+        os_unfair_lock_lock( &ios_srv_lock );
+        ios_srv_loop_locked = 1;
+        if (!__atomic_load_n( &ios_srv_direct_live, __ATOMIC_ACQUIRE ))
+        {
+            __atomic_store_n( &ios_srv_direct_live, 1, __ATOMIC_RELEASE );
+            fprintf( stderr, "[srv-direct] on (level %d): listed requests run on their own threads\n", level );
+        }
+    }
+    else if (__atomic_load_n( &ios_srv_direct_live, __ATOMIC_ACQUIRE ))
+    {
+        os_unfair_lock_lock( &ios_srv_lock );     /* a direct request still running ends first */
+        __atomic_store_n( &ios_srv_direct_live, 0, __ATOMIC_RELEASE );
+        os_unfair_lock_unlock( &ios_srv_lock );
+        fprintf( stderr, "[srv-direct] off\n" );
+    }
+}
+
+static void ios_srv_loop_leave(void)
+{
+    if (!ios_srv_loop_locked) return;
+    ios_srv_loop_locked = 0;
+    os_unfair_lock_unlock( &ios_srv_lock );
+}
+
+/* the loop is ending: no direct request may run after it, and the next server thread
+ * (WineServerBridge.m starts one per session) starts at its creation QoS */
+static void ios_srv_loop_exit(void)
+{
+    if (!ios_srv_loop_locked && __atomic_load_n( &ios_srv_direct_live, __ATOMIC_ACQUIRE ))
+    {
+        os_unfair_lock_lock( &ios_srv_lock );
+        ios_srv_loop_locked = 1;
+    }
+    __atomic_store_n( &ios_srv_direct_live, 0, __ATOMIC_RELEASE );
+    ios_srv_loop_leave();
+    ios_srv_qos_set = 0;
+    ios_srv_qos_follow_seen = ios_srv_qos_gen_seen = 0;
 }
 
 /* __WINESRC__ must be defined via -D flag so unicode_fix.h can see it */
@@ -695,6 +827,20 @@ struct timeout_user *add_timeout_user( timeout_t when, timeout_callback func, vo
         }
     }
     list_add_before( ptr, &user->entry );
+#ifdef WINE_IOS
+    /* madeira-bcd: a direct request (MADEIRA_SRV_DIRECT) runs while the loop sleeps until
+     * ios_srv_loop_wake_at; a timer due before that has the request wake the loop */
+    if (__atomic_load_n( &ios_srv_direct_live, __ATOMIC_RELAXED ))
+    {
+        timeout_t due;
+        if (user->when > 0)
+            due = (user->when - current_time > LLONG_MAX - monotonic_time)
+                  ? LLONG_MAX : monotonic_time + (user->when - current_time);
+        else
+            due = -user->when;
+        if (due < (timeout_t)ios_srv_loop_wake_at) ios_srv_timer_added = 1;
+    }
+#endif
     return user;
 }
 
@@ -1129,7 +1275,11 @@ static int add_poll_user( struct fd *fd )
     pollfd[ret].revents = 0;
     poll_users[ret] = fd;
     active_users++;
-    ws_log("[wineserver-fd] add_poll_user: user=%d unix_fd=%d active_users=%d", ret, fd->unix_fd, active_users);
+    {
+        static unsigned long logged;   /* madeira-bcd: ios_srv_log_sample */
+        if (ios_srv_log_sample( &logged ))
+            ws_log("[wineserver-fd] add_poll_user: user=%d unix_fd=%d active_users=%d", ret, fd->unix_fd, active_users);
+    }
     return ret;
 }
 
@@ -1414,6 +1564,7 @@ void main_loop(void)
             ws_log("[wineserver-fd] request-wake semaphore: kr=%d sem=0x%x", skr, ios_srv_wake_sem);
             if (skr != KERN_SUCCESS) ios_srv_wake_sem = 0;
         }
+        ios_srv_loop_enter();   /* madeira-bcd: MADEIRA_SRV_DIRECT; the lock is let go only to sleep */
         while (active_users)
         {
             /* Check stop flag */
@@ -1430,6 +1581,7 @@ void main_loop(void)
                 ios_next_timer_ns = (timeout >= 0)
                     ? (unsigned long long)next_ts.tv_sec * 1000000000ull + next_ts.tv_nsec
                     : ~0ull;
+                ios_srv_timer_added = 0;   /* madeira-bcd: every timer so far is in this deadline */
             }
             if (!active_users) { ws_log("[wineserver-fd] LOOP EXIT: active_users=0 at iter=%d", ios_iter); break; }
 
@@ -1507,7 +1659,7 @@ void main_loop(void)
              * Thumper's 8 zero-timeout polls/frame each paid the old
              * pickup latency: the 55-vs-60 FPS gap. */
             {
-                unsigned long long sleep_ns = 1000000ull;
+                unsigned long long sleep_ns = ios_srv_idle_ns();   /* madeira-bcd: 1 ms unless MADEIRA_SRV_IDLE_US */
                 /* ml585: timer lateness = how long past a due timer's deadline
                  * we actually resumed. This is the number that matters for the
                  * 77s Steam stalls — a starved loop shows up here even when the
@@ -1517,6 +1669,12 @@ void main_loop(void)
                 if (!lt_tb.denom) mach_timebase_info( &lt_tb );
                 lt_t0 = mach_absolute_time();
                 if (ios_next_timer_ns < sleep_ns) sleep_ns = ios_next_timer_ns;
+                /* madeira-bcd: direct requests run while the loop sleeps (MADEIRA_SRV_DIRECT) */
+                if (ios_srv_loop_locked)
+                {
+                    ios_srv_loop_wake_at = monotonic_counter() + sleep_ns / 100;
+                    ios_srv_loop_leave();
+                }
                 if (sleep_ns > 0)
                 {
                     /* ml585 A/B, default OFF. MADEIRA_SRV_NOSEM=1 ignores the
@@ -1580,6 +1738,8 @@ void main_loop(void)
                         mach_wait_until( deadline );
                     }
                 }
+                ios_srv_loop_enter();    /* madeira-bcd: MADEIRA_SRV_DIRECT */
+                ios_srv_qos_follow();    /* madeira-bcd: MADEIRA_SRV_ECO_FOLLOW */
                 lt_slept_ns = (mach_absolute_time() - lt_t0) * lt_tb.numer / lt_tb.denom;
                 if (ios_next_timer_ns != ~0ull && lt_slept_ns > ios_next_timer_ns)
                 {
@@ -1623,6 +1783,15 @@ void main_loop(void)
                              ios_bell_again / s, nb_users );
                     ios_pass_n = ios_full_n = ios_slow_n = ios_bell_threads = ios_bell_again = 0;
                     ios_db_report = now_ns;
+                    {   /* madeira-bcd: MADEIRA_SRV_DIRECT, only when it ran */
+                        extern unsigned long long ios_srv_direct_n, ios_srv_direct_fallback, ios_srv_direct_timer_wakes;
+                        unsigned long long dn = __atomic_exchange_n( &ios_srv_direct_n, 0, __ATOMIC_RELAXED );
+                        unsigned long long df = __atomic_exchange_n( &ios_srv_direct_fallback, 0, __ATOMIC_RELAXED );
+                        unsigned long long dw = __atomic_exchange_n( &ios_srv_direct_timer_wakes, 0, __ATOMIC_RELAXED );
+                        if (dn || df)
+                            fprintf( stderr, "[srv-direct] %.0f requests/s ran on their own threads, %.0f/s went "
+                                     "through the pipe instead, %.0f timer wakes/s\n", dn / s, df / s, dw / s );
+                    }
                 }
             }
             if (!ios_slow_pass) continue;
@@ -1762,6 +1931,7 @@ void main_loop(void)
                 ws_log("[wineserver-fd] POST iter=%d act=%d nb=%d ef=%d", ios_iter, active_users, nb_users, ios_events_fired);
             }
         }
+        ios_srv_loop_exit();   /* madeira-bcd: no direct request after the loop */
     }
     ws_log("[wineserver-fd] main_loop EXITED! active_users=%d", active_users);
 #else
@@ -4083,6 +4253,20 @@ DECL_HANDLER(get_handle_fd)
             reply->type = fd->fd_ops->get_fd_type( fd );
             reply->options = fd->options;
             reply->access = get_handle_access( current->process, req->handle );
+#ifdef WINE_IOS
+            /* madeira-bcd: the client is a thread of this process, so a client that leaves
+             * room for an int (server_ios.c server_get_unix_fd) gets its own descriptor for
+             * the same open file in the reply: what SCM_RIGHTS would give it (close-on-exec
+             * included), without the sendmsg here and the recvmsg and fcntl there. -1 in the
+             * reply is the descriptor table being full, which the client reports as the
+             * socket path does. */
+            if (get_reply_max_size() == sizeof(int))
+            {
+                int client_fd = fcntl( unix_fd, F_DUPFD_CLOEXEC, 0 );
+                if (!set_reply_data( &client_fd, sizeof(client_fd) ) && client_fd != -1) close( client_fd );
+            }
+            else
+#endif
             send_client_fd( current->process, unix_fd, req->handle );
         }
         release_object( fd );

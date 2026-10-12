@@ -143,6 +143,8 @@ static void ios_fdt_autopsy( const char *what, int fd, int ret, int err ) { (voi
 volatile int ios_srv_req_count;
 void ios_wineserver_wake(void) {}
 void ios_wineserver_ring( unsigned int tid ) { (void)tid; }
+volatile int g_madeira_srv_direct;      /* MADEIRA_SRV_DIRECT is off here: check-srv-direct.py */
+static BOOL ios_srv_try_direct( struct __server_request_info *req, unsigned int *status ) { (void)req; (void)status; return FALSE; }
 static DECLSPEC_NORETURN void server_protocol_perror( const char *err ) { perror( err ); abort(); }
 void server_enter_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset );
 void server_leave_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset );
