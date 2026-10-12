@@ -2260,10 +2260,20 @@ static int winios_game_cursor_enabled(void) {
     return !(e && *e == '0');
 }
 
+/* Both Wine bitmaps and the built-in fallback have a desktop-pixel size.
+ * A fixed 21-point fallback grows relative to a 1080p desktop fitted into a
+ * portrait view. Keep the arrow's shape and use a normal 32-pixel height. */
+static CGSize winios_cursor_pixel_size(void) {
+    if (g_cur_w > 0) return CGSizeMake(g_cur_w, g_cur_h);
+    CGSize shape = winios_cursor_image().size;
+    return CGSizeMake(32.0 * shape.width / shape.height, 32.0);
+}
+
 /* The cursor is a sublayer of the compositor view; a dropped view takes it. */
 static void winios_forget_cursor_layer(void) {
     [g_cursor_layer removeFromSuperlayer];
     g_cursor_layer = nil;
+    g_cur_w = g_cur_h = g_cur_hx = g_cur_hy = 0;
     g_game_cursor_seen = NO;
     g_game_cursor_prog_hidden = NO;
     atomic_store_explicit(&g_game_cursor_drawn, 0, memory_order_relaxed);
@@ -2288,18 +2298,19 @@ static void winios_ensure_cursor_layer(void) {
 static void winios_cursor_place(void) {
     if (!g_cursor_layer) return;
     CGFloat x = g_cursor_pos_px.x, y = g_cursor_pos_px.y;
+    CGSize pixels = winios_cursor_pixel_size();
     CGPoint fitted; CGFloat k = 0;
     if (winios_desktop_fit_map(x, y, &fitted, &k)) {   /* over a fitted window */
+        g_cursor_layer.bounds = CGRectMake(0, 0, pixels.width * k, pixels.height * k);
         if (g_cur_w > 0) {
-            g_cursor_layer.bounds = CGRectMake(0, 0, g_cur_w * k, g_cur_h * k);
             g_cursor_layer.position = CGPointMake(fitted.x - g_cur_hx * k, fitted.y - g_cur_hy * k);
         } else {
             g_cursor_layer.position = fitted;
         }
         return;
     }
+    g_cursor_layer.bounds = CGRectMake(0, 0, pixels.width * g_px_to_pt, pixels.height * WINIOS_PX_TO_PT_Y);
     if (g_cur_w > 0) {
-        g_cursor_layer.bounds = CGRectMake(0, 0, g_cur_w * g_px_to_pt, g_cur_h * g_px_to_pt);
         g_cursor_layer.position = CGPointMake(g_desk_origin.x + (x - g_cur_hx) * g_px_to_pt,
                                               g_desk_origin.y + (y - g_cur_hy) * WINIOS_PX_TO_PT_Y);
     } else {
