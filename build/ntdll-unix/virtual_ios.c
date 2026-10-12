@@ -7140,9 +7140,32 @@ NTSTATUS unixcall_ios_get_fex_arena( void *args )
  * rather than by a list of call sites someone has to remember to update. */
 static int fex_arena_covers( const void *limit_low, const void *limit_high )
 {
+    ULONG_PTR lo = (ULONG_PTR)limit_low, hi = (ULONG_PTR)limit_high;
+    static int wow_band = -1, logged;
+
     if (!ios_fex_arena_base_unix || !ios_fex_arena_end_unix) return 0;
-    return (ULONG_PTR)limit_low  >= ios_fex_arena_base_unix &&
-           (ULONG_PTR)limit_high <= ios_fex_arena_end_unix;
+    if (lo >= ios_fex_arena_base_unix && hi <= ios_fex_arena_end_unix) return 1;
+    /* madeira-bcd [wow-band]: the WOW64 CPU module (xtajit.dll) is never handed
+     * the arena (its ios_get_fex_arena unix call is unsupported), so its rpmalloc
+     * band selector asks for the whole hardware FEX band [0x7c00000000,
+     * 0x7fffffffff]. With env.MADEIRA_SC_PA_POOLS = 1/2 the arena starts at
+     * 0x7d00000000, so that request is not contained, [0x7c..,0x7d..) is Social
+     * Club's held cage and 32-63 GB is refused by the kernel: no band, rpmalloc
+     * returns NULL, SEGV at 0x7f0 before any x86 code runs (32-bit vc_redist
+     * started by the Rockstar Games Launcher installer). Serve exactly that
+     * request from the arena; the caller clamps placement to the area, so it
+     * stays inside. MADEIRA_WOW_FEX_BAND=0 turns this off. */
+    if (wow_band < 0) { const char *e = getenv( "MADEIRA_WOW_FEX_BAND" ); wow_band = !(e && e[0] == '0'); }
+    if (wow_band && lo == 0x7c00000000ULL && lo < ios_fex_arena_base_unix &&
+        hi + 1 >= ios_fex_arena_end_unix && hi <= ios_fex_arena_end_unix)
+    {
+        if (logged++ < 4)
+            dprintf( 2, "[wow-band] FEX hardware-band request [%p,%p] served from the FEX arena "
+                        "[0x%lx,0x%lx) (MADEIRA_WOW_FEX_BAND=0 reverts)\n", limit_low, limit_high,
+                     (unsigned long)ios_fex_arena_base_unix, (unsigned long)ios_fex_arena_end_unix );
+        return 1;
+    }
+    return 0;
 }
 
 struct builtin_module
@@ -31427,6 +31450,69 @@ void virtual_fill_image_information( const struct pe_image_info *pe_info, SECTIO
 #endif
 }
 
+/* madeira-bcd [ucrt-shadow]: an x64 program's folder can carry Microsoft's
+ * app-local UCRT (ucrtbase.dll). Wine turns api-ms-win-crt-* imports into the
+ * bare name "ucrtbase.dll" and searches the program's folder first; upstream
+ * Wine then swaps in the builtin in load_builtin(), but the iOS load_builtin()
+ * keeps the file it found. The first importer is the emulator itself
+ * (load_arm64ec_module), so that x64 DllMain runs while
+ * __os_arm64x_check_icall is still the early stub that treats every target as
+ * native: a native branch into x64 bytes, c000001d (RockstarService.exe of the
+ * Rockstar Games Launcher). Windows 10+ never uses an app-local UCRT either.
+ * Report such an image as built for another machine, so open_dll_file ->
+ * is_valid_binary rejects it and the search goes on to system32 / the sysx64
+ * mixed-arch fallback. MADEIRA_APP_UCRT=1 turns this off. */
+static BOOL ios_ucrt_shadow_refused( HANDLE handle, const struct pe_image_info *pi )
+{
+    extern int ios_is_arm64ec_cur(void);
+    static const char ucrt[] = "ucrtbase.dll";
+    static int opt = -1, logged;
+    struct pe_image_info *info = NULL;
+    unsigned int sec_flags;
+    mem_size_t full_size;
+    HANDLE shared_file = 0;
+    UNICODE_STRING nt_name;
+    ANSI_STRING exp_name;
+    const WCHAR *name;
+    USHORT len, i;
+    BOOL ret = FALSE;
+
+    if (pi->machine != IMAGE_FILE_MACHINE_AMD64 || pi->is_hybrid || pi->wine_builtin) return FALSE;
+    if (!ios_is_arm64ec_cur()) return FALSE;
+    if (opt < 0) { const char *e = getenv( "MADEIRA_APP_UCRT" ); opt = (e && e[0] == '1'); }
+    if (opt) return FALSE;
+    memset( &nt_name, 0, sizeof(nt_name) );
+    if (get_mapping_info( handle, SECTION_QUERY, &sec_flags, &full_size, &shared_file,
+                          &info, &nt_name, &exp_name )) return FALSE;
+    if (shared_file) NtClose( shared_file );
+    if (!info) return FALSE;
+    len = nt_name.Length / sizeof(WCHAR);
+    name = nt_name.Buffer;
+    for (i = 0; i < len; i++)
+        if (nt_name.Buffer[i] == '\\' || nt_name.Buffer[i] == '/') name = nt_name.Buffer + i + 1;
+    if (name) len -= name - nt_name.Buffer;
+    if (name && len == sizeof(ucrt) - 1)
+    {
+        for (i = 0; i < len; i++)
+        {
+            WCHAR c = name[i];
+            if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+            if (c != (WCHAR)ucrt[i]) break;
+        }
+        if (i == len)
+        {
+            ret = TRUE;
+            if (logged++ < 8)
+                dprintf( 2, "[ucrt-shadow] %s: plain x64 ucrtbase.dll outside the system farm in an "
+                            "x64 (ARM64EC) process -- reported as not loadable so the loader keeps "
+                            "searching and binds the system UCRT, as Windows 10+ does "
+                            "(MADEIRA_APP_UCRT=1 reverts)\n", debugstr_us(&nt_name) );
+        }
+    }
+    free( info );
+    return ret;
+}
+
 /******************************************************************************
  *             NtQuerySection   (NTDLL.@)
  *             ZwQuerySection   (NTDLL.@)
@@ -31436,6 +31522,7 @@ NTSTATUS WINAPI NtQuerySection( HANDLE handle, SECTION_INFORMATION_CLASS class, 
 {
     unsigned int status;
     struct pe_image_info image_info;
+    BOOL is_image = FALSE;
 
     switch (class)
     {
@@ -31471,11 +31558,16 @@ NTSTATUS WINAPI NtQuerySection( HANDLE handle, SECTION_INFORMATION_CLASS class, 
                 SECTION_IMAGE_INFORMATION *info = ptr;
                 virtual_fill_image_information( &image_info, info );
                 if (ret_size) *ret_size = sizeof(*info);
+                is_image = TRUE;
             }
             else status = STATUS_SECTION_NOT_IMAGE;
         }
     }
     SERVER_END_REQ;
+
+    /* outside the request block: the helper makes its own server call */
+    if (!status && is_image && ios_ucrt_shadow_refused( handle, &image_info ))
+        ((SECTION_IMAGE_INFORMATION *)ptr)->Machine = IMAGE_FILE_MACHINE_UNKNOWN;
 
     return status;
 }
