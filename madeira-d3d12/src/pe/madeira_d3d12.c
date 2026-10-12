@@ -358,6 +358,8 @@ struct mad_device {
     struct mad_hret { unsigned heap; UINT64 off, size, serial; } *hret; unsigned nhret, hret_cap;
     struct mad_mhret { obj_handle_t heap; UINT64 serial; void *mem; } *mhret; unsigned nmhret, mhret_cap;   /* ml1148: Metal heaps waiting for the GPU */
     struct { UINT32 value[4]; obj_handle_t buf; } fillpat[32]; unsigned nfillpat; SRWLOCK fillpat_lock;   /* ml1151: exact UAV clear patterns (a 16-byte period) */
+    obj_handle_t k_lib, k_ring; UINT64 k_ring_pos; int k_state; SRWLOCK k_lock;   /* madeira-bcd: helper kernels (mad_kernels.metal) */
+    obj_handle_t k_probe_pso; unsigned char *k_ring_cpu;   /* madeira-bcd: indirect-argument probes */
     LONG64 hp_live_bytes, hp_total_bytes; LONG hp_textures, hp_fallbacks;
 };
 static LONG g_tview_live, g_tview_made, g_xview_live;   /* ml1126 */
@@ -4156,6 +4158,63 @@ static void mad_gs_draw(UINT pt, UINT vertex_size, UINT max_prims, UINT instance
  * `mesh_prims` tessellated primitives. Every patch list is
  * IRRuntimePrimitiveTypeTriangle to the converter. */
 #define MAD_DTESS_OBJECT_TG_MEM 15360u   /* the helpers' setObjectThreadgroupMemoryLength:15360 atIndex:0 */
+
+/* madeira-bcd: HELPER KERNELS. mad_kernels.metal is compiled to a metallib by
+ * build/madeira-d3d12/build-pe.sh and embedded; the indirect-argument probe
+ * (ind-probe) runs on its kernel and a shared 4 MB ring the CPU can read.
+ * Without the metallib (no xcrun, or the compile failed) whatever needs it is
+ * skipped. */
+#ifdef MAD_HAVE_KERNELS
+#include "mad_kernels_metallib.h"
+#endif
+#define MAD_KRING_BYTES (4u << 20)
+static int mad_kernels_ready(struct mad_device *d) {
+    if (d->k_state) return d->k_state > 0;
+    AcquireSRWLockExclusive(&d->k_lock);
+    if (!d->k_state) {
+#ifdef MAD_HAVE_KERNELS
+        /* a heap copy, as the converter's libraries are made from (not a pointer into this image) */
+        void *img = malloc(mad_kernels_metallib_len);
+        obj_handle_t dd = 0, err = 0, fn = 0;
+        struct WMTComputePipelineInfo ci; struct WMTBufferInfo bi;
+        if (img) { memcpy(img, mad_kernels_metallib, mad_kernels_metallib_len); dd = DispatchData_alloc_init((uint64_t)(uintptr_t)img, (uint64_t)mad_kernels_metallib_len); }
+        if (dd) { d->k_lib = MTLDevice_newLibrary(d->mtl_device, dd, &err); NSObject_release(dd); }
+        free(img);
+        if (err) mad_log_nserror("helper kernels", err);
+        fn = d->k_lib ? MTLLibrary_newFunction(d->k_lib, "mad_probe_words") : 0;
+        if (fn) {
+            memset(&ci, 0, sizeof ci); ci.compute_function = fn; err = 0;
+            d->k_probe_pso = MTLDevice_newComputePipelineState(d->mtl_device, &ci, &err);
+            if (err) mad_log_nserror("mad_probe_words", err);
+            NSObject_release(fn);
+        }
+        memset(&bi, 0, sizeof bi); bi.length = MAD_KRING_BYTES; bi.options = WMTResourceStorageModeShared;
+        if (d->k_lib) d->k_ring = MTLDevice_newBuffer(d->mtl_device, &bi);
+        if (d->k_ring) { mad_resident(d, d->k_ring); d->k_ring_cpu = (unsigned char *)bi.memory.ptr; }
+        d->k_state = d->k_lib && d->k_ring ? 1 : -1;
+        d3d12_log("[madeira-d3d12] helper kernels: %s (library %d, probe kernel %d, ring %d%s)\n",
+                  d->k_state > 0 ? "ready" : "NOT available", !!d->k_lib, !!d->k_probe_pso, !!d->k_ring,
+                  d->k_ring_cpu ? ", CPU-visible" : "");
+#else
+        d->k_state = -1;
+        d3d12_log("[madeira-d3d12] helper kernels: not built in (no metallib); the indirect-argument probe is off\n");
+#endif
+    }
+    ReleaseSRWLockExclusive(&d->k_lock);
+    return d->k_state > 0;
+}
+/* A 256-byte-aligned range of the ring. The GPU consumes a range long before
+ * the ring comes round again (4 MB at 16 bytes a record). */
+static UINT64 mad_kring_alloc(struct mad_device *d, UINT64 bytes) {
+    UINT64 off;
+    bytes = (bytes + 255) & ~(UINT64)255;
+    if (bytes > MAD_KRING_BYTES) return ~(UINT64)0;
+    AcquireSRWLockExclusive(&d->k_lock);
+    if (d->k_ring_pos + bytes > MAD_KRING_BYTES) d->k_ring_pos = 0;
+    off = d->k_ring_pos; d->k_ring_pos += bytes;
+    ReleaseSRWLockExclusive(&d->k_lock);
+    return off;
+}
 static void mad_ts_draw(const struct mad_pso *p, UINT instances, UINT count, UINT16 index_type, UINT64 index_buffer,
                         struct mad_gs_drawinfo *di, struct WMTSize *grid, struct WMTSize *obj_tg, struct WMTSize *mesh_tg) {
     UINT overlap = p->dt.out_prim == 1 ? 0 : p->dt.out_prim == 2 ? 1 : 2;
@@ -6140,6 +6199,65 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     }
 }
 
+/* madeira-bcd: INDIRECT-ARGUMENT PROBES. Ghost of Tsushima's GPU time grows
+ * from ~17 to ~44 ms a frame within seconds while the command stream stays
+ * the same (~60 draws a list): something the GPU itself counts keeps growing
+ * (an append counter never reset, say, so ever more particles are simulated
+ * and drawn). Every 3 s per pipeline, the first argument record of an
+ * indirect draw or dispatch is copied to the CPU-visible ring, and the copy
+ * taken 3 s earlier is logged: counts that climb name the pipeline.
+ * madeira.cfg ind-probe = 0 turns it off. */
+static struct { const struct mad_pso *pso; UINT64 off; DWORD t; int kind, pending; } g_iprobe[96];
+static SRWLOCK g_iprobe_lock = SRWLOCK_INIT;
+static void exec_indirect_probe(struct mad_exec *e, const struct mad_cmd *c) {
+    static int on = -1; static LONG said;
+    struct mad_device *d = e->q->device;
+    const struct mad_pso *p = c->kind == MC_DISPATCH_INDIRECT ? e->cpso : e->pso;
+    struct wmtcmd_compute_setpso sp; struct wmtcmd_compute_setbuffer sb[2]; struct wmtcmd_compute_setbytes sby; struct wmtcmd_compute_dispatch dsp;
+    UINT32 n = c->kind == MC_DISPATCH_INDIRECT ? 3 : c->kind == MC_DRAW_INDEXED_INDIRECT ? 5 : 4;
+    DWORD now = GetTickCount();
+    unsigned k, slot = ~0u;
+    UINT64 off;
+    if (on < 0) on = (int)mad_cfg_int_pe("ind-probe", 1);
+    if (!on || !p || (c->u.ind.off & 3) || said >= 1500 || !mad_kernels_ready(d) || !d->k_probe_pso || !d->k_ring_cpu) return;
+    AcquireSRWLockExclusive(&g_iprobe_lock);
+    for (k = 0; k < sizeof g_iprobe / sizeof g_iprobe[0]; k++) {
+        if (g_iprobe[k].pso == p) { slot = k; break; }
+        if (!g_iprobe[k].pso && slot == ~0u) slot = k;
+    }
+    if (slot == ~0u || (g_iprobe[slot].pso == p && now - g_iprobe[slot].t < 3000)) { ReleaseSRWLockExclusive(&g_iprobe_lock); return; }
+    if (g_iprobe[slot].pso == p && g_iprobe[slot].pending) {
+        const UINT32 *w = (const UINT32 *)(d->k_ring_cpu + g_iprobe[slot].off);
+        LONG m = InterlockedIncrement(&said);
+        d3d12_log("[probe] %s '%s' first record: %u %u %u %u %u (%lu ms old)%s\n",
+                  g_iprobe[slot].kind == MC_DISPATCH_INDIRECT ? "dispatch" : g_iprobe[slot].kind == MC_DRAW_INDEXED_INDIRECT ? "draw-indexed" : "draw",
+                  p->vs_name, w[0], w[1], w[2], g_iprobe[slot].kind == MC_DISPATCH_INDIRECT ? 0 : w[3],
+                  g_iprobe[slot].kind == MC_DRAW_INDEXED_INDIRECT ? w[4] : 0, (unsigned long)(now - g_iprobe[slot].t),
+                  m == 1500 ? " -- probe log limit reached" : "");
+    }
+    off = mad_kring_alloc(d, 256);
+    if (off == ~(UINT64)0) { ReleaseSRWLockExclusive(&g_iprobe_lock); return; }
+    g_iprobe[slot].pso = p; g_iprobe[slot].off = off; g_iprobe[slot].t = now; g_iprobe[slot].kind = (int)c->kind; g_iprobe[slot].pending = 1;
+    ReleaseSRWLockExclusive(&g_iprobe_lock);
+    memset(d->k_ring_cpu + off, 0xff, 32);   /* 0xffffffff = never written */
+    if (!e->cenc) {
+        if (e->renc) InterlockedIncrement(&g_pass_end_dispatch);
+        exec_end(e);
+        e->cenc = MTLCommandBuffer_computeCommandEncoder(e->cb, false);
+        if (!e->cenc) return;
+        g_enc_seq++; e->cenc_pso = NULL; e->cenc_seq = g_enc_seq;
+        exec_fence_compute(e, e->cenc, 0);
+    }
+    memset(&sp, 0, sizeof sp); memset(sb, 0, sizeof sb); memset(&sby, 0, sizeof sby); memset(&dsp, 0, sizeof dsp);
+    sp.type = WMTComputeCommandSetPSO; sp.pso = d->k_probe_pso;
+    sp.threadgroup_size.width = 8; sp.threadgroup_size.height = 1; sp.threadgroup_size.depth = 1;
+    sb[0].type = WMTComputeCommandSetBuffer; sb[0].buffer = c->u.ind.args->buffer; sb[0].offset = c->u.ind.off; sb[0].index = 0;
+    sb[1].type = WMTComputeCommandSetBuffer; sb[1].buffer = d->k_ring; sb[1].offset = off; sb[1].index = 1;
+    sby.type = WMTComputeCommandSetBytes; sby.bytes.ptr = &n; sby.length = sizeof n; sby.index = 2;
+    dsp.type = WMTComputeCommandDispatch; dsp.size.width = 1; dsp.size.height = 1; dsp.size.depth = 1;
+    sp.next.ptr = &sb[0]; sb[0].next.ptr = &sb[1]; sb[1].next.ptr = &sby; sby.next.ptr = &dsp;
+    MTLComputeCommandEncoder_encodeCommands(e->cenc, (const struct wmtcmd_base *)&sp);
+}
 /* madeira-bcd: ind-count, the GPU half (the sums are in SYNC DIAGNOSTICS).
  * Every indirect command of an encoder is noted after it was encoded; when the
  * encoder ends, one blit copies the commands' argument records into 1 MB
@@ -6636,6 +6754,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT: case MC_DISPATCH_INDIRECT: {
             struct mad_cmd t = *c; UINT k;
             if (!c->u.ind.args || !c->u.ind.args->buffer) { e.skipped++; break; }
+            exec_indirect_probe(&e, c);   /* madeira-bcd: diagnostics, every 3 s per pipeline */
             for (k = 0; k < c->u.ind.count; k++) {
                 t.u.ind.off = c->u.ind.off + (UINT64)k * c->u.ind.stride;
                 if (c->kind == MC_DISPATCH_INDIRECT) exec_dispatch(&e, &t); else exec_draw(&e, &t);
@@ -7802,6 +7921,9 @@ static ULONG STDMETHODCALLTYPE device_Release(ID3D12Device *This) {
             for (k = 0; k < d->ntheaps; k++) { if (d->theaps[k].heap) NSObject_release(d->theaps[k].heap); free(d->theaps[k].fl); }
             mad_mheap_reclaim(d, 1); free(d->mhret);   /* ml1148 */
             for (k = 0; k < d->nfillpat; k++) if (d->fillpat[k].buf) NSObject_release(d->fillpat[k].buf);   /* ml1151 */
+            if (d->k_ring) NSObject_release(d->k_ring);          /* madeira-bcd: helper kernels */
+            if (d->k_probe_pso) NSObject_release(d->k_probe_pso);
+            if (d->k_lib) NSObject_release(d->k_lib);
             if (d->ds_scratch) NSObject_release(d->ds_scratch);   /* exec_copy_aspect */
             free(d->theaps); free(d->hret);
             DeleteCriticalSection(&d->heap_lock);

@@ -50,6 +50,22 @@ EXTRA+=(-DMAD_SC_CONVERTER_ID="\"$SCID\"")
 # MAD_BUILD_ID names the build in the device log ("madeira-d3d12 M2 <id>, <date>").
 if [ -n "${MAD_BUILD_ID:-}" ]; then EXTRA+=(-DMAD_BUILD_ID="\"$MAD_BUILD_ID\""); fi
 
+# The helper kernels (mad_kernels.metal) as an embedded metallib: the
+# indirect-argument probe runs on them. Without xcrun, or when the compile
+# fails, they are left out and the runtime skips what needs them.
+echo "=== helper kernels (metallib) ==="
+mad_kernels_metal() {
+    xcrun -sdk iphoneos metal -std=metal3.0 "$@" -o "$OUT/mad_kernels.metallib" "$SRC/mad_kernels.metal" 2> "$OUT/mad_kernels.err"
+}
+if command -v xcrun > /dev/null 2>&1 && mad_kernels_metal; then
+    (cd "$OUT" && xxd -i mad_kernels.metallib > mad_kernels_metallib.h)
+    EXTRA+=(-DMAD_HAVE_KERNELS -I"$OUT")
+    echo "  $(wc -c < "$OUT/mad_kernels.metallib" | tr -d ' ') bytes"
+else
+    echo "  helper kernels did not build -- what needs them is skipped"
+    head -20 "$OUT/mad_kernels.err" 2> /dev/null || true
+fi
+
 echo "=== madeira_d3d12.dll (arm64ec) ==="
 "$MINGW/arm64ec-w64-mingw32-clang" -shared -O2 -Wall ${EXTRA[@]+"${EXTRA[@]}"} \
     -o "$OUT/madeira_d3d12.dll" "$SRC/madeira_d3d12.c" "$SRC/d3d12.def" \
