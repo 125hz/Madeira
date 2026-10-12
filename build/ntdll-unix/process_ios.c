@@ -1216,6 +1216,45 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                 }
             }
         }
+
+        /* madeira-bcd: more optional helpers, named per game. Every x64 pseudo-
+         * process copies its own system DLLs into the JIT pool and gets a 16 MB
+         * code buffer. GTA V Enhanced build 374 (2026-10-04 09:25): with
+         * SocialClubHelper.exe's 240 MB libcef.dll in the big-image slot, the
+         * run below the hole was 557 of 560 MB full and its D3DCompiler_47.dll
+         * (4.5 MB) failed -- "The CEF browser ... crashed and could not
+         * restart" -- while the launcher's crashpad handler,
+         * RockstarErrorHandler.exe, held 17 MB of copies and a code buffer.
+         * MADEIRA_SPAWN_BLOCK = <name>;<name>;... refuses a spawn whose image
+         * path contains one of the names (case-insensitive), like the gate
+         * above; empty by default. */
+        {
+            const char *list = getenv( "MADEIRA_SPAWN_BLOCK" );
+
+            while (list && *list)
+            {
+                const char *end = strchr( list, ';' );
+                int bl = end ? (int)(end - list) : (int)strlen( list ), k, j;
+
+                for (k = 0; bl > 0 && k + bl <= ip_len; k++)
+                {
+                    for (j = 0; j < bl; j++)
+                    {
+                        WCHAR c = ip[k + j], w = (WCHAR)(unsigned char)list[j];
+                        if (c >= 'A' && c <= 'Z') c += 32;
+                        if (w >= 'A' && w <= 'Z') w += 32;
+                        if (c != w) break;
+                    }
+                    if (j == bl)
+                    {
+                        dprintf(2, "[proc-gate] madeira-bcd REFUSING spawn of %s (MADEIRA_SPAWN_BLOCK %.*s)\n",
+                                debugstr_us( &params->ImagePathName ), bl, list );
+                        return STATUS_ACCESS_DENIED;
+                    }
+                }
+                list = end ? end + 1 : NULL;
+            }
+        }
     }
 
     /* conhost.exe is refused in an ARM64EC session, where it would crash the app (see
