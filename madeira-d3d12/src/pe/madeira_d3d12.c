@@ -61,6 +61,18 @@ static void mad_dump_blob(const char *name, const void *data, SIZE_T len) {
     WriteFile(h, data, (DWORD)len, &wr, NULL);
     CloseHandle(h);
 }
+/* madeira-bcd quiet-log: madeira.cfg / a game's config quiet-log = 1 (default 0),
+ * read once when the device is created (mad_quiet_log_init). OutputDebugStringA
+ * raises DBG_PRINTEXCEPTION_C, which Wine dispatches through the game's vectored
+ * handlers and an unwind of the stack, then asks the wineserver for the DBWIN
+ * buffer: about 0.5-0.75 ms a line on the device. Horizon Zero Dawn's menu
+ * logged ~1000 lines a second while it built pipelines, and every census frame
+ * (ml899) logged ~2000 lines and froze the game for 1.5-2 s (493, 2026-10-11).
+ * With the switch on, a line goes only through __wine_dbg_output and stderr,
+ * which already carry every line to the log; census frames and the list
+ * 12000-12400 dump window are off; and the per-shader "converted at runtime"
+ * line is kept for the first 64 shaders and then every 1000th. */
+static int g_quiet_log;
 static void d3d12_log(const char *fmt, ...) {
     /* ml909: every record handed to __wine_dbg_output MUST end in a newline
      * and be shorter than ntdll's 1020-byte line buffer. A record truncated
@@ -81,7 +93,7 @@ static void d3d12_log(const char *fmt, ...) {
         if (len >= sizeof buf - 1) { buf[sizeof buf - 2] = '\n'; buf[sizeof buf - 1] = 0; }
         else { buf[len] = '\n'; buf[len + 1] = 0; }
     }
-    OutputDebugStringA(buf);
+    if (!g_quiet_log) OutputDebugStringA(buf);
     /* Wine's own debug output: an unbuffered write on the log's file
      * descriptor from unix ntdll, which reaches the log from EVERY process.
      * The engine launched from the desktop is a child of its launcher and has
@@ -2768,6 +2780,30 @@ static long long mad_cfg_int_pe(const char *key, long long dflt) {
     snprintf(a.name, sizeof a.name, "%s", key);
     MadeiraCtl(&a);
     return (a.ret && v[0]) ? _strtoi64(v, NULL, 0) : dflt;
+}
+/* madeira-bcd quiet-log (see g_quiet_log): read once, when the device is created. */
+static void mad_quiet_log_init(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    if (mad_cfg_int_pe("quiet-log", 0)) {
+        d3d12_log("[madeira-d3d12] quiet-log = 1: lines skip OutputDebugStringA; no census frames or list 12000-12400 dumps; "
+                  "\"converted at runtime\" for the first 64 shaders, then every 1000th\n");
+        g_quiet_log = 1;
+    }
+}
+static int mad_conv_log_ok(void) {   /* madeira-bcd quiet-log */
+    static volatile LONG n;
+    LONG k;
+    if (!g_quiet_log) return 1;
+    k = InterlockedIncrement(&n);
+    return k <= 64 || k % 1000 == 0;
+}
+static int mad_pso_lazy_on(void) {   /* madeira-bcd: madeira.cfg pso-lazy (default 1), see mad_pso_realize */
+    static int on = -1;
+    if (on < 0) { on = mad_cfg_int_pe("pso-lazy", 1) ? 1 : 0;
+                  d3d12_log("[madeira-d3d12] pipelines are built %s (madeira.cfg pso-lazy)\n", on ? "at their first draw/dispatch" : "at creation"); }
+    return on;
 }
 static int mad_upload_swap_on(void) {   /* ml1154: madeira.cfg upload-swap (default 1) */
     static int on = -1;
@@ -7242,7 +7278,7 @@ tess_go:
         if (!(e->pso->vb_mask & (1u << i)) || !e->vb[i].res) continue;
         /* ml878: stride differences are handled by mad_pso_for_strides above */
     }
-    if ((g_list_seq <= 3 || (g_list_seq >= 12000 && g_list_seq < 12400) || g_census_on) && g_dump_draws < 40000) {   /* ml893: ~3 frames mid-run */
+    if ((g_list_seq <= 3 || (!g_quiet_log && g_list_seq >= 12000 && g_list_seq < 12400) || g_census_on) && g_dump_draws < 40000) {   /* ml893: ~3 frames mid-run */
         char line[1200]; int n; unsigned k;
         g_dump_draws++;
         n = snprintf(line, sizeof(line), "[draw-dump] list#%u enc#%u vs='%s' ps='%s' topo=%u%s rt=%u", g_list_seq, e->renc_seq,
@@ -8111,7 +8147,7 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
         }
     }
 
-    if (((g_list_seq >= 12000 && g_list_seq < 12400) || g_census_on) && g_dump_draws < 40000) {   /* ml893 census + ml898 in-game window */
+    if (((!g_quiet_log && g_list_seq >= 12000 && g_list_seq < 12400) || g_census_on) && g_dump_draws < 40000) {   /* ml893 census + ml898 in-game window */
         g_dump_draws++;
         d3d12_log("[dispatch-dump] list#%u '%s' %s %ux%ux%u\n", g_list_seq, e->cpso->vs_name,
                   c->kind == MC_DISPATCH_INDIRECT ? "indirect" : "", c->u.dispatch.x, c->u.dispatch.y, c->u.dispatch.z);
@@ -8255,7 +8291,7 @@ static int exec_indirect_fast_why(struct mad_exec *e, const struct mad_cmd *c) {
     if (c->u.ind.count < 2) return IFR_ONE_RECORD;
     if (g_census_on || g_fault_diag || g_skip_ps_state > 0 || g_sd_state != 0) return IFR_DIAG;
     if (g_capture_on) return IFR_CAPTURE;
-    if ((g_list_seq <= 3 || (g_list_seq >= 12000 && g_list_seq < 12400)) && g_dump_draws < 40000) return IFR_DUMP;   /* draw dumps name each record */
+    if ((g_list_seq <= 3 || (!g_quiet_log && g_list_seq >= 12000 && g_list_seq < 12400)) && g_dump_draws < 40000) return IFR_DUMP;   /* draw dumps name each record */
     if (e->cap_after || e->cap_after_cs || e->ncap_after_buf || e->ncap_after_tex) return IFR_CAPTURE;
     if (c->kind == MC_DISPATCH_INDIRECT)
         return e->cenc && e->cpso && e->cpso->cps &&
@@ -8573,7 +8609,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     }
     {
         static unsigned said;
-        if ((said < 12 || (g_list_seq >= 12000 && g_list_seq < 12400) || g_census_on) && (e.draws || e.skipped)) {
+        if ((said < 12 || (!g_quiet_log && g_list_seq >= 12000 && g_list_seq < 12400) || g_census_on) && (e.draws || e.skipped)) {
             said++;
             d3d12_log("[madeira-d3d12] list executed: %u commands, %u draws, %u skipped\n", l->ncmds, e.draws, e.skipped);
         }
@@ -14738,8 +14774,9 @@ again:
         return 0;
     }
     if (o && o->lib_only) {   /* DXIL tessellation: the library is the result */
-        d3d12_log("[madeira-d3d12] %s converted at runtime: %u bytes of DXIL -> %u bytes of metallib, entry '%s'\n",
-                  tag, (unsigned)dxil_len, (unsigned)a.ret_len, name);
+        if (mad_conv_log_ok())
+            d3d12_log("[madeira-d3d12] %s converted at runtime: %u bytes of DXIL -> %u bytes of metallib, entry '%s'\n",
+                      tag, (unsigned)dxil_len, (unsigned)a.ret_len, name);
         if (o->name_out && o->name_cap) snprintf(o->name_out, o->name_cap, "%s", name);
         *lib_out = lib;
         free(buf);
@@ -14755,9 +14792,10 @@ again:
         free(buf);
         return 0;
     }
-    d3d12_log("[madeira-d3d12] %s converted at runtime: %u bytes of DXIL -> %u bytes of metallib, "
-              "entry '%s' (taken from the bytecode)\n", tag, (unsigned)dxil_len,
-              (unsigned)a.ret_len, name);
+    if (mad_conv_log_ok())
+        d3d12_log("[madeira-d3d12] %s converted at runtime: %u bytes of DXIL -> %u bytes of metallib, "
+                  "entry '%s' (taken from the bytecode)\n", tag, (unsigned)dxil_len,
+                  (unsigned)a.ret_len, name);
     snprintf(g_last_entry, sizeof g_last_entry, "%s", name);
     if (o && o->name_out && o->name_cap) snprintf(o->name_out, o->name_cap, "%s", name);   /* ml927b */
     if (!strcmp(name, "WriteToSliceMainVS") || !strcmp(name, "WriteToSliceMainGS")) {   /* ml926: bytes for offline disassembly */
@@ -17646,6 +17684,7 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12CreateDevice(IUnknown *adapter,
         free(d);
         return E_FAIL;
     }
+    mad_quiet_log_init();   /* madeira-bcd quiet-log */
     HRESULT hr = device_QI((ID3D12Device *)d, riid, device);
     device_Release((ID3D12Device *)d);
     if (SUCCEEDED(hr)) d3d12_log("[madeira-d3d12] device created: %s\n", MadeiraD3D12GetBuildMarker());
@@ -18208,11 +18247,11 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     mad_perf_present();   /* ml1108 */
     if (g_vt_on > 0) mad_vt_present(s->queue->device, s->presents);
     if (g_scbv_on > 0 && s->presents % 300 == 0) mad_scbv_report(s->presents);   /* madeira-bcd static-cbv */   /* madeira-bcd vis-trace */
-    g_census_on = (s->presents >= 1500 && s->presents < 3000 && (s->presents % 200) == 0);   /* ml899 */
+    g_census_on = !g_quiet_log && (s->presents >= 1500 && s->presents < 3000 && (s->presents % 200) == 0);   /* ml899; madeira-bcd quiet-log: off */
     if (g_capture_on) g_census_on = 1;   /* ml1098 */
     if (mad_skin_on()) mad_skin_present(s->presents);   /* madeira-bcd skin-check */
     if (g_view_census > 0 && (s->presents % 1800) == 0) mad_vc_report();   /* madeira-bcd view-census */
-    if ((g_list_seq >= 12000 && g_list_seq < 12400) || g_census_on)
+    if ((!g_quiet_log && g_list_seq >= 12000 && g_list_seq < 12400) || g_census_on)
         d3d12_log("[draw-dump] ===== Present #%llu (list#%u) =====\n", (unsigned long long)s->presents, g_list_seq);
     if (s->presents <= 3 || (s->presents % 600) == 0)
         d3d12_log("[madeira-d3d12] Present #%llu (buffer %u)\n", (unsigned long long)s->presents, idx);
