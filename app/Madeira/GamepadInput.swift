@@ -64,8 +64,11 @@ final class GamepadInput: @unchecked Sendable {
     /// otherwise -- and leaves XInput. "dualsense" / "generic" force that
     /// identity. Read once, at session start (beginPadSession): the device
     /// exists before the game enumerates, so a change applies at the next start.
+    /// The game's own lines come first (MadeiraConfig.gameValue), so a game's
+    /// config or its recommended settings choose its mode.
     static let padModeKey = "env.MADEIRA_PAD_MODE"
     static func configuredPadMode() -> (value: String, source: String) {
+        if let v = MadeiraConfig.gameValue(padModeKey) { return (v.lowercased(), "game") }
         if let v = MadeiraConfig.get(padModeKey), !v.isEmpty { return (v.lowercased(), "cfg") }
         if let v = ProcessInfo.processInfo.environment["MADEIRA_PAD_MODE"], !v.isEmpty { return (v.lowercased(), "env") }
         return ("xinput", "default")
@@ -76,8 +79,10 @@ final class GamepadInput: @unchecked Sendable {
     /// the virtual DualSense's output reports (rumble, adaptive triggers,
     /// lightbar, player LEDs) on player 1's pad. `env.MADEIRA_PAD_OUTPUT`:
     /// unset or 1 both, 0 none, hid only the DualSense's, xinput only XInput rumble.
+    /// The game's own lines come first, as for the pad mode.
     static func configuredPadOutput() -> (xinput: Bool, hid: Bool, value: String) {
-        let value = (MadeiraConfig.get("env.MADEIRA_PAD_OUTPUT")
+        let value = (MadeiraConfig.gameValue("env.MADEIRA_PAD_OUTPUT")
+            ?? MadeiraConfig.get("env.MADEIRA_PAD_OUTPUT")
             ?? ProcessInfo.processInfo.environment["MADEIRA_PAD_OUTPUT"]
             ?? "1").lowercased()
         switch value {
