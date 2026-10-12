@@ -558,6 +558,29 @@ static void *ios_child_thread_entry( void *arg )
         wine_ios_child_main( args->argc, args->argv, args->socketfd );
         /* Should not return */
         dprintf(STDERR_FILENO, "[Wine child thread] wine_ios_child_main returned unexpectedly!\n");
+        /* madeira-bcd [child-boot-fail]: a child that failed before
+         * server_init_process_child never used its server socket, so the
+         * wineserver still holds a process that will never start and a
+         * parent waiting on it (WaitForSingleObject on the process handle,
+         * WiX's vc_redist waiting for its clean-room copy) hangs forever.
+         * Closing the socket makes the server see the process die, as a
+         * failed exec does in upstream Wine. */
+        {
+            static const char *const pre_server[] = { "entry", "guest-window-reserve", "virtual_alloc_teb",
+                                                      "windowed-peb-alloc", "peb-mmap", "window-bind" };
+            const char *stage = ios_child_boot_stage;
+            unsigned int i;
+
+            for (i = 0; stage && i < sizeof(pre_server) / sizeof(pre_server[0]); i++)
+            {
+                if (strcmp( stage, pre_server[i] )) continue;
+                dprintf(STDERR_FILENO, "[child-boot-fail] boot failed at '%s' before the server knew the "
+                        "process: closing its server socket so waiters see it exit\n", stage);
+                close( args->socketfd );
+                args->socketfd = -1;
+                break;
+            }
+        }
     } else {
         dprintf(STDERR_FILENO, "[Wine child thread] child exited with code %d\n", wine_ios_exit_code);
     }
