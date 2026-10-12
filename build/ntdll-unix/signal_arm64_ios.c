@@ -610,6 +610,151 @@ void ios_watch_after_protect( const void *base, size_t size, const char *why )
                  (void *)ios_watch_page, errno, why );
 }
 
+/* ml1203: WALK THE JUMP CHAIN BACK FROM THE WRITER.
+ *
+ * The writer the watch caught sits in jump-threaded code: one instruction, then
+ * `jmp rel32`, so the instruction that computed the stored value is not in the
+ * bytes before the writer's rip. Scan the mapped image around the rip for
+ * branches (E9/E8 rel32, 0F 8x rel32, EB/7x rel8) whose target lands in the
+ * fragment that ends at the current address, print the 48 bytes that precede
+ * each such branch (the predecessor fragment's tail), and when the predecessor
+ * is unique step back to it. MADEIRA_WATCH_CHASE = hop count (default 24, 0 off);
+ * only the first two hits are chased, the scan reads with mach_vm_read_overwrite
+ * in 1 MB pieces so an unmapped page cannot fault the handler thread. */
+static void ios_watch_chase( uint64_t rip )
+{
+    static int hops = -1;
+    static unsigned char *buf;
+    enum { CHUNK = 1u << 20, WINDOW = 48, MAX_CAND = 6, SPAN_CAP = 256u << 20 };
+    uint64_t lo, hi, cur_lo, cur_hi;
+    int hop;
+
+    if (hops < 0) { const char *e = getenv( "MADEIRA_WATCH_CHASE" ); hops = (e && *e) ? atoi( e ) : 24; }
+    if (hops <= 0) return;
+    if (!buf && !(buf = malloc( CHUNK ))) return;
+
+    /* the contiguous mapped span around rip, capped */
+    {
+        mach_vm_address_t a = rip;
+        mach_vm_size_t s = 0;
+        vm_region_basic_info_data_64_t ri;
+        mach_msg_type_number_t rc = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t ro = MACH_PORT_NULL;
+        if (mach_vm_region( mach_task_self(), &a, &s, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&ri, &rc, &ro ) != KERN_SUCCESS
+            || a > rip)
+        {
+            dprintf( 2, "[watch-chase] ml1203 rip %p is not in a mapped region\n", (void *)rip );
+            return;
+        }
+        lo = a; hi = a + s;
+        while (hi - lo < SPAN_CAP)
+        {   /* extend downwards over adjacent readable regions */
+            mach_vm_address_t b = lo - 1;
+            mach_vm_size_t bs = 0;
+            rc = VM_REGION_BASIC_INFO_COUNT_64; ro = MACH_PORT_NULL;
+            if (lo == 0 || mach_vm_region( mach_task_self(), &b, &bs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&ri, &rc, &ro ) != KERN_SUCCESS
+                || b + bs != lo || !(ri.protection & VM_PROT_READ))
+                break;
+            lo = b;
+        }
+        while (hi - lo < SPAN_CAP)
+        {   /* and upwards */
+            mach_vm_address_t b = hi;
+            mach_vm_size_t bs = 0;
+            rc = VM_REGION_BASIC_INFO_COUNT_64; ro = MACH_PORT_NULL;
+            if (mach_vm_region( mach_task_self(), &b, &bs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&ri, &rc, &ro ) != KERN_SUCCESS
+                || b != hi || !(ri.protection & VM_PROT_READ))
+                break;
+            hi = b + bs;
+        }
+        dprintf( 2, "[watch-chase] ml1203 scanning %p-%p (%llu MB) for branches into the writer's fragment chain\n",
+                 (void *)lo, (void *)hi, (unsigned long long)((hi - lo) >> 20) );
+    }
+
+    cur_lo = rip > WINDOW ? rip - WINDOW : 0;
+    cur_hi = rip + 1;                                   /* targets in (rip-48, rip] */
+    for (hop = 1; hop <= hops; hop++)
+    {
+        struct { uint64_t at; uint64_t target; int len; const char *kind; } cand[MAX_CAND];
+        int ncand = 0, overflow = 0;
+        uint64_t p;
+
+        for (p = lo; p < hi && !overflow; p += CHUNK - 8)
+        {
+            mach_vm_size_t want = (hi - p < CHUNK) ? (hi - p) : CHUNK, got = 0;
+            size_t i;
+            if (want < 8) break;
+            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)p, want, (mach_vm_address_t)buf, &got ) != KERN_SUCCESS
+                || got != want)
+                continue;
+            for (i = 0; i + 6 <= got; i++)
+            {
+                uint64_t at = p + i, target;
+                int len;
+                const char *kind;
+                unsigned char b0 = buf[i];
+                if (b0 == 0xE9 || b0 == 0xE8)
+                {
+                    int32_t rel; memcpy( &rel, buf + i + 1, 4 );
+                    len = 5; target = at + 5 + (int64_t)rel; kind = b0 == 0xE9 ? "jmp" : "call";
+                }
+                else if (b0 == 0x0F && (buf[i + 1] & 0xF0) == 0x80)
+                {
+                    int32_t rel; memcpy( &rel, buf + i + 2, 4 );
+                    len = 6; target = at + 6 + (int64_t)rel; kind = "jcc";
+                }
+                else if (b0 == 0xEB || (b0 & 0xF0) == 0x70)
+                {
+                    len = 2; target = at + 2 + (int64_t)(int8_t)buf[i + 1]; kind = b0 == 0xEB ? "jmp8" : "jcc8";
+                }
+                else continue;
+                if (target < cur_lo || target >= cur_hi) continue;
+                if (ncand == MAX_CAND) { overflow = 1; break; }
+                cand[ncand].at = at; cand[ncand].target = target; cand[ncand].len = len; cand[ncand].kind = kind;
+                ncand++;
+            }
+        }
+
+        if (!ncand)
+        {
+            dprintf( 2, "[watch-chase] ml1203 hop %d: no branch targets (%p,%p]; the fragment is entered some other way (ret/indirect/fall-through)\n",
+                     hop, (void *)cur_lo, (void *)cur_hi );
+            return;
+        }
+        {
+            int c;
+            for (c = 0; c < ncand; c++)
+            {
+                unsigned char fb[WINDOW + 8];
+                char hx[(WINDOW + 8) * 3 + 1] = "?";
+                mach_vm_size_t g = 0;
+                uint64_t from = cand[c].at > WINDOW ? cand[c].at - WINDOW : 0;
+                if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)from, sizeof(fb), (mach_vm_address_t)fb, &g ) == KERN_SUCCESS
+                    && g == sizeof(fb))
+                {
+                    int b;
+                    for (b = 0; b < (int)sizeof(fb); b++) snprintf( hx + b * 3, 4, "%02x ", fb[b] );
+                }
+                dprintf( 2, "[watch-chase] ml1203 hop %d%s: %s at %p -> %p ; bytes[%p..+%d]: %s\n",
+                         hop, overflow ? " (more than 6, stopping)" : "", cand[c].kind, (void *)cand[c].at,
+                         (void *)cand[c].target, (void *)from, (int)sizeof(fb), hx );
+            }
+        }
+        if (ncand != 1 || overflow)
+        {
+            dprintf( 2, "[watch-chase] ml1203 hop %d: %d predecessors, the walk stops here\n", hop, ncand );
+            return;
+        }
+        if (cand[0].kind[0] == 'c')
+        {
+            dprintf( 2, "[watch-chase] ml1203 hop %d: reached through a call; the walk stops here\n", hop );
+            return;
+        }
+        cur_hi = cand[0].at + 1;
+        cur_lo = cand[0].at > WINDOW ? cand[0].at - WINDOW : 0;
+    }
+}
+
 /* A store to the watched page was emulated (or could not be): report it. */
 static void ios_watch_report( const arm_thread_state64_t *st, uint64_t pc, uint32_t insn, uintptr_t addr,
                               int emulated, int watch_prot )
@@ -684,6 +829,7 @@ static void ios_watch_report( const arm_thread_state64_t *st, uint64_t pc, uint3
                     for (b = 0; b < 48; b++) snprintf( hx + b * 3, 4, "%02x ", xb[b] );
                 dprintf( 2, "[watch] ml1201   guest rip=%p block=%p x86[rip-16..rip+31]: %s\n",
                          (void *)xrip, (void *)bb, hx );
+                if (ios_watch_hits <= 2) ios_watch_chase( xrip );   /* ml1203 */
             }
             else
                 dprintf( 2, "[watch] ml1201   guest rip unresolved (block=%p): %s\n", (void *)bb, why );
