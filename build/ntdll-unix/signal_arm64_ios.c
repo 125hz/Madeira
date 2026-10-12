@@ -5136,6 +5136,85 @@ skip_reclaim_band: ;
                             (void*)(uintptr_t)state.__x[0], (void*)(uintptr_t)state.__x[2],
                             (void *)thread_teb, peb_p, peb_ecbm);
                     }
+                    /* madeira-bcd [fault-full]: every register, and the host code
+                     * that led up to the faulting instruction (JIT blocks compute
+                     * the address a few instructions earlier), for the first two
+                     * unhandled faults. God of War on build 234 reads 0x40 through
+                     * LDAPR x27,[x6] and the short insn_stream cannot say where x6
+                     * came from. */
+                    /* madeira-bcd [fault-tls]: the thread's TLS[0] block (the main
+                     * image's thread-locals) next to the image's TLS template. God of
+                     * War (build 236) takes its current allocator from TLS[0]+0xc
+                     * (index) / +0xf0 (table) / +0x18 and finds none. */
+                    if (cnt == 1 && thread_teb)
+                    {
+                        uint64_t tlsarr = 0, blk = 0, peb = 0, img = 0;
+                        mach_vm_size_t g = 0;
+                        #define FT_RD(a, v) (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(a), sizeof(v), \
+                                             (mach_vm_address_t)&(v), &g) == KERN_SUCCESS && g == sizeof(v))
+                        if (FT_RD(thread_teb + 0x58, tlsarr) && tlsarr && FT_RD(tlsarr, blk) && blk)
+                        {
+                            uint64_t q[40];
+                            int i;
+                            if (FT_RD(blk, q))
+                                for (i = 0; i < 40; i += 4)
+                                    dprintf(STDERR_FILENO, "[fault-tls] tls0 %llx+%#x: %016llx %016llx %016llx %016llx\n",
+                                        (unsigned long long)blk, i * 8, (unsigned long long)q[i],
+                                        (unsigned long long)q[i + 1], (unsigned long long)q[i + 2],
+                                        (unsigned long long)q[i + 3]);
+                        }
+                        if (FT_RD(thread_teb + 0x60, peb) && peb && FT_RD(peb + 0x10, img) && img)
+                        {
+                            uint32_t lfanew = 0, tls_rva = 0;
+                            uint64_t dir[6];
+                            if (FT_RD(img + 0x3c, lfanew) && FT_RD(img + lfanew + 0xd0, tls_rva) && tls_rva
+                                && FT_RD(img + tls_rva, dir))
+                            {
+                                uint64_t q[40];
+                                uint32_t idx = 0;
+                                int i;
+                                (void)FT_RD(dir[2], idx);
+                                dprintf(STDERR_FILENO, "[fault-tls] image %llx tls dir: raw %llx-%llx index@%llx=%u callbacks %llx zerofill %llu\n",
+                                    (unsigned long long)img, (unsigned long long)dir[0], (unsigned long long)dir[1],
+                                    (unsigned long long)dir[2], idx, (unsigned long long)dir[3],
+                                    (unsigned long long)(dir[4] & 0xffffffffULL));
+                                if (FT_RD(dir[0], q))
+                                    for (i = 0; i < 40; i += 4)
+                                        dprintf(STDERR_FILENO, "[fault-tls] template +%#x: %016llx %016llx %016llx %016llx\n",
+                                            i * 8, (unsigned long long)q[i], (unsigned long long)q[i + 1],
+                                            (unsigned long long)q[i + 2], (unsigned long long)q[i + 3]);
+                            }
+                        }
+                        #undef FT_RD
+                    }
+                    if (cnt <= 2)
+                    {
+                        int r;
+                        for (r = 0; r < 29; r += 4)
+                            dprintf(STDERR_FILENO, "[fault-full] x%d=%llx x%d=%llx x%d=%llx x%d=%llx\n",
+                                r, (unsigned long long)state.__x[r],
+                                r + 1, (unsigned long long)(r + 1 < 29 ? state.__x[r + 1] : state.__fp),
+                                r + 2, (unsigned long long)(r + 2 < 29 ? state.__x[r + 2] : state.__lr),
+                                r + 3, (unsigned long long)(r + 3 < 29 ? state.__x[r + 3] : state.__sp));
+                        if ((uintptr_t)fault_pc >= 0x100000000ULL + 256)
+                        {
+                            uint32_t hc[68];
+                            mach_vm_size_t got = 0;
+                            if (mach_vm_read_overwrite( mach_task_self(),
+                                                        (mach_vm_address_t)((uintptr_t)fault_pc - 256),
+                                                        sizeof(hc), (mach_vm_address_t)hc, &got ) == KERN_SUCCESS
+                                && got == sizeof(hc))
+                            {
+                                int w;
+                                for (w = 0; w < 68; w += 8)
+                                    dprintf(STDERR_FILENO, "[fault-host] %llx: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                        (unsigned long long)((uintptr_t)fault_pc - 256 + w * 4),
+                                        hc[w], hc[w + 1], hc[w + 2], hc[w + 3],
+                                        w + 4 < 68 ? hc[w + 4] : 0, w + 5 < 68 ? hc[w + 5] : 0,
+                                        w + 6 < 68 ? hc[w + 6] : 0, w + 7 < 68 ? hc[w + 7] : 0);
+                            }
+                        }
+                    }
                     /* Read instruction at LR-4 to identify the BL/BLR */
                     if (cnt <= 3 && (uintptr_t)state.__lr >= 0x100000000ULL)
                     {
@@ -6023,6 +6102,59 @@ skip_reclaim_band: ;
                                     (unsigned long long)cr[10], (unsigned long long)cr[11],
                                     (unsigned long long)cr[12], (unsigned long long)cr[13],
                                     (unsigned long long)cr[14], (unsigned long long)cr[15]);
+                                /* madeira-bcd [guest-fn]: the guest code of the two
+                                 * innermost frames, so the faulting function can be
+                                 * disassembled from the log: 48 bytes before each
+                                 * return address, and 256 bytes of the function a
+                                 * direct call (E8 rel32) right before it enters. */
+                                {
+                                    static int guest_fn_dumps;
+                                    int e;
+                                    for (e = 0; e < 2 && guest_fn_dumps < 4; e++)
+                                    {
+                                        uint64_t ret = cr[e * 2];
+                                        uint8_t pre[48];
+                                        mach_vm_size_t gp = 0;
+                                        if (ret < 0x10000 + sizeof(pre) || ret >= 0x800000000000ULL) continue;
+                                        if (mach_vm_read_overwrite(mach_task_self(),
+                                                (mach_vm_address_t)(ret - sizeof(pre)), sizeof(pre),
+                                                (mach_vm_address_t)pre, &gp) != KERN_SUCCESS || gp != sizeof(pre))
+                                            continue;
+                                        guest_fn_dumps++;
+                                        {
+                                            char hex[sizeof(pre) * 2 + 1];
+                                            int b;
+                                            for (b = 0; b < (int)sizeof(pre); b++)
+                                                snprintf(hex + b * 2, 3, "%02x", pre[b]);
+                                            dprintf(STDERR_FILENO, "[guest-fn] [%d] %llx-48: %s\n",
+                                                e, (unsigned long long)ret, hex);
+                                        }
+                                        if (pre[sizeof(pre) - 5] == 0xe8)
+                                        {
+                                            int32_t rel;
+                                            uint64_t tgt;
+                                            uint8_t body[256];
+                                            mach_vm_size_t gb = 0;
+                                            memcpy(&rel, pre + sizeof(pre) - 4, sizeof(rel));
+                                            tgt = ret + (int64_t)rel;
+                                            if (mach_vm_read_overwrite(mach_task_self(),
+                                                    (mach_vm_address_t)tgt, sizeof(body),
+                                                    (mach_vm_address_t)body, &gb) == KERN_SUCCESS
+                                                && gb == sizeof(body))
+                                            {
+                                                char hex[65];
+                                                int off, b;
+                                                for (off = 0; off < (int)sizeof(body); off += 32)
+                                                {
+                                                    for (b = 0; b < 32; b++)
+                                                        snprintf(hex + b * 2, 3, "%02x", body[off + b]);
+                                                    dprintf(STDERR_FILENO, "[guest-fn] [%d] callee %llx+%#x: %s\n",
+                                                        e, (unsigned long long)tgt, off, hex);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
