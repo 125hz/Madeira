@@ -391,6 +391,13 @@ static const char *const g_cat_name[MAD_CAT_N] = { "tex-RT", "tex-DS", "tex-UAV"
 static volatile LONG64 g_cat_bytes[MAD_CAT_N], g_cat_peak[MAD_CAT_N];
 static volatile LONG g_cat_count[MAD_CAT_N];
 static volatile LONG64 g_upload_swap_bytes; static volatile LONG g_upload_swap_n;   /* ml1154 */
+/* madeira-bcd metal-gap: what the ml1150 line's Metal total is made of, beyond
+ * the ml1057 estimate. Red Dead Redemption 2 (build 467, 13:09) grew Metal's
+ * currentAllocatedSize from 2366 to 2931 MB in its last minute while the
+ * estimate stayed at ~1.55 GB. Standalone textures as Metal sizes them
+ * (heapTextureSizeAndAlign, so page rounding shows), the argument ring chunks
+ * (64 KB each, pooled and never freed), and the frees still waiting for the GPU. */
+static volatile LONG64 g_sa_tex_bytes, g_sa_tex_logical, g_mheap_bytes; static volatile LONG g_sa_tex_n, g_ring_chunks;
 static int mad_upload_swap_on(void);
 static volatile LONG64 g_lib_bytes; static volatile LONG g_lib_count;   /* ml1060: metallib bytes handed to newLibrary */
 static void mad_acct(struct mad_resource *r, unsigned cat, UINT64 bytes, int sign);
@@ -755,6 +762,7 @@ struct mad_resource {
     struct mad_xview { UINT type, lvl0, nlvl, sl0, nsl, pf, swz; obj_handle_t tex; UINT64 id; } *xview;
     unsigned nxview, xview_cap;
     UINT64 reserved_bytes;   /* d3d12-tiled-resources: created by CreateReservedResource (fully backed), its tiles x 64 KB */
+    UINT64 metal_bytes;      /* madeira-bcd metal-gap: a standalone texture, as Metal sizes it (0 = not counted) */
 };
 /* srv_res / uav_res membership, O(1) through the resource's slot (the linear
  * scan it replaces ran over ~15,000 textures on every view creation). */
@@ -1404,6 +1412,7 @@ static ULONG STDMETHODCALLTYPE list_Release(ID3D12GraphicsCommandList *This) {
         if (l->alloc && !l->closed) InterlockedDecrement(&l->alloc->recording);
         if (l->alloc) ID3D12CommandAllocator_Release((ID3D12CommandAllocator *)l->alloc);
         for (unsigned k = 0; k < l->nrings; k++) NSObject_release(l->rings[k]);
+        if (l->nrings) InterlockedExchangeAdd(&g_ring_chunks, -(LONG)l->nrings);   /* madeira-bcd metal-gap: live chunks */
         free(l->rings); free(l->ring_cpu); free(l->ring_gpu); free(l->cmds); free(l->used); free(l->cdata);
         free(l);
     }
@@ -1469,6 +1478,8 @@ struct mad_queue {
     obj_handle_t open_cb;
     UINT64 last_serial;            /* ml1061: serial of the newest committed batch */
     UINT64 batch_serial[64];       /* serial of batch n at [n & 63] */
+    struct mad_ringchunk *ring_parked;   /* madeira-bcd ring-share: chunks the open batch reads */
+    unsigned nring_parked, ring_parked_cap;
     unsigned open_lists;
     UINT64 batches;
     /* ml1021: SUBMISSION LOCK.
@@ -1551,6 +1562,7 @@ static ULONG STDMETHODCALLTYPE queue_Release(ID3D12CommandQueue *This) {
         }
         d3d12_log("[madeira-d3d12] destroyed %s\n", q->name);
         DeleteCriticalSection(&q->submit_lock);   /* ml1021 */
+        free(q->ring_parked);   /* madeira-bcd ring-share: emptied by the flush above */
         free(q);
     }
     return (ULONG)r;
@@ -3352,6 +3364,7 @@ static int mad_ring_chunk_get(struct mad_device *d, struct mad_ringchunk *out) {
     bi.options = WMTResourceStorageModeShared;
     out->buf = MTLDevice_newBuffer(d->mtl_device, &bi);
     if (!out->buf || !bi.memory.ptr) return 0;
+    InterlockedIncrement(&g_ring_chunks);   /* madeira-bcd metal-gap */
     out->cpu = bi.memory.ptr; out->gpu = bi.gpu_address; out->serial = 0;
     return 1;
 }
@@ -3362,7 +3375,66 @@ static void mad_ring_retire(struct mad_device *d, struct mad_list *l, UINT64 ser
         if (mad_grow((void **)&d->ring_retired, &d->ring_retired_cap, d->nring_retired + 1, sizeof *d->ring_retired)) {
             struct mad_ringchunk *c = &d->ring_retired[d->nring_retired++];
             c->buf = l->rings[k]; c->cpu = l->ring_cpu[k]; c->gpu = l->ring_gpu[k]; c->serial = serial;
-        } else NSObject_release(l->rings[k]);   /* the command buffer still holds it */
+        } else { NSObject_release(l->rings[k]); InterlockedDecrement(&g_ring_chunks); }   /* the command buffer still holds it */
+    LeaveCriticalSection(&d->ring_lock);
+    l->nrings = 0;
+}
+/* madeira-bcd: ring-share (madeira.cfg ring-share = 1, opt-in). A command list
+ * kept the argument-ring chunks of its last replay until it was reset (and
+ * reused them once the GPU was done), and a list executed again without a reset
+ * went on taking new ones, so the chunks added up over every list the game
+ * keeps. Red Dead Redemption 2 on build 470 (2026-10-09 14:48): they grew from
+ * 32 MB to 1575 MB within two minutes of play (metal-gap "argument ring chunks
+ * 25204"), almost half of Metal's 3.6 GB, while one frame's arguments take a
+ * few MB. With the switch a list gives its chunks back at every reset and
+ * before every replay: those the GPU has finished go to the device pool at
+ * once, the others retire with their batch's serial (mad_ring_retire), and any
+ * list takes them from the pool. */
+static int g_ring_share = -1;
+static int mad_ring_share_on(void) {
+    if (g_ring_share < 0) {
+        g_ring_share = mad_cfg_int_pe("ring-share", 0) ? 1 : 0;   /* madeira.cfg ring-share = 1 */
+        if (g_ring_share)
+            d3d12_log("[madeira-d3d12] ring-share = 1: command lists give their argument-ring chunks back to the "
+                      "device pool after every replay\n");
+    }
+    return g_ring_share;
+}
+/* At the end of a replay: the list's chunks go to the queue, read by its open batch.
+ * Called with the queue's submit_lock held (ExecuteCommandLists). */
+static void mad_ring_park(struct mad_queue *q, struct mad_list *l) {
+    unsigned k;
+    if (!mad_grow((void **)&q->ring_parked, &q->ring_parked_cap, q->nring_parked + l->nrings, sizeof *q->ring_parked))
+        return;   /* the list keeps them, as without ring-share */
+    for (k = 0; k < l->nrings; k++) {
+        struct mad_ringchunk *c = &q->ring_parked[q->nring_parked++];
+        c->buf = l->rings[k]; c->cpu = l->ring_cpu[k]; c->gpu = l->ring_gpu[k]; c->serial = 0;
+    }
+    l->nrings = 0; l->ring_used = 0;
+}
+/* At the batch's commit (mad_queue_flush, submit_lock held): its chunks retire with its serial. */
+static void mad_ring_unpark(struct mad_queue *q, UINT64 serial) {
+    struct mad_device *d = q->device;
+    unsigned k;
+    if (!serial) serial = q->last_serial;
+    EnterCriticalSection(&d->ring_lock);
+    for (k = 0; k < q->nring_parked; k++)
+        if (mad_grow((void **)&d->ring_retired, &d->ring_retired_cap, d->nring_retired + 1, sizeof *d->ring_retired)) {
+            struct mad_ringchunk *c = &d->ring_retired[d->nring_retired++];
+            *c = q->ring_parked[k]; c->serial = serial;
+        } else { NSObject_release(q->ring_parked[k].buf); InterlockedDecrement(&g_ring_chunks); }   /* the command buffer still holds it */
+    LeaveCriticalSection(&d->ring_lock);
+    q->nring_parked = 0;
+}
+/* The GPU has finished with every chunk of the list: all of them to the pool. */
+static void mad_ring_pool_put(struct mad_device *d, struct mad_list *l) {
+    unsigned k;
+    EnterCriticalSection(&d->ring_lock);
+    for (k = 0; k < l->nrings; k++)
+        if (mad_grow((void **)&d->ring_pool, &d->ring_pool_cap, d->nring_pool + 1, sizeof *d->ring_pool)) {
+            struct mad_ringchunk *c = &d->ring_pool[d->nring_pool++];
+            c->buf = l->rings[k]; c->cpu = l->ring_cpu[k]; c->gpu = l->ring_gpu[k]; c->serial = 0;
+        } else { NSObject_release(l->rings[k]); InterlockedDecrement(&g_ring_chunks); }
     LeaveCriticalSection(&d->ring_lock);
     l->nrings = 0;
 }
@@ -6709,6 +6781,159 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     }
 }
 
+/* madeira-bcd: indirect-fast (madeira.cfg indirect-fast = 1, opt-in). An
+ * ExecuteIndirect is MaxCommandCount draws or dispatches that share all state
+ * but the argument record's offset (list_ExecuteIndirect takes single-argument
+ * signatures only). The replay ran the whole exec_draw / exec_dispatch for every
+ * record: an argument slot, the bindings, the residency declarations and one
+ * encodeCommands call each. In the owner's Red Dead Redemption 2 run of
+ * 2026-10-09 11:02 that was 20-60 ms a frame for about 9,400 records, with the
+ * GPU about 30 % busy. With the switch the first record still takes the full
+ * path; the encoder keeps that state, and the other records are encoded 64 to a
+ * call as only what differs: the record's offset at buffer 4 (the converter's
+ * draw parameters) and the indirect draw, or the indirect dispatch alone. Only
+ * for Metal Shader Converter (DXIL) pipelines without geometry or tessellation
+ * emulation, and never while a capture, census, draw dump, fault or sync
+ * diagnostic runs: those keep the per-record path.
+ * Build 470: DXBC (sm5) pipelines too. Red Dead Redemption 2's shaders are DXBC,
+ * so the switch never ran for it (467, 13:09: no "indirect-fast:" count, indirect
+ * still 31-39 ms a frame). exec_draw / exec_dispatch build a DXBC stage's
+ * tables from the root state alone, which the records share, and bind the same
+ * buffer 4; nothing else of theirs depends on the record. Pipelines with a
+ * tessellation or geometry variant keep the per-record path. */
+static int g_indirect_fast = -1;
+static volatile LONG g_ifast_calls, g_ifast_records;
+
+/* madeira-bcd: why an ExecuteIndirect replay took the per-record path. Build
+ * 470's Red Dead Redemption 2 run (2026-10-09 14:48) spent 37-66 ms a frame in
+ * ExecuteIndirect with indirect-fast = 1 and never logged a fast-path call; the
+ * tallies below name the condition and the records those replays carried,
+ * every 20000 replays (and at 200). */
+enum { IFR_USED, IFR_TESS_IND, IFR_NOT_DRAWN, IFR_ONE_RECORD, IFR_DIAG, IFR_DUMP, IFR_CAPTURE, IFR_COMPUTE,
+       IFR_NO_ENCODER, IFR_GS_EMU, IFR_DXBC_TESS, IFR_BACKEND, IFR_NO_IB, IFR_N };
+static const char *const g_ifr_names[IFR_N] = {
+    "fast path", "tessellation indirect", "first record not drawn", "one record", "diagnostics running",
+    "draw dump", "capture", "compute state", "no render encoder or pipeline", "geometry emulation",
+    "DXBC tessellation", "other converter", "no index buffer" };
+static volatile LONG g_ifr[IFR_N], g_ifr_total;
+static volatile LONG64 g_ifr_rec[IFR_N];   /* records in those replays */
+
+static int mad_indirect_fast_on(void) {
+    if (g_indirect_fast < 0) {
+        g_indirect_fast = mad_cfg_int_pe("indirect-fast", 0) ? 1 : 0;   /* madeira.cfg indirect-fast = 1 */
+        if (g_indirect_fast)
+            d3d12_log("[madeira-d3d12] indirect-fast = 1: ExecuteIndirect records after the first are encoded "
+                      "without per-record setup (DXIL and DXBC pipelines)\n");
+    }
+    return g_indirect_fast;
+}
+
+static void mad_ifr_note(int why, UINT count) {
+    LONG total;
+    InterlockedIncrement(&g_ifr[why]);
+    InterlockedExchangeAdd64(&g_ifr_rec[why], (LONG64)count);
+    total = InterlockedIncrement(&g_ifr_total);
+    if (total == 200 || total % 20000 == 0) {
+        char buf[960]; int pos = 0, r;
+        for (r = 0; r < IFR_N && pos >= 0 && pos < (int)sizeof buf; r++)
+            if (g_ifr[r]) pos += snprintf(buf + pos, sizeof buf - pos, "%s%s %ld (%lld records)", pos ? ", " : "", g_ifr_names[r],
+                                          (long)g_ifr[r], (long long)g_ifr_rec[r]);
+        d3d12_log("[madeira-d3d12] indirect-fast: %ld ExecuteIndirect replays: %s\n", (long)total, buf);
+    }
+}
+
+/* IFR_USED when records 1..count-1 can share record 0's encoding. */
+static int exec_indirect_fast_why(struct mad_exec *e, const struct mad_cmd *c) {
+    if (c->u.ind.count < 2) return IFR_ONE_RECORD;
+    if (g_census_on || g_fault_diag || g_skip_ps_state > 0 || g_sd_state != 0) return IFR_DIAG;
+    if (g_capture_on) return IFR_CAPTURE;
+    if ((g_list_seq <= 3 || (g_list_seq >= 12000 && g_list_seq < 12400)) && g_dump_draws < 40000) return IFR_DUMP;   /* draw dumps name each record */
+    if (e->cap_after || e->cap_after_cs || e->ncap_after_buf || e->ncap_after_tex) return IFR_CAPTURE;
+    if (c->kind == MC_DISPATCH_INDIRECT)
+        return e->cenc && e->cpso && e->cpso->cps &&
+               (e->cpso->backend == MADEIRA_IR_BACKEND_MSC || e->cpso->backend == MADEIRA_IR_BACKEND_AIRCONV)
+               ? IFR_USED : IFR_COMPUTE;
+    if (!e->renc || !e->pso) return IFR_NO_ENCODER;
+    if (e->pso->gs_emu) return IFR_GS_EMU;
+    if (e->pso->backend == MADEIRA_IR_BACKEND_AIRCONV) {   /* build 470: its tables come from the shared root state */
+        if (e->pso->tess || e->pso->tess_strip || e->pso->has_tess) return IFR_DXBC_TESS;
+    } else if (e->pso->backend != MADEIRA_IR_BACKEND_MSC) return IFR_BACKEND;
+    return c->kind == MC_DRAW_INDIRECT || (c->kind == MC_DRAW_INDEXED_INDIRECT && e->ib && e->ib->buffer) ? IFR_USED : IFR_NO_IB;
+}
+
+/* Records 1..count-1 of an ExecuteIndirect whose record 0 was just encoded. */
+static void exec_indirect_rest(struct mad_exec *e, const struct mad_cmd *c) {
+    enum { B = 64 };
+    UINT k, n, i, rest = c->u.ind.count - 1;
+    for (k = 1; k < c->u.ind.count; k += n) {
+        n = c->u.ind.count - k < B ? c->u.ind.count - k : B;
+        if (c->kind == MC_DISPATCH_INDIRECT) {
+            struct wmtcmd_compute_dispatch_indirect d[B];
+            memset(d, 0, n * sizeof d[0]);
+            for (i = 0; i < n; i++) {
+                d[i].type = WMTComputeCommandDispatchIndirect;
+                d[i].indirect_args_buffer = c->u.ind.args->buffer;
+                d[i].indirect_args_offset = c->u.ind.off + (UINT64)(k + i) * c->u.ind.stride;
+                d[i].next.ptr = i + 1 < n ? (void *)&d[i + 1] : NULL;
+            }
+            MTLComputeCommandEncoder_encodeCommands(e->cenc, (const struct wmtcmd_base *)&d[0]);
+        } else {
+            struct wmtcmd_render_setbuffer sb[B];
+            struct wmtcmd_render_draw_indirect di[B];
+            struct wmtcmd_render_draw_indexed_indirect dii[B];
+            int indexed = c->kind == MC_DRAW_INDEXED_INDIRECT;
+            memset(sb, 0, n * sizeof sb[0]);
+            if (indexed) memset(dii, 0, n * sizeof dii[0]); else memset(di, 0, n * sizeof di[0]);
+            for (i = 0; i < n; i++) {
+                UINT64 off = c->u.ind.off + (UINT64)(k + i) * c->u.ind.stride;
+                void *draw = indexed ? (void *)&dii[i] : (void *)&di[i];
+                /* the converter's draw parameters: this record, as exec_draw binds them */
+                sb[i].type = WMTRenderCommandSetVertexBuffer;
+                sb[i].buffer = c->u.ind.args->buffer; sb[i].offset = off; sb[i].index = 4;
+                sb[i].next.ptr = draw;
+                if (indexed) {
+                    dii[i].type = WMTRenderCommandDrawIndexedIndirect;
+                    dii[i].primitive_type = mad_prim(e->topo);
+                    dii[i].index_type = e->ib_type;
+                    dii[i].index_buffer = e->ib->buffer;
+                    dii[i].index_buffer_offset = e->ib_off;
+                    dii[i].indirect_args_buffer = c->u.ind.args->buffer;
+                    dii[i].indirect_args_offset = off;
+                    dii[i].next.ptr = i + 1 < n ? (void *)&sb[i + 1] : NULL;
+                } else {
+                    di[i].type = WMTRenderCommandDrawIndirect;
+                    di[i].primitive_type = mad_prim(e->topo);
+                    di[i].indirect_args_buffer = c->u.ind.args->buffer;
+                    di[i].indirect_args_offset = off;
+                    di[i].next.ptr = i + 1 < n ? (void *)&sb[i + 1] : NULL;
+                }
+            }
+            MTLRenderCommandEncoder_encodeCommands(e->renc, (const struct wmtcmd_base *)&sb[0]);
+            e->pass_draws += n;
+        }
+        e->draws += n;
+    }
+    InterlockedExchangeAdd(&g_ifast_records, (LONG)rest);
+    if ((InterlockedIncrement(&g_ifast_calls) % 20000) == 1)
+        d3d12_log("[madeira-d3d12] indirect-fast: %ld calls, %ld records encoded without per-record setup\n",
+                  (long)g_ifast_calls, (long)g_ifast_records);
+}
+
+/* madeira-bcd: the first three replays of every refusal reason, with what
+ * decided it (the pipeline, its converter and emulation, the encoders, and
+ * how many draws record 0 encoded). */
+static void mad_ifr_detail(const struct mad_exec *e, const struct mad_cmd *c, int why, int drew) {
+    static volatile LONG said[IFR_N];
+    const struct mad_pso *p = c->kind == MC_DISPATCH_INDIRECT ? e->cpso : e->pso;
+    if (why == IFR_USED || InterlockedIncrement(&said[why]) > 3) return;
+    d3d12_log("[madeira-d3d12] indirect-fast: refused (%s): %s, %u records of stride %u; pipeline '%s' backend %u "
+              "gs_emu %d tess %d/%d/%d; render encoder %s, compute encoder %s, index buffer %s; record 0 encoded %d\n",
+              g_ifr_names[why], c->kind == MC_DISPATCH_INDIRECT ? "dispatch" : c->kind == MC_DRAW_INDEXED_INDIRECT ? "indexed draw" : "draw",
+              c->u.ind.count, c->u.ind.stride, p ? p->vs_name : "-", p ? p->backend : 0u, p ? p->gs_emu : -1,
+              p && p->tess ? 1 : 0, p && p->tess_strip ? 1 : 0, p ? p->has_tess : 0,
+              e->renc ? "open" : "none", e->cenc ? "open" : "none", e->ib && e->ib->buffer ? "bound" : "none", drew);
+}
+
 /* madeira-bcd: during a CAP frame, every clear and copy with its target's
  * identity and alias report -- clear-only passes are not captured as images,
  * and a copy into memory shared with a live target is a corruption source. */
@@ -6840,8 +7065,16 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             if (!c->u.ind.args || !c->u.ind.args->buffer) { e.skipped++; break; }
             exec_indirect_probe(&e, c);   /* madeira-bcd: diagnostics, every 3 s per pipeline */
             for (k = 0; k < c->u.ind.count; k++) {
+                unsigned drawn = e.draws;
                 t.u.ind.off = c->u.ind.off + (UINT64)k * c->u.ind.stride;
                 if (c->kind == MC_DISPATCH_INDIRECT) exec_dispatch(&e, &t); else exec_draw(&e, &t);
+                /* madeira-bcd: indirect-fast -- record 0 was encoded, the rest share its state */
+                if (!k && mad_indirect_fast_on()) {
+                    int why = e.draws != drawn + 1 ? IFR_NOT_DRAWN : exec_indirect_fast_why(&e, c);
+                    mad_ifr_note(why, c->u.ind.count);
+                    if (why != IFR_USED) mad_ifr_detail(&e, c, why, (int)(e.draws - drawn));
+                    if (why == IFR_USED) { exec_indirect_rest(&e, c); break; }
+                }
             }
             if (g_sd_state > 0 && g_ic_frames) mad_ic_note(&e, c);   /* madeira-bcd: ind-count */
             break;
@@ -6903,9 +7136,21 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         if (!qpf.QuadPart) QueryPerformanceFrequency(&qpf);
         if (now - prev > 5 * qpf.QuadPart && InterlockedCompareExchange64(&last_census, now, prev) == prev) {
             mad_acct_report();
-            if (e.q && e.q->device)
-                d3d12_log("[madeira-d3d12] ml1150 Metal currentAllocatedSize %llu MB\n",
-                          (unsigned long long)(MTLDevice_currentAllocatedSize(e.q->device->mtl_device) >> 20));
+            if (e.q && e.q->device) {
+                struct mad_device *md = e.q->device;
+                LONG64 metal = (LONG64)MTLDevice_currentAllocatedSize(md->mtl_device);
+                LONG64 sa = g_sa_tex_bytes, rings = (LONG64)g_ring_chunks * MAD_ARG_RING_BYTES;
+                LONG64 theaps = g_hp_dev ? (LONG64)g_hp_dev->hp_total_bytes : 0, mheaps = g_mheap_bytes;
+                LONG64 bufs = g_cat_bytes[MAD_CAT_BUF_PRIVATE] + g_cat_bytes[MAD_CAT_BUF_SHARED];
+                d3d12_log("[madeira-d3d12] ml1150 Metal currentAllocatedSize %llu MB\n", (unsigned long long)(metal >> 20));
+                /* madeira-bcd metal-gap: see g_sa_tex_bytes */
+                d3d12_log("[madeira-d3d12] metal-gap: Metal %lld MB = standalone textures %ld (%lld MB as Metal sizes them, "
+                          "%lld MB estimated) + texture heaps %lld MB + application heaps %lld MB + buffers %lld MB + "
+                          "argument ring chunks %ld (%lld MB) + the rest %lld MB; frees waiting for the GPU: %u\n",
+                          (long long)(metal >> 20), g_sa_tex_n, (long long)(sa >> 20), (long long)(g_sa_tex_logical >> 20),
+                          (long long)(theaps >> 20), (long long)(mheaps >> 20), (long long)(bufs >> 20), g_ring_chunks,
+                          (long long)(rings >> 20), (long long)((metal - sa - theaps - mheaps - bufs - rings) >> 20), md->nmhret);
+            }
         }
     }
     {
@@ -6915,6 +7160,9 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             d3d12_log("[madeira-d3d12] list executed: %u commands, %u draws, %u skipped\n", l->ncmds, e.draws, e.skipped);
         }
     }
+    /* madeira-bcd ring-share: the chunks this replay wrote belong to the open batch now;
+     * mad_queue_flush retires them with its serial, and the list keeps none. */
+    if (l->nrings && q->device->gpu_event && mad_ring_share_on()) mad_ring_park(q, l);
 }
 
 /* ml1120: the replay itself; runs on the caller (async-submit = 0) or on the
@@ -7271,6 +7519,7 @@ static void mad_queue_flush(struct mad_queue *q) {
         if (q->open_ticket) { mad_ticket_commit(q->open_ticket, serial); q->open_ticket = 0; }   /* madeira-bcd: sync diagnostics */
         LeaveCriticalSection(&sd->fence_lock);
         q->batch_serial[(q->batches + 1) & 63] = serial;
+        if (q->nring_parked) mad_ring_unpark(q, serial);   /* madeira-bcd ring-share */
     }
     q->pending[q->npending++] = q->open_cb;      /* the reference taken at open moves here */
     q->open_cb = 0; q->open_lists = 0; q->batches++;
@@ -7305,6 +7554,7 @@ static void mad_list_rings_rewind(struct mad_list *l) {
         UINT64 serial = (q->batches - l->ring_batch < 64) ? q->batch_serial[l->ring_batch & 63] : q->last_serial;
         if (!serial) serial = q->last_serial;
         if (serial && mad_gpu_completed(q->device) < serial) mad_ring_retire(q->device, l, serial);
+        else if (mad_ring_share_on()) mad_ring_pool_put(q->device, l);   /* madeira-bcd: ring-share */
     }
 }
 
@@ -9196,7 +9446,7 @@ static void mad_vis_complete(struct mad_device *d, struct mad_vis_batch *v) {
     for (k = 0; k < v->nchunks; k++) {
         if (mad_grow((void **)&d->ring_pool, &d->ring_pool_cap, d->nring_pool + 1, sizeof *d->ring_pool)) {
             v->chunks[k].serial = 0; d->ring_pool[d->nring_pool++] = v->chunks[k];
-        } else NSObject_release(v->chunks[k].buf);
+        } else { NSObject_release(v->chunks[k].buf); InterlockedDecrement(&g_ring_chunks); }
     }
     LeaveCriticalSection(&d->ring_lock);
     NSObject_release(v->cb);
@@ -9444,6 +9694,11 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
         }
         { unsigned k; for (k = 0; k < r->ntview; k++) if (r->tview[k].tex) { NSObject_release(r->tview[k].tex); InterlockedDecrement(&g_tview_live); } }   /* ml905; ml1126: never set members */
         { unsigned k; for (k = 0; k < r->nxview; k++) if (r->xview[k].tex) { mad_unresident(r->owner, r->xview[k].tex); NSObject_release(r->xview[k].tex); InterlockedDecrement(&g_xview_live); } }   /* ml913 */
+        if (r->metal_bytes) {   /* madeira-bcd metal-gap */
+            InterlockedExchangeAdd64(&g_sa_tex_bytes, -(LONG64)r->metal_bytes);
+            InterlockedExchangeAdd64(&g_sa_tex_logical, -(LONG64)r->acct_bytes);
+            InterlockedDecrement(&g_sa_tex_n);
+        }
         if (r->acct_bytes) mad_acct(r, r->acct_cat, r->acct_bytes, -1);   /* ml1057 */
         if (r->buffer && !r->placed_heap) mad_unresident(r->owner, r->buffer);
         if (r->texture && !r->borrowed && !r->hp_used && !r->placed_heap) mad_unresident(r->owner, r->texture);
@@ -9807,6 +10062,16 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
             mad_acct(r, ti.sample_count > 1 ? MAD_CAT_TEX_MSAA : is_depth ? MAD_CAT_TEX_DS
                         : (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ? MAD_CAT_TEX_RT
                         : (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ? MAD_CAT_TEX_UAV : MAD_CAT_TEX_PLAIN, bytes, +1);
+            if (!r->hp_used) {   /* madeira-bcd metal-gap: a standalone texture, as Metal sizes it */
+                UINT64 msz = 0, mal = 0;
+                MTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &msz, &mal);
+                if (msz) {
+                    r->metal_bytes = msz;
+                    InterlockedExchangeAdd64(&g_sa_tex_bytes, (LONG64)msz);
+                    InterlockedExchangeAdd64(&g_sa_tex_logical, (LONG64)bytes);
+                    InterlockedIncrement(&g_sa_tex_n);
+                }
+            }
         }
         hr = res_QI((ID3D12Resource *)r, riid, out);
         if (FAILED(hr)) mad_refuse_log(desc, heap_type, "interface not answered");
@@ -9927,6 +10192,7 @@ static ULONG STDMETHODCALLTYPE memheap_Release(ID3D12Heap *This) {
                       (unsigned long long)h->desc.SizeInBytes >> 10);   /* ml895 */
         if (h->mtl) {   /* ml1145: every placed resource held a reference, so none is left; ml1148: but the GPU may still hold them */
             struct mad_device *hd = h->device; int queued = 0;
+            InterlockedExchangeAdd64(&g_mheap_bytes, -(LONG64)h->desc.SizeInBytes);   /* madeira-bcd metal-gap: queued frees are counted apart */
             EnterCriticalSection(&hd->heap_lock);
             if (mad_grow((void **)&hd->mhret, &hd->mhret_cap, hd->nmhret + 1, sizeof *hd->mhret)) {
                 hd->mhret[hd->nmhret].heap = h->mtl; hd->mhret[hd->nmhret].serial = (UINT64)hd->gpu_serial; hd->mhret[hd->nmhret].mem = NULL; hd->nmhret++; queued = 1;
@@ -9978,7 +10244,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateHeap(ID3D12Device *This, const D3D
         if (backing < 0) { backing = (int)mad_cfg_int_pe("heap-backing", 1); d3d12_log("[madeira-d3d12] ml1145 heap-backing = %d (DEFAULT heaps %s)\n", backing, backing ? "are Metal placement heaps; placed resources alias" : "are descriptions only"); }
         if (backing && desc->Properties.Type == D3D12_HEAP_TYPE_DEFAULT && desc->SizeInBytes) {
             h->mtl = MTLDevice_newPlacementHeap(hd->mtl_device, desc->SizeInBytes, WMTResourceStorageModePrivate);
-            if (h->mtl) mad_resident(hd, h->mtl);
+            if (h->mtl) { mad_resident(hd, h->mtl); InterlockedExchangeAdd64(&g_mheap_bytes, (LONG64)desc->SizeInBytes); }   /* madeira-bcd metal-gap */
             if (said_b++ < 32) d3d12_log("[madeira-d3d12] ml1145 heap %llu KB flags %#x %s\n", (unsigned long long)(desc->SizeInBytes >> 10),
                                          (unsigned)desc->Flags, h->mtl ? "backed by a Metal placement heap" : "COULD NOT be backed; its resources stand alone");
         }
