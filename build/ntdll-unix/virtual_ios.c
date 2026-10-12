@@ -3457,7 +3457,16 @@ static volatile size_t ios_jit_tail_reserved = 0;
  * (1..32MB after the ml437 MAX_CODE_SIZE cap), so first-fit-larger waste is
  * bounded and reuse is usually exact. */
 #define IOS_TAIL_CARVE_MAX 256
-static struct { size_t off; size_t size; int free; time_t freed_at; } ios_tail_carves[IOS_TAIL_CARVE_MAX];
+struct ios_tail_carve
+{
+    size_t off;
+    size_t size;
+    int    free;
+    time_t freed_at;
+    void  *peb;       /* madeira-bcd: the pseudo-process it was handed to (NULL = unknown) */
+    int    retired;   /* madeira-bcd: freed because that process exited, not by FEX */
+};
+static struct ios_tail_carve ios_tail_carves[IOS_TAIL_CARVE_MAX];
 
 /* madeira-bcd pool-low: 1 for a carve offset in region C (`off` is its wrapping
  * distance from the pool's RX base, see ios_jit_low_rx_global). */
@@ -3536,6 +3545,77 @@ static int ios_tail_carve_occupied( const void *base, size_t size )
 }
 static unsigned ios_tail_carve_n;
 static pthread_mutex_t ios_tail_carve_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* madeira-bcd: a dead pseudo-process's FEX code buffers.
+ *
+ * FEX releases a code buffer when it rotates to a new one, never when its
+ * process exits: NtTerminateProcess longjmps out of the calling thread and
+ * nothing tears FEX down, so the process's last buffer stayed LIVE for the rest
+ * of the session. GTA V Enhanced, first start after the Dock installs (build
+ * 514, 2026-10-12 13:11): the exits of PlayGTAV.exe, the launcher before its
+ * self-restart and four RockstarService.exe left 96 MB of region C and a 128 MB
+ * tail buffer live, the tail stood at 0x18f38000, and every buffer the game
+ * asked for was capped at 16 MB ("tail CAP: refusing 0x8000000 (cap
+ * 0x1000000"): FEX retranslated its hot code over and over, about 7 fps. RDR2
+ * at 12:57 the same way.
+ *
+ * ios_jit_reclaim_process now retires them: free again, but `retired`. A
+ * retired carve is handed out, or lifts the code-buffer cap, only when the
+ * image reuse grace has passed since the exit, and is handed out only when a
+ * strict scan finds no thread's PC inside it (ios_tail_carve_scan): a laggard
+ * thread of the dead process may still run for a moment, as in its image
+ * copies. A buffer FEX releases itself keeps the old rules. Set
+ * MADEIRA_POOL_CODE_EXIT_RECLAIM=0 to keep dead processes' buffers live. */
+static int ios_tail_carve_ready( const struct ios_tail_carve *carve, time_t now )
+{
+    if (!carve->free) return 0;
+    return !carve->retired || now - carve->freed_at >= IOS_POOL_REUSE_GRACE_SEC;
+}
+
+/* Retire `peb`'s live carves; the caller holds ios_tail_carve_lock. Returns
+ * how many, and their bytes in *bytes. */
+static unsigned ios_tail_carves_retire_owner( struct ios_tail_carve *carves, unsigned n, void *peb,
+                                              time_t now, size_t *bytes )
+{
+    unsigned i, retired = 0;
+
+    *bytes = 0;
+    if (!peb) return 0;
+    for (i = 0; i < n; i++)
+    {
+        if (carves[i].free || carves[i].peb != peb) continue;
+        carves[i].free = 1;
+        carves[i].retired = 1;
+        carves[i].freed_at = now;
+        carves[i].peb = NULL;
+        *bytes += carves[i].size;
+        retired++;
+    }
+    return retired;
+}
+
+/* A release by a thread of another process than the carve's owner: a dead
+ * process's late release of a buffer that has since been handed on. */
+static int ios_tail_carve_foreign_release( const struct ios_tail_carve *carve, void *caller_peb )
+{
+    return carve->peb && caller_peb && carve->peb != caller_peb;
+}
+
+static void ios_tail_carves_owner_died( void *peb )
+{
+    const char *env = getenv( "MADEIRA_POOL_CODE_EXIT_RECLAIM" );
+    size_t bytes = 0;
+    unsigned n;
+
+    if (!peb || (env && !strcmp( env, "0" ))) return;
+    pthread_mutex_lock( &ios_tail_carve_lock );
+    n = ios_tail_carves_retire_owner( ios_tail_carves, ios_tail_carve_n, peb, time( NULL ), &bytes );
+    pthread_mutex_unlock( &ios_tail_carve_lock );
+    if (n)
+        dprintf( 2, "[jit-pool] RECLAIM peb=%p: %u FEX code buffer(s) 0x%lx bytes retired to the carve free-list, "
+                    "reusable after %ds once no thread runs in them (madeira-bcd)\n",
+                 peb, n, (unsigned long)bytes, IOS_POOL_REUSE_GRACE_SEC );
+}
 
 /* Unlike the existing freelist's best-effort check, a cross-allocator transfer
  * needs proof that every byte is mapped and currently readable/executable.
@@ -11180,6 +11260,10 @@ void ios_jit_reclaim_process( void *peb )
     }
 
     pthread_mutex_unlock( &ios_pool_lock );
+
+    /* madeira-bcd: and its FEX code buffers (after the pool lock: the carve
+     * lock is never taken under it) */
+    ios_tail_carves_owner_died( peb );
 
     if (ranges || maps_killed)
         dprintf(2, "[jit-pool] RECLAIM peb=%p: %d ranges 0x%lx bytes freed (grace %ds), "
@@ -27063,8 +27147,9 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
         int low_fits = low_ok && alloc_size <= IOS_POOL_LOW_CARVE_MAX &&
                        alloc_size <= ios_jit_low_size_global &&
                        ios_jit_low_reserved <= ios_jit_low_size_global - alloc_size;
-        int kept_large_carve = 0, reuse_all_carves = 0;
-        size_t tail_cap = ~(size_t)0;
+        int kept_large_carve = 0, reuse_all_carves = 0, retired_busy = 0;
+        size_t tail_cap = ~(size_t)0, budget_cap = ~(size_t)0;
+        void *carve_peb = ios_jit_current_peb();   /* madeira-bcd: the carve's owner, see ios_tail_carve_ready */
         /* ml459 (#75): cap a single EC code buffer at 16MB. FEX asks for 32MB
          * once its buffers get hot, but an old generation stays pinned by any
          * thread still referencing it (see [pool-tail] PIN) — and a 32MB
@@ -27113,12 +27198,14 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
                                                                    ios_jit_hole2_off, ios_jit_hole2_end ) );
             /* A retired generation of this size already sitting on the carve
              * free-list costs the pool nothing new: never refuse that. */
+            budget_cap = cap;
             if (alloc_size > cap)
             {
                 unsigned fi;
+                time_t now = time( NULL );
                 pthread_mutex_lock( &ios_tail_carve_lock );
                 for (fi = 0; fi < ios_tail_carve_n; fi++)
-                    if (ios_tail_carves[fi].free && ios_tail_carves[fi].size >= alloc_size &&
+                    if (ios_tail_carve_ready( &ios_tail_carves[fi], now ) && ios_tail_carves[fi].size >= alloc_size &&
                         (low_ok || !ios_tail_carve_in_low( ios_tail_carves[fi].off ))) { cap = alloc_size; break; }
                 pthread_mutex_unlock( &ios_tail_carve_lock );
             }
@@ -27147,9 +27234,10 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
 retry_code_carve_reuse:
         {
             unsigned i, best = ~0u;
+            time_t now = time( NULL );
             pthread_mutex_lock( &ios_tail_carve_lock );
             for (i = 0; i < ios_tail_carve_n; i++)
-                if (ios_tail_carves[i].free && ios_tail_carves[i].size >= alloc_size &&
+                if (ios_tail_carve_ready( &ios_tail_carves[i], now ) && ios_tail_carves[i].size >= alloc_size &&
                     (low_ok || !ios_tail_carve_in_low( ios_tail_carves[i].off )) &&   /* madeira-bcd pool-low */
                     (best == ~0u || ios_tail_carves[i].size < ios_tail_carves[best].size))
                     best = i;
@@ -27159,12 +27247,33 @@ retry_code_carve_reuse:
                 kept_large_carve = 1;
                 best = ~0u;
             }
+            /* madeira-bcd: a dead process's buffer, only when no thread runs in it;
+             * a busy one starts its grace again and the next one is tried */
+            if (best != ~0u && ios_tail_carves[best].retired &&
+                ios_tail_carve_scan( (char *)ios_jit_rx_base_global + ios_tail_carves[best].off,
+                                     ios_tail_carves[best].size, 1 ))
+            {
+                static unsigned busy_n;
+                void *busy_rx = (char *)ios_jit_rx_base_global + ios_tail_carves[best].off;
+                size_t busy_size = ios_tail_carves[best].size;
+
+                ios_tail_carves[best].freed_at = now;
+                pthread_mutex_unlock( &ios_tail_carve_lock );
+                retired_busy = 1;
+                if (++busy_n <= 32)
+                    dprintf(2, "[jit-pool] tail REUSE skipped rx=%p size=0x%lx: a thread runs in this dead process's "
+                            "buffer, or a thread's state could not be read (madeira-bcd)\n", busy_rx, (unsigned long)busy_size);
+                goto retry_code_carve_reuse;
+            }
             if (best != ~0u)
             {
                 void *jit_rx = (char *)ios_jit_rx_base_global + ios_tail_carves[best].off;
                 void *jit_rw = (char *)ios_jit_rw_base_global + ios_tail_carves[best].off;
                 size_t got = ios_tail_carves[best].size;
+                int was_retired = ios_tail_carves[best].retired;
                 ios_tail_carves[best].free = 0;
+                ios_tail_carves[best].retired = 0;
+                ios_tail_carves[best].peb = carve_peb;
                 pthread_mutex_unlock( &ios_tail_carve_lock );
                 {
                     volatile uint32_t *rw_words = (volatile uint32_t *)jit_rw;
@@ -27173,12 +27282,26 @@ retry_code_carve_reuse:
                 }
                 *ret = jit_rx;
                 *size_ptr = got;
-                dprintf(2, "[jit-pool] tail REUSE rx=%p size=0x%lx (asked 0x%lx) free_left=%u rev=ml438%s\n",
+                dprintf(2, "[jit-pool] tail REUSE rx=%p size=0x%lx (asked 0x%lx) free_left=%u rev=ml438%s%s\n",
                         jit_rx, (unsigned long)got, (unsigned long)alloc_size, ios_tail_carve_n,
-                        ios_jit_low_contains( (uintptr_t)jit_rx ) ? " [pool-low] region C" : "");
+                        ios_jit_low_contains( (uintptr_t)jit_rx ) ? " [pool-low] region C" : "",
+                        was_retired ? " (a dead process's buffer)" : "");
                 return STATUS_SUCCESS;
             }
             pthread_mutex_unlock( &ios_tail_carve_lock );
+        }
+        /* madeira-bcd: the cap was lifted for a dead process's buffer that a thread
+         * still runs in, so the pool's budget applies again (FEX halves down) */
+        if (retired_busy)
+        {
+            tail_cap = budget_cap;
+            if (alloc_size > tail_cap && !low_fits)
+            {
+                dprintf(2, "[jit-pool] tail CAP: refusing 0x%lx (cap 0x%lx, tail_resv=0x%lx): the dead process's "
+                        "buffer it counted on is still in use (madeira-bcd)\n", (unsigned long)alloc_size,
+                        (unsigned long)tail_cap, (unsigned long)ios_jit_tail_reserved);
+                return STATUS_NO_MEMORY;
+            }
         }
         /* madeira-bcd pool-low: carve from region C's bottom. The carve goes into
          * ios_tail_carves with `off` = its (wrapping) distance from the pool's RX
@@ -27201,6 +27324,8 @@ retry_code_carve_reuse:
                     ios_tail_carves[ios_tail_carve_n].size = alloc_size;
                     ios_tail_carves[ios_tail_carve_n].free = 0;
                     ios_tail_carves[ios_tail_carve_n].freed_at = 0;
+                    ios_tail_carves[ios_tail_carve_n].peb = carve_peb;
+                    ios_tail_carves[ios_tail_carve_n].retired = 0;
                     ios_tail_carve_n++;
                 }
                 pthread_mutex_unlock( &ios_tail_carve_lock );
@@ -27302,6 +27427,8 @@ retry_code_carve_reuse:
                         ios_tail_carves[ios_tail_carve_n].size = alloc_size;
                         ios_tail_carves[ios_tail_carve_n].free = 0;
                         ios_tail_carves[ios_tail_carve_n].freed_at = 0;
+                        ios_tail_carves[ios_tail_carve_n].peb = carve_peb;
+                        ios_tail_carves[ios_tail_carve_n].retired = 0;
                         ios_tail_carve_n++;
                     }
                     pthread_mutex_unlock( &ios_tail_carve_lock );
@@ -27345,7 +27472,7 @@ retry_code_carve_reuse:
                         dprintf(2, "[pool-tail] carve[%u] off=0x%lx size=0x%lx %s rev=ml459%s\n",
                                 ci, (unsigned long)ios_tail_carves[ci].off,
                                 (unsigned long)ios_tail_carves[ci].size,
-                                ios_tail_carves[ci].free ? "FREE" : "LIVE",
+                                !ios_tail_carves[ci].free ? "LIVE" : ios_tail_carves[ci].retired ? "FREE (owner exited)" : "FREE",
                                 ios_tail_carve_in_low( ios_tail_carves[ci].off ) ? " [pool-low] region C" : "");
                         if (ios_tail_carves[ci].free) freed += ios_tail_carves[ci].size;
                         else live += ios_tail_carves[ci].size;
@@ -27406,6 +27533,8 @@ retry_code_carve_reuse:
                 ios_tail_carves[ios_tail_carve_n].size = alloc_size;
                 ios_tail_carves[ios_tail_carve_n].free = 0;
                 ios_tail_carves[ios_tail_carve_n].freed_at = 0;
+                ios_tail_carves[ios_tail_carve_n].peb = carve_peb;
+                ios_tail_carves[ios_tail_carve_n].retired = 0;
                 ios_tail_carve_n++;
             }
             /* madeira-bcd split pool: this carve went below a hole; the span it
@@ -27420,6 +27549,8 @@ retry_code_carve_reuse:
                     ios_tail_carves[ios_tail_carve_n].size = skip_size[k];
                     ios_tail_carves[ios_tail_carve_n].free = 1;
                     ios_tail_carves[ios_tail_carve_n].freed_at = 0;   /* never executed, outside region C */
+                    ios_tail_carves[ios_tail_carve_n].peb = NULL;
+                    ios_tail_carves[ios_tail_carve_n].retired = 0;
                     ios_tail_carve_n++;
                 }
             }
@@ -28047,10 +28178,23 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
         unsigned i;
         size_t off = (size_t)((char *)base - (char *)ios_jit_rx_base_global);
         size_t carve_size = 0;
+        void *caller_peb = ios_jit_current_peb();
         pthread_mutex_lock( &ios_tail_carve_lock );
         for (i = 0; i < ios_tail_carve_n; i++)
         {
             if (ios_tail_carves[i].off != off || ios_tail_carves[i].free) continue;
+            /* madeira-bcd: never a release by another process than the owner: a
+             * dead process's late one, after its retired buffer was handed on */
+            if (ios_tail_carve_foreign_release( &ios_tail_carves[i], caller_peb ))
+            {
+                static unsigned foreign_n;
+                if (++foreign_n <= 16)
+                    dprintf(2, "[jit-pool] tail FREE REFUSED rx=%p size=0x%lx: released by peb=%p, owned by "
+                               "peb=%p (madeira-bcd)\n", base, (unsigned long)ios_tail_carves[i].size,
+                            caller_peb, ios_tail_carves[i].peb);
+                carve_size = 0;
+                break;
+            }
             /* ml557: do NOT recycle a carve a thread is still executing in. */
             if (ios_tail_carve_occupied( base, ios_tail_carves[i].size ))
             {
