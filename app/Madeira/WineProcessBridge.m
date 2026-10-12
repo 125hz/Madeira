@@ -631,6 +631,75 @@ static void madeira_link_syswow64_wbem(NSFileManager *fm, NSString *prefix, NSSt
     madeira_link_wbem(fm, prefix, @"syswow64", [bundle stringByAppendingPathComponent:@"i386-windows"]);
 }
 
+/* d3d9 = wined3d (madeira.cfg or the game's own lines; MADEIRA_D3D9=wined3d in
+ * the environment otherwise): this session's d3d9.dll is Wine's own frontend on
+ * wined3d's OpenGL renderer (opengl32 -> the winios WGL driver -> Zink on
+ * MoltenVK), not DXMT's. Unset, "emulated" and "native" keep DXMT's.
+ *
+ * The farms ship Wine's d3d9 as d3d9-wined3d.dll beside DXMT's d3d9.dll (ARM64EC
+ * for x64 programs, i386 for 32-bit ones). The links made for this session are
+ * re-pointed: system32\d3d9.dll when it names the ARM64EC DXMT file, sysx64\ and
+ * syswow64\d3d9.dll. Every session relinks the farms first, so the next session
+ * without the setting gets DXMT's again. No load-order override is needed: the
+ * iOS unix loader maps the PE file the link names (load_builtin in
+ * build/ntdll-unix/loader_ios.c returns STATUS_IMAGE_ALREADY_LOADED).
+ * wined3d.dll, d3d8.dll and ddraw.dll are Wine's in both farms already; d3d8 and
+ * ddraw always draw through wined3d. */
+static BOOL madeira_d3d9_wined3d_wanted(void)
+{
+    char v[32] = "";
+    const char *e;
+
+    if (madeira_cfg_get("d3d9", v, sizeof v) && v[0]) return !strcasecmp(v, "wined3d");
+    e = getenv("MADEIRA_D3D9");   /* the d3d9 key's value: emulated (default) or native = DXMT's i386 shim; wined3d = Wine's d3d9 on wined3d/OpenGL for 32- and 64-bit programs */
+    return e && !strcasecmp(e, "wined3d");
+}
+
+/* <dir>\d3d9.dll -> <farm>/d3d9-wined3d.dll. 1 linked, 0 link failed, -1 the farm has no such file. */
+static int madeira_link_d3d9_wined3d_in(NSFileManager *fm, NSString *dir, NSString *farm)
+{
+    NSString *src = [farm stringByAppendingPathComponent:@"d3d9-wined3d.dll"];
+    NSString *dst = [dir stringByAppendingPathComponent:@"d3d9.dll"];
+
+    if (access(src.fileSystemRepresentation, R_OK) != 0) return -1;
+    [fm removeItemAtPath:dst error:nil];
+    return [fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil] ? 1 : 0;
+}
+
+static void madeira_link_d3d9_wined3d(NSFileManager *fm, NSString *prefix, NSString *bundle, BOOL has_i386_set)
+{
+    NSString *win = [prefix stringByAppendingPathComponent:@"drive_c/windows"];
+    NSString *ec = [bundle stringByAppendingPathComponent:@"arm64ec-windows"];
+    NSString *sys32 = [win stringByAppendingPathComponent:@"system32"];
+    NSString *cur = [fm destinationOfSymbolicLinkAtPath:[sys32 stringByAppendingPathComponent:@"d3d9.dll"] error:nil];
+    const char *backend = getenv("MADEIRA_GL_BACKEND");
+    const char *extmax;
+    int s32 = -2, s64, s32wow = -2;
+
+    /* system32 holds the ARM64EC farm in an x64 session and, through the
+     * cross-link pass, in an ARM64 one whose farm has no d3d9.dll. */
+    if ([cur isEqualToString:[ec stringByAppendingPathComponent:@"d3d9.dll"]])
+        s32 = madeira_link_d3d9_wined3d_in(fm, sys32, ec);
+    s64 = madeira_link_d3d9_wined3d_in(fm, [win stringByAppendingPathComponent:@"sysx64"], ec);
+    if (has_i386_set)
+        s32wow = madeira_link_d3d9_wined3d_in(fm, [win stringByAppendingPathComponent:@"syswow64"],
+                                              [bundle stringByAppendingPathComponent:@"i386-windows"]);
+    setenv("MADEIRA_D3D9", "wined3d", 1);
+    /* wined3d asks for a context without a profile mask, gets a compatibility
+     * one and reads glGetString(GL_EXTENSIONS); the 3072-byte cut that 32-bit
+     * contexts get for engines that copy the string into a fixed buffer would
+     * hide extensions from it. overwrite=0: madeira.cfg can still set a limit. */
+    setenv("MADEIRA_GL_EXTENSIONS_MAX", "0", 0);
+    extmax = getenv("MADEIRA_GL_EXTENSIONS_MAX");   /* byte limit of GL_EXTENSIONS in 32-bit OpenGL contexts (opengl32, patches/wine-opengl-winios.patch): unset = 3072, 0 = none; d3d9 = wined3d makes it 0 unless set */
+    dprintf(STDERR_FILENO, "[WineProc] d3d9 = wined3d: Wine's d3d9 on wined3d/OpenGL (system32 %d, sysx64 %d, "
+            "syswow64 %d; 1 = linked, -1 = farm has no d3d9-wined3d.dll, -2 = not this session's), "
+            "MADEIRA_GL_BACKEND=%s, MADEIRA_GL_EXTENSIONS_MAX=%s\n", s32, s64, s32wow,
+            backend ? backend : "(unset)", extmax ? extmax : "(unset)");
+    if (!backend || strcmp(backend, "zink"))
+        dprintf(STDERR_FILENO, "[WineProc] d3d9 = wined3d needs desktop OpenGL (gl-backend = zink, the bundle's gl/ "
+                "folder); with OpenGL ES wined3d finds no usable context and Direct3DCreate9 returns NULL\n");
+}
+
 /* ml1275: C:\windows\mono\mono-2.0 -> the bundle's Wine Mono, when the build
  * carries one (the "Bundle Wine Mono" build phase); otherwise the copy Madeira
  * downloaded from WineHQ (WineMono.swift, Library/Application Support/WineMono/
@@ -1505,6 +1574,8 @@ static void *wine_process_thread(void *arg) {
                 madeira_seed_winsxs_x86(fm, prefix, bundlePath);
             }
             madeira_link_wine_mono(fm, prefix, bundlePath);
+            if (madeira_d3d9_wined3d_wanted())
+                madeira_link_d3d9_wined3d(fm, prefix, bundlePath, has_i386_set);
 
             /* ml719: REPAIR THE SHELL FOLDERS. They ship as symlinks to the BUILD
              * MACHINE's home directory.

@@ -457,8 +457,13 @@ OVERLAY = {
     "cpu-count": {"title": "Reported CPU count (0 = device)"},
     "desktop-size": {"title": "Virtual desktop size (WxH)",
                      "note": "The developer interface's Wine desktop size (ml1127); its Resolution menu writes it (ml1157). Madeira Dock sessions without a game's Resolution use it too. Unset: this screen's shape at 1280x720's pixel count (ml1172: 1408x648 on a 19.5:9 iPhone, 1152x800 on an 11-inch iPad). Applies at the next app start."},
-    "d3d9": {"title": "Direct3D 9 frontend (32-bit)", "kind": "choice",
-             "choices": [("", "Default (emulated)"), ("native", "Native ARM64 frontend")]},
+    "d3d9": {"title": "Direct3D 9 frontend", "kind": "choice",
+             "choices": [("", "Default (emulated)"), ("native", "Native ARM64 frontend"),
+                         ("wined3d", "Wine wined3d on OpenGL (Zink)")],
+             "note": "Unset or \"emulated\": DXMT's D3D9 frontend, translated by FEX in 32-bit programs (x64 programs "
+                     "always get DXMT's native ARM64EC build). \"native\": 32-bit programs run DXMT's frontend as native "
+                     "ARM64 code. \"wined3d\": 32- and 64-bit programs get Wine's own d3d9 on wined3d's OpenGL renderer "
+                     "(opengl32 on Zink/MoltenVK; needs gl-backend = zink, the default when the bundle has gl/)."},
     "fence-chain": {"title": "D3D12 fence chain mode"},
     "async-submit": {"title": "D3D12 asynchronous submission"},
     "upload-swap": {"title": "D3D12 upload buffers on file-backed memory"},
