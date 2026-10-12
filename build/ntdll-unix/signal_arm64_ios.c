@@ -647,15 +647,17 @@ static void ios_block_ring_dump( uintptr_t teb, unsigned max_entries, const char
              why, (void *)ring, (unsigned long long)idx, n );
     for (i = 0; i < n; i++)
     {
-        uint64_t rip = ents[(start + i) & (RING_N - 1)];
-        unsigned char xb[16];
-        char hx[16 * 3 + 1] = "?";
+        const uint64_t ent = ents[(start + i) & (RING_N - 1)];
+        const uint64_t rip = ent & 0xffffffffffffULL;           /* ml1206: high 16 bits = bytes in the block */
+        unsigned len = (unsigned)(ent >> 48); if (!len || len > 96) len = len ? 96 : 16;
+        unsigned char xb[96];
+        char hx[96 * 3 + 1] = "?";
         got = 0;
-        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)rip, sizeof(xb), (mach_vm_address_t)xb, &got ) == KERN_SUCCESS
-            && got == sizeof(xb))
+        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)rip, len, (mach_vm_address_t)xb, &got ) == KERN_SUCCESS
+            && got == len)
         {
             int b;
-            for (b = 0; b < 16; b++) snprintf( hx + b * 3, 4, "%02x ", xb[b] );
+            for (b = 0; b < (int)len; b++) snprintf( hx + b * 3, 4, "%02x ", xb[b] );
         }
         dprintf( 2, "[block-ring] -%-4u %llx: %s\n", n - i, (unsigned long long)rip, hx );
     }
