@@ -1730,6 +1730,178 @@ static void ios_power_gov_step( uint64_t now, double dt_ms, double mj )
     }
 }
 
+/* madeira-bcd fps-gov: a frame-rate cap as the power governor's actuator (opt-in).
+ * The governor above switches ECO, and ECO (every guest thread at utility QoS) made
+ * GTA V Enhanced crash while loading (a null-pointer write in a timing-sensitive
+ * path, build 449). A cap moves no thread and changes no timing inside a frame,
+ * only how often frames start. The CPU clamp comes after ~273-330 J of process CPU
+ * energy in Horizon Zero Dawn (builds 486-493), most of it spent in menus and
+ * loading at 2.75-3.8 W; Red Dead Redemption 2's menus ran at 57-60 fps for two
+ * minutes (build 460) and the clamp came before play. Two opt-in modes:
+ *   env.MADEIRA_FPS_CAP = N     a fixed cap of N fps (10-120) for the whole session;
+ *   env.MADEIRA_FPS_GOV_MW = P  while a game presents, hold the process CPU power
+ *       ([xp]'s ri_energy_nj) at P mW by moving the cap between 60/40/30/24/20 fps
+ *       (MADEIRA_FPS_GOV_MAX / _MIN bound the steps; 60 and 20 by default): a running
+ *       balance of (power - target) x time lowers the cap one step when it passes
+ *       +MADEIRA_FPS_GOV_BAND_MJ (1500 by default), skipping caps the game does not
+ *       reach anyway, and raises it one step when it passes -BAND while the game runs
+ *       at the cap; at most one change per 3 s. With nothing presented for 2 s
+ *       (loading) the balance and the cap are held.
+ * The cap is published in ios_fps_cap. The xprobe copies it into madeira-d3d12's
+ * counter block, which its Present reads to hold the game's thread
+ * (NtDelayExecution); DXMT's encode thread waits in winemetal's presentDrawable
+ * (winemetal in DXMT -> ios_fps_cap_dxmt_pace) when no D3D12 runtime
+ * paces itself. [fps-gov] summarises every 10 s. Unset: nothing is armed,
+ * ios_fps_cap stays 0 and neither presenter waits. Needs the [xp] sampler. */
+volatile int ios_fps_cap;                     /* fps the presenters pace to; 0 = none */
+static volatile int ios_fps_gov_armed;        /* a cap or a target is set (read once by the xprobe) */
+static volatile uint64_t ios_fps_presents;    /* presents through winemetal while armed */
+static volatile uint64_t ios_fps_paced_ns;    /* time DXMT presents waited for the cap */
+static const int ios_fps_steps[] = { 60, 40, 30, 24, 20 };
+#define IOS_FPS_NSTEPS ((int)(sizeof(ios_fps_steps) / sizeof(ios_fps_steps[0])))
+
+/* the D3D12 runtime's part of its counter block (madeira-d3d12 struct mad_xp, after
+ * the fields struct ios_xp_pe mirrors): fps_cap is ours to write, the rest is its own */
+struct ios_xp_pe_cap { int64_t fps_cap, t_cap, n_cap; };
+
+static void ios_fps_gov_step( uint64_t now, double dt_ms, double mj, uint64_t presents, double paced_ms )
+{
+    static int inited, fixed, target_mw, band_mj, hi, lo, idx, active;
+    static double balance, sum_mj, sum_ms, sum_paced, fps_avg;
+    static uint64_t last_presents, last_present_ns, last_change, last_report, report_presents;
+    static unsigned changes;
+    double fps;
+    int i, n;
+
+    if (!inited)
+    {
+        const char *c = getenv( "MADEIRA_FPS_CAP" );          /* fixed frame cap (fps, 10-120); unset/0 = none */
+        const char *e = getenv( "MADEIRA_FPS_GOV_MW" );       /* process CPU power (mW) the frame cap holds while a game presents; unset/0 = off */
+        const char *b = getenv( "MADEIRA_FPS_GOV_BAND_MJ" );  /* energy (mJ) the balance may drift before the cap moves (1500) */
+        const char *mx = getenv( "MADEIRA_FPS_GOV_MAX" );     /* highest cap of the governor (fps, 60) */
+        const char *mn = getenv( "MADEIRA_FPS_GOV_MIN" );     /* lowest cap of the governor (fps, 20) */
+        int max_fps = mx && *mx ? atoi( mx ) : 60, min_fps = mn && *mn ? atoi( mn ) : 20;
+        inited = 1;
+        fixed = c ? atoi( c ) : 0;
+        if (fixed < 10 || fixed > 120) fixed = 0;
+        target_mw = e ? atoi( e ) : 0;
+        if (target_mw < 0 || target_mw > 20000) target_mw = 0;
+        band_mj = b && *b ? atoi( b ) : 1500;
+        if (band_mj < 100 || band_mj > 100000) band_mj = 1500;
+        for (hi = 0; hi < IOS_FPS_NSTEPS - 1 && ios_fps_steps[hi] > max_fps; hi++) ;
+        for (lo = IOS_FPS_NSTEPS - 1; lo > hi && ios_fps_steps[lo] < min_fps; lo--) ;
+        idx = hi;
+        last_presents = presents;
+        if (fixed)
+        {
+            ios_fps_cap = fixed;
+            ios_fps_gov_armed = 1;
+            wine_log_write( "[fps-gov] madeira-bcd fixed frame cap: %d fps (MADEIRA_FPS_CAP)", fixed );
+        }
+        else if (target_mw)
+        {
+            ios_fps_gov_armed = 1;
+            wine_log_write( "[fps-gov] madeira-bcd on: process CPU power held at %d mW while a game presents, by a frame "
+                            "cap of %d..%d fps (band %d mJ; MADEIRA_FPS_GOV_MW, _MIN, _MAX, _BAND_MJ)",
+                            target_mw, ios_fps_steps[lo], ios_fps_steps[hi], band_mj );
+        }
+    }
+    if (fixed || !target_mw || dt_ms <= 0) return;
+    fps = presents >= last_presents ? (presents - last_presents) * 1000.0 / dt_ms : 0;
+    if (presents != last_presents) last_present_ns = now;
+    last_presents = presents;
+    if (!last_present_ns || now - last_present_ns >= 2000000000ull)
+    {
+        if (active)
+        {
+            active = 0;
+            wine_log_write( "[fps-gov] nothing presented for 2 s: cap held at %d fps", ios_fps_steps[idx] );
+        }
+        return;
+    }
+    if (!active)
+    {
+        active = 1;
+        balance = sum_mj = sum_ms = sum_paced = 0;
+        fps_avg = fps;
+        changes = 0;
+        last_change = last_report = now;
+        report_presents = presents;
+        ios_fps_cap = ios_fps_steps[idx];
+        wine_log_write( "[fps-gov] the game presents: cap %d fps", ios_fps_cap );
+    }
+    fps_avg += 0.25 * (fps - fps_avg);
+    balance += mj - target_mw * dt_ms / 1000.0;
+    if (balance > 3.0 * band_mj) balance = 3.0 * band_mj;     /* a long burst buys no long low-cap stretch */
+    if (balance < -3.0 * band_mj) balance = -3.0 * band_mj;   /* nor a long cheap stretch a long burst */
+    sum_mj += mj;
+    sum_ms += dt_ms;
+    sum_paced += paced_ms;
+    if (now - last_change >= 3000000000ull)
+    {
+        if (balance > band_mj && idx < lo)
+        {
+            for (n = idx + 1; n < lo && ios_fps_steps[n] >= fps_avg * 0.95; n++) ;   /* a cap above the game's rate changes nothing */
+            idx = n;
+            balance = 0;
+            last_change = now;
+            changes++;
+        }
+        else if (balance < -band_mj && idx > hi && fps_avg >= 0.85 * ios_fps_steps[idx])
+        {
+            idx--;
+            balance = 0;
+            last_change = now;
+            changes++;
+        }
+    }
+    ios_fps_cap = ios_fps_steps[idx];
+    if (now - last_report >= 10000000000ull && sum_ms > 0)
+    {
+        i = (int)(presents - report_presents);
+        wine_log_write( "[fps-gov] last %.0f s: %.2f W average (target %.2f W), cap %d fps, %.1f fps presented, "
+                        "waited %.0f ms/s for the cap, %u change(s)", sum_ms / 1000.0, sum_mj / sum_ms,
+                        target_mw / 1000.0, ios_fps_cap, i * 1000.0 / sum_ms, sum_paced * 1000.0 / sum_ms, changes );
+        last_report = now;
+        report_presents = presents;
+        sum_mj = sum_ms = sum_paced = 0;
+        changes = 0;
+    }
+}
+
+/* madeira-bcd fps-gov: DXMT's side of the cap. winemetal (DXMT)
+ * calls this at the top of winemetal's presentDrawable (on the presenting thread:
+ * DXMT's encode thread, or madeira-d3d12's queue worker). While a cap or governor
+ * is armed it counts the present; when a cap is set and no D3D12 runtime paces
+ * itself (madeira-d3d12 publishes its counter block, ios_xp_pe_block, and holds the
+ * game's thread in Present), it waits for this thread's next deadline with
+ * mach_wait_until, a timed kernel wait. The deadline moves one period from the
+ * previous one, and is re-based when the thread fell more than a period behind, so
+ * a slow frame is not paid twice and a stall banks no credit. Returns the
+ * nanoseconds waited (the [frame] limiter time). Not armed: returns at once. */
+unsigned long long ios_fps_cap_dxmt_pace( void )
+{
+    static __thread uint64_t next;
+    static mach_timebase_info_data_t tb;
+    uint64_t now, period, slept;
+    int cap;
+
+    if (!ios_fps_gov_armed) return 0;
+    __atomic_add_fetch( &ios_fps_presents, 1, __ATOMIC_RELAXED );
+    cap = ios_fps_cap;
+    if (cap < 10 || cap > 240 || ios_xp_pe_block) { next = 0; return 0; }
+    if (!tb.denom) mach_timebase_info( &tb );
+    period = (uint64_t)(1e9 / cap * tb.denom / tb.numer);
+    now = mach_absolute_time();
+    if (!next || now > next + period) { next = now + period; return 0; }
+    if (now >= next) { next += period; return 0; }
+    mach_wait_until( next );
+    slept = (mach_absolute_time() - now) * tb.numer / tb.denom;
+    next += period;
+    __atomic_add_fetch( &ios_fps_paced_ns, slept, __ATOMIC_RELAXED );
+    return slept;
+}
+
 static void ios_xprobe_main( void )
 {
     static struct ios_xp_row rows[1024];
@@ -1831,6 +2003,15 @@ static void ios_xprobe_main( void )
             double ins = (double)(ru.ri_instructions - pru.ri_instructions);
             double qf = (have_pe && pe.magic == 0x3130305058444d4dLL && pe.qpf) ? 1000.0 / (double)pe.qpf : 0;
             ios_power_gov_step( ios_bg_now_ns(), dt_ms, (double)(ru.ri_energy_nj - pru.ri_energy_nj) / 1e6 );
+            {   /* madeira-bcd fps-gov (opt-in): the frame cap, and madeira-d3d12's copy of it */
+                static int64_t prev_t_cap;
+                volatile struct ios_xp_pe_cap *pc = ios_xp_pe_block && ios_xp_pe_len >= sizeof(pe) + sizeof(struct ios_xp_pe_cap)
+                                                    ? (volatile struct ios_xp_pe_cap *)(uintptr_t)(ios_xp_pe_block + sizeof(pe)) : NULL;
+                double paced_ms = __atomic_exchange_n( &ios_fps_paced_ns, 0, __ATOMIC_RELAXED ) / 1e6;
+                if (pc && qf) { int64_t t = pc->t_cap; if (prev_t_cap && t >= prev_t_cap) paced_ms += (t - prev_t_cap) * qf; prev_t_cap = t; }
+                ios_fps_gov_step( ios_bg_now_ns(), dt_ms, (double)(ru.ri_energy_nj - pru.ri_energy_nj) / 1e6, ios_fps_presents, paced_ms );
+                if (pc && pe.magic == 0x3130305058444d4dLL && ios_fps_gov_armed && pc->fps_cap != ios_fps_cap) pc->fps_cap = ios_fps_cap;
+            }
             gettimeofday( &tv, NULL ); localtime_r( &tv.tv_sec, &tmv );
             snprintf( wall, sizeof(wall), "%02d:%02d:%02d.%03d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (int)(tv.tv_usec / 1000) );
             n = snprintf( line, sizeof(line),
