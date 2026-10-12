@@ -59,7 +59,8 @@ typedef uintptr_t ULONG_PTR; typedef unsigned int ULONG; typedef int NTSTATUS; t
 #define STATUS_NO_MEMORY ((NTSTATUS)0xc0000017)
 #define PtrToUlong(p) ((ULONG)(ULONG_PTR)(p))
 typedef int kern_return_t; typedef unsigned int mach_msg_type_number_t; typedef int task_t; typedef int *task_info_t;
-typedef uint64_t mach_vm_address_t, mach_vm_size_t; typedef int mach_port_t; typedef int *vm_region_info_t;
+/* Darwin's pthread headers already declare this port as unsigned int. */
+typedef uint64_t mach_vm_address_t, mach_vm_size_t; typedef unsigned int mach_port_t; typedef int *vm_region_info_t;
 typedef struct { int protection; } vm_region_basic_info_data_64_t;
 #define KERN_SUCCESS 0
 #define TASK_VM_INFO 22
@@ -111,6 +112,19 @@ static void *anon_mmap_fixed( void *start, size_t size, int prot, int flags ) {
     ULONG_PTR lo = (ULONG_PTR)start; (void)flags; mmap_calls++;
     if (!overlaps( lo, lo + size )) add_region( lo, lo + size, prot );
     return start; }
+/* The split guard fallback may acquire and release a temporary page. Model
+ * that release instead of calling the real host munmap on a fake address;
+ * new_mappings counts reservations left standing after each attempt. */
+static int fake_munmap( void *addr, size_t size ) {
+    int i;
+    for (i = 0; i < nmap; i++)
+        if (map[i].lo == (ULONG_PTR)addr && map[i].hi == (ULONG_PTR)addr + size) {
+            memmove( &map[i], &map[i + 1], (nmap - i - 1) * sizeof(map[0]) );
+            nmap--; mmap_calls--; return 0;
+        }
+    errno = EINVAL; return -1;
+}
+#define munmap fake_munmap
 static int reserved_areas;
 static void mmap_add_reserved_area( void *addr, size_t size ) { (void)addr; (void)size; reserved_areas++; }
 static void ios_va_describe_range( void *addr, ULONG_PTR len, char *buf, size_t n ) { (void)addr; (void)len; snprintf( buf, n, "-" ); }
