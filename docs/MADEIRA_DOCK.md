@@ -153,6 +153,20 @@ arguments are not supported.
    C:\madeira-dock-installers.cmd & C:\windows\system32\dockhost.exe`: the
    installers first, then the host, in the same session.
 
+   madeira-bcd: such a start runs only the installers (`... cmd.exe /c call
+   C:\madeira-dock-installers.cmd`, `MADEIRA_DOCK_INSTALL_SEPARATE`). In one
+   session, the installers' copies in the JIT pool left Red Dead Redemption 2
+   too little room, and it stopped while loading (`[jit-pool] EXHAUSTED`). The
+   session ends after the batch; the app runs one session per run, so Madeira
+   then asks for a restart ("Restart Madeira" alert), and the game starts at
+   the next start. If a program an installer started keeps the session open,
+   the alert comes 45 s after the batch ended (the wineserver saves the
+   registry every 30 s). That session runs without the game's
+   `env.MADEIRA_SC_PA_POOLS` and `env.MADEIRA_RDR2_VA_HOLD` lines
+   (`MADEIRA_DOCK_INSTALL_LAYOUT`): their holds take the 4 GB slots 32-bit
+   programs run in, and the Visual C++ setups' second 32-bit process could
+   not start (exit 0x8007054f).
+
    The session publishes no fixed Steam game identity. Every other launch
    gives its guests one title's `SteamAppId`, `SteamGameId` and `SteamAppPath`
    (a known compromise in `WineProcessBridge.m`); in a Dock session they
@@ -238,7 +252,7 @@ The status line follows the furthest stage in the host's report
 |---|---|
 | nothing yet | "Starting Madeira Dock…" ("Still starting Madeira Dock…" after 30 s) |
 | one-time installs running | the program running now, and any that failed |
-| one-time installs ended (`[dock-installers] end`) | "One-time installs finished: N of M succeeded." and the failed ones, then "Starting Madeira Dock…" (late 30 s after the installs' end) |
+| one-time installs ended (`[dock-installers] end`) | "One-time installs finished: N of M succeeded." and the failed ones, then "Starting Madeira Dock…" (late 30 s after the installs' end); madeira-bcd, in a session of installs only: "This session now closes…", then the restart alert |
 | `probe-start-bits` | "Loading Steam…" |
 | `session-native-token-submitted` or `session-logon-start-result` | "Signing in to Steam…" |
 | `session-authenticated-online=1` | "Signed in. Waiting for Steam to confirm this game's license…" |
@@ -342,6 +356,45 @@ tasks, before the step Dock asks it for, so on the Dock route nothing ran them.
    runs installers, Wine's own builtin 32-bit `fusion.dll`
    (`i386-windows/fusion.dll`) is copied there if the file is missing. A
    bundle without 32-bit Windows DLLs has nothing to copy (`no-source`).
+8. **Unfinished programs.** A program the batch started but never saw exit
+   (an installer window that stays open after its work, a session ended
+   early) is kept per game in `madeira-dock-installs.json` until the game's
+   next batch or request. Later starts log it (`last-run=unfinished`,
+   `unfinished=`) and the Dock note names it. While a program runs, the
+   status names the minutes after 10 minutes and one `still running` line is
+   logged; nothing is stopped. madeira-bcd: the Rockstar Games Launcher
+   installer was one of these. Its install page repaints its status line
+   without end, and paint goes before timer, so the timer its status text and
+   finish page run on never fired. The wineserver now lets an expired timer
+   that has waited 100 ms go before such a paint
+   (`build/wineserver/queue_ios.c`, `env.MADEIRA_TIMER_FAIRNESS`, log
+   `[timer-fair]`).
+9. **Record as done / Reset.** Under each game's choice, in the Dock sheet
+   and the game's Steam section. Each is confirmed, saved in
+   `madeira-dock-installs.json`, can be cancelled until the game's next Dock
+   start, and is applied by that start before it plans, while no session
+   runs. Both act only on the game's own programs (under its install folder);
+   shared Steamworks redistributables are left as they are. Record as done
+   writes their records as a finished run would. Reset removes them (log
+   `[dock-reset]`) and sets the choice to "Run at next start", so they run
+   again at that start; files the installers wrote stay in place.
+
+   madeira-bcd (`DockReset.swift`, `MADEIRA_DOCK_RESET_CLEAN`): Reset first
+   takes out what a Rockstar game's one-time installs put into the prefix, as
+   on a new device: the Rockstar Games Launcher and Social Club (folders under
+   Program Files and ProgramData, registry keys, uninstall entries, the
+   Rockstar Service), the Visual C++ 2015-2022 runtimes x86 and x64
+   (uninstall entries, Windows Installer registrations, Burn dependency keys,
+   the Package Cache, the regular runtime files in system32 and syswow64;
+   Madeira's own files there are links and stay) and the Vulkan runtime. The
+   VC++ markers a new prefix has go back to the bundled template's values.
+   "Reset and sign out of Rockstar" also takes the launcher's and Social
+   Club's sign-in data. Nothing is deleted: it all moves into
+   `Documents/madeira-reset-backup/<time>-app<id>/drive_c/`, next to the
+   registry files as they were and a list (`reset.txt`). The game, its Steam
+   files, its settings and saves stay. Another installed game whose own
+   programs record under the same keys, or run the same installer, gets its
+   records removed and "Run at next start" too.
 
 The plan, each program's fate and the results are logged as
 `[dock-installers]`; the Dock sheet's status and the starting screen show the
@@ -374,6 +427,11 @@ never asks. The preparation is Valve's; Dock does not touch the files.
 | `MADEIRA_DOCK_INSTALL_CHOICE` | on | `0`: no per-game choice; every start runs whatever is pending |
 | `MADEIRA_DOCK_INSTALL_SCM` | on | `0`: the batch records "services off" instead of starting the service manager (also read by the host's `--start-services`) |
 | `MADEIRA_DOCK_INSTALL_SERVER_SYNC` | on | `0`: a start that runs installers keeps madsync and leaves the service step out |
+| `MADEIRA_DOCK_INSTALL_SEPARATE` | on | madeira-bcd. `0`: the host follows the installers in the same session |
+| `MADEIRA_DOCK_INSTALL_LAYOUT` | on | madeira-bcd. `0`: a session of one-time installs keeps the game's `env.MADEIRA_SC_PA_POOLS` and `env.MADEIRA_RDR2_VA_HOLD` lines |
+| `MADEIRA_TIMER_FAIRNESS` | on | madeira-bcd, read by the wineserver. `0`: a WM_PAINT that is always pending keeps every timer of its thread waiting, as Windows' order says |
+| `MADEIRA_DOCK_RESET_CLEAN` | on | madeira-bcd. `0`: Reset only forgets the records; installed files stay |
+| `MADEIRA_DOCK_VULKAN_STANDIN` | on | madeira-bcd. Before a Dock start, a Vulkan loader an installer wrote into system32 (RDR2's VulkanRT) moves into `Documents/madeira-reset-backup`, so the session links Madeira's `vulkan-1.dll` stand-in again, as a direct launch does. `0`: it stays |
 | `MADEIRA_DOTNET_FUSION` | on | `0`: never place `fusion.dll` in the .NET 2.0 folder |
 | `MADEIRA_DOCK_HIDE_DESKTOP` | on | `0`: a Dock start's starting screen ends on the desktop's first frame, as before (no census) |
 | `MADEIRA_DOCK_AUTO_REVEAL` | on | `0`: a window that may need the user never reveals the desktop by itself (Show desktop still does) |
