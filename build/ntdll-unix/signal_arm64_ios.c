@@ -510,6 +510,7 @@ static void *ios_stale_va_scanner( void *arg )
      * MADEIRA_NO_HEAL=1 reverts to dry-run reporting. */
     int do_heal = getenv( "MADEIRA_NO_HEAL" ) == NULL;
     pthread_setname_np( "wine-stale-heal" );
+    { extern void ios_eco_native_self( const char *who ); ios_eco_native_self( "wine-stale-heal" ); }   /* madeira-bcd eco-native */
     for (;;)
     {
         usleep( 100000 );

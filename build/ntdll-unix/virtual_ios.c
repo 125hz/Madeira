@@ -668,6 +668,7 @@ static unsigned ios_warmer_sweep_cycles( void )
 static void *ios_pool_warmer_thread( void *arg )
 {
     unsigned cycle = 0;
+    { extern void ios_eco_native_self( const char *who ); ios_eco_native_self( "pool-warmer" ); }   /* madeira-bcd eco-native */
     for (;;)
     {
         /* ml1060: THE MONITOR WAS A TENTH OF THE MACHINE. Above 2400 MB this loop
