@@ -78,10 +78,13 @@
 #define HWREG_CPU_FEATURE_SSE2   0x00010000u
 #define HWREG_CPU_FEATURE_SSE3   0x00080000u
 #define HWREG_CPU_FEATURE_CX128  0x00100000u
+#define HWREG_CPU_FEATURE_XSAVE  0x00800000u
 #define HWREG_CPU_FEATURE_NX     0x20000000u
 #define HWREG_CPU_FEATURE_SSSE3  0x00008000u
 #define HWREG_CPU_FEATURE_SSE41  0x01000000u
 #define HWREG_CPU_FEATURE_SSE42  0x02000000u
+#define HWREG_CPU_FEATURE_AVX    0x40000000u
+#define HWREG_CPU_FEATURE_AVX2   0x80000000u
 #define HWREG_CPU_FEATURE_PAE    0x00200000u
 #define HWREG_CPU_FEATURE_DAZ    0x00400000u
 
@@ -155,9 +158,12 @@ static inline uint64_t hwreg_fex_tsc_hz( uint64_t cntfrq )
     return hz;
 }
 
-/* SSE4.2 follows SupportsCRC, which the iOS branch of FetchHostFeatures always
- * sets for the ARM64EC module. */
-static inline void hwreg_fex_cpu( struct hwreg_cpu *cpu, uint64_t cntfrq )
+/* `avx`: FEX runs with SupportsAVX (MADEIRA_FEX_AVX=1, read by FetchHostFeatures
+ * for the ARM64EC module only), which turns on CPUID's OSXSAVE/AVX (leaf 1) and
+ * AVX2 (leaf 7) and with them FEX's XSAVE/AVX/AVX2 feature bits. SSE4.2 follows
+ * SupportsCRC, which the iOS branch of FetchHostFeatures always sets for the
+ * ARM64EC module. */
+static inline void hwreg_fex_cpu( struct hwreg_cpu *cpu, int avx, uint64_t cntfrq )
 {
     const uint32_t eax = HWREG_FEX_STEPPING | HWREG_FEX_MODEL << 4 | HWREG_FEX_FAMILY << 8 |
                          HWREG_FEX_EXT_MODEL << 16 | HWREG_FEX_EXT_FAMILY << 20;
@@ -179,6 +185,7 @@ static inline void hwreg_fex_cpu( struct hwreg_cpu *cpu, uint64_t cntfrq )
               cpu->level, (cpu->revision >> 8) & 0xff, cpu->revision & 0xff );
 
     cpu->feature_set = HWREG_FEX_FEATURES | HWREG_CPU_FEATURE_SSE42;
+    if (avx) cpu->feature_set |= HWREG_CPU_FEATURE_XSAVE | HWREG_CPU_FEATURE_AVX | HWREG_CPU_FEATURE_AVX2;
     cpu->mhz = (uint32_t)(hwreg_fex_tsc_hz( cntfrq ) / 1000000);
 }
 

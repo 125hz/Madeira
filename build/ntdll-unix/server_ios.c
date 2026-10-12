@@ -3920,6 +3920,9 @@ void ios_hw_registry_publish(void)
 {
     static const char machine[] = "\\Registry\\Machine";
     static const char sysdesc[] = "HARDWARE\\DESCRIPTION\\System";
+    /* FEX reads this switch itself (FetchHostFeatures); it is only mirrored here. */
+    static const char fex_avx[] = "MADEIRA_FEX_AVX";
+    const char *avx = getenv( fex_avx );
     struct hwreg_cpu cpu;
     struct hwreg_bios bios;
     unsigned int i, count, cpus = 0, fpus = 0;
@@ -3937,7 +3940,9 @@ void ios_hw_registry_publish(void)
     }
 
     count = hwreg_cpu_count( peb->NumberOfProcessors );
-    hwreg_fex_cpu( &cpu, ios_hw_cntfrq() );
+    /* AVX exists only in FEX's ARM64EC module; a 32-bit main image runs the WOW64
+     * module, which has no AVX. */
+    hwreg_fex_cpu( &cpu, avx && avx[0] == '1' && !ios_main_image_i386, ios_hw_cntfrq() );
     if (!cpu.mhz) cpu.mhz = ios_hw_power_mhz();
     smbios = ios_hw_smbios( &smbios_len );
     hwreg_bios_values( &bios, smbios, smbios_len, PACKAGE_VERSION );
