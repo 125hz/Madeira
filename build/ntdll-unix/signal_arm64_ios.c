@@ -634,16 +634,20 @@ void ios_watch_after_protect( const void *base, size_t size, const char *why )
  * `jmp rel32`, so the instruction that computed the stored value is not in the
  * bytes before the writer's rip. Scan the mapped image around the rip for
  * branches (E9/E8 rel32, 0F 8x rel32, EB/7x rel8) whose target lands in the
- * fragment that ends at the current address, print the 48 bytes that precede
- * each such branch (the predecessor fragment's tail), and when the predecessor
- * is unique step back to it. MADEIRA_WATCH_CHASE = hop count (default 24, 0 off);
- * only the first two hits are chased, the scan reads with mach_vm_read_overwrite
- * in 1 MB pieces so an unmapped page cannot fault the handler thread. */
+ * window before the current address, group them by target and follow the group
+ * with the closest entry point (the start of the fragment that ends at the
+ * current address); print the 48 bytes before each branch of that group (the
+ * predecessor fragment's tail). ml1204: the first version kept six candidates
+ * and stopped on more; here a fragment every six bytes put six neighbours'
+ * entries in the window before the writer's own, so nothing was followed.
+ * MADEIRA_WATCH_CHASE = hop count (default 24, 0 off); only the first two hits
+ * are chased; reads go through mach_vm_read_overwrite in 1 MB pieces so an
+ * unmapped page cannot fault the handler thread. */
 static void ios_watch_chase( uint64_t rip )
 {
     static int hops = -1;
     static unsigned char *buf;
-    enum { CHUNK = 1u << 20, WINDOW = 48, MAX_CAND = 6, SPAN_CAP = 256u << 20 };
+    enum { CHUNK = 1u << 20, WINDOW = 48, MAX_CAND = 64, SPAN_CAP = 256u << 20 };
     uint64_t lo, hi, cur_lo, cur_hi;
     int hop;
 
@@ -694,8 +698,8 @@ static void ios_watch_chase( uint64_t rip )
     for (hop = 1; hop <= hops; hop++)
     {
         struct { uint64_t at; uint64_t target; int len; const char *kind; } cand[MAX_CAND];
-        int ncand = 0, overflow = 0;
-        uint64_t p;
+        int ncand = 0, overflow = 0, c, best = -1, nbest = 0, bestc = -1;
+        uint64_t p, best_target = 0;
 
         for (p = lo; p < hi && !overflow; p += CHUNK - 8)
         {
@@ -739,37 +743,50 @@ static void ios_watch_chase( uint64_t rip )
                      hop, (void *)cur_lo, (void *)cur_hi );
             return;
         }
+        /* the closest entry point below the current address is the start of its fragment */
+        for (c = 0; c < ncand; c++)
+            if (best < 0 || cand[c].target > best_target) { best = c; best_target = cand[c].target; }
+        for (c = 0; c < ncand; c++)
+            if (cand[c].target == best_target) { nbest++; bestc = c; }
         {
-            int c;
-            for (c = 0; c < ncand; c++)
-            {
-                unsigned char fb[WINDOW + 8];
-                char hx[(WINDOW + 8) * 3 + 1] = "?";
-                mach_vm_size_t g = 0;
-                uint64_t from = cand[c].at > WINDOW ? cand[c].at - WINDOW : 0;
-                if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)from, sizeof(fb), (mach_vm_address_t)fb, &g ) == KERN_SUCCESS
-                    && g == sizeof(fb))
-                {
-                    int b;
-                    for (b = 0; b < (int)sizeof(fb); b++) snprintf( hx + b * 3, 4, "%02x ", fb[b] );
-                }
-                dprintf( 2, "[watch-chase] ml1203 hop %d%s: %s at %p -> %p ; bytes[%p..+%d]: %s\n",
-                         hop, overflow ? " (more than 6, stopping)" : "", cand[c].kind, (void *)cand[c].at,
-                         (void *)cand[c].target, (void *)from, (int)sizeof(fb), hx );
-            }
+            char others[400];
+            int n = 0;
+            for (c = 0; c < ncand && n < (int)sizeof(others) - 40; c++)
+                if (cand[c].target != best_target)
+                    n += snprintf( others + n, sizeof(others) - n, " %llx>%llx", (unsigned long long)cand[c].at, (unsigned long long)cand[c].target );
+            dprintf( 2, "[watch-chase] ml1203 hop %d: %d branches into (%p,%p]%s; entry %p has %d source(s); others:%s\n",
+                     hop, ncand, (void *)cur_lo, (void *)cur_hi, overflow ? " (capped at 64)" : "",
+                     (void *)best_target, nbest, n ? others : " none" );
         }
-        if (ncand != 1 || overflow)
+        for (c = 0; c < ncand; c++)
         {
-            dprintf( 2, "[watch-chase] ml1203 hop %d: %d predecessors, the walk stops here\n", hop, ncand );
+            unsigned char fb[WINDOW + 8];
+            char hx[(WINDOW + 8) * 3 + 1] = "?";
+            mach_vm_size_t g = 0;
+            uint64_t from;
+            if (cand[c].target != best_target) continue;
+            from = cand[c].at > WINDOW ? cand[c].at - WINDOW : 0;
+            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)from, sizeof(fb), (mach_vm_address_t)fb, &g ) == KERN_SUCCESS
+                && g == sizeof(fb))
+            {
+                int b;
+                for (b = 0; b < (int)sizeof(fb); b++) snprintf( hx + b * 3, 4, "%02x ", fb[b] );
+            }
+            dprintf( 2, "[watch-chase] ml1203 hop %d: %s at %p -> %p ; bytes[%p..+%d]: %s\n",
+                     hop, cand[c].kind, (void *)cand[c].at, (void *)cand[c].target, (void *)from, (int)sizeof(fb), hx );
+        }
+        if (nbest != 1)
+        {
+            dprintf( 2, "[watch-chase] ml1203 hop %d: the entry is shared by %d sources, the walk stops here\n", hop, nbest );
             return;
         }
-        if (cand[0].kind[0] == 'c')
+        if (cand[bestc].kind[0] == 'c')
         {
             dprintf( 2, "[watch-chase] ml1203 hop %d: reached through a call; the walk stops here\n", hop );
             return;
         }
-        cur_hi = cand[0].at + 1;
-        cur_lo = cand[0].at > WINDOW ? cand[0].at - WINDOW : 0;
+        cur_hi = cand[bestc].at + 1;
+        cur_lo = cand[bestc].at > WINDOW ? cand[bestc].at - WINDOW : 0;
     }
 }
 
