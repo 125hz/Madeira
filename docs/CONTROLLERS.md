@@ -344,6 +344,10 @@ user sees are opt-in (only `1` enables); the others are on unless set to `0`:
 | `MADEIRA_PAD_MODE` | XInput | `hid` / `dualsense` / `generic`: player 1 as a HID controller (see above) |
 | `MADEIRA_HIDPAD_XINPUT` | **off** | `1`: in HID mode, player 1 stays an XInput pad as well |
 | `MADEIRA_PAD_OUTPUT` | on | `0`: no rumble/trigger/lightbar output to the pad; `hid` / `xinput`: only that half |
+| `MADEIRA_XINPUT_BATTERY` | on | `0`: XInput reports an unknown battery and no wireless flag (ml2170) |
+| `MADEIRA_XINPUT_WGI` | on | `0`: Windows.Gaming.Input lists no controllers (ml2171) |
+| `MADEIRA_XINPUT_ENABLE_FOREGROUND` | on | `0`: a game's XInputEnable(FALSE) zeroes the pad even while its window is in front (ml2115) |
+| `MADEIRA_XINPUT_SLOT0_RECONNECT` | on | `0`: a reconnected player 1 stays in the slot it landed in (ml2172) |
 
 `[controls-layout] ml1970` logs layout loads, saves, creation and deletion
 (never layout names); `[xinput] ml1990` logs the session slot reservation.
@@ -358,12 +362,60 @@ state trace.
 
 XInput vibration (ml2106): XInputSetState's two motors play on the pad in
 that slot through CoreHaptics, and XInputGetCapabilities reports motors, when
-`MADEIRA_PAD_OUTPUT` allows it. It needs the companion Wine xinput change
-(XInputSetState, XInputEnable and process detach forward the motors through
-`NtUserGamepadOp_SetVibration`) and rebuilt xinput1_1-1_4 DLLs; with the
-current prebuilt xinput the motors are not forwarded.
+`MADEIRA_PAD_OUTPUT` allows it. XInputSetState, XInputEnable and process
+detach forward the motors through `NtUserGamepadOp_SetVibration`; the shipped
+arm64ec xinput1_1-1_4 and xinputuap carry it.
 
-Battery telemetry, controller-driven navigation of the app itself,
+XInput battery (ml2170): XInputGetBatteryInformation reports each pad's
+GameController battery (GCDeviceBattery, read once a second): on its battery,
+`BATTERY_TYPE_NIMH` with EMPTY/LOW/MEDIUM/FULL at 5/20/70 %; charging or full,
+`BATTERY_TYPE_WIRED`/FULL, as Windows shows a pad on a cable; no battery
+information, `BATTERY_TYPE_UNKNOWN`/FULL; the touch controller alone,
+WIRED/FULL. Headset queries answer `BATTERY_TYPE_DISCONNECTED`, and
+XInputGetCapabilities sets `XINPUT_CAPS_WIRELESS` while the pad runs on its
+battery. Before this every host pad read as an unknown battery at EMPTY, which
+some games take for a low battery. `env.MADEIRA_XINPUT_BATTERY = 0` restores
+that. Changes are logged as `[xinput] ml2170 slot=N battery type=T level=L`
+(XInput's numbers: type 1 wired, 3 NiMH, 255 unknown; level 0-3).
+
+Windows.Gaming.Input (ml2171): Wine's windows.gaming.input only lists devices
+that winebus.sys creates, which a Madeira session never runs, so a game that
+reads controllers only through that API (`Gamepad.Gamepads`,
+`RawGameController.RawGameControllers`) saw none. Each connected XInput slot is
+now also a Gamepad there (and a RawGameController: six axes, ten buttons, one
+switch, 045E:028E like XInputGetCapabilitiesEx), read straight from the host
+slot (so a game's XInputEnable does not affect it) and rescanned once a second
+for pads that come and go. Gamepad.Vibration's two motors go to the slot's
+rumble; the trigger motors have no path on iOS and are dropped. Logged as
+`[wgi] ml2171 host pad N listed as a Gamepad` / `removed` (16 lines per
+process, only in games that use the API). `env.MADEIRA_XINPUT_WGI = 0` turns it
+off.
+
+A stale XInputEnable(FALSE) (ml2115): many games call XInputEnable(FALSE) when
+their window loses activation and XInputEnable(TRUE) when it comes back. The
+activation messages a window gets while the port restores it and brings it to
+the front at startup can arrive unbalanced, and the game then reads a
+connected pad at rest for the whole session. While XInput is disabled, xinput
+asks win32u (`NtUserGamepadOp_Foreground`, op 3) whether the calling process
+owns the foreground window; if it does, the disable is taken as stale and the
+live state is returned. `env.MADEIRA_XINPUT_ENABLE_FOREGROUND = 0` keeps the
+pad at rest while disabled. Logged (ERR, capped): `[xinput] ml2114
+XInputEnable(0|1) slot0=... foreground=...`, `[xinput] ml2114 first state query
+index=N: connected (host slot)|not connected, XInput enabled|disabled`, and
+once either `ml2115 ... live state` or `ml2114 ... host pad state zeroed
+(reason)`. The op keeps the number and ABI of the pre-2026-10-01 fork's query,
+whose 32-bit xinput builds are still in use; the battery op is 4.
+
+Player 1 after a reconnect (ml2172): GameController can report a pad that
+reconnects as a new controller before the old one leaves. The new one then
+lands in slot 1 while slot 0 is still taken, slot 0 empties a moment later,
+and a game that reads only player 1 sees nothing. When slot 0 has just
+emptied and exactly one controller joined another slot within the last 5 s,
+it is moved to slot 0 (`[xinput] ml2172 slot=N moved to slot 0`); a second
+player's pad that has been connected longer keeps its slot.
+`env.MADEIRA_XINPUT_SLOT0_RECONNECT = 0` leaves it where it landed.
+
+Controller-driven navigation of the app itself,
 shaped (non-round) controls, a layout-wide size slider and a movable top bar
 remain outside this contribution. Binding physical buttons to keyboard/mouse
 controls is the keyboard-and-mouse mode above.
@@ -403,6 +455,12 @@ python3 tests/host/check-control-presets.py
 python3 tests/host/check-hidpad.py      # needs the wine submodule or WINE_SRC
 python3 tests/host/check-pad-output.py
 ```
+
+`wine/tools/tests/xinput-host.c` and `wine/tools/tests/wgi-host-pads.c` are
+native Windows tests of the PE side (XInput, Windows.Gaming.Input) against a
+synthetic host query; `wine/tools/tests/xinput-host.md` has the build lines.
+`docs/CONTROLLERS_ANALYSIS.md` is the audit of the whole path and its
+remaining gaps.
 
 The first compiles production snapshot/query code and checks packets, ranges,
 slots, invalid queries, disconnect/reconnect and concurrent readers/writers.
