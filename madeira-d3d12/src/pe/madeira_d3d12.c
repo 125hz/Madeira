@@ -638,6 +638,11 @@ static struct mad_xp {
     LONG64 t_flush, n_lat, t_lat, t_draw, t_cmt;         /* inside Present: flush, frame-latency GPU wait, nextDrawable, blit+present+commit */
     LONG64 t_pool;                                       /* worker autorelease pool drain */
     LONG64 ecl_calls, t_ecl_caller;                      /* caller side */
+    /* madeira-bcd fps-gov (server_ios.c struct ios_xp_pe_cap): the frame cap the unix-side
+     * governor writes (fps, 0 = none; env.MADEIRA_FPS_CAP / MADEIRA_FPS_GOV_MW), and the
+     * time / number of times Present held the game's thread for it */
+    volatile LONG64 fps_cap;
+    LONG64 t_cap, n_cap;
 } g_xp;
 static void mad_xp_role(char role) {   /* tell the probe which thread this is (unix side records its thread id) */
     static DWORD seen[32]; static LONG nseen;
@@ -19273,6 +19278,7 @@ struct mad_swapchain {
     UINT max_latency;
     HANDLE latency_event;
     UINT64 present_serial[8];   /* ml1070: GPU serial the frame presented N ago must have passed */
+    LONG64 cap_next;   /* madeira-bcd fps-gov: QPC time the next frame may start (0 = no cap running) */
     /* MetalFX spatial upscaling of the presented image (madeira.cfg metalfx-upscale) */
     obj_handle_t fx_scaler, fx_out, fx_view[MAD_SWAP_MAX_BUFFERS];
     UINT fx_w, fx_h;
@@ -19499,6 +19505,45 @@ static HRESULT STDMETHODCALLTYPE swap_GetDevice(IDXGISwapChain4 *T, REFIID riid,
     return s->dev->vtbl->QueryInterface((ID3D12Device10 *)s->dev, riid, out);
 }
 
+/* madeira-bcd fps-gov: the D3D12 side of the frame cap (opt-in). The unix-side
+ * governor (server_ios.c ios_fps_gov_step: env.MADEIRA_FPS_CAP = fps, or
+ * env.MADEIRA_FPS_GOV_MW = a CPU power target) writes the cap into this DLL's
+ * counter block, g_xp.fps_cap; 0, the default, skips everything below. After
+ * a Present has queued its frame, the game's thread waits until one period
+ * after the previous deadline, so the next frame starts at most fps_cap times a
+ * second and the frame just presented is not delayed. The deadline moves one
+ * period at a time and is re-based when the game fell more than a period
+ * behind: a slow frame is not paid for twice and a stall banks no credit. The
+ * wait is NtDelayExecution (a timed kernel wait, 100 ns units), never a spin. */
+static void mad_fps_cap_pace(struct mad_swapchain *s, LONG64 now) {
+    typedef LONG (WINAPI *delay_fn)(BOOLEAN, const LARGE_INTEGER *);
+    static delay_fn delay;
+    static LONG looked;
+    LONG64 cap = g_xp.fps_cap, period, wait;
+    if (cap < 10 || cap > 240 || g_xp.qpf <= 0) { s->cap_next = 0; return; }
+    period = g_xp.qpf / cap;
+    if (!s->cap_next || now > s->cap_next + period) { s->cap_next = now + period; return; }
+    wait = s->cap_next - now;
+    s->cap_next += period;
+    if (wait <= 0) return;
+    if (!looked) {
+        HMODULE nt = GetModuleHandleA("ntdll.dll");
+        if (nt) delay = (delay_fn)(void *)GetProcAddress(nt, "NtDelayExecution");
+        looked = 1;
+    }
+    {
+        LONG64 t0 = mad_qpc();
+        if (delay) {
+            LARGE_INTEGER rel;
+            rel.QuadPart = -(LONGLONG)(wait * 10000000 / g_xp.qpf);   /* relative, 100 ns units */
+            if (rel.QuadPart < 0) delay(FALSE, &rel);
+        } else
+            Sleep((DWORD)(wait * 1000 / g_xp.qpf));
+        InterlockedExchangeAdd64(&g_xp.t_cap, mad_qpc() - t0);
+        InterlockedIncrement64(&g_xp.n_cap);
+    }
+}
+
 /* ml1056: drawable ownership. -[CAMetalLayer nextDrawable] returns an AUTORELEASED
  * (+0) object and this function ended with NSObject_release(drawable): a release
  * of a reference it never owned. On a thread with no autorelease pool that
@@ -19595,6 +19640,7 @@ static HRESULT STDMETHODCALLTYPE swap_Present(IDXGISwapChain4 *T, UINT sync, UIN
     hr = swap_Present_pool(T, sync, flags);
     QueryPerformanceCounter(&t1);
     InterlockedExchangeAdd64(&g_perf_present_ticks, t1.QuadPart - t0.QuadPart);
+    if (g_xp.fps_cap && !(flags & DXGI_PRESENT_TEST)) mad_fps_cap_pace((struct mad_swapchain *)T, t1.QuadPart);   /* madeira-bcd fps-gov */
     return hr;
 }
 static HRESULT swap_Present_pool(IDXGISwapChain4 *T, UINT sync, UINT flags) {

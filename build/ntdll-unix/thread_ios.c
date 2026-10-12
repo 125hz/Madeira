@@ -1247,6 +1247,29 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
 }
 
 
+/* madeira-bcd eco-native: env.MADEIRA_ECO_NATIVE = 1 (opt-in). The runtime's own
+ * native helper threads -- the JIT-pool warmer (virtual_ios.c: page warming and
+ * the periodic address-space walks, which ran on performance cores at ~2.8 GHz
+ * in hzd486) and the stale-pointer healer (signal_arm64_ios.c) -- do no work a
+ * frame waits for, yet they are created at the QoS of the thread that started
+ * them. With the switch each moves itself to utility QoS when it starts, so it
+ * runs on the efficiency cores at their lower clock, ECO on or off. Not moved:
+ * the wineserver thread, the Mach exception thread (it services the faults
+ * guest threads wait on), the samplers (already utility), audio, the UI. */
+void ios_eco_native_self( const char *who )
+{
+    static int on = -1;
+    int r;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_ECO_NATIVE" );   /* 1: the runtime's native helper threads run at utility QoS */
+        on = e && *e && strcmp( e, "0" ) != 0;
+    }
+    if (!on) return;
+    r = pthread_set_qos_class_self_np( QOS_CLASS_UTILITY, 0 );
+    dprintf( 2, "[eco-native] madeira-bcd %s thread at utility QoS%s (MADEIRA_ECO_NATIVE)\n", who, r ? ": refused" : "" );
+}
+
 /***********************************************************************
  *           start_thread
  *

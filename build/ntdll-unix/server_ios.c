@@ -1715,6 +1715,742 @@ static void ios_xp_api_report( const char *wall, double wall_s )
     }
 }
 
+/* madeira-bcd: [bg-qos] the launcher's processes leave the performance cores
+ * while the game presents. Every Wine thread runs at USER_INTERACTIVE
+ * (start_thread), so in build 442's GTA V gameplay SocialClubHelper.exe,
+ * dockhost.exe, RockstarService.exe and Launcher.exe took ~55 ms of P-core time
+ * per 320 ms [xp-t] sample next to the game's ~223, while the efficiency cores
+ * were ~86 % idle and ~2.7 threads waited for a core ([xp] run=). The [xp]
+ * sampler marks the game as presenting whenever its presenting thread (role P)
+ * ran in a sample; the threads of the processes named in MADEIRA_BG_QOS_PROCS
+ * then drop to QOS_CLASS_UTILITY at their next server call, and return to
+ * USER_INTERACTIVE once the game has not presented for IOS_BG_QOS_HOLD_NS.
+ * Not before the game has presented for MADEIRA_BG_QOS_DELAY_S (default 60 s):
+ * its first minute is when it talks to the launcher and Social Club (sign-in,
+ * entitlement), which must not slow down. Never the game's own process.
+ * Default list below; an empty value turns it off. Needs the [xp] sampler. */
+#include <pthread/qos.h>
+#define IOS_BG_QOS_HOLD_NS (2000ull * 1000 * 1000)
+static volatile uint64_t ios_bg_game_seen_ns;   /* 0: no game has presented */
+static volatile uint64_t ios_bg_game_since_ns;  /* when this run of presents began */
+static volatile uint32_t ios_bg_game_pid;
+static unsigned long ios_bg_qos_moves;
+static uint64_t ios_bg_qos_delay_ns;
+
+static uint64_t ios_bg_now_ns( void )
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static char ios_bg_qos_names[512];   /* lower-case, ';'-separated */
+static pthread_key_t ios_bg_qos_key;     /* per thread: 0 unknown, 1 not listed, 3 listed, 7 listed and demoted */
+static int ios_bg_qos_key_ok;
+static pthread_once_t ios_bg_qos_once = PTHREAD_ONCE_INIT;
+static void ios_bg_qos_init( void );
+
+/* the [xp] sampler saw the game's presenting thread run */
+static void ios_bg_game_note( uint32_t pid, uint32_t wtid )
+{
+    uint64_t now = ios_bg_now_ns(), last;
+
+    if (!pid) return;
+    last = __atomic_load_n( &ios_bg_game_seen_ns, __ATOMIC_RELAXED );
+    if (__atomic_exchange_n( &ios_bg_game_pid, pid, __ATOMIC_RELAXED ) != pid)
+    {
+        pthread_once( &ios_bg_qos_once, ios_bg_qos_init );
+        __atomic_store_n( &ios_bg_game_since_ns, now, __ATOMIC_RELAXED );
+        wine_log_write( "[bg-qos] the game is process %04x (presenting thread %04x); %s run at utility QoS once "
+                        "it has presented for %llu s (MADEIRA_BG_QOS_PROCS, MADEIRA_BG_QOS_DELAY_S)", (unsigned)pid,
+                        (unsigned)wtid, ios_bg_qos_key_ok ? ios_bg_qos_names : "nothing (off)",
+                        (unsigned long long)(ios_bg_qos_delay_ns / 1000000000ull) );
+    }
+    else if (!last || now - last >= IOS_BG_QOS_HOLD_NS)
+        __atomic_store_n( &ios_bg_game_since_ns, now, __ATOMIC_RELAXED );   /* presents resumed */
+    __atomic_store_n( &ios_bg_game_seen_ns, now, __ATOMIC_RELEASE );   /* publishes since and pid */
+}
+
+static void ios_bg_qos_init( void )
+{
+    /* ';'-separated exe names demoted to utility QoS while the game presents; empty = off */
+    const char *e = getenv( "MADEIRA_BG_QOS_PROCS" );
+    size_t i;
+
+    if (!e) e = "SocialClubHelper.exe;Launcher.exe;RockstarService.exe;dockhost.exe";
+    for (i = 0; e[i] && i < sizeof(ios_bg_qos_names) - 1; i++)
+        ios_bg_qos_names[i] = (e[i] >= 'A' && e[i] <= 'Z') ? e[i] + 32 : e[i];
+    ios_bg_qos_names[i] = 0;
+    {
+        /* seconds the game must present before the listed processes are demoted (default 60) */
+        const char *d = getenv( "MADEIRA_BG_QOS_DELAY_S" );
+        unsigned long s = d && *d ? strtoul( d, NULL, 10 ) : 60;
+        ios_bg_qos_delay_ns = (uint64_t)(s > 86400 ? 86400 : s) * 1000000000ull;
+    }
+    /* a TSD slot, not __thread: its first use allocates nothing */
+    ios_bg_qos_key_ok = ios_bg_qos_names[0] && !pthread_key_create( &ios_bg_qos_key, NULL );
+}
+
+/* Is the calling thread's process on the list? (its PEB's image name) */
+static int ios_bg_qos_listed_self( void )
+{
+    TEB *teb = NtCurrentTeb();
+    RTL_USER_PROCESS_PARAMETERS *pp = teb && teb->Peb ? teb->Peb->ProcessParameters : NULL;
+    const WCHAR *path;
+    const char *n;
+    size_t len, base = 0, k;
+
+    if (!pp || !(path = pp->ImagePathName.Buffer)) return 0;
+    len = pp->ImagePathName.Length / sizeof(WCHAR);
+    for (k = 0; k < len; k++) if (path[k] == '\\' || path[k] == '/') base = k + 1;
+    for (n = ios_bg_qos_names; *n; )
+    {
+        size_t m = 0;
+        while (n[m] && n[m] != ';') m++;
+        if (m && m == len - base)
+        {
+            for (k = 0; k < m; k++)
+            {
+                WCHAR c = path[base + k];
+                if (c >= 'A' && c <= 'Z') c += 32;
+                if (c != (WCHAR)(unsigned char)n[k]) break;
+            }
+            if (k == m) return 1;
+        }
+        n += m;
+        if (*n == ';') n++;
+    }
+    return 0;
+}
+
+/* At each server call: move this thread between utility and user-interactive. */
+static inline void ios_bg_qos_check( void )
+{
+    uint64_t seen = __atomic_load_n( &ios_bg_game_seen_ns, __ATOMIC_ACQUIRE );
+    uintptr_t st;
+    int want;
+
+    if (!seen) return;   /* no game has presented yet, so nothing was ever demoted */
+    pthread_once( &ios_bg_qos_once, ios_bg_qos_init );
+    if (!ios_bg_qos_key_ok) return;
+    if (!(st = (uintptr_t)pthread_getspecific( ios_bg_qos_key )))
+    {
+        st = ios_bg_qos_listed_self() ? 3 : 1;
+        pthread_setspecific( ios_bg_qos_key, (void *)st );
+    }
+    if (st == 1) return;
+    {
+        /* both stamps before the clock: the sampler stores a stamp after reading its
+         * clock, so one we loaded can never be later than our own `now` */
+        uint64_t since = __atomic_load_n( &ios_bg_game_since_ns, __ATOMIC_RELAXED );
+        uint64_t now = ios_bg_now_ns();
+        want = now - seen < IOS_BG_QOS_HOLD_NS && now - since >= ios_bg_qos_delay_ns &&
+               HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ) != __atomic_load_n( &ios_bg_game_pid, __ATOMIC_RELAXED );
+    }
+    if (want == (st == 7)) return;
+    if (pthread_set_qos_class_self_np( want ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INTERACTIVE, 0 ))
+    {
+        pthread_setspecific( ios_bg_qos_key, (void *)(uintptr_t)1 );   /* refused (fixed priority): leave it */
+        return;
+    }
+    pthread_setspecific( ios_bg_qos_key, (void *)(uintptr_t)(want ? 7 : 3) );
+    {
+        unsigned long n = __atomic_add_fetch( &ios_bg_qos_moves, 1, __ATOMIC_RELAXED );
+        if (n <= 24 || !(n % 256))
+            wine_log_write( "[bg-qos] #%lu process %04x thread %04x -> %s", n,
+                            (unsigned)HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ),
+                            (unsigned)HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ),
+                            want ? "utility (the game presents)" : "user-interactive (the game stopped presenting)" );
+    }
+}
+
+/* madeira-bcd: [xp-t] shows a native thread (no TEB) as m<thread id> only,
+ * and in build 442 two of them were 30-50 ms a sample with nothing to say what
+ * they were. Name each once, the first time it is busy enough to be listed. */
+static void ios_xp_name_native( pthread_t pt, uint64_t tid )
+{
+    static uint64_t named[128];
+    static int n;
+    char name[64] = "";
+    int i;
+
+    for (i = 0; i < n; i++) if (named[i] == tid) return;
+    if (n == (int)(sizeof(named) / sizeof(named[0]))) return;
+    named[n++] = tid;
+    pthread_getname_np( pt, name, sizeof(name) );
+    wine_log_write( "[xp-names] m%llu \"%s\"", (unsigned long long)tid, name[0] ? name : "(unnamed)" );
+}
+
+/* madeira-bcd: CPU power governor (opt-in: env.MADEIRA_POWER_GOV_MW = target in mW).
+ * The SoC clamps the CPU once a budget of energy spent above ~2.3 W is used up:
+ * ml1133 (sync.c, above ios_eco_gen) measured ~250 J in six runs within 3 %, and in
+ * builds 442/447 (2026-10-08) GTA V Enhanced was clamped at the start of play to P
+ * 1.31 / E 1.70 GHz and 0.5-0.9 W of process CPU power, 404-462 J into the session,
+ * after loading screens at 3-5 W. Bursting and then running clamped wastes the budget,
+ * so while a game presents this holds the process's CPU power ([xp]'s ri_energy_nj)
+ * at the target on average: a running balance of (power - target) x time turns ECO on
+ * (guest threads at utility QoS: efficiency cores, lower clocks) when it exceeds
+ * +MADEIRA_POWER_GOV_BAND_MJ (default 1000) and off when it falls below -BAND, at most
+ * one switch per 500 ms. When no game presents, ECO goes back to what it was before.
+ * [power-gov] summarises every 10 s. */
+extern void madeira_set_eco( int on );
+extern int madeira_get_eco( void );
+
+static void ios_power_gov_step( uint64_t now, double dt_ms, double mj )
+{
+    static int target_mw = -1, band_mj, base, active;
+    static double balance, sum_mj, sum_ms, eco_ms;
+    static unsigned switches;
+    static uint64_t last_switch, last_report;
+    uint64_t seen;
+    int eco;
+
+    if (target_mw < 0)
+    {
+        const char *e = getenv( "MADEIRA_POWER_GOV_MW" );   /* process CPU power target (mW) while a game presents; unset/0 = off */
+        const char *b = getenv( "MADEIRA_POWER_GOV_BAND_MJ" );   /* energy (mJ) the running balance may drift before ECO switches (1000) */
+        target_mw = e ? atoi( e ) : 0;
+        if (target_mw < 0 || target_mw > 20000) target_mw = 0;
+        band_mj = b ? atoi( b ) : 1000;
+        if (band_mj < 50 || band_mj > 100000) band_mj = 1000;
+        if (target_mw)
+            wine_log_write( "[power-gov] on: process CPU power held at %d mW while a game presents (band %d mJ; "
+                            "MADEIRA_POWER_GOV_MW, MADEIRA_POWER_GOV_BAND_MJ)", target_mw, band_mj );
+    }
+    if (!target_mw || dt_ms <= 0) return;
+    seen = __atomic_load_n( &ios_bg_game_seen_ns, __ATOMIC_ACQUIRE );
+    if (!seen || now - seen >= IOS_BG_QOS_HOLD_NS)
+    {
+        if (active)   /* the game stopped presenting: ECO back to what it was */
+        {
+            active = 0;
+            if (madeira_get_eco() != base) madeira_set_eco( base );
+            wine_log_write( "[power-gov] the game stopped presenting: ECO back %s", base ? "on" : "off" );
+        }
+        return;
+    }
+    eco = madeira_get_eco();   /* re-read: the ECO pill may have moved it */
+    if (!active)
+    {
+        active = 1;
+        base = eco;
+        balance = sum_mj = sum_ms = eco_ms = 0;
+        switches = 0;
+        last_switch = last_report = now;
+    }
+    balance += mj - target_mw * dt_ms / 1000.0;
+    if (balance > 3.0 * band_mj) balance = 3.0 * band_mj;     /* a long burst buys no long ECO stretch */
+    if (balance < -3.0 * band_mj) balance = -3.0 * band_mj;   /* nor a long idle stretch a long burst */
+    sum_mj += mj;
+    sum_ms += dt_ms;
+    if (eco) eco_ms += dt_ms;
+    if (now - last_switch >= 500000000ull && ((!eco && balance > band_mj) || (eco && balance < -band_mj)))
+    {
+        madeira_set_eco( !eco );
+        last_switch = now;
+        switches++;
+    }
+    if (now - last_report >= 10000000000ull && sum_ms > 0)
+    {
+        wine_log_write( "[power-gov] last %.0f s: %.2f W average (target %.2f W), ECO on %.0f%% of the time, %u switches",
+                        sum_ms / 1000.0, sum_mj / sum_ms, target_mw / 1000.0, 100.0 * eco_ms / sum_ms, switches );
+        last_report = now;
+        sum_mj = sum_ms = eco_ms = 0;
+        switches = 0;
+    }
+}
+
+/* madeira-bcd fps-gov: a frame-rate cap as the power governor's actuator (opt-in).
+ * The governor above switches ECO, and ECO (every guest thread at utility QoS) made
+ * GTA V Enhanced crash while loading (a null-pointer write in a timing-sensitive
+ * path, build 449). A cap moves no thread and changes no timing inside a frame,
+ * only how often frames start. The CPU clamp comes after ~273-330 J of process CPU
+ * energy in Horizon Zero Dawn (builds 486-493), most of it spent in menus and
+ * loading at 2.75-3.8 W; Red Dead Redemption 2's menus ran at 57-60 fps for two
+ * minutes (build 460) and the clamp came before play. Two opt-in modes:
+ *   env.MADEIRA_FPS_CAP = N     a fixed cap of N fps (10-120) for the whole session;
+ *   env.MADEIRA_FPS_GOV_MW = P  while a game presents, hold the process CPU power
+ *       ([xp]'s ri_energy_nj) at P mW by moving the cap between 60/40/30/24/20 fps
+ *       (MADEIRA_FPS_GOV_MAX / _MIN bound the steps; 60 and 20 by default): a running
+ *       balance of (power - target) x time lowers the cap one step when it passes
+ *       +MADEIRA_FPS_GOV_BAND_MJ (1500 by default), skipping caps the game does not
+ *       reach anyway, and raises it one step when it passes -BAND while the game runs
+ *       at the cap; at most one change per 3 s. With nothing presented for 2 s
+ *       (loading) the balance and the cap are held.
+ * The cap is published in ios_fps_cap. The xprobe copies it into madeira-d3d12's
+ * counter block, which its Present reads to hold the game's thread
+ * (NtDelayExecution); DXMT's encode thread waits in winemetal's presentDrawable
+ * (winemetal in DXMT -> ios_fps_cap_dxmt_pace) when no D3D12 runtime
+ * paces itself. [fps-gov] summarises every 10 s. Unset: nothing is armed,
+ * ios_fps_cap stays 0 and neither presenter waits. Needs the [xp] sampler. */
+volatile int ios_fps_cap;                     /* fps the presenters pace to; 0 = none */
+static volatile int ios_fps_gov_armed;        /* a cap or a target is set (read once by the xprobe) */
+static volatile uint64_t ios_fps_presents;    /* presents through winemetal while armed */
+static volatile uint64_t ios_fps_paced_ns;    /* time DXMT presents waited for the cap */
+static const int ios_fps_steps[] = { 60, 40, 30, 24, 20 };
+#define IOS_FPS_NSTEPS ((int)(sizeof(ios_fps_steps) / sizeof(ios_fps_steps[0])))
+
+/* the D3D12 runtime's part of its counter block (madeira-d3d12 struct mad_xp, after
+ * the fields struct ios_xp_pe mirrors): fps_cap is ours to write, the rest is its own */
+struct ios_xp_pe_cap { int64_t fps_cap, t_cap, n_cap; };
+
+static void ios_fps_gov_step( uint64_t now, double dt_ms, double mj, uint64_t presents, double paced_ms )
+{
+    static int inited, fixed, target_mw, band_mj, hi, lo, idx, active;
+    static double balance, sum_mj, sum_ms, sum_paced, fps_avg;
+    static uint64_t last_presents, last_present_ns, last_change, last_report, report_presents;
+    static unsigned changes;
+    double fps;
+    int i, n;
+
+    if (!inited)
+    {
+        const char *c = getenv( "MADEIRA_FPS_CAP" );          /* fixed frame cap (fps, 10-120); unset/0 = none */
+        const char *e = getenv( "MADEIRA_FPS_GOV_MW" );       /* process CPU power (mW) the frame cap holds while a game presents; unset/0 = off */
+        const char *b = getenv( "MADEIRA_FPS_GOV_BAND_MJ" );  /* energy (mJ) the balance may drift before the cap moves (1500) */
+        const char *mx = getenv( "MADEIRA_FPS_GOV_MAX" );     /* highest cap of the governor (fps, 60) */
+        const char *mn = getenv( "MADEIRA_FPS_GOV_MIN" );     /* lowest cap of the governor (fps, 20) */
+        int max_fps = mx && *mx ? atoi( mx ) : 60, min_fps = mn && *mn ? atoi( mn ) : 20;
+        inited = 1;
+        fixed = c ? atoi( c ) : 0;
+        if (fixed < 10 || fixed > 120) fixed = 0;
+        target_mw = e ? atoi( e ) : 0;
+        if (target_mw < 0 || target_mw > 20000) target_mw = 0;
+        band_mj = b && *b ? atoi( b ) : 1500;
+        if (band_mj < 100 || band_mj > 100000) band_mj = 1500;
+        for (hi = 0; hi < IOS_FPS_NSTEPS - 1 && ios_fps_steps[hi] > max_fps; hi++) ;
+        for (lo = IOS_FPS_NSTEPS - 1; lo > hi && ios_fps_steps[lo] < min_fps; lo--) ;
+        idx = hi;
+        last_presents = presents;
+        if (fixed)
+        {
+            ios_fps_cap = fixed;
+            ios_fps_gov_armed = 1;
+            wine_log_write( "[fps-gov] madeira-bcd fixed frame cap: %d fps (MADEIRA_FPS_CAP)", fixed );
+        }
+        else if (target_mw)
+        {
+            ios_fps_gov_armed = 1;
+            wine_log_write( "[fps-gov] madeira-bcd on: process CPU power held at %d mW while a game presents, by a frame "
+                            "cap of %d..%d fps (band %d mJ; MADEIRA_FPS_GOV_MW, _MIN, _MAX, _BAND_MJ)",
+                            target_mw, ios_fps_steps[lo], ios_fps_steps[hi], band_mj );
+        }
+    }
+    if (fixed || !target_mw || dt_ms <= 0) return;
+    fps = presents >= last_presents ? (presents - last_presents) * 1000.0 / dt_ms : 0;
+    if (presents != last_presents) last_present_ns = now;
+    last_presents = presents;
+    if (!last_present_ns || now - last_present_ns >= 2000000000ull)
+    {
+        if (active)
+        {
+            active = 0;
+            wine_log_write( "[fps-gov] nothing presented for 2 s: cap held at %d fps", ios_fps_steps[idx] );
+        }
+        return;
+    }
+    if (!active)
+    {
+        active = 1;
+        balance = sum_mj = sum_ms = sum_paced = 0;
+        fps_avg = fps;
+        changes = 0;
+        last_change = last_report = now;
+        report_presents = presents;
+        ios_fps_cap = ios_fps_steps[idx];
+        wine_log_write( "[fps-gov] the game presents: cap %d fps", ios_fps_cap );
+    }
+    fps_avg += 0.25 * (fps - fps_avg);
+    balance += mj - target_mw * dt_ms / 1000.0;
+    if (balance > 3.0 * band_mj) balance = 3.0 * band_mj;     /* a long burst buys no long low-cap stretch */
+    if (balance < -3.0 * band_mj) balance = -3.0 * band_mj;   /* nor a long cheap stretch a long burst */
+    sum_mj += mj;
+    sum_ms += dt_ms;
+    sum_paced += paced_ms;
+    if (now - last_change >= 3000000000ull)
+    {
+        if (balance > band_mj && idx < lo)
+        {
+            for (n = idx + 1; n < lo && ios_fps_steps[n] >= fps_avg * 0.95; n++) ;   /* a cap above the game's rate changes nothing */
+            idx = n;
+            balance = 0;
+            last_change = now;
+            changes++;
+        }
+        else if (balance < -band_mj && idx > hi && fps_avg >= 0.85 * ios_fps_steps[idx])
+        {
+            idx--;
+            balance = 0;
+            last_change = now;
+            changes++;
+        }
+    }
+    ios_fps_cap = ios_fps_steps[idx];
+    if (now - last_report >= 10000000000ull && sum_ms > 0)
+    {
+        i = (int)(presents - report_presents);
+        wine_log_write( "[fps-gov] last %.0f s: %.2f W average (target %.2f W), cap %d fps, %.1f fps presented, "
+                        "waited %.0f ms/s for the cap, %u change(s)", sum_ms / 1000.0, sum_mj / sum_ms,
+                        target_mw / 1000.0, ios_fps_cap, i * 1000.0 / sum_ms, sum_paced * 1000.0 / sum_ms, changes );
+        last_report = now;
+        report_presents = presents;
+        sum_mj = sum_ms = sum_paced = 0;
+        changes = 0;
+    }
+}
+
+/* madeira-bcd fps-gov: DXMT's side of the cap. winemetal (DXMT)
+ * calls this at the top of winemetal's presentDrawable (on the presenting thread:
+ * DXMT's encode thread, or madeira-d3d12's queue worker). While a cap or governor
+ * is armed it counts the present; when a cap is set and no D3D12 runtime paces
+ * itself (madeira-d3d12 publishes its counter block, ios_xp_pe_block, and holds the
+ * game's thread in Present), it waits for this thread's next deadline with
+ * mach_wait_until, a timed kernel wait. The deadline moves one period from the
+ * previous one, and is re-based when the thread fell more than a period behind, so
+ * a slow frame is not paid twice and a stall banks no credit. Returns the
+ * nanoseconds waited (the [frame] limiter time). Not armed: returns at once. */
+unsigned long long ios_fps_cap_dxmt_pace( void )
+{
+    static __thread uint64_t next;
+    static mach_timebase_info_data_t tb;
+    uint64_t now, period, slept;
+    int cap;
+
+    if (!ios_fps_gov_armed) return 0;
+    __atomic_add_fetch( &ios_fps_presents, 1, __ATOMIC_RELAXED );
+    cap = ios_fps_cap;
+    if (cap < 10 || cap > 240 || ios_xp_pe_block) { next = 0; return 0; }
+    if (!tb.denom) mach_timebase_info( &tb );
+    period = (uint64_t)(1e9 / cap * tb.denom / tb.numer);
+    now = mach_absolute_time();
+    if (!next || now > next + period) { next = now + period; return 0; }
+    if (now >= next) { next += period; return 0; }
+    mach_wait_until( next );
+    slept = (mach_absolute_time() - now) * tb.numer / tb.denom;
+    next += period;
+    __atomic_add_fetch( &ios_fps_paced_ns, slept, __ATOMIC_RELAXED );
+    return slept;
+}
+
+/* madeira-bcd power probe (opt-in: env.MADEIRA_POWER_PROBE = 1). Every 5 s, next
+ * to [xp]'s process CPU energy (proc_pid_rusage ri_energy_nj), one [power] line with
+ * what else a developer-signed app can read, each source tried once and named
+ * "unavailable" once when it gives nothing:
+ *  - the process's resource coalition (proc_pidinfo PROC_PIDCOALITIONINFO, then
+ *    libsystem_kernel's coalition_info_resource_usage): gpu_energy_nj and gpu_time,
+ *    which the GPU driver charges to coalitions (xnu coalition_add_to_gpu_energy,
+ *    ml_gpu_stat_update), plus the coalition's CPU energy and the energy others
+ *    did on our behalf. task_info(TASK_POWER_INFO_V2)'s gpu field is no use on
+ *    arm64: ml_gpu_stat() returns 0 there (osfmk/arm64/machine_routines.c);
+ *  - rusage's ri_billed_energy / ri_serviced_energy (work billed across processes);
+ *  - IOReport's "Energy Model" group (private /usr/lib/libIOReport.dylib), the SoC's
+ *    own CPU/GPU/DRAM energy counters, if the sandbox lets the app subscribe;
+ *  - the battery's IORegistry entry (AppleSmartBattery: Voltage, InstantAmperage),
+ *    i.e. the whole device's power while unplugged, if the sandbox lets it be read.
+ * One [power-t] line names the threads that used the most energy in those 5 s
+ * ([xp]'s per-thread PROC_PIDTHREADCOUNTS energy, which [xp-t] does not print), so
+ * the wineserver, Metal and app threads can be told apart from the game's; a
+ * native thread (m<tid>) carries its base priority, which names its QoS class
+ * (47 user-interactive, 37 user-initiated, 31 default, 20 utility, 4 background,
+ * 97 real-time). All calls are made on the xprobe thread; nothing is resolved
+ * while the switch is off. */
+static int ios_power_probe_on;   /* read where the samplers are armed */
+
+struct ios_pp_thr { uint64_t tid; uint32_t wtid; char role[6]; int pri; double p_mj, e_mj; };
+static struct ios_pp_thr ios_pp_thr[256];
+static int ios_pp_nthr;
+
+/* returns the entry, or NULL when the table is full; a new native entry has pri -2 (not yet asked) */
+static struct ios_pp_thr *ios_pp_thread( uint64_t tid, uint32_t wtid, const char *role, double p_mj, double e_mj )
+{
+    int i;
+    for (i = 0; i < ios_pp_nthr; i++) if (ios_pp_thr[i].tid == tid) break;
+    if (i == ios_pp_nthr)
+    {
+        if (ios_pp_nthr >= (int)(sizeof(ios_pp_thr) / sizeof(ios_pp_thr[0]))) return NULL;
+        memset( &ios_pp_thr[i], 0, sizeof(ios_pp_thr[i]) );
+        ios_pp_thr[i].tid = tid;
+        ios_pp_thr[i].pri = wtid ? -1 : -2;
+        ios_pp_nthr++;
+    }
+    ios_pp_thr[i].wtid = wtid;
+    if (role) snprintf( ios_pp_thr[i].role, sizeof(ios_pp_thr[i].role), "%s", role );
+    ios_pp_thr[i].p_mj += p_mj;
+    ios_pp_thr[i].e_mj += e_mj;
+    return &ios_pp_thr[i];
+}
+
+/* struct coalition_resource_usage (xnu osfmk/mach/coalition.h) up to swapins; the
+ * kernel copies min(its size, ours), so fields it lacks stay 0 */
+struct ios_pp_cru
+{
+    uint64_t tasks_started, tasks_exited, time_nonempty, cpu_time, interrupt_wakeups, platform_idle_wakeups,
+             bytesread, byteswritten, gpu_time, cpu_time_billed_to_me, cpu_time_billed_to_others, energy,
+             lwrites[8], energy_billed_to_me, energy_billed_to_others, cpu_ptime, cpu_time_eqos_len, cpu_time_eqos[7],
+             cpu_instructions, cpu_cycles, fs_metadata_writes, pm_writes, cpu_pinstructions, cpu_pcycles, conclave_mem,
+             ane_mach_time, ane_energy_nj, phys_footprint, gpu_energy_nj, gpu_energy_nj_billed_to_me,
+             gpu_energy_nj_billed_to_others, swapins;
+};
+
+typedef const void *ios_cf_t;
+static struct
+{
+    int inited;
+    /* coalition */
+    uint64_t cid;
+    int (*cru_fn)( uint64_t cid, void *cru, size_t size );
+    struct ios_pp_cru cru_prev;
+    int have_cru, said_coal;
+    /* CoreFoundation, IOKit, IOReport (all through dlsym) */
+    ios_cf_t (*str)( ios_cf_t alloc, const char *s, uint32_t encoding );
+    unsigned char (*num_get)( ios_cf_t num, long type, void *out );
+    unsigned long (*type_id)( ios_cf_t obj );
+    unsigned long (*num_type)( void );
+    void (*release)( ios_cf_t obj );
+    ios_cf_t (*dict_get)( ios_cf_t dict, ios_cf_t key );
+    ios_cf_t (*dict_mcopy)( ios_cf_t alloc, long capacity, ios_cf_t dict );
+    long (*arr_count)( ios_cf_t arr );
+    ios_cf_t (*arr_at)( ios_cf_t arr, long i );
+    unsigned char (*str_get)( ios_cf_t s, char *buf, long size, uint32_t encoding );
+    ios_cf_t (*io_matching)( const char *name );
+    mach_port_t (*io_service)( mach_port_t main_port, ios_cf_t matching );
+    ios_cf_t (*io_prop)( mach_port_t entry, ios_cf_t key, ios_cf_t alloc, uint32_t options );
+    mach_port_t battery;
+    ios_cf_t k_volt, k_amp;
+    int said_batt;
+    ios_cf_t (*ior_channels)( ios_cf_t group, ios_cf_t subgroup, uint64_t a, uint64_t b, uint64_t c );
+    ios_cf_t (*ior_subscribe)( ios_cf_t a, ios_cf_t channels, ios_cf_t *subbed, uint64_t b, ios_cf_t c );
+    ios_cf_t (*ior_samples)( ios_cf_t sub, ios_cf_t subbed, ios_cf_t a );
+    ios_cf_t (*ior_delta)( ios_cf_t prev, ios_cf_t cur, ios_cf_t a );
+    ios_cf_t (*ior_name)( ios_cf_t channel );
+    ios_cf_t (*ior_unit)( ios_cf_t channel );
+    int64_t (*ior_int)( ios_cf_t channel, int32_t index );
+    ios_cf_t ior_sub, ior_subbed, ior_prev, k_channels;
+    int said_ior, listed_ior;
+    /* accumulated between lines */
+    uint64_t last_ns;
+    double ms, cpu_mj, cpu_p_mj, billed_mj, serviced_mj;
+} ios_pp;
+
+#define IOS_CF_UTF8 0x08000100u   /* kCFStringEncodingUTF8 */
+#define IOS_CF_SINT64 4           /* kCFNumberSInt64Type */
+
+static void ios_pp_init( void )
+{
+    struct { uint64_t coalition_id[2]; uint64_t reserved[3]; } pci;
+    void *iokit, *ior;
+
+    ios_pp.inited = 1;
+    memset( &pci, 0, sizeof(pci) );
+    if (proc_pidinfo( getpid(), 20 /* PROC_PIDCOALITIONINFO */, 1, &pci, sizeof(pci) ) == (int)sizeof(pci))
+        ios_pp.cid = pci.coalition_id[0];   /* COALITION_TYPE_RESOURCE */
+    ios_pp.cru_fn = (int (*)( uint64_t, void *, size_t ))dlsym( RTLD_DEFAULT, "coalition_info_resource_usage" );
+    ios_pp.str = (ios_cf_t (*)( ios_cf_t, const char *, uint32_t ))dlsym( RTLD_DEFAULT, "CFStringCreateWithCString" );
+    ios_pp.num_get = (unsigned char (*)( ios_cf_t, long, void * ))dlsym( RTLD_DEFAULT, "CFNumberGetValue" );
+    ios_pp.type_id = (unsigned long (*)( ios_cf_t ))dlsym( RTLD_DEFAULT, "CFGetTypeID" );
+    ios_pp.num_type = (unsigned long (*)( void ))dlsym( RTLD_DEFAULT, "CFNumberGetTypeID" );
+    ios_pp.release = (void (*)( ios_cf_t ))dlsym( RTLD_DEFAULT, "CFRelease" );
+    ios_pp.dict_get = (ios_cf_t (*)( ios_cf_t, ios_cf_t ))dlsym( RTLD_DEFAULT, "CFDictionaryGetValue" );
+    ios_pp.dict_mcopy = (ios_cf_t (*)( ios_cf_t, long, ios_cf_t ))dlsym( RTLD_DEFAULT, "CFDictionaryCreateMutableCopy" );
+    ios_pp.arr_count = (long (*)( ios_cf_t ))dlsym( RTLD_DEFAULT, "CFArrayGetCount" );
+    ios_pp.arr_at = (ios_cf_t (*)( ios_cf_t, long ))dlsym( RTLD_DEFAULT, "CFArrayGetValueAtIndex" );
+    ios_pp.str_get = (unsigned char (*)( ios_cf_t, char *, long, uint32_t ))dlsym( RTLD_DEFAULT, "CFStringGetCString" );
+    if (!ios_pp.str || !ios_pp.num_get || !ios_pp.type_id || !ios_pp.num_type || !ios_pp.release || !ios_pp.dict_get ||
+        !ios_pp.dict_mcopy || !ios_pp.arr_count || !ios_pp.arr_at || !ios_pp.str_get)
+        ios_pp.str = NULL;   /* no CoreFoundation: neither IOKit nor IOReport */
+    if (ios_pp.str && (iokit = dlopen( "/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY )))
+    {
+        ios_pp.io_matching = (ios_cf_t (*)( const char * ))dlsym( iokit, "IOServiceMatching" );
+        ios_pp.io_service = (mach_port_t (*)( mach_port_t, ios_cf_t ))dlsym( iokit, "IOServiceGetMatchingService" );
+        ios_pp.io_prop = (ios_cf_t (*)( mach_port_t, ios_cf_t, ios_cf_t, uint32_t ))dlsym( iokit, "IORegistryEntryCreateCFProperty" );
+        if (ios_pp.io_matching && ios_pp.io_service && ios_pp.io_prop)
+        {
+            ios_cf_t m = ios_pp.io_matching( "AppleSmartBattery" );
+            if (m) ios_pp.battery = ios_pp.io_service( MACH_PORT_NULL, m );   /* consumes m */
+            ios_pp.k_volt = ios_pp.str( NULL, "Voltage", IOS_CF_UTF8 );
+            ios_pp.k_amp = ios_pp.str( NULL, "InstantAmperage", IOS_CF_UTF8 );
+        }
+    }
+    if (ios_pp.str && (ior = dlopen( "/usr/lib/libIOReport.dylib", RTLD_LAZY )))
+    {
+        ios_pp.ior_channels = (ios_cf_t (*)( ios_cf_t, ios_cf_t, uint64_t, uint64_t, uint64_t ))dlsym( ior, "IOReportCopyChannelsInGroup" );
+        ios_pp.ior_subscribe = (ios_cf_t (*)( ios_cf_t, ios_cf_t, ios_cf_t *, uint64_t, ios_cf_t ))dlsym( ior, "IOReportCreateSubscription" );
+        ios_pp.ior_samples = (ios_cf_t (*)( ios_cf_t, ios_cf_t, ios_cf_t ))dlsym( ior, "IOReportCreateSamples" );
+        ios_pp.ior_delta = (ios_cf_t (*)( ios_cf_t, ios_cf_t, ios_cf_t ))dlsym( ior, "IOReportCreateSamplesDelta" );
+        ios_pp.ior_name = (ios_cf_t (*)( ios_cf_t ))dlsym( ior, "IOReportChannelGetChannelName" );
+        ios_pp.ior_unit = (ios_cf_t (*)( ios_cf_t ))dlsym( ior, "IOReportChannelGetUnitLabel" );
+        ios_pp.ior_int = (int64_t (*)( ios_cf_t, int32_t ))dlsym( ior, "IOReportSimpleGetIntegerValue" );
+        if (ios_pp.ior_channels && ios_pp.ior_subscribe && ios_pp.ior_samples && ios_pp.ior_delta &&
+            ios_pp.ior_name && ios_pp.ior_unit && ios_pp.ior_int)
+        {
+            ios_cf_t group = ios_pp.str( NULL, "Energy Model", IOS_CF_UTF8 ), chans, mchans;
+            ios_pp.k_channels = ios_pp.str( NULL, "IOReportChannels", IOS_CF_UTF8 );
+            if (group && (chans = ios_pp.ior_channels( group, NULL, 0, 0, 0 )))
+            {
+                if ((mchans = ios_pp.dict_mcopy( NULL, 0, chans )))
+                    ios_pp.ior_sub = ios_pp.ior_subscribe( NULL, mchans, &ios_pp.ior_subbed, 0, NULL );
+                ios_pp.release( chans );
+            }
+            if (ios_pp.ior_sub && ios_pp.ior_subbed) ios_pp.ior_prev = ios_pp.ior_samples( ios_pp.ior_sub, ios_pp.ior_subbed, NULL );
+        }
+    }
+}
+
+static int ios_pp_num( ios_cf_t obj, int64_t *out )
+{
+    if (!obj || ios_pp.type_id( obj ) != ios_pp.num_type()) return 0;
+    return ios_pp.num_get( obj, IOS_CF_SINT64, out ) != 0;
+}
+
+/* scale an IOReport energy value to mJ by its unit label */
+static double ios_pp_ior_mj( int64_t v, const char *unit )
+{
+    if (!strcmp( unit, "nJ" )) return v / 1e6;
+    if (!strcmp( unit, "uJ" ) || !strcmp( unit, "\xc2\xb5J" )) return v / 1e3;
+    if (!strcmp( unit, "mJ" )) return (double)v;
+    if (!strcmp( unit, "J" )) return v * 1e3;
+    return -1;
+}
+
+static void ios_power_probe_tick( const char *wall, uint64_t now_ns, double dt_ms, double cpu_mj, double cpu_p_mj,
+                                  double billed_mj, double serviced_mj )
+{
+    char line[1400];
+    int n, i;
+    double ms;
+
+    if (!ios_pp.inited)
+    {
+        ios_pp_init();
+        ios_pp.last_ns = now_ns;
+        wine_log_write( "[power] madeira-bcd probe on (MADEIRA_POWER_PROBE): coalition %#llx (%s), IOReport %s, battery %s",
+                        (unsigned long long)ios_pp.cid, ios_pp.cru_fn ? "reader found" : "no reader",
+                        ios_pp.ior_sub ? "subscribed" : "not subscribed", ios_pp.battery ? "entry found" : "no entry" );
+    }
+    ios_pp.ms += dt_ms;
+    ios_pp.cpu_mj += cpu_mj;
+    ios_pp.cpu_p_mj += cpu_p_mj;
+    ios_pp.billed_mj += billed_mj;
+    ios_pp.serviced_mj += serviced_mj;
+    if (now_ns - ios_pp.last_ns < 5000000000ull || ios_pp.ms <= 0) return;
+    ios_pp.last_ns = now_ns;
+    ms = ios_pp.ms;
+    n = snprintf( line, sizeof(line), "[power] %s %.1f s: cpu %.2f W (P %.2f; rusage), billed %.2f W, serviced %.2f W", wall,
+                  ms / 1000.0, ios_pp.cpu_mj / ms, ios_pp.cpu_p_mj / ms, ios_pp.billed_mj / ms, ios_pp.serviced_mj / ms );
+
+    /* the resource coalition: GPU energy and time the driver charged to it */
+    {
+        struct ios_pp_cru cru;
+        int ok = 0, err = 0;
+        memset( &cru, 0, sizeof(cru) );
+        if (ios_pp.cid && ios_pp.cru_fn) { ok = !ios_pp.cru_fn( ios_pp.cid, &cru, sizeof(cru) ); if (!ok) err = errno; }
+        if (ok && ios_pp.have_cru)
+            n += snprintf( line + n, sizeof(line) - n, " | coalition: gpu %.2f W, busy %.0f%%, cpu %.2f W, ane %.2f W, "
+                           "billed to us: cpu %.2f W gpu %.2f W",
+                           (double)(cru.gpu_energy_nj - ios_pp.cru_prev.gpu_energy_nj) / 1e6 / ms,
+                           (double)(cru.gpu_time - ios_pp.cru_prev.gpu_time) / 1e4 / ms,
+                           (double)(cru.energy - ios_pp.cru_prev.energy) / 1e6 / ms,
+                           (double)(cru.ane_energy_nj - ios_pp.cru_prev.ane_energy_nj) / 1e6 / ms,
+                           (double)(cru.energy_billed_to_me - ios_pp.cru_prev.energy_billed_to_me) / 1e6 / ms,
+                           (double)(cru.gpu_energy_nj_billed_to_me - ios_pp.cru_prev.gpu_energy_nj_billed_to_me) / 1e6 / ms );
+        else if (!ok && !ios_pp.said_coal++)
+            n += snprintf( line + n, sizeof(line) - n, " | coalition unavailable (%s, errno %d)",
+                           !ios_pp.cid ? "no coalition id" : !ios_pp.cru_fn ? "no coalition_info_resource_usage" : "refused", err );
+        if (ok) { ios_pp.cru_prev = cru; ios_pp.have_cru = 1; }
+    }
+
+    /* IOReport "Energy Model": the SoC's own energy counters */
+    if (ios_pp.ior_prev)
+    {
+        ios_cf_t cur = ios_pp.ior_samples( ios_pp.ior_sub, ios_pp.ior_subbed, NULL ), delta = NULL, arr = NULL;
+        double gpu = 0, gpu_parts = 0, cpu = 0, cpu_parts = 0, dram = 0;
+        int named = 0, gpu_seen = 0, cpu_seen = 0, nn = 0;
+        char names[600];
+        names[0] = 0;
+        if (cur && (delta = ios_pp.ior_delta( ios_pp.ior_prev, cur, NULL ))) arr = ios_pp.dict_get( delta, ios_pp.k_channels );
+        if (arr)
+        {
+            long c, count = ios_pp.arr_count( arr );
+            for (c = 0; c < count; c++)
+            {
+                ios_cf_t ch = ios_pp.arr_at( arr, c ), nm = ch ? ios_pp.ior_name( ch ) : NULL, un = ch ? ios_pp.ior_unit( ch ) : NULL;
+                char name[64] = "", unit[16] = "";
+                double mj;
+                if (!nm || !ios_pp.str_get( nm, name, sizeof(name), IOS_CF_UTF8 )) continue;
+                if (un) ios_pp.str_get( un, unit, sizeof(unit), IOS_CF_UTF8 );
+                mj = ios_pp_ior_mj( ios_pp.ior_int( ch, 0 ), unit );
+                if (!ios_pp.listed_ior && nn < (int)sizeof(names) - 96)
+                    nn += snprintf( names + nn, sizeof(names) - nn, " %s=%.1f%s", name, mj, mj < 0 ? "(unit?)" : "" );
+                if (mj < 0) continue;
+                named++;
+                if (!strcmp( name, "GPU Energy" )) { gpu += mj; gpu_seen = 1; }
+                else if (!strncmp( name, "GPU", 3 )) gpu_parts += mj;
+                else if (!strcmp( name, "CPU Energy" )) { cpu += mj; cpu_seen = 1; }
+                else if (strstr( name, "CPU" )) cpu_parts += mj;
+                else if (!strncmp( name, "DRAM", 4 )) dram += mj;
+            }
+        }
+        if (named)
+        {
+            n += snprintf( line + n, sizeof(line) - n, " | IOReport: gpu %.2f W, cpu %.2f W, dram %.2f W",
+                           (gpu_seen ? gpu : gpu_parts) / ms, (cpu_seen ? cpu : cpu_parts) / ms, dram / ms );
+            if (!ios_pp.listed_ior++) wine_log_write( "[power] IOReport Energy Model channels (mJ in these %.1f s):%s", ms / 1000.0, names );
+        }
+        else if (!ios_pp.said_ior++)
+            n += snprintf( line + n, sizeof(line) - n, " | IOReport unavailable (no energy channel in the samples)" );
+        if (delta) ios_pp.release( delta );
+        if (cur) { ios_pp.release( ios_pp.ior_prev ); ios_pp.ior_prev = cur; }
+    }
+    else if (!ios_pp.said_ior++)
+        n += snprintf( line + n, sizeof(line) - n, " | IOReport unavailable (%s)",
+                       !ios_pp.ior_channels ? "libIOReport not loaded" : "no Energy Model subscription" );
+
+    /* the battery: the whole device's power while unplugged */
+    {
+        int64_t mv = 0, ma = 0;
+        ios_cf_t v = NULL, a = NULL;
+        if (ios_pp.battery)
+        {
+            v = ios_pp.io_prop( ios_pp.battery, ios_pp.k_volt, NULL, 0 );
+            a = ios_pp.io_prop( ios_pp.battery, ios_pp.k_amp, NULL, 0 );
+        }
+        if (ios_pp_num( v, &mv ) && ios_pp_num( a, &ma ) && mv > 0)
+            n += snprintf( line + n, sizeof(line) - n, " | battery %.2f V x %lld mA = %.2f W (%s)", mv / 1000.0, (long long)ma,
+                           (ma < 0 ? -ma : ma) * (double)mv / 1e6, ma < 0 ? "discharging: the whole device" : "charging" );
+        else if (!ios_pp.said_batt++)
+            n += snprintf( line + n, sizeof(line) - n, " | battery unavailable (%s)",
+                           !ios_pp.io_prop ? "IOKit not loaded" : !ios_pp.battery ? "no AppleSmartBattery entry" : "properties not readable" );
+        if (v) ios_pp.release( v );
+        if (a) ios_pp.release( a );
+    }
+    wine_log_write( "%s", line );
+
+    /* the threads that used the most energy in these 5 s */
+    n = snprintf( line, sizeof(line), "[power-t] %s top threads, W (P/E):", wall );
+    for (i = 0; i < 10 && n < (int)sizeof(line) - 64; i++)
+    {
+        int b = -1, k;
+        for (k = 0; k < ios_pp_nthr; k++)
+            if (ios_pp_thr[k].tid && (b < 0 || ios_pp_thr[k].p_mj + ios_pp_thr[k].e_mj > ios_pp_thr[b].p_mj + ios_pp_thr[b].e_mj)) b = k;
+        if (b < 0 || ios_pp_thr[b].p_mj + ios_pp_thr[b].e_mj <= 0) break;
+        if (ios_pp_thr[b].wtid)
+            n += snprintf( line + n, sizeof(line) - n, " %s%04x:%.3f(%.3f/%.3f)", ios_pp_thr[b].role[0] ? ios_pp_thr[b].role : "-",
+                           ios_pp_thr[b].wtid, (ios_pp_thr[b].p_mj + ios_pp_thr[b].e_mj) / ms, ios_pp_thr[b].p_mj / ms,
+                           ios_pp_thr[b].e_mj / ms );
+        else if (ios_pp_thr[b].pri >= 0)
+            n += snprintf( line + n, sizeof(line) - n, " m%llu/%d:%.3f(%.3f/%.3f)", (unsigned long long)ios_pp_thr[b].tid,
+                           ios_pp_thr[b].pri, (ios_pp_thr[b].p_mj + ios_pp_thr[b].e_mj) / ms, ios_pp_thr[b].p_mj / ms,
+                           ios_pp_thr[b].e_mj / ms );
+        else
+            n += snprintf( line + n, sizeof(line) - n, " m%llu:%.3f(%.3f/%.3f)", (unsigned long long)ios_pp_thr[b].tid,
+                           (ios_pp_thr[b].p_mj + ios_pp_thr[b].e_mj) / ms, ios_pp_thr[b].p_mj / ms, ios_pp_thr[b].e_mj / ms );
+        ios_pp_thr[b].tid = 0;   /* printed */
+    }
+    wine_log_write( "%s", line );
+    ios_pp_nthr = 0;
+    ios_pp.ms = ios_pp.cpu_mj = ios_pp.cpu_p_mj = ios_pp.billed_mj = ios_pp.serviced_mj = 0;
+}
+
 static void ios_xprobe_main( void )
 {
     static struct ios_xp_row rows[1024];
@@ -1778,10 +2514,28 @@ static void ios_xprobe_main( void )
                                 uint64_t teb = pt_ ? ios_ts_teb( pt_ ) : 0; uint32_t w = 0;
                                 if (teb) ios_ts_read( teb + 0x48, &w, 4 );
                                 r->tid = idi.thread_id; r->wtid = w; r->p_ms = pt; r->e_ms = et;
+                                if (!w && pt_ && pt + et >= 2.0) ios_xp_name_native( pt_, idi.thread_id );
                                 r->p_ghz = pt > 0 ? pcy / (pt * 1e6) : 0; r->e_ghz = et > 0 ? ecy / (et * 1e6) : 0;
                                 r->minst = (double)((cur[0].instr - pv->c[0].instr) + (cur[1].instr - pv->c[1].instr)) / 1e6;
                                 r->role = NULL;
                                 for (i = 0; i < ios_xp_nroles; i++) if (ios_xp_roles[i].tid == idi.thread_id) { r->role = ios_xp_roles[i].role; break; }
+                                if (ios_power_probe_on)   /* madeira-bcd power probe: this thread's energy on P and E cores */
+                                {
+                                    struct ios_pp_thr *pp = ios_pp_thread( idi.thread_id, w, r->role, (double)(cur[0].nj - pv->c[0].nj) / 1e6,
+                                                                           (double)(cur[1].nj - pv->c[1].nj) / 1e6 );
+                                    if (pp && pp->pri == -2)   /* a native thread, first time in this window: its base priority (QoS) */
+                                    {
+                                        thread_extended_info_data_t xi; mach_msg_type_number_t xc = THREAD_EXTENDED_INFO_COUNT;
+                                        pp->pri = thread_info( th[k], THREAD_EXTENDED_INFO, (thread_info_t)&xi, &xc ) == KERN_SUCCESS
+                                                  ? xi.pth_priority : -1;
+                                    }
+                                }
+                                if (r->role && strchr( r->role, 'P' ) && teb && pt + et >= 1.0)
+                                {
+                                    uint32_t gp = 0;
+                                    ios_ts_read( teb + 0x40, &gp, 4 );   /* ClientId.UniqueProcess */
+                                    ios_bg_game_note( gp, w );
+                                }
                                 if (r->role && teb && (strchr( r->role, 'P' ) || strchr( r->role, 'E' ))) ios_xp_game_teb = teb;   /* ml1131 */
                                 if (teb && !ios_xp_nroles) ios_xp_fallback_add( teb, pt + et );   /* ml1131c */
                                 sum_thr_ms += pt + et; nrows++;
@@ -1810,6 +2564,16 @@ static void ios_xprobe_main( void )
             double pcy = (double)(ru.ri_pcycles - pru.ri_pcycles), cy = (double)(ru.ri_cycles - pru.ri_cycles);
             double ins = (double)(ru.ri_instructions - pru.ri_instructions);
             double qf = (have_pe && pe.magic == 0x3130305058444d4dLL && pe.qpf) ? 1000.0 / (double)pe.qpf : 0;
+            ios_power_gov_step( ios_bg_now_ns(), dt_ms, (double)(ru.ri_energy_nj - pru.ri_energy_nj) / 1e6 );
+            {   /* madeira-bcd fps-gov (opt-in): the frame cap, and madeira-d3d12's copy of it */
+                static int64_t prev_t_cap;
+                volatile struct ios_xp_pe_cap *pc = ios_xp_pe_block && ios_xp_pe_len >= sizeof(pe) + sizeof(struct ios_xp_pe_cap)
+                                                    ? (volatile struct ios_xp_pe_cap *)(uintptr_t)(ios_xp_pe_block + sizeof(pe)) : NULL;
+                double paced_ms = __atomic_exchange_n( &ios_fps_paced_ns, 0, __ATOMIC_RELAXED ) / 1e6;
+                if (pc && qf) { int64_t t = pc->t_cap; if (prev_t_cap && t >= prev_t_cap) paced_ms += (t - prev_t_cap) * qf; prev_t_cap = t; }
+                ios_fps_gov_step( ios_bg_now_ns(), dt_ms, (double)(ru.ri_energy_nj - pru.ri_energy_nj) / 1e6, ios_fps_presents, paced_ms );
+                if (pc && pe.magic == 0x3130305058444d4dLL && ios_fps_gov_armed && pc->fps_cap != ios_fps_cap) pc->fps_cap = ios_fps_cap;
+            }
             gettimeofday( &tv, NULL ); localtime_r( &tv.tv_sec, &tmv );
             snprintf( wall, sizeof(wall), "%02d:%02d:%02d.%03d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (int)(tv.tv_usec / 1000) );
             n = snprintf( line, sizeof(line),
@@ -1855,6 +2619,11 @@ static void ios_xprobe_main( void )
                 wine_log_write( "%s", line );
             }
             if (!(gen & 3)) ios_xp_api_report( wall, XP_MS( now - t_start ) / 1000.0 );   /* ml1131: ~1 s */
+            if (ios_power_probe_on)   /* madeira-bcd power probe: every 5 s; ri_penergy_nj is the uint64 after ri_energy_nj in v6 */
+                ios_power_probe_tick( wall, ios_bg_now_ns(), dt_ms, (double)(ru.ri_energy_nj - pru.ri_energy_nj) / 1e6,
+                                      (double)((&ru.ri_energy_nj)[1] - (&pru.ri_energy_nj)[1]) / 1e6,
+                                      (double)(ru.ri_billed_energy - pru.ri_billed_energy) / 1e6,
+                                      (double)(ru.ri_serviced_energy - pru.ri_serviced_energy) / 1e6 );
         }
         else if (ru_rc && gen < 4) wine_log_write( "[xp] ml1128 proc_pid_rusage v6 failed rc=%d errno=%d", ru_rc, errno );
         if (!ru_rc) { pru = ru; have_ru = 1; }
@@ -2012,16 +2781,31 @@ static void ios_wprof_main( void )
     }
 }
 
+/* madeira-bcd lean-diag: env.MADEIRA_LEAN_DIAG = 1 (opt-in, read once where the
+ * samplers are armed). The periodic diagnostics that suspend threads stop: the
+ * [thread-sample] bursts (every thread suspended 4x every 20 s), the guest RIP
+ * profile behind [rip-profile]/[cpu-split] (the game's threads suspended ~2,400
+ * times in the second after each burst, by a utility-QoS thread that can be
+ * preempted while it holds one) and the [wprof] W-thread profiler. [sync-census]
+ * keeps its 20 s line and [xp]/[xp-t]/[xp-api]/[xp-api-top] keep their rates, so
+ * abline, bucket, xptphase, energyfit, clampstats and apitop read the same
+ * fields; tstime has no [thread-sample] lines to tag. The memory walks of
+ * virtual_ios.c's warmer thread run every ~10 min instead of every minute. */
+static int ios_lean_diag;
+
 static void ios_thread_sampler_main(void)
 {
     int gen = 0;
     ios_ts_calibrate();
-    wine_log_write("[thread-sample] ml876 armed (task-wide: burst of 4 passes / 250 ms every 20 s)");
+    wine_log_write(ios_lean_diag ? "[thread-sample] ml876 armed for [sync-census] only (MADEIRA_LEAN_DIAG: no bursts, no guest RIP profile)"
+                                 : "[thread-sample] ml876 armed (task-wide: burst of 4 passes / 250 ms every 20 s)");
     for (;;) {
         int b;
         sleep(20);
+        if (!ios_lean_diag) {
         for (b = 0; b < 4; b++) { ios_thread_sampler_pass(b); usleep(250000); }
         wine_log_write("[thread-sample] ml876 burst done");
+        }
         {   /* ml1115: alert (futex) traffic since the last burst, per second */
             extern volatile long long ios_alert_wakes, ios_alert_waits, ios_qpc_syscalls, ios_affinity_sets; extern volatile int ios_srv_req_count;
             extern volatile long long ios_alert_lat_n, ios_alert_lat_ticks, ios_alert_lat_hist[6], ios_alert_spin_tries, ios_alert_spin_hits;
@@ -2052,7 +2836,7 @@ static void ios_thread_sampler_main(void)
         /* ml979: profile the guest every third burst (~once a minute). Two
          * successive profiles are what distinguish a loop from a sweep: a
          * sweep's span and bucket set move, a loop's do not. */
-        ++gen; ios_guest_rip_profile( gen );   /* ml1123: every burst (was every third) */
+        if (!ios_lean_diag) { ++gen; ios_guest_rip_profile( gen ); }   /* ml1123: every burst (was every third) */
     }
 }
 
@@ -2114,6 +2898,7 @@ unsigned int server_call_unlocked( void *req_ptr )
 
     ios_srv_req_count++;
 #ifdef WINE_IOS
+    ios_bg_qos_check();   /* madeira-bcd: [bg-qos] */
     /* killed inside a section (ios_defer_section_abort): no more requests */
     if (ios_section_state() & IOS_SECTION_ABORT) return STATUS_THREAD_IS_TERMINATING;
     if (__atomic_load_n( &g_madeira_srv_direct, __ATOMIC_RELAXED ) > 0 && ios_srv_try_direct( req, &ret ))
@@ -4929,9 +5714,19 @@ void server_init_process_done(void)
          * ios_thread_sampler_main() above. */
         if (__sync_bool_compare_and_swap(&ios_ts_armed, 0, 1))
         {
+            /* 1: no thread-suspending samplers ([thread-sample], [rip-profile], [cpu-split], [wprof]) and rare memory walks; [xp] unchanged */
+            const char *lean_env = getenv("MADEIRA_LEAN_DIAG");
+            /* 1: a [power] line every 5 s (coalition GPU energy, IOReport, battery) and [power-t] (energy per thread) */
+            const char *probe_env = getenv("MADEIRA_POWER_PROBE");
+            ios_lean_diag = lean_env && *lean_env && strcmp(lean_env, "0") != 0;
+            ios_power_probe_on = probe_env && *probe_env && strcmp(probe_env, "0") != 0;
+            if (ios_lean_diag)
+                wine_log_write("[lean-diag] madeira-bcd MADEIRA_LEAN_DIAG=%s: [thread-sample] bursts, guest RIP profile ([rip-profile], "
+                               "[cpu-split]) and [wprof] off; [sync-census] every 20 s and [xp]/[xp-t]/[xp-api] every 250 ms / 1 s as "
+                               "before; the warmer's memory walks every ~10 min", lean_env);
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_thread_sampler_main(); });
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_xprobe_main(); });   /* ml1128 */
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_wprof_main(); });   /* ml1129 */
+            if (!ios_lean_diag) dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_wprof_main(); });   /* ml1129 */
         }
         if (!getenv("MADEIRA_QUIET"))
         {
