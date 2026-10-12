@@ -12282,6 +12282,193 @@ static int get_unix_prot( BYTE vprot )
 /***********************************************************************
  *           dump_view
  */
+#ifdef WINE_IOS
+/* Called with virtual_mutex held, only after a constrained FEX allocation
+ * fails. Count live views, rather than ALLOC/COMMIT events (which count the
+ * same span repeatedly). Read only Wine's native protection bookkeeping;
+ * never read guest/FEX payloads or reclaim a live or dead thread's memory. */
+static void ios_fex_arena_census( void *start, void *end, size_t request, size_t align_mask )
+{
+    struct fex_va_bucket { size_t size, bytes, committed; unsigned flags, views; } buckets[32] = {{0}};
+    struct file_view *view;
+    ULONG_PTR lo = ios_fex_arena_base_unix, hi = ios_fex_arena_end_unix, cursor;
+    size_t covered = 0, committed = 0, overlap = 0, biggest = 0, aligned_biggest = 0;
+    size_t other_bytes = 0, other_committed = 0;
+    unsigned nviews = 0, holes = 0, used = 0, other_views = 0, i, j;
+    static unsigned printed;
+
+    if (printed || !lo || hi <= lo || (ULONG_PTR)start < lo || (ULONG_PTR)end > hi ||
+        (ULONG_PTR)start >= (ULONG_PTR)end || !page_size) return;
+    printed = 1;
+    cursor = lo;
+    WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+    {
+        ULONG_PTR b = (ULONG_PTR)view->base, e, first, fresh, p;
+        size_t vc = 0;
+
+        if (b >= hi) break;
+        e = view->size > ~(ULONG_PTR)0 - b ? ~(ULONG_PTR)0 : b + view->size;
+        if (e <= lo || e <= b) continue;
+        if (b < lo) b = lo;
+        if (e > hi) e = hi;
+        nviews++;
+        if (b > cursor)
+        {
+            size_t gap = b - cursor;
+            ULONG_PTR aligned;
+            holes++;
+            if (gap > biggest) biggest = gap;
+            if (cursor <= ~(ULONG_PTR)0 - align_mask)
+            {
+                aligned = (cursor + align_mask) & ~(ULONG_PTR)align_mask;
+                if (aligned < b && b - aligned > aligned_biggest) aligned_biggest = b - aligned;
+            }
+        }
+        first = b;
+        fresh = b > cursor ? b : cursor;
+        if (b < cursor) overlap += (e < cursor ? e : cursor) - b;
+        if (e > fresh) covered += e - fresh;
+        if (e > cursor) cursor = e;
+        for (p = first; p < e; )
+        {
+            size_t bytes = e - p < page_size ? e - p : page_size;
+            if (get_page_vprot( (void *)p ) & VPROT_COMMITTED)
+            {
+                vc += bytes;
+                if (p >= fresh) committed += bytes;
+                else if (p + bytes > fresh) committed += p + bytes - fresh;
+            }
+            p += bytes;
+        }
+        for (i = 0; i < used; i++)
+            if (buckets[i].size == view->size && buckets[i].flags == view->protect) break;
+        if (i == used && used < ARRAY_SIZE(buckets))
+        {
+            buckets[i].size = view->size;
+            buckets[i].flags = view->protect;
+            used++;
+        }
+        if (i < used)
+        {
+            buckets[i].views++;
+            buckets[i].bytes += e - b;
+            buckets[i].committed += vc;
+        }
+        else
+        {
+            other_views++;
+            other_bytes += e - b;
+            other_committed += vc;
+        }
+    }
+    if (cursor < hi)
+    {
+        size_t gap = hi - cursor;
+        ULONG_PTR aligned;
+        holes++;
+        if (gap > biggest) biggest = gap;
+        if (cursor <= ~(ULONG_PTR)0 - align_mask)
+        {
+            aligned = (cursor + align_mask) & ~(ULONG_PTR)align_mask;
+            if (aligned < hi && hi - aligned > aligned_biggest) aligned_biggest = hi - aligned;
+        }
+    }
+    dprintf( 2, "[fex-va] live arena=%p..%p failed_range=%p..%p request=0x%llx align_mask=0x%llx "
+                "views=%u covered=0x%llx free=0x%llx committed=0x%llx overlap=0x%llx "
+                "holes=%u maxgap=0x%llx max_aligned_gap=0x%llx (virtual bytes, not residency)\n",
+             (void *)lo, (void *)hi, start, end, (unsigned long long)request, (unsigned long long)align_mask,
+             nviews, (unsigned long long)covered, (unsigned long long)(hi - lo - covered),
+             (unsigned long long)committed, (unsigned long long)overlap, holes,
+             (unsigned long long)biggest, (unsigned long long)aligned_biggest );
+    /* Largest consumers first, at most 32 buckets plus one overflow line. */
+    for (i = 0; i < used; i++)
+    {
+        unsigned largest = i;
+        struct fex_va_bucket tmp;
+        for (j = i + 1; j < used; j++) if (buckets[j].bytes > buckets[largest].bytes) largest = j;
+        tmp = buckets[i]; buckets[i] = buckets[largest]; buckets[largest] = tmp;
+        dprintf( 2, "[fex-va] size=0x%llx view_flags=0x%x views=%u reserved=0x%llx committed=0x%llx\n",
+                 (unsigned long long)buckets[i].size, buckets[i].flags, buckets[i].views,
+                 (unsigned long long)buckets[i].bytes, (unsigned long long)buckets[i].committed );
+    }
+    if (other_views)
+        dprintf( 2, "[fex-va] other_sizes views=%u reserved=0x%llx committed=0x%llx\n",
+                 other_views, (unsigned long long)other_bytes, (unsigned long long)other_committed );
+}
+
+/* madeira-bcd: how close the FEX arena is to full while things still work.
+ * Grand Theft Auto V Enhanced through the Rockstar Games Launcher (build 434,
+ * log 2026-10-07 20:51) stopped in FEXAlloc with the arena 95% covered
+ * (11.4 of 12 GB, 262 threads) and 593 MB free in 1052 holes, none with a
+ * 4 MB-aligned 4 MB gap; the next start of the same build played. Without a
+ * failure nothing said how close a run came. Called with virtual_mutex held
+ * after a successful placement inside the arena: a line every 30 s and when
+ * free space first drops below 3, 2, 1 and 0.5 GB (200 lines at most),
+ * measured at most once a second. Views only, no page scan.
+ * MADEIRA_FEX_HEADROOM_LOG=0 turns it off. */
+static void ios_fex_arena_headroom( void *start, void *end )
+{
+    static const size_t marks[] = { 3ull << 30, 2ull << 30, 1ull << 30, 512ull << 20 };
+    static unsigned next_mark, lines;
+    static long long next_ns, next_walk_ns;
+    static int on = -1;
+    const ULONG_PTR align_mask = 0x3fffff;  /* rpmalloc's 4 MB medium pages, what failed */
+    struct file_view *view;
+    ULONG_PTR lo = ios_fex_arena_base_unix, hi = ios_fex_arena_end_unix, cursor;
+    size_t covered = 0, biggest = 0, aligned_biggest = 0, free_bytes;
+    unsigned nviews = 0, holes = 0, crossed = 0;
+    struct timespec ts;
+    long long now;
+
+    if (on < 0) { const char *e = getenv( "MADEIRA_FEX_HEADROOM_LOG" ); on = !(e && e[0] == '0'); }  /* 0: no [fex-headroom] lines */
+    if (!on || lines >= 200 || !lo || hi <= lo) return;
+    if ((ULONG_PTR)start < lo || (ULONG_PTR)end > hi) return;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    now = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    if (now < next_walk_ns) return;   /* the walk costs every view: once a second at most */
+    next_walk_ns = now + 1000000000LL;
+
+    cursor = lo;
+    WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+    {
+        ULONG_PTR b = (ULONG_PTR)view->base, e;
+
+        if (b >= hi) break;
+        e = view->size > ~(ULONG_PTR)0 - b ? ~(ULONG_PTR)0 : b + view->size;
+        if (e <= lo || e <= b) continue;
+        if (b < lo) b = lo;
+        if (e > hi) e = hi;
+        nviews++;
+        if (b > cursor)
+        {
+            ULONG_PTR aligned = (cursor + align_mask) & ~align_mask;
+            holes++;
+            if (b - cursor > biggest) biggest = b - cursor;
+            if (aligned < b && b - aligned > aligned_biggest) aligned_biggest = b - aligned;
+        }
+        if (e > cursor) { covered += e - (b > cursor ? b : cursor); cursor = e; }
+    }
+    if (cursor < hi)
+    {
+        ULONG_PTR aligned = (cursor + align_mask) & ~align_mask;
+        holes++;
+        if (hi - cursor > biggest) biggest = hi - cursor;
+        if (aligned < hi && hi - aligned > aligned_biggest) aligned_biggest = hi - aligned;
+    }
+    free_bytes = hi - lo - covered;
+    while (next_mark < ARRAY_SIZE(marks) && free_bytes < marks[next_mark]) { next_mark++; crossed = 1; }
+    if (!crossed && now < next_ns) return;
+    next_ns = now + 30000000000LL;
+    lines++;
+    dprintf( 2, "[fex-headroom] arena=%p..%p used=%lluMB free=%lluMB (%u%% used) holes=%u maxgap=%lluKB "
+                "max_4mb_aligned_gap=%lluKB views=%u%s (MADEIRA_FEX_HEADROOM_LOG=0 disables)\n",
+             (void *)lo, (void *)hi, (unsigned long long)(covered >> 20), (unsigned long long)(free_bytes >> 20),
+             (unsigned)((unsigned long long)covered * 100 / (hi - lo)), holes,
+             (unsigned long long)(biggest >> 10), (unsigned long long)(aligned_biggest >> 10), nviews,
+             crossed ? " (threshold crossed)" : "" );
+}
+#endif
+
 static void dump_view( struct file_view *view )
 {
     UINT i, count;
@@ -18923,6 +19110,9 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         if ((ptr = map_reserved_area( start, end, host_size, top_down, unix_prot, align_mask )))
         {
             TRACE( "got mem in reserved area %p-%p\n", ptr, (char *)ptr + size );
+#ifdef WINE_IOS
+            ios_fex_arena_headroom( start, end );
+#endif
             goto done;
         }
 
@@ -18991,6 +19181,10 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                                                        : "  <-- STATUS_NO_MEMORY (callers see a NULL alloc)") );
                 }
             }
+#ifdef WINE_IOS
+            if (!ptr) ios_fex_arena_census( start, end, size, align_mask );
+            else ios_fex_arena_headroom( start, end );
+#endif
             if (ptr)
             {
                 TRACE( "got mem with map_free_area %p-%p\n", ptr, (char *)ptr + size );
