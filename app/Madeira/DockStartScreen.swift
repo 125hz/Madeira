@@ -199,9 +199,11 @@ enum DockStartStatus {
     /// installs first; `installerProgress`: their progress in words;
     /// `installsFinished`: they ended, and the host starts next. `waited`: seconds
     /// since the host could start (the start began, or the installs finished); it
-    /// only matters before the host's first field.
+    /// only matters before the host's first field. madeira-bcd: `restartHint`, for a session
+    /// that runs only the installs (DockInstallers.installsOnly): no host follows them; the
+    /// hint (the session closes, then Madeira asks for a restart) does.
     static func text(_ fields: [String: String], installers: Bool, installerProgress: String?,
-                     installsFinished: Bool, waited: Double) -> String {
+                     installsFinished: Bool, waited: Double, restartHint: String? = nil) -> String {
         if fields["launch-option-missing"] != nil || fields["launch-option-invalid"] != nil {
             return "Steam rejected this game's launch option."
         }
@@ -238,6 +240,7 @@ enum DockStartStatus {
         let starting = waited >= slowAfter ? "Still starting Madeira Dock…" : "Starting Madeira Dock…"
         guard installers else { return starting }
         guard installsFinished else { return installerProgress ?? "Running this game's one-time installs…" }
+        if let restartHint { return (installerProgress ?? "One-time installs finished.") + "\n" + restartHint }
         return (installerProgress ?? "One-time installs finished.") + "\n" + starting
     }
 

@@ -1345,6 +1345,9 @@ struct ContentView: View {
                 DeviceLoadDiagnostics.start()
                 // Madeira Dock: an unconsumed sign-in transfer from an earlier run goes.
                 if wine_process_is_running() == 0 { MadeiraDock.cleanup() }
+                // madeira-bcd: the Dock's Reset sets the VC++ markers back to a new prefix's
+                // values, read from the bundled prefix template (DockReset.swift).
+                DockReset.baselineProvider = { DockReset.templateRegistry { madeira_extract_prefix_tgz($0, $1) } }
             }
             .onReceive(NotificationCenter.default.publisher(for: SteamSignIn.didChange)) { _ in
                 if !SteamSignIn.isSignedIn { MadeiraDock.cleanup() }
@@ -2611,6 +2614,13 @@ struct ContentView: View {
             if let profile {
                 profile.applyEnvironment()
                 logStore.log("[launch-route] library profile applied")
+                // madeira-bcd: a Dock session of one-time installs runs without the game's
+                // address-space holds, which leave its 32-bit setups no room.
+                let dropped = DockInstallers.applyInstallSessionConfig()
+                if !dropped.isEmpty {
+                    logStore.log("[dock-installers] this session of one-time installs leaves out the game's " +
+                                 dropped.sorted().joined(separator: ", ") + " (MADEIRA_DOCK_INSTALL_LAYOUT=0 keeps them)")
+                }
             } else {
                 _ = try? MadeiraConfig.applyGame(nil)   // no library game: no game's own lines
             }
@@ -3312,7 +3322,19 @@ struct ContentView: View {
             MadeiraDock.configure(game, launchOption: launchOption)
             // The game's one-time installs (its Steam install script) run first, in the same
             // session. No session runs yet, so the registry files can be read and written.
-            DockInstallers.prepare(game, drive: MadeiraDock.drive, prefix: MadeiraDock.prefix)
+            // madeira-bcd: they run in a session of their own (DockInstallers.installsOnly), and
+            // a Reset takes out what they installed; the other games share those installs.
+            DockInstallers.prepare(game, drive: MadeiraDock.drive, prefix: MadeiraDock.prefix,
+                                   others: MadeiraDock.games(drive: MadeiraDock.drive))
+            if DockInstallers.installsOnly {
+                // No host runs in this session: nothing will take the sign-in transfer.
+                MadeiraDock.cleanup()
+                logStore.log("[madeira-dock] app \(game.id): this session runs only the one-time installs; the host starts after a restart")
+                // The launch leaves out the game's address-space holds (DockInstallers.applyInstallSessionConfig).
+                setenv("MADEIRA_DOCK_INSTALLS_SESSION", "1", 1)
+            } else {
+                unsetenv("MADEIRA_DOCK_INSTALLS_SESSION")
+            }
             // Only a start that runs installers turns madsync off, for its own session
             // (build/madsync/madsync.c reads MADEIRA_MADSYNC_SESSION once, when the server starts).
             if DockInstallers.serverSync {
@@ -3345,7 +3367,8 @@ struct ContentView: View {
                 width = size[0]; height = size[1]
             }
             setenv("MADEIRA_EXE", "explorer.exe", 1)
-            setenv("MADEIRA_ARGS", MadeiraDock.launchArguments(width: width, height: height, installers: DockInstallers.script), 1)
+            setenv("MADEIRA_ARGS", MadeiraDock.launchArguments(width: width, height: height, installers: DockInstallers.script,
+                                                               host: !DockInstallers.installsOnly), 1)
             setenv("MADEIRA_DESKTOP", "1", 1)
             setenv("MADEIRA_SCREEN_W", String(width), 1)
             setenv("MADEIRA_SCREEN_H", String(height), 1)
@@ -3354,7 +3377,9 @@ struct ContentView: View {
             // start this session from its own desktop size, not a previous one.
             winios_display_mode_changed(Int32(width), Int32(height))
             MadeiraDock.requestLaunch(compactPool: compactPool)
-            logStore.log("[madeira-dock] starting the host for app \(game.id); Valve's client authenticates and authorizes the launch")
+            if !DockInstallers.installsOnly {
+                logStore.log("[madeira-dock] starting the host for app \(game.id); Valve's client authenticates and authorizes the launch")
+            }
             MadeiraDockModel.shared.watchReport()
             if inLibrary {
                 if let profile { library.begin(profile, dock: game) }

@@ -11,6 +11,8 @@
 #import "SwiftSteam/lzma_shim.h"
 // On-device remote pairing for Built-in StikJIT (build/rppairing-ios, JITPairing.swift).
 #import "MadeiraRPPairing.h"
+// madeira-bcd: the bundled prefix template, read by the Dock's Reset (DockReset.swift).
+#include "PrefixExtractor.h"
 
 // Wine file-based logging (server_ios.c)
 void wine_log_set_file(const char *path);

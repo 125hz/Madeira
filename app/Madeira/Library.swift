@@ -3980,7 +3980,8 @@ struct LibraryHUD: View {
             let hostDue = DockInstallers.finishedAt ?? model.launchStartedAt
             return DockStartStatus.text(MadeiraDock.pollReport().fields, installers: DockInstallers.script != nil,
                                         installerProgress: progress, installsFinished: DockInstallers.finishedAt != nil,
-                                        waited: Date().timeIntervalSince(hostDue))
+                                        waited: Date().timeIntervalSince(hostDue),
+                                        restartHint: DockInstallers.installsOnly ? DockInstallers.closingWords : nil)
         }
     }
 
