@@ -100,6 +100,11 @@ ULONG_PTR ios_fex_arena_base_unix = 0x7c00000000ULL, ios_fex_arena_end_unix = 0x
 void *ios_jit_rw_base_global = (void *)0x7000000000ULL;   /* numerically inside the band on purpose */
 void *ios_jit_rx_base_global = (void *)0x119400000ULL;
 size_t ios_jit_pool_size_global = 0x20000000;
+/* madeira-bcd pool-low (region C) is off here: no region, every test on it is 0 */
+uintptr_t ios_jit_low_rx_global, ios_jit_low_rw_global;
+size_t ios_jit_low_size_global;
+static int ios_jit_low_overlaps( uintptr_t a, size_t size )
+''' + body_of(virt, 'static int ios_jit_low_overlaps(') + r'''
 /* Wine's rules (unix_private/virtual.c), EXEC mapped to read for the test */
 static int get_unix_prot( unsigned char v )
 {

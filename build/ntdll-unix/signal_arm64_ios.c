@@ -120,6 +120,16 @@ WINE_DEFAULT_DEBUG_CHANNEL(seh);
  * Gate the WORK, not the print — several probes do expensive reads first. */
 extern volatile int madeira_diag_enabled;
 
+/* madeira-bcd pool-low (virtual_ios.c, ios_jit_low_rx_global): region C, a third
+ * debugger region below the executable window that holds FEX code buffers, outside
+ * the pool span [rx, rx + size) but at the pool's RX->RW distance, so rw + (a - rx)
+ * is still its writable alias. Every "is this pc / store target JIT code?" test in
+ * this file that decides handling asks these as well; both are 0 without it. */
+extern int ios_jit_low_contains( uintptr_t a );
+extern int ios_jit_low_rw_contains( uintptr_t a );
+extern uintptr_t ios_jit_low_rx_global;
+extern size_t ios_jit_low_size_global;
+
 
 /* ml648: defined in virtual_ios.c, called from the SWPAL emulation path. */
 void ios_mono_bridge_capture( unsigned long long teb, unsigned long long frame,
@@ -2163,7 +2173,11 @@ static void *ios_mach_exception_thread( void *arg )
                     uintptr_t jit_rx = (uintptr_t)ios_jit_rx_base_global;
                     size_t jit_sz = ios_jit_pool_size_global;
 
-                    if (fault_pc >= jit_rx && fault_pc < jit_rx + jit_sz)
+                    /* madeira-bcd pool-low: region C is pool code too (nothing there
+                     * is an image, so this branch does nothing for it -- as for the
+                     * tail -- instead of trying an image translation) */
+                    if ((fault_pc >= jit_rx && fault_pc < jit_rx + jit_sz) ||
+                        ios_jit_low_contains( (uintptr_t)fault_pc ))
                     {
                         /* Exec fault IN JIT pool — only fixable if in .text (x18 issue) */
                         if (ios_jit_addr_is_text(fault_pc) && state.__x[18] == 0 && thread_teb && thread_trampoline)
@@ -2254,8 +2268,9 @@ static void *ios_mach_exception_thread( void *arg )
                             uintptr_t rw_base = (uintptr_t)ios_jit_rw_base_global;
                             uintptr_t rx_base2 = (uintptr_t)ios_jit_rx_base_global;
                             if (rw_base && rx_base2 && ios_jit_pool_size_global &&
-                                fault_pc >= rw_base &&
-                                fault_pc < rw_base + ios_jit_pool_size_global)
+                                ((fault_pc >= rw_base &&
+                                  fault_pc < rw_base + ios_jit_pool_size_global) ||
+                                 ios_jit_low_rw_contains( (uintptr_t)fault_pc )))   /* madeira-bcd pool-low */
                             {
                                 uintptr_t rx_pc = (uintptr_t)fault_pc - rw_base + rx_base2;
                                 jit_pc = (void *)rx_pc;
@@ -2625,7 +2640,10 @@ static void *ios_mach_exception_thread( void *arg )
                 size_t sz = ios_jit_pool_size_global;
                 uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
 
-                if (rx && rw && sz && fault_pc >= rx && fault_pc < rx + sz)
+                /* madeira-bcd pool-low: FEX code in region C is backpatched the same
+                 * way; its alias is at the same distance, so rw + (pc - rx) holds. */
+                if (rx && rw && sz && ((fault_pc >= rx && fault_pc < rx + sz) ||
+                                       ios_jit_low_contains( (uintptr_t)fault_pc )))
                 {
                     uintptr_t rw_pc = rw + (fault_pc - rx);
                     uint32_t insn; ios_fault_read_insn( (uint64_t)(uintptr_t)fault_pc, &insn );  /* ml982 */
@@ -3109,8 +3127,12 @@ static void *ios_mach_exception_thread( void *arg )
                  * the secondary alias table to find the user_VA → RW alias
                  * mapping. */
                 uintptr_t rw_addr = 0;
+                /* madeira-bcd pool-low: a store into region C (FEX code buffers) is
+                 * routed the same way -- its alias is at the pool's distance. in_low
+                 * keeps the bounds checks below to C's own extent. */
+                int in_low = rx && rw && sz && ios_jit_low_contains( (uintptr_t)fault_addr );
                 int in_jit = (rx && rw && sz &&
-                              fault_addr >= rx && fault_addr < rx + sz);
+                              fault_addr >= rx && fault_addr < rx + sz) || in_low;
                 if (in_jit) {
                     rw_addr = rw + (fault_addr - rx);
                 } else {
@@ -3211,7 +3233,8 @@ static void *ios_mach_exception_thread( void *arg )
 
                         /* The WHOLE 32-byte destination must live in the SAME alias, or the
                          * second copy would land outside it. */
-                        uintptr_t rw_end = in_jit ? (uintptr_t)(rw + ((fault_addr + 31) - rx))
+                        uintptr_t rw_end = in_jit ? ((in_low && !ios_jit_low_contains( (uintptr_t)fault_addr + 31 ))
+                                                     ? 0 : (uintptr_t)(rw + ((fault_addr + 31) - rx)))
                                                   : (uintptr_t)ios_jit_anon_alias_lookup( fault_addr + 31 );
                         if (!rw_end || rw_end != (uintptr_t)rw_addr + 31)
                         {
@@ -3918,7 +3941,12 @@ static void *ios_mach_exception_thread( void *arg )
                         (insn & 0xbfa07c00u) == 0x88a07c00u)
                     {
                         unsigned cas_width = (insn & 0x40000000u) ? 8 : 4;
-                        if (sz >= cas_width && fault_addr - rx <= sz - cas_width &&
+                        /* madeira-bcd pool-low: within region C for a lock word there */
+                        int cas_inside = in_low
+                            ? ios_jit_low_size_global >= cas_width &&
+                              fault_addr - ios_jit_low_rx_global <= ios_jit_low_size_global - cas_width
+                            : sz >= cas_width && fault_addr - rx <= sz - cas_width;
+                        if (cas_inside &&
                             ios_mach_emulate_cas(insn, rw_addr, state.__x))
                         {
                             static unsigned cas_mach_logs;
@@ -4373,7 +4401,8 @@ wx_done: ;
                     extern void *ios_jit_rx_base_global;
                     extern size_t ios_jit_pool_size_global;
                     uint64_t rx = (uint64_t)(uintptr_t)ios_jit_rx_base_global;
-                    int in_pool_rx = rx && fa >= rx && fa < rx + ios_jit_pool_size_global;
+                    int in_pool_rx = (rx && fa >= rx && fa < rx + ios_jit_pool_size_global) ||
+                                     ios_jit_low_contains( (uintptr_t)fa );   /* madeira-bcd pool-low */
                     int in_band    = (fa >= 0x7C00000000ULL && fa < 0x8000000000ULL);
 
                     if (in_pool_rx || in_band)
@@ -4484,7 +4513,8 @@ wx_done: ;
                     extern size_t ios_jit_pool_size_global;
                     uintptr_t rwb = (uintptr_t)ios_jit_rw_base_global;
                     if (rwb && ios_jit_pool_size_global &&
-                        fa >= rwb && fa < rwb + ios_jit_pool_size_global)
+                        ((fa >= rwb && fa < rwb + ios_jit_pool_size_global) ||
+                         ios_jit_low_rw_contains( (uintptr_t)fa )))   /* madeira-bcd pool-low */
                         goto skip_reclaim_band;
                 }
                 if (!handled && fa != (uint64_t)fault_pc &&
@@ -4581,6 +4611,34 @@ wx_done: ;
                     }
                 }
 skip_reclaim_band: ;
+            }
+
+            /* madeira-bcd: a thread of an EXITED pseudo-process woke into its
+             * reclaimed JIT copies; its ntdll copy is gone too, so guest SEH can
+             * only re-fault until the ml461/ml465 terminal kills the whole app
+             * (gta-2237: tid 014c, the thread-pool worker of the exited
+             * "RockstarService.exe stop"). End that thread only -- never through
+             * the exit wrappers, whose fds may belong to another thread by now. */
+            if (!handled && thread_teb &&
+                (req->exception == EXC_BAD_ACCESS || req->exception == EXC_BAD_INSTRUCTION))
+            {
+                extern int ios_peb_is_dead( const void *peb );
+                void *zpeb = NULL;
+                vm_size_t zsz = sizeof(zpeb);
+                if (vm_read_overwrite( mach_task_self(), (vm_address_t)(thread_teb + offsetof(TEB, Peb)),
+                                       sizeof(zpeb), (vm_address_t)&zpeb, &zsz ) == KERN_SUCCESS &&
+                    zsz == sizeof(zpeb) && ios_peb_is_dead( zpeb ))
+                {
+                    static int zombie_n;
+                    kern_return_t zkr = thread_terminate( thread );
+                    if (zkr != KERN_SUCCESS) zkr = thread_suspend( thread );
+                    if (zombie_n++ < 16)
+                        dprintf( 2, "[zombie] teb=%p of exited peb=%p faulted pc=0x%llx addr=0x%llx -- "
+                                    "ended this thread only (kr=%d)\n", (void *)thread_teb, zpeb,
+                                 (unsigned long long)__darwin_arm_thread_state64_get_pc( state ),
+                                 (unsigned long long)fault_addr, (int)zkr );
+                    handled = 1;   /* thread_set_state on the ended thread below is harmless */
+                }
             }
 
             /* ml369 (#63): last-resort in-process guest exception delivery.
@@ -6494,7 +6552,11 @@ NTSTATUS signal_set_full_context( CONTEXT *context )
         uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
         size_t psz = ios_jit_pool_size_global;
 
-        if (rx && psz && frame->pc >= rx && frame->pc < rx + psz)
+        /* madeira-bcd pool-low: FEX's code buffers in region C are pool code
+         * too -- a resume there bounced through the emulation dispatcher would
+         * make the guest "execute" FEX's own code. */
+        if ((rx && psz && frame->pc >= rx && frame->pc < rx + psz) ||
+            ios_jit_low_contains( (uintptr_t)frame->pc ))
         {
             static int bounce_saved;
             if (bounce_saved < 16 && ++bounce_saved <= 16)
@@ -7290,7 +7352,8 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
              *     host/system code (guest code runs from the pool, and PE
              *     modules are not Mach-O images so dladdr cannot name them) */
             {
-                int in_pool = rxb && pc >= rxb && pc < rxb + ios_jit_pool_size_global;
+                int in_pool = (rxb && pc >= rxb && pc < rxb + ios_jit_pool_size_global) ||
+                              ios_jit_low_contains( (uintptr_t)pc );   /* madeira-bcd pool-low */
                 Dl_info dli;
 
                 if (!ios_thread_is_registered( thread ) && state->__x[18] == 0 && !in_pool
@@ -7698,6 +7761,7 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
      * Host dylib and unix-side pcs keep the old decline path —
      * dispatching a guest exception on those contexts would be wrong. */
     if (!((rxb && pc >= rxb && pc < rxb + ios_jit_pool_size_global) ||
+          ios_jit_low_contains( (uintptr_t)pc ) ||   /* madeira-bcd pool-low: FEX code in region C */
           pc < 0x100000000ULL ||
           (pc >= 0x7000000000ULL && pc < 0x7400000000ULL)))
         return 0;
@@ -8361,7 +8425,9 @@ static inline void ios_fixup_x18_for_return( ucontext_t *context )
     uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
     size_t sz = ios_jit_pool_size_global;
 
-    if (rx && pc >= rx && pc < rx + sz)
+    /* madeira-bcd pool-low: FEX code in region C needs x18 back exactly like
+     * the pool tail's */
+    if ((rx && pc >= rx && pc < rx + sz) || ios_jit_low_contains( pc ))
     {
         REGn_sig(17, context) = pc;
         PC_sig(context) = (uintptr_t)ios_my_trampoline;
@@ -8377,7 +8443,7 @@ static inline void ios_track_signal( int sig, ucontext_t *context )
     uintptr_t pc = PC_sig(context);
     uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
     size_t sz = ios_jit_pool_size_global;
-    if (rx && pc >= rx && pc < rx + sz)
+    if ((rx && pc >= rx && pc < rx + sz) || ios_jit_low_contains( pc ))   /* madeira-bcd pool-low */
         ios_signal_in_pe++;
 }
 
@@ -8944,6 +9010,7 @@ static int ios_fault_is_foreign( const void *pc, const void *addr )
     /* TEB-less but running emulated code (threads CEF/FEX create directly) */
     if (sz && rx && p >= rx && p < rx + sz) return 0;
     if (sz && rw && p >= rw && p < rw + sz) return 0;
+    if (ios_jit_low_contains( p ) || ios_jit_low_rw_contains( p )) return 0;   /* madeira-bcd pool-low */
     if (p >= 0x7000000000ull && p < 0x8000000000ull) return 0;  /* guest | PA | FEX bands */
 
     /* host code, but touching emulator-managed memory (guard page, pool alias,
@@ -8952,6 +9019,7 @@ static int ios_fault_is_foreign( const void *pc, const void *addr )
     {
         if (sz && rx && a >= rx && a < rx + sz) return 0;
         if (sz && rw && a >= rw && a < rw + sz) return 0;
+        if (ios_jit_low_contains( a ) || ios_jit_low_rw_contains( a )) return 0;   /* madeira-bcd pool-low */
         if (a >= 0x7000000000ull && a < 0x8000000000ull) return 0;
     }
     return 1;
@@ -9889,7 +9957,8 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                     uintptr_t fpc = (uintptr_t)PC_sig(context);
                     static int wide_dumps;
 
-                    if (rxb && fpc >= rxb && fpc < rxb + ios_jit_pool_size_global &&
+                    if (((rxb && fpc >= rxb && fpc < rxb + ios_jit_pool_size_global) ||
+                         ios_jit_low_contains( fpc )) &&   /* madeira-bcd pool-low */
                         wide_dumps < 4)
                     {
                         const uint32_t *w = (const uint32_t *)(fpc - 48);
@@ -10318,6 +10387,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
          * corruption -- measured in ml938. Those come through the Mach handler
          * instead, which sets thread state directly. */
         if (!(sg_rx && sg_pc >= sg_rx && sg_pc < sg_rx + sg_sz) &&
+            !ios_jit_low_contains( sg_pc ) &&   /* madeira-bcd pool-low: region C is a pool PC too */
             ios_subfloor_service( context, siginfo->si_addr, "segv", ios_jit_current_peb() ))
         {
             PC_sig(context) = PC_sig(context) + 4;
@@ -11967,7 +12037,8 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         {
             uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
             size_t pool_sz = ios_jit_pool_size_global;
-            if (rx && (uintptr_t)pc >= rx && (uintptr_t)pc < rx + pool_sz)
+            if ((rx && (uintptr_t)pc >= rx && (uintptr_t)pc < rx + pool_sz) ||
+                ios_jit_low_contains( (uintptr_t)pc ))   /* madeira-bcd pool-low */
             {
                 extern volatile uint64_t g_wine_return_pc;
                 extern volatile uint64_t g_wine_return_x18;
@@ -12033,7 +12104,9 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         uintptr_t rw = (uintptr_t)ios_jit_rw_base_global;
         size_t pool_sz = ios_jit_pool_size_global;
 
-        if (rx && fault >= rx && fault < rx + pool_sz)
+        /* madeira-bcd pool-low: a store into region C goes through its alias at
+         * the same distance (rw_addr below holds for it unchanged) */
+        if ((rx && fault >= rx && fault < rx + pool_sz) || (rx && rw && ios_jit_low_contains( fault )))
         {
             uintptr_t rw_addr = fault - rx + rw;
             uint32_t insn = *(uint32_t *)(uintptr_t)PC_sig(bus_ctx);
@@ -12126,7 +12199,8 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
          *
          * Order: wine repair first; then a safe readability probe decides
          * honest-AV (unreadable) vs genuine-alignment 80000002 (readable). */
-        if (!is_exec_fault && !(rx && fault >= rx && fault < rx + pool_sz))
+        if (!is_exec_fault && !(rx && fault >= rx && fault < rx + pool_sz) &&
+            !(rx && rw && ios_jit_low_contains( fault )))   /* madeira-bcd pool-low */
         {
             EXCEPTION_RECORD vrec = { EXCEPTION_ACCESS_VIOLATION };
             mach_vm_size_t rd_out = 0;
@@ -12190,7 +12264,8 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 
                     ERR("[bus-rgn] si_code=%d addr=%p pc=%p pc_in_pool=%d readable=%d\n",
                         siginfo->si_code, siginfo->si_addr, pc,
-                        (rx && (uintptr_t)pc >= rx && (uintptr_t)pc < rx + pool_sz) ? 1 : 0,
+                        ((rx && (uintptr_t)pc >= rx && (uintptr_t)pc < rx + pool_sz) ||
+                         ios_jit_low_contains( (uintptr_t)pc )) ? 1 : 0,
                         rd_kr == KERN_SUCCESS);
                     if (mach_vm_region( mach_task_self(), &ba, &bs, VM_REGION_BASIC_INFO_64,
                                         (vm_region_info_t)&bbi, &bbc, &bbo ) == KERN_SUCCESS &&
