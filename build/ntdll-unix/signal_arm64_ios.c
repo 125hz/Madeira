@@ -6696,7 +6696,15 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
  * Opt-in, MADEIRA_CTX_CPU_AREA=1 (madeira.cfg env., or a game's own config):
  * the snapshot is the thread's last exit from emulated code, not where it is
  * now, so a caller that writes the context back (SetThreadContext, as a .NET
- * runtime redirecting a thread does) would move the thread back there. */
+ * runtime redirecting a thread does) would move the thread back there.
+ *
+ * MADEIRA_CTX_CPU_AREA=2 also returns the snapshot's integer registers when the
+ * caller asked for CONTEXT_INTEGER (the ARM64EC_NT_CONTEXT registers that hold
+ * x64 state: X0-X12, X15, X19-X22 and X25-X27; the others are zeroed) and sets
+ * Cpsr to 0, so the caller gets one x64 state from a single moment instead of
+ * the snapshot's control registers next to the server's integer registers.
+ * madeira-bcd has run this form by default since its build 213 (2026-09-28),
+ * and its game lists were tested with it. */
 static int ctx_peek( void *dst, const void *src, size_t size )
 {
     mach_vm_size_t got = 0;
@@ -6716,10 +6724,12 @@ static int get_context_from_amd64_area( HANDLE handle, CONTEXT *context, DWORD n
 
     if (on < 0)
     {
-        /* 1: a cross-thread GetThreadContext without control registers gets the target's
-         * saved x64 Pc/Sp/Fp/Lr (default off; a context written back would rewind it). */
+        /* For a cross-thread GetThreadContext without control registers. 1: the target's
+         * Pc/Sp/Fp/Lr from its last exit from emulated code (upstream's opt-in). 2: also
+         * X0-X12, X15, X19-X22, X25-X27 and Cpsr = 0 from the same snapshot (madeira-bcd's
+         * behaviour). Default off: a context written back would rewind the thread. */
         const char *env = getenv( "MADEIRA_CTX_CPU_AREA" );
-        on = env && env[0] == '1';
+        on = !env ? 0 : env[0] == '1' ? 1 : env[0] == '2' ? 2 : 0;
     }
     if (!on) return 0;
     if (NtQueryInformationThread( handle, ThreadBasicInformation, &tbi, sizeof(tbi), NULL )) return 0;
@@ -6729,16 +6739,28 @@ static int get_context_from_amd64_area( HANDLE handle, CONTEXT *context, DWORD n
     if (!ctx_peek( &ecp, &cpu->ContextAmd64, sizeof(ecp) ) || !ecp) return 0;
     if (!ctx_peek( &ec, ecp, sizeof(ec) )) return 0;
     if (!ec.Pc || !ec.Sp) return 0;
+    if (on == 2 && (needed & (CONTEXT_INTEGER & ~CONTEXT_ARM64)))
+    {
+        memset( context->X, 0, sizeof(context->X[0]) * 29 );
+        context->X[0] = ec.X0;   context->X[1] = ec.X1;   context->X[2] = ec.X2;   context->X[3] = ec.X3;
+        context->X[4] = ec.X4;   context->X[5] = ec.X5;   context->X[6] = ec.X6;   context->X[7] = ec.X7;
+        context->X[8] = ec.X8;   context->X[9] = ec.X9;   context->X[10] = ec.X10; context->X[11] = ec.X11;
+        context->X[12] = ec.X12; context->X[15] = ec.X15;
+        context->X[19] = ec.X19; context->X[20] = ec.X20; context->X[21] = ec.X21; context->X[22] = ec.X22;
+        context->X[25] = ec.X25; context->X[26] = ec.X26; context->X[27] = ec.X27;
+        context->ContextFlags |= CONTEXT_INTEGER;
+    }
     context->X[23] = context->X[28] = 0;
     context->Fp = ec.Fp;
     context->Lr = ec.Lr;
     context->Sp = ec.Sp;
     context->Pc = ec.Pc;
+    if (on == 2) context->Cpsr = 0;
     context->ContextFlags |= CONTEXT_CONTROL;
     if (InterlockedIncrement( &said ) <= 8)
         ERR( "[ctx] get handle=%p: no control registers from the server; "
-             "returning the target's saved x64 Pc/Sp/Fp/Lr rip=%p rsp=%p (MADEIRA_CTX_CPU_AREA)\n",
-             handle, (void *)ec.Pc, (void *)ec.Sp );
+             "returning the target's saved x64 %s rip=%p rsp=%p (MADEIRA_CTX_CPU_AREA=%d)\n",
+             handle, on == 2 ? "state" : "Pc/Sp/Fp/Lr", (void *)ec.Pc, (void *)ec.Sp, on );
     return 1;
 }
 
