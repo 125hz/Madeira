@@ -2040,6 +2040,37 @@ NTSTATUS WINAPI NtSuspendThread( HANDLE handle, ULONG *count )
         }
     }
     SERVER_END_REQ;
+#ifdef WINE_IOS
+    /* madeira-bcd: a thread that suspends itself must stop until it is resumed.
+     * Elsewhere the server's SIGUSR1 makes usr1_handler wait in wait_suspend();
+     * on iOS that signal never runs its handler (task #32), so SuspendThread on
+     * oneself returned at once. Crysis's intro-video threads suspend themselves
+     * once per frame and are resumed by the main thread: here they spun instead,
+     * piling the count up to MAXIMUM_SUSPEND_COUNT, and when a video ended the
+     * thread's exit (NtTerminateThread's select) waited on that count forever,
+     * so the main thread sat out a 30 s join timeout between videos
+     * (log 2026-09-30 12:25, build 244). Wait here the way wait_suspend does:
+     * a zero-timeout select only returns once the thread is no longer suspended. */
+    if (!ret)
+    {
+        BOOL self = handle == GetCurrentThread();
+        if (!self)
+        {
+            THREAD_BASIC_INFORMATION tbi;
+            self = !NtQueryInformationThread( handle, ThreadBasicInformation, &tbi, sizeof(tbi), NULL ) &&
+                   HandleToULong( tbi.ClientId.UniqueThread ) == GetCurrentThreadId();
+        }
+        if (self)
+        {
+            static LONG self_suspends;
+            LONG n = InterlockedIncrement( &self_suspends );
+            if (n <= 4 || !(n & (n - 1)))
+                dprintf( 2, "[self-suspend] madeira-bcd: tid=%04x suspended itself (#%d); waiting for the resume\n",
+                         (int)GetCurrentThreadId(), (int)n );
+            server_select( NULL, 0, SELECT_INTERRUPTIBLE, 0, NULL, NULL );
+        }
+    }
+#endif
     return ret;
 }
 
