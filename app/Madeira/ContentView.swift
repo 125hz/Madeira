@@ -2515,6 +2515,11 @@ struct ContentView: View {
     /// applies the entry's launch profile and runs the same full sequence as the
     /// developer interface's buttons.
     private func launchLibraryEntry(_ entry: LibraryEntry) {
+        // madeira-bcd: a game seen for the first time starts with Madeira's recommended
+        // settings (GameRecommendationsApply.swift).
+        var entry = entry
+        let isNew = !library.entries.contains { $0.id == entry.id }
+        if GameRecommendations.prepare(&entry, new: isNew) { library.save(entry) }
         // A Steam game starts through Madeira Dock with its own launch profile (SteamGames.swift),
         // unless its Game details page chose "The game": then its own program starts below, like
         // any library game (SteamDirectStart).
@@ -2523,6 +2528,9 @@ struct ContentView: View {
                 library.error = "Steam no longer lists this game as installed. Refresh the library and try again."; return
             }
             LogStore.shared.log("[steam-games] play app=\(appID)")
+            // madeira-bcd: the game's own options (AVX, NVIDIA, Wine's C++ runtime, its
+            // config file) -- this path never reached BCDLaunch, so a Steam game ran without them.
+            BCDLaunch.applyLibrary(entry)
             startDock(game, compactPool: MadeiraDockModel.shared.compactPool, profile: entry)
             return
         }
@@ -2563,6 +2571,9 @@ struct ContentView: View {
             library.error = "The executable path or launch arguments are too long."; return
         }
         entry.configureLaunch()
+        // madeira-bcd: the game's own options (LibraryBCD.swift).
+        BCDLaunch.applyLibrary(entry)
+        exportBCDDesktopProfile(entry)
         // This run's log under the program's name too (Documents/logs). A Steam game started
         // through Madeira Dock above gets its own from ntdll, once Valve's client starts it.
         let program = entry.desktop == true ? "explorer.exe"
@@ -2570,6 +2581,36 @@ struct ContentView: View {
         LogStore.shared.startSessionLog(program: program)
         library.begin(entry)
         runWineFullSequence(profile: entry)
+    }
+
+    /// madeira-bcd: LibraryPrefs' AVX, NVIDIA and Wine C++ runtime switches for a
+    /// library launch, set again after LibraryEntry.applyEnvironment (which unsets
+    /// what its own fields do not choose). For the Desktop entry too: Game details
+    /// writes them for every entry, and BCDLaunch.applyLibrary clears them there.
+    static func reassertBCDSwitches(_ entry: LibraryEntry) {
+        let path = entry.windowsPath
+        var on: [String] = []
+        if LibraryPrefs.avx(path) { setenv("MADEIRA_FEX_AVX", "1", 1); on.append("avx") }
+        if LibraryPrefs.wineVCRT(path) { setenv("MADEIRA_WINE_VCRT", "1", 1); on.append("wine-vcrt") }
+        if LibraryPrefs.nvidia(path) {
+            setenv("DXMT_ENABLE_NVEXT", "1", 1)
+            setenv("DXMT_WSI_MONITOR_IDENTITY", "1", 1)
+            setenv("DXMT_WSI_MODE_TABLE", "1", 1)
+            if entry.desktop == true, getenv("MADEIRA_DXMT_EXTRA") == nil { setenv("MADEIRA_DXMT_EXTRA", "dxgi.customDeviceId=2544", 1) }
+            on.append("nvidia")
+        }
+        if !on.isEmpty { LogStore.shared.log("[bcd] game switches: \(on.joined(separator: " "))") }
+    }
+
+    /// madeira-bcd: the Desktop entry's own file (Game details writes every entry's
+    /// options to GameProfiles.swift files); BCDLaunch.applyLibrary leaves the
+    /// Desktop without one, so it is exported here, before the session starts.
+    private func exportBCDDesktopProfile(_ entry: LibraryEntry) {
+        guard entry.desktop == true else { return }
+        let file = GameProfile(windowsPath: entry.windowsPath)
+        guard file.hasSettings, let url = file.url else { return }
+        setenv("MADEIRA_CFG_GAME", url.path, 1)
+        logStore.log("[bcd] Desktop: its own settings file \(url.lastPathComponent)")
     }
 
     /// Full sequence: allocate JIT pool, start wineserver, start Wine.
@@ -2622,6 +2663,11 @@ struct ContentView: View {
             // precision, frame limit).
             if let profile {
                 profile.applyEnvironment()
+                // madeira-bcd: applyEnvironment sets or unsets AVX and "Report an NVIDIA
+                // GPU" from the entry's own fields; BCDLaunch.applyExtras exported the
+                // game's LibraryPrefs switches before, on the main thread (Game details
+                // writes those). Either one turns a switch on.
+                Self.reassertBCDSwitches(profile)
                 logStore.log("[launch-route] library profile applied")
                 // madeira-bcd: a Dock session of one-time installs runs without the game's
                 // address-space holds, which leave its 32-bit setups no room.
@@ -2832,6 +2878,19 @@ struct ContentView: View {
             if profile?.reportNVIDIA == true {
                 dxmtOptions.append("dxgi.customDeviceId=2544")
                 logStore.log("DXMT config: dxgi.customDeviceId=2544 via Report an NVIDIA GPU")
+            }
+            // madeira-bcd: the game's options from BCDLaunch.applyExtras (LibraryPrefs'
+            // NVIDIA device id), last, as before the merge. An option whose key is already
+            // set above is replaced, not repeated: DXMT reads at most 259 characters.
+            if let c = getenv("MADEIRA_DXMT_EXTRA") {
+                let extra = String(cString: c).split(whereSeparator: { $0 == ";" || $0.isNewline })
+                    .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty && !$0.hasPrefix("#") }
+                for option in extra {
+                    let key = option.split(separator: "=", maxSplits: 1).first.map(String.init) ?? option
+                    dxmtOptions.removeAll { ($0.split(separator: "=", maxSplits: 1).first.map(String.init) ?? $0) == key }
+                    dxmtOptions.append(option)
+                }
+                if !extra.isEmpty { logStore.log("DXMT config: \(extra.joined(separator: ";")) via the game's settings") }
             }
             // Unset otherwise, so a previous session's options in this app process do not apply.
             if !dxmtOptions.isEmpty { setenv("DXMT_CONFIG", dxmtOptions.joined(separator: ";"), 1) } else { unsetenv("DXMT_CONFIG") }

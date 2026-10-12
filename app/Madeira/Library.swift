@@ -676,6 +676,20 @@ final class LibraryModel: ObservableObject {
             }
         }
         resetPhoneResolution()
+        applyRecommendations()
+    }
+
+    /// madeira-bcd: games already in the library get Madeira's recommended settings
+    /// when they are due (GameRecommendationsApply.swift); the entries' own fields
+    /// are saved here.
+    private func applyRecommendations() {
+        guard !readOnly else { return }
+        var next = entries
+        var changed = false
+        for i in next.indices {
+            if GameRecommendations.prepare(&next[i]) { changed = true }
+        }
+        if changed { persist(next) }
     }
 
     /// ml1172: every new entry used to get 1408x648, a 19.5:9 phone's shape.
@@ -710,6 +724,10 @@ final class LibraryModel: ObservableObject {
         guard !readOnly else { error = "The library file could not be read. Preserve or repair it before making changes."; return }
         var next = entries
         var entry = entry
+        // madeira-bcd: a game seen for the first time gets Madeira's recommended settings
+        // (GameRecommendationsApply.swift): a finished Steam download, a new or saved entry.
+        let isNew = !next.contains { $0.id == entry.id || (entry.steamAppID != nil && $0.steamAppID == entry.steamAppID) }
+        GameRecommendations.prepare(&entry, new: isNew)
         // A Steam game has one entry: a details page opened before its card first saved
         // one (refreshSteamMetadata) updates that entry.
         if let i = next.firstIndex(where: { $0.id == entry.id }) ??
@@ -2727,7 +2745,8 @@ struct LibraryView: View {
         }
         .sheet(isPresented: $browser) {
             NavigationStack { ExecutableBrowser(folder: LibraryModel.drive) { entry in
-                model.save(entry); browser = false; selected = entry
+                // madeira-bcd: the page shows the entry as stored, with its recommended settings.
+                model.save(entry); browser = false; selected = model.entries.first { $0.id == entry.id } ?? entry
             } }
         }
         .sheet(item: $selected) { entry in
@@ -2857,14 +2876,58 @@ struct LibraryDetail: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var model = LibraryModel.shared
     @State private var importCover = false
+    /// madeira-bcd: this game's own switches as the fork stores them (reloadBCD).
+    @State private var bcd = BCDGameValues()
     @State private var findCover = false
     @State private var remove = false
+    /// madeira-bcd: Madeira's recommended settings for this game, nil for none
+    /// (GameRecommendations.swift), and the question before Reset to Recommended.
+    @State private var recommended: GameRecommendation?
+    @State private var confirmReset = false
     @State private var leaving = false
     @State private var error: String?
     @State private var copiedLink = false
     /// Settings › Sync engine, read when the details open: the fastsync switches
     /// below only apply while it is Fastsync.
     @State private var syncEngine = SyncEngine.current
+    /// madeira-bcd: one storage for a game's own options -- where the fork keeps
+    /// them and BCDLaunch exports them at every launch (library, Madeira Dock,
+    /// Home Screen shortcuts): AVX, NVIDIA and Wine's C++ runtime in LibraryPrefs,
+    /// the game's config lines in its GameProfiles.swift file. This page's
+    /// controls read and write them; the entry fields upstream keeps for the
+    /// same options (avx, reportNVIDIA, config) are moved into them once.
+    private func reloadBCD() { bcd = BCDGameValues(windowsPath: entry.windowsPath) }
+    private func migrateEntryOptions() {
+        let path = entry.windowsPath
+        let file = GameProfile(windowsPath: path)
+        var moved: [String] = []
+        if entry.avx == true { LibraryPrefs.setAVX(true, for: path); moved.append("avx") }
+        if entry.reportNVIDIA == true { LibraryPrefs.setNvidia(true, for: path); moved.append("nvidia") }
+        if let config = entry.config, !config.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // The entry's lines first, the file's after: a key both set keeps the file's value.
+            let old = file.text
+            file.text = config + (config.hasSuffix("\n") ? "" : "\n") + old
+            moved.append("config")
+        }
+        guard !moved.isEmpty else { return }
+        entry.avx = nil; entry.reportNVIDIA = nil; entry.config = nil
+        model.save(entry)
+        LogStore.shared.log("[bcd] \(entry.title): moved \(moved.joined(separator: ",")) into the game's own settings")
+    }
+    /// madeira-bcd: a game seen for the first time gets Madeira's recommended settings,
+    /// which this page then shows (GameRecommendationsApply.swift).
+    private func prepareRecommendation() {
+        recommended = GameRecommendations.recommendation(for: entry)
+        // A copy the library has not stored (a Steam game's first page) is a new entry.
+        let isNew = !model.entries.contains { $0.id == entry.id }
+        if GameRecommendations.prepare(&entry, new: isNew) { model.save(entry) }
+    }
+    /// Reset to Recommended: the recommendation's config and switches, written at once.
+    private func resetToRecommended() {
+        recommended = GameRecommendations.reset(&entry)
+        model.save(entry)
+        reloadBCD()
+    }
     /// "None", or how many keys this game's own config sets.
     static func configSummary(_ config: String?) -> String {
         let count = MadeiraConfig.parse(config ?? "").count
@@ -3040,7 +3103,11 @@ struct LibraryDetail: View {
                 Section {
                     Toggle("Reduced-precision x87", isOn: $entry.reducedX87)
                     // Exported for this game only when chosen (applyEnvironment).
-                    Toggle("AVX and AVX2", isOn: Binding(get: { entry.avx ?? false }, set: { entry.avx = $0 ? true : nil }))
+                    // madeira-bcd: AVX, NVIDIA and Wine's C++ runtime are LibraryPrefs, which
+                    // BCDLaunch exports.
+                    Toggle("AVX and AVX2", isOn: Binding(get: { bcd.avx }, set: { on in
+                        bcd.avx = on; LibraryPrefs.setAVX(on, for: entry.windowsPath)
+                    }))
                     // Exported for this game only when chosen (applyEnvironment).
                     Picker("CPU cores reported", selection: Binding(get: { entry.cpuCount ?? 0 }, set: { entry.cpuCount = $0 == 0 ? nil : $0 })) {
                         Text("Automatic").tag(0)
@@ -3050,7 +3117,12 @@ struct LibraryDetail: View {
                         Text("Application default").tag(0)
                         ForEach([1, 2, 4, 8], id: \.self) { Text("Up to \($0)×").tag($0) }
                     }
-                    Toggle("Report an NVIDIA GPU", isOn: Binding(get: { entry.reportNVIDIA ?? false }, set: { entry.reportNVIDIA = $0 ? true : nil }))
+                    Toggle("Report an NVIDIA GPU", isOn: Binding(get: { bcd.nvidia }, set: { on in
+                        bcd.nvidia = on; LibraryPrefs.setNvidia(on, for: entry.windowsPath)
+                    }))
+                    Toggle("Wine's C++ runtime", isOn: Binding(get: { bcd.wineVCRT }, set: { on in
+                        bcd.wineVCRT = on; LibraryPrefs.setWineVCRT(on, for: entry.windowsPath)
+                    }))
                     // Fastsync-only switches: shown for every game, usable only while
                     // Settings › Sync engine is Fastsync.
                     Group {
@@ -3064,7 +3136,7 @@ struct LibraryDetail: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 } header: { Text("Compatibility & performance") } footer: {
-                    Text("Reduced-precision x87 can make older games faster at some cost in accuracy; it is off by default. Turn on AVX and AVX2 (off by default, 64-bit games) when a game built for AVX processors quits at start with an illegal instruction (c000001d); FEX then emulates AVX, which is slower. Report an NVIDIA GPU is for games that stop with \"no graphics card\" or \"failed to get GPU driver info\". With Fastsync, fast synchronization (on by default) handles events without a server round trip, and fast semaphore waits (off by default) does the same for semaphores. Settings apply to the next launch; a precision change may still require restarting Madeira.")
+                    Text("Reduced-precision x87 can make older games faster at some cost in accuracy; it is off by default. Turn on AVX and AVX2 (off by default, 64-bit games) when a game built for AVX processors quits at start with an illegal instruction (c000001d); FEX then emulates AVX, which is slower. Report an NVIDIA GPU is for games that stop with \"no graphics card\" or \"failed to get GPU driver info\". Wine's C++ runtime replaces Microsoft's concrt140/msvcp140_* for a game that crashes right after loading them. With Fastsync, fast synchronization (on by default) handles events without a server round trip, and fast semaphore waits (off by default) does the same for semaphores. Settings apply to the next launch; a precision change may still require restarting Madeira.")
                 }
                 Section("On screen") {
                     Toggle("Performance overlay", isOn: $entry.performance)
@@ -3095,11 +3167,19 @@ struct LibraryDetail: View {
                         Text("Keyboard and mouse: for games without controller support. The controller presses keys and moves the mouse (left stick WASD, right stick mouse, triggers click, D-pad arrows, Start Esc, Select Tab) and the game sees no controller. Change what each button does under Controller binds, here or in the in-game menu.").font(.caption).foregroundStyle(.secondary)
                     }
                 }
+                // madeira-bcd: this game's config is its own GameProfiles.swift file
+                // (Application Support/GameConfigs/<hash>.cfg), the file every launch of
+                // the game exports as MADEIRA_CFG_GAME. Lines an entry saved in upstream's
+                // `config` field are moved into it when the page opens (migrateEntryOptions).
                 Section {
                     NavigationLink {
-                        LibraryGameConfigEditor(text: Binding(get: { entry.config ?? "" }, set: { entry.config = $0.isEmpty ? nil : $0 }))
+                        LibraryGameConfigEditor(text: Binding(get: { bcd.configText }, set: { text in
+                            bcd.configText = text
+                            GameProfile(windowsPath: entry.windowsPath).text = text
+                        }))
+                        .onDisappear { reloadBCD() }
                     } label: {
-                        LabeledContent("This game's config", value: Self.configSummary(entry.config))
+                        LabeledContent("This game's config", value: Self.configSummary(bcd.configText))
                     }
                 } header: { Text("Advanced") } footer: {
                     Text("Lines in madeira.cfg's format for this game only. A key set here wins over madeira.cfg wherever the runtime reads it, env.NAME lines are exported after madeira.cfg's, and dxmt options are added to madeira.cfg's. Applies from the next start.")
@@ -3133,6 +3213,16 @@ struct LibraryDetail: View {
                     Section("Executable") { Text(entry.windowsPath).font(.caption.monospaced()).textSelection(.enabled) }
                     Section { Button("Remove from library", role: .destructive) { remove = true } }
                 }
+                // madeira-bcd: always last, for every entry, the Desktop too (GameRecommendationsApply.swift).
+                Section {
+                    Button("Reset to Recommended", systemImage: "arrow.counterclockwise") { confirmReset = true }
+                        .confirmationDialog(GameRecommendations.question(recommended, desktop: entry.desktop == true),
+                                            isPresented: $confirmReset, titleVisibility: .visible) {
+                            Button("Reset", role: .destructive) { resetToRecommended() }
+                        }
+                } footer: {
+                    Text(GameRecommendations.note(recommended, desktop: entry.desktop == true))
+                }
                 if let error { Section { Text(error).foregroundStyle(.red) } }
             }
             .navigationTitle("Game details").navigationBarTitleDisplayMode(.inline)
@@ -3160,9 +3250,14 @@ struct LibraryDetail: View {
             .task {
                 if entry.graphicsAPI == nil, entry.desktop != true, let url = try? LibraryModel.executable(entry.relativePath) { entry.graphicsAPI = LibraryModel.graphicsImports(url) }
             }
+            .onAppear {
+                migrateEntryOptions()
+                prepareRecommendation()
+                reloadBCD()
+            }
             .onDisappear { if !leaving { model.save(entry) } }
             .onReceive(LibraryController.shared.commands) { command in
-                guard !leaving, !findCover, !importCover, !remove else { return }
+                guard !leaving, !findCover, !importCover, !remove, !confirmReset else { return }
                 if command == "back" { model.save(entry); dismiss() }
                 if command == "accept" { start() }
             }
@@ -3170,9 +3265,24 @@ struct LibraryDetail: View {
     }
 }
 
+/// madeira-bcd: a game's own options as the fork stores them (LibraryDetail):
+/// LibraryPrefs' switches and the GameProfiles.swift file's lines.
+struct BCDGameValues {
+    var avx = false, nvidia = false, wineVCRT = false
+    var configText = ""
+    init() {}
+    init(windowsPath: String) {
+        avx = LibraryPrefs.avx(windowsPath)
+        nvidia = LibraryPrefs.nvidia(windowsPath)
+        wineVCRT = LibraryPrefs.wineVCRT(windowsPath)
+        configText = GameProfile(windowsPath: windowsPath).text
+    }
+}
+
 /// Game details › This game's config: the game's own lines in madeira.cfg's
-/// syntax, saved with the entry and applied at its next start
-/// (LibraryEntry.config, MadeiraConfig.applyGame).
+/// syntax, applied at its next start. madeira-bcd: LibraryDetail binds it to the
+/// game's GameProfiles.swift file (Application Support/GameConfigs), which every
+/// launch exports as MADEIRA_CFG_GAME (BCDLaunch, MadeiraConfig.applyGame).
 struct LibraryGameConfigEditor: View {
     @Binding var text: String
     var body: some View {
