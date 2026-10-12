@@ -288,6 +288,10 @@ extern void __wine_main(int argc, char *argv[]);
 // File-based logging (from server_ios.c)
 extern void wine_log_set_file(const char *path);
 
+/* madeira-bcd: env.MADEIRA_SRV_FGETPATH of the launch in progress, read by the in-app
+ * wineserver (build/wineserver/fd_ios.c), which is running before a game's env lines
+ * are set. Set after they are applied, cleared when the session ends. */
+volatile int g_madeira_srv_fgetpath = 0;
 static pthread_t g_wine_thread;
 static volatile int g_wine_running = 0;
 
@@ -1225,6 +1229,12 @@ static void *wine_process_thread(void *arg) {
                     setenv("MADEIRA_FASTSYNC", "auto", 0);
                     fprintf(stderr, "[madeira-env] sync engine: fastsync (default), MADEIRA_FASTSYNC=auto\n");
                 }
+                {   /* madeira-bcd: for the wineserver (g_madeira_srv_fgetpath) */
+                    const char *fp = getenv("MADEIRA_SRV_FGETPATH");
+                    g_madeira_srv_fgetpath = (fp && fp[0] == '1') ? 1 : 0;
+                    if (g_madeira_srv_fgetpath)
+                        fprintf(stderr, "[madeira-env] MADEIRA_SRV_FGETPATH=1: the server names the files it opens with F_GETPATH\n");
+                }
             }
         }
 
@@ -1692,6 +1702,10 @@ static void *wine_process_thread(void *arg) {
         unsetenv("MADEIRA_CPU_COUNT"); unsetenv("DXMT_D9_ANISO_LIMIT");
         unsetenv("FEX_X87REDUCEDPRECISION");   /* ml1184 */
         unsetenv("MADEIRA_DINPUT_PAD");        /* ml1240 */
+        /* madeira-bcd: Horizon Zero Dawn's per-game switches must not reach a later game
+         * of this app run (GTA V Enhanced runs without them). */
+        unsetenv("MADEIRA_SRV_FGETPATH");
+        g_madeira_srv_fgetpath = 0;
         unsetenv("MADEIRA_FEX_AVX"); unsetenv("MADEIRA_FRAMEGEN");   /* ml1184 */
         unsetenv("DXMT_ENABLE_NVEXT"); unsetenv("DXMT_WSI_MONITOR_IDENTITY"); unsetenv("DXMT_WSI_MODE_TABLE");
 
