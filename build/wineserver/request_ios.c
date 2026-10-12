@@ -319,6 +319,7 @@ static void call_req_handler( struct thread *thread )
         if (req < REQ_NB_REQUESTS) counts[req]++;
         if (!total) clock_gettime( CLOCK_MONOTONIC, &t0 );
         if (++total % 200000 == 0)
+        static unsigned long cursor_flags[6];   /* set_cursor by flag: handle count pos clip noclip fsclip */
         {
             struct timespec t1; char line[600]; int n = 0, k; unsigned r;
             clock_gettime( CLOCK_MONOTONIC, &t1 );
@@ -335,7 +336,21 @@ static void call_req_handler( struct thread *thread )
                      (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9, line );
             t0 = t1;
         }
+        if (req == REQ_set_cursor)
     }
+        {
+            unsigned int f = thread->req.set_cursor_request.flags, b;
+            for (b = 0; b < 6; b++) if (f & (1u << b)) cursor_flags[b]++;
+        }
+            if (cursor_flags[0] + cursor_flags[1] + cursor_flags[2] + cursor_flags[3] + cursor_flags[4])
+            {
+                extern unsigned long ios_clip_repeats_skipped;
+                fprintf( stderr, "[srv-req] set_cursor by flag: handle=%lu count=%lu pos=%lu clip=%lu noclip=%lu "
+                         "fsclip=%lu; unchanged ClipCursor notifications skipped so far: %lu\n",
+                         cursor_flags[0], cursor_flags[1], cursor_flags[2], cursor_flags[3], cursor_flags[4],
+                         cursor_flags[5], ios_clip_repeats_skipped );
+                memset( cursor_flags, 0, sizeof(cursor_flags) );
+            }
     if (req < REQ_NB_REQUESTS)
         req_handlers[req]( &current->req, &reply );
     else
