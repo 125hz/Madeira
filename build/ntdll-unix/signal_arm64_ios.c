@@ -109,6 +109,9 @@ WINE_DEFAULT_DEBUG_CHANNEL(seh);
  * ntdll image (cross-arch children run a private ARM64EC ntdll). Falls back
  * to the session p* globals when the process has no private image. */
 #include "ios_mixed.h"
+#ifdef WINE_IOS
+#include "ios_sc_runstate_diag.h"
+#endif
 #define IOS_PFUNC(name) __extension__ ({ \
     const struct ios_ntdll_funcs *_iosf = ios_cur_ntdll_funcs(); \
     _iosf ? _iosf->name : (void *)p##name; })
@@ -9704,6 +9707,13 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                             xrip = ios_native_rip_from_hostpc( bb, (uint64_t)(uintptr_t)pc, &why );
                         if (xrip)
                         {
+                            extern unsigned long long ios_jit_module_base_for_va( unsigned long long, unsigned long long * );
+                            unsigned long long sch_size = 0;
+                            uint64_t sch_base = ios_jit_module_base_for_va( xrip, &sch_size );
+                            /* Live SRA RBX/RSP, not potentially stale gregs. The
+                             * dump itself accepts only the exact helper build
+                             * and I/O pump fault range, and reads through Mach. */
+                            if (sch_base) ios_sc_runstate_dump( sch_base, xrip, REGn_sig(27, context), REGn_sig(23, context) );
                             uint8_t xb[16]; mach_vm_size_t g3 = 0;
                             if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)xrip, sizeof(xb),
                                                         (mach_vm_address_t)xb, &g3 ) == KERN_SUCCESS && g3 == sizeof(xb))
