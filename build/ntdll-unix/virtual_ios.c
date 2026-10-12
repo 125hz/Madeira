@@ -652,6 +652,43 @@ extern int ios_fast_footprint;
  * P cores paid for. Page warming still runs every cycle; the .text sweep keeps
  * its cadence. MADEIRA_WARMER_SWEEP_CYCLES (default 30, ~1 min; 5 restores the
  * old 10 s map walk with the inventory every 15). */
+/* madeira-bcd lean-diag (env.MADEIRA_LEAN_DIAG = 1, opt-in; server_ios.c reads the
+ * same switch for its samplers). The warmer keeps warming every page every cycle
+ * and keeps its [footprint] line; what is diagnostic only runs rarely: the map
+ * walk ([phys-map], [holes<64G], [malloc-zones]) and the slot/window inventory
+ * every 300 cycles (~10 min) instead of 30 -- in hzd486 the walk took 0.12-0.39 s
+ * of P-core time a minute, 3.2 s once the CPU was clamped -- the .text max_prot
+ * sweep every 30 cycles instead of 5, the CoreAnimation shmem replay and the
+ * malloc zone check every 30 cycles instead of every one (the check's cost is
+ * then logged, [lean-diag] zone-check), and mprotect_exec's ERR line (one per
+ * call, ~400/s while Horizon Zero Dawn loads) after its first 200 only for every
+ * 1000th call. */
+static int ios_lean_diag_virtual( void )
+{
+    static int v = -1;
+    if (v < 0)
+    {
+        const char *e = getenv( "MADEIRA_LEAN_DIAG" );
+        v = e && *e && strcmp( e, "0" ) != 0;
+    }
+    return v;
+}
+
+/* set by the warmer thread when it starts, so mprotect_exec (which can run in a
+ * fault path) never calls getenv itself; the first calls before that are logged */
+static volatile int ios_lean_mprotect_on;
+
+static int ios_lean_mprotect_log( void )
+{
+    static long n;
+    long k;
+    if (!ios_lean_mprotect_on) return 1;
+    k = __atomic_add_fetch( &n, 1, __ATOMIC_RELAXED );
+    if (k == 200)
+        dprintf( 2, "[lean-diag] mprotect_exec: 200 calls logged, from now on 1 in 1000 (MADEIRA_LEAN_DIAG)\n" );
+    return k <= 200 || !(k % 1000);
+}
+
 static unsigned ios_warmer_sweep_cycles( void )
 {
     static unsigned v;
@@ -659,8 +696,9 @@ static unsigned ios_warmer_sweep_cycles( void )
     {
         /* cycles of ~2 s between the warmer's map walk and slot/window inventory (default 30; 5 = old). */
         const char *e = getenv( "MADEIRA_WARMER_SWEEP_CYCLES" );
+        const char *lean = getenv( "MADEIRA_LEAN_DIAG" );   /* madeira-bcd lean-diag: 300 (~10 min) */
         unsigned long n = e && *e ? strtoul( e, NULL, 10 ) : 0;
-        v = n >= 1 && n <= 100000 ? (unsigned)n : 30;
+        v = n >= 1 && n <= 100000 ? (unsigned)n : lean && *lean && strcmp( lean, "0" ) != 0 ? 300 : 30;
     }
     return v;
 }
@@ -669,6 +707,7 @@ static void *ios_pool_warmer_thread( void *arg )
 {
     unsigned cycle = 0;
     { extern void ios_eco_native_self( const char *who ); ios_eco_native_self( "pool-warmer" ); }   /* madeira-bcd eco-native */
+    ios_lean_mprotect_on = ios_lean_diag_virtual();   /* madeira-bcd lean-diag: mprotect_exec thins its ERR line from now on */
     for (;;)
     {
         /* ml1060: THE MONITOR WAS A TENTH OF THE MACHINE. Above 2400 MB this loop
@@ -767,6 +806,7 @@ static void *ios_pool_warmer_thread( void *arg )
              * so walk exactly those ranges: any .text page whose max_prot has
              * lost EXECUTE is real corruption, with no benign explanation. */
             if ((cycle % 5) == 0 && rx)
+            if (!ios_lean_diag_virtual() || (cycle % 30) == 0)   /* madeira-bcd lean-diag: every 30 */
             {
                 unsigned mi;
                 size_t bad = 0, checked = 0;
@@ -867,6 +907,7 @@ static void *ios_pool_warmer_thread( void *arg )
                      *   vm_allocate(task, &addr, size, 0x33000003)
                      * = ANYWHERE | PURGABLE | VM_MAKE_TAG(51), and the tag picks
                      * the address range. Four variants isolate tag vs purgable. */
+                    if (!ios_lean_diag_virtual() || cycle == 1 || (cycle % 30) == 0)   /* madeira-bcd lean-diag */
                     {
                         static kern_return_t last[4] = { -1, -1, -1, -1 };
                         static const int fl[4] = { 0x33000003, 0x33000001, 0x00000003, 0x00000001 };
@@ -917,7 +958,7 @@ static void *ios_pool_warmer_thread( void *arg )
             {
                 extern boolean_t malloc_zone_check( malloc_zone_t *zone );
                 static int zone_bad, zone_announced;
-                if (!zone_bad)
+                if (!zone_bad && (!ios_lean_diag_virtual() || cycle == 1 || (cycle % 30) == 0))   /* madeira-bcd lean-diag */
                 {
                     struct timeval t0, t1;
                     int ok;
@@ -939,6 +980,12 @@ static void *ios_pool_warmer_thread( void *arg )
                             zone_announced = 1;
                             dprintf(2, "[zone-check] armed and PASSING at cycle=%u (%ld ms per check) "
                                        "rev=ml566\n", cycle, ms);
+                        }
+                        else if (ios_lean_diag_virtual())   /* madeira-bcd lean-diag: what each (now rare) check costs */
+                        {
+                            static unsigned lean_said;
+                            if (lean_said++ < 60)
+                                dprintf(2, "[lean-diag] zone-check passed at cycle=%u in %ld ms\n", cycle, ms);
                         }
                     }
                 }
@@ -12281,7 +12328,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
      *
      * Apply only on the PROT_WRITE-add path; non-write protect changes go
      * through the regular mprotect below. */
-    if (!ios_in_mach_exc)                       /* ml374: see ios_in_mach_exc */
+    if (!ios_in_mach_exc && ios_lean_mprotect_log())   /* ml374: see ios_in_mach_exc; madeira-bcd lean-diag */
         ERR("mprotect_exec(%p, 0x%lx, %c%c%c)\n", base, (unsigned long)size,
             (unix_prot & PROT_READ)  ? 'r' : '-',
             (unix_prot & PROT_WRITE) ? 'w' : '-',

@@ -2030,16 +2030,31 @@ static void ios_wprof_main( void )
     }
 }
 
+/* madeira-bcd lean-diag: env.MADEIRA_LEAN_DIAG = 1 (opt-in, read once where the
+ * samplers are armed). The periodic diagnostics that suspend threads stop: the
+ * [thread-sample] bursts (every thread suspended 4x every 20 s), the guest RIP
+ * profile behind [rip-profile]/[cpu-split] (the game's threads suspended ~2,400
+ * times in the second after each burst, by a utility-QoS thread that can be
+ * preempted while it holds one) and the [wprof] W-thread profiler. [sync-census]
+ * keeps its 20 s line and [xp]/[xp-t]/[xp-api]/[xp-api-top] keep their rates, so
+ * abline, bucket, xptphase, energyfit, clampstats and apitop read the same
+ * fields; tstime has no [thread-sample] lines to tag. The memory walks of
+ * virtual_ios.c's warmer thread run every ~10 min instead of every minute. */
+static int ios_lean_diag;
+
 static void ios_thread_sampler_main(void)
 {
     int gen = 0;
     ios_ts_calibrate();
-    wine_log_write("[thread-sample] ml876 armed (task-wide: burst of 4 passes / 250 ms every 20 s)");
+    wine_log_write(ios_lean_diag ? "[thread-sample] ml876 armed for [sync-census] only (MADEIRA_LEAN_DIAG: no bursts, no guest RIP profile)"
+                                 : "[thread-sample] ml876 armed (task-wide: burst of 4 passes / 250 ms every 20 s)");
     for (;;) {
         int b;
         sleep(20);
+        if (!ios_lean_diag) {
         for (b = 0; b < 4; b++) { ios_thread_sampler_pass(b); usleep(250000); }
         wine_log_write("[thread-sample] ml876 burst done");
+        }
         {   /* ml1115: alert (futex) traffic since the last burst, per second */
             extern volatile long long ios_alert_wakes, ios_alert_waits, ios_qpc_syscalls, ios_affinity_sets; extern volatile int ios_srv_req_count;
             extern volatile long long ios_alert_lat_n, ios_alert_lat_ticks, ios_alert_lat_hist[6], ios_alert_spin_tries, ios_alert_spin_hits;
@@ -2070,7 +2085,7 @@ static void ios_thread_sampler_main(void)
         /* ml979: profile the guest every third burst (~once a minute). Two
          * successive profiles are what distinguish a loop from a sweep: a
          * sweep's span and bucket set move, a loop's do not. */
-        ++gen; ios_guest_rip_profile( gen );   /* ml1123: every burst (was every third) */
+        if (!ios_lean_diag) { ++gen; ios_guest_rip_profile( gen ); }   /* ml1123: every burst (was every third) */
     }
 }
 
@@ -4824,9 +4839,16 @@ void server_init_process_done(void)
          * ios_thread_sampler_main() above. */
         if (__sync_bool_compare_and_swap(&ios_ts_armed, 0, 1))
         {
+            /* 1: no thread-suspending samplers ([thread-sample], [rip-profile], [cpu-split], [wprof]) and rare memory walks; [xp] unchanged */
+            const char *lean_env = getenv("MADEIRA_LEAN_DIAG");
+            ios_lean_diag = lean_env && *lean_env && strcmp(lean_env, "0") != 0;
+            if (ios_lean_diag)
+                wine_log_write("[lean-diag] madeira-bcd MADEIRA_LEAN_DIAG=%s: [thread-sample] bursts, guest RIP profile ([rip-profile], "
+                               "[cpu-split]) and [wprof] off; [sync-census] every 20 s and [xp]/[xp-t]/[xp-api] every 250 ms / 1 s as "
+                               "before; the warmer's memory walks every ~10 min", lean_env);
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_thread_sampler_main(); });
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_xprobe_main(); });   /* ml1128 */
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_wprof_main(); });   /* ml1129 */
+            if (!ios_lean_diag) dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_wprof_main(); });   /* ml1129 */
         }
         if (!getenv("MADEIRA_QUIET"))
         {
