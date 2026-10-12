@@ -45,7 +45,7 @@ fi
 export PATH="$VENV/bin:$PATH"
 
 # Patches are applied once; the marker keeps re-runs idempotent.
-for p in "$HERE"/patches/*.patch; do
+for p in "$HERE"/patches/[0-9]*.patch; do  # kosmickrisp-ios-* belong to build-kosmickrisp.sh
     [ -e "$p" ] || continue
     m="$SRC/.madeira-applied-$(basename "$p")"
     if [ ! -f "$m" ]; then
