@@ -47,7 +47,7 @@ git-ignored and consumed by the app project.
    of the script is UNVERIFIED.
 2. FEX (submodule, branch ios-port-2607):
    - `FEX/build-ios`: `build/fex-ios/build.sh` (same options as the development CMakeCache) -> `FEX/build-ios/FEXCore/Source/lib{FEXCore,FEXCore_Base,JemallocLibs}.a` and the `External/{cephes,fmt,SoftFloat-3e,xxhash}` archives. UNVERIFIED from clean.
-   - `FEX/build-arm64ec`: `build/fex-arm64ec/build.sh` (configures with `FEX/Data/CMake/toolchain_mingw.cmake` and the recorded options on first run, builds target `arm64ecfex`, copies `Bin/libarm64ecfex.dll` to `app/Madeira/arm64ec-windows/xtajit64.dll`). The build step was verified this session; the first-run configure in the script is reconstructed from CMakeCache and UNVERIFIED.
+   - `FEX/build-arm64ec`: `build/fex-arm64ec/build.sh` (configures with `FEX/Data/CMake/toolchain_mingw.cmake` and the recorded options on first run, builds target `arm64ecfex`, copies `Bin/libarm64ecfex.dll` to `app/Madeira/arm64ec-windows/xtajit64.dll`). The build step was verified this session. The first-run configure uses Ninja, `MINGW_TRIPLE=arm64ec-w64-mingw32`, `TUNE_CPU=cortex-a78`, `FEX_IOS_HOST_BUILD=ON`, `FEX_IOS_HOST=1` for the C, C++ and assembler flags, and LTO off: the options the madeira-bcd fork's macOS CI has built xtajit64.dll with since 2026-09-26 (the module every 64-bit game ran on from its build 231). A tree configured before keeps its cached options and generator (remove `FEX/build-arm64ec` to configure it again).
 3. Wine (submodule, branch madeira-lgpl):
    - unix side: `build/ntdll-unix/build.sh`, `build/wineserver/build.sh`,
      `build/win32u-unix/build.sh` -> `app/Madeira/lib{ntdll_unix,wineserver,win32u_unix}.a`. Verified on the development machine.
