@@ -20,8 +20,8 @@
 #                                  system32\xaudio2_7.dll
 # and GAME_MODULES below: builtins games or their installers import that the
 # farm does not have (without one the loader stops with STATUS_DLL_NOT_FOUND
-# before the program runs), with their delay imports linked as plain imports
-# (see UNDELAY below).
+# before the program runs). Every module built here links its delay imports
+# as plain imports (see UNDELAY below).
 # Pass the tracked modules a change touches (kernelbase, shell32, xinput1_1 ...
 # xinput1_4, ...) to rebuild them. ntdll is padded as well: build-ntdll.sh.
 #
@@ -107,7 +107,7 @@ mkdir -p "$B/dlls/stdole2.tlb"
 [ -e "$B/dlls/stdole2.tlb/aarch64-windows" ] || [ -L "$B/dlls/stdole2.tlb/aarch64-windows" ] \
     || ln -s arm64ec-windows "$B/dlls/stdole2.tlb/aarch64-windows"
 
-# UNDELAY: a GAME_MODULES module links its delay imports as plain imports.
+# UNDELAY: every module built here links its delay imports as plain imports.
 # lld's ARM64EC delay-load helper stub is x64 code inside .text (lea rax,
 # __imp_aux_X; jmp __tailMerge), and the JIT-pool copy Madeira runs a hybrid
 # module from relocates the delay IAT to the stub's pool address, so the first
@@ -125,7 +125,6 @@ trap restore_makefiles EXIT
 in_farm() { [ -n "$(find "$DEST" -maxdepth 1 -iname "$1.dll" 2>/dev/null)" ]; }
 if [ "${UNDELAY:-1}" != 0 ]; then
     for m in "$@"; do
-        case " $(echo $GAME_MODULES) " in *" $m "*) ;; *) continue ;; esac
         mk="$R/wine/dlls/$m/Makefile.in"
         delayed="$(sed -n 's/^DELAYIMPORTS[[:space:]]*=[[:space:]]*//p' "$mk")"
         [ -n "$delayed" ] && grep -q '^IMPORTS' "$mk" || continue
