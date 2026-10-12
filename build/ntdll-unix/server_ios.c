@@ -1902,6 +1902,325 @@ unsigned long long ios_fps_cap_dxmt_pace( void )
     return slept;
 }
 
+/* madeira-bcd power probe (opt-in: env.MADEIRA_POWER_PROBE = 1). Every 5 s, next
+ * to [xp]'s process CPU energy (proc_pid_rusage ri_energy_nj), one [power] line with
+ * what else a developer-signed app can read, each source tried once and named
+ * "unavailable" once when it gives nothing:
+ *  - the process's resource coalition (proc_pidinfo PROC_PIDCOALITIONINFO, then
+ *    libsystem_kernel's coalition_info_resource_usage): gpu_energy_nj and gpu_time,
+ *    which the GPU driver charges to coalitions (xnu coalition_add_to_gpu_energy,
+ *    ml_gpu_stat_update), plus the coalition's CPU energy and the energy others
+ *    did on our behalf. task_info(TASK_POWER_INFO_V2)'s gpu field is no use on
+ *    arm64: ml_gpu_stat() returns 0 there (osfmk/arm64/machine_routines.c);
+ *  - rusage's ri_billed_energy / ri_serviced_energy (work billed across processes);
+ *  - IOReport's "Energy Model" group (private /usr/lib/libIOReport.dylib), the SoC's
+ *    own CPU/GPU/DRAM energy counters, if the sandbox lets the app subscribe;
+ *  - the battery's IORegistry entry (AppleSmartBattery: Voltage, InstantAmperage),
+ *    i.e. the whole device's power while unplugged, if the sandbox lets it be read.
+ * One [power-t] line names the threads that used the most energy in those 5 s
+ * ([xp]'s per-thread PROC_PIDTHREADCOUNTS energy, which [xp-t] does not print), so
+ * the wineserver, Metal and app threads can be told apart from the game's; a
+ * native thread (m<tid>) carries its base priority, which names its QoS class
+ * (47 user-interactive, 37 user-initiated, 31 default, 20 utility, 4 background,
+ * 97 real-time). All calls are made on the xprobe thread; nothing is resolved
+ * while the switch is off. */
+static int ios_power_probe_on;   /* read where the samplers are armed */
+
+struct ios_pp_thr { uint64_t tid; uint32_t wtid; char role[6]; int pri; double p_mj, e_mj; };
+static struct ios_pp_thr ios_pp_thr[256];
+static int ios_pp_nthr;
+
+/* returns the entry, or NULL when the table is full; a new native entry has pri -2 (not yet asked) */
+static struct ios_pp_thr *ios_pp_thread( uint64_t tid, uint32_t wtid, const char *role, double p_mj, double e_mj )
+{
+    int i;
+    for (i = 0; i < ios_pp_nthr; i++) if (ios_pp_thr[i].tid == tid) break;
+    if (i == ios_pp_nthr)
+    {
+        if (ios_pp_nthr >= (int)(sizeof(ios_pp_thr) / sizeof(ios_pp_thr[0]))) return NULL;
+        memset( &ios_pp_thr[i], 0, sizeof(ios_pp_thr[i]) );
+        ios_pp_thr[i].tid = tid;
+        ios_pp_thr[i].pri = wtid ? -1 : -2;
+        ios_pp_nthr++;
+    }
+    ios_pp_thr[i].wtid = wtid;
+    if (role) snprintf( ios_pp_thr[i].role, sizeof(ios_pp_thr[i].role), "%s", role );
+    ios_pp_thr[i].p_mj += p_mj;
+    ios_pp_thr[i].e_mj += e_mj;
+    return &ios_pp_thr[i];
+}
+
+/* struct coalition_resource_usage (xnu osfmk/mach/coalition.h) up to swapins; the
+ * kernel copies min(its size, ours), so fields it lacks stay 0 */
+struct ios_pp_cru
+{
+    uint64_t tasks_started, tasks_exited, time_nonempty, cpu_time, interrupt_wakeups, platform_idle_wakeups,
+             bytesread, byteswritten, gpu_time, cpu_time_billed_to_me, cpu_time_billed_to_others, energy,
+             lwrites[8], energy_billed_to_me, energy_billed_to_others, cpu_ptime, cpu_time_eqos_len, cpu_time_eqos[7],
+             cpu_instructions, cpu_cycles, fs_metadata_writes, pm_writes, cpu_pinstructions, cpu_pcycles, conclave_mem,
+             ane_mach_time, ane_energy_nj, phys_footprint, gpu_energy_nj, gpu_energy_nj_billed_to_me,
+             gpu_energy_nj_billed_to_others, swapins;
+};
+
+typedef const void *ios_cf_t;
+static struct
+{
+    int inited;
+    /* coalition */
+    uint64_t cid;
+    int (*cru_fn)( uint64_t cid, void *cru, size_t size );
+    struct ios_pp_cru cru_prev;
+    int have_cru, said_coal;
+    /* CoreFoundation, IOKit, IOReport (all through dlsym) */
+    ios_cf_t (*str)( ios_cf_t alloc, const char *s, uint32_t encoding );
+    unsigned char (*num_get)( ios_cf_t num, long type, void *out );
+    unsigned long (*type_id)( ios_cf_t obj );
+    unsigned long (*num_type)( void );
+    void (*release)( ios_cf_t obj );
+    ios_cf_t (*dict_get)( ios_cf_t dict, ios_cf_t key );
+    ios_cf_t (*dict_mcopy)( ios_cf_t alloc, long capacity, ios_cf_t dict );
+    long (*arr_count)( ios_cf_t arr );
+    ios_cf_t (*arr_at)( ios_cf_t arr, long i );
+    unsigned char (*str_get)( ios_cf_t s, char *buf, long size, uint32_t encoding );
+    ios_cf_t (*io_matching)( const char *name );
+    mach_port_t (*io_service)( mach_port_t main_port, ios_cf_t matching );
+    ios_cf_t (*io_prop)( mach_port_t entry, ios_cf_t key, ios_cf_t alloc, uint32_t options );
+    mach_port_t battery;
+    ios_cf_t k_volt, k_amp;
+    int said_batt;
+    ios_cf_t (*ior_channels)( ios_cf_t group, ios_cf_t subgroup, uint64_t a, uint64_t b, uint64_t c );
+    ios_cf_t (*ior_subscribe)( ios_cf_t a, ios_cf_t channels, ios_cf_t *subbed, uint64_t b, ios_cf_t c );
+    ios_cf_t (*ior_samples)( ios_cf_t sub, ios_cf_t subbed, ios_cf_t a );
+    ios_cf_t (*ior_delta)( ios_cf_t prev, ios_cf_t cur, ios_cf_t a );
+    ios_cf_t (*ior_name)( ios_cf_t channel );
+    ios_cf_t (*ior_unit)( ios_cf_t channel );
+    int64_t (*ior_int)( ios_cf_t channel, int32_t index );
+    ios_cf_t ior_sub, ior_subbed, ior_prev, k_channels;
+    int said_ior, listed_ior;
+    /* accumulated between lines */
+    uint64_t last_ns;
+    double ms, cpu_mj, cpu_p_mj, billed_mj, serviced_mj;
+} ios_pp;
+
+#define IOS_CF_UTF8 0x08000100u   /* kCFStringEncodingUTF8 */
+#define IOS_CF_SINT64 4           /* kCFNumberSInt64Type */
+
+static void ios_pp_init( void )
+{
+    struct { uint64_t coalition_id[2]; uint64_t reserved[3]; } pci;
+    void *iokit, *ior;
+
+    ios_pp.inited = 1;
+    memset( &pci, 0, sizeof(pci) );
+    if (proc_pidinfo( getpid(), 20 /* PROC_PIDCOALITIONINFO */, 1, &pci, sizeof(pci) ) == (int)sizeof(pci))
+        ios_pp.cid = pci.coalition_id[0];   /* COALITION_TYPE_RESOURCE */
+    ios_pp.cru_fn = (int (*)( uint64_t, void *, size_t ))dlsym( RTLD_DEFAULT, "coalition_info_resource_usage" );
+    ios_pp.str = (ios_cf_t (*)( ios_cf_t, const char *, uint32_t ))dlsym( RTLD_DEFAULT, "CFStringCreateWithCString" );
+    ios_pp.num_get = (unsigned char (*)( ios_cf_t, long, void * ))dlsym( RTLD_DEFAULT, "CFNumberGetValue" );
+    ios_pp.type_id = (unsigned long (*)( ios_cf_t ))dlsym( RTLD_DEFAULT, "CFGetTypeID" );
+    ios_pp.num_type = (unsigned long (*)( void ))dlsym( RTLD_DEFAULT, "CFNumberGetTypeID" );
+    ios_pp.release = (void (*)( ios_cf_t ))dlsym( RTLD_DEFAULT, "CFRelease" );
+    ios_pp.dict_get = (ios_cf_t (*)( ios_cf_t, ios_cf_t ))dlsym( RTLD_DEFAULT, "CFDictionaryGetValue" );
+    ios_pp.dict_mcopy = (ios_cf_t (*)( ios_cf_t, long, ios_cf_t ))dlsym( RTLD_DEFAULT, "CFDictionaryCreateMutableCopy" );
+    ios_pp.arr_count = (long (*)( ios_cf_t ))dlsym( RTLD_DEFAULT, "CFArrayGetCount" );
+    ios_pp.arr_at = (ios_cf_t (*)( ios_cf_t, long ))dlsym( RTLD_DEFAULT, "CFArrayGetValueAtIndex" );
+    ios_pp.str_get = (unsigned char (*)( ios_cf_t, char *, long, uint32_t ))dlsym( RTLD_DEFAULT, "CFStringGetCString" );
+    if (!ios_pp.str || !ios_pp.num_get || !ios_pp.type_id || !ios_pp.num_type || !ios_pp.release || !ios_pp.dict_get ||
+        !ios_pp.dict_mcopy || !ios_pp.arr_count || !ios_pp.arr_at || !ios_pp.str_get)
+        ios_pp.str = NULL;   /* no CoreFoundation: neither IOKit nor IOReport */
+    if (ios_pp.str && (iokit = dlopen( "/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY )))
+    {
+        ios_pp.io_matching = (ios_cf_t (*)( const char * ))dlsym( iokit, "IOServiceMatching" );
+        ios_pp.io_service = (mach_port_t (*)( mach_port_t, ios_cf_t ))dlsym( iokit, "IOServiceGetMatchingService" );
+        ios_pp.io_prop = (ios_cf_t (*)( mach_port_t, ios_cf_t, ios_cf_t, uint32_t ))dlsym( iokit, "IORegistryEntryCreateCFProperty" );
+        if (ios_pp.io_matching && ios_pp.io_service && ios_pp.io_prop)
+        {
+            ios_cf_t m = ios_pp.io_matching( "AppleSmartBattery" );
+            if (m) ios_pp.battery = ios_pp.io_service( MACH_PORT_NULL, m );   /* consumes m */
+            ios_pp.k_volt = ios_pp.str( NULL, "Voltage", IOS_CF_UTF8 );
+            ios_pp.k_amp = ios_pp.str( NULL, "InstantAmperage", IOS_CF_UTF8 );
+        }
+    }
+    if (ios_pp.str && (ior = dlopen( "/usr/lib/libIOReport.dylib", RTLD_LAZY )))
+    {
+        ios_pp.ior_channels = (ios_cf_t (*)( ios_cf_t, ios_cf_t, uint64_t, uint64_t, uint64_t ))dlsym( ior, "IOReportCopyChannelsInGroup" );
+        ios_pp.ior_subscribe = (ios_cf_t (*)( ios_cf_t, ios_cf_t, ios_cf_t *, uint64_t, ios_cf_t ))dlsym( ior, "IOReportCreateSubscription" );
+        ios_pp.ior_samples = (ios_cf_t (*)( ios_cf_t, ios_cf_t, ios_cf_t ))dlsym( ior, "IOReportCreateSamples" );
+        ios_pp.ior_delta = (ios_cf_t (*)( ios_cf_t, ios_cf_t, ios_cf_t ))dlsym( ior, "IOReportCreateSamplesDelta" );
+        ios_pp.ior_name = (ios_cf_t (*)( ios_cf_t ))dlsym( ior, "IOReportChannelGetChannelName" );
+        ios_pp.ior_unit = (ios_cf_t (*)( ios_cf_t ))dlsym( ior, "IOReportChannelGetUnitLabel" );
+        ios_pp.ior_int = (int64_t (*)( ios_cf_t, int32_t ))dlsym( ior, "IOReportSimpleGetIntegerValue" );
+        if (ios_pp.ior_channels && ios_pp.ior_subscribe && ios_pp.ior_samples && ios_pp.ior_delta &&
+            ios_pp.ior_name && ios_pp.ior_unit && ios_pp.ior_int)
+        {
+            ios_cf_t group = ios_pp.str( NULL, "Energy Model", IOS_CF_UTF8 ), chans, mchans;
+            ios_pp.k_channels = ios_pp.str( NULL, "IOReportChannels", IOS_CF_UTF8 );
+            if (group && (chans = ios_pp.ior_channels( group, NULL, 0, 0, 0 )))
+            {
+                if ((mchans = ios_pp.dict_mcopy( NULL, 0, chans )))
+                    ios_pp.ior_sub = ios_pp.ior_subscribe( NULL, mchans, &ios_pp.ior_subbed, 0, NULL );
+                ios_pp.release( chans );
+            }
+            if (ios_pp.ior_sub && ios_pp.ior_subbed) ios_pp.ior_prev = ios_pp.ior_samples( ios_pp.ior_sub, ios_pp.ior_subbed, NULL );
+        }
+    }
+}
+
+static int ios_pp_num( ios_cf_t obj, int64_t *out )
+{
+    if (!obj || ios_pp.type_id( obj ) != ios_pp.num_type()) return 0;
+    return ios_pp.num_get( obj, IOS_CF_SINT64, out ) != 0;
+}
+
+/* scale an IOReport energy value to mJ by its unit label */
+static double ios_pp_ior_mj( int64_t v, const char *unit )
+{
+    if (!strcmp( unit, "nJ" )) return v / 1e6;
+    if (!strcmp( unit, "uJ" ) || !strcmp( unit, "\xc2\xb5J" )) return v / 1e3;
+    if (!strcmp( unit, "mJ" )) return (double)v;
+    if (!strcmp( unit, "J" )) return v * 1e3;
+    return -1;
+}
+
+static void ios_power_probe_tick( const char *wall, uint64_t now_ns, double dt_ms, double cpu_mj, double cpu_p_mj,
+                                  double billed_mj, double serviced_mj )
+{
+    char line[1400];
+    int n, i;
+    double ms;
+
+    if (!ios_pp.inited)
+    {
+        ios_pp_init();
+        ios_pp.last_ns = now_ns;
+        wine_log_write( "[power] madeira-bcd probe on (MADEIRA_POWER_PROBE): coalition %#llx (%s), IOReport %s, battery %s",
+                        (unsigned long long)ios_pp.cid, ios_pp.cru_fn ? "reader found" : "no reader",
+                        ios_pp.ior_sub ? "subscribed" : "not subscribed", ios_pp.battery ? "entry found" : "no entry" );
+    }
+    ios_pp.ms += dt_ms;
+    ios_pp.cpu_mj += cpu_mj;
+    ios_pp.cpu_p_mj += cpu_p_mj;
+    ios_pp.billed_mj += billed_mj;
+    ios_pp.serviced_mj += serviced_mj;
+    if (now_ns - ios_pp.last_ns < 5000000000ull || ios_pp.ms <= 0) return;
+    ios_pp.last_ns = now_ns;
+    ms = ios_pp.ms;
+    n = snprintf( line, sizeof(line), "[power] %s %.1f s: cpu %.2f W (P %.2f; rusage), billed %.2f W, serviced %.2f W", wall,
+                  ms / 1000.0, ios_pp.cpu_mj / ms, ios_pp.cpu_p_mj / ms, ios_pp.billed_mj / ms, ios_pp.serviced_mj / ms );
+
+    /* the resource coalition: GPU energy and time the driver charged to it */
+    {
+        struct ios_pp_cru cru;
+        int ok = 0, err = 0;
+        memset( &cru, 0, sizeof(cru) );
+        if (ios_pp.cid && ios_pp.cru_fn) { ok = !ios_pp.cru_fn( ios_pp.cid, &cru, sizeof(cru) ); if (!ok) err = errno; }
+        if (ok && ios_pp.have_cru)
+            n += snprintf( line + n, sizeof(line) - n, " | coalition: gpu %.2f W, busy %.0f%%, cpu %.2f W, ane %.2f W, "
+                           "billed to us: cpu %.2f W gpu %.2f W",
+                           (double)(cru.gpu_energy_nj - ios_pp.cru_prev.gpu_energy_nj) / 1e6 / ms,
+                           (double)(cru.gpu_time - ios_pp.cru_prev.gpu_time) / 1e4 / ms,
+                           (double)(cru.energy - ios_pp.cru_prev.energy) / 1e6 / ms,
+                           (double)(cru.ane_energy_nj - ios_pp.cru_prev.ane_energy_nj) / 1e6 / ms,
+                           (double)(cru.energy_billed_to_me - ios_pp.cru_prev.energy_billed_to_me) / 1e6 / ms,
+                           (double)(cru.gpu_energy_nj_billed_to_me - ios_pp.cru_prev.gpu_energy_nj_billed_to_me) / 1e6 / ms );
+        else if (!ok && !ios_pp.said_coal++)
+            n += snprintf( line + n, sizeof(line) - n, " | coalition unavailable (%s, errno %d)",
+                           !ios_pp.cid ? "no coalition id" : !ios_pp.cru_fn ? "no coalition_info_resource_usage" : "refused", err );
+        if (ok) { ios_pp.cru_prev = cru; ios_pp.have_cru = 1; }
+    }
+
+    /* IOReport "Energy Model": the SoC's own energy counters */
+    if (ios_pp.ior_prev)
+    {
+        ios_cf_t cur = ios_pp.ior_samples( ios_pp.ior_sub, ios_pp.ior_subbed, NULL ), delta = NULL, arr = NULL;
+        double gpu = 0, gpu_parts = 0, cpu = 0, cpu_parts = 0, dram = 0;
+        int named = 0, gpu_seen = 0, cpu_seen = 0, nn = 0;
+        char names[600];
+        names[0] = 0;
+        if (cur && (delta = ios_pp.ior_delta( ios_pp.ior_prev, cur, NULL ))) arr = ios_pp.dict_get( delta, ios_pp.k_channels );
+        if (arr)
+        {
+            long c, count = ios_pp.arr_count( arr );
+            for (c = 0; c < count; c++)
+            {
+                ios_cf_t ch = ios_pp.arr_at( arr, c ), nm = ch ? ios_pp.ior_name( ch ) : NULL, un = ch ? ios_pp.ior_unit( ch ) : NULL;
+                char name[64] = "", unit[16] = "";
+                double mj;
+                if (!nm || !ios_pp.str_get( nm, name, sizeof(name), IOS_CF_UTF8 )) continue;
+                if (un) ios_pp.str_get( un, unit, sizeof(unit), IOS_CF_UTF8 );
+                mj = ios_pp_ior_mj( ios_pp.ior_int( ch, 0 ), unit );
+                if (!ios_pp.listed_ior && nn < (int)sizeof(names) - 96)
+                    nn += snprintf( names + nn, sizeof(names) - nn, " %s=%.1f%s", name, mj, mj < 0 ? "(unit?)" : "" );
+                if (mj < 0) continue;
+                named++;
+                if (!strcmp( name, "GPU Energy" )) { gpu += mj; gpu_seen = 1; }
+                else if (!strncmp( name, "GPU", 3 )) gpu_parts += mj;
+                else if (!strcmp( name, "CPU Energy" )) { cpu += mj; cpu_seen = 1; }
+                else if (strstr( name, "CPU" )) cpu_parts += mj;
+                else if (!strncmp( name, "DRAM", 4 )) dram += mj;
+            }
+        }
+        if (named)
+        {
+            n += snprintf( line + n, sizeof(line) - n, " | IOReport: gpu %.2f W, cpu %.2f W, dram %.2f W",
+                           (gpu_seen ? gpu : gpu_parts) / ms, (cpu_seen ? cpu : cpu_parts) / ms, dram / ms );
+            if (!ios_pp.listed_ior++) wine_log_write( "[power] IOReport Energy Model channels (mJ in these %.1f s):%s", ms / 1000.0, names );
+        }
+        else if (!ios_pp.said_ior++)
+            n += snprintf( line + n, sizeof(line) - n, " | IOReport unavailable (no energy channel in the samples)" );
+        if (delta) ios_pp.release( delta );
+        if (cur) { ios_pp.release( ios_pp.ior_prev ); ios_pp.ior_prev = cur; }
+    }
+    else if (!ios_pp.said_ior++)
+        n += snprintf( line + n, sizeof(line) - n, " | IOReport unavailable (%s)",
+                       !ios_pp.ior_channels ? "libIOReport not loaded" : "no Energy Model subscription" );
+
+    /* the battery: the whole device's power while unplugged */
+    {
+        int64_t mv = 0, ma = 0;
+        ios_cf_t v = NULL, a = NULL;
+        if (ios_pp.battery)
+        {
+            v = ios_pp.io_prop( ios_pp.battery, ios_pp.k_volt, NULL, 0 );
+            a = ios_pp.io_prop( ios_pp.battery, ios_pp.k_amp, NULL, 0 );
+        }
+        if (ios_pp_num( v, &mv ) && ios_pp_num( a, &ma ) && mv > 0)
+            n += snprintf( line + n, sizeof(line) - n, " | battery %.2f V x %lld mA = %.2f W (%s)", mv / 1000.0, (long long)ma,
+                           (ma < 0 ? -ma : ma) * (double)mv / 1e6, ma < 0 ? "discharging: the whole device" : "charging" );
+        else if (!ios_pp.said_batt++)
+            n += snprintf( line + n, sizeof(line) - n, " | battery unavailable (%s)",
+                           !ios_pp.io_prop ? "IOKit not loaded" : !ios_pp.battery ? "no AppleSmartBattery entry" : "properties not readable" );
+        if (v) ios_pp.release( v );
+        if (a) ios_pp.release( a );
+    }
+    wine_log_write( "%s", line );
+
+    /* the threads that used the most energy in these 5 s */
+    n = snprintf( line, sizeof(line), "[power-t] %s top threads, W (P/E):", wall );
+    for (i = 0; i < 10 && n < (int)sizeof(line) - 64; i++)
+    {
+        int b = -1, k;
+        for (k = 0; k < ios_pp_nthr; k++)
+            if (ios_pp_thr[k].tid && (b < 0 || ios_pp_thr[k].p_mj + ios_pp_thr[k].e_mj > ios_pp_thr[b].p_mj + ios_pp_thr[b].e_mj)) b = k;
+        if (b < 0 || ios_pp_thr[b].p_mj + ios_pp_thr[b].e_mj <= 0) break;
+        if (ios_pp_thr[b].wtid)
+            n += snprintf( line + n, sizeof(line) - n, " %s%04x:%.3f(%.3f/%.3f)", ios_pp_thr[b].role[0] ? ios_pp_thr[b].role : "-",
+                           ios_pp_thr[b].wtid, (ios_pp_thr[b].p_mj + ios_pp_thr[b].e_mj) / ms, ios_pp_thr[b].p_mj / ms,
+                           ios_pp_thr[b].e_mj / ms );
+        else if (ios_pp_thr[b].pri >= 0)
+            n += snprintf( line + n, sizeof(line) - n, " m%llu/%d:%.3f(%.3f/%.3f)", (unsigned long long)ios_pp_thr[b].tid,
+                           ios_pp_thr[b].pri, (ios_pp_thr[b].p_mj + ios_pp_thr[b].e_mj) / ms, ios_pp_thr[b].p_mj / ms,
+                           ios_pp_thr[b].e_mj / ms );
+        else
+            n += snprintf( line + n, sizeof(line) - n, " m%llu:%.3f(%.3f/%.3f)", (unsigned long long)ios_pp_thr[b].tid,
+                           (ios_pp_thr[b].p_mj + ios_pp_thr[b].e_mj) / ms, ios_pp_thr[b].p_mj / ms, ios_pp_thr[b].e_mj / ms );
+        ios_pp_thr[b].tid = 0;   /* printed */
+    }
+    wine_log_write( "%s", line );
+    ios_pp_nthr = 0;
+    ios_pp.ms = ios_pp.cpu_mj = ios_pp.cpu_p_mj = ios_pp.billed_mj = ios_pp.serviced_mj = 0;
+}
+
 static void ios_xprobe_main( void )
 {
     static struct ios_xp_row rows[1024];
@@ -1970,6 +2289,17 @@ static void ios_xprobe_main( void )
                                 r->minst = (double)((cur[0].instr - pv->c[0].instr) + (cur[1].instr - pv->c[1].instr)) / 1e6;
                                 r->role = NULL;
                                 for (i = 0; i < ios_xp_nroles; i++) if (ios_xp_roles[i].tid == idi.thread_id) { r->role = ios_xp_roles[i].role; break; }
+                                if (ios_power_probe_on)   /* madeira-bcd power probe: this thread's energy on P and E cores */
+                                {
+                                    struct ios_pp_thr *pp = ios_pp_thread( idi.thread_id, w, r->role, (double)(cur[0].nj - pv->c[0].nj) / 1e6,
+                                                                           (double)(cur[1].nj - pv->c[1].nj) / 1e6 );
+                                    if (pp && pp->pri == -2)   /* a native thread, first time in this window: its base priority (QoS) */
+                                    {
+                                        thread_extended_info_data_t xi; mach_msg_type_number_t xc = THREAD_EXTENDED_INFO_COUNT;
+                                        pp->pri = thread_info( th[k], THREAD_EXTENDED_INFO, (thread_info_t)&xi, &xc ) == KERN_SUCCESS
+                                                  ? xi.pth_priority : -1;
+                                    }
+                                }
                                 if (r->role && strchr( r->role, 'P' ) && teb && pt + et >= 1.0)
                                 {
                                     uint32_t gp = 0;
@@ -2057,6 +2387,11 @@ static void ios_xprobe_main( void )
                 wine_log_write( "%s", line );
             }
             if (!(gen & 3)) ios_xp_api_report( wall, XP_MS( now - t_start ) / 1000.0 );   /* ml1131: ~1 s */
+            if (ios_power_probe_on)   /* madeira-bcd power probe: every 5 s; ri_penergy_nj is the uint64 after ri_energy_nj in v6 */
+                ios_power_probe_tick( wall, ios_bg_now_ns(), dt_ms, (double)(ru.ri_energy_nj - pru.ri_energy_nj) / 1e6,
+                                      (double)((&ru.ri_energy_nj)[1] - (&pru.ri_energy_nj)[1]) / 1e6,
+                                      (double)(ru.ri_billed_energy - pru.ri_billed_energy) / 1e6,
+                                      (double)(ru.ri_serviced_energy - pru.ri_serviced_energy) / 1e6 );
         }
         else if (ru_rc && gen < 4) wine_log_write( "[xp] ml1128 proc_pid_rusage v6 failed rc=%d errno=%d", ru_rc, errno );
         if (!ru_rc) { pru = ru; have_ru = 1; }
@@ -5022,7 +5357,10 @@ void server_init_process_done(void)
         {
             /* 1: no thread-suspending samplers ([thread-sample], [rip-profile], [cpu-split], [wprof]) and rare memory walks; [xp] unchanged */
             const char *lean_env = getenv("MADEIRA_LEAN_DIAG");
+            /* 1: a [power] line every 5 s (coalition GPU energy, IOReport, battery) and [power-t] (energy per thread) */
+            const char *probe_env = getenv("MADEIRA_POWER_PROBE");
             ios_lean_diag = lean_env && *lean_env && strcmp(lean_env, "0") != 0;
+            ios_power_probe_on = probe_env && *probe_env && strcmp(probe_env, "0") != 0;
             if (ios_lean_diag)
                 wine_log_write("[lean-diag] madeira-bcd MADEIRA_LEAN_DIAG=%s: [thread-sample] bursts, guest RIP profile ([rip-profile], "
                                "[cpu-split]) and [wprof] off; [sync-census] every 20 s and [xp]/[xp-t]/[xp-api] every 250 ms / 1 s as "
