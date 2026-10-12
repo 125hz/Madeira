@@ -2009,6 +2009,49 @@ NTSTATUS WINAPI NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL 
 {
     NTSTATUS status;
 #ifdef WINE_IOS
+    /* madeira-bcd: a 64-bit C++ throw carries the image base its ThrowInfo
+     * RVAs are relative to (parameter 3, from RtlPcToFileHeader(ThrowInfo)).
+     * When the ThrowInfo pointer is a JIT-pool alias of the image (native code
+     * computing its own data address runs from the pool copy) no module owns
+     * it, the base comes out 0 and __CxxFrameHandler4 faults reading 0+RVA
+     * (Ghost of Tsushima: AV READ of 0x16694 in VCRUNTIME140_1 after a save).
+     * Map the pointer back to the PE image and fill in the base. Upstream's
+     * RtlPcToFileHeader patch (ios_patch_rtl_pc_to_file_header) fixes the base
+     * where it is computed; this second layer catches a throw that still
+     * arrives with base 0 or a pool-alias ThrowInfo. */
+    if (rec && rec->ExceptionCode == 0xE06D7363 && rec->NumberParameters == 4 && rec->ExceptionInformation[2])
+    {
+        extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+        static LONG fixes, seen;
+        ULONG_PTR info = rec->ExceptionInformation[2], base = rec->ExceptionInformation[3];
+        uint64_t mod = 0, pe = ios_jit_reverse_translate( info, &mod );
+        const char *how = NULL;
+
+        if (pe && mod)
+        {
+            rec->ExceptionInformation[2] = pe;
+            rec->ExceptionInformation[3] = mod;
+            how = "pool alias -> PE image";
+        }
+        else if (!base)
+        {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!NtQueryVirtualMemory( NtCurrentProcess(), (void *)info, MemoryBasicInformation,
+                                       &mbi, sizeof(mbi), NULL ) && mbi.Type == MEM_IMAGE)
+            {
+                rec->ExceptionInformation[3] = (ULONG_PTR)mbi.AllocationBase;
+                how = "base 0 -> owning image";
+            }
+            else how = "base 0, NO owning image (left as is)";
+        }
+        if (how && InterlockedIncrement( &fixes ) <= 32)
+            ERR_(seh)( "[cxx-throw] #%d ThrowInfo %p base %p -> %p base %p: %s (addr %p)\n", (int)fixes,
+                       (void *)info, (void *)base, (void *)rec->ExceptionInformation[2],
+                       (void *)rec->ExceptionInformation[3], how, rec->ExceptionAddress );
+        else if (!how && InterlockedIncrement( &seen ) <= 4)
+            ERR_(seh)( "[cxx-throw] ok ThrowInfo %p base %p (addr %p)\n",
+                       (void *)info, (void *)base, rec->ExceptionAddress );
+    }
     /* ml845: the engine's thread-naming exception is where a bogus "stack base"
      * reaches its per-thread state. Watch the slot across this dispatch. */
     if (rec && rec->ExceptionCode == 0x406D1388)
