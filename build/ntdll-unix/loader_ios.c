@@ -2176,6 +2176,11 @@ static void load_ntdll_functions( HMODULE module )
             void *f = (void *)find_named_export( module, exports, "RtlPcToFileHeader" );
             if (f) ios_patch_rtl_pc_to_file_header( module, f );
         }
+        {   /* madeira-bcd: the [exec-req] path of NtProtectVirtualMemory leaves the
+             * syscall callback (virtual_ios.c, opt-in MADEIRA_EXECREQ_LEAVE=1) */
+            extern int ios_patch_execreq_leave( void *module );
+            ios_patch_execreq_leave( module );
+        }
     }
 
     /* Sync dispatcher pointers to JIT pool .data copy.
@@ -2523,6 +2528,11 @@ static int ios_load_child_ec_ntdll( PEB *child_peb )
             extern int ios_patch_rtl_pc_to_file_header( void *module, const void *export_addr );
             void *f = (void *)find_named_export( module, exports, "RtlPcToFileHeader" );
             if (f) ios_patch_rtl_pc_to_file_header( module, f );
+        }
+        {   /* madeira-bcd: the [exec-req] path of NtProtectVirtualMemory leaves the
+             * syscall callback (virtual_ios.c, opt-in MADEIRA_EXECREQ_LEAVE=1) */
+            extern int ios_patch_execreq_leave( void *module );
+            ios_patch_execreq_leave( module );
         }
 
         /* Sync all written slots into the pool copy (PE code reads there). */
@@ -3892,6 +3902,13 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
                 {
                     extern int ios_patch_rtl_pc_to_file_header_current( const void *pe_addr );
                     ios_patch_rtl_pc_to_file_header_current( pLdrInitializeThunk );
+                }
+                /* madeira-bcd: and the [exec-req] leave fix (virtual_ios.c,
+                 * opt-in MADEIRA_EXECREQ_LEAVE=1):
+                 * GTA V Enhanced runs in such a child. */
+                {
+                    extern int ios_patch_execreq_leave_current( const void *pe_addr );
+                    ios_patch_execreq_leave_current( pLdrInitializeThunk );
                 }
             }
         }

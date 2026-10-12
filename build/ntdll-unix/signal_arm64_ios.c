@@ -9919,6 +9919,31 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                     int i, plausible = 0;
 
                     ERR("  [guest-state] x28=%p rip=%p\n", (void*)state, (void*)cs[0]);
+                    /* madeira-bcd: name the image section the guest RIP is in, and
+                     * Wine's protection of its page. A NoExec trap (FEX's deliberate
+                     * load from 0) inside an image means the emulator does not know
+                     * the range as executable: an executable section here points at
+                     * the emulator, a data section with an executable vprot at a
+                     * protect it was never told about, a data section without one at
+                     * a wrong jump target (GTA V Enhanced's NoExec crash). */
+                    {
+                        extern int ios_image_section_describe( unsigned long long va, char *buf, size_t len,
+                                                               unsigned long long *img_base );
+                        extern unsigned char ios_reclaim_page_vprot( unsigned long long va );
+                        static int rip_sec_n;
+                        char rsec[160];
+                        unsigned long long ib = 0;
+
+                        if (rip_sec_n < 8 && ios_image_section_describe( cs[0], rsec, sizeof(rsec), &ib ))
+                        {
+                            rip_sec_n++;
+                            /* vprot is Wine's view of the address itself: meaningful
+                             * for a PE address, 0 for a pool copy (not Wine-managed). */
+                            ERR("  [guest-rip-sec] rip=%p in image %p: %s, vprot=%#x\n",
+                                (void*)cs[0], (void*)ib, rsec,
+                                (unsigned)ios_reclaim_page_vprot( cs[0] ));
+                        }
+                    }
                     /* ml885: State.rip is only the block ENTRY. Resolve the exact
                      * guest instruction from the block tail, and show its bytes,
                      * so a fault names the x86 instruction rather than the block.
