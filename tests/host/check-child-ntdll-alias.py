@@ -16,7 +16,15 @@ Replays a GTA V Enhanced child layout: ntdll at PE 0x71ffcd0000, session copy
     of invoke_arm64ec_syscall (copy + 0x87050) reverse-translates to the PE VA,
     which is what [pool-rip-fix] needs;
   - a dead (size 0) copy is never taken for the child's own;
-  - a dying registrant's callback is dropped before its pool is reclaimed.
+  - a dying registrant's callback is dropped before its pool is reclaimed;
+  - with per-process pushes (MADEIRA_ALIAS_PER_PROCESS, on by default; 0 is
+    the last-registrant rule above) an image goes to the emulator of the
+    process that maps it, a process whose emulator has not registered yet
+    keeps its images for its own drain, and a registration drains its own
+    mappings first and other processes' only while 96 of FEX's 256 entries
+    stay free (GTA V Enhanced build 372: RockstarService.exe started with a
+    nearly full table and died in its WINTRUST/cryptnet delay-load stubs).
+The harness runs once per mode.
 Needs python3 and a C compiler (AddressSanitizer/UBSan when available).
 """
 from pathlib import Path
@@ -41,7 +49,8 @@ def between(source, first, last):
 
 # The callback drop runs before the pool is reclaimed.
 reclaim = function(native, 'void ios_jit_reclaim_process( void *peb )')
-drop = re.search(r'    if \(peb == ios_jit_alias_pushback_peb && ios_jit_alias_pushback_cb\)\n    \{\n.*?\n    \}\n',
+drop = re.search(r'    ios_alias_cb_drop\( peb \);[^\n]*\n'
+                 r'    if \(peb == ios_jit_alias_pushback_peb && ios_jit_alias_pushback_cb\)\n    \{\n.*?\n    \}\n',
                  reclaim, re.S)
 assert drop and drop.start() < reclaim.index('pthread_mutex_lock( &ios_pool_lock )'), \
     'the dying registrant must lose the callback before its pool copy is reclaimed'
@@ -69,7 +78,9 @@ static void ios_resolve_fex_exports( void ) { }
 code += between(native, '#define IOS_JIT_MAX_MAPPINGS', '\n};')
 code += 'static struct ios_jit_mapping ios_jit_mappings[IOS_JIT_MAX_MAPPINGS];\n'
 code += 'static int ios_jit_mapping_count = 0;\n'
-code += between(native, 'static void (*ios_jit_alias_pushback_cb)', 'static void *ios_jit_alias_pushback_peb = NULL;')
+start = native.index('static void (*ios_jit_alias_pushback_cb)')
+end = native.index('\n}', native.index('static void ios_alias_cb_drop( void *peb )', start)) + 2
+code += native[start:end] + '\n'   # the callback, its owner, the per-process callbacks and their lookups
 code += function(native, 'void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)')
 code += between(native, 'struct ios_push_jit_aliases_args {', '\n};')
 code += function(native, 'static int ios_jit_owned_copy( void *pe_base, void *peb )')
@@ -106,6 +117,8 @@ static uint64_t fex_fwd( struct fex *f, uint64_t a )
 }
 static void cb_main( unsigned long long p, unsigned long long j, unsigned long long s ) { fex_add( &fex_main, p, j, s ); }
 static void cb_child( unsigned long long p, unsigned long long j, unsigned long long s ) { fex_add( &fex_child, p, j, s ); }
+static struct fex fex_svc;
+static void cb_svc( unsigned long long p, unsigned long long j, unsigned long long s ) { fex_add( &fex_svc, p, j, s ); }
 
 #define MAIN_PEB  ((void *)0x71ffff0000ull)
 #define CHILD_PEB ((void *)0x10999c000ull)
@@ -125,8 +138,9 @@ static void add_child_copy( uint64_t jit, size_t size, void *owner )
     ios_jit_mappings[s].pe_base = (void *)NT_PE;
 }
 
-int main( void )
+int main( int argc, char **argv )
 {
+    const int pp = argc > 1 && !strcmp( argv[1], "pp" );   /* per-process pushes */
     struct ios_push_jit_aliases_args reg;
 
     /* Session boot: ntdll and an image, then the main emulator registers. */
@@ -151,7 +165,8 @@ int main( void )
     cur_peb = CHILD_PEB;
     ios_jit_add_mapping( (void *)0x140000000ull, (void *)0x14a022000ull, 0x5b81000 );     /* GTA5_Enhanced.exe */
     ios_jit_add_mapping( (void *)0x71fcdb0000ull, (void *)0x14fce0000ull, 0x40f000 );     /* its libarm64ecfex */
-    assert( fex_rev( &fex_main, 0x14a022010ull ) == 0x140000010ull );                       /* still pushed to main */
+    /* per-process: the child keeps them for its own drain; old rule: the main gets them */
+    assert( fex_rev( &fex_main, 0x14a022010ull ) == (pp ? 0x14a022010ull : 0x140000010ull) );
     int main_adds = fex_main.adds;
 
     reg.callback = cb_child;
@@ -167,20 +182,78 @@ int main( void )
     assert( fex_rev( &fex_child, NT_MAIN + SYSCALL_HELPER ) == NT_MAIN + SYSCALL_HELPER );
     assert( fex_rev( &fex_child, 0x160000000ull + SYSCALL_HELPER ) == 0x160000000ull + SYSCALL_HELPER );
 
-    /* After the child registered every later image goes to its emulator, as before. */
+    /* After the child registered: the main maps an image, the child maps one.
+     * Per-process: each goes to its own emulator. Old rule: both go to the
+     * child's, the last registrant. */
     cur_peb = MAIN_PEB;
     ios_jit_add_mapping( (void *)0x71f0000000ull, (void *)0x151000000ull, 0x10000 );
-    assert( fex_rev( &fex_child, 0x151000010ull ) == 0x71f0000010ull );
+    if (pp)
+    {
+        assert( fex_rev( &fex_main, 0x151000010ull ) == 0x71f0000010ull );
+        assert( fex_rev( &fex_child, 0x151000010ull ) == 0x151000010ull );
+        main_adds = fex_main.adds;
+    }
+    else
+        assert( fex_rev( &fex_child, 0x151000010ull ) == 0x71f0000010ull );
+    cur_peb = CHILD_PEB;
+    ios_jit_add_mapping( (void *)0x71f1000000ull, (void *)0x151100000ull, 0x10000 );
+    assert( fex_rev( &fex_child, 0x151100010ull ) == 0x71f1000010ull );
 
-    /* The child dies: its callback is dropped, the next map calls nothing. */
+    /* The child dies: its callback is dropped; the next map by the child calls
+     * nothing, the main's goes to the main's own emulator (per-process) or
+     * nowhere (old rule). */
     int child_adds = fex_child.adds;
     reclaim_drop( MAIN_PEB );                                   /* not the registrant: kept */
     assert( ios_jit_alias_pushback_cb == cb_child );
+    if (pp) ios_alias_cb_set( MAIN_PEB, cb_main );              /* the main lives on: its own callback stays */
     reclaim_drop( CHILD_PEB );
     assert( !ios_jit_alias_pushback_cb && !ios_jit_alias_pushback_peb );
+    assert( !ios_alias_cb_for( CHILD_PEB ) );
+    cur_peb = CHILD_PEB;                                        /* a late thread of the child maps: nowhere */
+    ios_jit_add_mapping( (void *)0x71f3000000ull, (void *)0x151300000ull, 0x10000 );
+    assert( fex_child.adds == child_adds );
+    cur_peb = MAIN_PEB;
     ios_jit_add_mapping( (void *)0x71f2000000ull, (void *)0x151200000ull, 0x10000 );
-    assert( fex_child.adds == child_adds && fex_main.adds == main_adds );
-    printf( "child gets its own ntdll copy, main unchanged\n" );
+    assert( fex_child.adds == child_adds );
+    if (pp)
+        assert( fex_main.adds == main_adds + 1 && fex_rev( &fex_main, 0x151200010ull ) == 0x71f2000010ull );
+    else
+        assert( fex_main.adds == main_adds );
+
+    /* Build 372: a service registers while 300 images of another process are in
+     * the table. Its own come first and all of them land; the others stop at
+     * 256 - 96 pushes; a late image it maps (WINTRUST) still finds room. */
+    if (pp)
+    {
+        void *const SVC = (void *)0x10eea8000ull, *const OTHER = (void *)0x107a00000ull;
+        int k;
+        cur_peb = OTHER;
+        for (k = 0; k < 300; k++)
+            ios_jit_add_mapping( (void *)(0x7000000000ull + k * 0x100000ull), (void *)(0x160000000ull + k * 0x100000ull), 0x10000 );
+        cur_peb = SVC;
+        for (k = 0; k < 40; k++)
+            ios_jit_add_mapping( (void *)(0x7200000000ull + k * 0x100000ull), (void *)(0x190000000ull + k * 0x100000ull), 0x10000 );
+        reg.callback = cb_svc;
+        assert( unixcall_ios_push_jit_aliases( &reg ) == STATUS_SUCCESS );
+        assert( fex_svc.n <= 256 - 96 );
+        for (k = 0; k < 40; k++)
+            assert( fex_rev( &fex_svc, 0x190000010ull + k * 0x100000ull ) == 0x7200000010ull + k * 0x100000ull );
+        ios_jit_add_mapping( (void *)0x7300000000ull, (void *)0x1a0000000ull, 0x10000 );      /* WINTRUST */
+        assert( fex_rev( &fex_svc, 0x1a0000010ull ) == 0x7300000010ull );
+        cur_peb = OTHER;                                        /* no emulator yet: kept for its own drain */
+        ios_jit_add_mapping( (void *)0x7310000000ull, (void *)0x1a1000000ull, 0x10000 );
+        assert( fex_rev( &fex_svc, 0x1a1000010ull ) == 0x1a1000010ull );
+        cur_peb = NULL;                                         /* no PEB at all: the last registrant */
+        ios_jit_add_mapping( (void *)0x7318000000ull, (void *)0x1a1800000ull, 0x10000 );
+        assert( fex_rev( &fex_svc, 0x1a1800010ull ) == 0x7318000010ull );
+        cur_peb = OTHER;
+        ios_alias_cb_set( OTHER, cb_main );                     /* with one: its own, not the service's */
+        ios_jit_add_mapping( (void *)0x7320000000ull, (void *)0x1a2000000ull, 0x10000 );
+        assert( fex_rev( &fex_svc, 0x1a2000010ull ) == 0x1a2000010ull );
+        assert( fex_rev( &fex_main, 0x1a2000010ull ) == 0x7320000010ull );
+    }
+    printf( "PASS (%s): child gets its own ntdll copy, main unchanged\n",
+            pp ? "per-process pushes" : "the last registrant gets the pushes" );
     return 0;
 }
 '''
@@ -200,12 +273,26 @@ with tempfile.TemporaryDirectory(prefix='madeira-child-ntdll-alias-') as directo
         r = subprocess.run(flags, capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
         print('built without sanitizers')
-    result = subprocess.run([str(executable)], capture_output=True, text=True)
-    assert result.returncode == 0, result.stdout + result.stderr
-    err = result.stderr
-    assert err.count('[alias-push] peb=0x10999c000 registered its emulator: 1 image(s) mapped to this '
-                     'process\'s own copy') == 1, err
-    assert '[alias-push] peb=0x71ffff0000 registered' not in err, err
-    assert err.count('callback dropped before its pool copy is reclaimed') == 1, err
+    for value, mode in [(None, 'pp'), ('1', 'pp'), ('', 'pp'), ('0', 'last')]:
+        env = dict(os.environ)
+        env.pop('MADEIRA_ALIAS_PER_PROCESS', None)
+        if value is not None:
+            env['MADEIRA_ALIAS_PER_PROCESS'] = value
+        result = subprocess.run([str(executable), mode], env=env, capture_output=True, text=True)
+        assert result.returncode == 0, result.stdout + result.stderr
+        print(f'MADEIRA_ALIAS_PER_PROCESS={value!r}: {result.stdout.strip()}')
+        err = result.stderr
+        assert err.count('[alias-push] peb=0x10999c000 registered its emulator: 1 image(s) mapped to this '
+                         'process\'s own copy') == 1, err
+        assert '[alias-push] peb=0x71ffff0000 registered' not in err, err
+        assert err.count('callback dropped before its pool copy is reclaimed') == 1, err
+        left = re.findall(r'\[alias-push\] peb=(0x[0-9a-f]+): (\d+) mapping\(s\) pushed, (\d+) of other processes '
+                          r'left out to keep 96 table entries free', err)
+        if mode == 'pp':
+            assert len(left) == 1 and left[0][0] == '0x10eea8000' and int(left[0][1]) == 256 - 96 \
+                and int(left[0][2]) > 0, err
+        else:
+            assert not left, err
 print('PASS: a child emulator maps ntdll to the child copy, the main is unchanged, '
-      'a dead registrant loses the callback')
+      'a dead registrant loses the callback; per-process pushes (default) route each image to the '
+      'emulator of the process that maps it and keep room in a new table for late images')

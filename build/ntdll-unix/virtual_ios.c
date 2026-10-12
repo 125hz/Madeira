@@ -2955,8 +2955,95 @@ static void (*ios_jit_alias_pushback_cb)(unsigned long long, unsigned long long,
  * (ios_push_subfloor_window). */
 static void *ios_jit_alias_pushback_peb = NULL;
 
+/* madeira-bcd: PER-PROCESS alias pushes (env MADEIRA_ALIAS_PER_PROCESS, default
+ * on; 0 restores the single last-registrant callback above).
+ *
+ * Each x64 pseudo-process has its own 256-entry IosAliasEntries table. Two
+ * things filled the wrong ones (GTA V Enhanced, build 372, 2026-10-04 08:08 log):
+ * an image mapped after a later process registered went to THAT process's table
+ * (Launcher's d3d11/dxgi/oleaut32 to the RockstarService start helper's), and
+ * every registration drained every process's mappings into the new table
+ * (28, 114, 141, 166, 196, 232, then 250-268 pushes), so a RockstarService
+ * started with a nearly full table. Its later WINTRUST.dll / cryptnet.dll
+ * stayed unregistered, the delay-load stub ran from the pool copy with no
+ * pool -> PE translation ("[iOS-xquery] MISS ... rev=" the same address,
+ * "NoExec instruction in entry block"), the service died with c0000005, the
+ * launcher reported "Failed to connect to the Rockstar Games Library Service",
+ * and five restarts later the JIT pool was exhausted.
+ *
+ * Now each registered emulator keeps its own callback: an image goes to the
+ * emulator of the process that maps it; a known process without one yet keeps
+ * the image for its own drain, and only an image mapped with no PEB at all
+ * goes to the last registrant as before. The drain pushes the registering
+ * process's own and unattributed mappings first and other processes' only
+ * while the table keeps IOS_ALIAS_DRAIN_RESERVE entries free. */
+#define IOS_ALIAS_REG_MAX       32    /* emulators with a callback of their own */
+#define IOS_FEX_ALIAS_MAX       256   /* kMaxEntries in FEX's IosJitAlias.cpp */
+#define IOS_ALIAS_DRAIN_RESERVE 96
+typedef void (*ios_alias_cb_t)(unsigned long long, unsigned long long, unsigned long long);
+static struct { void *peb; ios_alias_cb_t cb; } ios_alias_cbs[IOS_ALIAS_REG_MAX];
+
+static int ios_alias_per_process_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        /* Default on. 0 restores the old pushes: every image goes to the emulator
+         * that registered last, and a registration drains every process's images. */
+        const char *env = getenv( "MADEIRA_ALIAS_PER_PROCESS" );
+        enabled = !(env && env[0] == '0' && !env[1]);
+    }
+    return enabled;
+}
+
+static ios_alias_cb_t ios_alias_cb_for( void *peb )
+{
+    int i;
+
+    if (!peb || !ios_alias_per_process_enabled()) return NULL;
+    for (i = 0; i < IOS_ALIAS_REG_MAX; i++)
+        if (ios_alias_cbs[i].peb == peb) return ios_alias_cbs[i].cb;
+    return NULL;
+}
+
+static void ios_alias_cb_set( void *peb, ios_alias_cb_t cb )
+{
+    int i, slot = -1;
+
+    if (!peb) return;
+    for (i = 0; i < IOS_ALIAS_REG_MAX; i++)
+    {
+        if (ios_alias_cbs[i].peb == peb) { slot = i; break; }
+        if (slot < 0 && !ios_alias_cbs[i].peb) slot = i;
+    }
+    if (slot < 0)
+    {
+        dprintf(2, "[alias-push] peb=%p: no free per-process callback slot (%d), "
+                "its images go to the last registrant\n", peb, IOS_ALIAS_REG_MAX);
+        return;
+    }
+    ios_alias_cbs[slot].cb = cb;
+    __sync_synchronize();
+    ios_alias_cbs[slot].peb = peb;
+}
+
+static void ios_alias_cb_drop( void *peb )
+{
+    int i;
+
+    if (!peb) return;
+    for (i = 0; i < IOS_ALIAS_REG_MAX; i++)
+        if (ios_alias_cbs[i].peb == peb)
+        {
+            ios_alias_cbs[i].peb = NULL;
+            __sync_synchronize();
+            ios_alias_cbs[i].cb = NULL;
+        }
+}
+
 void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
 {
+    ios_alias_cb_t own_cb;
     int i;
 
     /* Task #33: purge every entry whose PE range OVERLAPS the new image's.
@@ -3041,6 +3128,18 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
      * (via the unix_ios_push_jit_aliases unix-call), forward this new
      * mapping to it too. Early mappings (added before xtajit64 loads) are
      * picked up by the iteration in unix_ios_push_jit_aliases. */
+    if ((own_cb = ios_alias_cb_for( ios_jit_current_peb() )))
+        own_cb((unsigned long long)(uintptr_t)pe_base, (unsigned long long)(uintptr_t)jit_base,
+               (unsigned long long)size);
+    /* madeira-bcd: per-process, a known process whose emulator has not
+     * registered yet keeps its image to itself -- its drain pushes it (map_peb
+     * == self). Handing it to the last registrant left a dead entry there once
+     * the process exited and its pool range was reused: GTA V Enhanced build
+     * 376 (2026-10-04 10:29), RockstarService.exe's "start" instance mapped its
+     * exe before registering, the launcher's emulator got it, and the
+     * launcher's cryptnet.dll later landed on that range and was reverse-
+     * translated to the dead exe. */
+    else if (!(ios_alias_per_process_enabled() && ios_jit_current_peb()))
     {
         /* Loaded once: a child's exit can clear it between a test and a call. */
         void (*cb)(unsigned long long, unsigned long long, unsigned long long) =
@@ -3073,6 +3172,19 @@ void ios_push_subfloor_window( unsigned long long low_base, unsigned long long r
     {
         fprintf( stderr, "ml951: MADEIRA_NO_SUBFLOOR_XQUERY set — NOT pushing window %#llx\n",
                  low_base );
+        return;
+    }
+    /* madeira-bcd: with per-process callbacks (ios_alias_cbs) the owner's own
+     * emulator gets its window even after another process registered later,
+     * which closes the gap named below. Without a registered owner callback the
+     * catch-up loop of the owner's registration delivers it. */
+    if (owner && ios_alias_per_process_enabled())
+    {
+        ios_alias_cb_t own_cb = ios_alias_cb_for( owner );
+        if (!own_cb) return;   /* pushed later by the owner's catch-up loop */
+        fprintf( stderr, "ml951: pushing sub-floor window guest %#llx+%#llx -> real %#llx to FEX (owner %p, own callback)\n",
+                 low_base, size, real_base, owner );
+        own_cb( low_base, real_base, size );
         return;
     }
     void (*cb)(unsigned long long, unsigned long long, unsigned long long) =
@@ -3360,10 +3472,11 @@ NTSTATUS unixcall_ios_push_jit_aliases(void *args)
     /* the registering process is the one running this unix call (PE ntdll's
      * arm64ec_process_init_dispatchers, on its first thread) */
     void *self = ios_jit_current_peb();
-    int i, own_pushed = 0;
+    int i, pass, pushed = 0, own_pushed = 0, others_left = 0;
     if (!params || !params->callback) return STATUS_INVALID_PARAMETER;
     ios_jit_alias_pushback_peb = self;
     __atomic_store_n(&ios_jit_alias_pushback_cb, params->callback, __ATOMIC_RELEASE);
+    if (ios_alias_per_process_enabled()) ios_alias_cb_set( self, params->callback );
 
     /* ml951: any sub-floor window registered before xtajit64 loaded has not been
      * pushed yet — the per-registration push above needs this callback. Catch up,
@@ -3382,18 +3495,41 @@ NTSTATUS unixcall_ios_push_jit_aliases(void *args)
     /* Drain current table to the callback. A child-owned copy shares pe_base
      * with the parent entry and FEX keeps one entry per PE range, so only one
      * of the two is pushed: the registering process's own copy if it has one,
-     * else the parent entry (ios_jit_alias_drain_wants). */
+     * else the parent entry (ios_jit_alias_drain_wants).
+     * madeira-bcd: pass 0 pushes this process's own and unattributed mappings,
+     * pass 1 other processes' while the table keeps IOS_ALIAS_DRAIN_RESERVE
+     * free (see ios_alias_per_process_enabled); one pass when that is off. */
+    for (pass = 0; pass < 2; pass++)
     for (i = 0; i < ios_jit_mapping_count; i++)
     {
+        if (ios_alias_per_process_enabled() && self)
+        {
+            void *mapper = ios_jit_mappings[i].map_peb;
+            int mine = ios_jit_mappings[i].owner_peb == self || !mapper || mapper == self;
+
+            if (mine != !pass) continue;
+            if (pass && ios_jit_alias_drain_wants( i, self ) &&
+                pushed >= IOS_FEX_ALIAS_MAX - IOS_ALIAS_DRAIN_RESERVE)
+            {
+                others_left++;
+                continue;
+            }
+        }
+        else if (pass) break;
         if (!ios_jit_alias_drain_wants( i, self )) continue;
         if (ios_jit_mappings[i].owner_peb) own_pushed++;
         params->callback((unsigned long long)(uintptr_t)ios_jit_mappings[i].pe_base,
                          (unsigned long long)(uintptr_t)ios_jit_mappings[i].jit_base,
                          (unsigned long long)ios_jit_mappings[i].size);
+        pushed++;
     }
     if (own_pushed)
         dprintf(2, "[alias-push] peb=%p registered its emulator: %d image(s) mapped to this "
                 "process's own copy instead of the parent's\n", self, own_pushed);
+    if (others_left)
+        dprintf(2, "[alias-push] peb=%p: %d mapping(s) pushed, %d of other processes left out to keep "
+                "%d table entries free (MADEIRA_ALIAS_PER_PROCESS)\n", self, pushed, others_left,
+                IOS_ALIAS_DRAIN_RESERVE);
     /* ml613: the guaranteed init path — resolve both FEX exports here, where the
      * emulator module is certainly mapped, instead of from a diagnostic probe
      * (ml612's mistake) or from a dying thread inside pthread_exit (needlessly
@@ -9964,6 +10100,7 @@ void ios_jit_reclaim_process( void *peb )
      * dying, its emulator's pool copy is reclaimed below and the next image
      * map anywhere would call freed (later reused) code. Drop the callback:
      * the next emulator to register gets the whole table from its drain. */
+    ios_alias_cb_drop( peb );   /* madeira-bcd: its per-process callback too */
     if (peb == ios_jit_alias_pushback_peb && ios_jit_alias_pushback_cb)
     {
         dprintf(2, "[alias-push] peb=%p exits while its emulator receives the alias pushes: "
