@@ -10151,14 +10151,48 @@ static int ios_wow_guard_neighbour_blocked( ULONG_PTR addr, ULONG_PTR len )
     return a + size >= (mach_vm_address_t)addr + len;
 }
 
+/* A combined 4GB+page mapping may be refused even when the two pieces can
+ * be reserved separately. Own the guard first, without replacing any live
+ * mapping, then reserve the exact window. Publish only the complete pair;
+ * a failed window attempt must release only the guard we just acquired.
+ * Return -1 if cleanup failed, so the caller cannot borrow our leaked guard. */
+static int ios_wow_window_try_separate_guard( ULONG_PTR base, ULONG_PTR guard )
+{
+    void *guard_base;
+
+    if (guard > ~(ULONG_PTR)0 - IOS_WOW_WINDOW_SIZE ||
+        base > ~(ULONG_PTR)0 - IOS_WOW_WINDOW_SIZE - guard ||
+        !ios_wow_band_ok( base, IOS_WOW_WINDOW_SIZE + guard )) return 0;
+    guard_base = (void *)(base + IOS_WOW_WINDOW_SIZE);
+    if (anon_mmap_tryfixed( guard_base, guard, PROT_NONE, MAP_NORESERVE ) == MAP_FAILED)
+        return 0;
+    if (anon_mmap_tryfixed( (void *)base, IOS_WOW_WINDOW_SIZE,
+                            PROT_NONE, MAP_NORESERVE ) == MAP_FAILED)
+    {
+        if (munmap( guard_base, guard ))
+        {
+            dprintf( 2, "[wow-window] B=%p: failed to release own guard page at %p: errno=%d\n",
+                     (void *)base, guard_base, errno );
+            return -1;
+        }
+        return 0;
+    }
+    mmap_add_reserved_area( (void *)base, IOS_WOW_WINDOW_SIZE + guard );
+    dprintf( 2, "[wow-window] B=%p: reserved 4GB + own guard page in separate mappings (+0x%llx)\n",
+             (void *)base, (unsigned long long)guard );
+    return 1;
+}
+
 static int ios_wow_window_try( ULONG_PTR base, unsigned *guard_owned )
 {
     ULONG_PTR guard = ios_wow_guard_size();
     struct ios_wow_placeholder *ph;
     struct ios_wow_window *slot;
     char what[256];
+    int separate;
 
     *guard_owned = 0;
+    if (base > ~(ULONG_PTR)0 - IOS_WOW_WINDOW_SIZE - guard) return 0;
     if (!ios_wow_band_ok( base, IOS_WOW_WINDOW_SIZE )) return 0;
 
     /* A slot still owned by a registry entry (live, dead-awaiting-teardown or
@@ -10203,10 +10237,20 @@ static int ios_wow_window_try( ULONG_PTR base, unsigned *guard_owned )
         return 1;
     }
 
+    separate = ios_wow_window_try_separate_guard( base, guard );
+    if (separate < 0) return 0;
+    if (separate)
+    {
+        *guard_owned = 1;
+        return 1;
+    }
+
     /* an exactly-4GB gap: borrow the guard from the neighbour if — and only
      * if — the neighbour is already inaccessible */
     if (!ios_wow_guard_neighbour_blocked( base + IOS_WOW_WINDOW_SIZE, guard ))
     {
+        ios_va_describe_range( (void *)base, IOS_WOW_WINDOW_SIZE, what, sizeof(what) );
+        dprintf( 2, "[wow-window] B=%p: window body after failed reservations (%s)\n", (void *)base, what );
         ios_va_describe_range( (void *)(base + IOS_WOW_WINDOW_SIZE), guard, what, sizeof(what) );
         dprintf( 2, "[wow-window] B=%p REJECTED: 4GB+guard unavailable and the page at "
                     "%p is not an inaccessible neighbour (%s)\n",
