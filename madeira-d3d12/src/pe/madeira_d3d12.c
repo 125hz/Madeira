@@ -10947,7 +10947,14 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceView(ID3D12Device *This
  *   1 = MIN/MAX: no comparison, and POINT min/mag/mip filtering -- one real
  *       texel of the footprint, never an average of a near and a far depth
  *       that is neither (the closest Metal gets without shader changes);
- *   2 = MIN/MAX: no comparison, the filter as given (only the comparison bug).
+ *   2 = MIN/MAX: no comparison, the filter as given (only the comparison bug);
+ *   3 = MIN/MAX: Metal's own reductionMode (iOS 26, Apple10 GPUs such as the
+ *       A19): the mode rides in WMTSamplerInfo's padding byte after
+ *       support_argument_buffers (0xA1 minimum, 0xA2 maximum) and the patched
+ *       winemetal (DXMT's sampler-reduction change, same key) sets
+ *       it; no comparison, and a NEAREST mip filter becomes LINEAR because
+ *       Metal ignores reductionMode with a nearest mip filter (identical at the
+ *       whole-number LODs a depth pyramid is read at).
  * Every MIN/MAX filter value is logged once with its mapping (default on: a
  * game using one renders wrongly here); sampler-census = 1 logs every
  * distinct filter value. */
@@ -10957,9 +10964,9 @@ static const char *const g_cmp_names[8] = { "Never", "Less", "Equal", "LessEqual
 static void mad_sampler_red_load(void) {
     long long v;
     if (g_smp_red >= 0) return;
-    v = mad_cfg_int_pe("sampler-reduction", 0);    /* fix attempt: MIN/MAX reduction samplers (Metal has none): 1 = point filtering and no comparison, 2 = no comparison only */
+    v = mad_cfg_int_pe("sampler-reduction", 0);    /* MIN/MAX reduction samplers (GoT Hi-Z culling): 3 = Metal reductionMode (iOS 26, A19 / Apple10; the fix), 1 = point filtering and no comparison, 2 = no comparison only */
     g_smp_census = mad_cfg_int_pe("sampler-census", 0) ? 1 : 0;   /* diagnostic: log every distinct sampler filter value once with its Metal mapping */
-    g_smp_red = v == 1 || v == 2 ? (int)v : 0;
+    g_smp_red = v >= 1 && v <= 3 ? (int)v : 0;
     if (g_smp_red || g_smp_census)
         d3d12_log("[sampler] madeira-bcd sampler-reduction=%d sampler-census=%d\n", g_smp_red, g_smp_census);
 }
@@ -10975,7 +10982,8 @@ static void mad_sampler_log(const struct WMTSamplerInfo *si, UINT filter, UINT c
               si->min_filter == WMTSamplerMinMagFilterLinear ? "linear" : "nearest", si->mag_filter == WMTSamplerMinMagFilterLinear ? "linear" : "nearest",
               si->mip_filter == WMTSamplerMipFilterLinear ? "linear" : si->mip_filter == WMTSamplerMipFilterNearest ? "nearest" : "none",
               (unsigned)si->compare_function < 8 ? g_cmp_names[si->compare_function] : "?", (unsigned)si->max_anisotroy,
-              r < 2 ? "" : g_smp_red == 1 ? " -- NO min/max reduction in Metal: point-sampled, comparison dropped (sampler-reduction = 1)"
+              r < 2 ? "" : g_smp_red == 3 ? " -- Metal reductionMode (sampler-reduction = 3; [sampler-reduction] says whether the device took it)"
+                         : g_smp_red == 1 ? " -- NO min/max reduction in Metal: point-sampled, comparison dropped (sampler-reduction = 1)"
                          : g_smp_red == 2 ? " -- NO min/max reduction in Metal: comparison dropped, filter as given (sampler-reduction = 2)"
                          : r == 3 ? " -- NO min/max reduction in Metal, and MAXIMUM taken for a COMPARISON sampler (as before; sampler-reduction = 1 or 2 changes it)"
                                   : " -- NO min/max reduction in Metal: an averaging filter (as before; sampler-reduction = 1 changes it)");
@@ -11006,6 +11014,11 @@ static void mad_sampler_info(struct WMTSamplerInfo *si, UINT filter, UINT au, UI
         if (g_smp_red == 1) {
             si->min_filter = si->mag_filter = WMTSamplerMinMagFilterNearest; si->mip_filter = WMTSamplerMipFilterNearest;
             si->max_anisotroy = 1;
+        } else if (g_smp_red == 3) {
+            ((unsigned char *)si)[__builtin_offsetof(struct WMTSamplerInfo, support_argument_buffers) + 1] = red == 2 ? 0xA1 : 0xA2;
+            if (si->mip_filter == WMTSamplerMipFilterNearest &&
+                (si->min_filter == WMTSamplerMinMagFilterLinear || si->mag_filter == WMTSamplerMinMagFilterLinear))
+                si->mip_filter = WMTSamplerMipFilterLinear;
         }
     }
     if (red >= 2 || g_smp_census) mad_sampler_log(si, filter, cmp, who ? who : "?");
