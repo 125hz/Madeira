@@ -54,6 +54,11 @@
  * in the prefix the tile shows the installed steam.exe's own icon, read at
  * run time from its PE resources (ww_pe_icon: the first RT_GROUP_ICON, its
  * 32-bit 64x64 or 48x48 RT_ICON); no Valve artwork is in the repository.
+ * Round 7: the tile is there only while a Steam window is open, as that
+ * window's program button among the others (its dot, its tap), with the
+ * client's icon in the same 36-point box as every program icon; Steam starts
+ * from the search's Steam row or the library. env.MADEIRA_WINDOWED_STEAM = 1
+ * pins the round 4 tile again (now drawn at the same size).
  *
  * Search (round 5). The taskbar's search field is a launcher: while it is
  * being edited a results panel (WWLauncher, the chrome's material) sits above
@@ -65,6 +70,16 @@
  * MadeiraSession). Go picks the first result; a touch on a window or the
  * background closes it. While the field has the software keyboard, the
  * taskbar and the panel ride above it (keyboard frame notifications).
+ * Round 7: when the keyboard leaves too little room for two rows (an iPhone
+ * in landscape), the results become one sideways-scrolling strip of chips
+ * (icon and name): directly above the keyboard with the taskbar above it, or,
+ * with less room still, inside the taskbar itself right of the field (the
+ * program buttons step aside while searching). The first chip is the one the
+ * keyboard's Search key picks. env.MADEIRA_WINDOWED_CHIPS = 0 keeps the list.
+ *
+ * Maximize (round 3; round 7): the restore pill can be dragged anywhere in
+ * the safe area (kept for the session), and the library's round menu button
+ * hides meanwhile (WindowedMode.swift WindowedHUD): the pill has the menu.
  *
  * Log lines: "[windowed] ml1300 ..." for on/off, add, refit, remove, activate,
  * move, scale, minimize, restore, fullscreen, close, steam, search and the
@@ -614,9 +629,11 @@ static BOOL ww_by_touch(UIEvent *event, const char *what)
 @property (nonatomic, strong) WWSearchField *search;
 @property (nonatomic, strong) WWAppStrip *apps;
 @property (nonatomic, strong) UIButton *keyboardButton, *menuButton;
-@property (nonatomic, strong) UIButton *steamButton;   /* pinned, left of the program buttons */
+@property (nonatomic, strong) UIButton *steamButton;   /* pinned, left of the program buttons (env.MADEIRA_WINDOWED_STEAM = 1) */
 @property (nonatomic, strong) UIImageView *steamIcon;  /* round 5: the installed steam.exe's icon */
 @property (nonatomic, strong) UIView *steamDot;
+@property (nonatomic) BOOL steamAllowed;               /* Steam on the taskbar at all (env.MADEIRA_WINDOWED_STEAM != 0, a Swift bridge) */
+@property (nonatomic) BOOL steamPinned;                /* round 7: the round 4 pinned tile; else only while a Steam window is open */
 @property (nonatomic, strong) NSMutableArray<UIButton *> *appButtons;
 @end
 
@@ -634,6 +651,10 @@ static BOOL ww_launch_pick(NSUInteger index);
 static void ww_launch_layout(void);
 static void ww_steam_activate(const char *why);
 static void ww_steam_icon_check(BOOL force);
+/* Round 7: how the open results panel is laid out (ww_launch_mode). */
+enum { WW_LAUNCH_LIST = 0, WW_LAUNCH_CHIPS_ABOVE_KB = 1, WW_LAUNCH_CHIPS_IN_DOCK = 2 };
+static int ww_launch_mode(void);
+static uintptr_t g_steam_tile;            /* round 7: the Steam window whose program button is the Steam tile, 0 none */
 
 /* Maximize: one framed window fills the whole screen like a game session's
  * picture (no title bar, taskbar hidden, black letterbox); a small floating
@@ -645,6 +666,9 @@ static void ww_steam_icon_check(BOOL force);
 - (void)wake;
 @end
 static WWPill *g_pill;
+static BOOL g_pill_moved;                 /* round 7: dragged this session; its centre as fractions of the root */
+static CGPoint g_pill_at;
+static void ww_layout_pill(void);
 static uintptr_t g_max;   /* the maximized window, 0 when none */
 static void ww_set_maximized(WWWin *w, BOOL on, const char *why);
 
@@ -762,6 +786,17 @@ static void ww_bridge_call_with(NSString *sel, id arg)
     SEL s = NSSelectorFromString(sel);
     if (c && [c respondsToSelector:s]) {
         void (*fn)(id, SEL, id) = (void (*)(id, SEL, id))[c methodForSelector:s];
+        fn(c, s, arg);
+    }
+}
+
+/* Round 7: ... and one that takes a BOOL. */
+static void ww_bridge_call_bool(NSString *sel, BOOL arg)
+{
+    Class c = ww_bridge();
+    SEL s = NSSelectorFromString(sel);
+    if (c && [c respondsToSelector:s]) {
+        void (*fn)(id, SEL, BOOL) = (void (*)(id, SEL, BOOL))[c methodForSelector:s];
         fn(c, s, arg);
     }
 }
@@ -1030,9 +1065,12 @@ static void ww_bridge_call_with(NSString *sel, id arg)
     _search.font = [UIFont systemFontOfSize:14];
     _search.backgroundColor = [UIColor colorWithWhite:1 alpha:0.12];
     _search.layer.cornerRadius = WW_DOCK_ITEM / 2 - 1;
-    _search.returnKeyType = UIReturnKeyGo;
+    _search.returnKeyType = UIReturnKeySearch;   /* round 7: the keyboard's Search key picks the first result */
     _search.autocorrectionType = UITextAutocorrectionTypeNo;
     _search.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    /* round 7: no suggestion bar either, where iOS allows it (more room above the keyboard) */
+    _search.spellCheckingType = UITextSpellCheckingTypeNo;
+    _search.inlinePredictionType = UITextInlinePredictionTypeNo;
     _search.clearButtonMode = UITextFieldViewModeWhileEditing;
     _search.attributedPlaceholder = [[NSAttributedString alloc] initWithString:@"Search"
         attributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.5]}];
@@ -1066,7 +1104,11 @@ static void ww_bridge_call_with(NSString *sel, id arg)
     /* Steam, pinned left of the program buttons: a monochrome placeholder
      * glyph (no Valve artwork in the repository) on a rounded tile, a dot
      * under it while a Steam window is open. env.MADEIRA_WINDOWED_STEAM = 0
-     * (WindowedMode.swift) hides it. */
+     * (WindowedMode.swift) hides it. Round 7: pinned only with
+     * env.MADEIRA_WINDOWED_STEAM = 1; by default the Steam window's own
+     * program button is the tile (ww_dock_refresh). */
+    _steamAllowed = bridge && ww_bridge_bool(@"steamButtonEnabled");
+    _steamPinned = _steamAllowed && ww_bridge_bool(@"steamTilePinned");
     _steamButton = [WWButton buttonWithType:UIButtonTypeCustom];
     _steamButton.backgroundColor = [UIColor colorWithWhite:1 alpha:0.14];
     _steamButton.layer.cornerRadius = 9;
@@ -1075,12 +1117,18 @@ static void ww_bridge_call_with(NSString *sel, id arg)
     _steamButton.tintColor = [UIColor colorWithWhite:1 alpha:0.92];
     _steamButton.accessibilityLabel = @"Steam";
     [_steamButton addTarget:self action:@selector(steamPressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
-    _steamButton.hidden = !bridge || !ww_bridge_bool(@"steamButtonEnabled");
+    _steamButton.hidden = !_steamPinned;
     [_pill.contentView addSubview:_steamButton];
-    /* round 5: the installed client's own icon replaces the glyph (ww_steam_icon_check) */
+    /* round 5: the installed client's own icon replaces the glyph (ww_steam_icon_check).
+     * Round 7: placed by ww_layout_dock in the program icons' 36-point box; it
+     * used to grow with the button (flexible size from a zero-sized button: 72
+     * points, over the pill's edge). */
     _steamIcon = [[UIImageView alloc] initWithFrame:CGRectMake(0, 0, WW_DOCK_ITEM, WW_DOCK_ITEM)];
     _steamIcon.contentMode = UIViewContentModeScaleAspectFit;
-    _steamIcon.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _steamIcon.autoresizingMask = UIViewAutoresizingNone;
+    _steamIcon.layer.cornerRadius = 9;
+    _steamIcon.layer.cornerCurve = kCACornerCurveContinuous;
+    _steamIcon.clipsToBounds = YES;
     _steamIcon.userInteractionEnabled = NO;
     _steamIcon.hidden = YES;
     [_steamButton addSubview:_steamIcon];
@@ -1217,6 +1265,11 @@ static void ww_bridge_call_with(NSString *sel, id arg)
     self.layer.shadowRadius = 6;
     self.layer.shadowOffset = CGSizeMake(0, 2);
     self.hidden = YES;
+    /* round 7: drag it anywhere (one finger, touches only; a tap still hits
+     * the buttons: the pan begins only after the finger moves) */
+    UIPanGestureRecognizer *drag = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragged:)];
+    drag.maximumNumberOfTouches = 1;
+    [self addGestureRecognizer:drag];
     return self;
 }
 - (BOOL)canBecomeFocused { return NO; }
@@ -1226,6 +1279,26 @@ static void ww_bridge_call_with(NSString *sel, id arg)
     ww_material_fit(_blur);
     _restoreButton.frame = CGRectMake(5, 5, 36, 36);
     _menuButton.frame = CGRectMake(51, 5, 36, 36);
+}
+/* Round 7: the pill follows the finger, kept inside the safe area; where it
+ * was left is kept for the session (ww_layout_pill). */
+- (void)dragged:(UIPanGestureRecognizer *)g {
+    UIView *root = self.superview;
+    if (!root) return;
+    if (g.state == UIGestureRecognizerStateBegan) [self wake];
+    CGPoint t = [g translationInView:root];
+    [g setTranslation:CGPointZero inView:root];
+    CGPoint c = CGPointMake(self.center.x + t.x, self.center.y + t.y);
+    CGRect b = root.bounds;
+    if (b.size.width <= 0 || b.size.height <= 0) return;
+    g_pill_moved = YES;
+    g_pill_at = CGPointMake(c.x / b.size.width, c.y / b.size.height);
+    ww_layout_pill();
+    g_pill_at = CGPointMake(self.center.x / b.size.width, self.center.y / b.size.height);   /* as clamped */
+    if (g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled) {
+        [self wake];
+        ww_log("pill moved to (%.0f,%.0f) pt (kept for this session)", self.center.x, self.center.y);
+    }
 }
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
@@ -1259,7 +1332,17 @@ static void ww_layout_pill(void)
     UIEdgeInsets s = g_root.safeAreaInsets;
     CGRect b = g_root.bounds;
     CGFloat w = g_pill.menuButton.hidden ? 46 : 92, h = 46;
-    g_pill.frame = CGRectMake(CGRectGetMidX(b) - w / 2, CGRectGetMaxY(b) - MAX(s.bottom, 6) - h - 4, w, h);
+    if (!g_pill_moved || b.size.width <= 0 || b.size.height <= 0) {
+        g_pill.frame = CGRectMake(CGRectGetMidX(b) - w / 2, CGRectGetMaxY(b) - MAX(s.bottom, 6) - h - 4, w, h);
+        return;
+    }
+    /* round 7: where it was dragged (fractions of the root, so a rotation
+     * keeps it on the same side), inside the safe area */
+    CGFloat minX = MAX(s.left, 4) + w / 2, maxX = b.size.width - MAX(s.right, 4) - w / 2;
+    CGFloat minY = MAX(s.top, 4) + h / 2, maxY = b.size.height - MAX(s.bottom, 4) - h / 2;
+    CGFloat cx = MIN(MAX(g_pill_at.x * b.size.width, minX), MAX(maxX, minX));
+    CGFloat cy = MIN(MAX(g_pill_at.y * b.size.height, minY), MAX(maxY, minY));
+    g_pill.frame = CGRectMake(round(cx - w / 2), round(cy - h / 2), w, h);
 }
 
 /* Maximize on / off. On: the window fills the screen (ww_apply_frame), the
@@ -1282,8 +1365,10 @@ static void ww_set_maximized(WWWin *w, BOOL on, const char *why)
         if (g_dock) g_dock.hidden = YES;
         ww_apply_frame(w);
         ww_raise(w, YES, "maximize");
-        ww_log("maximize hwnd=%p on (%s): the whole screen, no title bar, taskbar hidden; the pill at the bottom "
-               "or the menu's Show all windows brings the windows back", (void *)w->hwnd, why);
+        ww_log("maximize hwnd=%p on (%s): the whole screen, no title bar, taskbar hidden; the pill %s "
+               "or the menu's Show all windows brings the windows back", (void *)w->hwnd, why,
+               g_pill_moved ? "where it was dragged" : "at the bottom (drag it anywhere)");
+        ww_bridge_call_bool(@"maximizedChanged:", YES);   /* round 7: the library's round menu button hides */
     } else {
         if (!w->maximized) return;
         w->maximized = NO;
@@ -1291,6 +1376,7 @@ static void ww_set_maximized(WWWin *w, BOOL on, const char *why)
         if (!g_max) {
             if (g_pill) g_pill.hidden = YES;
             if (g_dock) g_dock.hidden = NO;
+            ww_bridge_call_bool(@"maximizedChanged:", NO);   /* round 7: the round menu button comes back */
         }
         if (w->frame) {
             if (w->placed) ww_clamp(w);
@@ -1634,6 +1720,7 @@ static void ww_steam_icon_apply(void)
     d.steamIcon.hidden = !real;
     [d.steamButton setImage:real ? nil : ww_glyph(@"gamecontroller", WW_DOCK_ITEM) forState:UIControlStateNormal];
     d.steamButton.backgroundColor = real ? UIColor.clearColor : [UIColor colorWithWhite:1 alpha:0.14];
+    if (g_steam_tile) ww_dock_refresh();   /* round 7: the Steam window's program button takes the icon */
 }
 
 /* Main thread. Until the tile has the client's icon: is Steam installed in the
@@ -1644,7 +1731,7 @@ static void ww_steam_icon_apply(void)
 static void ww_steam_icon_check(BOOL force)
 {
     WWDock *d = g_dock;
-    if (!d || d.steamButton.hidden || g_steam_icon) return;
+    if (!d || !d.steamAllowed || g_steam_icon) return;
     CFTimeInterval now = CACurrentMediaTime();
     if (!force && g_steam_icon_checked > 0 && now - g_steam_icon_checked < 5) return;
     g_steam_icon_checked = now;
@@ -1709,15 +1796,51 @@ static UIImage *ww_letter_icon(NSString *name);
 static const CGFloat WW_ROW_H = 50;       /* a result row */
 static const CGFloat WW_LIST_PAD = 6;     /* panel edge to the rows */
 #define WW_LAUNCH_MAX 60                  /* rows shown at most */
+/* Round 7: results as chips (one sideways-scrolling strip) */
+static const CGFloat WW_CHIP_H = 36;      /* a chip: icon and name */
+static const CGFloat WW_CHIP_GAP = 8;
+static const CGFloat WW_CHIP_ICON = 24;
+static const CGFloat WW_CHIP_BAR_H = 48;  /* the chip strip's panel, directly above the keyboard */
 
 static NSArray<NSDictionary *> *g_launch_items;   /* tools, library, programs (WindowedMode.swift) */
 static NSArray<NSDictionary *> *g_launch_shown;   /* the rows, in order */
 static NSString *g_launch_windows_sig;            /* the open windows the rows were made from */
+static NSString *g_launch_query;                  /* round 7: what the rows were filtered by */
+static BOOL g_chips_ok = YES;                     /* round 7: env.MADEIRA_WINDOWED_CHIPS != 0 (read when the panel opens) */
+
+/* Round 7: the lowest point the taskbar (and the chips under it) may reach:
+ * 8 points above the software keyboard while the search field has it, else
+ * the bottom of the safe area. */
+static CGFloat ww_chrome_bottom(void)
+{
+    UIEdgeInsets s = g_root.safeAreaInsets;
+    CGRect b = g_root.bounds;
+    CGFloat y = b.size.height - MAX(s.bottom, 6);
+    if (g_kb_lift > 0) y = MIN(y, b.size.height - g_kb_lift - 8);
+    return y;
+}
+
+/* Round 7: how the open results fit above the keyboard. The list needs room
+ * for the taskbar and two rows (176 points); with less, one strip of chips
+ * directly above the keyboard and the taskbar above it (112 points; an iPhone
+ * in landscape has about 170 under the docked keyboard); with less still (a
+ * taller keyboard or its suggestion bar), the chips go into the taskbar,
+ * right of the field. env.MADEIRA_WINDOWED_CHIPS = 0: always the list. */
+static int ww_launch_mode(void)
+{
+    if (!g_root || !g_launch || ((UIView *)g_launch).hidden || !g_chips_ok) return WW_LAUNCH_LIST;
+    CGFloat room = ww_chrome_bottom() - MAX(g_root.safeAreaInsets.top, 8);
+    if (room >= WW_DOCK_H + 8 + 2 * WW_ROW_H + 2 * WW_LIST_PAD) return WW_LAUNCH_LIST;
+    if (room >= WW_DOCK_H + 8 + WW_CHIP_BAR_H) return WW_LAUNCH_CHIPS_ABOVE_KB;
+    return WW_LAUNCH_CHIPS_IN_DOCK;
+}
 
 @interface WWLaunchRow : WWButton
 @property (nonatomic, strong) UIImageView *iconView;
 @property (nonatomic, strong) UILabel *nameLabel, *detailLabel;
 @property (nonatomic) BOOL primary;      /* the row Go picks: a faint background */
+@property (nonatomic) BOOL compact;      /* round 7: a chip (icon and name) in a sideways strip */
+- (CGFloat)chipWidth;
 @end
 
 @implementation WWLaunchRow
@@ -1747,12 +1870,37 @@ static NSString *g_launch_windows_sig;            /* the open windows the rows w
     return self;
 }
 - (void)applyBackground {
-    self.backgroundColor = [UIColor colorWithWhite:1 alpha:self.highlighted ? 0.18 : _primary ? 0.08 : 0];
+    /* round 7: chips always show their pill; the one Go picks is brighter, with a light edge */
+    CGFloat a = self.highlighted ? (_compact ? 0.30 : 0.18) : _primary ? (_compact ? 0.22 : 0.08) : _compact ? 0.08 : 0;
+    self.backgroundColor = [UIColor colorWithWhite:1 alpha:a];
+    self.layer.borderWidth = _compact && _primary ? 1 : 0;
+    self.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.45].CGColor;
 }
 - (void)setHighlighted:(BOOL)highlighted { [super setHighlighted:highlighted]; [self applyBackground]; }
 - (void)setPrimary:(BOOL)primary { _primary = primary; [self applyBackground]; }
+- (void)setCompact:(BOOL)compact {
+    if (_compact == compact) return;
+    _compact = compact;
+    _detailLabel.hidden = compact;
+    _nameLabel.font = [UIFont systemFontOfSize:compact ? 14 : 15 weight:UIFontWeightSemibold];
+    self.layer.cornerRadius = compact ? WW_CHIP_H / 2 : 10;
+    _iconView.layer.cornerRadius = compact ? 6 : 7;
+    [self applyBackground];
+    [self setNeedsLayout];
+}
+/* Round 7: a chip's width for its name (icon, name, padding; 72 to 220 points). */
+- (CGFloat)chipWidth {
+    CGFloat text = ceil([_nameLabel sizeThatFits:CGSizeMake(CGFLOAT_MAX, WW_CHIP_H)].width);
+    return MIN(MAX(6 + WW_CHIP_ICON + 8 + text + 14, 72), 220);
+}
 - (void)layoutSubviews {
     [super layoutSubviews];
+    if (_compact) {
+        CGFloat h = self.bounds.size.height, w = self.bounds.size.width, x = 6 + WW_CHIP_ICON + 8;
+        _iconView.frame = CGRectMake(6, (h - WW_CHIP_ICON) / 2, WW_CHIP_ICON, WW_CHIP_ICON);
+        _nameLabel.frame = CGRectMake(x, 0, MAX(w - x - 12, 0), h);
+        return;
+    }
     CGFloat h = self.bounds.size.height, w = self.bounds.size.width, side = 32, x = 10 + side + 12;
     _iconView.frame = CGRectMake(10, (h - side) / 2, side, side);
     _nameLabel.frame = CGRectMake(x, h / 2 - 18, MAX(w - x - 12, 0), 19);
@@ -1767,6 +1915,7 @@ static NSString *g_launch_windows_sig;            /* the open windows the rows w
 @property (nonatomic, strong) WWAppStrip *list;
 @property (nonatomic, strong) UILabel *message;
 @property (nonatomic, strong) NSMutableArray<WWLaunchRow *> *rows;
+@property (nonatomic) int mode;          /* round 7: WW_LAUNCH_LIST or one of the chip layouts */
 @end
 
 @implementation WWLauncher
@@ -1798,9 +1947,28 @@ static NSString *g_launch_windows_sig;            /* the open windows the rows w
     _blur.frame = self.bounds;
     ww_material_fit(_blur);
     CGFloat w = self.bounds.size.width;
+    if (_mode != WW_LAUNCH_LIST) {
+        /* round 7: one strip of chips, scrolling sideways (in the taskbar: no
+         * panel of its own, the taskbar's material shows through) */
+        CGFloat h = self.bounds.size.height, inset = _mode == WW_LAUNCH_CHIPS_IN_DOCK ? 0 : WW_LIST_PAD;
+        _list.frame = CGRectMake(inset, 0, MAX(w - 2 * inset, 0), h);
+        CGFloat x = 0;
+        for (WWLaunchRow *row in _rows) {
+            row.compact = YES;
+            if (row.hidden) continue;
+            CGFloat cw = [row chipWidth];
+            row.frame = CGRectMake(x, round((h - WW_CHIP_H) / 2), cw, WW_CHIP_H);
+            x += cw + WW_CHIP_GAP;
+        }
+        _list.contentSize = CGSizeMake(MAX(x - WW_CHIP_GAP, 0), h);
+        _message.frame = CGRectInset(self.bounds, 12, 0);
+        self.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:self.bounds cornerRadius:16].CGPath;
+        return;
+    }
     _list.frame = CGRectInset(self.bounds, 0, WW_LIST_PAD);
     NSUInteger n = 0;
     for (WWLaunchRow *row in _rows) {
+        row.compact = NO;
         if (row.hidden) continue;
         row.frame = CGRectMake(WW_LIST_PAD, n * WW_ROW_H, w - 2 * WW_LIST_PAD, WW_ROW_H);
         n++;
@@ -1923,6 +2091,10 @@ static void ww_launch_filter(void)
     }
     L.message.hidden = shown.count > 0;
     L.message.text = q.length ? [NSString stringWithFormat:@"Nothing matches \u201C%@\u201D", q] : @"Nothing to show yet";
+    /* round 7: new text shows the first result (the one Go picks) again;
+     * a refill for icons or windows leaves the scroll where it is */
+    if (![q isEqualToString:g_launch_query ?: @""]) [L.list setContentOffset:CGPointZero animated:NO];
+    g_launch_query = q;
     ww_launch_layout();
     [L setNeedsLayout];
 }
@@ -1935,6 +2107,31 @@ static void ww_launch_layout(void)
     UIEdgeInsets s = g_root.safeAreaInsets;
     CGRect b = g_root.bounds;
     CGFloat left = MAX(s.left, 8), right = MAX(s.right, 8);
+    /* round 7: chips under the taskbar or in it (ww_launch_mode) */
+    int mode = ww_launch_mode();
+    if (mode != L.mode) {
+        if (!L.hidden)
+            ww_log("search: results %s (%.0f pt above the keyboard)",
+                   mode == WW_LAUNCH_CHIPS_IN_DOCK ? "as chips in the taskbar, right of the field"
+                   : mode == WW_LAUNCH_CHIPS_ABOVE_KB ? "as chips directly above the keyboard, the taskbar above them"
+                   : "as a list above the taskbar", ww_chrome_bottom() - MAX(s.top, 8));
+        L.mode = mode;
+        [L.list setContentOffset:CGPointZero animated:NO];
+        [L setNeedsLayout];
+    }
+    BOOL inDock = mode == WW_LAUNCH_CHIPS_IN_DOCK;
+    L.blur.hidden = inDock;
+    L.layer.shadowOpacity = inDock ? 0 : 0.35;
+    if (inDock) {
+        CGFloat lead = WW_DOCK_PAD + WW_SEARCH_W + WW_DOCK_GAP;
+        L.frame = CGRectMake(CGRectGetMinX(d.frame) + lead, CGRectGetMinY(d.frame),
+                             MAX(d.frame.size.width - lead - WW_DOCK_PAD, 0), WW_DOCK_H);
+        return;
+    }
+    if (mode == WW_LAUNCH_CHIPS_ABOVE_KB) {
+        L.frame = CGRectMake(left, CGRectGetMaxY(d.frame) + 8, MAX(b.size.width - left - right, 0), WW_CHIP_BAR_H);
+        return;
+    }
     CGFloat width = MIN(MAX(d.frame.size.width, 380), b.size.width - left - right);
     CGFloat x = MIN(MAX(round(CGRectGetMidX(d.frame) - width / 2), left), b.size.width - right - width);
     CGFloat bottom = CGRectGetMinY(d.frame) - 8, top = MAX(s.top, 8);
@@ -1955,6 +2152,12 @@ static void ww_launch_open(void)
     if (g_launch.superview != g_root) [g_root addSubview:g_launch];
     [g_root bringSubviewToFront:g_launch];
     BOOL was = !g_launch.hidden;
+    if (!was) {
+        char cfg[16];
+        const char *chips = madeira_cfg_get("env.MADEIRA_WINDOWED_CHIPS", cfg, sizeof(cfg)) ? cfg : getenv("MADEIRA_WINDOWED_CHIPS");   /* 0: the windowed taskbar's search always shows its results as a list above the taskbar (round 7 turns them into a strip of chips when the keyboard leaves too little room, e.g. an iPhone in landscape) */
+        g_chips_ok = !(chips && chips[0] == '0' && !chips[1]);
+        g_launch_query = nil;
+    }
     g_launch.hidden = NO;
     ww_steam_icon_check(YES);
     Class c = ww_bridge();
@@ -1968,6 +2171,7 @@ static void ww_launch_open(void)
         });
     }
     ww_launch_filter();
+    ww_layout_dock();   /* round 7: the taskbar makes room when the results are chips */
     [g_launch.list setContentOffset:CGPointZero animated:NO];
     if (!was) {
         g_launch.alpha = 0;
@@ -1990,12 +2194,15 @@ static void ww_launch_closed(void)
         ww_log("search: close (%s)", why);
     }
     g_launch_shown = nil;
+    g_launch_query = nil;
     if (g_dock) g_dock.search.text = @"";
     if (g_kb_lift > 0) {
         /* the keyboard's hide notification may not come (another text input takes it) */
         g_kb_lift = 0;
         [UIView animateWithDuration:0.25 delay:0 options:UIViewAnimationOptionBeginFromCurrentState
                          animations:^{ ww_layout_dock(); } completion:nil];
+    } else {
+        ww_layout_dock();   /* round 7: the program buttons come back from behind the chips */
     }
 }
 
@@ -2481,19 +2688,30 @@ static void ww_layout_dock(void)
     CGFloat fixed = pad + WW_SEARCH_W + (steam ? gap + item : 0) + (tools ? 2 * (gap + item) : 0) + pad;
     CGFloat want = fixed + (shownApps ? gap + appsW : 0);
     CGFloat maxW = b.size.width - MAX(s.left, 8) - MAX(s.right, 8);
-    CGFloat width = MIN(want, maxW);
-    CGFloat y = b.size.height - MAX(s.bottom, 6) - WW_DOCK_H;
+    /* round 7: while searching with little room above the keyboard, the
+     * result chips go under the taskbar or into it (ww_launch_mode) */
+    int mode = ww_launch_mode();
+    BOOL merged = mode == WW_LAUNCH_CHIPS_IN_DOCK;
+    CGFloat width = merged ? maxW : MIN(want, maxW);
     /* round 5: above the software keyboard while the search field has it */
-    if (g_kb_lift > 0) y = MAX(MIN(y, b.size.height - g_kb_lift - 8 - WW_DOCK_H), s.top);
+    CGFloat y = ww_chrome_bottom() - WW_DOCK_H;
+    if (mode == WW_LAUNCH_CHIPS_ABOVE_KB) y -= WW_CHIP_BAR_H + 8;
+    y = MAX(y, s.top);
     d.frame = CGRectMake(round((b.size.width - width) / 2), y, width, WW_DOCK_H);
     d.pill.frame = d.bounds;
     ww_material_fit(d.pill);
+    for (UIView *v in @[d.apps, d.steamButton, d.keyboardButton, d.menuButton]) {
+        v.alpha = merged ? 0 : 1;   /* the chips take their place while searching */
+        v.userInteractionEnabled = !merged;
+    }
+    d.steamDot.alpha = merged ? 0 : 1;
     CGFloat mid = WW_DOCK_H / 2, x = pad;
     d.search.frame = CGRectMake(x, mid - (item - 2) / 2, WW_SEARCH_W, item - 2);
     x += WW_SEARCH_W;
     if (steam) {
         x += gap;
         d.steamButton.frame = CGRectMake(x, mid - item / 2, item, item);
+        d.steamIcon.frame = d.steamButton.bounds;   /* round 7: the program icons' box, never larger */
         d.steamDot.frame = CGRectMake(x + (item - 5) / 2, WW_DOCK_H - 7.5, 5, 5);
         x += item;
     }
@@ -2506,7 +2724,8 @@ static void ww_layout_dock(void)
         ax += item + gap;
     }
     d.apps.contentSize = CGSizeMake(appsW, WW_DOCK_H);
-    CGFloat tx = width - pad - (2 * item + gap);
+    /* merged: the dock is wider than its items; they keep their places from the left */
+    CGFloat tx = (merged ? MIN(want, maxW) : width) - pad - (2 * item + gap);
     d.keyboardButton.frame = CGRectMake(tx, mid - item / 2, item, item);
     d.menuButton.frame = CGRectMake(tx + item + gap, mid - item / 2, item, item);
     ww_launch_layout();
@@ -2548,6 +2767,20 @@ static void ww_dock_refresh(void)
         [d.apps addSubview:b];
         [d.appButtons addObject:b];
     }
+    /* Round 7: unless pinned (env.MADEIRA_WINDOWED_STEAM = 1), the Steam tile
+     * is the first Steam window's own program button, in its place among the
+     * others, with the client's icon; no Steam window, no tile. */
+    WWWin *steamWin = d.steamAllowed && !d.steamPinned ? ww_steam_window() : nil;
+    uintptr_t tile = steamWin ? steamWin->hwnd : 0;
+    if (tile != g_steam_tile) {
+        if (steamWin)
+            ww_log("steam: tile shown (window hwnd=%p \"%s\" exe=%s, as its program button%s)", (void *)steamWin->hwnd,
+                   ww_display_title(steamWin).UTF8String, steamWin->exe.UTF8String,
+                   g_steam_icon ? ", the client's icon" : steamWin->icon ? ", the window's icon" : "");
+        else
+            ww_log("steam: tile hidden (no Steam window)");
+        g_steam_tile = tile;
+    }
     for (NSUInteger i = 0; i < d.appButtons.count; i++) {
         UIButton *b = d.appButtons[i];
         if (i >= list.count) { b.hidden = YES; b.tag = 0; continue; }
@@ -2555,9 +2788,9 @@ static void ww_dock_refresh(void)
         NSString *name = ww_display_title(w);
         b.hidden = NO;   /* round 5: typing filters the search panel, not the taskbar */
         b.tag = (NSInteger)w->hwnd;
-        b.accessibilityLabel = name;
+        b.accessibilityLabel = w == steamWin ? [@"Steam: " stringByAppendingString:name] : name;
         UIImageView *iv = [b viewWithTag:1];
-        iv.image = w->icon ?: ww_letter_icon(w->exe.length ? w->exe : name);
+        iv.image = (w == steamWin ? g_steam_icon : nil) ?: w->icon ?: ww_letter_icon(w->exe.length ? w->exe : name);
         BOOL minimized = w->appMinimized || ww_iconic(w);
         iv.alpha = minimized ? 0.45 : 1;
         UIView *dot = [b viewWithTag:2];
@@ -2610,8 +2843,10 @@ UIView *winios_windowed_make_root(CGRect frame)
     ww_log("compositor root attached: frames + taskbar (madeira.cfg windowed = 0 or env.MADEIRA_WINDOWED = 0 turns it off); "
            "chrome not focusable, gamepad events %s",
            claim ? "claimed for the Game Controller framework" : "left to UIKit (env.MADEIRA_XINPUT = 0)");
-    ww_log("steam: taskbar button %s", g_dock.steamButton.hidden
-           ? "hidden (env.MADEIRA_WINDOWED_STEAM = 0, or no Swift bridge)" : "pinned (env.MADEIRA_WINDOWED_STEAM = 0 hides it)");
+    ww_log("steam: taskbar tile %s", !g_dock.steamAllowed
+           ? "off (env.MADEIRA_WINDOWED_STEAM = 0, or no Swift bridge)"
+           : g_dock.steamPinned ? "pinned (env.MADEIRA_WINDOWED_STEAM = 1)"
+           : "shown only while a Steam window is open (env.MADEIRA_WINDOWED_STEAM = 1 pins it; Steam starts from the search or the library)");
     ww_steam_icon_check(YES);   /* round 5: the installed client's icon on the tile */
     return root;
 }
@@ -2623,7 +2858,9 @@ static void ww_clear_all(void)
     [g_order removeAllObjects];
     g_top = 0;
     g_cascade = 0;
+    if (g_max) ww_bridge_call_bool(@"maximizedChanged:", NO);   /* round 7: the round menu button comes back */
     g_max = 0;
+    g_steam_tile = 0;
     g_pill.hidden = YES;
     g_dock.hidden = NO;
     if (g_dock.search.isFirstResponder) { g_launch_close_why = "new session"; [g_dock.search resignFirstResponder]; }
@@ -2646,6 +2883,7 @@ void winios_windowed_teardown(void)
     g_dock = nil;
     [g_pill removeFromSuperview];
     g_pill = nil;
+    g_pill_moved = NO;   /* round 7: a dragged pill's place is kept for one session */
     /* round 5: the search panel, its items and the Steam icon go with the session */
     [(UIView *)g_launch removeFromSuperview];
     g_launch = nil;

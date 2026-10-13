@@ -5,8 +5,8 @@ window of its own on the iPhone or iPad screen: a dark translucent (blurred)
 title bar with the window's text centred and four round monochrome buttons
 (minimize, fit to screen, maximize, close), draggable, brought to the front by
 a tap, several of them overlapping at once. A taskbar along the bottom holds a
-search field, a pinned Steam button, the running program windows, the keyboard
-and the in-game menu. It is off by default; with it off nothing below runs and
+search field, the running program windows (Steam's with Steam's icon, round
+7), the keyboard and the in-game menu. It is off by default; with it off nothing below runs and
 desktop sessions look exactly as before.
 
 ## Turning it on
@@ -160,13 +160,21 @@ chose.
   all windows* while a window is maximized. One window at a time; a dialog the
   program opens still comes up in its own frame on top. The window being
   hidden, minimized or destroyed ends it. The app's own overlays (touch
-  controls, the menu button) are separate windows above and stay reachable.
+  controls, the performance overlay) are separate windows above and stay
+  reachable. Round 7: the library's round menu button hides while a window is
+  maximized (the pill's menu button opens the same menu; `WindowedHUD` in
+  `WindowedMode.swift`, observed by `LibraryHUD`; `env.MADEIRA_WINDOWED_HUD_MENU
+  = 1` keeps it), and the pill can be **dragged anywhere** inside the safe area
+  with one finger (a tap still hits its buttons; it still dims and wakes, still
+  touch only); where it was left is kept for the rest of the session (as
+  fractions of the screen, so a rotation keeps it on the same side) and every
+  later maximize puts it there.
 - *Close* posts `WM_SYSCOMMAND/SC_CLOSE`, which `DefWindowProc` turns into
   `WM_CLOSE`, as the close box of the window's own caption would.
 
 **Taskbar.** A pill along the bottom: a Search field (touch it to type; it
-opens the launcher below), the pinned Steam button (below),
-one button per program window (its class icon when the program registered one,
+opens the launcher below), (only with `env.MADEIRA_WINDOWED_STEAM = 1`) the
+pinned Steam tile (below), one button per program window (its class icon when the program registered one,
 else its program's initial; a dot under it, white for the frontmost window,
 the button dimmed when minimized; tap: restore / bring to front / minimize when
 already in front), then the keyboard and the in-game menu (both through
@@ -183,7 +191,8 @@ name and a second line saying what it is. The rows, in this order:
   minimized and brings it to the front.
 - **Tools**: *Explorer* (`C:\windows\explorer.exe C:\`, a file browser on
   drive C:), *Command Prompt* (`C:\windows\system32\cmd.exe`) and *Steam* (the
-  Steam tile's action, below; hidden with the tile).
+  Steam tile's action, below; there whether or not Steam runs, the way to start
+  it since round 7; `env.MADEIRA_WINDOWED_STEAM = 0` removes it).
 - **Library**: the games you added (their program with their launch arguments,
   working folder and "Start Windows services first"; a `.bat`/`.cmd` through
   `cmd.exe /c`), and the installed Steam games whose program is known: the one
@@ -221,7 +230,9 @@ path and its arguments, in the program's working folder (by default its own
 folder). A failure shows an alert with the reason ("It did not start in this
 session: …"; a library game adds that it still starts from the library).
 Go on the keyboard picks the first row (it has a faint background); Go with
-nothing typed only closes. The panel closes when the field gives up the
+nothing typed only closes. Round 7: the return key is labelled Search
+(`UIReturnKeySearch`, same action), and the field asks for no spell checking
+or inline prediction, which on most keyboards also drops the suggestion bar. The panel closes when the field gives up the
 keyboard: after a pick, a touch on any window or the black background, a
 taskbar button, the keyboard's own dismiss key, maximize, or a new session.
 Typing no longer hides taskbar buttons (round 4 filtered them).
@@ -233,6 +244,26 @@ with the keyboard's own duration and curve (`UIKeyboardWillChangeFrame` /
 the bottom of the screen lifts it; a floating iPad keyboard, or the keyboard
 of another text input (the library keyboard, a program's text field) does not.
 Frames stay where they are.
+
+**Little room above the keyboard** (round 7). The iOS keyboard cannot be made
+smaller, so the results change shape instead. With the taskbar 8 points above
+the keyboard, the list above it needs room for two rows (176 points from the
+top of the safe area to 8 points above the keyboard). With less:
+
+- 112 to 176 points (an iPhone in landscape: about 170 with the docked
+  keyboard, where round 6 showed one row): the results become one strip of
+  **chips** (a 24-point icon and the name on a 36-point pill, 72 to 220 points
+  wide, scrolling sideways) in a 48-point panel directly above the keyboard,
+  and the taskbar sits above the strip.
+- under 112 points (a taller keyboard, its suggestion bar, a smaller screen):
+  the chips go **into the taskbar**: it widens to the screen, the field stays
+  at its left, the program buttons, keyboard and menu buttons fade out while
+  the search is open, and the chips fill the rest of the pill.
+
+The first chip (with something typed) is brighter with a light edge: the
+Search key picks it. New text scrolls the strip back to it. In portrait (and
+on iPad) the list stays, capped to the room there is, as before.
+`env.MADEIRA_WINDOWED_CHIPS = 0` always shows the list.
 
 **Look** (round 4). Title bars, the taskbar pill and the maximize pill share
 one material (`ww_material`): `UIBlurEffectStyleSystemThinMaterialDark`, a
@@ -247,8 +278,24 @@ points and they are 10 points apart, 10 points from the pill's ends; the
 magnifier sits 11 points inside the search field and 7 points before its
 text. On a narrow screen only the program strip shrinks (it scrolls).
 
-**Steam on the taskbar** (round 4; `env.MADEIRA_WINDOWED_STEAM = 0` hides
-it). A tile pinned left of the program buttons in every windowed session,
+**Steam on the taskbar** (round 4; round 7). Since round 7 there is a Steam
+tile only **while a Steam window is open** in the session (a window whose
+program is `steam.exe` or `steamwebhelper.exe`): the first such window's own
+program button is the tile, in its place among the program buttons, with
+Steam's icon (below; the window's icon or initial until it is read), its dot
+and its tap (restore / bring to front / minimize, like any program button).
+Further Steam windows keep their own buttons. With no Steam window there is
+no tile; Steam starts from the search's *Steam* row (same action as the old
+tile, below) or from the library. `steam: tile shown (window hwnd=…)` /
+`steam: tile hidden (no Steam window)` log the changes.
+`env.MADEIRA_WINDOWED_STEAM = 1` brings back the round 4 tile pinned left of
+the program buttons in every session; `0` removes Steam from the taskbar and
+the search. The icon is drawn in the same 36-point box as every program icon
+(aspect-fit, rounded corners): until round 7 the pinned tile's icon view grew
+with the button from a zero size (flexible width and height) and came out 72
+points, over the pill's edge.
+
+Round 4's pinned tile: left of the program buttons in every windowed session,
 with a dot under it while a Steam window is open. Round 5: once Steam is
 installed in the prefix (the `steam.exe` the tile starts, below) the tile
 shows **that file's own icon**, read at run time from its PE resources: the
@@ -345,6 +392,10 @@ panel opens, so a Steam installed during the session gets its icon; a
   device-tested yet); the round 4 library entry remains the fallback. No
   Valve logo in the repository: the tile shows the installed `steam.exe`'s own
   icon (round 5), a generic glyph until Steam is installed.
+- Round 7: the iOS keyboard keeps its size (no API shrinks it); the chips are
+  the answer to a short screen. The chip thresholds are fixed (176 / 112
+  points), not settings. The restore pill's dragged place is not kept between
+  sessions.
 
 ## Log lines
 
@@ -376,7 +427,12 @@ All start with `[windowed] ml1300`:
     maximize hwnd=0x... on (button | fit button held): the whole screen, no title bar, taskbar hidden; ...
     maximize hwnd=0x... off (restore pill | menu | hidden or minimized | window destroyed | another window maximized): back to its frame
     restore pill ignored: not a touch (...)
-    steam: taskbar button pinned (env.MADEIRA_WINDOWED_STEAM = 0 hides it) | hidden (...)
+    steam: taskbar tile shown only while a Steam window is open (env.MADEIRA_WINDOWED_STEAM = 1 pins it; ...) | pinned (env.MADEIRA_WINDOWED_STEAM = 1) | off (...)   round 7
+    steam: tile shown (window hwnd=0x... "..." exe=steamwebhelper, as its program button[, the client's icon | , the window's icon])   round 7
+    steam: tile hidden (no Steam window)                                                             round 7
+    pill moved to (x,y) pt (kept for this session)                                                   round 7
+    hud menu button hidden (a frame is maximized; the restore pill has the menu) | shown             round 7 (Swift)
+    search: results as chips in the taskbar, right of the field | as chips directly above the keyboard, the taskbar above them | as a list above the taskbar (N pt above the keyboard)   round 7
     steam: launch (already running in this session: hwnd=0x... "..." exe=steam brought to the front)
     steam: button (no Steam window in this session; the app checks the install)
     steam: not available (cancelled at the memory warning)
@@ -598,3 +654,39 @@ the launches use ml1350's in-session launcher (needs its native libraries).
    changes to the icon.
 8. iPad with a floating keyboard, or a hardware keyboard: the taskbar stays put
    (or lifts only by the shortcut bar's height).
+
+### Round 7 (device feedback on vk6: Steam tile, landscape search, maximize pill)
+
+The owner on vk6: the Steam icon on the taskbar was absurdly large and should
+only be there while Steam runs; in landscape the search showed one result at
+a time ("the keyboard needs to be smaller"); with a window maximized the round
+menu button is redundant with the pill's, and the pill should be draggable.
+App only (WiniosWindowed.m, WindowedMode.swift, two lines in Library.swift).
+
+1. Windowed session, no Steam running: no Steam tile on the taskbar
+   (`steam: taskbar tile shown only while a Steam window is open ...`). Search
+   "steam", pick it: Steam starts as before; when its window appears its
+   program button carries Steam's icon at the same size as the other icons,
+   with the dot (`steam: tile shown (window hwnd=… exe=…)`). Tap it: front /
+   minimize like any program button. Quit Steam: the tile goes (`steam: tile
+   hidden (no Steam window)`).
+2. `env.MADEIRA_WINDOWED_STEAM = 1`: the pinned tile left of the program
+   buttons, its icon 36 points, inside the pill (`steam: taskbar tile pinned`).
+3. iPhone in landscape, touch the search field: the keyboard comes up; the
+   results are one strip of chips directly above it, the taskbar above the
+   strip (`search: results as chips directly above the keyboard, the taskbar
+   above them (N pt above the keyboard)`; report N). Swipe the chips sideways;
+   type: the strip filters, the first chip is bright with a light edge; the
+   Search key starts it; a chip tap picks that one.
+4. Where even less room is left (N under 112: a keyboard with its suggestion
+   bar, a smaller phone): the taskbar widens, its buttons fade and the chips sit
+   inside it right of the field (`... as chips in the taskbar, right of the
+   field ...`); closing the search brings the buttons back. Portrait and iPad:
+   the list as before. `env.MADEIRA_WINDOWED_CHIPS = 0`: always the list.
+5. Maximize a window: the library's round menu button disappears (`hud menu
+   button hidden ...`); the pill's menu button opens the menu. Drag the pill
+   to a corner (`pill moved to (x,y) pt`); it stays inside the safe area,
+   still dims and wakes, its buttons still work. Show all windows: the round
+   button comes back (`hud menu button shown`). Maximize again: the pill is
+   where it was left. Rotate: it stays on the same side.
+   `env.MADEIRA_WINDOWED_HUD_MENU = 1`: the round button stays.
