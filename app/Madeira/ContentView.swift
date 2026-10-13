@@ -2621,6 +2621,7 @@ struct ContentView: View {
         logStore.log("Running full Wine sequence...")
         DeviceDiagnostics.logLaunch()
         MadeiraExtensionProbe.runIfRequested()   /* ml1310: env.MADEIRA_EXT_PROBE = 1 only */
+        MadeiraExtProcess.runTestIfRequested()   /* ml1330: env.MADEIRA_EXT_PROCESS_TEST = 1 only (kill: MADEIRA_EXT_PROCESS = 0) */
 
         // Start a main thread heartbeat to diagnose hang
         var heartbeatCount = 0

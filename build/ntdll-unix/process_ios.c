@@ -408,6 +408,18 @@ static BOOL is_unix_console_handle( HANDLE handle )
  *           spawn_process
  */
 #ifdef WINE_IOS
+/* ml1330 (docs/PROCESS_HOST.md): a Wine process Madeira runs in a
+ * MadeiraProcessHost app extension is NOT started through this path. spawn_process
+ * / wine_ios_child_main create a child as another pthread + pseudo-process inside
+ * the app's own task (its own PEB, registered in ios_proc_sockets, same JIT pool).
+ * A remote process is started by the APP, over XPC: the app launches the extension
+ * (an NSExtension on com.apple.ar.viewer), hands it the prefix/env/argv and the
+ * client end of a socketpair to the app's wineserver, and the extension runs its
+ * own ntdll from main() (server_init_process's WINESERVERSOCKET path), with its
+ * own JIT pool and task. So no change is needed here for phase 1; CreateProcess
+ * from a guest still lands on this in-app path. Routing CreateProcess at the
+ * server to spawn a remote extension instead (the competitor's host-spawn hook,
+ * their patch 0031) is phase 2. */
 /* Child process thread entry point */
 extern void wine_ios_child_main( int argc, char *argv[], int child_fd_socket );
 

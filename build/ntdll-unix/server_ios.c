@@ -4182,6 +4182,39 @@ static void ios_hidpad_publish(void)
 
 
 /***********************************************************************
+ *           ios_ext_process_role   (iOS only, ml1330)
+ *
+ * This ntdll instance runs inside a MadeiraProcessHost app extension (a Wine
+ * process in its own iOS task), not in the app. The app sets
+ * MADEIRA_EXT_PROCESS_ROLE=host in the extension's own environment before this
+ * instance starts (never inherited through the Windows environment). A remote
+ * instance differs from an in-app pseudo-process in three ways, all arranged
+ * through its own environment so no code here has to special-case it:
+ *   - its JIT pool comes from its OWN WINE_IOS_JIT_* (competitor patch 0036),
+ *     set by the extension after the JIT helper enables JIT for its pid;
+ *   - it connects to the app's wineserver through the passed socket
+ *     (WINESERVERSOCKET), exactly as the env-socket path below already does;
+ *   - it runs plain server synchronisation: the extension leaves MADEIRA_FASTSYNC
+ *     unset and does not select inproc-sync, so fastsync cells / madsync (both
+ *     process-memory, not coherent across iOS tasks) never engage.
+ * See docs/PROCESS_HOST.md. The value is read once and logged so a device log
+ * states which kind of process it is.
+ */
+int ios_ext_process_role(void)
+{
+    static int role = -1;
+    if (role < 0)
+    {
+        const char *e = getenv( "MADEIRA_EXT_PROCESS_ROLE" );
+        role = (e && !strcmp( e, "host" )) ? 1 : 0;
+        if (role)
+            wine_log_write( "[ext-proc] ml1330 client: this process runs in a MadeiraProcessHost "
+                            "extension (remote task); plain server sync, own JIT pool" );
+    }
+    return role;
+}
+
+/***********************************************************************
  *           server_init_process
  *
  * Start the server and create the initial socket pair.
@@ -4199,6 +4232,7 @@ size_t server_init_process(void)
     DWORD pid, tid;
 
     server_pid = -1;
+    (void)ios_ext_process_role();   /* ml1330: log the remote-process kind once, before connect */
     if (env_socket)
     {
         fd_socket = atoi( env_socket );
