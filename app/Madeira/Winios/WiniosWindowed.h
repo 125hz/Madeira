@@ -72,4 +72,10 @@ void *winios_windowed_event_target(int x, int y, unsigned int flags, int *drop);
  * window and refreshes window text about once a second. */
 void winios_windowed_pump_wine(void);
 
+/* Main thread. 1 while a window is maximized (the whole screen, no title bar,
+ * taskbar hidden); unmaximize brings the windows back (any thread). Also
+ * declared in Winios.h for the library's in-game menu. */
+int winios_windowed_maximized(void);
+void winios_windowed_unmaximize(void);
+
 #endif

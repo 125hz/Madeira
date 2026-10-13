@@ -76,6 +76,10 @@ int winios_compositor_set_hidden(int hidden);
  * env.MADEIRA_WINDOWED = 1), drawing every top-level window in its own frame
  * with a title bar and a taskbar. Any thread; read once per session. */
 int winios_windowed_active(void);
+/* Main thread: 1 while one of its windows is maximized (the whole screen);
+ * unmaximize (any thread) brings the windows and the taskbar back. */
+int winios_windowed_maximized(void);
+void winios_windowed_unmaximize(void);
 
 /* Game-mode windows (Winios.m). The window a game session's swapchain
  * presents from (IOSDisplayShim) is never drawn as a GDI window; a Wine

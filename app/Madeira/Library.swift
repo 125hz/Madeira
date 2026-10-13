@@ -4495,6 +4495,10 @@ struct LibraryHUD: View {
                     }
                 }
                 Button("Keyboard", systemImage: "keyboard") { model.menu = false; LibraryKeyboard.show() }
+                // ml1300 windowed mode: a maximized window hides the title bars and the taskbar.
+                if WindowedMode.maximized {
+                    Button("Show all windows", systemImage: "rectangle.on.rectangle") { model.menu = false; WindowedMode.restoreWindows() }
+                }
                 Divider()
                 FPSChoice(mode: Binding(get: { model.fpsMode }, set: { model.setFPS($0) }))
                 // Saved to the game with the rest of the session's profile.

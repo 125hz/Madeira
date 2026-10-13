@@ -149,6 +149,17 @@ chose.
   move: while it is on, the button is blue with the "shrink" arrows and the
   title bar turns dark blue; dragging it only pulses the button and logs
   `move ... ignored: fullscreen`.
+- *Maximize* (round 3; the green "+" button, or hold the fit button) shows the
+  window as a game session does: the whole screen, no title bar, the taskbar
+  hidden, the picture aspect-fitted with black bars, touches mapped into it
+  (a touch on the bars is dropped). App-side again: the guest window keeps
+  its size. A small translucent pill at the bottom centre (it dims to 30 %
+  after a few seconds; a touch wakes it) brings the windows back (its window
+  icon) or opens the in-game menu; the library's in-game menu also has *Show
+  all windows* while a window is maximized. One window at a time; a dialog the
+  program opens still comes up in its own frame on top. The window being
+  hidden, minimized or destroyed ends it. The app's own overlays (touch
+  controls, the menu button) are separate windows above and stay reachable.
 - *Close* posts `WM_SYSCOMMAND/SC_CLOSE`, which `DefWindowProc` turns into
   `WM_CLOSE`, as the close box of the window's own caption would.
 
@@ -168,9 +179,10 @@ already in front), then the keyboard and the in-game menu (both through
 - No files or terminal tool in the taskbar.
 - Window icons set with `WM_SETICON` are not read (class icons only, and only
   icons up to 64x64).
-- Frames do not resize the guest window; the grip zooms the picture. There is
-  no maximize of the guest window (a program's own maximize button still works
-  inside the frame).
+- Frames do not resize the guest window; the grip zooms the picture, and
+  Maximize only shows it full screen. The guest window itself is never
+  maximized (a program's own maximize button still works inside the frame).
+- Maximize is not remembered; each session starts with frames.
 - Positions and zooms are not remembered between sessions.
 - The trackpad pointer and a hardware mouse move in guest desktop coordinates:
   the arrow is drawn in the frontmost frame whose window covers that desktop
@@ -213,6 +225,9 @@ All start with `[windowed] ml1300`:
     posted WM_SYSCOMMAND 0xf060 to hwnd=0x... ok=1
     title hwnd=0x... "..."
     taskbar keyboard | taskbar menu
+    maximize hwnd=0x... on (button | fit button held): the whole screen, no title bar, taskbar hidden; ...
+    maximize hwnd=0x... off (restore pill | menu | hidden or minimized | window destroyed | another window maximized): back to its frame
+    restore pill ignored: not a touch (...)
 
 `[winios] compositor attached inside presentation frame` is followed by the
 root line in a windowed session. `[winios] drv_post_mouse hwnd=0x...` (first
@@ -220,8 +235,8 @@ root line in a windowed session. `[winios] drv_post_mouse hwnd=0x...` (first
 
 ## Rebuilding
 
-Round 2 touched only the app (`WiniosWindowed.m`, `Info.plist`); no native
-rebuild. In the first version `build/win32u-unix/driver_ios.c` changed (new helpers, mouse routing by
+Rounds 2 and 3 touched only the app (`WiniosWindowed.m`, `Winios.m`, Swift,
+`Info.plist`); no native rebuild. In the first version `build/win32u-unix/driver_ios.c` changed (new helpers, mouse routing by
 window, the foreground-fix guard): `rebuild-native.sh win32u`, then the app.
 The app links against an older `libwin32u_unix.a` too (weak fallbacks in
 `WiniosWindowed.m`): frames then have no title, owner or icon, the buttons do
@@ -273,3 +288,39 @@ and keyboard instead of playing. Round 2 changes only `WiniosWindowed.m`,
    (a resolution change in its options): `refit ... (the zoom set with the
    grip is kept)`.
 7. Rotate the device: `refit ... (screen changed)` for frames you did not zoom.
+
+### Round 3 (maximize; and the desktop game fit without windowed mode)
+
+Windowed mode (`windowed = 1`):
+
+1. Tap the green "+" on the game's title bar (or hold the fit button):
+   `maximize hwnd=... on (button)`. The game fills the screen with black bars,
+   no title bar, no taskbar; touches and the controller play it; the touch
+   controls / menu button of the app stay on top.
+2. The pill at the bottom centre dims after about 3 s; touch it (it brightens)
+   and tap its window icon: `maximize hwnd=... off (restore pill)`, the frame and
+   the taskbar are back where they were. Maximize again, open the in-game menu,
+   *Show all windows*: `... off (menu)`.
+3. Rotate while maximized: the picture refits to the new screen.
+
+Without windowed mode (`windowed = 0`, the Dock / Steam default), Winios.m
+(ml1301, `env.MADEIRA_DESKTOP_GAME_FIT = 0` turns it off): when the guest's
+foreground window is a borderless window (`WS_POPUP`, or no full caption) that
+presents through Metal, that window's picture is shown fitted to the whole
+screen (aspect fit, black bars over the desktop) instead of the whole desktop
+being fitted, and touches map into it (a touch on the bars goes to its nearest
+edge). The desktop comes back when another window is foreground or the window
+is hidden, minimized or destroyed. The foreground is polled 4 times a second
+from the event pump (`winios_drv_foreground_window`, `winios_drv_census_owner`,
+both existing helpers: no win32u rebuild). Not in this version: the front end's
+Fill / Stretch display modes (it always aspect-fits), and a swapchain on a child
+window (only the top-level window's own Metal layer is fitted).
+
+4. Start a Dock game with `windowed = 0` whose window is smaller than the
+   desktop: `[winios] ml1301 desktop game fit hwnd=0x... 640x480 -> rect (...)
+   in WxH pt (env.MADEIRA_DESKTOP_GAME_FIT=0 disables)`; no teal desktop around
+   it; taps land where they are drawn.
+5. Switch to another window (Alt+Tab in the guest, or a dialog that takes the
+   foreground): `[winios] ml1301 desktop game fit hwnd=0x... off (foreground
+   changed): the whole desktop again`; back to the game: fitted again.
+6. `env.MADEIRA_DESKTOP_GAME_FIT = 0`: no `ml1301` lines, the old desktop fit.
