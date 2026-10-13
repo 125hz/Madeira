@@ -2878,6 +2878,25 @@ ULONG_PTR ios_gamepad_query( UINT index, UINT op, void *buffer )
         state->gamepad.thumb_ly     = pad.ly;
         state->gamepad.thumb_rx     = pad.rx;
         state->gamepad.thumb_ry     = pad.ry;
+        /* ml2180: evidence for "the pad is detected but nothing happens": the
+         * first eight non-rest states the program reads per slot, and the
+         * first rest state after one. Capped; nothing is logged for a slot
+         * that never moves. */
+        {
+            static unsigned int logged[4], was_live[4];
+            int live = pad.buttons || pad.left_trigger || pad.right_trigger ||
+                       pad.lx > 7849 || pad.lx < -7849 || pad.ly > 7849 || pad.ly < -7849 ||
+                       pad.rx > 8689 || pad.rx < -8689 || pad.ry > 8689 || pad.ry < -8689;
+            if (live != (int)was_live[index] && logged[index] < 16)
+            {
+                logged[index]++;
+                ERR( "[xinput] ml2180 state read index=%u %s: packet=%u buttons=0x%04x lt=%u rt=%u lx=%d ly=%d rx=%d ry=%d (pid %04x)\n",
+                     index, live ? "input" : "rest", (unsigned int)pad.packet, (unsigned int)pad.buttons,
+                     (unsigned int)pad.left_trigger, (unsigned int)pad.right_trigger, (int)pad.lx, (int)pad.ly,
+                     (int)pad.rx, (int)pad.ry, (unsigned int)GetCurrentProcessId() );
+            }
+            was_live[index] = live;
+        }
         return 1;
     }
     case 1:   /* NtUserGamepadOp_Caps */
