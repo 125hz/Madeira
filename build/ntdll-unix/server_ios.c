@@ -5760,7 +5760,6 @@ void server_init_process_done(void)
         extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
         ERR("signal_start_thread: teb=%p peb=%p TransferAddress=%p suspend=%d\n",
             NtCurrentTeb(), peb, ios_cur_image_info()->TransferAddress, suspend);
-
         /* Watchdog: suspend thread and sample registers at 2s and 4s */
         {
             pthread_t wine_pthread = pthread_self();
