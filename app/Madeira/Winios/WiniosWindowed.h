@@ -5,8 +5,9 @@
  * desktop session only) draws every top-level Wine window in a frame of its
  * own: a title bar with the window text and minimize / fullscreen / close
  * buttons, draggable, tapped to the front, and a taskbar along the bottom with
- * one button per program window, a pinned Steam button (round 4), the
- * keyboard and the in-game menu. Off,
+ * one button per program window, a pinned Steam button (round 4; round 5:
+ * the installed client's own icon), the keyboard and the in-game menu, and
+ * a search field that finds and starts programs (round 5). Off,
  * nothing here runs and the desktop compositor lays the guest desktop out as
  * before. See docs/WINDOWED.md. */
 #ifndef WINIOS_WINDOWED_H

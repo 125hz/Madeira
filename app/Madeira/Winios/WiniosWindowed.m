@@ -50,10 +50,25 @@
  * steamTapped) handles it: ml1350 starts Steam (or Valve's installer) inside
  * this session (MadeiraSession, docs/SESSION_LAUNCH.md); when that cannot
  * run it prepares a library entry for the next start and says so.
- * env.MADEIRA_WINDOWED_STEAM = 0 hides it.
+ * env.MADEIRA_WINDOWED_STEAM = 0 hides it. Round 5: once Steam is installed
+ * in the prefix the tile shows the installed steam.exe's own icon, read at
+ * run time from its PE resources (ww_pe_icon: the first RT_GROUP_ICON, its
+ * 32-bit 64x64 or 48x48 RT_ICON); no Valve artwork is in the repository.
+ *
+ * Search (round 5). The taskbar's search field is a launcher: while it is
+ * being edited a results panel (WWLauncher, the chrome's material) sits above
+ * the taskbar and lists, filtered as you type, the open windows, three tools
+ * (Explorer, Command Prompt, Steam), the library's games and the programs in
+ * the prefix (Start Menu / Desktop shortcuts, Program Files), the last four
+ * from WindowedMode.swift (MadeiraWindowedBridge launcherItems:). A window is
+ * raised; anything else starts inside the running session (launcherPick:,
+ * MadeiraSession). Go picks the first result; a touch on a window or the
+ * background closes it. While the field has the software keyboard, the
+ * taskbar and the panel ride above it (keyboard frame notifications).
  *
  * Log lines: "[windowed] ml1300 ..." for on/off, add, refit, remove, activate,
- * move, scale, minimize, restore, fullscreen, close, steam and the ignored presses. */
+ * move, scale, minimize, restore, fullscreen, close, steam, search and the
+ * ignored presses. */
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -600,11 +615,25 @@ static BOOL ww_by_touch(UIEvent *event, const char *what)
 @property (nonatomic, strong) WWAppStrip *apps;
 @property (nonatomic, strong) UIButton *keyboardButton, *menuButton;
 @property (nonatomic, strong) UIButton *steamButton;   /* pinned, left of the program buttons */
+@property (nonatomic, strong) UIImageView *steamIcon;  /* round 5: the installed steam.exe's icon */
 @property (nonatomic, strong) UIView *steamDot;
 @property (nonatomic, strong) NSMutableArray<UIButton *> *appButtons;
 @end
 
 static WWDock *g_dock;
+
+/* Round 5: the search launcher (results panel) and the Steam tile's icon. */
+@class WWLauncher;
+static WWLauncher *g_launch;
+static CGFloat g_kb_lift;                 /* points the software keyboard covers while the search field has it */
+static const char *g_launch_close_why;    /* why the search field is being released (log) */
+static void ww_launch_open(void);
+static void ww_launch_closed(void);
+static void ww_launch_filter(void);
+static BOOL ww_launch_pick(NSUInteger index);
+static void ww_launch_layout(void);
+static void ww_steam_activate(const char *why);
+static void ww_steam_icon_check(BOOL force);
 
 /* Maximize: one framed window fills the whole screen like a game session's
  * picture (no title bar, taskbar hidden, black letterbox); a small floating
@@ -624,6 +653,7 @@ static void ww_set_maximized(WWWin *w, BOOL on, const char *why);
 static void ww_search_release(const char *why)
 {
     if (!g_dock || !g_dock.search.isFirstResponder) return;
+    g_launch_close_why = why;   /* round 5: the results panel closes with it */
     [g_dock.search resignFirstResponder];
     ww_log("search field released (%s): the keyboard goes back to the program", why);
 }
@@ -712,6 +742,28 @@ static BOOL ww_bridge_bool(NSString *sel)
     if (!c || ![c respondsToSelector:s]) return NO;
     BOOL (*fn)(id, SEL) = (BOOL (*)(id, SEL))[c methodForSelector:s];
     return fn(c, s);
+}
+
+/* Round 5: a bridge class method that returns a string (nil bridge: nil)... */
+static NSString *ww_bridge_string(NSString *sel)
+{
+    Class c = ww_bridge();
+    SEL s = NSSelectorFromString(sel);
+    if (!c || ![c respondsToSelector:s]) return nil;
+    NSString *(*fn)(id, SEL) = (NSString *(*)(id, SEL))[c methodForSelector:s];
+    id value = fn(c, s);
+    return [value isKindOfClass:[NSString class]] ? value : nil;
+}
+
+/* ... and one that takes an object. */
+static void ww_bridge_call_with(NSString *sel, id arg)
+{
+    Class c = ww_bridge();
+    SEL s = NSSelectorFromString(sel);
+    if (c && [c respondsToSelector:s]) {
+        void (*fn)(id, SEL, id) = (void (*)(id, SEL, id))[c methodForSelector:s];
+        fn(c, s, arg);
+    }
 }
 
 @implementation WWRootView
@@ -1025,82 +1077,101 @@ static BOOL ww_bridge_bool(NSString *sel)
     [_steamButton addTarget:self action:@selector(steamPressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
     _steamButton.hidden = !bridge || !ww_bridge_bool(@"steamButtonEnabled");
     [_pill.contentView addSubview:_steamButton];
+    /* round 5: the installed client's own icon replaces the glyph (ww_steam_icon_check) */
+    _steamIcon = [[UIImageView alloc] initWithFrame:CGRectMake(0, 0, WW_DOCK_ITEM, WW_DOCK_ITEM)];
+    _steamIcon.contentMode = UIViewContentModeScaleAspectFit;
+    _steamIcon.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _steamIcon.userInteractionEnabled = NO;
+    _steamIcon.hidden = YES;
+    [_steamButton addSubview:_steamIcon];
     _steamDot = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 5, 5)];
     _steamDot.layer.cornerRadius = 2.5;
     _steamDot.backgroundColor = [UIColor colorWithWhite:1 alpha:0.55];
     _steamDot.userInteractionEnabled = NO;
     _steamDot.hidden = YES;
     [_pill.contentView addSubview:_steamDot];
+
+    /* round 5: while the search field has the software keyboard, the taskbar
+     * (and the results panel above it) ride above the keyboard */
+    NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+    [nc addObserver:self selector:@selector(keyboardWillChange:) name:UIKeyboardWillChangeFrameNotification object:nil];
+    [nc addObserver:self selector:@selector(keyboardWillChange:) name:UIKeyboardWillHideNotification object:nil];
     return self;
 }
 
+- (void)dealloc { [NSNotificationCenter.defaultCenter removeObserver:self]; }
+
 - (BOOL)canBecomeFocused { return NO; }
+
+/* The keyboard's end frame in the root view: a docked keyboard (it reaches
+ * the bottom of the view) lifts the taskbar by the height it covers, with the
+ * keyboard's own duration and curve. A floating (iPad) keyboard, one that
+ * belongs to another text input, or the keyboard going away: back down. */
+- (void)keyboardWillChange:(NSNotification *)n {
+    if (!g_root || g_dock != self) return;
+    BOOL hide = [n.name isEqualToString:UIKeyboardWillHideNotification];
+    NSValue *end = n.userInfo[UIKeyboardFrameEndUserInfoKey];
+    UIScreen *screen = g_root.window.windowScene.screen;
+    CGFloat lift = 0;
+    if (!hide && _search.isFirstResponder && end && screen) {
+        CGRect kb = [g_root convertRect:end.CGRectValue fromCoordinateSpace:screen.coordinateSpace];
+        CGRect b = g_root.bounds;
+        if (kb.size.height > 0 && CGRectGetMaxY(kb) >= CGRectGetMaxY(b) - 1 && CGRectGetMinY(kb) < CGRectGetMaxY(b))
+            lift = CGRectGetMaxY(b) - MAX(CGRectGetMinY(kb), CGRectGetMinY(b));
+    }
+    if (fabs(lift - g_kb_lift) < 0.5) return;
+    g_kb_lift = lift;
+    ww_log("search: keyboard %s (%.0f pt): taskbar %s", lift > 0 ? "up" : "down", lift,
+           lift > 0 ? "and results moved above it" : "back at the bottom");
+    double duration = [n.userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
+    NSUInteger curve = [n.userInfo[UIKeyboardAnimationCurveUserInfoKey] unsignedIntegerValue];
+    [UIView animateWithDuration:duration > 0 ? duration : 0.25 delay:0
+                        options:(UIViewAnimationOptions)(curve << 16) | UIViewAnimationOptionBeginFromCurrentState |
+                                UIViewAnimationOptionAllowUserInteraction
+                     animations:^{ ww_layout_dock(); [(UIView *)g_launch layoutIfNeeded]; }
+                     completion:nil];
+}
 
 /* The keyboard and menu buttons answer a touch only: a controller's A on a
  * focused button opened the keyboard over the game. */
 - (void)keyboardPressed:(UIButton *)b forEvent:(UIEvent *)e {
     if (!ww_by_touch(e, "taskbar keyboard button")) return;
-    [_search resignFirstResponder];
+    ww_search_release("taskbar keyboard button");
     ww_bridge_call(@"toggleKeyboard");
 }
 - (void)menuPressed:(UIButton *)b forEvent:(UIEvent *)e {
     if (!ww_by_touch(e, "taskbar menu button")) return;
-    [_search resignFirstResponder];
+    ww_search_release("taskbar menu button");
     ww_bridge_call(@"openMenu");
 }
-/* The pinned Steam button. A Steam window already open in this session comes
- * to the front (restored first when minimized). Otherwise the Swift side
- * decides: memory warning, then Steam (installed) or Valve's installer (not
- * installed), started inside this session (ml1350), or as a library entry for
- * the next start when that cannot run. */
+/* The pinned Steam button (ww_steam_activate). */
 - (void)steamPressed:(UIButton *)b forEvent:(UIEvent *)e {
     if (!ww_by_touch(e, "taskbar Steam button")) return;
-    [_search resignFirstResponder];
-    WWWin *w = ww_steam_window();
-    if (w) {
-        if (w->appMinimized || ww_iconic(w)) {
-            if (ww_iconic(w)) ww_enqueue(w->hwnd, WW_SC_RESTORE);
-            w->appMinimized = NO;
-            ww_update(w);
-        }
-        ww_raise(w, YES, "taskbar Steam button");
-        ww_log("steam: launch (already running in this session: hwnd=%p \"%s\" exe=%s brought to the front)",
-               (void *)w->hwnd, ww_display_title(w).UTF8String, w->exe.UTF8String);
-        return;
-    }
-    ww_log("steam: button (no Steam window in this session; the app checks the install)");
-    ww_bridge_call(@"steamTapped");
+    ww_search_release("taskbar Steam button");
+    ww_steam_icon_check(YES);
+    ww_steam_activate("taskbar Steam button");
 }
 
-- (void)searchChanged { ww_dock_refresh(); }
+/* Round 5: the field is the launcher's: editing it shows the results panel,
+ * typing filters it, Go picks the first result (nothing typed: just closes),
+ * and the panel closes with the keyboard. */
+- (void)searchChanged { ww_launch_filter(); }
+
+- (void)textFieldDidBeginEditing:(UITextField *)field { ww_launch_open(); }
+
+- (void)textFieldDidEndEditing:(UITextField *)field { ww_launch_closed(); }
 
 - (BOOL)textFieldShouldReturn:(UITextField *)field {
-    /* Go: bring the first matching window to the front. Nothing typed: just
-     * close the keyboard (Go on an empty field activated another program). */
     NSString *typed = [field.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
-    UIButton *first = nil;
-    if (typed.length) for (UIButton *b in _appButtons) if (!b.hidden) { first = b; break; }
+    if (typed.length && ww_launch_pick(0)) return NO;
+    g_launch_close_why = typed.length ? "Go with no match" : "Go on an empty field";
     [field resignFirstResponder];
-    if (first) {
-        WWWin *w = ww_get((uintptr_t)first.tag, NO);
-        if (w) {
-            if (w->appMinimized || ww_iconic(w)) {
-                if (ww_iconic(w)) ww_enqueue(w->hwnd, WW_SC_RESTORE);
-                w->appMinimized = NO;
-                ww_log("restore hwnd=%p (search)", (void *)w->hwnd);
-                ww_update(w);
-            }
-            ww_raise(w, YES, "search");
-        }
-    }
-    field.text = @"";
-    ww_dock_refresh();
     return NO;
 }
 
 - (void)appTapped:(UIButton *)b forEvent:(UIEvent *)e {
     if (!ww_by_touch(e, "taskbar button")) return;
-    [_search resignFirstResponder];
+    ww_search_release("taskbar button");
     WWWin *w = ww_get((uintptr_t)b.tag, NO);
     if (!w) return;
     if (w->appMinimized || ww_iconic(w)) {
@@ -1243,6 +1314,722 @@ void winios_windowed_unmaximize(void)
         if (w) ww_set_maximized(w, NO, "menu");
     };
     if (NSThread.isMainThread) run(); else dispatch_async(dispatch_get_main_queue(), run);
+}
+
+/* ------------------------------------------------------------------ *
+ * Program icons from PE resources (round 5)
+ *
+ * The icon Windows shows for a program file: its first icon group
+ * (RT_GROUP_ICON, in resource order) and, from that group, preferably the
+ * 32-bit 64x64 image, else the 32-bit 48x48, else the nearest size. The
+ * image is a PNG or a DIB (1/4/8/24/32 bits per pixel, AND mask for
+ * transparency). Read from the user's installed files at run time, on a
+ * background queue; every offset is bounds-checked against the file.
+ * ------------------------------------------------------------------ */
+
+static uint32_t ww_le16(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8; }
+static uint32_t ww_le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+typedef struct {
+    const uint8_t *base;
+    size_t size;
+    const uint8_t *sections;   /* the section table */
+    unsigned nsec;
+    uint32_t rsrc;             /* RVA of the resource directory */
+} ww_pe;
+
+#define WW_RES_NONE 0xFFFFFFFFu
+
+/* `len` bytes at `rva`, inside one section's data in the file; NULL otherwise. */
+static const uint8_t *ww_pe_at(const ww_pe *pe, uint32_t rva, uint32_t len)
+{
+    for (unsigned i = 0; i < pe->nsec; i++) {
+        const uint8_t *s = pe->sections + (size_t)i * 40;
+        uint32_t vsize = ww_le32(s + 8), va = ww_le32(s + 12), raw = ww_le32(s + 16), ptr = ww_le32(s + 20);
+        uint32_t span = vsize > raw ? vsize : raw;
+        if (rva < va || rva - va >= span) continue;
+        uint64_t in = (uint64_t)(rva - va);
+        if (in + len > raw) return NULL;                 /* past the file data (zero fill) */
+        uint64_t off = (uint64_t)ptr + in;
+        if (off + len > pe->size) return NULL;
+        return pe->base + off;
+    }
+    return NULL;
+}
+
+/* In the resource directory at `dir` (an offset into the resource section),
+ * the entry for `id` (id < 0: the first entry; named entries come first, as
+ * in Windows' resource order). Its offset: a subdirectory when `want_dir`,
+ * else a data entry; WW_RES_NONE when there is none. */
+static uint32_t ww_res_entry(const ww_pe *pe, uint32_t dir, int id, int want_dir)
+{
+    const uint8_t *d = ww_pe_at(pe, pe->rsrc + dir, 16);
+    if (!d) return WW_RES_NONE;
+    uint32_t n = ww_le16(d + 12) + ww_le16(d + 14);
+    if (!n || n > 4096) return WW_RES_NONE;
+    const uint8_t *e = ww_pe_at(pe, pe->rsrc + dir + 16, n * 8);
+    if (!e) return WW_RES_NONE;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t name = ww_le32(e + i * 8), data = ww_le32(e + i * 8 + 4);
+        if (id >= 0 && ((name & 0x80000000u) || name != (uint32_t)id)) continue;
+        int is_dir = (data & 0x80000000u) != 0;
+        if (is_dir != (want_dir != 0)) {
+            if (id >= 0) return WW_RES_NONE;
+            continue;
+        }
+        return data & 0x7FFFFFFFu;
+    }
+    return WW_RES_NONE;
+}
+
+/* The bytes of resource `type` / `id` (id < 0: the first), first language. */
+static const uint8_t *ww_res_data(const ww_pe *pe, int type, int id, uint32_t *len)
+{
+    uint32_t t = ww_res_entry(pe, 0, type, 1);
+    uint32_t r = t == WW_RES_NONE ? WW_RES_NONE : ww_res_entry(pe, t, id, 1);
+    uint32_t l = r == WW_RES_NONE ? WW_RES_NONE : ww_res_entry(pe, r, -1, 0);
+    if (l == WW_RES_NONE) return NULL;
+    const uint8_t *de = ww_pe_at(pe, pe->rsrc + l, 16);
+    if (!de) return NULL;
+    uint32_t rva = ww_le32(de), size = ww_le32(de + 4);
+    if (!size || size > 16u * 1024 * 1024) return NULL;
+    *len = size;
+    return ww_pe_at(pe, rva, size);
+}
+
+/* An icon DIB (BITMAPINFOHEADER, XOR bitmap at twice the height, AND mask)
+ * as a premultiplied BGRA image; NULL for a format it does not decode. */
+static CGImageRef ww_dib_image(const uint8_t *p, uint32_t len)
+{
+    if (len < 40) return NULL;
+    uint32_t hsize = ww_le32(p);
+    int32_t w = (int32_t)ww_le32(p + 4), h2 = (int32_t)ww_le32(p + 8);
+    uint32_t bpp = ww_le16(p + 14), comp = ww_le32(p + 16), used = ww_le32(p + 32);
+    if (hsize < 40 || hsize > len || w <= 0 || w > 512 || h2 <= 1 || h2 > 1024 || comp != 0) return NULL;
+    if (bpp != 1 && bpp != 4 && bpp != 8 && bpp != 24 && bpp != 32) return NULL;
+    int h = h2 / 2;
+    uint32_t ncolors = bpp <= 8 ? (used && used <= (1u << bpp) ? used : (1u << bpp)) : 0;
+    uint64_t xor_off = (uint64_t)hsize + (uint64_t)ncolors * 4;
+    uint64_t stride = (((uint64_t)w * bpp + 31) / 32) * 4, and_stride = (((uint64_t)w + 31) / 32) * 4;
+    if (xor_off + stride * h > len) return NULL;
+    const uint8_t *pal = p + hsize, *xor_bits = p + xor_off;
+    const uint8_t *and_bits = xor_off + stride * h + and_stride * h <= len ? xor_bits + stride * h : NULL;
+    uint8_t *px = malloc((size_t)w * h * 4);
+    if (!px) return NULL;
+    int any_alpha = 0;
+    for (int y = 0; y < h; y++) {
+        const uint8_t *row = xor_bits + (size_t)(h - 1 - y) * stride;   /* bottom-up */
+        uint8_t *out = px + (size_t)y * w * 4;
+        for (int x = 0; x < w; x++) {
+            uint8_t b = 0, g = 0, r = 0, a = 255;
+            if (bpp == 32) {
+                b = row[x * 4]; g = row[x * 4 + 1]; r = row[x * 4 + 2]; a = row[x * 4 + 3];
+                if (a) any_alpha = 1;
+            } else if (bpp == 24) {
+                b = row[x * 3]; g = row[x * 3 + 1]; r = row[x * 3 + 2];
+            } else {
+                uint32_t idx = bpp == 8 ? row[x]
+                             : bpp == 4 ? (uint32_t)(row[x >> 1] >> ((x & 1) ? 0 : 4)) & 15
+                                        : (uint32_t)(row[x >> 3] >> (7 - (x & 7))) & 1;
+                if (idx < ncolors) { b = pal[idx * 4]; g = pal[idx * 4 + 1]; r = pal[idx * 4 + 2]; }
+            }
+            out[x * 4] = b; out[x * 4 + 1] = g; out[x * 4 + 2] = r; out[x * 4 + 3] = a;
+        }
+    }
+    for (int y = 0; y < h; y++) {
+        const uint8_t *mask = and_bits ? and_bits + (size_t)(h - 1 - y) * and_stride : NULL;
+        uint8_t *out = px + (size_t)y * w * 4;
+        for (int x = 0; x < w; x++) {
+            uint8_t *q = out + x * 4;
+            /* no alpha channel (or an all-zero one): the AND mask marks the transparent pixels */
+            if (bpp < 32 || !any_alpha) q[3] = mask && ((mask[x >> 3] >> (7 - (x & 7))) & 1) ? 0 : 255;
+            if (q[3] != 255) { q[0] = (uint8_t)(q[0] * q[3] / 255); q[1] = (uint8_t)(q[1] * q[3] / 255); q[2] = (uint8_t)(q[2] * q[3] / 255); }
+        }
+    }
+    NSData *data = [NSData dataWithBytesNoCopy:px length:(size_t)w * h * 4 freeWhenDone:YES];
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGDataProviderRef dp = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
+    CGImageRef img = CGImageCreate(w, h, 8, 32, (size_t)w * 4, cs,
+                                   kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst,
+                                   dp, NULL, false, kCGRenderingIntentDefault);
+    CGDataProviderRelease(dp);
+    CGColorSpaceRelease(cs);
+    return img;
+}
+
+/* Any thread. The icon of the program file at `path` (host path), its size,
+ * or nil and why not. */
+static UIImage *ww_pe_icon(NSString *path, int *ow, int *oh, const char **why)
+{
+    *why = "unreadable";
+    __attribute__((objc_precise_lifetime)) NSData *file =
+        [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
+    if (!file || file.length < 64) return nil;
+    const uint8_t *b = file.bytes;
+    size_t size = file.length;
+    *why = "not a Windows program file";
+    if (b[0] != 'M' || b[1] != 'Z') return nil;
+    uint32_t pe_off = ww_le32(b + 60);
+    if ((uint64_t)pe_off + 24 > size || memcmp(b + pe_off, "PE\0\0", 4)) return nil;
+    const uint8_t *coff = b + pe_off + 4;
+    unsigned nsec = ww_le16(coff + 2), optsize = ww_le16(coff + 16);
+    const uint8_t *opt = coff + 20;
+    if (!nsec || nsec > 96 || optsize < 2 || (uint64_t)pe_off + 24 + optsize + (uint64_t)nsec * 40 > size) return nil;
+    uint32_t magic = ww_le16(opt), dd = magic == 0x10b ? 96 : magic == 0x20b ? 112 : 0;
+    if (!dd || optsize < dd + 3 * 8 || ww_le32(opt + dd - 4) < 3) return nil;   /* NumberOfRvaAndSizes */
+    ww_pe pe = { b, size, opt + optsize, nsec, ww_le32(opt + dd + 2 * 8) };
+    *why = "no resources";
+    if (!pe.rsrc) return nil;
+    *why = "no icon";
+    uint32_t glen = 0;
+    const uint8_t *grp = ww_res_data(&pe, 14 /* RT_GROUP_ICON */, -1, &glen);
+    if (!grp || glen < 6 || ww_le16(grp + 2) != 1) return nil;
+    unsigned count = ww_le16(grp + 4);
+    if (!count || count > 64 || 6 + count * 14 > glen) return nil;
+    /* 32-bit first; then 64x64, then 48x48, then the size nearest 64 (larger first) */
+    unsigned order[64];
+    long rank[64];
+    for (unsigned i = 0; i < count; i++) {
+        const uint8_t *e = grp + 6 + i * 14;
+        long side = e[0] ? e[0] : 256, bits = ww_le16(e + 6);
+        long r = (bits >= 32 ? 0 : 100000) + (side == 64 ? 0 : side == 48 ? 10000 : 20000 + labs(side - 64) * 10 + (side < 64));
+        unsigned k = i;
+        while (k > 0 && rank[k - 1] > r) { rank[k] = rank[k - 1]; order[k] = order[k - 1]; k--; }
+        rank[k] = r;
+        order[k] = i;
+    }
+    *why = "its icon could not be decoded";
+    for (unsigned k = 0; k < count; k++) {
+        const uint8_t *e = grp + 6 + order[k] * 14;
+        uint32_t ilen = 0;
+        const uint8_t *data = ww_res_data(&pe, 3 /* RT_ICON */, (int)ww_le16(e + 12), &ilen);
+        if (!data) continue;
+        CGImageRef img = NULL;
+        if (ilen >= 8 && !memcmp(data, "\x89PNG\r\n\x1a\n", 8)) {
+            UIImage *png = [UIImage imageWithData:[NSData dataWithBytes:data length:ilen]];
+            if (png.CGImage) img = CGImageRetain(png.CGImage);
+        } else {
+            img = ww_dib_image(data, ilen);
+        }
+        if (!img) continue;
+        *ow = (int)CGImageGetWidth(img);
+        *oh = (int)CGImageGetHeight(img);
+        UIImage *icon = [UIImage imageWithCGImage:img];
+        CGImageRelease(img);
+        *why = NULL;
+        return icon;
+    }
+    return nil;
+}
+
+static dispatch_queue_t ww_icon_queue(void)
+{
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("madeira.windowed.icons",
+                                  dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+    });
+    return q;
+}
+
+/* "<...>/wine/drive_c/Program Files/x.exe" -> "C:\Program Files\x.exe" (log lines). */
+static NSString *ww_windows_path(NSString *host)
+{
+    NSRange r = [host rangeOfString:@"/drive_c/"];
+    if (r.location == NSNotFound) return host.lastPathComponent ?: @"";
+    return [@"C:\\" stringByAppendingString:
+            [[host substringFromIndex:NSMaxRange(r)] stringByReplacingOccurrencesOfString:@"/" withString:@"\\"]];
+}
+
+/* Main thread. The icon of a program file, or (cover) a library cover image
+ * cut to a square: the cached one; nil while it loads in the background (the
+ * results panel is filled again when it arrives) or, with *failed, when there
+ * is none. */
+static NSMutableDictionary<NSString *, id> *g_icons;     /* path -> UIImage, or NSNull */
+static NSMutableSet<NSString *> *g_icons_pending;
+static BOOL g_icons_refill_queued;
+
+static UIImage *ww_icon_lookup(NSString *path, BOOL cover, BOOL *failed)
+{
+    if (failed) *failed = NO;
+    if (![path isKindOfClass:[NSString class]] || !path.length) { if (failed) *failed = YES; return nil; }
+    if (!g_icons) { g_icons = [NSMutableDictionary new]; g_icons_pending = [NSMutableSet new]; }
+    id hit = g_icons[path];
+    if ([hit isKindOfClass:[UIImage class]]) return hit;
+    if (hit) { if (failed) *failed = YES; return nil; }
+    if ([g_icons_pending containsObject:path]) return nil;
+    [g_icons_pending addObject:path];
+    dispatch_async(ww_icon_queue(), ^{
+        UIImage *image = nil;
+        if (cover) {
+            UIImage *full = [UIImage imageWithContentsOfFile:path];
+            CGSize s = full.size;
+            if (full && s.width > 0 && s.height > 0) {
+                CGFloat k = MAX(64 / s.width, 64 / s.height);
+                UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(64, 64)];
+                image = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+                    [full drawInRect:CGRectMake((64 - s.width * k) / 2, (64 - s.height * k) / 2, s.width * k, s.height * k)];
+                }];
+            }
+        } else {
+            int w = 0, h = 0;
+            const char *why = NULL;
+            image = ww_pe_icon(path, &w, &h, &why);
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!g_icons) return;
+            [g_icons_pending removeObject:path];
+            if (g_icons.count > 512) [g_icons removeAllObjects];
+            g_icons[path] = image ?: (id)NSNull.null;
+            if (g_icons_refill_queued) return;
+            g_icons_refill_queued = YES;
+            dispatch_async(dispatch_get_main_queue(), ^{ g_icons_refill_queued = NO; ww_launch_filter(); });
+        });
+    });
+    return nil;
+}
+
+/* A white SF Symbol on the chrome's neutral rounded tile (tools without an icon). */
+static UIImage *ww_symbol_tile(NSString *symbol)
+{
+    static NSMutableDictionary<NSString *, UIImage *> *cache;
+    if (!cache) cache = [NSMutableDictionary new];
+    UIImage *hit = cache[symbol];
+    if (hit) return hit;
+    UIImage *glyph = [[UIImage systemImageNamed:symbol withConfiguration:
+                       [UIImageSymbolConfiguration configurationWithPointSize:15 weight:UIImageSymbolWeightSemibold]]
+                      imageWithTintColor:UIColor.whiteColor renderingMode:UIImageRenderingModeAlwaysOriginal];
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(34, 34)];
+    UIImage *image = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [[UIColor colorWithWhite:1 alpha:0.16] setFill];
+        [[UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, 34, 34) cornerRadius:8] fill];
+        if (glyph) {
+            CGSize s = glyph.size;
+            [glyph drawInRect:CGRectMake((34 - s.width) / 2, (34 - s.height) / 2, s.width, s.height)];
+        }
+    }];
+    cache[symbol] = image;
+    return image;
+}
+
+/* ------------------------------------------------------------------ *
+ * Steam on the taskbar (round 4; round 5: its icon)
+ * ------------------------------------------------------------------ */
+
+static UIImage *g_steam_icon;              /* the installed steam.exe's icon, once read */
+static NSString *g_steam_icon_path;        /* the steam.exe last tried (loading, read or failed) */
+static CFTimeInterval g_steam_icon_checked;
+static BOOL g_steam_icon_logged;           /* the placeholder line, once per session */
+
+static void ww_steam_icon_apply(void)
+{
+    WWDock *d = g_dock;
+    if (!d) return;
+    BOOL real = g_steam_icon != nil;
+    d.steamIcon.image = g_steam_icon;
+    d.steamIcon.hidden = !real;
+    [d.steamButton setImage:real ? nil : ww_glyph(@"gamecontroller", WW_DOCK_ITEM) forState:UIControlStateNormal];
+    d.steamButton.backgroundColor = real ? UIColor.clearColor : [UIColor colorWithWhite:1 alpha:0.14];
+}
+
+/* Main thread. Until the tile has the client's icon: is Steam installed in the
+ * prefix (WindowedMode.swift, the paths the tile starts)? Then read the icon
+ * of that steam.exe in the background. At most every 5 s unless `force`
+ * (a tap on the tile, the search panel opening); a file whose icon could not
+ * be read is not read again this session. */
+static void ww_steam_icon_check(BOOL force)
+{
+    WWDock *d = g_dock;
+    if (!d || d.steamButton.hidden || g_steam_icon) return;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (!force && g_steam_icon_checked > 0 && now - g_steam_icon_checked < 5) return;
+    g_steam_icon_checked = now;
+    NSString *path = ww_bridge_string(@"steamClientHostPath");
+    if (!path.length) {
+        if (!g_steam_icon_logged && (g_steam_icon_logged = YES))
+            ww_log("steam: icon placeholder (Steam is not installed in the prefix; the tile keeps its glyph)");
+        return;
+    }
+    if ([path isEqualToString:g_steam_icon_path]) return;
+    g_steam_icon_path = path;
+    NSString *shown = ww_windows_path(path);
+    dispatch_async(ww_icon_queue(), ^{
+        int w = 0, h = 0;
+        const char *why = NULL;
+        UIImage *icon = ww_pe_icon(path, &w, &h, &why);
+        NSString *reason = why ? @(why) : @"";
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (![g_steam_icon_path isEqualToString:path]) return;   /* another session since */
+            if (icon) {
+                g_steam_icon = icon;
+                ww_steam_icon_apply();
+                ww_log("steam: icon from %s (%dx%d)", shown.UTF8String, w, h);
+                ww_launch_filter();
+            } else {
+                g_steam_icon_logged = YES;
+                ww_log("steam: icon placeholder (%s: %s; the tile keeps its glyph)", shown.UTF8String, reason.UTF8String);
+            }
+        });
+    });
+}
+
+/* The pinned Steam button, or the search's Steam tool. A Steam window already
+ * open in this session comes to the front (restored first when minimized).
+ * Otherwise the Swift side decides: memory warning, then Steam (installed) or
+ * Valve's installer (not installed), started inside this session (ml1350), or
+ * as a library entry for the next start when that cannot run. */
+static void ww_steam_activate(const char *why)
+{
+    WWWin *w = ww_steam_window();
+    if (w) {
+        if (w->appMinimized || ww_iconic(w)) {
+            if (ww_iconic(w)) ww_enqueue(w->hwnd, WW_SC_RESTORE);
+            w->appMinimized = NO;
+            ww_update(w);
+        }
+        ww_raise(w, YES, why);
+        ww_log("steam: launch (already running in this session: hwnd=%p \"%s\" exe=%s brought to the front)",
+               (void *)w->hwnd, ww_display_title(w).UTF8String, w->exe.UTF8String);
+        return;
+    }
+    ww_log("steam: button (no Steam window in this session; the app checks the install)");
+    ww_bridge_call(@"steamTapped");
+}
+
+/* ------------------------------------------------------------------ *
+ * Search launcher (round 5)
+ * ------------------------------------------------------------------ */
+
+static UIImage *ww_letter_icon(NSString *name);
+
+static const CGFloat WW_ROW_H = 50;       /* a result row */
+static const CGFloat WW_LIST_PAD = 6;     /* panel edge to the rows */
+#define WW_LAUNCH_MAX 60                  /* rows shown at most */
+
+static NSArray<NSDictionary *> *g_launch_items;   /* tools, library, programs (WindowedMode.swift) */
+static NSArray<NSDictionary *> *g_launch_shown;   /* the rows, in order */
+static NSString *g_launch_windows_sig;            /* the open windows the rows were made from */
+
+@interface WWLaunchRow : WWButton
+@property (nonatomic, strong) UIImageView *iconView;
+@property (nonatomic, strong) UILabel *nameLabel, *detailLabel;
+@property (nonatomic) BOOL primary;      /* the row Go picks: a faint background */
+@end
+
+@implementation WWLaunchRow
+- (instancetype)initWithFrame:(CGRect)frame {
+    if (!(self = [super initWithFrame:frame])) return nil;
+    self.layer.cornerRadius = 10;
+    self.layer.cornerCurve = kCACornerCurveContinuous;
+    _iconView = [[UIImageView alloc] initWithFrame:CGRectZero];
+    _iconView.contentMode = UIViewContentModeScaleAspectFit;
+    _iconView.layer.cornerRadius = 7;
+    _iconView.layer.cornerCurve = kCACornerCurveContinuous;
+    _iconView.clipsToBounds = YES;
+    _iconView.userInteractionEnabled = NO;
+    [self addSubview:_iconView];
+    _nameLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    _nameLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    _nameLabel.textColor = UIColor.whiteColor;
+    _nameLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    _nameLabel.userInteractionEnabled = NO;
+    [self addSubview:_nameLabel];
+    _detailLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    _detailLabel.font = [UIFont systemFontOfSize:12];
+    _detailLabel.textColor = [UIColor colorWithWhite:1 alpha:0.55];
+    _detailLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    _detailLabel.userInteractionEnabled = NO;
+    [self addSubview:_detailLabel];
+    return self;
+}
+- (void)applyBackground {
+    self.backgroundColor = [UIColor colorWithWhite:1 alpha:self.highlighted ? 0.18 : _primary ? 0.08 : 0];
+}
+- (void)setHighlighted:(BOOL)highlighted { [super setHighlighted:highlighted]; [self applyBackground]; }
+- (void)setPrimary:(BOOL)primary { _primary = primary; [self applyBackground]; }
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat h = self.bounds.size.height, w = self.bounds.size.width, side = 32, x = 10 + side + 12;
+    _iconView.frame = CGRectMake(10, (h - side) / 2, side, side);
+    _nameLabel.frame = CGRectMake(x, h / 2 - 18, MAX(w - x - 12, 0), 19);
+    _detailLabel.frame = CGRectMake(x, h / 2 + 2, MAX(w - x - 12, 0), 16);
+}
+@end
+
+/* The results panel: the chrome's material above the taskbar, a scrolling
+ * list of rows. Not focusable, touch only, as the rest of the chrome. */
+@interface WWLauncher : UIView
+@property (nonatomic, strong) UIVisualEffectView *blur;
+@property (nonatomic, strong) WWAppStrip *list;
+@property (nonatomic, strong) UILabel *message;
+@property (nonatomic, strong) NSMutableArray<WWLaunchRow *> *rows;
+@end
+
+@implementation WWLauncher
+- (instancetype)init {
+    if (!(self = [super initWithFrame:CGRectZero])) return nil;
+    _rows = [NSMutableArray new];
+    _blur = ww_material(16, kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner | kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner);
+    [self addSubview:_blur];
+    _list = [[WWAppStrip alloc] initWithFrame:CGRectZero];
+    _list.showsHorizontalScrollIndicator = NO;
+    _list.alwaysBounceVertical = NO;
+    [_blur.contentView addSubview:_list];
+    _message = [[UILabel alloc] initWithFrame:CGRectZero];
+    _message.font = [UIFont systemFontOfSize:14];
+    _message.textColor = [UIColor colorWithWhite:1 alpha:0.6];
+    _message.textAlignment = NSTextAlignmentCenter;
+    _message.userInteractionEnabled = NO;
+    [_blur.contentView addSubview:_message];
+    self.layer.shadowColor = UIColor.blackColor.CGColor;
+    self.layer.shadowOpacity = 0.35;
+    self.layer.shadowRadius = 10;
+    self.layer.shadowOffset = CGSizeMake(0, 4);
+    self.hidden = YES;
+    return self;
+}
+- (BOOL)canBecomeFocused { return NO; }
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    _blur.frame = self.bounds;
+    ww_material_fit(_blur);
+    CGFloat w = self.bounds.size.width;
+    _list.frame = CGRectInset(self.bounds, 0, WW_LIST_PAD);
+    NSUInteger n = 0;
+    for (WWLaunchRow *row in _rows) {
+        if (row.hidden) continue;
+        row.frame = CGRectMake(WW_LIST_PAD, n * WW_ROW_H, w - 2 * WW_LIST_PAD, WW_ROW_H);
+        n++;
+    }
+    _list.contentSize = CGSizeMake(w, n * WW_ROW_H);
+    _message.frame = CGRectInset(self.bounds, 16, 0);
+    self.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:self.bounds cornerRadius:16].CGPath;
+}
+- (void)rowPressed:(WWLaunchRow *)row forEvent:(UIEvent *)e {
+    if (!ww_by_touch(e, "search result")) return;
+    ww_launch_pick((NSUInteger)row.tag);
+}
+- (WWLaunchRow *)rowAt:(NSUInteger)i {
+    while (_rows.count <= i) {
+        WWLaunchRow *row = [[WWLaunchRow alloc] initWithFrame:CGRectZero];
+        [row addTarget:self action:@selector(rowPressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
+        [_list addSubview:row];
+        [_rows addObject:row];
+    }
+    return _rows[i];
+}
+@end
+
+/* The open windows as rows (the taskbar's windows), and a signature of them. */
+static NSArray<NSDictionary *> *ww_launch_windows(NSString **sig)
+{
+    NSMutableArray *list = [NSMutableArray new];
+    NSMutableString *s = [NSMutableString new];
+    for (NSNumber *key in g_order) {
+        WWWin *w = g_wins[key];
+        if (!w || !ww_present(w)) continue;
+        NSString *name = ww_display_title(w);
+        NSString *detail = w->exe.length ? [NSString stringWithFormat:@"Open window · %@", w->exe] : @"Open window";
+        [list addObject:@{@"kind": @"window", @"hwnd": key, @"name": name, @"detail": detail, @"alt": w->exe ?: @""}];
+        [s appendFormat:@"%@|%@|%d|%d;", key, name, w->icon != nil, w->appMinimized || ww_iconic(w)];
+    }
+    if (sig) *sig = s;
+    return list;
+}
+
+/* How well `q` matches an item: 0 its name starts with it, 1 a word of the
+ * name does, 2 the name contains it, 3 only its program file name does; -1
+ * no match. An empty query matches everything (2). */
+static int ww_launch_match(NSDictionary *item, NSString *q)
+{
+    if (!q.length) return 2;
+    NSString *name = item[@"name"];
+    NSStringCompareOptions o = NSCaseInsensitiveSearch | NSDiacriticInsensitiveSearch;
+    NSRange r = [name isKindOfClass:[NSString class]] ? [name rangeOfString:q options:o] : NSMakeRange(NSNotFound, 0);
+    if (r.location == 0) return 0;
+    if (r.location != NSNotFound) {
+        unichar before = [name characterAtIndex:r.location - 1];
+        return [[NSCharacterSet alphanumericCharacterSet] characterIsMember:before] ? 2 : 1;
+    }
+    NSString *alt = item[@"alt"];
+    if ([alt isKindOfClass:[NSString class]] && [alt rangeOfString:q options:o].location != NSNotFound) return 3;
+    return -1;
+}
+
+static int ww_launch_kind_rank(NSString *kind)
+{
+    if ([kind isEqualToString:@"window"]) return 0;
+    if ([kind isEqualToString:@"tool"]) return 1;
+    if ([kind isEqualToString:@"library"] || [kind isEqualToString:@"steam"]) return 2;
+    if ([kind isEqualToString:@"startmenu"]) return 3;
+    return 4;
+}
+
+static void ww_launch_configure(WWLaunchRow *row, NSDictionary *item, BOOL primary)
+{
+    NSString *kind = item[@"kind"], *name = item[@"name"] ?: @"";
+    row.nameLabel.text = name;
+    row.detailLabel.text = item[@"detail"];
+    row.accessibilityLabel = name;
+    UIImage *icon = nil;
+    if ([kind isEqualToString:@"window"]) {
+        WWWin *w = ww_get([item[@"hwnd"] unsignedLongValue], NO);
+        if (w) icon = w->icon ?: ww_letter_icon(w->exe.length ? w->exe : name);
+    } else if ([item[@"action"] isEqual:@"steam"] && g_steam_icon) {
+        icon = g_steam_icon;
+    } else {
+        BOOL failed = NO;
+        icon = ww_icon_lookup(item[@"icon"], NO, &failed);
+        if (!icon && failed && item[@"cover"]) icon = ww_icon_lookup(item[@"cover"], YES, NULL);
+        if (!icon && [item[@"symbol"] isKindOfClass:[NSString class]]) icon = ww_symbol_tile(item[@"symbol"]);
+    }
+    row.iconView.image = icon ?: ww_letter_icon(name);
+    row.primary = primary;
+}
+
+/* Main thread. The rows for what is typed: windows, then tools, the library,
+ * Start Menu programs, other programs, best matches first. */
+static void ww_launch_filter(void)
+{
+    WWLauncher *L = g_launch;
+    if (!L || L.hidden || !g_dock) return;
+    NSString *q = [g_dock.search.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet] ?: @"";
+    NSString *sig = nil;
+    NSMutableArray<NSDictionary *> *all = [ww_launch_windows(&sig) mutableCopy];
+    g_launch_windows_sig = sig;
+    if (g_launch_items) [all addObjectsFromArray:g_launch_items];
+    NSMutableArray<NSArray *> *hits = [NSMutableArray new];
+    for (NSUInteger i = 0; i < all.count; i++) {
+        int m = ww_launch_match(all[i], q);
+        if (m < 0) continue;
+        [hits addObject:@[@(m * 10 + ww_launch_kind_rank(all[i][@"kind"])), @(i), all[i]]];
+    }
+    [hits sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) {
+        NSComparisonResult c = [a[0] compare:b[0]];
+        return c != NSOrderedSame ? c : [a[1] compare:b[1]];
+    }];
+    NSMutableArray<NSDictionary *> *shown = [NSMutableArray new];
+    for (NSArray *h in hits) { if (shown.count >= WW_LAUNCH_MAX) break; [shown addObject:h[2]]; }
+    g_launch_shown = shown;
+    for (NSUInteger i = 0; i < MAX(shown.count, L.rows.count); i++) {
+        WWLaunchRow *row = [L rowAt:i];
+        row.hidden = i >= shown.count;
+        row.tag = (NSInteger)i;
+        if (!row.hidden) ww_launch_configure(row, shown[i], i == 0 && q.length > 0);
+    }
+    L.message.hidden = shown.count > 0;
+    L.message.text = q.length ? [NSString stringWithFormat:@"Nothing matches \u201C%@\u201D", q] : @"Nothing to show yet";
+    ww_launch_layout();
+    [L setNeedsLayout];
+}
+
+static void ww_launch_layout(void)
+{
+    WWLauncher *L = g_launch;
+    WWDock *d = g_dock;
+    if (!L || !d || !g_root) return;
+    UIEdgeInsets s = g_root.safeAreaInsets;
+    CGRect b = g_root.bounds;
+    CGFloat left = MAX(s.left, 8), right = MAX(s.right, 8);
+    CGFloat width = MIN(MAX(d.frame.size.width, 380), b.size.width - left - right);
+    CGFloat x = MIN(MAX(round(CGRectGetMidX(d.frame) - width / 2), left), b.size.width - right - width);
+    CGFloat bottom = CGRectGetMinY(d.frame) - 8, top = MAX(s.top, 8);
+    NSUInteger n = g_launch_shown.count;
+    CGFloat want = (n ? n * WW_ROW_H : WW_ROW_H) + 2 * WW_LIST_PAD;
+    CGFloat h = MIN(want, MAX(bottom - top, WW_ROW_H + 2 * WW_LIST_PAD));
+    L.frame = CGRectMake(x, bottom - h, width, h);
+}
+
+/* The search field became first responder (a touch on it): the panel opens
+ * with the open windows and the tools at once; the library and the prefix's
+ * programs follow from WindowedMode.swift (immediately from its last scan,
+ * again when a new scan of the prefix finishes). */
+static void ww_launch_open(void)
+{
+    if (!g_root || !g_dock) return;
+    if (!g_launch) g_launch = [WWLauncher new];
+    if (g_launch.superview != g_root) [g_root addSubview:g_launch];
+    [g_root bringSubviewToFront:g_launch];
+    BOOL was = !g_launch.hidden;
+    g_launch.hidden = NO;
+    ww_steam_icon_check(YES);
+    Class c = ww_bridge();
+    SEL s = NSSelectorFromString(@"launcherItems:");
+    if (c && [c respondsToSelector:s]) {
+        void (*fn)(id, SEL, void (^)(NSArray *)) = (void (*)(id, SEL, void (^)(NSArray *)))[c methodForSelector:s];
+        fn(c, s, ^(NSArray *items) {
+            /* the main thread: the Swift side answers on the main actor */
+            g_launch_items = [items isKindOfClass:[NSArray class]] ? [items copy] : nil;
+            ww_launch_filter();
+        });
+    }
+    ww_launch_filter();
+    [g_launch.list setContentOffset:CGPointZero animated:NO];
+    if (!was) {
+        g_launch.alpha = 0;
+        [UIView animateWithDuration:0.15 delay:0 options:UIViewAnimationOptionAllowUserInteraction
+                         animations:^{ g_launch.alpha = 1; } completion:nil];
+        NSUInteger windows = 0;
+        for (NSDictionary *item in g_launch_shown) if ([item[@"kind"] isEqual:@"window"]) windows++;
+        ww_log("search: open (%lu windows, %lu programs and tools%s)", (unsigned long)windows,
+               (unsigned long)g_launch_items.count, c ? "" : "; no Swift bridge: windows only");
+    }
+}
+
+/* The search field gave up the keyboard: the panel closes, the text goes. */
+static void ww_launch_closed(void)
+{
+    const char *why = g_launch_close_why ? g_launch_close_why : "keyboard dismissed";
+    g_launch_close_why = NULL;
+    if (g_launch && !g_launch.hidden) {
+        g_launch.hidden = YES;
+        ww_log("search: close (%s)", why);
+    }
+    g_launch_shown = nil;
+    if (g_dock) g_dock.search.text = @"";
+    if (g_kb_lift > 0) {
+        /* the keyboard's hide notification may not come (another text input takes it) */
+        g_kb_lift = 0;
+        [UIView animateWithDuration:0.25 delay:0 options:UIViewAnimationOptionBeginFromCurrentState
+                         animations:^{ ww_layout_dock(); } completion:nil];
+    }
+}
+
+/* Row `index` was picked (a touch, or Go for row 0): a window comes to the
+ * front (restored when minimized); the Steam tool does what the Steam tile
+ * does; anything else starts inside the running session (WindowedMode.swift
+ * launcherPick:, MadeiraSession). The field gives the keyboard back first. */
+static BOOL ww_launch_pick(NSUInteger index)
+{
+    if (index >= g_launch_shown.count || !g_dock) return NO;
+    NSDictionary *item = g_launch_shown[index];
+    NSString *kind = item[@"kind"] ?: @"?", *name = item[@"name"] ?: @"";
+    NSString *what = [kind isEqualToString:@"window"] ? [NSString stringWithFormat:@"hwnd=%p", (void *)[item[@"hwnd"] unsignedLongValue]]
+                   : [item[@"action"] isEqual:@"steam"] ? @"the Steam tile's action"
+                   : (item[@"command"] ?: @"");
+    ww_log("search: pick %s \"%s\" (%s)", kind.UTF8String, name.UTF8String, what.UTF8String);
+    g_launch_close_why = "picked";
+    [g_dock.search resignFirstResponder];
+    if ([kind isEqualToString:@"window"]) {
+        WWWin *w = ww_get([item[@"hwnd"] unsignedLongValue], NO);
+        if (!w) return YES;
+        if (w->appMinimized || ww_iconic(w)) {
+            if (ww_iconic(w)) ww_enqueue(w->hwnd, WW_SC_RESTORE);
+            w->appMinimized = NO;
+            ww_log("restore hwnd=%p (search)", (void *)w->hwnd);
+            ww_update(w);
+        }
+        ww_raise(w, YES, "search");
+    } else if ([item[@"action"] isEqual:@"steam"]) {
+        ww_steam_activate("search");
+    } else {
+        ww_bridge_call_with(@"launcherPick:", item);
+    }
+    return YES;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1595,6 +2382,7 @@ static void ww_raise(WWWin *w, BOOL activate, const char *why)
     if (strcmp(why, "shown") && strcmp(why, "guest")) ww_search_release(why);
     [g_root bringSubviewToFront:w->frame];
     if (g_dock) [g_root bringSubviewToFront:g_dock];
+    if (g_launch) [g_root bringSubviewToFront:(UIView *)g_launch];   /* round 5: the search results */
     if (g_pill) [g_root bringSubviewToFront:g_pill];   /* the way back from maximize stays on top */
     BOOL changed = g_top != w->hwnd;
     g_top = w->hwnd;
@@ -1695,6 +2483,8 @@ static void ww_layout_dock(void)
     CGFloat maxW = b.size.width - MAX(s.left, 8) - MAX(s.right, 8);
     CGFloat width = MIN(want, maxW);
     CGFloat y = b.size.height - MAX(s.bottom, 6) - WW_DOCK_H;
+    /* round 5: above the software keyboard while the search field has it */
+    if (g_kb_lift > 0) y = MAX(MIN(y, b.size.height - g_kb_lift - 8 - WW_DOCK_H), s.top);
     d.frame = CGRectMake(round((b.size.width - width) / 2), y, width, WW_DOCK_H);
     d.pill.frame = d.bounds;
     ww_material_fit(d.pill);
@@ -1719,6 +2509,7 @@ static void ww_layout_dock(void)
     CGFloat tx = width - pad - (2 * item + gap);
     d.keyboardButton.frame = CGRectMake(tx, mid - item / 2, item, item);
     d.menuButton.frame = CGRectMake(tx + item + gap, mid - item / 2, item, item);
+    ww_launch_layout();
 }
 
 /* The frontmost frame's title bar is the bright one. */
@@ -1732,7 +2523,6 @@ static void ww_dock_refresh(void)
 {
     WWDock *d = g_dock;
     if (!d) return;
-    NSString *filter = [d.search.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
     NSMutableArray<WWWin *> *list = [NSMutableArray new];
     for (NSNumber *key in g_order) {
         WWWin *w = g_wins[key];
@@ -1763,9 +2553,7 @@ static void ww_dock_refresh(void)
         if (i >= list.count) { b.hidden = YES; b.tag = 0; continue; }
         WWWin *w = list[i];
         NSString *name = ww_display_title(w);
-        BOOL match = !filter.length || [name localizedCaseInsensitiveContainsString:filter] ||
-                     (w->exe.length && [w->exe localizedCaseInsensitiveContainsString:filter]);
-        b.hidden = !match;
+        b.hidden = NO;   /* round 5: typing filters the search panel, not the taskbar */
         b.tag = (NSInteger)w->hwnd;
         b.accessibilityLabel = name;
         UIImageView *iv = [b viewWithTag:1];
@@ -1780,6 +2568,13 @@ static void ww_dock_refresh(void)
     if (steam) d.steamDot.backgroundColor = g_top == steam->hwnd ? UIColor.whiteColor : [UIColor colorWithWhite:1 alpha:0.45];
     ww_mark_active();
     ww_layout_dock();
+    ww_steam_icon_check(NO);   /* round 5: Steam may have been installed meanwhile (at most every 5 s) */
+    if (g_launch && !g_launch.hidden) {
+        /* the open search panel follows the windows (only when they changed) */
+        NSString *sig = nil;
+        ww_launch_windows(&sig);
+        if (![sig isEqualToString:g_launch_windows_sig]) ww_launch_filter();
+    }
 }
 
 /* ------------------------------------------------------------------ *
@@ -1817,6 +2612,7 @@ UIView *winios_windowed_make_root(CGRect frame)
            claim ? "claimed for the Game Controller framework" : "left to UIKit (env.MADEIRA_XINPUT = 0)");
     ww_log("steam: taskbar button %s", g_dock.steamButton.hidden
            ? "hidden (env.MADEIRA_WINDOWED_STEAM = 0, or no Swift bridge)" : "pinned (env.MADEIRA_WINDOWED_STEAM = 0 hides it)");
+    ww_steam_icon_check(YES);   /* round 5: the installed client's icon on the tile */
     return root;
 }
 
@@ -1830,6 +2626,10 @@ static void ww_clear_all(void)
     g_max = 0;
     g_pill.hidden = YES;
     g_dock.hidden = NO;
+    if (g_dock.search.isFirstResponder) { g_launch_close_why = "new session"; [g_dock.search resignFirstResponder]; }
+    g_launch.hidden = YES;
+    g_launch_shown = nil;
+    g_launch_windows_sig = nil;
     pthread_mutex_lock(&g_target_lock);
     g_t_latched = g_t_last = g_t_mapped = 0;
     g_t_pressed = 0;
@@ -1846,6 +2646,15 @@ void winios_windowed_teardown(void)
     g_dock = nil;
     [g_pill removeFromSuperview];
     g_pill = nil;
+    /* round 5: the search panel, its items and the Steam icon go with the session */
+    [(UIView *)g_launch removeFromSuperview];
+    g_launch = nil;
+    g_launch_items = nil;
+    g_kb_lift = 0;
+    g_steam_icon = nil;
+    g_steam_icon_path = nil;
+    g_steam_icon_checked = 0;
+    g_steam_icon_logged = NO;
     g_root = nil;
     ww_log("compositor root removed");
 }
@@ -1912,6 +2721,9 @@ static void ww_note_mapped(uintptr_t target, int px, int py)
 int winios_windowed_map_point(double wx, double wy, int *px, int *py)
 {
     if (!g_root) return 0;
+    /* round 5: a touch on a window or the background closes the search panel
+     * (and gives the keyboard back to the program) */
+    if (g_dock && g_dock.search.isFirstResponder) ww_search_release("tap elsewhere");
     CGPoint p = [g_root convertPoint:CGPointMake(wx, wy) fromView:nil];
     pthread_mutex_lock(&g_target_lock);
     unsigned pressed = g_t_pressed;

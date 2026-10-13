@@ -164,14 +164,75 @@ chose.
 - *Close* posts `WM_SYSCOMMAND/SC_CLOSE`, which `DefWindowProc` turns into
   `WM_CLOSE`, as the close box of the window's own caption would.
 
-**Taskbar.** A pill along the bottom: a Search field (touch it to type;
-filters the window buttons by title or program name; Go brings the first
-match to the front), the pinned Steam button (below),
+**Taskbar.** A pill along the bottom: a Search field (touch it to type; it
+opens the launcher below), the pinned Steam button (below),
 one button per program window (its class icon when the program registered one,
 else its program's initial; a dot under it, white for the frontmost window,
 the button dimmed when minimized; tap: restore / bring to front / minimize when
 already in front), then the keyboard and the in-game menu (both through
 `MadeiraWindowedBridge` in `WindowedMode.swift`).
+
+**Search** (round 5). The search field is a launcher, like a desktop OS's
+start search. Touching it opens a results panel just above the taskbar (the
+chrome's material, rounded, scrolling; at most 60 rows), and typing filters it
+live: names that start with the text first, then a word of the name, then
+anywhere in the name, then the program's file name. Each row has an icon, the
+name and a second line saying what it is. The rows, in this order:
+
+- **Open windows** (the taskbar's windows): picking one restores it if
+  minimized and brings it to the front.
+- **Tools**: *Explorer* (`C:\windows\explorer.exe C:\`, a file browser on
+  drive C:), *Command Prompt* (`C:\windows\system32\cmd.exe`) and *Steam* (the
+  Steam tile's action, below; hidden with the tile).
+- **Library**: the games you added (their program with their launch arguments,
+  working folder and "Start Windows services first"; a `.bat`/`.cmd` through
+  `cmd.exe /c`), and the installed Steam games whose program is known: the one
+  *Start with: The game* would start (the program picked in Game details,
+  Steam's launch configuration, or the install folder's only program). A Steam
+  game picked here starts as its own program, **without Steam** (Madeira Dock
+  is not involved; a game that requires Steam may close or try to start the
+  Steam client itself, as it would on Windows).
+  The Desktop entry is the Explorer tool. A game's own config lines and its
+  library settings that are not part of its command (display, touch controls,
+  FPS limit, Wine version …) do not apply: it starts inside the session that
+  is running.
+- **Start Menu / Desktop shortcuts**: every `.lnk` under
+  `C:\ProgramData\Microsoft\Windows\Start Menu\Programs`, and each user's
+  `AppData\Roaming\Microsoft\Windows\Start Menu\Programs` and `Desktop`, whose
+  target is a `.exe` on drive C: (LinkInfo's local path, else the relative
+  path), with the shortcut's arguments and working folder; uninstallers left out.
+- **Programs**: the `.exe` files directly inside each folder of `Program Files`
+  and `Program Files (x86)` (at most four a folder, 80 in all; Wine's own
+  folders, Steam's folder and file names with unins/uninstall/crash/setup/
+  update/redist/report/helper left out), named after the folder when it has
+  one program.
+
+One row per program file (the first of: tool, library, shortcut, program).
+The prefix is scanned off the main thread when the panel opens, at most every
+20 seconds (the panel shows the last scan at once and refills when a new one
+ends). Icons: a program file's own icon (read from its PE resources, as the
+Steam tile's below), else a library cover, else a glyph (folder, terminal,
+game controller) or the name's initial. Wine's `explorer.exe` has no icon
+resource, so Explorer shows the folder glyph.
+
+Picking anything but a window starts it **inside the running session**
+(`MadeiraSession.launch`, ml1350, `docs/SESSION_LAUNCH.md`): the quoted full
+path and its arguments, in the program's working folder (by default its own
+folder). A failure shows an alert with the reason ("It did not start in this
+session: …"; a library game adds that it still starts from the library).
+Go on the keyboard picks the first row (it has a faint background); Go with
+nothing typed only closes. The panel closes when the field gives up the
+keyboard: after a pick, a touch on any window or the black background, a
+taskbar button, the keyboard's own dismiss key, maximize, or a new session.
+Typing no longer hides taskbar buttons (round 4 filtered them).
+
+**The keyboard** (round 5). While the search field has the software keyboard,
+the taskbar and the results panel move up to sit 8 points above it, animated
+with the keyboard's own duration and curve (`UIKeyboardWillChangeFrame` /
+`WillHide`), and back down when it goes. Only a docked keyboard that reaches
+the bottom of the screen lifts it; a floating iPad keyboard, or the keyboard
+of another text input (the library keyboard, a program's text field) does not.
+Frames stay where they are.
 
 **Look** (round 4). Title bars, the taskbar pill and the maximize pill share
 one material (`ww_material`): `UIBlurEffectStyleSystemThinMaterialDark`, a
@@ -187,9 +248,18 @@ magnifier sits 11 points inside the search field and 7 points before its
 text. On a narrow screen only the program strip shrinks (it scrolls).
 
 **Steam on the taskbar** (round 4; `env.MADEIRA_WINDOWED_STEAM = 0` hides
-it). A rounded tile with a monochrome game-controller glyph (a placeholder:
-no Valve artwork is in the repository), pinned left of the program buttons
-in every windowed session, with a dot under it while a Steam window is open.
+it). A tile pinned left of the program buttons in every windowed session,
+with a dot under it while a Steam window is open. Round 5: once Steam is
+installed in the prefix (the `steam.exe` the tile starts, below) the tile
+shows **that file's own icon**, read at run time from its PE resources: the
+first icon group (`RT_GROUP_ICON`) and from it the 32-bit 64x64 image (else
+32-bit 48x48, else the nearest size), PNG or DIB with its transparency. The
+icon comes from the user's installed copy; no Valve artwork is in the
+repository. Until then the tile keeps the monochrome game-controller glyph
+on a rounded tile. The check runs when the session starts, at most every 5
+seconds while the taskbar changes, when the tile is tapped and when the search
+panel opens, so a Steam installed during the session gets its icon; a
+`steam.exe` whose icon cannot be read is not read again that session.
 
 - A Steam window open in this session (a taskbar window whose program is
   `steam.exe` or `steamwebhelper.exe`): the tap restores it if minimized and
@@ -239,7 +309,18 @@ in every windowed session, with a dot under it while a Steam window is open.
 
 - Direct game starts (no Wine desktop) are not windowed.
 - No host web view window; the competitor's browser window has no equivalent.
-- No files or terminal tool in the taskbar.
+- No files or terminal button in the taskbar itself; since round 5 the search
+  starts Explorer and Command Prompt (not device-tested: a console window
+  under this driver is unproven).
+- Search (round 5): no Steam game start through Madeira Dock or the Steam
+  client (`steam.exe -applaunch`); a Steam game without a known program is not
+  listed; shortcuts that point to an MSI feature or only through an ID list
+  (no path) are skipped; `.url` and document shortcuts are skipped; environment
+  variables in a shortcut's working folder are not expanded (the program's own
+  folder is used); no recent or pinned items; nothing is remembered.
+- The search panel closes on a touch on a window only in Touch pointer mode
+  (the default here); with `env.MADEIRA_WINDOWED_TOUCH = 0` close it with the
+  keyboard's dismiss key or Go.
 - Window icons set with `WM_SETICON` are not read (class icons only, and only
   icons up to 64x64).
 - Frames do not resize the guest window; the grip zooms the picture, and
@@ -262,7 +343,8 @@ in every windowed session, with a dot under it while a Steam window is open.
 - The XInput foreground fix is off while windowed mode is on (see above).
 - The Steam button starts Steam inside the running session since ml1350 (not
   device-tested yet); the round 4 library entry remains the fallback. No
-  Valve logo: the tile uses a generic glyph.
+  Valve logo in the repository: the tile shows the installed `steam.exe`'s own
+  icon (round 5), a generic glyph until Steam is installed.
 
 ## Log lines
 
@@ -307,6 +389,16 @@ All start with `[windowed] ml1300`:
     steam: not available (Steam's installer: cancelled | the download failed: ... | Valve's server answered N | the download left Valve's servers | an unexpected size (N bytes))
     steam: not available (... library entry could not be made: ...)
     taskbar Steam button ignored: not a touch (...)
+    steam: icon from C:\Program Files (x86)\Steam\steam.exe (64x64)                                  round 5
+    steam: icon placeholder (Steam is not installed in the prefix; the tile keeps its glyph)         round 5
+    steam: icon placeholder (C:\...\steam.exe: no icon | no resources | its icon could not be decoded | ...; the tile keeps its glyph)
+    search: open (N windows, M programs and tools[; no Swift bridge: windows only])                 round 5
+    search: scan (tools 3, library N, Steam games N, shortcuts N, programs N; N ms)                 round 5 (Swift)
+    search: keyboard up (N pt): taskbar and results moved above it | keyboard down (0 pt): taskbar back at the bottom
+    search: pick window "..." (hwnd=0x...) | pick tool "Steam" (the Steam tile's action) | pick <tool|library|steam|startmenu|program> "..." ("C:\...\x.exe" args)
+    search: launch <kind> "..." -> ok (pid N, parent N) | error (reason)                              round 5 (Swift)
+    search: close (picked | tap elsewhere | taskbar button | taskbar Steam button | Go on an empty field | Go with no match | keyboard dismissed | maximize | new session | ...)
+    search result ignored: not a touch (...)
 
 The in-session start itself logs `[launch] ml1350 ...` lines (app and ntdll);
 see `docs/SESSION_LAUNCH.md`.
@@ -318,7 +410,10 @@ root line in a windowed session. `[winios] drv_post_mouse hwnd=0x...` (first
 ## Rebuilding
 
 Rounds 2, 3 and 4 touched only the app (`WiniosWindowed.m`, `Winios.m`,
-Swift, `Info.plist`, round 4 also the config catalog); no native rebuild. In the first version `build/win32u-unix/driver_ios.c` changed (new helpers, mouse routing by
+Swift, `Info.plist`, round 4 also the config catalog); no native rebuild.
+Round 5 (search launcher, keyboard, Steam icon) is app only too
+(`WiniosWindowed.m`, `WindowedMode.swift`); its launches need ml1350's
+`libntdll_unix.a` / `libwin32u_unix.a`. In the first version `build/win32u-unix/driver_ios.c` changed (new helpers, mouse routing by
 window, the foreground-fix guard): `rebuild-native.sh win32u`, then the app.
 The app links against an older `libwin32u_unix.a` too (weak fallbacks in
 `WiniosWindowed.m`): frames then have no title, owner or icon, the buttons do
@@ -468,3 +563,38 @@ Full steps and log lines: `docs/SESSION_LAUNCH.md` "Test".
 4. `env.MADEIRA_SESSION_LAUNCH = 0`: no Run program… entry; the Steam tile
    falls back to the round 4 library entry, its alert naming
    `env.MADEIRA_SESSION_LAUNCH=0`.
+
+### Round 6 (windowed round 5: search launcher, keyboard, Steam icon)
+
+The owner after round 4/ml1350: the search bar did nothing, he wanted to open
+Explorer or search apps and games, the keyboard covered the field, and the
+Steam tile should show Steam. App only (WiniosWindowed.m, WindowedMode.swift);
+the launches use ml1350's in-session launcher (needs its native libraries).
+
+1. Windowed desktop session. Touch the search field: the keyboard comes up and
+   the taskbar rides above it (`search: keyboard up (N pt) ...`); the results
+   panel sits above the taskbar (`search: open (N windows, M programs and
+   tools)`, then `search: scan (tools 3, library N, ...)`). Rows: open
+   windows, Explorer, Command Prompt, Steam, library games, Start Menu /
+   Desktop shortcuts, programs, with icons.
+2. Type part of a game's or program's name: the panel filters live; the first
+   row has a faint background. Go: it starts (`search: pick library "..."`,
+   `[launch] ml1350 in-session: "C:\..." -> ok (pid ...)`, `search: launch
+   library "..." -> ok (...)`); its window comes up in a frame. Keyboard and
+   taskbar go back down (`search: keyboard down`, `search: close (picked)`).
+3. Search "explorer", pick Explorer: a file browser on C: in a frame. Command
+   Prompt: a console window (unproven under this driver; report what happens).
+4. Type a window's title and pick it: that frame comes to the front (restored
+   if minimized).
+5. Open the panel, then touch a window or the black background: it closes
+   (`search: close (tap elsewhere)`), the touch reaches the window.
+6. Pick something that fails (e.g. a program whose file was removed after the
+   scan): an alert with the reason, `search: launch ... -> error (...)`.
+7. Steam installed in the prefix: from the first frame of the session the
+   tile shows Steam's own icon (`steam: icon from C:\Program Files
+   (x86)\Steam\steam.exe (64x64)`). Not installed: the glyph and `steam: icon
+   placeholder (Steam is not installed ...)`; install it through the tile;
+   within a few seconds of the install finishing (or at the next tap) the tile
+   changes to the icon.
+8. iPad with a floating keyboard, or a hardware keyboard: the taskbar stays put
+   (or lifts only by the shortcut bar's height).
