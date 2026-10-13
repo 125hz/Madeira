@@ -354,6 +354,9 @@ final class GamepadInput: @unchecked Sendable {
         source.resume()
     }
 
+    /// ml2180: per-slot diagnostic budget (first 16 rest/input transitions) and last state.
+    private static var diagLeft = [16, 16, 16, 16]
+    private static var diagLive = [false, false, false, false]
     // XInput leaves dead zones to the game. Preserve the complete signed range.
     static func axis(_ value: Float) -> Int16 {
         guard value.isFinite else { return 0 }
@@ -452,6 +455,21 @@ final class GamepadInput: @unchecked Sendable {
                 if !hidKeepsXInput {
                     winios_gamepad_set_state(Int32(i), nil)
                     continue
+                }
+            }
+            // ml2180: evidence for "the pad is detected but nothing happens": the
+            // first transitions between rest and input per slot, as published to
+            // win32u (the driver logs what the program reads, ml2180 there).
+            if Self.diagLeft[i] > 0 {
+                let live = state.buttons != 0 || state.left_trigger != 0 || state.right_trigger != 0
+                    || abs(Int(state.lx)) > 7849 || abs(Int(state.ly)) > 7849
+                    || abs(Int(state.rx)) > 8689 || abs(Int(state.ry)) > 8689
+                if live != Self.diagLive[i] {
+                    Self.diagLive[i] = live
+                    Self.diagLeft[i] -= 1
+                    let kind = live ? "input" : "rest"
+                    let owns = i == 0 ? LibraryController.shared.ownsInput : false
+                    LogStore.shared.log("[xinput] ml2180 app slot=\(i) \(kind): buttons=0x\(String(state.buttons, radix: 16)) lt=\(state.left_trigger) rt=\(state.right_trigger) lx=\(state.lx) ly=\(state.ly) rx=\(state.rx) ry=\(state.ry) physical=\(pad != nil) active=\(active) libraryOwns=\(owns) kbm=\(keyboardMouse != nil) hid=\(hid)")
                 }
             }
             publishBattery(i, pad: pad)
