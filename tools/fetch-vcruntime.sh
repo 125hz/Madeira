@@ -63,19 +63,36 @@ WANTED=(
     "mfc140u.dll"
 )
 
+is_x64() {
+    python3 -c '
+import struct, sys
+try:
+    with open(sys.argv[1], "rb") as f:
+        d = f.read(1024)
+        if len(d) >= 0x40 and d[:2] == b"MZ":
+            pe = struct.unpack_from("<I", d, 0x3c)[0]
+            m = struct.unpack_from("<H", d, pe + 4)[0]
+            if m == 0x8664:
+                sys.exit(0)
+except Exception:
+    pass
+sys.exit(1)
+' "$1" 2>/dev/null
+}
+
 missing=()
 for name in "${WANTED[@]}"; do
+    base="${name%.dll}"
     matches=()
     while IFS= read -r -d '' match; do
-        matches+=("$match")
-    done < <(find "$TMP/cab_out" -type f -iname "$name" -print0)
+        if is_x64 "$match"; then
+            matches+=("$match")
+        fi
+    done < <(find "$TMP/cab_out" -type f \( -iname "$name" -o -iname "${name}_amd64" -o -iname "${name}*" -o -iname "F_CENTRAL_${base}_*" \) -print0)
 
     if [ "${#matches[@]}" -eq 0 ]; then
         missing+=("$name")
     else
-        if [ "${#matches[@]}" -gt 1 ]; then
-            echo "note: multiple matches for $name, using first"
-        fi
         cp "${matches[0]}" "$TMP/stage/$name"
     fi
 done
