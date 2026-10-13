@@ -40,10 +40,10 @@ index 66ce5d289f3..0128f9cbf71 100644
  VER_FILEDESCRIPTION_STR = "Wine OpenGL Client"
  VER_PRODUCTVERSION      = 5,1,2600,2082
 diff --git a/dlls/opengl32/make_opengl b/dlls/opengl32/make_opengl
-index c8f6c5f22f2..b889cb37d89 100755
+index c8f6c5f22f2..a224072b924 100755
 --- a/dlls/opengl32/make_opengl
 +++ b/dlls/opengl32/make_opengl
-@@ -354,6 +354,119 @@ my %pointer_array_count =
+@@ -354,6 +354,122 @@ my %pointer_array_count =
       "glDrawCommandsStatesNV" => "count",
       "glListDrawCommandsStatesClientNV" => "count",
      );
@@ -137,6 +137,9 @@ index c8f6c5f22f2..b889cb37d89 100755
 +        if $name =~ /^gl(?!Get).*Pointer(EXT|ARB|NV)?$/ && $pname =~ /^(pointer|ptr)$/;
 +    return "GL_ARRAY_BUFFER_BINDING"
 +        if $name eq "glInterleavedArrays" && $pname eq "pointer";
++    # ARB_query_buffer_object: the result goes to an offset in the query buffer.
++    return "GL_QUERY_BUFFER_BINDING"
++        if $name =~ /^glGetQueryObject(i|ui|i64|ui64)v(ARB|EXT)?$/ && $pname eq "params";
 +    return "";
 +}
 +
@@ -163,7 +166,7 @@ index c8f6c5f22f2..b889cb37d89 100755
  my %pointer_is_offset =
      (
       "glGetPointerv" => "params",
-@@ -509,7 +622,15 @@ sub generate_unix_thunk($$$$)
+@@ -509,7 +625,15 @@ sub generate_unix_thunk($$$$)
                      $arg_type =~ s/^const //;
                  }
                  $vars .= "    $arg_type$pname;\n";
@@ -180,7 +183,7 @@ index c8f6c5f22f2..b889cb37d89 100755
                  $output_conv .= "    free( $pname );\n";
                  $call_args .= " $pname,";
              }
-@@ -517,7 +638,7 @@ sub generate_unix_thunk($$$$)
+@@ -517,7 +641,7 @@ sub generate_unix_thunk($$$$)
              {
                  $arg_type =~ s/\*$//;
                  $vars .= "    $arg_type$pname\_arg;\n";
@@ -189,7 +192,7 @@ index c8f6c5f22f2..b889cb37d89 100755
                  $call_args .= " &$pname\_arg,";
              }
              elsif ($arg_type =~ /(sizei|int)ptr/)
-@@ -526,16 +647,21 @@ sub generate_unix_thunk($$$$)
+@@ -526,16 +650,21 @@ sub generate_unix_thunk($$$$)
              }
              elsif ($arg_type =~ /GLsync/)
              {
@@ -214,7 +217,7 @@ index c8f6c5f22f2..b889cb37d89 100755
          if (!is_void_func($func))
          {
              my $ret_type = get_arg_type( $func->[0] );
-@@ -611,7 +737,7 @@ sub generate_unix_thunk($$$$)
+@@ -611,7 +740,7 @@ sub generate_unix_thunk($$$$)
      if ($use_dc || $use_pbuffer || $use_context)
      {
          my $param = "params->" . get_arg_name( ${$func->[1]}[0] );
@@ -223,7 +226,7 @@ index c8f6c5f22f2..b889cb37d89 100755
          $ret .= "    const struct opengl_funcs *funcs = ";
          $ret .= "get_dc_funcs( $param );\n" if $use_dc;
          $ret .= "get_pbuffer_funcs( $param );\n" if $use_pbuffer;
-@@ -656,7 +782,7 @@ sub generate_unix_thunk($$$$)
+@@ -656,7 +785,7 @@ sub generate_unix_thunk($$$$)
          my $state_args = $state_attrib_funcs{$name};
          if ($is_wow64)
          {
@@ -232,7 +235,7 @@ index c8f6c5f22f2..b889cb37d89 100755
          }
          else
          {
-@@ -1948,3 +2074,16 @@ foreach (sort keys %ext_functions)
+@@ -1948,3 +2077,16 @@ foreach (sort keys %ext_functions)
  print OUT "};\n";
  
  close OUT;
@@ -250,10 +253,10 @@ index c8f6c5f22f2..b889cb37d89 100755
 +    }
 +}
 diff --git a/dlls/opengl32/unix_private.h b/dlls/opengl32/unix_private.h
-index 1eb571e1733..a9ef8d5b862 100644
+index 1eb571e1733..94385279c8c 100644
 --- a/dlls/opengl32/unix_private.h
 +++ b/dlls/opengl32/unix_private.h
-@@ -75,19 +75,48 @@ static inline GLsync get_unix_sync( GLsync sync )
+@@ -75,19 +75,60 @@ static inline GLsync get_unix_sync( GLsync sync )
  
  #ifdef _WIN64
  
@@ -269,17 +272,20 @@ index 1eb571e1733..a9ef8d5b862 100644
      if (!ptrs || !(tmp = calloc( count, sizeof(*tmp) ))) return NULL;
 -    while (count--) tmp[count] = ULongToPtr(ptrs[count]);
 +    while (count--) tmp[count] = ios_wow_host_ptr( ptrs[count] );
-+    return tmp;
-+}
-+
+     return tmp;
+ }
+ 
 +/* A pointer parameter that is an offset into the buffer bound at `binding` when
 + * there is one, and a pointer to guest memory otherwise. Guest memory never lies
 + * in the first 64 KB, so smaller values are offsets (or NULL) without asking. */
++extern void *wow64_query_buffer_ptr( TEB *teb, ULONG value );
++
 +static inline void *wow64_buffer_ptr( TEB *teb, GLenum binding, ULONG value )
 +{
 +    const struct opengl_funcs *funcs = teb->glTable;
 +    GLint name = 0;
 +
++    if (binding == GL_QUERY_BUFFER_BINDING) return wow64_query_buffer_ptr( teb, value );
 +    if (value < 0x10000) return ULongToPtr( value );
 +    if (funcs && funcs->p_glGetIntegerv) funcs->p_glGetIntegerv( binding, &name );
 +    return name ? ULongToPtr( value ) : ios_wow_host_ptr( value );
@@ -295,18 +301,27 @@ index 1eb571e1733..a9ef8d5b862 100644
 +    if (!ptrs || !(tmp = calloc( count, sizeof(*tmp) ))) return NULL;
 +    if (funcs && funcs->p_glGetIntegerv) funcs->p_glGetIntegerv( binding, &name );
 +    while (count--) tmp[count] = name ? ULongToPtr( ptrs[count] ) : ios_wow_host_ptr( ptrs[count] );
-     return tmp;
- }
- 
++    return tmp;
++}
++
++#ifdef WINE_IOS
++/* Madeira: 32-bit GL/WGL calls through these thunks, read by the winios GL
++ * driver's perf line (build/win32u-unix/opengl_ios.c). Weak: 0 when absent. */
++extern unsigned int madeira_gl_wow64_calls __attribute__((weak));
++#endif
++
  static inline TEB *get_teb64( ULONG teb32 )
  {
 -    TEB32 *teb32_ptr = ULongToPtr( teb32 );
++#ifdef WINE_IOS
++    if (&madeira_gl_wow64_calls) __atomic_fetch_add( &madeira_gl_wow64_calls, 1, __ATOMIC_RELAXED );
++#endif
 +    TEB32 *teb32_ptr = ios_wow_host_ptr( teb32 );
      return (TEB *)((char *)teb32_ptr + teb32_ptr->WowTebOffset);
  }
  
 diff --git a/dlls/opengl32/unix_thunks.c b/dlls/opengl32/unix_thunks.c
-index 75a8baf0e55..e1adbc05108 100644
+index 75a8baf0e55..5c504f3ca3f 100644
 --- a/dlls/opengl32/unix_thunks.c
 +++ b/dlls/opengl32/unix_thunks.c
 @@ -33687,9 +33687,9 @@ static NTSTATUS wow64_wgl_wglCopyContext( void *args )
@@ -6139,7 +6154,7 @@ index 75a8baf0e55..e1adbc05108 100644
      const struct opengl_funcs *funcs = teb->glTable;
      if (!funcs->p_glGetQueryObjecti64v) return STATUS_NOT_IMPLEMENTED;
 -    funcs->p_glGetQueryObjecti64v( params->id, params->pname, ULongToPtr(params->params) );
-+    funcs->p_glGetQueryObjecti64v( params->id, params->pname, ios_wow_host_ptr(params->params) );
++    funcs->p_glGetQueryObjecti64v( params->id, params->pname, wow64_buffer_ptr( teb, GL_QUERY_BUFFER_BINDING, params->params ) );
      return STATUS_SUCCESS;
  }
  
@@ -6148,7 +6163,7 @@ index 75a8baf0e55..e1adbc05108 100644
      const struct opengl_funcs *funcs = teb->glTable;
      if (!funcs->p_glGetQueryObjecti64vEXT) return STATUS_NOT_IMPLEMENTED;
 -    funcs->p_glGetQueryObjecti64vEXT( params->id, params->pname, ULongToPtr(params->params) );
-+    funcs->p_glGetQueryObjecti64vEXT( params->id, params->pname, ios_wow_host_ptr(params->params) );
++    funcs->p_glGetQueryObjecti64vEXT( params->id, params->pname, wow64_buffer_ptr( teb, GL_QUERY_BUFFER_BINDING, params->params ) );
      return STATUS_SUCCESS;
  }
  
@@ -6157,7 +6172,7 @@ index 75a8baf0e55..e1adbc05108 100644
      const struct opengl_funcs *funcs = teb->glTable;
      if (!funcs->p_glGetQueryObjectiv) return STATUS_NOT_IMPLEMENTED;
 -    funcs->p_glGetQueryObjectiv( params->id, params->pname, ULongToPtr(params->params) );
-+    funcs->p_glGetQueryObjectiv( params->id, params->pname, ios_wow_host_ptr(params->params) );
++    funcs->p_glGetQueryObjectiv( params->id, params->pname, wow64_buffer_ptr( teb, GL_QUERY_BUFFER_BINDING, params->params ) );
      return STATUS_SUCCESS;
  }
  
@@ -6166,7 +6181,7 @@ index 75a8baf0e55..e1adbc05108 100644
      const struct opengl_funcs *funcs = teb->glTable;
      if (!funcs->p_glGetQueryObjectivARB) return STATUS_NOT_IMPLEMENTED;
 -    funcs->p_glGetQueryObjectivARB( params->id, params->pname, ULongToPtr(params->params) );
-+    funcs->p_glGetQueryObjectivARB( params->id, params->pname, ios_wow_host_ptr(params->params) );
++    funcs->p_glGetQueryObjectivARB( params->id, params->pname, wow64_buffer_ptr( teb, GL_QUERY_BUFFER_BINDING, params->params ) );
      return STATUS_SUCCESS;
  }
  
@@ -6175,7 +6190,7 @@ index 75a8baf0e55..e1adbc05108 100644
      const struct opengl_funcs *funcs = teb->glTable;
      if (!funcs->p_glGetQueryObjectui64v) return STATUS_NOT_IMPLEMENTED;
 -    funcs->p_glGetQueryObjectui64v( params->id, params->pname, ULongToPtr(params->params) );
-+    funcs->p_glGetQueryObjectui64v( params->id, params->pname, ios_wow_host_ptr(params->params) );
++    funcs->p_glGetQueryObjectui64v( params->id, params->pname, wow64_buffer_ptr( teb, GL_QUERY_BUFFER_BINDING, params->params ) );
      return STATUS_SUCCESS;
  }
  
@@ -6184,7 +6199,7 @@ index 75a8baf0e55..e1adbc05108 100644
      const struct opengl_funcs *funcs = teb->glTable;
      if (!funcs->p_glGetQueryObjectui64vEXT) return STATUS_NOT_IMPLEMENTED;
 -    funcs->p_glGetQueryObjectui64vEXT( params->id, params->pname, ULongToPtr(params->params) );
-+    funcs->p_glGetQueryObjectui64vEXT( params->id, params->pname, ios_wow_host_ptr(params->params) );
++    funcs->p_glGetQueryObjectui64vEXT( params->id, params->pname, wow64_buffer_ptr( teb, GL_QUERY_BUFFER_BINDING, params->params ) );
      return STATUS_SUCCESS;
  }
  
@@ -6193,7 +6208,7 @@ index 75a8baf0e55..e1adbc05108 100644
      const struct opengl_funcs *funcs = teb->glTable;
      if (!funcs->p_glGetQueryObjectuiv) return STATUS_NOT_IMPLEMENTED;
 -    funcs->p_glGetQueryObjectuiv( params->id, params->pname, ULongToPtr(params->params) );
-+    funcs->p_glGetQueryObjectuiv( params->id, params->pname, ios_wow_host_ptr(params->params) );
++    funcs->p_glGetQueryObjectuiv( params->id, params->pname, wow64_buffer_ptr( teb, GL_QUERY_BUFFER_BINDING, params->params ) );
      return STATUS_SUCCESS;
  }
  
@@ -6202,7 +6217,7 @@ index 75a8baf0e55..e1adbc05108 100644
      const struct opengl_funcs *funcs = teb->glTable;
      if (!funcs->p_glGetQueryObjectuivARB) return STATUS_NOT_IMPLEMENTED;
 -    funcs->p_glGetQueryObjectuivARB( params->id, params->pname, ULongToPtr(params->params) );
-+    funcs->p_glGetQueryObjectuivARB( params->id, params->pname, ios_wow_host_ptr(params->params) );
++    funcs->p_glGetQueryObjectuivARB( params->id, params->pname, wow64_buffer_ptr( teb, GL_QUERY_BUFFER_BINDING, params->params ) );
      return STATUS_SUCCESS;
  }
  
@@ -15099,7 +15114,7 @@ index 75a8baf0e55..e1adbc05108 100644
  }
  
 diff --git a/dlls/opengl32/unix_wgl.c b/dlls/opengl32/unix_wgl.c
-index 00dfd96a551..3264a8443db 100644
+index 00dfd96a551..fac9d198e2a 100644
 --- a/dlls/opengl32/unix_wgl.c
 +++ b/dlls/opengl32/unix_wgl.c
 @@ -140,6 +140,9 @@ struct context
@@ -15265,7 +15280,29 @@ index 00dfd96a551..3264a8443db 100644
      for (i = 0; legacy_extensions[i]; i++) extensions[count++] = legacy_extensions[i];
      qsort( extensions, count, sizeof(*extensions), string_array_cmp );
      ctx->extension_array = extensions;
-@@ -2127,7 +2231,7 @@ NTSTATUS return_wow64_string( const void *str, PTR32 *wow64_str )
+@@ -1293,6 +1397,21 @@ static void make_context_current( TEB *teb, const struct opengl_funcs *funcs, HD
+         }
+         ctx->extension_count = j;
+     }
++#ifdef WINE_IOS
++    /* Madeira ml1340: once per process, how this 32-bit context will serve
++     * persistent buffer maps, and whether wined3d will see query buffers. */
++    if (is_win64 && ctx->buffers)
++    {
++        static LONG logged;
++        if (!InterlockedExchange( &logged, 1 ))
++            ERR( "[winios-gl] ml1340 32-bit GL %d.%d context: persistent maps via %s; GL_ARB_buffer_storage %s, "
++                 "GL_ARB_query_buffer_object %s\n", ctx->major_version, ctx->minor_version,
++                 ctx->buffers->vk_device && ctx->buffers->vk_device->vk_device ? "Vulkan memory" :
++                 ctx->use_pinned_memory ? "GL_AMD_pinned_memory" : "nothing (extension hidden)",
++                 is_extension_supported( ctx, "GL_ARB_buffer_storage" ) ? "listed" : "hidden",
++                 is_extension_supported( ctx, "GL_ARB_query_buffer_object" ) ? "listed" : "not listed" );
++    }
++#endif
+ 
+     if (TRACE_ON(opengl)) for (i = 0; i < count; i++) TRACE( "++ %s\n", extensions[i] );
+ }
+@@ -2127,7 +2246,7 @@ NTSTATUS return_wow64_string( const void *str, PTR32 *wow64_str )
      else if (wow64_strings[i].wow64_str) *wow64_str = wow64_strings[i].wow64_str;
      else if (*wow64_str)
      {
@@ -15274,16 +15311,112 @@ index 00dfd96a551..3264a8443db 100644
          wow64_strings[i].wow64_str = *wow64_str;
      }
  
-@@ -2475,7 +2579,7 @@ static void *wow64_map_buffer( TEB *teb, struct buffer *buffer, GLenum target, G
+@@ -2412,6 +2531,58 @@ static struct buffer *create_buffer_storage( TEB *teb, GLenum target, GLuint nam
+     return buffer;
+ }
+ 
++/* A glGetQueryObject*v result pointer: an OFFSET into the buffer bound at
++ * GL_QUERY_BUFFER while one is bound (ARB_query_buffer_object), a guest pointer
++ * otherwise. wined3d (d3d9/d3d8 on OpenGL) reads each occlusion query through
++ * a persistently mapped buffer, asking for the result at offsets 0 and 8 and
++ * treating the query as done once both agree. Converting 8 as a guest address
++ * sent the second write out of the buffer, so the query never completed and a
++ * 32-bit program waiting on it spun in GetData until its own timeout.
++ * Madeira: MADEIRA_GL_QUERY_BUFFER_OFFSETS=0 converts every value as a guest
++ * pointer again (the behaviour before ml1340). */
++void *wow64_query_buffer_ptr( TEB *teb, ULONG value )
++{
++    const struct opengl_funcs *funcs = teb->glTable;
++    GLint name = 0;
++#ifdef WINE_IOS
++    static int enabled = -1;
++    static LONG logged;
++
++    if (enabled < 0)
++    {
++        const char *env = getenv( "MADEIRA_GL_QUERY_BUFFER_OFFSETS" );
++        enabled = !(env && env[0] == '0');
++    }
++    if (!enabled) return ios_wow_host_ptr( value );
++#endif
++    /* Guest memory never lies in the first 64 KB: smaller values are offsets. */
++    if (value >= 0x10000)
++    {
++        if (funcs && funcs->p_glGetIntegerv) funcs->p_glGetIntegerv( GL_QUERY_BUFFER_BINDING, &name );
++        if (!name) return ios_wow_host_ptr( value );
++    }
++#ifdef WINE_IOS
++    if (value && !InterlockedExchange( &logged, 1 ))
++        ERR( "[winios-gl] ml1340 32-bit query result goes to offset %#x of the bound query buffer "
++             "(MADEIRA_GL_QUERY_BUFFER_OFFSETS=0 disables)\n", (unsigned int)value );
++#endif
++    return ULongToPtr( value );
++}
++
++#ifdef WINE_IOS
++/* Madeira ml1340: once per process, how the first persistent (GL_MAP_PERSISTENT_BIT)
++ * map of a 32-bit caller was served. wined3d's query buffers depend on it. */
++static void log_wow64_persistent_map( GLbitfield access, const char *how, const void *ptr, size_t size )
++{
++    static LONG logged;
++    if (!(access & GL_MAP_PERSISTENT_BIT) || InterlockedExchange( &logged, 1 )) return;
++    ERR( "[winios-gl] ml1340 first 32-bit persistent buffer map: %s (guest %#x, %zu bytes, access %#x)\n",
++         how, ios_wow_guest_ptr32( ptr ), size, access );
++}
++#else
++static inline void log_wow64_persistent_map( GLbitfield access, const char *how, const void *ptr, size_t size ) { }
++#endif
++
+ static void *wow64_map_buffer( TEB *teb, struct buffer *buffer, GLenum target, GLuint name, GLintptr offset,
+                                size_t length, GLbitfield access, void *ptr )
+ {
+@@ -2449,6 +2620,7 @@ static void *wow64_map_buffer( TEB *teb, struct buffer *buffer, GLenum target, G
+         }
+         assert( buffer->host_ptr == buffer->vm_ptr );
+         buffer->map_ptr = (char *)buffer->vm_ptr + offset;
++        log_wow64_persistent_map( access, "Vulkan memory placed in the guest window", buffer->map_ptr, buffer->size );
+         TRACE( "returning vk mapping %p\n", buffer->map_ptr );
+         return buffer->map_ptr;
+     }
+@@ -2456,11 +2628,16 @@ static void *wow64_map_buffer( TEB *teb, struct buffer *buffer, GLenum target, G
+     if (buffer && buffer->pinned)
+     {
+         buffer->map_ptr = (char *)buffer->vm_ptr + offset;
++        log_wow64_persistent_map( access, "pinned guest memory (GL_AMD_pinned_memory)", buffer->map_ptr, buffer->size );
+         TRACE( "returning pinned ptr %p\n", buffer->map_ptr );
+         return buffer->map_ptr;
+     }
+ 
+-    if (!ptr) return NULL;
++    if (!ptr)
++    {
++        log_wow64_persistent_map( access, "FAILED, the driver returned no mapping", NULL, length );
++        return NULL;
++    }
+ 
+     if (!buffer)
+     {
+@@ -2475,8 +2652,9 @@ static void *wow64_map_buffer( TEB *teb, struct buffer *buffer, GLenum target, G
  
      buffer->host_ptr = ptr;
      if (!offset && !length) length = buffer->size;
 -    if (ULongToPtr(PtrToUlong(ptr)) == ptr) /* we're lucky */
 +    if (ios_wow_host_ptr(PtrToUlong(ptr)) == ptr) /* we're lucky: already in the guest's 4 GB */
      {
++        log_wow64_persistent_map( access, "driver mapping inside the guest window", ptr, length );
          buffer->map_ptr = ptr;
          TRACE( "returning %p\n", buffer->map_ptr );
-@@ -2859,7 +2963,7 @@ NTSTATUS wow64_get_pixel_formats( void *args )
+         return buffer->map_ptr;
+@@ -2484,6 +2662,8 @@ static void *wow64_map_buffer( TEB *teb, struct buffer *buffer, GLenum target, G
+ 
+     if (access & GL_MAP_PERSISTENT_BIT)
+     {
++        log_wow64_persistent_map( access, "FAILED, driver mapping outside the guest window and no pinned/Vulkan path",
++                                  NULL, length );
+         FIXME( "GL_MAP_PERSISTENT_BIT not supported!\n" );
+         goto unmap;
+     }
+@@ -2859,7 +3039,7 @@ NTSTATUS wow64_get_pixel_formats( void *args )
      {
          .teb = get_teb64(params32->teb),
          .hdc = ULongToPtr(params32->hdc),

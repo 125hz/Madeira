@@ -39,6 +39,7 @@
 
 #include <dlfcn.h>
 #include <pthread.h>
+#include <mach/mach_time.h>
 
 #include "ntstatus.h"
 #include "ntgdi_private.h"
@@ -541,6 +542,92 @@ static const struct opengl_driver_funcs ios_driver_funcs =
 #define OSMESA_CONTEXT_MAJOR_VERSION 0x36
 #define OSMESA_CONTEXT_MINOR_VERSION 0x37
 
+/* ---- perf line (zink backend), ml1340 ---------------------------------
+ *
+ * Once a second at most, from the thread that presents or makes a context
+ * current, the zink backend logs
+ *   [winios-gl] perf hwnd=H presents/s=N wgl-calls/s=N (32-bit thunk N)
+ *               make-current/s=N flush-ms=N copy-ms=N over=Ss
+ * presents:     frames handed to the window's layer
+ * wgl-calls:    calls into this driver (make-current, flush, swap, contexts, drawables)
+ * 32-bit thunk: GL/WGL calls of 32-bit programs through opengl32's wow64 thunks,
+ *               every thread (dlls/opengl32/unix_private.h bumps the counter)
+ * flush-ms:     ms per second in glFinish at present: Zink finishes the frame and
+ *               OSMesa copies it into the IOSurface slot
+ * copy-ms:      ms per second handing the slot to Metal and locking the next one
+ *               (waits for Metal to release it) plus the OSMesa rebind
+ * over:         the window the rates cover; longer than 1 s when nothing presents.
+ * MADEIRA_GL_PERF=0 turns the counters and the line off. */
+
+unsigned int madeira_gl_wow64_calls = 0;   /* weak in opengl32's unix_private.h */
+
+static int gl_perf = -1;
+static unsigned int perf_presents, perf_wgl_calls, perf_make_current, perf_wow64_mark;
+static uint64_t perf_finish_ticks, perf_present_ticks, perf_window_start;
+static mach_timebase_info_data_t perf_timebase;
+
+static void perf_init(void)
+{
+    const char *env = getenv( "MADEIRA_GL_PERF" );
+    gl_perf = !(env && env[0] == '0');
+    mach_timebase_info( &perf_timebase );
+    ERR( "[winios-gl] ml1340 perf line %s (MADEIRA_GL_PERF)\n", gl_perf ? "on, once a second at most" : "off" );
+}
+
+static inline void perf_count( unsigned int *counter )
+{
+    if (gl_perf > 0) __atomic_fetch_add( counter, 1, __ATOMIC_RELAXED );
+}
+
+static inline uint64_t perf_now(void)
+{
+    return gl_perf > 0 ? mach_absolute_time() : 0;
+}
+
+static inline void perf_add_ticks( uint64_t *total, uint64_t start )
+{
+    if (gl_perf > 0) __atomic_fetch_add( total, mach_absolute_time() - start, __ATOMIC_RELAXED );
+}
+
+static double perf_ms( uint64_t ticks )
+{
+    return (double)ticks * perf_timebase.numer / perf_timebase.denom / 1e6;
+}
+
+static void perf_maybe_log( HWND hwnd )
+{
+    uint64_t now, start, finish, present;
+    unsigned int presents, wgl, make_current, wow64;
+    double secs;
+
+    if (gl_perf <= 0) return;
+    now = mach_absolute_time();
+    start = __atomic_load_n( &perf_window_start, __ATOMIC_RELAXED );
+    if (!start)
+    {
+        __atomic_compare_exchange_n( &perf_window_start, &start, now, FALSE, __ATOMIC_RELAXED, __ATOMIC_RELAXED );
+        perf_wow64_mark = __atomic_load_n( &madeira_gl_wow64_calls, __ATOMIC_RELAXED );
+        return;
+    }
+    if (perf_ms( now - start ) < 1000.0) return;
+    /* one thread closes the window */
+    if (!__atomic_compare_exchange_n( &perf_window_start, &start, now, FALSE, __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
+        return;
+
+    secs = perf_ms( now - start ) / 1000.0;
+    presents = __atomic_exchange_n( &perf_presents, 0, __ATOMIC_RELAXED );
+    wgl = __atomic_exchange_n( &perf_wgl_calls, 0, __ATOMIC_RELAXED );
+    make_current = __atomic_exchange_n( &perf_make_current, 0, __ATOMIC_RELAXED );
+    finish = __atomic_exchange_n( &perf_finish_ticks, 0, __ATOMIC_RELAXED );
+    present = __atomic_exchange_n( &perf_present_ticks, 0, __ATOMIC_RELAXED );
+    wow64 = __atomic_load_n( &madeira_gl_wow64_calls, __ATOMIC_RELAXED );
+    ERR( "[winios-gl] perf hwnd=%p presents/s=%.1f wgl-calls/s=%.0f (32-bit thunk %.0f) make-current/s=%.0f "
+         "flush-ms=%.1f copy-ms=%.1f over=%.1fs\n", hwnd, presents / secs, wgl / secs,
+         (wow64 - perf_wow64_mark) / secs, make_current / secs, perf_ms( finish ) / secs,
+         perf_ms( present ) / secs, secs );
+    perf_wow64_mark = wow64;
+}
+
 static void *osmesa_handle;
 static void *(*pOSMesaCreateContextAttribs)( const int *attribs, void *share );
 static void (*pOSMesaDestroyContext)( void *ctx );
@@ -587,6 +674,7 @@ static BOOL zink_context_create( int format, void *share, const int *attribs, vo
     const struct ios_format *f = format_from_index( format );
     int major = 0, minor = 0, profile = 0, a[20], n = 0;
 
+    perf_count( &perf_wgl_calls );
     for (; attribs && attribs[0]; attribs += 2)
     {
         switch (attribs[0])
@@ -628,6 +716,7 @@ static BOOL zink_context_create( int format, void *share, const int *attribs, vo
 
 static BOOL zink_context_destroy( void *context )
 {
+    perf_count( &perf_wgl_calls );
     pOSMesaDestroyContext( context );
     return TRUE;
 }
@@ -658,12 +747,15 @@ static BOOL zink_make_current( struct opengl_drawable *draw, struct opengl_drawa
 {
     TRACE( "draw %s, read %s, context %p\n", debugstr_opengl_drawable( draw ), debugstr_opengl_drawable( read ), context );
 
+    perf_count( &perf_wgl_calls );
+    perf_count( &perf_make_current );
     if (!context)
     {
         zink_current = NULL;
         return pOSMesaMakeCurrent( NULL, NULL, 0, 0, 0 );
     }
     if (!draw) return FALSE;
+    perf_maybe_log( drawable_hwnd( draw ) );
     /* OSMesa has no separate read surface; reads come from the draw buffer. */
     return zink_bind( zink_from_drawable( draw ), context );
 }
@@ -671,14 +763,23 @@ static BOOL zink_make_current( struct opengl_drawable *draw, struct opengl_drawa
 static BOOL zink_present( struct zink_surface *surface )
 {
     void *context = pOSMesaGetCurrentContext(), *next;
+    uint64_t start;
+    BOOL ret;
     int row = 0;
 
     if (!context || zink_current != surface) return FALSE;
     madeira_gl_wait_active();   /* no GPU work while the app is in the background */
+    start = perf_now();
     pz_glFinish();   /* OSMesa copies the frame into the locked IOSurface */
+    perf_add_ticks( &perf_finish_ticks, start );
+    start = perf_now();
     if (!(next = madeira_zink_target_present( &surface->target, drawable_hwnd( &surface->base ), &row )))
         return FALSE;
-    return zink_attach( surface, context, next, row );
+    ret = zink_attach( surface, context, next, row );
+    perf_add_ticks( &perf_present_ticks, start );
+    perf_count( &perf_presents );
+    perf_maybe_log( drawable_hwnd( &surface->base ) );
+    return ret;
 }
 
 static void zink_surface_flush( struct opengl_drawable *base, UINT flags )
@@ -688,6 +789,7 @@ static void zink_surface_flush( struct opengl_drawable *base, UINT flags )
 
     TRACE( "%s, flags %#x\n", debugstr_opengl_drawable( base ), flags );
 
+    perf_count( &perf_wgl_calls );
     if ((flags & GL_FLUSH_UPDATED) && zink_current == surface)
     {
         drawable_client_size( base, &width, &height );
@@ -700,12 +802,14 @@ static void zink_surface_flush( struct opengl_drawable *base, UINT flags )
 static BOOL zink_surface_swap( struct opengl_drawable *base )
 {
     TRACE( "%s\n", debugstr_opengl_drawable( base ) );
+    perf_count( &perf_wgl_calls );
     return zink_present( zink_from_drawable( base ) );
 }
 
 static void zink_surface_destroy( struct opengl_drawable *base )
 {
     struct zink_surface *surface = zink_from_drawable( base );
+    perf_count( &perf_wgl_calls );
     if (zink_current == surface) zink_current = NULL;
     if (surface->target) madeira_zink_target_release( surface->target );
 }
@@ -722,6 +826,7 @@ static BOOL zink_surface_create( HWND hwnd, int format, struct opengl_drawable *
     struct client_surface *client;
     struct zink_surface *surface;
 
+    perf_count( &perf_wgl_calls );
     if (!format_from_index( format )) return FALSE;
     if (!(client = nulldrv_client_surface_create( hwnd ))) return FALSE;
     surface = opengl_drawable_create( sizeof(*surface), &zink_surface_funcs, format, client );
@@ -843,6 +948,7 @@ static BOOL zink_init(void)
         ERR( "[winios-gl] zink: renderer is not Zink (MoltenVK did not start?)\n" );
         return FALSE;
     }
+    perf_init();
     return TRUE;
 }
 
