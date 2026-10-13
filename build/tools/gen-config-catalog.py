@@ -84,29 +84,48 @@ OVERLAY = {
     "async-submit": {"title": "D3D12 asynchronous submission"},
     "upload-swap": {"title": "D3D12 upload buffers on file-backed memory"},
     "d3d12-typed-uav-load": {"title": "D3D12 typed UAV loads (report support)"},
-    # The second Direct3D 12 route and the Vulkan library (WineProcessBridge.m,
-    # madeira_setup_vulkan; docs/BUILDING.md "winevulkan and vkd3d-proton").
-    "d3d12": {"category": "Direct3D 12", "title": "Direct3D 12 runtime (x64)", "kind": "choice",
+    # The Vulkan routes: vkd3d-proton for Direct3D 12, DXVK for Direct3D 10/11 and the
+    # Vulkan library (WineProcessBridge.m, madeira_setup_vulkan; docs/BUILDING.md
+    # "winevulkan and vkd3d-proton", docs/DXVK.md).
+    "d3d11": {"category": "Vulkan routes", "title": "Direct3D 10/11 runtime (x64)", "kind": "choice",
+              "choices": [("", "DXMT (default)"), ("dxvk", "DXVK on Vulkan")],
+              "note": "Unset: DXMT, Direct3D 10/11 on Metal. \"dxvk\": this session's d3d11.dll, d3d10core.dll and "
+                      "dxgi.dll are DXVK's (Direct3D 10/11 and DXGI on Vulkan, the bundle's vulkan/ folder), replacing "
+                      "DXMT for Direct3D 10/11 and DXGI; Vulkan is on (see vulkan). DXVK's DXGI only presents for Vulkan "
+                      "devices, so Direct3D 12 pairs with vkd3d-proton: with d3d12 unset this implies d3d12 = vkd3d. "
+                      "x64 programs only; read at session start; also from a game's own lines. Experimental, not "
+                      "device-tested."},
+    "d3d12": {"category": "Vulkan routes", "title": "Direct3D 12 runtime (x64)", "kind": "choice",
               "choices": [("", "madeira-d3d12 (default)"), ("vkd3d", "vkd3d-proton on Vulkan")],
               "note": "Unset: madeira-d3d12, Direct3D 12 on Metal. \"vkd3d\": this session's d3d12.dll and d3d12core.dll "
                       "are vkd3d-proton's (Direct3D 12 on Vulkan, the bundle's vulkan/ folder) and Vulkan is on (see "
                       "vulkan). x64 programs only; read at session start; also from a game's own lines. Not "
                       "device-tested. \"1\" (ml1095, developer) runs madeira-d3d12's shader converter canary at app start."},
-    "vulkan": {"category": "Direct3D 12", "title": "Vulkan library (x64)", "kind": "choice",
-               "choices": [("", "Off, MoltenVK with d3d12 = vkd3d"), ("moltenvk", "MoltenVK"),
+    "vulkan": {"category": "Vulkan routes", "title": "Vulkan library (x64)", "kind": "choice",
+               "choices": [("", "Off, MoltenVK with d3d12 = vkd3d or d3d11 = dxvk"), ("moltenvk", "MoltenVK"),
                            ("kosmickrisp", "KosmicKrisp"), ("off", "Off")],
                "note": "The Vulkan driver Wine's winevulkan loads: moltenvk = gl/libMoltenVK.dylib (the one Zink uses), "
                        "kosmickrisp = gl/libvulkan_kosmickrisp.dylib, or a .dylib path (absolute or bundle-relative). "
                        "Setting it turns Vulkan on for x64 programs (vulkan-1.dll and winevulkan.dll in the prefix); "
-                       "unset, Vulkan is off unless d3d12 = vkd3d. Read at session start; also from a game's own lines."},
-    "env.VKD3D_DEBUG": {"category": "Direct3D 12", "title": "vkd3d-proton log level",
+                       "unset, Vulkan is off unless d3d12 = vkd3d or d3d11 = dxvk. Read at session start; also from a "
+                       "game's own lines."},
+    "env.VKD3D_DEBUG": {"category": "Vulkan routes", "title": "vkd3d-proton log level",
                "note": "vkd3d-proton's log: none, err, warn, fixme (default), info, trace. Passed to the Windows "
                        "environment like any env line; only with d3d12 = vkd3d."},
-    "env.VKD3D_SHADER_DEBUG": {"category": "Direct3D 12", "title": "vkd3d-proton shader log level",
+    "env.VKD3D_SHADER_DEBUG": {"category": "Vulkan routes", "title": "vkd3d-proton shader log level",
                "note": "The shader translators' log level (none, err, warn, fixme, info, trace); with d3d12 = vkd3d."},
-    "env.VKD3D_CONFIG": {"category": "Direct3D 12", "title": "vkd3d-proton options",
+    "env.VKD3D_CONFIG": {"category": "Vulkan routes", "title": "vkd3d-proton options",
                "note": "Comma-separated vkd3d-proton flags (e.g. no_upload_hvv, force_static_cbv, skip_driver_workarounds); "
                        "with d3d12 = vkd3d. See vkd3d-proton's README."},
+    "env.DXVK_LOG_LEVEL": {"category": "Vulkan routes", "title": "DXVK log level",
+               "note": "DXVK's log (none, error, warn, info, debug, trace), written to the session log through Wine's "
+                       "debug output. d3d11 = dxvk sets info unless this is set."},
+    "env.DXVK_CONFIG_FILE": {"category": "Vulkan routes", "title": "DXVK config file",
+               "note": "A dxvk.conf to read instead of the one in the program's working folder (a Windows path, "
+                       "e.g. C:\\users\\madeira\\dxvk.conf); with d3d11 = dxvk. See DXVK's dxvk.conf for the options."},
+    "env.DXVK_CONFIG": {"category": "Vulkan routes", "title": "DXVK options",
+               "note": "dxvk.conf options inline, separated by ';' (e.g. dxgi.maxFrameRate=60;d3d11.cachedDynamicResources=a); "
+                       "applied after the config file; with d3d11 = dxvk."},
     # opengl32 32-bit thunks (patches/wine-opengl-winios.patch, applied to the wine tree at
     # build time, so the scanner never sees it): ml1340 query-buffer offsets.
     "env.MADEIRA_GL_QUERY_BUFFER_OFFSETS": {"category": "Graphics", "title": "32-bit GL query results as buffer offsets",
@@ -122,7 +141,7 @@ OVERLAY = {
                        "first creates an OpenGL context; the log says \"ml1344 zink Vulkan library: ...\".",
                "choices": [("", "MoltenVK (default)"), ("moltenvk", "MoltenVK"), ("kosmickrisp", "KosmicKrisp")]},
     # Read by DXMT's DXGI (dxmt/src/dxgi/dxgi_swapchain_vk.cpp, ml1320).
-    "env.MADEIRA_DXGI_VK_SWAPCHAIN": {"category": "Direct3D 12", "title": "DXGI swapchains for vkd3d-proton",
+    "env.MADEIRA_DXGI_VK_SWAPCHAIN": {"category": "Vulkan routes", "title": "DXGI swapchains for vkd3d-proton",
                "kind": "bool", "default": "1",
                "note": "On (default): DXMT's DXGI presents for a Direct3D 12 device on Vulkan (d3d12 = vkd3d) by "
                        "wrapping vkd3d-proton's swapchain (IDXGIVkSwapChainFactory); windowed only, a fullscreen "

@@ -2589,8 +2589,9 @@ struct LibraryView: View {
             if settingsShow("pointer", "mouse", "cursor", "touch", "trackpad", "sensitivity") {
                 Section("Pointer") { LibraryPointerSettings() }
             }
-            if GraphicsSettings.shown, settingsShow("graphics", "Direct3D", "D3D9", "D3D12", "DXMT", "wined3d", "vkd3d",
-                                                    "Vulkan", "MoltenVK", "KosmicKrisp", "windowed", "window", "taskbar") {
+            if GraphicsSettings.shown, settingsShow("graphics", "Direct3D", "D3D9", "D3D10", "D3D11", "D3D12", "DXMT", "wined3d",
+                                                    "vkd3d", "DXVK", "Vulkan", "MoltenVK", "KosmicKrisp", "windowed", "window",
+                                                    "taskbar") {
                 GraphicsSettings(refresh: settingsRefresh)
             }
             if MadeiraConfig.flag("MADEIRA_RUNTIME_SETTINGS") {
@@ -3893,8 +3894,8 @@ struct LibraryPointerSettings: View {
 /// keys out (RuntimeMemorySyncSettings.featuredKeys); MADEIRA_GRAPHICS_SETTINGS=0
 /// hides the section and puts them back in All settings.
 struct GraphicsSettings: View {
-    static let shown = MadeiraConfig.flag("MADEIRA_GRAPHICS_SETTINGS")   // 0: no Settings › Graphics section; d3d9, d3d12, vulkan and windowed are back in All settings
-    static let keys: Set<String> = ["d3d9", "d3d12", "vulkan", "windowed"]
+    static let shown = MadeiraConfig.flag("MADEIRA_GRAPHICS_SETTINGS")   // 0: no Settings › Graphics section; d3d9, d3d11, d3d12, vulkan and windowed are back in All settings
+    static let keys: Set<String> = ["d3d9", "d3d11", "d3d12", "vulkan", "windowed"]
     // Names held in constants, so the code that acts on them (WineProcessBridge.m,
     // WiniosWindowed.m) stays their catalog entry (build/tools/gen-config-catalog.py).
     static let windowedKey = "windowed", windowedEnvKey = "env.MADEIRA_WINDOWED", glBackendKey = "gl-backend"
@@ -3907,6 +3908,7 @@ struct GraphicsSettings: View {
     static let d3d9Choices: [(String, String)] = [
         ("", "DXMT (default)"), ("native", "DXMT native frontend (32-bit)"), ("wined3d", "Wine wined3d on OpenGL (Zink)"),
     ]
+    static let d3d11Choices: [(String, String)] = [("", "DXMT (default)"), ("dxvk", "DXVK on Vulkan (experimental)")]
     static let d3d12Choices: [(String, String)] = [("", "madeira-d3d12 (default)"), ("vkd3d", "vkd3d-proton on Vulkan")]
     static let vulkanChoices: [(String, String)] = [("", "Automatic"), ("moltenvk", "MoltenVK"), ("kosmickrisp", "KosmicKrisp")]
 
@@ -3917,6 +3919,8 @@ struct GraphicsSettings: View {
     static let hasKosmicKrisp = bundled("gl/libvulkan_kosmickrisp.dylib")
     /// vkd3d-proton's DLLs are git-ignored build products (build/vkd3d-proton/build.sh).
     static let hasVkd3d = bundled("vulkan/arm64ec-windows/d3d12.dll") && bundled("vulkan/arm64ec-windows/d3d12core.dll")
+    /// DXVK's DLLs are git-ignored build products too (build/dxvk/build.sh, docs/DXVK.md).
+    static let hasDxvk = ["d3d11", "d3d10core", "dxgi"].allSatisfy { bundled("vulkan/arm64ec-windows/dxvk-\($0).dll") }
     /// The Zink OpenGL backend's library; without it the default backend is OpenGL ES, where wined3d finds no context.
     static let hasZink = bundled("gl/libOSMesa.dylib")
     /// KosmicKrisp takes the first Metal 4 device: iOS 26 with an A14 or newer.
@@ -3933,13 +3937,15 @@ struct GraphicsSettings: View {
     static var anySet: Bool { keys.contains { MadeiraConfig.get($0) != nil } }
 
     @State private var d3d9 = Self.current("d3d9")
+    @State private var d3d11 = Self.current("d3d11")
     @State private var d3d12 = Self.current("d3d12")
     @State private var vulkan = Self.current("vulkan")
     @State private var windowed = Self.windowedOn
     @State private var anySet = Self.anySet
 
     private func reload() {
-        d3d9 = Self.current("d3d9"); d3d12 = Self.current("d3d12"); vulkan = Self.current("vulkan")
+        d3d9 = Self.current("d3d9"); d3d11 = Self.current("d3d11"); d3d12 = Self.current("d3d12")
+        vulkan = Self.current("vulkan")
         windowed = Self.windowedOn; anySet = Self.anySet
     }
 
@@ -3973,8 +3979,16 @@ struct GraphicsSettings: View {
         default: return "A value Madeira does not know; Direct3D 9 games use DXMT."
         }
     }
+    private var d3d11Note: String {
+        switch d3d11 {
+        case "": return "DXMT draws Direct3D 10 and 11 on Metal."
+        case "dxvk": return "Experimental, 64-bit games only: Direct3D 10/11 and DXGI run through DXVK on Vulkan (MoltenVK unless a Vulkan driver is chosen below). Direct3D 12 then uses vkd3d-proton."
+        default: return "A value Madeira does not know; Direct3D 10/11 games use DXMT."
+        }
+    }
     private var d3d12Note: String {
         switch d3d12 {
+        case "" where d3d11 == "dxvk": return "With DXVK chosen above, Direct3D 12 games use vkd3d-proton on Vulkan: DXVK's DXGI shows only Vulkan devices."
         case "": return "Direct3D 12 games run on madeira-d3d12, Madeira's own Direct3D 12 on Metal."
         case "vkd3d": return "Experimental, 64-bit games only: Direct3D 12 runs through vkd3d-proton on Vulkan (MoltenVK unless a Vulkan driver is chosen below)."
         default: return "A developer value; Direct3D 12 games run on madeira-d3d12."
@@ -3982,10 +3996,10 @@ struct GraphicsSettings: View {
     }
     private var vulkanNote: String {
         switch vulkan {
-        case "": return "Off, so games find no Vulkan, unless Direct3D 12 uses vkd3d-proton, which turns on MoltenVK."
+        case "": return "Off, so games find no Vulkan, unless DXVK or vkd3d-proton is chosen above, which turns on MoltenVK."
         case "moltenvk": return "64-bit games get Vulkan through MoltenVK, the driver the Zink OpenGL backend also uses."
         case "kosmickrisp": return "Experimental: 64-bit games get Vulkan through Mesa's KosmicKrisp driver. Needs iOS 26 and an A14 chip or newer."
-        case "off", "0": return "Off: games find no Vulkan, and vkd3d-proton is not used even when it is chosen above."
+        case "off", "0": return "Off: games find no Vulkan, and DXVK and vkd3d-proton are not used even when chosen above."
         default: return "A Vulkan library named by path in madeira.cfg."
         }
     }
@@ -4000,6 +4014,14 @@ struct GraphicsSettings: View {
                     note(Self.hasZink ? "madeira.cfg sets gl-backend = \(backend); wined3d needs gl-backend = zink."
                                       : "This build has no Zink OpenGL backend (gl/ folder), so wined3d cannot start.", warning: true)
                 }
+            }
+
+            choicePicker("Direct3D 10/11", key: "d3d11", value: $d3d11,
+                         choices: Self.hasDxvk || d3d11 == "dxvk" ? Self.d3d11Choices : Array(Self.d3d11Choices.prefix(1)))
+            note(d3d11Note)
+            if !Self.hasDxvk { note("DXVK is not in this build.", warning: d3d11 == "dxvk") }
+            if d3d11 == "dxvk" && !d3d12.isEmpty && d3d12 != "vkd3d" {
+                note("Direct3D 12 is set to \(d3d12); with DXVK only vkd3d-proton can show Direct3D 12 games.", warning: true)
             }
 
             choicePicker("Direct3D 12", key: "d3d12", value: $d3d12,
@@ -4028,12 +4050,12 @@ struct GraphicsSettings: View {
 
             Button("Reset to defaults") {
                 for key in Self.keys.sorted() { MadeiraConfig.set(key, nil) }
-                LogStore.shared.log("[graphics-settings] reset: d3d9, d3d12, vulkan and windowed removed")
+                LogStore.shared.log("[graphics-settings] reset: d3d9, d3d11, d3d12, vulkan and windowed removed")
                 reload()
             }
             .disabled(!anySet)
         } header: { Text("Graphics") } footer: {
-            Text("These write d3d9 / d3d12 / vulkan / windowed into madeira.cfg; changes apply at the next session start. Per-game overrides go in the game's custom config lines (Advanced › This game's config).")
+            Text("These write d3d9 / d3d11 / d3d12 / vulkan / windowed into madeira.cfg; changes apply at the next session start. Per-game overrides go in the game's custom config lines (Advanced › This game's config).")
         }
         .onChange(of: refresh) { _, _ in reload() }
     }

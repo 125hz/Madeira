@@ -74,6 +74,13 @@ app/Madeira/vulkan/arm64ec-windows/d3d12core.dll
 app/Madeira/licenses/vkd3d-proton-LGPL-2.1.txt
 app/Madeira/licenses/dxil-spirv-MIT.txt
 app/Madeira/licenses/dxbc-spirv-MIT.txt
+#   build/dxvk/build.sh -> vulkan/arm64ec-windows/dxvk-{d3d11,d3d10core,dxgi}.dll
+#                          and the DXVK and libdisplay-info texts
+app/Madeira/vulkan/arm64ec-windows/dxvk-d3d11.dll
+app/Madeira/vulkan/arm64ec-windows/dxvk-d3d10core.dll
+app/Madeira/vulkan/arm64ec-windows/dxvk-dxgi.dll
+app/Madeira/licenses/DXVK-zlib.txt
+app/Madeira/licenses/libdisplay-info-MIT.txt
 
 # DXMT build artifacts
 build/dxmt-ios/obj/
