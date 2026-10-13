@@ -38,8 +38,21 @@
  * is where GamepadInput.swift reads the pads for the guest. Info.plist also
  * sets GCSupportsControllerUserInteraction = false.
  *
+ * Look (round 4). Title bars, the taskbar and the restore pill share one
+ * material (ww_material: a dark translucent blur, a hairline edge and a faint
+ * top highlight); the title-bar buttons are monochrome glyph circles, brighter
+ * on the active frame, and a state (fit to screen) shows as a glyph and a
+ * light ring, never a colour.
+ *
+ * Steam on the taskbar (round 4). A pinned Steam button sits left of the
+ * program buttons. With a Steam window open in the session it brings that
+ * window to the front; otherwise WindowedMode.swift (MadeiraWindowedBridge
+ * steamTapped) handles it: a running session cannot start another program
+ * from the app, so it prepares Steam (or Valve's installer) as a library
+ * entry for the next start and says so. env.MADEIRA_WINDOWED_STEAM = 0 hides it.
+ *
  * Log lines: "[windowed] ml1300 ..." for on/off, add, refit, remove, activate,
- * move, scale, minimize, restore, fullscreen, close and the ignored presses. */
+ * move, scale, minimize, restore, fullscreen, close, steam and the ignored presses. */
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -86,9 +99,15 @@ extern int winios_drv_foreground_if_owner(void *hwnd);
 #define WW_MOUSE_DOWNS     (0x0002u | 0x0008u | 0x0020u | 0x0080u)   /* left/right/middle/X down */
 #define WW_MOUSE_UPS       (0x0004u | 0x0010u | 0x0040u | 0x0100u)
 
-static const CGFloat WW_BAR_H = 30;       /* title bar height, points */
-static const CGFloat WW_MIN_BAR_W = 180;  /* a tiny window still gets a usable title bar (four buttons) */
+static const CGFloat WW_BAR_H = 36;       /* title bar height, points */
+static const CGFloat WW_BTN = 28;         /* title-bar button circles, points (touch target a little larger) */
+static const CGFloat WW_BTN_GAP = 7;
+static const CGFloat WW_MIN_BAR_W = 220;  /* a tiny window still gets a usable title bar (four buttons) */
 static const CGFloat WW_DOCK_H = 56;
+static const CGFloat WW_DOCK_ITEM = 36;   /* taskbar icons and round buttons */
+static const CGFloat WW_DOCK_PAD = 10;    /* taskbar: pill edge to the first and last item */
+static const CGFloat WW_DOCK_GAP = 10;    /* taskbar: between any two items */
+static const CGFloat WW_SEARCH_W = 112;
 static const CGFloat WW_GRAB = 120;       /* title bar that always stays on screen, points */
 
 static void ww_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -465,6 +484,29 @@ static NSString *ww_display_title(WWWin *w)
     return [NSString stringWithFormat:@"Window %lx", (unsigned long)w->hwnd];
 }
 
+/* A window with a taskbar button: shown, minimized to the taskbar, or
+ * minimized by the program itself (also one first shown minimized); not a
+ * hidden window. */
+static BOOL ww_present(WWWin *w)
+{
+    if (!ww_in_taskbar(w)) return NO;
+    BOOL alive = w->visible && (w->info.style & WW_WS_VISIBLE);
+    return ww_shown(w) || (alive && (w->appMinimized || ww_iconic(w)));
+}
+
+/* Round 4: the first Steam window of the session (the client's program,
+ * steam.exe, or its web helper, which owns the client's UI windows). */
+static WWWin *ww_steam_window(void)
+{
+    for (NSNumber *key in g_order) {
+        WWWin *w = g_wins[key];
+        if (!w || !w->exe.length || !ww_present(w)) continue;
+        if ([w->exe caseInsensitiveCompare:@"steam"] == NSOrderedSame ||
+            [w->exe caseInsensitiveCompare:@"steamwebhelper"] == NSOrderedSame) return w;
+    }
+    return nil;
+}
+
 /* ------------------------------------------------------------------ *
  * Views
  * ------------------------------------------------------------------ */
@@ -508,6 +550,23 @@ static NSString *ww_display_title(WWWin *w)
     }
     return [super becomeFirstResponder];
 }
+/* Round 4: the magnifier sits 11 points in from the field's rounded edge and
+ * 7 points before the text, which keeps 10 points from the right edge (the
+ * clear button, while editing, takes its own room). */
+static const CGFloat WW_GLASS_X = 11, WW_GLASS_SIDE = 15, WW_GLASS_GAP = 7, WW_SEARCH_RIGHT = 10;
+- (CGRect)leftViewRectForBounds:(CGRect)bounds {
+    return CGRectMake(WW_GLASS_X, floor((bounds.size.height - WW_GLASS_SIDE) / 2), WW_GLASS_SIDE, WW_GLASS_SIDE);
+}
+- (CGRect)ww_textRect:(CGRect)r bounds:(CGRect)bounds {
+    CGFloat x = WW_GLASS_X + WW_GLASS_SIDE + WW_GLASS_GAP;
+    CGFloat maxX = MIN(CGRectGetMaxX(r), bounds.size.width - WW_SEARCH_RIGHT);
+    r.origin.x = x;
+    r.size.width = MAX(maxX - x, 0);
+    return r;
+}
+- (CGRect)textRectForBounds:(CGRect)bounds { return [self ww_textRect:[super textRectForBounds:bounds] bounds:bounds]; }
+- (CGRect)editingRectForBounds:(CGRect)bounds { return [self ww_textRect:[super editingRectForBounds:bounds] bounds:bounds]; }
+- (CGRect)placeholderRectForBounds:(CGRect)bounds { return [self ww_textRect:[super placeholderRectForBounds:bounds] bounds:bounds]; }
 @end
 
 /* A control's action came from a touch (or an accessibility activation), not
@@ -524,7 +583,8 @@ static BOOL ww_by_touch(UIEvent *event, const char *what)
 @interface WWFrameView : UIView
 @property (nonatomic) uintptr_t hwnd;
 @property (nonatomic) BOOL chromeless;
-@property (nonatomic, strong) UIView *bar;
+@property (nonatomic) BOOL active;          /* the frontmost frame: brighter title and buttons */
+@property (nonatomic, strong) UIVisualEffectView *bar;
 @property (nonatomic, strong) UILabel *label;
 @property (nonatomic, strong) UIButton *minButton, *fullButton, *maxButton, *closeButton;
 @property (nonatomic, strong) UIView *content;
@@ -538,6 +598,8 @@ static BOOL ww_by_touch(UIEvent *event, const char *what)
 @property (nonatomic, strong) WWSearchField *search;
 @property (nonatomic, strong) WWAppStrip *apps;
 @property (nonatomic, strong) UIButton *keyboardButton, *menuButton;
+@property (nonatomic, strong) UIButton *steamButton;   /* pinned, left of the program buttons */
+@property (nonatomic, strong) UIView *steamDot;
 @property (nonatomic, strong) NSMutableArray<UIButton *> *appButtons;
 @end
 
@@ -577,17 +639,78 @@ static void ww_bridge_call(NSString *sel)
     }
 }
 
-static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
+/* A monochrome glyph in a neutral translucent circle: every button of the
+ * chrome (title bars, taskbar, restore pill) looks like this; no colours. */
+static UIImage *ww_glyph(NSString *symbol, CGFloat side)
+{
+    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:round(side * 0.42)
+                                                                                      weight:UIImageSymbolWeightSemibold];
+    return [UIImage systemImageNamed:symbol withConfiguration:cfg];
+}
+
+static UIButton *ww_round_button(NSString *symbol, CGFloat side)
 {
     UIButton *b = [WWButton buttonWithType:UIButtonTypeCustom];
     b.frame = CGRectMake(0, 0, side, side);
-    b.backgroundColor = bg;
+    b.backgroundColor = [UIColor colorWithWhite:1 alpha:0.14];
     b.layer.cornerRadius = side / 2;
-    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:side * 0.45 weight:UIImageSymbolWeightBold];
-    [b setImage:[UIImage systemImageNamed:symbol withConfiguration:cfg] forState:UIControlStateNormal];
-    b.tintColor = UIColor.whiteColor;
-    /* a 20-point circle with a 36-point touch target */
+    [b setImage:ww_glyph(symbol, side) forState:UIControlStateNormal];
+    b.tintColor = [UIColor colorWithWhite:1 alpha:0.92];
     return b;
+}
+
+/* Title-bar buttons: a little brighter on the active (frontmost) frame. */
+static void ww_style_glyph_button(UIButton *b, BOOL active)
+{
+    b.backgroundColor = [UIColor colorWithWhite:1 alpha:active ? 0.17 : 0.09];
+    b.tintColor = [UIColor colorWithWhite:1 alpha:active ? 0.95 : 0.55];
+}
+
+/* The chrome's one material (title bars, taskbar pill, restore pill): a dark
+ * translucent blur with a hairline edge and a faint highlight along the top.
+ * ww_material_fit lays the highlight out after a size change. */
+static UIVisualEffectView *ww_material(CGFloat radius, CACornerMask corners)
+{
+    UIVisualEffectView *v = [[UIVisualEffectView alloc] initWithEffect:
+                             [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterialDark]];
+    v.layer.cornerRadius = radius;
+    v.layer.maskedCorners = corners;
+    v.layer.cornerCurve = kCACornerCurveContinuous;
+    v.clipsToBounds = YES;
+    v.layer.borderWidth = 0.5;
+    v.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.10].CGColor;
+    CAGradientLayer *sheen = [CAGradientLayer layer];
+    sheen.name = @"ww_sheen";
+    sheen.colors = @[(id)[UIColor colorWithWhite:1 alpha:0.09].CGColor, (id)[UIColor colorWithWhite:1 alpha:0].CGColor];
+    [v.contentView.layer insertSublayer:sheen atIndex:0];
+    CALayer *line = [CALayer layer];
+    line.name = @"ww_highlight";
+    line.backgroundColor = [UIColor colorWithWhite:1 alpha:0.24].CGColor;
+    [v.contentView.layer insertSublayer:line above:sheen];
+    return v;
+}
+
+static void ww_material_fit(UIVisualEffectView *v)
+{
+    CGRect b = v.bounds;
+    CGFloat hair = 1.0 / MAX(UIScreen.mainScreen.scale, 1);
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    for (CALayer *l in v.contentView.layer.sublayers) {
+        if ([l.name isEqualToString:@"ww_sheen"]) l.frame = CGRectMake(0, 0, b.size.width, MIN(b.size.height * 0.55, 20));
+        else if ([l.name isEqualToString:@"ww_highlight"]) l.frame = CGRectMake(0, 0, b.size.width, hair);
+    }
+    [CATransaction commit];
+}
+
+/* The Swift bridge's BOOL class methods (nil bridge: NO). */
+static BOOL ww_bridge_bool(NSString *sel)
+{
+    Class c = NSClassFromString(@"MadeiraWindowedBridge");
+    SEL s = NSSelectorFromString(sel);
+    if (!c || ![c respondsToSelector:s]) return NO;
+    BOOL (*fn)(id, SEL) = (BOOL (*)(id, SEL))[c methodForSelector:s];
+    return fn(c, s);
 }
 
 @implementation WWRootView
@@ -633,23 +756,23 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
     [_content.layer addSublayer:_host];
     if (chromeless) return self;
 
-    _bar = [[UIView alloc] initWithFrame:CGRectZero];
-    _bar.backgroundColor = [UIColor colorWithWhite:0.17 alpha:0.97];
-    _bar.layer.cornerRadius = 10;
-    _bar.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
+    /* round 4: a translucent blurred bar (the chrome's material), the title
+     * centred in white, monochrome glyph circles; no coloured buttons */
+    _bar = ww_material(10, kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner);
     [self addSubview:_bar];
     _label = [[UILabel alloc] initWithFrame:CGRectZero];
     _label.textColor = UIColor.whiteColor;
     _label.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
     _label.textAlignment = NSTextAlignmentCenter;
     _label.lineBreakMode = NSLineBreakByTruncatingTail;
-    [_bar addSubview:_label];
-    _minButton = ww_round_button(@"minus", [UIColor colorWithWhite:0.36 alpha:1], 20);
-    _fullButton = ww_round_button(@"arrow.up.left.and.arrow.down.right", [UIColor colorWithWhite:0.36 alpha:1], 20);
-    /* maximize: green "+", as a zoom button; the whole screen, no title bar */
-    _maxButton = ww_round_button(@"plus", UIColor.systemGreenColor, 20);
-    _closeButton = ww_round_button(@"xmark", UIColor.systemRedColor, 20);
-    for (UIButton *b in @[_minButton, _fullButton, _maxButton, _closeButton]) [_bar addSubview:b];
+    [_bar.contentView addSubview:_label];
+    _minButton = ww_round_button(@"minus", WW_BTN);
+    _fullButton = ww_round_button(@"arrow.up.left.and.arrow.down.right", WW_BTN);
+    /* maximize: "+", the whole screen, no title bar */
+    _maxButton = ww_round_button(@"plus", WW_BTN);
+    _closeButton = ww_round_button(@"xmark", WW_BTN);
+    for (UIButton *b in @[_minButton, _fullButton, _maxButton, _closeButton]) [_bar.contentView addSubview:b];
+    _fullButton.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.75].CGColor;   /* the ring while fitted */
     [_minButton addTarget:self action:@selector(minimizePressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
     [_fullButton addTarget:self action:@selector(fullscreenPressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
     [_maxButton addTarget:self action:@selector(maximizePressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
@@ -730,7 +853,7 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
     w->fullscreen = !w->fullscreen;
     if (!w->fullscreen && w->placed) ww_clamp(w);
     ww_log("fullscreen hwnd=%p %s", (void *)w->hwnd,
-           w->fullscreen ? "on (fit to the screen; the frame stays put, its button turns blue: tap it or double-tap the title bar to leave)"
+           w->fullscreen ? "on (fit to the screen; the frame stays put, its button shows the shrink arrows in a ring: tap it or double-tap the title bar to leave)"
                          : "off (back to its movable frame)");
     ww_apply_frame(w);
     ww_raise(w, YES, "fullscreen");
@@ -738,7 +861,7 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
 
 /* A fitted (fullscreen) frame does not move: show where the way out is. */
 - (void)pulseFullButton {
-    [UIView animateWithDuration:0.12 animations:^{ self.fullButton.transform = CGAffineTransformMakeScale(1.5, 1.5); }
+    [UIView animateWithDuration:0.12 animations:^{ self.fullButton.transform = CGAffineTransformMakeScale(1.3, 1.3); }
                      completion:^(BOOL done) {
         [UIView animateWithDuration:0.18 animations:^{ self.fullButton.transform = CGAffineTransformIdentity; }];
     }];
@@ -757,7 +880,7 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
     if (w->fullscreen) {
         if (g.state == UIGestureRecognizerStateBegan) {
             ww_raise(w, YES, "drag");
-            ww_log("move hwnd=%p ignored: fullscreen (fitted) frames stay put; the blue button or a double tap on the title bar leaves fullscreen",
+            ww_log("move hwnd=%p ignored: fullscreen (fitted) frames stay put; the ringed fit button or a double tap on the title bar leaves fullscreen",
                    (void *)w->hwnd);
             [self pulseFullButton];
         }
@@ -795,31 +918,44 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
 - (void)layoutChrome:(CGFloat)width {
     if (_chromeless) return;
     _bar.frame = CGRectMake(0, 0, width, WW_BAR_H);
-    CGFloat side = 20, gap = 8, x = width - 8 - side;
+    ww_material_fit(_bar);
+    CGFloat side = WW_BTN, gap = WW_BTN_GAP, x = width - (WW_BAR_H - side) / 2 - 2 - side;
     for (UIButton *b in @[_closeButton, _maxButton, _fullButton, _minButton]) {
         b.frame = CGRectMake(x, (WW_BAR_H - side) / 2, side, side);
         x -= side + gap;
     }
-    CGFloat buttons = 4 * side + 3 * gap + 16;
-    if (width >= 2 * buttons + 80) _label.frame = CGRectMake(buttons, 0, width - 2 * buttons, WW_BAR_H);
-    else _label.frame = CGRectMake(10, 0, MAX(width - buttons - 14, 0), WW_BAR_H);   /* narrow: left of the buttons */
+    CGFloat buttons = 4 * side + 3 * gap + 14;
+    if (width >= 2 * buttons + 80) _label.frame = CGRectMake(buttons, 0, width - 2 * buttons, WW_BAR_H);   /* centred */
+    else _label.frame = CGRectMake(12, 0, MAX(width - buttons - 16, 0), WW_BAR_H);   /* narrow: left of the buttons */
     WWWin *w = [self win];
     BOOL full = w && w->fullscreen;
-    [_fullButton setImage:[UIImage systemImageNamed:full ? @"arrow.down.right.and.arrow.up.left"
-                                                         : @"arrow.up.left.and.arrow.down.right"
-                                  withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:9 weight:UIImageSymbolWeightBold]]
+    /* fullscreen (fit) is a state the frame is in (it cannot be dragged): the
+     * button says so with the shrink arrows and a light ring, not a colour */
+    [_fullButton setImage:ww_glyph(full ? @"arrow.down.right.and.arrow.up.left" : @"arrow.up.left.and.arrow.down.right", side)
                  forState:UIControlStateNormal];
-    /* fullscreen is a state the frame is in (it cannot be dragged): the button says so */
-    _fullButton.backgroundColor = full ? UIColor.systemBlueColor : [UIColor colorWithWhite:0.36 alpha:1];
+    _fullButton.layer.borderWidth = full ? 1.5 : 0;
     _fullButton.accessibilityLabel = full ? @"Leave fit to screen" : @"Fit to screen";
-    _bar.backgroundColor = full ? [UIColor colorWithRed:0.10 green:0.16 blue:0.27 alpha:0.97] : [UIColor colorWithWhite:0.17 alpha:0.97];
+    [self applyActive];
 }
 
-/* Touches a little outside the round buttons still hit them. */
+- (void)setActive:(BOOL)active {
+    if (_active == active) return;
+    _active = active;
+    [self applyActive];
+}
+
+- (void)applyActive {
+    if (_chromeless) return;
+    for (UIButton *b in @[_minButton, _fullButton, _maxButton, _closeButton]) ww_style_glyph_button(b, _active);
+    _label.textColor = [UIColor colorWithWhite:1 alpha:_active ? 1 : 0.62];
+}
+
+/* Touches a little outside the round buttons still hit them (a 35x36 point
+ * target around each 28-point circle; the gaps are split between neighbours). */
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     if (!_chromeless && !self.hidden && !_bar.hidden) {
         for (UIButton *b in @[_closeButton, _maxButton, _fullButton, _minButton]) {
-            CGRect r = CGRectInset([self convertRect:b.frame fromView:_bar], -7, -6);
+            CGRect r = CGRectInset([self convertRect:b.frame fromView:b.superview], -WW_BTN_GAP / 2, -(WW_BAR_H - WW_BTN) / 2);
             if (CGRectContainsPoint(r, point)) return b;
         }
     }
@@ -831,9 +967,8 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
 - (instancetype)init {
     if (!(self = [super initWithFrame:CGRectZero])) return nil;
     _appButtons = [NSMutableArray new];
-    _pill = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThickMaterialDark]];
-    _pill.layer.cornerRadius = WW_DOCK_H / 2;
-    _pill.clipsToBounds = YES;
+    _pill = ww_material(WW_DOCK_H / 2, kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner |
+                                       kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner);
     [self addSubview:_pill];
 
     _search = [[WWSearchField alloc] initWithFrame:CGRectZero];
@@ -841,17 +976,19 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
     _search.textColor = UIColor.whiteColor;
     _search.font = [UIFont systemFontOfSize:14];
     _search.backgroundColor = [UIColor colorWithWhite:1 alpha:0.12];
-    _search.layer.cornerRadius = 15;
+    _search.layer.cornerRadius = WW_DOCK_ITEM / 2 - 1;
     _search.returnKeyType = UIReturnKeyGo;
     _search.autocorrectionType = UITextAutocorrectionTypeNo;
     _search.autocapitalizationType = UITextAutocapitalizationTypeNone;
     _search.clearButtonMode = UITextFieldViewModeWhileEditing;
     _search.attributedPlaceholder = [[NSAttributedString alloc] initWithString:@"Search"
         attributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.5]}];
-    UIImageView *glass = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"magnifyingglass"]];
+    /* placed by WWSearchField's rects: 11 points in from the edge, 7 before the text */
+    UIImageView *glass = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"magnifyingglass"
+        withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:13 weight:UIImageSymbolWeightMedium]]];
     glass.tintColor = [UIColor colorWithWhite:1 alpha:0.6];
-    glass.contentMode = UIViewContentModeCenter;
-    glass.frame = CGRectMake(0, 0, 26, 20);
+    glass.contentMode = UIViewContentModeScaleAspectFit;
+    glass.frame = CGRectMake(0, 0, WW_GLASS_SIDE, WW_GLASS_SIDE);
     _search.leftView = glass;
     _search.leftViewMode = UITextFieldViewModeAlways;
     _search.delegate = self;
@@ -862,16 +999,37 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
     _apps.showsHorizontalScrollIndicator = NO;
     [_pill.contentView addSubview:_apps];
 
-    _keyboardButton = ww_round_button(@"keyboard", [UIColor colorWithWhite:1 alpha:0.14], 40);
+    _keyboardButton = ww_round_button(@"keyboard", WW_DOCK_ITEM);
     [_keyboardButton addTarget:self action:@selector(keyboardPressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
     _keyboardButton.accessibilityLabel = @"Keyboard";
-    _menuButton = ww_round_button(@"line.3.horizontal", [UIColor colorWithWhite:1 alpha:0.14], 40);
+    _menuButton = ww_round_button(@"line.3.horizontal", WW_DOCK_ITEM);
     [_menuButton addTarget:self action:@selector(menuPressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
     _menuButton.accessibilityLabel = @"Menu";
     BOOL bridge = ww_bridge() != nil;
     _keyboardButton.hidden = _menuButton.hidden = !bridge;
     [_pill.contentView addSubview:_keyboardButton];
     [_pill.contentView addSubview:_menuButton];
+
+    /* Steam, pinned left of the program buttons: a monochrome placeholder
+     * glyph (no Valve artwork in the repository) on a rounded tile, a dot
+     * under it while a Steam window is open. env.MADEIRA_WINDOWED_STEAM = 0
+     * (WindowedMode.swift) hides it. */
+    _steamButton = [WWButton buttonWithType:UIButtonTypeCustom];
+    _steamButton.backgroundColor = [UIColor colorWithWhite:1 alpha:0.14];
+    _steamButton.layer.cornerRadius = 9;
+    _steamButton.layer.cornerCurve = kCACornerCurveContinuous;
+    [_steamButton setImage:ww_glyph(@"gamecontroller", WW_DOCK_ITEM) forState:UIControlStateNormal];
+    _steamButton.tintColor = [UIColor colorWithWhite:1 alpha:0.92];
+    _steamButton.accessibilityLabel = @"Steam";
+    [_steamButton addTarget:self action:@selector(steamPressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
+    _steamButton.hidden = !bridge || !ww_bridge_bool(@"steamButtonEnabled");
+    [_pill.contentView addSubview:_steamButton];
+    _steamDot = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 5, 5)];
+    _steamDot.layer.cornerRadius = 2.5;
+    _steamDot.backgroundColor = [UIColor colorWithWhite:1 alpha:0.55];
+    _steamDot.userInteractionEnabled = NO;
+    _steamDot.hidden = YES;
+    [_pill.contentView addSubview:_steamDot];
     return self;
 }
 
@@ -889,6 +1047,30 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
     [_search resignFirstResponder];
     ww_bridge_call(@"openMenu");
 }
+/* The pinned Steam button. A Steam window already open in this session comes
+ * to the front (restored first when minimized). Otherwise the Swift side
+ * decides: memory warning, then Steam (installed) or Valve's installer (not
+ * installed) as a library entry for the next start; a running session cannot
+ * start another program from the app. */
+- (void)steamPressed:(UIButton *)b forEvent:(UIEvent *)e {
+    if (!ww_by_touch(e, "taskbar Steam button")) return;
+    [_search resignFirstResponder];
+    WWWin *w = ww_steam_window();
+    if (w) {
+        if (w->appMinimized || ww_iconic(w)) {
+            if (ww_iconic(w)) ww_enqueue(w->hwnd, WW_SC_RESTORE);
+            w->appMinimized = NO;
+            ww_update(w);
+        }
+        ww_raise(w, YES, "taskbar Steam button");
+        ww_log("steam: launch (already running in this session: hwnd=%p \"%s\" exe=%s brought to the front)",
+               (void *)w->hwnd, ww_display_title(w).UTF8String, w->exe.UTF8String);
+        return;
+    }
+    ww_log("steam: button (no Steam window in this session; the app checks the install)");
+    ww_bridge_call(@"steamTapped");
+}
+
 - (void)searchChanged { ww_dock_refresh(); }
 
 - (BOOL)textFieldShouldReturn:(UITextField *)field {
@@ -943,17 +1125,16 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
 @implementation WWPill
 - (instancetype)init {
     if (!(self = [super initWithFrame:CGRectMake(0, 0, 92, 46)])) return nil;
-    _blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark]];
+    /* the chrome's material, as the title bars and the taskbar */
+    _blur = ww_material(23, kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner | kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner);
     _blur.frame = self.bounds;
-    _blur.layer.cornerRadius = 23;
-    _blur.clipsToBounds = YES;
     _blur.userInteractionEnabled = NO;
     [self addSubview:_blur];
     NSString *icon = [UIImage systemImageNamed:@"macwindow.on.rectangle"] ? @"macwindow.on.rectangle" : @"rectangle.on.rectangle";
-    _restoreButton = ww_round_button(icon, [UIColor colorWithWhite:1 alpha:0.16], 36);
+    _restoreButton = ww_round_button(icon, 36);
     _restoreButton.accessibilityLabel = @"Show all windows";
     [_restoreButton addTarget:self action:@selector(restorePressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
-    _menuButton = ww_round_button(@"line.3.horizontal", [UIColor colorWithWhite:1 alpha:0.16], 36);
+    _menuButton = ww_round_button(@"line.3.horizontal", 36);
     _menuButton.accessibilityLabel = @"Menu";
     [_menuButton addTarget:self action:@selector(menuPressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
     _menuButton.hidden = ww_bridge() == nil;
@@ -970,6 +1151,7 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
 - (void)layoutSubviews {
     [super layoutSubviews];
     _blur.frame = self.bounds;
+    ww_material_fit(_blur);
     _restoreButton.frame = CGRectMake(5, 5, 36, 36);
     _menuButton.frame = CGRectMake(51, 5, 36, 36);
 }
@@ -1498,30 +1680,51 @@ static void ww_layout_dock(void)
     if (!d || !g_root) return;
     UIEdgeInsets s = g_root.safeAreaInsets;
     CGRect b = g_root.bounds;
+    /* Round 4: search, Steam, the program buttons, keyboard, menu, with one
+     * even gap (WW_DOCK_GAP) between every two items and the same inset
+     * (WW_DOCK_PAD) at both ends; icons and round buttons share one size. When
+     * the screen is too narrow only the program strip shrinks (it scrolls). */
+    const CGFloat item = WW_DOCK_ITEM, gap = WW_DOCK_GAP, pad = WW_DOCK_PAD;
     NSUInteger shownApps = 0;
     for (UIButton *btn in d.appButtons) if (!btn.hidden) shownApps++;
-    BOOL tools = !d.keyboardButton.hidden;
-    CGFloat searchW = 96, cell = 46;
-    CGFloat want = 10 + searchW + 8 + shownApps * cell + (tools ? 2 * cell + 8 : 0) + 6;
+    BOOL tools = !d.keyboardButton.hidden, steam = !d.steamButton.hidden;
+    CGFloat appsW = shownApps ? shownApps * item + (shownApps - 1) * gap : 0;
+    CGFloat fixed = pad + WW_SEARCH_W + (steam ? gap + item : 0) + (tools ? 2 * (gap + item) : 0) + pad;
+    CGFloat want = fixed + (shownApps ? gap + appsW : 0);
     CGFloat maxW = b.size.width - MAX(s.left, 8) - MAX(s.right, 8);
-    CGFloat width = MIN(MAX(want, 220), maxW);
+    CGFloat width = MIN(want, maxW);
     CGFloat y = b.size.height - MAX(s.bottom, 6) - WW_DOCK_H;
-    d.frame = CGRectMake((b.size.width - width) / 2, y, width, WW_DOCK_H);
+    d.frame = CGRectMake(round((b.size.width - width) / 2), y, width, WW_DOCK_H);
     d.pill.frame = d.bounds;
-    d.search.frame = CGRectMake(10, (WW_DOCK_H - 30) / 2, searchW, 30);
-    CGFloat toolsW = tools ? 2 * cell + 8 : 0;
-    CGFloat appsX = 10 + searchW + 8;
-    d.apps.frame = CGRectMake(appsX, 0, MAX(width - appsX - toolsW - 6, 0), WW_DOCK_H);
-    CGFloat x = 0;
+    ww_material_fit(d.pill);
+    CGFloat mid = WW_DOCK_H / 2, x = pad;
+    d.search.frame = CGRectMake(x, mid - (item - 2) / 2, WW_SEARCH_W, item - 2);
+    x += WW_SEARCH_W;
+    if (steam) {
+        x += gap;
+        d.steamButton.frame = CGRectMake(x, mid - item / 2, item, item);
+        d.steamDot.frame = CGRectMake(x + (item - 5) / 2, WW_DOCK_H - 7.5, 5, 5);
+        x += item;
+    }
+    CGFloat stripW = shownApps ? MIN(MAX(width - fixed - gap, 0), appsW) : 0;
+    d.apps.frame = CGRectMake(shownApps ? x + gap : x, 0, stripW, WW_DOCK_H);
+    CGFloat ax = 0;
     for (UIButton *btn in d.appButtons) {
         if (btn.hidden) continue;
-        btn.frame = CGRectMake(x, 0, cell, WW_DOCK_H);
-        x += cell;
+        btn.frame = CGRectMake(ax, 0, item, WW_DOCK_H);
+        ax += item + gap;
     }
-    d.apps.contentSize = CGSizeMake(x, WW_DOCK_H);
-    CGFloat tx = width - 6 - toolsW + 4;
-    d.keyboardButton.frame = CGRectMake(tx, (WW_DOCK_H - 40) / 2, 40, 40);
-    d.menuButton.frame = CGRectMake(tx + cell, (WW_DOCK_H - 40) / 2, 40, 40);
+    d.apps.contentSize = CGSizeMake(appsW, WW_DOCK_H);
+    CGFloat tx = width - pad - (2 * item + gap);
+    d.keyboardButton.frame = CGRectMake(tx, mid - item / 2, item, item);
+    d.menuButton.frame = CGRectMake(tx + item + gap, mid - item / 2, item, item);
+}
+
+/* The frontmost frame's title bar is the bright one. */
+static void ww_mark_active(void)
+{
+    for (WWWin *w in g_wins.allValues)
+        if (w->frame && !w->frame.chromeless) w->frame.active = w->hwnd == g_top;
 }
 
 static void ww_dock_refresh(void)
@@ -1532,26 +1735,22 @@ static void ww_dock_refresh(void)
     NSMutableArray<WWWin *> *list = [NSMutableArray new];
     for (NSNumber *key in g_order) {
         WWWin *w = g_wins[key];
-        if (!w || !ww_in_taskbar(w)) continue;
-        /* shown, minimized to the taskbar, or minimized by the program itself
-         * (also one first shown minimized); not a hidden window */
-        BOOL alive = w->visible && (w->info.style & WW_WS_VISIBLE);
-        BOOL present = ww_shown(w) || (alive && (w->appMinimized || ww_iconic(w)));
-        if (!present) continue;
+        if (!w || !ww_present(w)) continue;
         [list addObject:w];
     }
     while (d.appButtons.count < list.count) {
         UIButton *b = [WWButton buttonWithType:UIButtonTypeCustom];
-        UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectMake(6, 6, 34, 34)];
+        UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectMake(0, (WW_DOCK_H - WW_DOCK_ITEM) / 2, WW_DOCK_ITEM, WW_DOCK_ITEM)];
         iv.tag = 1;
-        iv.layer.cornerRadius = 8;
+        iv.layer.cornerRadius = 9;
+        iv.layer.cornerCurve = kCACornerCurveContinuous;
         iv.clipsToBounds = YES;
         iv.contentMode = UIViewContentModeScaleAspectFit;
         iv.userInteractionEnabled = NO;
         [b addSubview:iv];
-        UIView *dot = [[UIView alloc] initWithFrame:CGRectMake(20, 45, 6, 6)];
+        UIView *dot = [[UIView alloc] initWithFrame:CGRectMake((WW_DOCK_ITEM - 5) / 2, WW_DOCK_H - 7.5, 5, 5)];
         dot.tag = 2;
-        dot.layer.cornerRadius = 3;
+        dot.layer.cornerRadius = 2.5;
         dot.userInteractionEnabled = NO;
         [b addSubview:dot];
         [b addTarget:d action:@selector(appTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
@@ -1575,6 +1774,10 @@ static void ww_dock_refresh(void)
         UIView *dot = [b viewWithTag:2];
         dot.backgroundColor = g_top == w->hwnd && !minimized ? UIColor.whiteColor : [UIColor colorWithWhite:1 alpha:0.45];
     }
+    WWWin *steam = d.steamButton.hidden ? nil : ww_steam_window();
+    d.steamDot.hidden = steam == nil;
+    if (steam) d.steamDot.backgroundColor = g_top == steam->hwnd ? UIColor.whiteColor : [UIColor colorWithWhite:1 alpha:0.45];
+    ww_mark_active();
     ww_layout_dock();
 }
 
@@ -1611,6 +1814,8 @@ UIView *winios_windowed_make_root(CGRect frame)
     ww_log("compositor root attached: frames + taskbar (madeira.cfg windowed = 0 or env.MADEIRA_WINDOWED = 0 turns it off); "
            "chrome not focusable, gamepad events %s",
            claim ? "claimed for the Game Controller framework" : "left to UIKit (env.MADEIRA_XINPUT = 0)");
+    ww_log("steam: taskbar button %s", g_dock.steamButton.hidden
+           ? "hidden (env.MADEIRA_WINDOWED_STEAM = 0, or no Swift bridge)" : "pinned (env.MADEIRA_WINDOWED_STEAM = 0 hides it)");
     return root;
 }
 

@@ -1,12 +1,13 @@
 # Windowed mode (ml1300, first version)
 
 Windowed mode shows every top-level Windows window of a desktop session as a
-window of its own on the iPhone or iPad screen: a dark title bar with the
-window's text and three round buttons (minimize, fullscreen / restore, close),
-draggable, brought to the front by a tap, several of them overlapping at once.
-A taskbar along the bottom lists the running program windows and holds the
-keyboard and the in-game menu. It is off by default; with it off nothing
-below runs and desktop sessions look exactly as before.
+window of its own on the iPhone or iPad screen: a dark translucent (blurred)
+title bar with the window's text centred and four round monochrome buttons
+(minimize, fit to screen, maximize, close), draggable, brought to the front by
+a tap, several of them overlapping at once. A taskbar along the bottom holds a
+search field, a pinned Steam button, the running program windows, the keyboard
+and the in-game menu. It is off by default; with it off nothing below runs and
+desktop sessions look exactly as before.
 
 ## Turning it on
 
@@ -146,10 +147,10 @@ chose.
 - *Fullscreen* fits the window into the whole screen above the taskbar (title
   bar kept, so restore is one tap; a double tap on the title bar does the
   same). App-side; the guest window keeps its size. A fitted frame does not
-  move: while it is on, the button is blue with the "shrink" arrows and the
-  title bar turns dark blue; dragging it only pulses the button and logs
-  `move ... ignored: fullscreen`.
-- *Maximize* (round 3; the green "+" button, or hold the fit button) shows the
+  move: while it is on, the button shows the "shrink" arrows in a light ring
+  (round 4; round 2 coloured it blue); dragging it only pulses the button and
+  logs `move ... ignored: fullscreen`.
+- *Maximize* (round 3; the "+" button, or hold the fit button) shows the
   window as a game session does: the whole screen, no title bar, the taskbar
   hidden, the picture aspect-fitted with black bars, touches mapped into it
   (a touch on the bars is dropped). App-side again: the guest window keeps
@@ -165,12 +166,65 @@ chose.
 
 **Taskbar.** A pill along the bottom: a Search field (touch it to type;
 filters the window buttons by title or program name; Go brings the first
-match to the front),
+match to the front), the pinned Steam button (below),
 one button per program window (its class icon when the program registered one,
 else its program's initial; a dot under it, white for the frontmost window,
 the button dimmed when minimized; tap: restore / bring to front / minimize when
 already in front), then the keyboard and the in-game menu (both through
 `MadeiraWindowedBridge` in `WindowedMode.swift`).
+
+**Look** (round 4). Title bars, the taskbar pill and the maximize pill share
+one material (`ww_material`): `UIBlurEffectStyleSystemThinMaterialDark`, a
+hairline edge and a faint highlight along the top. Title-bar buttons are
+28-point circles of the same neutral translucent white with a white SF Symbol
+(`minus`, `arrow.up.left.and.arrow.down.right`, `plus`, `xmark`), touch
+targets about 35x36 points; the frontmost frame's buttons and title are
+brighter, the others dimmed. No button has a colour; a state (fit to screen)
+shows as its glyph and a ring. The title bar is 36 points high. In the
+taskbar every item (search field, Steam, program icons, keyboard, menu) is 36
+points and they are 10 points apart, 10 points from the pill's ends; the
+magnifier sits 11 points inside the search field and 7 points before its
+text. On a narrow screen only the program strip shrinks (it scrolls).
+
+**Steam on the taskbar** (round 4; `env.MADEIRA_WINDOWED_STEAM = 0` hides
+it). A rounded tile with a monochrome game-controller glyph (a placeholder:
+no Valve artwork is in the repository), pinned left of the program buttons
+in every windowed session, with a dot under it while a Steam window is open.
+
+- A Steam window open in this session (a taskbar window whose program is
+  `steam.exe` or `steamwebhelper.exe`): the tap restores it if minimized and
+  brings it to the front (`steam: launch (already running ...)`).
+- Otherwise: **a running session cannot start another program from the
+  app.** The app starts Wine's first program of a session (`MADEIRA_EXE`),
+  and nothing inside a running session takes a launch request from the app
+  (Wine's explorer has no such message; `docs/PROCESS_HOST.md` is the
+  in-progress mechanism for a second process, headless and off by default).
+  One session runs per app run. So the button prepares the *next* start and
+  says so:
+  - The first tap shows "The full Steam client needs a lot of memory; the web
+    helper may be killed." (plus, when Madeira Dock's client files are in the
+    prefix: Steam updates its own files when it runs, and Dock refuses a
+    client build it has not verified) with Continue / Cancel. Continue is
+    remembered.
+  - **Steam installed** (`C:\Program Files (x86)\Steam\steam.exe`, or
+    `C:\Program Files\Steam\steam.exe`; Dock's client components include a
+    `steam.exe`, which then counts): a library entry "Steam" is made (unless
+    an entry already starts that file): Wine desktop start mode, services.exe
+    first, arguments `-no-cef-sandbox -cef-disable-gpu`. The alert says to
+    restart Madeira and open Steam in the library; it then runs in a Wine
+    desktop of its own, windowed when windowed mode is on.
+  - **Not installed**: Valve's installer is downloaded from
+    `https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe`
+    (HTTPS; redirects only within `*.steamstatic.com`; status 200, 256 KB to
+    64 MB, an x86/x64 PE) with a progress alert (Cancel stops it) into
+    `Library/Application Support/MadeiraSteam/SteamSetup.exe` (no backup),
+    copied to `C:\madeira-games\SteamSetup.exe` and added as the library
+    entry "Steam Setup" (same start mode). Restart Madeira and open it; after
+    Steam is installed the button adds the "Steam" entry. Not pinned to a
+    hash: Valve updates the installer.
+  - With the developer interface (library off) the entry is still made; the
+    alert says to switch to the library interface.
+- The button answers touches only, like the rest of the chrome.
 
 ## Not done in this version
 
@@ -197,6 +251,9 @@ already in front), then the keyboard and the in-game menu (both through
 - A controller cannot operate the frames or the taskbar (by design: its input
   is the program's); use touch for the chrome.
 - The XInput foreground fix is off while windowed mode is on (see above).
+- The Steam button cannot start Steam (or its installer) inside the running
+  session; it prepares a library entry for the next start (see above). No
+  Valve logo: the tile uses a generic glyph.
 
 ## Log lines
 
@@ -217,7 +274,7 @@ All start with `[windowed] ml1300`:
     scale hwnd=0x... zoom=0.62 pt/px (the guest window keeps its size; kept when it resizes)
     minimize hwnd=0x... (to the taskbar; app side, the program is not told)
     restore hwnd=0x... "..." [(SC_RESTORE posted)]
-    fullscreen hwnd=0x... on (fit to the screen; the frame stays put, its button turns blue: ...) | off (back to its movable frame)
+    fullscreen hwnd=0x... on (fit to the screen; the frame stays put, its button shows the shrink arrows in a ring: ...) | off (back to its movable frame)
     taskbar keyboard button ignored: not a touch (event type 3; controller or keyboard focus press)
     search field: first responder refused (not a touch on it; the keyboard stays with the program)
     search field released (tap | click | drag | taskbar | ...): the keyboard goes back to the program
@@ -228,6 +285,16 @@ All start with `[windowed] ml1300`:
     maximize hwnd=0x... on (button | fit button held): the whole screen, no title bar, taskbar hidden; ...
     maximize hwnd=0x... off (restore pill | menu | hidden or minimized | window destroyed | another window maximized): back to its frame
     restore pill ignored: not a touch (...)
+    steam: taskbar button pinned (env.MADEIRA_WINDOWED_STEAM = 0 hides it) | hidden (...)
+    steam: launch (already running in this session: hwnd=0x... "..." exe=steam brought to the front)
+    steam: button (no Steam window in this session; the app checks the install)
+    steam: not available (cancelled at the memory warning)
+    steam: not available (a running session cannot start another program from the app; library entry "Steam" for C:\Program Files (x86)\Steam\steam.exe added | already there, started at the next start)
+    steam: install (downloading https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe into Application Support/MadeiraSteam)
+    steam: install (SteamSetup.exe downloaded, N bytes, kept in Application Support/MadeiraSteam and C:\madeira-games\SteamSetup.exe; library entry "Steam Setup" added; it cannot run inside this session, it starts at the next start)
+    steam: not available (Steam's installer: cancelled | the download failed: ... | Valve's server answered N | the download left Valve's servers | an unexpected size (N bytes))
+    steam: not available (... library entry could not be made: ...)
+    taskbar Steam button ignored: not a touch (...)
 
 `[winios] compositor attached inside presentation frame` is followed by the
 root line in a windowed session. `[winios] drv_post_mouse hwnd=0x...` (first
@@ -235,8 +302,8 @@ root line in a windowed session. `[winios] drv_post_mouse hwnd=0x...` (first
 
 ## Rebuilding
 
-Rounds 2 and 3 touched only the app (`WiniosWindowed.m`, `Winios.m`, Swift,
-`Info.plist`); no native rebuild. In the first version `build/win32u-unix/driver_ios.c` changed (new helpers, mouse routing by
+Rounds 2, 3 and 4 touched only the app (`WiniosWindowed.m`, `Winios.m`,
+Swift, `Info.plist`, round 4 also the config catalog); no native rebuild. In the first version `build/win32u-unix/driver_ios.c` changed (new helpers, mouse routing by
 window, the foreground-fix guard): `rebuild-native.sh win32u`, then the app.
 The app links against an older `libwin32u_unix.a` too (weak fallbacks in
 `WiniosWindowed.m`): frames then have no title, owner or icon, the buttons do
@@ -324,3 +391,36 @@ window (only the top-level window's own Metal layer is fitted).
    foreground): `[winios] ml1301 desktop game fit hwnd=0x... off (foreground
    changed): the whole desktop again`; back to the game: fitted again.
 6. `env.MADEIRA_DESKTOP_GAME_FIT = 0`: no `ml1301` lines, the old desktop fit.
+
+### Round 4 (look; Steam on the taskbar)
+
+The owner's device run of round 3: "windowed mode works as intended now",
+with three requests: more room around the search field's magnifier, title
+bars translucent and blurred with monochrome buttons ("no Linux GNOME
+colours"), and a Steam installer or Steam itself reachable from the windowed
+desktop. App only (`WiniosWindowed.m`, `WiniosWindowed.h`,
+`WindowedMode.swift`, the config catalog).
+
+1. Start a windowed session. Title bars: dark, translucent (a window behind a
+   frame shows blurred through it), a faint line along the top, the title
+   centred in white; four grey-white circles with white glyphs, none
+   coloured. Tap another frame: its title and buttons brighten, the previous
+   one's dim. Tap fit: the button shows the inward arrows in a ring; tap it
+   again.
+2. Taskbar: the same material; the magnifier clearly inside the search
+   field's left end with a gap before "Search"; Steam tile, program icons,
+   keyboard and menu evenly spaced. Rotate: still even.
+3. Maximize, check the pill has the same material; restore.
+4. Tap the Steam tile with no Steam window open: the memory warning appears
+   once (`steam: button ...`); Cancel logs `steam: not available (cancelled at
+   the memory warning)`; tap again, Continue.
+   - Prefix with `steam.exe`: alert "Steam starts in a session of its own",
+     `steam: not available (... library entry "Steam" ... added ...)`. Restart
+     Madeira: the library has Steam; open it (windowed on): Steam's windows
+     come up in frames; tap the Steam tile: `steam: launch (already running
+     ...)` and the dot under the tile.
+   - Prefix without Steam: a "Downloading Steam's installer" alert counting
+     up, then "Steam's installer is ready", `steam: install (SteamSetup.exe
+     downloaded, N bytes ...)`. Restart, open Steam Setup from the library.
+5. `env.MADEIRA_WINDOWED_STEAM = 0`: no Steam tile, `steam: taskbar button
+   hidden (...)`.
