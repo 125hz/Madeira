@@ -18,7 +18,9 @@ FILES = [
     "vcomp140.dll",
     "vcruntime140.dll",
     "vcruntime140_1.dll",
-    "vcruntime140_threads.dll"
+    "vcruntime140_threads.dll",
+    "mfc140.dll",
+    "mfc140u.dll"
 ]
 
 def check_sig(d):

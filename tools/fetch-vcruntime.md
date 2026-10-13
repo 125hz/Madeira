@@ -49,4 +49,3 @@ python3 tests/host/check-vcruntime.py --strict
 
 A file whose certificate offset equals its own length has had the signature
 truncated off and is no longer an unmodified Microsoft binary.
-

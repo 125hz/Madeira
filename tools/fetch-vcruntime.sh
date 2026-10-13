@@ -59,6 +59,8 @@ WANTED=(
     "vcruntime140.dll"
     "vcruntime140_1.dll"
     "vcruntime140_threads.dll"
+    "mfc140.dll"
+    "mfc140u.dll"
 )
 
 missing=()
