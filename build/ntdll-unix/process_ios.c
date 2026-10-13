@@ -3987,7 +3987,11 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
                              MEM_EXECUTE_OPTION_DISABLE_THUNK_EMULATION |
                              MEM_EXECUTE_OPTION_PERMANENT;
         else
-            *(ULONG *)info = execute_flags;
+        {
+            /* ml1354: a 32-bit pseudo-process's own flags (virtual_ios.c ios_dep_per_process) */
+            extern ULONG ios_wow_exec_flags_current( ULONG fallback );
+            *(ULONG *)info = ios_wow_exec_flags_current( execute_flags );
+        }
         break;
 
     case ProcessPriorityClass:
@@ -4273,9 +4277,16 @@ NTSTATUS WINAPI NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class, 
 
     case ProcessExecuteFlags:
         if ((is_win64 && !is_wow64()) || size != sizeof(ULONG)) return STATUS_INVALID_PARAMETER;
-        if (execute_flags & MEM_EXECUTE_OPTION_PERMANENT) return STATUS_ACCESS_DENIED;
-        else
         {
+            /* ml1354: DEP is per process. The flags were one session-wide value, so a
+             * 32-bit browser making DEP permanent for itself also locked every later
+             * 32-bit process out of turning it off. */
+            extern ULONG ios_wow_exec_flags_current( ULONG fallback );
+            if (ios_wow_exec_flags_current( execute_flags ) & MEM_EXECUTE_OPTION_PERMANENT)
+                return STATUS_ACCESS_DENIED;
+        }
+        {
+            extern int ios_wow_exec_flags_store_current( ULONG flags );
             BOOL enable;
             switch (*(ULONG *)info & (MEM_EXECUTE_OPTION_ENABLE|MEM_EXECUTE_OPTION_DISABLE))
             {
@@ -4288,7 +4299,8 @@ NTSTATUS WINAPI NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class, 
             default:
                 return STATUS_INVALID_PARAMETER;
             }
-            execute_flags = *(ULONG *)info;
+            /* the session-wide value stays for processes without a guest window */
+            if (!ios_wow_exec_flags_store_current( *(ULONG *)info )) execute_flags = *(ULONG *)info;
             virtual_set_force_exec( enable );
         }
         break;
