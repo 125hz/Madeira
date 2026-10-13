@@ -353,6 +353,7 @@ user sees are opt-in (only `1` enables); the others are on unless set to `0`:
 | `MADEIRA_XINPUT_WGI` | on | `0`: Windows.Gaming.Input lists no controllers (ml2171) |
 | `MADEIRA_XINPUT_ENABLE_FOREGROUND` | on | `0`: a game's XInputEnable(FALSE) zeroes the pad even while its window is in front (ml2115) |
 | `MADEIRA_XINPUT_SLOT0_RECONNECT` | on | `0`: a reconnected player 1 stays in the slot it landed in (ml2172) |
+| `MADEIRA_CLICK_FOCUS` | on | `0`: a tap or click on an already active window leaves its keyboard focus as it is (ml2181, "Keyboard focus" below) |
 
 `[controls-layout] ml1970` logs layout loads, saves, creation and deletion
 (never layout names); `[xinput] ml1990` logs the session slot reservation.
@@ -435,6 +436,45 @@ foreground window is not one of its own, win32u makes the process's largest
 top-level window foreground and active, checking at most once a second; a
 window of the same process already in front is left alone. `[fg]` logs the first
 activations. `env.MADEIRA_FOREGROUND_FIX = 0` turns this off.
+
+Keyboard focus (ml2181). In front is not always enough: some engines start
+their per-frame input with `GetFocus() == their window` and drop polled input
+(XInput, DirectInput) otherwise, while keyboard messages still reach the
+window. Wine moves the keyboard focus into a top-level window only while it
+activates it, so a window that is already its thread's active window keeps
+whatever focus the thread has, possibly none: a click on it sends no
+`WM_MOUSEACTIVATE`, and `SetForegroundWindow` on the window already in front
+does nothing. On the window's own thread, after a mouse button press
+(win32u `process_mouse_message`, also while the program holds the capture), a
+windowed-mode tap or born-minimized restore (`winios_drv_foreground_if_owner`)
+and the once-a-second foreground check above, `winios_click_focus` focuses the
+top-level window when it is the thread's active window and the focus is
+nowhere inside it, which is what `DefWindowProc` does for `WM_ACTIVATE` on
+Windows. Focus already inside the window (a child control), menu and move/size
+modes, and minimized or disabled windows are left alone. Logged (stderr, 24
+lines): `[winios] ml2181 focus → hwnd H (click|tap|activate) was F now N`.
+`env.MADEIRA_CLICK_FOCUS = 0` turns it off.
+
+The `[xinput] ml2180 state read …` line (win32u, the first 16 input/rest
+transitions per slot) also carries the reading thread's GUI state since ml2181:
+`fg=H(pid P) active=A focus=F capture=C focus-in-fg=0|1 fg-focus=G` (the
+foreground window and its process, the reading thread's own active, focus and
+capture windows, whether that focus lies inside the foreground window, and the
+foreground thread's focus). `focus=0x0` with `active` equal to the game's
+window is the state ml2181 repairs.
+
+What reads a slot: XInputGetState and DirectInput's host joystick
+(`MADEIRA_DINPUT_PAD`) both sample through the same win32u query, so an
+`ml2180 state read index=0` line alone does not show that the game reads
+XInput. xinput prints `[xinput] ml2114 first state query index=N` the first
+time a game calls XInputGetState(Ex) for slot N; when that line exists for
+slots 1-3 but not 0 while `[dinput] ml2116 enumeration: slot0=connected,
+listed` is in the log, the game took the DirectInput joystick as its slot-0
+controller and polls XInput only for the other slots. A game written for
+both APIs tells an XInput pad apart from a DirectInput one by its PnP id
+(the `IG_` marker it looks up through WMI's `Win32_PnPEntity`); the host
+DirectInput joystick has no such entry, so such a game treats it as a generic
+joystick. Choose **XInput** (not "XInput and DirectInput") for such a game.
 
 ## Integration prerequisite
 
