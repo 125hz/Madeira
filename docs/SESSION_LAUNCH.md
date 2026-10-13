@@ -301,6 +301,42 @@ thread at one pc there, the thread runs `abort_process(c0000005)` (this pseudo-p
 protection has no EXECUTE (prot=3/3); ending this process …`. `env.MADEIRA_POOL_NOEXEC_GIVEUP = 0`
 keeps the endless retry.
 
+## ml1354/ml1355: two 32-bit processes side by side (log 95)
+
+Log 95 (a running 32-bit game, then the Steam tile): every ml1351 line says "same layout",
+`[pool-guard] ml1351` fired, no pool poison, the Steam client got its GDI guest view, showed its
+updater window (`[windowed] ml1300 add … title="Steam"`, removed when it finished), failed its
+manifest download (http error 0, it carries on), loaded steamui/steamclient and started the
+single-process web helper (pid 0394). Then two cross-process leaks broke both programs:
+
+- **ml1355, thread stacks freed in the wrong process.** Wine frees an exited thread's TEB and
+  stacks on the NEXT thread exit anywhere (`exit_thread`'s `prev_teb` handoff), which here is often
+  a thread of another pseudo-process. `virtual_free_teb` turned the dead WoW thread's 32-bit stack
+  (a guest address) into a host address with the FREEING thread's window base, so it released the
+  other process's live memory at that guest address. The game was creating and ending a short
+  render thread in a loop (~250 times after the Steam window took the foreground), so game and
+  Steam threads freed each other's memory: the game lost guest 0x167e0000+0x10000 (`NO wine view`)
+  and died reading 0x167EFF0C; Steam's own `steamerrorreporter` spawns follow the same pattern.
+  Fix (`virtual_ios.c` `virtual_free_teb`): the base is the window that holds the dead thread's TEB;
+  a window that is no longer live keeps the stack. `[wow-stack] ml1355 32-bit stack of an exited
+  thread (teb=…) freed in its own window B=…, not the freeing thread's (B=…)` (first 16).
+  `env.MADEIRA_WOW_STACK_FREE_OWNER = 0` restores the old base.
+- **ml1354, DEP state per process.** The single-process web helper turns DEP on for itself
+  (permanent). `execute_flags` and `force_exec_prot` were session-wide, so that also cancelled the
+  game's DEP-off, locked every later 32-bit process out of DEP-off, and `virtual_set_force_exec`
+  re-protected every view of every process from the helper's thread: every executable image of the
+  game and of the Steam client was copied into the JIT pool again under the helper's identity (~69
+  MB) until `[jit-pool] EXHAUSTED` refused loads and allocations (the helper's own included). Fix
+  (`virtual_ios.c`, `process_ios.c`): each guest window keeps its process's DEP-off state and
+  ProcessExecuteFlags; the sweep covers only the caller's window. `[dep] ml1354 pid …: DEP off|on for
+  this process only (window B=…); N of its views re-protected, other processes untouched`.
+  `env.MADEIRA_DEP_PER_PROCESS = 0` restores the session-wide behaviour.
+
+Still open: whether the Steam client's main window then appears (CEF in single-process mode under
+FEX, with the game also running, is the old heavy path: pool 496 MB was ~55% used before the sweep);
+conhost (pid 0474, started by the helper's AllocConsole) crashed on a NULL read in its own ntdll
+start-up (`[peb+0x18]` = 0), not investigated.
+
 ## Files
 
 `build/ntdll-unix/process_ios.c` (queue, parsing, `msl_create_process`),
