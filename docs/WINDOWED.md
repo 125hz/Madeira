@@ -74,6 +74,21 @@ New frames cascade from the top of the screen at a zoom of at most 1 point per
 guest pixel, small enough to fit the screen; a dialog opens centred over its
 owner.
 
+**Size changes refit the zoom** (round 2). Many programs create their main
+window parked off screen or at the minimized size (`-32000,-32000` and
+160x31) and only then give it its real size. A frame first placed at such a
+placeholder rect is placed again (cascade or centred over its owner) at the
+window's first real size; any later size change of the guest window, and a
+new screen size (rotation), recomputes the fit zoom, so a window larger than
+the screen comes up zoomed below 1 with its whole title bar on screen. Once
+you zoom a frame with the grip, size changes keep your zoom (the frame is only
+kept reachable). A placeholder rect (the program minimizing itself) never
+changes the frame. Each refit logs `refit hwnd=... rect=... zoom=...`.
+
+**The title bar stays reachable.** Dragging, zooming and refits keep the whole
+height of the title bar and at least 120 points of its width inside the area
+above the taskbar, so a frame can always be grabbed again.
+
 **Input.** Touches on window content fall through the compositor to the game
 view (`MetalBackedView`), which maps them through
 `winios_desktop_point_from_window`. In windowed mode that finds the frame (or
@@ -86,6 +101,32 @@ takes `msg->win` when it is visible, mouse capture first). A press latches its
 window until the last button is up, so a drag that leaves the frame still
 goes to it. A touch on the black background is dropped. Keys go to the
 focused window as before.
+
+**Game controllers and the keyboard** (round 2). Controllers reach the guest
+through the Game Controller framework (`GamepadInput.swift` polls the pads and
+feeds `WiniosGamepad.c`), which does not depend on UIKit focus; nothing in
+windowed mode gates it (the forced Touch pointer mode only changes touches; the
+pad stops only while the app is inactive or the library menu is open, as in
+every session). But since iOS 15 a controller also drives focusable UIKit
+controls (the focus engine), and the first version's taskbar search field and
+buttons were focusable: the pad's A opened the search field and the software
+keyboard, and its Go brought the first taskbar window (another program) to
+the front, so the game lost foreground and with it the pad. Now:
+- `Info.plist` sets `GCSupportsControllerUserInteraction = false`.
+- The windowed root carries a `GCEventInteraction` for gamepad events (as the
+  game view already does), so controller events under the frames and the
+  taskbar go to the Game Controller framework, not to UIKit navigation
+  (`env.MADEIRA_XINPUT = 0` leaves UIKit's default).
+- No chrome can take focus (`canBecomeFocused` is NO on the root, frames,
+  title-bar and taskbar buttons, the window strip and the search field), the
+  title-bar tap recognizers take no presses, and every button ignores an
+  action that does not come from a touch (`... ignored: not a touch`).
+- The search field becomes first responder only right after a touch on it.
+  Touching or picking a window (a tap or click in a frame, a title bar, a
+  taskbar button) gives the keyboard back to the program
+  (`search field released (...)`), so a hardware keyboard is not left typing
+  into the search field. Go with nothing typed only closes the keyboard.
+- The taskbar keyboard button answers a touch only.
 
 **Activation and z-order.** Touching a frame brings it to the front on
 screen; the click itself activates the window in Wine. Tapping or dragging a
@@ -104,12 +145,16 @@ chose.
   also shown dimmed; tapping it posts `WM_SYSCOMMAND/SC_RESTORE`.
 - *Fullscreen* fits the window into the whole screen above the taskbar (title
   bar kept, so restore is one tap; a double tap on the title bar does the
-  same). App-side; the guest window keeps its size.
+  same). App-side; the guest window keeps its size. A fitted frame does not
+  move: while it is on, the button is blue with the "shrink" arrows and the
+  title bar turns dark blue; dragging it only pulses the button and logs
+  `move ... ignored: fullscreen`.
 - *Close* posts `WM_SYSCOMMAND/SC_CLOSE`, which `DefWindowProc` turns into
   `WM_CLOSE`, as the close box of the window's own caption would.
 
-**Taskbar.** A pill along the bottom: a Search field (filters the window
-buttons by title or program name; Go brings the first match to the front),
+**Taskbar.** A pill along the bottom: a Search field (touch it to type;
+filters the window buttons by title or program name; Go brings the first
+match to the front),
 one button per program window (its class icon when the program registered one,
 else its program's initial; a dot under it, white for the frontmost window,
 the button dimmed when minimized; tap: restore / bring to front / minimize when
@@ -136,7 +181,9 @@ already in front), then the keyboard and the in-game menu (both through
 - A touch on the black background is dropped; to close an open menu, tap any
   window.
 - Windows are not clipped to the screen; a frame can be dragged mostly off it
-  (its title bar stays reachable).
+  (at least 120 points of its title bar stay on screen).
+- A controller cannot operate the frames or the taskbar (by design: its input
+  is the program's); use touch for the chrome.
 - The XInput foreground fix is off while windowed mode is on (see above).
 
 ## Log lines
@@ -145,16 +192,23 @@ All start with `[windowed] ml1300`:
 
     on (madeira.cfg windowed = 1)                     the switch, once per session
     off (env.MADEIRA_WINDOWED = 1; only desktop sessions are windowed)
-    compositor root attached: frames + taskbar ...
+    compositor root attached: frames + taskbar (...); chrome not focusable, gamepad events claimed for the Game Controller framework
     add hwnd=0x... kind=framed title="..." exe=steam class=... rect={x,y wxh} zoom=0.37
+    refit hwnd=0x... rect={0,0 1280x720} zoom=0.52 (first real size; placed again)
+    refit hwnd=0x... rect={...} zoom=... (size changed | screen changed)
+    refit hwnd=0x... rect={...} zoom=... (size changed; the zoom set with the grip is kept)
     remove hwnd=0x... kind=framed title="..."
     activate hwnd=0x... "..." (tap | drag | taskbar | fullscreen | search | guest)
     activate hwnd=0x... foreground=1 (tap)           the window's thread made it foreground
     move hwnd=0x... to (x,y) pt (app side; the guest window stays at x,y)
-    scale hwnd=0x... zoom=0.62 pt/px (the guest window keeps its size)
+    move hwnd=0x... ignored: fullscreen (fitted) frames stay put; ...
+    scale hwnd=0x... zoom=0.62 pt/px (the guest window keeps its size; kept when it resizes)
     minimize hwnd=0x... (to the taskbar; app side, the program is not told)
     restore hwnd=0x... "..." [(SC_RESTORE posted)]
-    fullscreen hwnd=0x... on (fit to the screen) | off (back to its frame)
+    fullscreen hwnd=0x... on (fit to the screen; the frame stays put, its button turns blue: ...) | off (back to its movable frame)
+    taskbar keyboard button ignored: not a touch (event type 3; controller or keyboard focus press)
+    search field: first responder refused (not a touch on it; the keyboard stays with the program)
+    search field released (tap | click | drag | taskbar | ...): the keyboard goes back to the program
     close hwnd=0x... "..." (WM_SYSCOMMAND SC_CLOSE -> WM_CLOSE)
     posted WM_SYSCOMMAND 0xf060 to hwnd=0x... ok=1
     title hwnd=0x... "..."
@@ -166,7 +220,8 @@ root line in a windowed session. `[winios] drv_post_mouse hwnd=0x...` (first
 
 ## Rebuilding
 
-`build/win32u-unix/driver_ios.c` changed (new helpers, mouse routing by
+Round 2 touched only the app (`WiniosWindowed.m`, `Info.plist`); no native
+rebuild. In the first version `build/win32u-unix/driver_ios.c` changed (new helpers, mouse routing by
 window, the foreground-fix guard): `rebuild-native.sh win32u`, then the app.
 The app links against an older `libwin32u_unix.a` too (weak fallbacks in
 `WiniosWindowed.m`): frames then have no title, owner or icon, the buttons do
@@ -189,3 +244,32 @@ nothing, and input is hit-tested on the guest desktop as before.
 7. Rotate the device: frames stay on screen, the taskbar re-centres.
 8. Remove the line (or `env.MADEIRA_WINDOWED = 0`): the next desktop session
    is the old fitted desktop.
+
+### Round 2 (after the first device run)
+
+The first device run showed a game window at full size at 1 point per pixel
+(it was added at its 160x31 placeholder and never refit), drags that left most
+of a frame off screen, and a controller that opened the taskbar search field
+and keyboard instead of playing. Round 2 changes only `WiniosWindowed.m`,
+`Info.plist` and these docs (the app; `libwin32u_unix.a` is unchanged).
+
+1. Start a game that opens a large window through a Dock or Desktop start.
+   Expect `add ... rect={-32000,-32000 160x31} zoom=1.00` (or a real rect)
+   and then `refit hwnd=... rect={0,0 WxH} zoom=0.xx (first real size; placed
+   again)`: the frame fits the screen above the taskbar, title bar on screen.
+2. Drag the title bar hard towards each edge: the frame stops with at least
+   120 points of its title bar on screen; drag it back.
+3. Tap fullscreen: the button turns blue and the title bar dark blue; a drag
+   only pulses the button (`move ... ignored: fullscreen`); tap it again to
+   get the movable frame back.
+4. With a controller connected, play the game's menus: the controller works in
+   the game; nothing in the taskbar highlights, no keyboard appears, and no
+   `activate ... (search)` or `taskbar keyboard` lines appear unless you touch
+   them. Any `... ignored: not a touch` line means a focus press was blocked.
+5. Touch the search field: the keyboard comes up (`keyboard focus: elsewhere
+   (responder)`); tap inside the game window: `search field released (click)`
+   and `keyboard focus: program`.
+6. Zoom a frame with the grip, then make the program change its window size
+   (a resolution change in its options): `refit ... (the zoom set with the
+   grip is kept)`.
+7. Rotate the device: `refit ... (screen changed)` for frames you did not zoom.
