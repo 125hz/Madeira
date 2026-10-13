@@ -711,8 +711,16 @@ static void madeira_link_d3d9_wined3d(NSFileManager *fm, NSString *prefix, NSStr
  *   d3d12  = vkd3d
  *            this session's d3d12.dll and d3d12core.dll are vkd3d-proton's
  *            (vulkan/arm64ec-windows in the bundle) instead of madeira-d3d12's.
+ *   d3d11  = dxvk
+ *            this session's d3d11.dll, d3d10core.dll and dxgi.dll are DXVK's
+ *            (vulkan/arm64ec-windows/dxvk-*.dll, build/dxvk/build.sh) instead of
+ *            DXMT's; docs/DXVK.md. DXVK's d3d11 needs its own dxgi, and DXMT's
+ *            dxgi is then gone, so Direct3D 12 must be vkd3d-proton (the usual
+ *            DXVK + vkd3d-proton pairing): with d3d12 unset this implies
+ *            d3d12 = vkd3d for the session.
  *
- * Vulkan is on for a session when `vulkan` names a library or d3d12 = vkd3d.
+ * Vulkan is on for a session when `vulkan` names a library, d3d12 = vkd3d or
+ * d3d11 = dxvk.
  * Off (the default) changes nothing: the prefix gets no vulkan-1.dll or
  * winevulkan.dll (no farm holds them, so a program that probes for Vulkan
  * finds none, as before), MADEIRA_VULKAN_LIBRARY stays unset, and win32u lists
@@ -724,11 +732,21 @@ static void madeira_link_d3d9_wined3d(NSFileManager *fm, NSString *prefix, NSStr
  * gets madeira-d3d12 again; the two Vulkan DLLs, which no farm relinks, are
  * removed here when they name the bundle's vulkan folder. x64 programs only:
  * the unix side binds no 32-bit table yet (build/ntdll-unix/virtual_ios.c). */
+static BOOL madeira_d3d11_dxvk_wanted(void)
+{
+    char v[32] = "";
+
+    return madeira_cfg_get("d3d11", v, sizeof v) && !strcasecmp(v, "dxvk");
+}
+
+/* d3d12 = vkd3d, or d3d12 unset with d3d11 = dxvk (DXVK's dxgi has no
+ * madeira-d3d12 swapchain; vkd3d-proton presents through it). */
 static BOOL madeira_d3d12_vkd3d_wanted(void)
 {
     char v[32] = "";
 
-    return madeira_cfg_get("d3d12", v, sizeof v) && !strcasecmp(v, "vkd3d");
+    if (madeira_cfg_get("d3d12", v, sizeof v) && v[0]) return !strcasecmp(v, "vkd3d");
+    return madeira_d3d11_dxvk_wanted();
 }
 
 /* The Vulkan library for this session, or nil when Vulkan stays off. */
@@ -738,7 +756,7 @@ static NSString *madeira_vulkan_library(NSString *bundle)
     BOOL set = madeira_cfg_get("vulkan", v, sizeof v) && v[0];
 
     if (set && (!strcasecmp(v, "off") || !strcmp(v, "0"))) return nil;
-    if (!set && !madeira_d3d12_vkd3d_wanted()) return nil;
+    if (!set && !madeira_d3d12_vkd3d_wanted() && !madeira_d3d11_dxvk_wanted()) return nil;
     if (!set || !strcasecmp(v, "moltenvk"))
         return [bundle stringByAppendingPathComponent:@"gl/libMoltenVK.dylib"];
     if (!strcasecmp(v, "kosmickrisp"))
@@ -766,10 +784,13 @@ static void madeira_setup_vulkan(NSFileManager *fm, NSString *prefix, NSString *
     NSString *stack = [bundle stringByAppendingPathComponent:@"vulkan/arm64ec-windows"];
     NSArray<NSString *> *vulkan_dlls = @[@"winevulkan.dll", @"vulkan-1.dll"];
     NSArray<NSString *> *vkd3d_dlls = @[@"d3d12.dll", @"d3d12core.dll"];
+    /* Link names in the prefix; DXVK's files are dxvk-<name> in the vulkan folder. */
+    NSArray<NSString *> *dxvk_dlls = @[@"d3d11.dll", @"d3d10core.dll", @"dxgi.dll"];
     NSArray<NSString *> *dirs = use_arm64ec ? @[@"system32", @"sysx64"] : @[@"sysx64"];
     NSString *lib = madeira_vulkan_library(bundle);
     BOOL vkd3d = madeira_d3d12_vkd3d_wanted();
-    int linked = 0, vkd3d_linked = 0;
+    BOOL dxvk = madeira_d3d11_dxvk_wanted();
+    int linked = 0, vkd3d_linked = 0, dxvk_linked = 0;
 
     /* A previous session's Vulkan links (no farm pass replaces these two). */
     for (NSString *dir in @[@"system32", @"sysx64"])
@@ -784,6 +805,8 @@ static void madeira_setup_vulkan(NSFileManager *fm, NSString *prefix, NSString *
         unsetenv("MADEIRA_VULKAN_LIBRARY");
         if (vkd3d)
             dprintf(STDERR_FILENO, "[vulkan] d3d12 = vkd3d with vulkan = off: madeira-d3d12 stays this session's D3D12\n");
+        if (dxvk)
+            dprintf(STDERR_FILENO, "[vulkan] d3d11 = dxvk with vulkan = off: DXMT stays this session's D3D10/11 and DXGI\n");
         return;
     }
     if (access(lib.fileSystemRepresentation, R_OK) != 0 ||
@@ -791,7 +814,8 @@ static void madeira_setup_vulkan(NSFileManager *fm, NSString *prefix, NSString *
         access([stack stringByAppendingPathComponent:@"vulkan-1.dll"].fileSystemRepresentation, R_OK) != 0) {
         unsetenv("MADEIRA_VULKAN_LIBRARY");
         dprintf(STDERR_FILENO, "[vulkan] Vulkan stays off: %s or the bundle's vulkan/arm64ec-windows/{winevulkan,vulkan-1}.dll "
-                "is missing%s\n", lib.UTF8String, vkd3d ? " (d3d12 = vkd3d ignored: madeira-d3d12 stays)" : "");
+                "is missing%s%s\n", lib.UTF8String, vkd3d ? " (d3d12 = vkd3d ignored: madeira-d3d12 stays)" : "",
+                dxvk ? " (d3d11 = dxvk ignored: DXMT stays)" : "");
         return;
     }
     setenv("MADEIRA_VULKAN_LIBRARY", lib.UTF8String, 1);   /* read by build/win32u-unix/vulkan_ios.c */
@@ -812,9 +836,47 @@ static void madeira_setup_vulkan(NSFileManager *fm, NSString *prefix, NSString *
                     "d3d12core.dll (build/vkd3d-proton/build.sh): madeira-d3d12 stays\n");
         }
     }
-    dprintf(STDERR_FILENO, "[vulkan] on: MADEIRA_VULKAN_LIBRARY=%s; %d Vulkan DLL links in %s; D3D12 = %s (%d links)\n",
+    if (dxvk) {
+        BOOL have = YES;
+
+        for (NSString *dll in dxvk_dlls)
+            if (access([stack stringByAppendingPathComponent:[@"dxvk-" stringByAppendingString:dll]].fileSystemRepresentation,
+                       R_OK) != 0)
+                have = NO;
+        if (have) {
+            const char *level;
+            char d3d12v[32] = "";
+            BOOL d3d12_set = madeira_cfg_get("d3d12", d3d12v, sizeof d3d12v) && d3d12v[0];
+
+            for (NSString *dir in dirs)
+                for (NSString *dll in dxvk_dlls)
+                    dxvk_linked += madeira_link_vulkan_file(fm, [win stringByAppendingPathComponent:dir], dll,
+                                                            [stack stringByAppendingPathComponent:
+                                                                [@"dxvk-" stringByAppendingString:dll]]);
+            /* Under Wine DXVK logs through __wine_dbg_output (the session log),
+             * and writes no log file unless DXVK_LOG_PATH names a folder;
+             * overwrite=0 keeps a madeira.cfg env.DXVK_LOG_LEVEL. */
+            setenv("DXVK_LOG_LEVEL", "info", 0);
+            level = getenv("DXVK_LOG_LEVEL");   /* DXVK's log level (none, error, warn, info, debug, trace); d3d11 = dxvk makes it info unless set */
+            dprintf(STDERR_FILENO, "[vulkan] d3d11 = dxvk: DXVK's d3d11.dll, d3d10core.dll and dxgi.dll for this session "
+                    "(links %d in %s); D3D12 = %s%s; DXVK_LOG_LEVEL=%s\n", dxvk_linked,
+                    use_arm64ec ? "system32 + sysx64" : "sysx64", vkd3d_linked ? "vkd3d-proton" : "madeira-d3d12",
+                    vkd3d_linked && !d3d12_set ? " (d3d12 unset: d3d11 = dxvk implies d3d12 = vkd3d)" : "",
+                    level ? level : "(unset)");
+            if (!vkd3d_linked)
+                dprintf(STDERR_FILENO, "[vulkan] d3d11 = dxvk without vkd3d-proton (d3d12 = %s): madeira-d3d12 cannot "
+                        "present through DXVK's dxgi, so Direct3D 12 programs get no swapchain this session\n",
+                        d3d12_set ? d3d12v : "vkd3d, DLLs missing");
+        } else {
+            dprintf(STDERR_FILENO, "[vulkan] d3d11 = dxvk, but the bundle has no vulkan/arm64ec-windows/dxvk-d3d11.dll, "
+                    "dxvk-d3d10core.dll and dxvk-dxgi.dll (build/dxvk/build.sh): DXMT stays\n");
+        }
+    }
+    dprintf(STDERR_FILENO, "[vulkan] on: MADEIRA_VULKAN_LIBRARY=%s; %d Vulkan DLL links in %s; D3D12 = %s (%d links); "
+            "D3D10/11 = %s (%d links)\n",
             lib.UTF8String, linked, use_arm64ec ? "system32 + sysx64" : "sysx64",
-            vkd3d_linked ? "vkd3d-proton" : "madeira-d3d12", vkd3d_linked);
+            vkd3d_linked ? "vkd3d-proton" : "madeira-d3d12", vkd3d_linked,
+            dxvk_linked ? "DXVK" : "DXMT", dxvk_linked);
 }
 
 /* ml1275: C:\windows\mono\mono-2.0 -> the bundle's Wine Mono, when the build
