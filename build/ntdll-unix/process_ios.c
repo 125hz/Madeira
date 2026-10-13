@@ -427,6 +427,7 @@ struct ios_child_args {
     int slot;   /* ios_child_slots index, -1 = none */
 };
 
+
 /* Pseudo-process children that are still running. A launcher stub that
  * starts the game and exits at once (GTA V Enhanced: PlayGTAV.exe starts
  * GTA5_Enhanced.exe and exits ~1 s later) ended the whole session: the main

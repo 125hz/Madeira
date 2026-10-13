@@ -3326,7 +3326,7 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
  * RECYCLES already-poisoned VA (68 freelist/reclaim events this run) so it arrives poisoned.
  * Checking maxprot at hand-out time -- BEFORE anything is written -- separates them.
  * VM_PROT_COPY was already ruled out (zero RW+COPY events in the failing run). */
-static void ios_pool_check_range_exec( size_t off, size_t size, int reused )
+static unsigned ios_pool_check_range_exec( size_t off, size_t size, int reused )
 {
     extern void *ios_jit_rx_base_global;
     uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
@@ -3340,7 +3340,7 @@ static void ios_pool_check_range_exec( size_t off, size_t size, int reused )
      * ...). It reported "CLEAN at hand-out 24/24" and I wrongly concluded the copy path was
      * to blame; [poison-step] pre-memcpy then showed the pages already non-exec BEFORE the
      * copy. Check everything, print only what is interesting. */
-    if (!rx) return;
+    if (!rx) return 0;
 
     for (o = 0; o < size; o += 0x4000)
     {
@@ -3386,16 +3386,54 @@ static void ios_pool_check_range_exec( size_t off, size_t size, int reused )
     if (bad && checked < 30)
         dprintf( 2, "[pool-poison] off=0x%lx +0x%lx : %u poisoned pages, reused=%d\n",
                  (unsigned long)off, (unsigned long)size, bad, reused );
+    return bad;
 }
 
 static size_t ios_pool_alloc_range( size_t alloc_size, size_t pool_limit )
 {
-    size_t off = ios_pool_alloc_range_ex( alloc_size, pool_limit, (size_t)-1, 0 );
+    /* ml1351: QUARANTINE A RANGE THAT IS ALREADY NON-EXECUTABLE (port of the pre-reset
+     * ml1970 guard).
+     *
+     * ml239 only reported such a range and handed it out anyway. Device logs 80-83: a
+     * 32-bit game's DRM loader image was copied into the pool, and from the exact end
+     * of that copy every later hand-out was born with maxprot RW ([pool-poison] HANDED
+     * OUT NON-EXEC off=0xa848000...). The next process started in that session (the
+     * windowed taskbar's in-session launcher: services.exe, then steam.exe) got its
+     * ntdll copy there and faulted NOEXEC at LdrInitializeThunk's first instruction,
+     * forever, one core at 100%. EXEC can never be restored to those pages, so leave
+     * them allocated and take the next range. Bounded: at most 16 attempts and 64 MB
+     * skipped per session, after which the report-only behaviour resumes rather than
+     * draining the pool. MADEIRA_POOL_QUARANTINE=0 restores report-only at once. */
+    static int quarantine = -1;
+    static size_t skipped_total;
+    int attempt;
+    size_t off = (size_t)-1;
 
-    /* ml239: see ios_pool_check_range_exec. ios_pool_last_alloc_reused tells us whether
-     * this came off the freelist or the virgin bump, which is exactly the discriminator. */
-    if (off != (size_t)-1)
-        ios_pool_check_range_exec( off, alloc_size, ios_pool_last_alloc_reused );
+    if (quarantine < 0)
+    {
+        const char *e = getenv( "MADEIRA_POOL_QUARANTINE" );
+        quarantine = !(e && e[0] == '0');
+    }
+    for (attempt = 0; attempt < 16; attempt++)
+    {
+        unsigned bad;
+        off = ios_pool_alloc_range_ex( alloc_size, pool_limit, (size_t)-1, 0 );
+        if (off == (size_t)-1) break;
+        /* ml239: see ios_pool_check_range_exec. ios_pool_last_alloc_reused tells us whether
+         * this came off the freelist or the virgin bump, which is exactly the discriminator. */
+        bad = ios_pool_check_range_exec( off, alloc_size, ios_pool_last_alloc_reused );
+        if (!bad || !quarantine || skipped_total + alloc_size > (64u << 20)) break;
+        skipped_total += alloc_size;
+        {
+            static unsigned int n_q;
+            if (++n_q <= 24)
+                dprintf( 2, "[pool-quarantine] ml1351 off=0x%lx size=0x%lx poisoned=%u reused=%d "
+                         "(maxprot lacks EXEC) left allocated; skipped=%lu KB\n",
+                         (unsigned long)off, (unsigned long)alloc_size, bad,
+                         ios_pool_last_alloc_reused, (unsigned long)(skipped_total >> 10) );
+        }
+        off = (size_t)-1;
+    }
     return off;
 }
 
@@ -18097,7 +18135,45 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                         uintptr_t sec_abs = (uintptr_t)((char *)jit_rx_base + offset + sec_rva);
                         uintptr_t sec_abs_end = (sec_abs + sec_vsize + page_size - 1) & ~(page_size - 1);
                         void *target = (void *)(sec_abs & ~(uintptr_t)(page_size - 1));
-                        size_t sec_page_size = sec_abs_end - (uintptr_t)target;
+                        size_t sec_page_size;
+                        /* ml1351: NEVER PROTECT POOL PAGES BEYOND THIS COPY (port of the
+                         * pre-reset ml1970 guard).
+                         *
+                         * A manually mapped image (a DRM loader's in-memory DLL, not a
+                         * loader-mapped file) can declare a writable section that runs
+                         * past the memory its mapper allocated -- and so past the
+                         * image_size bytes copied here. The RW mprotect below then
+                         * reached the NEXT pool pages. On blessed pool memory that drops
+                         * EXECUTE from max_protection for good (ml140), so every later
+                         * hand-out there was born non-executable: device logs 80-83 show
+                         * [pool-poison] starting exactly at such an image's allocation
+                         * end, after which every process started later in the session
+                         * (the in-session launcher's services.exe and steam.exe) faulted
+                         * at its ntdll copy's first instruction. Clamp to the pages this
+                         * copy owns. MADEIRA_POOL_SECTION_CLAMP=0 restores the unclamped
+                         * range. */
+                        {
+                            static int clamp = -1;
+                            uintptr_t limit = ((uintptr_t)((char *)jit_rx_base + offset + image_size)
+                                               + page_size - 1) & ~(uintptr_t)(page_size - 1);
+                            if (clamp < 0)
+                            {
+                                const char *e = getenv( "MADEIRA_POOL_SECTION_CLAMP" );
+                                clamp = !(e && e[0] == '0');
+                            }
+                            if (clamp && sec_abs_end > limit)
+                            {
+                                static unsigned int n_clamped;
+                                if (++n_clamped <= 16)
+                                    dprintf( 2, "[pool-guard] ml1351 %s section rva=0x%x vsize=0x%x runs past "
+                                             "the 0x%lx-byte pool copy: RW limited to the copy's own pages\n",
+                                             ios_pe_module_name( image_base, image_size ), sec_rva, sec_vsize,
+                                             (unsigned long)image_size );
+                                sec_abs_end = limit;
+                            }
+                            if (sec_abs_end <= (uintptr_t)target) continue;
+                        }
+                        sec_page_size = sec_abs_end - (uintptr_t)target;
 
                         /* Try mprotect to make data section writable (drops execute) */
                         if (mprotect(target, sec_page_size, PROT_READ | PROT_WRITE) == 0)
@@ -18569,7 +18645,16 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
             if ((chars & 0x80000000) && vsz)  /* IMAGE_SCN_MEM_WRITE */
             {
                 size_t p_off = rva & ~(pg - 1);
-                size_t p_sz = ((rva + vsz + pg - 1) & ~(pg - 1)) - p_off;
+                size_t p_end = ((size_t)rva + vsz + pg - 1) & ~(pg - 1);
+                size_t p_lim = ((size_t)m->size + pg - 1) & ~(pg - 1);
+                size_t p_sz;
+                /* ml1351: as in the image copy, never reach past this copy's pages
+                 * (MADEIRA_POOL_SECTION_CLAMP=0 restores the unclamped range). */
+                if (p_end > p_lim && !(getenv( "MADEIRA_POOL_SECTION_CLAMP" ) &&
+                                       getenv( "MADEIRA_POOL_SECTION_CLAMP" )[0] == '0'))
+                    p_end = p_lim;
+                if (p_end <= p_off) continue;
+                p_sz = p_end - p_off;
                 if (mprotect(rx_dest + p_off, p_sz, PROT_READ | PROT_WRITE) != 0)
                     dprintf(2, "[child-ntdll] mprotect RW failed for section RVA 0x%x (errno=%d)\n",
                             rva, errno);
