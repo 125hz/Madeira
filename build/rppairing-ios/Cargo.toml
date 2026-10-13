@@ -15,6 +15,8 @@ idevice = { version = "=0.1.68", default-features = false, features = ["remote_p
 # asks idevice for two services nothing here calls.
 isideload = { version = "=0.4.4", default-features = false, features = ["install", "tokio-mt"] }
 base64 = "0.22"
+# What Apple answers a verification code with, and isideload's sign-in data.
+plist = "1"
 rootcause = "0.12"
 # isideload's HTTPS client is built without a crypto provider and takes the
 # process default, which apple_id.rs sets to ring, as idevice uses.

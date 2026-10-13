@@ -291,6 +291,12 @@ sign-in from the Apple ID that installed it (`app/Madeira/AppleSignIn.swift`):
   `build/rppairing-ios/src/apple_id.rs`): Apple's SRP exchange, in which the
   password does not leave the device, then the second factor when Apple asks
   for one (a code from a trusted device or by text).
+- Madeira tells Apple it is an Android phone. The anisette servers make their
+  data with Apple's library for Android, and since October 2026 Apple refuses a
+  sign-in from a client on any other system ("This action cannot be completed
+  at this time", error -80045). Signed in that way, Apple sends the code to the
+  trusted devices without being asked and does not say that it did, so Madeira
+  asks for that code itself. A text cannot be asked for on this path.
 - What Madeira keeps, in the Keychain, is what an installer hands over: the
   token, the team and the anisette identity, and the Apple ID's address to show
   in Settings. The password is not kept, so when Apple no longer accepts the

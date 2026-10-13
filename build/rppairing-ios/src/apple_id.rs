@@ -44,6 +44,20 @@ pub type MadeiraAppleTwoFactorCallback =
 /// How long Apple's address book and the anisette server get to answer.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(40);
 
+/// What every request after Apple's address book says the client is: an
+/// Android phone, where isideload 0.4.4 says a Mac.
+///
+/// The anisette servers make their data with Apple's library for Android, and
+/// since 2026-10-12 Apple refuses a sign-in whose client is not on the system
+/// that data was made on: "This action cannot be completed at this time",
+/// error -80045, whatever the account. The address book is still asked for as
+/// the Mac. Asked as an Android phone it lists a different server
+/// (gsd.apple.com), and this sign-in was only tried on the usual one.
+const CLIENT_INFO: &str = "<Pixel 7> <Android;14;UQ1A.240205.002> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
+
+/// Apple's code for a wrong verification code.
+const WRONG_CODE: i64 = -21669;
+
 struct TwoFactor {
     callback: MadeiraAppleTwoFactorCallback,
     context: *mut c_void,
@@ -212,6 +226,74 @@ fn result_json(
     .to_string()
 }
 
+/// Whether Apple still waits for a code it sent by itself.
+///
+/// An Android phone that gave the right password is told a second step is due
+/// (409) but not which, which is how isideload learns that there is one: the
+/// code is already on its way to the account's trusted devices, and isideload
+/// takes the sign-in for finished. The tokens only come with the sign-in after
+/// the code, so asking for the developer token now is refused (error -22411).
+fn awaits_pushed_code(spd: Option<&plist::Dictionary>) -> bool {
+    let Some(spd) = spd else { return false };
+    spd.get("status-code").and_then(|value| value.as_signed_integer()) == Some(409)
+        && spd.get("t").and_then(|value| value.as_dictionary()).is_none_or(|tokens| tokens.is_empty())
+}
+
+/// Apple's answer to a verification code.
+#[derive(Debug, PartialEq)]
+enum CodeAnswer {
+    Accepted,
+    /// Not the code: Apple's words, to ask again with.
+    Wrong(String),
+}
+
+/// Reads Apple's reply to a verification code. Anything but "accepted" and
+/// "wrong code" ends the sign-in, with what Apple said.
+fn code_answer(reply: &[u8]) -> Result<CodeAnswer, String> {
+    let reply: plist::Dictionary =
+        plist::from_bytes(reply).map_err(|_| "Apple's answer to the verification code could not be read".to_string())?;
+    let status = reply.get("Status").and_then(|value| value.as_dictionary()).unwrap_or(&reply);
+    let message = status.get("em").and_then(|value| value.as_string()).unwrap_or("no reason given");
+    match status.get("ec").and_then(|value| value.as_signed_integer()).unwrap_or(0) {
+        0 => Ok(CodeAnswer::Accepted),
+        WRONG_CODE => Ok(CodeAnswer::Wrong(message.to_string())),
+        code => Err(format!("Apple said: {message} (error {code})")),
+    }
+}
+
+/// A second-factor request to the `url` entry of Apple's address book, in the
+/// name of the sign-in that waits for its code, as isideload sends its own:
+/// `validateCode` with a `code` hands it in, `trustedDeviceSecondaryAuth` has
+/// Apple send another. Returns Apple's reply.
+async fn second_factor_request(account: &mut AppleAccount, url: &str, code: Option<&str>) -> Result<String, SignInFailure> {
+    let client = account.grandslam_client.clone();
+    let anisette = account
+        .anisette_generator
+        .get_anisette_data(client.clone())
+        .await
+        .map_err(|e| SignInFailure::Anisette(describe(&e)))?;
+    let field = |key: &str| account.spd.as_ref().and_then(|spd| spd.get(key)).and_then(|value| value.as_string());
+    let (Some(adsid), Some(token)) = (field("adsid"), field("GsIdmsToken")) else {
+        return Err(SignInFailure::Other("Apple's answer named no account".to_string()));
+    };
+    let identity = BASE64_STANDARD.encode(format!("{adsid}:{token}"));
+
+    let other = |e: Report| SignInFailure::Other(describe(&e));
+    let mut request = client
+        .get(&client.get_url(url).map_err(other)?)
+        .map_err(other)?
+        .headers(anisette.get_header_map().map_err(other)?)
+        .header("X-Apple-Identity-Token", identity)
+        .header("X-Apple-I-MD-RINFO", anisette.routing_info.clone());
+    if let Some(code) = code {
+        request = request.header("security-code", code);
+    }
+    let unreachable = |e: &dyn std::fmt::Display| SignInFailure::Other(format!("Apple could not be reached ({e})"));
+    let response = request.send().await.map_err(|e| unreachable(&e))?;
+    let response = response.error_for_status().map_err(|e| SignInFailure::Other(format!("Apple refused the request ({e})")))?;
+    response.text().await.map_err(|e| unreachable(&e))
+}
+
 /// The anisette provider for `server`, holding `identity` (16 bytes and Apple's
 /// provisioning for them) when there is one to sign in as again, so that Apple
 /// sees the machine it already trusts. Without one, the first use provisions a
@@ -253,6 +335,12 @@ async fn sign_in(
         Ok(Err(e)) => return Err(SignInFailure::Other(format!("Apple could not be reached ({})", describe(&e)))),
         Err(_) => return Err(SignInFailure::Other("Apple did not answer in time".to_string())),
     };
+    // The address book came for the Mac isideload says it is. Nothing else holds
+    // the client yet, so every request from here on can say `CLIENT_INFO`.
+    match Arc::get_mut(&mut account.grandslam_client) {
+        Some(client) => client.client_info.client_info = CLIENT_INFO.to_string(),
+        None => return Err(SignInFailure::Other("the sign-in could not be set up".to_string())),
+    }
     let headers = account.anisette_generator.get_anisette_data(account.grandslam_client.clone());
     match tokio::time::timeout(SETUP_TIMEOUT, headers).await {
         Ok(Ok(_)) => {}
@@ -260,13 +348,55 @@ async fn sign_in(
         Err(_) => return Err(SignInFailure::Anisette("it did not answer in time".to_string())),
     }
 
-    let asked = account.login(password, move |params| std::future::ready(Ok::<_, Report>(two_factor.ask(&params)))).await;
-    if let Err(e) = asked {
-        return Err(if cancelled.load(Ordering::SeqCst) {
-            SignInFailure::Cancelled
-        } else {
-            SignInFailure::Other(describe(&e))
-        });
+    let two_factor = Arc::new(two_factor);
+    let refused = |e: Report| {
+        if cancelled.load(Ordering::SeqCst) { SignInFailure::Cancelled } else { SignInFailure::Other(describe(&e)) }
+    };
+    let asking = two_factor.clone();
+    account.login(password, move |params| std::future::ready(Ok::<_, Report>(asking.ask(&params)))).await.map_err(refused)?;
+
+    // The code Apple sent by itself (see `awaits_pushed_code`), which isideload
+    // never asks for. Needs proper testing with an account whose only second
+    // factor is a phone number: what Apple sends that one is not known, and a
+    // text cannot be asked for from here.
+    let mut last_error = None;
+    for _ in 0..10 {
+        if !awaits_pushed_code(account.spd.as_ref()) {
+            break;
+        }
+        let waiting = TwoFactorCallbackParams {
+            last_error: last_error.take(),
+            unknown: false,
+            sms: false,
+            numbers: Vec::new(),
+            selected_number_id: None,
+        };
+        match two_factor.ask(&waiting) {
+            TwoFactorCallbackResponse::SubmitCode(code) => {
+                let reply = second_factor_request(&mut account, "validateCode", Some(&code)).await?;
+                match code_answer(reply.as_bytes()).map_err(SignInFailure::Other)? {
+                    CodeAnswer::Accepted => {
+                        // The tokens come with the sign-in after the code.
+                        let asking = two_factor.clone();
+                        account
+                            .login(password, move |params| std::future::ready(Ok::<_, Report>(asking.ask(&params))))
+                            .await
+                            .map_err(refused)?;
+                    }
+                    CodeAnswer::Wrong(message) => last_error = Some(message),
+                }
+            }
+            TwoFactorCallbackResponse::SendToDevices | TwoFactorCallbackResponse::ResendCode => {
+                second_factor_request(&mut account, "trustedDeviceSecondaryAuth", None).await?;
+            }
+            TwoFactorCallbackResponse::SendSms(_) => {
+                last_error = Some("A text message cannot be sent for this sign-in.".to_string());
+            }
+            TwoFactorCallbackResponse::Abort => return Err(SignInFailure::Cancelled),
+        }
+    }
+    if awaits_pushed_code(account.spd.as_ref()) {
+        return Err(SignInFailure::Other("Apple kept asking for a verification code".to_string()));
     }
 
     let token = account.get_app_token("xcode.auth").await.map_err(|e| SignInFailure::Other(describe(&e)))?;
@@ -488,6 +618,53 @@ mod tests {
         for (identifier, provisioning) in [(&[9u8; 15][..], &b"provisioning"[..]), (&[9u8; 16][..], &b""[..])] {
             assert!(provider("https://anisette.example", Some((identifier, provisioning))).unwrap().state.is_none());
         }
+    }
+
+    #[test]
+    fn a_code_apple_sent_by_itself_is_still_waited_for() {
+        let answer = |status: i64, tokens: Option<usize>| {
+            let mut spd = plist::Dictionary::new();
+            spd.insert("adsid".to_string(), "000123-08-abc".into());
+            spd.insert("status-code".to_string(), status.into());
+            if let Some(count) = tokens {
+                let mut held = plist::Dictionary::new();
+                for index in 0..count {
+                    held.insert(format!("com.apple.gs.token{index}"), plist::Value::Dictionary(plist::Dictionary::new()));
+                }
+                spd.insert("t".to_string(), plist::Value::Dictionary(held));
+            }
+            spd
+        };
+        // What Apple answered an Android phone on 2026-10-13, before and after the code.
+        assert!(awaits_pushed_code(Some(&answer(409, None))));
+        assert!(awaits_pushed_code(Some(&answer(409, Some(0)))));
+        assert!(!awaits_pushed_code(Some(&answer(200, Some(2)))));
+        // A second step that left tokens behind is isideload's to judge.
+        assert!(!awaits_pushed_code(Some(&answer(409, Some(1)))));
+        assert!(!awaits_pushed_code(Some(&answer(200, None))));
+        assert!(!awaits_pushed_code(None));
+    }
+
+    #[test]
+    fn the_reply_to_a_code_is_accepted_wrong_or_a_refusal() {
+        let reply = |code: i64, message: &str| {
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>ec</key><integer>{code}</integer><key>em</key><string>{message}</string></dict></plist>"#
+            )
+        };
+        assert_eq!(code_answer(reply(0, "").as_bytes()), Ok(CodeAnswer::Accepted));
+        assert_eq!(
+            code_answer(reply(-21669, "Incorrect verification code.").as_bytes()),
+            Ok(CodeAnswer::Wrong("Incorrect verification code.".to_string()))
+        );
+        assert_eq!(
+            code_answer(reply(-20209, "This Apple Account has been locked.").as_bytes()),
+            Err("Apple said: This Apple Account has been locked. (error -20209)".to_string())
+        );
+        // The same, inside the Status that GrandSlam's own replies carry it in.
+        let nested = br#"<plist version="1.0"><dict><key>Status</key><dict><key>ec</key><integer>-21669</integer><key>em</key><string>No.</string></dict></dict></plist>"#;
+        assert_eq!(code_answer(nested), Ok(CodeAnswer::Wrong("No.".to_string())));
+        assert!(code_answer(b"<html>").is_err());
     }
 
     #[test]
