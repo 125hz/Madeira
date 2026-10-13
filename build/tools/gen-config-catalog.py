@@ -107,6 +107,13 @@ OVERLAY = {
     "env.VKD3D_CONFIG": {"category": "Direct3D 12", "title": "vkd3d-proton options",
                "note": "Comma-separated vkd3d-proton flags (e.g. no_upload_hvv, force_static_cbv, skip_driver_workarounds); "
                        "with d3d12 = vkd3d. See vkd3d-proton's README."},
+    # opengl32 32-bit thunks (patches/wine-opengl-winios.patch, applied to the wine tree at
+    # build time, so the scanner never sees it): ml1340 query-buffer offsets.
+    "env.MADEIRA_GL_QUERY_BUFFER_OFFSETS": {"category": "Graphics", "title": "32-bit GL query results as buffer offsets",
+               "kind": "bool", "default": "1",
+               "note": "On (default): a 32-bit program's glGetQueryObject*v result pointer is an offset into the bound "
+                       "GL_QUERY_BUFFER (wined3d reads occlusion results that way; converting it as a pointer left "
+                       "the game spinning at 1 fps, ml1340). 0: the old pointer conversion."},
     # Read by DXMT's DXGI (dxmt/src/dxgi/dxgi_swapchain_vk.cpp, ml1320).
     "env.MADEIRA_DXGI_VK_SWAPCHAIN": {"category": "Direct3D 12", "title": "DXGI swapchains for vkd3d-proton",
                "kind": "bool", "default": "1",
