@@ -253,10 +253,10 @@ index c8f6c5f22f2..a224072b924 100755
 +    }
 +}
 diff --git a/dlls/opengl32/unix_private.h b/dlls/opengl32/unix_private.h
-index 1eb571e1733..94385279c8c 100644
+index 1eb571e1733..3aa5aa28778 100644
 --- a/dlls/opengl32/unix_private.h
 +++ b/dlls/opengl32/unix_private.h
-@@ -75,19 +75,60 @@ static inline GLsync get_unix_sync( GLsync sync )
+@@ -75,19 +75,66 @@ static inline GLsync get_unix_sync( GLsync sync )
  
  #ifdef _WIN64
  
@@ -275,6 +275,7 @@ index 1eb571e1733..94385279c8c 100644
      return tmp;
  }
  
+-static inline TEB *get_teb64( ULONG teb32 )
 +/* A pointer parameter that is an offset into the buffer bound at `binding` when
 + * there is one, and a pointer to guest memory otherwise. Guest memory never lies
 + * in the first 64 KB, so smaller values are offsets (or NULL) without asking. */
@@ -306,15 +307,21 @@ index 1eb571e1733..94385279c8c 100644
 +
 +#ifdef WINE_IOS
 +/* Madeira: 32-bit GL/WGL calls through these thunks, read by the winios GL
-+ * driver's perf line (build/win32u-unix/opengl_ios.c). Weak: 0 when absent. */
++ * driver's perf line (build/win32u-unix/opengl_ios.c). Weak: 0 when absent.
++ * ml1343: also counted per thunk (by its __func__) for the driver's stall
++ * report, which lists the entry points a stalled 32-bit caller keeps calling. */
 +extern unsigned int madeira_gl_wow64_calls __attribute__((weak));
++extern void madeira_gl_count_call( const char *thunk ) __attribute__((weak));
 +#endif
 +
- static inline TEB *get_teb64( ULONG teb32 )
++#define get_teb64( teb32 ) get_teb64_from( (teb32), __func__ )
++
++static inline TEB *get_teb64_from( ULONG teb32, const char *caller )
  {
 -    TEB32 *teb32_ptr = ULongToPtr( teb32 );
 +#ifdef WINE_IOS
 +    if (&madeira_gl_wow64_calls) __atomic_fetch_add( &madeira_gl_wow64_calls, 1, __ATOMIC_RELAXED );
++    if (madeira_gl_count_call) madeira_gl_count_call( caller );
 +#endif
 +    TEB32 *teb32_ptr = ios_wow_host_ptr( teb32 );
      return (TEB *)((char *)teb32_ptr + teb32_ptr->WowTebOffset);

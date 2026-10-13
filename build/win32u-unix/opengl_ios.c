@@ -38,6 +38,10 @@
 #endif
 
 #include <dlfcn.h>
+#include <stdio.h>
+#include <string.h>
+#include <strings.h>
+#include "../madeira_cfg.h"   /* before Wine's headers, which poison strncpy */
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -653,6 +657,103 @@ static uint64_t perf_last_present, perf_finish_start;
 static unsigned int perf_wow64_at_present;
 static HWND perf_last_hwnd;
 
+/* ml1343: 32-bit GL calls per opengl32 wow64 thunk since the last present.
+ * opengl32's get_teb64() passes the thunk's __func__ (a string literal, so
+ * its address identifies the thunk); the slots are an open-addressed table
+ * keyed by that address. A present bumps the epoch, which zeroes a slot the
+ * next time it is counted. The stall report lists the top entries. */
+#define GL_CALL_SLOTS 4096
+struct gl_call_slot
+{
+    const char  *name;
+    unsigned int epoch;
+    unsigned int count;
+};
+static struct gl_call_slot gl_call_slots[GL_CALL_SLOTS];
+static unsigned int gl_call_epoch = 1;
+
+void madeira_gl_count_call( const char *thunk )   /* weak in opengl32's unix_private.h */
+{
+    unsigned int h, epoch, i;
+
+    if (gl_perf <= 0 || !thunk) return;
+    h = (unsigned int)(((uint64_t)(uintptr_t)thunk * 0x9e3779b97f4a7c15ull) >> 52);
+    epoch = __atomic_load_n( &gl_call_epoch, __ATOMIC_RELAXED );
+    for (i = 0; i < 32; i++)
+    {
+        struct gl_call_slot *s = &gl_call_slots[(h + i) & (GL_CALL_SLOTS - 1)];
+        const char *cur = __atomic_load_n( &s->name, __ATOMIC_ACQUIRE );
+
+        if (!cur)
+        {
+            const char *expected = NULL;
+            if (__atomic_compare_exchange_n( &s->name, &expected, thunk, FALSE, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ))
+                cur = thunk;
+            else
+                cur = expected;
+        }
+        if (cur != thunk) continue;
+        if (__atomic_load_n( &s->epoch, __ATOMIC_RELAXED ) != epoch)
+        {
+            __atomic_store_n( &s->epoch, epoch, __ATOMIC_RELAXED );
+            __atomic_store_n( &s->count, 0, __ATOMIC_RELAXED );
+        }
+        __atomic_fetch_add( &s->count, 1, __ATOMIC_RELAXED );
+        return;
+    }
+}
+
+/* "wow64_ext_glFoo" -> "glFoo", "wow64_wgl_wglFoo" -> "wglFoo" */
+static const char *gl_call_short_name( const char *name )
+{
+    const char *p = strstr( name, "_wgl" );
+    if (!p) p = strstr( name, "_gl" );
+    return p ? p + 1 : name;
+}
+
+/* Writes the ml1343 line: the top 12 thunks since the last present, and the
+ * calls that wait for or read back the GPU. */
+static void gl_call_report(void)
+{
+    static const struct { const char *label, *match; } waits[] =
+    {
+        { "finish", "_glFinish" }, { "flush", "_glFlush" }, { "fence", "_glFenceSync" },
+        { "client-wait", "_glClientWaitSync" }, { "wait-sync", "_glWaitSync" }, { "get-sync", "_glGetSynciv" },
+        { "get-query", "_glGetQueryObject" }, { "map", "_glMapBuffer" }, { "map-named", "_glMapNamedBuffer" },
+        { "read-pixels", "_glReadPixels" }, { "get-teximage", "_glGetTexImage" },
+    };
+    unsigned int epoch = __atomic_load_n( &gl_call_epoch, __ATOMIC_RELAXED );
+    unsigned int top_count[12] = {0}, wait_count[ARRAY_SIZE(waits)] = {0}, i, j, k, distinct = 0;
+    const char *top_name[12] = {0};
+    char line[4096];
+    int len;
+
+    for (i = 0; i < GL_CALL_SLOTS; i++)
+    {
+        const char *name = __atomic_load_n( &gl_call_slots[i].name, __ATOMIC_ACQUIRE );
+        unsigned int count = __atomic_load_n( &gl_call_slots[i].count, __ATOMIC_RELAXED );
+
+        if (!name || !count || __atomic_load_n( &gl_call_slots[i].epoch, __ATOMIC_RELAXED ) != epoch) continue;
+        distinct++;
+        for (k = 0; k < ARRAY_SIZE(waits); k++)
+            if (strstr( name, waits[k].match )) wait_count[k] += count;
+        for (j = 0; j < 12 && top_count[j] >= count; j++) ;
+        if (j == 12) continue;
+        memmove( top_count + j + 1, top_count + j, (11 - j) * sizeof(*top_count) );
+        memmove( top_name + j + 1, top_name + j, (11 - j) * sizeof(*top_name) );
+        top_count[j] = count;
+        top_name[j] = name;
+    }
+    len = snprintf( line, sizeof(line), "[winios-gl] ml1343 32-bit GL calls since the last present (%u entry points):",
+                    distinct );
+    for (j = 0; j < 12 && top_name[j] && len < (int)sizeof(line) - 128; j++)
+        len += snprintf( line + len, sizeof(line) - len, " %s %u", gl_call_short_name( top_name[j] ), top_count[j] );
+    len += snprintf( line + len, sizeof(line) - len, " | waits:" );
+    for (k = 0; k < ARRAY_SIZE(waits) && len < (int)sizeof(line) - 32; k++)
+        len += snprintf( line + len, sizeof(line) - len, " %s %u", waits[k].label, wait_count[k] );
+    fprintf( stderr, "%s\n", line );
+}
+
 static void *stall_watch( void *arg )
 {
     uint64_t stall_ref = 0;
@@ -690,6 +791,7 @@ static void *stall_watch( void *arg )
             fprintf( stderr, "[winios-gl] ml1341 no GL present for %.0f s (hwnd %p): 32-bit GL calls since the last "
                      "present %u (%u in the last %.0f s)\n", idle, perf_last_hwnd, since_present,
                      wow64 - interval_mark, idle - last_report );
+        gl_call_report();
         fflush( stderr );
         interval_mark = wow64;
         last_report = idle;
@@ -718,6 +820,7 @@ static void stall_presented( HWND hwnd )
     if (gl_perf <= 0) return;
     now = mach_absolute_time();
     prev = __atomic_exchange_n( &perf_last_present, now, __ATOMIC_RELAXED );
+    __atomic_fetch_add( &gl_call_epoch, 1, __ATOMIC_RELAXED );   /* ml1343 counts restart */
     perf_last_hwnd = hwnd;
     __atomic_store_n( &perf_wow64_at_present, __atomic_load_n( &madeira_gl_wow64_calls, __ATOMIC_RELAXED ),
                       __ATOMIC_RELAXED );
@@ -1114,7 +1217,36 @@ static BOOL zink_init(void)
         ERR( "[winios-gl] zink: MADEIRA_GL_DIR is not set\n" );
         return FALSE;
     }
-    snprintf( path, sizeof(path), "%s/libMoltenVK.dylib", dir );
+    /* ml1344: the Vulkan driver under Zink. madeira.cfg `gl-vulkan = moltenvk |
+     * kosmickrisp | <name or path>.dylib`, else env MADEIRA_GL_VULKAN; default
+     * MoltenVK. KosmicKrisp (gl/libvulkan_kosmickrisp.dylib) exports
+     * vkGetInstanceProcAddr itself (Mesa patch kosmickrisp-ios-0003), so Zink
+     * can dlopen it like MoltenVK; Zink's Apple-only
+     * VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR is ignored by Mesa's
+     * Vulkan runtime, and VK_KHR_portability_enumeration is not requested (the
+     * extension list is generated on the Linux build host). */
+    {
+        char want[1024] = "";
+        const char *env;
+
+        if ((!madeira_cfg_get( "gl-vulkan", want, sizeof(want) ) || !want[0]) &&
+            (env = getenv( "MADEIRA_GL_VULKAN" )) && *env)   /* Vulkan driver for Zink when madeira.cfg gl-vulkan is unset: moltenvk (default), kosmickrisp, or a .dylib name/path */
+            snprintf( want, sizeof(want), "%s", env );
+        if (!want[0] || !strcasecmp( want, "moltenvk" ))
+            snprintf( path, sizeof(path), "%s/libMoltenVK.dylib", dir );
+        else if (!strcasecmp( want, "kosmickrisp" ))
+            snprintf( path, sizeof(path), "%s/libvulkan_kosmickrisp.dylib", dir );
+        else if (want[0] == '/')
+            snprintf( path, sizeof(path), "%s", want );
+        else
+            snprintf( path, sizeof(path), "%s/%s", dir, want );
+        if (access( path, R_OK ))
+        {
+            ERR( "[winios-gl] ml1344 zink Vulkan library %s not found (gl-vulkan = %s), using MoltenVK\n", path, want );
+            snprintf( path, sizeof(path), "%s/libMoltenVK.dylib", dir );
+        }
+        ERR( "[winios-gl] ml1344 zink Vulkan library: %s\n", strrchr( path, '/' ) ? strrchr( path, '/' ) + 1 : path );
+    }
     setenv( "ZINK_VULKAN_LIBRARY", path, 1 );
     setenv( "GALLIUM_DRIVER", "zink", 1 );
     setenv( "MVK_CONFIG_LOG_LEVEL", "1", 0 );   /* MoltenVK: errors only */
