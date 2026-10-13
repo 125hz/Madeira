@@ -266,6 +266,41 @@ on, and `[launch] ml1351 launch #1 … => same layout as a normal child` for ser
 steam.exe. Still open: the core-burning retry loop on an unrecoverable NOEXEC fault
 (generic fault path), and log 84's steam.exe read fault.
 
+## ml1352: 32-bit Steam client launched into a plain desktop session (log 84)
+
+Log 84 (explorer desktop, no game, no Dock): the launched 32-bit steam.exe loads its imports,
+then reads unmapped memory at guest 0x24F50AEE from 0x7BB9FF61, first inside window
+callbacks (`dispatch_user_callback ignoring exception c0000005`, many times) and then
+fatally after `SetCurrentProcessExplicitAppUserModelID`. Symbolised against the unstripped
+i386 build (`wine/build-i386/dlls/gdi32/i386-windows/gdi32.dll`, .text identical to the
+shipped one; image base 0x10000000, loaded at 0x7BB80000): `get_gdi_client_ptr` →
+`handle_entry` (objects.c:92/121), the read of `gdi_shared->Handles[idx].Type`. The table
+address was the session's HOST table 0x70_24f50000 truncated to 32 bits (index 116 → +0xae0).
+
+Cause: win32u backs the GDI handle table with a section (so each 32-bit process can map a
+view inside its guest window) only when the session is armed for 32-bit code when win32u
+starts. Dock sessions force it (`ContentView.swift`, `MADEIRA_GDI_SHARED_SECTION=1`), which is
+why the Dock path never hit this; a plain desktop session starts 64-bit, keeps a private table,
+and a 32-bit program started later (by the launcher, or by any 64-bit program) inherits the
+cloned host pointer in its PEB. Not a Valve-specific path: any 32-bit GDI user does this.
+
+Fix (`wine/dlls/win32u/gdiobj.c`, `win32u_private.h`): the section-backed table is the default
+in every session (`[gdi-shared] ml1352 section-backed table by default (session armed … : 0|1)`);
+`env.MADEIRA_GDI_SECTION_ALWAYS = 0` restores "only when armed"; `env.MADEIRA_GDI_SHARED_SECTION`
+still forces either way. A 32-bit process that still meets a private table logs once
+`[gdi-shared] ml1352 peb=… pid=…: 32-bit process, but this session's GDI table … is private host
+memory …`. Expected next log: `[gdi-shared] peb=… pid=… wow=1 master=… guest-view=…` for steam.exe.
+
+## ml1353: a dead process no longer heats the device
+
+`signal_arm64_ios.c` bus_handler: an EXECUTE fault inside the JIT pool on a page whose max
+protection has no EXECUTE can never succeed; when the dispatcher itself lives on such pages
+(the process's own ntdll copy) delivery faults again forever. After 32 consecutive faults of one
+thread at one pc there, the thread runs `abort_process(c0000005)` (this pseudo-process only):
+`[pool] ml1353 giving up: pid … tid … pc=… (pool+0x…) faulted 32 times in a row on a page whose max
+protection has no EXECUTE (prot=3/3); ending this process …`. `env.MADEIRA_POOL_NOEXEC_GIVEUP = 0`
+keeps the endless retry.
+
 ## Files
 
 `build/ntdll-unix/process_ios.c` (queue, parsing, `msl_create_process`),
