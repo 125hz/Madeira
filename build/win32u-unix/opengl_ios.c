@@ -566,12 +566,15 @@ static unsigned int perf_presents, perf_wgl_calls, perf_make_current, perf_wow64
 static uint64_t perf_finish_ticks, perf_present_ticks, perf_window_start;
 static mach_timebase_info_data_t perf_timebase;
 
+static void stall_watch_start(void);
+
 static void perf_init(void)
 {
     const char *env = getenv( "MADEIRA_GL_PERF" );
     gl_perf = !(env && env[0] == '0');
     mach_timebase_info( &perf_timebase );
     ERR( "[winios-gl] ml1340 perf line %s (MADEIRA_GL_PERF)\n", gl_perf ? "on, once a second at most" : "off" );
+    if (gl_perf) stall_watch_start();
 }
 
 static inline void perf_count( unsigned int *counter )
@@ -626,6 +629,94 @@ static void perf_maybe_log( HWND hwnd )
          (wow64 - perf_wow64_mark) / secs, make_current / secs, perf_ms( finish ) / secs,
          perf_ms( present ) / secs, secs );
     perf_wow64_mark = wow64;
+}
+
+/* ---- stall reports (zink backend), ml1341 ------------------------------
+ *
+ * The perf line is written from the presenting thread, so it stops exactly
+ * when a game stops presenting. A watcher thread reports such stalls:
+ *   [winios-gl] ml1341 no GL present for N s (hwnd H): 32-bit GL calls since the last present A (B in the last C s)[; inside glFinish for D s]
+ * at 5, 10, 20, 40 ... s, and the presenting thread writes
+ *   [winios-gl] ml1341 presents resumed after N s
+ * When B stays 0 the 32-bit caller (wined3d's command stream thread) is stuck
+ * inside one GL call; when it grows, it is busy but not presenting. The
+ * watcher is a plain pthread, so it writes with fprintf, not Wine's ERR.
+ * Off with MADEIRA_GL_PERF=0. */
+
+static uint64_t perf_last_present, perf_finish_start;
+static unsigned int perf_wow64_at_present;
+static HWND perf_last_hwnd;
+
+static void *stall_watch( void *arg )
+{
+    uint64_t stall_ref = 0;
+    unsigned int interval_mark = 0;
+    double next = 5.0, last_report = 0.0;
+
+    for (;;)
+    {
+        uint64_t last, finish_start, now;
+        unsigned int wow64, since_present;
+        double idle;
+
+        sleep( 1 );
+        if (!(last = __atomic_load_n( &perf_last_present, __ATOMIC_RELAXED ))) continue;
+        now = mach_absolute_time();
+        wow64 = __atomic_load_n( &madeira_gl_wow64_calls, __ATOMIC_RELAXED );
+        if (last != stall_ref)
+        {
+            stall_ref = last;
+            next = 5.0;
+            last_report = 0.0;
+            interval_mark = wow64;
+            continue;
+        }
+        idle = perf_ms( now - last ) / 1000.0;
+        if (idle < next) continue;
+
+        since_present = wow64 - __atomic_load_n( &perf_wow64_at_present, __ATOMIC_RELAXED );
+        finish_start = __atomic_load_n( &perf_finish_start, __ATOMIC_RELAXED );
+        if (finish_start && finish_start < now)
+            fprintf( stderr, "[winios-gl] ml1341 no GL present for %.0f s (hwnd %p): 32-bit GL calls since the last "
+                     "present %u (%u in the last %.0f s); inside glFinish for %.1f s\n", idle, perf_last_hwnd,
+                     since_present, wow64 - interval_mark, idle - last_report, perf_ms( now - finish_start ) / 1000.0 );
+        else
+            fprintf( stderr, "[winios-gl] ml1341 no GL present for %.0f s (hwnd %p): 32-bit GL calls since the last "
+                     "present %u (%u in the last %.0f s)\n", idle, perf_last_hwnd, since_present,
+                     wow64 - interval_mark, idle - last_report );
+        fflush( stderr );
+        interval_mark = wow64;
+        last_report = idle;
+        next *= 2;
+    }
+    return NULL;
+}
+
+static void stall_watch_start(void)
+{
+    pthread_attr_t attr;
+    pthread_t thread;
+
+    pthread_attr_init( &attr );
+    pthread_attr_setdetachstate( &attr, PTHREAD_CREATE_DETACHED );
+    if (pthread_create( &thread, &attr, stall_watch, NULL ))
+        ERR( "[winios-gl] ml1341 stall watcher did not start\n" );
+    pthread_attr_destroy( &attr );
+}
+
+/* After a present: note it, and say so when it ends a stall the watcher reported. */
+static void stall_presented( HWND hwnd )
+{
+    uint64_t now, prev;
+
+    if (gl_perf <= 0) return;
+    now = mach_absolute_time();
+    prev = __atomic_exchange_n( &perf_last_present, now, __ATOMIC_RELAXED );
+    perf_last_hwnd = hwnd;
+    __atomic_store_n( &perf_wow64_at_present, __atomic_load_n( &madeira_gl_wow64_calls, __ATOMIC_RELAXED ),
+                      __ATOMIC_RELAXED );
+    if (prev && perf_ms( now - prev ) >= 5000.0)
+        ERR( "[winios-gl] ml1341 presents resumed after %.1f s\n", perf_ms( now - prev ) / 1000.0 );
 }
 
 static void *osmesa_handle;
@@ -770,13 +861,16 @@ static BOOL zink_present( struct zink_surface *surface )
     if (!context || zink_current != surface) return FALSE;
     madeira_gl_wait_active();   /* no GPU work while the app is in the background */
     start = perf_now();
+    if (start) __atomic_store_n( &perf_finish_start, start, __ATOMIC_RELAXED );
     pz_glFinish();   /* OSMesa copies the frame into the locked IOSurface */
+    if (start) __atomic_store_n( &perf_finish_start, 0, __ATOMIC_RELAXED );
     perf_add_ticks( &perf_finish_ticks, start );
     start = perf_now();
     if (!(next = madeira_zink_target_present( &surface->target, drawable_hwnd( &surface->base ), &row )))
         return FALSE;
     ret = zink_attach( surface, context, next, row );
     perf_add_ticks( &perf_present_ticks, start );
+    stall_presented( drawable_hwnd( &surface->base ) );
     perf_count( &perf_presents );
     perf_maybe_log( drawable_hwnd( &surface->base ) );
     return ret;
@@ -884,6 +978,33 @@ static BOOL zink_init(void)
     setenv( "ZINK_VULKAN_LIBRARY", path, 1 );
     setenv( "GALLIUM_DRIVER", "zink", 1 );
     setenv( "MVK_CONFIG_LOG_LEVEL", "1", 0 );   /* MoltenVK: errors only */
+    /* ml1341: Zink on MoltenVK compiles each new pipeline synchronously (no
+     * graphics pipeline libraries), and every GL thread that needs that
+     * pipeline -- and, through Mesa's threaded-context syncs, any texture upload
+     * -- waits for it. MoltenVK waits for a Metal compile forever by default, so
+     * one compile the Metal compiler never finishes freezes the game for good.
+     * Bound the wait: after MADEIRA_GL_COMPILE_TIMEOUT seconds (default 20) the
+     * shader fails, MoltenVK logs "Timeout after ... Likely internal Metal
+     * compiler error", keeps the failed library cached so it is not retried,
+     * and Zink skips the draws that need it (patch 0004). 0 keeps MoltenVK's
+     * default; an explicit env.MVK_CONFIG_METAL_COMPILE_TIMEOUT (ns) wins. */
+    {
+        const char *env = getenv( "MADEIRA_GL_COMPILE_TIMEOUT" );
+        long secs = env && *env ? strtol( env, NULL, 10 ) : 20;
+        char ns[32];
+
+        if (getenv( "MVK_CONFIG_METAL_COMPILE_TIMEOUT" ))
+            ERR( "[winios-gl] ml1341 Metal compile timeout from MVK_CONFIG_METAL_COMPILE_TIMEOUT=%s ns\n",
+                 getenv( "MVK_CONFIG_METAL_COMPILE_TIMEOUT" ) );
+        else if (secs > 0)
+        {
+            snprintf( ns, sizeof(ns), "%lld", (long long)secs * 1000000000LL );
+            setenv( "MVK_CONFIG_METAL_COMPILE_TIMEOUT", ns, 1 );
+            ERR( "[winios-gl] ml1341 Metal compile timeout %ld s (MADEIRA_GL_COMPILE_TIMEOUT=0: MoltenVK's default, no limit)\n",
+                 secs );
+        }
+        else ERR( "[winios-gl] ml1341 Metal compile timeout off (MADEIRA_GL_COMPILE_TIMEOUT=0)\n" );
+    }
     /* Metal has no geometry shaders, so Zink on MoltenVK honestly reports at
      * most OpenGL 3.1 -- 3.2 core requires them -- and every 3.3 core request
      * fails. Advertise 4.1 (what macOS ships, what GL games target on Apple)
