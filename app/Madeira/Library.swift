@@ -4,6 +4,7 @@ import UIKit
 import Darwin
 import ImageIO
 import Combine
+import Metal
 
 // ============================================================================
 // Library front end.
@@ -2588,6 +2589,10 @@ struct LibraryView: View {
             if settingsShow("pointer", "mouse", "cursor", "touch", "trackpad", "sensitivity") {
                 Section("Pointer") { LibraryPointerSettings() }
             }
+            if GraphicsSettings.shown, settingsShow("graphics", "Direct3D", "D3D9", "D3D12", "DXMT", "wined3d", "vkd3d",
+                                                    "Vulkan", "MoltenVK", "KosmicKrisp", "windowed", "window", "taskbar") {
+                GraphicsSettings(refresh: settingsRefresh)
+            }
             if MadeiraConfig.flag("MADEIRA_RUNTIME_SETTINGS") {
                 if settingsShow("display", "refresh", "rate", "ProMotion", "120 Hz") { DisplayRateSettings() }
                 if settingsShow("memory", "JIT pool", "pool", "video memory", "VRAM", "swap", "coverage", "madsync", "sync", "eco", "all settings") {
@@ -3757,9 +3762,10 @@ struct RuntimeMemorySyncSettings: View {
     var open: (SettingsSheet) -> Void = { _ in }
     /// Bumped when a Settings sheet closes, so the rows re-read madeira.cfg.
     var refresh = 0
-    /// The keys this section owns; All settings leaves them out.
-    static let featuredKeys: Set<String> = ["pool", "vram-mb", "swap-mb", "env.MADEIRA_SWAP_COVERAGE", "inproc-sync",
-                                            "env.MADEIRA_FASTSYNC", "eco"]
+    /// The keys this section and Settings › Graphics own; All settings and the Settings
+    /// search leave them out.
+    static let featuredKeys: Set<String> = Set(["pool", "vram-mb", "swap-mb", "env.MADEIRA_SWAP_COVERAGE", "inproc-sync",
+                                                "env.MADEIRA_FASTSYNC", "eco"]).union(GraphicsSettings.featuredKeys)
     // ml1241: 256 (the launch's lower bound) for the pool, 512 and 1024 for video memory
     // (winemetal accepts vram-mb >= 256), at the user's request.
     static let poolChoices = [0, 256, 512, 640, 768, 1024, 1152]          // 0 = the standard 896 MB
@@ -3875,6 +3881,161 @@ struct LibraryPointerSettings: View {
         LabeledContent("Touch sensitivity") {
             Slider(value: input.relative ? $input.sensRel : $input.sensAbs, in: 0.1...8)
         }
+    }
+}
+
+/// Settings › Graphics: the Direct3D 9 and Direct3D 12 routes, the Vulkan driver and
+/// windowed mode as plain controls for madeira.cfg d3d9, d3d12, vulkan and windowed
+/// (read at each session start by ContentView.swift, WineProcessBridge.m and
+/// Winios/WiniosWindowed.m; docs/BUILDING.md 6b and 6c, docs/WINDOWED.md). Default
+/// removes the key. The rows show the global file only: a game's own config lines
+/// still win for that game. While the section is shown All settings leaves these
+/// keys out (RuntimeMemorySyncSettings.featuredKeys); MADEIRA_GRAPHICS_SETTINGS=0
+/// hides the section and puts them back in All settings.
+struct GraphicsSettings: View {
+    static let shown = MadeiraConfig.flag("MADEIRA_GRAPHICS_SETTINGS")   // 0: no Settings › Graphics section; d3d9, d3d12, vulkan and windowed are back in All settings
+    static let keys: Set<String> = ["d3d9", "d3d12", "vulkan", "windowed"]
+    // Names held in constants, so the code that acts on them (WineProcessBridge.m,
+    // WiniosWindowed.m) stays their catalog entry (build/tools/gen-config-catalog.py).
+    static let windowedKey = "windowed", windowedEnvKey = "env.MADEIRA_WINDOWED", glBackendKey = "gl-backend"
+    static var windowedOn: Bool { MadeiraConfig.bool(windowedKey, default: false) }
+    /// The keys All settings and the Settings search leave to this section.
+    static var featuredKeys: Set<String> { shown ? keys : [] }
+    /// Bumped when a Settings sheet closes, so the rows re-read madeira.cfg.
+    var refresh = 0
+
+    static let d3d9Choices: [(String, String)] = [
+        ("", "DXMT (default)"), ("native", "DXMT native frontend (32-bit)"), ("wined3d", "Wine wined3d on OpenGL (Zink)"),
+    ]
+    static let d3d12Choices: [(String, String)] = [("", "madeira-d3d12 (default)"), ("vkd3d", "vkd3d-proton on Vulkan")]
+    static let vulkanChoices: [(String, String)] = [("", "Automatic"), ("moltenvk", "MoltenVK"), ("kosmickrisp", "KosmicKrisp")]
+
+    static func bundled(_ path: String) -> Bool {
+        FileManager.default.fileExists(atPath: Bundle.main.bundleURL.appendingPathComponent(path).path)
+    }
+    /// gl/libvulkan_kosmickrisp.dylib (docs/KOSMICKRISP.md); without it vulkan = kosmickrisp keeps Vulkan off.
+    static let hasKosmicKrisp = bundled("gl/libvulkan_kosmickrisp.dylib")
+    /// vkd3d-proton's DLLs are git-ignored build products (build/vkd3d-proton/build.sh).
+    static let hasVkd3d = bundled("vulkan/arm64ec-windows/d3d12.dll") && bundled("vulkan/arm64ec-windows/d3d12core.dll")
+    /// The Zink OpenGL backend's library; without it the default backend is OpenGL ES, where wined3d finds no context.
+    static let hasZink = bundled("gl/libOSMesa.dylib")
+    /// KosmicKrisp takes the first Metal 4 device: iOS 26 with an A14 or newer.
+    static let metal4: Bool = {
+        if #available(iOS 26.0, *) { return MTLCreateSystemDefaultDevice()?.supportsFamily(.metal4) ?? false }
+        return false
+    }()
+
+    /// The stored value, trimmed and lowercased, "" when unset; d3d9 "emulated" is the default.
+    static func current(_ key: String) -> String {
+        let v = (MadeiraConfig.get(key) ?? "").trimmingCharacters(in: .whitespaces).lowercased()
+        return key == "d3d9" && v == "emulated" ? "" : v
+    }
+    static var anySet: Bool { keys.contains { MadeiraConfig.get($0) != nil } }
+
+    @State private var d3d9 = Self.current("d3d9")
+    @State private var d3d12 = Self.current("d3d12")
+    @State private var vulkan = Self.current("vulkan")
+    @State private var windowed = Self.windowedOn
+    @State private var anySet = Self.anySet
+
+    private func reload() {
+        d3d9 = Self.current("d3d9"); d3d12 = Self.current("d3d12"); vulkan = Self.current("vulkan")
+        windowed = Self.windowedOn; anySet = Self.anySet
+    }
+
+    private func write(_ key: String, _ value: String?) {
+        MadeiraConfig.set(key, value)
+        anySet = Self.anySet
+        LogStore.shared.log("[graphics-settings] \(key)=\(value ?? "(default)")")
+    }
+
+    /// A menu picker over `choices`; a stored value that is not one of them stays selectable as itself.
+    private func choicePicker(_ title: String, key: String, value: Binding<String>, choices: [(String, String)],
+                              other: (String) -> String = { "Other (\($0))" }) -> some View {
+        Picker(title, selection: Binding(get: { value.wrappedValue }, set: { choice in
+            value.wrappedValue = choice
+            write(key, choice.isEmpty ? nil : choice)
+        })) {
+            ForEach(choices, id: \.0) { Text($0.1).tag($0.0) }
+            if !choices.contains(where: { $0.0 == value.wrappedValue }) { Text(other(value.wrappedValue)).tag(value.wrappedValue) }
+        }
+    }
+
+    private func note(_ text: String, warning: Bool = false) -> some View {
+        Text(text).font(.caption).foregroundStyle(warning ? Color.orange : Color.secondary)
+    }
+
+    private var d3d9Note: String {
+        switch d3d9 {
+        case "": return "DXMT draws Direct3D 9 on Metal; 32-bit games run its frontend through the x86 translator."
+        case "native": return "32-bit games run DXMT's Direct3D 9 frontend as native ARM64 code; 64-bit games are unchanged."
+        case "wined3d": return "Experimental: 32- and 64-bit games use Wine's own Direct3D 9 on OpenGL, which needs the Zink OpenGL backend."
+        default: return "A value Madeira does not know; Direct3D 9 games use DXMT."
+        }
+    }
+    private var d3d12Note: String {
+        switch d3d12 {
+        case "": return "Direct3D 12 games run on madeira-d3d12, Madeira's own Direct3D 12 on Metal."
+        case "vkd3d": return "Experimental, 64-bit games only: Direct3D 12 runs through vkd3d-proton on Vulkan (MoltenVK unless a Vulkan driver is chosen below)."
+        default: return "A developer value; Direct3D 12 games run on madeira-d3d12."
+        }
+    }
+    private var vulkanNote: String {
+        switch vulkan {
+        case "": return "Off, so games find no Vulkan, unless Direct3D 12 uses vkd3d-proton, which turns on MoltenVK."
+        case "moltenvk": return "64-bit games get Vulkan through MoltenVK, the driver the Zink OpenGL backend also uses."
+        case "kosmickrisp": return "Experimental: 64-bit games get Vulkan through Mesa's KosmicKrisp driver. Needs iOS 26 and an A14 chip or newer."
+        case "off", "0": return "Off: games find no Vulkan, and vkd3d-proton is not used even when it is chosen above."
+        default: return "A Vulkan library named by path in madeira.cfg."
+        }
+    }
+
+    var body: some View {
+        Section {
+            choicePicker("Direct3D 9", key: "d3d9", value: $d3d9, choices: Self.d3d9Choices)
+            note(d3d9Note)
+            if d3d9 == "wined3d" {
+                let backend = (MadeiraConfig.get(Self.glBackendKey) ?? "").lowercased()
+                if !Self.hasZink || (!backend.isEmpty && backend != "zink") {
+                    note(Self.hasZink ? "madeira.cfg sets gl-backend = \(backend); wined3d needs gl-backend = zink."
+                                      : "This build has no Zink OpenGL backend (gl/ folder), so wined3d cannot start.", warning: true)
+                }
+            }
+
+            choicePicker("Direct3D 12", key: "d3d12", value: $d3d12,
+                         choices: Self.hasVkd3d || d3d12 == "vkd3d" ? Self.d3d12Choices : Array(Self.d3d12Choices.prefix(1)))
+            note(d3d12Note)
+            if !Self.hasVkd3d { note("vkd3d-proton is not in this build.", warning: d3d12 == "vkd3d") }
+
+            choicePicker("Vulkan driver", key: "vulkan", value: $vulkan,
+                         choices: Self.hasKosmicKrisp || vulkan == "kosmickrisp" ? Self.vulkanChoices : Array(Self.vulkanChoices.prefix(2)),
+                         other: { $0 == "off" || $0 == "0" ? "Off" : "Custom library" })
+            note(vulkanNote)
+            if !Self.hasKosmicKrisp {
+                note("KosmicKrisp is not in this build (no gl/libvulkan_kosmickrisp.dylib).", warning: vulkan == "kosmickrisp")
+            } else if !Self.metal4 {
+                note("This device has no Metal 4 GPU, so KosmicKrisp cannot start on it.", warning: vulkan == "kosmickrisp")
+            }
+
+            Toggle("Windowed mode", isOn: Binding(get: { windowed }, set: { on in
+                windowed = on
+                write(Self.windowedKey, on ? "1" : nil)
+            }))
+            note("Show every window in its own frame with a taskbar (desktop and Steam sessions).")
+            if let env = MadeiraConfig.get(Self.windowedEnvKey) {
+                note("madeira.cfg also sets env.MADEIRA_WINDOWED = \(env), which wins over this switch.", warning: true)
+            }
+
+            Button("Reset to defaults") {
+                for key in Self.keys.sorted() { MadeiraConfig.set(key, nil) }
+                LogStore.shared.log("[graphics-settings] reset: d3d9, d3d12, vulkan and windowed removed")
+                reload()
+            }
+            .disabled(!anySet)
+        } header: { Text("Graphics") } footer: {
+            Text("These write d3d9 / d3d12 / vulkan / windowed into madeira.cfg; changes apply at the next session start. Per-game overrides go in the game's custom config lines (Advanced › This game's config).")
+        }
+        .onChange(of: refresh) { _, _ in reload() }
     }
 }
 

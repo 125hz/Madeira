@@ -10,7 +10,8 @@ below runs and desktop sessions look exactly as before.
 
 ## Turning it on
 
-In `Documents/madeira.cfg` (or a game's own config lines):
+**Settings › Graphics › Windowed mode** writes it; by hand, in
+`Documents/madeira.cfg` (or a game's own config lines):
 
     windowed = 1
 
