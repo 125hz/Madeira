@@ -436,7 +436,16 @@ struct ios_child_args {
     int argc;
     struct pe_image_info pe_info;
     int slot;   /* ios_child_slots index, -1 = none */
+    unsigned int launch_id;   /* ml1351: in-session launcher request, 0 = ordinary spawn */
 };
+
+/* ml1351: the in-session launcher (msl_create_process, below) marks the thread
+ * that is inside NtCreateUserProcess for one of its requests, so spawn_process
+ * can tag that child and the child can report its start-up state
+ * (madeira_session_launch_child_started). Only one launch runs at a time. */
+static pthread_t msl_spawn_thread;
+static unsigned int msl_spawn_id;   /* nonzero only while a launch is being created */
+_Thread_local unsigned int ios_child_launch_id;
 
 /* Pseudo-process children that are still running. A launcher stub that
  * starts the game and exits at once (GTA V Enhanced: PlayGTAV.exe starts
@@ -550,6 +559,7 @@ static void *ios_child_thread_entry( void *arg )
      * 32-bit furniture, and wow64.dll faults on the PEB32 nobody built. */
     ios_child_main_machine = (args->pe_info.image_flags & IMAGE_FLAGS_ComPlusNativeReady)
                              ? native_machine : args->pe_info.machine;
+    ios_child_launch_id = args->launch_id;   /* ml1351 */
 
     /* Use dprintf for early logging — ERR requires TEB which isn't set up yet */
     dprintf(STDERR_FILENO, "[Wine child thread] ENTRY: fd=%d, argc=%d, exe=%s\n",
@@ -639,6 +649,10 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     args->argc = argc;
     args->pe_info = *pe_info;
     args->slot = ios_child_slot_take( &params->ImagePathName );
+    {
+        unsigned int lid = __atomic_load_n( &msl_spawn_id, __ATOMIC_ACQUIRE );
+        args->launch_id = (lid && pthread_equal( msl_spawn_thread, pthread_self() )) ? lid : 0;
+    }
 
     if (winedebug) putenv( winedebug );
 
@@ -4033,9 +4047,27 @@ static void msl_set_string( UNICODE_STRING *str, const WCHAR *text )
 
 /* What CreateProcessW( NULL, cmdline, NULL, NULL, FALSE, 0, NULL, curdir,
  * &zeroed_si, &pi ) does on the calling thread (kernelbase/process.c
- * create_process_params + create_nt_process + the resume). */
+ * create_process_params + create_nt_process + the resume).
+ *
+ * ml1351 audit (device logs 81-84): the parameters match what
+ * create_process_params/RtlCreateProcessParametersEx build field for field
+ * (ConsoleFlags, ProcessGroupId, ConsoleHandle with the CONSOLE_HANDLE_ALLOC
+ * fallback, the parent's std handles with INVALID_HANDLE_VALUE -> NULL, the
+ * environment block, title = image path). The block may live on this stack:
+ * NtCreateUserProcess serialises it into the server request
+ * (create_startup_info) and the child reads its copy from the server, never
+ * the parent's memory -- the same pattern run_wineboot uses. From
+ * NtCreateUserProcess on, a launched child takes exactly the path of a
+ * normal one (new_process, new_thread, spawn_process, wine_ios_child_main).
+ * The children that crash-looped in logs 81-83 were an aarch64 services.exe
+ * and an i386 steam.exe, for which EcCodeBitMap = NULL is correct (only an
+ * x64 image under an aarch64 session gets the EC bitmap); they died because
+ * their ntdll copies landed in a JIT-pool tail that an earlier image copy had
+ * made permanently non-executable (virtual_ios.c [pool-guard]/[pool-quarantine]
+ * ml1351). Log 84, without that earlier image, shows a launched steam.exe
+ * booting through its whole import list. */
 static NTSTATUS msl_create_process( const WCHAR *image, const WCHAR *cmdline, const WCHAR *curdir,
-                                    DWORD *pid )
+                                    unsigned int launch_id, DWORD *pid )
 {
     static const WCHAR empty[] = {0};
     static WCHAR empty_env[2];
@@ -4100,9 +4132,13 @@ static NTSTATUS msl_create_process( const WCHAR *image, const WCHAR *cmdline, co
     memset( &create_info, 0, sizeof(create_info) );
     create_info.Size = sizeof(create_info);
 
+    /* ml1351: tag the child spawn_process creates on this thread (see msl_spawn_id) */
+    msl_spawn_thread = pthread_self();
+    __atomic_store_n( &msl_spawn_id, launch_id, __ATOMIC_RELEASE );
     status = NtCreateUserProcess( &process, &thread, PROCESS_ALL_ACCESS, THREAD_ALL_ACCESS,
                                   &process_attr, &thread_attr, 0, THREAD_CREATE_FLAGS_CREATE_SUSPENDED,
                                   &params, &create_info, attr );
+    __atomic_store_n( &msl_spawn_id, 0, __ATOMIC_RELEASE );
     if (!status)
     {
         NtResumeThread( thread, NULL );
@@ -4111,6 +4147,66 @@ static NTSTATUS msl_create_process( const WCHAR *image, const WCHAR *cmdline, co
     if (thread) NtClose( thread );
     if (process) NtClose( process );
     return status;
+}
+
+/* ml1351: server_init_process_done (server_ios.c), on a child's first thread just
+ * before it starts: one line with what a launched child got, so a device log
+ * proves it is set up like a normal child. The first 8 ordinary children of a
+ * session print the same line ("spawned") as the comparison.
+ *   peb       TEB->Peb, registered as this process's identity ([proc-ident])
+ *   ec-bitmap PEB->EcCodeBitMap: set exactly when the main image is x64 (an
+ *             ARM64EC process); NULL is correct for aarch64 and i386 children
+ *   start     LdrInitializeThunk of this process's ntdll and its JIT-pool copy,
+ *             whose page must keep EXECUTE in its max protection */
+#include "ios_mixed.h"
+void madeira_session_launch_child_started( void )
+{
+    extern void *pLdrInitializeThunk;
+    extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
+    extern const SECTION_IMAGE_INFORMATION *ios_image_info_for_peb( void *peb_id );
+    extern void *ios_jit_translate_addr( void *addr );
+    extern int ios_addr_max_prot( const void *addr, int *prot );
+    static int normal_reports;
+    unsigned int id = ios_child_launch_id;
+    TEB *teb = NtCurrentTeb();
+    const struct ios_ntdll_funcs *f;
+    PEB *cpeb;
+    void *start, *jit, *ecbm;
+    USHORT machine;
+    int expect_ec, prot = -1, maxp, peb_ok, ec_ok, exec_ok;
+    char who[24];
+
+    if (!teb || !ios_child_main_machine) return;   /* the session's first process: no spawner */
+    if (!id && __atomic_fetch_add( &normal_reports, 1, __ATOMIC_RELAXED ) >= 8) return;
+
+    cpeb = teb->Peb;
+    f = ios_cur_ntdll_funcs();
+    start = f ? f->LdrInitializeThunk : pLdrInitializeThunk;
+    jit = start ? ios_jit_translate_addr( start ) : NULL;
+    machine = ios_cur_image_info()->Machine;
+    ecbm = cpeb ? cpeb->EcCodeBitMap : NULL;
+    expect_ec = machine == IMAGE_FILE_MACHINE_AMD64;
+    maxp = jit ? ios_addr_max_prot( jit, &prot ) : -1;
+    /* registered in the per-process identity table (loader_ios.c [proc-ident]), as
+     * wine_ios_child_main registers every pseudo-process; an unregistered PEB
+     * falls back to the session's main image info */
+    peb_ok = cpeb && ios_image_info_for_peb( cpeb ) != ios_image_info_for_peb( NULL );
+    ec_ok = (ecbm != NULL) == expect_ec;
+    exec_ok = maxp >= 0 && (maxp & 4 /* VM_PROT_EXECUTE */);
+
+    if (id) snprintf( who, sizeof(who), "launch #%u", id );
+    else snprintf( who, sizeof(who), "spawned" );
+    dprintf( 2, "[launch] ml1351 %s first thread pid %04x tid %04x: peb=%p (%s) machine=%04x "
+             "EcCodeBitMap=%p (%s for this machine) start=%p -> %p prot=%x/%x (%s) => %s\n",
+             who, (int)HandleToULong( teb->ClientId.UniqueProcess ),
+             (int)HandleToULong( teb->ClientId.UniqueThread ), cpeb,
+             peb_ok ? "registered" : "NOT REGISTERED", machine, ecbm,
+             ec_ok ? (expect_ec ? "set, as expected" : "none, as expected")
+                   : (expect_ec ? "MISSING" : "UNEXPECTED"),
+             start, jit, prot < 0 ? 0 : prot, maxp < 0 ? 0 : maxp,
+             maxp < 0 ? "no mapping" : exec_ok ? "executable" : "NOT EXECUTABLE",
+             (peb_ok && ec_ok && exec_ok) ? "same layout as a normal child"
+                                          : "DIFFERS from a normal child" );
 }
 
 static const char *msl_status_text( NTSTATUS status )
@@ -4169,13 +4265,13 @@ static void msl_run_one( struct msl_request *req, int desktop_thread )
         else
         {
             DWORD spid = 0;
-            NTSTATUS sst = msl_create_process( services, services_cmd, system32, &spid );
+            NTSTATUS sst = msl_create_process( services, services_cmd, system32, req->id, &spid );
             dprintf( 2, "[launch] ml1350 #%u: services.exe first (%s): status %08x pid %04x\n", req->id,
                      running < 0 ? "the process list could not be read" : "none ran", (unsigned)sst, (int)spid );
         }
     }
 
-    status = msl_create_process( req->image, req->cmdline, req->curdir, &pid );
+    status = msl_create_process( req->image, req->cmdline, req->curdir, req->id, &pid );
     if (!status)
         snprintf( detail, sizeof(detail), "pid %04x, parent %s", (int)pid, parent );
     else if ((text = msl_status_text( status )))

@@ -4547,6 +4547,12 @@ void server_init_process_done(void)
         extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
         ERR("signal_start_thread: teb=%p peb=%p TransferAddress=%p suspend=%d\n",
             NtCurrentTeb(), peb, ios_cur_image_info()->TransferAddress, suspend);
+        {
+            /* ml1351: a child started by the in-session launcher (and the first few
+             * ordinary children, for comparison) reports its PEB/EC/start-code state */
+            extern void madeira_session_launch_child_started( void );
+            madeira_session_launch_child_started();
+        }
 
         /* Watchdog: suspend thread and sample registers at 2s and 4s */
         {

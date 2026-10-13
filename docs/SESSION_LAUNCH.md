@@ -194,6 +194,78 @@ Not verified (needs a device run, docs/WINDOWED.md round 5):
 - SteamSetup.exe (a 32-bit installer) started in a running session that already has
   64-bit processes (the WoW64 guest window path applies as for any 32-bit child).
 
+## ml1351: launched children that crash-looped (device logs 81-83)
+
+Written 2026-10-13, uncommitted, ntdll compiled in WSL, not device-tested.
+
+Logs 81, 82 and 83 (a Dock session with a 32-bit game running, then the taskbar's Steam
+tile) show the launcher working as designed: `services.exe first (none ran): status
+00000000` and `steam.exe … -> ok (pid …, parent explorer.exe)`. Both children then fault at
+their first instruction forever (`BUS EXEC in JIT .data`, `[exc-disp] raise … p0=8
+(EXECUTE)`, `kr=2(PROTECTION_FAILURE) entryprot=3 nowprot=3`), one thread at a full core.
+
+**The launcher was not the cause.** A diff of the launched path against a guest
+`CreateProcessW`:
+- `msl_create_process`'s `RTL_USER_PROCESS_PARAMETERS` match kernelbase's
+  `create_process_params` + `RtlCreateProcessParametersEx` field for field (ConsoleFlags,
+  ProcessGroupId, ConsoleHandle with the `CONSOLE_HANDLE_ALLOC` fallback, std handles with
+  `INVALID_HANDLE_VALUE` → NULL, environment, title). A stack block is fine:
+  `NtCreateUserProcess` serialises it into the server request (`create_startup_info`); the
+  child reads its own copy from the server and never touches the parent's memory (Wine's
+  own `run_wineboot` does the same from the unix side). No guest-memory block is needed.
+- From `NtCreateUserProcess` on the path is the normal one: `new_process`, `new_thread`,
+  `spawn_process`, `wine_ios_child_main` (PEB cloned from the initial one, `[proc-ident]`,
+  `[init-peb]`, child ntdll copy). The child PEBs in the app heap (0x11175c000) are normal:
+  dockhost's is 0x1054c8000.
+- `EcCodeBitMap = 0x0` is correct for these children. services.exe is aarch64 (`Machine=0xaa64`,
+  "NOT setting cpu_area") and steam.exe is i386 (WoW64); only an x64 image in an aarch64
+  session loads the ARM64EC ntdll and gets the bitmap (`[ec-child-ntdll]`, as dockhost does).
+- The real fault: both children's ntdll copies landed on JIT-pool pages whose max
+  protection had already lost EXECUTE: `[pool-poison] HANDED OUT NON-EXEC off=0xa854000 …
+  prot=3 max=3`, `[copy-verify] ntdll.dll: 29 of 29 .text pages BORN NON-EXEC`. The pool tail
+  from offset 0xa848000 had been unusable since the game's 32-bit DRM loader image
+  (`[jit-pool] image 0x7903ff0000+0x54000 (?)`, a manually mapped DLL) was copied: its
+  writable section runs past the bytes copied, and the RW `mprotect` of that section reached
+  the next pool pages, which on blessed pool memory removes EXECUTE for good. Every log in
+  70-83 that has `[pool-poison]` has its first poisoned hand-out at exactly 0xa848000. Any process
+  started after that point would die the same way, whoever starts it; the launcher was just
+  the first to start one.
+- Log 84 (no game first): the launched steam.exe boots through its whole import list
+  (kernel32 … mswsock, 30+ modules) with executable pool copies, then dies on a guest read
+  of uncommitted memory (`0x7924f50aee`, guest `0x24f50aee`, "NO wine view"; guest eip
+  0x7BB9FF61 in gdi32's range) — a separate WoW64 issue, not a set-up difference.
+
+**Fix (virtual_ios.c, port of the pre-reset ml1970 guard):**
+- `[pool-guard] ml1351`: the image copy's and the child-ntdll copy's writable-section
+  `mprotect` never reaches past the copy's own pages. `env.MADEIRA_POOL_SECTION_CLAMP = 0`
+  restores the unclamped range.
+- `[pool-quarantine] ml1351`: a pool range handed out non-executable is left allocated and
+  the next one taken (16 tries / 64 MB per session at most). `env.MADEIRA_POOL_QUARANTINE = 0`
+  restores report-only.
+
+No explorer.exe/PE-side change: the unix-side `NtCreateUserProcess` is equivalent to the
+guest `CreateProcessW`, so the custom-message path through explorer's desktop window would
+start the same children on the same poisoned pool.
+
+**New log line** (process_ios.c `madeira_session_launch_child_started`, called from
+`server_init_process_done` on the child's first thread just before it starts; launched
+children always, the first 8 ordinary children of a session as the comparison):
+
+    [launch] ml1351 launch #N first thread pid PPPP tid TTTT: peb=0x… (registered) machine=aa64 EcCodeBitMap=0x0 (none, as expected for this machine) start=0x71ffd5837c -> 0x15… prot=5/7 (executable) => same layout as a normal child
+    [launch] ml1351 spawned first thread pid … (same fields, an ordinary child)
+
+`registered` = the PEB is in the per-process identity table ([proc-ident]); EcCodeBitMap is
+expected exactly when the machine is 8664; `start` is the process's LdrInitializeThunk and
+its JIT-pool copy, whose page must keep EXECUTE in its max protection. Anything else prints
+`NOT REGISTERED` / `MISSING` / `UNEXPECTED` / `NOT EXECUTABLE` and `DIFFERS from a normal
+child`.
+
+Not verified: no device run. The next log should show `[pool-guard] ml1351 … runs past the
+0x…-byte pool copy` when the game's DRM image loads, no `[pool-poison]` from 0xa848000
+on, and `[launch] ml1351 launch #1 … => same layout as a normal child` for services.exe and
+steam.exe. Still open: the core-burning retry loop on an unrecoverable NOEXEC fault
+(generic fault path), and log 84's steam.exe read fault.
+
 ## Files
 
 `build/ntdll-unix/process_ios.c` (queue, parsing, `msl_create_process`),
