@@ -114,6 +114,13 @@ OVERLAY = {
                "note": "On (default): a 32-bit program's glGetQueryObject*v result pointer is an offset into the bound "
                        "GL_QUERY_BUFFER (wined3d reads occlusion results that way; converting it as a pointer left "
                        "the game spinning at 1 fps, ml1340). 0: the old pointer conversion."},
+    # build/win32u-unix/opengl_ios.c (ml1344): ZINK_VULKAN_LIBRARY for the desktop OpenGL backend.
+    "gl-vulkan": {"category": "Graphics", "title": "Vulkan driver for OpenGL (Zink)", "kind": "choice",
+               "note": "The Vulkan driver Zink runs desktop OpenGL (and d3d9 = wined3d) on: MoltenVK (default) or "
+                       "KosmicKrisp (gl/libvulkan_kosmickrisp.dylib); any other value is a .dylib name in the gl "
+                       "folder or an absolute path. env.MADEIRA_GL_VULKAN is the fallback. Read when a program "
+                       "first creates an OpenGL context; the log says \"ml1344 zink Vulkan library: ...\".",
+               "choices": [("", "MoltenVK (default)"), ("moltenvk", "MoltenVK"), ("kosmickrisp", "KosmicKrisp")]},
     # Read by DXMT's DXGI (dxmt/src/dxgi/dxgi_swapchain_vk.cpp, ml1320).
     "env.MADEIRA_DXGI_VK_SWAPCHAIN": {"category": "Direct3D 12", "title": "DXGI swapchains for vkd3d-proton",
                "kind": "bool", "default": "1",
