@@ -337,6 +337,34 @@ FEX, with the game also running, is the old heavy path: pool 496 MB was ~55% use
 conhost (pid 0474, started by the helper's AllocConsole) crashed on a NULL read in its own ntdll
 start-up (`[peb+0x18]` = 0), not investigated.
 
+## ml1356/ml1357: helpers of the full client (log 95)
+
+- **ml1356, no start on the shared ntdll.** The web helper's AllocConsole started conhost (aarch64)
+  while the pool was exhausted: `[child-ntdll] JIT pool exhausted`, `[Wine child] ntdll copy FAILED —
+  falling back to SHARED ntdll`, then a NULL read of `[peb+0x18]` (PEB.Ldr) in that shared copy. The
+  PEB itself was fine (`[launch] ml1351 … registered`); the shared copy's loader state belongs to
+  another process. `loader_ios.c` now ends such a start with `NtTerminateProcess(STATUS_NO_MEMORY)`
+  (the parent's CreateProcess fails; AllocConsole fails cleanly): `[launch] ml1356 pid … (image): no
+  JIT-pool room for this process's own ntdll copy; ending its start with STATUS_NO_MEMORY …`.
+  `env.MADEIRA_CHILD_NTDLL_STRICT = 0` runs it on the shared copy as before. dockhost's conhost at
+  session start had its own copy and no such problem.
+- **ml1357, the process gate.** `[proc-gate]` in `process_ios.c` NtCreateUserProcess is a DENY list
+  of optional helpers (steamerrorreporter, gldriverquery, vulkandriverquery, steamsysinfo,
+  hardwareupdater, a crash handler), not a slot limit. Each was refused because, before ml937, a
+  helper's crash or self-terminate took the whole app down; Valve's client tolerates every refusal.
+  When the PARENT is steam.exe (the full client, launched in-session or from a library entry) the
+  first four now start: `[proc-gate] ml1357 allowing … started by the full Steam client`.
+  `env.MADEIRA_PROC_GATE_STEAM = 0` refuses them as before. Dock sessions are unchanged (their
+  client lives in dockhost.exe). Still refused on purpose: hardwareupdater (pool churn) and the web
+  helper's `--type=` children (crashpad included): the helper runs `--single-process`, and a second
+  steamwebhelper process would load libcef again with its own PartitionAlloc pools, which the VA
+  layout has room for once. steamservice was never gated.
+- **Pool size.** Before the ml1354 sweep the 496 MB pool already had 203 MB of image copies at the
+  bottom and 224 MB reserved for FEX code at the top (86% claimed) with the game, the 32-bit client
+  and the web helper's x86 code all compiling into it; the sweep's 69 MB then filled it. Without the
+  sweep the session had ~69 MB left, so client + web helper + a running game is near the limit of
+  this pool even after ml1354; a larger (donor-backed) pool is the real fix.
+
 ## Files
 
 `build/ntdll-unix/process_ios.c` (queue, parsing, `msl_create_process`),
