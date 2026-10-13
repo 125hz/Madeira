@@ -386,13 +386,66 @@ int winios_drv_post_restore( HWND hwnd )
     return NtUserPostMessage( hwnd, WM_SYSCOMMAND, SC_RESTORE, 0 ) ? 1 : 0;
 }
 
+/* ml2181: keyboard focus for a window the user picked. Wine moves the focus
+ * into a top-level window only while it activates it (set_active_window with
+ * focus = TRUE); a window that is already its thread's active window keeps
+ * whatever focus the thread has, and that can be none: a click on it sends no
+ * WM_MOUSEACTIVATE (process_mouse_message activates only a window that is not
+ * active yet), and NtUserSetForegroundWindow on the foreground window does
+ * nothing at all. Keys still arrive then (the server hands them to the active
+ * window as WM_SYSKEYDOWN), but a program that tests GetFocus() against its
+ * window before it reads polled input (a game viewport typically does, every
+ * frame) drops the controller. Called on the window's own thread after a
+ * click (message_ios.c), a tap or restore activation
+ * (winios_drv_foreground_if_owner) and the XInput foreground check: when the
+ * top-level window of `hwnd` is the thread's active window and the focus is
+ * nowhere inside it, focus the top-level window, which is what Windows'
+ * DefWindowProc does for WM_ACTIVATE. Focus already inside the window, menu
+ * and move/size modes, and minimized or disabled windows are left alone.
+ * MADEIRA_CLICK_FOCUS=0 turns this off. Returns 1 when the focus moved. */
+int winios_click_focus( HWND hwnd, const char *why )
+{
+    static int enabled = -1;
+    static LONG logged;
+    GUITHREADINFO info;
+    HWND root, focus;
+    DWORD style;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_CLICK_FOCUS" );  /* 0: a tap or click on an active window leaves its keyboard focus as it is */
+        enabled = !(e && e[0] == '0' && !e[1]);
+    }
+    if (!enabled || !hwnd) return 0;
+    if (!(root = NtUserGetAncestor( hwnd, GA_ROOT ))) return 0;
+    if (get_window_thread( root, NULL ) != GetCurrentThreadId()) return 0;
+    info.cbSize = sizeof(info);
+    if (!NtUserGetGUIThreadInfo( GetCurrentThreadId(), &info )) return 0;
+    if (info.hwndActive != root) return 0;
+    if (info.flags & (GUI_INMENUMODE | GUI_INMOVESIZE)) return 0;
+    if (info.hwndFocus && NtUserGetAncestor( info.hwndFocus, GA_ROOT ) == root) return 0;
+    style = get_window_long( root, GWL_STYLE );
+    if (style & (WS_MINIMIZE | WS_DISABLED)) return 0;
+
+    NtUserSetFocus( root );
+    focus = get_focus();
+    if (InterlockedIncrement( &logged ) <= 24)
+        dprintf( 2, "[winios] ml2181 focus \xe2\x86\x92 hwnd %p (%s) was %p now %p (MADEIRA_CLICK_FOCUS=0 leaves it)\n",
+                 root, why, info.hwndFocus, focus );
+    return focus == root;
+}
+
 /* A taskbar click also brings the window to the front. Only the window's own
  * thread does that, from its event pump (not inside SetWindowPos). Returns 0
- * on another thread, 1 when the window is now foreground, -1 on failure. */
+ * on another thread, 1 when the window is now foreground, -1 on failure.
+ * ml2181: the window also gets keyboard focus when it has none (a window
+ * already in front is not activated again, so nothing else would give it). */
 int winios_drv_foreground_if_owner( HWND hwnd )
 {
     if (!hwnd || get_window_thread( hwnd, NULL ) != GetCurrentThreadId()) return 0;
-    return NtUserSetForegroundWindow( hwnd ) ? 1 : -1;
+    if (!NtUserSetForegroundWindow( hwnd )) return -1;
+    winios_click_focus( hwnd, "activate" );
+    return 1;
 }
 
 /* ============================================================ *
@@ -2798,10 +2851,21 @@ static void ios_foreground_check(void)
     next_ns = now + 1000000000LL;
     pthread_mutex_unlock( &lock );
 
-    if ((fg = NtUserGetForegroundWindow()) && get_window_thread( fg, &fg_pid ) && fg_pid == pid) return;
+    /* ml2181: in front is not enough for a program that reads its pad only
+     * while GetFocus() is its window. When the polling thread owns the
+     * foreground window and nothing in it has the focus, focus it (once a
+     * second at most, like the rest of this check; winios_click_focus). */
+    if ((fg = NtUserGetForegroundWindow()) && get_window_thread( fg, &fg_pid ) && fg_pid == pid)
+    {
+        winios_click_focus( fg, "activate" );
+        return;
+    }
     if (!(main_hwnd = ios_main_window( pid ))) return;
 
     ok = set_foreground_window( main_hwnd, FALSE, TRUE );
+    /* A window that was already its thread's active window is not activated
+     * again, so set_foreground_window gave it no focus. */
+    if (ok) winios_click_focus( main_hwnd, "activate" );
     if (logged < 16)
     {
         logged++;
@@ -2881,7 +2945,16 @@ ULONG_PTR ios_gamepad_query( UINT index, UINT op, void *buffer )
         /* ml2180: evidence for "the pad is detected but nothing happens": the
          * first eight non-rest states the program reads per slot, and the
          * first rest state after one. Capped; nothing is logged for a slot
-         * that never moves. */
+         * that never moves.
+         * ml2181: plus the reading thread's GUI state, for "reads the pad but
+         * ignores it": the foreground window and its process, the thread's
+         * active, focus and capture windows (its own input, not the
+         * foreground one: Wine's GetGUIThreadInfo(0) means the foreground
+         * thread), whether the focus lies inside the foreground window, and
+         * the foreground thread's focus. Note that DirectInput's host
+         * joystick (MADEIRA_DINPUT_PAD) samples through this same op: a slot
+         * read here with no "[xinput] ml2114 first state query index=N" line
+         * for that index came from DirectInput, not XInputGetState. */
         {
             static unsigned int logged[4], was_live[4];
             int live = pad.buttons || pad.left_trigger || pad.right_trigger ||
@@ -2889,11 +2962,25 @@ ULONG_PTR ios_gamepad_query( UINT index, UINT op, void *buffer )
                        pad.rx > 8689 || pad.rx < -8689 || pad.ry > 8689 || pad.ry < -8689;
             if (live != (int)was_live[index] && logged[index] < 16)
             {
+                GUITHREADINFO gui, fg_gui;
+                HWND fg = NtUserGetForegroundWindow(), focus_root = 0;
+                DWORD fg_pid = 0;
+
+                memset( &gui, 0, sizeof(gui) );
+                memset( &fg_gui, 0, sizeof(fg_gui) );
+                gui.cbSize = fg_gui.cbSize = sizeof(gui);
+                NtUserGetGUIThreadInfo( GetCurrentThreadId(), &gui );
+                NtUserGetGUIThreadInfo( 0, &fg_gui );
+                if (fg) get_window_thread( fg, &fg_pid );
+                if (gui.hwndFocus) focus_root = NtUserGetAncestor( gui.hwndFocus, GA_ROOT );
                 logged[index]++;
-                ERR( "[xinput] ml2180 state read index=%u %s: packet=%u buttons=0x%04x lt=%u rt=%u lx=%d ly=%d rx=%d ry=%d (pid %04x)\n",
+                ERR( "[xinput] ml2180 state read index=%u %s: packet=%u buttons=0x%04x lt=%u rt=%u lx=%d ly=%d rx=%d ry=%d (pid %04x) "
+                     "ml2181 fg=%p(pid %04x) active=%p focus=%p capture=%p focus-in-fg=%d fg-focus=%p\n",
                      index, live ? "input" : "rest", (unsigned int)pad.packet, (unsigned int)pad.buttons,
                      (unsigned int)pad.left_trigger, (unsigned int)pad.right_trigger, (int)pad.lx, (int)pad.ly,
-                     (int)pad.rx, (int)pad.ry, (unsigned int)GetCurrentProcessId() );
+                     (int)pad.rx, (int)pad.ry, (unsigned int)GetCurrentProcessId(),
+                     fg, (unsigned int)fg_pid, gui.hwndActive, gui.hwndFocus, gui.hwndCapture,
+                     fg && focus_root == fg, fg_gui.hwndFocus );
             }
             was_live[index] = live;
         }
