@@ -38,7 +38,13 @@
 #endif
 
 #include <dlfcn.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <ftw.h>
 #include <pthread.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include <mach/mach_time.h>
 
 #include "ntstatus.h"
@@ -570,7 +576,7 @@ static void stall_watch_start(void);
 
 static void perf_init(void)
 {
-    const char *env = getenv( "MADEIRA_GL_PERF" );
+    const char *env = getenv( "MADEIRA_GL_PERF" );   /* 0: no GL perf line (presents/s, flush-ms ...) and no ml1341 stall reports */
     gl_perf = !(env && env[0] == '0');
     mach_timebase_info( &perf_timebase );
     ERR( "[winios-gl] ml1340 perf line %s (MADEIRA_GL_PERF)\n", gl_perf ? "on, once a second at most" : "off" );
@@ -955,6 +961,140 @@ static const struct opengl_driver_funcs zink_driver_funcs =
     .p_pbuffer_bind = ios_pbuffer_bind,
 };
 
+/* ---- shader disk cache (zink backend), ml1342 ---------------------------
+ *
+ * libOSMesa is built with Mesa's on-disk shader cache (build/mesa-ios/build.sh):
+ * GLSL->NIR results, Zink's SPIR-V and its VkPipelineCache data persist, so a
+ * second run converts far less (the Metal compile itself is then cached by
+ * Metal). Mesa looks in $XDG_CACHE_HOME or $HOME/.cache; HOME is the Wine
+ * prefix here, so point it at the app's Library/Caches instead, before the
+ * dylib loads:
+ *   <container>/Library/Caches/mesa-shader-cache/<libOSMesa LC_UUID>
+ * Zink's cache key has no driver build id on Apple (no dl_iterate_phdr), so
+ * entries written by an older libOSMesa would be reused by a newer one with
+ * different shader passes; one directory per build avoids that, and the
+ * directories of other builds are deleted. An existing MESA_SHADER_CACHE_DIR
+ * is used as it is. Size limit MESA_SHADER_CACHE_MAX_SIZE, 256M unless set. */
+
+static const char *shader_cache_prune_keep;
+static uint64_t shader_cache_bytes;
+
+static int shader_cache_sum( const char *path, const struct stat *st, int type, struct FTW *ftw )
+{
+    if (type == FTW_F) shader_cache_bytes += st->st_size;
+    return 0;
+}
+
+static int shader_cache_rm( const char *path, const struct stat *st, int type, struct FTW *ftw )
+{
+    if (type == FTW_DP) rmdir( path );
+    else unlink( path );
+    return 0;
+}
+
+/* The LC_UUID of a thin arm64 Mach-O, as 32 hex digits. */
+static BOOL macho_uuid( const char *path, char hex[33] )
+{
+    unsigned char buf[65536];
+    unsigned int ncmds, off = 32, i;
+    ssize_t len;
+    int fd;
+
+    if ((fd = open( path, O_RDONLY )) < 0) return FALSE;
+    len = read( fd, buf, sizeof(buf) );
+    close( fd );
+    if (len < 32 || *(unsigned int *)buf != 0xfeedfacf) return FALSE;   /* MH_MAGIC_64 */
+    ncmds = *(unsigned int *)(buf + 16);
+    for (i = 0; i < ncmds && off + 8 <= (size_t)len; i++)
+    {
+        unsigned int cmd = *(unsigned int *)(buf + off), size = *(unsigned int *)(buf + off + 4);
+        if (cmd == 0x1b && size >= 24 && off + 24 <= (size_t)len)   /* LC_UUID */
+        {
+            for (int b = 0; b < 16; b++) sprintf( hex + 2 * b, "%02x", buf[off + 8 + b] );
+            return TRUE;
+        }
+        if (size < 8) break;
+        off += size;
+    }
+    return FALSE;
+}
+
+static BOOL mkdir_p( char *path )
+{
+    for (char *p = path + 1; *p; p++)
+    {
+        if (*p != '/') continue;
+        *p = 0;
+        if (mkdir( path, 0755 ) && errno != EEXIST) { *p = '/'; return FALSE; }
+        *p = '/';
+    }
+    return !mkdir( path, 0755 ) || errno == EEXIST;
+}
+
+static void shader_cache_init( const char *osmesa_path )
+{
+    const char *off = getenv( "MADEIRA_GL_SHADER_CACHE" );   /* 0: no Mesa shader disk cache for desktop OpenGL (Zink); every run converts and compiles all shaders again */
+    const char *dir = getenv( "MESA_SHADER_CACHE_DIR" ), *docs;
+    char base[2048], path[2200], id[33] = "";
+    struct dirent *de;
+    DIR *d;
+
+    if (off && off[0] == '0')
+    {
+        setenv( "MESA_SHADER_CACHE_DISABLE", "true", 1 );
+        ERR( "[winios-gl] ml1342 shader cache off (MADEIRA_GL_SHADER_CACHE=0)\n" );
+        return;
+    }
+    setenv( "MESA_SHADER_CACHE_MAX_SIZE", "256M", 0 );
+
+    if (!dir || !*dir)
+    {
+        /* MADEIRA_DOCS_DIR is <container>/Documents (WineProcessBridge.m) */
+        if ((docs = getenv( "MADEIRA_DOCS_DIR" )) && *docs && strlen( docs ) < sizeof(base) - 64)
+        {
+            char *slash;
+            snprintf( base, sizeof(base), "%s", docs );
+            if ((slash = strrchr( base, '/' ))) *slash = 0;
+            strcat( base, "/Library/Caches/mesa-shader-cache" );
+        }
+        else if (confstr( _CS_DARWIN_USER_CACHE_DIR, base, sizeof(base) - 64 ))
+            strcat( base, "/mesa-shader-cache" );
+        else
+        {
+            ERR( "[winios-gl] ml1342 shader cache: no Caches directory, Mesa uses its default\n" );
+            return;
+        }
+        if (!macho_uuid( osmesa_path, id )) strcpy( id, "unknown-build" );
+        snprintf( path, sizeof(path), "%s/%s", base, id );
+        if (!mkdir_p( path ))
+        {
+            ERR( "[winios-gl] ml1342 shader cache: cannot create %s (errno %d), Mesa uses its default\n", path, errno );
+            return;
+        }
+        /* drop the caches of other libOSMesa builds */
+        if ((d = opendir( base )))
+        {
+            char old[2200];
+            while ((de = readdir( d )))
+            {
+                if (de->d_name[0] == '.' || !strcmp( de->d_name, id ) || strlen( de->d_name ) != 32 ||
+                    strspn( de->d_name, "0123456789abcdef" ) != 32)
+                    continue;
+                snprintf( old, sizeof(old), "%s/%s", base, de->d_name );
+                nftw( old, shader_cache_rm, 8, FTW_DEPTH | FTW_PHYS );
+                ERR( "[winios-gl] ml1342 shader cache: removed the cache of an older build (%s)\n", de->d_name );
+            }
+            closedir( d );
+        }
+        setenv( "MESA_SHADER_CACHE_DIR", path, 1 );
+        dir = getenv( "MESA_SHADER_CACHE_DIR" );
+    }
+    shader_cache_bytes = 0;
+    nftw( dir, shader_cache_sum, 8, FTW_PHYS );
+    ERR( "[winios-gl] ml1342 shader cache at %s (%llu MB used, limit %s; MADEIRA_GL_SHADER_CACHE=0 turns it off)\n",
+         dir, (unsigned long long)((shader_cache_bytes + (1 << 19)) >> 20), getenv( "MESA_SHADER_CACHE_MAX_SIZE" ) );
+}
+
 /* Load OSMesa and prove Zink actually runs: a throwaway core-profile context
  * must report the Zink renderer. Mesa quietly falls back to softpipe when
  * Zink cannot start (no MoltenVK, missing Vulkan features), and a software
@@ -989,7 +1129,7 @@ static BOOL zink_init(void)
      * and Zink skips the draws that need it (patch 0004). 0 keeps MoltenVK's
      * default; an explicit env.MVK_CONFIG_METAL_COMPILE_TIMEOUT (ns) wins. */
     {
-        const char *env = getenv( "MADEIRA_GL_COMPILE_TIMEOUT" );
+        const char *env = getenv( "MADEIRA_GL_COMPILE_TIMEOUT" );   /* seconds a Metal shader compile may take under Zink (default 20); then the shader fails and its draws are skipped. 0: no limit */
         long secs = env && *env ? strtol( env, NULL, 10 ) : 20;
         char ns[32];
 
@@ -1018,6 +1158,7 @@ static BOOL zink_init(void)
     setenv( "MESA_GLSL_VERSION_OVERRIDE", "410", 0 );
 
     snprintf( path, sizeof(path), "%s/libOSMesa.dylib", dir );
+    shader_cache_init( path );
     if (!(osmesa_handle = dlopen( path, RTLD_NOW | RTLD_LOCAL )))
     {
         ERR( "[winios-gl] zink: cannot load %s: %s\n", path, dlerror() );
