@@ -403,6 +403,11 @@ extern int winios_drv_foreground_if_owner(HWND hwnd);
 /* ml1300 helper (driver_ios.c; a weak fallback in WiniosWindowed.m returns
  * NULL with an older libwin32u_unix.a). Wine thread. */
 extern void *winios_drv_foreground_window(void);
+/* ml1350 in-session launcher (driver_ios.c; docs/SESSION_LAUNCH.md): starts a
+ * program the app queued (MadeiraSession in WindowedMode.swift) on the thread
+ * that owns the desktop window. Weak fallback for a libwin32u_unix.a built
+ * before ml1350 (the strong definition there wins): nothing is started. */
+__attribute__((weak)) int winios_drv_session_launch_pump(void) { return 0; }
 
 /* ml1301 desktop game fit (below, after the desktop fit): the foreground
  * window and its style, polled on a Wine thread from winios_pProcessEvents. */
@@ -778,6 +783,8 @@ BOOL winios_pProcessEvents(DWORD mask) {
             fflush(stderr);
         }
     }
+    /* ml1350: a program the app asked to start inside this session */
+    winios_drv_session_launch_pump();
     /* ml1300 windowed mode: title-bar commands, tap activation, window text */
     if (winios_windowed_active()) winios_windowed_pump_wine();
     else winios_game_fit_poll_wine();   /* ml1301: which window a desktop session fits to the screen */

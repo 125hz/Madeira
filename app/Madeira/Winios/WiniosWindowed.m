@@ -47,9 +47,10 @@
  * Steam on the taskbar (round 4). A pinned Steam button sits left of the
  * program buttons. With a Steam window open in the session it brings that
  * window to the front; otherwise WindowedMode.swift (MadeiraWindowedBridge
- * steamTapped) handles it: a running session cannot start another program
- * from the app, so it prepares Steam (or Valve's installer) as a library
- * entry for the next start and says so. env.MADEIRA_WINDOWED_STEAM = 0 hides it.
+ * steamTapped) handles it: ml1350 starts Steam (or Valve's installer) inside
+ * this session (MadeiraSession, docs/SESSION_LAUNCH.md); when that cannot
+ * run it prepares a library entry for the next start and says so.
+ * env.MADEIRA_WINDOWED_STEAM = 0 hides it.
  *
  * Log lines: "[windowed] ml1300 ..." for on/off, add, refit, remove, activate,
  * move, scale, minimize, restore, fullscreen, close, steam and the ignored presses. */
@@ -1050,8 +1051,8 @@ static BOOL ww_bridge_bool(NSString *sel)
 /* The pinned Steam button. A Steam window already open in this session comes
  * to the front (restored first when minimized). Otherwise the Swift side
  * decides: memory warning, then Steam (installed) or Valve's installer (not
- * installed) as a library entry for the next start; a running session cannot
- * start another program from the app. */
+ * installed), started inside this session (ml1350), or as a library entry for
+ * the next start when that cannot run. */
 - (void)steamPressed:(UIButton *)b forEvent:(UIEvent *)e {
     if (!ww_by_touch(e, "taskbar Steam button")) return;
     [_search resignFirstResponder];

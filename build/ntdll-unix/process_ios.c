@@ -3624,3 +3624,641 @@ NTSTATUS WINAPI NtDebugContinue( HANDLE handle, CLIENT_ID *client, NTSTATUS stat
     SERVER_END_REQ;
     return ret;
 }
+
+
+#ifdef WINE_IOS
+/***********************************************************************
+ *           ml1350 in-session launcher (docs/SESSION_LAUNCH.md)
+ *
+ * The app starts the first program of a session (WineProcessBridge.m,
+ * __wine_main); every later Windows process is a pseudo-process made by
+ * NtCreateUserProcess on a thread of an existing one (spawn_process above).
+ * Nothing in a running session used to accept a request from the app, so the
+ * windowed taskbar could not start Steam (or anything else) into the desktop
+ * the user is looking at.
+ *
+ * The app queues a request here from any thread (madeira_session_launch_request).
+ * A Wine thread picks it up in the display driver's event hook
+ * (driver_ios.c winios_drv_session_launch_pump, from Winios.m's
+ * winios_pProcessEvents) and starts the program with NtCreateUserProcess,
+ * exactly what kernelbase's CreateProcessW( NULL, cmdline, NULL, NULL, FALSE,
+ * 0, NULL, curdir, &si, &pi ) does: parameters built the way
+ * create_process_params builds them (the caller's environment, console and
+ * standard handles, window title = image path), the NT image name, a
+ * suspended first thread that is resumed once the child has booted. No PE
+ * code is involved, so nothing has to be injected into a guest process.
+ *
+ * The thread that owns the desktop window runs it: in a desktop session that
+ * is explorer's shell thread, so the new program is explorer's child, with its
+ * window station, desktop and environment, like a program started from the
+ * Windows shell. Desktop sessions wake every message wait each 16 ms
+ * (message_ios.c wait_message); other threads post WM_NULL to the desktop
+ * window to wake its owner. When no desktop-owning thread has taken the
+ * request after 2 s (a game session whose desktop window has no live owner),
+ * the next Wine thread that pumps messages runs it and the log names that
+ * parent. A request nobody took in 30 s is dropped with a reason. One start
+ * runs at a time; the caller blocks while the child boots, as CreateProcessW
+ * does.
+ *
+ * Only absolute paths of .exe programs (X:\...\name.exe, quoted or not) are
+ * accepted; a .bat/.msi or a bare name is refused with a reason (the app
+ * shows it). MADEIRA_SESSION_LAUNCH_SERVICES_FIRST starts
+ * C:\windows\system32\services.exe first when no services.exe runs in the
+ * session (the library's "Start Windows services first", for Steam).
+ *
+ * env.MADEIRA_SESSION_LAUNCH = 0 refuses every request (the app falls back to
+ * preparing a library entry for the next start). Log lines: "[launch] ml1350".
+ */
+#define MSL_MAX_REQUESTS   8
+#define MSL_MAX_CHARS      4096      /* a command line, UTF-16 units */
+#define MSL_ANY_THREAD_S   2.0       /* the desktop thread's head start */
+#define MSL_EXPIRE_S       30.0      /* not taken by then: dropped */
+#define MSL_WAKE_EVERY_S   0.25      /* WM_NULL to the desktop window, at most this often */
+#define MSL_FLAG_SERVICES_FIRST 1u
+
+/* state values handed to the callback */
+#define MSL_STATE_STARTING 1u        /* a thread took it; detail names the parent */
+#define MSL_STATE_DONE     2u        /* status = NTSTATUS (0 = started), pid when started */
+
+typedef void (*madeira_session_launch_cb)( unsigned int id, unsigned int state, unsigned int status,
+                                           unsigned int pid, const char *detail );
+
+struct msl_request
+{
+    unsigned int id;
+    unsigned int flags;
+    double       queued;
+    WCHAR        image[MAX_PATH + 1];
+    WCHAR        curdir[MAX_PATH + 2];
+    WCHAR        cmdline[MSL_MAX_CHARS + 4];
+};
+
+static pthread_mutex_t msl_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct msl_request *msl_queue[MSL_MAX_REQUESTS];
+static int msl_count;                /* atomic reads without the lock */
+static int msl_busy;                 /* one start at a time */
+static unsigned int msl_next_id;
+static double msl_last_wake;
+static madeira_session_launch_cb msl_callback;
+
+void madeira_session_launch_set_callback( madeira_session_launch_cb cb );
+unsigned int madeira_session_launch_request( const char *cmdline_utf8, const char *cwd_utf8,
+                                             unsigned int flags, char *reason, int reason_len );
+int madeira_session_launch_pending( void );
+int madeira_session_launch_wake_due( void );
+int madeira_session_launch_run( int desktop_thread );
+void madeira_session_launch_fail_all( const char *why );
+
+void madeira_session_launch_set_callback( madeira_session_launch_cb cb )
+{
+    __atomic_store_n( &msl_callback, cb, __ATOMIC_RELEASE );
+}
+
+static void msl_report( unsigned int id, unsigned int state, unsigned int status, unsigned int pid,
+                        const char *detail )
+{
+    madeira_session_launch_cb cb = __atomic_load_n( &msl_callback, __ATOMIC_ACQUIRE );
+    if (cb) cb( id, state, status, pid, detail ? detail : "" );
+}
+
+/* UTF-8 to UTF-16 (dst holds max units plus the terminator). Control
+ * characters, broken sequences and surrogate code points are refused: a
+ * command line never needs them. Returns the length or -1. */
+static int msl_utf8_to_wide( const char *src, WCHAR *dst, int max )
+{
+    const unsigned char *s = (const unsigned char *)src;
+    int n = 0;
+
+    while (*s)
+    {
+        unsigned int c = *s++, extra = 0;
+
+        if (c >= 0x80)
+        {
+            if ((c & 0xe0) == 0xc0) { c &= 0x1f; extra = 1; }
+            else if ((c & 0xf0) == 0xe0) { c &= 0x0f; extra = 2; }
+            else if ((c & 0xf8) == 0xf0) { c &= 0x07; extra = 3; }
+            else return -1;
+            while (extra--)
+            {
+                if ((*s & 0xc0) != 0x80) return -1;
+                c = (c << 6) | (*s++ & 0x3f);
+            }
+            if (c < 0x80 || (c >= 0xd800 && c < 0xe000) || c > 0x10ffff) return -1;
+        }
+        else if (c < 0x20 && c != '\t') return -1;
+        if (c >= 0x10000)
+        {
+            if (n + 2 > max) return -1;
+            c -= 0x10000;
+            dst[n++] = 0xd800 | (c >> 10);
+            dst[n++] = 0xdc00 | (c & 0x3ff);
+        }
+        else
+        {
+            if (n + 1 > max) return -1;
+            dst[n++] = c;
+        }
+    }
+    dst[n] = 0;
+    return n;
+}
+
+/* For log lines: printable ASCII, everything else '?'. */
+static void msl_wide_to_ascii( const WCHAR *src, int len, char *out, int size )
+{
+    int i, j = 0;
+
+    if (size <= 0) return;
+    for (i = 0; src && (len < 0 ? src[i] != 0 : i < len) && j + 1 < size; i++)
+        out[j++] = (src[i] >= 32 && src[i] < 127) ? (char)src[i] : '?';
+    out[j] = 0;
+}
+
+static int msl_ends_in_exe( const WCHAR *start, const WCHAR *end )
+{
+    return end - start >= 4 && end[-4] == '.' && (end[-3] | 0x20) == 'e' &&
+           (end[-2] | 0x20) == 'x' && (end[-1] | 0x20) == 'e';
+}
+
+static int msl_is_absolute( const WCHAR *path )
+{
+    WCHAR d = path[0] | 0x20;
+    return d >= 'a' && d <= 'z' && path[1] == ':' && path[2] == '\\';
+}
+
+static void msl_fail( char *reason, int reason_len, const char *text )
+{
+    if (reason && reason_len > 0) snprintf( reason, reason_len, "%s", text );
+}
+
+/* Any thread (the app). Validates and queues; returns the request id, or 0
+ * with the reason in `reason`. */
+unsigned int madeira_session_launch_request( const char *cmdline_utf8, const char *cwd_utf8,
+                                             unsigned int flags, char *reason, int reason_len )
+{
+    /* 0: the app cannot start a program inside a running session (the windowed taskbar's Steam button falls back to a library entry for the next start); ml1350 */
+    const char *off = getenv( "MADEIRA_SESSION_LAUNCH" );
+    struct msl_request *req;
+    WCHAR *line, *image_start, *image_end, *rest, *p;
+    int len, n, i, slot = -1;
+
+    if (off && off[0] == '0' && !off[1])
+    {
+        msl_fail( reason, reason_len, "starting programs in a running session is off (env.MADEIRA_SESSION_LAUNCH=0)" );
+        return 0;
+    }
+    if (!cmdline_utf8 || !*cmdline_utf8)
+    {
+        msl_fail( reason, reason_len, "no command line" );
+        return 0;
+    }
+    if (!(req = calloc( 1, sizeof(*req) )) || !(line = malloc( (MSL_MAX_CHARS + 1) * sizeof(WCHAR) )))
+    {
+        free( req );
+        msl_fail( reason, reason_len, "out of memory" );
+        return 0;
+    }
+    if ((len = msl_utf8_to_wide( cmdline_utf8, line, MSL_MAX_CHARS )) < 0)
+    {
+        msl_fail( reason, reason_len, "the command line is too long or has characters a command line cannot hold" );
+        goto fail;
+    }
+    for (p = line; *p; p++) if (*p == '/') *p = '\\';   /* only in the program path below */
+
+    /* the program: quoted, or the shortest prefix that ends in .exe at a blank */
+    p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '"')
+    {
+        image_start = p + 1;
+        for (image_end = image_start; *image_end && *image_end != '"'; image_end++);
+        if (!*image_end)
+        {
+            msl_fail( reason, reason_len, "a quote is not closed" );
+            goto fail;
+        }
+        rest = image_end + 1;
+    }
+    else
+    {
+        image_start = p;
+        image_end = NULL;
+        for (; ; p++)
+        {
+            if (!*p || *p == ' ' || *p == '\t')
+            {
+                if (msl_ends_in_exe( image_start, p )) { image_end = p; break; }
+                if (!*p) break;
+            }
+        }
+        if (!image_end)
+        {
+            msl_fail( reason, reason_len, "the command line must start with a program path ending in .exe "
+                      "(C:\\folder\\program.exe; a .bat or an installer package does not start this way)" );
+            goto fail;
+        }
+        rest = image_end;
+    }
+    n = image_end - image_start;
+    if (n < 7 || n > MAX_PATH - 1 || !msl_is_absolute( image_start ) || !msl_ends_in_exe( image_start, image_end ))
+    {
+        msl_fail( reason, reason_len, "the program needs a full Windows path ending in .exe, such as "
+                  "C:\\Games\\Game\\game.exe" );
+        goto fail;
+    }
+    memcpy( req->image, image_start, n * sizeof(WCHAR) );
+    req->image[n] = 0;
+
+    /* the child's command line: the program quoted, then the rest as typed
+     * (the slash conversion above applied to the arguments too: undo it there) */
+    {
+        int rest_len = 0, o = 0;
+        const char *r = cmdline_utf8;
+        WCHAR *orig = malloc( (MSL_MAX_CHARS + 1) * sizeof(WCHAR) );
+
+        if (!orig || msl_utf8_to_wide( r, orig, MSL_MAX_CHARS ) < 0)
+        {
+            free( orig );
+            msl_fail( reason, reason_len, "out of memory" );
+            goto fail;
+        }
+        rest = orig + (rest - line);
+        rest_len = wcslen( rest );
+        if (n + rest_len + 2 > MSL_MAX_CHARS)
+        {
+            free( orig );
+            msl_fail( reason, reason_len, "the command line is too long" );
+            goto fail;
+        }
+        req->cmdline[o++] = '"';
+        memcpy( req->cmdline + o, req->image, n * sizeof(WCHAR) );
+        o += n;
+        req->cmdline[o++] = '"';
+        memcpy( req->cmdline + o, rest, rest_len * sizeof(WCHAR) );
+        o += rest_len;
+        req->cmdline[o] = 0;
+        free( orig );
+    }
+
+    /* the working folder: given (X:\...), or the program's own */
+    if (cwd_utf8 && *cwd_utf8)
+    {
+        if ((n = msl_utf8_to_wide( cwd_utf8, req->curdir, MAX_PATH - 1 )) < 3)
+        {
+            msl_fail( reason, reason_len, "the working folder is not a usable path" );
+            goto fail;
+        }
+        for (i = 0; i < n; i++) if (req->curdir[i] == '/') req->curdir[i] = '\\';
+        if (!msl_is_absolute( req->curdir ))
+        {
+            msl_fail( reason, reason_len, "the working folder needs a full Windows path such as C:\\Games\\Game" );
+            goto fail;
+        }
+    }
+    else
+    {
+        WCHAR *last = NULL;
+        for (i = 0; req->image[i]; i++) if (req->image[i] == '\\') last = req->image + i;
+        n = last ? (int)(last - req->image) : 2;
+        memcpy( req->curdir, req->image, n * sizeof(WCHAR) );
+        req->curdir[n] = 0;
+    }
+    while (n > 3 && req->curdir[n - 1] == '\\') req->curdir[--n] = 0;
+    if (req->curdir[n - 1] != '\\') { req->curdir[n++] = '\\'; req->curdir[n] = 0; }
+
+    req->flags = flags;
+    req->queued = ios_child_now();
+    free( line );
+    line = NULL;
+
+    pthread_mutex_lock( &msl_lock );
+    for (i = 0; i < MSL_MAX_REQUESTS; i++) if (!msl_queue[i]) { slot = i; break; }
+    if (slot >= 0)
+    {
+        if (!++msl_next_id) ++msl_next_id;
+        req->id = msl_next_id;
+        msl_queue[slot] = req;
+        __atomic_add_fetch( &msl_count, 1, __ATOMIC_RELEASE );
+    }
+    pthread_mutex_unlock( &msl_lock );
+    if (slot < 0)
+    {
+        msl_fail( reason, reason_len, "too many programs are waiting to start" );
+        free( req );
+        return 0;
+    }
+    {
+        char a[300], c[300];
+        msl_wide_to_ascii( req->cmdline, -1, a, sizeof(a) );
+        msl_wide_to_ascii( req->curdir, -1, c, sizeof(c) );
+        dprintf( 2, "[launch] ml1350 queued #%u: %s (in %s%s)\n", req->id, a, c,
+                 (flags & MSL_FLAG_SERVICES_FIRST) ? "; services.exe first" : "" );
+    }
+    return req->id;
+
+fail:
+    free( line );
+    free( req );
+    return 0;
+}
+
+int madeira_session_launch_pending( void )
+{
+    return __atomic_load_n( &msl_count, __ATOMIC_ACQUIRE );
+}
+
+/* Wine thread that does not own the desktop window: 1 at most every 0.25 s
+ * while a request waits, so it posts WM_NULL to wake the owner. */
+int madeira_session_launch_wake_due( void )
+{
+    double now;
+    int due = 0;
+
+    if (!madeira_session_launch_pending()) return 0;
+    now = ios_child_now();
+    pthread_mutex_lock( &msl_lock );
+    if (msl_count && now - msl_last_wake >= MSL_WAKE_EVERY_S)
+    {
+        msl_last_wake = now;
+        due = 1;
+    }
+    pthread_mutex_unlock( &msl_lock );
+    return due;
+}
+
+/* 1 when a process with this file name (services.exe) runs in the session,
+ * 0 when none does, -1 when the list could not be read. */
+static int msl_process_running( const WCHAR *name )
+{
+    ULONG size = 0x10000, needed = 0;
+    char *buf = NULL;
+    NTSTATUS status;
+    int found = 0, len = wcslen( name );
+
+    for (;;)
+    {
+        free( buf );
+        if (!(buf = malloc( size ))) return -1;
+        status = NtQuerySystemInformation( SystemProcessInformation, buf, size, &needed );
+        if (status != STATUS_INFO_LENGTH_MISMATCH) break;
+        size = (needed + 0x1000 > size * 2) ? needed + 0x1000 : size * 2;
+        if (size > 0x1000000) break;
+    }
+    if (!status)
+    {
+        SYSTEM_PROCESS_INFORMATION *spi = (SYSTEM_PROCESS_INFORMATION *)buf;
+        for (;;)
+        {
+            if (spi->ProcessName.Buffer && spi->ProcessName.Length == len * sizeof(WCHAR) &&
+                !wcsnicmp( spi->ProcessName.Buffer, name, len ))
+            {
+                found = 1;
+                break;
+            }
+            if (!spi->NextEntryOffset) break;
+            spi = (SYSTEM_PROCESS_INFORMATION *)((char *)spi + spi->NextEntryOffset);
+        }
+    }
+    free( buf );
+    return status ? -1 : found;
+}
+
+static void msl_set_string( UNICODE_STRING *str, const WCHAR *text )
+{
+    str->Buffer = (WCHAR *)text;
+    str->Length = wcslen( text ) * sizeof(WCHAR);
+    str->MaximumLength = str->Length + sizeof(WCHAR);
+}
+
+/* What CreateProcessW( NULL, cmdline, NULL, NULL, FALSE, 0, NULL, curdir,
+ * &zeroed_si, &pi ) does on the calling thread (kernelbase/process.c
+ * create_process_params + create_nt_process + the resume). */
+static NTSTATUS msl_create_process( const WCHAR *image, const WCHAR *cmdline, const WCHAR *curdir,
+                                    DWORD *pid )
+{
+    static const WCHAR empty[] = {0};
+    static WCHAR empty_env[2];
+    RTL_USER_PROCESS_PARAMETERS params, *cur = NtCurrentTeb()->Peb->ProcessParameters;
+    PS_CREATE_INFO create_info;
+    ULONG_PTR buffer[offsetof( PS_ATTRIBUTE_LIST, Attributes[2] ) / sizeof(ULONG_PTR) + 1];
+    PS_ATTRIBUTE_LIST *attr = (PS_ATTRIBUTE_LIST *)buffer;
+    OBJECT_ATTRIBUTES process_attr, thread_attr;
+    WCHAR nt_name[MAX_PATH + 8];
+    HANDLE process = 0, thread = 0;
+    CLIENT_ID id;
+    NTSTATUS status;
+    int len = wcslen( image );
+
+    *pid = 0;
+    if (len + 5 > ARRAY_SIZE(nt_name)) return STATUS_NAME_TOO_LONG;
+    nt_name[0] = '\\'; nt_name[1] = '?'; nt_name[2] = '?'; nt_name[3] = '\\';
+    memcpy( nt_name + 4, image, (len + 1) * sizeof(WCHAR) );
+
+    memset( &params, 0, sizeof(params) );
+    params.AllocationSize = params.Size = sizeof(params);
+    params.Flags = PROCESS_PARAMS_FLAG_NORMALIZED;
+    msl_set_string( &params.CurrentDirectory.DosPath, curdir );
+    params.CurrentDirectory.DosPath.MaximumLength = MAX_PATH * sizeof(WCHAR);
+    msl_set_string( &params.DllPath, empty );
+    msl_set_string( &params.ImagePathName, image );
+    msl_set_string( &params.CommandLine, cmdline );
+    msl_set_string( &params.WindowTitle, image );
+    msl_set_string( &params.Desktop, empty );
+    msl_set_string( &params.ShellInfo, empty );
+    msl_set_string( &params.RuntimeInfo, empty );
+    if (cur && cur->Environment)
+    {
+        params.Environment = cur->Environment;
+        params.EnvironmentSize = cur->EnvironmentSize;
+    }
+    else params.Environment = empty_env;
+    if (cur)
+    {
+        params.ConsoleFlags   = cur->ConsoleFlags;
+        params.ProcessGroupId = cur->ProcessGroupId;
+        params.ConsoleHandle  = cur->ConsoleHandle ? cur->ConsoleHandle : CONSOLE_HANDLE_ALLOC;
+        params.hStdInput      = cur->hStdInput  == INVALID_HANDLE_VALUE ? NULL : cur->hStdInput;
+        params.hStdOutput     = cur->hStdOutput == INVALID_HANDLE_VALUE ? NULL : cur->hStdOutput;
+        params.hStdError      = cur->hStdError  == INVALID_HANDLE_VALUE ? NULL : cur->hStdError;
+    }
+    else params.ConsoleHandle = CONSOLE_HANDLE_ALLOC;
+
+    memset( &id, 0, sizeof(id) );
+    attr->Attributes[0].Attribute    = PS_ATTRIBUTE_IMAGE_NAME;
+    attr->Attributes[0].Size         = (len + 4) * sizeof(WCHAR);
+    attr->Attributes[0].ValuePtr     = nt_name;
+    attr->Attributes[0].ReturnLength = NULL;
+    attr->Attributes[1].Attribute    = PS_ATTRIBUTE_CLIENT_ID;
+    attr->Attributes[1].Size         = sizeof(id);
+    attr->Attributes[1].ValuePtr     = &id;
+    attr->Attributes[1].ReturnLength = NULL;
+    attr->TotalLength = offsetof( PS_ATTRIBUTE_LIST, Attributes[2] );
+
+    InitializeObjectAttributes( &process_attr, NULL, 0, NULL, NULL );
+    InitializeObjectAttributes( &thread_attr, NULL, 0, NULL, NULL );
+    memset( &create_info, 0, sizeof(create_info) );
+    create_info.Size = sizeof(create_info);
+
+    status = NtCreateUserProcess( &process, &thread, PROCESS_ALL_ACCESS, THREAD_ALL_ACCESS,
+                                  &process_attr, &thread_attr, 0, THREAD_CREATE_FLAGS_CREATE_SUSPENDED,
+                                  &params, &create_info, attr );
+    if (!status)
+    {
+        NtResumeThread( thread, NULL );
+        *pid = HandleToULong( id.UniqueProcess );
+    }
+    if (thread) NtClose( thread );
+    if (process) NtClose( process );
+    return status;
+}
+
+static const char *msl_status_text( NTSTATUS status )
+{
+    switch (status)
+    {
+    case STATUS_OBJECT_NAME_NOT_FOUND:  return "the program file was not found";
+    case STATUS_OBJECT_PATH_NOT_FOUND:  return "a folder in the program's path was not found";
+    case STATUS_OBJECT_NAME_INVALID:    return "the program path is not valid";
+    case STATUS_ACCESS_DENIED:          return "refused (Madeira's process gate, or no access to the file)";
+    case STATUS_INVALID_IMAGE_NOT_MZ:   return "the file is not a Windows program";
+    case STATUS_INVALID_IMAGE_FORMAT:   return "the program is not for a machine this session runs";
+    case STATUS_INVALID_IMAGE_WIN_16:
+    case STATUS_INVALID_IMAGE_NE_FORMAT:
+    case STATUS_INVALID_IMAGE_PROTECT:  return "a 16-bit or DOS program (not supported)";
+    case STATUS_DLL_NOT_FOUND:          return "a DLL the program needs is missing";
+    case STATUS_NO_MEMORY:              return "out of memory";
+    case STATUS_NAME_TOO_LONG:          return "the path is too long";
+    default:                            return NULL;
+    }
+}
+
+static void msl_run_one( struct msl_request *req, int desktop_thread )
+{
+    RTL_USER_PROCESS_PARAMETERS *cur = NtCurrentTeb()->Peb->ProcessParameters;
+    char parent[96], line[300], detail[400];
+    const char *text;
+    NTSTATUS status;
+    DWORD pid = 0;
+
+    msl_wide_to_ascii( cur ? cur->ImagePathName.Buffer : NULL,
+                       cur ? (int)(cur->ImagePathName.Length / sizeof(WCHAR)) : 0, parent, sizeof(parent) );
+    if (!parent[0]) snprintf( parent, sizeof(parent), "?" );
+    msl_wide_to_ascii( req->cmdline, -1, line, sizeof(line) );
+    snprintf( detail, sizeof(detail), "parent %s, pid %04x, %s", parent,
+              (int)HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ),
+              desktop_thread ? "the desktop window's thread" : "the first Wine thread to pump messages "
+              "(no desktop-window owner took it in 2 s)" );
+    dprintf( 2, "[launch] ml1350 starting #%u on tid %04x (%s): %s\n", req->id,
+             (int)GetCurrentThreadId(), detail, line );
+    msl_report( req->id, MSL_STATE_STARTING, 0, 0, detail );
+
+    if (req->flags & MSL_FLAG_SERVICES_FIRST)
+    {
+        static const WCHAR services[] = {'C',':','\\','w','i','n','d','o','w','s','\\','s','y','s','t','e','m','3','2',
+                                         '\\','s','e','r','v','i','c','e','s','.','e','x','e',0};
+        static const WCHAR services_cmd[] = {'"','C',':','\\','w','i','n','d','o','w','s','\\','s','y','s','t','e','m',
+                                             '3','2','\\','s','e','r','v','i','c','e','s','.','e','x','e','"',0};
+        static const WCHAR system32[] = {'C',':','\\','w','i','n','d','o','w','s','\\','s','y','s','t','e','m','3','2',
+                                         '\\',0};
+        static const WCHAR services_name[] = {'s','e','r','v','i','c','e','s','.','e','x','e',0};
+        int running = msl_process_running( services_name );
+
+        if (running == 1)
+            dprintf( 2, "[launch] ml1350 #%u: services.exe already runs in this session\n", req->id );
+        else
+        {
+            DWORD spid = 0;
+            NTSTATUS sst = msl_create_process( services, services_cmd, system32, &spid );
+            dprintf( 2, "[launch] ml1350 #%u: services.exe first (%s): status %08x pid %04x\n", req->id,
+                     running < 0 ? "the process list could not be read" : "none ran", (unsigned)sst, (int)spid );
+        }
+    }
+
+    status = msl_create_process( req->image, req->cmdline, req->curdir, &pid );
+    if (!status)
+        snprintf( detail, sizeof(detail), "pid %04x, parent %s", (int)pid, parent );
+    else if ((text = msl_status_text( status )))
+        snprintf( detail, sizeof(detail), "%s, NTSTATUS %08x", text, (unsigned)status );
+    else
+        snprintf( detail, sizeof(detail), "NTSTATUS %08x", (unsigned)status );
+    dprintf( 2, "[launch] ml1350 #%u: %s -> %s (%s)\n", req->id, line, status ? "error" : "ok", detail );
+    msl_report( req->id, MSL_STATE_DONE, status, pid, detail );
+}
+
+/* Wine thread (driver_ios.c, from the display driver's event hook): run the
+ * queued requests whose turn it is on this thread. desktop_thread: this
+ * thread owns the desktop window. Returns 1 when it started something. */
+int madeira_session_launch_run( int desktop_thread )
+{
+    struct msl_request *take = NULL, *expired[MSL_MAX_REQUESTS];
+    int i, n_expired = 0;
+    double now;
+
+    if (!madeira_session_launch_pending()) return 0;
+    if (__atomic_exchange_n( &msl_busy, 1, __ATOMIC_ACQUIRE )) return 0;
+    now = ios_child_now();
+    pthread_mutex_lock( &msl_lock );
+    for (i = 0; i < MSL_MAX_REQUESTS; i++)
+    {
+        struct msl_request *req = msl_queue[i];
+        if (!req) continue;
+        if (now - req->queued > MSL_EXPIRE_S)
+        {
+            expired[n_expired++] = req;
+            msl_queue[i] = NULL;
+            __atomic_sub_fetch( &msl_count, 1, __ATOMIC_RELEASE );
+            continue;
+        }
+        if (!desktop_thread && now - req->queued < MSL_ANY_THREAD_S) continue;
+        if (take && take->queued <= req->queued) continue;   /* the oldest first */
+        take = req;
+    }
+    if (take)
+    {
+        for (i = 0; i < MSL_MAX_REQUESTS; i++) if (msl_queue[i] == take) msl_queue[i] = NULL;
+        __atomic_sub_fetch( &msl_count, 1, __ATOMIC_RELEASE );
+    }
+    pthread_mutex_unlock( &msl_lock );
+
+    for (i = 0; i < n_expired; i++)
+    {
+        dprintf( 2, "[launch] ml1350 #%u dropped: no Wine thread of the session took it in %.0f s\n",
+                 expired[i]->id, MSL_EXPIRE_S );
+        msl_report( expired[i]->id, MSL_STATE_DONE, STATUS_TIMEOUT, 0,
+                    "no Wine thread of the session took the request in 30 s" );
+        free( expired[i] );
+    }
+    if (take)
+    {
+        msl_run_one( take, desktop_thread );
+        free( take );
+    }
+    __atomic_store_n( &msl_busy, 0, __ATOMIC_RELEASE );
+    return take != NULL;
+}
+
+/* WineProcessBridge.m, when the session's first program has ended: what is
+ * still queued belongs to that session and is dropped. */
+void madeira_session_launch_fail_all( const char *why )
+{
+    struct msl_request *all[MSL_MAX_REQUESTS];
+    int i, n = 0;
+
+    pthread_mutex_lock( &msl_lock );
+    for (i = 0; i < MSL_MAX_REQUESTS; i++)
+    {
+        if (!msl_queue[i]) continue;
+        all[n++] = msl_queue[i];
+        msl_queue[i] = NULL;
+    }
+    __atomic_store_n( &msl_count, 0, __ATOMIC_RELEASE );
+    pthread_mutex_unlock( &msl_lock );
+    for (i = 0; i < n; i++)
+    {
+        dprintf( 2, "[launch] ml1350 #%u dropped: %s\n", all[i]->id, why ? why : "the session ended" );
+        msl_report( all[i]->id, MSL_STATE_DONE, STATUS_CANCELLED, 0, why ? why : "the session ended" );
+        free( all[i] );
+    }
+}
+#endif  /* WINE_IOS */

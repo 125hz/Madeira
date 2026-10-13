@@ -34,6 +34,23 @@ int madeira_write_continue_flag(void);
 // Madeira Dock's component setup calls it before writing Steam's registry keys.
 void madeira_seed_prefix_if_needed(const char *prefix_path);
 
+// ml1350 in-session launcher (build/ntdll-unix/process_ios.c, docs/SESSION_LAUNCH.md).
+// madeira_session_launch_request queues "C:\path\program.exe args" (UTF-8; the
+// working folder may be NULL: the program's own) from any thread and returns
+// its id, or 0 with the reason in `reason`. A Wine thread of the running
+// session starts it (the desktop window's thread: explorer's shell in a desktop
+// session) and reports through the callback, on that Wine thread: state 1 when
+// a thread took it (detail names the parent), state 2 when done (status is the
+// NTSTATUS, 0 = started; pid then set). Flags: 1 = start services.exe first when
+// none runs. env.MADEIRA_SESSION_LAUNCH=0 refuses every request.
+typedef void (*madeira_session_launch_cb)(unsigned int id, unsigned int state, unsigned int status,
+                                          unsigned int pid, const char *detail);
+void madeira_session_launch_set_callback(madeira_session_launch_cb cb);
+unsigned int madeira_session_launch_request(const char *cmdline_utf8, const char *cwd_utf8,
+                                            unsigned int flags, char *reason, int reason_len);
+// Drops what is still queued (WineProcessBridge.m, when the session ends).
+void madeira_session_launch_fail_all(const char *why);
+
 #ifdef __cplusplus
 }
 #endif
