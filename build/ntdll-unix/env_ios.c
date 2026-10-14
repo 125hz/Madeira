@@ -831,6 +831,11 @@ static void init_locale(void)
 }
 
 
+#ifdef WINE_IOS
+static void ios_fatal_startup_error( const char *err, ... ) __attribute__((noreturn, format(printf,1,2)));
+extern void ios_boot_mark( const char *stage );   /* ml1334, loader_ios.c */
+#endif
+
 /***********************************************************************
  *              init_environment
  */
@@ -846,6 +851,21 @@ void init_environment(void)
         uctable = case_table + 2;
         lctable = case_table + case_table[1] + 2;
     }
+#ifdef WINE_IOS
+    else
+    {
+        /* ml1334: without the case table every ntdll_towupper/towlower, and so
+         * every case-insensitive comparison (path lookup, registry, environment),
+         * reads a NULL table and faults at a low address, far from this cause.
+         * The process-host extension hit it when it looked for nls/ beside its
+         * .appex image (log 101); loader_ios.c now resolves the bundle, and a
+         * missing table ends the process here, with its cause, instead. */
+        const char *dir = build_dir ? build_dir : data_dir;
+        ios_fatal_startup_error( "ml1334 the case table %s/nls/l_intl.nls did not load; without it the first "
+                                 "case-insensitive name comparison would fault on a NULL table\n",
+                                 dir ? dir : "(no data dir)" );
+    }
+#endif
 }
 
 
@@ -2083,6 +2103,15 @@ static void ios_fatal_startup_error( const char *err, ... )
     va_end( args );
     ERR( "%s", buf );
     os_log_error( OS_LOG_DEFAULT, "[Wine ntdll] FATAL: %{public}s", buf );
+    /* ml1334: ERR is silent when WINEDEBUG turns err off; this line is not. */
+    dprintf( 2, "[Wine ntdll] ml1334 FATAL (this process's boot thread ends): %s%s", buf,
+             buf[0] && buf[strlen( buf ) - 1] == '\n' ? "" : "\n" );
+    {
+        /* The process-host extension's only Wine process: tell the app it ended. */
+        extern int ios_ext_process_role(void);
+        extern void wine_launched_process_did_exit( int status ) __attribute__((weak));
+        if (ios_ext_process_role() && wine_launched_process_did_exit) wine_launched_process_did_exit( 1 );
+    }
     pthread_exit( NULL );
 }
 #endif
@@ -2342,6 +2371,9 @@ void unix_init_startup_info(void)
 
     info = malloc( startup_info_size );
 
+#ifdef WINE_IOS
+    ios_boot_mark( "startup info: get_startup_info..." );   /* ml1334, loader_ios.c */
+#endif
     SERVER_START_REQ( get_startup_info )
     {
         wine_server_set_reply( req, info, startup_info_size );
@@ -2356,10 +2388,16 @@ void unix_init_startup_info(void)
     env = malloc( env_size * sizeof(WCHAR) );
     memcpy( env, (char *)info + info_size, env_size * sizeof(WCHAR) );
     env_pos = env_size - 1;
+#ifdef WINE_IOS
+    ios_boot_mark( "startup info: add_dynamic_environment..." );
+#endif
     add_dynamic_environment( &env, &env_pos, &env_size );
     is_prefix_bootstrap = !!find_env_var( env, env_pos, bootstrapW, ARRAY_SIZE(bootstrapW) );
     env[env_pos++] = 0;
 
+#ifdef WINE_IOS
+    ios_boot_mark( "startup info: process parameters..." );
+#endif
     size = (sizeof(*params)
             + MAX_PATH * sizeof(WCHAR)  /* curdir */
             + info->dllpath_len + sizeof(WCHAR)
@@ -2437,6 +2475,9 @@ void unix_init_startup_info(void)
     free( env );
     free( info );
 
+#ifdef WINE_IOS
+    ios_boot_mark( "startup info: load_main_exe..." );
+#endif
     status = load_main_exe( &nt_name, machine, &module );
     if (!NT_SUCCESS(status))
     {
@@ -2446,6 +2487,9 @@ void unix_init_startup_info(void)
     rebuild_argv();
     main_wargv = build_wargv( params->ImagePathName.Buffer );
     free( nt_name.Buffer );
+#ifdef WINE_IOS
+    ios_boot_mark( "startup info: init_peb..." );
+#endif
     init_peb( params, module );
 }
 

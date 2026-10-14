@@ -166,6 +166,8 @@ private final class HelperRequest {
             return
         }
         LogStore.shared.log("[jit-helper] \(operation): finished success=\(response.success ? 1 : 0)")
+        // ml1334: how the debugged process ended, from the helper's script tail.
+        if operation == "enable" { LogStore.shared.log("[jit-helper] ml1334 enable result: \(response.message)") }
         end(.success(response))
     }
 

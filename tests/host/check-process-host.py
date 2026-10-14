@@ -89,3 +89,58 @@ assert 'wineserver_inject_client_fd(' not in (root / 'app/Madeira/ProcessHostCli
 assert 'wine_ios_child_main' not in extension, 'remote boot must use __wine_main'
 assert 'madsync is active in this session' in source, 'remote madsync refusal missing'
 print('process-host launch contract: PASS (source checks; device behavior unverified)')
+
+# ml1334: Wine's data directory in an app extension. The production resolver from
+# loader_ios.c runs against synthetic bundle trees; the extension's own image directory
+# (App.app/PlugIns/<name>.appex) has no nls/, its host app does.
+loader = (root / 'build/ntdll-unix/loader_ios.c').read_text()
+resolver = loader[loader.index('static int ios_dir_has_nls('):loader.index('#endif\n\nstatic void init_paths(void)')]
+assert 'ios_resolve_bundle_dir( exe_path, sizeof(exe_path) );' in loader, 'init_paths no longer resolves the bundle'
+assert 'setenv("MADEIRA_BUNDLE_DIR"' in extension, 'the extension no longer names its host bundle'
+assert '"MADEIRA_BUNDLE_DIR=",19' in extension, 'an app-supplied MADEIRA_BUNDLE_DIR could override the extension'
+probe = r'''
+#define _GNU_SOURCE
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+''' + resolver + r'''
+int main(int argc, char **argv) {
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof dir, "%s", argv[1]);
+    ios_resolve_bundle_dir(dir, sizeof dir);
+    printf("%s\n", dir);
+    return argc < 2;
+}
+'''
+with tempfile.TemporaryDirectory(prefix='madeira-bundle-dir-') as temp:
+    path = Path(temp)
+    (path / 'probe.c').write_text(probe)
+    subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-Wall', '-Wextra', '-Werror', str(path / 'probe.c'),
+                    '-o', str(path / 'probe')], check=True)
+    app = path / 'Application' / 'App.app'
+    appex = app / 'PlugIns' / 'MadeiraProcessHost.appex'
+    (app / 'nls').mkdir(parents=True)
+    appex.mkdir(parents=True)
+    lonely = path / 'Other' / 'PlugIns' / 'Lonely.appex'
+    lonely.mkdir(parents=True)
+
+    def resolve(image, bundle=None):
+        env = {k: v for k, v in os.environ.items() if k != 'MADEIRA_BUNDLE_DIR'}
+        if bundle is not None:
+            env['MADEIRA_BUNDLE_DIR'] = str(bundle)
+        run = subprocess.run([str(path / 'probe'), str(image)], env=env, capture_output=True, text=True, check=True)
+        return run.stdout.strip(), run.stderr
+
+    out, err = resolve(app)                       # the app itself: unchanged and silent
+    assert out == str(app) and err == '', (out, err)
+    out, err = resolve(appex)                     # the extension, no hint: its containing bundle
+    assert out == str(app) and f'data dir: {app} (appex parent)' in err, (out, err)
+    out, err = resolve(appex, app)                # the extension's hint wins
+    assert out == str(app) and f'data dir: {app} (bundle env)' in err, (out, err)
+    out, err = resolve(appex, path / 'Other')     # a hint without nls/ is ignored, loudly
+    assert out == str(app) and 'ignored' in err and '(appex parent)' in err, (out, err)
+    out, err = resolve(lonely)                    # nothing anywhere: stays, and says so
+    assert out == str(lonely) and 'NO nls/ here' in err, (out, err)
+print('process-host data directory (app bundle from an .appex): PASS')

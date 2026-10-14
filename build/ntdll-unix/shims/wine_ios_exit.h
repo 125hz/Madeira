@@ -12,9 +12,15 @@ extern _Thread_local volatile int wine_ios_exit_code;
 extern _Thread_local pthread_t wine_ios_main_thread;
 extern _Thread_local int wine_ios_exit_initialized;
 
+/* ml1334: NULL in the app. The process-host extension sets it (ProcessHost.m) to
+ * log every intercepted exit with its caller and a backtrace before the longjmp or
+ * thread exit below. Defined in server_ios.c. */
+extern void (*volatile wine_ios_exit_observer)(int status);
+
 static inline __attribute__((noreturn)) void wine_ios_exit(int status) {
     os_log_error(OS_LOG_DEFAULT, "[Wine ntdll] exit(%d) intercepted on iOS (tid=%p)",
                  status, (void*)pthread_self());
+    if (wine_ios_exit_observer) wine_ios_exit_observer(status);
     if (wine_ios_exit_initialized && pthread_equal(pthread_self(), wine_ios_main_thread)) {
         wine_ios_exit_code = status;
         longjmp(wine_ios_exit_jmpbuf, 1);

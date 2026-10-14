@@ -112,7 +112,7 @@ while (!detached) {
 
     // W/X = inferior exited; nothing left to debug.
     if (typeof brkResponse === 'string' && /^[WX]/.test(brkResponse)) {
-        ulog(`Madeira JIT: inferior exited (${brkResponse})`);
+        log(`Madeira JIT: inferior exited (${brkResponse})`);   // ml1334: outside the budget, once
         detached = true;
         continue;
     }
@@ -209,7 +209,7 @@ while (!detached) {
         // main thread exactly this way). If the fault truly cannot be
         // delivered, kill the inferior — a visible death with logs intact.
         if (faultRepeats >= 8) {
-            ulog(`Madeira JIT: fault at pc=0x${pcNum.toString(16)} undeliverable after ` +
+            log(`Madeira JIT: fault at pc=0x${pcNum.toString(16)} undeliverable after ` +   // ml1334: once
                 `${faultRepeats} tries — killing inferior (visible death beats a parked thread)`);
             send_command(`k`);
             detached = true;
