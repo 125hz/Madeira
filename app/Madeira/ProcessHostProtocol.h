@@ -8,10 +8,9 @@
 // endpoint the app passes in the NSExtension request, the app is the XPC client,
 // and the extension exports the server object.
 //
-// Phase 1 is headless (no window presentation; GDI surfaces are not drawn) and runs
-// exactly one builtin for the env.MADEIRA_EXT_PROCESS_TEST=1 smoke test
-// (cmd.exe /c echo remote-ok). The whole feature is off unless asked and is killed
-// by env.MADEIRA_EXT_PROCESS=0.
+// ml1331: the owned extension has a dedicated control socket. Window geometry
+// is forwarded to the app; IOSurface presentation is deferred to phase 3.
+// Both MADEIRA_EXT_PROCESS and MADEIRA_SHARED_DRIVE default off.
 
 #import <Foundation/Foundation.h>
 #import <xpc/xpc.h>
@@ -24,6 +23,9 @@
 #define PH_INFO_NLS      "nls"      // string: the bundle's nls dir
 #define PH_INFO_ARGV     "argv"     // xpc array of strings: argv for __wine_main (argv[0]="wine")
 #define PH_INFO_ENV      "env"      // xpc array of "KEY=VALUE" strings exported before Wine
+#define PH_INFO_CONTROL "control" // dedicated control socket (no task-port transfer)
+#define PH_INFO_CWD "cwd" // inherited working directory, passed as an fd
+#define PH_INFO_GROUP "group" // app group the extension must resolve before opening the shared prefix
 #define PH_INFO_FD       "fd"       // the wineserver client socket (xpc_dictionary_set_fd)
 
 // Keys in a reply dictionary.
@@ -31,10 +33,6 @@
 #define PH_REPLY_PID     "pid"      // int64: the extension process pid
 #define PH_REPLY_STAGE   "stage"    // int64: how far it got (see PHStage)
 #define PH_REPLY_ERROR   "error"    // string: a human message when ok is false
-#define PH_REPLY_TASK    "task"     // mach send right: the extension's task port, if the
-                                    // platform allowed sending it (absent otherwise)
-#define PH_REPLY_TASKOK  "task_ok"  // bool: whether the task port was put in the reply
-
 typedef NS_ENUM(int, PHStage) {
     PHStageStarted      = 1,   // extension running, connected back
     PHStageJITPool      = 2,   // JIT pool mapped in the extension
@@ -50,11 +48,10 @@ typedef NS_ENUM(int, PHStage) {
 - (void)statusWithReply:(void (^)(int pid, uint64_t footprint, uint64_t available))reply;
 /// Set up the JIT pool and the environment for one Wine process (does not start it).
 /// `info` carries the prefix/bundle/argv/env and the wineserver client fd. The reply
-/// carries the extension's pid, a send right to its task port under PH_REPLY_TASK when
-/// the platform permits it, and the stage reached.
+/// carries the extension's pid, control-service readiness and the stage reached.
 - (void)prepareGuest:(xpc_object_t)info reply:(void (^)(xpc_object_t result))reply;
 /// Start __wine_main for the prepared process. Called after the app has registered
-/// the task port with the wineserver, so remote memory/thread ops are ready.
+/// the control socket with the wineserver, so remote memory/thread ops are ready.
 - (void)startGuestWithReply:(void (^)(xpc_object_t result))reply;
 @end
 
@@ -64,6 +61,9 @@ typedef NS_ENUM(int, PHStage) {
 - (void)extensionReady:(int)pid available:(uint64_t)available;
 /// A line the extension wants shown in Madeira's log (prefixed [ext-proc] there).
 - (void)log:(NSString *)line;
+- (void)spawnGuest:(xpc_object_t)info reply:(void (^)(BOOL ok))reply;
+- (void)guestExited:(int)status;
+- (void)windowChanged:(NSDictionary *)window;
 @end
 
 static inline NSXPCInterface *PHProcessServerInterface(void) {
@@ -74,5 +74,11 @@ static inline NSXPCInterface *PHProcessServerInterface(void) {
              argumentIndex:0 ofReply:YES];
     [interface setXPCType:XPC_TYPE_DICTIONARY forSelector:@selector(startGuestWithReply:)
              argumentIndex:0 ofReply:YES];
+    return interface;
+}
+
+static inline NSXPCInterface *PHProcessClientInterface(void) {
+    NSXPCInterface *interface = [NSXPCInterface interfaceWithProtocol:@protocol(PHProcessClient)];
+    [interface setXPCType:XPC_TYPE_DICTIONARY forSelector:@selector(spawnGuest:reply:) argumentIndex:0 ofReply:NO];
     return interface;
 }

@@ -1,0 +1,67 @@
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -1012,6 +1012,7 @@
+  *
+  * ios_apply_resume_context is a weak reference: without it, a dirty context
+  * is simply not applied (upstream's cache-only behaviour). */
++extern int ios_process_is_remote(struct process *);
+ extern int ios_fill_thread_context( struct thread *, struct context_data *, struct context_data * );
+ extern int ios_apply_resume_context( struct thread *thread, const struct context_data *native,
+                                      const struct context_data *wow ) __attribute__((weak));
+@@ -1031,7 +1032,7 @@
+ 
+ static int ios_wow_ctx_set_on( struct thread *thread )
+ {
+-    return ios_process_is_wow64( thread->process ) && ios_ctx_switch( &ctx_set, "MADEIRA_CTX_SET" );
++    return (ios_process_is_wow64( thread->process ) || ios_process_is_remote( thread->process )) && ios_ctx_switch( &ctx_set, "MADEIRA_CTX_SET" );
+ }
+ 
+ /* re-capture a WoW64 thread's snapshot context (stop_thread on an existing context) */
+@@ -1078,14 +1079,14 @@
+     if (thread->context)
+     {
+         /* WoW64 processes: a cached Mach snapshot is not a context (see below) */
+-        if (ios_process_is_wow64( thread->process )) ios_wow_ctx_refresh( thread );
++        if ((ios_process_is_wow64( thread->process ) || ios_process_is_remote( thread->process ))) ios_wow_ctx_refresh( thread );
+         return;
+     }
+ #endif
+     if (thread->context) return;  /* already suspended, no need for a signal */
+     if (!(thread->context = create_thread_context( thread ))) return;
+ #ifdef WINE_IOS
+-    if (ios_process_is_wow64( thread->process ))
++    if ((ios_process_is_wow64( thread->process ) || ios_process_is_remote( thread->process )))
+     {
+         /* Mark it refreshable BEFORE the first capture, so a capture that fails
+          * (no port yet, init not finished) does not wedge the context in
+@@ -1154,7 +1155,7 @@
+         extern struct thread *ios_pending_persistent_hold;
+         extern int ios_thread_mach_hold( struct thread * );
+         extern int ios_real_suspend_enabled(void);
+-        if (ios_real_suspend_enabled() && !thread->suspend)
++        if ((ios_real_suspend_enabled() || ios_process_is_remote(thread->process)) && !thread->suspend)
+             ios_pending_persistent_hold = thread;
+ #endif
+         if (!is_thread_suspended( thread )) stop_thread( thread );
+@@ -1164,7 +1165,7 @@
+         /* stop_thread() can bail out early (context already captured, or process
+          * init not finished), in which case no hold was established. Take it here.
+          * Idempotent: a no-op when the capture already claimed one. */
+-        if (ios_real_suspend_enabled() && thread->suspend == 1)
++        if ((ios_real_suspend_enabled() || ios_process_is_remote(thread->process)) && thread->suspend == 1)
+             ios_thread_mach_hold( thread );
+ #endif
+     }
+@@ -2777,6 +2778,12 @@
+              thread->state != TERMINATED && !is_thread_suspended( thread ))
+         set_error( STATUS_UNSUCCESSFUL );
+ #endif
++#ifdef WINE_IOS
++    else if (thread != current && ios_process_is_remote(thread->process) && thread->process->machine != IMAGE_FILE_MACHINE_I386 &&
++             ((contexts[CTX_NATIVE].flags & ~(SERVER_CTX_CONTROL | SERVER_CTX_INTEGER | SERVER_CTX_EXEC_SPACE)) ||
++              (ctx_count == 2 && contexts[CTX_WOW].flags)))
++        set_error(STATUS_NOT_SUPPORTED); /* ml1331: no pretend success for unsupported register groups */
++#endif
+     else if (thread->state != TERMINATED)
+     {
+         unsigned int flags = system_flags & contexts[CTX_NATIVE].flags;
