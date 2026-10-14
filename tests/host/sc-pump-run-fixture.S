@@ -1,5 +1,10 @@
-/* Win64 fixture for the guarded RunState write sites; no supplied binary.
- * Link at 0x1740e0. The labels must coincide with the production hook sites. */
+/* Win64 stand-in for the pump's Run at the guarded RunState write sites, written
+ * for this test (nothing here is taken from the helper). Only what the production
+ * hooks rely on is fixed: the two hook sites, byte for byte, at +0x41 and +0x4b;
+ * the RunState the install site publishes (delegate, dispatcher, quit, depth at
+ * +0x14); rbx holding the pump and rdi the outer state across the call; and the
+ * caller's rbx in the home slot the restore site reloads ([rsp+0x50] there).
+ * Link at 0x1740e0. */
 .intel_syntax noprefix
 .section .fixture,"ax"
 .global fixture_run, fixture_install, fixture_restore
@@ -7,21 +12,20 @@ fixture_run:
     mov qword ptr [rsp+8], rbx
     push rdi
     sub rsp, 0x40
-    mov rdi, qword ptr [rcx+0x40]
     mov rbx, rcx
+    mov rdi, qword ptr [rbx+0x40]
     mov qword ptr [rsp+0x20], rdx
-    mov qword ptr [rsp+0x28], 0
-    mov byte ptr [rsp+0x30], 0
-    test rdi, rdi
-    jz initial
-    mov eax, dword ptr [rdi+0x14]
+    xor eax, eax
+    mov qword ptr [rsp+0x28], rax
+    mov byte ptr [rsp+0x30], al
     inc eax
+    test rdi, rdi
+    jz 1f
+    add eax, dword ptr [rdi+0x14]
+1:
     mov dword ptr [rsp+0x34], eax
-    jmp ready
-initial:
-    mov dword ptr [rsp+0x34], 1
-ready:
     lea rax, [rsp+0x20]
+    .org fixture_run + 0x41, 0x90
 fixture_install:
     mov qword ptr [rcx+0x40], rax
     mov rax, qword ptr [rcx]

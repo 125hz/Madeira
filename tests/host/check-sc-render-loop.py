@@ -37,6 +37,34 @@ def array(name):
 blob = bytes(int(x, 16) for x in re.findall(r'0x([\da-fA-F]{2})', array('ios_sch_loop_thunk')))
 start = native.index('static const struct { unsigned int rva;')
 code_table = native[start:native.index('};', start) + 2]
+# The helper's code stays out of the tree: ios_sch_code holds each range's SHA-256.
+# The fixture image holds a filler in each range instead, and this stand-in for
+# CommonCrypto answers a range's own digest exactly while its filler is intact.
+SHA_STANDIN = r'''
+static char *sch_fixture_image;
+static unsigned char sch_filler(size_t rva, size_t i) { return (unsigned char)((rva + i) * 131u + 7u); }
+static void sch_fill(char *image)
+{
+    sch_fixture_image = image;
+    for (size_t k = 0; k < ARRAY_SIZE(ios_sch_code); k++)
+        for (size_t i = 0; i < ios_sch_code[k].len; i++)
+            image[ios_sch_code[k].rva + i] = (char)sch_filler(ios_sch_code[k].rva, i);
+}
+static unsigned char *CC_SHA256(const void *data, uint32_t len, unsigned char *md)
+{
+    memset(md, 0, CC_SHA256_DIGEST_LENGTH);
+    for (size_t k = 0; k < ARRAY_SIZE(ios_sch_code); k++)
+    {
+        const unsigned char *p = (const unsigned char *)sch_fixture_image + ios_sch_code[k].rva;
+        size_t i;
+        if ((const void *)p != data || len != ios_sch_code[k].len) continue;
+        for (i = 0; i < len && p[i] == sch_filler(ios_sch_code[k].rva, i); i++) ;
+        if (i == len) memcpy(md, ios_sch_code[k].sha256, CC_SHA256_DIGEST_LENGTH);
+    }
+    return md;
+}
+'''
+
 defines = '\n'.join(line for line in native.splitlines() if line.startswith('#define IOS_SCH_'))
 symbols = {
     'current_loop': define('IOS_SCH_CURRENT_LOOP'), 'helper_new': 0x13e708,
@@ -112,10 +140,12 @@ typedef struct { uint32_t VirtualAddress; union { uint32_t VirtualSize; } Misc;
 #define IMAGE_SCN_MEM_EXECUTE 0x20000000
 #define IMAGE_SCN_MEM_WRITE 0x80000000
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof((x)[0]))
+#define CC_SHA256_DIGEST_LENGTH 32
+static unsigned char *CC_SHA256(const void *data, uint32_t len, unsigned char *md);
 static int ios_sc_cef_enabled(void) { const char *e = getenv("MADEIRA_SC_CEF"); return !(e && e[0] == '0'); }
 /* Test output contains no guest payload or addresses. */
 #define dprintf(...) ((void)0)
-''' + defines + '\n' + array('ios_sch_thunk') + '\n' + array('ios_sch_loop_thunk') + '\n' + array('ios_sch_run_trace') + '\n' + array('ios_sch_render_drain') + '\n' + array('ios_sch_ipc_rebind') + '\n' + array('ios_sch_ipc_split') + '\n' + array('ios_sch_ui_trace') + '\n' + array('ios_sch_renderer_channels') + '\n' + code_table + '\n' + function('static int ios_sc_path_is_helper(') + '\n' + function('static const char *ios_sch_mismatch(') + '\n' + function('static void ios_sc_render_handler_patch(') + r'''
+''' + defines + '\n' + array('ios_sch_thunk') + '\n' + array('ios_sch_loop_thunk') + '\n' + array('ios_sch_run_trace') + '\n' + array('ios_sch_render_drain') + '\n' + array('ios_sch_ipc_rebind') + '\n' + array('ios_sch_ipc_split') + '\n' + array('ios_sch_ui_trace') + '\n' + array('ios_sch_renderer_channels') + '\n' + code_table + '\n' + SHA_STANDIN + '\n' + function('static int ios_sc_path_is_helper(') + '\n' + function('static const char *ios_sch_mismatch(') + '\n' + function('static void ios_sc_render_handler_patch(') + r'''
 static IMAGE_NT_HEADERS nt;
 static IMAGE_SECTION_HEADER sections[2];
 static WCHAR helper_name[] = {'S','o','c','i','a','l','C','l','u','b','H','e','l','p','e','r','.','e','x','e'};
@@ -127,8 +157,7 @@ static void reset_image(char *image, uint64_t base)
                            { IMAGE_NT_OPTIONAL_HDR64_MAGIC, IOS_SCH_SIZE }};
     sections[0] = (IMAGE_SECTION_HEADER){ IOS_SCH_TEXT, {0x17f34c}, 0x17f400, IMAGE_SCN_MEM_EXECUTE };
     sections[1] = (IMAGE_SECTION_HEADER){ IOS_SCH_DATA, {0x43bc}, 0x1a00, IMAGE_SCN_MEM_WRITE };
-    for (size_t i = 0; i < sizeof(ios_sch_code) / sizeof(ios_sch_code[0]); i++)
-        memcpy(image + ios_sch_code[i].rva, ios_sch_code[i].bytes, ios_sch_code[i].len);
+    sch_fill(image);
     uint64_t *vb = (void *)(image + IOS_SCH_VT_BROWSER), *vr = (void *)(image + IOS_SCH_VT_RENDERER);
     vb[IOS_SCH_SLOT_BROWSER] = vr[IOS_SCH_SLOT_RENDERER] = base + IOS_SCH_GET_HANDLER;
     vb[IOS_SCH_SLOT_RENDERER] = vr[IOS_SCH_SLOT_BROWSER] = base + IOS_SCH_GET_NULL;
