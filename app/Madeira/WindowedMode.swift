@@ -288,7 +288,10 @@ enum WindowedSteam {
 
     /// The program's folder, as a Windows path ("C:\Program Files (x86)\Steam").
     private static func windowsFolder(_ relative: String) -> String {
-        windowsPath((relative as NSString).deletingLastPathComponent)
+        let path = windowsPath(relative)
+        guard let slash = path.lastIndex(of: "\\") else { return "C:\\" }
+        let folder = String(path[..<slash])
+        return folder.count == 2 && folder.hasSuffix(":") ? folder + "\\" : folder
     }
 
     private static var libraryNote: String {
