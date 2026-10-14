@@ -87,5 +87,5 @@ extension = (root / 'app/MadeiraProcessHost/ProcessHost.m').read_text()
 assert 'xpc_dictionary_set_mach_send' not in extension, 'guarded task-port transfer returned'
 assert 'wineserver_inject_client_fd(' not in (root / 'app/Madeira/ProcessHostClient.m').read_text(), 'parentless boot returned'
 assert 'wine_ios_child_main' not in extension, 'remote boot must use __wine_main'
-assert 'inproc-sync",0' in source, 'remote madsync refusal missing'
+assert 'madsync is active in this session' in source, 'remote madsync refusal missing'
 print('process-host launch contract: PASS (source checks; device behavior unverified)')

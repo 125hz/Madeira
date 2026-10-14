@@ -98,6 +98,7 @@ body = (dock[dock.index('enum MadeiraDock {'):dock.index('    @MainActor private
 stubs = r'''
 import Foundation
 func madeira_process_host_active_prefix(_ prefix: String) -> String { prefix }
+enum SharedContainer { static func activePrefix(_ prefix: String) -> String { prefix } }
 #if canImport(Glibc)
 import Glibc
 #else

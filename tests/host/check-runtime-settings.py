@@ -111,8 +111,14 @@ with tempfile.TemporaryDirectory() as tmp:
     sp.write_text(swift)
     home = Path(tmp) / 'home'
     home.mkdir()
-    env = dict(os.environ, HOME=str(home), CFFIXED_USER_HOME=str(home))
-    r = subprocess.run(['swift', str(sp)], capture_output=True, text=True, env=env)
+    env = dict(os.environ, HOME=str(home), CFFIXED_USER_HOME=str(home),
+               SWIFTLY_HOME_DIR=os.path.expanduser("~/.local/share/swiftly"),
+               SWIFTLY_BIN_DIR=os.path.expanduser("~/.local/share/swiftly/bin"))  # swiftly keeps its config under the real home
+    # swiftly resolves its shim through $HOME, which is the scratch home here: call the toolchain directly.
+    import glob
+    real = sorted(glob.glob(os.path.expanduser("~/.local/share/swiftly/toolchains/*/usr/bin/swift")))
+    swift_bin = real[-1] if real else "swift"
+    r = subprocess.run([swift_bin, str(sp)], capture_output=True, text=True, env=env)
     sys.stdout.write(r.stdout)
     if r.returncode:
         sys.stdout.write(r.stderr[-4000:])
