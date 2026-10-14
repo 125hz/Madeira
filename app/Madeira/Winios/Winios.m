@@ -1617,7 +1617,7 @@ void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
         winios_apply_contents_rect(key, l);
         winios_place_metal_layer(key);
         [CATransaction commit];
-        if (g_comp_windowed) winios_windowed_place(hwnd, l, x, y, w, h, visible);   /* into its frame */
+        if (g_comp_windowed) winios_windowed_place(hwnd, l, x, y, w, h, visible, cw, ch);   /* into its frame */
         /* ml1301: the foreground window was shown, hidden or resized */
         else if (!g_comp_game && (g_gfit_fg == (uintptr_t)hwnd || (g_gfit_key && [g_gfit_key isEqual:key])))
             winios_game_fit_eval(visible ? "window changed" : "window hidden");

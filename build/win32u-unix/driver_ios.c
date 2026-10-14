@@ -604,6 +604,83 @@ HWND winios_drv_foreground_window(void)
     return NtUserGetForegroundWindow();
 }
 
+/* ml1302 windowed mode, round 8: the frame's bottom-right grip resizes the
+ * guest window, as a desktop window manager's sizing border does. The app
+ * asks for a client size in desktop pixels; this turns it into a window size
+ * with the window's own non-client frame as it is now (window rect minus
+ * client rect: caption, borders and a menu bar, whatever its styles make
+ * them) and calls SetWindowPos with SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE.
+ * A window without WS_THICKFRAME is resized too (the user asked for it);
+ * DefWindowProc still applies the program's WM_GETMINMAXINFO limits to windows
+ * with a sizing border or without WS_POPUP. Only on the window's own thread,
+ * from its event pump (as winios_drv_foreground_if_owner): returns 0 on
+ * another thread, 1 applied, -1 refused (also for a window that is gone).
+ * flags: 1 sends WM_ENTERSIZEMOVE before (the drag began), 2 WM_EXITSIZEMOVE
+ * after (it ended; programs that rebuild their swapchain only when sizing
+ * ends); 0x100 on another thread posts WM_NULL to the window, which wakes its
+ * thread's message wait so its pump runs (the app rate-limits this, as the
+ * ml1350 launcher's wake). */
+int winios_drv_resize_client_if_owner( HWND hwnd, int cw, int ch, unsigned int flags )
+{
+    struct window_rects rects;
+    const char *why = NULL;
+    DWORD style, tid;
+    UINT dpi;
+    int ncw, nch, ww, wh, nowcw, nowch;
+
+    if (!hwnd) return -1;
+    if (!(tid = get_window_thread( hwnd, NULL )))
+    {
+        dprintf( 2, "[winios] ml1302 resize hwnd=%p refused (the window is gone)\n", hwnd );
+        return -1;
+    }
+    if (tid != GetCurrentThreadId())
+    {
+        if (flags & 0x100) NtUserPostMessage( hwnd, WM_NULL, 0, 0 );
+        return 0;
+    }
+    style = get_window_long( hwnd, GWL_STYLE );
+    dpi = get_thread_dpi();
+    if (style & WS_CHILD) why = "a child window";
+    else if (style & WS_MINIMIZE) why = "minimized";
+    else if (style & WS_MAXIMIZE) why = "maximized by the program";
+    else if (cw < 1 || ch < 1 || cw > 16384 || ch > 16384) why = "size out of range";
+    else if (!get_window_rects( hwnd, COORDS_PARENT, &rects, dpi )) why = "no window rects";
+    if (why)
+    {
+        dprintf( 2, "[winios] ml1302 resize hwnd=%p refused (%s; asked client %dx%d)\n", hwnd, why, cw, ch );
+        if ((flags & 2) && !(style & WS_CHILD)) send_message( hwnd, WM_EXITSIZEMOVE, 0, 0 );
+        return -1;
+    }
+    ncw = (rects.window.right - rects.window.left) - (rects.client.right - rects.client.left);
+    nch = (rects.window.bottom - rects.window.top) - (rects.client.bottom - rects.client.top);
+    if (ncw < 0 || ncw > 4096) ncw = 0;
+    if (nch < 0 || nch > 4096) nch = 0;
+    ww = cw + ncw;
+    wh = ch + nch;
+    if (flags & 1) send_message( hwnd, WM_ENTERSIZEMOVE, 0, 0 );
+    if (!NtUserSetWindowPos( hwnd, 0, 0, 0, ww, wh, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE ))
+    {
+        dprintf( 2, "[winios] ml1302 resize hwnd=%p refused (SetWindowPos failed; asked client %dx%d, window %dx%d)\n",
+                 hwnd, cw, ch, ww, wh );
+        if (flags & 2) send_message( hwnd, WM_EXITSIZEMOVE, 0, 0 );
+        return -1;
+    }
+    if (flags & 2) send_message( hwnd, WM_EXITSIZEMOVE, 0, 0 );
+    nowcw = cw; nowch = ch;
+    if (get_window_rects( hwnd, COORDS_PARENT, &rects, dpi ))
+    {
+        nowcw = rects.client.right - rects.client.left;
+        nowch = rects.client.bottom - rects.client.top;
+    }
+    dprintf( 2, "[winios] ml1302 resize hwnd=%p applied (client %dx%d asked, window %dx%d with a %dx%d frame, client now %dx%d%s%s%s%s)\n",
+             hwnd, cw, ch, ww, wh, ncw, nch, nowcw, nowch,
+             nowcw != cw || nowch != ch ? "; the program's size limits" : "",
+             style & WS_THICKFRAME ? "" : "; no sizing border, resized anyway",
+             flags & 1 ? "; WM_ENTERSIZEMOVE" : "", flags & 2 ? "; WM_EXITSIZEMOVE" : "" );
+    return 1;
+}
+
 /* ml1350 in-session launcher (docs/SESSION_LAUNCH.md; the queue and the
  * NtCreateUserProcess call live in ntdll's process_ios.c). Called by
  * Winios.m's winios_pProcessEvents on every Wine thread that pumps messages;

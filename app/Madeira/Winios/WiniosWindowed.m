@@ -81,9 +81,28 @@
  * the safe area (kept for the session), and the library's round menu button
  * hides meanwhile (WindowedMode.swift WindowedHUD): the pill has the menu.
  *
+ * Resize (round 8). The bottom-right grip resizes the guest window, width and
+ * height independently, as a desktop window manager does: the drag shows an
+ * outline of the new size and asks for the client size it means (the visible
+ * rect minus the window's non-client frame) at most ten times a second and
+ * once more when the finger lifts, coalesced to the latest size per window.
+ * The window's own thread applies it from its event pump (driver_ios.c
+ * winios_drv_resize_client_if_owner: SetWindowPos with SWP_NOMOVE |
+ * SWP_NOZORDER | SWP_NOACTIVATE, WM_ENTERSIZEMOVE / WM_EXITSIZEMOVE around
+ * the drag), and the frame follows the new size through the usual size-change
+ * path with its zoom (points per pixel) unchanged. A pinch on the title bar
+ * zooms the picture instead (the round 2 grip); env.MADEIRA_WINDOWED_RESIZE = 0
+ * makes the grip zoom again. Fullscreen (fit) and maximized frames, and a
+ * window the program maximized, are not resized (the grip zooms the last).
+ * The grip shows only on the active frame, and only for about two seconds
+ * after a touch on that frame (then it fades; it takes no touches while
+ * faded). The title bar is 30 points with 22-point buttons (32-point touch
+ * targets).
+ *
  * Log lines: "[windowed] ml1300 ..." for on/off, add, refit, remove, activate,
- * move, scale, minimize, restore, fullscreen, close, steam, search and the
- * ignored presses. */
+ * move, scale, resize, minimize, restore, fullscreen, close, steam, search and
+ * the ignored presses; the driver's "[winios] ml1302 resize ..." says whether
+ * a resize was applied or refused. */
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -113,12 +132,16 @@ __attribute__((weak)) int winios_drv_window_icon(void *hwnd, unsigned int *out, 
 __attribute__((weak)) int winios_drv_post_syscommand(void *hwnd, unsigned int cmd)
 { (void)hwnd; (void)cmd; return 0; }
 __attribute__((weak)) void *winios_drv_foreground_window(void) { return NULL; }
+/* round 8 (ml1302): -2 = a libwin32u_unix.a without the resize helper */
+__attribute__((weak)) int winios_drv_resize_client_if_owner(void *hwnd, int cw, int ch, unsigned int flags)
+{ (void)hwnd; (void)cw; (void)ch; (void)flags; return -2; }
 extern int winios_drv_process_image(unsigned int pid, char *out, unsigned int size);
 extern int winios_drv_census_owner(void *hwnd, unsigned int *pid, unsigned int *style);
 extern int winios_drv_foreground_if_owner(void *hwnd);
 
 #define WW_WS_VISIBLE      0x10000000u
 #define WW_WS_MINIMIZE     0x20000000u
+#define WW_WS_MAXIMIZE     0x01000000u
 #define WW_WS_CHILD        0x40000000u
 #define WW_WS_CAPTION      0x00C00000u
 #define WW_WS_EX_TOOLWINDOW 0x00000080u
@@ -130,10 +153,15 @@ extern int winios_drv_foreground_if_owner(void *hwnd);
 #define WW_MOUSE_DOWNS     (0x0002u | 0x0008u | 0x0020u | 0x0080u)   /* left/right/middle/X down */
 #define WW_MOUSE_UPS       (0x0004u | 0x0010u | 0x0040u | 0x0100u)
 
-static const CGFloat WW_BAR_H = 36;       /* title bar height, points */
-static const CGFloat WW_BTN = 28;         /* title-bar button circles, points (touch target a little larger) */
-static const CGFloat WW_BTN_GAP = 7;
-static const CGFloat WW_MIN_BAR_W = 220;  /* a tiny window still gets a usable title bar (four buttons) */
+static const CGFloat WW_BAR_H = 30;       /* title bar height, points (round 8: was 36) */
+static const CGFloat WW_BTN = 22;         /* title-bar button circles, points (round 8: was 28) */
+static const CGFloat WW_BTN_HIT = 32;     /* round 8: their touch targets, centred on each circle */
+static const CGFloat WW_BTN_GAP = 10;     /* between two circles: the touch targets just meet */
+static const CGFloat WW_BTN_GLYPH = 24;   /* the glyph as drawn for a 24-point circle (10-point symbols) */
+static const CGFloat WW_MIN_BAR_W = 200;  /* a tiny window still gets a usable title bar (four buttons; was 220) */
+static const CGFloat WW_GRIP = 26;        /* the resize grip, points */
+static const double WW_GRIP_SHOW_S = 2.0; /* round 8: the grip shows this long after a touch on its frame */
+static const double WW_RESIZE_EVERY_S = 0.1;   /* round 8: a drag asks for a new size at most this often */
 static const CGFloat WW_DOCK_H = 56;
 static const CGFloat WW_DOCK_ITEM = 36;   /* taskbar icons and round buttons */
 static const CGFloat WW_DOCK_PAD = 10;    /* taskbar: pill edge to the first and last item */
@@ -198,6 +226,13 @@ static int g_ncmds;
 static struct { unsigned pid; char name[64]; } g_exes[WW_EXES_MAX];
 static int g_nexes;
 
+/* Round 8: grip resizes waiting for their window's thread, the latest size per
+ * window (flags: 1 the drag began, 2 it ended; see driver_ios.c). `busy`: its
+ * thread is applying it (a pump re-entered from the window procedure skips it). */
+#define WW_RESIZES_MAX 16
+static struct { uintptr_t hwnd; int cw, ch; unsigned flags, gen; long long ns, wake_ns; int busy; } g_resizes[WW_RESIZES_MAX];
+static int g_nresizes;
+
 static _Atomic(uintptr_t) g_fg_request;      /* activate on the window's own thread */
 static _Atomic long long g_fg_request_ns;
 static _Atomic long long g_next_fg_poll_ns, g_next_info_ns;
@@ -224,6 +259,88 @@ static void ww_enqueue(uintptr_t hwnd, unsigned cmd)
     pthread_mutex_lock(&g_ww_lock);
     if (g_ncmds < WW_CMDS_MAX) { g_cmds[g_ncmds].hwnd = hwnd; g_cmds[g_ncmds].cmd = cmd; g_ncmds++; }
     pthread_mutex_unlock(&g_ww_lock);
+}
+
+/* Round 8: a new client size for the window's thread; replaces one still
+ * waiting for the same window (its flags add up). */
+static void ww_enqueue_resize(uintptr_t hwnd, int cw, int ch, unsigned flags)
+{
+    pthread_mutex_lock(&g_ww_lock);
+    int i;
+    for (i = 0; i < g_nresizes; i++) if (g_resizes[i].hwnd == hwnd) break;
+    if (i == g_nresizes && g_nresizes < WW_RESIZES_MAX) {
+        memset(&g_resizes[i], 0, sizeof(g_resizes[i]));
+        g_resizes[i].hwnd = hwnd;
+        g_resizes[i].ns = ww_now_ns();
+        g_nresizes++;
+    }
+    if (i < g_nresizes) {
+        g_resizes[i].cw = cw;
+        g_resizes[i].ch = ch;
+        g_resizes[i].flags |= flags;
+        g_resizes[i].gen++;
+    }
+    pthread_mutex_unlock(&g_ww_lock);
+}
+
+/* Wine thread, from the pump: applies the waiting resizes of windows this
+ * thread owns; one whose thread has not pumped for 3 s is dropped. */
+static void ww_pump_resizes(void)
+{
+    struct { uintptr_t hwnd; int cw, ch; unsigned flags, gen; } todo[WW_RESIZES_MAX];
+    int n = 0;
+    long long now = ww_now_ns();
+    pthread_mutex_lock(&g_ww_lock);
+    for (int i = 0; i < g_nresizes; ) {
+        if (g_resizes[i].busy) { i++; continue; }
+        if (now - g_resizes[i].ns > 3000000000LL) {
+            ww_log("resize hwnd=%p to %dx%d (client px) dropped: its thread did not pump within 3 s",
+                   (void *)g_resizes[i].hwnd, g_resizes[i].cw, g_resizes[i].ch);
+            g_resizes[i] = g_resizes[--g_nresizes];
+            continue;
+        }
+        todo[n].hwnd = g_resizes[i].hwnd; todo[n].cw = g_resizes[i].cw; todo[n].ch = g_resizes[i].ch;
+        todo[n].flags = g_resizes[i].flags; todo[n].gen = g_resizes[i].gen;
+        n++;
+        i++;
+    }
+    pthread_mutex_unlock(&g_ww_lock);
+    for (int k = 0; k < n; k++) {
+        /* claim it, so a pump re-entered from the window procedure leaves it alone */
+        pthread_mutex_lock(&g_ww_lock);
+        int i, claimed = 0, wake = 0;
+        for (i = 0; i < g_nresizes; i++) if (g_resizes[i].hwnd == todo[k].hwnd) break;
+        if (i < g_nresizes && !g_resizes[i].busy) {
+            todo[k].cw = g_resizes[i].cw; todo[k].ch = g_resizes[i].ch;
+            todo[k].flags = g_resizes[i].flags; todo[k].gen = g_resizes[i].gen;
+            g_resizes[i].busy = 1;
+            claimed = 1;
+            /* another thread wakes the window's thread with a posted WM_NULL, at most every 100 ms */
+            if (now - g_resizes[i].wake_ns >= 100000000LL) { g_resizes[i].wake_ns = now; wake = 1; }
+        }
+        pthread_mutex_unlock(&g_ww_lock);
+        if (!claimed) continue;
+        int r = winios_drv_resize_client_if_owner((void *)todo[k].hwnd, todo[k].cw, todo[k].ch,
+                                                  todo[k].flags | (wake ? 0x100u : 0));
+        pthread_mutex_lock(&g_ww_lock);
+        for (i = 0; i < g_nresizes; i++) if (g_resizes[i].hwnd == todo[k].hwnd) break;
+        if (i < g_nresizes) {
+            g_resizes[i].busy = 0;
+            if (r != 0) {
+                if (g_resizes[i].gen == todo[k].gen) g_resizes[i] = g_resizes[--g_nresizes];
+                else {   /* a newer size came meanwhile: it waits, the drag's start is done */
+                    g_resizes[i].flags &= ~(todo[k].flags & 1u);
+                    g_resizes[i].ns = ww_now_ns();
+                }
+            }
+        }
+        pthread_mutex_unlock(&g_ww_lock);
+        if (r == -2) {
+            static int logged;
+            if (!logged && (logged = 1))
+                ww_log("resize hwnd=%p not applied: this libwin32u_unix.a has no ml1302 resize helper", (void *)todo[k].hwnd);
+        }
+    }
 }
 
 static void ww_request_foreground(uintptr_t hwnd)
@@ -344,6 +461,9 @@ void winios_windowed_pump_wine(void)
         ww_log("posted WM_SYSCOMMAND 0x%x to hwnd=%p ok=%d", cmds[i].cmd, (void *)cmds[i].hwnd, ok);
     }
 
+    /* round 8: grip resizes, on the window's own thread */
+    ww_pump_resizes();
+
     long long now = ww_now_ns();
     /* a tapped window becomes foreground on its own thread */
     uintptr_t fg = atomic_load_explicit(&g_fg_request, memory_order_relaxed);
@@ -399,6 +519,10 @@ static const char *ww_kind_name(ww_kind k)
     UIImage *icon;
     CALayer *layer;
     CGRect desk;           /* visible rect, desktop px */
+    CGSize client;         /* round 8: client size, desktop px (0 x 0 until known) */
+    BOOL resizing;         /* round 8: the grip is resizing the guest window */
+    CGSize resizeWant;     /* round 8: the visible size the drag asks for, desktop px */
+    CFTimeInterval resizeSentAt, resizeKeepK;   /* last request; until then a size change keeps the zoom */
     BOOL visible;          /* from the WindowPosChanged hook */
     BOOL placed;           /* the frame has a position */
     BOOL appMinimized;     /* minimized to the taskbar (app side) */
@@ -611,6 +735,46 @@ static BOOL ww_by_touch(UIEvent *event, const char *what)
     return NO;
 }
 
+/* Round 8: the grip resizes the guest window (default) or, with
+ * env.MADEIRA_WINDOWED_RESIZE = 0, zooms the picture as in rounds 2-7. Read
+ * once per session (winios_windowed_reset forgets it). */
+static int g_resize_mode = -1;
+static BOOL ww_grip_resizes(void)
+{
+    if (g_resize_mode < 0) {
+        char cfg[16];
+        const char *v = madeira_cfg_get("env.MADEIRA_WINDOWED_RESIZE", cfg, sizeof(cfg)) ? cfg : getenv("MADEIRA_WINDOWED_RESIZE");   /* 0: the windowed frame's bottom-right grip zooms the picture (the guest window keeps its size), as before round 8; default: it resizes the guest window, width and height independently */
+        g_resize_mode = (v && v[0] == '0' && !v[1]) ? 0 : 1;
+    }
+    return g_resize_mode != 0;
+}
+
+/* Round 8: asks the window's thread for the client size that gives the
+ * visible size `want` (desktop px): the visible rect minus the client rect is
+ * the window's non-client frame (caption, borders, menu bar) as last reported.
+ * flags: 1 the drag began, 2 it ended. A repeat of the last size mid-drag is
+ * not sent again. */
+static void ww_send_resize(WWWin *w, CGSize want, unsigned flags)
+{
+    CGFloat ncw = 0, nch = 0;
+    if (w->client.width > 0 && w->client.height > 0) {
+        ncw = MAX(w->desk.size.width - w->client.width, 0);
+        nch = MAX(w->desk.size.height - w->client.height, 0);
+    }
+    int cw = (int)MAX(lround(want.width - ncw), 1), ch = (int)MAX(lround(want.height - nch), 1);
+    static uintptr_t last_hwnd;
+    static int last_cw, last_ch;
+    if (!flags && last_hwnd == w->hwnd && last_cw == cw && last_ch == ch) return;
+    last_hwnd = w->hwnd; last_cw = cw; last_ch = ch;
+    ww_enqueue_resize(w->hwnd, cw, ch, flags);
+    CFTimeInterval now = CACurrentMediaTime();
+    w->resizeSentAt = now;
+    w->resizeKeepK = now + 3.0;   /* the size changes this brings keep the zoom */
+    ww_log("resize hwnd=%p to %dx%d (client px; window %.0fx%.0f, zoom %.2f pt/px kept)%s", (void *)w->hwnd, cw, ch,
+           want.width, want.height, w->k, (flags & 1) && (flags & 2) ? " (drag began and ended)"
+           : (flags & 1) ? " (drag began)" : (flags & 2) ? " (drag ended)" : "");
+}
+
 @interface WWFrameView : UIView
 @property (nonatomic) uintptr_t hwnd;
 @property (nonatomic) BOOL chromeless;
@@ -622,6 +786,19 @@ static BOOL ww_by_touch(UIEvent *event, const char *what)
 @property (nonatomic, strong) CALayer *host;
 @property (nonatomic, strong) UIView *grip;
 @property (nonatomic) CGFloat scaleStartK;
+/* round 8 */
+@property (nonatomic) BOOL gripAllowed;           /* not fullscreen (fit) or maximized */
+@property (nonatomic) BOOL gripDragging;
+@property (nonatomic) BOOL gripZooming;           /* this drag zooms (env.MADEIRA_WINDOWED_RESIZE = 0, or the program maximized it) */
+@property (nonatomic) CFTimeInterval touchedAt;   /* the last touch on this frame */
+@property (nonatomic) BOOL gripCheckPending;
+@property (nonatomic) BOOL resizeTrailPending;
+@property (nonatomic) CGSize resizeStart;         /* visible size when the drag began, desktop px */
+@property (nonatomic, strong) UIView *ghost;      /* the outline of the size a drag asks for */
+- (void)touched;
+- (void)scheduleGripCheck;
+- (void)updateGrip;
+- (void)ghostDone;
 @end
 
 @interface WWDock : UIView <UITextFieldDelegate>
@@ -850,7 +1027,7 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
     [self addSubview:_bar];
     _label = [[UILabel alloc] initWithFrame:CGRectZero];
     _label.textColor = UIColor.whiteColor;
-    _label.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+    _label.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];   /* round 8: was 13 */
     _label.textAlignment = NSTextAlignmentCenter;
     _label.lineBreakMode = NSLineBreakByTruncatingTail;
     [_bar.contentView addSubview:_label];
@@ -859,6 +1036,10 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
     /* maximize: "+", the whole screen, no title bar */
     _maxButton = ww_round_button(@"plus", WW_BTN);
     _closeButton = ww_round_button(@"xmark", WW_BTN);
+    /* round 8: 22-point circles keep a 10-point glyph */
+    [_minButton setImage:ww_glyph(@"minus", WW_BTN_GLYPH) forState:UIControlStateNormal];
+    [_maxButton setImage:ww_glyph(@"plus", WW_BTN_GLYPH) forState:UIControlStateNormal];
+    [_closeButton setImage:ww_glyph(@"xmark", WW_BTN_GLYPH) forState:UIControlStateNormal];
     for (UIButton *b in @[_minButton, _fullButton, _maxButton, _closeButton]) [_bar.contentView addSubview:b];
     _fullButton.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.75].CGColor;   /* the ring while fitted */
     [_minButton addTarget:self action:@selector(minimizePressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
@@ -887,9 +1068,30 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
     once.allowedPressTypes = @[];
     [once requireGestureRecognizerToFail:twice];
     [_bar addGestureRecognizer:once];
+    /* round 8: a pinch on the title bar zooms the picture (what the grip did
+     * before; the guest window keeps its size) */
+    UIPinchGestureRecognizer *pinch = [[UIPinchGestureRecognizer alloc] initWithTarget:self action:@selector(barPinched:)];
+    pinch.allowedPressTypes = @[];
+    [_bar addGestureRecognizer:pinch];
 
-    /* bottom-right grip: drag to zoom the window (the guest window keeps its size) */
-    _grip = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 26, 26)];
+    /* round 8: the outline of the size a grip drag asks for, while the guest
+     * window catches up (it is resized at most ten times a second) */
+    _ghost = [[UIView alloc] initWithFrame:CGRectZero];
+    _ghost.userInteractionEnabled = NO;
+    _ghost.backgroundColor = [UIColor colorWithWhite:1 alpha:0.06];
+    _ghost.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.7].CGColor;
+    _ghost.layer.borderWidth = 1.5;
+    _ghost.layer.cornerRadius = 10;
+    _ghost.layer.cornerCurve = kCACornerCurveContinuous;
+    _ghost.hidden = YES;
+    [self addSubview:_ghost];
+
+    /* bottom-right grip: drag to resize the guest window (round 8; with
+     * env.MADEIRA_WINDOWED_RESIZE = 0 it zooms the picture, the guest window
+     * keeping its size). Shown on the active frame for a moment after a touch. */
+    _gripAllowed = YES;
+    _grip = [[UIView alloc] initWithFrame:CGRectMake(0, 0, WW_GRIP, WW_GRIP)];
+    _grip.alpha = 0;
     _grip.backgroundColor = UIColor.clearColor;
     CAShapeLayer *lines = [CAShapeLayer layer];
     UIBezierPath *p = [UIBezierPath bezierPath];
@@ -904,9 +1106,56 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
     lines.shadowRadius = 1;
     lines.shadowOffset = CGSizeZero;
     [_grip.layer addSublayer:lines];
-    [_grip addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(gripDragged:)]];
+    UIPanGestureRecognizer *gripPan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(gripDragged:)];
+    gripPan.maximumNumberOfTouches = 1;
+    gripPan.allowedPressTypes = @[];
+    [_grip addGestureRecognizer:gripPan];
     [self addSubview:_grip];
     return self;
+}
+
+/* Round 8: a touch on this frame (title bar, grip or the window in it) shows
+ * the grip while the frame is the active one, for WW_GRIP_SHOW_S seconds. */
+- (void)touched {
+    if (_chromeless) return;
+    _touchedAt = CACurrentMediaTime();
+    [self updateGrip];
+    [self scheduleGripCheck];
+}
+
+/* One pending check at a time (touches arrive at the touch rate): when it
+ * runs, a newer touch schedules the next one. */
+- (void)scheduleGripCheck {
+    if (_gripCheckPending) return;
+    _gripCheckPending = YES;
+    double wait = MAX(WW_GRIP_SHOW_S - (CACurrentMediaTime() - _touchedAt), 0) + 0.05;
+    __weak WWFrameView *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        WWFrameView *s = weakSelf;
+        if (!s) return;
+        s.gripCheckPending = NO;
+        if (CACurrentMediaTime() - s.touchedAt < WW_GRIP_SHOW_S) [s scheduleGripCheck];
+        [s updateGrip];
+    });
+}
+
+- (void)updateGrip {
+    if (_chromeless || !_grip) return;
+    BOOL recent = CACurrentMediaTime() - _touchedAt < WW_GRIP_SHOW_S;
+    BOOL show = _gripAllowed && (_gripDragging || (_active && recent));
+    _grip.hidden = !_gripAllowed;
+    CGFloat alpha = show ? 1 : 0;
+    if (fabs(_grip.alpha - alpha) < 0.01) return;
+    /* hidden (alpha 0) the grip takes no touches: the corner is the program's */
+    [UIView animateWithDuration:show ? 0.15 : 0.5 delay:0
+                        options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
+                     animations:^{ self.grip.alpha = alpha; } completion:nil];
+}
+
+/* The guest window reached the size the drag asked for (or gave up). */
+- (void)ghostDone {
+    if (_gripDragging) return;
+    _ghost.hidden = YES;
 }
 
 - (BOOL)canBecomeFocused { return NO; }
@@ -986,9 +1235,120 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
                (void *)w->hwnd, w->origin.x, w->origin.y, w->desk.origin.x, w->desk.origin.y);
 }
 
+/* Round 8: the grip resizes the guest window (width and height on their own),
+ * or zooms the picture with env.MADEIRA_WINDOWED_RESIZE = 0 and for a window
+ * the program maximized (the guest would refuse the size). */
 - (void)gripDragged:(UIPanGestureRecognizer *)g {
     WWWin *w = [self win];
-    if (!w || w->fullscreen || w->desk.size.width <= 0) return;
+    BOOL end = g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled ||
+               g.state == UIGestureRecognizerStateFailed;
+    if (!w || w->fullscreen || w->maximized || w->desk.size.width <= 0 || w->desk.size.height <= 0) {
+        if (end && _gripDragging) {   /* became fullscreen / maximized / gone mid-drag */
+            _gripDragging = NO;
+            if (w && w->resizing) { w->resizing = NO; ww_send_resize(w, w->resizeWant, 2); }
+            _ghost.hidden = YES;
+            [self updateGrip];
+        }
+        return;
+    }
+    if (g.state == UIGestureRecognizerStateBegan) {
+        BOOL guestMax = w->infoKnown && (w->info.style & WW_WS_MAXIMIZE);
+        _gripZooming = !ww_grip_resizes() || guestMax || ww_iconic(w);
+        _gripDragging = YES;
+        if (_gripZooming && guestMax && ww_grip_resizes())
+            ww_log("resize hwnd=%p: the program maximized this window, so the grip zooms the picture instead", (void *)w->hwnd);
+        if (!_gripZooming) {
+            _resizeStart = w->desk.size;
+            w->resizing = YES;
+            w->resizeWant = w->desk.size;
+            w->resizeSentAt = 0;
+            ww_raise(w, YES, "resize");
+        }
+    }
+    [self touched];
+    if (_gripZooming) [self gripZoom:g];
+    else [self gripResize:g];
+    if (end) {
+        _gripDragging = NO;
+        [self updateGrip];
+    }
+}
+
+- (void)gripResize:(UIPanGestureRecognizer *)g {
+    WWWin *w = [self win];
+    if (!w || !w->resizing) return;
+    BOOL end = g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled ||
+               g.state == UIGestureRecognizerStateFailed;
+    CGPoint t = [g translationInView:self.superview];
+    CGFloat k = MAX(w->k, 0.01);
+    /* at least a grip's worth of window in points and 64 x 32 pixels; the
+     * program's own limits (WM_GETMINMAXINFO) apply in the guest */
+    CGFloat minW = MAX(64, ceil(2 * WW_GRIP / k)), minH = MAX(32, ceil(2 * WW_GRIP / k));
+    CGSize want = CGSizeMake(MIN(MAX(round(_resizeStart.width + t.x / k), minW), 8192),
+                             MIN(MAX(round(_resizeStart.height + t.y / k), minH), 8192));
+    w->resizeWant = want;
+    /* the outline of the new size, from the frame's top-left */
+    CGFloat barH = WW_BAR_H;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    _ghost.frame = CGRectMake(0, 0, MAX(want.width * k, WW_MIN_BAR_W), barH + want.height * k);
+    if (!end) _ghost.hidden = CGSizeEqualToSize(want, w->desk.size);
+    [CATransaction commit];
+    if (end) {
+        w->resizing = NO;
+        if (w->resizeSentAt <= 0 && CGSizeEqualToSize(want, w->desk.size)) {   /* never moved */
+            _ghost.hidden = YES;
+            return;
+        }
+        ww_send_resize(w, want, w->resizeSentAt > 0 ? 2 : 3);
+        __weak WWFrameView *weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [weakSelf ghostDone];   /* the program kept another size (its limits) or is slow */
+        });
+        return;
+    }
+    double since = CACurrentMediaTime() - w->resizeSentAt;
+    if (since >= WW_RESIZE_EVERY_S) {
+        if (!CGSizeEqualToSize(want, w->desk.size)) ww_send_resize(w, want, w->resizeSentAt > 0 ? 0 : 1);
+    } else if (!_resizeTrailPending) {
+        /* the finger may stop here: the latest size goes out when the interval is up */
+        _resizeTrailPending = YES;
+        __weak WWFrameView *weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((WW_RESIZE_EVERY_S - since) * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            WWFrameView *s = weakSelf;
+            if (!s) return;
+            s.resizeTrailPending = NO;
+            WWWin *v = [s win];
+            if (v && v->resizing && CACurrentMediaTime() - v->resizeSentAt >= WW_RESIZE_EVERY_S - 0.001)
+                ww_send_resize(v, v->resizeWant, v->resizeSentAt > 0 ? 0 : 1);
+        });
+    }
+}
+
+/* Round 8: a pinch on the title bar zooms the picture (the guest window keeps
+ * its size), what the grip did in rounds 2-7. */
+- (void)barPinched:(UIPinchGestureRecognizer *)g {
+    WWWin *w = [self win];
+    if (!w || w->fullscreen || w->maximized || w->desk.size.width <= 0) return;
+    if (g.state == UIGestureRecognizerStateBegan) {
+        _scaleStartK = w->k;
+        w->userScaled = YES;   /* from now on a size change keeps this zoom */
+        ww_raise(w, NO, "zoom");
+    }
+    [self touched];
+    w->k = MIN(MAX(_scaleStartK * g.scale, 0.15), 3.0);
+    ww_clamp(w);
+    ww_apply_frame(w);
+    if (g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled)
+        ww_log("scale hwnd=%p zoom=%.2f pt/px (title bar pinch; the guest window keeps its size; kept when it resizes)",
+               (void *)w->hwnd, w->k);
+}
+
+/* The round 2 grip: zoom the picture, the guest window keeps its size. */
+- (void)gripZoom:(UIPanGestureRecognizer *)g {
+    WWWin *w = [self win];
+    if (!w) return;
     if (g.state == UIGestureRecognizerStateBegan) {
         _scaleStartK = w->k;
         w->userScaled = YES;   /* from now on a size change keeps this zoom */
@@ -1019,7 +1379,7 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
     BOOL full = w && w->fullscreen;
     /* fullscreen (fit) is a state the frame is in (it cannot be dragged): the
      * button says so with the shrink arrows and a light ring, not a colour */
-    [_fullButton setImage:ww_glyph(full ? @"arrow.down.right.and.arrow.up.left" : @"arrow.up.left.and.arrow.down.right", side)
+    [_fullButton setImage:ww_glyph(full ? @"arrow.down.right.and.arrow.up.left" : @"arrow.up.left.and.arrow.down.right", WW_BTN_GLYPH)
                  forState:UIControlStateNormal];
     _fullButton.layer.borderWidth = full ? 1.5 : 0;
     _fullButton.accessibilityLabel = full ? @"Leave fit to screen" : @"Fit to screen";
@@ -1030,6 +1390,7 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
     if (_active == active) return;
     _active = active;
     [self applyActive];
+    [self updateGrip];   /* round 8: the grip belongs to the active frame only */
 }
 
 - (void)applyActive {
@@ -1038,16 +1399,23 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
     _label.textColor = [UIColor colorWithWhite:1 alpha:_active ? 1 : 0.62];
 }
 
-/* Touches a little outside the round buttons still hit them (a 35x36 point
- * target around each 28-point circle; the gaps are split between neighbours). */
+/* Touches a little outside the round buttons still hit them (round 8: a
+ * 32-point square target centred on each 22-point circle; with the 10-point
+ * gaps neighbouring targets just meet). A touch on the chrome (title bar,
+ * buttons, grip) shows the grip for a moment; one on the window inside is
+ * seen by winios_windowed_map_point. */
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = nil;
     if (!_chromeless && !self.hidden && !_bar.hidden) {
+        CGFloat pad = (WW_BTN_HIT - WW_BTN) / 2;
         for (UIButton *b in @[_closeButton, _maxButton, _fullButton, _minButton]) {
-            CGRect r = CGRectInset([self convertRect:b.frame fromView:b.superview], -WW_BTN_GAP / 2, -(WW_BAR_H - WW_BTN) / 2);
-            if (CGRectContainsPoint(r, point)) return b;
+            CGRect r = CGRectInset([self convertRect:b.frame fromView:b.superview], -pad, -pad);
+            if (CGRectContainsPoint(r, point)) { hit = b; break; }
         }
     }
-    return [super hitTest:point withEvent:event];
+    if (!hit) hit = [super hitTest:point withEvent:event];
+    if (hit && hit != self && !_chromeless && event && event.type == UIEventTypeTouches) [self touched];
+    return hit;
 }
 @end
 
@@ -2342,6 +2710,16 @@ static BOOL ww_refit(WWWin *w, const char *why)
         return YES;
     }
     BOOL resized = !CGSizeEqualToSize(w->fitSize, w->desk.size);
+    /* round 8: the size the grip asked for (or the program's answer to it)
+     * changes the window, never the zoom: the frame grows or shrinks with it */
+    if (resized && (w->resizing || CACurrentMediaTime() < w->resizeKeepK)) {
+        w->fitSize = w->desk.size;
+        ww_clamp(w);
+        if (!w->resizing)
+            ww_log("refit hwnd=%p rect={%.0f,%.0f %.0fx%.0f} zoom=%.2f (%s; resized with the grip, zoom kept)",
+                   (void *)w->hwnd, w->desk.origin.x, w->desk.origin.y, w->desk.size.width, w->desk.size.height, w->k, why);
+        return YES;
+    }
     if (w->userScaled) {
         if (!resized) return NO;
         w->fitSize = w->desk.size;
@@ -2403,8 +2781,15 @@ static void ww_apply_frame(WWWin *w)
     f.host.position = CGPointZero;
     f.host.transform = CATransform3DMakeScale(k / sx, k / sy, 1);
     [f layoutChrome:width];
-    f.grip.frame = CGRectMake(cs.width - 26, barH + cs.height - 26, 26, 26);
-    f.grip.hidden = w->fullscreen || max;
+    f.grip.frame = CGRectMake(cs.width - WW_GRIP, barH + cs.height - WW_GRIP, WW_GRIP, WW_GRIP);
+    if (!f.chromeless) {
+        /* round 8: shown on the active frame for a moment after a touch (updateGrip) */
+        f.gripAllowed = !w->fullscreen && !max;
+        [f updateGrip];
+        /* the guest window reached the size the drag asked for: the outline goes */
+        if (!f.ghost.hidden && !w->resizing && CGSizeEqualToSize(w->desk.size, w->resizeWant)) [f ghostDone];
+        if (!f.gripAllowed) f.ghost.hidden = YES;
+    }
     if (!f.chromeless) {
         f.bar.hidden = max;
         f.backgroundColor = max ? UIColor.blackColor : UIColor.clearColor;
@@ -2510,7 +2895,7 @@ static void ww_update(WWWin *w)
     ww_z_rebuild();
 }
 
-void winios_windowed_place(void *hwnd, CALayer *layer, int x, int y, int w, int h, int visible)
+void winios_windowed_place(void *hwnd, CALayer *layer, int x, int y, int w, int h, int visible, int cw, int ch)
 {
     if (!g_root || !layer) return;
     WWWin *win = ww_get((uintptr_t)hwnd, YES);
@@ -2518,6 +2903,7 @@ void winios_windowed_place(void *hwnd, CALayer *layer, int x, int y, int w, int 
     CGRect old = win->desk;
     win->layer = layer;
     win->desk = CGRectMake(x, y, w, h);
+    if (cw > 0 && ch > 0 && cw <= w && ch <= h) win->client = CGSizeMake(cw, ch);   /* round 8: the resize's non-client frame */
     win->visible = visible != 0;
     /* the program moved its own window (its title bar dragged inside the
      * frame, or SetWindowPos): the frame follows, so the finger stays on the
@@ -2848,6 +3234,9 @@ UIView *winios_windowed_make_root(CGRect frame)
            : g_dock.steamPinned ? "pinned (env.MADEIRA_WINDOWED_STEAM = 1)"
            : "shown only while a Steam window is open (env.MADEIRA_WINDOWED_STEAM = 1 pins it; Steam starts from the search or the library)");
     ww_steam_icon_check(YES);   /* round 5: the installed client's icon on the tile */
+    ww_log("grip: %s; a pinch on a title bar zooms the picture; the grip shows on the active frame for %.0f s after a touch",
+           ww_grip_resizes() ? "resizes the guest window (env.MADEIRA_WINDOWED_RESIZE = 0: zooms the picture instead)"
+                             : "zooms the picture (env.MADEIRA_WINDOWED_RESIZE = 0)", WW_GRIP_SHOW_S);
     return root;
 }
 
@@ -2906,8 +3295,12 @@ void winios_windowed_reset(void)
     g_nknown = 0;
     g_ncmds = 0;
     g_nexes = 0;
+    for (int i = 0; i < g_nresizes; ) {   /* round 8: one being applied right now finishes on its own */
+        if (g_resizes[i].busy) i++;
+        else g_resizes[i] = g_resizes[--g_nresizes];
+    }
     pthread_mutex_unlock(&g_ww_lock);
-    dispatch_async(dispatch_get_main_queue(), ^{ ww_clear_all(); });
+    dispatch_async(dispatch_get_main_queue(), ^{ g_resize_mode = -1; ww_clear_all(); });
 }
 
 void winios_windowed_relayout(void)
@@ -2975,6 +3368,8 @@ int winios_windowed_map_point(double wx, double wy, int *px, int *py)
             if (px) *px = x;
             if (py) *py = y;
             ww_note_mapped(latched, x, y);
+            WWWin *g = w->kind == WW_ATTACHED ? ww_get(w->group, NO) : w;
+            if (g) [g->frame touched];   /* round 8: the grip shows for a moment */
             return 1;
         }
     }
@@ -2990,6 +3385,7 @@ int winios_windowed_map_point(double wx, double wy, int *px, int *py)
             if (px) *px = x;
             if (py) *py = y;
             ww_note_mapped(w->hwnd, x, y);
+            [f touched];   /* round 8: the grip shows for a moment */
             return 1;
         }
         /* the frame's own title bar is chrome, not the window; a touch there

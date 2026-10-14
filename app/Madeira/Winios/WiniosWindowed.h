@@ -47,8 +47,10 @@ void winios_windowed_teardown(void);
 void winios_windowed_note_window_wine(void *hwnd);
 
 /* Main thread, after Winios.m set the window layer's frame (desktop-fit
- * coordinates) and visibility: moves the layer into its frame. */
-void winios_windowed_place(void *hwnd, CALayer *layer, int x, int y, int w, int h, int visible);
+ * coordinates) and visibility: moves the layer into its frame. cw / ch: the
+ * client size in desktop pixels (round 8: the grip's resize asks for a client
+ * size; the visible rect minus this is the window's non-client frame). */
+void winios_windowed_place(void *hwnd, CALayer *layer, int x, int y, int w, int h, int visible, int cw, int ch);
 
 /* Main thread: the window is gone. */
 void winios_windowed_forget(void *hwnd);
