@@ -94,7 +94,9 @@ for m in "$@"; do
         */*|.*|"") echo "$m: name a module directory under wine/dlls" >&2; exit 1 ;;
     esac
     [ -f "$R/wine/dlls/$m/Makefile.in" ] || { echo "$m: no wine/dlls/$m/Makefile.in" >&2; exit 1; }
-    case "$m" in *.*) f="$m" ;; *) f="$m.dll" ;; esac
+    # The file is the module's MODULE line: windows.gaming.input is a .dll, winecoreaudio.drv is not.
+    f="$(sed -n 's/^MODULE[[:space:]]*=[[:space:]]*//p' "$R/wine/dlls/$m/Makefile.in")"
+    [ -n "$f" ] || { echo "$m: no MODULE line in wine/dlls/$m/Makefile.in" >&2; exit 1; }
     targets+=("dlls/$m/arm64ec-windows/$f")
 done
 
@@ -134,7 +136,7 @@ if [ "${UNDELAY:-1}" != 0 ]; then
         done
         [ "$ok" = 1 ] || continue
         sed -i.bak -e '/^DELAYIMPORTS[[:space:]]*=/d' -e "s/^\(IMPORTS[[:space:]]*=.*\)\$/\1 $delayed/" "$mk" && rm -f "$mk.bak"
-        rm -f "$B/dlls/$m/arm64ec-windows/$m.dll"   # an earlier link with the delay imports must not satisfy make
+        rm -f "$B/dlls/$m/arm64ec-windows/$(sed -n 's/^MODULE[[:space:]]*=[[:space:]]*//p' "$mk")"   # an earlier link with the delay imports must not satisfy make
         undelayed+=("$m")
     done
     [ ${#undelayed[@]} -eq 0 ] || echo "delay imports linked as plain imports: ${undelayed[*]}"
