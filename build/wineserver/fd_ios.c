@@ -20,6 +20,7 @@
 
 
 #include "config.h"
+#include "../madeira_cfg.h"   /* ios_srv_switch */
 #include <os/log.h>
 #include <os/lock.h>
 #include <mach/mach_time.h>
@@ -55,6 +56,17 @@ semaphore_t ios_srv_wake_sem = 0;
  * restores one signal per request. */
 static volatile int ios_srv_wake_pending;
 static int ios_srv_wake_coalesce = -1;
+
+/* A switch the app exports as env.NAME: madeira.cfg's line (with the game's own lines,
+ * which win), else the process environment. The server starts before the bridge exports
+ * the env.* lines (ml1236), so getenv alone would miss them in the first session. */
+static const char *ios_srv_switch( const char *name, char *buf, size_t cap )
+{
+    char key[96];
+    snprintf( key, sizeof(key), "env.%s", name );
+    if (madeira_cfg_get( key, buf, cap )) return buf;
+    return getenv( name );
+}
 void ios_wineserver_wake(void)
 {
     if (!ios_srv_wake_sem) return;
@@ -1537,20 +1549,20 @@ void main_loop(void)
         ws_log("[wineserver-fd] iOS poll loop: master_fd=%d nb_users=%d active=%d", pollfd[0].fd, nb_users, active_users);
         {
             kern_return_t skr;
-            const char *wc = getenv( "MADEIRA_SRV_WAKE_COALESCE" );  /* 0: one wake signal per request, as before */
+            char wcb[16]; const char *wc = ios_srv_switch( "MADEIRA_SRV_WAKE_COALESCE", wcb, sizeof(wcb) );  /* 0: one wake signal per request, as before */
             ios_srv_wake_coalesce = !(wc && wc[0] == '0' && !wc[1]);
             ws_log("[wineserver-fd] coalesced request wake: %s (MADEIRA_SRV_WAKE_COALESCE=0 disables)",
                    ios_srv_wake_coalesce ? "on" : "off");
             {
-                const char *db = getenv( "MADEIRA_SRV_DOORBELL" );  /* 0: read every client fd on every pass, as before */
-                const char *fs = getenv( "MADEIRA_SRV_FULLSCAN_MS" );  /* ms between reads of every client fd with the doorbell on (default 10) */
+                char dbb[16], fsb[16]; const char *db = ios_srv_switch( "MADEIRA_SRV_DOORBELL", dbb, sizeof(dbb) );  /* 0: read every client fd on every pass, as before */
+                const char *fs = ios_srv_switch( "MADEIRA_SRV_FULLSCAN_MS", fsb, sizeof(fsb) );  /* ms between reads of every client fd with the doorbell on (default 10) */
                 long ms = fs && *fs ? strtol( fs, NULL, 10 ) : 10;
                 if (ms < 1) ms = 1;
                 if (ms > 1000) ms = 1000;
                 ios_doorbell = !(db && db[0] == '0' && !db[1]);
                 ios_fullscan_ns = (unsigned long long)ms * 1000000ull;
                 {
-                    const char *pu = getenv( "MADEIRA_SRV_POLL_US" );  /* us between socket polls and fd scans with the doorbell on (default 1000, 0 every pass) */
+                    char pub[16]; const char *pu = ios_srv_switch( "MADEIRA_SRV_POLL_US", pub, sizeof(pub) );  /* us between socket polls and fd scans with the doorbell on (default 1000, 0 every pass) */
                     long us = pu && *pu ? strtol( pu, NULL, 10 ) : 1000;
                     if (us < 0) us = 0;
                     if (us > 100000) us = 100000;

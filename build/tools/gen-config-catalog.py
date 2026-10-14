@@ -7,7 +7,7 @@ Two kinds of option live in Documents/madeira.cfg:
     the app (MadeiraConfig.get/bool/flag);
   - environment switches ("env.NAME = value"), which the app exports before
     Wine starts; any MADEIRA_*/DXMT_*/MYTHIC_* name the code reads with getenv,
-    GetEnvironmentVariable, env::getEnvVar, madeiraSwitch or a flag helper.
+    GetEnvironmentVariable, env::getEnvVar, madeiraSwitch, ios_srv_switch or a flag helper.
 
 The scan covers the tracked sources of this repository and of the wine, DXMT
 and FEX submodules. Each option gets its type and default from the reading
@@ -34,7 +34,7 @@ SKIP = ("/host-tests/", "/ffmpeg/", "ConfigCatalog.generated.swift")
 CFG = re.compile(r'\b(madeira_cfg_(?:get|int|bool)|mad_cfg_(?:int|str)_pe|'
                  r'MadeiraConfig\.(?:get|bool|flag))\(\s*"([A-Za-z0-9._-]+)"\s*(?:,\s*([^,)]+))?')
 ENV = re.compile(r'\b(getenv|GetEnvironmentVariable[AW]?|env::getEnvVar|madeiraSwitch|'
-                 r'madeira_switch_for_caller|mad_env_is_zero|flag|envFlag)\(\s*L?"((?:MADEIRA|DXMT|MYTHIC)_[A-Z0-9_]+)"'
+                 r'madeira_switch_for_caller|mad_env_is_zero|flag|envFlag|ios_srv_switch)\(\s*L?"((?:MADEIRA|DXMT|MYTHIC)_[A-Z0-9_]+)"'
                  r'\s*(?:,\s*(?:fallback:|default:)?\s*([^,)]+))?')
 BOOL_READERS = {"madeira_cfg_bool", "MadeiraConfig.bool", "MadeiraConfig.flag", "flag", "envFlag",
                 "madeiraSwitch", "madeira_switch_for_caller", "mad_env_is_zero"}
