@@ -307,6 +307,12 @@ static void *ph_wine_thread(void *arg) {
 @end
 
 static NSXPCConnection *ph_connection;
+// Both executables link the same server archive. The extension has no registry
+// of other tasks: its host hook can service only its own task, through the same
+// dispatcher used by the control thread. The app's hook owns remote routing.
+int wine_host_process_control(int pid,PHControlRequest *request,void *payload) {
+    return pid == getpid() ? ios_process_host_control(request,payload) : ESRCH;
+}
 int wine_host_spawn_process(int argc,char **argv,int fd,int cwd,char **env) {
     @autoreleasepool {
         xpc_object_t info=xpc_dictionary_create(NULL,NULL,0);
