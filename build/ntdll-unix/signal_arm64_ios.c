@@ -2487,7 +2487,14 @@ static void *ios_mach_exception_thread( void *arg )
                         {
                         /* unsigned-offset immediate loads, base x18 */
                         case 0xf9400000: /* LDR Xt */
-                            if (rt != 31) state.__x[rt] = *(uint64_t *)ea;
+                            /* The x18 patcher's "via x18" trampoline (mrs x18 / and /
+                             * ldr x18,[x18,#slot] / insn) preempted before its ldr: that
+                             * ldr reads the TSD slot holding the TEB, so x18 gets the TEB
+                             * itself, not the TEB field at the slot's offset. */
+                            if (rt == 18 && rn == 18 && ios_teb_tls_slot_offset &&
+                                fault_addr == (uintptr_t)ios_teb_tls_slot_offset)
+                                state.__x[18] = thread_teb;
+                            else if (rt != 31) state.__x[rt] = *(uint64_t *)ea;
                             emulated = 1; break;
                         case 0xb9400000: /* LDR Wt (zero-extend) */
                             if (rt != 31) state.__x[rt] = *(uint32_t *)ea;
