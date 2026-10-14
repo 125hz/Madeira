@@ -4062,8 +4062,9 @@ static ios_alias_cb_t ios_alias_cb_for( void *peb )
     int i;
 
     if (!peb || !ios_alias_per_process_enabled()) return NULL;
+    /* acquire: ios_alias_cb_set writes the callback before the PEB */
     for (i = 0; i < IOS_ALIAS_REG_MAX; i++)
-        if (ios_alias_cbs[i].peb == peb) return ios_alias_cbs[i].cb;
+        if (__atomic_load_n( &ios_alias_cbs[i].peb, __ATOMIC_ACQUIRE ) == peb) return ios_alias_cbs[i].cb;
     return NULL;
 }
 
