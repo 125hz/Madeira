@@ -7455,7 +7455,9 @@ struct file_view
     void         *base;          /* base address */
     size_t        size;          /* size in bytes */
     unsigned int  protect;       /* protection for all pages at allocation time and SEC_* flags */
+    unsigned int  ios_flags;     /* IOS_VIEW_* */
 };
+#define IOS_VIEW_QUARANTINED 0x4   /* a dead thread's stack held by the stack quarantine */
 
 /* per-page protection flags */
 #define VPROT_READ       0x01
@@ -13853,6 +13855,7 @@ static NTSTATUS create_view( struct file_view **view_ret, void *base, size_t siz
     view->base    = base;
     view->size    = size;
     view->protect = vprot;
+    view->ios_flags = 0;
     if (use_kernel_writewatch) vprot &= ~VPROT_WRITEWATCH;
     set_page_vprot( base, size, vprot );
 
@@ -21278,6 +21281,7 @@ static NTSTATUS remove_pages_from_view( struct file_view *view, char *base, size
         new_view->base    = base + size;
         new_view->size    = (char *)view->base + view->size - (char *)new_view->base;
         new_view->protect = view->protect;
+        new_view->ios_flags = view->ios_flags;
 
         unregister_view( view );
         view->size = base - (char *)view->base;
@@ -24318,6 +24322,7 @@ static void ios_stack_release( void *base )
     if (view && view->base == base)
     {
         vsize = view->size;
+        view->ios_flags |= IOS_VIEW_QUARANTINED;
         old = ios_stackq[ios_stackq_pos].base; oldsize = ios_stackq[ios_stackq_pos].size;
         ios_stackq[ios_stackq_pos].base = base; ios_stackq[ios_stackq_pos].size = vsize;
         ios_stackq_pos = (ios_stackq_pos + 1) % IOS_STACKQ_N;
@@ -24340,7 +24345,9 @@ static void ios_stack_release( void *base )
         int ok;
         server_enter_uninterrupted_section( &virtual_mutex, &sigset );
         view = find_view( old, 0 );
-        ok = view && view->base == old && view->size == oldsize;
+        /* the mark, not base and size: a new stack of the same size may have taken the
+         * range after someone else released the quarantined one */
+        ok = view && view->base == old && view->size == oldsize && (view->ios_flags & IOS_VIEW_QUARANTINED);
         server_leave_uninterrupted_section( &virtual_mutex, &sigset );
         if (ok)
         {
