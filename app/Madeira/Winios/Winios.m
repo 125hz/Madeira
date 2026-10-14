@@ -773,6 +773,8 @@ void winios_post_key(int vk, int down) {
 }
 
 BOOL winios_pProcessEvents(DWORD mask) {
+    extern void madeira_process_host_pump_windows(void) __attribute__((weak));
+    if (madeira_process_host_pump_windows) madeira_process_host_pump_windows();
     /* The restored born-minimized window's own thread brings it to the front
      * (see g_restore_foreground); other threads leave the request in place. */
     uintptr_t fg = atomic_load_explicit(&g_restore_foreground, memory_order_relaxed);
