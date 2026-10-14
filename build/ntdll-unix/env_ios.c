@@ -1116,6 +1116,25 @@ static void add_dynamic_environment( WCHAR **env, SIZE_T *pos, SIZE_T *size )
     append_envA( env, pos, size, "SystemDrive", "C:" );
     append_envA( env, pos, size, "SystemRoot", "C:\\windows" );
 #ifdef WINE_IOS
+    {
+        extern int ios_ext_process_role(void);
+        if (ios_ext_process_role())
+        {
+            /* ml1331: exec-child startup is supplied by the parent/server. Its JIT
+             * addresses name the parent's task. Replace them before the PE FEX
+             * module reads getenv; only this task's POSIX values are valid. */
+            append_envA(env,pos,size,"WINE_IOS_JIT_RX",getenv("WINE_IOS_JIT_RX"));
+            append_envA(env,pos,size,"WINE_IOS_JIT_RW",getenv("WINE_IOS_JIT_RW"));
+            append_envA(env,pos,size,"WINE_IOS_JIT_SIZE",getenv("WINE_IOS_JIT_SIZE"));
+            append_envA(env,pos,size,"FEX_MADEIRA_HOSTPROBE",getenv("FEX_MADEIRA_HOSTPROBE"));
+            append_envA(env,pos,size,"MADEIRA_EXT_PROCESS_ROLE","host");
+            append_envA(env,pos,size,"MADEIRA_FASTSYNC","0");
+            append_envA(env,pos,size,"WINE_IOS_FD_SOCKET",NULL);
+        }
+    }
+#endif
+
+#ifdef WINE_IOS
     os_log(OS_LOG_DEFAULT, "[Wine] add_dynamic_env: DONE");
 #endif
 }

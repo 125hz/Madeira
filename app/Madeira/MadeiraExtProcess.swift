@@ -1,112 +1,117 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Madeira Converter Exception: see LICENSE-EXCEPTION.md
-//
-// ml1330 process host (docs/PROCESS_HOST.md). The app-side orchestration that runs
-// ONE Wine process in the MadeiraProcessHost extension for the opt-in smoke test.
-// Nothing here runs unless the owner asks:
-//   env.MADEIRA_EXT_PROCESS = 0           kill switch for the whole feature
-//   env.MADEIRA_EXT_PROCESS_TEST = 1      run `cmd.exe /c echo remote-ok` once at session start
-// Each step logs an "[ext-proc] ml1330 …" line.
-
 import Foundation
+import Darwin
 
 @MainActor
 enum MadeiraExtProcess {
-    /// Kill switch: the whole process-host feature is off when env.MADEIRA_EXT_PROCESS = 0.
-    static var enabled: Bool { MadeiraConfig.flag("MADEIRA_EXT_PROCESS", fallback: true) }
+    // 1: enable owned Wine app-extension clients; default off (ml1331).
+    static var enabled: Bool { MadeiraConfig.flag("MADEIRA_EXT_PROCESS", fallback: false) }
+    private struct Launch {
+        let session: MadeiraProcessHostSession
+        let fd: Int32
+        let cwd: Int32
+        let done: (Bool) -> Void
+    }
+    private static var pending: [UUID: Launch] = [:]
+    private static var running: [UUID: MadeiraProcessHostSession] = [:]
 
-    /// Kept alive while the test runs.
-    private static var session: MadeiraProcessHostSession?
-
-    /// Called once per session start (ContentView.runWineFullSequence), after the probe.
     static func runTestIfRequested() {
+        guard enabled else { madeira_process_host_set_spawn_handler(nil); return }
+        madeira_process_host_set_spawn_handler { argv, env, fd, cwd, done in
+            // The block's descriptors are borrowed. Duplicate before crossing queues.
+            let socket = dup(fd), directory = cwd < 0 ? -1 : dup(cwd)
+            guard socket >= 0, cwd < 0 || directory >= 0 else {
+                if socket >= 0 { close(socket) }; done(false); return
+            }
+            DispatchQueue.main.async {
+                begin(argv: argv, env: env, fd: socket, cwd: directory, done: done)
+            }
+        }
+        // 1: exec-child cmd smoke test; steam: installed x64 full client (ml1331).
+        guard let test = MadeiraConfig.get("env.MADEIRA_EXT_PROCESS_TEST") ?? getenv("MADEIRA_EXT_PROCESS_TEST").map({ String(cString: $0) }),
+              test == "1" || test.lowercased() == "steam" else { return }
+        awaitSession(test: test.lowercased(), attempt: 0)
+    }
+
+    private static func awaitSession(test: String, attempt: Int) {
         guard enabled else { return }
-        guard MadeiraConfig.flag("MADEIRA_EXT_PROCESS_TEST", fallback: false) else { return }
-        if let reason = MadeiraBuiltInJIT.unavailableReason {
-            LogStore.shared.log("[ext-proc] ml1330 skipped: \(reason)")
+        guard MadeiraSession.available else {
+            if attempt < 60 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { awaitSession(test: test, attempt: attempt + 1) }
+            } else { LogStore.shared.log("[ext-proc] ml1331 test refused: no running desktop session") }
             return
         }
-        LogStore.shared.log("[ext-proc] ml1330 test: starting MadeiraProcessHost (cmd.exe /c echo remote-ok)")
-
-        let s = MadeiraProcessHostSession()
-        s.logger = { line in LogStore.shared.log("[ext-proc] ml1330 \(line)") }
-        session = s
-
-        s.start { pid in
-            DispatchQueue.main.async { continueAfterStart(pid: pid) }
+        guard MadeiraConfig.get("inproc-sync") != "1" else {
+            LogStore.shared.log("[ext-proc] ml1331 test refused: inproc-sync=1 uses app memory"); return
+        }
+        let command: String
+        let folder: String
+        if test == "steam" {
+            guard let path = WindowedSteam.readyClient else {
+                LogStore.shared.log("[ext-proc] ml1331 test refused: install the x64 full client first"); return
+            }
+            let windows = path.contains(":") ? path : "C:\\" + path.replacingOccurrences(of: "/", with: "\\")
+            folder = String(windows.prefix(upTo: windows.lastIndex(of: "\\")!))
+            command = "\"" + windows + "\" -nobootstrapperupdate -skipinitialbootstrap -norepairfiles -noverifyfiles -no-cef-sandbox"
+        } else {
+            command = "\"C:\\windows\\system32\\cmd.exe\" /c echo remote-ok"
+            folder = "C:\\windows\\system32"
+        }
+        LogStore.shared.log("[ext-proc] ml1331 test: launcher exec-child requested (\(test))")
+        MadeiraSession.launch(commandLine: command, workingDirectory: folder, remote: true) { result in
+            LogStore.shared.log("[ext-proc] ml1331 launcher result: \(result.ok ? "ok" : "error") \(result.reason)")
         }
     }
 
-    private static func continueAfterStart(pid: Int32) {
-        guard session != nil else { return }
-        guard pid > 0 else {
-            LogStore.shared.log("[ext-proc] ml1330 test: the extension did not start; nothing ran", level: .error)
-            session = nil
-            return
-        }
-        // Enable JIT for the EXTENSION's pid through the JIT helper (StikJIT.enableJIT
-        // takes a target pid). The helper attaches and runs Madeira's script; the pool
-        // request the extension makes is a BRK the attached debugger answers. The enable
-        // request stays open as long as the debugger is attached, so we proceed from the
-        // `started` callback rather than its completion.
-        guard let pairing = try? JITPairingFileStore.data(),
-              let script = StikJITHelper.scriptData else {
-            LogStore.shared.log("[ext-proc] ml1330 test: no pairing file or JIT script; cannot enable JIT for the extension",
-                                level: .error)
-            session = nil
-            return
-        }
-        LogStore.shared.log("[ext-proc] ml1330 enabling JIT for the extension pid=\(pid)")
-        MadeiraBuiltInJIT.send(
-            .enable(targetPID: pid, pairingData: pairing, scriptBase64: script.base64EncodedString()),
-            started: {
-                // The helper is attaching to the extension. Give it a moment, then
-                // prepare the guest; prepareGuest checks CS_DEBUGGED in the extension and
-                // reports honestly if the debugger has not landed yet.
-                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 1.0) {
-                    prepareAndRun()
-                }
-            },
-            completion: { result in
-                if case .failure(let error) = result {
-                    LogStore.shared.log("[ext-proc] ml1330 JIT enable for the extension failed: \(error.localizedDescription)",
-                                        level: .error)
-                }
-            })
+    private static func finish(_ id: UUID, ok: Bool, reason: String) {
+        guard let launch = pending.removeValue(forKey: id) else { return }
+        if !ok { shutdown(launch.fd, SHUT_RDWR); launch.session.invalidate() }
+        else { running[id] = launch.session }
+        close(launch.fd); if launch.cwd >= 0 { close(launch.cwd) }
+        LogStore.shared.log("[ext-proc] ml1331 spawn \(ok ? "ok" : "error"): \(reason)")
+        launch.done(ok)
     }
 
-    private static func prefixPath() -> String {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        return docs.appendingPathComponent("wine").path
-    }
-
-    private nonisolated static func prepareAndRun() {
-        DispatchQueue.main.async {
-            guard let s = session else { return }
-            let argv = ["wine", "C:\\windows\\system32\\cmd.exe", "/c", "echo remote-ok"]
-            // A clean environment: no MADEIRA_FASTSYNC and no inproc-sync, so the remote
-            // process runs plain server synchronisation (fastsync/madsync are process
-            // memory, not coherent across iOS tasks).
-            let env: [String] = []
-            s.prepareGuest(withArgv: argv, env: env, prefix: prefixPath()) { ok, stage, error in
+    private static func begin(argv: [String], env: [String], fd: Int32, cwd: Int32, done: @escaping (Bool) -> Void) {
+        guard enabled, MadeiraConfig.flag("MADEIRA_SHARED_DRIVE", fallback: false),
+              let prefix = madeira_process_host_shared_prefix(LibraryModel.documents.appendingPathComponent("wine").path),
+              let pairing = try? JITPairingFileStore.data(), let script = StikJITHelper.scriptData,
+              MadeiraBuiltInJIT.unavailableReason == nil else {
+            shutdown(fd, SHUT_RDWR); close(fd); if cwd >= 0 { close(cwd) }
+            LogStore.shared.log("[ext-proc] ml1331 spawn refused: shared prefix or JIT helper unavailable")
+            done(false); return
+        }
+        let id = UUID(), session = MadeiraProcessHostSession()
+        session.logger = { line in LogStore.shared.log("[ext-proc] ml1330 " + line) }
+        session.exitHandler = { _ in DispatchQueue.main.async { running[id] = nil } }
+        pending[id] = Launch(session: session, fd: fd, cwd: cwd, done: done)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 55) { finish(id, ok: false, reason: "extension startup timed out") }
+        DispatchQueue.global(qos: .userInitiated).async {
+            session.start { pid in
                 DispatchQueue.main.async {
-                    if !ok {
-                        LogStore.shared.log("[ext-proc] ml1330 test: prepare failed at stage \(stage): \(error ?? "")",
-                                            level: .error)
-                        return
-                    }
-                    s.startGuest { ok2, stage2, error2 in
-                        DispatchQueue.main.async {
-                            if ok2 {
-                                LogStore.shared.log("[ext-proc] ml1330 test: remote process started (stage \(stage2)); "
-                                    + "watch the extension's madeira-ext-log.txt for 'remote-ok' / the guest exit code",
-                                    level: .success)
-                            } else {
-                                LogStore.shared.log("[ext-proc] ml1330 test: start failed at stage \(stage2): \(error2 ?? "")",
-                                                    level: .error)
+                    guard pending[id] != nil else { session.invalidate(); return }
+                    guard pid > 0 else { finish(id, ok: false, reason: "extension did not start"); return }
+                    LogStore.shared.log("[ext-proc] ml1330 enabling JIT for the extension pid=\(pid)")
+                    MadeiraBuiltInJIT.send(.enable(targetPID: pid, pairingData: pairing, scriptBase64: script.base64EncodedString()),
+                        started: {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                                guard pending[id] != nil else { return }
+                                session.prepareGuest(withArgv: argv, socketFD: fd, directoryFD: cwd, env: env, prefix: prefix) { ok, stage, error in
+                                    DispatchQueue.main.async {
+                                        guard pending[id] != nil else { return }
+                                        guard ok else { finish(id, ok: false, reason: "prepare stage \(stage): \(error ?? "failed")"); return }
+                                        session.startGuest { started, stage, error in
+                                            DispatchQueue.main.async { finish(id, ok: started, reason: "start stage \(stage): \(error ?? "ready")") }
+                                        }
+                                    }
+                                }
                             }
-                        }
-                    }
+                        }, completion: { result in
+                            if case .failure(let error) = result {
+                                DispatchQueue.main.async { finish(id, ok: false, reason: error.localizedDescription) }
+                            }
+                        })
                 }
             }
         }

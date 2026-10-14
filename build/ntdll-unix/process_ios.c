@@ -62,6 +62,8 @@
 
 #ifdef WINE_IOS
 #include <pthread.h>
+#include <dlfcn.h>
+#include "../madeira_cfg.h"
 #include <setjmp.h>
 #include <sys/stat.h>
 #endif
@@ -408,18 +410,24 @@ static BOOL is_unix_console_handle( HANDLE handle )
  *           spawn_process
  */
 #ifdef WINE_IOS
-/* ml1330 (docs/PROCESS_HOST.md): a Wine process Madeira runs in a
- * MadeiraProcessHost app extension is NOT started through this path. spawn_process
- * / wine_ios_child_main create a child as another pthread + pseudo-process inside
- * the app's own task (its own PEB, registered in ios_proc_sockets, same JIT pool).
- * A remote process is started by the APP, over XPC: the app launches the extension
- * (an NSExtension on com.apple.ar.viewer), hands it the prefix/env/argv and the
- * client end of a socketpair to the app's wineserver, and the extension runs its
- * own ntdll from main() (server_init_process's WINESERVERSOCKET path), with its
- * own JIT pool and task. So no change is needed here for phase 1; CreateProcess
- * from a guest still lands on this in-app path. Routing CreateProcess at the
- * server to spawn a remote extension instead (the competitor's host-spawn hook,
- * their patch 0031) is phase 2. */
+/* ml1331: the first extension spawn is one launcher request, consumed only
+ * on that request's spawning Wine thread. Its descendants take the same normal
+ * NtCreateUserProcess path, then ask the app for another extension. */
+extern int ios_ext_process_role(void);
+static unsigned int msl_spawn_remote;
+static pthread_t msl_spawn_thread;
+static int ios_remote_spawn_enabled(void)
+{
+    /* MADEIRA_EXT_PROCESS=1: Wine exec children may run in owned app extensions; off by default. */
+    const char *e=getenv("MADEIRA_EXT_PROCESS");
+    return e && e[0]=='1';
+}
+static int ios_remote_spawn_requested(void)
+{
+    if (!ios_remote_spawn_enabled()) return 0;
+    return ios_ext_process_role() ||
+        (__atomic_load_n(&msl_spawn_remote,__ATOMIC_ACQUIRE) && pthread_equal(msl_spawn_thread,pthread_self()));
+}
 /* Child process thread entry point */
 extern void wine_ios_child_main( int argc, char *argv[], int child_fd_socket );
 
@@ -443,7 +451,6 @@ struct ios_child_args {
  * that is inside NtCreateUserProcess for one of its requests, so spawn_process
  * can tag that child and the child can report its start-up state
  * (madeira_session_launch_child_started). Only one launch runs at a time. */
-static pthread_t msl_spawn_thread;
 static unsigned int msl_spawn_id;   /* nonzero only while a launch is being created */
 _Thread_local unsigned int ios_child_launch_id;
 
@@ -634,6 +641,25 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     /* argv[0] and argv[1] are reserved for preloader/loader — set them */
     argv[0] = (char *)"wine";
     argv[1] = (char *)"wine";
+
+    if (ios_remote_spawn_requested())
+    {
+        extern int wine_host_spawn_process(int,char **,int,int,char **) __attribute__((weak));
+        int (*spawn)(int,char **,int,int,char **) = wine_host_spawn_process;
+        extern char **environ;
+        __atomic_store_n(&msl_spawn_remote,0,__ATOMIC_RELEASE);
+        if (madeira_cfg_bool("inproc-sync",0))
+        {
+            dprintf(2,"[ext-proc] ml1331 remote start refused: inproc-sync=1 uses app memory\n");
+            free(argv); return STATUS_NOT_SUPPORTED;
+        }
+        for(argc=0;argv[argc];argc++);
+        dprintf(2,"[ext-proc] ml1331 spawn exec-child fd=%d machine=%04x\n",socketfd,pe_info->machine);
+        ret=spawn && spawn(argc-1,argv+1,socketfd,unixdir,environ);
+        free(argv);
+        if(!ret) { shutdown(socketfd,SHUT_RDWR); return STATUS_UNSUCCESSFUL; }
+        return STATUS_SUCCESS;
+    }
 
     /* Count argc */
     for (argc = 0; argv[argc]; argc++);
@@ -1332,7 +1358,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
             }
             if (j == hl) is_helper = 1;
         }
-        if (is_helper)
+        if (is_helper && !ios_remote_spawn_requested())
         {
             const WCHAR *cl = params->CommandLine.Buffer;
             int cl_len = params->CommandLine.Length / sizeof(WCHAR);
@@ -3742,6 +3768,7 @@ NTSTATUS WINAPI NtDebugContinue( HANDLE handle, CLIENT_ID *client, NTSTATUS stat
 #define MSL_EXPIRE_S       30.0      /* not taken by then: dropped */
 #define MSL_WAKE_EVERY_S   0.25      /* WM_NULL to the desktop window, at most this often */
 #define MSL_FLAG_SERVICES_FIRST 1u
+#define MSL_FLAG_REMOTE 2u
 
 /* state values handed to the callback */
 #define MSL_STATE_STARTING 1u        /* a thread took it; detail names the parent */
@@ -4120,7 +4147,7 @@ static void msl_set_string( UNICODE_STRING *str, const WCHAR *text )
  * ml1351). Log 84, without that earlier image, shows a launched steam.exe
  * booting through its whole import list. */
 static NTSTATUS msl_create_process( const WCHAR *image, const WCHAR *cmdline, const WCHAR *curdir,
-                                    unsigned int launch_id, DWORD *pid )
+                                    unsigned int launch_id, unsigned int launch_flags, DWORD *pid )
 {
     static const WCHAR empty[] = {0};
     static WCHAR empty_env[2];
@@ -4133,6 +4160,7 @@ static NTSTATUS msl_create_process( const WCHAR *image, const WCHAR *cmdline, co
     HANDLE process = 0, thread = 0;
     CLIENT_ID id;
     NTSTATUS status;
+    WCHAR *clean_env=NULL;
     int len = wcslen( image );
 
     *pid = 0;
@@ -4158,6 +4186,36 @@ static NTSTATUS msl_create_process( const WCHAR *image, const WCHAR *cmdline, co
         params.EnvironmentSize = cur->EnvironmentSize;
     }
     else params.Environment = empty_env;
+    {
+        const char *names[]={"steam.exe","steamwebhelper.exe"};
+        int client=0, n;
+        const WCHAR *base=image;
+        const WCHAR *q;
+        /* MADEIRA_SESSION_CLEAN_STEAM_ENV=0 restores inherited per-game Steam variables for launcher client starts. */
+        const char *e=getenv("MADEIRA_SESSION_CLEAN_STEAM_ENV");
+        for(q=image;*q;q++)if(*q=='\\' || *q=='/')base=q+1;
+        for(n=0;n<2;n++) {
+            const char *name=names[n]; int i;
+            for(i=0;base[i] && name[i];i++) { WCHAR c=base[i]; if(c>='A' && c<='Z')c+=32; if(c!=name[i])break; }
+            if(!base[i] && !name[i])client=1;
+        }
+        if(client && !(e && e[0]=='0')) {
+            size_t units=1; WCHAR *env=params.Environment, *dst;
+            for(q=env;*q;q+=wcslen(q)+1)units+=wcslen(q)+1;
+            if(!(clean_env=calloc(units+1,sizeof(WCHAR))))return STATUS_NO_MEMORY;
+            dst=clean_env;
+            for(q=env;*q;q+=wcslen(q)+1) {
+                const char *blocked[]={"steamappid=","steamgameid=","steamapppath="}; int drop=0,j;
+                for(j=0;j<3;j++) { const char *b=blocked[j]; int i;
+                    for(i=0;b[i] && q[i];i++){WCHAR c=q[i];if(c>='A' && c<='Z')c+=32;if(c!=b[i])break;}
+                    if(!b[i])drop=1;
+                }
+                if(!drop){size_t l=wcslen(q)+1;memcpy(dst,q,l*sizeof(WCHAR));dst+=l;}
+            }
+            params.Environment=clean_env;params.EnvironmentSize=(dst-clean_env+1)*sizeof(WCHAR);
+            dprintf(2,"[ext-proc] ml1331 launcher client environment: per-game Steam identity removed\n");
+        }
+    }
     if (cur)
     {
         params.ConsoleFlags   = cur->ConsoleFlags;
@@ -4187,11 +4245,13 @@ static NTSTATUS msl_create_process( const WCHAR *image, const WCHAR *cmdline, co
 
     /* ml1351: tag the child spawn_process creates on this thread (see msl_spawn_id) */
     msl_spawn_thread = pthread_self();
+    __atomic_store_n(&msl_spawn_remote,!!(launch_flags & MSL_FLAG_REMOTE),__ATOMIC_RELEASE);
     __atomic_store_n( &msl_spawn_id, launch_id, __ATOMIC_RELEASE );
     status = NtCreateUserProcess( &process, &thread, PROCESS_ALL_ACCESS, THREAD_ALL_ACCESS,
                                   &process_attr, &thread_attr, 0, THREAD_CREATE_FLAGS_CREATE_SUSPENDED,
                                   &params, &create_info, attr );
     __atomic_store_n( &msl_spawn_id, 0, __ATOMIC_RELEASE );
+    __atomic_store_n(&msl_spawn_remote,0,__ATOMIC_RELEASE);
     if (!status)
     {
         NtResumeThread( thread, NULL );
@@ -4199,6 +4259,7 @@ static NTSTATUS msl_create_process( const WCHAR *image, const WCHAR *cmdline, co
     }
     if (thread) NtClose( thread );
     if (process) NtClose( process );
+    free(clean_env);
     return status;
 }
 
@@ -4318,13 +4379,13 @@ static void msl_run_one( struct msl_request *req, int desktop_thread )
         else
         {
             DWORD spid = 0;
-            NTSTATUS sst = msl_create_process( services, services_cmd, system32, req->id, &spid );
+            NTSTATUS sst = msl_create_process( services, services_cmd, system32, req->id, 0, &spid );
             dprintf( 2, "[launch] ml1350 #%u: services.exe first (%s): status %08x pid %04x\n", req->id,
                      running < 0 ? "the process list could not be read" : "none ran", (unsigned)sst, (int)spid );
         }
     }
 
-    status = msl_create_process( req->image, req->cmdline, req->curdir, req->id, &pid );
+    status = msl_create_process( req->image, req->cmdline, req->curdir, req->id, req->flags, &pid );
     if (!status)
         snprintf( detail, sizeof(detail), "pid %04x, parent %s", (int)pid, parent );
     else if ((text = msl_status_text( status )))
