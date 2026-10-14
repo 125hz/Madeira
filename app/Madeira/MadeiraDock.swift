@@ -63,7 +63,7 @@ enum MadeiraDock {
 
     static var prefix: URL {
         let original = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent("wine")
-        return URL(fileURLWithPath: madeira_process_host_active_prefix(original.path))
+        return URL(fileURLWithPath: SharedContainer.activePrefix(original.path))
     }
     static var drive: URL { prefix.appendingPathComponent("drive_c") }
     static var clientRoot: URL { drive.appendingPathComponent(SteamRuntimeFiles.relativeRoot, isDirectory: true) }

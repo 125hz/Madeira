@@ -3509,9 +3509,13 @@ struct ContentView: View {
 
         let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         let privatePrefix = documentsPath.appendingPathComponent("wine").path
-        let winePrefixPath = madeira_process_host_shared_prefix(privatePrefix) ?? privatePrefix
+        let winePrefixPath = SharedContainer.sharedPrefix(privatePrefix) ?? privatePrefix
 
         logStore.log("Wine prefix: \(winePrefixPath)")
+
+        // ml1331: remote processes cannot share madsync's app memory; with
+        // env.MADEIRA_EXT_PROCESS = 1 this session runs fastsync (before the server reads it).
+        ExtProcessSync.prepareSession()
 
         let result = wineserver_start(winePrefixPath)
         if result == 0 {
@@ -3531,7 +3535,7 @@ struct ContentView: View {
 
         let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         let privatePrefix = documentsPath.appendingPathComponent("wine").path
-        let winePrefixPath = madeira_process_host_shared_prefix(privatePrefix) ?? privatePrefix
+        let winePrefixPath = SharedContainer.sharedPrefix(privatePrefix) ?? privatePrefix
 
         // Call synchronously — caller already waited for wineserver to be ready
         let result = wine_process_start(winePrefixPath)

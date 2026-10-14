@@ -596,7 +596,7 @@ final class LibraryModel: ObservableObject {
     static var documents: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0] }
     static var drive: URL {
         let original = documents.appendingPathComponent("wine", isDirectory: true)
-        let prefix = URL(fileURLWithPath: madeira_process_host_active_prefix(original.path))
+        let prefix = URL(fileURLWithPath: SharedContainer.activePrefix(original.path))
         return prefix.appendingPathComponent("drive_c", isDirectory: true).resolvingSymlinksInPath()
     }
     @Published var enabled = false
@@ -4157,7 +4157,7 @@ struct LibraryHUD: View {
     @ObservedObject private var controls = TouchControlsModel.shared
     /// A Madeira Dock start: its status, failure and Show desktop (DockStartScreen).
     @ObservedObject private var dockStart = DockStartScreen.shared
-    /// Windowed mode: a maximized frame's restore pill has the menu button (round 7).
+    /// Windowed mode: the taskbar and the restore pill have the menu button (rounds 7 and 9).
     @ObservedObject private var windowed = WindowedHUD.shared
     private let sessionTools = MadeiraConfig.flag("MADEIRA_SESSION_TOOLS")
     /// The in-game menu's Diagnostics (frame capture, GPU sync), for testing: off

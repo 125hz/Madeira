@@ -99,6 +99,17 @@
  * faded). The title bar is 30 points with 22-point buttons (32-point touch
  * targets).
  *
+ * Round 9. The grip keeps the client area's aspect ratio from the start of
+ * the drag (a game that keeps its swapchain size is never shown stretched);
+ * holding the grip still for a moment before dragging, or two fingers, frees
+ * it for that drag, and env.MADEIRA_WINDOWED_RESIZE_FREE = 1 makes free the
+ * default. Every frame's picture is scaled uniformly (one zoom for both
+ * axes, ww_apply_frame); fit and maximize letterbox it. The title bar has
+ * minimize, maximize (the full-screen arrows) and close; the fit button is
+ * back only with env.MADEIRA_WINDOWED_FIT_BUTTON = 1. The taskbar and the
+ * restore pill are about a fifth smaller (30-point items), and the library's
+ * round menu button is hidden for the whole windowed session.
+ *
  * Log lines: "[windowed] ml1300 ..." for on/off, add, refit, remove, activate,
  * move, scale, resize, minimize, restore, fullscreen, close, steam, search and
  * the ignored presses; the driver's "[winios] ml1302 resize ..." says whether
@@ -138,6 +149,10 @@ __attribute__((weak)) int winios_drv_resize_client_if_owner(void *hwnd, int cw, 
 extern int winios_drv_process_image(unsigned int pid, char *out, unsigned int size);
 extern int winios_drv_census_owner(void *hwnd, unsigned int *pid, unsigned int *style);
 extern int winios_drv_foreground_if_owner(void *hwnd);
+/* ml1332: a window of a Wine client in the process-host extension has no thread in
+ * this task; any Wine thread asks the server to make it foreground (driver_ios.c). */
+__attribute__((weak)) int winios_drv_foreground_remote(void *hwnd) { (void)hwnd; return 0; }
+extern int madeira_process_host_is_remote_window(void *hwnd);   /* ProcessHostClient.m */
 
 #define WW_WS_VISIBLE      0x10000000u
 #define WW_WS_MINIMIZE     0x20000000u
@@ -158,15 +173,20 @@ static const CGFloat WW_BTN = 22;         /* title-bar button circles, points (r
 static const CGFloat WW_BTN_HIT = 32;     /* round 8: their touch targets, centred on each circle */
 static const CGFloat WW_BTN_GAP = 10;     /* between two circles: the touch targets just meet */
 static const CGFloat WW_BTN_GLYPH = 24;   /* the glyph as drawn for a 24-point circle (10-point symbols) */
-static const CGFloat WW_MIN_BAR_W = 200;  /* a tiny window still gets a usable title bar (four buttons; was 220) */
+static const CGFloat WW_MIN_BAR_W = 168;  /* a tiny window still gets a usable title bar (round 9: three buttons; was 200 with four) */
+static const CGFloat WW_MIN_BAR_W_FIT = 200;   /* round 9: the same with the fit button back (env.MADEIRA_WINDOWED_FIT_BUTTON = 1) */
 static const CGFloat WW_GRIP = 26;        /* the resize grip, points */
 static const double WW_GRIP_SHOW_S = 2.0; /* round 8: the grip shows this long after a touch on its frame */
 static const double WW_RESIZE_EVERY_S = 0.1;   /* round 8: a drag asks for a new size at most this often */
-static const CGFloat WW_DOCK_H = 56;
-static const CGFloat WW_DOCK_ITEM = 36;   /* taskbar icons and round buttons */
-static const CGFloat WW_DOCK_PAD = 10;    /* taskbar: pill edge to the first and last item */
-static const CGFloat WW_DOCK_GAP = 10;    /* taskbar: between any two items */
-static const CGFloat WW_SEARCH_W = 112;
+static const CGFloat WW_DOCK_H = 46;      /* round 9: was 56 */
+static const CGFloat WW_DOCK_ITEM = 30;   /* taskbar icons, round buttons and the search field's height (round 9: was 36) */
+static const CGFloat WW_DOCK_PAD = 8;     /* taskbar: pill edge to the first and last item (round 9: was 10) */
+static const CGFloat WW_DOCK_GAP = 8;     /* taskbar: between any two items (round 9: was 10) */
+static const CGFloat WW_DOCK_ICON_R = 7.5;    /* round 9: a program icon's corners (was 9) */
+static const CGFloat WW_DOCK_DOT_Y = 39.5;    /* round 9: the running dot's top, WW_DOCK_H - 6.5 (was 56 - 7.5) */
+static const CGFloat WW_SEARCH_W = 96;    /* round 9: was 112 */
+/* round 9: the restore pill, a fifth smaller (was two 36-point buttons, 10 apart, in a 92 x 46 pill) */
+static const CGFloat WW_PILL_BTN = 30, WW_PILL_PAD = 5, WW_PILL_GAP = 8;
 static const CGFloat WW_GRAB = 120;       /* title bar that always stays on screen, points */
 
 static void ww_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -472,6 +492,15 @@ void winios_windowed_pump_wine(void)
             atomic_compare_exchange_strong(&g_fg_request, &fg, 0);   /* its thread never pumped */
         } else {
             int r = winios_drv_foreground_if_owner((void *)fg);
+            /* ml1332: the owner-thread rule never runs for an extension client's
+             * window (its threads are in another task). The server routes the
+             * activation to that thread; nothing is asked of the extension. */
+            if (!r && madeira_process_host_is_remote_window((void *)fg)) {
+                r = winios_drv_foreground_remote((void *)fg);
+                static _Atomic int said;
+                if (r && !atomic_exchange(&said, 1))
+                    ww_log("ml1332 activate remote hwnd=%p foreground=%d (server-routed; no extension call)", (void *)fg, r);
+            }
             if (r && atomic_compare_exchange_strong(&g_fg_request, &fg, 0))
                 ww_log("activate hwnd=%p foreground=%d (tap)", (void *)fg, r);
         }
@@ -523,6 +552,8 @@ static const char *ww_kind_name(ww_kind k)
     BOOL resizing;         /* round 8: the grip is resizing the guest window */
     CGSize resizeWant;     /* round 8: the visible size the drag asks for, desktop px */
     CFTimeInterval resizeSentAt, resizeKeepK;   /* last request; until then a size change keeps the zoom */
+    CGSize resizeClientWant;   /* round 9: the client size an aspect-locked drag asks for (0 x 0: from the visible size) */
+    int resizeAspectW, resizeAspectH;   /* round 9: the reduced client aspect the drag keeps (0: a free drag) */
     BOOL visible;          /* from the WindowPosChanged hook */
     BOOL placed;           /* the frame has a position */
     BOOL appMinimized;     /* minimized to the taskbar (app side) */
@@ -707,8 +738,9 @@ static WWWin *ww_steam_window(void)
 }
 /* Round 4: the magnifier sits 11 points in from the field's rounded edge and
  * 7 points before the text, which keeps 10 points from the right edge (the
- * clear button, while editing, takes its own room). */
-static const CGFloat WW_GLASS_X = 11, WW_GLASS_SIDE = 15, WW_GLASS_GAP = 7, WW_SEARCH_RIGHT = 10;
+ * clear button, while editing, takes its own room). Round 9 (a smaller
+ * taskbar): 9, 13-point glass, 6 and 8. */
+static const CGFloat WW_GLASS_X = 9, WW_GLASS_SIDE = 13, WW_GLASS_GAP = 6, WW_SEARCH_RIGHT = 8;
 - (CGRect)leftViewRectForBounds:(CGRect)bounds {
     return CGRectMake(WW_GLASS_X, floor((bounds.size.height - WW_GLASS_SIDE) / 2), WW_GLASS_SIDE, WW_GLASS_SIDE);
 }
@@ -749,6 +781,53 @@ static BOOL ww_grip_resizes(void)
     return g_resize_mode != 0;
 }
 
+/* Round 9: a grip drag keeps the client area's aspect ratio from the start of
+ * the drag (default), so a program that keeps its swapchain (render) size is
+ * never shown stretched; env.MADEIRA_WINDOWED_RESIZE_FREE = 1 makes round 8's
+ * free resize the default. Holding the grip still for a moment before
+ * dragging, or two fingers on it, gives the other mode for that drag. Read
+ * once per session. */
+static int g_resize_free = -1;
+static BOOL ww_resize_free_default(void)
+{
+    if (g_resize_free < 0) {
+        char cfg[16];
+        const char *v = madeira_cfg_get("env.MADEIRA_WINDOWED_RESIZE_FREE", cfg, sizeof(cfg)) ? cfg : getenv("MADEIRA_WINDOWED_RESIZE_FREE");   /* 1: the windowed frame's grip resizes width and height on their own by default (round 8); default (round 9): it keeps the window's aspect ratio. Holding the grip a moment before dragging, or two fingers, gives the other mode for that drag */
+        g_resize_free = (v && v[0] == '1' && !v[1]) ? 1 : 0;
+    }
+    return g_resize_free != 0;
+}
+
+/* Round 9: no fit (diagonal arrows) button on the title bar: maximize, now
+ * drawn with the full-screen arrows, does that job; holding it or a double
+ * tap on the title bar maximizes too. env.MADEIRA_WINDOWED_FIT_BUTTON = 1
+ * brings back round 8's four buttons (maximize "+", hold fit to maximize, a
+ * double tap fits). Read once per session. */
+static int g_fit_button = -1;
+static BOOL ww_fit_button(void)
+{
+    if (g_fit_button < 0) {
+        char cfg[16];
+        const char *v = madeira_cfg_get("env.MADEIRA_WINDOWED_FIT_BUTTON", cfg, sizeof(cfg)) ? cfg : getenv("MADEIRA_WINDOWED_FIT_BUTTON");   /* 1: the windowed title bar keeps round 8's fit-to-screen button (diagonal arrows) beside maximize; default (round 9): minimize, maximize (drawn with the full-screen arrows) and close */
+        g_fit_button = (v && v[0] == '1' && !v[1]) ? 1 : 0;
+    }
+    return g_fit_button != 0;
+}
+
+/* The narrowest title bar for the buttons it has. */
+static CGFloat ww_min_bar_w(void) { return ww_fit_button() ? WW_MIN_BAR_W_FIT : WW_MIN_BAR_W; }
+
+/* Round 9: "16:9" for 1280 x 720 (the client size a drag began with). */
+static void ww_reduce_aspect(CGSize c, int *aw, int *ah)
+{
+    long a = lround(c.width), b = lround(c.height), x = a, y = b;
+    *aw = *ah = 0;
+    if (a <= 0 || b <= 0) return;
+    while (y) { long r = x % y; x = y; y = r; }
+    *aw = (int)(a / x);
+    *ah = (int)(b / x);
+}
+
 /* Round 8: asks the window's thread for the client size that gives the
  * visible size `want` (desktop px): the visible rect minus the client rect is
  * the window's non-client frame (caption, borders, menu bar) as last reported.
@@ -756,12 +835,20 @@ static BOOL ww_grip_resizes(void)
  * not sent again. */
 static void ww_send_resize(WWWin *w, CGSize want, unsigned flags)
 {
-    CGFloat ncw = 0, nch = 0;
-    if (w->client.width > 0 && w->client.height > 0) {
-        ncw = MAX(w->desk.size.width - w->client.width, 0);
-        nch = MAX(w->desk.size.height - w->client.height, 0);
+    int cw, ch;
+    if (w->resizeClientWant.width > 0 && w->resizeClientWant.height > 0) {
+        /* round 9: an aspect-locked drag names the client size itself (exactly W:H) */
+        cw = (int)MAX(lround(w->resizeClientWant.width), 1);
+        ch = (int)MAX(lround(w->resizeClientWant.height), 1);
+    } else {
+        CGFloat ncw = 0, nch = 0;
+        if (w->client.width > 0 && w->client.height > 0) {
+            ncw = MAX(w->desk.size.width - w->client.width, 0);
+            nch = MAX(w->desk.size.height - w->client.height, 0);
+        }
+        cw = (int)MAX(lround(want.width - ncw), 1);
+        ch = (int)MAX(lround(want.height - nch), 1);
     }
-    int cw = (int)MAX(lround(want.width - ncw), 1), ch = (int)MAX(lround(want.height - nch), 1);
     static uintptr_t last_hwnd;
     static int last_cw, last_ch;
     if (!flags && last_hwnd == w->hwnd && last_cw == cw && last_ch == ch) return;
@@ -770,12 +857,17 @@ static void ww_send_resize(WWWin *w, CGSize want, unsigned flags)
     CFTimeInterval now = CACurrentMediaTime();
     w->resizeSentAt = now;
     w->resizeKeepK = now + 3.0;   /* the size changes this brings keep the zoom */
-    ww_log("resize hwnd=%p to %dx%d (client px; window %.0fx%.0f, zoom %.2f pt/px kept)%s", (void *)w->hwnd, cw, ch,
+    char mode[48];
+    if (w->resizeAspectW > 0 && w->resizeAspectH > 0)
+        snprintf(mode, sizeof(mode), " (aspect locked %d:%d)", w->resizeAspectW, w->resizeAspectH);
+    else
+        snprintf(mode, sizeof(mode), " (free)");
+    ww_log("resize hwnd=%p to %dx%d (client px; window %.0fx%.0f, zoom %.2f pt/px kept)%s%s", (void *)w->hwnd, cw, ch,
            want.width, want.height, w->k, (flags & 1) && (flags & 2) ? " (drag began and ended)"
-           : (flags & 1) ? " (drag began)" : (flags & 2) ? " (drag ended)" : "");
+           : (flags & 1) ? " (drag began)" : (flags & 2) ? " (drag ended)" : "", mode);
 }
 
-@interface WWFrameView : UIView
+@interface WWFrameView : UIView <UIGestureRecognizerDelegate>
 @property (nonatomic) uintptr_t hwnd;
 @property (nonatomic) BOOL chromeless;
 @property (nonatomic) BOOL active;          /* the frontmost frame: brighter title and buttons */
@@ -795,6 +887,13 @@ static void ww_send_resize(WWWin *w, CGSize want, unsigned flags)
 @property (nonatomic) BOOL resizeTrailPending;
 @property (nonatomic) CGSize resizeStart;         /* visible size when the drag began, desktop px */
 @property (nonatomic, strong) UIView *ghost;      /* the outline of the size a drag asks for */
+/* round 9 */
+@property (nonatomic) BOOL gripFree;              /* this drag resizes width and height on their own */
+@property (nonatomic) CGSize resizeClient0;       /* the client size when the drag began, desktop px */
+@property (nonatomic) CGSize resizeNC;            /* the window's non-client frame then (visible minus client) */
+@property (nonatomic, strong) UIPanGestureRecognizer *gripPan;
+@property (nonatomic, strong) UILongPressGestureRecognizer *gripHold;   /* held still first: the other mode */
+@property (nonatomic, strong) CAShapeLayer *gripLines;
 - (void)touched;
 - (void)scheduleGripCheck;
 - (void)updateGrip;
@@ -1031,15 +1130,20 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
     _label.textAlignment = NSTextAlignmentCenter;
     _label.lineBreakMode = NSLineBreakByTruncatingTail;
     [_bar.contentView addSubview:_label];
+    /* maximize: the whole screen, no title bar. Round 9: drawn with the
+     * full-screen arrows, and the fit button is gone (it did the same job);
+     * env.MADEIRA_WINDOWED_FIT_BUTTON = 1 keeps round 8's fit button and "+" */
+    BOOL fit = ww_fit_button();
+    NSString *maxGlyph = fit ? @"plus" : @"arrow.up.left.and.arrow.down.right";
     _minButton = ww_round_button(@"minus", WW_BTN);
     _fullButton = ww_round_button(@"arrow.up.left.and.arrow.down.right", WW_BTN);
-    /* maximize: "+", the whole screen, no title bar */
-    _maxButton = ww_round_button(@"plus", WW_BTN);
+    _maxButton = ww_round_button(maxGlyph, WW_BTN);
     _closeButton = ww_round_button(@"xmark", WW_BTN);
     /* round 8: 22-point circles keep a 10-point glyph */
     [_minButton setImage:ww_glyph(@"minus", WW_BTN_GLYPH) forState:UIControlStateNormal];
-    [_maxButton setImage:ww_glyph(@"plus", WW_BTN_GLYPH) forState:UIControlStateNormal];
+    [_maxButton setImage:ww_glyph(maxGlyph, WW_BTN_GLYPH) forState:UIControlStateNormal];
     [_closeButton setImage:ww_glyph(@"xmark", WW_BTN_GLYPH) forState:UIControlStateNormal];
+    _fullButton.hidden = !fit;
     for (UIButton *b in @[_minButton, _fullButton, _maxButton, _closeButton]) [_bar.contentView addSubview:b];
     _fullButton.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.75].CGColor;   /* the ring while fitted */
     [_minButton addTarget:self action:@selector(minimizePressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
@@ -1050,17 +1154,18 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
     _fullButton.accessibilityLabel = @"Fit to screen";
     _maxButton.accessibilityLabel = @"Maximize";
     _closeButton.accessibilityLabel = @"Close";
-    /* holding the fit button maximizes too */
+    /* holding the fit button maximizes too (round 9: holding maximize, the
+     * button that is there) */
     UILongPressGestureRecognizer *hold = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(fullHeld:)];
     hold.allowedPressTypes = @[];
-    [_fullButton addGestureRecognizer:hold];
+    [(fit ? _fullButton : _maxButton) addGestureRecognizer:hold];
 
     /* The title bar drags the frame. Its recognizers take touches only (no
      * presses), so a controller or keyboard focus press never reaches them. */
     UIPanGestureRecognizer *drag = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragged:)];
     drag.maximumNumberOfTouches = 1;
     [_bar addGestureRecognizer:drag];
-    UITapGestureRecognizer *twice = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(fullscreenTapped)];
+    UITapGestureRecognizer *twice = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(barDoubleTapped)];
     twice.numberOfTapsRequired = 2;
     twice.allowedPressTypes = @[];
     [_bar addGestureRecognizer:twice];
@@ -1106,12 +1211,63 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
     lines.shadowRadius = 1;
     lines.shadowOffset = CGSizeZero;
     [_grip.layer addSublayer:lines];
+    _gripLines = lines;
     UIPanGestureRecognizer *gripPan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(gripDragged:)];
-    gripPan.maximumNumberOfTouches = 1;
+    gripPan.maximumNumberOfTouches = 2;   /* round 9: two fingers give the other resize mode */
     gripPan.allowedPressTypes = @[];
+    gripPan.delegate = self;
     [_grip addGestureRecognizer:gripPan];
+    _gripPan = gripPan;
+    /* round 9: the grip held still for a moment, then dragged: the other mode
+     * (free when the default keeps the aspect ratio); recognized beside the pan */
+    UILongPressGestureRecognizer *gripHold = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(gripHeld:)];
+    gripHold.minimumPressDuration = 0.35;
+    gripHold.allowableMovement = 12;
+    gripHold.allowedPressTypes = @[];
+    gripHold.cancelsTouchesInView = NO;
+    gripHold.delegate = self;
+    [_grip addGestureRecognizer:gripHold];
+    _gripHold = gripHold;
     [self addSubview:_grip];
     return self;
+}
+
+/* Round 9: the grip's pan and its hold run side by side (the hold only marks
+ * the drag that follows). */
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)a shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
+    return (a == _gripPan && b == _gripHold) || (a == _gripHold && b == _gripPan);
+}
+
+/* Round 9: the grip, held still, says the drag that follows is the other
+ * mode: a light tap of the haptics and bolder lines until the finger lifts. */
+- (void)gripHeld:(UILongPressGestureRecognizer *)g {
+    if (g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled ||
+        g.state == UIGestureRecognizerStateFailed) {
+        if (!_gripDragging) _gripLines.lineWidth = 2;
+        return;
+    }
+    if (g.state != UIGestureRecognizerStateBegan || _gripDragging) return;
+    WWWin *w = [self win];
+    if (!w || w->fullscreen || w->maximized || !ww_grip_resizes()) return;
+    [self touched];
+    _gripLines.lineWidth = 3;
+    UIImpactFeedbackGenerator *tick = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [tick impactOccurred];
+    ww_log("grip held on hwnd=%p: the drag that follows %s", (void *)w->hwnd,
+           ww_resize_free_default() ? "keeps the aspect ratio" : "resizes width and height freely");
+}
+
+/* Round 9: a double tap on the title bar maximizes (with the fit button back,
+ * env.MADEIRA_WINDOWED_FIT_BUTTON = 1, it fits as in round 8). */
+- (void)barDoubleTapped {
+    if (ww_fit_button()) { [self fullscreenTapped]; return; }
+    WWWin *w = [self win];
+    if (w) ww_set_maximized(w, YES, "title bar double tap");
+}
+
+/* The title-bar buttons there are, right to left. */
+- (NSArray<UIButton *> *)barButtons {
+    return _fullButton.hidden ? @[_closeButton, _maxButton, _minButton] : @[_closeButton, _maxButton, _fullButton, _minButton];
 }
 
 /* Round 8: a touch on this frame (title bar, grip or the window in it) shows
@@ -1173,7 +1329,7 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
 }
 - (void)fullHeld:(UILongPressGestureRecognizer *)g {
     WWWin *w = [self win];
-    if (w && g.state == UIGestureRecognizerStateBegan) ww_set_maximized(w, YES, "fit button held");
+    if (w && g.state == UIGestureRecognizerStateBegan) ww_set_maximized(w, YES, _fullButton.hidden ? "maximize button held" : "fit button held");
 }
 
 - (void)minimizeTapped {
@@ -1247,6 +1403,7 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
             _gripDragging = NO;
             if (w && w->resizing) { w->resizing = NO; ww_send_resize(w, w->resizeWant, 2); }
             _ghost.hidden = YES;
+            _gripLines.lineWidth = 2;
             [self updateGrip];
         }
         return;
@@ -1262,6 +1419,26 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
             w->resizing = YES;
             w->resizeWant = w->desk.size;
             w->resizeSentAt = 0;
+            /* round 9: keep the client aspect (default), or free: held first,
+             * two fingers, or env.MADEIRA_WINDOWED_RESIZE_FREE = 1 (then held
+             * or two fingers keep the aspect) */
+            BOOL held = _gripHold.state == UIGestureRecognizerStateBegan || _gripHold.state == UIGestureRecognizerStateChanged;
+            BOOL two = g.numberOfTouches >= 2;
+            _gripFree = ww_resize_free_default() != (held || two);
+            CGSize d = w->desk.size, c = w->client;
+            if (!(c.width > 0 && c.height > 0 && c.width <= d.width && c.height <= d.height)) c = d;   /* client not known yet */
+            _resizeClient0 = c;
+            _resizeNC = CGSizeMake(d.width - c.width, d.height - c.height);
+            w->resizeClientWant = CGSizeZero;
+            w->resizeAspectW = w->resizeAspectH = 0;
+            if (!_gripFree) ww_reduce_aspect(c, &w->resizeAspectW, &w->resizeAspectH);
+            const char *how = held && two ? "grip held, two fingers" : held ? "grip held" : two ? "two fingers" : "default";
+            if (_gripFree)
+                ww_log("resize hwnd=%p: free (width and height on their own; %s%s)", (void *)w->hwnd, how,
+                       ww_resize_free_default() ? ", env.MADEIRA_WINDOWED_RESIZE_FREE = 1" : "");
+            else
+                ww_log("resize hwnd=%p: aspect locked %d:%d (client %.0fx%.0f; %s)", (void *)w->hwnd,
+                       w->resizeAspectW, w->resizeAspectH, c.width, c.height, how);
             ww_raise(w, YES, "resize");
         }
     }
@@ -1270,6 +1447,7 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
     else [self gripResize:g];
     if (end) {
         _gripDragging = NO;
+        _gripLines.lineWidth = 2;
         [self updateGrip];
     }
 }
@@ -1284,14 +1462,41 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
     /* at least a grip's worth of window in points and 64 x 32 pixels; the
      * program's own limits (WM_GETMINMAXINFO) apply in the guest */
     CGFloat minW = MAX(64, ceil(2 * WW_GRIP / k)), minH = MAX(32, ceil(2 * WW_GRIP / k));
-    CGSize want = CGSizeMake(MIN(MAX(round(_resizeStart.width + t.x / k), minW), 8192),
-                             MIN(MAX(round(_resizeStart.height + t.y / k), minH), 8192));
+    CGSize want;
+    if (_gripFree) {
+        want = CGSizeMake(MIN(MAX(round(_resizeStart.width + t.x / k), minW), 8192),
+                          MIN(MAX(round(_resizeStart.height + t.y / k), minH), 8192));
+        w->resizeClientWant = CGSizeZero;
+    } else {
+        /* round 9: one scale for both axes of the client area, from the axis
+         * the finger moved more (relative to the size at the start), so the
+         * program's picture keeps its proportions; whole steps of the reduced
+         * aspect (16 x 9 pixels for 16:9) keep it exact */
+        CGSize c0 = _resizeClient0, nc = _resizeNC;
+        CGFloat sw = (c0.width + t.x / k) / c0.width, sh = (c0.height + t.y / k) / c0.height;
+        CGFloat s = fabs(sw - 1) >= fabs(sh - 1) ? sw : sh;
+        CGFloat sMin = MAX((minW - nc.width) / c0.width, (minH - nc.height) / c0.height);
+        CGFloat sMax = MIN((8192 - nc.width) / c0.width, (8192 - nc.height) / c0.height);
+        s = MIN(MAX(s, sMin), MAX(sMax, sMin));
+        int aw = w->resizeAspectW, ah = w->resizeAspectH;
+        CGFloat cw, ch;
+        if (aw > 0 && ah > 0 && aw <= 64 && ah <= 64) {
+            CGFloat n = MAX(round(c0.width * s / aw), MAX(ceil(c0.width * sMin / aw - 0.001), 1));
+            cw = n * aw;
+            ch = n * ah;
+        } else {
+            cw = MAX(round(c0.width * s), 1);
+            ch = MAX(round(c0.height * s), 1);
+        }
+        w->resizeClientWant = CGSizeMake(cw, ch);
+        want = CGSizeMake(cw + nc.width, ch + nc.height);
+    }
     w->resizeWant = want;
     /* the outline of the new size, from the frame's top-left */
     CGFloat barH = WW_BAR_H;
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    _ghost.frame = CGRectMake(0, 0, MAX(want.width * k, WW_MIN_BAR_W), barH + want.height * k);
+    _ghost.frame = CGRectMake(0, 0, MAX(want.width * k, ww_min_bar_w()), barH + want.height * k);
     if (!end) _ghost.hidden = CGSizeEqualToSize(want, w->desk.size);
     [CATransaction commit];
     if (end) {
@@ -1368,11 +1573,12 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
     _bar.frame = CGRectMake(0, 0, width, WW_BAR_H);
     ww_material_fit(_bar);
     CGFloat side = WW_BTN, gap = WW_BTN_GAP, x = width - (WW_BAR_H - side) / 2 - 2 - side;
-    for (UIButton *b in @[_closeButton, _maxButton, _fullButton, _minButton]) {
+    NSArray<UIButton *> *shown = [self barButtons];   /* round 9: three unless the fit button is back */
+    for (UIButton *b in shown) {
         b.frame = CGRectMake(x, (WW_BAR_H - side) / 2, side, side);
         x -= side + gap;
     }
-    CGFloat buttons = 4 * side + 3 * gap + 14;
+    CGFloat n = shown.count, buttons = n * side + (n - 1) * gap + 14;
     if (width >= 2 * buttons + 80) _label.frame = CGRectMake(buttons, 0, width - 2 * buttons, WW_BAR_H);   /* centred */
     else _label.frame = CGRectMake(12, 0, MAX(width - buttons - 16, 0), WW_BAR_H);   /* narrow: left of the buttons */
     WWWin *w = [self win];
@@ -1408,7 +1614,7 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
     UIView *hit = nil;
     if (!_chromeless && !self.hidden && !_bar.hidden) {
         CGFloat pad = (WW_BTN_HIT - WW_BTN) / 2;
-        for (UIButton *b in @[_closeButton, _maxButton, _fullButton, _minButton]) {
+        for (UIButton *b in [self barButtons]) {
             CGRect r = CGRectInset([self convertRect:b.frame fromView:b.superview], -pad, -pad);
             if (CGRectContainsPoint(r, point)) { hit = b; break; }
         }
@@ -1430,9 +1636,9 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
     _search = [[WWSearchField alloc] initWithFrame:CGRectZero];
     _search.placeholder = @"Search";
     _search.textColor = UIColor.whiteColor;
-    _search.font = [UIFont systemFontOfSize:14];
+    _search.font = [UIFont systemFontOfSize:13];   /* round 9: was 14 */
     _search.backgroundColor = [UIColor colorWithWhite:1 alpha:0.12];
-    _search.layer.cornerRadius = WW_DOCK_ITEM / 2 - 1;
+    _search.layer.cornerRadius = WW_DOCK_ITEM / 2;   /* round 9: one item high (was item - 2) */
     _search.returnKeyType = UIReturnKeySearch;   /* round 7: the keyboard's Search key picks the first result */
     _search.autocorrectionType = UITextAutocorrectionTypeNo;
     _search.autocapitalizationType = UITextAutocapitalizationTypeNone;
@@ -1444,7 +1650,7 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
         attributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.5]}];
     /* placed by WWSearchField's rects: 11 points in from the edge, 7 before the text */
     UIImageView *glass = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"magnifyingglass"
-        withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:13 weight:UIImageSymbolWeightMedium]]];
+        withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:11 weight:UIImageSymbolWeightMedium]]];   /* round 9: was 13 */
     glass.tintColor = [UIColor colorWithWhite:1 alpha:0.6];
     glass.contentMode = UIViewContentModeScaleAspectFit;
     glass.frame = CGRectMake(0, 0, WW_GLASS_SIDE, WW_GLASS_SIDE);
@@ -1479,7 +1685,7 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
     _steamPinned = _steamAllowed && ww_bridge_bool(@"steamTilePinned");
     _steamButton = [WWButton buttonWithType:UIButtonTypeCustom];
     _steamButton.backgroundColor = [UIColor colorWithWhite:1 alpha:0.14];
-    _steamButton.layer.cornerRadius = 9;
+    _steamButton.layer.cornerRadius = WW_DOCK_ICON_R;
     _steamButton.layer.cornerCurve = kCACornerCurveContinuous;
     [_steamButton setImage:ww_glyph(@"gamecontroller", WW_DOCK_ITEM) forState:UIControlStateNormal];
     _steamButton.tintColor = [UIColor colorWithWhite:1 alpha:0.92];
@@ -1488,13 +1694,13 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
     _steamButton.hidden = !_steamPinned;
     [_pill.contentView addSubview:_steamButton];
     /* round 5: the installed client's own icon replaces the glyph (ww_steam_icon_check).
-     * Round 7: placed by ww_layout_dock in the program icons' 36-point box; it
+     * Round 7: placed by ww_layout_dock in the program icons' box (30 points since round 9); it
      * used to grow with the button (flexible size from a zero-sized button: 72
      * points, over the pill's edge). */
     _steamIcon = [[UIImageView alloc] initWithFrame:CGRectMake(0, 0, WW_DOCK_ITEM, WW_DOCK_ITEM)];
     _steamIcon.contentMode = UIViewContentModeScaleAspectFit;
     _steamIcon.autoresizingMask = UIViewAutoresizingNone;
-    _steamIcon.layer.cornerRadius = 9;
+    _steamIcon.layer.cornerRadius = WW_DOCK_ICON_R;
     _steamIcon.layer.cornerCurve = kCACornerCurveContinuous;
     _steamIcon.clipsToBounds = YES;
     _steamIcon.userInteractionEnabled = NO;
@@ -1612,17 +1818,18 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
  * it. Not focusable, touch only, as the rest of the chrome. */
 @implementation WWPill
 - (instancetype)init {
-    if (!(self = [super initWithFrame:CGRectMake(0, 0, 92, 46)])) return nil;
+    CGFloat pillH = 2 * WW_PILL_PAD + WW_PILL_BTN;   /* round 9: 40 x 78 points (was 46 x 92) */
+    if (!(self = [super initWithFrame:CGRectMake(0, 0, 2 * WW_PILL_PAD + 2 * WW_PILL_BTN + WW_PILL_GAP, pillH)])) return nil;
     /* the chrome's material, as the title bars and the taskbar */
-    _blur = ww_material(23, kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner | kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner);
+    _blur = ww_material(pillH / 2, kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner | kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner);
     _blur.frame = self.bounds;
     _blur.userInteractionEnabled = NO;
     [self addSubview:_blur];
     NSString *icon = [UIImage systemImageNamed:@"macwindow.on.rectangle"] ? @"macwindow.on.rectangle" : @"rectangle.on.rectangle";
-    _restoreButton = ww_round_button(icon, 36);
+    _restoreButton = ww_round_button(icon, WW_PILL_BTN);
     _restoreButton.accessibilityLabel = @"Show all windows";
     [_restoreButton addTarget:self action:@selector(restorePressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
-    _menuButton = ww_round_button(@"line.3.horizontal", 36);
+    _menuButton = ww_round_button(@"line.3.horizontal", WW_PILL_BTN);
     _menuButton.accessibilityLabel = @"Menu";
     [_menuButton addTarget:self action:@selector(menuPressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
     _menuButton.hidden = ww_bridge() == nil;
@@ -1645,8 +1852,8 @@ static void ww_bridge_call_bool(NSString *sel, BOOL arg)
     [super layoutSubviews];
     _blur.frame = self.bounds;
     ww_material_fit(_blur);
-    _restoreButton.frame = CGRectMake(5, 5, 36, 36);
-    _menuButton.frame = CGRectMake(51, 5, 36, 36);
+    _restoreButton.frame = CGRectMake(WW_PILL_PAD, WW_PILL_PAD, WW_PILL_BTN, WW_PILL_BTN);
+    _menuButton.frame = CGRectMake(WW_PILL_PAD + WW_PILL_BTN + WW_PILL_GAP, WW_PILL_PAD, WW_PILL_BTN, WW_PILL_BTN);
 }
 /* Round 7: the pill follows the finger, kept inside the safe area; where it
  * was left is kept for the session (ww_layout_pill). */
@@ -1699,7 +1906,8 @@ static void ww_layout_pill(void)
     if (!g_pill || !g_root) return;
     UIEdgeInsets s = g_root.safeAreaInsets;
     CGRect b = g_root.bounds;
-    CGFloat w = g_pill.menuButton.hidden ? 46 : 92, h = 46;
+    CGFloat h = 2 * WW_PILL_PAD + WW_PILL_BTN;   /* round 9: 40 (was 46) */
+    CGFloat w = g_pill.menuButton.hidden ? h : 2 * WW_PILL_PAD + 2 * WW_PILL_BTN + WW_PILL_GAP;
     if (!g_pill_moved || b.size.width <= 0 || b.size.height <= 0) {
         g_pill.frame = CGRectMake(CGRectGetMidX(b) - w / 2, CGRectGetMaxY(b) - MAX(s.bottom, 6) - h - 4, w, h);
         return;
@@ -2165,10 +2373,10 @@ static const CGFloat WW_ROW_H = 50;       /* a result row */
 static const CGFloat WW_LIST_PAD = 6;     /* panel edge to the rows */
 #define WW_LAUNCH_MAX 60                  /* rows shown at most */
 /* Round 7: results as chips (one sideways-scrolling strip) */
-static const CGFloat WW_CHIP_H = 36;      /* a chip: icon and name */
+static const CGFloat WW_CHIP_H = 30;      /* a chip: icon and name (round 9: the taskbar's item height; was 36) */
 static const CGFloat WW_CHIP_GAP = 8;
-static const CGFloat WW_CHIP_ICON = 24;
-static const CGFloat WW_CHIP_BAR_H = 48;  /* the chip strip's panel, directly above the keyboard */
+static const CGFloat WW_CHIP_ICON = 22;   /* round 9: was 24 */
+static const CGFloat WW_CHIP_BAR_H = 40;  /* the chip strip's panel, directly above the keyboard (round 9: was 48) */
 
 static NSArray<NSDictionary *> *g_launch_items;   /* tools, library, programs (WindowedMode.swift) */
 static NSArray<NSDictionary *> *g_launch_shown;   /* the rows, in order */
@@ -2638,7 +2846,7 @@ static CGFloat ww_default_k(WWWin *w)
 static void ww_clamp(WWWin *w)
 {
     CGRect a = ww_area();
-    CGFloat width = MAX(w->desk.size.width * w->k, WW_MIN_BAR_W);
+    CGFloat width = MAX(w->desk.size.width * w->k, ww_min_bar_w());
     CGFloat keep = MIN(WW_GRAB, width);
     CGFloat minX = a.origin.x + keep - width, maxX = CGRectGetMaxX(a) - keep;
     CGFloat minY = a.origin.y + WW_BAR_H, maxY = CGRectGetMaxY(a);
@@ -2651,7 +2859,7 @@ static void ww_clamp(WWWin *w)
 static void ww_shift_inside(WWWin *w)
 {
     CGRect a = ww_area();
-    CGFloat width = MAX(w->desk.size.width * w->k, WW_MIN_BAR_W), height = w->desk.size.height * w->k;
+    CGFloat width = MAX(w->desk.size.width * w->k, ww_min_bar_w()), height = w->desk.size.height * w->k;
     CGFloat minX = a.origin.x + 8, maxX = CGRectGetMaxX(a) - 8 - width;
     CGFloat minY = a.origin.y + WW_BAR_H + 8, maxY = CGRectGetMaxY(a) - 8 - height;
     w->origin.x = maxX >= minX ? MIN(MAX(w->origin.x, minX), maxX) : minX;
@@ -2679,7 +2887,7 @@ static void ww_place_new(WWWin *w, BOOL again)
         w->origin = CGPointMake(centre.x - w->desk.size.width * w->k / 2, centre.y - w->desk.size.height * w->k / 2);
     } else {
         CGFloat step = 26 * w->cascadeStep;
-        CGFloat width = MAX(w->desk.size.width * w->k, WW_MIN_BAR_W), height = w->desk.size.height * w->k;
+        CGFloat width = MAX(w->desk.size.width * w->k, ww_min_bar_w()), height = w->desk.size.height * w->k;
         CGFloat x = a.size.width > width + 16 ? a.origin.x + (a.size.width - width) / 2 - 40 + step : a.origin.x + 8 + step;
         CGFloat y = a.origin.y + WW_BAR_H + 8 + step;
         /* the cascade step never pushes a fitted window past the area */
@@ -2766,7 +2974,7 @@ static void ww_apply_frame(WWWin *w)
                         a.origin.y + barH + (a.size.height - barH - w->desk.size.height * k) / 2);
     }
     CGSize cs = CGSizeMake(w->desk.size.width * k, w->desk.size.height * k);
-    CGFloat width = f.chromeless ? cs.width : MAX(cs.width, WW_MIN_BAR_W);
+    CGFloat width = f.chromeless ? cs.width : MAX(cs.width, ww_min_bar_w());
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     if (max) {
@@ -3092,13 +3300,13 @@ static void ww_layout_dock(void)
     }
     d.steamDot.alpha = merged ? 0 : 1;
     CGFloat mid = WW_DOCK_H / 2, x = pad;
-    d.search.frame = CGRectMake(x, mid - (item - 2) / 2, WW_SEARCH_W, item - 2);
+    d.search.frame = CGRectMake(x, mid - item / 2, WW_SEARCH_W, item);   /* round 9: a 30-point touch target */
     x += WW_SEARCH_W;
     if (steam) {
         x += gap;
         d.steamButton.frame = CGRectMake(x, mid - item / 2, item, item);
         d.steamIcon.frame = d.steamButton.bounds;   /* round 7: the program icons' box, never larger */
-        d.steamDot.frame = CGRectMake(x + (item - 5) / 2, WW_DOCK_H - 7.5, 5, 5);
+        d.steamDot.frame = CGRectMake(x + (item - 5) / 2, WW_DOCK_DOT_Y, 5, 5);
         x += item;
     }
     CGFloat stripW = shownApps ? MIN(MAX(width - fixed - gap, 0), appsW) : 0;
@@ -3138,13 +3346,13 @@ static void ww_dock_refresh(void)
         UIButton *b = [WWButton buttonWithType:UIButtonTypeCustom];
         UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectMake(0, (WW_DOCK_H - WW_DOCK_ITEM) / 2, WW_DOCK_ITEM, WW_DOCK_ITEM)];
         iv.tag = 1;
-        iv.layer.cornerRadius = 9;
+        iv.layer.cornerRadius = WW_DOCK_ICON_R;
         iv.layer.cornerCurve = kCACornerCurveContinuous;
         iv.clipsToBounds = YES;
         iv.contentMode = UIViewContentModeScaleAspectFit;
         iv.userInteractionEnabled = NO;
         [b addSubview:iv];
-        UIView *dot = [[UIView alloc] initWithFrame:CGRectMake((WW_DOCK_ITEM - 5) / 2, WW_DOCK_H - 7.5, 5, 5)];
+        UIView *dot = [[UIView alloc] initWithFrame:CGRectMake((WW_DOCK_ITEM - 5) / 2, WW_DOCK_DOT_Y, 5, 5)];
         dot.tag = 2;
         dot.layer.cornerRadius = 2.5;
         dot.userInteractionEnabled = NO;
@@ -3235,8 +3443,16 @@ UIView *winios_windowed_make_root(CGRect frame)
            : "shown only while a Steam window is open (env.MADEIRA_WINDOWED_STEAM = 1 pins it; Steam starts from the search or the library)");
     ww_steam_icon_check(YES);   /* round 5: the installed client's icon on the tile */
     ww_log("grip: %s; a pinch on a title bar zooms the picture; the grip shows on the active frame for %.0f s after a touch",
-           ww_grip_resizes() ? "resizes the guest window (env.MADEIRA_WINDOWED_RESIZE = 0: zooms the picture instead)"
-                             : "zooms the picture (env.MADEIRA_WINDOWED_RESIZE = 0)", WW_GRIP_SHOW_S);
+           !ww_grip_resizes() ? "zooms the picture (env.MADEIRA_WINDOWED_RESIZE = 0)"
+           : ww_resize_free_default() ? "resizes the guest window freely (env.MADEIRA_WINDOWED_RESIZE_FREE = 1; held a moment first or two fingers: aspect locked)"
+           : "resizes the guest window, aspect locked (held a moment first or two fingers: free; env.MADEIRA_WINDOWED_RESIZE_FREE = 1 frees it by default; env.MADEIRA_WINDOWED_RESIZE = 0 zooms instead)",
+           WW_GRIP_SHOW_S);
+    ww_log("title bar: %s", ww_fit_button() ? "minimize, fit, maximize, close (env.MADEIRA_WINDOWED_FIT_BUTTON = 1)"
+                                            : "minimize, maximize (full-screen arrows; also a hold on it or a double tap on the title bar), close "
+                                              "(env.MADEIRA_WINDOWED_FIT_BUTTON = 1 brings back the fit button)");
+    /* round 9: the library's round menu button hides for the whole windowed
+     * session (the taskbar and the restore pill have the menu) */
+    ww_bridge_call_bool(@"windowedSessionChanged:", YES);
     return root;
 }
 
@@ -3283,6 +3499,7 @@ void winios_windowed_teardown(void)
     g_steam_icon_checked = 0;
     g_steam_icon_logged = NO;
     g_root = nil;
+    ww_bridge_call_bool(@"windowedSessionChanged:", NO);   /* round 9: the round menu button comes back */
     ww_log("compositor root removed");
 }
 
@@ -3300,7 +3517,7 @@ void winios_windowed_reset(void)
         else g_resizes[i] = g_resizes[--g_nresizes];
     }
     pthread_mutex_unlock(&g_ww_lock);
-    dispatch_async(dispatch_get_main_queue(), ^{ g_resize_mode = -1; ww_clear_all(); });
+    dispatch_async(dispatch_get_main_queue(), ^{ g_resize_mode = -1; g_resize_free = -1; g_fit_button = -1; ww_clear_all(); });
 }
 
 void winios_windowed_relayout(void)

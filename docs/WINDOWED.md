@@ -351,13 +351,27 @@ panel opens, so a Steam installed during the session gets its icon; a
     what Valve's bootstrapper does, natively: it reads the manifest
     `https://client-update.akamai.steamstatic.com/steam_client_win64` (HTTPS,
     redirects only on that host, at most 1 MB, a `win64` section with a numeric
-    version), takes every package it lists (18 in version 1788652215, 356 MB:
-    `bins_cef_win64` 148 MB, `bins_win64` 63.7 MB, `steamui_websrc_all`
-    33 MB, `public_all` 31 MB, …, `steam_win64` last; `strings_<lang>_all`
-    only for English), downloads each from the same host, checks its size and
-    the manifest's SHA-256 before reading it, and unpacks it with Dock's ZIP
-    reader (same checks; larger limits: 512 MB archive / file, 2 GB in all,
-    32768 entries; files streamed to disk in 1 MB pieces) into a staging folder.
+    version), takes every package it lists (18 in version 1788652215, 356 MB;
+    smallest first since the device test, so an interruption loses the least:
+    `resources_hidpi_all` 0.1 MB … `bins_win64` 63.7 MB, `bins_cef_win64`
+    148 MB last; `strings_<lang>_all` only for English), downloads each from the
+    same host, checks its size and the manifest's SHA-256 before reading it, and
+    unpacks it with Dock's ZIP reader (same checks; larger limits: 512 MB
+    archive / file, 2 GB in all, 32768 entries; the archive is mapped, never
+    read whole, files streamed to disk in 1 MB pieces) into a staging folder,
+    `Library/Application Support/MadeiraSteam/client-stage` (not backed up).
+    **Resume:** each unpacked package leaves a marker (`done/<package>`: client
+    version, package name, SHA-256); a downloaded but not yet unpacked package
+    stays in `zips/` and is used again when its size and SHA-256 still match.
+    The next Install after an interruption (or a failure, or Cancel) skips the
+    marked packages and continues from the first unfinished one; the
+    confirmation then reads "Resume Steam install (N of M done)", and so does
+    the search's Steam row. A newer client version from Valve starts over. The
+    folder is removed after a complete install. While the install runs the
+    screen does not auto-lock and each package (and the final move) runs in a
+    UIKit background task; if iOS ends that time after the app leaves the
+    screen, the install stops cleanly (`interrupted at part N of M (app
+    suspended); tap Install again to resume`).
     Then it checks that `steam.exe` is x86-64 and moves everything into
     `C:\Program Files (x86)\Steam` (existing files replaced, `steamapps`,
     `userdata`, `config`, `logs`, `dumps`, `appcache`, `depotcache` files kept,
@@ -365,13 +379,16 @@ panel opens, so a Steam installed during the session gets its icon; a
     writes Valve's manifest to `package\steam_client_win64.manifest`. A
     progress sheet (over the windowed desktop or the library) shows "Downloading
     part N of 18 (name, size)…", "Unpacking part N of 18…", "Installing N
-    files…", "Steam is installed in C:\Program Files (x86)\Steam." with a bar;
-    Cancel stops it before anything is moved (the staging folder is deleted).
-    It needs about 3x the package size free. In a running session only files
-    are written (Steam writes its own registry keys when it starts); without a
-    session the prefix is seeded first and Dock's discovery keys are written
-    when they do not conflict. Refused during a Madeira Dock session. When it
-    finishes, Steam starts as above. `env.MADEIRA_STEAM_PACKAGE_INSTALL = 0`
+    files…", then "Installed. Starting Steam…" (for 2.5 s, while the start
+    is queued) with a bar; Cancel stops it before anything is moved (finished
+    packages are kept for the next Install). It needs about 3x the remaining
+    packages' size free. In a running session only files are written (Steam
+    writes its own registry keys when it starts); without a session the prefix
+    is seeded first and Dock's discovery keys are written when they do not
+    conflict. During a Madeira Dock game session the button does not start it:
+    "Quit the game first … then open the Desktop entry in your library and
+    install Steam from its taskbar". When it finishes, Steam starts as above
+    (`[steam-launch] ml1370 command line …`). `env.MADEIRA_STEAM_PACKAGE_INSTALL = 0`
     brings back the round 4 path: any `steam.exe` counts, else Valve's
     `SteamSetup.exe` is downloaded (cdn.cloudflare.steamstatic.com, progress
     alert, `C:\madeira-games\SteamSetup.exe`) and started.
@@ -436,12 +453,16 @@ panel opens, so a Steam installed during the session gets its icon; a
   device-tested yet); the round 4 library entry remains the fallback. No
   Valve logo in the repository: the tile shows the installed `steam.exe`'s own
   icon (round 5), a generic glyph until Steam is installed.
-- ml1370's package install is not device-tested and has never downloaded from
-  Valve's host in a test (the manifest parser and the ZIP reader were run on
-  this PC's own copy of Valve's `steam_client_win64` manifest and package
-  files). It does not write `package\steam_client_win64.installed` (Valve's
-  per-file list), has no resume (a failed or cancelled install starts again
-  from the first package), keeps no copy of Madeira Dock's replaced files, and
+- ml1370's package install ran once on a device (log 99, client 1791918634:
+  18 packages, 6557 files, install-phase footprint at most 688 MB, then Steam
+  started with the switches above). Steam then did not open: its web helper
+  loaded `libcef.dll` (~212 MB image) into the 560 MB JIT pool, the pool ran
+  out (`[jit-pool] TAIL REFUSED`, `[code-buffer] EXEC ALLOC FAILED … JIT pool
+  exhausted`) and steam.exe/steamwebhelper looped on execute faults while the
+  footprint rose to 2.1 GB. That is the process model's / pool's problem, not
+  the install's. Resume reuses only whole packages (no byte-range resume of a
+  partial download). It does not write `package\steam_client_win64.installed`
+  (Valve's per-file list), keeps no copy of Madeira Dock's replaced files, and
   never updates an installed client (for a newer Valve build, delete
   `package\steam_client_win64.manifest` in Steam's folder and install again). The web helper still runs in single-process mode
   in this task and still gets the session's fixed `SteamAppId`/`SteamGameId`/
@@ -449,7 +470,7 @@ panel opens, so a Steam installed during the session gets its icon; a
   non-Dock session; the in-session launcher passes no environment).
 - Round 7: the iOS keyboard keeps its size (no API shrinks it); the chips are
   the answer to a short screen. The chip thresholds are fixed (176 / 112
-  points), not settings. The restore pill's dragged place is not kept between
+  points; 166 / 94 since round 9's smaller taskbar), not settings. The restore pill's dragged place is not kept between
   sessions.
 
 ## Log lines
@@ -475,6 +496,11 @@ All start with `[windowed] ml1300`:
     resize hwnd=0x...: the program maximized this window, so the grip zooms the picture instead               round 8
     refit hwnd=0x... rect={...} zoom=... (size changed; resized with the grip, zoom kept)                      round 8
     grip: resizes the guest window (env.MADEIRA_WINDOWED_RESIZE = 0: ...); a pinch on a title bar zooms ...   round 8, once per session
+    grip: resizes the guest window, aspect locked (held a moment first or two fingers: free; ...) | freely (env.MADEIRA_WINDOWED_RESIZE_FREE = 1; ...)   round 9, once per session
+    title bar: minimize, maximize (full-screen arrows; ...), close (...) | minimize, fit, maximize, close (env.MADEIRA_WINDOWED_FIT_BUTTON = 1)   round 9, once per session
+    resize hwnd=0x...: aspect locked 16:9 (client 1280x720; default | grip held | two fingers) | free (width and height on their own; ...)   round 9, when a drag begins
+    resize hwnd=0x... to WxH (client px; window WxH, zoom 0.62 pt/px kept)[ (drag began) | (drag ended)] (aspect locked 16:9) | (free)   round 9
+    grip held on hwnd=0x...: the drag that follows resizes width and height freely | keeps the aspect ratio      round 9
 
 and from the driver (round 8):
 
@@ -493,7 +519,7 @@ The rest, all `[windowed] ml1300`:
     posted WM_SYSCOMMAND 0xf060 to hwnd=0x... ok=1
     title hwnd=0x... "..."
     taskbar keyboard | taskbar menu
-    maximize hwnd=0x... on (button | fit button held): the whole screen, no title bar, taskbar hidden; ...
+    maximize hwnd=0x... on (button | maximize button held | title bar double tap | fit button held): the whole screen, no title bar, taskbar hidden; ...
     maximize hwnd=0x... off (restore pill | menu | hidden or minimized | window destroyed | another window maximized): back to its frame
     restore pill ignored: not a touch (...)
     steam: taskbar tile shown only while a Steam window is open (env.MADEIRA_WINDOWED_STEAM = 1 pins it; ...) | pinned (env.MADEIRA_WINDOWED_STEAM = 1) | off (...)   round 7
@@ -501,6 +527,7 @@ The rest, all `[windowed] ml1300`:
     steam: tile hidden (no Steam window)                                                             round 7
     pill moved to (x,y) pt (kept for this session)                                                   round 7
     hud menu button hidden (a frame is maximized; the restore pill has the menu) | shown             round 7 (Swift)
+    hud menu button hidden (windowed mode: the taskbar and the restore pill have the menu) | shown (windowed mode ended) | kept (env.MADEIRA_WINDOWED_HUD_MENU = 1)   round 9 (Swift)
     search: results as chips in the taskbar, right of the field | as chips directly above the keyboard, the taskbar above them | as a list above the taskbar (N pt above the keyboard)   round 7
     steam: launch (already running in this session: hwnd=0x... "..." exe=steam brought to the front)
     steam: button (no Steam window in this session; the app checks the install)
@@ -531,13 +558,15 @@ see `docs/SESSION_LAUNCH.md`.
 
 ml1370's Steam install and start (Swift, also for the library's Steam entry):
 
-    [steam-install] ml1370 start: manifest https://client-update.akamai.steamstatic.com/steam_client_win64 (a session is running: files only, ... | no session)
-    [steam-install] ml1370 manifest version 1788652215: 18 packages, 356.4 MB
-    [steam-install] ml1370 part 1 of 18 (bins_cef_win64, 148.4 MB) downloading | unpacking | done
+    [steam-install] ml1370 start: manifest https://client-update.akamai.steamstatic.com/steam_client_win64 (a session is running: files only, ... | no session); footprint N MB
+    [steam-install] ml1370 manifest version 1788652215: 18 packages, 356.4 MB (smallest first)
+    [steam-install] ml1370 part 1 of 18 (resources_hidpi_all, 0.1 MB) downloading | unpacking | done; peak footprint N MB | already done (resumed)
     [steam-install] ml1370 installing 6597 files (client version ...) into C:\Program Files (x86)\Steam
-    [steam-install] ml1370 installed in C:\Program Files (x86)\Steam (client version ..., N files from 18 packages, 356.4 MB; registry: left to Steam (...) | install path and client DLL paths written | left as is (...)[; N existing user-data files kept])
-    [steam-install] ml1370 failed at part N of 18 (downloading|unpacking|...): <reason, "cancelled">
-    [steam-install] ml1370 not started (cancelled at the confirmation)
+    [steam-install] ml1370 installed in C:\Program Files (x86)\Steam (client version ..., N files from 18 packages, 356.4 MB[, N from an earlier attempt]; registry: left to Steam (...) | install path and client DLL paths written | left as is (...)[; N existing user-data files kept]; peak footprint N MB)
+    [steam-install] ml1370 failed at part N of 18 (downloading|unpacking|...): <reason | cancelled | interrupted (app suspended)>[; resumable: N of 18 packages done]
+    [steam-install] ml1370 interrupted at part N of 18 (app suspended); tap Install again to resume
+    [steam-install] ml1370 resumable install found: N of 18 packages done (client version ...)
+    [steam-install] ml1370 not started (cancelled at the confirmation | a Madeira Dock game session is running)
     [steam-install] ml1370 library entry "Steam": the full client is not installed; offering the install
     [steam-launch] ml1370 command line (in this session (taskbar) | library entry, a session of its own): "C:\Program Files (x86)\Steam\steam.exe" -nobootstrapperupdate ...
     [steam-launch] ml1370 web helper mode: single-process (in this task)
@@ -857,6 +886,112 @@ Test (round 8):
    buttons); on a very narrow window the title still shows a few characters.
    `env.MADEIRA_WINDOWED_HUD_MENU = 1`: the round button stays.
 
+### Round 9 (2026-10-13: device feedback on vk8: aspect-locked resize, slimmer chrome)
+
+The owner on vk8: resizing a window stretched the game ("i want it to and
+still be the correct aspect ratio inside"), and a weirdly sized window stayed
+stretched when fitted to the screen; the round menu button is redundant with
+the taskbar's menu button in windowed mode; the taskbar could be a bit
+smaller; the title bar's diagonal-arrows (fit) button does what maximize does.
+App only: WiniosWindowed.m, WindowedMode.swift, one comment line in
+Library.swift, three catalog lines; no native change.
+
+**Why it stretched.** The frame itself never scales a window unevenly: the
+picture inside a frame is the guest window at one zoom (points per pixel) for
+both axes (`ww_apply_frame`: the host transform divides out the compositor's
+own pixel-to-point factors, so the content area is always the window's
+desktop size times one zoom), and fit / maximize take the smaller of the two
+screen-to-window ratios and leave black bars (letterbox). What stretched is the
+program's picture inside its own window: a game that does not rebuild its
+swapchain when its window changes size keeps rendering at the old size, and
+that picture is shown across the new client area (as Windows itself would
+show it). A window resized to another shape therefore showed the game
+stretched, and fit or maximize then kept that shape.
+
+**Aspect-locked resize (default).** A grip drag now keeps the client area's
+aspect ratio from the moment the drag began. The new size comes from one
+scale for both axes, taken from the axis the finger moved more (relative to
+the size at the start); for a ratio with small terms (16:9, 4:3, 16:10) the
+client size moves in whole steps of it (16 x 9 pixels for 16:9), so it is
+exactly W:H. The outline shows that size; the request names the client size
+directly (`resize … (aspect locked 16:9)`). A game that keeps its swapchain
+size is then shown at the same proportions, only larger or smaller, and fit /
+maximize of that window letterbox it without distortion.
+
+Free resize (round 8: width and height on their own) for that drag: hold the
+grip still for about a third of a second before dragging (a light haptic tap,
+the grip's lines get bolder), or drag it with two fingers (the grip is small,
+so the hold is the practical way). `env.MADEIRA_WINDOWED_RESIZE_FREE = 1`
+makes free the default; then the hold or two fingers keep the aspect.
+`env.MADEIRA_WINDOWED_RESIZE = 0` still makes the grip zoom the picture.
+Program limits (`WM_GETMINMAXINFO`) can still give a size of another shape;
+the driver's `ml1302 resize … applied (… client now WxH)` line says so.
+
+**Round menu button.** Hidden for the whole windowed session (the desktop with
+frames and while maximized), not only while maximized: the taskbar and the
+restore pill both have a menu button. The native side tells the Swift side
+when its root is attached and removed (`windowedSessionChanged:`);
+`WindowedHUD.hidesMenuButton` is the same flag the library HUD already
+observes. `env.MADEIRA_WINDOWED_HUD_MENU = 1` keeps the round button.
+
+**Taskbar a fifth smaller.** Pill 46 points high (was 56); icons, round
+buttons and the search field 30 points (was 36; the field is now one item high,
+13-point text, 13-point magnifier box); 8 points of padding and gap (was 10);
+the field 96 points wide (was 112); icon corners 7.5. Every item stays a
+30-point touch target. Restore pill 78 x 40 points with 30-point buttons (was
+92 x 46 with 36). Landscape search chips: 30 points high in a 40-point strip
+(was 36 / 48), 22-point icons; the thresholds that choose the list or the
+chips follow (166 and 94 points above the keyboard, was 176 and 112). Windows
+get the 10 points the taskbar gave back.
+
+**Title bar.** Minimize, maximize and close. Maximize is drawn with the
+full-screen arrows; tapping it, holding it, or double-tapping the title bar
+maximizes (the restore pill brings the windows back). The fit button is gone;
+the narrowest title bar is 168 points (was 200 for four buttons: three
+22-point buttons, 10 points apart, keep the same title room).
+`env.MADEIRA_WINDOWED_FIT_BUTTON = 1` brings back round 8's four buttons
+(maximize "+", fit with the arrows, holding fit maximizes, a double tap fits,
+the narrowest bar 200).
+
+Test (round 9):
+
+1. A game in a window (one that keeps its render size): touch it, drag the
+   grip right: the window grows in both directions at the same proportions
+   (`resize hwnd=…: aspect locked 16:9 (client 1280x720; default)`, then
+   `resize … to WxH … (aspect locked 16:9)`); the picture is never stretched.
+   Drag it down instead: the same. Report the ratio in the lines and whether
+   the game's picture still looks right.
+2. Hold the grip still a moment (haptic tap, bolder lines, `grip held on
+   hwnd=…`), then drag: width and height on their own (`resize hwnd=…: free
+   (…; grip held)`). Lift; the next quick drag is aspect-locked again.
+3. After a free resize to an odd shape, maximize: the window fills the screen
+   with black bars where its shape differs; nothing in the frame stretches it
+   (the program's own picture may still be stretched inside its window, as
+   step 2 made it).
+4. `env.MADEIRA_WINDOWED_RESIZE_FREE = 1`: plain drags are free, held drags
+   keep the aspect (session start: `grip: resizes the guest window freely …`).
+5. Windowed session in the library: no round menu button on the desktop or
+   while maximized (`hud menu button hidden (windowed mode: …)`); the taskbar's
+   and the pill's menu buttons open the menu. Leave the session: the round
+   button is back on the next non-windowed session (`… shown (windowed mode
+   ended)`). `env.MADEIRA_WINDOWED_HUD_MENU = 1`: it stays (`… kept`).
+6. The taskbar: smaller, still easy to hit (search field, program icons,
+   keyboard, menu); iPhone landscape search shows the chip strip (report the
+   `N pt above the keyboard`). The restore pill: smaller, still draggable.
+7. Title bars: three buttons (minimize, maximize with the arrows, close);
+   double-tap a title bar or hold maximize: maximized (`maximize hwnd=… on
+   (title bar double tap | maximize button held)`). `env.MADEIRA_WINDOWED_
+   FIT_BUTTON = 1`: four buttons as in round 8.
+
+Not done in round 9: the program's own picture is not letterboxed inside its
+client area when its render size and its window disagree (a free resize, or a
+program that changes its window size itself): that needs the window's Metal
+layer to aspect-fit and the touch and cursor mapping to follow it
+(Winios.m / WiniosWindowed.m together), and it would move clicks for programs
+that expect Windows' stretch. The aspect lock makes it rare. The aspect is
+the client's at the start of each drag; a window whose client size was never
+reported uses its whole window rect.
+
 ### ml1370 (2026-10-13: Steam from Valve's packages, the full client's switches)
 
 The owner's run of a competing app showed how it gets a working full client:
@@ -883,8 +1018,18 @@ window. App only (`SteamRuntime.swift`, `WindowedMode.swift`, two lines in
    bootstrap_log.txt` and `logs/webhelper.txt` in the prefix say what the
    bootstrapper did).
 2. Cancel during a download: `failed at part N of 18 (downloading):
-   cancelled`, nothing in `C:\Program Files (x86)\Steam` changed; Install
-   again starts from part 1.
+   cancelled; resumable: K of 18 packages done`, nothing in `C:\Program Files
+   (x86)\Steam` changed. Search "steam": the row reads "Resume Steam install
+   (K of 18 done)"; pick it: `resumable install found: K of 18 …`, the alert
+   "Resume Steam install (K of 18 done)", Resume: parts 1…K log `already done
+   (resumed)` and the install continues at part K+1.
+2b. (Resume, device feedback 2026-10-13) Start an install, switch to another
+   app for a few minutes: either it finished in the background (`installed in
+   …`), or `interrupted at part N of 18 (app suspended); tap Install again to
+   resume`; back in Madeira the sheet says so; Install again resumes. The
+   screen does not auto-lock while the sheet runs.
+2c. During a Madeira Dock game: picking Steam shows "Quit the game first"
+   (`not started (a Madeira Dock game session is running)`), no sheet.
 3. Library interface, no session: the library's "Steam" entry (or one made by
    the fallback): Play brings up the install sheet instead of the starting
    screen when the client is missing; after it finishes the entry starts in a

@@ -28,9 +28,10 @@ enum MadeiraExtProcess {
                 begin(argv: argv, env: env, fd: socket, cwd: directory, done: done)
             }
         }
-        // 1: exec-child cmd smoke test; steam: installed x64 full client (ml1331).
+        // 1: exec-child cmd smoke test; steam: installed x64 full client (ml1331);
+        // notepad / winemine: a bundled GDI program, the cheap pixel test (ml1332).
         guard let test = MadeiraConfig.get("env.MADEIRA_EXT_PROCESS_TEST") ?? getenv("MADEIRA_EXT_PROCESS_TEST").map({ String(cString: $0) }),
-              test == "1" || test.lowercased() == "steam" else { return }
+              test == "1" || ["steam", "notepad", "winemine"].contains(test.lowercased()) else { return }
         awaitSession(test: test.lowercased(), attempt: 0)
     }
 
@@ -42,8 +43,11 @@ enum MadeiraExtProcess {
             } else { LogStore.shared.log("[ext-proc] ml1331 test refused: no running desktop session") }
             return
         }
-        guard MadeiraConfig.get("inproc-sync") != "1" else {
-            LogStore.shared.log("[ext-proc] ml1331 test refused: inproc-sync=1 uses app memory"); return
+        // Madsync keeps its objects in app memory. startWineserver switched this session to
+        // fastsync (ExtProcessSync) unless env.MADEIRA_EXT_PROCESS_KEEP_MADSYNC = 1 kept it,
+        // or an earlier session of this app run had already started madsync.
+        if let reason = ExtProcessSync.refusal {
+            LogStore.shared.log("[ext-proc] ml1331 test refused: " + reason); return
         }
         let command: String
         let folder: String
@@ -54,6 +58,10 @@ enum MadeiraExtProcess {
             let windows = path.contains(":") ? path : "C:\\" + path.replacingOccurrences(of: "/", with: "\\")
             folder = String(windows.prefix(upTo: windows.lastIndex(of: "\\")!))
             command = "\"" + windows + "\" -nobootstrapperupdate -skipinitialbootstrap -norepairfiles -noverifyfiles -no-cef-sandbox"
+        } else if test == "notepad" || test == "winemine" {
+            // Expect "[ext-proc] ml1332 surface hwnd=..." then "frame hwnd=... buffer 0".
+            command = "\"C:\\windows\\system32\\\(test).exe\""
+            folder = "C:\\windows\\system32"
         } else {
             command = "\"C:\\windows\\system32\\cmd.exe\" /c echo remote-ok"
             folder = "C:\\windows\\system32"
@@ -75,7 +83,7 @@ enum MadeiraExtProcess {
 
     private static func begin(argv: [String], env: [String], fd: Int32, cwd: Int32, done: @escaping (Bool) -> Void) {
         guard enabled, MadeiraConfig.flag("MADEIRA_SHARED_DRIVE", fallback: false),
-              let prefix = madeira_process_host_shared_prefix(LibraryModel.documents.appendingPathComponent("wine").path),
+              let prefix = SharedContainer.sharedPrefix(LibraryModel.documents.appendingPathComponent("wine").path),
               let pairing = try? JITPairingFileStore.data(), let script = StikJITHelper.scriptData,
               MadeiraBuiltInJIT.unavailableReason == nil else {
             shutdown(fd, SHUT_RDWR); close(fd); if cwd >= 0 { close(cwd) }
@@ -116,4 +124,59 @@ enum MadeiraExtProcess {
             }
         }
     }
+}
+
+/// madsync_enabled (build/madsync/madsync.c): the wineserver's answer, computed once per
+/// app run on first use and kept. Called after the session switch below is in place.
+@_silgen_name("madsync_enabled")
+private func madeira_madsync_enabled() -> Int32
+
+/// ml1331 sync switch (docs/PROCESS_HOST.md, "Prerequisites"). Madsync keeps every
+/// synchronisation object in app memory, which a Wine process in an extension task cannot
+/// reach. With env.MADEIRA_EXT_PROCESS = 1 and madeira.cfg selecting madsync
+/// (inproc-sync = 1), the session that is about to start runs fastsync instead:
+/// MADEIRA_MADSYNC_SESSION=0 (madsync.c reads it when the wineserver creates its first
+/// object) and MADEIRA_FASTSYNC = madeira.cfg's env.MADEIRA_FASTSYNC, else auto, unless the
+/// environment already has a value. madeira.cfg itself is not changed.
+/// env.MADEIRA_EXT_PROCESS_KEEP_MADSYNC = 1 keeps madsync and the old refusal of remote
+/// starts. Not main-actor bound: ContentView.startWineserver calls it on the launch path.
+enum ExtProcessSync {
+    private static let lock = NSLock()
+    private static var reason: String?
+
+    /// Why remote starts are refused in this session (madsync is active), or nil.
+    static var refusal: String? { lock.lock(); defer { lock.unlock() }; return reason }
+
+    /// Before wineserver_start, once per session.
+    static func prepareSession() {
+        guard MadeiraConfig.flag("MADEIRA_EXT_PROCESS", fallback: false), SyncEngine.current == .madsync else {
+            record(nil); return
+        }
+        // MADEIRA_EXT_PROCESS_KEEP_MADSYNC=1: keep madsync when MADEIRA_EXT_PROCESS=1 (remote starts are then refused); default 0: fastsync for that session.
+        if MadeiraConfig.flag("MADEIRA_EXT_PROCESS_KEEP_MADSYNC", fallback: false) {
+            // A Dock installer session may still have turned it off (MADEIRA_MADSYNC_SESSION=0).
+            record(madeira_madsync_enabled() == 0 ? nil
+                   : "madsync (inproc-sync = 1) uses app memory and env.MADEIRA_EXT_PROCESS_KEEP_MADSYNC = 1 keeps it")
+            LogStore.shared.log("[ext-proc] ml1331 sync: madsync kept (env.MADEIRA_EXT_PROCESS_KEEP_MADSYNC = 1); "
+                + "remote processes are refused in this session")
+            return
+        }
+        setenv("MADEIRA_MADSYNC_SESSION", "0", 1)
+        let fast = MadeiraConfig.get("env.MADEIRA_FASTSYNC") ?? "auto"
+        setenv("MADEIRA_FASTSYNC", fast, 0)
+        if madeira_madsync_enabled() != 0 {
+            // Wine decides once per app run: an earlier session already started madsync.
+            record("madsync (inproc-sync = 1) was already started by an earlier session of this app run; restart Madeira")
+            LogStore.shared.log("[ext-proc] ml1331 sync: madsync already active in this app run (an earlier session "
+                + "started it); restart Madeira to run remote processes")
+            return
+        }
+        record(nil)
+        let value = getenv("MADEIRA_FASTSYNC").map { String(cString: $0) } ?? ""
+        let engine = SyncEngine.fastsyncValues.contains(value) ? "fastsync" : "Wine standard sync (MADEIRA_FASTSYNC=\(value))"
+        LogStore.shared.log("[ext-proc] ml1331 sync: madsync (inproc-sync = 1) disabled for this session because remote "
+            + "processes cannot share app memory; \(engine) used")
+    }
+
+    private static func record(_ value: String?) { lock.lock(); reason = value; lock.unlock() }
 }

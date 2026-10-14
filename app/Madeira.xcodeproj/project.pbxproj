@@ -147,6 +147,7 @@
 		A1000246 /* TouchControlPresets.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000246 /* TouchControlPresets.swift */; };
 		CA000001 /* ProcessHostClient.m in Sources */ = {isa = PBXBuildFile; fileRef = CA000011 /* ProcessHostClient.m */; };
 		CA000002 /* MadeiraExtProcess.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA000012 /* MadeiraExtProcess.swift */; };
+		CA000008 /* SharedContainer.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA000019 /* SharedContainer.swift */; };
 		CA000003 /* ProcessHost.m in Sources */ = {isa = PBXBuildFile; fileRef = CA000013 /* ProcessHost.m */; };
 		CA000004 /* ProcessHostStubs.c in Sources */ = {isa = PBXBuildFile; fileRef = CA000014 /* ProcessHostStubs.c */; };
 		CA000006 /* JITAllocator.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000004 /* JITAllocator.c */; };
@@ -366,6 +367,7 @@
 		CA000015 /* ProcessHostClient.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ProcessHostClient.h; sourceTree = "<group>"; };
 		CA000016 /* ProcessHostProtocol.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ProcessHostProtocol.h; sourceTree = "<group>"; };
 		CA000012 /* MadeiraExtProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MadeiraExtProcess.swift; sourceTree = "<group>"; };
+		CA000019 /* SharedContainer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedContainer.swift; sourceTree = "<group>"; };
 		CA000013 /* ProcessHost.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ProcessHost.m; sourceTree = "<group>"; };
 		CA000014 /* ProcessHostStubs.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = ProcessHostStubs.c; sourceTree = "<group>"; };
 		CA000017 /* ProcessHost.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = ProcessHost.entitlements; sourceTree = "<group>"; };
@@ -453,6 +455,7 @@
 				CA000015 /* ProcessHostClient.h */,
 				CA000016 /* ProcessHostProtocol.h */,
 				CA000012 /* MadeiraExtProcess.swift */,
+				CA000019 /* SharedContainer.swift */,
 				A2000520 /* MadeiraDock.swift */,
 				A2000521 /* MadeiraDockView.swift */,
 				A2000650 /* DockStartScreen.swift */,
@@ -894,6 +897,7 @@
 				A1000033 /* wine_stubs.c in Sources */,
 				CA000001 /* ProcessHostClient.m in Sources */,
 				CA000002 /* MadeiraExtProcess.swift in Sources */,
+				CA000008 /* SharedContainer.swift in Sources */,
 				A1000041 /* PrefixExtractor.c in Sources */,
 				A1000050 /* IOSDisplayShim.m in Sources */,
 				A1000070 /* Winios/Winios.m in Sources */,
