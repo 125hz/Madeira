@@ -63,7 +63,7 @@ int ios_process_is_remote( struct process *process )
 }
 static int ios_remote_control( int pid, PHControlRequest *request, void *payload )
 {
-    extern int wine_host_process_control(int,PHControlRequest *,void *) __attribute__((weak));
+    extern int wine_host_process_control(int,PHControlRequest *,void *) __attribute__((weak_import));
     // A direct weak reference also retains the hook in a stripped executable.
     // dlsym-only hooks can disappear under the app/extension linker dead-strip.
     int (*hook)(int,PHControlRequest *,void *) = wine_host_process_control;

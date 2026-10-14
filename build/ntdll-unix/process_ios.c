@@ -644,7 +644,7 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
 
     if (ios_remote_spawn_requested())
     {
-        extern int wine_host_spawn_process(int,char **,int,int,char **) __attribute__((weak));
+        extern int wine_host_spawn_process(int,char **,int,int,char **) __attribute__((weak_import));
         int (*spawn)(int,char **,int,int,char **) = wine_host_spawn_process;
         extern char **environ;
         __atomic_store_n(&msl_spawn_remote,0,__ATOMIC_RELEASE);
