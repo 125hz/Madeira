@@ -431,6 +431,12 @@ panel opens, so a Steam installed during the session gets its icon; a
     another client changed them; in a session only the files (the log says
     whether the keys still point at Dock's folder). Refused while a Dock game's
     host has not reported a result.
+  - **Discovery keys** (ml1371): the full client, when it runs, writes Steam's
+    own `SteamPath` / `SteamExe` / `ActiveProcess\SteamClientDll(64)` for its
+    folder and is left to do so. Every Madeira Dock start puts them (and HKLM
+    `InstallPath`) back on Dock's folder before its session starts
+    (`MadeiraDock.assertDiscoveryKeys`), so a game in a Dock session always
+    finds Dock's `steamclient64.dll`.
   - **Fallback** (round 4's behaviour), when the in-session start is refused or
     fails (`env.MADEIRA_SESSION_LAUNCH = 0`, no session, the file is gone, a
     start error; the reason is in the alert and the log): a library entry
@@ -604,6 +610,7 @@ ml1370's Steam install and start (Swift, also for the library's Steam entry):
     [steam-install] ml1371 dock repair: start (the full client is in Dock's folder | Dock's folder is not the pinned build; a session is running: files only | no session: Dock's discovery keys are rewritten)
     [steam-install] ml1371 dock repair: done (moved the full client to C:\Program Files (x86)\Steam Client | removed N entries from Dock's folder; kept [appcache, config, depotcache, steamapps, userdata]; Dock's 3 pinned packages fetched; client sha256=71b391fe… (pinned: match); registry: Dock's discovery keys rewritten | left (...))
     [steam-install] ml1371 dock repair: failed (reason) | not started (declined | a Madeira Dock game is still running)
+    [steam-install] ml1371 dock keys: rewritten (were: C:\Program Files (x86)\Steam Client[, missing in user.reg]) | already Dock's[; not written: user.reg]   (every Dock start, before its session)
     [steam-install] ml1371 library entry "...": the full client is in Madeira Dock's folder; offering the Dock repair
     [steam-launch] ml1371 library entry "...": program moved from C:\Program Files (x86)\Steam\steam.exe to C:\Program Files (x86)\Steam Client\steam.exe
     [steam-install] ml1370 library entry "Steam": the full client is not installed; offering the install

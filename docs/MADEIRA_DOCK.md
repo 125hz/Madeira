@@ -480,10 +480,15 @@ configured engine again.
   Dock's folder, fetches the three pinned packages again and checks that
   `steamclient64.dll` is the pinned build. Without a session it also rewrites
   Dock's discovery keys (`registry(…, force: true)`); in a session it writes
-  files only. Log: `[steam-install] ml1371 dock repair: …`. Not yet handled:
-  the full client, once it runs, writes Steam's own `SteamPath` and
-  `ActiveProcess\SteamClientDll64` for its folder; a later Dock game reads
-  those keys until a repair without a session rewrites them.
+  files only. Log: `[steam-install] ml1371 dock repair: …`. The full client,
+  once it runs, writes Steam's own `SteamPath` and
+  `ActiveProcess\SteamClientDll64` for its folder (it is left to do so); so
+  every Dock start, before the session and dockhost.exe start
+  (`MadeiraDock.assertDiscoveryKeys`, called from ContentView's `startDock`),
+  puts all the keys `SteamRuntimeFiles.registry()` manages back on Dock's
+  folder with `force: true` and logs `[steam-install] ml1371 dock keys:
+  rewritten (were: <folder>) | already Dock's` (missing keys are added and
+  logged as `were: missing in user.reg`).
 
 ## Tests
 
