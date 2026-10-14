@@ -9,7 +9,10 @@
 //  download finishing, the library opening or saving the game, Game details
 //  opening, a start):
 //    - with nothing of its own yet (no config file, no lines in upstream's
-//      `config` field), the game gets its whole recommendation;
+//      `config` field), a game new to the library gets its whole
+//      recommendation, and one already in the library the config file only:
+//      its fields and switches (resolution, FPS limit, AVX ...) stay the
+//      player's until Reset to Recommended;
 //    - with a config of its own, it keeps it, and only Reset to Recommended
 //      replaces it.
 //  A config Madeira wrote that nobody has changed since follows a newer
@@ -56,7 +59,15 @@ extension GameRecommendations {
     @discardableResult
     static func prepare(_ entry: inout LibraryEntry, new: Bool = false) -> Bool {
         if let found = due(entry.windowsPath, recommendation(for: entry), ownLines: entry.config, title: entry.title),
-           put(found.rec, to: entry.windowsPath, found.kind, title: entry.title), found.kind == .firstSight {
+           put(found.rec, to: entry.windowsPath, found.kind, title: entry.title, switches: new), found.kind == .firstSight {
+            // A game already in the library keeps its own fields and switches (resolution,
+            // FPS limit, AVX ...): the player may have set them. It gets the config file only;
+            // Reset to Recommended brings the rest.
+            guard new else {
+                LogStore.shared.log("[recommended] \(entry.title): \(found.rec.id) v\(found.rec.version) config only; "
+                                    + "the entry keeps its own fields and switches")
+                return false
+            }
             takeEntryFields(found.rec, &entry)
             return true
         }
@@ -87,7 +98,7 @@ extension GameRecommendations {
             return (desktop ? "Madeira recommends its standard settings for the Desktop: "
                             : "Madeira has no list for this game yet, so it recommends its standard settings: ")
                 + "\(lines) config line\(lines == 1 ? "" : "s") (the emulator's code-patch report off, without which many games "
-                + "close at start, and the settings the tested games run with). Resetting replaces "
+                + "close at start). Resetting replaces "
                 + (desktop ? "the Desktop's" : "this game's") + " config with them."
         }
         let summary = rec.switchSummary
@@ -130,14 +141,15 @@ extension GameRecommendations {
     /// The config file, and on first sight or a reset the switches LibraryPrefs keeps for
     /// the game's path: AVX, NVIDIA and Wine's C++ runtime.
     @discardableResult
-    private static func put(_ rec: GameRecommendation, to windowsPath: String, _ kind: Write, title: String) -> Bool {
+    private static func put(_ rec: GameRecommendation, to windowsPath: String, _ kind: Write, title: String,
+                            switches: Bool = true) -> Bool {
         let file = GameProfile(windowsPath: windowsPath)
         file.text = rec.fileText
         guard file.text == rec.fileText else {
             LogStore.shared.log("[recommended] \(title): could not write \(rec.id)", level: .error)
             return false
         }
-        if kind != .updated {
+        if kind != .updated && switches {
             if let on = rec.avx { LibraryPrefs.setAVX(on, for: windowsPath) }
             if let on = rec.nvidia { LibraryPrefs.setNvidia(on, for: windowsPath) }
             if let on = rec.wineVCRT { LibraryPrefs.setWineVCRT(on, for: windowsPath) }

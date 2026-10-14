@@ -6,12 +6,14 @@ match the working lists they were taken from (Red Dead Redemption 2's line for
 line), every key that is not env.NAME is one Madeira reads (the generated
 settings catalog), no list overrides Social Club's DLLs, and the app applies them where the owner asked: a game's first sight (library
 start-up, saving an entry, Game details, a start) and Reset to Recommended at
-the bottom of Game details. Every list, the standard one too, ends with
-madeira-bcd's defaults where upstream's differ, because madeira-bcd's games ran
-with them: MADEIRA_FREE_DELAY_MS = 2000, MADEIRA_CTX_CPU_AREA = 2 (madeira-bcd's
+the bottom of Game details. Every game's own list ends with madeira-bcd's
+defaults where upstream's differ, because madeira-bcd's games ran with them: MADEIRA_FREE_DELAY_MS = 2000, MADEIRA_CTX_CPU_AREA = 2 (madeira-bcd's
 fuller GetThreadContext; 1 is the control-only form) and MADEIRA_WAIT_CHILDREN = 1
 (opt-in here) and MADEIRA_JIT_DUMP = 0 (here the JIT-pool dump is on by
-default; madeira-bcd's is opt-in). The Desktop gets the standard list. No list names madeira-bcd's dxgi-src.dll / d3d11-src.dll
+default; madeira-bcd's is opt-in). The standard list, which every other game and
+the Desktop get, has none of them (version 3): MADEIRA_FREE_DELAY_MS keeps a
+released block's addresses taken, so an allocator that reserves, releases and
+reserves again inside that range spins (Madeira Dock before Thumper). No list names madeira-bcd's dxgi-src.dll / d3d11-src.dll
 switches (env.MADEIRA_DXGI_SRC, env.MADEIRA_D3D11_SRC): here DXMT's own dxgi.dll
 and d3d11.dll carry those changes.
 
@@ -68,20 +70,25 @@ assert ('static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5Enhanced
         '                      standard]') in lists_src
 
 # madeira-bcd's defaults where upstream's differ: every game madeira-bcd ran had them,
-# so every list ends with them, the standard one too.
+# so every game's own list ends with them. The standard list reaches every other game
+# and the Desktop, and has none of them.
 FORK_DEFAULTS = ["# madeira-bcd's defaults, which this list was tested with (upstream's differ).",
                  'env.MADEIRA_FREE_DELAY_MS = 2000', 'env.MADEIRA_CTX_CPU_AREA = 2', 'env.MADEIRA_WAIT_CHILDREN = 1',
                  'env.MADEIRA_JIT_DUMP = 0']
 for ident, p in presets.items():
+    if ident == 'standard':
+        assert not set(FORK_DEFAULTS) & set(p['lines']), (ident, "the standard list has none of madeira-bcd's defaults")
+        p['tested'], p['fork'] = p['lines'][2:], []
+        continue
     assert p['lines'][-len(FORK_DEFAULTS):] == FORK_DEFAULTS, (ident, "the list ends with madeira-bcd's defaults")
-    p['tested'] = p['lines'][2:-len(FORK_DEFAULTS)]
+    p['tested'], p['fork'] = p['lines'][2:-len(FORK_DEFAULTS)], FORK_DEFAULTS[1:]
 
 catalog_keys = set(re.findall(r'ConfigOption\(key: "([^"]+)"', catalog))
 for ident, p in presets.items():
     assert p['version'] >= 1, ident
     assert p['lines'][0].startswith('# Madeira') and p['lines'][1].startswith('# Reset to Recommended'), ident
     seen = set()
-    for line in p['tested'] + FORK_DEFAULTS[1:]:
+    for line in p['tested'] + p['fork']:
         assert line == line.strip() and not line.startswith('#'), (ident, line)
         key, sep, value = line.partition(' = ')
         assert sep and key and value, (ident, line)
@@ -98,7 +105,7 @@ for ident, p in presets.items():
         if key != 'env.WINEDLLOVERRIDES':
             named = named.replace('socialclubhelper.exe', '')
         assert 'socialclub' not in named and 'MADEIRA_DLL_LOCAL' not in line, (ident, line)
-print('PASS: eight lists, two comment lines each, every list ends with the four fork defaults, no key twice, '
+print('PASS: eight lists, two comment lines each, every game list ends with the four fork defaults and the standard one has none, no key twice, '
       'every non-env key in the settings catalog, no Social Club DLL lines, no variant DLL switches')
 
 # Red Dead Redemption 2 from Steam: the owner's list of 2026-10-09 (build 463), line for line,
@@ -174,9 +181,9 @@ assert rdr2_other['tested'] == [line for line in rdr2 if line not in dock_only] 
 assert rdr2_other['version'] == 1 and rdr2_other['switches'] == presets['rdr2-steam']['switches'], rdr2_other
 assert 'env.MADEIRA_EC_HOOK_TRACE = 0' in presets['gta5e-other']['lines']
 # Every other game and the Desktop (owner's decisions, 2026-10-12): the ec-hook reporter off and,
-# since version 2, the fork defaults; no switches.
+# since version 3, nothing else (version 2 had the fork defaults); no switches.
 standard = presets['standard']
-assert standard['tested'] == ['env.MADEIRA_EC_HOOK_TRACE = 0'] and standard['switches'] == '' and standard['version'] == 2, standard
+assert standard['tested'] == ['env.MADEIRA_EC_HOOK_TRACE = 0'] and standard['switches'] == '' and standard['version'] == 3, standard
 assert 'if size != GameRecommendation.screen720 { entry.resolution = size }\n            else if let lines720 = ResolutionChoices.screen720Value { entry.resolution = lines720 }' in apply_src
 gta = presets['gta5e-steam']
 assert 'env.MADEIRA_CHILD_ARGS = PlayGTAV.exe -nobattleye' in gta['lines']
@@ -256,7 +263,7 @@ assert got['switches'] == ('avx: true, nvidia: true, wineVCRT: false, fastSync: 
                            'resolution: "1280x720", display: "fit"'), got['switches']
 assert not any(line.startswith(('view-census', 'typed-view-align', 'typed-view-shadow'))
                for p in presets.values() if p is not hzd and p is not got for line in p['lines']), 'the typed-view fix is HZD\'s and GoT\'s only'
-print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472, 475, 476, 480 and 514 test lines (v10), line for line with its switches (720 lines of this screen), and outside Steam the same without the Dock lines, with the ec-hook reporter off (v1); GTA V Enhanced keeps its tested lines plus the stamped orphan-lock mode (v2) and, from Steam, the VC++ engine block (v3), GoW its tested lines; Horizon Zero Dawn has build 491\'s proven list plus build 494\'s frame-rate switches (v16), GoT the owner\'s build 515 list (v3); every other game and the Desktop the standard list (v2)')
+print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472, 475, 476, 480 and 514 test lines (v10), line for line with its switches (720 lines of this screen), and outside Steam the same without the Dock lines, with the ec-hook reporter off (v1); GTA V Enhanced keeps its tested lines plus the stamped orphan-lock mode (v2) and, from Steam, the VC++ engine block (v3), GoW its tested lines; Horizon Zero Dawn has build 491\'s proven list plus build 494\'s frame-rate switches (v16), GoT the owner\'s build 515 list (v3); every other game and the Desktop the standard list (v3)')
 
 # Recognition: Steam by App ID or steamapps\common folder; everything else by the program's name.
 match = block(lists_src, 'static func match(', '\n    }\n')
@@ -316,7 +323,7 @@ assert 'entry.desktop == true ? standard : recommendation(windowsPath: entry.win
 assert 'if let found = due(entry.windowsPath, recommendation(for: entry), ownLines: entry.config, title: entry.title),' in apply_src
 assert 'guard entry.desktop != true' not in apply_src, 'prepare takes the Desktop too'
 put = block(apply_src, '    private static func put(', '\n    }\n')
-assert 'guard file.text == rec.fileText' in put and 'if kind != .updated {' in put
+assert 'guard file.text == rec.fileText' in put and 'if kind != .updated && switches {' in put
 assert ('if let on = rec.avx { LibraryPrefs.setAVX(on, for: windowsPath) }' in put
         and 'if let on = rec.nvidia { LibraryPrefs.setNvidia(on, for: windowsPath) }' in put
         and 'if let on = rec.wineVCRT { LibraryPrefs.setWineVCRT(on, for: windowsPath) }' in put)
@@ -461,9 +468,9 @@ check(R.recommendation(windowsPath: #"C:\Games\Foo\foo.exe"#, steamAppID: nil)?.
 check(R.recommendation(windowsPath: "", steamAppID: nil) == nil && R.recommendation(windowsPath: "C:\\", steamAppID: nil) == nil,
       "a path that names nothing has none")
 let standardLines = GameProfile.parse(R.standard.config).count
-check(standardLines == 5 && R.note(R.standard).contains("standard settings: \(standardLines) config lines (")
+check(standardLines == 1 && R.note(R.standard).contains("standard settings: 1 config line (")
       && R.question(R.standard).contains("standard settings"), R.note(R.standard))
-check(R.note(R.standard, desktop: true).hasPrefix("Madeira recommends its standard settings for the Desktop: \(standardLines) config lines")
+check(R.note(R.standard, desktop: true).hasPrefix("Madeira recommends its standard settings for the Desktop: 1 config line (")
       && R.question(R.standard, desktop: true).contains("the Desktop's config"), R.note(R.standard, desktop: true))
 
 // First sight, the player's changes, newer lists and Reset to Recommended.
@@ -474,8 +481,19 @@ func file(_ path: String) -> String { GameProfile(windowsPath: path).text }
 
 var red = LibraryEntry(title: "Red Dead Redemption 2", windowsPath: rdr2, steamAppID: 1174180)
 red.display = "fill"
+red.fpsMode = 2
 LibraryPrefs.setNvidia(true, for: rdr2)
-check(R.prepare(&red), "first sight takes the entry's fields")
+// A game already in the library: the config file only; its fields and switches are the player's.
+check(!R.prepare(&red), "first sight of a library entry changes none of its fields")
+check(file(rdr2) == R.rdr2Steam.fileText, "first sight writes the list")
+check(red.display == "fill" && red.fpsMode == 2 && LibraryPrefs.nvidia(rdr2), "a library entry keeps its fields and switches")
+check(mark(rdr2)?.hasPrefix("rdr2-steam#\(R.rdr2Steam.version)#") == true, "what was written is recorded")
+// A game new to the library takes the whole list.
+UserDefaults.standard.removeObject(forKey: key)
+GameProfile(windowsPath: rdr2).text = ""
+red = LibraryEntry(title: "Red Dead Redemption 2", windowsPath: rdr2, steamAppID: 1174180)
+red.display = "fill"
+check(R.prepare(&red, new: true), "first sight of a new entry takes the entry's fields")
 check(file(rdr2) == R.rdr2Steam.fileText, "first sight writes the list")
 check(red.fastSync == true && red.semaphoreFastPath == false && red.display == nil && red.fpsMode == 1, "first sight's entry fields")
 check(red.resolution == "1568x720", "this screen's shape at 720 lines")
@@ -517,8 +535,9 @@ let deskExe = #"C:\windows\system32\explorer.exe"#
 var desk = LibraryEntry(title: "Desktop", windowsPath: deskExe)
 desk.desktop = true
 check(R.recommendation(for: desk)?.id == "standard", "the Desktop: the standard list")
-check(R.prepare(&desk) && file(deskExe) == R.standard.fileText && mark(deskExe)?.hasPrefix("standard#\(R.standard.version)#") == true
-      && desk.resolution == "1408x648" && desk.fpsMode == 1 && !LibraryPrefs.avx(deskExe), "the Desktop's first sight: the standard list, no switches")
+desk.resolution = "1280x720"
+check(!R.prepare(&desk) && file(deskExe) == R.standard.fileText && mark(deskExe)?.hasPrefix("standard#\(R.standard.version)#") == true
+      && desk.resolution == "1280x720" && !LibraryPrefs.avx(deskExe), "the Desktop's first sight: the standard list, its own fields")
 check(!R.prepare(&desk), "once")
 GameProfile(windowsPath: deskExe).text = "fence-chain = 6\n"
 check(!R.prepare(&desk) && file(deskExe) == "fence-chain = 6\n", "a changed Desktop config is the player's")
@@ -530,19 +549,27 @@ check(!R.prepare(&foo) && file(fooExe) == "fence-chain = 6\n" && mark(fooExe) ==
 check(R.reset(&foo)?.id == "standard" && file(fooExe) == R.standard.fileText, "its Reset writes the standard list")
 let barExe = #"C:\Games\Bar\bar.exe"#
 var bar = LibraryEntry(title: "Bar", windowsPath: barExe)
-check(R.prepare(&bar) && file(barExe) == R.standard.fileText && bar.resolution == "1408x648" && bar.fpsMode == 1
+check(R.prepare(&bar, new: true) && file(barExe) == R.standard.fileText && bar.resolution == "1408x648" && bar.fpsMode == 1
       && !LibraryPrefs.avx(barExe) && mark(barExe)?.hasPrefix("standard#\(R.standard.version)#") == true,
-      "first sight of a game without a list: the standard list, no switches")
-// An untouched standard list gives way to the game's own list later, as on first sight: switches too.
+      "first sight of a new game without a list: the standard list, no switches")
+// An untouched standard list gives way to the game's own list later, as on first sight: the config
+// file for a game already in the library, the switches and fields too for a new entry.
 let laterExe = #"C:\Later\GoW.exe"#
 GameProfile(windowsPath: laterExe).text = R.standard.fileText
 marks = (UserDefaults.standard.dictionary(forKey: key) as? [String: String]) ?? [:]
 marks[laterExe.lowercased()] = "standard#\(R.standard.version)#" + String(LibraryPrefs.stableHash(R.standard.fileText), radix: 16)
 UserDefaults.standard.set(marks, forKey: key)
 var later = LibraryEntry(title: "God of War", windowsPath: laterExe)
+later.resolution = "1280x720"
 LibraryPrefs.setAVX(true, for: laterExe)
-check(R.prepare(&later) && file(laterExe) == R.godOfWar.fileText && later.resolution == "1920x1080"
-      && !LibraryPrefs.avx(laterExe), "an untouched standard list gives way to the game's list, switches too")
+check(!R.prepare(&later) && file(laterExe) == R.godOfWar.fileText && later.resolution == "1280x720"
+      && LibraryPrefs.avx(laterExe), "an untouched standard list gives way to the game's list; a library entry keeps its fields")
+GameProfile(windowsPath: laterExe).text = R.standard.fileText
+marks = (UserDefaults.standard.dictionary(forKey: key) as? [String: String]) ?? [:]
+marks[laterExe.lowercased()] = "standard#\(R.standard.version)#" + String(LibraryPrefs.stableHash(R.standard.fileText), radix: 16)
+UserDefaults.standard.set(marks, forKey: key)
+check(R.prepare(&later, new: true) && file(laterExe) == R.godOfWar.fileText && later.resolution == "1920x1080"
+      && !LibraryPrefs.avx(laterExe), "for a new entry, switches and fields too")
 print("PASS: own configs (the file or upstream's field) stay until Reset; Reset writes every switch of the list; no list of its own, and the Desktop: the standard list")
 
 // A program outside Steam: drive_c looked up; a list written for an entry since removed.
@@ -554,8 +581,8 @@ let play = #"C:\Games\GTA V Enhanced\PlayGTAV.exe"#
 check(R.recommendation(windowsPath: play, steamAppID: nil)?.id == "gta5e-other", "drive_c is looked up in any case")
 check(R.recommendation(windowsPath: #"C:\Games\GTA V\PlayGTAV.exe"#, steamAppID: nil)?.id == "standard", "a missing game file: the standard list")
 var removed = LibraryEntry(title: "GTA V Enhanced", windowsPath: play)
-check(R.prepare(&removed) && file(play) == R.gta5EnhancedOther.fileText && LibraryPrefs.nvidia(play)
-      && removed.resolution == "1280x720", "first sight of a program outside Steam")
+check(R.prepare(&removed, new: true) && file(play) == R.gta5EnhancedOther.fileText && LibraryPrefs.nvidia(play)
+      && removed.resolution == "1280x720", "first sight of a new program outside Steam")
 var playEntry = LibraryEntry(title: "GTA V Enhanced", windowsPath: play)
 check(!R.prepare(&playEntry), "another entry for the same program sees it was written")
 check(R.prepare(&playEntry, new: true) && playEntry.resolution == "1280x720" && playEntry.fastSync == true,
@@ -580,7 +607,7 @@ check(!R.prepare(&own, new: true) && mark(ownExe) == "" && own.resolution == "14
       "a config of its own stays its own for a new entry too")
 let got = #"C:\GoT\GhostOfTsushima.exe"#
 var gotOwn = LibraryEntry(title: "Ghost of Tsushima", windowsPath: got)
-check(R.prepare(&gotOwn) && LibraryPrefs.avx(got) && LibraryPrefs.nvidia(got) && gotOwn.resolution == "1280x720", "GoT by its program")
+check(R.prepare(&gotOwn, new: true) && LibraryPrefs.avx(got) && LibraryPrefs.nvidia(got) && gotOwn.resolution == "1280x720", "GoT by its program")
 check(LogStore.shared.lines.contains { $0.hasPrefix("[recommended] Red Dead Redemption 2: rdr2-steam v\(R.rdr2Steam.version) written (first sight)") }, "log line")
 UserDefaults.standard.removeObject(forKey: key)
 print("PASS: drive_c is looked up for a program's list; a new entry takes the fields of a list written for its path before")

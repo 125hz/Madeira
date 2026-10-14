@@ -523,20 +523,18 @@ enum GameRecommendations {
     /// the owner tried outside these lists closed at start until the [ec-hook]
     /// reporter was off. It reads code a game's protection rewrites at run time
     /// (GTA V Enhanced outside Steam on build 451, Ghost of Tsushima on build 515),
-    /// and it only logs, so turning it off costs a game nothing. Version 2: the same
-    /// madeira-bcd defaults the game lists end with, which every game madeira-bcd
-    /// ran had. No switches.
+    /// and it only logs, so turning it off costs a game nothing. Version 3: without
+    /// madeira-bcd's defaults (version 2 had them). This list reaches every game, and
+    /// MADEIRA_FREE_DELAY_MS keeps a released block's addresses taken, so an allocator
+    /// that reserves, releases and reserves again inside the same range never gets it
+    /// back: Madeira Dock spun on "Loading Steam" before Thumper. The game lists that
+    /// were tested with those defaults keep them. No switches.
     static let standard = GameRecommendation(
-        id: "standard", title: "games without a list of their own", version: 2,
+        id: "standard", title: "games without a list of their own", version: 3,
         config: """
         # Madeira's recommended settings for a game without a list of its own.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
         env.MADEIRA_EC_HOOK_TRACE = 0
-        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
-        env.MADEIRA_FREE_DELAY_MS = 2000
-        env.MADEIRA_CTX_CPU_AREA = 2
-        env.MADEIRA_WAIT_CHILDREN = 1
-        env.MADEIRA_JIT_DUMP = 0
         """)
 
     static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, ghostOfTsushima, godOfWar, horizonZeroDawn,

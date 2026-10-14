@@ -136,8 +136,12 @@ enum MadeiraConfig {
     /// (a file directly inside Application Support/GameConfigs), else nil --
     /// also for upstream's own madeira-game.cfg.
     private static func bcdProfileURL() -> URL? {
+        // GameProfile.directory's folder, named here so this file compiles on its own
+        // (the onboarding, runtime-settings and early-config host checks build it alone).
         guard let p = getenv("MADEIRA_CFG_GAME"), case let path = String(cString: p), !path.isEmpty,
-              let dir = GameProfile.directory else { return nil }
+              let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        else { return nil }
+        let dir = base.appendingPathComponent("GameConfigs", isDirectory: true)
         let url = URL(fileURLWithPath: path)
         guard url.deletingLastPathComponent().standardizedFileURL.path == dir.standardizedFileURL.path,
               FileManager.default.fileExists(atPath: url.path) else { return nil }
