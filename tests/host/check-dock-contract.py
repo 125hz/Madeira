@@ -97,6 +97,7 @@ body = (dock[dock.index('enum MadeiraDock {'):dock.index('    @MainActor private
         dock[dock.index("    /// The host's environment for one launch."):])
 stubs = r'''
 import Foundation
+func madeira_process_host_active_prefix(_ prefix: String) -> String { prefix }
 #if canImport(Glibc)
 import Glibc
 #else

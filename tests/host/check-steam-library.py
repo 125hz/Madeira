@@ -515,6 +515,7 @@ DECODERS_H = '#include "{app}/SwiftSteam/lzma_shim.h"\n'
 
 STUBS = r'''
 import Foundation
+func madeira_process_host_active_prefix(_ prefix: String) -> String { prefix }
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
