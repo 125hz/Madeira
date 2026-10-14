@@ -92,12 +92,17 @@ enum MadeiraDock {
                         installed: flags & 4 != 0, customExecutables: !(state["CheckGuid"]?.fields.isEmpty ?? true))
     }
 
-    /// The apps a record's `SharedDepots` names as owners of its shared depots.
-    static func sharedOwners(manifest data: Data) -> Set<Int> {
+    /// A record's depots: the ones it lends from each owner app (`SharedDepots`, depot -> owner)
+    /// and the ones installed for the app itself (`InstalledDepots`).
+    static func depots(manifest data: Data) -> (lent: [Int: Set<String>], installed: Set<String>) {
         guard data.count <= 1 << 20, var parser = try? SteamKeyValues(data), let root = try? parser.read(),
-              let state = root["AppState"], let appID = state["appid"]?.string.flatMap({ Int($0) }) else { return [] }
-        let ids = (state["SharedDepots"]?.fields ?? [:]).values.prefix(64).compactMap { $0.string.flatMap { Int($0) } }
-        return Set(ids.filter { validAppID($0) && $0 != appID })
+              let state = root["AppState"], let appID = state["appid"]?.string.flatMap({ Int($0) }) else { return ([:], []) }
+        var lent: [Int: Set<String>] = [:]
+        for (depot, owner) in (state["SharedDepots"]?.fields ?? [:]).prefix(64) {
+            guard let ownerID = owner.string.flatMap({ Int($0) }), validAppID(ownerID), ownerID != appID else { continue }
+            lent[ownerID, default: []].insert(depot)
+        }
+        return (lent, Set((state["InstalledDepots"]?.fields ?? [:]).keys.prefix(256)))
     }
 
     /// Installed games in the client's own library (`<client>/steamapps`) and the other
@@ -116,21 +121,25 @@ enum MadeiraDock {
         }
         var result: [DockGame] = []
         // Apps that only lend depots to another install ("Shared Only", e.g. GTA V
-        // Enhanced's RGL/SC 1899670) have a record but nothing to start.
-        var owners = Set<Int>()
+        // Enhanced's RGL/SC 1899670) have a record but nothing to start. A game that
+        // lends depots but has its own installed too (a base game whose depots its
+        // expansions share) stays: the same test as the uninstall (SteamInstall.swift).
+        var lent: [Int: Set<String>] = [:], installed: [Int: Set<String>] = [:]
         for library in libraries.prefix(16) {
             let folder = drive.appendingPathComponent(library, isDirectory: true)
             guard folder.resolvingSymlinksInPath().path.hasPrefix(drive.resolvingSymlinksInPath().path + "/"),
                   let names = try? fm.contentsOfDirectory(atPath: folder.path) else { continue }
             for file in names.sorted().prefix(2000) where file.hasPrefix("appmanifest_") && file.hasSuffix(".acf") {
                 guard let data = try? Data(contentsOf: folder.appendingPathComponent(file)) else { continue }
-                owners.formUnion(sharedOwners(manifest: data))
+                let held = depots(manifest: data)
+                lent.merge(held.lent) { $0.union($1) }
                 guard let game = game(manifest: data, library: library),
                       !result.contains(where: { $0.id == game.id }) else { continue }
+                installed[game.id] = held.installed
                 result.append(game)
             }
         }
-        result.removeAll { owners.contains($0.id) }
+        result.removeAll { game in lent[game.id].map { installed[game.id, default: []].isSubset(of: $0) } ?? false }
         return result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 

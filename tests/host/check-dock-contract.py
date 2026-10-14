@@ -181,6 +181,22 @@ func jwt(_ claims: String) -> String {
         require(found.map(\.id) == [10, 30, 20], "games from both C: libraries, sorted by name, invalid and duplicate skipped (\(found.map(\.id)))")
         require(found.first { $0.id == 30 }!.library == "Other/Lib/steamapps", "a game keeps its own library")
 
+        // Shared depots: an app that only lends depots to another install has nothing to
+        // start and is left out; one that lends depots but has its own installed stays.
+        let sharedDrive = drive.deletingLastPathComponent().appendingPathComponent("shared/drive_c")
+        let sharedApps = sharedDrive.appendingPathComponent("Program Files (x86)/Steam/steamapps")
+        try write(sharedApps.appendingPathComponent("appmanifest_40.acf"),
+                  "\"AppState\" { \"appid\" \"40\" \"name\" \"Episode\" \"installdir\" \"E\" \"StateFlags\" \"4\" " +
+                  "\"InstalledDepots\" { \"401\" { \"manifest\" \"1\" } } \"SharedDepots\" { \"501\" \"50\" \"601\" \"60\" } }")
+        try write(sharedApps.appendingPathComponent("appmanifest_50.acf"),
+                  "\"AppState\" { \"appid\" \"50\" \"name\" \"Lender\" \"installdir\" \"L\" \"StateFlags\" \"4\" " +
+                  "\"InstalledDepots\" { \"501\" { \"manifest\" \"2\" } } }")
+        try write(sharedApps.appendingPathComponent("appmanifest_60.acf"),
+                  "\"AppState\" { \"appid\" \"60\" \"name\" \"Base\" \"installdir\" \"B\" \"StateFlags\" \"4\" " +
+                  "\"InstalledDepots\" { \"601\" { \"manifest\" \"3\" } \"602\" { \"manifest\" \"4\" } } }")
+        let sharedFound = MadeiraDock.games(drive: sharedDrive).map(\.id)
+        require(sharedFound == [60, 40], "a lend-only owner is left out, a base game with its own depots stays (\(sharedFound))")
+
         // Validation.
         let alpha = found[0]
         func refused(_ run: () throws -> Void, _ text: String) -> Bool {
