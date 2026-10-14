@@ -307,6 +307,7 @@ func pe(_ url: URL, machine: UInt16) throws {
 
         // ---- prepare(): a first start on a bundle without 32-bit support or msiexec
         MadeiraConfig.values["inproc-sync"] = "1"   // madsync chosen: the per-session request applies
+        setenv("MADEIRA_DOCK_INSTALL_SEPARATE", "0", 1)   // the same session; the installs-only default is checked below
         try? FileManager.default.removeItem(at: prefix.appendingPathComponent(DockInstallLedger.fileName))
         try write(prefix.appendingPathComponent("system.reg"), "WINE REGISTRY Version 2\n\n[Software\\\\Wow6432Node\\\\Fixture Shared] 1700000000\n\"Shared Runtime\"=dword:00000001\n")
         try write(prefix.appendingPathComponent("user.reg"), "WINE REGISTRY Version 2\n")
@@ -336,6 +337,7 @@ func pe(_ url: URL, machine: UInt16) throws {
         require(ended != nil && DockInstallers.finishedAt == ended &&
                 LogStore.shared.lines.filter({ $0.contains("[dock-installers] end succeeded=1 failed=0 of=1; the host starts next") }).count == 1,
                 "the end is logged once and its time kept (the starting screen times the host from it)")
+        unsetenv("MADEIRA_DOCK_INSTALL_SEPARATE")
         // The words count what succeeded and name what failed (the text reads only the result file).
         try write(drive.appendingPathComponent("madeira-dock-installers.result"),
                   "begin 3 \r\nservices started\r\nstart 1 tool \r\nexit 1 0 \r\nstart 2 b \r\nexit 2 5 \r\nstart 3 c \r\nexit 3 -1073741819 \r\nend \r\n")
@@ -396,6 +398,9 @@ func pe(_ url: URL, machine: UInt16) throws {
         require(!DockInstallers.serverSync && ((try? String(contentsOf: drive.appendingPathComponent("madeira-dock-installers.cmd"), encoding: .utf8)) ?? "").contains("--start-services")
                 && !(DockInstallers.note ?? "").contains("standard synchronization"),
                 "no inproc-sync (fastsync, the default engine): the service step runs, no madsync note")
+        require((DockInstallers.note ?? "").contains("This start runs only them; afterwards restart Madeira and start the game again.")
+                && logged("this session runs only the one-time installs"),
+                "MADEIRA_DOCK_INSTALL_SEPARATE (on by default): a start that runs installers runs only them")
         unsetenv("MADEIRA_DOCK_INSTALL_SERVER_SYNC")
         setenv("MADEIRA_DOCK_INSTALL_SCM", "0", 1)
         DockInstallers.setRunsNext(7000, true, prefix: prefix)
