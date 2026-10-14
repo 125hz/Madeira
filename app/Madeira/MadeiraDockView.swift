@@ -149,6 +149,10 @@ struct MadeiraDockView: View {
                 Section {
                     if dock.clientInstalled {
                         Label("Valve's client components are installed", systemImage: "checkmark.circle")
+                        // ml1371: Steam's full client was installed into Dock's folder (before the folders were separated).
+                        if SteamDockRepair.needed {
+                            Button("Repair Madeira Dock's Steam files") { SteamDockRepair.offer(reason: .fullClientInDockFolder) { _ in dock.refresh() } }
+                        }
                     } else if dock.preparing {
                         HStack(spacing: 12) { ProgressView(); Text(dock.progress).foregroundStyle(.secondary) }
                     } else {

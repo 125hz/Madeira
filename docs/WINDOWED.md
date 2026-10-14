@@ -322,13 +322,22 @@ panel opens, so a Steam installed during the session gets its icon; a
   - The first tap shows "The full Steam client needs a lot of memory; the web
     helper may be killed." (plus, when Madeira Dock's client files are in the
     prefix: Madeira starts Steam with `-nobootstrapperupdate`, so it does not
-    update itself, but installing the full client replaces Dock's client files
-    with Valve's current build, and Dock refuses a client build it has not
-    verified) with Continue / Cancel. Continue is remembered.
+    update itself; the full client has its own folder and Dock's files stay as
+    Dock verified them) with Continue / Cancel. Continue is remembered.
+  - **Two folders (ml1371). The full client and Madeira Dock never share a
+    folder.** Dock's pinned client lives in `C:\Program Files (x86)\Steam` and
+    Dock refuses any other build there (device log 102: after an ml1370 install
+    into that folder every Dock start reported `client-sha256=e9045710…`,
+    `session-client-adapter=0`, `session-unsupported-client=1`). The full client
+    goes to `C:\Program Files (x86)\Steam Client`, or to `D:\Steam` when
+    `env.MADEIRA_SHARED_DRIVE = 1` and the shared container resolves; its
+    launch, the library entry, the taskbar tile and the search row use that
+    folder, and "installed" is checked there (also `C:\Program Files\Steam`),
+    never in Dock's folder. The installer refuses Dock's folder as a target.
   - **Steam installed** (ml1370: the full 64-bit client, i.e. an x86-64
     `steam.exe` plus `package\steam_client_win64.manifest` in
-    `C:\Program Files (x86)\Steam` or `C:\Program Files\Steam`; Madeira Dock's
-    components, whose `steam.exe` is the 32-bit one, do not count):
+    `C:\Program Files (x86)\Steam Client` (ml1371), `D:\Steam` or
+    `C:\Program Files\Steam`; Madeira Dock's folder never counts):
     `"…\steam.exe" -nobootstrapperupdate -skipinitialbootstrap -norepairfiles
     -noverifyfiles -no-cef-sandbox -cef-disable-gpu steam://open/games` is
     started in Steam's folder, `services.exe` first when none runs in the
@@ -346,8 +355,12 @@ panel opens, so a Steam installed during the session gets its icon; a
     A second tap within 90 s, while no Steam window is open yet, only says
     "Steam is starting". The search's Steam row reads "Steam client · path"
     only for the full client.
-  - **Not installed** (ml1370): "Install Steam" (Cancel / Install; with Dock's
-    files in the folder it says the current client replaces them). The app does
+  - **Full client in Dock's folder** (an ml1370 install from before ml1371):
+    the button and the library entry offer **Repair Madeira Dock's Steam
+    files** first (below); after the repair the client starts from its new
+    folder, or the install is offered when it had to be removed.
+  - **Not installed** (ml1370): "Install Steam" (Cancel / Install; it says
+    Dock's own client is not touched). The app does
     what Valve's bootstrapper does, natively: it reads the manifest
     `https://client-update.akamai.steamstatic.com/steam_client_win64` (HTTPS,
     redirects only on that host, at most 1 MB, a `win64` section with a numeric
@@ -372,8 +385,9 @@ panel opens, so a Steam installed during the session gets its icon; a
     UIKit background task; if iOS ends that time after the app leaves the
     screen, the install stops cleanly (`interrupted at part N of M (app
     suspended); tap Install again to resume`).
-    Then it checks that `steam.exe` is x86-64 and moves everything into
-    `C:\Program Files (x86)\Steam` (existing files replaced, `steamapps`,
+    Then it checks that `steam.exe` is x86-64 and moves everything into the
+    full client's folder (ml1371: `C:\Program Files (x86)\Steam Client` or
+    `D:\Steam`, never Dock's; existing files replaced, `steamapps`,
     `userdata`, `config`, `logs`, `dumps`, `appcache`, `depotcache` files kept,
     names matched case-insensitively to what is there, `steam.exe` last) and
     writes Valve's manifest to `package\steam_client_win64.manifest`. A
@@ -384,8 +398,10 @@ panel opens, so a Steam installed during the session gets its icon; a
     packages are kept for the next Install). It needs about 3x the remaining
     packages' size free. In a running session only files are written (Steam
     writes its own registry keys when it starts); without a session the prefix
-    is seeded first and Dock's discovery keys are written when they do not
-    conflict. During a Madeira Dock game session the button does not start it:
+    is seeded first and Steam's discovery keys are written for the full
+    client's folder only when Madeira Dock's client is not installed (Dock's
+    keys must keep pointing at Dock's folder) and they do not conflict. During
+    a Madeira Dock game session the button does not start it:
     "Quit the game first … then open the Desktop entry in your library and
     install Steam from its taskbar". When it finishes, Steam starts as above
     (`[steam-launch] ml1370 command line …`). `env.MADEIRA_STEAM_PACKAGE_INSTALL = 0`
@@ -393,11 +409,28 @@ panel opens, so a Steam installed during the session gets its icon; a
     `SteamSetup.exe` is downloaded (cdn.cloudflare.steamstatic.com, progress
     alert, `C:\madeira-games\SteamSetup.exe`) and started.
   - **The library's Steam entry** (the fallback's "Steam" below, or any entry
-    whose program is one of those two `steam.exe` paths): Play offers the same
-    install (the starting screen goes, the sheet comes up) when the full client
-    is missing and starts the entry when it finishes; an entry still carrying
-    round 4's `-no-cef-sandbox -cef-disable-gpu` is switched to the switches
-    above and saved.
+    whose program is one of those `steam.exe` paths, Dock's folder included):
+    Play offers the same install (the starting screen goes, the sheet comes up)
+    when the full client is missing and starts the entry when it finishes; an
+    entry still carrying round 4's `-no-cef-sandbox -cef-disable-gpu` is
+    switched to the switches above, and (ml1371) an entry pointing at Dock's
+    folder is moved to the full client's `steam.exe` (64-bit) and saved.
+  - **Repair Madeira Dock's Steam files** (ml1371, `SteamDockRepair`,
+    `SteamRuntimeInstaller.repairDock`). Offered when the full client is found
+    in Dock's folder (Steam button, library entry, the Madeira Dock sheet's
+    Steam client section) and automatically when a Dock start reports
+    `session-unsupported-client=1` with a `client-sha256` other than the pinned
+    one (MadeiraDock.pollReport, once per app run; the failure text names the
+    repair too). A complete full client in Dock's folder is moved whole to
+    `C:\Program Files (x86)\Steam Client` when that folder does not exist yet
+    (not to `D:`), then Dock's `steamapps`, `userdata`, `config`, `depotcache`
+    and `appcache` are moved back; otherwise everything in Dock's folder except
+    those is removed. Then Dock's three pinned packages are fetched again
+    (`prepare`, repair mode) and `steamclient64.dll` must hash to the pinned
+    `71b391fe…`. Without a session Dock's discovery keys are rewritten even if
+    another client changed them; in a session only the files (the log says
+    whether the keys still point at Dock's folder). Refused while a Dock game's
+    host has not reported a result.
   - **Fallback** (round 4's behaviour), when the in-session start is refused or
     fails (`env.MADEIRA_SESSION_LAUNCH = 0`, no session, the file is gone, a
     start error; the reason is in the alert and the log): a library entry
@@ -567,6 +600,12 @@ ml1370's Steam install and start (Swift, also for the library's Steam entry):
     [steam-install] ml1370 interrupted at part N of 18 (app suspended); tap Install again to resume
     [steam-install] ml1370 resumable install found: N of 18 packages done (client version ...)
     [steam-install] ml1370 not started (cancelled at the confirmation | a Madeira Dock game session is running)
+    [steam-install] ml1371 dock repair: offered (Dock reported client sha256=…, not the pinned 71b391fe…)
+    [steam-install] ml1371 dock repair: start (the full client is in Dock's folder | Dock's folder is not the pinned build; a session is running: files only | no session: Dock's discovery keys are rewritten)
+    [steam-install] ml1371 dock repair: done (moved the full client to C:\Program Files (x86)\Steam Client | removed N entries from Dock's folder; kept [appcache, config, depotcache, steamapps, userdata]; Dock's 3 pinned packages fetched; client sha256=71b391fe… (pinned: match); registry: Dock's discovery keys rewritten | left (...))
+    [steam-install] ml1371 dock repair: failed (reason) | not started (declined | a Madeira Dock game is still running)
+    [steam-install] ml1371 library entry "...": the full client is in Madeira Dock's folder; offering the Dock repair
+    [steam-launch] ml1371 library entry "...": program moved from C:\Program Files (x86)\Steam\steam.exe to C:\Program Files (x86)\Steam Client\steam.exe
     [steam-install] ml1370 library entry "Steam": the full client is not installed; offering the install
     [steam-launch] ml1370 command line (in this session (taskbar) | library entry, a session of its own): "C:\Program Files (x86)\Steam\steam.exe" -nobootstrapperupdate ...
     [steam-launch] ml1370 web helper mode: single-process (in this task)
@@ -1038,5 +1077,27 @@ window. App only (`SteamRuntime.swift`, `WindowedMode.swift`, two lines in
 4. `env.MADEIRA_STEAM_PACKAGE_INSTALL = 0`: the round 4 path (SteamSetup.exe).
    `env.MADEIRA_STEAM_LAUNCH_FLAGS = 0`: `-no-cef-sandbox -cef-disable-gpu`.
    `env.MADEIRA_STEAM_CEF_GPU = 1`: the switches without `-cef-disable-gpu`.
-5. After the install, a Madeira Dock start: Dock refuses the new client build
-   (expected until Dock supports it); report the Dock result line.
+5. After the install, a Madeira Dock start: it boots as before (ml1371: the
+   full client is in `C:\Program Files (x86)\Steam Client`; Dock's folder and
+   `client-sha256=71b391fe…` are unchanged).
+
+### ml1371 (2026-10-13: separate folders, Dock repair; device log 102)
+
+1. A prefix where ml1370 installed the full client into Dock's folder: start
+   a Dock game: it fails as in log 102 and the alert "Repair Madeira Dock's
+   Steam files" comes up over the starting screen (`dock repair: offered
+   (…)`). Repair: `dock repair: start (the full client is in Dock's folder; a
+   session is running: files only)`, then `done (moved the full client to
+   C:\Program Files (x86)\Steam Client; kept […]; … client sha256=71b391fe…
+   (pinned: match); registry: …)`. Restart Madeira, start the game again:
+   `client-sha256=71b391fe…`, no `session-unsupported-client`.
+2. Same, but from the library interface without a session: Settings › Steam ›
+   Madeira Dock shows "Repair Madeira Dock's Steam files"; registry: `Dock's
+   discovery keys rewritten`.
+3. Windowed desktop: search "steam", pick it: the full client starts from
+   `C:\Program Files (x86)\Steam Client\steam.exe` (`[steam-launch] ml1370
+   command line …`); the library's old "Steam" entry is moved there on its
+   next Play (`program moved from …`).
+4. Fresh prefix: Install Steam: `installing N files … into C:\Program Files
+   (x86)\Steam Client`; Dock's "Download Valve's client components" still works
+   afterwards, and the other way round.
