@@ -196,7 +196,10 @@ enum SteamRuntimeFiles {
 
     // Only fixed client-discovery paths are written. Never write user IDs,
     // licenses, login cache, tokens, or a value asserting ownership.
-    static func registry(_ text: String, machine: Bool, windowsRoot: String = SteamRuntimeFiles.windowsRoot) throws -> String {
+    // `force` (ml1371 Dock repair): values another client wrote for these names
+    // are replaced instead of stopping as a conflict.
+    static func registry(_ text: String, machine: Bool, windowsRoot: String = SteamRuntimeFiles.windowsRoot,
+                         force: Bool = false) throws -> String {
         guard text.hasPrefix("WINE REGISTRY Version 2") else { throw Failure.prefixMissing }
         let root = windowsRoot.replacingOccurrences(of: "\\", with: "\\\\")
         let sections: [(String, [(String, String)])] = machine
@@ -211,7 +214,13 @@ enum SteamRuntimeFiles {
             let starts = lines.indices.filter { lines[$0].lowercased().hasPrefix(header.lowercased()) }
             guard starts.count <= 1 else { throw Failure.conflict }
             if let start = starts.first {
-                let end = lines[(start + 1)...].firstIndex { $0.hasPrefix("[") } ?? lines.count
+                var end = lines[(start + 1)...].firstIndex { $0.hasPrefix("[") } ?? lines.count
+                if force {
+                    let names = values.map { "\"\($0.0)\"=".lowercased() }
+                    let stale = ((start + 1)..<end).filter { index in names.contains { lines[index].lowercased().hasPrefix($0) } }
+                    for index in stale.reversed() { lines.remove(at: index) }
+                    end -= stale.count
+                }
                 var additions: [String] = []
                 for (name, value) in values {
                     let prefix = "\"\(name)\"="
@@ -245,15 +254,20 @@ actor SteamRuntimeInstaller {
     private var busy = false
 
     // Runs before any Wine session in this app run; no Wine/JIT run.
-    func prepare(prefix: URL, progress: @Sendable (String) async -> Void) async throws {
-        guard !busy, wine_process_is_running() == 0, wineserver_is_running() == 0 else {
+    // `repair` (ml1371, repairDock): also inside a running session, where only
+    // the files are written; without a session Dock's discovery keys are
+    // rewritten even when another client changed them. Returns whether the keys
+    // were written.
+    @discardableResult
+    func prepare(prefix: URL, repair: Bool = false, progress: @Sendable (String) async -> Void) async throws -> Bool {
+        guard !busy, repair || (wine_process_is_running() == 0 && wineserver_is_running() == 0) else {
             throw SteamRuntimeFiles.Failure.activeSession
         }
         busy = true; defer { busy = false }
         let fm = FileManager.default
         // Do not let the template seeder overwrite a preexisting, unstamped
         // registry. Fresh downloads may have created drive_c/steamapps only.
-        if !fm.fileExists(atPath: prefix.appendingPathComponent(".update-timestamp").path),
+        if !repair, !fm.fileExists(atPath: prefix.appendingPathComponent(".update-timestamp").path),
            ["system.reg", "user.reg"].contains(where: { fm.fileExists(atPath: prefix.appendingPathComponent($0).path) }) {
             throw SteamRuntimeFiles.Failure.conflict
         }
@@ -300,20 +314,24 @@ actor SteamRuntimeInstaller {
         guard Self.hash(try Data(contentsOf: stage.appendingPathComponent("steamclient64.dll"))) == SteamRuntimeFiles.clientSHA256,
               files.contains("steam.exe") else { throw SteamRuntimeFiles.Failure.invalidPackage }
         try Task.checkCancellation()
-        guard wine_process_is_running() == 0, wineserver_is_running() == 0 else { throw SteamRuntimeFiles.Failure.activeSession }
+        let live = wine_process_is_running() != 0 || wineserver_is_running() != 0
+        guard repair || !live else { throw SteamRuntimeFiles.Failure.activeSession }
         await progress("Preparing the Windows environment…")
         try Task.checkCancellation()
-        guard wine_process_is_running() == 0, wineserver_is_running() == 0 else { throw SteamRuntimeFiles.Failure.activeSession }
-        madeira_seed_prefix_if_needed(prefix.path)
+        guard repair || (wine_process_is_running() == 0 && wineserver_is_running() == 0) else { throw SteamRuntimeFiles.Failure.activeSession }
         // Preflight all destinations and both hives before publishing anything.
+        // A running session owns the registry: then only the files are written.
         var pending: [(URL, Data)] = []
-        for (file, machine) in [("system.reg", true), ("user.reg", false)] {
-            let url = prefix.appendingPathComponent(file)
-            guard url.standardizedFileURL.path == url.resolvingSymlinksInPath().standardizedFileURL.path else {
-                throw SteamRuntimeFiles.Failure.conflict
+        if !live {
+            madeira_seed_prefix_if_needed(prefix.path)
+            for (file, machine) in [("system.reg", true), ("user.reg", false)] {
+                let url = prefix.appendingPathComponent(file)
+                guard url.standardizedFileURL.path == url.resolvingSymlinksInPath().standardizedFileURL.path else {
+                    throw SteamRuntimeFiles.Failure.conflict
+                }
+                let text = try String(contentsOf: url, encoding: .utf8)
+                pending.append((url, Data(try SteamRuntimeFiles.registry(text, machine: machine, force: repair).utf8)))
             }
-            let text = try String(contentsOf: url, encoding: .utf8)
-            pending.append((url, Data(try SteamRuntimeFiles.registry(text, machine: machine).utf8)))
         }
         for name in files {
             let target = try SteamRuntimeFiles.destination(SteamRuntimeFiles.relativeRoot + "/" + name, under: drive)
@@ -337,6 +355,75 @@ actor SteamRuntimeInstaller {
             try fm.moveItem(at: stage.appendingPathComponent(name), to: target)
         }
         await progress("Steam components are ready.")
+        return !pending.isEmpty
+    }
+
+    // MARK: ml1371: Dock repair
+
+    /// Madeira Dock's folder keeps these when it is repaired (the account's
+    /// data, the game library and the client's caches); everything else in it
+    /// is the client, which the pinned packages replace.
+    static let dockKept: Set<String> = ["steamapps", "userdata", "config", "depotcache", "appcache"]
+
+    struct DockRepair: Sendable {
+        /// The full client was moved from Dock's folder to `clientRoot`.
+        var moved = false
+        /// Top-level entries removed from Dock's folder (not moved).
+        var removed = 0
+        /// The kept entries found in Dock's folder.
+        var kept: [String] = []
+        /// steamclient64.dll's SHA-256 in Dock's folder afterwards.
+        var sha256 = ""
+        /// Dock's discovery keys were (re)written (no session was running).
+        var keys = false
+    }
+
+    /// Puts Madeira Dock's folder (`C:\Program Files (x86)\Steam`) back to the
+    /// pinned client build. A complete full client found there (an x86-64
+    /// steam.exe and its saved manifest: an ml1370 install before the folders
+    /// were separated) is moved to `clientRoot` when that is given and free,
+    /// and Dock's kept folders are moved back; otherwise everything in Dock's
+    /// folder except the kept folders is removed. Then the three pinned
+    /// packages are fetched again (prepare, repair mode). Throws when the
+    /// result is not the pinned steamclient64.dll.
+    func repairDock(prefix: URL, clientRoot: URL?, progress: @escaping @Sendable (String) async -> Void) async throws -> DockRepair {
+        guard !busy else { throw SteamRuntimeFiles.Failure.activeSession }
+        let fm = FileManager.default
+        var result = DockRepair()
+        let drive = prefix.appendingPathComponent("drive_c")
+        let dock = drive.appendingPathComponent(SteamRuntimeFiles.relativeRoot)
+        guard dock.standardizedFileURL.path == dock.resolvingSymlinksInPath().standardizedFileURL.path else {
+            throw SteamRuntimeFiles.Failure.conflict
+        }
+        await progress("Checking Madeira Dock's Steam folder…")
+        if fm.fileExists(atPath: dock.path) {
+            if SteamClientPackages.installed(root: dock), let clientRoot,
+               clientRoot.standardizedFileURL.path != dock.standardizedFileURL.path,
+               !fm.fileExists(atPath: clientRoot.path) {
+                await progress("Moving the full Steam client to its own folder…")
+                try fm.createDirectory(at: clientRoot.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try fm.moveItem(at: dock, to: clientRoot)
+                try fm.createDirectory(at: dock, withIntermediateDirectories: false)
+                for name in try fm.contentsOfDirectory(atPath: clientRoot.path) where Self.dockKept.contains(name.lowercased()) {
+                    try fm.moveItem(at: clientRoot.appendingPathComponent(name), to: dock.appendingPathComponent(name))
+                    result.kept.append(name)
+                }
+                result.moved = true
+            } else {
+                await progress("Removing the other client's files from Madeira Dock's folder…")
+                for name in try fm.contentsOfDirectory(atPath: dock.path) {
+                    if Self.dockKept.contains(name.lowercased()) { result.kept.append(name); continue }
+                    try fm.removeItem(at: dock.appendingPathComponent(name))
+                    result.removed += 1
+                }
+            }
+        }
+        result.keys = try await prepare(prefix: prefix, repair: true, progress: progress)
+        let client = dock.appendingPathComponent("steamclient64.dll")
+        result.sha256 = Self.hash(try Data(contentsOf: client, options: .alwaysMapped))
+        guard result.sha256 == SteamRuntimeFiles.clientSHA256 else { throw SteamRuntimeFiles.Failure.invalidPackage }
+        result.kept.sort()
+        return result
     }
 
     private static func hash(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
@@ -354,9 +441,42 @@ actor SteamRuntimeInstaller {
 /// verified subset of an older 32-bit manifest). No Valve file is bundled and
 /// no account data is read or written.
 enum SteamClientPackages {
-    static var installWindowsRoot: String {
-        let prefix = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent("wine")
-        return SharedContainer.drive(prefix: prefix.path) == nil ? SteamRuntimeFiles.windowsRoot : "D:\\Steam"
+    /// ml1371: the full client never shares Madeira Dock's folder (Dock refuses
+    /// any client build but its pinned one). Its own folder on drive C:, a sibling
+    /// of Dock's; the full client runs from any folder.
+    static let clientRelativeRoot = "Program Files (x86)/Steam Client"
+    static let clientWindowsRoot = "C:\\Program Files (x86)\\Steam Client"
+
+    /// Where the full client is installed: D:\Steam on the shared drive when
+    /// env.MADEIRA_SHARED_DRIVE = 1 and the shared container resolves, else
+    /// C:\Program Files (x86)\Steam Client in `prefix` (the active prefix).
+    struct Target: Sendable {
+        let root: URL
+        let windowsRoot: String
+        let shared: Bool
+    }
+
+    /// The app's own prefix (Documents/wine), which the shared-drive lookup takes.
+    static var originalPrefix: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent("wine")
+    }
+    /// The prefix sessions run in (MadeiraDock.prefix).
+    static var activePrefix: URL { URL(fileURLWithPath: SharedContainer.activePrefix(originalPrefix.path)) }
+
+    static func target(prefix: URL = activePrefix) -> Target {
+        if let shared = SharedContainer.drive(prefix: originalPrefix.path) {
+            return Target(root: URL(fileURLWithPath: shared).appendingPathComponent("Steam"), windowsRoot: "D:\\Steam", shared: true)
+        }
+        return Target(root: prefix.appendingPathComponent("drive_c").appendingPathComponent(clientRelativeRoot),
+                      windowsRoot: clientWindowsRoot, shared: false)
+    }
+
+    static var installWindowsRoot: String { target().windowsRoot }
+
+    /// An ml1370 install from before the folders were separated: the full client
+    /// in Madeira Dock's folder (an x86-64 steam.exe and the saved manifest).
+    static func inDockFolder(prefix: URL = activePrefix) -> Bool {
+        installed(root: prefix.appendingPathComponent("drive_c").appendingPathComponent(SteamRuntimeFiles.relativeRoot))
     }
     /// The manifest the 64-bit client's bootstrapper reads (Valve's file name).
     static let manifestName = "steam_client_win64"
@@ -715,9 +835,13 @@ actor SteamClientInstaller {
             madeira_seed_prefix_if_needed(prefix.path)
         }
         let drive = prefix.appendingPathComponent("drive_c")
-        let shared = SharedContainer.drive(prefix: prefix.path).map { URL(fileURLWithPath: $0) }
-        let root = shared?.appendingPathComponent("Steam") ?? drive.appendingPathComponent(SteamRuntimeFiles.relativeRoot)
-        let windowsRoot = shared == nil ? SteamRuntimeFiles.windowsRoot : "D:\\Steam"
+        // ml1371: never Madeira Dock's folder.
+        let target = SteamClientPackages.target(prefix: prefix)
+        let root = target.root, windowsRoot = target.windowsRoot
+        let dockRoot = drive.appendingPathComponent(SteamRuntimeFiles.relativeRoot)
+        guard root.standardizedFileURL.path.lowercased() != dockRoot.standardizedFileURL.path.lowercased() else {
+            throw SteamRuntimeFiles.Failure.conflict
+        }
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
         guard root.standardizedFileURL.path == root.resolvingSymlinksInPath().standardizedFileURL.path else {
             throw SteamRuntimeFiles.Failure.conflict
@@ -742,9 +866,13 @@ actor SteamClientInstaller {
         let packageFolder = try resolver.folder("package")
         try manifestData.write(to: packageFolder.appendingPathComponent(SteamClientPackages.manifestName + ".manifest"), options: .atomic)
 
-        // Steam's discovery keys, as Dock writes them, only while no session owns the registry.
+        // Steam's discovery keys for this folder, only while no session owns the
+        // registry and only when Madeira Dock's client is not installed (its keys
+        // must keep pointing at Dock's folder; games in a Dock session read them).
         if sessionRunning || wine_process_is_running() != 0 || wineserver_is_running() != 0 {
             state.registry = "left to Steam (a session is running; Steam writes its own keys when it starts)"
+        } else if fm.fileExists(atPath: dockRoot.appendingPathComponent("steamclient64.dll").path) {
+            state.registry = "left to Steam (Madeira Dock's discovery keys stay on Dock's folder)"
         } else if !fm.fileExists(atPath: prefix.appendingPathComponent(".update-timestamp").path) {
             state.registry = "left as is (the prefix's registry is not the app's template)"
         } else {

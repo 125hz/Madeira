@@ -460,6 +460,30 @@ configured engine again.
   "Download Valve's client components" stops with "Existing Steam files need
   attention" while a `steam.exe` is there. Started with `-nobootstrapperupdate`
   the full client does not update itself afterwards. See docs/WINDOWED.md.
+- 2026-10-13 (ml1371): device log 102 confirmed it: every Dock start after
+  that install reported `client-sha256=e9045710…` (pinned `71b391fe…`),
+  `session-client-adapter=0`, `session-unsupported-client=1`, and no game
+  booted. **Rule: the full client and Dock never share a folder.** Dock keeps
+  `C:\Program Files (x86)\Steam`; the full client installs to
+  `C:\Program Files (x86)\Steam Client` (or `D:\Steam` on the shared drive with
+  `env.MADEIRA_SHARED_DRIVE = 1`), and the installer refuses Dock's folder. It
+  writes Steam's discovery keys for its own folder only when Dock's client is
+  not installed, so Dock's keys keep pointing at Dock's folder.
+  **Repair Madeira Dock's Steam files** (`SteamRuntimeInstaller.repairDock`):
+  in the Dock sheet's Steam client section when the full client is in Dock's
+  folder, from the windowed Steam button and the library's Steam entry in that
+  case, and offered automatically when a Dock start reports
+  `session-unsupported-client=1` with a `client-sha256` other than the pinned
+  one. It moves a complete full client to `Steam Client` (when that folder is
+  free and not on `D:`; Dock's `steamapps`, `userdata`, `config`,
+  `depotcache`, `appcache` are moved back) or removes everything else from
+  Dock's folder, fetches the three pinned packages again and checks that
+  `steamclient64.dll` is the pinned build. Without a session it also rewrites
+  Dock's discovery keys (`registry(…, force: true)`); in a session it writes
+  files only. Log: `[steam-install] ml1371 dock repair: …`. Not yet handled:
+  the full client, once it runs, writes Steam's own `SteamPath` and
+  `ActiveProcess\SteamClientDll64` for its folder; a later Dock game reads
+  those keys until a repair without a session rewrites them.
 
 ## Tests
 
