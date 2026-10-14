@@ -48,8 +48,10 @@ __attribute__((noreturn)) void fatal_error(const char *err, ...) {
 // The wineserver event loop's stop flag (normally WineServerBridge.m). No server here.
 volatile int g_wineserver_should_stop = 0;
 
-// process_ios.c logs child-start phases through this; headless, so it is a no-op.
-void winios_phase(const char *name) { (void)name; }
+// process_ios.c stamps child-start phases through this; ml1333 writes them to the
+// extension log (ProcessHost.m), which the app appends to its session log.
+extern void madeira_process_host_phase(const char *name);
+void winios_phase(const char *name) { madeira_process_host_phase(name); }
 
 // win32u hands dibdrv_PutImage source bits to this surface-dump probe (app-only PNG
 // dumps). Frames reach the app through winios_surface_present below (ml1332).
