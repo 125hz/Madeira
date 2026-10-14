@@ -306,6 +306,7 @@ void madeira_process_host_pump_windows(void) {
 @end
 
 @interface MadeiraProcessHostSession () <NSXPCListenerDelegate, PHProcessClient>
+- (void)invalidateWithReason:(NSString *)why;   // ml1334
 @end
 
 @implementation MadeiraProcessHostSession {
@@ -394,8 +395,16 @@ void madeira_process_host_pump_windows(void) {
     [connection resume];
     _connection = connection;
     __weak typeof(self) weakSelf=self;
-    connection.interruptionHandler=^{ [weakSelf appendExtensionLog:@"connection interrupted"]; [weakSelf invalidate]; };
-    connection.invalidationHandler=^{ [weakSelf invalidate]; };
+    // ml1334: our own invalidate clears both handlers before it invalidates, so either
+    // block running means the extension's side went away (its process ended).
+    connection.interruptionHandler=^{
+        [weakSelf appendExtensionLog:@"connection interrupted"];
+        [weakSelf invalidateWithReason:@"the XPC connection was interrupted (the extension process ended)"];
+    };
+    connection.invalidationHandler=^{
+        [weakSelf appendExtensionLog:@"connection invalidated"];
+        [weakSelf invalidateWithReason:@"the XPC connection was invalidated (the extension process ended)"];
+    };
     return YES;
 }
 
@@ -422,7 +431,7 @@ void madeira_process_host_pump_windows(void) {
     [(id<PHNSExtension>)extension setRequestInterruptionBlock:^(NSUUID *uuid) {
         [interruptSelf emit:@"extension interrupted"];
         [interruptSelf appendExtensionLog:@"interrupted"];
-        [interruptSelf invalidate];
+        [interruptSelf invalidateWithReason:@"iOS interrupted the extension request (the extension process ended)"];
     }];
 
     _listener = [NSXPCListener anonymousListener];
@@ -467,7 +476,7 @@ void madeira_process_host_pump_windows(void) {
     _extSocketFD=dup(socketFD);
     int pair[2];
     if (_extSocketFD < 0 || socketpair(AF_UNIX,SOCK_STREAM,0,pair)) {
-        [self invalidate]; completion(NO,PHStageStarted,@"socket duplication failed"); return;
+        [self invalidateWithReason:@"prepare: socket duplication failed"]; completion(NO,PHStageStarted,@"socket duplication failed"); return;
     }
     _controlFD=pair[0];
     int noSigPipe=1; struct timeval timeout={10,0};
@@ -476,7 +485,8 @@ void madeira_process_host_pump_windows(void) {
     setsockopt(_controlFD,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof timeout);
     if (!ph_register(_extensionPID,_controlFD)) {
         close(pair[1]); close(_controlFD); _controlFD=-1;
-        [self invalidate]; completion(NO,PHStageStarted,@"control registry full or extension pid reused"); return;
+        [self invalidateWithReason:@"prepare: control registry full or extension pid reused"];
+        completion(NO,PHStageStarted,@"control registry full or extension pid reused"); return;
     }
     _controlRegistered=YES;
     xpc_object_t info = xpc_dictionary_create(NULL, NULL, 0);
@@ -512,7 +522,7 @@ void madeira_process_host_pump_windows(void) {
     if (desktop) xpc_dictionary_set_string(info,PH_INFO_DESKTOP,desktop);
 
     id<PHProcessServer> proxy = [_connection remoteObjectProxyWithErrorHandler:^(NSError *e) {
-        [self invalidate];
+        [self invalidateWithReason:[NSString stringWithFormat:@"prepareGuest failed over XPC: %@", e.localizedDescription]];
         completion(NO, PHStageStarted, e.localizedDescription);
     }];
     __weak typeof(self) weakSelf = self;
@@ -524,7 +534,8 @@ void madeira_process_host_pump_windows(void) {
         int stage = (int)xpc_dictionary_get_int64(result, PH_REPLY_STAGE);
         int pid = (int)xpc_dictionary_get_int64(result, PH_REPLY_PID);
         const char *err = xpc_dictionary_get_string(result, PH_REPLY_ERROR);
-        if (!ok) [s invalidate];
+        if (!ok) [s invalidateWithReason:[NSString stringWithFormat:@"the extension refused prepareGuest at stage %d: %s",
+                                          stage, err && *err ? err : "no reason"]];
         else [s emit:[NSString stringWithFormat:@"ml1331 control socket registered pid=%d",pid]];
         if (s) [s emit:[NSString stringWithFormat:@"pool mapped / server connected: ok=%d stage=%d%s%s",
                         ok, stage, err && *err ? " error=" : "", err && *err ? err : ""]];
@@ -535,7 +546,7 @@ void madeira_process_host_pump_windows(void) {
 - (void)startGuestWithCompletion:(void (^)(BOOL, int, NSString *_Nullable))completion {
     if (!_connection) { completion(NO, 0, @"no connection to the extension"); return; }
     id<PHProcessServer> proxy = [_connection remoteObjectProxyWithErrorHandler:^(NSError *e) {
-        [self invalidate];
+        [self invalidateWithReason:[NSString stringWithFormat:@"startGuest failed over XPC: %@", e.localizedDescription]];
         completion(NO, PHStageEnvReady, e.localizedDescription);
     }];
     __weak typeof(self) weakSelf = self;
@@ -664,9 +675,19 @@ void madeira_process_host_pump_windows(void) {
     [self emit:[NSString stringWithFormat:@"exit code %d",status]];
     [self appendExtensionLog:[NSString stringWithFormat:@"exit code %d",status]];
     if (self.exitHandler) self.exitHandler(status);
-    [self invalidate];
+    [self invalidateWithReason:[NSString stringWithFormat:@"its Wine process exited (code %d)", status]];
 }
+// The session's owner (MadeiraExtProcess.swift: a refused or failed launch, its timeout).
 - (void)invalidate {
+    [self invalidateWithReason:@"the launcher ended the session (refused, failed or timed out launch)"];
+}
+// ml1334: every path that ends an extension says why, once, before it cancels the request:
+// "[ext-proc] ml1334 app ended the extension: <why>".
+- (void)invalidateWithReason:(NSString *)why {
+    @synchronized(self) {
+        if (_connection || _request)
+            fprintf(stderr,"[ext-proc] ml1334 app ended the extension: %s (pid %d)\n",why.UTF8String ?: "?",_extensionPID);
+    }
     // ml1332: windows of an extension that ended without destroying them lose their
     // buffers and, through the Wine-thread pump, their layers and windowed frames.
     NSString *stats=nil;
