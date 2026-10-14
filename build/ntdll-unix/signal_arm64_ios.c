@@ -6500,6 +6500,8 @@ static void ios_install_task_exception_port(void)
 /* Register a Wine "process" thread with the shared Mach exception handler.
  * First call creates the shared port and handler thread.
  * Every call registers the thread and sets its exception ports. */
+static int ios_pc_in_app_text( uint64_t pc );
+
 static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
                                                void *trampoline )
 {
@@ -6523,6 +6525,12 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
             if (!ios_mach_align_fault_enabled)
                 ERR("[unaligned-atomic] Mach-path alignment classification DISABLED by "
                     "MADEIRA_MACH_ALIGN_FAULT=0: alignment faults are delivered as c0000005 there\n");
+        }
+
+        {
+            /* the app's __TEXT range for the native-unaligned emulation, resolved here:
+             * dyld's lookups do not belong on the exception thread */
+            ios_pc_in_app_text( 0 );
         }
 
         pthread_t handler;
@@ -7914,22 +7922,18 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
             }
             /* madeira-bcd: an ordered/exclusive/LSE access in the app's own code
              * (ios_native_unaligned_emulate: the Launcher's `stlr` of build 454).
-             * dladdr names the function for the first few. */
+             * The app offset names the function offline: dladdr would take dyld's
+             * lock on the exception thread for a fault that is recovered. */
             if (ios_native_unaligned_emulate( &uc, a_insn, fault_addr, (uint64_t)pc ))
             {
                 static unsigned long ua_native;
                 PC_sig(&uc) += 4;
                 *state = mc.__ss;
                 if (++ua_native <= 16 || (ua_native % 4096) == 0)
-                {
-                    Dl_info di = { 0 };
-                    const char *fn = dladdr( (const void *)(uintptr_t)pc, &di ) && di.dli_sname ? di.dli_sname : "?";
-                    uint64_t at = di.dli_saddr && fn[0] != '?' ? (uint64_t)pc - (uint64_t)(uintptr_t)di.dli_saddr : 0;
-                    dprintf( 2, "[unaligned-native] mach-path pc=0x%llx (app+0x%llx, %s+0x%llx) insn=0x%08x "
+                    dprintf( 2, "[unaligned-native] mach-path pc=0x%llx (app+0x%llx) insn=0x%08x "
                                 "addr=0x%llx emulated in place, not handed to FEX (#%lu)\n",
-                             (unsigned long long)pc, (unsigned long long)((uint64_t)pc - ios_app_text_lo), fn,
-                             (unsigned long long)at, a_insn, (unsigned long long)fault_addr, ua_native );
-                }
+                             (unsigned long long)pc, (unsigned long long)((uint64_t)pc - ios_app_text_lo),
+                             a_insn, (unsigned long long)fault_addr, ua_native );
                 return 1;
             }
 
