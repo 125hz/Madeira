@@ -4059,11 +4059,15 @@ struct mad_frec {
 static struct mad_frec g_frec[MAD_FREC_N];
 /* madeira-bcd: a compute shader that faulted the GPU is remembered in
  * C:\madeira-cs\fault-shaders.txt; at the next launch its bytecode is written
- * next to it and into the log (base64), so it can be disassembled offline. */
+ * next to it and into the log (base64), so it can be disassembled offline.
+ * Once: a shader whose fault_<hash>.dxil is already there was captured before,
+ * and is neither logged again at every later launch nor listed again. */
 static UINT64 g_fault_cs_want[16]; static UINT g_fault_cs_nwant; static LONG g_fault_cs_loaded;
 static void mad_fault_remember_cs(UINT64 hash, UINT len) {
     HANDLE h; DWORD wr; char line[64]; int n;
     if (!hash) return;
+    snprintf(line, sizeof line, "C:\\madeira-cs\\fault_%016llx.dxil", (unsigned long long)hash);
+    if (GetFileAttributesA(line) != INVALID_FILE_ATTRIBUTES) return;   /* captured at an earlier launch */
     CreateDirectoryA("C:\\madeira-cs", NULL);
     h = CreateFileA("C:\\madeira-cs\\fault-shaders.txt", FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -4112,6 +4116,7 @@ static void mad_fault_cs_check(const void *bc, UINT len, UINT64 hash) {
     if (i == g_fault_cs_nwant) return;
     g_fault_cs_want[i] = 0;   /* once */
     snprintf(name, sizeof name, "C:\\madeira-cs\\fault_%016llx.dxil", (unsigned long long)hash);
+    if (GetFileAttributesA(name) != INVALID_FILE_ATTRIBUTES) return;   /* captured at an earlier launch */
     h = CreateFileA(name, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) { WriteFile(h, bc, len, &wr, NULL); CloseHandle(h); }
     d3d12_log("[madeira-d3d12] GPU fault shader %016llx: %u bytes follow as base64 (also %s)\n", (unsigned long long)hash, len, name);
@@ -15247,17 +15252,31 @@ static int mad_sc_init(void) {
                 size_t l = strlen(g_sc_rt);
                 snprintf(g_sc_rt + l, sizeof g_sc_rt - l, ", dxbc-spaces 1");
             }
-            mad_sc_feed(&h, g_sc_stamp, strlen(g_sc_stamp) + 1);
-            mad_sc_feed(&h, g_sc_rt, sizeof g_sc_rt);
-            n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
-            if (!n || n >= MAX_PATH - 64) on = 0;
-            else {
-                _snwprintf(g_sc_root, MAX_PATH, L"%ls\\Madeira", base); CreateDirectoryW(g_sc_root, NULL);
-                _snwprintf(g_sc_root, MAX_PATH, L"%ls\\Madeira\\ShaderCache", base); CreateDirectoryW(g_sc_root, NULL);
-                _snwprintf(g_sc_build, 64, L"%016llx", (unsigned long long)h.a);
-                _snwprintf(g_sc_dir, MAX_PATH, L"%ls\\%ls", g_sc_root, g_sc_build);
-                CreateDirectoryW(g_sc_dir, NULL);
-                { HANDLE t = CreateThread(NULL, 0, mad_sc_prune, NULL, 0, NULL); if (t) CloseHandle(t); }
+            /* The build directory is the converter's identity alone -- this DLL's
+             * stamp and the app image the converter's unix half is linked into
+             * (MADEIRA_APP_IMAGE_UUID, from the bridge) -- and only other builds'
+             * directories are pruned. The switches above get a subdirectory each, so
+             * games with different lists (and two of them running) keep their caches. */
+            {
+                struct mad_sc_hash hr = { 0xcbf29ce484222325ull, 0x84222325cbf29ce4ull };
+                char uuid[40] = "";
+                DWORD ul = GetEnvironmentVariableA("MADEIRA_APP_IMAGE_UUID", uuid, sizeof uuid);   /* set by the app: not a switch */
+                if (!ul || ul >= sizeof uuid) uuid[0] = 0;
+                mad_sc_feed(&h, g_sc_stamp, strlen(g_sc_stamp) + 1);
+                mad_sc_feed(&h, uuid, strlen(uuid) + 1);
+                mad_sc_feed(&hr, g_sc_rt, sizeof g_sc_rt);
+                n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+                if (!n || n >= MAX_PATH - 112) on = 0;
+                else {
+                    _snwprintf(g_sc_root, MAX_PATH, L"%ls\\Madeira", base); CreateDirectoryW(g_sc_root, NULL);
+                    _snwprintf(g_sc_root, MAX_PATH, L"%ls\\Madeira\\ShaderCache", base); CreateDirectoryW(g_sc_root, NULL);
+                    _snwprintf(g_sc_build, 64, L"%016llx", (unsigned long long)h.a);
+                    _snwprintf(g_sc_dir, MAX_PATH, L"%ls\\%ls", g_sc_root, g_sc_build);
+                    CreateDirectoryW(g_sc_dir, NULL);
+                    _snwprintf(g_sc_dir, MAX_PATH, L"%ls\\%ls\\%016llx", g_sc_root, g_sc_build, (unsigned long long)hr.a);
+                    CreateDirectoryW(g_sc_dir, NULL);
+                    { HANDLE t = CreateThread(NULL, 0, mad_sc_prune, NULL, 0, NULL); if (t) CloseHandle(t); }
+                }
             }
         }
         if (on) d3d12_log("[madeira-d3d12] shader cache ON: %ls, identity '%s' (%s; madeira.cfg shader-cache = 0 turns it off)\n", g_sc_dir, g_sc_stamp, g_sc_rt);

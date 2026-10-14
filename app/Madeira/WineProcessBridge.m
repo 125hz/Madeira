@@ -27,6 +27,8 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <sys/sysctl.h>
+#include <dlfcn.h>
+#include <mach-o/loader.h>
 
 #include "WineProcessBridge.h"
 #include "WineServerBridge.h"
@@ -377,6 +379,30 @@ __attribute__((constructor)) static void madeira_docs_dir_ctor(void)
  * Only LocalLow is created. Roaming is left alone: Wine populates it itself and
  * decides by existence (see madeira_undo_appdata_skeleton). Local already
  * exists on every start (the TEMP directory is in it). */
+/* The PE shader cache's build identity (madeira_d3d12.c, mad_sc_init) includes the
+ * LC_UUID of the image this bridge is in: the converter's unix half is linked into it
+ * too, so the UUID changes whenever the converter could have, and a cache keyed on
+ * the DLL's own build would otherwise keep serving an older converter's output. */
+static void madeira_export_image_uuid(void)
+{
+    Dl_info di;
+    const struct mach_header_64 *mh;
+    const struct load_command *lc;
+    uint32_t i;
+
+    if (!dladdr((const void *)&madeira_export_image_uuid, &di) || !(mh = di.dli_fbase)) return;
+    lc = (const struct load_command *)(mh + 1);
+    for (i = 0; i < mh->ncmds; i++, lc = (const struct load_command *)((const char *)lc + lc->cmdsize))
+    {
+        if (lc->cmd != LC_UUID) continue;
+        const uint8_t *u = ((const struct uuid_command *)lc)->uuid;
+        char hex[33];
+        for (int k = 0; k < 16; k++) snprintf(hex + 2 * k, 3, "%02x", u[k]);
+        setenv("MADEIRA_APP_IMAGE_UUID", hex, 1);
+        return;
+    }
+}
+
 static void madeira_ensure_locallow(NSString *prefix)
 {
     /* 0 leaves the profile's AppData\LocalLow folder missing, as before. */
@@ -931,6 +957,7 @@ static void *wine_process_thread(void *arg) {
         // get_desktop_window's returned HWND fails get_user_object lookup
         // when create_window receives it as req->parent.
         setenv("MADEIRA_WIN32U", "1", 1);
+        madeira_export_image_uuid();
 
         /* iOS-Madeira ml711: default FNA to its D3D11 backend.
          *
