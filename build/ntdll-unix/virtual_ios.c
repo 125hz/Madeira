@@ -5725,6 +5725,14 @@ int ios_jit_heal_aux_iat( uintptr_t fault_pc, uintptr_t lr, void *thread_peb, ui
     }
     /* exactly where the redirect sends this process */
     if ((uintptr_t)ios_jit_translate_addr_for_owner( (void *)fault_pc, thread_peb ) != jit_pc) return 0;
+    /* a caller copy without an owner serves every process that maps the image, so it
+     * may only be sent to a target copy that is shared too, never to one process's own
+     * (each child has its own ntdll copy) */
+    if (!ios_jit_mappings[i].owner_peb)
+    {
+        int t = ios_aux_find_copy( jit_pc );
+        if (t < 0 || ios_jit_mappings[t].owner_peb) return 0;
+    }
 
     __atomic_store_n( (uint64_t *)(rw + (slot - rx)), (uint64_t)jit_pc, __ATOMIC_RELEASE );
     n = __sync_add_and_fetch( &healed, 1 );
