@@ -62,7 +62,8 @@ enum MadeiraDock {
     static let executable = "C:\\windows\\system32\\dockhost.exe"
 
     static var prefix: URL {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent("wine")
+        let original = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent("wine")
+        return URL(fileURLWithPath: madeira_process_host_active_prefix(original.path))
     }
     static var drive: URL { prefix.appendingPathComponent("drive_c") }
     static var clientRoot: URL { drive.appendingPathComponent(SteamRuntimeFiles.relativeRoot, isDirectory: true) }

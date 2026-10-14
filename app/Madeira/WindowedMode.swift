@@ -205,6 +205,11 @@ enum WindowedSteam {
     /// ml1370: the steam.exe the button starts: the full 64-bit client (not Madeira
     /// Dock's 32-bit components); with env.MADEIRA_STEAM_PACKAGE_INSTALL = 0 any steam.exe.
     static var readyClient: String? {
+        let original = LibraryModel.documents.appendingPathComponent("wine").path
+        if let shared = madeira_process_host_shared_drive(original),
+           SteamClientPackages.installed(root: URL(fileURLWithPath: shared).appendingPathComponent("Steam")) {
+            return "D:\\Steam\\steam.exe"
+        }
         guard packageInstall else { return installedClient }
         return clientPaths.first { SteamClientPackages.installed(root: LibraryModel.drive.appendingPathComponent(($0 as NSString).deletingLastPathComponent)) }
     }
@@ -278,7 +283,7 @@ enum WindowedSteam {
     }
 
     private static func windowsPath(_ relative: String) -> String {
-        "C:\\" + relative.replacingOccurrences(of: "/", with: "\\")
+        relative.contains(":") ? relative : "C:\\" + relative.replacingOccurrences(of: "/", with: "\\")
     }
 
     /// The program's folder, as a Windows path ("C:\Program Files (x86)\Steam").
@@ -341,8 +346,8 @@ enum WindowedSteam {
         if model.running { model.present(); return }
         var message = "Madeira downloads Valve's current Steam client from Valve's update server "
             + "(\(SteamClientPackages.manifestName): its packages, a few hundred MB, about 1 GB once unpacked) and installs it "
-            + "in \(SteamRuntimeFiles.windowsRoot), as Steam's own installer would. No sign-in is involved."
-        if MadeiraDock.enabled && MadeiraDock.clientInstalled {
+            + "in \(SteamClientPackages.installWindowsRoot), as Steam's own installer would. No sign-in is involved."
+        if SteamClientPackages.installWindowsRoot == SteamRuntimeFiles.windowsRoot, MadeiraDock.enabled && MadeiraDock.clientInstalled {
             message += "\n\nMadeira Dock's client files are in that folder. The current client replaces them, and Dock "
                 + "refuses a client build it has not verified, so Dock starts may fail until Dock supports that build."
         }
@@ -365,6 +370,11 @@ enum WindowedSteam {
         guard entry.steamAppID == nil, entry.desktop != true,
               clientPaths.contains(where: { $0.caseInsensitiveCompare(entry.relativePath) == .orderedSame }) else { return entry }
         guard packageInstall else { return entry }
+        if readyClient?.hasPrefix("D:") == true {
+            LibraryModel.shared.preparing = nil
+            show("Steam", "Steam is installed on the shared D: drive. Start a Windows desktop session and open Steam from its taskbar.")
+            return nil
+        }
         let folder = LibraryModel.drive.appendingPathComponent((entry.relativePath as NSString).deletingLastPathComponent)
         guard SteamClientPackages.installed(root: folder) else {
             LibraryModel.shared.preparing = nil   // the starting screen: no session follows this press
@@ -385,6 +395,11 @@ enum WindowedSteam {
     /// The round 4 fallback: a library entry for the next start.
     private static func prepareClient(_ relative: String, inSession failure: String) {
         let path = windowsPath(relative)
+        if relative.contains(":") {
+            show("Steam", "Steam is installed at \(path). Start a Windows desktop session, then use its taskbar to open Steam. "
+                 + "The shared-drive client can be opened inside a running session (\(failure)).")
+            return
+        }
         let entry = libraryEntry(relative: relative, title: "Steam", arguments: launchArguments)
         if let failure = entry.failure {
             log("not available (Steam is installed at \(path), but its library entry could not be made: \(failure))")
@@ -667,9 +682,9 @@ final class SteamClientInstallModel: ObservableObject {
                 fputs("[steam-install] ml1370 manifest version \(step.version): \(step.parts) packages, \(Self.size(step.totalBytes))\n", stderr)
             }
         case .installing:
-            line = "installing \(step.files) files (client version \(step.version)) into \(SteamRuntimeFiles.windowsRoot)"
+            line = "installing \(step.files) files (client version \(step.version)) into \(SteamClientPackages.installWindowsRoot)"
         case .finished:
-            line = "installed in \(SteamRuntimeFiles.windowsRoot) (client version \(step.version), \(step.files) files from "
+            line = "installed in \(SteamClientPackages.installWindowsRoot) (client version \(step.version), \(step.files) files from "
                 + "\(step.parts) packages, \(Self.size(step.totalBytes)); registry: \(step.registry))"
         }
         guard line != logged else { return }
@@ -719,7 +734,7 @@ final class SteamClientInstallModel: ObservableObject {
         case .downloading: return "Downloading part \(p.part) of \(p.parts) (\(p.name), \(Self.size(p.bytes)))…"
         case .unpacking, .done: return "Unpacking part \(p.part) of \(p.parts) (\(p.name))…"
         case .installing: return "Installing \(p.files) files…"
-        case .finished: return "Steam is installed in \(SteamRuntimeFiles.windowsRoot)."
+        case .finished: return "Steam is installed in \(SteamClientPackages.installWindowsRoot)."
         }
     }
 
@@ -1258,7 +1273,7 @@ enum MadeiraSession {
     private static var callbackSet = false
     private static var pending: [UInt32: (command: String, taken: Bool, completion: @MainActor (Result) -> Void)] = [:]
 
-    static func launch(commandLine: String, workingDirectory: String? = nil, servicesFirst: Bool = false,
+    static func launch(commandLine: String, workingDirectory: String? = nil, servicesFirst: Bool = false, remote: Bool = false,
                        completion: @escaping @MainActor (Result) -> Void = { _ in }) {
         let command = commandLine.trimmingCharacters(in: .whitespacesAndNewlines)
         guard available else {
@@ -1273,9 +1288,9 @@ enum MadeiraSession {
         let folder = workingDirectory?.trimmingCharacters(in: .whitespacesAndNewlines)
         let id: UInt32 = command.withCString { cmd in
             if let folder, !folder.isEmpty {
-                return folder.withCString { madeira_session_launch_request(cmd, $0, servicesFirst ? servicesFirstFlag : 0, &reason, Int32(reason.count)) }
+                return folder.withCString { madeira_session_launch_request(cmd, $0, (servicesFirst ? servicesFirstFlag : 0) | (remote ? 2 : 0), &reason, Int32(reason.count)) }
             }
-            return madeira_session_launch_request(cmd, nil, servicesFirst ? servicesFirstFlag : 0, &reason, Int32(reason.count))
+            return madeira_session_launch_request(cmd, nil, (servicesFirst ? servicesFirstFlag : 0) | (remote ? 2 : 0), &reason, Int32(reason.count))
         }
         guard id != 0 else {
             finish(command, Result(ok: false, pid: 0, status: 0, reason: String(cString: reason)), completion)

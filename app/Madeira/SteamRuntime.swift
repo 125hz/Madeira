@@ -196,7 +196,7 @@ enum SteamRuntimeFiles {
 
     // Only fixed client-discovery paths are written. Never write user IDs,
     // licenses, login cache, tokens, or a value asserting ownership.
-    static func registry(_ text: String, machine: Bool) throws -> String {
+    static func registry(_ text: String, machine: Bool, windowsRoot: String = SteamRuntimeFiles.windowsRoot) throws -> String {
         guard text.hasPrefix("WINE REGISTRY Version 2") else { throw Failure.prefixMissing }
         let root = windowsRoot.replacingOccurrences(of: "\\", with: "\\\\")
         let sections: [(String, [(String, String)])] = machine
@@ -354,6 +354,10 @@ actor SteamRuntimeInstaller {
 /// verified subset of an older 32-bit manifest). No Valve file is bundled and
 /// no account data is read or written.
 enum SteamClientPackages {
+    static var installWindowsRoot: String {
+        let prefix = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent("wine")
+        return madeira_process_host_shared_drive(prefix.path) == nil ? SteamRuntimeFiles.windowsRoot : "D:\\Steam"
+    }
     /// The manifest the 64-bit client's bootstrapper reads (Valve's file name).
     static let manifestName = "steam_client_win64"
     /// Its top-level section ("win64").
@@ -629,7 +633,9 @@ actor SteamClientInstaller {
             madeira_seed_prefix_if_needed(prefix.path)
         }
         let drive = prefix.appendingPathComponent("drive_c")
-        let root = drive.appendingPathComponent(SteamRuntimeFiles.relativeRoot)
+        let shared = madeira_process_host_shared_drive(prefix.path).map { URL(fileURLWithPath: $0) }
+        let root = shared?.appendingPathComponent("Steam") ?? drive.appendingPathComponent(SteamRuntimeFiles.relativeRoot)
+        let windowsRoot = shared == nil ? SteamRuntimeFiles.windowsRoot : "D:\\Steam"
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
         guard root.standardizedFileURL.path == root.resolvingSymlinksInPath().standardizedFileURL.path else {
             throw SteamRuntimeFiles.Failure.conflict
@@ -668,7 +674,7 @@ actor SteamClientInstaller {
                         throw SteamRuntimeFiles.Failure.conflict
                     }
                     let text = try String(contentsOf: url, encoding: .utf8)
-                    pending.append((url, Data(try SteamRuntimeFiles.registry(text, machine: machine).utf8)))
+                    pending.append((url, Data(try SteamRuntimeFiles.registry(text, machine: machine, windowsRoot: windowsRoot).utf8)))
                 }
                 for (url, bytes) in pending {
                     let backup = url.appendingPathExtension("steam-setup-bak")
