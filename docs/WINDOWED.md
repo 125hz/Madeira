@@ -321,26 +321,66 @@ panel opens, so a Steam installed during the session gets its icon; a
   you are looking at and its windows come up in frames.
   - The first tap shows "The full Steam client needs a lot of memory; the web
     helper may be killed." (plus, when Madeira Dock's client files are in the
-    prefix: Steam updates its own files when it runs, and Dock refuses a
-    client build it has not verified) with Continue / Cancel. Continue is
-    remembered.
-  - **Steam installed** (`C:\Program Files (x86)\Steam\steam.exe`, or
-    `C:\Program Files\Steam\steam.exe`; Dock's client components include a
-    `steam.exe`, which then counts): `"…\steam.exe" -no-cef-sandbox
-    -cef-disable-gpu` is started in Steam's folder, `services.exe` first when
-    none runs in the session (the library's "Start Windows services first").
-    No alert: Steam's window appears when it is ready (the bootstrapper's
-    update window first). A second tap within 90 s, while no Steam window is
-    open yet, only says "Steam is starting".
-  - **Not installed**: Valve's installer is downloaded from
-    `https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe`
-    (HTTPS; redirects only within `*.steamstatic.com`; status 200, 256 KB to
-    64 MB, an x86/x64 PE) with a progress alert (Cancel stops it) into
-    `Library/Application Support/MadeiraSteam/SteamSetup.exe` (no backup),
-    copied to `C:\madeira-games\SteamSetup.exe` and started in the session
-    (services first). A copy already in `C:\madeira-games` from an earlier
-    download is started without downloading again. Once Steam is installed the
-    button starts Steam. Not pinned to a hash: Valve updates the installer.
+    prefix: Madeira starts Steam with `-nobootstrapperupdate`, so it does not
+    update itself, but installing the full client replaces Dock's client files
+    with Valve's current build, and Dock refuses a client build it has not
+    verified) with Continue / Cancel. Continue is remembered.
+  - **Steam installed** (ml1370: the full 64-bit client, i.e. an x86-64
+    `steam.exe` plus `package\steam_client_win64.manifest` in
+    `C:\Program Files (x86)\Steam` or `C:\Program Files\Steam`; Madeira Dock's
+    components, whose `steam.exe` is the 32-bit one, do not count):
+    `"…\steam.exe" -nobootstrapperupdate -skipinitialbootstrap -norepairfiles
+    -noverifyfiles -no-cef-sandbox -cef-disable-gpu steam://open/games` is
+    started in Steam's folder, `services.exe` first when none runs in the
+    session (the library's "Start Windows services first"). The bootstrapper
+    neither updates itself nor downloads the manifest nor checks the files (the
+    app installed and checked them), so it goes straight to the client and the
+    library page. `-cef-disable-gpu` stays: the web helper runs in
+    single-process mode in this task (ntdll's proc-gate), where its GPU thread
+    would be ANGLE on Direct3D 11 inside the same process;
+    `env.MADEIRA_STEAM_CEF_GPU = 1` drops it. `env.MADEIRA_STEAM_LAUNCH_FLAGS = 0`
+    goes back to `-no-cef-sandbox -cef-disable-gpu` (the bootstrapper then
+    updates and verifies). The competitor's log spells the first switch
+    `-nobootstrapupdate`; Valve's `steam.exe` only contains
+    `-nobootstrapperupdate`. No alert: Steam's window appears when it is ready.
+    A second tap within 90 s, while no Steam window is open yet, only says
+    "Steam is starting". The search's Steam row reads "Steam client · path"
+    only for the full client.
+  - **Not installed** (ml1370): "Install Steam" (Cancel / Install; with Dock's
+    files in the folder it says the current client replaces them). The app does
+    what Valve's bootstrapper does, natively: it reads the manifest
+    `https://client-update.akamai.steamstatic.com/steam_client_win64` (HTTPS,
+    redirects only on that host, at most 1 MB, a `win64` section with a numeric
+    version), takes every package it lists (18 in version 1788652215, 356 MB:
+    `bins_cef_win64` 148 MB, `bins_win64` 63.7 MB, `steamui_websrc_all`
+    33 MB, `public_all` 31 MB, …, `steam_win64` last; `strings_<lang>_all`
+    only for English), downloads each from the same host, checks its size and
+    the manifest's SHA-256 before reading it, and unpacks it with Dock's ZIP
+    reader (same checks; larger limits: 512 MB archive / file, 2 GB in all,
+    32768 entries; files streamed to disk in 1 MB pieces) into a staging folder.
+    Then it checks that `steam.exe` is x86-64 and moves everything into
+    `C:\Program Files (x86)\Steam` (existing files replaced, `steamapps`,
+    `userdata`, `config`, `logs`, `dumps`, `appcache`, `depotcache` files kept,
+    names matched case-insensitively to what is there, `steam.exe` last) and
+    writes Valve's manifest to `package\steam_client_win64.manifest`. A
+    progress sheet (over the windowed desktop or the library) shows "Downloading
+    part N of 18 (name, size)…", "Unpacking part N of 18…", "Installing N
+    files…", "Steam is installed in C:\Program Files (x86)\Steam." with a bar;
+    Cancel stops it before anything is moved (the staging folder is deleted).
+    It needs about 3x the package size free. In a running session only files
+    are written (Steam writes its own registry keys when it starts); without a
+    session the prefix is seeded first and Dock's discovery keys are written
+    when they do not conflict. Refused during a Madeira Dock session. When it
+    finishes, Steam starts as above. `env.MADEIRA_STEAM_PACKAGE_INSTALL = 0`
+    brings back the round 4 path: any `steam.exe` counts, else Valve's
+    `SteamSetup.exe` is downloaded (cdn.cloudflare.steamstatic.com, progress
+    alert, `C:\madeira-games\SteamSetup.exe`) and started.
+  - **The library's Steam entry** (the fallback's "Steam" below, or any entry
+    whose program is one of those two `steam.exe` paths): Play offers the same
+    install (the starting screen goes, the sheet comes up) when the full client
+    is missing and starts the entry when it finishes; an entry still carrying
+    round 4's `-no-cef-sandbox -cef-disable-gpu` is switched to the switches
+    above and saved.
   - **Fallback** (round 4's behaviour), when the in-session start is refused or
     fails (`env.MADEIRA_SESSION_LAUNCH = 0`, no session, the file is gone, a
     start error; the reason is in the alert and the log): a library entry
@@ -396,6 +436,17 @@ panel opens, so a Steam installed during the session gets its icon; a
   device-tested yet); the round 4 library entry remains the fallback. No
   Valve logo in the repository: the tile shows the installed `steam.exe`'s own
   icon (round 5), a generic glyph until Steam is installed.
+- ml1370's package install is not device-tested and has never downloaded from
+  Valve's host in a test (the manifest parser and the ZIP reader were run on
+  this PC's own copy of Valve's `steam_client_win64` manifest and package
+  files). It does not write `package\steam_client_win64.installed` (Valve's
+  per-file list), has no resume (a failed or cancelled install starts again
+  from the first package), keeps no copy of Madeira Dock's replaced files, and
+  never updates an installed client (for a newer Valve build, delete
+  `package\steam_client_win64.manifest` in Steam's folder and install again). The web helper still runs in single-process mode
+  in this task and still gets the session's fixed `SteamAppId`/`SteamGameId`/
+  `SteamAppPath` environment (WineProcessBridge.m publishes it to every
+  non-Dock session; the in-session launcher passes no environment).
 - Round 7: the iOS keyboard keeps its size (no API shrinks it); the chips are
   the answer to a short screen. The chip thresholds are fixed (176 / 112
   points), not settings. The restore pill's dragged place is not kept between
@@ -454,7 +505,8 @@ The rest, all `[windowed] ml1300`:
     steam: launch (already running in this session: hwnd=0x... "..." exe=steam brought to the front)
     steam: button (no Steam window in this session; the app checks the install)
     steam: not available (cancelled at the memory warning)
-    steam: launch (started in this session: C:\Program Files (x86)\Steam\steam.exe -no-cef-sandbox -cef-disable-gpu)      ml1350
+    steam: launch (started in this session: C:\Program Files (x86)\Steam\steam.exe -nobootstrapperupdate -skipinitialbootstrap -norepairfiles -noverifyfiles -no-cef-sandbox -cef-disable-gpu steam://open/games)      ml1350, ml1370
+    steam: install (the full client is not in the prefix[; the steam.exe there is not the 64-bit client])               ml1370
     steam: launch (already starting in this session; its window has not opened yet)                                        ml1350
     steam: install (SteamSetup.exe downloaded | already in drive_c from an earlier download, N bytes, at C:\madeira-games\SteamSetup.exe; started in this session)   ml1350
     steam: not available (it could not start in this session: <reason>; library entry "Steam" for C:\Program Files (x86)\Steam\steam.exe added | already there, started at the next start)
@@ -476,6 +528,21 @@ The rest, all `[windowed] ml1300`:
 
 The in-session start itself logs `[launch] ml1350 ...` lines (app and ntdll);
 see `docs/SESSION_LAUNCH.md`.
+
+ml1370's Steam install and start (Swift, also for the library's Steam entry):
+
+    [steam-install] ml1370 start: manifest https://client-update.akamai.steamstatic.com/steam_client_win64 (a session is running: files only, ... | no session)
+    [steam-install] ml1370 manifest version 1788652215: 18 packages, 356.4 MB
+    [steam-install] ml1370 part 1 of 18 (bins_cef_win64, 148.4 MB) downloading | unpacking | done
+    [steam-install] ml1370 installing 6597 files (client version ...) into C:\Program Files (x86)\Steam
+    [steam-install] ml1370 installed in C:\Program Files (x86)\Steam (client version ..., N files from 18 packages, 356.4 MB; registry: left to Steam (...) | install path and client DLL paths written | left as is (...)[; N existing user-data files kept])
+    [steam-install] ml1370 failed at part N of 18 (downloading|unpacking|...): <reason, "cancelled">
+    [steam-install] ml1370 not started (cancelled at the confirmation)
+    [steam-install] ml1370 library entry "Steam": the full client is not installed; offering the install
+    [steam-launch] ml1370 command line (in this session (taskbar) | library entry, a session of its own): "C:\Program Files (x86)\Steam\steam.exe" -nobootstrapperupdate ...
+    [steam-launch] ml1370 web helper mode: single-process (in this task)
+    [steam-launch] ml1370 web helper switches: --no-sandbox from -no-cef-sandbox, --disable-gpu from -cef-disable-gpu; ntdll's proc-gate appends --single-process and refuses --type= children
+    [steam-launch] ml1370 library entry "Steam": switches brought from -no-cef-sandbox -cef-disable-gpu to ...
 
 `[winios] compositor attached inside presentation frame` is followed by the
 root line in a windowed session. `[winios] drv_post_mouse hwnd=0x...` (first
@@ -789,3 +856,42 @@ Test (round 8):
 8. Title bars: smaller buttons, still easy to hit (try the edges between two
    buttons); on a very narrow window the title still shows a few characters.
    `env.MADEIRA_WINDOWED_HUD_MENU = 1`: the round button stays.
+
+### ml1370 (2026-10-13: Steam from Valve's packages, the full client's switches)
+
+The owner's run of a competing app showed how it gets a working full client:
+it installs Valve's `steam_client_win64` packages itself and starts the x64
+`steam.exe` with the bootstrapper's no-update / no-verify switches. Ours ran
+SteamSetup.exe and then the 32-bit `steam.exe`, whose bootstrapper tried to
+update, failed its manifest download, verified files and never showed the main
+window. App only (`SteamRuntime.swift`, `WindowedMode.swift`, two lines in
+`ContentView.swift`, the config catalog); no native change.
+
+1. Windowed desktop session, prefix without Steam (or with only Madeira Dock's
+   components): search "steam", pick it (after the memory warning): "Install
+   Steam" (with Dock's files: the note that they are replaced). Install: the
+   sheet counts "Downloading part 1 of 18 (…)" up to "Installing N files…";
+   the log has `[steam-install] ml1370 manifest version …: 18 packages, …`,
+   one `part N of 18 (name, size) downloading | unpacking | done` triple per
+   package and `installed in C:\Program Files (x86)\Steam (…)`. Steam then
+   starts: `[steam-launch] ml1370 command line (in this session (taskbar)):
+   "C:\Program Files (x86)\Steam\steam.exe" -nobootstrapperupdate
+   -skipinitialbootstrap -norepairfiles -noverifyfiles -no-cef-sandbox
+   -cef-disable-gpu steam://open/games` and `web helper mode: single-process
+   (in this task)`. Report whether the bootstrapper window still appears, and
+   whether the sign-in or library window opens (Steam's own `logs/
+   bootstrap_log.txt` and `logs/webhelper.txt` in the prefix say what the
+   bootstrapper did).
+2. Cancel during a download: `failed at part N of 18 (downloading):
+   cancelled`, nothing in `C:\Program Files (x86)\Steam` changed; Install
+   again starts from part 1.
+3. Library interface, no session: the library's "Steam" entry (or one made by
+   the fallback): Play brings up the install sheet instead of the starting
+   screen when the client is missing; after it finishes the entry starts in a
+   session of its own (`command line (library entry, …)`). An entry from round
+   4: `switches brought from -no-cef-sandbox -cef-disable-gpu to …`.
+4. `env.MADEIRA_STEAM_PACKAGE_INSTALL = 0`: the round 4 path (SteamSetup.exe).
+   `env.MADEIRA_STEAM_LAUNCH_FLAGS = 0`: `-no-cef-sandbox -cef-disable-gpu`.
+   `env.MADEIRA_STEAM_CEF_GPU = 1`: the switches without `-cef-disable-gpu`.
+5. After the install, a Madeira Dock start: Dock refuses the new client build
+   (expected until Dock supports it); report the Dock result line.

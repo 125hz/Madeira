@@ -2556,6 +2556,8 @@ struct ContentView: View {
         guard wine_process_is_running() == 0, wineserver_is_running() == 0, library.current == nil else {
             library.error = "A session is already running."; return
         }
+        // ml1370: the library's Steam entry: the full client from Valve's packages first, then its launch switches (WindowedSteam).
+        guard let entry = WindowedSteam.libraryLaunch(entry, retry: { launchLibraryEntry($0) }) else { return }
         // One Wine session per app run (see LibraryModel.sessionsThisRun).
         if LibraryModel.sessionsThisRun > 0, MadeiraConfig.flag("MADEIRA_ONE_SESSION_PER_RUN") {
             LogStore.shared.log("[session-once] launch held: \(LibraryModel.sessionsThisRun) session(s) already ran in this app run")

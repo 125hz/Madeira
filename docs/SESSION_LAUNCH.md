@@ -122,7 +122,11 @@ Swift (`app/Madeira/WindowedMode.swift`):
 ## Users
 
 - **The windowed taskbar's Steam tile** (`WindowedSteam`, docs/WINDOWED.md): starts
-  `"…\Steam\steam.exe" -no-cef-sandbox -cef-disable-gpu` (services first), or Valve's
+  `"…\Steam\steam.exe" -nobootstrapperupdate -skipinitialbootstrap -norepairfiles
+  -noverifyfiles -no-cef-sandbox -cef-disable-gpu steam://open/games` (ml1370; services
+  first) once the full 64-bit client is installed, after installing it from Valve's packages
+  when it is not (`SteamClientPackages`). With `env.MADEIRA_STEAM_PACKAGE_INSTALL = 0`, the
+  round 4 path: any `steam.exe` with `-no-cef-sandbox -cef-disable-gpu`, or Valve's
   `C:\madeira-games\SteamSetup.exe` after the download (or the copy an earlier download
   left). On a refused/failed start the round 4 library entry and its "restart Madeira"
   alert are the fallback, with the reason. The memory warning and the download code are
