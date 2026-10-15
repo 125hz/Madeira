@@ -519,6 +519,25 @@ enum GameRecommendations {
         """,
         avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit")
 
+    /// Crysis Remastered (Steam): madeira-bcd build 528, 2026-10-13 22:08, the owner:
+    /// "mükemmel çalıştı" (it ran perfectly). It ran with the standard list's line and
+    /// every switch off (AVX, NVIDIA, Wine's C++ runtime, MetalFX) at 1408x648 Fit,
+    /// 5.2 GB at most, and closed normally. Its own list keeps those switches and the
+    /// defaults it was tested with when the standard list changes.
+    static let crysisRemastered = GameRecommendation(
+        id: "crysis-remastered", title: "Crysis Remastered", version: 1,
+        config: """
+        # Madeira's recommended settings for Crysis Remastered.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: false, wineVCRT: false, display: "fit")
+
     /// Every other game, and the Desktop (owner's decisions, 2026-10-12): most games
     /// the owner tried outside these lists closed at start until the [ec-hook]
     /// reporter was off. It reads code a game's protection rewrites at run time
@@ -538,13 +557,13 @@ enum GameRecommendations {
         """)
 
     static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, ghostOfTsushima, godOfWar, horizonZeroDawn,
-                      standard]
+                      crysisRemastered, standard]
 
     // MARK: Recognising a game
 
     /// Steam App IDs.
     static let rdr2AppID = 1174180, gta5EnhancedAppID = 3240220, ghostAppID = 2215430, godOfWarAppID = 1593500,
-               horizonZeroDawnAppID = 1151640
+               horizonZeroDawnAppID = 1151640, crysisRemasteredAppID = 1715130
 
     /// The recommendation for a game, or nil.
     /// - windowsPath: a program ("C:\Games\GoW\GoW.exe"), or a library Steam
@@ -566,6 +585,7 @@ enum GameRecommendations {
                 || installFolder == "ghost of tsushima" { return ghostOfTsushima }
             if steamAppID == godOfWarAppID || installFolder == "godofwar" || installFolder == "god of war" { return godOfWar }
             if steamAppID == horizonZeroDawnAppID || installFolder == "horizon zero dawn" { return horizonZeroDawn }
+            if steamAppID == crysisRemasteredAppID || installFolder == "crysis remastered" { return crysisRemastered }
             return nil
         }
         // A program, wherever it was installed: only the game's own programs, so a
@@ -586,6 +606,8 @@ enum GameRecommendations {
             return godOfWar
         case "horizonzerodawn.exe":
             return horizonZeroDawn
+        case "crysisremastered.exe":
+            return crysisRemastered
         default:
             return nil
         }
