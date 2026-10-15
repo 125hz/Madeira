@@ -253,6 +253,7 @@ static LONG InterlockedExchange(volatile LONG *p, LONG v) { LONG o = *p; *p = v;
 struct mad_tvs { LONG64 seen; UINT32 k; int dropped; };
 struct mad_tview { UINT fmt; UINT64 off, num; UINT8 uav, eoff; obj_handle_t tex; UINT64 id, sh_gpu; struct mad_tvs *sh; };
 struct mad_resource { obj_handle_t buffer; void *cpu; UINT64 size, gpu_address; struct mad_tview *tview; unsigned ntview, tview_cap; int heap;
+                      void *own_mem; /* default-buffer-swap: a typed view over our storage is Shared */
                       UINT32 *tvh; unsigned tvh_cap; /* tv-hash */ };
 typedef struct mad_resource ID3D12Resource;
 static int released;
