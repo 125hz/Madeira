@@ -519,6 +519,64 @@ enum GameRecommendations {
         """,
         avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit")
 
+    /// Horizon Forbidden West (Complete Edition, Steam 2420110), community builds
+    /// 517-534 (2026-10-13/14). The game needs AVX. Memory it frees is released at
+    /// once (with the free delay it reserved the same aligned addresses again and
+    /// looped), and its programs run from their own image, which leaves the JIT pool
+    /// room. Its memory goes to the swap file from 64 KB, and it sees a 3 GB
+    /// video-memory budget with budget events (a smaller one left it on a black
+    /// screen). Horizon Zero Dawn's typed-view alignment and aligned copies keep
+    /// the image right (without the copies, vegetation shot into the sky); the
+    /// copies need the 262,144-entry table and its fixed-cost refresh, and the
+    /// game's float3 typed views a 16-byte-element copy (typed-view-rgb32).
+    /// Render passes stay open across lists. mip0-full gives FSR 3's MipLevels 0
+    /// pyramid its full chain: without it, frame generation showed black squares
+    /// (build 533: gone). Our log lines skip OutputDebugString and the census
+    /// frames; shader libraries wait for a pipeline's first draw; guest threads run
+    /// at the efficiency QoS; the thread samplers are off and Wine's fixme lines are
+    /// quiet. Played with FSR 3 frame generation on: 24 presents a second before
+    /// mip0-full (build 531), 15 with it (533; its GPU cost is still open); the
+    /// sound is robotic (env.MADEIRA_AUDIO_SPATIAL = 0 is the next try). Version 5, as
+    /// ships it, without its own variant DXGI DLL (this dxgi.dll has the
+    /// budget events).
+    static let horizonForbiddenWest = GameRecommendation(
+        id: "horizon-forbidden-west", title: "Horizon Forbidden West", version: 5,
+        config: """
+        # Madeira's recommended settings for Horizon Forbidden West.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        vram-mb = 3072
+        swap-mb = 8192
+        swap-mode = 2
+        swap-min-mb = 1
+        swap-images = 1
+        typed-view-align = 16
+        typed-view-shadow = 1
+        typed-view-rgb32 = 1
+        mip0-full = 1
+        rp-carry = 1
+        quiet-log = 1
+        pso-lazy-libs = 1
+        eco = 1
+        env.MADEIRA_DXGI_BUDGET_EVENTS = 1
+        env.MADEIRA_SWAP_MIN_KB = 64
+        env.MADEIRA_SWAP_RESERVE_MAX_MB = 9216
+        env.MADEIRA_INPUT_FOREGROUND = 1
+        env.MADEIRA_WGI_HOST_PADS = 1
+        env.MADEIRA_LOCK_ORPHAN = stamped
+        env.MADEIRA_SRV_FGETPATH = 1
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_FREE_DELAY_MS = 0
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        env.MADEIRA_PAD_MODE = hid
+        env.MADEIRA_LEAN_DIAG = 1
+        env.WINEDEBUG = err+all,err-virtual,fixme-all
+        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: true, nvidia: true, wineVCRT: false, fastSync: true, fpsMode: 3, display: "fit")
+
     /// Crysis Remastered (Steam): community build 528, 2026-10-13 22:08, a tester:
     /// it ran perfectly. It ran with the standard list's line and
     /// every switch off (AVX, NVIDIA, Wine's C++ runtime, MetalFX) at 1408x648 Fit,
@@ -595,14 +653,15 @@ enum GameRecommendations {
         """)
 
     static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, ghostOfTsushima, godOfWar, horizonZeroDawn,
-                      crysisRemastered, crysis2Remastered, crysis3Remastered, standard]
+                      horizonForbiddenWest, crysisRemastered, crysis2Remastered, crysis3Remastered,
+                      standard]
 
     // MARK: Recognising a game
 
     /// Steam App IDs.
     static let rdr2AppID = 1174180, gta5EnhancedAppID = 3240220, ghostAppID = 2215430, godOfWarAppID = 1593500,
                horizonZeroDawnAppID = 1151640, crysisRemasteredAppID = 1715130, crysis2RemasteredAppID = 2096600,
-               crysis3RemasteredAppID = 2096610
+               crysis3RemasteredAppID = 2096610, horizonForbiddenWestAppID = 2420110
 
     /// The recommendation for a game, or nil.
     /// - windowsPath: a program ("C:\Games\GoW\GoW.exe"), or a library Steam
@@ -624,6 +683,9 @@ enum GameRecommendations {
                 || installFolder == "ghost of tsushima" { return ghostOfTsushima }
             if steamAppID == godOfWarAppID || installFolder == "godofwar" || installFolder == "god of war" { return godOfWar }
             if steamAppID == horizonZeroDawnAppID || installFolder == "horizon zero dawn" { return horizonZeroDawn }
+            if steamAppID == horizonForbiddenWestAppID || installFolder == "horizon forbidden west complete edition" {
+                return horizonForbiddenWest
+            }
             if steamAppID == crysisRemasteredAppID || installFolder == "crysis remastered" { return crysisRemastered }
             if steamAppID == crysis2RemasteredAppID || installFolder == "crysis 2 remastered" { return crysis2Remastered }
             if steamAppID == crysis3RemasteredAppID || installFolder == "crysis 3 remastered" { return crysis3Remastered }
@@ -647,6 +709,8 @@ enum GameRecommendations {
             return godOfWar
         case "horizonzerodawn.exe":
             return horizonZeroDawn
+        case "horizonforbiddenwest.exe":
+            return horizonForbiddenWest
         case "crysisremastered.exe":
             return crysisRemastered
         case "crysis2remastered.exe":
