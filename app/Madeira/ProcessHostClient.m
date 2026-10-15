@@ -21,40 +21,6 @@ static pthread_mutex_t ph_control_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct { int pid, fd; unsigned int logs; } ph_controls[64];
 static PHSpawnHandler ph_spawn_handler;
 
-// ml1333: a C string from Wine (argv, a Windows environment block) as an NSString.
-// @(cstr) is nil for NULL or non-UTF-8 bytes, and inserting nil into a collection
-// threw on a Wine thread (log prev(6): explorer's desktop thread died, the session
-// ended). UTF-8 first, else Latin-1, which accepts every byte. NULL stays nil.
-static NSString *ph_string(const char *s) {
-    if (!s) return nil;
-    size_t n = strlen(s);
-    NSString *r = [[NSString alloc] initWithBytes:s length:n encoding:NSUTF8StringEncoding];
-    return r ?: [[NSString alloc] initWithBytes:s length:n encoding:NSISOLatin1StringEncoding];
-}
-
-// ml1333: an Objective-C exception nothing catches (for instance one thrown on a
-// Wine thread, where unwinding then fails) is written to the session log before
-// the process dies. Chains to a handler installed earlier, if any.
-static NSUncaughtExceptionHandler *ph_previous_exception_handler;
-static void ph_uncaught_exception(NSException *exception) {
-    @try {
-        fprintf(stderr, "[crash] ml1333 uncaught Objective-C exception %s: %s (thread mach id %u%s)\n",
-                exception.name.UTF8String ?: "?", exception.reason.UTF8String ?: "(no reason)",
-                pthread_mach_thread_np(pthread_self()), NSThread.isMainThread ? ", main" : "");
-        NSArray<NSString *> *symbols = exception.callStackSymbols;
-        for (NSUInteger i = 0; i < symbols.count && i < 24; i++)
-            fprintf(stderr, "[crash] ml1333   %s\n", symbols[i].UTF8String ?: "?");
-        fflush(stderr);
-    } @catch (__unused id e) {}
-    if (ph_previous_exception_handler) ph_previous_exception_handler(exception);
-}
-__attribute__((constructor)) static void ph_install_exception_logger(void) {
-    NSUncaughtExceptionHandler *previous = NSGetUncaughtExceptionHandler();
-    if (previous == ph_uncaught_exception) return;
-    ph_previous_exception_handler = previous;
-    NSSetUncaughtExceptionHandler(ph_uncaught_exception);
-}
-
 void madeira_process_host_set_spawn_handler(PHSpawnHandler handler) {
     @synchronized(MadeiraProcessHostSession.class) { ph_spawn_handler = [handler copy]; }
 }
@@ -125,8 +91,8 @@ int wine_host_spawn_process(int argc, char **argv, int socketFD, int directoryFD
         @synchronized(MadeiraProcessHostSession.class) { handler=ph_spawn_handler; }
         if (!handler) return 0;
         NSMutableArray *args=[NSMutableArray new], *environment=[NSMutableArray new];
-        for (int i=0;i<argc;i++) { NSString *s=ph_string(argv[i]); [args addObject:s ?: @""]; }   // keep argv positions
-        for (int i=0;env && env[i];i++) { NSString *s=ph_string(env[i]); if(s)[environment addObject:s]; }
+        for (int i=0;i<argc;i++) [args addObject:@(argv[i])];
+        for (int i=0;env && env[i];i++) [environment addObject:@(env[i])];
         int fd=dup(socketFD), cwd=directoryFD < 0 ? -1 : dup(directoryFD);
         if (fd < 0 || (directoryFD >= 0 && cwd < 0)) { if(fd>=0)close(fd); return 0; }
         dispatch_semaphore_t sem=dispatch_semaphore_create(0);
@@ -317,43 +283,6 @@ void madeira_process_host_pump_windows(void) {
     int _controlFD;
     int _extSocketFD;             // the extension side (handed over); -1 once passed
     NSMutableSet<NSNumber *> *_windows;   // ml1332: this extension's top-level windows (class lock)
-    BOOL _extLogRead;                     // ml1333: its shared-container log was appended once
-}
-
-// ml1333: the extension writes its stderr (Wine's own output, its milestones, fatal
-// signals and uncaught exceptions) to <shared>/ext-logs/<pid>.txt. When the extension
-// is interrupted or its guest exits, that file goes into this session's log as
-// "[ext-proc] ml1333 ext log: ..." (the first 60 and last 140 lines of a longer file).
-- (void)appendExtensionLog:(NSString *)why {
-    int pid=_extensionPID;
-    @synchronized(self) { if (_extLogRead || pid <= 0) return; _extLogRead=YES; }
-    NSString *shared;
-    @synchronized(MadeiraProcessHostSession.class) { shared=ph_shared; }
-    NSString *path=shared ? [[shared stringByAppendingPathComponent:@"ext-logs"]
-                             stringByAppendingPathComponent:[NSString stringWithFormat:@"%d.txt",pid]] : nil;
-    NSData *data=path ? [NSData dataWithContentsOfFile:path] : nil;
-    if (!data) {
-        fprintf(stderr,"[ext-proc] ml1333 ext log pid=%d (%s): no file%s%s\n",pid,why.UTF8String ?: "",
-                path ? " at " : " (no shared container)",path ? path.UTF8String : "");
-        return;
-    }
-    NSString *text=[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]
-                   ?: [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding] ?: @"";
-    NSMutableArray<NSString *> *lines=[[text componentsSeparatedByString:@"\n"] mutableCopy];
-    while (lines.count && !lines.lastObject.length) [lines removeLastObject];
-    NSUInteger total=lines.count;
-    fprintf(stderr,"[ext-proc] ml1333 ext log pid=%d (%s): %lu lines, %lu bytes, %s\n",pid,why.UTF8String ?: "",
-            (unsigned long)total,(unsigned long)data.length,path.UTF8String);
-    for (NSUInteger i=0;i<total;i++) {
-        if (total>200 && i==60) {
-            fprintf(stderr,"[ext-proc] ml1333 ext log: ... %lu lines omitted ...\n",(unsigned long)(total-200));
-            i=total-140;
-        }
-        NSString *line=[lines[i] stringByTrimmingCharactersInSet:NSCharacterSet.newlineCharacterSet];
-        if (line.length>400) line=[[line substringToIndex:400] stringByAppendingString:@" ..."];
-        fprintf(stderr,"[ext-proc] ml1333 ext log: %s\n",line.UTF8String ?: "");
-    }
-    fflush(stderr);
 }
 
 - (instancetype)init {
@@ -394,7 +323,7 @@ void madeira_process_host_pump_windows(void) {
     [connection resume];
     _connection = connection;
     __weak typeof(self) weakSelf=self;
-    connection.interruptionHandler=^{ [weakSelf appendExtensionLog:@"connection interrupted"]; [weakSelf invalidate]; };
+    connection.interruptionHandler=^{ [weakSelf invalidate]; };
     connection.invalidationHandler=^{ [weakSelf invalidate]; };
     return YES;
 }
@@ -421,7 +350,6 @@ void madeira_process_host_pump_windows(void) {
     __weak typeof(self) interruptSelf=self;
     [(id<PHNSExtension>)extension setRequestInterruptionBlock:^(NSUUID *uuid) {
         [interruptSelf emit:@"extension interrupted"];
-        [interruptSelf appendExtensionLog:@"interrupted"];
         [interruptSelf invalidate];
     }];
 
@@ -498,7 +426,7 @@ void madeira_process_host_pump_windows(void) {
         if (([e hasPrefix:@"MADEIRA_"] || [e hasPrefix:@"FEX_"] || [e hasPrefix:@"WINEDEBUG="]) &&
             ![e hasPrefix:@"MADEIRA_DOCS_DIR="] && ![e hasPrefix:@"MADEIRA_CFG_GAME="] &&
             ![e hasPrefix:@"MADEIRA_JIT"] && ![e hasPrefix:@"MADEIRA_DONOR"])
-            xpc_array_set_string(xenv,XPC_ARRAY_APPEND,e.UTF8String ?: "");
+            xpc_array_set_string(xenv,XPC_ARRAY_APPEND,e.UTF8String);
     }
     xpc_dictionary_set_value(info, PH_INFO_ENV, xenv);
     xpc_dictionary_set_fd(info, PH_INFO_FD, _extSocketFD);
@@ -557,11 +485,9 @@ void madeira_process_host_pump_windows(void) {
     NSMutableArray *argv=[NSMutableArray new], *env=[NSMutableArray new];
     xpc_object_t xa=xpc_dictionary_get_value(info,PH_INFO_ARGV), xe=xpc_dictionary_get_value(info,PH_INFO_ENV);
     if (xa && xpc_get_type(xa)==XPC_TYPE_ARRAY) xpc_array_apply(xa,^bool(size_t i,xpc_object_t v){
-        if(xpc_get_type(v)==XPC_TYPE_STRING) { NSString *s=ph_string(xpc_string_get_string_ptr(v)); [argv addObject:s ?: @""]; }
-        return true; });
+        if(xpc_get_type(v)==XPC_TYPE_STRING) [argv addObject:@(xpc_string_get_string_ptr(v))]; return true; });
     if (xe && xpc_get_type(xe)==XPC_TYPE_ARRAY) xpc_array_apply(xe,^bool(size_t i,xpc_object_t v){
-        if(xpc_get_type(v)==XPC_TYPE_STRING) { NSString *s=ph_string(xpc_string_get_string_ptr(v)); if(s)[env addObject:s]; }
-        return true; });
+        if(xpc_get_type(v)==XPC_TYPE_STRING) [env addObject:@(xpc_string_get_string_ptr(v))]; return true; });
     if (!handler || fd < 0 || !argv.count) { if(fd>=0)close(fd); if(cwd>=0)close(cwd); reply(NO); return; }
     handler(argv,env,fd,cwd,^(BOOL ok){
         if(!ok)shutdown(fd,SHUT_RDWR);
@@ -662,7 +588,6 @@ void madeira_process_host_pump_windows(void) {
 }
 - (void)guestExited:(int)status {
     [self emit:[NSString stringWithFormat:@"exit code %d",status]];
-    [self appendExtensionLog:[NSString stringWithFormat:@"exit code %d",status]];
     if (self.exitHandler) self.exitHandler(status);
     [self invalidate];
 }
