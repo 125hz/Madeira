@@ -9,19 +9,10 @@
 // and the extension exports the server object.
 //
 // ml1331: the owned extension has a dedicated control socket. Window geometry
-// is forwarded to the app. Both MADEIRA_EXT_PROCESS and MADEIRA_SHARED_DRIVE
-// default off.
-//
-// ml1332 (phase 3): frames. The extension backs each top-level window's GDI
-// surface, or a Metal swapchain's drawable copy, with two IOSurfaces, sends
-// them once per creation/resize (windowSurface:) and then names the buffer that
-// holds each complete frame (windowFrame:reply:, at most one per window in
-// flight; the reply is the app's acknowledgement). IOSurface objects travel by
-// their public NSSecureCoding (the iOS SDK does not declare the C XPC-object
-// functions). env.MADEIRA_EXT_PROCESS_FRAMES=0 keeps phase 2's black frames.
+// is forwarded to the app; IOSurface presentation is deferred to phase 3.
+// Both MADEIRA_EXT_PROCESS and MADEIRA_SHARED_DRIVE default off.
 
 #import <Foundation/Foundation.h>
-#import <IOSurface/IOSurfaceObjC.h>
 #import <xpc/xpc.h>
 
 // Keys in the prepareGuest info dictionary (an xpc dictionary, so it can carry the
@@ -36,15 +27,6 @@
 #define PH_INFO_CWD "cwd" // inherited working directory, passed as an fd
 #define PH_INFO_GROUP "group" // app group the extension must resolve before opening the shared prefix
 #define PH_INFO_FD       "fd"       // the wineserver client socket (xpc_dictionary_set_fd)
-#define PH_INFO_FRAMES   "frames"   // bool: ml1332 IOSurface frame transport (env.MADEIRA_EXT_PROCESS_FRAMES, default 1)
-#define PH_INFO_DESKTOP  "desktop"  // string: the app session's MADEIRA_DESKTOP value (driver surface mode)
-
-// ml1332 frame messages (NSDictionary keys, NSNumber values).
-#define PH_FRAME_HWND    @"hwnd"    // the top-level window (a server-wide handle)
-#define PH_FRAME_GEN     @"gen"     // buffer-pair generation, new on every (re)allocation
-#define PH_FRAME_KIND    @"kind"    // 0 GDI window surface, 1 Metal drawable copy (client rect)
-#define PH_FRAME_BUFFER  @"buffer"  // 0 or 1: the buffer that now holds the frame
-// windowSurface: also carries @"w"/@"h" (pixels); windowFrame: the dirty rect @"x" @"y" @"w" @"h".
 
 // Keys in a reply dictionary.
 #define PH_REPLY_OK      "ok"       // bool
@@ -82,14 +64,6 @@ typedef NS_ENUM(int, PHStage) {
 - (void)spawnGuest:(xpc_object_t)info reply:(void (^)(BOOL ok))reply;
 - (void)guestExited:(int)status;
 - (void)windowChanged:(NSDictionary *)window;
-/// ml1332: a window's two frame buffers (BGRA, opaque alpha), once per creation/resize.
-- (void)windowSurface:(NSDictionary *)info buffer0:(IOSurface *)buffer0 buffer1:(IOSurface *)buffer1;
-/// ml1332: `buffer` of window `hwnd` holds a complete frame. Reply once it is shown;
-/// the extension writes neither buffer again until then.
-- (void)windowFrame:(NSDictionary *)frame reply:(void (^)(void))reply;
-/// ml1332: the remote process's cursor image (@"bits" BGRA straight alpha, @"w" @"h"
-/// @"hx" @"hy") or visibility (@"show").
-- (void)windowCursor:(NSDictionary *)cursor;
 @end
 
 static inline NSXPCInterface *PHProcessServerInterface(void) {

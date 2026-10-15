@@ -30,31 +30,6 @@ func checkAppEntitlement(_ ent: String) -> Bool {
     return false
 }
 
-/// The app's own signed entitlement as a list of strings (an array value, or a
-/// single string); empty when the entitlement is absent.
-func appEntitlementStrings(_ ent: String) -> [String] {
-    guard let task = _SecTaskCreateFromSelf(nil),
-          let value = _SecTaskCopyValueForEntitlement(task, ent as NSString, nil) else { return [] }
-    if let list = value as? [String] { return list }
-    if let one = value as? String { return [one] }
-    return []
-}
-
-/// The embedded provisioning profile (embedded.mobileprovision): the plist
-/// between "<?xml" and "</plist>" inside the CMS wrapper. nil without one.
-/// The sideloader writes it when it signs, so it names the entitlements it
-/// registered for this install (SideStore/AltStore rewrite app-group ids).
-func embeddedProvisioningProfile() -> [String: Any]? {
-    guard let path = Bundle.main.path(forResource: "embedded", ofType: "mobileprovision"),
-          let data = FileManager.default.contents(atPath: path),
-          let start = data.range(of: Data("<?xml".utf8)),
-          let end = data.range(of: Data("</plist>".utf8), in: start.lowerBound..<data.endIndex),
-          let object = try? PropertyListSerialization.propertyList(from: data.subdata(in: start.lowerBound..<end.upperBound),
-                                                                   options: [], format: nil)
-    else { return nil }
-    return object as? [String: Any]
-}
-
 struct EntitlementStatus {
     let jitAllowed: Bool
     let increasedMemory: Bool
@@ -134,7 +109,14 @@ enum DeviceDiagnostics {
     /// The kind and lifetime of the embedded provisioning profile and the
     /// entitlements it grants. A 7-day lifetime is a free developer account.
     private static func profile() -> String {
-        guard let plist = embeddedProvisioningProfile() else { return "profile=none" }
+        guard let path = Bundle.main.path(forResource: "embedded", ofType: "mobileprovision"),
+              let data = FileManager.default.contents(atPath: path),
+              let start = data.range(of: Data("<?xml".utf8)),
+              let end = data.range(of: Data("</plist>".utf8), in: start.lowerBound..<data.endIndex),
+              let object = try? PropertyListSerialization.propertyList(from: data.subdata(in: start.lowerBound..<end.upperBound),
+                                                                       options: [], format: nil),
+              let plist = object as? [String: Any]
+        else { return "profile=none" }
         let granted = plist["Entitlements"] as? [String: Any] ?? [:]
         func grants(_ key: String) -> Int { (granted[key] as? Bool) == true ? 1 : 0 }
         let kind: String
@@ -150,8 +132,6 @@ enum DeviceDiagnostics {
         return text + " profile-get-task-allow=\(grants("get-task-allow"))"
             + " profile-increased-memory=\(grants("com.apple.developer.kernel.increased-memory-limit"))"
             + " profile-extended-va=\(grants("com.apple.developer.kernel.extended-virtual-addressing"))"
-            // ml1331: how many app groups the sideloader registered (ids: the [ext-proc] shared container line).
-            + " profile-app-groups=\((granted["com.apple.security.application-groups"] as? [String])?.count ?? 0)"
     }
     private static func signing() -> String {
         let status = SigningStatus.current

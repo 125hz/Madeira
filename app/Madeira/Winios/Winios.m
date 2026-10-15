@@ -998,9 +998,6 @@ static NSMutableDictionary<NSNumber *, NSValue *> *g_px_rects;  /* hwnd → last
 static NSMutableDictionary<NSNumber *, NSValue *> *g_surf_sizes; /* hwnd → surface px size */
 static NSMutableDictionary<NSNumber *, CAMetalLayer *> *g_metal_layers; /* hwnd → DXMT layer */
 static NSMutableDictionary<NSNumber *, NSValue *> *g_client_rects;      /* hwnd → client px rect */
-/* ml1332: a remote (process-host) swapchain's frames, placed where a local
- * window's CAMetalLayer would be (winios_remote_surface_frame) */
-static NSMutableDictionary<NSNumber *, CALayer *> *g_remote_client_layers;
 /* Desktop fit state (winios_desktop_fit below), main thread only. */
 static NSNumber *g_fit_key;
 static CGRect g_fit_client_px;   /* the window's client rect, desktop px */
@@ -1260,7 +1257,6 @@ static void winios_drop_compositor(const char *why) {
     [g_surf_sizes removeAllObjects];
     [g_metal_layers removeAllObjects];
     [g_client_rects removeAllObjects];
-    [g_remote_client_layers removeAllObjects];   /* sublayers of the window layers above */
     g_fit_key = nil;
     g_gfit_key = nil;   /* ml1301: its host goes with the view */
     g_gfit_host = nil;
@@ -1466,7 +1462,6 @@ static void winios_remove_layer(HWND hwnd) {
             [g_px_rects removeObjectForKey:key];
             winios_game_cursor_refresh();
         }
-        [g_remote_client_layers removeObjectForKey:key];   /* ml1332: went with its window layer */
         CAMetalLayer *ml = g_metal_layers[key];
         if (ml) {
             [ml removeFromSuperlayer];
@@ -1700,13 +1695,6 @@ static BOOL winios_game_fit_place(NSNumber *key, CAMetalLayer *ml, CGRect c) {
  * parent (window) layer's coordinate space. Parent bounds are the window
  * rect in points, so client offset = (client_px - window_px) * scale. */
 static void winios_place_metal_layer(NSNumber *key) {
-    CALayer *rl = g_remote_client_layers[key];   /* ml1332: a remote swapchain's copy */
-    if (rl && g_px_rects[key] && g_client_rects[key]) {
-        CGRect w = g_px_rects[key].CGRectValue, c = g_client_rects[key].CGRectValue;
-        rl.frame = CGRectMake((c.origin.x - w.origin.x) * g_px_to_pt,
-                              (c.origin.y - w.origin.y) * WINIOS_PX_TO_PT_Y,
-                              c.size.width * g_px_to_pt, c.size.height * WINIOS_PX_TO_PT_Y);
-    }
     CAMetalLayer *ml = g_metal_layers[key];
     if (!ml) return;
     NSValue *wv = g_px_rects[key], *cv = g_client_rects[key];
@@ -2492,56 +2480,6 @@ int winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
         CGColorSpaceRelease(cs);
     });
     return 1;
-}
-
-/* ml1332 process host, phase 3 (docs/PROCESS_HOST.md). Main thread, inside a
- * CATransaction opened by ProcessHostClient.m: a window of a Wine client running
- * in the MadeiraProcessHost extension has a complete frame in `surface`, one of
- * the two IOSurfaces that extension draws into (sw x sh pixels, BGRA, opaque).
- * kind 0: the window's GDI surface, shown exactly like winios_surface_present's
- * image above (the 128-aligned surface is cropped by the contents rect).
- * kind 1: a remote D3D/Vulkan swapchain's drawable copy, in a sublayer over the
- * client rect, where a local window's CAMetalLayer sits. The layer itself and
- * its position come from the phase-2 geometry forwarding (winios_window_frame);
- * contents alternate between the two surfaces, so each frame is a new value. */
-void winios_remote_surface_frame(void *hwnd, void *surface, int sw, int sh, int kind) {
-    if (!surface || sw <= 0 || sh <= 0) return;
-    winios_ensure_compositor();
-    if (!g_compositor_view) return;
-    NSNumber *key = @((uintptr_t)hwnd);
-    BOOL pending = NO;   /* game mode, position not known yet (as winios_surface_present) */
-    if (g_comp_game) {
-        if (!g_px_rects[key] && ![g_game_metal containsObject:key]) pending = YES;
-        else if (!winios_game_window_shown(key)) return;
-    }
-    CALayer *l = winios_layer_for(hwnd, true);
-    if (kind == 1) {
-        if (!g_remote_client_layers) g_remote_client_layers = [NSMutableDictionary new];
-        CALayer *cl = g_remote_client_layers[key];
-        if (!cl || cl.superlayer != l) {
-            cl = [CALayer layer];
-            cl.anchorPoint = CGPointMake(0, 0);
-            cl.opaque = YES;
-            [l addSublayer:cl];
-            g_remote_client_layers[key] = cl;
-            winios_census_note_metal((HWND)hwnd);
-            fprintf(stderr, "[ext-proc] ml1332 remote swapchain layer for hwnd=%p (%dx%d)\n", hwnd, sw, sh);
-            fflush(stderr);
-        }
-        cl.contents = (__bridge id)surface;
-        winios_place_metal_layer(key);
-        if (CGRectIsEmpty(cl.frame) && !CGRectIsEmpty(l.bounds)) cl.frame = l.bounds;   /* client rect not delivered yet */
-    } else {
-        l.contents = (__bridge id)surface;
-        g_surf_sizes[key] = [NSValue valueWithCGSize:CGSizeMake(sw, sh)];
-        if (!pending && CGRectIsEmpty(l.frame)) {
-            g_px_rects[key] = [NSValue valueWithCGRect:CGRectMake(0, 0, sw, sh)];
-            l.frame = winios_layer_rect(0, 0, sw, sh);
-        }
-        winios_apply_contents_rect(key, l);
-    }
-    if (pending) l.hidden = YES;   /* winios_window_frame decides */
-    else atomic_fetch_add_explicit(&g_surface_present_count, 1, memory_order_relaxed);
 }
 
 /* ============================================================ *

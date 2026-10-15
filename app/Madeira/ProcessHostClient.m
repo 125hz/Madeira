@@ -6,8 +6,6 @@
 #import "ProcessHostClient.h"
 #import "ProcessHostProtocol.h"
 #import "WineServerBridge.h"
-#import <QuartzCore/QuartzCore.h>
-#import <IOSurface/IOSurfaceRef.h>
 #import <sys/socket.h>
 #import <mach/mach.h>
 #import <dlfcn.h>
@@ -212,38 +210,6 @@ NSString *madeira_process_host_active_prefix(NSString *prefix) {
 }
 
 static NSMutableDictionary<NSNumber *,NSDictionary *> *ph_window_changes;
-
-// ml1332 frames (docs/PROCESS_HOST.md "Phase 3: frames"). A remote window's two
-// IOSurfaces, as the extension last announced them. Guarded by the class lock.
-@interface PHRemoteSurface : NSObject
-@property (nonatomic, strong) IOSurface *buffer0, *buffer1;
-@property (nonatomic) int width, height, kind;
-@property (nonatomic) uint32_t generation;
-@end
-@implementation PHRemoteSurface
-@end
-static NSMutableDictionary<NSNumber *, PHRemoteSurface *> *ph_surfaces;   // hwnd -> buffers
-static NSMutableSet<NSNumber *> *ph_remote_windows;                        // hwnds owned by extension clients
-static unsigned long long ph_surfaces_received, ph_surfaces_dropped, ph_frames_shown;
-static unsigned ph_surface_logs, ph_frame_logs;
-
-// WiniosWindowed.m (any thread): this top-level window belongs to an extension client.
-int madeira_process_host_is_remote_window(void *hwnd) {
-    @synchronized(MadeiraProcessHostSession.class) {
-        return [ph_remote_windows containsObject:@((uintptr_t)hwnd)] ? 1 : 0;
-    }
-}
-
-// Class lock held. The app's references to a window's buffers go; CA releases the
-// one its layer shows when the layer is removed (winios_pDestroyWindow).
-static void ph_drop_surface_locked(NSNumber *hwnd) {
-    if (ph_surfaces[hwnd]) { [ph_surfaces removeObjectForKey:hwnd]; ph_surfaces_dropped += 2; }
-}
-static NSString *ph_surface_stats_locked(void) {
-    return [NSString stringWithFormat:@"[ext-proc] ml1332 stats remote windows=%lu surfaces live=%llu received=%llu "
-            "dropped=%llu frames=%llu", (unsigned long)ph_remote_windows.count,
-            ph_surfaces_received - ph_surfaces_dropped, ph_surfaces_received, ph_surfaces_dropped, ph_frames_shown];
-}
 // Wine-thread pump: metadata queries need a valid TEB, never an XPC worker.
 void madeira_process_host_pump_windows(void) {
     NSArray *changes;
@@ -282,12 +248,10 @@ void madeira_process_host_pump_windows(void) {
     dispatch_semaphore_t _connected;
     int _controlFD;
     int _extSocketFD;             // the extension side (handed over); -1 once passed
-    NSMutableSet<NSNumber *> *_windows;   // ml1332: this extension's top-level windows (class lock)
 }
 
 - (instancetype)init {
     if ((self = [super init])) {
-        _windows = [NSMutableSet new];
         _connected = dispatch_semaphore_create(0);
         _controlFD = -1;
         _extSocketFD = -1;
@@ -434,10 +398,6 @@ void madeira_process_host_pump_windows(void) {
     if (directoryFD >= 0) xpc_dictionary_set_fd(info, PH_INFO_CWD, directoryFD);
     NSString *group=madeira_process_host_shared_group();
     if (group) xpc_dictionary_set_string(info,PH_INFO_GROUP,group.UTF8String);
-    // MADEIRA_EXT_PROCESS_FRAMES=0: extension clients' windows stay black (no IOSurface frames, ml1332).
-    xpc_dictionary_set_bool(info,PH_INFO_FRAMES,flag("MADEIRA_EXT_PROCESS_FRAMES",true));
-    const char *desktop=getenv("MADEIRA_DESKTOP");
-    if (desktop) xpc_dictionary_set_string(info,PH_INFO_DESKTOP,desktop);
 
     id<PHProcessServer> proxy = [_connection remoteObjectProxyWithErrorHandler:^(NSError *e) {
         [self invalidate];
@@ -497,93 +457,9 @@ void madeira_process_host_pump_windows(void) {
 - (void)windowChanged:(NSDictionary *)window {
     NSNumber *hwnd=window[@"hwnd"];
     if(![hwnd isKindOfClass:NSNumber.class] || !hwnd.unsignedLongLongValue)return;
-    NSString *stats=nil;
     @synchronized(MadeiraProcessHostSession.class) {
         if(!ph_window_changes)ph_window_changes=[NSMutableDictionary new];
         if(ph_window_changes.count<512 || ph_window_changes[hwnd])ph_window_changes[hwnd]=window;
-        if(!ph_remote_windows)ph_remote_windows=[NSMutableSet new];
-        if([window[@"destroy"] boolValue]) {
-            BOOL had=ph_surfaces[hwnd]!=nil;
-            ph_drop_surface_locked(hwnd);
-            [ph_remote_windows removeObject:hwnd]; [_windows removeObject:hwnd];
-            static unsigned logs;
-            if(had && logs++<32) stats=ph_surface_stats_locked();
-        } else if(ph_remote_windows.count<1024) {
-            [ph_remote_windows addObject:hwnd]; [_windows addObject:hwnd];
-        }
-    }
-    if(stats) fprintf(stderr,"%s (window destroyed)\n",stats.UTF8String);
-}
-
-// ml1332: a remote window's (re)allocated buffer pair.
-- (void)windowSurface:(NSDictionary *)info buffer0:(IOSurface *)buffer0 buffer1:(IOSurface *)buffer1 {
-    NSNumber *hwnd=info[PH_FRAME_HWND];
-    if(![hwnd isKindOfClass:NSNumber.class] || !hwnd.unsignedLongLongValue ||
-       ![buffer0 isKindOfClass:IOSurface.class] || ![buffer1 isKindOfClass:IOSurface.class])return;
-    PHRemoteSurface *surface=[PHRemoteSurface new];
-    surface.buffer0=buffer0; surface.buffer1=buffer1;
-    surface.width=[info[@"w"] intValue]; surface.height=[info[@"h"] intValue];
-    surface.kind=[info[PH_FRAME_KIND] intValue]; surface.generation=[info[PH_FRAME_GEN] unsignedIntValue];
-    BOOL log=NO;
-    @synchronized(MadeiraProcessHostSession.class) {
-        if(!ph_surfaces)ph_surfaces=[NSMutableDictionary new];
-        if(!ph_remote_windows)ph_remote_windows=[NSMutableSet new];
-        if(!ph_surfaces[hwnd] && ph_surfaces.count>=256)return;
-        ph_drop_surface_locked(hwnd);
-        ph_surfaces[hwnd]=surface; ph_surfaces_received+=2;
-        [ph_remote_windows addObject:hwnd]; [_windows addObject:hwnd];
-        log=ph_surface_logs++<64;
-    }
-    if(log)
-        fprintf(stderr,"[ext-proc] ml1332 surface hwnd=%p %dx%d iosurface id=%u,%u (buffers 0,1) kind=%s gen=%u\n",
-                (void *)(uintptr_t)hwnd.unsignedLongLongValue,surface.width,surface.height,
-                IOSurfaceGetID((__bridge IOSurfaceRef)buffer0),IOSurfaceGetID((__bridge IOSurfaceRef)buffer1),
-                surface.kind ? "metal" : "gdi",surface.generation);
-}
-
-// ml1332: one buffer holds a complete frame. The reply (the extension's permission
-// to write the other buffer again) goes once Core Animation has the new contents.
-- (void)windowFrame:(NSDictionary *)frame reply:(void (^)(void))reply {
-    NSNumber *hwnd=frame[PH_FRAME_HWND];
-    int buffer=[frame[PH_FRAME_BUFFER] intValue];
-    PHRemoteSurface *surface=nil;
-    BOOL log=NO;
-    @synchronized(MadeiraProcessHostSession.class) {
-        if([hwnd isKindOfClass:NSNumber.class]) surface=ph_surfaces[hwnd];
-        if(surface && surface.generation==[frame[PH_FRAME_GEN] unsignedIntValue] && (buffer==0 || buffer==1)) {
-            ph_frames_shown++;
-            log=ph_frame_logs<400 && (ph_frame_logs++<96 || ph_frames_shown%256==0);
-        } else surface=nil;
-    }
-    if(!surface) { reply(); return; }
-    IOSurface *contents=buffer ? surface.buffer1 : surface.buffer0;
-    void *window=(void *)(uintptr_t)hwnd.unsignedLongLongValue;
-    if(log)
-        fprintf(stderr,"[ext-proc] ml1332 frame hwnd=%p buffer %d dirty %d,%d %dx%d (#%llu)\n",window,buffer,
-                [frame[@"x"] intValue],[frame[@"y"] intValue],[frame[@"w"] intValue],[frame[@"h"] intValue],ph_frames_shown);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        // A destroy that overtook this frame leaves no layer to recreate.
-        if(!madeira_process_host_is_remote_window(window)) { reply(); return; }
-        extern void winios_remote_surface_frame(void *,void *,int,int,int);
-        [CATransaction begin];
-        [CATransaction setDisableActions:YES];
-        [CATransaction setCompletionBlock:^{ reply(); }];
-        winios_remote_surface_frame(window,(__bridge void *)contents,surface.width,surface.height,surface.kind);
-        [CATransaction commit];
-    });
-}
-
-// ml1332: the remote process's cursor (driver_ios.c winios_drv_set_cursor there).
-- (void)windowCursor:(NSDictionary *)cursor {
-    extern void winios_cursor_set(unsigned int,int,int,int,int,const void *);
-    extern void winios_cursor_show(int);
-    NSData *bits=cursor[@"bits"];
-    int w=[cursor[@"w"] intValue], h=[cursor[@"h"] intValue];
-    if([bits isKindOfClass:NSData.class]) {
-        if(w>0 && h>0 && w<=256 && h<=256 && bits.length==(NSUInteger)w*h*4)
-            winios_cursor_set([cursor[@"id"] unsignedIntValue],w,h,[cursor[@"hx"] intValue],[cursor[@"hy"] intValue],bits.bytes);
-    } else if([cursor[@"show"] isKindOfClass:NSNumber.class]) {
-        winios_cursor_show([cursor[@"show"] intValue]);
     }
 }
 - (void)guestExited:(int)status {
@@ -592,22 +468,6 @@ void madeira_process_host_pump_windows(void) {
     [self invalidate];
 }
 - (void)invalidate {
-    // ml1332: windows of an extension that ended without destroying them lose their
-    // buffers and, through the Wine-thread pump, their layers and windowed frames.
-    NSString *stats=nil;
-    @synchronized(MadeiraProcessHostSession.class) {
-        if(_windows.count || _extensionPID) {
-            if(!ph_window_changes)ph_window_changes=[NSMutableDictionary new];
-            for(NSNumber *hwnd in _windows) {
-                ph_drop_surface_locked(hwnd);
-                [ph_remote_windows removeObject:hwnd];
-                ph_window_changes[hwnd]=@{@"hwnd":hwnd,@"destroy":@YES};
-            }
-            if(_windows.count || _controlRegistered) stats=ph_surface_stats_locked();
-            [_windows removeAllObjects];
-        }
-    }
-    if(stats) fprintf(stderr,"%s (session pid=%d ended)\n",stats.UTF8String,_extensionPID);
     @synchronized(self) {
         if (_controlRegistered) { ph_unregister(_extensionPID); _controlRegistered=NO; _controlFD=-1; }
         if (_extSocketFD>=0) { shutdown(_extSocketFD,SHUT_RDWR); close(_extSocketFD); _extSocketFD=-1; }

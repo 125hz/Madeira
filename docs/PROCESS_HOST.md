@@ -1,4 +1,4 @@
-# Process host: phases 2 and 3 (ml1331, ml1332)
+# Process host: phase 2 (ml1331)
 
 Implemented 2026-10-13 on `vulkan-stack`. **Not device-tested.** Wine clients can
 join the app's existing wineserver from owned `MadeiraProcessHost` extensions.
@@ -63,83 +63,10 @@ register writes are explicitly rejected with `STATUS_NOT_SUPPORTED`. Captured
 guest AMD64 registers have the same last-saved CPU-area limitations as the
 existing in-task path. Full register-group support remains future work.
 
-### Prerequisites: app group and sync engine
-
-Device log 98 (first phase-2 trial) stopped at both of these: every stage logged
-`shared container: none` (about 30 times) and `test refused: inproc-sync=1 uses
-app memory`.
-
-**App group.** `app/Madeira/Madeira.entitlements` and
-`app/MadeiraProcessHost/ProcessHost.entitlements` declare the same group,
-`com.apple.security.application-groups = [group.com.willfaust.madeora]`
-(`group.` + the default bundle id). Before this the app declared no group, so a
-sideloader had nothing to register and no container existed. How each binary
-carries it into the IPA:
-
-- the app: xtool signs the app binary ad hoc with `entitlementsPath`
-  (`xtool.yml`, written by `prepare-upstream.py`: `app/Madeira/Madeira.entitlements`);
-- the extension: `embed-process-host.py` builds it outside xtool and used to leave it
-  unsigned, and a sideloader reads each binary's entitlements from its code signature
-  (ldid's `Entitlements`) to choose that App ID's capabilities and groups. It now signs
-  the extension ad hoc with `ProcessHost.entitlements` (`.xtool/upstream-build/adhoc_sign.py`,
-  the layout `ldid -S` writes; SHA-256 CodeDirectory, entitlements in slot 5) and
-  asserts both files name the same groups. The memory host and the JIT helper are
-  still embedded unsigned (no group needed, out of scope).
-
-SideStore/AltStore register the group for the installing team and rewrite its id
-(AltStore appends `.<TEAMID>`; the bundle id is rewritten the same way, as the
-`com.willfaust.madeora.<TEAMID>.JITHelper` probe line shows), identically for the
-app and its extensions, then re-sign with a profile that grants the rewritten id.
-So nothing hard-codes the id at run time: `SharedContainer.swift` tries the groups
-of the embedded provisioning profile (`embeddedProvisioningProfile()`, EntitlementChecker.swift),
-then the signed binary's own groups, then `group.com.SideStore.SideStore` and
-`group.com.rileytestut.AltStore`, and uses the first one iOS resolves. It runs once
-per app run and logs once:
-
-```
-[ext-proc] ml1331 shared container: <container path> (group <id>)
-[ext-proc] ml1331 shared container: none (profile groups: [...] signed groups: [...]). ...
-```
-
-`[device] signing:` also reports `profile-app-groups=<n>` (the count; ids only in the
-line above). The ProcessHostClient.m lookup (signed groups, then SideStore's) is
-only called once a container exists, so its `shared container: <path>/madeira-shared`
-line appears once and `none` no longer repeats per launch. The extension opens the
-group the app passes in `PH_INFO_GROUP`, which works only when its own profile
-grants the same rewritten id.
-
-Reading a device log: `profile-app-groups=0` and `none (profile groups: [])` mean
-the sideloader registered no group (old IPA, or the sideloader ignores groups);
-`profile groups: [<id>]` with `none` means the group was registered but iOS
-refused the container (report it); a path means the app side is ready, and an
-extension-side refusal (`extension cannot resolve the shared container`) then
-means the extension's profile lacks the group (check that the IPA's appex carries
-a signature: `adhoc_sign.py --show <appex binary>`).
-
-**Sync engine.** Madsync keeps synchronisation objects in app memory, which an
-extension task cannot reach. With `env.MADEIRA_EXT_PROCESS = 1` and madeira.cfg
-selecting madsync (`inproc-sync = 1`), `ExtProcessSync.prepareSession`
-(MadeiraExtProcess.swift, called by `startWineserver` before `wineserver_start`)
-switches that session to fastsync without changing madeira.cfg: it sets
-`MADEIRA_MADSYNC_SESSION=0` (madsync.c reads it when the server creates its first
-object) and `MADEIRA_FASTSYNC` = cfg `env.MADEIRA_FASTSYNC`, else `auto`, unless
-already set, then logs
-
-```
-[ext-proc] ml1331 sync: madsync (inproc-sync = 1) disabled for this session because remote processes cannot share app memory; fastsync used
-```
-
-Wine decides madsync once per app run: if an earlier session of the same run
-already started it, the log says `madsync already active in this app run ...;
-restart Madeira`. `env.MADEIRA_EXT_PROCESS_KEEP_MADSYNC = 1` keeps madsync and the
-old refusal (`sync: madsync kept ...`). The refusals now follow the real state: the
-app test refuses only when `ExtProcessSync` recorded active madsync, and
-`process_ios.c` refuses a remote start only when this process was handed madsync's
-device (`inproc_device_fd >= 0`), not merely because the cfg key is 1.
-
 ### Storage and synchronisation
 
-`env.MADEIRA_SHARED_DRIVE = 1` uses the shared container above. The extension must
+`env.MADEIRA_SHARED_DRIVE = 1` detects every app group in the app's signed
+entitlements and also tries `group.com.SideStore.SideStore`. The extension must
 resolve the selected group itself before using the prefix. A missing group or
 missing extension entitlement stops preparation with a diagnostic.
 
@@ -169,9 +96,8 @@ SideStore is one such app for its own group. Setting the shared-drive flag is an
 explicit opt-in to that storage. No developer login, token or account data is
 bundled or committed. A large existing prefix requires space for its copy.
 
-Madsync never runs with remote starts: madsync objects belong to app memory, so
-a madsync session is switched to fastsync (Prerequisites above), and a remote
-start is refused only while madsync is really active. Each remote client forces **client-side fastsync off** in both its
+`inproc-sync = 1` is refused for every remote start: madsync objects belong to
+app memory. Each remote client forces **client-side fastsync off** in both its
 POSIX and Windows environments. Its separate image has a separate cell table.
 The app server may retain fastsync: clients using ordinary server requests see
 the server's event state correctly. A cfg snapshot reaches the extension's own
@@ -194,9 +120,10 @@ the `~0u` no-override sentinel, and GDI surface presentation acknowledges succes
 Window geometry/destruction go to the app over XPC, are coalesced, and are
 consumed on the existing Wine event-pump thread (metadata queries require a TEB).
 The compositor/windowed-mode code then gets the HWND and geometry. Input uses
-the shared wineserver window station. Phase 2 transferred no pixels; phase 3
-(below) adds IOSurface frames. Controller snapshots in the headless extension
-are still unsupported; visible content/input behavior needs device tests.
+the shared wineserver window station. **Frames remain black:** no GDI pixels,
+Metal layers or IOSurfaces are transferred. GL/Vulkan presentation and controller
+snapshots in the headless extension are still unsupported. Phase 3 must add
+IOSurface frame transport; visible content/input behavior needs device tests.
 
 Startup has a 55-second app deadline within the native hook's 60-second bound.
 Failure/timeout/interruption shuts down the exec-child socket (including its
@@ -205,115 +132,6 @@ parent's process-info wait gets EOF/failure. Fatal extension loader errors notif
 the app and connection invalidation aborts its socket. Normal initial-process
 exit reaches the existing `wine_launched_process_did_exit` hook and the app logs
 `[ext-proc] ml1330 exit code N`.
-
-## Phase 3: frames (ml1332)
-
-Implemented 2026-10-13 on `vulkan-stack`. **Not device-tested.** Active only
-with `env.MADEIRA_EXT_PROCESS = 1`; `env.MADEIRA_EXT_PROCESS_FRAMES = 0` keeps
-phase 2's black windows (the app tells the extension in `prepareGuest`).
-
-### Design
-
-Every top-level window of an extension client that presents gets **two
-IOSurfaces** (window pixel size, `BGRA`, alpha forced to 255), created by the
-extension so their memory counts against the extension. They reach the app once
-per creation or resize (`windowSurface:buffer0:buffer1:`, with the HWND, size,
-kind and a generation number), as `IOSurface` objects through their public
-`NSSecureCoding` over the existing NSXPC connection. The iOS SDK exports but does
-not declare `IOSurfaceCreateXPCObject`/`IOSurfaceLookupFromXPCObject`, so the
-documented object route is used; it carries the same XPC object. After each
-frame the extension sends `windowFrame:reply:` (HWND, generation, buffer index,
-dirty rect). **One frame per window is in flight:** the extension writes neither
-buffer until the app's reply, which the app sends from the completion block of
-the Core Animation transaction that set the layer's contents. The buffer the app
-shows is therefore never written, and contents alternate between two distinct
-surfaces, so every frame is a new contents value for Core Animation.
-
-**GDI** (ProcessHostStubs.c `winios_surface_present` → ProcessHost.m): Wine's
-window surface bits are valid only during its flush, so the dirty rect is first
-copied into a private mirror of the surface (alpha forced opaque: a GDI DIB is
-BGRX and its alpha byte is often 0). Each buffer keeps a stale rect (everything
-dirtied since it was last written); a frame copies only that rect from the mirror
-under `IOSurfaceLock`. A flush during a flight only updates the mirror and is
-counted as coalesced; the reply sends the newest state, so the last frame never
-waits for another Wine flush. Only a failed mirror allocation returns 0 to Wine
-(its dirty bounds are kept). Memory: three surface-sized copies per window
-(mirror plus two IOSurfaces, about 12 MB for a 1280x800 window).
-
-**Metal** (DXMT/vkd3d swapchains, winevulkan surfaces): the extension cannot
-present into the app's layer. It now exports its own `macdrv_functions` table
-(DXMT finds it with `dlsym`) and `madeira_vulkan_layer_for_hwnd`; both return an
-extension-owned `CAMetalLayer` subclass per HWND that is never in a layer tree
-and forces `framebufferOnly = NO`. Drawables are presented normally.
-`-[MTLCommandBuffer presentDrawable:]`, `presentDrawable:atTime:` and
-`presentDrawable:afterMinimumDuration:` are replaced on the device's concrete
-command-buffer classes (found once from sample command buffers; the original IMP
-is always called). For a drawable of such a layer the hook encodes one blit of
-the drawable's texture into the back buffer's IOSurface-backed `MTLTexture`
-(`newTextureWithDescriptor:iosurface:plane:`) on the same command buffer, and the
-command buffer's completion sends the frame. DXMT ends its presenter encoder before
-`presentDrawable`, so no encoder is open at that point. This was preferred over a
-DXMT texture-provider change: it needs no submodule change or DXMT rebuild and also
-covers Vulkan drivers that present through the command buffer. Trade-off: one extra
-full-frame GPU copy per present; presents during a flight are not copied (counted
-as dropped). Only `BGRA8Unorm` and `BGRA8Unorm_sRGB` drawables are copied (a
-one-time log names any other format).
-
-**App** (ProcessHostClient.m → Winios.m `winios_remote_surface_frame`, main
-thread): kind 0 sets the HWND's existing compositor layer (the layer created for
-the remote HWND by phase 2's geometry forwarding) to the IOSurface, exactly like
-a local GDI image (same contents-rect crop, game-mode rules and present counter).
-Kind 1 uses a sublayer placed over the client rect where a local window's
-CAMetalLayer sits (`winios_place_metal_layer`). Windowed mode places that layer
-in its frame as for a local window.
-
-**Cursor and focus.** Cursor images and visibility from the remote process
-(driver_ios.c `winios_drv_set_cursor` there) are forwarded (`windowCursor:`,
-visibility only when it changes) to the app's drawn cursor. A tap inside a remote
-window reaches its thread as hardware input through the shared server, and that
-thread activates the window itself. A windowed-mode activation request (frame
-chrome or taskbar) used the owner-thread rule, which never runs for a remote
-window: the app's pump now calls `winios_drv_foreground_remote` for HWNDs an
-extension reported, which asks the server to make the window foreground; win32u
-sends `WM_WINE_SETACTIVEWINDOW` to the owning thread through the server. Nothing
-is asked of the extension. Logged once: `[windowed] ml1300 ml1332 activate remote
-hwnd=... foreground=1 (server-routed; no extension call)`.
-
-**Lifetime.** The extension frees a window's IOSurfaces, textures and mirror in
-`pDestroyWindow` before it forwards the destroy, and all of them at process exit.
-The app drops its references on the destroy message; when an extension session
-ends (exit, invalidation, crash) the app drops the buffers of every window that
-session reported and queues a destroy for each, so the Wine-thread pump removes
-their layers and windowed frames. Stats lines count both sides:
-extension `ml1332 stats windows=N surfaces live=N created=N released=N frames=N
-coalesced=N dropped=N lost=N`; app `[ext-proc] ml1332 stats remote windows=N
-surfaces live=N received=N dropped=N frames=N (window destroyed | session pid=N
-ended)`. `live` must return to 0 after a session.
-
-### Logs (capped)
-
-App: `[ext-proc] ml1332 surface hwnd=0x… WxH iosurface id=A,B (buffers 0,1)
-kind=gdi gen=N`, `[ext-proc] ml1332 frame hwnd=0x… buffer N dirty x,y WxH (#n)`
-(first 96 frames, then every 256th, 400 lines at most), `[ext-proc] ml1332 remote
-swapchain layer for hwnd=…`. Extension (relayed as `ext:`): `ml1332 metal layer for
-hwnd=…`, `ml1332 metal present copy hooked on <classes> (N methods)`, IOSurface
-allocation failures, the unsupported-format line and the exit stats.
-
-### Limits
-
-- Not device-tested. Assumed but unverified on device: IOSurface `NSSecureCoding`
-  across this NSXPC connection, `CALayer.contents` accepting an IOSurface on iOS,
-  its row order (top row first, as for the CGImage path), and that a layer never
-  added to a tree still vends drawables and completes presents in an extension.
-- GL in a remote process is unsupported (the GL presenter is app-only).
-  Vulkan frames arrive only if the Vulkan driver presents through
-  `-[MTLCommandBuffer presentDrawable*]`; a driver calling `-[CAMetalDrawable
-  present]` directly is not copied. HDR/float drawables are not copied.
-- A remote swapchain's sublayer is not used by the desktop fit or game fit
-  (those follow local CAMetalLayers only).
-- If a reply is lost (only with a dead connection) the next frame proceeds after
-  2 s (`lost` in the stats).
-- Controller snapshots are still not routed to extension clients.
 
 ## Device tests
 
@@ -324,15 +142,10 @@ session that pumps messages; fully quit/reopen after changing cfg.
 env.MADEIRA_EXT_PROCESS = 1
 env.MADEIRA_SHARED_DRIVE = 1
 env.MADEIRA_EXT_PROCESS_TEST = 1
+inproc-sync = 0
 ```
 
-`inproc-sync` need not change: a madsync cfg is switched to fastsync for the
-session (`ml1331 sync: madsync (inproc-sync = 1) disabled for this session ...`).
-The IPA must be installed (not only refreshed) by the sideloader so it registers
-the app group for the app and the extension.
-
-Expected stages: `[device] signing: ... profile-app-groups=1`,
-`ml1331 shared container: <path> (group <id>)`, `shared prefix ready`,
+Expected stages: `ml1331 shared container: <path>`, `shared prefix ready`,
 `test: launcher exec-child requested (1)`, `spawn exec-child fd=...`,
 `ml1330 extension started pid=...`, `enabling JIT for the extension pid=...`,
 `ext: JIT pool: RX=... RW=...`, `ml1331 control socket registered`,
@@ -350,31 +163,11 @@ env.MADEIRA_EXT_PROCESS_TEST = steam
 It starts the installed client with `-nobootstrapperupdate -skipinitialbootstrap
 -norepairfiles -noverifyfiles -no-cef-sandbox`. Watch for a second distinct iOS pid
 when the client starts its web helper. Remote window geometry should reach the
-windowed-mode list, and since ml1332 the client's first window should show pixels
-(`ml1332 surface hwnd=...` then `ml1332 frame hwnd=... buffer 0`). A successful
+windowed-mode list; content is intentionally black in this phase. A successful
 build is not evidence that the client authenticated or its helper booted.
 
-The cheap pixel test (ml1332) starts a bundled GDI program instead:
-
-```ini
-env.MADEIRA_EXT_PROCESS_TEST = notepad
-```
-
-(`winemine` works the same way.) Expect `test: launcher exec-child requested
-(notepad)`, the phase-2 start stages, then `[ext-proc] ml1332 surface hwnd=0x…
-WxH iosurface id=…,… (buffers 0,1) kind=gdi`, `[ext-proc] ml1332 frame hwnd=0x…
-buffer 0 dirty 0,0 WxH`, then alternating `buffer 1` / `buffer 0` lines while
-typing, and a visible, typeable Notepad window (in windowed mode, its own frame).
-Closing it should log both stats lines with `surfaces live=0`.
-Frame failure shapes: no `surface` line (no GDI surface in the extension: check
-that the session is a desktop session); `surface` but no `frame` lines (XPC
-send failed); `frame` lines but a black/garbled window (Core Animation did not
-take the IOSurface: report it, `env.MADEIRA_EXT_PROCESS_FRAMES = 0` restores
-phase 2); `IOSurface ... allocation failed`.
-
-Failure shapes: no shared group / extension cannot resolve it (see Prerequisites
-for reading the group lines); madsync still active (kept by
-`env.MADEIRA_EXT_PROCESS_KEEP_MADSYNC = 1`, or started earlier in the app run); JIT helper/pool unavailable; preparation stage failure; reused extension
+Failure shapes: no shared group / extension cannot resolve it; inproc-sync
+refused; JIT helper/pool unavailable; preparation stage failure; reused extension
 pid; startup timeout; `remote <operation> pid=... tid=... -> error`; loader fatal; nonzero exit.
 Rollback: `env.MADEIRA_EXT_PROCESS = 0`, then restart. Set shared-drive to 0 too
 to stop preferring D: for future full-client installs. Shared files are retained.
@@ -392,12 +185,6 @@ replacement and verifies that missing local aliases never retain parent values.
 Config-catalog, Dock components/contract, Steam library, onboarding, gamepad and
 swap-coverage host checks accompany it. Exact final IPA/hash and build outcomes
 are recorded in the local dated `HANDOFF.md` entry. No device run was made.
-
-Phase 3: `rebuild-native.sh win32u` (only `driver_ios.c` changed on the Unix side);
-iOS SDK `-fsyntax-only -Wall` of ProcessHost.m, ProcessHostStubs.c,
-ProcessHostClient.m, Winios.m and WiniosWindowed.m; `swiftc -typecheck` of
-MadeiraExtProcess.swift against stubs; one full `build-app.sh` that links and
-embeds the extension (see HANDOFF.md for its outcome and the symbol checks).
 
 Apple API references: [App Group container access](https://developer.apple.com/documentation/foundation/filemanager/1412643-containerurl),
 [thread_get_state](https://developer.apple.com/documentation/kernel/1418576-thread_get_state).
