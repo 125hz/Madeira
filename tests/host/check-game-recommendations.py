@@ -65,9 +65,9 @@ for m in re.finditer(r'static let (\w+) = GameRecommendation\(\n\s*id: "([^"]+)"
     lines = [line[len(indent):] if line.startswith(indent) else line for line in body.split('\n')]
     presets[ident] = dict(name=name, title=title, version=int(version), lines=lines, switches=' '.join((switches or '').split()))
 assert set(presets) == {'rdr2-steam', 'rdr2-other', 'gta5e-steam', 'gta5e-other', 'ghost-of-tsushima', 'god-of-war',
-                        'horizon-zero-dawn', 'crysis-remastered', 'standard'}, sorted(presets)
+                        'horizon-zero-dawn', 'crysis-remastered', 'crysis-2-remastered', 'crysis-3-remastered', 'standard'}, sorted(presets)
 assert ('static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, ghostOfTsushima, godOfWar, horizonZeroDawn,\n'
-        '                      crysisRemastered, standard]') in lists_src
+        '                      crysisRemastered, crysis2Remastered, crysis3Remastered, standard]') in lists_src
 
 # madeira-bcd's defaults where upstream's differ: every game madeira-bcd ran had them,
 # so every game's own list ends with them. The standard list reaches every other game
@@ -105,7 +105,7 @@ for ident, p in presets.items():
         if key != 'env.WINEDLLOVERRIDES':
             named = named.replace('socialclubhelper.exe', '')
         assert 'socialclub' not in named and 'MADEIRA_DLL_LOCAL' not in line, (ident, line)
-print('PASS: nine lists, two comment lines each, every game list ends with the four fork defaults and the standard one has none, no key twice, '
+print('PASS: eleven lists, two comment lines each, every game list ends with the four fork defaults and the standard one has none, no key twice, '
       'every non-env key in the settings catalog, no Social Club DLL lines, no variant DLL switches')
 
 # Red Dead Redemption 2 from Steam: the owner's list of 2026-10-09 (build 463), line for line,
@@ -270,13 +270,26 @@ print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472, 
 crysis = presets['crysis-remastered']
 assert crysis['tested'] == ['env.MADEIRA_EC_HOOK_TRACE = 0'], crysis['lines']
 assert crysis['version'] == 1 and crysis['switches'] == 'avx: false, nvidia: false, wineVCRT: false, display: "fit"', crysis
-print('PASS: Crysis Remastered is the standard line with the fork defaults and every switch off (v1)')
+# Crysis 2 and 3 Remastered, version 1 (not yet run with them): madeira-bcd build 540's tries stopped with AVX off
+# (Crysis 2) and in Microsoft's msvcp140 (Crysis 3), so AVX on, and Wine's C++ runtime for Crysis 3.
+for ident, vcrt in (('crysis-2-remastered', 'false'), ('crysis-3-remastered', 'true')):
+    c = presets[ident]
+    assert c['tested'] == ['env.MADEIRA_EC_HOOK_TRACE = 0'], c['lines']
+    assert c['version'] == 1 and c['switches'] == 'avx: true, nvidia: false, wineVCRT: %s, display: "fit"' % vcrt, c
+print('PASS: Crysis Remastered is the standard line with the fork defaults and every switch off (v1); Crysis 2 and 3 '
+      'Remastered the same with AVX on, and Wine\'s C++ runtime for Crysis 3 (v1)')
 
 # Recognition: Steam by App ID or steamapps\common folder; everything else by the program's name.
 match = block(lists_src, 'static func match(', '\n    }\n')
-assert 'rdr2AppID = 1174180, gta5EnhancedAppID = 3240220, ghostAppID = 2215430, godOfWarAppID = 1593500,\n               horizonZeroDawnAppID = 1151640, crysisRemasteredAppID = 1715130' in lists_src
+assert ('rdr2AppID = 1174180, gta5EnhancedAppID = 3240220, ghostAppID = 2215430, godOfWarAppID = 1593500,\n'
+        '               horizonZeroDawnAppID = 1151640, crysisRemasteredAppID = 1715130, crysis2RemasteredAppID = 2096600,\n'
+        '               crysis3RemasteredAppID = 2096610') in lists_src
 assert 'if steamAppID == crysisRemasteredAppID || installFolder == "crysis remastered" { return crysisRemastered }' in match
 assert 'case "crysisremastered.exe":\n            return crysisRemastered' in match
+assert 'if steamAppID == crysis2RemasteredAppID || installFolder == "crysis 2 remastered" { return crysis2Remastered }' in match
+assert 'if steamAppID == crysis3RemasteredAppID || installFolder == "crysis 3 remastered" { return crysis3Remastered }' in match
+assert 'case "crysis2remastered.exe":\n            return crysis2Remastered' in match
+assert 'case "crysis3remastered.exe":\n            return crysis3Remastered' in match
 assert 'let installFolder = last == steamFolder ? steamFolder : nil' in match
 assert 'installFolder == "red dead redemption 2"' in match and 'installFolder == "grand theft auto v enhanced"' in match
 assert 'case "ghostoftsushima.exe":' in match and 'case "gow.exe":' in match and 'case "rdr2.exe", "playrdr2.exe":' in match
@@ -460,9 +473,15 @@ check(id(crysis, 1715130) == "crysis-remastered", "Crysis Remastered by its App 
 check(id(crysis) == "crysis-remastered", "Crysis Remastered by its Steam folder")
 check(id(crysis + #"\Bin64\CrysisRemastered.exe"#) == "crysis-remastered", "its program inside Steam")
 check(id(#"C:\Games\Crysis\Bin64\Crysis.exe"#) == "none", "the original Crysis is another game")
+let crysis2 = steam + #"\Crysis 2 Remastered"#, crysis3 = steam + #"\Crysis 3 Remastered"#
+check(id(crysis2, 2096600) == "crysis-2-remastered" && id(crysis3, 2096610) == "crysis-3-remastered", "Crysis 2 and 3 Remastered by their App IDs")
+check(id(crysis2) == "crysis-2-remastered" && id(crysis3) == "crysis-3-remastered", "by their Steam folders")
+check(id(crysis2 + #"\Bin64\Crysis2Remastered.exe"#) == "crysis-2-remastered"
+      && id(crysis3 + #"\Bin64\Crysis3Remastered.exe"#) == "crysis-3-remastered", "their programs inside Steam")
+check(id(#"C:\Games\Crysis 2\Bin32\Crysis2.exe"#) == "none", "the original Crysis 2 is another game")
 check(id(#"C:\Games\Foo\foo.exe"#) == "none" && id(steam + #"\Portal 2"#, 620) == "none", "other games")
 check(id("") == "none" && id("C:\\") == "none", "no path")
-print("PASS: Steam games by App ID or steamapps\\common folder, GTA V Enhanced and RDR2 inside and outside Steam, GoT, GoW, Horizon Zero Dawn and Crysis Remastered by their programs, others none")
+print("PASS: Steam games by App ID or steamapps\\common folder, GTA V Enhanced and RDR2 inside and outside Steam, GoT, GoW, Horizon Zero Dawn and the three Crysis Remastered games by their programs, others none")
 
 // The lists themselves.
 check(Set(R.all.map(\.id)).count == R.all.count, "ids are unique")
