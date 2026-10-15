@@ -496,6 +496,7 @@ static const char *const g_cat_name[MAD_CAT_N] = { "tex-RT", "tex-DS", "tex-UAV"
 static volatile LONG64 g_cat_bytes[MAD_CAT_N], g_cat_peak[MAD_CAT_N];
 static volatile LONG g_cat_count[MAD_CAT_N];
 static volatile LONG64 g_upload_swap_bytes; static volatile LONG g_upload_swap_n;   /* ml1154 */
+static volatile LONG64 g_defswap_bytes; static volatile LONG g_defswap_n;   /* fix: default-buffer-swap (opt-in), a part of the ml1154 count */
 /* madeira-bcd metal-gap: what the ml1150 line's Metal total is made of, beyond
  * the ml1057 estimate. Red Dead Redemption 2 (build 467, 13:09) grew Metal's
  * currentAllocatedSize from 2366 to 2931 MB in its last minute while the
@@ -1083,6 +1084,9 @@ static void mad_acct_report(void) {
     }
     d3d12_log("[madeira-d3d12] ml1057 live GPU backing (estimated) total=%lldMB:%s\n", (long long)(tot >> 20), line);
     d3d12_log("[madeira-d3d12] ml1154 CPU-visible buffers on file-backed storage: %ld, %lld MB\n", g_upload_swap_n, (long long)(g_upload_swap_bytes >> 20));
+    if (g_defswap_n || g_defswap_bytes)   /* fix: default-buffer-swap (opt-in) */
+        d3d12_log("[madeira-d3d12] default-buffer-swap: %ld DEFAULT buffers on file-backed storage, %lld MB (inside the ml1154 count above)\n",
+                  (long)g_defswap_n, (long long)(g_defswap_bytes >> 20));
     if (g_hp_dev) d3d12_log("[madeira-d3d12] ml1072 texture heaps: %u (%lld MB reserved, %lld MB live in them), %ld textures placed, %ld fallbacks, %u blocks awaiting GPU\n",
                             g_hp_dev->ntheaps, (long long)(g_hp_dev->hp_total_bytes >> 20), (long long)(g_hp_dev->hp_live_bytes >> 20),
                             g_hp_dev->hp_textures, g_hp_dev->hp_fallbacks, g_hp_dev->nhret);
@@ -3292,6 +3296,33 @@ static void mad_pso_warm(obj_handle_t device, const void *info, const void *vd, 
     }
     if (InterlockedIncrement(&sent) == 1)
         d3d12_log("[madeira-d3d12] pso-warm: first pipeline handed to the warm-up queues\n");
+}
+/* fix: default-buffer-swap (opt-in, default 0). Horizon Forbidden
+ * West keeps 1.3-1.6 GB of committed DEFAULT buffers live (256 MB each, flags 0:
+ * written by copies, read through typed views; logs 2026-10-13 17:10 and 22:47)
+ * on GPU-private Metal memory, which phys_footprint charges in full: Metal held
+ * 4.4-4.7 GB and the game reached the 8 GB line. 1: a committed DEFAULT buffer
+ * of at least default-buffer-swap-mb (default 64) with no UAV, render-target or
+ * depth flag gets storage WE allocate, handed to Metal as a shared no-copy
+ * buffer, exactly as upload-swap (ml1154) does for UPLOAD buffers: a fresh guest
+ * commit that the file tier (swap-mb, ml1077) backs is not charged to
+ * phys_footprint. 2: UAV buffers too. The application still sees a GPU-only
+ * resource (r->cpu stays NULL, Map is refused as before). Without the swap tier
+ * the commit is anonymous memory and nothing is saved. */
+static UINT64 g_defswap_min = 64ull << 20;
+static int mad_defswap_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        long long m = mad_cfg_int_pe("default-buffer-swap", 0);   /* fix: 1 = large committed DEFAULT buffers (no UAV/RT/DS) on file-backed storage, 2 = UAV ones too; 0 = Metal-owned private memory (as before) */
+        long long mb = mad_cfg_int_pe("default-buffer-swap-mb", 64);   /* fix: default-buffer-swap: the smallest DEFAULT buffer moved, in MB (at least 8) */
+        g_defswap_min = (UINT64)(mb < 8 ? 8 : mb) << 20;
+        if (m > 0)
+            d3d12_log("[madeira-d3d12] default-buffer-swap = %lld (opt-in): committed DEFAULT buffers of %llu MB or more%s live on file-backed storage, off the jetsam footprint\n",
+                      m, (unsigned long long)(g_defswap_min >> 20), m >= 2 ? ", UAV ones too," : " without a UAV flag");
+        MemoryBarrier();
+        mode = m <= 0 ? 0 : m >= 2 ? 2 : 1;
+    }
+    return mode;
 }
 
 static int mad_rtvp_eq(const struct mad_rtvp *a, const struct mad_rtvp *b) {
@@ -12347,7 +12378,7 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
         ti.pixel_format = pf; ti.width = (uint32_t)width; ti.height = 1; ti.depth = 1; ti.array_length = 1;
         ti.type = WMTTextureTypeTextureBuffer; ti.mipmap_level_count = 1; ti.sample_count = 1;
         ti.usage = uav ? (WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite) : WMTTextureUsageShaderRead;
-        ti.options = r->cpu ? WMTResourceStorageModeShared : WMTResourceStorageModePrivate;
+        ti.options = (r->cpu || r->own_mem) ? WMTResourceStorageModeShared : WMTResourceStorageModePrivate;   /* fix: default-buffer-swap: a DEFAULT buffer on our storage is Shared to Metal */
         if (uav && (pf == WMTPixelFormatR32Uint || pf == WMTPixelFormatR32Sint) && mad_typed_uav_atomic())   /* madeira-bcd, opt-in */
             ti.usage = (enum WMTTextureUsage)(ti.usage | WMTTextureUsageShaderAtomic);
         sh_gpu = 0; sh = NULL; tex = 0;
@@ -13306,6 +13337,9 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
         if (r->own_mem) {   /* ml1154: the GPU may still read it; free after its serial (reclaimed with the ml1148 list) */
             struct mad_device *md = r->owner; int queued = 0;
             InterlockedExchangeAdd64(&g_upload_swap_bytes, -(LONG64)((r->size + 0xffff) & ~(UINT64)0xffff)); InterlockedDecrement(&g_upload_swap_n);
+            if (r->heap == D3D12_HEAP_TYPE_DEFAULT) {   /* fix: default-buffer-swap */
+                InterlockedExchangeAdd64(&g_defswap_bytes, -(LONG64)((r->size + 0xffff) & ~(UINT64)0xffff)); InterlockedDecrement(&g_defswap_n);
+            }
             if (md) {
                 EnterCriticalSection(&md->heap_lock);
                 if (mad_grow((void **)&md->mhret, &md->mhret_cap, md->nmhret + 1, sizeof *md->mhret)) {
@@ -13717,6 +13751,36 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
                 }
             }
         }
+        /* fix: default-buffer-swap (opt-in, see mad_defswap_mode): a large committed
+         * DEFAULT buffer on storage WE allocate, as ml1154 above, so the file tier
+         * keeps it off phys_footprint. Shared to Metal; GPU-only to the application. */
+        if (!r->buffer && !ph && heap_type == D3D12_HEAP_TYPE_DEFAULT && mad_defswap_mode() && info.length >= g_defswap_min &&
+            !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) &&
+            (mad_defswap_mode() >= 2 || !(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) {
+            SIZE_T len = (SIZE_T)((info.length + 0xffff) & ~(UINT64)0xffff);
+            void *mem = VirtualAlloc(NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (mem) {
+                UINT64 want = info.length;
+                info.length = len; info.memory.ptr = mem; info.options = WMTResourceStorageModeShared;
+                r->buffer = MTLDevice_newBuffer(d->mtl_device, &info);
+                if (r->buffer) {
+                    r->own_mem = mem;   /* released (after the GPU) by the ml1154 path in res_Release */
+                    InterlockedExchangeAdd64(&g_upload_swap_bytes, (LONG64)len); InterlockedIncrement(&g_upload_swap_n);
+                    InterlockedExchangeAdd64(&g_defswap_bytes, (LONG64)len); InterlockedIncrement(&g_defswap_n);
+                } else {
+                    VirtualFree(mem, 0, MEM_RELEASE);
+                    info.length = want; info.memory.ptr = NULL; info.gpu_address = 0; info.options = WMTResourceStorageModePrivate;
+                }
+                {
+                    static unsigned said;
+                    if (said++ < 8)
+                        d3d12_log("[madeira-d3d12] default-buffer-swap: DEFAULT buffer %llu MB (flags %#x) on our storage %p: %s; %ld so far, %lld MB\n",
+                                  (unsigned long long)(want >> 20), (unsigned)desc->Flags, mem,
+                                  r->buffer ? "Metal accepted it" : "Metal REFUSED it, GPU-private instead",
+                                  (long)g_defswap_n, (long long)(g_defswap_bytes >> 20));
+                }
+            }
+        }
         if (!r->buffer) r->buffer = MTLDevice_newBuffer(d->mtl_device, &info);
         if (!r->buffer) { free(r); return mad_creation_failure(d, "newBuffer"); }
         if (!r->placed_heap) {
@@ -13724,6 +13788,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
             mad_resident(d, r->buffer);
         }
         r->cpu = info.memory.ptr;      /* NULL for GPU-private, which is correct */
+        if (r->own_mem && heap_type == D3D12_HEAP_TYPE_DEFAULT) r->cpu = NULL;   /* fix: default-buffer-swap: still GPU-only to the application */
         r->gpu_address = info.gpu_address;
         mad_track(d, r);
         if (info.length >= (16u << 20) && !r->placed_heap) {            /* ml885: big buffers, with where they live */
