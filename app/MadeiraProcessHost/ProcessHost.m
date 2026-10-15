@@ -28,9 +28,6 @@
 #import <sys/sysctl.h>
 #import <fcntl.h>
 #import <unistd.h>
-#import <sys/socket.h>
-#import "../Madeira/ProcessHostControl.h"
-extern int ios_process_host_control(PHControlRequest *, void *);
 #import "../Madeira/ProcessHostProtocol.h"
 #import "../Madeira/JITAllocator.h"   // jit26_prepare_region, jit_check_debugged
 
@@ -74,24 +71,6 @@ static void ph_publish_host_probe(void) {
     setenv("FEX_MADEIRA_HOSTPROBE", buf, 1);
 }
 
-static void *ph_control_thread(void *arg) {
-    int fd=(int)(intptr_t)arg;
-    // Allocate before any client thread can be suspended; no malloc in the RPC loop.
-    unsigned char *payload=calloc(1,PH_CONTROL_LIMIT);
-    PHControlRequest request;
-    while (payload && ph_control_transfer(fd,&request,sizeof request,0)) {
-        if(request.version!=PH_CONTROL_VERSION || request.length>PH_CONTROL_LIMIT)break;
-        if((request.op==PH_WRITE || request.op==PH_SET_CONTEXT) &&
-           !ph_control_transfer(fd,payload,request.length,0))break;
-        request.status=ios_process_host_control(&request,payload);
-        if(!ph_control_transfer(fd,&request,sizeof request,1))break;
-        if(!request.status && (request.op==PH_READ || request.op==PH_GET_CONTEXT) &&
-           !ph_control_transfer(fd,payload,request.length,1))break;
-    }
-    shutdown(fd,SHUT_RDWR); close(fd); free(payload);
-    return NULL;
-}
-
 #pragma mark - The server object
 
 @interface PHServer : NSObject <PHProcessServer>
@@ -103,19 +82,8 @@ static void *ph_control_thread(void *arg) {
     int _argc;
     int _serverFD;
     BOOL _prepared;
-    BOOL _started;
-    int _controlFD;
-    size_t _poolMB;
 }
 
-- (instancetype)init {
-    if ((self=[super init])) { _serverFD=-1; _controlFD=-1; }
-    return self;
-}
-- (void)abortGuest {
-    if(_serverFD>=0)shutdown(_serverFD,SHUT_RDWR);
-    if(_controlFD>=0)shutdown(_controlFD,SHUT_RDWR);
-}
 - (void)clientLog:(NSString *)line {
     id<PHProcessClient> client = (id<PHProcessClient>)self.connection.remoteObjectProxy;
     @try { [client log:line]; } @catch (__unused id e) {}
@@ -131,7 +99,7 @@ static void *ph_control_thread(void *arg) {
 // OWN environment (competitor patch 0036: never inherited from the parent).
 // Returns YES and fills rx/rw/size on success.
 - (BOOL)setUpPoolRX:(void **)rxOut RW:(void **)rwOut size:(size_t *)sizeOut {
-    const size_t size = _poolMB * 1024 * 1024;   // phase-1 test pool; the app uses far more
+    const size_t size = 128 * 1024 * 1024;   // phase-1 test pool; the app uses far more
     if (!jit_check_debugged()) {
         [self clientLog:@"JIT pool: CS_DEBUGGED not set — the app did not enable JIT for this extension"];
         return NO;
@@ -172,6 +140,7 @@ static void *ph_control_thread(void *arg) {
 
     const char *prefix = xpc_dictionary_get_string(info, PH_INFO_PREFIX);
     const char *bundle = xpc_dictionary_get_string(info, PH_INFO_BUNDLE);
+    const char *docs = xpc_dictionary_get_string(info, PH_INFO_DOCS);
     const char *nls = xpc_dictionary_get_string(info, PH_INFO_NLS);
     int fd = xpc_dictionary_dup_fd(info, PH_INFO_FD);
     if (fd < 0 || !prefix || !*prefix) {
@@ -180,37 +149,18 @@ static void *ph_control_thread(void *arg) {
         reply(result); return;
     }
     _serverFD = fd;
-    _controlFD=xpc_dictionary_dup_fd(info,PH_INFO_CONTROL);
-    if (_controlFD < 0) { close(fd); xpc_dictionary_set_string(result,PH_REPLY_ERROR,"missing control socket"); reply(result); return; }
-    int noSigPipe=1; setsockopt(_controlFD,SOL_SOCKET,SO_NOSIGPIPE,&noSigPipe,sizeof noSigPipe);
-    const char *group=xpc_dictionary_get_string(info,PH_INFO_GROUP);
-    if (!group || ![NSFileManager.defaultManager containerURLForSecurityApplicationGroupIdentifier:@(group)]) {
-        close(fd); close(_controlFD);
-        xpc_dictionary_set_string(result,PH_REPLY_ERROR,"extension cannot resolve the shared container"); reply(result); return;
-    }
-    int cwd=xpc_dictionary_get_value(info,PH_INFO_CWD) ? xpc_dictionary_dup_fd(info,PH_INFO_CWD) : -1;
-    if (cwd>=0) { fchdir(cwd); close(cwd); }
-    pthread_t control;
-    if (pthread_create(&control,NULL,ph_control_thread,(void *)(intptr_t)_controlFD)) {
-        close(fd); close(_controlFD); xpc_dictionary_set_string(result,PH_REPLY_ERROR,"control thread failed"); reply(result); return;
-    }
-    pthread_detach(control);
 
-    // The extension cannot access the app's Documents directory.
-    NSString *ownDocs=NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES).firstObject;
-    NSString *log=[ownDocs stringByAppendingPathComponent:@"madeira-ext-log.txt"];
-    wine_log_set_file(log.UTF8String);
-    int lf=open(log.UTF8String,O_WRONLY|O_CREAT|O_APPEND,0600);
-    if(lf>=0){dup2(lf,STDERR_FILENO);close(lf);}
-    setenv("MADEIRA_DOCS_DIR",ownDocs.UTF8String,1);
-    size_t cfgSize=0; const void *cfg=xpc_dictionary_get_data(info,"cfg",&cfgSize);
-    if(cfg && cfgSize<=65536) [[NSData dataWithBytes:cfg length:cfgSize] writeToFile:[ownDocs stringByAppendingPathComponent:@"madeira.cfg"] atomically:YES];
-    else [NSFileManager.defaultManager removeItemAtPath:[ownDocs stringByAppendingPathComponent:@"madeira.cfg"] error:nil];
+    // Logging to the extension's own file (the app's log is a different process).
+    if (docs && *docs) {
+        char log[1024]; snprintf(log, sizeof log, "%s/madeira-ext-log.txt", docs);
+        wine_log_set_file(log);
+        int lf = open(log, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (lf >= 0) { dup2(lf, STDERR_FILENO); close(lf); }
+        setenv("MADEIRA_DOCS_DIR", docs, 1);
+    }
 
     // Set up the JIT pool from this process's own debugger before any env that depends on it.
     void *rx = NULL, *rw = NULL; size_t sz = 0;
-    _poolMB=(size_t)xpc_dictionary_get_int64(info,"pool_mb");
-    if(_poolMB<128 || _poolMB>1152)_poolMB=512;
     BOOL pool = [self setUpPoolRX:&rx RW:&rw size:&sz];
     xpc_dictionary_set_int64(result, PH_REPLY_STAGE, pool ? PHStageJITPool : PHStageStarted);
 
@@ -226,23 +176,17 @@ static void *ph_control_thread(void *arg) {
     setenv("WINEDEBUG", "err+all,err-virtual", 0);
     ph_publish_host_probe();
 
-    // Transfer only independent native options. The caller has refused madsync;
-    // server-side fastsync may remain enabled. Pool/socket/prefix values are owned here.
+    // Caller-supplied environment (the app builds a clean set: NO MADEIRA_FASTSYNC and
+    // NO inproc-sync selection, so the remote process runs plain server sync).
     xpc_object_t xenv = xpc_dictionary_get_value(info, PH_INFO_ENV);
     if (xenv && xpc_get_type(xenv) == XPC_TYPE_ARRAY) {
         xpc_array_apply(xenv, ^bool(size_t i, xpc_object_t v) {
             const char *s = xpc_string_get_string_ptr(v);
-            if (s && strncmp(s,"WINE_IOS_JIT_",13) && strncmp(s,"WINESERVERSOCKET=",17) &&
-                strncmp(s,"WINE_IOS_FD_SOCKET=",19) && strncmp(s,"MADEIRA_EXT_PROCESS_ROLE=",24) &&
-                strncmp(s,"WINEPREFIX=",11) && strncmp(s,"HOME=",5) && strncmp(s,"MADEIRA_DOCS_DIR=",17)) { char *eq = strchr(s, '='); if (eq) { char k[128];
+            if (s) { char *eq = strchr(s, '='); if (eq) { char k[128];
                 size_t kl = (size_t)(eq - s); if (kl < sizeof k) { memcpy(k, s, kl); k[kl] = 0; setenv(k, eq + 1, 1); } } }
             return true;
         });
     }
-
-    // Client-side cells live in the app's image and are not shared across tasks.
-    // The app server may keep its cells: this client uses ordinary server requests.
-    setenv("MADEIRA_FASTSYNC","0",1);
 
     // Save argv for startGuest.
     xpc_object_t xargv = xpc_dictionary_get_value(info, PH_INFO_ARGV);
@@ -252,15 +196,24 @@ static void *ph_control_thread(void *arg) {
         for (int i = 0; i < _argc; i++) _argv[i] = strdup(xpc_array_get_string(xargv, i) ?: "");
     }
     ios_main_image_i386 = 0;   // phase-1 test guest is 64-bit (cmd.exe)
-    _prepared = pool && (_argc > 0);
-    if (!_prepared || _started) { shutdown(_serverFD,SHUT_RDWR); close(_serverFD); _serverFD=-1; shutdown(_controlFD,SHUT_RDWR); }
+    _prepared = (_argc > 0);
+
+    // Attempt to hand the app a send right to our task port. On iOS this may be
+    // refused (the task port is guarded); the app detects a missing right and uses
+    // the host-routed path instead (documented).
+    BOOL taskOk = NO;
+    @try {
+        xpc_dictionary_set_mach_send(result, PH_REPLY_TASK, mach_task_self());
+        taskOk = YES;
+    } @catch (__unused id e) {}
+    xpc_dictionary_set_bool(result, PH_REPLY_TASKOK, taskOk);
 
     xpc_dictionary_set_int64(result, PH_REPLY_STAGE, _prepared ? PHStageEnvReady : PHStageJITPool);
     xpc_dictionary_set_bool(result, PH_REPLY_OK, pool && _prepared);
     if (!pool) xpc_dictionary_set_string(result, PH_REPLY_ERROR, "JIT pool not available (enable JIT for the extension)");
     else if (!_prepared) xpc_dictionary_set_string(result, PH_REPLY_ERROR, "no argv supplied");
-    [self clientLog:[NSString stringWithFormat:@"prepared: pool=%d argv=%d control ready footprint=%lluMB",
-                     pool, _argc, ph_footprint() >> 20]];
+    [self clientLog:[NSString stringWithFormat:@"prepared: pool=%d argv=%d task_sent=%d footprint=%lluMB",
+                     pool, _argc, taskOk, ph_footprint() >> 20]];
     reply(result);
 }
 
@@ -295,8 +248,7 @@ static void *ph_wine_thread(void *arg) {
     pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
     int rc = pthread_create(&t, &attr, ph_wine_thread, (__bridge void *)self);
     pthread_attr_destroy(&attr);
-    if (rc == 0) { _started=YES; pthread_detach(t); }
-    else { shutdown(_serverFD,SHUT_RDWR); close(_serverFD); _prepared=NO; }
+    if (rc == 0) pthread_detach(t);
     xpc_dictionary_set_bool(result, PH_REPLY_OK, rc == 0);
     xpc_dictionary_set_int64(result, PH_REPLY_STAGE, rc == 0 ? PHStageProcessRun : PHStageEnvReady);
     if (rc != 0) xpc_dictionary_set_string(result, PH_REPLY_ERROR, "pthread_create failed");
@@ -306,43 +258,12 @@ static void *ph_wine_thread(void *arg) {
 
 @end
 
-static NSXPCConnection *ph_connection;
-int wine_host_spawn_process(int argc,char **argv,int fd,int cwd,char **env) {
-    @autoreleasepool {
-        xpc_object_t info=xpc_dictionary_create(NULL,NULL,0);
-        xpc_object_t xa=xpc_array_create(NULL,0), xe=xpc_array_create(NULL,0);
-        for(int i=0;i<argc;i++)xpc_array_set_string(xa,XPC_ARRAY_APPEND,argv[i]);
-        for(int i=0;env && env[i];i++)xpc_array_set_string(xe,XPC_ARRAY_APPEND,env[i]);
-        xpc_dictionary_set_value(info,PH_INFO_ARGV,xa); xpc_dictionary_set_value(info,PH_INFO_ENV,xe);
-        xpc_dictionary_set_fd(info,PH_INFO_FD,fd);
-        if(cwd>=0)xpc_dictionary_set_fd(info,PH_INFO_CWD,cwd);
-        dispatch_semaphore_t sem=dispatch_semaphore_create(0); __block BOOL ok=NO;
-        id<PHProcessClient> proxy=[ph_connection remoteObjectProxyWithErrorHandler:^(NSError *e){dispatch_semaphore_signal(sem);}];
-        [proxy spawnGuest:info reply:^(BOOL result){ok=result;dispatch_semaphore_signal(sem);}];
-        if(dispatch_semaphore_wait(sem,dispatch_time(DISPATCH_TIME_NOW,60*NSEC_PER_SEC)))ok=NO;
-        if(!ok)shutdown(fd,SHUT_RDWR);
-        return ok;
-    }
-}
-void madeira_process_host_window_frame(void *hwnd,int x,int y,int w,int h,int visible,int cx,int cy,int cw,int ch) {
-    @autoreleasepool {
-        [(id<PHProcessClient>)ph_connection.remoteObjectProxy windowChanged:@{
-            @"hwnd":@((uintptr_t)hwnd),@"x":@(x),@"y":@(y),@"w":@(w),@"h":@(h),@"visible":@(visible),
-            @"cx":@(cx),@"cy":@(cy),@"cw":@(cw),@"ch":@(ch)}];
-    }
-}
-void madeira_process_host_window_destroy(void *hwnd) {
-    [(id<PHProcessClient>)ph_connection.remoteObjectProxy windowChanged:@{@"hwnd":@((uintptr_t)hwnd),@"destroy":@YES}];
-}
-void madeira_process_host_did_exit(int status) {
-    [(id<PHProcessClient>)ph_connection.remoteObjectProxy guestExited:status];
-}
-
 #pragma mark - Extension entry
 
 @interface MadeiraProcessHostHandler : NSObject <NSExtensionRequestHandling>
 @end
 
+static NSXPCConnection *ph_connection;
 static PHServer *ph_server;
 
 @implementation MadeiraProcessHostHandler
@@ -353,19 +274,12 @@ static PHServer *ph_server;
         NSLog(@"[ext-proc] ml1330 no endpoint in the request");
         return;
     }
-    if(ph_server) {
-        NSLog(@"[ext-proc] ml1331 extension process reused; refusing a second Wine instance");
-        [context completeRequestReturningItems:@[] completionHandler:nil];
-        return;
-    }
     ph_server = [PHServer new];
     ph_connection = [[NSXPCConnection alloc] initWithListenerEndpoint:endpoint];
     ph_connection.exportedInterface = PHProcessServerInterface();
     ph_connection.exportedObject = ph_server;
-    ph_connection.remoteObjectInterface = PHProcessClientInterface();
+    ph_connection.remoteObjectInterface = [NSXPCInterface interfaceWithProtocol:@protocol(PHProcessClient)];
     ph_server.connection = ph_connection;
-    ph_connection.invalidationHandler=^{ [ph_server abortGuest]; };
-    ph_connection.interruptionHandler=^{ [ph_server abortGuest]; };
     [ph_connection resume];
     [(id<PHProcessClient>)ph_connection.remoteObjectProxy extensionReady:getpid()
                                                               available:os_proc_available_memory()];
