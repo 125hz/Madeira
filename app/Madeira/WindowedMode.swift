@@ -11,13 +11,6 @@ enum WindowedMode {
     /// session with madeira.cfg `windowed = 1` or env.MADEIRA_WINDOWED = 1.
     static var active: Bool { winios_windowed_active() != 0 }
 
-    /// One window fills the whole screen (its frame's maximize button); the
-    /// in-game menu then offers the way back. Main thread.
-    static var maximized: Bool { active && winios_windowed_maximized() != 0 }
-
-    /// Back to the frames and the taskbar.
-    static func restoreWindows() { winios_windowed_unmaximize() }
-
     /// Windowed mode taps a window where the finger is (the Touch pointer mode
     /// of MetalBackedView): the trackpad pointer that desktop sessions use by
     /// default cannot cross from one frame to another on screen.

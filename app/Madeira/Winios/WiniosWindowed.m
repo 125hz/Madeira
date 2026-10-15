@@ -87,7 +87,7 @@ extern int winios_drv_foreground_if_owner(void *hwnd);
 #define WW_MOUSE_UPS       (0x0004u | 0x0010u | 0x0040u | 0x0100u)
 
 static const CGFloat WW_BAR_H = 30;       /* title bar height, points */
-static const CGFloat WW_MIN_BAR_W = 180;  /* a tiny window still gets a usable title bar (four buttons) */
+static const CGFloat WW_MIN_BAR_W = 150;  /* a tiny window still gets a usable title bar */
 static const CGFloat WW_DOCK_H = 56;
 static const CGFloat WW_GRAB = 120;       /* title bar that always stays on screen, points */
 
@@ -353,7 +353,6 @@ static const char *ww_kind_name(ww_kind k)
     BOOL placed;           /* the frame has a position */
     BOOL appMinimized;     /* minimized to the taskbar (app side) */
     BOOL fullscreen;
-    BOOL maximized;        /* the whole screen, no title bar, taskbar hidden (g_max) */
     BOOL wasShown;
     BOOL everShown;        /* logged as added */
     CGFloat k;             /* frame zoom, points per desktop pixel */
@@ -526,7 +525,7 @@ static BOOL ww_by_touch(UIEvent *event, const char *what)
 @property (nonatomic) BOOL chromeless;
 @property (nonatomic, strong) UIView *bar;
 @property (nonatomic, strong) UILabel *label;
-@property (nonatomic, strong) UIButton *minButton, *fullButton, *maxButton, *closeButton;
+@property (nonatomic, strong) UIButton *minButton, *fullButton, *closeButton;
 @property (nonatomic, strong) UIView *content;
 @property (nonatomic, strong) CALayer *host;
 @property (nonatomic, strong) UIView *grip;
@@ -542,19 +541,6 @@ static BOOL ww_by_touch(UIEvent *event, const char *what)
 @end
 
 static WWDock *g_dock;
-
-/* Maximize: one framed window fills the whole screen like a game session's
- * picture (no title bar, taskbar hidden, black letterbox); a small floating
- * pill brings the windows back. */
-@interface WWPill : UIView
-@property (nonatomic, strong) UIVisualEffectView *blur;
-@property (nonatomic, strong) UIButton *restoreButton, *menuButton;
-@property (nonatomic) unsigned wakeGen;
-- (void)wake;
-@end
-static WWPill *g_pill;
-static uintptr_t g_max;   /* the maximized window, 0 when none */
-static void ww_set_maximized(WWWin *w, BOOL on, const char *why);
 
 /* A frame was touched or activated: the search field (if a touch opened it)
  * gives the keyboard back to the program. */
@@ -646,22 +632,14 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
     [_bar addSubview:_label];
     _minButton = ww_round_button(@"minus", [UIColor colorWithWhite:0.36 alpha:1], 20);
     _fullButton = ww_round_button(@"arrow.up.left.and.arrow.down.right", [UIColor colorWithWhite:0.36 alpha:1], 20);
-    /* maximize: green "+", as a zoom button; the whole screen, no title bar */
-    _maxButton = ww_round_button(@"plus", UIColor.systemGreenColor, 20);
     _closeButton = ww_round_button(@"xmark", UIColor.systemRedColor, 20);
-    for (UIButton *b in @[_minButton, _fullButton, _maxButton, _closeButton]) [_bar addSubview:b];
+    for (UIButton *b in @[_minButton, _fullButton, _closeButton]) [_bar addSubview:b];
     [_minButton addTarget:self action:@selector(minimizePressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
     [_fullButton addTarget:self action:@selector(fullscreenPressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
-    [_maxButton addTarget:self action:@selector(maximizePressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
     [_closeButton addTarget:self action:@selector(closePressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
     _minButton.accessibilityLabel = @"Minimize";
     _fullButton.accessibilityLabel = @"Fit to screen";
-    _maxButton.accessibilityLabel = @"Maximize";
     _closeButton.accessibilityLabel = @"Close";
-    /* holding the fit button maximizes too */
-    UILongPressGestureRecognizer *hold = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(fullHeld:)];
-    hold.allowedPressTypes = @[];
-    [_fullButton addGestureRecognizer:hold];
 
     /* The title bar drags the frame. Its recognizers take touches only (no
      * presses), so a controller or keyboard focus press never reaches them. */
@@ -707,14 +685,6 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
 - (void)minimizePressed:(UIButton *)b forEvent:(UIEvent *)e { if (ww_by_touch(e, "minimize button")) [self minimizeTapped]; }
 - (void)fullscreenPressed:(UIButton *)b forEvent:(UIEvent *)e { if (ww_by_touch(e, "fullscreen button")) [self fullscreenTapped]; }
 - (void)closePressed:(UIButton *)b forEvent:(UIEvent *)e { if (ww_by_touch(e, "close button")) [self closeTapped]; }
-- (void)maximizePressed:(UIButton *)b forEvent:(UIEvent *)e {
-    WWWin *w = [self win];
-    if (w && ww_by_touch(e, "maximize button")) ww_set_maximized(w, YES, "button");
-}
-- (void)fullHeld:(UILongPressGestureRecognizer *)g {
-    WWWin *w = [self win];
-    if (w && g.state == UIGestureRecognizerStateBegan) ww_set_maximized(w, YES, "fit button held");
-}
 
 - (void)minimizeTapped {
     WWWin *w = [self win];
@@ -796,13 +766,12 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
     if (_chromeless) return;
     _bar.frame = CGRectMake(0, 0, width, WW_BAR_H);
     CGFloat side = 20, gap = 8, x = width - 8 - side;
-    for (UIButton *b in @[_closeButton, _maxButton, _fullButton, _minButton]) {
+    for (UIButton *b in @[_closeButton, _fullButton, _minButton]) {
         b.frame = CGRectMake(x, (WW_BAR_H - side) / 2, side, side);
         x -= side + gap;
     }
-    CGFloat buttons = 4 * side + 3 * gap + 16;
-    if (width >= 2 * buttons + 80) _label.frame = CGRectMake(buttons, 0, width - 2 * buttons, WW_BAR_H);
-    else _label.frame = CGRectMake(10, 0, MAX(width - buttons - 14, 0), WW_BAR_H);   /* narrow: left of the buttons */
+    CGFloat buttons = 3 * side + 2 * gap + 16;
+    _label.frame = CGRectMake(buttons, 0, MAX(width - 2 * buttons, 0), WW_BAR_H);
     WWWin *w = [self win];
     BOOL full = w && w->fullscreen;
     [_fullButton setImage:[UIImage systemImageNamed:full ? @"arrow.down.right.and.arrow.up.left"
@@ -817,8 +786,8 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
 
 /* Touches a little outside the round buttons still hit them. */
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    if (!_chromeless && !self.hidden && !_bar.hidden) {
-        for (UIButton *b in @[_closeButton, _maxButton, _fullButton, _minButton]) {
+    if (!_chromeless && !self.hidden) {
+        for (UIButton *b in @[_closeButton, _fullButton, _minButton]) {
             CGRect r = CGRectInset([self convertRect:b.frame fromView:_bar], -7, -6);
             if (CGRectContainsPoint(r, point)) return b;
         }
@@ -937,131 +906,6 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
 }
 @end
 
-/* The floating pill shown while a window is maximized: back to the windows,
- * and the in-game menu. Dims to 30 % after a few seconds; a touch on it wakes
- * it. Not focusable, touch only, as the rest of the chrome. */
-@implementation WWPill
-- (instancetype)init {
-    if (!(self = [super initWithFrame:CGRectMake(0, 0, 92, 46)])) return nil;
-    _blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark]];
-    _blur.frame = self.bounds;
-    _blur.layer.cornerRadius = 23;
-    _blur.clipsToBounds = YES;
-    _blur.userInteractionEnabled = NO;
-    [self addSubview:_blur];
-    NSString *icon = [UIImage systemImageNamed:@"macwindow.on.rectangle"] ? @"macwindow.on.rectangle" : @"rectangle.on.rectangle";
-    _restoreButton = ww_round_button(icon, [UIColor colorWithWhite:1 alpha:0.16], 36);
-    _restoreButton.accessibilityLabel = @"Show all windows";
-    [_restoreButton addTarget:self action:@selector(restorePressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
-    _menuButton = ww_round_button(@"line.3.horizontal", [UIColor colorWithWhite:1 alpha:0.16], 36);
-    _menuButton.accessibilityLabel = @"Menu";
-    [_menuButton addTarget:self action:@selector(menuPressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
-    _menuButton.hidden = ww_bridge() == nil;
-    [self addSubview:_restoreButton];
-    [self addSubview:_menuButton];
-    self.layer.shadowColor = UIColor.blackColor.CGColor;
-    self.layer.shadowOpacity = 0.35;
-    self.layer.shadowRadius = 6;
-    self.layer.shadowOffset = CGSizeMake(0, 2);
-    self.hidden = YES;
-    return self;
-}
-- (BOOL)canBecomeFocused { return NO; }
-- (void)layoutSubviews {
-    [super layoutSubviews];
-    _blur.frame = self.bounds;
-    _restoreButton.frame = CGRectMake(5, 5, 36, 36);
-    _menuButton.frame = CGRectMake(51, 5, 36, 36);
-}
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hit = [super hitTest:point withEvent:event];
-    if (hit && event.type == UIEventTypeTouches) [self wake];
-    return hit;
-}
-- (void)wake {
-    unsigned gen = ++_wakeGen;
-    [UIView animateWithDuration:0.15 animations:^{ self.alpha = 1; }];
-    __weak WWPill *weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        WWPill *s = weakSelf;
-        if (!s || s.wakeGen != gen) return;
-        [UIView animateWithDuration:0.6 animations:^{ s.alpha = 0.3; }];
-    });
-}
-- (void)restorePressed:(UIButton *)b forEvent:(UIEvent *)e {
-    if (!ww_by_touch(e, "restore pill")) return;
-    WWWin *w = g_max ? ww_get(g_max, NO) : nil;
-    if (w) ww_set_maximized(w, NO, "restore pill");
-}
-- (void)menuPressed:(UIButton *)b forEvent:(UIEvent *)e {
-    if (!ww_by_touch(e, "restore pill menu button")) return;
-    ww_bridge_call(@"openMenu");
-}
-@end
-
-static void ww_layout_pill(void)
-{
-    if (!g_pill || !g_root) return;
-    UIEdgeInsets s = g_root.safeAreaInsets;
-    CGRect b = g_root.bounds;
-    CGFloat w = g_pill.menuButton.hidden ? 46 : 92, h = 46;
-    g_pill.frame = CGRectMake(CGRectGetMidX(b) - w / 2, CGRectGetMaxY(b) - MAX(s.bottom, 6) - h - 4, w, h);
-}
-
-/* Maximize on / off. On: the window fills the screen (ww_apply_frame), the
- * taskbar hides and the pill shows; one window at a time. App-side, like the
- * other buttons: the guest window keeps its size and position. */
-static void ww_set_maximized(WWWin *w, BOOL on, const char *why)
-{
-    if (!g_root || !w) return;
-    if (on) {
-        if (w->kind != WW_FRAMED || !w->frame) return;
-        if (w->maximized) return;
-        WWWin *old = g_max && g_max != w->hwnd ? ww_get(g_max, NO) : nil;
-        if (old && old->maximized) ww_set_maximized(old, NO, "another window maximized");
-        w->maximized = YES;
-        g_max = w->hwnd;
-        if (!g_pill) { g_pill = [WWPill new]; [g_root addSubview:g_pill]; }
-        g_pill.hidden = NO;
-        ww_layout_pill();
-        [g_pill wake];
-        if (g_dock) g_dock.hidden = YES;
-        ww_apply_frame(w);
-        ww_raise(w, YES, "maximize");
-        ww_log("maximize hwnd=%p on (%s): the whole screen, no title bar, taskbar hidden; the pill at the bottom "
-               "or the menu's Show all windows brings the windows back", (void *)w->hwnd, why);
-    } else {
-        if (!w->maximized) return;
-        w->maximized = NO;
-        if (g_max == w->hwnd) g_max = 0;
-        if (!g_max) {
-            if (g_pill) g_pill.hidden = YES;
-            if (g_dock) g_dock.hidden = NO;
-        }
-        if (w->frame) {
-            if (w->placed) ww_clamp(w);
-            ww_apply_frame(w);
-        }
-        ww_log("maximize hwnd=%p off (%s): back to its frame", (void *)w->hwnd, why);
-        ww_dock_refresh();
-        ww_z_rebuild();
-    }
-}
-
-int winios_windowed_maximized(void)
-{
-    return g_max != 0;
-}
-
-void winios_windowed_unmaximize(void)
-{
-    void (^run)(void) = ^{
-        WWWin *w = g_max ? ww_get(g_max, NO) : nil;
-        if (w) ww_set_maximized(w, NO, "menu");
-    };
-    if (NSThread.isMainThread) run(); else dispatch_async(dispatch_get_main_queue(), run);
-}
-
 /* ------------------------------------------------------------------ *
  * Geometry
  * ------------------------------------------------------------------ */
@@ -1127,7 +971,7 @@ static void ww_place_new(WWWin *w, BOOL again)
     WWWin *owner = w->infoKnown && w->info.owner ? ww_get((uintptr_t)w->info.owner, NO) : nil;
     if (owner && owner->kind == WW_ATTACHED) owner = ww_get(owner->group, NO);
     if (owner && owner->frame && !owner->frame.hidden && owner->desk.size.width > 0) {
-        CGFloat ok = owner->fullscreen || owner->maximized ? owner->frame.content.bounds.size.width / owner->desk.size.width : owner->k;
+        CGFloat ok = owner->fullscreen ? owner->frame.content.bounds.size.width / owner->desk.size.width : owner->k;
         CGPoint oc = [g_root convertPoint:CGPointZero fromView:owner->frame.content];
         CGPoint centre = CGPointMake(oc.x + (CGRectGetMidX(w->desk) - owner->desk.origin.x) * ok,
                                      oc.y + (CGRectGetMidY(w->desk) - owner->desk.origin.y) * ok);
@@ -1193,17 +1037,11 @@ static void ww_apply_frame(WWWin *w)
     CGFloat sx = lr.size.width > 0 ? lr.size.width / w->desk.size.width : 1;
     CGFloat sy = lr.size.height > 0 ? lr.size.height / w->desk.size.height : sx;
     CGFloat k = w->k;
-    BOOL max = w->maximized && w->kind == WW_FRAMED && g_root;
-    CGFloat barH = f.chromeless || max ? 0 : WW_BAR_H;
+    CGFloat barH = f.chromeless ? 0 : WW_BAR_H;
     CGPoint o = w->origin;
-    CGRect screen = g_root ? g_root.bounds : CGRectZero;
     if (w->kind == WW_LOOSE) {           /* where the desktop fit puts it */
         k = sx;
         o = lr.origin;
-    } else if (max) {                    /* the whole screen, letterboxed, as a game session shows it */
-        k = MIN(screen.size.width / w->desk.size.width, screen.size.height / w->desk.size.height);
-        o = CGPointMake(CGRectGetMidX(screen) - w->desk.size.width * k / 2,
-                        CGRectGetMidY(screen) - w->desk.size.height * k / 2);
     } else if (w->fullscreen) {
         CGRect a = ww_area();
         k = MIN(a.size.width / w->desk.size.width, (a.size.height - barH) / w->desk.size.height);
@@ -1214,26 +1052,15 @@ static void ww_apply_frame(WWWin *w)
     CGFloat width = f.chromeless ? cs.width : MAX(cs.width, WW_MIN_BAR_W);
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    if (max) {
-        /* the frame covers the screen in black; the window sits centred in it */
-        f.frame = screen;
-        f.content.frame = CGRectMake(o.x - screen.origin.x, o.y - screen.origin.y, cs.width, cs.height);
-    } else {
-        f.frame = CGRectMake(o.x, o.y - barH, width, cs.height + barH);
-        f.content.frame = CGRectMake(0, barH, cs.width, cs.height);
-    }
+    f.frame = CGRectMake(o.x, o.y - barH, width, cs.height + barH);
+    f.content.frame = CGRectMake(0, barH, cs.width, cs.height);
     f.host.bounds = lr;
     f.host.position = CGPointZero;
     f.host.transform = CATransform3DMakeScale(k / sx, k / sy, 1);
     [f layoutChrome:width];
     f.grip.frame = CGRectMake(cs.width - 26, barH + cs.height - 26, 26, 26);
-    f.grip.hidden = w->fullscreen || max;
-    if (!f.chromeless) {
-        f.bar.hidden = max;
-        f.backgroundColor = max ? UIColor.blackColor : UIColor.clearColor;
-        f.layer.shadowOpacity = max ? 0 : 0.45;
-        f.layer.shadowPath = max ? NULL : [UIBezierPath bezierPathWithRoundedRect:f.bounds cornerRadius:10].CGPath;
-    }
+    f.grip.hidden = w->fullscreen;
+    if (!f.chromeless) f.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:f.bounds cornerRadius:10].CGPath;
     [CATransaction commit];
 }
 
@@ -1322,9 +1149,6 @@ static void ww_update(WWWin *w)
     [CATransaction commit];
     BOOL newlyShown = shown && !w->wasShown;
     w->wasShown = shown;
-    /* a maximized window that goes away (hidden, minimized) gives the screen back */
-    if (w->maximized && (!shown || w->kind != WW_FRAMED))
-        ww_set_maximized(w, NO, shown ? "no longer a framed window" : "hidden or minimized");
     if (w->frame) ww_apply_frame(w);
     /* popups riding in this window's host follow its zoom */
     if (newlyShown && w->kind == WW_FRAMED) ww_raise(w, NO, "shown");
@@ -1388,7 +1212,6 @@ void winios_windowed_forget(void *hwnd)
     if (!w) return;
     if (w->everShown)
         ww_log("remove hwnd=%p kind=%s title=\"%s\"", (void *)w->hwnd, ww_kind_name(w->kind), ww_display_title(w).UTF8String);
-    if (w->maximized) ww_set_maximized(w, NO, "window destroyed");
     ww_drop_frame(w);
     [w->layer setValue:nil forKey:@"ww_hwnd"];
     [g_wins removeObjectForKey:@((uintptr_t)hwnd)];
@@ -1412,7 +1235,6 @@ static void ww_raise(WWWin *w, BOOL activate, const char *why)
     if (strcmp(why, "shown") && strcmp(why, "guest")) ww_search_release(why);
     [g_root bringSubviewToFront:w->frame];
     if (g_dock) [g_root bringSubviewToFront:g_dock];
-    if (g_pill) [g_root bringSubviewToFront:g_pill];   /* the way back from maximize stays on top */
     BOOL changed = g_top != w->hwnd;
     g_top = w->hwnd;
     if (activate) {
@@ -1493,7 +1315,6 @@ static UIImage *ww_letter_icon(NSString *name)
 
 static void ww_layout_dock(void)
 {
-    ww_layout_pill();
     WWDock *d = g_dock;
     if (!d || !g_root) return;
     UIEdgeInsets s = g_root.safeAreaInsets;
@@ -1621,9 +1442,6 @@ static void ww_clear_all(void)
     [g_order removeAllObjects];
     g_top = 0;
     g_cascade = 0;
-    g_max = 0;
-    g_pill.hidden = YES;
-    g_dock.hidden = NO;
     pthread_mutex_lock(&g_target_lock);
     g_t_latched = g_t_last = g_t_mapped = 0;
     g_t_pressed = 0;
@@ -1638,8 +1456,6 @@ void winios_windowed_teardown(void)
     ww_clear_all();
     [g_dock removeFromSuperview];
     g_dock = nil;
-    [g_pill removeFromSuperview];
-    g_pill = nil;
     g_root = nil;
     ww_log("compositor root removed");
 }
