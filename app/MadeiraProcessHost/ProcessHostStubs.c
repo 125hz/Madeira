@@ -134,17 +134,3 @@ void madeira_gl_wait_active(void) {}
 void *madeira_zink_target_bind(void **state,void *hwnd,int w,int h,int *rows) { (void)state;(void)hwnd;(void)w;(void)h;if(rows)*rows=0;return NULL; }
 void *madeira_zink_target_present(void **state,void *hwnd,int *rows) { (void)state;(void)hwnd;if(rows)*rows=0;return NULL; }
 void madeira_zink_target_release(void *state) { (void)state; }
-
-// Upstream main through #324 (synced 2026-10-15): the app half of the wineserver switches
-// (WineProcessBridge.m) and the [swap-win] / visibility / geometry window hooks (Winios.m).
-// The extension has no in-app server UI and reports its windows through winios_window_frame
-// above, so these are the null driver's answers.
-volatile int g_madeira_srv_log_all = 0;
-volatile int g_madeira_srv_fgetpath = 0;
-volatile int g_madeira_srv_direct = 0;
-int winios_swapchain_hwnd(void *hwnd) { (void)hwnd; return 0; }
-int winios_swapchain_take(int slot, int kind, unsigned int *seq) { (void)slot;(void)kind; if(seq)*seq=0; return 0; }
-void winios_window_visibility(HWND hwnd, int visible) { (void)hwnd;(void)visible; }
-void winios_window_geometry(HWND hwnd, int x, int y, int w, int h, int cx, int cy, int cw, int ch) {
-    (void)hwnd;(void)x;(void)y;(void)w;(void)h;(void)cx;(void)cy;(void)cw;(void)ch;
-}
