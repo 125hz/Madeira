@@ -3625,8 +3625,7 @@ struct ContentView: View {
         logStore.log("Starting wineserver...")
 
         let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let privatePrefix = documentsPath.appendingPathComponent("wine").path
-        let winePrefixPath = madeira_process_host_shared_prefix(privatePrefix) ?? privatePrefix
+        let winePrefixPath = documentsPath.appendingPathComponent("wine").path
 
         logStore.log("Wine prefix: \(winePrefixPath)")
 
@@ -3647,8 +3646,7 @@ struct ContentView: View {
         }
 
         let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let privatePrefix = documentsPath.appendingPathComponent("wine").path
-        let winePrefixPath = madeira_process_host_shared_prefix(privatePrefix) ?? privatePrefix
+        let winePrefixPath = documentsPath.appendingPathComponent("wine").path
 
         // Call synchronously — caller already waited for wineserver to be ready
         let result = wine_process_start(winePrefixPath)

@@ -608,11 +608,7 @@ struct LibraryEntry: Codable, Identifiable {
 final class LibraryModel: ObservableObject {
     static let shared = LibraryModel()
     static var documents: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0] }
-    static var drive: URL {
-        let original = documents.appendingPathComponent("wine", isDirectory: true)
-        let prefix = URL(fileURLWithPath: madeira_process_host_active_prefix(original.path))
-        return prefix.appendingPathComponent("drive_c", isDirectory: true).resolvingSymlinksInPath()
-    }
+    static var drive: URL { documents.appendingPathComponent("wine/drive_c", isDirectory: true).resolvingSymlinksInPath() }
     @Published var enabled = false
     @Published var entries: [LibraryEntry] = []
     @Published var current: UUID?
