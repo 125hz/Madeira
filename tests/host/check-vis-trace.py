@@ -191,7 +191,7 @@ static volatile LONG g_tv_eoff_views, g_sd_strict_waits;
         'static void mad_tvs_touch_locked(struct mad_tvs *t, LONG64 now) {',
         'static obj_handle_t mad_tvs_view(struct mad_device *d, struct mad_resource *r, struct WMTTextureInfo *ti,',
         'static void mad_tvs_touch(struct mad_tvs *t) {', 'static void mad_tvs_drop(struct mad_tvs *t) {',
-        'static void mad_tvs_cmp(struct mad_tvs *t, LONG *n) {', 'static void mad_tvs_refresh(void) {',
+        'static int mad_tvs_cmp(struct mad_tvs *t, LONG *n) {', 'static void mad_tvs_refresh(void) {',
         'static void mad_tvs_forget(struct mad_resource *r) {', 'static void mad_tvs_report(void) {')) + r'''
 /* vis-trace */
 enum { MC_DRAW = 1, MC_DRAW_INDEXED = 2 };
@@ -253,7 +253,9 @@ int main(void) {
     mad_tvs_refresh();
     EXPECT(g_tvs_copies == 1 && g_tvs_cpu[1232] == upmem[2000] && g_tvs_cpu[102] != upmem[106], "many copies: a view looked up again is compared");
     g_presents_now = 31; mad_tvs_refresh();
-    EXPECT(g_tvs_copies == 2 && g_tvs_cpu[102] == upmem[106], "many copies: the first call after a Present compares 4096 of the others, in turn");
+    EXPECT(g_tvs_copies == 2 && g_tvs_cpu[102] == upmem[106],
+           "many copies: the first call after a Present compares the others, in turn (all of them up to 8 MB)");
+    EXPECT(g_tvs_late == 1, "a rewrite only that pass finds (view made 31 presents ago, never looked up) is counted as outside the recent window");
     upmem[4 + 103] ^= 0xff; mad_tvs_refresh();
     EXPECT(g_tvs_copies == 2 && g_tvs_cpu[103] != upmem[107], "many copies: the next calls in the same present compare only the recent ones");
     {   /* a copy made now is compared at the next calls, for 16 presents */
@@ -326,7 +328,7 @@ int main(void) {
     }
     g_tv_eoff_views = 5; loglen = 0; logbuf[0] = 0; mad_tvs_report();
     EXPECT(strstr(logbuf, "[typed-view] views that start off a 16-byte boundary: 5 kept their element offset, ") != NULL &&
-           strstr(logbuf, "given to a new view") != NULL, "the periodic line");
+           strstr(logbuf, "given to a new view") != NULL && strstr(logbuf, " of them outside the recent window (found by the per-present pass)") != NULL, "the periodic line");
     g_tv_eoff_views = 0;
 
     /* vis-trace and readback-far */
