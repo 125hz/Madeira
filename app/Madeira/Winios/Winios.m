@@ -532,14 +532,6 @@ extern int winios_drv_census_owner(HWND hwnd, unsigned int *pid, unsigned int *s
 extern int winios_drv_process_image(unsigned int pid, char *out, unsigned int size);
 extern int winios_drv_post_restore(HWND hwnd);
 extern int winios_drv_foreground_if_owner(HWND hwnd);
-/* ml1300 helper (driver_ios.c; a weak fallback in WiniosWindowed.m returns
- * NULL with an older libwin32u_unix.a). Wine thread. */
-extern void *winios_drv_foreground_window(void);
-
-/* ml1301 desktop game fit (below, after the desktop fit): the foreground
- * window and its style, polled on a Wine thread from winios_pProcessEvents. */
-static void winios_game_fit_poll_wine(void);
-static void winios_game_fit_reset_wine(void);
 
 /* A game's main window can be shown minimized the first time it is shown
  * (ShowWindow cmd 2, parked at -32000,-32000). On Windows the taskbar brings
@@ -929,7 +921,6 @@ BOOL winios_pProcessEvents(DWORD mask) {
     }
     /* ml1300 windowed mode: title-bar commands, tap activation, window text */
     if (winios_windowed_active()) winios_windowed_pump_wine();
-    else winios_game_fit_poll_wine();   /* ml1301: which window a desktop session fits to the screen */
     static unsigned int cnt;
     static int quiet = -1;
     if (quiet < 0) quiet = getenv("MADEIRA_QUIET") != NULL;
@@ -993,15 +984,7 @@ static NSMutableDictionary<NSNumber *, NSValue *> *g_client_rects;      /* hwnd 
 static NSNumber *g_fit_key;
 static CGRect g_fit_client_px;   /* the window's client rect, desktop px */
 static CGRect g_fit_view_pt;     /* where it is shown, compositor-view points */
-/* ml1301 desktop game fit state (winios_game_fit_* below), main thread only.
- * While g_gfit_key is set, g_fit_* above describe that window. */
-static NSNumber *g_gfit_key;     /* the window shown fitted to the whole screen */
-static CALayer *g_gfit_host;     /* black, the whole compositor view, holds its Metal layer */
-static uintptr_t g_gfit_fg;      /* the guest's foreground window (polled) */
-static unsigned g_gfit_fg_style; /* and its style */
 static void winios_place_metal_layer(NSNumber *key);
-static void winios_game_fit_eval(const char *why);
-static void winios_game_fit_off(const char *why);
 static void winios_metal_hud_pick(void);   /* MADEIRA_METAL_HUD_MAIN, below */
 
 /* Surfaces are 128px-aligned (win32u), usually LARGER than the window.
@@ -1178,17 +1161,6 @@ int winios_desktop_point_from_window(double wx, double wy, int *px, int *py) {
         if (py) *py = (int)(g_fit_client_px.origin.y + (wy - f.origin.y - g_fit_view_pt.origin.y) * k);
         return 1;
     }
-    /* ml1301: a window fitted to the whole screen hides the desktop, so a touch
-     * on its letterbox goes to the nearest edge of that window */
-    if (g_gfit_key && g_fit_key && [g_fit_key isEqual:g_gfit_key] && g_fit_view_pt.size.width > 0 &&
-        g_fit_view_pt.size.height > 0) {
-        CGFloat k = g_fit_client_px.size.width / g_fit_view_pt.size.width;
-        CGFloat vx = MIN(MAX(wx - f.origin.x, CGRectGetMinX(g_fit_view_pt)), CGRectGetMaxX(g_fit_view_pt) - 0.5);
-        CGFloat vy = MIN(MAX(wy - f.origin.y, CGRectGetMinY(g_fit_view_pt)), CGRectGetMaxY(g_fit_view_pt) - 0.5);
-        if (px) *px = (int)(g_fit_client_px.origin.x + (vx - g_fit_view_pt.origin.x) * k);
-        if (py) *py = (int)(g_fit_client_px.origin.y + (vy - g_fit_view_pt.origin.y) * k);
-        return 1;
-    }
     double x = (wx - f.origin.x - g_desk_origin.x) / g_px_to_pt;
     double y = (wy - f.origin.y - g_desk_origin.y) / WINIOS_PX_TO_PT_Y;
     if (x < 0) x = 0;
@@ -1249,10 +1221,6 @@ static void winios_drop_compositor(const char *why) {
     [g_metal_layers removeAllObjects];
     [g_client_rects removeAllObjects];
     g_fit_key = nil;
-    g_gfit_key = nil;   /* ml1301: its host goes with the view */
-    g_gfit_host = nil;
-    g_gfit_fg = 0;
-    winios_game_fit_reset_wine();   /* the poll reports the foreground again */
     if (g_comp_windowed) winios_windowed_teardown();   /* ml1300: frames and taskbar */
     g_comp_windowed = NO;
     [g_compositor_view removeFromSuperview];
@@ -1293,7 +1261,6 @@ void winios_note_game_metal_hwnd(void *hwnd) {
         fprintf(stderr, "[winios] game window hwnd=%p presents through Metal; its GDI surface is not drawn\n", hwnd);
         fflush(stderr);
         if (g_comp_game) (void)winios_game_window_shown(key);
-        else winios_game_fit_eval("presents through Metal");   /* ml1301, desktop sessions */
     });
 }
 
@@ -1301,12 +1268,9 @@ void winios_note_game_metal_hwnd(void *hwnd) {
  * starts with no overlay windows and no known Metal windows. */
 void winios_session_reset(void) {
     winios_windowed_reset();   /* ml1300: the switch is read again for the new session */
-    winios_game_fit_reset_wine();   /* ml1301: the new session's foreground is read afresh */
     winios_swapchain_hwnds_reset();   /* [swap-win]: HWND values of the last session mean nothing now */
     dispatch_async(dispatch_get_main_queue(), ^{
         [g_game_metal removeAllObjects];
-        if (g_gfit_key) winios_game_fit_off("new session");
-        g_gfit_fg = 0;
         if (g_comp_game) winios_drop_compositor("new session");
         winios_metal_hud_pick();   /* the window-level layer's HUD follows the session kind */
     });
@@ -1443,9 +1407,6 @@ static void winios_remove_layer(HWND hwnd) {
         if (winios_windowed_active()) winios_windowed_forget(hwnd);   /* its frame and taskbar button */
         if (!g_layers) return;
         NSNumber *key = @((uintptr_t)hwnd);
-        /* ml1301: a window fitted to the screen went away: the desktop again */
-        if (g_gfit_key && [g_gfit_key isEqual:key]) winios_game_fit_off("destroyed");
-        if (g_gfit_fg == (uintptr_t)hwnd) g_gfit_fg = 0;
         CALayer *l = g_layers[key];
         if (l) {
             [l removeFromSuperlayer];
@@ -1496,9 +1457,6 @@ static BOOL winios_desktop_fit(NSNumber *key, CAMetalLayer *ml, CGRect c) {
     CGRect desk = CGRectMake(0, 0, desk_w, desk_h);
     BOOL outside = desk_w > 0 && desk_h > 0 && c.size.width >= 64 && c.size.height >= 64
         && !CGRectContainsRect(CGRectInset(desk, -8, -8), c);
-    /* ml1301: while one window is fitted to the whole screen (below), the
-     * others keep their plain placement under it */
-    if (g_gfit_key && ![g_gfit_key isEqual:key]) return NO;
     /* ml1300 windowed mode: a frame's own zoom and fullscreen button do this */
     if (!winios_desktop_fit_enabled() || g_comp_windowed || !outside || !ml.superlayer || !g_compositor_view) {
         if (g_fit_key && [g_fit_key isEqual:key]) g_fit_key = nil;
@@ -1531,157 +1489,6 @@ static BOOL winios_desktop_fit_map(CGFloat x, CGFloat y, CGPoint *pt, CGFloat *s
     return YES;
 }
 
-/* ml1301 DESKTOP GAME FIT. A desktop session without windowed mode (the Dock
- * and Steam default) fits the whole Wine desktop to the screen, so a game that
- * presents through Metal from a small borderless window (a 640x480 WS_POPUP
- * on a 960x540 desktop) showed as a small picture with the teal desktop
- * around it. While such a window is the guest's foreground window, its Metal
- * layer is instead shown fitted to the whole presentation frame (aspect fit,
- * black letterbox, over the desktop) and touches map into it, as in a game
- * session; the desktop comes back when another window is foreground, or the
- * window is hidden, minimized or destroyed. Which window: the foreground
- * top-level window, presenting through Metal (winios_note_game_metal_hwnd),
- * visible and not minimized, with WS_POPUP or without a full caption.
- * MADEIRA_DESKTOP_GAME_FIT=0 turns it off. */
-#define WINIOS_WS_POPUP      0x80000000u
-#define WINIOS_WS_CHILD      0x40000000u
-#define WINIOS_WS_CAPTION    0x00C00000u
-
-static int winios_game_fit_enabled(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *e = getenv("MADEIRA_DESKTOP_GAME_FIT");   /* 0: a desktop session keeps showing the whole desktop when its foreground window is a borderless window presenting through Metal (on by default: that window fills the screen, letterboxed) */
-        enabled = !(e && e[0] == '0');
-    }
-    return enabled;
-}
-
-static _Atomic long long g_gfit_next_ms;
-static _Atomic(uintptr_t) g_gfit_seen_fg;
-static _Atomic unsigned g_gfit_seen_style;
-static _Atomic int g_gfit_seen_valid;
-
-static void winios_game_fit_foreground(uintptr_t hwnd, unsigned style);
-
-/* Wine thread (any; from winios_pProcessEvents), 4 times a second: the guest's
- * foreground window and its style go to the main thread when they change. */
-static void winios_game_fit_poll_wine(void) {
-    if (!winios_game_fit_enabled() || !winios_desktop_session()) return;
-    long long now = (long long)(winios_now_mono() * 1000.0);
-    long long next = atomic_load(&g_gfit_next_ms);
-    if (now < next || !atomic_compare_exchange_strong(&g_gfit_next_ms, &next, now + 250)) return;
-    HWND fg = (HWND)winios_drv_foreground_window();
-    unsigned int pid = 0, style = 0;
-    if (fg && !winios_drv_census_owner(fg, &pid, &style)) style = 0;   /* gone, or not top-level */
-    uintptr_t prev = atomic_exchange(&g_gfit_seen_fg, (uintptr_t)fg);
-    unsigned prev_style = atomic_exchange(&g_gfit_seen_style, style);
-    int valid = atomic_exchange(&g_gfit_seen_valid, 1);
-    if (valid && prev == (uintptr_t)fg && prev_style == style) return;
-    uintptr_t h = (uintptr_t)fg;
-    unsigned s = style;
-    dispatch_async(dispatch_get_main_queue(), ^{ winios_game_fit_foreground(h, s); });
-}
-
-static void winios_game_fit_reset_wine(void) {
-    atomic_store(&g_gfit_seen_valid, 0);
-    atomic_store(&g_gfit_next_ms, 0);
-}
-
-/* main thread: may `key` be shown fitted to the screen? */
-static BOOL winios_game_fit_eligible(NSNumber *key) {
-    if (!winios_game_fit_enabled() || !g_compositor_view || g_comp_game || g_comp_windowed) return NO;
-    if (!winios_desktop_session()) return NO;
-    if (!key || (uintptr_t)key.unsignedLongLongValue != g_gfit_fg) return NO;
-    unsigned st = g_gfit_fg_style;
-    if (!(st & WINIOS_WS_VISIBLE) || (st & (WINIOS_WS_MINIMIZE | WINIOS_WS_CHILD))) return NO;
-    if (!(st & WINIOS_WS_POPUP) && (st & WINIOS_WS_CAPTION) == WINIOS_WS_CAPTION) return NO;   /* a normal framed window */
-    if (![g_game_metal containsObject:key] || !g_metal_layers[key]) return NO;
-    CALayer *l = g_layers[key];
-    if (!l || l.hidden) return NO;
-    NSValue *cv = g_client_rects[key];
-    if (!cv || cv.CGRectValue.size.width < 64 || cv.CGRectValue.size.height < 64) return NO;
-    return YES;
-}
-
-/* main thread: back to the plain desktop for the fitted window */
-static void winios_game_fit_off(const char *why) {
-    NSNumber *key = g_gfit_key;
-    if (!key) return;
-    g_gfit_key = nil;
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    CAMetalLayer *ml = g_metal_layers[key];
-    CALayer *wl = g_layers[key];
-    if (ml && wl && ml.superlayer != wl) [wl addSublayer:ml];   /* back into its window */
-    else if (ml && !wl) [ml removeFromSuperlayer];
-    g_gfit_host.hidden = YES;
-    if (g_fit_key && [g_fit_key isEqual:key]) g_fit_key = nil;
-    /* every presenting window to its desktop place (or the desktop fit, which
-     * stood down for the others while this one was fitted) */
-    for (NSNumber *other in g_metal_layers.allKeys) winios_place_metal_layer(other);
-    [CATransaction commit];
-    fprintf(stderr, "[winios] ml1301 desktop game fit hwnd=0x%llx off (%s): the whole desktop again\n",
-            key.unsignedLongLongValue, why);
-    fflush(stderr);
-}
-
-/* main thread: re-decides which window (if any) is fitted to the screen */
-static void winios_game_fit_eval(const char *why) {
-    NSNumber *want = g_gfit_fg ? @(g_gfit_fg) : nil;
-    if (want && !winios_game_fit_eligible(want)) want = nil;
-    if (g_gfit_key && !(want && [want isEqual:g_gfit_key])) winios_game_fit_off(why);
-    if (want && !g_gfit_key) {
-        g_gfit_key = want;
-        [CATransaction begin];
-        [CATransaction setDisableActions:YES];
-        winios_place_metal_layer(want);
-        [CATransaction commit];
-    }
-}
-
-static void winios_game_fit_foreground(uintptr_t hwnd, unsigned style) {
-    g_gfit_fg = hwnd;
-    g_gfit_fg_style = style;
-    winios_game_fit_eval("foreground changed");
-}
-
-/* main thread, from winios_place_metal_layer: shows `key`'s Metal layer fitted
- * to the whole compositor view when it is the fitted window. */
-static BOOL winios_game_fit_place(NSNumber *key, CAMetalLayer *ml, CGRect c) {
-    if (!g_gfit_key || ![g_gfit_key isEqual:key] || !g_compositor_view) return NO;
-    if (c.size.width <= 0 || c.size.height <= 0) return NO;
-    CALayer *root = g_compositor_view.layer;
-    if (!g_gfit_host) {
-        g_gfit_host = [CALayer layer];
-        g_gfit_host.anchorPoint = CGPointZero;
-        g_gfit_host.backgroundColor = UIColor.blackColor.CGColor;
-        g_gfit_host.opaque = YES;
-        g_gfit_host.zPosition = 9000;   /* over every window layer, under the cursor (10000) */
-    }
-    if (g_gfit_host.superlayer != root) [root addSublayer:g_gfit_host];
-    CGRect b = root.bounds;
-    g_gfit_host.frame = b;
-    g_gfit_host.hidden = NO;
-    if (ml.superlayer != g_gfit_host) [g_gfit_host addSublayer:ml];
-    CGFloat k = MIN(b.size.width / c.size.width, b.size.height / c.size.height);
-    CGSize sz = CGSizeMake(c.size.width * k, c.size.height * k);
-    CGRect view = CGRectMake((b.size.width - sz.width) / 2, (b.size.height - sz.height) / 2, sz.width, sz.height);
-    ml.frame = view;   /* the host's coordinates are the view's */
-    BOOL changed = !g_fit_key || ![g_fit_key isEqual:key] || !CGRectEqualToRect(g_fit_client_px, c) ||
-                   !CGRectEqualToRect(g_fit_view_pt, view);
-    g_fit_key = key; g_fit_client_px = c; g_fit_view_pt = view;
-    static unsigned logged;
-    if (changed && logged < 32) {
-        logged++;
-        fprintf(stderr, "[winios] ml1301 desktop game fit hwnd=0x%llx %.0fx%.0f -> rect (%.1f,%.1f %.1fx%.1f) "
-                "in %.0fx%.0f pt (env.MADEIRA_DESKTOP_GAME_FIT=0 disables)\n",
-                key.unsignedLongLongValue, c.size.width, c.size.height,
-                view.origin.x, view.origin.y, view.size.width, view.size.height, b.size.width, b.size.height);
-        fflush(stderr);
-    }
-    return YES;
-}
-
 /* main thread only — frame the metal sublayer to the client rect in the
  * parent (window) layer's coordinate space. Parent bounds are the window
  * rect in points, so client offset = (client_px - window_px) * scale. */
@@ -1691,7 +1498,6 @@ static void winios_place_metal_layer(NSNumber *key) {
     NSValue *wv = g_px_rects[key], *cv = g_client_rects[key];
     if (!wv || !cv) return;
     CGRect w = wv.CGRectValue, c = cv.CGRectValue;
-    if (winios_game_fit_place(key, ml, c)) return;   /* ml1301: fitted to the whole screen */
     CGFloat s = g_px_to_pt;
     ml.frame = CGRectMake((c.origin.x - w.origin.x) * s,
                           (c.origin.y - w.origin.y) * WINIOS_PX_TO_PT_Y,
@@ -2004,9 +1810,6 @@ void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
         winios_place_metal_layer(key);
         [CATransaction commit];
         if (g_comp_windowed) winios_windowed_place(hwnd, l, x, y, w, h, visible);   /* into its frame */
-        /* ml1301: the foreground window was shown, hidden or resized */
-        else if (!g_comp_game && (g_gfit_fg == (uintptr_t)hwnd || (g_gfit_key && [g_gfit_key isEqual:key])))
-            winios_game_fit_eval(visible ? "window changed" : "window hidden");
         winios_sync_metal_hidden(key, l);
         winios_swap_layer_note(key, "window frame");
         winios_game_cursor_refresh();
