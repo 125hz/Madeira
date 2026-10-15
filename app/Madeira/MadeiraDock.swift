@@ -226,7 +226,7 @@ enum MadeiraDock {
             guard let result, result != 0 else { return nil }
             if result == 30 {
                 if fields["session-unsupported-client"] == "1" || fields["session-user-method-mismatch"] != nil {
-                    return "Madeira Dock does not support this Steam client build. Dock only drives client builds it has verified; the log has the client fingerprint and the failed check. If Steam's full client was installed into Dock's folder, use Repair Madeira Dock's Steam files (Settings › Steam › Madeira Dock)."
+                    return "Madeira Dock does not support this Steam client build. Dock only drives client builds it has verified; the log has the client fingerprint and the failed check."
                 }
                 return "Madeira Dock could not initialize the Steam session (code 30). Export the log to identify the failed check."
             }
@@ -380,11 +380,6 @@ enum MadeiraDock {
             let lines = String(decoding: data, as: UTF8.self).split(separator: "\n").filter { $0.hasPrefix("[steam-host] ") }
             SteamLog.event("[dock-report-file] lines=\(lines.count)")
             for line in lines.prefix(400) { SteamLog.event("[dock-report-file] " + line.trimmingCharacters(in: .whitespacesAndNewlines)) }
-        }
-        // ml1371: another client build in Dock's folder: offer the repair (SteamDockRepair, WindowedMode.swift).
-        if report.fields["session-unsupported-client"] == "1", lastReport.fields["session-unsupported-client"] != "1",
-           let sha = report.fields["client-sha256"] {
-            SteamDockRepair.offerAfterReport(clientSHA256: sha)
         }
         lastReport = report
         return report
