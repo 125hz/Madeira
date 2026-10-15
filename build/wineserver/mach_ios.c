@@ -49,129 +49,8 @@
 #include <mach/thread_act.h>
 #include <mach/mach_vm.h>
 #include <servers/bootstrap.h>
-#include <dlfcn.h>
-#include <pthread.h>
 
 static mach_port_t server_mach_port;
-
-/* ================= ml1330 REMOTE PROCESSES (app-extension processes) =================
- *
- * docs/PROCESS_HOST.md, docs/NUTSEMU_ANALYSIS.md section 4c steps 4-5.
- *
- * Every Wine process Madeira has ever run lives in the app's own Mach task:
- * the whole server-side debugger support above takes `thread->unix_tid` (a
- * value from mach_thread_self()) to be a port NAME in mach_task_self()'s own
- * IPC space, and reads/writes client memory through mach_task_self(). A Wine
- * process Madeira runs in an app extension (MadeiraProcessHost) has its threads
- * and its address space in ANOTHER task. Two things change for such a process:
- *
- *  - MEMORY is real and direct: the extension sends a send right to its own
- *    task port over XPC, the app registers it here, and read/write_process_memory
- *    use mach_vm_read_overwrite / mach_vm_write on that remote port. Nothing else
- *    is needed for cross-process memory; the task port is sufficient.
- *
- *  - THREAD control (suspend/resume, native register get/set, POSIX signal) needs
- *    a THREAD port, and a remote thread's unix_tid is a name in the EXTENSION's
- *    space, meaningless here. The competitor routes these through the host
- *    (their patches 0040/0042: wine_host_signal_thread, the host asks the
- *    extension to act on its own thread). Madeira does the same: the app exports
- *    wine_host_signal_thread / wine_host_read_process_memory etc. via dlsym.
- *    Phase 1 ships the task-port MEMORY path as real and leaves thread control
- *    as a host-routed call; when the host hook is absent it fails with a logged
- *    [ext-proc] line rather than operating on a wrong port (patch 0039's crash).
- *
- * A remote process is one whose server-side unix_pid is not the app's getpid().
- * We never set such a process's trace_data to our own task (patch 0039: that
- * killed the app with EXC_GUARD when thread_policy_set ran on a bogus port), so
- * apply_thread_priority / get_process_port keep returning 0 for it and the
- * remote branches below take over.
- *
- * The registry is written by the app's launch thread (ProcessHostClient.m,
- * through WineServerBridge) and read by the wineserver thread, so it is small,
- * fixed and mutex-guarded. Disabled wholesale from the app (env MADEIRA_EXT_PROCESS=0);
- * with nothing registered every function below behaves exactly as before. */
-#define IOS_MAX_REMOTE_TASKS 8
-static struct { int unix_pid; mach_port_t task; } ios_remote_tasks[IOS_MAX_REMOTE_TASKS];
-static pthread_mutex_t ios_remote_tasks_lock = PTHREAD_MUTEX_INITIALIZER;
-
-/* Register (or replace) the task port the app received from a process-host
- * extension whose Wine client reports unix_pid. The port is a send right the
- * server keeps for the life of the process. Returns 1 on success. Called from
- * the app via WineServerBridge (ios_remote_task_register). */
-int ios_remote_task_register( int unix_pid, mach_port_t task )
-{
-    int i, slot = -1;
-    if (unix_pid <= 0 || task == MACH_PORT_NULL || task == MACH_PORT_DEAD) return 0;
-    pthread_mutex_lock( &ios_remote_tasks_lock );
-    for (i = 0; i < IOS_MAX_REMOTE_TASKS; i++)
-    {
-        if (ios_remote_tasks[i].unix_pid == unix_pid) { slot = i; break; }
-        if (slot < 0 && ios_remote_tasks[i].unix_pid == 0) slot = i;
-    }
-    if (slot >= 0)
-    {
-        if (ios_remote_tasks[slot].task && ios_remote_tasks[slot].task != task)
-            mach_port_deallocate( mach_task_self(), ios_remote_tasks[slot].task );
-        ios_remote_tasks[slot].unix_pid = unix_pid;
-        ios_remote_tasks[slot].task = task;
-    }
-    pthread_mutex_unlock( &ios_remote_tasks_lock );
-    fprintf( stderr, "[ext-proc] ml1330 server: %s remote task for pid=%d port=0x%x\n",
-             slot >= 0 ? "registered" : "NO SLOT for", unix_pid, (unsigned)task );
-    return slot >= 0;
-}
-
-void ios_remote_task_unregister( int unix_pid )
-{
-    int i;
-    pthread_mutex_lock( &ios_remote_tasks_lock );
-    for (i = 0; i < IOS_MAX_REMOTE_TASKS; i++)
-        if (ios_remote_tasks[i].unix_pid == unix_pid)
-        {
-            if (ios_remote_tasks[i].task) mach_port_deallocate( mach_task_self(), ios_remote_tasks[i].task );
-            ios_remote_tasks[i].unix_pid = 0;
-            ios_remote_tasks[i].task = MACH_PORT_NULL;
-        }
-    pthread_mutex_unlock( &ios_remote_tasks_lock );
-}
-
-/* The registered remote task port for a unix_pid, or MACH_PORT_NULL. */
-static mach_port_t ios_remote_task_for_pid( int unix_pid )
-{
-    mach_port_t task = MACH_PORT_NULL;
-    int i;
-    if (unix_pid <= 0) return MACH_PORT_NULL;
-    pthread_mutex_lock( &ios_remote_tasks_lock );
-    for (i = 0; i < IOS_MAX_REMOTE_TASKS; i++)
-        if (ios_remote_tasks[i].unix_pid == unix_pid) { task = ios_remote_tasks[i].task; break; }
-    pthread_mutex_unlock( &ios_remote_tasks_lock );
-    return task;
-}
-
-/* A process whose threads live in another iOS task (an extension). */
-static int ios_process_is_remote( struct process *process )
-{
-    return process && process->unix_pid != -1 && process->unix_pid != getpid() &&
-           ios_remote_task_for_pid( process->unix_pid ) != MACH_PORT_NULL;
-}
-
-/* Host hook (app exports it): ask the extension to signal one of its own
- * threads. Phase 1 ships this as a stub in the app; see PROCESS_HOST.md. */
-static int ios_host_signal_remote_thread( int unix_pid, int unix_tid, int sig )
-{
-    static int (*host_signal)( int, int, int );
-    static int looked;
-    if (!looked) { host_signal = dlsym( RTLD_DEFAULT, "wine_host_signal_thread" ); looked = 1; }
-    if (!host_signal)
-    {
-        static int warned;
-        if (warned++ < 8)
-            fprintf( stderr, "[ext-proc] ml1330 server: no wine_host_signal_thread; cannot signal "
-                     "remote tid=%04x of pid=%d (thread control is host-routed, phase 2)\n", unix_tid, unix_pid );
-        return -1;
-    }
-    return host_signal( unix_pid, unix_tid, sig );   /* 0 on success, like the competitor's hook */
-}
 
 void sigchld_callback(void)
 {
@@ -500,16 +379,6 @@ int send_thread_signal( struct thread *thread, int sig )
     int ret = -1;
     mach_port_t process_port = get_process_port( thread->process );
 
-    /* ml1330: a thread in another iOS task has no port name here; route to the
-     * host, which asks the extension to signal its own thread (competitor 0040). */
-    if (!process_port && ios_process_is_remote( thread->process ))
-    {
-        if (!ios_host_signal_remote_thread( thread->unix_pid, thread->unix_tid, sig )) ret = 0;
-        if (debug_level && ret != -1)
-            fprintf( stderr, "%04x: *sent signal* signal=%d (remote, through the host)\n", thread->id, sig );
-        return (ret != -1);
-    }
-
     if (thread->unix_pid != -1 && process_port)
     {
         mach_msg_type_name_t type;
@@ -605,28 +474,14 @@ int send_thread_signal( struct thread *thread, int sig )
 #define IOS_A64_FLTSAVE 0x100
 #define IOS_A64_CTXLEN  0x4d0            /* full AMD64 CONTEXT */
 
-/* ml1330: the task to read a thread's TEB-side state from. For a local thread
- * that is mach_task_self(); for a thread in an extension it is the registered
- * remote task port, and the read crosses tasks (the task port is enough). */
-static mach_port_t ios_thread_read_task( struct thread *thread )
-{
-    mach_port_t remote = ios_remote_task_for_pid( thread->process->unix_pid );
-    return remote != MACH_PORT_NULL ? remote : mach_task_self();
-}
-
-static int ios_safe_read_task( mach_port_t task, uint64_t addr, void *buf, unsigned int size )
+static int ios_safe_read( uint64_t addr, void *buf, unsigned int size )
 {
     mach_vm_size_t got = 0;
     if (!addr) return 0;
-    if (mach_vm_read_overwrite( task, (mach_vm_address_t)addr,
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)addr,
                                 (mach_vm_size_t)size, (mach_vm_address_t)buf, &got ))
         return 0;
     return got == size;
-}
-
-static int ios_safe_read( uint64_t addr, void *buf, unsigned int size )
-{
-    return ios_safe_read_task( mach_task_self(), addr, buf, size );
 }
 
 /* ================= ml730 REAL THREAD SUSPENSION (opt-in) =================
@@ -712,18 +567,6 @@ int ios_thread_mach_hold( struct thread *thread )
     if (!ios_real_suspend_enabled()) return 0;
     if (!rs_flag_ok( thread, "hold" )) return 0;
     if (thread->ios_mach_suspended) return 1;          /* nested: counter only */
-    /* ml1330: a remote thread cannot be thread_suspend()ed from here (no port
-     * name); a persistent hold would be host-routed (phase 2). Refuse rather
-     * than suspend the wrong thread. Remote processes run on plain server sync,
-     * so MADEIRA_REAL_SUSPEND is not expected for them anyway. */
-    if (ios_process_is_remote( thread->process ))
-    {
-        static int warned;
-        if (warned++ < 8)
-            fprintf( stderr, "[ext-proc] ml1330 server: real-suspend hold skipped for remote tid=%04x "
-                     "(host-routed, phase 2)\n", thread->id );
-        return 0;
-    }
     if (thread->unix_pid == -1 || thread->unix_tid == (unsigned int)-1) return 0;
     if (mach_port_extract_right( mach_task_self(), thread->unix_tid,
                                  MACH_MSG_TYPE_COPY_SEND, &port, &type ))
@@ -752,8 +595,6 @@ int ios_thread_mach_release( struct thread *thread )
     if (!rs_flag_ok( thread, "release" )) return 0;
     if (!thread->ios_mach_suspended) return 0;
     thread->ios_mach_suspended = 0;                    /* clear first: never double-release */
-    /* ml1330: remote holds are never taken here (see ios_thread_mach_hold). */
-    if (ios_process_is_remote( thread->process )) return 0;
     if (thread->unix_pid == -1 || thread->unix_tid == (unsigned int)-1) return 0;
     if (mach_port_extract_right( mach_task_self(), thread->unix_tid,
                                  MACH_MSG_TYPE_COPY_SEND, &port, &type ))
@@ -1044,64 +885,6 @@ int ios_fill_thread_context( struct thread *thread,
     int have_native = 0;
 
     if (thread->unix_pid == -1 || thread->unix_tid == (unsigned int)-1) return 0;
-
-    /* ml1330: a thread in an extension task. We have no port NAME for it here,
-     * so thread_get_state (the native ARM64 regs) is host-routed (phase 2). But
-     * the guest x86-64 context lives in that thread's TEB->ChpeV2CpuAreaInfo->
-     * ContextAmd64, which the registered remote task port lets us read directly.
-     * Fill the guest side from it and return captured, so a GetThreadContext on
-     * a remote thread completes instead of waiting forever. The native side is
-     * left empty (flags 0); the EC wrapper that wants native regs on a remote
-     * thread is the phase-2 host-routed path. */
-    if (ios_process_is_remote( thread->process ))
-    {
-        mach_port_t rtask = ios_remote_task_for_pid( thread->process->unix_pid );
-        uint64_t cpuarea = 0, ctx64 = 0;
-        unsigned char ctx[IOS_A64_CTXLEN];
-        static int n_remote;
-        if (n_remote++ < 16)
-            fprintf( stderr, "[ext-proc] ml1330 server: remote context tid=%04x pid=%d teb=%p "
-                     "(guest regs via task port; native regs host-routed)\n",
-                     thread->id, thread->process->unix_pid, (void *)(uintptr_t)thread->teb );
-        if (!wow || !thread->teb || rtask == MACH_PORT_NULL) return 0;
-        wow->machine = thread->process->machine;
-        if (ios_safe_read_task( rtask, (uint64_t)thread->teb + IOS_TEB_CHPE_CPUAREA_OFF, &cpuarea, 8 ) && cpuarea &&
-            ios_safe_read_task( rtask, cpuarea + IOS_CPUAREA_CTX64_OFF, &ctx64, 8 ) && ctx64 &&
-            ios_safe_read_task( rtask, ctx64, ctx, sizeof(ctx) ))
-        {
-            wow->flags |= SERVER_CTX_CONTROL | SERVER_CTX_INTEGER | SERVER_CTX_SEGMENTS |
-                          SERVER_CTX_FLOATING_POINT;
-            wow->ctl.x86_64_regs.rip   = *(uint64_t *)(ctx + IOS_A64_RIP);
-            wow->ctl.x86_64_regs.rsp   = *(uint64_t *)(ctx + IOS_A64_RSP);
-            wow->ctl.x86_64_regs.cs    = *(uint16_t *)(ctx + IOS_A64_SEGCS);
-            wow->ctl.x86_64_regs.ss    = *(uint16_t *)(ctx + IOS_A64_SEGSS);
-            wow->ctl.x86_64_regs.flags = *(uint32_t *)(ctx + IOS_A64_EFLAGS);
-            wow->integer.x86_64_regs.rax = *(uint64_t *)(ctx + IOS_A64_RAX);
-            wow->integer.x86_64_regs.rbx = *(uint64_t *)(ctx + IOS_A64_RBX);
-            wow->integer.x86_64_regs.rcx = *(uint64_t *)(ctx + IOS_A64_RCX);
-            wow->integer.x86_64_regs.rdx = *(uint64_t *)(ctx + IOS_A64_RDX);
-            wow->integer.x86_64_regs.rbp = *(uint64_t *)(ctx + IOS_A64_RBP);
-            wow->integer.x86_64_regs.rsi = *(uint64_t *)(ctx + IOS_A64_RSI);
-            wow->integer.x86_64_regs.rdi = *(uint64_t *)(ctx + IOS_A64_RDI);
-            wow->integer.x86_64_regs.r8  = *(uint64_t *)(ctx + IOS_A64_R8);
-            wow->integer.x86_64_regs.r9  = *(uint64_t *)(ctx + IOS_A64_R9);
-            wow->integer.x86_64_regs.r10 = *(uint64_t *)(ctx + IOS_A64_R10);
-            wow->integer.x86_64_regs.r11 = *(uint64_t *)(ctx + IOS_A64_R11);
-            wow->integer.x86_64_regs.r12 = *(uint64_t *)(ctx + IOS_A64_R12);
-            wow->integer.x86_64_regs.r13 = *(uint64_t *)(ctx + IOS_A64_R13);
-            wow->integer.x86_64_regs.r14 = *(uint64_t *)(ctx + IOS_A64_R14);
-            wow->integer.x86_64_regs.r15 = *(uint64_t *)(ctx + IOS_A64_R15);
-            wow->seg.x86_64_regs.ds = *(uint16_t *)(ctx + IOS_A64_SEGDS);
-            wow->seg.x86_64_regs.es = *(uint16_t *)(ctx + IOS_A64_SEGES);
-            wow->seg.x86_64_regs.fs = *(uint16_t *)(ctx + IOS_A64_SEGFS);
-            wow->seg.x86_64_regs.gs = *(uint16_t *)(ctx + IOS_A64_SEGGS);
-            memcpy( wow->fp.x86_64_regs.fpregs, ctx + IOS_A64_FLTSAVE,
-                    sizeof(wow->fp.x86_64_regs.fpregs) );
-            return 1;
-        }
-        return 0;   /* CPU area not readable yet: leave PENDING, as for a local early thread */
-    }
-
     if (mach_port_extract_right( mach_task_self(), thread->unix_tid,
                                  MACH_MSG_TYPE_COPY_SEND, &port, &type ))
         return 0;
@@ -1330,13 +1113,6 @@ int read_process_memory( struct process *process, client_ptr_t ptr, data_size_t 
         }
         if (!local_read_off) process_port = mach_task_self();
     }
-    /* ml1330: a process in an extension task — read through the registered remote
-     * task port (the task-port path is real; no host round trip needed for memory). */
-    if (!process_port)
-    {
-        mach_port_t rtask = ios_remote_task_for_pid( process->unix_pid );
-        if (rtask != MACH_PORT_NULL) process_port = rtask;
-    }
 #endif
 
     if (!process_port)
@@ -1364,18 +1140,6 @@ int write_process_memory( struct process *process, client_ptr_t ptr, data_size_t
     mach_vm_offset_t data;
 
     if (written) *written = 0;
-
-#ifdef WINE_IOS
-    /* ml1330: a process in an extension task — write through its registered task
-     * port. Unlike the local in-task case (where writes stayed denied for safety),
-     * a remote task is a genuinely separate address space, so the historical
-     * "some caller depends on the ACCESS_DENIED no-op" hazard does not apply. */
-    if (!process_port)
-    {
-        mach_port_t rtask = ios_remote_task_for_pid( process->unix_pid );
-        if (rtask != MACH_PORT_NULL) process_port = rtask;
-    }
-#endif
 
     if (!process_port)
     {
