@@ -4677,11 +4677,6 @@ static int init_thread_pipe(void)
 }
 
 
-#ifdef WINE_IOS
-/* ml1334: see shims/wine_ios_exit.h. Set only by the process-host extension. */
-void (*volatile wine_ios_exit_observer)(int status) = NULL;
-#endif
-
 /***********************************************************************
  *           process_exit_wrapper
  *

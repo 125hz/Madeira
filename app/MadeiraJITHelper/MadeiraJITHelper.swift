@@ -43,18 +43,6 @@ private enum StikJIT {
 }
 #endif
 
-/// ml1334: the newest six lines the JIT script logged (each cut to 200 characters).
-private final class ScriptTail: @unchecked Sendable {
-    private let lock = NSLock()
-    private var lines: [String] = []
-    func add(_ line: String) {
-        lock.lock(); defer { lock.unlock() }
-        lines.append(String(line.prefix(200)))
-        if lines.count > 6 { lines.removeFirst(lines.count - 6) }
-    }
-    var text: String { lock.lock(); defer { lock.unlock() }; return lines.joined(separator: " | ") }
-}
-
 private enum MadeiraJITWork {
     /// One request at a time, as the XPC handler ran them before.
     static let queue = DispatchQueue(label: "com.willfaust.madeora.jit-helper")
@@ -108,11 +96,6 @@ private enum MadeiraJITWork {
                                   userInfo: [NSLocalizedDescriptionKey:
                                     "The target process or Madeira JIT script was not provided."])
                 }
-                // ml1334: the script's last lines go back to Madeira with the result. Its loop
-                // ends on the target's exit stop packet ("inferior exited (W..)" = exit status,
-                // "(X..)" = the signal that ended it), on its own kill after undeliverable
-                // faults, or on a detach, so Madeira's log names how a debugged process ended.
-                let tail = ScriptTail()
                 try StikJIT.enableJIT(
                     targetPID: targetPID,
                     pairingFile: pairingURL,
@@ -122,14 +105,9 @@ private enum MadeiraJITWork {
                     preparationProgress: {
                         NSLog("[MadeiraJIT] prepare: %@", String(describing: $0))
                     },
-                    progress: { line in
-                        NSLog("[MadeiraJIT] %@", line)
-                        tail.add(line)
-                    })
-                let lines = tail.text
+                    progress: { NSLog("[MadeiraJIT] %@", $0) })
                 return .init(success: true,
-                             message: "Madeira detached cleanly from its built-in JIT helper." +
-                                (lines.isEmpty ? "" : " Script tail: " + lines),
+                             message: "Madeira detached cleanly from its built-in JIT helper.",
                              txmPresent: StikJIT.isTXMPresent)
             case .resetDDI, .probe:
                 preconditionFailure("Handled above")

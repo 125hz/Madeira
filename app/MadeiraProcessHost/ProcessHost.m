@@ -24,7 +24,6 @@
 #import <objc/runtime.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <execinfo.h>
-#import <dlfcn.h>
 #import <signal.h>
 #import <stdarg.h>
 #import <sys/ucontext.h>
@@ -114,29 +113,17 @@ static NSString *ph_open_log(NSURL *container, NSString *ownDocs) {
     return fd >= 0 ? path : nil;
 }
 
-// ml1334: the newest Wine start-up step (loader_ios.c ios_boot_mark), for the heartbeat,
-// the exit observer and the crash lines.
-extern const char *volatile ios_boot_stage;
-static const char *ph_boot_stage(void) { const char *s = ios_boot_stage; return s && *s ? s : "(before __wine_main)"; }
-
 // Fatal signals before Wine's own handlers exist. ntdll's signal init (signal_arm64_ios.c)
 // replaces SIGSEGV/SIGBUS/SIGABRT/SIGILL/SIGTRAP/SIGFPE with Wine's handlers, whose fault
 // output then lands in this same file. Async-signal-safe output only, then the default action.
-// ml1334: also every signal whose default action ends the process without a word (Wine
-// later installs its own SIGINT/SIGQUIT/SIGUSR1/SIGUSR2 and ignores SIGPIPE), and the
-// handlers run on the thread's alternate stack, so a stack overflow is reported too.
-static const int ph_fatal_signals[] = { SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGTRAP, SIGFPE, SIGSYS,
-                                        SIGPIPE, SIGUSR1, SIGUSR2, SIGQUIT, SIGINT, SIGTERM, SIGHUP,
-                                        SIGALRM, SIGVTALRM, SIGPROF, SIGXCPU, SIGXFSZ, SIGEMT };
+static const int ph_fatal_signals[] = { SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGTRAP, SIGFPE };
 static void ph_fatal_signal(int sig, siginfo_t *info, void *context) {
-    char buf[384];
+    char buf[256];
     unsigned long long pc = 0;
     ucontext_t *uc = context;
     if (uc && uc->uc_mcontext) pc = (unsigned long long)__darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss);
-    int n = snprintf(buf, sizeof buf, "[ext-crash] ml1333 signal %d addr=%p pc=0x%llx code=%d sender pid=%d "
-                     "thread mach id %u, boot step %s; backtrace:\n",
-                     sig, info ? info->si_addr : NULL, pc, info ? info->si_code : 0, info ? info->si_pid : 0,
-                     pthread_mach_thread_np(pthread_self()), ph_boot_stage());
+    int n = snprintf(buf, sizeof buf, "[ext-crash] ml1333 signal %d addr=%p pc=0x%llx code=%d thread mach id %u; backtrace:\n",
+                     sig, info ? info->si_addr : NULL, pc, info ? info->si_code : 0, pthread_mach_thread_np(pthread_self()));
     if (n > 0) write(STDERR_FILENO, buf, (size_t)MIN(n, (int)sizeof buf - 1));
     void *frames[32];
     int count = backtrace(frames, 32);
@@ -158,7 +145,7 @@ static void ph_install_crash_handlers(void) {
     struct sigaction action;
     memset(&action, 0, sizeof action);
     action.sa_sigaction = ph_fatal_signal;
-    action.sa_flags = SA_SIGINFO | SA_RESETHAND | SA_ONSTACK;
+    action.sa_flags = SA_SIGINFO | SA_RESETHAND;
     sigemptyset(&action.sa_mask);
     for (size_t i = 0; i < sizeof ph_fatal_signals / sizeof ph_fatal_signals[0]; i++)
         sigaction(ph_fatal_signals[i], &action, NULL);
@@ -208,50 +195,16 @@ static void ph_log_start_milestones(int argc, char **argv) {
            fd, fd >= 0 && fcntl(fd, F_GETFD) != -1, getenv("MADEIRA_DESKTOP") ?: "(unset)",
            getenv("MADEIRA_FASTSYNC") ?: "(unset)", ph_footprint() >> 20, (size_t)os_proc_available_memory() >> 20,
            ph_thread_count());
-    // ml1334: until the process ends (dense at first, then every 10 s, after 2 min every
-    // 60 s), with the newest Wine start-up step, so the last line brackets any death.
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        static const unsigned marks[] = { 50, 100, 200, 300, 400, 600, 800, 1200, 1600, 2400, 3200, 4800, 6400 };
+        static const unsigned marks[] = { 50, 100, 200, 400, 800, 1600, 3200, 6400 };
         double t0 = CACurrentMediaTime();
-        for (unsigned i = 0, ms = 0;; i++) {
-            ms = i < sizeof marks / sizeof marks[0] ? marks[i] : ms < 10000 ? 10000 : ms + (ms < 120000 ? 10000 : 60000);
-            double wait = t0 + ms / 1000.0 - CACurrentMediaTime();
+        for (size_t i = 0; i < sizeof marks / sizeof marks[0]; i++) {
+            double wait = t0 + marks[i] / 1000.0 - CACurrentMediaTime();
             if (wait > 0) usleep((useconds_t)(wait * 1e6));
-            ph_log("ml1333 alive +%ums footprint=%lluMB available=%zuMB threads=%u step=%s", ms, ph_footprint() >> 20,
-                   (size_t)os_proc_available_memory() >> 20, ph_thread_count(), ph_boot_stage());
+            ph_log("ml1333 alive +%ums footprint=%lluMB available=%zuMB threads=%u", marks[i], ph_footprint() >> 20,
+                   (size_t)os_proc_available_memory() >> 20, ph_thread_count());
         }
     });
-}
-
-#pragma mark - ml1334 exit diagnostics
-
-// Every exit the Wine Unix side takes goes through the exit() shim (shims/wine_ios_exit.h),
-// which calls this before it longjmps to ph_wine_thread or ends the calling thread. The
-// caller is the frame after the observer (the shim is inlined into it); the image offset symbolicates
-// against the unstripped extension binary when dladdr has no name.
-__attribute__((noinline)) static void ph_log_backtrace(const char *why, int skip) {
-    void *frames[32];
-    int count = backtrace(frames, 32);
-    Dl_info info;
-    const char *caller = "?";
-    uintptr_t offset = 0, image = 0;
-    if (count > skip && dladdr(frames[skip], &info)) {
-        if (info.dli_sname) { caller = info.dli_sname; offset = (uintptr_t)frames[skip] - (uintptr_t)info.dli_saddr; }
-        image = (uintptr_t)frames[skip] - (uintptr_t)info.dli_fbase;
-    }
-    ph_log("[ext-proc] ml1334 %s from %s+0x%lx (image offset 0x%lx), thread mach id %u, boot step %s; backtrace:",
-           why, caller, (unsigned long)offset, (unsigned long)image, pthread_mach_thread_np(pthread_self()), ph_boot_stage());
-    if (count > skip) backtrace_symbols_fd(frames + skip, count - skip, STDERR_FILENO);
-}
-static void ph_exit_observer(int status) {
-    char why[48];
-    snprintf(why, sizeof why, "exit(%d)", status);
-    ph_log_backtrace(why, 2);   // frames: 0 ph_log_backtrace, 1 this observer, 2 the exit() caller
-}
-// libc exit() itself (code outside Wine's shim, or the extension runtime ending the process);
-// exit's caller is a frame or two below libc's atexit runner in the backtrace.
-static void ph_atexit(void) {
-    ph_log_backtrace("libc exit(): the extension process is ending", 2);
 }
 
 static uint64_t ph_footprint(void) {
@@ -413,11 +366,6 @@ static void *ph_control_thread(void *arg) {
     ph_install_crash_handlers();
     ph_log("ml1333 extension pid=%d log=%s; crash handlers installed until ntdll installs its own",
            getpid(),log.UTF8String ?: "(none)");
-    // ml1334: name every exit (Wine's shimmed exit() and libc's own) in this log.
-    extern void (*volatile wine_ios_exit_observer)(int);
-    wine_ios_exit_observer = ph_exit_observer;
-    static dispatch_once_t atexitOnce;
-    dispatch_once(&atexitOnce, ^{ atexit(ph_atexit); });
     setenv("MADEIRA_DOCS_DIR",ownDocs.UTF8String,1);
     size_t cfgSize=0; const void *cfg=xpc_dictionary_get_data(info,"cfg",&cfgSize);
     if(cfg && cfgSize<=65536) [[NSData dataWithBytes:cfg length:cfgSize] writeToFile:[ownDocs stringByAppendingPathComponent:@"madeira.cfg"] atomically:YES];
@@ -436,24 +384,6 @@ static void *ph_control_thread(void *arg) {
     setenv("HOME", prefix, 1);
     setenv("WINELOADERNOEXEC", "1", 1);
     if (bundle && *bundle) setenv("WINEDLLPATH", bundle, 1);
-    // ml1334: Wine's data directory (nls/, the PE sets, apisetschema) is the HOST APP's
-    // bundle. ntdll used its running image's directory, which here is this .appex, so
-    // every nls table failed to load (log 101). loader_ios.c honours MADEIRA_BUNDLE_DIR
-    // first; the app sends its bundle path, else this extension's containing bundle.
-    {
-        NSString *own = NSBundle.mainBundle.bundlePath, *dir = nil, *source = @"from the app";
-        if (bundle && *bundle) dir = @(bundle);
-        else if ([own.pathExtension isEqualToString:@"appex"] &&
-                 [own.stringByDeletingLastPathComponent.lastPathComponent isEqualToString:@"PlugIns"]) {
-            dir = own.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent;
-            source = @"this extension's containing bundle";
-        }
-        BOOL nlsDir = NO;
-        BOOL found = dir && [NSFileManager.defaultManager fileExistsAtPath:[dir stringByAppendingPathComponent:@"nls"] isDirectory:&nlsDir] && nlsDir;
-        if (dir) setenv("MADEIRA_BUNDLE_DIR", dir.UTF8String, 1);
-        ph_log("[ext-proc] ml1334 bundle dir for Wine: %s (%s) nls/=%s", dir.UTF8String ?: "(none)",
-               source.UTF8String, found ? "present" : "MISSING");
-    }
     if (nls && *nls) wineserver_set_nls_dir(nls);
     char fds[16]; snprintf(fds, sizeof fds, "%d", _serverFD);
     setenv("WINESERVERSOCKET", fds, 1);
@@ -468,8 +398,7 @@ static void *ph_control_thread(void *arg) {
             const char *s = xpc_string_get_string_ptr(v);
             if (s && strncmp(s,"WINE_IOS_JIT_",13) && strncmp(s,"WINESERVERSOCKET=",17) &&
                 strncmp(s,"WINE_IOS_FD_SOCKET=",19) && strncmp(s,"MADEIRA_EXT_PROCESS_ROLE=",24) &&
-                strncmp(s,"WINEPREFIX=",11) && strncmp(s,"HOME=",5) && strncmp(s,"MADEIRA_DOCS_DIR=",17) &&
-                strncmp(s,"MADEIRA_BUNDLE_DIR=",19)) { char *eq = strchr(s, '='); if (eq) { char k[128];
+                strncmp(s,"WINEPREFIX=",11) && strncmp(s,"HOME=",5) && strncmp(s,"MADEIRA_DOCS_DIR=",17)) { char *eq = strchr(s, '='); if (eq) { char k[128];
                 size_t kl = (size_t)(eq - s); if (kl < sizeof k) { memcpy(k, s, kl); k[kl] = 0; setenv(k, eq + 1, 1); } } }
             return true;
         });
@@ -514,16 +443,12 @@ static void *ph_wine_thread(void *arg) {
         int argc = server->_argc; char **argv = server->_argv;
         NSLog(@"[ext-proc] ml1330 starting __wine_main argc=%d argv[1]=%s", argc, argc > 1 ? argv[1] : "(none)");
         ph_log_start_milestones(argc, argv);   // ml1333
-        // ml1334: an alternate signal stack until Wine sets its own (init_thread_pipe), so a
-        // stack overflow on this thread still reaches ph_fatal_signal (SA_ONSTACK).
-        stack_t ss = { .ss_sp = malloc(64 * 1024), .ss_size = 64 * 1024, .ss_flags = 0 };
-        if (ss.ss_sp) sigaltstack(&ss, NULL);
         ph_log("ml1333 entering __wine_main");
         if (setjmp(wine_ios_exit_jmpbuf) == 0) {
             __wine_main(argc, argv);
-            ph_log("ml1333 __wine_main returned (boot step %s)", ph_boot_stage());
+            ph_log("ml1333 __wine_main returned");
         } else {
-            ph_log("ml1333 guest exited code=%d (boot step %s)", wine_ios_exit_code, ph_boot_stage());
+            ph_log("ml1333 guest exited code=%d", wine_ios_exit_code);
         }
     }
     return NULL;

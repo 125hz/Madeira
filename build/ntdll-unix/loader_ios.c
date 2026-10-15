@@ -148,18 +148,6 @@ static void fatal_error( const char *err, ... )
     vsnprintf( buf, sizeof(buf), err, args );
     va_end( args );
     os_log_error( OS_LOG_DEFAULT, "[Wine ntdll] FATAL: %{public}s", buf );
-    /* ml1334: os_log alone never reaches a session or extension log; a failed
-     * ntdll/apiset load or bad WINEPREFIX ended the boot thread with no line. */
-    dprintf( 2, "[Wine ntdll] ml1334 FATAL (this process's boot thread ends): %s%s", buf,
-             buf[0] && buf[strlen( buf ) - 1] == '\n' ? "" : "\n" );
-    {
-        /* The process-host extension runs exactly one Wine process: report its
-         * end to the app (guestExited) instead of idling with a dead boot thread.
-         * The app's own pseudo-processes keep the plain thread exit. */
-        extern int ios_ext_process_role(void);
-        extern void wine_launched_process_did_exit( int status ) __attribute__((weak));
-        if (ios_ext_process_role() && wine_launched_process_did_exit) wine_launched_process_did_exit( 1 );
-    }
     pthread_exit( NULL );
 #else
     fprintf( stderr, "wine: " );
@@ -697,64 +685,6 @@ static void set_config_dir(void)
     }
 }
 
-#ifdef WINE_IOS
-/***********************************************************************
- *           ios_resolve_bundle_dir   (ml1334)
- *
- * The directory init_paths derives data_dir (nls/), dll_dir (the PE sets
- * aarch64-windows/, arm64ec-windows/, i386-windows/, so ntdll.dll and
- * apisetschema.dll), bin_dir, ntdll_dir and the loader name from. In the app
- * that is the running image's directory, App.app. In the MadeiraProcessHost
- * extension the image is App.app/PlugIns/<name>.appex/<name>, whose directory
- * has none of them: log 101's remote client failed to load every nls table, and
- * without l_intl.nls (the case table) the first case-insensitive name comparison
- * reads a NULL table. Order: MADEIRA_BUNDLE_DIR when it names a directory with
- * nls/ (the extension sets it to its host app's bundle, ProcessHost.m); else,
- * when the image directory has no nls/ and is <bundle>/PlugIns/<name>.appex,
- * the containing bundle if that has nls/; else the image directory. The app's
- * own processes never set the variable and their image directory has nls/, so
- * they are unchanged and silent. `dir` is the image directory on entry.
- */
-static int ios_dir_has_nls( const char *dir )
-{
-    char path[PATH_MAX];
-    struct stat st;
-
-    if (snprintf( path, sizeof(path), "%s/nls", dir ) >= (int)sizeof(path)) return 0;
-    return !stat( path, &st ) && S_ISDIR( st.st_mode );
-}
-
-static void ios_resolve_bundle_dir( char *dir, size_t size )
-{
-    const char *env = getenv( "MADEIRA_BUNDLE_DIR" );
-    const char *source = "image dir";
-    size_t len = strlen( dir );
-
-    if (env && env[0] == '/' && strlen( env ) < size && ios_dir_has_nls( env ))
-    {
-        memmove( dir, env, strlen( env ) + 1 );
-        source = "bundle env";
-    }
-    else if (!ios_dir_has_nls( dir ) && len > 6 && !strcmp( dir + len - 6, ".appex" ))
-    {
-        char *plugins = NULL, *p;
-
-        for (p = strstr( dir, "/PlugIns/" ); p; p = strstr( p + 1, "/PlugIns/" )) plugins = p;
-        if (plugins && plugins > dir && !strchr( plugins + 9, '/' ))
-        {
-            *plugins = 0;
-            if (ios_dir_has_nls( dir )) source = "appex parent";
-            else *plugins = '/';
-        }
-    }
-    if (env && env[0] && strcmp( source, "bundle env" ))
-        dprintf( 2, "[ext-proc] ml1334 MADEIRA_BUNDLE_DIR=%s ignored: not an absolute directory with nls/\n", env );
-    if (strcmp( source, "image dir" ) || !ios_dir_has_nls( dir ))
-        dprintf( 2, "[ext-proc] ml1334 data dir: %s (%s)%s\n", dir, source,
-                 ios_dir_has_nls( dir ) ? "" : " -- NO nls/ here: the locale and case tables cannot load" );
-}
-#endif
-
 static void init_paths(void)
 {
 #ifdef WINE_IOS
@@ -768,7 +698,6 @@ static void init_paths(void)
 
     p = strrchr( exe_path, '/' );
     if (p) *p = 0;
-    ios_resolve_bundle_dir( exe_path, sizeof(exe_path) );   /* ml1334: an .appex's host app */
 
     ntdll_dir = strdup( exe_path );
     dll_dir = strdup( exe_path );
@@ -3141,25 +3070,10 @@ static ULONG_PTR get_image_address(void)
  */
 extern void ios_reserve_fex_arena(void);  /* ml756, virtual_ios.c */
 
-#ifdef WINE_IOS
-/* ml1334: the newest start-up step this task reached. The process-host
- * extension (one Wine process per task) also prints every step as
- * "[boot] ml1334 <step>" to stderr, its log, and its heartbeat repeats the newest
- * one (ProcessHost.m), so a death without a crash line still names its step.
- * In the app the pointer is only stored: start-up steps stay in os_log. */
-const char *volatile ios_boot_stage = "";
-void ios_boot_mark( const char *stage )
-{
-    extern int ios_ext_process_role(void);
-    ios_boot_stage = stage;
-    if (ios_ext_process_role()) dprintf( 2, "[boot] ml1334 %s\n", stage );
-}
-#endif
-
 static void start_main_thread(void)
 {
 #ifdef WINE_IOS
-#define WINE_IOS_LOG(msg) do { os_log(OS_LOG_DEFAULT, "[Wine init] " msg); ios_boot_mark( msg ); } while(0)
+#define WINE_IOS_LOG(msg) do { os_log(OS_LOG_DEFAULT, "[Wine init] " msg); } while(0)
 #else
 #define WINE_IOS_LOG(msg)
 #endif
@@ -4237,13 +4151,7 @@ DECLSPEC_EXPORT void __wine_main( int argc, char *argv[] )
     set_max_limit( RLIMIT_NICE );
 #endif
 
-#ifdef WINE_IOS
-    ios_boot_mark( "virtual_init..." );
-#endif
     virtual_init();
-#ifdef WINE_IOS
-    ios_boot_mark( "init_environment (nls tables)..." );
-#endif
     init_environment();
 
 #if defined(__APPLE__) && !defined(WINE_IOS)
