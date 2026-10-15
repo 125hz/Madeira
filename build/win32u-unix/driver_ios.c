@@ -451,7 +451,7 @@ int winios_drv_foreground_if_owner( HWND hwnd )
 {
     if (!hwnd || get_window_thread( hwnd, NULL ) != GetCurrentThreadId()) return 0;
     if (!NtUserSetForegroundWindow( hwnd )) return -1;
-    winios_click_focus( hwnd, winios_windowed_active && winios_windowed_active() ? "tap" : "activate" );
+    winios_click_focus( hwnd, "activate" );
     return 1;
 }
 

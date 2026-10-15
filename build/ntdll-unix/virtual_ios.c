@@ -3439,7 +3439,7 @@ static size_t ios_pool_alloc_range( size_t alloc_size, size_t pool_limit )
 
 /* ml1351: max protection (and current protection in *prot) of the page holding
  * addr, -1 when nothing is mapped there. For the launcher's child start report
- * (process_ios.c madeira_session_launch_child_started). */
+ * (kept for diagnostics; its launcher caller is gone). */
 int ios_addr_max_prot( const void *addr, int *prot )
 {
     mach_vm_address_t want = (mach_vm_address_t)(uintptr_t)addr, a = want;
