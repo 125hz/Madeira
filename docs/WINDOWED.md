@@ -68,10 +68,8 @@ the event pump (so a title change shows within a second).
 
 **Frames are app-side.** Dragging a title bar moves the frame on screen only;
 the guest window keeps its desktop position. The bottom-right grip zooms the
-frame (the guest window keeps its size); since round 8 it resizes the guest
-window instead and a pinch on the title bar zooms (see Round 8). When the
-program moves its own window (its caption dragged inside the frame, or
-`SetWindowPos`), the frame follows by
+frame (the guest window keeps its size). When the program moves its own window
+(its caption dragged inside the frame, or `SetWindowPos`), the frame follows by
 the same amount, so a drag on the guest's own caption moves the frame too.
 New frames cascade from the top of the screen at a zoom of at most 1 point per
 guest pixel, small enough to fit the screen; a dialog opens centred over its
@@ -274,8 +272,7 @@ hairline edge and a faint highlight along the top. Title-bar buttons are
 (`minus`, `arrow.up.left.and.arrow.down.right`, `plus`, `xmark`), touch
 targets about 35x36 points; the frontmost frame's buttons and title are
 brighter, the others dimmed. No button has a colour; a state (fit to screen)
-shows as its glyph and a ring. The title bar is 36 points high (round 8: 30
-points, 22-point buttons with 32-point touch targets, 12-point title). In the
+shows as its glyph and a ring. The title bar is 36 points high. In the
 taskbar every item (search field, Steam, program icons, keyboard, menu) is 36
 points and they are 10 points apart, 10 points from the pill's ends; the
 magnifier sits 11 points inside the search field and 7 points before its
@@ -374,8 +371,7 @@ panel opens, so a Steam installed during the session gets its icon; a
 - Window icons set with `WM_SETICON` are not read (class icons only, and only
   icons up to 64x64).
 - Frames do not resize the guest window; the grip zooms the picture, and
-  Maximize only shows it full screen (round 8: the grip resizes the guest
-  window; Maximize and fit still only show it). The guest window itself is never
+  Maximize only shows it full screen. The guest window itself is never
   maximized (a program's own maximize button still works inside the frame).
 - Maximize is not remembered; each session starts with frames.
 - Positions and zooms are not remembered between sessions.
@@ -418,20 +414,6 @@ All start with `[windowed] ml1300`:
     move hwnd=0x... to (x,y) pt (app side; the guest window stays at x,y)
     move hwnd=0x... ignored: fullscreen (fitted) frames stay put; ...
     scale hwnd=0x... zoom=0.62 pt/px (the guest window keeps its size; kept when it resizes)
-    scale hwnd=0x... zoom=0.62 pt/px (title bar pinch; the guest window keeps its size; kept when it resizes)   round 8
-    resize hwnd=0x... to WxH (client px; window WxH, zoom 0.62 pt/px kept) [(drag began) | (drag ended)]          round 8
-    resize hwnd=0x... to WxH (client px) dropped: its thread did not pump within 3 s                          round 8
-    resize hwnd=0x...: the program maximized this window, so the grip zooms the picture instead               round 8
-    refit hwnd=0x... rect={...} zoom=... (size changed; resized with the grip, zoom kept)                      round 8
-    grip: resizes the guest window (env.MADEIRA_WINDOWED_RESIZE = 0: ...); a pinch on a title bar zooms ...   round 8, once per session
-
-and from the driver (round 8):
-
-    [winios] ml1302 resize hwnd=0x... applied (client WxH asked, window WxH with a WxH frame, client now WxH[; the program's size limits][; no sizing border, resized anyway][; WM_ENTERSIZEMOVE][; WM_EXITSIZEMOVE])
-    [winios] ml1302 resize hwnd=0x... refused (a child window | minimized | maximized by the program | size out of range | no window rects | SetWindowPos failed | the window is gone; ...)
-
-The rest, all `[windowed] ml1300`:
-
     minimize hwnd=0x... (to the taskbar; app side, the program is not told)
     restore hwnd=0x... "..." [(SC_RESTORE posted)]
     fullscreen hwnd=0x... on (fit to the screen; the frame stays put, its button shows the shrink arrows in a ring: ...) | off (back to its movable frame)
@@ -707,85 +689,4 @@ App only (WiniosWindowed.m, WindowedMode.swift, two lines in Library.swift).
    still dims and wakes, its buttons still work. Show all windows: the round
    button comes back (`hud menu button shown`). Maximize again: the pill is
    where it was left. Rotate: it stays on the same side.
-
-### Round 8 (2026-10-13: real resize, grip visibility, smaller title bar)
-
-The owner, after using another windowed app: resize by dragging the
-bottom-right corner, width and height on their own; the grip should not stay
-on screen forever; smaller title-bar buttons and a slightly smaller title bar.
-WiniosWindowed.m (+.h), one line in Winios.m (the client size goes to
-`winios_windowed_place`), and a new helper in `build/win32u-unix/driver_ios.c`.
-
-**Resize.** The grip now resizes the guest window, as a desktop window
-manager's sizing corner does. While the finger moves, an outline shows the new
-size (from the frame's top-left, at the frame's zoom) and the app asks for the
-client size that means: the visible size minus the window's non-client frame
-(caption, borders, menu bar) as last reported. Requests are coalesced to the
-latest size per window, sent at most ten times a second during the drag, once
-more when the finger stops for a moment, and once when it lifts. The window's
-own thread applies them from its event pump
-(`winios_drv_resize_client_if_owner`, ml1302): the client size plus the
-window's current frame (window rect minus client rect) becomes the window size
-for `SetWindowPos(SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)`;
-`WM_ENTERSIZEMOVE` goes before the first size of a drag and `WM_EXITSIZEMOVE`
-after the last, for programs that rebuild their swapchain only when sizing
-ends. A window without `WS_THICKFRAME` is resized too (the user asked for
-it); `DefWindowProc` still applies the program's `WM_GETMINMAXINFO` limits
-(windows with a sizing border or without `WS_POPUP`), and the driver logs the
-client size the window really got. Another Wine thread that pumps first posts
-`WM_NULL` to the window (at most every 100 ms) so a thread idle in its message
-wait wakes and applies it, as the ml1350 launcher wakes the shell; a request
-not applied within 3 s is dropped with a log line. The new size reaches the
-frame through the usual size-change path, and the refit keeps the zoom (points
-per pixel) for up to 3 s after a grip request: the frame grows or shrinks with
-the window, nothing is rescaled, the top-left stays put. The outline goes when
-the window reaches the size (or 1.5 s after the finger lifts, when the program
-kept another size).
-
-Not resized: fullscreen (fit) and maximized frames (no grip there), and a
-window the program maximized itself (`WS_MAXIMIZE`: the guest would refuse;
-the grip zooms the picture for that window and says so). The old zoom is still
-there: a pinch on the title bar zooms the picture (the guest window keeps its
-size; later size changes keep that zoom, as the old grip did), and
-`env.MADEIRA_WINDOWED_RESIZE = 0` makes the grip zoom again. A
-`libwin32u_unix.a` without the helper: the grip's requests log `not applied:
-this libwin32u_unix.a has no ml1302 resize helper` once.
-
-**Grip visibility.** The grip shows only on the active (frontmost) frame and
-only for about 2 seconds after a touch on that frame: its title bar, its
-buttons, the grip, or the window inside it (a touch mapped through the frame).
-Then it fades out; while faded it takes no touches, so the window's own
-bottom-right corner is the program's. During a drag it stays.
-
-**Title bar.** 30 points high (was 36), the title in 12-point semibold (was
-13), the four buttons 22-point circles (was 28) with 10-point glyphs, 10 points
-apart, each with a 32-point square touch target centred on it (neighbouring
-targets just meet). The narrowest title bar is 200 points (was 220). The
-restore pill and the taskbar are unchanged.
-
-Test (round 8):
-
-1. A program with a resizable window (Notepad, Explorer, Steam): touch the
-   frame; the grip appears at the content's bottom-right, fades about 2 s
-   later. Touch another frame: the grip moves to that one (only the active
-   frame shows it).
-2. Drag the grip right only, then down only: the outline follows the finger;
-   the window follows a little behind, width and height on their own (`resize
-   hwnd=… to WxH (client px; …) (drag began)`, then the driver's `[winios]
-   ml1302 resize hwnd=… applied (…)`, last `(drag ended)` with
-   `WM_EXITSIZEMOVE`). The text inside reflows; nothing is stretched. The zoom
-   in the refit lines stays the same (`refit … (size changed; resized with the
-   grip, zoom kept)`).
-3. Drag it very small: the program's minimum wins (`client now WxH; the
-   program's size limits`); the outline goes 1.5 s after you lift.
-4. A dialog without a sizing border (a message box): it resizes anyway (`no
-   sizing border, resized anyway`); report how it draws.
-5. A game window: drag the grip; report whether the game follows the new size
-   (swapchain resize) or keeps rendering at the old one.
-6. Pinch the title bar with two fingers: the picture zooms (`scale … (title bar
-   pinch; …)`), the guest window keeps its size.
-7. `env.MADEIRA_WINDOWED_RESIZE = 0`: the grip zooms as in round 7 (`grip:
-   zooms the picture (env.MADEIRA_WINDOWED_RESIZE = 0)` at session start).
-8. Title bars: smaller buttons, still easy to hit (try the edges between two
-   buttons); on a very narrow window the title still shows a few characters.
    `env.MADEIRA_WINDOWED_HUD_MENU = 1`: the round button stays.
