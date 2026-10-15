@@ -65,16 +65,16 @@ for m in re.finditer(r'static let (\w+) = GameRecommendation\(\n\s*id: "([^"]+)"
     lines = [line[len(indent):] if line.startswith(indent) else line for line in body.split('\n')]
     presets[ident] = dict(name=name, title=title, version=int(version), lines=lines, switches=' '.join((switches or '').split()))
 assert set(presets) == {'rdr2-steam', 'rdr2-other', 'gta5e-steam', 'gta5e-other', 'ghost-of-tsushima', 'god-of-war',
-                        'horizon-zero-dawn', 'horizon-forbidden-west', 'crysis-remastered',
+                        'horizon-zero-dawn', 'horizon-forbidden-west', 'ratchet-clank-rift-apart', 'crysis-remastered',
                         'crysis-2-remastered', 'crysis-3-remastered', 'standard'}, sorted(presets)
 assert ('static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, ghostOfTsushima, godOfWar, horizonZeroDawn,\n'
-        '                      horizonForbiddenWest, crysisRemastered, crysis2Remastered, crysis3Remastered,\n'
+        '                      horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered, crysis2Remastered, crysis3Remastered,\n'
         '                      standard]') in lists_src
 
 # madeira-bcd's defaults where upstream's differ: every game madeira-bcd ran had them,
 # so every game's own list ends with them. The standard list reaches every other game
 # and the Desktop, and has none of them. A list that sets one of them itself
-# (Horizon Forbidden West: MADEIRA_FREE_DELAY_MS = 0) leaves it out of the block.
+# (Horizon Forbidden West and Rift Apart: MADEIRA_FREE_DELAY_MS = 0) leaves it out of the block.
 FORK_DEFAULTS = ["# madeira-bcd's defaults, which this list was tested with (upstream's differ).",
                  'env.MADEIRA_FREE_DELAY_MS = 2000', 'env.MADEIRA_CTX_CPU_AREA = 2', 'env.MADEIRA_WAIT_CHILDREN = 1',
                  'env.MADEIRA_JIT_DUMP = 0']
@@ -112,7 +112,7 @@ for ident, p in presets.items():
         if key != 'env.WINEDLLOVERRIDES':
             named = named.replace('socialclubhelper.exe', '')
         assert 'socialclub' not in named and 'MADEIRA_DLL_LOCAL' not in line, (ident, line)
-print('PASS: twelve lists, two comment lines each, every game list ends with the four fork defaults and the standard one has none, no key twice, '
+print('PASS: thirteen lists, two comment lines each, every game list ends with the four fork defaults and the standard one has none, no key twice, '
       'every non-env key in the settings catalog, no Social Club DLL lines, no variant DLL switches')
 
 # Red Dead Redemption 2 from Steam: the owner's list of 2026-10-09 (build 463), line for line,
@@ -248,9 +248,10 @@ assert hzd['tested'] == ['dxbc-register-spaces = 1', 'msc-unbounded-retry = 1', 
                             'env.MADEIRA_LOCK_ORPHAN = stamped', 'env.MADEIRA_SRV_FGETPATH = 1',
                             'env.WINEDEBUG = fixme-input'], hzd['lines']
 hfw = presets['horizon-forbidden-west']
+rca = presets['ratchet-clank-rift-apart']
 assert not any(line.startswith(('quiet-log', 'env.MADEIRA_SRV_FGETPATH'))
-               for p in presets.values() if p not in (hzd, hfw) for line in p['lines']), \
-    'the build 494 switches are the two Horizon games\' only'
+               for p in presets.values() if p not in (hzd, hfw, rca) for line in p['lines']), \
+    'the build 494 switches are the two Horizon games\' and Rift Apart\'s only'
 assert hzd['version'] == 16 and hzd['switches'] == 'avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit"', hzd
 assert not any(line.startswith(('d3d12-wave-ops', 'd3d12-raw-typed-views', 'typed-uav-atomic', 'ignore-volatile-metadata',
                                  'env.FEX_MEMCPYSETTSOENABLED', 'env.FEX_STRICTINPROCESSSPLITLOCKS'))
@@ -258,8 +259,8 @@ assert not any(line.startswith(('d3d12-wave-ops', 'd3d12-raw-typed-views', 'type
 assert not any(line.startswith('clear-rects')
                for p in presets.values() if p is not hzd for line in p['lines']), 'clear-rects is Horizon Zero Dawn\'s only'
 assert not any(line.startswith('pso-lazy-libs')
-               for p in presets.values() if p not in (hzd, hfw) for line in p['lines']), \
-    'pso-lazy-libs is the two Horizon games\' only'
+               for p in presets.values() if p not in (hzd, hfw, rca) for line in p['lines']), \
+    'pso-lazy-libs is the two Horizon games\' and Rift Apart\'s only'
 assert not any(line.startswith(('skin-check', 'skin-dump', 'fence-strict', 'vis-trace', 'readback-far', 'desc-guard', 'readback-swap',
                                  'static-cbv', 'env.FEX_VECTORTSOENABLED = 1'))
                for p in presets.values() for line in p['lines']), 'the build 482-491 experiments are in no list'
@@ -291,8 +292,14 @@ assert hfw['tested'] == HFW_GENERAL + ['typed-view-align = 16', 'typed-view-shad
 assert hfw['fork'] == ['env.MADEIRA_CTX_CPU_AREA = 2', 'env.MADEIRA_WAIT_CHILDREN = 1', 'env.MADEIRA_JIT_DUMP = 0'], hfw['fork']
 assert hfw['version'] == 5 and hfw['switches'] == ('avx: true, nvidia: true, wineVCRT: false, fastSync: true, fpsMode: 3, '
                                                    'display: "fit"'), hfw
-assert not any(line.startswith(('typed-view-rgb32', 'mip0-full')) for p in presets.values() if p is not hfw
-               for line in p['lines']), 'typed-view-rgb32 and mip0-full are HFW\'s only'
+# Ratchet & Clank: Rift Apart, version 1: HFW's general lines without Decima's typed-view alignment and copies,
+# rp-carry and eco; AVX and NVIDIA on. Seen up to its intro video on an 8 GB phone (community build 531).
+assert rca['tested'] == HFW_GENERAL + ['typed-view-rgb32 = 1', 'mip0-full = 1', 'quiet-log = 1',
+                                       'pso-lazy-libs = 1'] + HFW_ENV, rca['lines']
+assert set(rca['tested']) < set(hfw['tested']), 'Rift Apart\'s lines are a subset of HFW\'s'
+assert rca['fork'] == hfw['fork'] and rca['version'] == 1 and rca['switches'] == hfw['switches'], rca
+assert not any(line.startswith(('typed-view-rgb32', 'mip0-full')) for p in presets.values() if p not in (hfw, rca)
+               for line in p['lines']), 'typed-view-rgb32 and mip0-full are HFW\'s and Rift Apart\'s only'
 print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472, 475, 476, 480 and 514 test lines (v10), line for line with its switches (720 lines of this screen), and outside Steam the same without the Dock lines, with the ec-hook reporter off (v1); GTA V Enhanced keeps its tested lines plus the stamped orphan-lock mode (v2) and, from Steam, the VC++ engine block (v3), GoW its tested lines; Horizon Zero Dawn has build 491\'s proven list plus build 494\'s frame-rate switches (v16), GoT the owner\'s build 515 list (v3); every other game and the Desktop the standard list (v3)')
 
 # Crysis Remastered, version 1 (community build 528, 2026-10-13 22:08, it ran perfectly): the
@@ -313,11 +320,13 @@ print('PASS: Crysis Remastered is the standard line with the fork defaults and e
 match = block(lists_src, 'static func match(', '\n    }\n')
 assert ('rdr2AppID = 1174180, gta5EnhancedAppID = 3240220, ghostAppID = 2215430, godOfWarAppID = 1593500,\n'
         '               horizonZeroDawnAppID = 1151640, crysisRemasteredAppID = 1715130, crysis2RemasteredAppID = 2096600,\n'
-        '               crysis3RemasteredAppID = 2096610, horizonForbiddenWestAppID = 2420110') in lists_src
+        '               crysis3RemasteredAppID = 2096610, horizonForbiddenWestAppID = 2420110, ratchetClankRiftApartAppID = 1895880') in lists_src
 assert ('if steamAppID == horizonForbiddenWestAppID || installFolder == "horizon forbidden west complete edition" {\n'
         '                return horizonForbiddenWest\n            }') in match
 assert 'case "horizonforbiddenwest.exe":\n            return horizonForbiddenWest' in match
-
+assert ('if steamAppID == ratchetClankRiftApartAppID || installFolder == "ratchet & clank - rift apart" {\n'
+        '                return ratchetClankRiftApart\n            }') in match
+assert 'case "riftapart.exe":\n            return ratchetClankRiftApart' in match
 assert 'if steamAppID == crysisRemasteredAppID || installFolder == "crysis remastered" { return crysisRemastered }' in match
 assert 'case "crysisremastered.exe":\n            return crysisRemastered' in match
 assert 'if steamAppID == crysis2RemasteredAppID || installFolder == "crysis 2 remastered" { return crysis2Remastered }' in match
@@ -513,6 +522,11 @@ check(id(hfw) == "horizon-forbidden-west", "Horizon Forbidden West by its Steam 
 check(id(hfw + #"\HorizonForbiddenWest.exe"#) == "horizon-forbidden-west", "its program inside Steam")
 check(id(#"D:\Games\HFW\horizonforbiddenwest.EXE"#) == "horizon-forbidden-west", "its program anywhere, in any case")
 check(id(hfw + #"\crs-handler.exe"#) == "none", "not its crash reporter")
+let rca = steam + #"\Ratchet & Clank - Rift Apart"#
+check(id(rca, 1895880) == "ratchet-clank-rift-apart", "Rift Apart by its App ID")
+check(id(rca) == "ratchet-clank-rift-apart", "Rift Apart by its Steam folder")
+check(id(rca + #"\RiftApart.exe"#) == "ratchet-clank-rift-apart", "its program inside Steam")
+check(id(#"D:\Games\RC\RIFTAPART.exe"#) == "ratchet-clank-rift-apart", "its program anywhere, in any case")
 let crysis2 = steam + #"\Crysis 2 Remastered"#, crysis3 = steam + #"\Crysis 3 Remastered"#
 check(id(crysis2, 2096600) == "crysis-2-remastered" && id(crysis3, 2096610) == "crysis-3-remastered", "Crysis 2 and 3 Remastered by their App IDs")
 check(id(crysis2) == "crysis-2-remastered" && id(crysis3) == "crysis-3-remastered", "by their Steam folders")
@@ -521,7 +535,7 @@ check(id(crysis2 + #"\Bin64\Crysis2Remastered.exe"#) == "crysis-2-remastered"
 check(id(#"C:\Games\Crysis 2\Bin32\Crysis2.exe"#) == "none", "the original Crysis 2 is another game")
 check(id(#"C:\Games\Foo\foo.exe"#) == "none" && id(steam + #"\Portal 2"#, 620) == "none", "other games")
 check(id("") == "none" && id("C:\\") == "none", "no path")
-print("PASS: Steam games by App ID or steamapps\\common folder, GTA V Enhanced and RDR2 inside and outside Steam, GoT, GoW, the Horizon games and the three Crysis Remastered games by their programs, others none")
+print("PASS: Steam games by App ID or steamapps\\common folder, GTA V Enhanced and RDR2 inside and outside Steam, GoT, GoW, the Horizon games, Rift Apart and the three Crysis Remastered games by their programs, others none")
 
 // The lists themselves.
 check(Set(R.all.map(\.id)).count == R.all.count, "ids are unique")
