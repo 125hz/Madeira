@@ -538,6 +538,44 @@ enum GameRecommendations {
         """,
         avx: false, nvidia: false, wineVCRT: false, display: "fit")
 
+    /// Crysis 2 Remastered (Steam 2096600), not yet run with this list. On madeira
+    /// build 540 (2026-10-14 23:54) it ran with the standard list and every switch off,
+    /// and stopped at its first AVX instruction (c000001d, FEX "DISABLEAVX expected");
+    /// the game needs AVX, on Windows too. Version 1: the standard line with AVX on,
+    /// the other switches off, at Fit.
+    static let crysis2Remastered = GameRecommendation(
+        id: "crysis-2-remastered", title: "Crysis 2 Remastered", version: 1,
+        config: """
+        # Madeira's recommended settings for Crysis 2 Remastered.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: true, nvidia: false, wineVCRT: false, display: "fit")
+
+    /// Crysis 3 Remastered (Steam 2096610), not yet run with this list. On madeira
+    /// build 540 (2026-10-14 23:55) it ran with the standard list and every switch off,
+    /// and stopped when Microsoft's ARM64EC msvcp140.dll branched to its own image base
+    /// (c000001d on the MZ header). Version 1: the standard line with AVX on and Wine's
+    /// C++ runtime instead of Microsoft's, NVIDIA off, at Fit.
+    static let crysis3Remastered = GameRecommendation(
+        id: "crysis-3-remastered", title: "Crysis 3 Remastered", version: 1,
+        config: """
+        # Madeira's recommended settings for Crysis 3 Remastered.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: true, nvidia: false, wineVCRT: true, display: "fit")
+
     /// Every other game, and the Desktop (owner's decisions, 2026-10-12): most games
     /// the owner tried outside these lists closed at start until the [ec-hook]
     /// reporter was off. It reads code a game's protection rewrites at run time
@@ -557,13 +595,14 @@ enum GameRecommendations {
         """)
 
     static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, ghostOfTsushima, godOfWar, horizonZeroDawn,
-                      crysisRemastered, standard]
+                      crysisRemastered, crysis2Remastered, crysis3Remastered, standard]
 
     // MARK: Recognising a game
 
     /// Steam App IDs.
     static let rdr2AppID = 1174180, gta5EnhancedAppID = 3240220, ghostAppID = 2215430, godOfWarAppID = 1593500,
-               horizonZeroDawnAppID = 1151640, crysisRemasteredAppID = 1715130
+               horizonZeroDawnAppID = 1151640, crysisRemasteredAppID = 1715130, crysis2RemasteredAppID = 2096600,
+               crysis3RemasteredAppID = 2096610
 
     /// The recommendation for a game, or nil.
     /// - windowsPath: a program ("C:\Games\GoW\GoW.exe"), or a library Steam
@@ -586,6 +625,8 @@ enum GameRecommendations {
             if steamAppID == godOfWarAppID || installFolder == "godofwar" || installFolder == "god of war" { return godOfWar }
             if steamAppID == horizonZeroDawnAppID || installFolder == "horizon zero dawn" { return horizonZeroDawn }
             if steamAppID == crysisRemasteredAppID || installFolder == "crysis remastered" { return crysisRemastered }
+            if steamAppID == crysis2RemasteredAppID || installFolder == "crysis 2 remastered" { return crysis2Remastered }
+            if steamAppID == crysis3RemasteredAppID || installFolder == "crysis 3 remastered" { return crysis3Remastered }
             return nil
         }
         // A program, wherever it was installed: only the game's own programs, so a
@@ -608,6 +649,10 @@ enum GameRecommendations {
             return horizonZeroDawn
         case "crysisremastered.exe":
             return crysisRemastered
+        case "crysis2remastered.exe":
+            return crysis2Remastered
+        case "crysis3remastered.exe":
+            return crysis3Remastered
         default:
             return nil
         }
