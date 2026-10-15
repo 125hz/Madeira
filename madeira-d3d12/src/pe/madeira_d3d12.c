@@ -496,6 +496,9 @@ static const char *const g_cat_name[MAD_CAT_N] = { "tex-RT", "tex-DS", "tex-UAV"
 static volatile LONG64 g_cat_bytes[MAD_CAT_N], g_cat_peak[MAD_CAT_N];
 static volatile LONG g_cat_count[MAD_CAT_N];
 static volatile LONG64 g_upload_swap_bytes; static volatile LONG g_upload_swap_n;   /* ml1154 */
+static volatile LONG64 g_defswap_bytes; static volatile LONG g_defswap_n;   /* fix: default-buffer-swap (opt-in), a part of the ml1154 count */
+static volatile LONG64 g_defswap_wired; static volatile LONG g_defswap_nwired, g_defswap_wire_fail;   /* madeira-bcd default-buffer-swap-wire (opt-in) */
+static void mad_dsw_census(void);   /* madeira-bcd default-buffer-swap residency census (opt-in) */
 /* madeira-bcd metal-gap: what the ml1150 line's Metal total is made of, beyond
  * the ml1057 estimate. Red Dead Redemption 2 (build 467, 13:09) grew Metal's
  * currentAllocatedSize from 2366 to 2931 MB in its last minute while the
@@ -658,6 +661,20 @@ static void mad_xp_role(char role) {   /* tell the probe which thread this is (u
     memset(&a, 0, sizeof a); a.op = 4; a.len = (UINT64)(unsigned char)role; a.ptr = me; MadeiraCtl(&a);
 }
 static LONG64 mad_qpc(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+/* madeira-bcd eco-prio (opt-in, env.MADEIRA_ECO_PRIO; build/ntdll-unix/thread_ios.c
+ * ios_eco_prio_note): the runtime's own latency-critical threads -- the fence
+ * worker, which advances a fence once the GPU is done, and async-submit's
+ * submission workers -- ask for THREAD_PRIORITY_TIME_CRITICAL, which the switch
+ * turns into the user-interactive QoS (the performance cores) while eco keeps the
+ * game's threads on the efficiency cores. The fence worker also gets an [xp-t]
+ * role, F. Without the switch nothing here runs. */
+static void mad_eco_prio_self(char role) {
+    char v[8];
+    DWORD n = GetEnvironmentVariableA("MADEIRA_ECO_PRIO", v, sizeof v);   /* madeira-bcd: 1 or 2 = the runtime's own worker threads ask for TIME_CRITICAL (performance cores under eco); unset/0 = off */
+    if (!n || n >= sizeof v || v[0] == '0') return;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    if (role) mad_xp_role(role);
+}
 
 /* madeira-bcd: WHERE ExecuteCommandLists SPENDS ITS TIME. Ghost of Tsushima's
  * render thread spends 10-16 ms of a 40 ms frame inside our replay (14:04 log,
@@ -1083,6 +1100,13 @@ static void mad_acct_report(void) {
     }
     d3d12_log("[madeira-d3d12] ml1057 live GPU backing (estimated) total=%lldMB:%s\n", (long long)(tot >> 20), line);
     d3d12_log("[madeira-d3d12] ml1154 CPU-visible buffers on file-backed storage: %ld, %lld MB\n", g_upload_swap_n, (long long)(g_upload_swap_bytes >> 20));
+    if (g_defswap_n || g_defswap_bytes)   /* fix: default-buffer-swap (opt-in) */
+        d3d12_log("[madeira-d3d12] default-buffer-swap: %ld DEFAULT buffers on file-backed storage, %lld MB (inside the ml1154 count above)\n",
+                  (long)g_defswap_n, (long long)(g_defswap_bytes >> 20));
+    if (g_defswap_nwired || g_defswap_wire_fail)   /* madeira-bcd default-buffer-swap-wire (opt-in) */
+        d3d12_log("[madeira-d3d12] default-buffer-swap-wire: %ld of them wired, %lld MB; %ld refused by VirtualLock\n",
+                  (long)g_defswap_nwired, (long long)(g_defswap_wired >> 20), (long)g_defswap_wire_fail);
+    if (g_defswap_n) mad_dsw_census();   /* madeira-bcd: opt-in, env.MADEIRA_WSEX_MINCORE */
     if (g_hp_dev) d3d12_log("[madeira-d3d12] ml1072 texture heaps: %u (%lld MB reserved, %lld MB live in them), %ld textures placed, %ld fallbacks, %u blocks awaiting GPU\n",
                             g_hp_dev->ntheaps, (long long)(g_hp_dev->hp_total_bytes >> 20), (long long)(g_hp_dev->hp_live_bytes >> 20),
                             g_hp_dev->hp_textures, g_hp_dev->hp_fallbacks, g_hp_dev->nhret);
@@ -1144,6 +1168,7 @@ struct mad_resource {
     UINT64 placed_off, placed_size;    /* madeira-bcd: where in that heap, and how much Metal took */
     unsigned serial;                   /* madeira-bcd: creation number, names a resource in capture / alias logs */
     void *own_mem;                     /* ml1154: our VirtualAlloc'd storage behind a CPU-visible buffer */
+    int own_wired;                     /* madeira-bcd default-buffer-swap-wire: own_mem is VirtualLock'ed (VirtualFree unwires it) */
     unsigned track_seq;                /* ml1157: creation order in the address index (newest alias wins) */
     obj_handle_t buffer;
     void *cpu;                 /* NULL for GPU-private */
@@ -1580,10 +1605,19 @@ struct mad_fence {
     struct mad_queue *volatile sig_q; volatile LONG64 sig_value, sig_batch;   /* madeira-bcd vis-trace: the newest Signal, its queue and the batch it needs committed */
     struct { UINT64 value; HANDLE event; LONGLONG t_reg; } waiters[MAD_FENCE_WAITERS];   /* ml1109: t_reg = registration time */
     unsigned nwaiters;
+    /* madeira-bcd fence-poll-backoff (opt-in, see mad_fpb_init): the last value a
+     * poll returned, when (mad_tick), how many polls in a row saw it unchanged,
+     * and polls not yet added to the ml1109 count. Written without atomics by the
+     * threads that poll: a lost update only shortens or lengthens one run. */
+    UINT64 fpb_seen, fpb_t;
+    LONG fpb_run, fpb_polls;
 };
 
 static void fence_set_locked(struct mad_fence *f, UINT64 v) {
-    f->value = v;
+    /* madeira-bcd fence-poll-backoff: a release store, so a poll that reads the
+     * value without the lock sees what was written before it (the same order the
+     * critical section gives a locked reader) */
+    __atomic_store_n(&f->value, v, __ATOMIC_RELEASE);
     WakeAllConditionVariable(&f->cv);
     unsigned w = 0;
     for (unsigned i = 0; i < f->nwaiters; i++) {
@@ -1651,8 +1685,90 @@ static void mad_gcv_sample(struct mad_fence *f, UINT64 v) {
             d3d12_log("[gcv]   %04lx  +0x%llx <- +0x%llx  x%ld\n", g_gcv_site[i].tid, (unsigned long long)g_gcv_site[i].r0, (unsigned long long)g_gcv_site[i].r1, (long)g_gcv_site[i].n);
     }
 }
+/* madeira-bcd fence-poll-backoff (opt-in; madeira.cfg or the game's file,
+ * default 0). Horizon Forbidden West with FSR 3 frame generation, build 531
+ * (2026-10-14 11:01-11:24 logs): 34,000-137,000 GetCompletedValue calls per
+ * present (ml1109), ~2.5 million a second, ~70 % of them from FSR's "AMD FSR
+ * Interpolation Thread" and most of the rest from its presenter thread ([gcv]
+ * ml1142): a loop that polls a fence until the GPU gets there. Every call took
+ * the fence's critical section and two process-wide interlocked counters, and
+ * the loop kept an efficiency core busy ([thread-stacks]: the two FSR threads
+ * at 25-55 % of a core) while, with eco = 1, 6-8 threads waited for a core
+ * ([xp] run=) -- the game's own job workers among them.
+ * With fence-poll-backoff = N (2 or more; 64 suggested) a call reads the value
+ * without the lock (fence_set_locked stores it with release order) and adds to
+ * the ml1109 / ml1142 counters 256 at a time. A thread that sees the same value
+ * N times in a row, each call within 50 us of the one before (a spin, not a
+ * once-a-frame check), sleeps on the fence's condition variable until the value
+ * moves (fence_set_locked wakes every sleeper) or for at most
+ * fence-poll-backoff-us (default 200, 20..2000), then returns the value as it
+ * is then. Every answer is a value the fence really had; a spinning caller just
+ * spins less. A [perf] line every 5 s gives the back-offs per frame, how many
+ * ended because the fence moved, and the time asleep. 0 (the default): the
+ * locked read and the per-call counters, as before. Read once. */
+static volatile int g_fpb = -1;          /* polls before a back-off, 0 = off; -1 = not read yet */
+static LONG64 g_fpb_win = 1200;           /* 50 us in mad_tick units */
+static LONG64 g_fpb_wait = 2000;          /* the longest sleep, 100 ns units */
+static volatile LONG g_fpb_n, g_fpb_moved;   /* back-offs; of which the fence moved */
+static volatile LONG64 g_fpb_ticks;       /* time asleep, mad_tick units */
+static void mad_fpb_init(void) {
+    static LONG said;
+    long long n = mad_cfg_int_pe("fence-poll-backoff", 0);   /* madeira-bcd: N >= 2 = a thread that polls one unchanged fence N times in a row (each within 50 us) sleeps until it moves, at most fence-poll-backoff-us; 0 = the locked read, as before */
+    long long us = mad_cfg_int_pe("fence-poll-backoff-us", 200);   /* madeira-bcd fence-poll-backoff: the longest sleep in microseconds (20..2000) */
+    if (n < 0) n = 0;
+    if (n == 1) n = 2;
+    if (n > 1000000) n = 1000000;
+    if (us < 20) us = 20;
+    if (us > 2000) us = 2000;
+    g_fpb_win = (LONG64)(mad_tick_freq() / 20000);   /* 50 us */
+    if (g_fpb_win < 1) g_fpb_win = 1;
+    g_fpb_wait = us * 10;
+    if (n && !InterlockedExchange(&said, 1))
+        d3d12_log("[madeira-d3d12] fence-poll-backoff = %lld (opt-in): GetCompletedValue reads without the lock; a thread that polls an unchanged "
+                  "fence %lld times in a row sleeps until it moves, at most %lld us\n", n, n, us);
+    __atomic_store_n(&g_fpb, (int)n, __ATOMIC_RELEASE);
+}
+/* The back-off: wait for fence_set_locked's broadcast, bounded. Returns the value now. */
+static UINT64 mad_fpb_sleep(struct mad_fence *f, UINT64 seen) {
+    typedef LONG (WINAPI *sleep_cs_fn)(CONDITION_VARIABLE *, CRITICAL_SECTION *, const LARGE_INTEGER *);
+    static sleep_cs_fn sleep_cs; static volatile LONG looked;
+    UINT64 t0 = mad_tick(), v;
+    LARGE_INTEGER rel;
+    if (!looked) {
+        HMODULE nt = GetModuleHandleA("ntdll.dll");
+        if (nt) sleep_cs = (sleep_cs_fn)(void *)GetProcAddress(nt, "RtlSleepConditionVariableCS");
+        looked = 1;
+    }
+    rel.QuadPart = -g_fpb_wait;   /* relative, 100 ns units */
+    EnterCriticalSection(&f->lock);
+    if (f->value == seen) {
+        if (sleep_cs) sleep_cs(&f->cv, &f->lock, &rel);
+        else SleepConditionVariableCS(&f->cv, &f->lock, 1);
+    }
+    v = f->value;
+    LeaveCriticalSection(&f->lock);
+    InterlockedIncrement(&g_fpb_n);
+    if (v != seen) InterlockedIncrement(&g_fpb_moved);
+    InterlockedExchangeAdd64(&g_fpb_ticks, (LONG64)(mad_tick() - t0));
+    return v;
+}
 static UINT64 STDMETHODCALLTYPE fence_GetCompletedValue(ID3D12Fence *This) {
     struct mad_fence *f = (struct mad_fence *)This;
+    if (g_fpb < 0) mad_fpb_init();
+    if (g_fpb > 0) {   /* madeira-bcd fence-poll-backoff */
+        UINT64 v = __atomic_load_n(&f->value, __ATOMIC_ACQUIRE), now = mad_tick();
+        if (!(++f->fpb_polls & 255)) {   /* ml1109 / ml1142: 256 polls at a time */
+            InterlockedExchangeAdd(&g_perf_polls, 256);
+            if (((InterlockedExchangeAdd(&g_gcv_calls, 256) + 256) & 0x3ffff) == 0) mad_gcv_sample(f, v);
+        }
+        if (v != f->fpb_seen || now - f->fpb_t > (UINT64)g_fpb_win) { f->fpb_seen = v; f->fpb_run = 0; }
+        f->fpb_t = now;
+        if (++f->fpb_run < g_fpb) return v;
+        f->fpb_run = 0;
+        v = mad_fpb_sleep(f, v);
+        f->fpb_seen = v; f->fpb_t = mad_tick();
+        return v;
+    }
     InterlockedIncrement(&g_perf_polls);   /* ml1109 */
     if ((InterlockedIncrement(&g_gcv_calls) & 0x3ffff) == 0) mad_gcv_sample(f, f->value);   /* ml1142 */
     EnterCriticalSection(&f->lock);
@@ -3303,6 +3419,136 @@ static void mad_pso_warm(obj_handle_t device, const void *info, const void *vd, 
     }
     if (InterlockedIncrement(&sent) == 1)
         d3d12_log("[madeira-d3d12] pso-warm: first pipeline handed to the warm-up queues\n");
+}
+/* fix: default-buffer-swap (madeira-bcd, opt-in, default 0). Horizon Forbidden
+ * West keeps 1.3-1.6 GB of committed DEFAULT buffers live (256 MB each, flags 0:
+ * written by copies, read through typed views; logs 2026-10-13 17:10 and 22:47)
+ * on GPU-private Metal memory, which phys_footprint charges in full: Metal held
+ * 4.4-4.7 GB and the game reached the 8 GB line. 1: a committed DEFAULT buffer
+ * of at least default-buffer-swap-mb (default 64) with no UAV, render-target or
+ * depth flag gets storage WE allocate, handed to Metal as a shared no-copy
+ * buffer, exactly as upload-swap (ml1154) does for UPLOAD buffers: a fresh guest
+ * commit that the file tier (swap-mb, ml1077) backs is not charged to
+ * phys_footprint. 2: UAV buffers too. The application still sees a GPU-only
+ * resource (r->cpu stays NULL, Map is refused as before). Without the swap tier
+ * the commit is anonymous memory and nothing is saved. */
+static UINT64 g_defswap_min = 64ull << 20;
+/* madeira-bcd default-buffer-swap-wire and default-buffer-swap-max-mb (both
+ * opt-in, default 0; read with default-buffer-swap, and only used with it). On
+ * build 531 (Horizon Forbidden West, log 2026-10-14 11:24:13) the six moved
+ * 256 MB buffers took the footprint peak from 7.7 to 6.05 GB, but 20-30 s into
+ * play the GPU time per present went from 16.5 to 48-57 ms while the attachment
+ * traffic stayed that of the baseline (gpu-traffic 275-336 MB loaded a frame;
+ * 284-364 MB on the 11:20:16 baseline) and no command buffer failed; the change
+ * came with a burst of 8,081 page-ins a second ([xp] 11:26:33). The suspect: the
+ * storage is file-backed memory that only the GPU touches, so the CPU's pageout
+ * scan never sees it referenced and keeps deactivating or evicting it, and the
+ * GPU pays at every page it finds that way.
+ * default-buffer-swap-wire = 1: VirtualLock (mlock) the storage once Metal has
+ * accepted it, so its pages stay resident and off the paging queues; physical
+ * memory then holds what the private buffers held before, and the footprint line
+ * says whether wired file-backed pages stay off phys_footprint. A refusal (the
+ * per-process wire limit) is logged; that buffer stays as it is. VirtualFree,
+ * after the GPU (the ml1154 path), unwires it.
+ * default-buffer-swap-max-mb = N: buffers move only while the moved total stays
+ * at or below N MB, the rest stay GPU-private: the GPU cost against the amount
+ * moved. 0 = no limit. */
+static int g_defswap_wire;
+static UINT64 g_defswap_max;
+static int mad_defswap_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        long long m = mad_cfg_int_pe("default-buffer-swap", 0);   /* fix: 1 = large committed DEFAULT buffers (no UAV/RT/DS) on file-backed storage, 2 = UAV ones too; 0 = Metal-owned private memory (as before) */
+        long long mb = mad_cfg_int_pe("default-buffer-swap-mb", 64);   /* fix: default-buffer-swap: the smallest DEFAULT buffer moved, in MB (at least 8) */
+        long long w = mad_cfg_int_pe("default-buffer-swap-wire", 0);   /* madeira-bcd: 1 = VirtualLock (mlock) default-buffer-swap's storage so its pages stay resident; 0 = pageable (as before) */
+        long long cap = mad_cfg_int_pe("default-buffer-swap-max-mb", 0);   /* madeira-bcd: default-buffer-swap moves buffers only while the moved total stays at or below this many MB; 0 = no limit */
+        g_defswap_min = (UINT64)(mb < 8 ? 8 : mb) << 20;
+        g_defswap_wire = w > 0;
+        g_defswap_max = cap > 0 ? (UINT64)cap << 20 : 0;
+        if (m > 0)
+            d3d12_log("[madeira-d3d12] default-buffer-swap = %lld (opt-in): committed DEFAULT buffers of %llu MB or more%s live on file-backed storage, off the jetsam footprint"
+                      "; default-buffer-swap-wire = %d, default-buffer-swap-max-mb = %lld\n",
+                      m, (unsigned long long)(g_defswap_min >> 20), m >= 2 ? ", UAV ones too," : " without a UAV flag",
+                      g_defswap_wire, (long long)(g_defswap_max >> 20));
+        MemoryBarrier();
+        mode = m <= 0 ? 0 : m >= 2 ? 2 : 1;
+    }
+    return mode;
+}
+/* default-buffer-swap-max-mb: is there room for a buffer of this length? */
+static int mad_defswap_room(UINT64 length) {
+    static LONG said;
+    UINT64 len = (length + 0xffff) & ~(UINT64)0xffff;
+    if (!g_defswap_max || (UINT64)g_defswap_bytes + len <= g_defswap_max) return 1;
+    if (InterlockedIncrement(&said) <= 4)
+        d3d12_log("[madeira-d3d12] default-buffer-swap: a %llu MB DEFAULT buffer stays GPU-private: %lld MB moved already, default-buffer-swap-max-mb = %llu\n",
+                  (unsigned long long)(len >> 20), (long long)(g_defswap_bytes >> 20), (unsigned long long)(g_defswap_max >> 20));
+    return 0;
+}
+/* default-buffer-swap-wire: lock a moved buffer's storage. Returns 1 when it is locked. */
+static int mad_defswap_wire(void *mem, SIZE_T len) {
+    static LONG said;
+    UINT64 t0 = mad_tick();
+    BOOL ok = VirtualLock(mem, len);
+    DWORD err = ok ? 0 : GetLastError();
+    double ms = 1000.0 * (double)(mad_tick() - t0) / (double)mad_tick_freq();
+    if (ok) { InterlockedExchangeAdd64(&g_defswap_wired, (LONG64)len); InterlockedIncrement(&g_defswap_nwired); }
+    else InterlockedIncrement(&g_defswap_wire_fail);
+    if (InterlockedIncrement(&said) <= 8)
+        d3d12_log("[madeira-d3d12] default-buffer-swap-wire: %llu MB at %p %s (error %lu) in %.1f ms; %ld wired so far, %lld MB\n",
+                  (unsigned long long)(len >> 20), mem, ok ? "wired (VirtualLock)" : "NOT wired, stays pageable: VirtualLock failed",
+                  (unsigned long)err, ms, (long)g_defswap_nwired, (long long)(g_defswap_wired >> 20));
+    return ok ? 1 : 0;
+}
+/* madeira-bcd default-buffer-swap residency census (opt-in, env.MADEIRA_WSEX_MINCORE = 1,
+ * the switch that also makes QueryWorkingSetEx answer from mincore in
+ * build/ntdll-unix/virtual_ios.c). Every 5 s, next to the default-buffer-swap
+ * line: of 128 pages spread over each moved buffer, how many are in memory. A
+ * buffer whose pages left memory while the GPU time per present went up is the
+ * evidence the 11:24:13 log lacks. Logging only; nothing changes without it. */
+#define MAD_DSW_MAX 32
+static struct { void *mem; SIZE_T len; } g_dsw[MAD_DSW_MAX];
+static SRWLOCK g_dsw_lock = SRWLOCK_INIT;
+static void mad_dsw_track(void *mem, SIZE_T len, int add) {
+    unsigned i;
+    AcquireSRWLockExclusive(&g_dsw_lock);
+    for (i = 0; i < MAD_DSW_MAX; i++) {
+        if (add && !g_dsw[i].mem) { g_dsw[i].mem = mem; g_dsw[i].len = len; break; }
+        if (!add && g_dsw[i].mem == mem) { g_dsw[i].mem = NULL; g_dsw[i].len = 0; break; }
+    }
+    ReleaseSRWLockExclusive(&g_dsw_lock);
+}
+static void mad_dsw_census(void) {
+    struct mad_wsex { void *va; ULONG_PTR attr; } info[128];   /* PSAPI_WORKING_SET_EX_INFORMATION: bit 0 of attr = Valid */
+    typedef BOOL (WINAPI *qwse_fn)(HANDLE, void *, DWORD);
+    static qwse_fn qwse; static int on = -1;
+    char line[900]; int n = 0, k = 0; unsigned i, j, res, all = 0, all_res = 0;
+    if (on < 0) {
+        char v[4];
+        DWORD m = GetEnvironmentVariableA("MADEIRA_WSEX_MINCORE", v, sizeof v);   /* madeira-bcd: 1 = the default-buffer-swap residency census (QueryWorkingSetEx over mincore); unset/0 = off */
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        qwse = k32 ? (qwse_fn)(void *)GetProcAddress(k32, "K32QueryWorkingSetEx") : NULL;
+        on = m == 1 && v[0] == '1' && qwse;
+    }
+    if (!on) return;
+    line[0] = 0;
+    AcquireSRWLockShared(&g_dsw_lock);
+    for (i = 0; i < MAD_DSW_MAX; i++) {
+        SIZE_T step;
+        if (!g_dsw[i].mem) continue;
+        step = (g_dsw[i].len / 128) & ~(SIZE_T)0x3fff;
+        if (!step) step = 0x4000;
+        for (j = 0; j < 128; j++) { info[j].va = (char *)g_dsw[i].mem + (SIZE_T)j * step; info[j].attr = 0; }
+        res = 0;
+        if (qwse(GetCurrentProcess(), info, sizeof info))
+            for (j = 0; j < 128; j++) res += (unsigned)(info[j].attr & 1);
+        all += 128; all_res += res; k++;
+        if (n < (int)sizeof line - 40) n += snprintf(line + n, sizeof line - n, " #%u %u%%", i, res * 100 / 128);
+    }
+    ReleaseSRWLockShared(&g_dsw_lock);
+    if (k)
+        d3d12_log("[madeira-d3d12] default-buffer-swap residency (QueryWorkingSetEx over mincore, 128 pages a buffer): %u%% of the sampled pages in memory;%s\n",
+                  all ? all_res * 100 / all : 0, line);
 }
 
 static int mad_rtvp_eq(const struct mad_rtvp *a, const struct mad_rtvp *b) {
@@ -10194,6 +10440,13 @@ static void mad_perf_present(void) {
                   g_perf_presents ? 1000.0 * g_perf_wait_ticks / (double)fq.QuadPart / g_perf_presents : 0.0, 100.0 * g_perf_wait_ticks / (double)fq.QuadPart / wall,
                   g_perf_presents ? (double)g_perf_polls / g_perf_presents : 0.0, g_perf_presents ? (double)g_perf_qwait_sleeps / g_perf_presents : 0.0,
                   g_perf_sig_lat_n ? 1000.0 * g_perf_sig_lat_ticks / (double)fq.QuadPart / g_perf_sig_lat_n : 0.0, g_perf_sig_lat_n);
+        if (g_fpb > 0 && g_perf_presents) {   /* madeira-bcd fence-poll-backoff */
+            LONG bn = InterlockedExchange(&g_fpb_n, 0), bm = InterlockedExchange(&g_fpb_moved, 0);
+            LONG64 bt = InterlockedExchange64(&g_fpb_ticks, 0);
+            d3d12_log("[perf] fence-poll-backoff per frame: %.1f back-offs, %.1f of them ended by the fence moving, %.2f ms asleep (fence-poll-backoff = %d, at most %lld us each)\n",
+                      (double)bn / g_perf_presents, (double)bm / g_perf_presents, 1000.0 * (double)bt / (double)mad_tick_freq() / g_perf_presents,
+                      g_fpb, (long long)(g_fpb_wait / 10));
+        }
         g_perf_t0 = now.QuadPart; g_perf_presents = 0; g_perf_cbs = 0; g_perf_gpu_sum = g_perf_gpu_union = g_perf_wait_s = 0; g_perf_first_start = 0;
         g_perf_ecl = g_perf_signals = g_perf_waits = g_perf_polls = g_perf_qwait_sleeps = 0; g_perf_wait_ticks = g_perf_sig_lat_ticks = 0; g_perf_sig_lat_n = 0;
     }
@@ -10327,6 +10580,7 @@ static void mad_list_rings_rewind(struct mad_list *l) {
  * advances the fence. Jobs are FIFO, so fence values stay ordered. */
 static DWORD WINAPI mad_fence_worker(void *arg) {
     struct mad_device *d = arg;
+    mad_eco_prio_self('F');   /* madeira-bcd eco-prio (opt-in) */
     for (;;) {
         struct mad_fence_job job; int have = 0; unsigned k, stalled_ms = 0;
         EnterCriticalSection(&d->fence_lock);
@@ -10651,6 +10905,7 @@ static void mad_swd_stall(struct mad_queue *q, const char *what, unsigned slices
 static DWORD WINAPI mad_sub_worker(void *arg) {
     struct mad_queue *q = arg;
     mad_xp_role('W');   /* ml1128 */
+    mad_eco_prio_self(0);   /* madeira-bcd eco-prio (opt-in) */
     for (;;) {
         struct mad_subjob *j;
         LARGE_INTEGER t0, t1;
@@ -12400,7 +12655,7 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
         ti.pixel_format = pf; ti.width = (uint32_t)width; ti.height = 1; ti.depth = 1; ti.array_length = 1;
         ti.type = WMTTextureTypeTextureBuffer; ti.mipmap_level_count = 1; ti.sample_count = 1;
         ti.usage = uav ? (WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite) : WMTTextureUsageShaderRead;
-        ti.options = r->cpu ? WMTResourceStorageModeShared : WMTResourceStorageModePrivate;
+        ti.options = (r->cpu || r->own_mem) ? WMTResourceStorageModeShared : WMTResourceStorageModePrivate;   /* fix: default-buffer-swap: a DEFAULT buffer on our storage is Shared to Metal */
         if (uav && (pf == WMTPixelFormatR32Uint || pf == WMTPixelFormatR32Sint) && mad_typed_uav_atomic())   /* madeira-bcd, opt-in */
             ti.usage = (enum WMTTextureUsage)(ti.usage | WMTTextureUsageShaderAtomic);
         sh_gpu = 0; sh = NULL; tex = 0;
@@ -13772,6 +14027,13 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
         if (r->own_mem) {   /* ml1154: the GPU may still read it; free after its serial (reclaimed with the ml1148 list) */
             struct mad_device *md = r->owner; int queued = 0;
             InterlockedExchangeAdd64(&g_upload_swap_bytes, -(LONG64)((r->size + 0xffff) & ~(UINT64)0xffff)); InterlockedDecrement(&g_upload_swap_n);
+            if (r->heap == D3D12_HEAP_TYPE_DEFAULT) {   /* fix: default-buffer-swap */
+                InterlockedExchangeAdd64(&g_defswap_bytes, -(LONG64)((r->size + 0xffff) & ~(UINT64)0xffff)); InterlockedDecrement(&g_defswap_n);
+                mad_dsw_track(r->own_mem, 0, 0);   /* madeira-bcd default-buffer-swap residency census: no longer sampled */
+                if (r->own_wired) {   /* madeira-bcd default-buffer-swap-wire: the VirtualFree below unwires it */
+                    InterlockedExchangeAdd64(&g_defswap_wired, -(LONG64)((r->size + 0xffff) & ~(UINT64)0xffff)); InterlockedDecrement(&g_defswap_nwired);
+                }
+            }
             if (md) {
                 EnterCriticalSection(&md->heap_lock);
                 if (mad_grow((void **)&md->mhret, &md->mhret_cap, md->nmhret + 1, sizeof *md->mhret)) {
@@ -14193,6 +14455,39 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
                 }
             }
         }
+        /* fix: default-buffer-swap (opt-in, see mad_defswap_mode): a large committed
+         * DEFAULT buffer on storage WE allocate, as ml1154 above, so the file tier
+         * keeps it off phys_footprint. Shared to Metal; GPU-only to the application. */
+        if (!r->buffer && !ph && heap_type == D3D12_HEAP_TYPE_DEFAULT && mad_defswap_mode() && info.length >= g_defswap_min &&
+            !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) &&
+            (mad_defswap_mode() >= 2 || !(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) &&
+            mad_defswap_room(info.length)) {   /* madeira-bcd default-buffer-swap-max-mb */
+            SIZE_T len = (SIZE_T)((info.length + 0xffff) & ~(UINT64)0xffff);
+            void *mem = VirtualAlloc(NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (mem) {
+                UINT64 want = info.length;
+                info.length = len; info.memory.ptr = mem; info.options = WMTResourceStorageModeShared;
+                r->buffer = MTLDevice_newBuffer(d->mtl_device, &info);
+                if (r->buffer) {
+                    r->own_mem = mem;   /* released (after the GPU) by the ml1154 path in res_Release */
+                    InterlockedExchangeAdd64(&g_upload_swap_bytes, (LONG64)len); InterlockedIncrement(&g_upload_swap_n);
+                    InterlockedExchangeAdd64(&g_defswap_bytes, (LONG64)len); InterlockedIncrement(&g_defswap_n);
+                    if (g_defswap_wire) r->own_wired = mad_defswap_wire(mem, len);   /* madeira-bcd default-buffer-swap-wire */
+                    mad_dsw_track(mem, len, 1);   /* madeira-bcd default-buffer-swap residency census */
+                } else {
+                    VirtualFree(mem, 0, MEM_RELEASE);
+                    info.length = want; info.memory.ptr = NULL; info.gpu_address = 0; info.options = WMTResourceStorageModePrivate;
+                }
+                {
+                    static unsigned said;
+                    if (said++ < 8)
+                        d3d12_log("[madeira-d3d12] default-buffer-swap: DEFAULT buffer %llu MB (flags %#x) on our storage %p: %s; %ld so far, %lld MB\n",
+                                  (unsigned long long)(want >> 20), (unsigned)desc->Flags, mem,
+                                  r->buffer ? "Metal accepted it" : "Metal REFUSED it, GPU-private instead",
+                                  (long)g_defswap_n, (long long)(g_defswap_bytes >> 20));
+                }
+            }
+        }
         if (!r->buffer) r->buffer = MTLDevice_newBuffer(d->mtl_device, &info);
         if (!r->buffer) { free(r); return mad_creation_failure(d, "newBuffer"); }
         if (!r->placed_heap) {
@@ -14200,6 +14495,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
             mad_resident(d, r->buffer);
         }
         r->cpu = info.memory.ptr;      /* NULL for GPU-private, which is correct */
+        if (r->own_mem && heap_type == D3D12_HEAP_TYPE_DEFAULT) r->cpu = NULL;   /* fix: default-buffer-swap: still GPU-only to the application */
         r->gpu_address = info.gpu_address;
         mad_track(d, r);
         if (info.length >= (16u << 20) && !r->placed_heap) {            /* ml885: big buffers, with where they live */
