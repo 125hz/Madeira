@@ -11440,6 +11440,34 @@ static void mad_format_info(DXGI_FORMAT f, UINT *bytes, UINT *block) {
 
 static UINT64 mad_align(UINT64 v, UINT64 a) { return (v + a - 1) & ~(a - 1); }
 
+/* mip0-full. D3D12 reads a texture's MipLevels = 0 as the full
+ * chain, 1 + floor(log2) of its largest dimension, and GetDesc answers that
+ * count. This runtime kept the 0 -- GetDesc answered 0 -- and made one level.
+ * FSR 3.1 frame generation creates its inpainting pyramid that way and makes
+ * GetDesc().MipLevels UAV descriptors for it, so it had none: pyramid level k
+ * was the k-th descriptor after it, another resource's view, and its SPD passes
+ * stored levels 1, 2 and 3 into the optical-flow motion-vector fields X and Y
+ * and the previous interpolation source (Horizon Forbidden West's black
+ * squares, build 531 fi-field-check: 176x82, 88x41 and 44x21 texels written).
+ * The count is resolved where a description enters: creation, sizes, layouts. */
+static int g_mip0_full = -1;
+static UINT mad_full_mips(const D3D12_RESOURCE_DESC *d) {
+    UINT64 m = d->Width; UINT n = 1;
+    if (d->SampleDesc.Count > 1) return 1;
+    if (d->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D && d->Height > m) m = d->Height;
+    if (d->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && d->DepthOrArraySize > m) m = d->DepthOrArraySize;
+    while (m > 1) { n++; m >>= 1; }
+    return n;
+}
+static const D3D12_RESOURCE_DESC *mad_desc_mips(const D3D12_RESOURCE_DESC *in, D3D12_RESOURCE_DESC *tmp) {
+    if (!in || in->MipLevels || in->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || in->Dimension == D3D12_RESOURCE_DIMENSION_UNKNOWN) return in;
+    if (g_mip0_full < 0) g_mip0_full = mad_cfg_int_pe("mip0-full", 0) ? 1 : 0;   /* fix: a texture created with MipLevels 0 gets the full mip chain and GetDesc answers its count, as D3D12 does (FSR 3.1 frame generation's inpainting pyramid: Horizon Forbidden West's black squares); 0 = one level, GetDesc answers 0 */
+    if (!g_mip0_full) return in;
+    *tmp = *in;
+    tmp->MipLevels = (UINT16)mad_full_mips(in);
+    return tmp;
+}
+
 /* The standard subresource layout: rows padded to 256 bytes, each subresource
  * starting on a 512-byte boundary. Both constants are the API's own. */
 static void STDMETHODCALLTYPE device_GetCopyableFootprints(ID3D12Device *This,
@@ -11448,7 +11476,10 @@ static void STDMETHODCALLTYPE device_GetCopyableFootprints(ID3D12Device *This,
         UINT64 *total_bytes) {
     UINT bytes, block, i;
     UINT64 offset = base_offset;
-    UINT mips = desc->MipLevels ? desc->MipLevels : 1;
+    D3D12_RESOURCE_DESC dfix;
+    UINT mips;
+    desc = mad_desc_mips(desc, &dfix);   /* mip0-full */
+    mips = desc->MipLevels ? desc->MipLevels : 1;
     (void)This;
     mad_format_info(desc->Format, &bytes, &block);
     for (i = 0; i < count; i++) {
@@ -11489,7 +11520,8 @@ static D3D12_RESOURCE_ALLOCATION_INFO * STDMETHODCALLTYPE device_GetResourceAllo
     UINT64 total = 0, align = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, i;
     (void)visible_mask;
     for (i = 0; i < n; i++) {
-        const D3D12_RESOURCE_DESC *d = &descs[i];
+        D3D12_RESOURCE_DESC dfix;
+        const D3D12_RESOURCE_DESC *d = mad_desc_mips(&descs[i], &dfix);   /* mip0-full: the size of what creation makes */
         UINT64 bytes = 0, a = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, msz = 0, mal = 0;
         struct mad_device *md = (struct mad_device *)This;
         if (d->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
@@ -12335,9 +12367,17 @@ static void mad_uavtex_forget(const struct mad_resource *r, UINT64 id) {
  * (fi-setup-zero), and which dispatch leaves NaN halves behind (fi-field-check).
  * "Setup-like": a FidelityFX dispatch (entry point 'CS') that binds four or more
  * R32 UAV textures of one size -- FSR 3.1's Setup binds the game and the
- * optical-flow vector fields, X and Y. */
-static int g_cs_split, g_fsz, g_ffc;   /* set once by mad_ffx_load; g_ffx_exp says whether any is on */
-static volatile LONG g_cs_split_n, g_fsz_n;
+ * optical-flow vector fields, X and Y.
+ * Build 531 (2026-10-14): Setup's clear holds (s01 all zero); the NaN halves
+ * arrive with FSR's two SPD passes, the game-vector-field pyramid (render
+ * size / 64 groups) and the inpainting pyramid (display / 64), which store
+ * pyramid levels 1 and 2 into the optical-flow fields X and Y: the pyramid had
+ * no UAV descriptors of its own (MipLevels 0, see mip0-full). fi-nan-clean is
+ * the stopgap: after a FidelityFX dispatch that binds one of Setup's R32 fields
+ * as a UAV, a helper kernel zeroes the field's texels whose vector half is a
+ * NaN/Inf half-float. */
+static int g_cs_split, g_fsz, g_ffc, g_fnc;   /* set once by mad_ffx_load; g_ffx_exp says whether any is on */
+static volatile LONG g_cs_split_n, g_fsz_n, g_fnc_n;
 static void mad_ffx_load(void) {
     long long v;
     v = mad_cfg_int_pe("cs-split", 0);   /* fix: 1 = every compute dispatch ends its compute encoder, so the next one waits on the encoder fence (FSR 3 black squares: ordering inside an encoder); 2 = only FidelityFX ('CS' entry) dispatches */
@@ -12345,13 +12385,17 @@ static void mad_ffx_load(void) {
     g_fsz = mad_cfg_int_pe("fi-setup-zero", 0) ? 1 : 0;   /* fix: zero-fill the R32 UAV textures of FSR 3's frame-interpolation Setup pass with a blit just before it (black squares: is Setup's own clear lost?) */
     v = mad_cfg_int_pe("fi-field-check", 0);   /* diagnostic: every N presents (1 = 60) read back FSR 3's R32 vector fields before its Setup pass and after each later FidelityFX dispatch of that frame; log texels whose low half is a NaN/Inf half-float ([fi-field]) */
     g_ffc = v <= 0 ? 0 : v == 1 ? 60 : v > 100000 ? 100000 : (int)v;
+    v = mad_cfg_int_pe("fi-nan-clean", 0);   /* fix: after each FidelityFX dispatch that binds one of the R32 vector fields FSR 3's Setup pass binds, a helper kernel zeroes the field's texels whose vector half (bits 0..15) is a NaN/Inf half-float (HFW's black squares); 2 = also when bits 16..31 read as one */
+    g_fnc = (v == 1 || v == 2) ? (int)v : 0;
     if (g_cs_split) d3d12_log("[cs-split] %s ends its compute encoder (the next encoder waits on the encoder fence)\n",
                               g_cs_split == 1 ? "every compute dispatch" : "every FidelityFX ('CS') dispatch");
     if (g_fsz) d3d12_log("[fi-setup-zero] the R32 UAV textures of a Setup-like FidelityFX dispatch are zero-filled by a blit before it runs\n");
     if (g_ffc) d3d12_log("[fi-field] DIAGNOSTIC: every %d presents, FSR 3's R32 vector fields (first %ux%u texels) are read back "
                          "before its Setup pass and after each later FidelityFX dispatch of that frame\n", g_ffc, 256u, 128u);
+    if (g_fnc) d3d12_log("[fi-nan-clean] after a FidelityFX dispatch that binds one of Setup's R32 vector fields, its texels "
+                         "with a NaN/Inf %s are zeroed\n", g_fnc == 2 ? "half (either half)" : "vector half (bits 0..15)");
     MemoryBarrier();
-    g_ffx_exp = (g_cs_split || g_fsz || g_ffc) ? 1 : 0;
+    g_ffx_exp = (g_cs_split || g_fsz || g_ffc || g_fnc) ? 1 : 0;
 }
 /* 4-byte colour texels the census reads as 32-bit words: R32, RG16, RGBA8,
  * BGRA8, RGB10A2, RG11B10 (Metal pixel format numbers). */
@@ -12481,12 +12525,115 @@ static void mad_ffx_sync(struct mad_exec *e) {
     e->f6_sync_needed = 1;
     e->fence_needed = 1;
 }
+/* fi-nan-clean: the R32 fields the last Setup-like dispatch bound (referenced
+ * until another Setup-like dispatch binds others), that dispatch's pipeline,
+ * the helper kernel (mad_kernels.metal) and a shared pair of counters it adds
+ * the zeroed texels to. */
+#define MAD_FNC_FIELDS 8u
+static struct mad_resource *g_fnc_f[MAD_FNC_FIELDS]; static unsigned g_fnc_nf; static UINT64 g_fnc_setup;
+static SRWLOCK g_fnc_lock = SRWLOCK_INIT, g_fnc_init_lock = SRWLOCK_INIT;
+static struct mad_device *g_fnc_dev; static obj_handle_t g_fnc_pso, g_fnc_buf; static volatile UINT32 *g_fnc_cnt; static int g_fnc_state;
+static void mad_fnc_fields(struct mad_resource *const *t, unsigned n, UINT64 setup_hash) {
+    struct mad_resource *rel[MAD_FNC_FIELDS]; unsigned i, nrel = 0, same;
+    if (n > MAD_FNC_FIELDS) n = MAD_FNC_FIELDS;
+    AcquireSRWLockExclusive(&g_fnc_lock);
+    g_fnc_setup = setup_hash;
+    same = n == g_fnc_nf;
+    for (i = 0; same && i < n; i++) if (g_fnc_f[i] != t[i]) same = 0;
+    if (!same) {
+        nrel = g_fnc_nf; memcpy(rel, g_fnc_f, nrel * sizeof *rel);
+        for (i = 0; i < n; i++) { ID3D12Resource_AddRef((ID3D12Resource *)t[i]); g_fnc_f[i] = t[i]; }
+        g_fnc_nf = n;
+    }
+    ReleaseSRWLockExclusive(&g_fnc_lock);
+    for (i = 0; i < nrel; i++) ID3D12Resource_Release((ID3D12Resource *)rel[i]);
+    if (!same) {
+        static LONG said;
+        if (InterlockedIncrement(&said) <= 16)
+            d3d12_log("[fi-nan-clean] fields: %u R32 textures %ux%u (r#%u..r#%u) of Setup-like cs %016llx\n",
+                      n, t[0]->width, t[0]->height, t[0]->serial, t[n - 1]->serial, (unsigned long long)setup_hash);
+    }
+}
+static int mad_fnc_ready(struct mad_device *d) {
+    if (g_fnc_state) return g_fnc_state > 0 && g_fnc_dev == d;
+    AcquireSRWLockExclusive(&g_fnc_init_lock);
+    if (!g_fnc_state) {
+        obj_handle_t fn = 0, err = 0; struct WMTComputePipelineInfo ci; void *cpu = NULL;
+        if (mad_kernels_ready(d) && d->k_lib) fn = MTLLibrary_newFunction(d->k_lib, "mad_fi_nan_clean");
+        if (fn) {
+            memset(&ci, 0, sizeof ci); ci.compute_function = fn;
+            g_fnc_pso = MTLDevice_newComputePipelineState(d->mtl_device, &ci, &err);
+            if (err) mad_log_nserror("mad_fi_nan_clean", err);
+            NSObject_release(fn);
+        }
+        if (g_fnc_pso) g_fnc_buf = mad_capbuf_alloc(d, 4096, &cpu);
+        if (g_fnc_buf) { memset(cpu, 0, 64); g_fnc_cnt = (volatile UINT32 *)cpu; mad_resident(d, g_fnc_buf); }
+        g_fnc_dev = d;
+        g_fnc_state = g_fnc_pso && g_fnc_buf ? 1 : -1;
+        d3d12_log("[fi-nan-clean] helper kernel %s (library %d, pipeline %d, counters %d)\n",
+                  g_fnc_state > 0 ? "ready" : "NOT available -- nothing is cleaned", !!d->k_lib, !!g_fnc_pso, !!g_fnc_buf);
+    }
+    ReleaseSRWLockExclusive(&g_fnc_init_lock);
+    return g_fnc_state > 0 && g_fnc_dev == d;
+}
+/* After a FidelityFX dispatch other than Setup: each of Setup's fields it binds
+ * as a UAV goes through the kernel, in a compute encoder of its own that waits
+ * for the dispatch and is waited for by what follows. */
+static void mad_fnc_after(struct mad_exec *e, const struct mad_cmd *c) {
+    struct mad_resource *t[MAD_FFC_WATCH], *f[MAD_FNC_FIELDS]; unsigned n, i, j, nf = 0;
+    struct mad_device *d = e->q->device;
+    struct wmtcmd_compute_setpso sp; struct wmtcmd_compute_setbuffer sb;
+    struct wmtcmd_compute_settexture st[MAD_FNC_FIELDS]; struct wmtcmd_compute_setbytes sby[MAD_FNC_FIELDS];
+    struct wmtcmd_compute_dispatch dsp[MAD_FNC_FIELDS]; UINT32 prm[MAD_FNC_FIELDS][4];
+    struct wmtcmd_base *tail;
+    LONG k;
+    if (!g_fnc_nf) return;
+    n = mad_ffx_uavs(e, t, MAD_FFC_WATCH, 1);
+    if (!n) return;
+    AcquireSRWLockShared(&g_fnc_lock);
+    if (e->cpso->cs_hash != g_fnc_setup)   /* Setup itself stores zeros; the kernel reads uint texels */
+        for (i = 0; i < n; i++)
+            for (j = 0; j < g_fnc_nf && t[i]->tex_pf == WMTPixelFormatR32Uint; j++)
+                if (t[i] == g_fnc_f[j] && nf < MAD_FNC_FIELDS) { f[nf++] = t[i]; break; }
+    ReleaseSRWLockShared(&g_fnc_lock);
+    if (!nf || !mad_fnc_ready(d)) return;
+    mad_ffx_sync(e);   /* the kernel waits for the dispatch ... */
+    exec_end(e);
+    e->cenc = MTLCommandBuffer_computeCommandEncoder(e->cb, false);
+    if (!e->cenc) return;
+    g_enc_seq++; e->cenc_pso = NULL; e->cenc_seq = g_enc_seq;
+    if (g_enc_labels) mad_label(e->cenc, "C#%u fi-nan-clean", g_enc_seq);
+    exec_fence_compute(e, e->cenc, 0);
+    memset(&sp, 0, sizeof sp); memset(&sb, 0, sizeof sb); memset(st, 0, sizeof st); memset(sby, 0, sizeof sby); memset(dsp, 0, sizeof dsp);
+    sp.type = WMTComputeCommandSetPSO; sp.pso = g_fnc_pso;
+    sp.threadgroup_size.width = 8; sp.threadgroup_size.height = 8; sp.threadgroup_size.depth = 1;
+    sb.type = WMTComputeCommandSetBuffer; sb.buffer = g_fnc_buf; sb.offset = 0; sb.index = 1;
+    sp.next.ptr = &sb; tail = (struct wmtcmd_base *)&sb;
+    for (i = 0; i < nf; i++) {   /* buffer 0: width, height, mode; texture 0: the field; one thread a texel and layer */
+        prm[i][0] = f[i]->width; prm[i][1] = f[i]->height; prm[i][2] = (UINT32)g_fnc; prm[i][3] = 0;
+        st[i].type = WMTComputeCommandSetTexture; st[i].texture = f[i]->texture; st[i].index = 0;
+        sby[i].type = WMTComputeCommandSetBytes; sby[i].bytes.ptr = prm[i]; sby[i].length = sizeof prm[i]; sby[i].index = 0;
+        dsp[i].type = WMTComputeCommandDispatch;
+        dsp[i].size.width = (f[i]->width + 7) / 8; dsp[i].size.height = (f[i]->height + 7) / 8;
+        dsp[i].size.depth = f[i]->tex_layers ? f[i]->tex_layers : 1;
+        tail->next.ptr = &st[i]; st[i].next.ptr = &sby[i]; sby[i].next.ptr = &dsp[i]; tail = (struct wmtcmd_base *)&dsp[i];
+    }
+    MTLComputeCommandEncoder_encodeCommands(e->cenc, (const struct wmtcmd_base *)&sp);
+    mad_ffx_sync(e);   /* ... and what follows waits for the kernel */
+    exec_end(e);
+    k = InterlockedIncrement(&g_fnc_n);
+    if (k <= 4 || !(k % 1800))
+        d3d12_log("[fi-nan-clean] #%ld: after cs %016llx %ux%ux%u, %u field(s) %ux%u (first r#%u); texels zeroed so far: %u with a NaN/Inf "
+                  "vector half, %u for the upper half only\n", (long)k, (unsigned long long)e->cpso->cs_hash, c->u.dispatch.x, c->u.dispatch.y,
+                  c->u.dispatch.z, nf, f[0]->width, f[0]->height, f[0]->serial, g_fnc_cnt[0], g_fnc_cnt[1]);
+}
 /* Before a FidelityFX dispatch (replay loop, MC_DISPATCH only). */
 static void mad_ffx_before(struct mad_exec *e, const struct mad_cmd *c) {
     struct mad_resource *t[MAD_FFC_WATCH], *rel[MAD_FFC_WATCH]; unsigned n, i, nrel = 0;
-    if (!e->cpso || !e->cpso->is_compute || strcmp(e->cpso->vs_name, "CS") || (!g_fsz && !g_ffc)) return;
+    if (!e->cpso || !e->cpso->is_compute || strcmp(e->cpso->vs_name, "CS") || (!g_fsz && !g_ffc && !g_fnc)) return;
     n = mad_ffx_uavs(e, t, MAD_FFC_WATCH, 1);
     if (!mad_ffx_setup_like(t, n)) return;
+    if (g_fnc) mad_fnc_fields(t, n, e->cpso->cs_hash);   /* fi-nan-clean: the fields to clean until the next Setup */
     if (g_ffc) {   /* a window starts at a Setup pass and ends at the next one */
         LONG64 p = g_presents_now;
         AcquireSRWLockExclusive(&g_ffc_lock);
@@ -12546,6 +12693,7 @@ static void mad_ffx_after(struct mad_exec *e, const struct mad_cmd *c) {
         }
         ReleaseSRWLockExclusive(&g_ffc_lock);
     }
+    if (g_fnc && ffx) mad_fnc_after(e, c);   /* fi-nan-clean: after the census copy, so it still shows what the dispatch wrote */
     if (g_cs_split && e->cenc && (g_cs_split == 1 || ffx)) {
         LONG k;
         mad_ffx_sync(e);   /* the next encoder waits for this one, whatever the fence-chain mode */
@@ -13631,7 +13779,9 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
                                       struct mad_memheap *ph, UINT64 poff) {
     struct mad_resource *r;
     HRESULT hr;
+    D3D12_RESOURCE_DESC dfix; int mip0 = 0;
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_UNKNOWN) { mad_refuse_log(desc, heap_type, "dimension UNKNOWN"); return E_INVALIDARG; }
+    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && !desc->MipLevels) { mip0 = 1; desc = mad_desc_mips(desc, &dfix); }   /* mip0-full */
 
     r = calloc(1, sizeof *r);
     if (!r) return E_OUTOFMEMORY;
@@ -13706,6 +13856,14 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
                     InterlockedIncrement(&g_sa_tex_n);
                 }
             }
+        }
+        if (mip0) {   /* mip0-full: who asks for the full chain, and what it got */
+            static LONG said;
+            if (InterlockedIncrement(&said) <= 24)
+                d3d12_log("[mip0] r#%u %llux%ux%u dx%u flags %#x%s: MipLevels 0 (D3D12: the full chain, %u levels) -> %u level(s)%s\n",
+                          r->serial, (unsigned long long)desc->Width, desc->Height, (unsigned)desc->DepthOrArraySize, (unsigned)desc->Format,
+                          (unsigned)desc->Flags, ph ? " placed" : "", mad_full_mips(desc), (unsigned)r->tex_mips,
+                          desc->MipLevels ? "" : "; GetDesc answers 0 (madeira.cfg mip0-full = 1 resolves it)");
         }
         hr = res_QI((ID3D12Resource *)r, riid, out);
         if (FAILED(hr)) mad_refuse_log(desc, heap_type, "interface not answered");
