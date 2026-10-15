@@ -11741,8 +11741,8 @@ static volatile LONG g_tv_eoff_pf[1024];   /* views made with a nonzero element 
  * last went into g_tvs_touch; k: its view's index in r->tview + 1 (0 = not yet
  * published). r NULL: its resource is gone (the record stays, never freed, so the
  * recent lists never point at freed memory; its bytes go to a new view). */
-struct mad_tvs { struct mad_resource *r; const unsigned char *src; unsigned char *dst; UINT32 len, cap, boff, k; obj_handle_t buf; UINT64 gpu;
-                 volatile LONG64 seen; LONG64 touched; };
+struct mad_tvs { struct mad_resource *r; const unsigned char *src; unsigned char *dst; UINT32 len, cap, boff, k, x3; obj_handle_t buf; UINT64 gpu;
+                 volatile LONG64 seen; LONG64 touched; };   /* len: the source's bytes; x3: 12-byte elements copied at 16 (typed-view-rgb32) */
 static struct mad_tvs **g_tvs; static unsigned g_tvs_n, g_tvs_cap;
 static SRWLOCK g_tvs_lock = SRWLOCK_INIT;
 static obj_handle_t g_tvs_buf; static unsigned char *g_tvs_cpu; static UINT64 g_tvs_gpu; static UINT32 g_tvs_used;
@@ -11755,6 +11755,8 @@ static unsigned g_tvs_hand, g_tvs_rr;
 static LONG64 g_tvs_cmp, g_tvs_cmp_bytes;   /* compared at ExecuteCommandLists (under g_tvs_lock), for the periodic line */
 static LONG64 g_tvs_late;   /* rewritten copies the per-present pass found outside the recent window (under g_tvs_lock) */
 static int g_tvs_on = -1;
+static int g_tv_rgb32 = -1;   /* madeira-bcd typed-view-rgb32 (see mad_tv_rgb32_on) */
+static volatile LONG g_tv_rgb32_views, g_tv_rgb32_other;
 static int mad_tv_mode(void) {
     if (g_tv_align < 0) {
         long long v = mad_cfg_int_pe("typed-view-align", 0);   /* fix: texture-buffer views start at their first element (4, probed) or at a 16- or 256-byte boundary, instead of 64 */
@@ -11983,6 +11985,44 @@ static int mad_tvs_on(void) {
     }
     return g_tvs_on;
 }
+/* madeira-bcd typed-view-rgb32 (madeira.cfg typed-view-rgb32 = 1, opt-in).
+ * Horizon Forbidden West on build 528 (2026-10-13 22:47): 1,789 of its 220,112
+ * typed views were DXGI_FORMAT_R32G32B32_FLOAT (12-byte float3 elements) in its
+ * UPLOAD rings. Metal has no 96-bit texture-buffer format, so they fell back to
+ * plain buffers and every typed load of them saw no texture: the vegetation
+ * went into the sky with every offset view already copied. Such an SRV of
+ * UPLOAD memory reads a copy whose elements are 16 bytes (x, y, z, then 0)
+ * through an RGBA32 texture buffer. The copy lives in typed-view-shadow's
+ * table and is refreshed with it; UAVs and GPU-written memory fall back as
+ * before (counted). */
+static int mad_tv_rgb32_on(void) {
+    if (g_tv_rgb32 < 0) {
+        g_tv_rgb32 = mad_cfg_int_pe("typed-view-rgb32", 0) ? 1 : 0;   /* fix: typed SRVs of UPLOAD memory in an R32G32B32 format (no Metal texture-buffer format) read a copy with 16-byte elements through an RGBA32 texture buffer */
+        if (g_tv_rgb32)
+            d3d12_log("[typed-view] madeira-bcd typed-view-rgb32 = 1: R32G32B32 typed SRVs of UPLOAD memory read a copy with 16-byte "
+                      "elements through an RGBA32 texture buffer\n");
+    }
+    return g_tv_rgb32;
+}
+/* The RGBA32 format of an R32G32B32 view's copy, or 0 (another format, or the switch off). */
+static int mad_tv_rgb32_format(DXGI_FORMAT fmt, enum WMTPixelFormat *pf) {
+    switch (fmt) {
+    case DXGI_FORMAT_R32G32B32_FLOAT: *pf = WMTPixelFormatRGBA32Float; break;
+    case DXGI_FORMAT_R32G32B32_UINT:  *pf = WMTPixelFormatRGBA32Uint;  break;
+    case DXGI_FORMAT_R32G32B32_SINT:  *pf = WMTPixelFormatRGBA32Sint;  break;
+    default: return 0;
+    }
+    return mad_tv_rgb32_on();
+}
+/* typed-view-rgb32: n 12-byte elements of src into dst at 16 bytes each (the
+ * fourth word 0). all: every element; else only those that differ. 1 if any
+ * element was written. */
+static int mad_tvs_x3_sync(unsigned char *dst, const unsigned char *src, UINT32 n, int all) {
+    UINT32 i; int changed = 0;
+    for (i = 0; i < n; i++, dst += 16, src += 12)
+        if (all || memcmp(dst, src, 12)) { memcpy(dst, src, 12); memset(dst + 12, 0, 4); changed = 1; }
+    return changed;
+}
 /* A full table: a copy whose resource is gone, or whose view (of this device,
  * so view_lock covers it) has not been made or looked up for MAD_TVS_IDLE
  * presents, with room for need bytes. Looked for from where the last search
@@ -12015,23 +12055,26 @@ static void mad_tvs_touch_locked(struct mad_tvs *t, LONG64 now) {
  * table is larger, and once full a copy nobody used for MAD_TVS_IDLE presents
  * goes to the new view: its old view is never handed out again (format 0
  * matches no lookup), so a game making the same view again gets a new one. */
-static obj_handle_t mad_tvs_view(struct mad_device *d, struct mad_resource *r, struct WMTTextureInfo *ti,
-                                 UINT64 byte_off, UINT64 num, UINT bytes, UINT64 *gpu, struct mad_tvs **rec) {
-    UINT64 len = num * bytes, al;
+/* dbytes: the copy's element size; bytes unless typed-view-rgb32 stores 12-byte
+ * elements at 16 (then dbytes 16). */
+static obj_handle_t mad_tvs_view_x(struct mad_device *d, struct mad_resource *r, struct WMTTextureInfo *ti,
+                                   UINT64 byte_off, UINT64 num, UINT bytes, UINT dbytes, UINT64 *gpu, struct mad_tvs **rec) {
+    UINT64 len = num * bytes, dlen, al;
     uint32_t w0 = ti->width;
     obj_handle_t tex = 0;
     struct mad_tvs *t = NULL;
     LONG64 now = g_presents_now;
-    if (byte_off >= r->size || !bytes) return 0;
+    if (byte_off >= r->size || !bytes || dbytes < bytes) return 0;
     if (len > r->size - byte_off) len = r->size - byte_off;   /* past the end: what is there, as the plain view is cut short */
     len -= len % bytes;
-    if (!len || len > MAD_TVS_MAX_VIEW) { InterlockedIncrement(&g_tvs_full); return 0; }
-    al = (len + 15) & ~(UINT64)15;
+    dlen = len / bytes * dbytes;
+    if (!len || dlen > MAD_TVS_MAX_VIEW) { InterlockedIncrement(&g_tvs_full); return 0; }
+    al = (dlen + 15) & ~(UINT64)15;
     AcquireSRWLockExclusive(&g_tvs_lock);
     ti->width = (uint32_t)(len / bytes);
     if (g_tvs_n >= MAD_TVS_MAX_N || g_tvs_bytes + (LONG64)al > (LONG64)MAD_TVS_MAX_BYTES) {
         if (!(t = mad_tvs_victim(d, (UINT32)al))) goto full;
-        tex = MTLBuffer_newTexture(t->buf, ti, t->boff, len);
+        tex = MTLBuffer_newTexture(t->buf, ti, t->boff, dlen);
         if (!tex || !ti->gpu_resource_id) goto refused;
         if (t->r && t->k) {   /* a descriptor still naming the old view reads the new bytes: it went unused for MAD_TVS_IDLE presents */
             struct mad_tview *v = &t->r->tview[t->k - 1];
@@ -12051,15 +12094,16 @@ static obj_handle_t mad_tvs_view(struct mad_device *d, struct mad_resource *r, s
             g_tvs_buf = nb; g_tvs_cpu = (unsigned char *)bi.memory.ptr; g_tvs_gpu = bi.gpu_address; g_tvs_used = 0;
         }
         if (!mad_grow((void **)&g_tvs, &g_tvs_cap, g_tvs_n + 1, sizeof *g_tvs) || !(t = calloc(1, sizeof *t))) goto full;
-        tex = MTLBuffer_newTexture(g_tvs_buf, ti, g_tvs_used, len);
+        tex = MTLBuffer_newTexture(g_tvs_buf, ti, g_tvs_used, dlen);
         if (!tex || !ti->gpu_resource_id) { free(t); goto refused; }
         t->buf = g_tvs_buf; t->boff = g_tvs_used; t->dst = g_tvs_cpu + g_tvs_used; t->gpu = g_tvs_gpu + g_tvs_used; t->cap = (UINT32)al;
         t->touched = now;   /* new copies are at the end of the table, where the recent pass looks */
         g_tvs[g_tvs_n++] = t;
         g_tvs_used += (UINT32)al; g_tvs_bytes += (LONG64)al;
     }
-    memcpy(t->dst, (const unsigned char *)r->cpu + byte_off, (size_t)len);
-    t->r = r; t->src = (const unsigned char *)r->cpu + byte_off; t->len = (UINT32)len; t->k = 0;
+    if (dbytes != bytes) mad_tvs_x3_sync(t->dst, (const unsigned char *)r->cpu + byte_off, (UINT32)(len / bytes), 1);
+    else memcpy(t->dst, (const unsigned char *)r->cpu + byte_off, (size_t)len);
+    t->r = r; t->src = (const unsigned char *)r->cpu + byte_off; t->len = (UINT32)len; t->k = 0; t->x3 = dbytes != bytes;
     t->seen = now;
     *rec = t;
     *gpu = t->gpu;
@@ -12078,6 +12122,10 @@ full:
         d3d12_log("[typed-view] typed-view-shadow: no room for another copy (%u views, %lld KB); this view keeps its element offset\n",
                   g_tvs_n, (long long)(g_tvs_bytes >> 10));
     return 0;
+}
+static obj_handle_t mad_tvs_view(struct mad_device *d, struct mad_resource *r, struct WMTTextureInfo *ti,
+                                 UINT64 byte_off, UINT64 num, UINT bytes, UINT64 *gpu, struct mad_tvs **rec) {
+    return mad_tvs_view_x(d, r, ti, byte_off, num, bytes, bytes, gpu, rec);
 }
 /* A view made before is looked up again (view_lock held): in use, and into the
  * recent pass once a present. */
@@ -12098,6 +12146,10 @@ static void mad_tvs_drop(struct mad_tvs *t) {
 static int mad_tvs_cmp(struct mad_tvs *t, LONG *n) {
     if (!t->r || !t->len) return 0;
     g_tvs_cmp++; g_tvs_cmp_bytes += t->len;
+    if (t->x3) {   /* typed-view-rgb32: element by element, 12 bytes of the source at 16 in the copy */
+        if (!mad_tvs_x3_sync(t->dst, t->src, t->len / 12, 0)) return 0;
+        (*n)++; return 1;
+    }
     if (memcmp(t->dst, t->src, t->len)) { memcpy(t->dst, t->src, t->len); (*n)++; return 1; }
     return 0;
 }
@@ -12178,9 +12230,11 @@ static void mad_tvs_report(void) {
     d3d12_log("[typed-view] views that start off a 16-byte boundary: %ld kept their element offset, %ld read an aligned copy (typed-view-shadow %d; "
               "%u copies, %lld KB, %ld given to a new view, %ld views refused: no room or over 64 KB); %ld offset views not copied (UAV or not UPLOAD); "
               "since the last line %lld copies compared (%lld KB), %ld rewritten in all, %lld of them outside the recent window "
-              "(found by the per-present pass)\n",
+              "(found by the per-present pass); typed-view-rgb32 %d: %ld R32G32B32 views read a 16-byte-element copy, %ld fell back "
+              "(UAV, not UPLOAD memory, or no room)\n",
               (long)g_tv_eoff_views, (long)g_tvs_views, g_tvs_on > 0, g_tvs_n, (long long)(g_tvs_bytes >> 10), (long)g_tvs_recycled,
-              (long)g_tvs_full, (long)g_tvs_other, (long long)c, (long long)(b >> 10), (long)g_tvs_copies, (long long)g_tvs_late);
+              (long)g_tvs_full, (long)g_tvs_other, (long long)c, (long long)(b >> 10), (long)g_tvs_copies, (long long)g_tvs_late,
+              g_tv_rgb32 > 0, (long)g_tv_rgb32_views, (long)g_tv_rgb32_other);
 }
 /* why (may be NULL): 0, or the g_vc_why index of a refusal (1-8) or of a view
  * cut short (9, still made). */
@@ -12192,11 +12246,18 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
     struct WMTTextureInfo ti;
     obj_handle_t tex;
     static unsigned said_fail, said_ok;
+    int x3;
     if (!r->buffer) { if (why) *why = 1; return 0; }
-    if (!mad_map_texture_format(fmt, 0, &pf, &is_depth)) { if (why) *why = 2; return 0; }
-    if (is_depth) { if (why) *why = 3; return 0; }
-    mad_format_info(fmt, &bytes, &block);
-    if (!bytes || block != 1) { if (why) *why = 4; return 0; }
+    x3 = mad_tv_rgb32_format(fmt, &pf);   /* madeira-bcd typed-view-rgb32: R32G32B32 has no Metal format; an RGBA32 copy */
+    if (x3) {
+        if (uav || !r->cpu || r->heap != D3D12_HEAP_TYPE_UPLOAD) { InterlockedIncrement(&g_tv_rgb32_other); if (why) *why = 2; return 0; }
+        bytes = 12; block = 1;
+    } else {
+        if (!mad_map_texture_format(fmt, 0, &pf, &is_depth)) { if (why) *why = 2; return 0; }
+        if (is_depth) { if (why) *why = 3; return 0; }
+        mad_format_info(fmt, &bytes, &block);
+        if (!bytes || block != 1) { if (why) *why = 4; return 0; }
+    }
     byte_off = first * bytes;
     if (mad_tv_mode() == 4) mad_tv_probe_once(d);   /* madeira-bcd typed-view-align = 4: before the first view, outside the lock */
     EnterCriticalSection(&d->view_lock);   /* ml1049: creation races creation on another thread */
@@ -12222,7 +12283,11 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
         if (uav && (pf == WMTPixelFormatR32Uint || pf == WMTPixelFormatR32Sint) && mad_typed_uav_atomic())   /* madeira-bcd, opt-in */
             ti.usage = (enum WMTTextureUsage)(ti.usage | WMTTextureUsageShaderAtomic);
         sh_gpu = 0; sh = NULL; tex = 0;
-        if (elem_off && mad_tvs_on()) {   /* madeira-bcd typed-view-shadow: an aligned copy instead of an element offset */
+        if (x3) {   /* madeira-bcd typed-view-rgb32: always the 16-byte-element copy, never the buffer itself */
+            tex = mad_tvs_view_x(d, r, &ti, byte_off, num, 12, 16, &sh_gpu, &sh);
+            if (!tex) { InterlockedIncrement(&g_tv_rgb32_other); LeaveCriticalSection(&d->view_lock); if (why) *why = 2; return 0; }
+            InterlockedIncrement(&g_tv_rgb32_views);
+        } else if (elem_off && mad_tvs_on()) {   /* madeira-bcd typed-view-shadow: an aligned copy instead of an element offset */
             if (!uav && r->cpu && r->heap == D3D12_HEAP_TYPE_UPLOAD) tex = mad_tvs_view(d, r, &ti, byte_off, num, bytes, &sh_gpu, &sh);
             if (!tex) InterlockedIncrement(&g_tvs_other);
         }
@@ -12290,7 +12355,7 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
     if (r->tview[k].sh) mad_tvs_touch(r->tview[k].sh);   /* madeira-bcd typed-view-shadow: in use, refresh it at the next calls */
     e->gpu_va = r->tview[k].sh_gpu ? r->tview[k].sh_gpu : r->gpu_address + r->tview[k].off;   /* madeira-bcd typed-view-shadow: the copy */
     e->texture_view_id = r->tview[k].id;
-    e->metadata = ((num * bytes) & 0xffffffffull) | ((elem_off & 0x7fffffffull) << 32) | (1ull << 63);
+    e->metadata = ((num * (x3 ? 16 : bytes)) & 0xffffffffull) | ((elem_off & 0x7fffffffull) << 32) | (1ull << 63);   /* x3: the copy's bytes */
     LeaveCriticalSection(&d->view_lock);
     return 1;
 }
