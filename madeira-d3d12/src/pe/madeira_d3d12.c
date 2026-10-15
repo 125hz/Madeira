@@ -9644,6 +9644,13 @@ static void mad_capture_log_op(const struct mad_cmd *c) {
     d3d12_log("[capture-op] list#%u enc#%u %s -> %s\n", g_list_seq, g_enc_seq, extra, al);
 }
 
+/* FidelityFX frame-generation experiments (cs-split, fi-setup-zero,
+ * fi-field-check), defined after the texture-UAV table they read. */
+static int g_ffx_exp = -1;   /* -1 = not read yet, 0 = all off */
+static void mad_ffx_load(void);
+static void mad_ffx_before(struct mad_exec *e, const struct mad_cmd *c);
+static void mad_ffx_after(struct mad_exec *e, const struct mad_cmd *c);
+static obj_handle_t mad_fill_pattern(struct mad_device *d, UINT32 v);
 static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t cb) {
     g_list_seq++;
     struct mad_exec e;
@@ -9662,11 +9669,13 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     l->ring_q = q; l->ring_batch = q->batches + 1;   /* ml1061: the batch this replay belongs to */
     e.topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     if (g_skin_now) mad_skin_begin(&e);   /* madeira-bcd skin-check */
+    if (g_ffx_exp < 0) mad_ffx_load();   /* cs-split, fi-setup-zero, fi-field-check */
     exec_rp_list_begin(&e);   /* madeira-bcd rp-carry: the pass the previous list handed over */
     for (i = 0; i < l->ncmds; i++) {
         const struct mad_cmd *c = &l->cmds[i];
         e.cur = i;   /* ml1137 */
         if (g_capture_on) mad_capture_log_op(c);   /* madeira-bcd */
+        if (g_ffx_exp > 0 && c->kind == MC_DISPATCH) mad_ffx_before(&e, c);   /* fi-setup-zero, fi-field-check */
         if ((e.npend | e.rp_ndisc) || c->kind == MC_DISCARD) exec_rp_note(&e, c);   /* madeira-bcd clear-defer, rp-discard */
         switch (c->kind) {
         case MC_PSO: if (c->u.pso && c->u.pso->is_compute) e.cpso = c->u.pso; else e.pso = c->u.pso;
@@ -9785,6 +9794,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         case MC_RESOLVE: exec_resolve(&e, c); break;
         case MC_DISCARD: break;   /* madeira-bcd rp-discard: exec_rp_note above */
         }
+        if (g_ffx_exp > 0 && c->kind == MC_DISPATCH) mad_ffx_after(&e, c);   /* cs-split, fi-field-check */
         if (rs) {   /* madeira-bcd: replay split, summed per list */
             UINT64 t1 = mad_tick();
             int b = mad_rs_bucket(c->kind);
@@ -12307,6 +12317,303 @@ static void mad_uavtex_forget(const struct mad_resource *r, UINT64 id) {
         if (!u->id) break;
     }
     ReleaseSRWLockExclusive(&g_uavtex_lock);
+}
+
+/* FidelityFX frame-generation experiments (cs-split, fi-setup-zero,
+ * fi-field-check). Horizon Forbidden West's FSR 3 generated frames (builds
+ * 525-529) carry black squares of exactly 16x16 output pixels on an 8-pixel
+ * lattice, [8k-4, 8k+12): the 2x2 bilinear footprint of ONE texel of FSR's
+ * optical-flow motion-vector field (R32_UINT, one texel per 8x8 block, each
+ * entry priority bits | a half-float vector), which the interpolation pass
+ * blends by hand (SampleOpticalFlowMotionVectorField). A texel whose low half
+ * decodes to NaN blacks out its whole footprint. FSR never packs a NaN: its
+ * Setup pass stores 0 into every texel and the optical-flow pass only
+ * InterlockedMax-es finite vectors where it found motion -- and in 528's
+ * recording the squares sit where it found none, so the bits were in the
+ * field before that scatter. The switches below tell the candidates apart:
+ * ordering inside a compute encoder (cs-split), Setup's own clear being lost
+ * (fi-setup-zero), and which dispatch leaves NaN halves behind (fi-field-check).
+ * "Setup-like": a FidelityFX dispatch (entry point 'CS') that binds four or more
+ * R32 UAV textures of one size -- FSR 3.1's Setup binds the game and the
+ * optical-flow vector fields, X and Y. */
+static int g_cs_split, g_fsz, g_ffc;   /* set once by mad_ffx_load; g_ffx_exp says whether any is on */
+static volatile LONG g_cs_split_n, g_fsz_n;
+static void mad_ffx_load(void) {
+    long long v;
+    v = mad_cfg_int_pe("cs-split", 0);   /* fix: 1 = every compute dispatch ends its compute encoder, so the next one waits on the encoder fence (FSR 3 black squares: ordering inside an encoder); 2 = only FidelityFX ('CS' entry) dispatches */
+    g_cs_split = (v == 1 || v == 2) ? (int)v : 0;
+    g_fsz = mad_cfg_int_pe("fi-setup-zero", 0) ? 1 : 0;   /* fix: zero-fill the R32 UAV textures of FSR 3's frame-interpolation Setup pass with a blit just before it (black squares: is Setup's own clear lost?) */
+    v = mad_cfg_int_pe("fi-field-check", 0);   /* diagnostic: every N presents (1 = 60) read back FSR 3's R32 vector fields before its Setup pass and after each later FidelityFX dispatch of that frame; log texels whose low half is a NaN/Inf half-float ([fi-field]) */
+    g_ffc = v <= 0 ? 0 : v == 1 ? 60 : v > 100000 ? 100000 : (int)v;
+    if (g_cs_split) d3d12_log("[cs-split] %s ends its compute encoder (the next encoder waits on the encoder fence)\n",
+                              g_cs_split == 1 ? "every compute dispatch" : "every FidelityFX ('CS') dispatch");
+    if (g_fsz) d3d12_log("[fi-setup-zero] the R32 UAV textures of a Setup-like FidelityFX dispatch are zero-filled by a blit before it runs\n");
+    if (g_ffc) d3d12_log("[fi-field] DIAGNOSTIC: every %d presents, FSR 3's R32 vector fields (first %ux%u texels) are read back "
+                         "before its Setup pass and after each later FidelityFX dispatch of that frame\n", g_ffc, 256u, 128u);
+    MemoryBarrier();
+    g_ffx_exp = (g_cs_split || g_fsz || g_ffc) ? 1 : 0;
+}
+/* 4-byte colour texels the census reads as 32-bit words: R32, RG16, RGBA8,
+ * BGRA8, RGB10A2, RG11B10 (Metal pixel format numbers). */
+static int mad_ffx_pf4(UINT pf) {
+    switch (pf) {
+    case WMTPixelFormatR32Uint: case WMTPixelFormatR32Sint: case WMTPixelFormatR32Float:
+    case WMTPixelFormatRG16Unorm: case WMTPixelFormatRG16Snorm: case WMTPixelFormatRG16Uint: case WMTPixelFormatRG16Sint:
+    case WMTPixelFormatRG16Float: case WMTPixelFormatRGBA8Unorm: case 71: case WMTPixelFormatRGBA8Snorm:
+    case WMTPixelFormatRGBA8Uint: case WMTPixelFormatRGBA8Sint: case WMTPixelFormatBGRA8Unorm: case 81:
+    case WMTPixelFormatRGB10A2Unorm: case WMTPixelFormatRGB10A2Uint: case WMTPixelFormatRG11B10Float: return 1;
+    default: return 0;
+    }
+}
+/* The distinct 2D texture UAVs (mip 0) a compute dispatch binds through
+ * descriptor tables, up to max: R32Uint / R32Sint only (r32), else every
+ * 4-byte colour format. */
+static unsigned mad_ffx_uavs(const struct mad_exec *e, struct mad_resource **out, unsigned max, int r32) {
+    const struct mad_rootsig *rs = e->crs; unsigned i, ri, k, j, n = 0;
+    if (!rs || !e->srv || !e->srv->cpu) return 0;
+    for (i = 0; i < rs->nparams && i < MAD_ROOT_PARAM_MAX; i++) {
+        const struct madeira_ir_root_param *p = &rs->params[i]; UINT64 va = e->croot[i]; unsigned base, run = 0;
+        if (p->type != MADEIRA_IR_PARAM_TABLE || va < e->srv->gpu_address ||
+            va >= e->srv->gpu_address + (UINT64)e->srv->count * sizeof(struct mad_descriptor)) continue;
+        base = (unsigned)((va - e->srv->gpu_address) / sizeof(struct mad_descriptor));
+        for (ri = 0; ri < p->num_ranges; ri++) {
+            const struct madeira_ir_root_range *rg; unsigned nd, off;
+            if (p->first_range + ri >= rs->nranges) break;
+            rg = &rs->ranges[p->first_range + ri];
+            nd = rg->num_descriptors; if (nd == 0xffffffffu || nd > 64) nd = 64;
+            off = rg->table_offset != 0xffffffffu ? rg->table_offset : run;
+            run = off + nd;
+            if (rg->range_type != MADEIRA_IR_RANGE_UAV) continue;
+            for (k = 0; k < nd && base + off + k < e->srv->count; k++) {
+                const struct mad_descriptor *de = &e->srv->cpu[base + off + k];
+                struct mad_uavtex u; struct mad_resource *r;
+                if (!de->texture_view_id || de->gpu_va || (de->metadata >> 63)) continue;
+                if (!mad_uavtex_get(de->texture_view_id, &u) || !(r = u.res) || !r->texture || u.level) continue;
+                if (r->tex_type == WMTTextureType3D || r->samples > 1 || r->height < 4) continue;
+                if (r32 ? r->tex_pf != WMTPixelFormatR32Uint && r->tex_pf != WMTPixelFormatR32Sint : !mad_ffx_pf4((UINT)r->tex_pf)) continue;
+                for (j = 0; j < n; j++) if (out[j] == r) break;
+                if (j == n && n < max) out[n++] = r;
+            }
+        }
+    }
+    return n;
+}
+static int mad_ffx_setup_like(struct mad_resource *const *t, unsigned n) {
+    unsigned i;
+    if (n < 4) return 0;
+    for (i = 1; i < n; i++) if (t[i]->width != t[0]->width || t[i]->height != t[0]->height) return 0;
+    return 1;
+}
+/* fi-field-check: the watched textures' first MAD_FFC_W x MAD_FFC_H texels are
+ * copied into our own memory; the copies are scanned at a later Present once
+ * their command buffer has completed. */
+#define MAD_FFC_MAX 256u
+#define MAD_FFC_WATCH 12u
+#define MAD_FFC_W 256u
+#define MAD_FFC_H 128u
+struct mad_ffc_rec {
+    obj_handle_t cb, buf; void *cpu; UINT w, h, tw, th;
+    const struct mad_resource *r; unsigned rser, step, list, pf; UINT64 hash; UINT gx, gy, gz; int bound; LONG64 win;
+};
+static struct mad_ffc_rec g_ffc_q[MAD_FFC_MAX]; static unsigned g_ffc_head, g_ffc_n;
+static SRWLOCK g_ffc_lock = SRWLOCK_INIT;
+static LONG64 g_ffc_win = -1000000; static unsigned g_ffc_step, g_ffc_budget, g_ffc_setups;
+static struct mad_resource *g_ffc_watch[MAD_FFC_WATCH]; static unsigned g_ffc_nwatch;
+static LONG g_ffc_lines;
+/* Under g_ffc_lock: hand back the watched set; the caller releases it unlocked. */
+static unsigned mad_ffc_unwatch_locked(struct mad_resource **rel) {
+    unsigned n = g_ffc_nwatch;
+    memcpy(rel, g_ffc_watch, n * sizeof *rel);
+    g_ffc_nwatch = 0;
+    return n;
+}
+static void mad_ffc_release(struct mad_resource **rel, unsigned n) {
+    unsigned i;
+    for (i = 0; i < n; i++) ID3D12Resource_Release((ID3D12Resource *)rel[i]);
+}
+/* Under g_ffc_lock: watch the textures not watched yet (referenced until the
+ * window ends) and name each once: size, formats, and where its memory is
+ * (its own, or a heap range with the placed resources overlapping it). */
+static void mad_ffc_watch_locked(struct mad_resource *const *t, unsigned n) {
+    unsigned i, j;
+    for (i = 0; i < n; i++) {
+        char al[256];
+        for (j = 0; j < g_ffc_nwatch; j++) if (g_ffc_watch[j] == t[i]) break;
+        if (j < g_ffc_nwatch || g_ffc_nwatch >= MAD_FFC_WATCH) continue;
+        ID3D12Resource_AddRef((ID3D12Resource *)t[i]);
+        g_ffc_watch[g_ffc_nwatch++] = t[i];
+        mad_alias_desc(t[i], al, sizeof al);
+        if (InterlockedIncrement(&g_ffc_lines) <= 4000)
+            d3d12_log("[fi-field] watch %ux%u pf%u dx%u flags %#x from step s%02u: %s\n", t[i]->width, t[i]->height,
+                      (unsigned)t[i]->tex_pf, (unsigned)t[i]->desc.Format, (unsigned)t[i]->desc.Flags, g_ffc_step, al);
+    }
+}
+/* Under g_ffc_lock, with the replay's blit encoder open: copy every watched texture. */
+static void mad_ffc_copy_locked(struct mad_exec *e, const struct mad_cmd *c, struct mad_resource *const *bound, unsigned nbound) {
+    unsigned i, j;
+    for (i = 0; i < g_ffc_nwatch && g_ffc_budget && g_ffc_n < MAD_FFC_MAX; i++) {
+        struct mad_resource *r = g_ffc_watch[i]; struct wmtcmd_blit_copy_from_texture_to_buffer k; struct mad_ffc_rec *q;
+        void *cpu = NULL; obj_handle_t buf;
+        UINT w = r->width < MAD_FFC_W ? r->width : MAD_FFC_W, h = r->height < MAD_FFC_H ? r->height : MAD_FFC_H;
+        if (!w || !h || !r->texture) continue;
+        buf = mad_capbuf_alloc(e->q->device, (UINT64)w * h * 4, &cpu);
+        if (!buf) continue;
+        memset(&k, 0, sizeof k);
+        k.type = WMTBlitCommandCopyFromTextureToBuffer;
+        k.src = r->texture; k.slice = 0; k.level = 0;
+        k.size.width = w; k.size.height = h; k.size.depth = 1;
+        k.dst = buf; k.offset = 0; k.bytes_per_row = w * 4; k.bytes_per_image = w * h * 4;
+        MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
+        q = &g_ffc_q[(g_ffc_head + g_ffc_n) % MAD_FFC_MAX];
+        memset(q, 0, sizeof *q);
+        q->cb = e->cb; NSObject_retain(e->cb);
+        q->buf = buf; q->cpu = cpu; q->w = w; q->h = h; q->tw = r->width; q->th = r->height;
+        q->r = r; q->rser = r->serial; q->step = g_ffc_step; q->list = g_list_seq; q->win = g_ffc_win; q->pf = (unsigned)r->tex_pf;
+        q->hash = e->cpso ? e->cpso->cs_hash : 0;
+        q->gx = c->u.dispatch.x; q->gy = c->u.dispatch.y; q->gz = c->u.dispatch.z;
+        for (j = 0; j < nbound; j++) if (bound[j] == r) q->bound = 1;
+        g_ffc_n++; g_ffc_budget--;
+    }
+}
+/* Copies of a dispatch's targets must wait for what ran before them and be
+ * waited for by what follows, in every fence-chain mode. */
+static void mad_ffx_sync(struct mad_exec *e) {
+    e->f6_sync_needed = 1;
+    e->fence_needed = 1;
+}
+/* Before a FidelityFX dispatch (replay loop, MC_DISPATCH only). */
+static void mad_ffx_before(struct mad_exec *e, const struct mad_cmd *c) {
+    struct mad_resource *t[MAD_FFC_WATCH], *rel[MAD_FFC_WATCH]; unsigned n, i, nrel = 0;
+    if (!e->cpso || !e->cpso->is_compute || strcmp(e->cpso->vs_name, "CS") || (!g_fsz && !g_ffc)) return;
+    n = mad_ffx_uavs(e, t, MAD_FFC_WATCH, 1);
+    if (!mad_ffx_setup_like(t, n)) return;
+    if (g_ffc) {   /* a window starts at a Setup pass and ends at the next one */
+        LONG64 p = g_presents_now;
+        AcquireSRWLockExclusive(&g_ffc_lock);
+        if (p - g_ffc_win >= g_ffc && g_ffc_n + MAD_FFC_WATCH <= MAD_FFC_MAX) {
+            struct mad_resource *all[MAD_FFC_WATCH]; unsigned na;
+            nrel = mad_ffc_unwatch_locked(rel);
+            g_ffc_win = p; g_ffc_step = 0; g_ffc_budget = 192; g_ffc_setups = 1;
+            if (InterlockedIncrement(&g_ffc_lines) <= 4000)
+                d3d12_log("[fi-field] window at present #%lld: Setup-like cs %016llx %ux%ux%u binds %u R32 UAV textures %ux%u "
+                          "(first r#%u); s00 = before it\n", (long long)p, (unsigned long long)e->cpso->cs_hash,
+                          c->u.dispatch.x, c->u.dispatch.y, c->u.dispatch.z, n, t[0]->width, t[0]->height, t[0]->serial);
+            na = mad_ffx_uavs(e, all, MAD_FFC_WATCH, 0);   /* the R32 fields and any other 4-byte target of Setup */
+            mad_ffc_watch_locked(all, na);
+            mad_ffx_sync(e);
+            if (exec_begin_blit(e)) mad_ffc_copy_locked(e, c, all, na);
+            mad_ffx_sync(e);
+        } else if (g_ffc_budget && g_ffc_setups++) g_ffc_budget = 0;   /* the next frame's Setup closes the window */
+        ReleaseSRWLockExclusive(&g_ffc_lock);
+        mad_ffc_release(rel, nrel);
+    }
+    if (g_fsz) {
+        obj_handle_t pat = mad_fill_pattern(e->q->device, 0); LONG k;
+        if (!pat) return;
+        mad_ffx_sync(e);   /* the fill waits for everything before it ... */
+        for (i = 0; i < n; i++) {
+            struct mad_cmd fc;
+            memset(&fc, 0, sizeof fc);
+            fc.kind = MC_FILL_TEX;
+            fc.u.filltex.res = t[i]; fc.u.filltex.level = 0; fc.u.filltex.sl0 = 0; fc.u.filltex.nsl = ~0u;
+            fc.u.filltex.bpp = 4; fc.u.filltex.pattern = pat;
+            exec_copy(e, &fc);
+        }
+        mad_ffx_sync(e);   /* ... and the Setup pass waits for the fill */
+        k = InterlockedIncrement(&g_fsz_n);
+        if (k <= 4 || !(k % 1800))
+            d3d12_log("[fi-setup-zero] #%ld: cs %016llx %ux%ux%u, %u R32 UAV textures %ux%u (first r#%u) zero-filled before it\n",
+                      (long)k, (unsigned long long)e->cpso->cs_hash, c->u.dispatch.x, c->u.dispatch.y, c->u.dispatch.z,
+                      n, t[0]->width, t[0]->height, t[0]->serial);
+    }
+}
+/* After a compute dispatch (replay loop, MC_DISPATCH only). */
+static void mad_ffx_after(struct mad_exec *e, const struct mad_cmd *c) {
+    int ffx;
+    if (!e->cpso || !e->cpso->is_compute) return;
+    ffx = !strcmp(e->cpso->vs_name, "CS");
+    if (g_ffc && ffx) {
+        struct mad_resource *t[MAD_FFC_WATCH]; unsigned n;
+        LONG64 p = g_presents_now;
+        AcquireSRWLockExclusive(&g_ffc_lock);
+        if (g_ffc_budget && p <= g_ffc_win + 2) {
+            g_ffc_step++;
+            n = mad_ffx_uavs(e, t, MAD_FFC_WATCH, 0);
+            mad_ffc_watch_locked(t, n);   /* later passes' 4-byte targets join the watch */
+            mad_ffx_sync(e);
+            if (exec_begin_blit(e)) mad_ffc_copy_locked(e, c, t, n);   /* ends the compute encoder: the copies see this dispatch */
+            mad_ffx_sync(e);
+        }
+        ReleaseSRWLockExclusive(&g_ffc_lock);
+    }
+    if (g_cs_split && e->cenc && (g_cs_split == 1 || ffx)) {
+        LONG k;
+        mad_ffx_sync(e);   /* the next encoder waits for this one, whatever the fence-chain mode */
+        exec_end(e);
+        k = InterlockedIncrement(&g_cs_split_n);
+        if (k == 1 || !(k % 50000)) d3d12_log("[cs-split] %ld dispatches have ended their compute encoder so far\n", (long)k);
+    }
+}
+/* One copy's census: texels v with (v & 0x7c00) == 0x7c00 hold a NaN (mantissa
+ * bits set) or an Inf half-float in bits 0..15, where FSR's vector fields keep
+ * a vector component; sum is an FNV-1a of the texels, to see a change. */
+struct mad_ffc_counts { UINT64 nz, nan, inf, sum; UINT bx0, by0, bx1, by1; int nex; char ex[192]; };
+static void mad_ffc_count(const UINT32 *px, UINT w, UINT h, struct mad_ffc_counts *o) {
+    UINT x, y; int ln = 0;
+    memset(o, 0, sizeof *o);
+    o->sum = 0xcbf29ce484222325ull; o->bx0 = o->by0 = ~0u;
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++) {
+            UINT32 v = px[(size_t)y * w + x];
+            o->sum = (o->sum ^ v) * 0x100000001b3ull;
+            if (!v) continue;
+            o->nz++;
+            if ((v & 0x7c00u) != 0x7c00u) continue;
+            if (!(v & 0x3ffu)) { o->inf++; continue; }
+            o->nan++;
+            if (x < o->bx0) o->bx0 = x;
+            if (y < o->by0) o->by0 = y;
+            if (x > o->bx1) o->bx1 = x;
+            if (y > o->by1) o->by1 = y;
+            if (o->nex < 4 && ln < (int)sizeof o->ex - 32) { ln += snprintf(o->ex + ln, sizeof o->ex - ln, " (%u,%u)=%08x", x, y, v); o->nex++; }
+        }
+}
+/* At Present: scan the copies whose command buffer has completed, in order.
+ * Logged: the first copy of each texture in a window, every copy that changed,
+ * and every copy holding NaN halves. */
+static void mad_ffc_poll(void) {
+    static LONG64 prev_win = -1; static struct { const struct mad_resource *r; UINT64 sum; } prev[MAD_FFC_WATCH];
+    struct mad_resource *rel[MAD_FFC_WATCH]; unsigned nrel = 0;
+    if (g_ffc <= 0) return;
+    AcquireSRWLockExclusive(&g_ffc_lock);
+    while (g_ffc_n) {
+        struct mad_ffc_rec *q = &g_ffc_q[g_ffc_head];
+        enum WMTCommandBufferStatus st = MTLCommandBuffer_status(q->cb);
+        if (st < WMTCommandBufferStatusCompleted) break;
+        if (q->win != prev_win) { prev_win = q->win; memset(prev, 0, sizeof prev); }
+        if (st == WMTCommandBufferStatusCompleted) {
+            struct mad_ffc_counts k; unsigned i; int slot = -1, first = 0;
+            mad_ffc_count((const UINT32 *)q->cpu, q->w, q->h, &k);
+            for (i = 0; i < MAD_FFC_WATCH; i++) if (prev[i].r == q->r) { slot = (int)i; break; }
+            if (slot < 0) for (i = 0; i < MAD_FFC_WATCH; i++) if (!prev[i].r) { slot = (int)i; prev[i].r = q->r; first = 1; break; }
+            if ((first || slot < 0 || prev[slot].sum != k.sum || k.nan) && InterlockedIncrement(&g_ffc_lines) <= 4000) {
+                char box[64] = "";
+                if (k.nan) snprintf(box, sizeof box, " in (%u,%u)-(%u,%u)", k.bx0, k.by0, k.bx1, k.by1);
+                d3d12_log("[fi-field] p%lld s%02u list#%u cs %016llx %ux%ux%u r#%u %ux%u pf%u%s: nonzero %llu of %u, NaN-half %llu%s, "
+                          "Inf-half %llu%s%s%s\n", (long long)q->win, q->step, q->list, (unsigned long long)q->hash, q->gx, q->gy, q->gz,
+                          q->rser, q->tw, q->th, q->pf, q->bound ? " (bound)" : "", (unsigned long long)k.nz, q->w * q->h,
+                          (unsigned long long)k.nan, box, (unsigned long long)k.inf,
+                          first ? " first" : slot >= 0 && prev[slot].sum != k.sum ? " changed" : "", k.nex ? ", e.g." : "", k.ex);
+            }
+            if (slot >= 0) prev[slot].sum = k.sum;
+        }
+        { struct mad_capbuf t; memset(&t, 0, sizeof t); t.buf = q->buf; t.own = q->cpu; mad_capbuf_free(&t); }
+        NSObject_release(q->cb);
+        g_ffc_head = (g_ffc_head + 1) % MAD_FFC_MAX; g_ffc_n--;
+    }
+    if (!g_ffc_n && g_ffc_nwatch && g_presents_now > g_ffc_win + 3) nrel = mad_ffc_unwatch_locked(rel);
+    ReleaseSRWLockExclusive(&g_ffc_lock);
+    mad_ffc_release(rel, nrel);
 }
 
 static void STDMETHODCALLTYPE device_CreateConstantBufferView(ID3D12Device *This,
@@ -19986,6 +20293,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     { LONG64 tf = mad_qpc();   /* ml1128 */
     mad_device_flush_all(s->queue->device);          /* ml884: the frame's batch precedes the present */
     InterlockedExchangeAdd64(&g_xp.t_flush, mad_qpc() - tf); }
+    mad_ffc_poll();   /* fi-field-check: copies whose command buffer has completed */
     {   /* ml1098: manual frame capture -- finish the frame that just ended, then see whether the UI asked for another */
         struct madeira_ctl_args a;
         if (g_capture_on) { mad_capture_finish(s->queue->device, g_capture_frame); if (g_capture_left) g_capture_left--; g_capture_on = 0; }
