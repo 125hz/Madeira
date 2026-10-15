@@ -227,28 +227,6 @@ enum SteamRuntimeFiles {
         }
         return lines.joined(separator: "\n")
     }
-
-    /// ml1371: the Steam folders a hive's discovery keys name now (machine:
-    /// InstallPath; user: SteamPath), as Windows paths, without duplicates.
-    static func discoveryRoots(_ text: String, machine: Bool) -> [String] {
-        let sections = machine ? ["software\\\\valve\\\\steam", "software\\\\wow6432node\\\\valve\\\\steam"] : ["software\\\\valve\\\\steam"]
-        let name = machine ? "\"installpath\"=" : "\"steampath\"="
-        var roots: [String] = []
-        var inside = false
-        for line in text.components(separatedBy: "\n") {
-            let lower = line.lowercased()
-            if lower.hasPrefix("[") {
-                inside = sections.contains { lower.hasPrefix("[" + $0 + "]") }
-                continue
-            }
-            guard inside, lower.hasPrefix(name) else { continue }
-            var value = String(line.dropFirst(name.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-            if value.hasPrefix("\""), value.hasSuffix("\""), value.count >= 2 { value = String(value.dropFirst().dropLast()) }
-            value = value.replacingOccurrences(of: "\\\\", with: "\\")
-            if !value.isEmpty, !roots.contains(where: { $0.caseInsensitiveCompare(value) == .orderedSame }) { roots.append(value) }
-        }
-        return roots
-    }
 }
 
 #if canImport(CryptoKit)

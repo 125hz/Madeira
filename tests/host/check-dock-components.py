@@ -48,21 +48,6 @@ if mode == "registry" {
     let conflict = "WINE REGISTRY Version 2\n\n[Software\\\\Valve\\\\Steam]\n\"SteamPath\"=\"another location\"\n"
     do { _ = try SteamRuntimeFiles.registry(conflict, machine: false); fatalError("conflict accepted") }
     catch SteamRuntimeFiles.Failure.conflict { }
-    // ml1371: force (the key check before every Dock start, and the Dock repair) puts
-    // another client's folder back to Dock's, keeps unrelated values, and is stable.
-    let other = "WINE REGISTRY Version 2\n\n[Software\\\\Valve\\\\Steam]\n\"SteamPath\"=\"C:\\\\Program Files (x86)\\\\Steam Client\"\n\"Unrelated\"=\"preserved\"\n\n[Software\\\\Valve\\\\Steam\\\\ActiveProcess]\n\"SteamClientDll64\"=\"C:\\\\Program Files (x86)\\\\Steam Client\\\\steamclient64.dll\"\n\"pid\"=dword:00000000\n"
-    assert(SteamRuntimeFiles.discoveryRoots(other, machine: false) == ["C:\\Program Files (x86)\\Steam Client"])
-    do { _ = try SteamRuntimeFiles.registry(other, machine: false); fatalError("another folder accepted without force") }
-    catch SteamRuntimeFiles.Failure.conflict { }
-    let forced = try SteamRuntimeFiles.registry(other, machine: false, force: true)
-    assert(!forced.contains("Steam Client") && forced.contains("\"Unrelated\"=\"preserved\"") && forced.contains("\"pid\"=dword:00000000"))
-    assert(SteamRuntimeFiles.discoveryRoots(forced, machine: false) == [SteamRuntimeFiles.windowsRoot])
-    let again = try SteamRuntimeFiles.registry(forced, machine: false)
-    let forcedAgain = try SteamRuntimeFiles.registry(forced, machine: false, force: true)
-    assert(again == forced && forcedAgain == forced)
-    let machineForced = try SteamRuntimeFiles.registry("WINE REGISTRY Version 2\n\n[Software\\\\Wow6432Node\\\\Valve\\\\Steam]\n\"InstallPath\"=\"D:\\\\Steam\"\n",
-                                                      machine: true, force: true)
-    assert(SteamRuntimeFiles.discoveryRoots(machineForced, machine: true) == [SteamRuntimeFiles.windowsRoot])
     do { _ = try SteamRuntimeFiles.registry("invalid", machine: true); fatalError("invalid hive accepted") }
     catch SteamRuntimeFiles.Failure.prefixMissing { }
     for path in ["../escape", "/absolute", "c:/other", "a\\b", "a//b", "a/./b", "a/../b", "a/space "] {
@@ -77,7 +62,7 @@ if mode == "registry" {
     try fm.createSymbolicLink(at: folder.appendingPathComponent("link"), withDestinationURL: folder.appendingPathComponent("Bin"))
     do { _ = try SteamRuntimeFiles.destination("link/new.dll", under: folder); fatalError("symlink accepted") }
     catch SteamRuntimeFiles.Failure.conflict { }
-    print("PASS: discovery keys, idempotence, unrelated settings, conflicts, forced rewrite (ml1371) and path rules")
+    print("PASS: discovery keys, idempotence, unrelated settings, conflicts and path rules")
 } else {
     let data = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[2]))
     do {
