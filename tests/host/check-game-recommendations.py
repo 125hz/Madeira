@@ -64,12 +64,12 @@ for m in re.finditer(r'static let (\w+) = GameRecommendation\(\n\s*id: "([^"]+)"
     body = body.replace('\\\\', '\\')
     lines = [line[len(indent):] if line.startswith(indent) else line for line in body.split('\n')]
     presets[ident] = dict(name=name, title=title, version=int(version), lines=lines, switches=' '.join((switches or '').split()))
-assert set(presets) == {'rdr2-steam', 'rdr2-other', 'gta5e-steam', 'gta5e-other', 'ghost-of-tsushima', 'god-of-war',
+assert set(presets) == {'rdr2-steam', 'rdr2-other', 'gta5e-steam', 'gta5e-other', 'gta5l-steam', 'ghost-of-tsushima', 'god-of-war',
                         'horizon-zero-dawn', 'horizon-forbidden-west', 'ratchet-clank-rift-apart', 'crysis-remastered',
                         'crysis-2-remastered', 'crysis-3-remastered', 'standard'}, sorted(presets)
-assert ('static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, ghostOfTsushima, godOfWar, horizonZeroDawn,\n'
-        '                      horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered, crysis2Remastered, crysis3Remastered,\n'
-        '                      standard]') in lists_src
+assert ('static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, gta5LegacySteam, ghostOfTsushima, godOfWar,\n'
+        '                      horizonZeroDawn, horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered, crysis2Remastered,\n'
+        '                      crysis3Remastered, standard]') in lists_src
 
 # madeira-bcd's defaults where upstream's differ: every game madeira-bcd ran had them,
 # so every game's own list ends with them. The standard list reaches every other game
@@ -112,7 +112,7 @@ for ident, p in presets.items():
         if key != 'env.WINEDLLOVERRIDES':
             named = named.replace('socialclubhelper.exe', '')
         assert 'socialclub' not in named and 'MADEIRA_DLL_LOCAL' not in line, (ident, line)
-print('PASS: thirteen lists, two comment lines each, every game list ends with the four fork defaults and the standard one has none, no key twice, '
+print('PASS: fourteen lists, two comment lines each, every game list ends with the four fork defaults and the standard one has none, no key twice, '
       'every non-env key in the settings catalog, no Social Club DLL lines, no variant DLL switches')
 
 # Red Dead Redemption 2 from Steam: the owner's list of 2026-10-09 (build 463), line for line,
@@ -342,7 +342,24 @@ assert 'if steamAppID == horizonZeroDawnAppID || installFolder == "horizon zero 
 assert 'installFolder == "ghost of tsushima director\'s cut"' in match and 'installFolder == "godofwar"' in match
 assert 'case "playgtav.exe", "gta5_enhanced.exe":' in match and 'return inSteam ? gta5EnhancedSteam : gta5EnhancedOther' in match
 assert 'return inSteam ? rdr2Steam : rdr2Other' in match
-assert 'guard fileExists(folder + "\\\\GTA5_Enhanced.exe") else { return nil }' in match and 'default:\n            return nil' in match
+assert 'guard fileExists(folder + "\\\\GTA5_Enhanced.exe") else {' in match and 'default:\n            return nil' in match
+# GTA V Legacy: Steam only; Enhanced (GTA5_Enhanced.exe beside the program) is checked first.
+assert 'static let gta5LegacyAppID = 271590' in lists_src
+assert 'if steamAppID == gta5LegacyAppID || installFolder == "grand theft auto v" { return gta5LegacySteam }' in match
+assert 'return last == "playgtav.exe" && inSteam && fileExists(folder + "\\\\GTA5.exe") ? gta5LegacySteam : nil' in match
+assert 'case "gta5.exe":\n            // GTA V Legacy\'s game program, from Steam only.\n            return inSteam ? gta5LegacySteam : nil' in match
+# GTA V Legacy (Steam) v1 (madeira-bcd build 547): DirectX 11, so no D3D12 lines and no DualSense mode; no vram-mb or
+# swap-mb in the list; a device under 12 GB of RAM gets the 3 GB RAM swap after it.
+legacy = presets['gta5l-steam']
+assert legacy['version'] == 1 and legacy['title'] == 'GTA V Legacy (Steam)', legacy
+assert 'env.MADEIRA_DOCK_KEEP_ALIVE = Launcher.exe;GTA5.exe' in legacy['tested']
+assert 'env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;.be\\vc_redist' in legacy['tested']
+assert not any(line.startswith(('d3d12-', 'pso-warm', 'vram-mb', 'swap-mb', 'env.MADEIRA_PAD_MODE')) for line in legacy['lines']), legacy['lines']
+assert legacy['switches'] == ('avx: false, nvidia: true, wineVCRT: false, fastSync: true, semaphoreFastPath: true, fpsMode: 4, '
+                              'display: "fit", smallRAMConfig: smallRAMSwapLines'), legacy['switches']
+assert 'static let smallRAMSwapLines = "swap-mb = 3072"' in lists_src
+assert 'static var smallRAMDevice: Bool { deviceRAMBytes < 10 << 30 }' in lists_src
+assert lists_src.count('smallRAMConfig: smallRAMSwapLines') == 1
 
 # Where the app applies them.
 save = block(library, '    func save(_ entry: LibraryEntry) {', '\n    }\n')
@@ -495,7 +512,30 @@ check(id(other + #"\PlayGTAV.exe"#, files: [other + #"\GTA5_Enhanced.exe"#]) == 
 check(id(other + #"\GTA5_Enhanced.exe"#, files: [other + #"\GTA5_Enhanced.exe"#]) == "gta5e-other", "GTA5_Enhanced.exe elsewhere")
 check(id(#"C:\GAMES\gta v enhanced\PLAYGTAV.EXE"#, files: [other + #"\gta5_enhanced.exe"#]) == "gta5e-other", "names in any case")
 check(id("C:/Games/GTA V Enhanced/PlayGTAV.exe", files: [other + #"\GTA5_Enhanced.exe"#]) == "gta5e-other", "forward slashes")
-check(id(#"C:\Games\GTA V\PlayGTAV.exe"#, files: [#"C:\Games\GTA V\GTA5.exe"#]) == "none", "the legacy edition has no list")
+check(id(#"C:\Games\GTA V\PlayGTAV.exe"#, files: [#"C:\Games\GTA V\GTA5.exe"#]) == "none", "the legacy edition outside Steam has no list")
+check(id(#"C:\Games\GTA V\GTA5.exe"#) == "none", "GTA5.exe outside Steam has no list")
+let legacy = steam + #"\Grand Theft Auto V"#
+check(id(legacy, 271590) == "gta5l-steam", "GTA V Legacy by its App ID")
+check(id(legacy) == "gta5l-steam", "GTA V Legacy by its Steam folder")
+check(id(legacy + #"\PlayGTAV.exe"#, files: [legacy + #"\GTA5.exe"#]) == "gta5l-steam", "Legacy's PlayGTAV.exe inside Steam")
+check(id(legacy + #"\GTA5.exe"#) == "gta5l-steam", "Legacy's GTA5.exe inside Steam")
+check(id(legacy + #"\PlayGTAV.exe"#) == "none", "PlayGTAV.exe inside Steam with neither game program beside it")
+check(id(gta + #"\PlayGTAV.exe"#, files: [gta + #"\GTA5_Enhanced.exe"#, gta + #"\GTA5.exe"#]) == "gta5e-steam",
+      "GTA5_Enhanced.exe beside PlayGTAV.exe stays Enhanced, even with a GTA5.exe there")
+check(id(legacy + #"\_CommonRedist\vc_redist.x64.exe"#, 271590) == "none", "not Legacy's redistributables")
+// The device's RAM: GTA V Legacy's 3 GB RAM swap only under 12 GB; every other list the same everywhere.
+R.deviceRAMBytes = 11_695 << 20
+let onTwelve = R.all.map { $0.fileText }
+check(!R.gta5LegacySteam.fileText.contains("swap-mb") && !R.gta5LegacySteam.fileText.contains("vram-mb"),
+      "a 12 GB phone: no RAM swap in GTA V Legacy's list")
+R.deviceRAMBytes = 16 << 30
+check(R.all.map { $0.fileText } == onTwelve, "a 16 GB iPad: the same lists as a 12 GB phone")
+R.deviceRAMBytes = 7_500 << 20
+check(R.gta5LegacySteam.fileText.hasSuffix("env.MADEIRA_JIT_DUMP = 0\nswap-mb = 3072\n"),
+      "an 8 GB phone: the 3 GB RAM swap after GTA V Legacy's list")
+check(zip(R.all, onTwelve).allSatisfy { $0.0.id == "gta5l-steam" || $0.0.fileText == $0.1 },
+      "every other list is the same on an 8 GB phone")
+R.deviceRAMBytes = 11_695 << 20
 check(id(other + #"\PlayGTAV.exe"#) == "none", "PlayGTAV.exe without GTA5_Enhanced.exe beside it")
 check(id(#"C:\GhostOfTsushima\GhostOfTsushima.exe"#) == "ghost-of-tsushima", "GoT by its program")
 check(id(#"E:\Some Other Folder\ghostoftsushima.EXE"#) == "ghost-of-tsushima", "GoT anywhere, in any case")
