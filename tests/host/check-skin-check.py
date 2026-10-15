@@ -75,6 +75,9 @@ check('skin-check-every defaults to 300 presents, at least 30', 'mad_cfg_int_pe(
       'g_skin_every = ev < 30 ? 30 : ev;' in pe)
 check('skin-check-capture defaults to on (copies), 0 logs only', 'mad_cfg_int_pe("skin-check-capture", 1)' in pe)
 check('view-census off by default', 'mad_cfg_int_pe("view-census", 0)' in pe)
+check('tv-hash on by default (0 keeps the scan), in the settings catalog; the table is freed with the resource',
+      'mad_cfg_int_pe("tv-hash", 1)' in pe and 'ConfigOption(key: "tv-hash"' in catalog and
+      'free(r->tview); free(r->tvh); free(r->xview);' in pe and 'k = mad_tvh_find(r, (UINT)fmt, byte_off, num, (UINT)uav);' in pe)
 
 draw = body('static void exec_draw(struct mad_exec *e, const struct mad_cmd *c)')
 check('draw: the hook runs only with the switch on, before the render pass begins',
@@ -249,7 +252,8 @@ static LONG64 InterlockedExchangeAdd64(volatile LONG64 *p, LONG64 v) { LONG64 o 
 static LONG InterlockedExchange(volatile LONG *p, LONG v) { LONG o = *p; *p = v; return o; }
 struct mad_tvs { LONG64 seen; UINT32 k; int dropped; };
 struct mad_tview { UINT fmt; UINT64 off, num; UINT8 uav, eoff; obj_handle_t tex; UINT64 id, sh_gpu; struct mad_tvs *sh; };
-struct mad_resource { obj_handle_t buffer; void *cpu; UINT64 size, gpu_address; struct mad_tview *tview; unsigned ntview, tview_cap; int heap; };
+struct mad_resource { obj_handle_t buffer; void *cpu; UINT64 size, gpu_address; struct mad_tview *tview; unsigned ntview, tview_cap; int heap;
+                      UINT32 *tvh; unsigned tvh_cap; /* tv-hash */ };
 typedef struct mad_resource ID3D12Resource;
 static int released;
 static void ID3D12Resource_Release(ID3D12Resource *r) { (void)r; released++; }
@@ -336,7 +340,9 @@ static obj_handle_t mad_tvs_view_x(struct mad_device *d, struct mad_resource *r,
     if (ti->pixel_format != WMTPixelFormatRGBA32Float) return 0;
     return mad_tvs_view(d, r, ti, byte_off, num, bytes, gpu, rec);
 }
-''' + body('static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, DXGI_FORMAT fmt,') + r'''
+static long long tvh_cfg = 1;
+static long long mad_cfg_int_pe(const char *k, long long d) { (void)k; (void)d; return tvh_cfg; }
+''' + pe[pe.index('#define MAD_TVH_MIN'):pe.index('/* why (may be NULL): 0, or the g_vc_why index')] + body('static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, DXGI_FORMAT fmt,') + r'''
 static int bad;
 #define EXPECT(c, what) do { if (!(c)) { printf("FAIL %s\n", what); bad = 1; } else printf("ok   %s\n", what); } while (0)
 static int qa, qb;
@@ -520,6 +526,43 @@ int main(void) {
         mad_skin_flush(&qa);
         EXPECT(b64_lines == 0 && strstr(logbuf, "dump budget is spent; J dump") != NULL && strstr(logbuf, "[skin-cap] J dump") != NULL,
                "skin-dump: past the 4 MB budget only the summary");
+    }
+    {   /* tv-hash: from 32 views on, lookups go through the table and find what the scan would */
+        struct mad_device d = { { 0 } };
+        struct mad_resource big = { (obj_handle_t)7, NULL, 256u << 20, 0x300000000ull, NULL, 0, 0 };
+        struct mad_descriptor e;
+        unsigned i, n; UINT64 id17 = 0; int why, ok = 1;
+        tv_align = 64; tv_mode = 64; tvs_on = 0; tv_rgb32 = 0; metal_refuses = 0; grow_fails = 0;
+        for (i = 0; i < 31; i++) ok &= mad_typed_buffer_view(&d, &big, 41, (UINT64)i * 64, 16, 0, &e, &why) == 1;
+        EXPECT(ok && big.ntview == 31 && !big.tvh, "31 views: no table, the scan");
+        ok &= mad_typed_buffer_view(&d, &big, 41, 31 * 64, 16, 0, &e, &why) == 1;
+        EXPECT(ok && big.ntview == 32 && big.tvh && big.tvh_cap == 128, "the 32nd view builds a 128-slot table");
+        for (i = 32; i < 3000; i++) ok &= mad_typed_buffer_view(&d, &big, 41, (UINT64)i * 64, 16, 0, &e, &why) == 1;
+        EXPECT(ok && big.ntview == 3000 && big.tvh_cap == 8192, "3,000 views: the table doubled to stay at most half full (8,192 slots)");
+        for (i = 0, n = 0; i < big.tvh_cap; i++) n += big.tvh[i] != 0;
+        EXPECT(n == 3000, "every view has one slot");
+        ok = mad_typed_buffer_view(&d, &big, 41, 17 * 64, 16, 0, &e, &why) == 1; id17 = e.texture_view_id;
+        EXPECT(ok && big.ntview == 3000 && id17 == big.tview[17].id, "a repeated (format, offset, count) finds its view, none made");
+        ok = mad_typed_buffer_view(&d, &big, 41, 17 * 64, 16, 1, &e, &why) == 1;
+        EXPECT(ok && big.ntview == 3001 && e.texture_view_id != id17, "the same range as a UAV is another view");
+        ok = mad_typed_buffer_view(&d, &big, 42, 17 * 64, 16, 0, &e, &why) == 1;
+        EXPECT(ok && big.ntview == 3002, "another format is another view");
+        ok = mad_typed_buffer_view(&d, &big, 41, 17 * 64, 17, 0, &e, &why) == 1;
+        EXPECT(ok && big.ntview == 3003, "another count is another view");
+        big.tview[5].fmt = 0;   /* typed-view-shadow gave its copy away: it matches no lookup */
+        ok = mad_typed_buffer_view(&d, &big, 41, 5 * 64, 16, 0, &e, &why) == 1;
+        EXPECT(ok && big.ntview == 3004 && e.texture_view_id == big.tview[3003].id, "a view whose copy was given away no longer matches; a new one is made and found");
+        ok = mad_typed_buffer_view(&d, &big, 41, 5 * 64, 16, 0, &e, &why) == 1;
+        EXPECT(ok && big.ntview == 3004, "... and found again");
+        {   /* the same lookups with tv-hash = 0 */
+            struct mad_resource lin = { (obj_handle_t)8, NULL, 256u << 20, 0x400000000ull, NULL, 0, 0 };
+            int save = g_tvh_on; g_tvh_on = 0;
+            for (i = 0, ok = 1; i < 100; i++) ok &= mad_typed_buffer_view(&d, &lin, 41, (UINT64)i * 64, 16, 0, &e, &why) == 1;
+            ok &= mad_typed_buffer_view(&d, &lin, 41, 40 * 64, 16, 0, &e, &why) == 1;
+            EXPECT(ok && lin.ntview == 100 && !lin.tvh && e.texture_view_id == lin.tview[40].id, "tv-hash = 0: no table, the scan finds the same view");
+            g_tvh_on = save; free(lin.tview);
+        }
+        free(big.tview); free(big.tvh);
     }
     printf("%s\n", bad ? "harness FAILED" : "harness ok");
     return bad;

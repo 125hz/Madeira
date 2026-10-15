@@ -1170,6 +1170,7 @@ struct mad_resource {
      * that descriptors still named as soon as a 17th distinct view appeared. */
     struct mad_tview { UINT fmt; UINT64 off, num; UINT8 uav, eoff; obj_handle_t tex; UINT64 id, sh_gpu; struct mad_tvs *sh; } *tview;   /* eoff: elements before the view's first (madeira-bcd typed-view-align); sh_gpu / sh: its typed-view-shadow copy, 0 = none */
     unsigned ntview, tview_cap;
+    UINT32 *tvh; unsigned tvh_cap;            /* tv-hash: index + 1 of each typed view by (format, offset, count, access); view_lock */
     void *view_old[24]; unsigned nview_old;   /* outgrown arrays, freed with the resource */
     unsigned srv_slot, uav_slot;              /* index + 1 in the device's srv_res / uav_res, 0 = absent (list_lock) */
     UINT64 acct_bytes; unsigned acct_cat;        /* ml1057: live-backing census */
@@ -12253,6 +12254,57 @@ static void mad_tvs_report(void) {
               fq.QuadPart ? tk * 1000.0 / (double)fq.QuadPart : 0.0, (long)g_tvs_copies, (long long)g_tvs_late,
               g_tv_rgb32 > 0, (long)g_tv_rgb32_views, (long)g_tv_rgb32_other);
 }
+/* tv-hash. A typed-buffer view is looked up by (format, offset,
+ * count, access) among its resource's views, which are never released (ml1049).
+ * Horizon Forbidden West's six 256 MB geometry buffers pass 16,384 views each
+ * (531: 118,000 live after 3 minutes), and every CreateShaderResourceView /
+ * CreateUnorderedAccessView of one scanned them all under the device's
+ * view_lock, which every thread creating views shares. From MAD_TVH_MIN views
+ * on, a resource keeps an open-addressing table of view indices (load <= 1/2,
+ * rebuilt doubled); a slot only says where to compare, so a view whose copy was
+ * given away (fmt 0, typed-view-shadow) just stops matching. view_lock held
+ * throughout; no lock-free reader. madeira.cfg tv-hash = 0 keeps the scan. */
+#define MAD_TVH_MIN 32u
+static int g_tvh_on = -1;
+static UINT32 mad_tvh_hash(UINT fmt, UINT64 off, UINT64 num, UINT uav) {
+    UINT64 h = (off * 0x9E3779B97F4A7C15ull) ^ ((num + ((UINT64)fmt << 40) + ((UINT64)uav << 62)) * 0xC2B2AE3D27D4EB4Full);
+    h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
+    return (UINT32)h;
+}
+static void mad_tvh_put(UINT32 *t, unsigned cap, const struct mad_resource *r, unsigned k) {
+    const struct mad_tview *v = &r->tview[k];
+    unsigned i = mad_tvh_hash(v->fmt, v->off, v->num, v->uav) & (cap - 1);
+    while (t[i]) i = (i + 1) & (cap - 1);
+    t[i] = k + 1;
+}
+/* After view k was published: index it, building or doubling the table as
+ * needed. Out of memory: the table goes and lookups scan again. */
+static void mad_tvh_add(struct mad_resource *r, unsigned k) {
+    unsigned cap, j;
+    UINT32 *t;
+    if (g_tvh_on < 0) g_tvh_on = mad_cfg_int_pe("tv-hash", 1) ? 1 : 0;   /* fix: typed-buffer views are found through a hash table once a resource has 32 of them, instead of a scan of all of its views under the device-wide view lock; 0 = the scan as before */
+    if (!g_tvh_on || r->ntview < MAD_TVH_MIN) return;
+    if (r->tvh && (UINT64)r->ntview * 2 <= r->tvh_cap) { mad_tvh_put(r->tvh, r->tvh_cap, r, k); return; }
+    for (cap = r->tvh_cap ? r->tvh_cap * 2 : 128; cap < r->ntview * 2; cap *= 2) {}
+    if (!(t = calloc(cap, sizeof *t))) { free(r->tvh); r->tvh = NULL; r->tvh_cap = 0; return; }
+    for (j = 0; j < r->ntview; j++) mad_tvh_put(t, cap, r, j);
+    free(r->tvh);
+    r->tvh = t; r->tvh_cap = cap;
+}
+/* The index of the matching view, or r->ntview. */
+static unsigned mad_tvh_find(const struct mad_resource *r, UINT fmt, UINT64 off, UINT64 num, UINT uav) {
+    unsigned k, i;
+    if (!r->tvh) {
+        for (k = 0; k < r->ntview; k++)
+            if (r->tview[k].fmt == fmt && r->tview[k].off == off && r->tview[k].num == num && r->tview[k].uav == (UINT8)uav) return k;
+        return r->ntview;
+    }
+    for (i = mad_tvh_hash(fmt, off, num, uav) & (r->tvh_cap - 1); r->tvh[i]; i = (i + 1) & (r->tvh_cap - 1)) {
+        k = r->tvh[i] - 1;
+        if (r->tview[k].fmt == fmt && r->tview[k].off == off && r->tview[k].num == num && r->tview[k].uav == (UINT8)uav) return k;
+    }
+    return r->ntview;
+}
 /* why (may be NULL): 0, or the g_vc_why index of a refusal (1-8) or of a view
  * cut short (9, still made). */
 static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, DXGI_FORMAT fmt,
@@ -12278,8 +12330,7 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
     byte_off = first * bytes;
     if (mad_tv_mode() == 4) mad_tv_probe_once(d);   /* madeira-bcd typed-view-align = 4: before the first view, outside the lock */
     EnterCriticalSection(&d->view_lock);   /* ml1049: creation races creation on another thread */
-    for (k = 0; k < r->ntview; k++)
-        if (r->tview[k].fmt == (UINT)fmt && r->tview[k].off == byte_off && r->tview[k].num == num && r->tview[k].uav == (UINT8)uav) break;
+    k = mad_tvh_find(r, (UINT)fmt, byte_off, num, (UINT)uav);   /* tv-hash */
     if (k == r->ntview) {
         UINT al = mad_tv_align(d, pf, bytes);   /* madeira-bcd typed-view-align: 64 unless the switch says otherwise */
         int cut;
@@ -12355,6 +12406,7 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
         r->tview[k].eoff = (UINT8)elem_off; r->tview[k].sh_gpu = sh_gpu; r->tview[k].sh = sh;
         r->tview[k].tex = tex; r->tview[k].id = ti.gpu_resource_id;
         r->ntview = k + 1;   /* published last: a reader never sees a half-written entry */
+        mad_tvh_add(r, k);   /* tv-hash */
         if (sh) sh->k = k + 1;   /* typed-view-shadow: the view that names the copy (view_lock held, as when it is given away) */
         if (elem_off) {   /* madeira-bcd: what typed-view-align leaves to the converter (view-census reports it) */
             InterlockedIncrement(&g_tv_eoff_views);
@@ -13246,7 +13298,7 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
         if (r->buffer && !r->placed_heap) mad_unresident(r->owner, r->buffer);
         if (r->texture && !r->borrowed && !r->hp_used && !r->placed_heap) mad_unresident(r->owner, r->texture);
         if (r->hp_used && r->owner) mad_hp_release(r->owner, r);   /* ml1072: block returns after the GPU is done with it */
-        { unsigned k; for (k = 0; k < r->nview_old; k++) free(r->view_old[k]); free(r->tview); free(r->xview); }
+        { unsigned k; for (k = 0; k < r->nview_old; k++) free(r->view_old[k]); free(r->tview); free(r->tvh); free(r->xview); }
         if (r->buffer) NSObject_release(r->buffer);
         if (r->texture && !r->borrowed) NSObject_release(r->texture);
         if (r->resolve_tmp) NSObject_release(r->resolve_tmp);
