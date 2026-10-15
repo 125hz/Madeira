@@ -36,6 +36,15 @@ static DWORD fake_owner_pid, fake_self_pid = 0x24;
 static HWND NtUserGetForegroundWindow(void) { return fake_foreground; }
 static DWORD get_window_thread(HWND hwnd, DWORD *pid) { if (!hwnd) return 0; if (pid) *pid = fake_owner_pid; return 0x30; }
 #define GetCurrentProcessId() fake_self_pid
+/* ml2181 (this fork): the state line's focus evidence reads the GUI thread info; faked empty. */
+typedef struct { DWORD cbSize, flags; HWND hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret;
+                 struct { long left, top, right, bottom; } rcCaret; } GUITHREADINFO;
+static int NtUserGetGUIThreadInfo(DWORD tid, GUITHREADINFO *info) { (void)tid; memset(info, 0, sizeof(*info)); info->cbSize = sizeof(*info); return 1; }
+#define GA_ROOT 2
+static HWND NtUserGetAncestor(HWND hwnd, UINT flags) { (void)flags; return hwnd; }
+#define GetCurrentThreadId() 0x30u
+static void fake_err(const char *fmt, ...) { (void)fmt; }
+#define ERR fake_err
 '''
 tests = r'''
 static atomic_int finished;
