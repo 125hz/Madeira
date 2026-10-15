@@ -190,13 +190,8 @@ final class MadeiraWindowedBridge: NSObject {
 @MainActor
 enum WindowedSteam {
     static let installerURL = URL(string: "https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe")!
-    /// steam.exe relative to drive_c: ml1371's full-client folder, Madeira Dock's
-    /// folder (where Steam installs by default; the round 4 entries point there)
-    /// and the 64-bit tree. Matched for the icon, the library entry and the search.
-    static let clientPaths = [SteamClientPackages.clientRelativeRoot + "/steam.exe",
-                              "Program Files (x86)/Steam/steam.exe", "Program Files/Steam/steam.exe"]
-    /// ml1371: where a full client may run from. Never Madeira Dock's folder.
-    static let fullClientPaths = [SteamClientPackages.clientRelativeRoot + "/steam.exe", "Program Files/Steam/steam.exe"]
+    /// steam.exe relative to drive_c; Program Files (x86) is where Steam installs by default.
+    static let clientPaths = ["Program Files (x86)/Steam/steam.exe", "Program Files/Steam/steam.exe"]
     static let installerPath = "madeira-games/SteamSetup.exe"
     /// ml1370: the full client's start, as Valve's steam.exe spells its switches:
     /// no bootstrapper self-update, no initial bootstrap (manifest download and
@@ -241,13 +236,13 @@ enum WindowedSteam {
     /// ml1370: the steam.exe the button starts: the full 64-bit client (not Madeira
     /// Dock's 32-bit components); with env.MADEIRA_STEAM_PACKAGE_INSTALL = 0 any steam.exe.
     static var readyClient: String? {
-        let target = SteamClientPackages.target()
-        if target.shared, SteamClientPackages.installed(root: target.root) {
-            return target.windowsRoot + "\\steam.exe"
+        let original = LibraryModel.documents.appendingPathComponent("wine").path
+        if let shared = SharedContainer.drive(prefix: original),
+           SteamClientPackages.installed(root: URL(fileURLWithPath: shared).appendingPathComponent("Steam")) {
+            return "D:\\Steam\\steam.exe"
         }
         guard packageInstall else { return installedClient }
-        // ml1371: the full client's own folder (never Madeira Dock's; one there is offered the repair).
-        return fullClientPaths.first { SteamClientPackages.installed(root: LibraryModel.drive.appendingPathComponent(($0 as NSString).deletingLastPathComponent)) }
+        return clientPaths.first { SteamClientPackages.installed(root: LibraryModel.drive.appendingPathComponent(($0 as NSString).deletingLastPathComponent)) }
     }
 
     static func tapped() {
@@ -271,9 +266,9 @@ enum WindowedSteam {
             var message = "The full Steam client needs a lot of memory; the web helper may be killed."
             if MadeiraDock.enabled && MadeiraDock.clientInstalled {
                 message += packageInstall && MadeiraConfig.flag("MADEIRA_STEAM_LAUNCH_FLAGS", fallback: true)
-                    ? "\n\nMadeira starts Steam with -nobootstrapperupdate, so it does not update itself. The full client "
-                        + "has its own folder (\(SteamClientPackages.installWindowsRoot)); Madeira Dock's files stay as Dock "
-                        + "verified them."
+                    ? "\n\nMadeira starts Steam with -nobootstrapperupdate, so it does not update itself. Installing the full "
+                        + "client replaces Madeira Dock's client files with Valve's current build, and Dock refuses a client "
+                        + "build it has not verified."
                     : "\n\nSteam updates its own files when it runs; Madeira Dock refuses a client build it has not verified."
             }
             let alert = UIAlertController(title: "Steam", message: message, preferredStyle: .alert)
@@ -294,16 +289,6 @@ enum WindowedSteam {
         guard packageInstall else { legacyProceed(); return }
         if let client = readyClient {
             startClient(client)
-            return
-        }
-        // ml1371: an ml1370 install in Madeira Dock's folder: repair moves it to its own folder (or removes it).
-        if SteamClientPackages.inDockFolder() {
-            log("install (the full client is in Madeira Dock's folder; offering the Dock repair)")
-            SteamDockRepair.offer(reason: .fullClientInDockFolder) { repaired in
-                // Moved: the full client now starts from its own folder. Removed: install it there.
-                guard repaired, !SteamClientPackages.inDockFolder() else { return }
-                WindowedSteam.proceed()
-            }
             return
         }
         log("install (the full client is not in the prefix\(installedClient != nil ? "; the steam.exe there is not the 64-bit client" : ""))")
@@ -414,9 +399,9 @@ enum WindowedSteam {
             message = "An earlier Steam install stopped with \(pending.done) of \(pending.parts) packages done. Madeira "
                 + "continues from the first unfinished package (a newer client version from Valve starts over)."
         }
-        if MadeiraDock.enabled && MadeiraDock.clientInstalled {
-            message += "\n\nMadeira Dock's own client in \(SteamRuntimeFiles.windowsRoot) is not touched: the full client "
-                + "and Dock never share a folder."
+        if SteamClientPackages.installWindowsRoot == SteamRuntimeFiles.windowsRoot, MadeiraDock.enabled && MadeiraDock.clientInstalled {
+            message += "\n\nMadeira Dock's client files are in that folder. The current client replaces them, and Dock "
+                + "refuses a client build it has not verified, so Dock starts may fail until Dock supports that build."
         }
         let title = pending.map { "Resume Steam install (\($0.done) of \($0.parts) done)" } ?? "Install Steam"
         let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
@@ -438,39 +423,25 @@ enum WindowedSteam {
         guard entry.steamAppID == nil, entry.desktop != true,
               clientPaths.contains(where: { $0.caseInsensitiveCompare(entry.relativePath) == .orderedSame }) else { return entry }
         guard packageInstall else { return entry }
-        let ready = readyClient
-        if ready?.hasPrefix("D:") == true {
+        if readyClient?.hasPrefix("D:") == true {
             LibraryModel.shared.preparing = nil
             show("Steam", "Steam is installed on the shared D: drive. Start a Windows desktop session and open Steam from its taskbar.")
             return nil
         }
-        guard let ready else {
+        let folder = LibraryModel.drive.appendingPathComponent((entry.relativePath as NSString).deletingLastPathComponent)
+        guard SteamClientPackages.installed(root: folder) else {
             LibraryModel.shared.preparing = nil   // the starting screen: no session follows this press
-            if SteamClientPackages.inDockFolder() {
-                // ml1371: an ml1370 install in Madeira Dock's folder: repair first (it moves the client out).
-                fputs("[steam-install] ml1371 library entry \"\(entry.title)\": the full client is in Madeira Dock's folder; offering the Dock repair\n", stderr)
-                SteamDockRepair.offer(reason: .fullClientInDockFolder) { repaired in
-                    if repaired, !SteamClientPackages.inDockFolder() { retry(entry) }
-                }
-                return nil
-            }
             fputs("[steam-install] ml1370 library entry \"\(entry.title)\": the full client is not installed; offering the install\n", stderr)
             offerInstall { installed in if installed { retry(entry) } }
             return nil
         }
         var updated = entry
-        // ml1371: the entry starts the full client from its own folder (a round 4 entry pointed at Dock's).
-        if entry.relativePath.caseInsensitiveCompare(ready) != .orderedSame {
-            updated.relativePath = ready
-            updated.bits = 64   // the full client's steam.exe is x86-64 (SteamClientPackages.installed)
-            fputs("[steam-launch] ml1371 library entry \"\(entry.title)\": program moved from \(windowsPath(entry.relativePath)) to \(windowsPath(ready))\n", stderr)
-        }
         if entry.arguments.trimmingCharacters(in: .whitespaces) == legacyClientArguments, launchArguments != legacyClientArguments {
             updated.arguments = launchArguments
+            LibraryModel.shared.save(updated)
             fputs("[steam-launch] ml1370 library entry \"\(entry.title)\": switches brought from \(legacyClientArguments) to \(launchArguments)\n", stderr)
         }
-        if updated.relativePath != entry.relativePath || updated.arguments != entry.arguments { LibraryModel.shared.save(updated) }
-        launchLog(command: "\"\(windowsPath(updated.relativePath))\" " + updated.arguments, how: "library entry, a session of its own")
+        launchLog(command: "\"\(windowsPath(entry.relativePath))\" " + updated.arguments, how: "library entry, a session of its own")
         return updated
     }
 
@@ -935,123 +906,6 @@ struct SteamClientInstallSheet: View {
         }
         .padding(20)
         .frame(maxWidth: 520)
-    }
-}
-
-/// ml1371: Madeira Dock's folder back to its pinned client
-/// (SteamRuntimeInstaller.repairDock, SteamRuntime.swift). The full client and
-/// Dock never share a folder; an ml1370 install made before that rule put the
-/// current client into Dock's folder and Dock then refused every start
-/// (session-unsupported-client=1). Offered when the Steam button or the
-/// library's Steam entry finds the full client in Dock's folder, when a Dock
-/// start reports a client other than the pinned build (MadeiraDock.pollReport),
-/// and from the Madeira Dock sheet. Log: "[steam-install] ml1371 dock repair: …".
-@MainActor
-enum SteamDockRepair {
-    enum Reason { case fullClientInDockFolder, unsupportedClient }
-    private(set) static var running = false
-    private static var offeredForReport = false
-    private static weak var progressAlert: UIAlertController?
-
-    /// The full client sits in Madeira Dock's folder.
-    static var needed: Bool { SteamClientPackages.inDockFolder() }
-
-    private static func log(_ line: String) { fputs("[steam-install] ml1371 dock repair: \(line)\n", stderr) }
-
-    /// A Dock start reported a client build in Dock's folder: offer the repair
-    /// once per app run when it is not the pinned build.
-    static func offerAfterReport(clientSHA256: String) {
-        guard !running, !offeredForReport, clientSHA256.lowercased() != SteamRuntimeFiles.clientSHA256 else { return }
-        offeredForReport = true
-        log("offered (Dock reported client sha256=\(clientSHA256), not the pinned \(SteamRuntimeFiles.clientSHA256))")
-        offer(reason: .unsupportedClient) { _ in }
-    }
-
-    static func offer(reason: Reason, done: @escaping @MainActor (Bool) -> Void) {
-        guard !running else { done(false); return }
-        let target = SteamClientPackages.target()
-        let moves = !target.shared && SteamClientPackages.inDockFolder() && !FileManager.default.fileExists(atPath: target.root.path)
-        var message = reason == .fullClientInDockFolder
-            ? "Steam's full client was installed into Madeira Dock's folder (\(SteamRuntimeFiles.windowsRoot)). Dock only "
-                + "accepts the client build it verified, so games started through Dock do not boot."
-            : "Madeira Dock found a Steam client build it has not verified in its folder (\(SteamRuntimeFiles.windowsRoot)), "
-                + "so games started through Dock do not boot."
-        message += moves
-            ? " Repair moves the full client to \(target.windowsRoot), where it keeps working, and downloads Dock's three "
-                + "verified packages (about 73 MB) again."
-            : " Repair removes the other client's files from Dock's folder and downloads Dock's three verified packages "
-                + "(about 73 MB) again."
-        message += " Your Steam account data, settings and games (userdata, config, steamapps) stay where they are."
-        let alert = UIAlertController(title: "Repair Madeira Dock's Steam files", message: message, preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "Not now", style: .cancel) { _ in
-            SteamDockRepair.log("not started (declined)")
-            done(false)
-        })
-        alert.addAction(UIAlertAction(title: "Repair", style: .default) { _ in SteamDockRepair.run(done: done) })
-        WindowedSteam.present(alert)
-    }
-
-    static func run(done: @escaping @MainActor (Bool) -> Void) {
-        guard !running else { done(false); return }
-        let live = wine_process_is_running() != 0 || wineserver_is_running() != 0
-        // A Dock host that has not reported a result still uses the folder.
-        if live, getenv("MADEIRA_DOCK_SESSION").map({ String(cString: $0) == "1" }) == true, MadeiraDock.pollReport().result == nil {
-            log("not started (a Madeira Dock game is still running)")
-            WindowedSteam.show("Quit the game first", "Madeira Dock's Steam files are in use by the running game. Quit it, "
-                               + "then repair them from Settings › Steam › Madeira Dock.")
-            done(false)
-            return
-        }
-        running = true
-        let target = SteamClientPackages.target()
-        let prefix = MadeiraDock.prefix
-        log("start (\(SteamClientPackages.inDockFolder() ? "the full client is in Dock's folder" : "Dock's folder is not the pinned build"); "
-            + "\(live ? "a session is running: files only" : "no session: Dock's discovery keys are rewritten"))")
-        let alert = UIAlertController(title: "Repairing Madeira Dock's Steam files", message: "Starting…", preferredStyle: .alert)
-        progressAlert = alert
-        WindowedSteam.present(alert)
-        Task {
-            do {
-                let result = try await SteamRuntimeInstaller.shared.repairDock(prefix: prefix, clientRoot: target.shared ? nil : target.root) { text in
-                    await SteamDockRepair.setProgress(text)
-                }
-                let keys = result.keys ? "Dock's discovery keys rewritten"
-                    : (dockKeysIntact(prefix) ? "left (a session is running; Dock's keys still point at Dock's folder)"
-                        : "left (a session is running and another client changed Dock's keys: repair again without a session, "
-                            + "Settings › Steam › Madeira Dock, before the next game)")
-                SteamDockRepair.log("done (\(result.moved ? "moved the full client to \(target.windowsRoot)" : "removed \(result.removed) entries from Dock's folder"); "
-                    + "kept [\(result.kept.joined(separator: ", "))]; Dock's 3 pinned packages fetched; client sha256=\(result.sha256) "
-                    + "(pinned: \(result.sha256 == SteamRuntimeFiles.clientSHA256 ? "match" : "MISMATCH")); registry: \(keys))")
-                SteamDockRepair.finish("Madeira Dock's Steam files are repaired",
-                                       (result.moved ? "The full client now starts from \(target.windowsRoot). " : "")
-                                       + "Dock's folder holds the client build Dock verified again."
-                                       + (live ? " Restart Madeira (swipe it away) before the next game." : ""), ok: true, done)
-            } catch {
-                let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                SteamDockRepair.log("failed (\(reason))")
-                SteamDockRepair.finish("Madeira Dock's Steam files were not repaired", reason, ok: false, done)
-            }
-        }
-    }
-
-    private static func setProgress(_ text: String) { progressAlert?.message = text }
-
-    private static func finish(_ title: String, _ message: String, ok: Bool, _ done: @escaping @MainActor (Bool) -> Void) {
-        running = false
-        MadeiraDockModel.shared.refresh()
-        let show = { WindowedSteam.show(title, message); done(ok) }
-        if let alert = progressAlert, alert.presentingViewController != nil {
-            alert.dismiss(animated: true, completion: show)
-        } else {
-            show()
-        }
-        progressAlert = nil
-    }
-
-    /// Dock's discovery keys in user.reg do not point at another folder.
-    private static func dockKeysIntact(_ prefix: URL) -> Bool {
-        guard let text = try? String(contentsOf: prefix.appendingPathComponent("user.reg"), encoding: .utf8) else { return true }
-        return (try? SteamRuntimeFiles.registry(text, machine: false)) != nil
     }
 }
 
