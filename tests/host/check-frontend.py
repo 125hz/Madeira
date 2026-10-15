@@ -527,7 +527,7 @@ check(0 <= snap < loop and 'getenv(per_launch[i])' not in bridge[loop:bridge.ind
 # ml1184: every switch a game's page exports is one of those keys, and is cleared when the session ends.
 per_launch = set(re.findall(r'"([A-Z0-9_]+)"', block(bridge, 'static const char *const per_launch[] =')))
 exported = set(re.findall(r'setenv\("([A-Z0-9_]+)"', block(lib, 'func applyEnvironment()')))
-ended = bridge[bridge.index('/* ml1184: these belong to the launch that just ended'):]   # the ml1350 drop sits between g_wine_running = 0 and this comment now
+ended = bridge[bridge.index('/* ml1184: these belong to the launch that just ended'):]
 ended = set(re.findall(r'unsetenv\("([A-Z0-9_]+)"\)', ended[:ended.index('stopping wineserver')]))
 check(exported and exported <= per_launch and per_launch <= ended,
       "ml1184: the per-launch list holds every key applyEnvironment exports, and the session's end unsets them "

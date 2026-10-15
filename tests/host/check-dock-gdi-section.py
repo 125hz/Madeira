@@ -68,7 +68,6 @@ if gdiobj.exists():
         c = Path(tmp) / 't.c'
         c.write_text('#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\ntypedef int BOOL;\n'
                      '#ifndef TRUE\n#define TRUE 1\n#define FALSE 0\n#endif\n'
-                     'static BOOL gdi_shared_own_task;\n'   # ml1373: the remote-instance flag the function sets
                      'static int armed;\nstatic int ios_wow_session_armed(void) { return armed; }\n'
                      + func.replace('ios_wow_session_armed && ', '') +
                      'int main(int c, char **v) { armed = atoi(v[1]); printf("%d\\n", gdi_shared_use_section()); return 0; }\n')

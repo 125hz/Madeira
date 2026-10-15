@@ -100,8 +100,7 @@ Removing an entry never removes the game's files or saves.
   default; or vkd3d-proton on Vulkan, `d3d12 = vkd3d`, experimental, x64
   only), **Vulkan driver** (Automatic: off, MoltenVK when vkd3d-proton is
   chosen; `vulkan = moltenvk`; or `vulkan = kosmickrisp`, iOS 26 on an A14 or
-  newer, offered only when the bundle has `gl/libvulkan_kosmickrisp.dylib`)
-  and **Windowed mode** (`windowed = 1`, docs/WINDOWED.md). Each control
+  newer, offered only when the bundle has `gl/libvulkan_kosmickrisp.dylib`). Each control
   writes its key in `Documents/madeira.cfg` and the default removes it;
   **Reset to defaults** removes all four. They apply at the next session
   start. The rows show the global file; a game's **Advanced › This game's
