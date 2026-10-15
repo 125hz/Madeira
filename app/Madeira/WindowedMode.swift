@@ -1,5 +1,4 @@
 import Foundation
-import SwiftUI
 import UIKit
 
 // ml1300 windowed mode (docs/WINDOWED.md). The frames, title bars and the
@@ -137,16 +136,13 @@ final class MadeiraWindowedBridge: NSObject {
 ///
 /// ml1350: the button starts Steam INSIDE the running session (MadeiraSession
 /// below, docs/SESSION_LAUNCH.md), as a child of the Wine desktop's shell:
-/// - ml1370: the full 64-bit client installed in the prefix (SteamClientPackages,
-///   SteamRuntime.swift: an x86-64 steam.exe and package/steam_client_win64.manifest
-///   under Program Files (x86)\Steam or Program Files\Steam): steam.exe with
-///   `launchArguments` (the bootstrapper's own no-update / no-verify switches) in
-///   its folder, services.exe first when none runs.
-/// - Not installed (Madeira Dock's 32-bit components alone do not count): "Install
-///   Steam" downloads Valve's client packages from the manifest with a progress
-///   sheet (SteamClientInstallModel) and then starts it. Valve's SteamSetup.exe is
-///   not used (env.MADEIRA_STEAM_PACKAGE_INSTALL = 0 brings back the round 4 path:
-///   any steam.exe counts, else SteamSetup.exe is downloaded and started).
+/// - Steam installed in the prefix (steam.exe under Program Files (x86)\Steam or
+///   Program Files\Steam): steam.exe -no-cef-sandbox -cef-disable-gpu in its
+///   folder, services.exe first when none runs.
+/// - Not installed: Valve's SteamSetup.exe, downloaded from Valve's CDN with a
+///   progress alert into Application Support/MadeiraSteam, copied to
+///   C:\madeira-games and started (a copy already there is started without a
+///   new download).
 /// When the in-session start is refused or fails (env.MADEIRA_SESSION_LAUNCH=0,
 /// no session, a start error), the round 4 behaviour is the fallback: a library
 /// entry "Steam" / "Steam Setup" (Wine desktop, services first) for the next
@@ -154,38 +150,15 @@ final class MadeiraWindowedBridge: NSObject {
 /// The first tap shows the memory warning (Continue / Cancel); a second tap
 /// while the started Steam has not opened a window yet only says so.
 /// Log lines: "[windowed] ml1300 steam: launch | install | not available (reason)",
-/// plus MadeiraSession's "[launch] ml1350 in-session: …", ml1370's
-/// "[steam-install] ml1370 …" and "[steam-launch] ml1370 …".
+/// plus MadeiraSession's "[launch] ml1350 in-session: …".
 @MainActor
 enum WindowedSteam {
     static let installerURL = URL(string: "https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe")!
     /// steam.exe relative to drive_c; Program Files (x86) is where Steam installs by default.
     static let clientPaths = ["Program Files (x86)/Steam/steam.exe", "Program Files/Steam/steam.exe"]
     static let installerPath = "madeira-games/SteamSetup.exe"
-    /// ml1370: the full client's start, as Valve's steam.exe spells its switches:
-    /// no bootstrapper self-update, no initial bootstrap (manifest download and
-    /// file check) and no repair or verify pass (the app installed the packages and
-    /// checked their SHA-256), no Chromium sandbox (the web helper runs in
-    /// single-process mode in this task, process_ios.c), a software-rendered web
-    /// helper (in single-process mode its GPU thread would be ANGLE on D3D11 inside
-    /// the same process; env.MADEIRA_STEAM_CEF_GPU = 1 drops the switch), and the
-    /// library page. The competitor's log spells the first one -nobootstrapupdate;
-    /// steam.exe only knows -nobootstrapperupdate.
-    static let clientArguments = "-nobootstrapperupdate -skipinitialbootstrap -norepairfiles -noverifyfiles "
-        + "-no-cef-sandbox -cef-disable-gpu steam://open/games"
-    /// Before ml1370 (env.MADEIRA_STEAM_LAUNCH_FLAGS = 0): the bootstrapper updates and verifies.
-    static let legacyClientArguments = "-no-cef-sandbox -cef-disable-gpu"
-    static var launchArguments: String {
-        guard MadeiraConfig.flag("MADEIRA_STEAM_LAUNCH_FLAGS", fallback: true) else { return legacyClientArguments }   // 0: the full Steam client starts with the round 4 switches only (-no-cef-sandbox -cef-disable-gpu); its bootstrapper then updates and verifies itself (ml1370)
-        if MadeiraConfig.flag("MADEIRA_STEAM_CEF_GPU", fallback: false) {   // 1: the full Steam client starts without -cef-disable-gpu (its single-process web helper then tries GPU rendering in the same task; ml1370)
-            return clientArguments.replacingOccurrences(of: " -cef-disable-gpu", with: "")
-        }
-        return clientArguments
-    }
-    /// ml1370: "Install Steam" is Valve's client packages (SteamClientPackages).
-    static var packageInstall: Bool {
-        MadeiraConfig.flag("MADEIRA_STEAM_PACKAGE_INSTALL", fallback: true)   // 0: the Steam button and the library's Steam entry use any steam.exe in the prefix and otherwise download Valve's SteamSetup.exe (round 4) instead of installing the full client from Valve's packages (ml1370)
-    }
+    /// The full client under Wine: no Chromium sandbox, a software-rendered web helper.
+    static let clientArguments = "-no-cef-sandbox -cef-disable-gpu"
     private static let warnedKey = "madeira.windowed.steam-memory-warning"
     private static var download: URLSessionDownloadTask?
     private static var session: URLSession?
@@ -202,20 +175,9 @@ enum WindowedSteam {
         clientPaths.first { FileManager.default.fileExists(atPath: LibraryModel.drive.appendingPathComponent($0).path) }
     }
 
-    /// ml1370: the steam.exe the button starts: the full 64-bit client (not Madeira
-    /// Dock's 32-bit components); with env.MADEIRA_STEAM_PACKAGE_INSTALL = 0 any steam.exe.
-    static var readyClient: String? {
-        guard packageInstall else { return installedClient }
-        return clientPaths.first { SteamClientPackages.installed(root: LibraryModel.drive.appendingPathComponent(($0 as NSString).deletingLastPathComponent)) }
-    }
-
     static func tapped() {
         if download != nil {
             if let alert = progressAlert, alert.presentingViewController == nil { present(alert) }
-            return
-        }
-        if SteamClientInstallModel.shared.running {
-            SteamClientInstallModel.shared.present()
             return
         }
         // ml1350: the Steam just started has no window yet (a window would have
@@ -229,11 +191,7 @@ enum WindowedSteam {
         guard UserDefaults.standard.bool(forKey: warnedKey) else {
             var message = "The full Steam client needs a lot of memory; the web helper may be killed."
             if MadeiraDock.enabled && MadeiraDock.clientInstalled {
-                message += packageInstall && MadeiraConfig.flag("MADEIRA_STEAM_LAUNCH_FLAGS", fallback: true)
-                    ? "\n\nMadeira starts Steam with -nobootstrapperupdate, so it does not update itself. Installing the full "
-                        + "client replaces Madeira Dock's client files with Valve's current build, and Dock refuses a client "
-                        + "build it has not verified."
-                    : "\n\nSteam updates its own files when it runs; Madeira Dock refuses a client build it has not verified."
+                message += "\n\nSteam updates its own files when it runs; Madeira Dock refuses a client build it has not verified."
             }
             let alert = UIAlertController(title: "Steam", message: message, preferredStyle: .alert)
             alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
@@ -250,24 +208,6 @@ enum WindowedSteam {
     }
 
     private static func proceed() {
-        guard packageInstall else { legacyProceed(); return }
-        if let client = readyClient {
-            startClient(client)
-            return
-        }
-        log("install (the full client is not in the prefix\(installedClient != nil ? "; the steam.exe there is not the 64-bit client" : ""))")
-        offerInstall { installed in
-            guard installed else { return }
-            if let client = WindowedSteam.readyClient {
-                WindowedSteam.startClient(client)
-            } else {
-                WindowedSteam.log("not available (installed, but the client was not found afterwards)")
-            }
-        }
-    }
-
-    /// Round 4 / ml1350 (env.MADEIRA_STEAM_PACKAGE_INSTALL = 0): any steam.exe, else SteamSetup.exe.
-    private static func legacyProceed() {
         if let client = installedClient {
             startClient(client)
         } else if MadeiraSession.available, let bytes = installerCopyBytes {
@@ -311,81 +251,19 @@ enum WindowedSteam {
             prepareClient(relative, inSession: MadeiraSession.unavailableReason)
             return
         }
-        let arguments = launchArguments
-        launchLog(command: "\"\(path)\" " + arguments, how: "in this session (taskbar)")
-        startInSession(relative, arguments: arguments) { failure in
+        startInSession(relative, arguments: clientArguments) { failure in
             if let failure {
                 WindowedSteam.prepareClient(relative, inSession: failure)
             } else {
-                WindowedSteam.log("launch (started in this session: \(path) \(arguments))")
+                WindowedSteam.log("launch (started in this session: \(path) \(WindowedSteam.clientArguments))")
             }
         }
-    }
-
-    // MARK: ml1370: the full client (install from Valve's packages, launch flags)
-
-    /// "[steam-launch] ml1370 …": the exact command line, and how the web helper runs.
-    static func launchLog(command: String, how: String) {
-        fputs("[steam-launch] ml1370 command line (\(how)): \(command)\n", stderr)
-        fputs("[steam-launch] ml1370 web helper mode: single-process (in this task)\n", stderr)
-        let sandbox = command.contains(" -no-cef-sandbox"), gpu = command.contains(" -cef-disable-gpu")
-        fputs("[steam-launch] ml1370 web helper switches: \(sandbox ? "--no-sandbox from -no-cef-sandbox" : "SANDBOX ON (no -no-cef-sandbox; single-process mode needs it off)"), "
-              + "\(gpu ? "--disable-gpu from -cef-disable-gpu" : "GPU rendering (no -cef-disable-gpu)"); "
-              + "ntdll's proc-gate appends --single-process and refuses --type= children\n", stderr)
-    }
-
-    /// Confirm, then install the full client with the progress sheet. `done(true)`
-    /// once it is installed; false when cancelled or failed (the sheet says why).
-    static func offerInstall(done: @escaping @MainActor (Bool) -> Void) {
-        let model = SteamClientInstallModel.shared
-        if model.running { model.present(); return }
-        var message = "Madeira downloads Valve's current Steam client from Valve's update server "
-            + "(\(SteamClientPackages.manifestName): its packages, a few hundred MB, about 1 GB once unpacked) and installs it "
-            + "in \(SteamRuntimeFiles.windowsRoot), as Steam's own installer would. No sign-in is involved."
-        if MadeiraDock.enabled && MadeiraDock.clientInstalled {
-            message += "\n\nMadeira Dock's client files are in that folder. The current client replaces them, and Dock "
-                + "refuses a client build it has not verified, so Dock starts may fail until Dock supports that build."
-        }
-        let alert = UIAlertController(title: "Install Steam", message: message, preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
-            fputs("[steam-install] ml1370 not started (cancelled at the confirmation)\n", stderr)
-            done(false)
-        })
-        alert.addAction(UIAlertAction(title: "Install", style: .default) { _ in
-            SteamClientInstallModel.shared.start(done: done)
-        })
-        present(alert)
-    }
-
-    /// Play on the library's Steam entry (ContentView.launchLibraryEntry): the
-    /// entry to start, its round 4 switches brought to `launchArguments`; nil while
-    /// the full client is installed first (`retry` then starts the entry again).
-    /// Any other entry comes back unchanged.
-    static func libraryLaunch(_ entry: LibraryEntry, retry: @escaping @MainActor (LibraryEntry) -> Void) -> LibraryEntry? {
-        guard entry.steamAppID == nil, entry.desktop != true,
-              clientPaths.contains(where: { $0.caseInsensitiveCompare(entry.relativePath) == .orderedSame }) else { return entry }
-        guard packageInstall else { return entry }
-        let folder = LibraryModel.drive.appendingPathComponent((entry.relativePath as NSString).deletingLastPathComponent)
-        guard SteamClientPackages.installed(root: folder) else {
-            LibraryModel.shared.preparing = nil   // the starting screen: no session follows this press
-            fputs("[steam-install] ml1370 library entry \"\(entry.title)\": the full client is not installed; offering the install\n", stderr)
-            offerInstall { installed in if installed { retry(entry) } }
-            return nil
-        }
-        var updated = entry
-        if entry.arguments.trimmingCharacters(in: .whitespaces) == legacyClientArguments, launchArguments != legacyClientArguments {
-            updated.arguments = launchArguments
-            LibraryModel.shared.save(updated)
-            fputs("[steam-launch] ml1370 library entry \"\(entry.title)\": switches brought from \(legacyClientArguments) to \(launchArguments)\n", stderr)
-        }
-        launchLog(command: "\"\(windowsPath(entry.relativePath))\" " + updated.arguments, how: "library entry, a session of its own")
-        return updated
     }
 
     /// The round 4 fallback: a library entry for the next start.
     private static func prepareClient(_ relative: String, inSession failure: String) {
         let path = windowsPath(relative)
-        let entry = libraryEntry(relative: relative, title: "Steam", arguments: launchArguments)
+        let entry = libraryEntry(relative: relative, title: "Steam", arguments: clientArguments)
         if let failure = entry.failure {
             log("not available (Steam is installed at \(path), but its library entry could not be made: \(failure))")
             show("Steam", "Steam is installed, but Madeira could not add it to the library: \(failure)")
@@ -608,164 +486,6 @@ private final class SteamSetupRedirects: NSObject, URLSessionTaskDelegate, @unch
     }
 }
 
-/// ml1370: the full client's install (SteamClientInstaller, SteamRuntime.swift)
-/// and its progress sheet, shown over the windowed desktop or the library. One
-/// install at a time; the sheet can be reopened (the Steam button, the library
-/// entry) while it runs. Log lines:
-/// "[steam-install] ml1370 part N of M (name, size) downloading | unpacking | done",
-/// "[steam-install] ml1370 installed in C:\Program Files (x86)\Steam (…)", "… failed (…)".
-@MainActor
-final class SteamClientInstallModel: ObservableObject {
-    static let shared = SteamClientInstallModel()
-    @Published private(set) var progress = SteamClientInstallProgress()
-    @Published private(set) var running = false
-    @Published private(set) var failure: String?
-    private var task: Task<Void, Never>?
-    private var completions: [@MainActor (Bool) -> Void] = []
-    private weak var controller: UIViewController?
-    private var logged = ""
-
-    static func size(_ bytes: Int) -> String { String(format: "%.1f MB", Double(bytes) / 1_000_000) }
-
-    func start(done: @escaping @MainActor (Bool) -> Void) {
-        completions.append(done)
-        present()
-        guard !running else { return }
-        running = true; failure = nil; progress = SteamClientInstallProgress(); logged = ""
-        let prefix = MadeiraDock.prefix
-        let session = wine_process_is_running() != 0 || wineserver_is_running() != 0
-        fputs("[steam-install] ml1370 start: manifest \(SteamRuntimeFiles.origin)\(SteamClientPackages.manifestName) "
-              + "(\(session ? "a session is running: files only, Steam writes its own registry keys" : "no session"))\n", stderr)
-        task = Task {
-            do {
-                let result = try await SteamClientInstaller.shared.install(prefix: prefix, sessionRunning: session) { step in
-                    await SteamClientInstallModel.shared.update(step)
-                }
-                SteamClientInstallModel.shared.finish(result, failure: nil)
-            } catch {
-                let reason = error is CancellationError ? "cancelled"
-                    : (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                SteamClientInstallModel.shared.finish(nil, failure: reason)
-            }
-        }
-    }
-
-    func cancel() { task?.cancel() }
-
-    private func update(_ step: SteamClientInstallProgress) {
-        guard running else { return }
-        // Download progress comes from its own tasks: one that arrives after the
-        // package moved on is dropped.
-        if step.phase == .downloading, step.part < progress.part || (step.part == progress.part && progress.phase != .downloading) { return }
-        progress = step
-        let line: String
-        switch step.phase {
-        case .manifest: return
-        case .downloading, .unpacking, .done:
-            line = "part \(step.part) of \(step.parts) (\(step.name), \(Self.size(step.bytes))) \(step.phase.rawValue)"
-            if step.part == 1, step.phase == .downloading, !logged.hasPrefix("part") {
-                fputs("[steam-install] ml1370 manifest version \(step.version): \(step.parts) packages, \(Self.size(step.totalBytes))\n", stderr)
-            }
-        case .installing:
-            line = "installing \(step.files) files (client version \(step.version)) into \(SteamRuntimeFiles.windowsRoot)"
-        case .finished:
-            line = "installed in \(SteamRuntimeFiles.windowsRoot) (client version \(step.version), \(step.files) files from "
-                + "\(step.parts) packages, \(Self.size(step.totalBytes)); registry: \(step.registry))"
-        }
-        guard line != logged else { return }
-        logged = line
-        fputs("[steam-install] ml1370 \(line)\n", stderr)
-    }
-
-    private func finish(_ result: SteamClientInstallProgress?, failure reason: String?) {
-        running = false
-        task = nil
-        if let reason {
-            failure = reason
-            fputs("[steam-install] ml1370 failed at part \(progress.part) of \(progress.parts) "
-                  + "(\(progress.phase.rawValue)): \(reason)\n", stderr)
-        } else if let result {
-            progress = result
-        }
-        let callbacks = completions
-        completions = []
-        let ok = reason == nil
-        if ok, let controller, controller.presentingViewController != nil {
-            controller.dismiss(animated: true) { for callback in callbacks { callback(true) } }
-        } else {
-            for callback in callbacks { callback(ok) }
-        }
-    }
-
-    /// Shows the sheet (again) over whatever is on screen.
-    func present() {
-        if let controller, controller.presentingViewController != nil { return }
-        let host = UIHostingController(rootView: SteamClientInstallSheet())
-        host.modalPresentationStyle = .formSheet
-        host.isModalInPresentation = true
-        controller = host
-        WindowedSteam.present(host)
-    }
-
-    func close() {
-        controller?.dismiss(animated: true)
-    }
-
-    var title: String {
-        let p = progress
-        if let failure { return failure == "cancelled" ? "Install cancelled." : "Steam was not installed." }
-        switch p.phase {
-        case .manifest: return "Reading Valve's client manifest…"
-        case .downloading: return "Downloading part \(p.part) of \(p.parts) (\(p.name), \(Self.size(p.bytes)))…"
-        case .unpacking, .done: return "Unpacking part \(p.part) of \(p.parts) (\(p.name))…"
-        case .installing: return "Installing \(p.files) files…"
-        case .finished: return "Steam is installed in \(SteamRuntimeFiles.windowsRoot)."
-        }
-    }
-
-    var fraction: Double {
-        let p = progress
-        if p.phase == .finished || p.phase == .installing { return 1 }
-        guard p.totalBytes > 0 else { return 0 }
-        let now = p.finishedBytes + (p.phase == .downloading ? p.received : (p.phase == .done ? 0 : p.bytes))
-        return min(1, Double(now) / Double(p.totalBytes))
-    }
-
-    var detail: String {
-        let p = progress
-        guard p.totalBytes > 0 else { return "From \(SteamRuntimeFiles.origin)" }
-        let done = p.finishedBytes + (p.phase == .downloading ? p.received : (p.phase == .done ? 0 : p.bytes))
-        return "\(Self.size(min(done, p.totalBytes))) of \(Self.size(p.totalBytes)) · client version \(p.version)"
-    }
-}
-
-/// The progress sheet (SteamClientInstallModel).
-struct SteamClientInstallSheet: View {
-    @ObservedObject private var model = SteamClientInstallModel.shared
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Installing Steam").font(.headline)
-            Text(model.title).font(.subheadline)
-            ProgressView(value: model.fraction)
-            Text(model.detail).font(.footnote).foregroundStyle(.secondary)
-            if let failure = model.failure, failure != "cancelled" {
-                Text(failure).font(.footnote).foregroundStyle(.orange)
-            }
-            HStack {
-                Spacer()
-                if model.running {
-                    Button("Cancel", role: .cancel) { model.cancel() }
-                } else {
-                    Button("Close") { model.close() }
-                }
-            }
-        }
-        .padding(20)
-        .frame(maxWidth: 520)
-    }
-}
-
 /// Round 5: the windowed taskbar's search is a launcher (docs/WINDOWED.md
 /// "Search"). WiniosWindowed.m draws the results panel and lists the open
 /// windows itself; this side supplies what can be started:
@@ -906,10 +626,8 @@ enum WindowedLauncher {
         ]
         if MadeiraWindowedBridge.steamButtonEnabled() {
             let client = WindowedSteam.installedClient
-            let ready = WindowedSteam.readyClient   // ml1370: the full client; Dock's components alone install it first
-            let missing = WindowedSteam.packageInstall ? "Not installed: installs Valve's client packages" : "Not installed: downloads Valve's installer"
             list.append(Item(kind: "tool", name: "Steam",
-                             detail: ready.map { "Steam client · " + windowsPath($0) } ?? missing,
+                             detail: client.map { "Steam client · " + windowsPath($0) } ?? "Not installed: downloads Valve's installer",
                              icon: client.map { drive.appendingPathComponent($0).path }, symbol: "gamecontroller",
                              action: "steam", key: client.map { windowsPath($0).lowercased() } ?? "steam"))
         }

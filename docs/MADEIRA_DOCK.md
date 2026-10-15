@@ -445,21 +445,6 @@ configured engine again.
 - Valve can change the client at any time. A new client build needs a newly
   verified adapter in the Dock repository and new pins in `SteamRuntime.swift`.
   Until then, Dock refuses the new build.
-- 2026-10-13 (ml1370): Dock's three pinned packages (`bins_win32`,
-  `bins_win64_win32`, `steam_win32`, 73 MB, from the January 2026 32-bit
-  `steam_client_win32` manifest) are 3 of that manifest's 19 packages: the
-  32-bit `steam.exe`, the client binaries and `steamclient64.dll`; no UI DLLs'
-  web sources, no CEF/web helper, no resources or strings. They cannot run the
-  full client UI. The windowed taskbar's Steam button and the library's Steam
-  entry now install the full 64-bit client (`SteamClientPackages` in the same
-  file: all packages of Valve's current `steam_client_win64` manifest, read at
-  run time, each checked against the manifest's size and SHA-256, unpacked
-  with Dock's ZIP reader under larger limits) into the same
-  `C:\Program Files (x86)\Steam`. That replaces Dock's pinned files with the
-  current build, which Dock then refuses (it fails closed), and Dock's
-  "Download Valve's client components" stops with "Existing Steam files need
-  attention" while a `steam.exe` is there. Started with `-nobootstrapperupdate`
-  the full client does not update itself afterwards. See docs/WINDOWED.md.
 
 ## Tests
 
