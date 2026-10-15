@@ -73,6 +73,12 @@ assert len(dns) == 1, len(dns)
 assert "funcs64 = (const void *)dnsapi_unix_call_funcs;" in dns[0], dns[0]
 assert "funcs_wow64 = (const void *)dnsapi_unix_call_wow64_funcs;" in dns[0], dns[0]
 branches = [b for b in branches if b is not dns[0]]
+# winevulkan's branch is this fork's (Vulkan for x64 programs, docs/BUILDING.md 6c): a 64-bit
+# table only, like opengl32's; left out of the comparison the same way.
+vk = [b for b in branches if 'strstr(match, "winevulkan")' in b.split("\n")[0]]
+assert len(vk) == 1, len(vk)
+assert "winevulkan_unix_call_funcs" in vk[0], vk[0]
+branches = [b for b in branches if b is not vk[0]]
 assert len(branches) == len(upstream) + 1, len(branches)
 for (test, table), body in zip(upstream, branches):
     assert test in body.split("\n")[0], (test, body.split("\n")[0])

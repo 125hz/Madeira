@@ -3453,6 +3453,8 @@ int ios_addr_max_prot( const void *addr, int *prot )
                         (vm_region_info_t)&inf, &cnt, &obj ) != KERN_SUCCESS || a > want) return -1;
     if (prot) *prot = inf.protection;
     return inf.max_protection;
+}
+
 /* Default-off overflow for small image copies. EC_CODE and images reserve
  * from the same atomic region-C cursor, so neither can overwrite the other.
  * Live code buffers, the low-VA margin and existing reuse grace are untouched. */
@@ -9351,6 +9353,8 @@ static void * volatile ios_exewin_waiter_owner;
 int ios_exe_win_handoff_waits_on( void *peb )
 {
     return peb && ios_exewin_waiters > 0 && ios_exewin_waiter_owner == peb;
+}
+
 /* madeira-bcd: the image view virtual_map_section is placing right now is
  * resource-only: no execute access and not the loader's (no
  * ArbitraryUserPointer), i.e. LOAD_LIBRARY_AS_IMAGE_RESOURCE for a version or

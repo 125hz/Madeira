@@ -301,8 +301,10 @@ assert 'GameRecommendations.question(recommended, desktop: entry.desktop == true
 # For every entry, the Desktop too: the section is not gated off.
 assert ('// madeira-bcd: always last, for every entry, the Desktop too (GameRecommendationsApply.swift).\n'
         '                Section {\n                    Button("Reset to Recommended"') in detail
-# Last in the form, after the Executable section and Remove from library.
-assert detail.index('Button("Remove from library"') < detail.index('Button("Reset to Recommended"') < detail.index('if let error { Section')
+# Last in the form. In this fork Game details is paged (PR #245): Remove from library sits on the
+# Library details page and the reset section ends the root page, after the page links.
+assert 'Button("Remove from library"' in detail
+assert detail.index('ForEach(Array(pageGroups.enumerated()), id: \\.offset)') < detail.index('Button("Reset to Recommended"')
 assert '!remove, !confirmReset else { return }' in detail
 launch = block(content, '    private func launchLibraryEntry(_ entry: LibraryEntry) {', '\n    }\n')
 assert launch.index('if GameRecommendations.prepare(&entry, new: isNew) { library.save(entry) }') < launch.index('BCDLaunch.applyLibrary(entry)')

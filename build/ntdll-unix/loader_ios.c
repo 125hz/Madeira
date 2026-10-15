@@ -1538,6 +1538,8 @@ static int ios_log_throttle_drop( const char *str, unsigned len )
     pthread_mutex_unlock( &ios_lt_lock );
     for (i = 0; i < flushed; i++) write( 2, flush[i], strlen( flush[i] ) );
     return drop;
+}
+
 /* madeira-bcd: rtcs-cap v1. The PE ntdll (upstream's tracked binary) prints
  * "[rtcs] pre:" for every exception prepare_exception_arm64ec sees; its
  * 40-line cap (signal_arm64ec.c) only covers the block before the ERR. A
@@ -1623,8 +1625,8 @@ static NTSTATUS ios_wrap_2(void *a)
 {
     struct wine_dbg_write_params *p = a;
     if (p && ios_log_throttle_drop( p->str, p->len )) return p->len;
-    /* madeira-bcd rtcs-cap (above): the PE ntdll's "[rtcs] pre:" lines, then the throttle. */
-    if (p && !ios_rtcs_admit( p->str, p->len ))
+    /* madeira-bcd rtcs-cap (above): the PE ntdll's "[rtcs] pre:" lines, after the throttle. */
+    if (!ios_rtcs_admit( p->str, p->len ))
     {
         g_wine_unix_call_count++;
         return p->len;  /* what write() returns for the whole line */

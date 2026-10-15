@@ -3398,9 +3398,9 @@ struct LibraryDetail: View {
             }
             // Play's checks read the installed games and Dock's client state, which the
             // Steam page refreshed when it was on this page.
+            .onAppear { if entry.steamAppID != nil { MadeiraDockModel.shared.refresh(); SteamGamesModel.shared.refresh() } }
+            // madeira-bcd: the game's own switches and config file, and its recommended settings.
             .onAppear {
-                if entry.steamAppID != nil { MadeiraDockModel.shared.refresh(); SteamGamesModel.shared.refresh() }
-                // madeira-bcd: the game's own switches and config file, and its recommended settings.
                 migrateEntryOptions()
                 prepareRecommendation()
                 reloadBCD()
