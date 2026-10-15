@@ -4638,15 +4638,6 @@ struct LibraryHUD: View {
                     }
                 }
                 Button("Keyboard", systemImage: "keyboard") { model.menu = false; LibraryKeyboard.show() }
-                // ml1350: start another Windows program inside this session (MadeiraSession,
-                // WindowedMode.swift); env.MADEIRA_SESSION_LAUNCH=0 hides it.
-                if MadeiraSession.enabled {
-                    Button("Run program…", systemImage: "play.rectangle") {
-                        model.menu = false
-                        // After the menu has gone, so the prompt is not presented over it.
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { MainActor.assumeIsolated { MadeiraSession.promptRun() } }
-                    }
-                }
                 // ml1300 windowed mode: a maximized window hides the title bars and the taskbar.
                 if WindowedMode.maximized {
                     Button("Show all windows", systemImage: "rectangle.on.rectangle") { model.menu = false; WindowedMode.restoreWindows() }

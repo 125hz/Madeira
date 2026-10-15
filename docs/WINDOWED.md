@@ -194,11 +194,13 @@ in every windowed session, with a dot under it while a Steam window is open.
 - A Steam window open in this session (a taskbar window whose program is
   `steam.exe` or `steamwebhelper.exe`): the tap restores it if minimized and
   brings it to the front (`steam: launch (already running ...)`).
-- Otherwise (ml1350) **the button starts Steam inside the running session**,
-  through the in-session launcher (`docs/SESSION_LAUNCH.md`): the Wine desktop's
-  shell thread (explorer) starts it with `NtCreateUserProcess`, as Windows
-  starts a program from its shell, so Steam is explorer's child in the desktop
-  you are looking at and its windows come up in frames.
+- Otherwise: **a running session cannot start another program from the
+  app.** The app starts Wine's first program of a session (`MADEIRA_EXE`),
+  and nothing inside a running session takes a launch request from the app
+  (Wine's explorer has no such message; `docs/PROCESS_HOST.md` is the
+  in-progress mechanism for a second process, headless and off by default).
+  One session runs per app run. So the button prepares the *next* start and
+  says so:
   - The first tap shows "The full Steam client needs a lot of memory; the web
     helper may be killed." (plus, when Madeira Dock's client files are in the
     prefix: Steam updates its own files when it runs, and Dock refuses a
@@ -206,34 +208,23 @@ in every windowed session, with a dot under it while a Steam window is open.
     remembered.
   - **Steam installed** (`C:\Program Files (x86)\Steam\steam.exe`, or
     `C:\Program Files\Steam\steam.exe`; Dock's client components include a
-    `steam.exe`, which then counts): `"…\steam.exe" -no-cef-sandbox
-    -cef-disable-gpu` is started in Steam's folder, `services.exe` first when
-    none runs in the session (the library's "Start Windows services first").
-    No alert: Steam's window appears when it is ready (the bootstrapper's
-    update window first). A second tap within 90 s, while no Steam window is
-    open yet, only says "Steam is starting".
+    `steam.exe`, which then counts): a library entry "Steam" is made (unless
+    an entry already starts that file): Wine desktop start mode, services.exe
+    first, arguments `-no-cef-sandbox -cef-disable-gpu`. The alert says to
+    restart Madeira and open Steam in the library; it then runs in a Wine
+    desktop of its own, windowed when windowed mode is on.
   - **Not installed**: Valve's installer is downloaded from
     `https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe`
     (HTTPS; redirects only within `*.steamstatic.com`; status 200, 256 KB to
     64 MB, an x86/x64 PE) with a progress alert (Cancel stops it) into
     `Library/Application Support/MadeiraSteam/SteamSetup.exe` (no backup),
-    copied to `C:\madeira-games\SteamSetup.exe` and started in the session
-    (services first). A copy already in `C:\madeira-games` from an earlier
-    download is started without downloading again. Once Steam is installed the
-    button starts Steam. Not pinned to a hash: Valve updates the installer.
-  - **Fallback** (round 4's behaviour), when the in-session start is refused or
-    fails (`env.MADEIRA_SESSION_LAUNCH = 0`, no session, the file is gone, a
-    start error; the reason is in the alert and the log): a library entry
-    "Steam" / "Steam Setup" is made (unless an entry already starts that file;
-    Wine desktop start mode, services.exe first, the same arguments) and the
-    alert says why the live start failed and to restart Madeira and open it in
-    the library. With the developer interface (library off) the entry is still
-    made; the alert says to switch to the library interface.
+    copied to `C:\madeira-games\SteamSetup.exe` and added as the library
+    entry "Steam Setup" (same start mode). Restart Madeira and open it; after
+    Steam is installed the button adds the "Steam" entry. Not pinned to a
+    hash: Valve updates the installer.
+  - With the developer interface (library off) the entry is still made; the
+    alert says to switch to the library interface.
 - The button answers touches only, like the rest of the chrome.
-- Any other program: the in-game menu (the taskbar's menu button) has
-  **Run program…** (ml1350): a command line such as
-  `C:\Games\Tool\tool.exe -option`, started in this session the same way; an
-  error shows its reason. The last command is offered again.
 
 ## Not done in this version
 
@@ -260,8 +251,8 @@ in every windowed session, with a dot under it while a Steam window is open.
 - A controller cannot operate the frames or the taskbar (by design: its input
   is the program's); use touch for the chrome.
 - The XInput foreground fix is off while windowed mode is on (see above).
-- The Steam button starts Steam inside the running session since ml1350 (not
-  device-tested yet); the round 4 library entry remains the fallback. No
+- The Steam button cannot start Steam (or its installer) inside the running
+  session; it prepares a library entry for the next start (see above). No
   Valve logo: the tile uses a generic glyph.
 
 ## Log lines
@@ -298,18 +289,12 @@ All start with `[windowed] ml1300`:
     steam: launch (already running in this session: hwnd=0x... "..." exe=steam brought to the front)
     steam: button (no Steam window in this session; the app checks the install)
     steam: not available (cancelled at the memory warning)
-    steam: launch (started in this session: C:\Program Files (x86)\Steam\steam.exe -no-cef-sandbox -cef-disable-gpu)      ml1350
-    steam: launch (already starting in this session; its window has not opened yet)                                        ml1350
-    steam: install (SteamSetup.exe downloaded | already in drive_c from an earlier download, N bytes, at C:\madeira-games\SteamSetup.exe; started in this session)   ml1350
-    steam: not available (it could not start in this session: <reason>; library entry "Steam" for C:\Program Files (x86)\Steam\steam.exe added | already there, started at the next start)
+    steam: not available (a running session cannot start another program from the app; library entry "Steam" for C:\Program Files (x86)\Steam\steam.exe added | already there, started at the next start)
     steam: install (downloading https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe into Application Support/MadeiraSteam)
-    steam: install (SteamSetup.exe downloaded, N bytes, kept in Application Support/MadeiraSteam and C:\madeira-games\SteamSetup.exe; library entry "Steam Setup" added; it could not start in this session: <reason>; it starts at the next start)
+    steam: install (SteamSetup.exe downloaded, N bytes, kept in Application Support/MadeiraSteam and C:\madeira-games\SteamSetup.exe; library entry "Steam Setup" added; it cannot run inside this session, it starts at the next start)
     steam: not available (Steam's installer: cancelled | the download failed: ... | Valve's server answered N | the download left Valve's servers | an unexpected size (N bytes))
     steam: not available (... library entry could not be made: ...)
     taskbar Steam button ignored: not a touch (...)
-
-The in-session start itself logs `[launch] ml1350 ...` lines (app and ntdll);
-see `docs/SESSION_LAUNCH.md`.
 
 `[winios] compositor attached inside presentation frame` is followed by the
 root line in a windowed session. `[winios] drv_post_mouse hwnd=0x...` (first
@@ -439,32 +424,3 @@ desktop. App only (`WiniosWindowed.m`, `WiniosWindowed.h`,
      downloaded, N bytes ...)`. Restart, open Steam Setup from the library.
 5. `env.MADEIRA_WINDOWED_STEAM = 0`: no Steam tile, `steam: taskbar button
    hidden (...)`.
-
-(Since ml1350 step 4 starts Steam / the installer in the session; the alerts
-above are the fallback. Test with round 5.)
-
-### Round 5 (ml1350: Steam and other programs start in the running session)
-
-The owner: start the Steam client (or its installer) from the taskbar into
-the running desktop, like a desktop OS. Needs `libntdll_unix.a` and
-`libwin32u_unix.a` rebuilt (`rebuild-native.sh ntdll win32u`) plus the app.
-Full steps and log lines: `docs/SESSION_LAUNCH.md` "Test".
-
-1. Windowed desktop session, prefix with Steam: tap the Steam tile, Continue.
-   Expect `[launch] ml1350 queued #1`, `starting #1 on tid … (parent
-   C:\windows\explorer.exe …, the desktop window's thread)`, services.exe
-   first (or "already runs"), `#1: … -> ok (pid …)`, then the app's
-   `[launch] ml1350 in-session: "C:\Program Files (x86)\Steam\steam.exe"
-   -no-cef-sandbox -cef-disable-gpu -> ok (pid …, parent …)` and
-   `steam: launch (started in this session: …)`. Steam's window comes up in
-   a frame; the tile gets its dot. A second tap before the window: "Steam is
-   starting".
-2. Prefix without Steam: the download as in round 4, then SteamSetup.exe
-   starts in a frame (`steam: install (… started in this session)`); finish
-   the install; tap the tile again: Steam starts.
-3. Taskbar menu → Run program…: `C:\windows\system32\winemine.exe` (or any
-   GUI program in the prefix): a frame appears; a wrong path shows "It did not
-   start: the program file was not found, NTSTATUS c0000034."
-4. `env.MADEIRA_SESSION_LAUNCH = 0`: no Run program… entry; the Steam tile
-   falls back to the round 4 library entry, its alert naming
-   `env.MADEIRA_SESSION_LAUNCH=0`.

@@ -2141,9 +2141,6 @@ static void *wine_process_thread(void *arg) {
         }
 
         g_wine_running = 0;
-        /* ml1350: a program the app queued for this session but no Wine thread
-         * started is dropped with a reason, never started in the next session. */
-        madeira_session_launch_fail_all("the session ended before a Wine thread took the request");
         /* ml1184: these belong to the launch that just ended; a later session in this app
          * run gets its own from its game, or madeira.cfg's. */
         unsetenv("MADEIRA_FASTSYNC"); unsetenv("MADEIRA_FASTSYNC_SEM");

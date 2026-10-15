@@ -614,31 +614,6 @@ HWND winios_drv_foreground_window(void)
     return NtUserGetForegroundWindow();
 }
 
-/* ml1350 in-session launcher (docs/SESSION_LAUNCH.md; the queue and the
- * NtCreateUserProcess call live in ntdll's process_ios.c). Called by
- * Winios.m's winios_pProcessEvents on every Wine thread that pumps messages;
- * nothing happens unless the app queued a program. The thread that owns the
- * desktop window (explorer's shell thread in a desktop session) starts it,
- * so it becomes the shell's child; any other thread wakes that owner with a
- * posted WM_NULL (DefWindowProc ignores it), and after 2 s without a taker
- * starts it itself. Returns 1 when this thread started one. */
-extern int madeira_session_launch_pending( void );
-extern int madeira_session_launch_wake_due( void );
-extern int madeira_session_launch_run( int desktop_thread );
-
-int winios_drv_session_launch_pump(void)
-{
-    HWND desktop;
-    DWORD owner;
-
-    if (!madeira_session_launch_pending()) return 0;
-    desktop = get_desktop_window();
-    owner = desktop ? get_window_thread( desktop, NULL ) : 0;
-    if (owner && owner == GetCurrentThreadId()) return madeira_session_launch_run( 1 );
-    if (owner && madeira_session_launch_wake_due()) NtUserPostMessage( desktop, WM_NULL, 0, 0 );
-    return madeira_session_launch_run( 0 );
-}
-
 /* ============================================================ *
  * winios window surfaces (S2): GDI window content → app compositor.
  * Modeled on win32u's offscreen surface (dce.c): the generic
