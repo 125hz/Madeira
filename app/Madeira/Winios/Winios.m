@@ -36,8 +36,6 @@
 /* The window census struct is shared with Swift through this header;
  * including it here keeps both sides' definitions the same. */
 #include "Winios.h"
-/* ml1300 windowed mode: each top-level window in its own frame (desktop sessions). */
-#include "WiniosWindowed.h"
 
 /* csops syscall — CS_DEBUGGED is the flag StikDebug JIT rides on. Declared by
  * hand for the same reason JITAllocator.c does: <sys/codesign.h> is not in the
@@ -844,7 +842,6 @@ typedef struct {
     int x, y;                /* mouse: coords; key: x = virtual-key code */
     unsigned int flags;      /* mouse: MOUSEEVENTF_*; key: KEYEVENTF_* */
     unsigned int data;       /* mouse: mouseData (wheel delta) */
-    void *hwnd;              /* mouse, ml1300 windowed mode: the top-level window it goes to; NULL = hit test */
 } winios_input_event_t;
 
 static struct {
@@ -855,18 +852,10 @@ static struct {
 } g_input_q = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
 static void winios_q_push_ev(unsigned int type, int x, int y, unsigned int flags, unsigned int data) {
-    /* ml1300 windowed mode: a mouse event goes to the window whose frame it
-     * was mapped through (WiniosWindowed.m); one over the background is dropped */
-    void *target = NULL;
-    if (type == WINIOS_EV_MOUSE && winios_windowed_active()) {
-        int drop = 0;
-        target = winios_windowed_event_target(x, y, flags, &drop);
-        if (drop) return;
-    }
     pthread_mutex_lock(&g_input_q.lock);
     unsigned int next = (g_input_q.head + 1) % WINIOS_RING_SIZE;
     if (next != g_input_q.tail) {
-        g_input_q.buf[g_input_q.head] = (winios_input_event_t){type, x, y, flags, data, target};
+        g_input_q.buf[g_input_q.head] = (winios_input_event_t){type, x, y, flags, data};
         g_input_q.head = next;
     }
     /* If buffer is full we drop the oldest event by simply not advancing —
@@ -919,8 +908,6 @@ BOOL winios_pProcessEvents(DWORD mask) {
             fflush(stderr);
         }
     }
-    /* ml1300 windowed mode: title-bar commands, tap activation, window text */
-    if (winios_windowed_active()) winios_windowed_pump_wine();
     static unsigned int cnt;
     static int quiet = -1;
     if (quiet < 0) quiet = getenv("MADEIRA_QUIET") != NULL;
@@ -955,7 +942,7 @@ BOOL winios_pProcessEvents(DWORD mask) {
         if (e.type == WINIOS_EV_KEY)
             winios_drv_post_key((unsigned short)e.x, e.flags);
         else
-            winios_drv_post_mouse(e.x, e.y, e.flags, e.data, e.hwnd);
+            winios_drv_post_mouse(e.x, e.y, e.flags, e.data, NULL);
         drained = TRUE;
     }
     return drained;
@@ -1016,7 +1003,6 @@ extern NSString * const MadeiraDisplayModeChangedNotification;
 
 static UIView *g_compositor_view;
 static BOOL g_comp_game;   /* g_compositor_view is the game-mode overlay (below) */
-static BOOL g_comp_windowed;   /* ml1300: g_compositor_view is the windowed-mode root (WiniosWindowed.m) */
 static void winios_drop_compositor(const char *why);
 static CALayer *g_desk_bg;               /* teal desktop-area backdrop */
 static CGFloat g_px_to_pt = 1.0 / 3.0;   /* desktop px → screen pt (x, and y unless stretched) */
@@ -1085,7 +1071,6 @@ static void winios_layout_compositor(void) {
             frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
             desk_w, desk_h, (double)g_px_to_pt);
     fflush(stderr);
-    if (g_comp_windowed) winios_windowed_relayout();   /* frames follow the new layer rects */
 }
 
 /* Called from Swift (MetalBackedView) with the presentation area in
@@ -1149,9 +1134,6 @@ int winios_desktop_point_from_window(double wx, double wy, int *px, int *py) {
     if (px) *px = 0;
     if (py) *py = 0;
     if (!g_compositor_view || g_px_to_pt <= 0) return 0;
-    /* ml1300 windowed mode: through the frame under the point, into that
-     * window's own desktop pixels (it also picks the event's target window) */
-    if (g_comp_windowed) return winios_windowed_map_point(wx, wy, px, py);
     CGRect f = g_compositor_view.frame;
     /* a tap on a fitted window (winios_desktop_fit) lands in that window's
      * own client pixels */
@@ -1221,8 +1203,6 @@ static void winios_drop_compositor(const char *why) {
     [g_metal_layers removeAllObjects];
     [g_client_rects removeAllObjects];
     g_fit_key = nil;
-    if (g_comp_windowed) winios_windowed_teardown();   /* ml1300: frames and taskbar */
-    g_comp_windowed = NO;
     [g_compositor_view removeFromSuperview];
     g_compositor_view = nil;
     g_desk_bg = nil;
@@ -1267,7 +1247,6 @@ void winios_note_game_metal_hwnd(void *hwnd) {
 /* Called at every Wine session start (WineProcessBridge): a game session
  * starts with no overlay windows and no known Metal windows. */
 void winios_session_reset(void) {
-    winios_windowed_reset();   /* ml1300: the switch is read again for the new session */
     winios_swapchain_hwnds_reset();   /* [swap-win]: HWND values of the last session mean nothing now */
     dispatch_async(dispatch_get_main_queue(), ^{
         [g_game_metal removeAllObjects];
@@ -1279,9 +1258,8 @@ void winios_session_reset(void) {
 /* main thread only */
 static void winios_ensure_compositor(void) {
     BOOL desk = winios_desktop_session();
-    BOOL windowed = desk && winios_windowed_active();
     if (g_compositor_view) {
-        if (g_comp_game == !desk && g_comp_windowed == windowed) return;
+        if (g_comp_game == !desk) return;
         /* the other kind, left by an earlier session of this app run */
         winios_drop_compositor("session kind changed");
     }
@@ -1327,13 +1305,6 @@ static void winios_ensure_compositor(void) {
     g_layers = [NSMutableDictionary new];
     g_px_rects = [NSMutableDictionary new];
     g_surf_sizes = [NSMutableDictionary new];
-    g_comp_windowed = windowed;
-    if (windowed) {
-        /* ml1300 windowed mode (WiniosWindowed.m): a black root that holds a
-         * frame per top-level window and the taskbar; it takes touches only
-         * on the frames' chrome and the taskbar. No teal desktop backdrop. */
-        g_compositor_view = winios_windowed_make_root(win.bounds);
-    } else {
     g_compositor_view = [[UIView alloc] initWithFrame:win.bounds];
     g_compositor_view.userInteractionEnabled = NO;  /* touches fall through */
     g_compositor_view.clipsToBounds = YES;
@@ -1345,7 +1316,6 @@ static void winios_ensure_compositor(void) {
     g_desk_bg = [CALayer layer];
     g_desk_bg.backgroundColor = [UIColor colorWithRed:0.0 green:0.502 blue:0.502 alpha:1.0].CGColor;
     [g_compositor_view.layer addSublayer:g_desk_bg];
-    }
     [win addSubview:g_compositor_view];
     winios_layout_compositor();
     fprintf(stderr, "[winios] compositor attached inside presentation frame\n");
@@ -1387,13 +1357,7 @@ static CALayer *winios_layer_for(HWND hwnd, bool create) {
         /* A surface or swapchain can arrive before the window's position.
          * Stay hidden until Wine delivers the frame and visibility. */
         l.hidden = YES;
-        if (g_comp_windowed) {
-            /* ml1300: under the frames until winios_windowed_place puts it into
-             * its frame (it needs the window's position and info) */
-            [g_compositor_view.layer insertSublayer:l atIndex:0];
-        } else {
-            [g_compositor_view.layer addSublayer:l];
-        }
+        [g_compositor_view.layer addSublayer:l];
         g_layers[key] = l;
         fprintf(stderr, "[winios] layer created for hwnd=%p (%lu layers)\n",
                 hwnd, (unsigned long)g_layers.count);
@@ -1404,7 +1368,6 @@ static CALayer *winios_layer_for(HWND hwnd, bool create) {
 
 static void winios_remove_layer(HWND hwnd) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (winios_windowed_active()) winios_windowed_forget(hwnd);   /* its frame and taskbar button */
         if (!g_layers) return;
         NSNumber *key = @((uintptr_t)hwnd);
         CALayer *l = g_layers[key];
@@ -1457,8 +1420,7 @@ static BOOL winios_desktop_fit(NSNumber *key, CAMetalLayer *ml, CGRect c) {
     CGRect desk = CGRectMake(0, 0, desk_w, desk_h);
     BOOL outside = desk_w > 0 && desk_h > 0 && c.size.width >= 64 && c.size.height >= 64
         && !CGRectContainsRect(CGRectInset(desk, -8, -8), c);
-    /* ml1300 windowed mode: a frame's own zoom and fullscreen button do this */
-    if (!winios_desktop_fit_enabled() || g_comp_windowed || !outside || !ml.superlayer || !g_compositor_view) {
+    if (!winios_desktop_fit_enabled() || !outside || !ml.superlayer || !g_compositor_view) {
         if (g_fit_key && [g_fit_key isEqual:key]) g_fit_key = nil;
         return NO;
     }
@@ -1783,9 +1745,6 @@ void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
     /* Here, not in the block below: the census asks win32u about the window,
      * which needs this Wine thread. No-op unless the app turned it on. */
     winios_census_note_frame(hwnd, x, y, w, h, visible);
-    /* ml1300 windowed mode: the window's text, styles, owner and icon, read on
-     * this thread; they reach the main queue before the block below */
-    if (winios_windowed_active()) winios_windowed_note_window_wine(hwnd);
     dispatch_async(dispatch_get_main_queue(), ^{
         winios_ensure_compositor();
         if (!g_compositor_view) return;
@@ -1809,7 +1768,6 @@ void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
         winios_apply_contents_rect(key, l);
         winios_place_metal_layer(key);
         [CATransaction commit];
-        if (g_comp_windowed) winios_windowed_place(hwnd, l, x, y, w, h, visible);   /* into its frame */
         winios_sync_metal_hidden(key, l);
         winios_swap_layer_note(key, "window frame");
         winios_game_cursor_refresh();
@@ -2371,14 +2329,6 @@ static void winios_cursor_place(void) {
     CGFloat x = g_cursor_pos_px.x, y = g_cursor_pos_px.y;
     CGSize pixels = winios_cursor_pixel_size();
     CGPoint fitted; CGFloat k = 0;
-    if (g_comp_windowed) {
-        /* ml1300: drawn in the frame of the window the pointer is in; over
-         * no window it stays where it was */
-        if (!winios_windowed_cursor_point(x, y, &fitted, &k) || k <= 0) return;
-        g_cursor_layer.bounds = g_cur_w > 0 ? CGRectMake(0, 0, g_cur_w * k, g_cur_h * k) : g_cursor_layer.bounds;
-        g_cursor_layer.position = g_cur_w > 0 ? CGPointMake(fitted.x - g_cur_hx * k, fitted.y - g_cur_hy * k) : fitted;
-        return;
-    }
     if (winios_desktop_fit_map(x, y, &fitted, &k)) {   /* over a fitted window */
         g_cursor_layer.bounds = CGRectMake(0, 0, pixels.width * k, pixels.height * k);
         if (g_cur_w > 0) {

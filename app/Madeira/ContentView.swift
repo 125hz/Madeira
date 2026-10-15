@@ -352,8 +352,7 @@ final class MetalBackedView: UIView {
     private static let tmSlop: CGFloat = 10
     private let F_MDOWN: UInt32 = 0x20, F_MUP: UInt32 = 0x40
 
-    // ml1300 windowed mode taps where the finger is (WindowedMode.swift).
-    private var touchPointerMode: Bool { InputSettings.shared.touchMode || WindowedMode.forcesTouchPointer }
+    private var touchPointerMode: Bool { InputSettings.shared.touchMode }
 
     private func tmResetGesture() {
         tmDownPoints.removeAll()
