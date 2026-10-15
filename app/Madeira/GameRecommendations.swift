@@ -24,6 +24,9 @@
 //      anywhere else a copy from outside Steam (Rockstar Games Launcher or
 //      another store), and each has its own list. Red Dead Redemption 2's
 //      RDR2.exe and PlayRDR2.exe the same way.
+//    - GTA V Legacy only from Steam: App ID 271590, the folder "Grand
+//      Theft Auto V", GTA5.exe, or PlayGTAV.exe beside GTA5.exe and without
+//      GTA5_Enhanced.exe (Enhanced is checked first).
 //    - Any other game, and the Desktop, gets the standard list (owner's
 //      decisions, 2026-10-12; GameRecommendationsApply.swift).
 //
@@ -65,8 +68,19 @@ struct GameRecommendation: Equatable {
     /// Aspect & scaling (DisplayMode raw value); "fit" is the default.
     var display: String? = nil
 
-    /// The config file's text as GameProfile stores it (one trailing newline).
-    var fileText: String { config.hasSuffix("\n") ? config : config + "\n" }
+    /// Lines only a device with less than 12 GB of RAM gets, after `config`
+    /// (GameRecommendations.smallRAMDevice). nil: every device gets the same list.
+    var smallRAMConfig: String? = nil
+
+    /// The config file's text as GameProfile stores it (one trailing newline): `config`,
+    /// and on a device with less than 12 GB of RAM `smallRAMConfig` after it.
+    var fileText: String {
+        var text = config.hasSuffix("\n") ? config : config + "\n"
+        if let extra = smallRAMConfig, GameRecommendations.smallRAMDevice {
+            text += extra.hasSuffix("\n") ? extra : extra + "\n"
+        }
+        return text
+    }
 
     /// A short list of the switches it sets, for Game details.
     var switchSummary: String {
@@ -86,6 +100,16 @@ struct GameRecommendation: Equatable {
 }
 
 enum GameRecommendations {
+    // MARK: The device
+
+    /// Installed RAM (hw.memsize): a 12 GB iPhone reports 11,695 MB, an 8 GB one
+    /// about 7,500 MB. A variable so the host test can try both.
+    static var deviceRAMBytes: UInt64 = ProcessInfo.processInfo.physicalMemory
+
+    /// An 8 GB (or smaller) device: under 10 GB installed. It gets a list's
+    /// `smallRAMConfig`; a 12 GB phone or a 16 GB iPad does not.
+    static var smallRAMDevice: Bool { deviceRAMBytes < 10 << 30 }
+
     // MARK: The lists
 
     /// Red Dead Redemption 2 from Steam, through Madeira Dock: the build 463
@@ -304,6 +328,57 @@ enum GameRecommendations {
         """,
         avx: false, nvidia: true, wineVCRT: false, fastSync: true, semaphoreFastPath: true, fpsMode: 4,
         display: "fit")
+
+    /// GTA V Legacy from Steam (App ID 271590, DirectX 11 through DXMT): the
+    /// Enhanced list without its D3D12 lines and its DualSense mode (Legacy takes
+    /// XInput only), the Dock keeping Launcher.exe and GTA5.exe, and DXMT's display
+    /// mode table and monitor identity. On madeira-bcd build 547 (2026-10-15,
+    /// log GTA5.exe 13:37:35, a 12 GB iPhone) it played Story Mode into the city
+    /// at 38-60 FPS, after the airconv geometry-shader fix (willfaust/dxmt). With
+    /// vram-mb = 4096 and swap-mb = 3072 the first try had sudden drops and
+    /// stalls; without them it ran smoothly (the DXGI budget then is the default
+    /// 1536 MB). A device with less than 12 GB of RAM still gets the 3 GB RAM
+    /// swap (`smallRAMConfig`); a 12 GB phone or a 16 GB iPad does not. From
+    /// Steam only: another copy (Epic, Rockstar's store) keeps the standard list.
+    static let gta5LegacySteam = GameRecommendation(
+        id: "gta5l-steam", title: "GTA V Legacy (Steam)", version: 1,
+        config: """
+        # Madeira's recommended settings for GTA V Legacy (Steam).
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        pool-low = 1
+        pool-page-fit = 1
+        pool-split = 1
+        env.FEX_VECTORTSOENABLED = 0
+        env.MADEIRA_CHILD_ARGS = PlayGTAV.exe -nobattleye
+        env.MADEIRA_DOCK_GAME_SCM = 1
+        env.MADEIRA_DOCK_KEEP_ALIVE = Launcher.exe;GTA5.exe
+        env.MADEIRA_EXECREQ_LEAVE = 1
+        env.MADEIRA_KMT_ADAPTER = 1
+        env.MADEIRA_LOCK_ORPHAN = stamped
+        env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
+        env.MADEIRA_POOL_LOW_IMAGES = 1
+        env.MADEIRA_POOL_RECYCLE_IMAGES = 1
+        env.MADEIRA_SC_PA_POOLS = 2
+        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;.be\\vc_redist
+        env.MADEIRA_TOUCH_MOUSE = 1
+        env.MADEIRA_WOW_MIN_FREE_GB = 2
+        env.MADEIRA_X64_GRAPHICS_ENTRY = 1
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.DXMT_WSI_MONITOR_IDENTITY = 1
+        env.DXMT_WSI_MODE_TABLE = 1
+        env.DXMT_SMALL_RINGS = Launcher.exe;SocialClubHelper.exe
+        env.WINEDLLOVERRIDES = video64=
+        env.MADEIRA_DEVICE_STATS = 1
+        env.MADEIRA_METAL_HUD_MAIN = 1
+        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: true, wineVCRT: false, fastSync: true, semaphoreFastPath: true, fpsMode: 4,
+        display: "fit", smallRAMConfig: smallRAMSwapLines)
 
     /// GTA V Enhanced started from its own PlayGTAV.exe outside a Steam
     /// library (Rockstar Games Launcher or another store; build 451). Version 2:
@@ -698,9 +773,13 @@ enum GameRecommendations {
         env.MADEIRA_EC_HOOK_TRACE = 0
         """)
 
-    static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, ghostOfTsushima, godOfWar, horizonZeroDawn,
-                      horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered, crysis2Remastered, crysis3Remastered,
-                      standard]
+    /// The 3 GB RAM swap a device with less than 12 GB of RAM gets in GTA V
+    /// Legacy's list.
+    static let smallRAMSwapLines = "swap-mb = 3072"
+
+    static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, gta5LegacySteam, ghostOfTsushima, godOfWar,
+                      horizonZeroDawn, horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered, crysis2Remastered,
+                      crysis3Remastered, standard]
 
     // MARK: Recognising a game
 
@@ -708,6 +787,8 @@ enum GameRecommendations {
     static let rdr2AppID = 1174180, gta5EnhancedAppID = 3240220, ghostAppID = 2215430, godOfWarAppID = 1593500,
                horizonZeroDawnAppID = 1151640, crysisRemasteredAppID = 1715130, crysis2RemasteredAppID = 2096600,
                crysis3RemasteredAppID = 2096610, horizonForbiddenWestAppID = 2420110, ratchetClankRiftApartAppID = 1895880
+    /// GTA V Legacy, the edition every Steam copy of GTA V also carries.
+    static let gta5LegacyAppID = 271590
 
     /// The recommendation for a game, or nil.
     /// - windowsPath: a program ("C:\Games\GoW\GoW.exe"), or a library Steam
@@ -725,6 +806,7 @@ enum GameRecommendations {
             let installFolder = last == steamFolder ? steamFolder : nil
             if steamAppID == rdr2AppID || installFolder == "red dead redemption 2" { return rdr2Steam }
             if steamAppID == gta5EnhancedAppID || installFolder == "grand theft auto v enhanced" { return gta5EnhancedSteam }
+            if steamAppID == gta5LegacyAppID || installFolder == "grand theft auto v" { return gta5LegacySteam }
             if steamAppID == ghostAppID || installFolder == "ghost of tsushima director's cut"
                 || installFolder == "ghost of tsushima" { return ghostOfTsushima }
             if steamAppID == godOfWarAppID || installFolder == "godofwar" || installFolder == "god of war" { return godOfWar }
@@ -748,8 +830,14 @@ enum GameRecommendations {
             // GTA V Enhanced (the legacy edition has PlayGTAV.exe too, beside GTA5.exe):
             // inside a Steam library the Steam copy, anywhere else the list for outside Steam.
             let folder = path.lastIndex(of: "\\").map { String(path[..<$0]) } ?? ""
-            guard fileExists(folder + "\\GTA5_Enhanced.exe") else { return nil }
+            guard fileExists(folder + "\\GTA5_Enhanced.exe") else {
+                // GTA V Legacy: PlayGTAV.exe beside GTA5.exe, from Steam only.
+                return last == "playgtav.exe" && inSteam && fileExists(folder + "\\GTA5.exe") ? gta5LegacySteam : nil
+            }
             return inSteam ? gta5EnhancedSteam : gta5EnhancedOther
+        case "gta5.exe":
+            // GTA V Legacy's game program, from Steam only.
+            return inSteam ? gta5LegacySteam : nil
         case "rdr2.exe", "playrdr2.exe":
             return inSteam ? rdr2Steam : rdr2Other
         case "ghostoftsushima.exe":
