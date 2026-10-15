@@ -390,63 +390,6 @@ handlers report into the same file). The app also logs any uncaught Objective-C
 exception before it dies: `[crash] ml1333 uncaught Objective-C exception <name>:
 <reason> (thread mach id N)` plus up to 24 `[crash] ml1333   <frame>` lines.
 
-**Data directory and silent deaths (ml1334).** Log 101: the remote `cmd.exe` reached
-`entering __wine_main`, then `err:environ:read_nls_file failed to load
-…/App.app/PlugIns/MadeiraProcessHost.appex/nls/normnfc.nls` (and `locale.nls`,
-`l_intl.nls`), connected to the server, published the hardware registry and ended
-~0.3 s after stage 5 with no crash line (app: `extension interrupted`, launcher
-`c00000e5`). ntdll's `init_paths` took every bundle path from its running image's
-directory, which in the extension is the `.appex`: nls/ (locale, normalisation and
-the case table), the PE sets that `load_ntdll`/`apisetschema` open through `dll_dir`,
-`bin_dir`, `ntdll_dir` and the loader name. Without `l_intl.nls` the case table is
-NULL and the first case-insensitive comparison (the next steps are init_files and the
-startup info's path work) reads it; had boot got further, ntdll.dll would not have
-been found either, and the loader's `fatal_error` only wrote to os_log.
-- `loader_ios.c ios_resolve_bundle_dir`: `MADEIRA_BUNDLE_DIR` first when it names a
-  directory with nls/; else, when the image directory has no nls/ and is
-  `<bundle>/PlugIns/<name>.appex`, the containing bundle if it has nls/; else the image
-  directory. The app's processes never set the variable and keep their directory,
-  silently. Log: `[ext-proc] ml1334 data dir: <path> (bundle env | appex parent | image
-  dir)`, with `-- NO nls/ here` when none was found, and `MADEIRA_BUNDLE_DIR=… ignored`.
-- ProcessHost.m sets `MADEIRA_BUNDLE_DIR` to the app's bundle path (`PH_INFO_BUNDLE`),
-  else its own containing bundle, and logs `[ext-proc] ml1334 bundle dir for Wine:
-  <path> (from the app | this extension's containing bundle) nls/=present|MISSING`. An
-  app-supplied value in the forwarded environment is not applied.
-- A missing case table now ends the process at its cause: `[Wine ntdll] ml1334 FATAL
-  (this process's boot thread ends): ml1334 the case table <dir>/nls/l_intl.nls did not
-  load …`. The loader's `fatal_error` and `ios_fatal_startup_error` now also write
-  `[Wine ntdll] ml1334 FATAL …` to stderr, and in the extension report the end to the
-  app (`wine_launched_process_did_exit(1)`, so `ml1330 exit code 1` and the log).
-- Boot steps: in the extension every start-up step prints `[boot] ml1334 <step>`
-  (`virtual_init...`, `init_environment (nls tables)...`, `server_init_process...`,
-  `init_files...`, `startup info: get_startup_info...`, `… add_dynamic_environment...`,
-  `… load_main_exe...`, `load_ntdll...`, …; the app only stores the newest step). The
-  heartbeat runs until the process ends (`ml1333 alive +Nms … step=<newest step>`: dense
-  for 6.4 s, then every 10 s, after 2 min every 60 s).
-- Exits: every `exit()` of the Wine Unix side passes the shim's observer, `[ext-proc]
-  ml1334 exit(N) from <symbol>+0x… (image offset 0x…), thread mach id …, boot step …;
-  backtrace:`; libc `exit()` itself logs `ml1334 libc exit(): the extension process is
-  ending …` (atexit). Crash handlers now also cover SIGSYS, SIGPIPE, SIGUSR1/2, SIGQUIT,
-  SIGINT, SIGTERM, SIGHUP, SIGALRM, SIGVTALRM, SIGPROF, SIGXCPU, SIGXFSZ and SIGEMT
-  (default actions that end a process without a word) and run on an alternate stack
-  (a stack overflow is reported); the `[ext-crash]` line adds the sender pid and the
-  boot step. Only SIGKILL (jetsam, code signing, a guard exception, the debugger) and
-  `_exit` remain unlogged in the extension; see the next point.
-- The extension runs under its JIT debugger for its whole life (`[jit-helper] enable:
-  finished` came 70 ms after the death in log 101). The helper now returns the script's
-  last six lines and the app logs them: `[jit-helper] ml1334 enable result: Madeira
-  detached cleanly … Script tail: … | Madeira JIT: inferior exited (W<status> | X<signal>)`
-  or `… undeliverable after 8 tries — killing inferior …`. This names a SIGKILL death,
-  including one by the debugger after a fault it could not hand back. (Assumes the
-  StikJIT progress callback carries the script's `log()` lines, as its NSLog does.)
-- App side: every path that ends an extension logs `[ext-proc] ml1334 app ended the
-  extension: <why> (pid N)`, e.g. `the XPC connection was invalidated (the extension
-  process ended)`, `iOS interrupted the extension request (…)`, `its Wine process
-  exited (code N)`, `prepareGuest failed over XPC: …`, `the launcher ended the session
-  (…)`. The app never times out a started extension: the 55 s deadline only covers
-  start-up (`finish` ignores it once the launch completed), the control socket's 10 s
-  timeouts only poison that socket, and its EOF/EAGAIN never cancel the request.
-
 Failure shapes: no shared group / extension cannot resolve it (see Prerequisites
 for reading the group lines); madsync still active (kept by
 `env.MADEIRA_EXT_PROCESS_KEEP_MADSYNC = 1`, or started earlier in the app run); JIT helper/pool unavailable; preparation stage failure; reused extension
@@ -473,14 +416,6 @@ iOS SDK `-fsyntax-only -Wall` of ProcessHost.m, ProcessHostStubs.c,
 ProcessHostClient.m, Winios.m and WiniosWindowed.m; `swiftc -typecheck` of
 MadeiraExtProcess.swift against stubs; one full `build-app.sh` that links and
 embeds the extension (see HANDOFF.md for its outcome and the symbol checks).
-
-ml1334: `rebuild-native.sh ntdll win32u` (loader_ios.c, env_ios.c, server_ios.c and the
-exit shim); iOS SDK `-fsyntax-only -Wall` of ProcessHost.m, ProcessHostStubs.c and
-ProcessHostClient.m; `swiftc -parse` of MadeiraJITHelper.swift / JITBuiltInHost.swift and
-an executed Swift 6 probe of the helper's script-tail buffer; `check-process-host.py`
-now also runs the production `ios_resolve_bundle_dir` against synthetic bundles (app
-unchanged and silent, .appex resolves to its app, the variable wins, a variable without
-nls/ is ignored loudly, no nls/ anywhere is reported). No device run.
 
 Apple API references: [App Group container access](https://developer.apple.com/documentation/foundation/filemanager/1412643-containerurl),
 [thread_get_state](https://developer.apple.com/documentation/kernel/1418576-thread_get_state).
