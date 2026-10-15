@@ -151,13 +151,6 @@
 		A1000281 /* Winios/WiniosCursor.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000281 /* Winios/WiniosCursor.c */; };
 		A1000245 /* TouchGamepad.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000245 /* TouchGamepad.swift */; };
 		A1000246 /* TouchControlPresets.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000246 /* TouchControlPresets.swift */; };
-		CA000001 /* ProcessHostClient.m in Sources */ = {isa = PBXBuildFile; fileRef = CA000011 /* ProcessHostClient.m */; };
-		CA000002 /* MadeiraExtProcess.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA000012 /* MadeiraExtProcess.swift */; };
-		CA000003 /* ProcessHost.m in Sources */ = {isa = PBXBuildFile; fileRef = CA000013 /* ProcessHost.m */; };
-		CA000004 /* ProcessHostStubs.c in Sources */ = {isa = PBXBuildFile; fileRef = CA000014 /* ProcessHostStubs.c */; };
-		CA000006 /* JITAllocator.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000004 /* JITAllocator.c */; };
-		CA000007 /* wine_stubs.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000034 /* wine_stubs.c */; };
-		CA000005 /* MadeiraProcessHost.appex in Embed Process Host */ = {isa = PBXBuildFile; fileRef = CA000020 /* MadeiraProcessHost.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -167,13 +160,6 @@
 			proxyType = 1;
 			remoteGlobalIDString = B5000001;
 			remoteInfo = MadeiraJITHelper;
-		};
-		CA000040 /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = A6000001 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = CA000030;
-			remoteInfo = MadeiraProcessHost;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -197,17 +183,6 @@
 				B1000016 /* MadeiraJITHelper.appex in Embed JIT Helper */,
 			);
 			name = "Embed JIT Helper";
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-		CA000050 /* Embed Process Host */ = {
-			isa = PBXCopyFilesBuildPhase;
-			buildActionMask = 2147483647;
-			dstPath = "";
-			dstSubfolderSpec = 13;
-			files = (
-				CA000005 /* MadeiraProcessHost.appex in Embed Process Host */,
-			);
-			name = "Embed Process Host";
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXCopyFilesBuildPhase section */
@@ -374,15 +349,6 @@
 		A2000281 /* Winios/WiniosCursor.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "Winios/WiniosCursor.c"; sourceTree = "<group>"; };
 		A2000245 /* TouchGamepad.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TouchGamepad.swift; sourceTree = "<group>"; };
 		A2000246 /* TouchControlPresets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TouchControlPresets.swift; sourceTree = "<group>"; };
-		CA000011 /* ProcessHostClient.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ProcessHostClient.m; sourceTree = "<group>"; };
-		CA000015 /* ProcessHostClient.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ProcessHostClient.h; sourceTree = "<group>"; };
-		CA000016 /* ProcessHostProtocol.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = ProcessHostProtocol.h; sourceTree = "<group>"; };
-		CA000012 /* MadeiraExtProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MadeiraExtProcess.swift; sourceTree = "<group>"; };
-		CA000013 /* ProcessHost.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ProcessHost.m; sourceTree = "<group>"; };
-		CA000014 /* ProcessHostStubs.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = ProcessHostStubs.c; sourceTree = "<group>"; };
-		CA000017 /* ProcessHost.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = ProcessHost.entitlements; sourceTree = "<group>"; };
-		CA000018 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
-		CA000020 /* MadeiraProcessHost.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = MadeiraProcessHost.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -437,13 +403,6 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		CA000032 /* Frameworks */ = {
-			isa = PBXFrameworksBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -452,7 +411,6 @@
 			children = (
 				A4000002 /* Madeira */,
 				B4000001 /* MadeiraJITHelper */,
-				CA000060 /* MadeiraProcessHost */,
 				A4000004 /* Libraries */,
 				A4000003 /* Products */,
 			);
@@ -461,10 +419,6 @@
 		A4000002 /* Madeira */ = {
 			isa = PBXGroup;
 			children = (
-				CA000011 /* ProcessHostClient.m */,
-				CA000015 /* ProcessHostClient.h */,
-				CA000016 /* ProcessHostProtocol.h */,
-				CA000012 /* MadeiraExtProcess.swift */,
 				A2000520 /* MadeiraDock.swift */,
 				A2000521 /* MadeiraDockView.swift */,
 				A2000650 /* DockStartScreen.swift */,
@@ -594,7 +548,6 @@
 			children = (
 				A2000009 /* Madeira.app */,
 				B2000022 /* MadeiraJITHelper.appex */,
-				CA000020 /* MadeiraProcessHost.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -652,17 +605,6 @@
 			path = MadeiraJITHelper;
 			sourceTree = "<group>";
 		};
-		CA000060 /* MadeiraProcessHost */ = {
-			isa = PBXGroup;
-			children = (
-				CA000013 /* ProcessHost.m */,
-				CA000014 /* ProcessHostStubs.c */,
-				CA000017 /* ProcessHost.entitlements */,
-				CA000018 /* Info.plist */,
-			);
-			path = MadeiraProcessHost;
-			sourceTree = "<group>";
-		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -676,14 +618,12 @@
 				A30000E2 /* Bundle Wine Mono */,
 				B3000003 /* Embed JIT Helper */,
 				B3000007 /* Embed StikJIT */,
-				CA000050 /* Embed Process Host */,
 				A30000D1 /* Sign bundled dylibs */,
 			);
 			buildRules = (
 			);
 			dependencies = (
 				B3000006 /* PBXTargetDependency */,
-				CA000080 /* PBXTargetDependency */,
 			);
 			name = Madeira;
 			productName = Madeira;
@@ -705,22 +645,6 @@
 			name = MadeiraJITHelper;
 			productName = MadeiraJITHelper;
 			productReference = B2000022 /* MadeiraJITHelper.appex */;
-			productType = "com.apple.product-type.app-extension";
-		};
-		CA000030 /* MadeiraProcessHost */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = CA000070 /* Build configuration list for PBXNativeTarget "MadeiraProcessHost" */;
-			buildPhases = (
-				CA000031 /* Sources */,
-				CA000032 /* Frameworks */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-			);
-			name = MadeiraProcessHost;
-			productName = MadeiraProcessHost;
-			productReference = CA000020 /* MadeiraProcessHost.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
 /* End PBXNativeTarget section */
@@ -758,7 +682,6 @@
 			targets = (
 				A5000001 /* Madeira */,
 				B5000001 /* MadeiraJITHelper */,
-				CA000030 /* MadeiraProcessHost */,
 			);
 		};
 /* End PBXProject section */
@@ -916,8 +839,6 @@
 				A1000020 /* WineServerBridge.m in Sources */,
 				A1000030 /* WineProcessBridge.m in Sources */,
 				A1000033 /* wine_stubs.c in Sources */,
-				CA000001 /* ProcessHostClient.m in Sources */,
-				CA000002 /* MadeiraExtProcess.swift in Sources */,
 				A1000041 /* PrefixExtractor.c in Sources */,
 				A1000050 /* IOSDisplayShim.m in Sources */,
 				A1000070 /* Winios/Winios.m in Sources */,
@@ -944,17 +865,6 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		CA000031 /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				CA000003 /* ProcessHost.m in Sources */,
-				CA000004 /* ProcessHostStubs.c in Sources */,
-				CA000006 /* JITAllocator.c in Sources */,
-				CA000007 /* wine_stubs.c in Sources */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -962,11 +872,6 @@
 			isa = PBXTargetDependency;
 			target = B5000001 /* MadeiraJITHelper */;
 			targetProxy = B3000001 /* PBXContainerItemProxy */;
-		};
-		CA000080 /* PBXTargetDependency */ = {
-			isa = PBXTargetDependency;
-			target = CA000030 /* MadeiraProcessHost */;
-			targetProxy = CA000040 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -1199,58 +1104,6 @@
 			};
 			name = Release;
 		};
-		CA000071 /* Debug */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				APPLICATION_EXTENSION_API_ONLY = YES;
-				CODE_SIGN_ENTITLEMENTS = MadeiraProcessHost/ProcessHost.entitlements;
-				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 4;
-				DEVELOPMENT_TEAM = V8NU3FX3TL;
-				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = MadeiraProcessHost/Info.plist;
-				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/Frameworks",
-					"@executable_path/../../Frameworks",
-				);
-				MARKETING_VERSION = 0.1.3;
-				PRODUCT_BUNDLE_IDENTIFIER = "$(MADEIRA_BUNDLE_IDENTIFIER).ProcessHost";
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				SKIP_INSTALL = NO;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
-				SUPPORTS_MACCATALYST = NO;
-				TARGETED_DEVICE_FAMILY = "1,2";
-			};
-			name = Debug;
-		};
-		CA000072 /* Release */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				APPLICATION_EXTENSION_API_ONLY = YES;
-				CODE_SIGN_ENTITLEMENTS = MadeiraProcessHost/ProcessHost.entitlements;
-				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 4;
-				DEVELOPMENT_TEAM = V8NU3FX3TL;
-				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = MadeiraProcessHost/Info.plist;
-				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/Frameworks",
-					"@executable_path/../../Frameworks",
-				);
-				MARKETING_VERSION = 0.1.3;
-				PRODUCT_BUNDLE_IDENTIFIER = "$(MADEIRA_BUNDLE_IDENTIFIER).ProcessHost";
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				SKIP_INSTALL = NO;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
-				SUPPORTS_MACCATALYST = NO;
-				TARGETED_DEVICE_FAMILY = "1,2";
-			};
-			name = Release;
-		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -1277,15 +1130,6 @@
 			buildConfigurations = (
 				B8000001 /* Debug */,
 				B8000002 /* Release */,
-			);
-			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Release;
-		};
-		CA000070 /* Build configuration list for PBXNativeTarget "MadeiraProcessHost" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (
-				CA000071 /* Debug */,
-				CA000072 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

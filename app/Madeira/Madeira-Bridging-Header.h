@@ -2,8 +2,6 @@
 #import "FEXBridge.h"
 #import "WineServerBridge.h"
 #import "WineProcessBridge.h"
-// ml1330 process host: app-side launch of the MadeiraProcessHost extension (ProcessHostClient.m).
-#import "ProcessHostClient.h"
 #import "IOSDisplayShim.h"
 #import "Winios/Winios.h"
 #import "Winios/WiniosCursor.h"
