@@ -38,6 +38,7 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <time.h>
 #include <dlfcn.h>
 #ifdef HAVE_PWD_H
 # include <pwd.h>
@@ -1537,12 +1538,97 @@ static int ios_log_throttle_drop( const char *str, unsigned len )
     pthread_mutex_unlock( &ios_lt_lock );
     for (i = 0; i < flushed; i++) write( 2, flush[i], strlen( flush[i] ) );
     return drop;
+/* madeira-bcd: rtcs-cap v1. The PE ntdll (upstream's tracked binary) prints
+ * "[rtcs] pre:" for every exception prepare_exception_arm64ec sees; its
+ * 40-line cap (signal_arm64ec.c) only covers the block before the ERR. A
+ * self-modifying launcher (RockstarService, builds 435-437) faults 150-1000
+ * times a second, so that one line was 42-53% of the session log, each one a
+ * write(2) and a pass through the log pipeline. Keep at most N such lines per
+ * second per thread (the "%04x:" prefix, hashed into 64 slots), count the
+ * rest, and say how many were left out once a second while it happens.
+ * MADEIRA_RTCS_LOG=all prints every line; a number sets N (default 10, 0 =
+ * none). Every other dbg_write is untouched. */
+#define IOS_RTCS_SLOTS 64
+static int ios_rtcs_limit = -2;                     /* -2 = not read yet, -1 = every line */
+static long long ios_rtcs_slot_second[IOS_RTCS_SLOTS];
+static int ios_rtcs_slot_lines[IOS_RTCS_SLOTS];
+static long long ios_rtcs_note_second = -1;
+static unsigned long long ios_rtcs_seen, ios_rtcs_dropped, ios_rtcs_unnoted;
+
+static int ios_rtcs_read_limit( void )
+{
+    const char *e = getenv( "MADEIRA_RTCS_LOG" );   /* all: every "[rtcs] pre" line; N: at most N a second per thread (default 10, 0 none) */
+    char *end;
+    long n;
+
+    if (!e || !*e) return 10;
+    if (!strcmp( e, "all" )) return -1;
+    n = strtol( e, &end, 10 );
+    if (*end || n < 0) return 10;
+    return n > 100000 ? 100000 : (int)n;
+}
+
+/* 1 = write the line, 0 = leave it out */
+static int ios_rtcs_admit( const char *str, unsigned int len )
+{
+    static const char tag[] = "[rtcs] pre: ";
+    unsigned int scan = len < 160 ? len : 160, i, slot, hash = 2166136261u;
+    long long now, last;
+    struct timespec ts;
+    int limit;
+
+    for (i = 0; i + sizeof(tag) - 1 <= scan; i++)
+        if (str[i] == '[' && !memcmp( str + i, tag, sizeof(tag) - 1 )) break;
+    if (i + sizeof(tag) - 1 > scan) return 1;
+    limit = __atomic_load_n( &ios_rtcs_limit, __ATOMIC_RELAXED );
+    if (limit == -2)
+    {
+        limit = ios_rtcs_read_limit();
+        __atomic_store_n( &ios_rtcs_limit, limit, __ATOMIC_RELAXED );
+    }
+    __atomic_add_fetch( &ios_rtcs_seen, 1, __ATOMIC_RELAXED );
+    if (limit < 0) return 1;
+
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    now = ts.tv_sec;
+    last = __atomic_load_n( &ios_rtcs_note_second, __ATOMIC_RELAXED );
+    if (now != last && __atomic_compare_exchange_n( &ios_rtcs_note_second, &last, now, 0,
+                                                     __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
+    {
+        unsigned long long unnoted = __atomic_exchange_n( &ios_rtcs_unnoted, 0, __ATOMIC_RELAXED );
+        if (unnoted)
+        {
+            char note[256];
+            int n = snprintf( note, sizeof(note),
+                              "[rtcs-cap] madeira-bcd v1: %llu '[rtcs] pre' lines left out since the last note "
+                              "(%llu seen, %llu left out; %d per second per thread kept; "
+                              "MADEIRA_RTCS_LOG=all prints every line)\n",
+                              unnoted, __atomic_load_n( &ios_rtcs_seen, __ATOMIC_RELAXED ),
+                              __atomic_load_n( &ios_rtcs_dropped, __ATOMIC_RELAXED ), limit );
+            if (n > 0) write( 2, note, n < (int)sizeof(note) ? n : (int)sizeof(note) - 1 );
+        }
+    }
+
+    for (i = 0; i < len && i < 16 && str[i] != ':'; i++) hash = (hash ^ (unsigned char)str[i]) * 16777619u;
+    slot = hash % IOS_RTCS_SLOTS;
+    if (__atomic_exchange_n( &ios_rtcs_slot_second[slot], now, __ATOMIC_RELAXED ) != now)
+        __atomic_store_n( &ios_rtcs_slot_lines[slot], 0, __ATOMIC_RELAXED );
+    if (__atomic_add_fetch( &ios_rtcs_slot_lines[slot], 1, __ATOMIC_RELAXED ) <= limit) return 1;
+    __atomic_add_fetch( &ios_rtcs_dropped, 1, __ATOMIC_RELAXED );
+    __atomic_add_fetch( &ios_rtcs_unnoted, 1, __ATOMIC_RELAXED );
+    return 0;
 }
 
 static NTSTATUS ios_wrap_2(void *a)
 {
     struct wine_dbg_write_params *p = a;
     if (p && ios_log_throttle_drop( p->str, p->len )) return p->len;
+    /* rtcs-cap (above): the PE ntdll's "[rtcs] pre:" lines, then the throttle. */
+    if (p && !ios_rtcs_admit( p->str, p->len ))
+    {
+        g_wine_unix_call_count++;
+        return p->len;  /* what write() returns for the whole line */
+    }
     return ios_wrap_unix_call(2, a, unixcall_wine_dbg_write);
 }
 
@@ -2328,6 +2414,11 @@ static void load_ntdll_functions( HMODULE module )
             void *f = (void *)find_named_export( module, exports, "RtlPcToFileHeader" );
             if (f) ios_patch_rtl_pc_to_file_header( module, f );
         }
+        {   /* madeira-bcd: the [exec-req] path of NtProtectVirtualMemory leaves the
+             * syscall callback (virtual_ios.c, opt-in MADEIRA_EXECREQ_LEAVE=1) */
+            extern int ios_patch_execreq_leave( void *module );
+            ios_patch_execreq_leave( module );
+        }
     }
 
     /* Sync dispatcher pointers to JIT pool .data copy.
@@ -2675,6 +2766,11 @@ static int ios_load_child_ec_ntdll( PEB *child_peb )
             extern int ios_patch_rtl_pc_to_file_header( void *module, const void *export_addr );
             void *f = (void *)find_named_export( module, exports, "RtlPcToFileHeader" );
             if (f) ios_patch_rtl_pc_to_file_header( module, f );
+        }
+        {   /* madeira-bcd: the [exec-req] path of NtProtectVirtualMemory leaves the
+             * syscall callback (virtual_ios.c, opt-in MADEIRA_EXECREQ_LEAVE=1) */
+            extern int ios_patch_execreq_leave( void *module );
+            ios_patch_execreq_leave( module );
         }
 
         /* Sync all written slots into the pool copy (PE code reads there). */
@@ -4079,6 +4175,13 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
                 {
                     extern int ios_patch_rtl_pc_to_file_header_current( const void *pe_addr );
                     ios_patch_rtl_pc_to_file_header_current( pLdrInitializeThunk );
+                }
+                /* madeira-bcd: and the [exec-req] leave fix (virtual_ios.c,
+                 * opt-in MADEIRA_EXECREQ_LEAVE=1):
+                 * GTA V Enhanced runs in such a child. */
+                {
+                    extern int ios_patch_execreq_leave_current( const void *pe_addr );
+                    ios_patch_execreq_leave_current( pLdrInitializeThunk );
                 }
             }
         }

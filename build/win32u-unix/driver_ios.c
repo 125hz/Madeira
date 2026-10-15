@@ -115,6 +115,8 @@ static BOOL winios_drv_set_cursor_pos( INT x, INT y )
     return TRUE;
 }
 
+static void ios_foreground_if_none( const char *why );   /* madeira-bcd, MADEIRA_INPUT_FOREGROUND, below */
+
 /* C bridge for Winios.m to inject mouse input without pulling in Wine
  * headers into Obj-C (where INPUT/HWND/etc. would conflict with UIKit
  * types). Call this from pProcessEvents drain or directly from a
@@ -146,6 +148,7 @@ void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_
      * message to that window (find_hardware_message_window: msg->win when it
      * is visible, capture first) instead of hit-testing the guest desktop.
      * Only windowed mode passes a window; everything else still passes NULL. */
+    ios_foreground_if_none( "an injected mouse event" );   /* madeira, MADEIRA_INPUT_FOREGROUND */
     NTSTATUS st = send_hardware_message( hwnd, 0, &input, 0 );
     {
         static unsigned cnt;
@@ -229,6 +232,7 @@ void winios_drv_post_key(unsigned short vk, unsigned int flags)
     input.ki.time        = 0;
     input.ki.dwExtraInfo = 0;
 
+    ios_foreground_if_none( "an injected key" );
     st = send_hardware_message( NULL, 0, &input, 0 );
     {
         /* ml647: COUNT EVENTS, and never let a cap masquerade as absence. The
@@ -263,6 +267,12 @@ void winios_dump_window_tree(void)
         return;
     }
     dprintf( 2, "[winios-tree] ---- %u top-level windows ----\n", (unsigned)(size ? size - 1 : 0) );
+    /* who takes the keyboard and, for a game that pauses without focus, the pad */
+    {
+        HWND fg = NtUserGetForegroundWindow();
+        DWORD fg_pid = 0, fg_tid = fg ? get_window_thread( fg, &fg_pid ) : 0;
+        dprintf( 2, "[winios-tree] foreground=%p pid=%04x tid=%04x\n", fg, (unsigned)fg_pid, (unsigned)fg_tid );
+    }
     for (i = 0; i + 1 < size && i < ARRAY_SIZE(list); i++)
     {
         HWND hwnd = list[i];
@@ -734,9 +744,13 @@ int winios_drv_session_launch_pump(void)
  * driver hooks below). Called on wine threads — the app side copies the
  * bits before returning and uploads on the main thread. */
 extern int winios_surface_present( HWND hwnd, int dirty_x, int dirty_y, int dirty_w, int dirty_h,
-                                    int surf_w, int surf_h, int stride, const void *bits ) __attribute__((weak));
+                                    int surf_w, int surf_h, int stride, const void *bits,
+                                    unsigned int alpha_mask ) __attribute__((weak));
 extern void winios_window_frame( HWND hwnd, int x, int y, int w, int h, int visible,
                                  int cx, int cy, int cw, int ch ) __attribute__((weak));
+extern void winios_window_visibility( HWND hwnd, int visible ) __attribute__((weak));
+extern void winios_window_geometry( HWND hwnd, int x, int y, int w, int h,
+                                    int cx, int cy, int cw, int ch ) __attribute__((weak));
 extern void winios_cursor_set( unsigned int id, int w, int h, int hot_x, int hot_y,
                                const void *bgra ) __attribute__((weak));
 extern void winios_cursor_show( int show ) __attribute__((weak));
@@ -921,6 +935,85 @@ static void winios_note_dialog_thread( HWND hwnd, const RECT *visible )
                  (int)visible->left, (int)visible->top, (int)visible->right, (int)visible->bottom );
 }
 
+/* Activation of a full-screen window when it is shown. iOS has no window
+ * manager, and the wineserver keeps Windows' foreground lock (queue_ios.c,
+ * set_foreground_window): a process that has had neither input nor the
+ * foreground may not take it from another process unless its parent holds
+ * it. A game started by a launcher whose windows belong to other processes
+ * is refused: Grand Theft Auto V Enhanced, started by Launcher.exe in a Dock
+ * session (log 2026-10-07 19:27, build 433), asked four times to activate
+ * its 1920x1080 window after the launcher's windows (SocialClubHelper.exe's
+ * UI, the console conhost.exe opened for it) had held the foreground, and
+ * sat at its first screen with no keyboard, mouse or pad; a copy of the game
+ * started on its own plays with a pad on the same build. A window manager
+ * gives a newly shown full-screen window the activation it asks for, so: a
+ * visible top-level window covering the whole virtual screen that is shown
+ * without SWP_NOACTIVATE is made foreground by its own thread at its next
+ * message poll, unless a window of its process already is (the internal path
+ * ios_foreground_check uses). Once per show; smaller windows (launchers,
+ * dialogs) are left to the lock. MADEIRA_FULLSCREEN_FOREGROUND=0 turns this
+ * off. Logs [fg-show] (16 lines at most). */
+static __thread HWND ios_show_foreground;
+
+static int ios_fullscreen_foreground_enabled(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+    {
+        const char *env = getenv( "MADEIRA_FULLSCREEN_FOREGROUND" );  /* 0: a full-screen window shown with activation is left to the foreground lock */
+        on = !(env && env[0] == '0' && !env[1]);
+    }
+    return on;
+}
+
+/* From winios_drv_window_pos_changed, on the window's own thread. */
+static void ios_note_fullscreen_show( HWND hwnd, UINT swp_flags, const RECT *visible )
+{
+    DWORD style;
+    RECT screen;
+
+    if (!(swp_flags & SWP_SHOWWINDOW) || (swp_flags & (SWP_NOACTIVATE | SWP_HIDEWINDOW))) return;
+    if (!ios_fullscreen_foreground_enabled()) return;
+    style = get_window_long( hwnd, GWL_STYLE );
+    if ((style & (WS_CHILD | WS_MINIMIZE | WS_DISABLED)) || !(style & WS_VISIBLE)) return;
+    if (get_window_long( hwnd, GWL_EXSTYLE ) & WS_EX_NOACTIVATE) return;
+    if (NtUserGetAncestor( hwnd, GA_PARENT ) != get_desktop_window()) return;
+    if (get_window_thread( hwnd, NULL ) != GetCurrentThreadId()) return;
+    screen = get_virtual_screen_rect( 0, MDT_DEFAULT );
+    if (visible->left > screen.left || visible->top > screen.top ||
+        visible->right < screen.right || visible->bottom < screen.bottom) return;
+    ios_show_foreground = hwnd;
+}
+
+static void ios_apply_fullscreen_foreground(void)
+{
+    static unsigned int said;
+    HWND hwnd = ios_show_foreground, fg;
+    DWORD pid = GetCurrentProcessId(), fg_pid = 0;
+    BOOL ok;
+
+    ios_show_foreground = 0;
+    if (!is_window( hwnd ) || !is_window_visible( hwnd )) return;
+    if ((fg = NtUserGetForegroundWindow()) && get_window_thread( fg, &fg_pid ) && fg_pid == pid) return;
+    ok = set_foreground_window( hwnd, FALSE, TRUE );
+    if (__atomic_fetch_add( &said, 1, __ATOMIC_RELAXED ) < 16)
+        dprintf( 2, "[fg-show] full-screen window %p of pid %04x was shown with activation while %p "
+                 "(pid %04x) held the foreground: made it foreground ok=%d "
+                 "(MADEIRA_FULLSCREEN_FOREGROUND=0 disables)\n",
+                 hwnd, (unsigned)pid, fg, (unsigned)fg_pid, ok );
+}
+
+/* pProcessEvents: runs on every message poll of a wine thread (message_ios.c
+ * process_driver_events), so a window's own thread gets here right after it
+ * was shown. */
+static BOOL winios_drv_process_events( DWORD mask )
+{
+    if (ios_show_foreground) ios_apply_fullscreen_foreground();
+    ios_foreground_if_none( "a message poll" );
+    return winios_pProcessEvents ? winios_pProcessEvents( mask ) : FALSE;
+}
+
 /* ml505 probe. This hook was a pure stub: wine hands the driver the
  * surface's VISIBLE REGION here — the rects left after sibling and child
  * occlusion — and we discarded all of it.
@@ -983,7 +1076,7 @@ static BOOL winios_surface_flush( struct window_surface *surface, const RECT *re
         if (!winios_surface_present( surface->hwnd,
                                      dirty->left, dirty->top,
                                      dirty->right - dirty->left, dirty->bottom - dirty->top,
-                                     surf_w, surf_h, surf_w * 4, color_bits ))
+                                     surf_w, surf_h, surf_w * 4, color_bits, surface->alpha_mask ))
             return FALSE;
     }
     return TRUE;
@@ -1001,6 +1094,108 @@ static const struct window_surface_funcs winios_surface_funcs =
     winios_surface_flush,
     winios_surface_destroy
 };
+
+/* madeira-bcd: [swap-win] WHAT HAPPENS TO A SWAPCHAIN'S WINDOW. Red Dead
+ * Redemption 2 hangs when its Screen Type is switched to Windowed Borderless
+ * (owner, 2026-10-08); the switch restyles, moves and re-activates the window
+ * its swapchain presents into, and the logs said nothing about that window
+ * ([win-pos] stops at its 1200th line and has no style or activation). Winios.m
+ * keeps the windows a swapchain made its Metal view for (IOSDisplayShim reports
+ * each one); for those windows these hooks log style changes (SetWindowStyle),
+ * position changes (pos-begin at WindowPosChanging, pos at WindowPosChanged,
+ * with the time between the two on the window's thread) and activations
+ * (ActivateWindow). The three hooks did not exist before and do what win32u's
+ * null driver does: nothing, or TRUE. Logging only: each window's first 32
+ * lines of a kind, then every 100th (Winios.m keeps the counts). */
+extern int winios_swapchain_hwnd( void *hwnd ) __attribute__((weak));
+extern int winios_swapchain_take( int slot, int kind, unsigned int *seq ) __attribute__((weak));
+enum { WINIOS_SWAP_STYLE, WINIOS_SWAP_POS_BEGIN, WINIOS_SWAP_POS, WINIOS_SWAP_ACTIVATE };
+
+/* The window's slot + 1 in Winios.m's table, 0 when no swapchain presents into it. */
+static int winios_swap_win( HWND hwnd )
+{
+    return hwnd && winios_swapchain_hwnd ? winios_swapchain_hwnd( hwnd ) : 0;
+}
+
+static int winios_swap_win_take( int slot, int kind, unsigned int *seq )
+{
+    return slot && winios_swapchain_take && winios_swapchain_take( slot, kind, seq );
+}
+
+static double winios_swap_win_ms(void)
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+static __thread HWND winios_swap_pos_hwnd;   /* the swapchain window between pos-begin and pos */
+static __thread double winios_swap_pos_t0;
+
+static void winios_drv_set_window_style( HWND hwnd, INT offset, STYLESTRUCT *style )
+{
+    unsigned int seq;
+    HWND fg;
+
+    if (!winios_swap_win_take( winios_swap_win( hwnd ), WINIOS_SWAP_STYLE, &seq )) return;
+    fg = NtUserGetForegroundWindow();
+    dprintf( 2, "[swap-win] #%u style hwnd=%p %s %08x -> %08x (set %08x, cleared %08x) shown=%d fg=%p%s tid=%04x\n",
+             seq, hwnd, offset == GWL_STYLE ? "GWL_STYLE" : offset == GWL_EXSTYLE ? "GWL_EXSTYLE" : "other",
+             (unsigned)style->styleOld, (unsigned)style->styleNew,
+             (unsigned)(style->styleNew & ~style->styleOld), (unsigned)(style->styleOld & ~style->styleNew),
+             (int)is_window_visible( hwnd ), fg, fg == hwnd ? " (this window)" : "", (int)GetCurrentThreadId() );
+}
+
+static BOOL winios_drv_window_pos_changing( HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects )
+{
+    unsigned int seq;
+    int slot = winios_swap_win( hwnd );
+
+    if (slot)
+    {
+        winios_swap_pos_hwnd = hwnd;
+        winios_swap_pos_t0 = winios_swap_win_ms();
+        if (winios_swap_win_take( slot, WINIOS_SWAP_POS_BEGIN, &seq ))
+            dprintf( 2, "[swap-win] #%u pos-begin hwnd=%p flags=%08x window={%d,%d,%d,%d} client={%d,%d,%d,%d} "
+                     "tid=%04x\n", seq, hwnd, swp_flags,
+                     (int)rects->window.left, (int)rects->window.top, (int)rects->window.right, (int)rects->window.bottom,
+                     (int)rects->client.left, (int)rects->client.top, (int)rects->client.right, (int)rects->client.bottom,
+                     (int)GetCurrentThreadId() );
+    }
+    return TRUE;   /* as win32u's null driver: the window may have a surface */
+}
+
+static void winios_drv_activate_window( HWND hwnd, HWND previous )
+{
+    unsigned int seq;
+    int now_swap = winios_swap_win( hwnd ), was_swap = winios_swap_win( previous );
+
+    if (!winios_swap_win_take( now_swap ? now_swap : was_swap, WINIOS_SWAP_ACTIVATE, &seq )) return;
+    dprintf( 2, "[swap-win] #%u activate hwnd=%p%s (now foreground) previous=%p%s tid=%04x\n", seq,
+             hwnd, now_swap ? " (swapchain window)" : "", previous, was_swap ? " (swapchain window)" : "",
+             (int)GetCurrentThreadId() );
+}
+
+/* From the end of winios_drv_window_pos_changed, on the window's thread. */
+static void winios_swap_win_pos( int slot, HWND hwnd, HWND insert_after, UINT swp_flags, const struct window_rects *r )
+{
+    unsigned int seq;
+    double since = winios_swap_pos_hwnd == hwnd ? winios_swap_win_ms() - winios_swap_pos_t0 : -1.0;
+    HWND fg;
+
+    if (winios_swap_pos_hwnd == hwnd) winios_swap_pos_hwnd = 0;
+    if (!winios_swap_win_take( slot, WINIOS_SWAP_POS, &seq )) return;
+    fg = NtUserGetForegroundWindow();
+    dprintf( 2, "[swap-win] #%u pos hwnd=%p after=%p flags=%08x window={%d,%d,%d,%d} client={%d,%d,%d,%d} "
+             "visible={%d,%d,%d,%d} style=%08x exstyle=%08x shown=%d fg=%p%s tid=%04x, %.2f ms after pos-begin%s\n",
+             seq, hwnd, insert_after, swp_flags,
+             (int)r->window.left, (int)r->window.top, (int)r->window.right, (int)r->window.bottom,
+             (int)r->client.left, (int)r->client.top, (int)r->client.right, (int)r->client.bottom,
+             (int)r->visible.left, (int)r->visible.top, (int)r->visible.right, (int)r->visible.bottom,
+             (unsigned)get_window_long( hwnd, GWL_STYLE ), (unsigned)get_window_long( hwnd, GWL_EXSTYLE ),
+             (int)is_window_visible( hwnd ), fg, fg == hwnd ? " (this window)" : "", (int)GetCurrentThreadId(),
+             since < 0 ? 0.0 : since, since < 0 ? " (no pos-begin on this thread)" : "" );
+}
 
 static BOOL winios_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_rect,
                                         struct window_surface **window_surface )
@@ -1055,12 +1250,89 @@ static BOOL winios_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *sur
     return TRUE;
 }
 
+/* WindowPosChanged gives children parent-relative raw-pixel rectangles, but
+ * the app's independent HWND layers need screen coordinates. Query on this
+ * Wine thread, after apply_window_pos updated the rectangles. Translate the
+ * supplied frame rather than replacing it: retain its visible bounds, client
+ * offset and pixel dimensions, including a server-side rectangle fallback.
+ * Roots keep the driver's supplied frame (notably exclusive fullscreen). */
+static BOOL winios_drv_screen_rects( HWND hwnd, const struct window_rects *new_rects,
+                                    struct window_rects *rects )
+{
+    struct window_rects screen, parent;
+    HWND ancestor = NtUserGetAncestor( hwnd, GA_PARENT );
+    UINT raw_dpi = 0;
+    int x, y;
+
+    if (new_rects && (!ancestor || ancestor == get_desktop_window()))
+    {
+        *rects = *new_rects;
+        return TRUE;
+    }
+    if (!get_win_monitor_dpi( hwnd, &raw_dpi ) || !raw_dpi ||
+        !get_window_rects( hwnd, COORDS_SCREEN, &screen, raw_dpi )) return FALSE;
+    if (!new_rects)
+    {
+        *rects = screen;
+        return TRUE;
+    }
+    if (!get_window_rects( hwnd, COORDS_PARENT, &parent, raw_dpi )) return FALSE;
+    x = screen.window.left - parent.window.left;
+    y = screen.window.top - parent.window.top;
+    *rects = *new_rects;
+    OffsetRect( &rects->window, x, y );
+    /* An RTL parent can mirror asymmetric client/visible insets. Use each
+     * rectangle's own translation, while keeping the supplied dimensions. */
+    OffsetRect( &rects->client, screen.client.left - parent.client.left,
+                screen.client.top - parent.client.top );
+    OffsetRect( &rects->visible, screen.visible.left - parent.visible.left,
+                screen.visible.top - parent.visible.top );
+    return TRUE;
+}
+
+/* A parent move/show/hide does not send WindowPosChanged to every child.
+ * Refresh existing independent layers without recreating their surfaces or
+ * Metal layers. Query screen coordinates through Wine for nested children. */
+static void winios_drv_refresh_children( HWND hwnd, BOOL geometry )
+{
+    HWND *children;
+    ULONG capacity = 128, count, i;
+    NTSTATUS status;
+
+    if (!winios_window_visibility && !(geometry && winios_window_geometry)) return;
+    for (;;)
+    {
+        if (!(children = malloc( capacity * sizeof(*children) ))) return;
+        status = NtUserBuildHwndList( 0, hwnd, TRUE, TRUE, 0, capacity, children, &count );
+        if (!status) break;
+        free( children );
+        if (status != STATUS_BUFFER_TOO_SMALL || count <= capacity) return;
+        capacity = count;
+    }
+    /* NtUserBuildHwndList includes a final HWND_BOTTOM sentinel. */
+    for (i = 0; i + 1 < count; i++)
+    {
+        struct window_rects rects;
+        if (geometry && winios_window_geometry && winios_drv_screen_rects( children[i], NULL, &rects ))
+        {
+            const RECT *v = &rects.visible, *c = &rects.client;
+            winios_window_geometry( children[i], v->left, v->top, v->right - v->left, v->bottom - v->top,
+                                    c->left, c->top, c->right - c->left, c->bottom - c->top );
+        }
+        if (winios_window_visibility)
+            winios_window_visibility( children[i], is_window_visible( children[i] ) );
+    }
+    free( children );
+}
+
 /* pWindowPosChanged wrapper: dereference window_rects HERE (Winios.m
  * cannot include wine headers) and forward plain ints for the layer
  * frame; chain to the Winios.m hook afterwards. */
 static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                                            const struct window_rects *new_rects, struct window_surface *surface )
 {
+    ios_note_fullscreen_show( hwnd, swp_flags, &new_rects->visible );
+
     /* desktop mode, or a top-level window in game mode (Winios.m draws it
      * in its transparent game-mode overlay, never the desktop backdrop that
      * would cover the DXMT Metal layer) */
@@ -1068,11 +1340,36 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
         || (winios_game_windows() && !(get_window_long( hwnd, GWL_STYLE ) & WS_CHILD)
             && NtUserGetAncestor( hwnd, GA_PARENT ) == get_desktop_window())))
     {
-        const RECT *v = &new_rects->visible;
-        const RECT *c = &new_rects->client;
-        int visible = !IsRectEmpty( v ) && !(swp_flags & SWP_HIDEWINDOW);
-        winios_window_frame( hwnd, v->left, v->top, v->right - v->left, v->bottom - v->top, visible,
-                             c->left, c->top, c->right - c->left, c->bottom - c->top );
+        struct window_rects rects = *new_rects;
+        const RECT *v = &rects.visible;
+        const RECT *c = &rects.client;
+        BOOL desktop = winios_desktop_mode();
+        BOOL frame_valid = !desktop || winios_drv_screen_rects( hwnd, new_rects, &rects );
+        /* The visible rect describes geometry even for a hidden window.
+         * Wine has already updated WS_VISIBLE before this callback; include
+         * its parent chain so a hidden browser's child Metal layer stays hidden. */
+        int visible = is_window_visible( hwnd ) && !IsRectEmpty( v ) && !(swp_flags & SWP_HIDEWINDOW);
+        if (frame_valid)
+            winios_window_frame( hwnd, v->left, v->top, v->right - v->left, v->bottom - v->top, visible,
+                                 c->left, c->top, c->right - c->left, c->bottom - c->top );
+        if (desktop)
+        {
+            BOOL geometry = !(swp_flags & SWP_NOMOVE) || !(swp_flags & SWP_NOSIZE) ||
+                            (swp_flags & SWP_FRAMECHANGED);
+            if (geometry || (swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW)))
+                winios_drv_refresh_children( hwnd, geometry );
+            if (!frame_valid || v->left != new_rects->visible.left || v->top != new_rects->visible.top)
+            {
+                static unsigned frame_n;
+                unsigned n = ++frame_n;
+                if (n <= 64 || (n % 128) == 0)
+                    dprintf( 2, "[win-frame] #%u hwnd=%p valid=%u local={%d,%d,%d,%d} "
+                             "screen={%d,%d,%d,%d} rev=sc-screen\n", n, (void *)hwnd, (unsigned)frame_valid,
+                             (int)new_rects->visible.left, (int)new_rects->visible.top,
+                             (int)new_rects->visible.right, (int)new_rects->visible.bottom,
+                             (int)v->left, (int)v->top, (int)v->right, (int)v->bottom );
+            }
+        }
         if (visible && surface && winios_game_windows()) winios_note_dialog_thread( hwnd, v );
     }
     /* ml505: z-order and geometry churn. If the three same-rect siblings are
@@ -1092,8 +1389,11 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
         {
             const RECT *v = &new_rects->visible;
             dprintf( 2, "[win-pos] #%u hwnd=%p after=%p flags=%08x vis={%d,%d,%d,%d} "
-                     "surface=%p rev=ml505\n", n, hwnd, insert_after, (unsigned)swp_flags,
-                     (int)v->left, (int)v->top, (int)v->right, (int)v->bottom, surface );
+                     "surface=%p rev=ml505 style=%08x visible=%u parent=%p\n",
+                     n, hwnd, insert_after, (unsigned)swp_flags,
+                     (int)v->left, (int)v->top, (int)v->right, (int)v->bottom, surface,
+                     (unsigned)get_window_long( hwnd, GWL_STYLE ), (unsigned)is_window_visible( hwnd ),
+                     NtUserGetAncestor( hwnd, GA_PARENT ) );
             /* ml853: name the window. A dialog nobody can see (nothing is
              * presenting) is otherwise just a rectangle; the class and the
              * text of every window, children included, make it readable
@@ -1137,6 +1437,11 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
 
     if (winios_pWindowPosChanged)
         winios_pWindowPosChanged( hwnd, insert_after, owner_hint, swp_flags, new_rects, surface );
+
+    {   /* madeira-bcd: [swap-win] */
+        int slot = winios_swap_win( hwnd );
+        if (slot) winios_swap_win_pos( slot, hwnd, insert_after, swp_flags, new_rects );
+    }
 }
 #endif
 
@@ -2180,7 +2485,7 @@ static void load_display_driver(void)
          * in app/Madeira/Winios/Winios.m and link in via Madeira.app. */
         if (winios_pCreateWindow)        winios_user_driver.pCreateWindow        = winios_pCreateWindow;
         if (winios_pDestroyWindow)       winios_user_driver.pDestroyWindow       = winios_pDestroyWindow;
-        if (winios_pProcessEvents)       winios_user_driver.pProcessEvents       = winios_pProcessEvents;
+        if (winios_pProcessEvents)       winios_user_driver.pProcessEvents       = winios_drv_process_events;
         if (winios_desktop_mode())       winios_user_driver.pSetCursor           = winios_drv_set_cursor;
         /* direct mode: inert (like winios_pSetCursor) until the app enables it */
         else if (winios_direct_cursor_set) winios_user_driver.pSetCursor         = winios_drv_set_cursor;
@@ -2193,6 +2498,14 @@ static void load_display_driver(void)
          * forwards plain ints to Winios.m's layer compositor */
         if (winios_pWindowPosChanged || winios_window_frame)
             winios_user_driver.pWindowPosChanged = winios_drv_window_pos_changed;
+        /* madeira-bcd: [swap-win] logging around a swapchain's window; each
+         * does what the null driver's does (nothing, or TRUE) */
+        if (winios_swapchain_hwnd && winios_swapchain_take)
+        {
+            winios_user_driver.pSetWindowStyle = winios_drv_set_window_style;
+            winios_user_driver.pWindowPosChanging = winios_drv_window_pos_changing;
+            winios_user_driver.pActivateWindow = winios_drv_activate_window;
+        }
         /* S2 desktop mode: GDI window surfaces → app compositor. */
         if (winios_desktop_mode())
         {
@@ -2742,6 +3055,10 @@ static HWND ios_main_window( DWORD pid )
         if (!get_window_thread( list[i], &wpid ) || wpid != pid) continue;
         style = get_window_long( list[i], GWL_STYLE );
         if ((style & (WS_POPUP | WS_CHILD)) == WS_CHILD) continue;
+        /* madeira-bcd: never a hidden window -- its keys would go nowhere, and
+         * a launcher that polls XInput with only hidden windows left (behind
+         * the game it started) must not take the game's foreground. */
+        if (!(style & WS_VISIBLE)) continue;
         if (!get_window_rect( list[i], &r, dpi )) continue;
         if (r.right - r.left < 320 || r.bottom - r.top < 200) continue;
         area = (LONGLONG)(r.right - r.left) * (r.bottom - r.top);
@@ -2749,6 +3066,53 @@ static HWND ios_main_window( DWORD pid )
     }
     free( list );
     return best;
+}
+
+/* madeira-bcd: NOBODY IN FRONT (opt-in, MADEIRA_INPUT_FOREGROUND=1). Horizon
+ * Zero Dawn on build 471 (2026-10-09 15:01) showed its window "DX12" through
+ * style changes and SetWindowPos with SWP_NOACTIVATE only, and it reads no
+ * XInput (it uses Windows.Gaming.Input), so neither the show rule above nor
+ * ios_foreground_check made it foreground: GetForegroundWindow() stayed NULL
+ * ([swap-win] ... fg=0x0). The wineserver queues WM_INPUT only for the
+ * foreground process (queue_ios.c get_foreground_thread) and sends keys to the
+ * foreground thread's focus, so its language menu got none of the Enter
+ * presses (drv_post_key status 0) and none of the taps. With the switch, while
+ * no window at all is foreground, a wine thread polling its messages or posting
+ * injected input makes its process's main window (ios_main_window: the largest
+ * visible top-level window of 320x200 or more) foreground. Never while some
+ * window is foreground, so it cannot take the foreground from another process.
+ * At most every 250 ms. Logs [fg-none] (16 lines). */
+static void ios_foreground_if_none( const char *why )
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static long long next_ns;
+    static int enabled = -1;
+    static unsigned int said;
+    DWORD pid = GetCurrentProcessId();
+    HWND main_hwnd;
+    struct timespec ts;
+    long long now;
+    BOOL ok;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_INPUT_FOREGROUND" );  /* 1: while no window is foreground, a process polling messages or posting input makes its main window foreground */
+        enabled = e && e[0] == '1' && !e[1];
+    }
+    if (!enabled || NtUserGetForegroundWindow()) return;
+
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    now = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    if (pthread_mutex_trylock( &lock )) return;
+    if (now < next_ns) { pthread_mutex_unlock( &lock ); return; }
+    next_ns = now + 250000000LL;
+    pthread_mutex_unlock( &lock );
+
+    if (!(main_hwnd = ios_main_window( pid ))) return;
+    ok = set_foreground_window( main_hwnd, FALSE, TRUE );
+    if (__atomic_fetch_add( &said, 1, __ATOMIC_RELAXED ) < 16)
+        dprintf( 2, "[fg-none] no window was foreground: made the main window %p of pid %04x foreground "
+                 "on %s, ok=%d (MADEIRA_INPUT_FOREGROUND=1)\n", main_hwnd, (unsigned)pid, why, ok );
 }
 
 static void ios_foreground_check(void)

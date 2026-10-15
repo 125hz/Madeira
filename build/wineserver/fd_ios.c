@@ -20,12 +20,15 @@
 
 
 #include "config.h"
+#include "../madeira_cfg.h"   /* ios_srv_switch */
 #include <os/log.h>
+#include <os/lock.h>
 #include <mach/mach_time.h>
 #include <mach/mach_init.h>
 #include <mach/semaphore.h>
 #include <mach/task.h>
 #include <pthread.h>
+#include <pthread/qos.h>
 #include <mach/mach_vm.h>
 #include <mach/vm_region.h>
 #include "wine_log_ios.h"
@@ -40,9 +43,193 @@
  * right after writing a request; the loop sleeps in semaphore_timedwait
  * and wakes instantly. Extra signals just cause cheap extra scans. */
 semaphore_t ios_srv_wake_sem = 0;
+/* madeira-bcd: coalesced wake. A semaphore count per request never drained:
+ * past the loop's own rate every wait returned at once and the loop ran
+ * pass after pass, each one a read() on every client thread's request fd.
+ * GTA V Enhanced with the Rockstar launcher, Chromium and Steam
+ * alive (352 Wine threads, log 2026-10-07 22:06, build 435) kept the
+ * wineserver thread ~90% busy at ~10k requests/s, ~90 us of server CPU a
+ * request, while the game alone (122 threads) needed ~22 us. Now a client
+ * signals only when no wake is pending, and the loop clears the flag before
+ * it scans, so a request written after the clear signals again and none is
+ * missed (the 1 ms tick stays as the floor). MADEIRA_SRV_WAKE_COALESCE=0
+ * restores one signal per request. */
+static volatile int ios_srv_wake_pending;
+static int ios_srv_wake_coalesce = -1;
+
+/* A switch the app exports as env.NAME: madeira.cfg's line (with the game's own lines,
+ * which win), else the process environment. The server starts before the bridge exports
+ * the env.* lines (ml1236), so getenv alone would miss them in the first session. */
+static const char *ios_srv_switch( const char *name, char *buf, size_t cap )
+{
+    char key[96];
+    snprintf( key, sizeof(key), "env.%s", name );
+    if (madeira_cfg_get( key, buf, cap )) return buf;
+    return getenv( name );
+}
 void ios_wineserver_wake(void)
 {
-    if (ios_srv_wake_sem) semaphore_signal( ios_srv_wake_sem );
+    if (!ios_srv_wake_sem) return;
+    if (ios_srv_wake_coalesce && __atomic_exchange_n( &ios_srv_wake_pending, 1, __ATOMIC_SEQ_CST )) return;
+    semaphore_signal( ios_srv_wake_sem );
+}
+
+/* madeira-bcd: request doorbell. Coalescing the wake (above) did not cut the
+ * server's CPU (build 436: still ~267 ms per ~300 ms sample): the cost is the
+ * pass itself, a read() on every client fd (~1,500 poll users with the
+ * launcher, Chromium, Steam and the game alive), so the loop managed under
+ * ~280 passes/s against ~15,000 requests/s and a request waited ~1.5 ms just to
+ * be read. Now a client sets its thread id's bit here after writing a request
+ * and before it wakes the loop; each pass reads the request fds of the rung
+ * threads only, and the read() of every client fd (thread exits, process
+ * sockets, anything without a bell) runs every MADEIRA_SRV_FULLSCAN_MS (10 by
+ * default) or at once when a ring carried no usable thread id. Nothing is
+ * lost: a bit set after the loop took the words is seen on the next pass,
+ * which the wake guarantees, and a request still partly unread is rung again
+ * by the loop. MADEIRA_SRV_DOORBELL=0 restores the read() of every client fd
+ * on every pass. Wine thread ids are multiples of 4: 65536 / 4 bits. */
+#define IOS_SRV_BELL_WORDS 256
+static volatile unsigned long long ios_srv_bell[IOS_SRV_BELL_WORDS];
+static volatile int ios_srv_bell_full;
+void ios_wineserver_ring( unsigned int tid )
+{
+    unsigned int bit = tid >> 2;
+    if (tid && !(tid & 3) && bit < IOS_SRV_BELL_WORDS * 64)
+        __atomic_fetch_or( &ios_srv_bell[bit >> 6], 1ull << (bit & 63), __ATOMIC_SEQ_CST );
+    else
+        __atomic_store_n( &ios_srv_bell_full, 1, __ATOMIC_SEQ_CST );
+    ios_wineserver_wake();
+}
+
+/* madeira-bcd: the server's per-launch switches. The server thread is running before a
+ * game's env lines are applied, so WineProcessBridge.m sets these after them and clears
+ * them when the session ends (the way g_madeira_srv_fgetpath works). */
+extern volatile int g_madeira_srv_eco_follow;   /* env.MADEIRA_SRV_ECO_FOLLOW = 1 */
+extern volatile int g_madeira_srv_direct;       /* env.MADEIRA_SRV_DIRECT = 1 or 2 */
+extern volatile int g_madeira_srv_idle_us;      /* env.MADEIRA_SRV_IDLE_US = us, 0 = 1000 */
+extern volatile int g_madeira_srv_log_all;      /* env.MADEIRA_SRV_LOG_ALL = 1 */
+
+/* madeira-bcd: a ws_log line written for every fd object (add_poll_user) or every
+ * descriptor sent to a client (request_ios.c send_client_fd) costs the server thread a
+ * vsnprintf, a localtime_r and an fflush (a write) each: about 2,800 a second in Horizon
+ * Zero Dawn's menu (~940 opened shader-cache files a second; 493, 2026-10-11), on a
+ * performance core, and most of them never reach the session log. Each such line is now
+ * written for its first 64 occurrences and then every 1000th; the program does the same
+ * work either way. env.MADEIRA_SRV_LOG_ALL = 1 writes every line, as before. */
+int ios_srv_log_sample( unsigned long *count )
+{
+    unsigned long n = ++*count;
+    return n <= 64 || !(n % 1000) || __atomic_load_n( &g_madeira_srv_log_all, __ATOMIC_RELAXED ) == 1;
+}
+
+/* madeira-bcd: env.MADEIRA_SRV_ECO_FOLLOW = 1 (off by default). The server thread is
+ * created at user-interactive QoS (WineServerBridge.m), so it keeps a performance core at
+ * full clock while ECO holds every guest thread on the efficiency cores: Horizon Zero
+ * Dawn's menu with eco = 1 (2026-10-11 11:10) ran it at 0.54 cores, all of it on P at
+ * ~3.9 GHz, while every guest thread ran on E. With the switch the server thread runs at
+ * utility QoS (ECO's default class; never background, which could stall every request
+ * for seconds) while ECO is on, and user-interactive again when ECO goes off or the
+ * session ends. ECO changes come from ntdll's generation counter (sync.c ios_eco_gen: the
+ * ECO pill, the power governor), looked at once per loop pass. madeira_get_eco() reads
+ * madeira.cfg the first time it runs and keeps the answer, so it is called only once the
+ * bridge has set the switch, which is after the game's configuration is in place. */
+extern volatile int ios_eco_gen;      /* wine/dlls/ntdll/unix/sync.c */
+extern int madeira_get_eco( void );   /* same */
+static qos_class_t ios_srv_qos_set;   /* 0: the class the thread was created with */
+static int ios_srv_qos_follow_seen, ios_srv_qos_gen_seen;
+
+static void ios_srv_qos_follow(void)
+{
+    int follow = __atomic_load_n( &g_madeira_srv_eco_follow, __ATOMIC_ACQUIRE ) == 1;
+    int gen;
+    qos_class_t want = QOS_CLASS_USER_INTERACTIVE;
+
+    if (!follow && !ios_srv_qos_set) return;   /* switch off and nothing changed: nothing to do */
+    gen = __atomic_load_n( &ios_eco_gen, __ATOMIC_ACQUIRE );
+    if (follow == ios_srv_qos_follow_seen && gen == ios_srv_qos_gen_seen) return;
+    ios_srv_qos_follow_seen = follow;
+    ios_srv_qos_gen_seen = gen;
+    if (follow && madeira_get_eco()) want = QOS_CLASS_UTILITY;
+    if (want == (ios_srv_qos_set ? ios_srv_qos_set : QOS_CLASS_USER_INTERACTIVE)) return;
+    pthread_set_qos_class_self_np( want, 0 );
+    ios_srv_qos_set = want == QOS_CLASS_USER_INTERACTIVE ? 0 : want;
+    fprintf( stderr, "[srv-qos] server thread -> %s (ECO %s, MADEIRA_SRV_ECO_FOLLOW %s)\n",
+             want == QOS_CLASS_UTILITY ? "utility" : "user-interactive", want == QOS_CLASS_UTILITY ? "on" : "off",
+             follow ? "on" : "off" );
+}
+
+/* madeira-bcd: env.MADEIRA_SRV_IDLE_US (off by default: 1000 us, as before). The longest
+ * the loop sleeps when no timer is due sooner. A request wakes it at once (the wake
+ * semaphore) and a timer at its deadline; only the socket poll, the init-fd checks and the
+ * read of every client fd (MADEIRA_SRV_POLL_US, MADEIRA_SRV_FULLSCAN_MS) wait for this
+ * tick, so a longer sleep delays those and nothing else. It is the floor of the server
+ * thread's wake-ups: 1000 a second while idle, and with direct requests
+ * (MADEIRA_SRV_DIRECT) most requests no longer wake it at all. 100 us to 50 ms. */
+static unsigned long long ios_srv_idle_ns(void)
+{
+    int us = __atomic_load_n( &g_madeira_srv_idle_us, __ATOMIC_RELAXED );
+    if (us <= 0) return 1000000ull;
+    if (us < 100) us = 100;
+    if (us > 50000) us = 50000;
+    return (unsigned long long)us * 1000ull;
+}
+
+/* madeira-bcd: direct requests (env.MADEIRA_SRV_DIRECT, off by default; request_ios.c
+ * ios_srv_direct_call). While they are on, everything this loop does runs under
+ * ios_srv_lock, which the loop lets go only while it sleeps, and a client thread runs a
+ * listed request under the same lock. ios_srv_direct_live is set and cleared only by the
+ * loop, with the lock held, so a client that finds it set under the lock knows the loop is
+ * not running without the lock. Turning the switch off waits for a direct request still
+ * running, then the loop goes on without the lock, exactly as before. */
+extern os_unfair_lock ios_srv_lock;               /* request_ios.c */
+extern volatile int ios_srv_direct_live;          /* request_ios.c */
+extern volatile int ios_srv_timer_added;          /* request_ios.c */
+extern unsigned long long ios_srv_loop_wake_at;   /* request_ios.c: monotonic tick the loop sleeps until */
+static int ios_srv_loop_locked;
+
+static void ios_srv_loop_enter(void)
+{
+    int level = __atomic_load_n( &g_madeira_srv_direct, __ATOMIC_ACQUIRE );
+
+    if (level > 0)
+    {
+        os_unfair_lock_lock( &ios_srv_lock );
+        ios_srv_loop_locked = 1;
+        if (!__atomic_load_n( &ios_srv_direct_live, __ATOMIC_ACQUIRE ))
+        {
+            __atomic_store_n( &ios_srv_direct_live, 1, __ATOMIC_RELEASE );
+            fprintf( stderr, "[srv-direct] on (level %d): listed requests run on their own threads\n", level );
+        }
+    }
+    else if (__atomic_load_n( &ios_srv_direct_live, __ATOMIC_ACQUIRE ))
+    {
+        os_unfair_lock_lock( &ios_srv_lock );     /* a direct request still running ends first */
+        __atomic_store_n( &ios_srv_direct_live, 0, __ATOMIC_RELEASE );
+        os_unfair_lock_unlock( &ios_srv_lock );
+        fprintf( stderr, "[srv-direct] off\n" );
+    }
+}
+
+static void ios_srv_loop_leave(void)
+{
+    if (!ios_srv_loop_locked) return;
+    ios_srv_loop_locked = 0;
+    os_unfair_lock_unlock( &ios_srv_lock );
+}
+
+/* the loop is ending: no direct request may run after it, and the next server thread
+ * (WineServerBridge.m starts one per session) starts at its creation QoS */
+static void ios_srv_loop_exit(void)
+{
+    if (!ios_srv_loop_locked && __atomic_load_n( &ios_srv_direct_live, __ATOMIC_ACQUIRE ))
+    {
+        os_unfair_lock_lock( &ios_srv_lock );
+        ios_srv_loop_locked = 1;
+    }
+    __atomic_store_n( &ios_srv_direct_live, 0, __ATOMIC_RELEASE );
+    ios_srv_loop_leave();
+    ios_srv_qos_set = 0;
+    ios_srv_qos_follow_seen = ios_srv_qos_gen_seen = 0;
 }
 
 /* __WINESRC__ must be defined via -D flag so unicode_fix.h can see it */
@@ -652,6 +839,20 @@ struct timeout_user *add_timeout_user( timeout_t when, timeout_callback func, vo
         }
     }
     list_add_before( ptr, &user->entry );
+#ifdef WINE_IOS
+    /* madeira-bcd: a direct request (MADEIRA_SRV_DIRECT) runs while the loop sleeps until
+     * ios_srv_loop_wake_at; a timer due before that has the request wake the loop */
+    if (__atomic_load_n( &ios_srv_direct_live, __ATOMIC_RELAXED ))
+    {
+        timeout_t due;
+        if (user->when > 0)
+            due = (user->when - current_time > LLONG_MAX - monotonic_time)
+                  ? LLONG_MAX : monotonic_time + (user->when - current_time);
+        else
+            due = -user->when;
+        if (due < (timeout_t)ios_srv_loop_wake_at) ios_srv_timer_added = 1;
+    }
+#endif
     return user;
 }
 
@@ -1086,7 +1287,11 @@ static int add_poll_user( struct fd *fd )
     pollfd[ret].revents = 0;
     poll_users[ret] = fd;
     active_users++;
-    ws_log("[wineserver-fd] add_poll_user: user=%d unix_fd=%d active_users=%d", ret, fd->unix_fd, active_users);
+    {
+        static unsigned long logged;   /* madeira-bcd: ios_srv_log_sample */
+        if (ios_srv_log_sample( &logged ))
+            ws_log("[wineserver-fd] add_poll_user: user=%d unix_fd=%d active_users=%d", ret, fd->unix_fd, active_users);
+    }
     return ret;
 }
 
@@ -1182,6 +1387,46 @@ static int get_next_timeout( struct timespec *ts )
     if (ret > INT_MAX) ret = INT_MAX;
     return ret;
 }
+
+#ifdef WINE_IOS
+/* madeira-bcd doorbell: deliver POLLIN to one client fd if it is still a live
+ * poll user that wants it (called through ios_doorbell_poll_thread). */
+void ios_fd_poll_in( struct fd *fd )
+{
+    int user = fd->poll_index;
+    if (user <= 0 || user >= nb_users || poll_users[user] != fd) return;
+    if (pollfd[user].fd < 0 || !(pollfd[user].events & POLLIN)) return;
+    fd_poll_event( fd, POLLIN );
+}
+
+/* the rung threads: take every word, read each thread's request fd; a request
+ * left partly unread is rung again for the next pass */
+static unsigned long long ios_bell_threads, ios_bell_again;
+static void ios_doorbell_service(void)
+{
+    extern int ios_doorbell_poll_thread( unsigned int tid );
+    unsigned int w;
+
+    for (w = 0; w < IOS_SRV_BELL_WORDS; w++)
+    {
+        unsigned long long bits;
+        if (!ios_srv_bell[w]) continue;
+        bits = __atomic_exchange_n( &ios_srv_bell[w], 0ull, __ATOMIC_SEQ_CST );
+        while (bits)
+        {
+            unsigned int b = __builtin_ctzll( bits );
+            unsigned int tid = ((w << 6) | b) << 2;
+            bits &= bits - 1;
+            ios_bell_threads++;
+            if (ios_doorbell_poll_thread( tid ))
+            {
+                ios_bell_again++;
+                __atomic_fetch_or( &ios_srv_bell[w], 1ull << b, __ATOMIC_SEQ_CST );
+            }
+        }
+    }
+}
+#endif
 
 /* server main poll() loop */
 /* iOS-Madeira 2026-07-05 (Steam S0): the sandbox poll() limitation is
@@ -1284,7 +1529,15 @@ void main_loop(void)
         static unsigned ios_syn_per_user[64];        /* rolling, low 6 bits of user */
         static int ios_post_inject = 0;  /* trace first N iters after injection */
         static int ios_client_fd_start = -1;  /* first poll index added by injection */
+        static int ios_doorbell = 0;                     /* madeira-bcd: see ios_srv_bell */
+        static unsigned long long ios_fullscan_ns = 10000000ull;
+        unsigned long long ios_last_full = 0, ios_full_n = 0, ios_pass_n = 0;
+        unsigned long long ios_db_report = 0;
+        unsigned long long ios_last_slow = 0, ios_slow_n = 0;
+        static unsigned long long ios_slow_ns = 1000000ull;  /* madeira-bcd: see MADEIRA_SRV_POLL_US */
+        int ios_slow_pass = 1;
         unsigned long long ios_next_timer_ns = ~0ull;  /* ns until next timer (deadline-aware sleep) */
+        int ios_full_scan = 1;                           /* madeira-bcd: read every client fd this pass */
 
         /* iOS socketpair bypass: check for injected client fd from app bridge */
         extern volatile int g_injected_client_fd;
@@ -1295,11 +1548,35 @@ void main_loop(void)
 
         ws_log("[wineserver-fd] iOS poll loop: master_fd=%d nb_users=%d active=%d", pollfd[0].fd, nb_users, active_users);
         {
-            kern_return_t skr = semaphore_create( mach_task_self(), &ios_srv_wake_sem,
-                                                  SYNC_POLICY_FIFO, 0 );
+            kern_return_t skr;
+            char wcb[16]; const char *wc = ios_srv_switch( "MADEIRA_SRV_WAKE_COALESCE", wcb, sizeof(wcb) );  /* 0: one wake signal per request, as before */
+            ios_srv_wake_coalesce = !(wc && wc[0] == '0' && !wc[1]);
+            ws_log("[wineserver-fd] coalesced request wake: %s (MADEIRA_SRV_WAKE_COALESCE=0 disables)",
+                   ios_srv_wake_coalesce ? "on" : "off");
+            {
+                char dbb[16], fsb[16]; const char *db = ios_srv_switch( "MADEIRA_SRV_DOORBELL", dbb, sizeof(dbb) );  /* 0: read every client fd on every pass, as before */
+                const char *fs = ios_srv_switch( "MADEIRA_SRV_FULLSCAN_MS", fsb, sizeof(fsb) );  /* ms between reads of every client fd with the doorbell on (default 10) */
+                long ms = fs && *fs ? strtol( fs, NULL, 10 ) : 10;
+                if (ms < 1) ms = 1;
+                if (ms > 1000) ms = 1000;
+                ios_doorbell = !(db && db[0] == '0' && !db[1]);
+                ios_fullscan_ns = (unsigned long long)ms * 1000000ull;
+                {
+                    char pub[16]; const char *pu = ios_srv_switch( "MADEIRA_SRV_POLL_US", pub, sizeof(pub) );  /* us between socket polls and fd scans with the doorbell on (default 1000, 0 every pass) */
+                    long us = pu && *pu ? strtol( pu, NULL, 10 ) : 1000;
+                    if (us < 0) us = 0;
+                    if (us > 100000) us = 100000;
+                    ios_slow_ns = (unsigned long long)us * 1000ull;
+                }
+                ws_log("[wineserver-fd] request doorbell: %s, read of every client fd every %ld ms "
+                       "(MADEIRA_SRV_DOORBELL=0 disables, MADEIRA_SRV_FULLSCAN_MS)",
+                       ios_doorbell ? "on" : "off", ms);
+            }
+            skr = semaphore_create( mach_task_self(), &ios_srv_wake_sem, SYNC_POLICY_FIFO, 0 );
             ws_log("[wineserver-fd] request-wake semaphore: kr=%d sem=0x%x", skr, ios_srv_wake_sem);
             if (skr != KERN_SUCCESS) ios_srv_wake_sem = 0;
         }
+        ios_srv_loop_enter();   /* madeira-bcd: MADEIRA_SRV_DIRECT; the lock is let go only to sleep */
         while (active_users)
         {
             /* Check stop flag */
@@ -1316,6 +1593,7 @@ void main_loop(void)
                 ios_next_timer_ns = (timeout >= 0)
                     ? (unsigned long long)next_ts.tv_sec * 1000000000ull + next_ts.tv_nsec
                     : ~0ull;
+                ios_srv_timer_added = 0;   /* madeira-bcd: every timer so far is in this deadline */
             }
             if (!active_users) { ws_log("[wineserver-fd] LOOP EXIT: active_users=0 at iter=%d", ios_iter); break; }
 
@@ -1393,7 +1671,7 @@ void main_loop(void)
              * Thumper's 8 zero-timeout polls/frame each paid the old
              * pickup latency: the 55-vs-60 FPS gap. */
             {
-                unsigned long long sleep_ns = 1000000ull;
+                unsigned long long sleep_ns = ios_srv_idle_ns();   /* madeira-bcd: 1 ms unless MADEIRA_SRV_IDLE_US */
                 /* ml585: timer lateness = how long past a due timer's deadline
                  * we actually resumed. This is the number that matters for the
                  * 77s Steam stalls — a starved loop shows up here even when the
@@ -1403,6 +1681,12 @@ void main_loop(void)
                 if (!lt_tb.denom) mach_timebase_info( &lt_tb );
                 lt_t0 = mach_absolute_time();
                 if (ios_next_timer_ns < sleep_ns) sleep_ns = ios_next_timer_ns;
+                /* madeira-bcd: direct requests run while the loop sleeps (MADEIRA_SRV_DIRECT) */
+                if (ios_srv_loop_locked)
+                {
+                    ios_srv_loop_wake_at = monotonic_counter() + sleep_ns / 100;
+                    ios_srv_loop_leave();
+                }
                 if (sleep_ns > 0)
                 {
                     /* ml585 A/B, default OFF. MADEIRA_SRV_NOSEM=1 ignores the
@@ -1440,6 +1724,8 @@ void main_loop(void)
                         wkr = semaphore_timedwait( ios_srv_wake_sem, wts );
                         if (wkr == KERN_OPERATION_TIMED_OUT) ios_c_semto++;
                         else ios_c_semret++;
+                        /* coalesced wake: cleared before the scan below */
+                        if (ios_srv_wake_coalesce) __atomic_store_n( &ios_srv_wake_pending, 0, __ATOMIC_SEQ_CST );
                     }
                     else if (ios_srv_wake_sem && nosem)
                     {
@@ -1464,6 +1750,8 @@ void main_loop(void)
                         mach_wait_until( deadline );
                     }
                 }
+                ios_srv_loop_enter();    /* madeira-bcd: MADEIRA_SRV_DIRECT */
+                ios_srv_qos_follow();    /* madeira-bcd: MADEIRA_SRV_ECO_FOLLOW */
                 lt_slept_ns = (mach_absolute_time() - lt_t0) * lt_tb.numer / lt_tb.denom;
                 if (ios_next_timer_ns != ~0ull && lt_slept_ns > ios_next_timer_ns)
                 {
@@ -1472,6 +1760,53 @@ void main_loop(void)
                 }
             }
             set_current_time();
+
+            /* madeira-bcd doorbell: the rung threads first; the read() of every
+             * client fd only when it is due or a ring had no thread id */
+            {
+                unsigned long long now_ns = clock_gettime_nsec_np( CLOCK_UPTIME_RAW );
+                ios_pass_n++;
+                if (ios_doorbell)
+                {
+                    ios_doorbell_service();
+                    ios_full_scan = __atomic_exchange_n( &ios_srv_bell_full, 0, __ATOMIC_SEQ_CST )
+                                    || now_ns - ios_last_full >= ios_fullscan_ns;
+                }
+                else ios_full_scan = 1;
+                if (ios_full_scan) { ios_last_full = now_ns; ios_full_n++; }
+                /* madeira-bcd: with requests found through their bells, a pass
+                 * woken for a request needs nothing else; the socket poll and the
+                 * scan of every fd below (INET sockets, init fds, POLLOUT) run when
+                 * a full scan is due or MADEIRA_SRV_POLL_US (1000) has passed --
+                 * the 1 ms tick the loop had before the wake semaphore. Build 442
+                 * ran ~25,000 such passes a second and spent ~210 ms of every
+                 * ~300 ms in them. */
+                ios_slow_pass = !ios_doorbell || ios_full_scan || now_ns - ios_last_slow >= ios_slow_ns;
+                if (ios_slow_pass) { ios_last_slow = now_ns; ios_slow_n++; }
+                if (!ios_db_report) ios_db_report = now_ns;
+                else if (now_ns - ios_db_report >= 10000000000ull)
+                {
+                    double s = (now_ns - ios_db_report) / 1e9;
+                    /* stderr: ws_log stops reaching the session log once the app
+                     * sets ws_log_quiet (ContentView), which hid this line in 442 */
+                    fprintf( stderr, "[srv-doorbell] %.0f passes/s, %.0f socket+fd scans/s, %.0f full scans/s, "
+                             "%.0f rung threads/s (%.0f rung again), %d poll users\n",
+                             ios_pass_n / s, ios_slow_n / s, ios_full_n / s, ios_bell_threads / s,
+                             ios_bell_again / s, nb_users );
+                    ios_pass_n = ios_full_n = ios_slow_n = ios_bell_threads = ios_bell_again = 0;
+                    ios_db_report = now_ns;
+                    {   /* madeira-bcd: MADEIRA_SRV_DIRECT, only when it ran */
+                        extern unsigned long long ios_srv_direct_n, ios_srv_direct_fallback, ios_srv_direct_timer_wakes;
+                        unsigned long long dn = __atomic_exchange_n( &ios_srv_direct_n, 0, __ATOMIC_RELAXED );
+                        unsigned long long df = __atomic_exchange_n( &ios_srv_direct_fallback, 0, __ATOMIC_RELAXED );
+                        unsigned long long dw = __atomic_exchange_n( &ios_srv_direct_timer_wakes, 0, __ATOMIC_RELAXED );
+                        if (dn || df)
+                            fprintf( stderr, "[srv-direct] %.0f requests/s ran on their own threads, %.0f/s went "
+                                     "through the pipe instead, %.0f timer wakes/s\n", dn / s, df / s, dw / s );
+                    }
+                }
+            }
+            if (!ios_slow_pass) continue;
 
             /* Real sockets first: zero-timeout poll() gives true INET
              * event semantics (connect completion, errors, data). See
@@ -1563,9 +1898,14 @@ void main_loop(void)
                         if (ios_client_fd_start >= 0 && i >= ios_client_fd_start)
                         {
                             /* Client fd (socketpair/pipe from injection) —
-                             * always try, ioctl broken for AF_UNIX on iOS */
-                            revents |= POLLIN;
-                            ios_c_synin++;
+                             * always try, ioctl broken for AF_UNIX on iOS.
+                             * madeira-bcd: only on a full-scan pass; rung
+                             * request fds were read above */
+                            if (ios_full_scan)
+                            {
+                                revents |= POLLIN;
+                                ios_c_synin++;
+                            }
                         }
                         else
                         {
@@ -1603,6 +1943,7 @@ void main_loop(void)
                 ws_log("[wineserver-fd] POST iter=%d act=%d nb=%d ef=%d", ios_iter, active_users, nb_users, ios_events_fired);
             }
         }
+        ios_srv_loop_exit();   /* madeira-bcd: no direct request after the loop */
     }
     ws_log("[wineserver-fd] main_loop EXITED! active_users=%d", active_users);
 #else
@@ -2560,6 +2901,31 @@ void set_fd_user( struct fd *fd, const struct fd_ops *user_ops, struct object *u
     fd->user   = user;
 }
 
+/* madeira-bcd: MADEIRA_SRV_FGETPATH=1 names a file the server has just opened
+ * from its descriptor (fcntl F_GETPATH) instead of realpath() on its path.
+ * realpath walks the path one component at a time (getattrlist and lstat for
+ * each, every call checked by the sandbox): about 0.5 ms a file on the device,
+ * and Horizon Zero Dawn's menu opens ~1000 shader-cache files a second, which
+ * kept this thread busy on a performance core (493, 2026-10-11). F_GETPATH is
+ * one call and gives the resolved path realpath gives (open() here follows
+ * symlinks; /var comes back as /private/var); realpath stays the fallback.
+ * The server is running before a game's env lines are set, so
+ * WineProcessBridge.m passes the switch for each launch in this global. */
+extern volatile int g_madeira_srv_fgetpath;
+
+static char *srv_open_fd_name( int unix_fd, const char *path )
+{
+#ifdef F_GETPATH
+    if (g_madeira_srv_fgetpath == 1 && unix_fd != -1)
+    {
+        char buf[PATH_MAX > 1024 ? PATH_MAX : 1024];   /* F_GETPATH wants MAXPATHLEN (1024) */
+
+        if (fcntl( unix_fd, F_GETPATH, buf ) != -1 && buf[0] == '/') return strdup( buf );
+    }
+#endif
+    return realpath( path, NULL );
+}
+
 char *dup_fd_name( struct fd *root, const char *name )
 {
     char *ret;
@@ -2784,7 +3150,7 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
 
         if ((path = dup_fd_name( root, name )))
         {
-            fd->unix_name = realpath( path, NULL );
+            fd->unix_name = srv_open_fd_name( fd->unix_fd, path );
             free( path );
         }
 
@@ -3924,6 +4290,20 @@ DECL_HANDLER(get_handle_fd)
             reply->type = fd->fd_ops->get_fd_type( fd );
             reply->options = fd->options;
             reply->access = get_handle_access( current->process, req->handle );
+#ifdef WINE_IOS
+            /* madeira-bcd: the client is a thread of this process, so a client that leaves
+             * room for an int (server_ios.c server_get_unix_fd) gets its own descriptor for
+             * the same open file in the reply: what SCM_RIGHTS would give it (close-on-exec
+             * included), without the sendmsg here and the recvmsg and fcntl there. -1 in the
+             * reply is the descriptor table being full, which the client reports as the
+             * socket path does. */
+            if (get_reply_max_size() == sizeof(int))
+            {
+                int client_fd = fcntl( unix_fd, F_DUPFD_CLOEXEC, 0 );
+                if (!set_reply_data( &client_fd, sizeof(client_fd) ) && client_fd != -1) close( client_fd );
+            }
+            else
+#endif
             send_client_fd( current->process, unix_fd, req->handle );
         }
         release_object( fd );

@@ -235,13 +235,17 @@ final class DepotDownloader {
             for ownerID in Set(owners.values).sorted() {
                 let depots = shared.filter { owners[UInt32($0.depotID)] == ownerID }
                 guard !depots.isEmpty else { continue }
-                // Only when the owner installs to this same folder, where the files are.
-                guard let owner = app.sharedOwners[ownerID],
-                      SteamInstallFiles.safeFolderName(owner.installDir).caseInsensitiveCompare(folderName) == .orderedSame else {
+                // The owner keeps its own installdir, as in the record Valve's
+                // client writes for it ("Shared Only"); the files stay in this
+                // app's folder. Skipping owners with another folder left GTA V
+                // Enhanced's owner 1899670 (installdir RGLSC) without the depot,
+                // and every launch failed with "required app 1899670 not ready".
+                guard let owner = app.sharedOwners[ownerID] else {
                     skipped += 1; continue
                 }
+                let ownerFolder = SteamInstallFiles.safeFolderName(owner.installDir)
                 try AppManifestWriter.mergeOwnerManifest(ownerAppID: ownerID, ownerName: owner.name, ownerBuildID: owner.buildID,
-                                                         installDir: folderName,
+                                                         installDir: ownerFolder.isEmpty ? folderName : ownerFolder,
                                                          steamID: accountID, steamAppsPath: steamApps.path,
                                                          depots: depots)
                 written += 1

@@ -74,6 +74,9 @@ enum MadeiraConfig {
 
     /// `key` from the running game's own lines, or nil (also when empty). The
     /// native reader lets it win on its own; Swift readers that merge (dxmt) ask.
+    /// madeira-bcd: whichever file MADEIRA_CFG_GAME names -- a game's own
+    /// GameProfiles.swift file, or the merged madeira-game.cfg (applyGame) --
+    /// with the same parser GameProfile uses.
     static func gameValue(_ key: String) -> String? {
         guard let p = getenv("MADEIRA_CFG_GAME"), case let path = String(cString: p), !path.isEmpty,
               let text = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
@@ -85,11 +88,40 @@ enum MadeiraConfig {
     /// and the file removed, so a previous game's lines never apply. Returns the
     /// pairs it applied; throws (with the variable unset) when the file cannot
     /// be written.
+    ///
+    /// madeira-bcd: a game's own GameProfiles.swift file (Application
+    /// Support/GameConfigs/<hash>.cfg) is exported as MADEIRA_CFG_GAME by
+    /// BCDLaunch.applyExtras on the main thread before this runs on the launch
+    /// worker. That file stays the game's file: with no lines of the entry's own
+    /// it is left exported exactly as it was (the owner's per-game profiles run
+    /// unchanged); with some, both are written to madeira-game.cfg, the entry's
+    /// lines first and the game's file after them, so a key the game's file sets
+    /// wins. A launch without a game file (applyExtras unset the variable) is
+    /// upstream's behaviour unchanged.
     @discardableResult
     static func applyGame(_ text: String?) throws -> [String: String] {
+        let profileURL = bcdProfileURL()
         unsetenv("MADEIRA_CFG_GAME")
         let pairs = parse(text ?? "")
         guard let u = gameURL else { return [:] }
+        if let profileURL {
+            let profileText = (try? String(contentsOf: profileURL, encoding: .utf8)) ?? ""
+            let profilePairs = parse(profileText)
+            if pairs.isEmpty || text == nil {
+                try? FileManager.default.removeItem(at: u)
+                if !profilePairs.isEmpty { setenv("MADEIRA_CFG_GAME", profileURL.path, 1) }
+                return profilePairs
+            }
+            if let text {
+                let merged = (text.hasSuffix("\n") ? text : text + "\n")
+                    + "# madeira-bcd: the game's own file (\(profileURL.lastPathComponent)), after the lines above so it wins\n"
+                    + profileText
+                try FileManager.default.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try (merged.hasSuffix("\n") ? merged : merged + "\n").write(to: u, atomically: true, encoding: .utf8)
+                setenv("MADEIRA_CFG_GAME", u.path, 1)
+                return pairs.merging(profilePairs) { $1 }
+            }
+        }
         guard !pairs.isEmpty, let text else {
             try? FileManager.default.removeItem(at: u)
             return [:]
@@ -98,6 +130,22 @@ enum MadeiraConfig {
         try (text.hasSuffix("\n") ? text : text + "\n").write(to: u, atomically: true, encoding: .utf8)
         setenv("MADEIRA_CFG_GAME", u.path, 1)
         return pairs
+    }
+
+    /// madeira-bcd: the GameProfiles.swift file MADEIRA_CFG_GAME names right now
+    /// (a file directly inside Application Support/GameConfigs), else nil --
+    /// also for upstream's own madeira-game.cfg.
+    private static func bcdProfileURL() -> URL? {
+        // GameProfile.directory's folder, named here so this file compiles on its own
+        // (the onboarding, runtime-settings and early-config host checks build it alone).
+        guard let p = getenv("MADEIRA_CFG_GAME"), case let path = String(cString: p), !path.isEmpty,
+              let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        else { return nil }
+        let dir = base.appendingPathComponent("GameConfigs", isDirectory: true)
+        let url = URL(fileURLWithPath: path)
+        guard url.deletingLastPathComponent().standardizedFileURL.path == dir.standardizedFileURL.path,
+              FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return url
     }
 
     static func bool(_ key: String, default dflt: Bool = false) -> Bool {

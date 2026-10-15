@@ -88,10 +88,19 @@ final class MetalHostView: UIView {
 /// sent while the landscape overlay shows at least one controller mapping,
 /// unless touch is set to work as a trackpad. A hardware mouse or trackpad is
 /// not affected.
+///
+/// madeira-bcd: the game's own file (Game details › This game's config) is
+/// read first, as for the pad mode, so a per-game line applies. And by
+/// default a desktop (Dock) session keeps touches as the mouse: there the
+/// pointer is how windows are used. Build 433, Grand Theft Auto V through the
+/// Rockstar Games Launcher: with the Xbox layout shown every tap on the game
+/// was dropped, so its window never got the click that would also have
+/// brought it to the front (log 2026-10-07 19:27).
 @MainActor enum TouchMouseGate {
     enum Mode: String { case auto, on, off }
     static let mode: Mode = {
-        let v = MadeiraConfig.get("env.MADEIRA_TOUCH_MOUSE")  // 1: touches always reach the program as a mouse, 0: never; default: not while touch controller mappings are shown
+        let v = MadeiraConfig.gameValue("env.MADEIRA_TOUCH_MOUSE")
+            ?? MadeiraConfig.get("env.MADEIRA_TOUCH_MOUSE")  // 1: touches always reach the program as a mouse, 0: never; default: not while touch controller mappings are shown
             ?? ProcessInfo.processInfo.environment["MADEIRA_TOUCH_MOUSE"]
         let m: Mode = v == "1" ? .on : (v == "0" ? .off : .auto)
         LogStore.shared.log("[touch-mouse] mode=\(m.rawValue)")
@@ -100,11 +109,11 @@ final class MetalHostView: UIView {
     /// Set by TouchControlsOverlay.configureGamepad: the landscape overlay is
     /// visible, not editing, and has at least one controller mapping.
     static var padOverlay = false
-    static func suppressing(touchpad: Bool) -> Bool {
+    static func suppressing(touchpad: Bool, desktop: Bool) -> Bool {
         switch mode {
         case .on: return false
         case .off: return true
-        case .auto: return padOverlay && !touchpad
+        case .auto: return padOverlay && !touchpad && !desktop
         }
     }
 }
@@ -574,7 +583,7 @@ final class MetalBackedView: UIView {
     private func tmgFilter(_ touches: Set<UITouch>, _ phase: UITouch.Phase) -> Set<UITouch>? {
         if phase == .began {
             _ = TouchMouseGate.mode   // logs the mode once
-            guard TouchMouseGate.suppressing(touchpad: touchPointerMode) else { return touches }
+            guard TouchMouseGate.suppressing(touchpad: touchPointerMode, desktop: desktopMode) else { return touches }
             let direct = touches.filter { $0.type == .direct }
             guard !direct.isEmpty else { return touches }
             for t in direct { tmgSwallowed.insert(ObjectIdentifier(t)) }
@@ -1376,6 +1385,9 @@ struct ContentView: View {
                 DeviceLoadDiagnostics.start()
                 // Madeira Dock: an unconsumed sign-in transfer from an earlier run goes.
                 if wine_process_is_running() == 0 { MadeiraDock.cleanup() }
+                // madeira-bcd: the Dock's Reset sets the VC++ markers back to a new prefix's
+                // values, read from the bundled prefix template (DockReset.swift).
+                DockReset.baselineProvider = { DockReset.templateRegistry { madeira_extract_prefix_tgz($0, $1) } }
             }
             .onReceive(NotificationCenter.default.publisher(for: SteamSignIn.didChange)) { _ in
                 if !SteamSignIn.isSignedIn { MadeiraDock.cleanup() }
@@ -2534,6 +2546,11 @@ struct ContentView: View {
     /// applies the entry's launch profile and runs the same full sequence as the
     /// developer interface's buttons.
     private func launchLibraryEntry(_ entry: LibraryEntry) {
+        // madeira-bcd: a game seen for the first time starts with Madeira's recommended
+        // settings (GameRecommendationsApply.swift).
+        var entry = entry
+        let isNew = !library.entries.contains { $0.id == entry.id }
+        if GameRecommendations.prepare(&entry, new: isNew) { library.save(entry) }
         // A Steam game starts through Madeira Dock with its own launch profile (SteamGames.swift),
         // unless its Game details page chose "The game": then its own program starts below, like
         // any library game (SteamDirectStart).
@@ -2542,6 +2559,9 @@ struct ContentView: View {
                 library.error = "Steam no longer lists this game as installed. Refresh the library and try again."; return
             }
             LogStore.shared.log("[steam-games] play app=\(appID)")
+            // madeira-bcd: the game's own options (AVX, NVIDIA, Wine's C++ runtime, its
+            // config file) -- this path never reached BCDLaunch, so a Steam game ran without them.
+            BCDLaunch.applyLibrary(entry)
             startDock(game, compactPool: MadeiraDockModel.shared.compactPool, profile: entry)
             return
         }
@@ -2584,6 +2604,9 @@ struct ContentView: View {
             library.error = "The executable path or launch arguments are too long."; return
         }
         entry.configureLaunch()
+        // madeira-bcd: the game's own options (LibraryBCD.swift).
+        BCDLaunch.applyLibrary(entry)
+        exportBCDDesktopProfile(entry)
         // This run's log under the program's name too (Documents/logs). A Steam game started
         // through Madeira Dock above gets its own from ntdll, once Valve's client starts it.
         let program = entry.desktop == true ? "explorer.exe"
@@ -2591,6 +2614,36 @@ struct ContentView: View {
         LogStore.shared.startSessionLog(program: program)
         library.begin(entry)
         runWineFullSequence(profile: entry)
+    }
+
+    /// madeira-bcd: LibraryPrefs' AVX, NVIDIA and Wine C++ runtime switches for a
+    /// library launch, set again after LibraryEntry.applyEnvironment (which unsets
+    /// what its own fields do not choose). For the Desktop entry too: Game details
+    /// writes them for every entry, and BCDLaunch.applyLibrary clears them there.
+    static func reassertBCDSwitches(_ entry: LibraryEntry) {
+        let path = entry.windowsPath
+        var on: [String] = []
+        if LibraryPrefs.avx(path) { setenv("MADEIRA_FEX_AVX", "1", 1); on.append("avx") }
+        if LibraryPrefs.wineVCRT(path) { setenv("MADEIRA_WINE_VCRT", "1", 1); on.append("wine-vcrt") }
+        if LibraryPrefs.nvidia(path) {
+            setenv("DXMT_ENABLE_NVEXT", "1", 1)
+            setenv("DXMT_WSI_MONITOR_IDENTITY", "1", 1)
+            setenv("DXMT_WSI_MODE_TABLE", "1", 1)
+            if entry.desktop == true, getenv("MADEIRA_DXMT_EXTRA") == nil { setenv("MADEIRA_DXMT_EXTRA", "dxgi.customDeviceId=2544", 1) }
+            on.append("nvidia")
+        }
+        if !on.isEmpty { LogStore.shared.log("[bcd] game switches: \(on.joined(separator: " "))") }
+    }
+
+    /// madeira-bcd: the Desktop entry's own file (Game details writes every entry's
+    /// options to GameProfiles.swift files); BCDLaunch.applyLibrary leaves the
+    /// Desktop without one, so it is exported here, before the session starts.
+    private func exportBCDDesktopProfile(_ entry: LibraryEntry) {
+        guard entry.desktop == true else { return }
+        let file = GameProfile(windowsPath: entry.windowsPath)
+        guard file.hasSettings, let url = file.url else { return }
+        setenv("MADEIRA_CFG_GAME", url.path, 1)
+        logStore.log("[bcd] Desktop: its own settings file \(url.lastPathComponent)")
     }
 
     /// Full sequence: allocate JIT pool, start wineserver, start Wine.
@@ -2645,7 +2698,19 @@ struct ContentView: View {
             // precision, frame limit).
             if let profile {
                 profile.applyEnvironment()
+                // madeira-bcd: applyEnvironment sets or unsets AVX and "Report an NVIDIA
+                // GPU" from the entry's own fields; BCDLaunch.applyExtras exported the
+                // game's LibraryPrefs switches before, on the main thread (Game details
+                // writes those). Either one turns a switch on.
+                Self.reassertBCDSwitches(profile)
                 logStore.log("[launch-route] library profile applied")
+                // madeira-bcd: a Dock session of one-time installs runs without the game's
+                // address-space holds, which leave its 32-bit setups no room.
+                let dropped = DockInstallers.applyInstallSessionConfig()
+                if !dropped.isEmpty {
+                    logStore.log("[dock-installers] this session of one-time installs leaves out the game's " +
+                                 dropped.sorted().joined(separator: ", ") + " (MADEIRA_DOCK_INSTALL_LAYOUT=0 keeps them)")
+                }
             } else {
                 _ = try? MadeiraConfig.applyGame(nil)   // no library game: no game's own lines
             }
@@ -2855,6 +2920,19 @@ struct ContentView: View {
             // every session unless madeira.cfg sets env.DXMT_CENSUS_THROTTLE itself.
             if MadeiraConfig.get("env.DXMT_CENSUS_THROTTLE") == nil && getenv("DXMT_CENSUS_THROTTLE") == nil {
                 setenv("DXMT_CENSUS_THROTTLE", "1", 0)
+            }
+            // madeira-bcd: the game's options from BCDLaunch.applyExtras (LibraryPrefs'
+            // NVIDIA device id), last, as before the merge. An option whose key is already
+            // set above is replaced, not repeated: DXMT reads at most 259 characters.
+            if let c = getenv("MADEIRA_DXMT_EXTRA") {
+                let extra = String(cString: c).split(whereSeparator: { $0 == ";" || $0.isNewline })
+                    .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty && !$0.hasPrefix("#") }
+                for option in extra {
+                    let key = option.split(separator: "=", maxSplits: 1).first.map(String.init) ?? option
+                    dxmtOptions.removeAll { ($0.split(separator: "=", maxSplits: 1).first.map(String.init) ?? $0) == key }
+                    dxmtOptions.append(option)
+                }
+                if !extra.isEmpty { logStore.log("DXMT config: \(extra.joined(separator: ";")) via the game's settings") }
             }
             // Unset otherwise, so a previous session's options in this app process do not apply.
             if !dxmtOptions.isEmpty { setenv("DXMT_CONFIG", dxmtOptions.joined(separator: ";"), 1) } else { unsetenv("DXMT_CONFIG") }
@@ -3122,6 +3200,30 @@ struct ContentView: View {
                 setenv("WINE_IOS_JIT_RX", String(format: "%lx", Int(bitPattern: pool.rx)), 1)
                 setenv("WINE_IOS_JIT_RW", String(format: "%lx", Int(bitPattern: pool.rw)), 1)
                 setenv("WINE_IOS_JIT_SIZE", String(format: "%lx", pool.size), 1)
+                // madeira-bcd split pool (pool-split = 1): the pool offsets between its two
+                // debugger regions, which ntdll never hands out (StikJITHelper.poolHole).
+                if let hole = StikJITHelper.poolHole {
+                    setenv("WINE_IOS_JIT_HOLE", String(format: "%lx:%lx", hole.off, hole.end), 1)
+                } else {
+                    unsetenv("WINE_IOS_JIT_HOLE")
+                }
+                // madeira-bcd pool-mid (pool-mid = 1): the second hole, when a free run
+                // between the split regions became a third region (StikJITHelper.poolHole2).
+                if let hole2 = StikJITHelper.poolHole2 {
+                    setenv("WINE_IOS_JIT_HOLE2", String(format: "%lx:%lx", hole2.off, hole2.end), 1)
+                } else {
+                    unsetenv("WINE_IOS_JIT_HOLE2")
+                }
+                // madeira-bcd pool-low (pool-low = 1): region C below the executable window,
+                // RW alias at the pool's distance; ntdll carves FEX's code buffers from it
+                // first (StikJITHelper.poolLow).
+                if let low = StikJITHelper.poolLow {
+                    setenv("WINE_IOS_JIT_TAIL_REGION", String(format: "%lx:%lx", low.rx, low.size), 1)
+                    logStore.log(String(format: "[pool-low] WINE_IOS_JIT_TAIL_REGION=%lx:%lx (%ldMB for FEX code buffers)",
+                                        low.rx, low.size, low.size >> 20), level: .success)
+                } else {
+                    unsetenv("WINE_IOS_JIT_TAIL_REGION")
+                }
             } else {
                 // ml596: ABORT. "Continuing without it" produced ml595 — a run that
                 // looked like an ARM64EC/optimizer regression but was only Wine
@@ -3360,7 +3462,19 @@ struct ContentView: View {
             MadeiraDock.assertDiscoveryKeys()
             // The game's one-time installs (its Steam install script) run first, in the same
             // session. No session runs yet, so the registry files can be read and written.
-            DockInstallers.prepare(game, drive: MadeiraDock.drive, prefix: MadeiraDock.prefix)
+            // madeira-bcd: they run in a session of their own (DockInstallers.installsOnly), and
+            // a Reset takes out what they installed; the other games share those installs.
+            DockInstallers.prepare(game, drive: MadeiraDock.drive, prefix: MadeiraDock.prefix,
+                                   others: MadeiraDock.games(drive: MadeiraDock.drive))
+            if DockInstallers.installsOnly {
+                // No host runs in this session: nothing will take the sign-in transfer.
+                MadeiraDock.cleanup()
+                logStore.log("[madeira-dock] app \(game.id): this session runs only the one-time installs; the host starts after a restart")
+                // The launch leaves out the game's address-space holds (DockInstallers.applyInstallSessionConfig).
+                setenv("MADEIRA_DOCK_INSTALLS_SESSION", "1", 1)
+            } else {
+                unsetenv("MADEIRA_DOCK_INSTALLS_SESSION")
+            }
             // Only a start that runs installers turns madsync off, for its own session
             // (build/madsync/madsync.c reads MADEIRA_MADSYNC_SESSION once, when the server starts).
             if DockInstallers.serverSync {
@@ -3393,7 +3507,8 @@ struct ContentView: View {
                 width = size[0]; height = size[1]
             }
             setenv("MADEIRA_EXE", "explorer.exe", 1)
-            setenv("MADEIRA_ARGS", MadeiraDock.launchArguments(width: width, height: height, installers: DockInstallers.script), 1)
+            setenv("MADEIRA_ARGS", MadeiraDock.launchArguments(width: width, height: height, installers: DockInstallers.script,
+                                                               host: !DockInstallers.installsOnly), 1)
             setenv("MADEIRA_DESKTOP", "1", 1)
             setenv("MADEIRA_SCREEN_W", String(width), 1)
             setenv("MADEIRA_SCREEN_H", String(height), 1)
@@ -3402,7 +3517,9 @@ struct ContentView: View {
             // start this session from its own desktop size, not a previous one.
             winios_display_mode_changed(Int32(width), Int32(height))
             MadeiraDock.requestLaunch(compactPool: compactPool)
-            logStore.log("[madeira-dock] starting the host for app \(game.id); Valve's client authenticates and authorizes the launch")
+            if !DockInstallers.installsOnly {
+                logStore.log("[madeira-dock] starting the host for app \(game.id); Valve's client authenticates and authorizes the launch")
+            }
             MadeiraDockModel.shared.watchReport()
             if inLibrary {
                 if let profile { library.begin(profile, dock: game) }

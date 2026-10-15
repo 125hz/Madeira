@@ -1247,6 +1247,29 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
 }
 
 
+/* madeira-bcd eco-native: env.MADEIRA_ECO_NATIVE = 1 (opt-in). The runtime's own
+ * native helper threads -- the JIT-pool warmer (virtual_ios.c: page warming and
+ * the periodic address-space walks, which ran on performance cores at ~2.8 GHz
+ * in hzd486) and the stale-pointer healer (signal_arm64_ios.c) -- do no work a
+ * frame waits for, yet they are created at the QoS of the thread that started
+ * them. With the switch each moves itself to utility QoS when it starts, so it
+ * runs on the efficiency cores at their lower clock, ECO on or off. Not moved:
+ * the wineserver thread, the Mach exception thread (it services the faults
+ * guest threads wait on), the samplers (already utility), audio, the UI. */
+void ios_eco_native_self( const char *who )
+{
+    static int on = -1;
+    int r;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_ECO_NATIVE" );   /* 1: the runtime's native helper threads run at utility QoS */
+        on = e && *e && strcmp( e, "0" ) != 0;
+    }
+    if (!on) return;
+    r = pthread_set_qos_class_self_np( QOS_CLASS_UTILITY, 0 );
+    dprintf( 2, "[eco-native] madeira-bcd %s thread at utility QoS%s (MADEIRA_ECO_NATIVE)\n", who, r ? ": refused" : "" );
+}
+
 /***********************************************************************
  *           start_thread
  *
@@ -1378,6 +1401,42 @@ void set_thread_id( TEB *teb, DWORD pid, DWORD tid )
 /***********************************************************************
  *           init_thread_stack
  */
+/* madeira-bcd: which part of a new thread could not be allocated.
+ * SocialClubHelper.exe's Chrome_IOThread created a thread and the helper died
+ * at once with Chromium's out-of-memory exit and a size of 0 (logs 2026-10-08
+ * 13:39:08, build 451, and 16:38:52, build 455; GTA V Enhanced then shows
+ * "Failed to initialize. Error code: 17"): Chromium terminates with the stack
+ * size it asked for (0 = default) when CreateThread fails with an
+ * out-of-memory error. The server had made the thread; what failed after it
+ * (the TEB, one of the stacks, pthread_create) was never logged.
+ * init_thread_stack records the stack it is allocating; NtCreateThreadEx
+ * reports a failure with that step, the status, the pthread error, the sizes
+ * asked for and the task's thread count. At most 64 lines. */
+static __thread const char *ios_its_step;
+
+static void ios_note_thread_create_failure( const char *step, NTSTATUS status, int err,
+                                            SIZE_T reserve, SIZE_T commit )
+{
+    static LONG lines;
+    thread_act_array_t acts = NULL;
+    mach_msg_type_number_t n = 0, i;
+    int threads = -1;
+
+    if (InterlockedIncrement( &lines ) > 64) return;
+    if (task_threads( mach_task_self(), &acts, &n ) == KERN_SUCCESS)
+    {
+        threads = (int)n;
+        for (i = 0; i < n; i++) mach_port_deallocate( mach_task_self(), acts[i] );
+        vm_deallocate( mach_task_self(), (vm_address_t)acts, n * sizeof(*acts) );
+    }
+    dprintf( 2, "[thr-create] FAILED at %s: status=0x%x pthread=%d(%s) reserve=0x%lx commit=0x%lx "
+                "creator pid=%04x tid=%04x peb=%p; task threads %d\n",
+             step ? step : "?", (unsigned)status, err, err ? strerror( err ) : "-",
+             (unsigned long)reserve, (unsigned long)commit,
+             (unsigned)HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ),
+             (unsigned)HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ), NtCurrentTeb()->Peb, threads );
+}
+
 NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE_T commit_size )
 {
     struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
@@ -1386,6 +1445,7 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
     NTSTATUS status;
 
     /* kernel stack */
+    ios_its_step = "kernel stack";
     if ((status = virtual_alloc_thread_stack( &stack, limit_4g, 0, kernel_stack_size, kernel_stack_size, FALSE )))
         return status;
     thread_data->kernel_stack = stack.DeallocationStack;
@@ -1409,6 +1469,7 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
             ((get_machine_context_size( wow_machine ) + 7) & ~7) + sizeof(ULONG64);
 
         /* 64-bit stack */
+        ios_its_step = "WoW64 64-bit stack";
         if ((status = virtual_alloc_thread_stack( &stack, limit_4g, 0, 0x40000, 0x40000, TRUE ))) return status;
         cpu = (WOW64_CPURESERVED *)(((ULONG_PTR)stack.StackBase - cpusize) & ~15);
         cpu->Machine = wow_machine;
@@ -1433,6 +1494,7 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
          * non-LAA program's own stack above 0x80000000. */
         if (!limit && ios_wow_base()) limit = limit_2g - 1;
 #endif
+        ios_its_step = "WoW64 32-bit stack";
         if ((status = virtual_alloc_thread_stack( &stack, 0, limit, reserve_size, commit_size, TRUE )))
             return status;
         wow_teb->Tib.StackBase = ios_wow_guest_addr( stack.StackBase );
@@ -1459,6 +1521,7 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
         const SIZE_T chpev2_stack_size = 0x40000;
 
         /* emulator stack */
+        ios_its_step = "emulator stack";
         if ((status = virtual_alloc_thread_stack( &stack, limit_4g, 0, chpev2_stack_size, chpev2_stack_size, FALSE )))
             return status;
 
@@ -1479,6 +1542,7 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
 #endif
 
     /* native stack */
+    ios_its_step = "stack";
     if ((status = virtual_alloc_thread_stack( &stack, 0, limit, reserve_size, commit_size, TRUE )))
         return status;
     teb->Tib.StackBase = stack.StackBase;
@@ -1561,7 +1625,7 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
     struct object_attributes *objattr;
     struct ntdll_thread_data *thread_data;
     DWORD tid = 0;
-    int request_pipe[2];
+    int request_pipe[2], pthread_err;
     TEB *teb;
     WOW_TEB *wow_teb;
     unsigned int status;
@@ -1702,10 +1766,16 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
 
     pthread_sigmask( SIG_BLOCK, &server_block_set, &sigset );
 
-    if ((status = virtual_alloc_teb( &teb ))) goto done;
+    if ((status = virtual_alloc_teb( &teb )))
+    {
+        ios_note_thread_create_failure( "TEB", status, 0, stack_reserve, stack_commit );
+        goto done;
+    }
 
+    ios_its_step = NULL;
     if ((status = init_thread_stack( teb, get_zero_bits_limit( zero_bits ), stack_reserve, stack_commit )))
     {
+        ios_note_thread_create_failure( ios_its_step, status, 0, stack_reserve, stack_commit );
         virtual_free_teb( teb );
         goto done;
     }
@@ -1731,11 +1801,12 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
     pthread_attr_setguardsize( &pthread_attr, 0 );
     pthread_attr_setscope( &pthread_attr, PTHREAD_SCOPE_SYSTEM ); /* force creating a kernel thread */
     InterlockedIncrement( &nb_threads );
-    if (pthread_create( &pthread_id, &pthread_attr, (void * (*)(void *))start_thread, teb ))
+    if ((pthread_err = pthread_create( &pthread_id, &pthread_attr, (void * (*)(void *))start_thread, teb )))
     {
         InterlockedDecrement( &nb_threads );
         virtual_free_teb( teb );
         status = STATUS_NO_MEMORY;
+        ios_note_thread_create_failure( "pthread_create", status, pthread_err, stack_reserve, stack_commit );
     }
     pthread_attr_destroy( &pthread_attr );
 
@@ -1938,12 +2009,81 @@ NTSTATUS WINAPI NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL 
 {
     NTSTATUS status;
 #ifdef WINE_IOS
+    /* madeira-bcd: a 64-bit C++ throw carries the image base its ThrowInfo
+     * RVAs are relative to (parameter 3, from RtlPcToFileHeader(ThrowInfo)).
+     * When the ThrowInfo pointer is a JIT-pool alias of the image (native code
+     * computing its own data address runs from the pool copy) no module owns
+     * it, the base comes out 0 and __CxxFrameHandler4 faults reading 0+RVA
+     * (Ghost of Tsushima: AV READ of 0x16694 in VCRUNTIME140_1 after a save).
+     * Map the pointer back to the PE image and fill in the base. Upstream's
+     * RtlPcToFileHeader patch (ios_patch_rtl_pc_to_file_header) fixes the base
+     * where it is computed; this second layer catches a throw that still
+     * arrives with base 0 or a pool-alias ThrowInfo. */
+    if (rec && rec->ExceptionCode == 0xE06D7363 && rec->NumberParameters == 4 && rec->ExceptionInformation[2])
+    {
+        extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+        static LONG fixes, seen;
+        ULONG_PTR info = rec->ExceptionInformation[2], base = rec->ExceptionInformation[3];
+        uint64_t mod = 0, pe = ios_jit_reverse_translate( info, &mod );
+        const char *how = NULL;
+
+        if (pe && mod)
+        {
+            rec->ExceptionInformation[2] = pe;
+            rec->ExceptionInformation[3] = mod;
+            how = "pool alias -> PE image";
+        }
+        else if (!base)
+        {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!NtQueryVirtualMemory( NtCurrentProcess(), (void *)info, MemoryBasicInformation,
+                                       &mbi, sizeof(mbi), NULL ) && mbi.Type == MEM_IMAGE)
+            {
+                rec->ExceptionInformation[3] = (ULONG_PTR)mbi.AllocationBase;
+                how = "base 0 -> owning image";
+            }
+            else how = "base 0, NO owning image (left as is)";
+        }
+        if (how && InterlockedIncrement( &fixes ) <= 32)
+            ERR_(seh)( "[cxx-throw] #%d ThrowInfo %p base %p -> %p base %p: %s (addr %p)\n", (int)fixes,
+                       (void *)info, (void *)base, (void *)rec->ExceptionInformation[2],
+                       (void *)rec->ExceptionInformation[3], how, rec->ExceptionAddress );
+        else if (!how && InterlockedIncrement( &seen ) <= 4)
+            ERR_(seh)( "[cxx-throw] ok ThrowInfo %p base %p (addr %p)\n",
+                       (void *)info, (void *)base, rec->ExceptionAddress );
+    }
     /* ml845: the engine's thread-naming exception is where a bogus "stack base"
      * reaches its per-thread state. Watch the slot across this dispatch. */
     if (rec && rec->ExceptionCode == 0x406D1388)
     {
         extern void ios_tlswatch_arm( const char * );
         ios_tlswatch_arm( "raise 0x406D1388" );
+    }
+    /* madeira-bcd: Chromium's out-of-memory exit (SocialClubHelper.exe died of
+     * it on the first launch of build 442, on four threads at once). The PE
+     * [exc] line names the code only; PartitionAlloc passes { size of the
+     * failed request, total page file, available page file } and base's own
+     * OOM path passes the size alone, and the size is what tells a failed
+     * reservation from a failed commit. */
+    if (rec && rec->ExceptionCode == 0xE0000008 && rec->NumberParameters >= 1)
+    {
+        static LONG oom_lines;
+        unsigned int tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
+
+        if (InterlockedIncrement( &oom_lines ) <= 16)
+        {
+            if (rec->NumberParameters >= 3)
+                ERR_(seh)( "[chromium-oom] tid %04x: request %#lx bytes (%lu MB), page file total %lu MB, "
+                           "available %lu MB, at %p\n", tid,
+                           (unsigned long)rec->ExceptionInformation[0],
+                           (unsigned long)(rec->ExceptionInformation[0] >> 20),
+                           (unsigned long)(rec->ExceptionInformation[1] >> 20),
+                           (unsigned long)(rec->ExceptionInformation[2] >> 20), rec->ExceptionAddress );
+            else
+                ERR_(seh)( "[chromium-oom] tid %04x: request %#lx bytes (%lu MB), at %p\n", tid,
+                           (unsigned long)rec->ExceptionInformation[0],
+                           (unsigned long)(rec->ExceptionInformation[0] >> 20), rec->ExceptionAddress );
+        }
     }
 #endif
     status = send_debug_event( rec, context, first_chance, !(is_win64 || is_wow64() || is_old_wow64()) );
@@ -2040,6 +2180,37 @@ NTSTATUS WINAPI NtSuspendThread( HANDLE handle, ULONG *count )
         }
     }
     SERVER_END_REQ;
+#ifdef WINE_IOS
+    /* madeira-bcd: a thread that suspends itself must stop until it is resumed.
+     * Elsewhere the server's SIGUSR1 makes usr1_handler wait in wait_suspend();
+     * on iOS that signal never runs its handler (task #32), so SuspendThread on
+     * oneself returned at once. Crysis's intro-video threads suspend themselves
+     * once per frame and are resumed by the main thread: here they spun instead,
+     * piling the count up to MAXIMUM_SUSPEND_COUNT, and when a video ended the
+     * thread's exit (NtTerminateThread's select) waited on that count forever,
+     * so the main thread sat out a 30 s join timeout between videos
+     * (log 2026-09-30 12:25, build 244). Wait here the way wait_suspend does:
+     * a zero-timeout select only returns once the thread is no longer suspended. */
+    if (!ret)
+    {
+        BOOL self = handle == GetCurrentThread();
+        if (!self)
+        {
+            THREAD_BASIC_INFORMATION tbi;
+            self = !NtQueryInformationThread( handle, ThreadBasicInformation, &tbi, sizeof(tbi), NULL ) &&
+                   HandleToULong( tbi.ClientId.UniqueThread ) == GetCurrentThreadId();
+        }
+        if (self)
+        {
+            static LONG self_suspends;
+            LONG n = InterlockedIncrement( &self_suspends );
+            if (n <= 4 || !(n & (n - 1)))
+                dprintf( 2, "[self-suspend] madeira-bcd: tid=%04x suspended itself (#%d); waiting for the resume\n",
+                         (int)GetCurrentThreadId(), (int)n );
+            server_select( NULL, 0, SELECT_INTERRUPTIBLE, 0, NULL, NULL );
+        }
+    }
+#endif
     return ret;
 }
 

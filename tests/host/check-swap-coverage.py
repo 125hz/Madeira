@@ -100,6 +100,11 @@ ULONG_PTR ios_fex_arena_base_unix = 0x7c00000000ULL, ios_fex_arena_end_unix = 0x
 void *ios_jit_rw_base_global = (void *)0x7000000000ULL;   /* numerically inside the band on purpose */
 void *ios_jit_rx_base_global = (void *)0x119400000ULL;
 size_t ios_jit_pool_size_global = 0x20000000;
+/* madeira-bcd pool-low (region C) is off here: no region, every test on it is 0 */
+uintptr_t ios_jit_low_rx_global, ios_jit_low_rw_global;
+size_t ios_jit_low_size_global;
+static int ios_jit_low_overlaps( uintptr_t a, size_t size )
+''' + body_of(virt, 'static int ios_jit_low_overlaps(') + r'''
 /* Wine's rules (unix_private/virtual.c), EXEC mapped to read for the test */
 static int get_unix_prot( unsigned char v )
 {
@@ -208,6 +213,14 @@ static void test_config( void )
     CHECK( ios_swap_min == ((size_t)1 << 32), "MIN_KB clamped to 4 GB without overflow" );
     env( "wide", NULL, "64" );
     CHECK( ios_swap_resv_max == (64u << 20), "MADEIRA_SWAP_RESERVE_MAX_MB" );
+    env( "wide", NULL, "9216" );
+    CHECK( ios_swap_resv_max == ((size_t)1 << 32), "wide: RESERVE_MAX still clamped to 4 GB" );
+    env( "broad", NULL, NULL );
+    CHECK( ios_swap_broad && ios_swap_resv_max == ((size_t)8 << 30), "broad: 8 GB unless set" );
+    env( "broad", NULL, "9216" );
+    CHECK( ios_swap_resv_max == ((size_t)9216 << 20), "broad: 9216 MB takes RDR2's 8960 MB heap" );
+    env( "broad", NULL, "99999" );
+    CHECK( ios_swap_resv_max == ((size_t)16 << 30), "broad: RESERVE_MAX clamped to 16 GB" );
 }
 
 static void test_why( void )

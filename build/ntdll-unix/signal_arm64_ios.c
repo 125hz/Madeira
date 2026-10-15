@@ -39,6 +39,8 @@
 #ifdef WINE_IOS
 #include <dlfcn.h>
 #include <mach/mach.h>
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
 
 /* iOS-Madeira ml674: XZR/WZR AS A STORE SOURCE MUST READ ZERO.
  *
@@ -102,6 +104,8 @@
 
 /* defined at the bottom of this file with the [thread-stacks] dumper */
 static const char *ios_pe_module_name( uint64_t base );
+/* madeira-bcd: for the watchdog's guest-stack dump (server_ios.c). */
+const char *ios_pe_module_name_ext( uint64_t base ) { return ios_pe_module_name( base ); }
 
 WINE_DEFAULT_DEBUG_CHANNEL(seh);
 
@@ -109,6 +113,9 @@ WINE_DEFAULT_DEBUG_CHANNEL(seh);
  * ntdll image (cross-arch children run a private ARM64EC ntdll). Falls back
  * to the session p* globals when the process has no private image. */
 #include "ios_mixed.h"
+#ifdef WINE_IOS
+#include "ios_sc_runstate_diag.h"
+#endif
 #define IOS_PFUNC(name) __extension__ ({ \
     const struct ios_ntdll_funcs *_iosf = ios_cur_ntdll_funcs(); \
     _iosf ? _iosf->name : (void *)p##name; })
@@ -119,6 +126,16 @@ WINE_DEFAULT_DEBUG_CHANNEL(seh);
 /* ml649: runtime diagnostic switch, defined in virtual_ios.c. Default OFF.
  * Gate the WORK, not the print — several probes do expensive reads first. */
 extern volatile int madeira_diag_enabled;
+
+/* madeira-bcd pool-low (virtual_ios.c, ios_jit_low_rx_global): region C, a third
+ * debugger region below the executable window that holds FEX code buffers, outside
+ * the pool span [rx, rx + size) but at the pool's RX->RW distance, so rw + (a - rx)
+ * is still its writable alias. Every "is this pc / store target JIT code?" test in
+ * this file that decides handling asks these as well; both are 0 without it. */
+extern int ios_jit_low_contains( uintptr_t a );
+extern int ios_jit_low_rw_contains( uintptr_t a );
+extern uintptr_t ios_jit_low_rx_global;
+extern size_t ios_jit_low_size_global;
 
 
 /* ml648: defined in virtual_ios.c, called from the SWPAL emulation path. */
@@ -510,6 +527,7 @@ static void *ios_stale_va_scanner( void *arg )
      * MADEIRA_NO_HEAL=1 reverts to dry-run reporting. */
     int do_heal = getenv( "MADEIRA_NO_HEAL" ) == NULL;
     pthread_setname_np( "wine-stale-heal" );
+    { extern void ios_eco_native_self( const char *who ); ios_eco_native_self( "wine-stale-heal" ); }   /* madeira-bcd eco-native */
     for (;;)
     {
         usleep( 100000 );
@@ -1775,19 +1793,39 @@ static int ios_fault_read_insn( uint64_t fault_pc, uint32_t *out )
  * that wrote exactly this base register from x18, the base holds
  * (0 + offset) and fault_addr is the TEB offset, so the same TEB-relative
  * emulation is correct. Only ADD (extended/shifted register or immediate) and
- * MOV Xd,X18; the other operand must not be the destination (it still holds
- * the value the ADD used). */
+ * MOV Xd,X18.
+ * madeira-bcd: the other operand may be the destination itself, as in
+ * `add x8, x18, x8, lsl #3`: the emulation reads only fault_addr. That form is
+ * the one the x18 patcher runs "via x18" (its destination cannot carry the TEB),
+ * and declining it killed Horizon Zero Dawn on build 500 (2026-10-11 19:17,
+ * madeira_d3d12.dll+0x15ed4 reading 0x1508 = TEB 0 + TLS slot 17). */
 static int ios_x18_derived_base( uint64_t fault_pc, int rn )
 {
     uint32_t p;
     int rd, pn, pm;
 
     if (rn == 18 || rn >= 29 || !ios_fault_read_insn( fault_pc - 4, &p )) return 0;
+    /* The x18 patcher (virtual_ios.c, "via x18" form) moves such an ADD into a
+     * trampoline -- `mrs x18, TPIDRRO_EL0; and x18, x18, #~7; ldr x18, [x18,
+     * #slot]; <ADD>; b back` -- and leaves `b tramp` at pc-4. TlsGetValue is
+     * hot enough that a preemption between that ldr and the ADD (iOS zeroes
+     * x18) does happen: build 264 died exactly there again. Follow the branch
+     * when the trampoline has that shape and branches back to the fault. */
+    if ((p & 0xfc000000u) == 0x14000000u)
+    {
+        int64_t imm = (int64_t)(int32_t)((p & 0x03ffffffu) << 6) >> 4;   /* sign-extended imm26 * 4 */
+        uint64_t t = fault_pc - 4 + imm;
+        uint32_t t0, t4;
+        if (!ios_fault_read_insn( t, &t0 ) || t0 != (0xd53bd060u | 18)) return 0;
+        if (!ios_fault_read_insn( t + 16, &t4 ) || (t4 & 0xfc000000u) != 0x14000000u) return 0;
+        if (t + 16 + ((int64_t)(int32_t)((t4 & 0x03ffffffu) << 6) >> 4) != fault_pc) return 0;
+        if (!ios_fault_read_insn( t + 12, &p )) return 0;
+    }
     rd = p & 31; pn = (p >> 5) & 31; pm = (p >> 16) & 31;
     if (rd != rn) return 0;
-    if ((p & 0xffe00000u) == 0x8b200000u) return pn == 18 && pm != rd;           /* ADD Xd, X18, Wm/Xm, ext */
-    if ((p & 0xff200000u) == 0x8b000000u) return (pn == 18 && pm != rd) ||       /* ADD Xd, X18, Xm, shift */
-                                                 (pm == 18 && pn != rd && !((p >> 10) & 0x3f));
+    if ((p & 0xffe00000u) == 0x8b200000u) return pn == 18;                       /* ADD Xd, X18, Wm/Xm, ext */
+    if ((p & 0xff200000u) == 0x8b000000u) return pn == 18 ||                     /* ADD Xd, X18, Xm, shift */
+                                                 (pm == 18 && !((p >> 10) & 0x3f));
     if ((p & 0xff800000u) == 0x91000000u) return pn == 18;                       /* ADD Xd, X18, #imm */
     if ((p & 0xffffffe0u) == (0xaa0003e0u | (18u << 16))) return 1;              /* MOV Xd, X18 */
     return 0;
@@ -2557,7 +2595,11 @@ static void *ios_mach_exception_thread( void *arg )
                     uintptr_t jit_rx = (uintptr_t)ios_jit_rx_base_global;
                     size_t jit_sz = ios_jit_pool_size_global;
 
-                    if (fault_pc >= jit_rx && fault_pc < jit_rx + jit_sz)
+                    /* madeira-bcd pool-low: region C is pool code too (nothing there
+                     * is an image, so this branch does nothing for it -- as for the
+                     * tail -- instead of trying an image translation) */
+                    if ((fault_pc >= jit_rx && fault_pc < jit_rx + jit_sz) ||
+                        ios_jit_low_contains( (uintptr_t)fault_pc ))
                     {
                         /* Exec fault IN JIT pool — only fixable if in .text (x18 issue) */
                         if (ios_jit_addr_is_text(fault_pc) && state.__x[18] == 0 && thread_teb && thread_trampoline)
@@ -2648,8 +2690,9 @@ static void *ios_mach_exception_thread( void *arg )
                             uintptr_t rw_base = (uintptr_t)ios_jit_rw_base_global;
                             uintptr_t rx_base2 = (uintptr_t)ios_jit_rx_base_global;
                             if (rw_base && rx_base2 && ios_jit_pool_size_global &&
-                                fault_pc >= rw_base &&
-                                fault_pc < rw_base + ios_jit_pool_size_global)
+                                ((fault_pc >= rw_base &&
+                                  fault_pc < rw_base + ios_jit_pool_size_global) ||
+                                 ios_jit_low_rw_contains( (uintptr_t)fault_pc )))   /* madeira-bcd pool-low */
                             {
                                 uintptr_t rx_pc = (uintptr_t)fault_pc - rw_base + rx_base2;
                                 jit_pc = (void *)rx_pc;
@@ -2717,6 +2760,17 @@ static void *ios_mach_exception_thread( void *arg )
                                              "hottest in the last 100000:%s\n", total, n ? line : " (none above 50)" );
                                     memset( top, 0, sizeof(top) );
                                 }
+                            }
+                            /* madeira-bcd: an EC import stub that reached this
+                             * PE address through check_icall gets the copy
+                             * address in its AuxiliaryIAT slot, so its next
+                             * call does not fault (virtual_ios.c aux-IAT heal) */
+                            {
+                                extern int ios_jit_heal_aux_iat( uintptr_t fault_pc, uintptr_t lr,
+                                                                 void *thread_peb, uintptr_t jit_pc );
+                                ios_jit_heal_aux_iat( (uintptr_t)fault_pc,
+                                                      (uintptr_t)__darwin_arm_thread_state64_get_lr(state),
+                                                      fault_owner_peb, (uintptr_t)jit_pc );
                             }
                             __darwin_arm_thread_state64_set_pc_fptr(state, jit_pc);
                             ios_exc_x18_fixes++;
@@ -2827,7 +2881,14 @@ static void *ios_mach_exception_thread( void *arg )
                         {
                         /* unsigned-offset immediate loads, base x18 */
                         case 0xf9400000: /* LDR Xt */
-                            if (rt != 31) state.__x[rt] = *(uint64_t *)ea;
+                            /* The x18 patcher's "via x18" trampoline (mrs x18 / and /
+                             * ldr x18,[x18,#slot] / insn) preempted before its ldr: that
+                             * ldr reads the TSD slot holding the TEB, so x18 gets the TEB
+                             * itself, not the TEB field at the slot's offset. */
+                            if (rt == 18 && rn == 18 && ios_teb_tls_slot_offset &&
+                                fault_addr == (uintptr_t)ios_teb_tls_slot_offset)
+                                state.__x[18] = thread_teb;
+                            else if (rt != 31) state.__x[rt] = *(uint64_t *)ea;
                             emulated = 1; break;
                         case 0xb9400000: /* LDR Wt (zero-extend) */
                             if (rt != 31) state.__x[rt] = *(uint32_t *)ea;
@@ -3019,7 +3080,10 @@ static void *ios_mach_exception_thread( void *arg )
                 size_t sz = ios_jit_pool_size_global;
                 uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
 
-                if (rx && rw && sz && fault_pc >= rx && fault_pc < rx + sz)
+                /* madeira-bcd pool-low: FEX code in region C is backpatched the same
+                 * way; its alias is at the same distance, so rw + (pc - rx) holds. */
+                if (rx && rw && sz && ((fault_pc >= rx && fault_pc < rx + sz) ||
+                                       ios_jit_low_contains( (uintptr_t)fault_pc )))
                 {
                     uintptr_t rw_pc = rw + (fault_pc - rx);
                     uint32_t insn; ios_fault_read_insn( (uint64_t)(uintptr_t)fault_pc, &insn );  /* ml982 */
@@ -3110,6 +3174,51 @@ static void *ios_mach_exception_thread( void *arg )
                             }
                             /* Aligned — this is a genuine SEGV/BUS, not an
                              * unaligned-atomic-needs-backpatch case. Skip. */
+                            goto skip_unaligned_backpatch;
+                        }
+                    }
+
+                    /* madeira-bcd: ALREADY BACKPATCHED BY A CONCURRENT FAULT.
+                     *
+                     * Two threads running the same block hit the same unaligned
+                     * LDAPR/STLR at once. This handler runs on the one Mach
+                     * exception-server thread, so it rewrites the instruction for
+                     * the first fault and then reads the SECOND thread's fault
+                     * with the plain LDR/STR (LDUR/STUR) already in place -- which
+                     * matches none of the atomic forms below, so the fault went out
+                     * as unhandled and the guest took an access violation on a
+                     * legal unaligned load. God of War's intro video decode threads
+                     * (build 239, logs 2026-09-30 10:49 / 10:51: `ldr x8,[x27,xzr]`,
+                     * `str xzr,[x6,xzr]` at kr=0x101, several threads, same pc).
+                     *
+                     * A plain LDR/STR cannot raise an alignment fault on normal
+                     * memory, so kr == EXC_ARM_DA_ALIGN with one of our rewritten
+                     * forms (and its half-barrier in the neighbouring slot) means the
+                     * fault came from the pre-patch instruction. Re-run it: at pc for
+                     * the loads (barrier after), at pc-4 for the stores (barrier
+                     * before). The patching fault already invalidated the icache. */
+                    if (fault_kr == 0x101 /* EXC_ARM_DA_ALIGN */)
+                    {
+                        uint32_t next_slot = __atomic_load_n((volatile uint32_t *)(rw_pc + 4), __ATOMIC_ACQUIRE);
+                        uint32_t prev_slot_now = __atomic_load_n((volatile uint32_t *)(rw_pc - 4), __ATOMIC_ACQUIRE);
+                        int resume = 0;   /* 1 = at pc, -4 = at pc-4 */
+                        if (((insn & LDAXR_MASK) == LDR_INST || (insn & RCPC2_MASK) == LDUR_INST) && next_slot == DMB_LD)
+                            resume = 1;
+                        else if (((insn & LDAXR_MASK) == STR_INST || (insn & RCPC2_MASK) == STUR_INST) && prev_slot_now == DMB)
+                            resume = -4;
+                        if (resume)
+                        {
+                            static volatile int rp_count;
+                            int n = __sync_add_and_fetch(&rp_count, 1);
+                            if (resume < 0)
+                                __darwin_arm_thread_state64_set_pc_fptr(state, (void *)(uintptr_t)(fault_pc - 4));
+                            if (n <= 16 || (n % 256) == 0)
+                                dprintf(STDERR_FILENO,
+                                        "[mach_exc] UNALIGNED-REPATCHED madeira-bcd #%d pc=0x%llx insn=0x%08x addr=0x%llx "
+                                        "-- rewritten by a concurrent fault, re-run%s\n",
+                                        n, (unsigned long long)fault_pc, insn, (unsigned long long)fault_addr,
+                                        resume < 0 ? " from the barrier" : "");
+                            handled = 1;
                             goto skip_unaligned_backpatch;
                         }
                     }
@@ -3325,6 +3434,78 @@ static void *ios_mach_exception_thread( void *arg )
                         }
                     }
 
+                    /* madeira-bcd: misaligned LSE atomic memory operations.
+                     *
+                     * x86 `lock add/xadd/and/or/xor/xchg` on a misaligned operand is
+                     * legal and FEX lowers it to LDADD/LDCLR/LDEOR/LDSET/SWP (with
+                     * A/L), which alignment-fault here like CAS does. God of War on
+                     * build 241 (logs 2026-09-30 11:20 and 11:21): `ldaddal w7, w8,
+                     * [x6]` on 0x...b6267e, guest 0x1408df521, the frame after the
+                     * intro videos. Emulated like the CAS above: read, compute,
+                     * write through mach_vm on the single exception-server thread,
+                     * old value to Rt, pc + 4. Never patched: the same instruction
+                     * also serves aligned operands. LDAPR shares the family bits
+                     * (o3=1, opc=100) and is left to the backpatch above. */
+                    else if (!handled && (insn & 0x3F200C00u) == 0x38200000u &&
+                             (((insn >> 15) & 1) == 0 || ((insn >> 12) & 7) == 0))
+                    {
+                        uint32_t Size = (insn >> 30) & 0x3;
+                        uint32_t Rs = (insn >> 16) & 0x1F;
+                        uint32_t Rn = (insn >> 5) & 0x1F;
+                        uint32_t Rt = insn & 0x1F;
+                        uint32_t o3 = (insn >> 15) & 1;
+                        uint32_t opc = (insn >> 12) & 7;
+                        uint32_t nbytes = 1u << Size;
+                        uint64_t addr = (Rn == 31) ? __darwin_arm_thread_state64_get_sp(state)
+                                                   : state.__x[Rn];
+                        uint64_t szmask = (Size == 3) ? ~0ULL : ((1ULL << (8u << Size)) - 1);
+                        uint64_t sbit = 1ULL << ((8u << Size) - 1);
+                        uint64_t opnd = ((Rs == 31) ? 0 : state.__x[Rs]) & szmask;
+                        uint64_t cur = 0, nv = 0;
+                        mach_vm_size_t got = 0;
+                        if (mach_vm_read_overwrite( mach_task_self(), addr, nbytes,
+                                                    (mach_vm_address_t)&cur, &got ) == KERN_SUCCESS
+                            && got == nbytes)
+                        {
+                            int64_t sc, so;
+                            cur &= szmask;
+                            sc = (int64_t)((cur ^ sbit) - sbit);
+                            so = (int64_t)((opnd ^ sbit) - sbit);
+                            if (o3) nv = opnd;                                   /* SWP */
+                            else switch (opc)
+                            {
+                            case 0: nv = cur + opnd; break;                      /* LDADD */
+                            case 1: nv = cur & ~opnd; break;                     /* LDCLR */
+                            case 2: nv = cur ^ opnd; break;                      /* LDEOR */
+                            case 3: nv = cur | opnd; break;                      /* LDSET */
+                            case 4: nv = (sc > so) ? cur : opnd; break;          /* LDSMAX */
+                            case 5: nv = (sc < so) ? cur : opnd; break;          /* LDSMIN */
+                            case 6: nv = (cur > opnd) ? cur : opnd; break;       /* LDUMAX */
+                            default: nv = (cur < opnd) ? cur : opnd; break;      /* LDUMIN */
+                            }
+                            nv &= szmask;
+                            if (mach_vm_write( mach_task_self(), addr, (vm_offset_t)(uintptr_t)&nv,
+                                               nbytes ) != KERN_SUCCESS)
+                                goto skip_unaligned_backpatch;  /* write failed: honest AV path */
+                            if (Rt != 31) state.__x[Rt] = cur;
+                            __darwin_arm_thread_state64_set_pc_fptr(
+                                state, (void *)(uintptr_t)(fault_pc + 4));
+                            {
+                                static volatile int lse_count;
+                                int n = __sync_add_and_fetch(&lse_count, 1);
+                                if (n <= 8 || (n % 256) == 0)
+                                    dprintf(STDERR_FILENO,
+                                            "[mach_exc] UNALIGNED-LSE madeira-bcd #%d %s pc=0x%llx addr=0x%llx "
+                                            "size=%u old=0x%llx new=0x%llx\n",
+                                            n, o3 ? "SWP" : (const char *[]){"LDADD","LDCLR","LDEOR","LDSET",
+                                                                              "LDSMAX","LDSMIN","LDUMAX","LDUMIN"}[opc],
+                                            (unsigned long long)fault_pc, (unsigned long long)addr, nbytes,
+                                            (unsigned long long)cur, (unsigned long long)nv);
+                            }
+                            handled = 1;
+                        }
+                    }
+
                     if (patched)
                     {
                         if (adjust_pc)
@@ -3504,8 +3685,12 @@ static void *ios_mach_exception_thread( void *arg )
                  * mapping. */
                 uintptr_t rw_addr = 0;
                 int watch_hit = 0, watch_prot = 0;   /* ml1201 */
+                /* madeira-bcd pool-low: a store into region C (FEX code buffers) is
+                 * routed the same way -- its alias is at the pool's distance. in_low
+                 * keeps the bounds checks below to C's own extent. */
+                int in_low = rx && rw && sz && ios_jit_low_contains( (uintptr_t)fault_addr );
                 int in_jit = (rx && rw && sz &&
-                              fault_addr >= rx && fault_addr < rx + sz);
+                              fault_addr >= rx && fault_addr < rx + sz) || in_low;
                 if (in_jit) {
                     rw_addr = rw + (fault_addr - rx);
                 } else {
@@ -3622,7 +3807,8 @@ static void *ios_mach_exception_thread( void *arg )
 
                         /* The WHOLE 32-byte destination must live in the SAME alias, or the
                          * second copy would land outside it. */
-                        uintptr_t rw_end = in_jit ? (uintptr_t)(rw + ((fault_addr + 31) - rx))
+                        uintptr_t rw_end = in_jit ? ((in_low && !ios_jit_low_contains( (uintptr_t)fault_addr + 31 ))
+                                                     ? 0 : (uintptr_t)(rw + ((fault_addr + 31) - rx)))
                                                   : (uintptr_t)ios_jit_anon_alias_lookup( fault_addr + 31 );
                         if (!rw_end || rw_end != (uintptr_t)rw_addr + 31)
                         {
@@ -4329,7 +4515,12 @@ static void *ios_mach_exception_thread( void *arg )
                         (insn & 0xbfa07c00u) == 0x88a07c00u)
                     {
                         unsigned cas_width = (insn & 0x40000000u) ? 8 : 4;
-                        if (sz >= cas_width && fault_addr - rx <= sz - cas_width &&
+                        /* madeira-bcd pool-low: within region C for a lock word there */
+                        int cas_inside = in_low
+                            ? ios_jit_low_size_global >= cas_width &&
+                              fault_addr - ios_jit_low_rx_global <= ios_jit_low_size_global - cas_width
+                            : sz >= cas_width && fault_addr - rx <= sz - cas_width;
+                        if (cas_inside &&
                             ios_mach_emulate_cas(insn, rw_addr, state.__x))
                         {
                             static unsigned cas_mach_logs;
@@ -4795,7 +4986,8 @@ wx_done: ;
                     extern void *ios_jit_rx_base_global;
                     extern size_t ios_jit_pool_size_global;
                     uint64_t rx = (uint64_t)(uintptr_t)ios_jit_rx_base_global;
-                    int in_pool_rx = rx && fa >= rx && fa < rx + ios_jit_pool_size_global;
+                    int in_pool_rx = (rx && fa >= rx && fa < rx + ios_jit_pool_size_global) ||
+                                     ios_jit_low_contains( (uintptr_t)fa );   /* madeira-bcd pool-low */
                     int in_band    = (fa >= 0x7C00000000ULL && fa < 0x8000000000ULL);
 
                     if (in_pool_rx || in_band)
@@ -4906,7 +5098,8 @@ wx_done: ;
                     extern size_t ios_jit_pool_size_global;
                     uintptr_t rwb = (uintptr_t)ios_jit_rw_base_global;
                     if (rwb && ios_jit_pool_size_global &&
-                        fa >= rwb && fa < rwb + ios_jit_pool_size_global)
+                        ((fa >= rwb && fa < rwb + ios_jit_pool_size_global) ||
+                         ios_jit_low_rw_contains( (uintptr_t)fa )))   /* madeira-bcd pool-low */
                         goto skip_reclaim_band;
                 }
                 if (!handled && fa != (uint64_t)fault_pc &&
@@ -5003,6 +5196,34 @@ wx_done: ;
                     }
                 }
 skip_reclaim_band: ;
+            }
+
+            /* madeira-bcd: a thread of an EXITED pseudo-process woke into its
+             * reclaimed JIT copies; its ntdll copy is gone too, so guest SEH can
+             * only re-fault until the ml461/ml465 terminal kills the whole app
+             * (gta-2237: tid 014c, the thread-pool worker of the exited
+             * "RockstarService.exe stop"). End that thread only -- never through
+             * the exit wrappers, whose fds may belong to another thread by now. */
+            if (!handled && thread_teb &&
+                (req->exception == EXC_BAD_ACCESS || req->exception == EXC_BAD_INSTRUCTION))
+            {
+                extern int ios_peb_is_dead( const void *peb );
+                void *zpeb = NULL;
+                vm_size_t zsz = sizeof(zpeb);
+                if (vm_read_overwrite( mach_task_self(), (vm_address_t)(thread_teb + offsetof(TEB, Peb)),
+                                       sizeof(zpeb), (vm_address_t)&zpeb, &zsz ) == KERN_SUCCESS &&
+                    zsz == sizeof(zpeb) && ios_peb_is_dead( zpeb ))
+                {
+                    static int zombie_n;
+                    kern_return_t zkr = thread_terminate( thread );
+                    if (zkr != KERN_SUCCESS) zkr = thread_suspend( thread );
+                    if (zombie_n++ < 16)
+                        dprintf( 2, "[zombie] teb=%p of exited peb=%p faulted pc=0x%llx addr=0x%llx -- "
+                                    "ended this thread only (kr=%d)\n", (void *)thread_teb, zpeb,
+                                 (unsigned long long)__darwin_arm_thread_state64_get_pc( state ),
+                                 (unsigned long long)fault_addr, (int)zkr );
+                    handled = 1;   /* thread_set_state on the ended thread below is harmless */
+                }
             }
 
             /* ml369 (#63): last-resort in-process guest exception delivery.
@@ -5557,6 +5778,85 @@ skip_reclaim_band: ;
                             (void*)(uintptr_t)state.__x[10], (void*)(uintptr_t)state.__x[11],
                             (void*)(uintptr_t)state.__x[0], (void*)(uintptr_t)state.__x[2],
                             (void *)thread_teb, peb_p, peb_ecbm);
+                    }
+                    /* madeira-bcd [fault-full]: every register, and the host code
+                     * that led up to the faulting instruction (JIT blocks compute
+                     * the address a few instructions earlier), for the first two
+                     * unhandled faults. God of War on build 234 reads 0x40 through
+                     * LDAPR x27,[x6] and the short insn_stream cannot say where x6
+                     * came from. */
+                    /* madeira-bcd [fault-tls]: the thread's TLS[0] block (the main
+                     * image's thread-locals) next to the image's TLS template. God of
+                     * War (build 236) takes its current allocator from TLS[0]+0xc
+                     * (index) / +0xf0 (table) / +0x18 and finds none. */
+                    if (cnt == 1 && thread_teb)
+                    {
+                        uint64_t tlsarr = 0, blk = 0, peb = 0, img = 0;
+                        mach_vm_size_t g = 0;
+                        #define FT_RD(a, v) (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(a), sizeof(v), \
+                                             (mach_vm_address_t)&(v), &g) == KERN_SUCCESS && g == sizeof(v))
+                        if (FT_RD(thread_teb + 0x58, tlsarr) && tlsarr && FT_RD(tlsarr, blk) && blk)
+                        {
+                            uint64_t q[40];
+                            int i;
+                            if (FT_RD(blk, q))
+                                for (i = 0; i < 40; i += 4)
+                                    dprintf(STDERR_FILENO, "[fault-tls] tls0 %llx+%#x: %016llx %016llx %016llx %016llx\n",
+                                        (unsigned long long)blk, i * 8, (unsigned long long)q[i],
+                                        (unsigned long long)q[i + 1], (unsigned long long)q[i + 2],
+                                        (unsigned long long)q[i + 3]);
+                        }
+                        if (FT_RD(thread_teb + 0x60, peb) && peb && FT_RD(peb + 0x10, img) && img)
+                        {
+                            uint32_t lfanew = 0, tls_rva = 0;
+                            uint64_t dir[6];
+                            if (FT_RD(img + 0x3c, lfanew) && FT_RD(img + lfanew + 0xd0, tls_rva) && tls_rva
+                                && FT_RD(img + tls_rva, dir))
+                            {
+                                uint64_t q[40];
+                                uint32_t idx = 0;
+                                int i;
+                                (void)FT_RD(dir[2], idx);
+                                dprintf(STDERR_FILENO, "[fault-tls] image %llx tls dir: raw %llx-%llx index@%llx=%u callbacks %llx zerofill %llu\n",
+                                    (unsigned long long)img, (unsigned long long)dir[0], (unsigned long long)dir[1],
+                                    (unsigned long long)dir[2], idx, (unsigned long long)dir[3],
+                                    (unsigned long long)(dir[4] & 0xffffffffULL));
+                                if (FT_RD(dir[0], q))
+                                    for (i = 0; i < 40; i += 4)
+                                        dprintf(STDERR_FILENO, "[fault-tls] template +%#x: %016llx %016llx %016llx %016llx\n",
+                                            i * 8, (unsigned long long)q[i], (unsigned long long)q[i + 1],
+                                            (unsigned long long)q[i + 2], (unsigned long long)q[i + 3]);
+                            }
+                        }
+                        #undef FT_RD
+                    }
+                    if (cnt <= 2)
+                    {
+                        int r;
+                        for (r = 0; r < 29; r += 4)
+                            dprintf(STDERR_FILENO, "[fault-full] x%d=%llx x%d=%llx x%d=%llx x%d=%llx\n",
+                                r, (unsigned long long)state.__x[r],
+                                r + 1, (unsigned long long)(r + 1 < 29 ? state.__x[r + 1] : state.__fp),
+                                r + 2, (unsigned long long)(r + 2 < 29 ? state.__x[r + 2] : state.__lr),
+                                r + 3, (unsigned long long)(r + 3 < 29 ? state.__x[r + 3] : state.__sp));
+                        if ((uintptr_t)fault_pc >= 0x100000000ULL + 256)
+                        {
+                            uint32_t hc[68];
+                            mach_vm_size_t got = 0;
+                            if (mach_vm_read_overwrite( mach_task_self(),
+                                                        (mach_vm_address_t)((uintptr_t)fault_pc - 256),
+                                                        sizeof(hc), (mach_vm_address_t)hc, &got ) == KERN_SUCCESS
+                                && got == sizeof(hc))
+                            {
+                                int w;
+                                for (w = 0; w < 68; w += 8)
+                                    dprintf(STDERR_FILENO, "[fault-host] %llx: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                        (unsigned long long)((uintptr_t)fault_pc - 256 + w * 4),
+                                        hc[w], hc[w + 1], hc[w + 2], hc[w + 3],
+                                        w + 4 < 68 ? hc[w + 4] : 0, w + 5 < 68 ? hc[w + 5] : 0,
+                                        w + 6 < 68 ? hc[w + 6] : 0, w + 7 < 68 ? hc[w + 7] : 0);
+                            }
+                        }
                     }
                     /* Read instruction at LR-4 to identify the BL/BLR */
                     if (cnt <= 3 && (uintptr_t)state.__lr >= 0x100000000ULL)
@@ -6445,6 +6745,59 @@ skip_reclaim_band: ;
                                     (unsigned long long)cr[10], (unsigned long long)cr[11],
                                     (unsigned long long)cr[12], (unsigned long long)cr[13],
                                     (unsigned long long)cr[14], (unsigned long long)cr[15]);
+                                /* madeira-bcd [guest-fn]: the guest code of the two
+                                 * innermost frames, so the faulting function can be
+                                 * disassembled from the log: 48 bytes before each
+                                 * return address, and 256 bytes of the function a
+                                 * direct call (E8 rel32) right before it enters. */
+                                {
+                                    static int guest_fn_dumps;
+                                    int e;
+                                    for (e = 0; e < 2 && guest_fn_dumps < 4; e++)
+                                    {
+                                        uint64_t ret = cr[e * 2];
+                                        uint8_t pre[48];
+                                        mach_vm_size_t gp = 0;
+                                        if (ret < 0x10000 + sizeof(pre) || ret >= 0x800000000000ULL) continue;
+                                        if (mach_vm_read_overwrite(mach_task_self(),
+                                                (mach_vm_address_t)(ret - sizeof(pre)), sizeof(pre),
+                                                (mach_vm_address_t)pre, &gp) != KERN_SUCCESS || gp != sizeof(pre))
+                                            continue;
+                                        guest_fn_dumps++;
+                                        {
+                                            char hex[sizeof(pre) * 2 + 1];
+                                            int b;
+                                            for (b = 0; b < (int)sizeof(pre); b++)
+                                                snprintf(hex + b * 2, 3, "%02x", pre[b]);
+                                            dprintf(STDERR_FILENO, "[guest-fn] [%d] %llx-48: %s\n",
+                                                e, (unsigned long long)ret, hex);
+                                        }
+                                        if (pre[sizeof(pre) - 5] == 0xe8)
+                                        {
+                                            int32_t rel;
+                                            uint64_t tgt;
+                                            uint8_t body[256];
+                                            mach_vm_size_t gb = 0;
+                                            memcpy(&rel, pre + sizeof(pre) - 4, sizeof(rel));
+                                            tgt = ret + (int64_t)rel;
+                                            if (mach_vm_read_overwrite(mach_task_self(),
+                                                    (mach_vm_address_t)tgt, sizeof(body),
+                                                    (mach_vm_address_t)body, &gb) == KERN_SUCCESS
+                                                && gb == sizeof(body))
+                                            {
+                                                char hex[65];
+                                                int off, b;
+                                                for (off = 0; off < (int)sizeof(body); off += 32)
+                                                {
+                                                    for (b = 0; b < 32; b++)
+                                                        snprintf(hex + b * 2, 3, "%02x", body[off + b]);
+                                                    dprintf(STDERR_FILENO, "[guest-fn] [%d] callee %llx+%#x: %s\n",
+                                                        e, (unsigned long long)tgt, off, hex);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -6569,6 +6922,8 @@ static void ios_install_task_exception_port(void)
 /* Register a Wine "process" thread with the shared Mach exception handler.
  * First call creates the shared port and handler thread.
  * Every call registers the thread and sets its exception ports. */
+static int ios_pc_in_app_text( uint64_t pc );
+
 static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
                                                void *trampoline )
 {
@@ -6592,6 +6947,12 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
             if (!ios_mach_align_fault_enabled)
                 ERR("[unaligned-atomic] Mach-path alignment classification DISABLED by "
                     "MADEIRA_MACH_ALIGN_FAULT=0: alignment faults are delivered as c0000005 there\n");
+        }
+
+        {
+            /* the app's __TEXT range for the native-unaligned emulation, resolved here:
+             * dyld's lookups do not belong on the exception thread */
+            ios_pc_in_app_text( 0 );
         }
 
         pthread_t handler;
@@ -6916,7 +7277,11 @@ NTSTATUS signal_set_full_context( CONTEXT *context )
         uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
         size_t psz = ios_jit_pool_size_global;
 
-        if (rx && psz && frame->pc >= rx && frame->pc < rx + psz)
+        /* madeira-bcd pool-low: FEX's code buffers in region C are pool code
+         * too -- a resume there bounced through the emulation dispatcher would
+         * make the guest "execute" FEX's own code. */
+        if ((rx && psz && frame->pc >= rx && frame->pc < rx + psz) ||
+            ios_jit_low_contains( (uintptr_t)frame->pc ))
         {
             static int bounce_saved;
             if (bounce_saved < 16 && ++bounce_saved <= 16)
@@ -7118,7 +7483,15 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
  * Opt-in, MADEIRA_CTX_CPU_AREA=1 (madeira.cfg env., or a game's own config):
  * the snapshot is the thread's last exit from emulated code, not where it is
  * now, so a caller that writes the context back (SetThreadContext, as a .NET
- * runtime redirecting a thread does) would move the thread back there. */
+ * runtime redirecting a thread does) would move the thread back there.
+ *
+ * MADEIRA_CTX_CPU_AREA=2 also returns the snapshot's integer registers when the
+ * caller asked for CONTEXT_INTEGER (the ARM64EC_NT_CONTEXT registers that hold
+ * x64 state: X0-X12, X15, X19-X22 and X25-X27; the others are zeroed) and sets
+ * Cpsr to 0, so the caller gets one x64 state from a single moment instead of
+ * the snapshot's control registers next to the server's integer registers.
+ * madeira-bcd has run this form by default since its build 213 (2026-09-28),
+ * and its game lists were tested with it. */
 static int ctx_peek( void *dst, const void *src, size_t size )
 {
     mach_vm_size_t got = 0;
@@ -7138,10 +7511,12 @@ static int get_context_from_amd64_area( HANDLE handle, CONTEXT *context, DWORD n
 
     if (on < 0)
     {
-        /* 1: a cross-thread GetThreadContext without control registers gets the target's
-         * saved x64 Pc/Sp/Fp/Lr (default off; a context written back would rewind it). */
+        /* For a cross-thread GetThreadContext without control registers. 1: the target's
+         * Pc/Sp/Fp/Lr from its last exit from emulated code (upstream's opt-in). 2: also
+         * X0-X12, X15, X19-X22, X25-X27 and Cpsr = 0 from the same snapshot (madeira-bcd's
+         * behaviour). Default off: a context written back would rewind the thread. */
         const char *env = getenv( "MADEIRA_CTX_CPU_AREA" );
-        on = env && env[0] == '1';
+        on = !env ? 0 : env[0] == '1' ? 1 : env[0] == '2' ? 2 : 0;
     }
     if (!on) return 0;
     if (NtQueryInformationThread( handle, ThreadBasicInformation, &tbi, sizeof(tbi), NULL )) return 0;
@@ -7151,16 +7526,28 @@ static int get_context_from_amd64_area( HANDLE handle, CONTEXT *context, DWORD n
     if (!ctx_peek( &ecp, &cpu->ContextAmd64, sizeof(ecp) ) || !ecp) return 0;
     if (!ctx_peek( &ec, ecp, sizeof(ec) )) return 0;
     if (!ec.Pc || !ec.Sp) return 0;
+    if (on == 2 && (needed & (CONTEXT_INTEGER & ~CONTEXT_ARM64)))
+    {
+        memset( context->X, 0, sizeof(context->X[0]) * 29 );
+        context->X[0] = ec.X0;   context->X[1] = ec.X1;   context->X[2] = ec.X2;   context->X[3] = ec.X3;
+        context->X[4] = ec.X4;   context->X[5] = ec.X5;   context->X[6] = ec.X6;   context->X[7] = ec.X7;
+        context->X[8] = ec.X8;   context->X[9] = ec.X9;   context->X[10] = ec.X10; context->X[11] = ec.X11;
+        context->X[12] = ec.X12; context->X[15] = ec.X15;
+        context->X[19] = ec.X19; context->X[20] = ec.X20; context->X[21] = ec.X21; context->X[22] = ec.X22;
+        context->X[25] = ec.X25; context->X[26] = ec.X26; context->X[27] = ec.X27;
+        context->ContextFlags |= CONTEXT_INTEGER;
+    }
     context->X[23] = context->X[28] = 0;
     context->Fp = ec.Fp;
     context->Lr = ec.Lr;
     context->Sp = ec.Sp;
     context->Pc = ec.Pc;
+    if (on == 2) context->Cpsr = 0;
     context->ContextFlags |= CONTEXT_CONTROL;
     if (InterlockedIncrement( &said ) <= 8)
         ERR( "[ctx] get handle=%p: no control registers from the server; "
-             "returning the target's saved x64 Pc/Sp/Fp/Lr rip=%p rsp=%p (MADEIRA_CTX_CPU_AREA)\n",
-             handle, (void *)ec.Pc, (void *)ec.Sp );
+             "returning the target's saved x64 %s rip=%p rsp=%p (MADEIRA_CTX_CPU_AREA=%d)\n",
+             handle, on == 2 ? "state" : "Pc/Sp/Fp/Lr", (void *)ec.Pc, (void *)ec.Sp, on );
     return 1;
 }
 
@@ -7600,6 +7987,11 @@ static void setup_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec )
  * declared here because the Mach path must run the SAME emulator — see the
  * [unaligned-atomic] block below for why the two paths may not disagree. */
 static int ios_emulate_unaligned_guest_access(ucontext_t *ctx, uint32_t insn, uintptr_t addr);
+/* madeira-bcd: the same for an ordered/exclusive/LSE access in the app's own
+ * code, which FEX cannot handle (defined after ios_emulate_store_rel); the
+ * executable's __TEXT bounds it checks, filled on first use. */
+static int ios_native_unaligned_emulate( ucontext_t *ctx, uint32_t insn, uintptr_t addr, uint64_t pc );
+static uint64_t ios_app_text_lo, ios_app_text_hi;
 
 static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_state64_t *state,
                                                    arm_neon_state64_t *neon, int have_neon,
@@ -7712,7 +8104,8 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
              *     host/system code (guest code runs from the pool, and PE
              *     modules are not Mach-O images so dladdr cannot name them) */
             {
-                int in_pool = rxb && pc >= rxb && pc < rxb + ios_jit_pool_size_global;
+                int in_pool = (rxb && pc >= rxb && pc < rxb + ios_jit_pool_size_global) ||
+                              ios_jit_low_contains( (uintptr_t)pc );   /* madeira-bcd pool-low */
                 Dl_info dli;
 
                 if (!ios_thread_is_registered( thread ) && state->__x[18] == 0 && !in_pool
@@ -7949,6 +8342,22 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
                              ua_emu, ua_fex );
                 return 1;
             }
+            /* madeira-bcd: an ordered/exclusive/LSE access in the app's own code
+             * (ios_native_unaligned_emulate: the Launcher's `stlr` of build 454).
+             * The app offset names the function offline: dladdr would take dyld's
+             * lock on the exception thread for a fault that is recovered. */
+            if (ios_native_unaligned_emulate( &uc, a_insn, fault_addr, (uint64_t)pc ))
+            {
+                static unsigned long ua_native;
+                PC_sig(&uc) += 4;
+                *state = mc.__ss;
+                if (++ua_native <= 16 || (ua_native % 4096) == 0)
+                    dprintf( 2, "[unaligned-native] mach-path pc=0x%llx (app+0x%llx) insn=0x%08x "
+                                "addr=0x%llx emulated in place, not handed to FEX (#%lu)\n",
+                             (unsigned long long)pc, (unsigned long long)((uint64_t)pc - ios_app_text_lo),
+                             a_insn, (unsigned long long)fault_addr, ua_native );
+                return 1;
+            }
 
             rec.ExceptionCode = EXCEPTION_DATATYPE_MISALIGNMENT;
             rec.NumberParameters = 0;
@@ -8120,6 +8529,7 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
      * Host dylib and unix-side pcs keep the old decline path —
      * dispatching a guest exception on those contexts would be wrong. */
     if (!((rxb && pc >= rxb && pc < rxb + ios_jit_pool_size_global) ||
+          ios_jit_low_contains( (uintptr_t)pc ) ||   /* madeira-bcd pool-low: FEX code in region C */
           pc < 0x100000000ULL ||
           (pc >= 0x7000000000ULL && pc < 0x7400000000ULL)))
         return 0;
@@ -8783,7 +9193,9 @@ static inline void ios_fixup_x18_for_return( ucontext_t *context )
     uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
     size_t sz = ios_jit_pool_size_global;
 
-    if (rx && pc >= rx && pc < rx + sz)
+    /* madeira-bcd pool-low: FEX code in region C needs x18 back exactly like
+     * the pool tail's */
+    if ((rx && pc >= rx && pc < rx + sz) || ios_jit_low_contains( pc ))
     {
         REGn_sig(17, context) = pc;
         PC_sig(context) = (uintptr_t)ios_my_trampoline;
@@ -8799,7 +9211,7 @@ static inline void ios_track_signal( int sig, ucontext_t *context )
     uintptr_t pc = PC_sig(context);
     uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
     size_t sz = ios_jit_pool_size_global;
-    if (rx && pc >= rx && pc < rx + sz)
+    if ((rx && pc >= rx && pc < rx + sz) || ios_jit_low_contains( pc ))   /* madeira-bcd pool-low */
         ios_signal_in_pe++;
 }
 
@@ -9366,6 +9778,7 @@ static int ios_fault_is_foreign( const void *pc, const void *addr )
     /* TEB-less but running emulated code (threads CEF/FEX create directly) */
     if (sz && rx && p >= rx && p < rx + sz) return 0;
     if (sz && rw && p >= rw && p < rw + sz) return 0;
+    if (ios_jit_low_contains( p ) || ios_jit_low_rw_contains( p )) return 0;   /* madeira-bcd pool-low */
     if (p >= 0x7000000000ull && p < 0x8000000000ull) return 0;  /* guest | PA | FEX bands */
 
     /* host code, but touching emulator-managed memory (guard page, pool alias,
@@ -9374,6 +9787,7 @@ static int ios_fault_is_foreign( const void *pc, const void *addr )
     {
         if (sz && rx && a >= rx && a < rx + sz) return 0;
         if (sz && rw && a >= rw && a < rw + sz) return 0;
+        if (ios_jit_low_contains( a ) || ios_jit_low_rw_contains( a )) return 0;   /* madeira-bcd pool-low */
         if (a >= 0x7000000000ull && a < 0x8000000000ull) return 0;
     }
     return 1;
@@ -10224,6 +10638,31 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                     int i, plausible = 0;
 
                     ERR("  [guest-state] x28=%p rip=%p\n", (void*)state, (void*)cs[0]);
+                    /* madeira-bcd: name the image section the guest RIP is in, and
+                     * Wine's protection of its page. A NoExec trap (FEX's deliberate
+                     * load from 0) inside an image means the emulator does not know
+                     * the range as executable: an executable section here points at
+                     * the emulator, a data section with an executable vprot at a
+                     * protect it was never told about, a data section without one at
+                     * a wrong jump target (GTA V Enhanced's NoExec crash). */
+                    {
+                        extern int ios_image_section_describe( unsigned long long va, char *buf, size_t len,
+                                                               unsigned long long *img_base );
+                        extern unsigned char ios_reclaim_page_vprot( unsigned long long va );
+                        static int rip_sec_n;
+                        char rsec[160];
+                        unsigned long long ib = 0;
+
+                        if (rip_sec_n < 8 && ios_image_section_describe( cs[0], rsec, sizeof(rsec), &ib ))
+                        {
+                            rip_sec_n++;
+                            /* vprot is Wine's view of the address itself: meaningful
+                             * for a PE address, 0 for a pool copy (not Wine-managed). */
+                            ERR("  [guest-rip-sec] rip=%p in image %p: %s, vprot=%#x\n",
+                                (void*)cs[0], (void*)ib, rsec,
+                                (unsigned)ios_reclaim_page_vprot( cs[0] ));
+                        }
+                    }
                     /* ml885: State.rip is only the block ENTRY. Resolve the exact
                      * guest instruction from the block tail, and show its bytes,
                      * so a fault names the x86 instruction rather than the block.
@@ -10239,6 +10678,13 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                             xrip = ios_native_rip_from_hostpc( bb, (uint64_t)(uintptr_t)pc, &why );
                         if (xrip)
                         {
+                            extern unsigned long long ios_jit_module_base_for_va( unsigned long long, unsigned long long * );
+                            unsigned long long sch_size = 0;
+                            uint64_t sch_base = ios_jit_module_base_for_va( xrip, &sch_size );
+                            /* Live SRA RBX/RSP, not potentially stale gregs. The
+                             * dump itself accepts only the exact helper build
+                             * and I/O pump fault range, and reads through Mach. */
+                            if (sch_base) ios_sc_runstate_dump( sch_base, xrip, REGn_sig(27, context), REGn_sig(23, context) );
                             uint8_t xb[16]; mach_vm_size_t g3 = 0;
                             if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)xrip, sizeof(xb),
                                                         (mach_vm_address_t)xb, &g3 ) == KERN_SUCCESS && g3 == sizeof(xb))
@@ -10492,7 +10938,8 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                     uintptr_t fpc = (uintptr_t)PC_sig(context);
                     static int wide_dumps;
 
-                    if (rxb && fpc >= rxb && fpc < rxb + ios_jit_pool_size_global &&
+                    if (((rxb && fpc >= rxb && fpc < rxb + ios_jit_pool_size_global) ||
+                         ios_jit_low_contains( fpc )) &&   /* madeira-bcd pool-low */
                         wide_dumps < 4)
                     {
                         const uint32_t *w = (const uint32_t *)(fpc - 48);
@@ -10927,6 +11374,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
          * corruption -- measured in ml938. Those come through the Mach handler
          * instead, which sets thread state directly. */
         if (!(sg_rx && sg_pc >= sg_rx && sg_pc < sg_rx + sg_sz) &&
+            !ios_jit_low_contains( sg_pc ) &&   /* madeira-bcd pool-low: region C is a pool PC too */
             ios_subfloor_service( context, siginfo->si_addr, "segv", ios_jit_current_peb() ))
         {
             PC_sig(context) = PC_sig(context) + 4;
@@ -11981,6 +12429,81 @@ static int ios_emulate_store_rel( ucontext_t *ctx, uint32_t insn, uintptr_t addr
     return 0;
 }
 
+/***********************************************************************
+ *		ios_native_unaligned_emulate                    (madeira-bcd)
+ *
+ * An alignment fault in the app's OWN code (the Madeira executable's __TEXT:
+ * the unix side, DXMT's native half, the app itself), not in FEX's
+ * translations or a PE image. GTA V Enhanced's Rockstar Games Launcher died
+ * on build 454 twice in a row (logs 2026-10-08 15:41:42 and 15:44:14): a
+ * launcher thread ran `stlr w21, [x19]` (0x889ffe75) at Madeira+0xb5310c on
+ * 0x14dac5b3f, then 0x118c86bcf -- a 4-byte release store that crosses a
+ * 16-byte boundary, which faults even with LSE2. Both delivery paths handed
+ * it to FEX as 80000002 ("[unaligned-atomic] mach-path ... to-fex",
+ * "[unaligned-guest] REFUSED-OTHER"); FEX took the pc for guest code (NoExec
+ * at pc+4), the thread raised c0000005, the Launcher exited and PlayGTAV.exe
+ * showed its "Error" box, so the game never started. FEX's unaligned machinery
+ * only knows its own code; for ours it can only fail.
+ *
+ * Here the access is done byte-wise between two full barriers and the thread
+ * goes on at the next instruction: the release store, the acquire load, the
+ * exclusive pair (the store always succeeds, as in ios_emulate_store_rel) and
+ * the LSE read-modify-write family, none with base-register writeback. A
+ * crossing access cannot be single-copy atomic on ARM anyway; x86, whose
+ * pointers these are, does not promise it either. Returns 1 when emulated.
+ * FEX's translations keep their own path: the pc must lie in the executable's
+ * __TEXT. Safe on the exception-server thread: no wine log macros, and the
+ * __TEXT bounds are read from the loaded Mach-O header once. */
+static int ios_pc_in_app_text( uint64_t pc )
+{
+    if (!__atomic_load_n( &ios_app_text_hi, __ATOMIC_ACQUIRE ))
+    {
+        const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header( 0 );
+        unsigned long size = 0;
+        uint8_t *text = mh ? getsegmentdata( mh, "__TEXT", &size ) : NULL;
+
+        if (!text || !size) return 0;
+        ios_app_text_lo = (uint64_t)(uintptr_t)text;
+        __atomic_store_n( &ios_app_text_hi, (uint64_t)(uintptr_t)text + size, __ATOMIC_RELEASE );
+    }
+    return pc >= ios_app_text_lo && pc < __atomic_load_n( &ios_app_text_hi, __ATOMIC_RELAXED );
+}
+
+/* The load side of the ordered and exclusive accesses: LDAR, LDLAR, LDAXR,
+ * LDXR, LDAPR (RCpc) and LDAPUR (LRCPC2, zero-extending). Rt gets the value
+ * zero-extended, as the instructions do. */
+static int ios_emulate_load_acq( ucontext_t *ctx, uint32_t insn, uintptr_t addr )
+{
+    const int rt = insn & 0x1F;
+    const int nbytes = 1 << ((insn >> 30) & 3);
+    uint64_t v = 0;
+
+    if ((insn & 0x3FFFFC00) == 0x08DFFC00 ||     /* LDAR*  */
+        (insn & 0x3FFFFC00) == 0x08DF7C00 ||     /* LDLAR* */
+        (insn & 0x3FFFFC00) == 0x085FFC00 ||     /* LDAXR* */
+        (insn & 0x3FFFFC00) == 0x085F7C00 ||     /* LDXR*  */
+        (insn & 0x3FFFFC00) == 0x38BFC000 ||     /* LDAPR* */
+        (insn & 0x3FE00C00) == 0x19400000)       /* LDAPUR* */
+    {
+        memcpy( &v, (const void *)addr, nbytes );
+        if (rt != 31) REGn_sig(rt, ctx) = v;
+        return 1;
+    }
+    return 0;
+}
+
+static int ios_native_unaligned_emulate( ucontext_t *ctx, uint32_t insn, uintptr_t addr, uint64_t pc )
+{
+    int done;
+
+    if (!insn || !ios_pc_in_app_text( pc )) return 0;
+    if ((insn & 0x3E000000) == 0x2C000000) return 0;   /* SIMD pairs: writeback forms, not ours */
+    __atomic_thread_fence( __ATOMIC_SEQ_CST );
+    done = ios_emulate_store_rel( ctx, insn, addr ) || ios_emulate_load_acq( ctx, insn, addr );
+    __atomic_thread_fence( __ATOMIC_SEQ_CST );
+    return done;
+}
+
 /*
  * Apply base-register writeback for the pre/post-index forms, in the GUEST
  * (sub-floor) domain -- Rn holds a low address and must keep holding one.
@@ -12576,7 +13099,8 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         {
             uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
             size_t pool_sz = ios_jit_pool_size_global;
-            if (rx && (uintptr_t)pc >= rx && (uintptr_t)pc < rx + pool_sz)
+            if ((rx && (uintptr_t)pc >= rx && (uintptr_t)pc < rx + pool_sz) ||
+                ios_jit_low_contains( (uintptr_t)pc ))   /* madeira-bcd pool-low */
             {
                 extern volatile uint64_t g_wine_return_pc;
                 extern volatile uint64_t g_wine_return_x18;
@@ -12706,7 +13230,9 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         uintptr_t rw = (uintptr_t)ios_jit_rw_base_global;
         size_t pool_sz = ios_jit_pool_size_global;
 
-        if (rx && fault >= rx && fault < rx + pool_sz)
+        /* madeira-bcd pool-low: a store into region C goes through its alias at
+         * the same distance (rw_addr below holds for it unchanged) */
+        if ((rx && fault >= rx && fault < rx + pool_sz) || (rx && rw && ios_jit_low_contains( fault )))
         {
             uintptr_t rw_addr = fault - rx + rw;
             uint32_t insn = *(uint32_t *)(uintptr_t)PC_sig(bus_ctx);
@@ -12799,7 +13325,8 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
          *
          * Order: wine repair first; then a safe readability probe decides
          * honest-AV (unreadable) vs genuine-alignment 80000002 (readable). */
-        if (!is_exec_fault && !(rx && fault >= rx && fault < rx + pool_sz))
+        if (!is_exec_fault && !(rx && fault >= rx && fault < rx + pool_sz) &&
+            !(rx && rw && ios_jit_low_contains( fault )))   /* madeira-bcd pool-low */
         {
             EXCEPTION_RECORD vrec = { EXCEPTION_ACCESS_VIOLATION };
             mach_vm_size_t rd_out = 0;
@@ -12876,7 +13403,8 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 
                     ERR("[bus-rgn] si_code=%d addr=%p pc=%p pc_in_pool=%d readable=%d\n",
                         siginfo->si_code, siginfo->si_addr, pc,
-                        (rx && (uintptr_t)pc >= rx && (uintptr_t)pc < rx + pool_sz) ? 1 : 0,
+                        ((rx && (uintptr_t)pc >= rx && (uintptr_t)pc < rx + pool_sz) ||
+                         ios_jit_low_contains( (uintptr_t)pc )) ? 1 : 0,
                         rd_kr == KERN_SUCCESS);
                     if (mach_vm_region( mach_task_self(), &ba, &bs, VM_REGION_BASIC_INFO_64,
                                         (vm_region_info_t)&bbi, &bbc, &bbo ) == KERN_SUCCESS &&
@@ -13403,6 +13931,22 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                         ERR("[unaligned-guest] emulated insn=0x%08x addr=%p pc=%p "
                             "(emu=%lu simd=%lu other=%lu) rev=ml498\n",
                             a_insn, siginfo->si_addr, pc, ua_emu_n, ua_simd_n, ua_other_n);
+                    PC_sig(bus_ctx) += 4;
+                    ios_fixup_x18_for_return( bus_ctx );
+                    return;
+                }
+                /* madeira-bcd: an ordered/exclusive/LSE access in the app's own
+                 * code -- ios_native_unaligned_emulate (the Launcher's `stlr` of
+                 * build 454, which FEX took for guest code). */
+                if (ios_native_unaligned_emulate( bus_ctx, a_insn, (uintptr_t)siginfo->si_addr,
+                                                  (uint64_t)(uintptr_t)pc ))
+                {
+                    static unsigned long ua_native_sig;
+                    if (++ua_native_sig <= 16 || (ua_native_sig % 4096) == 0)
+                        ERR("[unaligned-native] signal-path pc=%p (app+0x%llx) insn=0x%08x addr=%p "
+                            "emulated in place, not handed to FEX (#%lu)\n", pc,
+                            (unsigned long long)((uint64_t)(uintptr_t)pc - ios_app_text_lo), a_insn,
+                            siginfo->si_addr, ua_native_sig);
                     PC_sig(bus_ctx) += 4;
                     ios_fixup_x18_for_return( bus_ctx );
                     return;

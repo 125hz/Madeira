@@ -32,7 +32,8 @@ harness = r"""
 #include <algorithm>
 #define WARN(...) do {} while (0)
 namespace dxmt {
-namespace env { inline std::string getEnvVar(const char *) { return ""; } }
+// getExeName: dxmt's DXMT_SMALL_RINGS change (staging ring blocks for the programs it names) asks for it.
+namespace env { inline std::string getEnvVar(const char *) { return ""; } inline std::string getExeName() { return ""; } }
 // Every Madeira switch reads as unset: DXMT_RING_OVERSIZE_REUSE off, the
 // upstream block lifetime, so only the settle policy differs between runs.
 inline bool madeiraSwitch(const char *) { return false; }

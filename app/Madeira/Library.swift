@@ -21,9 +21,11 @@ import Metal
 // madeira.cfg turns it off.
 // ============================================================================
 
-/// Thermal state, Low Power Mode and screen capture every 10 s while a session
-/// runs: the three device conditions that explain a slow run in a log.
-/// MADEIRA_DEVICE_STATS=0 turns the line off.
+/// Thermal state, Low Power Mode, screen capture, battery and brightness every
+/// 10 s while a session runs: the device conditions that explain a slow run in
+/// a log (447: the CPU was held at 1.31/1.70 GHz from the start of play with
+/// thermal=nominal; charging and screen recording also draw from the power
+/// budget). MADEIRA_DEVICE_STATS=0 turns the line off.
 enum DeviceLoadDiagnostics {
     private static var lastReport = 0.0
     private static var timer: Timer?
@@ -31,6 +33,7 @@ enum DeviceLoadDiagnostics {
     /// session is a diagnostic, so it is off by default.
     static func start() {
         guard timer == nil, MadeiraConfig.flag("MADEIRA_DEVICE_STATS", fallback: false) else { return }
+        UIDevice.current.isBatteryMonitoringEnabled = true
         let value = Timer(timeInterval: 10, repeats: true) { _ in report() }
         timer = value
         RunLoop.main.add(value, forMode: .common)
@@ -42,7 +45,18 @@ enum DeviceLoadDiagnostics {
         lastReport = now
         let process = ProcessInfo.processInfo
         let thermal = thermalName(process.thermalState)
-        fputs("[device-load] thermal=\(thermal) low-power=\(process.isLowPowerModeEnabled ? 1 : 0) capture=\(UIScreen.main.isCaptured ? 1 : 0)\n", stderr)
+        let device = UIDevice.current
+        if !device.isBatteryMonitoringEnabled { device.isBatteryMonitoringEnabled = true }   // the HUD turns it off when it closes
+        let level = device.batteryLevel < 0 ? "?" : String(Int((device.batteryLevel * 100).rounded()))
+        let battery: String
+        switch device.batteryState {
+        case .charging: battery = "charging"
+        case .full: battery = "full"
+        case .unplugged: battery = "unplugged"
+        default: battery = "unknown"
+        }
+        fputs("[device-load] thermal=\(thermal) low-power=\(process.isLowPowerModeEnabled ? 1 : 0) capture=\(UIScreen.main.isCaptured ? 1 : 0) "
+              + "battery=\(level)% \(battery) brightness=\(String(format: "%.2f", UIScreen.main.brightness))\n", stderr)
     }
     static func thermalName(_ state: ProcessInfo.ThermalState) -> String {
         switch state {
@@ -681,6 +695,20 @@ final class LibraryModel: ObservableObject {
             }
         }
         resetPhoneResolution()
+        applyRecommendations()
+    }
+
+    /// madeira-bcd: games already in the library get Madeira's recommended settings
+    /// when they are due (GameRecommendationsApply.swift); the entries' own fields
+    /// are saved here.
+    private func applyRecommendations() {
+        guard !readOnly else { return }
+        var next = entries
+        var changed = false
+        for i in next.indices {
+            if GameRecommendations.prepare(&next[i]) { changed = true }
+        }
+        if changed { persist(next) }
     }
 
     /// ml1172: every new entry used to get 1408x648, a 19.5:9 phone's shape.
@@ -715,6 +743,10 @@ final class LibraryModel: ObservableObject {
         guard !readOnly else { error = "The library file could not be read. Preserve or repair it before making changes."; return }
         var next = entries
         var entry = entry
+        // madeira-bcd: a game seen for the first time gets Madeira's recommended settings
+        // (GameRecommendationsApply.swift): a finished Steam download, a new or saved entry.
+        let isNew = !next.contains { $0.id == entry.id || (entry.steamAppID != nil && $0.steamAppID == entry.steamAppID) }
+        GameRecommendations.prepare(&entry, new: isNew)
         // A Steam game has one entry: a details page opened before its card first saved
         // one (refreshSteamMetadata) updates that entry.
         if let i = next.firstIndex(where: { $0.id == entry.id }) ??
@@ -2761,7 +2793,8 @@ struct LibraryView: View {
         }
         .sheet(isPresented: $browser) {
             NavigationStack { ExecutableBrowser(folder: LibraryModel.drive) { entry in
-                model.save(entry); browser = false; selected = entry
+                // madeira-bcd: the page shows the entry as stored, with its recommended settings.
+                model.save(entry); browser = false; selected = model.entries.first { $0.id == entry.id } ?? entry
             } }
         }
         .sheet(item: $selected) { entry in
@@ -2893,8 +2926,14 @@ struct LibraryDetail: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var model = LibraryModel.shared
     @State private var importCover = false
+    /// madeira-bcd: this game's own switches as the fork stores them (reloadBCD).
+    @State private var bcd = BCDGameValues()
     @State private var findCover = false
     @State private var remove = false
+    /// madeira-bcd: Madeira's recommended settings for this game, nil for none
+    /// (GameRecommendations.swift), and the question before Reset to Recommended.
+    @State private var recommended: GameRecommendation?
+    @State private var confirmReset = false
     @State private var leaving = false
     @State private var error: String?
     @State private var copiedLink = false
@@ -2903,6 +2942,44 @@ struct LibraryDetail: View {
     /// Settings › Sync engine, read when the details open: the fastsync switches
     /// below only apply while it is Fastsync.
     @State private var syncEngine = SyncEngine.current
+    /// madeira-bcd: one storage for a game's own options -- where the fork keeps
+    /// them and BCDLaunch exports them at every launch (library, Madeira Dock,
+    /// Home Screen shortcuts): AVX, NVIDIA and Wine's C++ runtime in LibraryPrefs,
+    /// the game's config lines in its GameProfiles.swift file. This page's
+    /// controls read and write them; the entry fields upstream keeps for the
+    /// same options (avx, reportNVIDIA, config) are moved into them once.
+    private func reloadBCD() { bcd = BCDGameValues(windowsPath: entry.windowsPath) }
+    private func migrateEntryOptions() {
+        let path = entry.windowsPath
+        let file = GameProfile(windowsPath: path)
+        var moved: [String] = []
+        if entry.avx == true { LibraryPrefs.setAVX(true, for: path); moved.append("avx") }
+        if entry.reportNVIDIA == true { LibraryPrefs.setNvidia(true, for: path); moved.append("nvidia") }
+        if let config = entry.config, !config.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // The entry's lines first, the file's after: a key both set keeps the file's value.
+            let old = file.text
+            file.text = config + (config.hasSuffix("\n") ? "" : "\n") + old
+            moved.append("config")
+        }
+        guard !moved.isEmpty else { return }
+        entry.avx = nil; entry.reportNVIDIA = nil; entry.config = nil
+        model.save(entry)
+        LogStore.shared.log("[bcd] \(entry.title): moved \(moved.joined(separator: ",")) into the game's own settings")
+    }
+    /// madeira-bcd: a game seen for the first time gets Madeira's recommended settings,
+    /// which this page then shows (GameRecommendationsApply.swift).
+    private func prepareRecommendation() {
+        recommended = GameRecommendations.recommendation(for: entry)
+        // A copy the library has not stored (a Steam game's first page) is a new entry.
+        let isNew = !model.entries.contains { $0.id == entry.id }
+        if GameRecommendations.prepare(&entry, new: isNew) { model.save(entry) }
+    }
+    /// Reset to Recommended: the recommendation's config and switches, written at once.
+    private func resetToRecommended() {
+        recommended = GameRecommendations.reset(&entry)
+        model.save(entry)
+        reloadBCD()
+    }
     /// "None", or how many keys this game's own config sets.
     static func configSummary(_ config: String?) -> String {
         let count = MadeiraConfig.parse(config ?? "").count
@@ -2989,7 +3066,7 @@ struct LibraryDetail: View {
         case .controls: return entry.controllerMode == "keys" ? "Keyboard and mouse" : entry.controllerMode == "dinput" ? "XInput and DirectInput" : nil
         case .launch: return entry.usesLaunchOptions ? (entry.runsInDesktop ? "Wine desktop" : "Directly") : nil
         case .steam: return entry.startsSteamGameDirectly ? "The game" : "Madeira Dock"
-        case .advanced: return Self.configSummary(entry.config)
+        case .advanced: return Self.configSummary(bcd.configText)   // madeira-bcd: the game's own config file
         default: return nil
         }
     }
@@ -3130,8 +3207,9 @@ struct LibraryDetail: View {
     @ViewBuilder private var compatibilityPage: some View {
         Section {
             Toggle(isOn: $entry.reducedX87) { compatLabel("Reduced-precision x87", "Faster, less accurate") }
-            // Exported for this game only when chosen (applyEnvironment).
-            Toggle(isOn: Binding(get: { entry.avx ?? false }, set: { entry.avx = $0 ? true : nil })) {
+            // madeira-bcd: AVX, NVIDIA and Wine's C++ runtime are LibraryPrefs, which
+            // BCDLaunch exports at every launch (reloadBCD / migrateEntryOptions).
+            Toggle(isOn: Binding(get: { bcd.avx }, set: { on in bcd.avx = on; LibraryPrefs.setAVX(on, for: entry.windowsPath) })) {
                 compatLabel("AVX and AVX2", "For games that quit with c000001d")
             }
             // Exported for this game only when chosen (applyEnvironment).
@@ -3143,8 +3221,11 @@ struct LibraryDetail: View {
                 Text("Application default").tag(0)
                 ForEach([1, 2, 4, 8], id: \.self) { Text("Up to \($0)×").tag($0) }
             }
-            Toggle(isOn: Binding(get: { entry.reportNVIDIA ?? false }, set: { entry.reportNVIDIA = $0 ? true : nil })) {
+            Toggle(isOn: Binding(get: { bcd.nvidia }, set: { on in bcd.nvidia = on; LibraryPrefs.setNvidia(on, for: entry.windowsPath) })) {
                 compatLabel("Report an NVIDIA GPU", "For \"no graphics card\" errors")
+            }
+            Toggle(isOn: Binding(get: { bcd.wineVCRT }, set: { on in bcd.wineVCRT = on; LibraryPrefs.setWineVCRT(on, for: entry.windowsPath) })) {
+                compatLabel("Wine's C++ runtime", "Instead of the game's msvcp/vcruntime")
             }
             // Fastsync-only switches: shown for every game, usable only while
             // Settings › Sync engine is Fastsync.
@@ -3213,10 +3294,18 @@ struct LibraryDetail: View {
     @ViewBuilder private var advancedPage: some View {
         Section {
             Toggle("Live logs", isOn: $entry.liveLogs)
+            // madeira-bcd: this game's config is its own GameProfiles.swift file
+            // (Application Support/GameConfigs/<hash>.cfg), the file every launch of
+            // the game exports as MADEIRA_CFG_GAME. Lines an entry saved in upstream's
+            // `config` field are moved into it when the page opens (migrateEntryOptions).
             NavigationLink {
-                LibraryGameConfigEditor(text: Binding(get: { entry.config ?? "" }, set: { entry.config = $0.isEmpty ? nil : $0 }))
+                LibraryGameConfigEditor(text: Binding(get: { bcd.configText }, set: { text in
+                    bcd.configText = text
+                    GameProfile(windowsPath: entry.windowsPath).text = text
+                }))
+                .onDisappear { reloadBCD() }
             } label: {
-                LabeledContent("This game's config", value: Self.configSummary(entry.config))
+                LabeledContent("This game's config", value: Self.configSummary(bcd.configText))
             }
         } header: { Text("Advanced") } footer: {
             Text("Per-game madeira.cfg lines; they override the global file.")
@@ -3288,6 +3377,16 @@ struct LibraryDetail: View {
                         }
                     }
                 }
+                // madeira-bcd: always last, for every entry, the Desktop too (GameRecommendationsApply.swift).
+                Section {
+                    Button("Reset to Recommended", systemImage: "arrow.counterclockwise") { confirmReset = true }
+                        .confirmationDialog(GameRecommendations.question(recommended, desktop: entry.desktop == true),
+                                            isPresented: $confirmReset, titleVisibility: .visible) {
+                            Button("Reset", role: .destructive) { resetToRecommended() }
+                        }
+                } footer: {
+                    Text(GameRecommendations.note(recommended, desktop: entry.desktop == true))
+                }
             }
             .navigationTitle("Game details").navigationBarTitleDisplayMode(.inline)
             .navigationDestination(for: Page.self) { item in page(item) }
@@ -3299,7 +3398,13 @@ struct LibraryDetail: View {
             }
             // Play's checks read the installed games and Dock's client state, which the
             // Steam page refreshed when it was on this page.
-            .onAppear { if entry.steamAppID != nil { MadeiraDockModel.shared.refresh(); SteamGamesModel.shared.refresh() } }
+            .onAppear {
+                if entry.steamAppID != nil { MadeiraDockModel.shared.refresh(); SteamGamesModel.shared.refresh() }
+                // the game's own switches and config file, and its recommended settings.
+                migrateEntryOptions()
+                prepareRecommendation()
+                reloadBCD()
+            }
         }
         .sheet(isPresented: $findCover) { SteamSearchView(query: entry.title) { match in entry.steamID = match.id; entry.title = match.name; entry.coverFile = nil } }
         .fileImporter(isPresented: $importCover, allowedContentTypes: [.image]) { result in
@@ -3321,7 +3426,7 @@ struct LibraryDetail: View {
         }
         .onDisappear { if !leaving { model.save(entry) } }
         .onReceive(LibraryController.shared.commands) { command in
-            guard !leaving, !findCover, !importCover, !remove else { return }
+            guard !leaving, !findCover, !importCover, !remove, !confirmReset else { return }
             if command == "back" {
                 if path.isEmpty { model.save(entry); dismiss() } else { path.removeLast() }
             }
@@ -3330,9 +3435,24 @@ struct LibraryDetail: View {
     }
 }
 
+/// madeira-bcd: a game's own options as the fork stores them (LibraryDetail):
+/// LibraryPrefs' switches and the GameProfiles.swift file's lines.
+struct BCDGameValues {
+    var avx = false, nvidia = false, wineVCRT = false
+    var configText = ""
+    init() {}
+    init(windowsPath: String) {
+        avx = LibraryPrefs.avx(windowsPath)
+        nvidia = LibraryPrefs.nvidia(windowsPath)
+        wineVCRT = LibraryPrefs.wineVCRT(windowsPath)
+        configText = GameProfile(windowsPath: windowsPath).text
+    }
+}
+
 /// Game details › This game's config: the game's own lines in madeira.cfg's
-/// syntax, saved with the entry and applied at its next start
-/// (LibraryEntry.config, MadeiraConfig.applyGame).
+/// syntax, applied at its next start. madeira-bcd: LibraryDetail binds it to the
+/// game's GameProfiles.swift file (Application Support/GameConfigs), which every
+/// launch exports as MADEIRA_CFG_GAME (BCDLaunch, MadeiraConfig.applyGame).
 struct LibraryGameConfigEditor: View {
     @Binding var text: String
     var body: some View {
@@ -4468,7 +4588,8 @@ struct LibraryHUD: View {
             let hostDue = DockInstallers.finishedAt ?? model.launchStartedAt
             return DockStartStatus.text(MadeiraDock.pollReport().fields, installers: DockInstallers.script != nil,
                                         installerProgress: progress, installsFinished: DockInstallers.finishedAt != nil,
-                                        waited: Date().timeIntervalSince(hostDue))
+                                        waited: Date().timeIntervalSince(hostDue),
+                                        restartHint: DockInstallers.installsOnly ? DockInstallers.closingWords : nil)
         }
     }
 

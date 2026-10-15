@@ -13,6 +13,13 @@
  * the NET_RT_IFLIST sysctl it uses are all available; the routing-message
  * declarations come from shims/net/route.h. */
 #include "config.h"
+/* madeira-bcd: CI configures Wine against the iPhoneOS SDK, which has no
+ * <net/route.h>, so its config.h leaves HAVE_NET_ROUTE_H undefined and the
+ * routing declarations below were never included (RTM_IFINFO, RTA_IFP,
+ * RTF_LLINFO undeclared, build 254). shims/net/route.h provides them. */
+#ifndef HAVE_NET_ROUTE_H
+#define HAVE_NET_ROUTE_H 1
+#endif
 #undef HAVE_NET_IF_ARP_H
 #undef HAVE_NETINET_IF_ETHER_H
 #undef HAVE_NETINET_IP_VAR_H
