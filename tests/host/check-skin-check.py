@@ -247,7 +247,7 @@ static void d3d12_log(const char *fmt, ...) {
 typedef int64_t LONG64;
 static LONG64 InterlockedExchangeAdd64(volatile LONG64 *p, LONG64 v) { LONG64 o = *p; *p += v; return o; }
 static LONG InterlockedExchange(volatile LONG *p, LONG v) { LONG o = *p; *p = v; return o; }
-struct mad_tvs { LONG64 seen; };
+struct mad_tvs { LONG64 seen; UINT32 k; int dropped; };
 struct mad_tview { UINT fmt; UINT64 off, num; UINT8 uav, eoff; obj_handle_t tex; UINT64 id, sh_gpu; struct mad_tvs *sh; };
 struct mad_resource { obj_handle_t buffer; void *cpu; UINT64 size, gpu_address; struct mad_tview *tview; unsigned ntview, tview_cap; int heap; };
 typedef struct mad_resource ID3D12Resource;
@@ -322,6 +322,8 @@ static obj_handle_t mad_tvs_view(struct mad_device *d, struct mad_resource *r, s
     *rec = &tvs_rec[tvs_made++ & 7]; (*rec)->seen = g_presents_now;
     return (obj_handle_t)(uintptr_t)ti->gpu_resource_id;
 }
+static void mad_tvs_touch(struct mad_tvs *t) { t->seen = g_presents_now; }
+static void mad_tvs_drop(struct mad_tvs *t) { t->dropped = 1; }
 ''' + body('static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, DXGI_FORMAT fmt,') + r'''
 static int bad;
 #define EXPECT(c, what) do { if (!(c)) { printf("FAIL %s\n", what); bad = 1; } else printf("ok   %s\n", what); } while (0)
@@ -429,7 +431,8 @@ int main(void) {
             tvs_on = 1;
             why = -1; EXPECT(mad_typed_buffer_view(&d, &up, 42, 6, 4, 0, &e, &why) == 1 && ((e.metadata >> 32) & 0xff) == 0 &&
                              e.gpu_va == 0x70000000ull && tvs_made == 1 && up.tview[up.ntview - 1].sh_gpu == 0x70000000ull &&
-                             g_tv_eoff_views == eoff0 + 1, "487: on: an R32 view of UPLOAD memory off 16 bytes reads its aligned copy, no offset");
+                             g_tv_eoff_views == eoff0 + 1 && tvs_rec[0].k == up.ntview,
+                             "487: on: an R32 view of UPLOAD memory off 16 bytes reads its aligned copy, no offset; the copy knows its view");
             g_presents_now = 40;
             why = -1; EXPECT(mad_typed_buffer_view(&d, &up, 42, 6, 4, 0, &e, &why) == 1 && e.gpu_va == 0x70000000ull && tvs_made == 1 &&
                              tvs_rec[0].seen == 40, "487: the cached view keeps pointing at its copy, which is marked as in use");
