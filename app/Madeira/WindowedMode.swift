@@ -31,29 +31,6 @@ enum WindowedMode {
         let keep = getenv("MADEIRA_WINDOWED_TOUCH")   // 0: windowed mode keeps the Settings pointer mode (trackpad) instead of tap-where-you-touch
         return !(keep.map { $0.pointee == 48 && $0.advanced(by: 1).pointee == 0 } ?? false)
     }
-
-    /// Round 7: the library HUD's round menu button is hidden (a frame is
-    /// maximized; its restore pill has a menu button). SwiftUI views observe
-    /// WindowedHUD.shared.
-    @MainActor static var hidesHUDMenuButton: Bool { WindowedHUD.shared.hidesMenuButton }
-}
-
-/// Round 7: windowed-mode state the library HUD (Library.swift LibraryHUD)
-/// observes. Main thread.
-@MainActor
-final class WindowedHUD: ObservableObject {
-    static let shared = WindowedHUD()
-    /// A maximized frame shows the restore pill, which has its own menu button,
-    /// so the HUD's round menu button would be a second one.
-    @Published private(set) var hidesMenuButton = false
-
-    func update(maximized: Bool) {
-        let keep = MadeiraConfig.flag("MADEIRA_WINDOWED_HUD_MENU", fallback: false)   // 1: the library's round menu button stays while a windowed-mode frame is maximized (round 7 hides it; the restore pill has a menu button)
-        let hide = maximized && !keep
-        guard hide != hidesMenuButton else { return }
-        hidesMenuButton = hide
-        fputs("[windowed] ml1300 hud menu button \(hide ? "hidden (a frame is maximized; the restore pill has the menu)" : "shown")\n", stderr)
-    }
 }
 
 /// Found by name (NSClassFromString) from WiniosWindowed.m's taskbar, so the
@@ -81,30 +58,9 @@ final class MadeiraWindowedBridge: NSObject {
         }
     }
 
-    /// Round 7: env.MADEIRA_WINDOWED_STEAM as set (madeira.cfg first, then the
-    /// environment the session exported), nil when unset.
-    private static var steamSetting: String? {
-        if MadeiraConfig.present { return MadeiraConfig.get("env.MADEIRA_WINDOWED_STEAM") }   // unset: the taskbar shows a Steam tile only while a Steam window is open (round 7); 1: the round 4 tile, always pinned left of the program buttons; 0: no Steam tile and no Steam row in the search
-        return getenv("MADEIRA_WINDOWED_STEAM").map { String(cString: $0) }
-    }
-
-    /// Steam on the taskbar and in its search at all (env.MADEIRA_WINDOWED_STEAM = 0: neither).
+    /// Round 4: the taskbar's pinned Steam button (left of the program buttons).
     @objc static func steamButtonEnabled() -> Bool {
-        steamSetting?.trimmingCharacters(in: .whitespaces) != "0"
-    }
-
-    /// Round 7: env.MADEIRA_WINDOWED_STEAM = 1 keeps the round 4 tile pinned
-    /// left of the program buttons; unset, the tile is there only while a Steam
-    /// window is open (WiniosWindowed.m).
-    @objc static func steamTilePinned() -> Bool {
-        steamSetting?.trimmingCharacters(in: .whitespaces) == "1"
-    }
-
-    /// Round 7: a frame was maximized or brought back (WiniosWindowed.m, main
-    /// thread). The library's round menu button hides while one is maximized:
-    /// the restore pill has its own menu button.
-    @MainActor @objc static func maximizedChanged(_ on: Bool) {
-        WindowedHUD.shared.update(maximized: on)
+        MadeiraConfig.flag("MADEIRA_WINDOWED_STEAM", fallback: true)   // 0: no pinned Steam button on the windowed-mode taskbar (round 4)
     }
 
     /// The Steam button when no Steam window is open in the session (one that
