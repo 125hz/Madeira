@@ -47,6 +47,8 @@ typedef int kern_return_t;
 typedef uintptr_t vm_address_t;
 typedef size_t vm_size_t;
 #define KERN_SUCCESS 0
+#define ROUND_SIZE(addr,size,mask) (((size_t)(size) + ((uintptr_t)(addr) & (mask)) + (mask)) & ~(mask))   /* this fork: claims round the image to host pages */
+static size_t host_page_mask = 0x3fff;
 static unsigned mach_task_self(void) { return 1; }
 static int dealloc_n; static vm_address_t dealloc_addr; static vm_size_t dealloc_size;
 static kern_return_t vm_deallocate(unsigned task, vm_address_t a, vm_size_t s)

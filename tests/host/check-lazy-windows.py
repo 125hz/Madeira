@@ -55,6 +55,7 @@ harness = r"""
 #include <time.h>
 #include <sys/mman.h>
 typedef int BOOL;   /* this fork: ios_wow_force_exec_set_current */
+unsigned long long ios_layerkit_lo, ios_layerkit_hi;   /* this fork: the measured CoreAnimation span */
 typedef uintptr_t ULONG_PTR; typedef unsigned int ULONG; typedef int NTSTATUS; typedef struct { int x; } PEB;
 #define STATUS_SUCCESS 0
 #define STATUS_NO_MEMORY ((NTSTATUS)0xc0000017)
