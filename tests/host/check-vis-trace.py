@@ -187,8 +187,10 @@ static volatile LONG64 g_presents_now;
 static volatile LONG g_tv_eoff_views, g_sd_strict_waits;
 ''' + block(pe, '#define MAD_TVS_CHUNK', 'static int mad_tv_mode(void) {') + \
     '\n'.join(body(f) for f in (
+        'static int mad_tvs_x3_sync(unsigned char *dst, const unsigned char *src, UINT32 n, int all) {',
         'static struct mad_tvs *mad_tvs_victim(struct mad_device *d, UINT32 need) {',
         'static void mad_tvs_touch_locked(struct mad_tvs *t, LONG64 now) {',
+        'static obj_handle_t mad_tvs_view_x(struct mad_device *d, struct mad_resource *r, struct WMTTextureInfo *ti,',
         'static obj_handle_t mad_tvs_view(struct mad_device *d, struct mad_resource *r, struct WMTTextureInfo *ti,',
         'static void mad_tvs_touch(struct mad_tvs *t) {', 'static void mad_tvs_drop(struct mad_tvs *t) {',
         'static int mad_tvs_cmp(struct mad_tvs *t, LONG *n) {', 'static void mad_tvs_refresh(void) {',
@@ -326,9 +328,28 @@ int main(void) {
         EXPECT(!b->r && !b->len, "a copy no view will name is dropped");
         up.tview = NULL; up.ntview = 0;
     }
+    {   /* typed-view-rgb32 (build 529): 12-byte elements copied at 16 */
+        static float f3[4][3] = { { 1, 2, 3 }, { 4, 5, 6 }, { 7, 8, 9 }, { 10, 11, 12 } };
+        UINT64 g6 = 0; struct mad_tvs *r6 = NULL; float *o; LONG c0;
+        memcpy(upmem + 8192, f3, sizeof f3);
+        ti.width = 77; ti.gpu_resource_id = 0;
+        EXPECT(mad_tvs_view_x(&d, &up, &ti, 8192, 4, 12, 16, &g6, &r6) != 0 && r6 && r6->x3 && r6->len == 48 && r6->cap == 64 &&
+               ti.width == 4 && (g6 & 15) == 0, "rgb32: four float3 elements, a 64-byte copy, the texture 4 wide");
+        o = (float *)r6->dst;
+        EXPECT(o[0] == 1 && o[1] == 2 && o[2] == 3 && o[3] == 0 && o[4] == 4 && o[12] == 10 && o[14] == 12 && o[15] == 0,
+               "rgb32: x, y, z at 16-byte steps, the fourth word 0");
+        ((float *)(upmem + 8192))[7] = 99;   /* element 2, y */
+        c0 = g_tvs_copies; mad_tvs_refresh();
+        EXPECT(g_tvs_copies == c0 + 1 && o[9] == 99 && o[11] == 0, "rgb32: a rewritten element reaches the copy at its 16-byte slot");
+        c0 = g_tvs_copies; mad_tvs_refresh();
+        EXPECT(g_tvs_copies == c0, "rgb32: unchanged, nothing rewritten");
+        ti.width = 9;
+        EXPECT(mad_tvs_view_x(&d, &up, &ti, 8192, 4, 12, 8, &g6, &r6) == 0, "a copy narrower than its source is refused");
+    }
     g_tv_eoff_views = 5; loglen = 0; logbuf[0] = 0; mad_tvs_report();
     EXPECT(strstr(logbuf, "[typed-view] views that start off a 16-byte boundary: 5 kept their element offset, ") != NULL &&
-           strstr(logbuf, "given to a new view") != NULL && strstr(logbuf, " of them outside the recent window (found by the per-present pass)") != NULL, "the periodic line");
+           strstr(logbuf, "given to a new view") != NULL && strstr(logbuf, " of them outside the recent window (found by the per-present pass)") != NULL &&
+           strstr(logbuf, "typed-view-rgb32 0: 0 R32G32B32 views read a 16-byte-element copy") != NULL, "the periodic line");
     g_tv_eoff_views = 0;
 
     /* vis-trace and readback-far */

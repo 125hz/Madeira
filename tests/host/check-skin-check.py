@@ -324,6 +324,18 @@ static obj_handle_t mad_tvs_view(struct mad_device *d, struct mad_resource *r, s
 }
 static void mad_tvs_touch(struct mad_tvs *t) { t->seen = g_presents_now; }
 static void mad_tvs_drop(struct mad_tvs *t) { t->dropped = 1; }
+/* typed-view-rgb32 */
+static int tv_rgb32; static volatile LONG g_tv_rgb32_views, g_tv_rgb32_other; static UINT last_x_bytes, last_x_dbytes;
+static int mad_tv_rgb32_format(DXGI_FORMAT f, enum WMTPixelFormat *pf) {
+    if (f != 6 || !tv_rgb32) return 0;
+    *pf = WMTPixelFormatRGBA32Float; return 1;
+}
+static obj_handle_t mad_tvs_view_x(struct mad_device *d, struct mad_resource *r, struct WMTTextureInfo *ti,
+                                   UINT64 byte_off, UINT64 num, UINT bytes, UINT dbytes, UINT64 *gpu, struct mad_tvs **rec) {
+    last_x_bytes = bytes; last_x_dbytes = dbytes;
+    if (ti->pixel_format != WMTPixelFormatRGBA32Float) return 0;
+    return mad_tvs_view(d, r, ti, byte_off, num, bytes, gpu, rec);
+}
 ''' + body('static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, DXGI_FORMAT fmt,') + r'''
 static int bad;
 #define EXPECT(c, what) do { if (!(c)) { printf("FAIL %s\n", what); bad = 1; } else printf("ok   %s\n", what); } while (0)
@@ -418,6 +430,25 @@ int main(void) {
                          g_tv_fallback == 2 && strstr(logbuf, "at a 4-byte boundary (offset 36); made at 16") != NULL && g_tv_eoff_views == 5,
                          "Metal refuses the exact start: made at 16, one element in, and counted");
         refuse_unaligned16 = 0; tv_mode = 64; tv_align = 64;
+        {   /* typed-view-rgb32 (build 529): R32G32B32 SRVs of UPLOAD memory read a 16-byte-element copy */
+            static unsigned char upm[4096];
+            struct mad_resource up3 = { (obj_handle_t)3, upm, sizeof upm, 0x300000000ull, NULL, 0, 0, D3D12_HEAP_TYPE_UPLOAD };
+            struct mad_resource gpu3 = { (obj_handle_t)4, NULL, sizeof upm, 0x400000000ull, NULL, 0, 0, 0 };
+            why = 0; EXPECT(mad_typed_buffer_view(&d, &up3, 6, 0, 16, 0, &e, &why) == 0 && why == 2 && g_tv_rgb32_views == 0,
+                            "typed-view-rgb32 off: R32G32B32 still has no format (reason 2)");
+            tv_rgb32 = 1;
+            why = -1; EXPECT(mad_typed_buffer_view(&d, &up3, 6, 3, 16, 0, &e, &why) == 1 && why == -1 && last_x_bytes == 12 &&
+                             last_x_dbytes == 16 && (e.metadata & 0xffffffffull) == 16 * 16 && ((e.metadata >> 32) & 0xff) == 0 &&
+                             e.gpu_va >= 0x70000000ull && e.gpu_va < 0x80000000ull && g_tv_rgb32_views == 1,
+                             "on: a float3 SRV of UPLOAD memory reads the 16-byte-element copy (16 elements, no element offset)");
+            why = -1; EXPECT(mad_typed_buffer_view(&d, &up3, 6, 3, 16, 0, &e, &why) == 1 && g_tv_rgb32_views == 1 && up3.ntview == 1,
+                             "the same view again: the cached one");
+            why = 0; EXPECT(mad_typed_buffer_view(&d, &up3, 6, 0, 16, 1, &e, &why) == 0 && why == 2 && g_tv_rgb32_other == 1,
+                            "a float3 UAV: falls back (reason 2), counted");
+            why = 0; EXPECT(mad_typed_buffer_view(&d, &gpu3, 6, 0, 16, 0, &e, &why) == 0 && why == 2 && g_tv_rgb32_other == 2,
+                            "GPU-written memory: falls back (reason 2), counted");
+            tv_rgb32 = 0; tvs_made = 0; memset(tvs_rec, 0, sizeof tvs_rec);   /* the 487 cases count copies from 0 */
+        }
         EXPECT(probes == 3, "the probe hook runs for every view made while the switch is 4 (it probes once itself)");
         {   /* 487: typed-view-shadow */
             static unsigned char upmem[4096];
