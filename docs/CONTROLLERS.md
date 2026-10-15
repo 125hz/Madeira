@@ -350,7 +350,7 @@ user sees are opt-in (only `1` enables); the others are on unless set to `0`:
 | `MADEIRA_HIDPAD_XINPUT` | **off** | `1`: in HID mode, player 1 stays an XInput pad as well |
 | `MADEIRA_PAD_OUTPUT` | on | `0`: no rumble/trigger/lightbar output to the pad; `hid` / `xinput`: only that half |
 | `MADEIRA_XINPUT_BATTERY` | on | `0`: XInput reports an unknown battery and no wireless flag (ml2170) |
-| `MADEIRA_XINPUT_WGI` | on | `0`: Windows.Gaming.Input lists no controllers (ml2171) |
+| `MADEIRA_WGI_HOST_PADS` | on | `0`: Windows.Gaming.Input lists no controllers (ml2171) |
 | `MADEIRA_XINPUT_ENABLE_FOREGROUND` | on | `0`: a game's XInputEnable(FALSE) zeroes the pad even while its window is in front (ml2115) |
 | `MADEIRA_XINPUT_SLOT0_RECONNECT` | on | `0`: a reconnected player 1 stays in the slot it landed in (ml2172) |
 | `MADEIRA_CLICK_FOCUS` | on | `0`: a tap or click on an already active window leaves its keyboard focus as it is (ml2181, "Keyboard focus" below) |
@@ -394,7 +394,7 @@ slot (so a game's XInputEnable does not affect it) and rescanned once a second
 for pads that come and go. Gamepad.Vibration's two motors go to the slot's
 rumble; the trigger motors have no path on iOS and are dropped. Logged as
 `[wgi] ml2171 host pad N listed as a Gamepad` / `removed` (16 lines per
-process, only in games that use the API). `env.MADEIRA_XINPUT_WGI = 0` turns it
+process, only in games that use the API). `env.MADEIRA_WGI_HOST_PADS = 0` turns it
 off.
 
 A stale XInputEnable(FALSE) (ml2115): many games call XInputEnable(FALSE) when
@@ -475,6 +475,31 @@ both APIs tells an XInput pad apart from a DirectInput one by its PnP id
 (the `IG_` marker it looks up through WMI's `Win32_PnPEntity`); the host
 DirectInput joystick has no such entry, so such a game treats it as a generic
 joystick. Choose **XInput** (not "XInput and DirectInput") for such a game.
+A game that reads no XInput is not covered by that rule, and Windows sends raw
+keyboard and mouse input only to the process in front. Horizon Zero Dawn
+(madeira-bcd build 471) showed its window with `SWP_NOACTIVATE` only, reads its
+pad through Windows.Gaming.Input, and nothing was in front at all
+(`GetForegroundWindow()` NULL), so it ignored every key and tap. With
+`env.MADEIRA_INPUT_FOREGROUND = 1` (opt-in), while no window at all is in
+front, a process that polls its messages or receives an injected key or mouse
+event makes its largest visible top-level window (at least 320x200) foreground,
+at most every 250 ms; never while another window is in front. `[fg-none]` logs
+the first activations.
+
+## Windows.Gaming.Input
+
+Wine's windows.gaming.input lists HID devices only, and counts one as a Gamepad
+only when it is an XInput-compatible (winexinput) device, so on iOS a game
+that reads its controller only through `Windows.Gaming.Input.Gamepad` sees
+none: in XInput mode there is no HID device, in HID mode player 1 is a
+DualSense, a raw game controller. With `env.MADEIRA_WGI_HOST_PADS = 1`
+(opt-in), windows.gaming.input.dll (the matching willfaust/wine change;
+`build/wine-pe/build-modules.sh windows.gaming.input` rebuilds it) also lists each connected XInput slot (through `XInputGetState`, i.e. the pads
+described above) as a Gamepad, an Xbox 360 pad to the game; rumble goes back
+through `XInputSetState`. The slots are polled twice a second for arrivals and
+removals; the first poll runs before the game gets its first gamepad list.
+A game reading both APIs could list a pad twice, so it is per game.
+`[wgi-host]` lines log the switch and each slot change.
 
 ## Integration prerequisite
 

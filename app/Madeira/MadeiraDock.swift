@@ -93,6 +93,19 @@ enum MadeiraDock {
                         installed: flags & 4 != 0, customExecutables: !(state["CheckGuid"]?.fields.isEmpty ?? true))
     }
 
+    /// A record's depots: the ones it lends from each owner app (`SharedDepots`, depot -> owner)
+    /// and the ones installed for the app itself (`InstalledDepots`).
+    static func depots(manifest data: Data) -> (lent: [Int: Set<String>], installed: Set<String>) {
+        guard data.count <= 1 << 20, var parser = try? SteamKeyValues(data), let root = try? parser.read(),
+              let state = root["AppState"], let appID = state["appid"]?.string.flatMap({ Int($0) }) else { return ([:], []) }
+        var lent: [Int: Set<String>] = [:]
+        for (depot, owner) in (state["SharedDepots"]?.fields ?? [:]).prefix(64) {
+            guard let ownerID = owner.string.flatMap({ Int($0) }), validAppID(ownerID), ownerID != appID else { continue }
+            lent[ownerID, default: []].insert(depot)
+        }
+        return (lent, Set((state["InstalledDepots"]?.fields ?? [:]).keys.prefix(256)))
+    }
+
     /// Installed games in the client's own library (`<client>/steamapps`) and the other
     /// libraries on C: that its `libraryfolders.vdf` lists. Read-only.
     static func games(drive: URL) -> [DockGame] {
@@ -108,17 +121,26 @@ enum MadeiraDock {
             }
         }
         var result: [DockGame] = []
+        // Apps that only lend depots to another install ("Shared Only", e.g. GTA V
+        // Enhanced's RGL/SC 1899670) have a record but nothing to start. A game that
+        // lends depots but has its own installed too (a base game whose depots its
+        // expansions share) stays: the same test as the uninstall (SteamInstall.swift).
+        var lent: [Int: Set<String>] = [:], installed: [Int: Set<String>] = [:]
         for library in libraries.prefix(16) {
             let folder = drive.appendingPathComponent(library, isDirectory: true)
             guard folder.resolvingSymlinksInPath().path.hasPrefix(drive.resolvingSymlinksInPath().path + "/"),
                   let names = try? fm.contentsOfDirectory(atPath: folder.path) else { continue }
             for file in names.sorted().prefix(2000) where file.hasPrefix("appmanifest_") && file.hasSuffix(".acf") {
-                guard let data = try? Data(contentsOf: folder.appendingPathComponent(file)),
-                      let game = game(manifest: data, library: library),
+                guard let data = try? Data(contentsOf: folder.appendingPathComponent(file)) else { continue }
+                let held = depots(manifest: data)
+                lent.merge(held.lent) { $0.union($1) }
+                guard let game = game(manifest: data, library: library),
                       !result.contains(where: { $0.id == game.id }) else { continue }
+                installed[game.id] = held.installed
                 result.append(game)
             }
         }
+        result.removeAll { game in lent[game.id].map { installed[game.id, default: []].isSubset(of: $0) } ?? false }
         return result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
@@ -306,6 +328,7 @@ enum MadeiraDock {
         "ceg-request", "ceg-request-result", "ceg-request-busy", "ceg-server-result", "ceg-job-result",
         "ceg-finished-jobs", "ceg-result", "ceg-disabled", "ceg-unsupported-client",
         "ceg-scm", "ceg-scm-started", "ceg-scm-error", "ceg-service-registered", "ceg-service-install", "ceg-service-stop", "ceg-scm-stopped",
+        "game-scm", "game-scm-timeout", "launch-keep-alive",
         "shutdown-begin", "shutdown-complete", "probe-result"]
     /// The host's report rounds (madeira-dock src/main.c).
     static let reportRounds: Set<String> = ["ml1820", "ml1830", "ml1860", "ml1870", "ml1970", "ml1990", "ml2000", "ml2011", "ml2015", "ml2016"]
@@ -499,8 +522,11 @@ enum MadeiraDock {
     /// installs in the same session, then the host. No token is quoted: MADEIRA_ARGS is
     /// split at spaces and passed on as is, so quote characters would reach Wine
     /// literally, and none of these paths contains a space.
-    static func launchArguments(width: Int, height: Int, installers: String? = nil) -> String {
+    /// madeira-bcd: `host` false runs only the installers; the session ends after them
+    /// (DockInstallers.installsOnly).
+    static func launchArguments(width: Int, height: Int, installers: String? = nil, host: Bool = true) -> String {
         guard let installers else { return "/desktop=madeira,\(width)x\(height) \(executable)" }
+        guard host else { return "/desktop=madeira,\(width)x\(height) C:\\windows\\system32\\cmd.exe /c call \(installers)" }
         return "/desktop=madeira,\(width)x\(height) C:\\windows\\system32\\cmd.exe /c call \(installers) & \(executable)"
     }
 

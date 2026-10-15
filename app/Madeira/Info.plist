@@ -42,6 +42,8 @@
 	<true/>
 	<key>GCSupportsControllerUserInteraction</key>
 	<false/>
+	<key>LSSupportsGameMode</key>
+	<true/>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.games</string>
 	<key>LSApplicationQueriesSchemes</key>

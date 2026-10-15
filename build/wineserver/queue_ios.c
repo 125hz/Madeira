@@ -618,11 +618,30 @@ static void get_message_defaults( struct msg_queue *queue, int *x, int *y, unsig
     *time = get_tick_count();
 }
 
+/* madeira-bcd: a ClipCursor that changes nothing (same rectangle, same flags,
+ * no reset) still queued a WM_WINE_CLIPCURSOR for the foreground thread, which
+ * fetches it with its own get_message round trip and hands it to a driver whose
+ * ClipCursor is the null one on iOS. GTA V Enhanced sent up to 2,400
+ * set_cursor requests a second from its own thread (build 437); such a repeat
+ * now updates nothing and notifies no one. MADEIRA_CLIP_NOTIFY_ALWAYS=1
+ * restores the notification for every call. */
+unsigned long ios_clip_repeats_skipped;
+static int ios_clip_dedupe(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *e = getenv( "MADEIRA_CLIP_NOTIFY_ALWAYS" );  /* 1: notify the foreground thread on every ClipCursor, as before */
+        cached = !(e && e[0] == '1' && !e[1]);
+    }
+    return cached;
+}
+
 /* set the cursor clip rectangle */
 void set_clip_rectangle( struct desktop *desktop, const struct rectangle *rect, unsigned int flags, int reset )
 {
     desktop_shm_t *desktop_shm = desktop->shared;
-    struct rectangle top_rect, new_rect;
+    struct rectangle top_rect, new_rect, old_rect = desktop_shm->cursor.clip;
     unsigned int old_flags;
     int x, y;
 
@@ -654,6 +673,15 @@ void set_clip_rectangle( struct desktop *desktop, const struct rectangle *rect, 
 
     /* request clip cursor rectangle reset to the desktop thread */
     if (reset) post_desktop_message( desktop, WM_WINE_CLIPCURSOR, flags, FALSE );
+
+    /* madeira-bcd: nothing changed, nothing to tell (see ios_clip_dedupe) */
+    if (!reset && flags == old_flags && ios_clip_dedupe() &&
+        new_rect.left == old_rect.left && new_rect.top == old_rect.top &&
+        new_rect.right == old_rect.right && new_rect.bottom == old_rect.bottom)
+    {
+        ios_clip_repeats_skipped++;
+        return;
+    }
 
     /* notify foreground thread of reset, clipped, or released cursor rect */
     if (reset || flags != SET_CURSOR_NOCLIP || old_flags != SET_CURSOR_NOCLIP)
@@ -1630,6 +1658,31 @@ static struct timer *find_expired_timer( struct msg_queue *queue, user_handle_t 
         }
     }
     return NULL;
+}
+
+/* madeira-bcd: WM_TIMER not starved by WM_PAINT. Whether the queue's oldest
+ * expired timer has waited longer than 100 ms. Paint goes before timer, so a
+ * window that invalidates itself while it paints keeps WM_PAINT pending and its
+ * thread's timers never ran: the Rockstar Games Launcher installer's install page
+ * repainted its status line 219 times a second (wake bits QS_PAINT|QS_TIMER), and
+ * its status text and finish page run on a timer, so it stayed at "Preparing to
+ * Install..." after its work was done (logs 2026-10-03 17:14, 2026-10-12 10:00).
+ * MADEIRA_TIMER_FAIRNESS=0: never (Windows' strict order). */
+static int madeira_timer_starved( struct msg_queue *queue )
+{
+    static int enabled = -1;
+    struct list *ptr;
+    struct timer *timer;
+
+    if (enabled < 0)
+    {
+        const char *env = getenv( "MADEIRA_TIMER_FAIRNESS" );  /* 0: a pending WM_PAINT always goes before timers */
+        enabled = !(env && env[0] == '0');
+    }
+    if (!enabled || !(ptr = list_head( &queue->expired_timers ))) return 0;
+    timer = LIST_ENTRY( ptr, struct timer, entry );
+    if (timer->when > 0) return 0;  /* not a monotonic expiry */
+    return monotonic_time + timer->when > (timeout_t)100 * 10000;
 }
 
 /* add a timer */
@@ -3378,6 +3431,27 @@ DECL_HANDLER(get_message)
         filter_contains_hw_range( req->get_first, req->get_last ) &&
         get_hardware_message( current, req->hw_id, get_win, req->get_first, req->get_last, req->flags, reply ))
         return;
+
+    /* madeira-bcd: an expired timer that has waited 100 ms goes before a WM_PAINT
+     * that is always pending (madeira_timer_starved); otherwise Windows' order. */
+    if ((filter & QS_TIMER) && (filter & QS_PAINT) && queue->paint_count &&
+        madeira_timer_starved( queue ) &&
+        (timer = find_expired_timer( queue, get_win, req->get_first,
+                                     req->get_last, (req->flags & PM_REMOVE) )))
+    {
+        static unsigned int fair_count;
+        if (++fair_count <= 8 || !(fair_count % 1000))
+            fprintf( stderr, "[timer-fair] #%u tid=%04x win=%08x msg=%04x id=%lx went before a pending WM_PAINT "
+                     "(MADEIRA_TIMER_FAIRNESS=0: strict order)\n", fair_count, current->id, timer->win,
+                     timer->msg, (unsigned long)timer->id );
+        reply->type   = MSG_POSTED;
+        reply->win    = timer->win;
+        reply->msg    = timer->msg;
+        reply->wparam = timer->id;
+        reply->lparam = timer->lparam;
+        get_message_defaults( queue, &reply->x, &reply->y, &reply->time );
+        return;
+    }
 
     /* now check for WM_PAINT */
     if ((filter & QS_PAINT) &&

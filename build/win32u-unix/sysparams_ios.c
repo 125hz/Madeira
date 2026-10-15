@@ -4207,9 +4207,25 @@ static void ios_publish_screen_size( BOOL broadcast )
 
     if (!broadcast) return;
 
-    send_notify_message( get_desktop_window(), WM_DISPLAYCHANGE, 32, MAKELPARAM( w, h ), FALSE );
-    send_message_timeout( HWND_BROADCAST, WM_DISPLAYCHANGE, 32, MAKELPARAM( w, h ),
-                          SMTO_ABORTIFHUNG, 2000, FALSE );
+    {
+        /* madeira-bcd: how long the broadcast took. Every top-level window of
+         * every process is sent WM_DISPLAYCHANGE and may take up to 2 s to
+         * answer, which the caller (a game switching modes) waits through; one
+         * of the candidates for Red Dead Redemption 2 hanging when its Screen
+         * Type is switched to Windowed Borderless (owner, 2026-10-08). */
+        static unsigned int said;
+        struct timespec t0, t1;
+
+        clock_gettime( CLOCK_MONOTONIC, &t0 );
+        send_notify_message( get_desktop_window(), WM_DISPLAYCHANGE, 32, MAKELPARAM( w, h ), FALSE );
+        send_message_timeout( HWND_BROADCAST, WM_DISPLAYCHANGE, 32, MAKELPARAM( w, h ),
+                              SMTO_ABORTIFHUNG, 2000, FALSE );
+        clock_gettime( CLOCK_MONOTONIC, &t1 );
+        if (__atomic_add_fetch( &said, 1, __ATOMIC_RELAXED ) <= 64)
+            dprintf( STDERR_FILENO, "[display] WM_DISPLAYCHANGE %dx%d sent to every top-level window in %.0f ms "
+                     "(tid %04x)\n", w, h, (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6,
+                     (int)GetCurrentThreadId() );
+    }
     NtUserPostMessage( NtUserGetForegroundWindow(), WM_WINE_CLIPCURSOR, SET_CURSOR_FSCLIP, 0 );
 }
 
@@ -8575,6 +8591,9 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
         LIST_FOR_EACH_ENTRY(monitor, &monitors, struct monitor, entry)
         {
             if (target_name->header.id != monitor->output_id) continue;
+            /* madeira-bcd: the virtual monitor (the only one on iOS since the WoW64
+             * series) has no source; QueryDisplayConfig reports no path for it either. */
+            if (!monitor->source) continue;
             if (memcmp( &target_name->header.adapterId, &monitor->source->gpu->luid,
                         sizeof(monitor->source->gpu->luid) ))
                 continue;
@@ -8622,6 +8641,9 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
         LIST_FOR_EACH_ENTRY(monitor, &monitors, struct monitor, entry)
         {
             if (preferred_mode->header.id != monitor->output_id) continue;
+            /* madeira-bcd: the virtual monitor (the only one on iOS since the WoW64
+             * series) has no source; QueryDisplayConfig reports no path for it either. */
+            if (!monitor->source) continue;
             if (memcmp( &preferred_mode->header.adapterId, &monitor->source->gpu->luid,
                         sizeof(monitor->source->gpu->luid) ))
                 continue;
@@ -8727,6 +8749,9 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
         LIST_FOR_EACH_ENTRY(monitor, &monitors, struct monitor, entry)
         {
             if (color_info->header.id != monitor->output_id) continue;
+            /* madeira-bcd: the virtual monitor (the only one on iOS since the WoW64
+             * series) has no source; QueryDisplayConfig reports no path for it either. */
+            if (!monitor->source) continue;
             if (memcmp( &color_info->header.adapterId, &monitor->source->gpu->luid,
                         sizeof(monitor->source->gpu->luid) ))
                 continue;

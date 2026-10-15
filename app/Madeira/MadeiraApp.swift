@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 @main
@@ -5,6 +6,15 @@ struct MadeiraApp: App {
     init() {
         // Opt-in iPhone pointer experiments (PhonePointer.m): before any scene exists.
         madeira_phone_pointer_setup()
+        // madeira-bcd: the Metal Performance HUD's performance insights (the
+        // notes that stack up left of its panel: shader compiles, similar render
+        // passes, blit encoders) cover the game. Off unless madeira.cfg says
+        // env.MTL_HUD_INSIGHTS_ENABLED = 1, which is exported later and wins.
+        setenv("MTL_HUD_INSIGHTS_ENABLED", "0", 0)
+        // Host pads as Windows.Gaming.Input gamepads (upstream's opt-in provider, #40 in
+        // willfaust/wine): on by default here, as the fork's own provider was (ml2171);
+        // madeira.cfg env.MADEIRA_WGI_HOST_PADS = 0 is exported later and wins.
+        setenv("MADEIRA_WGI_HOST_PADS", "1", 0)
         // ml1172: read the screen on the main thread; library entries, whose
         // default Resolution comes from it, are also made on other threads.
         _ = ResolutionChoices.screen

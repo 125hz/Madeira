@@ -128,15 +128,24 @@ struct __server_request_info
 struct thread_data { int request_fd, reply_fd; };
 static __thread struct thread_data tdata;
 static struct thread_data *ntdll_get_thread_data(void) { return &tdata; }
-static void *NtCurrentTeb(void) { return &tdata; }
+struct fake_teb { struct { void *UniqueProcess, *UniqueThread; } ClientId; };
+static __thread struct fake_teb fteb;
+static struct fake_teb *NtCurrentTeb(void) { return &fteb; }
+#ifndef HandleToULong
+#define HandleToULong(h) ((unsigned long)(unsigned long long)(h))
+#endif
 static int fd_socket = -1;
 static unsigned int GetCurrentThreadId(void) { return 0x42; }
 static sigset_t server_block_set;
 static void mutex_lock( pthread_mutex_t *m ) { pthread_mutex_lock( m ); }
 static void mutex_unlock( pthread_mutex_t *m ) { pthread_mutex_unlock( m ); }
 static void ios_fdt_autopsy( const char *what, int fd, int ret, int err ) { (void)what; (void)fd; (void)ret; (void)err; }
+static void ios_bg_qos_check(void) {}   /* [bg-qos]: check-bg-qos.py */
 volatile int ios_srv_req_count;
 void ios_wineserver_wake(void) {}
+void ios_wineserver_ring( unsigned int tid ) { (void)tid; }
+volatile int g_madeira_srv_direct;      /* MADEIRA_SRV_DIRECT is off here: check-srv-direct.py */
+static BOOL ios_srv_try_direct( struct __server_request_info *req, unsigned int *status ) { (void)req; (void)status; return FALSE; }
 static DECLSPEC_NORETURN void server_protocol_perror( const char *err ) { perror( err ); abort(); }
 void server_enter_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset );
 void server_leave_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset );
