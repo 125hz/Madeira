@@ -309,12 +309,18 @@ assert crysis['tested'] == ['env.MADEIRA_EC_HOOK_TRACE = 0'], crysis['lines']
 assert crysis['version'] == 1 and crysis['switches'] == 'avx: false, nvidia: false, wineVCRT: false, display: "fit"', crysis
 # Crysis 2 and 3 Remastered, version 1 (not yet run with them): madeira-bcd build 540's tries stopped with AVX off
 # (Crysis 2) and in Microsoft's msvcp140 (Crysis 3), so AVX on, and Wine's C++ runtime for Crysis 3.
-for ident, vcrt in (('crysis-2-remastered', 'false'), ('crysis-3-remastered', 'true')):
-    c = presets[ident]
-    assert c['tested'] == ['env.MADEIRA_EC_HOOK_TRACE = 0'], c['lines']
-    assert c['version'] == 1 and c['switches'] == 'avx: true, nvidia: false, wineVCRT: %s, display: "fit"' % vcrt, c
-print('PASS: Crysis Remastered is the standard line with the fork defaults and every switch off (v1); Crysis 2 and 3 '
-      'Remastered the same with AVX on, and Wine\'s C++ runtime for Crysis 3 (v1)')
+c = presets['crysis-2-remastered']
+assert c['tested'] == ['env.MADEIRA_EC_HOOK_TRACE = 0'], c['lines']
+assert c['version'] == 1 and c['switches'] == 'avx: true, nvidia: false, wineVCRT: false, display: "fit"', c
+# Crysis 3 Remastered, version 2 (madeira-bcd 547/549): the game's own x64 vcruntime140.dll next to Wine's ARM64EC
+# msvcp140 stopped it; env.MADEIRA_APP_DLL_SHADOW refuses that copy, and Wine's C++ runtime switch is off again.
+c = presets['crysis-3-remastered']
+assert c['tested'] == ['env.MADEIRA_EC_HOOK_TRACE = 0', 'env.MADEIRA_APP_DLL_SHADOW = vcruntime140.dll'], c['lines']
+assert c['version'] == 2 and c['switches'] == 'avx: true, nvidia: false, wineVCRT: false, display: "fit"', c
+assert not any(line.startswith('env.MADEIRA_APP_DLL_SHADOW') for p in presets.values() if p is not c for line in p['lines']), \
+    'the app-local DLL shadow is Crysis 3 Remastered\'s only'
+print('PASS: Crysis Remastered is the standard line with the fork defaults and every switch off (v1); Crysis 2 '
+      'Remastered the same with AVX on (v1); Crysis 3 Remastered with AVX on and its own vcruntime140.dll refused (v2)')
 
 # Recognition: Steam by App ID or steamapps\common folder; everything else by the program's name.
 match = block(lists_src, 'static func match(', '\n    }\n')
