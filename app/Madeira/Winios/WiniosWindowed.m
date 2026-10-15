@@ -28,23 +28,12 @@
  * post the title-bar commands from their event pump. The event-target state
  * is behind g_target_lock: winios_pointer can be called off the main thread.
  *
- * Game controllers. The frames and the taskbar are UIKit controls, and iOS
- * lets a game controller drive focusable UIKit controls (the focus engine):
- * a pad's A on the taskbar's search field opened the software keyboard and
- * its Return activated another program's window. None of the chrome can take
- * focus (WWButton, WWSearchField, WWAppStrip), the search field becomes first
- * responder only from a touch, the buttons ignore presses, and the root claims
- * gamepad events for the Game Controller framework (GCEventInteraction), which
- * is where GamepadInput.swift reads the pads for the guest. Info.plist also
- * sets GCSupportsControllerUserInteraction = false.
- *
- * Log lines: "[windowed] ml1300 ..." for on/off, add, refit, remove, activate,
- * move, scale, minimize, restore, fullscreen, close and the ignored presses. */
+ * Log lines: "[windowed] ml1300 ..." for on/off, add, remove, activate, move,
+ * scale, minimize, restore, fullscreen and close. */
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
-#import <GameController/GameController.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
@@ -89,7 +78,6 @@ extern int winios_drv_foreground_if_owner(void *hwnd);
 static const CGFloat WW_BAR_H = 30;       /* title bar height, points */
 static const CGFloat WW_MIN_BAR_W = 150;  /* a tiny window still gets a usable title bar */
 static const CGFloat WW_DOCK_H = 56;
-static const CGFloat WW_GRAB = 120;       /* title bar that always stays on screen, points */
 
 static void ww_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void ww_log(const char *fmt, ...)
@@ -356,11 +344,6 @@ static const char *ww_kind_name(ww_kind k)
     BOOL wasShown;
     BOOL everShown;        /* logged as added */
     CGFloat k;             /* frame zoom, points per desktop pixel */
-    BOOL userScaled;       /* zoomed with the grip: a size change keeps that zoom */
-    BOOL provisional;      /* placed at a placeholder rect (parked off screen, minimized
-                              size); placed again at its first real size */
-    CGSize fitSize;        /* the desktop size `k` was last fitted to */
-    int cascadeStep;       /* its step in the first-placement cascade */
     CGPoint origin;        /* content top-left in the root view */
     uintptr_t group;       /* WW_ATTACHED: the framed window whose host holds it */
     WWFrameView *frame;
@@ -382,18 +365,8 @@ static void ww_dock_refresh(void);
 static void ww_z_rebuild(void);
 static void ww_layout_dock(void);
 static CGRect ww_area(void);
-static void ww_clamp(WWWin *w);
 
 static BOOL ww_iconic(WWWin *w) { return w->infoKnown && (w->info.style & WW_WS_MINIMIZE); }
-
-/* A rect a window has before its real one: parked off screen (the -32000
- * position of a minimized or still-starting window) or the minimized size
- * (160x31 by default). Never fitted to. */
-static BOOL ww_placeholder(CGRect r)
-{
-    if (r.origin.x <= -10000 || r.origin.y <= -10000) return YES;
-    return r.size.width <= 200 && r.size.height <= 40;
-}
 
 static BOOL ww_shown(WWWin *w)
 {
@@ -471,55 +444,6 @@ static NSString *ww_display_title(WWWin *w)
 @interface WWRootView : UIView
 @end
 
-/* Chrome that a game controller's focus engine (or keyboard focus navigation)
- * can never reach: the pad's input belongs to the program in the frame. */
-@interface WWButton : UIButton
-@end
-@implementation WWButton
-- (BOOL)canBecomeFocused { return NO; }
-@end
-
-@interface WWAppStrip : UIScrollView
-@end
-@implementation WWAppStrip
-- (BOOL)canBecomeFocused { return NO; }
-@end
-
-/* The taskbar's search field: never focusable, and first responder only from
- * a touch on it (a controller's A on a focused field opened the keyboard). */
-@interface WWSearchField : UITextField
-@property (nonatomic) CFTimeInterval touchedAt;
-@end
-@implementation WWSearchField
-- (BOOL)canBecomeFocused { return NO; }
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hit = [super hitTest:point withEvent:event];
-    if (hit && event.type == UIEventTypeTouches) _touchedAt = CACurrentMediaTime();
-    return hit;
-}
-- (BOOL)becomeFirstResponder {
-    if (self.isFirstResponder) return YES;
-    if (_touchedAt <= 0 || CACurrentMediaTime() - _touchedAt > 2.0) {
-        static int logged;
-        if (logged < 16 && ++logged)
-            ww_log("search field: first responder refused (not a touch on it; the keyboard stays with the program)");
-        return NO;
-    }
-    return [super becomeFirstResponder];
-}
-@end
-
-/* A control's action came from a touch (or an accessibility activation), not
- * a press: the focus engine's select (a pad's A, a keyboard's space) sends
- * presses. */
-static BOOL ww_by_touch(UIEvent *event, const char *what)
-{
-    if (!event || event.type == UIEventTypeTouches) return YES;
-    static int logged;
-    if (logged < 32 && ++logged) ww_log("%s ignored: not a touch (event type %ld; controller or keyboard focus press)", what, (long)event.type);
-    return NO;
-}
-
 @interface WWFrameView : UIView
 @property (nonatomic) uintptr_t hwnd;
 @property (nonatomic) BOOL chromeless;
@@ -534,22 +458,13 @@ static BOOL ww_by_touch(UIEvent *event, const char *what)
 
 @interface WWDock : UIView <UITextFieldDelegate>
 @property (nonatomic, strong) UIVisualEffectView *pill;
-@property (nonatomic, strong) WWSearchField *search;
-@property (nonatomic, strong) WWAppStrip *apps;
+@property (nonatomic, strong) UITextField *search;
+@property (nonatomic, strong) UIScrollView *apps;
 @property (nonatomic, strong) UIButton *keyboardButton, *menuButton;
 @property (nonatomic, strong) NSMutableArray<UIButton *> *appButtons;
 @end
 
 static WWDock *g_dock;
-
-/* A frame was touched or activated: the search field (if a touch opened it)
- * gives the keyboard back to the program. */
-static void ww_search_release(const char *why)
-{
-    if (!g_dock || !g_dock.search.isFirstResponder) return;
-    [g_dock.search resignFirstResponder];
-    ww_log("search field released (%s): the keyboard goes back to the program", why);
-}
 
 /* The Swift side (WindowedMode.swift) for the taskbar's tools. */
 static Class ww_bridge(void) { return NSClassFromString(@"MadeiraWindowedBridge"); }
@@ -565,7 +480,7 @@ static void ww_bridge_call(NSString *sel)
 
 static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
 {
-    UIButton *b = [WWButton buttonWithType:UIButtonTypeCustom];
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
     b.frame = CGRectMake(0, 0, side, side);
     b.backgroundColor = bg;
     b.layer.cornerRadius = side / 2;
@@ -584,7 +499,6 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
     if (!hit || hit == self || [hit isKindOfClass:[WWFrameView class]]) return nil;
     return hit;
 }
-- (BOOL)canBecomeFocused { return NO; }
 - (void)layoutSubviews {
     [super layoutSubviews];
     ww_layout_dock();
@@ -634,24 +548,16 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
     _fullButton = ww_round_button(@"arrow.up.left.and.arrow.down.right", [UIColor colorWithWhite:0.36 alpha:1], 20);
     _closeButton = ww_round_button(@"xmark", UIColor.systemRedColor, 20);
     for (UIButton *b in @[_minButton, _fullButton, _closeButton]) [_bar addSubview:b];
-    [_minButton addTarget:self action:@selector(minimizePressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
-    [_fullButton addTarget:self action:@selector(fullscreenPressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
-    [_closeButton addTarget:self action:@selector(closePressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
-    _minButton.accessibilityLabel = @"Minimize";
-    _fullButton.accessibilityLabel = @"Fit to screen";
-    _closeButton.accessibilityLabel = @"Close";
+    [_minButton addTarget:self action:@selector(minimizeTapped) forControlEvents:UIControlEventTouchUpInside];
+    [_fullButton addTarget:self action:@selector(fullscreenTapped) forControlEvents:UIControlEventTouchUpInside];
+    [_closeButton addTarget:self action:@selector(closeTapped) forControlEvents:UIControlEventTouchUpInside];
 
-    /* The title bar drags the frame. Its recognizers take touches only (no
-     * presses), so a controller or keyboard focus press never reaches them. */
     UIPanGestureRecognizer *drag = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragged:)];
-    drag.maximumNumberOfTouches = 1;
     [_bar addGestureRecognizer:drag];
     UITapGestureRecognizer *twice = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(fullscreenTapped)];
     twice.numberOfTapsRequired = 2;
-    twice.allowedPressTypes = @[];
     [_bar addGestureRecognizer:twice];
     UITapGestureRecognizer *once = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(barTapped)];
-    once.allowedPressTypes = @[];
     [once requireGestureRecognizerToFail:twice];
     [_bar addGestureRecognizer:once];
 
@@ -676,15 +582,9 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
     return self;
 }
 
-- (BOOL)canBecomeFocused { return NO; }
-
 - (WWWin *)win { return ww_get(_hwnd, NO); }
 
 - (void)barTapped { WWWin *w = [self win]; if (w) ww_raise(w, YES, "tap"); }
-
-- (void)minimizePressed:(UIButton *)b forEvent:(UIEvent *)e { if (ww_by_touch(e, "minimize button")) [self minimizeTapped]; }
-- (void)fullscreenPressed:(UIButton *)b forEvent:(UIEvent *)e { if (ww_by_touch(e, "fullscreen button")) [self fullscreenTapped]; }
-- (void)closePressed:(UIButton *)b forEvent:(UIEvent *)e { if (ww_by_touch(e, "close button")) [self closeTapped]; }
 
 - (void)minimizeTapped {
     WWWin *w = [self win];
@@ -698,20 +598,9 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
     WWWin *w = [self win];
     if (!w) return;
     w->fullscreen = !w->fullscreen;
-    if (!w->fullscreen && w->placed) ww_clamp(w);
-    ww_log("fullscreen hwnd=%p %s", (void *)w->hwnd,
-           w->fullscreen ? "on (fit to the screen; the frame stays put, its button turns blue: tap it or double-tap the title bar to leave)"
-                         : "off (back to its movable frame)");
+    ww_log("fullscreen hwnd=%p %s", (void *)w->hwnd, w->fullscreen ? "on (fit to the screen)" : "off (back to its frame)");
     ww_apply_frame(w);
     ww_raise(w, YES, "fullscreen");
-}
-
-/* A fitted (fullscreen) frame does not move: show where the way out is. */
-- (void)pulseFullButton {
-    [UIView animateWithDuration:0.12 animations:^{ self.fullButton.transform = CGAffineTransformMakeScale(1.5, 1.5); }
-                     completion:^(BOOL done) {
-        [UIView animateWithDuration:0.18 animations:^{ self.fullButton.transform = CGAffineTransformIdentity; }];
-    }];
 }
 
 - (void)closeTapped {
@@ -723,22 +612,12 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
 
 - (void)dragged:(UIPanGestureRecognizer *)g {
     WWWin *w = [self win];
-    if (!w) return;
-    if (w->fullscreen) {
-        if (g.state == UIGestureRecognizerStateBegan) {
-            ww_raise(w, YES, "drag");
-            ww_log("move hwnd=%p ignored: fullscreen (fitted) frames stay put; the blue button or a double tap on the title bar leaves fullscreen",
-                   (void *)w->hwnd);
-            [self pulseFullButton];
-        }
-        return;
-    }
+    if (!w || w->fullscreen) return;
     if (g.state == UIGestureRecognizerStateBegan) ww_raise(w, YES, "drag");
     CGPoint t = [g translationInView:self.superview];
     [g setTranslation:CGPointZero inView:self.superview];
     w->origin.x += t.x;
     w->origin.y += t.y;
-    ww_clamp(w);   /* the title bar never leaves the screen, so it can always be grabbed again */
     ww_apply_frame(w);
     if (g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled)
         ww_log("move hwnd=%p to (%.0f,%.0f) pt (app side; the guest window stays at %.0f,%.0f)",
@@ -748,18 +627,13 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
 - (void)gripDragged:(UIPanGestureRecognizer *)g {
     WWWin *w = [self win];
     if (!w || w->fullscreen || w->desk.size.width <= 0) return;
-    if (g.state == UIGestureRecognizerStateBegan) {
-        _scaleStartK = w->k;
-        w->userScaled = YES;   /* from now on a size change keeps this zoom */
-        ww_raise(w, NO, "zoom");
-    }
+    if (g.state == UIGestureRecognizerStateBegan) { _scaleStartK = w->k; ww_raise(w, NO, "zoom"); }
     CGPoint t = [g translationInView:self.superview];
     CGFloat width = _scaleStartK * w->desk.size.width + MAX(t.x, t.y * w->desk.size.width / MAX(w->desk.size.height, 1));
     w->k = MIN(MAX(width / w->desk.size.width, 0.15), 3.0);
-    ww_clamp(w);
     ww_apply_frame(w);
     if (g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled)
-        ww_log("scale hwnd=%p zoom=%.2f pt/px (the guest window keeps its size; kept when it resizes)", (void *)w->hwnd, w->k);
+        ww_log("scale hwnd=%p zoom=%.2f pt/px (the guest window keeps its size)", (void *)w->hwnd, w->k);
 }
 
 - (void)layoutChrome:(CGFloat)width {
@@ -773,15 +647,10 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
     CGFloat buttons = 3 * side + 2 * gap + 16;
     _label.frame = CGRectMake(buttons, 0, MAX(width - 2 * buttons, 0), WW_BAR_H);
     WWWin *w = [self win];
-    BOOL full = w && w->fullscreen;
-    [_fullButton setImage:[UIImage systemImageNamed:full ? @"arrow.down.right.and.arrow.up.left"
-                                                         : @"arrow.up.left.and.arrow.down.right"
+    [_fullButton setImage:[UIImage systemImageNamed:(w && w->fullscreen) ? @"arrow.down.right.and.arrow.up.left"
+                                                                         : @"arrow.up.left.and.arrow.down.right"
                                   withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:9 weight:UIImageSymbolWeightBold]]
                  forState:UIControlStateNormal];
-    /* fullscreen is a state the frame is in (it cannot be dragged): the button says so */
-    _fullButton.backgroundColor = full ? UIColor.systemBlueColor : [UIColor colorWithWhite:0.36 alpha:1];
-    _fullButton.accessibilityLabel = full ? @"Leave fit to screen" : @"Fit to screen";
-    _bar.backgroundColor = full ? [UIColor colorWithRed:0.10 green:0.16 blue:0.27 alpha:0.97] : [UIColor colorWithWhite:0.17 alpha:0.97];
 }
 
 /* Touches a little outside the round buttons still hit them. */
@@ -805,7 +674,7 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
     _pill.clipsToBounds = YES;
     [self addSubview:_pill];
 
-    _search = [[WWSearchField alloc] initWithFrame:CGRectZero];
+    _search = [[UITextField alloc] initWithFrame:CGRectZero];
     _search.placeholder = @"Search";
     _search.textColor = UIColor.whiteColor;
     _search.font = [UIFont systemFontOfSize:14];
@@ -827,16 +696,14 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
     [_search addTarget:self action:@selector(searchChanged) forControlEvents:UIControlEventEditingChanged];
     [_pill.contentView addSubview:_search];
 
-    _apps = [[WWAppStrip alloc] initWithFrame:CGRectZero];
+    _apps = [[UIScrollView alloc] initWithFrame:CGRectZero];
     _apps.showsHorizontalScrollIndicator = NO;
     [_pill.contentView addSubview:_apps];
 
     _keyboardButton = ww_round_button(@"keyboard", [UIColor colorWithWhite:1 alpha:0.14], 40);
-    [_keyboardButton addTarget:self action:@selector(keyboardPressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
-    _keyboardButton.accessibilityLabel = @"Keyboard";
+    [_keyboardButton addTarget:self action:@selector(keyboardTapped) forControlEvents:UIControlEventTouchUpInside];
     _menuButton = ww_round_button(@"line.3.horizontal", [UIColor colorWithWhite:1 alpha:0.14], 40);
-    [_menuButton addTarget:self action:@selector(menuPressed:forEvent:) forControlEvents:UIControlEventTouchUpInside];
-    _menuButton.accessibilityLabel = @"Menu";
+    [_menuButton addTarget:self action:@selector(menuTapped) forControlEvents:UIControlEventTouchUpInside];
     BOOL bridge = ww_bridge() != nil;
     _keyboardButton.hidden = _menuButton.hidden = !bridge;
     [_pill.contentView addSubview:_keyboardButton];
@@ -844,28 +711,14 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
     return self;
 }
 
-- (BOOL)canBecomeFocused { return NO; }
-
-/* The keyboard and menu buttons answer a touch only: a controller's A on a
- * focused button opened the keyboard over the game. */
-- (void)keyboardPressed:(UIButton *)b forEvent:(UIEvent *)e {
-    if (!ww_by_touch(e, "taskbar keyboard button")) return;
-    [_search resignFirstResponder];
-    ww_bridge_call(@"toggleKeyboard");
-}
-- (void)menuPressed:(UIButton *)b forEvent:(UIEvent *)e {
-    if (!ww_by_touch(e, "taskbar menu button")) return;
-    [_search resignFirstResponder];
-    ww_bridge_call(@"openMenu");
-}
+- (void)keyboardTapped { [_search resignFirstResponder]; ww_bridge_call(@"toggleKeyboard"); }
+- (void)menuTapped { [_search resignFirstResponder]; ww_bridge_call(@"openMenu"); }
 - (void)searchChanged { ww_dock_refresh(); }
 
 - (BOOL)textFieldShouldReturn:(UITextField *)field {
-    /* Go: bring the first matching window to the front. Nothing typed: just
-     * close the keyboard (Go on an empty field activated another program). */
-    NSString *typed = [field.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    /* Go: bring the first matching window to the front */
     UIButton *first = nil;
-    if (typed.length) for (UIButton *b in _appButtons) if (!b.hidden) { first = b; break; }
+    for (UIButton *b in _appButtons) if (!b.hidden) { first = b; break; }
     [field resignFirstResponder];
     if (first) {
         WWWin *w = ww_get((uintptr_t)first.tag, NO);
@@ -884,9 +737,7 @@ static UIButton *ww_round_button(NSString *symbol, UIColor *bg, CGFloat side)
     return NO;
 }
 
-- (void)appTapped:(UIButton *)b forEvent:(UIEvent *)e {
-    if (!ww_by_touch(e, "taskbar button")) return;
-    [_search resignFirstResponder];
+- (void)appTapped:(UIButton *)b {
     WWWin *w = ww_get((uintptr_t)b.tag, NO);
     if (!w) return;
     if (w->appMinimized || ww_iconic(w)) {
@@ -931,42 +782,21 @@ static CGFloat ww_default_k(WWWin *w)
     return MAX(k, 0.1);
 }
 
-/* Keeps the title bar grabbable: all of its height and at least WW_GRAB
- * points of its width inside the frame area (a drag or a resize may leave
- * the rest of the window off screen). */
 static void ww_clamp(WWWin *w)
 {
     CGRect a = ww_area();
     CGFloat width = MAX(w->desk.size.width * w->k, WW_MIN_BAR_W);
-    CGFloat keep = MIN(WW_GRAB, width);
-    CGFloat minX = a.origin.x + keep - width, maxX = CGRectGetMaxX(a) - keep;
-    CGFloat minY = a.origin.y + WW_BAR_H, maxY = CGRectGetMaxY(a);
+    CGFloat minX = a.origin.x - width + 80, maxX = CGRectGetMaxX(a) - 80;
+    CGFloat minY = a.origin.y + WW_BAR_H, maxY = CGRectGetMaxY(a) - 10;
     w->origin.x = MIN(MAX(w->origin.x, minX), MAX(maxX, minX));
     w->origin.y = MIN(MAX(w->origin.y, minY), MAX(maxY, minY));
 }
 
-/* Moves a frame that fits the area entirely inside it (only after the
- * program or the screen changed its size, never after a drag). */
-static void ww_shift_inside(WWWin *w)
-{
-    CGRect a = ww_area();
-    CGFloat width = MAX(w->desk.size.width * w->k, WW_MIN_BAR_W), height = w->desk.size.height * w->k;
-    CGFloat minX = a.origin.x + 8, maxX = CGRectGetMaxX(a) - 8 - width;
-    CGFloat minY = a.origin.y + WW_BAR_H + 8, maxY = CGRectGetMaxY(a) - 8 - height;
-    w->origin.x = maxX >= minX ? MIN(MAX(w->origin.x, minX), maxX) : minX;
-    w->origin.y = maxY >= minY ? MIN(MAX(w->origin.y, minY), maxY) : minY;
-}
-
 /* First position of a frame: a dialog over its owner, a program window
- * cascaded from the top-left of the screen. `again`: the window had only a
- * placeholder rect when first placed; this is its first real size, placed in
- * the same cascade step. */
-static void ww_place_new(WWWin *w, BOOL again)
+ * cascaded from the top-left of the screen. */
+static void ww_first_place(WWWin *w)
 {
     w->k = ww_default_k(w);
-    w->fitSize = w->desk.size;
-    w->provisional = ww_placeholder(w->desk);
-    if (!again) w->cascadeStep = g_cascade++ % 6;
     CGRect a = ww_area();
     WWWin *owner = w->infoKnown && w->info.owner ? ww_get((uintptr_t)w->info.owner, NO) : nil;
     if (owner && owner->kind == WW_ATTACHED) owner = ww_get(owner->group, NO);
@@ -977,55 +807,13 @@ static void ww_place_new(WWWin *w, BOOL again)
                                      oc.y + (CGRectGetMidY(w->desk) - owner->desk.origin.y) * ok);
         w->origin = CGPointMake(centre.x - w->desk.size.width * w->k / 2, centre.y - w->desk.size.height * w->k / 2);
     } else {
-        CGFloat step = 26 * w->cascadeStep;
-        CGFloat width = MAX(w->desk.size.width * w->k, WW_MIN_BAR_W), height = w->desk.size.height * w->k;
+        CGFloat step = 26 * (g_cascade++ % 6);
+        CGFloat width = w->desk.size.width * w->k;
         CGFloat x = a.size.width > width + 16 ? a.origin.x + (a.size.width - width) / 2 - 40 + step : a.origin.x + 8 + step;
-        CGFloat y = a.origin.y + WW_BAR_H + 8 + step;
-        /* the cascade step never pushes a fitted window past the area */
-        x = MIN(x, CGRectGetMaxX(a) - 8 - width);
-        y = MIN(y, CGRectGetMaxY(a) - 8 - height);
-        w->origin = CGPointMake(MAX(x, a.origin.x + 8), MAX(y, a.origin.y + WW_BAR_H + 8));
+        w->origin = CGPointMake(MAX(x, a.origin.x + 8), a.origin.y + WW_BAR_H + 8 + step);
     }
     ww_clamp(w);
     w->placed = YES;
-}
-
-static void ww_first_place(WWWin *w) { ww_place_new(w, NO); }
-
-/* The window's desktop size (or the screen) changed after it was placed. A
- * zoom the user did not choose with the grip follows it, so a window that
- * grows past the screen (a program window that starts at a placeholder size
- * and then becomes full-size) comes up fitted, title bar on screen. A
- * placeholder rect (minimized, parked off screen) changes nothing. Returns
- * YES when the frame changed. */
-static BOOL ww_refit(WWWin *w, const char *why)
-{
-    if (w->kind != WW_FRAMED || !w->placed || ww_placeholder(w->desk)) return NO;
-    if (w->desk.size.width <= 0 || w->desk.size.height <= 0) return NO;
-    if (w->provisional) {
-        ww_place_new(w, YES);
-        ww_log("refit hwnd=%p rect={%.0f,%.0f %.0fx%.0f} zoom=%.2f (first real size; placed again)",
-               (void *)w->hwnd, w->desk.origin.x, w->desk.origin.y, w->desk.size.width, w->desk.size.height, w->k);
-        return YES;
-    }
-    BOOL resized = !CGSizeEqualToSize(w->fitSize, w->desk.size);
-    if (w->userScaled) {
-        if (!resized) return NO;
-        w->fitSize = w->desk.size;
-        ww_clamp(w);
-        ww_log("refit hwnd=%p rect={%.0f,%.0f %.0fx%.0f} zoom=%.2f (%s; the zoom set with the grip is kept)",
-               (void *)w->hwnd, w->desk.origin.x, w->desk.origin.y, w->desk.size.width, w->desk.size.height, w->k, why);
-        return YES;
-    }
-    CGFloat k = ww_default_k(w);
-    if (!resized && fabs(k - w->k) < 0.005) return NO;
-    w->k = k;
-    w->fitSize = w->desk.size;
-    ww_shift_inside(w);
-    ww_clamp(w);
-    ww_log("refit hwnd=%p rect={%.0f,%.0f %.0fx%.0f} zoom=%.2f (%s)",
-           (void *)w->hwnd, w->desk.origin.x, w->desk.origin.y, w->desk.size.width, w->desk.size.height, w->k, why);
-    return YES;
 }
 
 static void ww_apply_frame(WWWin *w)
@@ -1135,7 +923,6 @@ static void ww_update(WWWin *w)
         }
         ww_put_layer(w->layer, w->frame.host, YES);
         if (w->kind == WW_FRAMED && !w->placed && shown) ww_first_place(w);
-        else if (w->kind == WW_FRAMED && shown) ww_refit(w, "size changed");   /* no-op unless it did */
         w->frame.label.text = ww_display_title(w);
         w->frame.hidden = !shown || (w->kind == WW_FRAMED && !w->placed);
         if (shown && !w->everShown && (w->everShown = YES))
@@ -1169,7 +956,7 @@ void winios_windowed_place(void *hwnd, CALayer *layer, int x, int y, int w, int 
     /* the program moved its own window (its title bar dragged inside the
      * frame, or SetWindowPos): the frame follows, so the finger stays on the
      * spot it grabbed and the mapping stays stable */
-    if (win->placed && win->kind == WW_FRAMED && !win->fullscreen && !win->provisional && !ww_iconic(win) && visible &&
+    if (win->placed && win->kind == WW_FRAMED && !win->fullscreen && !ww_iconic(win) && visible &&
         old.size.width > 0 && (old.origin.x != x || old.origin.y != y) &&
         fabs(old.origin.x - x) < 16000 && fabs(old.origin.y - y) < 16000) {
         win->origin.x += (x - old.origin.x) * win->k;
@@ -1230,9 +1017,6 @@ static void ww_raise(WWWin *w, BOOL activate, const char *why)
 {
     if (w->kind == WW_ATTACHED) { WWWin *g = ww_get(w->group, NO); if (g) w = g; }
     if (!w->frame) return;
-    /* the user touched or picked a window (not the program showing or
-     * activating one itself): the keyboard is the program's again */
-    if (strcmp(why, "shown") && strcmp(why, "guest")) ww_search_release(why);
     [g_root bringSubviewToFront:w->frame];
     if (g_dock) [g_root bringSubviewToFront:g_dock];
     BOOL changed = g_top != w->hwnd;
@@ -1362,7 +1146,7 @@ static void ww_dock_refresh(void)
         [list addObject:w];
     }
     while (d.appButtons.count < list.count) {
-        UIButton *b = [WWButton buttonWithType:UIButtonTypeCustom];
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
         UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectMake(6, 6, 34, 34)];
         iv.tag = 1;
         iv.layer.cornerRadius = 8;
@@ -1375,7 +1159,7 @@ static void ww_dock_refresh(void)
         dot.layer.cornerRadius = 3;
         dot.userInteractionEnabled = NO;
         [b addSubview:dot];
-        [b addTarget:d action:@selector(appTapped:forEvent:) forControlEvents:UIControlEventTouchUpInside];
+        [b addTarget:d action:@selector(appTapped:) forControlEvents:UIControlEventTouchUpInside];
         [d.apps addSubview:b];
         [d.appButtons addObject:b];
     }
@@ -1413,25 +1197,8 @@ UIView *winios_windowed_make_root(CGRect frame)
     if (!g_wins) { g_wins = [NSMutableDictionary new]; g_order = [NSMutableArray new]; }
     g_dock = [WWDock new];
     [root addSubview:g_dock];
-    /* Gamepad events under the frames and the taskbar go to the Game
-     * Controller framework (GamepadInput.swift, which feeds the guest), not to
-     * UIKit focus navigation: the root sits beside the game view, outside the
-     * views that already claim them. env.MADEIRA_XINPUT = 0 (no physical pads
-     * for the guest) leaves UIKit's default. */
-    char cfg[16];
-    const char *xinput = madeira_cfg_get("env.MADEIRA_XINPUT", cfg, sizeof(cfg)) ? cfg : getenv("MADEIRA_XINPUT");
-    BOOL claim = !(xinput && xinput[0] == '0' && !xinput[1]);   /* as GamepadInput.enabled reads it */
-    if (claim) {
-        if (@available(iOS 18.0, *)) {
-            GCEventInteraction *gi = [GCEventInteraction new];
-            gi.handledEventTypes = GCUIEventTypeGamepad;
-            [root addInteraction:gi];
-        }
-    }
     ww_layout_dock();
-    ww_log("compositor root attached: frames + taskbar (madeira.cfg windowed = 0 or env.MADEIRA_WINDOWED = 0 turns it off); "
-           "chrome not focusable, gamepad events %s",
-           claim ? "claimed for the Game Controller framework" : "left to UIKit (env.MADEIRA_XINPUT = 0)");
+    ww_log("compositor root attached: frames + taskbar (madeira.cfg windowed = 0 or env.MADEIRA_WINDOWED = 0 turns it off)");
     return root;
 }
 
@@ -1478,8 +1245,7 @@ void winios_windowed_relayout(void)
     if (!g_root) return;
     for (WWWin *w in g_wins.allValues) {
         if (!w->frame) continue;
-        /* a new screen size refits a zoom the user did not set (rotation) */
-        if (w->kind == WW_FRAMED && w->placed && !(ww_shown(w) && ww_refit(w, "screen changed"))) ww_clamp(w);
+        if (w->kind == WW_FRAMED && w->placed) ww_clamp(w);
         ww_apply_frame(w);
     }
     ww_layout_dock();

@@ -40,8 +40,6 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>GCSupportsGameMode</key>
 	<true/>
-	<key>GCSupportsControllerUserInteraction</key>
-	<false/>
 	<key>LSSupportsGameMode</key>
 	<true/>
 	<key>LSApplicationCategoryType</key>

@@ -14,11 +14,6 @@ controllers remain connected but report neutral input. Disconnects clear slots
 unless the touch layout still supplies slot 0. Buttons, triggers, and signed
 stick axes reach XInput without mouse synthesis or an app-imposed dead zone.
 iOS 18 event claims prevent focus navigation from consuming controller events.
-`Info.plist` also sets `GCSupportsControllerUserInteraction = false`, so a pad
-does not operate UIKit controls (the focus engine) over a game. Windowed mode
-(docs/WINDOWED.md) claims gamepad events on its frames-and-taskbar root as
-well and makes none of that chrome focusable: a pad's A once opened the
-taskbar search field and keyboard and moved the foreground to another program.
 
 `WiniosGamepad.c` publishes snapshots under a short mutex. Packet numbers change
 only when the sample or connection changes. The win32u query copies state or
