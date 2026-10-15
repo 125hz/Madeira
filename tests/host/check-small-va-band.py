@@ -20,6 +20,7 @@ harness = r"""
 #include <string.h>
 #include <stdint.h>
 typedef uintptr_t ULONG_PTR;
+unsigned long long ios_layerkit_lo, ios_layerkit_hi;   /* this fork: the measured CoreAnimation span ios_wow_band keeps out of */
 typedef int kern_return_t; typedef unsigned int mach_msg_type_number_t; typedef int task_t; typedef int *task_info_t;
 typedef uint64_t mach_vm_address_t, mach_vm_size_t; typedef int mach_port_t; typedef int *vm_region_info_t;
 typedef struct { int protection; } vm_region_basic_info_data_64_t;

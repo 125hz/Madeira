@@ -66,7 +66,9 @@ if gdiobj.exists():
     CC = os.environ.get('CC') or shutil.which('cc') or 'cc'
     with tempfile.TemporaryDirectory() as tmp:
         c = Path(tmp) / 't.c'
-        c.write_text('#include <stdio.h>\n#include <stdlib.h>\ntypedef int BOOL;\n'
+        c.write_text('#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\ntypedef int BOOL;\n'
+                     '#ifndef TRUE\n#define TRUE 1\n#define FALSE 0\n#endif\n'
+                     'static BOOL gdi_shared_own_task;\n'   # ml1373: the remote-instance flag the function sets
                      'static int armed;\nstatic int ios_wow_session_armed(void) { return armed; }\n'
                      + func.replace('ios_wow_session_armed && ', '') +
                      'int main(int c, char **v) { armed = atoi(v[1]); printf("%d\\n", gdi_shared_use_section()); return 0; }\n')
@@ -81,8 +83,8 @@ if gdiobj.exists():
 
         require(run('1', 0) == '1', 'wine: "1" section-backs the table in an unarmed (64-bit start) session')
         require(run('0', 1) == '0', 'wine: "0" keeps the private table even in an armed session')
-        require(run(None, 0) == '0' and run(None, 1) == '1', 'wine: unset follows the session being armed')
-        require(run('', 1) == '1', 'wine: empty follows the session being armed')
+        require(run(None, 0) == '1' and run(None, 1) == '1', 'wine: unset = section-backed table in every session (ml1352; MADEIRA_GDI_SECTION_ALWAYS=0 restores "only when armed")')
+        require(run('', 0) == '1' and run('', 1) == '1', 'wine: empty = unset')
 else:
     print('SKIP: wine submodule not checked out; gdi_shared_use_section not compiled')
 

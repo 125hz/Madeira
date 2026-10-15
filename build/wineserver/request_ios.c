@@ -339,6 +339,8 @@ static void ios_regflush_request(void)
         return;
     }
     ios_regflush_save( "now" );
+}
+
 /* madeira-bcd: the ml1055 request census, moved out of call_req_handler unchanged so a
  * direct request (ios_srv_direct_call) is counted the same way. current is thread. */
 static void ios_req_census( struct thread *thread, enum request req )

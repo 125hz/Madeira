@@ -98,8 +98,8 @@ static int ios_pool_range_execable(size_t off, size_t size, unsigned *cur, unsig
 static int ios_pool_range_clean(size_t off, size_t size)
 { return ios_pool_range_execable(off, size, NULL, NULL); }
 typedef int (*ios_pool_clean_fn)(size_t, size_t);
-static void ios_pool_check_range_exec(size_t off, size_t size, int reused)
-{ (void)off; (void)size; (void)reused; }
+static unsigned ios_pool_check_range_exec(size_t off, size_t size, int reused)
+{ (void)off; (void)size; (void)reused; return 0; }   /* this fork: returns the bad-range count */
 static int ios_pool_live_overlap(uintptr_t start, size_t size, size_t *off_out, void **peb_out)
 {
     size_t off = start - (uintptr_t)ios_jit_rw_base_global;
