@@ -3458,8 +3458,6 @@ struct ContentView: View {
                 try MadeiraDock.writeHandoff(account: signIn.accountName, token: signIn.refreshToken, appID: game.id)
             } catch { fail(error); return }
             MadeiraDock.configure(game, launchOption: launchOption)
-            // ml1371: Steam's discovery keys back to Dock's folder (the full client writes its own when it runs).
-            MadeiraDock.assertDiscoveryKeys()
             // The game's one-time installs (its Steam install script) run first, in the same
             // session. No session runs yet, so the registry files can be read and written.
             // madeira-bcd: they run in a session of their own (DockInstallers.installsOnly), and

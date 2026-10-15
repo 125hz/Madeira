@@ -385,46 +385,6 @@ enum MadeiraDock {
         return report
     }
 
-    // MARK: Discovery keys (ml1371)
-
-    /// Before every Dock start (no session runs yet, so the hives can be written):
-    /// Steam's discovery keys (SteamRuntimeFiles.registry: HKLM InstallPath, HKCU
-    /// SteamPath / SteamExe, ActiveProcess SteamClientDll / SteamClientDll64) point
-    /// at Dock's folder again. The full client writes its own when it runs; a game
-    /// in a Dock session reads them to find steamclient64.dll, which must be Dock's.
-    /// Log: "[steam-install] ml1371 dock keys: rewritten (were: <folder>) | already Dock's".
-    @MainActor static func assertDiscoveryKeys() {
-        guard wine_process_is_running() == 0, wineserver_is_running() == 0 else {
-            LogStore.shared.log("[steam-install] ml1371 dock keys: not checked (a session is running)")
-            return
-        }
-        var previous: [String] = [], pending: [(URL, String)] = [], problems: [String] = []
-        for (file, machine) in [("system.reg", true), ("user.reg", false)] {
-            let hive = prefix.appendingPathComponent(file)
-            guard hive.standardizedFileURL.path == hive.resolvingSymlinksInPath().standardizedFileURL.path,
-                  let text = try? String(contentsOf: hive, encoding: .utf8) else { continue }
-            if let plain = try? SteamRuntimeFiles.registry(text, machine: machine) {
-                if plain != text { pending.append((hive, plain)); previous.append("missing in " + file) }
-                continue
-            }
-            previous += SteamRuntimeFiles.discoveryRoots(text, machine: machine)
-                .filter { $0.caseInsensitiveCompare(SteamRuntimeFiles.windowsRoot) != .orderedSame }
-            do { pending.append((hive, try SteamRuntimeFiles.registry(text, machine: machine, force: true))) }
-            catch { problems.append(file) }
-        }
-        for (hive, text) in pending {
-            do { try Data(text.utf8).write(to: hive, options: .atomic) } catch { problems.append(hive.lastPathComponent) }
-        }
-        var unique: [String] = []
-        for folder in previous where !unique.contains(where: { $0.caseInsensitiveCompare(folder) == .orderedSame }) { unique.append(folder) }
-        let failed = problems.isEmpty ? "" : "; not written: " + problems.joined(separator: ", ")
-        if pending.isEmpty {
-            LogStore.shared.log("[steam-install] ml1371 dock keys: already Dock's" + failed)
-        } else {
-            LogStore.shared.log("[steam-install] ml1371 dock keys: rewritten (were: " + (unique.isEmpty ? "?" : unique.joined(separator: ", ")) + ")" + failed)
-        }
-    }
-
     // MARK: Launch
 
     private static var transferURL: URL? {
