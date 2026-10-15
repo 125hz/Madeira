@@ -672,14 +672,9 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
         int (*spawn)(int,char **,int,int,char **) = wine_host_spawn_process;
         extern char **environ;
         __atomic_store_n(&msl_spawn_remote,0,__ATOMIC_RELEASE);
-        /* Only when madsync really runs in this session (the server handed this process its
-         * device): the app switches a madsync session to fastsync when MADEIRA_EXT_PROCESS=1
-         * (ExtProcessSync), unless env.MADEIRA_EXT_PROCESS_KEEP_MADSYNC=1 keeps madsync. */
-        if (inproc_device_fd >= 0)
+        if (madeira_cfg_bool("inproc-sync",0))
         {
-            dprintf(2,"[ext-proc] ml1331 remote start refused: madsync is active in this session and uses app "
-                    "memory (env.MADEIRA_EXT_PROCESS_KEEP_MADSYNC=1, or an earlier session of this app run "
-                    "started it; restart Madeira)\n");
+            dprintf(2,"[ext-proc] ml1331 remote start refused: inproc-sync=1 uses app memory\n");
             free(argv); return STATUS_NOT_SUPPORTED;
         }
         for(argc=0;argv[argc];argc++);

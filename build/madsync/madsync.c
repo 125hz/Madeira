@@ -134,16 +134,13 @@ int madsync_enabled(void)
         int on = madeira_cfg_sync_engine() == MADEIRA_SYNC_MADSYNC;
         /* Madeira Dock: the app sets MADEIRA_MADSYNC_SESSION=0 only for a session that runs a
          * game's one-time installers first (Wine's services.exe never answered its RPC clients
-         * under madsync on device). ml1331: also for a session with env.MADEIRA_EXT_PROCESS = 1
-         * (ExtProcessSync, MadeiraExtProcess.swift): processes in extension tasks cannot reach
-         * app memory. Unset, or any other value: unchanged. Read once, like the cfg key, so it
-         * holds for the whole session. */
+         * under madsync on device). Unset, or any other value: unchanged. Read once, like the
+         * cfg key, so it holds for the whole session. */
         const char *session = getenv( "MADEIRA_MADSYNC_SESSION" );
         if (on && session && !strcmp( session, "0" ))
         {
             on = 0;
-            dprintf( 2, "[madsync] off for this session (MADEIRA_MADSYNC_SESSION=0: set by the app for one-time "
-                     "installs or remote processes)\n" );
+            dprintf( 2, "[madsync] off for this session (MADEIRA_MADSYNC_SESSION=0: one-time installs)\n" );
         }
         state = on;
         dprintf( 2, "[madsync] ml1058 in-process synchronisation %s (madeira.cfg inproc-sync = 1 enables; fastsync is the default)\n",

@@ -34,9 +34,8 @@ enum WindowedMode {
     }
 
     /// Round 7: the library HUD's round menu button is hidden (a frame is
-    /// maximized; its restore pill has a menu button). Round 9: for the whole
-    /// windowed session (the taskbar has a menu button too). SwiftUI views
-    /// observe WindowedHUD.shared.
+    /// maximized; its restore pill has a menu button). SwiftUI views observe
+    /// WindowedHUD.shared.
     @MainActor static var hidesHUDMenuButton: Bool { WindowedHUD.shared.hidesMenuButton }
 }
 
@@ -45,39 +44,16 @@ enum WindowedMode {
 @MainActor
 final class WindowedHUD: ObservableObject {
     static let shared = WindowedHUD()
-    /// The windowed taskbar and a maximized frame's restore pill both have a
-    /// menu button, so the HUD's round menu button would be a second one: it is
-    /// hidden for the whole windowed session (round 9; round 7 hid it only
-    /// while a frame was maximized).
+    /// A maximized frame shows the restore pill, which has its own menu button,
+    /// so the HUD's round menu button would be a second one.
     @Published private(set) var hidesMenuButton = false
-    private var session = false
-    private var maximized = false
-    private var keptSaid = false
 
-    /// The windowed compositor's root was attached (true) or removed.
-    func update(windowed on: Bool) {
-        session = on
-        apply(on ? "windowed mode: the taskbar and the restore pill have the menu" : "windowed mode ended")
-        if !on { keptSaid = false }
-    }
-
-    /// A frame was maximized or brought back.
-    func update(maximized on: Bool) {
-        maximized = on
-        apply(on ? "a frame is maximized; the restore pill has the menu" : "no frame maximized")
-    }
-
-    private func apply(_ why: String) {
-        let keep = MadeiraConfig.flag("MADEIRA_WINDOWED_HUD_MENU", fallback: false)   // 1: the library's round menu button stays in windowed mode (round 9 hides it for the whole windowed session, round 7 while a frame was maximized; the taskbar and the restore pill have a menu button)
-        let windowed = session || maximized
-        if keep && windowed && !keptSaid {
-            keptSaid = true
-            fputs("[windowed] ml1300 hud menu button kept (env.MADEIRA_WINDOWED_HUD_MENU = 1)\n", stderr)
-        }
-        let hide = windowed && !keep
+    func update(maximized: Bool) {
+        let keep = MadeiraConfig.flag("MADEIRA_WINDOWED_HUD_MENU", fallback: false)   // 1: the library's round menu button stays while a windowed-mode frame is maximized (round 7 hides it; the restore pill has a menu button)
+        let hide = maximized && !keep
         guard hide != hidesMenuButton else { return }
         hidesMenuButton = hide
-        fputs("[windowed] ml1300 hud menu button \(hide ? "hidden" : "shown") (\(why))\n", stderr)
+        fputs("[windowed] ml1300 hud menu button \(hide ? "hidden (a frame is maximized; the restore pill has the menu)" : "shown")\n", stderr)
     }
 }
 
@@ -130,13 +106,6 @@ final class MadeiraWindowedBridge: NSObject {
     /// the restore pill has its own menu button.
     @MainActor @objc static func maximizedChanged(_ on: Bool) {
         WindowedHUD.shared.update(maximized: on)
-    }
-
-    /// Round 9: the windowed compositor's root was attached or removed
-    /// (WiniosWindowed.m, main thread). The library's round menu button hides
-    /// for the whole windowed session: the taskbar has its own menu button.
-    @MainActor @objc static func windowedSessionChanged(_ on: Bool) {
-        WindowedHUD.shared.update(windowed: on)
     }
 
     /// The Steam button when no Steam window is open in the session (one that
@@ -237,7 +206,7 @@ enum WindowedSteam {
     /// Dock's 32-bit components); with env.MADEIRA_STEAM_PACKAGE_INSTALL = 0 any steam.exe.
     static var readyClient: String? {
         let original = LibraryModel.documents.appendingPathComponent("wine").path
-        if let shared = SharedContainer.drive(prefix: original),
+        if let shared = madeira_process_host_shared_drive(original),
            SteamClientPackages.installed(root: URL(fileURLWithPath: shared).appendingPathComponent("Steam")) {
             return "D:\\Steam\\steam.exe"
         }
@@ -378,38 +347,19 @@ enum WindowedSteam {
     static func offerInstall(done: @escaping @MainActor (Bool) -> Void) {
         let model = SteamClientInstallModel.shared
         if model.running { model.present(); return }
-        // A Madeira Dock game session uses the client's files: say what to do instead of failing in the sheet.
-        if wine_process_is_running() != 0 || wineserver_is_running() != 0,
-           getenv("MADEIRA_DOCK_SESSION").map({ String(cString: $0) == "1" }) == true {
-            fputs("[steam-install] ml1370 not started (a Madeira Dock game session is running)\n", stderr)
-            show("Quit the game first", "Steam can't be installed while a Madeira Dock game is running (Dock uses "
-                 + "Steam's client files). Quit the game, then open the Desktop entry in your library and install Steam "
-                 + "from its taskbar (search \"Steam\").")
-            done(false)
-            return
-        }
-        let pending = SteamClientPackages.pendingInstall()
         var message = "Madeira downloads Valve's current Steam client from Valve's update server "
             + "(\(SteamClientPackages.manifestName): its packages, a few hundred MB, about 1 GB once unpacked) and installs it "
-            + "in \(SteamClientPackages.installWindowsRoot), as Steam's own installer would. No sign-in is involved. "
-            + "Keep Madeira open until it finishes; if it is interrupted, Install continues where it stopped."
-        if let pending {
-            fputs("[steam-install] ml1370 resumable install found: \(pending.done) of \(pending.parts) packages done "
-                  + "(client version \(pending.version))\n", stderr)
-            message = "An earlier Steam install stopped with \(pending.done) of \(pending.parts) packages done. Madeira "
-                + "continues from the first unfinished package (a newer client version from Valve starts over)."
-        }
+            + "in \(SteamClientPackages.installWindowsRoot), as Steam's own installer would. No sign-in is involved."
         if SteamClientPackages.installWindowsRoot == SteamRuntimeFiles.windowsRoot, MadeiraDock.enabled && MadeiraDock.clientInstalled {
             message += "\n\nMadeira Dock's client files are in that folder. The current client replaces them, and Dock "
                 + "refuses a client build it has not verified, so Dock starts may fail until Dock supports that build."
         }
-        let title = pending.map { "Resume Steam install (\($0.done) of \($0.parts) done)" } ?? "Install Steam"
-        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        let alert = UIAlertController(title: "Install Steam", message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
             fputs("[steam-install] ml1370 not started (cancelled at the confirmation)\n", stderr)
             done(false)
         })
-        alert.addAction(UIAlertAction(title: pending == nil ? "Install" : "Resume", style: .default) { _ in
+        alert.addAction(UIAlertAction(title: "Install", style: .default) { _ in
             SteamClientInstallModel.shared.start(done: done)
         })
         present(alert)
@@ -679,29 +629,19 @@ private final class SteamSetupRedirects: NSObject, URLSessionTaskDelegate, @unch
 /// ml1370: the full client's install (SteamClientInstaller, SteamRuntime.swift)
 /// and its progress sheet, shown over the windowed desktop or the library. One
 /// install at a time; the sheet can be reopened (the Steam button, the library
-/// entry) while it runs. While it runs the screen does not lock (idle timer off)
-/// and each package runs inside a UIKit background task, so switching away
-/// gives it the time iOS allows; when that runs out the install stops cleanly
-/// and the next Install resumes from the first unfinished package. Log lines:
-/// "[steam-install] ml1370 part N of M (name, size) downloading | unpacking | done | already done (resumed)",
-/// "[steam-install] ml1370 installed in C:\Program Files (x86)\Steam (…)", "… failed (…)",
-/// "… interrupted at part N of M (app suspended); tap Install again to resume".
+/// entry) while it runs. Log lines:
+/// "[steam-install] ml1370 part N of M (name, size) downloading | unpacking | done",
+/// "[steam-install] ml1370 installed in C:\Program Files (x86)\Steam (…)", "… failed (…)".
 @MainActor
 final class SteamClientInstallModel: ObservableObject {
     static let shared = SteamClientInstallModel()
     @Published private(set) var progress = SteamClientInstallProgress()
     @Published private(set) var running = false
     @Published private(set) var failure: String?
-    /// The install finished and Steam is being started.
-    @Published private(set) var startingSteam = false
     private var task: Task<Void, Never>?
     private var completions: [@MainActor (Bool) -> Void] = []
     private weak var controller: UIViewController?
     private var logged = ""
-    private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
-    private var backgroundPart = -1
-    private var suspended = false
-    private var idleTimerWasDisabled = false
 
     static func size(_ bytes: Int) -> String { String(format: "%.1f MB", Double(bytes) / 1_000_000) }
 
@@ -709,16 +649,11 @@ final class SteamClientInstallModel: ObservableObject {
         completions.append(done)
         present()
         guard !running else { return }
-        running = true; failure = nil; startingSteam = false; suspended = false
-        progress = SteamClientInstallProgress(); logged = ""
-        idleTimerWasDisabled = UIApplication.shared.isIdleTimerDisabled
-        UIApplication.shared.isIdleTimerDisabled = true   // no auto-lock while it runs
-        holdBackground(part: 0)
+        running = true; failure = nil; progress = SteamClientInstallProgress(); logged = ""
         let prefix = MadeiraDock.prefix
         let session = wine_process_is_running() != 0 || wineserver_is_running() != 0
         fputs("[steam-install] ml1370 start: manifest \(SteamRuntimeFiles.origin)\(SteamClientPackages.manifestName) "
-              + "(\(session ? "a session is running: files only, Steam writes its own registry keys" : "no session")); "
-              + "footprint \(SteamClientInstaller.footprintMB()) MB\n", stderr)
+              + "(\(session ? "a session is running: files only, Steam writes its own registry keys" : "no session"))\n", stderr)
         task = Task {
             do {
                 let result = try await SteamClientInstaller.shared.install(prefix: prefix, sessionRunning: session) { step in
@@ -735,62 +670,25 @@ final class SteamClientInstallModel: ObservableObject {
 
     func cancel() { task?.cancel() }
 
-    /// One UIKit background task per package (and one for the move into the
-    /// Steam folder): iOS lets the current one finish after the app leaves the
-    /// screen, for as long as it grants. Expired: stop; the markers keep what is done.
-    private func holdBackground(part: Int) {
-        guard part != backgroundPart || backgroundTask == .invalid else { return }
-        let previous = backgroundTask
-        backgroundPart = part
-        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "Steam install part \(part)") {
-            MainActor.assumeIsolated { SteamClientInstallModel.shared.backgroundExpired() }
-        }
-        if previous != .invalid { UIApplication.shared.endBackgroundTask(previous) }
-    }
-
-    private func releaseBackground() {
-        if backgroundTask != .invalid { UIApplication.shared.endBackgroundTask(backgroundTask) }
-        backgroundTask = .invalid
-        backgroundPart = -1
-    }
-
-    private func backgroundExpired() {
-        guard running else { releaseBackground(); return }
-        suspended = true
-        fputs("[steam-install] ml1370 interrupted at part \(progress.part) of \(progress.parts) (app suspended); "
-              + "tap Install again to resume\n", stderr)
-        task?.cancel()
-        releaseBackground()   // iOS requires it now; the cancelled install ends when the app runs again
-    }
-
     private func update(_ step: SteamClientInstallProgress) {
         guard running else { return }
         // Download progress comes from its own tasks: one that arrives after the
         // package moved on is dropped.
         if step.phase == .downloading, step.part < progress.part || (step.part == progress.part && progress.phase != .downloading) { return }
         progress = step
-        switch step.phase {
-        case .downloading, .unpacking, .skipped: holdBackground(part: step.part)
-        case .installing: holdBackground(part: step.parts + 1)
-        default: break
-        }
         let line: String
         switch step.phase {
         case .manifest: return
-        case .downloading, .unpacking, .done, .skipped:
-            let what = step.phase == .skipped ? "already done (resumed)" : step.phase.rawValue
-            line = "part \(step.part) of \(step.parts) (\(step.name), \(Self.size(step.bytes))) \(what)"
-                + (step.phase == .done ? "; peak footprint \(step.peakFootprintMB) MB" : "")
-            if step.part == 1, step.phase == .downloading || step.phase == .skipped, !logged.hasPrefix("part") {
-                fputs("[steam-install] ml1370 manifest version \(step.version): \(step.parts) packages, \(Self.size(step.totalBytes)) "
-                      + "(smallest first)\n", stderr)
+        case .downloading, .unpacking, .done:
+            line = "part \(step.part) of \(step.parts) (\(step.name), \(Self.size(step.bytes))) \(step.phase.rawValue)"
+            if step.part == 1, step.phase == .downloading, !logged.hasPrefix("part") {
+                fputs("[steam-install] ml1370 manifest version \(step.version): \(step.parts) packages, \(Self.size(step.totalBytes))\n", stderr)
             }
         case .installing:
             line = "installing \(step.files) files (client version \(step.version)) into \(SteamClientPackages.installWindowsRoot)"
         case .finished:
             line = "installed in \(SteamClientPackages.installWindowsRoot) (client version \(step.version), \(step.files) files from "
-                + "\(step.parts) packages, \(Self.size(step.totalBytes))\(step.resumed > 0 ? ", \(step.resumed) from an earlier attempt" : ""); "
-                + "registry: \(step.registry); peak footprint \(step.peakFootprintMB) MB)"
+                + "\(step.parts) packages, \(Self.size(step.totalBytes)); registry: \(step.registry))"
         }
         guard line != logged else { return }
         logged = line
@@ -800,40 +698,20 @@ final class SteamClientInstallModel: ObservableObject {
     private func finish(_ result: SteamClientInstallProgress?, failure reason: String?) {
         running = false
         task = nil
-        UIApplication.shared.isIdleTimerDisabled = idleTimerWasDisabled
-        releaseBackground()
         if let reason {
-            let pending = SteamClientPackages.pendingInstall()
-            let kept = pending.map { " \($0.done) of \($0.parts) packages are kept; tap Install again to resume." } ?? ""
-            if suspended {
-                failure = "Interrupted at part \(progress.part) of \(progress.parts): iOS suspended Madeira while it was in "
-                    + "the background." + kept
-            } else {
-                failure = reason == "cancelled" ? "Stopped." + kept : reason + kept
-            }
+            failure = reason
             fputs("[steam-install] ml1370 failed at part \(progress.part) of \(progress.parts) "
-                  + "(\(progress.phase.rawValue)): \(suspended ? "interrupted (app suspended)" : reason)"
-                  + "\(pending.map { "; resumable: \($0.done) of \($0.parts) packages done" } ?? "")\n", stderr)
+                  + "(\(progress.phase.rawValue)): \(reason)\n", stderr)
         } else if let result {
             progress = result
         }
         let callbacks = completions
         completions = []
         let ok = reason == nil
-        if ok {
-            // "Installed. Starting Steam…" stays up a moment while the launch is queued.
-            startingSteam = true
-            for callback in callbacks { callback(true) }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-                MainActor.assumeIsolated {
-                    let model = SteamClientInstallModel.shared
-                    guard !model.running, model.startingSteam else { return }
-                    model.startingSteam = false
-                    model.close()
-                }
-            }
+        if ok, let controller, controller.presentingViewController != nil {
+            controller.dismiss(animated: true) { for callback in callbacks { callback(true) } }
         } else {
-            for callback in callbacks { callback(false) }
+            for callback in callbacks { callback(ok) }
         }
     }
 
@@ -853,14 +731,13 @@ final class SteamClientInstallModel: ObservableObject {
 
     var title: String {
         let p = progress
-        if let failure { return failure.hasPrefix("Stopped.") ? "Install stopped." : "Steam was not installed." }
+        if let failure { return failure == "cancelled" ? "Install cancelled." : "Steam was not installed." }
         switch p.phase {
         case .manifest: return "Reading Valve's client manifest…"
         case .downloading: return "Downloading part \(p.part) of \(p.parts) (\(p.name), \(Self.size(p.bytes)))…"
         case .unpacking, .done: return "Unpacking part \(p.part) of \(p.parts) (\(p.name))…"
-        case .skipped: return "Part \(p.part) of \(p.parts) (\(p.name)) is already done…"
         case .installing: return "Installing \(p.files) files…"
-        case .finished: return startingSteam ? "Installed. Starting Steam…" : "Steam is installed in \(SteamClientPackages.installWindowsRoot)."
+        case .finished: return "Steam is installed in \(SteamClientPackages.installWindowsRoot)."
         }
     }
 
@@ -868,17 +745,15 @@ final class SteamClientInstallModel: ObservableObject {
         let p = progress
         if p.phase == .finished || p.phase == .installing { return 1 }
         guard p.totalBytes > 0 else { return 0 }
-        let now = p.finishedBytes + (p.phase == .downloading ? p.received : (p.phase == .done || p.phase == .skipped ? 0 : p.bytes))
+        let now = p.finishedBytes + (p.phase == .downloading ? p.received : (p.phase == .done ? 0 : p.bytes))
         return min(1, Double(now) / Double(p.totalBytes))
     }
 
     var detail: String {
         let p = progress
         guard p.totalBytes > 0 else { return "From \(SteamRuntimeFiles.origin)" }
-        let done = p.finishedBytes + (p.phase == .downloading ? p.received : (p.phase == .done || p.phase == .skipped ? 0 : p.bytes))
+        let done = p.finishedBytes + (p.phase == .downloading ? p.received : (p.phase == .done ? 0 : p.bytes))
         return "\(Self.size(min(done, p.totalBytes))) of \(Self.size(p.totalBytes)) · client version \(p.version)"
-            + (p.resumed > 0 ? " · \(p.resumed) packages from an earlier attempt" : "")
-            + (running ? " · keep Madeira open" : "")
     }
 }
 
@@ -892,7 +767,7 @@ struct SteamClientInstallSheet: View {
             Text(model.title).font(.subheadline)
             ProgressView(value: model.fraction)
             Text(model.detail).font(.footnote).foregroundStyle(.secondary)
-            if let failure = model.failure {
+            if let failure = model.failure, failure != "cancelled" {
                 Text(failure).font(.footnote).foregroundStyle(.orange)
             }
             HStack {
@@ -1050,10 +925,7 @@ enum WindowedLauncher {
         if MadeiraWindowedBridge.steamButtonEnabled() {
             let client = WindowedSteam.installedClient
             let ready = WindowedSteam.readyClient   // ml1370: the full client; Dock's components alone install it first
-            var missing = WindowedSteam.packageInstall ? "Not installed: installs Valve's client packages" : "Not installed: downloads Valve's installer"
-            if WindowedSteam.packageInstall, let pending = SteamClientPackages.pendingInstall() {
-                missing = "Resume Steam install (\(pending.done) of \(pending.parts) done)"   // ml1370: an interrupted install
-            }
+            let missing = WindowedSteam.packageInstall ? "Not installed: installs Valve's client packages" : "Not installed: downloads Valve's installer"
             list.append(Item(kind: "tool", name: "Steam",
                              detail: ready.map { "Steam client · " + windowsPath($0) } ?? missing,
                              icon: client.map { drive.appendingPathComponent($0).path }, symbol: "gamecontroller",

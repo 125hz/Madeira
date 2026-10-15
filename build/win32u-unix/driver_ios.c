@@ -465,21 +465,6 @@ int winios_drv_foreground_if_owner( HWND hwnd )
     return 1;
 }
 
-/* ml1332 process host (docs/PROCESS_HOST.md): a top-level window owned by a Wine
- * client in the MadeiraProcessHost extension has no thread in this task, so the
- * owner-thread rule above never runs for it. Any Wine thread may ask the server
- * to make it foreground; win32u then sends WM_WINE_SETACTIVEWINDOW through the
- * server to the owning thread, which activates the window (and takes the focus,
- * as DefWindowProc does) inside its own process. The app calls this only for a
- * window an extension client reported. Returns 0 for a window of this process,
- * 1 when it is now foreground, -1 on failure. */
-int winios_drv_foreground_remote( HWND hwnd )
-{
-    DWORD pid = 0;
-    if (!hwnd || !get_window_thread( hwnd, &pid ) || pid == GetCurrentProcessId()) return 0;
-    return NtUserSetForegroundWindow( hwnd ) ? 1 : -1;
-}
-
 /* ml1300 windowed mode helpers for app/Madeira/Winios/WiniosWindowed.m, which
  * draws each top-level window in its own frame with a title bar and lists the
  * program windows in a taskbar. Winios.m cannot include the Wine headers, so

@@ -356,7 +356,7 @@ actor SteamRuntimeInstaller {
 enum SteamClientPackages {
     static var installWindowsRoot: String {
         let prefix = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent("wine")
-        return SharedContainer.drive(prefix: prefix.path) == nil ? SteamRuntimeFiles.windowsRoot : "D:\\Steam"
+        return madeira_process_host_shared_drive(prefix.path) == nil ? SteamRuntimeFiles.windowsRoot : "D:\\Steam"
     }
     /// The manifest the 64-bit client's bootstrapper reads (Valve's file name).
     static let manifestName = "steam_client_win64"
@@ -377,8 +377,7 @@ enum SteamClientPackages {
 
     struct Manifest: Sendable {
         let version: String
-        /// Download order (ml1370 resume): smallest first, so an interruption
-        /// loses the least; ties by name.
+        /// Download order: by name, the bootstrapper's own package (steam.exe) last.
         let packages: [Package]
         var bytes: Int { packages.reduce(0) { $0 + $1.bytes } }
     }
@@ -391,7 +390,7 @@ enum SteamClientPackages {
             case .download(let why): return "A Steam package could not be downloaded: \(why)."
             case .package(let why): return "A Steam package failed its check: \(why). Nothing was installed; try again."
             case .space(let mb): return "Not enough free space: installing Steam needs about \(mb) MB."
-            case .dockSession: return "Steam can't be installed while a Madeira Dock game is running (Dock uses the client's files). Quit the game first, then install Steam from the Desktop entry."
+            case .dockSession: return "Steam cannot be installed during a Madeira Dock session (Dock uses the client's files). End the game first."
             case .notWindows64: return "The downloaded client is not the 64-bit Windows client."
             }
         }
@@ -421,38 +420,12 @@ enum SteamClientPackages {
             packages.append(Package(name: name, file: file, bytes: bytes, sha256: sha))
         }
         guard (1...64).contains(packages.count) else { throw Failure.manifest("\(packages.count) packages") }
-        packages.sort { $0.bytes != $1.bytes ? $0.bytes < $1.bytes : $0.name < $1.name }
+        let bootstrapper = section.fields.filter { $0.value["isbootstrapperpackage"]?.string == "1" }.map(\.key)
+        packages.sort { a, b in
+            let la = bootstrapper.contains(a.name), lb = bootstrapper.contains(b.name)
+            return la != lb ? lb : a.name < b.name
+        }
         return Manifest(version: version, packages: packages)
-    }
-
-    // MARK: Resume (ml1370)
-
-    /// The install's staging folder, kept between attempts (and app runs) so an
-    /// interrupted install continues: `state` (manifest version, package count),
-    /// `done/<package>` markers ("version package sha256") for packages already
-    /// unpacked into `files/`, and `zips/` for downloaded packages not yet
-    /// unpacked. Removed after a complete install. Not backed up.
-    static var stageFolder: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("MadeiraSteam/client-stage", isDirectory: true)
-    }
-
-    static func marker(version: String, _ package: Package) -> String { "\(version) \(package.name) \(package.sha256)" }
-
-    /// An interrupted install: its manifest version, the packages already done
-    /// and the package count; nil when there is none.
-    static func pendingInstall() -> (version: String, done: Int, parts: Int)? {
-        let stage = stageFolder
-        guard let text = try? String(contentsOf: stage.appendingPathComponent("state"), encoding: .utf8) else { return nil }
-        let lines = text.split(separator: "\n").map(String.init)
-        guard lines.count >= 2, let parts = Int(lines[1]), parts > 0 else { return nil }
-        let version = lines[0]
-        let done = ((try? FileManager.default.contentsOfDirectory(atPath: stage.appendingPathComponent("done").path)) ?? [])
-            .filter { name in
-                (try? String(contentsOf: stage.appendingPathComponent("done/" + name), encoding: .utf8))?
-                    .hasPrefix(version + " " + name + " ") == true
-            }.count
-        return (version, min(done, parts), parts)
     }
 
     /// A PE file for x86-64 (IMAGE_FILE_MACHINE_AMD64); false for the 32-bit
@@ -483,7 +456,7 @@ enum SteamClientPackages {
 
 /// What the installer is doing, for the progress sheet and the log.
 struct SteamClientInstallProgress: Sendable, Equatable {
-    enum Phase: String, Sendable { case manifest, downloading, unpacking, done, skipped, installing, finished }
+    enum Phase: String, Sendable { case manifest, downloading, unpacking, done, installing, finished }
     var phase: Phase = .manifest
     /// 1-based package number and the package count (0 before the manifest).
     var part = 0, parts = 0
@@ -498,10 +471,6 @@ struct SteamClientInstallProgress: Sendable, Equatable {
     var files = 0
     /// What happened to Steam's registry keys (finished).
     var registry = ""
-    /// ml1370 resume: packages taken from an earlier, interrupted attempt.
-    var resumed = 0
-    /// The app's largest phys_footprint seen during the install, in MB.
-    var peakFootprintMB = 0
 }
 
 /// Download progress arrives for every buffer; the sheet needs a few hundred updates.
@@ -542,9 +511,7 @@ actor SteamClientInstaller {
     /// left to Steam, which writes its own keys when it starts. Without a session
     /// the prefix is seeded first and Madeira Dock's discovery keys are written
     /// when they do not conflict. Existing files are replaced, except user data
-    /// (SteamClientPackages.keptFolders); steam.exe is written last. ml1370
-    /// resume: packages finished by an earlier attempt of the same client version
-    /// are skipped (SteamClientPackages.stageFolder).
+    /// (SteamClientPackages.keptFolders); steam.exe is written last.
     func install(prefix: URL, sessionRunning: Bool,
                  progress: @escaping @Sendable (SteamClientInstallProgress) async -> Void) async throws -> SteamClientInstallProgress {
         guard !busy else { throw SteamClientPackages.Failure.download("an install is already running") }
@@ -572,46 +539,23 @@ actor SteamClientInstaller {
         }
         let manifest = try SteamClientPackages.parse(manifestData)
         state.parts = manifest.packages.count; state.totalBytes = manifest.bytes; state.version = manifest.version
-        state.peakFootprintMB = Self.footprintMB()
 
-        // The staging folder survives an interruption; a different client version starts over.
-        let stage = SteamClientPackages.stageFolder
-        let files = stage.appendingPathComponent("files", isDirectory: true)
-        let doneFolder = stage.appendingPathComponent("done", isDirectory: true)
-        let zips = stage.appendingPathComponent("zips", isDirectory: true)
-        if let earlier = SteamClientPackages.pendingInstall(), earlier.version != manifest.version {
-            try? fm.removeItem(at: stage)
-        }
-        for folder in [files, doneFolder, zips] { try fm.createDirectory(at: folder, withIntermediateDirectories: true) }
-        var excluded = URLResourceValues(); excluded.isExcludedFromBackup = true
-        var stageURL = stage; try? stageURL.setResourceValues(excluded)
-        try Data("\(manifest.version)\n\(manifest.packages.count)\n".utf8).write(to: stage.appendingPathComponent("state"), options: .atomic)
-        func finished(_ package: SteamClientPackages.Package) -> Bool {
-            (try? String(contentsOf: doneFolder.appendingPathComponent(package.name), encoding: .utf8))
-                == SteamClientPackages.marker(version: manifest.version, package)
-        }
-
-        // Room for the remaining packages, their unpacked files and a margin (the unpacked client is ~2.3x the packages).
-        let remaining = manifest.packages.filter { !finished($0) }.reduce(0) { $0 + $1.bytes }
-        let need = remaining * 3 + (256 << 20)
-        if let free = try? stage.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage,
+        // Room for the packages, the unpacked client and a margin (the unpacked client is ~2.3x the packages).
+        let need = manifest.bytes * 3 + (256 << 20)
+        if let free = try? URL(fileURLWithPath: NSTemporaryDirectory())
+            .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage,
            free < Int64(need) {
             throw SteamClientPackages.Failure.space(need >> 20)
         }
 
+        let stage = fm.temporaryDirectory.appendingPathComponent("madeira-steam-client-" + UUID().uuidString)
+        let files = stage.appendingPathComponent("files", isDirectory: true)
+        try fm.createDirectory(at: files, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: stage) }
         // Lower-case relative path -> the spelling of its first package. The
         // stage keeps exact spellings; the commit matches them to the disk.
-        // A resumed install reads back what earlier attempts staged.
         var names: [String: String] = [:], folders: [String: String] = [:]
         var made = Set<String>()   // stage folders already created (exact spelling)
-        for (relative, isFolder) in Self.staged(in: files) {
-            if isFolder {
-                folders[relative.lowercased()] = folders[relative.lowercased()] ?? relative
-                made.insert(relative)
-            } else {
-                names[relative.lowercased()] = names[relative.lowercased()] ?? relative
-            }
-        }
         func staged(_ name: String) throws -> URL {
             let key = name.lowercased()
             let spelled = names[key] ?? name
@@ -627,49 +571,28 @@ actor SteamClientInstaller {
         for (index, package) in manifest.packages.enumerated() {
             try Task.checkCancellation()
             state.part = index + 1; state.name = package.name; state.bytes = package.bytes; state.received = 0
-            if finished(package) {
-                state.finishedBytes += package.bytes; state.resumed += 1; state.phase = .skipped
-                await progress(state)
-                continue
+            state.phase = .downloading
+            await progress(state)
+            let archive = stage.appendingPathComponent("package.zip")
+            try? fm.removeItem(at: archive)
+            let url = URL(string: SteamRuntimeFiles.origin + package.file)!
+            let snapshot = state
+            let throttle = SteamProgressThrottle(step: max(256 << 10, package.bytes / 200))
+            let response = try await Self.download(url, to: archive, session: session) { received in
+                guard throttle.pass(received) else { return }
+                var now = snapshot; now.received = Int(received)
+                Task { await progress(now) }
             }
-            // A package downloaded by an earlier attempt but not unpacked is used
-            // again when its size and SHA-256 still match.
-            let archive = zips.appendingPathComponent(package.file)
-            if let size = (try? archive.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size == package.bytes,
-               let earlier = try? Data(contentsOf: archive, options: .alwaysMapped), Self.hash(earlier) == package.sha256 {
-                state.received = package.bytes; state.phase = .downloading
-                await progress(state)
-            } else {
-                try? fm.removeItem(at: archive)
-                state.phase = .downloading
-                await progress(state)
-                let url = URL(string: SteamRuntimeFiles.origin + package.file)!
-                let snapshot = state
-                let throttle = SteamProgressThrottle(step: max(256 << 10, package.bytes / 200))
-                let response = try await Self.download(url, to: archive, session: session) { received in
-                    guard throttle.pass(received) else { return }
-                    var now = snapshot; now.received = Int(received)
-                    Task { await progress(now) }
-                }
-                guard response.statusCode == 200, response.url?.host == url.host, response.url?.scheme == "https" else {
-                    try? fm.removeItem(at: archive)
-                    throw SteamClientPackages.Failure.download("Valve's server answered \(response.statusCode) for \(package.name)")
-                }
-                guard (try archive.resourceValues(forKeys: [.fileSizeKey])).fileSize == package.bytes else {
-                    try? fm.removeItem(at: archive)
-                    throw SteamClientPackages.Failure.package("\(package.name) has the wrong size")
-                }
+            guard response.statusCode == 200, response.url?.host == url.host, response.url?.scheme == "https" else {
+                throw SteamClientPackages.Failure.download("Valve's server answered \(response.statusCode) for \(package.name)")
+            }
+            guard (try archive.resourceValues(forKeys: [.fileSizeKey])).fileSize == package.bytes else {
+                throw SteamClientPackages.Failure.package("\(package.name) has the wrong size")
             }
             state.received = package.bytes; state.phase = .unpacking
             await progress(state)
-            // Mapped, never read whole into memory: the hash and the reader page
-            // through the file, and each entry is written out in 1 MB pieces.
             let data = try Data(contentsOf: archive, options: .alwaysMapped)
-            guard Self.hash(data) == package.sha256 else {
-                try? fm.removeItem(at: archive)
-                throw SteamClientPackages.Failure.package("\(package.name) has the wrong SHA-256")
-            }
-            var written = 0
+            guard Self.hash(data) == package.sha256 else { throw SteamClientPackages.Failure.package("\(package.name) has the wrong SHA-256") }
             do {
                 try SteamRuntimeFiles.unpack(data, limits: .client, directory: { name in
                     let key = name.lowercased()
@@ -679,8 +602,6 @@ actor SteamClientInstaller {
                         try fm.createDirectory(at: files.appendingPathComponent(spelled), withIntermediateDirectories: true)
                     }
                 }) { name, _, read in
-                    written += 1
-                    if written % 128 == 0 { state.peakFootprintMB = max(state.peakFootprintMB, Self.footprintMB()) }
                     let target = try staged(name)
                     try? fm.removeItem(at: target)   // a later package's copy of the same file wins, as in the bootstrapper
                     guard fm.createFile(atPath: target.path, contents: nil) else { throw SteamRuntimeFiles.Failure.invalidPackage }
@@ -696,10 +617,7 @@ actor SteamClientInstaller {
             } catch SteamRuntimeFiles.Failure.invalidPackage {
                 throw SteamClientPackages.Failure.package("\(package.name) is not a ZIP archive Madeira accepts")
             }
-            try Data(SteamClientPackages.marker(version: manifest.version, package).utf8)
-                .write(to: doneFolder.appendingPathComponent(package.name), options: .atomic)
             try? fm.removeItem(at: archive)
-            state.peakFootprintMB = max(state.peakFootprintMB, Self.footprintMB())
             state.finishedBytes += package.bytes; state.phase = .done
             await progress(state)
         }
@@ -715,7 +633,7 @@ actor SteamClientInstaller {
             madeira_seed_prefix_if_needed(prefix.path)
         }
         let drive = prefix.appendingPathComponent("drive_c")
-        let shared = SharedContainer.drive(prefix: prefix.path).map { URL(fileURLWithPath: $0) }
+        let shared = madeira_process_host_shared_drive(prefix.path).map { URL(fileURLWithPath: $0) }
         let root = shared?.appendingPathComponent("Steam") ?? drive.appendingPathComponent(SteamRuntimeFiles.relativeRoot)
         let windowsRoot = shared == nil ? SteamRuntimeFiles.windowsRoot : "D:\\Steam"
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
@@ -768,38 +686,10 @@ actor SteamClientInstaller {
                 state.registry = "left as is (\(error is SteamRuntimeFiles.Failure ? "Steam keys for another folder are already there" : Self.reason(error)))"
             }
         }
-        try? fm.removeItem(at: stage)   // complete: nothing to resume
         state.phase = .finished
-        state.peakFootprintMB = max(state.peakFootprintMB, Self.footprintMB())
         if kept > 0 { state.registry += "; \(kept) existing user-data files kept" }
         await progress(state)
         return state
-    }
-
-    /// What earlier attempts left in the stage's `files/`: relative paths (exact
-    /// spelling) and whether each is a folder.
-    private static func staged(in files: URL) -> [(String, Bool)] {
-        guard let walker = FileManager.default.enumerator(at: files, includingPropertiesForKeys: [.isDirectoryKey]) else { return [] }
-        let base = files.standardizedFileURL.path + "/"
-        var found: [(String, Bool)] = []
-        for case let url as URL in walker {
-            let path = url.standardizedFileURL.path
-            guard path.hasPrefix(base) else { continue }
-            found.append((String(path.dropFirst(base.count)), (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true))
-        }
-        return found
-    }
-
-    /// The app's phys_footprint (the number jetsam judges), in MB.
-    static func footprintMB() -> Int {
-        var info = task_vm_info_data_t()
-        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
-        let kr = withUnsafeMutablePointer(to: &info) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
-            }
-        }
-        return kr == KERN_SUCCESS ? Int(info.phys_footprint >> 20) : 0
     }
 
     private static func download(_ url: URL, to target: URL, session: URLSession,
