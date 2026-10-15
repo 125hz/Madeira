@@ -736,24 +736,31 @@ enum GameRecommendations {
         """,
         avx: true, nvidia: false, wineVCRT: false, display: "fit")
 
-    /// Crysis 3 Remastered (Steam 2096610), not yet run with this list. On madeira-bcd
-    /// build 540 (2026-10-14 23:55) it ran with the standard list and every switch off,
-    /// and stopped when Microsoft's ARM64EC msvcp140.dll branched to its own image base
-    /// (c000001d on the MZ header). Version 1: the standard line with AVX on and Wine's
-    /// C++ runtime instead of Microsoft's, NVIDIA off, at Fit.
+    /// Crysis 3 Remastered (Steam 2096610). On madeira-bcd build 540 (2026-10-14
+    /// 23:55) it ran with the standard list and every switch off, and stopped when
+    /// msvcp140.dll branched to its own image base (c000001d on the MZ header).
+    /// Version 1 turned Wine's C++ runtime on; it stopped the same way on build 547
+    /// (2026-10-15 15:08:17): that switch does nothing in a Steam (Dock) session,
+    /// and the DLL is Wine's ARM64EC msvcp140 (sysx64) all along. The game's Bin64
+    /// ships Microsoft's x64 vcruntime140.dll, and Wine's msvcp140 cannot call its
+    /// x64 memcpy (no exit thunk). Version 2: env.MADEIRA_APP_DLL_SHADOW =
+    /// vcruntime140.dll makes the loader take Wine's vcruntime140, as in every Steam
+    /// game without its own copy, and Wine's C++ runtime switch is off again. It runs
+    /// with it (owner, build 549: "sorunsuz çalıştı").
     static let crysis3Remastered = GameRecommendation(
-        id: "crysis-3-remastered", title: "Crysis 3 Remastered", version: 1,
+        id: "crysis-3-remastered", title: "Crysis 3 Remastered", version: 2,
         config: """
         # Madeira's recommended settings for Crysis 3 Remastered.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
         env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_APP_DLL_SHADOW = vcruntime140.dll
         # madeira-bcd's defaults, which this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
         env.MADEIRA_CTX_CPU_AREA = 2
         env.MADEIRA_WAIT_CHILDREN = 1
         env.MADEIRA_JIT_DUMP = 0
         """,
-        avx: true, nvidia: false, wineVCRT: true, display: "fit")
+        avx: true, nvidia: false, wineVCRT: false, display: "fit")
 
     /// Every other game, and the Desktop (owner's decisions, 2026-10-12): most games
     /// the owner tried outside these lists closed at start until the [ec-hook]
