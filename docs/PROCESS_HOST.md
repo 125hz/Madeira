@@ -372,24 +372,6 @@ send failed); `frame` lines but a black/garbled window (Core Animation did not
 take the IOSurface: report it, `env.MADEIRA_EXT_PROCESS_FRAMES = 0` restores
 phase 2); `IOSurface ... allocation failed`.
 
-**Extension log (ml1333).** The extension writes its stderr (Wine's own output, its
-milestones, early fatal signals and uncaught Objective-C exceptions) to
-`<shared container>/madeira-shared/ext-logs/<pid>.txt` (newest 16 kept; its own
-Documents only if the group does not resolve). When the extension is interrupted, its
-connection drops or its guest exits, the app appends that file to the session log as
-`[ext-proc] ml1333 ext log pid=N (<why>): L lines, B bytes, <path>` followed by
-`[ext-proc] ml1333 ext log: <line>` (first 60 and last 140 lines of a longer file).
-Inside it: `[ext +T] ml1333 extension pid=N log=<path>; crash handlers installed ...`,
-`ml1333 start argv[i]=…`, `start cwd=…`, `start prefix=… exists= system.reg= c:->… drive_c=`,
-`start ntdll <arch> readable=`, `start server socket fd=… open=… desktop=… fastsync=…
-footprint= available= threads=`, `ml1333 entering __wine_main`, `ml1333 phase spawn:…`,
-heartbeats `ml1333 alive +50ms … +6400ms footprint= available= threads=`, and on a
-death before Wine's own signal handlers exist `[ext-crash] ml1333 signal N addr= pc= code=
-thread mach id …; backtrace:` with symbol lines (after ntdll initialises signals, Wine's
-handlers report into the same file). The app also logs any uncaught Objective-C
-exception before it dies: `[crash] ml1333 uncaught Objective-C exception <name>:
-<reason> (thread mach id N)` plus up to 24 `[crash] ml1333   <frame>` lines.
-
 Failure shapes: no shared group / extension cannot resolve it (see Prerequisites
 for reading the group lines); madsync still active (kept by
 `env.MADEIRA_EXT_PROCESS_KEEP_MADSYNC = 1`, or started earlier in the app run); JIT helper/pool unavailable; preparation stage failure; reused extension

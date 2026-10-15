@@ -23,10 +23,6 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <IOSurface/IOSurfaceRef.h>
-#import <execinfo.h>
-#import <signal.h>
-#import <stdarg.h>
-#import <sys/ucontext.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 #import <mach/mach.h>
@@ -56,156 +52,6 @@ extern _Thread_local int wine_ios_exit_initialized;
 
 // ml1332: IOSurface frame transport for this process's windows (set by prepareGuest).
 static int ph_frames_on;
-
-#pragma mark - ml1333 extension log, crash handlers, start milestones
-
-// stderr (Wine's own output included) goes to <shared container>/madeira-shared/ext-logs/
-// <pid>.txt when the app group resolves, else to this extension's Documents (unreadable
-// from the app). The app appends the shared file to its session log when the extension
-// is interrupted or the guest exits ("[ext-proc] ml1333 ext log: ..."). stderr is
-// unbuffered and the file is O_APPEND, so every line is on disk when it is written.
-static double ph_log_t0;
-static void ph_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-static void ph_log(const char *fmt, ...) {
-    char buf[1024];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof buf, fmt, ap);
-    va_end(ap);
-    dprintf(STDERR_FILENO, "[ext +%.3fs] %s\n", ph_log_t0 > 0 ? CACurrentMediaTime() - ph_log_t0 : 0.0, buf);
-}
-
-// Keeps the newest `keep` logs of earlier extension processes.
-static void ph_prune_logs(NSString *dir, NSUInteger keep) {
-    NSFileManager *fm = NSFileManager.defaultManager;
-    NSMutableArray<NSURL *> *logs = [NSMutableArray new];
-    for (NSURL *url in [fm contentsOfDirectoryAtURL:[NSURL fileURLWithPath:dir]
-                         includingPropertiesForKeys:@[NSURLContentModificationDateKey] options:0 error:nil] ?: @[])
-        if ([url.pathExtension isEqualToString:@"txt"]) [logs addObject:url];
-    if (logs.count <= keep) return;
-    [logs sortUsingComparator:^NSComparisonResult(NSURL *a, NSURL *b) {
-        NSDate *da = nil, *db = nil;
-        [a getResourceValue:&da forKey:NSURLContentModificationDateKey error:nil];
-        [b getResourceValue:&db forKey:NSURLContentModificationDateKey error:nil];
-        return [(db ?: NSDate.distantPast) compare:(da ?: NSDate.distantPast)];   // newest first
-    }];
-    for (NSUInteger i = keep; i < logs.count; i++) [fm removeItemAtURL:logs[i] error:nil];
-}
-
-static NSString *ph_open_log(NSURL *container, NSString *ownDocs) {
-    NSString *path = nil;
-    int fd = -1;
-    if (container) {
-        NSString *dir = [container.path stringByAppendingPathComponent:@"madeira-shared/ext-logs"];
-        if ([NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil]) {
-            ph_prune_logs(dir, 15);
-            path = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%d.txt", getpid()]];
-            fd = open(path.UTF8String, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0600);
-        }
-    }
-    if (fd < 0) {
-        path = [ownDocs stringByAppendingPathComponent:@"madeira-ext-log.txt"];
-        fd = open(path.UTF8String, O_WRONLY | O_CREAT | O_APPEND, 0600);
-    }
-    if (fd >= 0) { dup2(fd, STDERR_FILENO); close(fd); }
-    setvbuf(stderr, NULL, _IONBF, 0);
-    ph_log_t0 = CACurrentMediaTime();
-    return fd >= 0 ? path : nil;
-}
-
-// Fatal signals before Wine's own handlers exist. ntdll's signal init (signal_arm64_ios.c)
-// replaces SIGSEGV/SIGBUS/SIGABRT/SIGILL/SIGTRAP/SIGFPE with Wine's handlers, whose fault
-// output then lands in this same file. Async-signal-safe output only, then the default action.
-static const int ph_fatal_signals[] = { SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGTRAP, SIGFPE };
-static void ph_fatal_signal(int sig, siginfo_t *info, void *context) {
-    char buf[256];
-    unsigned long long pc = 0;
-    ucontext_t *uc = context;
-    if (uc && uc->uc_mcontext) pc = (unsigned long long)__darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss);
-    int n = snprintf(buf, sizeof buf, "[ext-crash] ml1333 signal %d addr=%p pc=0x%llx code=%d thread mach id %u; backtrace:\n",
-                     sig, info ? info->si_addr : NULL, pc, info ? info->si_code : 0, pthread_mach_thread_np(pthread_self()));
-    if (n > 0) write(STDERR_FILENO, buf, (size_t)MIN(n, (int)sizeof buf - 1));
-    void *frames[32];
-    int count = backtrace(frames, 32);
-    backtrace_symbols_fd(frames, count, STDERR_FILENO);
-    signal(sig, SIG_DFL);
-    raise(sig);
-}
-
-// Objective-C exceptions nothing catches (Wine does not replace this one).
-static void ph_uncaught_exception(NSException *exception) {
-    ph_log("[ext-crash] ml1333 uncaught Objective-C exception %s: %s (thread mach id %u)",
-           exception.name.UTF8String ?: "?", exception.reason.UTF8String ?: "(no reason)",
-           pthread_mach_thread_np(pthread_self()));
-    NSArray<NSString *> *symbols = exception.callStackSymbols;
-    for (NSUInteger i = 0; i < symbols.count && i < 24; i++) ph_log("[ext-crash] ml1333   %s", symbols[i].UTF8String ?: "?");
-}
-
-static void ph_install_crash_handlers(void) {
-    struct sigaction action;
-    memset(&action, 0, sizeof action);
-    action.sa_sigaction = ph_fatal_signal;
-    action.sa_flags = SA_SIGINFO | SA_RESETHAND;
-    sigemptyset(&action.sa_mask);
-    for (size_t i = 0; i < sizeof ph_fatal_signals / sizeof ph_fatal_signals[0]; i++)
-        sigaction(ph_fatal_signals[i], &action, NULL);
-    NSSetUncaughtExceptionHandler(ph_uncaught_exception);
-}
-
-// process_ios.c stamps every accepted spawn through winios_phase (ProcessHostStubs.c).
-void madeira_process_host_phase(const char *name) {
-    static unsigned logs;
-    if (name && __atomic_fetch_add(&logs, 1, __ATOMIC_RELAXED) < 64) ph_log("ml1333 phase %s", name);
-}
-
-static uint64_t ph_footprint(void);
-static unsigned ph_thread_count(void) {
-    thread_act_array_t list;
-    mach_msg_type_number_t n = 0;
-    if (task_threads(mach_task_self(), &list, &n) != KERN_SUCCESS) return 0;
-    for (mach_msg_type_number_t i = 0; i < n; i++) mach_port_deallocate(mach_task_self(), list[i]);
-    vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof(*list));
-    return n;
-}
-
-// What __wine_main is about to use, then a heartbeat through the first seconds, so a
-// silent death is bracketed in time (the last "alive" line before the end of the file).
-static void ph_log_start_milestones(int argc, char **argv) {
-    for (int i = 0; i < argc && i < 8; i++) ph_log("ml1333 start argv[%d]=%s", i, argv[i] ? argv[i] : "(null)");
-    char cwd[1024];
-    ph_log("ml1333 start cwd=%s", getcwd(cwd, sizeof cwd) ? cwd : "(unknown)");
-    const char *prefix = getenv("WINEPREFIX"), *dlls = getenv("WINEDLLPATH"), *sock = getenv("WINESERVERSOCKET");
-    NSFileManager *fm = NSFileManager.defaultManager;
-    if (prefix) {
-        NSString *p = @(prefix);
-        NSString *c = [fm destinationOfSymbolicLinkAtPath:[p stringByAppendingPathComponent:@"dosdevices/c:"] error:nil];
-        ph_log("ml1333 start prefix=%s exists=%d system.reg=%d c:->%s drive_c=%d", prefix,
-               [fm fileExistsAtPath:p], [fm isReadableFileAtPath:[p stringByAppendingPathComponent:@"system.reg"]],
-               c.UTF8String ?: "(none)", [fm fileExistsAtPath:[p stringByAppendingPathComponent:@"drive_c/windows/system32"]]);
-    } else ph_log("ml1333 start WINEPREFIX unset");
-    if (dlls) {
-        NSString *d = @(dlls);
-        for (NSString *arch in @[@"aarch64-windows", @"arm64ec-windows", @"i386-windows"]) {
-            NSString *ntdll = [[d stringByAppendingPathComponent:arch] stringByAppendingPathComponent:@"ntdll.dll"];
-            ph_log("ml1333 start ntdll %s readable=%d", arch.UTF8String, [fm isReadableFileAtPath:ntdll]);
-        }
-    } else ph_log("ml1333 start WINEDLLPATH unset");
-    int fd = sock ? atoi(sock) : -1;
-    ph_log("ml1333 start server socket fd=%d open=%d desktop=%s fastsync=%s footprint=%lluMB available=%zuMB threads=%u",
-           fd, fd >= 0 && fcntl(fd, F_GETFD) != -1, getenv("MADEIRA_DESKTOP") ?: "(unset)",
-           getenv("MADEIRA_FASTSYNC") ?: "(unset)", ph_footprint() >> 20, (size_t)os_proc_available_memory() >> 20,
-           ph_thread_count());
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        static const unsigned marks[] = { 50, 100, 200, 400, 800, 1600, 3200, 6400 };
-        double t0 = CACurrentMediaTime();
-        for (size_t i = 0; i < sizeof marks / sizeof marks[0]; i++) {
-            double wait = t0 + marks[i] / 1000.0 - CACurrentMediaTime();
-            if (wait > 0) usleep((useconds_t)(wait * 1e6));
-            ph_log("ml1333 alive +%ums footprint=%lluMB available=%zuMB threads=%u", marks[i], ph_footprint() >> 20,
-                   (size_t)os_proc_available_memory() >> 20, ph_thread_count());
-        }
-    });
-}
 
 static uint64_t ph_footprint(void) {
     task_vm_info_data_t info;
@@ -281,7 +127,6 @@ static void *ph_control_thread(void *arg) {
     id<PHProcessClient> client = (id<PHProcessClient>)self.connection.remoteObjectProxy;
     @try { [client log:line]; } @catch (__unused id e) {}
     NSLog(@"[ext-proc] ml1330 %@", line);
-    ph_log("%s", line.UTF8String ?: "");   // ml1333: also in the shared-container log
 }
 
 - (void)statusWithReply:(void (^)(int, uint64_t, uint64_t))reply {
@@ -358,14 +203,12 @@ static void *ph_control_thread(void *arg) {
     }
     pthread_detach(control);
 
-    // The extension cannot access the app's Documents directory. ml1333: its log goes
-    // to the shared container, where the app can read it (ph_open_log). Wine's own log
-    // lines also go to stderr, so wine_log_set_file is not used (it would double them).
+    // The extension cannot access the app's Documents directory.
     NSString *ownDocs=NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES).firstObject;
-    NSString *log=ph_open_log([NSFileManager.defaultManager containerURLForSecurityApplicationGroupIdentifier:@(group)],ownDocs);
-    ph_install_crash_handlers();
-    ph_log("ml1333 extension pid=%d log=%s; crash handlers installed until ntdll installs its own",
-           getpid(),log.UTF8String ?: "(none)");
+    NSString *log=[ownDocs stringByAppendingPathComponent:@"madeira-ext-log.txt"];
+    wine_log_set_file(log.UTF8String);
+    int lf=open(log.UTF8String,O_WRONLY|O_CREAT|O_APPEND,0600);
+    if(lf>=0){dup2(lf,STDERR_FILENO);close(lf);}
     setenv("MADEIRA_DOCS_DIR",ownDocs.UTF8String,1);
     size_t cfgSize=0; const void *cfg=xpc_dictionary_get_data(info,"cfg",&cfgSize);
     if(cfg && cfgSize<=65536) [[NSData dataWithBytes:cfg length:cfgSize] writeToFile:[ownDocs stringByAppendingPathComponent:@"madeira.cfg"] atomically:YES];
@@ -442,13 +285,11 @@ static void *ph_wine_thread(void *arg) {
         wine_ios_exit_initialized = 1;
         int argc = server->_argc; char **argv = server->_argv;
         NSLog(@"[ext-proc] ml1330 starting __wine_main argc=%d argv[1]=%s", argc, argc > 1 ? argv[1] : "(none)");
-        ph_log_start_milestones(argc, argv);   // ml1333
-        ph_log("ml1333 entering __wine_main");
         if (setjmp(wine_ios_exit_jmpbuf) == 0) {
             __wine_main(argc, argv);
-            ph_log("ml1333 __wine_main returned");
+            NSLog(@"[ext-proc] ml1330 __wine_main returned");
         } else {
-            ph_log("ml1333 guest exited code=%d", wine_ios_exit_code);
+            NSLog(@"[ext-proc] ml1330 guest exited code=%d", wine_ios_exit_code);
         }
     }
     return NULL;
