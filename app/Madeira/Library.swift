@@ -4,6 +4,7 @@ import UIKit
 import Darwin
 import ImageIO
 import Combine
+import Metal
 
 // ============================================================================
 // Library front end.
@@ -2597,8 +2598,7 @@ struct LibraryView: View {
                 Section("Pointer") { LibraryPointerSettings() }
             }
             if GraphicsSettings.shown, settingsShow("graphics", "Direct3D", "D3D9", "D3D10", "D3D11", "D3D12", "DXMT", "wined3d",
-                                                    "vkd3d", "DXVK", "Vulkan", "MoltenVK", "KosmicKrisp", "windowed", "window",
-                                                    "taskbar") {
+                                                    "vkd3d", "DXVK", "Vulkan", "MoltenVK", "KosmicKrisp") {
                 GraphicsSettings(refresh: settingsRefresh)
             }
             if MadeiraConfig.flag("MADEIRA_RUNTIME_SETTINGS") {
@@ -3736,9 +3736,10 @@ struct RuntimeMemorySyncSettings: View {
     var open: (SettingsSheet) -> Void = { _ in }
     /// Bumped when a Settings sheet closes, so the rows re-read madeira.cfg.
     var refresh = 0
-    /// The keys this section owns; All settings leaves them out.
-    static let featuredKeys: Set<String> = ["pool", "vram-mb", "swap-mb", "env.MADEIRA_SWAP_COVERAGE", "inproc-sync",
-                                            "env.MADEIRA_FASTSYNC", "eco"]
+    /// The keys this section and Settings › Graphics own; All settings and the Settings
+    /// search leave them out.
+    static let featuredKeys: Set<String> = Set(["pool", "vram-mb", "swap-mb", "env.MADEIRA_SWAP_COVERAGE", "inproc-sync",
+                                                "env.MADEIRA_FASTSYNC", "eco"]).union(GraphicsSettings.featuredKeys)
     // ml1241: 256 (the launch's lower bound) for the pool, 512 and 1024 for video memory
     // (winemetal accepts vram-mb >= 256), at the user's request.
     static let poolChoices = [0, 256, 512, 640, 768, 1024, 1152]          // 0 = the standard 896 MB
@@ -3857,21 +3858,17 @@ struct LibraryPointerSettings: View {
     }
 }
 
-/// Settings › Graphics: the Direct3D 9 and Direct3D 12 routes, the Vulkan driver and
-/// windowed mode as plain controls for madeira.cfg d3d9, d3d12, vulkan and windowed
-/// (read at each session start by ContentView.swift, WineProcessBridge.m and
-/// Winios/WiniosWindowed.m; docs/BUILDING.md 6b and 6c, docs/WINDOWED.md). Default
+/// Settings › Graphics: the Direct3D 9, 11 and 12 routes and the Vulkan driver as plain
+/// controls for madeira.cfg d3d9, d3d11, d3d12 and vulkan (read at each session start by
+/// ContentView.swift and WineProcessBridge.m; docs/BUILDING.md 6b, 6c and 6d). Default
 /// removes the key. The rows show the global file only: a game's own config lines
 /// still win for that game. While the section is shown All settings leaves these
 /// keys out (RuntimeMemorySyncSettings.featuredKeys); MADEIRA_GRAPHICS_SETTINGS=0
 /// hides the section and puts them back in All settings.
 struct GraphicsSettings: View {
-    static let shown = MadeiraConfig.flag("MADEIRA_GRAPHICS_SETTINGS")   // 0: no Settings › Graphics section; d3d9, d3d11, d3d12, vulkan and windowed are back in All settings
-    static let keys: Set<String> = ["d3d9", "d3d11", "d3d12", "vulkan", "windowed"]
-    // Names held in constants, so the code that acts on them (WineProcessBridge.m,
-    // WiniosWindowed.m) stays their catalog entry (build/tools/gen-config-catalog.py).
-    static let windowedKey = "windowed", windowedEnvKey = "env.MADEIRA_WINDOWED", glBackendKey = "gl-backend"
-    static var windowedOn: Bool { MadeiraConfig.bool(windowedKey, default: false) }
+    static let shown = MadeiraConfig.flag("MADEIRA_GRAPHICS_SETTINGS")   // 0: no Settings › Graphics section; d3d9, d3d11, d3d12 and vulkan are back in All settings
+    static let keys: Set<String> = ["d3d9", "d3d11", "d3d12", "vulkan"]
+    static let glBackendKey = "gl-backend"
     /// The keys All settings and the Settings search leave to this section.
     static var featuredKeys: Set<String> { shown ? keys : [] }
     /// Bumped when a Settings sheet closes, so the rows re-read madeira.cfg.
@@ -3912,13 +3909,12 @@ struct GraphicsSettings: View {
     @State private var d3d11 = Self.current("d3d11")
     @State private var d3d12 = Self.current("d3d12")
     @State private var vulkan = Self.current("vulkan")
-    @State private var windowed = Self.windowedOn
     @State private var anySet = Self.anySet
 
     private func reload() {
         d3d9 = Self.current("d3d9"); d3d11 = Self.current("d3d11"); d3d12 = Self.current("d3d12")
         vulkan = Self.current("vulkan")
-        windowed = Self.windowedOn; anySet = Self.anySet
+        anySet = Self.anySet
     }
 
     private func write(_ key: String, _ value: String?) {
@@ -4011,23 +4007,14 @@ struct GraphicsSettings: View {
                 note("This device has no Metal 4 GPU, so KosmicKrisp cannot start on it.", warning: vulkan == "kosmickrisp")
             }
 
-            Toggle("Windowed mode", isOn: Binding(get: { windowed }, set: { on in
-                windowed = on
-                write(Self.windowedKey, on ? "1" : nil)
-            }))
-            note("Show every window in its own frame with a taskbar (desktop and Steam sessions).")
-            if let env = MadeiraConfig.get(Self.windowedEnvKey) {
-                note("madeira.cfg also sets env.MADEIRA_WINDOWED = \(env), which wins over this switch.", warning: true)
-            }
-
             Button("Reset to defaults") {
                 for key in Self.keys.sorted() { MadeiraConfig.set(key, nil) }
-                LogStore.shared.log("[graphics-settings] reset: d3d9, d3d11, d3d12, vulkan and windowed removed")
+                LogStore.shared.log("[graphics-settings] reset: d3d9, d3d11, d3d12 and vulkan removed")
                 reload()
             }
             .disabled(!anySet)
         } header: { Text("Graphics") } footer: {
-            Text("These write d3d9 / d3d11 / d3d12 / vulkan / windowed into madeira.cfg; changes apply at the next session start. Per-game overrides go in the game's custom config lines (Advanced › This game's config).")
+            Text("These write d3d9 / d3d11 / d3d12 / vulkan into madeira.cfg; changes apply at the next session start. Per-game overrides go in the game's custom config lines (Advanced › This game's config).")
         }
         .onChange(of: refresh) { _, _ in reload() }
     }
