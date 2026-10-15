@@ -11733,8 +11733,10 @@ static volatile LONG g_tv_eoff_pf[1024];   /* views made with a nonzero element 
 #define MAD_TVS_MAX_N 262144u
 #define MAD_TVS_ALL_BYTES (2u << 20)   /* up to this much in all ... */
 #define MAD_TVS_ALL_N 4096u            /* ... and this many copies, every copy is compared at every ExecuteCommandLists */
-#define MAD_TVS_RECENT 16              /* past that: copies whose view was made or looked up in the last 16 presents, at every call */
-#define MAD_TVS_SWEEP_BYTES (8u << 20) /* and the others, in turn, at the first call after each Present: all of them while they add up to this much, else this much */
+#define MAD_TVS_EVERY 4                /* past that: copies whose view was made or looked up in the last 4 presents, at every call */
+#define MAD_TVS_RECENT 16              /* those of the last 16 presents at the first call after each Present */
+#define MAD_TVS_SWEEP_N 4096u          /* and the others, in turn, at that call: this many ... */
+#define MAD_TVS_SWEEP_BYTES (1u << 20) /* ... or this much, whichever comes first */
 #define MAD_TVS_IDLE 600               /* a full table gives the copy of a view unused for this many presents to a new view */
 #define MAD_TVS_TOUCH 16384u           /* views looked up again (not new), for the recent pass */
 /* seen: the present its view was last made or looked up; touched: the present it
@@ -11754,6 +11756,7 @@ static struct mad_tvs *g_tvs_touch[MAD_TVS_TOUCH]; static UINT64 g_tvs_touch_n, 
 static unsigned g_tvs_hand, g_tvs_rr;
 static LONG64 g_tvs_cmp, g_tvs_cmp_bytes;   /* compared at ExecuteCommandLists (under g_tvs_lock), for the periodic line */
 static LONG64 g_tvs_late;   /* rewritten copies the per-present pass found outside the recent window (under g_tvs_lock) */
+static LONG64 g_tvs_ticks, g_tvs_calls;   /* time in mad_tvs_refresh and its calls (under g_tvs_lock), for the periodic line */
 static int g_tvs_on = -1;
 static int g_tv_rgb32 = -1;   /* typed-view-rgb32 (see mad_tv_rgb32_on) */
 static volatile LONG g_tv_rgb32_views, g_tv_rgb32_other;
@@ -12019,8 +12022,11 @@ static int mad_tv_rgb32_format(DXGI_FORMAT fmt, enum WMTPixelFormat *pf) {
  * element was written. */
 static int mad_tvs_x3_sync(unsigned char *dst, const unsigned char *src, UINT32 n, int all) {
     UINT32 i; int changed = 0;
-    for (i = 0; i < n; i++, dst += 16, src += 12)
-        if (all || memcmp(dst, src, 12)) { memcpy(dst, src, 12); memset(dst + 12, 0, 4); changed = 1; }
+    for (i = 0; i < n; i++, dst += 16, src += 12) {   /* each side read once, in registers */
+        UINT64 a, b; UINT32 c, e;
+        memcpy(&a, src, 8); memcpy(&c, src + 8, 4); memcpy(&b, dst, 8); memcpy(&e, dst + 8, 4);
+        if (all || a != b || c != e) { memcpy(dst, &a, 8); memcpy(dst + 8, &c, 4); memset(dst + 12, 0, 4); changed = 1; }
+    }
     return changed;
 }
 /* A full table: a copy whose resource is gone, or whose view (of this device,
@@ -12161,28 +12167,34 @@ static int mad_tvs_cmp(struct mad_tvs *t, LONG *n) {
  * one view per frame and range, so copies pile up; comparing 16,384 of them at
  * each of Horizon Forbidden West's ~33 calls a frame cost 12-40 ms) only these
  * are compared every time: the copies made, and the views looked up again, in
- * the last MAD_TVS_RECENT presents or since the last call. The others, in turn,
- * at the first call after each Present: all of them while they add up to
- * MAD_TVS_SWEEP_BYTES. Build 526 compared 4,096 of them a present, so with
- * HFW's ~50,000 copies (1.4 MB) a view made once and then only copied between
- * descriptor heaps read bytes up to ~12 presents old; the vegetation still
- * went into the sky with every offset view copied. g_tvs_late counts the
- * rewrites only this pass finds. */
+ * the last MAD_TVS_EVERY presents or since the last call. At the first call
+ * after each Present, also those of the last MAD_TVS_RECENT presents, and the
+ * others in turn: MAD_TVS_SWEEP_N of them or MAD_TVS_SWEEP_BYTES, whichever
+ * comes first. Build 526 swept 4,096 copies a present; 528 and 529 swept 8 MB
+ * (all ~50,000 of HFW's copies, then 8 MB of its 16 MB once R32G32B32 views
+ * were copied too) and compared the last 16 presents' copies at every call:
+ * ExecuteCommandLists went from ~9 to 24-30 ms a frame (~300 ns a copy, most
+ * of it cache misses), with no change on screen (the vegetation in the sky was
+ * the R32G32B32 views, fixed in 529). g_tvs_late counts the rewrites only the
+ * sweep finds. */
 static void mad_tvs_refresh(void) {
     static LONG64 last = -1;
     static unsigned done_n; static UINT64 done_t;
-    LONG64 now = g_presents_now;
-    unsigned i, m, from; UINT64 j, tfrom; LONG n = 0; int all;
+    LONG64 now = g_presents_now, t0;
+    unsigned i, m, from; UINT64 j, tfrom; LONG n = 0; int all, first, win;
     if (!g_tvs_n) return;
+    t0 = mad_qpc();
     AcquireSRWLockExclusive(&g_tvs_lock);
-    if (now != last) {   /* the first call in this present: where its copies and lookups begin */
+    first = now != last;
+    if (first) {   /* the first call in this present: where its copies and lookups begin */
         g_tvs_mark[now & 31] = g_tvs_n; g_tvs_touch_mark[now & 31] = g_tvs_touch_n; g_tvs_mark_at[now & 31] = now + 1;
     }
     all = g_tvs_n <= MAD_TVS_ALL_N && g_tvs_bytes <= (LONG64)MAD_TVS_ALL_BYTES;
     from = all ? 0 : done_n; tfrom = done_t;
+    win = first ? MAD_TVS_RECENT : MAD_TVS_EVERY - 1;
     if (!all)
         for (i = 0; i < 32; i++)   /* mark_at is present + 1, so 0 is "never" */
-            if (g_tvs_mark_at[i] && g_tvs_mark_at[i] - 1 >= now - MAD_TVS_RECENT) {
+            if (g_tvs_mark_at[i] && g_tvs_mark_at[i] - 1 >= now - win) {
                 if (g_tvs_mark[i] < from) from = g_tvs_mark[i];
                 if (g_tvs_touch_mark[i] < tfrom) tfrom = g_tvs_touch_mark[i];
             }
@@ -12190,9 +12202,9 @@ static void mad_tvs_refresh(void) {
     if (!all) {
         if (g_tvs_touch_n - tfrom > MAD_TVS_TOUCH) tfrom = g_tvs_touch_n - MAD_TVS_TOUCH;
         for (j = tfrom; j < g_tvs_touch_n; j++) mad_tvs_cmp(g_tvs_touch[j % MAD_TVS_TOUCH], &n);
-        if (now != last) {
+        if (first) {
             UINT64 b = 0;
-            for (m = 0; m < g_tvs_n && b < MAD_TVS_SWEEP_BYTES; m++) {
+            for (m = 0; m < g_tvs_n && m < MAD_TVS_SWEEP_N && b < MAD_TVS_SWEEP_BYTES; m++) {
                 struct mad_tvs *t;
                 if (g_tvs_rr >= g_tvs_n) g_tvs_rr = 0;
                 t = g_tvs[g_tvs_rr++];
@@ -12202,6 +12214,7 @@ static void mad_tvs_refresh(void) {
         }
     }
     last = now; done_n = g_tvs_n; done_t = g_tvs_touch_n;
+    g_tvs_ticks += mad_qpc() - t0; g_tvs_calls++;
     ReleaseSRWLockExclusive(&g_tvs_lock);
     if (n) InterlockedExchangeAdd(&g_tvs_copies, n);
 }
@@ -12221,19 +12234,23 @@ static void mad_tvs_forget(struct mad_resource *r) {
 }
 /* The periodic line (ml1126's report), when any view has an element offset. */
 static void mad_tvs_report(void) {
-    static LONG64 cmp_last, bytes_last;
-    LONG64 c, b;
+    static LONG64 cmp_last, bytes_last, ticks_last, calls_last;
+    LONG64 c, b, tk, calls;
+    LARGE_INTEGER fq;
     if (!g_tv_eoff_views && !g_tvs_views) return;
     AcquireSRWLockExclusive(&g_tvs_lock);
     c = g_tvs_cmp - cmp_last; b = g_tvs_cmp_bytes - bytes_last; cmp_last = g_tvs_cmp; bytes_last = g_tvs_cmp_bytes;
+    tk = g_tvs_ticks - ticks_last; calls = g_tvs_calls - calls_last; ticks_last = g_tvs_ticks; calls_last = g_tvs_calls;
     ReleaseSRWLockExclusive(&g_tvs_lock);
+    QueryPerformanceFrequency(&fq);
     d3d12_log("[typed-view] views that start off a 16-byte boundary: %ld kept their element offset, %ld read an aligned copy (typed-view-shadow %d; "
               "%u copies, %lld KB, %ld given to a new view, %ld views refused: no room or over 64 KB); %ld offset views not copied (UAV or not UPLOAD); "
-              "since the last line %lld copies compared (%lld KB), %ld rewritten in all, %lld of them outside the recent window "
-              "(found by the per-present pass); typed-view-rgb32 %d: %ld R32G32B32 views read a 16-byte-element copy, %ld fell back "
+              "since the last line %lld copies compared (%lld KB) in %lld calls taking %.1f ms, %ld rewritten in all, %lld of them outside "
+              "the recent window (found by the per-present pass); typed-view-rgb32 %d: %ld R32G32B32 views read a 16-byte-element copy, %ld fell back "
               "(UAV, not UPLOAD memory, or no room)\n",
               (long)g_tv_eoff_views, (long)g_tvs_views, g_tvs_on > 0, g_tvs_n, (long long)(g_tvs_bytes >> 10), (long)g_tvs_recycled,
-              (long)g_tvs_full, (long)g_tvs_other, (long long)c, (long long)(b >> 10), (long)g_tvs_copies, (long long)g_tvs_late,
+              (long)g_tvs_full, (long)g_tvs_other, (long long)c, (long long)(b >> 10), (long long)calls,
+              fq.QuadPart ? tk * 1000.0 / (double)fq.QuadPart : 0.0, (long)g_tvs_copies, (long long)g_tvs_late,
               g_tv_rgb32 > 0, (long)g_tv_rgb32_views, (long)g_tv_rgb32_other);
 }
 /* why (may be NULL): 0, or the g_vc_why index of a refusal (1-8) or of a view

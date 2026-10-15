@@ -153,6 +153,10 @@ static LONG InterlockedExchangeAdd(volatile LONG *p, LONG v) { LONG o = *p; *p +
 static LONG64 InterlockedExchange64(volatile LONG64 *p, LONG64 v) { LONG64 o = *p; *p = v; return o; }
 static LONG64 InterlockedExchangeAdd64(volatile LONG64 *p, LONG64 v) { LONG64 o = *p; *p += v; return o; }
 static void MemoryBarrier(void) { }
+typedef union { LONG64 QuadPart; } LARGE_INTEGER;
+static LONG64 qpc_now;
+static LONG64 mad_qpc(void) { return qpc_now += 250; }   /* 0.25 ms a reading at 1 MHz */
+static int QueryPerformanceFrequency(LARGE_INTEGER *f) { f->QuadPart = 1000000; return 1; }
 static char logbuf[32768]; static size_t loglen;
 static void d3d12_log(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
@@ -256,18 +260,22 @@ int main(void) {
     EXPECT(g_tvs_copies == 1 && g_tvs_cpu[1232] == upmem[2000] && g_tvs_cpu[102] != upmem[106], "many copies: a view looked up again is compared");
     g_presents_now = 31; mad_tvs_refresh();
     EXPECT(g_tvs_copies == 2 && g_tvs_cpu[102] == upmem[106],
-           "many copies: the first call after a Present compares the others, in turn (all of them up to 8 MB)");
+           "many copies: the first call after a Present compares the others, in turn (4,096 of them or 1 MB)");
     EXPECT(g_tvs_late == 1, "a rewrite only that pass finds (view made 31 presents ago, never looked up) is counted as outside the recent window");
     upmem[4 + 103] ^= 0xff; mad_tvs_refresh();
     EXPECT(g_tvs_copies == 2 && g_tvs_cpu[103] != upmem[107], "many copies: the next calls in the same present compare only the recent ones");
-    {   /* a copy made now is compared at the next calls, for 16 presents */
+    {   /* a copy made now is compared at every call for 4 presents, at the first call of a present for 16 */
         UINT64 g3 = 0; struct mad_tvs *r3 = NULL; LONG c0;
         ti.width = 9; EXPECT(mad_tvs_view(&d, &up, &ti, 3000, 8, 4, &g3, &r3) != 0 && g_tvs_n == 3 && r3 == g_tvs[2] && g3 == 0x100000000ull + 1264,
                              "a third copy, in present 31");
         upmem[3000] ^= 0xff; c0 = g_tvs_copies; mad_tvs_refresh();
         EXPECT(g_tvs_copies == c0 + 1 && r3->dst[0] == upmem[3000], "new since the last call: compared");
+        g_presents_now = 34; mad_tvs_refresh(); upmem[3001] ^= 0xff; c0 = g_tvs_copies; mad_tvs_refresh();
+        EXPECT(g_tvs_copies == c0 + 1 && r3->dst[1] == upmem[3001], "3 presents later, at a later call of the present: still compared");
         g_presents_now = 40; mad_tvs_refresh(); upmem[3001] ^= 0xff; c0 = g_tvs_copies; mad_tvs_refresh();
-        EXPECT(g_tvs_copies == c0 + 1 && r3->dst[1] == upmem[3001], "9 presents later, at a later call of the present: still compared");
+        EXPECT(g_tvs_copies == c0 && r3->dst[1] != upmem[3001], "9 presents later: not at a later call of the present ...");
+        g_presents_now = 41; c0 = g_tvs_copies; mad_tvs_refresh();
+        EXPECT(g_tvs_copies == c0 + 1 && r3->dst[1] == upmem[3001], "... but at the first call after the next Present");
         g_presents_now = 60; mad_tvs_refresh(); upmem[3002] ^= 0xff; c0 = g_tvs_copies; mad_tvs_refresh();
         EXPECT(g_tvs_copies == c0 && r3->dst[2] != upmem[3002], "29 presents later: only the sweep at the first call");
         upmem[3002] ^= 0xff;
@@ -346,9 +354,35 @@ int main(void) {
         ti.width = 9;
         EXPECT(mad_tvs_view_x(&d, &up, &ti, 8192, 4, 12, 8, &g6, &r6) == 0, "a copy narrower than its source is refused");
     }
+    {   /* build 531: the sweep stops after 1 MB; a copy of the last 16 presents is compared at the first call of a present, of the last 4 at every call */
+        static unsigned char bigmem[64u << 10]; static struct mad_resource bm = { bigmem, sizeof bigmem, 0, 0 };
+        UINT64 g7 = 0; struct mad_tvs *big = NULL, *r7 = NULL, *r8 = NULL; unsigned k, n0; LONG c0; int made = 1;
+        bm.owner = &d;
+        g_tvs_bytes += MAD_TVS_ALL_BYTES;   /* many copies */
+        g_presents_now = 2000; mad_tvs_refresh(); n0 = g_tvs_n;
+        for (k = 0; k < 20; k++) { ti.width = 77; made &= mad_tvs_view(&d, &bm, &ti, 4, 16383, 4, &g7, &big) != 0; }
+        ti.width = 9; made &= mad_tvs_view(&d, &up, &ti, 9000, 8, 4, &g7, &r7) != 0;
+        EXPECT(made && g_tvs_n == n0 + 21 && r7 == g_tvs[n0 + 20], "twenty 64 KB copies (1.25 MB) and a small one, in present 2000");
+        mad_tvs_refresh();
+        g_presents_now = 2010; g_tvs_rr = n0; upmem[9000] ^= 0xff; c0 = g_tvs_copies; mad_tvs_refresh();
+        EXPECT(g_tvs_copies == c0 + 1 && r7->dst[0] == upmem[9000], "10 presents old: compared at the first call after a Present");
+        EXPECT(g_tvs_rr == n0 + 17, "the sweep stops once it has compared 1 MB (17 copies of 64 KB)");
+        upmem[9001] ^= 0xff; c0 = g_tvs_copies; mad_tvs_refresh();
+        EXPECT(g_tvs_copies == c0 && r7->dst[1] != upmem[9001], "10 presents old: not compared at a later call of the present");
+        g_presents_now = 2012; mad_tvs_refresh();
+        ti.width = 9; EXPECT(mad_tvs_view(&d, &up, &ti, 9500, 8, 4, &g7, &r8) != 0, "a copy made in present 2012");
+        upmem[9500] ^= 0xff; c0 = g_tvs_copies; mad_tvs_refresh();
+        EXPECT(g_tvs_copies == c0 + 1 && r8->dst[0] == upmem[9500], "new since the last call: compared");
+        g_presents_now = 2015; mad_tvs_refresh(); upmem[9501] ^= 0xff; c0 = g_tvs_copies; mad_tvs_refresh();
+        EXPECT(g_tvs_copies == c0 + 1 && r8->dst[1] == upmem[9501], "3 presents old: compared at a later call of the present too");
+        g_presents_now = 2016; mad_tvs_refresh(); upmem[9502] ^= 0xff; c0 = g_tvs_copies; mad_tvs_refresh();
+        EXPECT(g_tvs_copies == c0 && r8->dst[2] != upmem[9502], "4 presents old: no longer at a later call");
+        g_tvs_bytes -= MAD_TVS_ALL_BYTES;
+    }
     g_tv_eoff_views = 5; loglen = 0; logbuf[0] = 0; mad_tvs_report();
     EXPECT(strstr(logbuf, "[typed-view] views that start off a 16-byte boundary: 5 kept their element offset, ") != NULL &&
            strstr(logbuf, "given to a new view") != NULL && strstr(logbuf, " of them outside the recent window (found by the per-present pass)") != NULL &&
+           strstr(logbuf, " calls taking ") != NULL && strstr(logbuf, " ms, ") != NULL &&
            strstr(logbuf, "typed-view-rgb32 0: 0 R32G32B32 views read a 16-byte-element copy") != NULL, "the periodic line");
     g_tv_eoff_views = 0;
 
