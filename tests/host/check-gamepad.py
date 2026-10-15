@@ -29,8 +29,6 @@ typedef unsigned int UINT;
 typedef uintptr_t ULONG_PTR;
 #define C_ASSERT(x) _Static_assert(x, #x)
 #include <stdlib.h>
-#include <stdio.h>
-#define ERR(...) fprintf(stderr, __VA_ARGS__)
 /* ml2115: the foreground query's win32u calls, faked. */
 typedef void *HWND;
 static HWND fake_foreground;
@@ -38,12 +36,6 @@ static DWORD fake_owner_pid, fake_self_pid = 0x24;
 static HWND NtUserGetForegroundWindow(void) { return fake_foreground; }
 static DWORD get_window_thread(HWND hwnd, DWORD *pid) { if (!hwnd) return 0; if (pid) *pid = fake_owner_pid; return 0x30; }
 #define GetCurrentProcessId() fake_self_pid
-/* The query's diagnostic reads focus, but this transport check has no windows. */
-typedef struct { DWORD cbSize; HWND hwndActive, hwndFocus, hwndCapture; } GUITHREADINFO;
-static int NtUserGetGUIThreadInfo(DWORD tid, GUITHREADINFO *out) { (void)tid; memset(out,0,sizeof(*out)); return 0; }
-static HWND NtUserGetAncestor(HWND hwnd, UINT which) { (void)which; return hwnd; }
-#define GetCurrentThreadId() 0x30
-#define GA_ROOT 2
 '''
 tests = r'''
 static atomic_int finished;
