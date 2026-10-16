@@ -21,3 +21,10 @@ licence (MIT).
 - `kosmickrisp-ios-0003-export-get-proc-addr-on-apple.patch`: on Apple platforms the driver also
   exports `vkGetInstanceProcAddr` and `vkGetDeviceProcAddr`. An app can then `dlopen` it and use it
   as its libvulkan without a Vulkan loader, the same way it uses MoltenVK.
+- `kosmickrisp-ios-0004-metal4-drawable-sync.patch`: a Metal 4 queue must wait for a
+  `CAMetalLayer` drawable (`waitForDrawable:`) before it commits work that writes it, and the
+  layer's `residencySet` must be on the queue so the drawable texture is resident. KosmicKrisp
+  only signalled and presented the drawable, so on iOS the copy into the drawable was lost and the
+  window stayed black while the game ran. The queue now adds each layer's residency set once (up to
+  eight, retained) and waits for the drawable before the commit. `MADEIRA_KK_DRAWABLE_SYNC=0`
+  turns this off.
