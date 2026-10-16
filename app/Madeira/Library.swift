@@ -3114,6 +3114,18 @@ struct LibraryDetail: View {
                         Text("Passed to the program on every start; the line above is the command that runs. The flags add or remove themselves; the renderer flags exclude each other, as do -windowed and -fullscreen.")
                     }
                 }
+                // A Steam game: Madeira Dock hands these to Steam, which appends them to the
+                // game's own launch option (as Steam's per-game launch options do on a PC).
+                if entry.desktop != true && entry.steamAppID != nil {
+                    Section {
+                        TextField("Launch arguments", text: $entry.arguments.plainLaunchArguments, axis: .vertical)
+                            .font(.body.monospaced()).lineLimit(1...4)
+                            .autocorrectionDisabled().textInputAutocapitalization(.never).smartPunctuationOff()
+                        LaunchFlagChips(arguments: $entry.arguments)
+                    } header: { Text("Launch arguments") } footer: {
+                        Text("Steam adds these to the game's launch option on every start. At most 64 arguments in 4 KB, with balanced double quotes.")
+                    }
+                }
                 Section {
                     Toggle("Reduced-precision x87", isOn: $entry.reducedX87)
                     // Exported for this game only when chosen (applyEnvironment).
