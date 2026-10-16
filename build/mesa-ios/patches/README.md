@@ -28,3 +28,16 @@ licence (MIT).
   window stayed black while the game ran. The queue now adds each layer's residency set once (up to
   eight, retained) and waits for the drawable before the commit. `MADEIRA_KK_DRAWABLE_SYNC=0`
   turns this off.
+- `kosmickrisp-ios-0005-release-presented-drawables.patch`: a command buffer retained its drawable
+  when the WSI encoded the present, and the submit dropped the pointer without releasing it. A
+  `CAMetalLayer` reuses a drawable only after every reference is gone, so after a few frames
+  `nextDrawable` blocked for a second at a time and the swapchain stalled. The submit now releases
+  the drawable after presenting it, and re-recording or destroying an unsubmitted command buffer
+  releases it too. The commit feedback handler is also added once at queue creation instead of on
+  every submit, where it piled up on the shared commit options (`MADEIRA_KK_FEEDBACK_ONCE=0`
+  restores the per-submit add).
+- `kosmickrisp-ios-0006-present-probe.patch`: diagnostics. On presents 1-3, 10, 30, 120, 600 and
+  3000 the queue reads back the last copy's source texture and the drawable through a Metal 3
+  queue that waits on a shared event, and logs pixel statistics as `[kk-present]`; the first probe
+  of each layer also logs its state. `nextDrawable` time-outs are logged as `[kk-wsi]`.
+  `MADEIRA_KK_PRESENT_PROBE=0` turns the readback off.
