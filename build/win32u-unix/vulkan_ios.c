@@ -159,16 +159,57 @@ static const struct vulkan_driver_funcs winios_vulkan_driver_funcs =
     .p_map_device_extensions = winios_map_device_extensions,
 };
 
+/* ml1380: does the library offer VK_EXT_metal_surface? MoltenVK exports every entry
+ * point, so the old dlsym( "vkCreateMetalSurfaceEXT" ) test found it. A Mesa driver
+ * used as the library (KosmicKrisp) exports only vkGetInstanceProcAddr and
+ * vkGetDeviceProcAddr: that test failed, the driver fell back to
+ * VK_EXT_headless_surface, which a Metal-platform Mesa build does not offer, and
+ * every vkCreateInstance that enabled VK_KHR_win32_surface failed with
+ * VK_ERROR_EXTENSION_NOT_PRESENT. Ask the library's own extension list instead.
+ * MADEIRA_VK_SURFACE_QUERY=0 restores the dlsym-only test. */
+static BOOL winios_vk_library_has_extension( void *vulkan_handle, const char *name, BOOL *headless )
+{
+    PFN_vkGetInstanceProcAddr gipa = dlsym( vulkan_handle, "vkGetInstanceProcAddr" );
+    PFN_vkEnumerateInstanceExtensionProperties enumerate;
+    VkExtensionProperties *props;
+    uint32_t count = 0, i;
+    BOOL found = FALSE;
+
+    *headless = FALSE;
+    if (!gipa) return FALSE;
+    enumerate = (PFN_vkEnumerateInstanceExtensionProperties)gipa( NULL, "vkEnumerateInstanceExtensionProperties" );
+    if (!enumerate || enumerate( NULL, &count, NULL ) || !count) return FALSE;
+    if (!(props = calloc( count, sizeof(*props) ))) return FALSE;
+    if (enumerate( NULL, &count, props ) >= 0)
+    {
+        for (i = 0; i < count; i++)
+        {
+            if (!strcmp( props[i].extensionName, name )) found = TRUE;
+            if (!strcmp( props[i].extensionName, "VK_EXT_headless_surface" )) *headless = TRUE;
+        }
+    }
+    free( props );
+    return found;
+}
+
 UINT winios_VulkanInit( UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs )
 {
+    const char *query = getenv( "MADEIRA_VK_SURFACE_QUERY" );
+    BOOL exported, listed = FALSE, headless = FALSE;
+
     if (version != WINE_VULKAN_DRIVER_VERSION)
     {
         ERR( "version mismatch, win32u wants %u but driver has %u\n", version, WINE_VULKAN_DRIVER_VERSION );
         return STATUS_INVALID_PARAMETER;
     }
-    winios_vk_metal_surface = vulkan_handle && dlsym( vulkan_handle, "vkCreateMetalSurfaceEXT" );
-    dprintf( 2, "[winios-vk] driver ready (%s surfaces)\n",
-             winios_vk_metal_surface ? "VK_EXT_metal_surface" : "headless" );
+    exported = vulkan_handle && dlsym( vulkan_handle, "vkCreateMetalSurfaceEXT" );
+    if (vulkan_handle && !(query && *query == '0'))
+        listed = winios_vk_library_has_extension( vulkan_handle, "VK_EXT_metal_surface", &headless );
+    winios_vk_metal_surface = exported || listed;
+    dprintf( 2, "[winios-vk] ml1380 driver ready (%s surfaces; exported=%d listed=%d headless=%d%s)\n",
+             winios_vk_metal_surface ? "VK_EXT_metal_surface" : "headless", exported, listed, headless,
+             !winios_vk_metal_surface && !headless && !(query && *query == '0')
+                 ? "; the library offers neither, so VK_KHR_win32_surface is unavailable" : "" );
     *driver_funcs = &winios_vulkan_driver_funcs;
     return STATUS_SUCCESS;
 }
