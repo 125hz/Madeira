@@ -241,12 +241,14 @@ Device checklist:
 - the iPhone AssistiveTouch hint and click filter;
 - the right-stick mouse on and off;
 - each switch at its non-default value.
+
 ## Clipboard text paste
 
 Copy text on the iPad, focus a text field in the Windows program, then press
-**Command-V** on a hardware keyboard. The Session menu also has a system Paste
-button, including when no hardware keyboard is connected. Only plain text is
-accepted. This types into the current Windows input target; it does not sync
+**Command-V** on a hardware keyboard. Open Keyboard from the Session menu to
+use the system Paste button on its accessory bar, including when no hardware
+keyboard is connected. The bar stays open for repeated pastes. Only plain text
+is accepted. This types into the current Windows input target; it does not sync
 the Windows clipboard, copy text back to iPadOS, or transfer files/images.
 
 ASCII uses the same US-layout virtual keys as the software keyboard. Other
@@ -263,7 +265,15 @@ physical releases. Losing focus, disconnecting the keyboard, another key-down,
 or starting another paste cancels the remaining text. Held modifiers are
 released and stay suppressed until physically released. Command-V is consumed
 locally; Ctrl-V and other Command chords retain their Windows behavior. Native
-iOS text fields keep their usual paste behavior. The paste bridge does not log clipboard contents.
+iOS text fields keep their usual paste behavior. The paste bridge does not log
+clipboard contents. A single nonblocking consumer keeps queued input in FIFO
+order across concurrent Wine pumps. The minimum character interval is enforced
+at delivery too, so a stalled pump cannot flush pasted characters in a burst.
+
+For compatibility testing, `env.MADEIRA_PASTE_INTERVAL_MS = 5` in a game's
+advanced config selects a 5 ms character interval after relaunch. The default
+is 10 ms; the supported range is 5–100 ms. This affects simulated clipboard
+typing, not the ordering or timing of physical hardware keyboard events.
 
 Host regression: `python3 tests/host/check-clipboard-paste.py`.
 The Unicode contract is described in Microsoft's

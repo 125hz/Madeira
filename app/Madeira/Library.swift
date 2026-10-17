@@ -4160,12 +4160,6 @@ struct LibraryHUD: View {
                     }
                 }
                 Button("Keyboard", systemImage: "keyboard") { model.menu = false; LibraryKeyboard.show() }
-                PasteButton(payloadType: String.self) { strings in
-                    guard let text = strings.first else { return }
-                    model.menu = false
-                    DispatchQueue.main.async { HardwareInput.shared.paste(text) }
-                }
-
                 Divider()
                 FPSChoice(mode: Binding(get: { model.fpsMode }, set: { model.setFPS($0) }))
                 // Saved to the game with the rest of the session's profile.
@@ -4444,6 +4438,10 @@ final class LibraryKeyInput: UIView, UIKeyInput {
     override var inputAccessoryView: UIView? {
         let scroll = UIScrollView(frame: CGRect(x: 0, y: 0, width: 650, height: 52)); scroll.backgroundColor = .secondarySystemBackground
         let row = UIStackView(); row.axis = .horizontal; row.spacing = 5
+        pasteConfiguration = UIPasteConfiguration(forAccepting: NSString.self)
+        let paste = UIPasteControl()
+        paste.target = self
+        row.addArrangedSubview(paste)
         for (title, key) in [("Esc", 0x1b), ("Ctrl", 0x11), ("Shift", 0x10), ("Alt", 0x12), ("Tab", 0x09), ("Enter", 0x0d), ("←", 0x25), ("↑", 0x26), ("↓", 0x28), ("→", 0x27), ("Done", 0)] {
             let button = UIButton(type: .system); button.configuration = .tinted(); button.setTitle(title, for: .normal)
             button.widthAnchor.constraint(greaterThanOrEqualToConstant: 48).isActive = true
@@ -4462,6 +4460,16 @@ final class LibraryKeyInput: UIView, UIKeyInput {
         scroll.addSubview(row); row.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([row.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 8), row.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -8), row.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor, constant: 4), row.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor, constant: -4), row.heightAnchor.constraint(equalToConstant: 44)])
         return scroll
+    }
+    override func paste(itemProviders: [NSItemProvider]) {
+        guard let provider = itemProviders.first(where: { $0.canLoadObject(ofClass: NSString.self) }) else { return }
+        provider.loadObject(ofClass: NSString.self) { [weak self] value, _ in
+            guard let text = value as? String else { return }
+            DispatchQueue.main.async {
+                guard self?.isFirstResponder == true else { return }
+                HardwareInput.shared.paste(text)
+            }
+        }
     }
     private func press(_ vk: Int32) { winios_post_key(vk, 1); winios_post_key(vk, 0) }
     func insertText(_ text: String) {

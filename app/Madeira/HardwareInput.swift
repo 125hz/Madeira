@@ -110,6 +110,11 @@ struct PasteText {
     private var scalars: String.UnicodeScalarView.Iterator
     private(set) var next: PasteStroke?
 
+    static func interval(milliseconds: String?) -> Double {
+        guard let raw = milliseconds, let value = Double(raw), value.isFinite else { return 0.01 }
+        return min(100, max(5, value)) / 1000
+    }
+
     init(_ text: String) {
         scalars = text.replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n").unicodeScalars.makeIterator()
@@ -653,6 +658,7 @@ final class HardwareInput: ObservableObject {
     private var deferredCommands: Set<Int32> = []
     private var pasteText: PasteText?
     private var pasteTimer: Timer?
+    private var pasteInterval = 0.01
     /// Buttons whose press went to the program and are still down.
     private var gameButtons: Set<MouseButton> = []
     private var buttonsPosted = HeldEdges<MouseButton>()
@@ -1061,7 +1067,9 @@ final class HardwareInput: ObservableObject {
         LibraryKeyboard.input?.releaseModifiers()
         pasteText = PasteText(text)
         guard pasteText?.next != nil else { pasteText = nil; return }
-        let timer = Timer(timeInterval: 0.01, repeats: true) { [weak self] _ in
+        let interval = PasteText.interval(milliseconds: getenv("MADEIRA_PASTE_INTERVAL_MS").map { String(cString: $0) })
+        pasteInterval = interval
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             self?.advancePaste()
         }
         pasteTimer = timer
@@ -1072,7 +1080,7 @@ final class HardwareInput: ObservableObject {
         guard canPaste, let stroke = pasteText?.next else { cancelPaste(); return }
         // Retry the SAME scalar under queue pressure. A whole character's
         // down/up (and Shift, or a UTF-16 surrogate pair) is drained together.
-        if winios_try_post_text(stroke.scalar, stroke.vk, stroke.shift ? 1 : 0) != 0 {
+        if winios_try_post_text(stroke.scalar, stroke.vk, stroke.shift ? 1 : 0, Int32(pasteInterval * 1000)) != 0 {
             pasteText?.advance()
             if pasteText?.next == nil {
                 pasteTimer?.invalidate(); pasteTimer = nil; pasteText = nil
