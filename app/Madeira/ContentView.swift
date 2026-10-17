@@ -129,6 +129,17 @@ final class MetalBackedView: UIView {
     // Run) directly instead of relying on the browse list.
     static weak var keyboardTarget: MetalBackedView?
     override var canBecomeFirstResponder: Bool { true }
+    override var keyCommands: [UIKeyCommand]? {
+        [UIKeyCommand(input: "v", modifierFlags: .command, action: #selector(paste(_:)))]
+    }
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(paste(_:)) { return HardwareInput.shared.canPaste && UIPasteboard.general.hasStrings }
+        return super.canPerformAction(action, withSender: sender)
+    }
+    override func paste(_ sender: Any?) {
+        if !HardwareInput.shared.handlesTyping { HardwareInput.shared.pasteClipboard() }
+    }
+
     static func toggleKeyboard() {
         guard let v = keyboardTarget else { return }
         if v.isFirstResponder { v.resignFirstResponder() }
@@ -1100,34 +1111,8 @@ struct JoystickKeyView: View {
 extension MetalBackedView: UIKeyInput {
     var hasText: Bool { false }
 
-    // US-keyboard VK + shift for a character. Returns nil for chars we can't map.
     static func vkForChar(_ ch: Character) -> (Int32, Bool)? {
-        if ch == "\n" || ch == "\r" { return (0x0D, false) }   // VK_RETURN
-        if ch == "\t" { return (0x09, false) }                 // VK_TAB
-        if ch == " " { return (0x20, false) }                  // VK_SPACE
-        if ch.isLetter, let up = ch.uppercased().first?.asciiValue, up >= 0x41, up <= 0x5A {
-            return (Int32(up), ch.isUppercase)                 // VK_A..VK_Z
-        }
-        if let a = ch.asciiValue, a >= 0x30, a <= 0x39 {
-            return (Int32(a), false)                           // VK_0..VK_9 (unshifted)
-        }
-        let table: [Character: (Int32, Bool)] = [
-            "!": (0x31, true), "@": (0x32, true), "#": (0x33, true), "$": (0x34, true),
-            "%": (0x35, true), "^": (0x36, true), "&": (0x37, true), "*": (0x38, true),
-            "(": (0x39, true), ")": (0x30, true),
-            "-": (0xBD, false), "_": (0xBD, true),
-            "=": (0xBB, false), "+": (0xBB, true),
-            "[": (0xDB, false), "{": (0xDB, true),
-            "]": (0xDD, false), "}": (0xDD, true),
-            "\\": (0xDC, false), "|": (0xDC, true),
-            ";": (0xBA, false), ":": (0xBA, true),
-            "'": (0xDE, false), "\"": (0xDE, true),
-            ",": (0xBC, false), "<": (0xBC, true),
-            ".": (0xBE, false), ">": (0xBE, true),
-            "/": (0xBF, false), "?": (0xBF, true),
-            "`": (0xC0, false), "~": (0xC0, true),
-        ]
-        return table[ch]
+        PasteText.key(for: ch)
     }
 
     func insertText(_ text: String) {

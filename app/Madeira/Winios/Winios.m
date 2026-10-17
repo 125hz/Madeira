@@ -801,12 +801,14 @@ void winios_pWindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 
 extern void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_data, void *hwnd);
 extern void winios_drv_post_key(unsigned short vk, unsigned int flags);
+extern void winios_drv_post_text(unsigned int scalar, unsigned short vk, int shift);
 extern void winios_dump_window_tree(void);
 extern void ios_dump_all_thread_stacks(void);
 
 #define WINIOS_RING_SIZE 256
 #define WINIOS_EV_MOUSE 0
 #define WINIOS_EV_KEY   1
+#define WINIOS_EV_TEXT  2
 #define KEYEVENTF_KEYUP 0x0002
 typedef struct {
     unsigned int type;       /* WINIOS_EV_MOUSE / WINIOS_EV_KEY */
@@ -821,6 +823,36 @@ static struct {
     unsigned int tail;       /* consumer cursor (Wine drain) */
     pthread_mutex_t lock;
 } g_input_q = { .lock = PTHREAD_MUTEX_INITIALIZER };
+
+static _Atomic unsigned int g_text_generation;
+
+int winios_try_post_text(unsigned int scalar, int vk, int shift) {
+    int accepted = 0;
+    pthread_mutex_lock(&g_input_q.lock);
+    unsigned int used = (g_input_q.head + WINIOS_RING_SIZE - g_input_q.tail) % WINIOS_RING_SIZE;
+    /* Leave room for physical key/button releases while the game is busy. */
+    if (used < WINIOS_RING_SIZE - 16) {
+        g_input_q.buf[g_input_q.head] = (winios_input_event_t){
+            WINIOS_EV_TEXT, (int)scalar, vk, (unsigned int)shift,
+            atomic_load(&g_text_generation)
+        };
+        g_input_q.head = (g_input_q.head + 1) % WINIOS_RING_SIZE;
+        accepted = 1;
+    }
+    pthread_mutex_unlock(&g_input_q.lock);
+    return accepted;
+}
+
+void winios_cancel_text(void) {
+    atomic_fetch_add(&g_text_generation, 1);
+}
+
+static int winios_drain_text(const winios_input_event_t *e) {
+    if (e->type != WINIOS_EV_TEXT) return 0;
+    if (e->data == atomic_load(&g_text_generation))
+        winios_drv_post_text((unsigned int)e->x, (unsigned short)e->y, e->flags != 0);
+    return 1;
+}
 
 static void winios_q_push_ev(unsigned int type, int x, int y, unsigned int flags, unsigned int data) {
     pthread_mutex_lock(&g_input_q.lock);
@@ -909,6 +941,10 @@ BOOL winios_pProcessEvents(DWORD mask) {
         g_input_q.tail = (g_input_q.tail + 1) % WINIOS_RING_SIZE;
         pthread_mutex_unlock(&g_input_q.lock);
 
+        if (winios_drain_text(&e)) {
+            drained = TRUE;
+            continue; /* Clipboard contents must not enter the input log. */
+        }
         fprintf(stderr, "[winios] drain type=%u x=%d y=%d flags=0x%x\n", e.type, e.x, e.y, e.flags); fflush(stderr);
         if (e.type == WINIOS_EV_KEY)
             winios_drv_post_key((unsigned short)e.x, e.flags);

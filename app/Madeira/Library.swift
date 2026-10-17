@@ -4160,6 +4160,12 @@ struct LibraryHUD: View {
                     }
                 }
                 Button("Keyboard", systemImage: "keyboard") { model.menu = false; LibraryKeyboard.show() }
+                PasteButton(payloadType: String.self) { strings in
+                    guard let text = strings.first else { return }
+                    model.menu = false
+                    DispatchQueue.main.async { HardwareInput.shared.paste(text) }
+                }
+
                 Divider()
                 FPSChoice(mode: Binding(get: { model.fpsMode }, set: { model.setFPS($0) }))
                 // Saved to the game with the rest of the session's profile.
@@ -4418,6 +4424,17 @@ final class LibraryKeyboardWindow: UIWindow {
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? { nil }
 }
 final class LibraryKeyInput: UIView, UIKeyInput {
+    override var keyCommands: [UIKeyCommand]? {
+        [UIKeyCommand(input: "v", modifierFlags: .command, action: #selector(paste(_:)))]
+    }
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(paste(_:)) { return HardwareInput.shared.canPaste && UIPasteboard.general.hasStrings }
+        return super.canPerformAction(action, withSender: sender)
+    }
+    override func paste(_ sender: Any?) {
+        if !HardwareInput.shared.handlesTyping { HardwareInput.shared.pasteClipboard() }
+    }
+
     var hasText: Bool { true }
     override var canBecomeFirstResponder: Bool { true }
     private var held = Set<Int32>()
@@ -4448,13 +4465,14 @@ final class LibraryKeyInput: UIView, UIKeyInput {
     }
     private func press(_ vk: Int32) { winios_post_key(vk, 1); winios_post_key(vk, 0) }
     func insertText(_ text: String) {
+        if HardwareInput.shared.handlesTyping { return }
         for ch in text {
             guard let (vk, shift) = MetalBackedView.vkForChar(ch) else { continue }
             let temporary = shift && !held.contains(0x10)
             if temporary { winios_post_key(0x10, 1) }; press(vk); if temporary { winios_post_key(0x10, 0) }
         }
     }
-    func deleteBackward() { press(0x08) }
+    func deleteBackward() { if !HardwareInput.shared.handlesTyping { press(0x08) } }
     func releaseModifiers() { for key in held { winios_post_key(key, 0) }; held.removeAll() }
 }
 

@@ -241,3 +241,32 @@ Device checklist:
 - the iPhone AssistiveTouch hint and click filter;
 - the right-stick mouse on and off;
 - each switch at its non-default value.
+## Clipboard text paste
+
+Copy text on the iPad, focus a text field in the Windows program, then press
+**Command-V** on a hardware keyboard. The Session menu also has a system Paste
+button, including when no hardware keyboard is connected. Only plain text is
+accepted. This types into the current Windows input target; it does not sync
+the Windows clipboard, copy text back to iPadOS, or transfer files/images.
+
+ASCII uses the same US-layout virtual keys as the software keyboard. Other
+Unicode scalars use `KEYEVENTF_UNICODE` / `VK_PACKET`, including UTF-16 surrogate
+pairs. Windows programs that translate keyboard messages can receive those
+characters; a game that only reads raw scan codes, rejects a character, or lacks
+the corresponding font may not. Caps Lock is accounted for when typing letters.
+Newlines type Enter and tabs type Tab, so they can submit a single-line dialog
+or change its focus, just as keyboard input would.
+
+Paste reads the iPad clipboard only on an explicit paste action. It sends one
+scalar every 10 ms, retries under queue pressure, and reserves queue slots for
+physical releases. Losing focus, disconnecting the keyboard, another key-down,
+or starting another paste cancels the remaining text. Held modifiers are
+released and stay suppressed until physically released. Command-V is consumed
+locally; Ctrl-V and other Command chords retain their Windows behavior. Native
+iOS text fields keep their usual paste behavior. The paste bridge does not log clipboard contents.
+
+Host regression: `python3 tests/host/check-clipboard-paste.py`.
+The Unicode contract is described in Microsoft's
+[KEYBDINPUT reference](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-keybdinput).
+Apple documents explicit keyboard paste intent in its
+[UIPasteboard reference](https://developer.apple.com/documentation/uikit/uipasteboard).
