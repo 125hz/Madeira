@@ -163,6 +163,27 @@ struct PasteText {
     }
 }
 
+/// Each explicit paste is a complete request, even when the user taps Paste
+/// again before the previous request has finished reaching the game.
+struct PasteQueue {
+    private var active: PasteText?
+    private var pending: [PasteText] = []
+    var next: PasteStroke? { active?.next }
+
+    mutating func append(_ text: String) {
+        let request = PasteText(text)
+        guard request.next != nil else { return }
+        if active == nil { active = request } else { pending.append(request) }
+    }
+
+    mutating func advance() {
+        active?.advance()
+        if active?.next == nil { active = pending.isEmpty ? nil : pending.removeFirst() }
+    }
+
+    mutating func cancel() { active = nil; pending.removeAll() }
+}
+
 enum HardwareKeyMap {
     /// Windows virtual-key code for a USB HID keyboard/keypad usage (page
     /// 0x07), or nil for a key Windows has no virtual key for. Ordered exactly
@@ -656,7 +677,7 @@ final class HardwareInput: ObservableObject {
     // Defer Command until its partner is known: Command-V must not open the
     // guest Start menu. A Command tap or another chord still reaches Windows.
     private var deferredCommands: Set<Int32> = []
-    private var pasteText: PasteText?
+    private var pasteText = PasteQueue()
     private var pasteTimer: Timer?
     private var pasteInterval = 0.01
     /// Buttons whose press went to the program and are still down.
@@ -1008,6 +1029,7 @@ final class HardwareInput: ObservableObject {
         let isCommand = vk == 0x5B || vk == 0x5C
         if !pressed, deferredCommands.remove(vk) != nil,
            keys.wanted(focused: keyboardFocused).contains(vk) {
+            cancelPaste()
             winios_post_key(vk, 1); winios_post_key(vk, 0)
         }
         if pressed { keys.press(vk, focused: keyboardFocused) } else { keys.release(vk) }
@@ -1023,7 +1045,7 @@ final class HardwareInput: ObservableObject {
             pasteClipboard()
             return
         }
-        if pressed { cancelPaste() }
+        if pressed, !isCommand { cancelPaste() }
         if pressed, !isCommand, !deferredCommands.isEmpty {
             // Post the modifier BEFORE the other key, even though Windows VK
             // sort order places e.g. A before LWIN.
@@ -1058,15 +1080,14 @@ final class HardwareInput: ObservableObject {
 
     func paste(_ text: String) {
         guard canPaste else { return }
-        cancelPaste()
         deferredCommands.removeAll()
         // Held Command/Ctrl/Shift must not turn the inserted text into hotkeys.
         // Suppress held keys until release, rather than inventing another down.
         for vk in keys.physical { keys.block(vk) }
         syncKeys()
         LibraryKeyboard.input?.releaseModifiers()
-        pasteText = PasteText(text)
-        guard pasteText?.next != nil else { pasteText = nil; return }
+        pasteText.append(text)
+        guard pasteText.next != nil, pasteTimer == nil else { return }
         let interval = PasteText.interval(milliseconds: getenv("MADEIRA_PASTE_INTERVAL_MS").map { String(cString: $0) })
         pasteInterval = interval
         let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
@@ -1077,19 +1098,19 @@ final class HardwareInput: ObservableObject {
     }
 
     private func advancePaste() {
-        guard canPaste, let stroke = pasteText?.next else { cancelPaste(); return }
+        guard canPaste, let stroke = pasteText.next else { cancelPaste(); return }
         // Retry the SAME scalar under queue pressure. A whole character's
         // down/up (and Shift, or a UTF-16 surrogate pair) is drained together.
         if winios_try_post_text(stroke.scalar, stroke.vk, stroke.shift ? 1 : 0, Int32(pasteInterval * 1000)) != 0 {
-            pasteText?.advance()
-            if pasteText?.next == nil {
-                pasteTimer?.invalidate(); pasteTimer = nil; pasteText = nil
+            pasteText.advance()
+            if pasteText.next == nil {
+                pasteTimer?.invalidate(); pasteTimer = nil
             }
         }
     }
 
-    private func cancelPaste() {
-        pasteTimer?.invalidate(); pasteTimer = nil; pasteText = nil
+    func cancelPaste() {
+        pasteTimer?.invalidate(); pasteTimer = nil; pasteText.cancel()
         winios_cancel_text()
     }
 

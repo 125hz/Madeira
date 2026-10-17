@@ -261,8 +261,9 @@ or change its focus, just as keyboard input would.
 
 Paste reads the iPad clipboard only on an explicit paste action. It sends one
 scalar every 10 ms, retries under queue pressure, and reserves queue slots for
-physical releases. Losing focus, disconnecting the keyboard, another key-down,
-or starting another paste cancels the remaining text. Held modifiers are
+physical releases. Losing focus, disconnecting the keyboard, typing another
+key or closing the keyboard cancels the remaining text. Rapid repeated pastes
+are queued as complete requests, in order. Held modifiers are
 released and stay suppressed until physically released. Command-V is consumed
 locally; Ctrl-V and other Command chords retain their Windows behavior. Native
 iOS text fields keep their usual paste behavior. The paste bridge does not log

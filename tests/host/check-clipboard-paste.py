@@ -23,6 +23,14 @@ assert(text[9].vk == 0 && text[10].vk == 0 && text[11].vk == 0 && text[13].vk ==
 assert(PasteText.key(for: "ß") == nil)
 assert(strokes("").isEmpty && strokes("\0\u{8}\u{1b}").isEmpty)
 assert(strokes(String(repeating: "中A!", count: 10000)).count == 30000)
+var requests = PasteQueue()
+requests.append("Ab"); requests.advance()
+requests.append("中"); requests.append(""); requests.append("Cd")
+var repeated: [UInt32] = []
+while let stroke = requests.next { repeated.append(stroke.scalar); requests.advance() }
+assert(repeated == [98, 0x4e2d, 67, 100]) // rapid taps retain complete requests, in order
+requests.append("stale"); requests.cancel(); requests.append("Z")
+assert(requests.next?.scalar == 90); requests.advance(); assert(requests.next == nil)
 assert(PasteText.interval(milliseconds: nil) == 0.01)
 assert(PasteText.interval(milliseconds: "5") == 0.005)
 assert(PasteText.interval(milliseconds: "10") == 0.01)
@@ -157,13 +165,15 @@ with tempfile.TemporaryDirectory(prefix='madeira-paste-') as temp:
     subprocess.run([str(temp/'c-test')], check=True)
 
 assert 'if (winios_drain_text(&e))' in bridge
-assert 'if pressed { cancelPaste() }' in hardware
+assert 'if pressed, !isCommand { cancelPaste() }' in hardware
 assert 'if !keyboard { keys.focusLost(); deferredCommands.removeAll(); cancelPaste() }' in hardware
 assert '!(fr is LibraryKeyInput)' in hardware
 assert 'guard canPaste, let text = UIPasteboard.general.string' in hardware
 library = (app/'Library.swift').read_text()
 assert 'let paste = UIPasteControl()' in library
 assert 'paste.target = self' in library
+assert 'HardwareInput.shared.cancelPaste()' in library.split('static func hide() {', 1)[1]
+assert 'button.isSelected = false' in library
 assert 'override func paste(itemProviders: [NSItemProvider])' in library
 assert 'if HardwareInput.shared.handlesTyping { return }' in library.split('final class LibraryKeyInput:', 1)[1]
 print('PASS: focus cancellation, explicit clipboard read, native-field isolation and both text input bridges wired')
