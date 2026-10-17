@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use isideload::SideloadError;
-use isideload::anisette::AnisetteDataGenerator;
+use isideload::anisette::{AnisetteClientInfo, AnisetteDataGenerator};
 use isideload::anisette::remote_v3::RemoteV3AnisetteProvider;
 use isideload::auth::apple_account::{AppToken, AppleAccount, TwoFactorCallbackParams, TwoFactorCallbackResponse};
 use isideload::dev::developer_session::DeveloperSession;
@@ -44,19 +44,33 @@ pub type MadeiraAppleTwoFactorCallback =
 /// How long Apple's address book and the anisette server get to answer.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(40);
 
-/// What every request after Apple's address book says the client is: an
-/// Android phone, where isideload 0.4.4 says a Mac.
+/// What every request after Apple's address book says the client is, the new
+/// identity's provisioning included: iTunes on a Windows PC, where isideload
+/// 0.4.4 says a Mac.
 ///
-/// The anisette servers make their data with Apple's library for Android, and
-/// since 2026-10-12 Apple refuses a sign-in whose client is not on the system
-/// that data was made on: "This action cannot be completed at this time",
-/// error -80045, whatever the account. The address book is still asked for as
-/// the Mac. Asked as an Android phone it lists a different server
-/// (gsd.apple.com), and this sign-in was only tried on the usual one.
-const CLIENT_INFO: &str = "<Pixel 7> <Android;14;UQ1A.240205.002> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
+/// The anisette servers make their data with Apple's library for Android. Since
+/// 2026-10-12 Apple refuses the Mac on them ("This action cannot be completed
+/// at this time", error -80045, whatever the account), and since 2026-10-15 it
+/// answers the Android phone this sign-in said it was in between with HTTP 503.
+/// The Windows PC gets through: it is what the newer servers on Apple's library
+/// for Windows hand out, and Apple takes it with data from the Android ones
+/// too. The address book is still asked for as the Mac, which is what this
+/// sign-in has always fetched it as.
+const CLIENT_INFO: &str = "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iTunes/12.12.4.1)>";
+/// akd's, as those Windows servers hand it out with `CLIENT_INFO` (and as
+/// isideload 0.4.4 says anyway).
+const USER_AGENT: &str = "akd/1.0 CFNetwork/808.1.4";
 
 /// Apple's code for a wrong verification code.
 const WRONG_CODE: i64 = -21669;
+
+/// Apple's code (with hsc 434) for anisette data it takes only after the
+/// server's machine has been resynced with data Apple sends along. The servers
+/// on Apple's library for Windows (win.ani.sidestore.io, ani.jkcoxson.com) get
+/// it at a new machine's first sign-in, and isideload 0.4.4 cannot pass that
+/// data on (0.4.5 can), so those servers are not on Madeira's list and a
+/// server that gets this counts as one that gave nothing Apple takes.
+const NEEDS_RESYNC: i64 = -22421;
 
 struct TwoFactor {
     callback: MadeiraAppleTwoFactorCallback,
@@ -159,13 +173,19 @@ impl SignInFailure {
     }
 }
 
+/// Apple's error code and words, when the report holds a refusal from Apple.
+fn apple_said(report: &Report) -> Option<(i64, &str)> {
+    report.iter_reports().find_map(|node| match node.downcast_current_context::<SideloadError>() {
+        Some(SideloadError::AuthWithMessage(code, message)) => Some((*code, message.as_str())),
+        _ => None,
+    })
+}
+
 /// A report in one line: what Apple said when it said something, else each step
 /// that failed, outermost first, then why the request behind it never got out.
 fn describe(report: &Report) -> String {
-    for node in report.iter_reports() {
-        if let Some(SideloadError::AuthWithMessage(code, message)) = node.downcast_current_context::<SideloadError>() {
-            return format!("Apple said: {message} (error {code})");
-        }
+    if let Some((code, message)) = apple_said(report) {
+        return format!("Apple said: {message} (error {code})");
     }
     let mut parts: Vec<String> = Vec::new();
     let mut add = |text: String| {
@@ -183,6 +203,18 @@ fn describe(report: &Report) -> String {
         }
     }
     parts.join(": ")
+}
+
+/// What a sign-in that failed counts as: the user gave up, the anisette server's
+/// data needs a resync first (see `NEEDS_RESYNC`), or Apple refused.
+fn refusal(report: &Report, cancelled: bool) -> SignInFailure {
+    if cancelled {
+        SignInFailure::Cancelled
+    } else if apple_said(report).is_some_and(|(code, _)| code == NEEDS_RESYNC) {
+        SignInFailure::Anisette(describe(report))
+    } else {
+        SignInFailure::Other(describe(report))
+    }
 }
 
 /// A token's `expiry` as Unix seconds, or None when Apple sent none. Apple does not
@@ -228,11 +260,14 @@ fn result_json(
 
 /// Whether Apple still waits for a code it sent by itself.
 ///
-/// An Android phone that gave the right password is told a second step is due
-/// (409) but not which, which is how isideload learns that there is one: the
-/// code is already on its way to the account's trusted devices, and isideload
-/// takes the sign-in for finished. The tokens only come with the sign-in after
-/// the code, so asking for the developer token now is refused (error -22411).
+/// The Android phone this sign-in said it was from 2026-10-13 to 2026-10-15,
+/// having given the right password, was told a second step is due (409) but
+/// not which, which is how isideload learns that there is one: the code is
+/// already on its way to the account's trusted devices, and isideload takes
+/// the sign-in for finished. The tokens only come with the sign-in after the
+/// code, so asking for the developer token now is refused (error -22411).
+/// Whether Apple answers the Windows PC (`CLIENT_INFO`) the same way or names
+/// the step as it does for the Mac is not known yet; either is handled.
 fn awaits_pushed_code(spd: Option<&plist::Dictionary>) -> bool {
     let Some(spd) = spd else { return false };
     spd.get("status-code").and_then(|value| value.as_signed_integer()) == Some(409)
@@ -336,9 +371,13 @@ async fn sign_in(
         Err(_) => return Err(SignInFailure::Other("Apple did not answer in time".to_string())),
     };
     // The address book came for the Mac isideload says it is. Nothing else holds
-    // the client yet, so every request from here on can say `CLIENT_INFO`.
+    // the client yet, so every request from here on can say `CLIENT_INFO`,
+    // including those that provision a new identity just below.
     match Arc::get_mut(&mut account.grandslam_client) {
-        Some(client) => client.client_info.client_info = CLIENT_INFO.to_string(),
+        Some(client) => {
+            client.client_info =
+                AnisetteClientInfo { client_info: CLIENT_INFO.to_string(), user_agent: USER_AGENT.to_string() }
+        }
         None => return Err(SignInFailure::Other("the sign-in could not be set up".to_string())),
     }
     let headers = account.anisette_generator.get_anisette_data(account.grandslam_client.clone());
@@ -349,9 +388,7 @@ async fn sign_in(
     }
 
     let two_factor = Arc::new(two_factor);
-    let refused = |e: Report| {
-        if cancelled.load(Ordering::SeqCst) { SignInFailure::Cancelled } else { SignInFailure::Other(describe(&e)) }
-    };
+    let refused = |e: Report| refusal(&e, cancelled.load(Ordering::SeqCst));
     let asking = two_factor.clone();
     account.login(password, move |params| std::future::ready(Ok::<_, Report>(asking.ask(&params)))).await.map_err(refused)?;
 
@@ -682,6 +719,26 @@ mod tests {
             Ok(())
         };
         assert_eq!(describe(&unreachable().unwrap_err()), "Failed to fetch URL Bag: nodename nor servname provided");
+    }
+
+    fn apple_refused(code: i64, message: &str) -> Report {
+        let refused = || -> Result<(), Report> {
+            Err(report!(SideloadError::AuthWithMessage(code, message.to_string()))).context("Failed to log in to Apple ID")?;
+            Ok(())
+        };
+        refused().unwrap_err()
+    }
+
+    #[test]
+    fn a_resync_apple_asks_for_moves_on_to_the_next_server() {
+        // What a Windows-ADI server's new machine got on 2026-10-15, with hsc 434.
+        let resync = apple_refused(-22421, "This action could not be completed. Try again.");
+        assert!(matches!(refusal(&resync, false),
+            SignInFailure::Anisette(m) if m == "Apple said: This action could not be completed. Try again. (error -22421)"));
+        assert!(matches!(refusal(&resync, true), SignInFailure::Cancelled));
+        // A made-up account, as the Windows PC through an Android-ADI server.
+        let wrong = apple_refused(-20970, "Your account information was entered incorrectly.");
+        assert!(matches!(refusal(&wrong, false), SignInFailure::Other(m) if m.contains("(error -20970)")));
     }
 
     #[test]

@@ -291,12 +291,14 @@ sign-in from the Apple ID that installed it (`app/Madeira/AppleSignIn.swift`):
   `build/rppairing-ios/src/apple_id.rs`): Apple's SRP exchange, in which the
   password does not leave the device, then the second factor when Apple asks
   for one (a code from a trusted device or by text).
-- Madeira tells Apple it is an Android phone. The anisette servers make their
-  data with Apple's library for Android, and since October 2026 Apple refuses a
-  sign-in from a client on any other system ("This action cannot be completed
-  at this time", error -80045). Signed in that way, Apple sends the code to the
-  trusted devices without being asked and does not say that it did, so Madeira
-  asks for that code itself. A text cannot be asked for on this path.
+- Madeira tells Apple it is iTunes on a Windows PC. The anisette servers make
+  their data with Apple's library for Android. Since October 2026 Apple refuses
+  a Mac on them ("This action cannot be completed at this time", error -80045),
+  and since 2026-10-15 it answers the Android phone Madeira said it was in
+  between with HTTP 503; the Windows PC gets through. Signed in as the Android
+  phone, Apple sent the code to the trusted devices without being asked and did
+  not say that it did, so when that happens Madeira asks for the code itself. A
+  text cannot be asked for on this path.
 - What Madeira keeps, in the Keychain, is what an installer hands over: the
   token, the team and the anisette identity, and the Apple ID's address to show
   in Settings. The password is not kept, so when Apple no longer accepts the
@@ -305,6 +307,10 @@ sign-in from the Apple ID that installed it (`app/Madeira/AppleSignIn.swift`):
 - An anisette server supplies the device data Apple asks for: `ani.sidestore.io`
   first, then five more from the list SideStore and SideInstaller read, when
   one gives nothing Apple takes. It sees neither the Apple ID nor the password.
+  The list's two servers on Apple's library for Windows (`win.ani.sidestore.io`,
+  `ani.jkcoxson.com`) are left out: Apple asks a new machine of theirs to be
+  resynced first (error -22421), which isideload 0.4.4 cannot do. A server that
+  gets that answer counts as one that gave nothing Apple takes.
 - The Apple ID has to be the one this copy was signed with: Madeira takes the
   team from its own provisioning profile, and keeps no sign-in for another.
 

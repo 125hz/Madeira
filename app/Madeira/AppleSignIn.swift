@@ -153,7 +153,10 @@ private let secondFactorCallback: MadeiraAppleTwoFactorCallback = { context, req
     }
 
     /// Anisette servers from the community list SideStore and SideInstaller read
-    /// (servers.sidestore.io), tried in this order.
+    /// (servers.sidestore.io), tried in this order. The two on Apple's library for
+    /// Windows (win.ani.sidestore.io, ani.jkcoxson.com) are left out: Apple has a
+    /// new machine of theirs resynced first, which isideload 0.4.4 cannot do
+    /// (`NEEDS_RESYNC` in apple_id.rs).
     nonisolated static let anisetteServers = [
         "https://ani.sidestore.io", "https://ani.stikstore.app", "https://ani.npeg.us",
         "https://ani.sidestore.app", "https://ani.sidestore.zip", "https://ani.846969.xyz",
