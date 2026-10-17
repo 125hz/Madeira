@@ -32,6 +32,7 @@ assert "g_game_input_hidden = !visible" in frame and "g_game_input_hidden = !vis
 assert "g_game_input_key = nil;" in function("static void winios_drop_compositor(const char *why) {")
 
 functions = "\n".join(function(signature) for signature in (
+    "static void winios_request_game_size(",
     "int winios_game_client_rect(",
     "void winios_note_game_metal_hwnd(",
     "static void winios_remove_layer(HWND hwnd) {",
@@ -67,6 +68,8 @@ static NSNumber *g_game_input_key, *g_fit_key;
 static BOOL g_game_input_hidden, g_comp_game;
 static CALayer *g_compositor_view;
 static BOOL desktop, dialog;
+static int winios_swapchain_hwnd(void *hwnd) { return hwnd != NULL; }
+static void winios_screen_size(int *w, int *h) { *w = 1280; *h = 720; }
 static int winios_desktop_session(void) { return desktop; }
 static BOOL winios_game_dialog_visible(void) { return dialog; }
 static BOOL winios_game_window_shown(NSNumber *key) { return NO; }

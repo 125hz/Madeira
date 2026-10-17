@@ -809,6 +809,19 @@ extern void ios_dump_all_thread_stacks(void);
 extern int winios_drv_size_game_window(void *hwnd, int width, int height);
 extern void winios_screen_size(int *w, int *h);
 
+/* MADEIRA_DIRECT_WINDOW_SIZE=1: keep an opted-in presenting window's client
+ * at the selected resolution, including an engine resize after startup.
+ * Default off; desktop sessions and ordinary windowed games are unchanged. */
+static void winios_request_game_size(void *hwnd, int cw, int ch) {
+    const char *size = getenv("MADEIRA_DIRECT_WINDOW_SIZE");
+    const char *desktop = getenv("MADEIRA_DESKTOP");
+    if (!size || strcmp(size, "1") || (desktop && desktop[0] == '1') || !winios_swapchain_hwnd(hwnd)) return;
+    int width, height;
+    winios_screen_size(&width, &height);
+    if (width > 0 && height > 0 && (cw != width || ch != height))
+        atomic_store(&g_size_game_hwnd, (uintptr_t)hwnd);
+}
+
 #define WINIOS_RING_SIZE 256
 #define WINIOS_EV_MOUSE 0
 #define WINIOS_EV_KEY   1
@@ -1222,11 +1235,7 @@ static BOOL winios_game_window_shown(NSNumber *key) {
 /* Called by IOSDisplayShim on a wine thread when a swapchain (D3D9/11/12)
  * takes the game layer for an HWND in a game session. */
 void winios_note_game_metal_hwnd(void *hwnd) {
-    /* 1: size the direct-mode game's Windows client to the selected resolution
-     * after swapchain creation. Default off; ordinary windowed games keep
-     * their requested client size. */
-    const char *size = getenv("MADEIRA_DIRECT_WINDOW_SIZE");
-    if (size && !strcmp(size, "1")) atomic_store(&g_size_game_hwnd, (uintptr_t)hwnd);
+    winios_request_game_size(hwnd, 0, 0);
     dispatch_async(dispatch_get_main_queue(), ^{
         NSNumber *key = @((uintptr_t)hwnd);
         if (![g_game_input_key isEqual:key]) {
@@ -1746,6 +1755,7 @@ void winios_window_geometry(HWND hwnd, int x, int y, int w, int h,
  * x/y/w/h = visible rect, cx/cy/cw/ch = client rect, screen desktop pixels. */
 void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
                          int cx, int cy, int cw, int ch) {
+    winios_request_game_size(hwnd, cw, ch);
     /* Here, not in the block below: the census asks win32u about the window,
      * which needs this Wine thread. No-op unless the app turned it on. */
     winios_census_note_frame(hwnd, x, y, w, h, visible);

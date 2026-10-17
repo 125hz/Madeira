@@ -215,7 +215,8 @@ and command are Dock's:
   small Windows client unchanged, its own config can set
   `env.MADEIRA_DIRECT_WINDOW_SIZE = 1`. After creating its Metal view, Madeira
   asks the window's owner thread to size its client to the selected resolution,
-  preserving its border widths. This is opt-in: ordinary windowed games keep
+  preserving its border widths, and repeats this if the engine shrinks it
+  again after startup. This is opt-in: ordinary windowed games keep
   their requested size and use client-coordinate input mapping.
 - **Working folder** (`workingDirectory`): a `C:\` folder; empty means Steam's
   working folder for **The game**, else the program's own folder. It is
