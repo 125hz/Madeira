@@ -170,10 +170,13 @@ assert 'if !keyboard { keys.focusLost(); deferredCommands.removeAll(); cancelPas
 assert '!(fr is LibraryKeyInput)' in hardware
 assert 'guard canPaste, let text = UIPasteboard.general.string' in hardware
 library = (app/'Library.swift').read_text()
-assert 'let paste = UIPasteControl()' in library
-assert 'paste.target = self' in library
+assert '[("Paste", -1), ("Esc", 0x1b)' in library
+assert 'if key == -1 { HardwareInput.shared.pasteClipboard(); return }' in library
 assert 'HardwareInput.shared.cancelPaste()' in library.split('static func hide() {', 1)[1]
 assert 'button.isSelected = false' in library
-assert 'override func paste(itemProviders: [NSItemProvider])' in library
+for source in [library, (app/'ContentView.swift').read_text()]:
+    handler = source.split('override func paste(_ sender: Any?) {', 1)[1].split('}', 1)[0]
+    assert 'HardwareInput.shared.pasteClipboard()' in handler and 'handlesTyping' not in handler
+    assert 'command.wantsPriorityOverSystemBehavior = true' in source
 assert 'if HardwareInput.shared.handlesTyping { return }' in library.split('final class LibraryKeyInput:', 1)[1]
 print('PASS: focus cancellation, explicit clipboard read, native-field isolation and both text input bridges wired')

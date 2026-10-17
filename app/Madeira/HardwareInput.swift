@@ -1037,12 +1037,16 @@ final class HardwareInput: ObservableObject {
             deferredCommands.insert(vk)
         }
         if pressed, keyboardFocused, PasteText.isCommandV(vk, held: keys.physical) {
-            // UIKit also dispatches paste: when a text bridge is first
-            // responder. Raw hardware input owns this chord in that case.
+            // A first-responder text bridge owns UIKit's paste command. Do
+            // not discard it merely because GCKeyboard is connected: UIKit
+            // can consume the shortcut before the raw V callback arrives.
             for key in keys.physical { keys.block(key) }
             deferredCommands.removeAll()
             syncKeys()
-            pasteClipboard()
+            let responder = FirstResponder.current
+            if responder !== MetalBackedView.keyboardTarget && !(responder is LibraryKeyInput) {
+                pasteClipboard()
+            }
             return
         }
         if pressed, !isCommand { cancelPaste() }

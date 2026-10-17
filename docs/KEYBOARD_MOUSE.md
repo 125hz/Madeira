@@ -246,7 +246,7 @@ Device checklist:
 
 Copy text on the iPad, focus a text field in the Windows program, then press
 **Command-V** on a hardware keyboard. Open Keyboard from the Session menu to
-use the system Paste button on its accessory bar, including when no hardware
+use the Paste button on its accessory bar, including when no hardware
 keyboard is connected. The bar stays open for repeated pastes. Only plain text
 is accepted. This types into the current Windows input target; it does not sync
 the Windows clipboard, copy text back to iPadOS, or transfer files/images.

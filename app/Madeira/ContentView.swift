@@ -130,14 +130,16 @@ final class MetalBackedView: UIView {
     static weak var keyboardTarget: MetalBackedView?
     override var canBecomeFirstResponder: Bool { true }
     override var keyCommands: [UIKeyCommand]? {
-        [UIKeyCommand(input: "v", modifierFlags: .command, action: #selector(paste(_:)))]
+        let command = UIKeyCommand(input: "v", modifierFlags: .command, action: #selector(paste(_:)))
+        command.wantsPriorityOverSystemBehavior = true
+        return [command]
     }
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         if action == #selector(paste(_:)) { return HardwareInput.shared.canPaste && UIPasteboard.general.hasStrings }
         return super.canPerformAction(action, withSender: sender)
     }
     override func paste(_ sender: Any?) {
-        if !HardwareInput.shared.handlesTyping { HardwareInput.shared.pasteClipboard() }
+        HardwareInput.shared.pasteClipboard()
     }
 
     static func toggleKeyboard() {

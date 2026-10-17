@@ -4420,14 +4420,16 @@ final class LibraryKeyboardWindow: UIWindow {
 }
 final class LibraryKeyInput: UIView, UIKeyInput {
     override var keyCommands: [UIKeyCommand]? {
-        [UIKeyCommand(input: "v", modifierFlags: .command, action: #selector(paste(_:)))]
+        let command = UIKeyCommand(input: "v", modifierFlags: .command, action: #selector(paste(_:)))
+        command.wantsPriorityOverSystemBehavior = true
+        return [command]
     }
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         if action == #selector(paste(_:)) { return HardwareInput.shared.canPaste && UIPasteboard.general.hasStrings }
         return super.canPerformAction(action, withSender: sender)
     }
     override func paste(_ sender: Any?) {
-        if !HardwareInput.shared.handlesTyping { HardwareInput.shared.pasteClipboard() }
+        HardwareInput.shared.pasteClipboard()
     }
 
     var hasText: Bool { true }
@@ -4441,15 +4443,12 @@ final class LibraryKeyInput: UIView, UIKeyInput {
         let scroll = UIScrollView(frame: CGRect(x: 0, y: 0, width: 650, height: 52)); scroll.backgroundColor = .secondarySystemBackground
         let row = UIStackView(); row.axis = .horizontal; row.spacing = 5
         accessoryRow = row
-        pasteConfiguration = UIPasteConfiguration(forAccepting: NSString.self)
-        let paste = UIPasteControl()
-        paste.target = self
-        row.addArrangedSubview(paste)
-        for (title, key) in [("Esc", 0x1b), ("Ctrl", 0x11), ("Shift", 0x10), ("Alt", 0x12), ("Tab", 0x09), ("Enter", 0x0d), ("←", 0x25), ("↑", 0x26), ("↓", 0x28), ("→", 0x27), ("Done", 0)] {
+        for (title, key) in [("Paste", -1), ("Esc", 0x1b), ("Ctrl", 0x11), ("Shift", 0x10), ("Alt", 0x12), ("Tab", 0x09), ("Enter", 0x0d), ("←", 0x25), ("↑", 0x26), ("↓", 0x28), ("→", 0x27), ("Done", 0)] {
             let button = UIButton(type: .system); button.configuration = .tinted(); button.setTitle(title, for: .normal)
             button.widthAnchor.constraint(greaterThanOrEqualToConstant: 48).isActive = true
             button.addAction(UIAction { [weak self, weak button] _ in
                 guard let self else { return }
+                if key == -1 { HardwareInput.shared.pasteClipboard(); return }
                 HardwareInput.shared.cancelPaste()
                 let vk = Int32(key)
                 if key == 0 { LibraryKeyboard.hide() }
@@ -4464,16 +4463,6 @@ final class LibraryKeyInput: UIView, UIKeyInput {
         scroll.addSubview(row); row.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([row.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 8), row.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -8), row.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor, constant: 4), row.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor, constant: -4), row.heightAnchor.constraint(equalToConstant: 44)])
         return scroll
-    }
-    override func paste(itemProviders: [NSItemProvider]) {
-        guard let provider = itemProviders.first(where: { $0.canLoadObject(ofClass: NSString.self) }) else { return }
-        provider.loadObject(ofClass: NSString.self) { [weak self] value, _ in
-            guard let text = value as? String else { return }
-            DispatchQueue.main.async {
-                guard self?.isFirstResponder == true else { return }
-                HardwareInput.shared.paste(text)
-            }
-        }
     }
     private func press(_ vk: Int32) { winios_post_key(vk, 1); winios_post_key(vk, 0) }
     func insertText(_ text: String) {
