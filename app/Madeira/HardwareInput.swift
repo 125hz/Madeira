@@ -1858,15 +1858,16 @@ final class DirectCursorOverlay {
         CATransaction.setDisableActions(true)
         l.isHidden = !visible
         if visible {
-            let guest = MetalBackedView.keyboardTarget?.guestSize() ?? CGSize(width: 1024, height: 768)
-            let kx = MetalHostView.shared.bounds.width / guest.width
-            let ky = MetalHostView.shared.bounds.height / guest.height
+            let client = MetalBackedView.keyboardTarget?.pointerRect() ?? CGRect(x: 0, y: 0, width: 1024, height: 768)
+            let kx = MetalHostView.shared.bounds.width / client.width
+            let ky = MetalHostView.shared.bounds.height / client.height
             let w = serial != 0 ? Int(image.w) : Self.arrowSize.w
             let h = serial != 0 ? Int(image.h) : Self.arrowSize.h
             let hx = serial != 0 ? Int(image.hot_x) : 0
             let hy = serial != 0 ? Int(image.hot_y) : 0
             l.bounds = CGRect(x: 0, y: 0, width: CGFloat(w) * kx, height: CGFloat(h) * ky)
-            l.position = CGPoint(x: CGFloat(Int(x) - hx) * kx, y: CGFloat(Int(y) - hy) * ky)
+            l.position = CGPoint(x: (CGFloat(Int(x) - hx) - client.minX) * kx,
+                                 y: (CGFloat(Int(y) - hy) - client.minY) * ky)
         }
         CATransaction.commit()
     }

@@ -77,6 +77,9 @@ int winios_compositor_set_hidden(int hidden);
 void winios_note_game_metal_hwnd(void *hwnd);
 void winios_session_reset(void);
 int winios_desktop_point_from_window(double wx, double wy, int *px, int *py);
+/* Main thread: the client rectangle shown by the direct-mode Metal layer.
+ * Returns 0 in desktop mode, for launcher dialogs, or before a valid frame. */
+int winios_game_client_rect(int *x, int *y, int *w, int *h);
 
 /* Top-level window census, for the starting screen of a Madeira Dock start
  * (DockStartScreen.swift). A Dock start is a desktop session, and the

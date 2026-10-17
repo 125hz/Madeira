@@ -30,14 +30,16 @@ def function(source, signature):
 
 
 mapping = function(content, "func mapPoint(")
+pointer_rect = function(content, "func pointerRect(")
+game_rect = function(content, "private func gameRect(")
 absolute = function(hardware, "private func postAbsolute(")
 relative = function(hardware, "func postRelative(")
 overlay = function(hardware, "func render(visible:")
 assert "gameView.mapPoint(p)" in absolute
 assert "ScreenMap" not in hardware and "DirectCursorOverlay.screenW" not in hardware
 assert "p.x.isFinite" in absolute and "p.y.isFinite" in absolute
-assert "guestSize()" in overlay
-assert "bounds.width / guest.width" in overlay and "bounds.height / guest.height" in overlay
+assert "pointerRect()" in overlay
+assert "bounds.width / client.width" in overlay and "bounds.height / client.height" in overlay
 assert "* kx" in overlay and "* ky" in overlay
 
 harness = r'''
@@ -54,6 +56,8 @@ final class MetalBackedView: UIView {
     func guestSize() -> CGSize { size }
     func drawableAspect() -> CGSize { aspect }
     func effectiveDisplayMode() -> DisplayMode { mode }
+    POINTER_RECT
+    GAME_RECT
     func convert(_ point: CGPoint, to: Any?) -> CGPoint {
         CGPoint(x: point.x + 30, y: point.y + 60)
     }
@@ -103,6 +107,13 @@ final class DirectCursorOverlay {
     OVERLAY
 }
 var compositorCalls = 0
+var clientRect: CGRect?
+func winios_game_client_rect(_ x: inout Int32, _ y: inout Int32, _ w: inout Int32, _ h: inout Int32) -> Int32 {
+    if CommandLine.arguments.contains("monitor") { return 0 }
+    guard let rect = clientRect else { return 0 }
+    x = Int32(rect.minX); y = Int32(rect.minY); w = Int32(rect.width); h = Int32(rect.height)
+    return 1
+}
 func winios_desktop_point_from_window(_ x: Double, _ y: Double, _ px: inout Int32, _ py: inout Int32) -> Int32 {
     compositorCalls += 1
     // A desktop window with a non-zero client origin, fitted 2x onscreen.
@@ -167,12 +178,30 @@ view.size = CGSize(width: 1280, height: 720)
 expect(point(CGPoint(x: 590, y: 410)), (640, 360), "1280 centre")
 view.size = CGSize(width: 1600, height: 1200)
 expect(point(CGPoint(x: 590, y: 410)), (800, 600), "1600 centre after mode change")
+// A 480x270 client is displayed across the 1280x720 game surface. Its
+// window can have a non-zero screen origin; every edge must hit that HWND.
+view.size = CGSize(width: 1280, height: 720)
+for origin in [CGPoint.zero, CGPoint(x: 37, y: 51)] {
+    clientRect = CGRect(origin: origin, size: CGSize(width: 480, height: 270))
+    for mode in DisplayMode.allCases {
+        view.mode = mode
+        let frame = view.gameRect()
+        for (p, expected) in [
+            (CGPoint(x: frame.minX, y: frame.minY), (Int32(origin.x), Int32(origin.y))),
+            (CGPoint(x: frame.maxX, y: frame.minY), (Int32(origin.x + 479), Int32(origin.y))),
+            (CGPoint(x: frame.minX, y: frame.maxY), (Int32(origin.x), Int32(origin.y + 269))),
+            (CGPoint(x: frame.maxX, y: frame.maxY), (Int32(origin.x + 479), Int32(origin.y + 269))),
+            (CGPoint(x: frame.midX, y: frame.midY), (Int32(origin.x + 240), Int32(origin.y + 135)))
+        ] { expect(point(p), expected, "small client at \(origin) in \(mode)") }
+    }
+}
 // Desktop uses its own compositor transform, including fitted client windows.
 view.desktopMode = true
 expect(point(CGPoint(x: 100, y: 200)), (60, 120), "desktop compositor coordinates")
 expect((Int32(MetalBackedView.cursor.x), Int32(MetalBackedView.cursor.y)), (60, 120), "desktop trackpad synced")
 assert(compositorCalls == 2)  // one hardware move, one touch comparison
 assert(input.desktopCursorSynced)
+clientRect = nil
 // Relative HID counts retain their units and direction. They are not view
 // points and must not be multiplied by the drawable, screen or Retina scale.
 HardwareInput.desktopMode = false
@@ -213,10 +242,18 @@ for size in [CGSize(width: 1280, height: 720), CGSize(width: 1600, height: 1200)
         assert(!layer.isHidden)
     }
 }
+clientRect = CGRect(x: 37, y: 51, width: 480, height: 270)
+view.size = CGSize(width: 1280, height: 720)
+MetalHostView.shared.bounds = CGRect(x: 0, y: 0, width: 1280, height: 720)
+cursor.render(visible: true, x: 277, y: 186)
+assert(abs(cursor.layer!.position.x + 2 * 1280.0 / 480 - 640) < 1e-8)
+assert(abs(cursor.layer!.position.y + 3 * 720.0 / 270 - 360) < 1e-8)
+clientRect = nil  // destroyed/ended window falls back to the live monitor
+assert(view.pointerRect() == CGRect(origin: .zero, size: view.size))
 cursor.render(visible: false, x: 0, y: 0)
 assert(cursor.layer!.isHidden)
 print("PASS: live guest sizes, hardware/touch corners, centre, Fit/Fill/Stretch/Aspect, clamp, desktop and cursor")
-'''.replace("MAPPING", mapping).replace("ABSOLUTE", absolute.replace("private func", "func", 1)).replace("RELATIVE", relative).replace("OVERLAY", overlay)
+'''.replace("MAPPING", mapping).replace("POINTER_RECT", pointer_rect).replace("GAME_RECT", game_rect.replace("private func", "func", 1)).replace("ABSOLUTE", absolute.replace("private func", "func", 1)).replace("RELATIVE", relative).replace("OVERLAY", overlay)
 
 with tempfile.TemporaryDirectory(prefix="madeira-pointer-geometry-") as temp:
     source, binary = Path(temp) / "main.swift", Path(temp) / "check"
@@ -227,3 +264,6 @@ with tempfile.TemporaryDirectory(prefix="madeira-pointer-geometry-") as temp:
     assert negative.returncode != 0, "negative control: old fixed mapping unexpectedly passed"
     assert b"expected" in negative.stderr, "negative control failed before reaching a coordinate assertion"
     print("PASS: legacy fixed 1024x768 hardware mapping fails the same geometry assertions")
+    negative = subprocess.run([str(binary), "monitor"], capture_output=True)
+    assert negative.returncode != 0 and b"small client" in negative.stderr, "monitor-only mapping did not fail the small-client regression"
+    print("PASS: monitor-only mapping fails the 480x270 presenting-client regression")

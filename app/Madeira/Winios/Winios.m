@@ -938,6 +938,8 @@ static NSMutableDictionary<NSNumber *, NSValue *> *g_px_rects;  /* hwnd → last
 static NSMutableDictionary<NSNumber *, NSValue *> *g_surf_sizes; /* hwnd → surface px size */
 static NSMutableDictionary<NSNumber *, CAMetalLayer *> *g_metal_layers; /* hwnd → DXMT layer */
 static NSMutableDictionary<NSNumber *, NSValue *> *g_client_rects;      /* hwnd → client px rect */
+static NSNumber *g_game_input_key;       /* HWND using the fullscreen game layer */
+static BOOL g_game_input_hidden;
 /* Desktop fit state (winios_desktop_fit below), main thread only. */
 static NSNumber *g_fit_key;
 static CGRect g_fit_client_px;   /* the window's client rect, desktop px */
@@ -1076,6 +1078,7 @@ void winios_set_compositor_frame(double x, double y, double w, double h) {
  * the session ended, so the library hides it then and shows it again for the
  * next session. Returns 1 when there was a view to change. */
 int winios_compositor_set_hidden(int hidden) {
+    if (hidden) dispatch_async(dispatch_get_main_queue(), ^{ g_game_input_key = nil; });
     if (!g_compositor_view) return 0;
     if (g_comp_game) {   /* an ended game session's windows go away */
         if (!hidden) return 0;
@@ -1165,6 +1168,7 @@ static void winios_game_cursor_refresh(void);   /* cursor section, below */
 
 /* main thread only. Removes the compositor view and every window layer. */
 static void winios_drop_compositor(const char *why) {
+    g_game_input_key = nil;
     if (!g_compositor_view) return;
     winios_forget_cursor_layer();
     for (CALayer *l in g_layers.allValues) [l removeFromSuperlayer];
@@ -1206,6 +1210,10 @@ static BOOL winios_game_window_shown(NSNumber *key) {
 void winios_note_game_metal_hwnd(void *hwnd) {
     dispatch_async(dispatch_get_main_queue(), ^{
         NSNumber *key = @((uintptr_t)hwnd);
+        if (![g_game_input_key isEqual:key]) {
+            g_game_input_key = key;
+            g_game_input_hidden = NO;
+        }
         if (!g_game_metal) g_game_metal = [NSMutableSet new];
         if ([g_game_metal containsObject:key]) return;
         [g_game_metal addObject:key];
@@ -1220,6 +1228,7 @@ void winios_note_game_metal_hwnd(void *hwnd) {
 void winios_session_reset(void) {
     winios_swapchain_hwnds_reset();   /* [swap-win]: HWND values of the last session mean nothing now */
     dispatch_async(dispatch_get_main_queue(), ^{
+        g_game_input_key = nil;
         [g_game_metal removeAllObjects];
         if (g_comp_game) winios_drop_compositor("new session");
         winios_metal_hud_pick();   /* the window-level layer's HUD follows the session kind */
@@ -1339,8 +1348,11 @@ static CALayer *winios_layer_for(HWND hwnd, bool create) {
 
 static void winios_remove_layer(HWND hwnd) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!g_layers) return;
         NSNumber *key = @((uintptr_t)hwnd);
+        if ([g_game_input_key isEqual:key]) g_game_input_key = nil;
+        [g_game_metal removeObject:key];
+        [g_client_rects removeObjectForKey:key];
+        if (!g_layers) return;
         CALayer *l = g_layers[key];
         if (l) {
             [l removeFromSuperlayer];
@@ -1665,6 +1677,7 @@ CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
  * A hidden child retains its surface and Metal layer for a later parent show. */
 void winios_window_visibility(HWND hwnd, int visible) {
     dispatch_async(dispatch_get_main_queue(), ^{
+        if ([g_game_input_key isEqual:@((uintptr_t)hwnd)]) g_game_input_hidden = !visible;
         CALayer *l = g_layers[@((uintptr_t)hwnd)];
         if (!l) return;
         BOOL hidden = !visible || CGRectIsEmpty(l.bounds);
@@ -1691,11 +1704,11 @@ void winios_window_geometry(HWND hwnd, int x, int y, int w, int h,
                             int cx, int cy, int cw, int ch) {
     dispatch_async(dispatch_get_main_queue(), ^{
         NSNumber *key = @((uintptr_t)hwnd);
+        if (!g_client_rects) g_client_rects = [NSMutableDictionary new];
+        g_client_rects[key] = [NSValue valueWithCGRect:CGRectMake(cx, cy, cw, ch)];
         CALayer *l = g_layers[key];
         if (!l) return;
         g_px_rects[key] = [NSValue valueWithCGRect:CGRectMake(x, y, w, h)];
-        if (!g_client_rects) g_client_rects = [NSMutableDictionary new];
-        g_client_rects[key] = [NSValue valueWithCGRect:CGRectMake(cx, cy, cw, ch)];
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
         l.frame = winios_layer_rect(x, y, w, h);
@@ -1720,14 +1733,15 @@ void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
         winios_ensure_compositor();
         if (!g_compositor_view) return;
         NSNumber *key = @((uintptr_t)hwnd);
+        if (!g_client_rects) g_client_rects = [NSMutableDictionary new];
+        g_client_rects[key] = [NSValue valueWithCGRect:CGRectMake(cx, cy, cw, ch)];
+        if ([g_game_input_key isEqual:key]) g_game_input_hidden = !visible;
         if (g_comp_game) {   /* game-mode windows, see winios_game_window_shown */
             g_px_rects[key] = [NSValue valueWithCGRect:CGRectMake(x, y, w, h)];
             if (!winios_game_window_shown(key)) return;
         }
         CALayer *l = winios_layer_for(hwnd, true);
         g_px_rects[key] = [NSValue valueWithCGRect:CGRectMake(x, y, w, h)];
-        if (!g_client_rects) g_client_rects = [NSMutableDictionary new];
-        g_client_rects[key] = [NSValue valueWithCGRect:CGRectMake(cx, cy, cw, ch)];
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
         l.frame = winios_layer_rect(x, y, w, h);
@@ -2388,6 +2402,23 @@ static BOOL winios_game_dialog_visible(void) {
     for (CALayer *l in g_layers.allValues)
         if (!l.hidden && CGRectIntersectsRect(l.frame, view)) return YES;
     return NO;
+}
+
+/* Main thread. The fullscreen Metal layer can show a swapchain whose HWND
+ * has a smaller client area than the virtual monitor. Input and the cursor
+ * must use that client area's screen coordinates, not the backbuffer size.
+ * A launcher/message box still uses its normal desktop coordinates. */
+int winios_game_client_rect(int *x, int *y, int *w, int *h) {
+    if (winios_desktop_session() || !g_game_input_key || g_game_input_hidden || winios_game_dialog_visible()) return 0;
+    NSValue *value = g_client_rects[g_game_input_key];
+    if (!value) return 0;
+    CGRect rect = value.CGRectValue;
+    if (rect.size.width <= 0 || rect.size.height <= 0) return 0;
+    if (x) *x = (int)rect.origin.x;
+    if (y) *y = (int)rect.origin.y;
+    if (w) *w = (int)rect.size.width;
+    if (h) *h = (int)rect.size.height;
+    return 1;
 }
 
 /* main thread only: the game-mode cursor is drawn while a dialog is on screen,
