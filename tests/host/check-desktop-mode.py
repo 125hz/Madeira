@@ -66,6 +66,9 @@ expect(env("MADEIRA_EXE") == "C:\\Games\\A Game\\game.exe"
        "direct launch preserves the executable and quoted arguments")
 finishSession()
 expect(env("MADEIRA_DESKTOP") == nil, "session end clears desktop mode")
+setenv("MADEIRA_DIRECT_WINDOW_SIZE", "1", 1)
+finishSession()
+expect(env("MADEIRA_DIRECT_WINDOW_SIZE") == nil, "session end clears the direct window resize opt-in")
 
 game.launchMode = "desktop"
 game.applyEnvironment()

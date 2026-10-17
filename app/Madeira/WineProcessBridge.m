@@ -1853,6 +1853,7 @@ static void *wine_process_thread(void *arg) {
         unsetenv("FEX_X87REDUCEDPRECISION");   /* ml1184 */
         unsetenv("MADEIRA_DINPUT_PAD");        /* ml1240 */
         unsetenv("MADEIRA_DESKTOP");           /* each launch chooses its own presentation mode */
+        unsetenv("MADEIRA_DIRECT_WINDOW_SIZE"); /* a game's opt-in must not resize the next game */
         /* madeira-bcd: Horizon Zero Dawn's per-game switches must not reach a later game
          * of this app run (GTA V Enhanced runs without them). */
         unsetenv("MADEIRA_SRV_FGETPATH");
