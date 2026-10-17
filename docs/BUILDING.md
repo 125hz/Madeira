@@ -96,6 +96,16 @@ clean-machine release build. The Microsoft x64 runtime resources came from
 Microsoft's `vc_redist.x64.exe`, as described above. Device installation and
 game compatibility are separate checks from successful native compilation.
 
+Development signing also needs a provisioning profile authorizing both
+`com.apple.developer.kernel.increased-memory-limit` and
+`com.apple.developer.kernel.extended-virtual-addressing`. An existing wildcard
+profile without those capabilities can sign an app which installs but cannot
+reserve the WoW64 guest window. Use an explicit app identifier and regenerate
+its profile through Xcode's normal signing workflow; retain those entitlements
+in the app signature. On the tested M1 iPad this changed the observed task map
+from 17 GB to 63 GB. This removes that reservation limit; it is not proof that
+every 32-bit child process starts successfully.
+
 A recipient of a built package can obtain the complete corresponding
 source of every LGPL library (Wine fork, GnuTLS, Nettle, GMP, FFmpeg) from the
 repository, and the application source and build scripts above. Whether

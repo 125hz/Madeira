@@ -448,6 +448,7 @@ BOOL winios_pCreateWindow(HWND hwnd) {
 #define WINIOS_SWAP_HWNDS 32
 #define WINIOS_SWAP_KINDS 8   /* style, pos-begin, pos, activate (driver_ios.c); show, layer (here) */
 static _Atomic(uintptr_t) g_swap_hwnds[WINIOS_SWAP_HWNDS];
+static _Atomic(uintptr_t) g_size_game_hwnd;
 static _Atomic unsigned g_swap_said[WINIOS_SWAP_HWNDS][WINIOS_SWAP_KINDS];
 enum { WINIOS_SWAP_SHOW = 4, WINIOS_SWAP_LAYER = 5 };
 
@@ -697,6 +698,8 @@ void winios_pDestroyWindow(HWND hwnd) {
     WLOG("pDestroyWindow hwnd=%p", hwnd);
     uintptr_t pending = (uintptr_t)hwnd;
     atomic_compare_exchange_strong(&g_restore_foreground, &pending, 0);
+    pending = (uintptr_t)hwnd;
+    atomic_compare_exchange_strong(&g_size_game_hwnd, &pending, 0);
     winios_census_forget(hwnd);
     if (winios_forget_swapchain_hwnd(hwnd)) {   /* madeira-bcd: [swap-win] */
         fprintf(stderr, "[swap-win] hwnd=%p destroyed (pDestroyWindow) while a swapchain had presented into it\n", hwnd);
@@ -803,6 +806,8 @@ extern void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int
 extern void winios_drv_post_key(unsigned short vk, unsigned int flags);
 extern void winios_dump_window_tree(void);
 extern void ios_dump_all_thread_stacks(void);
+extern int winios_drv_size_game_window(void *hwnd, int width, int height);
+extern void winios_screen_size(int *w, int *h);
 
 #define WINIOS_RING_SIZE 256
 #define WINIOS_EV_MOUSE 0
@@ -869,6 +874,15 @@ void winios_post_key(int vk, int down) {
 }
 
 BOOL winios_pProcessEvents(DWORD mask) {
+    uintptr_t size_hwnd = atomic_load(&g_size_game_hwnd);
+    if (size_hwnd) {
+        int width, height;
+        winios_screen_size(&width, &height);
+        /* The owner thread may dispatch WM_SIZE here, after swapchain creation
+         * has returned. Other event-pump threads leave the request pending. */
+        if (winios_drv_size_game_window((void *)size_hwnd, width, height))
+            atomic_compare_exchange_strong(&g_size_game_hwnd, &size_hwnd, 0);
+    }
     /* The restored born-minimized window's own thread brings it to the front
      * (see g_restore_foreground); other threads leave the request in place. */
     uintptr_t fg = atomic_load_explicit(&g_restore_foreground, memory_order_relaxed);
@@ -1208,6 +1222,11 @@ static BOOL winios_game_window_shown(NSNumber *key) {
 /* Called by IOSDisplayShim on a wine thread when a swapchain (D3D9/11/12)
  * takes the game layer for an HWND in a game session. */
 void winios_note_game_metal_hwnd(void *hwnd) {
+    /* 1: size the direct-mode game's Windows client to the selected resolution
+     * after swapchain creation. Default off; ordinary windowed games keep
+     * their requested client size. */
+    const char *size = getenv("MADEIRA_DIRECT_WINDOW_SIZE");
+    if (size && !strcmp(size, "1")) atomic_store(&g_size_game_hwnd, (uintptr_t)hwnd);
     dispatch_async(dispatch_get_main_queue(), ^{
         NSNumber *key = @((uintptr_t)hwnd);
         if (![g_game_input_key isEqual:key]) {
@@ -1226,6 +1245,7 @@ void winios_note_game_metal_hwnd(void *hwnd) {
 /* Called at every Wine session start (WineProcessBridge): a game session
  * starts with no overlay windows and no known Metal windows. */
 void winios_session_reset(void) {
+    atomic_store(&g_size_game_hwnd, 0);
     winios_swapchain_hwnds_reset();   /* [swap-win]: HWND values of the last session mean nothing now */
     dispatch_async(dispatch_get_main_queue(), ^{
         g_game_input_key = nil;

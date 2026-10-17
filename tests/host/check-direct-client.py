@@ -42,6 +42,8 @@ harness = r'''
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #include <assert.h>
+#include <stdatomic.h>
+static _Atomic(uintptr_t) g_size_game_hwnd;
 typedef void *HWND;
 #define dispatch_async(queue, block) (block)()
 #define dispatch_get_main_queue() NULL
@@ -84,6 +86,7 @@ int main(void) { @autoreleasepool {
     void *a = (void *)0x10030, *b = (void *)0x10040;
     g_client_rects[@((uintptr_t)a)] = [NSValue valueWithRect:NSMakeRect(37,51,480,270)];
     winios_note_game_metal_hwnd(a);
+    assert(!atomic_load(&g_size_game_hwnd));
     expect_rect(37,51,480,270);
     desktop = YES; assert(!winios_game_client_rect(NULL,NULL,NULL,NULL)); desktop = NO;
     dialog = YES; assert(!winios_game_client_rect(NULL,NULL,NULL,NULL)); dialog = NO;
@@ -102,7 +105,11 @@ int main(void) { @autoreleasepool {
     winios_compositor_set_hidden(1); // session ended, even without compositor
     assert(!winios_game_client_rect(NULL,NULL,NULL,NULL));
     winios_note_game_metal_hwnd(a);
+    setenv("MADEIRA_DIRECT_WINDOW_SIZE", "1", 1);
+    winios_note_game_metal_hwnd(a);
+    assert(atomic_load(&g_size_game_hwnd) == (uintptr_t)a);
     winios_session_reset();
+    assert(!atomic_load(&g_size_game_hwnd));
     assert(!winios_game_client_rect(NULL,NULL,NULL,NULL) && g_game_metal.count == 0);
     puts("PASS: presenting HWND geometry, desktop/dialog/hidden fallback, switch, destruction and session reset");
 } return 0; }
