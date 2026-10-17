@@ -887,14 +887,16 @@ void winios_post_key(int vk, int down) {
 }
 
 BOOL winios_pProcessEvents(DWORD mask) {
-    uintptr_t size_hwnd = atomic_load(&g_size_game_hwnd);
+    uintptr_t size_hwnd = atomic_exchange(&g_size_game_hwnd, 0);
     if (size_hwnd) {
         int width, height;
         winios_screen_size(&width, &height);
         /* The owner thread may dispatch WM_SIZE here, after swapchain creation
          * has returned. Other event-pump threads leave the request pending. */
-        if (winios_drv_size_game_window((void *)size_hwnd, width, height))
-            atomic_compare_exchange_strong(&g_size_game_hwnd, &size_hwnd, 0);
+        if (!winios_drv_size_game_window((void *)size_hwnd, width, height)) {
+            uintptr_t empty = 0;
+            atomic_compare_exchange_strong(&g_size_game_hwnd, &empty, size_hwnd);
+        }
     }
     /* The restored born-minimized window's own thread brings it to the front
      * (see g_restore_foreground); other threads leave the request in place. */
