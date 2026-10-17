@@ -73,6 +73,12 @@ entered Free Mode gameplay, saved to an unused slot, terminated Madeira,
 re-enabled JIT, and loaded the same slot. The expected balance remained
 743105. The original executable and pre-existing saves were preserved.
 
+A subsequent cold-launch regression after the FE test IPA/font/locale changes
+loaded the same slot and reached the home screen in Traditional Chinese. The
+built-in language selector used index 5 in this build. Disabling the CRT
+effect (`crt=0`) visibly sharpened text while retaining 1280x720 fullscreen.
+The desktop compositor left a narrow desktop strip below the D3D game.
+
 Vector/memcpy TSO settings did not change the original crash. `FEX_O0=1`
 failed earlier with an invalid-instruction exception at a different guest
 RIP. None of those diagnostic environment switches was retained.
