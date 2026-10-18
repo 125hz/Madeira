@@ -671,6 +671,10 @@ void *ios_jit_current_peb(void);
  * -Wno-implicit-function-declaration, which would otherwise turn the call into
  * a conflicting non-static declaration). */
 static void ios_lowalloc_note_qualifying_image( unsigned long long pref_base, int relocs_stripped );
+/* ml1100: image low-alias, see the block at the sub-floor registration site. */
+static void ios_image_lowalias_register( unsigned long long pref_base, unsigned long long real_base,
+                                         unsigned long long size, const char *why );
+static void ios_image_lowalias_retire( unsigned long long real_base );
 extern void *ios_jit_rw_base_global;  /* defined below */
 extern void *ios_jit_rx_base_global;  /* defined below */
 
@@ -22468,6 +22472,11 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         ios_lowalloc_note_qualifying_image(
             (unsigned long long)image_info->base,
             (nt->FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED) ? 1 : 0 );
+        /* ml1100: and give the NARROWED form of the high base a name too.
+         * See ios_image_lowalias_register. */
+        ios_image_lowalias_register( (unsigned long long)image_info->base,
+                                     (unsigned long long)(uintptr_t)ptr,
+                                     (unsigned long long)total_size, "sub-floor preferred base" );
     }
     /* madeira-bcd: [sc-rph], before the protections and the JIT-pool copy. */
     ios_sc_render_handler_patch( ptr, total_size, nt, sec, nt_name );
@@ -26451,7 +26460,7 @@ void ios_tls38_poll( const char *where )
  * match that shape, 7 of them in the game process. Kill switch:
  * MADEIRA_NO_LOW_ALLOC=1.
  */
-#define IOS_LOWALLOC_MAX   16
+#define IOS_LOWALLOC_MAX   48   /* ml1100: was 16; images take slots too */
 #define IOS_LOWALLOC_BASE  0x30000000ull   /* fresh + reserved; clear of the */
 #define IOS_LOWALLOC_LIMIT 0x38000000ull   /* image windows, and < 2 GB      */
 #define IOS_LOWALLOC_GRAN  0x10000ull      /* Windows allocation granularity */
@@ -26741,6 +26750,73 @@ void *ios_subfloor_low_entry( void *entry, ULONG image_charact )
         return (void *)(ULONG_PTR)(lo + (e - re));
     }
     return entry;
+}
+
+/**********************************************************************
+ * ml1100: IMAGE LOW-ALIAS -- the ml969 alias, applied to a relocated image.
+ *
+ * Measured (dsr-log-codex-steamclient, 29.09): steam_api64.dll prefers
+ * 0x3b400000, iOS cannot map below the 4 GB floor, so it was mapped at
+ * 0x71fe0b0000 and that HIGH address is what LoadLibrary/GetModuleHandle hand
+ * the guest. Unpacked code in steamclient64.dll then does
+ *     8b 7b 30        mov    edi, [rbx+0x30]      ; HMODULE, 32-bit load
+ *     48 63 57 3c     movsxd rdx, [rdi+0x3c]      ; e_lfanew  -> AV at 0xfe0b003c
+ * i.e. the program itself narrows the module handle. On Windows and on Wine
+ * for macOS a module whose preferred base is below 4 GB also LIVES below
+ * 4 GB, so the narrowing is a no-op there. The ml938 window does not help:
+ * it names the PREFERRED base (0x3b400000), while the narrowed value is the
+ * low 32 bits of the ACTUAL base (0xfe0b0000).
+ *
+ * Fix: declare [real & 0xffffffff, +size) as a second name for the image,
+ * exactly as ml969 does for 0x1000 RW allocations. Additive: no pointer any
+ * caller receives changes; an access to the low name that used to raise
+ * c0000005 is serviced by the Mach gate (ios_subfloor_service ->
+ * ios_lowalloc_translate, whole-span bounds-checked) instead. Registration
+ * refuses on collision with an image window, another alias, the ml966 arena
+ * or the bottom 16 MB, so it can never shadow a real name.
+ *
+ * Scope: only images whose PREFERRED base is below 4 GB -- the images whose
+ * authors were promised a sub-4 GB address by Windows. No module name is
+ * hard-coded. Data accesses only: execution through the low name is not
+ * provided (FEX is not told about it).
+ * Kill switch: MADEIRA_NO_IMAGE_LOW_ALIAS=1 (and MADEIRA_NO_LOW_ALIAS=1). */
+static int ios_image_lowalias_enabled(void)
+{
+    static int dec = -1;
+    if (dec < 0)
+    {
+        const char *off = getenv( "MADEIRA_NO_IMAGE_LOW_ALIAS" );
+        dec = (off && *off && *off != '0') ? 0 : 1;
+        dprintf( 2, "ml1100: image low-alias %s\n",
+                 dec ? "ENABLED (default)" : "DISABLED by MADEIRA_NO_IMAGE_LOW_ALIAS" );
+    }
+    return dec && ios_lowalias_enabled();
+}
+
+static void ios_image_lowalias_register( unsigned long long pref_base, unsigned long long real_base,
+                                         unsigned long long size, const char *why )
+{
+    uint64_t alias;
+
+    if (!ios_image_lowalias_enabled()) return;
+    if (real_base < 0x100000000ull || !size) return;
+    alias = ios_lowalias_register( real_base, size, ios_jit_current_peb() );
+    dprintf( 2, "ml1100: image %#llx+%#llx (preferred %#llx, %s): low alias %s%#llx\n",
+             real_base, size, pref_base, why,
+             alias ? "" : "REFUSED (collision/table full/crosses 4GB) for ",
+             alias ? (unsigned long long)alias : (real_base & 0xFFFFFFFFull) );
+}
+
+static void ios_image_lowalias_retire( unsigned long long real_base )
+{
+    uint64_t gone;
+
+    if (real_base < 0x100000000ull) return;
+    /* peb NULL: the view is being unmapped, whoever owned the name */
+    gone = ios_lowalias_retire_by_real( real_base, NULL );
+    if (gone)
+        dprintf( 2, "ml1100: RETIRED image alias %#llx for %#llx on unmap\n",
+                 (unsigned long long)gone, real_base );
 }
 
 /* Translate a WHOLE access span, not just its start. Returns 1 only when
@@ -31012,6 +31088,221 @@ static struct file_view *get_memory_region_size( char *base, char **region_start
 }
 
 
+#ifdef WINE_IOS
+/**********************************************************************
+ * ml1101: VirtualQuery must not call memory MEM_FREE that VirtualAlloc
+ * can never hand out.
+ *
+ * Measured (dsr-log-dearxan2, 29.09): a mod tool looks for a free block
+ * within +-2 GB of a fixed-base exe at 0x140000000, starting at
+ * 0xc3820000. VirtualQuery said MEM_FREE (the view tree is empty there),
+ * the tool called VirtualAlloc(0xc3820000, 16MB, RESERVE|COMMIT, RWX), and
+ * mach_vm_map answered KERN_INVALID_ADDRESS (ml814 STAGE=fixed-map err=1,
+ * status c0000017): below the task's VM floor (iOS 4 GB __PAGEZERO and the
+ * slid main binary) nothing can be mapped. The same run then burned 4000+
+ * failed page-by-page requests at 0x7200000000.. (err=3 KERN_NO_SPACE):
+ * host mappings (CoreAnimation, dyld, the JIT pool, ...) that are not Wine
+ * views and were reported as MEM_FREE too.
+ *
+ * Windows semantics: MEM_FREE means "a VirtualAlloc at this address can
+ * succeed". So for a range the view tree calls free:
+ *   - below the map floor (max(address_space_start, TASK_VM_INFO
+ *     min_address)) report MEM_RESERVE up to the floor;
+ *   - otherwise ask the kernel where the next host mapping is. Host ranges
+ *     inside a Wine reserved area stay free (map_fixed_area may overwrite
+ *     them); any other host mapping ends the free region, and if it covers
+ *     the queried address itself the answer is MEM_RESERVE for its extent.
+ * Only the MEM_FREE answer is narrowed; views, commits and every allocation
+ * path are untouched. Skipped in a WoW64 pseudo-process (32-bit guest
+ * addresses keep their previous answer).
+ * Kill switch: MADEIRA_NO_QUERY_CLIP=1. */
+static int ios_query_clip_enabled(void)
+{
+    static int dec = -1;
+    if (dec < 0)
+    {
+        const char *off = getenv( "MADEIRA_NO_QUERY_CLIP" );
+        dec = (off && *off && *off != '0') ? 0 : 1;
+        dprintf( 2, "ml1101: query clip %s\n",
+                 dec ? "ENABLED (default)" : "DISABLED by MADEIRA_NO_QUERY_CLIP" );
+    }
+    return dec;
+}
+
+static char *ios_query_map_floor(void)
+{
+    static char *floor;
+
+    if (!floor)
+    {
+        task_vm_info_data_t vmi;
+        mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+        char *f = (char *)address_space_start;
+
+        if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt ) == KERN_SUCCESS &&
+            (char *)(uintptr_t)vmi.min_address > f)
+            f = (char *)(uintptr_t)vmi.min_address;
+        floor = f;
+        dprintf( 2, "ml1101: query floor %p (address_space_start %p)\n", floor, address_space_start );
+    }
+    return floor;
+}
+
+/* First part of the host-occupied [lo,hi) that is NOT inside a Wine reserved
+ * area (reserved_areas is sorted ascending). Returns 0 if all of it is. */
+static int ios_query_first_blocked( char *lo, char *hi, char **bs, char **be )
+{
+    struct reserved_area *area;
+    char *cur = lo;
+
+    LIST_FOR_EACH_ENTRY( area, &reserved_areas, struct reserved_area, entry )
+    {
+        char *s = area->base, *e = s + area->size;
+
+        if (e <= cur) continue;
+        if (s >= hi) break;
+        if (s > cur) { *bs = cur; *be = s; return 1; }
+        cur = e;
+        if (cur >= hi) return 0;
+    }
+    if (cur < hi) { *bs = cur; *be = hi; return 1; }
+    return 0;
+}
+
+/* One kernel map entry at or above `at`: returns 0 if nothing is mapped above. */
+static int ios_query_host_region( char *at, char **hs, char **he, int *prot, int *maxprot )
+{
+    mach_vm_address_t ra = (mach_vm_address_t)(uintptr_t)at;
+    mach_vm_size_t rs = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+
+    if (mach_vm_region( mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                        (vm_region_info_t)&info, &cnt, &obj ) != KERN_SUCCESS)
+        return 0;
+    if (obj != MACH_PORT_NULL) mach_port_deallocate( mach_task_self(), obj );
+    *hs = (char *)(uintptr_t)ra;
+    *he = *hs + rs;
+    *prot = info.protection;
+    *maxprot = info.max_protection;
+    return 1;
+}
+
+/* ml1101b: the JIT pool is ONE opaque block for this purpose.
+ *
+ * Measured (dsr-log-nearalloc, 29.09): with ml1101 a startup walker that
+ * queries upward from 0 hung at 100% CPU (samples in mach_msg and
+ * pthread_sigmask, stack get_committed_size <- get_basic_memory_info).
+ * Cause (from the code): NtQueryVirtualMemory first passes the address
+ * through ios_jit_reverse_translate_addr, so a query that lands INSIDE the RX
+ * pool on an image copy is answered for the PE image (0x140000000...), whose
+ * end lies BELOW the pool -- the walker's next address goes backwards and it
+ * loops forever. Before ml1101 the free answer jumped over the pool, so no
+ * walker ever landed inside it. Rule: no answer may end strictly inside a
+ * pool span; an answer that reaches into a pool is extended to the pool's
+ * end. The pool start itself is safe to land on: image copies are bumped
+ * from a non-zero offset, so the first byte never reverse-translates. */
+static void ios_query_pool_fix( char *base, char *end, char **region_end, BOOL *fake_reserved )
+{
+    char *spans[2][2];
+    int i;
+
+    spans[0][0] = ios_jit_rx_base_global;
+    spans[1][0] = ios_jit_rw_base_global;
+    for (i = 0; i < 2; i++)
+    {
+        char *lo = spans[i][0], *hi;
+
+        if (!lo || !ios_jit_pool_size_global) continue;
+        hi = lo + ios_jit_pool_size_global;
+        if (hi > end) hi = end;
+        if (hi <= base || *region_end <= lo) continue;          /* no overlap */
+        if (*fake_reserved || base >= lo)
+        {
+            /* reserved answer touching the pool, or a query inside it: cover it all */
+            *fake_reserved = TRUE;
+            if (*region_end < hi) *region_end = hi;
+        }
+        else if (*region_end > lo) *region_end = lo;             /* free answer: stop at the pool */
+    }
+}
+
+/* Called with virtual_mutex held, only for a range the view tree calls free. */
+static void ios_query_clip_free( char *base, char **region_start, char **region_end,
+                                 BOOL *fake_reserved )
+{
+    static int log_n;
+    char *floor, *cur = base, *end = *region_end;
+    char *hs, *he, *bs, *be, *first_hs = NULL;
+    int guard, prot = 0, maxprot = 0, merged = 0;
+
+    if (!ios_query_clip_enabled()) return;
+    if (ios_wow_slot_current()) return;
+
+    floor = ios_query_map_floor();
+    if (base < floor)
+    {
+        *fake_reserved = TRUE;
+        if (end > floor) *region_end = floor;
+        if (log_n < 32)
+        {
+            log_n++;
+            dprintf( 2, "[query-clip] ml1101 %p: FREE -> RESERVE [%p,%p) (below the map floor)\n",
+                     base, *region_start, *region_end );
+        }
+        return;
+    }
+
+    for (guard = 0; guard < 64 && cur < end; guard++)
+    {
+        if (!ios_query_host_region( cur, &hs, &he, &prot, &maxprot )) break;
+        if (hs >= end) break;             /* next host mapping lies past the free range */
+        if (!first_hs) first_hs = hs;
+        if (hs < cur) hs = cur;
+        if (he > end) he = end;
+        if (ios_query_first_blocked( hs, he, &bs, &be ))
+        {
+            if (bs > base) *region_end = bs;      /* free only up to the host mapping */
+            else
+            {
+                /* the queried address itself is host-occupied: report it RESERVE and
+                 * coalesce the contiguous occupied run (ml1101b: one answer per run,
+                 * not one per kernel map entry -- 80k entries on a phone) */
+                *fake_reserved = TRUE;
+                if ((char *)first_hs > *region_start) *region_start = first_hs;
+                while (be < end && merged < 1024)
+                {
+                    char *nhs, *nhe, *nbs, *nbe;
+                    int np, nmp;
+
+                    if (!ios_query_host_region( be, &nhs, &nhe, &np, &nmp )) break;
+                    if (nhs > be) break;                              /* a real hole */
+                    if (nhe > end) nhe = end;
+                    if (!ios_query_first_blocked( be, nhe, &nbs, &nbe ) || nbs != be) break;
+                    be = nbe;
+                    merged++;
+                }
+                *region_end = be;
+            }
+            goto done;
+        }
+        cur = he;   /* host range entirely inside Wine reserved areas: allocatable */
+    }
+    if (cur > base && cur < end) *region_end = cur;   /* only what was verified */
+
+done:
+    ios_query_pool_fix( base, end, region_end, fake_reserved );
+    if (log_n < 32 && (*fake_reserved || *region_end != end))
+    {
+        log_n++;
+        dprintf( 2, "[query-clip] ml1101b %p: first host %p (prot=%d/%d) merged=%d -> %s up to %p\n",
+                 base, first_hs, prot, maxprot, merged,
+                 *fake_reserved ? "RESERVE" : "FREE", *region_end );
+    }
+}
+#endif
+
 static unsigned int fill_basic_memory_info( const void *addr, MEMORY_BASIC_INFORMATION *info )
 {
     char *base, *alloc_base, *alloc_end;
@@ -31027,6 +31318,10 @@ static unsigned int fill_basic_memory_info( const void *addr, MEMORY_BASIC_INFOR
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
     view = get_memory_region_size( base, &alloc_base, &alloc_end, &fake_reserved );
+#ifdef WINE_IOS
+    /* ml1101: MEM_FREE only where an allocation can actually land. */
+    if (!view && !fake_reserved) ios_query_clip_free( base, &alloc_base, &alloc_end, &fake_reserved );
+#endif
 
     /* Fill the info structure */
 
@@ -31977,6 +32272,10 @@ static NTSTATUS unmap_view_of_section( HANDLE process, PVOID addr, ULONG flags )
     if (!status)
     {
         if (view->protect & SEC_IMAGE) release_builtin_module( view->base );
+#ifdef WINE_IOS
+        /* ml1100: the low name must die with the mapping. */
+        if (view->protect & SEC_IMAGE) ios_image_lowalias_retire( (unsigned long long)(uintptr_t)view->base );
+#endif
         if (flags & MEM_PRESERVE_PLACEHOLDER) free_pages_preserve_placeholder( view, view->base, view->size );
         else delete_view( view );
     }
