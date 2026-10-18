@@ -792,6 +792,7 @@ func packageBuffer(apps: [UInt32], depots: [UInt32]) -> Data {
     require(info.type == .game, "PICS type names match without case")
     require(info.installDepots().map(\.depotID) == [101, 102, 105], "install depots: common, English, 64-bit only")
     require(info.downloadSize(for: "windows") == 420, "the download size counts only the selected depots")
+    require(info.installSize(for: "windows") == 620, "the installed size: manifests.public.size, else the download figure")
     require(info.buildID == 4242 && info.installableOnWindows && info.installDir == "Fixture Game", "build id, install folder and Windows installability")
     require(info.libraryCapsule == "cap/1.jpg" && info.parentID == nil, "artwork name; a parent equal to itself is not kept")
     require(info.depotSelectionSummary().contains("103[-]lang") && info.depotSelectionSummary().contains("107[-]dlc"), "the selection log names the rule that left a depot out")

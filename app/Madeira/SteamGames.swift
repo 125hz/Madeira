@@ -899,6 +899,18 @@ struct SteamGameSheet: View {
                         }
                     }
                     Section {
+                        if item.installed == nil, let game = steam.game(appID) {
+                            if let bytes = game.downloadBytes {
+                                LabeledContent("Download size", value: "About " + formatBytes(Int64(clamping: bytes)))
+                            }
+                            if let bytes = game.installBytes {
+                                LabeledContent("Size on this device", value: "About " + formatBytes(Int64(clamping: bytes)))
+                            }
+                            if game.downloadBytes == nil && game.installBytes == nil {
+                                Text("Steam states no size for this game. Refresh your Steam library to read it again.")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
                         if let freeSpace { LabeledContent("Free space on this device", value: formatBytes(freeSpace)) }
                         Text(SteamGameSheet.downloadNote)
                             .font(.footnote).foregroundStyle(.secondary)
