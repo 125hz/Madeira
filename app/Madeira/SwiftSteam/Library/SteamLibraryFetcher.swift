@@ -99,7 +99,7 @@ class SteamLibraryFetcher {
         var visited: Set<UInt32> = [appID], references = Set<String>()
         func eligible(_ d: SteamAppInfo.DepotInfo) -> Bool {
             !d.isSharedInstall && d.dlcAppID == nil && d.supports(os: "windows") &&
-                !d.lowViolence && (d.language.isEmpty || d.language.lowercased() == "english")
+                !d.lowViolence && (d.language.isEmpty || ["english", SteamLanguage.download(for: appID)].contains(d.language.lowercased()))
         }
         var pending = app.depots.filter { eligible($0) && $0.publicManifestID == nil && $0.fromApp != nil }
             .map { ($0.fromApp!, $0.depotID) }
