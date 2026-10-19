@@ -538,10 +538,12 @@ OVERLAY = {
                         "launch, the game's own file wins. Restart Madeira and enable JIT again after changing it."},
     "pool-pair": {"category": "Memory & JIT pool", "title": "Split JIT pool: prefer two runs above the window",
                 "kind": "bool", "default": "1",
-                "note": "With pool-split on: when the largest free run lies below the 0x140000000 executable window "
-                        "(where the pool cannot split), the pool takes two runs above the window instead if together "
-                        "they are larger (GTA V: 368 + 320 MB instead of 464 MB). Falls back to the single run if the "
-                        "placement misses. On by default; 0 turns it off. Read at launch, the game's own file wins."},
+                "note": "With pool-split on: the pool takes two runs above the 0x140000000 executable window when "
+                        "together they are larger than the single run it would get -- whether that run lies below the "
+                        "window, where the pool cannot split (GTA V: 368 + 320 MB instead of 464 MB), or is the higher "
+                        "of two runs above it (The Adventures of Elliot: 240 + 288 MB instead of 288 MB). Falls back to "
+                        "the single run if the placement misses. On by default; 0 turns it off. Read at launch, the "
+                        "game's own file wins."},
     "pool-mid": {"category": "Memory & JIT pool", "title": "Split JIT pool: use the free run between the regions",
                 "kind": "bool", "default": "0",
                 "note": "With pool-split on: when another mapping sits between the pool's two regions and leaves a "
