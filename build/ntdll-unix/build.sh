@@ -192,6 +192,20 @@ for src in $WINE_SRC/dlls/ntdll/unix/*.c; do
         thread)
             compile_one "$BUILD_DIR/thread_ios.c" "thread"
             ;;
+        sync)
+            # madeira-bcd: a NULL keyed-event handle resolves per guest process
+            # (ios_default_keyed_event, loader_ios.c), not to the first process's
+            # global. The copy is compiled from obj/, so its one relative include
+            # is made absolute; the build fails if the source no longer matches.
+            perl -0pe 's/(NTSTATUS WINAPI NtWaitForKeyedEvent\()/HANDLE ios_default_keyed_event(void);\n$1/;
+                       s/if \(!handle\) handle = keyed_event;/if (!handle) handle = ios_default_keyed_event();/g;
+                       s{"\.\./\.\./\.\./\.\./build/madeira_cfg\.h"}{"'"$REPO_ROOT"'/build/madeira_cfg.h"}' \
+                "$src" > "$OBJ_DIR/sync_ios.c"
+            if [ "$(grep -c 'handle = ios_default_keyed_event()' "$OBJ_DIR/sync_ios.c")" != 2 ]; then
+                echo "  sync: keyed-event patch did not apply"; exit 1
+            fi
+            compile_one "$OBJ_DIR/sync_ios.c" "sync"
+            ;;
         *)
             compile_one "$src" "$name"
             ;;

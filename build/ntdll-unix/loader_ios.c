@@ -2989,6 +2989,83 @@ static ULONG_PTR get_image_address(void)
 }
 
 /***********************************************************************
+ *           ios_default_keyed_event
+ *
+ * madeira-bcd: the keyed event NtWaitForKeyedEvent/NtReleaseKeyedEvent use for
+ * a NULL handle, per guest process. Upstream keeps one global, created by the
+ * process's own start_main_thread; here every guest process shares this
+ * library, only the first runs start_main_thread (children boot through
+ * wine_ios_child_main), and a handle is only valid in the handle table of the
+ * process that created it. Children therefore passed the first process's
+ * handle value to the server, where it named some other object of theirs:
+ * Slay the Spire 2 (.NET) had NtReleaseKeyedEvent fail with
+ * STATUS_OBJECT_TYPE_MISMATCH in RtlRunOnceComplete, whose waiter had already
+ * left after the same failure, and the waker then followed the stale waiter
+ * entry and faulted. Each process now gets its own, created on first use and
+ * keyed by PEB and process id (a PEB address can be reused by a later process).
+ * sync.c is compiled with its two `handle = keyed_event` lines pointed here
+ * (build/ntdll-unix/build.sh).
+ */
+static pthread_mutex_t ios_keyed_event_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct { void *peb; ULONG_PTR pid; HANDLE handle; } ios_keyed_events[64];
+static unsigned ios_keyed_event_next;
+
+static void ios_keyed_event_store( void *peb, ULONG_PTR pid, HANDLE handle )
+{
+    unsigned i;
+    for (i = 0; i < ARRAY_SIZE(ios_keyed_events); i++)
+        if (ios_keyed_events[i].peb == peb && ios_keyed_events[i].pid == pid) break;
+    if (i == ARRAY_SIZE(ios_keyed_events)) i = ios_keyed_event_next++ % ARRAY_SIZE(ios_keyed_events);
+    ios_keyed_events[i].peb = peb;
+    ios_keyed_events[i].pid = pid;
+    ios_keyed_events[i].handle = handle;
+}
+
+void ios_default_keyed_event_register( HANDLE handle )
+{
+    TEB *teb = NtCurrentTeb();
+    if (!teb || !handle) return;
+    pthread_mutex_lock( &ios_keyed_event_lock );
+    ios_keyed_event_store( teb->Peb, (ULONG_PTR)teb->ClientId.UniqueProcess, handle );
+    pthread_mutex_unlock( &ios_keyed_event_lock );
+}
+
+HANDLE ios_default_keyed_event(void)
+{
+    TEB *teb = NtCurrentTeb();
+    void *peb = teb ? teb->Peb : NULL;
+    ULONG_PTR pid = teb ? (ULONG_PTR)teb->ClientId.UniqueProcess : 0;
+    HANDLE handle = 0;
+    unsigned i;
+
+    if (!peb) return keyed_event;
+    pthread_mutex_lock( &ios_keyed_event_lock );
+    for (i = 0; i < ARRAY_SIZE(ios_keyed_events); i++)
+        if (ios_keyed_events[i].peb == peb && ios_keyed_events[i].pid == pid)
+        {
+            handle = ios_keyed_events[i].handle;
+            break;
+        }
+    if (!handle)
+    {
+        NTSTATUS status = NtCreateKeyedEvent( &handle, GENERIC_READ | GENERIC_WRITE, NULL, 0 );
+        if (!status && handle)
+        {
+            ios_keyed_event_store( peb, pid, handle );
+            ERR( "[keyed-event] process %04lx (peb %p): own default keyed event %p\n",
+                 (unsigned long)pid, peb, handle );
+        }
+        else
+        {
+            ERR( "[keyed-event] process %04lx: NtCreateKeyedEvent failed %#x\n", (unsigned long)pid, (unsigned)status );
+            handle = keyed_event;
+        }
+    }
+    pthread_mutex_unlock( &ios_keyed_event_lock );
+    return handle;
+}
+
+/***********************************************************************
  *           start_main_thread
  */
 extern void ios_reserve_fex_arena(void);  /* ml756, virtual_ios.c */
@@ -3142,6 +3219,7 @@ static void start_main_thread(void)
     WINE_IOS_LOG("init_thread_stack...");
     init_thread_stack( teb, 0, 0, 0 );
     NtCreateKeyedEvent( &keyed_event, GENERIC_READ | GENERIC_WRITE, NULL, 0 );
+    ios_default_keyed_event_register( keyed_event );
     /* ml756: take FEX's host arena BEFORE any PE module is placed.
      *
      * This is the whole point of the placeholder: once guest DLLs start
