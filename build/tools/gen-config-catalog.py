@@ -557,6 +557,10 @@ OVERLAY = {
                         "becomes a third debugger region for the emulator's code buffers, so the whole JIT pool is "
                         "left to DLL copies (GTA V: about 300 MB more). Needs the pool above the window; costs the "
                         "region's size in memory. Off by default; read at launch, the game's own file wins."},
+    "exe-window-mb": {"category": "Memory & JIT pool", "title": "Executable window size (MB)",
+                "kind": "int", "default": "128",
+                "note": "The address range at 0x140000000 kept for a game exe without relocations, which can only run there. Unset: 128 MB, or for a Madeira Dock launch the size of the largest such exe in the game's folder (The Adventures of Elliot: 473 MB -> 480). The JIT pool then starts above it and is that much smaller, so a large one also needs env.MADEIRA_X64_IMAGE_NOCOPY = 1 and pool-split = 1. A number sets it (129 to 960); 128 or less keeps 128 MB. Read at launch, the game's own file wins.",
+                "sources": ["app/Madeira/StikJITHelper.swift"]},
     "pool-low-margin": {"category": "Memory & JIT pool", "title": "Code-buffer region: MB left free below the window",
                 "kind": "int", "default": "128",
                 "note": "With pool-low on: how much of the free run below the executable window stays free for "

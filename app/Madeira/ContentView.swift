@@ -3397,6 +3397,15 @@ struct ContentView: View {
             let options = await SteamOwnedLibrary.shared.launchOptions(appID: game.id)
             let installFolder = MadeiraDock.drive.appendingPathComponent(game.library + "/common/" + game.installDir)
             let chosen = options.flatMap { SteamDirectStart.choose($0, installFolder: installFolder)?.launchIndex }
+            // madeira-bcd exe-window-mb: measure the game's own fixed-base exe now, so the
+            // JIT pool is placed above it (StikJITHelper.allocatePool reads this once).
+            if let need = StikJITHelper.fixedBaseWindowMB(in: installFolder) {
+                StikJITHelper.exeWindowAutoMB = need.mb
+                LogStore.shared.log("[exe-window] \(need.exe) is a fixed-base image ending \(need.mb)MB above 0x140000000: "
+                    + "the executable window is widened to \(need.mb)MB for this session (exe-window-mb in the game's file overrides)")
+            } else {
+                StikJITHelper.exeWindowAutoMB = 0
+            }
             let launchOption = chosen ?? 0
             LogStore.shared.log("[madeira-dock] launch option \(launchOption)\(chosen == nil ? " (none chosen: the default)" : "")")
             await SteamOwnedLibrary.shared.prepareDock()
