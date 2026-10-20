@@ -29579,7 +29579,13 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
              * ceiling. Serving from wherever we have room lets PA take its
              * aligned pool from the top hole instead of dying in the 32GB
              * fallback. Jumbo-only, loudly logged. */
-            if (st && *ret && *size_ptr >= 0x40000000 && (type & MEM_RESERVE))
+            /* A non-NULL base is a fixed-address request. Ordinary callers
+             * must receive the backend failure and choose their own retry;
+             * relocating can invalidate arena-relative pointer arithmetic.
+             * Keep the existing helper workaround scoped to its owner: its
+             * boot-held pools are handed off by the routes below. */
+            if (st && *ret && *size_ptr >= 0x40000000 && (type & MEM_RESERVE)
+                && ios_sc_cef_enabled() && ios_sc_current_is_helper())
             {
                 void *hint = *ret;
                 void *pick = NULL;
