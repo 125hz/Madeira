@@ -3681,6 +3681,10 @@ struct LibraryDetail: View {
                 }
                 // madeira-bcd: always last, for every entry, the Desktop too (GameRecommendationsApply.swift).
                 Section {
+                    Button("Copy Settings", systemImage: "doc.on.doc") {
+                        let configText = entry.config ?? ""
+                        UIPasteboard.general.string = configText.isEmpty ? "# Default configuration" : configText
+                    }
                     Button("Reset to Recommended", systemImage: "arrow.counterclockwise") { confirmReset = true }
                         .confirmationDialog(GameRecommendations.question(recommended, desktop: entry.desktop == true),
                                             isPresented: $confirmReset, titleVisibility: .visible) {
