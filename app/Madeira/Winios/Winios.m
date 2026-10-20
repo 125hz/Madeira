@@ -524,6 +524,7 @@ static void winios_remove_layer(HWND hwnd);   /* compositor, below */
  * normal session never pays a lookup. */
 #define WINIOS_WS_VISIBLE    0x10000000u
 #define WINIOS_WS_MINIMIZE   0x20000000u
+#define WINIOS_WS_CAPTION    0x00C00000u   /* WS_BORDER | WS_DLGFRAME */
 
 extern int winios_drv_census_owner(HWND hwnd, unsigned int *pid, unsigned int *style);
 extern int winios_drv_process_image(unsigned int pid, char *out, unsigned int size);
@@ -624,6 +625,7 @@ static void winios_census_note_frame(HWND hwnd, int x, int y, int w, int h, int 
         e->x = x; e->y = y; e->w = w; e->h = h;
         e->pid = pid;
         e->visible = (unsigned char)shown;
+        e->caption = (style & WINIOS_WS_CAPTION) == WINIOS_WS_CAPTION;
         memcpy(e->image, image, sizeof(e->image));
         if (shown) e->shown_once = 1;
         else if ((style & WINIOS_WS_VISIBLE) && (style & WINIOS_WS_MINIMIZE) && !e->shown_once && !e->restore_sent &&
