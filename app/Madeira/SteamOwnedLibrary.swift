@@ -527,6 +527,11 @@ final class SteamOwnedLibrary: ObservableObject {
                 return (audit, elsewhere)
             }.value
             let audit = result.0
+            // Valve's client in a session shows the game only the files its list
+            // names (SteamRemoteCache); not while that client runs.
+            if !inSession, let written = SteamRemoteCache.write(appID: appID, audit: audit, paths: paths) {
+                SteamLog.event("[steam-cloud] app=\(appID) remotecache synced=\(written.synced) device-only=\(written.local) dropped=\(written.dropped) change=\(audit.changeNumber)")
+            }
             let plan = SteamCloudPlan.make(audit: audit, baseline: baseline(appID))
             recordBaseline(appID, settled: plan.settled)
             state.audit = audit; state.conflicts = plan.conflicts; state.checked = Date(); state.phase = .ready
