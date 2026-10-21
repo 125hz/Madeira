@@ -11,6 +11,15 @@ APP_LIB="$REPO_ROOT/app/Madeira/libntdll_unix.a"
 
 mkdir -p "$OBJ_DIR"
 
+# Detect optional diagnostic fields in the SDK used for this target build.
+# Keep SDK versions without this member buildable; it is not a runtime requirement.
+RUSAGE_PAGE_WAIT_FLAGS=()
+if printf '#include <sys/resource.h>\nvoid probe(struct rusage_info_v6 *r) { (void)r->ri_page_wait_time_mach; }\n' | \
+    xcrun -sdk iphoneos clang -arch arm64 -isysroot "$SDK" \
+        -miphoneos-version-min=17.0 -x c -fsyntax-only - >/dev/null 2>&1; then
+    RUSAGE_PAGE_WAIT_FLAGS=(-DMADEIRA_HAVE_RUSAGE_PAGE_WAIT_TIME_MACH=1)
+fi
+
 SUCCEEDED=0
 FAILED=0
 FAILED_FILES=""
@@ -34,6 +43,7 @@ compile_one() {
         -DBINDIR=\"/usr/local/bin\" -DLIBDIR=\"/usr/local/lib\" \
         -DDATADIR=\"/usr/local/share\" -DSYSTEMDLLPATH=\"\" \
         -DWINE_UNIX_LIB -DWINE_IOS=1 \
+        "${RUSAGE_PAGE_WAIT_FLAGS[@]}" \
         -Dget_thread_context=ntdll_get_thread_context \
         -Dset_thread_context=ntdll_set_thread_context \
         -c "$src" -o "$OBJ_DIR/$name.o" 2>"$OBJ_DIR/$name.err"; then
