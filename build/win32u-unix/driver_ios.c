@@ -2020,9 +2020,16 @@ static LRESULT nulldrv_WintabProc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
     return 0;
 }
 
+#ifdef MADEIRA_MOLTENVK
+extern UINT madeira_ios_VulkanInit( UINT version, void *handle, const struct vulkan_driver_funcs **funcs );
+#endif
 static UINT nulldrv_VulkanInit( UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs )
 {
+#ifdef MADEIRA_MOLTENVK
+    return madeira_ios_VulkanInit( version, vulkan_handle, driver_funcs );
+#else
     return STATUS_NOT_IMPLEMENTED;
+#endif
 }
 
 static UINT nulldrv_OpenGLInit( UINT version, const struct opengl_funcs *opengl_funcs, const struct opengl_driver_funcs **driver_funcs )

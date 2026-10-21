@@ -11362,6 +11362,9 @@ static void ios_init_stub_tables(void)
  * libdxmt_combined.a (originally __wine_unix_call_funcs, renamed in
  * winemetal_unix.c to avoid collision with our own ntdll table). */
 extern const void *dxmt_winemetal_unix_call_funcs[];
+#ifdef MADEIRA_MOLTENVK
+extern const void *madeira_winevulkan_unix_call_funcs[];
+#endif
 
 /* DXMT's winemetal_unix.c, linked into the same image, reports per-frame
  * statistics into a "[frame]" instrument through the symbols below.  That
@@ -11679,6 +11682,12 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             libname = "winemetal";
             funcs64 = (const void *)dxmt_winemetal_unix_call_funcs;
             funcs_wow64 = (const void *)dxmt_winemetal_unix_call_wow64_funcs;
+#ifdef MADEIRA_MOLTENVK
+        } else if (!wow && match && strstr(match, "winevulkan")) {
+            libname = "winevulkan";
+            funcs64 = (const void *)madeira_winevulkan_unix_call_funcs;
+            dprintf(2, "[vk-bind] ARM64EC WineVulkan -> native Unix table module=%p\n", module);
+#endif
         } else if (wow && ((match && strstr(match, "d3d9shim")) ||
                            (modname && strstr(modname, "d3d9shim")))) {
             /* The i386 D3D9 shim, bound to the native ARM64 frontend.  A

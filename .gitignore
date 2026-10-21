@@ -169,3 +169,8 @@ app/Madeira/arm64ec-windows/dock-notices.txt
 
 # faultrep.dll: build/faultrep/build.sh (its install goes into the tracked farm)
 build/faultrep/out/
+
+# Optional Vulkan native build outputs
+/app/Madeira/libmadeira_vulkan.a
+/app/Madeira/arm64ec-windows/winevulkan.dll
+/app/Madeira/legal/LICENSE-MoltenVK.txt

@@ -207,3 +207,13 @@ into a signed app.
 `LiveContainer/` and `research/LiveContainer/` are AGPL-3.0 reference copies
 used for local research. Both are gitignored, untracked, and no part of them is
 linked into or shipped with the app. They form no part of the combined work.
+
+## Optional experimental Vulkan backend
+
+`build/vulkan-ios/fetch.sh` retrieves the official KhronosGroup/MoltenVK v1.4.2
+iOS archive, pinned by SHA-256. MoltenVK and its bundled shader-conversion code
+are distributed under Apache-2.0; the archive's license is copied by the optional
+build to `app/Madeira/legal/LICENSE-MoltenVK.txt`. The integration and Wine Unix
+adapters retain their LGPL-2.1-or-later source notices. No third-party runtime
+binary is added to this repository. Build and validation limits are documented
+in `build/vulkan-ios/README.md`.

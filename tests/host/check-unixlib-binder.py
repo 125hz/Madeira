@@ -73,6 +73,14 @@ assert len(dns) == 1, len(dns)
 assert "funcs64 = (const void *)dnsapi_unix_call_funcs;" in dns[0], dns[0]
 assert "funcs_wow64 = (const void *)dnsapi_unix_call_wow64_funcs;" in dns[0], dns[0]
 branches = [b for b in branches if b is not dns[0]]
+# The experimental Vulkan path is ARM64EC-only; reject accidental WoW64 binding.
+vulkan = [b for b in branches if 'strstr(match, "winevulkan")' in b.split("\n")[0]]
+assert len(vulkan) == 1
+assert 'if (!wow && match &&' in vulkan[0].split("\n")[0]
+assert 'funcs64 = (const void *)madeira_winevulkan_unix_call_funcs;' in vulkan[0]
+assert 'funcs_wow64 =' not in vulkan[0]
+branches.remove(vulkan[0])
+print("PASS: WineVulkan binds only its native 64-bit Unix table; WoW64 is not advertised")
 assert len(branches) == len(upstream) + 1, len(branches)
 for (test, table), body in zip(upstream, branches):
     assert test in body.split("\n")[0], (test, body.split("\n")[0])
