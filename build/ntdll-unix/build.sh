@@ -18,6 +18,7 @@ FAILED_FILES=""
 compile_one() {
     local src=$1
     local name=$2
+    shift 2   # anything after src and name: extra flags for this file only
     echo -n "  $name... "
 
     if xcrun -sdk iphoneos clang \
@@ -36,6 +37,7 @@ compile_one() {
         -DWINE_UNIX_LIB -DWINE_IOS=1 \
         -Dget_thread_context=ntdll_get_thread_context \
         -Dset_thread_context=ntdll_set_thread_context \
+        "$@" \
         -c "$src" -o "$OBJ_DIR/$name.o" 2>"$OBJ_DIR/$name.err"; then
         echo "OK"
         SUCCEEDED=$((SUCCEEDED + 1))
@@ -191,6 +193,12 @@ for src in $WINE_SRC/dlls/ntdll/unix/*.c; do
             ;;
         thread)
             compile_one "$BUILD_DIR/thread_ios.c" "thread"
+            ;;
+        sync)
+            # MADEIRA_THREAD_QOS (thread_ios.c): ios_eco_apply_self sets a guest
+            # thread's QoS through madeira_guest_qos_self, which picks the class
+            # given for the thread's name; with the variable unset it passes through.
+            compile_one "$src" "sync" -Dpthread_set_qos_class_self_np=madeira_guest_qos_self
             ;;
         *)
             compile_one "$src" "$name"
