@@ -250,6 +250,16 @@ design does, and what to check on device.
   nearest level; a width change during a zoom ends the zoom at its nearest
   level first. *Check:* rotate mid-scroll, resize a Stage Manager window,
   split view at 1/3 width (two columns minimum).
+- The grid is laid out across the page's full width, under a landscape iPhone's
+  side safe areas (the floating controls keep their own insets). A rotation lays
+  the page out for the new width inside the system's rotation animation, so the
+  cards glide to their new places, and keeps the card at the middle of the screen
+  at the middle (a page at its top stays at its top); a pinch in flight lands
+  first. *Check:* rotate mid-page in both directions, with and without a pinch.
+- A pinch that catches a settle carries the settle's shift into the new pinch (the
+  picture does not move at the catch) and starts from the un-banded coordinate when
+  the settle was past the first or last level. *Check:* zoom in near the top of a
+  long page and pinch out again while the cards are still sliding to the centre.
 
 ### Sign-in / refresh changing the data
 - See "Data changing mid-zoom". A sign-out removes the Not installed section;
