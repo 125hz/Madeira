@@ -1620,6 +1620,46 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         return STATUS_ACCESS_DENIED;
     }
 
+    /* madeira-conhost-headless: a pipe cannot be a --unix console's tty (the server
+     * calls tcgetattr on it); --headless takes the same standard handles and needs no
+     * terminal device. env.MADEIRA_CONHOST_HEADLESS = 1. */
+    {
+        const char *hl = getenv( "MADEIRA_CONHOST_HEADLESS" );
+        const WCHAR *cl = params->CommandLine.Buffer;
+        int cl_len = params->CommandLine.Length / sizeof(WCHAR), k, at = -1;
+        static const char from[] = "--unix", to[] = "--headless";
+
+        if (hl && hl[0] == '1' && cl &&
+            ios_image_name_is( params->ImagePathName.Buffer, params->ImagePathName.Length / sizeof(WCHAR),
+                               "conhost.exe" ))
+        {
+            for (k = 0; k + (int)sizeof(from) - 1 <= cl_len && at < 0; k++)
+            {
+                int j;
+                for (j = 0; j < (int)sizeof(from) - 1; j++) if (cl[k + j] != (WCHAR)from[j]) break;
+                if (j == (int)sizeof(from) - 1) at = k;
+            }
+            if (at >= 0)
+            {
+                int add = (int)sizeof(to) - (int)sizeof(from), o = 0;
+                WCHAR *nbuf = malloc( (cl_len + add + 1) * sizeof(WCHAR) );   /* leaks once per console, as the other rewrites */
+
+                if (nbuf)
+                {
+                    for (k = 0; k < at; k++) nbuf[o++] = cl[k];
+                    for (k = 0; k < (int)sizeof(to) - 1; k++) nbuf[o++] = (WCHAR)to[k];
+                    for (k = at + (int)sizeof(from) - 1; k < cl_len; k++) nbuf[o++] = cl[k];
+                    nbuf[o] = 0;
+                    params->CommandLine.Buffer = nbuf;
+                    params->CommandLine.Length = o * sizeof(WCHAR);
+                    params->CommandLine.MaximumLength = params->CommandLine.Length + sizeof(WCHAR);
+                    dprintf( 2, "[console] conhost --unix -> --headless (a pipe is not a terminal device; "
+                                "MADEIRA_CONHOST_HEADLESS)\n" );
+                }
+            }
+        }
+    }
+
     /* ml526: stamp every accepted spawn on the startup timeline. This is the
      * boundary the coarse phase accounting could not see — steam.exe -> the
      * webhelper spawn was a ~16s block with no internal detail. */
