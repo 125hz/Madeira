@@ -222,15 +222,19 @@ final class LibraryGridHostController: UIViewController, UICollectionViewDelegat
         glow?.viewportChanged(collectionView.bounds.size)
         if let glow, collectionView.subviews.first !== glow { collectionView.sendSubviewToBack(glow) }   // the light stays under the cells
         glow?.syncDraw()   // frames that moved in this pass: the light is drawn for them in the same commit
-        // A change of the page's width or left edge (rotation, Stage Manager, a landscape notch) lays the page out again.
-        if layoutKey != lastLayout, let props {
-            lastLayout = layoutKey
-            // A width change during a zoom lands it first (rotation, Stage Manager).
-            zoom?.abandon()
-            dropBridgeIfLive()
-            applyAgain = true
-            update(props)
-        }
+        applyForNewWidth()
+    }
+
+    /// A change of the page's width (rotation, Stage Manager) lays the page out again. A rotation does this first thing in its
+    /// animation, before the collection view lays out, so the layout it animates to is already the new one.
+    private func applyForNewWidth() {
+        guard layoutKey != lastLayout, let props else { return }
+        lastLayout = layoutKey
+        // A width change during a zoom lands it first (rotation, Stage Manager).
+        zoom?.abandon()
+        dropBridgeIfLive()
+        applyAgain = true
+        update(props)
     }
 
     // MARK: Updates
@@ -271,14 +275,13 @@ final class LibraryGridHostController: UIViewController, UICollectionViewDelegat
         schedulePrefetch()
     }
 
-    /// The width inside the horizontal safe area (a landscape iPhone's notch side): the
-    /// SwiftUI page's ScrollView keeps its content inside it.
-    var layoutWidth: CGFloat {
-        max(1, collectionView.bounds.width - collectionView.safeAreaInsets.left - collectionView.safeAreaInsets.right)
-    }
-    var layoutKey: CGSize { CGSize(width: layoutWidth.rounded(), height: collectionView.safeAreaInsets.left.rounded()) }
+    /// The page's full width. The cards run under a landscape iPhone's side safe areas (the Dynamic Island's strip and the
+    /// home-indicator side), as the Photos grid's do: the collection view is full-screen already, and the columns are computed
+    /// from the whole width. The floating chrome keeps its own safe-area insets.
+    var layoutWidth: CGFloat { max(1, collectionView.bounds.width) }
+    var layoutKey: CGSize { CGSize(width: layoutWidth.rounded(), height: 0) }
     var contentWidth: CGFloat { LibraryGridGeometry.contentWidth(viewport: layoutWidth) }
-    var originX: CGFloat { collectionView.safeAreaInsets.left + (layoutWidth - contentWidth) / 2 }
+    var originX: CGFloat { (layoutWidth - contentWidth) / 2 }
 
     var stops: [Int] { LibraryGridGeometry.stops(content: contentWidth) }
 
@@ -296,6 +299,10 @@ final class LibraryGridHostController: UIViewController, UICollectionViewDelegat
 
     /// Set by a change the inputs do not show (the type size, the width): the next apply runs in full.
     private var applyAgain = false
+    /// What a rotation keeps in view while it runs (`viewWillTransition`): the page applies for the new width inside the system's
+    /// animation, so it must not also correct the offset by its own first-card anchor.
+    private var rotationAnchor: RotationAnchor?
+    private var reconfigureAfterRotation = Set<LibraryGridItem>()
 
     /// Whether `props` would rebuild the page already on screen: the same inputs, no publication from the library or the Steam
     /// models since, the same focus and column count. A landing writes the new size back to the stored state and that update
@@ -317,7 +324,7 @@ final class LibraryGridHostController: UIViewController, UICollectionViewDelegat
         applyAgain = false
         let model = LibraryModel.shared
         let revision = model.revision
-        let anchor = props.inputsKey == appliedKey ? captureAnchor() : nil
+        let anchor = props.inputsKey == appliedKey && rotationAnchor == nil ? captureAnchor() : nil
         let page: LibraryGridPageModel
         if let ids = metadataDelta(props, model) {
             var kept = self.page
@@ -375,14 +382,11 @@ final class LibraryGridHostController: UIViewController, UICollectionViewDelegat
         } else {
             layoutObject.invalidateLayout()
         }
-        // The hosted views read the page's state through their closures: the visible ones are configured again.
-        var snapshot = dataSource.snapshot()
+        // The hosted views read the page's state through their closures: the visible ones are configured again. A rotation does
+        // that after its animation: a diffable apply lays the collection out without animation and would snap the cards.
         let visible = collectionView.indexPathsForVisibleItems.compactMap { $0.item < items.count ? items[$0.item] : nil }
-        let again = Array(Set(visible + changedFixed)).filter { snapshot.indexOfItem($0) != nil }
-        if !again.isEmpty {
-            snapshot.reconfigureItems(again)
-            dataSource.apply(snapshot, animatingDifferences: false)
-        }
+        let again = Array(Set(visible + changedFixed))
+        if rotationAnchor != nil { reconfigureAfterRotation.formUnion(again) } else { reconfigure(again) }
         if props.focused != lastFocused {
             lastFocused = props.focused
             scrollToFocus(props.focused)
@@ -395,6 +399,72 @@ final class LibraryGridHostController: UIViewController, UICollectionViewDelegat
         if applyCount == 1 { LibraryCardLabel.warmGlyphs(fonts: fonts) }
     }
 
+
+    // MARK: Rotation
+
+    /// The item at the middle of the visible region, and how far down it the middle falls (0 its top, 1 its bottom).
+    private struct RotationAnchor { let index: Int; let fraction: CGFloat; let atTop: Bool }
+
+    private func captureRotationAnchor() -> RotationAnchor? {
+        guard let frames = live?.result.frames, !frames.isEmpty else { return nil }
+        let inset = collectionView.adjustedContentInset
+        let top = collectionView.contentOffset.y + inset.top
+        if top <= 1 { return RotationAnchor(index: 0, fraction: 0, atTop: true) }
+        let middle = top + max(0, collectionView.bounds.height - inset.top - inset.bottom) / 2
+        var lo = 0, hi = frames.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if frames[mid].maxY > middle { hi = mid } else { lo = mid + 1 }
+        }
+        guard lo < frames.count else { return nil }
+        let frame = frames[lo]
+        return RotationAnchor(index: lo, fraction: min(1, max(0, (middle - frame.minY) / max(1, frame.height))), atTop: false)
+    }
+
+    private func restoreRotationAnchor(_ anchor: RotationAnchor) {
+        guard let result = live?.result, anchor.index < result.frames.count else { return }
+        let inset = collectionView.adjustedContentInset
+        let visible = max(0, collectionView.bounds.height - inset.top - inset.bottom)
+        let lowest = -inset.top
+        let highest = max(lowest, result.contentHeight + inset.bottom - collectionView.bounds.height)
+        let frame = result.frames[anchor.index]
+        let wanted = anchor.atTop ? lowest : frame.minY + anchor.fraction * frame.height - visible / 2 - inset.top
+        collectionView.contentOffset.y = min(highest, max(lowest, wanted))
+    }
+
+    /// A rotation lays the page out for the new width INSIDE the system's rotation animation, so the cards glide to their new
+    /// frames with it, and keeps the card at the middle of the screen at the middle. A pinch in flight lands first.
+    override func viewWillTransition(to size: CGSize, with coordinator: any UIViewControllerTransitionCoordinator) {
+        super.viewWillTransition(to: size, with: coordinator)
+        guard isViewLoaded, abs(size.width - collectionView.bounds.width) > 0.5 else { return }
+        zoom?.abandon()
+        dropBridgeIfLive()
+        let anchor = captureRotationAnchor()
+        rotationAnchor = anchor
+        let applied = applyCount
+        coordinator.animate(alongsideTransition: { [weak self] _ in
+            guard let self else { return }
+            // The new bounds are in place: this pass applies the page for the new width (`viewDidLayoutSubviews`). The offset is
+            // set BEFORE the collection lays out, so the cells made are those of the region the user keeps in view.
+            self.applyForNewWidth()
+            if self.applyCount != applied, let anchor { self.restoreRotationAnchor(anchor) }
+            self.view.layoutIfNeeded()
+        }, completion: { [weak self] _ in
+            guard let self else { return }
+            self.rotationAnchor = nil
+            let again = Array(self.reconfigureAfterRotation)
+            self.reconfigureAfterRotation = []
+            self.reconfigure(again)
+        })
+    }
+
+    private func reconfigure(_ again: [LibraryGridItem]) {
+        var snapshot = dataSource.snapshot()
+        let present = again.filter { snapshot.indexOfItem($0) != nil }
+        guard !present.isEmpty else { return }
+        snapshot.reconfigureItems(present)
+        dataSource.apply(snapshot, animatingDifferences: false)
+    }
 
     // MARK: Anchor
 
