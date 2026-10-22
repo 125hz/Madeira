@@ -864,6 +864,7 @@ final class LibraryGridHostController: UIViewController, UICollectionViewDelegat
 
     func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
         DeferredMainWork.shared.beginScroll()
+        resumeCellPrefetchForScroll()
         // Covers keep loading while the page scrolls; only the idle neighbour-level requests step aside.
         LibraryCoverCache.shared.dropIdle()
     }
@@ -885,7 +886,14 @@ final class LibraryGridHostController: UIViewController, UICollectionViewDelegat
     }
     private var scrollPending = false
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
-        if let zoom { zoom.realScrolled() } else { measureAhead(); glow?.scrolled(); sampleSpeed(); coversAhead(idle: false); noteScrollMoved() }
+        if let zoom { zoom.realScrolled() } else { measureAhead(); glow?.scrolled(); sampleSpeed(); coversAhead(idle: false); noteScrollMoved(); if scrollView.isDecelerating { resumeCellPrefetchForScroll() } }
+    }
+    /// A pinch turns cell prefetch off (`cancelZoomIdleWork`) and the warm job turns it back on once the grid has been at rest, so a
+    /// scroll that begins right after a landing would otherwise run without it and realise every cell on the frame it appears. A scroll
+    /// (a drag beginning, or a fling still running from before a pinch) turns it back on, unless a zoom or its bridge is running.
+    func resumeCellPrefetchForScroll() {
+        guard zoom == nil, zoomStart.bridge == nil, !collectionView.isPrefetchingEnabled else { return }
+        collectionView.isPrefetchingEnabled = true
     }
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)

@@ -206,7 +206,9 @@ extension LibraryGridZoomSession {
     func wantedRealOffset(base: CGFloat, shift: CGFloat, in collection: UICollectionView) -> CGFloat {
         let low = -beginInsetTop + Self.edgeHold
         let high = max(low, collection.contentSize.height + beginInsetBottom - collection.bounds.height)
-        return max(low, settling ? base - (shift - clampShift) : min(high, base))
+        // A caught settle's shift is still in the picture, so the real offset keeps the part of it the settle had folded in
+        // (`carriedShift`): the pinch and the next settle start from the offset the settle left (the scroll bar and the blur read it).
+        return max(low, settling ? base - (shift - clampShift) : min(high, base - carriedShift))
     }
 
     func snapToFloor(in collection: UICollectionView) {

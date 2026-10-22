@@ -78,6 +78,11 @@ final class LibraryGridZoomSession {
     var displayVelocity: CGFloat = 0
     var shownShift: CGFloat = 0
     var clampShift: CGFloat = 0
+    /// The part of the shift a picked-up settle had reached (`interrupt`): `frameShift` keeps adding it for the rest of the pinch,
+    /// and the next settle eases from it, so the picture never moves at the catch. Zero for a session never caught in a settle.
+    /// `carryBound` is the range every frame's shift stays inside (the plans cover it).
+    var carriedShift: CGFloat = 0
+    var carryBound: ClosedRange<CGFloat>?
     var shownOffset: CGFloat = 0
     var followsRealScroll = true
     private var holdingOffset = false
@@ -319,14 +324,43 @@ final class LibraryGridZoomSession {
     /// with, wherever the new fingers are (a mid-zoom side switch would show a slide, a snap or a double); the new fingers'
     /// side picks the line of the next fresh zoom.
     func interrupt() {
+        foldSettleShift()
         stopMotion()
         settling = false
         settleTarget = nil
-        baseT = t
+        baseT = unbanded(t)
         fingerT = t
         lastScale = 1
         movingFrames = 0
         haptics.decider = GridZoomHapticDecider(level: Int(t.rounded()))
+    }
+
+    /// The raw coordinate whose rubber band is `shown`. A pinch draws `rubberBand(coordinate(base, scale))`, so a catch whose displayed
+    /// coordinate is already past the first or last level (the release spring overshoots, or the band was out) must start from the
+    /// coordinate the band maps to it; started from `shown` itself, the first frame would band it a second time and move every card.
+    func unbanded(_ shown: CGFloat) -> CGFloat {
+        let give = GridZoomFeel.rubberReach
+        let top = CGFloat(max(0, coordCount - 1))
+        func raw(_ excess: CGFloat) -> CGFloat {
+            // The inverse of `damped(e) = give * (1 - 1 / (e / give + 1))`.
+            let share = min(0.999, max(0, excess / give))
+            return give * (1 / (1 - share) - 1)
+        }
+        if shown < 0 { return -raw(-shown) }
+        if shown > top { return top + raw(shown - top) }
+        return shown
+    }
+
+    /// Keeps what the settle had shifted. The picture on screen is `placed + shift`, and `frameShift` falls back to the bare page
+    /// clamp the moment `settling` ends, so a pinch that catches the centring scroll would drop the whole in-flight shift in one
+    /// frame. The part of the last drawn shift beyond the clamp is carried instead (`carriedShift`): the first frame of the new
+    /// pinch draws every card where the last settle frame did. It is session state rather than a write into the real offset, which
+    /// UIKit clamps to the start level's range (the top floor is exactly where the shift is largest).
+    private func foldSettleShift() {
+        carriedShift = shownShift - clampShift
+        let held = shownShift
+        let reach = reachShifts()
+        carryBound = min(reach.lowerBound, held)...max(reach.upperBound, held)
     }
 
     func release(velocity: CGFloat, cancelled: Bool) {
@@ -484,8 +518,11 @@ final class LibraryGridZoomSession {
     func frameShift(pageTop: CGFloat, blend: GridZoomBlend, width: CGFloat, drawnTop: CGFloat = 0) -> CGFloat {
         clampShift = clampAmount(pageTop: pageTop, height: virtualPageHeight(blend, width: width))
         if clampShift <= 0 { clampShift = min(clampShift, drawnTop) }
-        guard settling, let target = settleTarget else { return clampShift }
-        return clampShift + (deltas[steps[target]] - clampShift) * settleShift
+        // What a picked-up settle had reached rides on top of the clamp: the pinch draws from it, and the next settle eases from it.
+        var held = clampShift + carriedShift
+        if carriedShift != 0, let bound = carryBound { held = min(bound.upperBound, max(bound.lowerBound, held)) }
+        guard settling, let target = settleTarget else { return held }
+        return held + (deltas[steps[target]] - held) * settleShift
     }
 
     /// The frame's placer and its shift. The placer is built first (the drawn first rows decide the top clamp); its window is
@@ -698,6 +735,10 @@ extension LibraryGridHostController: UIGestureRecognizerDelegate {
             commitColumns(landed.columns, page: page)
             // The offset first, then ONE layout pass: the layout is built where the page lands, so no cell is made for a region never shown.
             UIView.performWithoutAnimation {
+                // The content size first: the scroll view takes the landed layout's size BEFORE the offset is written. Written against
+                // the old size the offset can be several times the whole old content height, UIKit learns the real size only in the
+                // layout pass below with no scroll event after it, and the top scroll-edge blur can be left out after a zoom-in.
+                collectionView.contentSize = collectionView.collectionViewLayout.collectionViewContentSize
                 if !abandoned {
                     collectionView.contentOffset = CGPoint(x: collectionView.contentOffset.x, y: landingOffset(page))
                 }

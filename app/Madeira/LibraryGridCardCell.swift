@@ -129,7 +129,12 @@ final class LibraryGridCardCell: LibraryGridHeldCell {
             cover.center = CGPoint(x: rect.midX, y: rect.midY)
         }
         let top = LibraryGridGeometry.coverHeight(cardWidth: w)
-        labelView.frame = CGRect(x: 0, y: top, width: w, height: max(0, bounds.height - top))
+        // Rest geometry through `bounds` + `center`, never `frame`: the label carries the zoom placement's transform while a bridge has
+        // placed this cell, and `frame` is undefined under a transform. A layout pass in that window (a reconfigure, a resize)
+        // would leave the label displaced by the placement when the transform is cleared.
+        let labelRect = CGRect(x: 0, y: top, width: w, height: max(0, bounds.height - top))
+        labelView.bounds = CGRect(origin: .zero, size: labelRect.size)
+        labelView.center = CGPoint(x: labelRect.midX, y: labelRect.midY)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         ring.path = UIBezierPath(roundedRect: bounds, cornerRadius: 16).cgPath
@@ -157,9 +162,11 @@ final class LibraryGridCardCell: LibraryGridHeldCell {
         cover.transform = .identity
         labelView.transform = .identity
         let local = coverRect.offsetBy(dx: -frame.minX, dy: -frame.minY)
-        let rest = LibraryGridGeometry.artworkRect(cardWidth: max(1, bounds.width))
         let art = LibraryGridGeometry.artworkRect(cardWidth: max(1, local.width)).offsetBy(dx: local.minX, dy: local.minY)
-        let scale = art.width / max(1, rest.width)
+        // Scaled against the width the cover DRAWS (its own bounds), which is the cell's rest artwork once the cell has laid out
+        // and not before: a cell whose layout pass is pending would otherwise be placed at a size off by the width ratio.
+        let drawn = cover.bounds.width > 0 ? cover.bounds.width : LibraryGridGeometry.artworkRect(cardWidth: max(1, bounds.width)).width
+        let scale = art.width / max(1, drawn)
         cover.transform = CGAffineTransform(a: scale, b: 0, c: 0, d: scale, tx: art.midX - cover.center.x, ty: art.midY - cover.center.y)
         labelView.transform = CGAffineTransform(translationX: local.midX - labelView.center.x,
                                                 y: local.maxY + labelView.bounds.height / 2 - labelView.center.y)
