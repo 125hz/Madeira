@@ -298,6 +298,18 @@ struct WheelAccumulator {
     mutating func reset() { x = 0; y = 0 }
 }
 
+/// GCMouse's scroll pad reports the vertical wheel in its first value,
+/// negative away from the user, and the horizontal wheel in its second,
+/// positive to the right (SDL reads it the same way: vertical = -x,
+/// horizontal = y, in SDL_uikitevents.m). Passed through unchanged, every
+/// wheel turn reached Windows as MOUSEEVENTF_HWHEEL. Returns
+/// WheelAccumulator's (dx, dy).
+enum GCMouseWheel {
+    static func axes(_ first: Double, _ second: Double) -> (dx: Double, dy: Double) {
+        (second, -first)
+    }
+}
+
 /// AssistiveTouch (the only pointer path iPhone has) turns a mouse CLICK into
 /// a synthesised `.direct` touch at its cursor. That touch has no contact patch
 /// (`majorRadius` at or near zero, where a fingertip measures roughly 10-30
@@ -988,7 +1000,8 @@ final class HardwareInput: ObservableObject {
             }
         }
         m.scroll.valueChangedHandler = { [weak self] _, x, y in
-            self?.scrolled(Double(x), Double(y))
+            let wheel = GCMouseWheel.axes(Double(x), Double(y))
+            self?.scrolled(wheel.dx, wheel.dy)
         }
         noteMousePresent()
         if fresh {

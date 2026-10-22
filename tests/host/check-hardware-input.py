@@ -120,6 +120,23 @@ assert(n.count == WheelAccumulator.maxNotchesPerEvent)
 assert(wheel.add(0, 0.5).isEmpty)                           // the burst did not linger
 assert(wheel.add(.nan, .infinity).isEmpty)
 
+// GCMouse's scroll pad: vertical first (negative away from the user),
+// horizontal second (positive right). A turn away from the user is WHEEL +120,
+// one to the right HWHEEL +120; never the other axis.
+var gcWheel = WheelAccumulator()
+var w = GCMouseWheel.axes(-1, 0)
+n = gcWheel.add(w.dx, w.dy)
+assert(n.count == 1 && n[0].flags == 0x0800 && n[0].delta == 120)
+w = GCMouseWheel.axes(3, 0)
+n = gcWheel.add(w.dx, w.dy)
+assert(n.count == 3 && n.allSatisfy { $0.flags == 0x0800 && $0.delta == -120 })
+w = GCMouseWheel.axes(0, 1)
+n = gcWheel.add(w.dx, w.dy)
+assert(n.count == 1 && n[0].flags == 0x1000 && n[0].delta == 120)
+w = GCMouseWheel.axes(0, -2)
+n = gcWheel.add(w.dx, w.dy)
+assert(n.count == 2 && n.allSatisfy { $0.flags == 0x1000 && $0.delta == -120 })
+
 // AssistiveTouch classifier: no contact patch, or coincident with a GC button.
 assert(SynthesizedTouch.looksSynthesized(direct: true, majorRadius: 0, secondsSinceButton: .infinity))
 assert(SynthesizedTouch.looksSynthesized(direct: true, majorRadius: 20, secondsSinceButton: 0.010))
@@ -579,6 +596,10 @@ check('presentedViewController != nil' in glue and 'fr is UIKeyInput' in glue
 check('GCController' not in source.split('final class PadStickMouse', 1)[0].split('// MARK: - Device glue', 1)[1]
       .replace('GCControllerButtonInput', '').replace('GCControllerDirectionPad', ''),
       'only PadStickMouse may touch controllers; GamepadInput owns them')
+check(re.search(r'm\.scroll\.valueChangedHandler = \{ \[weak self\] _, x, y in\s*'
+                r'let wheel = GCMouseWheel\.axes\(Double\(x\), Double\(y\)\)\s*'
+                r'self\?\.scrolled\(wheel\.dx, wheel\.dy\)', glue) is not None,
+      'the GCMouse wheel goes through GCMouseWheel.axes')
 docs = (root / 'docs/KEYBOARD_MOUSE.md').read_text()
 for name in switches + ('MADEIRA_NAV_KEYS_E0', 'sensMouse', 'padRightStickMouse', 'ignoreTouchesWithMouse',
                         'Ctrl+Alt+P'):
