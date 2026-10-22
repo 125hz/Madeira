@@ -567,6 +567,9 @@ struct ios_thread_entry {
 };
 static struct ios_thread_entry ios_thread_registry[IOS_MAX_WINE_THREADS];
 static volatile int32_t ios_thread_count = 0;
+/* Writers (ios_thread_registry_add, ios_thread_registry_purge_range) hold this
+ * so two of them never fill the same entry; the lookups stay lock-free. */
+static pthread_mutex_t ios_thread_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Exact-match registry probe — NO slot-0 fallback.
  *
@@ -632,8 +635,10 @@ static int ios_teb_is_registered(uintptr_t teb)
  * called from the guest-window teardown (virtual_ios.c). */
 int ios_thread_registry_purge_range( uintptr_t base, uintptr_t size )
 {
-    int count = ios_thread_registry_count(), purged = 0, i;
+    int count, purged = 0, i;
 
+    pthread_mutex_lock( &ios_thread_registry_lock );
+    count = ios_thread_registry_count();
     for (i = 0; i < count; i++)
     {
         uintptr_t teb = ios_thread_registry[i].teb;
@@ -645,7 +650,20 @@ int ios_thread_registry_purge_range( uintptr_t base, uintptr_t size )
         ios_thread_registry[i].trampoline = NULL;
         purged++;
     }
+    pthread_mutex_unlock( &ios_thread_registry_lock );
     return purged;
+}
+
+/* Has the thread behind a registry port name exited?  The registry pins send
+ * references on every name it stores, so an exited thread leaves a dead name
+ * that thread_info refuses.  An unexpected query failure counts as alive. */
+static int ios_thread_port_gone( thread_t port )
+{
+    struct thread_basic_info info;
+    mach_msg_type_number_t length = THREAD_BASIC_INFO_COUNT;
+    kern_return_t kr = thread_info( port, THREAD_BASIC_INFO, (thread_info_t)&info, &length );
+
+    return kr == KERN_INVALID_ARGUMENT || kr == MACH_SEND_INVALID_DEST || kr == KERN_TERMINATED;
 }
 
 /* Is a thread whose TEB lies in [base, base+size) still alive?  An exited
@@ -660,15 +678,112 @@ int ios_thread_registry_range_busy( uintptr_t base, uintptr_t size )
     {
         uintptr_t teb = ios_thread_registry[i].teb;
         thread_t port = ios_thread_registry[i].mach_thread;
-        struct thread_basic_info info;
-        mach_msg_type_number_t length = THREAD_BASIC_INFO_COUNT;
-        kern_return_t kr;
 
         if (!port || !teb || teb < base || teb - base >= size) continue;
-        kr = thread_info( port, THREAD_BASIC_INFO, (thread_info_t)&info, &length );
-        if (kr != KERN_INVALID_ARGUMENT && kr != MACH_SEND_INVALID_DEST && kr != KERN_TERMINATED) return 1;
+        if (!ios_thread_port_gone( port )) return 1;
     }
     return 0;
+}
+
+/* An entry a full registry may give to a new thread: one its guest window's
+ * teardown purged, or one whose thread has exited.  Entry 0 is never taken, it
+ * is what ios_lookup_thread falls back to.  Neither is an exited thread's entry
+ * whose TEB still carries a FEX lock stamp (Instrumentation[6] or [8]):
+ * ios_lock_census finds the hold of a thread that died with it through that
+ * entry.  -1 when every entry belongs to a live thread. */
+static int ios_thread_registry_reclaim( void )
+{
+    int i;
+
+    for (i = 1; i < IOS_MAX_WINE_THREADS; i++)
+    {
+        thread_t port = ios_thread_registry[i].mach_thread;
+        uintptr_t teb = ios_thread_registry[i].teb;
+        uint64_t stamps[3] = { 0, 0, 0 };   /* TEB+0x16e8 [6], +0x16f0 [7], +0x16f8 [8] */
+        mach_vm_size_t got = 0;
+
+        if (!port) return i;
+        if (!ios_thread_port_gone( port )) continue;
+        if (teb && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(teb + 0x16e8),
+                                           sizeof(stamps), (mach_vm_address_t)stamps, &got ) == KERN_SUCCESS
+            && got == sizeof(stamps) && (stamps[0] || stamps[2]))
+            continue;
+        return i;
+    }
+    return -1;
+}
+
+/* Register a thread's port, TEB and trampoline; returns its entry, or -1.
+ *
+ * ml384: replace an existing entry for the same port first — the kernel
+ * recycles thread port names, and a stale entry earlier in the array would
+ * shadow the new registration in ios_lookup_thread (first match wins).
+ *
+ * Entries were never given back, so the registry filled after 512 threads
+ * over the session's life, not 512 at once: a WoW64 game that keeps starting
+ * and ending worker threads got there within minutes with a few dozen alive
+ * (#397), and every later thread resolved to the slot-0 TEB.  A full registry
+ * now gives the new thread an entry ios_thread_registry_reclaim finds free. */
+static int ios_thread_registry_add( thread_t pe_thread, uintptr_t teb, void *trampoline )
+{
+    int idx, reg_count;
+
+    pthread_mutex_lock( &ios_thread_registry_lock );
+    reg_count = ios_thread_registry_count();
+    for (idx = 0; idx < reg_count; idx++)
+        if (ios_thread_registry[idx].mach_thread == pe_thread) break;
+    if (idx < reg_count)
+    {
+        /* ml390 (task #66): make the replace path LOUD.  If a name gets
+         * recycled while its previous owner still has live guest state, this
+         * overwrite silently redirects that thread's TEB resolution — and a
+         * thread_set_state aimed at the new owner could land on the old one
+         * (zeroed-state suspect).  old_teb!=0 && old_teb!=new_teb = the case
+         * to correlate offline against [reg-miss] and fault dumps. */
+        if (ios_thread_registry[idx].teb && ios_thread_registry[idx].teb != teb)
+            ERR( "[thread-registry] REPLACE idx=%d port=0x%x old_teb=%p new_teb=%p\n",
+                 idx, pe_thread, (void *)ios_thread_registry[idx].teb, (void *)teb );
+    }
+    else if (reg_count < IOS_MAX_WINE_THREADS)
+        idx = __sync_fetch_and_add(&ios_thread_count, 1);
+    else if ((idx = ios_thread_registry_reclaim()) >= 0)
+    {
+        static unsigned int reused;
+
+        if (++reused <= 16 || !(reused % 256))
+            ERR( "[thread-registry] REUSE #%u idx=%d port=0x%x old_port=0x%x old_teb=%p new_teb=%p\n",
+                 reused, idx, pe_thread, ios_thread_registry[idx].mach_thread,
+                 (void *)ios_thread_registry[idx].teb, (void *)teb );
+        ios_thread_registry[idx].mach_thread = 0;
+        __sync_synchronize();
+    }
+    else
+        ERR("[thread-registry] FULL (%d slots, none free) — thread 0x%x teb=%p NOT registered; "
+            "Mach events on it will resolve to the slot-0 TEB (wrong process!)\n",
+            IOS_MAX_WINE_THREADS, pe_thread, (void *)teb);
+    if (idx >= 0)
+    {
+        ios_thread_registry[idx].teb = teb;
+        ios_thread_registry[idx].trampoline = trampoline;
+        __sync_synchronize();
+        ios_thread_registry[idx].mach_thread = pe_thread;
+        /* ml401 (tasks #60/#66): EVERY registry port name proved
+         * MACH_SEND_INVALID_DEST when the census sampler tried to use it —
+         * something deallocates the mach_thread_self() ref after we store the
+         * name, leaving the registry full of dead keys ([pump-sample] blind,
+         * and dead names are exactly what the kernel recycles = the #66
+         * wrong-thread hazard).  Pin extra send refs so the name outlives any
+         * stray deallocate; dead-name lingering after thread exit is harmless
+         * and prevents recycling. */
+        {
+            kern_return_t krr = mach_port_mod_refs( mach_task_self(), pe_thread,
+                                                    MACH_PORT_RIGHT_SEND, 4 );
+            if (krr != KERN_SUCCESS)
+                ERR( "[thread-registry] mod_refs(+4) port=0x%x FAILED kr=%d\n", pe_thread, krr );
+        }
+    }
+    pthread_mutex_unlock( &ios_thread_registry_lock );
+    return idx;
 }
 
 static int ios_lookup_thread(thread_t mach_thread, uintptr_t *teb_out, void **tramp_out)
@@ -6680,56 +6795,8 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
         ios_exc_handler_started = 1;
     }
 
-    /* Register this thread in the registry.
-     * ml384: replace an existing entry for the same port first — the kernel
-     * recycles thread port names, and a stale entry earlier in the array would
-     * shadow the new registration in ios_lookup_thread (first match wins). */
-    int idx, reg_count = __sync_fetch_and_add(&ios_thread_count, 0);
-    if (reg_count > IOS_MAX_WINE_THREADS) reg_count = IOS_MAX_WINE_THREADS;
-    for (idx = 0; idx < reg_count; idx++)
-        if (ios_thread_registry[idx].mach_thread == pe_thread) break;
-    if (idx == reg_count)
-    {
-        idx = __sync_fetch_and_add(&ios_thread_count, 1);
-        if (idx >= IOS_MAX_WINE_THREADS)
-        {
-            ERR("[thread-registry] FULL (%d slots) — thread 0x%x teb=%p NOT registered; "
-                "Mach events on it will resolve to the slot-0 TEB (wrong process!)\n",
-                IOS_MAX_WINE_THREADS, pe_thread, (void *)teb);
-            idx = -1;
-        }
-    }
-    if (idx >= 0)
-    {
-        /* ml390 (task #66): make the replace path LOUD.  If a name gets
-         * recycled while its previous owner still has live guest state, this
-         * overwrite silently redirects that thread's TEB resolution — and a
-         * thread_set_state aimed at the new owner could land on the old one
-         * (zeroed-state suspect).  old_teb!=0 && old_teb!=new_teb = the case
-         * to correlate offline against [reg-miss] and fault dumps. */
-        if (idx < reg_count && ios_thread_registry[idx].teb &&
-            ios_thread_registry[idx].teb != teb)
-            ERR( "[thread-registry] REPLACE idx=%d port=0x%x old_teb=%p new_teb=%p\n",
-                 idx, pe_thread, (void *)ios_thread_registry[idx].teb, (void *)teb );
-        ios_thread_registry[idx].teb = teb;
-        ios_thread_registry[idx].trampoline = trampoline;
-        __sync_synchronize();
-        ios_thread_registry[idx].mach_thread = pe_thread;
-        /* ml401 (tasks #60/#66): EVERY registry port name proved
-         * MACH_SEND_INVALID_DEST when the census sampler tried to use it —
-         * something deallocates the mach_thread_self() ref after we store the
-         * name, leaving the registry full of dead keys ([pump-sample] blind,
-         * and dead names are exactly what the kernel recycles = the #66
-         * wrong-thread hazard).  Pin extra send refs so the name outlives any
-         * stray deallocate; dead-name lingering after thread exit is harmless
-         * and prevents recycling. */
-        {
-            kern_return_t krr = mach_port_mod_refs( mach_task_self(), pe_thread,
-                                                    MACH_PORT_RIGHT_SEND, 4 );
-            if (krr != KERN_SUCCESS)
-                ERR( "[thread-registry] mod_refs(+4) port=0x%x FAILED kr=%d\n", pe_thread, krr );
-        }
-    }
+    /* Register this thread in the registry. */
+    int idx = ios_thread_registry_add( pe_thread, teb, trampoline );
 
     /* Set exception port for this thread (shared port).
      * ml353: also claim EXC_BAD_INSTRUCTION. udf-class faults (executing
