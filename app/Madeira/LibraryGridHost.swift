@@ -460,6 +460,12 @@ final class LibraryGridHostController: UIViewController, UICollectionViewDelegat
             }
             // The offset is the bounds' origin and UIKit animated it with the size; the cards' frames carry the motion instead.
             for key in self.collectionView.layer.animationKeys() ?? [] where key.hasPrefix("bounds.origin") { self.collectionView.layer.removeAnimation(forKey: key) }
+            // The scroll edge effect (the top blur) is a subview UIKit keeps at the viewport by writing its frame with the offset; those
+            // writes were animated by the same block, so with the offset's own animation gone the blur would slide in from where the
+            // old offset put it. It takes the new place at once.
+            for edge in self.collectionView.subviews where NSStringFromClass(type(of: edge)).hasPrefix("_UITouchPassthrough") {
+                for key in edge.layer.animationKeys() ?? [] where key.hasPrefix("position") || key.hasPrefix("bounds") { edge.layer.removeAnimation(forKey: key) }
+            }
             for (cell, frame) in arrivals { cell.frame = frame; cell.alpha = 1 }
         }, completion: { [weak self] _ in
             guard let self else { return }
