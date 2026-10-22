@@ -442,13 +442,25 @@ final class LibraryGridHostController: UIViewController, UICollectionViewDelegat
         let anchor = captureRotationAnchor()
         rotationAnchor = anchor
         let applied = applyCount
+        let before = RotationBefore(frames: live?.result.frames ?? [], offset: collectionView.contentOffset.y, viewport: collectionView.bounds.height)
         coordinator.animate(alongsideTransition: { [weak self] _ in
             guard let self else { return }
             // The new bounds are in place: this pass applies the page for the new width (`viewDidLayoutSubviews`). The offset is
             // set BEFORE the collection lays out, so the cells made are those of the region the user keeps in view.
-            self.applyForNewWidth()
-            if self.applyCount != applied, let anchor { self.restoreRotationAnchor(anchor) }
-            self.view.layoutIfNeeded()
+            //
+            // The collection view puts its cells at their new frames without animating them, while a scroll offset written in
+            // an animation block would animate (it is the bounds' origin). Both happen with no animation, then each card is
+            // set back to where it sat on the screen and glides from there to its new place.
+            var arrivals: [(cell: UICollectionViewCell, frame: CGRect)] = []
+            UIView.performWithoutAnimation {
+                self.applyForNewWidth()
+                if self.applyCount != applied, let anchor { self.restoreRotationAnchor(anchor) }
+                self.view.layoutIfNeeded()
+                arrivals = self.placeCardsWhereTheyWere(before)
+            }
+            // The offset is the bounds' origin and UIKit animated it with the size; the cards' frames carry the motion instead.
+            for key in self.collectionView.layer.animationKeys() ?? [] where key.hasPrefix("bounds.origin") { self.collectionView.layer.removeAnimation(forKey: key) }
+            for (cell, frame) in arrivals { cell.frame = frame; cell.alpha = 1 }
         }, completion: { [weak self] _ in
             guard let self else { return }
             self.rotationAnchor = nil
@@ -456,6 +468,29 @@ final class LibraryGridHostController: UIViewController, UICollectionViewDelegat
             self.reconfigureAfterRotation = []
             self.reconfigure(again)
         })
+    }
+
+    private struct RotationBefore { let frames: [CGRect]; let offset: CGFloat; let viewport: CGFloat }
+
+    /// Puts each card on screen back at its place before the rotation (in the new offset's coordinates), and a card that was off
+    /// screen before at its new place, transparent. Returns the cards with the frames they are to glide to.
+    private func placeCardsWhereTheyWere(_ before: RotationBefore) -> [(cell: UICollectionViewCell, frame: CGRect)] {
+        let shift = collectionView.contentOffset.y - before.offset
+        var out: [(cell: UICollectionViewCell, frame: CGRect)] = []
+        for cell in collectionView.visibleCells {
+            guard let path = collectionView.indexPath(for: cell) else { continue }
+            out.append((cell, cell.frame))
+            if path.item < before.frames.count {
+                let was = before.frames[path.item]
+                let onScreen = was.minY - before.offset
+                if onScreen < before.viewport && onScreen + was.height > 0 {
+                    cell.frame = was.offsetBy(dx: 0, dy: shift)
+                    continue
+                }
+            }
+            cell.alpha = 0
+        }
+        return out
     }
 
     private func reconfigure(_ again: [LibraryGridItem]) {
