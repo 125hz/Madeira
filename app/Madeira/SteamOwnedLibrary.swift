@@ -45,6 +45,11 @@ struct SteamOwnedGame: Codable, Identifiable, Hashable, Sendable {
     var depotLanguages: [String]?
     /// The language-pack depots a Windows install of each language takes.
     var languageDepots: [String: [Int]]?
+    /// About how much a Windows install downloads and takes on disk
+    /// (SteamAppInfo.downloadSize / installSize); nil in older caches or when
+    /// Steam states no size.
+    var downloadBytes: UInt64?
+    var installBytes: UInt64?
 
     init(_ info: SteamAppInfo) {
         id = Int(info.appID)
@@ -63,6 +68,9 @@ struct SteamOwnedGame: Codable, Identifiable, Hashable, Sendable {
                 .filter { $0.language.lowercased() == language }.map { Int($0.depotID) }
         }
         self.languageDepots = languageDepots
+        let download = info.downloadSize(for: "windows"), install = info.installSize(for: "windows")
+        downloadBytes = download > 0 ? download : nil
+        installBytes = install > 0 ? install : nil
     }
 
     /// The language to offer on an installed game's page (Download in ...):

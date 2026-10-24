@@ -101,8 +101,11 @@ modify them. **Uninstall** also removes the game's library entry.
 **A game that is not installed** opens its download sheet: artwork, playtime,
 **Install** (or **Resume download**), **Pause**, **Resume**, **Try again**,
 progress, speed and time left, **Cancel download** (a first-time install's
-partial files are deleted; an update is only stopped), the free space on the
-device and a link to the game's Steam Store page. When the download finishes,
+partial files are deleted; an update is only stopped), about how much the
+game downloads and takes on the device (the selected depots'
+`manifests.public.download` and `.size` from the cached library; a cache
+from before shows a note to refresh it), the free space on the device and a
+link to the game's Steam Store page. When the download finishes,
 the game becomes a library entry and the sheet's button reads **Open**, which
 opens its Game details page.
 

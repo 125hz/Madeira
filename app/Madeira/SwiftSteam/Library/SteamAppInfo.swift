@@ -243,6 +243,17 @@ struct SteamAppInfo {
         }
     }
 
+    /// Approximate installed size for a platform: `manifests.public.size` per
+    /// selected depot, else its download figure. Same selection and caveats as
+    /// downloadSize (shared depots whose owner's product info was not read count 0).
+    func installSize(for os: String) -> UInt64 {
+        installDepots(os: os).reduce(0) { total, d in
+            let bytes = d.publicSizeBytes > 0 ? d.publicSizeBytes : (d.publicDownloadBytes > 0 ? d.publicDownloadBytes : d.maxSize)
+            let (sum, overflow) = total.addingReportingOverflow(bytes)
+            return overflow ? UInt64.max : sum
+        }
+    }
+
     // MARK: - Parsing
 
     /// Parse app info from a PICS text-VDF buffer.
