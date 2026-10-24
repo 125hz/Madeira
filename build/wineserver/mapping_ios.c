@@ -1503,7 +1503,7 @@ static struct session_object *find_free_session_object( mem_size_t size )
 volatile void *alloc_shared_object( mem_size_t shm_size )
 {
     struct session_object *object;
-    mem_size_t size = sizeof(*object) - sizeof(object_shm_t) + max(shm_size, sizeof(object_shm_t));
+    mem_size_t size = round_size( sizeof(*object) - sizeof(object_shm_t) + max(shm_size, sizeof(object_shm_t)), 7 );
 
     if ((object = find_free_session_object( size )))
         list_remove( &object->entry );
