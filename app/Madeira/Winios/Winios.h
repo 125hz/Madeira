@@ -84,7 +84,7 @@ int winios_desktop_point_from_window(double wx, double wy, int *px, int *py);
  * user watched the Dock host's console window instead of the game. The app
  * keeps the starting screen until a window of the started game is up, and
  * needs to know, per top-level window: is it shown, how big, has it put a
- * frame on screen, and which program owns it.
+ * frame on screen, does it have a title bar, and which program owns it.
  *
  * Fed from the driver hooks on the window's own Wine thread (WindowPosChanged,
  * the GDI flush, DestroyWindow, the desktop-mode swapchain), so nothing polls
@@ -104,6 +104,7 @@ struct winios_census_window {
     unsigned char metal;          /* a D3D swapchain presents into it (DXMT) */
     unsigned char shown_once;     /* has been shown at least once */
     unsigned char restore_sent;   /* born minimized; SC_RESTORE posted */
+    unsigned char caption;        /* WS_CAPTION: a title bar (a message box or a dialog) */
     char image[WINIOS_CENSUS_IMAGE];
 };
 
