@@ -3473,7 +3473,8 @@ struct ContentView: View {
             // MADEIRA_DOCK_GAME_SCM, else the prefix's system.reg decides). Decided here, before
             // the session, because such a session must also leave madsync (below).
             let scm = DockGameSession.decide(prefix: MadeiraDock.prefix,
-                                             gameConfig: profile.map { GameProfile(windowsPath: $0.windowsPath).text })
+                                             gameConfig: profile.map { GameProfile(windowsPath: $0.windowsPath).text },
+                                             thirdPartyInstalls: DockInstallers.thirdPartyInstalls)
             setenv("MADEIRA_DOCK_GAME_SCM", scm.exported, 1)
             logStore.log(scm.logLine)
             let scmServerSync = DockGameSession.serverSyncOff(scm, madsyncConfigured: DockInstallers.madsyncConfigured)

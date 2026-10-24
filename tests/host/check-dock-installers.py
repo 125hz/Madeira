@@ -102,6 +102,9 @@ enum MadeiraConfig {
     nonisolated(unsafe) static var values: [String: String] = [:]
     static func get(_ key: String) -> String? { values[key] }
     static var gameURL: URL? { nil }
+    // DockGameSession.swift (compiled with the production installers for isMicrosoftKey)
+    static func flag(_ name: String, fallback: Bool = true) -> Bool { getenv(name).map { String(cString: $0) != "0" } ?? fallback }
+    static func parse(_ text: String) -> [String: String] { [:] }
 }
 struct LogEntry { enum Level { case info, success, error, debug } }
 @MainActor final class LogStore {
@@ -547,7 +550,7 @@ with tempfile.TemporaryDirectory(prefix='madeira-dock-installers-') as tmp:
     else:
         build = subprocess.run([SWIFTC, '-parse-as-library', '-swift-version', '5', '-sanitize=address', '-o', str(exe),
                                 str(tmp / 'stubs.swift'), str(tmp / 'checks.swift'), str(app / 'DockInstallers.swift'),
-                                str(app / 'DockReset.swift')])
+                                str(app / 'DockReset.swift'), str(app / 'DockGameSession.swift')])
         require(build.returncode == 0, 'production installer Swift compiles on the host')
     if build is not None and build.returncode == 0:
         run = subprocess.run([str(exe), str(tmp / 'fixture.cmd')], env=dict(os.environ, ASAN_OPTIONS='detect_leaks=0'))

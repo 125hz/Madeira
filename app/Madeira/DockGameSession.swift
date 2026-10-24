@@ -130,9 +130,11 @@ enum DockGameSession {
     }
 
     /// The same test as the host's `sh_service_is_foreign_autostart` (madeira-dock
-    /// `src/validation.c`): a Win32 service with automatic start whose image is not Windows' own.
+    /// `src/validation.c`): a Win32 service with automatic (2) or on-demand (3) start whose
+    /// image is not Windows' own. A program starts its demand-start service itself, through
+    /// the manager, so it needs one as much as an automatic service does.
     static func isForeignAutoStart(type: UInt32, start: UInt32, image: String) -> Bool {
-        guard type & 0x30 != 0, start == 2 else { return false }
+        guard type & 0x30 != 0, start == 2 || start == 3 else { return false }
         let path = image.trimmingCharacters(in: CharacterSet(charactersIn: "\" ")).lowercased()
         guard !path.isEmpty else { return false }
         return !isWindowsImage(path)
@@ -155,12 +157,17 @@ enum DockGameSession {
     struct Decision: Equatable {
         let mode: Mode
         let services: [ForeignService]
+        /// Programs the game's own Steam install script recorded under a registry key that is
+        /// not Microsoft's (DockInstallers.thirdPartyInstalls): a publisher's launcher,
+        /// runtime or anti-cheat. Such a program registers its service on its own first run,
+        /// through the service manager, so the registry cannot show the service before then.
+        var installs = 0
         /// Whether the host is asked to start the service manager.
         var on: Bool {
             switch mode {
             case .off: return false
             case .on: return true
-            case .auto: return !services.isEmpty
+            case .auto: return !services.isEmpty || installs > 0
             }
         }
         /// The value exported as MADEIRA_DOCK_GAME_SCM for the host.
@@ -169,16 +176,28 @@ enum DockGameSession {
         var logLine: String {
             "[dock-game-scm] mode=\(mode.rawValue) services=\(services.count)"
                 + (services.isEmpty ? "" : " (" + services.map(\.name).sorted().joined(separator: ", ") + ")")
-                + " service-manager=\(on ? "on" : "off")"
+                + " third-party-installs=\(installs) service-manager=\(on ? "on" : "off")"
         }
     }
 
-    /// Reads the prefix's system.reg only when the mode needs it.
-    static func decide(prefix: URL, gameConfig: String?) -> Decision {
+    /// Reads the prefix's system.reg only when the mode needs it. `thirdPartyInstalls` is the
+    /// count of the game's recorded non-Microsoft install-script programs (DockInstallers).
+    static func decide(prefix: URL, gameConfig: String?, thirdPartyInstalls: Int = 0) -> Decision {
         let mode = configuredMode(gameConfig: gameConfig)
         guard mode == .auto else { return Decision(mode: mode, services: []) }
         let text = (try? String(contentsOf: prefix.appendingPathComponent("system.reg"), encoding: .utf8)) ?? ""
-        return Decision(mode: mode, services: foreignAutoStartServices(systemReg: text))
+        return Decision(mode: mode, services: foreignAutoStartServices(systemReg: text), installs: max(0, thirdPartyInstalls))
+    }
+
+    /// Whether an install-script record's registry key (under its hive, Wine spelling with
+    /// single backslashes) is Microsoft's own: `Software\Microsoft\...`, also through
+    /// `Wow6432Node`. Microsoft's redistributables (DirectX, Visual C++, .NET, XNA) never need a
+    /// service manager at game time; a publisher's program may.
+    static func isMicrosoftKey(_ key: String) -> Bool {
+        var parts = key.split(whereSeparator: { $0 == "\\" || $0 == "/" }).map { $0.lowercased() }
+        if parts.first == "software" { parts.removeFirst() }
+        if parts.first == "wow6432node" { parts.removeFirst() }
+        return parts.first == "microsoft"
     }
 
     /// Whether this session runs under server sync instead of madsync because it starts the
