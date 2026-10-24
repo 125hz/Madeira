@@ -534,7 +534,9 @@ enum PointerRoute: String {
 }
 
 enum PointerPolicy {
-    static func cursorShown(desktop: Bool, directEnabled: Bool, reports: UInt32, shown: Bool) -> Bool {
+    static func cursorShown(desktop: Bool, directEnabled: Bool, reports: UInt32, shown: Bool,
+                            routingEnabled: Bool = true) -> Bool {
+        if !routingEnabled { return desktop || (directEnabled && shown) }
         if desktop { return reports == 0 || shown }
         return directEnabled && shown
     }
@@ -607,6 +609,11 @@ final class HardwareInput: ObservableObject {
     /// MADEIRA_POINTER_AUTOLOCK=0: the pointer locks only on request, not
     /// while the program hides its cursor (see `AutoLock`).
     static let autoLockEnabled = lockEnabled && flag("MADEIRA_POINTER_AUTOLOCK", defaultOn: true)
+
+    /// MADEIRA_MOUSE_ROUTING=0 restores the pre-PR desktop cursor routing,
+    /// button callbacks, surface touches and key-window-only pointer lock.
+    /// Read once from madeira.cfg (env.MADEIRA_MOUSE_ROUTING); restart to apply.
+    static let mouseRoutingEnabled = flag("MADEIRA_MOUSE_ROUTING", defaultOn: true)
 
     /// Only `0` disables a default-on switch; only `1` enables a default-off one.
     private static func flag(_ name: String, defaultOn: Bool) -> Bool {
@@ -779,7 +786,8 @@ final class HardwareInput: ObservableObject {
         started = true
         log("enabled=\(Self.enabled ? 1 : 0) focus=\(Self.focusEnabled ? 1 : 0) "
             + "cursor=\(Self.directCursorEnabled ? 1 : 0) absolute=\(Self.absoluteEnabled ? 1 : 0) "
-            + "lock=\(Self.lockEnabled ? 1 : 0) autolock=\(Self.autoLockEnabled ? 1 : 0)")
+            + "lock=\(Self.lockEnabled ? 1 : 0) autolock=\(Self.autoLockEnabled ? 1 : 0) "
+            + "mouse-routing=\(Self.mouseRoutingEnabled ? 1 : 0)")
         guard Self.enabled else { return }
         appActive = UIApplication.shared.applicationState == .active
         hoverSeen = UIDevice.current.userInterfaceIdiom != .phone
@@ -919,7 +927,7 @@ final class HardwareInput: ObservableObject {
         let over = hoverSeen ? pointerOver : clickFocus.onGame
         let mouse = base && (!Self.focusEnabled || pointerLocked || over || !gameButtons.isEmpty)
         baseFocused = base
-        updateButtonPolling(active: appActive && mouseConnected)
+        updateButtonPolling(active: Self.mouseRoutingEnabled && appActive && mouseConnected)
         if keyboard != keyboardFocused {
             keyboardFocused = keyboard
             if !keyboard { keys.focusLost() }
@@ -941,7 +949,7 @@ final class HardwareInput: ObservableObject {
         renderCursor()
         updateFocusTimer()
         // Scene roots can change without changing the desired lock value.
-        PointerLock.refresh()
+        if Self.mouseRoutingEnabled { PointerLock.refresh() }
     }
 
     /// The app is active, the game view is on screen in the foreground scene,
@@ -1080,19 +1088,35 @@ final class HardwareInput: ObservableObject {
         m.mouseMovedHandler = { [weak self] _, dx, dy in
             self?.moved(Double(dx), Double(dy))
         }
-        let device = ObjectIdentifier(mouse)
-        mouseQueue.async { [weak self] in
-            guard let self else { return }
-            let inputs = Self.buttonInputs(m)
-            self.rawProfiles[device] = m
-            self.rawButtons.attach(device, held: Self.heldButtons(inputs))
-            for (b, input) in inputs {
-                input.valueChangedHandler = { [weak self] _, value, pressed in
-                    guard let self, self.rawProfiles[device] != nil else { return }
-                    let edges = self.rawButtons.update(device, button: b, down: value > 0)
-                    self.traceButton("callback", "b=\(b.rawValue) value=\(value) pressed=\(pressed)")
-                    self.deliverRawButtons(edges, source: "callback")
+        if Self.mouseRoutingEnabled {
+            let device = ObjectIdentifier(mouse)
+            mouseQueue.async { [weak self] in
+                guard let self else { return }
+                let inputs = Self.buttonInputs(m)
+                self.rawProfiles[device] = m
+                self.rawButtons.attach(device, held: Self.heldButtons(inputs))
+                for (b, input) in inputs {
+                    input.valueChangedHandler = { [weak self] _, value, pressed in
+                        guard let self, self.rawProfiles[device] != nil else { return }
+                        let edges = self.rawButtons.update(device, button: b, down: value > 0)
+                        self.traceButton("callback", "b=\(b.rawValue) value=\(value) pressed=\(pressed)")
+                        self.deliverRawButtons(edges, source: "callback")
+                    }
                 }
+            }
+        } else {
+            m.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in
+                self?.gcButton(.left, pressed)
+            }
+            m.rightButton?.pressedChangedHandler = { [weak self] _, _, pressed in
+                self?.gcButton(.right, pressed)
+            }
+            m.middleButton?.pressedChangedHandler = { [weak self] _, _, pressed in
+                self?.gcButton(.middle, pressed)
+            }
+            for (i, aux) in (m.auxiliaryButtons ?? []).enumerated() where i < 2 {
+                let b: MouseButton = i == 0 ? .x1 : .x2
+                aux.pressedChangedHandler = { [weak self] _, _, pressed in self?.gcButton(b, pressed) }
             }
         }
         m.scroll.valueChangedHandler = { [weak self] _, x, y in
@@ -1291,7 +1315,7 @@ final class HardwareInput: ObservableObject {
             let p = DesktopCursor.advance(x: Double(cur.x), y: Double(cur.y), dx: dx, dy: dy,
                                           width: desk.w, height: desk.h)
             MetalBackedView.cursor = CGPoint(x: p.x, y: p.y)
-            if sync && HardwareInput.shared.cursorShownForRoute {
+            if sync && (!Self.mouseRoutingEnabled || HardwareInput.shared.cursorShownForRoute) {
                 // Also draws the arrow (winios_pointer draws absolute moves).
                 winios_pointer(Int32(p.x), Int32(p.y), Self.moveFlag | Self.absoluteFlag, 0)
             } else {
@@ -1431,7 +1455,8 @@ final class HardwareInput: ObservableObject {
 
     private var cursorShownForRoute: Bool {
         PointerPolicy.cursorShown(desktop: Self.desktopMode, directEnabled: Self.directCursorEnabled,
-                                  reports: cursorState.reports, shown: cursorState.shown != 0)
+                                  reports: cursorState.reports, shown: cursorState.shown != 0,
+                                  routingEnabled: Self.mouseRoutingEnabled)
     }
 
     private func updateRoute() {
@@ -1449,7 +1474,7 @@ final class HardwareInput: ObservableObject {
     /// The driver's position reports are wanted while the drawn cursor follows
     /// Wine's cursor, and as the automatic lock's sign of a live program.
     private func updateTracking() {
-        guard Self.directCursorEnabled else { return }
+        guard (Self.mouseRoutingEnabled ? Self.directCursorEnabled : directCursorLive) else { return }
         let on = mouseInUse && (currentRoute == .relative || lastAbsolute == nil)
         winios_direct_cursor_track(on ? 1 : 0)
     }
@@ -1499,7 +1524,8 @@ final class HardwareInput: ObservableObject {
     }
 
     private func updateAutoLock() {
-        guard Self.autoLockEnabled, Self.directCursorEnabled, Self.pointerLockAvailable, mousePath == .gcmouse else {
+        guard Self.autoLockEnabled, (Self.mouseRoutingEnabled ? Self.directCursorEnabled : directCursorLive),
+              Self.pointerLockAvailable, mousePath == .gcmouse else {
             if pointerLocked && lockedByUs { setPointerLocked(false, byUs: true, why: "automatic lock unavailable") }
             return
         }
@@ -1585,6 +1611,11 @@ final class HardwareInput: ObservableObject {
             }
             return true
         }
+        if !Self.mouseRoutingEnabled {
+            let drop = shouldIgnore(touches, logging: phase == .began)
+            if !drop, phase == .began { setMouseInUse(false) }
+            return drop
+        }
         var drop = !touches.isEmpty
         for touch in touches {
             let ignore = phase == .began && shouldIgnore(touch, logging: true)
@@ -1651,7 +1682,7 @@ final class HardwareInput: ObservableObject {
     /// Includes compatibility clicks reported as direct touches. Real surface
     /// touches likewise must not warp a camera already driven by the raw mouse.
     var hardwareOwnsRelativeMotion: Bool {
-        Self.enabled && gcDeltaSeen && currentRoute == .relative
+        Self.mouseRoutingEnabled && Self.enabled && gcDeltaSeen && currentRoute == .relative
     }
 
     func surfacePointerEvent(x: Int32, y: Int32, flags: UInt32, data: UInt32 = 0) -> SurfacePointerEvent? {
@@ -1706,12 +1737,14 @@ final class HardwareInput: ObservableObject {
     /// The complete set of buttons UIKit says are down, declared, not edged.
     /// These touches reach the game view only while the pointer is over it.
     func uikitButtons(_ want: Set<MouseButton>) {
-        guard Self.enabled else { return }
+        guard Self.enabled, Self.mouseRoutingEnabled || !gcLive else { return }
         // A raw movement report does not establish a source for mouse buttons.
         // Keep each raw-reported button authoritative; allow the fallback for
         // the others without dropping a raw hold or posting duplicate edges.
-        let allowed = MouseButtonSources.merge(current: gameButtons, fallback: want,
-                                               rawSeen: gcButtonsSeen, focused: baseFocused)
+        let allowed = Self.mouseRoutingEnabled
+            ? MouseButtonSources.merge(current: gameButtons, fallback: want,
+                                       rawSeen: gcButtonsSeen, focused: baseFocused)
+            : (baseFocused ? want : [])
         if !want.isEmpty { noteUIKitPointer(); setMouseInUse(true) }
         guard allowed != gameButtons else { return }
         gameButtons = allowed
@@ -1865,6 +1898,7 @@ enum PointerLock {
     /// Only controllers constructed by the app are registered; keyboard and
     /// other system windows must keep their own pointer-lock preferences.
     static func register(_ root: UIViewController) {
+        guard HardwareInput.mouseRoutingEnabled else { return }
         include(root)
         refresh()
     }
@@ -1881,6 +1915,7 @@ enum PointerLock {
     /// Called on preference/focus changes and the existing focus poll. Re-ask
     /// only when the request, owned roots or key controller actually changed.
     static func refresh() {
+        guard HardwareInput.mouseRoutingEnabled else { LegacyPointerLock.refresh(); return }
         DispatchQueue.main.async {
             let gameWindow = MetalBackedView.keyboardTarget?.window
             guard let scene = gameWindow?.windowScene ?? lastScene else { return }
@@ -1940,6 +1975,53 @@ enum PointerLock {
         guard line != lastReport else { return }
         lastReport = line
         fputs("[hwinput] system pointer lock (\(why)): \(line)\n", stderr)
+    }
+}
+
+/// Shared with the Wine driver and desktop compositor; use the same cfg
+/// precedence and startup snapshot as the Swift routing policy.
+@_cdecl("winios_mouse_routing_enabled")
+func winiosMouseRoutingEnabled() -> Int32 { HardwareInput.mouseRoutingEnabled ? 1 : 0 }
+
+private enum LegacyPointerLock {
+    private static var installed = false
+
+    /// Re-ask UIKit for the preference. The root controller is re-resolved
+    /// every time: a cached reference that went stale after a scene rebuild
+    /// would silently stop updating it.
+    static func refresh() {
+        DispatchQueue.main.async {
+            install()
+            keyWindow()?.rootViewController?.setNeedsUpdateOfPrefersPointerLocked()
+        }
+    }
+
+    private static func keyWindow() -> UIWindow? {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap { $0.windows }
+            .first { $0.isKeyWindow }
+    }
+
+    private static func install() {
+        guard !installed else { return }
+        guard let root = keyWindow()?.rootViewController else {
+            fputs("[hwinput] pointer lock: no key window yet (will retry)\n", stderr)
+            return
+        }
+        guard let cls: AnyClass = object_getClass(root) else { return }
+        let sel = NSSelectorFromString("prefersPointerLocked")
+        let body: @convention(block) (AnyObject) -> Bool = { _ in
+            HardwareInput.shared.pointerLocked
+        }
+        let imp = imp_implementationWithBlock(body)
+        // "B@:": returns BOOL, takes self and _cmd. Add first; replace only if
+        // this exact class already had one.
+        if !class_addMethod(cls, sel, imp, "B@:") {
+            _ = class_replaceMethod(cls, sel, imp, "B@:")
+        }
+        installed = true
+        fputs("[hwinput] pointer lock installed on \(NSStringFromClass(cls))\n", stderr)
     }
 }
 

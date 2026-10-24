@@ -1899,7 +1899,8 @@ void winios_cursor_set(unsigned int cur_id, int w, int h, int hot_x, int hot_y, 
 }
 
 void winios_cursor_show(int show) {
-    winios_direct_cursor_show(show); // Visibility metadata also drives desktop mouse routing.
+    if (winios_mouse_routing_enabled())
+        winios_direct_cursor_show(show); // Desktop mouse-routing metadata.
     dispatch_async(dispatch_get_main_queue(), ^{
         if (g_cursor_layer) g_cursor_layer.hidden = !show;
     });

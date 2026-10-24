@@ -218,8 +218,17 @@ settings: `sensMouse`, `padRightStickMouse`, `ignoreTouchesWithMouse`.
 Set these with `env.NAME = value` in `Documents/madeira.cfg`, or in the process
 environment.
 
+To roll back the mouse-routing and pointer-lock changes without rebuilding,
+add `env.MADEIRA_MOUSE_ROUTING = 0` to `Documents/madeira.cfg` and fully quit
+and reopen Madeira. This restores the previous desktop cursor routing,
+pressed-button callbacks (without sampling), surface-touch handling and
+key-window-only pointer-lock request. Hardware keyboard/mouse input and the
+manual Ctrl+Alt+P shortcut remain available. Remove the line or set it to `1`
+and restart to enable the fixes again. The same switch is listed in Settings > All settings; it is read once per app run, not changed during a held gesture.
+
 | Switch | Default | Effect |
 | --- | --- | --- |
+| `MADEIRA_MOUSE_ROUTING` | on | `0`: restore the previous mouse routing and pointer-lock behaviour; restart Madeira. |
 | `MADEIRA_HWINPUT` | on | `0`: no keyboard/mouse bridging, pointer recognisers, touch filter, drawn cursor, lock or right-stick mouse; the app behaves as before this change (the Info.plist key stays). |
 | `MADEIRA_INPUT_FOCUS` | on | `0`: keyboard and mouse reach the program whatever has focus in the app (still not while the app is inactive). |
 | `MADEIRA_DIRECT_CURSOR` | on | `0`: no cursor is drawn on the game view, motion stays relative there and the pointer never locks by itself; the driver reports nothing. |

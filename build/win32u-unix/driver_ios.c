@@ -69,6 +69,7 @@ static struct user_driver_funcs winios_user_driver;
  * program hides it, and where Wine's cursor is after clipping; it changes
  * nothing the program sees, and does nothing until the app has asked for the
  * reports (MADEIRA_DIRECT_CURSOR=0 or MADEIRA_HWINPUT=0 in the app: never). */
+extern int winios_mouse_routing_enabled( void ) __attribute__((weak));
 extern int winios_direct_cursor_wanted( void ) __attribute__((weak));
 extern void winios_direct_cursor_set( unsigned int id, int w, int h, int hot_x, int hot_y,
                                       const void *bgra ) __attribute__((weak));
@@ -77,9 +78,15 @@ extern void winios_direct_cursor_pos( int x, int y ) __attribute__((weak));
 
 static int winios_desktop_mode(void);
 
+static int winios_mouse_routing_on(void)
+{
+    return !winios_mouse_routing_enabled || winios_mouse_routing_enabled();
+}
+
 static int winios_direct_cursor_on(void)
 {
-    return winios_direct_cursor_wanted && winios_direct_cursor_wanted();
+    return (!winios_desktop_mode() || winios_mouse_routing_on()) &&
+           winios_direct_cursor_wanted && winios_direct_cursor_wanted();
 }
 
 /* Wine's cursor position, read the way NtUserGetCursorPos does but without the
@@ -1849,7 +1856,7 @@ static void load_display_driver(void)
         /* direct mode: inert (like winios_pSetCursor) until the app enables it */
         else if (winios_direct_cursor_set) winios_user_driver.pSetCursor         = winios_drv_set_cursor;
         else if (winios_pSetCursor)      winios_user_driver.pSetCursor           = winios_pSetCursor;
-        if (winios_direct_cursor_pos)
+        if ((!winios_desktop_mode() || winios_mouse_routing_on()) && winios_direct_cursor_pos)
             winios_user_driver.pSetCursorPos = winios_drv_set_cursor_pos;
         if (winios_pDestroyCursorIcon)   winios_user_driver.pDestroyCursorIcon   = winios_pDestroyCursorIcon;
         if (winios_pShowWindow)          winios_user_driver.pShowWindow          = winios_pShowWindow;
