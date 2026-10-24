@@ -19666,8 +19666,15 @@ static void *map_reserved_area_inner( void *limit_low, void *limit_high, size_t 
             void *start = area->base;
             void *end = (char *)start + area->size;
 
-            /* ml799: the FEX arena serves only requests contained in it. */
-            if (area->fex_only && !fex_arena_covers( limit_low, limit_high )) continue;
+            /* ml799: the FEX arena serves only requests contained in it.
+             * ml2020: and every FEX_ONLY area serves such a request, whole: the
+             * emulator's limits name the first band only (ios_fex_arena_grow). */
+            if (area->fex_only)
+            {
+                if (!fex_arena_covers( limit_low, limit_high )) continue;
+                if ((ptr = find_reserved_free_area_outside_preloader( start, end, size, top_down, align_mask ))) break;
+                continue;
+            }
             if (area->thin_only) continue;   /* Madeira: thin heads are placed at fixed slots */
             if (start >= limit_high) continue;
             if (end <= limit_low) return NULL;
@@ -19684,8 +19691,14 @@ static void *map_reserved_area_inner( void *limit_low, void *limit_high, size_t 
             void *start = area->base;
             void *end = (char *)start + area->size;
 
-            /* ml799: the FEX arena serves only requests contained in it. */
-            if (area->fex_only && !fex_arena_covers( limit_low, limit_high )) continue;
+            /* ml799: the FEX arena serves only requests contained in it.
+             * ml2020: and every FEX_ONLY area serves such a request, whole (see above). */
+            if (area->fex_only)
+            {
+                if (!fex_arena_covers( limit_low, limit_high )) continue;
+                if ((ptr = find_reserved_free_area_outside_preloader( start, end, size, top_down, align_mask ))) break;
+                continue;
+            }
             if (area->thin_only) continue;   /* Madeira: thin heads are placed at fixed slots */
             if (start >= limit_high) return NULL;
             if (end <= limit_low) continue;
@@ -19918,6 +19931,106 @@ static int ios_stack_spill_enabled(void)
  * Create a view and mmap the corresponding memory area.
  * virtual_mutex must be held by caller.
  */
+#ifdef WINE_IOS
+/* ml2020 [fex-arena] GROW: a second (third, fourth...) FEX_ONLY band when the
+ * arena is full.
+ *
+ * The emulator reserves its per-thread memory in the arena (lookup cache,
+ * code staging, call-return stack, thread state: about 70 MB of address space a
+ * guest thread on this build), so the arena's size caps the number of guest
+ * threads a session can run: with MADEIRA_SC_PA_POOLS=2 the arena is 12 GB and
+ * a publisher launcher plus its Chromium helper, 165 threads between them,
+ * filled it (device log 2026-10-24 17:44: [fex-headroom] 84% used, 1265 views,
+ * then [va-scan] FAILED window=0x7d00000000..0x8000000000 size=0x1000000 and
+ * the emulator wrote through the pointer it had not got, an AV storm at
+ * 0x800010 that ended the process). The arena is a VA budget, not a
+ * correctness boundary: what matters is that the emulator's memory stays out of
+ * the guest's furniture band (CallRetStack.h: a guest over-read of a
+ * call-return frame yields a host code label) and that Wine knows every range.
+ *
+ * So when a request whose limits name the arena cannot be placed in it, hold
+ * another band for the emulator: FIXED candidates below the arena, 1 GB apart
+ * and never below 0x7000000000 (the hardware bands' free parts: the layouts'
+ * unused slot halves, above the furniture), 8 GB first, then 4, 2 and 1 GB,
+ * registered FEX_ONLY like the arena itself, so generic placement skips it and
+ * the arena guard refuses fixed guest requests into it. map_reserved_area_inner
+ * then serves the emulator's requests from every FEX_ONLY area, whole: the
+ * limits the emulator passes name the first band only (ml797 handed it over as
+ * plain data, once). At most four extra bands. MADEIRA_FEX_ARENA_GROW=0: a full
+ * arena fails the request as before. */
+static int ios_fex_arena_grow_enabled(void)
+{
+    static int enabled = -1;
+    int v = __atomic_load_n( &enabled, __ATOMIC_ACQUIRE );
+
+    if (v < 0)
+    {
+        const char *e = getenv( "MADEIRA_FEX_ARENA_GROW" );   /* 0: a full FEX arena fails the emulator's request as before, instead of adding a FEX_ONLY band below it */
+        v = !(e && e[0] == '0');
+        __atomic_store_n( &enabled, v, __ATOMIC_RELEASE );
+    }
+    return v;
+}
+
+#define IOS_FEX_ARENA_GROW_MAX   4
+#define IOS_FEX_ARENA_GROW_FLOOR 0x7000000000ULL
+
+/* virtual_mutex held. Returns 1 when a new FEX_ONLY band at least `need` bytes
+ * large now exists, 0 when none could be held (the request then fails as before). */
+static int ios_fex_arena_grow( size_t need )
+{
+    static const unsigned long long sizes[] = { 8ULL << 30, 4ULL << 30, 2ULL << 30, 1ULL << 30 };
+    static unsigned bands, said_cap, said_none;
+    unsigned i;
+
+    if (!ios_fex_arena_grow_enabled() || !ios_fex_arena_base_unix) return 0;
+    if (bands >= IOS_FEX_ARENA_GROW_MAX)
+    {
+        if (!said_cap++)
+            dprintf( 2, "[fex-arena] ml2020 GROW: %u extra bands already held, no more (0x%lx bytes wanted); "
+                        "the emulator's request fails as before\n", bands, (unsigned long)need );
+        return 0;
+    }
+    for (i = 0; i < ARRAY_SIZE(sizes); i++)
+    {
+        unsigned long long size = sizes[i];
+        mach_vm_address_t cand;
+        unsigned tries;
+
+        if (size < need) continue;
+        if (ios_fex_arena_base_unix < IOS_FEX_ARENA_GROW_FLOOR + size) continue;
+        for (cand = ((unsigned long long)ios_fex_arena_base_unix - size) & ~((1ULL << 30) - 1), tries = 0;
+             cand >= IOS_FEX_ARENA_GROW_FLOOR && tries < 64; cand -= 1ULL << 30, tries++)
+        {
+            mach_vm_address_t addr = cand;
+            kern_return_t kr;
+
+            if (find_view_range( (void *)(ULONG_PTR)addr, (size_t)size )) continue;
+            kr = mach_vm_map( mach_task_self(), &addr, (mach_vm_size_t)size, 0xffff, VM_FLAGS_FIXED,
+                              MEMORY_OBJECT_NULL, 0, 0, PROT_NONE, VM_PROT_ALL, VM_INHERIT_COPY );
+            if (kr != KERN_SUCCESS) continue;
+            if (!mmap_add_fex_reserved_area( (void *)(ULONG_PTR)addr, (SIZE_T)size ))
+            {
+                mach_vm_deallocate( mach_task_self(), addr, (mach_vm_size_t)size );
+                continue;
+            }
+            bands++;
+            dprintf( 2, "[fex-arena] ml2020 GROW #%u: the arena 0x%lx..0x%lx is full (0x%lx bytes wanted); band "
+                        "0x%llx+0x%llx (%llu MB) held natively and registered FEX_ONLY after %u tries -- the "
+                        "emulator's requests are served from it too (MADEIRA_FEX_ARENA_GROW=0 fails them as before)\n",
+                     bands, (unsigned long)ios_fex_arena_base_unix, (unsigned long)ios_fex_arena_end_unix,
+                     (unsigned long)need, (unsigned long long)addr, size, size >> 20, tries + 1 );
+            return 1;
+        }
+    }
+    if (!said_none++)
+        dprintf( 2, "[fex-arena] ml2020 GROW: no free band of 1 GB or more between 0x%llx and the arena 0x%lx for "
+                    "a 0x%lx-byte request; the emulator's request fails as before\n",
+                 IOS_FEX_ARENA_GROW_FLOOR, (unsigned long)ios_fex_arena_base_unix, (unsigned long)need );
+    return 0;
+}
+#endif
+
 static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                           unsigned int alloc_type, unsigned int vprot,
                           ULONG_PTR limit_low, ULONG_PTR limit_high, size_t align_mask )
@@ -20247,6 +20360,18 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
              * the unclamped kernel pick below. Only constraints WE added are
              * dropped — a caller-supplied limit_high never sets
              * ceiling_relaxable, so its contract still holds. */
+#ifdef WINE_IOS
+            /* ml2020: the emulator's arena is full and this request names it:
+             * hold another FEX_ONLY band and place the view there (see
+             * ios_fex_arena_grow). Only for the emulator's own requests. */
+            if (!ceiling_relaxable && fex_arena_covers( (void *)limit_low, (void *)limit_high ) &&
+                ios_fex_arena_grow( view_size ) &&
+                (ptr = map_reserved_area( start, end, host_size, top_down, unix_prot, align_mask )))
+            {
+                TRACE( "got mem in a grown FEX band %p-%p\n", ptr, (char *)ptr + size );
+                goto done;
+            }
+#endif
             if (!ceiling_relaxable)
             {
                 ios_af_set( 2, ios_scan_fail_errno, ios_scan_fail_addr, size );
