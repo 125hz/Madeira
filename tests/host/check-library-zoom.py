@@ -101,7 +101,9 @@ require('Real Steam data' in docs and 'madeiraSteamInstalledSnapshot.v1' in docs
 # ------------------------------------------------------------------ Swift
 geometry = between(levels, '// MARK: - Geometry', '// MARK: - Card labels')
 checks = r'''
+#if canImport(CoreGraphics)
 import CoreGraphics
+#endif
 import Foundation
 
 @main
@@ -444,7 +446,7 @@ struct Checks {
 
 with tempfile.TemporaryDirectory() as tmp:
     tmp = Path(tmp)
-    (tmp / 'geometry.swift').write_text('import CoreGraphics\nimport Foundation\n' + geometry)
+    (tmp / 'geometry.swift').write_text('#if canImport(CoreGraphics)\nimport CoreGraphics\n#endif\nimport Foundation\n' + geometry)
     (tmp / 'checks.swift').write_text(checks)
     out = tmp / 'checks'
     build = subprocess.run([SWIFTC, '-parse-as-library', '-o', str(out), str(app / 'LibraryGridZoomModel.swift'),

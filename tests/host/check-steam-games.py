@@ -201,6 +201,12 @@ enum SteamSignIn {
     static func flag(_ name: String, default fallback: Bool) -> Bool { getenv(name).map { String(cString: $0) != "0" } ?? fallback }
 }
 enum SteamLog { static func event(_ m: String) {}; static func trace(_ m: @autoclosure () -> String) {} }
+// SteamLanguage (SteamAppInfo.swift) reads and writes the madeira.cfg language key.
+enum MadeiraConfig {
+    static func get(_ key: String) -> String? { nil }
+    static func set(_ key: String, _ value: String?) {}
+    static func gameValue(_ key: String) -> String? { nil }
+}
 enum SteamRuntimeFiles {
     static let relativeRoot = "Program Files (x86)/Steam"
     static let windowsRoot = "C:\\Program Files (x86)\\Steam"
