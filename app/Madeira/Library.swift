@@ -2892,6 +2892,7 @@ struct LibraryView: View {
                 SteamSettingsSection(open: { settingsSheet = $0 })
             }
             if settingsShow(".NET", "Mono", "Wine Mono", "framework", "download") { WineMonoSettingsSection() }
+            if VCRedistModel.enabled, settingsShow("Visual C++", "C++", "runtime", "redist", "vcredist", "download") { VCRedistSettingsSection() }
             if settingsShow("saves", "backup", "restore", "save games") { SavesSection() }
             if settingsShow("appearance", "liquid metal", "metal", "glass") {
                 Section {
