@@ -33,6 +33,10 @@ check(re.search(r'setenv\("MADEIRA_DOCK_GAME_SCM", \w+\.exported, 1\)', content)
       'the decision is exported to the host as MADEIRA_DOCK_GAME_SCM (0 or 1)')
 check('DockGameSession.serverSyncOff(' in content and 'DockInstallers.madsyncConfigured' in content,
       'madsync is turned off for a session that starts the service manager')
+check('thirdPartyInstalls: DockInstallers.thirdPartyInstalls' in content, "the game's third-party install-script programs feed the decision")
+installers = (ROOT / 'app/Madeira/DockInstallers.swift').read_text(encoding='utf-8')
+check('DockGameSession.isMicrosoftKey(' in installers and 'thirdPartyInstalls = 0' in installers,
+      'DockInstallers counts the non-Microsoft records and resets the count at every prepare')
 check(re.search(r'if DockInstallers\.serverSync \|\| \w+ \{\s*setenv\("MADEIRA_MADSYNC_SESSION", "0", 1\)', content) is not None,
       'MADEIRA_MADSYNC_SESSION=0 is set for the installers case or the service-manager case, never otherwise')
 check(content.count('unsetenv("MADEIRA_MADSYNC_SESSION")') >= 1, 'the variable is cleared for every other session')
@@ -131,8 +135,9 @@ expect(S.registryValue("@=\"default\"") == nil && S.registryValue("\"NoEquals\""
 // the test itself, same as the host's sh_service_is_foreign_autostart
 expect(S.isForeignAutoStart(type: 0x10, start: 2, image: "\"C:\\Program Files\\Publisher\\Service.exe\""), "an automatic own-process service outside Windows")
 expect(S.isForeignAutoStart(type: 0x20, start: 2, image: "C:\\Games\\svc.exe --run"), "a shared-process one too")
-expect(!S.isForeignAutoStart(type: 0x10, start: 3, image: "C:\\Games\\svc.exe"), "demand start does not count")
+expect(S.isForeignAutoStart(type: 0x10, start: 3, image: "C:\\Games\\svc.exe"), "demand start counts: the program starts it through the manager")
 expect(!S.isForeignAutoStart(type: 0x10, start: 4, image: "C:\\Games\\svc.exe"), "disabled does not count")
+expect(!S.isForeignAutoStart(type: 0x10, start: 0, image: "C:\\Games\\svc.exe") && !S.isForeignAutoStart(type: 0x10, start: 1, image: "C:\\Games\\svc.exe"), "boot and system start do not count")
 expect(!S.isForeignAutoStart(type: 0x1, start: 2, image: "C:\\Games\\drv.sys"), "a kernel driver does not count")
 expect(!S.isForeignAutoStart(type: 0x10, start: 2, image: "%SystemRoot%\\system32\\svchost.exe -k x"), "Wine's svchost services do not count")
 expect(!S.isForeignAutoStart(type: 0x10, start: 2, image: "C:\\windows\\system32\\spoolsv.exe"), "a Windows-folder image does not count")
@@ -160,9 +165,9 @@ WINE REGISTRY Version 2
 "Start"=dword:00000002
 "Type"=dword:00000010
 
-[System\\\\CurrentControlSet\\\\Services\\\\AntiCheatSvc] 1700000000
+[System\\\\CurrentControlSet\\\\Services\\\\DisabledSvc] 1700000000
 "ImagePath"="\\"C:\\\\Program Files (x86)\\\\Common Files\\\\AC\\\\acsvc.exe\\""
-"Start"=dword:00000003
+"Start"=dword:00000004
 "Type"=dword:00000010
 
 [System\\\\CurrentControlSet\\\\Services\\\\PublisherService] 1700000000
@@ -184,7 +189,7 @@ WINE REGISTRY Version 2
 
 """
 let found = S.foreignAutoStartServices(systemReg: reg)
-expect(found.map(\.name) == ["PublisherService"], "only the publisher's automatic service is found: \(found.map(\.name))")
+expect(found.map(\.name) == ["PublisherService"], "only the publisher's startable service is found (not Wine's, not a disabled one): \(found.map(\.name))")
 expect(found.first?.image == "\"C:\\Program Files\\Publisher\\Launcher\\PublisherService.exe\"", "its image is the registry string")
 expect(S.foreignAutoStartServices(systemReg: "").isEmpty && S.foreignAutoStartServices(systemReg: "garbage\n[x\n\"a\"=b").isEmpty, "empty or malformed text finds nothing")
 
@@ -193,8 +198,21 @@ let auto = S.Decision(mode: .auto, services: found)
 expect(auto.on && auto.exported == "1", "auto with a foreign service: on, exported as 1")
 expect(!S.Decision(mode: .auto, services: []).on && S.Decision(mode: .auto, services: []).exported == "0", "auto without: off, exported as 0")
 expect(S.Decision(mode: .on, services: []).on && !S.Decision(mode: .off, services: found).on, "on and off ignore the registry")
-expect(auto.logLine == "[dock-game-scm] mode=auto services=1 (PublisherService) service-manager=on", "the log line: \(auto.logLine)")
+expect(auto.logLine == "[dock-game-scm] mode=auto services=1 (PublisherService) third-party-installs=0 service-manager=on", "the log line: \(auto.logLine)")
 expect(!auto.logLine.contains("Program Files"), "no image path in the log")
+
+// a game whose install script recorded a publisher's program: the service is registered only on
+// that program's first run, through the manager, so the registry cannot show it yet
+let installs = S.Decision(mode: .auto, services: [], installs: 2)
+expect(installs.on && installs.exported == "1", "auto with a third-party install-script program: on")
+expect(installs.logLine == "[dock-game-scm] mode=auto services=0 third-party-installs=2 service-manager=on", "its log line: \(installs.logLine)")
+expect(!S.Decision(mode: .off, services: [], installs: 2).on, "off still wins")
+expect(S.isMicrosoftKey("Software\\Microsoft\\DirectX") && S.isMicrosoftKey("Software\\Wow6432Node\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64"),
+       "Microsoft's redistributable keys, also through Wow6432Node")
+expect(S.isMicrosoftKey("SOFTWARE/microsoft/.NETFramework") && S.isMicrosoftKey("Microsoft\\XNA\\Framework"), "any case, either separator, with or without Software")
+expect(!S.isMicrosoftKey("Software\\Publisher\\Steam\\Launcher") && !S.isMicrosoftKey("Software\\Wow6432Node\\Publisher\\SDK") && !S.isMicrosoftKey("Software\\Valve\\Steam\\Apps\\1"),
+       "a publisher's key is not Microsoft's")
+expect(!S.isMicrosoftKey("") && !S.isMicrosoftKey("Software"), "empty keys are not Microsoft's")
 
 // the prefix read
 let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("madeira-dock-game-session-\(getpid())", isDirectory: true)
@@ -203,6 +221,8 @@ try! reg.write(to: dir.appendingPathComponent("system.reg"), atomically: true, e
 expect(S.decide(prefix: dir, gameConfig: nil).on, "decide reads system.reg from the prefix")
 expect(!S.decide(prefix: dir, gameConfig: "env.MADEIRA_DOCK_GAME_SCM = 0\n").on, "a game's 0 wins without reading")
 expect(!S.decide(prefix: dir.appendingPathComponent("missing"), gameConfig: nil).on, "a missing registry means off in auto")
+expect(S.decide(prefix: dir.appendingPathComponent("missing"), gameConfig: nil, thirdPartyInstalls: 1).on, "unless the game's install script recorded a third-party program")
+expect(S.decide(prefix: dir.appendingPathComponent("missing"), gameConfig: nil, thirdPartyInstalls: -3).installs == 0, "a negative count reads as none")
 try? FileManager.default.removeItem(at: dir)
 
 // madsync

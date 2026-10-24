@@ -559,6 +559,11 @@ enum DockInstallers {
     /// session of their own also leaves madsync on for the game. One session runs per app run,
     /// so the game starts after a restart of Madeira.
     private(set) static var installsOnly = false
+    /// ml2020: the game's install-script programs recorded (or about to run) under a registry key
+    /// that is not Microsoft's: a publisher's launcher, runtime or anti-cheat, which may register
+    /// and start a Windows service of its own (DockGameSession.isMicrosoftKey; the game session's
+    /// service manager decision reads this).
+    private(set) static var thirdPartyInstalls = 0
     nonisolated static let restartWords = "To start the game, restart Madeira: swipe it away in the app switcher, open it again and start the game."
     /// What the starting screen says once the installs ended, until the session has closed (the
     /// wineserver writes the registry to disk as it stops; Madeira asks for the restart then).
@@ -857,7 +862,7 @@ enum DockInstallers {
                         has32Bit: Bool = DockInstallers.bundleHas32Bit, hasMsiexec: Bool = DockInstallers.bundleHasMsiexec,
                         fusionSource: URL? = Bundle.main.resourceURL?.appendingPathComponent("i386-windows/fusion.dll")) {
         script = nil; serverSync = false; note = nil; finishedAt = nil; logged = []; runningSince = nil; installsOnly = false
-        allSucceeded = false
+        allSucceeded = false; thirdPartyInstalls = 0
         let app = game.id
         let batchFile = drive.appendingPathComponent(scriptName)
         try? FileManager.default.removeItem(at: batchFile)
@@ -889,6 +894,10 @@ enum DockInstallers {
                                             done: { DockInstallScripts.marked($0, in: registry[$0.hive] ?? "") },
                                             exists: { resolve($0, drive: drive) != nil },
                                             runnable: { runnable($0, drive: drive, has32Bit: has32Bit, hasMsiexec: hasMsiexec) })
+        // ml2020: a publisher's program the script installed (or installs now), by its record's
+        // key: the game session's service-manager decision (DockGameSession) reads the count.
+        thirdPartyInstalls = items.filter { [.done, .pending, .limit].contains($0.status)
+                                            && !DockGameSession.isMicrosoftKey($0.process.run.key) }.count
         var pending = items.filter { $0.status == .pending }.map(\.process)
         var ledger = DockInstallLedger.load(prefix: prefix)
         // Programs the game's last batch started but never saw exit (absorbResults).
@@ -965,6 +974,7 @@ enum DockInstallers {
         }
         LogStore.shared.log("[dock-installers] app=\(app) scripts=\(scripts) programs=\(found.count) pending=\(pending.count) " +
                             "done=\(items.filter { $0.status == .done }.count) missing=\(items.filter { $0.status == .missing }.count) " +
+                            "third-party=\(thirdPartyInstalls) " +
                             "unsupported=\(items.filter { $0.status == .unsupported }.count) default-key=\(defaultKey ? 1 : 0) " +
                             "services-step=\(script == nil ? "-" : services == .off ? "off" : "start") session-madsync-off=\(serverSync ? 1 : 0) " +
                             "installs-only=\(installsOnly ? 1 : 0)")
