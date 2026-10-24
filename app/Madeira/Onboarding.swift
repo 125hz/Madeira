@@ -687,6 +687,7 @@ struct SteamSettingsSection: View {
     @ObservedObject private var signIn = SteamSignInModel.shared
     @ObservedObject private var dock = MadeiraDockModel.shared
     @ObservedObject private var onboarding = OnboardingModel.shared
+    @ObservedObject private var cloud = SteamCloudSetting.shared
     @State private var confirmSignOut = false
     /// Settings › Steam › Game language (SteamLanguage); "" follows the device.
     @State private var language = SteamLanguage.chosen ?? ""
@@ -708,6 +709,10 @@ struct SteamSettingsSection: View {
             }
             .pickerStyle(.navigationLink)
             .onChange(of: language) { _, value in SteamLanguage.choose(value.isEmpty ? nil : value) }
+            // Off: no Steam Cloud checks, transfers or prompts before Play (docs/STEAM_CLOUD.md).
+            if SteamOwnedLibrary.enabled {
+                Toggle("Steam Cloud saves", isOn: $cloud.on)
+            }
             if MadeiraDock.enabled {
                 Button { open(.dock) } label: { Label("Madeira Dock", systemImage: "shippingbox") }
                 if let status = dock.status {
