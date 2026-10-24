@@ -23,6 +23,7 @@
 		A1000700 /* SteamCloud.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000700 /* SteamCloud.swift */; };
 		A1000710 /* SavesAndShortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000710 /* SavesAndShortcuts.swift */; };
 		A1000711 /* WineMono.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000711 /* WineMono.swift */; };
+		A1000715 /* DockGameSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000715 /* DockGameSession.swift */; };
 		A1000712 /* VCRedist.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000712 /* VCRedist.swift */; };
 		A1000713 /* CabinetReader.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000713 /* CabinetReader.c */; };
 		A1000602 /* SteamDownloadBackground.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000602 /* SteamDownloadBackground.swift */; };
@@ -222,6 +223,7 @@
 		A2000700 /* SteamCloud.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamCloud.swift"; sourceTree = "<group>"; };
 		A2000710 /* SavesAndShortcuts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SavesAndShortcuts.swift"; sourceTree = "<group>"; };
 		A2000711 /* WineMono.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "WineMono.swift"; sourceTree = "<group>"; };
+		A2000715 /* DockGameSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DockGameSession.swift"; sourceTree = "<group>"; };
 		A2000712 /* VCRedist.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "VCRedist.swift"; sourceTree = "<group>"; };
 		A2000713 /* CabinetReader.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = CabinetReader.c; sourceTree = "<group>"; };
 		A2000714 /* CabinetReader.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = CabinetReader.h; sourceTree = "<group>"; };
@@ -471,6 +473,7 @@
 				A2000700 /* SteamCloud.swift */,
 				A2000710 /* SavesAndShortcuts.swift */,
 				A2000711 /* WineMono.swift */,
+				A2000715 /* DockGameSession.swift */,
 				A2000712 /* VCRedist.swift */,
 				A2000713 /* CabinetReader.c */,
 				A2000714 /* CabinetReader.h */,
@@ -834,6 +837,7 @@
 				A1000700 /* SteamCloud.swift in Sources */,
 				A1000710 /* SavesAndShortcuts.swift in Sources */,
 				A1000711 /* WineMono.swift in Sources */,
+				A1000715 /* DockGameSession.swift in Sources */,
 				A1000712 /* VCRedist.swift in Sources */,
 				A1000713 /* CabinetReader.c in Sources */,
 				A1000602 /* SteamDownloadBackground.swift in Sources */,

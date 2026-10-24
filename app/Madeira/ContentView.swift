@@ -3468,11 +3468,23 @@ struct ContentView: View {
             } else {
                 unsetenv("MADEIRA_DOCK_INSTALLS_SESSION")
             }
-            // Only a start that runs installers turns madsync off, for its own session
-            // (build/madsync/madsync.c reads MADEIRA_MADSYNC_SESSION once, when the server starts).
-            if DockInstallers.serverSync {
+            // ml2020: a launcher's own automatic-start service needs a service manager in the
+            // game session, which the host starts when asked (DockGameSession: the game's
+            // MADEIRA_DOCK_GAME_SCM, else the prefix's system.reg decides). Decided here, before
+            // the session, because such a session must also leave madsync (below).
+            let scm = DockGameSession.decide(prefix: MadeiraDock.prefix,
+                                             gameConfig: profile.map { GameProfile(windowsPath: $0.windowsPath).text })
+            setenv("MADEIRA_DOCK_GAME_SCM", scm.exported, 1)
+            logStore.log(scm.logLine)
+            let scmServerSync = DockGameSession.serverSyncOff(scm, madsyncConfigured: DockInstallers.madsyncConfigured)
+            // Only a start that runs installers, or one that starts the service manager, turns
+            // madsync off, for its own session (build/madsync/madsync.c reads
+            // MADEIRA_MADSYNC_SESSION once, when the server starts).
+            if DockInstallers.serverSync || scmServerSync {
                 setenv("MADEIRA_MADSYNC_SESSION", "0", 1)
-                logStore.log("[dock-installers] this session runs one-time installs: madsync off for this session only (MADEIRA_MADSYNC_SESSION=0)")
+                logStore.log(DockInstallers.serverSync
+                    ? "[dock-installers] this session runs one-time installs: madsync off for this session only (MADEIRA_MADSYNC_SESSION=0)"
+                    : "[dock-game-scm] this session starts the service manager: madsync off for this session only (MADEIRA_MADSYNC_SESSION=0; env.MADEIRA_DOCK_GAME_SCM_SERVER_SYNC = 0 keeps madsync)")
             } else {
                 unsetenv("MADEIRA_MADSYNC_SESSION")
             }
