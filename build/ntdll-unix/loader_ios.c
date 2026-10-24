@@ -3004,7 +3004,8 @@ static ULONG_PTR get_image_address(void)
  * entry and faulted. Each process now gets its own, created on first use and
  * keyed by PEB and process id (a PEB address can be reused by a later process).
  * sync.c is compiled with its two `handle = keyed_event` lines pointed here
- * (build/ntdll-unix/build.sh).
+ * (build/ntdll-unix/build.sh). env.MADEIRA_KEYED_EVENT_PER_PROCESS = 0 goes
+ * back to the one global.
  */
 static pthread_mutex_t ios_keyed_event_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct { void *peb; ULONG_PTR pid; HANDLE handle; } ios_keyed_events[64];
@@ -3037,8 +3038,16 @@ HANDLE ios_default_keyed_event(void)
     ULONG_PTR pid = teb ? (ULONG_PTR)teb->ClientId.UniqueProcess : 0;
     HANDLE handle = 0;
     unsigned i;
+    static int on = -1;
 
-    if (!peb) return keyed_event;
+    if (on < 0)
+    {
+        /* 0: every process uses the first process's keyed event, as before */
+        const char *env = getenv( "MADEIRA_KEYED_EVENT_PER_PROCESS" );
+        on = !(env && env[0] == '0');
+        if (!on) ERR( "[keyed-event] MADEIRA_KEYED_EVENT_PER_PROCESS=0: one default keyed event for every process\n" );
+    }
+    if (!on || !peb) return keyed_event;
     pthread_mutex_lock( &ios_keyed_event_lock );
     for (i = 0; i < ARRAY_SIZE(ios_keyed_events); i++)
         if (ios_keyed_events[i].peb == peb && ios_keyed_events[i].pid == pid)
