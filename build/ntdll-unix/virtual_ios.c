@@ -19416,6 +19416,106 @@ failed:
     return status;
 }
 
+/* madeira-bcd: [arena-guard] a fixed or hinted guest reservation never lands
+ * in the FEX arena.
+ *
+ * map_reserved_area_inner keeps NULL-base requests out of the FEX_ONLY area
+ * (ml799, fex_arena_covers), but a request that names its own base goes to
+ * map_fixed_area, which treats every reserved area alike and maps over it with
+ * anon_mmap_fixed, so a guest that picks an address inside the arena is given
+ * the emulator's address space. SocialClubHelper.exe's V8 does exactly that:
+ * 4 GB reserves at random hints through VirtualAlloc2, and one hint inside the
+ * arena was granted there; FEX's 16 MB claims then failed and killed the
+ * launcher or RDR2.exe (libarm64ecfex.dll+0xfe770 AV, +0x1175bc c000001d).
+ *
+ * Refuse such a request with STATUS_CONFLICTING_ADDRESSES, what it gets when
+ * the range holds any view (find_view_range in map_fixed_area). A base address
+ * is exact on Windows, never a preference, so callers already handle it: V8 and
+ * PartitionAlloc retry without a hint (c0000018, then hint 0 -> 0x7240000000 in
+ * the device log), a preferred image base relocates (map_image_view), and a
+ * hinted reserve of 1 GB or more through NtAllocateVirtualMemory is placed
+ * again by its own retry walk (task#29 plan C). FEX never asks with a base: its
+ * reservations are NULL-base with MEM_ADDRESS_REQUIREMENTS in the arena
+ * (AllocatorHooks.h, CallRetStack.h, rpmalloc's os_mmap), and
+ * NtAllocateVirtualMemoryEx refuses a base together with limits. A request
+ * whose limits lie in the arena still passes, the map_reserved_area_inner rule;
+ * MEM_REPLACE_PLACEHOLDER returns before this. Called with virtual_mutex held.
+ * The steering valve is kept out of the arena too (ios_steer_top_slot_usable),
+ * so no guest NULL-base reserve is placed there either and a guest's release +
+ * re-reserve at an aligned base inside its own reserve (V8's alignment
+ * two-step, PartitionAlloc's TrimMapping) never meets this refusal.
+ * MADEIRA_ARENA_GUARD=0 restores the old placement of both. */
+static int ios_arena_guard_enabled(void)
+{
+    static int enabled = -1;
+    int v = __atomic_load_n( &enabled, __ATOMIC_ACQUIRE );
+
+    if (v < 0)
+    {
+        /* On by default. MADEIRA_ARENA_GUARD=0 lets a fixed or hinted guest reservation take FEX arena space again. */
+        const char *e = getenv( "MADEIRA_ARENA_GUARD" );
+
+        v = !(e && e[0] == '0');
+        __atomic_store_n( &enabled, v, __ATOMIC_RELEASE );
+    }
+    return v;
+}
+
+static int ios_arena_guard_refuses( void *base, size_t size, ULONG_PTR limit_low, ULONG_PTR limit_high )
+{
+    static unsigned long refused_n;
+    struct reserved_area *area;
+    char *start = base, *end = (char *)base + ROUND_SIZE( 0, size, host_page_mask );
+
+    if (!ios_arena_guard_enabled()) return 0;
+    if (limit_high && fex_arena_covers( (void *)limit_low, (void *)limit_high )) return 0;
+
+    LIST_FOR_EACH_ENTRY( area, &reserved_areas, struct reserved_area, entry )
+    {
+        char *area_start = area->base;
+        char *area_end = area_start + area->size;
+
+        if (area_start >= end) break;
+        if (area_end <= start || !area->fex_only) continue;
+        if (++refused_n <= 32 || !(refused_n % 256))
+            dprintf( 2, "[arena-guard] #%lu refused fixed/hinted %p+0x%lx tid=%04x: overlaps the FEX arena %p..%p "
+                        "-> STATUS_CONFLICTING_ADDRESSES, the caller places it elsewhere (MADEIRA_ARENA_GUARD=0 "
+                        "reverts)\n", refused_n, base, (unsigned long)size,
+                     NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0,
+                     area_start, area_end );
+        return 1;
+    }
+    return 0;
+}
+
+/* madeira-bcd: [arena-guard] may NtAllocateVirtualMemory's steering valve use
+ * its top slot [ios_steer_slot, host_addr_space_limit)?
+ *
+ * Not when the FEX arena lies in it. That slot predates the arena: in layout 0
+ * the arena IS [0x7c00000000, 0x8000000000), so fex_arena_covers accepts the
+ * steer's limits outright, and in layouts 1/2 its [wow-band] clause accepts
+ * [0x7c00000000, 0x8000000000] -- the device log shows "[wow-band] ... served
+ * from the FEX arena" followed by "[steer] #1 ... -> above ceiling
+ * 0x7f6b810000", a guest reserve inside FEX's range. What the arena leaves of
+ * the slot is Social Club's native hold (layouts 1/2) or nothing (layout 0),
+ * so skipping the whole slot loses nothing; the valve goes on to its
+ * 0x7400000000 slot and then to normal placement, as it already did when the
+ * top slot was full. */
+static int ios_steer_top_slot_usable(void)
+{
+    static int said;
+
+    if (!ios_arena_guard_enabled()) return 1;
+    if (!ios_fex_arena_base_unix || ios_fex_arena_end_unix <= ios_steer_slot ||
+        ios_fex_arena_base_unix >= (ULONG_PTR)host_addr_space_limit) return 1;
+    if (!__atomic_exchange_n( &said, 1, __ATOMIC_RELAXED ))
+        dprintf( 2, "[arena-guard] steering valve: the top slot [0x%lx,%p) holds the FEX arena [0x%lx,0x%lx); "
+                    "steered reserves use the 0x7400000000 slot or normal placement (MADEIRA_ARENA_GUARD=0 "
+                    "reverts)\n", (unsigned long)ios_steer_slot, host_addr_space_limit,
+                 (unsigned long)ios_fex_arena_base_unix, (unsigned long)ios_fex_arena_end_unix );
+    return 0;
+}
+
 /* madeira-bcd: [stack-spill] a 4 GB floor constrains nothing on iOS.
  *
  * init_thread_stack asks for every thread's kernel stack (1 MB), CHPE emulator
@@ -19506,6 +19606,8 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         if (limit_low && base < (void *)limit_low) return STATUS_CONFLICTING_ADDRESSES;
         if (limit_high && is_beyond_limit( base, size, (void *)limit_high )) return STATUS_CONFLICTING_ADDRESSES;
         if (is_beyond_limit( base, size, host_addr_space_limit )) return STATUS_CONFLICTING_ADDRESSES;
+        /* madeira-bcd: [arena-guard] -- see ios_arena_guard_refuses */
+        if (ios_arena_guard_refuses( base, size, limit_low, limit_high )) return STATUS_CONFLICTING_ADDRESSES;
         if ((status = map_fixed_area( base, size, unix_prot ))) return status;
         if (is_beyond_limit( base, size, working_set_limit )) working_set_limit = address_space_limit;
         ptr = base;
@@ -28456,7 +28558,10 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                  * described the EMPTY range [ios_spill_cap, 0) and every steer failed with
                  * *ret = 0x0. The upper bound has to be a real address: use the host VA
                  * ceiling, which is_beyond_limit treats as EXCLUSIVE. */
-                NTSTATUS sst = allocate_virtual_memory( ret, size_ptr, type, protect,
+                /* madeira-bcd: [arena-guard] -- see ios_steer_top_slot_usable */
+                int steer_top = ios_steer_top_slot_usable();
+                NTSTATUS sst = !steer_top ? STATUS_NO_MEMORY :
+                               allocate_virtual_memory( ret, size_ptr, type, protect,
                                                         ios_steer_slot,
                                                         (ULONG_PTR)host_addr_space_limit,
                                                         0, 0 );
@@ -28479,7 +28584,8 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                 if (sst && ios_steer_reclaim_dead())
                 {
                     *ret = saved; *size_ptr = want;
-                    sst = allocate_virtual_memory( ret, size_ptr, type, protect,
+                    sst = !steer_top ? STATUS_NO_MEMORY :
+                          allocate_virtual_memory( ret, size_ptr, type, protect,
                                                    ios_steer_slot,
                                                    (ULONG_PTR)host_addr_space_limit, 0, 0 );
                     if (sst)
