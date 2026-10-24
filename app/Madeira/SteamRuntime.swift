@@ -143,9 +143,25 @@ enum SteamRuntimeFiles {
         try need(cursor == end)
     }
 
+    /// The registry value or file that stopped the last setup, for the log.
+    nonisolated(unsafe) static var lastConflict: String?
+
+    /// A REG_SZ line's value, unescaped ("C:\\\\Steam" in the hive is C:\Steam), or nil.
+    static func stringValue(_ line: String, after prefix: String) -> String? {
+        let rest = line.dropFirst(prefix.count)
+        guard rest.hasPrefix("\""), rest.hasSuffix("\""), rest.count >= 2 else { return nil }
+        return String(rest.dropFirst().dropLast())
+            .replacingOccurrences(of: "\\\\", with: "\u{0}").replacingOccurrences(of: "\u{0}", with: "\\")
+    }
+
     // Only fixed client-discovery paths are written. Never write user IDs,
     // licenses, login cache, tokens, or a value asserting ownership.
-    static func registry(_ text: String, machine: Bool) throws -> String {
+    // - stale: whether a value already there names a Steam client that is not
+    //   on the drive (a C:\ path, unescaped). A Steam emulator shipped with a
+    //   game, or a client removed since, leaves SteamPath / SteamClientDll64
+    //   pointing at a folder without Steam: such a value is replaced (both hives
+    //   keep their .dock-setup-bak copy), and any other differing value is kept.
+    static func registry(_ text: String, machine: Bool, stale: (String) -> Bool = { _ in false }) throws -> String {
         guard text.hasPrefix("WINE REGISTRY Version 2") else { throw Failure.prefixMissing }
         let root = windowsRoot.replacingOccurrences(of: "\\", with: "\\\\")
         let sections: [(String, [(String, String)])] = machine
@@ -164,10 +180,18 @@ enum SteamRuntimeFiles {
                 var additions: [String] = []
                 for (name, value) in values {
                     let prefix = "\"\(name)\"="
-                    let matches = lines[(start + 1)..<end].filter { $0.lowercased().hasPrefix(prefix.lowercased()) }
+                    let found = lines[(start + 1)..<end].indices.filter { lines[$0].lowercased().hasPrefix(prefix.lowercased()) }
                     let expected = prefix + "\"\(value)\""
-                    guard matches.isEmpty || matches == [expected] else { throw Failure.conflict }
-                    if matches.isEmpty { additions.append(expected) }
+                    if found.count == 1, lines[found[0]] != expected, let old = stringValue(lines[found[0]], after: prefix),
+                       stale(old) {
+                        lines[found[0]] = expected
+                        continue
+                    }
+                    guard found.isEmpty || found.map({ lines[$0] }) == [expected] else {
+                        lastConflict = "\(key)\\\(name)"
+                        throw Failure.conflict
+                    }
+                    if found.isEmpty { additions.append(expected) }
                 }
                 lines.insert(contentsOf: additions, at: end)
             } else {
@@ -199,20 +223,24 @@ actor SteamRuntimeInstaller {
             throw SteamRuntimeFiles.Failure.activeSession
         }
         busy = true; defer { busy = false }
+        SteamRuntimeFiles.lastConflict = nil
         let fm = FileManager.default
         // Do not let the template seeder overwrite a preexisting, unstamped
         // registry. Fresh downloads may have created drive_c/steamapps only.
         if !fm.fileExists(atPath: prefix.appendingPathComponent(".update-timestamp").path),
            ["system.reg", "user.reg"].contains(where: { fm.fileExists(atPath: prefix.appendingPathComponent($0).path) }) {
+            SteamRuntimeFiles.lastConflict = "an unstamped registry"
             throw SteamRuntimeFiles.Failure.conflict
         }
         let drive = prefix.appendingPathComponent("drive_c")
         let root = drive.appendingPathComponent(SteamRuntimeFiles.relativeRoot)
         guard root.standardizedFileURL.path == root.resolvingSymlinksInPath().standardizedFileURL.path else {
+            SteamRuntimeFiles.lastConflict = "a linked Steam folder"
             throw SteamRuntimeFiles.Failure.conflict
         }
         // Existing installs are retained; this trial prepares missing files.
         guard !fm.fileExists(atPath: root.appendingPathComponent("steam.exe").path) else {
+            SteamRuntimeFiles.lastConflict = "steam.exe already there"
             throw SteamRuntimeFiles.Failure.conflict
         }
         let stage = fm.temporaryDirectory.appendingPathComponent("madeira-runtime-" + UUID().uuidString)
@@ -255,6 +283,14 @@ actor SteamRuntimeInstaller {
         guard wine_process_is_running() == 0, wineserver_is_running() == 0 else { throw SteamRuntimeFiles.Failure.activeSession }
         madeira_seed_prefix_if_needed(prefix.path)
         // Preflight all destinations and both hives before publishing anything.
+        // A discovery value naming a C:\ folder (or a file in one) without steam.exe
+        // points at no Steam client: an emulator's or a removed client's leftover.
+        let stale: (String) -> Bool = { value in
+            guard value.lowercased().hasPrefix("c:\\") else { return false }
+            var folder = drive.appendingPathComponent(value.dropFirst(3).replacingOccurrences(of: "\\", with: "/"))
+            if [".exe", ".dll"].contains(where: value.lowercased().hasSuffix) { folder.deleteLastPathComponent() }
+            return !fm.fileExists(atPath: folder.appendingPathComponent("steam.exe").path)
+        }
         var pending: [(URL, Data)] = []
         for (file, machine) in [("system.reg", true), ("user.reg", false)] {
             let url = prefix.appendingPathComponent(file)
@@ -262,11 +298,12 @@ actor SteamRuntimeInstaller {
                 throw SteamRuntimeFiles.Failure.conflict
             }
             let text = try String(contentsOf: url, encoding: .utf8)
-            pending.append((url, Data(try SteamRuntimeFiles.registry(text, machine: machine).utf8)))
+            pending.append((url, Data(try SteamRuntimeFiles.registry(text, machine: machine, stale: stale).utf8)))
         }
         for name in files {
             let target = try SteamRuntimeFiles.destination(SteamRuntimeFiles.relativeRoot + "/" + name, under: drive)
             if fm.fileExists(atPath: target.path), !fm.contentsEqual(atPath: target.path, andPath: stage.appendingPathComponent(name).path) {
+                SteamRuntimeFiles.lastConflict = name
                 throw SteamRuntimeFiles.Failure.conflict
             }
         }

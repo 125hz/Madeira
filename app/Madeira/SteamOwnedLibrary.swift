@@ -39,6 +39,17 @@ struct SteamOwnedGame: Codable, Identifiable, Hashable, Sendable {
     /// Steam's launch configuration, for "Start with: The game" (SteamDirectStart);
     /// nil in older caches, which then ask Steam once (SteamOwnedLibrary.launchOptions).
     var launches: [SteamLaunchOption]?
+    /// Steam API language names the game supports and those it has language
+    /// depots for (SteamAppInfo.languages, DepotInfo.language); nil in older caches.
+    var languages: [String]?
+    var depotLanguages: [String]?
+    /// The language-pack depots a Windows install of each language takes.
+    var languageDepots: [String: [Int]]?
+    /// About how much a Windows install downloads and takes on disk
+    /// (SteamAppInfo.downloadSize / installSize); nil in older caches or when
+    /// Steam states no size.
+    var downloadBytes: UInt64?
+    var installBytes: UInt64?
 
     init(_ info: SteamAppInfo) {
         id = Int(info.appID)
@@ -48,6 +59,39 @@ struct SteamOwnedGame: Codable, Identifiable, Hashable, Sendable {
         libraryCapsule = info.libraryCapsule; libraryHero = info.libraryHero; headerImage = info.headerImage
         parentID = info.parentID.map(Int.init)
         launches = info.launches
+        languages = info.languages.sorted()
+        let depotLanguages = Set(info.depots.map { $0.language.lowercased() }.filter { !$0.isEmpty })
+        self.depotLanguages = depotLanguages.sorted()
+        var languageDepots: [String: [Int]] = [:]
+        for language in depotLanguages.prefix(64) {
+            languageDepots[language] = info.installDepots(language: language)
+                .filter { $0.language.lowercased() == language }.map { Int($0.depotID) }
+        }
+        self.languageDepots = languageDepots
+        let download = info.downloadSize(for: "windows"), install = info.installSize(for: "windows")
+        downloadBytes = download > 0 ? download : nil
+        installBytes = install > 0 ? install : nil
+    }
+
+    /// The language to offer on an installed game's page (Download in ...):
+    /// the language an install made now would take, when the record names
+    /// another or lacks one of its language-pack depots (a record whose
+    /// language was edited by hand). Nil when nothing is missing or an older
+    /// cache does not say.
+    func languageToDownload(recorded: String?, installedDepots: Set<Int>) -> String? {
+        guard let wanted = installLanguage else { return nil }
+        if wanted != recorded { return wanted }
+        let needed = Set(languageDepots?[wanted] ?? [])
+        return needed.isSubset(of: installedDepots) ? nil : wanted
+    }
+
+    /// The language an install made now would record (SteamAppInfo.gameLanguage),
+    /// or nil when an older cache does not say.
+    var installLanguage: String? {
+        guard let languages, let depotLanguages else { return nil }
+        let wanted = SteamLanguage.download(for: UInt32(id))
+        if languages.contains(wanted) || depotLanguages.contains(wanted) { return wanted }
+        return "english"
     }
 
     var folderName: String { SteamInstallFiles.safeFolderName(installDir.isEmpty ? "app_\(id)" : installDir) }
@@ -187,7 +231,9 @@ final class SteamOwnedLibrary: ObservableObject {
     static var enabled: Bool { MadeiraDock.enabled && SteamSignIn.flag("MADEIRA_STEAM_LIBRARY", default: true) }
 
     @Published private(set) var signedIn = false
-    @Published private(set) var owned: [SteamOwnedGame] = []
+    @Published private(set) var owned: [SteamOwnedGame] = [] { didSet { ownedRevision &+= 1 } }
+    /// Changes with every write to `owned`, so a reader can keep what it derived from the records.
+    private(set) var ownedRevision = 0
     @Published private(set) var refreshing = false
     @Published private(set) var libraryUpdated: Date?
     /// Steam's playtime and last played, by App ID.
@@ -397,6 +443,10 @@ final class SteamOwnedLibrary: ObservableObject {
     /// `env.MADEIRA_STEAM_CLOUD_AUTO = 0`: compare only; nothing is copied
     /// either way without the user asking on the game's page.
     static var cloudAutomatic: Bool { SteamSignIn.flag("MADEIRA_STEAM_CLOUD_AUTO", default: true) }
+    /// `env.MADEIRA_STEAM_CLOUD_REMOTECACHE = 0`: Valve's client's remotecache.vdf
+    /// is left as the client wrote it, as before SteamRemoteCache.
+    static var cloudRemoteCache: Bool { SteamSignIn.flag("MADEIRA_STEAM_CLOUD_REMOTECACHE", default: true) }
+    private var remoteCacheOffLogged = false
 
     /// Steam Cloud state of the games checked in this app run, by App ID.
     @Published private(set) var cloud: [Int: SteamCloudState] = [:]
@@ -553,6 +603,16 @@ final class SteamOwnedLibrary: ObservableObject {
                 return (audit, elsewhere)
             }.value
             let audit = result.0
+            // Valve's client in a session shows the game only the files its list
+            // names (SteamRemoteCache); not while that client runs.
+            if !Self.cloudRemoteCache {
+                if !remoteCacheOffLogged {
+                    remoteCacheOffLogged = true
+                    SteamLog.event("[steam-cloud] remotecache off (MADEIRA_STEAM_CLOUD_REMOTECACHE=0)")
+                }
+            } else if !inSession, let written = SteamRemoteCache.write(appID: appID, audit: audit, paths: paths) {
+                SteamLog.event("[steam-cloud] app=\(appID) remotecache synced=\(written.synced) device-only=\(written.local) dropped=\(written.dropped) change=\(audit.changeNumber)")
+            }
             let plan = SteamCloudPlan.make(audit: audit, baseline: baseline(appID))
             recordBaseline(appID, settled: plan.settled)
             state.audit = audit; state.conflicts = plan.conflicts; state.checked = Date(); state.phase = .ready
