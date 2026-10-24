@@ -41,7 +41,11 @@ enum MadeiraConfig {
     static func all() -> [String: String] {
         guard let u = url else { return [:] }
         var info = stat()
+        #if os(Linux)   // the host checks compile this file on Linux, where stat has st_mtim
+        let stamp: String = stat(u.path, &info) == 0 ? "\(info.st_mtim.tv_sec).\(info.st_mtim.tv_nsec).\(info.st_size)" : ""
+        #else
         let stamp: String = stat(u.path, &info) == 0 ? "\(info.st_mtimespec.tv_sec).\(info.st_mtimespec.tv_nsec).\(info.st_size)" : ""
+        #endif
         cache.lock.lock()
         defer { cache.lock.unlock() }
         if let hit = cache.value, cache.stamp == stamp { return hit }

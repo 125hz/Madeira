@@ -4,7 +4,9 @@
 //
 // Foundation/CoreGraphics only, so tests/host/check-library-zoom.py compiles it on the host.
 
+#if canImport(CoreGraphics)   // Foundation has the CG types on Linux, where the host checks compile this file
 import CoreGraphics
+#endif
 import Foundation
 
 /// The Photos-style grid zoom's arithmetic. Nothing here knows UIKit: a host hands it the cover widths of its levels,
