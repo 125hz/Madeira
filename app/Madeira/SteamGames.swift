@@ -359,6 +359,10 @@ enum SteamDirectStart {
     @Published private(set) var games: [DockGame] = []
     /// `buildid` of each install in Madeira's own library folder, by App ID.
     @Published private(set) var builds: [Int: Int] = [:]
+    /// The language each of those install records names (`UserConfig.language`).
+    @Published private(set) var languages: [Int: String] = [:]
+    /// The depots each of those install records holds.
+    @Published private(set) var depots: [Int: Set<Int>] = [:]
     private var scanning = false
     /// A refresh was asked for while a scan ran (an install record was just
     /// written): scan again once it ends.
@@ -385,13 +389,16 @@ enum SteamDirectStart {
         let drive = MadeiraDock.drive
         Task.detached(priority: .utility) {
             let found = MadeiraDock.games(drive: drive)
-            var builds: [Int: Int] = [:]
+            var builds: [Int: Int] = [:], languages: [Int: String] = [:], depots: [Int: Set<Int>] = [:]
             for game in found where SteamInstallPaths.isManaged(library: game.library) && game.installed {
-                if let build = SteamInstallFiles.buildID(appID: game.id, steamApps: SteamInstallPaths.steamApps(drive: drive)) {
+                let steamApps = SteamInstallPaths.steamApps(drive: drive)
+                if let build = SteamInstallFiles.buildID(appID: game.id, steamApps: steamApps) {
                     builds[game.id] = build
                 }
+                languages[game.id] = SteamInstallFiles.language(appID: game.id, steamApps: steamApps)
+                depots[game.id] = SteamInstallFiles.depots(appID: game.id, steamApps: steamApps)
             }
-            let recorded = builds
+            let recorded = builds, recordedLanguages = languages, recordedDepots = depots
             await MainActor.run {
                 self.scanning = false
                 let again = self.rescan
@@ -405,6 +412,8 @@ enum SteamDirectStart {
                         UserDefaults.standard.set(data, forKey: Self.snapshotKey)
                     }
                 }
+                if self.languages != recordedLanguages { self.languages = recordedLanguages }
+                if self.depots != recordedDepots { self.depots = recordedDepots }
                 if found.count != self.lastCount {
                     self.lastCount = found.count
                     LogStore.shared.log("[steam-games] installed=\(found.count) ready=\(found.filter(\.installed).count)")
@@ -867,6 +876,41 @@ struct SteamDownloadStatus: View {
     }
 }
 
+// MARK: - Game language
+
+/// Tells the pages that show a game's language that a choice changed
+/// (SteamLanguage keeps the choices).
+final class SteamGameLanguageChoices: ObservableObject {
+    static let shared = SteamGameLanguageChoices()
+
+    @MainActor func choose(_ appID: Int, _ code: String?) {
+        SteamLanguage.chooseForGame(UInt32(appID), code)
+        objectWillChange.send()
+    }
+}
+
+/// Game language on a Steam game's pages: Default follows Settings › Steam ›
+/// Game language; the list is the languages the game supports (all of them
+/// when the cached library does not say).
+struct SteamGameLanguagePicker: View {
+    let appID: Int
+    @ObservedObject private var steam = SteamOwnedLibrary.shared
+    @ObservedObject private var choices = SteamGameLanguageChoices.shared
+
+    var body: some View {
+        let game = steam.game(appID)
+        let supported = Set((game?.languages ?? []) + (game?.depotLanguages ?? []))
+        let current = SteamLanguage.gameChoice(UInt32(appID))
+        let options = SteamLanguage.all.filter { supported.isEmpty || supported.contains($0.code) || $0.code == current }
+        Picker("Game language", selection: Binding(get: { current ?? "" },
+                                                   set: { choices.choose(appID, $0.isEmpty ? nil : $0) })) {
+            Text("Default (\(SteamLanguage.name(SteamLanguage.download)))").tag("")
+            ForEach(options, id: \.code) { Text($0.name).tag($0.code) }
+        }
+        .pickerStyle(.navigationLink)
+    }
+}
+
 // MARK: - Download sheet
 
 /// A game the account owns that is not installed: Install, Pause, Resume and
@@ -918,6 +962,7 @@ struct SteamGameSheet: View {
                         }
                     }
                     Section {
+                        if item.installed == nil { SteamGameLanguagePicker(appID: appID) }
                         if let freeSpace { LabeledContent("Free space on this device", value: formatBytes(freeSpace)) }
                         Text(SteamGameSheet.downloadNote)
                             .font(.footnote).foregroundStyle(.secondary)
@@ -1183,6 +1228,7 @@ struct SteamEntrySection: View {
     @ObservedObject private var dock = MadeiraDockModel.shared
     @ObservedObject private var steam = SteamOwnedLibrary.shared
     @ObservedObject private var games = SteamGamesModel.shared
+    @ObservedObject private var languageChoices = SteamGameLanguageChoices.shared
     @State private var confirmUninstall = false
     @State private var freeSpace: Int64?
     /// "The game": the install folder's programs (the Program picker) and whether
@@ -1248,6 +1294,18 @@ struct SteamEntrySection: View {
             } else if downloads, steam.updateAvailable(appID: appID, installedBuild: games.builds[appID]) {
                 Button { steam.install(appID) } label: { Label("Update available — download", systemImage: "arrow.down.circle") }
                     .disabled(!steam.signedIn)
+            }
+            if managed, let recorded = games.languages[appID] {
+                if downloads { SteamGameLanguagePicker(appID: appID) }
+                LabeledContent("Installed language", value: SteamLanguage.name(recorded))
+                if downloads, download == nil,
+                   let wanted = steam.game(appID)?.languageToDownload(recorded: recorded, installedDepots: games.depots[appID] ?? []) {
+                    Button { steam.repair(appID) } label: {
+                        Label("Download in \(SteamLanguage.name(wanted))", systemImage: "character.bubble")
+                    }.disabled(!steam.signedIn)
+                    Text("Adds the game's \(SteamLanguage.name(wanted)) content and tells Steam to start it in that language. Files of the current language are kept.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
             if downloads, download == nil {
                 Button { steam.repair(appID) } label: { Label("Repair installed files", systemImage: "arrow.triangle.2.circlepath") }
