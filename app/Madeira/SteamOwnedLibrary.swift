@@ -397,6 +397,10 @@ final class SteamOwnedLibrary: ObservableObject {
     /// `env.MADEIRA_STEAM_CLOUD_AUTO = 0`: compare only; nothing is copied
     /// either way without the user asking on the game's page.
     static var cloudAutomatic: Bool { SteamSignIn.flag("MADEIRA_STEAM_CLOUD_AUTO", default: true) }
+    /// `env.MADEIRA_STEAM_CLOUD_REMOTECACHE = 0`: Valve's client's remotecache.vdf
+    /// is left as the client wrote it, as before SteamRemoteCache.
+    static var cloudRemoteCache: Bool { SteamSignIn.flag("MADEIRA_STEAM_CLOUD_REMOTECACHE", default: true) }
+    private var remoteCacheOffLogged = false
 
     /// Steam Cloud state of the games checked in this app run, by App ID.
     @Published private(set) var cloud: [Int: SteamCloudState] = [:]
@@ -529,7 +533,12 @@ final class SteamOwnedLibrary: ObservableObject {
             let audit = result.0
             // Valve's client in a session shows the game only the files its list
             // names (SteamRemoteCache); not while that client runs.
-            if !inSession, let written = SteamRemoteCache.write(appID: appID, audit: audit, paths: paths) {
+            if !Self.cloudRemoteCache {
+                if !remoteCacheOffLogged {
+                    remoteCacheOffLogged = true
+                    SteamLog.event("[steam-cloud] remotecache off (MADEIRA_STEAM_CLOUD_REMOTECACHE=0)")
+                }
+            } else if !inSession, let written = SteamRemoteCache.write(appID: appID, audit: audit, paths: paths) {
                 SteamLog.event("[steam-cloud] app=\(appID) remotecache synced=\(written.synced) device-only=\(written.local) dropped=\(written.dropped) change=\(audit.changeNumber)")
             }
             let plan = SteamCloudPlan.make(audit: audit, baseline: baseline(appID))

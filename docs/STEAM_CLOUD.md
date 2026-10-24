@@ -96,6 +96,8 @@ cloud's change number, one that differs or that only the device has keeps the
 client's entry (or gets the one the client gives a file the game wrote), and
 one that only the cloud has is left out. Log: `[steam-cloud] app=<id>
 remotecache synced=<n> device-only=<n> dropped=<n>`.
+`env.MADEIRA_STEAM_CLOUD_REMOTECACHE = 0` leaves the list as the client wrote
+it, as before; the log says `[steam-cloud] remotecache off` once per app run.
 
 ## Safety
 
