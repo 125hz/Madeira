@@ -104,6 +104,7 @@ require(winios.count('winios_census_note_frame(hwnd, x, y, w, h, visible);') == 
         winios.count('winios_census_note_present(hwnd);') == 1 and winios.count('winios_census_note_metal((HWND)hwnd);') == 1,
         'the census is fed by the frame, GDI flush and swapchain hooks')
 require('#include "Winios.h"' in winios, 'Winios.m includes the header Swift reads the census struct from')
+require('caption: window.caption != 0' in screen, "the census's title bar reaches the rules")
 
 # ------------------------------------------------------------------ 1. Swift
 checks = r'''
@@ -113,9 +114,9 @@ func require(_ condition: @autoclosure () -> Bool, _ label: String) {
     if condition() { print("PASS: " + label) } else { print("FAIL: " + label); failures += 1 }
 }
 var nextHwnd: UInt64 = 0x100
-func window(_ image: String, _ w: Int, _ h: Int, visible: Bool = true, drawn: Bool = true) -> SteamLaunchWindow {
+func window(_ image: String, _ w: Int, _ h: Int, visible: Bool = true, drawn: Bool = true, caption: Bool = false) -> SteamLaunchWindow {
     nextHwnd += 2
-    return SteamLaunchWindow(image: image, width: w, height: h, visible: visible, drawn: drawn, pid: 0x40, hwnd: nextHwnd)
+    return SteamLaunchWindow(image: image, width: w, height: h, visible: visible, drawn: drawn, pid: 0x40, hwnd: nextHwnd, caption: caption)
 }
 
 @main struct Checks {
@@ -171,6 +172,23 @@ func window(_ image: String, _ w: Int, _ h: Int, visible: Bool = true, drawn: Bo
         require(S.decide([window("C:\\Program Files (x86)\\Steam\\a.exe", 200, 100)], rendered: false, places: places).scene == .waiting,
                 "a small client window does not")
         require(S.decide([reporter, game], rendered: false, places: places).scene == .game, "the game's window wins over a client dialog")
+
+        // The game's own message box ("Failed to load il2cpp", 179x114) waits for OK.
+        let gameImage = "\\??\\C:\\Program Files (x86)\\Steam\\steamapps\\common\\Fixture Game\\Game.exe"
+        let box = window(gameImage, 179, 114, caption: true)
+        let boxed = S.decide(before + [box], rendered: false, places: places)
+        require(boxed.scene == .steamWindow && boxed.window == box, "the game's own message box needs the user")
+        require(S.decide(before + [window(gameImage, 179, 114)], rendered: true, places: places).scene == .waiting,
+                "a small game window without a title bar does not (a splash, a tool strip)")
+        require(S.decide([window(gameImage, 179, 114, drawn: false, caption: true)], rendered: true, places: places).scene == .waiting,
+                "an undrawn message box does not, D3D frames or not")
+        require(S.decide([window(gameImage, 179, 114, visible: false, caption: true)], rendered: false, places: places).scene == .waiting,
+                "a hidden message box does not")
+        require(S.decide([window("\\??\\C:\\windows\\system32\\conhost.exe", 179, 114, caption: true)], rendered: false, places: places).scene == .waiting,
+                "a helper's captioned window does not")
+        require(S.decide([box, game], rendered: false, places: places).scene == .game, "the game's window wins over its message box")
+        let both = S.decide([reporter, box], rendered: false, places: places)
+        require(both.scene == .steamWindow && both.window == reporter, "the first window that may need the user is the one logged")
 
         // One-time installs run before the host starts: their windows are never the game's.
         let setup = window("C:\\Program Files (x86)\\Steam\\steamapps\\common\\Fixture Game\\_CommonRedist\\setup.exe", 480, 360)
@@ -428,6 +446,7 @@ int main(int argc, char **argv) {
     CHECK(g && !strcmp(g->image, "c:\\games\\pid68\\game68.exe") && g->visible && g->shown_once, "game window owner, shown once");
     CHECK(find(hidden, n) && !find(hidden, n)->visible, "a hidden window is not shown");
     CHECK(u && u->image[0] == 0 && u->pid == 0x99, "an unreadable owner stays empty");
+    CHECK(d->caption && !g->caption && find(game2, n)->caption, "the title bar (WS_CAPTION) is read from the style");
     CHECK(image_queries == 3, "one path lookup per process");
 
     /* Born minimized: first shown minimized, never shown before. */
@@ -456,6 +475,13 @@ int main(int argc, char **argv) {
     n = winios_window_census(out, WINIOS_CENSUS_MAX);
     CHECK(n == 5 && !find(game, n) && find(game2, n), "destroyed windows leave");
     CHECK(winios_window_census(out, 2) == 2, "copy is bounded by the caller");
+
+    /* A game's message box, with the style of a device log's "Fatal error" box. */
+    HWND box = add(0x204, 0x94c801c4, 1, 0x44);
+    winios_census_note_frame(box, 614, 267, 179, 114, 1);
+    n = winios_window_census(out, WINIOS_CENSUS_MAX);
+    CHECK(find(box, n) && find(box, n)->visible && find(box, n)->caption && find(box, n)->w == 179 && find(box, n)->h == 114,
+          "a message box is listed with its title bar");
 
     for (unsigned long i = 0; i < 80; i++) winios_census_note_frame(add(0x1000 + i, 0x84000000, 1, 0x44), 0, 0, 10, 10, 1);
     n = winios_window_census(out, WINIOS_CENSUS_MAX);

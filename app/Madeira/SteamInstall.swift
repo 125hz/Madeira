@@ -37,6 +37,21 @@ enum SteamInstallFiles {
         return state["buildid"]?.string.flatMap { Int($0) }
     }
 
+    /// The language the install record states (`UserConfig.language`), or nil.
+    static func language(appID: Int, steamApps: URL) -> String? {
+        guard let state = record(appID: appID, steamApps: steamApps),
+              let language = state["UserConfig"]?["language"]?.string, !language.isEmpty else { return nil }
+        return language.lowercased()
+    }
+
+    /// The depots the install record holds: its own (`InstalledDepots`) and
+    /// those shared from other apps (`SharedDepots`).
+    static func depots(appID: Int, steamApps: URL) -> Set<Int> {
+        guard let state = record(appID: appID, steamApps: steamApps) else { return [] }
+        let keys = Array((state["InstalledDepots"]?.fields ?? [:]).keys) + Array((state["SharedDepots"]?.fields ?? [:]).keys)
+        return Set(keys.prefix(512).compactMap { Int($0) })
+    }
+
     /// The install size the record states (`SizeOnDisk`, bytes), or nil.
     static func sizeOnDisk(appID: Int, steamApps: URL) -> Int64? {
         guard let state = record(appID: appID, steamApps: steamApps),

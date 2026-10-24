@@ -393,7 +393,8 @@ struct SteamCloudDownloadInfo: Sendable {
 
     var url: URL? {
         guard !host.isEmpty, !host.contains("/"), !host.contains("@") else { return nil }
-        return URL(string: (https ? "https://" : "http://") + host + (path.hasPrefix("/") ? path : "/" + path))
+        // Saves and request headers always go over TLS, whatever use_https says.
+        return URL(string: "https://" + host + (path.hasPrefix("/") ? path : "/" + path))
     }
 }
 
@@ -481,6 +482,145 @@ enum SteamCloudTransfer {
         if time > 0 {
             try? manager.setAttributes([.modificationDate: Date(timeIntervalSince1970: TimeInterval(time))], ofItemAtPath: url.path)
         }
+    }
+}
+
+// MARK: - Valve's client's file list
+
+/// madeira-bcd: userdata/<account>/<app>/remotecache.vdf, the list of an
+/// app's Steam Cloud API files that Valve's client in a Madeira Dock session
+/// answers ISteamRemoteStorage from. That client syncs an app only at its
+/// "init" (the launch download never runs: Madeira starts the game itself), and
+/// an init with no list deletes the file and leaves the list empty. So the
+/// files Madeira downloaded into `remote` were invisible to the game: Slay the
+/// Spire 2 saw no saves, started a new profile and wrote it over the
+/// downloaded progress.save, which the next sync then uploaded as a change
+/// made on this device (cloud_log.txt: only "Starting sync (init,)" for the
+/// app; remotecache.vdf: ChangeNumber 0 and the two files the game wrote).
+///
+/// After each comparison, while no session runs, the list is rewritten from
+/// what is on the device: a file identical to the cloud's is listed as synced
+/// (syncstate 1) at the cloud's change number; a file that differs or that only
+/// the device has keeps the client's entry, or gets the one the client gives a
+/// file the game wrote (syncstate 3); a file only the cloud has is left out.
+/// Entries for files not under `remote` (AutoCloud roots) are kept as they are.
+/// Foundation only.
+enum SteamRemoteCache {
+    typealias Fields = [(key: String, value: String)]
+
+    struct List: Equatable {
+        var appID = ""
+        var header: Fields = []
+        var files: [(name: String, fields: Fields)] = []
+
+        static func == (a: List, b: List) -> Bool {
+            func same(_ x: Fields, _ y: Fields) -> Bool { x.elementsEqual(y) { $0.key == $1.key && $0.value == $1.value } }
+            return a.appID == b.appID && same(a.header, b.header)
+                && a.files.elementsEqual(b.files) { $0.name == $1.name && same($0.fields, $1.fields) }
+        }
+    }
+
+    private enum Token: Equatable { case text(String), open, close }
+
+    private static func tokens(_ text: String) -> [Token] {
+        var out: [Token] = []
+        var chars = Array(text)[...]
+        while let char = chars.popFirst() {
+            switch char {
+            case "{": out.append(.open)
+            case "}": out.append(.close)
+            case "\"":
+                var value = ""
+                while let c = chars.popFirst(), c != "\"" {
+                    if c == "\\", let next = chars.popFirst() { value.append(next) } else { value.append(c) }
+                }
+                out.append(.text(value))
+            default: continue
+            }
+        }
+        return out
+    }
+
+    /// The flat two-level layout the client writes: "app" { "Key" "value" ... "file" { "key" "value" ... } }.
+    static func parse(_ text: String) -> List? {
+        var t = tokens(text)[...]
+        guard case .text(let app)? = t.popFirst(), t.popFirst() == .open else { return nil }
+        var list = List(appID: app)
+        while let token = t.popFirst() {
+            guard case .text(let key) = token else { return token == .close ? list : nil }
+            switch t.popFirst() {
+            case .text(let value)?: list.header.append((key, value))
+            case .open?:
+                var fields: Fields = []
+                while let inner = t.popFirst(), inner != .close {
+                    guard case .text(let k) = inner, case .text(let v)? = t.popFirst() else { return nil }
+                    fields.append((k, v))
+                }
+                list.files.append((key, fields))
+            default: return nil
+            }
+        }
+        return nil   // no closing brace
+    }
+
+    static func format(_ list: List) -> String {
+        func quoted(_ s: String) -> String { "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\"" }
+        var out = quoted(list.appID) + "\n{\n"
+        for field in list.header { out += "\t" + quoted(field.key) + "\t\t" + quoted(field.value) + "\n" }
+        for file in list.files {
+            out += "\t" + quoted(file.name) + "\n\t{\n"
+            for field in file.fields { out += "\t\t" + quoted(field.key) + "\t\t" + quoted(field.value) + "\n" }
+            out += "\t}\n"
+        }
+        return out + "}\n"
+    }
+
+    /// Rewrites the app's list from a comparison. Returns the counts written,
+    /// or nil when there is nothing to write (no `remote` files, or no change).
+    static func write(appID: Int, audit: SteamCloudAudit, paths: SteamCloudPaths) -> (synced: Int, local: Int, dropped: Int)? {
+        let url = paths.remoteFolder.deletingLastPathComponent().appendingPathComponent("remotecache.vdf")
+        let remote = audit.entries.filter { SteamCloudPaths.split($0.path).root == nil }
+        let existing = (try? String(contentsOf: url, encoding: .utf8)).flatMap(parse)
+        guard !remote.isEmpty || existing != nil else { return nil }
+        var list = existing ?? List()
+        list.appID = String(appID)
+        func setHeader(_ key: String, _ value: String) {
+            if let at = list.header.firstIndex(where: { $0.key == key }) { list.header[at].value = value } else { list.header.append((key, value)) }
+        }
+        setHeader("ChangeNumber", String(audit.changeNumber))
+        if !list.header.contains(where: { $0.key == "OSType" }) { setHeader("OSType", "0") }
+        func at(_ name: String) -> Int? { list.files.firstIndex { $0.name.caseInsensitiveCompare(name) == .orderedSame } }
+        func isRemote(_ fields: Fields) -> Bool { (fields.first { $0.key == "root" }?.value ?? "0") == "0" }
+        var synced = 0, local = 0, dropped = 0
+        for entry in remote {
+            let index = at(entry.path)
+            if let index, !isRemote(list.files[index].fields) { continue }
+            switch entry.kind {
+            case .same:
+                let fields: Fields = [("root", "0"), ("size", String(entry.localSize)), ("localtime", String(entry.localTime)),
+                                      ("time", String(entry.cloudTime)), ("remotetime", String(entry.cloudTime)),
+                                      ("sha", SteamCloudPlan.hex(entry.localSHA)), ("syncstate", "1"),
+                                      ("persiststate", "0"), ("platformstosync2", "-1")]
+                if let index { list.files[index] = (list.files[index].name, fields) } else { list.files.append((entry.path, fields)) }
+                synced += 1
+            case .differ, .localOnly:
+                if index == nil {
+                    list.files.append((entry.path, [("root", "0"), ("size", String(entry.localSize)), ("localtime", String(entry.localTime)),
+                                                    ("time", String(entry.localTime)), ("remotetime", "0"),
+                                                    ("sha", SteamCloudPlan.hex(entry.localSHA)), ("syncstate", "3"),
+                                                    ("persiststate", "0"), ("platformstosync2", "-1")]))
+                }
+                local += 1
+            case .cloudOnly:
+                if let index { list.files.remove(at: index); dropped += 1 }
+            }
+        }
+        guard list != existing else { return nil }
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(format(list).utf8).write(to: url, options: .atomic)
+        } catch { return nil }
+        return (synced, local, dropped)
     }
 }
 
@@ -609,7 +749,8 @@ struct SteamCloudUploadBlock: Sendable {
 
     var url: URL? {
         guard !host.isEmpty, !host.contains("/"), !host.contains("@") else { return nil }
-        return URL(string: (https ? "https://" : "http://") + host + (path.hasPrefix("/") ? path : "/" + path))
+        // Saves and request headers always go over TLS, whatever use_https says.
+        return URL(string: "https://" + host + (path.hasPrefix("/") ? path : "/" + path))
     }
 }
 

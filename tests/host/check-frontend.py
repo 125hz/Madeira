@@ -110,6 +110,7 @@ enum ProMotionIntent {
 struct TouchControl: Codable, Equatable { var nx = 0.5 }
 enum ControlAction: Codable, Equatable, Hashable { case none }   // LibraryEntry.controllerBinds
 enum GamepadInput { static let keyboardMouseAvailable = true }   // LibraryEntry's per-game DirectInput choice
+struct GestureZone: Codable, Identifiable, Equatable { var id = UUID() }   // LibraryEntry.zones (GestureZones.swift)
 enum LibraryError: LocalizedError { case message(String) }
 func env(_ name: String) -> String? { getenv(name).map { String(cString: $0) } }
 '''
@@ -549,7 +550,7 @@ check('ResolutionChoices.metalFX(in: groups)' in detail and 'entry.metalFXUpscal
       'game details: the MetalFX 1.5× screen shape while MetalFX 1.5× is chosen (or saved), not also as "saved"')
 reset = block(model, 'private func resetPhoneResolution(')
 check('resetPhoneResolution()' in block(model, 'private init()') and 'ResolutionChoices.fills(1408, 648)' in reset
-      and 'madeira.ml1172.resolution-reset' in reset and 'guard persist(next) else { return }' in reset,
+      and 'madeira.ml1172.resolution-reset' in reset and 'guard persist(next, wait: true) else { return }' in reset,
       'ml1172: 1408x648 entries are reset once on a screen of another shape')
 check('ResolutionChoices.groups()' in block(content, 'private var resolutionPicker') and 'DesktopResolution' not in content,
       'ml1172: the developer Resolution menu shows the same choices')

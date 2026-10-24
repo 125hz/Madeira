@@ -86,6 +86,24 @@ file is written whole.
    - synced before and now missing in the cloud (deleted elsewhere): left
      alone, not sent back.
 
+## Valve's client's file list
+
+Files a game writes through the Steam Cloud API live in Steam's
+`userdata/<account>/<app>/remote`, and Valve's client in a Madeira Dock
+session shows the game only those its `remotecache.vdf` lists. That client
+never downloads for the game (Madeira starts the game itself, so the launch
+sync does not run), and with no list it answers that there are no saves:
+Slay the Spire 2 then started a new profile over the progress Madeira had
+downloaded, and that new profile was uploaded as a change made on the device.
+So after every comparison, while no session runs, Madeira rewrites the list
+from the device: a file identical to the cloud's is listed as synced at the
+cloud's change number, one that differs or that only the device has keeps the
+client's entry (or gets the one the client gives a file the game wrote), and
+one that only the cloud has is left out. Log: `[steam-cloud] app=<id>
+remotecache synced=<n> device-only=<n> dropped=<n>`.
+`env.MADEIRA_STEAM_CLOUD_REMOTECACHE = 0` leaves the list as the client wrote
+it, as before; the log says `[steam-cloud] remotecache off` once per app run.
+
 ## Safety
 
 - A downloaded file is checked against the SHA-1 in Steam's list before

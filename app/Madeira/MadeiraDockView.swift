@@ -75,7 +75,8 @@ final class MadeiraDockModel: ObservableObject {
                 SteamLog.event("[dock-setup] client components ready")
             } catch {
                 self.error = error.localizedDescription
-                SteamLog.event("[dock-setup] client components failed")
+                SteamLog.event("[dock-setup] client components failed: \(error.localizedDescription)"
+                               + (SteamRuntimeFiles.lastConflict.map { " (at \($0))" } ?? ""))
             }
             preparing = false
             refresh()
