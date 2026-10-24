@@ -713,6 +713,22 @@ static int ios_thread_registry_reclaim( void )
     return -1;
 }
 
+static int ios_thread_registry_reuse_enabled( void )
+{
+    static int enabled = -1;
+    int v = __atomic_load_n( &enabled, __ATOMIC_ACQUIRE );
+
+    if (v < 0)
+    {
+        /* On by default. MADEIRA_THREAD_REUSE=0 never gives a full thread registry's exited or purged entries to new threads (a session again registers 512 threads at most). */
+        const char *e = getenv( "MADEIRA_THREAD_REUSE" );
+
+        v = !(e && e[0] == '0');
+        __atomic_store_n( &enabled, v, __ATOMIC_RELEASE );
+    }
+    return v;
+}
+
 /* Register a thread's port, TEB and trampoline; returns its entry, or -1.
  *
  * ml384: replace an existing entry for the same port first — the kernel
@@ -723,7 +739,8 @@ static int ios_thread_registry_reclaim( void )
  * over the session's life, not 512 at once: a WoW64 game that keeps starting
  * and ending worker threads got there within minutes with a few dozen alive
  * (#397), and every later thread resolved to the slot-0 TEB.  A full registry
- * now gives the new thread an entry ios_thread_registry_reclaim finds free. */
+ * now gives the new thread an entry ios_thread_registry_reclaim finds free;
+ * MADEIRA_THREAD_REUSE=0 turns that off. */
 static int ios_thread_registry_add( thread_t pe_thread, uintptr_t teb, void *trampoline )
 {
     int idx, reg_count;
@@ -746,7 +763,7 @@ static int ios_thread_registry_add( thread_t pe_thread, uintptr_t teb, void *tra
     }
     else if (reg_count < IOS_MAX_WINE_THREADS)
         idx = __sync_fetch_and_add(&ios_thread_count, 1);
-    else if ((idx = ios_thread_registry_reclaim()) >= 0)
+    else if (ios_thread_registry_reuse_enabled() && (idx = ios_thread_registry_reclaim()) >= 0)
     {
         static unsigned int reused;
 
@@ -758,9 +775,13 @@ static int ios_thread_registry_add( thread_t pe_thread, uintptr_t teb, void *tra
         __sync_synchronize();
     }
     else
-        ERR("[thread-registry] FULL (%d slots, none free) — thread 0x%x teb=%p NOT registered; "
+    {
+        ERR("[thread-registry] FULL (%d slots, %s) — thread 0x%x teb=%p NOT registered; "
             "Mach events on it will resolve to the slot-0 TEB (wrong process!)\n",
-            IOS_MAX_WINE_THREADS, pe_thread, (void *)teb);
+            IOS_MAX_WINE_THREADS, ios_thread_registry_reuse_enabled() ? "none free" : "MADEIRA_THREAD_REUSE=0",
+            pe_thread, (void *)teb);
+        idx = -1;
+    }
     if (idx >= 0)
     {
         ios_thread_registry[idx].teb = teb;

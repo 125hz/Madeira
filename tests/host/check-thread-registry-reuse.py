@@ -7,12 +7,13 @@ Wine runs.
 ("[thread-registry] FULL (512 slots)" after idx=511); every later thread
 resolved to the slot-0 TEB and the process died on a wrong thread context.
 Compiles from build/ntdll-unix/signal_arm64_ios.c the registry and its writers
-(ios_thread_registry_add, _reclaim, _purge_range, _range_busy,
+(ios_thread_registry_add, _reclaim, _reuse_enabled, _purge_range, _range_busy,
 ios_thread_port_gone) and ios_lookup_thread, with a fake thread_info that knows
 which fake threads are alive, and checks:
   - 4000 threads over the session's life with at most 40 alive all register and
-    each resolves to its own TEB; with the reclaim taken out, the same run
-    reproduces the report: thread 512 is not registered and resolves to slot 0;
+    each resolves to its own TEB; with MADEIRA_THREAD_REUSE=0 (the kill switch),
+    the same run reproduces the report: thread 512 is not registered and
+    resolves to slot 0;
   - a full registry of live threads still refuses (FULL), and displaces none;
   - entry 0 (the lookup's fallback) and an exited thread's entry whose TEB still
     carries a FEX lock stamp are kept; an entry purged with its guest window and
@@ -46,6 +47,7 @@ functions = '\n'.join(body(s) for s in (
     'static int ios_thread_port_gone( thread_t port )',
     'int ios_thread_registry_range_busy( uintptr_t base, uintptr_t size )',
     'static int ios_thread_registry_reclaim( void )',
+    'static int ios_thread_registry_reuse_enabled( void )',
     'static int ios_thread_registry_add( thread_t pe_thread, uintptr_t teb, void *trampoline )',
     'static int ios_lookup_thread(thread_t mach_thread, uintptr_t *teb_out, void **tramp_out)',
 ))
@@ -53,8 +55,8 @@ setup = body('static void ios_setup_mach_exception_handler( thread_t pe_thread, 
              '                                               void *trampoline )')
 assert 'int idx = ios_thread_registry_add( pe_thread, teb, trampoline );' in setup
 assert 'ios_thread_registry[' not in setup, 'registration writes the registry only through ios_thread_registry_add'
-reclaim_call = 'else if ((idx = ios_thread_registry_reclaim()) >= 0)'
-assert functions.count(reclaim_call) == 1
+assert functions.count('ios_thread_registry_reclaim()') == 1
+assert 'else if (ios_thread_registry_reuse_enabled() && (idx = ios_thread_registry_reclaim()) >= 0)' in functions
 
 harness = r'''
 #include <assert.h>
@@ -113,7 +115,7 @@ static kern_return_t mach_port_mod_refs(mach_port_t task, thread_t port, int rig
     __atomic_add_fetch(&mod_refs_calls, 1, __ATOMIC_RELAXED);
     return KERN_SUCCESS;
 }
-static unsigned long full_lines, reuse_lines, replace_lines;
+static unsigned long full_lines, reuse_lines, replace_lines, switch_off_lines;
 static void fake_err(const char *format, ...)
 {
     char line[512];
@@ -122,6 +124,8 @@ static void fake_err(const char *format, ...)
     vsnprintf(line, sizeof(line), format, ap);
     va_end(ap);
     if (strstr(line, "] FULL (")) __atomic_add_fetch(&full_lines, 1, __ATOMIC_RELAXED);
+    if (strstr(line, "] FULL (") && strstr(line, "MADEIRA_THREAD_REUSE=0"))
+        __atomic_add_fetch(&switch_off_lines, 1, __ATOMIC_RELAXED);
     if (strstr(line, "] REUSE #")) __atomic_add_fetch(&reuse_lines, 1, __ATOMIC_RELAXED);
     if (strstr(line, "] REPLACE idx=")) __atomic_add_fetch(&replace_lines, 1, __ATOMIC_RELAXED);
 }
@@ -137,7 +141,7 @@ static void reset(void)
     ios_thread_count = 0;
     memset(thread_state, 0, sizeof(thread_state));
     memset(teb_pool, 0, sizeof(teb_pool));
-    full_lines = reuse_lines = replace_lines = 0;
+    full_lines = reuse_lines = replace_lines = switch_off_lines = 0;
 }
 static int entry_of(thread_t port)
 {
@@ -184,8 +188,8 @@ static void churn(int with_reclaim)
     else
     {
         assert(first_failed == IOS_MAX_WINE_THREADS && failed == TOTAL - (IOS_MAX_WINE_THREADS - 1));
-        assert(misresolved && full_lines == failed);
-        printf("PASS: without the reclaim the same run reproduces #397: thread %u is not registered, "
+        assert(misresolved && full_lines == failed && switch_off_lines == failed && !reuse_lines);
+        printf("PASS: with MADEIRA_THREAD_REUSE=0 the same run reproduces #397: thread %u is not registered, "
                "%u threads unregistered, %u lookups resolved to the slot-0 TEB\n",
                first_failed, failed, misresolved);
     }
@@ -289,6 +293,7 @@ static void concurrent(void)
 int main(int argc, char **argv)
 {
     assert(argc == 2);
+    assert(ios_thread_registry_reuse_enabled() == atoi(argv[1]));
     if (atoi(argv[1])) { churn(1); edges(); concurrent(); }
     else churn(0);
     return 0;
@@ -297,12 +302,13 @@ int main(int argc, char **argv)
 
 with tempfile.TemporaryDirectory(prefix='madeira-thread-registry-') as directory:
     temp = Path(directory)
-    for fixed in (True, False):
-        text = harness if fixed else harness.replace(reclaim_call, 'else if ((idx = -1) >= 0)')
-        unit = temp / 'registry.c'
-        exe = temp / ('fixed' if fixed else 'no-reclaim')
-        unit.write_text(text)
-        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra', '-Werror',
-                        '-Wno-unused-function', '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
-                        str(unit), '-pthread', '-o', str(exe)], check=True)
-        subprocess.run([str(exe), str(int(fixed))], check=True)
+    unit = temp / 'registry.c'
+    exe = temp / 'registry'
+    unit.write_text(harness)
+    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra', '-Werror',
+                    '-Wno-unused-function', '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
+                    str(unit), '-pthread', '-o', str(exe)], check=True)
+    env = {k: v for k, v in os.environ.items() if k != 'MADEIRA_THREAD_REUSE'}
+    for value, reuse in ((None, 1), ('1', 1), ('0', 0)):
+        run_env = dict(env, **({'MADEIRA_THREAD_REUSE': value} if value is not None else {}))
+        subprocess.run([str(exe), str(reuse)], env=run_env, check=True)
