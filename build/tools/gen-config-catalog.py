@@ -632,6 +632,14 @@ OVERLAY = {
                         "games that open many files a second (Horizon Zero Dawn's shader cache in its menu). "
                         "Off (default): realpath as before. Read at each launch; a later game of the same app run does not "
                         "inherit it."},
+    # madeira-bcd: one default keyed event per guest process (build/ntdll-unix/loader_ios.c).
+    "env.MADEIRA_KEYED_EVENT_PER_PROCESS": {"category": "Wine core (ntdll)", "title": "A default keyed event per process",
+                "kind": "bool", "default": "1",
+                "sources": ["build/ntdll-unix/loader_ios.c"],
+                "note": "On (default): each Windows process gets its own keyed event for the waits and wakes that "
+                        "pass no handle (RtlRunOnce among them), created on first use. 0: every "
+                        "process uses the one the first process created, as before, whose handle is not valid in the "
+                        "others (Slay the Spire 2 failed in RtlRunOnceComplete). Read once per app run."},
     "env.MADEIRA_SRV_DIRECT": {"category": "Wine server", "title": "Run simple server requests on the calling thread",
                 "kind": "text", "default": "0",
                 "choices": [("", "Off (default)"), ("1", "Files, handles, registry, events, semaphores"),
