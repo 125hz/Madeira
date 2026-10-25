@@ -380,6 +380,52 @@ enum GameRecommendations {
         avx: false, nvidia: true, wineVCRT: false, fastSync: true, semaphoreFastPath: true, fpsMode: 4,
         display: "fit", smallRAMConfig: smallRAMSwapLines)
 
+    /// Grand Theft Auto IV from Steam (App ID 12210, the Complete Edition): a
+    /// 32-bit game behind the same publisher launcher as GTA V (PlayGTAIV.exe
+    /// starts Launcher.exe, which starts GTAIV.exe), so it takes the launcher
+    /// chain's lines from the GTA V Legacy list and none of GTA V's graphics
+    /// lines: the service manager in the Dock session, the Dock holding the
+    /// session for Launcher.exe and GTAIV.exe, pure-x64 images uncopied, the
+    /// browser helper's address-space layout, the crash handler and the
+    /// vc_redist re-run refused, and the emulator's code buffers below the
+    /// window (pool-low). Logs of 2026-10-24 (vk-1024-4): without pool-low the
+    /// chain's eleven pseudo-processes held 423 MB of a 567 MB JIT pool in DLL
+    /// copies, the helper's renderer thread got a 16 MB code buffer and
+    /// recompiled four million blocks while the sign-in page never painted. A
+    /// 32-bit game also needs its 4 GB guest window late in the session, when
+    /// the helper's reservations have taken most of the map: 2 GB of margin
+    /// instead of 8. Not yet played through; from Steam only.
+    static let gta4Steam = GameRecommendation(
+        id: "gta4-steam", title: "Grand Theft Auto IV (Steam)", version: 1,
+        config: """
+        # Madeira's recommended settings for Grand Theft Auto IV (Steam).
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        pool-low = 1
+        pool-page-fit = 1
+        pool-split = 1
+        env.FEX_VECTORTSOENABLED = 0
+        env.MADEIRA_DOCK_GAME_SCM = 1
+        env.MADEIRA_DOCK_KEEP_ALIVE = Launcher.exe;GTAIV.exe
+        env.MADEIRA_EXECREQ_LEAVE = 1
+        env.MADEIRA_LOCK_ORPHAN = stamped
+        env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
+        env.MADEIRA_POOL_LOW_IMAGES = 1
+        env.MADEIRA_POOL_RECYCLE_IMAGES = 1
+        env.MADEIRA_SC_PA_POOLS = 2
+        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;.be\\vc_redist
+        env.MADEIRA_TOUCH_MOUSE = 1
+        env.MADEIRA_WOW_MIN_FREE_GB = 2
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.DXMT_SMALL_RINGS = Launcher.exe;SocialClubHelper.exe
+        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        fastSync: true, semaphoreFastPath: true, display: "fit")
+
     /// GTA V Enhanced started from its own PlayGTAV.exe outside a Steam
     /// library (Rockstar Games Launcher or another store; build 451). Version 2:
     /// the same orphan-lock reaper mode as the Steam copy (its launcher and
@@ -784,8 +830,8 @@ enum GameRecommendations {
     /// Legacy's list.
     static let smallRAMSwapLines = "swap-mb = 3072"
 
-    static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, gta5LegacySteam, ghostOfTsushima, godOfWar,
-                      horizonZeroDawn, horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered, crysis2Remastered,
+    static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, gta5LegacySteam, gta4Steam, ghostOfTsushima,
+                      godOfWar, horizonZeroDawn, horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered, crysis2Remastered,
                       crysis3Remastered, standard]
 
     // MARK: Recognising a game
@@ -796,6 +842,8 @@ enum GameRecommendations {
                crysis3RemasteredAppID = 2096610, horizonForbiddenWestAppID = 2420110, ratchetClankRiftApartAppID = 1895880
     /// GTA V Legacy, the edition every Steam copy of GTA V also carries.
     static let gta5LegacyAppID = 271590
+    /// Grand Theft Auto IV: The Complete Edition.
+    static let gta4AppID = 12210
 
     /// The recommendation for a game, or nil.
     /// - windowsPath: a program ("C:\Games\GoW\GoW.exe"), or a library Steam
@@ -814,6 +862,7 @@ enum GameRecommendations {
             if steamAppID == rdr2AppID || installFolder == "red dead redemption 2" { return rdr2Steam }
             if steamAppID == gta5EnhancedAppID || installFolder == "grand theft auto v enhanced" { return gta5EnhancedSteam }
             if steamAppID == gta5LegacyAppID || installFolder == "grand theft auto v" { return gta5LegacySteam }
+            if steamAppID == gta4AppID || installFolder == "grand theft auto iv" { return gta4Steam }
             if steamAppID == ghostAppID || installFolder == "ghost of tsushima director's cut"
                 || installFolder == "ghost of tsushima" { return ghostOfTsushima }
             if steamAppID == godOfWarAppID || installFolder == "godofwar" || installFolder == "god of war" { return godOfWar }
@@ -845,6 +894,9 @@ enum GameRecommendations {
         case "gta5.exe":
             // GTA V Legacy's game program, from Steam only.
             return inSteam ? gta5LegacySteam : nil
+        case "playgtaiv.exe", "launchgtaiv.exe", "gtaiv.exe":
+            // Grand Theft Auto IV's launcher stub and game program, from Steam only.
+            return inSteam ? gta4Steam : nil
         case "rdr2.exe", "playrdr2.exe":
             return inSteam ? rdr2Steam : rdr2Other
         case "ghostoftsushima.exe":
