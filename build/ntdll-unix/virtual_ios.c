@@ -21427,8 +21427,161 @@ static void ios_swap_free_add( uint64_t off, uint64_t len )
     if (ios_swap_nfree < 8192) { ios_swap_free[ios_swap_nfree].off = off; ios_swap_free[ios_swap_nfree].len = len; ios_swap_nfree++; }
     else ios_swap_free_drop++;   /* leaked offset space: later backings may be refused, never wrong */
 }
+/* ml1150: DONOR POOL, the tier's first stage (2026-09-29 extension experiment,
+ * app/Madeira/MemoryHostTest.m runs 2-6). Memory OWNED by another task is
+ * billed to that task's phys_footprint, and once the owner has exited, to
+ * nobody. The app starts its MadeiraMemoryHost extension, which creates owned
+ * regions without touching them, hands their memory entries over and exits;
+ * madeira_donor_pool_add() registers them here. A tier range is mapped from a pool
+ * region while the guard allows it, else from the file as before. Measured on
+ * the iPhone 18 Pro: 14.5 GB of 2:1-compressible data held and verified on an
+ * 11.5 GB phone, footprint +5 MB, reads at full speed after compression; but
+ * running the SYSTEM out of pages kills Madeira (memory-vmpage-shortage). The
+ * guard therefore stops taking pool memory when iOS reports memory pressure
+ * (madeira_donor_pool_set_pressure from a dispatch source in the app) or when free
+ * RAM falls below MADEIRA_DONOR_POOL_MARGIN_MB (default 256 since ml2020; the first
+ * port's 1024 refused 12 of 13 takes on device, 2026-10-12). Already-mapped pool
+ * ranges stay where they are; moving them to the file under pressure is not
+ * done yet. A freed pool range is zeroed with MADV_ZERO through a private
+ * window onto the region, so a recommit reads zero like a punched file hole.
+ * Pool offsets carry IOS_DONOR_FLAG so the extent table needs no new field.
+ *
+ * ml1151 (local): the free list is kept sorted by offset and neighbours are
+ * merged on insert, never across a region boundary, the way MeloNX's RAM donor
+ * keeps its free ranges; a list that filled up used to count freed bytes as
+ * lost. Best fit still walks the list; a taken range that empties its entry
+ * is removed in place so the order holds. */
+#define IOS_DONOR_FLAG (1ull << 63)
+#define IOS_DONOR_MAX_REGIONS 128
+#define IOS_DONOR_MAX_FREE 4096
+#ifdef __APPLE__
+extern kern_return_t mach_vm_map( vm_map_t, mach_vm_address_t *, mach_vm_size_t, mach_vm_offset_t, int,
+                                  mem_entry_name_port_t, memory_object_offset_t, boolean_t, vm_prot_t, vm_prot_t, vm_inherit_t );
+static struct { mach_port_t entry; char *window; uint64_t bump; } ios_donor_reg[IOS_DONOR_MAX_REGIONS];
+static unsigned ios_donor_nreg;               /* published with release ordering by madeira_donor_pool_add */
+static uint64_t ios_donor_region;             /* every region's size (the first one sets it) */
+static struct { uint64_t off, len; } ios_donor_free[IOS_DONOR_MAX_FREE];   /* sorted by off, no two adjacent in a region */
+static unsigned ios_donor_nfree;
+static int ios_donor_pressure;                /* 0 normal, 1 warning, 2 critical */
+static uint64_t ios_donor_margin = 256ull << 20;   /* ml2020: was 1024, which kept the pool off on device (free RAM is rarely that high) */
+static unsigned long long ios_donor_bytes, ios_donor_peak, ios_donor_takes, ios_donor_guarded, ios_donor_lost, ios_donor_merges;
+
+/* Called by the app (DonorPool.m) before Wine starts, one region at a time. */
+int madeira_donor_pool_add( unsigned int entry, unsigned long long size )
+{
+    mach_vm_address_t window = 0;
+    unsigned n = __atomic_load_n( &ios_donor_nreg, __ATOMIC_ACQUIRE );
+    const char *margin = getenv( "MADEIRA_DONOR_POOL_MARGIN_MB" );
+    if (n >= IOS_DONOR_MAX_REGIONS || !size || (ios_donor_region && size != ios_donor_region)) return -1;
+    if (mach_vm_map( mach_task_self(), &window, size, 0, VM_FLAGS_ANYWHERE, entry, 0, FALSE,
+                     VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE ) != KERN_SUCCESS) return -1;
+    if (margin) ios_donor_margin = strtoull( margin, NULL, 10 ) << 20;
+    ios_donor_region = size;
+    ios_donor_reg[n].entry = entry; ios_donor_reg[n].window = (char *)window; ios_donor_reg[n].bump = 0;
+    __atomic_store_n( &ios_donor_nreg, n + 1, __ATOMIC_RELEASE );
+    if (n == 0) dprintf( 2, "[swap] ml1150 donor pool: regions of %llu MB, guard margin %llu MB\n", size >> 20,
+                         (unsigned long long)(ios_donor_margin >> 20) );
+    return 0;
+}
+void madeira_donor_pool_set_pressure( int level )
+{
+    __atomic_store_n( &ios_donor_pressure, level, __ATOMIC_RELAXED );
+    dprintf( 2, "[swap] ml1150 donor pool: memory pressure %s; %llu MB in use\n",
+             level >= 2 ? "CRITICAL" : level ? "warning" : "normal", ios_donor_bytes >> 20 );
+}
+static uint64_t ios_donor_system_free( void )
+{
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64( mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &count ) != KERN_SUCCESS) return 0;
+    return (uint64_t)vm.free_count * vm_kernel_page_size;
+}
+/* ml1151: insert [off, off+len) into the sorted free list, merging with the
+ * neighbours it touches when they lie in the same region. */
+static void ios_donor_free_insert( uint64_t off, uint64_t len )
+{
+    const uint64_t r = off / ios_donor_region;
+    unsigned i = 0;
+    while (i < ios_donor_nfree && ios_donor_free[i].off < off) i++;
+    if (i && ios_donor_free[i - 1].off + ios_donor_free[i - 1].len == off && ios_donor_free[i - 1].off / ios_donor_region == r)
+    {
+        i--;
+        ios_donor_free[i].len += len;
+        ios_donor_merges++;
+    }
+    else
+    {
+        if (ios_donor_nfree >= IOS_DONOR_MAX_FREE) { ios_donor_lost += len; return; }
+        memmove( &ios_donor_free[i + 1], &ios_donor_free[i], (ios_donor_nfree - i) * sizeof(ios_donor_free[0]) );
+        ios_donor_free[i].off = off; ios_donor_free[i].len = len;
+        ios_donor_nfree++;
+    }
+    if (i + 1 < ios_donor_nfree && ios_donor_free[i].off + ios_donor_free[i].len == ios_donor_free[i + 1].off
+        && ios_donor_free[i + 1].off / ios_donor_region == r)
+    {
+        ios_donor_free[i].len += ios_donor_free[i + 1].len;
+        memmove( &ios_donor_free[i + 1], &ios_donor_free[i + 2], (ios_donor_nfree - i - 2) * sizeof(ios_donor_free[0]) );
+        ios_donor_nfree--;
+        ios_donor_merges++;
+    }
+}
+/* A pool offset for len bytes inside one region, or -1 (the guard, or no room). */
+static uint64_t ios_donor_take( size_t len )
+{
+    unsigned i, best = ~0u, n = __atomic_load_n( &ios_donor_nreg, __ATOMIC_ACQUIRE );
+    if (!n || len > ios_donor_region) return (uint64_t)-1;
+    if (__atomic_load_n( &ios_donor_pressure, __ATOMIC_RELAXED ) || ios_donor_system_free() < ios_donor_margin)
+    {
+        ios_donor_guarded++;
+        return (uint64_t)-1;
+    }
+    for (i = 0; i < ios_donor_nfree; i++)
+        if (ios_donor_free[i].len >= len && (best == ~0u || ios_donor_free[i].len < ios_donor_free[best].len)) best = i;
+    if (best != ~0u)
+    {
+        uint64_t off = ios_donor_free[best].off;
+        if (ios_donor_free[best].len > len) { ios_donor_free[best].off += len; ios_donor_free[best].len -= len; }
+        else
+        {   /* ml1151: remove in place; the list stays sorted */
+            memmove( &ios_donor_free[best], &ios_donor_free[best + 1], (ios_donor_nfree - best - 1) * sizeof(ios_donor_free[0]) );
+            ios_donor_nfree--;
+        }
+        return off;
+    }
+    for (i = 0; i < n; i++)
+        if (ios_donor_reg[i].bump + len <= ios_donor_region)
+        {
+            uint64_t off = (uint64_t)i * ios_donor_region + ios_donor_reg[i].bump;
+            ios_donor_reg[i].bump += len;
+            return off;
+        }
+    return (uint64_t)-1;
+}
+static int ios_donor_map( char *va, size_t len, int unix_prot, uint64_t off )
+{
+    mach_vm_address_t addr = (mach_vm_address_t)va;
+    unsigned r = (unsigned)(off / ios_donor_region);
+    /* PROT_READ/PROT_WRITE have the VM_PROT values */
+    return mach_vm_map( mach_task_self(), &addr, len, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, ios_donor_reg[r].entry,
+                        off % ios_donor_region, FALSE, unix_prot & (VM_PROT_READ | VM_PROT_WRITE),
+                        VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE ) == KERN_SUCCESS ? 0 : -1;
+}
+static void ios_donor_give( uint64_t off, size_t len )
+{
+    unsigned r = (unsigned)(off / ios_donor_region);
+    madvise( ios_donor_reg[r].window + off % ios_donor_region, len, MADV_ZERO );
+    ios_donor_bytes -= len;
+    ios_donor_free_insert( off, len );
+}
+#else
+static uint64_t ios_donor_take( size_t len ) { (void)len; return (uint64_t)-1; }
+static int ios_donor_map( char *va, size_t len, int unix_prot, uint64_t off ) { (void)va; (void)len; (void)unix_prot; (void)off; return -1; }
+static void ios_donor_give( uint64_t off, size_t len ) { (void)off; (void)len; }
+static unsigned long long ios_donor_bytes, ios_donor_peak, ios_donor_takes, ios_donor_guarded, ios_donor_lost, ios_donor_merges;
+#endif
 static void ios_swap_give( uint64_t off, size_t len )
 {
+    if (off & IOS_DONOR_FLAG) { ios_donor_give( off & ~IOS_DONOR_FLAG, len ); return; }   /* ml1150 */
     struct fpunchhole ph;
     memset( &ph, 0, sizeof(ph) );
     ph.fp_offset = (off_t)off; ph.fp_length = (off_t)len;
@@ -21568,6 +21721,20 @@ static int ios_swap_map( void *base, size_t size, int unix_prot )
     /* ml1257: in broad the cap is the disk the sparse file really occupies */
     if (ios_swap_broad && ios_swap_disk_used() >= ios_swap_cap) { ios_swap_disk_refused++; ios_swap_refused++; return IOS_SW_REFUSED; }
     len = he - hs;
+    off = ios_donor_take( len );   /* ml1150: the donor pool first, while the guard allows */
+    if (off != (uint64_t)-1)
+    {
+        if (!ios_donor_map( hs, len, unix_prot, off ))
+        {
+            off |= IOS_DONOR_FLAG;
+            ios_donor_bytes += len; if (ios_donor_bytes > ios_donor_peak) ios_donor_peak = ios_donor_bytes;
+            ios_donor_takes++;
+            p = hs;
+            goto mapped;
+        }
+        ios_donor_give( off, len );
+        ios_donor_bytes += len;   /* give subtracts */
+    }
     off = ios_swap_take( len );
     if (off == (uint64_t)-1) { ios_swap_refused++; return IOS_SW_REFUSED; }
     p = mmap( hs, len, unix_prot, MAP_FIXED | MAP_SHARED, ios_swap_fd, (off_t)off );
@@ -21578,6 +21745,7 @@ static int ios_swap_map( void *base, size_t size, int unix_prot )
         ios_swap_give( off, len );
         return IOS_SW_MAPFAIL;
     }
+mapped:
     ios_swap_ext[ios_swap_n].va = hs; ios_swap_ext[ios_swap_n].len = len; ios_swap_ext[ios_swap_n].off = off;
     ios_swap_ext[ios_swap_n].resv = 0; ios_swap_ext[ios_swap_n].key = size; ios_swap_ext[ios_swap_n].img = 0;
     ios_swap_ext[ios_swap_n].born = ios_swap_broad ? ios_swap_now_ns() : 0; ios_swap_n++;
@@ -21756,6 +21924,9 @@ void ios_swap_stats_line( void )
     if (ios_swap_img_backs || ios_swap_img_refused)   /* madeira-bcd swap-images */
         dprintf( 2, "[swap] swap-images: %llu MB of image sections in the file (peak %llu), %llu sections moved, %llu refused\n",
                  ios_swap_img_bytes >> 20, ios_swap_img_peak >> 20, ios_swap_img_backs, ios_swap_img_refused );
+    if (ios_donor_takes || ios_donor_guarded)
+        dprintf( 2, "[swap] ml1150 donor pool: %llu MB in use (peak %llu), %llu takes, %llu guarded, %llu MB lost to a full free list, %llu merges\n",
+                 ios_donor_bytes >> 20, ios_donor_peak >> 20, ios_donor_takes, ios_donor_guarded, ios_donor_lost >> 20, ios_donor_merges );
     /* ml1221: the census (bytes by reason) with every stats line, ~10 s, not only
      * after its own 30 s: Ori and the Will of the Wisps was jetsammed at 26 s and never printed one. */
     ios_swap_tick( 1 );

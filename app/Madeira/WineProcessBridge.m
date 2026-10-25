@@ -1584,6 +1584,16 @@ static void *wine_process_thread(void *arg) {
                         }
                         LOG("ml1077 swap tier armed: %{public}s, %ld MB", swapPath.UTF8String, capMB);
                         fprintf(stderr, "[swap] ml1077 app: backing file %s, cap %ld MB\n", swapPath.UTF8String, capMB);
+                        /* ml1150: donor pool, the tier's first stage (DonorPool.m). donor-pool-kind = ledger (default) |
+                         * purgeable chooses how the extension creates the memory (the A/B of ml1152). */
+                        long poolMB = (long)madeira_cfg_int("donor-pool-mb", 0);   /* madeira.cfg donor-pool-mb = N */
+                        if (poolMB >= 512) {
+                            char poolKind[32] = "";
+                            madeira_cfg_get("donor-pool-kind", poolKind, sizeof poolKind);   /* madeira.cfg donor-pool-kind = ledger | purgeable */
+                            extern long MadeiraDonorPoolStart(long megabytes, int purgeable);
+                            long got = MadeiraDonorPoolStart(poolMB, strcmp(poolKind, "purgeable") == 0);
+                            LOG("ml1150 donor pool: %ld of %ld MB (%s)", got, poolMB, poolKind[0] ? poolKind : "ledger");
+                        }
                     }
                 }
             }
