@@ -200,6 +200,48 @@ enum DockGameSession {
         return parts.first == "microsoft"
     }
 
+    // MARK: - A 32-bit program behind a 64-bit launcher
+
+    /// Folder and file names that mark a redistributable or installer rather than a game's
+    /// own program: a 32-bit setup in a game's folder must not hold a guest window.
+    static let redistributableMarks = ["redist", "installer", "setup", "dxsetup", "vc_", "vcredist", "dotnet", "directx",
+                                       "unins", "physx", "_commonredist"]
+
+    static func isRedistributable(_ name: String) -> Bool {
+        let lower = name.lowercased()
+        return redistributableMarks.contains { lower.contains($0) }
+    }
+
+    /// Whether the game's folder holds a 32-bit program of its own (PE machine 0x14c), two
+    /// levels deep, redistributables and installers left out. A 64-bit launcher chain that
+    /// starts such a program needs a 4 GB guest window late in the session, when the launcher's
+    /// browser helper has taken most of the map; the app then has ntdll hold one placeholder at
+    /// session start (`MADEIRA_WOW_HOLD_WINDOWS=1`, virtual_ios.c ios_wow_session_start).
+    /// `machine` reads a file's PE machine (DockInstallers.machine in production).
+    static func has32BitProgram(in folder: URL, machine: (URL) -> UInt16?, limit: Int = 400) -> Bool {
+        let fm = FileManager.default
+        var queue: [(URL, Int)] = [(folder, 0)]
+        var seen = 0
+        while let (dir, depth) = queue.first {
+            queue.removeFirst()
+            guard let items = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.isDirectoryKey],
+                                                          options: [.skipsHiddenFiles]) else { continue }
+            for item in items {
+                seen += 1
+                if seen > limit { return false }
+                let name = item.lastPathComponent
+                let isDir = (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+                if isDir {
+                    if depth < 1, !isRedistributable(name) { queue.append((item, depth + 1)) }
+                    continue
+                }
+                guard name.lowercased().hasSuffix(".exe"), !isRedistributable(name) else { continue }
+                if machine(item) == 0x14c { return true }
+            }
+        }
+        return false
+    }
+
     /// Whether this session runs under server sync instead of madsync because it starts the
     /// service manager. `MADEIRA_DOCK_GAME_SCM_SERVER_SYNC=0` keeps madsync.
     static func serverSyncOff(_ decision: Decision, madsyncConfigured: Bool) -> Bool {

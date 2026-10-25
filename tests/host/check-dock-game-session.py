@@ -34,6 +34,13 @@ check(re.search(r'setenv\("MADEIRA_DOCK_GAME_SCM", \w+\.exported, 1\)', content)
 check('DockGameSession.serverSyncOff(' in content and 'DockInstallers.madsyncConfigured' in content,
       'madsync is turned off for a session that starts the service manager')
 check('thirdPartyInstalls: DockInstallers.thirdPartyInstalls' in content, "the game's third-party install-script programs feed the decision")
+check('DockGameSession.has32BitProgram(in: gameFolder, machine: DockInstallers.machine)' in content
+      and 'setenv("MADEIRA_WOW_HOLD_WINDOWS", "1", 1)' in content and 'unsetenv("MADEIRA_WOW_HOLD_WINDOWS")' in content,
+      'a Dock game with a 32-bit program of its own has ntdll hold one guest-window placeholder; every other start clears it')
+ntdll = (ROOT / 'build/ntdll-unix/virtual_ios.c').read_text(encoding='utf-8', errors='replace')
+check(re.search(r'getenv\( "MADEIRA_WOW_HOLD_WINDOWS" \);\s*/\* N:', ntdll) is not None
+      and 'want = hold_n > IOS_WOW_MAX_WINDOWS ? IOS_WOW_MAX_WINDOWS : (unsigned)hold_n;' in ntdll,
+      'ntdll reads MADEIRA_WOW_HOLD_WINDOWS at session start, bounded by the window registry')
 installers = (ROOT / 'app/Madeira/DockInstallers.swift').read_text(encoding='utf-8')
 check('DockGameSession.isMicrosoftKey(' in installers and 'thirdPartyInstalls = 0' in installers,
       'DockInstallers counts the non-Microsoft records and resets the count at every prepare')
@@ -57,7 +64,7 @@ check(re.search(r'getenv\("MADEIRA_DOCK_GAME_SCM"\)[^\n]*//', session) is not No
 catalog = ROOT / 'app/Madeira/ConfigCatalog.generated.swift'
 if catalog.exists():
     text = catalog.read_text(encoding='utf-8')
-    for key in ['env.MADEIRA_DOCK_GAME_SCM', 'env.MADEIRA_DOCK_GAME_SCM_SERVER_SYNC']:
+    for key in ['env.MADEIRA_DOCK_GAME_SCM', 'env.MADEIRA_DOCK_GAME_SCM_SERVER_SYNC', 'env.MADEIRA_WOW_HOLD_WINDOWS']:
         check(f'key: "{key}"' in text, f'the config catalog documents {key}')
 host_launch = ROOT / 'madeira-dock/src/launch.c'
 if host_launch.exists():
@@ -224,6 +231,37 @@ expect(!S.decide(prefix: dir.appendingPathComponent("missing"), gameConfig: nil)
 expect(S.decide(prefix: dir.appendingPathComponent("missing"), gameConfig: nil, thirdPartyInstalls: 1).on, "unless the game's install script recorded a third-party program")
 expect(S.decide(prefix: dir.appendingPathComponent("missing"), gameConfig: nil, thirdPartyInstalls: -3).installs == 0, "a negative count reads as none")
 try? FileManager.default.removeItem(at: dir)
+
+// a 32-bit program of the game's own, behind a 64-bit launcher: a synthetic folder of tiny PE files
+func pe(_ url: URL, machine: UInt16) {
+    var bytes = [UInt8](repeating: 0, count: 64)
+    bytes[0] = 0x4d; bytes[1] = 0x5a; bytes[60] = 64
+    bytes += [0x50, 0x45, 0, 0, UInt8(machine & 0xff), UInt8(machine >> 8)] + [UInt8](repeating: 0, count: 10)
+    try! Data(bytes).write(to: url)
+}
+let readMachine: (URL) -> UInt16? = { url in
+    guard let d = try? Data(contentsOf: url), d.count >= 70, d[0] == 0x4d, d[1] == 0x5a else { return nil }
+    return UInt16(d[68]) | UInt16(d[69]) << 8
+}
+let game = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("madeira-dock-32bit-\(getpid())", isDirectory: true)
+try? FileManager.default.removeItem(at: game)
+try! FileManager.default.createDirectory(at: game.appendingPathComponent("Installers"), withIntermediateDirectories: true)
+try! FileManager.default.createDirectory(at: game.appendingPathComponent("bin/deep"), withIntermediateDirectories: true)
+pe(game.appendingPathComponent("PlayGame.exe"), machine: 0x8664)
+pe(game.appendingPathComponent("Installers/vc_redist.x86.exe"), machine: 0x14c)
+pe(game.appendingPathComponent("DXSETUP.exe"), machine: 0x14c)
+pe(game.appendingPathComponent("bin/deep/Game32.exe"), machine: 0x14c)
+expect(!S.has32BitProgram(in: game, machine: readMachine), "a 64-bit program, a 32-bit redistributable and a 32-bit setup are not a 32-bit game program (depth 2 excluded)")
+pe(game.appendingPathComponent("bin/Game32.exe"), machine: 0x14c)
+expect(S.has32BitProgram(in: game, machine: readMachine), "a 32-bit program one folder down is")
+try? FileManager.default.removeItem(at: game.appendingPathComponent("bin/Game32.exe"))
+pe(game.appendingPathComponent("Game.exe"), machine: 0x14c)
+expect(S.has32BitProgram(in: game, machine: readMachine), "a 32-bit program at the top is")
+expect(!S.has32BitProgram(in: game, machine: readMachine, limit: 0), "the scan is bounded (a limit of 0 looks at nothing)")
+expect(!S.has32BitProgram(in: game.appendingPathComponent("missing"), machine: readMachine), "a missing folder has none")
+expect(S.isRedistributable("vc_redist.x64.exe") && S.isRedistributable("_CommonRedist") && S.isRedistributable("unins000.exe") && !S.isRedistributable("Game.exe"),
+       "the redistributable marks")
+try? FileManager.default.removeItem(at: game)
 
 // madsync
 expect(S.serverSyncOff(auto, madsyncConfigured: true), "madsync configured and the manager on: this session runs server sync")

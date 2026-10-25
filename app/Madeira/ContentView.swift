@@ -3478,6 +3478,17 @@ struct ContentView: View {
             setenv("MADEIRA_DOCK_GAME_SCM", scm.exported, 1)
             logStore.log(scm.logLine)
             let scmServerSync = DockGameSession.serverSyncOff(scm, madsyncConfigured: DockInstallers.madsyncConfigured)
+            // ml2020: a 32-bit program behind a 64-bit launcher chain needs its 4 GB guest window
+            // late in the session, when the launcher's browser helper has taken most of the map
+            // (two device runs found no slot). ntdll holds one placeholder at session start.
+            // env.MADEIRA_WOW_HOLD_WINDOWS in madeira.cfg or the game's file, exported after this, wins.
+            let gameFolder = MadeiraDock.drive.appendingPathComponent(game.library + "/common/" + game.installDir, isDirectory: true)
+            if DockGameSession.has32BitProgram(in: gameFolder, machine: DockInstallers.machine) {
+                setenv("MADEIRA_WOW_HOLD_WINDOWS", "1", 1)
+                logStore.log("[dock-wow] the game's folder holds a 32-bit program: one guest-window placeholder is held from session start (MADEIRA_WOW_HOLD_WINDOWS=1)")
+            } else {
+                unsetenv("MADEIRA_WOW_HOLD_WINDOWS")
+            }
             // Only a start that runs installers, or one that starts the service manager, turns
             // madsync off, for its own session (build/madsync/madsync.c reads
             // MADEIRA_MADSYNC_SESSION once, when the server starts).
