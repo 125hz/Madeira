@@ -10204,19 +10204,23 @@ static ULONG_PTR ios_wow_window_covering( const void *start, const void *end )
     return 0;
 }
 
-static int ios_wow_limits_in_window( ULONG_PTR low, ULONG_PTR high );
-
 /* map_reserved_area_inner: may a request with these limits take space in the
  * reserved area [start, end)? Not when the area is a window or placeholder and
  * the request is not constrained to the caller's own window. */
 static int ios_wow_reserved_area_open( const void *start, const void *end, const void *limit_low, const void *limit_high )
 {
-    ULONG_PTR wb;
+    ULONG_PTR wb, lo = (ULONG_PTR)limit_low, hi = (ULONG_PTR)limit_high;
 
     if (!ios_wow_window_keep_enabled()) return 1;
     if (!ios_wow_window_count && !ios_wow_placeholder_count) return 1;
     if (!(wb = ios_wow_window_covering( start, end ))) return 1;
-    return wb == ios_wow_base() && ios_wow_limits_in_window( (ULONG_PTR)limit_low, (ULONG_PTR)limit_high );
+    /* A request confined to this window is the window's own: ios_wow_translate_limits
+     * puts a 32-bit process's bounds inside its window, and nothing else asks with
+     * such bounds. map_view passes its end exclusive (limit_high + 1), which is the
+     * window's end for a whole-window request such as the boot PEB (device logs
+     * 2026-10-25: "windowed PEB alloc returned 0xc0000017" when this asked
+     * ios_wow_limits_in_window, whose test is strict), so the test is containment. */
+    return lo >= wb && hi > lo && hi <= wb + IOS_WOW_WINDOW_SIZE + ios_wow_guard_size();
 }
 
 /* map_fixed_area: a fixed map into a window or placeholder by a process that
