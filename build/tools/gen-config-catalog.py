@@ -446,6 +446,8 @@ OVERLAY = {
     "donor-pool-kind": {"category": "Memory & JIT pool", "title": "Donor pool memory kind", "kind": "choice",
                 "note": "ml1152: how the extension creates each donated region. ledger (the default): a named memory entry tagged to the extension's ledger. purgeable: a purgeable allocation in the extension named by a memory entry (the way MeloNX donates RAM). Everything else in the tier is the same, so the two can be compared.",
                 "choices": [("", "Ledger-tagged entry (default)"), ("purgeable", "Purgeable allocation")]},
+    "env.MADEIRA_DONOR_WINDOWS": {"category": "Memory & JIT pool", "title": "Donor pool: permanent region windows", "kind": "bool", "default": "0",
+                "note": "ml2021: 1 maps every donated region into the address space when it is registered, as the first port did. Off (the default) maps only the range being freed, for its zeroing: the permanent windows were placed before Wine held the 32-bit guest-window slot and took it, so 32-bit programs failed at guest-window-reserve."},
     "env.MADEIRA_DONOR_POOL_MARGIN_MB": {"category": "Memory & JIT pool", "title": "Donor pool free-RAM margin (MB)",
                 "note": "ml1150: the donor pool takes no more regions while the system's free RAM is below this many MB (default 256; the 1024 of the first port kept the pool off on device, free RAM is rarely that high)."},
     "swap-mb": { "note": "Moves game data to a file on this device's storage when memory runs short, up to this size. Off by default; read at launch.", "category": "Memory & JIT pool","title": "Swap tier size", "kind": "choice",

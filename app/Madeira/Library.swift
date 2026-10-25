@@ -4992,7 +4992,7 @@ struct LibraryHUD: View {
                 Divider()
                 Toggle("Performance overlay", isOn: $model.performance)
                 if model.performance {
-                    ForEach(["FPS", "Frame time", "CPU", "GPU", "RAM", "Battery", "Thermal"], id: \.self) { field in
+                    ForEach(["FPS", "Frame time", "CPU", "GPU", "RAM", "Swap & donor", "Battery", "Thermal"], id: \.self) { field in
                         Toggle(field, isOn: Binding(get: { model.overlayFields.contains(field) }, set: { on in
                             model.overlayFields.removeAll { $0 == field }; if on { model.overlayFields.append(field) }
                         })).font(.subheadline)
@@ -5076,6 +5076,13 @@ struct LibraryMetrics: View {
     @State private var lastGPUBuffers: UInt64 = 0
     @State private var gpu = -1.0
     @State private var gpuFrameMs = 0.0
+    /// ml2021: the swap tier's figures (madeira_swap_overlay_stats): MB backed by the
+    /// swap file, MB served from the donor pool, the pool's registered size, and the
+    /// takes its free-RAM guard refused.
+    @State private var swapFileMB = 0
+    @State private var donatedMB = 0
+    @State private var donorPoolMB = 0
+    @State private var donorGuarded = 0
     private let ticks = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     var body: some View {
         Text(parts.joined(separator: "  ·  "))
@@ -5101,6 +5108,11 @@ struct LibraryMetrics: View {
                     thermal = state
                 }
                 if model.overlayFields.contains("CPU") { cpu = cpuMeter.sample() }
+                if model.overlayFields.contains("Swap & donor") {
+                    var file: UInt64 = 0, donated: UInt64 = 0, pool: UInt64 = 0, guarded: UInt64 = 0
+                    madeira_swap_overlay_stats(&file, &donated, &pool, &guarded)
+                    swapFileMB = Int(file); donatedMB = Int(donated); donorPoolMB = Int(pool); donorGuarded = Int(guarded)
+                }
                 if model.overlayFields.contains("GPU") {
                     let busy = madeira_gpu_meter_busy_seconds(), buffers = madeira_gpu_meter_cmdbufs()
                     let used = max(0, busy - lastGPUBusy)
@@ -5128,6 +5140,15 @@ struct LibraryMetrics: View {
             else { result.append(String(format: "GPU %.0f%%", gpu)) }
         }
         if model.overlayFields.contains("RAM") { result.append("\(memory) MB") }
+        if model.overlayFields.contains("Swap & donor") {
+            // RAM above is the app's own footprint; donated memory is billed to the
+            // extension's ledger, so it is shown beside it rather than added to it.
+            if donorPoolMB > 0 {
+                result.append(donorGuarded > 0 ? "Donated \(donatedMB)/\(donorPoolMB) MB (\(donorGuarded) guarded)"
+                                               : "Donated \(donatedMB)/\(donorPoolMB) MB")
+            }
+            result.append("Swap \(swapFileMB) MB")
+        }
         if model.overlayFields.contains("Battery"), battery >= 0 { result.append("\(battery)%") }
         if model.overlayFields.contains("Thermal") {
             switch thermal {

@@ -21442,9 +21442,19 @@ static void ios_swap_free_add( uint64_t off, uint64_t len )
  * RAM falls below MADEIRA_DONOR_POOL_MARGIN_MB (default 256 since ml2020; the first
  * port's 1024 refused 12 of 13 takes on device, 2026-10-12). Already-mapped pool
  * ranges stay where they are; moving them to the file under pressure is not
- * done yet. A freed pool range is zeroed with MADV_ZERO through a private
- * window onto the region, so a recommit reads zero like a punched file hole.
+ * done yet. A freed pool range is zeroed with MADV_ZERO through a mapping of the
+ * region, so a recommit reads zero like a punched file hole.
  * Pool offsets carry IOS_DONOR_FLAG so the extent table needs no new field.
+ *
+ * ml2021: no permanent region windows. The first port mapped every region
+ * (512 MB each) VM_FLAGS_ANYWHERE when the app registered it, which is before
+ * Wine starts and before ios_wow_session_start holds the 32-bit guest-window
+ * placeholder; on device the kernel put the eight windows at 0x71e01a4000..
+ * 0x72e01a4000, straight across the only free 4 GB-aligned slot (0x7200000000),
+ * so every 32-bit program failed at 'guest-window-reserve' (logs 67-69). A
+ * give now maps just the freed range for the madvise and unmaps it again
+ * (under virtual_mutex, like every fixed-address decision in this file).
+ * MADEIRA_DONOR_WINDOWS=1 restores the permanent windows.
  *
  * ml1151 (local): the free list is kept sorted by offset and neighbours are
  * merged on insert, never across a region boundary, the way MeloNX's RAM donor
@@ -21472,15 +21482,19 @@ int madeira_donor_pool_add( unsigned int entry, unsigned long long size )
     mach_vm_address_t window = 0;
     unsigned n = __atomic_load_n( &ios_donor_nreg, __ATOMIC_ACQUIRE );
     const char *margin = getenv( "MADEIRA_DONOR_POOL_MARGIN_MB" );
+    const char *windows = getenv( "MADEIRA_DONOR_WINDOWS" );   /* 1: a permanent ANYWHERE window per region (default off since ml2021: the windows took the 32-bit guest-window slot) */
+    int permanent = windows && windows[0] == '1';
     if (n >= IOS_DONOR_MAX_REGIONS || !size || (ios_donor_region && size != ios_donor_region)) return -1;
-    if (mach_vm_map( mach_task_self(), &window, size, 0, VM_FLAGS_ANYWHERE, entry, 0, FALSE,
-                     VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE ) != KERN_SUCCESS) return -1;
+    if (permanent && mach_vm_map( mach_task_self(), &window, size, 0, VM_FLAGS_ANYWHERE, entry, 0, FALSE,
+                                  VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE ) != KERN_SUCCESS) return -1;
     if (margin) ios_donor_margin = strtoull( margin, NULL, 10 ) << 20;
     ios_donor_region = size;
-    ios_donor_reg[n].entry = entry; ios_donor_reg[n].window = (char *)window; ios_donor_reg[n].bump = 0;
+    ios_donor_reg[n].entry = entry; ios_donor_reg[n].window = permanent ? (char *)window : NULL; ios_donor_reg[n].bump = 0;
     __atomic_store_n( &ios_donor_nreg, n + 1, __ATOMIC_RELEASE );
-    if (n == 0) dprintf( 2, "[swap] ml1150 donor pool: regions of %llu MB, guard margin %llu MB\n", size >> 20,
-                         (unsigned long long)(ios_donor_margin >> 20) );
+    if (n == 0) dprintf( 2, "[swap] ml1150 donor pool: regions of %llu MB, guard margin %llu MB; %s\n", size >> 20,
+                         (unsigned long long)(ios_donor_margin >> 20),
+                         permanent ? "permanent region windows (MADEIRA_DONOR_WINDOWS=1)"
+                                   : "ml2021 no permanent region windows (a give maps the freed range for its zeroing)" );
     return 0;
 }
 void madeira_donor_pool_set_pressure( int level )
@@ -21569,7 +21583,23 @@ static int ios_donor_map( char *va, size_t len, int unix_prot, uint64_t off )
 static void ios_donor_give( uint64_t off, size_t len )
 {
     unsigned r = (unsigned)(off / ios_donor_region);
-    madvise( ios_donor_reg[r].window + off % ios_donor_region, len, MADV_ZERO );
+    if (ios_donor_reg[r].window) madvise( ios_donor_reg[r].window + off % ios_donor_region, len, MADV_ZERO );
+    else
+    {   /* ml2021: a window onto the freed range only, for as long as the zeroing takes */
+        mach_vm_address_t tmp = 0;
+        if (mach_vm_map( mach_task_self(), &tmp, len, 0, VM_FLAGS_ANYWHERE, ios_donor_reg[r].entry, off % ios_donor_region, FALSE,
+                         VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE ) == KERN_SUCCESS)
+        {
+            madvise( (void *)tmp, len, MADV_ZERO );
+            mach_vm_deallocate( mach_task_self(), tmp, len );
+        }
+        else
+        {
+            static int said;
+            if (said++ < 4) dprintf( 2, "[swap] ml2021 donor pool: no window for zeroing %zu bytes at pool offset %llu; the range is reused unzeroed\n",
+                                     len, (unsigned long long)off );
+        }
+    }
     ios_donor_bytes -= len;
     ios_donor_free_insert( off, len );
 }
@@ -21579,6 +21609,23 @@ static int ios_donor_map( char *va, size_t len, int unix_prot, uint64_t off ) { 
 static void ios_donor_give( uint64_t off, size_t len ) { (void)off; (void)len; }
 static unsigned long long ios_donor_bytes, ios_donor_peak, ios_donor_takes, ios_donor_guarded, ios_donor_lost, ios_donor_merges;
 #endif
+/* ml2021: the performance overlay's view of the tier (Library.swift "Swap & donor"): MB
+ * backed by the swap file, MB served from the donor pool, the pool's registered size, and
+ * the takes the guard refused. Plain reads of the counters; a torn read shows a stale
+ * number for one tick, nothing more. */
+void madeira_swap_overlay_stats( unsigned long long *file_mb, unsigned long long *donor_mb, unsigned long long *donor_pool_mb,
+                                 unsigned long long *donor_guarded )
+{
+    unsigned long long total = ios_swap_bytes, donor = ios_donor_bytes;
+    if (file_mb) *file_mb = (total > donor ? total - donor : 0) >> 20;
+    if (donor_mb) *donor_mb = donor >> 20;
+    if (donor_guarded) *donor_guarded = ios_donor_guarded;
+#ifdef __APPLE__
+    if (donor_pool_mb) *donor_pool_mb = ((unsigned long long)__atomic_load_n( &ios_donor_nreg, __ATOMIC_ACQUIRE ) * ios_donor_region) >> 20;
+#else
+    if (donor_pool_mb) *donor_pool_mb = 0;
+#endif
+}
 static void ios_swap_give( uint64_t off, size_t len )
 {
     if (off & IOS_DONOR_FLAG) { ios_donor_give( off & ~IOS_DONOR_FLAG, len ); return; }   /* ml1150 */

@@ -31,6 +31,10 @@ uint64_t madeira_frame_count(void);
 // ml1174: GPU busy time for the performance overlay (winemetal_unix.c). While
 // enabled, each committed command buffer adds its GPU time (union) on completion.
 void madeira_gpu_meter_enable(int on);
+/// ml2021: swap tier figures for the performance overlay (virtual_ios.c): file-backed MB,
+/// MB served from the donor pool, the pool's registered size, takes the guard refused.
+void madeira_swap_overlay_stats(unsigned long long *file_mb, unsigned long long *donor_mb, unsigned long long *donor_pool_mb,
+                                unsigned long long *donor_guarded);
 double madeira_gpu_meter_busy_seconds(void);
 uint64_t madeira_gpu_meter_cmdbufs(void);
 // ml1098: ask the D3D12 runtime to capture the next N frames (winemetal_unix.c)
