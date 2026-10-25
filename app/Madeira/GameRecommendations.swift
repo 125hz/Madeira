@@ -847,9 +847,13 @@ enum GameRecommendations {
     /// updater, iDeck's finding), and the swap tier with the donor pool so the web
     /// helper's idle pages leave the footprint. No release delay: the client's
     /// allocator reserves, releases and reserves again (the standard list dropped it
-    /// for Madeira Dock's "Loading Steam"). Not yet run on device.
+    /// for Madeira Dock's "Loading Steam"). Version 2 (log 83, 2026-10-25): the win32
+    /// client's steam.exe and its web helper are 32-bit programs, one 4 GB guest window
+    /// each; the second was refused for the default 8 GB of spare address space
+    /// (`refused: map too small`), so the margin is the launcher chain's 2 GB and the
+    /// session holds every window slot from the start.
     static let steamBigPicture = GameRecommendation(
-        id: "steam-big-picture", title: "Steam Big Picture", version: 1,
+        id: "steam-big-picture", title: "Steam Big Picture", version: 2,
         config: """
         # Madeira's recommended settings for Steam Big Picture.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -868,6 +872,8 @@ enum GameRecommendations {
         env.MADEIRA_LOCK_ORPHAN = stamped
         env.MADEIRA_GDI_SHARED_SECTION = 1
         env.MADEIRA_TOUCH_MOUSE = 1
+        env.MADEIRA_WOW_MIN_FREE_GB = 2
+        env.MADEIRA_WOW_PLACEHOLDERS = 1
         env.MADEIRA_FREE_DELAY_MS = 0
         env.MADEIRA_EC_HOOK_TRACE = 0
         # madeira-bcd's defaults, which this list was tested with (upstream's differ).

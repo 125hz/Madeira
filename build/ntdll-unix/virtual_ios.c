@@ -20303,6 +20303,51 @@ static int ios_fex_arena_grow( size_t need )
 }
 #endif
 
+/* ml2021: what fills a 32-bit program's guest window when a placement scan in it
+ * fails. Log 81 (vk-1024-20): 9.5 minutes into a 32-bit title's drive the scan in
+ * its window found 1260 views and no gap over 1.4 MB, 43 allocations returned NULL
+ * and the title wrote through one (BUS->AV at window+0x22e8, then WER and the
+ * process's teardown: the "freeze"). Nothing said what the 4 GB held. Once per
+ * window: the views by kind and the ten largest. virtual_mutex held (map_view). */
+static void ios_wow_window_census( const void *start, const void *end )
+{
+    static ULONG_PTR done[IOS_WOW_MAX_WINDOWS];
+    static unsigned ndone;
+    static const char *const kind_name[5] = { "image", "file", "placeholder", "reserve", "anonymous" };
+    struct { void *base; size_t size; unsigned int protect; } top[10];
+    unsigned long long kind_bytes[5] = { 0 }, total = 0;
+    unsigned kind_views[5] = { 0 }, ntop = 0, views = 0, i, k;
+    ULONG_PTR wb = ios_wow_window_covering( start, end );
+    struct file_view *view;
+    char line[320];
+    int len;
+
+    if (!wb) return;
+    for (i = 0; i < ndone; i++) if (done[i] == wb) return;
+    if (ndone < IOS_WOW_MAX_WINDOWS) done[ndone++] = wb;
+    WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+    {
+        if ((ULONG_PTR)view->base < wb || (ULONG_PTR)view->base >= wb + IOS_WOW_WINDOW_SIZE) continue;
+        k = (view->protect & SEC_IMAGE) ? 0 : (view->protect & SEC_FILE) ? 1
+          : (view->protect & (VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER)) ? 2 : (view->protect & SEC_RESERVE) ? 3 : 4;
+        kind_views[k]++; kind_bytes[k] += view->size; total += view->size; views++;
+        if (ntop < 10) { top[ntop].base = view->base; top[ntop].size = view->size; top[ntop].protect = view->protect; ntop++; }
+        else
+        {
+            unsigned m = 0;
+            for (i = 1; i < 10; i++) if (top[i].size < top[m].size) m = i;
+            if (view->size > top[m].size) { top[m].base = view->base; top[m].size = view->size; top[m].protect = view->protect; }
+        }
+    }
+    len = snprintf( line, sizeof(line), "[wow-census] ml2021 window %p: %u views, %llu MB of 4096 mapped",
+                    (void *)wb, views, total >> 20 );
+    for (k = 0; k < 5 && len > 0 && len < (int)sizeof(line) - 40; k++)
+        len += snprintf( line + len, sizeof(line) - len, " | %s %u/%llu MB", kind_name[k], kind_views[k], kind_bytes[k] >> 20 );
+    dprintf( 2, "%s\n", line );
+    for (i = 0; i < ntop; i++)
+        dprintf( 2, "[wow-census]   %p+0x%zx protect=%08x\n", top[i].base, top[i].size, top[i].protect );
+}
+
 static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                           unsigned int alloc_type, unsigned int vprot,
                           ULONG_PTR limit_low, ULONG_PTR limit_high, size_t align_mask )
@@ -20558,6 +20603,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
 
                     ios_va_pressure = 1;
                     if (!censused) { censused = 1; ios_furniture_census(); }
+                    if (!ptr) ios_wow_window_census( start, end );   /* ml2021: a 32-bit program's window, once */
                 }
 
                 /* ml118 discriminator — see ios_scan_fail_addr. Rate-limited:
@@ -21539,10 +21585,27 @@ static void ios_donor_free_insert( uint64_t off, uint64_t len )
         ios_donor_merges++;
     }
 }
+/* ml2021: what the memory-pressure notification does to the pool. madeira.cfg
+ * donor-pool-guard: 0/unset = nothing, the pool is spent like MeloNX's (log 81: 475
+ * CRITICAL notifications refused 502 takes and left 2.6 GB of the pool unused while
+ * the title's own memory, 4.5 GB of it compressed, filled the app's limit — the
+ * device is full either way, and donated pages are the extension's to be compressed,
+ * not the app's); 1 = CRITICAL refuses takes; 2 = warning and critical (pre-ml2021). */
+static int ios_donor_guard_level( void )
+{
+    static int level = -1;
+    if (level < 0)
+    {
+        level = (int)madeira_cfg_int( "donor-pool-guard", 0 );   /* 0: pressure notifications do not stop takes; 1: critical stops them; 2: warning too */
+        if (level < 0 || level > 2) level = 0;
+    }
+    return level;
+}
 /* The guard: 1 refuses every take (iOS reported memory pressure, or the optional free-RAM floor). */
 static int ios_donor_guard( size_t len )
 {
-    if (__atomic_load_n( &ios_donor_pressure, __ATOMIC_RELAXED ))
+    int pressure = __atomic_load_n( &ios_donor_pressure, __ATOMIC_RELAXED ), level = ios_donor_guard_level();
+    if (pressure && ((level == 2) || (level == 1 && pressure >= 2)))
     {
         ios_donor_guarded++;
         return 1;
@@ -21817,6 +21880,20 @@ static int ios_swap_x64_idle( uintptr_t b, size_t size )
     if (keep || !ios_swap_broad || !ios_swap_wow_in_session()) return 0;
     return ios_wow_window_covering( (const void *)b, (const void *)(b + size) ) == 0;
 }
+static int ios_swap_wow64_policy( void );
+/* ml2021: a 32-bit program's range under the donor-only policy (swap-wow64 unset). Its
+ * churny sizes cost a pool take and a give, no file work, so the churn filter has nothing
+ * to save there; filtered, they could never reach the pool at all (log 81: 854 GB of
+ * commits "churn", the pool a third used, the title's memory compressed inside the limit). */
+static int ios_swap_wow_churn_exempt( uintptr_t b, size_t size )
+{
+    if (ios_swap_wow64_policy() != 0) return 0;
+    return ios_wow_window_covering( (const void *)b, (const void *)(b + size) ) != 0;
+}
+static int ios_swap_churn_exempt( uintptr_t b, size_t size )
+{
+    return ios_swap_x64_idle( b, size ) || ios_swap_wow_churn_exempt( b, size );
+}
 static int ios_swap_why( const void *base, size_t size, unsigned int vprot, struct file_view *view )
 {
     uintptr_t b = (uintptr_t)base;
@@ -21828,7 +21905,7 @@ static int ios_swap_why( const void *base, size_t size, unsigned int vprot, stru
     if (ios_swap_broad) { if (b + size > 0x7c00000000ULL) return IOS_SW_BAND; }   /* ml1257: FEX's band and above */
     else if (!ios_swap_wide && (b < 0x7000000000ULL || b >= 0x7c00000000ULL)) return IOS_SW_BAND;
     if (size < ios_swap_min) return IOS_SW_SMALL;
-    if (ios_swap_churny( size ) && !ios_swap_x64_idle( b, size )) { ios_swap_churn_skips++; return IOS_SW_CHURN; }   /* ml1258 */
+    if (ios_swap_churny( size ) && !ios_swap_churn_exempt( b, size )) { ios_swap_churn_skips++; return IOS_SW_CHURN; }   /* ml1258 */
     return IOS_SW_BACKED;
 }
 static const char *ios_swap_map_tag = "";   /* ml1257: the "backed" log line names whole reservations */
@@ -22282,7 +22359,7 @@ static int ios_swap_whole_resv( struct file_view *view, unsigned int vprot )
     if (ios_swap_is_fexjit( b, view->size ) || b + view->size > 0x7c00000000ULL)
     { ios_swap_skip_bytes[IOS_SWK_FEXJIT] += view->size; return 0; }
     if (ios_swap_n && ios_swap_overlaps( view->base, view->size )) { ios_swap_skip_bytes[IOS_SWK_OVERLAP] += view->size; return 0; }
-    if (ios_swap_churny( view->size ) && !ios_swap_x64_idle( b, view->size ))   /* ml1258; ml2021: not beside a 32-bit program */
+    if (ios_swap_churny( view->size ) && !ios_swap_churn_exempt( b, view->size ))   /* ml1258; ml2021: not beside/inside a 32-bit program */
     { ios_swap_churn_skips++; ios_swap_skip_bytes[IOS_SWK_CHURN] += view->size; return 0; }
     ios_swap_map_tag = " (whole reservation, ml1257)";
     why = ios_swap_map( view->base, view->size, get_unix_prot( vprot ) );
