@@ -77,6 +77,16 @@ take = src[src.index('static int ios_donor_guard( size_t len )'):src.index('stat
 check('static uint64_t ios_donor_margin;   /* ml2021: 0 =' in src and 'if (ios_donor_margin)' in take
       and 'host free %llu MB < margin %llu MB' in take,
       'the free-RAM margin is off by default (pressure alone guards) and a refusal names the measured free RAM')
+# ml2021: the pressure guard is off unless madeira.cfg donor-pool-guard says 1 (critical) or 2 (warning too)
+check('madeira_cfg_int( "donor-pool-guard", 0 )' in src and 'if (level < 0 || level > 2) level = 0;' in src
+      and 'if (pressure && ((level == 2) || (level == 1 && pressure >= 2)))' in take,
+      'pressure notifications stop takes only when donor-pool-guard asks (1 critical, 2 warning too)')
+# ml2021: the churn filter spares 64-bit ranges beside a 32-bit program and the 32-bit program's own ranges under the donor-only policy
+check('static int ios_swap_churn_exempt( uintptr_t b, size_t size )' in src
+      and 'return ios_swap_x64_idle( b, size ) || ios_swap_wow_churn_exempt( b, size );' in src
+      and src.count('ios_swap_churn_exempt( b, size )') + src.count('ios_swap_churn_exempt( b, view->size )') >= 2,
+      'both churn checks (commit and whole reservation) consult the exemption')
+check('if (ios_swap_wow64_policy() != 0) return 0;' in src, "a 32-bit range is exempt only under the donor-only policy (never for the file)")
 # ml2021: pieces -- a request is served from the largest piece available when no hole fits it whole
 check('static uint64_t ios_donor_take_upto( size_t want, size_t *got )' in take
       and 'if (want > ios_donor_region) want = (size_t)ios_donor_region;' in take
