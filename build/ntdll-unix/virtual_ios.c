@@ -20050,8 +20050,20 @@ static int ios_stack_spill_enabled(void)
  * the arena guard refuses fixed guest requests into it. map_reserved_area_inner
  * then serves the emulator's requests from every FEX_ONLY area, whole: the
  * limits the emulator passes name the first band only (ml797 handed it over as
- * plain data, once). At most four extra bands. MADEIRA_FEX_ARENA_GROW=0: a full
- * arena fails the request as before. */
+ * plain data, once). At most four extra bands.
+ *
+ * OFF BY DEFAULT since the device logs of 2026-10-25 (three runs of a 64-bit
+ * launcher chain under the Dock, Social Club layout 2): the only candidates the
+ * kernel accepted lay in [0x7000000000, 0x7400000000), inside the 32 GB
+ * PartitionAlloc reservation the browser helper's libcef.dll had been told it
+ * owns (4 GB of it real, [sc-cef] layout 2). Every free range of the top 64 GB
+ * is inside such a grant, so a band there is guest address space as far as the
+ * helper is concerned: in each run the first thread created after GROW took a
+ * write-fault storm in the band's first span (pages the emulator's allocator
+ * had committed were PROT_NONE again, their headers held pointers into the V8
+ * cage), and a later helper process read garbage heap pointers from a band
+ * span and died (c0000005). The arena's own demand is cut instead (rpmalloc's
+ * 4 MB spans, rev ml2020). MADEIRA_FEX_ARENA_GROW=1 holds a band anyway. */
 static int ios_fex_arena_grow_enabled(void)
 {
     static int enabled = -1;
@@ -20059,8 +20071,8 @@ static int ios_fex_arena_grow_enabled(void)
 
     if (v < 0)
     {
-        const char *e = getenv( "MADEIRA_FEX_ARENA_GROW" );   /* 0: a full FEX arena fails the emulator's request as before, instead of adding a FEX_ONLY band below it */
-        v = !(e && e[0] == '0');
+        const char *e = getenv( "MADEIRA_FEX_ARENA_GROW" );   /* 1: a full FEX arena adds a FEX_ONLY band below it (default off: on the Social Club layout a band lies in address space the browser helper's allocators were granted, and their writes corrupted it); default: the request fails as before */
+        v = (e && e[0] == '1');
         __atomic_store_n( &enabled, v, __ATOMIC_RELEASE );
     }
     return v;
@@ -20111,7 +20123,7 @@ static int ios_fex_arena_grow( size_t need )
             bands++;
             dprintf( 2, "[fex-arena] ml2020 GROW #%u: the arena 0x%lx..0x%lx is full (0x%lx bytes wanted); band "
                         "0x%llx+0x%llx (%llu MB) held natively and registered FEX_ONLY after %u tries -- the "
-                        "emulator's requests are served from it too (MADEIRA_FEX_ARENA_GROW=0 fails them as before)\n",
+                        "emulator's requests are served from it too (opted in by MADEIRA_FEX_ARENA_GROW=1)\n",
                      bands, (unsigned long)ios_fex_arena_base_unix, (unsigned long)ios_fex_arena_end_unix,
                      (unsigned long)need, (unsigned long long)addr, size, size >> 20, tries + 1 );
             return 1;

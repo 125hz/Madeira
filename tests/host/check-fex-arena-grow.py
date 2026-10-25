@@ -21,8 +21,10 @@ def check(cond, text):
     print(('PASS: ' if cond else 'FAIL: ') + text)
     if not cond: failures += 1
 
-check(re.search(r'getenv\( "MADEIRA_FEX_ARENA_GROW" \);\s*/\* 0:', src) is not None,
-      'the switch is read once with the note the config catalog takes (0 = fail the request as before)')
+check(re.search(r'getenv\( "MADEIRA_FEX_ARENA_GROW" \);\s*/\* 1:', src) is not None
+      and "v = (e && e[0] == '1');" in src,
+      'the switch is read once with the note the config catalog takes, and it is opt-in (1 = hold a band; '
+      'default: fail the request as before, since a band on the Social Club layout lies in guest-granted address space)')
 grow = src[src.index('static int ios_fex_arena_grow( size_t need )'):src.index('static NTSTATUS map_view(')]
 check('IOS_FEX_ARENA_GROW_MAX' in src and re.search(r'#define IOS_FEX_ARENA_GROW_MAX\s+4\b', src) is not None,
       'at most four extra bands')
