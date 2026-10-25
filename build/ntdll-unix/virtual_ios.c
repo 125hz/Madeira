@@ -21274,9 +21274,9 @@ static unsigned long long ios_swap_img_bytes, ios_swap_img_peak, ios_swap_img_ba
  * not backed, and phys_footprint. The line is built in a stack buffer and
  * written with write(2); nothing here allocates. */
 enum { IOS_SW_BACKED, IOS_SW_SMALL, IOS_SW_BAND, IOS_SW_FEXJIT, IOS_SW_PROT, IOS_SW_VIEW,
-       IOS_SW_RECOMMIT, IOS_SW_PRESENT, IOS_SW_REFUSED, IOS_SW_MAPFAIL, IOS_SW_CHURN, IOS_SW_REASONS };
+       IOS_SW_RECOMMIT, IOS_SW_PRESENT, IOS_SW_REFUSED, IOS_SW_MAPFAIL, IOS_SW_CHURN, IOS_SW_WOW64, IOS_SW_REASONS };
 static const char * const ios_swap_reason_name[IOS_SW_REASONS] =
-    { "backed", "small", "band", "fex/jit", "prot", "view", "recommit", "present", "refused", "mapfail", "churn" };
+    { "backed", "small", "band", "fex/jit", "prot", "view", "recommit", "present", "refused", "mapfail", "churn", "32-bit-ram" };
 static int         ios_swap_v2;               /* blocks, wide or broad; 0 = classic */
 static int         ios_swap_wide;
 static int         ios_swap_broad;            /* ml1257 */
@@ -21473,7 +21473,7 @@ static uint64_t ios_donor_region;             /* every region's size (the first 
 static struct { uint64_t off, len; } ios_donor_free[IOS_DONOR_MAX_FREE];   /* sorted by off, no two adjacent in a region */
 static unsigned ios_donor_nfree;
 static int ios_donor_pressure;                /* 0 normal, 1 warning, 2 critical */
-static uint64_t ios_donor_margin = 256ull << 20;   /* ml2020: was 1024, which kept the pool off on device (free RAM is rarely that high) */
+static uint64_t ios_donor_margin;   /* ml2021: 0 = the pressure source alone guards (MADEIRA_DONOR_POOL_MARGIN_MB sets a free-RAM floor; 1024 then 256 refused most takes on device) */
 static unsigned long long ios_donor_bytes, ios_donor_peak, ios_donor_takes, ios_donor_guarded, ios_donor_lost, ios_donor_merges;
 
 /* Called by the app (DonorPool.m) before Wine starts, one region at a time. */
@@ -21544,10 +21544,22 @@ static uint64_t ios_donor_take( size_t len )
 {
     unsigned i, best = ~0u, n = __atomic_load_n( &ios_donor_nreg, __ATOMIC_ACQUIRE );
     if (!n || len > ios_donor_region) return (uint64_t)-1;
-    if (__atomic_load_n( &ios_donor_pressure, __ATOMIC_RELAXED ) || ios_donor_system_free() < ios_donor_margin)
+    if (__atomic_load_n( &ios_donor_pressure, __ATOMIC_RELAXED ))
     {
         ios_donor_guarded++;
         return (uint64_t)-1;
+    }
+    if (ios_donor_margin)   /* ml2021: off by default; free_count alone refused 573 of 1003 takes on device (log 70) */
+    {
+        uint64_t free_now = ios_donor_system_free();
+        if (free_now < ios_donor_margin)
+        {
+            static int said;
+            ios_donor_guarded++;
+            if (said++ < 4) dprintf( 2, "[swap] ml1150 donor pool: take of %zu KB refused, host free %llu MB < margin %llu MB\n",
+                                     len >> 10, (unsigned long long)(free_now >> 20), (unsigned long long)(ios_donor_margin >> 20) );
+            return (uint64_t)-1;
+        }
     }
     for (i = 0; i < ios_donor_nfree; i++)
         if (ios_donor_free[i].len >= len && (best == ~0u || ios_donor_free[i].len < ios_donor_free[best].len)) best = i;
@@ -21756,18 +21768,40 @@ static int ios_swap_why( const void *base, size_t size, unsigned int vprot, stru
     return IOS_SW_BACKED;
 }
 static const char *ios_swap_map_tag = "";   /* ml1257: the "backed" log line names whole reservations */
+/* ml2021: what the tier may do with a 32-bit program's memory (a range inside a WoW64
+ * guest window). madeira.cfg swap-wow64: 0/unset = donor RAM only, the range stays
+ * anonymous when the pool has none (the default: log 70 ran a 32-bit title with its heap
+ * on the swap file and froze for 5-10 s at a time while the kernel paged that file in and
+ * out of flash; the 64-bit launcher and helpers next to it are what the file is for);
+ * 1 = donor RAM, then the file, like every other range (the pre-ml2021 behaviour);
+ * 2 = never tiered. Read once under virtual_mutex. */
+static int ios_swap_wow64_policy( void )
+{
+    static int policy = -1;
+    if (policy < 0)
+    {
+        policy = (int)madeira_cfg_int( "swap-wow64", 0 );   /* 0: donor RAM only; 1: donor RAM, then the file; 2: never tiered */
+        if (policy < 0 || policy > 2) policy = 0;
+        dprintf( 2, "[swap] ml2021 32-bit programs: %s (madeira.cfg swap-wow64 = %d)\n",
+                 policy == 1 ? "donor RAM, then the swap file" : policy == 2 ? "never tiered, RAM only" : "donor RAM only, never the swap file", policy );
+    }
+    return policy;
+}
+static unsigned long long ios_swap_wow_kept;   /* ml2021: bytes a 32-bit program's commits kept in RAM instead of the file */
 /* Map the host-page interior of [base, base+size) from the file with
  * unix_prot. Returns IOS_SW_BACKED, IOS_SW_SMALL, IOS_SW_REFUSED or IOS_SW_MAPFAIL. */
 static int ios_swap_map( void *base, size_t size, int unix_prot )
 {
     char *hs = (char *)(((uintptr_t)base + host_page_mask) & ~(uintptr_t)host_page_mask);
     char *he = (char *)(((uintptr_t)base + size) & ~(uintptr_t)host_page_mask);
-    size_t len; uint64_t off; void *p;
+    size_t len; uint64_t off; void *p; int wow;
     if (he <= hs) return IOS_SW_SMALL;
     if (ios_swap_n >= 16384) { if (ios_swap_v2) ios_swap_refused++; return IOS_SW_REFUSED; }
     /* ml1257: in broad the cap is the disk the sparse file really occupies */
     if (ios_swap_broad && ios_swap_disk_used() >= ios_swap_cap) { ios_swap_disk_refused++; ios_swap_refused++; return IOS_SW_REFUSED; }
     len = he - hs;
+    wow = ios_wow_window_covering( hs, he ) != 0;   /* ml2021: a 32-bit program's range */
+    if (wow && ios_swap_wow64_policy() == 2) { ios_swap_wow_kept += len; return IOS_SW_WOW64; }
     off = ios_donor_take( len );   /* ml1150: the donor pool first, while the guard allows */
     if (off != (uint64_t)-1)
     {
@@ -21782,6 +21816,7 @@ static int ios_swap_map( void *base, size_t size, int unix_prot )
         ios_donor_give( off, len );
         ios_donor_bytes += len;   /* give subtracts */
     }
+    if (wow && ios_swap_wow64_policy() != 1) { ios_swap_wow_kept += len; return IOS_SW_WOW64; }   /* ml2021: RAM, not the file */
     off = ios_swap_take( len );
     if (off == (uint64_t)-1) { ios_swap_refused++; return IOS_SW_REFUSED; }
     p = mmap( hs, len, unix_prot, MAP_FIXED | MAP_SHARED, ios_swap_fd, (off_t)off );
@@ -21972,8 +22007,10 @@ void ios_swap_stats_line( void )
         dprintf( 2, "[swap] swap-images: %llu MB of image sections in the file (peak %llu), %llu sections moved, %llu refused\n",
                  ios_swap_img_bytes >> 20, ios_swap_img_peak >> 20, ios_swap_img_backs, ios_swap_img_refused );
     if (ios_donor_takes || ios_donor_guarded)
-        dprintf( 2, "[swap] ml1150 donor pool: %llu MB in use (peak %llu), %llu takes, %llu guarded, %llu MB lost to a full free list, %llu merges\n",
-                 ios_donor_bytes >> 20, ios_donor_peak >> 20, ios_donor_takes, ios_donor_guarded, ios_donor_lost >> 20, ios_donor_merges );
+        dprintf( 2, "[swap] ml1150 donor pool: %llu MB in use (peak %llu), %llu takes, %llu guarded, %llu MB lost to a full free list, %llu merges"
+                    " | ml2021 host free %llu MB, 32-bit kept in RAM %llu MB\n",
+                 ios_donor_bytes >> 20, ios_donor_peak >> 20, ios_donor_takes, ios_donor_guarded, ios_donor_lost >> 20, ios_donor_merges,
+                 (unsigned long long)(ios_donor_system_free() >> 20), ios_swap_wow_kept >> 20 );
     /* ml1221: the census (bytes by reason) with every stats line, ~10 s, not only
      * after its own 30 s: Ori and the Will of the Wisps was jetsammed at 26 s and never printed one. */
     ios_swap_tick( 1 );
