@@ -83,6 +83,7 @@ final class ProMotionIntent {
             l.add(to: .main, forMode: .common)
             link = l
             activeMax = want
+            displaySyncApplied = false; armedAt = 0; tickStart = 0   // ml2021: per arming
             fputs("[promote] display link armed preferred=\(Int(want))Hz panel_max=\(ProMotionIntent.panelMaxFPS)Hz\n", stderr)
             // ml2020: stderr written before Wine starts is not in the exported log; say it there too
             LogStore.shared.log("[promote] display link armed min=\(Int(lo))Hz preferred=\(Int(want))Hz panel_max=\(ProMotionIntent.panelMaxFPS)Hz")
@@ -128,8 +129,27 @@ final class ProMotionIntent {
     private var kickOn = false
     static var kickEnabled: Bool { MadeiraConfig.flag("MADEIRA_PROMOTE_KICK", fallback: false) }
 
+    /// ml2021: env.MADEIRA_DISPLAY_SYNC applied to the game's layer once the session's
+    /// environment is exported (the link is armed a few ms BEFORE the game's config lines
+    /// are, so log 77's "= 1" run never saw it: the layer kept displaySyncEnabled=false from
+    /// app start). Applied from the first tick a second after arming, once per arming.
+    private var displaySyncApplied = false
+    private var armedAt: CFTimeInterval = 0
+    private func applyDisplaySync(now: CFTimeInterval) {
+        guard !displaySyncApplied, now - armedAt >= 1 else { return }
+        displaySyncApplied = true
+        let layer = MetalHostView.shared.metalLayer
+        let sel = NSSelectorFromString("setDisplaySyncEnabled:")
+        guard layer.responds(to: sel) else { return }
+        let on = MadeiraConfig.flag("MADEIRA_DISPLAY_SYNC", fallback: false)
+        layer.perform(sel, with: NSNumber(value: on))
+        LogStore.shared.log("[promote] game layer displaySyncEnabled=\(on ? "true (env.MADEIRA_DISPLAY_SYNC = 1)" : "false (default; env.MADEIRA_DISPLAY_SYNC = 1 keeps display sync)")")
+    }
+
     @objc private func tick(_ sender: CADisplayLink) {
         let now = sender.timestamp
+        if armedAt == 0 { armedAt = now }
+        applyDisplaySync(now: now)
         if tickStart == 0 { tickStart = now; tickLast = now; tickCount = 0; tickMaxGap = 0 }
         else {
             tickMaxGap = max(tickMaxGap, now - tickLast)

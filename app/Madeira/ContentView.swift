@@ -2585,6 +2585,11 @@ struct ContentView: View {
 
     /// The rest of Play, with JIT on: checks the entry's launch profile and starts it.
     private func startLibraryEntry(_ entry: LibraryEntry) {
+        // ml2021: Big Picture's batch exists only once written; the preflight checks the file.
+        if entry.bigPicture == true, !LibraryEntry.writeBigPictureBatch() {
+            library.error = "Big Picture needs Madeira Dock's Steam components (Settings › Steam) to start from."
+            return
+        }
         do { if entry.desktop != true { _ = try LibraryModel.executable(entry.launchRelativePath) }; try entry.validate() }
         catch {
             library.error = error.localizedDescription

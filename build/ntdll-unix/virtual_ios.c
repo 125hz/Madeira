@@ -22282,7 +22282,7 @@ static int ios_swap_whole_resv( struct file_view *view, unsigned int vprot )
     if (ios_swap_is_fexjit( b, view->size ) || b + view->size > 0x7c00000000ULL)
     { ios_swap_skip_bytes[IOS_SWK_FEXJIT] += view->size; return 0; }
     if (ios_swap_n && ios_swap_overlaps( view->base, view->size )) { ios_swap_skip_bytes[IOS_SWK_OVERLAP] += view->size; return 0; }
-    if (ios_swap_churny( view->size ))   /* ml1258 */
+    if (ios_swap_churny( view->size ) && !ios_swap_x64_idle( b, view->size ))   /* ml1258; ml2021: not beside a 32-bit program */
     { ios_swap_churn_skips++; ios_swap_skip_bytes[IOS_SWK_CHURN] += view->size; return 0; }
     ios_swap_map_tag = " (whole reservation, ml1257)";
     why = ios_swap_map( view->base, view->size, get_unix_prot( vprot ) );
