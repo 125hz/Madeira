@@ -115,6 +115,9 @@ size_t ios_jit_low_size_global;
 static long madeira_cfg_int( const char *key, long def ) { (void)key; return def; }
 static ULONG_PTR ios_wow_window_covering( const void *s, const void *e ) { (void)s; (void)e; return 0; }
 static uint64_t ios_donor_system_free( void ) { return 0; }
+/* ml2021: the swap core asks whether a 32-bit program is in the session (none here) */
+static unsigned ios_wow_window_count, ios_wow_placeholder_count;
+static struct { unsigned long base; } ios_wow_windows[1], ios_wow_placeholders[1];
 static int ios_jit_low_overlaps( uintptr_t a, size_t size )
 ''' + body_of(virt, 'static int ios_jit_low_overlaps(') + r'''
 /* Wine's rules (unix_private/virtual.c), EXEC mapped to read for the test */

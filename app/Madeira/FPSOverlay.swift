@@ -111,7 +111,61 @@ final class ProMotionIntent {
         madeira_set_display_max_fps(Int32(panelMaxFPS), Int32(hz))
     }
 
-    @objc private func tick(_ sender: CADisplayLink) {}
+    /// ml2021: what the link actually runs at. Log 71 ran with the 120 Hz link armed and
+    /// the title still parked 80 ms a frame in nextDrawable, so whether the panel follows
+    /// the intent at all is the open question; every 10 s the exported log gets the tick
+    /// count, the mean interval and the longest one.
+    private var tickCount = 0
+    private var tickStart: CFTimeInterval = 0
+    private var tickLast: CFTimeInterval = 0
+    private var tickMaxGap: CFTimeInterval = 0
+    /// ml2021 (opt-in, env.MADEIRA_PROMOTE_KICK = 1): a one-pixel layer whose opacity
+    /// alternates every tick, so each tick commits a CoreAnimation transaction. The
+    /// DXMT note of 2026-07-03 found that this device's compositor completes our
+    /// layer's presentations only when something else makes it composite; if the
+    /// drawable waits fall with this on, that is what the display link alone does not do.
+    private var kickLayer: CALayer?
+    private var kickOn = false
+    static var kickEnabled: Bool { MadeiraConfig.flag("MADEIRA_PROMOTE_KICK", fallback: false) }
+
+    @objc private func tick(_ sender: CADisplayLink) {
+        let now = sender.timestamp
+        if tickStart == 0 { tickStart = now; tickLast = now; tickCount = 0; tickMaxGap = 0 }
+        else {
+            tickMaxGap = max(tickMaxGap, now - tickLast)
+            tickLast = now
+        }
+        tickCount += 1
+        let span = now - tickStart
+        if span >= 10 {
+            let hz = Double(tickCount - 1) / span
+            LogStore.shared.log(String(format: "[promote] link ran %d ticks in %.1f s = %.1f Hz (mean %.1f ms, longest gap %.1f ms, target %.0f ms)",
+                                       tickCount, span, hz, span * 1000 / Double(max(1, tickCount - 1)), tickMaxGap * 1000,
+                                       (sender.targetTimestamp - sender.timestamp) * 1000))
+            tickStart = now; tickCount = 1; tickMaxGap = 0
+        }
+        if ProMotionIntent.kickEnabled { kick() }
+    }
+
+    private func kick() {
+        if kickLayer == nil {
+            guard let window = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
+                .flatMap({ $0.windows }).first(where: { $0.isKeyWindow }) ?? UIApplication.shared.connectedScenes
+                .compactMap({ $0 as? UIWindowScene }).flatMap({ $0.windows }).first else { return }
+            let l = CALayer()
+            l.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
+            l.backgroundColor = UIColor.black.cgColor
+            l.opacity = 0.01
+            window.layer.addSublayer(l)
+            kickLayer = l
+            LogStore.shared.log("[promote] kick layer added (env.MADEIRA_PROMOTE_KICK = 1): a transaction per tick")
+        }
+        kickOn.toggle()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        kickLayer?.opacity = kickOn ? 0.02 : 0.01
+        CATransaction.commit()
+    }
 }
 
 /// Opt-in `env.MADEIRA_THERMAL_CAP = 1`: when iOS reports the device as

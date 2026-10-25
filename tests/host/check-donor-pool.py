@@ -35,7 +35,7 @@ check('ios_donor_reg[n].window = permanent ? (char *)window : NULL;' in add,
       'without them the region keeps no window (NULL)')
 check(add.count('VM_FLAGS_ANYWHERE') == 1, 'no other ANYWHERE mapping at registration')
 
-give = src[src.index('static void ios_donor_give( uint64_t off, size_t len )'):src.index('#else\nstatic uint64_t ios_donor_take( size_t len ) { (void)len;')]
+give = src[src.index('static void ios_donor_give( uint64_t off, size_t len )'):src.index('#else\nstatic uint64_t ios_donor_take_upto( size_t want, size_t *got )')]
 check('if (ios_donor_reg[r].window) madvise( ios_donor_reg[r].window + off % ios_donor_region, len, MADV_ZERO );' in give,
       'a region with a window is zeroed through it, as before')
 check('mach_vm_map( mach_task_self(), &tmp, len, 0, VM_FLAGS_ANYWHERE, ios_donor_reg[r].entry, off % ios_donor_region, FALSE,' in give
@@ -66,16 +66,35 @@ check('madeira_cfg_int( "swap-wow64", 0 )' in pol and 'if (policy < 0 || policy 
 smap = src[src.index('static int ios_swap_map( void *base, size_t size, int unix_prot )'):src.index('static void ios_swap_release_range( void *base, size_t size, int copy_back )\n{')]
 check('wow = ios_wow_window_covering( hs, he ) != 0;' in smap, 'the map step asks whether the range lies in a WoW64 guest window')
 check('if (wow && ios_swap_wow64_policy() == 2) { ios_swap_wow_kept += len; return IOS_SW_WOW64; }' in smap
-      and smap.index('ios_swap_wow64_policy() == 2') < smap.index('off = ios_donor_take( len );'),
+      and smap.index('ios_swap_wow64_policy() == 2') < smap.index('done = ios_swap_donor_pieces( hs, len, unix_prot, size );'),
       'policy 2 keeps the range in RAM before the donor attempt')
-check('if (wow && ios_swap_wow64_policy() != 1) { ios_swap_wow_kept += len; return IOS_SW_WOW64; }' in smap
-      and smap.index('ios_swap_wow64_policy() != 1') > smap.index('off = ios_donor_take( len );')
-      and smap.index('ios_swap_wow64_policy() != 1') < smap.index('off = ios_swap_take( len );'),
-      'the default lets the donor pool serve it and stops before the file')
-take = src[src.index('static uint64_t ios_donor_take( size_t len )'):src.index('static int ios_donor_map( char *va, size_t len, int unix_prot, uint64_t off )')]
+check('if (wow && ios_swap_wow64_policy() != 1)   /* ml2021: the rest stays RAM, not the file */' in smap
+      and smap.index('ios_swap_wow64_policy() != 1') > smap.index('done = ios_swap_donor_pieces( hs, len, unix_prot, size );')
+      and smap.index('ios_swap_wow64_policy() != 1') < smap.index('off = ios_swap_take( len );')
+      and 'if (!done) return IOS_SW_WOW64;' in smap,
+      'the default lets the donor pool serve what it can and stops before the file; nothing taken = kept in RAM')
+take = src[src.index('static int ios_donor_guard( size_t len )'):src.index('static int ios_donor_map( char *va, size_t len, int unix_prot, uint64_t off )')]
 check('static uint64_t ios_donor_margin;   /* ml2021: 0 =' in src and 'if (ios_donor_margin)' in take
       and 'host free %llu MB < margin %llu MB' in take,
       'the free-RAM margin is off by default (pressure alone guards) and a refusal names the measured free RAM')
+# ml2021: pieces -- a request is served from the largest piece available when no hole fits it whole
+check('static uint64_t ios_donor_take_upto( size_t want, size_t *got )' in take
+      and 'if (want > ios_donor_region) want = (size_t)ios_donor_region;' in take
+      and 'if (big != ~0u && ios_donor_free[big].len >= room && ios_donor_free[big].len >= IOS_DONOR_MIN_PIECE)' in take
+      and 'if (room >= IOS_DONOR_MIN_PIECE)' in take and '#define IOS_DONOR_MIN_PIECE (1u << 20)' in src,
+      'a take larger than a region or than any hole gets the largest piece (free entry or bump room) of at least 1 MB')
+check('ios_donor_take(' not in src.replace('ios_donor_take_upto(', ''), 'the whole-or-nothing take is gone')
+pieces = src[src.index('static size_t ios_swap_donor_pieces( char *hs, size_t len, int unix_prot, size_t key )'):src.index('static int ios_swap_map( void *base, size_t size, int unix_prot )')]
+check('while (done < len && ios_swap_n < 16384)' in pieces and 'ios_swap_record( hs + done, got, off | IOS_DONOR_FLAG, key );' in pieces,
+      'the map step takes pool pieces until the range is covered or the pool has none, one extent each')
+check("donor_first = wow || x64 == 1 || (x64 == 0 && !ios_swap_wow_in_session());" in smap
+      and 'madeira_cfg_int( "swap-x64", 0 )' in src,
+      'a 64-bit range goes to the file first while a 32-bit program is in the session (swap-x64 unset), the pool otherwise')
+check('if (!donor_first && (done = ios_swap_donor_pieces( hs, len, unix_prot, size )) != 0)' in smap,
+      'with the file first, the pool is the fallback when the file refuses')
+check(src.count('for (i = ios_swap_map_first; i < ios_swap_n; i++) ios_swap_ext[i].resv = 1;') == 2
+      and 'ios_swap_map_first = ios_swap_n;' in smap,
+      'a reservation marks every extent its map call created')
 check('32-bit kept in RAM %llu MB' in src, 'the donor stats line reports host free RAM and the MB kept in RAM for 32-bit programs')
 check('MadeiraConfig.set("swap-wow64", choice.isEmpty ? nil : choice)' in swift and '"swap-wow64",' in swift,
       'Settings offers the 32-bit programs picker and the key is featured (not listed twice)')

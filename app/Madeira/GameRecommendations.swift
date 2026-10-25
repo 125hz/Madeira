@@ -394,12 +394,24 @@ enum GameRecommendations {
     /// recompiled four million blocks while the sign-in page never painted. A
     /// 32-bit game also needs its 4 GB guest window late in the session, when
     /// the helper's reservations have taken most of the map: 2 GB of margin
-    /// instead of 8. Not yet played through; from Steam only.
+    /// instead of 8. Version 2 (logs 66–70, 2026-10-25): the chain and the
+    /// game together pass the 6 GB jetsam limit, so the swap tier is on with
+    /// donated RAM (donor-pool-mb) as its first stage and the file behind it,
+    /// broad coverage from 1 MB; the game's own memory takes donated RAM but
+    /// never the file (swap-wow64's default: on the file its heap froze the
+    /// game for seconds at a time). The display link is held at the panel's
+    /// maximum (MADEIRA_PROMOTE) while the frame-rate sag is diagnosed. Played
+    /// through to driving; from Steam only.
     static let gta4Steam = GameRecommendation(
-        id: "gta4-steam", title: "Grand Theft Auto IV (Steam)", version: 1,
+        id: "gta4-steam", title: "Grand Theft Auto IV (Steam)", version: 2,
         config: """
         # Madeira's recommended settings for Grand Theft Auto IV (Steam).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        swap-mb = 4096
+        swap-min-mb = 1
+        env.MADEIRA_SWAP_COVERAGE = broad
+        donor-pool-mb = 4096
+        env.MADEIRA_PROMOTE = 1
         pool-low = 1
         pool-page-fit = 1
         pool-split = 1

@@ -160,6 +160,9 @@ static unsigned long long ios_swap_disk_used( void ) { return 0; }
 static long madeira_cfg_int( const char *key, long def ) { (void)key; return def; }
 static unsigned long ios_wow_window_covering( const void *s, const void *e ) { (void)s; (void)e; return 0; }
 static uint64_t ios_donor_system_free( void ) { return 0; }
+/* ml2021: the swap core asks whether a 32-bit program is in the session (none here) */
+static unsigned ios_wow_window_count, ios_wow_placeholder_count;
+static struct { unsigned long base; } ios_wow_windows[1], ios_wow_placeholders[1];
 /* the take and the map must run with the lock held: wrap the core's versions */
 #define ios_swap_image_take real_ios_swap_image_take
 #define ios_swap_image_map real_ios_swap_image_map
