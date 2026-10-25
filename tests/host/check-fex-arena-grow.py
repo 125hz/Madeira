@@ -36,15 +36,27 @@ check('mmap_add_fex_reserved_area(' in grow and 'mach_vm_deallocate(' in grow,
 check(grow.count('return 0;') >= 3 and 'return 1;' in grow, 'the function reports whether a band now exists')
 
 inner = src[src.index('static void *map_reserved_area_inner('):src.index('static NTSTATUS map_fixed_area(')]
-rule = 'if (area->fex_only)\n            {\n                if (!fex_arena_covers( limit_low, limit_high )) continue;\n                if ((ptr = find_reserved_free_area_outside_preloader( start, end, size, top_down, align_mask ))) break;\n                continue;\n            }'
-check(inner.count(rule) == 2, 'both scan directions serve the emulator from every FEX_ONLY area, whole, and from nothing else')
+check(inner.count('if (!fex_arena_covers( limit_low, limit_high )) continue;') == 2
+      and inner.count('if (fex_arena_request_is_own( limit_low, limit_high ))') == 2
+      and inner.count('if (start != (void *)ios_fex_arena_base_unix) continue;   /* a grown band: not for the WoW64 module */') == 2
+      and inner.count('find_reserved_free_area_outside_preloader( a_start, a_end, size, top_down, align_mask )') == 2,
+      "both scan directions: the emulator's own request from every FEX_ONLY area, the WoW64 module's from the arena only, clipped")
+check(inner.count('ULONG_PTR hold = ios_fex_arena_tail_hold();') == 2
+      and inner.count('a_end = (char *)start + (area->size - hold);') == 2,
+      "the arena's held tail is left to the 32-bit program's emulator in both directions")
 check('if (area->fex_only && !fex_arena_covers' not in inner, 'the old clipped rule is gone')
+check('static int fex_arena_request_is_own( const void *limit_low, const void *limit_high )' in src
+      and 'return lo >= ios_fex_arena_base_unix && hi <= ios_fex_arena_end_unix;' in src,
+      "own = strictly inside the published arena (the [wow-band] clause is not own)")
+check(re.search(r'getenv\( "MADEIRA_WOW_ARENA_HOLD_GB" \);\s*/\* GB at the top', src) is not None
+      and 'hold = (w && w[0] >= \'1\' && w[0] <= \'9\' && gb) ? (ULONG_PTR)gb << 30 : 0;' in src,
+      'the tail hold is sized by MADEIRA_WOW_ARENA_HOLD_GB (default 3) and only while a guest window is held')
 
 view = src[src.index('static NTSTATUS map_view('):]
 hook = view.index('ios_fex_arena_grow( view_size )')
 fail = view.index('return STATUS_NO_MEMORY;', hook)
-check(fail - hook < 1200 and 'fex_arena_covers( (void *)limit_low, (void *)limit_high )' in view[hook - 200:hook],
-      "the grow attempt sits right before the STATUS_NO_MEMORY return and only for requests that name the arena")
+check(fail - hook < 1200 and 'fex_arena_request_is_own( (void *)limit_low, (void *)limit_high )' in view[hook - 200:hook],
+      "the grow attempt sits right before the STATUS_NO_MEMORY return and only for the emulator's own requests")
 check('map_reserved_area( start, end, host_size, top_down, unix_prot, align_mask )' in view[hook:hook + 400],
       'after growing, the request is placed through the reserved-area path (the new band is one)')
 
@@ -55,7 +67,9 @@ check('LIST_FOR_EACH_ENTRY( area, &reserved_areas' in guard and '!area->fex_only
 
 catalog = ROOT / 'app/Madeira/ConfigCatalog.generated.swift'
 if catalog.exists():
-    check('key: "env.MADEIRA_FEX_ARENA_GROW"' in catalog.read_text(encoding='utf-8'), 'the config catalog documents env.MADEIRA_FEX_ARENA_GROW')
+    text = catalog.read_text(encoding='utf-8')
+    check('key: "env.MADEIRA_FEX_ARENA_GROW"' in text, 'the config catalog documents env.MADEIRA_FEX_ARENA_GROW')
+    check('key: "env.MADEIRA_WOW_ARENA_HOLD_GB"' in text, 'the config catalog documents env.MADEIRA_WOW_ARENA_HOLD_GB')
 
 print(f'check-fex-arena-grow: {"OK" if not failures else f"{failures} FAILED"}')
 sys.exit(1 if failures else 0)
