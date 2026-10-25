@@ -4223,7 +4223,7 @@ struct RuntimeMemorySyncSettings: View {
     var refresh = 0
     /// The keys this section and Settings › Graphics own; All settings and the Settings
     /// search leave them out.
-    static let featuredKeys: Set<String> = Set(["pool", "vram-mb", "swap-mb", "env.MADEIRA_SWAP_COVERAGE", "donor-pool-mb",
+    static let featuredKeys: Set<String> = Set(["pool", "vram-mb", "swap-mb", "env.MADEIRA_SWAP_COVERAGE", "donor-pool-mb", "swap-wow64",
                                                 "inproc-sync", "env.MADEIRA_FASTSYNC", "eco"]).union(GraphicsSettings.featuredKeys)
     // ml1241: 256 (the launch's lower bound) for the pool, 512 and 1024 for video memory
     // (winemetal accepts vram-mb >= 256), at the user's request.
@@ -4242,6 +4242,10 @@ struct RuntimeMemorySyncSettings: View {
     @State private var swapMB = Self.intKey("swap-mb")
     @State private var donorPoolMB = Self.intKey("donor-pool-mb")
     @State private var coverage = Self.currentCoverage()
+    @State private var wow64 = MadeiraConfig.get("swap-wow64") ?? ""
+    static let wow64Choices: [(String, String)] = [
+        ("", "Donor RAM only"), ("1", "Donor RAM, then the swap file"), ("2", "Never tiered (RAM only)"),
+    ]
     @State private var engine = SyncEngine.current
     @State private var eco = MadeiraConfig.bool("eco", default: false)
     @State private var changed = false
@@ -4293,6 +4297,17 @@ struct RuntimeMemorySyncSettings: View {
             mbPicker("Donor pool", key: "donor-pool-mb", value: $donorPoolMB, choices: Self.donorPoolChoices,
                      zero: "Off", label: Self.gb)
                 .disabled(swapMB == 0)
+            // ml2021: a 32-bit program's memory takes donor RAM but never the swap file unless asked
+            // (madeira.cfg swap-wow64, virtual_ios.c ios_swap_wow64_policy).
+            Picker("32-bit programs", selection: Binding(get: { wow64 }, set: { choice in
+                wow64 = choice; changed = true
+                MadeiraConfig.set("swap-wow64", choice.isEmpty ? nil : choice)
+                LogStore.shared.log("[runtime-settings] swap-wow64=\(choice.isEmpty ? "donor" : choice)")
+            })) {
+                ForEach(Self.wow64Choices, id: \.0) { Text($0.1).tag($0.0) }
+                if !Self.wow64Choices.contains(where: { $0.0 == wow64 }) { Text(wow64).tag(wow64) }
+            }
+            .disabled(swapMB == 0)
             Picker("Sync engine", selection: Binding(get: { engine }, set: { choice in
                 engine = choice; changed = true
                 SyncEngine.apply(choice)
@@ -4322,7 +4337,7 @@ struct RuntimeMemorySyncSettings: View {
         }
         .onChange(of: refresh) { _, _ in
             poolMB = Self.intKey("pool"); vramMB = Self.intKey("vram-mb"); swapMB = Self.intKey("swap-mb"); donorPoolMB = Self.intKey("donor-pool-mb")
-            coverage = Self.currentCoverage(); engine = SyncEngine.current
+            coverage = Self.currentCoverage(); wow64 = MadeiraConfig.get("swap-wow64") ?? ""; engine = SyncEngine.current
             eco = MadeiraConfig.bool("eco", default: false)
         }
     }

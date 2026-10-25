@@ -57,10 +57,34 @@ check('madeira_swap_overlay_stats(&file, &donated, &pool, &guarded)' in swift
 check('"Donated \\(donatedMB)/\\(donorPoolMB) MB' in swift and '"Swap \\(swapFileMB) MB"' in swift,
       'the pill shows Donated used/pool MB (guarded count when non-zero) and the swap-file MB')
 
+# ml2021: a 32-bit program's memory takes donor RAM, never the swap file, unless swap-wow64 says so
+check('IOS_SW_WOW64, IOS_SW_REASONS };' in src and '"churn", "32-bit-ram" };' in src,
+      'the census has a reason for 32-bit ranges kept in RAM')
+pol = src[src.index('static int ios_swap_wow64_policy( void )'):src.index('static unsigned long long ios_swap_wow_kept;')]
+check('madeira_cfg_int( "swap-wow64", 0 )' in pol and 'if (policy < 0 || policy > 2) policy = 0;' in pol,
+      'madeira.cfg swap-wow64 (0 donor only, 1 donor then file, 2 never) is read once, out-of-range = default')
+smap = src[src.index('static int ios_swap_map( void *base, size_t size, int unix_prot )'):src.index('static void ios_swap_release_range( void *base, size_t size, int copy_back )\n{')]
+check('wow = ios_wow_window_covering( hs, he ) != 0;' in smap, 'the map step asks whether the range lies in a WoW64 guest window')
+check('if (wow && ios_swap_wow64_policy() == 2) { ios_swap_wow_kept += len; return IOS_SW_WOW64; }' in smap
+      and smap.index('ios_swap_wow64_policy() == 2') < smap.index('off = ios_donor_take( len );'),
+      'policy 2 keeps the range in RAM before the donor attempt')
+check('if (wow && ios_swap_wow64_policy() != 1) { ios_swap_wow_kept += len; return IOS_SW_WOW64; }' in smap
+      and smap.index('ios_swap_wow64_policy() != 1') > smap.index('off = ios_donor_take( len );')
+      and smap.index('ios_swap_wow64_policy() != 1') < smap.index('off = ios_swap_take( len );'),
+      'the default lets the donor pool serve it and stops before the file')
+take = src[src.index('static uint64_t ios_donor_take( size_t len )'):src.index('static int ios_donor_map( char *va, size_t len, int unix_prot, uint64_t off )')]
+check('static uint64_t ios_donor_margin;   /* ml2021: 0 =' in src and 'if (ios_donor_margin)' in take
+      and 'host free %llu MB < margin %llu MB' in take,
+      'the free-RAM margin is off by default (pressure alone guards) and a refusal names the measured free RAM')
+check('32-bit kept in RAM %llu MB' in src, 'the donor stats line reports host free RAM and the MB kept in RAM for 32-bit programs')
+check('MadeiraConfig.set("swap-wow64", choice.isEmpty ? nil : choice)' in swift and '"swap-wow64",' in swift,
+      'Settings offers the 32-bit programs picker and the key is featured (not listed twice)')
+
 catalog = ROOT / 'app/Madeira/ConfigCatalog.generated.swift'
 if catalog.exists():
     text = catalog.read_text(encoding='utf-8')
     check('key: "env.MADEIRA_DONOR_WINDOWS"' in text, 'the config catalog documents env.MADEIRA_DONOR_WINDOWS')
+    check('key: "swap-wow64"' in text, 'the config catalog documents swap-wow64')
 
 print(f'check-donor-pool: {"OK" if not failures else f"{failures} FAILED"}')
 sys.exit(1 if failures else 0)
