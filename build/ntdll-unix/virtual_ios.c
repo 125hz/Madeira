@@ -7532,6 +7532,48 @@ static int fex_arena_covers( const void *limit_low, const void *limit_high )
     return 0;
 }
 
+/* ml2020: the emulator's OWN request, strictly inside the published arena (the
+ * ARM64EC module asks with exactly [arena base, arena end], handed over by
+ * ml797). Only such a request may be served from a grown band (ios_fex_arena_grow)
+ * or made to leave the arena's tail alone (ios_fex_arena_tail_hold). The WoW64
+ * module's hardware-band request ([wow-band] above) is not one: its allocator
+ * keeps to the band it asked for and released a 256 MB span a grown band had
+ * given it at 0x7380000000, then freed inside it and died in rpfree (device log
+ * 2026-10-24 20:45, the first 32-bit program through a 64-bit launcher chain). */
+static int fex_arena_request_is_own( const void *limit_low, const void *limit_high )
+{
+    ULONG_PTR lo = (ULONG_PTR)limit_low, hi = (ULONG_PTR)limit_high;
+
+    if (!ios_fex_arena_base_unix || !ios_fex_arena_end_unix) return 0;
+    return lo >= ios_fex_arena_base_unix && hi <= ios_fex_arena_end_unix;
+}
+
+/* ml2020: bytes at the top of the arena the ARM64EC module's requests leave
+ * alone, for a 32-bit program that starts later in the session: its WoW64
+ * module asks for the hardware band and nothing else, so when the 64-bit
+ * launcher chain has filled the arena the 32-bit program cannot get its first
+ * span and dies before any x86 code runs. Held only when the app holds a guest
+ * window for the session (MADEIRA_WOW_HOLD_WINDOWS); MADEIRA_WOW_ARENA_HOLD_GB
+ * sizes it (default 3). Read once. */
+static ULONG_PTR ios_fex_arena_tail_hold(void)
+{
+    static ULONG_PTR hold = ~(ULONG_PTR)0;
+
+    if (hold == ~(ULONG_PTR)0)
+    {
+        const char *w = getenv( "MADEIRA_WOW_HOLD_WINDOWS" );
+        const char *g = getenv( "MADEIRA_WOW_ARENA_HOLD_GB" );   /* GB at the top of the FEX arena kept for a 32-bit program's emulator while MADEIRA_WOW_HOLD_WINDOWS is set (default 3); 0: none */
+        unsigned long gb = (g && g[0] >= '0' && g[0] <= '9') ? strtoul( g, NULL, 10 ) : 3;
+
+        hold = (w && w[0] >= '1' && w[0] <= '9' && gb) ? (ULONG_PTR)gb << 30 : 0;
+        if (hold)
+            dprintf( 2, "[fex-arena] ml2020 the top %lu GB of the arena 0x%lx..0x%lx are kept for a 32-bit program's "
+                        "emulator (MADEIRA_WOW_HOLD_WINDOWS is set; MADEIRA_WOW_ARENA_HOLD_GB=0 keeps none)\n",
+                     gb, (unsigned long)ios_fex_arena_base_unix, (unsigned long)ios_fex_arena_end_unix );
+    }
+    return hold;
+}
+
 struct builtin_module
 {
     struct list  entry;
@@ -19685,12 +19727,30 @@ static void *map_reserved_area_inner( void *limit_low, void *limit_high, size_t 
             void *end = (char *)start + area->size;
 
             /* ml799: the FEX arena serves only requests contained in it.
-             * ml2020: and every FEX_ONLY area serves such a request, whole: the
-             * emulator's limits name the first band only (ios_fex_arena_grow). */
+             * ml2020: the emulator's own request is served from every FEX_ONLY
+             * area, whole (its limits name the first band only, see
+             * ios_fex_arena_grow), less the arena's tail held for a 32-bit
+             * program; the WoW64 module's hardware-band request gets the arena
+             * only, clipped to its limits, as before (fex_arena_request_is_own). */
             if (area->fex_only)
             {
+                void *a_start = start, *a_end = end;
+
                 if (!fex_arena_covers( limit_low, limit_high )) continue;
-                if ((ptr = find_reserved_free_area_outside_preloader( start, end, size, top_down, align_mask ))) break;
+                if (fex_arena_request_is_own( limit_low, limit_high ))
+                {
+                    ULONG_PTR hold = ios_fex_arena_tail_hold();
+                    if (hold && start == (void *)ios_fex_arena_base_unix && area->size > hold + (1UL << 24))
+                        a_end = (char *)start + (area->size - hold);
+                }
+                else
+                {
+                    if (start != (void *)ios_fex_arena_base_unix) continue;   /* a grown band: not for the WoW64 module */
+                    if (start >= limit_high || end <= limit_low) continue;
+                    if (start < limit_low) a_start = (void *)ROUND_SIZE( 0, limit_low, host_page_mask );
+                    if (end > limit_high) a_end = ROUND_ADDR( limit_high, host_page_mask );
+                }
+                if ((ptr = find_reserved_free_area_outside_preloader( a_start, a_end, size, top_down, align_mask ))) break;
                 continue;
             }
             if (area->thin_only) continue;   /* Madeira: thin heads are placed at fixed slots */
@@ -19710,11 +19770,27 @@ static void *map_reserved_area_inner( void *limit_low, void *limit_high, size_t 
             void *end = (char *)start + area->size;
 
             /* ml799: the FEX arena serves only requests contained in it.
-             * ml2020: and every FEX_ONLY area serves such a request, whole (see above). */
+             * ml2020: the emulator's own request from every FEX_ONLY area, less
+             * the arena's held tail; the WoW64 module's from the arena only (see above). */
             if (area->fex_only)
             {
+                void *a_start = start, *a_end = end;
+
                 if (!fex_arena_covers( limit_low, limit_high )) continue;
-                if ((ptr = find_reserved_free_area_outside_preloader( start, end, size, top_down, align_mask ))) break;
+                if (fex_arena_request_is_own( limit_low, limit_high ))
+                {
+                    ULONG_PTR hold = ios_fex_arena_tail_hold();
+                    if (hold && start == (void *)ios_fex_arena_base_unix && area->size > hold + (1UL << 24))
+                        a_end = (char *)start + (area->size - hold);
+                }
+                else
+                {
+                    if (start != (void *)ios_fex_arena_base_unix) continue;   /* a grown band: not for the WoW64 module */
+                    if (start >= limit_high || end <= limit_low) continue;
+                    if (start < limit_low) a_start = (void *)ROUND_SIZE( 0, limit_low, host_page_mask );
+                    if (end > limit_high) a_end = ROUND_ADDR( limit_high, host_page_mask );
+                }
+                if ((ptr = find_reserved_free_area_outside_preloader( a_start, a_end, size, top_down, align_mask ))) break;
                 continue;
             }
             if (area->thin_only) continue;   /* Madeira: thin heads are placed at fixed slots */
@@ -20381,8 +20457,9 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
 #ifdef WINE_IOS
             /* ml2020: the emulator's arena is full and this request names it:
              * hold another FEX_ONLY band and place the view there (see
-             * ios_fex_arena_grow). Only for the emulator's own requests. */
-            if (!ceiling_relaxable && fex_arena_covers( (void *)limit_low, (void *)limit_high ) &&
+             * ios_fex_arena_grow). Only for the ARM64EC module's own requests;
+             * the WoW64 module's hardware-band request fails as before. */
+            if (!ceiling_relaxable && fex_arena_request_is_own( (void *)limit_low, (void *)limit_high ) &&
                 ios_fex_arena_grow( view_size ) &&
                 (ptr = map_reserved_area( start, end, host_size, top_down, unix_prot, align_mask )))
             {
