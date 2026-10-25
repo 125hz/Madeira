@@ -465,8 +465,11 @@ struct LibraryEntry: Codable, Identifiable {
         entry.id = bigPictureID; entry.bigPicture = true; entry.graphicsAPI = "Steam"; entry.launchMode = "desktop"
         return entry
     }
-    /// Steam's folder inside the prefix (Windows path, Unix path), when steam.exe is there.
-    static var steamClientFolder: (windows: String, unix: String)? {
+    /// Madeira Dock's Steam folder inside the prefix (Windows path, Unix path), when its
+    /// steam.exe is there. Its component set is PINNED (SteamRuntime: steamclient64.dll must be
+    /// the build the Dock host supports), so the client UI must never run from it: steam.exe
+    /// would complete the install from Valve's CDN and replace the pinned build.
+    static var dockSteamFolder: (windows: String, unix: String)? {
         let fm = FileManager.default
         guard let documents = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return nil }
         let prefix = documents.appendingPathComponent("wine").path
@@ -476,14 +479,42 @@ struct LibraryEntry: Codable, Identifiable {
         ]
         return candidates.first { fm.fileExists(atPath: "\($0.1)/steam.exe") }
     }
-    static var steamClientInstalled: Bool { steamClientFolder != nil }
-    /// Writes C:\big-picture.bat for this launch. False, having logged why, when Steam is not installed.
+    /// Big Picture's own Steam folder: Valve's client completes itself there on the first
+    /// run (steam.exe is Valve's bootstrapper: it fetches the client's packages, the web
+    /// helper included, from Valve's CDN into its own folder), leaving the Dock's pinned
+    /// install alone.
+    static var bigPictureFolder: (windows: String, unix: String)? {
+        guard let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return nil }
+        let prefix = documents.appendingPathComponent("wine").path
+        return ("C:\\Program Files\\Steam Big Picture", "\(prefix)/drive_c/Program Files/Steam Big Picture")
+    }
+    /// The button is offered when Big Picture's folder has a client, or the Dock's steam.exe
+    /// can seed one.
+    static var steamClientInstalled: Bool {
+        let fm = FileManager.default
+        if let bp = bigPictureFolder, fm.fileExists(atPath: "\(bp.unix)/steam.exe") { return true }
+        return dockSteamFolder != nil
+    }
+    /// Writes C:\big-picture.bat for this launch, seeding Big Picture's folder with the
+    /// Dock's steam.exe when it has none yet. False, having logged why, when there is no client.
     @discardableResult
     static func writeBigPictureBatch() -> Bool {
-        guard let folder = steamClientFolder,
-              let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
-            LogStore.shared.log("[big-picture] Steam is not installed in this prefix (steam.exe not found)", level: .error)
-            return false
+        let fm = FileManager.default
+        guard let folder = bigPictureFolder,
+              let documents = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return false }
+        if !fm.fileExists(atPath: "\(folder.unix)/steam.exe") {
+            guard let dock = dockSteamFolder else {
+                LogStore.shared.log("[big-picture] no Steam client to start from: prepare Madeira Dock's Steam components first", level: .error)
+                return false
+            }
+            do {
+                try fm.createDirectory(atPath: folder.unix, withIntermediateDirectories: true)
+                try fm.copyItem(atPath: "\(dock.unix)/steam.exe", toPath: "\(folder.unix)/steam.exe")
+                LogStore.shared.log("[big-picture] seeded \(folder.windows) with the Dock's steam.exe; Valve's client completes itself there on this first run (a download from Valve's CDN)")
+            } catch {
+                LogStore.shared.log("[big-picture] could not seed \(folder.windows): \(error.localizedDescription)", level: .error)
+                return false
+            }
         }
         let bat = [
             "@echo off",
