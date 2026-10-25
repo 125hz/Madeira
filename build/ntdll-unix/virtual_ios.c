@@ -21798,6 +21798,25 @@ static int ios_swap_is_fexjit( uintptr_t b, size_t size )
     if (ios_jit_low_overlaps( b, size )) return 1;   /* madeira-bcd pool-low: region C */
     return 0;
 }
+static int ios_swap_wow_in_session( void );
+/* ml2021: a 64-bit program's range while a 32-bit program is in the session. The
+ * churn filter (ml1258) keeps short-lived sizes anonymous; beside a 32-bit title
+ * the 64-bit launcher chain is idle, and log 74 left 420 GB of its commits
+ * anonymous that way: the kernel then compressed the resident ones INTO the
+ * footprint (compressed 2.8 GB of the 6 GB limit) instead of evicting them from
+ * the file. Such a range skips the filter and goes to the file like any other
+ * (MADEIRA_SWAP_X64_CHURN=1 keeps the filter for it). */
+static int ios_swap_x64_idle( uintptr_t b, size_t size )
+{
+    static int keep = -1;
+    if (keep < 0)
+    {
+        const char *e = getenv( "MADEIRA_SWAP_X64_CHURN" );   /* 1: the churn filter also covers 64-bit ranges beside a 32-bit program */
+        keep = e && e[0] == '1';
+    }
+    if (keep || !ios_swap_broad || !ios_swap_wow_in_session()) return 0;
+    return ios_wow_window_covering( (const void *)b, (const void *)(b + size) ) == 0;
+}
 static int ios_swap_why( const void *base, size_t size, unsigned int vprot, struct file_view *view )
 {
     uintptr_t b = (uintptr_t)base;
@@ -21809,7 +21828,7 @@ static int ios_swap_why( const void *base, size_t size, unsigned int vprot, stru
     if (ios_swap_broad) { if (b + size > 0x7c00000000ULL) return IOS_SW_BAND; }   /* ml1257: FEX's band and above */
     else if (!ios_swap_wide && (b < 0x7000000000ULL || b >= 0x7c00000000ULL)) return IOS_SW_BAND;
     if (size < ios_swap_min) return IOS_SW_SMALL;
-    if (ios_swap_churny( size )) { ios_swap_churn_skips++; return IOS_SW_CHURN; }   /* ml1258 */
+    if (ios_swap_churny( size ) && !ios_swap_x64_idle( b, size )) { ios_swap_churn_skips++; return IOS_SW_CHURN; }   /* ml1258 */
     return IOS_SW_BACKED;
 }
 static const char *ios_swap_map_tag = "";   /* ml1257: the "backed" log line names whole reservations */

@@ -66,10 +66,18 @@ for m in re.finditer(r'static let (\w+) = GameRecommendation\(\n\s*id: "([^"]+)"
     presets[ident] = dict(name=name, title=title, version=int(version), lines=lines, switches=' '.join((switches or '').split()))
 assert set(presets) == {'rdr2-steam', 'rdr2-other', 'gta5e-steam', 'gta5e-other', 'gta5l-steam', 'gta4-steam', 'ghost-of-tsushima',
                         'god-of-war', 'horizon-zero-dawn', 'horizon-forbidden-west', 'ratchet-clank-rift-apart', 'crysis-remastered',
-                        'crysis-2-remastered', 'crysis-3-remastered', 'standard'}, sorted(presets)
+                        'crysis-2-remastered', 'crysis-3-remastered', 'steam-big-picture', 'standard'}, sorted(presets)
 assert ('static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, gta5LegacySteam, gta4Steam, ghostOfTsushima,\n'
         '                      godOfWar, horizonZeroDawn, horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered, crysis2Remastered,\n'
-        '                      crysis3Remastered, standard]') in lists_src
+        '                      crysis3Remastered, steamBigPicture, standard]') in lists_src
+# ml2021: the Big Picture entry (C:\big-picture.bat) is recognised by its batch name and gets the Steam Big Picture list
+assert 'if last == "big-picture.bat" { return steamBigPicture }' in lists_src
+assert 'static var bigPictureEntry: LibraryEntry' in library and 'relativePath: "big-picture.bat"' in library \
+    and 'entry.bigPicture = true' in library and 'entry.launchMode = "desktop"' in library, 'the library offers the Big Picture entry (desktop-mode batch)'
+assert 'if bigPicture == true { Self.writeBigPictureBatch() }' in library and '-bigpicture -no-cef-sandbox -cef-disable-gpu' in library, \
+    'the batch (services.exe, then steam.exe -bigpicture) is written at every launch'
+assert 'if LibraryEntry.steamClientInstalled {' in library and 'Label("Big Picture", systemImage: "gamecontroller")' in library, \
+    'the Big Picture button sits beside the Desktop button once steam.exe is installed'
 
 # madeira-bcd's defaults where upstream's differ: every game madeira-bcd ran had them,
 # so every game's own list ends with them. The standard list reaches every other game
@@ -112,7 +120,7 @@ for ident, p in presets.items():
         if key != 'env.WINEDLLOVERRIDES':
             named = named.replace('socialclubhelper.exe', '')
         assert 'socialclub' not in named and 'MADEIRA_DLL_LOCAL' not in line, (ident, line)
-print('PASS: fifteen lists, two comment lines each, every game list ends with the four fork defaults and the standard one has none, no key twice, '
+print('PASS: sixteen lists, two comment lines each, every game list ends with the four fork defaults and the standard one has none, no key twice, '
       'every non-env key in the settings catalog, no Social Club DLL lines, no variant DLL switches')
 
 # Red Dead Redemption 2 from Steam: the owner's list of 2026-10-09 (build 463), line for line,

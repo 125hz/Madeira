@@ -838,13 +838,52 @@ enum GameRecommendations {
         env.MADEIRA_EC_HOOK_TRACE = 0
         """)
 
+    /// ml2021: Valve's client in Big Picture (the library's Big Picture button;
+    /// C:\big-picture.bat in the Wine desktop, LibraryEntry.bigPictureEntry). A
+    /// 64-bit Chromium host like the publisher launcher's helper, so it takes that
+    /// chain's memory lines: Social Club layout 2 for libcef.dll's PartitionAlloc
+    /// pools, the emulator's code buffers below the window, pure-x64 images
+    /// uncopied, the stamped orphan-lock mode, GDI's shared section (the client's
+    /// updater, iDeck's finding), and the swap tier with the donor pool so the web
+    /// helper's idle pages leave the footprint. No release delay: the client's
+    /// allocator reserves, releases and reserves again (the standard list dropped it
+    /// for Madeira Dock's "Loading Steam"). Not yet run on device.
+    static let steamBigPicture = GameRecommendation(
+        id: "steam-big-picture", title: "Steam Big Picture", version: 1,
+        config: """
+        # Madeira's recommended settings for Steam Big Picture.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        swap-mb = 4096
+        swap-min-mb = 1
+        env.MADEIRA_SWAP_COVERAGE = broad
+        donor-pool-mb = 4096
+        pool-low = 1
+        pool-page-fit = 1
+        pool-split = 1
+        env.MADEIRA_SC_PA_POOLS = 2
+        env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
+        env.MADEIRA_POOL_LOW_IMAGES = 1
+        env.MADEIRA_POOL_RECYCLE_IMAGES = 1
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        env.MADEIRA_LOCK_ORPHAN = stamped
+        env.MADEIRA_GDI_SHARED_SECTION = 1
+        env.MADEIRA_TOUCH_MOUSE = 1
+        env.MADEIRA_FREE_DELAY_MS = 0
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        fastSync: true, display: "fit")
+
     /// The 3 GB RAM swap a device with less than 12 GB of RAM gets in GTA V
     /// Legacy's list.
     static let smallRAMSwapLines = "swap-mb = 3072"
 
     static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, gta5LegacySteam, gta4Steam, ghostOfTsushima,
                       godOfWar, horizonZeroDawn, horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered, crysis2Remastered,
-                      crysis3Remastered, standard]
+                      crysis3Remastered, steamBigPicture, standard]
 
     // MARK: Recognising a game
 
@@ -867,6 +906,7 @@ enum GameRecommendations {
         let parts = path.lowercased().split(separator: "\\").map(String.init)
         guard let last = parts.last else { return nil }
         let steamFolder = steamCommonFolder(parts)
+        if last == "big-picture.bat" { return steamBigPicture }   // ml2021: the library's Big Picture entry
         guard last.hasSuffix(".exe") else {
             // A library Steam game: its App ID, or its install folder right under
             // steamapps\common (not a batch file inside it).
