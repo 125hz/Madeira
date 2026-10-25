@@ -34,6 +34,17 @@ final class ProMotionIntent {
     /// The opt-in above; read when a session's pacing is applied.
     static var holdMaximum: Bool { MadeiraConfig.flag("MADEIRA_PROMOTE", fallback: false) }
 
+    /// ml2020: hold the panel at 60 Hz under the 60 and 30 caps too. Without any
+    /// display link a ProMotion iPhone lets the panel idle once nothing drives
+    /// it: a 32-bit title under the 60 cap presented at a steady 9.9 FPS with
+    /// the GPU 1% busy, every frame parked 80 ms in nextDrawable (the compositor
+    /// handing drawables back at the idle rate), 43 FPS while the user's touches
+    /// kept the panel up (device logs 2026-10-25, `[gpu-perf] ml1254`). A 60 Hz
+    /// range is the smallest intent that keeps the compositor at the cap's own
+    /// grid. `env.MADEIRA_PANEL_IDLE = 1` restores the old behaviour (no link
+    /// under the 60 and 30 caps).
+    static var panelFloor: Bool { !MadeiraConfig.flag("MADEIRA_PANEL_IDLE", fallback: false) }
+
     /// Whether DXMT has the 30 FPS cap (vsync mode 3) and the display-rate
     /// hook. Both arrive with willfaust/dxmt#1; without it mode 3 would run
     /// uncapped, so the 30 choice is offered only when this is true.
@@ -83,9 +94,10 @@ final class ProMotionIntent {
 
     /// The intent that belongs to a given pacing mode (0 = none). See the type comment.
     static func maxHz(for mode: Int32) -> Int {
-        if mode == 3 { return holdMaximum ? min(60, panelMaxFPS) : 0 }   // 30 cap
-        if mode == 1 { return holdMaximum ? panelMaxFPS : 0 }            // 60 cap
-        return panelMaxFPS                                                // MAX, RAW, 40 cap
+        let floor = panelFloor ? min(60, panelMaxFPS) : 0                 // ml2020: see panelFloor
+        if mode == 3 { return holdMaximum ? min(60, panelMaxFPS) : floor }   // 30 cap
+        if mode == 1 { return holdMaximum ? panelMaxFPS : floor }            // 60 cap
+        return panelMaxFPS                                                    // MAX, RAW, 40 cap
     }
 
     /// Arms or releases the link for `mode` and publishes the rates to DXMT.
