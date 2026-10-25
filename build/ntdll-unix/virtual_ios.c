@@ -21539,15 +21539,13 @@ static void ios_donor_free_insert( uint64_t off, uint64_t len )
         ios_donor_merges++;
     }
 }
-/* A pool offset for len bytes inside one region, or -1 (the guard, or no room). */
-static uint64_t ios_donor_take( size_t len )
+/* The guard: 1 refuses every take (iOS reported memory pressure, or the optional free-RAM floor). */
+static int ios_donor_guard( size_t len )
 {
-    unsigned i, best = ~0u, n = __atomic_load_n( &ios_donor_nreg, __ATOMIC_ACQUIRE );
-    if (!n || len > ios_donor_region) return (uint64_t)-1;
     if (__atomic_load_n( &ios_donor_pressure, __ATOMIC_RELAXED ))
     {
         ios_donor_guarded++;
-        return (uint64_t)-1;
+        return 1;
     }
     if (ios_donor_margin)   /* ml2021: off by default; free_count alone refused 573 of 1003 takes on device (log 70) */
     {
@@ -21558,29 +21556,76 @@ static uint64_t ios_donor_take( size_t len )
             ios_donor_guarded++;
             if (said++ < 4) dprintf( 2, "[swap] ml1150 donor pool: take of %zu KB refused, host free %llu MB < margin %llu MB\n",
                                      len >> 10, (unsigned long long)(free_now >> 20), (unsigned long long)(ios_donor_margin >> 20) );
-            return (uint64_t)-1;
+            return 1;
         }
     }
+    return 0;
+}
+/* Take free-list entry i whole and return its offset (the list stays sorted). */
+static uint64_t ios_donor_free_take_whole( unsigned i )
+{
+    uint64_t off = ios_donor_free[i].off;
+    memmove( &ios_donor_free[i], &ios_donor_free[i + 1], (ios_donor_nfree - i - 1) * sizeof(ios_donor_free[0]) );
+    ios_donor_nfree--;
+    return off;
+}
+#define IOS_DONOR_MIN_PIECE (1u << 20)
+static unsigned long long ios_donor_pieces;   /* ml2021: takes served as a piece smaller than asked */
+/* A pool offset for a piece of up to `want` bytes inside one region; *got is the
+ * piece's length. The exact length first (best fit in the free list, then bump
+ * room), then (ml2021) the largest piece available -- the biggest free entry or
+ * the biggest bump room -- so a request larger than a region, or larger than any
+ * one hole, is served in pieces instead of refused: log 71 kept 969 MB of a 32-bit
+ * program's memory in the footprint while the pool had 2.5 GB free. -1: the
+ * guard, or no piece of IOS_DONOR_MIN_PIECE. */
+static uint64_t ios_donor_take_upto( size_t want, size_t *got )
+{
+    unsigned i, best = ~0u, big = ~0u, room_i = ~0u, n = __atomic_load_n( &ios_donor_nreg, __ATOMIC_ACQUIRE );
+    size_t room = 0;
+    *got = 0;
+    if (!n || !want) return (uint64_t)-1;
+    if (ios_donor_guard( want )) return (uint64_t)-1;
+    if (want > ios_donor_region) want = (size_t)ios_donor_region;
     for (i = 0; i < ios_donor_nfree; i++)
-        if (ios_donor_free[i].len >= len && (best == ~0u || ios_donor_free[i].len < ios_donor_free[best].len)) best = i;
+    {
+        if (ios_donor_free[i].len >= want && (best == ~0u || ios_donor_free[i].len < ios_donor_free[best].len)) best = i;
+        if (big == ~0u || ios_donor_free[i].len > ios_donor_free[big].len) big = i;
+    }
     if (best != ~0u)
     {
         uint64_t off = ios_donor_free[best].off;
-        if (ios_donor_free[best].len > len) { ios_donor_free[best].off += len; ios_donor_free[best].len -= len; }
-        else
-        {   /* ml1151: remove in place; the list stays sorted */
-            memmove( &ios_donor_free[best], &ios_donor_free[best + 1], (ios_donor_nfree - best - 1) * sizeof(ios_donor_free[0]) );
-            ios_donor_nfree--;
-        }
+        if (ios_donor_free[best].len > want) { ios_donor_free[best].off += want; ios_donor_free[best].len -= want; }
+        else ios_donor_free_take_whole( best );   /* ml1151: remove in place; the list stays sorted */
+        *got = want;
         return off;
     }
     for (i = 0; i < n; i++)
-        if (ios_donor_reg[i].bump + len <= ios_donor_region)
+    {
+        size_t r = (size_t)(ios_donor_region - ios_donor_reg[i].bump);
+        if (r >= want)
         {
             uint64_t off = (uint64_t)i * ios_donor_region + ios_donor_reg[i].bump;
-            ios_donor_reg[i].bump += len;
+            ios_donor_reg[i].bump += want;
+            *got = want;
             return off;
         }
+        if (r > room) { room = r; room_i = i; }
+    }
+    /* ml2021: the largest piece there is */
+    if (big != ~0u && ios_donor_free[big].len >= room && ios_donor_free[big].len >= IOS_DONOR_MIN_PIECE)
+    {
+        *got = (size_t)ios_donor_free[big].len;
+        ios_donor_pieces++;
+        return ios_donor_free_take_whole( big );
+    }
+    if (room >= IOS_DONOR_MIN_PIECE)
+    {
+        uint64_t off = (uint64_t)room_i * ios_donor_region + ios_donor_reg[room_i].bump;
+        ios_donor_reg[room_i].bump += room;
+        *got = room;
+        ios_donor_pieces++;
+        return off;
+    }
     return (uint64_t)-1;
 }
 static int ios_donor_map( char *va, size_t len, int unix_prot, uint64_t off )
@@ -21616,10 +21661,10 @@ static void ios_donor_give( uint64_t off, size_t len )
     ios_donor_free_insert( off, len );
 }
 #else
-static uint64_t ios_donor_take( size_t len ) { (void)len; return (uint64_t)-1; }
+static uint64_t ios_donor_take_upto( size_t want, size_t *got ) { (void)want; *got = 0; return (uint64_t)-1; }
 static int ios_donor_map( char *va, size_t len, int unix_prot, uint64_t off ) { (void)va; (void)len; (void)unix_prot; (void)off; return -1; }
 static void ios_donor_give( uint64_t off, size_t len ) { (void)off; (void)len; }
-static unsigned long long ios_donor_bytes, ios_donor_peak, ios_donor_takes, ios_donor_guarded, ios_donor_lost, ios_donor_merges;
+static unsigned long long ios_donor_bytes, ios_donor_peak, ios_donor_takes, ios_donor_guarded, ios_donor_lost, ios_donor_merges, ios_donor_pieces;
 #endif
 /* ml2021: the performance overlay's view of the tier (Library.swift "Swap & donor"): MB
  * backed by the swap file, MB served from the donor pool, the pool's registered size, and
@@ -21788,51 +21833,124 @@ static int ios_swap_wow64_policy( void )
     return policy;
 }
 static unsigned long long ios_swap_wow_kept;   /* ml2021: bytes a 32-bit program's commits kept in RAM instead of the file */
+/* ml2021: whether a 32-bit program is in the session (a guest window held for one
+ * or adopted by one). While it is, the donor pool's RAM is its: log 71 had the
+ * 64-bit launcher chain holding 1.5 GB of the pool when the 32-bit title's own
+ * heap arrived, the device ran out of RAM (host free 62 MB), iOS reported
+ * CRITICAL pressure and the guard then kept 969 MB of the title's memory in the
+ * app's footprint, which reached the 6 GB limit. */
+static int ios_swap_wow_in_session( void )
+{
+    unsigned i;
+    for (i = 0; i < ios_wow_window_count; i++) if (ios_wow_windows[i].base) return 1;
+    for (i = 0; i < ios_wow_placeholder_count; i++) if (ios_wow_placeholders[i].base) return 1;
+    return 0;
+}
+/* ml2021: madeira.cfg swap-x64 -- where a 64-bit range goes first. 0/unset: the
+ * swap file while a 32-bit program is in the session (its idle pages are then the
+ * kernel's to evict, and the pool stays for the 32-bit program), the donor pool
+ * otherwise; 1: the donor pool first, always (pre-ml2021); 2: the file first, always.
+ * The other stage is the fallback either way. Read once under virtual_mutex. */
+static int ios_swap_x64_policy( void )
+{
+    static int policy = -1;
+    if (policy < 0)
+    {
+        policy = (int)madeira_cfg_int( "swap-x64", 0 );   /* 0: file first while a 32-bit program is in the session; 1: donor pool first; 2: file first */
+        if (policy < 0 || policy > 2) policy = 0;
+        dprintf( 2, "[swap] ml2021 64-bit programs: %s (madeira.cfg swap-x64 = %d)\n",
+                 policy == 1 ? "donor RAM first, then the swap file" : policy == 2 ? "the swap file first, then donor RAM"
+                 : "the swap file first while a 32-bit program is in the session, donor RAM first otherwise", policy );
+    }
+    return policy;
+}
+static unsigned ios_swap_map_first;   /* ml2021: the extent index a map call started at (a call may add several) */
+/* One extent of the tier at [hs, hs+len), pool offset `off` (IOS_DONOR_FLAG for the pool). */
+static void ios_swap_record( char *hs, size_t len, uint64_t off, size_t key )
+{
+    ios_swap_ext[ios_swap_n].va = hs; ios_swap_ext[ios_swap_n].len = len; ios_swap_ext[ios_swap_n].off = off;
+    ios_swap_ext[ios_swap_n].resv = 0; ios_swap_ext[ios_swap_n].key = key; ios_swap_ext[ios_swap_n].img = 0;
+    ios_swap_ext[ios_swap_n].born = ios_swap_broad ? ios_swap_now_ns() : 0; ios_swap_n++;
+    ios_swap_churn_backed( key );   /* ml1226 */
+    ios_swap_bytes += len; if (ios_swap_bytes > ios_swap_peak) ios_swap_peak = ios_swap_bytes;
+}
+/* ml2021: map [hs, hs+len) from the donor pool in as many pieces as it takes;
+ * returns the bytes mapped from the start (0: nothing, the guard or an empty pool). */
+static size_t ios_swap_donor_pieces( char *hs, size_t len, int unix_prot, size_t key )
+{
+    size_t done = 0;
+    while (done < len && ios_swap_n < 16384)
+    {
+        size_t got = 0;
+        uint64_t off = ios_donor_take_upto( len - done, &got );
+        if (off == (uint64_t)-1 || !got) break;
+        if (ios_donor_map( hs + done, got, unix_prot, off ))
+        {
+            ios_donor_bytes += got;   /* give subtracts */
+            ios_donor_give( off, got );
+            break;
+        }
+        ios_donor_bytes += got; if (ios_donor_bytes > ios_donor_peak) ios_donor_peak = ios_donor_bytes;
+        ios_donor_takes++;
+        ios_swap_record( hs + done, got, off | IOS_DONOR_FLAG, key );
+        done += got;
+    }
+    return done;
+}
 /* Map the host-page interior of [base, base+size) from the file with
  * unix_prot. Returns IOS_SW_BACKED, IOS_SW_SMALL, IOS_SW_REFUSED or IOS_SW_MAPFAIL. */
 static int ios_swap_map( void *base, size_t size, int unix_prot )
 {
     char *hs = (char *)(((uintptr_t)base + host_page_mask) & ~(uintptr_t)host_page_mask);
     char *he = (char *)(((uintptr_t)base + size) & ~(uintptr_t)host_page_mask);
-    size_t len; uint64_t off; void *p; int wow;
+    size_t len, done; uint64_t off; void *p; int wow, donor_first, x64;
     if (he <= hs) return IOS_SW_SMALL;
     if (ios_swap_n >= 16384) { if (ios_swap_v2) ios_swap_refused++; return IOS_SW_REFUSED; }
     /* ml1257: in broad the cap is the disk the sparse file really occupies */
     if (ios_swap_broad && ios_swap_disk_used() >= ios_swap_cap) { ios_swap_disk_refused++; ios_swap_refused++; return IOS_SW_REFUSED; }
     len = he - hs;
+    ios_swap_map_first = ios_swap_n;
     wow = ios_wow_window_covering( hs, he ) != 0;   /* ml2021: a 32-bit program's range */
     if (wow && ios_swap_wow64_policy() == 2) { ios_swap_wow_kept += len; return IOS_SW_WOW64; }
-    off = ios_donor_take( len );   /* ml1150: the donor pool first, while the guard allows */
-    if (off != (uint64_t)-1)
+    x64 = ios_swap_x64_policy();
+    donor_first = wow || x64 == 1 || (x64 == 0 && !ios_swap_wow_in_session());
+    if (donor_first)   /* ml1150: the donor pool first, while the guard allows; ml2021: in pieces */
     {
-        if (!ios_donor_map( hs, len, unix_prot, off ))
+        done = ios_swap_donor_pieces( hs, len, unix_prot, size );
+        if (done == len) { off = ios_swap_ext[ios_swap_n - 1].off; goto mapped; }
+        hs += done; len -= done;
+        if (wow && ios_swap_wow64_policy() != 1)   /* ml2021: the rest stays RAM, not the file */
         {
-            off |= IOS_DONOR_FLAG;
-            ios_donor_bytes += len; if (ios_donor_bytes > ios_donor_peak) ios_donor_peak = ios_donor_bytes;
-            ios_donor_takes++;
-            p = hs;
+            ios_swap_wow_kept += len;
+            if (!done) return IOS_SW_WOW64;
+            len = done; hs -= done; off = ios_swap_ext[ios_swap_n - 1].off;
             goto mapped;
         }
-        ios_donor_give( off, len );
-        ios_donor_bytes += len;   /* give subtracts */
     }
-    if (wow && ios_swap_wow64_policy() != 1) { ios_swap_wow_kept += len; return IOS_SW_WOW64; }   /* ml2021: RAM, not the file */
     off = ios_swap_take( len );
-    if (off == (uint64_t)-1) { ios_swap_refused++; return IOS_SW_REFUSED; }
+    if (off == (uint64_t)-1)
+    {
+        if (!donor_first && (done = ios_swap_donor_pieces( hs, len, unix_prot, size )) != 0)   /* ml2021: the pool behind the file */
+        {
+            off = ios_swap_ext[ios_swap_n - 1].off;
+            if (done == len) goto mapped;
+            ios_swap_refused++;
+            len = done;
+            goto mapped;
+        }
+        ios_swap_refused++;
+        return ios_swap_n > ios_swap_map_first ? IOS_SW_BACKED : IOS_SW_REFUSED;
+    }
     p = mmap( hs, len, unix_prot, MAP_FIXED | MAP_SHARED, ios_swap_fd, (off_t)off );
     if (p == MAP_FAILED)
     {
         static int said;
         if (said++ < 8) dprintf( 2, "[swap] ml1077 mmap MAP_SHARED %p+0x%zx failed errno=%d (range stays anonymous)\n", hs, len, errno );
         ios_swap_give( off, len );
-        return IOS_SW_MAPFAIL;
+        return ios_swap_n > ios_swap_map_first ? IOS_SW_BACKED : IOS_SW_MAPFAIL;
     }
+    ios_swap_record( hs, len, off, size );
 mapped:
-    ios_swap_ext[ios_swap_n].va = hs; ios_swap_ext[ios_swap_n].len = len; ios_swap_ext[ios_swap_n].off = off;
-    ios_swap_ext[ios_swap_n].resv = 0; ios_swap_ext[ios_swap_n].key = size; ios_swap_ext[ios_swap_n].img = 0;
-    ios_swap_ext[ios_swap_n].born = ios_swap_broad ? ios_swap_now_ns() : 0; ios_swap_n++;
-    ios_swap_churn_backed( size );   /* ml1226 */
-    ios_swap_bytes += len; if (ios_swap_bytes > ios_swap_peak) ios_swap_peak = ios_swap_bytes;
     ios_swap_backs++;
     /* ml1081: NO page touches under virtual_mutex. ml1078's first-touch timing loop
      * ran here with the lock held; in ph-rdr46 that thread sat in a single page-in
@@ -22008,9 +22126,9 @@ void ios_swap_stats_line( void )
                  ios_swap_img_bytes >> 20, ios_swap_img_peak >> 20, ios_swap_img_backs, ios_swap_img_refused );
     if (ios_donor_takes || ios_donor_guarded)
         dprintf( 2, "[swap] ml1150 donor pool: %llu MB in use (peak %llu), %llu takes, %llu guarded, %llu MB lost to a full free list, %llu merges"
-                    " | ml2021 host free %llu MB, 32-bit kept in RAM %llu MB\n",
+                    " | ml2021 host free %llu MB, 32-bit kept in RAM %llu MB, %llu pieces\n",
                  ios_donor_bytes >> 20, ios_donor_peak >> 20, ios_donor_takes, ios_donor_guarded, ios_donor_lost >> 20, ios_donor_merges,
-                 (unsigned long long)(ios_donor_system_free() >> 20), ios_swap_wow_kept >> 20 );
+                 (unsigned long long)(ios_donor_system_free() >> 20), ios_swap_wow_kept >> 20, ios_donor_pieces );
     /* ml1221: the census (bytes by reason) with every stats line, ~10 s, not only
      * after its own 30 s: Ori and the Will of the Wisps was jetsammed at 26 s and never printed one. */
     ios_swap_tick( 1 );
@@ -22117,8 +22235,8 @@ static void ios_swap_reserve( void *base, size_t size, unsigned int vprot, struc
     if (ios_swap_map( base, size, get_unix_prot( vprot ) ) != IOS_SW_BACKED) return;
     /* ml1257: decommit inside it punches in place, like broad's reservations, so a
      * small recommit stays file-backed instead of splitting the extent (wide has not
-     * run on a device yet). */
-    ios_swap_ext[ios_swap_n - 1].resv = 1;
+     * run on a device yet). ml2021: every extent the call made (pool pieces). */
+    { unsigned i; for (i = ios_swap_map_first; i < ios_swap_n; i++) ios_swap_ext[i].resv = 1; }
     ios_swap_resv_n++;
     ios_swap_resv_bytes += size;
     ios_swap_tick( 0 );
@@ -22152,7 +22270,8 @@ static int ios_swap_whole_resv( struct file_view *view, unsigned int vprot )
     ios_swap_map_tag = "";
     if (why == IOS_SW_BACKED)
     {
-        ios_swap_ext[ios_swap_n - 1].resv = 1;
+        unsigned i;
+        for (i = ios_swap_map_first; i < ios_swap_n; i++) ios_swap_ext[i].resv = 1;   /* ml2021: every piece */
         ios_swap_resv_n++;
         ios_swap_resv_bytes += view->size;
     }
