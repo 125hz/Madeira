@@ -6,9 +6,14 @@ library and downloads use, `docs/STEAM_LIBRARY.md`), which is closed
 while a game session holds the account: saves sync before and after a
 session, and during one only on the game menu's upload button.
 
-It is on by default. **Settings › Steam Cloud saves** turns it off, which
-keeps `env.MADEIRA_STEAM_CLOUD = 0` in `madeira.cfg`; turning it back on
-syncs the installed games at once.
+It is on by default. The **Steam Cloud saves** switch in **Settings › Steam**
+turns it off, which keeps `env.MADEIRA_STEAM_CLOUD = 0` in `madeira.cfg`.
+Off, Madeira checks, downloads and uploads nothing: Play never waits or
+asks, the game page's Steam Cloud section and the game menu's upload button
+are hidden, a running transfer stops between files, and saves stay as they
+are on the device and in the cloud. The log says `[steam-cloud] off (setting)`
+once per app run. Turning it back on drops what earlier checks found and
+syncs the installed games at once against the record of the last sync.
 `env.MADEIRA_STEAM_CLOUD_AUTO = 0` keeps the comparison and the game page
 but copies nothing in either direction unless the user asks there.
 
@@ -80,6 +85,24 @@ file is written whole.
      too, never uploaded over the cloud's copy unasked;
    - synced before and now missing in the cloud (deleted elsewhere): left
      alone, not sent back.
+
+## Valve's client's file list
+
+Files a game writes through the Steam Cloud API live in Steam's
+`userdata/<account>/<app>/remote`, and Valve's client in a Madeira Dock
+session shows the game only those its `remotecache.vdf` lists. That client
+never downloads for the game (Madeira starts the game itself, so the launch
+sync does not run), and with no list it answers that there are no saves:
+Slay the Spire 2 then started a new profile over the progress Madeira had
+downloaded, and that new profile was uploaded as a change made on the device.
+So after every comparison, while no session runs, Madeira rewrites the list
+from the device: a file identical to the cloud's is listed as synced at the
+cloud's change number, one that differs or that only the device has keeps the
+client's entry (or gets the one the client gives a file the game wrote), and
+one that only the cloud has is left out. Log: `[steam-cloud] app=<id>
+remotecache synced=<n> device-only=<n> dropped=<n>`.
+`env.MADEIRA_STEAM_CLOUD_REMOTECACHE = 0` leaves the list as the client wrote
+it, as before; the log says `[steam-cloud] remotecache off` once per app run.
 
 ## Safety
 

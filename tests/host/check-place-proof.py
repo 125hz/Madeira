@@ -208,8 +208,18 @@ with tempfile.TemporaryDirectory() as tmp:
     assert out.returncode == 0, out.stderr
 
 # --- textual wiring -----------------------------------------------------------
+def definition_index(text, signature):
+    """The definition of `signature` (a '{' follows), not a forward declaration (a ';' follows)."""
+    i = text.find(signature)
+    while i >= 0:
+        semi, brace = text.find(';', i), text.find('{', i)
+        if brace != -1 and (semi == -1 or brace < semi):
+            return i
+        i = text.find(signature, i + 1)
+    raise ValueError(signature)
+
 def body(name):
-    b = src[src.index(name):]
+    b = src[definition_index(src, name):]
     return b[:b.index('\n}\n')]
 
 unmap = body('static void unmap_area( void *start, size_t size )')

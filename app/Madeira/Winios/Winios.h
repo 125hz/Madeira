@@ -43,6 +43,12 @@ void winios_post_touch_up(int x, int y);
  * down=1 press, down=0 release. */
 void winios_post_key(int vk, int down);
 
+/* Text-only paste: one Unicode scalar, optionally represented by a US-layout
+ * virtual key. Returns 0 when the queue is busy; retry without advancing.
+ * Cancel invalidates text already queued, without discarding physical input. */
+int winios_try_post_text(unsigned int scalar, int vk, int shift, int interval_ms);
+void winios_cancel_text(void);
+
 /* S2 desktop compositor placement. Called by the Swift presentation
  * placeholder (MetalBackedView) with its bounds in UIWindow coords —
  * the wine virtual desktop renders aspect-fit inside this frame, like
@@ -84,7 +90,7 @@ int winios_desktop_point_from_window(double wx, double wy, int *px, int *py);
  * user watched the Dock host's console window instead of the game. The app
  * keeps the starting screen until a window of the started game is up, and
  * needs to know, per top-level window: is it shown, how big, has it put a
- * frame on screen, and which program owns it.
+ * frame on screen, does it have a title bar, and which program owns it.
  *
  * Fed from the driver hooks on the window's own Wine thread (WindowPosChanged,
  * the GDI flush, DestroyWindow, the desktop-mode swapchain), so nothing polls
@@ -104,11 +110,14 @@ struct winios_census_window {
     unsigned char metal;          /* a D3D swapchain presents into it (DXMT) */
     unsigned char shown_once;     /* has been shown at least once */
     unsigned char restore_sent;   /* born minimized; SC_RESTORE posted */
+    unsigned char caption;        /* WS_CAPTION: a title bar (a message box or a dialog) */
     char image[WINIOS_CENSUS_IMAGE];
 };
 
 /* Main thread. on=1 starts an empty census (and forgets cached process paths,
- * whose ids a new session may reuse); on=0 stops and empties it. */
+ * whose ids a new session may reuse); on=0 stops and empties it. on=2 ends a
+ * running census but keeps the windows it knows and only goes on restoring a
+ * window first shown minimized, for the rest of the session. */
 void winios_window_census_enable(int on);
 
 /* Main thread. Copies up to `max` entries; returns how many were copied. */

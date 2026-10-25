@@ -354,7 +354,8 @@ configuration.
 **Settings › .NET Framework** shows Wine Mono's state, with **Download Wine
 Mono** or **Remove Wine Mono** (hidden in a build that carries it).
 Settings › Steam also shows the signed-in account with **Sign out of Steam**
-(or **Sign in to Steam**), **Madeira Dock** (Dock's sheet, with the last Dock
+(or **Sign in to Steam**), the **Steam Cloud saves** switch
+(`docs/STEAM_CLOUD.md`), **Madeira Dock** (Dock's sheet, with the last Dock
 result under it). A game started from the Dock sheet here runs as a library
 session: full-screen view, starting screen, in-game menu, and the
 one-session-per-run rule. That session is not added to the library.
@@ -422,11 +423,12 @@ Opt-in (`env.NAME = 1`), off by default:
 | Switch | `1` means |
 | --- | --- |
 | `MADEIRA_PROMOTE` | the display link also holds the panel at its maximum rate in the 60 FPS cap (Settings › Display) |
+| `MADEIRA_THERMAL_CAP` | while iOS reports the device as serious or critical, a session at the 60 cap, MAX or RAW runs at the 40 cap (30 where 40 is not offered) and returns to its own mode at nominal; a cap chosen during the session is kept. Logs `[thermal-cap]` |
 | `MADEIRA_DEVICE_STATS` | a `[device-load]` line (thermal state, low power, screen capture) every 10 s while Wine runs |
 
 Log tags: `[frontend]`, `[library]` (ml1163: each game's start mode, batch, services and working folder), `[display]`, `[display-shape]`, `[frontend-pointer]`, `[launch-view]`, `[startup-log]`, `[exit-report]`,
 `[session-once]`, `[library-surface]`, `[library-metadata]`, `[onboarding]`,
-`[frontend-controller]`, `[frontend-keyboard]`, `[device-load]`, `[promote]`.
+`[frontend-controller]`, `[frontend-keyboard]`, `[device-load]`, `[promote]`, `[thermal-cap]`.
 
 ## Tests
 

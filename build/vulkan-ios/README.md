@@ -15,9 +15,9 @@ require the diagnostic changes in the contributor's private Wine worktree.
 
 First satisfy `docs/BUILDING.md`, including a configured `wine/build-macos`,
 llvm-mingw, the existing native archives, and the SDK required by main. This is
-not a replacement bootstrap for those inputs. An SDK lacking
-`rusage_info_v6.ri_page_wait_time_mach` still needs the separate portability
-change proposed in #399 (or an SDK providing the field).
+not a replacement bootstrap for those inputs. The main-branch portability change merged in #399 now probes the optional
+`rusage_info_v6.ri_page_wait_time_mach` member; SDKs without it report the
+unavailable diagnostic sentinel rather than requiring that field.
 
 From the repository root:
 

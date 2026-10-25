@@ -101,8 +101,11 @@ modify them. **Uninstall** also removes the game's library entry.
 **A game that is not installed** opens its download sheet: artwork, playtime,
 **Install** (or **Resume download**), **Pause**, **Resume**, **Try again**,
 progress, speed and time left, **Cancel download** (a first-time install's
-partial files are deleted; an update is only stopped), the free space on the
-device and a link to the game's Steam Store page. When the download finishes,
+partial files are deleted; an update is only stopped), about how much the
+game downloads and takes on the device (the selected depots'
+`manifests.public.download` and `.size` from the cached library; a cache
+from before shows a note to refresh it), the free space on the device and a
+link to the game's Steam Store page. When the download finishes,
 the game becomes a library entry and the sheet's button reads **Open**, which
 opens its Game details page.
 
@@ -132,8 +135,23 @@ opens again when needed.
 account that owns the depot, so ownership is Steam's decision, not Madeira's.
 
 1. Product info of the app (and of the apps whose depots it shares) selects the
-   Windows, English, 64-bit (else 32-bit) depots, without DLC, redistributables
-   or regional alternates.
+   Windows, 64-bit (else 32-bit) depots of the game language, without DLC,
+   redistributables or regional alternates. The game language is
+   **Settings › Steam › Game language**, kept in madeira.cfg as
+   `env.MADEIRA_STEAM_LANGUAGE` (a Steam API language name such as
+   `japanese`); unset, it follows the device's language.
+   A game's own **Game language** (its download sheet, or the Steam section of
+   its Game details page) overrides the setting for that game; Default follows
+   it. The per-game choices are kept in the app's defaults (`steam-game-languages`). A game with no
+   depots in that language takes the English ones, as Valve's client does.
+   The install record's `UserConfig.language` names the game language when the
+   game supports it (`common.supported_languages`), even if its text is in the
+   common content, so Valve's client starts the game in it; else the depot
+   language. An installed game's page shows its language and, when the setting
+   differs or the record lacks that language's depots (a record edited by
+   hand), **Download in <language>**, which runs Repair with the new
+   selection (the files of the previous language stay). Log:
+   `[steam-depot] selection ... language=<depots>/<record>`.
 2. For each depot: the depot key, the manifest request code, a per-server
    authorization token, then the manifest from a content server (a single-entry
    zip; older depots encrypt the manifest as a whole). File names in a manifest
@@ -352,6 +370,11 @@ nothing else), and the Windows desktop client's installer and launch code.
 
 ## Tests
 
+`tests/host/check-steam-session-jobs.py` compiles the production session with
+a test connection. It checks that disconnecting during a send resumes each
+pending request once, even when the send then fails. It needs `swiftc` and
+Python 3 and never contacts Steam.
+
 `tests/host/check-steam-library.py` (needs `swiftc` on Linux, `cc`,
 `python3` with `cryptography` or the `openssl` command, and libssl, liblzma and
 zlib development files; it never contacts Steam):
@@ -414,8 +437,7 @@ Madeira Dock or as The game).
 ## Not included, and limits
 
 - No Steam Cloud, no achievements, no workshop content, no DLC installation,
-  no branch (beta) selection, no language selection: English, the public
-  branch.
+  no branch (beta) selection: the public branch.
 - A file that a newer build no longer contains is not deleted by an update
   (the install keeps it); **Uninstall** removes the whole folder.
 - Only the account's licenses are read; family sharing and free-on-demand

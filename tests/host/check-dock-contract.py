@@ -47,7 +47,7 @@ for name, text in [('MadeiraDock.swift', dock), ('MadeiraDockView.swift', view),
                     f'{name}: no credential or path in "{line.strip()[:60]}"')
 require('SteamSignIn.flag("MADEIRA_DOCK_COMPACT_POOL", default: false)' in view, 'compact pool is off unless opted in')
 pool = content.index('let dockLaunch = MadeiraDock.takeLaunchRequest()')
-require(pool < content.index('if let txt = MadeiraConfig.get("pool")', pool), 'madeira.cfg pool is applied after the Dock policy (explicit wins)')
+require(pool < content.index('if let txt = gamePool ?? MadeiraConfig.get("pool")', pool), 'madeira.cfg pool is applied after the Dock policy (explicit wins)')
 require('DockPerformancePolicy.sessionPoolMB(standard: 896, dock: dockLaunch.dock, compact: dockLaunch.compact)' in content,
         'the standard 896 MB pool is unchanged outside a compact Dock launch')
 require(content.count('MadeiraDock.requestLaunch(') == 1, 'only the Dock launch requests the Dock pool policy')

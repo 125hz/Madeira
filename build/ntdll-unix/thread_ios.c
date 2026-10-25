@@ -1242,6 +1242,10 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
             extern void ios_thread_died( unsigned tid );
             ios_thread_died( (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread );
         }
+        {
+            extern void ios_thread_qos_exit( unsigned tid );   /* MADEIRA_THREAD_QOS */
+            ios_thread_qos_exit( (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread );
+        }
     }
     pthread_exit( UIntToPtr(status) );
 }
@@ -1268,6 +1272,244 @@ void ios_eco_native_self( const char *who )
     if (!on) return;
     r = pthread_set_qos_class_self_np( QOS_CLASS_UTILITY, 0 );
     dprintf( 2, "[eco-native] madeira-bcd %s thread at utility QoS%s (MADEIRA_ECO_NATIVE)\n", who, r ? ": refused" : "" );
+}
+
+/* thread-qos: env.MADEIRA_THREAD_QOS = "GXWorker*=user-initiated;FD4JobWorker*=utility"
+ * (opt-in). Every guest thread runs at USER_INTERACTIVE, so the scheduler cannot
+ * tell a game's main thread from its worker pools: in Dark Souls III the five
+ * GXWorker threads took more performance-core time than the main thread, which
+ * spent 19 % of its time on the efficiency cores. With the switch, a thread whose
+ * name (SetThreadDescription) matches a pattern runs at that class instead; first
+ * match wins, '*' and '?' are wildcards, classes are user-interactive,
+ * user-initiated (initiated), default, utility, background. Threads with no
+ * name or no matching rule keep USER_INTERACTIVE, and ECO still overrides all.
+ *
+ * QoS can only be set by a thread on itself. A thread that names itself (also
+ * through a real handle, as Dark Souls III does) applies its class at once; a
+ * thread named by another one applies it at its next wait, sleep or yield: the
+ * name is stored under its tid and ios_eco_gen is bumped, so every guest thread
+ * re-runs ios_eco_apply_self (sync.c), whose pthread_set_qos_class_self_np is
+ * renamed to madeira_guest_qos_self below (build.sh compiles sync.c with
+ * -Dpthread_set_qos_class_self_np=madeira_guest_qos_self). Unset = nothing
+ * changes: madeira_guest_qos_self passes the class through untouched. */
+#define TQ_MAX_RULES   32
+#define TQ_MAX_THREADS 512
+struct tq_rule { char pat[64]; qos_class_t cls; };
+struct tq_thread { unsigned tid; qos_class_t cls; char name[48]; };
+static struct tq_rule tq_rules[TQ_MAX_RULES];
+static int tq_nrules;
+static int tq_on;
+static pthread_once_t tq_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t tq_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct tq_thread tq_threads[TQ_MAX_THREADS];   /* tid 0 = free slot */
+static __thread unsigned tq_self_tid;                 /* set once the TEB is known */
+static __thread qos_class_t tq_self_applied;          /* class this thread set through the switch, 0 = none */
+
+static const char *tq_class_name( qos_class_t c )
+{
+    switch (c)
+    {
+    case QOS_CLASS_USER_INTERACTIVE: return "user-interactive";
+    case QOS_CLASS_USER_INITIATED:   return "user-initiated";
+    case QOS_CLASS_DEFAULT:          return "default";
+    case QOS_CLASS_UTILITY:          return "utility";
+    case QOS_CLASS_BACKGROUND:       return "background";
+    default:                         return "?";
+    }
+}
+
+static qos_class_t tq_parse_class( const char *s )
+{
+    if (!strcmp( s, "user-interactive" ) || !strcmp( s, "interactive" )) return QOS_CLASS_USER_INTERACTIVE;
+    if (!strcmp( s, "user-initiated" ) || !strcmp( s, "initiated" )) return QOS_CLASS_USER_INITIATED;
+    if (!strcmp( s, "default" )) return QOS_CLASS_DEFAULT;
+    if (!strcmp( s, "utility" )) return QOS_CLASS_UTILITY;
+    if (!strcmp( s, "background" )) return QOS_CLASS_BACKGROUND;
+    return QOS_CLASS_UNSPECIFIED;
+}
+
+static int tq_glob( const char *p, const char *s )
+{
+    for (;;)
+    {
+        if (*p == '*')
+        {
+            while (*p == '*') p++;
+            if (!*p) return 1;
+            for (; *s; s++) if (tq_glob( p, s )) return 1;
+            return 0;
+        }
+        if (!*p) return !*s;
+        if (!*s || (*p != '?' && *p != *s)) return 0;
+        p++; s++;
+    }
+}
+
+static char *tq_trim( char *s, char *end )   /* [s, end) without surrounding blanks, NUL-terminated */
+{
+    while (s < end && (*s == ' ' || *s == '\t')) s++;
+    while (end > s && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '"')) end--;
+    if (s < end && *s == '"') s++;
+    *end = 0;
+    return s;
+}
+
+static void tq_init_once(void)
+{
+    const char *e = getenv( "MADEIRA_THREAD_QOS" );
+    char buf[1024], *p, *next;
+    if (!e || !*e) return;
+    snprintf( buf, sizeof(buf), "%s", e );
+    for (p = buf; p && *p && tq_nrules < TQ_MAX_RULES; p = next)
+    {
+        char *semi = strchr( p, ';' ), *end = semi ? semi : p + strlen( p ), *eq, *pat, *cls;
+        qos_class_t c;
+        next = semi ? semi + 1 : NULL;
+        *end = 0;
+        if (!(eq = strrchr( p, '=' ))) continue;
+        pat = tq_trim( p, eq );
+        cls = tq_trim( eq + 1, end );
+        if (!*pat || strlen( pat ) >= sizeof(tq_rules[0].pat)) continue;
+        if ((c = tq_parse_class( cls )) == QOS_CLASS_UNSPECIFIED)
+        {
+            dprintf( 2, "[thread-qos] ignored rule \"%s=%s\": unknown class\n", pat, cls );
+            continue;
+        }
+        strcpy( tq_rules[tq_nrules].pat, pat );
+        tq_rules[tq_nrules++].cls = c;
+    }
+    tq_on = tq_nrules > 0;
+    dprintf( 2, "[thread-qos] MADEIRA_THREAD_QOS: %d rule(s)%s\n", tq_nrules, tq_on ? "" : ", switch off" );
+}
+
+static int tq_enabled(void)
+{
+    pthread_once( &tq_once, tq_init_once );
+    return tq_on;
+}
+
+/* the class stored for tid (0 = none); copies its name into name[48] */
+static qos_class_t tq_lookup( unsigned tid, char *name )
+{
+    qos_class_t c = QOS_CLASS_UNSPECIFIED;
+    int i;
+    pthread_mutex_lock( &tq_lock );
+    for (i = 0; i < TQ_MAX_THREADS; i++)
+        if (tq_threads[i].tid == tid)
+        {
+            c = tq_threads[i].cls;
+            if (name) memcpy( name, tq_threads[i].name, sizeof(tq_threads[i].name) );
+            break;
+        }
+    pthread_mutex_unlock( &tq_lock );
+    return c;
+}
+
+/* cls 0 removes the entry; returns 1 if the stored class changed */
+static int tq_store( unsigned tid, qos_class_t cls, const char *name )
+{
+    int i, free_slot = -1, changed = 0;
+    pthread_mutex_lock( &tq_lock );
+    for (i = 0; i < TQ_MAX_THREADS; i++)
+    {
+        if (tq_threads[i].tid == tid) break;
+        if (!tq_threads[i].tid && free_slot < 0) free_slot = i;
+    }
+    if (i < TQ_MAX_THREADS)
+    {
+        changed = tq_threads[i].cls != cls;
+        if (cls)
+        {
+            tq_threads[i].cls = cls;
+            snprintf( tq_threads[i].name, sizeof(tq_threads[i].name), "%s", name ? name : "" );
+        }
+        else tq_threads[i].tid = 0;
+    }
+    else if (cls && free_slot >= 0)
+    {
+        tq_threads[free_slot].cls = cls;
+        snprintf( tq_threads[free_slot].name, sizeof(tq_threads[free_slot].name), "%s", name ? name : "" );
+        __atomic_store_n( &tq_threads[free_slot].tid, tid, __ATOMIC_RELEASE );
+        changed = 1;
+    }
+    pthread_mutex_unlock( &tq_lock );
+    return changed;
+}
+
+/* sync.c's ios_eco_apply_self calls this in place of pthread_set_qos_class_self_np */
+int madeira_guest_qos_self( qos_class_t cls, int rel )
+{
+    if (cls == QOS_CLASS_USER_INTERACTIVE && tq_self_tid && tq_enabled())
+    {
+        char name[48];
+        qos_class_t want = tq_lookup( tq_self_tid, name );
+        if (want)
+        {
+            int r = pthread_set_qos_class_self_np( want, 0 );
+            if (want != tq_self_applied)
+            {
+                tq_self_applied = want;
+                dprintf( 2, "[thread-qos] %04x %s -> %s%s\n", tq_self_tid, name,
+                         tq_class_name( want ), r ? " REFUSED, stays user-interactive" : "" );
+            }
+            if (!r) return 0;
+        }
+        else if (tq_self_applied)
+        {
+            tq_self_applied = QOS_CLASS_UNSPECIFIED;
+            dprintf( 2, "[thread-qos] %04x (no rule now) -> user-interactive\n", tq_self_tid );
+        }
+    }
+    else if (cls != QOS_CLASS_USER_INTERACTIVE) tq_self_applied = QOS_CLASS_UNSPECIFIED;   /* ECO class */
+    return pthread_set_qos_class_self_np( cls, rel );
+}
+
+/* start_thread, once the TEB is published: a thread named before it ran */
+static void ios_thread_qos_start( unsigned tid )
+{
+    extern void ios_eco_apply_self(void);
+    tq_self_tid = tid;
+    if (tq_enabled() && tq_lookup( tid, NULL )) ios_eco_apply_self();
+}
+
+/* thread exit: a reused tid must not inherit the class */
+void ios_thread_qos_exit( unsigned tid )
+{
+    if (tq_enabled()) tq_store( tid, QOS_CLASS_UNSPECIFIED, NULL );
+}
+
+/* set_native_thread_name */
+static void ios_thread_qos_named( HANDLE handle, const char *name )
+{
+    extern void ios_eco_apply_self(void);
+    extern volatile int ios_eco_gen;
+    unsigned self, tid = 0;
+    qos_class_t cls = QOS_CLASS_UNSPECIFIED;
+    int i, changed;
+
+    if (!tq_enabled()) return;
+    self = (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread;
+    if (handle == GetCurrentThread() || handle == 0) tid = self;
+    else
+    {
+        SERVER_START_REQ( get_thread_info )
+        {
+            req->handle = wine_server_obj_handle( handle );
+            req->access = THREAD_QUERY_LIMITED_INFORMATION;
+            if (!wine_server_call( req )) tid = reply->tid;
+        }
+        SERVER_END_REQ;
+    }
+    if (!tid) return;
+    for (i = 0; i < tq_nrules; i++)
+        if (tq_glob( tq_rules[i].pat, name )) { cls = tq_rules[i].cls; break; }
+    changed = tq_store( tid, cls, name );
+    if (tid == self)
+    {
+        tq_self_tid = self;
+        if (changed) ios_eco_apply_self();
+    }
+    else if (changed) __atomic_add_fetch( &ios_eco_gen, 1, __ATOMIC_RELEASE );
 }
 
 /***********************************************************************
@@ -1322,6 +1564,7 @@ static void start_thread( TEB *teb )
                 (unsigned int)(ULONG_PTR)teb->ClientId.UniqueThread, raw, (void *)teb,
                 raw == teb ? "MATCH" : "MISMATCH");
     }
+    ios_thread_qos_start( (unsigned)(ULONG_PTR)teb->ClientId.UniqueThread );   /* MADEIRA_THREAD_QOS */
     server_init_thread( thread_data->start, &suspend );
     signal_start_thread( thread_data->start, thread_data->param, suspend, teb );
 }
@@ -2646,6 +2889,7 @@ static void set_native_thread_name( HANDLE handle, const UNICODE_STRING *name )
         else
             ERR( "[thr-name] ml810 handle=%p (named by tid=%04x, NOT self) name=\"%s\"\n",
                  handle, (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, nm );
+        ios_thread_qos_named( handle, nm );   /* MADEIRA_THREAD_QOS */
     }
 #ifdef linux
     unsigned int status;
