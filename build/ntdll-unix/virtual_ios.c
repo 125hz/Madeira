@@ -11155,13 +11155,31 @@ static void ios_wow_reserve_placeholders( unsigned max )
  *  - MADEIRA_WOW_PLACEHOLDERS=1: arm and reserve a placeholder for every slot
  *    of the band (on a small map at most MADEIRA_WOW_SMALL_VA_SLOTS), for
  *    64-bit launchers that start 32-bit children on a crowded map.
+ *  - MADEIRA_WOW_HOLD_WINDOWS=N (ml2020): arm and reserve N placeholders, for a
+ *    64-bit session the app knows will start a 32-bit program later. A Dock
+ *    game whose folder holds a 32-bit program behind a 64-bit launcher chain
+ *    (the app sets 1) found no 4 GB-aligned slot by the time the game started:
+ *    the launcher's browser helper had reserved its caches at 0x7174..., the
+ *    emulator's grown band sat at 0x7200..., and the map rule refused the rest
+ *    (device logs 2026-10-24 20:21 and 20:23, [wow-window] REJECTED for every
+ *    B from 0x7100000000 to 0x7a00000000). A placeholder taken here, before
+ *    any of that, is adopted by the first 32-bit child and costs the band one
+ *    slot; every slot would starve the furniture.
  */
 static void ios_wow_session_start(void)
 {
     unsigned want;
+    const char *hold = getenv( "MADEIRA_WOW_HOLD_WINDOWS" );   /* N: hold N guest-window placeholders at session start for 32-bit programs a 64-bit launcher starts later (the app sets 1 for a Dock game whose folder has a 32-bit program); unset or 0: none */
+    unsigned long hold_n = (hold && hold[0] >= '1' && hold[0] <= '9') ? strtoul( hold, NULL, 10 ) : 0;
 
     if (ios_wow_env_ulong( "MADEIRA_WOW_PLACEHOLDERS", 0 ) == 1) want = IOS_WOW_MAX_WINDOWS;
     else if (ios_main_image_i386) want = 1;
+    else if (hold_n)
+    {
+        want = hold_n > IOS_WOW_MAX_WINDOWS ? IOS_WOW_MAX_WINDOWS : (unsigned)hold_n;
+        dprintf( 2, "[wow-window] MADEIRA_WOW_HOLD_WINDOWS=%s: holding %u guest-window placeholder%s for a 32-bit "
+                    "program this session starts later\n", hold, want, want == 1 ? "" : "s" );
+    }
     else return;
 
     ios_wow_session_arm();

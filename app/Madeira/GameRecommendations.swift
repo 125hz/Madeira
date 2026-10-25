@@ -412,7 +412,7 @@ enum GameRecommendations {
         env.MADEIRA_POOL_LOW_IMAGES = 1
         env.MADEIRA_POOL_RECYCLE_IMAGES = 1
         env.MADEIRA_SC_PA_POOLS = 2
-        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;.be\\vc_redist
+        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;.be\\vc_redist;syswow64\\dllhost
         env.MADEIRA_TOUCH_MOUSE = 1
         env.MADEIRA_WOW_MIN_FREE_GB = 2
         env.MADEIRA_X64_IMAGE_NOCOPY = 1
