@@ -56,6 +56,9 @@ for rel in ('app/Madeira/arm64ec-windows/xtajit64.dll', 'app/Madeira/aarch64-win
         continue
     data = p.read_bytes()
     check(b'rpmalloc-span4 rev=ml2020' in data, f'{rel} was built from the small-span allocator')
+    if rel.endswith('xtajit.dll'):
+        check(b'[smc-hot] wow64: hot SMC pages' in data,
+              f'{rel} enables hot self-modifying-code pages (FEX/Source/Windows/WOW64/Module.cpp, ml2020)')
 
 print(f'check-fex-rpmalloc-spans: {"OK" if not failures else f"{failures} FAILED"}')
 sys.exit(1 if failures else 0)
