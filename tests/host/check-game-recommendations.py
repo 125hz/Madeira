@@ -64,11 +64,11 @@ for m in re.finditer(r'static let (\w+) = GameRecommendation\(\n\s*id: "([^"]+)"
     body = body.replace('\\\\', '\\')
     lines = [line[len(indent):] if line.startswith(indent) else line for line in body.split('\n')]
     presets[ident] = dict(name=name, title=title, version=int(version), lines=lines, switches=' '.join((switches or '').split()))
-assert set(presets) == {'rdr2-steam', 'rdr2-other', 'gta5e-steam', 'gta5e-other', 'gta5l-steam', 'ghost-of-tsushima', 'god-of-war',
-                        'horizon-zero-dawn', 'horizon-forbidden-west', 'ratchet-clank-rift-apart', 'crysis-remastered',
+assert set(presets) == {'rdr2-steam', 'rdr2-other', 'gta5e-steam', 'gta5e-other', 'gta5l-steam', 'gta4-steam', 'ghost-of-tsushima',
+                        'god-of-war', 'horizon-zero-dawn', 'horizon-forbidden-west', 'ratchet-clank-rift-apart', 'crysis-remastered',
                         'crysis-2-remastered', 'crysis-3-remastered', 'standard'}, sorted(presets)
-assert ('static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, gta5LegacySteam, ghostOfTsushima, godOfWar,\n'
-        '                      horizonZeroDawn, horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered, crysis2Remastered,\n'
+assert ('static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, gta5LegacySteam, gta4Steam, ghostOfTsushima,\n'
+        '                      godOfWar, horizonZeroDawn, horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered, crysis2Remastered,\n'
         '                      crysis3Remastered, standard]') in lists_src
 
 # madeira-bcd's defaults where upstream's differ: every game madeira-bcd ran had them,
@@ -112,7 +112,7 @@ for ident, p in presets.items():
         if key != 'env.WINEDLLOVERRIDES':
             named = named.replace('socialclubhelper.exe', '')
         assert 'socialclub' not in named and 'MADEIRA_DLL_LOCAL' not in line, (ident, line)
-print('PASS: fourteen lists, two comment lines each, every game list ends with the four fork defaults and the standard one has none, no key twice, '
+print('PASS: fifteen lists, two comment lines each, every game list ends with the four fork defaults and the standard one has none, no key twice, '
       'every non-env key in the settings catalog, no Social Club DLL lines, no variant DLL switches')
 
 # Red Dead Redemption 2 from Steam: the owner's list of 2026-10-09 (build 463), line for line,
@@ -532,6 +532,11 @@ check(id(legacy + #"\PlayGTAV.exe"#) == "none", "PlayGTAV.exe inside Steam with 
 check(id(gta + #"\PlayGTAV.exe"#, files: [gta + #"\GTA5_Enhanced.exe"#, gta + #"\GTA5.exe"#]) == "gta5e-steam",
       "GTA5_Enhanced.exe beside PlayGTAV.exe stays Enhanced, even with a GTA5.exe there")
 check(id(legacy + #"\_CommonRedist\vc_redist.x64.exe"#, 271590) == "none", "not Legacy's redistributables")
+let gta4 = steam + #"\Grand Theft Auto IV"#
+check(id(gta4, 12210) == "gta4-steam", "GTA IV by its App ID")
+check(id(gta4) == "gta4-steam", "GTA IV by its Steam folder")
+check(id(gta4 + #"\GTAIV\PlayGTAIV.exe"#) == "gta4-steam" && id(gta4 + #"\GTAIV\GTAIV.exe"#) == "gta4-steam", "GTA IV's programs inside Steam")
+check(id(#"C:\Games\GTA IV\GTAIV.exe"#) == "none", "GTA IV outside Steam has no list")
 // The device's RAM: GTA V Legacy's 3 GB RAM swap only under 12 GB; every other list the same everywhere.
 R.deviceRAMBytes = 11_695 << 20
 let onTwelve = R.all.map { $0.fileText }
