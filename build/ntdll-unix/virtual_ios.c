@@ -10157,6 +10157,132 @@ ULONG ios_wow_guest_addr( const void *host )
     return PtrToUlong( host );   /* no window: unchanged (and truncating, as before) */
 }
 
+/* Madeira ml2020: a guest window and its placeholder are Wine reserved areas,
+ * and two paths still handed their space to other programs (device logs
+ * 2026-10-25, a 64-bit launcher chain with a 32-bit title's placeholder held
+ * from session start): the relaxed retry of map_view, which drops the window
+ * exclusion, placed a browser helper's 1 GB reservation at the placeholder's
+ * base (the title then ran inside it), and a fixed-base request placed one over
+ * the placeholder's guard page. A reserved area that is a window or placeholder
+ * is for that window's own process: map_reserved_area_inner skips it for every
+ * request that is not window-constrained, and map_fixed_area refuses a fixed
+ * map into it from any other process. MADEIRA_WOW_WINDOW_KEEP=0 restores the
+ * old placement. */
+static int ios_wow_window_keep_enabled(void)
+{
+    static int enabled = -1;
+    int v = __atomic_load_n( &enabled, __ATOMIC_ACQUIRE );
+
+    if (v < 0)
+    {
+        const char *e = getenv( "MADEIRA_WOW_WINDOW_KEEP" );   /* 0: other programs' views may be placed inside a 32-bit guest window or its placeholder again (default 1: only the window's own process maps there) */
+        v = !(e && e[0] == '0');
+        __atomic_store_n( &enabled, v, __ATOMIC_RELEASE );
+    }
+    return v;
+}
+
+/* The window or placeholder base whose reservation overlaps [start, end), or 0. */
+static ULONG_PTR ios_wow_window_covering( const void *start, const void *end )
+{
+    ULONG_PTR lo = (ULONG_PTR)start, hi = (ULONG_PTR)end;
+    unsigned i;
+
+    for (i = 0; i < ios_wow_window_count; i++)
+    {
+        ULONG_PTR wb = ios_wow_windows[i].base;
+        if (!wb) continue;
+        if (wb < hi && wb + ios_wow_slot_reservation( &ios_wow_windows[i] ) > lo) return wb;
+    }
+    for (i = 0; i < ios_wow_placeholder_count; i++)
+    {
+        ULONG_PTR pb = ios_wow_placeholders[i].base;
+        if (!pb) continue;
+        if (pb < hi && pb + IOS_WOW_WINDOW_SIZE + (ios_wow_placeholders[i].guard_owned ? ios_wow_guard_size() : 0) > lo)
+            return pb;
+    }
+    return 0;
+}
+
+static int ios_wow_limits_in_window( ULONG_PTR low, ULONG_PTR high );
+
+/* map_reserved_area_inner: may a request with these limits take space in the
+ * reserved area [start, end)? Not when the area is a window or placeholder and
+ * the request is not constrained to the caller's own window. */
+static int ios_wow_reserved_area_open( const void *start, const void *end, const void *limit_low, const void *limit_high )
+{
+    ULONG_PTR wb;
+
+    if (!ios_wow_window_keep_enabled()) return 1;
+    if (!ios_wow_window_count && !ios_wow_placeholder_count) return 1;
+    if (!(wb = ios_wow_window_covering( start, end ))) return 1;
+    return wb == ios_wow_base() && ios_wow_limits_in_window( (ULONG_PTR)limit_low, (ULONG_PTR)limit_high );
+}
+
+/* map_fixed_area: a fixed map into a window or placeholder by a process that
+ * does not own that window is refused (STATUS_CONFLICTING_ADDRESSES, what a
+ * Windows caller gets for a range someone else holds). */
+static int ios_wow_fixed_map_refused( const void *start, const void *end )
+{
+    static unsigned long refused_n;
+    ULONG_PTR wb;
+
+    if (!ios_wow_window_keep_enabled()) return 0;
+    if (!ios_wow_window_count && !ios_wow_placeholder_count) return 0;
+    if (!(wb = ios_wow_window_covering( start, end )) || wb == ios_wow_base()) return 0;
+    if (++refused_n <= 16 || !(refused_n % 256))
+        dprintf( 2, "[wow-window] #%lu refused a fixed map %p..%p: it lies in the guest window or placeholder at "
+                    "0x%lx, which is not this process's (MADEIRA_WOW_WINDOW_KEEP=0 reverts)\n",
+                 refused_n, start, end, (unsigned long)wb );
+    return 1;
+}
+
+/* Madeira ml2020: the overrun guard page inside the window.
+ *
+ * The guard page (see ios_wow_guard_size) sat at B+4G, one host page past the
+ * window, so the 4 GB-aligned gap above a window was 4 GB minus one page. A
+ * browser helper's V8 needs 1 GB at a 4 GB-aligned base for its trusted range
+ * (three hinted tries, each freed as misaligned, then a 4 GB + 1 GB
+ * over-reservation that no gap of this map can hold, then Chromium's
+ * out-of-memory exception 0xe0000008: device logs 2026-10-25, two of four runs);
+ * the only 4 GB-aligned base left on the device was that guard page. The guard
+ * now is the window's own top host page: the guest ceiling stops one host page
+ * short of 4 GB (ios_wow_ceiling_for_charact; Windows itself keeps the top
+ * 64 KB of a 32-bit address space unmapped), so no guest view ever reaches it,
+ * and the reservation is exactly 4 GB (guard_owned = 0, like a borrowed guard).
+ * An emulator access computed as B+4G+n lands on whatever follows the window,
+ * as it did with a borrowed guard. MADEIRA_WOW_GUARD_INSIDE=0 reserves 4 GB plus
+ * a guard page again. */
+/* Madeira ml2020: the jumbo aligned walk (see NtAllocateVirtualMemory's hinted
+ * retry) and the gigabyte map_view keeps for it above the windows. */
+static int ios_jumbo_aligned_enabled(void)
+{
+    static int enabled = -1;
+    int v = __atomic_load_n( &enabled, __ATOMIC_ACQUIRE );
+
+    if (v < 0)
+    {
+        const char *e = getenv( "MADEIRA_JUMBO_ALIGNED" );   /* 0: a hinted reservation at a 4 GB boundary (V8's trusted range) takes a kernel pick as before, and furniture may fill the 4 GB-aligned gigabyte above a guest window (default 1: 4 GB-aligned bases are tried first and that gigabyte is left for such an ask) */
+        v = !(e && e[0] == '0');
+        __atomic_store_n( &enabled, v, __ATOMIC_RELEASE );
+    }
+    return v;
+}
+
+static int ios_wow_guard_inside(void)
+{
+    static int enabled = -1;
+    int v = __atomic_load_n( &enabled, __ATOMIC_ACQUIRE );
+
+    if (v < 0)
+    {
+        const char *e = getenv( "MADEIRA_WOW_GUARD_INSIDE" );   /* 0: a 32-bit guest window reserves 4 GB plus a guard page above it, as before (default 1: the guard is the window's top page, so the 4 GB gap above stays 4 GB-aligned) */
+        v = !(e && e[0] == '0');
+        __atomic_store_n( &enabled, v, __ATOMIC_RELEASE );
+    }
+    return v;
+}
+
 /* Is `addr` inside ANY guest window or placeholder of this session, whatever
  * its state?  Not the same question as ios_wow_in_window(), which asks about
  * the CALLER's window: this one is for session-wide bookkeeping that must not
@@ -10388,6 +10514,9 @@ static ULONG_PTR ios_wow_ceiling_for_charact( WORD charact )
                         "(MADEIRA_LAA=0 keeps 2 GB)\n" );
         laa = TRUE;
     }
+    /* ml2020: with the guard inside the window its top host page is never the
+     * guest's (ios_wow_guard_inside) */
+    if (laa && ios_wow_guard_inside()) return limit_4g - ios_wow_guard_size() - 1;
     return (laa ? limit_4g : limit_2g) - 1;
 }
 
@@ -10834,6 +10963,21 @@ static int ios_wow_window_try( ULONG_PTR base, unsigned *guard_owned )
         dprintf( 2, "[wow-window] adopted placeholder B=%p..%p guard=%s\n",
                  (void *)base, (void *)(base + IOS_WOW_WINDOW_SIZE),
                  ph->guard_owned ? "owned" : "borrowed" );
+        return 1;
+    }
+
+    /* ml2020: the guard is the window's own top page (see ios_wow_guard_inside) */
+    if (ios_wow_guard_inside())
+    {
+        if (anon_mmap_tryfixed( (void *)base, IOS_WOW_WINDOW_SIZE, PROT_NONE, MAP_NORESERVE ) == MAP_FAILED)
+        {
+            ios_va_describe_range( (void *)base, IOS_WOW_WINDOW_SIZE, what, sizeof(what) );
+            dprintf( 2, "[wow-window] B=%p REJECTED: the 4GB range is not free (%s)\n", (void *)base, what );
+            return 0;
+        }
+        mmap_add_reserved_area( (void *)base, IOS_WOW_WINDOW_SIZE );
+        dprintf( 2, "[wow-window] B=%p: reserved exactly 4GB; the overrun guard is the window's top page "
+                    "(MADEIRA_WOW_GUARD_INSIDE=0 reserves a page above it instead)\n", (void *)base );
         return 1;
     }
 
@@ -16692,7 +16836,20 @@ static int ios_guest_image_is_host_data( const void *base, size_t size )
 
     if (!ios_guest_image_write_enabled()) return 0;
     if (!ios_wow_in_window( base )) return 0;
-    if (!(view = find_view( base, size ))) return 0;
+    if (!(view = find_view( base, size )))
+    {
+        /* ml2020: the request is host-page rounded while an image view ends on a
+         * 4 KB boundary. A launcher's protector DLL (loaded by a 32-bit title)
+         * made its last section plus the rest of that section's final host page
+         * executable and writable, unpacked code there and jumped to it; the
+         * range was not "the image" by this test, became an anonymous RWX pool
+         * copy, and the code it wrote afterwards was not what the emulator ran
+         * ("Invalid instruction in entry block", device logs 2026-10-25). A
+         * range that runs past an image view only within the view's last host
+         * page is still that image's. */
+        if (!(view = find_view( base, 0 ))) return 0;
+        if ((char *)base + size > (char *)view->base + ROUND_SIZE( view->base, view->size, host_page_mask )) return 0;
+    }
     return (view->protect & SEC_IMAGE) != 0;
 #else
     return 0;
@@ -17801,9 +17958,10 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
              * w0,[x8], 8+ identical faults, thread dead). Range-check the hit;
              * on failure fall through to the anonymous-RWX path, which carves a
              * pool slot AND registers the alias the store emulator needs. */
+            /* ml2020: the request is host-page rounded; an image's last host page is the image's */
             if (image_base &&
                 ((uintptr_t)base < (uintptr_t)image_base ||
-                 (uintptr_t)base + size > (uintptr_t)image_base + image_size))
+                 (uintptr_t)base + size > (uintptr_t)image_base + ROUND_SIZE( image_base, image_size, host_page_mask )))
             {
                 dprintf(2, "[jit-pool] exec page %p+0x%lx is OUTSIDE nearest image %p+0x%lx "
                         "(%s) — treating as anonymous RWX rev=ml348\n",
@@ -19754,6 +19912,7 @@ static void *map_reserved_area_inner( void *limit_low, void *limit_high, size_t 
                 continue;
             }
             if (area->thin_only) continue;   /* Madeira: thin heads are placed at fixed slots */
+            if (!ios_wow_reserved_area_open( start, end, limit_low, limit_high )) continue;   /* ml2020: a window is its process's */
             if (start >= limit_high) continue;
             if (end <= limit_low) return NULL;
             if (start < limit_low) start = (void *)ROUND_SIZE( 0, limit_low, host_page_mask );
@@ -19794,6 +19953,7 @@ static void *map_reserved_area_inner( void *limit_low, void *limit_high, size_t 
                 continue;
             }
             if (area->thin_only) continue;   /* Madeira: thin heads are placed at fixed slots */
+            if (!ios_wow_reserved_area_open( start, end, limit_low, limit_high )) continue;   /* ml2020: a window is its process's */
             if (start >= limit_high) return NULL;
             if (end <= limit_low) continue;
             if (start < limit_low) start = (void *)ROUND_SIZE( 0, limit_low, host_page_mask );
@@ -19827,6 +19987,8 @@ static NTSTATUS map_fixed_area( void *base, size_t size, int unix_prot )
     if ((UINT_PTR)base & host_page_mask) return STATUS_CONFLICTING_ADDRESSES;
     if (find_view_range( base, size )) return STATUS_CONFLICTING_ADDRESSES;
 #ifdef WINE_IOS
+    /* ml2020: a guest window or placeholder is its own process's (see ios_wow_fixed_map_refused) */
+    if (ios_wow_fixed_map_refused( start, end )) return STATUS_CONFLICTING_ADDRESSES;
     /* Madeira: every address in a thin arena lies inside some thin reservation's
      * range (or the arena's margin), so a fixed map there conflicts, as it would
      * on Windows. Only ios_thin_reserve places heads in it. */
@@ -20449,8 +20611,19 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
             {
                 static unsigned long hi_n;
 
-                ptr = map_reserved_area( wow_hi_start, wow_hi_end, host_size, top_down, unix_prot, align_mask );
-                if (!ptr) ptr = map_free_area( wow_hi_start, wow_hi_end, host_size, top_down, unix_prot, align_mask );
+                /* ml2020: leave the first 4 GB-aligned gigabyte above the windows to a 4 GB-aligned
+                 * ask (the jumbo aligned walk) while the band has room beyond it */
+                void *hs = wow_hi_start;
+                if (ios_jumbo_aligned_enabled() && !((ULONG_PTR)hs & 0xffffffffULL) &&
+                    (size_t)((char *)wow_hi_end - (char *)hs) >= 0x40000000ULL + view_size)
+                    hs = (char *)hs + 0x40000000ULL;
+                ptr = map_reserved_area( hs, wow_hi_end, host_size, top_down, unix_prot, align_mask );
+                if (!ptr) ptr = map_free_area( hs, wow_hi_end, host_size, top_down, unix_prot, align_mask );
+                if (!ptr && hs != wow_hi_start)
+                {
+                    ptr = map_reserved_area( wow_hi_start, wow_hi_end, host_size, top_down, unix_prot, align_mask );
+                    if (!ptr) ptr = map_free_area( wow_hi_start, wow_hi_end, host_size, top_down, unix_prot, align_mask );
+                }
                 if (++hi_n <= 16 || !(hi_n % 256))
                     dprintf( 2, "[wow-window] #%lu band below the 32-bit windows full: 0x%lx bytes %s above them in %p..%p%s\n",
                              hi_n, (unsigned long)size, ptr ? "placed" : "NOT placed", wow_hi_start, wow_hi_end,
@@ -29894,6 +30067,33 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                         dprintf(2, "[cage] soft-grant %p size=0x%lx (4GB cage in PA guard dead zone) rev=ml434\n",
                                 pick, (unsigned long)sz);
                     }
+                }
+                /* Madeira ml2020: a hint at a 4 GB boundary for up to 4 GB is a
+                 * request for a 4 GB-ALIGNED base (V8's trusted range: 1 GB,
+                 * kPtrComprCageBaseAlignment). A kernel pick below gave it
+                 * 0x7177920000 three times, each freed as misaligned, and the
+                 * 4 GB + 1 GB over-reservation that follows fits no gap of this
+                 * map: Chromium's out-of-memory exception, the browser helper
+                 * gone (device logs 2026-10-25). Walk the 4 GB-aligned bases of
+                 * the top band first; a window, the arena and every held slot
+                 * refuse their own base, so only a free aligned gap answers (the
+                 * one above a guest window, see ios_wow_guard_inside).
+                 * MADEIRA_JUMBO_ALIGNED=0 skips the walk. */
+                if (st2 && !((ULONG_PTR)hint & 0xffffffffULL) && *size_ptr <= 0x100000000ULL &&
+                    ios_jumbo_aligned_enabled())
+                {
+                    ULONG_PTR a;
+                    unsigned tries = 0;
+                    for (a = 0x7b00000000ULL; a >= 0x7000000000ULL && st2; a -= 0x100000000ULL, tries++)
+                    {
+                        SIZE_T csz = *size_ptr;
+                        pick = (void *)a;
+                        st2 = allocate_virtual_memory( &pick, &csz, type, protect, 0, 0, 0, 0 );
+                        if (!st2) sz = csz;
+                    }
+                    dprintf( 2, "[jumbo] ml2020 4 GB-aligned hint %p size=0x%lx: aligned walk %s after %u tries%s%p\n",
+                             hint, (unsigned long)*size_ptr, st2 ? "found nothing" : "placed it", tries,
+                             st2 ? "" : " at ", st2 ? NULL : pick );
                 }
                 if (st2)
                 {
