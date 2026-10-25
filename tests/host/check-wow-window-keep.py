@@ -45,8 +45,10 @@ cov = body('static ULONG_PTR ios_wow_window_covering(')
 check('ios_wow_slot_reservation( &ios_wow_windows[i] )' in cov and 'ios_wow_placeholders[i].guard_owned' in cov,
       'the covering test walks live windows and placeholders with their guard pages')
 op = body('static int ios_wow_reserved_area_open(')
-check('return wb == ios_wow_base() && ios_wow_limits_in_window(' in op,
-      "a reserved area that is a window is open only to that window's process with window-constrained limits")
+check('return lo >= wb && hi > lo && hi <= wb + IOS_WOW_WINDOW_SIZE + ios_wow_guard_size();' in op
+      and 'ios_wow_limits_in_window(' not in op,
+      "a reserved area that is a window is open only to a request confined to that window (containment, "
+      "not the strict limits test: map_view's end is exclusive and the boot PEB asks for the whole window)")
 inner = src[src.index('static void *map_reserved_area_inner('):src.index('static NTSTATUS map_fixed_area(')]
 check(inner.count('if (!ios_wow_reserved_area_open( start, end, limit_low, limit_high )) continue;') == 2,
       'both scan directions of map_reserved_area_inner skip a window that is not the caller\'s')
