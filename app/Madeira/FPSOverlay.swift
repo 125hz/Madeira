@@ -84,8 +84,11 @@ final class ProMotionIntent {
             link = l
             activeMax = want
             fputs("[promote] display link armed preferred=\(Int(want))Hz panel_max=\(ProMotionIntent.panelMaxFPS)Hz\n", stderr)
+            // ml2020: stderr written before Wine starts is not in the exported log; say it there too
+            LogStore.shared.log("[promote] display link armed min=\(Int(lo))Hz preferred=\(Int(want))Hz panel_max=\(ProMotionIntent.panelMaxFPS)Hz")
         } else {
             if link != nil { fputs("[promote] display link released\n", stderr) }
+            if link != nil { LogStore.shared.log("[promote] display link released") }
             link?.invalidate()
             link = nil
             activeMax = 0
@@ -103,6 +106,7 @@ final class ProMotionIntent {
     /// Arms or releases the link for `mode` and publishes the rates to DXMT.
     static func apply(mode: Int32) {
         let hz = maxHz(for: mode)
+        LogStore.shared.log("[promote] pacing mode \(mode): display intent \(hz) Hz (panel max \(panelMaxFPS), hold-maximum \(holdMaximum), floor \(panelFloor))")
         shared.setActive(hz > 0, maxHz: hz)
         madeira_set_display_max_fps(Int32(panelMaxFPS), Int32(hz))
     }
