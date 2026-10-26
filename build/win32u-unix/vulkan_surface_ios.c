@@ -54,7 +54,8 @@ static VkResult ios_vulkan_surface_create(HWND hwnd, const struct vulkan_instanc
     struct ios_vulkan_client_surface *surface;
     VkResult result;
     *client = NULL;
-    if (!instance->p_vkCreateMetalSurfaceEXT) return VK_ERROR_EXTENSION_NOT_PRESENT;
+    *handle = VK_NULL_HANDLE;
+    if (!instance->host.instance || !instance->p_vkCreateMetalSurfaceEXT) return VK_ERROR_EXTENSION_NOT_PRESENT;
     surface = client_surface_create(sizeof(*surface), &ios_vulkan_client_funcs, hwnd);
     if (!surface) return VK_ERROR_OUT_OF_HOST_MEMORY;
     surface->layer = madeira_vulkan_layer_acquire(hwnd);
@@ -64,7 +65,12 @@ static VkResult ios_vulkan_surface_create(HWND hwnd, const struct vulkan_instanc
     result = instance->p_vkCreateMetalSurfaceEXT(instance->host.instance, &info, NULL, handle);
     fprintf(stderr, "[vk-surface] HWND=%p layer=%p -> vkCreateMetalSurfaceEXT result=%d\n",
             hwnd, surface->layer, result);
-    if (result != VK_SUCCESS) { client_surface_release(&surface->client); return result; }
+    if (result != VK_SUCCESS)
+    {
+        *handle = VK_NULL_HANDLE;
+        client_surface_release(&surface->client);
+        return result;
+    }
     *client = &surface->client;
     return VK_SUCCESS;
 }
@@ -114,6 +120,7 @@ static const struct vulkan_driver_funcs ios_vulkan_driver_funcs =
 UINT madeira_ios_VulkanInit(UINT version, void *handle, const struct vulkan_driver_funcs **funcs)
 {
     (void)handle;
+    *funcs = NULL;
     if (version != WINE_VULKAN_DRIVER_VERSION) return STATUS_INVALID_PARAMETER;
     *funcs = &ios_vulkan_driver_funcs;
     fprintf(stderr, "[vk-surface] iOS Metal window surface driver selected ABI=%u\n", version);

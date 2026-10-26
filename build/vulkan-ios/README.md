@@ -165,6 +165,9 @@ python3 tests/host/check-vulkan-layer-geometry.py
 ```
 
 The adapter tests use external API fixtures and do not prove GPU execution.
+The surface test also keeps PR #88's failure-output and repeated-detach checks.
+It checks that a failed create clears both output handles and that the Metal
+layer stays retained through detach, update, and present until client release.
 The geometry check uses real macOS CAMetalLayer objects with external window
-lookup fixtures. Surface tests need configured Wine headers; backend tests need
+lookup fixtures. Surface tests need the pinned Wine headers; backend tests need
 the pinned Vulkan headers. The gate test needs only a C compiler and Bash.
