@@ -244,6 +244,11 @@ frames arrive (Metal presents or a desktop surface); after 30 seconds it offers
 until the game's own window is shown, and adds **Show desktop**
 (`docs/MADEIRA_DOCK.md`, "Starting screen"). A row of round glyph-only buttons (their words are
 VoiceOver labels) holds **Show live log**, which shows the most recent log lines.
+Lines known to be harmless in a normal session (Wine's other display drivers,
+Windows' sign-in packages, Steam's optional modules such as SDL3 and
+steamservice, the WoW64 CPU fallback, FEX's code-buffer mprotect note) show in
+grey as "harmless: …" instead of as errors; out of memory (c0000017) never does
+(`tests/host/check-harmless-warnings.py`).
 
 The small menu button (drag to move; it fades after three seconds) opens the
 in-game menu:

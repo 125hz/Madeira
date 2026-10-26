@@ -74,7 +74,29 @@ struct LogPattern {
             s = String(s.prefix(200))
         }
 
+        // Known-harmless warnings read as such, in grey, instead of as errors.
+        if isHarmless(raw) { return ("harmless: " + s, .debug) }
+
         return (s, level)
+    }
+
+    /// DLLs sessions look for and run fine without: Wine's other display drivers,
+    /// Windows' sign-in packages, Steam's optional modules, and debugging tools
+    /// games probe for. Out of memory (c0000017) is never harmless.
+    static let harmlessDLLs = [
+        "winemac.drv", "winex11.drv", "winewayland.drv", "kerberos.dll", "msv1_0.dll",
+        "video64.dll", "steamservice.dll", "sdl3.dll", "windisc.dll", "wow64cpu.dll",
+    ]
+
+    /// Lines that look like errors but are expected in a normal session.
+    static func isHarmless(_ raw: String) -> Bool {
+        if raw.contains("Failed to mprotect last page of code buffer") { return true }
+        // WoW64 falls back to its own CPU backend at once.
+        if raw.contains("CPU backend wow64cpu.dll not available") { return true }
+        guard raw.contains("[dll-missing]") || raw.contains("err:module:"), !raw.contains("c0000017") else { return false }
+        let line = raw.lowercased()
+        // The name starts the quoted path, follows a backslash, or stands alone.
+        return harmlessDLLs.contains { name in ["\"", "\\", " "].contains { line.contains($0 + name) } }
     }
 
     /// Infer log level from raw line content.
