@@ -2549,3 +2549,43 @@ void winios_pSetCursor(HWND hwnd, HCURSOR cursor) {
 void winios_pDestroyCursorIcon(HCURSOR cursor) {
     /* nothing to release; we never allocated anything for the cursor */
 }
+
+/* Hooks the engine's win32u / wineserver look up as weak symbols for features
+ * this app does not implement: a direct-cursor clip rectangle and warp report,
+ * the raw-input cursor reader, the tiny-swapchain-window table and the desktop
+ * compositor's window lineage. Mach-O still needs a definition at link time, so
+ * each one here answers "nothing": no swapchain slots, no lineage, and the
+ * cursor calls do nothing beyond the plain position report the engine already
+ * makes. MADEIRA_WINDOW_LINEAGE=0 skips the lineage walk entirely. */
+void winios_direct_cursor_clip(int left, int top, int right, int bottom) {
+    (void)left; (void)top; (void)right; (void)bottom;
+}
+
+void winios_direct_cursor_warp(int x, int y) {
+    winios_direct_cursor_pos(x, y);
+}
+
+void winios_direct_cursor_reader(unsigned int flags) {
+    (void)flags;
+}
+
+void *winios_swapchain_hwnd_at(int index) {
+    (void)index;
+    return NULL;
+}
+
+int winios_swapchain_drawable(void *hwnd, int *width, int *height) {
+    (void)hwnd;
+    if (width) *width = 0;
+    if (height) *height = 0;
+    return 0;
+}
+
+unsigned winios_swapchain_slot_generation(int index) {
+    (void)index;
+    return 0;
+}
+
+void winios_window_lineage(HWND hwnd, HWND root, int depth) {
+    (void)hwnd; (void)root; (void)depth;
+}

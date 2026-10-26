@@ -203,7 +203,9 @@ static inline void hwreg_fex_cpu( struct hwreg_cpu *cpu, int avx, uint64_t cntfr
               cpu->level, (cpu->revision >> 8) & 0xff, cpu->revision & 0xff );
 
     cpu->feature_set = HWREG_FEX_FEATURES | HWREG_CPU_FEATURE_SSE42;
-    if (avx) cpu->feature_set |= HWREG_CPU_FEATURE_XSAVE | HWREG_CPU_FEATURE_AVX | HWREG_CPU_FEATURE_AVX2;
+    /* avx 2: MADEIRA_FEX_AVX=2, CPUID reports AVX without AVX2 (FEX's HideAVX2) */
+    if (avx) cpu->feature_set |= HWREG_CPU_FEATURE_XSAVE | HWREG_CPU_FEATURE_AVX;
+    if (avx && avx != 2) cpu->feature_set |= HWREG_CPU_FEATURE_AVX2;
     cpu->mhz = (uint32_t)(hwreg_fex_tsc_hz( cntfrq ) / 1000000);
 }
 

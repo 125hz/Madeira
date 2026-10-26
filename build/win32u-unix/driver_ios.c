@@ -1272,8 +1272,8 @@ static int winios_lineage_enabled(void)
 
     if (enabled < 0)
     {
-        const char *e = getenv( "MADEIRA_WINDOW_LINEAGE" );  /* 0: no window lineage for the desktop compositor */
-        enabled = winios_window_lineage && !(e && e[0] == '0' && !e[1]);
+        const char *e = getenv( "MADEIRA_WINDOW_LINEAGE" );  /* 1: report window lineage to the desktop compositor (off by default; this app's hook is a stub) */
+        enabled = winios_window_lineage && e && e[0] == '1' && !e[1];
     }
     return enabled;
 }

@@ -5684,7 +5684,9 @@ void ios_hw_registry_publish(void)
     count = hwreg_cpu_count( peb->NumberOfProcessors );
     /* AVX exists only in FEX's ARM64EC module; a 32-bit main image runs the WOW64
      * module, which has no AVX. */
-    hwreg_fex_cpu( &cpu, avx && avx[0] == '1' && !ios_main_image_i386, ios_hw_cntfrq() );
+    /* as FEX reads it: "1..." AVX and AVX2; exactly "2" AVX without AVX2 */
+    hwreg_fex_cpu( &cpu, (!avx || ios_main_image_i386) ? 0 : avx[0] == '1' ? 1 :
+                         (avx[0] == '2' && !avx[1]) ? 2 : 0, ios_hw_cntfrq() );
     if (!cpu.mhz) cpu.mhz = ios_hw_power_mhz();
     smbios = ios_hw_smbios( &smbios_len );
     hwreg_bios_values( &bios, smbios, smbios_len, PACKAGE_VERSION );
