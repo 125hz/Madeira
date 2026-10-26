@@ -12,5 +12,5 @@ if [ ! -f "$B/CMakeCache.txt" ]; then
         -DENABLE_FEX_ALLOCATOR=OFF -DENABLE_ASSERTIONS=OFF -DENABLE_CLANG_THUNKS=ON -DENABLE_CCACHE=ON \
         -DTUNE_CPU=cortex-a78
 fi
-cmake --build "$B" --target FEXCore FEXCore_Base JemallocLibs
+cmake --build "$B" --target FEXCore FEXCore_Base JemallocLibs fmt cephes_128bit softfloat_3e xxhash
 ls "$B/FEXCore/Source/"*.a

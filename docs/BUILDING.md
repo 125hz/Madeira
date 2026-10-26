@@ -95,6 +95,19 @@ DXMT/LLVM archive on first use. FEX explicitly selects arm64 and cortex-a78
 instead of probing Linux's `/proc/cpuinfo`. The optional page-wait diagnostic
 counter is compile-probed; SDKs without that field report `pgw=-1`.
 
+The clean-build work from PR #261 is combined here. Run
+`bash build/wine-macos/configure.sh` to configure the host Wine headers, and
+`bash build/llvm-ios/build.sh` to build host llvm-tblgen and the iOS LLVM
+archives. The latter disables app bundles, terminfo, zlib, and zstd for the
+libraries the app links. FreeType's build script fetches its pinned release
+when absent and refuses to replace an existing incomplete source directory.
+The FEX build includes the external archives the app links. The wineserver
+build selects unchanged sources from Wine's Makefile and excludes this fork's
+replacement objects. It does not need a separate fixed-list base builder.
+
+These combined changes have host script checks. A new full native-library or
+IPA build has not been run for the consolidation.
+
 This run reused the release's i386 PE farm and the tracked PE resources, with
 separately rebuilt ARM64EC ntdll and aarch64 wow64win. It did not rebuild every
 PE module or the Windows FEX modules, so it does not establish a complete

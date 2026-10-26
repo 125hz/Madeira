@@ -2563,10 +2563,6 @@ static void ios_xprobe_main( void )
             double ems = cpu - pms;
             double pcy = (double)(ru.ri_pcycles - pru.ri_pcycles), cy = (double)(ru.ri_cycles - pru.ri_cycles);
             double ins = (double)(ru.ri_instructions - pru.ri_instructions);
-            double page_wait_ms = -1;  /* unavailable in older SDKs */
-#ifdef MADEIRA_HAVE_RUSAGE_PAGE_WAIT
-            page_wait_ms = XP_MS( ru.ri_page_wait_time_mach - pru.ri_page_wait_time_mach );
-#endif
             double qf = (have_pe && pe.magic == 0x3130305058444d4dLL && pe.qpf) ? 1000.0 / (double)pe.qpf : 0;
             double page_wait_ms = -1.0; /* unavailable in the build SDK */
 #ifdef MADEIRA_HAVE_RUSAGE_PAGE_WAIT_TIME_MACH
