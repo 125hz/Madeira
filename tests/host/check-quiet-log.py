@@ -210,6 +210,17 @@ others = rec
 for found in (m, hfw, rca):
     if found:
         others = others.replace(found.group(0), "")
+# Lists ported from community tested lists that also turn the log off: quiet-log only, never the
+# server's F_GETPATH switch.
+quiet_only = ("marvels-spider-man-miles-morales", "marvels-spider-man-remastered", "marvels-spider-man-2",
+              "minecraft-dungeons-2")
+for qid in quiet_only:
+    q = re.search(r'static let \w+ = GameRecommendation\(\s*id: "%s",.*?config: """(.*?)"""' % re.escape(qid), rec, re.S)
+    check(bool(q) and re.search(r"^\s*quiet-log = 1$", q.group(1), re.M) is not None
+          and "MADEIRA_SRV_FGETPATH" not in q.group(1),
+          "list %s sets quiet-log = 1 and not env.MADEIRA_SRV_FGETPATH" % qid)
+    if q:
+        others = others.replace(q.group(0), "")
 check("quiet-log" not in re.sub(r"///.*", "", others) and "MADEIRA_SRV_FGETPATH" not in re.sub(r"///.*", "", others),
       "no other game's list sets either switch")
 
