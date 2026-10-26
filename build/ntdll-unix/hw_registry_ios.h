@@ -134,10 +134,28 @@ struct hwreg_bios
     unsigned int defaults;    /* strings taken from Wine's generic table */
 };
 
-/* MADEIRA_HW_REGISTRY: 0 writes nothing; unset or anything else writes the keys. */
+#define HWREG_ENV_VALUES 5
+struct hwreg_env
+{
+    const char *name;
+    char value[96];
+};
+
+/* MADEIRA_HW_REGISTRY: unset or empty = 1 (the keys), 0 = nothing,
+ * 2 = the keys and wineboot's five processor values in Session Manager\Environment. */
+static inline int hwreg_mode( const char *env )
+{
+    if (!env || !env[0]) return 1;
+    if (env[0] == '0') return 0;
+    if (env[0] == '2') return 2;
+    return 1;
+}
+
+/* MADEIRA_HW_REGISTRY: 0 writes nothing; unset or anything else writes the keys
+ * (every mode hwreg_mode reports as non-zero). */
 static inline int hwreg_enabled( const char *env )
 {
-    return !(env && env[0] == '0');
+    return hwreg_mode( env ) != 0;
 }
 
 /* One CentralProcessor key per processor GetSystemInfo reports. */
@@ -305,6 +323,22 @@ static inline void hwreg_bios_values( struct hwreg_bios *b, const unsigned char 
     hwreg_field( b->sys_version, buf, len, sys, 6, wine_version, &b->defaults );
     hwreg_field( b->sys_sku, buf, len, sys, sys_ext ? 0x19 : 0, "", &b->defaults );
     hwreg_field( b->sys_family, buf, len, sys, sys_ext ? 0x1a : 0, "", &b->defaults );
+}
+
+/* wineboot's Session Manager\Environment values (create_bios_processor_values, package 0). */
+static inline void hwreg_environment( struct hwreg_env env[HWREG_ENV_VALUES], const struct hwreg_cpu *cpu,
+                                      unsigned long processors )
+{
+    env[0].name = "PROCESSOR_ARCHITECTURE";
+    snprintf( env[0].value, sizeof(env[0].value), "%s", "AMD64" );
+    env[1].name = "PROCESSOR_IDENTIFIER";
+    snprintf( env[1].value, sizeof(env[1].value), "%s, %s", cpu->identifier, cpu->vendor );
+    env[2].name = "PROCESSOR_LEVEL";
+    snprintf( env[2].value, sizeof(env[2].value), "%u", cpu->level );
+    env[3].name = "PROCESSOR_REVISION";
+    snprintf( env[3].value, sizeof(env[3].value), "%04x", cpu->revision );
+    env[4].name = "NUMBER_OF_PROCESSORS";
+    snprintf( env[4].value, sizeof(env[4].value), "%lu", processors );
 }
 
 #endif /* MADEIRA_HW_REGISTRY_IOS_H */
