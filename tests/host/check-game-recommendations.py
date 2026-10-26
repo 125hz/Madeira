@@ -65,9 +65,9 @@ for m in re.finditer(r'static let (\w+) = GameRecommendation\(\n\s*id: "([^"]+)"
     lines = [line[len(indent):] if line.startswith(indent) else line for line in body.split('\n')]
     presets[ident] = dict(name=name, title=title, version=int(version), lines=lines, switches=' '.join((switches or '').split()))
 assert set(presets) == {'rdr2-steam', 'rdr2-other', 'gta5e-steam', 'gta5e-other', 'ghost-of-tsushima', 'god-of-war',
-                        'horizon-zero-dawn', 'standard'}, sorted(presets)
+                        'horizon-zero-dawn', 'fallout-new-vegas', 'fallout-3', 'standard'}, sorted(presets)
 assert ('static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, ghostOfTsushima, godOfWar, horizonZeroDawn,\n'
-        '                      standard]') in lists_src
+        '                      falloutNewVegas, fallout3, standard]') in lists_src
 
 # madeira-bcd's defaults where upstream's differ: every game madeira-bcd ran had them,
 # so every game's own list ends with them. The standard list reaches every other game
@@ -76,7 +76,8 @@ FORK_DEFAULTS = ["# madeira-bcd's defaults, which this list was tested with (ups
                  'env.MADEIRA_FREE_DELAY_MS = 2000', 'env.MADEIRA_CTX_CPU_AREA = 2', 'env.MADEIRA_WAIT_CHILDREN = 1',
                  'env.MADEIRA_JIT_DUMP = 0']
 for ident, p in presets.items():
-    if ident == 'standard':
+    # The Fallout lists are the standard one plus a switch: the games ran with it.
+    if ident in ('standard', 'fallout-new-vegas', 'fallout-3'):
         assert not set(FORK_DEFAULTS) & set(p['lines']), (ident, "the standard list has none of madeira-bcd's defaults")
         p['tested'], p['fork'] = p['lines'][2:], []
         continue
@@ -105,7 +106,9 @@ for ident, p in presets.items():
         if key != 'env.WINEDLLOVERRIDES':
             named = named.replace('socialclubhelper.exe', '')
         assert 'socialclub' not in named and 'MADEIRA_DLL_LOCAL' not in line, (ident, line)
-print('PASS: eight lists, two comment lines each, every game list ends with the four fork defaults and the standard one has none, no key twice, '
+for ident in ('fallout-new-vegas', 'fallout-3'):
+    assert presets[ident]['tested'] == presets['standard']['tested'] and presets[ident]['switches'] == 'olderNvidia: true', presets[ident]
+print('PASS: ten lists, two comment lines each, every game list ends with the four fork defaults and the standard and Fallout ones have none, no key twice, '
       'every non-env key in the settings catalog, no Social Club DLL lines, no variant DLL switches')
 
 # Red Dead Redemption 2 from Steam: the owner's list of 2026-10-09 (build 463), line for line,
@@ -273,6 +276,8 @@ assert 'installFolder == "red dead redemption 2"' in match and 'installFolder ==
 assert 'case "ghostoftsushima.exe":' in match and 'case "gow.exe":' in match and 'case "rdr2.exe", "playrdr2.exe":' in match
 assert 'case "horizonzerodawn.exe":\n            return horizonZeroDawn' in match
 assert 'if steamAppID == horizonZeroDawnAppID || installFolder == "horizon zero dawn" { return horizonZeroDawn }' in match
+assert 'static let falloutNewVegasAppID = 22380, fallout3AppIDs: Set<Int> = [22300, 22370]' in lists_src
+assert 'case "falloutnv.exe":\n            return falloutNewVegas' in match and 'case "fallout3.exe":\n            return fallout3' in match
 # GoT, GoW and Horizon Zero Dawn from Steam: their App IDs, and their folders as for RDR2 and GTA V Enhanced.
 assert 'installFolder == "ghost of tsushima director\'s cut"' in match and 'installFolder == "godofwar"' in match
 assert 'case "playgtav.exe", "gta5_enhanced.exe":' in match and 'return inSteam ? gta5EnhancedSteam : gta5EnhancedOther' in match
@@ -331,6 +336,7 @@ put = block(apply_src, '    private static func put(', '\n    }\n')
 assert 'guard file.text == rec.fileText' in put and 'if kind != .updated && switches {' in put
 assert ('if let on = rec.avx { LibraryPrefs.setAVX(on, for: windowsPath) }' in put
         and 'if let on = rec.nvidia { LibraryPrefs.setNvidia(on, for: windowsPath) }' in put
+        and 'if let on = rec.olderNvidia { LibraryPrefs.setOlderNvidia(on, for: windowsPath) }' in put
         and 'if let on = rec.wineVCRT { LibraryPrefs.setWineVCRT(on, for: windowsPath) }' in put)
 print('PASS: first sight in the library (start-up, save, Game details, start); Reset to Recommended last in Game details')
 
@@ -384,6 +390,8 @@ enum LibraryPrefs {
     static func setAVX(_ on: Bool, for path: String) { PrefStore.shared.flags["avx|" + path] = on ? true : nil }
     static func nvidia(_ path: String) -> Bool { PrefStore.shared.flags["nvidia|" + path] ?? false }
     static func setNvidia(_ on: Bool, for path: String) { PrefStore.shared.flags["nvidia|" + path] = on ? true : nil }
+    static func olderNvidia(_ path: String) -> Bool { PrefStore.shared.flags["older|" + path] ?? false }
+    static func setOlderNvidia(_ on: Bool, for path: String) { PrefStore.shared.flags["older|" + path] = on ? true : nil }
     static func wineVCRT(_ path: String) -> Bool { PrefStore.shared.flags["vcrt|" + path] ?? false }
     static func setWineVCRT(_ on: Bool, for path: String) { PrefStore.shared.flags["vcrt|" + path] = on ? true : nil }
 }
@@ -453,6 +461,13 @@ check(id(steam + #"\Horizon Zero Dawn"#, 1151640) == "horizon-zero-dawn", "Horiz
 check(id(#"C:\Games\Horizon Zero Dawn Remastered\HorizonZeroDawnRemastered.exe"#) == "none", "the remaster is another game")
 check(id(#"C:\Games\Foo\foo.exe"#) == "none" && id(steam + #"\Portal 2"#, 620) == "none", "other games")
 check(id("") == "none" && id("C:\\") == "none", "no path")
+check(id(steam + #"\Fallout New Vegas"#, 22380) == "fallout-new-vegas" && id(steam + #"\Fallout New Vegas"#) == "fallout-new-vegas",
+      "New Vegas from Steam")
+check(id(#"C:\GOG Games\Fallout New Vegas\FalloutNV.exe"#) == "fallout-new-vegas", "New Vegas by its program")
+check(id(steam + #"\Fallout 3 goty"#, 22370) == "fallout-3" && id(steam + #"\Fallout 3"#) == "fallout-3"
+      && id(#"D:\Fallout 3\Fallout3.exe"#) == "fallout-3", "Fallout 3 and its GOTY Edition")
+check(id(steam + #"\Fallout 4"#, 377160) == "none", "Fallout 4 has no list")
+check(R.falloutNewVegas.switchSummary == "older NVIDIA card on", R.falloutNewVegas.switchSummary)
 print("PASS: Steam games by App ID or steamapps\\common folder, GTA V Enhanced and RDR2 inside and outside Steam, GoT, GoW and Horizon Zero Dawn by their programs, others none")
 
 // The lists themselves.

@@ -3526,6 +3526,9 @@ struct LibraryDetail: View {
             Toggle(isOn: Binding(get: { bcd.nvidia }, set: { on in bcd.nvidia = on; LibraryPrefs.setNvidia(on, for: entry.windowsPath) })) {
                 compatLabel("Report an NVIDIA GPU", "For \"no graphics card\" errors")
             }
+            Toggle(isOn: Binding(get: { bcd.olderNvidia }, set: { on in bcd.olderNvidia = on; LibraryPrefs.setOlderNvidia(on, for: entry.windowsPath) })) {
+                compatLabel("Older NVIDIA card (Direct3D 9)", "For older games that crash with this GPU, like Fallout 3 and New Vegas")
+            }
             Toggle(isOn: Binding(get: { bcd.wineVCRT }, set: { on in bcd.wineVCRT = on; LibraryPrefs.setWineVCRT(on, for: entry.windowsPath) })) {
                 compatLabel("Wine's C++ runtime", "Instead of the game's msvcp/vcruntime")
             }
@@ -3741,12 +3744,13 @@ struct LibraryDetail: View {
 /// madeira-bcd: a game's own options as the fork stores them (LibraryDetail):
 /// LibraryPrefs' switches and the GameProfiles.swift file's lines.
 struct BCDGameValues {
-    var avx = false, nvidia = false, wineVCRT = false
+    var avx = false, nvidia = false, olderNvidia = false, wineVCRT = false
     var configText = ""
     init() {}
     init(windowsPath: String) {
         avx = LibraryPrefs.avx(windowsPath)
         nvidia = LibraryPrefs.nvidia(windowsPath)
+        olderNvidia = LibraryPrefs.olderNvidia(windowsPath)
         wineVCRT = LibraryPrefs.wineVCRT(windowsPath)
         configText = GameProfile(windowsPath: windowsPath).text
     }
