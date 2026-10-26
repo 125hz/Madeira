@@ -73,7 +73,8 @@ for path in sources:
             bad = [w for w in ('accessToken', 'refreshToken', 'exchange)', 'code)', 'displayName', 'accountID') if '\\(' + w in line.replace(' ', '')]
             require(not bad, f'{path.name}: no credential in a log line: {line.strip()[:80]}') if bad else None
 bridge = (app / 'WineProcessBridge.m').read_text()
-require('-AUTH_PASSWORD=' in bridge and 'redacted' in bridge, 'the bridge redacts the exchange code in its argv log')
+require('madeira_redact_arg_a(extra_argv[i]' in bridge and 'madeira_redact.h' in bridge,
+        'the bridge redacts the exchange code with the shared credential filter')
 library = (app / 'Library.swift').read_text()
 entries = library[library.index('private var entries: [LibraryEntry] {'):]
 entries = entries[:entries.index('var body: some View {')]

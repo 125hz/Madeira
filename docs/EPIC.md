@@ -43,7 +43,9 @@ entry, including saves that the game kept inside that directory.
 
 Play obtains a one-use exchange code just before launch. The code goes into the
 temporary arguments, not the saved game profile. The Wine argument log hides
-`-AUTH_PASSWORD`. Games that require unsupported anti-cheat, another launcher,
+`-AUTH_PASSWORD` through the shared credential filter from #248. That filter also
+protects child-process and environment command-line logs. Games that require
+unsupported anti-cheat, another launcher,
 or an overlay can still fail. The game details include an offline launch option
 for the supported Easy Anti-Cheat case.
 
