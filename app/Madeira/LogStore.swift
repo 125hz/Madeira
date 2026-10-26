@@ -188,6 +188,7 @@ final class LogStore: ObservableObject {
 
     /// Called from tail-file callback (background queue) or C callback.
     private func handleRawLine(_ raw: String) {
+        JITPoolMeter.note(raw)   // the overlay's JIT memory, also while the live log is hidden
         stateLock.lock(); let suppressed = displaySuppressed; stateLock.unlock()
         if suppressed { return }
         // Filter out lines we never want in UI (excessive byte spam, etc.)

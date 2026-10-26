@@ -79,6 +79,7 @@
 		A1000033 /* wine_stubs.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000034 /* wine_stubs.c */; };
 		A1000034 /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000035 /* IOKit.framework */; };
 		A1000035 /* StikJITHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000036 /* StikJITHelper.swift */; };
+		A1000980 /* JITPoolMeter.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000980 /* JITPoolMeter.swift */; };
 		B1000001 /* JITSetup.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000001 /* JITSetup.swift */; };
 		B1000050 /* JITNetwork.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000050 /* JITNetwork.swift */; };
 		B1000002 /* JITBuiltInHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2000002 /* JITBuiltInHost.swift */; };
@@ -280,6 +281,7 @@
 		A2000034 /* wine_stubs.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wine_stubs.c; sourceTree = "<group>"; };
 		A2000035 /* IOKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOKit.framework; path = System/Library/Frameworks/IOKit.framework; sourceTree = SDKROOT; };
 		A2000036 /* StikJITHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StikJITHelper.swift; sourceTree = "<group>"; };
+		A2000980 /* JITPoolMeter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JITPoolMeter.swift; sourceTree = "<group>"; };
 		B2000001 /* JITSetup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JITSetup.swift; sourceTree = "<group>"; };
 		B2000050 /* JITNetwork.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JITNetwork.swift; sourceTree = "<group>"; };
 		B2000002 /* JITBuiltInHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JITBuiltInHost.swift; sourceTree = "<group>"; };
@@ -534,6 +536,7 @@
 				A2000031 /* WineProcessBridge.h */,
 				A200000A /* EntitlementChecker.swift */,
 				A2000036 /* StikJITHelper.swift */,
+				A2000980 /* JITPoolMeter.swift */,
 				B2000001 /* JITSetup.swift */,
 				B2000050 /* JITNetwork.swift */,
 				B2000002 /* JITBuiltInHost.swift */,
@@ -882,6 +885,7 @@
 				A1000070 /* Winios/Winios.m in Sources */,
 				A1000247 /* PadOutput.m in Sources */,
 				A1000035 /* StikJITHelper.swift in Sources */,
+				A1000980 /* JITPoolMeter.swift in Sources */,
 				B1000001 /* JITSetup.swift in Sources */,
 				B1000050 /* JITNetwork.swift in Sources */,
 				B1000002 /* JITBuiltInHost.swift in Sources */,

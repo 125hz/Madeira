@@ -258,7 +258,10 @@ in-game menu:
    pointer settings;
 3. the performance overlay and its fields (FPS, average frame time, CPU load
    with the busiest thread, GPU load with GPU time per frame, memory
-   footprint, battery, and the thermal state: Cool, Warm, Hot or Critical; a
+   footprint, JIT memory (the JIT pool's use from its own log lines, such as
+   "JIT 374/560 MB", "(small)" when iPadOS gave the pool less room at launch,
+   "FULL" once a DLL did not fit; counted with Live logs off too), battery,
+   and the thermal state: Cool, Warm, Hot or Critical; a
    change is logged as `[thermal]` while the overlay is shown), then
    **Diagnostics**: **Capture the next frame** and **GPU sync** F1/F6/F5/F0,
    the developer overlay's CAP and F pills, for Direct3D 12 games (shown only with
@@ -440,6 +443,8 @@ math, controller commands, the exit hook, and the presence of the details and
 in-game menu options), `tests/host/check-runtime-settings.py`
 (`MadeiraConfig.set` and the Settings defaults) and
 `tests/host/check-library-api.py` (renderer detection and the badge).
+`tests/host/check-jit-pool-meter.py` covers the JIT memory field's parsing
+(split pools, the small-pool note) and that it counts with Live logs off.
 `tests/host/check-onboarding.py` covers first-run setup: the JIT choices,
 pairing import, pages with and without Dock, the done key, the
 `MADEIRA_ONBOARDING` switch, and the wiring (no Wine session, no pool or
