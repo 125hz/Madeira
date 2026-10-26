@@ -933,6 +933,213 @@ OVERLAY = {
                         "call counted per thread instead of with an atomic, and the alias lookup starting at the thread's "
                         "own last hit; 31 instructions instead of 44. [xp-api] x64->EC rates lag by under 64 calls per "
                         "thread. 0: ExitFunctionEC as before. Read when a program starts."},
+    # 2026-10-26 merge wave: engine switches read by build/ntdll-unix, build/win32u-unix and madeira-d3d12
+    # (titles and notes for the scan's entries; a key whose reader is not merged yet is listed all the same).
+    "env.LC_ALL": {"category": "Wine core (ntdll)", "title": "Wine's locale for this game", "kind": "text", "default": "",
+                "note": "Empty: Wine takes the user locale from the device's language. en_US.UTF-8 gives the game an English "
+                        "system and user locale, for a game that fails right after loading a non-English OEM code page. "
+                        "Read at session start."},
+    "env.MADEIRA_NLS_EXTRA": {"category": "Wine core (ntdll)", "title": "Extra code page tables", "kind": "bool", "default": "0",
+                "note": "Default off. 1: a code page table that is not loaded for every game (932, 936, 949, 950, 874, 1250, "
+                        "1251, 1253-1258) is read from the app's nls/extra folder when the game asks for it; without the line "
+                        "such a request fails (GetCPInfo and MultiByteToWideChar return an error), as before. For a game that "
+                        "converts its text in one of those pages. Logged as [nls-extra]; [nls-missing] names a table that was "
+                        "not found. Read at every request."},
+    "env.MADEIRA_ALIAS_RELEASE": {"category": "Memory & JIT pool", "title": "Drop a released arena's code copies", "kind": "bool",
+                "default": "0",
+                "note": "Default off. 1: anonymous memory the game made executable (copied into the JIT pool) follows the game's "
+                        "MEM_RELEASE and MEM_DECOMMIT: a released view drops its copies' records, a decommit zeroes each copy in "
+                        "its pool slot. For a game that releases a memory arena and reserves it again at the same base. Logged "
+                        "as [alias-release]. Read once per session."},
+    "env.MADEIRA_JUMBO_HALF": {"category": "Memory & JIT pool", "title": "Give a too-large probe reservation half its size",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a reserve-only request of 4 GB or more (a power of two) that finds no hole gets half its "
+                        "size at a half-aligned free slot below the emulator's arena, for a game that finds each aligned arena "
+                        "with a double-size probe and keeps only half. A game that uses the whole reservation would fault, so "
+                        "set it per game. Logged as [jumbo-half]."},
+    "env.MADEIRA_FEX_BAND_KEEP_MB": {"category": "Memory & JIT pool",
+                "title": "Keep the lowest MB of the emulator's address range for the emulator", "kind": "int", "default": "0",
+                "note": "Default 0 (off). N MB: reservations of 32 MB to 1 GB that are placed above the game's own range because "
+                        "that range is tight may not take the lowest N MB of the emulator's 16 GB range; what no longer fits goes "
+                        "below it. For a game that reserves many 511 MB ranges and then ends with \"FEXAlloc could not "
+                        "allocate\"; 6144 keeps 6 GB. Only with the 16 GB range at 0x7c00000000. Logged as [fex-keep]. Read once "
+                        "per session."},
+    "env.MADEIRA_WOW_CPU_POOL_ONLY": {"category": "Memory & JIT pool", "title": "32-bit emulator module runs from its JIT-pool copy only",
+                "kind": "bool", "default": "1",
+                "note": "Default on. Where the kernel lets an image become executable in place (iOS 18; iOS 26 without TXM), the "
+                        "32-bit emulator module (xtajit.dll) kept an executable view beside its JIT-pool copy, and its start-up "
+                        "code ran in the view while the emulator was called in the copy. On: EXEC is taken back from that view "
+                        "once the copy exists. 0: as before. Logged as [wow-cpu-pool]. Read once per session."},
+    "d3d12-pipeline-library": {"category": "Direct3D 12", "title": "Pipeline library for the game", "kind": "bool", "default": "0",
+                "note": "Default off: CreatePipelineLibrary fails (E_NOTIMPL), as before. 1: it makes a library that keeps no "
+                        "pipeline (loads answer \"not in the library\", stores are accepted and forgotten). For an engine that "
+                        "ends in a fatal error when the call fails. Read once per game start."},
+    "d3d12-pso-cached-blob": {"category": "Direct3D 12", "title": "Cached blob of a pipeline", "kind": "bool", "default": "0",
+                "note": "Default off: ID3D12PipelineState::GetCachedBlob fails (E_NOTIMPL), as before. 1: it answers a 16-byte "
+                        "blob, for an engine that treats the failure as fatal. Creating a pipeline never reads a blob handed "
+                        "back. Read once per game start."},
+    "d3d12-fl-12-1": {"category": "Direct3D 12", "title": "Claim feature level 12_1", "kind": "bool", "default": "0",
+                "note": "Default off: 12_0 is the highest feature level the runtime claims. 1: 12_1, for a game that creates its "
+                        "device at 12_1 and stops when that is refused; OPTIONS still reports no conservative rasterization or "
+                        "ROVs. Read once per game start."},
+    "d3d12-sm-6-7": {"category": "Direct3D 12", "title": "Report shader model 6.7", "kind": "bool", "default": "0",
+                "note": "Default off: SHADER_MODEL reports up to 6.6. 1: up to 6.7, for a game that requires it; the converter "
+                        "may still refuse a 6.7 shader, which fails its pipeline like any other conversion failure. Read once "
+                        "per game start."},
+    "d3d12-raytracing-tier": {"category": "Direct3D 12", "title": "Experiment: report a ray-tracing tier", "kind": "int",
+                "default": "0",
+                "note": "Experiment, default 0. 10 or 11 reports DXR tier 1.0 or 1.1 in OPTIONS5 although the runtime has no ray "
+                        "tracing (its calls stay unimplemented stubs, logged once). Only for finding out whether a game's "
+                        "device check wants it."},
+    "dxil-tess-patch-topology": {"category": "Direct3D 12", "title": "Experiment: DXIL tessellation with the patch input topology",
+                "kind": "bool", "default": "0",
+                "note": "Experiment, default off. 1: the stages of a DXIL tessellation pipeline are converted with the "
+                        "converter's patch input topology instead of triangles; such shaders are cached apart."},
+    "fence-early": {"category": "Direct3D 12", "title": "Fences advance when the GPU reached their batch", "kind": "bool",
+                "default": "0",
+                "note": "Default off. 1: a job whose command buffers have no query results advances its fence right after the "
+                        "GPU's shared event, and its buffers are retired in order on a second thread; under the CPU clamp the "
+                        "completion bookkeeping took 2-5 ms per job, which a game that polls its fences many times a frame "
+                        "waited for. Jobs with query results, a full ring or upload-guard take the old order. Read once per "
+                        "game start; [perf] fence-early lines show it."},
+    "query-timestamps": {"category": "Direct3D 12", "title": "Timestamp queries from the CPU clock", "kind": "bool", "default": "0",
+                "note": "Default off: every timestamp resolves to zero. 1: a resolved timestamp is the process's monotonic clock "
+                        "in ns when the resolve is recorded (plus its place in the range), and GetClockCalibration's GPU value is "
+                        "the same clock, for a game that spins on zero timestamps. Nothing is measured on the GPU. Read once per "
+                        "game start."},
+    "write-buffer-immediate": {"category": "Direct3D 12", "title": "WriteBufferImmediate writes its values", "kind": "bool",
+                "default": "0",
+                "note": "Default off: the method stays a stub (nothing written). 1: the values are written by the GPU in list "
+                        "order and a submission that wrote one is committed at once. CheckFeatureSupport still reports no "
+                        "support either way. Read once per game start."},
+    "env.MADEIRA_D3D12_CAPS_BY_FAMILY": {"category": "Direct3D 12", "title": "Report 64-bit atomics and wave operations by GPU",
+                "kind": "bool", "default": "0",
+                "note": "Default off: both are claimed on every GPU, as before. 1: 64-bit atomics (OPTIONS9, OPTIONS11) only on "
+                        "Apple9 GPUs (A17 Pro, A18, M3 and later) and wave operations (OPTIONS1) only from Apple7 (A14, M1), for "
+                        "an engine that picks shader paths the GPU cannot run."},
+    "ignore-volatile-metadata": {"category": "x86 emulation (FEX)", "title": "FEX: x86 ordering for the whole image", "kind": "bool",
+                "default": "0",
+                "note": "Default off. 1: an x64 image's PE volatile metadata (MSVC /volatileMetadata) is cleared when it is "
+                        "mapped, so FEX orders every instruction of it by its TSO settings instead of only the listed ones. "
+                        "Slower; for testing memory-ordering bugs. Logged as [fex-vmeta]. Read at session start."},
+    "env.MADEIRA_AUDIO_RESUME": {"category": "Audio", "title": "Bring game audio back after an interruption", "kind": "bool",
+                "default": "0",
+                "note": "Default off: after a call, Siri, an alarm or a suspension the sound stays off until the game restarts. "
+                        "1: the audio session is activated again and the output restarted; while iOS holds it stopped the game's "
+                        "audio clock keeps running. Logged as [audio] interruption began / ended. Read when the session starts."},
+    "env.MADEIRA_AUDIO_GAIN": {"category": "Audio", "title": "Game volume at the output (%)", "kind": "int", "default": "100",
+                "note": "Percent of the game's level, 10-200; unset or 100 leaves it unchanged. Read once, at the first audio "
+                        "endpoint. Set it in the game's own file."},
+    "env.MADEIRA_TAIL_CARVE_EXEC_CHECK": {"category": "Memory & JIT pool", "title": "Refuse a code buffer that cannot execute",
+                "kind": "bool", "default": "1",
+                "note": "Default on: a new emulator code buffer whose first 16 MB hold a JIT-pool page that lost execute "
+                        "permission for good is refused, and the emulator asks for half the size elsewhere. 0: every buffer is "
+                        "granted, as before. Read once per session."},
+    "env.MADEIRA_EA_CEF": {"category": "Memory & JIT pool", "title": "A store launcher's Chromium in one process", "kind": "bool",
+                "default": "0",
+                "note": "Default off; set with env.MADEIRA_SC_PA_POOLS = 2 for the EA app's launcher. EADesktop.exe runs "
+                        "--single-process with V8 --jitless (MADEIRA_JITLESS = 0 keeps V8's JIT), its --type= children are "
+                        "refused, and its four PartitionAlloc pools get the four 16 GB slots of the address band instead of "
+                        "overlapping. No effect on any other program."},
+    "env.MADEIRA_EA_CEF_FLAGS": {"category": "Memory & JIT pool", "title": "Extra EADesktop.exe switches", "kind": "text", "default": "",
+                "note": "Appended verbatim to EADesktop.exe's command line while env.MADEIRA_EA_CEF is on (e.g. --disable-gpu)."},
+    "env.MADEIRA_EA_CEF_CMDLINE": {"category": "Memory & JIT pool", "title": "Rewrite EADesktop.exe's command line", "kind": "bool",
+                "default": "1",
+                "note": "Default on. 0: while env.MADEIRA_EA_CEF is on, EADesktop.exe's command line is not rewritten; its "
+                        "--type= children are still refused. For testing a switch the launcher may not know."},
+    "env.MADEIRA_NTDLL_DATA_SYNC_RANGE": {"category": "Memory & JIT pool", "title": "ntdll data patches copy only the bytes asked for",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: when a 64-bit game changes the protection of a few bytes of ntdll's writable data, only "
+                        "those bytes are copied to the copy ntdll runs from, not the whole page (which also overwrote live "
+                        "callbacks next to the slot). Logged as [ntdll-data-sync]. Read once per session."},
+    "env.MADEIRA_FAULT_LOOP_GUEST_PROGRESS": {"category": "Exceptions & threads",
+                "title": "A run of breakpoints at different addresses is not a stuck thread", "kind": "bool", "default": "0",
+                "note": "Default off. 1: the loop breaker (50 faults at one place end the thread) no longer counts int3 traps at "
+                        "different guest addresses as one stuck fault, though the emulator raises all of them from one host "
+                        "instruction. Logged as [fault-progress]. Read once per session."},
+    "env.MADEIRA_FAULT_GUARD_GUEST_RIP": {"category": "Exceptions & threads", "title": "Fault guards tell FEX's invalid instructions apart",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: the fault-storm guards also key an invalid-instruction delivery on the guest instruction "
+                        "FEX saved, so a program that steps over a long run of them in its own handler is not ended while it "
+                        "advances, and the 50-fault page breaker counts memory faults only. Logged as [redeliv] guest_rip. Read "
+                        "once per session."},
+    "env.MADEIRA_FAULT_GUARD_RATE": {"category": "Exceptions & threads", "title": "Fault-storm guards end only a real storm",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a run of 2000 faults at one instruction ends the game only when it is dense (inside half "
+                        "a second) or presenting makes no progress, and the 5-repeat guard counts per thread within 5 ms; for a "
+                        "Unity title that throws managed exceptions through null-check traps while it keeps drawing. Read once "
+                        "per session."},
+    "env.MADEIRA_VCRT_ARM64_KEY": {"category": "Wine core (ntdll)", "title": "ARM64 Visual C++ runtime marker", "kind": "text", "default": "",
+                "note": "Default empty: nothing written. 1 (or a version such as 14.50.35717): the session has the ARM64 Visual "
+                        "C++ 2015-2022 redistributable's Installed marker (volatile keys; one the prefix has is left alone), for "
+                        "an Unreal bootstrap program that sees an ARM64 machine and stops asking for that redistributable "
+                        "(exit 0x2329). Read at session start."},
+    "env.MADEIRA_TINY_WINDOW_FIX": {"category": "Windows, display & input", "title": "Size a tiny game window to the screen",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a window a swapchain presents into whose client area stays under 160x120 for 3 seconds "
+                        "while the swapchain draws 320x200 or more is sized to the virtual screen (at most twice per window). "
+                        "Needs a desktop (Dock) session. Logged as [tiny-win]. Read at session start."},
+    "env.MADEIRA_RECOVERY_LOG_SAMPLE": {"category": "Exceptions & threads", "title": "Sample routine instruction recovery logs",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: of FEX's records about each recovered invalid instruction (C000001D) only the first 16 "
+                        "and every 1024th are kept, and of the shared-trap ILL reports the first 8 and every 1024th; only the "
+                        "log changes. For a game that recovers thousands a second. Read before guest threads start."},
+    "env.MADEIRA_RESERVED_REMAP": {"category": "Memory & JIT pool", "title": "Last resort for a refused window placement",
+                "kind": "bool", "default": "1",
+                "note": "Default on, and only on the path that already fails: when the system refuses every placement of a "
+                        "32-bit program's request inside its 4 GB window (ENOMEM), the first refused range, which Wine's tables "
+                        "call free, is unmapped and mapped again without overwriting; if that fails the request fails as before. "
+                        "0: no last resort. Read when a program starts."},
+    "env.MADEIRA_VDCFG_PATH": {"category": "Windows, display & input", "title": "QueryDisplayConfig lists the monitor's path",
+                "kind": "bool", "default": "0",
+                "note": "Default off: success with no path, as before. 1: QueryDisplayConfig returns the virtual monitor's one path "
+                        "(source and target mode, the desktop size) and DisplayConfigGetDeviceInfo names its source, target and "
+                        "adapter, for a game that builds its fullscreen window from the paths."},
+    "env.MADEIRA_TLS_CLEAR_OWN_PROCESS": {"category": "Wine core (ntdll)", "title": "TlsFree only touches the calling program's threads",
+                "kind": "bool", "default": "0",
+                "note": "Default off: TlsFree clears the freed slot in every thread of the session (all programs share one address "
+                        "space). 1: only the calling program's threads, as on Windows. A slot cleared in another program while it "
+                        "held a value is logged as [tls-cross-clear] either way. Read once per session."},
+    "env.MADEIRA_REDELIV_CHILD_ONLY": {"category": "Exceptions & threads", "title": "A fault storm in a helper program ends only that program",
+                "kind": "bool", "default": "1",
+                "note": "Default on: when the fault-storm guard gives up on a thread of a program the session started (a "
+                        "launcher's helper), that program ends and the app keeps running; the session's first program keeps the "
+                        "old ending. 0: the whole app ends for every storm, as before."},
+    "env.MADEIRA_USER_VA_GB": {"category": "Memory & JIT pool", "title": "Address space the game is told it has (GiB)", "kind": "int",
+                "default": "0",
+                "note": "Default 0 (off): a 64-bit game is told its user address space is what the device maps. N (4-4096, never "
+                        "more than the real figure): it is told N GiB; only the figure changes, not placement. For a game that "
+                        "sizes one reservation from it and quits when it cannot get it (32 is the value to try). Logged as "
+                        "[user-va]. Read once per session."},
+    "env.MADEIRA_ANON_LDADDAL32": {"category": "Exceptions & threads", "title": "Atomic adds on runtime-written code", "kind": "bool",
+                "default": "0",
+                "note": "Default off. 1: a 32-bit atomic add a managed runtime does on its own executable memory goes through the "
+                        "validated write workaround. For one recorded start-up failure of a .NET title; other games keep the "
+                        "existing path."},
+    "env.MADEIRA_ANON_CAS_FLUSH": {"category": "Exceptions & threads", "title": "Atomic code patches go through the emulator", "kind": "bool",
+                "default": "0",
+                "note": "Default off: a compare-and-swap the game does on its own executable memory (a .NET runtime patching a stub "
+                        "it ran) is completed by the host. 1: it is handed to the emulator, which discards its translation of the "
+                        "page first, as in older builds. Slower. Logged as [anon-cas]. Read once per session."},
+    "env.MADEIRA_VA_PRESSURE_GAP_OK": {"category": "Memory & JIT pool", "title": "A slow scan through the refused hole is not pressure",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: an address-space scan that succeeded after grinding through the hole iOS refuses below the "
+                        "app image does not mark the address space as under pressure (which steers big reservations away from "
+                        "the swap tier). Read once."},
+    "env.MADEIRA_ATOM_ARG": {"category": "Windows, display & input", "title": "Atoms in a 32-bit program's class and property names",
+                "kind": "bool", "default": "1",
+                "note": "Default on: a class or property name given as an atom that arrives offset by the 32-bit program's window "
+                        "base (inside its never-mapped first 64 KB) is taken as the atom, not read as a string pointer. 0 turns "
+                        "it off."},
+    "env.DOTNET_EnableWriteXorExecute": {"category": "Wine core (ntdll)", "title": ".NET runtime: W^X mapping", "kind": "text", "default": "",
+                "note": "Passed into the game's environment and read by the .NET (CoreCLR) runtime itself. 0 turns off its "
+                        "write-xor-execute double mapping of JIT code, for a .NET game whose JIT stops at start."},
+    "env.DOTNET_GCRegionRange": {"category": "Wine core (ntdll)", "title": ".NET runtime: GC region reservation", "kind": "text", "default": "",
+                "note": "Passed into the game's environment and read by the .NET runtime: the size (hex bytes) of the address "
+                        "range its regions GC reserves at start, for a .NET game whose default reservation fails."},
+    "env._JAVA_OPTIONS": {"category": "Wine core (ntdll)", "title": "Java runtime options", "kind": "text", "default": "",
+                "note": "Passed into the game's environment and read by a bundled Java runtime (e.g. -XX:-UseZGC to leave a garbage "
+                        "collector off that cannot map its heap here)."},
     "dxmt": {"title": "DXMT options (a=b;c=d)",
              "note": "Exported as DXMT_CONFIG with the options joined by ';', a library game's own dxmt options after these: "
                      "e.g. d3d11.mipClampBC=1;d3d11.preferredMaxFrameRate=30. DXMT reads at most 259 characters of it, "

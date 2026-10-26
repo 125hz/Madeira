@@ -64,12 +64,28 @@ for m in re.finditer(r'static let (\w+) = GameRecommendation\(\n\s*id: "([^"]+)"
     body = body.replace('\\\\', '\\')
     lines = [line[len(indent):] if line.startswith(indent) else line for line in body.split('\n')]
     presets[ident] = dict(name=name, title=title, version=int(version), lines=lines, switches=' '.join((switches or '').split()))
-assert set(presets) == {'rdr2-steam', 'rdr2-other', 'gta5e-steam', 'gta5e-other', 'gta5l-steam', 'gta4-steam', 'ghost-of-tsushima',
-                        'god-of-war', 'horizon-zero-dawn', 'horizon-forbidden-west', 'ratchet-clank-rift-apart', 'crysis-remastered',
-                        'crysis-2-remastered', 'crysis-3-remastered', 'steam-big-picture', 'standard'}, sorted(presets)
-assert ('static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, gta5LegacySteam, gta4Steam, ghostOfTsushima,\n'
-        '                      godOfWar, horizonZeroDawn, horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered, crysis2Remastered,\n'
-        '                      crysis3Remastered, steamBigPicture, standard]') in lists_src
+# The Steam titles merged on 2026-10-26 from community tested lists (GameRecommendations.steamTitles).
+MERGED = {'msfs-2024', 'counter-strike-2', 'breakneck', 'spelunky-2', 'albion-online', 'hogwarts-legacy',
+          'metal-gear-solid-v', 'stellar-blade-demo', 'star-wars-galactic-racer', 'minecraft-dungeons-2', 'denshattack', 'final-fantasy-resonance-demo',
+          'no-rest-for-the-wicked', 'quaver', 'dying-light', 'beamng-drive', 'monster-hunter-stories-3-trial', 'pwaat',
+          'american-truck-simulator', 'marvels-spider-man-miles-morales', 'diablo-ii-resurrected', 'clair-obscur-expedition-33', 'gtasa-de-steam', 'unrailed-2-back-on-track',
+          'blazblue-entropy-effect', 'dark-souls-iii', 'marvels-spider-man-remastered', 'marvels-spider-man-2', 'raidou-remastered', 'yakuza-like-a-dragon',
+          'batman-arkham-city-goty', 'trails-in-the-sky-1st-chapter', 'subnautica-2', 'rdr1-steam', 'resident-evil-requiem', 'resident-evil-requiem-demo',
+          'life-is-strange-remastered', 'life-is-strange-2', 'project-zomboid', 'spiderheck', 'rounds', 'plateup',
+          'final-fantasy-tactics-ivalice-chronicles', 'jetboard-joust', 'dead-as-disco', 'tung', 'sekiro-shadows-die-twice', 'stardew-valley',
+          'glyphica-typing-survival', 'the-adventures-of-elliot'}
+assert set(presets) == {'rdr2-steam', 'rdr2-other', 'gta5e-steam', 'gta5e-other', 'gta5l-steam', 'gta5l-other', 'gta4-steam',
+                        'ghost-of-tsushima', 'god-of-war', 'horizon-zero-dawn', 'horizon-forbidden-west', 'ratchet-clank-rift-apart',
+                        'crysis-remastered', 'crysis-2-remastered', 'crysis-3-remastered', 'steam-big-picture', 'standard'} | MERGED, \
+    sorted(presets)
+assert ('static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, gta5LegacySteam, gta5LegacyOther, gta4Steam,\n'
+        '                      ghostOfTsushima, godOfWar, horizonZeroDawn, horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered,\n'
+        '                      crysis2Remastered, crysis3Remastered, steamBigPicture, standard] + steamTitles.map(\\.list)') in lists_src
+# Every merged list is in the recognition table, once.
+titles_src = block(lists_src, '    static let steamTitles: [SteamTitle] = [', '\n    ]\n')
+for ident in MERGED:
+    assert titles_src.count('list: %s)' % presets[ident]['name']) == 1, ident
+assert titles_src.count('SteamTitle(') == len(MERGED)
 # ml2021: the Big Picture entry (C:\big-picture.bat) is recognised by its batch name and gets the Steam Big Picture list
 assert 'if last == "big-picture.bat" { return steamBigPicture }' in lists_src
 assert 'static var bigPictureEntry: LibraryEntry' in library and 'relativePath: "big-picture.bat"' in library \
@@ -83,7 +99,7 @@ assert 'if LibraryEntry.steamClientInstalled {' in library and 'Label("Big Pictu
 # so every game's own list ends with them. The standard list reaches every other game
 # and the Desktop, and has none of them. A list that sets one of them itself
 # (Horizon Forbidden West and Rift Apart: MADEIRA_FREE_DELAY_MS = 0) leaves it out of the block.
-FORK_DEFAULTS = ["# madeira-bcd's defaults, which this list was tested with (upstream's differ).",
+FORK_DEFAULTS = ["# The defaults this list was tested with (upstream's differ).",
                  'env.MADEIRA_FREE_DELAY_MS = 2000', 'env.MADEIRA_CTX_CPU_AREA = 2', 'env.MADEIRA_WAIT_CHILDREN = 1',
                  'env.MADEIRA_JIT_DUMP = 0']
 for ident, p in presets.items():
@@ -120,7 +136,7 @@ for ident, p in presets.items():
         if key != 'env.WINEDLLOVERRIDES':
             named = named.replace('socialclubhelper.exe', '')
         assert 'socialclub' not in named and 'MADEIRA_DLL_LOCAL' not in line, (ident, line)
-print('PASS: sixteen lists, two comment lines each, every game list ends with the four fork defaults and the standard one has none, no key twice, '
+print('PASS: sixty-seven lists (seventeen plus 50 merged Steam titles), two comment lines each, every game list ends with the four fork defaults and the standard one has none, no key twice, '
       'every non-env key in the settings catalog, no Social Club DLL lines, no variant DLL switches')
 
 # Red Dead Redemption 2 from Steam: the owner's list of 2026-10-09 (build 463), line for line,
@@ -257,9 +273,12 @@ assert hzd['tested'] == ['dxbc-register-spaces = 1', 'msc-unbounded-retry = 1', 
                             'env.WINEDEBUG = fixme-input'], hzd['lines']
 hfw = presets['horizon-forbidden-west']
 rca = presets['ratchet-clank-rift-apart']
-assert not any(line.startswith(('quiet-log', 'env.MADEIRA_SRV_FGETPATH'))
+assert not any(line.startswith('env.MADEIRA_SRV_FGETPATH')
                for p in presets.values() if p not in (hzd, hfw, rca) for line in p['lines']), \
-    'the build 494 switches are the two Horizon games\' and Rift Apart\'s only'
+    'the build 494 file-path switch is the two Horizon games\' and Rift Apart\'s only'
+assert not any(line.startswith('quiet-log')
+               for ident, p in presets.items() if p not in (hzd, hfw, rca) and ident not in MERGED for line in p['lines']), \
+    'quiet-log is the two Horizon games\', Rift Apart\'s and some merged titles\' only'
 assert hzd['version'] == 16 and hzd['switches'] == 'avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit"', hzd
 assert not any(line.startswith(('d3d12-wave-ops', 'd3d12-raw-typed-views', 'typed-uav-atomic', 'ignore-volatile-metadata',
                                  'env.FEX_MEMCPYSETTSOENABLED', 'env.FEX_STRICTINPROCESSSPLITLOCKS'))
@@ -301,13 +320,30 @@ assert hfw['fork'] == ['env.MADEIRA_CTX_CPU_AREA = 2', 'env.MADEIRA_WAIT_CHILDRE
 assert hfw['version'] == 5 and hfw['switches'] == ('avx: true, nvidia: true, wineVCRT: false, fastSync: true, fpsMode: 3, '
                                                    'display: "fit"'), hfw
 # Ratchet & Clank: Rift Apart, version 1: HFW's general lines without Decima's typed-view alignment and copies,
+# rp-carry and eco. Version 2 (2026-10-26, a community last known working list, its version 6): a 2 GB budget and
+# a 1 GB swap file, fence-early, the arena switches (jumbo-half, cage, alias release, VA pressure gap) and LC_ALL.
 # rp-carry and eco; AVX and NVIDIA on. Seen up to its intro video on an 8 GB phone (community build 531).
-assert rca['tested'] == HFW_GENERAL + ['typed-view-rgb32 = 1', 'mip0-full = 1', 'quiet-log = 1',
-                                       'pso-lazy-libs = 1'] + HFW_ENV, rca['lines']
-assert set(rca['tested']) < set(hfw['tested']), 'Rift Apart\'s lines are a subset of HFW\'s'
-assert rca['fork'] == hfw['fork'] and rca['version'] == 1 and rca['switches'] == hfw['switches'], rca
-assert not any(line.startswith(('typed-view-rgb32', 'mip0-full')) for p in presets.values() if p not in (hfw, rca)
-               for line in p['lines']), 'typed-view-rgb32 and mip0-full are HFW\'s and Rift Apart\'s only'
+RCA_ENV = HFW_ENV[:-1] + ['env.MADEIRA_JUMBO_HALF = 1', 'env.MADEIRA_CAGE_RELEASE = 1', 'env.MADEIRA_ALIAS_RELEASE = 1',
+                         'env.LC_ALL = en_US.UTF-8', HFW_ENV[-1], 'env.MADEIRA_VA_PRESSURE_GAP_OK = 1']
+assert rca['tested'] == ['vram-mb = 2048', 'swap-mb = 1024'] + HFW_GENERAL[2:] + [
+    'typed-view-rgb32 = 1', 'mip0-full = 1', 'quiet-log = 1', 'pso-lazy-libs = 1', 'fence-early = 1'] + RCA_ENV, rca['lines']
+assert rca['fork'] == hfw['fork'] and rca['version'] == 2 and rca['switches'] == hfw['switches'], rca
+assert not any(line.startswith('typed-view-rgb32') for p in presets.values() if p not in (hfw, rca)
+               for line in p['lines']), 'typed-view-rgb32 is HFW\'s and Rift Apart\'s only'
+assert not any(line.startswith('mip0-full') for ident, p in presets.items() if p not in (hfw, rca) and ident not in MERGED
+               for line in p['lines']), 'mip0-full is HFW\'s, Rift Apart\'s and some merged titles\' only'
+# GTA IV, version 3: AVX pinned off (a community list for the same launcher chain).
+assert presets['gta4-steam']['version'] == 3 and presets['gta4-steam']['switches'] == \
+    'avx: false, fastSync: true, semaphoreFastPath: true, display: "fit"', presets['gta4-steam']
+# The merged lists: version 1, none of the community variant or app-side switches, and no MADEIRA_SPAWN_SWAP
+# (its engine code is not in this tree).
+for ident in MERGED:
+    p = presets[ident]
+    assert p['version'] == 1, ident
+    assert not any(line.startswith(('env.MADEIRA_WINTYPES', 'env.MADEIRA_OPTIN_DLLS', 'env.MADEIRA_D3D8 ',
+                                    'env.MADEIRA_STEAM_IDENTITY', 'env.MADEIRA_MFC_DOCK', 'pool-split-retry'))
+                   for line in p['lines']), (ident, p['lines'])
+assert [ident for ident, p in presets.items() if any(line.startswith('env.MADEIRA_SPAWN_SWAP') for line in p['lines'])] == []
 print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472, 475, 476, 480 and 514 test lines (v10), line for line with its switches (720 lines of this screen), and outside Steam the same without the Dock lines, with the ec-hook reporter off (v1); GTA V Enhanced keeps its tested lines plus the stamped orphan-lock mode (v2) and, from Steam, the VC++ engine block (v3), GoW its tested lines; Horizon Zero Dawn has build 491\'s proven list plus build 494\'s frame-rate switches (v16), GoT the owner\'s build 515 list (v3); every other game and the Desktop the standard list (v3)')
 
 # Crysis Remastered, version 1 (community build 528, 2026-10-13 22:08, it ran perfectly): the
@@ -356,12 +392,17 @@ assert 'if steamAppID == horizonZeroDawnAppID || installFolder == "horizon zero 
 assert 'installFolder == "ghost of tsushima director\'s cut"' in match and 'installFolder == "godofwar"' in match
 assert 'case "playgtav.exe", "gta5_enhanced.exe":' in match and 'return inSteam ? gta5EnhancedSteam : gta5EnhancedOther' in match
 assert 'return inSteam ? rdr2Steam : rdr2Other' in match
-assert 'guard fileExists(folder + "\\\\GTA5_Enhanced.exe") else {' in match and 'default:\n            return nil' in match
+assert 'guard fileExists(folder + "\\\\GTA5_Enhanced.exe") else {' in match
 # GTA V Legacy: Steam only; Enhanced (GTA5_Enhanced.exe beside the program) is checked first.
 assert 'static let gta5LegacyAppID = 271590' in lists_src
 assert 'if steamAppID == gta5LegacyAppID || installFolder == "grand theft auto v" { return gta5LegacySteam }' in match
-assert 'return last == "playgtav.exe" && inSteam && fileExists(folder + "\\\\GTA5.exe") ? gta5LegacySteam : nil' in match
-assert 'case "gta5.exe":\n            // GTA V Legacy\'s game program, from Steam only.\n            return inSteam ? gta5LegacySteam : nil' in match
+assert 'guard last == "playgtav.exe" && fileExists(folder + "\\\\GTA5.exe") else { return nil }\n' \
+       '                return inSteam ? gta5LegacySteam : gta5LegacyOther' in match
+assert 'case "gta5.exe":\n            // GTA V Legacy\'s game program, inside or outside a Steam library.\n' \
+       '            return inSteam ? gta5LegacySteam : gta5LegacyOther' in match
+# The merged Steam titles: by App ID or folder after the lists above, by program in the switch's default.
+assert 'return steamTitles.first { title in\n' in match
+assert 'default:\n            return steamTitles.first { $0.programs.contains(last) || (inSteam && $0.steamPrograms.contains(last)) }?.list' in match
 # GTA V Legacy (Steam) v1 (community build 547): DirectX 11, so no D3D12 lines and no DualSense mode; no vram-mb or
 # swap-mb in the list; a device under 12 GB of RAM gets the 3 GB RAM swap after it.
 legacy = presets['gta5l-steam']
@@ -373,7 +414,10 @@ assert legacy['switches'] == ('avx: false, nvidia: true, wineVCRT: false, fastSy
                               'display: "fit", smallRAMConfig: smallRAMSwapLines'), legacy['switches']
 assert 'static let smallRAMSwapLines = "swap-mb = 3072"' in lists_src
 assert 'static var smallRAMDevice: Bool { deviceRAMBytes < 10 << 30 }' in lists_src
-assert lists_src.count('smallRAMConfig: smallRAMSwapLines') == 1
+assert lists_src.count('smallRAMConfig: smallRAMSwapLines') == 2   # GTA V Legacy inside and outside Steam
+other_legacy = presets['gta5l-other']
+assert other_legacy['tested'] == [line for line in legacy['tested'] if not line.startswith('env.MADEIRA_DOCK_')], other_legacy
+assert other_legacy['switches'] == legacy['switches'] and other_legacy['version'] == 1, other_legacy
 
 # Where the app applies them.
 save = block(library, '    func save(_ entry: LibraryEntry, metadata: Bool = false) {', '\n    }\n')
@@ -529,8 +573,9 @@ check(id(other + #"\PlayGTAV.exe"#, files: [other + #"\GTA5_Enhanced.exe"#]) == 
 check(id(other + #"\GTA5_Enhanced.exe"#, files: [other + #"\GTA5_Enhanced.exe"#]) == "gta5e-other", "GTA5_Enhanced.exe elsewhere")
 check(id(#"C:\GAMES\gta v enhanced\PLAYGTAV.EXE"#, files: [other + #"\gta5_enhanced.exe"#]) == "gta5e-other", "names in any case")
 check(id("C:/Games/GTA V Enhanced/PlayGTAV.exe", files: [other + #"\GTA5_Enhanced.exe"#]) == "gta5e-other", "forward slashes")
-check(id(#"C:\Games\GTA V\PlayGTAV.exe"#, files: [#"C:\Games\GTA V\GTA5.exe"#]) == "none", "the legacy edition outside Steam has no list")
-check(id(#"C:\Games\GTA V\GTA5.exe"#) == "none", "GTA5.exe outside Steam has no list")
+check(id(#"C:\Games\GTA V\PlayGTAV.exe"#, files: [#"C:\Games\GTA V\GTA5.exe"#]) == "gta5l-other", "the legacy edition outside Steam")
+check(id(#"C:\Games\GTA V\GTA5.exe"#) == "gta5l-other", "GTA5.exe outside Steam")
+check(id(#"C:\Games\GTA V\PlayGTAV.exe"#) == "none", "PlayGTAV.exe outside Steam with neither game program beside it")
 let legacy = steam + #"\Grand Theft Auto V"#
 check(id(legacy, 271590) == "gta5l-steam", "GTA V Legacy by its App ID")
 check(id(legacy) == "gta5l-steam", "GTA V Legacy by its Steam folder")
@@ -555,7 +600,9 @@ check(R.all.map { $0.fileText } == onTwelve, "a 16 GB iPad: the same lists as a 
 R.deviceRAMBytes = 7_500 << 20
 check(R.gta5LegacySteam.fileText.hasSuffix("env.MADEIRA_JIT_DUMP = 0\nswap-mb = 3072\n"),
       "an 8 GB phone: the 3 GB RAM swap after GTA V Legacy's list")
-check(zip(R.all, onTwelve).allSatisfy { $0.0.id == "gta5l-steam" || $0.0.fileText == $0.1 },
+check(R.gta5LegacyOther.fileText.hasSuffix("env.MADEIRA_JIT_DUMP = 0\nswap-mb = 3072\n"),
+      "an 8 GB phone: the 3 GB RAM swap after GTA V Legacy's list outside Steam too")
+check(zip(R.all, onTwelve).allSatisfy { $0.0.id == "gta5l-steam" || $0.0.id == "gta5l-other" || $0.0.fileText == $0.1 },
       "every other list is the same on an 8 GB phone")
 R.deviceRAMBytes = 11_695 << 20
 check(id(other + #"\PlayGTAV.exe"#) == "none", "PlayGTAV.exe without GTA5_Enhanced.exe beside it")
@@ -597,9 +644,18 @@ check(id(crysis2) == "crysis-2-remastered" && id(crysis3) == "crysis-3-remastere
 check(id(crysis2 + #"\Bin64\Crysis2Remastered.exe"#) == "crysis-2-remastered"
       && id(crysis3 + #"\Bin64\Crysis3Remastered.exe"#) == "crysis-3-remastered", "their programs inside Steam")
 check(id(#"C:\Games\Crysis 2\Bin32\Crysis2.exe"#) == "none", "the original Crysis 2 is another game")
+// The merged Steam titles: App ID, folder, a program anywhere, a Steam-only program only inside a library.
+check(id(steam + #"\MSFS2024"#, 2537590) == "msfs-2024" && id(steam + #"\MSFS2024"#) == "msfs-2024", "a merged title by App ID and folder")
+check(id(#"D:\Games\FS\FlightSimulator2024.exe"#) == "msfs-2024", "a merged title's program anywhere")
+check(id(steam + #"\DARK SOULS III\Game\DarkSoulsIII.exe"#) == "dark-souls-iii", "a Steam-only program inside Steam")
+check(id(#"C:\Games\DS3\DarkSoulsIII.exe"#) == "none", "a Steam-only program outside Steam")
+check(id(steam + #"\Dead as Disco"#, 3404260) == "dead-as-disco" && id(steam + #"\TUNG"#) == "tung", "App ID only, folder only")
+check(id(steam + #"\Red Dead Redemption"#) == "rdr1-steam" && id(steam + #"\Red Dead Redemption 2"#) == "rdr2-steam",
+      "folders match whole names")
+check(R.steamTitles.count == 50 && R.all.count == 67, "50 merged titles, 67 lists")
 check(id(#"C:\Games\Foo\foo.exe"#) == "none" && id(steam + #"\Portal 2"#, 620) == "none", "other games")
 check(id("") == "none" && id("C:\\") == "none", "no path")
-print("PASS: Steam games by App ID or steamapps\\common folder, GTA V Enhanced and RDR2 inside and outside Steam, GoT, GoW, the Horizon games, Rift Apart and the three Crysis Remastered games by their programs, others none")
+print("PASS: Steam games by App ID or steamapps\\common folder, GTA V Enhanced and RDR2 inside and outside Steam, GoT, GoW, the Horizon games, Rift Apart and the three Crysis Remastered games by their programs, GTA V Legacy outside Steam, the 50 merged Steam titles, others none")
 
 // The lists themselves.
 check(Set(R.all.map(\.id)).count == R.all.count, "ids are unique")

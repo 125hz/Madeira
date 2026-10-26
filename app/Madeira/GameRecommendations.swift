@@ -24,9 +24,13 @@
 //      anywhere else a copy from outside Steam (Rockstar Games Launcher or
 //      another store), and each has its own list. Red Dead Redemption 2's
 //      RDR2.exe and PlayRDR2.exe the same way.
-//    - GTA V Legacy only from Steam: App ID 271590, the folder "Grand
-//      Theft Auto V", GTA5.exe, or PlayGTAV.exe beside GTA5.exe and without
-//      GTA5_Enhanced.exe (Enhanced is checked first).
+//    - GTA V Legacy: App ID 271590, the folder "Grand Theft Auto V",
+//      GTA5.exe, or PlayGTAV.exe beside GTA5.exe and without
+//      GTA5_Enhanced.exe (Enhanced is checked first); inside a Steam library
+//      the Steam copy, anywhere else the list for outside Steam.
+//    - The Steam titles of `steamTitles` (merged 2026-10-26): their App IDs,
+//      their folders under steamapps\common and their own programs; a
+//      program marked Steam-only names the game only inside a Steam library.
 //    - Any other game, and the Desktop, gets the standard list (owner's
 //      decisions, 2026-10-12; GameRecommendationsApply.swift).
 //
@@ -194,7 +198,7 @@ enum GameRecommendations {
         env.WINEDLLOVERRIDES = video64=
         env.MADEIRA_DEVICE_STATS = 1
         env.MADEIRA_METAL_HUD_MAIN = 1
-        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
         env.MADEIRA_CTX_CPU_AREA = 2
         env.MADEIRA_WAIT_CHILDREN = 1
@@ -264,7 +268,7 @@ enum GameRecommendations {
         env.MADEIRA_DEVICE_STATS = 1
         env.MADEIRA_METAL_HUD_MAIN = 1
         env.MADEIRA_EC_HOOK_TRACE = 0
-        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
         env.MADEIRA_CTX_CPU_AREA = 2
         env.MADEIRA_WAIT_CHILDREN = 1
@@ -320,7 +324,7 @@ enum GameRecommendations {
         env.MADEIRA_DEVICE_STATS = 1
         env.MADEIRA_PAD_MODE = hid
         env.MADEIRA_METAL_HUD_MAIN = 1
-        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
         env.MADEIRA_CTX_CPU_AREA = 2
         env.MADEIRA_WAIT_CHILDREN = 1
@@ -338,8 +342,8 @@ enum GameRecommendations {
     /// vram-mb = 4096 and swap-mb = 3072 the first try had sudden drops and
     /// stalls; without them it ran smoothly (the DXGI budget then is the default
     /// 1536 MB). A device with less than 12 GB of RAM still gets the 3 GB RAM
-    /// swap (`smallRAMConfig`); a 12 GB phone or a 16 GB iPad does not. From
-    /// Steam only: another copy (Epic, Rockstar's store) keeps the standard list.
+    /// swap (`smallRAMConfig`); a 12 GB phone or a 16 GB iPad does not. A copy
+    /// from outside Steam (Epic, Rockstar's store) gets `gta5LegacyOther`.
     static let gta5LegacySteam = GameRecommendation(
         id: "gta5l-steam", title: "GTA V Legacy (Steam)", version: 1,
         config: """
@@ -371,7 +375,51 @@ enum GameRecommendations {
         env.WINEDLLOVERRIDES = video64=
         env.MADEIRA_DEVICE_STATS = 1
         env.MADEIRA_METAL_HUD_MAIN = 1
-        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: true, wineVCRT: false, fastSync: true, semaphoreFastPath: true, fpsMode: 4,
+        display: "fit", smallRAMConfig: smallRAMSwapLines)
+
+    /// GTA V Legacy started from its own GTA5.exe, or PlayGTAV.exe beside it,
+    /// outside a Steam library (Epic, Rockstar's store; merged 2026-10-26 from
+    /// a community list for it). The Steam list without the two lines only
+    /// Madeira Dock reads when Steam starts the game (the service manager and
+    /// the programs that keep that session alive), the same switches and the
+    /// same 3 GB RAM swap under 12 GB of RAM. Not device-tested here.
+    static let gta5LegacyOther = GameRecommendation(
+        id: "gta5l-other", title: "GTA V Legacy (outside Steam)", version: 1,
+        config: """
+        # Madeira's recommended settings for GTA V Legacy (outside Steam).
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        pool-low = 1
+        pool-page-fit = 1
+        pool-split = 1
+        env.FEX_VECTORTSOENABLED = 0
+        env.MADEIRA_CHILD_ARGS = PlayGTAV.exe -nobattleye
+        env.MADEIRA_EXECREQ_LEAVE = 1
+        env.MADEIRA_KMT_ADAPTER = 1
+        env.MADEIRA_LOCK_ORPHAN = stamped
+        env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
+        env.MADEIRA_POOL_LOW_IMAGES = 1
+        env.MADEIRA_POOL_RECYCLE_IMAGES = 1
+        env.MADEIRA_SC_PA_POOLS = 2
+        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;.be\\vc_redist
+        env.MADEIRA_TOUCH_MOUSE = 1
+        env.MADEIRA_WOW_MIN_FREE_GB = 2
+        env.MADEIRA_X64_GRAPHICS_ENTRY = 1
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.DXMT_WSI_MONITOR_IDENTITY = 1
+        env.DXMT_WSI_MODE_TABLE = 1
+        env.DXMT_SMALL_RINGS = Launcher.exe;SocialClubHelper.exe
+        env.WINEDLLOVERRIDES = video64=
+        env.MADEIRA_DEVICE_STATS = 1
+        env.MADEIRA_METAL_HUD_MAIN = 1
+        # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
         env.MADEIRA_CTX_CPU_AREA = 2
         env.MADEIRA_WAIT_CHILDREN = 1
@@ -401,9 +449,13 @@ enum GameRecommendations {
     /// never the file (swap-wow64's default: on the file its heap froze the
     /// game for seconds at a time). The display link is held at the panel's
     /// maximum (MADEIRA_PROMOTE) while the frame-rate sag is diagnosed. Played
-    /// through to driving; from Steam only.
+    /// through to driving; from Steam only. Version 3 (2026-10-26, from a
+    /// community list for the same launcher chain): AVX off. With AVX on in the
+    /// publisher launcher's process but not in its service, the launcher cannot
+    /// connect to the service (the community GTA V and RDR2 logs). The Social Club
+    /// browser's address-space layout (MADEIRA_SC_PA_POOLS = 2) was already here.
     static let gta4Steam = GameRecommendation(
-        id: "gta4-steam", title: "Grand Theft Auto IV (Steam)", version: 2,
+        id: "gta4-steam", title: "Grand Theft Auto IV (Steam)", version: 3,
         config: """
         # Madeira's recommended settings for Grand Theft Auto IV (Steam).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -430,13 +482,13 @@ enum GameRecommendations {
         env.MADEIRA_X64_IMAGE_NOCOPY = 1
         env.MADEIRA_EC_HOOK_TRACE = 0
         env.DXMT_SMALL_RINGS = Launcher.exe;SocialClubHelper.exe
-        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
         env.MADEIRA_CTX_CPU_AREA = 2
         env.MADEIRA_WAIT_CHILDREN = 1
         env.MADEIRA_JIT_DUMP = 0
         """,
-        fastSync: true, semaphoreFastPath: true, display: "fit")
+        avx: false, fastSync: true, semaphoreFastPath: true, display: "fit")
 
     /// GTA V Enhanced started from its own PlayGTAV.exe outside a Steam
     /// library (Rockstar Games Launcher or another store; build 451). Version 2:
@@ -464,7 +516,7 @@ enum GameRecommendations {
         env.FEX_VECTORTSOENABLED = 0
         env.MADEIRA_DEVICE_STATS = 1
         env.MADEIRA_EC_HOOK_TRACE = 0
-        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
         env.MADEIRA_CTX_CPU_AREA = 2
         env.MADEIRA_WAIT_CHILDREN = 1
@@ -500,7 +552,7 @@ enum GameRecommendations {
         swap-mb = 4096
         env.MADEIRA_EC_HOOK_TRACE = 0
         env.MADEIRA_THREAD_STACK_SPILL = 1
-        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
         env.MADEIRA_CTX_CPU_AREA = 2
         env.MADEIRA_WAIT_CHILDREN = 1
@@ -520,7 +572,7 @@ enum GameRecommendations {
         swap-min-kb = 1024
         env.WINEDEBUG = err+all,err-virtual,fixme-all
         env.MADEIRA_PAD_MODE = hid
-        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
         env.MADEIRA_CTX_CPU_AREA = 2
         env.MADEIRA_WAIT_CHILDREN = 1
@@ -644,7 +696,7 @@ enum GameRecommendations {
         env.MADEIRA_LOCK_ORPHAN = stamped
         env.MADEIRA_SRV_FGETPATH = 1
         env.WINEDEBUG = fixme-input
-        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
         env.MADEIRA_CTX_CPU_AREA = 2
         env.MADEIRA_WAIT_CHILDREN = 1
@@ -703,7 +755,7 @@ enum GameRecommendations {
         env.MADEIRA_PAD_MODE = hid
         env.MADEIRA_LEAN_DIAG = 1
         env.WINEDEBUG = err+all,err-virtual,fixme-all
-        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_CTX_CPU_AREA = 2
         env.MADEIRA_WAIT_CHILDREN = 1
         env.MADEIRA_JIT_DUMP = 0
@@ -722,13 +774,23 @@ enum GameRecommendations {
     /// with 6 GB for the app) the game created its D3D12 device and swapchain and
     /// played the Bink intro, then thrashed memory there (footprint 3.3-4.1 GB with
     /// 1.1-2.2 GB compressed); a device with more memory should get further.
+    /// Version 2 (2026-10-26, a community last known working list for it, its
+    /// version 6: the game loaded a save and played on a 12 GB phone): a 2 GB
+    /// video-memory budget and a 1 GB swap file; fence-early; MADEIRA_JUMBO_HALF
+    /// (the game probes 8 GB for each 4 GB arena, and the fifth probe found no
+    /// hole and the game called NULL), MADEIRA_CAGE_RELEASE (the guest band ran
+    /// out while 8 GB sat in a holdback nothing here asks for), MADEIRA_ALIAS_RELEASE
+    /// and MADEIRA_VA_PRESSURE_GAP_OK (loading a save releases and re-reserves
+    /// the arenas at the same bases), and LC_ALL = en_US.UTF-8 (with the
+    /// phone's Turkish locale the game threw an unhandled exception after loading
+    /// code page 857). Left out: the community variant dxgi.dll switch.
     static let ratchetClankRiftApart = GameRecommendation(
-        id: "ratchet-clank-rift-apart", title: "Ratchet & Clank: Rift Apart", version: 1,
+        id: "ratchet-clank-rift-apart", title: "Ratchet & Clank: Rift Apart", version: 2,
         config: """
         # Madeira's recommended settings for Ratchet & Clank: Rift Apart.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
-        vram-mb = 3072
-        swap-mb = 8192
+        vram-mb = 2048
+        swap-mb = 1024
         swap-mode = 2
         swap-min-mb = 1
         swap-images = 1
@@ -736,6 +798,7 @@ enum GameRecommendations {
         mip0-full = 1
         quiet-log = 1
         pso-lazy-libs = 1
+        fence-early = 1
         env.MADEIRA_DXGI_BUDGET_EVENTS = 1
         env.MADEIRA_SWAP_MIN_KB = 64
         env.MADEIRA_SWAP_RESERVE_MAX_MB = 9216
@@ -748,8 +811,13 @@ enum GameRecommendations {
         env.MADEIRA_X64_IMAGE_NOCOPY = 1
         env.MADEIRA_PAD_MODE = hid
         env.MADEIRA_LEAN_DIAG = 1
+        env.MADEIRA_JUMBO_HALF = 1
+        env.MADEIRA_CAGE_RELEASE = 1
+        env.MADEIRA_ALIAS_RELEASE = 1
+        env.LC_ALL = en_US.UTF-8
         env.WINEDEBUG = err+all,err-virtual,fixme-all
-        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        env.MADEIRA_VA_PRESSURE_GAP_OK = 1
+        # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_CTX_CPU_AREA = 2
         env.MADEIRA_WAIT_CHILDREN = 1
         env.MADEIRA_JIT_DUMP = 0
@@ -767,7 +835,7 @@ enum GameRecommendations {
         # Madeira's recommended settings for Crysis Remastered.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
         env.MADEIRA_EC_HOOK_TRACE = 0
-        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
         env.MADEIRA_CTX_CPU_AREA = 2
         env.MADEIRA_WAIT_CHILDREN = 1
@@ -786,7 +854,7 @@ enum GameRecommendations {
         # Madeira's recommended settings for Crysis 2 Remastered.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
         env.MADEIRA_EC_HOOK_TRACE = 0
-        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
         env.MADEIRA_CTX_CPU_AREA = 2
         env.MADEIRA_WAIT_CHILDREN = 1
@@ -812,7 +880,7 @@ enum GameRecommendations {
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
         env.MADEIRA_EC_HOOK_TRACE = 0
         env.MADEIRA_APP_DLL_SHADOW = vcruntime140.dll
-        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_FREE_DELAY_MS = 2000
         env.MADEIRA_CTX_CPU_AREA = 2
         env.MADEIRA_WAIT_CHILDREN = 1
@@ -876,7 +944,7 @@ enum GameRecommendations {
         env.MADEIRA_WOW_PLACEHOLDERS = 1
         env.MADEIRA_FREE_DELAY_MS = 0
         env.MADEIRA_EC_HOOK_TRACE = 0
-        # madeira-bcd's defaults, which this list was tested with (upstream's differ).
+        # The defaults this list was tested with (upstream's differ).
         env.MADEIRA_CTX_CPU_AREA = 2
         env.MADEIRA_WAIT_CHILDREN = 1
         env.MADEIRA_JIT_DUMP = 0
@@ -887,9 +955,9 @@ enum GameRecommendations {
     /// Legacy's list.
     static let smallRAMSwapLines = "swap-mb = 3072"
 
-    static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, gta5LegacySteam, gta4Steam, ghostOfTsushima,
-                      godOfWar, horizonZeroDawn, horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered, crysis2Remastered,
-                      crysis3Remastered, steamBigPicture, standard]
+    static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, gta5LegacySteam, gta5LegacyOther, gta4Steam,
+                      ghostOfTsushima, godOfWar, horizonZeroDawn, horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered,
+                      crysis2Remastered, crysis3Remastered, steamBigPicture, standard] + steamTitles.map(\.list)
 
     // MARK: Recognising a game
 
@@ -934,7 +1002,9 @@ enum GameRecommendations {
             if steamAppID == crysisRemasteredAppID || installFolder == "crysis remastered" { return crysisRemastered }
             if steamAppID == crysis2RemasteredAppID || installFolder == "crysis 2 remastered" { return crysis2Remastered }
             if steamAppID == crysis3RemasteredAppID || installFolder == "crysis 3 remastered" { return crysis3Remastered }
-            return nil
+            return steamTitles.first { title in
+                steamAppID.map { title.appIDs.contains($0) } == true || installFolder.map { title.folders.contains($0) } == true
+            }?.list
         }
         // A program, wherever it was installed: only the game's own programs, so a
         // redistributable inside a game's folder gets nothing.
@@ -945,13 +1015,14 @@ enum GameRecommendations {
             // inside a Steam library the Steam copy, anywhere else the list for outside Steam.
             let folder = path.lastIndex(of: "\\").map { String(path[..<$0]) } ?? ""
             guard fileExists(folder + "\\GTA5_Enhanced.exe") else {
-                // GTA V Legacy: PlayGTAV.exe beside GTA5.exe, from Steam only.
-                return last == "playgtav.exe" && inSteam && fileExists(folder + "\\GTA5.exe") ? gta5LegacySteam : nil
+                // GTA V Legacy: PlayGTAV.exe beside GTA5.exe, inside or outside a Steam library.
+                guard last == "playgtav.exe" && fileExists(folder + "\\GTA5.exe") else { return nil }
+                return inSteam ? gta5LegacySteam : gta5LegacyOther
             }
             return inSteam ? gta5EnhancedSteam : gta5EnhancedOther
         case "gta5.exe":
-            // GTA V Legacy's game program, from Steam only.
-            return inSteam ? gta5LegacySteam : nil
+            // GTA V Legacy's game program, inside or outside a Steam library.
+            return inSteam ? gta5LegacySteam : gta5LegacyOther
         case "playgtaiv.exe", "launchgtaiv.exe", "gtaiv.exe":
             // Grand Theft Auto IV's launcher stub and game program, from Steam only.
             return inSteam ? gta4Steam : nil
@@ -974,7 +1045,7 @@ enum GameRecommendations {
         case "crysis3remastered.exe":
             return crysis3Remastered
         default:
-            return nil
+            return steamTitles.first { $0.programs.contains(last) || (inSteam && $0.steamPrograms.contains(last)) }?.list
         }
     }
 
@@ -986,6 +1057,1002 @@ enum GameRecommendations {
         }
         return nil
     }
+}
+
+// MARK: More Steam titles
+
+/// Lists merged on 2026-10-26 from community tested lists, one per Steam title,
+/// in this file's format. Only lines this tree reads are kept; each list's comment
+/// names the lines left out and why.
+extension GameRecommendations {
+    /// A title `match` recognises: its Steam App IDs, its folders right under
+    /// steamapps\common (lowercased), the programs that name it wherever they are
+    /// installed, and the programs that name it only inside a Steam library.
+    struct SteamTitle {
+        let appIDs: [Int]
+        let folders: [String]
+        let programs: [String]
+        let steamPrograms: [String]
+        let list: GameRecommendation
+    }
+
+    static let steamTitles: [SteamTitle] = [
+        SteamTitle(appIDs: [2537590], folders: ["msfs2024"],
+                   programs: ["flightsimulator2024.exe"], steamPrograms: [], list: msfs2024),
+        SteamTitle(appIDs: [730], folders: ["counter-strike global offensive"],
+                   programs: ["cs2.exe"], steamPrograms: [], list: counterStrike2),
+        SteamTitle(appIDs: [432940], folders: ["breakneck"],
+                   programs: ["breakneck.exe"], steamPrograms: [], list: breakneck),
+        SteamTitle(appIDs: [418530], folders: ["spelunky 2"],
+                   programs: ["spel2.exe"], steamPrograms: [], list: spelunky2),
+        SteamTitle(appIDs: [761890], folders: ["albion online"],
+                   programs: ["albionlauncher.exe"], steamPrograms: [], list: albionOnline),
+        SteamTitle(appIDs: [990080], folders: ["hogwarts legacy"],
+                   programs: ["hogwartslegacy.exe"], steamPrograms: [], list: hogwartsLegacy),
+        SteamTitle(appIDs: [287700], folders: ["mgs_tpp"],
+                   programs: ["mgsvtpp.exe"], steamPrograms: [], list: metalGearSolidV),
+        SteamTitle(appIDs: [3564860], folders: ["stellarbladedemo"],
+                   programs: ["sb-win64-shipping.exe"], steamPrograms: [], list: stellarBladeDemo),
+        SteamTitle(appIDs: [4078430], folders: ["star wars galactic racer"],
+                   programs: ["swgr-win64-shipping.exe"], steamPrograms: [], list: starWarsGalacticRacer),
+        SteamTitle(appIDs: [], folders: ["minecraft dungeons ii"],
+                   programs: [], steamPrograms: [], list: minecraftDungeons2),
+        SteamTitle(appIDs: [2524850], folders: ["denshattack"],
+                   programs: ["denshattack_proto.exe"], steamPrograms: [], list: denshattack),
+        SteamTitle(appIDs: [4474710], folders: ["final fantasy resonance demo"],
+                   programs: ["ffrs.exe"], steamPrograms: [], list: finalFantasyResonanceDemo),
+        SteamTitle(appIDs: [1371980], folders: ["norestforthewicked"],
+                   programs: ["norestforthewicked.exe"], steamPrograms: [], list: noRestForTheWicked),
+        SteamTitle(appIDs: [980610], folders: ["quaver"],
+                   programs: ["quaver.exe"], steamPrograms: [], list: quaver),
+        SteamTitle(appIDs: [239140], folders: ["dying light"],
+                   programs: ["dyinglightgame.exe"], steamPrograms: [], list: dyingLight),
+        SteamTitle(appIDs: [284160], folders: ["beamng.drive"],
+                   programs: ["beamng.drive.exe"], steamPrograms: [], list: beamngDrive),
+        SteamTitle(appIDs: [3470630], folders: ["monster_hunter_stories_3_twisted_reflection_trial"],
+                   programs: ["monster_hunter_stories_3_twisted_reflection_trial.exe"], steamPrograms: [], list: monsterHunterStories3Trial),
+        SteamTitle(appIDs: [787480], folders: ["phoenix wright ace attorney trilogy"],
+                   programs: ["pwaat.exe"], steamPrograms: [], list: pwaat),
+        SteamTitle(appIDs: [270880], folders: ["american truck simulator"],
+                   programs: ["amtrucks.exe"], steamPrograms: [], list: americanTruckSimulator),
+        SteamTitle(appIDs: [1817190], folders: ["marvel's spider-man miles morales"],
+                   programs: ["milesmorales.exe"], steamPrograms: [], list: marvelsSpiderManMilesMorales),
+        SteamTitle(appIDs: [2536520], folders: ["diablo ii resurrected"],
+                   programs: ["d2r.exe"], steamPrograms: [], list: diabloIIResurrected),
+        SteamTitle(appIDs: [1903340], folders: ["expedition 33"],
+                   programs: ["expedition33_steam.exe", "sandfall-win64-shipping.exe"], steamPrograms: [], list: clairObscurExpedition33),
+        SteamTitle(appIDs: [1547000], folders: ["gta san andreas - the definitive edition"],
+                   programs: [], steamPrograms: ["playgtasanandreas.exe"], list: gtasaDeSteam),
+        SteamTitle(appIDs: [2211170], folders: ["unrailed! 2 back on track"],
+                   programs: [], steamPrograms: [], list: unrailed2BackOnTrack),
+        SteamTitle(appIDs: [2273430], folders: ["blazblueentropyeffect"],
+                   programs: [], steamPrograms: ["blazblueentropyeffect.exe"], list: blazblueEntropyEffect),
+        SteamTitle(appIDs: [374320], folders: ["dark souls iii"],
+                   programs: [], steamPrograms: ["darksoulsiii.exe"], list: darkSoulsIII),
+        SteamTitle(appIDs: [1817070], folders: ["marvel's spider-man remastered"],
+                   programs: ["spider-man.exe"], steamPrograms: [], list: marvelsSpiderManRemastered),
+        SteamTitle(appIDs: [2651280], folders: ["marvel's spider-man 2"],
+                   programs: ["spider-man2.exe"], steamPrograms: [], list: marvelsSpiderMan2),
+        SteamTitle(appIDs: [2288350], folders: ["raidou tmotsa"],
+                   programs: [], steamPrograms: ["raidou tmotsa.exe"], list: raidouRemastered),
+        SteamTitle(appIDs: [1235140], folders: ["yakuza like a dragon"],
+                   programs: [], steamPrograms: ["yakuzalikeadragon.exe"], list: yakuzaLikeADragon),
+        SteamTitle(appIDs: [200260], folders: ["batman arkham city goty"],
+                   programs: [], steamPrograms: ["batmanac.exe", "bmlauncher.exe"], list: batmanArkhamCityGoty),
+        SteamTitle(appIDs: [3375780], folders: ["trails in the sky 1st chapter"],
+                   programs: [], steamPrograms: ["sora_1st.exe"], list: trailsInTheSky1stChapter),
+        SteamTitle(appIDs: [1962700], folders: ["subnautica2"],
+                   programs: [], steamPrograms: ["subnautica2-win64-shipping.exe"], list: subnautica2),
+        SteamTitle(appIDs: [2668510], folders: ["red dead redemption"],
+                   programs: [], steamPrograms: ["playrdr.exe"], list: rdr1Steam),
+        SteamTitle(appIDs: [3764200], folders: ["resident evil requiem biohazard requiem"],
+                   programs: [], steamPrograms: ["re9.exe"], list: residentEvilRequiem),
+        SteamTitle(appIDs: [4459100], folders: ["resident evil requiem biohazard requiem - demo"],
+                   programs: [], steamPrograms: ["re9demo.exe"], list: residentEvilRequiemDemo),
+        SteamTitle(appIDs: [1265920], folders: ["lis - remastered"],
+                   programs: [], steamPrograms: ["lis-win64-shipping.exe"], list: lifeIsStrangeRemastered),
+        SteamTitle(appIDs: [532210], folders: ["life is strange 2"],
+                   programs: [], steamPrograms: ["lis2-win64-shipping.exe"], list: lifeIsStrange2),
+        SteamTitle(appIDs: [108600], folders: ["projectzomboid"],
+                   programs: [], steamPrograms: ["projectzomboid64.exe"], list: projectZomboid),
+        SteamTitle(appIDs: [1329500], folders: ["spiderheck"],
+                   programs: [], steamPrograms: ["spiderheckapp.exe"], list: spiderheck),
+        SteamTitle(appIDs: [1557740], folders: ["rounds"],
+                   programs: [], steamPrograms: ["rounds.exe"], list: rounds),
+        SteamTitle(appIDs: [1599600], folders: ["plateup"],
+                   programs: [], steamPrograms: ["plateup.exe"], list: plateup),
+        SteamTitle(appIDs: [1004640], folders: ["final fantasy tactics - the ivalice chronicles"],
+                   programs: [], steamPrograms: ["fft_enhanced.exe"], list: finalFantasyTacticsIvaliceChronicles),
+        SteamTitle(appIDs: [1181600], folders: ["jetboardjoust"],
+                   programs: [], steamPrograms: ["jetboardjoust.exe"], list: jetboardJoust),
+        SteamTitle(appIDs: [3404260], folders: [],
+                   programs: ["pagoda.exe"], steamPrograms: [], list: deadAsDisco),
+        SteamTitle(appIDs: [], folders: ["tung"],
+                   programs: ["tung.exe"], steamPrograms: [], list: tung),
+        SteamTitle(appIDs: [814380], folders: ["sekiro"],
+                   programs: ["sekiro.exe"], steamPrograms: [], list: sekiroShadowsDieTwice),
+        SteamTitle(appIDs: [413150], folders: ["stardew valley"],
+                   programs: ["stardew valley.exe"], steamPrograms: [], list: stardewValley),
+        SteamTitle(appIDs: [2400160], folders: ["glyphica"],
+                   programs: ["neosphere.exe"], steamPrograms: [], list: glyphicaTypingSurvival),
+        SteamTitle(appIDs: [3483510], folders: ["the adventures of elliot the millennium tales"],
+                   programs: ["elliot-win64-shipping.exe"], steamPrograms: [], list: theAdventuresOfElliot),
+
+    ]
+
+    /// Microsoft Flight Simulator 2024 (Steam App ID 2537590). Ported on 2026-10-26 from a community tested list
+    /// for it (its version 6); not device-tested here.
+    static let msfs2024 = GameRecommendation(
+        id: "msfs-2024", title: "Microsoft Flight Simulator 2024", version: 1,
+        config: """
+        # Madeira's recommended settings for Microsoft Flight Simulator 2024.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        d3d12-fl-12-1 = 1
+        d3d12-sm-6-7 = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: true, nvidia: true, wineVCRT: false, display: "fit")
+
+    /// Counter-Strike 2 (Steam App ID 730). Ported on 2026-10-26 from a community tested list for it (its version
+    /// 2); not device-tested here.
+    static let counterStrike2 = GameRecommendation(
+        id: "counter-strike-2", title: "Counter-Strike 2", version: 1,
+        config: """
+        # Madeira's recommended settings for Counter-Strike 2.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        pool-split = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: false, wineVCRT: false, display: "fit")
+
+    /// Breakneck (Steam App ID 432940). Ported on 2026-10-26 from a community tested list for it (its version 1);
+    /// not device-tested here.
+    static let breakneck = GameRecommendation(
+        id: "breakneck", title: "Breakneck", version: 1,
+        config: """
+        # Madeira's recommended settings for Breakneck.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_WOW_RWX_PLAIN = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: false, wineVCRT: false, display: "fit")
+
+    /// Spelunky 2 (Steam App ID 418530). Ported on 2026-10-26 from a community tested list for it (its version 3);
+    /// not device-tested here.
+    static let spelunky2 = GameRecommendation(
+        id: "spelunky-2", title: "Spelunky 2", version: 1,
+        config: """
+        # Madeira's recommended settings for Spelunky 2.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        env.DXMT_WSI_MONITOR_IDENTITY = 1
+        env.DXMT_WSI_MODE_TABLE = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: false, wineVCRT: false, display: "fit")
+
+    /// Albion Online (Steam App ID 761890). Ported on 2026-10-26 from a community tested list for it (its version
+    /// 1); not device-tested here.
+    static let albionOnline = GameRecommendation(
+        id: "albion-online", title: "Albion Online", version: 1,
+        config: """
+        # Madeira's recommended settings for Albion Online.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        pool-split = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: false, wineVCRT: false, display: "fit")
+
+    /// Hogwarts Legacy (Steam App ID 990080). Ported on 2026-10-26 from a community tested list for it (its
+    /// version 1); not device-tested here.
+    static let hogwartsLegacy = GameRecommendation(
+        id: "hogwarts-legacy", title: "Hogwarts Legacy", version: 1,
+        config: """
+        # Madeira's recommended settings for Hogwarts Legacy.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        exe-window-mb = 448
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: false, wineVCRT: false, display: "fit")
+
+    /// METAL GEAR SOLID V: THE PHANTOM PAIN (Steam App ID 287700). Ported on 2026-10-26 from a community tested
+    /// list for it (its version 1); not device-tested here.
+    static let metalGearSolidV = GameRecommendation(
+        id: "metal-gear-solid-v", title: "METAL GEAR SOLID V: THE PHANTOM PAIN", version: 1,
+        config: """
+        # Madeira's recommended settings for METAL GEAR SOLID V: THE PHANTOM PAIN.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        exe-window-mb = 176
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: false, wineVCRT: false, display: "fit")
+
+    /// Stellar Blade Demo (Steam App ID 3564860). Ported on 2026-10-26 from a community tested list for it (its
+    /// version 2); not device-tested here.
+    static let stellarBladeDemo = GameRecommendation(
+        id: "stellar-blade-demo", title: "Stellar Blade Demo", version: 1,
+        config: """
+        # Madeira's recommended settings for Stellar Blade Demo.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        exe-window-mb = 320
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: false, wineVCRT: false, display: "fit")
+
+    /// STAR WARS Galactic Racer (Steam App ID 4078430). Ported on 2026-10-26 from a community tested list for it
+    /// (its version 2); not device-tested here.
+    static let starWarsGalacticRacer = GameRecommendation(
+        id: "star-wars-galactic-racer", title: "STAR WARS Galactic Racer", version: 1,
+        config: """
+        # Madeira's recommended settings for STAR WARS Galactic Racer.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        exe-window-mb = 496
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: false, wineVCRT: false, display: "fit")
+
+    /// Minecraft Dungeons II (Steam folder "minecraft dungeons ii"). Ported on 2026-10-26 from a community tested
+    /// list for it (its version 1); not device-tested here. Left out: MADEIRA_OPTIN_DLLS (the community app-side
+    /// switch; not in this tree (opt-in DLLs not merged)); pool-split-retry (the community app-side switch; not in
+    /// this tree).
+    static let minecraftDungeons2 = GameRecommendation(
+        id: "minecraft-dungeons-2", title: "Minecraft Dungeons II", version: 1,
+        config: """
+        # Madeira's recommended settings for Minecraft Dungeons II.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_LOCK_ORPHAN = 0
+        quiet-log = 1
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        pool-split = 1
+        env.MADEIRA_VCRT_ARM64_KEY = 1
+        env.MADEIRA_FAULT_GUARD_GUEST_RIP = 1
+        env.MADEIRA_RECOVERY_LOG_SAMPLE = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// Denshattack! (Steam App ID 2524850). Ported on 2026-10-26 from a community tested list for it (its version
+    /// 1); not device-tested here.
+    static let denshattack = GameRecommendation(
+        id: "denshattack", title: "Denshattack!", version: 1,
+        config: """
+        # Madeira's recommended settings for Denshattack!.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_VCRT_ARM64_KEY = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: false, wineVCRT: false, display: "fit")
+
+    /// FINAL FANTASY RESONANCE DEMO (Steam App ID 4474710). Ported on 2026-10-26 from a community tested list for
+    /// it (its version 2); not device-tested here.
+    static let finalFantasyResonanceDemo = GameRecommendation(
+        id: "final-fantasy-resonance-demo", title: "FINAL FANTASY RESONANCE DEMO", version: 1,
+        config: """
+        # Madeira's recommended settings for FINAL FANTASY RESONANCE DEMO.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_VCRT_ARM64_KEY = 1
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: false, wineVCRT: false, display: "fit")
+
+    /// No Rest for the Wicked (Steam App ID 1371980). Ported on 2026-10-26 from a community tested list for it
+    /// (its version 4); not device-tested here. Left out: MADEIRA_WINTYPES (the community app-side switch; not in
+    /// this tree).
+    static let noRestForTheWicked = GameRecommendation(
+        id: "no-rest-for-the-wicked", title: "No Rest for the Wicked", version: 1,
+        config: """
+        # Madeira's recommended settings for No Rest for the Wicked.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_FEX_BAND_KEEP_MB = 6144
+        dxmt = d3d11.mipClampBC=1
+        env.MADEIRA_CTX_FRAME = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: false, wineVCRT: false, display: "fit")
+
+    /// Quaver (Steam App ID 980610). Ported on 2026-10-26 from a community tested list for it (its version 1); not
+    /// device-tested here.
+    static let quaver = GameRecommendation(
+        id: "quaver", title: "Quaver", version: 1,
+        config: """
+        # Madeira's recommended settings for Quaver.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.DOTNET_EnableWriteXorExecute = 0
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: false, wineVCRT: false, display: "fit")
+
+    /// Dying Light (Steam App ID 239140). Ported on 2026-10-26 from a community tested list for it (its version
+    /// 2); not device-tested here. Left out: MADEIRA_OPTIN_DLLS (the community app-side switch; not in this tree
+    /// (opt-in DLLs not merged)); MADEIRA_OPTIN_DLLS (the community app-side switch; not in this tree (opt-in DLLs
+    /// not merged)).
+    static let dyingLight = GameRecommendation(
+        id: "dying-light", title: "Dying Light", version: 1,
+        config: """
+        # Madeira's recommended settings for Dying Light.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.LC_ALL = en_US.UTF-8
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: false, wineVCRT: false, display: "fit")
+
+    /// BeamNG.drive (Steam App ID 284160). Ported on 2026-10-26 from a community tested list for it (its version
+    /// 2); not device-tested here. Left out: MADEIRA_X64_MACHINE (read by a Wine/tools patch that is not merged).
+    static let beamngDrive = GameRecommendation(
+        id: "beamng-drive", title: "BeamNG.drive", version: 1,
+        config: """
+        # Madeira's recommended settings for BeamNG.drive.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// Monster Hunter Stories 3: Twisted Reflection Trial Version (Steam App ID 3470630). Ported on 2026-10-26 from
+    /// a community tested list for it (its version 1); not device-tested here.
+    static let monsterHunterStories3Trial = GameRecommendation(
+        id: "monster-hunter-stories-3-trial", title: "Monster Hunter Stories 3: Twisted Reflection Trial Version", version: 1,
+        config: """
+        # Madeira's recommended settings for Monster Hunter Stories 3: Twisted Reflection Trial Version.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// Phoenix Wright: Ace Attorney Trilogy (Steam App ID 787480). Ported on 2026-10-26 from a community tested
+    /// list for it (its version 1); not device-tested here.
+    static let pwaat = GameRecommendation(
+        id: "pwaat", title: "Phoenix Wright: Ace Attorney Trilogy", version: 1,
+        config: """
+        # Madeira's recommended settings for Phoenix Wright: Ace Attorney Trilogy.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_WOW_RWX_PLAIN = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: false, wineVCRT: false, display: "fit")
+
+    /// American Truck Simulator (Steam App ID 270880). Ported on 2026-10-26 from a community tested list for it
+    /// (its version 1); not device-tested here.
+    static let americanTruckSimulator = GameRecommendation(
+        id: "american-truck-simulator", title: "American Truck Simulator", version: 1,
+        config: """
+        # Madeira's recommended settings for American Truck Simulator.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_TINY_WINDOW_FIX = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// Marvel's Spider-Man: Miles Morales (Steam App ID 1817190). Ported on 2026-10-26 from a community tested
+    /// list for it (its version 1); not device-tested here.
+    static let marvelsSpiderManMilesMorales = GameRecommendation(
+        id: "marvels-spider-man-miles-morales", title: "Marvel's Spider-Man: Miles Morales", version: 1,
+        config: """
+        # Madeira's recommended settings for Marvel's Spider-Man: Miles Morales.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        mip0-full = 1
+        quiet-log = 1
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: true, wineVCRT: false, display: "fit")
+
+    /// Diablo II: Resurrected (Steam App ID 2536520). Ported on 2026-10-26 from a community tested list for it
+    /// (its version 2); not device-tested here. Left out: MADEIRA_OPTIN_DLLS (the community app-side switch; not
+    /// in this tree (opt-in DLLs not merged)); MADEIRA_NTDLL_XSEC (read by the companion ntdll-xsec.dll, which this
+    /// tree does not build); MADEIRA_SHARED_SECTION_EXEC (needs ntdll-xsec.dll (NTDLL_XSEC) to tell the emulator; not
+    /// built here); MADEIRA_D2R_PROBE_RECOVERY (read by a Wine/tools patch that is not merged).
+    static let diabloIIResurrected = GameRecommendation(
+        id: "diablo-ii-resurrected", title: "Diablo II: Resurrected", version: 1,
+        config: """
+        # Madeira's recommended settings for Diablo II: Resurrected.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_NTDLL_DATA_SYNC_RANGE = 1
+        env.MADEIRA_FAULT_LOOP_GUEST_PROGRESS = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// Clair Obscur: Expedition 33 (Steam App ID 1903340). Ported on 2026-10-26 from a community tested list for
+    /// it (its version 1); not device-tested here.
+    static let clairObscurExpedition33 = GameRecommendation(
+        id: "clair-obscur-expedition-33", title: "Clair Obscur: Expedition 33", version: 1,
+        config: """
+        # Madeira's recommended settings for Clair Obscur: Expedition 33.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// GTA San Andreas - The Definitive Edition (Steam) (Steam App ID 1547000). Ported on 2026-10-26 from a
+    /// community tested list for it (its version 1); not device-tested here. Left out: MADEIRA_FEX_AVX (the AVX switch
+    /// (avx: false) instead).
+    static let gtasaDeSteam = GameRecommendation(
+        id: "gtasa-de-steam", title: "GTA San Andreas - The Definitive Edition (Steam)", version: 1,
+        config: """
+        # Madeira's recommended settings for GTA San Andreas - The Definitive Edition (Steam).
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_DOCK_GAME_SCM = 1
+        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false)
+
+    /// Unrailed! 2: Back on Track (Steam App ID 2211170). Ported on 2026-10-26 from a community tested list for it
+    /// (its version 1); not device-tested here.
+    static let unrailed2BackOnTrack = GameRecommendation(
+        id: "unrailed-2-back-on-track", title: "Unrailed! 2: Back on Track", version: 1,
+        config: """
+        # Madeira's recommended settings for Unrailed! 2: Back on Track.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.DOTNET_GCRegionRange = 400000000
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// BlazBlue Entropy Effect (Steam App ID 2273430). Ported on 2026-10-26 from a community tested list for it
+    /// (its version 1); not device-tested here.
+    static let blazblueEntropyEffect = GameRecommendation(
+        id: "blazblue-entropy-effect", title: "BlazBlue Entropy Effect", version: 1,
+        config: """
+        # Madeira's recommended settings for BlazBlue Entropy Effect.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// DARK SOULS III (Steam App ID 374320). Ported on 2026-10-26 from a community tested list for it (its version
+    /// 1); not device-tested here.
+    static let darkSoulsIII = GameRecommendation(
+        id: "dark-souls-iii", title: "DARK SOULS III", version: 1,
+        config: """
+        # Madeira's recommended settings for DARK SOULS III.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// Marvel's Spider-Man Remastered (Steam App ID 1817070). Ported on 2026-10-26 from a community tested list
+    /// for it (its version 2); not device-tested here.
+    static let marvelsSpiderManRemastered = GameRecommendation(
+        id: "marvels-spider-man-remastered", title: "Marvel's Spider-Man Remastered", version: 1,
+        config: """
+        # Madeira's recommended settings for Marvel's Spider-Man Remastered.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        mip0-full = 1
+        quiet-log = 1
+        write-buffer-immediate = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: true, wineVCRT: false, display: "fit")
+
+    /// Marvel's Spider-Man 2 (Steam App ID 2651280). Ported on 2026-10-26 from a community tested list for it (its
+    /// version 1); not device-tested here.
+    static let marvelsSpiderMan2 = GameRecommendation(
+        id: "marvels-spider-man-2", title: "Marvel's Spider-Man 2", version: 1,
+        config: """
+        # Madeira's recommended settings for Marvel's Spider-Man 2.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        env.MADEIRA_CAGE_RELEASE = 1
+        mip0-full = 1
+        quiet-log = 1
+        swap-mb = 6144
+        swap-mode = 2
+        swap-min-mb = 1
+        env.MADEIRA_FEX_AVX = 2
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        avx: false, nvidia: true, wineVCRT: false, display: "fit")
+
+    /// RAIDOU Remastered: The Mystery of the Soulless Army (Steam App ID 2288350). Ported on 2026-10-26 from a
+    /// community tested list for it (its version 1); not device-tested here.
+    static let raidouRemastered = GameRecommendation(
+        id: "raidou-remastered", title: "RAIDOU Remastered: The Mystery of the Soulless Army", version: 1,
+        config: """
+        # Madeira's recommended settings for RAIDOU Remastered: The Mystery of the Soulless Army.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// Yakuza: Like a Dragon (Steam App ID 1235140). Ported on 2026-10-26 from a community tested list for it (its
+    /// version 1); not device-tested here.
+    static let yakuzaLikeADragon = GameRecommendation(
+        id: "yakuza-like-a-dragon", title: "Yakuza: Like a Dragon", version: 1,
+        config: """
+        # Madeira's recommended settings for Yakuza: Like a Dragon.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        exe-window-mb = 416
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// Batman: Arkham City GOTY (Steam App ID 200260). Ported on 2026-10-26 from a community tested list for it
+    /// (its version 2); not device-tested here.
+    static let batmanArkhamCityGoty = GameRecommendation(
+        id: "batman-arkham-city-goty", title: "Batman: Arkham City GOTY", version: 1,
+        config: """
+        # Madeira's recommended settings for Batman: Arkham City GOTY.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.FEX_X87REDUCEDPRECISION = 0
+        env.MADEIRA_TLS_CLEAR_OWN_PROCESS = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// Trails in the Sky 1st Chapter (Steam App ID 3375780). Ported on 2026-10-26 from a community tested list for
+    /// it (its version 1); not device-tested here.
+    static let trailsInTheSky1stChapter = GameRecommendation(
+        id: "trails-in-the-sky-1st-chapter", title: "Trails in the Sky 1st Chapter", version: 1,
+        config: """
+        # Madeira's recommended settings for Trails in the Sky 1st Chapter.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_VDCFG_PATH = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// Subnautica 2 (Steam App ID 1962700). Ported on 2026-10-26 from a community tested list for it (its version
+    /// 1); not device-tested here.
+    static let subnautica2 = GameRecommendation(
+        id: "subnautica-2", title: "Subnautica 2", version: 1,
+        config: """
+        # Madeira's recommended settings for Subnautica 2.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// Red Dead Redemption (Steam) (Steam App ID 2668510). Ported on 2026-10-26 from a community tested list for
+    /// it (its version 1); not device-tested here.
+    static let rdr1Steam = GameRecommendation(
+        id: "rdr1-steam", title: "Red Dead Redemption (Steam)", version: 1,
+        config: """
+        # Madeira's recommended settings for Red Dead Redemption (Steam).
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_DOCK_GAME_SCM = 1
+        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// Resident Evil Requiem (Steam App ID 3764200). Ported on 2026-10-26 from a community tested list for it (its
+    /// version 2); not device-tested here.
+    static let residentEvilRequiem = GameRecommendation(
+        id: "resident-evil-requiem", title: "Resident Evil Requiem", version: 1,
+        config: """
+        # Madeira's recommended settings for Resident Evil Requiem.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        exe-window-mb = 592
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        d3d12-pso-cached-blob = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// Resident Evil Requiem Demo (Steam App ID 4459100). Ported on 2026-10-26 from a community tested list for it
+    /// (its version 1); not device-tested here.
+    static let residentEvilRequiemDemo = GameRecommendation(
+        id: "resident-evil-requiem-demo", title: "Resident Evil Requiem Demo", version: 1,
+        config: """
+        # Madeira's recommended settings for Resident Evil Requiem Demo.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        d3d12-pso-cached-blob = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// Life is Strange Remastered (Steam App ID 1265920). Ported on 2026-10-26 from a community tested list for it
+    /// (its version 1); not device-tested here.
+    static let lifeIsStrangeRemastered = GameRecommendation(
+        id: "life-is-strange-remastered", title: "Life is Strange Remastered", version: 1,
+        config: """
+        # Madeira's recommended settings for Life is Strange Remastered.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// Life is Strange 2 (Steam App ID 532210). Ported on 2026-10-26 from a community tested list for it (its
+    /// version 1); not device-tested here.
+    static let lifeIsStrange2 = GameRecommendation(
+        id: "life-is-strange-2", title: "Life is Strange 2", version: 1,
+        config: """
+        # Madeira's recommended settings for Life is Strange 2.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        exe-window-mb = 400
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// Project Zomboid (Steam App ID 108600). Ported on 2026-10-26 from a community tested list for it (its
+    /// version 1); not device-tested here.
+    static let projectZomboid = GameRecommendation(
+        id: "project-zomboid", title: "Project Zomboid", version: 1,
+        config: """
+        # Madeira's recommended settings for Project Zomboid.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env._JAVA_OPTIONS = -XX:-UseZGC
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// SpiderHeck (Steam App ID 1329500). Ported on 2026-10-26 from a community tested list for it (its version
+    /// 1); not device-tested here.
+    static let spiderheck = GameRecommendation(
+        id: "spiderheck", title: "SpiderHeck", version: 1,
+        config: """
+        # Madeira's recommended settings for SpiderHeck.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_FAULT_GUARD_RATE = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// ROUNDS (Steam App ID 1557740). Ported on 2026-10-26 from a community tested list for it (its version 1);
+    /// not device-tested here.
+    static let rounds = GameRecommendation(
+        id: "rounds", title: "ROUNDS", version: 1,
+        config: """
+        # Madeira's recommended settings for ROUNDS.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_FAULT_GUARD_RATE = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// PlateUp! (Steam App ID 1599600). Ported on 2026-10-26 from a community tested list for it (its version 1);
+    /// not device-tested here.
+    static let plateup = GameRecommendation(
+        id: "plateup", title: "PlateUp!", version: 1,
+        config: """
+        # Madeira's recommended settings for PlateUp!.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_FAULT_GUARD_RATE = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// FINAL FANTASY TACTICS - The Ivalice Chronicles (Steam App ID 1004640). Ported on 2026-10-26 from a
+    /// community tested list for it (its version 1); not device-tested here.
+    static let finalFantasyTacticsIvaliceChronicles = GameRecommendation(
+        id: "final-fantasy-tactics-ivalice-chronicles", title: "FINAL FANTASY TACTICS - The Ivalice Chronicles", version: 1,
+        config: """
+        # Madeira's recommended settings for FINAL FANTASY TACTICS - The Ivalice Chronicles.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_USER_VA_GB = 32
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// Jetboard Joust (Steam App ID 1181600). Ported on 2026-10-26 from a community tested list for it (its
+    /// version 1); not device-tested here.
+    static let jetboardJoust = GameRecommendation(
+        id: "jetboard-joust", title: "Jetboard Joust", version: 1,
+        config: """
+        # Madeira's recommended settings for Jetboard Joust.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_ANON_CAS_FLUSH = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// Dead as Disco (Steam App ID 3404260). Ported on 2026-10-26 from a community tested list for it (its version
+    /// 1); not device-tested here. Left out: MADEIRA_OPTIN_DLLS (the community app-side switch; not in this tree
+    /// (opt-in DLLs not merged)).
+    static let deadAsDisco = GameRecommendation(
+        id: "dead-as-disco", title: "Dead as Disco", version: 1,
+        config: """
+        # Madeira's recommended settings for Dead as Disco.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_VCRT_ARM64_KEY = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// TUNG (Steam folder "tung"). Ported on 2026-10-26 from a community tested list for it (its version 1); not
+    /// device-tested here.
+    static let tung = GameRecommendation(
+        id: "tung", title: "TUNG", version: 1,
+        config: """
+        # Madeira's recommended settings for TUNG.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_VCRT_ARM64_KEY = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// Sekiro: Shadows Die Twice (Steam App ID 814380). Ported on 2026-10-26 from a community tested list for it
+    /// (its version 1); not device-tested here.
+    static let sekiroShadowsDieTwice = GameRecommendation(
+        id: "sekiro-shadows-die-twice", title: "Sekiro: Shadows Die Twice", version: 1,
+        config: """
+        # Madeira's recommended settings for Sekiro: Shadows Die Twice.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_NLS_EXTRA = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// Stardew Valley (Steam App ID 413150). Ported on 2026-10-26 from a community tested list for it (its version
+    /// 1); not device-tested here.
+    static let stardewValley = GameRecommendation(
+        id: "stardew-valley", title: "Stardew Valley", version: 1,
+        config: """
+        # Madeira's recommended settings for Stardew Valley.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_ANON_CAS_FLUSH = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// Glyphica: Typing Survival (Steam App ID 2400160). Ported on 2026-10-26 from a community tested list for it
+    /// (its version 1); not device-tested here.
+    static let glyphicaTypingSurvival = GameRecommendation(
+        id: "glyphica-typing-survival", title: "Glyphica: Typing Survival", version: 1,
+        config: """
+        # Madeira's recommended settings for Glyphica: Typing Survival.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        env.MADEIRA_ZERO_MITIGATION_POLICY = 1
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
+    /// The Adventures of Elliot: The Millennium Tales (Steam App ID 3483510). Ported on 2026-10-26 from a
+    /// community tested list for it (its version 1); not device-tested here. Left out: pool-above-window (the
+    /// community app-side switch; not in this tree); MADEIRA_KUSER_KEEP_REGS (its engine code (signal_arm64_ios.c) is
+    /// not in this tree yet).
+    static let theAdventuresOfElliot = GameRecommendation(
+        id: "the-adventures-of-elliot", title: "The Adventures of Elliot: The Millennium Tales", version: 1,
+        config: """
+        # Madeira's recommended settings for The Adventures of Elliot: The Millennium Tales.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        exe-window-mb = 480
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        pool-split = 1
+        pool-low = 1
+        pool-low-margin = 32
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """)
+
 }
 
 private extension String {
