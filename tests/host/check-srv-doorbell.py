@@ -39,6 +39,7 @@ harness = r'''
 #include <stdlib.h>
 #include <time.h>
 #include <errno.h>
+#include "madeira_cfg.h"   /* ios_srv_switch: madeira.cfg, then the environment */
 typedef int semaphore_t;
 static sem_t real_sem;
 static semaphore_t ios_srv_wake_sem = 1;
@@ -128,7 +129,7 @@ with tempfile.TemporaryDirectory() as tmp:
     exe = Path(tmp) / 'bell'
     cc = os.environ.get('CC', 'cc')
     subprocess.run([cc, '-O2', '-pthread', '-std=gnu11', '-Wall', '-Werror', '-Wno-unused-function',
-                    str(c), '-o', str(exe)], check=True)
+                    '-I', str(root / 'build'), str(c), '-o', str(exe)], check=True)
     out = subprocess.run([str(exe)], check=True, capture_output=True, text=True, timeout=600)
     print('PASS:', out.stdout.strip())
 
