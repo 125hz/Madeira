@@ -1090,6 +1090,9 @@ static void winios_layout_compositor(void) {
     UIWindow *win = g_compositor_view.superview ? (UIWindow *)g_compositor_view.superview : nil;
     CGRect frame = g_comp_frame_set ? g_comp_frame : (win ? win.bounds : g_compositor_view.frame);
     g_compositor_view.frame = frame;
+    /* madeira-compositor-stay-on-top: a view controller presented after the first present adds its
+     * transition view above us; the desktop would be drawn and invisible. */
+    if (win) [win bringSubviewToFront:g_compositor_view];
 
     /* The LIVE guest size, not MADEIRA_SCREEN_W/H. That environment pair is
      * the session's launch-time seed; win32u owns the value afterwards and
