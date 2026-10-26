@@ -438,6 +438,17 @@ Log tags: `[frontend]`, `[library]` (ml1163: each game's start mode, batch, serv
 `[session-once]`, `[library-surface]`, `[library-metadata]`, `[onboarding]`,
 `[frontend-controller]`, `[frontend-keyboard]`, `[device-load]`, `[promote]`, `[thermal-cap]`.
 
+**Session summary.** When a session returns to the library (or when Madeira
+goes to the background), `LogSummary` reads the log once and writes
+`Documents/madeira-summary.txt`: the program, the programs started and how
+each ended (exit code, or the Windows error in plain words and where it
+crashed), the JIT pool's size and use and whether it ran out, out-of-memory
+and wrong-architecture DLLs, other missing DLLs minus a known-harmless list,
+Quit game and force close, iPadOS refusing a second 32-bit program, and Madeira
+Dock's result in words. A session that never got back is summarised at the
+next launch from `madeira-log.prev.txt`. `tests/host/check-log-summary.py`
+covers it on synthetic logs.
+
 ## Tests
 
 `tests/host/check-frontend.py` (profiles incl. resolution and scaling,
