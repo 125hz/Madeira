@@ -5208,10 +5208,84 @@ struct LibraryMetrics: View {
     @State private var donorPoolMB = 0
     @State private var donorGuarded = 0
     private let ticks = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    /// ml2021: one cell per figure. A fixed width per cell (the widest value it can show)
+    /// keeps the pill from shifting as digits change; monospaced digits keep the value
+    /// still within the cell. Label above, value below, hairlines between cells, the
+    /// system material behind: no gradients, no custom colours beyond the thermal dot.
+    struct Cell: Identifiable {
+        let id: String
+        let label: String
+        let value: String
+        let width: CGFloat
+        var dot: Color? = nil
+    }
+    private var cells: [Cell] {
+        var result: [Cell] = []
+        if model.overlayFields.contains("FPS") { result.append(Cell(id: "fps", label: "FPS", value: String(format: "%.0f", fps), width: 44)) }
+        if model.overlayFields.contains("Frame time") {
+            result.append(Cell(id: "ms", label: "MS", value: fps > 0 ? String(format: "%.1f", 1000 / fps) : "–", width: 52))
+        }
+        if model.overlayFields.contains("CPU") {
+            result.append(Cell(id: "cpu", label: "CPU", value: cpu.map { String(format: "%.0f%%", $0.total) } ?? "–", width: 50))
+            result.append(Cell(id: "top", label: "TOP", value: cpu.map { String(format: "%.0f%%", $0.top) } ?? "–", width: 50))
+        }
+        if model.overlayFields.contains("GPU") {
+            result.append(Cell(id: "gpu", label: "GPU", value: gpu < 0 ? "–" : String(format: "%.0f%%", gpu), width: 50))
+            result.append(Cell(id: "gpums", label: "GPU MS", value: gpu < 0 || gpuFrameMs <= 0 ? "–" : String(format: "%.1f", gpuFrameMs), width: 56))
+        }
+        if model.overlayFields.contains("RAM") { result.append(Cell(id: "ram", label: "MB", value: "\(memory)", width: 54)) }
+        if model.overlayFields.contains("Swap & donor") {
+            if donorPoolMB > 0 { result.append(Cell(id: "donor", label: "DONOR", value: "\(donatedMB)", width: 54)) }
+            result.append(Cell(id: "swap", label: "SWAP", value: "\(swapFileMB)", width: 54))
+        }
+        if model.overlayFields.contains("Battery"), battery >= 0 { result.append(Cell(id: "bat", label: "BAT", value: "\(battery)%", width: 50)) }
+        if model.overlayFields.contains("Thermal") {
+            let (word, dot): (String, Color) = {
+                switch thermal {
+                case .nominal: return ("Cool", .green)
+                case .fair: return ("Warm", .yellow)
+                case .serious: return ("Hot", .orange)
+                case .critical: return ("Critical", .red)
+                @unknown default: return ("–", .gray)
+                }
+            }()
+            result.append(Cell(id: "temp", label: "TEMP", value: word, width: 62, dot: dot))
+        }
+        return result
+    }
+    private func cell(_ c: Cell) -> some View {
+        VStack(spacing: 1) {
+            Text(c.label).font(.system(size: 9, weight: .medium, design: .rounded)).tracking(0.6).foregroundStyle(.secondary)
+            HStack(spacing: 4) {
+                if let dot = c.dot { Circle().fill(dot).frame(width: 6, height: 6) }
+                Text(c.value).font(.system(size: 13, weight: .semibold, design: .rounded).monospacedDigit()).foregroundStyle(.primary)
+            }
+        }
+        .frame(width: c.width)
+    }
+    private func row(_ cells: [Cell]) -> some View {
+        HStack(spacing: 0) {
+            ForEach(Array(cells.enumerated()), id: \.element.id) { index, c in
+                if index > 0 { Rectangle().fill(.primary.opacity(0.12)).frame(width: 1, height: 20) }
+                cell(c)
+            }
+        }
+    }
     var body: some View {
-        Text(parts.joined(separator: "  ·  "))
-            .font(.caption.monospacedDigit().weight(.medium)).padding(.horizontal, 12).padding(.vertical, 8)
-            .background(.black.opacity(0.8), in: Capsule()).foregroundStyle(.white)
+        let all = cells
+        // Up to five cells on a row; more wrap onto a second row so the pill stays under the
+        // viewport's width instead of truncating.
+        let split = all.count > 5 ? (all.count + 1) / 2 : all.count
+        VStack(spacing: 6) {
+            row(Array(all.prefix(split)))
+            if split < all.count { row(Array(all.suffix(from: split))) }
+        }
+        .padding(.horizontal, 6).padding(.vertical, 6)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.primary.opacity(0.1), lineWidth: 0.5))
+        .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(parts.joined(separator: ", "))
             .onAppear {
                 lastCount = madeira_frame_count(); lastTime = Date(); UIDevice.current.isBatteryMonitoringEnabled = true
                 applyGPUMeter()
