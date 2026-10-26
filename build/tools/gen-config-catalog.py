@@ -43,6 +43,10 @@ INT_READERS = {"madeira_cfg_int", "mad_cfg_int_pe"}
 # Titles, kinds and fixed choices for options with a dedicated Settings row.
 # "choices" are (value, label); the empty value means "remove the key".
 OVERLAY = {
+    "env.MADEIRA_PASTE_INTERVAL_MS": {"category": "Windows, display & input", "title": "Clipboard typing interval (ms)",
+                "kind": "int", "default": "10",
+                "note": "Default 10 ms between pasted characters. Range 5-100 ms; use a longer interval for games "
+                        "that miss fast text input. Enforced at delivery as well as queueing. Restart the session after changing it."},
     "env.MADEIRA_PIN_GRAPHICS_DLLS": {"category": "Memory & JIT pool", "title": "Keep graphics DLLs loaded",
                 "kind": "bool", "default": "0",
                 "note": "Default off. On a D3D12 device/probe call, pins already loaded D3D12, DXGI and Wine Metal "
@@ -538,10 +542,12 @@ OVERLAY = {
                         "launch, the game's own file wins. Restart Madeira and enable JIT again after changing it."},
     "pool-pair": {"category": "Memory & JIT pool", "title": "Split JIT pool: prefer two runs above the window",
                 "kind": "bool", "default": "1",
-                "note": "With pool-split on: when the largest free run lies below the 0x140000000 executable window "
-                        "(where the pool cannot split), the pool takes two runs above the window instead if together "
-                        "they are larger (GTA V: 368 + 320 MB instead of 464 MB). Falls back to the single run if the "
-                        "placement misses. On by default; 0 turns it off. Read at launch, the game's own file wins."},
+                "note": "With pool-split on: the pool takes two runs above the 0x140000000 executable window when "
+                        "together they are larger than the single run it would get -- whether that run lies below the "
+                        "window, where the pool cannot split (GTA V: 368 + 320 MB instead of 464 MB), or is the higher "
+                        "of two runs above it (The Adventures of Elliot: 240 + 288 MB instead of 288 MB). Falls back to "
+                        "the single run if the placement misses. On by default; 0 turns it off. Read at launch, the "
+                        "game's own file wins."},
     "pool-mid": {"category": "Memory & JIT pool", "title": "Split JIT pool: use the free run between the regions",
                 "kind": "bool", "default": "0",
                 "note": "With pool-split on: when another mapping sits between the pool's two regions and leaves a "
@@ -557,6 +563,10 @@ OVERLAY = {
                         "becomes a third debugger region for the emulator's code buffers, so the whole JIT pool is "
                         "left to DLL copies (GTA V: about 300 MB more). Needs the pool above the window; costs the "
                         "region's size in memory. Off by default; read at launch, the game's own file wins."},
+    "exe-window-mb": {"category": "Memory & JIT pool", "title": "Executable window size (MB)",
+                "kind": "int", "default": "128",
+                "note": "The address range at 0x140000000 kept for a game exe without relocations, which can only run there. Unset: 128 MB, or for a Madeira Dock launch the size of the largest such exe in the game's folder (The Adventures of Elliot: 473 MB -> 480). The JIT pool then starts above it and is that much smaller, so a large one also needs env.MADEIRA_X64_IMAGE_NOCOPY = 1 and pool-split = 1. A number sets it (129 to 960); 128 or less keeps 128 MB. Read at launch, the game's own file wins.",
+                "sources": ["app/Madeira/StikJITHelper.swift"]},
     "pool-low-margin": {"category": "Memory & JIT pool", "title": "Code-buffer region: MB left free below the window",
                 "kind": "int", "default": "128",
                 "note": "With pool-low on: how much of the free run below the executable window stays free for "
@@ -622,6 +632,14 @@ OVERLAY = {
                         "games that open many files a second (Horizon Zero Dawn's shader cache in its menu). "
                         "Off (default): realpath as before. Read at each launch; a later game of the same app run does not "
                         "inherit it."},
+    # madeira-bcd: one default keyed event per guest process (build/ntdll-unix/loader_ios.c).
+    "env.MADEIRA_KEYED_EVENT_PER_PROCESS": {"category": "Wine core (ntdll)", "title": "A default keyed event per process",
+                "kind": "bool", "default": "1",
+                "sources": ["build/ntdll-unix/loader_ios.c"],
+                "note": "On (default): each Windows process gets its own keyed event for the waits and wakes that "
+                        "pass no handle (RtlRunOnce among them), created on first use. 0: every "
+                        "process uses the one the first process created, as before, whose handle is not valid in the "
+                        "others (Slay the Spire 2 failed in RtlRunOnceComplete). Read once per app run."},
     "env.MADEIRA_SRV_DIRECT": {"category": "Wine server", "title": "Run simple server requests on the calling thread",
                 "kind": "text", "default": "0",
                 "choices": [("", "Off (default)"), ("1", "Files, handles, registry, events, semaphores"),

@@ -2164,8 +2164,17 @@ static void *ios_mach_exception_thread( void *arg )
             int srcwatch_hit = ios_srcwatch_handle( &state, fault_addr );
             if (srcwatch_hit) handled = 1;
 
-            /* 1. Redirect user_shared_data accesses (0x7FFE0000) */
-            if (!srcwatch_hit && fault_addr >= 0x7FFE0000 && fault_addr < 0x7FFF0000 && ios_exc_usd)
+            /* 1. Redirect user_shared_data accesses (0x7FFE0000)
+             *
+             * madeira-bcd: only when the sub-floor service above did NOT already
+             * emulate the access. It runs first (ml953) and handles KUSER, after
+             * which this scan used to run anyway on the resumed state and rebase
+             * every register holding a 0x7FFE**** value -- including registers
+             * that were only data. A protected game (The Adventures of Elliot)
+             * keeps the constant 0x7ffe0283 in rcx while it reads KUSER through
+             * another register; rcx came back as the real address and the
+             * pointer it computed was off by exactly ios_exc_usd - 0x7FFE0000. */
+            if (!handled && !srcwatch_hit && fault_addr >= 0x7FFE0000 && fault_addr < 0x7FFF0000 && ios_exc_usd)
             {
                 for (int reg = 0; reg <= 28; reg++)
                 {

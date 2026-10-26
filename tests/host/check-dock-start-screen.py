@@ -86,8 +86,10 @@ require(status.index('DockInstallers.poll(drive: MadeiraDock.drive)') < status.i
         "the status line reads the installs' end after polling them, and times the host from it (or from the start)")
 require('SteamGameArtwork(appID: appID)' in library and 'SteamLaunchBackdrop(appID: appID)' in library,
         "a Dock start shows the game's cover and backdrop by App ID")
-require('winios_window_census_enable(1)' in screen and screen.count('winios_window_census_enable(0)') == 1,
-        'the census runs only while a Dock start holds the desktop back')
+require('winios_window_census_enable(1)' in screen and screen.count('winios_window_census_enable(0)') == 2
+        and 'winios_window_census_enable(reason == "game-window" ? 2 : 0)' in screen,
+        'the census runs only while a Dock start holds the desktop back; after the game window, only the '
+        'born-minimized restore runs, until the session ends or the next one begins')
 require('int winios_drv_foreground_if_owner( HWND hwnd )' in driver and 'GetCurrentThreadId()' in driver and
         'NtUserPostMessage( hwnd, WM_SYSCOMMAND, SC_RESTORE, 0 )' in driver, 'driver helpers: restore posted, front by the own thread')
 events = winios[winios.index('BOOL winios_pProcessEvents(DWORD mask) {'):]
@@ -102,6 +104,7 @@ require(winios.count('winios_census_note_frame(hwnd, x, y, w, h, visible);') == 
         winios.count('winios_census_note_present(hwnd);') == 1 and winios.count('winios_census_note_metal((HWND)hwnd);') == 1,
         'the census is fed by the frame, GDI flush and swapchain hooks')
 require('#include "Winios.h"' in winios, 'Winios.m includes the header Swift reads the census struct from')
+require('caption: window.caption != 0' in screen, "the census's title bar reaches the rules")
 
 # ------------------------------------------------------------------ 1. Swift
 checks = r'''
@@ -111,9 +114,9 @@ func require(_ condition: @autoclosure () -> Bool, _ label: String) {
     if condition() { print("PASS: " + label) } else { print("FAIL: " + label); failures += 1 }
 }
 var nextHwnd: UInt64 = 0x100
-func window(_ image: String, _ w: Int, _ h: Int, visible: Bool = true, drawn: Bool = true) -> SteamLaunchWindow {
+func window(_ image: String, _ w: Int, _ h: Int, visible: Bool = true, drawn: Bool = true, caption: Bool = false) -> SteamLaunchWindow {
     nextHwnd += 2
-    return SteamLaunchWindow(image: image, width: w, height: h, visible: visible, drawn: drawn, pid: 0x40, hwnd: nextHwnd)
+    return SteamLaunchWindow(image: image, width: w, height: h, visible: visible, drawn: drawn, pid: 0x40, hwnd: nextHwnd, caption: caption)
 }
 
 @main struct Checks {
@@ -169,6 +172,23 @@ func window(_ image: String, _ w: Int, _ h: Int, visible: Bool = true, drawn: Bo
         require(S.decide([window("C:\\Program Files (x86)\\Steam\\a.exe", 200, 100)], rendered: false, places: places).scene == .waiting,
                 "a small client window does not")
         require(S.decide([reporter, game], rendered: false, places: places).scene == .game, "the game's window wins over a client dialog")
+
+        // The game's own message box ("Failed to load il2cpp", 179x114) waits for OK.
+        let gameImage = "\\??\\C:\\Program Files (x86)\\Steam\\steamapps\\common\\Fixture Game\\Game.exe"
+        let box = window(gameImage, 179, 114, caption: true)
+        let boxed = S.decide(before + [box], rendered: false, places: places)
+        require(boxed.scene == .steamWindow && boxed.window == box, "the game's own message box needs the user")
+        require(S.decide(before + [window(gameImage, 179, 114)], rendered: true, places: places).scene == .waiting,
+                "a small game window without a title bar does not (a splash, a tool strip)")
+        require(S.decide([window(gameImage, 179, 114, drawn: false, caption: true)], rendered: true, places: places).scene == .waiting,
+                "an undrawn message box does not, D3D frames or not")
+        require(S.decide([window(gameImage, 179, 114, visible: false, caption: true)], rendered: false, places: places).scene == .waiting,
+                "a hidden message box does not")
+        require(S.decide([window("\\??\\C:\\windows\\system32\\conhost.exe", 179, 114, caption: true)], rendered: false, places: places).scene == .waiting,
+                "a helper's captioned window does not")
+        require(S.decide([box, game], rendered: false, places: places).scene == .game, "the game's window wins over its message box")
+        let both = S.decide([reporter, box], rendered: false, places: places)
+        require(both.scene == .steamWindow && both.window == reporter, "the first window that may need the user is the one logged")
 
         // One-time installs run before the host starts: their windows are never the game's.
         let setup = window("C:\\Program Files (x86)\\Steam\\steamapps\\common\\Fixture Game\\_CommonRedist\\setup.exe", 480, 360)
@@ -386,6 +406,16 @@ int main(int argc, char **argv) {
               "MADEIRA_RESTORE_BORN_MINIMIZED=0 leaves a born-minimized window alone");
         return failures ? 1 : 0;
     }
+    if (argc > 1 && !strcmp(argv[1], "late-off")) {
+        /* MADEIRA_RESTORE_BORN_MINIMIZED_LATE=0 in the environment. */
+        HWND born = add(0x701, 0x34c80000, 1, 0x71);
+        winios_window_census_enable(1);
+        winios_window_census_enable(2);
+        winios_census_note_frame(born, -32000, -32000, 160, 24, 1);
+        CHECK(restores == 0 && winios_window_census(out, WINIOS_CENSUS_MAX) == 0,
+              "MADEIRA_RESTORE_BORN_MINIMIZED_LATE=0 ends the restore with the census");
+        return failures ? 1 : 0;
+    }
     HWND desktop = add(0x20, 0x96000000, 0, 1);
     HWND child = add(0x101, 0x50000000, 0, 7);            /* WS_CHILD|WS_VISIBLE */
     HWND dialog = add(0x100, 0x96ca0000, 1, 7);           /* visible dialog */
@@ -416,6 +446,7 @@ int main(int argc, char **argv) {
     CHECK(g && !strcmp(g->image, "c:\\games\\pid68\\game68.exe") && g->visible && g->shown_once, "game window owner, shown once");
     CHECK(find(hidden, n) && !find(hidden, n)->visible, "a hidden window is not shown");
     CHECK(u && u->image[0] == 0 && u->pid == 0x99, "an unreadable owner stays empty");
+    CHECK(d->caption && !g->caption && find(game2, n)->caption, "the title bar (WS_CAPTION) is read from the style");
     CHECK(image_queries == 3, "one path lookup per process");
 
     /* Born minimized: first shown minimized, never shown before. */
@@ -445,6 +476,13 @@ int main(int argc, char **argv) {
     CHECK(n == 5 && !find(game, n) && find(game2, n), "destroyed windows leave");
     CHECK(winios_window_census(out, 2) == 2, "copy is bounded by the caller");
 
+    /* A game's message box, with the style of a device log's "Fatal error" box. */
+    HWND box = add(0x204, 0x94c801c4, 1, 0x44);
+    winios_census_note_frame(box, 614, 267, 179, 114, 1);
+    n = winios_window_census(out, WINIOS_CENSUS_MAX);
+    CHECK(find(box, n) && find(box, n)->visible && find(box, n)->caption && find(box, n)->w == 179 && find(box, n)->h == 114,
+          "a message box is listed with its title bar");
+
     for (unsigned long i = 0; i < 80; i++) winios_census_note_frame(add(0x1000 + i, 0x84000000, 1, 0x44), 0, 0, 10, 10, 1);
     n = winios_window_census(out, WINIOS_CENSUS_MAX);
     CHECK(n == WINIOS_CENSUS_MAX, "capacity holds");
@@ -459,6 +497,21 @@ int main(int argc, char **argv) {
     int before = image_queries;
     winios_census_note_frame(dialog, 287, 140, 705, 440, 1);
     CHECK(image_queries == before + 1, "a new census forgets cached process paths");
+
+    /* The starting screen ended on a splash or launcher window: on=2 keeps the known windows and
+     * goes on restoring a window first shown minimized, counting nothing else, until the session ends. */
+    HWND born2 = add(0x6000, 0x34c80000, 1, 0x45);
+    winios_window_census_enable(2);
+    int r0 = restores;
+    winios_census_note_present(dialog);
+    winios_census_note_frame(born2, -32000, -32000, 160, 24, 1);
+    n = winios_window_census(out, WINIOS_CENSUS_MAX);
+    CHECK(restores == r0 + 1 && last_restore == born2, "after the census ends, a window first shown minimized still gets SC_RESTORE");
+    CHECK(find(dialog, n) && find(dialog, n)->presents == 0, "restore-only: known windows kept, no frames counted");
+    winios_window_census_enable(0);
+    winios_census_note_frame(add(0x6001, 0x34c80000, 1, 0x45), -32000, -32000, 160, 24, 1);
+    CHECK(restores == r0 + 1, "the session's end stops it");
+    winios_window_census_enable(1);
 
     /* Concurrency: writers on "Wine threads", the app reading on the main thread. */
     for (long t = 0; t < 4; t++) for (int i = 0; i < 16; i++) add(0x9000 + t * 16 + i, 0x94000000, 1, 0x50 + (unsigned)t);
@@ -545,9 +598,13 @@ else:
             print(f'--- census under {name}')
             env = dict(os.environ, ASAN_OPTIONS='detect_leaks=0', TSAN_OPTIONS='halt_on_error=1')
             env.pop('MADEIRA_RESTORE_BORN_MINIMIZED', None)
+            env.pop('MADEIRA_RESTORE_BORN_MINIMIZED_LATE', None)
             require(subprocess.run([str(exe)], env=env).returncode == 0, f'census checks ({name})')
             env['MADEIRA_RESTORE_BORN_MINIMIZED'] = '0'
             require(subprocess.run([str(exe), 'restore-off'], env=env).returncode == 0, f'restore switch ({name})')
+            env.pop('MADEIRA_RESTORE_BORN_MINIMIZED', None)
+            env['MADEIRA_RESTORE_BORN_MINIMIZED_LATE'] = '0'
+            require(subprocess.run([str(exe), 'late-off'], env=env).returncode == 0, f'late restore switch ({name})')
         (tmp / 'image.c').write_text(d_prelude + image + d_checks, encoding='utf-8')
         exe = tmp / 'image'
         r = subprocess.run([CC, '-std=gnu11', '-O1', '-g', '-Wall', '-fsanitize=address,undefined', '-fno-sanitize-recover=undefined',

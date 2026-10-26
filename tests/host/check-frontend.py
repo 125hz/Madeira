@@ -110,6 +110,7 @@ enum ProMotionIntent {
 struct TouchControl: Codable, Equatable { var nx = 0.5 }
 enum ControlAction: Codable, Equatable, Hashable { case none }   // LibraryEntry.controllerBinds
 enum GamepadInput { static let keyboardMouseAvailable = true }   // LibraryEntry's per-game DirectInput choice
+struct GestureZone: Codable, Identifiable, Equatable { var id = UUID() }   // LibraryEntry.zones (GestureZones.swift)
 enum LibraryError: LocalizedError { case message(String) }
 func env(_ name: String) -> String? { getenv(name).map { String(cString: $0) } }
 '''
@@ -549,7 +550,7 @@ check('ResolutionChoices.metalFX(in: groups)' in detail and 'entry.metalFXUpscal
       'game details: the MetalFX 1.5× screen shape while MetalFX 1.5× is chosen (or saved), not also as "saved"')
 reset = block(model, 'private func resetPhoneResolution(')
 check('resetPhoneResolution()' in block(model, 'private init()') and 'ResolutionChoices.fills(1408, 648)' in reset
-      and 'madeira.ml1172.resolution-reset' in reset and 'guard persist(next) else { return }' in reset,
+      and 'madeira.ml1172.resolution-reset' in reset and 'guard persist(next, wait: true) else { return }' in reset,
       'ml1172: 1408x648 entries are reset once on a screen of another shape')
 check('ResolutionChoices.groups()' in block(content, 'private var resolutionPicker') and 'DesktopResolution' not in content,
       'ml1172: the developer Resolution menu shows the same choices')
@@ -606,11 +607,13 @@ check('TouchControlsModel.diameter(control)' in content and 'library.opacity' in
       "touch controls follow the session's size and opacity")
 
 # Owner requests: the starting screen's glyph row, Settings credits last, no drive_c note.
-launch = block(hud, 'private func launchView(')
+launch = block(hud, 'private func launchColumnView(')
+wide = block(hud, 'private func launchWideView(')
 glyph = block(hud, 'private func launchGlyph(')
 row = block(launch, 'HStack(spacing: 14)')
 check('launchGlyph(showLogs ? "Hide live log" : "Show live log", "text.alignleft", on: showLogs)' in row
-      and 'Button(showLogs ?' not in launch,
+      and 'launchGlyph(showLogs ? "Hide live log" : "Show live log", "text.alignleft", on: showLogs)' in wide
+      and 'Button(showLogs ?' not in launch and 'Button(showLogs ?' not in wide,
       'starting screen: the live-log control is a glyph in one row')
 check('Image(systemName: symbol)' in glyph and '.accessibilityLabel(label)' in glyph and 'Text(' not in glyph
       and 'Circle()' in glyph, 'starting screen: glyph buttons show no text and keep their words as VoiceOver labels')

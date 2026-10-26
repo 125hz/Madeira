@@ -2568,6 +2568,10 @@ static void ios_xprobe_main( void )
             page_wait_ms = XP_MS( ru.ri_page_wait_time_mach - pru.ri_page_wait_time_mach );
 #endif
             double qf = (have_pe && pe.magic == 0x3130305058444d4dLL && pe.qpf) ? 1000.0 / (double)pe.qpf : 0;
+            double page_wait_ms = -1.0; /* unavailable in the build SDK */
+#ifdef MADEIRA_HAVE_RUSAGE_PAGE_WAIT_TIME_MACH
+            page_wait_ms = XP_MS( ru.ri_page_wait_time_mach - pru.ri_page_wait_time_mach );
+#endif
             ios_power_gov_step( ios_bg_now_ns(), dt_ms, (double)(ru.ri_energy_nj - pru.ri_energy_nj) / 1e6 );
             {   /* madeira-bcd fps-gov (opt-in): the frame cap, and madeira-d3d12's copy of it */
                 static int64_t prev_t_cap;

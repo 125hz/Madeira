@@ -32,6 +32,9 @@ struct SteamAppInfo {
     /// SteamDirectStart and Madeira Dock select an installed Windows entry;
     /// Dock passes its original key to Valve's client.
     var launches: [SteamLaunchOption] = []
+    /// Steam API language names the app supports (`common.supported_languages`
+    /// or `common.languages`), lowercased. Empty when PICS lists none.
+    var languages: Set<String> = []
     /// Steam Auto-Cloud configuration (`ufs`): which files of the game are its
     /// saves, and where another platform keeps them. Empty for a game that
     /// only uses the Steam Cloud API (its files live in the user's `remote` folder).
@@ -152,13 +155,32 @@ struct SteamAppInfo {
         oslist.lowercased().contains("windows") || oslist.isEmpty
     }
 
+    /// The language-pack depots to install: the chosen download language
+    /// (SteamLanguage) when the app has depots for it, else English, as
+    /// Valve's client falls back.
+    var depotLanguage: String {
+        let wanted = SteamLanguage.download(for: appID)
+        return depots.contains { $0.language.caseInsensitiveCompare(wanted) == .orderedSame } ? wanted : "english"
+    }
+
+    /// The language the install record names, which Valve's client reports to
+    /// the game (`GetCurrentGameLanguage`): the chosen download language when
+    /// the app supports it, even with no depot of its own (text in the common
+    /// content), else the depot language.
+    var gameLanguage: String {
+        let wanted = SteamLanguage.download(for: appID)
+        return languages.contains(wanted) ? wanted : depotLanguage
+    }
+
     /// The depots a Windows install takes: matching OS, architecture-neutral
-    /// or matching osarch, common or requested-language content, no
-    /// low-violence alternates, no DLC or shared redistributables, and only
-    /// depots that publish a public manifest. A 64-bit selection falls back
-    /// to 32-bit depots when the app only publishes those.
+    /// or matching osarch, common or requested-language content (by default
+    /// `depotLanguage`), no low-violence alternates, no DLC or shared
+    /// redistributables, and only depots that publish a public manifest. A
+    /// 64-bit selection falls back to 32-bit depots when the app only
+    /// publishes those.
     func installDepots(os: String = "windows", arch: String = "64",
-                       language: String = "english") -> [DepotInfo] {
+                       language: String? = nil) -> [DepotInfo] {
+        let language = language ?? depotLanguage
         func select(_ arch: String) -> [DepotInfo] {
             depots.filter { d in
                 d.supports(os: os) && d.dlcAppID == nil && !d.isSharedInstall &&
@@ -178,7 +200,8 @@ struct SteamAppInfo {
     /// Every depot with why it was or was not selected, for the install log
     /// ("sel", or the first failing rule). IDs and flags only.
     func depotSelectionSummary(os: String = "windows", arch: String = "64",
-                               language: String = "english", limit: Int = 24) -> String {
+                               language: String? = nil, limit: Int = 24) -> String {
+        let language = language ?? depotLanguage
         let chosen = Set(installDepots(os: os, arch: arch, language: language).map(\.depotID))
         return depots.sorted { $0.depotID < $1.depotID }.prefix(limit).map { d in
             let why = selectionRule(d, chosen: chosen, os: os, language: language)
@@ -215,6 +238,17 @@ struct SteamAppInfo {
             guard bytes > 0 else { return total }
             // Sizes are parsed from untrusted PICS VDF strings with no bound:
             // saturate instead of trapping if a malformed depot overflows the sum.
+            let (sum, overflow) = total.addingReportingOverflow(bytes)
+            return overflow ? UInt64.max : sum
+        }
+    }
+
+    /// Approximate installed size for a platform: `manifests.public.size` per
+    /// selected depot, else its download figure. Same selection and caveats as
+    /// downloadSize (shared depots whose owner's product info was not read count 0).
+    func installSize(for os: String) -> UInt64 {
+        installDepots(os: os).reduce(0) { total, d in
+            let bytes = d.publicSizeBytes > 0 ? d.publicSizeBytes : (d.publicDownloadBytes > 0 ? d.publicDownloadBytes : d.maxSize)
             let (sum, overflow) = total.addingReportingOverflow(bytes)
             return overflow ? UInt64.max : sum
         }
@@ -263,6 +297,15 @@ struct SteamAppInfo {
             info.headerImage = asset(common["header_image"])
             if let parent = (common["parent"] as? String).flatMap(UInt32.init), parent != 0, parent != info.appID {
                 info.parentID = parent
+            }
+            // supported_languages: name -> {supported, full_audio, ...};
+            // languages: name -> "1" (older apps).
+            for key in ["supported_languages", "languages"] {
+                guard let table = common[key] as? [String: Any] else { continue }
+                for (name, value) in table.prefix(64) where name.utf8.count <= 32 {
+                    let flag = ((value as? [String: Any])?["supported"] as? String) ?? (value as? String) ?? ""
+                    if !["0", "false"].contains(flag.lowercased()) { info.languages.insert(name.lowercased()) }
+                }
             }
         }
 
@@ -416,5 +459,100 @@ struct SteamLaunchOption: Codable, Hashable, Sendable {
                                              type: type, oslist: oslist, osarch: osarch, betaKey: betaKey))
         }
         return options
+    }
+}
+
+// MARK: - Download language
+
+/// The language Steam downloads install: which language-pack depots are taken
+/// and the language the install record names (Valve's client reports it to
+/// the game). Settings › Steam › Game language, kept in madeira.cfg as
+/// `env.MADEIRA_STEAM_LANGUAGE` (a Steam API language name); unset follows
+/// the device's language. A game without the language falls back to English.
+enum SteamLanguage {
+    static let configKey = "env.MADEIRA_STEAM_LANGUAGE"
+
+    /// Steam API language names with their names in that language, in the
+    /// order Steam's own client lists them.
+    static let all: [(code: String, name: String)] = [
+        ("arabic", "العربية"), ("bulgarian", "Български"), ("schinese", "简体中文"),
+        ("tchinese", "繁體中文"), ("czech", "Čeština"), ("danish", "Dansk"),
+        ("dutch", "Nederlands"), ("english", "English"), ("finnish", "Suomi"),
+        ("french", "Français"), ("german", "Deutsch"), ("greek", "Ελληνικά"),
+        ("hungarian", "Magyar"), ("indonesian", "Bahasa Indonesia"), ("italian", "Italiano"),
+        ("japanese", "日本語"), ("koreana", "한국어"), ("norwegian", "Norsk"),
+        ("polish", "Polski"), ("portuguese", "Português"), ("brazilian", "Português (Brasil)"),
+        ("romanian", "Română"), ("russian", "Русский"), ("spanish", "Español (España)"),
+        ("latam", "Español (Latinoamérica)"), ("swedish", "Svenska"), ("thai", "ไทย"),
+        ("turkish", "Türkçe"), ("ukrainian", "Українська"), ("vietnamese", "Tiếng Việt"),
+    ]
+
+    static func name(_ code: String) -> String {
+        all.first { $0.code == code }?.name ?? code.capitalized
+    }
+
+    /// The chosen language, or nil when it follows the device.
+    static var chosen: String? {
+        guard let value = MadeiraConfig.get(configKey)?.lowercased(), all.contains(where: { $0.code == value }) else { return nil }
+        return value
+    }
+
+    static func choose(_ code: String?) {
+        MadeiraConfig.set(configKey, code)
+        SteamLog.event("[steam-language] setting=\(code ?? "device") download=\(download)")
+    }
+
+    /// The language downloads use now.
+    static var download: String { chosen ?? device }
+
+    /// The language one game's downloads use: its own choice on its page, else
+    /// the setting's.
+    static func download(for appID: UInt32) -> String { gameChoice(appID) ?? download }
+
+    /// Per-game choices (Game language on the game's page), by App ID, kept in
+    /// the app's defaults; a game without one follows the setting.
+    private static let gameChoicesKey = "steam-game-languages"
+
+    static func gameChoice(_ appID: UInt32) -> String? {
+        let value = (UserDefaults.standard.dictionary(forKey: gameChoicesKey) as? [String: String])?[String(appID)]
+        return value.flatMap { code in all.contains { $0.code == code } ? code : nil }
+    }
+
+    static func chooseForGame(_ appID: UInt32, _ code: String?) {
+        var choices = UserDefaults.standard.dictionary(forKey: gameChoicesKey) as? [String: String] ?? [:]
+        choices[String(appID)] = code
+        UserDefaults.standard.set(choices, forKey: gameChoicesKey)
+        SteamLog.event("[steam-language] app=\(appID) choice=\(code ?? "setting") download=\(download(for: appID))")
+    }
+
+    /// The device's preferred language as a Steam API name, English when Steam
+    /// has none for it.
+    static var device: String {
+        for identifier in Locale.preferredLanguages {
+            if let code = steamName(Locale(identifier: identifier)) { return code }
+        }
+        return "english"
+    }
+
+    static func steamName(_ locale: Locale) -> String? {
+        guard let language = locale.language.languageCode?.identifier else { return nil }
+        let region = locale.region?.identifier
+        switch language {
+        case "zh":
+            let script = locale.language.script?.identifier
+            if script == "Hant" || (script == nil && ["TW", "HK", "MO"].contains(region ?? "")) { return "tchinese" }
+            return "schinese"
+        case "pt": return region == "BR" ? "brazilian" : "portuguese"
+        case "es": return region == nil || region == "ES" ? "spanish" : "latam"
+        case "ko": return "koreana"
+        case "nb", "nn", "no": return "norwegian"
+        default:
+            let names = ["ar": "arabic", "bg": "bulgarian", "cs": "czech", "da": "danish", "nl": "dutch",
+                         "en": "english", "fi": "finnish", "fr": "french", "de": "german", "el": "greek",
+                         "hu": "hungarian", "id": "indonesian", "it": "italian", "ja": "japanese",
+                         "pl": "polish", "ro": "romanian", "ru": "russian", "sv": "swedish", "th": "thai",
+                         "tr": "turkish", "uk": "ukrainian", "vi": "vietnamese"]
+            return names[language]
+        }
     }
 }

@@ -271,8 +271,9 @@ a result before any game window means the game did not start).
 **Which window is the game's.** Winios keeps a census of the desktop's
 top-level windows while a Dock start's starting screen is up: per window,
 whether it is shown, its size, whether it has put a frame on screen (a GDI
-frame or a D3D swapchain of its own), and the owning process with its
-executable path, read once per process from the Wine server by process id.
+frame or a D3D swapchain of its own), whether it has a title bar
+(`WS_CAPTION`), and the owning process with its executable path, read once
+per process from the Wine server by process id.
 The app classes the owner by where the program lives on drive C, never by
 its name:
 
@@ -280,13 +281,16 @@ its name:
 |---|---|---|
 | under `C:\windows\` | helper | never the game: Wine's shell, services and console hosts, msiexec, and the Dock host itself |
 | under the Steam client's folder, outside its `steamapps` library | client | a shown, drawn dialog (240x120 or larger) may need the user |
-| anywhere else | other | the game's (or its own launcher's) once shown, drawn and 160x120 or larger |
+| anywhere else | other | the game's (or its own launcher's) once shown, drawn and 160x120 or larger; a smaller shown, drawn window with a title bar (the game's own message box) may need the user |
 | unreadable | unknown | the game's only when D3D frames reached the screen |
 
 A window first shown before the host started (its first report field,
 `probe-start-bits`) belongs to the one-time installs, which run before the
 host: it is never the game's, and a dialog of it may need the user (a failed
-installer can wait for OK). A window that may need the user and stays up for
+installer can wait for OK). A game that fails early can do the same with its
+own message box (Unity's "Failed to load il2cpp" is 179x114), smaller than a
+game window and than a dialog: its title bar tells it from a splash screen or
+a tool strip. A window that may need the user and stays up for
 2 s reveals the desktop; 4 s after it is gone the starting screen returns, at
 most six times. **Show desktop** reveals the desktop for good. The game's
 window ends the starting screen in every case. `[steam-launch-view]` logs the
@@ -300,6 +304,10 @@ show is minimized gets what a taskbar click sends, once: `WM_SYSCOMMAND` /
 `SC_RESTORE`, posted, and its own thread then brings it to the front from its
 event pump (a fullscreen game pauses without focus). A window that was shown
 and minimized itself later is left alone. `[born-minimized]` logs both steps.
+The starting screen often ends on a splash or launcher window, before the
+game's main window is shown at all, so the restore keeps running after the
+census ends (counting nothing else) until the session ends.
+`MADEIRA_RESTORE_BORN_MINIMIZED_LATE=0` ends it with the census, as before.
 
 The census runs only for a Dock start's starting screen: with it off, each
 hook costs one atomic load, and nothing else changes for any other session,
@@ -438,6 +446,7 @@ never asks. The preparation is Valve's; Dock does not touch the files.
 | `MADEIRA_DOCK_INSTALLER_REVEAL` | on | `0`: a one-time installer's dialog never reveals the desktop by itself |
 | `MADEIRA_DOCK_STATUS` | on | `0`: the starting screen does not watch the host's result |
 | `MADEIRA_RESTORE_BORN_MINIMIZED` | on | `0`: while the census runs, a window first shown minimized stays minimized |
+| `MADEIRA_RESTORE_BORN_MINIMIZED_LATE` | on | `0`: after the starting screen ends, a window first shown minimized stays minimized |
 
 ## 64-bit and runtime impact
 

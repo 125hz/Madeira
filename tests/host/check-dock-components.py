@@ -48,6 +48,18 @@ if mode == "registry" {
     let conflict = "WINE REGISTRY Version 2\n\n[Software\\\\Valve\\\\Steam]\n\"SteamPath\"=\"another location\"\n"
     do { _ = try SteamRuntimeFiles.registry(conflict, machine: false); fatalError("conflict accepted") }
     catch SteamRuntimeFiles.Failure.conflict { }
+    // A Steam emulator's leftover (SteamPath and the client DLL in folders without steam.exe) is replaced.
+    let leftover = "WINE REGISTRY Version 2\n\n[Software\\\\Valve\\\\Steam]\n\"SteamPath\"=\"C:\\\\Games\\\\Emu\\\\Steam\"\n\n" +
+        "[Software\\\\Valve\\\\Steam\\\\ActiveProcess]\n\"pid\"=dword:00000020\n\"SteamClientDll64\"=\"C:\\\\Program Files\\\\Steam\\\\steamclient64.dll\"\n"
+    var asked: [String] = []
+    let replaced = try SteamRuntimeFiles.registry(leftover, machine: false, stale: { asked.append($0); return true })
+    assert(asked.sorted() == ["C:\\Games\\Emu\\Steam", "C:\\Program Files\\Steam\\steamclient64.dll"], "\(asked)")
+    assert(!replaced.contains("Emu") && !replaced.contains("Program Files\\\\Steam\\\\") && replaced.contains("\"pid\"=dword:00000020"))
+    let again = try SteamRuntimeFiles.registry(replaced, machine: false)
+    assert(again == replaced)
+    // A value naming a client that is there stays a conflict.
+    do { _ = try SteamRuntimeFiles.registry(leftover, machine: false, stale: { _ in false }); fatalError("live client replaced") }
+    catch SteamRuntimeFiles.Failure.conflict { assert(SteamRuntimeFiles.lastConflict?.hasSuffix("SteamPath") == true) }
     do { _ = try SteamRuntimeFiles.registry("invalid", machine: true); fatalError("invalid hive accepted") }
     catch SteamRuntimeFiles.Failure.prefixMissing { }
     for path in ["../escape", "/absolute", "c:/other", "a\\b", "a//b", "a/./b", "a/../b", "a/space "] {
@@ -62,7 +74,7 @@ if mode == "registry" {
     try fm.createSymbolicLink(at: folder.appendingPathComponent("link"), withDestinationURL: folder.appendingPathComponent("Bin"))
     do { _ = try SteamRuntimeFiles.destination("link/new.dll", under: folder); fatalError("symlink accepted") }
     catch SteamRuntimeFiles.Failure.conflict { }
-    print("PASS: discovery keys, idempotence, unrelated settings, conflicts and path rules")
+    print("PASS: discovery keys, idempotence, unrelated settings, conflicts, stale leftovers and path rules")
 } else {
     let data = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[2]))
     do {
