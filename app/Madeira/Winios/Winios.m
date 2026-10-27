@@ -22,6 +22,7 @@
 #import <ImageIO/ImageIO.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
+#include "WiniosCursor.h"
 #import <os/log.h>
 #include <stdarg.h>
 #include <pthread.h>
@@ -531,6 +532,13 @@ extern int winios_drv_census_owner(HWND hwnd, unsigned int *pid, unsigned int *s
 extern int winios_drv_process_image(unsigned int pid, char *out, unsigned int size);
 extern int winios_drv_post_restore(HWND hwnd);
 extern int winios_drv_foreground_if_owner(HWND hwnd);
+extern int winios_drv_close_desktop_if_owner(void);
+
+/* winios_close_desktop: the app asks explorer's desktop to close (a Dock
+ * session whose game and Steam have ended); the desktop's own thread does it
+ * from its event pump (winios_pProcessEvents). */
+static atomic_int g_close_desktop;
+void winios_close_desktop(void) { atomic_store(&g_close_desktop, 1); }
 
 /* A game's main window can be shown minimized the first time it is shown
  * (ShowWindow cmd 2, parked at -32000,-32000). On Windows the taskbar brings
@@ -950,7 +958,6 @@ void winios_post_touch_up(int x, int y) {
 /* Key press bridge. vk = Windows virtual-key code, down = 1 for press,
  * 0 for release. Queued like mouse events; drained in pProcessEvents. */
 void winios_post_key(int vk, int down) {
-    fprintf(stderr, "[winios] post_key vk=0x%x down=%d\n", vk, down); fflush(stderr);
     winios_q_push_ev(WINIOS_EV_KEY, vk, 0, down ? 0 : KEYEVENTF_KEYUP, 0);
 }
 
@@ -983,7 +990,9 @@ static BOOL winios_drain_input(void) {
             drained = TRUE;
             continue; /* Clipboard contents must not enter the input log. */
         }
-        fprintf(stderr, "[winios] drain type=%u x=%d y=%d flags=0x%x\n", e.type, e.x, e.y, e.flags); fflush(stderr);
+        if (e.type != WINIOS_EV_KEY) {
+            fprintf(stderr, "[winios] drain type=%u x=%d y=%d flags=0x%x\n", e.type, e.x, e.y, e.flags); fflush(stderr);
+        }
         if (e.type == WINIOS_EV_KEY)
             winios_drv_post_key((unsigned short)e.x, e.flags);
         else
@@ -1013,6 +1022,14 @@ BOOL winios_pProcessEvents(DWORD mask) {
         int r = winios_drv_foreground_if_owner((HWND)fg);
         if (r && atomic_compare_exchange_strong(&g_restore_foreground, &fg, 0)) {
             fprintf(stderr, "[born-minimized] hwnd=%p foreground=%d\n", (HWND)fg, r);
+            fflush(stderr);
+        }
+    }
+    if (atomic_load_explicit(&g_close_desktop, memory_order_relaxed)) {
+        int r = winios_drv_close_desktop_if_owner();
+        int expected = 1;
+        if (r && atomic_compare_exchange_strong(&g_close_desktop, &expected, 0)) {
+            fprintf(stderr, "[winios] desktop close posted=%d (the Dock session ends)\n", r);
             fflush(stderr);
         }
     }
@@ -1121,6 +1138,9 @@ static void winios_layout_compositor(void) {
     UIWindow *win = g_compositor_view.superview ? (UIWindow *)g_compositor_view.superview : nil;
     CGRect frame = g_comp_frame_set ? g_comp_frame : (win ? win.bounds : g_compositor_view.frame);
     g_compositor_view.frame = frame;
+    /* madeira-compositor-stay-on-top: a view controller presented after the first present adds its
+     * transition view above us; the desktop would be drawn and invisible. */
+    if (win) [win bringSubviewToFront:g_compositor_view];
 
     /* The LIVE guest size, not MADEIRA_SCREEN_W/H. That environment pair is
      * the session's launch-time seed; win32u owns the value afterwards and
@@ -1346,6 +1366,7 @@ void winios_note_game_metal_hwnd(void *hwnd) {
  * starts with no overlay windows and no known Metal windows. */
 void winios_session_reset(void) {
     atomic_store(&g_size_game_hwnd, 0);
+    atomic_store(&g_close_desktop, 0);
     winios_swapchain_hwnds_reset();   /* [swap-win]: HWND values of the last session mean nothing now */
     dispatch_async(dispatch_get_main_queue(), ^{
         g_game_input_key = nil;
@@ -2504,6 +2525,8 @@ void winios_cursor_set(unsigned int cur_id, int w, int h, int hot_x, int hot_y, 
 }
 
 void winios_cursor_show(int show) {
+    if (winios_mouse_routing_enabled())
+        winios_direct_cursor_show(show); // Desktop mouse-routing metadata.
     dispatch_async(dispatch_get_main_queue(), ^{
         if (g_comp_game) {   /* the dialog cursor shows only over a dialog */
             g_game_cursor_prog_hidden = !show;

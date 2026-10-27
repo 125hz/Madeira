@@ -64,8 +64,16 @@ file is written whole.
 2. Maps each cloud path to a file of Madeira Dock's Wine prefix, through
    the `%Root%` placeholder of the path and the app's `ufs` product info:
    `GameInstall` is the game's folder, `WinAppDataLocalLow` and its
-   siblings are under the Windows user folder (the one Wine names after
-   `$USER`), and a path with no placeholder is under Steam's
+   siblings are under the Windows user folder: the profile the prefix's
+   registry names (ProfileList's `ProfileImagePath`, where Wine points
+   `%USERPROFILE%` and so the games; the template's is `C:\users\mythic`,
+   not the unix user `mobile`), else the one named after `$USER`. At start
+   Madeira makes that profile the unix user's (`ProfileUnification`): the
+   registry's profile paths are rewritten to `C:\users\mobile` and the
+   template profile's files are copied there, because a game Valve's client
+   starts in a Madeira Dock session gets its environment from the account
+   name and writes under `mobile` regardless. A path
+   with no placeholder is under Steam's
    `userdata/<account>/<app>/remote`. Names are matched without regard to
    case. A path that would leave its folder is refused.
 3. Compares SHA-1 and size, and also lists files matching the app's save
@@ -128,3 +136,5 @@ it, as before; the log says `[steam-cloud] remotecache off` once per app run.
   uploaded.
 - Encrypted cloud files are not supported.
 - Log tag `[steam-cloud]`: App IDs, counts and results; no file names or paths.
+
+Profile migration copies files before it changes registry paths. The old profile stays as a recovery copy. A copy or backup failure stops the migration. The sync record is cleared before copying, so a changed save needs a new comparison.

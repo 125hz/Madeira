@@ -909,6 +909,31 @@ static int active_users;                    /* current number of active users */
 static int allocated_users;                 /* count of allocated entries in the array */
 static struct fd **freelist;                /* list of free entries in the array */
 
+/* The INET classification cache of ios_fd_is_inet(), one entry per poll user slot, at file
+ * scope so that add_poll_user() and remove_poll_user() can forget a slot's entry. The
+ * freelist is LIFO and unix fds are allocated lowest-first, so a socket created right after
+ * a thread exits can get that thread's request-fifo slot AND fd number. A stale "not INET"
+ * verdict then made the poll loop synthesise POLLOUT for the socket: its nonblocking connect
+ * was reported complete while the kernel was still connecting, and the next send failed
+ * with ENOTCONN. */
+static int *ios_inet_cache_fd;
+static signed char *ios_inet_cache_val;
+static int ios_inet_cache_size;
+
+static void ios_fd_inet_forget( int user )
+{
+    if (user >= 0 && user < ios_inet_cache_size) ios_inet_cache_fd[user] = -1;
+}
+
+static signed char ios_fd_family_is_inet( int fd )
+{
+    struct sockaddr_storage ss;
+    socklen_t slen = sizeof(ss);
+
+    if (getsockname( fd, (struct sockaddr *)&ss, &slen ) == -1) return 0;
+    return ss.ss_family == AF_INET || ss.ss_family == AF_INET6;
+}
+
 static int get_next_timeout( struct timespec *ts );
 
 static inline void fd_poll_event( struct fd *fd, int event )
@@ -1287,6 +1312,7 @@ static int add_poll_user( struct fd *fd )
     pollfd[ret].revents = 0;
     poll_users[ret] = fd;
     active_users++;
+    ios_fd_inet_forget( ret );   /* a reused slot must be classified again */
     {
         static unsigned long logged;   /* madeira-bcd: ios_srv_log_sample */
         if (ios_srv_log_sample( &logged ))
@@ -1301,6 +1327,7 @@ static void remove_poll_user( struct fd *fd, int user )
     assert( user >= 0 );
     assert( poll_users[user] == fd );
 
+    ios_fd_inet_forget( user );
     remove_epoll_user( fd, user );
     pollfd[user].fd = -1;
     pollfd[user].events = 0;
@@ -1440,18 +1467,19 @@ static void ios_doorbell_service(void)
  * Family is cached per (user,fd) — getsockname once per socket. */
 static signed char ios_fd_is_inet( int user, int fd )
 {
-    static int *cache_fd;
-    static signed char *cache_val;
-    static int cache_size;
-
-    if (user >= cache_size)
+    if (user >= ios_inet_cache_size)
     {
         int newsize = (user + 64) & ~63;
-        int *nfd = realloc( cache_fd, newsize * sizeof(*nfd) );
-        signed char *nval = realloc( cache_val, newsize );
-        if (!nfd || !nval) return 0;
-        memset( nfd + cache_size, 0xff, (newsize - cache_size) * sizeof(*nfd) );
-        cache_fd = nfd; cache_val = nval; cache_size = newsize;
+        int *nfd = realloc( ios_inet_cache_fd, newsize * sizeof(*nfd) );
+        signed char *nval;
+        /* If the cache cannot grow, classify this fd uncached: answering "not INET" would
+         * be the harmful direction (a real socket polled as a pipe gets a synthesised
+         * POLLOUT). Each pointer is stored as soon as its realloc succeeds. */
+        if (!nfd) return ios_fd_family_is_inet( fd );
+        ios_inet_cache_fd = nfd;
+        if (!(nval = realloc( ios_inet_cache_val, newsize ))) return ios_fd_family_is_inet( fd );
+        memset( nfd + ios_inet_cache_size, 0xff, (newsize - ios_inet_cache_size) * sizeof(*nfd) );
+        ios_inet_cache_val = nval; ios_inet_cache_size = newsize;
     }
     /* ml579: CACHE RESTORED. The ml576 A/B ran 30.8M classifications across two
      * runs and found the cache would have been wrong TWICE, with ZERO of the
@@ -1461,20 +1489,17 @@ static signed char ios_fd_is_inet( int user, int fd )
      * each CM ping exactly 1000 ms, so starving the poll loop that hard can eat
      * the deadline before the encrypted /cmping/ request is even written.
      *
-     * The missing invalidation is still a latent correctness bug (nothing clears
-     * cache_fd/cache_val when add_poll_user/remove_poll_user recycle a slot); it
-     * simply is not the network failure. Fix it on merit, not as a network lead. */
-    if (cache_fd[user] != fd)
+     * The missing invalidation was a real correctness bug after all, in the
+     * harmful direction: a TCP socket that reused an exited thread's request-fifo
+     * slot and fd number was polled as a pipe, and its nonblocking connect was
+     * reported complete early. add_poll_user()/remove_poll_user() now forget the
+     * slot's entry (ios_fd_inet_forget). */
+    if (ios_inet_cache_fd[user] != fd)
     {
-        struct sockaddr_storage ss;
-        socklen_t slen = sizeof(ss);
-        cache_fd[user] = fd;
-        if (getsockname( fd, (struct sockaddr *)&ss, &slen ) == -1)
-            cache_val[user] = 0;
-        else
-            cache_val[user] = (ss.ss_family == AF_INET || ss.ss_family == AF_INET6);
+        ios_inet_cache_fd[user] = fd;
+        ios_inet_cache_val[user] = ios_fd_family_is_inet( fd );
     }
-    return cache_val[user];
+    return ios_inet_cache_val[user];
 }
 
 void main_loop(void)
@@ -2062,6 +2087,17 @@ static void device_destroy( struct object *obj )
 /****************************************************************/
 /* inode functions */
 
+/* Madeira: ntdll keeps directory listings in memory (dlls/ntdll/unix/file.c,
+ * dircache_find) and checks each directory again after this is called. Every
+ * delete, mkdir, rename and link below calls it. Weak, so the server still
+ * links without ntdll. */
+extern void madeira_dircache_changed(void) __attribute__((weak));
+
+static void dircache_changed(void)
+{
+    if (madeira_dircache_changed) madeira_dircache_changed();
+}
+
 static void unlink_closed_fd( struct inode *inode, struct closed_fd *fd )
 {
     /* make sure it is still the same file */
@@ -2070,6 +2106,7 @@ static void unlink_closed_fd( struct inode *inode, struct closed_fd *fd )
     {
         if (S_ISDIR(st.st_mode)) rmdir( fd->unix_name );
         else unlink( fd->unix_name );
+        dircache_changed();
     }
 }
 
@@ -3034,6 +3071,7 @@ static int ios_replace_readonly_link( const char *name, int flags, unsigned int 
     if (lstat( name, &st ) == -1 || !S_ISLNK( st.st_mode )) goto keep;
     if (stat( name, &st ) == -1 || !S_ISREG( st.st_mode ) || ios_link_target_in_use( &st )) goto keep;
     if (unlink( name ) == -1) goto keep;
+    dircache_changed();
     if (++count <= 16)
         fprintf( stderr, "[readonly-link] #%u an overwrite replaced a link to a read-only file with a new file "
                  "(MADEIRA_REPLACE_READONLY_LINK=0 fails it)\n", count );
@@ -3094,6 +3132,7 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
                 goto error;
             }
         }
+        else dircache_changed();
         flags &= ~(O_CREAT | O_EXCL | O_TRUNC);
     }
 
@@ -3661,6 +3700,7 @@ static void set_reparse_point( struct fd *fd, struct async *async )
             free( reparse_name );
             return;
         }
+        dircache_changed();
         free( fd->unix_name );
         fd->closed->unix_name = fd->unix_name = reparse_name;
     }
@@ -3758,6 +3798,7 @@ static void delete_reparse_point( struct fd *fd, struct async *async )
         free( base_name );
         return;
     }
+    dircache_changed();
 
     free( fd->unix_name );
     fd->closed->unix_name = fd->unix_name = base_name;
@@ -4087,6 +4128,7 @@ static void set_fd_name( struct fd *fd, struct fd *root, const char *nameptr, da
                 file_set_error();
                 goto failed;
             }
+            dircache_changed();
         }
     }
 
@@ -4094,6 +4136,8 @@ static void set_fd_name( struct fd *fd, struct fd *root, const char *nameptr, da
     {
         if (link( fd->unix_name, name ))
             file_set_error();
+        else
+            dircache_changed();
         free( name );
         return;
     }
@@ -4103,6 +4147,7 @@ static void set_fd_name( struct fd *fd, struct fd *root, const char *nameptr, da
         file_set_error();
         goto failed;
     }
+    dircache_changed();
 
     if (is_file_executable( fd->unix_name ) != is_file_executable( name ) && !fstat( fd->unix_fd, &st ))
     {

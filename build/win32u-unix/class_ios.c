@@ -429,6 +429,11 @@ NTSTATUS WINAPI NtUserInitializeClientPfnArrays( const ntuser_client_func_ptr *c
     pthread_mutex_unlock( &winproc_lock );
 
     pthread_once( &init_once, init_user );
+#ifdef WINE_IOS
+    /* madeira-gdi-shared-every-process: init_user() ran in whichever
+     * pseudo-process loaded user32 first; this one needs the table too. */
+    win32u_gdi_check_publish();
+#endif
     return STATUS_SUCCESS;
 }
 

@@ -30,6 +30,7 @@
 #include <dlfcn.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach/mach_vm.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <sys/time.h>
@@ -213,11 +214,20 @@ static int ios_current_fd_socket(void)
 
 /* Per-process process_exiting flag (used by NtTerminateProcess). A global
  * flag poisons every OTHER pseudo-process's exit path once the first one
- * dies (they skip their self-terminate and the server never hears). */
+ * dies (they skip their self-terminate and the server never hears).
+ *
+ * The session's initial process has no slot and gets a flag of its own too:
+ * the global process_exiting must stay FALSE. Wine's mutex_lock() and
+ * mutex_unlock() (unix_private.h) skip the pthread call while it is set, for
+ * every thread of every pseudo-process, so once a launcher that started the
+ * game had exited, virtual_mutex, fd_cache_mutex and every other lock taken
+ * through them stopped excluding anything for the rest of the session. */
+static BOOL ios_initial_process_exiting;
+
 BOOL *ios_process_exiting_ptr(void)
 {
     int i = ios_proc_socket_index();
-    return (i >= 0) ? &ios_proc_sockets[i].exiting : &process_exiting;
+    return (i >= 0) ? &ios_proc_sockets[i].exiting : &ios_initial_process_exiting;
 }
 
 /* ─── ml586 fd-ownership trace ────────────────────────────────────────────
@@ -623,6 +633,129 @@ static BOOL read_reply_data( void *buffer, size_t size )
 }
 
 
+#ifdef WINE_IOS
+/* Reply data for anonymous RWX memory.
+ *
+ * VirtualAlloc(PAGE_EXECUTE_READWRITE) memory that takes the JIT-pool path is the pool's RX view at its guest address
+ * (W^X); guest stores into it fault and the store emulator (signal_arm64_ios.c) writes them through the pool's RW
+ * alias. read() cannot fault its way through: it returns EFAULT, and read_reply_data treated every EFAULT as a fatal
+ * protocol error ("wine client error: read: Bad address"), which killed the calling thread. Any request whose reply
+ * buffer is such memory hit it (NtQueryValueKey, NtQueryObject, NtReadVirtualMemory of another process, ...);
+ * Windows writes the reply.
+ *
+ * So the data part of a reply whose destination touches JIT-pool RX memory is read page by page through a bounce
+ * buffer and stored through the RW alias, as a guest store would be. Every other destination keeps the single read().
+ * If such a read still fails with EFAULT, the rest of the reply is read page by page and the call fails with
+ * STATUS_ACCESS_VIOLATION (what Windows returns for an output buffer it cannot write) instead of the thread dying.
+ * Limit of that fallback: if the failed read() had already consumed a prefix (a pipe-buffer wrap into a destination
+ * that is only partly writable), the drain waits for bytes that never come; the alias case never takes this path. */
+extern void *ios_jit_rx_base_global, *ios_jit_rw_base_global;
+extern size_t ios_jit_pool_size_global;
+extern uintptr_t ios_jit_anon_alias_lookup( uintptr_t addr );
+extern void ios_jit_anon_alias_note_write( unsigned long long addr );
+
+#define IOS_REPLY_PAGE 0x1000   /* guest page: pool ranges and anonymous-RWX aliases are multiples of it */
+
+/* The RW alias of a guest address that is a JIT-pool RX view (not writable at its own address), or 0. */
+static uintptr_t ios_reply_rw_alias( uintptr_t addr )
+{
+    uintptr_t rx = (uintptr_t)ios_jit_rx_base_global, rw = (uintptr_t)ios_jit_rw_base_global;
+    size_t size = ios_jit_pool_size_global;
+
+    if (rx && rw && size && addr >= rx && addr - rx < size) return rw + (addr - rx);
+    return ios_jit_anon_alias_lookup( addr );
+}
+
+/* Is all of [addr, addr+size) mapped and writable at its own address? */
+static BOOL ios_reply_host_writable( uintptr_t addr, size_t size )
+{
+    mach_vm_address_t a = addr, end = addr + size;
+
+    while (a < end)
+    {
+        mach_vm_address_t q = a;
+        mach_vm_size_t sz = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+
+        if (mach_vm_region( mach_task_self(), &q, &sz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info,
+                            &cnt, &obj ) != KERN_SUCCESS)
+            return FALSE;
+        if (q > a || !(info.protection & VM_PROT_WRITE)) return FALSE;
+        a = q + sz;
+    }
+    return TRUE;
+}
+
+/* Read size reply bytes for guest memory one guest page at a time through a bounce buffer: a JIT-pool RX page is
+ * stored through its RW alias, a writable page directly, any other page drops its bytes and sets *fault.
+ * Returns FALSE only for a deferred thread exit. */
+static BOOL ios_read_reply_paged( uintptr_t dst, size_t size, BOOL *fault )
+{
+    char bounce[IOS_REPLY_PAGE];
+
+    while (size)
+    {
+        size_t n = IOS_REPLY_PAGE - (dst & (IOS_REPLY_PAGE - 1));
+        uintptr_t rw;
+
+        if (n > size) n = size;
+        if (!read_reply_data( bounce, n )) return FALSE;
+        if ((rw = ios_reply_rw_alias( dst )))
+        {
+            memcpy( (void *)rw, bounce, n );
+            ios_jit_anon_alias_note_write( dst );
+        }
+        else if (ios_reply_host_writable( dst, n )) memcpy( (void *)dst, bounce, n );
+        else *fault = TRUE;
+        dst += n;
+        size -= n;
+    }
+    return TRUE;
+}
+
+/* The data part of a reply (wait_reply). Returns FALSE only for a deferred thread exit; *fault is set when part of
+ * the destination could not be written. req is the request code, for the log only. */
+static BOOL ios_read_reply_guest( void *buffer, size_t size, int req, BOOL *fault )
+{
+    static unsigned int alias_logs, efault_logs;
+    uintptr_t dst = (uintptr_t)buffer, page, end = dst + size;
+    ssize_t ret;
+
+    for (page = dst & ~(uintptr_t)(IOS_REPLY_PAGE - 1); page < end; page += IOS_REPLY_PAGE)
+    {
+        if (!ios_reply_rw_alias( page )) continue;
+        if (__sync_fetch_and_add( &alias_logs, 1 ) < 8)
+            dprintf( 2, "[reply-alias] tid=%04x req=%d dst=%p size=%#lx: reply data stored through the RW alias "
+                     "of anonymous RWX memory\n", (unsigned int)GetCurrentThreadId(), req, buffer,
+                     (unsigned long)size );
+        return ios_read_reply_paged( dst, size, fault );
+    }
+    while (size)
+    {
+        if ((ret = read( ntdll_get_thread_data()->reply_fd, (void *)dst, size )) > 0)
+        {
+            dst += ret;
+            size -= ret;
+            continue;
+        }
+        if (ret < 0 && errno == EINTR) continue;
+        if (ret < 0 && errno == EFAULT)
+        {
+            if (__sync_fetch_and_add( &efault_logs, 1 ) < 8)
+                dprintf( 2, "[reply-efault] tid=%04x req=%d dst=%p size=%#lx: destination not writable and not "
+                         "aliased; read page by page, STATUS_ACCESS_VIOLATION if a page stays unwritable\n",
+                         (unsigned int)GetCurrentThreadId(), req, (void *)dst, (unsigned long)size );
+            return ios_read_reply_paged( dst, size, fault );
+        }
+        return read_reply_data( (void *)dst, size );   /* EOF, EPIPE, anything else: the original handling */
+    }
+    return TRUE;
+}
+#endif
+
+
 /***********************************************************************
  *           wait_reply
  *
@@ -630,10 +763,24 @@ static BOOL read_reply_data( void *buffer, size_t size )
  */
 static inline unsigned int wait_reply( struct __server_request_info *req )
 {
+#ifdef WINE_IOS
+    int code = req->u.req.request_header.req;   /* the reply header overwrites it */
+    BOOL fault = FALSE;
+#endif
+
     if (!read_reply_data( &req->u.reply, sizeof(req->u.reply) )) return STATUS_THREAD_IS_TERMINATING;
+#ifdef WINE_IOS
+    if (req->u.reply.reply_header.reply_size)
+    {
+        if (!ios_read_reply_guest( req->reply_data, req->u.reply.reply_header.reply_size, code, &fault ))
+            return STATUS_THREAD_IS_TERMINATING;
+        if (fault) return STATUS_ACCESS_VIOLATION;
+    }
+#else
     if (req->u.reply.reply_header.reply_size &&
         !read_reply_data( req->reply_data, req->u.reply.reply_header.reply_size ))
         return STATUS_THREAD_IS_TERMINATING;
+#endif
     return req->u.reply.reply_header.error;
 }
 
@@ -2797,15 +2944,196 @@ static void ios_wprof_main( void )
  * virtual_ios.c's warmer thread run every ~10 min instead of every minute. */
 static int ios_lean_diag;
 
+/* ml1288: stuck page-crossing store detector, ml1292: and its fix (Ori and the
+ * Will of the Wisps, 2026-10-06/07).
+ *
+ * A game thread sat for 0.3-18 s at ONE store instruction with identical guest
+ * registers, ~100% of its time IN THE KERNEL and the task taking ~22,000 page
+ * faults a second, while every other thread was idle. The store is a 16- or
+ * 32-byte SIMD&FP store (STR Q, STP Q post-index: FEX's translation of guest
+ * memcpy and SSE stores) whose bytes cross a 16 KB page, into memory the swap
+ * tier maps from its file (share mode TRUESHARED). Both pages read back present
+ * and writable, and touching the second page from another thread did not
+ * release the thread: the kernel keeps retrying the access without ever
+ * completing it.
+ *
+ * Every 100 ms this check looks at the threads; only a RUNNING thread that
+ * spent at least 60% of the interval in the kernel is suspended and read. If
+ * it is a guest thread (x28 points at a FEX frame) at a store that crosses a
+ * page, at the same pc and address as at the previous check, it is stuck: the
+ * store is completed from here a page at a time (ios_store_split_crossing,
+ * signal_arm64_ios.c: each part is a single-page write, which the kernel
+ * serves normally), the base register written back for the indexed forms, pc
+ * moved past it, and the thread resumed. `[stuck-store]` lines report each
+ * episode. MADEIRA_STUCK_CHECK=0 turns the check off. */
+#define ML1288_SLOTS 64
+static struct { uint64_t tid, pc, ea, seen_ms; uint32_t sys_ms, hits; } ios_stuck[ML1288_SLOTS];
+static int ios_stuck_logs;
+static unsigned long long ios_stuck_fixed;
+
+/* Effective address and size of the load/store at insn (A64), 0 if not one. */
+static int ios_ldst_ea( uint32_t insn, const arm_thread_state64_t *st, uint64_t *ea, unsigned *len )
+{
+    unsigned rn = (insn >> 5) & 31, size = insn >> 30, v = (insn >> 26) & 1, opc = (insn >> 22) & 3;
+    unsigned scale = v ? (size | ((opc & 2) << 1)) : size;
+    uint64_t base = rn == 31 ? arm_thread_state64_get_sp( *st ) : st->__x[rn];
+
+    if ((insn & 0x3b000000u) == 0x39000000u)            /* LDR/STR, unsigned immediate */
+    {
+        *ea = base + ((uint64_t)((insn >> 10) & 0xfff) << scale); *len = 1u << scale; return 1;
+    }
+    if ((insn & 0x3b200c00u) == 0x38200800u)            /* LDR/STR, register offset */
+    {
+        unsigned rm = (insn >> 16) & 31, option = (insn >> 13) & 7, s = (insn >> 12) & 1;
+        uint64_t m = rm == 31 ? 0 : st->__x[rm];
+        if (option == 2) m = (uint32_t)m;
+        else if (option == 6) m = (uint64_t)(int64_t)(int32_t)m;
+        *ea = base + (m << (s ? scale : 0)); *len = 1u << scale; return 1;
+    }
+    if ((insn & 0x3b200000u) == 0x38000000u)            /* LDUR/STUR, pre/post-index */
+    {
+        int64_t imm9 = ((int64_t)((insn >> 12) & 0x1ff) << 55) >> 55;
+        *ea = ((insn >> 10) & 3) == 1 ? base : base + imm9; *len = 1u << scale; return 1;
+    }
+    if ((insn & 0x3a000000u) == 0x28000000u)            /* LDP/STP */
+    {
+        unsigned psc = v ? 2 + (insn >> 30) : 2 + (insn >> 31);
+        int64_t imm7 = ((int64_t)((insn >> 15) & 0x7f) << 57) >> 57;
+        *ea = ((insn >> 23) & 3) == 1 ? base : base + (imm7 << psc); *len = 2u << psc; return 1;
+    }
+    if ((insn & 0x3f200c00u) == 0x19000000u)            /* LDAPUR/STLUR */
+    {
+        int64_t imm9 = ((int64_t)((insn >> 12) & 0x1ff) << 55) >> 55;
+        *ea = base + imm9; *len = 1u << size; return 1;
+    }
+    if ((insn & 0x3f000000u) == 0x08000000u)            /* LDAR/STLR/LDXR family */
+    {
+        *ea = base; *len = 1u << size; return 1;
+    }
+    return 0;
+}
+
+int ios_store_split_crossing( uint32_t insn, arm_thread_state64_t *st, const arm_neon_state64_t *neon,
+                              uintptr_t rx, uintptr_t rw, size_t sz );   /* ml1289, signal_arm64_ios.c */
+
+static void ios_stuck_store_check( void )
+{
+    extern void *ios_jit_rx_base_global, *ios_jit_rw_base_global;
+    extern size_t ios_jit_pool_size_global;
+    mach_port_t self_port = pthread_mach_thread_np( pthread_self() );
+    thread_act_array_t tl;
+    mach_msg_type_number_t tc;
+    struct timespec ts;
+    uint64_t now;
+    unsigned k;
+
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    now = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    if (task_threads( mach_task_self(), &tl, &tc ) != KERN_SUCCESS) return;
+    for (k = 0; k < tc; k++)
+    {
+        thread_basic_info_data_t bi;
+        thread_identifier_info_data_t idi;
+        arm_thread_state64_t st;
+        arm_neon_state64_t neon;
+        mach_msg_type_number_t bic = THREAD_BASIC_INFO_COUNT, idc = THREAD_IDENTIFIER_INFO_COUNT,
+                               cnt = ARM_THREAD_STATE64_COUNT, nc = ARM_NEON_STATE64_COUNT;
+        uint64_t pc, bb = 0, ea = 0, dt;
+        uint32_t insn = 0, sys, dsys;
+        unsigned len = 0, slot, i;
+        int got, have_neon, cross;
+
+        if (tl[k] == self_port) continue;
+        if (thread_info( tl[k], THREAD_BASIC_INFO, (thread_info_t)&bi, &bic ) != KERN_SUCCESS) continue;
+        if (thread_info( tl[k], THREAD_IDENTIFIER_INFO, (thread_info_t)&idi, &idc ) != KERN_SUCCESS) continue;
+        sys = bi.system_time.seconds * 1000 + bi.system_time.microseconds / 1000;
+
+        for (slot = 0; slot < ML1288_SLOTS; slot++) if (ios_stuck[slot].tid == idi.thread_id) break;
+        if (slot == ML1288_SLOTS)
+        {
+            for (slot = 0, i = 1; i < ML1288_SLOTS; i++)   /* a free slot, else the longest unseen */
+                if (ios_stuck[i].seen_ms < ios_stuck[slot].seen_ms) slot = i;
+            ios_stuck[slot].tid = idi.thread_id; ios_stuck[slot].seen_ms = now;
+            ios_stuck[slot].sys_ms = sys;
+            ios_stuck[slot].pc = 0; ios_stuck[slot].hits = 0;
+            continue;
+        }
+        dt = now - ios_stuck[slot].seen_ms;
+        dsys = sys - ios_stuck[slot].sys_ms;
+        ios_stuck[slot].seen_ms = now; ios_stuck[slot].sys_ms = sys;
+        if (bi.run_state != TH_STATE_RUNNING || !dt || (uint64_t)dsys * 10 < dt * 6)
+        {
+            ios_stuck[slot].pc = 0; ios_stuck[slot].hits = 0;
+            continue;
+        }
+
+        /* kernel-bound: read it */
+        if (thread_suspend( tl[k] ) != KERN_SUCCESS) continue;
+        got = thread_get_state( tl[k], ARM_THREAD_STATE64, (thread_state_t)&st, &cnt ) == KERN_SUCCESS;
+        have_neon = thread_get_state( tl[k], ARM_NEON_STATE64, (thread_state_t)&neon, &nc ) == KERN_SUCCESS;
+        if (!got || !ios_ts_read( st.__x[28], &bb, 8 ) || bb <= 0x10000)   /* not in FEX state */
+        {
+            thread_resume( tl[k] );
+            continue;
+        }
+        pc = arm_thread_state64_get_pc( st );
+        cross = ios_ts_read( pc, &insn, 4 ) && ios_ldst_ea( insn, &st, &ea, &len ) &&
+                ((ea ^ (ea + len - 1)) & ~(uint64_t)(vm_page_size - 1));
+        if (cross && ios_stuck[slot].pc == pc && ios_stuck[slot].ea == ea)
+        {
+            unsigned hits = ++ios_stuck[slot].hits;
+            int r = ios_store_split_crossing( insn, &st, have_neon ? &neon : NULL,
+                                              (uintptr_t)ios_jit_rx_base_global, (uintptr_t)ios_jit_rw_base_global,
+                                              ios_jit_pool_size_global );
+            if (r > 0)
+            {
+                __darwin_arm_thread_state64_set_pc_fptr( st, (void *)(uintptr_t)(pc + 4) );
+                if (thread_set_state( tl[k], ARM_THREAD_STATE64, (thread_state_t)&st, ARM_THREAD_STATE64_COUNT ) != KERN_SUCCESS)
+                    r = -2;   /* the store is written, pc not moved: the thread redoes the same bytes */
+                else
+                    ios_stuck_fixed++;
+            }
+            thread_resume( tl[k] );
+            if (ios_stuck_logs < 400 && (r > 0 || hits <= 3 || hits % 10 == 0))
+            {
+                ios_stuck_logs++;
+                wine_log_write( "[stuck-store] ml1292 tid=%llu hits=%u pc=0x%llx insn=%08x ea=0x%llx len=%u "
+                                "sys+%u ms in %llu ms: %s (%llu completed so far)",
+                                (unsigned long long)idi.thread_id, hits, (unsigned long long)pc, insn,
+                                (unsigned long long)ea, len, dsys, (unsigned long long)dt,
+                                r > 0 ? "completed, pc+4" : r == -2 ? "written, set_state FAILED"
+                                : r < 0 ? "refused (a page not writable)" : "not a store it decodes", ios_stuck_fixed );
+            }
+            if (r > 0) { ios_stuck[slot].pc = 0; ios_stuck[slot].hits = 0; }
+        }
+        else
+        {
+            thread_resume( tl[k] );
+            ios_stuck[slot].pc = cross ? pc : 0;
+            ios_stuck[slot].ea = cross ? ea : 0;
+        }
+    }
+    for (k = 0; k < tc; k++) mach_port_deallocate( mach_task_self(), tl[k] );
+    vm_deallocate( mach_task_self(), (vm_address_t)tl, tc * sizeof(*tl) );
+}
+
 static void ios_thread_sampler_main(void)
 {
     int gen = 0;
+    /* ml1288: MADEIRA_STUCK_CHECK=0 turns off the check that completes a store stuck across a 16 KB page. */
+    const char *sc = getenv( "MADEIRA_STUCK_CHECK" );
+    const int stuck_check = !(sc && sc[0] == '0');
     ios_ts_calibrate();
     wine_log_write(ios_lean_diag ? "[thread-sample] ml876 armed for [sync-census] only (MADEIRA_LEAN_DIAG: no bursts, no guest RIP profile)"
                                  : "[thread-sample] ml876 armed (task-wide: burst of 4 passes / 250 ms every 20 s)");
     for (;;) {
         int b;
-        sleep(20);
+        unsigned tick;
+        for (tick = 0; tick < 200; tick++)   /* ml1288: the stuck-store check every 100 ms between bursts */
+        {
+            usleep( 100000 );
+            if (stuck_check && !ios_lean_diag) ios_stuck_store_check();
+        }
         if (!ios_lean_diag) {
         for (b = 0; b < 4; b++) { ios_thread_sampler_pass(b); usleep(250000); }
         wine_log_write("[thread-sample] ml876 burst done");
@@ -4742,6 +5070,23 @@ void process_exit_wrapper( int status )
     }
     else
     {
+        /* madeira-orphan-exit: "no slot" is not proof of being the session.
+         * A thread of a child process that has already exited also has no
+         * slot -- its slot was cleared when the process went -- and on iOS
+         * such a thread is still running, because a pthread cannot be stopped
+         * from outside. Treating it as the session closed the session's
+         * master socket and ended every program in it. Compare the caller's
+         * PEB with the session's own; anything else exits only itself. */
+        extern void *ios_session_peb_get( void );
+        void *caller = ios_jit_current_peb();
+        void *session = ios_session_peb_get();
+        if (caller && session && caller != session)
+        {
+            wine_log_write( "[Wine ntdll/server] process_exit_wrapper(%d): orphaned thread "
+                            "of an exited process (peb=%p); exiting this thread only",
+                            status, caller );
+            pthread_exit( NULL );
+        }
         /* No slot: this is the session's initial process, the program the app
          * itself handed to __wine_main (WineProcessBridge.m). Its exit status
          * is how the app's library tells a crash from a normal quit. A weak
@@ -4757,6 +5102,42 @@ void process_exit_wrapper( int status )
     wine_log_write("[Wine ntdll/server] process_exit_wrapper(%d)", status );
     exit( status );  /* on iOS, wine_ios_exit shim longjmps back to wine_process_thread */
 }
+
+
+#ifdef WINE_IOS
+/***********************************************************************
+ *           ios_unix_fatal_exit   (ml1310)
+ *
+ * For the bare exit() calls left in ntdll's unix side (failed shared user data
+ * or ARM64EC map, failed signal set-up). exit() is already the wine_ios_exit
+ * shim, so it never ends the app, but it ends only the calling thread (or
+ * longjmps a pseudo-process's boot thread) without closing that pseudo-
+ * process's master socket: the server never learns the process died, its
+ * waiters hang, and its JIT-pool copies are never reclaimed. A pseudo-process
+ * that has its own server socket now ends through process_exit_wrapper, the
+ * path exit_process and abort_process take. Without one (the session's own
+ * start-up, a child before it registered), plain exit() as before. Idea from
+ * the published patch 0032 of another iOS port.
+ */
+void ios_unix_fatal_exit( int status, const char *why ) __attribute__((noreturn));
+void ios_unix_fatal_exit( int status, const char *why )
+{
+    static int route = -1;
+    int i = ios_proc_socket_index();
+
+    /* MADEIRA_UNIX_EXIT_ROUTE=0: a fatal unix-side error calls plain (shimmed) exit() again (ml1310) */
+    if (route < 0) { const char *e = getenv( "MADEIRA_UNIX_EXIT_ROUTE" ); route = !(e && e[0] == '0'); }
+    dprintf( 2, "[exit-route] ml1310 %s: status %d, %s\n", why, status,
+             route && i >= 0 ? "ending this pseudo-process (socket closed, pool reclaimed)"
+                             : "plain exit (no own server socket, or MADEIRA_UNIX_EXIT_ROUTE=0)" );
+    if (route && i >= 0)
+    {
+        pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
+        process_exit_wrapper( status );
+    }
+    exit( status );
+}
+#endif
 
 
 #ifdef WINE_IOS
@@ -5577,7 +5958,6 @@ void server_init_process_done(void)
         extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
         ERR("signal_start_thread: teb=%p peb=%p TransferAddress=%p suspend=%d\n",
             NtCurrentTeb(), peb, ios_cur_image_info()->TransferAddress, suspend);
-
         /* Watchdog: suspend thread and sample registers at 2s and 4s */
         {
             pthread_t wine_pthread = pthread_self();

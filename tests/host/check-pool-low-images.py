@@ -30,7 +30,7 @@ helpers = ''.join(function(signature) for signature in (
     'static int ios_pool_keep_big(',
     'static int ios_pool_free_put(',
     'static size_t ios_pool_alloc_range_ex(',
-    'static size_t ios_pool_alloc_range(',
+    'static size_t ios_pool_alloc_range_tagged(',
     'static size_t ios_pool_low_image_range(',
     'static int ios_pool_ledger_holds(',
     'static int ios_tail_carve_scan(',
@@ -42,10 +42,10 @@ helpers = ''.join(function(signature) for signature in (
 image_copy = source[source.index('size_t image_alloc = (image_size + page_size - 1)'):]
 image_copy = image_copy[:image_copy.index('/* Copy ENTIRE PE image')]
 assert image_copy.count('ios_pool_low_image_range( alloc_size )') == 1
-allocation = ('offset = ios_pool_alloc_range(alloc_size, jit_pool_size - ios_jit_tail_reserved);\n'
+allocation = ('offset = ios_pool_alloc_range_tagged(alloc_size, jit_pool_size - ios_jit_tail_reserved, image_tag);\n'
               '                if (offset == (size_t)-1) offset = ios_pool_low_image_range( alloc_size );\n'
               '                if (offset == (size_t)-1 && ios_pool_recycle_code_range( alloc_size ))\n'
-              '                    offset = ios_pool_alloc_range(alloc_size, jit_pool_size - ios_jit_tail_reserved);')
+              '                    offset = ios_pool_alloc_range_tagged(alloc_size, jit_pool_size - ios_jit_tail_reserved, image_tag);')
 assert allocation in image_copy, 'the overflow runs only after normal image allocation fails'
 assert source.count('ios_pool_low_image_range( alloc_size )') == 1, 'anonymous RWX must retain its old path'
 assert source.count('ios_pool_recycle_code_range( alloc_size )') == 1, 'only the image failure path may transfer code ranges'
@@ -70,11 +70,12 @@ fixture = r'''
 #define IOS_POOL_LEDGER_MAX 1024
 #define IOS_POOL_FREE_MAX 256
 #define IOS_POOL_REUSE_GRACE_SEC 3
-struct ios_pool_free { size_t off, size; time_t freed_at; int advised; };
-struct ios_pool_alloc { size_t off, size; void *peb; };
+struct ios_pool_free { size_t off, size; time_t freed_at; int advised; uint64_t tag; };
+struct ios_pool_alloc { size_t off, size; void *peb; uint64_t tag; };
 static struct ios_pool_free ios_pool_freelist[IOS_POOL_FREE_MAX];
 static struct ios_pool_alloc ios_pool_ledger[IOS_POOL_LEDGER_MAX];
 static int ios_pool_free_count, ios_pool_ledger_count, ios_pool_last_alloc_reused;
+static __thread int ios_pool_last_same_image;
 static size_t jit_pool_offset, ios_jit_hole_off_eff, ios_jit_hole_end_eff;
 static size_t ios_jit_hole2_off, ios_jit_hole2_end;   /* pool-mid: no second hole here */
 static size_t ios_pool_big_off, ios_pool_big_size, ios_jit_pool_size_global;
@@ -98,8 +99,8 @@ static int ios_pool_range_execable(size_t off, size_t size, unsigned *cur, unsig
 static int ios_pool_range_clean(size_t off, size_t size)
 { return ios_pool_range_execable(off, size, NULL, NULL); }
 typedef int (*ios_pool_clean_fn)(size_t, size_t);
-static void ios_pool_check_range_exec(size_t off, size_t size, int reused)
-{ (void)off; (void)size; (void)reused; }
+static unsigned ios_pool_check_range_exec(size_t off, size_t size, int reused)
+{ (void)off; (void)size; (void)reused; return poisoned; }
 static int ios_pool_live_overlap(uintptr_t start, size_t size, size_t *off_out, void **peb_out)
 {
     size_t off = start - (uintptr_t)ios_jit_rw_base_global;
@@ -176,7 +177,7 @@ static int mach_vm_region(mach_port_t task, mach_vm_address_t *address, mach_vm_
 static size_t image(size_t alloc_size)
 {
     size_t jit_pool_size = ios_jit_pool_size_global, offset;
-''' + allocation + r'''
+''' + 'uint64_t image_tag = 0;\n' + allocation + r'''
     return offset;
 }
 
@@ -340,7 +341,7 @@ static void check_recycled(void)
     reset(); retired(272 * MB, 32 * MB, 30); ios_pool_ledger_count = IOS_POOL_LEDGER_MAX;
     CHECK(!ios_pool_recycle_code_range(request) && ios_tail_carve_n == 1);
     reset(); retired(272 * MB, 32 * MB, 30);
-    ios_pool_ledger[0] = (struct ios_pool_alloc){ios_tail_carves[0].off + MB, MB, (void *)3};
+    ios_pool_ledger[0] = (struct ios_pool_alloc){ios_tail_carves[0].off + MB, MB, (void *)3, 0};
     ios_pool_ledger_count = 1;
     CHECK(!ios_pool_recycle_code_range(request) && ios_tail_carve_n == 1);
 
@@ -469,26 +470,26 @@ int main(void)
      * even when the image-overflow switch has subsequently been disabled. */
     reset();
     size_t coff = (size_t)(ios_jit_low_rx_global - (uintptr_t)ios_jit_rx_base_global);
-    ios_pool_freelist[0] = (struct ios_pool_free){coff, MB, time(NULL), 1};
+    ios_pool_freelist[0] = (struct ios_pool_free){coff, MB, time(NULL), 1, 0};
     ios_pool_free_count = 1;
     CHECK(ios_pool_best_fit(ios_pool_freelist, 1, 0x4000,
                            ios_pool_freelist[0].freed_at, (size_t)-1, 0) == -1);
     CHECK(ios_pool_best_fit(ios_pool_freelist, 1, 0x4000,
                            ios_pool_freelist[0].freed_at + 3, (size_t)-1, 0) == 0);
     wow = 1;
-    CHECK(ios_pool_alloc_range_ex(0x4000, 0, (size_t)-1, 0) == (size_t)-1);
+    CHECK(ios_pool_alloc_range_ex(0x4000, 0, (size_t)-1, 0, 0) == (size_t)-1);
     CHECK(ios_pool_free_count == 1 && !ios_pool_ledger_count);
     ios_pool_freelist[0].freed_at -= 4;
-    CHECK(ios_pool_alloc_range_ex(0x4000, 0, (size_t)-1, 0) == (size_t)-1);
+    CHECK(ios_pool_alloc_range_ex(0x4000, 0, (size_t)-1, 0, 0) == (size_t)-1);
     wow = 0;
-    CHECK(ios_pool_alloc_range_ex(0x4000, 0, (size_t)-1, 0) == coff);
+    CHECK(ios_pool_alloc_range_ex(0x4000, 0, (size_t)-1, 0, 0) == coff);
     CHECK(ios_pool_ledger[0].peb == (void *)1);
 
     reset();
-    ios_pool_freelist[0] = (struct ios_pool_free){coff, MB, 0, 1};
-    ios_pool_freelist[1] = (struct ios_pool_free){MB, MB, 0, 1};
+    ios_pool_freelist[0] = (struct ios_pool_free){coff, MB, 0, 1, 0};
+    ios_pool_freelist[1] = (struct ios_pool_free){MB, MB, 0, 1, 0};
     ios_pool_free_count = 2; wow = 1;
-    CHECK(ios_pool_alloc_range_ex(0x4000, 0, (size_t)-1, 0) == MB);
+    CHECK(ios_pool_alloc_range_ex(0x4000, 0, (size_t)-1, 0, 0) == MB);
 
     reset();
     ios_jit_low_reserved = 0; ios_jit_low_size_global = 12 * MB;

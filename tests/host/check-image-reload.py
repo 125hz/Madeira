@@ -73,7 +73,7 @@ assert re.search(r'if \(reload_jit && reload_pe == image_base && reload_size == 
                  r'image_alloc \+ tramp_prealloc, ios_jit_current_peb\(\) \)\)', alloc), \
     'in place only inside this process\'s own ledger record'
 assert 'offset = (size_t)((char *)reload_jit - (char *)jit_rx_base);' in alloc
-assert alloc.index('reload_jit = NULL;') < alloc.index('offset = ios_pool_alloc_range(')
+assert alloc.index('reload_jit = NULL;') < alloc.index('offset = ios_pool_alloc_range_tagged(')
 assert 'if (!reload_jit && offset != (size_t)-1 && data_delta)' in alloc, 'no second data-align shift'
 
 # --- behaviour ----------------------------------------------------------------
