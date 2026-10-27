@@ -18,3 +18,7 @@ extension handling. It does not add optional device features.
 
 Host fixtures cover surface lifetime, failure propagation and backend selection.
 They do not prove GPU presentation, driver compatibility or gameplay on iOS.
+
+An optional, isolated MoltenVK v1.4.2 source backport for direct pipeline-cache
+exports is documented in `patches/README.md`. `MADEIRA_MOLTENVK_LIBRARY` selects
+its static archive at build time; omitting it keeps the official archive path.
