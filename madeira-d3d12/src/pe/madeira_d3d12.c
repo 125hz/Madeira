@@ -16661,6 +16661,44 @@ static void mad_scn_init(void) {
                          "keeps Wine's file calls)\n");
     else d3d12_log("[madeira-d3d12] shader cache: native file access unavailable (%s); Wine's file calls stay in use\n", why);
 }
+/* PIPELINE ARCHIVE (madeira.cfg / a game's config pso-archive = 1;
+ * default 0). Metal's own cache of compiled pipelines can be emptied by iOS
+ * between sessions (logs 2026-10-26: 6,904 of 6,986 pipelines found there in one
+ * session, 19 of the first 500 in the next, which then compiled for minutes at
+ * 420-550 ms each). With the switch on, winemetal keeps the pipelines this game
+ * compiles in Metal binary archives of its own and looks there first
+ * (MadeiraCtl op 11, winemetal in DXMT): a folder per executable in this
+ * build's shader cache directory, so the archives go when a new build prunes it.
+ * A winemetal without op 11 answers 0 and nothing changes. */
+static void mad_pso_archive_init(void) {
+    typedef char *(CDECL *unix_name_fn)(LPCWSTR);
+    unix_name_fn unix_name = NULL;
+    struct mad_sc_hash h = { 0xcbf29ce484222325ull, 0x84222325cbf29ce4ull };
+    WCHAR exe[MAX_PATH], dir[MAX_PATH];
+    struct madeira_ctl_args a;
+    HMODULE k32;
+    char *udir;
+    DWORD n, i;
+    if (mad_cfg_int_pe("pso-archive", 0) <= 0) return;   /* compiled pipelines kept in Metal binary archives of our own (1; 0 = Metal's cache only) */
+    n = GetModuleFileNameW(NULL, exe, MAX_PATH);
+    if (!n || n >= MAX_PATH) return;
+    for (i = 0; i < n; i++) if (exe[i] >= 'A' && exe[i] <= 'Z') exe[i] += 'a' - 'A';
+    mad_sc_feed(&h, exe, n * sizeof(WCHAR));
+    _snwprintf(dir, MAX_PATH, L"%ls\\pso-archive-%016llx", g_sc_dir, (unsigned long long)h.a);
+    CreateDirectoryW(dir, NULL);
+    if ((k32 = GetModuleHandleW(L"kernel32.dll")))
+        unix_name = (unix_name_fn)(void *)GetProcAddress(k32, "wine_get_unix_file_name");
+    if (!unix_name || !(udir = unix_name(dir))) {
+        d3d12_log("[madeira-d3d12] pso-archive: %ls has no unix name; Metal's cache only\n", dir);
+        return;
+    }
+    memset(&a, 0, sizeof a);
+    a.op = 11; a.ptr = (UINT64)(ULONG_PTR)udir;
+    MadeiraCtl(&a);
+    HeapFree(GetProcessHeap(), 0, udir);
+    if (a.ret) d3d12_log("[madeira-d3d12] pso-archive: compiled pipelines kept in %ls (madeira.cfg pso-archive)\n", dir);
+    else d3d12_log("[madeira-d3d12] pso-archive: winemetal took no archive directory (no op 11, or remote mode); Metal's cache only\n");
+}
 static int mad_sc_init(void) {
     static SRWLOCK lk = SRWLOCK_INIT;
     if (g_sc_on >= 0) return g_sc_on;
@@ -16722,7 +16760,7 @@ static int mad_sc_init(void) {
         }
         if (on) d3d12_log("[madeira-d3d12] shader cache ON: %ls, identity '%s' (%s; madeira.cfg shader-cache = 0 turns it off)\n", g_sc_dir, g_sc_stamp, g_sc_rt);
         else d3d12_log("[madeira-d3d12] shader cache off\n");
-        if (on) { mad_scn_init(); MemoryBarrier(); }   /* madeira-bcd shader-cache-native: g_scn before g_sc_on */
+        if (on) { mad_scn_init(); mad_pso_archive_init(); MemoryBarrier(); }   /* shader-cache-native: g_scn before g_sc_on */
         g_sc_on = on;
     }
     ReleaseSRWLockExclusive(&lk);

@@ -207,7 +207,10 @@ What the game gets, with `hid`:
   others read as zeros. Sony's libScePad (God of War, other Sony PC ports)
   and SDL's HIDAPI driver see a PS5 pad; DirectInput shows it as Windows does
   (X/Y left stick, Z/Rz right stick, Rx/Ry the triggers, a hat, 15 buttons).
-- Any other pad: a **generic HID gamepad**, pid.codes 1209:4D47, with the
+- Any other pad: stays on **XInput** (`[hid-pad] ... is not a PlayStation pad`),
+  since an XInput game that does not also enumerate DirectInput never sees the
+  generic HID gamepad. `generic` (or `env.MADEIRA_HIDPAD_AUTO_GENERIC = 1` with
+  `hid`) makes it a **generic HID gamepad**, pid.codes 1209:4D47, with the
   object set of the opt-in DirectInput pad below: X/Y and Rx/Ry sticks, Z =
   LT - RT, an 8-way hat, buttons A B X Y LB RB Back Start L3 R3 Guide.
 

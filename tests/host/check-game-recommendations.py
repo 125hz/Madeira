@@ -227,10 +227,12 @@ for ident in ('gta5e-steam', 'gta5e-other', 'rdr2-steam', 'rdr2-other', 'horizon
     assert 'env.MADEIRA_LOCK_ORPHAN = stamped' in presets[ident]['lines'], ident
 # Version 3 of the Steam list (build 514): the VC++ setup's elevated engine is not started, as for RDR2.
 # Version 4 / 3 (2026-10-26): new pipelines are built off the render thread (pso-async).
-assert presets['gta5e-steam']['version'] == 4 and presets['gta5e-other']['version'] == 3, \
+# Version 5 / 4: compiled pipelines kept in archives of our own (pso-archive).
+assert presets['gta5e-steam']['version'] == 5 and presets['gta5e-other']['version'] == 4, \
     (presets['gta5e-steam']['version'], presets['gta5e-other']['version'])
 for ident in ('gta5e-steam', 'gta5e-other'):
     assert 'pso-async = 1' in presets[ident]['lines'], ident
+    assert 'pso-archive = 1' in presets[ident]['lines'], ident
 for ident in ('rdr2-steam', 'rdr2-other', 'gta5e-steam'):
     assert 'env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;.be\\vc_redist' in presets[ident]['lines'], ident
 assert 'resolution: "1280x720"' in presets['ghost-of-tsushima']['switches'] and 'avx: true' in presets['ghost-of-tsushima']['switches']

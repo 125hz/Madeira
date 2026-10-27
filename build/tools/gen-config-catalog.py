@@ -602,8 +602,8 @@ OVERLAY = {
     # ml2100: the HID controller (build/wineserver/hidpad_ios.c, docs/CONTROLLERS.md).
     "env.MADEIRA_PAD_MODE": {"category": "Controllers", "title": "Controller API (player 1)", "kind": "choice",
                 "note": "XInput (default): every controller is an Xbox pad. hid: player 1 becomes a HID game controller, "
-                        "a DualSense (054C:0CE6) when it is a PlayStation pad, else a generic HID gamepad, and leaves "
-                        "XInput. dualsense/generic force the identity. Read at session start; the game's own file wins.",
+                        "a DualSense (054C:0CE6) when it is a PlayStation pad, and leaves XInput; any other pad stays "
+                        "on XInput. dualsense/generic force the identity. Read at session start; the game's own file wins.",
                 "choices": [("", "XInput (default)"), ("hid", "DirectInput / HID"), ("dualsense", "HID, always a DualSense"),
                             ("generic", "HID, always a generic gamepad")],
                 "sources": ["app/Madeira/GamepadInput.swift"]},
@@ -617,6 +617,16 @@ OVERLAY = {
                 "note": "1: with the HID controller on, player 1 also stays an XInput pad. Off by default, so a game "
                         "that reads both APIs does not see the same pad twice.",
                 "sources": ["app/Madeira/GamepadInput.swift"]},
+    "env.MADEIRA_HIDPAD_AUTO_GENERIC": {"category": "Controllers", "title": "HID mode: other pads as a generic HID gamepad",
+                "kind": "bool", "default": "0",
+                "note": "1: with env.MADEIRA_PAD_MODE = hid, a pad that is not a PlayStation one becomes a generic HID "
+                        "gamepad and leaves XInput (the old behaviour). Off: it stays on XInput.",
+                "sources": ["app/Madeira/GamepadInput.swift"]},
+    "env.MADEIRA_X18_TRAMP_ALIGN": {"category": "Memory & JIT pool", "title": "x18 trampolines on their own page",
+                "kind": "bool", "default": "1",
+                "note": "1 (default): an image whose .data was shifted to a 16 KB page gets its x18 trampolines on the "
+                        "page after it, not on its last .data page (mapped without exec). 0: the old offsets.",
+                "sources": ["build/ntdll-unix/virtual_ios.c"]},
     # ml2106: game output to the physical pad (app/Madeira/PadOutput.m).
     "env.MADEIRA_PAD_OUTPUT": {"category": "Controllers", "title": "Rumble, adaptive triggers and lightbar to the pad",
                 "kind": "choice",

@@ -116,6 +116,16 @@ final class GamepadInput: @unchecked Sendable {
         // Player 1 is the first paired extended gamepad, as refreshControllers assigns slots.
         let first = GCController.controllers().first { $0.extendedGamepad != nil }
         let sony = first?.extendedGamepad is GCDualSenseGamepad || first?.extendedGamepad is GCDualShockGamepad
+        // "hid" is there for the DualSense identity. Any other pad became a generic HID
+        // gamepad off XInput, which an XInput game sees only if it also enumerates
+        // DirectInput (logs 2026-10-26 23:33/23:36: a GameSir pad, no controller in game
+        // in two of three runs). Such a pad stays on XInput; "generic" still forces it.
+        if mode.value == "hid", first != nil, !sony, !Self.optIn("MADEIRA_HIDPAD_AUTO_GENERIC") {
+            LogStore.shared.log("[hid-pad] ml2100 session mode=hid source=\(mode.source) pad=\(first?.productCategory ?? "none") "
+                                + "is not a PlayStation pad: XInput (env.MADEIRA_HIDPAD_AUTO_GENERIC=1 makes it a generic HID gamepad)")
+            beginPadOutput(xinput: output.xinput, hid: false, value: output.value)
+            return
+        }
         let kind: String
         switch mode.value {
         case "dualsense", "generic": kind = mode.value

@@ -287,9 +287,12 @@ enum GameRecommendations {
     /// install's VC++ setup may not start its elevated engine, as for RDR2
     /// (with the line GTA's installs passed, 13:08). Version 4 (2026-10-26): new
     /// pipelines are built off the render thread (pso-async); 252 of them held it
-    /// for 12 s in two minutes of driving and the game fell to 3-15 FPS.
+    /// for 12 s in two minutes of driving and the game fell to 3-15 FPS. Version 5
+    /// (2026-10-26 late): compiled pipelines kept in archives of our own (pso-archive):
+    /// Metal's cache had 6,904 of 6,986 in one session and 19 of the first 500 in the
+    /// next, which froze for seconds at a time while they compiled again.
     static let gta5EnhancedSteam = GameRecommendation(
-        id: "gta5e-steam", title: "GTA V Enhanced (Steam)", version: 4,
+        id: "gta5e-steam", title: "GTA V Enhanced (Steam)", version: 5,
         config: """
         # Madeira's recommended settings for GTA V Enhanced (Steam).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -306,6 +309,7 @@ enum GameRecommendations {
         swap-mb = 3072
         pso-warm = 2
         pso-async = 1
+        pso-archive = 1
         env.FEX_VECTORTSOENABLED = 0
         env.MADEIRA_CHILD_ARGS = PlayGTAV.exe -nobattleye
         env.MADEIRA_DOCK_GAME_SCM = 1
@@ -497,9 +501,9 @@ enum GameRecommendations {
     /// library (Rockstar Games Launcher or another store; build 451). Version 2:
     /// the same orphan-lock reaper mode as the Steam copy (its launcher and
     /// Social Club too). Version 3: pipelines built off the render thread, as
-    /// for the Steam copy.
+    /// for the Steam copy. Version 4: the pipeline archive, as for the Steam copy.
     static let gta5EnhancedOther = GameRecommendation(
-        id: "gta5e-other", title: "GTA V Enhanced (outside Steam)", version: 3,
+        id: "gta5e-other", title: "GTA V Enhanced (outside Steam)", version: 4,
         config: """
         # Madeira's recommended settings for GTA V Enhanced outside Steam (Rockstar Games Launcher or another store).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -512,6 +516,7 @@ enum GameRecommendations {
         d3d12-msaa8 = 1
         pool-split = 1
         pso-async = 1
+        pso-archive = 1
         env.MADEIRA_KMT_ADAPTER = 1
         env.MADEIRA_LOCK_ORPHAN = stamped
         env.MADEIRA_PAD_MODE = hid
