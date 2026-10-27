@@ -84,7 +84,13 @@ GAME_MODULES="msvcr70 msvcr71 msvcr80 msvcr90 msvcr100 msvcrt20 msvcrt40 msvcirt
     xapofx1_1 xapofx1_2 xapofx1_3 xapofx1_4
     d2d1 wmvcore winegstreamer netprofm"
 # shellcheck disable=SC2086 # the list is split on purpose
-[ $# -gt 0 ] || set -- cryptsp d3dx11_43 msvcp110 msvcr110 xaudio2_7 $GAME_MODULES
+#   tbs                     Unreal Engine shipping executables import it statically
+#   wintypes                Unity IL2CPP GameAssembly.dll imports api-ms-win-core-winrt-robuffer-l1-1-0
+#   wmadmod                 XAudio2's xWMA voices decode through the WMA decoder DMO (docs/MEDIA.md)
+#   build/wine-pe/farm-modules.txt   other stock modules the farm ships for programs that import them
+# shellcheck disable=SC2086,SC2046 # the lists are split on purpose
+[ $# -gt 0 ] || set -- cryptsp d3dx11_43 msvcp110 msvcr110 xaudio2_7 tbs wintypes wmadmod $GAME_MODULES \
+    $(grep -v '^#' "$R/build/wine-pe/farm-modules.txt")
 [ -x "$STRIP" ] || { echo "llvm-mingw not found at $TC (docs/BUILDING.md)" >&2; exit 1; }
 
 targets=()
