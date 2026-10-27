@@ -99,6 +99,15 @@ library session. The sheet has:
    script has programs to run (see below): "Run at next start" or "Skip".
    A game starts at "Run at next start"; a start that runs its programs
    turns it to "Skip".
+6. **Steam starts.** "Steam's choice", or a program in the game's folder.
+   Madeira can start only one 32-bit program per session, so a game whose
+   32-bit launcher starts the game (Fallout: New Vegas) ends the session at
+   the launcher's Play. With a program chosen, the next Dock start, while no
+   session runs, keeps the program Steam's launch entry names beside it as
+   `<name>.madeira-launcher` and copies the chosen program in its place, so
+   Valve's client still starts the game and checks ownership. "Steam's
+   choice" puts the kept launcher back at the next start. Log lines:
+   `[dock-start-program]`.
 
 Tap a game. Dock is started with Steam's default launch option only; custom
 arguments are not supported.
@@ -538,6 +547,10 @@ credentials:
   switch), `madsync_enabled()` with the production `madeira_cfg.h`, and,
   where Windows `cmd.exe` is reachable, the batch run for real with stand-in
   installers and the staged `dockhost.exe --start-services`.
+- `check-dock-start-program.py`: "Steam starts" is applied before the
+  session with Steam's launch entry, Game details offers it, the file is in
+  the Xcode project, and (with Swift) the swap, the restore and refused paths
+  outside the game's folder.
 - `build/madeira-dock/build.sh --check`: Dock's own ASan/UBSan unit tests
   (transfer parsing, 2,000 malformed inputs, client selection, launch-result
   and callback bounds).
@@ -548,3 +561,20 @@ credentials:
   ASan/UBSan and ThreadSanitizer (top-level windows only, one path lookup per
   process, frames and swapchains, capacity, the born-minimized restore and its
   switch), the driver's path form, and the wiring and glyph row.
+
+## Launch arguments and ownership timing
+
+Game details passes the saved game arguments through
+`MADEIRA_STEAM_HOST_ARGUMENTS`. Dock appends them to the selected Steam launch
+option. Both the app and the host reject unbalanced unescaped quotes, control
+characters other than tabs, more than 64 arguments, and commands of 4096 bytes
+or more. Invalid arguments stop the host with code 54. Code 50 remains the
+offline sign-in result. Argument values do not appear in the host report.
+
+The host waits 500 ms after ownership setup by default. The developer override
+`MADEIRA_DOCK_LICENCE_WAIT_MS` accepts decimal values from 0 to
+30000. Invalid values keep the default. This changes timing only. Valve's
+client still checks the account and the game license.
+
+Rebuild the Dock host with these source changes. The source tests and the
+Windows cross-build do not establish Steam startup or gameplay on a device.

@@ -10,12 +10,13 @@
 //
 
 import Foundation
+import Metal
 
 /// What a launch exports on top of the exe, its arguments and its screen.
 enum BCDLaunch {
     /// The switches every launch of a game applies. Everything is set or unset, so a
     /// previous launch's choice never leaks into this one.
-    static func applyExtras(avx: Bool, wineVCRT: Bool, nvidia: Bool, profile: GameProfile?) {
+    static func applyExtras(avx: Bool, wineVCRT: Bool, nvidia: Bool, olderNvidia: Bool = false, profile: GameProfile?) {
         if avx { setenv("MADEIRA_FEX_AVX", "1", 1) } else { unsetenv("MADEIRA_FEX_AVX") }
         if wineVCRT { setenv("MADEIRA_WINE_VCRT", "1", 1) } else { unsetenv("MADEIRA_WINE_VCRT") }
         var dxmtExtra: [String] = []
@@ -39,6 +40,8 @@ enum BCDLaunch {
             unsetenv("DXMT_WSI_MONITOR_IDENTITY")
             unsetenv("DXMT_WSI_MODE_TABLE")
         }
+        // "Older NVIDIA card (Direct3D 9)": after the NVIDIA ids, so its D3D9 ids win.
+        if olderNvidia { dxmtExtra += D3D9Identity.olderNvidia.options }
         // The game's own settings (GameProfiles.swift).
         if let p = profile, p.hasSettings, let u = p.url {
             setenv("MADEIRA_CFG_GAME", u.path, 1)
@@ -58,11 +61,84 @@ enum BCDLaunch {
         }
         let path = entry.windowsPath
         let profile = GameProfile(windowsPath: path)
+        let olderNvidia = LibraryPrefs.olderNvidia(path)
         applyExtras(avx: LibraryPrefs.avx(path), wineVCRT: LibraryPrefs.wineVCRT(path),
-                    nvidia: LibraryPrefs.nvidia(path), profile: profile)
+                    nvidia: LibraryPrefs.nvidia(path), olderNvidia: olderNvidia, profile: profile)
+        if let appID = entry.steamAppID { D3D9Identity.syncGamePrefs(appID: appID, olderNvidia: olderNvidia) }
         let program = path.split(separator: "\\").last.map(String.init) ?? path
         LogStore.shared.log("[bcd] library launch \(program): avx=\(LibraryPrefs.avx(path) ? 1 : 0) "
                             + "wine-vcrt=\(LibraryPrefs.wineVCRT(path) ? 1 : 0) nvidia=\(LibraryPrefs.nvidia(path) ? 1 : 0) "
+                            + "older-nvidia=\(olderNvidia ? 1 : 0) "
                             + "game-config=\(profile.hasSettings ? 1 : 0)")
+    }
+}
+
+/// "Older NVIDIA card (Direct3D 9)" (Game details › Compatibility): Direct3D 9
+/// names a GeForce 7900 GS with NVIDIA's driver file, as the d3d9.dll wrapper
+/// New Vegas players install does. Fallout 3 and New Vegas pick their render
+/// path from the card's name and the driver: with Madeira's own ("Apple ...",
+/// "DXMT (Metal)") they take the basic one (Shader Package 2), and New Vegas
+/// crashes loading a save at 00B57AA9 right after building faces; the
+/// wrapper's identity gives NVIDIA's (Shader Package 13). The ids alone did not
+/// help (2026-10-26 logs): the driver name is the part that counts
+/// (d3d9.customDriver, willfaust/dxmt d3d9_interface.cpp).
+enum D3D9Identity {
+    static let olderNvidiaName = "NVIDIA GeForce 7900 GS"
+
+    struct Card { let options: [String] }
+    static let olderNvidia = Card(options: [
+        "d3d9.customVendorId=10de", "d3d9.customDeviceId=0292",
+        "d3d9.customDeviceDesc=\"\(olderNvidiaName)\"", "d3d9.customDriver=nv4_disp.dll",
+    ])
+
+    /// Games that keep the card's name in their prefs (sD3DDevice) and open their
+    /// launcher when it changes: a second 32-bit program, which ends the session.
+    /// App ID -> the file under Documents/My Games.
+    static let prefsFiles: [Int: String] = [
+        22380: "FalloutNV/FalloutPrefs.ini",                                   // Fallout: New Vegas
+        22300: "Fallout3/FalloutPrefs.ini", 22370: "Fallout3/FalloutPrefs.ini", // Fallout 3, GOTY
+    ]
+
+    /// Keeps the game's sD3DDevice on the card it will see, before a launch (no session runs).
+    static func syncGamePrefs(appID: Int, olderNvidia: Bool) {
+        guard let relative = prefsFiles[appID] else { return }
+        let users = LibraryModel.drive.appendingPathComponent("users", isDirectory: true)
+        let metalName = MTLCreateSystemDefaultDevice()?.name
+        for user in (try? FileManager.default.contentsOfDirectory(atPath: users.path)) ?? [] {
+            let file = users.appendingPathComponent(user).appendingPathComponent("Documents/My Games/" + relative)
+            guard let data = try? Data(contentsOf: file) else { continue }
+            let utf8 = String(data: data, encoding: .utf8)
+            guard let text = utf8 ?? String(data: data, encoding: .isoLatin1),
+                  let updated = prefsText(text, olderNvidia: olderNvidia, metalName: metalName),
+                  let out = updated.data(using: utf8 != nil ? .utf8 : .isoLatin1) else { continue }
+            do {
+                try out.write(to: file, options: .atomic)
+                LogStore.shared.log("[d3d9-identity] app=\(appID) \(relative): sD3DDevice set to the card the game sees")
+            } catch {
+                LogStore.shared.log("[d3d9-identity] app=\(appID) \(relative): not written: \(error.localizedDescription)", level: .error)
+            }
+        }
+    }
+
+    /// The prefs with sD3DDevice naming the card the game will see, or nil when nothing
+    /// changes. Switching off puts back the Metal name only over the name this setting
+    /// wrote, never over a name the game or the user chose.
+    static func prefsText(_ text: String, olderNvidia: Bool, metalName: String?) -> String? {
+        var lines = text.components(separatedBy: "\n")
+        var changed = false
+        for (i, raw) in lines.enumerated() {
+            let cr = raw.hasSuffix("\r")
+            let line = cr ? String(raw.dropLast()) : raw
+            guard line.lowercased().hasPrefix("sd3ddevice=") else { continue }
+            let key = line.prefix { $0 != "=" }
+            let current = line.dropFirst(key.count + 1).trimmingCharacters(in: CharacterSet(charactersIn: "\" \t"))
+            let wanted: String?
+            if olderNvidia { wanted = current == olderNvidiaName ? nil : olderNvidiaName }
+            else { wanted = current == olderNvidiaName ? metalName : nil }
+            guard let wanted else { continue }
+            lines[i] = "\(key)=\"\(wanted)\"" + (cr ? "\r" : "")
+            changed = true
+        }
+        return changed ? lines.joined(separator: "\n") : nil
     }
 }

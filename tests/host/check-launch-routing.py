@@ -22,13 +22,9 @@ def function(source, start):
 
 # ---- Part A: the launch function
 thread = function(src, "static void *wine_process_thread(void *arg) {")
-upstream_ec = """BOOL use_arm64ec = (force_ec && *force_ec == '1') ||
-                           (strstr(madeira_exe, "x64") != NULL) ||
-                           (strchr(madeira_exe, '\\\\') != NULL);"""
-assert upstream_ec in thread, "the session-core heuristic is upstream's, verbatim"
-assigns = re.findall(r"use_arm64ec\s*=[^=][^;]*;", thread)
-assert assigns[1:] == ["use_arm64ec = NO;"], assigns
-assert "if (is_i386_target) use_arm64ec = NO;" in thread, "only an i386 target changes the core"
+assert "const BOOL use_arm64ec = madeira_use_arm64ec_for_target(madeira_exe, force_ec," in thread
+assert "target_machine, has_i386_set);" in thread
+assert "use_arm64ec = NO;" not in thread
 assert "const BOOL is_i386_target = has_i386_set && target_machine == MADEIRA_IMAGE_FILE_MACHINE_I386;" in thread
 farm = thread[thread.index("if (has_i386_set) {"):]
 farm = farm[:farm.index("/* ml719: REPAIR THE SHELL FOLDERS.")]
@@ -86,7 +82,7 @@ int main(int argc, char **argv)
     assert(madeira_target_machine("D:\\app32.exe", prefix, bundle) == 0);
     assert(madeira_target_machine("\\Program Files\\App Dir\\app32.exe", prefix, bundle) == 0);
     /* bare names: a name in a 64-bit farm is 64-bit even if i386-windows has it too */
-    assert(madeira_target_machine("both.exe", prefix, bundle) == 0);
+    assert(madeira_target_machine("both.exe", prefix, bundle) == 0xaa64);
     assert(madeira_target_machine("only32.exe", prefix, bundle) == 0x14c);
     assert(madeira_target_machine("nowhere.exe", prefix, bundle) == 0);
     puts("probe ok");

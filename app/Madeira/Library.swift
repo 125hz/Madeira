@@ -190,8 +190,8 @@ struct LibraryEntry: Codable, Identifiable {
     var display: String?
     /// FPS limit: 1 = 60, 3 = 30, 4 = 40, 0 = display maximum, 2 = uncapped (madeira_set_vsync_locked).
     var fpsMode = 1
-    /// FEX's X87ReducedPrecision for this game. Off by default, as in FEX; only
-    /// an explicit choice exports FEX_X87REDUCEDPRECISION=1.
+    /// FEX's X87ReducedPrecision for this game. Export both states explicitly:
+    /// FEX defaults to reduced precision when no override is set.
     var reducedX87 = false
     var liveLogs = false
     var performance = false
@@ -462,15 +462,9 @@ struct LibraryEntry: Codable, Identifiable {
               launchWindowsPath.utf8.count < 1024, (steamWorkingWindowsPath?.utf8.count ?? 0) < 512 else {
             throw LibraryError.message("The saved launch profile contains invalid display or argument values.")
         }
-        var quoted = false, inToken = false, tokens = 0
-        for character in launchArguments {
-            if character == "\"" { quoted.toggle() }
-            if !quoted && (character == " " || character == "\t") { inToken = false }
-            else if !inToken { tokens += 1; inToken = true }
+        guard LaunchArgumentText.valid(launchArguments) else {
+            throw LibraryError.message("Use balanced double quotes, no control characters, and at most 64 launch arguments in 4 KB.")
         }
-        // WineProcessBridge takes at most 64 arguments in 4 KB.
-        guard launchArguments.utf8.count < 4096 else { throw LibraryError.message("The complete launch command is too long.") }
-        guard !quoted, tokens <= 64 else { throw LibraryError.message("Use balanced double quotes and at most 64 launch arguments in total.") }
         // build/madeira_cfg.h reads at most 64 KB of a file.
         guard (config?.utf8.count ?? 0) < 60_000, config?.contains("\0") != true else {
             throw LibraryError.message("This game's config is too long.")
@@ -507,8 +501,7 @@ struct LibraryEntry: Codable, Identifiable {
     /// Runs on the launch worker, before the JIT pool is taken.
     func applyEnvironment() {
         configureLaunch()
-        // Unset unless chosen: FEX's own default then applies, as for any other launch.
-        if reducedX87 { setenv("FEX_X87REDUCEDPRECISION", "1", 1) } else { unsetenv("FEX_X87REDUCEDPRECISION") }
+        setenv("FEX_X87REDUCEDPRECISION", reducedX87 ? "1" : "0", 1)
         // Exported only when chosen: unset keeps the engine's own default (and any
         // madeira.cfg setting), as before these choices existed.
         // Unset otherwise, so a previous game's choice (a launch that died before the
@@ -585,7 +578,7 @@ struct LibraryEntry: Codable, Identifiable {
         }
         let command = desktop == true ? (exe: "explorer.exe", args: launchArguments) : launchCommand
         setenv("MADEIRA_EXE", command.exe, 1)
-        setenv("MADEIRA_ARGS", command.args, 1)
+        setenv("MADEIRA_ARGS", LaunchArgumentText.plain(command.args), 1)
         // Export both choices: unsetting Directly lets a global env.MADEIRA_DESKTOP=1
         // turn the desktop back on when the bridge applies madeira.cfg.
         setenv("MADEIRA_DESKTOP", desktop == true || runsInDesktop ? "1" : "0", 1)
@@ -3357,7 +3350,7 @@ struct LibraryDetail: View {
     }
     /// The pages the details page links to (iOS Settings style), each with its own Form.
     enum Page: Hashable {
-        case display, controls, launch, compatibility, steam, cloud, library, advanced
+        case display, controls, launch, compatibility, steam, cloud, library, iniFiles, advanced
         var title: String {
             switch self {
             case .display: return "Display"
@@ -3367,6 +3360,7 @@ struct LibraryDetail: View {
             case .steam: return "Steam"
             case .cloud: return "Steam Cloud"
             case .library: return "Library details"
+            case .iniFiles: return "Settings files"
             case .advanced: return "Advanced"
             }
         }
@@ -3379,6 +3373,7 @@ struct LibraryDetail: View {
             case .steam: return "shippingbox"
             case .cloud: return "icloud"
             case .library: return "info.circle"
+            case .iniFiles: return "doc.text"
             case .advanced: return "wrench.and.screwdriver"
             }
         }
@@ -3387,10 +3382,10 @@ struct LibraryDetail: View {
     /// The rows of the details page, in groups. The Desktop entry has no launch options
     /// or library details; a Steam game has its Steam pages.
     private var pageGroups: [[Page]] {
-        let launch = entry.usesLaunchOptions || (entry.desktop != true && entry.steamAppID == nil)
+        let launch = entry.usesLaunchOptions || entry.desktop != true
         let steam: [Page] = entry.steamAppID == nil ? [] : (SteamOwnedLibrary.cloudEnabled ? [.steam, .cloud] : [.steam])
         let tuning: [Page] = launch ? [.display, .controls, .launch, .compatibility] : [.display, .controls, .compatibility]
-        let more: [Page] = entry.desktop == true ? [.advanced] : [.library, .advanced]
+        let more: [Page] = entry.desktop == true ? [.advanced] : [.library, .iniFiles, .advanced]
         return [tuning, steam, more].filter { !$0.isEmpty }
     }
     /// The value a page's row shows, when one setting sums it up.
@@ -3401,6 +3396,9 @@ struct LibraryDetail: View {
         case .launch: return entry.usesLaunchOptions ? (entry.runsInDesktop ? "Wine desktop" : "Directly") : nil
         case .steam: return entry.startsSteamGameDirectly ? "The game" : "Madeira Dock"
         case .advanced: return Self.configSummary(bcd.configText)   // madeira-bcd: the game's own config file
+        case .iniFiles:
+            let count = GameIniFiles.files(entry.windowsPath).count
+            return count == 0 ? nil : count == 1 ? "1 file" : "\(count) files"
         default: return nil
         }
     }
@@ -3415,6 +3413,7 @@ struct LibraryDetail: View {
             case .steam: steamPage
             case .cloud: if let appID = entry.steamAppID { SteamCloudSection(appID: appID) }
             case .library: libraryPage
+            case .iniFiles: GameIniFilesSection(windowsPath: entry.windowsPath, gameFolder: iniGameFolder)
             case .advanced: advancedPage
             }
         }
@@ -3522,18 +3521,18 @@ struct LibraryDetail: View {
             }
         }
         // A Steam game starts with Steam's own launch option through Madeira Dock.
-        if entry.desktop != true && entry.steamAppID == nil {
+        if entry.desktop != true {
             Section {
-                TextField("Launch arguments", text: $entry.arguments, axis: .vertical)
+                TextField("Launch arguments", text: $entry.arguments.plainLaunchArguments, axis: .vertical)
                     .font(.body.monospaced()).lineLimit(1...4)
-                    .autocorrectionDisabled().textInputAutocapitalization(.never)
+                    .autocorrectionDisabled().textInputAutocapitalization(.never).smartPunctuationOff()
                 LaunchFlagChips(arguments: $entry.arguments)
                 // What the next start runs (ml1163: in the Wine desktop, a batch file or
                 // the services batch, what starts the program).
                 Text(entry.commandPreview)
                     .font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
             } header: { Text("Launch arguments") } footer: {
-                Text("Passed on every start. Above: the full command.")
+                Text(entry.steamAppID == nil ? "Passed on every start. Above: the full command." : "Steam adds these to the selected launch option on every start.")
             }
         }
     }
@@ -3557,6 +3556,9 @@ struct LibraryDetail: View {
             }
             Toggle(isOn: Binding(get: { bcd.nvidia }, set: { on in bcd.nvidia = on; LibraryPrefs.setNvidia(on, for: entry.windowsPath) })) {
                 compatLabel("Report an NVIDIA GPU", "For \"no graphics card\" errors")
+            }
+            Toggle(isOn: Binding(get: { bcd.olderNvidia }, set: { on in bcd.olderNvidia = on; LibraryPrefs.setOlderNvidia(on, for: entry.windowsPath) })) {
+                compatLabel("Older NVIDIA card (Direct3D 9)", "For older games that crash with this GPU, like Fallout 3 and New Vegas")
             }
             Toggle(isOn: Binding(get: { bcd.wineVCRT }, set: { on in bcd.wineVCRT = on; LibraryPrefs.setWineVCRT(on, for: entry.windowsPath) })) {
                 compatLabel("Wine's C++ runtime", "Instead of the game's msvcp/vcruntime")
@@ -3623,6 +3625,13 @@ struct LibraryDetail: View {
             Section { Button("Remove from library", role: .destructive) { remove = true } }
         }
         if let error { Section { Text(error).foregroundStyle(.red) } }
+    }
+
+    /// The game's folder under drive_c, where Settings files looks for .ini files.
+    private var iniGameFolder: String {
+        var isDirectory: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: LibraryModel.drive.appendingPathComponent(entry.relativePath).path, isDirectory: &isDirectory)
+        return GameIniFiles.gameFolder(relativePath: entry.relativePath, isDirectory: exists && isDirectory.boolValue)
     }
 
     @ViewBuilder private var advancedPage: some View {
@@ -3773,12 +3782,13 @@ struct LibraryDetail: View {
 /// madeira-bcd: a game's own options as the fork stores them (LibraryDetail):
 /// LibraryPrefs' switches and the GameProfiles.swift file's lines.
 struct BCDGameValues {
-    var avx = false, nvidia = false, wineVCRT = false
+    var avx = false, nvidia = false, olderNvidia = false, wineVCRT = false
     var configText = ""
     init() {}
     init(windowsPath: String) {
         avx = LibraryPrefs.avx(windowsPath)
         nvidia = LibraryPrefs.nvidia(windowsPath)
+        olderNvidia = LibraryPrefs.olderNvidia(windowsPath)
         wineVCRT = LibraryPrefs.wineVCRT(windowsPath)
         configText = GameProfile(windowsPath: windowsPath).text
     }
@@ -5455,5 +5465,80 @@ private struct LaunchFloodShape: Shape {
             if !model.startingScreen && model.current == nil && model.startingJIT == nil && t > 2.5 { retract(); return }
             if t > 4 { handOff(to: .zero, style: CoverStyle(corner: 14, shadowOpacity: 0, shadowRadius: 0, shadowOffset: .zero), landed: {}); return }
         }
+    }
+}
+
+// MARK: - Launch arguments are command lines, not prose
+
+/// iOS Smart Punctuation turns `--` into an em dash and straight quotes into
+/// curly ones, which breaks flags such as `--rendering-driver opengl3` and
+/// quoted paths.
+enum LaunchArgumentText {
+    static func valid(_ text: String) -> Bool {
+        guard text.utf8.count < 4096 else { return false }
+        var quoted = false, inToken = false, tokens = 0, slashes = 0
+        for byte in text.utf8 {
+            if (byte < 32 && byte != 9) || byte == 127 { return false }
+            if byte == 34 && slashes % 2 == 0 { quoted.toggle() }
+            if !quoted && (byte == 32 || byte == 9) { inToken = false }
+            else if !inToken { tokens += 1; inToken = true }
+            slashes = byte == 92 ? slashes + 1 : 0
+        }
+        return !quoted && tokens <= 64
+    }
+
+    static func plain(_ s: String) -> String {
+        var out = s
+        for (from, to) in [("\u{2014}", "--"), ("\u{2013}", "--"), ("\u{2212}", "-"),
+                           ("\u{201C}", "\""), ("\u{201D}", "\""), ("\u{201E}", "\""),
+                           ("\u{2018}", "'"), ("\u{2019}", "'")] {
+            out = out.replacingOccurrences(of: from, with: to)
+        }
+        return out
+    }
+}
+
+extension Binding where Value == String {
+    var plainLaunchArguments: Binding<String> {
+        Binding(get: { LaunchArgumentText.plain(wrappedValue) },
+                set: { wrappedValue = LaunchArgumentText.plain($0) })
+    }
+}
+
+/// Finds the UIKit text view behind a SwiftUI TextField and turns off smart
+/// dashes and quotes on it (SwiftUI has no modifier for these traits).
+private struct SmartPunctuationOff: UIViewRepresentable {
+    final class Probe: UIView {
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            DispatchQueue.main.async { [weak self] in self?.apply() }
+        }
+        func apply() {
+            var node: UIView? = superview
+            for _ in 0..<4 {
+                guard let n = node else { break }
+                if Self.disable(in: n) { return }
+                node = n.superview
+            }
+        }
+        static func disable(in view: UIView) -> Bool {
+            if let t = view as? UITextView {
+                t.smartDashesType = .no; t.smartQuotesType = .no; t.smartInsertDeleteType = .no
+                return true
+            }
+            if let t = view as? UITextField {
+                t.smartDashesType = .no; t.smartQuotesType = .no; t.smartInsertDeleteType = .no
+                return true
+            }
+            return view.subviews.contains { disable(in: $0) }
+        }
+    }
+    func makeUIView(context: Context) -> Probe { let p = Probe(); p.isUserInteractionEnabled = false; return p }
+    func updateUIView(_ uiView: Probe, context: Context) { DispatchQueue.main.async { uiView.apply() } }
+}
+
+extension View {
+    func smartPunctuationOff() -> some View {
+        background(SmartPunctuationOff().frame(width: 0, height: 0))
     }
 }
