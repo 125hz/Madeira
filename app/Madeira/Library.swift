@@ -586,7 +586,9 @@ struct LibraryEntry: Codable, Identifiable {
         let command = desktop == true ? (exe: "explorer.exe", args: launchArguments) : launchCommand
         setenv("MADEIRA_EXE", command.exe, 1)
         setenv("MADEIRA_ARGS", command.args, 1)
-        if desktop == true || runsInDesktop { setenv("MADEIRA_DESKTOP", "1", 1) } else { unsetenv("MADEIRA_DESKTOP") }
+        // Export both choices: unsetting Directly lets a global env.MADEIRA_DESKTOP=1
+        // turn the desktop back on when the bridge applies madeira.cfg.
+        setenv("MADEIRA_DESKTOP", desktop == true || runsInDesktop ? "1" : "0", 1)
         if startsSteamGameDirectly, let steamAppID {
             // The game's own Steam identity (SteamAppId, SteamGameId, SteamAppPath = its install
             // folder) instead of the bridge's fixed one.
@@ -730,6 +732,16 @@ final class LibraryModel: ObservableObject {
     @Published var error: String? { didSet { if error != nil { preparing = nil } } }
     @Published var sessionMessage = ""
     private var smallPoolNoted = false
+    /// Quit game was asked for and the program is still running after `forceCloseAfter`
+    /// seconds: a frozen program never handles Alt+F4, so the menu offers to close Madeira.
+    @Published var forceCloseOffered = false
+    static let forceCloseAfter: TimeInterval = 10
+    /// A Dock session whose game ended: Madeira Dock shut Valve's client down, and
+    /// explorer's desktop is asked to close so the session returns to the library.
+    /// Close Madeira is offered if the session is still up `forceCloseAfter` seconds later.
+    @Published var dockGameEnded = false
+    private var dockGameEndedAt: Date?
+    private var quitRequestedAt: Date?
     @Published var launching = false
     @Published var overlayFields = ["FPS", "Frame time", "RAM", "Battery"]
     private var launchPresent: UInt64 = 0
@@ -1209,6 +1221,7 @@ final class LibraryModel: ObservableObject {
         wine_exit_status_reset()
         JITPoolMeter.reset(); smallPoolNoted = false
         quitRequested = false
+ quitRequestedAt = nil; forceCloseOffered = false; dockGameEnded = false; dockGameEndedAt = nil
         LibraryController.shared.configure(enabled: enabled, ownsInput: false)
         Self.sessionsThisRun += 1
         launchPresent = madeira_get_present_count(); launchStarted = Date(); launchSlow = false; launchLogs = entry.liveLogs
@@ -1286,6 +1299,24 @@ final class LibraryModel: ObservableObject {
             sawProcess = true
             if sessionMessage == "Starting…" { sessionMessage = "" }
         } else if sawProcess && wineserver_is_running() == 0 { finish() }
+        if current != nil, !forceCloseOffered, let asked = quitRequestedAt,
+           Date().timeIntervalSince(asked) > Self.forceCloseAfter {
+            forceCloseOffered = true
+            sessionMessage = "The game did not close. Open the menu to force-close Madeira."
+            fputs("[frontend] still running \(Int(Self.forceCloseAfter)) s after the close request; force close offered\n", stderr)
+        }
+        if current != nil, dockGameEndedAt == nil, !launching, DockStartScreen.shared.active,
+           MainActor.assumeIsolated({ MadeiraDock.pollReport().result }) == 0 {
+            dockGameEndedAt = Date()
+            sessionMessage = "The game has closed. Returning to the library…"
+            winios_close_desktop()
+            fputs("[frontend] the Dock game ended and Steam shut down; closing the desktop\n", stderr)
+        }
+        if current != nil, !dockGameEnded, let ended = dockGameEndedAt, Date().timeIntervalSince(ended) > Self.forceCloseAfter {
+            dockGameEnded = true; forceCloseOffered = true; menu = true
+            sessionMessage = "The game has closed."
+            fputs("[frontend] the desktop is still up \(Int(Self.forceCloseAfter)) s after the Dock game ended; Close Madeira offered\n", stderr)
+        }
         // The first frame gives Aspect and Fill height the drawable's shape.
         if current != nil, !laidOutAfterFirstPresent, madeira_get_present_count() != MetalBackedView.presentCountAtLaunch {
             laidOutAfterFirstPresent = true
@@ -1355,6 +1386,7 @@ final class LibraryModel: ObservableObject {
     func requestQuit() {
         LibraryKeyboard.hide()
         quitRequested = true
+        if quitRequestedAt == nil { quitRequestedAt = Date() }
         // Ask the application to close (Alt+F4) through the normal input queue,
         // so it can save; the surface stays up until the native session ends.
         winios_post_key(0x12, 1); winios_post_key(0x73, 1)
@@ -1397,6 +1429,7 @@ final class LibraryModel: ObservableObject {
         GestureZonesModel.shared.selected = nil; GestureZonesModel.shared.zones = savedZones
         if ControlPresetsModel.enabled { controls.layoutID = savedLayout }
         current = nil; activeEntry = nil; menu = false; sessionMessage = ""
+        quitRequestedAt = nil; forceCloseOffered = false; dockGameEnded = false; dockGameEndedAt = nil
         displayMode = .fit
         LogStore.shared.setDisplayActive(true)
         launching = false; launchLogs = false; LibraryKeyboard.hide()
@@ -4851,6 +4884,25 @@ struct LibraryHUD: View {
                     Label("Quit game", systemImage: "stop.circle").foregroundStyle(.red)
                 }.tint(.red)
                 Text("Closes the running session. Unsaved progress will be lost.").font(.caption).foregroundStyle(.secondary)
+                if model.dockGameEnded {
+                    Button {
+                        LogStore.shared.log("[frontend] closing Madeira after the Dock game ended")
+                        exit(0)
+                    } label: {
+                        Label("Close Madeira", systemImage: "checkmark.circle")
+                    }
+                    Text("The game and Steam have closed, and Steam has saved. Madeira runs one game each time it is opened: open it again to play.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else if model.forceCloseOffered {
+                    Button(role: .destructive) {
+                        LogStore.shared.log("[frontend] force close: the program ignored the close request; closing Madeira", level: .error)
+                        exit(0)
+                    } label: {
+                        Label("Force close Madeira", systemImage: "xmark.octagon").foregroundStyle(.red)
+                    }.tint(.red)
+                    Text("The game did not respond to Quit game. This closes Madeira at once: unsaved progress, and settings the game changed in this session, are lost.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }.frame(maxWidth: .infinity, alignment: .leading).padding(22)
                 .foregroundStyle(.primary)
         }

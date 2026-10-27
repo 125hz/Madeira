@@ -22,6 +22,9 @@
 
 /* ---- win32u side: wine threads ---- */
 
+/* Default-on mouse-routing rollback switch, resolved by HardwareInput. */
+int winios_mouse_routing_enabled(void);
+
 /* Nonzero once the app has enabled the direct-mode cursor. */
 int winios_direct_cursor_wanted(void);
 /* A new cursor image: straight-alpha BGRA, w*h*4 bytes, copied before return. */
