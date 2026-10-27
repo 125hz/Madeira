@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 HERE="$ROOT/build/vulkan-ios"
 MVK="$ROOT/toolchains/moltenvk/MoltenVK"
 OBJ="$HERE/obj"
-LIB="$MVK/static/MoltenVK.xcframework/ios-arm64/libMoltenVK.a"
+LIB="${MADEIRA_MOLTENVK_LIBRARY:-$MVK/static/MoltenVK.xcframework/ios-arm64/libMoltenVK.a}"
 [ -f "$LIB" ] || { echo "Missing pinned MoltenVK: run bash build/vulkan-ios/fetch.sh" >&2; exit 1; }
 [ -f "$MVK/include/vulkan/vulkan.h" ] || { echo "Missing pinned Vulkan headers" >&2; exit 1; }
 mkdir -p "$OBJ"
