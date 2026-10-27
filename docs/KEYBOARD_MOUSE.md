@@ -202,11 +202,23 @@ that iPadOS granted it. A request alone is not proof of containment; see
   cursor, when the program loses focus, and when the program stops draining
   the mouse (no report for 2 s while the mouse moves, e.g. it exited).
   `MADEIRA_POINTER_AUTOLOCK=0` turns this off.
+- **Relative pointer mode:** the existing Relative toggle also selects relative
+  hardware mouse motion and automatic lock. It does not need a cursor report
+  from the game. A desktop game that hides its cursor also keeps its automatic
+  lock without fresh reports. Focus loss and manual unlock still release it.
+  Hidden desktop mouse-look does not get an extra absolute cursor move.
 - **By hand:** the lock button in the pointer settings or **Ctrl+Alt+P** on the
   keyboard (P is not sent to the program). Touch keeps working while locked, so
   the button is always a way out. Releasing an automatic lock by hand keeps it
   off until the program's cursor next changes visibility.
 - The lock is released when the mouse disconnects.
+
+Library sessions hide the home indicator on the game and controls windows.
+This is a display preference. Only `actual=1` in the pointer-lock log confirms
+that iPadOS contained the mouse. If it refuses the lock, use Madeira full screen.
+The relative-mode, desktop capture and system-overlay changes are adapted from
+[BCD 0.1.614 by thebcd69](https://github.com/thebcd69/bcd-games/commit/dd2fe9c90dfe9aa5f8b156f89fe1f0073276060b).
+Run `python3 tests/host/check-pointer-capture.py` for the host regression check.
 
 ## Right stick controls mouse
 
