@@ -81,7 +81,7 @@ git-ignored and consumed by the app project.
    bytes. `tests/host/check-mesa-fence-fallback.py` checks the fence patch
    against the built tree. At session start WineProcessBridge.m links these
    DLLs over Wine's opengl32 stub for x64 games (`env.MADEIRA_OPENGL = 0`
-   keeps the stub); without them nothing changes. Verified on the development
+   selects the native WGL route; set env.MADEIRA_OPENGL = 1 for Mesa on D3D12). Without the DLLs nothing changes. Verified on the development
    machine 2026-10-06.
 6. App: `xcodebuild -project app/Madeira.xcodeproj -scheme Madeira -destination 'generic/platform=iOS' -allowProvisioningUpdates build` (Debug is the configuration that runs the games; Release builds have crashed the guest), then zip `Payload/Madeira.app` into an IPA and sideload. Verified this session on the development machine.
 7. WoW64 (32-bit programs, optional): `build/wine-i386/build.sh` (i386 Wine farm
@@ -185,3 +185,9 @@ See `build/vulkan-ios/README.md` for the pinned MoltenVK input, explicit
 and Windows-side enumerate/readback/presentation fixtures. The normal native
 build and app link do not require MoltenVK. Existing prerequisites above still
 apply; this route is not a replacement bootstrap or complete Vulkan support.
+
+The combined graphics source selects native WGL with OpenGL ES or Zink by
+default. `env.MADEIRA_OPENGL = 1` selects the separate Mesa-on-D3D12 Windows
+overlay when its DLLs are built. `vulkan = static` selects the optional static
+MoltenVK backend; the app requires that backend to be linked. The dynamic
+MoltenVK and KosmicKrisp choices share the same retained-layer surface adapter.

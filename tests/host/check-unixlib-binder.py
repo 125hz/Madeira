@@ -77,8 +77,8 @@ branches = [b for b in branches if b is not dns[0]]
 vulkan = [b for b in branches if 'strstr(match, "winevulkan")' in b.split("\n")[0]]
 assert len(vulkan) == 1
 assert 'if (!wow && match &&' in vulkan[0].split("\n")[0]
-assert 'funcs64 = (const void *)madeira_winevulkan_unix_call_funcs;' in vulkan[0]
-assert 'funcs_wow64 =' not in vulkan[0]
+assert 'funcs64 = (const void *)winevulkan_unix_call_funcs;' in vulkan[0]
+assert 'funcs_wow64 = NULL;' in vulkan[0]
 branches.remove(vulkan[0])
 print("PASS: WineVulkan binds only its native 64-bit Unix table; WoW64 is not advertised")
 assert len(branches) == len(upstream) + 1, len(branches)

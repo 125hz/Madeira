@@ -2202,15 +2202,15 @@ static void *wine_process_thread(void *arg) {
              * Metal), with Microsoft's dxil.dll validating the shaders.
              * build/mesa-d3d12/build.sh writes them to x86_64-opengl/; an
              * empty folder changes nothing. Wine's builtin opengl32 here is a
-             * stub whose every call fails, so the overlay is on by default;
-             * env.MADEIRA_OPENGL = 0 keeps the builtin. The loop above has
+             * native WGL route on OpenGL ES or Zink. The alternative overlay
+             * is selected with env.MADEIRA_OPENGL = 1. The loop above has
              * already restored the builtin opengl32 for this session, so off
              * only has to drop the overlay's other files. A game folder that
              * ships its own opengl32.dll still comes first. */
             if (use_arm64ec) {
                 NSString *glSource = [bundlePath stringByAppendingPathComponent:@"x86_64-opengl"];
                 const char *glSwitch = getenv("MADEIRA_OPENGL");
-                const BOOL glOn = !(glSwitch && glSwitch[0] == '0');
+                const BOOL glOn = glSwitch && glSwitch[0] == '1';
                 int glLinked = 0;
                 for (NSString *dll in [fm contentsOfDirectoryAtPath:glSource error:nil]) {
                     if (![[[dll pathExtension] lowercaseString] isEqualToString:@"dll"]) continue;

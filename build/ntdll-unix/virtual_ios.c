@@ -12317,7 +12317,7 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             }
             libname = "win32u (stub table)";
             funcs64 = funcs_wow64 = (const void *)ios_stub_unix_call_table;
-        } else if (match && strstr(match, "winevulkan")) {
+        } else if (!wow && match && strstr(match, "winevulkan")) {
             /* "winevulkan" matches the export name winevulkan.dll and a unix_path
              * of winevulkan.so. No wow64 table: a 32-bit caller is refused. */
             libname = "winevulkan (Vulkan through win32u, MADEIRA_VULKAN_LIBRARY)";

@@ -4384,8 +4384,12 @@ struct GraphicsSettings: View {
     static let hasZink = bundled("gl/libOSMesa.dylib")
     /// KosmicKrisp takes the first Metal 4 device: iOS 26 with an A14 or newer.
     static let metal4: Bool = {
+        #if targetEnvironment(simulator)
+        return false
+        #else
         if #available(iOS 26.0, *) { return MTLCreateSystemDefaultDevice()?.supportsFamily(.metal4) ?? false }
         return false
+        #endif
     }()
 
     /// The stored value, trimmed and lowercased, "" when unset; d3d9 "emulated" is the default.

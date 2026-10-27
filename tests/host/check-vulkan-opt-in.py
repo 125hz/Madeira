@@ -17,10 +17,11 @@ virt=(root/'build/ntdll-unix/virtual_ios.c').read_text()
 chain=function(virt,'static NTSTATUS load_builtin_unixlib(')
 for on in [False,True]:
  code=preprocess(chain,on)
- assert ('madeira_winevulkan_unix_call_funcs' in code)==on
+ assert 'madeira_winevulkan_unix_call_funcs' not in code
+ assert 'winevulkan_unix_call_funcs' in code
  assert ('dxmt_winemetal_unix_call_funcs' in code)
  assert 'dxmt_winemetal_unix_call_wow64_funcs' in code
- if on:assert '!wow && match && strstr(match, "winevulkan")' in code
+ assert '!wow && match && strstr(match, "winevulkan")' in code
  print('PASS binder Vulkan gate',on)
 for name in ['ntdll-unix','win32u-unix']:
  script=(root/'build'/name/'build.sh').read_text()
@@ -45,7 +46,7 @@ for name in vulkan; do
 '''+case+'''\necho /stock/vulkan.c
 done
 '''],env=env,text=True).strip()
- assert result==('/adapter/vulkan_ios.c' if setting=='1' else '/stock/vulkan.c'),result
+ assert result=='/adapter/vulkan_ios.c',result
 print('PASS production per-file selection keeps stock Vulkan source by default')
 driver=function((root/'build/win32u-unix/driver_ios.c').read_text(),'static UINT nulldrv_VulkanInit(')
 with tempfile.TemporaryDirectory() as temp:
