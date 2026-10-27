@@ -33405,6 +33405,17 @@ static int ios_query_host_region( char *at, char **hs, char **he, int *prot, int
     return 1;
 }
 
+int ios_addr_max_prot( const void *addr, int *prot )
+{
+    char *start, *end;
+    int current, maximum;
+
+    if (!ios_query_host_region( (char *)addr, &start, &end, &current, &maximum ) ||
+        (uintptr_t)addr < (uintptr_t)start || (uintptr_t)addr >= (uintptr_t)end) return -1;
+    if (prot) *prot = current;
+    return maximum;
+}
+
 /* ml1101b: the JIT pool is ONE opaque block for this purpose.
  *
  * Measured (dsr-log-nearalloc, 29.09): with ml1101 a startup walker that

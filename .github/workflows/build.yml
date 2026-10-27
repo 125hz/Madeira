@@ -33,6 +33,7 @@ jobs:
           python3 tests/host/check-ci-component-keys.py
           python3 tests/host/check-ci-llvm-cache.py
           python3 tests/host/check-clean-bootstrap.py
+          python3 tests/host/check-app-link-inputs.py
       - id: sdk
         run: bash tools/build/ci-input-key.sh
       - id: key

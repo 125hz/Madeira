@@ -94,6 +94,8 @@ The host checks cover all 4,096 combinations of twelve representative source
 changes, further Cargo/configuration inputs, and sixteen combinations of native,
 Rust, graphics and app settings. These checks verify the declared invalidation
 rules. The full workflow verifies the native build, IPA package and cache restores.
+The preflight also checks Xcode source membership, native protection queries,
+optional Vulkan linkage and the iOS pointer exports before the full app build.
 
 You can override parallelism with, for example:
 
