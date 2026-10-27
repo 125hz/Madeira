@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import io
 from pathlib import Path
 import shutil
 import subprocess
@@ -103,5 +104,36 @@ with tempfile.TemporaryDirectory() as tmpdir:
     check("restored save file exists and matches", restored_save.is_file() and restored_save.read_text(encoding="utf-8") == "SAVE_DATA")
     check("restored doc exists and matches", restored_doc.is_file() and restored_doc.read_text(encoding="utf-8") == "CONFIG_DATA")
     check("target user.reg was not overwritten", restored_reg.is_file() and restored_reg.read_text(encoding="utf-8") == "DST_REGISTRY")
+
+# Reject the complete archive before a valid earlier entry can overwrite a save.
+with tempfile.TemporaryDirectory() as directory:
+    base = Path(directory)
+    prefix, archive = base / 'prefix', base / 'bad.tar.gz'
+    prefix.mkdir()
+    target = prefix / 'drive_c/users/test/Documents/first.sav'
+    for bad_name, kind in [('../escape', 'file'), ('user.reg', 'file'),
+                           ('drive_c/users/test/Documents/link', 'symlink'),
+                           ('drive_c/users/test/Documents/hard', 'hardlink')]:
+        with tarfile.open(archive, 'w:gz') as tar:
+            good = tarfile.TarInfo('drive_c/users/test/Documents/first.sav')
+            good.size = 3
+            tar.addfile(good, io.BytesIO(b'new'))
+            bad = tarfile.TarInfo(bad_name)
+            if kind != 'file':
+                bad.type = tarfile.SYMTYPE if kind == 'symlink' else tarfile.LNKTYPE
+                bad.linkname = str(base / 'outside')
+            tar.addfile(bad)
+        result = subprocess.run([sh_bin, str(script), 'restore', str(prefix), str(archive)], capture_output=True)
+        check('reject ' + kind + ' ' + bad_name + ' before any write', result.returncode != 0 and not target.exists())
+    outside = base / 'outside'
+    outside.mkdir()
+    (prefix / 'drive_c/users/test').mkdir(parents=True)
+    (prefix / 'drive_c/users/test/Documents').symlink_to(outside, target_is_directory=True)
+    with tarfile.open(archive, 'w:gz') as tar:
+        member = tarfile.TarInfo('drive_c/users/test/Documents/escape.sav')
+        member.size = 3
+        tar.addfile(member, io.BytesIO(b'bad'))
+    result = subprocess.run([sh_bin, str(script), 'restore', str(prefix), str(archive)], capture_output=True)
+    check('reject an existing destination symlink', result.returncode != 0 and not list(outside.iterdir()))
 
 sys.exit(0 if ok else 1)

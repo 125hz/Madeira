@@ -1,6 +1,5 @@
 #!/bin/sh
 # Host-side tool to backup and restore game saves from a Wine prefix.
-# (On iOS devices, save backup/restore is handled in-app under Settings > Saves).
 #
 # Backs up user Documents, Saved Games, and AppData from drive_c/users.
 # Excludes caches, temporary files, and never touches registry files (user.reg).
@@ -34,10 +33,6 @@ case "$archive" in
     *)             archive_path="$(pwd)/$archive" ;;
 esac
 
-case "$archive_path" in
-    *:*) tar_flags="--force-local" ;;
-    *)   tar_flags="" ;;
-esac
 
 case "$action" in
     backup)
@@ -49,39 +44,38 @@ case "$action" in
         echo "backing up saves from $prefix to $archive..."
         (
             cd "$prefix"
-            save_list=""
-            for u in drive_c/users/*; do
-                [ -d "$u" ] || continue
-                uname="$(basename "$u")"
-                case "$uname" in
-                    Public|Default|"All Users") continue ;;
-                esac
-                for sub in "Saved Games" "Documents" "AppData/Roaming" "AppData/LocalLow" "AppData/Local"; do
-                    if [ -d "$u/$sub" ]; then
-                        save_list="${save_list}${u}/${sub}\n"
-                    fi
-                done
-            done
+            save_list="$(mktemp)"
+            trap 'rm -f "$save_list"' EXIT HUP INT TERM
+            python3 - "$archive_path" > "$save_list" <<'PY_LIST'
+from pathlib import Path
+import os
+import sys
 
-            if [ -n "$save_list" ]; then
-                printf "%b" "$save_list" | tar $tar_flags -czf "$archive_path" \
-                    --exclude='*/AppData/Local/Temp' \
-                    --exclude='*/cache' \
-                    --exclude='*/Cache' \
-                    --exclude='*/caches' \
-                    --exclude='*/crashdumps' \
-                    --exclude='*/logs' \
-                    --exclude='*/webcache' \
-                    --exclude='*/htmlcache' \
-                    -T -
-            else
-                echo "warning: no save directories found under drive_c/users" >&2
-                tar $tar_flags -czf "$archive_path" \
-                    --exclude='*/AppData/Local/Temp' \
-                    --exclude='*/cache' \
-                    --exclude='*/logs' \
-                    drive_c/users
-            fi
+output = Path(sys.argv[1]).resolve()
+ignored = {"cache", "caches", "crashdumps", "logs", "webcache", "htmlcache"}
+for user in Path("drive_c/users").iterdir():
+    if user.is_symlink() or not user.is_dir() or user.name in ("Public", "Default", "All Users"):
+        continue
+    for sub in ("Saved Games", "Documents", "AppData/Roaming", "AppData/LocalLow", "AppData/Local"):
+        base = user / sub
+        if not base.is_dir() or any(p.is_symlink() for p in (base, *base.parents)):
+            continue
+        for current, dirs, files in os.walk(base):
+            folder = Path(current)
+            dirs[:] = [d for d in dirs if d.lower() not in ignored and not (folder / d).is_symlink()
+                       and not (folder == user / "AppData/Local" and d == "Temp")]
+            for entry in [folder, *(folder / f for f in files)]:
+                if entry.is_symlink() or entry.resolve() == output or not (entry.is_file() or entry.is_dir()):
+                    continue
+                sys.stdout.buffer.write(os.fsencode(entry) + b"\0")
+PY_LIST
+            COPYFILE_DISABLE=1 tar -cz --null --no-recursion \
+                --exclude='*/AppData/Local/Temp' \
+                --exclude='*/cache' --exclude='*/Cache' --exclude='*/caches' \
+                --exclude='*/crashdumps' --exclude='*/logs' \
+                --exclude='*/webcache' --exclude='*/htmlcache' \
+                -T "$save_list" > "$archive_path"
+
         )
         echo "backup written to $archive"
         ;;
@@ -92,10 +86,34 @@ case "$action" in
             exit 1
         fi
 
+        # Check every entry before tar can write any of them.
+        python3 - "$prefix" "$archive_path" <<'PY_CHECK'
+from pathlib import Path, PurePosixPath
+import sys
+import tarfile
+
+root = Path(sys.argv[1]).resolve()
+with tarfile.open(sys.argv[2], "r:gz") as archive:
+    for entry in archive.getmembers():
+        parts = PurePosixPath(entry.name).parts
+        safe = (not entry.name.startswith("/") and ".." not in parts and "\\" not in entry.name
+                and len(parts) >= 4 and parts[:2] == ("drive_c", "users")
+                and parts[2] not in ("Public", "Default", "All Users")
+                and (parts[3] in ("Documents", "Saved Games") or
+                     len(parts) >= 5 and parts[3] == "AppData" and parts[4] in ("Local", "LocalLow", "Roaming"))
+                and (entry.isdir() or entry.isfile()))
+        if not safe:
+            sys.exit("error: unsafe save archive entry: " + repr(entry.name))
+        target = root
+        for part in parts:
+            target = target / part
+            if target.is_symlink():
+                sys.exit("error: save path contains a symlink: " + str(target))
+PY_CHECK
         echo "restoring saves from $archive to $prefix..."
         (
             cd "$prefix"
-            tar $tar_flags -xzf "$archive_path"
+            COPYFILE_DISABLE=1 tar -xz --no-same-owner --no-same-permissions < "$archive_path"
         )
         echo "restore finished"
         ;;

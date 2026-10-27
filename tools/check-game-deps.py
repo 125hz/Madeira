@@ -24,7 +24,7 @@ def parse_pe_imports(bin_path):
     with open(bin_path, "rb") as f:
         data = f.read()
 
-    if len(data) < 64:
+    if len(data) < 64 or data[:2] != b"MZ":
         return None, []
 
     pe_offset = struct.unpack_from("<I", data, 0x3c)[0]
@@ -35,10 +35,12 @@ def parse_pe_imports(bin_path):
     num_sections = struct.unpack_from("<H", data, pe_offset + 6)[0]
     opt_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
     opt_offset = pe_offset + 24
-    if opt_offset + 2 > len(data):
+    if opt_size < 2 or opt_offset + opt_size > len(data):
         return machine, []
 
     magic = struct.unpack_from("<H", data, opt_offset)[0]
+    if magic not in (0x10b, 0x20b):
+        return None, []
 
     # Standard imports
     import_dir_offset = opt_offset + (120 if magic == 0x20b else 104)
@@ -47,7 +49,7 @@ def parse_pe_imports(bin_path):
         import_rva, import_sz = struct.unpack_from("<II", data, import_dir_offset)
 
     # Delay-load imports (DataDirectory[13])
-    delay_dir_offset = opt_offset + (200 if magic == 0x20b else 184)
+    delay_dir_offset = opt_offset + (216 if magic == 0x20b else 200)
     delay_rva, delay_sz = 0, 0
     if delay_dir_offset + 8 <= opt_offset + opt_size:
         delay_rva, delay_sz = struct.unpack_from("<II", data, delay_dir_offset)
@@ -56,7 +58,7 @@ def parse_pe_imports(bin_path):
     sections = []
     for i in range(num_sections):
         sec = data[sec_start + i * 40:sec_start + (i + 1) * 40]
-        if len(sec) < 20:
+        if len(sec) < 40:
             break
         vsize, vrva, rsize, roff = struct.unpack_from("<IIII", sec, 8)
         sections.append((vrva, vsize, roff, rsize))
@@ -115,7 +117,14 @@ def main():
         print(f"error: file not found: {bin_path}", file=sys.stderr)
         return 1
 
-    machine, deps = parse_pe_imports(bin_path)
+    try:
+        machine, deps = parse_pe_imports(bin_path)
+    except (OSError, ValueError, struct.error) as error:
+        print(f"error: cannot read {bin_path}: {error}", file=sys.stderr)
+        return 1
+    if machine is None:
+        print(f"error: not a supported PE file: {bin_path}", file=sys.stderr)
+        return 1
     if not deps:
         print(f"no imports found in {bin_path.name}")
         return 0
