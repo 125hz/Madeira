@@ -44,8 +44,24 @@ also uses iOS 18.0 as its effective deployment target.
 
 Toolchains and expensive native build outputs are cached under their existing
 ignored build directories. Re-running `./tools/build-ipa.sh` reconfigures the source builds and uses their incremental compile rules.
-An existing archive alone does not skip FEX, DXMT, LLVM or Wine headers.
-The CI keys also include the Xcode/SDK/compiler identity and build inputs.
+An existing archive alone does not skip these local source builds.
+
+GitHub Actions runs once for each PR update, on pushes to main, and on manual
+requests. Changes limited to docs/, README.md or BUILDING.md do not start an
+automatic build. A newer run cancels an older run for the same PR or branch.
+
+CI can reuse a completed IPA when the checked-out Git tree, runner platform,
+Xcode/SDK/compiler identity, runner image and build flags match. The Git tree
+includes component pins and build scripts. A reused IPA must pass the ZIP and
+bundle-layout checks before upload. GitHub's branch and PR cache access rules
+still apply; an unrelated branch's cache is not a shared artifact store.
+
+On an IPA cache miss, the workflow builds the native stages in parallel. Their
+cache keys include the relevant source pins, recipes and build environment.
+Unrelated workflow edits do not invalidate LLVM or FEX. CI accepts a complete
+restored FEX/DXMT output set; LLVM also checks its archive checksum list and
+required headers. Its source-header cache does not need an LLVM Git checkout.
+Local source builds keep their normal incremental path.
 
 You can override parallelism with, for example:
 
