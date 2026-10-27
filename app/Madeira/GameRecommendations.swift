@@ -28,6 +28,9 @@
 //      GTA5.exe, or PlayGTAV.exe beside GTA5.exe and without
 //      GTA5_Enhanced.exe (Enhanced is checked first); inside a Steam library
 //      the Steam copy, anywhere else the list for outside Steam.
+//    - The Rockstar Games Launcher outside Steam: Launcher.exe in a
+//      "Rockstar Games\Launcher" folder, and its installer
+//      Rockstar-Games-Launcher.exe, wherever it was downloaded.
 //    - The Steam titles of `steamTitles` (merged 2026-10-26): their App IDs,
 //      their folders under steamapps\common and their own programs; a
 //      program marked Steam-only names the game only inside a Steam library.
@@ -71,6 +74,10 @@ struct GameRecommendation: Equatable {
     static let screen720 = "screen@720"
     /// Aspect & scaling (DisplayMode raw value); "fit" is the default.
     var display: String? = nil
+    /// Game details › Launch › Start (LibraryEntry.launchMode): "desktop", the Wine desktop.
+    var launchMode: String? = nil
+    /// Game details › Launch › Start Windows services first (LibraryEntry.startServices).
+    var startServices: Bool? = nil
 
     /// Lines only a device with less than 12 GB of RAM gets, after `config`
     /// (GameRecommendations.smallRAMDevice). nil: every device gets the same list.
@@ -99,6 +106,8 @@ struct GameRecommendation: Equatable {
             parts.append("FPS limit \(label)")
         }
         if let resolution { parts.append(resolution == Self.screen720 ? "this screen's shape at 720 lines" : resolution) }
+        if launchMode == "desktop" { parts.append("starts in the Wine desktop") }
+        if startServices == true { parts.append("Windows services first") }
         return parts.joined(separator: ", ")
     }
 }
@@ -916,6 +925,67 @@ enum GameRecommendations {
         env.MADEIRA_EC_HOOK_TRACE = 0
         """)
 
+    /// The Rockstar Games Launcher outside Steam (Launcher.exe in its own folder;
+    /// a tester's copy of a game bought there, 2026-10-28). Through Madeira Dock the
+    /// game's own list carries the launcher chain's lines and the Dock starts the
+    /// service manager; a library entry for the launcher itself had neither. Log 91:
+    /// no service manager, so the launcher's service could not be installed
+    /// (\pipe\svcctl missing, RPC 1722). Log 92: with it, the sign-in helper's
+    /// libcef.dll found no room in a 624 MB pool (c0000017, six restarts, a black
+    /// window). Log 93: with the pool lines, libcef loaded, then the helper's 32 GB
+    /// PartitionAlloc reservation met the emulator's arena and Chromium stopped
+    /// itself (0x80000003). So: the Wine desktop with Windows services first, and the
+    /// chain's lines from the games' lists (Social Club layout 2, the pool lines,
+    /// pure-x64 images uncopied, the crash handler and the vc_redist re-run refused).
+    static let rockstarLauncher = GameRecommendation(
+        id: "rockstar-launcher", title: "Rockstar Games Launcher", version: 1,
+        config: """
+        # Madeira's recommended settings for the Rockstar Games Launcher outside Steam.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        pool-low = 1
+        pool-mid = 1
+        pool-page-fit = 1
+        pool-split = 1
+        env.FEX_VECTORTSOENABLED = 0
+        env.MADEIRA_SC_PA_POOLS = 2
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        env.MADEIRA_EXECREQ_LEAVE = 1
+        env.MADEIRA_LOCK_ORPHAN = stamped
+        env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
+        env.MADEIRA_POOL_LOW_IMAGES = 1
+        env.MADEIRA_POOL_RECYCLE_IMAGES = 1
+        env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;.be\\vc_redist
+        env.MADEIRA_TOUCH_MOUSE = 1
+        env.MADEIRA_WOW_MIN_FREE_GB = 2
+        env.DXMT_SMALL_RINGS = Launcher.exe;SocialClubHelper.exe
+        env.DXMT_WSI_MONITOR_IDENTITY = 1
+        env.DXMT_WSI_MODE_TABLE = 1
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        fastSync: true, display: "fit", launchMode: "desktop", startServices: true)
+
+    /// The launcher's installer (log 91): it installs the launcher's service, which
+    /// needs the service manager, and runs the embedded vc_redist, which the
+    /// launcher's list refuses; so the two Launch switches and the standard line only.
+    static let rockstarLauncherSetup = GameRecommendation(
+        id: "rockstar-launcher-setup", title: "Rockstar Games Launcher installer", version: 1,
+        config: """
+        # Madeira's recommended settings for the Rockstar Games Launcher installer.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        # The defaults this list was tested with (upstream's differ).
+        env.MADEIRA_FREE_DELAY_MS = 2000
+        env.MADEIRA_CTX_CPU_AREA = 2
+        env.MADEIRA_WAIT_CHILDREN = 1
+        env.MADEIRA_JIT_DUMP = 0
+        """,
+        launchMode: "desktop", startServices: true)
+
     /// ml2021: Valve's client in Big Picture (the library's Big Picture button;
     /// C:\big-picture.bat in the Wine desktop, LibraryEntry.bigPictureEntry). A
     /// 64-bit Chromium host like the publisher launcher's helper, so it takes that
@@ -967,7 +1037,8 @@ enum GameRecommendations {
 
     static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, gta5LegacySteam, gta5LegacyOther, gta4Steam,
                       ghostOfTsushima, godOfWar, horizonZeroDawn, horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered,
-                      crysis2Remastered, crysis3Remastered, steamBigPicture, standard] + steamTitles.map(\.list)
+                      crysis2Remastered, crysis3Remastered, rockstarLauncher, rockstarLauncherSetup, steamBigPicture, standard]
+        + steamTitles.map(\.list)
 
     // MARK: Recognising a game
 
@@ -1054,6 +1125,11 @@ enum GameRecommendations {
             return crysis2Remastered
         case "crysis3remastered.exe":
             return crysis3Remastered
+        case "launcher.exe" where Array(parts.dropLast().suffix(2)) == ["rockstar games", "launcher"]:
+            // The Rockstar Games Launcher outside Steam; another publisher's Launcher.exe gets nothing here.
+            return rockstarLauncher
+        case "rockstar-games-launcher.exe":
+            return rockstarLauncherSetup
         default:
             return steamTitles.first { $0.programs.contains(last) || (inSteam && $0.steamPrograms.contains(last)) }?.list
         }

@@ -76,11 +76,31 @@ MERGED = {'msfs-2024', 'counter-strike-2', 'breakneck', 'spelunky-2', 'albion-on
           'glyphica-typing-survival', 'the-adventures-of-elliot'}
 assert set(presets) == {'rdr2-steam', 'rdr2-other', 'gta5e-steam', 'gta5e-other', 'gta5l-steam', 'gta5l-other', 'gta4-steam',
                         'ghost-of-tsushima', 'god-of-war', 'horizon-zero-dawn', 'horizon-forbidden-west', 'ratchet-clank-rift-apart',
-                        'crysis-remastered', 'crysis-2-remastered', 'crysis-3-remastered', 'steam-big-picture', 'standard'} | MERGED, \
+                        'crysis-remastered', 'crysis-2-remastered', 'crysis-3-remastered', 'rockstar-launcher', 'rockstar-launcher-setup',
+                        'steam-big-picture', 'standard'} | MERGED, \
     sorted(presets)
 assert ('static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, gta5LegacySteam, gta5LegacyOther, gta4Steam,\n'
         '                      ghostOfTsushima, godOfWar, horizonZeroDawn, horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered,\n'
-        '                      crysis2Remastered, crysis3Remastered, steamBigPicture, standard] + steamTitles.map(\\.list)') in lists_src
+        '                      crysis2Remastered, crysis3Remastered, rockstarLauncher, rockstarLauncherSetup, steamBigPicture, standard]\n'
+        '        + steamTitles.map(\\.list)') in lists_src
+# The Rockstar Games Launcher outside Steam (logs 91-93, 2026-10-28): Launcher.exe in its own folder gets the
+# launcher chain's lines, its installer the standard line; both start in the Wine desktop with Windows services.
+assert ('        case "launcher.exe" where Array(parts.dropLast().suffix(2)) == ["rockstar games", "launcher"]:\n'
+        '            // The Rockstar Games Launcher outside Steam; another publisher\'s Launcher.exe gets nothing here.\n'
+        '            return rockstarLauncher\n'
+        '        case "rockstar-games-launcher.exe":\n'
+        '            return rockstarLauncherSetup\n') in lists_src
+for ident in ('rockstar-launcher', 'rockstar-launcher-setup'):
+    assert presets[ident]['switches'].endswith('launchMode: "desktop", startServices: true'), (ident, presets[ident]['switches'])
+launcher_lines = set(presets['rockstar-launcher']['lines'])
+for line in ('env.MADEIRA_SC_PA_POOLS = 2', 'env.MADEIRA_X64_IMAGE_NOCOPY = 1', 'pool-low = 1', 'pool-split = 1',
+             'env.MADEIRA_POOL_LOW_IMAGES = 1', 'env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler;.be\\vc_redist',
+             'env.DXMT_SMALL_RINGS = Launcher.exe;SocialClubHelper.exe'):
+    assert line in launcher_lines, ('rockstar-launcher', line)
+assert not any(l.startswith('env.MADEIRA_SPAWN_BLOCK') for l in presets['rockstar-launcher-setup']['lines']), \
+    'the installer runs its embedded vc_redist'
+assert 'if let mode = rec.launchMode { entry.launchMode = mode == "desktop" ? mode : nil }' in apply_src
+assert 'if let on = rec.startServices { entry.startServices = on ? true : nil }' in apply_src
 # Every merged list is in the recognition table, once.
 titles_src = block(lists_src, '    static let steamTitles: [SteamTitle] = [', '\n    ]\n')
 for ident in MERGED:
@@ -136,7 +156,7 @@ for ident, p in presets.items():
         if key != 'env.WINEDLLOVERRIDES':
             named = named.replace('socialclubhelper.exe', '')
         assert 'socialclub' not in named and 'MADEIRA_DLL_LOCAL' not in line, (ident, line)
-print('PASS: sixty-seven lists (seventeen plus 50 merged Steam titles), two comment lines each, every game list ends with the four fork defaults and the standard one has none, no key twice, '
+print('PASS: sixty-nine lists (nineteen plus 50 merged Steam titles), two comment lines each, every game list ends with the four fork defaults and the standard one has none, no key twice, '
       'every non-env key in the settings catalog, no Social Club DLL lines, no variant DLL switches')
 
 # Red Dead Redemption 2 from Steam: the owner's list of 2026-10-09 (build 463), line for line,
@@ -516,6 +536,8 @@ struct LibraryEntry {
     var fpsMode = 1
     var fastSync: Bool? = nil
     var semaphoreFastPath: Bool? = nil
+    var launchMode: String? = nil
+    var startServices: Bool? = nil
 }
 
 final class PrefStore {
@@ -557,6 +579,9 @@ func id(_ path: String, _ app: Int? = nil, files: [String] = []) -> String {
 
 // How a game is recognised.
 let rdr2 = steam + #"\Red Dead Redemption 2"#
+check(id(#"C:\Program Files\Rockstar Games\Launcher\Launcher.exe"#) == "rockstar-launcher", "the publisher launcher in its folder")
+check(id(#"C:\Games\Some Game\Launcher.exe"#) == "none", "another program called Launcher.exe")
+check(id(#"C:\users\a\Downloads\Rockstar-Games-Launcher.exe"#) == "rockstar-launcher-setup", "the launcher's installer")
 check(id(rdr2, 1174180) == "rdr2-steam", "RDR2 by its App ID")
 check(id(rdr2) == "rdr2-steam", "RDR2 by its Steam folder")
 check(id("D:\\SteamLibrary\\steamapps\\common\\Red Dead Redemption 2\\") == "rdr2-steam", "another Steam library, trailing backslash")

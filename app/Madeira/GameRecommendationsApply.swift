@@ -176,6 +176,8 @@ extension GameRecommendations {
             else if let lines720 = ResolutionChoices.screen720Value { entry.resolution = lines720 }
         }
         if let mode = rec.display { entry.display = mode == DisplayMode.fit.rawValue ? nil : mode }
+        if let mode = rec.launchMode { entry.launchMode = mode == "desktop" ? mode : nil }
+        if let on = rec.startServices { entry.startServices = on ? true : nil }
     }
 
     private static var marks: [String: String] {
