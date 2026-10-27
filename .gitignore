@@ -171,3 +171,6 @@ app/Madeira/arm64ec-windows/dock-notices.txt
 build/faultrep/out/
 
 .worktree/
+
+# Python host-check caches
+__pycache__/
