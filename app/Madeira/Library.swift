@@ -3250,7 +3250,10 @@ struct LibraryDetail: View {
     /// the game's config lines in its GameProfiles.swift file. This page's
     /// controls read and write them; the entry fields upstream keeps for the
     /// same options (avx, reportNVIDIA, config) are moved into them once.
-    private func reloadBCD() { bcd = BCDGameValues(windowsPath: entry.windowsPath) }
+    private func reloadBCD() {
+        bcd = BCDGameValues(windowsPath: entry.windowsPath)
+        bcd.unityIL2CPP = BCDLaunch.isUnityIL2CPP(entry)
+    }
     private func migrateEntryOptions() {
         let path = entry.windowsPath
         let file = GameProfile(windowsPath: path)
@@ -3529,6 +3532,15 @@ struct LibraryDetail: View {
             Toggle(isOn: Binding(get: { bcd.wineVCRT }, set: { on in bcd.wineVCRT = on; LibraryPrefs.setWineVCRT(on, for: entry.windowsPath) })) {
                 compatLabel("Wine's C++ runtime", "Instead of the game's msvcp/vcruntime")
             }
+            // madeira-bcd: MADEIRA_REAL_SUSPEND for this game (BCDLaunch.realSuspend).
+            Picker(selection: Binding(get: { bcd.realSuspend.map { $0 ? 1 : 2 } ?? 0 },
+                                      set: { v in bcd.realSuspend = v == 0 ? nil : v == 1; LibraryPrefs.setRealSuspend(bcd.realSuspend, for: entry.windowsPath) })) {
+                Text(bcd.unityIL2CPP ? "Automatic (on: Unity game)" : "Automatic (off)").tag(0)
+                Text("On").tag(1)
+                Text("Off").tag(2)
+            } label: {
+                compatLabel("Pause threads fully", "For Unity games that crash while loading, like Megabonk. Can make other games freeze")
+            }
             // Fastsync-only switches: shown for every game, usable only while
             // Settings › Sync engine is Fastsync.
             Group {
@@ -3742,12 +3754,14 @@ struct LibraryDetail: View {
 /// LibraryPrefs' switches and the GameProfiles.swift file's lines.
 struct BCDGameValues {
     var avx = false, nvidia = false, wineVCRT = false
+    var realSuspend: Bool? = nil, unityIL2CPP = false
     var configText = ""
     init() {}
     init(windowsPath: String) {
         avx = LibraryPrefs.avx(windowsPath)
         nvidia = LibraryPrefs.nvidia(windowsPath)
         wineVCRT = LibraryPrefs.wineVCRT(windowsPath)
+        realSuspend = LibraryPrefs.realSuspend(windowsPath)
         configText = GameProfile(windowsPath: windowsPath).text
     }
 }
