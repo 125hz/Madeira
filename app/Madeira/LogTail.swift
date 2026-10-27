@@ -13,6 +13,8 @@ final class LogTail {
     private var lineBuffer = Data()
     private var lastSize: off_t = 0
     private var displayPaused = false
+    /// Poll ticks since the last read while the display is paused.
+    private var pausedTicks = 0
 
     func setDisplayPaused(_ paused: Bool) {
         queue.async { [weak self] in
@@ -20,10 +22,9 @@ final class LogTail {
             self.displayPaused = paused
             if paused { self.source?.suspend() }
             else {
-                // Hidden lines remain in the file, but need not be parsed later.
-                if self.fd >= 0 { lseek(self.fd, 0, SEEK_END) }
-                self.lineBuffer.removeAll(keepingCapacity: true)
+                // Hidden lines were read once a second (readWhilePaused).
                 self.source?.resume()
+                self.readAvailable()
             }
         }
     }
@@ -95,14 +96,26 @@ final class LogTail {
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now() + 0.25, repeating: 0.25)
         t.setEventHandler { [weak self] in
-            self?.readAvailable()
+            guard let self else { return }
+            if self.displayPaused { self.readWhilePaused() } else { self.readAvailable() }
         }
         t.resume()
         pollTimer = t
     }
 
+    /// With the live log hidden the file is still read, once a second instead of on
+    /// every write: the overlay's JIT memory (JITPoolMeter) counts the pool's lines,
+    /// and LogStore drops the rest unparsed. Paused before, the meter stayed at 0 with
+    /// Live logs off (New Vegas, 2026-10-26).
+    private func readWhilePaused() {
+        pausedTicks += 1
+        guard pausedTicks >= 4 else { return }
+        pausedTicks = 0
+        readAvailable()
+    }
+
     private func readAvailable() {
-        guard fd >= 0, !displayPaused else { return }
+        guard fd >= 0 else { return }
         var buf = [UInt8](repeating: 0, count: 64 * 1024)
         while true {
             let n = buf.withUnsafeMutableBytes { ptr in

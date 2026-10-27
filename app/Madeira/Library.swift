@@ -729,6 +729,7 @@ final class LibraryModel: ObservableObject {
     }
     @Published var error: String? { didSet { if error != nil { preparing = nil } } }
     @Published var sessionMessage = ""
+    private var smallPoolNoted = false
     /// Quit game was asked for and the program is still running after `forceCloseAfter`
     /// seconds: a frozen program never handles Alt+F4, so the menu offers to close Madeira.
     @Published var forceCloseOffered = false
@@ -1216,7 +1217,9 @@ final class LibraryModel: ObservableObject {
     /// `dock`: the game a Madeira Dock start launches (DockStartScreen).
     func begin(_ entry: LibraryEntry, remember: Bool = true, dock: DockGame? = nil) {
         wine_exit_status_reset()
-        quitRequested = false; quitRequestedAt = nil; forceCloseOffered = false; dockGameEnded = false; dockGameEndedAt = nil
+        JITPoolMeter.reset(); smallPoolNoted = false
+        quitRequested = false
+ quitRequestedAt = nil; forceCloseOffered = false; dockGameEnded = false; dockGameEndedAt = nil
         LibraryController.shared.configure(enabled: enabled, ownsInput: false)
         Self.sessionsThisRun += 1
         launchPresent = madeira_frame_count(); launchStarted = Date(); launchSlow = false; launchLogs = entry.liveLogs
@@ -1279,6 +1282,16 @@ final class LibraryModel: ObservableObject {
             } else if winios_surface_present_count() > launchSurface {
                 showGameView(reason: "surface")
             } else if Date().timeIntervalSince(launchStarted) > 30 { launchSlow = true }
+        }
+        // iPadOS gave the JIT pool less room than asked at launch: say so once the game is up.
+        if !smallPoolNoted, !launching, current != nil, JITPoolMeter.current.shrunk {
+            smallPoolNoted = true
+            let words = "JIT memory is small this time (\(JITPoolMeter.current.sizeMB.map { "\($0) MB" } ?? "smaller than usual")). " +
+                "Big games may stop loading; closing and reopening Madeira can give more."
+            sessionMessage = words
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self] in
+                if self?.sessionMessage == words { self?.sessionMessage = "" }
+            }
         }
         if wine_process_is_running() != 0 {
             sawProcess = true
@@ -1424,6 +1437,7 @@ final class LibraryModel: ObservableObject {
         ProMotionIntent.shared.setActive(false)
         ThermalPacing.shared.end()
         fputs("[frontend] returned to library\n", stderr)
+        LogSummary.writeLater(from: LogStore.shared.logURL, source: "madeira-log.txt (this session)")
     }
 }
 
@@ -3732,6 +3746,10 @@ struct LibraryDetail: View {
                 }
                 // madeira-bcd: always last, for every entry, the Desktop too (GameRecommendationsApply.swift).
                 Section {
+                    Button("Copy Settings", systemImage: "doc.on.doc") {
+                        let configText = entry.config ?? ""
+                        UIPasteboard.general.string = configText.isEmpty ? "# Default configuration" : configText
+                    }
                     Button("Reset to Recommended", systemImage: "arrow.counterclockwise") { confirmReset = true }
                         .confirmationDialog(GameRecommendations.question(recommended, desktop: entry.desktop == true),
                                             isPresented: $confirmReset, titleVisibility: .visible) {
@@ -5010,7 +5028,7 @@ struct LibraryHUD: View {
                 Divider()
                 Toggle("Performance overlay", isOn: $model.performance)
                 if model.performance {
-                    ForEach(["FPS", "Frame time", "CPU", "GPU", "RAM", "Battery", "Thermal"], id: \.self) { field in
+                    ForEach(["FPS", "Frame time", "CPU", "GPU", "RAM", "JIT memory", "Battery", "Thermal"], id: \.self) { field in
                         Toggle(field, isOn: Binding(get: { model.overlayFields.contains(field) }, set: { on in
                             model.overlayFields.removeAll { $0 == field }; if on { model.overlayFields.append(field) }
                         })).font(.subheadline)
@@ -5165,6 +5183,8 @@ struct LibraryMetrics: View {
             else { result.append(String(format: "GPU %.0f%%", gpu)) }
         }
         if model.overlayFields.contains("RAM") { result.append("\(memory) MB") }
+        // The memory games' code runs from; "FULL" once a DLL did not fit (JITPoolMeter).
+        if model.overlayFields.contains("JIT memory") { result.append(JITPoolMeter.text(JITPoolMeter.current) ?? "JIT —") }
         if model.overlayFields.contains("Battery"), battery >= 0 { result.append("\(battery)%") }
         if model.overlayFields.contains("Thermal") {
             switch thermal {
