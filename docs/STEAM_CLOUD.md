@@ -136,3 +136,5 @@ it, as before; the log says `[steam-cloud] remotecache off` once per app run.
   uploaded.
 - Encrypted cloud files are not supported.
 - Log tag `[steam-cloud]`: App IDs, counts and results; no file names or paths.
+
+Profile migration copies files before it changes registry paths. The old profile stays as a recovery copy. A copy or backup failure stops the migration. The sync record is cleared before copying, so a changed save needs a new comparison.
