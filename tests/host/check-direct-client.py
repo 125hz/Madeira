@@ -45,6 +45,7 @@ harness = r'''
 #include <assert.h>
 #include <stdatomic.h>
 static _Atomic(uintptr_t) g_size_game_hwnd;
+static _Atomic(int) g_close_desktop;
 typedef void *HWND;
 #define dispatch_async(queue, block) (block)()
 #define dispatch_get_main_queue() NULL
