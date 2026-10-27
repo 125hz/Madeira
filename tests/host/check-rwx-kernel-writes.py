@@ -20,8 +20,8 @@ write-watch helpers), and checks:
   - read(), pread() and recvmsg() (one aliased iovec of two) fill aliased memory through the alias;
     a destination with an unwritable page fails with EFAULT before any byte is consumed;
   - releasing a range retires exactly the aliases that start inside it, so a later lookup or
-    cover check at that address finds no stale backing; NtFreeVirtualMemory retires before
-    free_pages.
+    cover check at that address finds no stale backing; NtFreeVirtualMemory retires only after
+    free_pages succeeds.
 Needs python3 and a C compiler (AddressSanitizer/UBSan when available).
 """
 from pathlib import Path
@@ -53,11 +53,11 @@ def upto(source, first, last_line):
 wait = function(server, 'static inline unsigned int wait_reply(')
 assert 'ios_read_reply_guest( req->reply_data, req->u.reply.reply_header.reply_size, code, &fault )' in wait
 assert wait.index('ios_read_reply_guest(') < wait.index('if (fault) return STATUS_ACCESS_VIOLATION;')
-# NtFreeVirtualMemory retires the aliases of a released range before the pages go.
+# A failed release must keep the mapping and its aliases intact.
 free_fn = virtual[virtual.index('NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process'):]
 release = free_fn[free_fn.index('    case MEM_RELEASE:\n'):]
 release = release[:release.index('break;')]
-assert release.index('ios_jit_anon_alias_retire_range( base, size );') < release.index('free_pages( view, base, size )')
+assert release.index('free_pages( view, base, size )') < release.index('if (!status) ios_jit_anon_alias_retire_range( base, size );')
 
 code = r'''
 #include <assert.h>

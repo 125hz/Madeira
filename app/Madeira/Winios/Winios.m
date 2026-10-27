@@ -964,7 +964,9 @@ static BOOL winios_drain_input(void) {
             drained = TRUE;
             continue; /* Clipboard contents must not enter the input log. */
         }
-        fprintf(stderr, "[winios] drain type=%u x=%d y=%d flags=0x%x\n", e.type, e.x, e.y, e.flags); fflush(stderr);
+        if (e.type != WINIOS_EV_KEY) {
+            fprintf(stderr, "[winios] drain type=%u x=%d y=%d flags=0x%x\n", e.type, e.x, e.y, e.flags); fflush(stderr);
+        }
         if (e.type == WINIOS_EV_KEY)
             winios_drv_post_key((unsigned short)e.x, e.flags);
         else
