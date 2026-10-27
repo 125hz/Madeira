@@ -173,6 +173,16 @@ and check-frontend fails if a setting is hidden from it. A profile holds:
 - performance overlay, live logs and touch controls for the session, with the
   controls' **opacity** and overall **size**. The touch layout itself is saved
   per game from the in-game editor;
+- **Settings files** (games only; the Desktop has no folder of its own): the
+  game's own .ini files, edited in the app instead of the Files app. **Add
+  .ini file** lists the .ini files in the game's folder and in
+  `Documents/My Games`; the editor shows each section's settings as switches,
+  numbers and text, with an ⓘ that says what a setting does (a sentence for
+  well-known Bethesda settings, otherwise what its name's type letter means).
+  Saving rewrites only the changed values and keeps line endings, encoding,
+  comments and order; a file the game rewrote since it was saved here is
+  noted when it opens. Close the game before saving, or it may write over the
+  change. `tests/host/check-ini-editor.py` covers the parser and the save.
 - **Advanced › This game's config**: lines in madeira.cfg's syntax for this
   game only. Each launch writes them to `Application Support/madeira-game.cfg`
   and exports `MADEIRA_CFG_GAME` (unset when there are none): a key set there
