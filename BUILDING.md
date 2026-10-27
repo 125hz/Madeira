@@ -48,9 +48,9 @@ Toolchains and expensive native build outputs are cached under their existing
 ignored build directories. Re-running `./tools/build-ipa.sh` reconfigures the source builds and uses their incremental compile rules.
 An existing archive alone does not skip these local source builds.
 
-GitHub Actions runs once for each PR update, on pushes to main, and on manual
-requests. Changes limited to docs/, README.md or BUILDING.md do not start an
-automatic build. A newer run cancels an older run for the same PR or branch.
+GitHub Actions runs once for each PR update, on every push to main, and on manual
+requests. Documentation changes also start a run. A newer run cancels an older
+run for the same PR or branch.
 
 CI can reuse a completed IPA when the checked-out Git tree, runner platform,
 Xcode/SDK/compiler identity, runner image and build flags match. The Git tree

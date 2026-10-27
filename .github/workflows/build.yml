@@ -3,15 +3,7 @@ name: Build IPA
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - 'docs/**'
-      - 'README.md'
-      - 'BUILDING.md'
   pull_request:
-    paths-ignore:
-      - 'docs/**'
-      - 'README.md'
-      - 'BUILDING.md'
   workflow_dispatch:
 
 permissions:
