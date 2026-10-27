@@ -111,7 +111,7 @@ for ident, p in presets.items():
         assert 'socialclub' not in named and 'MADEIRA_DLL_LOCAL' not in line, (ident, line)
 for ident in ('fallout-new-vegas', 'fallout-3'):
     assert presets[ident]['tested'] == presets['standard']['tested'] and presets[ident]['switches'] == 'olderNvidia: true', presets[ident]
-print('PASS: ten lists, two comment lines each, every game list ends with the four fork defaults and the standard and Fallout ones have none, no key twice, '
+print('PASS: twelve lists, recorded fork defaults retained, Dark Souls and Fallout lists kept separate, no key twice, '
       'every non-env key in the settings catalog, no Social Club DLL lines, no variant DLL switches')
 
 # Red Dead Redemption 2 from Steam: the owner's list of 2026-10-09 (build 463), line for line,
@@ -311,7 +311,8 @@ assert reset_section.index('Button("Reset", role: .destructive) { resetToRecomme
 assert 'GameRecommendations.question(recommended, desktop: entry.desktop == true)' in reset_section
 # For every entry, the Desktop too: the section is not gated off.
 assert ('// madeira-bcd: always last, for every entry, the Desktop too (GameRecommendationsApply.swift).\n'
-        '                Section {\n                    Button("Reset to Recommended"') in detail
+        '                Section {\n') in detail
+assert detail.index('// madeira-bcd: always last,') < detail.index('Button("Reset to Recommended"')
 # Last in the form, after the Executable section and Remove from library (the error line is
 # shown with the page's other sections since the Game details pages).
 assert detail.index('Button("Remove from library"') < detail.index('Button("Reset to Recommended"')

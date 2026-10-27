@@ -213,6 +213,9 @@ build/faultrep/out/
 
 .worktree/
 build/dcomp/out/
+
+# Python host-check caches
+__pycache__/
 # Optional Vulkan native build outputs
 /app/Madeira/libmadeira_vulkan.a
 /app/Madeira/arm64ec-windows/winevulkan.dll
