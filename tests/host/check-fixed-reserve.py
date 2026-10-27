@@ -67,10 +67,13 @@ static void ios_window_inventory(const char *s, uintptr_t l, uintptr_t h) {}
 static void ios_slot_probe(const char *s) {}
 static void ios_bigres_report(const char *s) {}
 static uintptr_t ios_usable_va_floor;
+static void ios_oversize_commit_failed(const void *addr, SIZE_T size, NTSTATUS status) {}
 static NTSTATUS run(void **ret, SIZE_T *size_ptr, ULONG type, ULONG protect)
 {
     NTSTATUS st = STATUS_NO_MEMORY;
     int ios_steered = 0, hint_was_set = *ret != NULL;
+    void *jumbo_hint = *ret;
+    SIZE_T jumbo_size = *size_ptr;
     ULONG_PTR limit = 0;
     if (1) {
 '''
