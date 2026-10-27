@@ -519,6 +519,47 @@ enum GameRecommendations {
         """,
         avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit")
 
+    /// Dark Souls: Remastered (tested on an iPhone Air, iOS 27.2, 2026-10).
+    /// The game enumerates XInput only at start and never looks again (no
+    /// device-arrival broadcast reaches it here), so player 1 is published from
+    /// the first frame, and a player without controls of their own gets the Xbox
+    /// layout. Without these the game runs but ignores the touch controller.
+    /// The game's Arxan protection needs no dearxan: start-up also needs the image
+    /// low-alias for steamclient64 (#385).
+    static let darkSoulsRemastered = GameRecommendation(
+        id: "dark-souls-remastered", title: "Dark Souls: Remastered", version: 1,
+        config: """
+        # Madeira's recommended settings for Dark Souls: Remastered.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        # The game looks for a controller only when it starts: player 1 is there from the first frame.
+        env.MADEIRA_PAD_EARLY_SLOT = 1
+        env.MADEIRA_CONTROLS_XBOX_DEFAULT = 1
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        """)
+
+    /// Dark Souls III (Steam; tested on an iPhone Air, iOS 27.2, 2026-10). Its JIT
+    /// pool used to fill with the game's and Steam's image copies (the exe alone is
+    /// 87 MB), so FEX's code buffer reset dozens of times a minute and combat ran at
+    /// 3-11 fps: pool-split takes the pool past the main thread's stack (688 MB
+    /// instead of 384-544) and MADEIRA_X64_IMAGE_NOCOPY runs the pure-x64 images in
+    /// place. The orphan-lock reaper in its default mode released a live
+    /// DynamicBuffer lock with three waiters, and two threads then crashed in DXMT;
+    /// stamped reaps only locks of threads that are gone, as for Horizon Zero Dawn.
+    /// The game looks for a controller only at start, as Dark Souls: Remastered.
+    /// With these, combat holds 16-20 fps.
+    static let darkSoulsIII = GameRecommendation(
+        id: "dark-souls-iii", title: "Dark Souls III", version: 1,
+        config: """
+        # Madeira's recommended settings for Dark Souls III.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        pool-split = 1
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        env.MADEIRA_LOCK_ORPHAN = stamped
+        env.MADEIRA_PAD_EARLY_SLOT = 1
+        env.MADEIRA_CONTROLS_XBOX_DEFAULT = 1
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        """)
+
     /// Every other game, and the Desktop (owner's decisions, 2026-10-12): most games
     /// the owner tried outside these lists closed at start until the [ec-hook]
     /// reporter was off. It reads code a game's protection rewrites at run time
@@ -538,13 +579,13 @@ enum GameRecommendations {
         """)
 
     static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, ghostOfTsushima, godOfWar, horizonZeroDawn,
-                      standard]
+                      darkSoulsRemastered, darkSoulsIII, standard]
 
     // MARK: Recognising a game
 
     /// Steam App IDs.
     static let rdr2AppID = 1174180, gta5EnhancedAppID = 3240220, ghostAppID = 2215430, godOfWarAppID = 1593500,
-               horizonZeroDawnAppID = 1151640
+               horizonZeroDawnAppID = 1151640, darkSoulsRemasteredAppID = 570940, darkSoulsIIIAppID = 374320
 
     /// The recommendation for a game, or nil.
     /// - windowsPath: a program ("C:\Games\GoW\GoW.exe"), or a library Steam
@@ -566,6 +607,8 @@ enum GameRecommendations {
                 || installFolder == "ghost of tsushima" { return ghostOfTsushima }
             if steamAppID == godOfWarAppID || installFolder == "godofwar" || installFolder == "god of war" { return godOfWar }
             if steamAppID == horizonZeroDawnAppID || installFolder == "horizon zero dawn" { return horizonZeroDawn }
+            if steamAppID == darkSoulsRemasteredAppID || installFolder == "dark souls remastered" { return darkSoulsRemastered }
+            if steamAppID == darkSoulsIIIAppID || installFolder == "dark souls iii" { return darkSoulsIII }
             return nil
         }
         // A program, wherever it was installed: only the game's own programs, so a
@@ -586,6 +629,10 @@ enum GameRecommendations {
             return godOfWar
         case "horizonzerodawn.exe":
             return horizonZeroDawn
+        case "darksoulsremastered.exe":
+            return darkSoulsRemastered
+        case "darksoulsiii.exe":
+            return darkSoulsIII
         default:
             return nil
         }
